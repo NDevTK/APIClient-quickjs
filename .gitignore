@@ -12,3 +12,35 @@ CMakeUserPresets.json
 fuzz
 .vscode/
 microbench*.txt
+
+# ── APIClient fork: scratch + regenerable artifacts ──────────────────
+# The forced-execution work generates many throwaway fixtures, capture
+# dumps, and rebuildable wasm. None belong in history. The real
+# green-gate fixtures are force-added (git add -f) so they survive the
+# `_*` blanket below — see the "Fork version-control system" section in
+# APIClient/CLAUDE.md.
+#
+# Regenerable build outputs (node engine/build.mjs ...):
+qjs_wasm.*
+qjs_mod.*
+qjs_worker.*
+pre.gen.js
+# Scratch logs / temp / bytecode / backups:
+*.tmp
+*.out
+*.err
+*.bc
+*.bak*
+*.scripts.json
+*.pre.js
+t.tr
+diag.txt
+# Scratch fixtures, probes, and multi-MB site captures (regenerable via
+# `harness dumpscripts`). Blanket — the named gate fixtures are tracked
+# via `git add -f`, which overrides this.
+_*
+# Stray one-offs:
+.t.gh
+vue.js
+jq.js
+jq.out
