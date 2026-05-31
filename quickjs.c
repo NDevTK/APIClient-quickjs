@@ -53387,6 +53387,26 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
         goto exception;
     }
 
+    /* A nested opaque field — JSON.stringify({id: <opaque>}) — must
+       CONCRETIZE to the marker string, not fall into the generic-object
+       branch below (it has our private qjs_opq class_id, so the circular-
+       check / key-enumeration there throws a TypeError; that throw was
+       silently swallowed by the cb-drive, DROPPING the endpoint whose
+       POST body was `JSON.stringify({id:id})` — _hof's /api/detail).
+       JS_JSONStringify already concretizes a WHOLE-arg opaque (infectious
+       return); this is the per-FIELD analogue, so a concrete object with
+       opaque fields serializes to a valid JSON string and the bundle's
+       fetch fires. Emitting the literal marker (not an infectious opaque)
+       is correct here: the per-field SHAPE is captured separately by
+       bodyShape; this string form just has to be valid JSON. */
+    if (qjs_is_opaque(val)) {
+        JS_FreeValue(ctx, val);
+        val = JS_NewString(ctx, "[object Object]");
+        if (JS_IsException(val))
+            goto exception;
+        goto concat_primitive;
+    }
+
     if (JS_IsObject(val)) {
         p = JS_VALUE_GET_OBJ(val);
         cl = p->class_id;
