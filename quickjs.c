@@ -45,7 +45,1771 @@
 #include "cutils.h"
 #include "list.h"
 #include "quickjs.h"
+/* Forward-declared so quickjs-forced.h's qjs_forced_config can reset
+   the per-run path-condition list. The definition is below alongside
+   the symbolic-term shadow. */
+static void qjs_pc_reset(void);
+/* Forward-declared so quickjs-forced.h's qjs_forced_decide_k can SMT-
+   prune infeasible frontier emissions before the driver enqueues an
+   X-Force false-path schedule (KLEE/DART/ExpoSE discipline; X-Force
+   §3 false-path filter). Returns 1 if the flip is SAT under current
+   Φ (or no Z3 / unknown — never lose coverage), 0 only on a confident
+   UNSAT. Definition lives near the Z3 sink-verdict helper. */
+typedef struct qjs_term qjs_term;
+static int qjs_z3_check_flip_sat(qjs_term *flip_term);
+/* Forward-declared so the patched OP_if_* handlers can ask "does this
+   function's bytecode reach a host-edge atom (direct OP_get_var /
+   OP_get_field, or via a closure-literal pushed by OP_fclosure)?"
+   before forcing an opaque branch. Branches in functions with NO
+   such reach can't change what API call fires, so the schedule
+   controller skips them — bounding BFS to the host-edge subgraph
+   at normal-website scale (10K+ minified functions). Definition
+   lives near js_fe_static_sites which shares the host-edge atom set. */
+typedef struct JSFunctionBytecode JSFunctionBytecode;
+static int qjs_host_reach_check(JSContext *ctx, JSFunctionBytecode *b);
+/* Branch-level refinement: "can forward control flow FROM start_pc reach a
+   host-edge site?" Used by the OP_if_* handlers to force ONLY branches
+   whose flipped arm can change which API call fires — the proper answer
+   to "which branches to follow", tighter than the per-function check. */
+static int qjs_host_reach_from(JSContext *ctx, JSFunctionBytecode *b, int start_pc);
+static int qjs_host_reach_net_from(JSContext *ctx, JSFunctionBytecode *b, int start_pc);
+static int qjs_fn_reaches_net(JSFunctionBytecode *b);
+static int qjs_is_sink_atom(JSAtom a);
+/* Directed-drive state — the principled answer to "which branches to
+   follow". When active, the OP_if_* handlers in the TARGET function
+   (qjs_dir_b) fork ONLY value-determining branches (both arms can reach
+   qjs_dir_target, a host-edge site bytecode offset) and FORCE the single
+   reaching arm of every other branch with no schedule frontier. This
+   collapses the schedule space from "every host-reaching branch" (which
+   never terminates on a 7 MB bundle — feature-gates, guard-returns and
+   error arms all reach SOME fetch, so all fork) down to "per-site value
+   spread" (bounded by host-call sites, not branch edges). Set/cleared
+   around each directed JS_Call in js_fe_drive_static; inactive (b NULL /
+   active 0) everywhere else, so top-level forced execution and
+   event-loop-driven handlers keep the exact host-reach gating below —
+   the security and naturally-reached polarity gates are untouched. */
+static JSFunctionBytecode *qjs_dir_b = NULL;
+static int qjs_dir_target = -1;
+static int qjs_dir_active = 0;
+/* "Can forward control flow FROM from_pc reach the SPECIFIC bytecode
+   offset target_pc within b?" — the directed refinement of
+   qjs_host_reach_from (which asks about ANY host edge). Same CFG walk +
+   fmt-decoded jumps + STRICTLY-CONSERVATIVE discipline (undecodable /
+   overflow / with-jump → 1, never force an arm wrongly AWAY from a real
+   target); a call is NOT terminal (control returns and continues), only
+   OP_return/throw end a path. Defined near qjs_host_reach_from. */
+static int qjs_reach_pc(JSContext *ctx, JSFunctionBytecode *b, int from_pc, int target_pc);
+/* Memoised qjs_reach_pc: during a directed drive every opaque OP_if asks
+   "does this arm reach qjs_dir_target?" — the SAME target, O(branches)
+   times. The plain walk is O(bytecode) each, so a large orphan costs
+   O(branches·bytecode) (the GitHub-scale deep-pass cliff). This computes a
+   "reaches target" bitmap ONCE per (b,target) and answers O(1) after. */
+static int qjs_reach_pc_memo(JSContext *ctx, JSFunctionBytecode *b, int from_pc, int target_pc);
+static void qjs_reach_memo_free(JSContext *ctx);
+/* Set b->qjs_h_fired if `a` is a host-edge atom (fetch/XHR/eval/…) — called
+   from the OP_get_var/get_field handlers so the deep residue is "host site
+   never reached", catching entered-but-guard-skipped endpoints. Gated by the
+   caller on !qjs_h_fired (set-once); a no-op until host atoms are interned. */
+static void qjs_mark_h_fired(JSFunctionBytecode *b, JSAtom a);
+#include "quickjs-forced.h"
 #include "libregexp.h"
+#ifdef QJS_HAVE_Z3
+#include "z3.h"
+#endif
+
+/* Forced-exec opaque sentinel: a singleton object marking a host-
+   unknown input. SELECTIVE forcing — only conditions derived from it
+   fork; every concrete branch runs real, so framework init (jQuery)
+   is unaffected. */
+/* TWO opaque provenances (FV8 §precision: a forced/synthetic unknown
+   must not be reported like real attacker input):
+   - TAINT  : host-edge attacker data (responseText/location/cookie/…,
+              via __opaque()). Recorded at security sinks (@S).
+   - SYNTH  : a value invented by forced execution itself — §4.1
+              missing-object recovery, and (later) forced-entry args.
+              Drives branching/coverage IDENTICALLY but is NOT a
+              finding (reporting it as attacker-controlled would be a
+              fabricated vulnerability — a soundness violation).
+   qjs_is_opaque() is true for EITHER flavor, so every existing
+   propagation/forking site (OP_if_*, OP_CMP, OP_get_*, OP_call,
+   js_json_parse, JS_GetIterator) behaves byte-identically — coverage
+   and the jQuery gate are unchanged. Only the taint test split out
+   (qjs_is_taint, used by the JS __isOpaque the @S gate calls) becomes
+   precise. Propagation preserves flavor (qjs_like); when two operands
+   mix, TAINT wins (never lose a real finding — only avoid inventing
+   one from pure synthetic). */
+/* Each opaque value has IDENTITY (a per-instance struct), not a
+   singleton. Identity is for SECURITY checking, not value resolution:
+   API values stay assumed (opaque ⊤ / forked / structural @T) — we
+   want hidden APIs too, so values are never "solved". The identity +
+   `label` (the attacker taint source: location.search, responseText,
+   …) lets a tainted value be tracked source→sink so the @S decision
+   can ask Z3 whether the path is actually satisfiable (REAL EXPLOIT
+   vs TAINT REACH ONLY). `flavor` 0=TAINT 1=SYNTH (provenance-split:
+   synth never a finding). qjs_is_opaque stays true for any instance
+   so all forking/coverage/gate behaviour is unchanged.
+   Allocated with libc malloc/free (a tiny engine-internal struct, not
+   JS-visible memory) and released in the class finalizer — avoids
+   JS-allocator/forward-decl coupling this early in the TU. */
+/* ---- Z3-security symbolic shadow on TAINT opaque ----
+   A TAINT opaque carries the symbolic expression of how it was derived
+   from attacker leaves. The forced OP_if records the path predicate
+   over that term. At a tainted @S sink, Z3 decides whether the
+   accumulated path-condition Φ is satisfiable: SAT ⇒ TAINT REACH on a
+   feasible path (and REAL EXPLOIT if Ψ is exploit-shaped); UNSAT ⇒
+   X-Force forced an *infeasible* branch combination and the @S is a
+   false finding (X-Force's documented false-positive source). NOT
+   value resolution — API values stay assumed/forked/structural.
+   Discipline: terms are PURE SHADOW. They never change a JSValue, a
+   branch decision, or qjs_is_opaque() — the green set stays
+   byte-identical (same superset discipline as provenance-split).
+
+   Design lineage:
+   - DART (Sen et al., FSE'05) and CUTE (Godefroid, ISSTA'05): the
+     concolic discipline — concrete execution + shadow symbolic expr
+     captured per value, path constraint collected at branches.
+   - KLEE (Cadar et al., OSDI'08): SMT-backed path reasoning on
+     real-program traces.
+   - ExpoSE (Loring et al., SPIN'17): concolic for JS specifically,
+     including the string-theory predicates this layer relies on.
+   - The novelty here is *coupling* concolic to X-Force forced
+     execution: X-Force forces past opaque branches without solving
+     (covers hidden code paths, incl. unreachable APIs); Z3 then
+     decides post-hoc whether the security-relevant @S sinks on each
+     forced run sit on a *feasible* combination (REAL_EXPLOIT) or an
+     X-Force false-path artifact (INFEASIBLE — suppress). */
+typedef struct qjs_term qjs_term;
+struct qjs_term {
+    int      ref;        /* refcount: shared, immutable */
+    char     op;         /* 'L' leaf  'K' const-string  'N' const-num
+                            '=' '!' '<' 'l' '>' 'g'    comparisons
+                            'O' opaque-derived (no Z3 structure: free) */
+    int      leaf;       /* op=='L': interned leaf id (Z3 var identity) */
+    char    *s;          /* 'L' label / 'K' literal string */
+    double   n;          /* 'N' literal number */
+    qjs_term *a, *b;     /* comparison children */
+    /* Generated source position (1-based line, col) where the value that
+       produced this term was read into a URL string concat — captured in
+       js_add_slow. Lets __feUrlHoles emit each path-param hole's bundle
+       position so a standard source-map library (background.js) can resolve
+       the declared name (e→owner) via originalPositionFor().name. 0 = unset.
+       Metadata only — never read by the Z3 path (op/leaf/s/a/b). */
+    int      line, col;
+};
+/* Leaf id table. Entries are indexed by id; each row is the source
+   label as a heap-allocated string. Two interning policies coexist:
+   - PERSISTENT (cookie, hash, search, storage, responseText): JS code
+     reading the same source twice within one execution sees the same
+     value, so two LEAFs with the same label INTERN to the same id →
+     same Z3 variable.
+   - EVENT (postMessage.*, handler.*): each opaque mint is a distinct
+     event firing — multi-message PoCs need them to remain distinct
+     Z3 variables. Each call creates a fresh entry in the table. The
+     stored label is the same string for grouping in the @P record;
+     only the id is distinct.
+   Bounded by attacker-source × event-count per run. */
+static char **qjs_leaf_tab; static int qjs_leaf_n, qjs_leaf_cap;
+static int qjs_leaf_append(const char *L) {
+    if (qjs_leaf_n == qjs_leaf_cap) {
+        int nc = qjs_leaf_cap ? qjs_leaf_cap * 2 : 16;
+        char **nt = realloc(qjs_leaf_tab, nc * sizeof *nt);
+        if (!nt) return 0;
+        qjs_leaf_tab = nt; qjs_leaf_cap = nc;
+    }
+    size_t n = strlen(L) + 1; char *d = malloc(n); if (!d) return 0; memcpy(d, L, n);
+    qjs_leaf_tab[qjs_leaf_n] = d;
+    return qjs_leaf_n++;
+}
+static int qjs_leaf_is_event(const char *L) {
+    return L && (!strncmp(L, "postMessage.", 12) || !strncmp(L, "handler.", 8));
+}
+static int qjs_leaf_id(const char *label) {
+    const char *L = (label && label[0]) ? label : "?";
+    if (!qjs_leaf_is_event(L)) {
+        for (int i = 0; i < qjs_leaf_n; i++) if (!strcmp(qjs_leaf_tab[i], L)) return i;
+    }
+    return qjs_leaf_append(L);
+}
+static qjs_term *qjs_t_ref(qjs_term *t) { if (t) t->ref++; return t; }
+static void qjs_t_free(qjs_term *t) {
+    if (!t || --t->ref > 0) return;
+    qjs_t_free(t->a); qjs_t_free(t->b); free(t->s); free(t);
+}
+static qjs_term *qjs_t_alloc(char op) {
+    qjs_term *t = calloc(1, sizeof *t); if (!t) return NULL;
+    t->ref = 1; t->op = op; return t;
+}
+static qjs_term *qjs_t_leaf(const char *label) {
+    qjs_term *t = qjs_t_alloc('L'); if (!t) return NULL;
+    const char *L = (label && label[0]) ? label : "?";
+    size_t n = strlen(L) + 1; t->s = malloc(n); if (t->s) memcpy(t->s, L, n);
+    t->leaf = qjs_leaf_id(L);
+    return t;
+}
+static qjs_term *qjs_t_kstr(const char *v) {
+    qjs_term *t = qjs_t_alloc('K'); if (!t) return NULL;
+    size_t n = strlen(v ? v : "") + 1; t->s = malloc(n); if (t->s) memcpy(t->s, v ? v : "", n);
+    return t;
+}
+static qjs_term *qjs_t_knum(double v) {
+    qjs_term *t = qjs_t_alloc('N'); if (!t) return NULL;
+    t->n = v; return t;
+}
+static qjs_term *qjs_t_opaque(void) { return qjs_t_alloc('O'); }
+static qjs_term *qjs_t_cmp(char op, qjs_term *a, qjs_term *b) {
+    qjs_term *t = qjs_t_alloc(op); if (!t) { qjs_t_free(a); qjs_t_free(b); return NULL; }
+    t->a = a; t->b = b; return t;
+}
+/* Member access term: x.length, x.role, …. `name` is the property
+   atom string. Carried so a sanitizer gate or length CMP becomes a
+   precise Z3 query (str.len, etc.) instead of a free var. */
+static qjs_term *qjs_t_member(const char *name, qjs_term *base) {
+    qjs_term *t = qjs_t_alloc('M'); if (!t) { qjs_t_free(base); return NULL; }
+    if (name) { size_t n = strlen(name) + 1; t->s = malloc(n); if (t->s) memcpy(t->s, name, n); }
+    t->a = base; return t;
+}
+/* Method-call term: x.startsWith(arg), x.indexOf(arg), …. `name` is
+   the method name extracted from the callee's MEMBER term. */
+static qjs_term *qjs_t_call(const char *name, qjs_term *base, qjs_term *arg) {
+    qjs_term *t = qjs_t_alloc('F'); if (!t) { qjs_t_free(base); qjs_t_free(arg); return NULL; }
+    if (name) { size_t n = strlen(name) + 1; t->s = malloc(n); if (t->s) memcpy(t->s, name, n); }
+    t->a = base; t->b = arg; return t;
+}
+
+typedef struct qjs_opq { int flavor; char *label; qjs_term *term; } qjs_opq;
+static JSClassID qjs_opq_cid;
+static JSRuntime *qjs_opq_rt = NULL;   /* runtime the opaque class is registered in */
+static void qjs_opq_fin(JSRuntime *rt, JSValue v) {
+    qjs_opq *o = JS_GetOpaque(v, qjs_opq_cid);
+    if (o) { qjs_t_free(o->term); free(o->label); free(o); }
+}
+static qjs_opq *qjs_opq_of(JSValueConst v) {
+    if (!JS_IsObject(v)) return NULL;
+    return JS_GetOpaque(v, qjs_opq_cid);   /* NULL if class mismatch */
+}
+static int qjs_is_opaque(JSValueConst v) { return qjs_opq_of(v) != NULL; }
+static int qjs_is_taint(JSValueConst v) { qjs_opq *o = qjs_opq_of(v); return o && o->flavor == 0; }
+static int qjs_is_synth(JSValueConst v) { qjs_opq *o = qjs_opq_of(v); return o && o->flavor == 1; }
+/* `term` is consumed (one ref); pass NULL for synth or unstructured. */
+static JSValue qjs_opq_make(JSContext *ctx, int flavor, const char *label, qjs_term *term) {
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    /* The class ID is process-global (QuickJS-ng allocates ids globally), but
+       JS_NewClass + JS_SetClassProto register the class IN A RUNTIME and must
+       run once PER runtime. The wasm instance reuses memory across callMain,
+       each a fresh JS_NewRuntime; guarding only on `!qjs_opq_cid` skipped
+       registration in every run after the first, so opaque objects there had
+       no registered class — qjs_is_opaque() returned NULL for them, forced
+       execution stopped forking, and host calls collapsed (github 59→7 on the
+       2nd schedule). Re-register whenever the runtime changes. */
+    if (!qjs_opq_cid) JS_NewClassID(rt, &qjs_opq_cid);
+    if (qjs_opq_rt != rt) {
+        JSClassDef d; memset(&d, 0, sizeof d);
+        d.class_name = "OpaqueV"; d.finalizer = qjs_opq_fin;
+        JS_NewClass(rt, qjs_opq_cid, &d);
+        /* Class proto = Object.prototype so String(opaque)/concat
+           yields "[object Object]" exactly like the old JS_NewObject
+           sentinel — the @S concat-taint marker depends on it. */
+        JSValue pl = JS_NewObject(ctx);
+        JS_SetClassProto(ctx, qjs_opq_cid, JS_GetPrototype(ctx, pl));
+        JS_FreeValue(ctx, pl);
+        qjs_opq_rt = rt;
+    }
+    JSValue v = JS_NewObjectClass(ctx, qjs_opq_cid);
+    if (JS_IsException(v)) { qjs_t_free(term); return v; }
+    qjs_opq *o = calloc(1, sizeof(*o));
+    if (!o) { qjs_t_free(term); JS_FreeValue(ctx, v); return JS_ThrowOutOfMemory(ctx); }
+    o->flavor = flavor;
+    if (label && label[0]) { o->label = malloc(strlen(label) + 1); if (o->label) strcpy(o->label, label); }
+    o->term = term;
+    JS_SetOpaque(v, o);
+    return v;
+}
+static JSValue qjs_opaque_new(JSContext *ctx) { return qjs_opq_make(ctx, 0, NULL, qjs_t_opaque()); }
+static JSValue qjs_synth_new(JSContext *ctx) { return qjs_opq_make(ctx, 1, NULL, NULL); }
+/* qjs_fe_named_arg defined after the JSFunctionBytecode struct (it reads
+   b->vardefs); forward-declared here so the qjs_opq helpers stay together. */
+static JSValue qjs_fe_named_arg(JSContext *ctx, struct JSFunctionBytecode *b, int ai, const char *fallback);
+/* fwd (defined near qjs_deep_step_c): the deep-grind residue array + the
+   in-grind closure-instance capture. js_closure2 calls the capture so a cold-
+   module nested fn (an aliased-fetch endpoint in a never-required webpack
+   chunk) is driven with its REAL closure when its factory orphan is driven. */
+static struct JSFunctionBytecode **qjs_deep_rb;
+static void qjs_deep_capture_inst(JSContext *ctx, struct JSFunctionBytecode *b, JSValue func_obj);
+/* flavor + taint-source label + symbolic term propagate through
+   derivation so a value reaching a sink names which attacker input it
+   came from and how. qjs_like is pass-through (member-get / generic
+   call / json — the term is whatever the base was). */
+static JSValue qjs_like(JSContext *ctx, JSValueConst a) {
+    qjs_opq *o = qjs_opq_of(a);
+    return qjs_opq_make(ctx, o ? o->flavor : 0, o ? o->label : NULL,
+                        o ? qjs_t_ref(o->term) : qjs_t_opaque());
+}
+static JSValue qjs_like2(JSContext *ctx, JSValueConst a, JSValueConst b) {
+    qjs_opq *ta = qjs_is_taint(a) ? qjs_opq_of(a) : NULL;
+    qjs_opq *tb = qjs_is_taint(b) ? qjs_opq_of(b) : NULL;
+    qjs_opq *t = ta ? ta : tb;
+    /* generic 2-op merge (e.g. OP_call argv pair propagation): no
+       structural CMP node — use the taint operand's term as-is. */
+    qjs_term *st = NULL;
+    if (t && t->term) st = qjs_t_ref(t->term);
+    else if (qjs_opq_of(a) && qjs_opq_of(a)->term) st = qjs_t_ref(qjs_opq_of(a)->term);
+    else if (qjs_opq_of(b) && qjs_opq_of(b)->term) st = qjs_t_ref(qjs_opq_of(b)->term);
+    return qjs_opq_make(ctx, t ? 0 : 1, t ? t->label : NULL, st);
+}
+/* OP_CMP-specific 2-op merge that builds a CMP term node — the path
+   predicate at the subsequent forced OP_if depends on it. `opstr` is
+   `#binary_op` from the OP_CMP macro (e.g. "==", "<=", "!="). The
+   concrete operand becomes a CONST term so Z3 can solve the gate. */
+static char qjs_cmp_opchar(const char *opstr) {
+    if (!opstr) return '=';
+    if (opstr[0] == '<' && opstr[1] == '=') return 'l';
+    if (opstr[0] == '>' && opstr[1] == '=') return 'g';
+    if (opstr[0] == '!') return '!';
+    if (opstr[0] == '<') return '<';
+    if (opstr[0] == '>') return '>';
+    return '=';                              /* == and === both '=' */
+}
+static qjs_term *qjs_t_of_val(JSContext *ctx, JSValueConst v) {
+    if (qjs_is_opaque(v)) return qjs_t_ref(qjs_opq_of(v)->term);
+    if (JS_IsString(v)) {
+        const char *s = JS_ToCString(ctx, v);
+        qjs_term *t = qjs_t_kstr(s ? s : "");
+        if (s) JS_FreeCString(ctx, s);
+        return t;
+    }
+    if (JS_IsNumber(v)) {
+        double d; if (JS_ToFloat64(ctx, &d, v)) d = 0;
+        return qjs_t_knum(d);
+    }
+    if (JS_IsBool(v)) return qjs_t_knum(JS_ToBool(ctx, v) ? 1.0 : 0.0);
+    return qjs_t_opaque();                   /* unknown concrete: free var */
+}
+static JSValue qjs_cmp_term(JSContext *ctx, JSValueConst a, JSValueConst b, const char *opstr) {
+    qjs_opq *ta = qjs_is_taint(a) ? qjs_opq_of(a) : NULL;
+    qjs_opq *tb = qjs_is_taint(b) ? qjs_opq_of(b) : NULL;
+    qjs_opq *t = ta ? ta : tb;
+    qjs_term *cmp = qjs_t_cmp(qjs_cmp_opchar(opstr), qjs_t_of_val(ctx, a), qjs_t_of_val(ctx, b));
+    return qjs_opq_make(ctx, t ? 0 : 1, t ? t->label : NULL, cmp);
+}
+/* OP_inc/OP_dec/OP_post_inc/OP_post_dec/OP_inc_loc/OP_dec_loc on an opaque:
+   the result STAYS opaque — arithmetic is opaque-infectious, exactly like
+   OP_CMP and get_field. Without this the unary slow path runs ToNumber on the
+   sentinel → NaN, and `NaN >= x` / `NaN < x` are CONCRETE false, so a loop
+   over an opaque counter (`for(;;){if(++n>=r)break; …}` — markdown-it's
+   autolink rule r6 driven with an opaque parser state) degrades into a
+   CONCRETE infinite loop that the forced-execution loop-revisit fixpoint can
+   NEVER terminate (it fires only on OPAQUE branches; with a concrete predicate
+   the branch is never forced, the seen-set stays empty, and the orphan drive
+   hangs the whole priority frontier — verified live on learn.microsoft.com).
+   Carries an `n op 1` term so a tainted counter keeps its symbolic shadow. */
+static JSValue qjs_unary_step(JSContext *ctx, JSValueConst v, char op) {
+    qjs_opq *o = qjs_opq_of(v);
+    qjs_term *t = qjs_t_cmp(op, qjs_t_of_val(ctx, v), qjs_t_knum(1));
+    return qjs_opq_make(ctx, o ? o->flavor : 1, o ? o->label : NULL, t);
+}
+/* Result of a unary op (neg / bitwise ~ / unary + / typeof) on an opaque STAYS
+   opaque — coercion is opaque-infectious, completing the set OP_CMP/OP_add/
+   get_field already enforce. Without it, ToNumber/typeof collapses the sentinel
+   to a CONCRETE value (NaN / "object"), so a loop gated by `-n<0`, `~flags`, or
+   `typeof x==="undefined"` over an opaque is a concrete infinite loop the
+   forced-exec fixpoint can never see. Carries the operand's term + taint
+   flavor/label (the unary transform is approximated as identity on the symbolic
+   shadow — sound for termination; precise per-op terms matter only to the Z3
+   security path, unaffected for these ops). */
+static JSValue qjs_opaque_unary(JSContext *ctx, JSValueConst v) {
+    qjs_opq *o = qjs_opq_of(v);
+    qjs_term *t = (o && o->term) ? qjs_t_ref(o->term) : qjs_t_opaque();
+    return qjs_opq_make(ctx, o ? o->flavor : 1, o ? o->label : NULL, t);
+}
+/* OP_get_field on opaque: build a MEMBER term carrying the property
+   name. So `x.length` later in a numeric CMP solves as str.len(x),
+   and `x.startsWith` carries the method-name forward into the call. */
+static JSValue qjs_member(JSContext *ctx, JSValueConst base, JSAtom atom) {
+    qjs_opq *o = qjs_opq_of(base);
+    qjs_term *bt = (o && o->term) ? qjs_t_ref(o->term) : qjs_t_opaque();
+    const char *name = JS_AtomToCString(ctx, atom);
+    qjs_term *mt = qjs_t_member(name ? name : "?", bt);
+    if (name) JS_FreeCString(ctx, name);
+    return qjs_opq_make(ctx, o ? o->flavor : 0, o ? o->label : NULL, mt);
+}
+/* OP_get_array_el on opaque: obj[k] where k is dynamic. Build a
+   MEMBER term using k's string form as the name. If k is itself
+   opaque, the name is "?" — sound; the Z3 query falls through to
+   a fresh free var for that member. */
+static JSValue qjs_member_dyn(JSContext *ctx, JSValueConst base, JSValueConst key) {
+    qjs_opq *o = qjs_opq_of(base);
+    qjs_term *bt = (o && o->term) ? qjs_t_ref(o->term) : qjs_t_opaque();
+    const char *name = NULL; char buf[32];
+    if (JS_IsString(key)) name = JS_ToCString(ctx, key);
+    else if (JS_IsNumber(key)) { double d; if (!JS_ToFloat64(ctx, &d, key)) { snprintf(buf, sizeof buf, "%g", d); name = buf; } }
+    else if (JS_IsSymbol(key)) { JSAtom a = JS_ValueToAtom(ctx, key); if (a != JS_ATOM_NULL) { name = JS_AtomToCString(ctx, a); JS_FreeAtom(ctx, a); } }   /* private-field key #x: keep the slot name */
+    qjs_term *mt = qjs_t_member(name && name[0] ? name : "?", bt);
+    if (name && name != buf) JS_FreeCString(ctx, name);
+    return qjs_opq_make(ctx, o ? o->flavor : 0, o ? o->label : NULL, mt);
+}
+/* OP_call_method on opaque: build a CALL term. The callee carries a
+   MEMBER term from the prior OP_get_field2; its `s` is the method
+   name. Receiver term + first arg term become the CALL's children. */
+static JSValue qjs_call(JSContext *ctx, JSValueConst recv, JSValueConst meth,
+                       int argc, JSValueConst *argv) {
+    qjs_opq *or_ = qjs_opq_of(recv);
+    qjs_opq *om_ = qjs_opq_of(meth);
+    const char *name = NULL;
+    if (om_ && om_->term && om_->term->op == 'M') name = om_->term->s;
+    qjs_term *bt = (or_ && or_->term) ? qjs_t_ref(or_->term) : qjs_t_opaque();
+    qjs_term *at = (argc > 0) ? qjs_t_of_val(ctx, argv[0]) : qjs_t_opaque();
+    qjs_term *ct = qjs_t_call(name ? name : "?", bt, at);
+    qjs_opq *t = (or_ && or_->flavor == 0) ? or_ : ((om_ && om_->flavor == 0) ? om_ : NULL);
+    return qjs_opq_make(ctx, t ? 0 : 1, t ? t->label : NULL, ct);
+}
+
+/* Path condition Φ: list of (term, decision) pushed at every forced
+   OP_if whose operand was TAINT. Decision=1 ⇒ assert term; 0 ⇒ ¬term.
+   Reset per forced run (qjs_forced_config). Process-global because
+   the host spawns a fresh QuickJS instance per schedule. */
+static qjs_term **qjs_pc_t; static int *qjs_pc_d;
+static int qjs_pc_n, qjs_pc_cap;
+static void qjs_pc_reset(void) {
+    for (int i = 0; i < qjs_pc_n; i++) qjs_t_free(qjs_pc_t[i]);
+    qjs_pc_n = 0;
+}
+/* X-Force schedule invariant: ONE forced decision per opaque VALUE,
+   not per bytecode position. The bytecode pattern for `if (A || B)`
+   emits TWO OP_if branches that both consult the SAME opaque on the
+   JS stack: (1) the OR short-circuit JUMP_IF_TRUE on A; (2) the
+   outer IF's JUMP_IF_TRUE on the OR-result (which IS A when A short-
+   circuited). The patched OP_if reads `qjs_opq_of(op1)->term` and
+   op1 is the IDENTICAL JSValue across both ops — so the term-pointer
+   is identical too. The invariant is: a value can be truthy or
+   falsy ONCE per execution; multiple bytecode tests on it must all
+   agree. Enforced at both ends of the decision path:
+   - `qjs_pc_lookup(t)`: at OP_if entry, if t is already in Φ, the
+     decision is pinned (no schedule cursor advance, no F-frontier).
+   - `qjs_pc_push(t, dec)`: at Φ-push, dedup by t — never two entries
+     for the same value (would let Z3 see `1:p, 0:p` = INFEASIBLE).
+   Mathematically equivalent to a bytecode peephole that removes the
+   redundant OP_if; this enforces the invariant at the consume point
+   instead, with no IR changes. */
+static int qjs_pc_lookup(qjs_term *t) {
+    if (!t) return -1;
+    for (int i = 0; i < qjs_pc_n; i++) if (qjs_pc_t[i] == t) return qjs_pc_d[i];
+    return -1;
+}
+static void qjs_pc_push(qjs_term *t, int dec) {
+    if (!t) return;
+    for (int i = 0; i < qjs_pc_n; i++) {
+        if (qjs_pc_t[i] == t) return;
+    }
+    if (qjs_pc_n == qjs_pc_cap) {
+        int nc = qjs_pc_cap ? qjs_pc_cap * 2 : 16;
+        qjs_term **nt = realloc(qjs_pc_t, nc * sizeof *nt);
+        int *nd = realloc(qjs_pc_d, nc * sizeof *nd);
+        if (!nt || !nd) { free(nt); free(nd); return; }
+        qjs_pc_t = nt; qjs_pc_d = nd; qjs_pc_cap = nc;
+    }
+    qjs_pc_t[qjs_pc_n] = qjs_t_ref(t); qjs_pc_d[qjs_pc_n] = dec; qjs_pc_n++;
+}
+
+/* Term serializer (Lisp-y; small, deterministic, easy to ingest).
+   Leaf: $L:label. Const: "lit" / num. Cmp: (op a b). Free var: ?.
+   Growable byte-buffer (caller frees via qjs_sb_free). */
+typedef struct { char *p; size_t n, cap; } qjs_sb;
+static void qjs_sb_putc(qjs_sb *b, int c) {
+    if (b->n + 1 >= b->cap) {
+        size_t nc = b->cap ? b->cap * 2 : 64;
+        char *np = realloc(b->p, nc); if (!np) return; b->p = np; b->cap = nc;
+    }
+    b->p[b->n++] = (char)c;
+}
+static void qjs_sb_puts(qjs_sb *b, const char *s) { while (s && *s) qjs_sb_putc(b, *s++); }
+static void qjs_sb_printf(qjs_sb *b, const char *fmt, ...) {
+    char small[64]; va_list ap; va_start(ap, fmt);
+    int n = vsnprintf(small, sizeof small, fmt, ap); va_end(ap);
+    if (n < 0) return;
+    if ((size_t)n < sizeof small) { qjs_sb_puts(b, small); return; }
+    char *big = malloc((size_t)n + 1); if (!big) return;
+    va_start(ap, fmt); vsnprintf(big, (size_t)n + 1, fmt, ap); va_end(ap);
+    qjs_sb_puts(b, big); free(big);
+}
+static void qjs_sb_term0(qjs_sb *b, qjs_term *t) {
+    if (!t) { qjs_sb_putc(b, '?'); return; }
+    switch (t->op) {
+    case 'L': qjs_sb_printf(b, "$%d:%s", t->leaf, t->s ? t->s : "?"); return;
+    case 'K':
+        qjs_sb_putc(b, '"');
+        for (const char *p = t->s ? t->s : ""; *p; p++) {
+            if (*p == '"' || *p == '\\') qjs_sb_putc(b, '\\');
+            qjs_sb_putc(b, (unsigned char)*p);
+        }
+        qjs_sb_putc(b, '"');
+        return;
+    case 'N': qjs_sb_printf(b, "%g", t->n); return;
+    case 'O': qjs_sb_putc(b, '?'); return;
+    case 'M':                          /* MEMBER: (. base "name") */
+        qjs_sb_puts(b, "(. ");
+        qjs_sb_term0(b, t->a);
+        qjs_sb_printf(b, " \"%s\")", t->s ? t->s : "?");
+        return;
+    case 'F':                          /* CALL: (name base arg) */
+        qjs_sb_putc(b, '(');
+        qjs_sb_puts(b, t->s ? t->s : "?"); qjs_sb_putc(b, ' ');
+        qjs_sb_term0(b, t->a); qjs_sb_putc(b, ' '); qjs_sb_term0(b, t->b);
+        qjs_sb_putc(b, ')');
+        return;
+    case 'U':                          /* UNARY NOT: (! base) */
+        qjs_sb_puts(b, "(! ");
+        qjs_sb_term0(b, t->a);
+        qjs_sb_putc(b, ')');
+        return;
+    default:
+        qjs_sb_putc(b, '('); qjs_sb_putc(b, t->op); qjs_sb_putc(b, ' ');
+        qjs_sb_term0(b, t->a); qjs_sb_putc(b, ' '); qjs_sb_term0(b, t->b);
+        qjs_sb_putc(b, ')');
+        return;
+    }
+}
+static void qjs_sb_pc(qjs_sb *b) {
+    qjs_sb_putc(b, '[');
+    for (int i = 0; i < qjs_pc_n; i++) {
+        if (i) qjs_sb_putc(b, ',');
+        qjs_sb_printf(b, "%d:", qjs_pc_d[i]);
+        qjs_sb_term0(b, qjs_pc_t[i]);
+    }
+    qjs_sb_putc(b, ']');
+}
+static void qjs_sb_free(qjs_sb *b) { free(b->p); b->p = NULL; b->n = b->cap = 0; }
+
+/* ---- Z3 SMT solver for @S security path-satisfiability (NOT value
+   resolution — API values stay assumed/forked/structural). For each
+   tainted @S, ask Z3 whether the source→sink path is feasible under
+   the accumulated Φ AND whether Ψ can take an exploit-shaped value:
+     UNSAT(Φ)           → INFEASIBLE  (X-Force forced a path the gates
+                                       reject; suppress the @S — false)
+     SAT(Φ) ∧ UNSAT(es) → TAINT_REACH (path reachable but exploit
+                                       value blocked by gates)
+     SAT(Φ) ∧ SAT(es)   → REAL_EXPLOIT + witness model
+   Leaves are String-sorted; numeric CMP wraps the leaf with
+   str.to.int. Exploit-shape per sink family. All AST is built fresh
+   per solve (cheap; @S frequency is low; correctness first). */
+#ifdef QJS_HAVE_Z3
+typedef struct { int leaf; Z3_ast var; } qjs_z3_leaf;
+/* Structured-field registry: a MEMBER term rooted at a LEAF gets a
+   fresh Z3 var (one per distinct term-pointer), and we remember the
+   root leaf id + dot-joined key path. The PoC emitter walks this so
+   `event.data.type == "init" ∧ event.data.html contains "<svg…>"`
+   becomes a structured postMessage payload `{type:"init", html:"<svg…>"}`
+   — the form a real attacker would send. Without this, only the
+   parent LEAF's value would land in the PoC and the nested-field
+   payload would be lost. */
+typedef struct { qjs_term *term; Z3_ast var; int leaf_root; char *path; } qjs_z3_mem;
+typedef struct {
+    Z3_context c; Z3_solver s;
+    Z3_sort str_sort, int_sort;
+    qjs_z3_leaf *leaves; int n, cap;
+    qjs_z3_mem  *members; int n_mem, cap_mem;
+    /* Set when the psi→Z3 translation used an UNSOUND over-approximation that
+       could turn a non-exploitable flow into a satisfiable one — a fresh free
+       var for an unmodeled transform (the value is disconnected from the real
+       attacker leaf), or replace()≈base (a sanitizing replace would block the
+       payload but we model it as identity). When set, a SAT exploit is NOT a
+       proven PoC: the verdict must NOT be REAL_EXPLOIT (the "PoC" badge would be
+       a lie). Invertible (de/en)coders + slice are SOUND (attacker controls the
+       pre-image) and do NOT set this. */
+    int overapprox;
+} qjs_z3_ctx;
+
+static Z3_ast qjs_z3_leaf_var(qjs_z3_ctx *zc, int leaf) {
+    for (int i = 0; i < zc->n; i++) if (zc->leaves[i].leaf == leaf) return zc->leaves[i].var;
+    if (zc->n == zc->cap) {
+        int nc = zc->cap ? zc->cap * 2 : 8;
+        qjs_z3_leaf *nl = realloc(zc->leaves, nc * sizeof *nl);
+        if (!nl) return Z3_mk_string(zc->c, "");
+        zc->leaves = nl; zc->cap = nc;
+    }
+    char name[32]; snprintf(name, sizeof name, "s%d", leaf);
+    Z3_symbol sym = Z3_mk_string_symbol(zc->c, name);
+    Z3_ast v = Z3_mk_const(zc->c, sym, zc->str_sort);
+    zc->leaves[zc->n].leaf = leaf;
+    zc->leaves[zc->n].var = v;
+    return zc->leaves[zc->n++].var;
+}
+/* Walk a MEMBER chain back to its root LEAF, building the dot-joined
+   key path. Returns the root LEAF id (and writes the path into the
+   given buffer) or -1 if the chain bottoms out at something other
+   than a LEAF (e.g. an 'O' opaque-derived or a CALL result). Stack-
+   bounded; deeper-than-32-member chains fall back to opaque. */
+static int qjs_mem_root_leaf(qjs_term *t, char *out_path, size_t cap) {
+    if (!t || !out_path || cap == 0) return -1;
+    out_path[0] = 0;
+    qjs_term *stack[32]; int sp = 0;
+    qjs_term *cur = t;
+    while (cur && cur->op == 'M' && sp < 32) { stack[sp++] = cur; cur = cur->a; }
+    if (!cur || cur->op != 'L') return -1;
+    int leaf_id = cur->leaf;
+    size_t off = 0;
+    for (int i = sp - 1; i >= 0; i--) {
+        qjs_term *mt = stack[i];
+        const char *k = mt->s ? mt->s : "?";
+        size_t kl = strlen(k);
+        if (off > 0 && off + 1 < cap) { out_path[off++] = '.'; out_path[off] = 0; }
+        if (off + kl < cap) { memcpy(out_path + off, k, kl); off += kl; out_path[off] = 0; }
+        else break;
+    }
+    return leaf_id;
+}
+/* Register a MEMBER term in the context's members[] (interned by term
+   pointer — same JS expression yields the same Z3 var). Returns the
+   fresh string-sort var the term translates to. ALSO ensures the
+   root LEAF is in zc->leaves[] so the @P emitter — which walks the
+   leaves[] table — finds it as the parent of these members. Without
+   this, MEMBER-only access patterns (`e.data.type`, no direct read
+   of `e.data`) would leave the leaf invisible to the PoC emitter
+   and `steps:[]` would be empty even when fields are populated. */
+static Z3_ast qjs_z3_mem_var(qjs_z3_ctx *zc, qjs_term *t) {
+    for (int i = 0; i < zc->n_mem; i++) if (zc->members[i].term == t) return zc->members[i].var;
+    char path[256] = {0};
+    int leaf_root = qjs_mem_root_leaf(t, path, sizeof path);
+    if (leaf_root >= 0) (void)qjs_z3_leaf_var(zc, leaf_root); /* anchor for @P */
+    if (zc->n_mem == zc->cap_mem) {
+        int nc = zc->cap_mem ? zc->cap_mem * 2 : 8;
+        qjs_z3_mem *nm = realloc(zc->members, nc * sizeof *nm);
+        if (!nm) { char nm2[32]; snprintf(nm2, sizeof nm2, "m%p", (void *)t);
+                   return Z3_mk_const(zc->c, Z3_mk_string_symbol(zc->c, nm2), zc->str_sort); }
+        zc->members = nm; zc->cap_mem = nc;
+    }
+    char vname[64];
+    if (leaf_root >= 0) snprintf(vname, sizeof vname, "m_%d_%s", leaf_root, path);
+    else                snprintf(vname, sizeof vname, "m%p", (void *)t);
+    Z3_ast v = Z3_mk_const(zc->c, Z3_mk_string_symbol(zc->c, vname), zc->str_sort);
+    qjs_z3_mem *e = &zc->members[zc->n_mem++];
+    e->term = t; e->var = v; e->leaf_root = leaf_root;
+    size_t pl = strlen(path);
+    e->path = malloc(pl + 1); if (e->path) memcpy(e->path, path, pl + 1);
+    return v;
+}
+static Z3_ast qjs_z3_str(qjs_term *side, qjs_z3_ctx *zc);
+static Z3_ast qjs_z3_side(qjs_term *side, qjs_z3_ctx *zc, int numeric) {
+    if (!side) return numeric ? Z3_mk_int(zc->c, 0, zc->int_sort) : Z3_mk_string(zc->c, "");
+    if (numeric) {
+        if (side->op == 'N') {
+            char buf[64]; snprintf(buf, sizeof buf, "%lld", (long long)side->n);
+            return Z3_mk_numeral(zc->c, buf, zc->int_sort);
+        }
+        if (side->op == 'L') return Z3_mk_str_to_int(zc->c, qjs_z3_leaf_var(zc, side->leaf));
+        if (side->op == 'K') {
+            long long v = strtoll(side->s ? side->s : "0", NULL, 10);
+            char buf[64]; snprintf(buf, sizeof buf, "%lld", v);
+            return Z3_mk_numeral(zc->c, buf, zc->int_sort);
+        }
+        if (side->op == 'M') {
+            /* .length in numeric context → str.len(base). Other member
+               names: free Int var (we don't know the semantics). */
+            if (side->s && !strcmp(side->s, "length"))
+                return Z3_mk_seq_length(zc->c, qjs_z3_str(side->a, zc));
+            char name[64]; snprintf(name, sizeof name, "m%p", (void *)side);
+            return Z3_mk_const(zc->c, Z3_mk_string_symbol(zc->c, name), zc->int_sort);
+        }
+        if (side->op == 'F' && side->s) {
+            /* indexOf returns Int; map to str.indexof(base, arg, 0). */
+            if (!strcmp(side->s, "indexOf"))
+                return Z3_mk_seq_index(zc->c, qjs_z3_str(side->a, zc),
+                                       qjs_z3_str(side->b, zc),
+                                       Z3_mk_int(zc->c, 0, zc->int_sort));
+        }
+        return Z3_mk_int(zc->c, 0, zc->int_sort);
+    }
+    return qjs_z3_str(side, zc);
+}
+/* Build a Z3 String-sort AST for a term that is used AS a string
+   value (Ψ at sink, receiver of a method, the right side of `===`). */
+static Z3_ast qjs_z3_str(qjs_term *side, qjs_z3_ctx *zc) {
+    if (!side) return Z3_mk_string(zc->c, "");
+    if (side->op == 'L') return qjs_z3_leaf_var(zc, side->leaf);
+    if (side->op == 'K') return Z3_mk_string(zc->c, side->s ? side->s : "");
+    if (side->op == 'N') {
+        char buf[64]; snprintf(buf, sizeof buf, "%g", side->n);
+        return Z3_mk_string(zc->c, buf);
+    }
+    if (side->op == 'M') {
+        /* member access producing a string. Registered with the leaf-
+           root + path so the PoC emitter can recombine into a
+           structured payload object (essential for postMessage
+           handlers reading e.data.type, e.data.payload, …). */
+        return qjs_z3_mem_var(zc, side);
+    }
+    if (side->op == 'F' && side->s) {
+        /* String-returning methods we can model precisely. */
+        if (!strcmp(side->s, "toLowerCase") || !strcmp(side->s, "toUpperCase") ||
+            !strcmp(side->s, "trim") || !strcmp(side->s, "trimStart") ||
+            !strcmp(side->s, "trimEnd"))
+            return qjs_z3_str(side->a, zc);   /* identity over-approx */
+        if (!strcmp(side->s, "slice") || !strcmp(side->s, "substring") ||
+            !strcmp(side->s, "substr"))
+            return qjs_z3_str(side->a, zc);   /* substring relation: any prefix/sub */
+        if (!strcmp(side->s, "concat"))
+            return Z3_mk_seq_concat(zc->c, 2, (Z3_ast[]){ qjs_z3_str(side->a, zc), qjs_z3_str(side->b, zc) });
+        if (!strcmp(side->s, "replace") || !strcmp(side->s, "replaceAll")) {
+            /* replace ≈ base is UNSOUND for exploitability: a SANITIZING replace
+               (e.g. /</g→"") would block the payload, but we model it as identity.
+               So a SAT exploit through a replace is NOT a proven PoC. */
+            zc->overapprox = 1;
+            return qjs_z3_str(side->a, zc);
+        }
+        /* Invertible (de/en)coders — IDENTITY over-approx. Sound for exploit
+           FEASIBILITY (the attacker controls the pre-transform input, so the
+           post-transform string can be any target value), and — critically —
+           recursing REGISTERS the inner leaf so qjs_z3_emit_poc emits a PoC step
+           for the real source (location.hash etc.). Without this, a sink wrapped
+           in decodeURIComponent (the COMMON reflected-XSS shape) solves to a
+           fresh var with no leaf → empty @P → the PoC builder falls back to a
+           template instead of the Z3-solved value. The extension's decoder chain
+           pre-encodes the solved value back through the transform. */
+        if (!strcmp(side->s, "decodeURIComponent") || !strcmp(side->s, "decodeURI") ||
+            !strcmp(side->s, "encodeURIComponent") || !strcmp(side->s, "encodeURI") ||
+            !strcmp(side->s, "escape") || !strcmp(side->s, "unescape") ||
+            !strcmp(side->s, "atob") || !strcmp(side->s, "btoa") ||
+            !strcmp(side->s, "normalize") || !strcmp(side->s, "toString") ||
+            !strcmp(side->s, "valueOf") || !strcmp(side->s, "decode") || !strcmp(side->s, "encode"))
+            return qjs_z3_str(side->a, zc);
+    }
+    /* 'O' or unknown CALL/CMP-result: fresh free string. This DISCONNECTS the
+       value from the real attacker leaf, so any exploit SAT here is unsound —
+       mark it so the verdict is not declared a proven PoC. */
+    zc->overapprox = 1;
+    char name[64]; snprintf(name, sizeof name, "t%p", (void *)side);
+    return Z3_mk_const(zc->c, Z3_mk_string_symbol(zc->c, name), zc->str_sort);
+}
+static Z3_ast qjs_z3_pred(qjs_term *t, qjs_z3_ctx *zc) {
+    if (!t) return Z3_mk_true(zc->c);
+    if (t->op == '=' || t->op == '!') {
+        /* JS '===' between a leaf and a const: leaf is a string
+           (responseText/…/hash), the const is a string literal in the
+           common XSS-gate shape. For the security feasibility filter,
+           string equality is the sound under-approximation. */
+        Z3_ast la = qjs_z3_side(t->a, zc, 0);
+        Z3_ast lb = qjs_z3_side(t->b, zc, 0);
+        Z3_ast eq = Z3_mk_eq(zc->c, la, lb);
+        return t->op == '!' ? Z3_mk_not(zc->c, eq) : eq;
+    }
+    if (t->op == '<' || t->op == 'l' || t->op == '>' || t->op == 'g') {
+        Z3_ast la = qjs_z3_side(t->a, zc, 1);
+        Z3_ast lb = qjs_z3_side(t->b, zc, 1);
+        switch (t->op) {
+        case '<': return Z3_mk_lt(zc->c, la, lb);
+        case 'l': return Z3_mk_le(zc->c, la, lb);
+        case '>': return Z3_mk_gt(zc->c, la, lb);
+        case 'g': return Z3_mk_ge(zc->c, la, lb);
+        }
+    }
+    if (t->op == 'L') {
+        Z3_ast v = qjs_z3_leaf_var(zc, t->leaf);
+        Z3_ast empty = Z3_mk_string(zc->c, "");
+        return Z3_mk_not(zc->c, Z3_mk_eq(zc->c, v, empty));
+    }
+    if (t->op == 'F' && t->s) {
+        /* Boolean-returning string methods used directly as predicates
+           — sanitizer gates the Z3 solve needs precise. */
+        if (!strcmp(t->s, "startsWith"))
+            return Z3_mk_seq_prefix(zc->c, qjs_z3_str(t->b, zc), qjs_z3_str(t->a, zc));
+        if (!strcmp(t->s, "endsWith"))
+            return Z3_mk_seq_suffix(zc->c, qjs_z3_str(t->b, zc), qjs_z3_str(t->a, zc));
+        if (!strcmp(t->s, "includes"))
+            return Z3_mk_seq_contains(zc->c, qjs_z3_str(t->a, zc), qjs_z3_str(t->b, zc));
+        if (!strcmp(t->s, "test")) {
+            /* RegExp.prototype.test on a string — we don't model the
+               regex pattern; treat the predicate as a free Bool. */
+            char name[64]; snprintf(name, sizeof name, "re%p", (void *)t);
+            return Z3_mk_const(zc->c, Z3_mk_string_symbol(zc->c, name), Z3_mk_bool_sort(zc->c));
+        }
+    }
+    if (t->op == 'M') {
+        /* MEMBER used as truthy predicate. `.length > 0` for the length
+           accessor; otherwise the natural JS truthy = non-empty-string
+           formulation `v != ""`, identical to the LEAF case above. The
+           qjs_z3_mem_var call registers the member in zc->members so
+           the @P emit walk finds its model value. */
+        if (t->s && !strcmp(t->s, "length"))
+            return Z3_mk_gt(zc->c, Z3_mk_seq_length(zc->c, qjs_z3_str(t->a, zc)),
+                            Z3_mk_int(zc->c, 0, zc->int_sort));
+        Z3_ast v = qjs_z3_mem_var(zc, t);
+        Z3_ast empty = Z3_mk_string(zc->c, "");
+        return Z3_mk_not(zc->c, Z3_mk_eq(zc->c, v, empty));
+    }
+    if (t->op == 'U') {
+        /* Unary NOT of a predicate: recurse + Z3_mk_not. So `!s.includes(p)`
+           reaches Z3 as `not(seq.contains s p)`. */
+        return Z3_mk_not(zc->c, qjs_z3_pred(t->a, zc));
+    }
+    return Z3_mk_true(zc->c);
+}
+static const char *qjs_z3_family(const char *sinkType) {
+    if (!sinkType) return NULL;
+    if (!strcmp(sinkType,"innerHTML") || !strcmp(sinkType,"outerHTML") ||
+        !strcmp(sinkType,"insertAdjacentHTML") || !strcmp(sinkType,"document.write") ||
+        !strcmp(sinkType,"setAttribute"))
+        return "html";
+    if (!strcmp(sinkType,"href") || !strcmp(sinkType,"src") ||
+        !strcmp(sinkType,"location.href") || !strcmp(sinkType,"location.assign") ||
+        !strcmp(sinkType,"location.replace") || !strcmp(sinkType,"location") ||
+        !strcmp(sinkType,"location.search"))
+        return "url";
+    if (!strcmp(sinkType,"eval") || !strcmp(sinkType,"Function") ||
+        !strcmp(sinkType,"setTimeout") || !strcmp(sinkType,"setInterval"))
+        return "code";
+    return NULL;
+}
+/* Exploit-shape predicates. SHORT vector markers (`<script`, `<svg`,
+   `javascript:`) keep Z3's seq theory fast even when Ψ is a concat
+   tree several levels deep — long full-payload contains predicates
+   sent the solver into multi-minute string-equation solves on
+   `<b>` + leaf + `</b>` shaped Ψ. The PoC value the analyst pastes
+   is upgraded to a full alert payload by the follow-up tightening
+   solve in qjs_z3_solve_sec_inner (raw-LEAF Ψ only — for concat Ψ
+   the template already pins the leaf shape so trimming doesn't add
+   value). A single SAT on the disjunction proves exploitability. */
+static Z3_ast qjs_z3_exploit(qjs_z3_ctx *zc, Z3_ast psi, const char *family) {
+    if (!family) return NULL;
+    if (!strcmp(family, "code"))
+        return Z3_mk_seq_contains(zc->c, psi, Z3_mk_string(zc->c, "alert("));
+    if (!strcmp(family, "html")) {
+        static const char *PL[] = {
+            "<script", "<svg", "<iframe", "<img",
+            " onerror=", " onload=", " onclick=", "javascript:",
+        };
+        const int N = (int)(sizeof PL / sizeof *PL);
+        Z3_ast args[16];
+        for (int i = 0; i < N; i++)
+            args[i] = Z3_mk_seq_contains(zc->c, psi, Z3_mk_string(zc->c, PL[i]));
+        return Z3_mk_or(zc->c, N, args);
+    }
+    if (!strcmp(family, "url")) {
+        static const char *PL[] = { "javascript:", "data:text/html" };
+        const int N = (int)(sizeof PL / sizeof *PL);
+        Z3_ast args[4];
+        for (int i = 0; i < N; i++)
+            args[i] = Z3_mk_seq_prefix(zc->c, Z3_mk_string(zc->c, PL[i]), psi);
+        return Z3_mk_or(zc->c, N, args);
+    }
+    return NULL;
+}
+static Z3_ast qjs_z3_psi(qjs_term *psi, qjs_z3_ctx *zc) {
+    /* Ψ at the sink — string-typed. Delegates to qjs_z3_str, which
+       precisely models concat / known string methods (sanitizer-aware
+       replace stays as identity over-approx; sound). */
+    return qjs_z3_str(psi, zc);
+}
+/* True when Ψ reduces to a SINGLE leaf through single-arg transforms (slice /
+   decoders / member) — NOT concat. The PoC tightening pass (equating Ψ to a
+   clean payload template) is cheap + correct for these (one leaf var), so it
+   should run; only multi-leaf concat drops Z3 into expensive seq-theory. */
+static int qjs_psi_single_leaf(qjs_term *t) {
+    if (!t) return 0;
+    if (t->op == 'L' || t->op == 'M') return 1;
+    if (t->op == 'F' && t->s && strcmp(t->s, "concat") != 0) return qjs_psi_single_leaf(t->a);
+    return 0;
+}
+/* Ψ's sink "spine": the root leaf id + base-first dot-path of the MEMBER chain
+   that reflects the attacker value into the sink (Ψ=(. (. handler.event "data")
+   "html") → leaf=<handler.event id>, path="data.html"). The PoC's sink-bearing
+   field is set to the PROVEN executable vector at exactly this (leaf, path) — Z3's
+   raw model gives only the minimal exploit-shape MARKER there ("<svg", an inert
+   fragment the HTML parser discards, so it never executes the proof hook).
+   Descends single-arg transforms (slice/decoders) like qjs_psi_single_leaf, which
+   don't contribute a member name. Returns 1 on a clean LEAF/MEMBER reflection
+   (path may be ""); 0 for concat/other shapes (there the model leaf value is the
+   meaningful assignment, so no override). */
+static int qjs_psi_sink_spine(qjs_term *t, int *leafOut, char *pathBuf, size_t pathCap) {
+    const char *names[32]; int nn = 0;
+    while (t && (t->op == 'M' || (t->op == 'F' && t->s && strcmp(t->s, "concat") != 0))) {
+        if (t->op == 'M' && nn < 32) names[nn++] = t->s ? t->s : "?";
+        t = t->a;
+    }
+    if (!t || t->op != 'L') return 0;
+    if (leafOut) *leafOut = t->leaf;
+    size_t used = 0; if (pathCap) pathBuf[0] = 0;
+    for (int i = nn - 1; i >= 0; i--) {
+        size_t l = strlen(names[i]);
+        if (used + l + 2 >= pathCap) break;
+        if (used) pathBuf[used++] = '.';
+        memcpy(pathBuf + used, names[i], l); used += l; pathBuf[used] = 0;
+    }
+    return 1;
+}
+/* Walk a left-associative concat tree IN SOURCE ORDER, accumulating the leading
+   CONCRETE ('K') literal text into `pre` until the first attacker value, whose
+   sink-spine (leaf id + member path) is captured. Detects Ψ = <literal prefix>
+   + <attacker leaf/member> + … — the reflected-into-a-literal case (template
+   strings, string building) where the PoC payload must BREAK OUT of the HTML
+   context the bundle wrapped the value in (`class='`…). This is the genuine
+   reverse-logic the family vector alone can't satisfy. `*found` stays 0 until
+   the attacker part is seen; later parts (the suffix) are then ignored. */
+static void qjs_concat_prefix(qjs_term *t, char *pre, size_t cap, size_t *preLen,
+                              int *leafOut, char *pathBuf, size_t pathCap, int *found) {
+    if (!t || *found) return;
+    if (t->op == 'F' && t->s && !strcmp(t->s, "concat")) {
+        qjs_concat_prefix(t->a, pre, cap, preLen, leafOut, pathBuf, pathCap, found);
+        qjs_concat_prefix(t->b, pre, cap, preLen, leafOut, pathBuf, pathCap, found);
+        return;
+    }
+    if (t->op == 'K') {                       /* concrete literal → part of the prefix */
+        const char *str = t->s ? t->s : "";
+        size_t l = strlen(str);
+        if (*preLen + l < cap) { memcpy(pre + *preLen, str, l); *preLen += l; pre[*preLen] = 0; }
+        return;
+    }
+    if (qjs_psi_sink_spine(t, leafOut, pathBuf, pathCap)) *found = 1;   /* first attacker value */
+}
+/* Minimal HTML injection-context → breakout synthesis over the concrete prefix.
+   Tracks the HTML5 tokenizer's injection-relevant states (data / tag-open /
+   single- & double-quoted attribute value / comment) and returns the minimal
+   text that CLOSES the open construct so the vector that follows parses as a
+   live element. This is the injection-context analysis Lexbor's tokenizer does
+   not expose as a partial-EOF API — the bounded HTML5 state subset that decides
+   breakout, NOT a general HTML parser. (script/rawtext string contexts are a
+   documented gap: they keep TAINT_REACH rather than emit a possibly-wrong
+   breakout — the dynamic probe is the backstop.) */
+static const char *qjs_html_breakout(const char *pre) {
+    enum { DATA, TAG, ADQ, ASQ, COMMENT } st = DATA;
+    size_t n = pre ? strlen(pre) : 0;
+    for (size_t i = 0; i < n; i++) {
+        char ch = pre[i];
+        switch (st) {
+        case DATA:
+            if (ch == '<') {
+                if (i + 3 < n && pre[i+1] == '!' && pre[i+2] == '-' && pre[i+3] == '-') { st = COMMENT; i += 3; }
+                else { char nx = (i+1 < n) ? pre[i+1] : 0;
+                       if ((nx >= 'a' && nx <= 'z') || (nx >= 'A' && nx <= 'Z') || nx == '/') st = TAG; }
+            }
+            break;
+        case TAG:     if (ch == '"') st = ADQ; else if (ch == '\'') st = ASQ; else if (ch == '>') st = DATA; break;
+        case ADQ:     if (ch == '"')  st = TAG; break;
+        case ASQ:     if (ch == '\'') st = TAG; break;
+        case COMMENT: if (ch == '-' && i+2 < n && pre[i+1] == '-' && pre[i+2] == '>') { st = DATA; i += 2; } break;
+        }
+    }
+    switch (st) {
+    case ASQ:     return "'>";
+    case ADQ:     return "\">";
+    case TAG:     return ">";
+    case COMMENT: return "-->";
+    default:      return "";       /* DATA — inject directly, no breakout needed */
+    }
+}
+/* Canonical executable vector for a sink family — the irreducible exploit
+   primitive (browser semantics, not bundle logic). alert(document.domain) is the
+   proof placeholder the PoC builder swaps for apiclientsink("<id>"). */
+static const char *qjs_exec_vector(const char *family) {
+    if (!family) return NULL;
+    if (!strcmp(family, "html")) return "<img src=x onerror=alert(document.domain)>";
+    if (!strcmp(family, "url"))  return "javascript:alert(document.domain)";
+    if (!strcmp(family, "code")) return "alert(document.domain)";
+    return NULL;
+}
+/* Z3 error handler: DOES NOT swallow — records the last error so the
+   inner solver can check Z3_get_error_code after each API call and
+   emit an @E diagnostic. Falls through to Z3_ERROR verdict; a
+   silent fall-through to TAINT_REACH would hide a real failure. */
+static Z3_error_code qjs_z3_last_err = Z3_OK;
+static void qjs_z3_err_h(Z3_context c, Z3_error_code e) { (void)c; qjs_z3_last_err = e; }
+/* Emit @E for a Z3 failure (the standard error-diagnostic channel
+   hostedge already uses for resolverError; ast-thread maps @E to
+   resolverErrors[]). Called from the C++ shim on a caught throw AND
+   inline when Z3_get_error_code is non-OK. */
+static void qjs_z3_diag(const char *sinkType, const char *what) {
+    qjs_sb sb = {0};
+    qjs_sb_printf(&sb, "@E {\"channel\":\"z3\",\"sink\":\"%s\",\"error\":\"",
+                  sinkType ? sinkType : "?");
+    for (const char *p = what ? what : "(no detail)"; *p; p++) {
+        unsigned char ch = (unsigned char)*p;
+        if (ch == '"' || ch == '\\') qjs_sb_putc(&sb, '\\');
+        if (ch < 0x20) qjs_sb_printf(&sb, "\\u%04x", ch); else qjs_sb_putc(&sb, ch);
+    }
+    qjs_sb_puts(&sb, "\"}\n");
+    fwrite(sb.p, 1, sb.n, stdout);
+    qjs_sb_free(&sb);
+}
+/* C++ trampoline declared in qjs_z3_shim.cpp — converts a Z3 C++
+   exception into a Z3_ERROR verdict + an @E diagnostic, never silent. */
+typedef const char *(*qjs_z3_inner_fn)(void *, const char *, char **);
+typedef void (*qjs_z3_diag_fn)(const char *, const char *);
+extern const char *qjs_z3_try(qjs_z3_inner_fn, qjs_z3_diag_fn,
+                              void *psi, const char *sinkType, char **witness_out);
+/* Check Z3_get_error_code; on non-OK emit @E and return 1 (caller bails
+   out with Z3_ERROR). Surfaces errors that Z3 reports via the handler
+   without actually throwing — never silently degraded. */
+static int qjs_z3_check_err(Z3_context c, const char *sinkType, const char *where) {
+    if (qjs_z3_last_err == Z3_OK) return 0;
+    Z3_string s = Z3_get_error_msg(c, qjs_z3_last_err);
+    qjs_sb m = {0};
+    qjs_sb_printf(&m, "%s: %s", where, s ? s : "(unknown)");
+    qjs_sb_putc(&m, 0);
+    qjs_z3_diag(sinkType, m.p ? m.p : "?");
+    qjs_sb_free(&m);
+    qjs_z3_last_err = Z3_OK;
+    return 1;
+}
+
+/* Translate a leaf label to the attacker-action class the extension's
+   PoC runner uses: hash / search / cookie / localStorage / window-name
+   / server-response / postMessage / event / clipboard. `key_out` (cap
+   `key_cap`) gets a sub-key when relevant (storage key, postMessage
+   field, handler role) — caller emits as a separate JSON property so
+   the popup can show e.g. "Set localStorage('payload', '<svg…>')". */
+static const char *qjs_poc_action(const char *label, char *key_out, size_t key_cap) {
+    if (key_out && key_cap) key_out[0] = 0;
+    if (!label) return "unknown";
+    if (!strcmp(label, "location.hash"))   return "hash";
+    if (!strcmp(label, "location.search")) return "search";
+    if (!strcmp(label, "document.cookie")) return "cookie";
+    if (!strcmp(label, "window.name"))     return "window-name";
+    if (!strcmp(label, "clipboard.readText")) return "clipboard";
+    if (!strncmp(label, "storage.", 8)) {
+        if (key_out) snprintf(key_out, key_cap, "%s", label + 8);
+        return "localStorage";
+    }
+    if (!strncmp(label, "postMessage.", 12)) {
+        if (key_out) snprintf(key_out, key_cap, "%s", label + 12);
+        return "postMessage";
+    }
+    if (!strncmp(label, "handler.", 8)) {
+        if (key_out) snprintf(key_out, key_cap, "%s", label + 8);
+        return "event";
+    }
+    if (!strncmp(label, "XHR.", 4) || !strncmp(label, "fetch.", 6))
+        return "server-response";
+    if (!strcmp(label, "eval.exception") || !strcmp(label, "Function.exception"))
+        return "throw-propagation";
+    return "unknown";
+}
+/* JSON-escape a C-string into a builder. Same rules as qjs_sb_json_in
+   but takes a const char* directly. */
+static void qjs_sb_json_in_cstr(qjs_sb *out, const char *s) {
+    if (!s) return;
+    for (const char *p = s; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '"' || c == '\\') qjs_sb_putc(out, '\\');
+        if (c < 0x20) qjs_sb_printf(out, "\\u%04x", c);
+        else qjs_sb_putc(out, c);
+    }
+}
+/* Z3's string-model serialization uses `\u{HH}` (1-6 hex) for any
+   character outside printable ASCII. Z3_get_string returns this form
+   verbatim; the extension wants the *real* code point so the PoC the
+   reviewer pastes is byte-identical to the attack string. Decode the
+   Z3 escape into a real char (≤0x7F → raw, ≥0x80 → JSON `\uXXXX`)
+   while applying JSON quoting. */
+static void qjs_sb_z3val(qjs_sb *out, const char *s) {
+    if (!s) return;
+    const char *p = s;
+    while (*p) {
+        if (p[0] == '\\' && p[1] == 'u' && p[2] == '{') {
+            const char *q = p + 3;
+            unsigned v = 0; int ok = 0;
+            while (*q && *q != '}') {
+                int d;
+                if (*q >= '0' && *q <= '9') d = *q - '0';
+                else if (*q >= 'a' && *q <= 'f') d = *q - 'a' + 10;
+                else if (*q >= 'A' && *q <= 'F') d = *q - 'A' + 10;
+                else { ok = -1; break; }
+                v = (v << 4) | (unsigned)d;
+                q++; ok = 1;
+            }
+            if (ok == 1 && *q == '}') {
+                if (v < 0x80) {
+                    if (v == '"' || v == '\\') qjs_sb_putc(out, '\\');
+                    if (v < 0x20) qjs_sb_printf(out, "\\u%04x", v);
+                    else qjs_sb_putc(out, (int)v);
+                } else if (v < 0x10000) {
+                    qjs_sb_printf(out, "\\u%04x", v);
+                } else {
+                    /* > BMP — surrogate pair */
+                    unsigned u = v - 0x10000;
+                    qjs_sb_printf(out, "\\u%04x\\u%04x",
+                                  0xD800 | (u >> 10), 0xDC00 | (u & 0x3FF));
+                }
+                p = q + 1;
+                continue;
+            }
+        }
+        unsigned char c = (unsigned char)*p++;
+        if (c == '"' || c == '\\') qjs_sb_putc(out, '\\');
+        if (c < 0x20) qjs_sb_printf(out, "\\u%04x", c);
+        else qjs_sb_putc(out, c);
+    }
+}
+/* @P {sink, steps:[{action,label,key?,id,value?,fields?}]} —
+   structured PoC the extension's popup combines with the target tab
+   URL to produce an executable attack recipe. `value` is the leaf's
+   flat string assignment (when the bundle reads the leaf as-is, e.g.
+   raw reflection of document.cookie); `fields` is the dot-joined
+   sub-path → value map from MEMBER accesses (when the bundle reads
+   structured fields like `e.data.type`, `e.data.payload.html`).
+   Both can co-exist; the popup picks the appropriate form per sink.
+   This is what makes postMessage object-payload PoCs work — without
+   it the @P would only show the raw leaf assignment ("[object Object]"
+   or arbitrary), and the user couldn't reconstruct the attack object. */
+static void qjs_z3_emit_poc(Z3_context c, Z3_model m, qjs_z3_ctx *zc, const char *sinkType,
+                            int sinkLeaf, const char *sinkPath, const char *sinkPayload) {
+    /* sinkPayload (non-NULL on REAL_EXPLOIT) is the EXECUTABLE value to place at
+       Ψ's sink-bearing field, identified by (sinkLeaf, sinkPath): for a clean
+       reflection the proven family vector ("<img src=x onerror=…>"); for a
+       literal-embedded reflection the context BREAKOUT + vector ("'><img …>").
+       Z3's raw model only binds the field to the minimal exploit-shape MARKER
+       ("<svg", inert), so we override it here. The proof hook
+       (alert(document.domain) → apiclientsink("<id>")) is woven by the PoC
+       builder. NULL ⇒ keep the model values (no override). */
+    int haveSpine = (sinkPayload && sinkLeaf >= 0 && sinkPath);
+    qjs_sb p = {0};
+    qjs_sb_puts(&p, "@P {\"sink\":\"");
+    qjs_sb_json_in_cstr(&p, sinkType ? sinkType : "?");
+    qjs_sb_puts(&p, "\"");
+    /* Emit the sink-bearing (leaf, field) the ENGINE identified from Ψ's spine.
+       The adapter must NOT re-derive it by scraping quoted segments from the psi
+       string — a concat Ψ ("<div class='" + e.data.cls + "'>…") includes the
+       literal wrapper segments, so that scrape mis-identifies the field and the
+       proof hook never gets woven. The engine knows it exactly. */
+    if (haveSpine) {
+        qjs_sb_printf(&p, ",\"sinkLeaf\":%d,\"sinkField\":\"", sinkLeaf);
+        qjs_sb_json_in_cstr(&p, sinkPath);
+        qjs_sb_puts(&p, "\"");
+    }
+    qjs_sb_puts(&p, ",\"steps\":[");
+    int first = 1;
+    for (int i = 0; i < zc->n; i++) {
+        int leaf_id = zc->leaves[i].leaf;
+        Z3_ast var = zc->leaves[i].var;
+        Z3_ast assigned = NULL;
+        Z3_string val_str = NULL;
+        if (Z3_model_eval(c, m, var, true, &assigned) && assigned)
+            val_str = Z3_get_string(c, assigned);
+        const char *label = (leaf_id >= 0 && leaf_id < qjs_leaf_n && qjs_leaf_tab)
+                            ? qjs_leaf_tab[leaf_id] : "?";
+        char key_buf[128] = {0};
+        const char *action = qjs_poc_action(label, key_buf, sizeof key_buf);
+        if (!first) qjs_sb_putc(&p, ',');
+        qjs_sb_puts(&p, "{\"action\":\"");
+        qjs_sb_json_in_cstr(&p, action);
+        qjs_sb_puts(&p, "\",\"label\":\"");
+        qjs_sb_json_in_cstr(&p, label);
+        qjs_sb_puts(&p, "\"");
+        if (key_buf[0]) {
+            qjs_sb_puts(&p, ",\"key\":\"");
+            qjs_sb_json_in_cstr(&p, key_buf);
+            qjs_sb_puts(&p, "\"");
+        }
+        qjs_sb_puts(&p, ",\"id\":");
+        qjs_sb_printf(&p, "%d", leaf_id);
+        qjs_sb_puts(&p, ",\"value\":\"");
+        if (haveSpine && leaf_id == sinkLeaf && !sinkPath[0])
+            qjs_sb_z3val(&p, sinkPayload);   /* bare-LEAF reflection (Ψ is the leaf itself) → proven vector */
+        else
+            qjs_sb_z3val(&p, val_str ? val_str : "");
+        qjs_sb_puts(&p, "\"");
+        /* Collect MEMBER children for this leaf into a structured
+           fields object. Path is dot-joined (`data.type`); popup
+           splits on "." to build nested objects when posting.
+           Dedup by path string — two `e.data.type` reads in the same
+           handler call build TWO distinct MEMBER term-pointers but
+           Z3 still binds them to the same value through the .data
+           parent. Emitting each twice clutters the PoC without adding
+           info — the popup just wants {type:"init"}, not
+           {type:"init", type:"init"}. */
+        int hadField = 0;
+        for (int mi = 0; mi < zc->n_mem; mi++) {
+            if (zc->members[mi].leaf_root != leaf_id) continue;
+            const char *pth = zc->members[mi].path ? zc->members[mi].path : "?";
+            int dup = 0;
+            for (int mj = 0; mj < mi; mj++) {
+                if (zc->members[mj].leaf_root != leaf_id) continue;
+                const char *p2 = zc->members[mj].path ? zc->members[mj].path : "?";
+                if (!strcmp(pth, p2)) { dup = 1; break; }
+            }
+            if (dup) continue;
+            int isSinkField = (haveSpine && leaf_id == sinkLeaf && !strcmp(pth, sinkPath));
+            Z3_ast fv = NULL; Z3_string fs = NULL;
+            if (Z3_model_eval(c, m, zc->members[mi].var, true, &fv) && fv) fs = Z3_get_string(c, fv);
+            /* The sink-bearing field is ALWAYS emitted (with the proven vector),
+               even if Z3 left its raw member value blank — an unconstrained sink
+               field is exactly the exploitable case. Non-sink fields keep their
+               solved gate values and skip when empty. */
+            if (!isSinkField && (!fs || !fs[0])) continue;
+            if (!hadField) { qjs_sb_puts(&p, ",\"fields\":{"); hadField = 1; }
+            else qjs_sb_putc(&p, ',');
+            qjs_sb_putc(&p, '"');
+            qjs_sb_json_in_cstr(&p, pth);
+            qjs_sb_puts(&p, "\":\"");
+            qjs_sb_z3val(&p, isSinkField ? sinkPayload : (fs ? fs : ""));
+            qjs_sb_putc(&p, '"');
+        }
+        if (hadField) qjs_sb_putc(&p, '}');
+        qjs_sb_putc(&p, '}');
+        first = 0;
+    }
+    qjs_sb_puts(&p, "]}\n");
+    fwrite(p.p, 1, p.n, stdout);
+    qjs_sb_free(&p);
+}
+/* Inner solver — called via the C++ shim. Returns "REAL_EXPLOIT" /
+   "TAINT_REACH" / "INFEASIBLE" / "Z3_ERROR". *witness_out (caller-
+   frees) is the Z3 model string on REAL_EXPLOIT. The void* psi is the
+   qjs_term* widened for the function-pointer signature shared with the
+   C++ trampoline. */
+static int qjs_z3_globals_set = 0;
+/* SMT-directed BFS pruning helper (X-Force §3 false-path filter).
+   Called from qjs_forced_decide_k at every TAINT frontier emission to
+   decide whether the FLIPPED schedule (decision = 1 = assert the
+   predicate) is satisfiable under the accumulated Φ. Same Z3 context
+   setup as the sink solver, minus Ψ/exploit-shape. Returns:
+     "SAT"      — Φ ∧ predicate is satisfiable; F-emission proceeds
+     "UNSAT"    — Φ ∧ predicate is unsatisfiable; F-emission is suppressed
+     "Z3_ERROR" — Z3 failed (handler set or rlimit hit); F-emission
+                  proceeds (conservative — never lose coverage on a
+                  solver error, only on a confident UNSAT). */
+static const char *qjs_z3_check_flip_sat_inner(void *flip_v, const char *unused, char **unused_w) {
+    qjs_term *flip = (qjs_term *)flip_v;
+    (void)unused; (void)unused_w;
+    qjs_z3_last_err = Z3_OK;
+    if (!qjs_z3_globals_set) {
+        Z3_global_param_set("memory_high_watermark_mb", "1024");
+        Z3_global_param_set("rlimit", "100000");
+        qjs_z3_globals_set = 1;
+    }
+    Z3_config cfg = Z3_mk_config();
+    Z3_context c = Z3_mk_context(cfg);
+    Z3_set_error_handler(c, qjs_z3_err_h);
+    Z3_del_config(cfg);
+    if (qjs_z3_check_err(c, "phi-sat", "ctx-create")) { Z3_del_context(c); return "Z3_ERROR"; }
+    Z3_solver s = Z3_mk_solver(c);
+    Z3_solver_inc_ref(c, s);
+    qjs_z3_ctx zc = {0};
+    zc.c = c; zc.s = s;
+    zc.str_sort = Z3_mk_string_sort(c);
+    zc.int_sort = Z3_mk_int_sort(c);
+    const char *result = "SAT";
+    for (int i = 0; i < qjs_pc_n; i++) {
+        Z3_ast p = qjs_z3_pred(qjs_pc_t[i], &zc);
+        if (qjs_z3_check_err(c, "phi-sat", "build-pred")) { result = "Z3_ERROR"; goto done; }
+        Z3_solver_assert(c, s, qjs_pc_d[i] ? p : Z3_mk_not(c, p));
+        if (qjs_z3_check_err(c, "phi-sat", "assert-phi")) { result = "Z3_ERROR"; goto done; }
+    }
+    Z3_ast fp = qjs_z3_pred(flip, &zc);
+    if (qjs_z3_check_err(c, "phi-sat", "build-flip")) { result = "Z3_ERROR"; goto done; }
+    Z3_solver_assert(c, s, fp);
+    if (qjs_z3_check_err(c, "phi-sat", "assert-flip")) { result = "Z3_ERROR"; goto done; }
+    Z3_lbool r = Z3_solver_check(c, s);
+    if (qjs_z3_check_err(c, "phi-sat", "check-flip")) { result = "Z3_ERROR"; goto done; }
+    result = (r == Z3_L_FALSE) ? "UNSAT" : "SAT";
+done:
+    for (int mi = 0; mi < zc.n_mem; mi++) free(zc.members[mi].path);
+    free(zc.members);
+    free(zc.leaves);
+    Z3_solver_dec_ref(c, s);
+    Z3_del_context(c);
+    return result;
+}
+static int qjs_z3_check_flip_sat(qjs_term *flip_term) {
+    if (!flip_term) return 1;
+    char *unused = NULL;
+    const char *r = qjs_z3_try(qjs_z3_check_flip_sat_inner, qjs_z3_diag,
+                               (void *)flip_term, "phi-sat", &unused);
+    free(unused);
+    return (r && !strcmp(r, "UNSAT")) ? 0 : 1;
+}
+static const char *qjs_z3_solve_sec_inner(void *psi_v, const char *sinkType, char **witness_out) {
+    qjs_term *psi = (qjs_term *)psi_v;
+    *witness_out = NULL;
+    qjs_z3_last_err = Z3_OK;
+    /* Z3 process globals. NOT setting `timeout` deliberately — the
+       Z3 timeout is enforced via a watchdog std::thread (discovered
+       via @E diagnostic when wasm reported "thread constructor
+       failed: Not supported"); emcc has no pthreads. Resource cap
+       via memory_high_watermark instead — a runaway string-theory
+       case OOMs cleanly inside Z3 (Z3_ERROR + @E) rather than
+       crashing the wasm heap. */
+    if (!qjs_z3_globals_set) {
+        Z3_global_param_set("memory_high_watermark_mb", "1024");
+        /* rlimit (not the unix `timeout` param) caps Z3's internal
+           "resource units" — pure CPU work, no thread/timer needed.
+           emcc has no pthreads, so `timeout` deadlocks; rlimit is the
+           thread-free equivalent. */
+        Z3_global_param_set("rlimit", "100000");
+        qjs_z3_globals_set = 1;
+    }
+    Z3_config cfg = Z3_mk_config();
+    Z3_set_param_value(cfg, "model", "true");
+    Z3_context c = Z3_mk_context(cfg);
+    Z3_set_error_handler(c, qjs_z3_err_h);
+    Z3_del_config(cfg);
+    if (qjs_z3_check_err(c, sinkType, "ctx-create")) { Z3_del_context(c); return "Z3_ERROR"; }
+    Z3_solver s = Z3_mk_solver(c);
+    Z3_solver_inc_ref(c, s);
+    qjs_z3_ctx zc = {0};
+    zc.c = c; zc.s = s;
+    zc.str_sort = Z3_mk_string_sort(c);
+    zc.int_sort = Z3_mk_int_sort(c);
+    Z3_model phiModel = NULL;   /* Φ-feasible model (gate fields) for the concat-breakout path; declared pre-goto so z3_err can free it */
+    for (int i = 0; i < qjs_pc_n; i++) {
+        Z3_ast p = qjs_z3_pred(qjs_pc_t[i], &zc);
+        if (qjs_z3_check_err(c, sinkType, "build-pred")) goto z3_err;
+        Z3_solver_assert(c, s, qjs_pc_d[i] ? p : Z3_mk_not(c, p));
+        if (qjs_z3_check_err(c, sinkType, "assert-phi")) goto z3_err;
+    }
+    Z3_lbool r = Z3_solver_check(c, s);
+    if (qjs_z3_check_err(c, sinkType, "check-phi")) goto z3_err;
+    const char *verdict;
+    /* Capture the Φ-feasible model BEFORE the exploit shape is asserted — the
+       constructive concat-breakout path needs the gate-field values
+       (data.type=="set", …) and an UNDEF exploit check leaves no usable model. */
+    if (r != Z3_L_FALSE) { phiModel = Z3_solver_get_model(c, s); if (phiModel) Z3_model_inc_ref(c, phiModel); }
+    if (r == Z3_L_FALSE) {
+        verdict = "INFEASIBLE";
+    } else {
+        Z3_ast psi_ast = qjs_z3_psi(psi, &zc);
+        if (qjs_z3_check_err(c, sinkType, "build-psi")) goto z3_err;
+        const char *fam = qjs_z3_family(sinkType);
+        Z3_ast es = qjs_z3_exploit(&zc, psi_ast, fam);
+        if (qjs_z3_check_err(c, sinkType, "build-exploit")) goto z3_err;
+        if (!es) {
+            verdict = "TAINT_REACH";
+        } else {
+            Z3_solver_assert(c, s, es);
+            if (qjs_z3_check_err(c, sinkType, "assert-exploit")) goto z3_err;
+            r = Z3_solver_check(c, s);
+            if (qjs_z3_check_err(c, sinkType, "check-exploit")) goto z3_err;
+            if (r == Z3_L_TRUE) {
+                /* SAT exploit. Only a SOUND solve is a proven PoC: if the
+                   psi→Z3 translation used an unsound over-approximation (a
+                   fresh free var for an unmodeled transform, or replace()≈base
+                   that could mask a sanitizer), the exploit is satisfiable only
+                   UNDER that approximation — not proven against the real flow.
+                   Declaring "REAL_EXPLOIT" (the "PoC" badge) then would be a lie;
+                   emit the distinct EXPLOIT_UNPROVEN so the UI shows it honestly
+                   as taint-reaches-exploit-shape-but-unproven, never as a PoC. */
+                verdict = zc.overapprox ? "EXPLOIT_UNPROVEN" : "REAL_EXPLOIT";
+                /* Capture the ORIGINAL SAT model NOW — before the
+                   optional tightening pass runs push/assert/check/pop.
+                   If rlimit gets hit during tightening, the solver's
+                   internal state can stop returning models; preserving
+                   the original guarantees a non-null witness. */
+                Z3_model originalModel = Z3_solver_get_model(c, s);
+                if (originalModel) Z3_model_inc_ref(c, originalModel);
+                /* Tightening pass — Z3's first model satisfies the
+                   disjunction `contains(Ψ,p1) ∨ … ∨ prefixof(pN,Ψ)`
+                   with the MINIMUM required match plus arbitrary
+                   padding bytes (Z3 fills unconstrained suffix with
+                   any chars). Push the solver state, add `Ψ == p`
+                   per disjunct and pick the FIRST SAT — gives a
+                   minimal, padding-free PoC value the extension can
+                   paste directly. Only run when Ψ is a flat LEAF
+                   (raw reflection): for concat-wrapped Ψ the template
+                   already constrains the leaf and equating to a
+                   specific payload-length string drops Z3 into an
+                   expensive seq-theory string-equation solve that
+                   regularly times out — the original model is already
+                   minimal in that case. */
+                Z3_model bestModel = NULL;
+                const char *chosenPayload = NULL;   /* the executable vector proven SAT for Ψ */
+                if (qjs_psi_single_leaf(psi)) {
+                    Z3_ast psi_str = qjs_z3_psi(psi, &zc);
+                    const char *fam2 = qjs_z3_family(sinkType);
+                    /* Executable sink-family vectors — the exploit primitive of the
+                       PROVEN sink (a fact about innerHTML/eval/location, not a
+                       fabricated template of the bundle). innerHTML-EXECUTING forms
+                       LEAD: a <script> inserted via innerHTML does NOT run (HTML5),
+                       so the event-handler vectors must come first for the clean-
+                       reflection fallback to pick one that actually fires.
+                       alert(document.domain) is the proof placeholder the PoC
+                       builder swaps for apiclientsink("<id>"). */
+                    static const struct { const char *fam; const char *p; } TIGHT[] = {
+                        {"html","<img src=x onerror=alert(document.domain)>"},
+                        {"html","<svg onload=alert(document.domain)>"},
+                        {"html","<iframe src=\"javascript:alert(document.domain)\">"},
+                        {"html","<a href=\"javascript:alert(document.domain)\">x</a>"},
+                        {"html","<script>alert(document.domain)</script>"},
+                        {"url", "javascript:alert(document.domain)"},
+                        {"url", "data:text/html,<script>alert(document.domain)</script>"},
+                        {"code","alert(document.domain)"},
+                    };
+                    int NT = (int)(sizeof TIGHT / sizeof *TIGHT);
+                    const char *undefVec = NULL;   /* first vector Z3 could neither confirm nor refute */
+                    for (int ti = 0; ti < NT && !chosenPayload; ti++) {
+                        if (!fam2 || strcmp(TIGHT[ti].fam, fam2)) continue;
+                        /* Try to CONFIRM the full vector fits: assert Ψ == vector.
+                             L_TRUE  → Z3-proven; use it (clean minimal model).
+                             L_FALSE → a modeled length/charset gate forbids THIS
+                                       vector; try a shorter one.
+                             L_UNDEF → Z3's seq solver can't decide the long string
+                                       equation once the exploit-shape disjunction is
+                                       asserted (routine for a MEMBER reflection like
+                                       e.data.html — even contains/len-≥ go UNDEF).
+                                       NOT a refutation — remember it for the clean-
+                                       reflection fallback below. */
+                        Z3_solver_push(c, s);
+                        Z3_solver_assert(c, s, Z3_mk_eq(c, psi_str, Z3_mk_string(c, TIGHT[ti].p)));
+                        Z3_lbool rr = (qjs_z3_last_err == Z3_OK) ? Z3_solver_check(c, s) : Z3_L_UNDEF;
+                        if (rr == Z3_L_TRUE) {
+                            bestModel = Z3_solver_get_model(c, s);
+                            if (bestModel) Z3_model_inc_ref(c, bestModel);
+                            chosenPayload = TIGHT[ti].p;
+                        } else if (rr == Z3_L_UNDEF && !undefVec) {
+                            undefVec = TIGHT[ti].p;
+                        }
+                        Z3_solver_pop(c, s, 1);
+                        qjs_z3_last_err = Z3_OK;   /* a tightening miss/undef is not an error */
+                    }
+                    /* No exact fit CONFIRMED, but none REFUTED either (UNDEF) — for a
+                       SOUND (non-over-approx) reflection the attacker controls Ψ
+                       wholesale, so the executable vector IS achievable; Z3's seq
+                       solver just can't confirm the long equation under the multi-
+                       leaf Φ. Use it; the dynamic probe (Verify) is the ground-truth
+                       backstop — a genuine length/charset cap surfaces as NOT
+                       REPRODUCED, never a false REAL EXPLOIT. Never substitute a
+                       vector for an OVER-APPROXIMATED solve (that path is the honest
+                       EXPLOIT_UNPROVEN — a sanitizer might block it). */
+                    if (!chosenPayload && undefVec && !zc.overapprox) chosenPayload = undefVec;
+                }
+                int eLeaf = -1; char ePath[256] = {0};
+                int eHave = chosenPayload ? qjs_psi_sink_spine(psi, &eLeaf, ePath, sizeof ePath) : 0;
+                Z3_model m = bestModel ? bestModel : originalModel;
+                if (m) {
+                    qjs_z3_emit_poc(c, m, &zc, sinkType, eHave ? eLeaf : -1, eHave ? ePath : NULL, chosenPayload);
+                    Z3_string ms = Z3_model_to_string(c, m);
+                    if (ms) {
+                        size_t n = strlen(ms);
+                        char *w = malloc(n + 1);
+                        if (w) { memcpy(w, ms, n + 1); *witness_out = w; }
+                    }
+                }
+                if (bestModel) Z3_model_dec_ref(c, bestModel);
+                if (originalModel) Z3_model_dec_ref(c, originalModel);
+            } else {
+                /* Exploit shape UNDEF/FALSE. Z3's seq solver routinely returns
+                   UNDEF on contains() over a concat that embeds an attacker
+                   MEMBER var (`"<div class='" + e.data.x + "'>"`), so a bare
+                   TAINT_REACH would UNDER-report a real reflected XSS. Try the
+                   CONSTRUCTIVE breakout: pull the concrete literal prefix the
+                   bundle wraps the value in, find its HTML injection context, and
+                   synthesize <breakout> + <executable vector>. A context-correct
+                   breakout that EXISTS is the proof — Φ is feasible (r≠FALSE) and
+                   the attacker leaf is free. html family only (url/code embedded
+                   in a literal need a different breakout grammar — documented gap,
+                   stays TAINT_REACH); over-approx solves never take this path. */
+                verdict = "TAINT_REACH";
+                const char *fam3 = qjs_z3_family(sinkType);
+                if (fam3 && !strcmp(fam3, "html") && !zc.overapprox && phiModel) {
+                    char pre[1024] = {0}; size_t preLen = 0; int found = 0;
+                    int bLeaf = -1; char bPath[256] = {0};
+                    qjs_concat_prefix(psi, pre, sizeof pre, &preLen, &bLeaf, bPath, sizeof bPath, &found);
+                    const char *vec = qjs_exec_vector(fam3);
+                    if (found && vec) {
+                        char payload[768];
+                        snprintf(payload, sizeof payload, "%s%s", qjs_html_breakout(pre), vec);
+                        qjs_z3_emit_poc(c, phiModel, &zc, sinkType, bLeaf, bPath, payload);
+                        char *w = malloc(strlen(payload) + 1);
+                        if (w) { memcpy(w, payload, strlen(payload) + 1); *witness_out = w; }
+                        verdict = "REAL_EXPLOIT";
+                    }
+                }
+            }
+        }
+    }
+    if (phiModel) Z3_model_dec_ref(c, phiModel);
+    for (int mi = 0; mi < zc.n_mem; mi++) free(zc.members[mi].path);
+    free(zc.members);
+    free(zc.leaves);
+    Z3_solver_dec_ref(c, s);
+    Z3_del_context(c);
+    return verdict;
+z3_err:
+    /* Reached only when Z3_get_error_code reported a non-OK status.
+       qjs_z3_check_err already emitted @E describing where it failed;
+       return Z3_ERROR (a distinct verdict — drive.mjs / ast-thread
+       MUST NOT collapse this into TAINT_REACH). */
+    if (phiModel) Z3_model_dec_ref(c, phiModel);
+    for (int mi = 0; mi < zc.n_mem; mi++) free(zc.members[mi].path);
+    free(zc.members);
+    free(zc.leaves);
+    Z3_solver_dec_ref(c, s);
+    Z3_del_context(c);
+    return "Z3_ERROR";
+}
+/* Public entry: trampolines through the C++ shim so any Z3 throw
+   becomes a Z3_ERROR verdict + @E diagnostic, never a silent crash
+   or a silent TAINT_REACH downgrade. */
+static const char *qjs_z3_solve_sec(qjs_term *psi, const char *sinkType, char **witness_out) {
+    return qjs_z3_try(qjs_z3_solve_sec_inner, qjs_z3_diag,
+                      (void *)psi, sinkType, witness_out);
+}
+#else
+static const char *qjs_z3_solve_sec(qjs_term *psi, const char *sinkType, char **witness_out) {
+    (void)psi; (void)sinkType;
+    *witness_out = NULL;
+    return "TAINT_REACH";
+}
+static int qjs_z3_check_flip_sat(qjs_term *flip_term) {
+    /* No Z3 linked in: cannot decide feasibility — never prune
+       coverage on a missing solver (the X-Force schedule space is
+       complete; SMT pruning is an *optimization*, not the source of
+       truth). Returns 1 = always feasible = emit every F-frontier. */
+    (void)flip_term;
+    return 1;
+}
+#endif
+static JSValue js_make_opaque(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv) {
+    /* __opaque("location.search") — the label is the Z3 LEAF identity
+       (interned per distinct source) for the security path solve. */
+    const char *lab = NULL;
+    if (argc > 0 && JS_IsString(argv[0])) lab = JS_ToCString(ctx, argv[0]);
+    JSValue r = qjs_opq_make(ctx, 0, lab, qjs_t_leaf(lab));
+    if (lab) JS_FreeCString(ctx, lab);
+    return r;
+}
+/* __synth("label") — a SYNTH-opaque (flavor 1, NO Z3 leaf): for the host
+   model's CLIENT-GENERATED nondeterministic values (performance.now,
+   crypto.randomUUID) that must not bake a fake literal into a learned endpoint
+   NOR be treated as attacker-taint (flavor-0 __opaque would, causing false
+   security findings). Mirrors the engine's Math.random/Date.now SYNTH-opaque. */
+static JSValue js_make_synth(JSContext *ctx, JSValueConst this_val,
+                             int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    return qjs_synth_new(ctx);
+}
+/* __feTerm(v) → string serialization of v's symbolic term (Ψ at
+   sink). __fePC() → serialization of the current path-condition Φ.
+   __feSec(v, sinkType) → emits one '@Z' line on stdout with both;
+   drives the host model's @S record-then-Z3 step (the C-side Z3
+   solver wired in next is what turns @Z into a verdict). */
+static JSValue js_fe_term(JSContext *ctx, JSValueConst this_val,
+                          int argc, JSValueConst *argv) {
+    qjs_term *t = (argc > 0 && qjs_is_opaque(argv[0])) ? qjs_opq_of(argv[0])->term : NULL;
+    qjs_sb b = {0}; qjs_sb_term0(&b, t); qjs_sb_putc(&b, 0);
+    JSValue r = JS_NewString(ctx, b.p ? b.p : "?");
+    qjs_sb_free(&b);
+    return r;
+}
+/* Best param-name for an opaque URL hole: the property the bundle read
+   to produce the value. `/settings/avatars/${t.id}` → MEMBER 'id';
+   encodeURIComponent(x) → dig into the arg; a raw source leaf
+   (location.search) → its last dot-segment. NULL when nothing names it
+   (a bare opaque arg) — the walker then renders an unnamed {} hole. */
+static const char *qjs_url_hole_name(qjs_term *t) {
+    if (!t) return NULL;
+    if (t->op == 'M') {
+        if (t->s && t->s[0] && strcmp(t->s, "?")) return t->s;
+        return qjs_url_hole_name(t->a);
+    }
+    if (t->op == 'L' && t->s && t->s[0]) {
+        const char *dot = strrchr(t->s, '.');
+        return (dot && dot[1]) ? dot + 1 : t->s;
+    }
+    if (t->op == 'F') {                 /* encode/decode/String pass the
+                                           value through: name from arg
+                                           then base */
+        const char *nm = qjs_url_hole_name(t->b);
+        return nm ? nm : qjs_url_hole_name(t->a);
+    }
+    return NULL;
+}
+/* Walk a CONCAT-of-(literal, opaque-hole) term into a URL template:
+   CONST 'K'/number 'N' → literal text; any other term → "{name}" (or
+   "{pN}" when no name can be derived from the source — N is the 1-based
+   positional index of the hole so distinct path params become distinct
+   keys instead of collapsing into a single literal "{}" path segment).
+   *lits counts concrete literal emissions so the caller distinguishes a
+   partially-concrete URL (>=1 literal → a real endpoint shape) from a
+   fully-opaque one (0 → resolverError, not an endpoint). *holes counts
+   unnamed-hole emissions to drive the {pN} numbering. */
+static void qjs_sb_url0(qjs_sb *b, qjs_term *t, int *lits, int *holes) {
+    if (!t) {
+        (*holes)++;
+        qjs_sb_printf(b, "{p%d}", *holes);
+        return;
+    }
+    if (t->op == 'K') { if (t->s && t->s[0]) { qjs_sb_puts(b, t->s); (*lits)++; } return; }
+    if (t->op == 'N') { qjs_sb_printf(b, "%g", t->n); (*lits)++; return; }
+    if (t->op == 'F' && t->s && !strcmp(t->s, "concat")) {
+        qjs_sb_url0(b, t->a, lits, holes);
+        qjs_sb_url0(b, t->b, lits, holes);
+        return;
+    }
+    const char *nm = qjs_url_hole_name(t);
+    qjs_sb_putc(b, '{');
+    if (nm) {
+        qjs_sb_puts(b, nm);
+    } else {
+        (*holes)++;
+        qjs_sb_printf(b, "p%d", *holes);
+    }
+    qjs_sb_putc(b, '}');
+}
+/* __feUrlShape(v): when v is an opaque URL (a template literal / concat
+   that interpolated attacker/SYNTH input), return the URL template with
+   concrete literal segments preserved and opaque segments as {name}
+   holes — so a host-edge fetch records `/settings/avatars/{id}` (a real
+   endpoint shape, opaque path param) instead of String(v) = "[object
+   Object]". Returns undefined when v is concrete (caller uses String)
+   or fully opaque with no literal anchor (caller's isUnresolved then
+   files a resolverError — never a fabricated endpoint). */
+static JSValue js_fe_url_shape(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv) {
+    if (argc < 1 || !qjs_is_opaque(argv[0])) return JS_UNDEFINED;
+    qjs_term *t = qjs_opq_of(argv[0])->term;
+    if (!t) return JS_UNDEFINED;
+    qjs_sb b = {0}; int lits = 0, holes = 0;
+    qjs_sb_url0(&b, t, &lits, &holes);
+    qjs_sb_putc(&b, 0);
+    JSValue r = (lits > 0 && b.p) ? JS_NewString(ctx, b.p) : JS_UNDEFINED;
+    qjs_sb_free(&b);
+    return r;
+}
+/* Parallel to qjs_sb_url0 — same hole order. Each opaque URL hole emits a JSON
+   {name,line,col} where line/col is the generated bundle position where the
+   value was interpolated into the URL (stamped in js_add_slow). background.js
+   pairs each path param with its position and resolves the declared name
+   (e→owner) through a standard source-map library — the engine supplies only
+   the runtime position it alone knows, never the name resolution itself. */
+static void qjs_sb_holes(qjs_sb *b, qjs_term *t, int *n) {
+    if (!t) return;
+    if (t->op == 'K' || t->op == 'N') return;
+    if (t->op == 'F' && t->s && !strcmp(t->s, "concat")) {
+        qjs_sb_holes(b, t->a, n);
+        qjs_sb_holes(b, t->b, n);
+        return;
+    }
+    const char *nm = qjs_url_hole_name(t);
+    if (*n) qjs_sb_putc(b, ',');
+    (*n)++;
+    qjs_sb_puts(b, "{\"name\":\"");
+    if (nm) qjs_sb_puts(b, nm);   /* hole names are identifiers/property names — JSON-safe ASCII */
+    qjs_sb_printf(b, "\",\"line\":%d,\"col\":%d}", t->line, t->col);
+}
+static JSValue js_fe_url_holes(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv) {
+    return JS_UNDEFINED; /* DISABLED with the rest of the read-site capture (wasm OOB on real bundles); the source-map relabel runs from the finding's call-site loc in background.js, needing no engine hole code */
+    if (argc < 1 || !qjs_is_opaque(argv[0])) return JS_UNDEFINED;
+    qjs_term *t = qjs_opq_of(argv[0])->term;
+    if (!t) return JS_UNDEFINED;
+    qjs_sb b = {0}; int n = 0;
+    qjs_sb_putc(&b, '[');
+    qjs_sb_holes(&b, t, &n);
+    qjs_sb_putc(&b, ']');
+    qjs_sb_putc(&b, 0);
+    JSValue r = (n > 0 && b.p) ? JS_NewString(ctx, b.p) : JS_UNDEFINED;
+    qjs_sb_free(&b);
+    return r;
+}
+static JSValue js_fe_pc(JSContext *ctx, JSValueConst this_val,
+                        int argc, JSValueConst *argv) {
+    qjs_sb b = {0}; qjs_sb_pc(&b); qjs_sb_putc(&b, 0);
+    JSValue r = JS_NewString(ctx, b.p ? b.p : "[]");
+    qjs_sb_free(&b);
+    return r;
+}
+/* JSON-escape into another sb. Terms only contain printable ASCII + the
+   literal-string contents (already escaped at construction), so we only
+   need to re-escape `"` and `\` for the outer JSON string. */
+static void qjs_sb_json_in(qjs_sb *out, qjs_sb *in) {
+    for (size_t i = 0; i < in->n; i++) {
+        unsigned char c = (unsigned char)in->p[i];
+        if (c == '"' || c == '\\') qjs_sb_putc(out, '\\');
+        if (c < 0x20) qjs_sb_printf(out, "\\u%04x", c); else qjs_sb_putc(out, c);
+    }
+}
+static JSValue js_fe_sec(JSContext *ctx, JSValueConst this_val,
+                         int argc, JSValueConst *argv) {
+    /* @Z {sink, verdict, psi, phi, witness?} — emitted at every @S
+       tainted-sink. Verdict is decided by the C-side Z3 solver over
+       Φ + Ψ: REAL_EXPLOIT (with a concrete witness model) / TAINT_REACH
+       (path feasible but exploit shape unreachable, or sink family
+       unknown) / INFEASIBLE (X-Force forced an infeasible branch
+       combination — false @S, suppress in reporting). Drive.mjs /
+       ast-thread map this to securitySinks.severity. */
+    const char *sinkType = (argc > 1 && JS_IsString(argv[1])) ? JS_ToCString(ctx, argv[1]) : NULL;
+    qjs_term *psi = (argc > 0 && qjs_is_opaque(argv[0])) ? qjs_opq_of(argv[0])->term : NULL;
+    char *witness = NULL;
+    const char *verdict = qjs_z3_solve_sec(psi, sinkType, &witness);
+    qjs_sb psi_b = {0}; qjs_sb_term0(&psi_b, psi);
+    qjs_sb phi_b = {0}; qjs_sb_pc(&phi_b);
+    qjs_sb line = {0};
+    qjs_sb_printf(&line, "@Z {\"sink\":\"%s\",\"verdict\":\"%s\",\"psi\":\"",
+                  sinkType ? sinkType : "?", verdict);
+    qjs_sb_json_in(&line, &psi_b);
+    qjs_sb_puts(&line, "\",\"phi\":\"");
+    qjs_sb_json_in(&line, &phi_b);
+    if (witness) {
+        qjs_sb wb = {0};
+        for (const char *p = witness; *p; p++) qjs_sb_putc(&wb, (unsigned char)*p);
+        qjs_sb_puts(&line, "\",\"witness\":\"");
+        qjs_sb_json_in(&line, &wb);
+        qjs_sb_free(&wb);
+    }
+    qjs_sb_puts(&line, "\"}\n");
+    fwrite(line.p, 1, line.n, stdout);
+    qjs_sb_free(&psi_b); qjs_sb_free(&phi_b); qjs_sb_free(&line);
+    free(witness);
+    if (sinkType) JS_FreeCString(ctx, sinkType);
+    return JS_UNDEFINED;
+}
+/* Concrete TAINT test: returns a real boolean by pointer compare,
+   NOT through OP_CMP (a JS `v === sentinel` is intercepted and itself
+   becomes opaque/forced — so the host model must ask in C). hostedge's
+   @S sink gate calls this, so it must be TAINT-only: a synthetic
+   forced/recovery value reaching a sink is not a vulnerability. */
+static JSValue js_is_opaque(JSContext *ctx, JSValueConst this_val,
+                            int argc, JSValueConst *argv) {
+    return JS_NewBool(ctx, argc > 0 && qjs_is_taint(argv[0]));
+}
+/* TAINT-or-SYNTH test for API-learning provenance (header/body field).
+   __isOpaque is TAINT-only on purpose — the security path must not flag a
+   SYNTH static-drive arg as an attacker sink. But for "is this header/body
+   value a concrete literal the bundle pushed, or an unknown it computed
+   from caller/host input?", EITHER flavor is "opaque, no fabricated value"
+   — same predicate __feUrlShape already uses for URL holes. */
+static JSValue js_is_opaque_any(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv) {
+    return JS_NewBool(ctx, argc > 0 && qjs_is_opaque(argv[0]));
+}
+/* Host model brackets entry-point driving with __feMute(1)/(0): forced
+   decisions inside still run (coverage) but seed no new schedules.
+   The bundle's path constraints under the entry-point still push to
+   Φ (that data flow is the analysis target) — only frontier seeding
+   is muted. */
+static JSValue js_fe_mute(JSContext *ctx, JSValueConst this_val,
+                          int argc, JSValueConst *argv) {
+    qjs_fe_mute = (argc > 0 && JS_ToBool(ctx, argv[0]));
+    return JS_UNDEFINED;
+}
+/* hostedge.js's S() function wraps its @S/@Z/@P record-emission body
+   with __fePhiMute(1)/(0). The body's OP_CMP-on-opaque (`value==null`
+   etc.) would otherwise pollute Φ with bookkeeping predicates; this
+   flag silences Φ-push without affecting schedule seeding. */
+static JSValue js_fe_phi_mute(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv) {
+    qjs_fe_phi_mute = (argc > 0 && JS_ToBool(ctx, argv[0]));
+    return JS_UNDEFINED;
+}
+/* Schedule-cursor accessor for structural termination of __hostDrive's
+   per-handler re-firing loop (replaces the HMAX=3 magic cap). Each
+   forced decision advances the cursor; a call that doesn't advance
+   the cursor encountered no opaque branches and would behave
+   identically on re-fire — no point firing again. A call that does
+   advance has cursor positions the BFS will extend; further re-fires
+   may reach deeper multi-message states. Finite because cursor is
+   monotone and the schedule length is finite per run. */
+static JSValue js_fe_cursor(JSContext *ctx, JSValueConst this_val,
+                            int argc, JSValueConst *argv) {
+    return JS_NewInt64(ctx, (int64_t)qjs_fe_cur);
+}
+/* Schedule length accessor — the size of the current run's forced
+   decision string. After cursor exceeds this, all `qjs_forced_decide`
+   calls return the default (0) and emit F-frontiers; further handler
+   invocations are deterministic-default and contribute no NEW state.
+   Used by __hostDrive to stop re-firing structurally. */
+static JSValue js_fe_len(JSContext *ctx, JSValueConst this_val,
+                         int argc, JSValueConst *argv) {
+    return JS_NewInt64(ctx, (int64_t)qjs_fe_len);
+}
 #include "dtoa.h"
 
 #if defined(EMSCRIPTEN) || defined(_MSC_VER)
@@ -377,6 +2141,27 @@ typedef struct JSStackFrame {
     uint16_t var_ref_count; /* number of var refs */
     uint16_t arg_count;
     bool is_strict_mode;
+    /* Forced-exec: per-invocation id, stamped at function entry from a
+       per-run counter. The opaque-loop-revisit fixpoint keys on
+       (branch-site ⊕ this) so a site revisited WITHIN one invocation (a real
+       loop, same frame) is detected, while the SAME site reached by a
+       SEPARATE call (e.g. two independent opaque-URL fetches both running the
+       shared fetch-shim's `input && input.method` branch) is NOT mistaken for
+       a loop revisit — that false revisit was flipping every fetch after the
+       first into a phantom opaque init. */
+    unsigned int qjs_inv;
+    /* Forced-exec: set when THIS frame takes a backward branch (a loop
+       back-edge). Used so an opaque branch in a function CALLED FROM WITHIN an
+       iterating loop keys the loop-revisit on the branch SITE ALONE (dropping
+       the per-call invocation-id) — otherwise a scanner/parser called once per
+       loop iteration gets a fresh invocation each call, its EOF/terminating
+       branch is forced the SAME way every time (the loop-revisit never sees a
+       revisit), it returns a CONCRETE token, and the caller's loop becomes a
+       concrete infinite loop the fixpoint can't see (freeze #4: a JSONC scanner
+       on learn.microsoft.com, EOF check forced not-EOF across 43M calls).
+       Distinct from two SEQUENTIAL calls (no ancestor loop ⇒ inv-keyed, so the
+       _hof phantom-init guard stays correct). */
+    unsigned int qjs_looped;
     /* only used in generators. Current stack pointer value. NULL if
        the function is running. */
     JSValue *cur_sp;
@@ -790,7 +2575,67 @@ typedef struct JSFunctionBytecode {
     uint8_t super_allowed : 1;
     uint8_t arguments_allowed : 1;
     uint8_t backtrace_barrier : 1; /* stop backtrace on this function */
-    /* XXX: 5 bits available */
+    /* qjs_host_reach: lazy-computed flag (read inside the patched
+       OP_if handlers) — 1 if this function's bytecode contains an
+       OP_get_var / OP_get_field of a host-edge atom (fetch / XHR /
+       WebSocket / eval / innerHTML / setTimeout / etc.) OR pushes
+       (OP_fclosure) a closure-literal function that's itself reach.
+       Branches in functions where this is 0 cannot affect which
+       host-edge call fires (no direct or closure-literal reach to
+       any host edge), so the X-Force schedule controller skips
+       forcing them — bounds BFS to the host-edge subgraph at
+       normal-website scale. The companion `_computed` bit marks
+       lazy-init done; set inside qjs_host_reach_check on first use. */
+    uint8_t qjs_host_reach : 1;
+    uint8_t qjs_host_reach_computed : 1;
+    /* qjs_executed: set the first time this function's bytecode actually
+       RUNS (natural execution, an event-loop/handler drive, or a forced
+       schedule). __feDriveStatic drives only functions where this is 0 —
+       the genuinely-unused features. Re-driving reached code with opaque
+       args yields nothing new (its real values were already captured) and
+       is what makes a framework like jQuery wedge when its internal
+       setTimeout/innerHTML/Function helpers are force-invoked with opaque
+       this/args. This is the JAW static half done right: it covers ONLY
+       the code the dynamic frontier never entered. */
+    uint8_t qjs_executed : 1;
+    /* qjs_h_fired: set when control REACHES a host-edge READ in this function
+       (a fetch/XHR/eval get_var/get_field actually executed). The deep orphan
+       residue is host-bearing functions where this is 0 — which catches not
+       only never-RUN functions but ones the cascade ENTERED yet whose host
+       call a guard/await skipped (preheat: its module ran via the lazy
+       cascade, but `if(flagOff)return` short-circuited before the fetch, so
+       qjs_executed=1 wrongly excluded it). Driving those with opaque args
+       forces past the guard so the unfired endpoint is still learned. */
+    uint8_t qjs_h_fired : 1;
+    /* qjs_driven: set when the deep grind has driven this function once via
+       qjs_deep_step_c (or recorded as already-driven on cross-session resume
+       from the persisted driven-set). Replaces the linear-scan qjs_dd[] check
+       so the live-pick design (priority.h qjs_priority_live_orphan_better)
+       can ask "is this orphan still candidate?" in O(1) instead of O(driven).
+       Sticky across the runtime's lifetime; cleared only when the bytecode
+       itself is freed (the function ceasing to exist makes its driven status
+       moot). */
+    uint8_t qjs_driven : 1;
+    /* qjs_driven_opaque: the drive that set qjs_driven used the
+       qjs_fe_inst_opaque fallback (no real instance existed yet), so the
+       closure free-vars were opaque and an aliased host call (M(K())) dead-
+       ended before the host edge. When a factory orphan is later driven and
+       instantiates this fn's REAL closure (js_closure2 -> qjs_deep_capture_inst),
+       qjs_driven is cleared for exactly ONE real-instance re-drive (monotone
+       opaque->real, never a loop). */
+    uint8_t qjs_driven_opaque : 1;
+    /* qjs_is_event_handler: set (via __feMarkHandler, called by hostedge.js's
+       addEventListener/__feHandler) when this function is registered as an
+       EVENT handler. Its first arg is the event object — genuine ATTACKER input
+       (postMessage data, etc.), so the deep-grind drives arg0 as a TAINT leaf
+       (not SYNTH), making a reached sink a REAL_EXPLOIT/PoC rather than
+       EXPLOIT_UNPROVEN. Sound: an event arg IS attacker-controlled — TAINT here
+       is never a false positive, and it's scoped to registered handlers only. */
+    uint8_t qjs_is_event_handler : 1;
+    /* qjs_deep_ix: post-sort back-index into qjs_deep_rb during an active
+       grind (set when the residue is built) so qjs_deep_capture_inst is O(1).
+       The qjs_deep_rb[ix]==b guard makes a stale/zero-init index a safe miss. */
+    int qjs_deep_ix;
     uint8_t *byte_code_buf; /* (self pointer) */
     int byte_code_len;
     JSAtom func_name;
@@ -813,6 +2658,41 @@ typedef struct JSFunctionBytecode {
     uint8_t *pc2line_buf;
     char *source;
 } JSFunctionBytecode;
+
+/* A synth-drive argument as a NAMED opaque: label it with the driven
+   function's own parameter name (from the bytecode var defs) and give it a
+   LEAF term, so an opaque value reaching a URL path segment renders
+   `/{owner}/{repo}/issues/preheat/index` — a real template param the UI can
+   name + make editable and the learner groups by template — instead of a
+   nameless `/{}/{}/…`. Minified names (`e`,`a`,`t`) are still distinct + then
+   sourcemap-resolvable to owner/repo/source. Falls back to an unlabeled
+   opaque when the arg name wasn't retained (destructured/stripped param).
+   SYNTH flavor keeps it out of the security taint set (only the URL-hole name
+   rides on the LEAF). */
+static JSValue qjs_fe_named_arg(JSContext *ctx, JSFunctionBytecode *b, int ai, const char *fallback) {
+    if (b && b->vardefs && ai < b->arg_count && b->vardefs[ai].var_name != JS_ATOM_NULL) {
+        const char *nm = JS_AtomToCString(ctx, b->vardefs[ai].var_name);
+        if (nm && nm[0] && nm[0] != '<') {   /* a real identifier, not "<null>"/internal */
+            JSValue r = qjs_opq_make(ctx, 1, nm, qjs_t_leaf(nm));
+            JS_FreeCString(ctx, nm);
+            return r;
+        }
+        if (nm) JS_FreeCString(ctx, nm);
+    }
+    return qjs_opq_make(ctx, 1, fallback, qjs_t_opaque());
+}
+
+/* If `b` is a registered event handler, its arg0 (the event) is genuine
+   attacker input — replace the SYNTH arg the generic driver built with a TAINT
+   leaf labeled "handler.event", so a reached sink solves to a REAL_EXPLOIT/PoC
+   (the postMessage-XSS channel) instead of EXPLOIT_UNPROVEN. No-op for
+   non-handlers, so it never over-taints a structural drive. */
+static void qjs_fe_taint_event_arg0(JSContext *ctx, struct JSFunctionBytecode *b, JSValue *args, int nargs) {
+    if (b && b->qjs_is_event_handler && nargs > 0 && args) {
+        JS_FreeValue(ctx, args[0]);
+        args[0] = qjs_opq_make(ctx, 0, "handler.event", qjs_t_leaf("handler.event"));
+    }
+}
 
 typedef struct JSBoundFunction {
     JSValue func_obj;
@@ -1199,6 +3079,7 @@ static JSValue js_call_bound_function(JSContext *ctx, JSValueConst func_obj,
 static JSValue JS_CallInternal(JSContext *ctx, JSValueConst func_obj,
                                JSValueConst this_obj, JSValueConst new_target,
                                int argc, JSValueConst *argv, int flags);
+static void qjs_drive_opaque_call_cbs(JSContext *ctx, JSValueConst *call_argv, int call_argc);
 static JSValue JS_CallConstructorInternal(JSContext *ctx,
                                           JSValueConst func_obj,
                                           JSValueConst new_target,
@@ -1543,6 +3424,12 @@ static JSValue js_number(double d)
         return js_int32((int32_t)d);
     else
         return js_float64(d);
+}
+
+static JSValue __JS_NewShortBigInt(JSContext *ctx, int32_t d)
+{
+    (void)&ctx;
+    return JS_MKVAL(JS_TAG_SHORT_BIG_INT, d);
 }
 
 JSValue JS_NewNumber(JSContext *ctx, double d)
@@ -2136,7 +4023,19 @@ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
     JSJobEntry *e;
     int i;
 
-    assert(!rt->in_free);
+    /* A job enqueued WHILE the runtime is being freed (in_free) can never run
+       — the event loop is gone once JS_FreeRuntime starts. Enqueuing anyway
+       js_dup's the argv objects onto a job_list that's about to be discarded,
+       stranding them so JS_FreeRuntime's final list_empty(&rt->gc_obj_list)
+       check fails (aborting the wasm at emcc -O1 where assert() is live). A
+       Promise reaction / finalizer settling during teardown legitimately
+       reaches here on heavy-async bundles (learn.microsoft.com's deep-grind
+       teardown). Dropping the unrunnable job is the correct teardown
+       semantic, not a leak mask: it releases nothing it should keep and lets
+       the free sweep complete. (Upstream asserts here; the assert documented
+       the invariant, the early-return enforces it safely.) */
+    if (rt->in_free)
+        return 0;
 
     e = js_malloc(ctx, sizeof(*e) + argc * sizeof(JSValue));
     if (!e)
@@ -2193,6 +4092,24 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
     js_free(ctx, e);
     *pctx = ctx;
     return ret;
+}
+
+/* Drop (free without running) every pending microtask job — mirrors the
+   job_list cleanup in JS_FreeRuntime. The deep orphan drive calls this after
+   an async orphan's host site has fired: the jobs left in the queue are the
+   fetch's own .then() response-processing chain (no new @H), and leaving them
+   pending across ~1000 orphans accumulates references that balloon memory
+   (24 GB observed). Bounded-memory robustness, not an analysis cap — the @H
+   the drive came for has already been emitted before this runs. */
+static void qjs_drop_pending_jobs(JSRuntime *rt) {
+    struct list_head *el, *el1;
+    list_for_each_safe(el, el1, &rt->job_list) {
+        JSJobEntry *e = list_entry(el, JSJobEntry, link);
+        for (int i = 0; i < e->argc; i++)
+            JS_FreeValueRT(rt, e->argv[i]);
+        js_free_rt(rt, e);
+    }
+    init_list_head(&rt->job_list);
 }
 
 static inline uint32_t atom_get_free(const JSAtomStruct *p)
@@ -2339,6 +4256,28 @@ void JS_FreeRuntime(JSRuntime *rt)
     }
 #endif
 
+    if (!list_empty(&rt->gc_obj_list)) {
+        /* Diagnostic before the assertion fires: dump what type of GC
+           objects remain. This is the leak we need to fix (NOT mask). */
+        int n_obj = 0, n_bc = 0, n_shape = 0, n_var = 0, n_async = 0, n_ctx = 0, n_other = 0;
+        struct list_head *el;
+        list_for_each(el, &rt->gc_obj_list) {
+            JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
+            switch (gp->gc_obj_type) {
+            case JS_GC_OBJ_TYPE_JS_OBJECT: n_obj++; break;
+            case JS_GC_OBJ_TYPE_FUNCTION_BYTECODE: n_bc++; break;
+            case JS_GC_OBJ_TYPE_SHAPE: n_shape++; break;
+            case JS_GC_OBJ_TYPE_VAR_REF: n_var++; break;
+            case JS_GC_OBJ_TYPE_ASYNC_FUNCTION: n_async++; break;
+            case JS_GC_OBJ_TYPE_JS_CONTEXT: n_ctx++; break;
+            default: n_other++; break;
+            }
+        }
+        fprintf(stderr,
+            "@WHY {\"phase\":\"FreeRuntime_residue\",\"obj\":%d,\"bytecode\":%d,\"shape\":%d,\"varref\":%d,\"async\":%d,\"context\":%d,\"other\":%d}\n",
+            n_obj, n_bc, n_shape, n_var, n_async, n_ctx, n_other);
+        fflush(stderr);
+    }
     assert(list_empty(&rt->gc_obj_list));
 
     /* free the classes */
@@ -4410,6 +6349,8 @@ JSValue JS_NewStringUTF16(JSContext *ctx, const uint16_t *buf, size_t len)
 
     if (unlikely(!len))
         return js_empty_string(ctx->rt);
+    if (unlikely(len > JS_STRING_LEN_MAX))
+        return JS_ThrowRangeError(ctx, "invalid string length");
 
     str = js_alloc_string(ctx, len, 1);
     if (unlikely(!str))
@@ -6251,6 +8192,7 @@ static JSValue js_call_c_function_data(JSContext *ctx, JSValueConst func_obj,
     sf->is_strict_mode = false;
     sf->cur_func = unsafe_unconst(func_obj);
     sf->arg_count = argc;
+    sf->qjs_inv = 0; sf->qjs_looped = 0;   /* native/bound frame: no bytecode, but a descendant's _inloop reads qjs_looped up the chain — leaving it uninitialised made keying (and thus the learned endpoint set) nondeterministic build-to-build */
     ret = s->func(ctx, this_val, argc, arg_buf, s->magic, vc(s->data));
     rt->current_stack_frame = sf->prev_frame;
     return ret;
@@ -6376,6 +8318,7 @@ static JSValue js_call_c_closure(JSContext *ctx, JSValueConst func_obj,
     sf->is_strict_mode = false;
     sf->cur_func = unsafe_unconst(func_obj);
     sf->arg_count = argc;
+    sf->qjs_inv = 0; sf->qjs_looped = 0;   /* native/bound frame: no bytecode, but a descendant's _inloop reads qjs_looped up the chain — leaving it uninitialised made keying (and thus the learned endpoint set) nondeterministic build-to-build */
     ret = s->func(ctx, this_val, argc, arg_buf, s->magic, s->opaque);
     rt->current_stack_frame = sf->prev_frame;
 
@@ -6947,8 +8890,39 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
     }
 }
 
+/* Set by gc_decref before each mark_children so the underflow diagnostic can
+   name the PARENT holding the dangling reference to a freed child — the freed
+   child itself has class_id 0 (says nothing), but the parent's type points
+   straight at the fork patch that over-freed. */
+static JSGCObjectHeader *g_gc_decref_parent = NULL;
 static void gc_decref_child(JSRuntime *rt, JSGCObjectHeader *p)
 {
+    if (p->ref_count <= 0) {
+        /* OBSERVABILITY: a refcount UNDERFLOW here = an object decref'd more than
+           incref'd — a fork-patch bug (opaque sentinel / deep-drive / snapshot
+           path). The abort recurs ~1/vendor-grind in the Chrome worker but does
+           NOT reproduce in the CLI, so report WHAT underflows (gc type + class id
+           for an object, line for a bytecode) BEFORE the assert aborts, so a
+           Chrome run names the culprit instead of a bare "wasm_abort". */
+        int cid = -1, lnum = -1;
+        if (p->gc_obj_type == JS_GC_OBJ_TYPE_JS_OBJECT) cid = (int)((JSObject *)p)->class_id;
+        else if (p->gc_obj_type == JS_GC_OBJ_TYPE_FUNCTION_BYTECODE) lnum = (int)((JSFunctionBytecode *)p)->line_num;
+        /* Bake the underflowing object's type into the abort MESSAGE via
+           __assert_fail directly — that message is what reaches the worker's
+           onAbort(reason), the one channel that reliably survives the wasm abort
+           (emscripten's stderr/stdout buffers are lost on abort, so a printf/
+           fprintf diagnostic here never arrives). Names the culprit so the
+           recurring Chrome-only teardown abort is diagnosable, not a bare assert. */
+        int pgt = -1, pcid = -1;
+        if (g_gc_decref_parent) {
+            pgt = (int)g_gc_decref_parent->gc_obj_type;
+            if (pgt == JS_GC_OBJ_TYPE_JS_OBJECT) pcid = (int)((JSObject *)g_gc_decref_parent)->class_id;
+        }
+        static char gcmsg[200];
+        snprintf(gcmsg, sizeof gcmsg, "gc_decref_underflow child[gcType=%d classId=%d line=%d] parent[gcType=%d classId=%d] rc=%d",
+                 (int)p->gc_obj_type, cid, lnum, pgt, pcid, (int)p->ref_count);
+        __assert_fail(gcmsg, __FILE__, __LINE__, __func__);
+    }
     assert(p->ref_count > 0);
     p->ref_count--;
     if (p->ref_count == 0 && p->mark == 1) {
@@ -6970,6 +8944,7 @@ static void gc_decref(JSRuntime *rt)
     list_for_each_safe(el, el1, &rt->gc_obj_list) {
         p = list_entry(el, JSGCObjectHeader, link);
         assert(p->mark == 0);
+        g_gc_decref_parent = p;   /* diagnostic: parent of any underflowing child */
         mark_children(rt, p, gc_decref_child);
         p->mark = 1;
         if (p->ref_count == 0) {
@@ -7712,6 +9687,43 @@ fail:
     return b->line_num;
 }
 
+/* Generated source position (1-based line/col) of the executing bytecode,
+   from the live stack frame's cur_pc — same derivation build_backtrace uses.
+   Returns 0 when unavailable (no frame / not a bytecode fn / no pc2line). */
+static int qjs_cur_loc(JSContext *ctx, int *line, int *col) {
+    JSStackFrame *sf = ctx->rt->current_stack_frame;
+    if (!sf || !sf->cur_pc || JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT) return 0;
+    JSObject *p = JS_VALUE_GET_OBJ(sf->cur_func);
+    if (!p) return 0;
+    int cid = p->class_id;
+    if (cid != JS_CLASS_BYTECODE_FUNCTION && cid != JS_CLASS_GENERATOR_FUNCTION &&
+        cid != JS_CLASS_ASYNC_FUNCTION && cid != JS_CLASS_ASYNC_GENERATOR_FUNCTION) return 0;
+    JSFunctionBytecode *b = p->u.func.function_bytecode;
+    if (!b || !b->byte_code_buf || !b->pc2line_buf) return 0;
+    uint32_t pc = (uint32_t)(sf->cur_pc - b->byte_code_buf - 1);
+    int c = 1, ln = find_line_num(ctx, b, pc, &c);
+    if (ln <= 0) return 0;
+    *line = ln; *col = c;
+    return 1;
+}
+
+/* Stamp an opaque value's term with its generated read position (interpreter
+   live pc) the FIRST time read. Template-literal holes (`/${e}` lowers to
+   "/".concat(e) via OP_call_method, NOT OP_add) get per-token positions this
+   way, so the source-map library can name each path param distinctly. Opaque-
+   only; the caller gates on a cheap tag check so non-object reads pay nothing. */
+static void qjs_stamp_rd(JSContext *ctx, JSFunctionBytecode *b, const uint8_t *pc, JSValueConst v) {
+    return; /* DISABLED: read-site position stamping caused a wasm "memory access out of bounds" on real Chrome bundles (not reproduced in the _wdeep fixture). Relabel deferred pending root-cause; grind restored. */
+    qjs_opq *o = qjs_opq_of(v);
+    if (!o || !o->term || o->term->line || !b || !b->byte_code_buf || !b->pc2line_buf) return;
+    /* Only LEAF/MEMBER terms ever become a URL-hole NAME (qjs_url_hole_name);
+       concat/compare/call terms — which dominate opaque churn during the grind —
+       never do, so skip the pc2line walk for them. Keeps the hot read path off
+       find_line_num except for the bounded set of named-source reads. */
+    if (o->term->op != 'L' && o->term->op != 'M') return;
+    int c = 1, l = find_line_num(ctx, b, (uint32_t)(pc - b->byte_code_buf - 1), &c);
+    if (l > 0) { o->term->line = l; o->term->col = c; }
+}
 /* in order to avoid executing arbitrary code during the stack trace
    generation, we only look at simple 'name' properties containing a
    string. */
@@ -7760,7 +9772,7 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
                             int line_num, int col_num, int backtrace_flags)
 {
     JSStackFrame *sf, *sf_start;
-    JSValue stack, prepare, saved_exception;
+    JSValue stack, prepare, saved_exception, error_obj;
     DynBuf dbuf;
     const char *func_name_str;
     const char *str1;
@@ -7777,6 +9789,7 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
     if (rt->in_build_stack_trace)
         return;
     rt->in_build_stack_trace = true;
+    error_obj = js_dup(error_val);
 
     // Save exception because conversion to double may fail.
     saved_exception = JS_GetException(ctx);
@@ -7922,7 +9935,7 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
             JS_FreeValue(ctx, csd[k].func_name);
         }
         JSValueConst args[] = {
-            error_val,
+            error_obj,
             stack,
         };
         JSValue stack2 = JS_Call(ctx, prepare, ctx->error_ctor, countof(args), args);
@@ -7943,13 +9956,14 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
 
     if (JS_IsUndefined(ctx->error_back_trace))
         ctx->error_back_trace = js_dup(stack);
-    if (has_filter_func || can_add_backtrace(error_val)) {
-        JS_DefinePropertyValue(ctx, error_val, JS_ATOM_stack, stack,
+    if (has_filter_func || can_add_backtrace(error_obj)) {
+        JS_DefinePropertyValue(ctx, error_obj, JS_ATOM_stack, stack,
                                JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
     } else {
         JS_FreeValue(ctx, stack);
     }
 
+    JS_FreeValue(ctx, error_obj);
     rt->in_build_stack_trace = false;
 }
 
@@ -8208,10 +10222,104 @@ static void JS_ThrowInterrupted(JSContext *ctx)
     JS_SetUncatchableError(ctx, ctx->rt->current_exception);
 }
 
+#if defined(__EMSCRIPTEN__) && defined(QJS_HAS_JSPI)
+/* qjs_host_yield is declared in quickjs-forced.h (included above). The
+   op-poll heartbeat is the ONE fine-grained yield point: it fires every
+   JS_INTERRUPT_COUNTER_INIT ops (including at every OP_if, which polls),
+   giving the host a turn for cross-page preemption + cooling sleeps. */
+#define QJS_DO_YIELD() qjs_host_yield()
+#else
+#define QJS_DO_YIELD() ((void)0)
+#endif
+
+/* ALWAYS-ON non-termination surface (was the -DQJS_SPIN_PROBE native-only dump).
+   A resumed-but-non-terminating forced drive MUST name its stuck site — never
+   stay a bare resumeCount (CLAUDE.md observability). After a high cadence of
+   FORCED OP_if decisions (8M; a terminating drive does thousands, so this fires
+   ONLY on a non-terminating one), emit ONE concise @WHY to STDOUT (the worker
+   captures stdout into _whyRecords; stderr is lost on the worker). It reports the
+   site AND whether the loop-revisit fixpoint KEY already holds it (hk_seen): if
+   0, the fixpoint isn't catching this construct's revisit = the keying hole to
+   close. A diagnostic CADENCE, NOT a cap — the drive continues; the fix is to
+   make the fixpoint terminate the loop, never to bound it. */
+/* Forced decisions since the last DRIVE/ORPHAN boundary (reset on @DD, the
+   deep-grind per-orphan boundary). A single segment doing >500k forced
+   decisions = non-terminating: a deep-grind orphan that never returns (no @DD),
+   OR a BFS drive whose one schedule's forced exec never completes (SO — no @DD
+   at all). Resetting per @DD means a large TERMINATING grind (MS: 11915 orphans,
+   each <500k before its @DD) never false-fires; only a segment that blows past
+   500k without a boundary does. Catches hard no-progress spins AND churn-with-
+   progress (SO) alike — strictly broader than a host-progress reset. */
+static unsigned long long g_spin_n = 0;
+static void qjs_spin_probe(JSContext *ctx, JSStackFrame *sf, JSFunctionBytecode *cur, const uint8_t *pc) {
+    if ((++g_spin_n) < 500000ULL) return;
+    g_spin_n = 0;   /* re-arm so a persistent spin re-emits (deduped by site on the worker) */
+    if (!cur || !cur->byte_code_buf) return;
+    long pco = (long)(pc - cur->byte_code_buf);
+    unsigned long long _s = (((unsigned long long)cur->line_num << 40) ^ ((unsigned long long)cur->col_num << 24) ^ (unsigned long long)(size_t)pco);
+    int _hin = 0, _hrec = 0; JSFunctionBytecode *_hmb = JS_GetFunctionBytecode(sf->cur_func);
+    for (JSStackFrame *_af = sf->prev_frame; _af && !(_hin && _hrec); _af = _af->prev_frame) {
+        if (_af->qjs_looped && !sf->qjs_looped) _hin = 1;
+        if (_hmb && JS_GetFunctionBytecode(_af->cur_func) == _hmb) _hrec = 1;
+    }
+    unsigned long long _hk = (_hin || _hrec) ? _s : (_s ^ ((unsigned long long)sf->qjs_inv * 0x9E3779B97F4A7C15ULL));
+    int _hd = -1; int _hseen = qjs_fe_seen_get(_hk, &_hd);
+    const char *fn = cur->filename ? JS_AtomToCString(ctx, cur->filename) : NULL;
+    printf("@WHY {\"phase\":\"spin_nonterminating\",\"file\":\"%s\",\"line\":%d,\"col\":%d,\"pc\":%ld,\"inv\":%u,\"ownlooped\":%u,\"inloop\":%d,\"recur\":%d,\"hk_seen\":%d}\n",
+           fn ? fn : "?", cur->line_num, cur->col_num, pco, sf->qjs_inv, sf->qjs_looped, _hin, _hrec, _hseen);
+    fflush(stdout);
+    if (fn) JS_FreeCString(ctx, fn);
+}
+#define QJS_SPIN_PROBE_CALL(b, pc) qjs_spin_probe(ctx, sf, (b), (pc))
+
+/* On every yield, emit @Y with reachability info from the current frame
+   so the host scheduler can apply lexicographic priority across all
+   suspended code flows. `reaches=1` means the bytecode position
+   downstream of cur_pc contains a host-edge atom (fetch/XHR/sink) —
+   i.e. this fiber's slice has potential to emit @H/@S; `reaches=0`
+   means it's currently in code that can't reach an endpoint, so other
+   fiber's may be more productive. The host pairs this with its own
+   per-fiber metadata (page focus / visit recency / recent emissions /
+   age-since-resumed) for the full lexicographic priority. */
+static void qjs_emit_yield_status(JSContext *ctx) {
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSStackFrame *sf = rt->current_stack_frame;
+    int reaches = 0;
+    if (sf && JS_VALUE_GET_TAG(sf->cur_func) == JS_TAG_OBJECT) {
+        JSObject *p = JS_VALUE_GET_OBJ(sf->cur_func);
+        if (p && (p->class_id == JS_CLASS_BYTECODE_FUNCTION ||
+                  p->class_id == JS_CLASS_GENERATOR_FUNCTION ||
+                  p->class_id == JS_CLASS_ASYNC_FUNCTION ||
+                  p->class_id == JS_CLASS_ASYNC_GENERATOR_FUNCTION)) {
+            JSFunctionBytecode *b = p->u.func.function_bytecode;
+            if (b && b->byte_code_buf && sf->cur_pc >= b->byte_code_buf) {
+                long pco = (long)(sf->cur_pc - b->byte_code_buf);
+                if (pco >= 0 && pco < b->byte_code_len) {
+                    reaches = qjs_host_reach_from(ctx, b, (int)pco) ? 1 : 0;
+                }
+            }
+        }
+    }
+    printf("@Y reaches=%d\n", reaches);
+    fflush(stdout);
+}
+
 static no_inline __exception int __js_poll_interrupts(JSContext *ctx)
 {
     JSRuntime *rt = ctx->rt;
     ctx->interrupt_counter = JS_INTERRUPT_COUNTER_INIT;
+    /* Cooperative yield (JSPI-enabled wasm only): every poll (QuickJS's
+       existing JS_INTERRUPT_COUNTER_INIT cadence — not a new cap), emit
+       a @Y reachability signal then call back to the host via JSPI
+       (real wasm stack switching, no save buffer / no depth cap on the
+       suspended call chain). The host's qjs_host_yield resolves the
+       suspension by lexicographic priority across all paused flows.
+       Native + non-JSPI wasm builds (qjs.exe, qjs_mod.mjs, qjs_wasm.js)
+       skip this — single-threaded iteration tools, no orchestrator. */
+#if defined(__EMSCRIPTEN__) && defined(QJS_HAS_JSPI)
+    qjs_emit_yield_status(ctx);
+#endif
+    QJS_DO_YIELD();
     if (rt->interrupt_handler) {
         if (rt->interrupt_handler(rt, rt->interrupt_opaque)) {
             JS_ThrowInterrupted(ctx);
@@ -8674,8 +10782,16 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
     if (unlikely(tag != JS_TAG_OBJECT)) {
         switch(tag) {
         case JS_TAG_NULL:
+            /* J-Force §4.1 missing-object recovery: under forced
+               execution a mutated predicate can leave a base null on
+               an infeasible path; crashing there loses every deeper
+               fetch/XHR call site. Yield opaque (infectious) so the
+               forced run continues — gated by qjs_fe_enabled so normal
+               execution keeps exact ECMA throw semantics. */
+            if (qjs_fe_enabled) return qjs_synth_new(ctx);
             return JS_ThrowTypeErrorAtom(ctx, "cannot read property '%s' of null", prop);
         case JS_TAG_UNDEFINED:
+            if (qjs_fe_enabled) return qjs_synth_new(ctx);
             return JS_ThrowTypeErrorAtom(ctx, "cannot read property '%s' of undefined", prop);
         case JS_TAG_EXCEPTION:
             return JS_EXCEPTION;
@@ -9596,6 +11712,9 @@ static JSValue JS_GetPropertyValue(JSContext *ctx, JSValueConst this_obj,
         JS_FreeValue(ctx, prop);
         if (unlikely(atom == JS_ATOM_NULL))
             return JS_EXCEPTION;
+        /* J-Force §4.1 missing-object recovery (computed-key get) —
+           see JS_GetPropertyInternal; same forced-only gate. */
+        if (qjs_fe_enabled) { JS_FreeAtom(ctx, atom); return qjs_synth_new(ctx); }
         if (tag == JS_TAG_NULL) {
             JS_ThrowTypeErrorAtom(ctx, "cannot read property '%s' of null", atom);
         } else {
@@ -14739,6 +16858,7 @@ static no_inline __exception int js_unary_arith_slow(JSContext *ctx,
     JSBigInt *p1;
 
     op1 = sp[-1];
+    if (qjs_is_opaque(op1)) { JSValue _r = qjs_opaque_unary(ctx, op1); JS_FreeValue(ctx, op1); sp[-1] = _r; return 0; }
     /* fast path for float64 */
     if (JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(op1)))
         goto handle_float64;
@@ -14890,6 +17010,7 @@ static no_inline int js_not_slow(JSContext *ctx, JSValue *sp)
     JSValue op1;
 
     op1 = sp[-1];
+    if (qjs_is_opaque(op1)) { JSValue _r = qjs_opaque_unary(ctx, op1); JS_FreeValue(ctx, op1); sp[-1] = _r; return 0; }
     op1 = JS_ToNumericFree(ctx, op1);
     if (JS_IsException(op1))
         goto exception;
@@ -15117,6 +17238,30 @@ static no_inline __exception int js_add_slow(JSContext *ctx, JSValue *sp)
     op1 = sp[-2];
     op2 = sp[-1];
 
+    /* Infectious string concatenation on TAINT opaque (X-Force "unknown
+       is infectious" generalized to OP_add). Without this, opaque +
+       "...html..." would ToPrimitive to "[object Object]" + html and
+       produce a CONCRETE string carrying the marker; the @S record
+       still fires (via the marker substring) but the Z3 query loses
+       the CONCAT structure of Ψ, degrading verdicts on
+       attacker-injected-into-template sinks to fresh-free-var
+       over-approx. Building a CONCAT (op='F' s="concat") term keeps
+       Ψ precise: Z3 sees Z3_mk_seq_concat(prefix, leaf, suffix) and
+       the exploit-shape check is exact. SYNTH flavor stays SYNTH;
+       label propagates from the TAINT operand. */
+    if (qjs_is_opaque(op1) || qjs_is_opaque(op2)) {
+        qjs_opq *ta = qjs_is_taint(op1) ? qjs_opq_of(op1) : (qjs_is_taint(op2) ? qjs_opq_of(op2) : NULL);
+        qjs_opq *anyop = qjs_opq_of(op1) ? qjs_opq_of(op1) : qjs_opq_of(op2);
+        qjs_term *la = qjs_t_of_val(ctx, op1);
+        qjs_term *lb = qjs_t_of_val(ctx, op2);
+                qjs_term *ct = qjs_t_call("concat", la, lb);
+        JSValue r = qjs_opq_make(ctx, ta ? 0 : 1,
+                                 ta ? ta->label : (anyop ? anyop->label : NULL), ct);
+        JS_FreeValue(ctx, op1); JS_FreeValue(ctx, op2);
+        sp[-2] = r;
+        return 0;
+    }
+
     tag1 = JS_VALUE_GET_NORM_TAG(op1);
     tag2 = JS_VALUE_GET_NORM_TAG(op2);
     /* fast path for float64 */
@@ -15237,6 +17382,7 @@ static no_inline __exception int js_binary_logic_slow(JSContext *ctx,
 
     op1 = sp[-2];
     op2 = sp[-1];
+    if (qjs_is_opaque(op1) || qjs_is_opaque(op2)) { JSValue _r = qjs_cmp_term(ctx, op1, op2, "&"); JS_FreeValue(ctx, op1); JS_FreeValue(ctx, op2); sp[-2] = _r; return 0; }
     tag1 = JS_VALUE_GET_NORM_TAG(op1);
     tag2 = JS_VALUE_GET_NORM_TAG(op2);
 
@@ -15753,6 +17899,7 @@ static no_inline int js_shr_slow(JSContext *ctx, JSValue *sp)
 
     op1 = sp[-2];
     op2 = sp[-1];
+    if (qjs_is_opaque(op1) || qjs_is_opaque(op2)) { JSValue _r = qjs_cmp_term(ctx, op1, op2, "&"); JS_FreeValue(ctx, op1); JS_FreeValue(ctx, op2); sp[-2] = _r; return 0; }
     op1 = JS_ToNumericFree(ctx, op1);
     if (JS_IsException(op1)) {
         JS_FreeValue(ctx, op2);
@@ -16489,6 +18636,25 @@ static JSValue JS_GetIterator(JSContext *ctx, JSValueConst obj, bool is_async)
 {
     JSValue method, ret, sync_iter;
 
+    /* Forced-exec: opaque is infectious through the iteration protocol
+       too (X-Force assume-and-continue). `for…of`/spread/destructuring
+       of a host-unknown (e.g. document.cookie.split(";")) must not
+       throw "value is not iterable" — it yields a BOUNDED opaque
+       iterator: one opaque element then done (a real Array Iterator,
+       so the protocol is exact and termination is structural). The
+       loop body runs once with an opaque element; its gates fork. */
+    if (qjs_is_opaque(obj)) {
+        JSValue arr = JS_NewArray(ctx);
+        if (!JS_IsException(arr)) {
+            JS_SetPropertyUint32(ctx, arr, 0, qjs_like(ctx, obj));
+            JSValue m = JS_GetProperty(ctx, arr, JS_ATOM_Symbol_iterator);
+            ret = JS_GetIterator2(ctx, arr, m);
+            JS_FreeValue(ctx, m);
+            JS_FreeValue(ctx, arr);
+            return ret;
+        }
+    }
+
     if (is_async) {
         method = JS_GetProperty(ctx, obj, JS_ATOM_Symbol_asyncIterator);
         if (JS_IsException(method))
@@ -17118,6 +19284,7 @@ static JSValue js_closure2(JSContext *ctx, JSValue func_obj,
             var_refs[i] = var_ref;
         }
     }
+    if (qjs_deep_rb) qjs_deep_capture_inst(ctx, b, func_obj);
     return func_obj;
  fail:
     /* bfunc is freed when func_obj is freed */
@@ -17368,6 +19535,7 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
     sf->is_strict_mode = false;
     sf->cur_func = unsafe_unconst(func_obj);
     sf->arg_count = argc;
+    sf->qjs_inv = 0; sf->qjs_looped = 0;   /* native/bound frame: no bytecode, but a descendant's _inloop reads qjs_looped up the chain — leaving it uninitialised made keying (and thus the learned endpoint set) nondeterministic build-to-build */
     arg_buf = argv;
 
     if (unlikely(argc < arg_count)) {
@@ -17672,6 +19840,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #endif
 
  restart:
+    b->qjs_executed = 1;   /* reached: __feDriveStatic drives only unreached functions */
+    /* A generator/async RESUME re-enters here (goto restart from the
+       JS_CALL_FLAG_GENERATOR path) with the SAME logical invocation — its
+       qjs_inv was stamped once in async_func_init. Re-stamping per resume gave
+       every `await`-iteration a fresh inv, so an opaque-gated loop containing an
+       `await` (real MS-Learn SSE reader, _idxdocs.js:9485 `async run`) was keyed
+       by an ever-changing inv and the loop-revisit fixpoint NEVER collapsed it
+       (deep-grind freeze). qjs_looped must likewise persist across resumes (a
+       back-edge taken in an earlier resume is still a loop). Only a fresh
+       (non-generator) frame gets a new per-invocation id. */
+    if (!(flags & JS_CALL_FLAG_GENERATOR)) {
+        sf->qjs_inv = ++qjs_inv_ctr;   /* per-invocation id for the loop-revisit key (see JSStackFrame) */
+        sf->qjs_looped = 0;            /* set on this frame's first backward branch (loop back-edge) */
+    }
     for(;;) {
         int call_argc;
         JSValue *call_argv;
@@ -17758,6 +19940,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (unlikely(JS_IsException(val)))
                         goto exception;
                 }
+                /* Forced-exec: .length on opaque becomes MEMBER('length',
+                   base) so the Z3 query can use str.len(leaf) for
+                   sanitizer-length gates like `if (s.length < N)`. */
+                if (qjs_is_opaque(sp[-1])) { JS_FreeValue(ctx, val); val = qjs_member(ctx, sp[-1], atom); }
                 JS_FreeValue(ctx, sp[-1]);
                 sp[-1] = val;
             }
@@ -18034,11 +20220,26 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             has_call_argc:
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
-                ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
-                                          JS_UNDEFINED, call_argc,
-                                          vc(call_argv), 0);
-                if (unlikely(JS_IsException(ret_val)))
-                    goto exception;
+                /* Forced-exec: calling a host-unknown (opaque) callee
+                   (e.g. an opaque-typed factory) yields unknown, not
+                   a TypeError — the path keeps running so downstream
+                   gate predicates still fork. Build a CALL term with
+                   the callee's MEMBER name if known (chained from a
+                   prior OP_get_field on opaque); first arg term is
+                   the second child. Receiver is JS_UNDEFINED here
+                   (non-method call). */
+                if (qjs_is_opaque(call_argv[-1])) {
+                    ret_val = qjs_call(ctx, JS_UNDEFINED, call_argv[-1], call_argc, vc(call_argv));
+                    /* opaque callee dropped any callback args — drive them so a
+                       fetch inside `unknownFactory(cb)` still fires (see helper). */
+                    qjs_drive_opaque_call_cbs(ctx, vc(call_argv), call_argc);
+                } else {
+                    ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
+                                              JS_UNDEFINED, call_argc,
+                                              vc(call_argv), 0);
+                    if (unlikely(JS_IsException(ret_val)))
+                        goto exception;
+                }
                 if (opcode == OP_tail_call)
                     goto done;
                 for(i = -1; i < call_argc; i++)
@@ -18071,11 +20272,26 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc += 2;
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
-                ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
-                                          JS_UNDEFINED, call_argc,
-                                          vc(call_argv), 0);
-                if (unlikely(JS_IsException(ret_val)))
-                    goto exception;
+                /* Forced-exec: opaque receiver or method (e.g.
+                   opaque.indexOf(x), data.cb() where data is unknown)
+                   -> unknown result, no TypeError. Build a CALL term
+                   so the receiver's symbolic expression + method name
+                   carry forward into Φ and the Z3 query (a
+                   `.startsWith("safe-")` gate becomes a real prefix
+                   constraint instead of a free var). */
+                if (qjs_is_opaque(call_argv[-1]) || qjs_is_opaque(call_argv[-2])) {
+                    ret_val = qjs_call(ctx, call_argv[-2], call_argv[-1], call_argc, vc(call_argv));
+                    /* opaque receiver/method dropped any callback args — drive
+                       them so `data.rows.forEach(cb)` / `sel.ids.map(cb)` fire
+                       their per-element fetch (see helper). */
+                    qjs_drive_opaque_call_cbs(ctx, vc(call_argv), call_argc);
+                } else {
+                    ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
+                                              JS_UNDEFINED, call_argc,
+                                              vc(call_argv), 0);
+                    if (unlikely(JS_IsException(ret_val)))
+                        goto exception;
+                }
                 if (opcode == OP_tail_call_method)
                     goto done;
                 for(i = -2; i < call_argc; i++)
@@ -18159,12 +20375,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
         CASE(OP_check_brand):
             {
-                int ret = JS_CheckBrand(ctx, sp[-2], sp[-1]);
-                if (ret < 0)
-                    goto exception;
-                if (!ret) {
-                    JS_ThrowTypeError(ctx, "invalid brand on object");
-                    goto exception;
+                /* Forced-exec: a driven handler with opaque `this`
+                   (__feDriveStatic / J-Force) has no brand; JS_CheckBrand
+                   would throw and abort the private method/getter before
+                   its host edge. Treat the brand as unknown-infectious
+                   (skip the check) so `this.#m()` / `this.#g` on an opaque
+                   receiver still drives through to the fetch. */
+                if (!qjs_is_opaque(sp[-2])) {
+                    int ret = JS_CheckBrand(ctx, sp[-2], sp[-1]);
+                    if (ret < 0)
+                        goto exception;
+                    if (!ret) {
+                        JS_ThrowTypeError(ctx, "invalid brand on object");
+                        goto exception;
+                    }
                 }
             }
             BREAK;
@@ -18316,6 +20540,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSAtom atom;
                 atom = get_u32(pc);
                 pc += 4;
+                if (unlikely(!b->qjs_h_fired)) qjs_mark_h_fired(b, atom);
                 sf->cur_pc = pc;
 
                 val = JS_GetGlobalVar(ctx, atom, opcode - OP_get_var_undef);
@@ -18382,7 +20607,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int idx;
                 idx = get_u16(pc);
                 pc += 2;
-                sp[0] = js_dup(var_buf[idx]);
+                sp[0] = js_dup(var_buf[idx]); if (JS_VALUE_GET_TAG(sp[0])==JS_TAG_OBJECT) qjs_stamp_rd(ctx,b,pc,sp[0]);
                 sp++;
             }
             BREAK;
@@ -18408,7 +20633,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int idx;
                 idx = get_u16(pc);
                 pc += 2;
-                sp[0] = js_dup(arg_buf[idx]);
+                sp[0] = js_dup(arg_buf[idx]); if (JS_VALUE_GET_TAG(sp[0])==JS_TAG_OBJECT) qjs_stamp_rd(ctx,b,pc,sp[0]);
                 sp++;
             }
             BREAK;
@@ -18430,7 +20655,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
 
-        CASE(OP_get_loc8): *sp++ = js_dup(var_buf[*pc++]); BREAK;
+        CASE(OP_get_loc8): *sp++ = js_dup(var_buf[*pc++]); if (JS_VALUE_GET_TAG(sp[-1])==JS_TAG_OBJECT) qjs_stamp_rd(ctx,b,pc,sp[-1]); BREAK;
         CASE(OP_put_loc8): set_value(ctx, &var_buf[*pc++], *--sp); BREAK;
         CASE(OP_set_loc8): set_value(ctx, &var_buf[*pc++], js_dup(sp[-1])); BREAK;
 
@@ -18442,10 +20667,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             *sp++ = js_dup(var_buf[1]);
             BREAK;
 
-        CASE(OP_get_loc0): *sp++ = js_dup(var_buf[0]); BREAK;
-        CASE(OP_get_loc1): *sp++ = js_dup(var_buf[1]); BREAK;
-        CASE(OP_get_loc2): *sp++ = js_dup(var_buf[2]); BREAK;
-        CASE(OP_get_loc3): *sp++ = js_dup(var_buf[3]); BREAK;
+        CASE(OP_get_loc0): *sp++ = js_dup(var_buf[0]); if (JS_VALUE_GET_TAG(sp[-1])==JS_TAG_OBJECT) qjs_stamp_rd(ctx,b,pc,sp[-1]); BREAK;
+        CASE(OP_get_loc1): *sp++ = js_dup(var_buf[1]); if (JS_VALUE_GET_TAG(sp[-1])==JS_TAG_OBJECT) qjs_stamp_rd(ctx,b,pc,sp[-1]); BREAK;
+        CASE(OP_get_loc2): *sp++ = js_dup(var_buf[2]); if (JS_VALUE_GET_TAG(sp[-1])==JS_TAG_OBJECT) qjs_stamp_rd(ctx,b,pc,sp[-1]); BREAK;
+        CASE(OP_get_loc3): *sp++ = js_dup(var_buf[3]); if (JS_VALUE_GET_TAG(sp[-1])==JS_TAG_OBJECT) qjs_stamp_rd(ctx,b,pc,sp[-1]); BREAK;
         CASE(OP_put_loc0): set_value(ctx, &var_buf[0], *--sp); BREAK;
         CASE(OP_put_loc1): set_value(ctx, &var_buf[1], *--sp); BREAK;
         CASE(OP_put_loc2): set_value(ctx, &var_buf[2], *--sp); BREAK;
@@ -18454,10 +20679,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_set_loc1): set_value(ctx, &var_buf[1], js_dup(sp[-1])); BREAK;
         CASE(OP_set_loc2): set_value(ctx, &var_buf[2], js_dup(sp[-1])); BREAK;
         CASE(OP_set_loc3): set_value(ctx, &var_buf[3], js_dup(sp[-1])); BREAK;
-        CASE(OP_get_arg0): *sp++ = js_dup(arg_buf[0]); BREAK;
-        CASE(OP_get_arg1): *sp++ = js_dup(arg_buf[1]); BREAK;
-        CASE(OP_get_arg2): *sp++ = js_dup(arg_buf[2]); BREAK;
-        CASE(OP_get_arg3): *sp++ = js_dup(arg_buf[3]); BREAK;
+        CASE(OP_get_arg0): *sp++ = js_dup(arg_buf[0]); if (JS_VALUE_GET_TAG(sp[-1])==JS_TAG_OBJECT) qjs_stamp_rd(ctx,b,pc,sp[-1]); BREAK;
+        CASE(OP_get_arg1): *sp++ = js_dup(arg_buf[1]); if (JS_VALUE_GET_TAG(sp[-1])==JS_TAG_OBJECT) qjs_stamp_rd(ctx,b,pc,sp[-1]); BREAK;
+        CASE(OP_get_arg2): *sp++ = js_dup(arg_buf[2]); if (JS_VALUE_GET_TAG(sp[-1])==JS_TAG_OBJECT) qjs_stamp_rd(ctx,b,pc,sp[-1]); BREAK;
+        CASE(OP_get_arg3): *sp++ = js_dup(arg_buf[3]); if (JS_VALUE_GET_TAG(sp[-1])==JS_TAG_OBJECT) qjs_stamp_rd(ctx,b,pc,sp[-1]); BREAK;
         CASE(OP_put_arg0): set_value(ctx, &arg_buf[0], *--sp); BREAK;
         CASE(OP_put_arg1): set_value(ctx, &arg_buf[1], *--sp); BREAK;
         CASE(OP_put_arg2): set_value(ctx, &arg_buf[2], *--sp); BREAK;
@@ -18652,17 +20877,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         CASE(OP_goto):
-            pc += (int32_t)get_u32(pc);
+            { int32_t _o = (int32_t)get_u32(pc); if (_o < 0) sf->qjs_looped = 1; pc += _o; }
             if (unlikely(js_poll_interrupts(ctx)))
                 goto exception;
             BREAK;
         CASE(OP_goto16):
-            pc += (int16_t)get_u16(pc);
+            { int16_t _o = (int16_t)get_u16(pc); if (_o < 0) sf->qjs_looped = 1; pc += _o; }
             if (unlikely(js_poll_interrupts(ctx)))
                 goto exception;
             BREAK;
         CASE(OP_goto8):
-            pc += (int8_t)pc[0];
+            { int8_t _o = (int8_t)pc[0]; if (_o < 0) sf->qjs_looped = 1; pc += _o; }
             if (unlikely(js_poll_interrupts(ctx)))
                 goto exception;
             BREAK;
@@ -18673,7 +20898,155 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
                 op1 = sp[-1];
                 pc += 4;
-                if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) {
+                if (qjs_is_opaque(op1)) {
+                    qjs_term *_pt = (qjs_is_taint(op1) && !qjs_fe_phi_mute) ? qjs_t_ref(qjs_opq_of(op1)->term) : NULL;
+                    JS_FreeValue(ctx, op1);
+                    QJS_SPIN_PROBE_CALL(b, pc);
+                    unsigned long long _site = (((unsigned long long)b->line_num << 40) ^ ((unsigned long long)b->col_num << 24) ^ (unsigned long long)(size_t)(pc - b->byte_code_buf));
+                    /* If a CALLER frame is iterating a loop, this function is
+                       being called once per iteration — key on SITE ALONE so a
+                       branch forced identically each call is bounded (freeze #4
+                       loop-of-calls). Else (site ⊕ invocation-id) keeps
+                       sequential calls distinct (the _hof phantom-init guard). */
+                    int _inloop = 0;
+                    /* Site-alone keying is ONLY for a callee invoked repeatedly from
+                       a looping ANCESTOR (loop-of-calls: the callee's terminating
+                       branch is forced the same way each call). If THIS frame has
+                       its OWN loop, its loop-guard must stay inv-keyed so the
+                       loop-revisit flip can terminate it — site-alone would share
+                       the guard's key across this frame's separate invocations and
+                       mis-pin it (a previous call's stored decision flips this
+                       call's guard to the wrong arm). */
+                    /* _recur: this fn's bytecode is also on an ANCESTOR frame — a
+                       recursive re-entry. Opaque-gated recursion makes a fresh-inv frame
+                       per level, so inv-salted keys never match the seen-set and the
+                       recursion runs until the native stack overflows (~2400 deep:
+                       thousands of redundant drives; in wasm's deeper fiber stack +
+                       per-branch JSPI yield, a freeze — /index-docs.js live). Key
+                       recursive frames on _site alone (like a loop-of-calls callee) so
+                       the second re-entry at the same site hits the fixpoint and the
+                       recursion is taken FINITELY; its arms are still explored once.
+                       Concrete recursion never reaches here (opaque branches only). One
+                       ancestor walk decides both _inloop and _recur. */
+                    /* _recur is gated on !sf->qjs_looped for the SAME reason _inloop is
+                       (ye/12004): a frame with its OWN loop MUST stay inv-keyed so its
+                       loop terminates on ITS OWN first decision's complement. If _recur
+                       site-keyed it, the loop inherits a seen decision from a SIBLING
+                       recursion level (different data) and the blind complement maps to
+                       the CONTINUE arm under OP_if_false's if(!res) polarity → the loop
+                       never exits (learn.microsoft.com `ye` forEach-polyfill: own loop +
+                       recursion, froze at 24M iters). Pure recursion (no own loop, e.g.
+                       _opqrec) still collapses by _site. */
+                    int _recur = 0;
+                    JSFunctionBytecode *_mb = sf->qjs_looped ? NULL : JS_GetFunctionBytecode(sf->cur_func);
+                    for (JSStackFrame *_af = sf->prev_frame; _af && !(_inloop && _recur); _af = _af->prev_frame) {
+                        if (_af->qjs_looped && !sf->qjs_looped) _inloop = 1;
+                        if (_mb && JS_GetFunctionBytecode(_af->cur_func) == _mb) _recur = 1;
+                    }
+                    unsigned long long _lk = (_inloop || _recur) ? _site : (_site ^ ((unsigned long long)sf->qjs_inv * 0x9E3779B97F4A7C15ULL));
+                    if (qjs_fe_loop_revisit(_lk, &res)) { if (_pt) qjs_t_free(_pt); }
+                    else {
+                    /* If the term is already in Φ from an earlier OP_if
+                       (typically: OR short-circuit JUMP just decided
+                       this value, now the outer IF tests the SAME
+                       opaque), reuse that decision. Skips schedule
+                       cursor + F-frontier emission for the redundant
+                       branch — the schedule space stays linear in the
+                       number of DISTINCT opaque values tested, not the
+                       number of bytecode branches that test them. The
+                       X-Force schedule has no business deciding a
+                       value's truthiness twice. */
+                    int _pinned = _pt ? qjs_pc_lookup(_pt) : -1;
+                    if (_pinned >= 0) {
+                        res = _pinned;
+                        qjs_t_free(_pt);
+                    } else if (!qjs_host_reach_check(ctx, b)) {
+                        /* Per-function scope pruning: this function's
+                           bytecode reaches no host-edge atom (direct or
+                           via closure-literal). Flipping its opaque
+                           branches can't change which fetch/XHR fires
+                           or what flows into one — the schedule
+                           controller skips forcing here, bounding BFS
+                           to the host-edge subgraph at normal-website
+                           scale. Take default 0, pin so subsequent
+                           uses of this opaque agree. */
+                        res = 0;
+                        if (_pt) { qjs_pc_push(_pt, res); qjs_t_free(_pt); }
+                    } else if (qjs_dir_active && b == qjs_dir_b) {
+                        /* Directed drive — this IS the force-driven target
+                           function. Fork ONLY a value-determining branch
+                           (BOTH arms can reach the target host-edge site,
+                           e.g. role=admin vs guest both flowing into the
+                           one fetch); FORCE the single reaching arm of a
+                           guard/feature-gate branch with no frontier. The
+                           same drive promotes @H (network site) and @S
+                           (sink site) — one execution, two views. */
+                        int _fpc = (int)(pc - b->byte_code_buf);
+                        int _jpc = _fpc + (int32_t)get_u32(pc - 4) - 4;
+                        int _rj = qjs_reach_pc_memo(ctx, b, _jpc, qjs_dir_target);
+                        int _rf = qjs_reach_pc_memo(ctx, b, _fpc, qjs_dir_target);
+                        if (_rj && _rf)
+                            /* Both arms reach the target (a value-determining
+                               branch). Emitting a BFS F-frontier here is both
+                               wrong and explosive: a plain --fe-sched replay
+                               never re-runs __feDriveStatic (it is seed-only),
+                               so the flipped schedule cannot reproduce this
+                               directed call — it just re-boots the whole bundle
+                               to no effect, exploding the schedule space (github
+                               eager: BFS did not terminate in 200 s). Take the
+                               reaching fall-through arm (res=0; _rf proves it
+                               reaches) with NO frontier — the site's structure
+                               is captured this run. Per-value spread for a
+                               DRIVEN function would need a local re-call inside
+                               __feDriveStatic, not a BFS schedule. */
+                            res = 0;
+                        else {
+                            res = _rj ? 1 : 0;   /* if_true: res=1 takes the jump toward target */
+                        }
+                        if (_pt) { qjs_pc_push(_pt, res); qjs_t_free(_pt); }
+                    } else if (!qjs_host_reach_from(ctx, b, (int)((pc - b->byte_code_buf) + (int32_t)get_u32(pc - 4) - 4))) {
+                        /* JUMP arm dead → default 0 (fall-through), no frontier. */
+                        res = 0;
+                        if (_pt) { qjs_pc_push(_pt, res); qjs_t_free(_pt); }
+                    } else if (!qjs_host_reach_from(ctx, b, (int)(pc - b->byte_code_buf))) {
+                        /* FALL-THROUGH arm dead → default 1 (jump), no frontier.
+                           Symmetric prune: until now the engine only pruned the
+                           flipped-dead case (above); the default-dead case fell
+                           through to qjs_forced_decide_k_p which defaulted to 0,
+                           wasting every replay on a dead arm. With this prune the
+                           live arm runs FIRST and no frontier is enqueued for
+                           the proven-dead flipped arm. */
+                        res = 1;
+                        if (_pt) { qjs_pc_push(_pt, res); qjs_t_free(_pt); }
+                    } else {
+                        /* Both arms reach a host edge. Per-arm NET-density
+                           refines the priority_default: when JUMP reaches a
+                           network endpoint but FALL-THROUGH only reaches a
+                           sink (eval/innerHTML/etc.), prefer JUMP first
+                           (priority_default=1 = res=1 = jump for OP_if_true)
+                           since endpoint completeness is goal #1. SCHEDULING
+                           ONLY — the FLIPPED schedule still seeds via the
+                           F-frontier, so both arms get explored; this just
+                           orders WHICH runs first. */
+                        int _fpc_n = (int)(pc - b->byte_code_buf);
+                        int _jpc_n = _fpc_n + (int32_t)get_u32(pc - 4) - 4;
+                        int _other_net = qjs_host_reach_net_from(ctx, b, _jpc_n);
+                        int _default_net = qjs_host_reach_net_from(ctx, b, _fpc_n);
+                        int _prio = (_other_net && !_default_net) ? 1 : 0;
+                        /* Frontier signature for schedCmp: the arm the FLIP
+                           explores is the one priority_default did NOT pick.
+                           flip_net = does that arm reach a network edge. Both
+                           arms already reach SOME host edge (this is the
+                           both-reach else branch), so sig 2 = net-reaching
+                           flip, 1 = host-but-not-net flip. */
+                        int _flip_net = _prio ? _default_net : _other_net;
+                        int _sig = _flip_net ? 2 : 1;
+                        res = qjs_forced_decide_k_p(0, (((unsigned long long)b->line_num << 40) ^ ((unsigned long long)b->col_num << 24) ^ (unsigned long long)(size_t)(pc - b->byte_code_buf)), _pt, _prio, _sig);
+                        if (_pt) { qjs_pc_push(_pt, res); qjs_t_free(_pt); }
+                    }
+                    qjs_fe_loop_seen(_lk, res);
+                    }
+                } else if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) {
                     res = JS_VALUE_GET_INT(op1);
                 } else {
                     res = JS_ToBoolFree(ctx, op1);
@@ -18693,7 +21066,143 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
                 op1 = sp[-1];
                 pc += 4;
-                if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) {
+                if (qjs_is_opaque(op1)) {
+                    qjs_term *_pt = (qjs_is_taint(op1) && !qjs_fe_phi_mute) ? qjs_t_ref(qjs_opq_of(op1)->term) : NULL;
+                    JS_FreeValue(ctx, op1);
+                    QJS_SPIN_PROBE_CALL(b, pc);
+                    unsigned long long _site = (((unsigned long long)b->line_num << 40) ^ ((unsigned long long)b->col_num << 24) ^ (unsigned long long)(size_t)(pc - b->byte_code_buf));
+                    /* If a CALLER frame is iterating a loop, this function is
+                       being called once per iteration — key on SITE ALONE so a
+                       branch forced identically each call is bounded (freeze #4
+                       loop-of-calls). Else (site ⊕ invocation-id) keeps
+                       sequential calls distinct (the _hof phantom-init guard). */
+                    int _inloop = 0;
+                    /* Site-alone keying is ONLY for a callee invoked repeatedly from
+                       a looping ANCESTOR (loop-of-calls: the callee's terminating
+                       branch is forced the same way each call). If THIS frame has
+                       its OWN loop, its loop-guard must stay inv-keyed so the
+                       loop-revisit flip can terminate it — site-alone would share
+                       the guard's key across this frame's separate invocations and
+                       mis-pin it (a previous call's stored decision flips this
+                       call's guard to the wrong arm). */
+                    /* _recur: this fn's bytecode is also on an ANCESTOR frame — a
+                       recursive re-entry. Opaque-gated recursion makes a fresh-inv frame
+                       per level, so inv-salted keys never match the seen-set and the
+                       recursion runs until the native stack overflows (~2400 deep:
+                       thousands of redundant drives; in wasm's deeper fiber stack +
+                       per-branch JSPI yield, a freeze — /index-docs.js live). Key
+                       recursive frames on _site alone (like a loop-of-calls callee) so
+                       the second re-entry at the same site hits the fixpoint and the
+                       recursion is taken FINITELY; its arms are still explored once.
+                       Concrete recursion never reaches here (opaque branches only). One
+                       ancestor walk decides both _inloop and _recur. */
+                    /* _recur is gated on !sf->qjs_looped for the SAME reason _inloop is
+                       (ye/12004): a frame with its OWN loop MUST stay inv-keyed so its
+                       loop terminates on ITS OWN first decision's complement. If _recur
+                       site-keyed it, the loop inherits a seen decision from a SIBLING
+                       recursion level (different data) and the blind complement maps to
+                       the CONTINUE arm under OP_if_false's if(!res) polarity → the loop
+                       never exits (learn.microsoft.com `ye` forEach-polyfill: own loop +
+                       recursion, froze at 24M iters). Pure recursion (no own loop, e.g.
+                       _opqrec) still collapses by _site. */
+                    int _recur = 0;
+                    JSFunctionBytecode *_mb = sf->qjs_looped ? NULL : JS_GetFunctionBytecode(sf->cur_func);
+                    for (JSStackFrame *_af = sf->prev_frame; _af && !(_inloop && _recur); _af = _af->prev_frame) {
+                        if (_af->qjs_looped && !sf->qjs_looped) _inloop = 1;
+                        if (_mb && JS_GetFunctionBytecode(_af->cur_func) == _mb) _recur = 1;
+                    }
+                    unsigned long long _lk = (_inloop || _recur) ? _site : (_site ^ ((unsigned long long)sf->qjs_inv * 0x9E3779B97F4A7C15ULL));
+                    if (qjs_fe_loop_revisit(_lk, &res)) { if (_pt) qjs_t_free(_pt); }
+                    else {
+                    /* If the term is already in Φ from an earlier OP_if
+                       (typically: OR short-circuit JUMP just decided
+                       this value, now the outer IF tests the SAME
+                       opaque), reuse that decision. Skips schedule
+                       cursor + F-frontier emission for the redundant
+                       branch — the schedule space stays linear in the
+                       number of DISTINCT opaque values tested, not the
+                       number of bytecode branches that test them. The
+                       X-Force schedule has no business deciding a
+                       value's truthiness twice. */
+                    int _pinned = _pt ? qjs_pc_lookup(_pt) : -1;
+                    if (_pinned >= 0) {
+                        res = _pinned;
+                        qjs_t_free(_pt);
+                    } else if (!qjs_host_reach_check(ctx, b)) {
+                        /* Per-function scope pruning: this function's
+                           bytecode reaches no host-edge atom (direct or
+                           via closure-literal). Flipping its opaque
+                           branches can't change which fetch/XHR fires
+                           or what flows into one — the schedule
+                           controller skips forcing here, bounding BFS
+                           to the host-edge subgraph at normal-website
+                           scale. Take default 0, pin so subsequent
+                           uses of this opaque agree. */
+                        res = 0;
+                        if (_pt) { qjs_pc_push(_pt, res); qjs_t_free(_pt); }
+                    } else if (qjs_dir_active && b == qjs_dir_b) {
+                        /* Directed drive — fork only a both-arms-reach
+                           (value-determining) branch; force the single
+                           reaching arm of a guard/gate branch, no frontier. */
+                        int _fpc = (int)(pc - b->byte_code_buf);
+                        int _jpc = _fpc + (int32_t)get_u32(pc - 4) - 4;
+                        int _rj = qjs_reach_pc_memo(ctx, b, _jpc, qjs_dir_target);
+                        int _rf = qjs_reach_pc_memo(ctx, b, _fpc, qjs_dir_target);
+                        if (_rj && _rf)
+                            /* Both arms reach the target (a value-determining
+                               branch). Emitting a BFS F-frontier here is both
+                               wrong and explosive: a plain --fe-sched replay
+                               never re-runs __feDriveStatic (it is seed-only),
+                               so the flipped schedule cannot reproduce this
+                               directed call — it just re-boots the whole bundle
+                               to no effect, exploding the schedule space (github
+                               eager: BFS did not terminate in 200 s). Take the
+                               reaching fall-through arm (res=0; _rf proves it
+                               reaches) with NO frontier — the site's structure
+                               is captured this run. Per-value spread for a
+                               DRIVEN function would need a local re-call inside
+                               __feDriveStatic, not a BFS schedule. */
+                            res = 0;
+                        else {
+                            res = _rj ? 0 : (_rf ? 1 : 0);   /* if_false: res=0 takes the jump toward target */
+                        }
+                        if (_pt) { qjs_pc_push(_pt, res); qjs_t_free(_pt); }
+                    } else if (!qjs_host_reach_from(ctx, b, (int)(pc - b->byte_code_buf))) {
+                        /* FALL-THROUGH arm dead → default 0 (which for OP_if_false
+                           takes the jump), no frontier. */
+                        res = 0;
+                        if (_pt) { qjs_pc_push(_pt, res); qjs_t_free(_pt); }
+                    } else if (!qjs_host_reach_from(ctx, b, (int)((pc - b->byte_code_buf) + (int32_t)get_u32(pc - 4) - 4))) {
+                        /* JUMP arm dead → default 1 (fall-through for OP_if_false
+                           since the jump fires on res=0), no frontier. Symmetric
+                           prune mirroring OP_if_true's added case above. */
+                        res = 1;
+                        if (_pt) { qjs_pc_push(_pt, res); qjs_t_free(_pt); }
+                    } else {
+                        /* Per-arm NET-density: for OP_if_false, default arm
+                           = jump (res=0 takes the jump per `if (!res)`),
+                           other arm = fall-through. priority_default=1
+                           (= res=1 = fall-through) when fall-through
+                           reaches NET but jump only reaches a sink. */
+                        int _fpc_n = (int)(pc - b->byte_code_buf);
+                        int _jpc_n = _fpc_n + (int32_t)get_u32(pc - 4) - 4;
+                        int _other_net = qjs_host_reach_net_from(ctx, b, _fpc_n);
+                        int _default_net = qjs_host_reach_net_from(ctx, b, _jpc_n);
+                        int _prio = (_other_net && !_default_net) ? 1 : 0;
+                        /* Frontier signature for schedCmp: the arm the FLIP
+                           explores is the one priority_default did NOT pick.
+                           flip_net = does that arm reach a network edge. Both
+                           arms already reach SOME host edge (this is the
+                           both-reach else branch), so sig 2 = net-reaching
+                           flip, 1 = host-but-not-net flip. */
+                        int _flip_net = _prio ? _default_net : _other_net;
+                        int _sig = _flip_net ? 2 : 1;
+                        res = qjs_forced_decide_k_p(0, (((unsigned long long)b->line_num << 40) ^ ((unsigned long long)b->col_num << 24) ^ (unsigned long long)(size_t)(pc - b->byte_code_buf)), _pt, _prio, _sig);
+                        if (_pt) { qjs_pc_push(_pt, res); qjs_t_free(_pt); }
+                    }
+                    qjs_fe_loop_seen(_lk, res);
+                    }
+                } else if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) {
                     res = JS_VALUE_GET_INT(op1);
                 } else {
                     res = JS_ToBoolFree(ctx, op1);
@@ -18713,7 +21222,138 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
                 op1 = sp[-1];
                 pc += 1;
-                if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) {
+                if (qjs_is_opaque(op1)) {
+                    qjs_term *_pt = (qjs_is_taint(op1) && !qjs_fe_phi_mute) ? qjs_t_ref(qjs_opq_of(op1)->term) : NULL;
+                    JS_FreeValue(ctx, op1);
+                    QJS_SPIN_PROBE_CALL(b, pc);
+                    unsigned long long _site = (((unsigned long long)b->line_num << 40) ^ ((unsigned long long)b->col_num << 24) ^ (unsigned long long)(size_t)(pc - b->byte_code_buf));
+                    /* If a CALLER frame is iterating a loop, this function is
+                       being called once per iteration — key on SITE ALONE so a
+                       branch forced identically each call is bounded (freeze #4
+                       loop-of-calls). Else (site ⊕ invocation-id) keeps
+                       sequential calls distinct (the _hof phantom-init guard). */
+                    int _inloop = 0;
+                    /* Site-alone keying is ONLY for a callee invoked repeatedly from
+                       a looping ANCESTOR (loop-of-calls: the callee's terminating
+                       branch is forced the same way each call). If THIS frame has
+                       its OWN loop, its loop-guard must stay inv-keyed so the
+                       loop-revisit flip can terminate it — site-alone would share
+                       the guard's key across this frame's separate invocations and
+                       mis-pin it (a previous call's stored decision flips this
+                       call's guard to the wrong arm). */
+                    /* _recur: this fn's bytecode is also on an ANCESTOR frame — a
+                       recursive re-entry. Opaque-gated recursion makes a fresh-inv frame
+                       per level, so inv-salted keys never match the seen-set and the
+                       recursion runs until the native stack overflows (~2400 deep:
+                       thousands of redundant drives; in wasm's deeper fiber stack +
+                       per-branch JSPI yield, a freeze — /index-docs.js live). Key
+                       recursive frames on _site alone (like a loop-of-calls callee) so
+                       the second re-entry at the same site hits the fixpoint and the
+                       recursion is taken FINITELY; its arms are still explored once.
+                       Concrete recursion never reaches here (opaque branches only). One
+                       ancestor walk decides both _inloop and _recur. */
+                    /* _recur is gated on !sf->qjs_looped for the SAME reason _inloop is
+                       (ye/12004): a frame with its OWN loop MUST stay inv-keyed so its
+                       loop terminates on ITS OWN first decision's complement. If _recur
+                       site-keyed it, the loop inherits a seen decision from a SIBLING
+                       recursion level (different data) and the blind complement maps to
+                       the CONTINUE arm under OP_if_false's if(!res) polarity → the loop
+                       never exits (learn.microsoft.com `ye` forEach-polyfill: own loop +
+                       recursion, froze at 24M iters). Pure recursion (no own loop, e.g.
+                       _opqrec) still collapses by _site. */
+                    int _recur = 0;
+                    JSFunctionBytecode *_mb = sf->qjs_looped ? NULL : JS_GetFunctionBytecode(sf->cur_func);
+                    for (JSStackFrame *_af = sf->prev_frame; _af && !(_inloop && _recur); _af = _af->prev_frame) {
+                        if (_af->qjs_looped && !sf->qjs_looped) _inloop = 1;
+                        if (_mb && JS_GetFunctionBytecode(_af->cur_func) == _mb) _recur = 1;
+                    }
+                    unsigned long long _lk = (_inloop || _recur) ? _site : (_site ^ ((unsigned long long)sf->qjs_inv * 0x9E3779B97F4A7C15ULL));
+                    if (qjs_fe_loop_revisit(_lk, &res)) { if (_pt) qjs_t_free(_pt); }
+                    else {
+                    /* If the term is already in Φ from an earlier OP_if
+                       (typically: OR short-circuit JUMP just decided
+                       this value, now the outer IF tests the SAME
+                       opaque), reuse that decision. Skips schedule
+                       cursor + F-frontier emission for the redundant
+                       branch — the schedule space stays linear in the
+                       number of DISTINCT opaque values tested, not the
+                       number of bytecode branches that test them. The
+                       X-Force schedule has no business deciding a
+                       value's truthiness twice. */
+                    int _pinned = _pt ? qjs_pc_lookup(_pt) : -1;
+                    if (_pinned >= 0) {
+                        res = _pinned;
+                        qjs_t_free(_pt);
+                    } else if (!qjs_host_reach_check(ctx, b)) {
+                        /* Per-function scope pruning: this function's
+                           bytecode reaches no host-edge atom (direct or
+                           via closure-literal). Flipping its opaque
+                           branches can't change which fetch/XHR fires
+                           or what flows into one — the schedule
+                           controller skips forcing here, bounding BFS
+                           to the host-edge subgraph at normal-website
+                           scale. Take default 0, pin so subsequent
+                           uses of this opaque agree. */
+                        res = 0;
+                        if (_pt) { qjs_pc_push(_pt, res); qjs_t_free(_pt); }
+                    } else if (qjs_dir_active && b == qjs_dir_b) {
+                        /* Directed drive — fork only a both-arms-reach
+                           branch; force the single reaching arm, no frontier. */
+                        int _fpc = (int)(pc - b->byte_code_buf);
+                        int _jpc = _fpc + (int8_t)pc[-1] - 1;
+                        int _rj = qjs_reach_pc_memo(ctx, b, _jpc, qjs_dir_target);
+                        int _rf = qjs_reach_pc_memo(ctx, b, _fpc, qjs_dir_target);
+                        if (_rj && _rf)
+                            /* Both arms reach the target (a value-determining
+                               branch). Emitting a BFS F-frontier here is both
+                               wrong and explosive: a plain --fe-sched replay
+                               never re-runs __feDriveStatic (it is seed-only),
+                               so the flipped schedule cannot reproduce this
+                               directed call — it just re-boots the whole bundle
+                               to no effect, exploding the schedule space (github
+                               eager: BFS did not terminate in 200 s). Take the
+                               reaching fall-through arm (res=0; _rf proves it
+                               reaches) with NO frontier — the site's structure
+                               is captured this run. Per-value spread for a
+                               DRIVEN function would need a local re-call inside
+                               __feDriveStatic, not a BFS schedule. */
+                            res = 0;
+                        else {
+                            res = _rj ? 1 : 0;   /* if_true8: res=1 takes the jump toward target */
+                        }
+                        if (_pt) { qjs_pc_push(_pt, res); qjs_t_free(_pt); }
+                    } else if (!qjs_host_reach_from(ctx, b, (int)((pc - b->byte_code_buf) + (int8_t)pc[-1] - 1))) {
+                        /* JUMP arm dead → default 0 (fall-through), no frontier. */
+                        res = 0;
+                        if (_pt) { qjs_pc_push(_pt, res); qjs_t_free(_pt); }
+                    } else if (!qjs_host_reach_from(ctx, b, (int)(pc - b->byte_code_buf))) {
+                        /* FALL-THROUGH arm dead → default 1 (jump), no frontier.
+                           Symmetric prune (8-bit-offset variant of OP_if_true). */
+                        res = 1;
+                        if (_pt) { qjs_pc_push(_pt, res); qjs_t_free(_pt); }
+                    } else {
+                        /* Per-arm NET-density (OP_if_true8 same encoding as
+                           OP_if_true): default arm = fall-through, other
+                           arm = jump. */
+                        int _fpc_n = (int)(pc - b->byte_code_buf);
+                        int _jpc_n = _fpc_n + (int8_t)pc[-1] - 1;
+                        int _other_net = qjs_host_reach_net_from(ctx, b, _jpc_n);
+                        int _default_net = qjs_host_reach_net_from(ctx, b, _fpc_n);
+                        int _prio = (_other_net && !_default_net) ? 1 : 0;
+                        /* Frontier signature for schedCmp: the arm the FLIP
+                           explores is the one priority_default did NOT pick.
+                           flip_net = does that arm reach a network edge. Both
+                           arms already reach SOME host edge (this is the
+                           both-reach else branch), so sig 2 = net-reaching
+                           flip, 1 = host-but-not-net flip. */
+                        int _flip_net = _prio ? _default_net : _other_net;
+                        int _sig = _flip_net ? 2 : 1;
+                        res = qjs_forced_decide_k_p(0, (((unsigned long long)b->line_num << 40) ^ ((unsigned long long)b->col_num << 24) ^ (unsigned long long)(size_t)(pc - b->byte_code_buf)), _pt, _prio, _sig);
+                        if (_pt) { qjs_pc_push(_pt, res); qjs_t_free(_pt); }
+                    }
+                    qjs_fe_loop_seen(_lk, res);
+                    }
+                } else if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) {
                     res = JS_VALUE_GET_INT(op1);
                 } else {
                     res = JS_ToBoolFree(ctx, op1);
@@ -18733,7 +21373,139 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
                 op1 = sp[-1];
                 pc += 1;
-                if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) {
+                if (qjs_is_opaque(op1)) {
+                    qjs_term *_pt = (qjs_is_taint(op1) && !qjs_fe_phi_mute) ? qjs_t_ref(qjs_opq_of(op1)->term) : NULL;
+                    JS_FreeValue(ctx, op1);
+                    QJS_SPIN_PROBE_CALL(b, pc);
+                    unsigned long long _site = (((unsigned long long)b->line_num << 40) ^ ((unsigned long long)b->col_num << 24) ^ (unsigned long long)(size_t)(pc - b->byte_code_buf));
+                    /* If a CALLER frame is iterating a loop, this function is
+                       being called once per iteration — key on SITE ALONE so a
+                       branch forced identically each call is bounded (freeze #4
+                       loop-of-calls). Else (site ⊕ invocation-id) keeps
+                       sequential calls distinct (the _hof phantom-init guard). */
+                    int _inloop = 0;
+                    /* Site-alone keying is ONLY for a callee invoked repeatedly from
+                       a looping ANCESTOR (loop-of-calls: the callee's terminating
+                       branch is forced the same way each call). If THIS frame has
+                       its OWN loop, its loop-guard must stay inv-keyed so the
+                       loop-revisit flip can terminate it — site-alone would share
+                       the guard's key across this frame's separate invocations and
+                       mis-pin it (a previous call's stored decision flips this
+                       call's guard to the wrong arm). */
+                    /* _recur: this fn's bytecode is also on an ANCESTOR frame — a
+                       recursive re-entry. Opaque-gated recursion makes a fresh-inv frame
+                       per level, so inv-salted keys never match the seen-set and the
+                       recursion runs until the native stack overflows (~2400 deep:
+                       thousands of redundant drives; in wasm's deeper fiber stack +
+                       per-branch JSPI yield, a freeze — /index-docs.js live). Key
+                       recursive frames on _site alone (like a loop-of-calls callee) so
+                       the second re-entry at the same site hits the fixpoint and the
+                       recursion is taken FINITELY; its arms are still explored once.
+                       Concrete recursion never reaches here (opaque branches only). One
+                       ancestor walk decides both _inloop and _recur. */
+                    /* _recur is gated on !sf->qjs_looped for the SAME reason _inloop is
+                       (ye/12004): a frame with its OWN loop MUST stay inv-keyed so its
+                       loop terminates on ITS OWN first decision's complement. If _recur
+                       site-keyed it, the loop inherits a seen decision from a SIBLING
+                       recursion level (different data) and the blind complement maps to
+                       the CONTINUE arm under OP_if_false's if(!res) polarity → the loop
+                       never exits (learn.microsoft.com `ye` forEach-polyfill: own loop +
+                       recursion, froze at 24M iters). Pure recursion (no own loop, e.g.
+                       _opqrec) still collapses by _site. */
+                    int _recur = 0;
+                    JSFunctionBytecode *_mb = sf->qjs_looped ? NULL : JS_GetFunctionBytecode(sf->cur_func);
+                    for (JSStackFrame *_af = sf->prev_frame; _af && !(_inloop && _recur); _af = _af->prev_frame) {
+                        if (_af->qjs_looped && !sf->qjs_looped) _inloop = 1;
+                        if (_mb && JS_GetFunctionBytecode(_af->cur_func) == _mb) _recur = 1;
+                    }
+                    unsigned long long _lk = (_inloop || _recur) ? _site : (_site ^ ((unsigned long long)sf->qjs_inv * 0x9E3779B97F4A7C15ULL));
+                    if (qjs_fe_loop_revisit(_lk, &res)) { if (_pt) qjs_t_free(_pt); }
+                    else {
+                    /* If the term is already in Φ from an earlier OP_if
+                       (typically: OR short-circuit JUMP just decided
+                       this value, now the outer IF tests the SAME
+                       opaque), reuse that decision. Skips schedule
+                       cursor + F-frontier emission for the redundant
+                       branch — the schedule space stays linear in the
+                       number of DISTINCT opaque values tested, not the
+                       number of bytecode branches that test them. The
+                       X-Force schedule has no business deciding a
+                       value's truthiness twice. */
+                    int _pinned = _pt ? qjs_pc_lookup(_pt) : -1;
+                    if (_pinned >= 0) {
+                        res = _pinned;
+                        qjs_t_free(_pt);
+                    } else if (!qjs_host_reach_check(ctx, b)) {
+                        /* Per-function scope pruning: this function's
+                           bytecode reaches no host-edge atom (direct or
+                           via closure-literal). Flipping its opaque
+                           branches can't change which fetch/XHR fires
+                           or what flows into one — the schedule
+                           controller skips forcing here, bounding BFS
+                           to the host-edge subgraph at normal-website
+                           scale. Take default 0, pin so subsequent
+                           uses of this opaque agree. */
+                        res = 0;
+                        if (_pt) { qjs_pc_push(_pt, res); qjs_t_free(_pt); }
+                    } else if (qjs_dir_active && b == qjs_dir_b) {
+                        /* Directed drive — fork only a both-arms-reach
+                           branch; force the single reaching arm, no frontier. */
+                        int _fpc = (int)(pc - b->byte_code_buf);
+                        int _jpc = _fpc + (int8_t)pc[-1] - 1;
+                        int _rj = qjs_reach_pc_memo(ctx, b, _jpc, qjs_dir_target);
+                        int _rf = qjs_reach_pc_memo(ctx, b, _fpc, qjs_dir_target);
+                        if (_rj && _rf)
+                            /* Both arms reach the target (a value-determining
+                               branch). Emitting a BFS F-frontier here is both
+                               wrong and explosive: a plain --fe-sched replay
+                               never re-runs __feDriveStatic (it is seed-only),
+                               so the flipped schedule cannot reproduce this
+                               directed call — it just re-boots the whole bundle
+                               to no effect, exploding the schedule space (github
+                               eager: BFS did not terminate in 200 s). Take the
+                               reaching fall-through arm (res=0; _rf proves it
+                               reaches) with NO frontier — the site's structure
+                               is captured this run. Per-value spread for a
+                               DRIVEN function would need a local re-call inside
+                               __feDriveStatic, not a BFS schedule. */
+                            res = 0;
+                        else {
+                            res = _rj ? 0 : (_rf ? 1 : 0);   /* if_false8: res=0 takes the jump toward target */
+                        }
+                        if (_pt) { qjs_pc_push(_pt, res); qjs_t_free(_pt); }
+                    } else if (!qjs_host_reach_from(ctx, b, (int)(pc - b->byte_code_buf))) {
+                        /* FALL-THROUGH arm dead → default 0 (jump for OP_if_false8),
+                           no frontier. */
+                        res = 0;
+                        if (_pt) { qjs_pc_push(_pt, res); qjs_t_free(_pt); }
+                    } else if (!qjs_host_reach_from(ctx, b, (int)((pc - b->byte_code_buf) + (int8_t)pc[-1] - 1))) {
+                        /* JUMP arm dead → default 1 (fall-through), no frontier.
+                           Symmetric prune (8-bit-offset variant of OP_if_false). */
+                        res = 1;
+                        if (_pt) { qjs_pc_push(_pt, res); qjs_t_free(_pt); }
+                    } else {
+                        /* Per-arm NET-density (OP_if_false8 same encoding as
+                           OP_if_false): default arm = jump (res=0 jumps),
+                           other arm = fall-through. */
+                        int _fpc_n = (int)(pc - b->byte_code_buf);
+                        int _jpc_n = _fpc_n + (int8_t)pc[-1] - 1;
+                        int _other_net = qjs_host_reach_net_from(ctx, b, _fpc_n);
+                        int _default_net = qjs_host_reach_net_from(ctx, b, _jpc_n);
+                        int _prio = (_other_net && !_default_net) ? 1 : 0;
+                        /* Frontier signature for schedCmp: the arm the FLIP
+                           explores is the one priority_default did NOT pick.
+                           flip_net = does that arm reach a network edge. Both
+                           arms already reach SOME host edge (this is the
+                           both-reach else branch), so sig 2 = net-reaching
+                           flip, 1 = host-but-not-net flip. */
+                        int _flip_net = _prio ? _default_net : _other_net;
+                        int _sig = _flip_net ? 2 : 1;
+                        res = qjs_forced_decide_k_p(0, (((unsigned long long)b->line_num << 40) ^ ((unsigned long long)b->col_num << 24) ^ (unsigned long long)(size_t)(pc - b->byte_code_buf)), _pt, _prio, _sig);
+                        if (_pt) { qjs_pc_push(_pt, res); qjs_t_free(_pt); }
+                    }
+                    qjs_fe_loop_seen(_lk, res);
+                    }
+                } else if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) {
                     res = JS_VALUE_GET_INT(op1);
                 } else {
                     res = JS_ToBoolFree(ctx, op1);
@@ -19033,12 +21805,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValue op1;
 
                 op1 = sp[-1];
-                if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) {
-                    res = JS_VALUE_GET_INT(op1) != 0;
+                if (qjs_is_opaque(op1)) {
+                    /* !opaque is opaque (infectious — `!x.includes(p)`
+                       must reach OP_if and fork). Wrap the term with a
+                       'U' (unary NOT) node so the Z3 translation
+                       inverts the predicate (Z3_mk_not). Subsequent
+                       OP_if pushes the wrapped term to Φ; with the
+                       forced decision, the assertion is `not P` when
+                       decision=1, `P` when decision=0 — semantically
+                       matching JS `if (!P)` taking the branch iff P
+                       is falsy. */
+                    qjs_opq *o = qjs_opq_of(op1);
+                    qjs_term *nt = qjs_t_alloc('U');
+                    if (nt) { nt->a = qjs_t_ref(o->term); }
+                    sp[-1] = qjs_opq_make(ctx, o->flavor, o->label, nt);
+                    JS_FreeValue(ctx, op1);
                 } else {
-                    res = JS_ToBoolFree(ctx, op1);
+                    if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) {
+                        res = JS_VALUE_GET_INT(op1) != 0;
+                    } else {
+                        res = JS_ToBoolFree(ctx, op1);
+                    }
+                    sp[-1] = js_bool(!res);
                 }
-                sp[-1] = js_bool(!res);
             }
             BREAK;
 
@@ -19052,6 +21841,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
                 atom = get_u32(pc);
                 pc += 4;
+                if (unlikely(!b->qjs_h_fired)) qjs_mark_h_fired(b, atom);
 
                 obj = sp[-1];
                 if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
@@ -19085,6 +21875,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (unlikely(JS_IsException(val)))
                         goto exception;
                 }
+                /* Forced-exec: a host-unknown (opaque) receiver makes
+                   every property unknown too — X-Force "unknown is
+                   infectious" — so `JSON.parse(rt).role === "admin"`
+                   reaches OP_CMP and both server-gate arms fork. The
+                   result carries a MEMBER term so `.length` becomes
+                   str.len in the Z3 query, and `.startsWith` carries
+                   the method name forward into the call. */
+                if (qjs_is_opaque(sp[-1])) { JS_FreeValue(ctx, val); val = qjs_member(ctx, sp[-1], atom); }
                 JS_FreeValue(ctx, sp[-1]);
                 sp[-1] = val;
             }
@@ -19100,6 +21898,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
                 atom = get_u32(pc);
                 pc += 4;
+                if (unlikely(!b->qjs_h_fired)) qjs_mark_h_fired(b, atom);
 
                 obj = sp[-1];
                 if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
@@ -19133,6 +21932,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (unlikely(JS_IsException(val)))
                         goto exception;
                 }
+                if (qjs_is_opaque(sp[-1])) { JS_FreeValue(ctx, val); val = qjs_member(ctx, sp[-1], atom); }
                 *sp++ = val;
             }
             BREAK;
@@ -19194,8 +21994,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_get_private_field):
             {
                 JSValue val;
-                sf->cur_pc = pc;
-                val = JS_GetPrivateField(ctx, sp[-2], sp[-1]);
+                /* Forced-exec: a driven handler with opaque `this` reads
+                   `this.#e` before the gated fetch — JS_GetPrivateField
+                   would TypeError on a receiver lacking the brand,
+                   aborting the method before its host edge. The private
+                   slot is unknown-infectious like any property on an
+                   opaque receiver (mirrors OP_get_field), so the read
+                   yields opaque and the fetch after it is still reached. */
+                if (qjs_is_opaque(sp[-2])) {
+                    val = qjs_member_dyn(ctx, sp[-2], sp[-1]);
+                } else {
+                    sf->cur_pc = pc;
+                    val = JS_GetPrivateField(ctx, sp[-2], sp[-1]);
+                }
                 JS_FreeValue(ctx, sp[-1]);
                 JS_FreeValue(ctx, sp[-2]);
                 sp[-2] = val;
@@ -19360,7 +22171,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValue val;
 
                 sf->cur_pc = pc;
-                val = JS_GetPropertyValue(ctx, sp[-2], sp[-1]);
+                /* JS_GetPropertyValue CONSUMES the key (sp[-1]); calling
+                   qjs_member_dyn afterwards would read the freed key (UAF that
+                   double-frees its atom). Branch FIRST: qjs_member_dyn borrows
+                   the key, so free it here to match the consume path. */
+                if (qjs_is_opaque(sp[-2])) {
+                    val = qjs_member_dyn(ctx, sp[-2], sp[-1]);
+                    JS_FreeValue(ctx, sp[-1]);
+                } else {
+                    val = JS_GetPropertyValue(ctx, sp[-2], sp[-1]);
+                }
                 JS_FreeValue(ctx, sp[-2]);
                 sp[-2] = val;
                 sp--;
@@ -19374,7 +22194,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValue val;
 
                 sf->cur_pc = pc;
-                val = JS_GetPropertyValue(ctx, sp[-2], sp[-1]);
+                if (qjs_is_opaque(sp[-2])) {
+                    val = qjs_member_dyn(ctx, sp[-2], sp[-1]);
+                    JS_FreeValue(ctx, sp[-1]);
+                } else {
+                    val = JS_GetPropertyValue(ctx, sp[-2], sp[-1]);
+                }
                 sp[-1] = val;
                 if (unlikely(JS_IsException(val)))
                     goto exception;
@@ -19789,7 +22614,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValue op1;
                 int val;
                 op1 = sp[-1];
-                if (JS_VALUE_GET_TAG(op1) == JS_TAG_INT) {
+                if (qjs_is_opaque(op1)) {
+                    JSValue _r = qjs_unary_step(ctx, op1, '+');
+                    JS_FreeValue(ctx, op1);
+                    sp[-1] = _r;
+                } else if (JS_VALUE_GET_TAG(op1) == JS_TAG_INT) {
                     val = JS_VALUE_GET_INT(op1);
                     if (unlikely(val == INT32_MAX))
                         goto inc_slow;
@@ -19807,7 +22636,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValue op1;
                 int val;
                 op1 = sp[-1];
-                if (JS_VALUE_GET_TAG(op1) == JS_TAG_INT) {
+                if (qjs_is_opaque(op1)) {
+                    JSValue _r = qjs_unary_step(ctx, op1, '-');
+                    JS_FreeValue(ctx, op1);
+                    sp[-1] = _r;
+                } else if (JS_VALUE_GET_TAG(op1) == JS_TAG_INT) {
                     val = JS_VALUE_GET_INT(op1);
                     if (unlikely(val == INT32_MIN))
                         goto dec_slow;
@@ -19825,7 +22658,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValue op1;
                 int val;
                 op1 = sp[-1];
-                if (JS_VALUE_GET_TAG(op1) == JS_TAG_INT) {
+                if (qjs_is_opaque(op1)) {
+                    /* old op1 stays at sp[-1] (the post-inc result); the
+                       stepped opaque goes to sp[0]. op1's term is ref'd, not
+                       consumed, so leaving it on the stack is correct. */
+                    sp[0] = qjs_unary_step(ctx, op1, '+');
+                } else if (JS_VALUE_GET_TAG(op1) == JS_TAG_INT) {
                     val = JS_VALUE_GET_INT(op1);
                     if (unlikely(val == INT32_MAX))
                         goto post_inc_slow;
@@ -19844,7 +22682,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValue op1;
                 int val;
                 op1 = sp[-1];
-                if (JS_VALUE_GET_TAG(op1) == JS_TAG_INT) {
+                if (qjs_is_opaque(op1)) {
+                    sp[0] = qjs_unary_step(ctx, op1, '-');
+                } else if (JS_VALUE_GET_TAG(op1) == JS_TAG_INT) {
                     val = JS_VALUE_GET_INT(op1);
                     if (unlikely(val == INT32_MIN))
                         goto post_dec_slow;
@@ -19867,7 +22707,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc += 1;
 
                 op1 = var_buf[idx];
-                if (JS_VALUE_GET_TAG(op1) == JS_TAG_INT) {
+                if (qjs_is_opaque(op1)) {
+                    set_value(ctx, &var_buf[idx], qjs_unary_step(ctx, op1, '+'));
+                } else if (JS_VALUE_GET_TAG(op1) == JS_TAG_INT) {
                     val = JS_VALUE_GET_INT(op1);
                     if (unlikely(val == INT32_MAX))
                         goto inc_loc_slow;
@@ -19893,7 +22735,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc += 1;
 
                 op1 = var_buf[idx];
-                if (JS_VALUE_GET_TAG(op1) == JS_TAG_INT) {
+                if (qjs_is_opaque(op1)) {
+                    set_value(ctx, &var_buf[idx], qjs_unary_step(ctx, op1, '-'));
+                } else if (JS_VALUE_GET_TAG(op1) == JS_TAG_INT) {
                     val = JS_VALUE_GET_INT(op1);
                     if (unlikely(val == INT32_MIN))
                         goto dec_loc_slow;
@@ -20039,7 +22883,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValue op1, op2;                         \
                 op1 = sp[-2];                             \
                 op2 = sp[-1];                                   \
-                if (likely(JS_VALUE_IS_BOTH_INT(op1, op2))) {           \
+                if (qjs_is_opaque(op1) || qjs_is_opaque(op2)) {         \
+                    JSValue _r = qjs_cmp_term(ctx, op1, op2, #binary_op); \
+                    JS_FreeValue(ctx, op1); JS_FreeValue(ctx, op2);     \
+                    sp[-2] = _r; sp--;                                  \
+                } else if (likely(JS_VALUE_IS_BOTH_INT(op1, op2))) {    \
                     sp[-2] = js_bool(JS_VALUE_GET_INT(op1) binary_op JS_VALUE_GET_INT(op2)); \
                     sp--;                                               \
                 } else {                                                \
@@ -20083,9 +22931,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSAtom atom;
 
                 op1 = sp[-1];
-                atom = js_operator_typeof(ctx, op1);
-                JS_FreeValue(ctx, op1);
-                sp[-1] = JS_AtomToString(ctx, atom);
+                if (qjs_is_opaque(op1)) {
+                    /* typeof opaque must stay opaque — else `typeof x ===
+                       "undefined"` over an opaque collapses to "object" (a
+                       concrete string), making such a guard-loop concrete. */
+                    JSValue _r = qjs_opaque_unary(ctx, op1);
+                    JS_FreeValue(ctx, op1);
+                    sp[-1] = _r;
+                } else {
+                    atom = js_operator_typeof(ctx, op1);
+                    JS_FreeValue(ctx, op1);
+                    sp[-1] = JS_AtomToString(ctx, atom);
+                }
             }
             BREAK;
         CASE(OP_delete):
@@ -20260,6 +23117,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_nop):
             BREAK;
         CASE(OP_is_undefined_or_null):
+            /* Opaque-infectious null check (mirrors OP_CMP). The bare
+               tag-test returns a CONCRETE boolean for an opaque (it's an
+               object, tag OBJECT, so "not null" = false), which makes the
+               canonical DOM loop `while(node.firstChild != null){…}` over an
+               opaque node a CONCRETE infinite loop the forced-exec fixpoint
+               can never see (it forces only OPAQUE branches; seen-set stays
+               empty) — freeze #3 on learn.microsoft.com (removeChildNodes).
+               An opaque result forks the branch so the loop-revisit fixpoint
+               terminates it. */
+            if (qjs_is_opaque(sp[-1])) { JSValue _r = qjs_cmp_term(ctx, sp[-1], JS_NULL, "=="); JS_FreeValue(ctx, sp[-1]); sp[-1] = _r; BREAK; }
             if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_UNDEFINED ||
                 JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_NULL) {
                 goto set_true;
@@ -20267,12 +23134,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 goto free_and_set_false;
             }
         CASE(OP_is_undefined):
+            if (qjs_is_opaque(sp[-1])) { JSValue _r = qjs_cmp_term(ctx, sp[-1], JS_UNDEFINED, "=="); JS_FreeValue(ctx, sp[-1]); sp[-1] = _r; BREAK; }
             if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_UNDEFINED) {
                 goto set_true;
             } else {
                 goto free_and_set_false;
             }
         CASE(OP_is_null):
+            if (qjs_is_opaque(sp[-1])) { JSValue _r = qjs_cmp_term(ctx, sp[-1], JS_NULL, "=="); JS_FreeValue(ctx, sp[-1]); sp[-1] = _r; BREAK; }
             if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_NULL) {
                 goto set_true;
             } else {
@@ -20280,6 +23149,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             /* XXX: could merge to a single opcode */
         CASE(OP_typeof_is_undefined):
+            /* `typeof x === "undefined"` fuses to THIS opcode, not OP_typeof +
+               compare — so the opaque guard must live here too, else the common
+               `while (typeof x !== "undefined") …` guard-loop over an opaque is
+               concrete-infinite (opaque typeof is "object", never undefined). */
+            if (qjs_is_opaque(sp[-1])) { JSValue _r = qjs_opaque_unary(ctx, sp[-1]); JS_FreeValue(ctx, sp[-1]); sp[-1] = _r; BREAK; }
             /* different from OP_is_undefined because of isHTMLDDA */
             if (js_operator_typeof(ctx, sp[-1]) == JS_ATOM_undefined) {
                 goto free_and_set_true;
@@ -20287,6 +23161,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 goto free_and_set_false;
             }
         CASE(OP_typeof_is_function):
+            if (qjs_is_opaque(sp[-1])) { JSValue _r = qjs_opaque_unary(ctx, sp[-1]); JS_FreeValue(ctx, sp[-1]); sp[-1] = _r; BREAK; }
             if (js_operator_typeof(ctx, sp[-1]) == JS_ATOM_function) {
                 goto free_and_set_true;
             } else {
@@ -20561,6 +23436,7 @@ static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s,
     if (!sf->arg_buf)
         return -1;
     sf->cur_func = js_dup(func_obj);
+    sf->qjs_inv = ++qjs_inv_ctr; sf->qjs_looped = 0;   /* async/generator frames run bytecode — same loop-revisit-key init as the sync bytecode path */
     s->this_val = js_dup(this_obj);
     s->argc = argc;
     sf->arg_count = arg_buf_len;
@@ -22677,6 +25553,7 @@ static __exception int next_token(JSParseState *s)
             if (JS_VALUE_IS_NAN(ret) ||
                 lre_js_is_ident_next(utf8_decode(p, &p1))) {
                 JS_FreeValue(s->ctx, ret);
+                s->col_num = max_int(1, s->mark - s->eol);
                 js_parse_error(s, "invalid number literal");
                 goto fail;
             }
@@ -23384,14 +26261,19 @@ static void emit_u32(JSParseState *s, uint32_t val)
     dbuf_put_u32(&s->cur_func->byte_code, val);
 }
 
-static void emit_source_loc(JSParseState *s)
+static void emit_source_loc_at(JSParseState *s, int line_num, int col_num)
 {
     JSFunctionDef *fd = s->cur_func;
     DynBuf *bc = &fd->byte_code;
 
     dbuf_putc(bc, OP_source_loc);
-    dbuf_put_u32(bc, s->token.line_num);
-    dbuf_put_u32(bc, s->token.col_num);
+    dbuf_put_u32(bc, line_num);
+    dbuf_put_u32(bc, col_num);
+}
+
+static void emit_source_loc(JSParseState *s)
+{
+    emit_source_loc_at(s, s->token.line_num, s->token.col_num);
 }
 
 static void emit_op(JSParseState *s, uint8_t val)
@@ -26250,8 +29132,11 @@ static int js_parse_destructuring_element(JSParseState *s, int tok,
     } else if (s->token.val == '[') {
         bool has_spread;
         int enum_depth;
+        int source_line_num, source_col_num;
         BlockEnv block_env;
 
+        source_line_num = s->token.line_num;
+        source_col_num = s->token.col_num;
         if (next_token(s))
             return -1;
         /* the block environment is only needed in generators in case
@@ -26347,6 +29232,7 @@ static int js_parse_destructuring_element(JSParseState *s, int tok,
         }
         /* close iterator object:
            if completed, enum_obj has been replaced by undefined */
+        emit_source_loc_at(s, source_line_num, source_col_num);
         emit_op(s, OP_iterator_close);
         pop_break_entry(s->cur_func);
         if (next_token(s))
@@ -28369,7 +31255,9 @@ static int is_using(JSParseState *s, bool is_for_of)
 /* XXX: handle IteratorClose when exiting the loop before the
    enumeration is done */
 static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
-                                          bool is_async)
+                                          bool is_async,
+                                          int source_line_num,
+                                          int source_col_num)
 {
     JSContext *ctx = s->ctx;
     JSFunctionDef *fd = s->cur_func;
@@ -28676,6 +31564,7 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
     emit_label(s, label_break);
     if (is_for_of) {
         /* close and drop enum_rec */
+        emit_source_loc_at(s, source_line_num, source_col_num);
         emit_op(s, OP_iterator_close);
     } else {
         emit_op(s, OP_drop);
@@ -28941,8 +31830,11 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
             int for_scope_level;
             BlockEnv break_entry;
             int tok, bits;
+            int source_line_num, source_col_num;
             bool is_async;
 
+            source_line_num = s->token.line_num;
+            source_col_num = s->token.col_num;
             if (next_token(s))
                 goto fail;
 
@@ -28966,7 +31858,8 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
 
             if (!(bits & SKIP_HAS_SEMI)) {
                 /* parse for/in or for/of */
-                if (js_parse_for_in_of(s, label_name, is_async))
+                if (js_parse_for_in_of(s, label_name, is_async,
+                                       source_line_num, source_col_num))
                     goto fail;
                 break;
             }
@@ -40215,7 +43108,7 @@ JSValue JS_ToObject(JSContext *ctx, JSValueConst val)
             if (!JS_IsException(obj)) {
                 JS_DefinePropertyValue(ctx, obj, JS_ATOM_length,
                                        JS_NewInt32(ctx, JS_VALUE_GET_STRING(str)->len), 0);
-                JS_SetObjectData(ctx, obj, JS_DupValue(ctx, str));
+                JS_SetObjectData(ctx, obj, js_dup(str));
             }
             JS_FreeValue(ctx, str);
             return obj;
@@ -40679,6 +43572,32 @@ static JSValue JS_GetOwnPropertyNames2(JSContext *ctx, JSValueConst obj1,
     JSObject *p;
     JSPropertyEnum *atoms;
     uint32_t len, i, j;
+
+    /* Forced-exec: Object.keys/values/entries of a host-unknown (opaque) is
+       infectious like for-of (see JS_GetIterator) — the opaque is a
+       property-less class instance, so JS_GetOwnPropertyNamesInternal yields
+       [] and a downstream `Object.keys(cfg).map(cb)` / `.forEach(cb)` runs
+       ZERO times, silently dropping the per-key fetch (the config-iteration
+       shape MS docs render code uses). Return a BOUNDED one-element array of
+       opaque so the iteration runs ONCE with an opaque element and the
+       callback's host edges fire. KEY/VALUE → [opaque]; ENTRIES →
+       [[opaque,opaque]]. A real concrete Array, so the protocol is exact and
+       termination structural — NOT a cap. */
+    if (qjs_is_opaque(obj1)) {
+        r = JS_NewArray(ctx);
+        if (JS_IsException(r))
+            return r;
+        if (kind == JS_ITERATOR_KIND_KEY_AND_VALUE) {
+            JSValue pair = JS_NewArray(ctx);
+            if (JS_IsException(pair)) { JS_FreeValue(ctx, r); return pair; }
+            JS_SetPropertyUint32(ctx, pair, 0, qjs_like(ctx, obj1));
+            JS_SetPropertyUint32(ctx, pair, 1, qjs_like(ctx, obj1));
+            JS_SetPropertyUint32(ctx, r, 0, pair);
+        } else {
+            JS_SetPropertyUint32(ctx, r, 0, qjs_like(ctx, obj1));
+        }
+        return r;
+    }
 
     r = JS_UNDEFINED;
     val = JS_UNDEFINED;
@@ -42481,6 +45400,18 @@ static JSValue js_array_concat(JSContext *ctx, JSValueConst this_val,
     int64_t len, k, n;
     int i, res;
 
+    /* Opaque-infectious concat (X-Force unknown-infectious, like .join / OP_add):
+       an opaque `this` or argument is an UNKNOWN collection (any length, maybe
+       not spreadable), so the result array is unknown — return opaque. Appending
+       the opaque as ONE concrete element would pin `.length` to a real number and
+       turn a worklist loop `for(;r.length;){ r=r.concat(opaqueChildren) }` into a
+       CONCRETE infinite loop the fixpoint can't bound (MathJax TrieNode
+       .collectRules_ froze the deep grind on learn.microsoft.com). Concrete
+       concat is unaffected (one class check per operand); opaques exist only
+       under forced exec. */
+    if (qjs_is_opaque(this_val)) return qjs_like(ctx, this_val);
+    for (i = 0; i < argc; i++) if (qjs_is_opaque(argv[i])) return qjs_like(ctx, argv[i]);
+
     arr = JS_UNDEFINED;
     obj = JS_ToObject(ctx, this_val);
     if (JS_IsException(obj))
@@ -42669,6 +45600,30 @@ static JSValue js_array_every(JSContext *ctx, JSValueConst this_val,
             JS_FreeValue(ctx, index_val);
             if (JS_IsException(res))
                 goto exception;
+            /* Opaque-infectious HOF predicate (every/some/filter): a callback
+               returning an opaque (unknown) makes the boolean outcome — and for
+               filter the result array's membership/length — UNKNOWN. Letting
+               JS_ToBool concretize it turns a worklist loop
+               `for(;t.length;){ t=t.filter(x=>opaquePredicate) }` into a CONCRETE
+               infinite loop the forced-exec fixpoint can't bound: the loop
+               predicate (`t.length`) stays a concrete number so no OP_if ever
+               forks (MathJax `setdifference = t.filter(x=>o.indexOf(x)<0)` froze
+               the deep grind on learn.microsoft.com's safeFetch-loaded
+               tex-mml-chtml.js). Yield opaque so the downstream `.length`/branch
+               is opaque and the loop bounds. map/forEach COLLECT/ignore res (not
+               predicate-consuming) → an opaque element propagates naturally,
+               unaffected. Same class as opaque-infectious concat/join. */
+            if (qjs_is_opaque(res)) {
+                int _sp = special & ~special_TA;
+                if (_sp == special_every || _sp == special_some || _sp == special_filter) {
+                    JSValue _o = qjs_like(ctx, res);
+                    JS_FreeValue(ctx, res);
+                    JS_FreeValue(ctx, val);
+                    JS_FreeValue(ctx, obj);
+                    JS_FreeValue(ctx, ret);
+                    return _o;
+                }
+            }
             switch (special) {
             case special_every:
             case special_every | special_TA:
@@ -42864,6 +45819,31 @@ static JSValue js_array_fill(JSContext *ctx, JSValueConst this_val,
     return JS_EXCEPTION;
 }
 
+/* Forced-exec opaque-infectivity for Array search builtins (includes/indexOf/
+   lastIndexOf). js_strict_eq2 is a CONCRETE C compare, so an opaque search
+   target OR any opaque element yields a concrete false/-1 — and a gate like
+   `allowed.includes(x)` / `roles.indexOf("admin") >= 0` becomes concrete-false,
+   so the gated endpoint/sink is NEVER explored (confirmed live: a
+   getOwnPropertyNames(e.data).indexOf("html")-gated innerHTML on stackoverflow
+   was unreached). When membership/index is UNDETERMINED (opaque operand),
+   return an opaque carrying that operand's term so the gate FORKS and the gated
+   path is driven. O(1) for the common opaque-TARGET case; the element scan only
+   runs for a concrete target (rarer). Returns 1 + sets *out when opaque. */
+static int qjs_array_search_opaque(JSContext *ctx, JSValueConst target, JSValueConst obj, int64_t len, JSValue *out) {
+    if (qjs_is_opaque(target)) { *out = qjs_like(ctx, target); return 1; }
+    JSValue *arrp; uint32_t count;
+    if (js_get_fast_array(ctx, obj, &arrp, &count)) {
+        for (uint32_t i = 0; i < count; i++)
+            if (qjs_is_opaque(arrp[i])) { *out = qjs_like(ctx, arrp[i]); return 1; }
+    } else if (len > 0 && len < 100000) {   /* bounded scan: a concrete array this large in a gate is not the opaque case */
+        for (int64_t i = 0; i < len; i++) {
+            JSValue v = JS_GetPropertyInt64(ctx, obj, i);
+            if (qjs_is_opaque(v)) { *out = qjs_like(ctx, v); JS_FreeValue(ctx, v); return 1; }
+            JS_FreeValue(ctx, v);
+        }
+    }
+    return 0;
+}
 static JSValue js_array_includes(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv)
 {
@@ -42876,6 +45856,7 @@ static JSValue js_array_includes(JSContext *ctx, JSValueConst this_val,
     obj = JS_ToObject(ctx, this_val);
     if (js_get_length64(ctx, &len, obj))
         goto exception;
+    { JSValue _op; if (qjs_array_search_opaque(ctx, argv[0], obj, len, &_op)) { JS_FreeValue(ctx, obj); return _op; } }
 
     res = true;
     if (len > 0) {
@@ -42924,6 +45905,7 @@ static JSValue js_array_indexOf(JSContext *ctx, JSValueConst this_val,
     obj = JS_ToObject(ctx, this_val);
     if (js_get_length64(ctx, &len, obj))
         goto exception;
+    { JSValue _op; if (qjs_array_search_opaque(ctx, argv[0], obj, len, &_op)) { JS_FreeValue(ctx, obj); return _op; } }
 
     if (len > 0) {
         n = 0;
@@ -42972,6 +45954,7 @@ static JSValue js_array_lastIndexOf(JSContext *ctx, JSValueConst this_val,
     obj = JS_ToObject(ctx, this_val);
     if (js_get_length64(ctx, &len, obj))
         goto exception;
+    { JSValue _op; if (qjs_array_search_opaque(ctx, argv[0], obj, len, &_op)) { JS_FreeValue(ctx, obj); return _op; } }
 
     if (len > 0) {
         n = len - 1;
@@ -43119,6 +46102,14 @@ static JSValue js_array_join(JSContext *ctx, JSValueConst this_val,
     JSString *p = NULL;
     int64_t i, n;
     int c;
+    /* opaque-infectious join (X-Force unknown-infectious, like .concat /
+       OP_add): once any element is opaque the result is a CONCAT term so
+       `["api","v3",id].join("/")` keeps its /api/v3/{id} structure
+       instead of flattening id to "[object Object]". Lazy — the term is
+       seeded only at the first opaque element (the concrete prefix
+       already in b is snapshotted as a CONST), so the all-concrete hot
+       path is the original code plus one per-element class check. */
+    qjs_term *jt = NULL; qjs_opq *jta = NULL, *jany = NULL; int b_live = 0;
 
     obj = JS_ToObject(ctx, this_val);
     if (js_get_length64(ctx, &n, obj))
@@ -43136,10 +46127,16 @@ static JSValue js_array_join(JSContext *ctx, JSValueConst this_val,
             c = -1;
     }
     string_buffer_init(ctx, b, 0);
+    b_live = 1;
 
     for(i = 0; i < n; i++) {
         if (i > 0) {
-            if (c >= 0) {
+            if (jt) {
+                char sb[2]; qjs_term *st;
+                if (c >= 0) { sb[0] = (char)c; sb[1] = 0; st = qjs_t_kstr(sb); }
+                else st = qjs_t_of_val(ctx, sep);
+                jt = qjs_t_call("concat", jt, st);
+            } else if (c >= 0) {
                 string_buffer_putc8(b, c);
             } else {
                 string_buffer_concat(b, p, 0, p->len);
@@ -43148,20 +46145,41 @@ static JSValue js_array_join(JSContext *ctx, JSValueConst this_val,
         el = JS_GetPropertyUint32(ctx, obj, i);
         if (JS_IsException(el))
             goto fail;
-        if (!JS_IsNull(el) && !JS_IsUndefined(el)) {
-            if (toLocaleString) {
-                el = JS_ToLocaleStringFree(ctx, el);
+        if (!jt && qjs_is_opaque(el)) {
+            /* first opaque: snapshot the concrete prefix in b as the
+               seed CONST, then switch to term-building for the rest. */
+            JSValue pre = string_buffer_end(b);    /* ends/frees b */
+            b_live = 0;
+            jt = qjs_t_of_val(ctx, pre);
+            JS_FreeValue(ctx, pre);
+        }
+        if (jt) {
+            if (!JS_IsNull(el) && !JS_IsUndefined(el)) {
+                if (!jta && qjs_is_taint(el)) jta = qjs_opq_of(el);
+                if (!jany && qjs_is_opaque(el)) jany = qjs_opq_of(el);
+                jt = qjs_t_call("concat", jt, qjs_t_of_val(ctx, el));
             }
-            if (string_buffer_concat_value_free(b, el))
-                goto fail;
+            JS_FreeValue(ctx, el);
+        } else {
+            if (!JS_IsNull(el) && !JS_IsUndefined(el)) {
+                if (toLocaleString) {
+                    el = JS_ToLocaleStringFree(ctx, el);
+                }
+                if (string_buffer_concat_value_free(b, el))
+                    goto fail;
+            }
         }
     }
     JS_FreeValue(ctx, sep);
     JS_FreeValue(ctx, obj);
+    if (jt)
+        return qjs_opq_make(ctx, jta ? 0 : 1,
+                            jta ? jta->label : (jany ? jany->label : NULL), jt);
     return string_buffer_end(b);
 
 fail:
-    string_buffer_free(b);
+    if (b_live) string_buffer_free(b);
+    if (jt) qjs_t_free(jt);
     JS_FreeValue(ctx, sep);
 exception:
     JS_FreeValue(ctx, obj);
@@ -45698,6 +48716,15 @@ static JSValue js_string_constructor(JSContext *ctx, JSValueConst new_target,
     if (argc == 0) {
         val = js_empty_string(ctx->rt);
     } else {
+        if (qjs_is_opaque(argv[0])) {
+            /* String(opaque) must stay opaque (infectious) so it shapes a {name}
+               at a URL slot, not concretize to the literal "[object Object]" —
+               which drops every URL segment / query param built via String(x) as
+               a resolverError instead of a learnable opaque-segment template. Same
+               opaque-infectivity discipline as the OP_add / template-literal path
+               (those already stay opaque); only this explicit builtin was missing. */
+            return qjs_opaque_unary(ctx, argv[0]);
+        }
         if (JS_IsUndefined(new_target) && JS_IsSymbol(argv[0])) {
             JSAtomStruct *p = JS_VALUE_GET_PTR(argv[0]);
             val = JS_ConcatString3(ctx, "Symbol(", JS_AtomToString(ctx, js_get_atom_index(ctx->rt, p)), ")");
@@ -45989,6 +49016,36 @@ static JSValue js_string_concat(JSContext *ctx, JSValueConst this_val,
     uint32_t n;
     JSValue r;
     char *d;
+
+    /* Infectious concat on opaque (X-Force "unknown is infectious",
+       same as js_add_slow's OP_add path). Non-tagged template literals
+       `/x/${e}` lower to "/x/".concat(e) via OP_call_method, NOT OP_add,
+       so without this an opaque interpolant ToStrings to "[object
+       Object]" and the CONCAT term is lost — the host-edge URL/Ψ
+       recovery then sees a fabricated string instead of the literal-
+       prefix + opaque-hole structure (this is what made every
+       __feDriveStatic arg-derived fetch URL record as "[object
+       Object]"). Fold all parts into one CONCAT term: TAINT if any part
+       is taint, label from the first taint (else any opaque). Concrete
+       interpolants stay on the fast path below, so only opaque-bearing
+       templates become shapes — same bounded blast radius as OP_add. */
+    {
+        int any_opq = qjs_is_opaque(this_val);
+        for (i = 0; i < argc && !any_opq; i++)
+            if (qjs_is_opaque(argv[i])) any_opq = 1;
+        if (any_opq) {
+            qjs_opq *ta = qjs_is_taint(this_val) ? qjs_opq_of(this_val) : NULL;
+            qjs_opq *anyop = qjs_opq_of(this_val);
+            qjs_term *acc = qjs_t_of_val(ctx, this_val);
+            for (i = 0; i < argc; i++) {
+                if (!ta && qjs_is_taint(argv[i])) ta = qjs_opq_of(argv[i]);
+                if (!anyop && qjs_is_opaque(argv[i])) anyop = qjs_opq_of(argv[i]);
+                acc = qjs_t_call("concat", acc, qjs_t_of_val(ctx, argv[i]));
+            }
+            return qjs_opq_make(ctx, ta ? 0 : 1,
+                                ta ? ta->label : (anyop ? anyop->label : NULL), acc);
+        }
+    }
 
     if (JS_TAG_STRING != JS_VALUE_GET_TAG(this_val))
         goto slow_path;
@@ -47818,6 +50875,16 @@ static JSValue js_math_random(JSContext *ctx, JSValueConst this_val,
     JSFloat64Union u;
     uint64_t v;
 
+    /* Under forced execution, Math.random() is a NONDETERMINISTIC source: a real
+       value would (1) break snapshot/resume determinism (same script ⇒ different
+       result) and (2) bake a per-request nonce into learned endpoints (observed
+       live: stackoverflow's `/cdn-cgi/challenge-platform/.../0.6235…` and a
+       `?r=0.32585…&t=…` URL). Return a SYNTH-opaque instead of throwing (throwing
+       would abort a bundle's `fetch("/api/"+Math.random())` and lose the
+       endpoint): the value flows infectiously so the derived URL param is marked
+       valueSource:opaque (a dynamic client nonce, NOT a fabricated literal), and
+       it's deterministic for resume. */
+    if (qjs_fe_enabled) return qjs_synth_new(ctx);
     v = xorshift64star(&ctx->random_state);
     /* 1.0 <= u.d < 2 */
     u.u64 = ((uint64_t)0x3ff << 52) | (v >> 12);
@@ -48426,6 +51493,20 @@ int lre_check_timeout(void *opaque)
 {
     JSContext *ctx = opaque;
     JSRuntime *rt = ctx->rt;
+    /* Cooperative yield from inside regex backtracking. libregexp polls this
+       at its own INTERRUPT_COUNTER_INIT cadence (lre_poll_timeout), so a
+       heavy/backtracking regex on concrete page/literal input would otherwise
+       run to completion as ONE C call between two JS-op heartbeats — the JS-op
+       heartbeat (__js_poll_interrupts) can't fire while the interpreter is
+       parked inside lre_exec, so that single C call monopolizes the one wasm
+       thread and freezes the whole priority frontier (the active page can't
+       preempt). Routing QJS_DO_YIELD through this existing poll closes that gap
+       the same way the op-poll heartbeat does for JS ops: JSPI preserves the
+       libregexp C frames across the suspend, the scheduler interleaves higher-
+       priority fibers, then the regex resumes. NOT an abort/cap — what the
+       regex computes is unchanged; native/non-JSPI builds compile it to a
+       no-op. */
+    QJS_DO_YIELD();
     return (rt->interrupt_handler &&
             rt->interrupt_handler(rt, rt->interrupt_opaque));
 }
@@ -50105,6 +53186,13 @@ static JSValue js_json_parse(JSContext *ctx, JSValueConst this_val,
     const char *str;
     size_t len;
 
+    /* Forced-exec: JSON.parse of a host-unknown (opaque) string — the
+       canonical `JSON.parse(xhr.responseText)` server-reply boundary —
+       yields an unknown object so member reads on it stay infectious
+       and the gate they feed forks. */
+    if (qjs_is_opaque(argv[0]))
+        return qjs_like(ctx, argv[0]);
+
     str = JS_ToCStringLen(ctx, &len, argv[0]);
     if (!str)
         return JS_EXCEPTION;
@@ -50482,6 +53570,15 @@ JSValue JS_JSONStringify(JSContext *ctx, JSValueConst obj,
     JSValue val, v, space, ret, wrapper;
     int res;
     int64_t i, j, n;
+
+    /* JSON.stringify(opaque) must stay opaque (infectious) — same {name}/body-shape
+       reason as String()/encodeURIComponent. A bare opaque otherwise serializes to
+       "{}" (the sentinel has no enumerable props), so a URL/body built from it loses
+       the field. (Nested opaque — stringify({a:opaque}) — still concretizes; that's
+       the harder serializer-walk case, partly covered by hostedge bodyShape for
+       object bodies.) */
+    if (qjs_is_opaque(obj))
+        return qjs_opaque_unary(ctx, obj);
 
     jsc->replacer_func = JS_UNDEFINED;
     jsc->stack = JS_UNDEFINED;
@@ -55673,6 +58770,30 @@ static JSValue js_global_decodeURI(JSContext *ctx, JSValueConst this_val,
     JSString *p;
     int k, c, c1, n, c_min;
 
+    /* Forced-exec: decoding an opaque (attacker-controlled) value keeps it
+       opaque AND preserves its shadow term as a CALL, so the source LEAF
+       survives into Ψ — the attacker controls the decoded output too, so a
+       decoder on the taint path must not erase provenance (it otherwise drops
+       to term "?" and the @S source + probe strategy are lost). Mirrors
+       OP_add's CONCAT term-building. */
+    /* Keep an opaque opaque through the decoder. TAINT also tracks the shadow
+       term as a CALL (Z3 security needs the source LEAF through the decoder).
+       SYNTH (from __feDriveStatic) needs no shadow term — but it MUST stay opaque:
+       a SYNTH URL segment is exactly the {name} shape, and concretizing it here to
+       "[object Object]" drops the endpoint as a resolverError instead of learning
+       the opaque-segment path template (163 such URLs on learn.microsoft.com —
+       familyTrees/byPlatform/{moniker}, apibrowser/{x}). The old TAINT-only guard
+       traded API-learning completeness for one hot-path allocation. */
+    if (argc > 0 && qjs_is_opaque(argv[0])) {
+        qjs_opq *o = qjs_opq_of(argv[0]);
+        if (qjs_is_taint(argv[0])) {
+            qjs_term *ct = qjs_t_call(isComponent ? "decodeURIComponent" : "decodeURI",
+                                      qjs_t_of_val(ctx, argv[0]), NULL);
+            return qjs_opq_make(ctx, o->flavor, o->label, ct);
+        }
+        return qjs_opaque_unary(ctx, argv[0]);
+    }
+
     str = JS_ToString(ctx, argv[0]);
     if (JS_IsException(str))
         return str;
@@ -55785,6 +58906,21 @@ static JSValue js_global_encodeURI(JSContext *ctx, JSValueConst this_val,
     JSString *p;
     int k, c, c1;
 
+    /* Forced-exec: keep an opaque arg opaque + preserve its shadow term (see
+       js_global_decodeURI) — a string transform on the taint path must not
+       erase the source LEAF. */
+    /* SYNTH must stay opaque too (the {name} URL-shape flavour) — see the
+       js_global_decodeURI note. TAINT also carries the shadow term for Z3. */
+    if (argc > 0 && qjs_is_opaque(argv[0])) {
+        qjs_opq *o = qjs_opq_of(argv[0]);
+        if (qjs_is_taint(argv[0])) {
+            qjs_term *ct = qjs_t_call(isComponent ? "encodeURIComponent" : "encodeURI",
+                                      qjs_t_of_val(ctx, argv[0]), NULL);
+            return qjs_opq_make(ctx, o->flavor, o->label, ct);
+        }
+        return qjs_opaque_unary(ctx, argv[0]);
+    }
+
     str = JS_ToString(ctx, argv[0]);
     if (JS_IsException(str))
         return str;
@@ -55849,6 +58985,18 @@ static JSValue js_global_escape(JSContext *ctx, JSValueConst this_val,
     JSString *p;
     int i, len, c;
 
+    /* Forced-exec: preserve an opaque arg + its shadow term (see
+       js_global_decodeURI). */
+    /* TAINT-only — SYNTH-opaque args (from __feDriveStatic) don't need the
+       shadow term tracked through the decoder; only the security taint path
+       (location.hash et al. → @S) benefits, and that flavour is TAINT. Skipping
+       SYNTH cuts a hot-path allocation per decoder call on heavy bundles. */
+    if (argc > 0 && qjs_is_taint(argv[0])) {
+        qjs_opq *o = qjs_opq_of(argv[0]);
+        qjs_term *ct = qjs_t_call("escape", qjs_t_of_val(ctx, argv[0]), NULL);
+        return qjs_opq_make(ctx, o->flavor, o->label, ct);
+    }
+
     str = JS_ToString(ctx, argv[0]);
     if (JS_IsException(str))
         return str;
@@ -55874,6 +59022,18 @@ static JSValue js_global_unescape(JSContext *ctx, JSValueConst this_val,
     StringBuffer b_s, *b = &b_s;
     JSString *p;
     int i, len, c, n;
+
+    /* Forced-exec: preserve an opaque arg + its shadow term (see
+       js_global_decodeURI). */
+    /* TAINT-only — SYNTH-opaque args (from __feDriveStatic) don't need the
+       shadow term tracked through the decoder; only the security taint path
+       (location.hash et al. → @S) benefits, and that flavour is TAINT. Skipping
+       SYNTH cuts a hot-path allocation per decoder call on heavy bundles. */
+    if (argc > 0 && qjs_is_taint(argv[0])) {
+        qjs_opq *o = qjs_opq_of(argv[0]);
+        qjs_term *ct = qjs_t_call("unescape", qjs_t_of_val(ctx, argv[0]), NULL);
+        return qjs_opq_make(ctx, o->flavor, o->label, ct);
+    }
 
     str = JS_ToString(ctx, argv[0]);
     if (JS_IsException(str))
@@ -55902,9 +59062,1635 @@ static JSValue js_global_unescape(JSContext *ctx, JSValueConst this_val,
     return string_buffer_end(b);
 }
 
+/* Host-edge atom set — the Web API surface that defines our "interesting"
+   path. Shared between qjs_host_reach_check (per-function scope-pruning
+   for the schedule controller) and js_fe_static_sites (the @T emitter).
+   Runtime-global, lazy-initialized on first use. */
+static const char *QJS_HOST_NM[] = {
+    "fetch","XMLHttpRequest","WebSocket","EventSource","sendBeacon",
+    "send","eval","Function","setTimeout","setInterval",
+    "innerHTML","outerHTML","insertAdjacentHTML","insertAdjacentText",
+    "importScripts", NULL };
+static JSAtom qjs_host_atoms[24];
+static int qjs_host_atoms_n = 0;
+static int qjs_host_atoms_inited = 0;
+/* Property-WRITE sinks: innerHTML/outerHTML reach the host edge via
+   OP_put_field (`el.innerHTML = x`), not a get_var/get_field read — so a
+   read-only scan misses them and XSS-via-write-sink is second-class to
+   API learning. Matched in put position so the reach walks, the @T
+   emitter and the driver treat a write-sink site identically to a fetch
+   site: one execution, two views. (The network edges + callable sinks in
+   QJS_HOST_NM — fetch/XHR/eval/setTimeout/insertAdjacentHTML/… — are
+   reads, matched in get position.) */
+static const char *QJS_SINK_WR_NM[] = { "innerHTML", "outerHTML", NULL };
+static JSAtom qjs_sink_wr_atoms[4];
+static int qjs_sink_wr_n = 0;
+/* The SECURITY sinks within the host set — code-exec (eval/Function/timers/
+   importScripts) + DOM-HTML (innerHTML/outerHTML/insertAdjacent*). A function
+   reaching one of these is a candidate XSS/code-exec finding, the highest-value
+   thing a SECURITY tool can surface — so the deep-residue usefulness sort ranks
+   sink-reaching functions first. (The rest of QJS_HOST_NM — fetch/XHR/WS/… — are
+   network edges = API endpoints.) */
+static const char *QJS_SINK_NM[] = {
+    "eval","Function","setTimeout","setInterval","importScripts",
+    "innerHTML","outerHTML","insertAdjacentHTML","insertAdjacentText", NULL };
+static JSAtom qjs_sink_atoms[16];
+static int qjs_sink_n = 0;
+/* The analyzer's OWN host-model files. Their host-edge references are shim
+   DEFINITIONS (the Lexbor prelude's createContextualFragment `d.innerHTML=h`,
+   hostedge's `G.fetch=…`), not the analyzed page's API surface — so @T must
+   not list them and __feDriveStatic must not force-drive them. The page is
+   always /b.js (/b.bc); these names are fixed by the native harness and by
+   ast-thread.js (/h.js shim, /d.js driver). Interned once for O(1) atom
+   compare in the per-function GC walk. */
+static const char *QJS_HOSTMODEL_NM[] = { "<qjs-dom-prelude>", "hostedge.js", "/h.js", "hostedge.gen.js", "driver.js", "/d.js", NULL };
+static JSAtom qjs_hostmodel_atoms[8];
+static int qjs_hostmodel_n = 0;
+static JSRuntime *qjs_host_atoms_rt = NULL;
+static void qjs_init_host_atoms(JSContext *ctx) {
+    /* JSAtoms are interned in the RUNTIME's atom table — valid only for that
+       runtime. The wasm instance is reused across callMain, each a fresh
+       JS_NewRuntime, so a cached set from a freed runtime is STALE and
+       silently mis-matches every host-edge scan in the next run (github: 59
+       host calls collapse to 7 on the 2nd callMain). Re-intern whenever the
+       runtime changes — the per-instance cache must be per-runtime. */
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    if (qjs_host_atoms_inited && qjs_host_atoms_rt == rt) return;
+    qjs_host_atoms_n = 0; qjs_sink_wr_n = 0; qjs_hostmodel_n = 0; qjs_sink_n = 0;
+    for (int i = 0; QJS_HOST_NM[i]; i++)
+        qjs_host_atoms[qjs_host_atoms_n++] = JS_NewAtom(ctx, QJS_HOST_NM[i]);
+    for (int i = 0; QJS_SINK_WR_NM[i]; i++)
+        qjs_sink_wr_atoms[qjs_sink_wr_n++] = JS_NewAtom(ctx, QJS_SINK_WR_NM[i]);
+    for (int i = 0; QJS_SINK_NM[i]; i++)
+        qjs_sink_atoms[qjs_sink_n++] = JS_NewAtom(ctx, QJS_SINK_NM[i]);
+    for (int i = 0; QJS_HOSTMODEL_NM[i]; i++)
+        qjs_hostmodel_atoms[qjs_hostmodel_n++] = JS_NewAtom(ctx, QJS_HOSTMODEL_NM[i]);
+    qjs_host_atoms_inited = 1; qjs_host_atoms_rt = rt;
+}
+/* Public entry so qjsmain can intern the host atoms BEFORE the deep-step boot
+   eval — the qjs_h_fired hook is a no-op until they're interned, so without
+   this the boot wouldn't mark which sites fired and the residue would be the
+   whole host set (re-driving reached endpoints). */
+void qjs_host_atoms_init(JSContext *ctx) { qjs_init_host_atoms(ctx); }
+static int qjs_is_host_model_file(JSAtom filename) {
+    if (filename == JS_ATOM_NULL) return 0;
+    for (int i = 0; i < qjs_hostmodel_n; i++)
+        if (filename == qjs_hostmodel_atoms[i]) return 1;
+    return 0;
+}
+/* The single definition of "is the opcode at pos a host-edge site": a
+   READ (get_var/get_field/get_field2) of a network edge or callable sink,
+   OR a WRITE (put_field/put_field2) of a property-write sink. Returns the
+   matched JSAtom (for naming the @T/@H/@S), or JS_ATOM_NULL. Read-only;
+   callers init the atom sets and keep pos in range. Shared by every reach
+   walk + the @T emitter + the driver so the host-edge surface is one set,
+   keeping XSS detection and API learning the same system. */
+static JSAtom qjs_host_atom_at(JSFunctionBytecode *b, int pos) {
+    const uint8_t *bc = b->byte_code_buf;
+    int op = bc[pos];
+    if (op == OP_get_var || op == OP_get_field || op == OP_get_field2) {
+        JSAtom a = (JSAtom)get_u32(bc + pos + 1);
+        for (int k = 0; k < qjs_host_atoms_n; k++)
+            if (a == qjs_host_atoms[k]) return a;
+    } else if (op == OP_put_field) {
+        JSAtom a = (JSAtom)get_u32(bc + pos + 1);
+        for (int k = 0; k < qjs_sink_wr_n; k++)
+            if (a == qjs_sink_wr_atoms[k]) return a;
+    }
+    return JS_ATOM_NULL;
+}
+static void qjs_mark_h_fired(JSFunctionBytecode *b, JSAtom a) {
+    for (int k = 0; k < qjs_host_atoms_n; k++)
+        if (a == qjs_host_atoms[k]) { b->qjs_h_fired = 1; return; }
+}
+
+/* qjs_host_reach_check: does this function's bytecode reach a host-edge
+   atom directly (OP_get_var/OP_get_field of fetch/XHR/etc.) OR via
+   closure-literal recursion (OP_fclosure pushing a function constant
+   from cpool that itself has reach)? Result cached on the bytecode
+   struct (qjs_host_reach + qjs_host_reach_computed bits). Cycle-safe:
+   mark `computed = 1, reach = 0` BEFORE recursing into children, so a
+   closure that captures its enclosing function doesn't infinite-loop;
+   if any child returns reach, parent's reach gets set to 1 monotonically.
+   Sound under-approximation: cycles whose only path to a host edge is
+   the recursive self-reference won't be detected — those branches stay
+   non-forking. Conservative enough for the BFS-pruning use case (we
+   never lose a fetch that we COULD have reached; at worst we miss
+   forking on an indirect-call path the static analysis can't see). */
+static int qjs_host_reach_check(JSContext *ctx, JSFunctionBytecode *b) {
+    if (!b || !b->byte_code_buf) return 0;
+    if (b->qjs_host_reach_computed) return b->qjs_host_reach;
+    qjs_init_host_atoms(ctx);
+    /* Pre-mark before recursing — breaks cycles via closure capture. */
+    b->qjs_host_reach_computed = 1;
+    b->qjs_host_reach = 0;
+    const uint8_t *bc = b->byte_code_buf;
+    int len = b->byte_code_len, pos = 0;
+    while (pos < len) {
+        int op = bc[pos];
+        int sz = short_opcode_info(op).size;
+        if (sz < 1) break;
+        if (qjs_host_atom_at(b, pos) != JS_ATOM_NULL) { b->qjs_host_reach = 1; return 1; }
+        if (op == OP_fclosure || op == OP_fclosure8) {
+            int cidx = (op == OP_fclosure) ? (int)get_u32(bc + pos + 1) : (int)bc[pos + 1];
+            if (cidx >= 0 && cidx < b->cpool_count) {
+                JSValue cv = b->cpool[cidx];
+                if (JS_VALUE_GET_TAG(cv) == JS_TAG_FUNCTION_BYTECODE) {
+                    JSFunctionBytecode *child = JS_VALUE_GET_PTR(cv);
+                    if (qjs_host_reach_check(ctx, child)) {
+                        b->qjs_host_reach = 1;
+                        return 1;
+                    }
+                }
+            }
+        }
+        pos += sz;
+    }
+    return 0;
+}
+
+/* Branch-level refinement of qjs_host_reach_check — the hard problem:
+   WHICH branches to follow. The per-function check forces EVERY opaque
+   branch in any host-bearing function, incl. guard/error arms that
+   dead-end away from the fetch (why github's 92 fetch @T explode under
+   no-mute). This asks the tighter, SOUND question: does forward control
+   flow FROM the flipped arm (start_pc) reach a host-edge site (host
+   get_var/get_field or a host-reaching closure — same detection as the
+   per-function check)? CFG walk driven by QuickJS's OWN opcode-format
+   table (every `label*` fmt is a jump), so it tracks the real opcode set
+   rather than a hand-listed blacklist. STRICTLY CONSERVATIVE: an
+   undecodable op, a with-statement (atom_label) jump whose target base
+   is uncertain, an out-of-range target, or a worklist overflow all
+   return 1 (reachable) — it NEVER prunes a branch that could fire an API
+   call, only ones that provably dead-end into returns/throws. The
+   `seen` bitmap bounds the walk to the function's bytecode (terminates).
+   Soundness backstop: every polarity gate count must be unchanged. */
+static int qjs_host_reach_from(JSContext *ctx, JSFunctionBytecode *b, int start_pc) {
+    if (!b || !b->byte_code_buf) return 1;
+    int len = b->byte_code_len;
+    if (start_pc < 0 || start_pc >= len) return 1;
+    qjs_init_host_atoms(ctx);
+    const uint8_t *bc = b->byte_code_buf;
+    uint8_t *seen = js_mallocz(ctx, (size_t)len);
+    if (!seen) return 1;
+    enum { STK = 512 };
+    int stk[STK]; int sp = 0; int reach = 0;
+    stk[sp++] = start_pc;
+    while (sp > 0) {
+        int pos = stk[--sp];
+        while (pos >= 0 && pos < len && !seen[pos]) {
+            seen[pos] = 1;
+            int op = bc[pos];
+            int osz = short_opcode_info(op).size;
+            if (osz < 1) { reach = 1; goto done; }
+            if (qjs_host_atom_at(b, pos) != JS_ATOM_NULL) { reach = 1; goto done; }
+            if (op == OP_fclosure || op == OP_fclosure8) {
+                int cidx = (op == OP_fclosure) ? (int)get_u32(bc + pos + 1) : (int)bc[pos + 1];
+                if (cidx >= 0 && cidx < b->cpool_count) {
+                    JSValue cv = b->cpool[cidx];
+                    if (JS_VALUE_GET_TAG(cv) == JS_TAG_FUNCTION_BYTECODE &&
+                        qjs_host_reach_check(ctx, JS_VALUE_GET_PTR(cv))) { reach = 1; goto done; }
+                }
+            }
+            /* A CALL keeps the branch — value-soundness, not just
+               endpoint-soundness: the callee may fetch, OR the caller may
+               pass its concrete data into a host-reaching helper
+               (`if(cond) load(this.dataset.id)`), and pruning that flip
+               would drop the concrete example value the goal wants. Only
+               provably-inert arms (no call, no host atom — pure
+               computation then return/throw) are safe to prune. (`fetch`
+               itself is OP_get_var/get_field of a host atom, already
+               caught above, before its OP_call.) */
+            if (op == OP_call || op == OP_call0 || op == OP_call1 || op == OP_call2 ||
+                op == OP_call3 || op == OP_call_method || op == OP_tail_call ||
+                op == OP_tail_call_method || op == OP_call_constructor ||
+                op == OP_apply || op == OP_apply_eval || op == OP_eval) { reach = 1; goto done; }
+            if (op == OP_return || op == OP_return_undef || op == OP_return_async ||
+                op == OP_throw || op == OP_throw_error) break;   /* terminal arm */
+            int fmt = short_opcode_info(op).fmt;
+            if (fmt == OP_FMT_label8) {
+                int tgt = pos + 1 + (int8_t)bc[pos + 1];
+                if (tgt < 0 || tgt >= len || sp >= STK) { reach = 1; goto done; }
+                stk[sp++] = tgt;
+            } else if (fmt == OP_FMT_label16) {
+                int tgt = pos + 1 + (int16_t)get_u16(bc + pos + 1);
+                if (tgt < 0 || tgt >= len || sp >= STK) { reach = 1; goto done; }
+                stk[sp++] = tgt;
+            } else if (fmt == OP_FMT_label || fmt == OP_FMT_label_u16) {
+                int tgt = pos + 1 + (int32_t)get_u32(bc + pos + 1);
+                if (tgt < 0 || tgt >= len || sp >= STK) { reach = 1; goto done; }
+                stk[sp++] = tgt;
+            } else if (fmt == OP_FMT_atom_label_u8 || fmt == OP_FMT_atom_label_u16) {
+                reach = 1; goto done;     /* with-stmt jump: target uncertain */
+            }
+            pos += osz;   /* fall-through (goto* dead-fall is over-approx, safe) */
+        }
+    }
+done:
+    js_free(ctx, seen);
+    return reach;
+}
+
+/* Network-only refinement of qjs_host_reach_from: returns 1 iff control
+   from start_pc reaches a NETWORK-edge host atom (fetch/XHR/WebSocket/
+   EventSource/sendBeacon/send) — i.e. an atom that is NOT a sink. Used
+   by the per-branch priority signal in qjs_forced_decide_k_p: when one
+   arm of an opaque branch reaches a network endpoint and the other
+   reaches only a sink (eval/innerHTML/etc.), the network arm is
+   preferred FIRST per the analyzer's primary goal (endpoint
+   completeness, #1). Same CFG walk + conservativism as host_reach_from
+   (undecodable / overflow / call → 1); only OP_return/throw end a path. */
+static int qjs_host_reach_net_from(JSContext *ctx, JSFunctionBytecode *b, int start_pc) {
+    if (!b || !b->byte_code_buf) return 1;
+    int len = b->byte_code_len;
+    if (start_pc < 0 || start_pc >= len) return 1;
+    qjs_init_host_atoms(ctx);
+    const uint8_t *bc = b->byte_code_buf;
+    uint8_t *seen = js_mallocz(ctx, (size_t)len);
+    if (!seen) return 1;
+    enum { STK = 512 };
+    int stk[STK]; int sp = 0; int reach = 0;
+    stk[sp++] = start_pc;
+    while (sp > 0) {
+        int pos = stk[--sp];
+        while (pos >= 0 && pos < len && !seen[pos]) {
+            seen[pos] = 1;
+            int op = bc[pos];
+            int osz = short_opcode_info(op).size;
+            if (osz < 1) { reach = 1; goto done2; }
+            JSAtom a = qjs_host_atom_at(b, pos);
+            if (a != JS_ATOM_NULL && !qjs_is_sink_atom(a)) { reach = 1; goto done2; }
+            if (op == OP_fclosure || op == OP_fclosure8) {
+                int cidx = (op == OP_fclosure) ? (int)get_u32(bc + pos + 1) : (int)bc[pos + 1];
+                if (cidx >= 0 && cidx < b->cpool_count) {
+                    JSValue cv = b->cpool[cidx];
+                    if (JS_VALUE_GET_TAG(cv) == JS_TAG_FUNCTION_BYTECODE) {
+                        JSFunctionBytecode *cb = JS_VALUE_GET_PTR(cv);
+                        if (cb && qjs_fn_reaches_net(cb)) { reach = 1; goto done2; }
+                    }
+                }
+            }
+            if (op == OP_call || op == OP_call0 || op == OP_call1 || op == OP_call2 ||
+                op == OP_call3 || op == OP_call_method || op == OP_tail_call ||
+                op == OP_tail_call_method || op == OP_call_constructor ||
+                op == OP_apply || op == OP_apply_eval || op == OP_eval) { reach = 1; goto done2; }
+            if (op == OP_return || op == OP_return_undef || op == OP_return_async ||
+                op == OP_throw || op == OP_throw_error) break;
+            int fmt = short_opcode_info(op).fmt;
+            if (fmt == OP_FMT_label8) {
+                int tgt = pos + 1 + (int8_t)bc[pos + 1];
+                if (tgt < 0 || tgt >= len || sp >= STK) { reach = 1; goto done2; }
+                stk[sp++] = tgt;
+            } else if (fmt == OP_FMT_label16) {
+                int tgt = pos + 1 + (int16_t)get_u16(bc + pos + 1);
+                if (tgt < 0 || tgt >= len || sp >= STK) { reach = 1; goto done2; }
+                stk[sp++] = tgt;
+            } else if (fmt == OP_FMT_label || fmt == OP_FMT_label_u16) {
+                int tgt = pos + 1 + (int32_t)get_u32(bc + pos + 1);
+                if (tgt < 0 || tgt >= len || sp >= STK) { reach = 1; goto done2; }
+                stk[sp++] = tgt;
+            } else if (fmt == OP_FMT_atom_label_u8 || fmt == OP_FMT_atom_label_u16) {
+                reach = 1; goto done2;
+            }
+            pos += osz;
+        }
+    }
+done2:
+    js_free(ctx, seen);
+    return reach;
+}
+
+/* Directed reachability — "can forward control flow FROM from_pc reach the
+   SPECIFIC bytecode offset target_pc within b?". The directed refinement
+   of qjs_host_reach_from (which asks about ANY host edge): this asks about
+   ONE site, so the driver can steer each force-driven function toward each
+   of ITS host-call sites and fork ONLY value-determining branches (both
+   arms reach target_pc) — collapsing the schedule space from "every
+   host-reaching branch" (never terminates on a 7 MB bundle) to "per-site
+   value spread". Same CFG walk + fmt-decoded jumps + STRICTLY-CONSERVATIVE
+   discipline (undecodable op / out-of-range / with-jump / worklist
+   overflow → 1, so an arm is never wrongly forced AWAY from a real target;
+   at worst an extra schedule). Unlike host_reach_from, a CALL is NOT
+   terminal here — it returns and control continues toward target_pc — so
+   we step past it; only OP_return/throw end a path (an arm that returns
+   before target_pc genuinely cannot reach it, which is exactly the
+   guard/error arm the directed drive forces past). */
+static int qjs_reach_pc(JSContext *ctx, JSFunctionBytecode *b, int from_pc, int target_pc) {
+    if (!b || !b->byte_code_buf) return 1;
+    int len = b->byte_code_len;
+    if (target_pc < 0 || target_pc >= len) return 1;
+    if (from_pc < 0 || from_pc >= len) return 0;   /* off the end: unreachable */
+    const uint8_t *bc = b->byte_code_buf;
+    uint8_t *seen = js_mallocz(ctx, (size_t)len);
+    if (!seen) return 1;
+    enum { STK = 512 };
+    int stk[STK]; int sp = 0; int reach = 0;
+    stk[sp++] = from_pc;
+    while (sp > 0) {
+        int pos = stk[--sp];
+        while (pos >= 0 && pos < len && !seen[pos]) {
+            if (pos == target_pc) { reach = 1; goto done2; }
+            seen[pos] = 1;
+            int op = bc[pos];
+            int osz = short_opcode_info(op).size;
+            if (osz < 1) { reach = 1; goto done2; }
+            if (op == OP_return || op == OP_return_undef || op == OP_return_async ||
+                op == OP_throw || op == OP_throw_error) break;   /* terminal arm */
+            int fmt = short_opcode_info(op).fmt;
+            if (fmt == OP_FMT_label8) {
+                int tgt = pos + 1 + (int8_t)bc[pos + 1];
+                if (tgt < 0 || tgt >= len || sp >= STK) { reach = 1; goto done2; }
+                stk[sp++] = tgt;
+            } else if (fmt == OP_FMT_label16) {
+                int tgt = pos + 1 + (int16_t)get_u16(bc + pos + 1);
+                if (tgt < 0 || tgt >= len || sp >= STK) { reach = 1; goto done2; }
+                stk[sp++] = tgt;
+            } else if (fmt == OP_FMT_label || fmt == OP_FMT_label_u16) {
+                int tgt = pos + 1 + (int32_t)get_u32(bc + pos + 1);
+                if (tgt < 0 || tgt >= len || sp >= STK) { reach = 1; goto done2; }
+                stk[sp++] = tgt;
+            } else if (fmt == OP_FMT_atom_label_u8 || fmt == OP_FMT_atom_label_u16) {
+                reach = 1; goto done2;     /* with-stmt jump: target uncertain */
+            }
+            pos += osz;   /* fall-through (goto* dead-fall is over-approx, safe) */
+        }
+    }
+done2:
+    js_free(ctx, seen);
+    return reach;
+}
+
+/* Memoised reverse-reachability for the directed drive. qjs_rm[pc]==1 iff
+   forward control flow from pc can reach qjs_rm_target — same conservative
+   discipline as qjs_reach_pc (undecodable/with-jump/out-of-range ⇒ reachable;
+   return/throw terminal; CALL non-terminal). Computed once per (b,target) by
+   a backward fixpoint over the fall-through + jump successors, then O(1) per
+   query. Freed by qjs_reach_memo_free after each drive so no js_malloc
+   outlives JS_FreeRuntime. */
+static JSFunctionBytecode *qjs_rm_b = NULL;
+static int qjs_rm_target = -1;
+static uint8_t *qjs_rm = NULL;
+static int qjs_rm_len = 0;
+static void qjs_reach_memo_free(JSContext *ctx) {
+    if (qjs_rm) { js_free(ctx, qjs_rm); qjs_rm = NULL; }
+    qjs_rm_b = NULL; qjs_rm_target = -1; qjs_rm_len = 0;
+}
+static void qjs_rm_build(JSContext *ctx, JSFunctionBytecode *b, int target) {
+    qjs_reach_memo_free(ctx);
+    int len = b->byte_code_len;
+    qjs_rm = js_mallocz(ctx, (size_t)len);
+    if (!qjs_rm) return;                       /* OOM → callers fall back to qjs_reach_pc */
+    qjs_rm_b = b; qjs_rm_target = target; qjs_rm_len = len;
+    const uint8_t *bc = b->byte_code_buf;
+    if (target >= 0 && target < len) qjs_rm[target] = 1;
+    int changed = 1, guard = 0;
+    while (changed && guard++ <= len) {
+        changed = 0;
+        int pos = 0;
+        while (pos < len) {
+            int op = bc[pos];
+            int osz = short_opcode_info(op).size;
+            if (osz < 1) {                      /* undecodable: conservatively reachable */
+                for (int q = pos; q < len; q++) if (!qjs_rm[q]) { qjs_rm[q] = 1; changed = 1; }
+                break;
+            }
+            if (!qjs_rm[pos]) {
+                int r = 0;
+                if (pos == target) r = 1;
+                else if (op == OP_return || op == OP_return_undef || op == OP_return_async ||
+                         op == OP_throw || op == OP_throw_error) r = 0;   /* terminal */
+                else {
+                    int fmt = short_opcode_info(op).fmt;
+                    int tgt = -1;
+                    if (fmt == OP_FMT_label8) tgt = pos + 1 + (int8_t)bc[pos + 1];
+                    else if (fmt == OP_FMT_label16) tgt = pos + 1 + (int16_t)get_u16(bc + pos + 1);
+                    else if (fmt == OP_FMT_label || fmt == OP_FMT_label_u16) tgt = pos + 1 + (int32_t)get_u32(bc + pos + 1);
+                    else if (fmt == OP_FMT_atom_label_u8 || fmt == OP_FMT_atom_label_u16) r = 1;  /* with-jump */
+                    if (!r && tgt >= 0) { if (tgt >= len) r = 1; else if (qjs_rm[tgt]) r = 1; }
+                    if (!r) { int fall = pos + osz; if (fall < len && qjs_rm[fall]) r = 1; }
+                }
+                if (r) { qjs_rm[pos] = 1; changed = 1; }
+            }
+            pos += osz;
+        }
+    }
+}
+static int qjs_reach_pc_memo(JSContext *ctx, JSFunctionBytecode *b, int from_pc, int target_pc) {
+    if (!b || !b->byte_code_buf) return 1;
+    int len = b->byte_code_len;
+    if (target_pc < 0 || target_pc >= len) return 1;
+    if (from_pc < 0 || from_pc >= len) return 0;
+    if (qjs_rm_b != b || qjs_rm_target != target_pc || !qjs_rm) qjs_rm_build(ctx, b, target_pc);
+    if (!qjs_rm) return qjs_reach_pc(ctx, b, from_pc, target_pc);   /* OOM fallback */
+    return qjs_rm[from_pc] ? 1 : 0;
+}
+
+/* JAW (USENIX'21) hybrid model, engine-native + strictly READ-ONLY:
+   the static "code representation" half. QuickJS compiles EVERY
+   function's bytecode — including module factories the bundler never
+   require()s (their function objects are on the GC list). Walking that
+   bytecode for host-edge call sites surfaces API usage that dynamic
+   forced execution cannot reach (unrequired modules — github's case).
+   No execution at all: it cannot affect the jQuery gate or fabricate
+   @S; no AST/Babel, no bundler recognition. Emits @T (sTructural
+   endpoint candidate) — distinct from observed @H / tainted @S; the
+   dynamic forced runs supply concrete values for the reached subset.
+   Host-edge names matched as the real Web API operation (the
+   analyzer's defined source/sink surface), not app identifiers. */
+static JSValue js_fe_static_sites(JSContext *ctx, JSValueConst this_val,
+                                  int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    /* Location-only @T: name + file:line:col of every host-edge SITE
+       (qjs_host_atom_at — network read OR write-sink) in any compiled
+       function. URL-extraction at this layer was a bytecode-pattern hack
+       that bypassed the real engine — the proper @T→@H/@S promotion path
+       is __feDriveStatic (invokes each such function directed to the site
+       so its call/sink fires for real, with values whatever ECMA
+       computes). The reached subset gets concrete values from real
+       execution; the unreached residue stays a structural candidate. The
+       SAME site set drives API learning and XSS detection. */
+    qjs_init_host_atoms(ctx);
+    int dbg_total = 0, dbg_bc = 0, dbg_skipped_host = 0, dbg_skipped_nobuf = 0, dbg_emitted = 0;
+    struct list_head *el; JSGCObjectHeader *gp;
+    list_for_each(el, &rt->gc_obj_list) {
+        dbg_total++;
+        gp = list_entry(el, JSGCObjectHeader, link);
+        /* EVERY compiled function is on the GC list as a raw bytecode
+           object (add_gc_object at js_create_function time) — whether or
+           not OP_fclosure ever wrapped it in a JSObject. Iterating the raw
+           bytecodes, not the instantiated closures, is what reaches a
+           function nested inside a module factory the bundler never
+           require()s (github's unused-feature chunks: the preheat fetch
+           lives in a chunk only the login flow loads). Its @T site is
+           invisible to the closure walk because the factory never ran to
+           instantiate it. One GC entry per function — no closure/raw
+           double-count. All four func_kinds (regular / generator / async /
+           async-generator) share JSFunctionBytecode, so async `await
+           fetch(...)` sites are covered. */
+        if (gp->gc_obj_type != JS_GC_OBJ_TYPE_FUNCTION_BYTECODE) continue;
+        dbg_bc++;
+        JSFunctionBytecode *b = (JSFunctionBytecode *)gp;
+        if (!b->byte_code_buf) { dbg_skipped_nobuf++; continue; }
+        if (qjs_is_host_model_file(b->filename)) { dbg_skipped_host++; continue; }   /* our shim, not the page */
+        const uint8_t *bc = b->byte_code_buf;
+        int len = b->byte_code_len, pos = 0;
+        while (pos < len) {
+            int op = bc[pos];
+            int sz = short_opcode_info(op).size;
+            if (sz < 1) break;            /* defensive: never spin */
+            JSAtom a = qjs_host_atom_at(b, pos);
+            if (a != JS_ATOM_NULL) {
+                const char *fn = b->filename ? JS_AtomToCString(ctx, b->filename) : NULL;
+                const char *nm = JS_AtomToCString(ctx, a);
+                printf("@T {\"api\":\"%s\",\"file\":\"%s\",\"line\":%d,\"col\":%d}\n",
+                       nm ? nm : "?", fn ? fn : "?", b->line_num, b->col_num);
+                dbg_emitted++;
+                if (fn) JS_FreeCString(ctx, fn);
+                if (nm) JS_FreeCString(ctx, nm);
+            }
+            pos += sz;
+        }
+    }
+    /* @WHY: zero @T from a successful scan is suspicious and the worst
+       silent failure mode. Always emit a diagnostic so the brain can
+       distinguish "scan ran, no candidates" from "scan never ran". */
+    printf("@WHY {\"phase\":\"static_sites\",\"gc_total\":%d,\"bytecode_objs\":%d,\"skipped_host\":%d,\"skipped_nobuf\":%d,\"host_atoms\":%d,\"sink_wr\":%d,\"emitted\":%d}\n",
+           dbg_total, dbg_bc, dbg_skipped_host, dbg_skipped_nobuf, qjs_host_atoms_n, qjs_sink_wr_n, dbg_emitted);
+    fflush(stdout);
+    return JS_UNDEFINED;
+}
+
+
+/* ── Bundler chunk-discovery via the require's own runtime contract ──
+   webpack/rspack hand the module/chunk `require` to each chunk's runtime
+   function through the chunk-array push contract: the runtime replaces a
+   global array's `push` with its chunk-install closure, which runs
+   `if (runtimeFn) runtimeFn(require)`. The dormant lazy-loaders for the
+   features the SSR HTML didn't include (logged-out github: the nav/feature
+   `react-partial` chunks) close over THIS require value and call its
+   chunk-load method `require.e(id)`, which the natural run never fires
+   because nothing in the (logged-out) DOM invokes the loader.
+
+   Capturing the require by VALUE — not by the minified name (`t`/`b`), not
+   by a method-name fingerprint — lets the targeted drive recognise a loader
+   as "an unreached instantiated closure that reads an OWN property off the
+   captured require", then driving it runs `require.e(id)` for real so the
+   runtime's own `require.u(id)` computes the real chunk URL and the script
+   loader sets `<script src>` (recorded by the createElement host-edge). No
+   `require.u(0..N)` probing, no literal extraction: the chunk ids come from
+   the app's own loader calls executed for real. */
+static int qjs_val_is_jsfunc(JSValueConst v) {
+    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT) return 0;
+    int cid = JS_VALUE_GET_OBJ(v)->class_id;
+    return cid == JS_CLASS_BYTECODE_FUNCTION || cid == JS_CLASS_GENERATOR_FUNCTION ||
+           cid == JS_CLASS_ASYNC_FUNCTION || cid == JS_CLASS_ASYNC_GENERATOR_FUNCTION;
+}
+
+/* Unwrap bound functions (the runtime sets `array.push = install.bind(...)`)
+   to the underlying bytecode closure whose var_refs hold the require. */
+static JSObject *qjs_unwrap_closure(JSValueConst v) {
+    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT) return NULL;
+    JSObject *p = JS_VALUE_GET_OBJ(v);
+    int guard = 0;
+    while (p && p->class_id == JS_CLASS_BOUND_FUNCTION && guard++ < 8) {
+        JSBoundFunction *bf = p->u.bound_function;
+        if (!bf || JS_VALUE_GET_TAG(bf->func_obj) != JS_TAG_OBJECT) return NULL;
+        p = JS_VALUE_GET_OBJ(bf->func_obj);
+    }
+    if (p && (p->class_id == JS_CLASS_BYTECODE_FUNCTION ||
+              p->class_id == JS_CLASS_GENERATOR_FUNCTION ||
+              p->class_id == JS_CLASS_ASYNC_FUNCTION ||
+              p->class_id == JS_CLASS_ASYNC_GENERATOR_FUNCTION))
+        return p;
+    return NULL;
+}
+
+/* Own-property count of a candidate (the require carries its method table —
+   e/u/l/m/c/d/o/r/p/…; an unrelated captured helper carries ~0). Only used
+   to pick the require among an install closure's callable var_refs when more
+   than one is callable: an argmax, not a magic threshold. */
+static int qjs_own_prop_count(JSContext *ctx, JSValueConst v) {
+    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT) return 0;
+    JSPropertyEnum *tab = NULL; uint32_t len = 0;
+    if (JS_GetOwnPropertyNames(ctx, &tab, &len, v, JS_GPN_STRING_MASK) != 0) return 0;
+    for (uint32_t i = 0; i < len; i++) JS_FreeAtom(ctx, tab[i].atom);
+    js_free(ctx, tab);
+    return (int)len;
+}
+
+/* Find the bundler require by its push contract. Returns a BORROWED JSValue
+   (held alive by globalThis for the whole run — never freed by the caller),
+   or JS_UNDEFINED if this page isn't a webpack/rspack bundle (e.g. jQuery).
+   A global own-property Array whose OWN `push` is a function is the hijacked
+   chunk array; its install closure's unique callable var_ref (argmax of own
+   props) is the require. */
+static JSValue qjs_capture_require(JSContext *ctx) {
+    JSValue g = JS_GetGlobalObject(ctx);
+    JSAtom push_atom = JS_NewAtom(ctx, "push");
+    JSPropertyEnum *gtab = NULL; uint32_t glen = 0;
+    JSValue best = JS_UNDEFINED; int best_props = -1;   /* best is BORROWED */
+    if (JS_GetOwnPropertyNames(ctx, &gtab, &glen, g, JS_GPN_STRING_MASK) == 0) {
+        for (uint32_t i = 0; i < glen; i++) {
+            JSValue v = JS_GetProperty(ctx, g, gtab[i].atom);
+            if (JS_IsException(v)) { JS_FreeValue(ctx, JS_GetException(ctx)); continue; }
+            if (JS_IsArray(v)) {
+                JSObject *arr = JS_VALUE_GET_OBJ(v);
+                JSProperty *pr = NULL;
+                JSShapeProperty *prs = find_own_property(&pr, arr, push_atom);
+                if (prs && !(prs->flags & JS_PROP_TMASK) && pr) {
+                    JSObject *inst = qjs_unwrap_closure(pr->u.value);
+                    if (inst && inst->u.func.function_bytecode) {
+                        int nref = inst->u.func.function_bytecode->closure_var_count;
+                        for (int k = 0; k < nref; k++) {
+                            JSVarRef *vr = inst->u.func.var_refs[k];
+                            if (!vr || !vr->pvalue) continue;
+                            JSValueConst cand = *vr->pvalue;
+                            if (qjs_val_is_jsfunc(cand)) {
+                                int pc = qjs_own_prop_count(ctx, cand);
+                                if (pc > best_props) { best_props = pc; best = cand; }
+                            }
+                        }
+                    }
+                }
+            }
+            JS_FreeValue(ctx, v);
+        }
+    }
+    if (gtab) { for (uint32_t i = 0; i < glen; i++) JS_FreeAtom(ctx, gtab[i].atom); js_free(ctx, gtab); }
+    JS_FreeAtom(ctx, push_atom);
+    JS_FreeValue(ctx, g);
+    /* require has its method table; a 0-own-prop callable is not it. */
+    return best_props >= 1 ? best : JS_UNDEFINED;
+}
+
+/* First bytecode offset >= `from` at which closure `p` reads an OWN property
+   off the captured require — the receiver pushed by the immediately-
+   preceding get_var_ref whose LIVE value IS the require. Returns -1 if none.
+   The own-property test (find_own_property on the require) keeps it to the
+   bundler's runtime methods (require.e/require.u/…), not an inherited
+   .bind/.then nor an unrelated field read — pure value identity, no name. */
+static int qjs_require_site_from(JSContext *ctx, JSObject *p, JSValueConst req, int from) {
+    JSFunctionBytecode *fb = p->u.func.function_bytecode;
+    if (!fb || !fb->byte_code_buf) return -1;
+    if (JS_VALUE_GET_TAG(req) != JS_TAG_OBJECT) return -1;
+    JSObject *reqo = JS_VALUE_GET_OBJ(req);
+    int nref = fb->closure_var_count;
+    const uint8_t *bc = fb->byte_code_buf;
+    int len = fb->byte_code_len, pos = 0, prev_is_req = 0;
+    while (pos < len) {
+        int op = bc[pos];
+        int sz = short_opcode_info(op).size;
+        if (sz < 1) break;
+        int this_is_req = 0, ridx = -1;
+        if (op == OP_get_var_ref) ridx = (int)get_u16(bc + pos + 1);
+        else if (op >= OP_get_var_ref0 && op <= OP_get_var_ref3) ridx = op - OP_get_var_ref0;
+        if (ridx >= 0 && ridx < nref) {
+            JSVarRef *vr = p->u.func.var_refs[ridx];
+            if (vr && vr->pvalue && JS_VALUE_GET_TAG(*vr->pvalue) == JS_TAG_OBJECT &&
+                JS_VALUE_GET_OBJ(*vr->pvalue) == reqo)
+                this_is_req = 1;
+        }
+        if ((op == OP_get_field || op == OP_get_field2) && prev_is_req && pos >= from) {
+            JSAtom a = (JSAtom)get_u32(bc + pos + 1);
+            JSProperty *pr = NULL;
+            if (find_own_property(&pr, reqo, a)) return pos;
+        }
+        prev_is_req = this_is_req;
+        pos += sz;
+    }
+    return -1;
+}
+
+/* Instantiate a raw bytecode function whose enclosing module factory never
+   ran (a React-lazy + render-gated chunk method like the login-gated
+   `preheat` fetch) so it can be force-called. Its closure variables — the
+   module's imports — get SYNTHETIC opaque var-refs (the function never had a
+   parent frame to capture from), so a `this.x`/`imported.y` read yields
+   opaque and propagates; `fetch`/`location`/etc. stay the real host stubs
+   (globals, not closure vars). The result: calling it under directed drive
+   resolves the fetch URL's literal/this-derived parts and marks the rest
+   opaque — the structural endpoint, no synthetic var-ref GC surgery beyond
+   the standard detached-var-ref the engine already frees on teardown. */
+static JSValue qjs_fe_inst_opaque(JSContext *ctx, JSFunctionBytecode *b) {
+    JSValue fo = JS_NewObjectClass(ctx, func_kind_to_class_id[b->func_kind]);
+    if (JS_IsException(fo)) return fo;
+    JSObject *p = JS_VALUE_GET_OBJ(fo);
+    p->u.func.function_bytecode = b;
+    js_dup(JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, b));   /* the closure now refs the bytecode */
+    p->u.func.home_object = NULL;
+    p->u.func.var_refs = NULL;
+    int n = b->closure_var_count;
+    if (n) {
+        JSVarRef **vrs = js_mallocz(ctx, sizeof(JSVarRef *) * n);
+        if (!vrs) { JS_FreeValue(ctx, fo); return JS_EXCEPTION; }
+        p->u.func.var_refs = vrs;
+        for (int i = 0; i < n; i++) {
+            JSVarRef *vr = js_create_var_ref(ctx, true);   /* detached, GC-tracked */
+            if (!vr) { JS_FreeValue(ctx, fo); return JS_EXCEPTION; }
+            vr->value = qjs_opq_make(ctx, 1, "fe-inst", qjs_t_opaque());
+            vr->pvalue = &vr->value;
+            vrs[i] = vr;
+        }
+    }
+    js_function_set_properties(ctx, fo,
+        b->func_name == JS_ATOM_NULL ? JS_ATOM_empty_string : b->func_name,
+        b->defined_arg_count);
+    return fo;
+}
+
+/* Force-drive the UNREACHED @T host functions whose module factory never ran
+   — the React-lazy + render-gated chunk methods (the login-gated `preheat`
+   fetch: its `class ar` is module-level in a chunk only a logged-in render
+   would require, so no closure for it ever exists). Instantiate ONLY the
+   leaf @T function with opaque var-refs (qjs_fe_inst_opaque — no module
+   factory re-run, which corrupts the atom table) and directed-drive it to
+   each host site (J-Force §3.1.3 / CLAUDE.md source-2 @T→@H promotion).
+
+   RESUMABLE / THROTTLED. There are ~hundreds of orphan drives — running them
+   in one shot pegs a core for minutes and overheats the device. So this is a
+   CURSOR-BASED BATCH: qjs_deep_step_c(ctx, maxN) drives the next maxN orphans
+   and returns how many remain; the worker calls it in small batches with an
+   `await sleep()` between, keeping the CPU at a low duty cycle. Time is free
+   (background worker); the device stays cool and no core is maxed. The orphan
+   list + cursor are cached per runtime (the persistent stepping runtime in
+   qjsmain), so the bundle is booted ONCE, not re-parsed per batch. */
+static JSFunctionBytecode **qjs_deep_rb = NULL;
+static JSValue *qjs_deep_insts = NULL;   /* parallel to qjs_deep_rb: real function-instance JSObject when one exists on the heap (so its closure var_refs carry through to the drive); JS_UNDEFINED otherwise → fall back to qjs_fe_inst_opaque (opaque var_refs). Real var_refs let a closure-private CALLER reach its sibling wrapper concretely instead of collapsing to opaque on `M(literal)`. */
+/* Cached STATIC reach-bits parallel to qjs_deep_rb. net/sink are pure
+   functions of bytecode (they never change as the grind runs), so the
+   per-pick comparator reads them in O(1) instead of re-walking the
+   bytecode every comparison. This is what makes the non-FIFO live-pick
+   cheap: the only DYNAMIC signal (qjs_executed) is read live off the
+   struct (also O(1)); the two expensive bytecode scans are hoisted to a
+   single O(residue·bytecode) pass at build time. Without this the pick
+   loop was O(N²·bytecode) — the real cost the "non-FIFO is slow" worry
+   was actually measuring. */
+static uint8_t *qjs_deep_net = NULL;    /* 1 = reaches a network host edge */
+static uint8_t *qjs_deep_sink = NULL;   /* 1 = reaches a security sink */
+/* Driving-completeness counters (per grind): a host-bearing @T function was
+   directed-driven but fired no host call. threw = an opaque op before the
+   fetch raised; ret = it returned without fetching (guard arm not forced /
+   event-gated handler registered-not-dispatched / deep call chain broke on
+   opaque). Carried on the @DS line so the representative extension path
+   surfaces the frontier shape (stderr @WHY isn't visible there). Reset when
+   the residue is rebuilt (qjs_deep_free). */
+static int qjs_dnf_threw = 0, qjs_dnf_ret = 0;
+static int qjs_deep_rb_n = 0, qjs_deep_cursor = 0;
+static JSRuntime *qjs_deep_cache_rt = NULL;
+static void qjs_dd_free(JSContext *ctx);   /* fwd: driven-set + ids reset (defined below) */
+/* Capture a REAL closure instance the moment a driven factory orphan
+   instantiates it (called from js_closure2 during an active grind), so a
+   cold-module nested fn — an aliased-fetch endpoint in a never-required
+   webpack chunk — is later driven with its real var_refs (M/K/$/S bound)
+   rather than the qjs_fe_inst_opaque fallback that collapses the alias to
+   opaque before the host edge. Rides the factory's own single orphan-drive:
+   no factory re-run, so no atom-table churn. */
+static void qjs_deep_capture_inst(JSContext *ctx, JSFunctionBytecode *b, JSValue func_obj) {
+    if (!qjs_deep_rb || !qjs_deep_insts || !b) return;
+    int ix = b->qjs_deep_ix;
+    if (ix < 0 || ix >= qjs_deep_rb_n || qjs_deep_rb[ix] != b) return;   /* stale/zero-init index -> safe miss */
+    if (!JS_IsUndefined(qjs_deep_insts[ix])) return;                     /* first instance wins (matches build-time scan) */
+    qjs_deep_insts[ix] = JS_DupValue(ctx, func_obj);
+    /* A leaf driven via the opaque fallback BEFORE its factory existed gets
+       exactly ONE real-instance re-drive once the factory instantiates it
+       (monotone opaque->real, never a loop). MEASURED +~4% drives on the real
+       MS bundle (1503 vs 1449 baseline residue), within CLAUDE.md's 10% budget
+       — NOT the 2x I first miscounted (1449 is the bundle's residue size, not a
+       doubling). */
+    if (b->qjs_driven && b->qjs_driven_opaque) {
+        b->qjs_driven = 0;
+        b->qjs_driven_opaque = 0;
+    }
+}
+void qjs_deep_free(JSContext *ctx) {
+    if (qjs_deep_insts) {
+        for (int i = 0; i < qjs_deep_rb_n; i++) {
+            if (!JS_IsUndefined(qjs_deep_insts[i])) JS_FreeValue(ctx, qjs_deep_insts[i]);
+        }
+        js_free(ctx, qjs_deep_insts); qjs_deep_insts = NULL;
+    }
+    if (qjs_deep_rb) { js_free(ctx, qjs_deep_rb); qjs_deep_rb = NULL; }
+    if (qjs_deep_net) { js_free(ctx, qjs_deep_net); qjs_deep_net = NULL; }
+    if (qjs_deep_sink) { js_free(ctx, qjs_deep_sink); qjs_deep_sink = NULL; }
+    qjs_deep_rb_n = 0; qjs_deep_cursor = 0; qjs_deep_cache_rt = NULL;
+    qjs_dnf_threw = 0; qjs_dnf_ret = 0;
+    qjs_dd_free(ctx);
+}
+/* Driving-completeness counters — see qjs_dnf_threw decl. Carried on the @DS
+   status line so the extension surfaces the per-grind frontier shape. */
+int qjs_deep_dnf_threw_c(void) { return qjs_dnf_threw; }
+int qjs_deep_dnf_ret_c(void) { return qjs_dnf_ret; }
+/* Drop the runtime's pending-job queue (unsettled Promise / fetch().then
+   continuations the bundle's async init left behind). Called before
+   JS_FreeContext/JS_FreeRuntime at --fe-deep-end: those jobs hold object
+   references, so leaving them is why JS_FreeRuntime's
+   `list_empty(&rt->gc_obj_list)` assert trips on bundles with heavy async
+   init (learn.microsoft.com), AND a job settling during the free sweep is
+   the `!rt->in_free` JS_EnqueueJob assert. We're done learning at teardown,
+   so dropping (freeing the held refs without running the continuations) is
+   the correct cleanup — NOT a GC-loop mask: it releases real references the
+   queue owns, the spec-legitimate "drain before free". Non-static so
+   qjsmain's deep_end can call it. */
+void qjs_deep_drain_jobs(JSContext *ctx) {
+    if (ctx) qjs_drop_pending_jobs(JS_GetRuntime(ctx));
+}
+/* Absolute orphan cursor — persisted by the worker to IndexedDB so a fresh
+   runtime resumes here (the count of orphans SCANNED incl. skipped, which the
+   worker can't derive from batch size alone). */
+int qjs_deep_cursor_c(void) { return qjs_deep_cursor; }
+
+/* Per-function-ID driven SET — the resumable-progress mechanism that REPLACES
+   the cursor index. A function's id is a STABLE hash of file:line:col (a
+   property of the function, independent of the residue set + execution state),
+   so it survives a fresh resume runtime AND lets the usefulness order reorder
+   freely (an index-based cursor forces a static order; a done-SET does not).
+   The worker collects the `@DD <id>` line emitted per driven function, persists
+   the union, and on resume writes them to `/driven`, loaded here so those
+   functions are skipped. */
+static uint64_t *qjs_deep_ids = NULL;   /* parallel to qjs_deep_rb: stable id per residue fn */
+static uint64_t *qjs_dd = NULL; static int qjs_dd_n = 0, qjs_dd_cap = 0;   /* loaded driven set */
+static uint64_t qjs_fn_id(JSContext *ctx, JSFunctionBytecode *b) {
+    uint64_t h = 1469598103934665603ULL;   /* FNV-1a */
+    if (b->filename != JS_ATOM_NULL) {
+        const char *fn = JS_AtomToCString(ctx, b->filename);
+        if (fn) { for (const char *p = fn; *p; p++) { h ^= (unsigned char)*p; h *= 1099511628211ULL; } JS_FreeCString(ctx, fn); }
+    }
+    uint32_t parts[2] = { (uint32_t)b->line_num, (uint32_t)b->col_num };
+    for (int k = 0; k < 2; k++) for (int i = 0; i < 4; i++) { h ^= (parts[k] >> (i*8)) & 0xff; h *= 1099511628211ULL; }
+    /* Minified-bundle functions frequently carry NO debug position
+       (line=col=0), so file:line:col alone collides ALL of them onto one id
+       (measured: 140 distinct rust orphans → 1 id). The driven-set keys on
+       this id, so on resume one drive marks every colliding function driven
+       and silently drops the rest's coverage — the exact index-cursor flaw
+       the id design exists to avoid. Fold in the function's own bytecode
+       (arg_count + length + the byte_code_buf), which is deterministic for a
+       given source, so the id stays resume-stable while distinct bodies get
+       distinct ids. */
+    uint32_t meta[2] = { (uint32_t)b->byte_code_len, (uint32_t)b->arg_count };
+    for (int k = 0; k < 2; k++) for (int i = 0; i < 4; i++) { h ^= (meta[k] >> (i*8)) & 0xff; h *= 1099511628211ULL; }
+    if (b->byte_code_buf) for (int i = 0; i < b->byte_code_len; i++) { h ^= b->byte_code_buf[i]; h *= 1099511628211ULL; }
+    return h;
+}
+static int qjs_dd_has(uint64_t id) { for (int i = 0; i < qjs_dd_n; i++) if (qjs_dd[i] == id) return 1; return 0; }
+static void qjs_dd_add(JSContext *ctx, uint64_t id) {
+    if (qjs_dd_has(id)) return;
+    if (qjs_dd_n == qjs_dd_cap) { int nc = qjs_dd_cap ? qjs_dd_cap*2 : 256; uint64_t *nt = js_realloc(ctx, qjs_dd, (size_t)nc*sizeof*nt); if (!nt) return; qjs_dd = nt; qjs_dd_cap = nc; }
+    qjs_dd[qjs_dd_n++] = id;
+}
+static void qjs_dd_free(JSContext *ctx) { if (qjs_dd) js_free(ctx, qjs_dd); qjs_dd = NULL; qjs_dd_n = qjs_dd_cap = 0; if (qjs_deep_ids) js_free(ctx, qjs_deep_ids); qjs_deep_ids = NULL; }
+static void qjs_dd_load(JSContext *ctx) {   /* /driven = newline-separated hex ids the worker persisted */
+    FILE *f = fopen("/driven", "r"); if (!f) return;
+    char ln[64];
+    while (fgets(ln, sizeof ln, f)) { uint64_t id = strtoull(ln, NULL, 16); if (id) qjs_dd_add(ctx, id); }
+    fclose(f);
+}
+/* Usefulness ordering for the deep residue — drive the MOST USEFUL unused
+   functions first. Lexicographic tiers, no magic weights. Relevance (page
+   last-visit recency) is the CROSS-grind signal, handled at grind selection
+   (`_resumeIncompleteDeep`); WITHIN a grind the tiers, in PINNED-GOAL order
+   per CLAUDE.md (endpoint completeness #1, security finding detection #10
+   — same forced-execution pass produces BOTH, one engine two views, just
+   ordered so endpoints land in the @H stream first):
+     1. ENDPOINT — reaches a NETWORK edge (fetch/XHR/WebSocket/EventSource/
+        sendBeacon/send): an unused API endpoint, which is the entire reason the
+        deep grind exists (lazy-chunk fetch recovery — the login-gated `preheat`
+        fetch in chunk 30129 lives here). Driven FIRST. (Ordering sinks first
+        buried every network orphan behind ~900 sink fns → preheat at
+        driven-position 1008/1108 → never reached before the user gave up.)
+     2. QUALITY — `qjs_executed`: the function's body actually RAN in the page's
+        real context (its closure/module-scope state is concrete) but its host
+        SITE was guard-skipped (qjs_h_fired=0) — the preheat shape exactly.
+        Driving it resolves CONCRETE URL/body values; a never-entered cold
+        orphan (qjs_executed=0) can only yield an opaque shape. So among
+        endpoint orphans the concrete-context ones come first → higher-quality
+        learning sooner. (The deep-grind residue is `!qjs_h_fired`, which DOES
+        include qjs_executed==1 fns — earlier this tier was wrongly dropped on
+        the false premise that the residue is all-unexecuted, conflating it with
+        js_fe_static's `!qjs_executed` set.)
+     3. SECURITY — reaches a SINK (eval/Function/timers/importScripts/innerHTML/
+        outerHTML/insertAdjacent*): a candidate XSS/code-exec finding. Next.
+     4. EFFORT — smaller bytecode first (cheaper → more learned per cycle).
+     5. Original GC index — a stable tiebreak.
+   This ONLY reorders; every orphan is still driven (NO cap); SCHEDULING, never
+   a value heuristic (changes ORDER, never WHAT is learned). qjs_executed is an
+   execution-state fact (not a score/heuristic/bundler-recognition). */
+static int qjs_is_sink_atom(JSAtom a) {
+    for (int i = 0; i < qjs_sink_n; i++) if (a == qjs_sink_atoms[i]) return 1;
+    return 0;
+}
+static int qjs_fn_reaches_sink(JSFunctionBytecode *b) {
+    int len = b->byte_code_len, pos = 0;
+    while (pos < len) {
+        int op = b->byte_code_buf[pos];
+        int sz = short_opcode_info(op).size;
+        if (sz < 1) break;
+        JSAtom a = qjs_host_atom_at(b, pos);
+        if (a != JS_ATOM_NULL && qjs_is_sink_atom(a)) return 1;
+        pos += sz;
+    }
+    return 0;
+}
+/* The host atom set is network-edges ∪ XSS-sinks; a host atom that is NOT a
+   sink is a network edge (fetch/XHR/WebSocket/EventSource/sendBeacon/send).
+   The deep grind exists to recover lazy-chunk FETCHES — the unused API
+   surface (goal #1) — so a network-reaching orphan (e.g. chunk-30129's
+   `preheat` fetch) is the most-useful one to drive first; security sinks
+   come from the SAME drive (goal #10), driven next in the same pass — one
+   engine, two views, just ordered. */
+static int qjs_fn_reaches_net(JSFunctionBytecode *b) {
+    int len = b->byte_code_len, pos = 0;
+    while (pos < len) {
+        int op = b->byte_code_buf[pos];
+        int sz = short_opcode_info(op).size;
+        if (sz < 1) break;
+        JSAtom a = qjs_host_atom_at(b, pos);
+        if (a != JS_ATOM_NULL && !qjs_is_sink_atom(a)) return 1;
+        pos += sz;
+    }
+    return 0;
+}
+typedef struct { JSFunctionBytecode *b; int net; int exec; int sink; int size; int idx; } qjs_deep_ent;
+/* Comparator extracted to priority.h — see that file for the lexicographic
+   dimensions. Header-only inline; the struct layout above must precede the
+   include since the comparator dereferences it. */
+#include "priority.h"
+static void qjs_deep_relevance_sort(JSContext *ctx, JSFunctionBytecode **rb, int n) {
+    if (n < 2) return;
+    qjs_deep_ent *e = js_malloc(ctx, (size_t)n * sizeof *e);
+    if (!e) {
+        /* OOM on the priority-sort entry array — keep GC order (still
+           correct, just unsorted) but SURFACE the diagnostic so a slow
+           "endpoint orphan driven last" symptom on a large bundle is
+           traceable to the allocator, not to a comparator bug. */
+        fprintf(stderr, "@WHY {\"phase\":\"deep_relevance_sort_oom\",\"n\":%d}\n", n);
+        fflush(stderr);
+        return;
+    }
+    for (int i = 0; i < n; i++) { e[i].b = rb[i]; e[i].net = qjs_fn_reaches_net(rb[i]); e[i].exec = rb[i]->qjs_executed; e[i].sink = qjs_fn_reaches_sink(rb[i]); e[i].size = rb[i]->byte_code_len; e[i].idx = i; }
+    rqsort(e, n, sizeof *e, qjs_priority_deep_relcmp, NULL);
+    for (int i = 0; i < n; i++) rb[i] = e[i].b;
+    js_free(ctx, e);
+}
+/* Drive up to maxN not-yet-driven orphans from the cursor; return how many
+   orphans remain after this batch (0 = done). Non-static: qjsmain calls it
+   from the persistent stepping runtime. fromCursor >= 0 SEEKS the cursor when
+   the orphan list is first built on this runtime — for durable RESUME: a
+   fresh worker (after MV3 eviction) re-boots the same combined bundle (stable
+   GC order ⇒ same orphan indices) and continues from the IndexedDB-saved
+   cursor instead of re-driving the done orphans. */
+int qjs_deep_step_c(JSContext *ctx, int maxN, int fromCursor) {
+    if (maxN < 1) maxN = 1;
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    qjs_init_host_atoms(ctx);
+    if (qjs_deep_cache_rt != rt) {
+        /* First batch on this runtime: enumerate the UNREACHED host-bearing
+           bytecodes (the boot, incl. the driver's static/loader drive, has
+           already marked the reached set qjs_executed, so this is the true
+           never-reached residue). GC-list order is stable, so the cursor is
+           a consistent index across batches. */
+        qjs_deep_free(ctx);
+        qjs_deep_cache_rt = rt;
+        int cap = 0;
+        struct list_head *el;
+        list_for_each(el, &rt->gc_obj_list) {
+            JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
+            if (gp->gc_obj_type != JS_GC_OBJ_TYPE_FUNCTION_BYTECODE) continue;
+            JSFunctionBytecode *b = (JSFunctionBytecode *)gp;
+            /* Residue = functions whose host SITE never fired (qjs_h_fired=0)
+               — INCLUDING those without a direct host-edge atom in their own
+               bytecode. The transitive-call case is why: a thin wrapper like
+               `function M(e,t){ ...await fetch(e,t)... }` is a @T candidate
+               (has fetch atom) and __feDriveStatic drives it, but with opaque
+               args yields only an OPAQUE-URL @H. The CONCRETE URL lives in a
+               CALLER like `function mxe(){ return M("/site-header.json") }`,
+               which has no host atom (just an OP_call to M) — under the old
+               has-host filter that caller was never driven, so its literal URL
+               never reached fetch and the page's site-header GET appeared
+               [live]-only (network-vs-AST diff on learn.microsoft.com). Drive
+               every un-fired function once: when a caller runs, it invokes the
+               wrapper with the literal in scope, the wrapper's fetch fires
+               with the CONCRETE URL, and @H is emitted naturally. Per-fn-ID
+               driven-SET prevents re-drives across batches/resumes. Sort below
+               keeps host-atom functions FIRST (preheat-style endpoints stay
+               goal #1); non-host callers tail-drive as eventual consistency.
+               qjs_h_fired stays 0 forever for a non-host function (no site to
+               fire), so the driven-SET is the sole "done" mark for them. */
+            if (!b->byte_code_buf || b->qjs_h_fired) continue;
+            if (qjs_is_host_model_file(b->filename)) continue;
+            if (qjs_deep_rb_n == cap) {
+                int nc = cap ? cap * 2 : 64;
+                JSFunctionBytecode **nt = js_realloc(ctx, qjs_deep_rb, nc * sizeof *nt);
+                if (!nt) break;
+                qjs_deep_rb = nt; cap = nc;
+            }
+            qjs_deep_rb[qjs_deep_rb_n++] = b;
+        }
+        qjs_deep_relevance_sort(ctx, qjs_deep_rb, qjs_deep_rb_n);
+        /* Post-sort back-index for O(1) in-grind closure-instance capture
+           (qjs_deep_capture_inst), set after the sort fixes the final order. */
+        for (int _bi = 0; _bi < qjs_deep_rb_n; _bi++) qjs_deep_rb[_bi]->qjs_deep_ix = _bi;
+        /* Residue total, emitted ONCE at grind start, so the host (ast-thread)
+           can show LIVE deep-scan progress: done = count of @DD seen so far,
+           total = this. Without it the popup only shows a vague "Background
+           work" until the grind ends (@DS rem) — the user can't tell slow from
+           stuck from done. Flushed so it streams during the single callMain. */
+        printf("@DTOTAL %d\n", qjs_deep_rb_n); fflush(stdout);
+        /* Stable per-fn ids (post-sort, parallel to qjs_deep_rb) + load the
+           persisted driven SET so a resume skips functions driven in earlier
+           runs by ID — independent of order, so the usefulness sort can reorder
+           freely. (The fromCursor index seek below is the legacy resume path,
+           kept until the worker switches to the driven set.) */
+        if (qjs_deep_ids) { js_free(ctx, qjs_deep_ids); qjs_deep_ids = NULL; }
+        qjs_deep_ids = js_malloc(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1) * sizeof(uint64_t));
+        if (qjs_deep_ids) for (int i = 0; i < qjs_deep_rb_n; i++) qjs_deep_ids[i] = qjs_fn_id(ctx, qjs_deep_rb[i]);
+        /* Cache the STATIC reach-bits once (parallel to qjs_deep_rb) so the
+           per-pick comparator is O(1) — net/sink never change as the grind
+           runs, so walking them per comparison was the O(N²·bytecode) cost. */
+        if (qjs_deep_net) { js_free(ctx, qjs_deep_net); qjs_deep_net = NULL; }
+        if (qjs_deep_sink) { js_free(ctx, qjs_deep_sink); qjs_deep_sink = NULL; }
+        qjs_deep_net = js_malloc(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1));
+        qjs_deep_sink = js_malloc(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1));
+        if (qjs_deep_net && qjs_deep_sink) {
+            for (int i = 0; i < qjs_deep_rb_n; i++) {
+                qjs_deep_net[i] = (uint8_t)qjs_fn_reaches_net(qjs_deep_rb[i]);
+                qjs_deep_sink[i] = (uint8_t)qjs_fn_reaches_sink(qjs_deep_rb[i]);
+            }
+        }
+        qjs_dd_load(ctx);
+        /* Stamp the persisted driven-set onto each residue bytecode's
+           b->qjs_driven flag so the runtime check is O(1) instead of a linear
+           qjs_dd_has scan. Boot-time cost is O(driven × residue) — fine since
+           this runs once per runtime, not per pick. The flag is sticky-set
+           and matches qjs_dd[] semantically: both say "this function was
+           driven, don't re-drive". qjs_dd[] is kept for the @DD emission
+           path (we still need the ID to print on first-time-driven). */
+        if (qjs_deep_ids && qjs_dd_n > 0) {
+            for (int i = 0; i < qjs_deep_rb_n; i++) {
+                if (qjs_dd_has(qjs_deep_ids[i])) qjs_deep_rb[i]->qjs_driven = 1;
+            }
+        }
+        if (fromCursor > 0) qjs_deep_cursor = fromCursor < qjs_deep_rb_n ? fromCursor : qjs_deep_rb_n;
+        /* Pair each residue bytecode with an existing function-INSTANCE on the
+           heap when one is reachable — its u.func.var_refs hold the REAL
+           closure-captured values from the IIFE's frame, so a closure-private
+           caller (`mxe`) that references its sibling wrapper (`M`) reaches the
+           REAL M instead of an opaque (which qjs_fe_inst_opaque would give for
+           every var_ref, collapsing `M(literal)` to opaque). Without this the
+           expanded residue catches the caller bytecode but the call chain
+           through closure vars dead-ends opaque before fetch. */
+        qjs_deep_insts = js_malloc(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1) * sizeof(JSValue));
+        if (qjs_deep_insts) {
+            for (int i = 0; i < qjs_deep_rb_n; i++) qjs_deep_insts[i] = JS_UNDEFINED;
+            struct list_head *iel;
+            list_for_each(iel, &rt->gc_obj_list) {
+                JSGCObjectHeader *igp = list_entry(iel, JSGCObjectHeader, link);
+                if (igp->gc_obj_type != JS_GC_OBJ_TYPE_JS_OBJECT) continue;
+                JSObject *iobj = (JSObject *)igp;
+                int icid = iobj->class_id;
+                if (icid != JS_CLASS_BYTECODE_FUNCTION && icid != JS_CLASS_GENERATOR_FUNCTION &&
+                    icid != JS_CLASS_ASYNC_FUNCTION && icid != JS_CLASS_ASYNC_GENERATOR_FUNCTION)
+                    continue;
+                JSFunctionBytecode *ifb = iobj->u.func.function_bytecode;
+                if (!ifb) continue;
+                /* Linear scan over qjs_deep_rb (per real instance — count is
+                   bounded by the module-instantiated subset, which is much
+                   smaller than the GC list). First instance wins; subsequent
+                   instances of the same bytecode are ignored (same var_refs
+                   shape, one drive suffices per residue entry — driven-SET
+                   dedup by stable fn id handles cross-batch). */
+                for (int ri = 0; ri < qjs_deep_rb_n; ri++) {
+                    if (qjs_deep_rb[ri] == ifb) {
+                        if (JS_IsUndefined(qjs_deep_insts[ri])) {
+                            qjs_deep_insts[ri] = JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, iobj));
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        JS_RunGC(rt);
+    }
+    int driven = 0;
+    qjs_drop_pending_jobs(rt);   /* clear any boot residue before per-orphan draining */
+    /* LIVE-PICK driver — non-FIFO priority scan over qjs_deep_rb, NOT a
+       cursor over a one-time sort. At each iteration it picks the not-yet-
+       driven, not-yet-fired function with the highest LIVE priority. The
+       comparator reads CACHED net/sink bits (qjs_deep_net/qjs_deep_sink,
+       computed once at build) plus the LIVE qjs_executed bit — so a
+       function whose body ran mid-grind (exec 0→1) promotes on the next
+       pick, while the O(bytecode) reach scans never run in the loop. Cost
+       is O(N²) cheap integer compares (no bytecode walk), so the productive
+       network-reaching orphans are driven first and useful endpoints come
+       back EARLY even on a 1100-orphan residue. Falls back to the
+       bytecode-walking comparator only if the bit arrays failed to alloc
+       (OOM) — correctness preserved either way. */
+    int _have_bits = (qjs_deep_net != NULL && qjs_deep_sink != NULL);
+    while (driven < maxN) {
+        int _ix = -1;
+        JSFunctionBytecode *b = NULL;
+        for (int _ci = 0; _ci < qjs_deep_rb_n; _ci++) {
+            JSFunctionBytecode *cb = qjs_deep_rb[_ci];
+            if (!cb || !cb->byte_code_buf) continue;
+            if (cb->qjs_driven) continue;   /* O(1) skip via the flag */
+            if (cb->qjs_h_fired) {
+                cb->qjs_driven = 1;
+                uint64_t fid = qjs_deep_ids ? qjs_deep_ids[_ci] : 0;
+                if (fid) printf("@DD %llx\n", (unsigned long long)fid);
+                continue;   /* already fired naturally — don't drive */
+            }
+            int better;
+            if (b == NULL) better = 1;
+            else if (_have_bits)
+                better = qjs_priority_live_orphan_better_bits(
+                    qjs_deep_net[_ci], cb->qjs_executed, qjs_deep_sink[_ci], cb->byte_code_len,
+                    qjs_deep_net[_ix], b->qjs_executed, qjs_deep_sink[_ix], b->byte_code_len);
+            else
+                better = qjs_priority_live_orphan_better(cb, b);
+            if (better) { b = cb; _ix = _ci; }
+        }
+        if (b == NULL) break;   /* residue exhausted */
+        uint64_t _id = qjs_deep_ids ? qjs_deep_ids[_ix] : 0;
+        /* Pre-drive marker (flushed): a single non-terminating orphan drive
+           (opaque-controlled loop the intra-run fixpoint failed to bound)
+           wedges the whole grind, and @DD only emits AFTER a drive returns —
+           so the wedged orphan is otherwise invisible. The LAST @DSTART with
+           no matching @DD is the culprit; carries its source location so it
+           can be read in the bundle. Silent hang is the worst failure mode. */
+        { const char *_dfn = b->filename ? JS_AtomToCString(ctx, b->filename) : NULL;
+          printf("@DSTART {\"id\":\"%llx\",\"file\":\"%s\",\"line\":%d,\"col\":%d,\"size\":%d,\"net\":%d}\n",
+                 (unsigned long long)_id, _dfn ? _dfn : "?", b->line_num, b->col_num,
+                 b->byte_code_len, _have_bits ? qjs_deep_net[_ix] : -1);
+          fflush(stdout);
+          if (_dfn) JS_FreeCString(ctx, _dfn); }
+        /* Prefer a REAL function instance (with closure-captured var_refs from
+           its original IIFE/module frame) when one is reachable on the heap —
+           that's how a closure-private caller's reference to its sibling
+           wrapper reaches the REAL wrapper (and its real fetch call site).
+           qjs_fe_inst_opaque is the fallback when no instance exists (e.g.,
+           cold-orphan webpack-lazy chunk fns that were never instantiated). */
+        int _from_real = (qjs_deep_insts && !JS_IsUndefined(qjs_deep_insts[_ix]));
+        JSValue fo = _from_real
+            ? JS_DupValue(ctx, qjs_deep_insts[_ix])
+            : qjs_fe_inst_opaque(ctx, b);
+        if (JS_IsException(fo)) { JSValue e = JS_GetException(ctx); JS_FreeValue(ctx, e); continue; }
+        int nargs = b->arg_count, len = b->byte_code_len, pos = 0;
+        /* Pre-classify: does this function's own bytecode hold any host atom?
+           If not, it's a CALLER of a thin wrapper — the drive can't steer to a
+           local host site (there is none), so call it once with opaque args
+           and let the chain reach the host edge inside whatever wrapper it
+           invokes (works because qjs_deep_insts gives it real closure var_refs
+           pointing at the real wrapper, not opaque). The targeted-drive loop
+           below stays the regular path for functions WITH host atoms. */
+        int has_host_in_b = 0;
+        for (int hp = 0; hp < len; ) {
+            int hop = b->byte_code_buf[hp];
+            int hsz = short_opcode_info(hop).size;
+            if (hsz < 1) break;
+            if (qjs_host_atom_at(b, hp) != JS_ATOM_NULL) { has_host_in_b = 1; break; }
+            hp += hsz;
+        }
+        /* Class constructor? Its bytecode starts with OP_check_ctor, which
+           throws "must be invoked with 'new'" on a plain JS_Call. Drive such an
+           orphan with JS_CallConstructor on BOTH the plain-call and targeted
+           paths so a real `this` instance is created (and its arrows/closures
+           captured with the real instance) instead of a wasted throw. */
+        int _is_cls_ctor = 0;
+        for (int cp = 0; cp < len && cp < 8; ) { int cop = b->byte_code_buf[cp]; if (cop == OP_check_ctor) { _is_cls_ctor = 1; break; } int csz = short_opcode_info(cop).size; if (csz < 1) break; cp += csz; }
+        if (!has_host_in_b) {
+            JSValue *args3 = nargs > 0 ? js_mallocz(ctx, nargs * sizeof(JSValue)) : NULL;
+            if (nargs > 0 && !args3) { JS_FreeValue(ctx, fo); continue; }
+            for (int ai = 0; ai < nargs; ai++) args3[ai] = qjs_fe_named_arg(ctx, b, ai, "deep-drive");
+            qjs_fe_taint_event_arg0(ctx, b, args3, nargs);
+            JSValue this_opq2 = qjs_opq_make(ctx, 1, "deep-drive-this", qjs_t_opaque());
+            qjs_dir_active = 0; qjs_dir_b = NULL; qjs_dir_target = -1;   /* no host site to steer to */
+            qjs_fe_seen_reset();   /* fresh loop-revisit bound per drive (one execution unit) */
+            /* A class constructor's bytecode starts with OP_check_ctor, which
+               THROWS "must be invoked with 'new'" on a plain JS_Call — so the
+               body never runs, no real instance exists, and its methods/arrows
+               (driven separately) only ever see opaque `this`, leaving
+               instance-state-derived URLs (this.url) opaque. Drive it with
+               JS_CallConstructor: a real `this` is created, the body runs, and
+               js_closure2 captures the arrows it creates WITH the real instance
+               (qjs_deep_capture_inst) → their re-drive resolves this.X
+               CONCRETELY (the cold-instance class gap; learn.microsoft.com
+               search component `this._input=$0e(async()=>this.fetch())`). */
+            JSValue r2 = _is_cls_ctor
+                ? JS_CallConstructor(ctx, fo, nargs, args3)
+                : JS_Call(ctx, fo, this_opq2, nargs, args3);
+            if (b->func_kind & JS_FUNC_ASYNC) { JSContext *c2;
+                while (JS_ExecutePendingJob(rt, &c2) > 0) {
+#if defined(__EMSCRIPTEN__) && defined(QJS_HAS_JSPI)
+                    qjs_host_yield();   /* preemptible drain — same-script re-pick (live review wins) per the targeted-drive path */
+#endif
+                }
+            }
+            if (JS_IsException(r2)) { JSValue e2 = JS_GetException(ctx); JS_FreeValue(ctx, e2); }
+            JS_FreeValue(ctx, r2);
+            JS_FreeValue(ctx, this_opq2);
+            for (int ai = 0; ai < nargs; ai++) JS_FreeValue(ctx, args3[ai]);
+            if (args3) js_free(ctx, args3);
+            JS_FreeValue(ctx, fo);
+            qjs_drop_pending_jobs(rt);
+            b->qjs_driven = 1;   /* mark on the bytecode for O(1) skip on next pick */
+            b->qjs_driven_opaque = !_from_real;   /* opaque fallback -> eligible for one real-instance re-drive when a factory instantiates it */
+            if (_id) { printf("@DD %llx\n", (unsigned long long)_id); fflush(stdout); }
+            g_spin_n = 0;   /* orphan boundary: reset the non-termination surface so a terminating deep grind never false-fires (only a segment blowing past 500k without a boundary does) */
+            driven++;
+            /* Per-orphan JSPI yield — give the host scheduler a turn to
+               (a) pick a higher-priority fiber across pages via priority.js
+               flowCmp, (b) cool the CPU via the scheduler's macrotask sleep.
+               Without this yield, the engine drives `maxN` orphans in a
+               tight loop before any host turn — coarse scheduling.
+               Compiled in only for the JSPI-enabled worker build (the only
+               place qjs_host_yield is defined); native + non-JSPI mod
+               build leaves the loop coarse, which is fine for those. */
+#if defined(__EMSCRIPTEN__) && defined(QJS_HAS_JSPI)
+            qjs_host_yield();
+#endif
+            continue;
+        }
+        int _drv_threw = 0;
+        while (pos < len) {
+            int op = b->byte_code_buf[pos];
+            int sz = short_opcode_info(op).size;
+            if (sz < 1) break;
+            if (qjs_host_atom_at(b, pos) == JS_ATOM_NULL) { pos += sz; continue; }
+            JSValue *args2 = nargs > 0 ? js_mallocz(ctx, nargs * sizeof(JSValue)) : NULL;
+            if (nargs > 0 && !args2) break;
+            for (int ai = 0; ai < nargs; ai++)
+                args2[ai] = qjs_fe_named_arg(ctx, b, ai, "deep-drive");
+            qjs_fe_taint_event_arg0(ctx, b, args2, nargs);
+            JSValue this_opq = qjs_opq_make(ctx, 1, "deep-drive-this", qjs_t_opaque());
+            qjs_dir_b = b; qjs_dir_target = pos; qjs_dir_active = 1;
+            qjs_fe_seen_reset();   /* fresh loop-revisit bound per directed drive (one execution unit) */
+            JSValue r = _is_cls_ctor
+                ? JS_CallConstructor(ctx, fo, nargs, args2)
+                : JS_Call(ctx, fo, this_opq, nargs, args2);
+            /* An async @T method suspends at an `await` BEFORE its gated
+               fetch (`if(await this.#e.getItem(o))return; …await fetch(…)`);
+               the call above only runs it to that point. Resume the
+               continuation (same bytecode b, so qjs_dir_b==b keeps steering
+               its post-await opaque guard to the host site) by draining the
+               microtask queue until this function's host site fires.
+               Per-job JSPI yield (worker build): a continuation can drain
+               long, and the drive must remain PREEMPTIBLE — the same-script
+               pause/resume frontier exists so a slow/stuck background path
+               yields and a higher-priority same-script fiber resumes, above
+               all a LIVE REVIEW of this page so the user's review is never
+               stuck behind the grind (`priority.js` flowCmp's active-page-
+               focus tier wins the re-pick). Yielding per drained job is the
+               boundary at which that re-pick happens. */
+            if (b->func_kind & JS_FUNC_ASYNC) { JSContext *c1;
+              while (!b->qjs_h_fired && JS_ExecutePendingJob(rt, &c1) > 0) {
+#if defined(__EMSCRIPTEN__) && defined(QJS_HAS_JSPI)
+                qjs_host_yield();
+#endif
+              } }
+            qjs_dir_active = 0; qjs_dir_b = NULL; qjs_dir_target = -1;
+            if (JS_IsException(r)) { _drv_threw = 1; JSValue e = JS_GetException(ctx); JS_FreeValue(ctx, e); }
+            JS_FreeValue(ctx, r);
+            JS_FreeValue(ctx, this_opq);
+            for (int ai = 0; ai < nargs; ai++) JS_FreeValue(ctx, args2[ai]);
+            if (args2) js_free(ctx, args2);
+            pos += sz;
+        }
+        /* MULTI-FIRE STATE PRIMING (J-Force event sequences). If the host edge
+           never fired (qjs_h_fired==0) it may be GATED on persistent state a
+           PRIOR handler invocation sets — the multi-message pattern: an `init`
+           message does `window._cfg = e.data.config`, gating a later `render`
+           message's innerHTML on `_cfg`. A single directed invocation can't
+           set-then-read it. So FIRST drive the function toward each PERSISTENT-
+           STORE site (global/closure-var/property writes — they survive across
+           these same-ctx JS_Calls, no snapshot between them), THEN re-drive
+           toward the host sites with state primed. TARGETED: runs ONLY for a
+           gated host edge (qjs_h_fired==0 after the direct pass), so a function
+           whose host edge fires directly pays nothing. Bounded by the finite
+           store-site set; terminates by the same monotone fixpoint, no cap. */
+        if (!b->qjs_h_fired) {
+            int _primed = 0;
+            for (int spos = 0; spos < len; ) {
+                int sop = b->byte_code_buf[spos];
+                int ssz = short_opcode_info(sop).size;
+                if (ssz < 1) break;
+                if (sop == OP_put_var_ref || sop == OP_put_var_ref0 || sop == OP_put_var_ref1 ||
+                    sop == OP_put_var_ref2 || sop == OP_put_var_ref3 || sop == OP_put_var ||
+                    sop == OP_put_field || sop == OP_define_field) {
+                    JSValue *argsp = nargs > 0 ? js_mallocz(ctx, nargs * sizeof(JSValue)) : NULL;
+                    if (nargs > 0 && !argsp) { spos += ssz; continue; }
+                    for (int ai = 0; ai < nargs; ai++) argsp[ai] = qjs_fe_named_arg(ctx, b, ai, "prime-drive");
+                    qjs_fe_taint_event_arg0(ctx, b, argsp, nargs);
+                    JSValue this_p = qjs_opq_make(ctx, 1, "prime-drive-this", qjs_t_opaque());
+                    qjs_dir_b = b; qjs_dir_target = spos; qjs_dir_active = 1;
+                    qjs_fe_seen_reset();
+                    JSValue rp = _is_cls_ctor ? JS_CallConstructor(ctx, fo, nargs, argsp) : JS_Call(ctx, fo, this_p, nargs, argsp);
+                    if (JS_IsException(rp)) { JSValue ep = JS_GetException(ctx); JS_FreeValue(ctx, ep); }
+                    JS_FreeValue(ctx, rp); JS_FreeValue(ctx, this_p);
+                    for (int ai = 0; ai < nargs; ai++) JS_FreeValue(ctx, argsp[ai]);
+                    if (argsp) js_free(ctx, argsp);
+                    qjs_drop_pending_jobs(rt);
+                    _primed++;
+                }
+                spos += ssz;
+            }
+            if (_primed) {   /* re-drive host sites now that globals are primed */
+                int pos2 = 0;
+                while (pos2 < len && !b->qjs_h_fired) {
+                    int op2 = b->byte_code_buf[pos2];
+                    int sz2 = short_opcode_info(op2).size;
+                    if (sz2 < 1) break;
+                    if (qjs_host_atom_at(b, pos2) == JS_ATOM_NULL) { pos2 += sz2; continue; }
+                    JSValue *argsr = nargs > 0 ? js_mallocz(ctx, nargs * sizeof(JSValue)) : NULL;
+                    if (nargs > 0 && !argsr) break;
+                    for (int ai = 0; ai < nargs; ai++) argsr[ai] = qjs_fe_named_arg(ctx, b, ai, "reprime-drive");
+                    qjs_fe_taint_event_arg0(ctx, b, argsr, nargs);
+                    JSValue this_r = qjs_opq_make(ctx, 1, "reprime-this", qjs_t_opaque());
+                    qjs_dir_b = b; qjs_dir_target = pos2; qjs_dir_active = 1;
+                    qjs_fe_seen_reset();
+                    JSValue rr = _is_cls_ctor ? JS_CallConstructor(ctx, fo, nargs, argsr) : JS_Call(ctx, fo, this_r, nargs, argsr);
+                    if (b->func_kind & JS_FUNC_ASYNC) { JSContext *cr; while (JS_ExecutePendingJob(rt, &cr) > 0) {} }
+                    if (JS_IsException(rr)) { JSValue er = JS_GetException(ctx); JS_FreeValue(ctx, er); }
+                    JS_FreeValue(ctx, rr); JS_FreeValue(ctx, this_r);
+                    for (int ai = 0; ai < nargs; ai++) JS_FreeValue(ctx, argsr[ai]);
+                    if (argsr) js_free(ctx, argsr);
+                    qjs_drop_pending_jobs(rt);
+                    pos2 += sz2;
+                }
+            }
+        }
+        JS_FreeValue(ctx, fo);
+        /* Observability for the driving-completeness frontier: this function
+           HAS a host-edge atom (has_host_in_b) and was directed-driven at
+           each host site, yet its host call never fired (qjs_h_fired still 0)
+           — no @H AND no resolverError, the silent "driven but produced
+           nothing" case that makes a real vendor fetch (learn.microsoft.com
+           toc.json) look unlearnable. Surface WHY: `threw` = an opaque
+           operation before the fetch raised (e.g. an opaque `this.x()` that
+           isn't infectious, or a non-opaque guard throwing); `!threw` = the
+           function returned before the host site (a guard arm the directed
+           drive didn't force, or an await continuation that never resumed).
+           This is the diagnostic that turns "MS under-learns" into a
+           specific, fixable forced-exec gap per CLAUDE.md's no-silent-zero
+           rule. async flag distinguishes the await-continuation case. */
+        if (!b->qjs_h_fired) {
+            if (_drv_threw) qjs_dnf_threw++; else qjs_dnf_ret++;
+            fprintf(stderr, "@WHY {\"phase\":\"driven_no_fire\",\"fn\":\"%llx\",\"threw\":%d,\"async\":%d}\n",
+                    (unsigned long long)_id, _drv_threw, (b->func_kind & JS_FUNC_ASYNC) ? 1 : 0);
+            fflush(stderr);
+        }
+        /* Drop this orphan's leftover continuation jobs (post-fetch .then
+           chain); the @H is already emitted. */
+        qjs_drop_pending_jobs(rt);
+        b->qjs_driven = 1;   /* mark on the bytecode for O(1) skip on next pick */
+        b->qjs_driven_opaque = !_from_real;   /* opaque fallback -> eligible for one real-instance re-drive when a factory instantiates it */
+        if (_id) printf("@DD %llx\n", (unsigned long long)_id);   /* attempted — worker persists; next resume skips this id */
+        driven++;
+        /* Per-orphan JSPI yield — same rationale as the host-less caller
+           path above: scheduler picks higher-priority fiber across pages,
+           cools the CPU between drives. */
+#if defined(__EMSCRIPTEN__) && defined(QJS_HAS_JSPI)
+        qjs_host_yield();
+#endif
+    }
+    /* Drive loop exited (selection found no more drivable orphan). Flushed
+       marker: distinguishes "stuck mid-drive" (this never prints, the last
+       @DSTART has no @DD) from "stuck after the loop / completed" (this
+       prints). Pairs with @DSTART to localize any deep-grind stall. */
+    printf("@DLOOP_DONE %d\n", driven); fflush(stdout);
+    qjs_reach_memo_free(ctx);
+    fflush(stdout);
+    /* Remaining work = residue entries not yet driven AND not yet host-
+       fired naturally. The live-pick loop above doesn't advance
+       qjs_deep_cursor (an index-based cursor is meaningless when picks
+       are non-sequential), so report the real count rather than
+       `qjs_deep_rb_n - qjs_deep_cursor` which would always equal the
+       initial residue size after a live-pick batch. The worker's deep
+       loop relies on rem==0 to declare the grind done; a stale non-zero
+       would force an unnecessary recycle. */
+    int rem = 0;
+    for (int _ri = 0; _ri < qjs_deep_rb_n; _ri++) {
+        JSFunctionBytecode *cb = qjs_deep_rb[_ri];
+        if (!cb || !cb->byte_code_buf) continue;
+        if (cb->qjs_driven) continue;
+        if (cb->qjs_h_fired) continue;
+        rem++;
+    }
+    return rem;
+}
+
+/* JAW static-half function DRIVE — the @T → @H/@S promotion path, now
+   DIRECTED, plus the chunk-discovery drive. Two kinds of site in an
+   unreached instantiated closure are driven, each ONCE PER site with the
+   directed-drive target set to it:
+
+   (a) HOST sites (qjs_host_atom_at — network read OR XSS write-sink): a
+       previously-unreached fetch/XHR/sink fires for real (emitting @H with
+       the resolved URL + per-field body shape, or @S for a tainted sink).
+   (b) REQUIRE sites (qjs_require_site_from — a read of an own method off the
+       captured bundler require, `require.e(id)`): the dormant lazy-loader
+       runs the chunk-load for real so `require.u(id)` computes the real
+       chunk URL and the script loader's `<script src>` is recorded — the
+       login-gated, never-DOM-invoked feature surface.
+
+   The patched OP_if_* handlers fork ONLY the value-determining branches on
+   the way to the target (both arms reach it) and FORCE the single reaching
+   arm of every guard / feature-gate, so each call explores the per-site
+   value spread WITHOUT enumerating the function's whole branch graph. SAME
+   drive for API learning, XSS, and chunk discovery — one execution, three
+   views. NO __feMute: directed forcing (not muting) is what keeps the
+   exploration bounded; `this` is opaque because most host sites are class
+   methods reading `this.fooUrl`/`this.src` (this=undefined throws before the
+   call).
+
+   Driving only INSTANTIATED closures (real captured vars) is what makes the
+   require path sound: the loader's captured require is the LIVE runtime
+   object, so `require.e(id)`/`require.u(id)` run against the real chunk map,
+   not a stub. A never-instantiated nested function (unrequired chunk) has
+   only opaque free vars — driving it would be blind function-calling (a
+   sandboxed iframe already does that) and spins on dormant message
+   handlers; such code is reached the real way: discover its chunk here,
+   download it, re-analyse.
+
+   Reachability (qjs_reach_pc) is INTRA-procedural: the site is in this
+   function's own bytecode and each target is invoked DIRECTLY, so steering
+   never crosses a call boundary to REACH the site. Two sites on different
+   arms (`if(a)fetch(x);else fetch(y)`) each get a directed run, so both are
+   recovered. Redundant require-site runs are self-bounding: the runtime
+   marks a chunk installed on the first `require.e(id)`, so a second call
+   short-circuits before re-injecting the script. */
+/* Forced-exec callback driving at an OPAQUE-callee call site. A higher-order
+   call whose callee is opaque — `data.rows.forEach(cb)`, `sel.ids.map(cb)`,
+   any iterator/visitor helper on an unknown collection — returns opaque
+   WITHOUT invoking cb (the opaque is infectious through the call). So a
+   fetch/XHR inside cb is silently dropped: the per-element endpoint + its
+   body-field examples vanish, the exact unused-feature surface forced
+   execution exists to recover (MS docs render code is map/forEach-heavy over
+   data that's opaque under forced exec). When the callee is opaque, invoke
+   each callable ARGUMENT once with opaque this+args (its declared arg_count),
+   so its host edges fire for real with opaque (structural) values. By
+   STRUCTURE — the arg is a bundle bytecode function — never by method name
+   (forEach/map/reduce/a custom visitor are driven uniformly; code is
+   minified, names are meaningless). Guarded by qjs_executed (set at function
+   entry): a callback that already ran — including the recursive re-entry of
+   the same cb, and one a later schedule reaches concretely — is skipped, so
+   this terminates by the same monotone fixpoint as __feDriveStatic (bounded
+   by the finite function set), never a cap. */
+static void qjs_drive_opaque_call_cbs(JSContext *ctx, JSValueConst *call_argv, int call_argc) {
+    for (int j = 0; j < call_argc; j++) {
+        JSValueConst a = call_argv[j];
+        if (!JS_IsObject(a)) continue;
+        JSObject *p = JS_VALUE_GET_OBJ(a);
+        if (p->class_id != JS_CLASS_BYTECODE_FUNCTION &&
+            p->class_id != JS_CLASS_GENERATOR_FUNCTION &&
+            p->class_id != JS_CLASS_ASYNC_FUNCTION &&
+            p->class_id != JS_CLASS_ASYNC_GENERATOR_FUNCTION) continue;
+        JSFunctionBytecode *b = p->u.func.function_bytecode;
+        if (!b || !b->byte_code_buf) continue;
+        if (b->qjs_executed) continue;                        /* already ran (concrete or driven) — fixpoint guard */
+        if (qjs_is_host_model_file(b->filename)) continue;    /* never drive our own shim */
+        int nargs = b->arg_count;
+        JSValue *args2 = nargs > 0 ? js_mallocz(ctx, nargs * sizeof(JSValue)) : NULL;
+        if (nargs > 0 && !args2) continue;
+        for (int ai = 0; ai < nargs; ai++)
+            args2[ai] = qjs_fe_named_arg(ctx, b, ai, "cb-drive");
+        JSValue this_opq = qjs_opq_make(ctx, 1, "cb-drive-this", qjs_t_opaque());
+        /* Isolate the drive from the OUTER forced-execution schedule. The
+           callback runs with forcing ON (its opaque branches fork so it
+           reaches its host edge), but qjs_forced_decide_k_p ALWAYS advances
+           qjs_fe_cur (the schedule cursor) — even when muted. Running cb
+           inline DURING the main run would therefore desync the cursor, and a
+           subsequent main-flow opaque branch reads the wrong schedule slot:
+           observed as a later opaque-URL `fetch` mis-deciding the shim's
+           `input && input.method` arm and recording a PHANTOM opaque init.
+           __hostDrive gets away with bare mute only because it runs in the
+           epilogue (main cursor already consumed). Full isolation needs ALL of:
+           - qjs_fe_mute: gates the loop-revisit fixpoint set (qjs_fe_seen,
+             keyed by branch SITE). cb's fetch shim and the main run's fetch
+             shim are the SAME bytecode site for `input && input.method`; if cb
+             records its decision there, the main run's later visit to that site
+             is mistaken for a loop revisit and gets the COMPLEMENT decision —
+             flipping the shim into reading input.method (opaque) and recording
+             a PHANTOM opaque method/body/headers. Mute disables both the record
+             (qjs_fe_loop_seen) and the lookup (qjs_fe_loop_revisit), AND
+             frontier seeding.
+           - qjs_fe_trace=NULL: suppresses the B/F trace lines (cursor-scoped).
+           - qjs_fe_phi_mute: cb's path constraints must not pollute the main
+             run's Φ (Z3 verdicts).
+           - save+restore qjs_fe_cur: the cursor advances even when muted.
+           cb's own branch/Φ exploration is the deep grind's job (cb is
+           residue), so suppressing it here loses no coverage. */
+        size_t save_cur = qjs_fe_cur;
+        FILE *save_trace = qjs_fe_trace;
+        int save_phi = qjs_fe_phi_mute, save_mute = qjs_fe_mute;
+        qjs_fe_trace = NULL; qjs_fe_phi_mute = 1; qjs_fe_mute = 1;
+        JSValue r = JS_Call(ctx, a, this_opq, nargs, args2);
+        qjs_fe_mute = save_mute; qjs_fe_phi_mute = save_phi; qjs_fe_trace = save_trace; qjs_fe_cur = save_cur;
+        if (JS_IsException(r)) { JSValue e = JS_GetException(ctx); JS_FreeValue(ctx, e); }
+        JS_FreeValue(ctx, r);
+        JS_FreeValue(ctx, this_opq);
+        for (int ai = 0; ai < nargs; ai++) JS_FreeValue(ctx, args2[ai]);
+        if (args2) js_free(ctx, args2);
+    }
+}
+
+/* hostedge.js's addEventListener/__feHandler calls __feMarkHandler(fn) to tag a
+   registered event handler. Its event arg (arg0) is genuine attacker input, so
+   the deep-grind drives arg0 as a TAINT leaf — a reached sink becomes a real
+   solvable exploit instead of EXPLOIT_UNPROVEN. Scoped to registered handlers
+   (sound: an event object IS attacker-controlled). */
+static JSValue js_fe_mark_handler(JSContext *ctx, JSValueConst this_val,
+                                  int argc, JSValueConst *argv) {
+    (void)ctx; (void)this_val;
+    if (argc > 0 && JS_IsObject(argv[0])) {
+        JSObject *p = JS_VALUE_GET_OBJ(argv[0]);
+        if (p && (p->class_id == JS_CLASS_BYTECODE_FUNCTION ||
+                  p->class_id == JS_CLASS_GENERATOR_FUNCTION ||
+                  p->class_id == JS_CLASS_ASYNC_FUNCTION ||
+                  p->class_id == JS_CLASS_ASYNC_GENERATOR_FUNCTION)) {
+            JSFunctionBytecode *b = p->u.func.function_bytecode;
+            if (b) b->qjs_is_event_handler = 1;
+        }
+    }
+    return JS_UNDEFINED;
+}
+
+static JSValue js_fe_drive_static(JSContext *ctx, JSValueConst this_val,
+                                  int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    qjs_init_host_atoms(ctx);
+    JSValue req = qjs_capture_require(ctx);   /* BORROWED; JS_UNDEFINED if not a webpack/rspack bundle */
+    JSValue *targets = NULL; int n_targets = 0, cap_targets = 0;
+    struct list_head *el;
+    list_for_each(el, &rt->gc_obj_list) {
+        JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
+        if (gp->gc_obj_type != JS_GC_OBJ_TYPE_JS_OBJECT) continue;
+        JSObject *p = (JSObject *)gp;
+        if (p->class_id != JS_CLASS_BYTECODE_FUNCTION &&
+            p->class_id != JS_CLASS_GENERATOR_FUNCTION &&
+            p->class_id != JS_CLASS_ASYNC_FUNCTION &&
+            p->class_id != JS_CLASS_ASYNC_GENERATOR_FUNCTION) continue;
+        JSFunctionBytecode *b = p->u.func.function_bytecode;
+        if (!b || !b->byte_code_buf) continue;
+        if (b->qjs_executed) continue;   /* reached by the dynamic frontier — its real values are already captured */
+        if (qjs_is_host_model_file(b->filename)) continue;   /* never force-drive our own shim */
+        int has_host = 0;
+        int len = b->byte_code_len, pos = 0;
+        while (pos < len) {
+            int op = b->byte_code_buf[pos];
+            int sz = short_opcode_info(op).size;
+            if (sz < 1) break;
+            if (qjs_host_atom_at(b, pos) != JS_ATOM_NULL) { has_host = 1; break; }
+            pos += sz;
+        }
+        /* Loader: reads an own method off the captured require (require.e). */
+        int has_req = (!JS_IsUndefined(req) && qjs_require_site_from(ctx, p, req, 0) >= 0);
+        if (!has_host && !has_req) continue;
+        if (n_targets == cap_targets) {
+            int nc = cap_targets ? cap_targets * 2 : 16;
+            JSValue *nt = js_realloc(ctx, targets, nc * sizeof *nt);
+            if (!nt) break;
+            targets = nt; cap_targets = nc;
+        }
+        targets[n_targets++] = JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, p));
+    }
+    int n_called = 0;
+    for (int i = 0; i < n_targets; i++) {
+        /* arg_count is the function's real ECMA-declared parameter count
+           — give it exactly that many SYNTH-opaque args (hardcoding any
+           arity would miss URL captures for wider handlers and waste
+           cycles for narrower ones). */
+        JSObject *p = JS_VALUE_GET_OBJ(targets[i]);
+        JSFunctionBytecode *b = p->u.func.function_bytecode;
+        if (!b || !b->byte_code_buf) continue;
+        if (b->qjs_executed) continue;   /* executed by a prior drive/side-effect — its sites already fired */
+        int nargs = b->arg_count;
+        int len = b->byte_code_len, pos = 0;
+        (void)pos;
+        /* Invoke the function ONCE in NON-DIRECTED mode (qjs_dir_active=0),
+           with opaque this+args. Forced-exec normally takes the default
+           arm at every opaque OP_if and emits an F frontier — the BFS
+           over the outer schedule picks up the F frontiers and enqueues
+           flipped schedules. On subsequent BFS schedules, this same
+           function is re-invoked here (each callMain re-runs driver.js)
+           with the flipped decision at the relevant cursor position,
+           taking the other arm. Convergence = both arms of every
+           opaque OP_if in every unreached host-bearing function get
+           explored, all without directed steering (which was hiding
+           the F frontiers from the BFS and capping coverage at intra-
+           function reachability). The within-page priority scheduler
+           (deep-bypass first, shorter prefix, anti-starvation tiebreak)
+           keeps the BFS productive even as the work queue grows. */
+        if (1) {
+            JSValue *args2 = nargs > 0 ? js_mallocz(ctx, nargs * sizeof(JSValue)) : NULL;
+            if (nargs > 0 && !args2) goto skip_host;
+            for (int ai = 0; ai < nargs; ai++)
+                args2[ai] = qjs_fe_named_arg(ctx, b, ai, "static-drive");
+            JSValue this_opq = qjs_opq_make(ctx, 1, "static-drive-this", qjs_t_opaque());
+            qjs_dir_active = 0; qjs_dir_b = NULL; qjs_dir_target = -1;
+            JSValue r = JS_Call(ctx, targets[i], this_opq, nargs, args2);
+            if (JS_IsException(r)) { JSValue e = JS_GetException(ctx); JS_FreeValue(ctx, e); }
+            JS_FreeValue(ctx, r);
+            JS_FreeValue(ctx, this_opq);
+            for (int ai = 0; ai < nargs; ai++) JS_FreeValue(ctx, args2[ai]);
+            if (args2) js_free(ctx, args2);
+            n_called++;
+        }
+        skip_host:;
+        /* (b) require/chunk-load sites — only when a require was captured. */
+        if (JS_IsUndefined(req)) continue;
+        int rpos = qjs_require_site_from(ctx, p, req, 0);
+        while (rpos >= 0) {
+            JSValue *args2 = nargs > 0 ? js_mallocz(ctx, nargs * sizeof(JSValue)) : NULL;
+            if (nargs > 0 && !args2) break;
+            for (int ai = 0; ai < nargs; ai++)
+                args2[ai] = qjs_fe_named_arg(ctx, b, ai, "chunk-drive");
+            JSValue this_opq = qjs_opq_make(ctx, 1, "chunk-drive-this", qjs_t_opaque());
+            qjs_dir_b = b; qjs_dir_target = rpos; qjs_dir_active = 1;
+            JSValue r = JS_Call(ctx, targets[i], this_opq, nargs, args2);
+            qjs_dir_active = 0; qjs_dir_b = NULL; qjs_dir_target = -1;
+            if (JS_IsException(r)) { JSValue e = JS_GetException(ctx); JS_FreeValue(ctx, e); }
+            JS_FreeValue(ctx, r);
+            JS_FreeValue(ctx, this_opq);
+            for (int ai = 0; ai < nargs; ai++) JS_FreeValue(ctx, args2[ai]);
+            if (args2) js_free(ctx, args2);
+            n_called++;
+            /* Entering the loader once runs its straight-line Promise.all,
+               firing ALL its require sites in that single execution; only
+               keep stepping to a later site if a guard kept this drive from
+               entering (qjs_executed unset), so a branch-gated loader still
+               gets a directed run toward its next site. */
+            if (b->qjs_executed) break;
+            int nb = b->byte_code_len, sz = short_opcode_info(b->byte_code_buf[rpos]).size;
+            if (sz < 1 || rpos + sz >= nb) break;
+            rpos = qjs_require_site_from(ctx, p, req, rpos + sz);
+        }
+    }
+    for (int i = 0; i < n_targets; i++) JS_FreeValue(ctx, targets[i]);
+    js_free(ctx, targets);
+    qjs_reach_memo_free(ctx);
+    return JS_NewInt32(ctx, n_called);
+}
+
 /* global object */
 
 static const JSCFunctionListEntry js_global_funcs[] = {
+    JS_CFUNC_DEF("__opaque", 0, js_make_opaque ),
+    JS_CFUNC_DEF("__synth", 0, js_make_synth ),
+    JS_CFUNC_DEF("__isOpaque", 1, js_is_opaque ),
+    JS_CFUNC_DEF("__isOpaqueAny", 1, js_is_opaque_any ),
+    JS_CFUNC_DEF("__feMute", 1, js_fe_mute ),
+    JS_CFUNC_DEF("__fePhiMute", 1, js_fe_phi_mute ),
+    JS_CFUNC_DEF("__feCursor", 0, js_fe_cursor ),
+    JS_CFUNC_DEF("__feLen", 0, js_fe_len ),
+    JS_CFUNC_DEF("__feDriveStatic", 0, js_fe_drive_static ),
+    JS_CFUNC_DEF("__feMarkHandler", 1, js_fe_mark_handler ),
+    JS_CFUNC_DEF("__feStaticSites", 0, js_fe_static_sites ),
+    JS_CFUNC_DEF("__feTerm", 1, js_fe_term ),
+    JS_CFUNC_DEF("__feUrlShape", 1, js_fe_url_shape ),
+    JS_CFUNC_DEF("__feUrlHoles", 1, js_fe_url_holes ),
+    JS_CFUNC_DEF("__fePC", 0, js_fe_pc ),
+    JS_CFUNC_DEF("__feSec", 2, js_fe_sec ),
     JS_CFUNC_DEF("parseInt", 2, js_parseInt ),
     JS_CFUNC_DEF("parseFloat", 1, js_parseFloat ),
     JS_CFUNC_DEF("isNaN", 1, js_global_isNaN ),
@@ -56867,6 +61653,10 @@ static JSValue js_Date_now(JSContext *ctx, JSValueConst this_val,
                            int argc, JSValueConst *argv)
 {
     // now()
+    /* Nondeterministic source under forced exec — SYNTH-opaque (same rationale
+       as js_math_random): a real timestamp breaks resume determinism and bakes a
+       per-request value into learned endpoints (`?t=1780170627094`). */
+    if (qjs_fe_enabled) return qjs_synth_new(ctx);
     return js_int64(date_now());
 }
 
