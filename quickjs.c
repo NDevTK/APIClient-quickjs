@@ -53301,6 +53301,16 @@ typedef struct JSONStringifyContext {
     JSValue gap;
     JSValue empty;
     StringBuffer *b;
+    /* Forced-exec: the FIRST opaque field encountered during the walk.
+       JSON.stringify({id:<opaque>}) must stay INFECTIOUS (return an
+       opaque carrying a json(<leaf>) term), not a concrete marker — so
+       the Z3 shadow survives to the sink (a tainted stringify→innerHTML
+       is a solvable PoC, not a leafless heuristic) and a stringify→URL
+       records valueSource:"opaque", never a fabricated value. seen_label
+       is BORROWED from the live opq (qjs_opq_make strdup's it). */
+    qjs_term *seen_term;
+    int seen_flavor;
+    const char *seen_label;
 } JSONStringifyContext;
 
 static JSValue JS_ToQuotedStringFree(JSContext *ctx, JSValue val) {
@@ -53400,6 +53410,16 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
        is correct here: the per-field SHAPE is captured separately by
        bodyShape; this string form just has to be valid JSON. */
     if (qjs_is_opaque(val)) {
+        /* Capture the FIRST opaque field's term so JS_JSONStringify can
+           return an INFECTIOUS opaque (json(<leaf>) term) instead of the
+           concrete string — the marker written here just lets the walk
+           finish without throwing and is discarded when seen_term is set. */
+        if (!jsc->seen_term) {
+            qjs_opq *_o = qjs_opq_of(val);
+            jsc->seen_term = qjs_t_ref(_o->term);
+            jsc->seen_flavor = _o->flavor;
+            jsc->seen_label = _o->label;
+        }
         JS_FreeValue(ctx, val);
         val = JS_NewString(ctx, "[object Object]");
         if (JS_IsException(val))
@@ -53594,9 +53614,11 @@ JSValue JS_JSONStringify(JSContext *ctx, JSValueConst obj,
     /* JSON.stringify(opaque) must stay opaque (infectious) — same {name}/body-shape
        reason as String()/encodeURIComponent. A bare opaque otherwise serializes to
        "{}" (the sentinel has no enumerable props), so a URL/body built from it loses
-       the field. (Nested opaque — stringify({a:opaque}) — still concretizes; that's
-       the harder serializer-walk case, partly covered by hostedge bodyShape for
-       object bodies.) */
+       the field. The NESTED case — stringify({a:opaque}) — is now also infectious:
+       js_json_to_str captures the first opaque field's term into jsc->seen_term and
+       the walk's result is replaced by an opaque carrying json(<leaf>) below (was a
+       concrete "[object Object]" marker, which dropped the Z3 shadow + recorded a
+       fabricated value). */
     if (qjs_is_opaque(obj))
         return qjs_opaque_unary(ctx, obj);
 
@@ -53606,6 +53628,9 @@ JSValue JS_JSONStringify(JSContext *ctx, JSValueConst obj,
     jsc->gap = JS_UNDEFINED;
     jsc->b = &b_s;
     jsc->empty = js_empty_string(ctx->rt);
+    jsc->seen_term = NULL;
+    jsc->seen_flavor = 0;
+    jsc->seen_label = NULL;
     ret = JS_UNDEFINED;
     wrapper = JS_UNDEFINED;
 
@@ -53710,6 +53735,15 @@ JSValue JS_JSONStringify(JSContext *ctx, JSValueConst obj,
         goto exception;
 
     ret = string_buffer_end(jsc->b);
+    /* A nested opaque field was seen — the concrete string is discarded
+       and the result becomes an infectious opaque carrying json(<leaf>)
+       (ownership of seen_term transfers into the CALL term). */
+    if (jsc->seen_term) {
+        JS_FreeValue(ctx, ret);
+        ret = qjs_opq_make(ctx, jsc->seen_flavor, jsc->seen_label,
+                           qjs_t_call("json", jsc->seen_term, NULL));
+        jsc->seen_term = NULL;
+    }
     goto done;
 
 exception:
@@ -53717,6 +53751,9 @@ exception:
 done1:
     string_buffer_free(jsc->b);
 done:
+    /* seen_term is NULL once transferred; non-NULL only on the exception/
+       undefined paths, where it must be freed to avoid a term leak. */
+    if (jsc->seen_term) qjs_t_free(jsc->seen_term);
     JS_FreeValue(ctx, wrapper);
     JS_FreeValue(ctx, jsc->empty);
     JS_FreeValue(ctx, jsc->gap);
