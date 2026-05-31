@@ -60208,6 +60208,19 @@ int qjs_deep_step_c(JSContext *ctx, int maxN, int fromCursor) {
         }
         if (b == NULL) break;   /* residue exhausted */
         uint64_t _id = qjs_deep_ids ? qjs_deep_ids[_ix] : 0;
+        /* Re-baseline the JS recursion guard to THIS frame before driving.
+           js_check_stack_overflow compares the live SP against
+           rt->stack_top (captured at JS_NewRuntime). Under JSPI each
+           per-orphan resume runs on a DIFFERENT physical wasm stack, so a
+           one-shot baseline is stale — the guard then mis-measures depth and
+           either false-throws or (worse) fails to fire, letting a deep
+           recursive orphan overflow the real C-stack into an uncatchable
+           wasm trap that poisons the instance. Re-stamping stack_top here
+           makes the guard measure depth from the CURRENT frame, so a genuine
+           deep recursion throws a catchable RangeError (caught below →
+           orphan marked driven → grind tail proceeds) instead of trapping.
+           Spec stack-guard accuracy, not a depth/work cap. */
+        JS_UpdateStackTop(rt);
         /* Pre-drive marker (flushed): a single non-terminating orphan drive
            (opaque-controlled loop the intra-run fixpoint failed to bound)
            wedges the whole grind, and @DD only emits AFTER a drive returns —

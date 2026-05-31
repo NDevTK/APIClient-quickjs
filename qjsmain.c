@@ -530,6 +530,22 @@ int main(int argc, char **argv) {
         if (deep_step >= 0 || deep_grind) {
             if (!g_deep_ctx) {
                 g_deep_rt = JS_NewRuntime();
+                /* The JS recursion guard (js_check_stack_overflow) must throw a
+                   CATCHABLE RangeError before the real wasm C-stack (8 MB,
+                   -sSTACK_SIZE) is exhausted — otherwise a deeply-recursive
+                   driven orphan (forced exec drives a recursive fn whose base
+                   case never concretizes) overflows the C-stack into an
+                   UNCATCHABLE wasm trap that poisons the instance, and the
+                   grind's recycle abandons every remaining orphan (rem:-1).
+                   Default stack_size is 1 MB (quickjs.h) — far under the 8 MB
+                   wasm stack, AND its baseline stack_top is captured here at
+                   NewRuntime; under JSPI each per-orphan resume runs on a
+                   different physical stack, so that baseline goes stale. Size
+                   the guard to 6 MB (8 MB wasm − ~2 MB headroom for host/JSPI
+                   frames); JS_UpdateStackTop is re-called per orphan drive
+                   (qjs_deep_step_c) so the limit tracks the live frame. This
+                   is the spec stack guard made ACCURATE, not a depth cap. */
+                JS_SetMaxStackSize(g_deep_rt, 6 * 1024 * 1024);
                 js_std_init_handlers(g_deep_rt);
                 JS_SetModuleLoaderFunc2(g_deep_rt, qjs_module_normalize, qjs_module_loader_hook,
                                         js_module_check_attributes, NULL);
