@@ -21244,7 +21244,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 sp--;
                 if (res) {
-                    pc += (int32_t)get_u32(pc - 4) - 4;
+                    int32_t _bo = (int32_t)get_u32(pc - 4) - 4;
+                    /* A backward conditional branch IS a loop back-edge (do-while /
+                       `while(cond)` with the test at the bottom). Register it like the
+                       goto back-edges so loop-of-calls keying + exit-arm bounds engage
+                       (the goto-only version left do-while callees un-bounded — rc2). */
+                    if (_bo < 0) { sf->qjs_looped = 1; sf->qjs_loop_src = (int)(pc - b->byte_code_buf) - 5; sf->qjs_loop_pc = (int)(pc - b->byte_code_buf) + _bo; }
+                    pc += _bo;
                 }
                 if (unlikely(js_poll_interrupts(ctx)))
                     goto exception;
@@ -21414,7 +21420,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 sp--;
                 if (!res) {
-                    pc += (int32_t)get_u32(pc - 4) - 4;
+                    int32_t _bo = (int32_t)get_u32(pc - 4) - 4;
+                    if (_bo < 0) { sf->qjs_looped = 1; sf->qjs_loop_src = (int)(pc - b->byte_code_buf) - 5; sf->qjs_loop_pc = (int)(pc - b->byte_code_buf) + _bo; }
+                    pc += _bo;
                 }
                 if (unlikely(js_poll_interrupts(ctx)))
                     goto exception;
@@ -21579,7 +21587,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 sp--;
                 if (res) {
-                    pc += (int8_t)pc[-1] - 1;
+                    int _bo = (int)(int8_t)pc[-1] - 1;
+                    if (_bo < 0) { sf->qjs_looped = 1; sf->qjs_loop_src = (int)(pc - b->byte_code_buf) - 2; sf->qjs_loop_pc = (int)(pc - b->byte_code_buf) + _bo; }
+                    pc += _bo;
                 }
                 if (unlikely(js_poll_interrupts(ctx)))
                     goto exception;
@@ -21745,7 +21755,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 sp--;
                 if (!res) {
-                    pc += (int8_t)pc[-1] - 1;
+                    int _bo = (int)(int8_t)pc[-1] - 1;
+                    if (_bo < 0) { sf->qjs_looped = 1; sf->qjs_loop_src = (int)(pc - b->byte_code_buf) - 2; sf->qjs_loop_pc = (int)(pc - b->byte_code_buf) + _bo; }
+                    pc += _bo;
                 }
                 if (unlikely(js_poll_interrupts(ctx)))
                     goto exception;
