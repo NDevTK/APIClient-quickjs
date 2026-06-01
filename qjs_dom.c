@@ -1816,7 +1816,11 @@ int qjs_dom_install(JSContext *ctx) {
            __hostMicrotaskDrain fires it inside the fixpoint, and a throw stays in
            the job queue instead of aborting the observe() caller). */
         "if(typeof globalThis.IntersectionObserver!=='function'){var __IO=function(cb){this._cb=cb;};"
-        "__IO.prototype.observe=function(t){var cb=this._cb,o=this;if(typeof cb==='function')Promise.resolve().then(function(){cb([{target:t,isIntersecting:true,intersectionRatio:1,boundingClientRect:{},intersectionRect:{},rootBounds:null,time:0}],o);});};"
+        "__IO.prototype.observe=function(t){var cb=this._cb,o=this;"
+        "try{if(typeof __feDomPrint==='function')__feDomPrint('@WHY {\"phase\":\"io_observe\",\"tag\":'+JSON.stringify(String(((t&&t.tagName)||'')).toLowerCase())+'}');}catch(e){}"
+        "if(typeof cb==='function')Promise.resolve().then(function(){"
+        "try{if(typeof __feDomPrint==='function')__feDomPrint('@WHY {\"phase\":\"io_fire\",\"tag\":'+JSON.stringify(String(((t&&t.tagName)||'')).toLowerCase())+'}');}catch(e){}"
+        "cb([{target:t,isIntersecting:true,intersectionRatio:1,boundingClientRect:{},intersectionRect:{},rootBounds:null,time:0}],o);});};"
         "__IO.prototype.unobserve=function(){};__IO.prototype.disconnect=function(){};__IO.prototype.takeRecords=function(){return[];};"
         "globalThis.IntersectionObserver=__IO;}"
         "I('ResizeObserver',{observe:function(){},unobserve:function(){},disconnect:function(){}});"
@@ -1925,11 +1929,23 @@ int qjs_dom_install(JSContext *ctx) {
     "var tn=(node.tagName||'').toLowerCase();if(R[tn])up(node,R[tn]);"
     "if(node.querySelectorAll){var d=node.querySelectorAll('*');for(var i=0;i<d.length;i++){var e=d[i],t=(e.tagName||'').toLowerCase();if(R[t])up(e,R[t]);}}"
     "}catch(e){}};"
+    /* Capture the real `print` NOW (prelude eval, before any bundle clobbers
+       the global — same trick hostedge.js uses for EPRINT) so the ce_define
+       diagnostic below survives into bundle-exec time when define() actually
+       runs. */
+    "var __feDomPrint=(typeof print==='function')?print:null;"
     "globalThis.customElements={"
     "define:function(n,c){R[n]=c;try{c.__ceName=n;if(c&&c.prototype)Object.defineProperty(c.prototype,'__ceTag',{value:n,configurable:true});}catch(e){}"
     /* On define, upgrade every element of this tag already in the (real
-       server-rendered) document — the SSR-present loaders. */
-    "try{var EX=document.querySelectorAll(n);for(var qi=0;qi<EX.length;qi++){up(EX[qi],c);}}catch(e){}"
+       server-rendered) document — the SSR-present loaders. Emit one deduped
+       @WHY per distinct tag with the SSR-match count: this surfaces WHICH
+       custom elements actually got defined+executed during analysis and
+       whether the define found SSR nodes to upgrade — the layer-4 signal for
+       lazy-defined elements like include-fragment (define present in the
+       folded combined code but maybe never executed, or executed under an
+       opaque/computed tag, or executed with 0 SSR matches). */
+    "try{var EX=document.querySelectorAll(n);for(var qi=0;qi<EX.length;qi++){up(EX[qi],c);}"
+    "if(__feDomPrint){if(!R.__ceLg)R.__ceLg={};var _tg=String(n);if(!R.__ceLg[_tg]){R.__ceLg[_tg]=1;__feDomPrint('@WHY {\"phase\":\"ce_define\",\"tag\":'+JSON.stringify(_tg)+',\"ssr\":'+EX.length+'}');}}}catch(e){}"
     "var w=W[n];if(w){W[n]=null;for(var i=0;i<w.length;i++)w[i](c);}},"
     "get:function(n){return R[n];},"
     "getName:function(c){for(var k in R)if(R[k]===c)return k;return null;},"
