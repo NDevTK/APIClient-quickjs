@@ -10141,6 +10141,39 @@ JSValue JS_ThrowOutOfMemory(JSContext *ctx)
 
 static JSValue JS_ThrowStackOverflow(JSContext *ctx)
 {
+    /* Overflow observability: a stack overflow during a forced-exec orphan
+       drive aborts the whole callMain (caught at the host boundary as
+       "Maximum call stack size exceeded"), and the host only sees the LEAF
+       orphan (_currentOrphan), not the RECURSIVE function that actually blew
+       the stack — same leaf-vs-culprit gap the spin probe's looping-ancestor
+       walk fixed. The frame chain is still intact HERE (before unwinding), so
+       walk it and emit the deepest function whose bytecode appears MULTIPLE
+       times in the live chain = the recursion that overflowed, with its
+       source loc. Names the culprit (e.g. github 43540-*.js's recursive
+       type/proto walk) so the recursion-revisit fixpoint gap can be read in
+       the real source instead of guessed at the benign leaf. One emit per
+       overflow (rare), so no flood; surfaces through printErr → worker
+       _lastStderr/@WHY. */
+    JSRuntime *rt = ctx->rt;
+    JSStackFrame *sf0 = rt->current_stack_frame;
+    JSFunctionBytecode *_recb = NULL; int _depth = 0;
+    /* Find the function bytecode that recurs most/deepest: the first frame
+       whose bytecode also appears further up the chain is the recursion. */
+    for (JSStackFrame *_a = sf0; _a; _a = _a->prev_frame) {
+        JSFunctionBytecode *_ab = JS_GetFunctionBytecode(_a->cur_func);
+        if (!_ab) continue;
+        int _cnt = 0;
+        for (JSStackFrame *_b = sf0; _b; _b = _b->prev_frame)
+            if (JS_GetFunctionBytecode(_b->cur_func) == _ab) _cnt++;
+        if (_cnt > _depth) { _depth = _cnt; _recb = _ab; }
+    }
+    if (_recb && _recb->filename && _depth >= 2) {
+        const char *fn = JS_AtomToCString(ctx, _recb->filename);
+        printf("@WHY {\"phase\":\"stack_overflow_recursion\",\"file\":\"%s\",\"line\":%d,\"col\":%d,\"recurDepth\":%d}\n",
+               fn ? fn : "?", _recb->line_num, _recb->col_num, _depth);
+        fflush(stdout);
+        if (fn) JS_FreeCString(ctx, fn);
+    }
     return JS_ThrowRangeError(ctx, "Maximum call stack size exceeded");
 }
 
