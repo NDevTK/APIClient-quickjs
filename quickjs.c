@@ -2169,6 +2169,16 @@ typedef struct JSStackFrame {
        loop back-edge, not just the leaf OP_if the probe happened to sample
        (the gap that left AppMeasurement.js:387's spin un-located). -1 = none. */
     int qjs_loop_pc;
+    /* Forced-exec loop-revisit EXIT-arm determination: bytecode offset of the
+       most-recent backward-goto SOURCE (the back-edge instruction). With
+       qjs_loop_pc (the target/top) this gives the innermost loop's range
+       [qjs_loop_pc, qjs_loop_src]; on a loop-revisit the EXIT arm is the branch
+       arm whose target leaves that range. The blind complement (!firstDecision)
+       spins when the first decision was ALREADY the exit arm (the inner guard
+       re-reached via an ENCLOSING loop, then flipped to CONTINUE — a.S/Adobe
+       AppMeasurement: outer `for(d)` re-enters the inner `e<f.length` guard
+       whose d=0 decision had exited). -1 = none. */
+    int qjs_loop_src;
     /* only used in generators. Current stack pointer value. NULL if
        the function is running. */
     JSValue *cur_sp;
@@ -8203,7 +8213,7 @@ static JSValue js_call_c_function_data(JSContext *ctx, JSValueConst func_obj,
     sf->is_strict_mode = false;
     sf->cur_func = unsafe_unconst(func_obj);
     sf->arg_count = argc;
-    sf->qjs_inv = 0; sf->qjs_looped = 0; sf->qjs_loop_pc = -1;   /* native/bound frame: no bytecode, but a descendant's _inloop reads qjs_looped up the chain — leaving it uninitialised made keying (and thus the learned endpoint set) nondeterministic build-to-build */
+    sf->qjs_inv = 0; sf->qjs_looped = 0; sf->qjs_loop_pc = -1; sf->qjs_loop_src = -1;   /* native/bound frame: no bytecode, but a descendant's _inloop reads qjs_looped up the chain — leaving it uninitialised made keying (and thus the learned endpoint set) nondeterministic build-to-build */
     ret = s->func(ctx, this_val, argc, arg_buf, s->magic, vc(s->data));
     rt->current_stack_frame = sf->prev_frame;
     return ret;
@@ -8329,7 +8339,7 @@ static JSValue js_call_c_closure(JSContext *ctx, JSValueConst func_obj,
     sf->is_strict_mode = false;
     sf->cur_func = unsafe_unconst(func_obj);
     sf->arg_count = argc;
-    sf->qjs_inv = 0; sf->qjs_looped = 0; sf->qjs_loop_pc = -1;   /* native/bound frame: no bytecode, but a descendant's _inloop reads qjs_looped up the chain — leaving it uninitialised made keying (and thus the learned endpoint set) nondeterministic build-to-build */
+    sf->qjs_inv = 0; sf->qjs_looped = 0; sf->qjs_loop_pc = -1; sf->qjs_loop_src = -1;   /* native/bound frame: no bytecode, but a descendant's _inloop reads qjs_looped up the chain — leaving it uninitialised made keying (and thus the learned endpoint set) nondeterministic build-to-build */
     ret = s->func(ctx, this_val, argc, arg_buf, s->magic, s->opaque);
     rt->current_stack_frame = sf->prev_frame;
 
@@ -10343,14 +10353,67 @@ static void qjs_spin_probe(JSContext *ctx, JSStackFrame *sf, JSFunctionBytecode 
     /* Looping-ancestor source location (the loop owner, not the shim leaf). */
     const char *lpfn = (_lpb && _lpb->filename) ? JS_AtomToCString(ctx, _lpb->filename) : NULL;
     long _lppco = (_lpb && _lpb->byte_code_buf && _lppc) ? (long)(_lppc - _lpb->byte_code_buf) : -1;
-    printf("@WHY {\"phase\":\"spin_nonterminating\",\"file\":\"%s\",\"line\":%d,\"col\":%d,\"pc\":%ld,\"inv\":%u,\"ownlooped\":%u,\"inloop\":%d,\"recur\":%d,\"hk_seen\":%d,\"loopFile\":\"%s\",\"loopLine\":%d,\"loopCol\":%d,\"loopPc\":%ld,\"ownLoopBackPc\":%d}\n",
-           fn ? fn : "?", cur->line_num, cur->col_num, pco, sf->qjs_inv, sf->qjs_looped, _hin, _hrec, _hseen,
+    printf("@WHY {\"phase\":\"spin_nonterminating\",\"file\":\"%s\",\"line\":%d,\"col\":%d,\"pc\":%ld,\"inv\":%u,\"ownlooped\":%u,\"inloop\":%d,\"recur\":%d,\"hk_seen\":%d,\"seenN\":%d,\"loopFile\":\"%s\",\"loopLine\":%d,\"loopCol\":%d,\"loopPc\":%ld,\"ownLoopBackPc\":%d}\n",
+           fn ? fn : "?", cur->line_num, cur->col_num, pco, sf->qjs_inv, sf->qjs_looped, _hin, _hrec, _hseen, qjs_fe_seen_n,
            lpfn ? lpfn : "?", _lpb ? _lpb->line_num : 0, _lpb ? _lpb->col_num : 0, _lppco, sf->qjs_loop_pc);
     fflush(stdout);
     if (fn) JS_FreeCString(ctx, fn);
     if (lpfn) JS_FreeCString(ctx, lpfn);
+    /* ONE-SHOT disasm of the own-frame loop top (opcode byte values from
+       qjs_loop_pc) so the spinning loop's guard construct is readable — for a
+       minified one-line function the opcode sequence is the only way to see
+       WHICH loop + whether its guard is a forced OP_if (loop-revisit keying bug)
+       or concrete (concrete infinite loop). Decoded against quickjs-opcode.h.
+       Emit-only, deduped to one dump. */
+    static int _qjs_disasm_done = 0;
+    if (!_qjs_disasm_done && sf->qjs_loop_pc >= 0 && cur->byte_code_buf && sf->qjs_looped) {
+        _qjs_disasm_done = 1;
+        /* Raw bytes from the loop top (short_opcode_info is a macro defined far
+           below, unusable here) — decode operand sizes against quickjs-opcode.h
+           by hand. 40 bytes covers the loop guard + a few body ops. */
+        /* Dump the WHOLE function bytecode from offset 0 (in 700-byte chunks so
+           a long minified one-liner's every loop + back-edge is visible), plus
+           byte_code_len + the sampled branch pc, so the full control-flow can be
+           decoded by hand against quickjs-opcode.h. */
+        int blen = cur->byte_code_len, off = 0;
+        for (int seg = 0; off < blen && seg < 6; seg++) {
+            char dbuf[2100]; int dbo = 0; int segStart = off;
+            int end = off + 700; if (end > blen) end = blen;
+            for (; off < end && dbo < 2080; off++)
+                dbo += snprintf(dbuf + dbo, sizeof(dbuf) - dbo, "%d,", cur->byte_code_buf[off]);
+            dbuf[dbo] = 0;
+            printf("@WHY {\"phase\":\"loop_disasm\",\"seg\":%d,\"start\":%d,\"len\":%d,\"backpc\":%d,\"rawbytes\":\"%s\"}\n",
+                   seg, segStart, blen, sf->qjs_loop_pc, dbuf);
+        }
+        fflush(stdout);
+    }
 }
 #define QJS_SPIN_PROBE_CALL(b, pc) qjs_spin_probe(ctx, sf, (b), (pc))
+
+/* Loop-revisit EXIT-arm selection. The loop-revisit fixpoint flips a forced
+   branch on its second visit to break a non-terminating opaque loop. The old
+   choice — the blind complement of the FIRST decision — assumes that first
+   decision CONTINUED the loop (so the complement exits). That assumption is
+   FALSE when the first decision was already the EXIT arm: e.g. an inner guard
+   `for(e=0;e<f.length;e++)` whose f.length is opaque takes res=0 (exit) on a
+   no-host-edge function's pin, then the ENCLOSING `for(d=0;2>d;d++)` re-reaches
+   that guard, the revisit flips it to ENTER, and it loops forever (Adobe
+   AppMeasurement a.S — froze every grind reaching it). The structural fix: pick
+   the arm whose target LEAVES the innermost known loop body [lo, hi] (back-edge
+   target..source). Returns the res that EXITS, or -1 when undeterminable (both
+   arms inside or both outside the range, or no loop bounds recorded yet) so the
+   caller keeps the !d0 fallback. This is a fixpoint refinement, not a cap: it
+   bounds re-visits of identical state, never distinct work. */
+static int qjs_loop_exit_arm(int fall_pc, int jump_pc, int lo, int hi, int is_if_false) {
+    if (lo < 0 || hi < lo) return -1;
+    int fall_in = (fall_pc >= lo && fall_pc <= hi);
+    int jump_in = (jump_pc >= lo && jump_pc <= hi);
+    if (fall_in == jump_in) return -1;   /* both in or both out — not a guard we can resolve */
+    int exit_is_jump = !jump_in;         /* the arm whose target leaves the loop body */
+    /* if_false jumps on res==0, if_true jumps on res==1 */
+    if (is_if_false) return exit_is_jump ? 0 : 1;
+    return exit_is_jump ? 1 : 0;
+}
 
 /* On every yield, emit @Y with reachability info from the current frame
    so the host scheduler can apply lexicographic priority across all
@@ -19647,7 +19710,7 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
     sf->is_strict_mode = false;
     sf->cur_func = unsafe_unconst(func_obj);
     sf->arg_count = argc;
-    sf->qjs_inv = 0; sf->qjs_looped = 0; sf->qjs_loop_pc = -1;   /* native/bound frame: no bytecode, but a descendant's _inloop reads qjs_looped up the chain — leaving it uninitialised made keying (and thus the learned endpoint set) nondeterministic build-to-build */
+    sf->qjs_inv = 0; sf->qjs_looped = 0; sf->qjs_loop_pc = -1; sf->qjs_loop_src = -1;   /* native/bound frame: no bytecode, but a descendant's _inloop reads qjs_looped up the chain — leaving it uninitialised made keying (and thus the learned endpoint set) nondeterministic build-to-build */
     arg_buf = argv;
 
     if (unlikely(argc < arg_count)) {
@@ -19966,6 +20029,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         sf->qjs_inv = ++qjs_inv_ctr;   /* per-invocation id for the loop-revisit key (see JSStackFrame) */
         sf->qjs_looped = 0;            /* set on this frame's first backward branch (loop back-edge) */
         sf->qjs_loop_pc = -1;          /* loop back-edge target offset for spin diagnosis */
+        sf->qjs_loop_src = -1;         /* loop back-edge source offset for exit-arm determination */
     }
     for(;;) {
         int call_argc;
@@ -20990,17 +21054,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         CASE(OP_goto):
-            { int32_t _o = (int32_t)get_u32(pc); if (_o < 0) sf->qjs_looped = 1; pc += _o; if (_o < 0) sf->qjs_loop_pc = (int)(pc - b->byte_code_buf); }
+            { int32_t _o = (int32_t)get_u32(pc); if (_o < 0) { sf->qjs_looped = 1; sf->qjs_loop_src = (int)(pc - b->byte_code_buf) - 1; } pc += _o; if (_o < 0) sf->qjs_loop_pc = (int)(pc - b->byte_code_buf); }
             if (unlikely(js_poll_interrupts(ctx)))
                 goto exception;
             BREAK;
         CASE(OP_goto16):
-            { int16_t _o = (int16_t)get_u16(pc); if (_o < 0) sf->qjs_looped = 1; pc += _o; if (_o < 0) sf->qjs_loop_pc = (int)(pc - b->byte_code_buf); }
+            { int16_t _o = (int16_t)get_u16(pc); if (_o < 0) { sf->qjs_looped = 1; sf->qjs_loop_src = (int)(pc - b->byte_code_buf) - 1; } pc += _o; if (_o < 0) sf->qjs_loop_pc = (int)(pc - b->byte_code_buf); }
             if (unlikely(js_poll_interrupts(ctx)))
                 goto exception;
             BREAK;
         CASE(OP_goto8):
-            { int8_t _o = (int8_t)pc[0]; if (_o < 0) sf->qjs_looped = 1; pc += _o; if (_o < 0) sf->qjs_loop_pc = (int)(pc - b->byte_code_buf); }
+            { int8_t _o = (int8_t)pc[0]; if (_o < 0) { sf->qjs_looped = 1; sf->qjs_loop_src = (int)(pc - b->byte_code_buf) - 1; } pc += _o; if (_o < 0) sf->qjs_loop_pc = (int)(pc - b->byte_code_buf); }
             if (unlikely(js_poll_interrupts(ctx)))
                 goto exception;
             BREAK;
@@ -21008,6 +21072,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 int res;
                 JSValue op1;
+                int _ffARM = 0, _ffW = 0;   /* loop-revisit exit-arm: if_true jumps on res==1, 32-bit offset */
 
                 op1 = sp[-1];
                 pc += 4;
@@ -21057,7 +21122,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (_mb && JS_GetFunctionBytecode(_af->cur_func) == _mb) _recur = 1;
                     }
                     unsigned long long _lk = (_inloop || _recur) ? _site : (_site ^ ((unsigned long long)sf->qjs_inv * 0x9E3779B97F4A7C15ULL));
-                    if (qjs_fe_loop_revisit(_lk, &res)) { if (_pt) qjs_t_free(_pt); }
+                    if (qjs_fe_loop_revisit(_lk, &res)) {
+                        /* Prefer the STRUCTURAL exit arm over the blind complement
+                           (!firstDecision). The complement spins when the first
+                           decision was already the EXIT arm and the site is re-reached
+                           via an ENCLOSING loop (Adobe AppMeasurement a.S). _ffARM /
+                           _ffW were stamped at the handler top (polarity / offset
+                           width). qjs_loop_exit_arm returns -1 (keep the complement)
+                           when it can't resolve the guard. */
+                        int _fall = (int)(pc - b->byte_code_buf);
+                        int _jmp = _fall + (_ffW ? ((int)(int8_t)pc[-1] - 1) : ((int)(int32_t)get_u32(pc - 4) - 4));
+                        int _ea = qjs_loop_exit_arm(_fall, _jmp, sf->qjs_loop_pc, sf->qjs_loop_src, _ffARM);
+                        if (_ea >= 0) res = _ea;
+                        if (_pt) qjs_t_free(_pt);
+                    }
                     else {
                     /* If the term is already in Φ from an earlier OP_if
                        (typically: OR short-circuit JUMP just decided
@@ -21176,6 +21254,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 int res;
                 JSValue op1;
+                int _ffARM = 1, _ffW = 0;   /* loop-revisit exit-arm: if_false jumps on res==0, 32-bit offset */
 
                 op1 = sp[-1];
                 pc += 4;
@@ -21225,7 +21304,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (_mb && JS_GetFunctionBytecode(_af->cur_func) == _mb) _recur = 1;
                     }
                     unsigned long long _lk = (_inloop || _recur) ? _site : (_site ^ ((unsigned long long)sf->qjs_inv * 0x9E3779B97F4A7C15ULL));
-                    if (qjs_fe_loop_revisit(_lk, &res)) { if (_pt) qjs_t_free(_pt); }
+                    if (qjs_fe_loop_revisit(_lk, &res)) {
+                        /* Prefer the STRUCTURAL exit arm over the blind complement
+                           (!firstDecision). The complement spins when the first
+                           decision was already the EXIT arm and the site is re-reached
+                           via an ENCLOSING loop (Adobe AppMeasurement a.S). _ffARM /
+                           _ffW were stamped at the handler top (polarity / offset
+                           width). qjs_loop_exit_arm returns -1 (keep the complement)
+                           when it can't resolve the guard. */
+                        int _fall = (int)(pc - b->byte_code_buf);
+                        int _jmp = _fall + (_ffW ? ((int)(int8_t)pc[-1] - 1) : ((int)(int32_t)get_u32(pc - 4) - 4));
+                        int _ea = qjs_loop_exit_arm(_fall, _jmp, sf->qjs_loop_pc, sf->qjs_loop_src, _ffARM);
+                        if (_ea >= 0) res = _ea;
+                        if (_pt) qjs_t_free(_pt);
+                    }
                     else {
                     /* If the term is already in Φ from an earlier OP_if
                        (typically: OR short-circuit JUMP just decided
@@ -21332,6 +21424,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 int res;
                 JSValue op1;
+                int _ffARM = 0, _ffW = 1;   /* loop-revisit exit-arm: if_true8 jumps on res==1, 8-bit offset */
 
                 op1 = sp[-1];
                 pc += 1;
@@ -21381,7 +21474,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (_mb && JS_GetFunctionBytecode(_af->cur_func) == _mb) _recur = 1;
                     }
                     unsigned long long _lk = (_inloop || _recur) ? _site : (_site ^ ((unsigned long long)sf->qjs_inv * 0x9E3779B97F4A7C15ULL));
-                    if (qjs_fe_loop_revisit(_lk, &res)) { if (_pt) qjs_t_free(_pt); }
+                    if (qjs_fe_loop_revisit(_lk, &res)) {
+                        /* Prefer the STRUCTURAL exit arm over the blind complement
+                           (!firstDecision). The complement spins when the first
+                           decision was already the EXIT arm and the site is re-reached
+                           via an ENCLOSING loop (Adobe AppMeasurement a.S). _ffARM /
+                           _ffW were stamped at the handler top (polarity / offset
+                           width). qjs_loop_exit_arm returns -1 (keep the complement)
+                           when it can't resolve the guard. */
+                        int _fall = (int)(pc - b->byte_code_buf);
+                        int _jmp = _fall + (_ffW ? ((int)(int8_t)pc[-1] - 1) : ((int)(int32_t)get_u32(pc - 4) - 4));
+                        int _ea = qjs_loop_exit_arm(_fall, _jmp, sf->qjs_loop_pc, sf->qjs_loop_src, _ffARM);
+                        if (_ea >= 0) res = _ea;
+                        if (_pt) qjs_t_free(_pt);
+                    }
                     else {
                     /* If the term is already in Φ from an earlier OP_if
                        (typically: OR short-circuit JUMP just decided
@@ -21483,6 +21589,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 int res;
                 JSValue op1;
+                int _ffARM = 1, _ffW = 1;   /* loop-revisit exit-arm: if_false8 jumps on res==0, 8-bit offset */
 
                 op1 = sp[-1];
                 pc += 1;
@@ -21532,7 +21639,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (_mb && JS_GetFunctionBytecode(_af->cur_func) == _mb) _recur = 1;
                     }
                     unsigned long long _lk = (_inloop || _recur) ? _site : (_site ^ ((unsigned long long)sf->qjs_inv * 0x9E3779B97F4A7C15ULL));
-                    if (qjs_fe_loop_revisit(_lk, &res)) { if (_pt) qjs_t_free(_pt); }
+                    if (qjs_fe_loop_revisit(_lk, &res)) {
+                        /* Prefer the STRUCTURAL exit arm over the blind complement
+                           (!firstDecision). The complement spins when the first
+                           decision was already the EXIT arm and the site is re-reached
+                           via an ENCLOSING loop (Adobe AppMeasurement a.S). _ffARM /
+                           _ffW were stamped at the handler top (polarity / offset
+                           width). qjs_loop_exit_arm returns -1 (keep the complement)
+                           when it can't resolve the guard. */
+                        int _fall = (int)(pc - b->byte_code_buf);
+                        int _jmp = _fall + (_ffW ? ((int)(int8_t)pc[-1] - 1) : ((int)(int32_t)get_u32(pc - 4) - 4));
+                        int _ea = qjs_loop_exit_arm(_fall, _jmp, sf->qjs_loop_pc, sf->qjs_loop_src, _ffARM);
+                        if (_ea >= 0) res = _ea;
+                        if (_pt) qjs_t_free(_pt);
+                    }
                     else {
                     /* If the term is already in Φ from an earlier OP_if
                        (typically: OR short-circuit JUMP just decided
@@ -23605,7 +23725,7 @@ static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s,
     if (!sf->arg_buf)
         return -1;
     sf->cur_func = js_dup(func_obj);
-    sf->qjs_inv = ++qjs_inv_ctr; sf->qjs_looped = 0; sf->qjs_loop_pc = -1;   /* async/generator frames run bytecode — same loop-revisit-key init as the sync bytecode path */
+    sf->qjs_inv = ++qjs_inv_ctr; sf->qjs_looped = 0; sf->qjs_loop_pc = -1; sf->qjs_loop_src = -1;   /* async/generator frames run bytecode — same loop-revisit-key init as the sync bytecode path */
     s->this_val = js_dup(this_obj);
     s->argc = argc;
     sf->arg_count = arg_buf_len;
