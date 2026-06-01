@@ -60155,7 +60155,16 @@ static void qjs_deep_relevance_sort(JSContext *ctx, JSFunctionBytecode **rb, int
    fresh worker (after MV3 eviction) re-boots the same combined bundle (stable
    GC order ⇒ same orphan indices) and continues from the IndexedDB-saved
    cursor instead of re-driving the done orphans. */
+int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only);
 int qjs_deep_step_c(JSContext *ctx, int maxN, int fromCursor) {
+    return qjs_deep_step_c_h(ctx, maxN, fromCursor, 0);
+}
+/* head_only: drive ONLY the net-reaching (endpoint) HEAD then return, so the
+   worker can rotate to another open page's head before this page's tail
+   (continuous-session scheduler). The live-pick already orders net-reaching
+   first; head_only just stops the loop when the best remaining pick is NOT
+   net-reaching. */
+int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
     if (maxN < 1) maxN = 1;
     JSRuntime *rt = JS_GetRuntime(ctx);
     qjs_init_host_atoms(ctx);
@@ -60336,6 +60345,13 @@ int qjs_deep_step_c(JSContext *ctx, int maxN, int fromCursor) {
             if (better) { b = cb; _ix = _ci; }
         }
         if (b == NULL) break;   /* residue exhausted */
+        /* HEAD-ONLY stop: the live-pick orders net-reaching (endpoint) orphans
+           FIRST, so the first pick whose net-bit is 0 means the net HEAD is
+           fully driven — return so the worker can rotate to another open page's
+           head before this page's completeness tail (continuous-session
+           scheduler). qjs_h_fired orphans were already marked+skipped above, so
+           _ix here is a genuine to-drive pick. */
+        if (head_only && _have_bits && !qjs_deep_net[_ix]) break;
         uint64_t _id = qjs_deep_ids ? qjs_deep_ids[_ix] : 0;
         /* Re-baseline the JS recursion guard to THIS frame before driving.
            js_check_stack_overflow compares the live SP against
