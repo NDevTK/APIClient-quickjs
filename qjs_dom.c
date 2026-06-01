@@ -182,14 +182,21 @@ static JSValue m_appendChild(JSContext *ctx, JSValueConst t, int ac, JSValueCons
        descendants under insert_before). */
     if (c->parent) lxb_dom_node_remove(c);
     lxb_dom_node_append_child(p, c);
-    /* NB: CE connection reactions are fired only from the HTML-injection
-       paths (innerHTML / insertAdjacentHTML / insertAdjacentElement), NOT
-       here — appendChild is the hottest DOM op (called per node during bulk
-       construction), and a per-call __ceConnect (querySelectorAll subtree
-       walk) measurably slowed real-bundle analysis with no benefit: the
-       deferred-fragment loaders that motivated this arrive as HTML strings,
-       not single createElement+appendChild nodes (and createElement of a
-       custom element is currently a separate broken path — null tagName). */
+    /* Fire CE connection reactions ONLY when appending INTO the document tree
+       (spec: connectedCallback fires on document-connection). This restores the
+       createElement(CE)+appendChild render-cycle the prelude's up()/__ceConnect
+       design intends (see qjs_dom.c "CE-reactions on CONNECTION" comment): a
+       JS-INJECTED loader (<include-fragment src>, image-cropper, React-rendered
+       custom element) runs its connectedCallback fetch — goal #1's unused-feature
+       surface (confirmed lost by the _ce_render gate). The original perf worry
+       (appendChild is the hottest op; a per-call subtree walk slowed real
+       bundles) is addressed by the document-connection gate: OFF-document bulk
+       construction skips (the parent-walk finds no DOCUMENT and returns — O(depth),
+       no JS call, no subtree walk); only the single append that connects a
+       subtree to the document fires qjs_ce_connect. createElement of a CE is no
+       longer the "broken null-tagName path" — dom_ctor builds a real element and
+       up() upgrades it. */
+    { lxb_dom_node_t *q = p; while (q) { if (q->type == LXB_DOM_NODE_TYPE_DOCUMENT) { qjs_ce_connect(ctx, av[0]); break; } q = q->parent; } }
     return JS_DupValue(ctx, av[0]);
 }
 static JSValue m_insertBefore(JSContext *ctx, JSValueConst t, int ac, JSValueConst *av) {
@@ -206,6 +213,9 @@ static JSValue m_insertBefore(JSContext *ctx, JSValueConst t, int ac, JSValueCon
         return JS_ThrowTypeError(ctx, "insertBefore: node is an inclusive ancestor of the parent or reference node (would cycle the tree)");
     if (c->parent) lxb_dom_node_remove(c);   /* DOM move semantics — unlink before re-insert (see m_appendChild) */
     if (r) lxb_dom_node_insert_before(r, c); else lxb_dom_node_append_child(p, c);
+    /* CE connection reactions on document-connecting insert — same rationale +
+       perf gate as m_appendChild. */
+    { lxb_dom_node_t *q = p; while (q) { if (q->type == LXB_DOM_NODE_TYPE_DOCUMENT) { qjs_ce_connect(ctx, av[0]); break; } q = q->parent; } }
     return JS_DupValue(ctx, av[0]);
 }
 static JSValue m_removeChild(JSContext *ctx, JSValueConst t, int ac, JSValueConst *av) {
