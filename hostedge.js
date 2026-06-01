@@ -708,7 +708,19 @@
     if (b == null) return null;
     if (ISOPQANY(b)) return { kind: "opaque" };
     var t = typeof b;
-    if (t === "string" || t === "number" || t === "boolean") return { kind: "literal", value: String(b) };
+    if (t === "string") {
+      // The ubiquitous `body: JSON.stringify({...})` arrives here as a STRING.
+      // Recording it as one literal blob loses every field KEY + value — the
+      // goal-#2 depth gap (POST endpoints learned with NO body params despite a
+      // content-type:application/json header; _bodykeys gate). If it parses as a
+      // JSON object/array, walk the PARSED structure so per-field keys+values are
+      // captured. A non-JSON string (or one not starting with {/[) stays literal.
+      if (b.length > 1) { var c0 = b.charCodeAt(0); if (c0 === 123 || c0 === 91) {   // '{' or '['
+        try { var pj = JSON.parse(b); if (pj && typeof pj === "object") return bodyShape(pj); } catch (_) {}
+      } }
+      return { kind: "literal", value: String(b) };
+    }
+    if (t === "number" || t === "boolean") return { kind: "literal", value: String(b) };
     if (b && b._fd) {                              // FormData (our shim's _fd backing object)
       var f = {};
       for (var k in b._fd) f[k] = bodyShape(b._fd[k]);
