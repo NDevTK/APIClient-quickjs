@@ -1626,6 +1626,17 @@ int qjs_dom_install(JSContext *ctx) {
     "Object.defineProperty(P,'dataset',{configurable:true,get:function(){var el=this;return new Proxy({},{get:function(_,k){if(typeof k!=='string')return undefined;var v=el.getAttribute('data-'+k.replace(/[A-Z]/g,function(m){return '-'+m.toLowerCase();}));return v==null?undefined:v;},set:function(_,k,v){el.setAttribute('data-'+String(k).replace(/[A-Z]/g,function(m){return '-'+m.toLowerCase();}),String(v));return true;},has:function(_,k){return el.hasAttribute('data-'+String(k));}});}});"
     "Object.defineProperty(P,'style',{configurable:true,get:function(){if(!this.__st){var m={};this.__st={setProperty:function(k,v){m[k]=v;},removeProperty:function(k){delete m[k];},getPropertyValue:function(k){return m[k]||'';},item:function(){return '';},get cssText(){return Object.keys(m).map(function(k){return k+':'+m[k];}).join(';');},set cssText(v){}};}return this.__st;}});"
     "['value','checked','selected','disabled','readOnly','href','src','type','name','title','action','placeholder','rel','htmlFor'].forEach(function(pk){var at=pk==='htmlFor'?'for':pk;Object.defineProperty(P,pk,{configurable:true,get:function(){var v=this.getAttribute(at);if(pk==='checked'||pk==='disabled'||pk==='selected'||pk==='readOnly')return v!=null;return v==null?'':v;},set:function(v){this.setAttribute(at,v===true?'':String(v));}});});"
+    /* Element.isConnected — spec: true iff the node is reachable from the
+       document root via parentNode. It was defined ONLY on `document` (a
+       constant), so ELEMENTS returned undefined. That silently broke any
+       custom element whose connectedCallback gates on it — github's
+       <include-fragment> does `connectedCallback(){this.isConnected&&(this.#load(),…)}`,
+       so on an upgraded SSR node `this.isConnected===undefined` short-circuited
+       the eager #load() and its fetch NEVER fired (used_by_list /
+       sidebar_partial lost despite the node being upgraded — the layer-5 gap).
+       Walk parentNode to a document node (nodeType 9 / === document); detached
+       nodes correctly return false. Acyclic tree ⇒ terminates at the root. */
+    "Object.defineProperty(P,'isConnected',{configurable:true,get:function(){var n=this;while(n){if(n===document||n.nodeType===9)return true;n=n.parentNode;}return false;}});"
     "document.createDocumentFragment=function(){return document.createElement('div');};"
     "document.createComment=function(){return document.createTextNode('');};"
     "document.createElementNS=function(ns,t){return document.createElement(t);};"
