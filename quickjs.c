@@ -18230,6 +18230,21 @@ static __exception int js_operator_instanceof(JSContext *ctx, JSValue *sp)
 
     op1 = sp[-2];
     op2 = sp[-1];
+    /* Opaque-infectious instanceof: `<opaque> instanceof C` (or `x instanceof
+       <opaque>`) is UNKNOWN, so the result must be opaque — not a concrete bool
+       from JS_IsInstanceOf coercing the sentinel. Same hole + same recursion-
+       overflow risk as OP_in: a branch `if(x instanceof C)` over an opaque x
+       never forks, so a recursion gated by it (e.g. a type-dispatch
+       `from(x){ if(x instanceof T) ...; return from(x.inner) }`) recurses
+       concretely until the stack overflows. github 43540's `k` type-check
+       (`t instanceof e || t.constructor.name===e.name`) is exactly this shape.
+       Carry an `instanceof` CMP term for the Z3 path. */
+    if (qjs_is_opaque(op1) || qjs_is_opaque(op2)) {
+        JSValue _r = qjs_cmp_term(ctx, op1, op2, "instanceof");
+        JS_FreeValue(ctx, op1); JS_FreeValue(ctx, op2);
+        sp[-2] = _r;
+        return 0;
+    }
     ret = JS_IsInstanceOf(ctx, op1, op2);
     if (ret < 0)
         return ret;
