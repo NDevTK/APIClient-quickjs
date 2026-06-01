@@ -10258,17 +10258,32 @@ static void qjs_spin_probe(JSContext *ctx, JSStackFrame *sf, JSFunctionBytecode 
     long pco = (long)(pc - cur->byte_code_buf);
     unsigned long long _s = (((unsigned long long)cur->line_num << 40) ^ ((unsigned long long)cur->col_num << 24) ^ (unsigned long long)(size_t)pco);
     int _hin = 0, _hrec = 0; JSFunctionBytecode *_hmb = JS_GetFunctionBytecode(sf->cur_func);
+    /* Walk to the nearest LOOPING ancestor frame — the actual loop that
+       spins, vs `cur` which is just the leaf the probe sampled (usually our
+       own fetch/Response shim, useless for locating the bug). The spin lives
+       in BUNDLE code calling the shim in a loop; reporting the looped
+       ancestor's file:line names the real culprit so the fixpoint-key gap
+       can be read in the real source instead of guessed. */
+    JSFunctionBytecode *_lpb = NULL; const uint8_t *_lppc = NULL;
     for (JSStackFrame *_af = sf->prev_frame; _af && !(_hin && _hrec); _af = _af->prev_frame) {
-        if (_af->qjs_looped && !sf->qjs_looped) _hin = 1;
+        if (_af->qjs_looped && !sf->qjs_looped) {
+            _hin = 1;
+            if (!_lpb) { _lpb = JS_GetFunctionBytecode(_af->cur_func); _lppc = _af->cur_pc; }
+        }
         if (_hmb && JS_GetFunctionBytecode(_af->cur_func) == _hmb) _hrec = 1;
     }
     unsigned long long _hk = (_hin || _hrec) ? _s : (_s ^ ((unsigned long long)sf->qjs_inv * 0x9E3779B97F4A7C15ULL));
     int _hd = -1; int _hseen = qjs_fe_seen_get(_hk, &_hd);
     const char *fn = cur->filename ? JS_AtomToCString(ctx, cur->filename) : NULL;
-    printf("@WHY {\"phase\":\"spin_nonterminating\",\"file\":\"%s\",\"line\":%d,\"col\":%d,\"pc\":%ld,\"inv\":%u,\"ownlooped\":%u,\"inloop\":%d,\"recur\":%d,\"hk_seen\":%d}\n",
-           fn ? fn : "?", cur->line_num, cur->col_num, pco, sf->qjs_inv, sf->qjs_looped, _hin, _hrec, _hseen);
+    /* Looping-ancestor source location (the loop owner, not the shim leaf). */
+    const char *lpfn = (_lpb && _lpb->filename) ? JS_AtomToCString(ctx, _lpb->filename) : NULL;
+    long _lppco = (_lpb && _lpb->byte_code_buf && _lppc) ? (long)(_lppc - _lpb->byte_code_buf) : -1;
+    printf("@WHY {\"phase\":\"spin_nonterminating\",\"file\":\"%s\",\"line\":%d,\"col\":%d,\"pc\":%ld,\"inv\":%u,\"ownlooped\":%u,\"inloop\":%d,\"recur\":%d,\"hk_seen\":%d,\"loopFile\":\"%s\",\"loopLine\":%d,\"loopCol\":%d,\"loopPc\":%ld}\n",
+           fn ? fn : "?", cur->line_num, cur->col_num, pco, sf->qjs_inv, sf->qjs_looped, _hin, _hrec, _hseen,
+           lpfn ? lpfn : "?", _lpb ? _lpb->line_num : 0, _lpb ? _lpb->col_num : 0, _lppco);
     fflush(stdout);
     if (fn) JS_FreeCString(ctx, fn);
+    if (lpfn) JS_FreeCString(ctx, lpfn);
 }
 #define QJS_SPIN_PROBE_CALL(b, pc) qjs_spin_probe(ctx, sf, (b), (pc))
 
