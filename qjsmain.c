@@ -570,6 +570,34 @@ int main(int argc, char **argv) {
                 }
                 qjs_forced_config(1, "", NULL);
                 qjs_host_atoms_init(g_deep_ctx);   /* before boot, so qjs_h_fired marks correctly */
+                /* Parse the SSR page HTML into the deep runtime's document too.
+                   g_deep_ctx is a SEPARATE runtime from the main/BFS ctx (which
+                   gets --fe-html at the bottom of main()), and a --fe-deep-grind
+                   callMain never reaches that main-path parse — so the deep
+                   document was EMPTY. A custom element whose customElements.define
+                   lives in a chunk loaded DURING the grind (absent from the boot
+                   bundle — verified on github) then finds nothing to upgrade:
+                   define's `document.querySelectorAll(tag)` (qjs_dom.c) is empty,
+                   so the SSR <include-fragment>'s connectedCallback never runs and
+                   its fetch is lost (github used_by_list / sidebar_partial). Set
+                   innerHTML only — the nodes — NOT the inline-script run the main
+                   path does (the bundle boot below is the deep runtime's script
+                   execution); a grind-time define then upgrades the present
+                   nodes. */
+                for (int hi = 1; hi < argc; hi++) {
+                    if (strncmp(argv[hi], "--fe-html=", 10)) continue;
+                    size_t hn; char *h = readfile(argv[hi] + 10, &hn);
+                    if (!h) break;
+                    JSValue dg = JS_GetGlobalObject(g_deep_ctx);
+                    JS_SetPropertyStr(g_deep_ctx, dg, "__fe_html", JS_NewStringLen(g_deep_ctx, h, hn));
+                    JS_FreeValue(g_deep_ctx, dg);
+                    free(h);
+                    static const char *DEEP_HTML = "document.body.innerHTML=__fe_html;delete __fe_html;";
+                    JSValue hv = JS_Eval(g_deep_ctx, DEEP_HTML, strlen(DEEP_HTML), "<deep-fe-html>", JS_EVAL_TYPE_GLOBAL);
+                    if (JS_IsException(hv)) { JSValue e = JS_GetException(g_deep_ctx); const char *em = JS_ToCString(g_deep_ctx, e); fprintf(stderr, "@WHY {\"phase\":\"deep_fe_html_throw\",\"err\":\"%s\"}\n", em ? em : "(throw)"); if (em) JS_FreeCString(g_deep_ctx, em); JS_FreeValue(g_deep_ctx, e); }
+                    JS_FreeValue(g_deep_ctx, hv);
+                    break;
+                }
                 /* Boot once: eval the bundle + driver so the reached set is
                    marked qjs_executed; the stepped drive then hits only the
                    never-reached residue. Parse --fe-script-start-lines first
