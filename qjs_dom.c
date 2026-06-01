@@ -1804,7 +1804,21 @@ int qjs_dom_install(JSContext *ctx) {
         "I('AbortController',{signal:null,abort:function(){}});"
         "I('AbortSignal',{aborted:false,reason:undefined,onabort:null});"
         "I('MutationObserver',{observe:function(){},disconnect:function(){},takeRecords:function(){return[];}});"
-        "I('IntersectionObserver',{observe:function(){},unobserve:function(){},disconnect:function(){},takeRecords:function(){return[];}});"
+        /* IntersectionObserver DRIVES its callback on observe() with a synthetic
+           "intersecting" entry — forced exec must fire the visibility-gated path
+           (the user would trigger it by scrolling) so loading="lazy" deferred
+           loaders fetch: include-fragment's lazy connectedCallback calls
+           observe(this) and only fetches inside the IO callback when intersecting
+           (github used_by_list / hovercard sidebar_partial), and lazy images /
+           infinite-scroll do the same. A no-op observe() (the generic I() stub,
+           which also DISCARDS the constructor callback) silently drops every such
+           endpoint. Scheduled as a microtask (spec-accurate async; the driver's
+           __hostMicrotaskDrain fires it inside the fixpoint, and a throw stays in
+           the job queue instead of aborting the observe() caller). */
+        "if(typeof globalThis.IntersectionObserver!=='function'){var __IO=function(cb){this._cb=cb;};"
+        "__IO.prototype.observe=function(t){var cb=this._cb,o=this;if(typeof cb==='function')Promise.resolve().then(function(){cb([{target:t,isIntersecting:true,intersectionRatio:1,boundingClientRect:{},intersectionRect:{},rootBounds:null,time:0}],o);});};"
+        "__IO.prototype.unobserve=function(){};__IO.prototype.disconnect=function(){};__IO.prototype.takeRecords=function(){return[];};"
+        "globalThis.IntersectionObserver=__IO;}"
         "I('ResizeObserver',{observe:function(){},unobserve:function(){},disconnect:function(){}});"
         "I('FileReader',{readAsText:function(){},readAsDataURL:function(){},readAsArrayBuffer:function(){},result:null,error:null,readyState:0});"
         "I('Blob',{size:0,type:'',slice:function(){return new Blob();},text:function(){return Promise.resolve('');},arrayBuffer:function(){return Promise.resolve(new ArrayBuffer(0));},stream:function(){return null;}});"
