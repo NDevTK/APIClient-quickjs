@@ -46462,8 +46462,26 @@ static JSValue js_array_slice(JSContext *ctx, JSValueConst this_val,
             del_count = len - start;
         } else {
             item_count = argc - 2;
-            if (JS_ToInt64Clamp(ctx, &del_count, argv[1], 0, len - start, 0))
+            /* Opaque deleteCount: the number to remove is UNKNOWN. Coercing it
+               via ToInt64Clamp pins del_count to the fallback 0 (opaque→NaN→0),
+               so `b.splice(start, opaque)` removes NOTHING — and a worklist
+               drain `for(; b.length>0; ){ b.splice(0, opaqueBatchSize) }` is a
+               CONCRETE infinite loop the forced-exec fixpoint can't bound (its
+               predicate `b.length` stays a real number, no OP_if forks). This
+               is the live Google YouTube-docs spin (devsite hK:
+               `for(;b.length>0;){var d=b.splice(0,a.maxBatchSize);...}` with a
+               SYNTH-opaque `a`). Model an unknown deleteCount as delete-to-end
+               (the `argc==1` semantics): the batch could be the whole array, so
+               this is a sound concrete execution that DRAINS `b` in one pass →
+               the loop terminates after running its body (the fetch fires, the
+               endpoint is learned). Same termination goal as opaque-infectious
+               concat/filter, applied where the loop variable is the RECEIVER
+               (b), not the result (d) — so returning opaque wouldn't help. */
+            if (qjs_is_opaque(argv[1])) {
+                del_count = len - start;
+            } else if (JS_ToInt64Clamp(ctx, &del_count, argv[1], 0, len - start, 0)) {
                 goto exception;
+            }
         }
         if (len + item_count - del_count > MAX_SAFE_INTEGER) {
             JS_ThrowTypeError(ctx, "Array loo long");
