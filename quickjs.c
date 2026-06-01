@@ -18136,6 +18136,23 @@ static __exception int js_operator_in(JSContext *ctx, JSValue *sp)
     op1 = sp[-2];
     op2 = sp[-1];
 
+    /* Opaque-infectious `in`: `key in <opaque>` membership is UNKNOWN, so the
+       result must be opaque (not a concrete false from JS_HasProperty on the
+       sentinel). Without this, a recursion/loop gated by `if(K in t)` over an
+       opaque `t` never forks — the branch is CONCRETE so the forced-exec
+       loop-revisit fixpoint can't see it, and a `.parent`-walk recursion
+       `es(e,t)=>{ if(K in t) ...; return es(e,t.parent) }` (github protobuf
+       27600-*.js:664 `es` feature-resolution, recurDepth 583) recurses up an
+       opaque parent chain until the JS stack overflows. Same opcode-infectivity
+       class as OP_cmp / splice / concat. Carry an `in` CALL term (key, obj) so
+       a tainted membership keeps its symbolic shadow for the Z3 path. */
+    if (qjs_is_opaque(op2)) {
+        JSValue _r = qjs_cmp_term(ctx, op1, op2, "in");
+        JS_FreeValue(ctx, op1); JS_FreeValue(ctx, op2);
+        sp[-2] = _r;
+        return 0;
+    }
+
     if (JS_VALUE_GET_TAG(op2) != JS_TAG_OBJECT) {
         JS_ThrowTypeError(ctx, "invalid 'in' operand");
         return -1;
