@@ -74,6 +74,7 @@ static int qjs_host_reach_check(JSContext *ctx, JSFunctionBytecode *b);
 static int qjs_host_reach_from(JSContext *ctx, JSFunctionBytecode *b, int start_pc);
 static int qjs_host_reach_net_from(JSContext *ctx, JSFunctionBytecode *b, int start_pc);
 static int qjs_fn_reaches_net(JSFunctionBytecode *b);
+static uint64_t qjs_fn_id(JSContext *ctx, JSFunctionBytecode *b);   /* defined ~60029; used by the caught_throw diagnostic in JS_CallInternal */
 static int qjs_is_sink_atom(JSAtom a);
 /* Directed-drive state — the principled answer to "which branches to
    follow". When active, the OP_if_* handlers in the TARGET function
@@ -2632,6 +2633,10 @@ typedef struct JSFunctionBytecode {
        EXPLOIT_UNPROVEN. Sound: an event arg IS attacker-controlled — TAINT here
        is never a false positive, and it's scoped to registered handlers only. */
     uint8_t qjs_is_event_handler : 1;
+    /* qjs_caught_logged: set once this function has emitted a @WHY caught_throw,
+       so the per-catch diagnostic dedups to one record per host-edge function
+       (a try/catch in a hot loop won't flood). */
+    uint8_t qjs_caught_logged : 1;
     /* qjs_deep_ix: post-sort back-index into qjs_deep_rb during an active
        grind (set when the residue is built) so qjs_deep_capture_inst is O(1).
        The qjs_deep_rb[ix]==b guard makes a stale/zero-init index a safe miss. */
@@ -23303,6 +23308,26 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp--;
                     JS_IteratorClose(ctx, sp[-1], true);
                 } else {
+                    /* CAUGHT-EXCEPTION OBSERVABILITY (no silent failure): an
+                       exception about to be swallowed by a try/catch INSIDE a
+                       host-edge-reaching function means a fetch/XHR the function
+                       was heading toward may be silently lost (e.g. github's
+                       include-fragment load chain throws → catch{is-error} → the
+                       fetch never fires → the endpoint vanishes with zero
+                       signal). Surface it as @WHY so the throwing host stub is
+                       findable instead of guessed. Emit-only (can't change
+                       execution); host-reach-gated (qjs_host_reach_check is
+                       memoized) so routine feature-detect catches in non-host
+                       code stay quiet; deduped to one record per function. The
+                       fn id resolves to file:line:col via the srcloc harness. */
+                    if (!b->qjs_caught_logged && qjs_host_reach_check(ctx, b)) {
+                        b->qjs_caught_logged = 1;
+                        const char *_cfn = b->filename ? JS_AtomToCString(ctx, b->filename) : NULL;
+                        printf("@WHY {\"phase\":\"caught_throw\",\"fn\":\"%llx\",\"file\":\"%s\",\"line\":%d,\"col\":%d}\n",
+                               (unsigned long long)qjs_fn_id(ctx, b), _cfn ? _cfn : "?", b->line_num, b->col_num);
+                        fflush(stdout);
+                        if (_cfn) JS_FreeCString(ctx, _cfn);
+                    }
                     *sp++ = rt->current_exception;
                     rt->current_exception = JS_UNINITIALIZED;
                     JS_FreeValueRT(rt, ctx->error_back_trace);
