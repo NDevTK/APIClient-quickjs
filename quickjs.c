@@ -23323,8 +23323,44 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (!b->qjs_caught_logged && qjs_host_reach_check(ctx, b)) {
                         b->qjs_caught_logged = 1;
                         const char *_cfn = b->filename ? JS_AtomToCString(ctx, b->filename) : NULL;
-                        printf("@WHY {\"phase\":\"caught_throw\",\"fn\":\"%llx\",\"file\":\"%s\",\"line\":%d,\"col\":%d}\n",
-                               (unsigned long long)qjs_fn_id(ctx, b), _cfn ? _cfn : "?", b->line_num, b->col_num);
+                        /* Capture the exception message so each caught_throw is
+                           self-diagnosing (the message names the wrong host stub
+                           — e.g. "Cannot read 'signal' of undefined" → the
+                           AbortController stub). SAFE: the exception (rt->current
+                           _exception) is about to be pushed to the catch below;
+                           shield it (UNINITIALIZED) so a throwing .message getter
+                           /toString can't clobber it, extract, drop any exception
+                           the extraction itself raised, then restore. Borrow _exc
+                           (never consume it). Manual JSON-escape into a bounded
+                           buffer — no JSON.stringify re-entry during unwind. */
+                        char _emb[256]; _emb[0] = 0;
+                        {
+                            JSValue _exc = rt->current_exception;
+                            rt->current_exception = JS_UNINITIALIZED;
+                            const char *_ms = NULL;
+                            if (JS_IsObject(_exc)) {
+                                JSValue _mv = JS_GetPropertyStr(ctx, _exc, "message");
+                                if (JS_IsString(_mv)) _ms = JS_ToCString(ctx, _mv);
+                                JS_FreeValue(ctx, _mv);
+                            } else if (JS_IsString(_exc)) {
+                                _ms = JS_ToCString(ctx, _exc);
+                            }
+                            JS_FreeValue(ctx, rt->current_exception);   /* no-op if UNINITIALIZED; frees an extraction-raised throw */
+                            rt->current_exception = _exc;               /* restore for the catch push below */
+                            if (_ms) {
+                                int _o = 0;
+                                for (int _i = 0; _ms[_i] && _o < (int)sizeof(_emb) - 8; _i++) {
+                                    unsigned char _ch = (unsigned char)_ms[_i];
+                                    if (_ch == '"' || _ch == '\\') { _emb[_o++] = '\\'; _emb[_o++] = (char)_ch; }
+                                    else if (_ch == '\n') { _emb[_o++] = '\\'; _emb[_o++] = 'n'; }
+                                    else if (_ch >= 0x20) { _emb[_o++] = (char)_ch; }
+                                }
+                                _emb[_o] = 0;
+                                JS_FreeCString(ctx, _ms);
+                            }
+                        }
+                        printf("@WHY {\"phase\":\"caught_throw\",\"fn\":\"%llx\",\"file\":\"%s\",\"line\":%d,\"col\":%d,\"msg\":\"%s\"}\n",
+                               (unsigned long long)qjs_fn_id(ctx, b), _cfn ? _cfn : "?", b->line_num, b->col_num, _emb);
                         fflush(stdout);
                         if (_cfn) JS_FreeCString(ctx, _cfn);
                     }
