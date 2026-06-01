@@ -19,7 +19,18 @@
   // SYNTH static-drive arg flowing into a header/body is also opaque (no
   // fabricated value), matching urlOf's __feUrlShape treatment of URL holes.
   var ISOPQANY = (typeof __isOpaqueAny === "function") ? __isOpaqueAny : ISOPQ;
+  // Concrete presence test. `opaque != null` is opaque-infectious (forks), so a
+  // shim presence check on a maybe-opaque value (init.body, init.headers,
+  // input.url) would fork — and __feDriveStatic's single forced pass takes one
+  // arm, dropping the value. An opaque is always present, so short-circuit it
+  // first (ISOPQANY is concrete); only a non-opaque reaches the `!= null`.
+  var PRESENT = function (x) { return ISOPQANY(x) || x != null; };
   var URLSHAPE = (typeof __feUrlShape === "function") ? __feUrlShape : function () { return undefined; };
+  // JSON.stringify({k:opaque,...}) returns an infectious opaque (taint kept for
+  // @S/@Z) but stashes the rendered concrete-keyed JSON; OPQSHAPE recovers it so
+  // bodyShape can emit the body field KEYS + literal values instead of a bare
+  // {kind:opaque}. undefined for a bare/unary opaque (no nested object).
+  var OPQSHAPE = (typeof __opaqueShape === "function") ? __opaqueShape : function () { return undefined; };
   // Per-URL-hole generated bundle positions ([{name,line,col}], same order as
   // the __feUrlShape template). Lets the SW pair each opaque path param with
   // its read site and resolve the declared name (e→owner) via a source-map
@@ -401,7 +412,7 @@
     language: "en-US", languages: ["en-US", "en"], onLine: true, cookieEnabled: true,
     doNotTrack: null, hardwareConcurrency: 4, deviceMemory: 8, maxTouchPoints: 0,
     vendor: "", product: "Gecko", productSub: "20030107", appName: "Netscape",
-    sendBeacon: function (u, d) { H("sendBeacon", [urlOf(u), recBody(d), d == null ? null : bodyShape(d)]); return true; },
+    sendBeacon: function (u, d) { H("sendBeacon", [urlOf(u), recBody(d), bodyShape(d)]); return true; },
     clipboard: { writeText: function () { return Promise.resolve(); }, readText: function () { return Promise.resolve(OPQ("clipboard.readText")); } },
     serviceWorker: { register: function () { return Promise.resolve({ scope: "/", update: function () {}, unregister: function () { return Promise.resolve(true); }, addEventListener: function () {} }); }, ready: Promise.resolve({ active: {} }), addEventListener: function () {}, controller: null, getRegistrations: function () { return Promise.resolve([]); } },
     permissions: { query: function () { return Promise.resolve({ state: "prompt", addEventListener: function () {} }); } },
@@ -582,7 +593,7 @@
     // collapsing opaque-bearer-tokens into a literal record.
     var hs = null;
     if (this._h) { hs = {}; for (var hk in this._h) hs[hk] = this._h[hk]; }
-    H("XMLHttpRequest.send", [bs, b == null ? null : bodyShape(b), hs]);
+    H("XMLHttpRequest.send", [bs, bodyShape(b), hs]);   // bodyShape is null+opaque-safe; `b == null` would fork on an opaque body
     var self = this;
     enq(function () {
       var rs = [2, 3, 4];
@@ -660,8 +671,8 @@
   // structure separately; this is just the readable string form. Mirrors
   // S()'s @S concretization — the same invariant for the @H record layer.
   function recBody(b) {
+    if (ISOPQANY(b)) return "[opaque]";   // concrete check before `== null` (which forks on opaque)
     if (b == null) return null;
-    if (ISOPQANY(b)) return "[opaque]";
     return (typeof b === "object" && !b._fd) ? safeBody(b) : String(b);
   }
   // Per-header provenance: literal vs opaque per header name. Accepts
@@ -671,6 +682,7 @@
   // attacker leaf) stay marked opaque so the learner records "this
   // endpoint needs an Authorization header" without inventing a value.
   function headersShape(h) {
+    if (ISOPQANY(h)) return null;   // concrete before `== null`; a wholly-opaque headers value has no enumerable per-header provenance
     if (h == null) return null;
     var out = {};
     function record(k, v) {
@@ -704,9 +716,45 @@
   // over object / array / FormData / URLSearchParams. Termination is
   // structural — bounded by the bundle's body-object's own structure
   // (which is constructed at runtime, finite per construction).
+  // Walk a recovered __opaqueShape JSON tree. The engine renders opaque-valued
+  // fields as the literal marker "[object Object]" (the sentinel's String()
+  // form); map THAT back to {kind:"opaque"} so the field's provenance stays
+  // honest (no fabricated value) while literal keys + literal scalar values are
+  // emitted as captured. Confined to shape JSON (only reached via OPQSHAPE) so
+  // the marker check can't misclassify a legitimate real-body value.
+  function shapeWalk(v) {
+    if (v === "[object Object]") return { kind: "opaque" };
+    if (v == null) return { kind: "literal", value: String(v) };
+    var tv = typeof v;
+    if (tv === "string" || tv === "number" || tv === "boolean") return { kind: "literal", value: String(v) };
+    if (Array.isArray(v)) { var a = []; for (var i = 0; i < v.length; i++) a.push(shapeWalk(v[i])); return { kind: "array", items: a }; }
+    if (tv === "object") { var o = {}; for (var k in v) if (Object.prototype.hasOwnProperty.call(v, k)) o[k] = shapeWalk(v[k]); return { kind: "object", fields: o }; }
+    return { kind: "literal", value: String(v) };
+  }
   function bodyShape(b) {
+    // ISOPQANY (concrete) BEFORE the `== null` check: `opaque == null` is
+    // opaque-infectious (forks), and __feDriveStatic's single forced pass would
+    // take the "is null" arm and skip recovery. An opaque value is present.
+    if (ISOPQANY(b)) {
+      // A mixed-opaque body (`JSON.stringify({k:opaque, n:7})`) is an infectious
+      // opaque, but the engine stashed the rendered field structure — recover
+      // the keys + literal values rather than collapsing to {kind:opaque}.
+      var sh = OPQSHAPE(b);
+      if (typeof sh === "string" && sh.length > 1) {
+        var c0 = sh.charCodeAt(0);
+        if (c0 === 123 || c0 === 91) {            // '{' or '[' — engine renders shape as valid JSON
+          try {
+            var pj = JSON.parse(sh);
+            if (pj && typeof pj === "object") return shapeWalk(pj);
+          } catch (e) {
+            if (typeof printErr === "function")
+              printErr('@WHY {"phase":"opaqueShape_parse","err":' + JSON.stringify(String(e && e.message || e)) + '}');
+          }
+        }
+      }
+      return { kind: "opaque" };
+    }
     if (b == null) return null;
-    if (ISOPQANY(b)) return { kind: "opaque" };
     var t = typeof b;
     if (t === "string") {
       // The ubiquitous `body: JSON.stringify({...})` arrives here as a STRING.
@@ -798,12 +846,14 @@
   }
   G.fetch = function (input, init) {
     init = init || {};
-    var url = (input && typeof input === "object" && input.url != null) ? input.url : input;
+    var url = (input && typeof input === "object" && PRESENT(input.url)) ? input.url : input;
     var method = (init.method || (input && input.method) || "GET");
-    var body = init.body != null ? init.body : (input && typeof input === "object" ? input.body : null);
-    var headers = init.headers != null ? init.headers : (input && typeof input === "object" ? input.headers : null);
+    var body = PRESENT(init.body) ? init.body : (input && typeof input === "object" ? input.body : null);
+    var headers = PRESENT(init.headers) ? init.headers : (input && typeof input === "object" ? input.headers : null);
     var bodyStr = recBody(body);
-    H("fetch", [urlOf(url), String(method).toUpperCase(), bodyStr, body == null ? null : bodyShape(body), headers == null ? null : headersShape(headers), urlHolesOf(url)]);
+    // bodyShape/headersShape are null- AND opaque-safe (ISOPQANY-first); calling
+    // them directly avoids a `body == null` fork on an opaque body.
+    H("fetch", [urlOf(url), String(method).toUpperCase(), bodyStr, bodyShape(body), headersShape(headers), urlHolesOf(url)]);
     return Promise.resolve(new Response(null, { url: String(url) }));
   };
   /* Blob / File — minimal WHATWG models. The point isn't full Blob

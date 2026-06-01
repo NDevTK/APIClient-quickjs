@@ -277,12 +277,12 @@ static qjs_term *qjs_t_call(const char *name, qjs_term *base, qjs_term *arg) {
     t->a = base; t->b = arg; return t;
 }
 
-typedef struct qjs_opq { int flavor; char *label; qjs_term *term; } qjs_opq;
+typedef struct qjs_opq { int flavor; char *label; qjs_term *term; char *shape; } qjs_opq;
 static JSClassID qjs_opq_cid;
 static JSRuntime *qjs_opq_rt = NULL;   /* runtime the opaque class is registered in */
 static void qjs_opq_fin(JSRuntime *rt, JSValue v) {
     qjs_opq *o = JS_GetOpaque(v, qjs_opq_cid);
-    if (o) { qjs_t_free(o->term); free(o->label); free(o); }
+    if (o) { qjs_t_free(o->term); free(o->label); free(o->shape); free(o); }
 }
 static qjs_opq *qjs_opq_of(JSValueConst v) {
     if (!JS_IsObject(v)) return NULL;
@@ -324,6 +324,18 @@ static JSValue qjs_opq_make(JSContext *ctx, int flavor, const char *label, qjs_t
     o->term = term;
     JS_SetOpaque(v, o);
     return v;
+}
+/* Attach the rendered concrete-keyed JSON shape to an opaque (see
+   JS_JSONStringify's seen_term path). Defined here, BEFORE the js_malloc
+   forbidden-macro poison (quickjs.c ~line 4034), so it uses the real libc
+   allocator that qjs_opq_fin's free(o->shape) matches; the stringify capture
+   site is past the poison and cannot call malloc directly. */
+static void qjs_opq_set_shape(JSValueConst v, const char *s) {
+    qjs_opq *o = qjs_opq_of(v);
+    if (!o || !s) return;
+    free(o->shape);
+    o->shape = malloc(strlen(s) + 1);
+    if (o->shape) strcpy(o->shape, s);
 }
 static JSValue qjs_opaque_new(JSContext *ctx) { return qjs_opq_make(ctx, 0, NULL, qjs_t_opaque()); }
 static JSValue qjs_synth_new(JSContext *ctx) { return qjs_opq_make(ctx, 1, NULL, NULL); }
@@ -1663,6 +1675,22 @@ static JSValue js_fe_url_shape(JSContext *ctx, JSValueConst this_val,
     JSValue r = (lits > 0 && b.p) ? JS_NewString(ctx, b.p) : JS_UNDEFINED;
     qjs_sb_free(&b);
     return r;
+}
+/* API-learning body-field recovery. `JSON.stringify({k:opaque, n:7})` must
+   return an INFECTIOUS opaque (taint term preserved for @S/@Z — making it a
+   concrete string broke every security finding), which collapses the body to
+   {kind:opaque} in hostedge bodyShape, losing the literal field KEYS + values
+   that ARE in the bundle. JS_JSONStringify stashes the already-rendered
+   concrete-keyed JSON ("{\"k\":\"[object Object]\",\"n\":7}") onto the opaque's
+   `shape` (additive — value/term unchanged); bodyShape reads it here to recover
+   the field structure ("[object Object]" marks the opaque-valued fields).
+   Undefined for a bare/unary opaque (no nested object was stringified). */
+static JSValue js_opaque_shape(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv) {
+    if (argc < 1) return JS_UNDEFINED;
+    qjs_opq *o = qjs_opq_of(argv[0]);
+    if (o && o->shape) return JS_NewString(ctx, o->shape);
+    return JS_UNDEFINED;
 }
 /* Parallel to qjs_sb_url0 — same hole order. Each opaque URL hole emits a JSON
    {name,line,col} where line/col is the generated bundle position where the
@@ -54056,12 +54084,19 @@ JSValue JS_JSONStringify(JSContext *ctx, JSValueConst obj,
     ret = string_buffer_end(jsc->b);
     /* A nested opaque field was seen — the concrete string is discarded
        and the result becomes an infectious opaque carrying json(<leaf>)
-       (ownership of seen_term transfers into the CALL term). */
+       (ownership of seen_term transfers into the CALL term). The rendered
+       string IS the body's field structure (literal keys + literal values +
+       "[object Object]" markers for the opaque-valued fields); capture it onto
+       the opaque as an additive API-learning shape (security value/term
+       unchanged) so bodyShape can recover the body field keys the
+       infectious-opaque return would otherwise collapse to {kind:opaque}. */
     if (jsc->seen_term) {
+        const char *cstr = JS_ToCString(ctx, ret);   /* the rendered concrete-keyed JSON */
         JS_FreeValue(ctx, ret);
         ret = qjs_opq_make(ctx, jsc->seen_flavor, jsc->seen_label,
                            qjs_t_call("json", jsc->seen_term, NULL));
         jsc->seen_term = NULL;
+        if (cstr) { qjs_opq_set_shape(ret, cstr); JS_FreeCString(ctx, cstr); }
     }
     goto done;
 
@@ -61104,6 +61139,7 @@ static const JSCFunctionListEntry js_global_funcs[] = {
     JS_CFUNC_DEF("__feTerm", 1, js_fe_term ),
     JS_CFUNC_DEF("__feUrlShape", 1, js_fe_url_shape ),
     JS_CFUNC_DEF("__feUrlHoles", 1, js_fe_url_holes ),
+    JS_CFUNC_DEF("__opaqueShape", 1, js_opaque_shape ),
     JS_CFUNC_DEF("__fePC", 0, js_fe_pc ),
     JS_CFUNC_DEF("__feSec", 2, js_fe_sec ),
     JS_CFUNC_DEF("parseInt", 2, js_parseInt ),
