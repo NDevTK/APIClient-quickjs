@@ -10173,6 +10173,27 @@ static JSValue JS_ThrowStackOverflow(JSContext *ctx)
                fn ? fn : "?", _recb->line_num, _recb->col_num, _depth);
         fflush(stdout);
         if (fn) JS_FreeCString(ctx, fn);
+    } else {
+        /* No JS function repeats deeply in the live chain ⇒ this overflow is
+           NOT a JS-bytecode recursion: it's either a C-side recursion (JSON/
+           structuredClone/DOM traversal over a cyclic/opaque structure hitting
+           the C-function stack check at the same depth) or genuinely-deep
+           non-recursive nesting. Surface the LEAF JS frame + the chain depth so
+           the C-recursion class is diagnosable too, not silently invisible
+           (observed: github driven~38,271 threw overflow with NO
+           stack_overflow_recursion record — this is that gap). */
+        int _chain = 0; JSFunctionBytecode *_leaf = NULL;
+        for (JSStackFrame *_a = sf0; _a; _a = _a->prev_frame) {
+            _chain++;
+            if (!_leaf) { JSFunctionBytecode *_lb = JS_GetFunctionBytecode(_a->cur_func); if (_lb && _lb->filename) _leaf = _lb; }
+        }
+        if (_leaf) {
+            const char *fn = JS_AtomToCString(ctx, _leaf->filename);
+            printf("@WHY {\"phase\":\"stack_overflow_nonrecursive\",\"leafFile\":\"%s\",\"leafLine\":%d,\"leafCol\":%d,\"jsChainDepth\":%d}\n",
+                   fn ? fn : "?", _leaf->line_num, _leaf->col_num, _chain);
+            fflush(stdout);
+            if (fn) JS_FreeCString(ctx, fn);
+        }
     }
     return JS_ThrowRangeError(ctx, "Maximum call stack size exceeded");
 }
