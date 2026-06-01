@@ -559,7 +559,7 @@
     Object.defineProperty(this, "response", { get: function () { return OPQ("XHR.response"); }, configurable: true });
     Object.defineProperty(this, "responseXML", { get: function () { return OPQ("XHR.responseXML"); }, configurable: true });
   }
-  XHR.prototype.open = function (m, u) { H("XMLHttpRequest.open", [String(m || "GET"), urlOf(u), urlHolesOf(u)]); this._m = m; this._u = u; this.responseURL = String(u); this.readyState = 1; this._fire("readystatechange"); };
+  XHR.prototype.open = function (m, u) { H("XMLHttpRequest.open", [String(m || "GET").toUpperCase(), urlOf(u), urlHolesOf(u)]); this._m = m; this._u = u; this.responseURL = String(u); this.readyState = 1; this._fire("readystatechange"); };
   XHR.prototype.setRequestHeader = function (k, v) { this._h[String(k)] = ISOPQANY(v) ? { kind: "opaque" } : { kind: "literal", value: String(v) }; };
   XHR.prototype.getAllResponseHeaders = function () { return OPQ("XHR.responseHeaders"); };
   XHR.prototype.getResponseHeader = function () { return OPQ("XHR.responseHeader"); };
