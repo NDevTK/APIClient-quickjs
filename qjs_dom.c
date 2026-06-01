@@ -451,6 +451,24 @@ static JSValue s_className(JSContext *ctx, JSValueConst t, JSValueConst v) {
         (const lxb_char_t *)"class", 5, (const lxb_char_t *)s, l); JS_FreeCString(ctx, s); }
     return JS_UNDEFINED;
 }
+/* Reflected global string attributes (HTMLElement.lang/dir/title, …). Same
+   shape as g_id/g_className but magic-indexed by a name table so one pair of
+   functions covers every plain string-reflected attribute. `documentElement.lang`
+   feeds many bundles' locale (MS Learn `b.data.userLocale` → the content-nav
+   URL); without this it read undefined and the URL became `/undefined/…`. */
+static const char *const dom_refl_attrs[] = { "lang", "dir", "title" };
+static JSValue g_refl(JSContext *ctx, JSValueConst t, int magic) {
+    lxb_dom_element_t *el = el_of(self_node(t)); if (!el) return JS_NewString(ctx, "");
+    const char *name = dom_refl_attrs[magic]; size_t l = 0;
+    const lxb_char_t *v = lxb_dom_element_get_attribute(el, (const lxb_char_t *)name, strlen(name), &l);
+    return v ? JS_NewStringLen(ctx, (const char *)v, l) : JS_NewString(ctx, "");
+}
+static JSValue s_refl(JSContext *ctx, JSValueConst t, JSValueConst v, int magic) {
+    lxb_dom_element_t *el = el_of(self_node(t)); if (!el) return JS_UNDEFINED;
+    const char *name = dom_refl_attrs[magic]; size_t l; const char *s = JS_ToCStringLen(ctx, &l, v);
+    if (s) { lxb_dom_element_set_attribute(el, (const lxb_char_t *)name, strlen(name), (const lxb_char_t *)s, l); JS_FreeCString(ctx, s); }
+    return JS_UNDEFINED;
+}
 static JSValue g_innerHTML(JSContext *ctx, JSValueConst t) {
     lxb_dom_node_t *n = self_node(t); return n ? ser_children(ctx, n) : JS_NewString(ctx, "");
 }
@@ -818,6 +836,9 @@ static const JSCFunctionListEntry dom_proto[] = {
     JS_CGETSET_DEF("content", g_content, NULL),
     JS_CGETSET_DEF("id", g_id, s_id),
     JS_CGETSET_DEF("className", g_className, s_className),
+    JS_CGETSET_MAGIC_DEF("lang", g_refl, s_refl, 0),
+    JS_CGETSET_MAGIC_DEF("dir", g_refl, s_refl, 1),
+    JS_CGETSET_MAGIC_DEF("title", g_refl, s_refl, 2),
     JS_CGETSET_DEF("innerHTML", g_innerHTML, s_innerHTML),
     JS_CGETSET_DEF("outerHTML", g_outerHTML, s_outerHTML),
     JS_CGETSET_DEF("textContent", g_textContent, s_textContent),
