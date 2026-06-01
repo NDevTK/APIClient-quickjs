@@ -2163,6 +2163,12 @@ typedef struct JSStackFrame {
        Distinct from two SEQUENTIAL calls (no ancestor loop ⇒ inv-keyed, so the
        _hof phantom-init guard stays correct). */
     unsigned int qjs_looped;
+    /* Forced-exec spin diagnosis: bytecode offset of the most-recent backward
+       goto TARGET in this frame (the innermost active loop's top). The spin
+       probe reports it so an OWN-FRAME non-terminating loop names its actual
+       loop back-edge, not just the leaf OP_if the probe happened to sample
+       (the gap that left AppMeasurement.js:387's spin un-located). -1 = none. */
+    int qjs_loop_pc;
     /* only used in generators. Current stack pointer value. NULL if
        the function is running. */
     JSValue *cur_sp;
@@ -8197,7 +8203,7 @@ static JSValue js_call_c_function_data(JSContext *ctx, JSValueConst func_obj,
     sf->is_strict_mode = false;
     sf->cur_func = unsafe_unconst(func_obj);
     sf->arg_count = argc;
-    sf->qjs_inv = 0; sf->qjs_looped = 0;   /* native/bound frame: no bytecode, but a descendant's _inloop reads qjs_looped up the chain — leaving it uninitialised made keying (and thus the learned endpoint set) nondeterministic build-to-build */
+    sf->qjs_inv = 0; sf->qjs_looped = 0; sf->qjs_loop_pc = -1;   /* native/bound frame: no bytecode, but a descendant's _inloop reads qjs_looped up the chain — leaving it uninitialised made keying (and thus the learned endpoint set) nondeterministic build-to-build */
     ret = s->func(ctx, this_val, argc, arg_buf, s->magic, vc(s->data));
     rt->current_stack_frame = sf->prev_frame;
     return ret;
@@ -8323,7 +8329,7 @@ static JSValue js_call_c_closure(JSContext *ctx, JSValueConst func_obj,
     sf->is_strict_mode = false;
     sf->cur_func = unsafe_unconst(func_obj);
     sf->arg_count = argc;
-    sf->qjs_inv = 0; sf->qjs_looped = 0;   /* native/bound frame: no bytecode, but a descendant's _inloop reads qjs_looped up the chain — leaving it uninitialised made keying (and thus the learned endpoint set) nondeterministic build-to-build */
+    sf->qjs_inv = 0; sf->qjs_looped = 0; sf->qjs_loop_pc = -1;   /* native/bound frame: no bytecode, but a descendant's _inloop reads qjs_looped up the chain — leaving it uninitialised made keying (and thus the learned endpoint set) nondeterministic build-to-build */
     ret = s->func(ctx, this_val, argc, arg_buf, s->magic, s->opaque);
     rt->current_stack_frame = sf->prev_frame;
 
@@ -10337,9 +10343,9 @@ static void qjs_spin_probe(JSContext *ctx, JSStackFrame *sf, JSFunctionBytecode 
     /* Looping-ancestor source location (the loop owner, not the shim leaf). */
     const char *lpfn = (_lpb && _lpb->filename) ? JS_AtomToCString(ctx, _lpb->filename) : NULL;
     long _lppco = (_lpb && _lpb->byte_code_buf && _lppc) ? (long)(_lppc - _lpb->byte_code_buf) : -1;
-    printf("@WHY {\"phase\":\"spin_nonterminating\",\"file\":\"%s\",\"line\":%d,\"col\":%d,\"pc\":%ld,\"inv\":%u,\"ownlooped\":%u,\"inloop\":%d,\"recur\":%d,\"hk_seen\":%d,\"loopFile\":\"%s\",\"loopLine\":%d,\"loopCol\":%d,\"loopPc\":%ld}\n",
+    printf("@WHY {\"phase\":\"spin_nonterminating\",\"file\":\"%s\",\"line\":%d,\"col\":%d,\"pc\":%ld,\"inv\":%u,\"ownlooped\":%u,\"inloop\":%d,\"recur\":%d,\"hk_seen\":%d,\"loopFile\":\"%s\",\"loopLine\":%d,\"loopCol\":%d,\"loopPc\":%ld,\"ownLoopBackPc\":%d}\n",
            fn ? fn : "?", cur->line_num, cur->col_num, pco, sf->qjs_inv, sf->qjs_looped, _hin, _hrec, _hseen,
-           lpfn ? lpfn : "?", _lpb ? _lpb->line_num : 0, _lpb ? _lpb->col_num : 0, _lppco);
+           lpfn ? lpfn : "?", _lpb ? _lpb->line_num : 0, _lpb ? _lpb->col_num : 0, _lppco, sf->qjs_loop_pc);
     fflush(stdout);
     if (fn) JS_FreeCString(ctx, fn);
     if (lpfn) JS_FreeCString(ctx, lpfn);
@@ -19641,7 +19647,7 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
     sf->is_strict_mode = false;
     sf->cur_func = unsafe_unconst(func_obj);
     sf->arg_count = argc;
-    sf->qjs_inv = 0; sf->qjs_looped = 0;   /* native/bound frame: no bytecode, but a descendant's _inloop reads qjs_looped up the chain — leaving it uninitialised made keying (and thus the learned endpoint set) nondeterministic build-to-build */
+    sf->qjs_inv = 0; sf->qjs_looped = 0; sf->qjs_loop_pc = -1;   /* native/bound frame: no bytecode, but a descendant's _inloop reads qjs_looped up the chain — leaving it uninitialised made keying (and thus the learned endpoint set) nondeterministic build-to-build */
     arg_buf = argv;
 
     if (unlikely(argc < arg_count)) {
@@ -19959,6 +19965,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     if (!(flags & JS_CALL_FLAG_GENERATOR)) {
         sf->qjs_inv = ++qjs_inv_ctr;   /* per-invocation id for the loop-revisit key (see JSStackFrame) */
         sf->qjs_looped = 0;            /* set on this frame's first backward branch (loop back-edge) */
+        sf->qjs_loop_pc = -1;          /* loop back-edge target offset for spin diagnosis */
     }
     for(;;) {
         int call_argc;
@@ -20983,17 +20990,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         CASE(OP_goto):
-            { int32_t _o = (int32_t)get_u32(pc); if (_o < 0) sf->qjs_looped = 1; pc += _o; }
+            { int32_t _o = (int32_t)get_u32(pc); if (_o < 0) sf->qjs_looped = 1; pc += _o; if (_o < 0) sf->qjs_loop_pc = (int)(pc - b->byte_code_buf); }
             if (unlikely(js_poll_interrupts(ctx)))
                 goto exception;
             BREAK;
         CASE(OP_goto16):
-            { int16_t _o = (int16_t)get_u16(pc); if (_o < 0) sf->qjs_looped = 1; pc += _o; }
+            { int16_t _o = (int16_t)get_u16(pc); if (_o < 0) sf->qjs_looped = 1; pc += _o; if (_o < 0) sf->qjs_loop_pc = (int)(pc - b->byte_code_buf); }
             if (unlikely(js_poll_interrupts(ctx)))
                 goto exception;
             BREAK;
         CASE(OP_goto8):
-            { int8_t _o = (int8_t)pc[0]; if (_o < 0) sf->qjs_looped = 1; pc += _o; }
+            { int8_t _o = (int8_t)pc[0]; if (_o < 0) sf->qjs_looped = 1; pc += _o; if (_o < 0) sf->qjs_loop_pc = (int)(pc - b->byte_code_buf); }
             if (unlikely(js_poll_interrupts(ctx)))
                 goto exception;
             BREAK;
@@ -23598,7 +23605,7 @@ static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s,
     if (!sf->arg_buf)
         return -1;
     sf->cur_func = js_dup(func_obj);
-    sf->qjs_inv = ++qjs_inv_ctr; sf->qjs_looped = 0;   /* async/generator frames run bytecode — same loop-revisit-key init as the sync bytecode path */
+    sf->qjs_inv = ++qjs_inv_ctr; sf->qjs_looped = 0; sf->qjs_loop_pc = -1;   /* async/generator frames run bytecode — same loop-revisit-key init as the sync bytecode path */
     s->this_val = js_dup(this_obj);
     s->argc = argc;
     sf->arg_count = arg_buf_len;
