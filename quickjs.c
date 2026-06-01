@@ -60227,12 +60227,22 @@ int qjs_deep_step_c(JSContext *ctx, int maxN, int fromCursor) {
         if (qjs_deep_sink) { js_free(ctx, qjs_deep_sink); qjs_deep_sink = NULL; }
         qjs_deep_net = js_malloc(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1));
         qjs_deep_sink = js_malloc(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1));
+        int _head_net = 0;
         if (qjs_deep_net && qjs_deep_sink) {
             for (int i = 0; i < qjs_deep_rb_n; i++) {
                 qjs_deep_net[i] = (uint8_t)qjs_fn_reaches_net(qjs_deep_rb[i]);
                 qjs_deep_sink[i] = (uint8_t)qjs_fn_reaches_sink(qjs_deep_rb[i]);
+                if (qjs_deep_net[i]) _head_net++;
             }
         }
+        /* HEAD size = count of net-reaching (endpoint) orphans. The residue is
+           relevance-sorted net-first, so these are the high-value HEAD the
+           continuous-session scheduler drives before any page's completeness
+           TAIL (project_continuous_session_scheduler_design). Emitted once at
+           grind start so the worker knows the head/tail boundary for
+           head-first interleaving across open pages. Observability only — the
+           live-pick already drives net-reaching orphans first regardless. */
+        printf("@DHEAD %d\n", _head_net); fflush(stdout);
         qjs_dd_load(ctx);
         /* Stamp the persisted driven-set onto each residue bytecode's
            b->qjs_driven flag so the runtime check is O(1) instead of a linear
