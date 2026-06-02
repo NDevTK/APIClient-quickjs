@@ -60189,6 +60189,41 @@ static uint8_t *qjs_deep_sink = NULL;   /* 1 = reaches a security sink */
 static int qjs_dnf_threw = 0, qjs_dnf_ret = 0;
 static int qjs_deep_rb_n = 0, qjs_deep_cursor = 0;
 static JSRuntime *qjs_deep_cache_rt = NULL;
+/* Spin-DEFER scheduling (pause-and-resume; NEVER a cap). The grind installs an
+   interrupt handler that YIELDS an orphan drive making NO forced-progress
+   (qjs_fe_seen_n flat — a CONCRETE infinite loop the opaque-loop fixpoint can't
+   key, e.g. MathJax m()'s for(;t.length>0;) under a cold-empty worklist) for a
+   scheduling QUANTUM, so the grind DEFERS it and drives other orphans first —
+   one of which may establish the module/heap state (a producer that populates
+   the worklist) that lets the deferred orphan TERMINATE on re-drive (the loop
+   re-reads the now-populated state → l.pop() opaque → loop opaque → existing
+   fixpoint). The quantum is a fair-scheduling slice, NOT a work bound: the
+   orphan completes across re-drives, or is abandoned ONLY at the
+   no-global-progress fixpoint (a deferred orphan re-spins while NO other orphan
+   completed since its last defer ⇒ provably unhelpable ⇒ mark driven). Monotone
+   (g_grind_completions only rises), so it terminates without a magic limit. */
+#define QJS_DEFER_QUANTUM 64          /* no-forced-progress interrupt polls (×10000 ops) before yielding a drive */
+static int g_grind_drive_active = 0;  /* 1 only while an orphan JS_Call is in flight — gates the handler */
+static int g_defer_fired = 0;         /* the handler yielded the current drive */
+static unsigned g_grind_completions = 0;   /* orphans that completed (no defer) this grind — the progress fixpoint */
+static int g_progress_seen = 0;       /* qjs_fe_seen_n at last forced-progress */
+static int g_noprog_polls = 0;        /* interrupt polls since last forced-progress */
+static uint8_t *qjs_deep_deferred = NULL;     /* parallel to qjs_deep_rb: 1 = spin-deferred (skip until non-deferred drained, then re-attempt) */
+static unsigned *qjs_deep_defer_comp = NULL;  /* parallel: g_grind_completions snapshot at last defer (no-progress fixpoint) */
+/* The deep-grind interrupt handler (op-counted via js_poll_interrupts, so it
+   fires at every OP_if/back-edge — catches CONCRETE spins the opaque-only spin
+   probe misses). Returns 1 to interrupt (throw) the spinning drive so the grind
+   can yield/defer it. Forced-progress = qjs_fe_seen_n grew (a new forced state
+   explored); a spinning concrete loop revisits the SAME state so it stays flat,
+   while a legitimately-long orphan keeps exploring → it is NOT false-deferred. */
+static int qjs_grind_interrupt(JSRuntime *rt, void *opaque) {
+    (void)rt; (void)opaque;
+    if (!g_grind_drive_active) return 0;                 /* only yield orphan drives, never boot/BFS */
+    if (qjs_fe_seen_n != g_progress_seen) { g_progress_seen = qjs_fe_seen_n; g_noprog_polls = 0; return 0; }
+    if (++g_noprog_polls < QJS_DEFER_QUANTUM) return 0;  /* still within the fair slice */
+    g_defer_fired = 1; g_noprog_polls = 0;
+    return 1;                                            /* yield: throws → unwinds the drive → grind defers */
+}
 static void qjs_dd_free(JSContext *ctx);   /* fwd: driven-set + ids reset (defined below) */
 /* Capture a REAL closure instance the moment a driven factory orphan
    instantiates it (called from js_closure2 during an active grind), so a
@@ -60224,6 +60259,8 @@ void qjs_deep_free(JSContext *ctx) {
     if (qjs_deep_rb) { js_free(ctx, qjs_deep_rb); qjs_deep_rb = NULL; }
     if (qjs_deep_net) { js_free(ctx, qjs_deep_net); qjs_deep_net = NULL; }
     if (qjs_deep_sink) { js_free(ctx, qjs_deep_sink); qjs_deep_sink = NULL; }
+    if (qjs_deep_deferred) { js_free(ctx, qjs_deep_deferred); qjs_deep_deferred = NULL; }
+    if (qjs_deep_defer_comp) { js_free(ctx, qjs_deep_defer_comp); qjs_deep_defer_comp = NULL; }
     qjs_deep_rb_n = 0; qjs_deep_cursor = 0; qjs_deep_cache_rt = NULL;
     qjs_dnf_threw = 0; qjs_dnf_ret = 0;
     qjs_dd_free(ctx);
@@ -60469,8 +60506,14 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
            runs, so walking them per comparison was the O(N²·bytecode) cost. */
         if (qjs_deep_net) { js_free(ctx, qjs_deep_net); qjs_deep_net = NULL; }
         if (qjs_deep_sink) { js_free(ctx, qjs_deep_sink); qjs_deep_sink = NULL; }
+        if (qjs_deep_deferred) { js_free(ctx, qjs_deep_deferred); qjs_deep_deferred = NULL; }
+        if (qjs_deep_defer_comp) { js_free(ctx, qjs_deep_defer_comp); qjs_deep_defer_comp = NULL; }
         qjs_deep_net = js_malloc(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1));
         qjs_deep_sink = js_malloc(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1));
+        qjs_deep_deferred = js_mallocz(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1));   /* 0 = not spin-deferred */
+        qjs_deep_defer_comp = js_malloc(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1) * sizeof(unsigned));
+        if (qjs_deep_defer_comp) for (int _i = 0; _i < qjs_deep_rb_n; _i++) qjs_deep_defer_comp[_i] = (unsigned)-1;   /* UINT_MAX sentinel = never deferred */
+        g_grind_completions = 0;   /* per-grind progress counter (the defer fixpoint) */
         int _head_net = 0;
         if (qjs_deep_net && qjs_deep_sink) {
             for (int i = 0; i < qjs_deep_rb_n; i++) {
@@ -60556,6 +60599,8 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
        bytecode-walking comparator only if the bit arrays failed to alloc
        (OOM) — correctness preserved either way. */
     int _have_bits = (qjs_deep_net != NULL && qjs_deep_sink != NULL);
+    unsigned _last_clear_comp = (unsigned)-1;   /* g_grind_completions at the last deferred-set re-attempt (no-progress fixpoint) */
+    JS_SetInterruptHandler(rt, qjs_grind_interrupt, NULL);   /* spin-defer yield (gated by g_grind_drive_active, off during boot/BFS); runtime-free clears it */
     while (driven < maxN) {
         int _ix = -1;
         JSFunctionBytecode *b = NULL;
@@ -60563,6 +60608,7 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
             JSFunctionBytecode *cb = qjs_deep_rb[_ci];
             if (!cb || !cb->byte_code_buf) continue;
             if (cb->qjs_driven) continue;   /* O(1) skip via the flag */
+            if (qjs_deep_deferred && qjs_deep_deferred[_ci]) continue;   /* spin-deferred: skip until non-deferred drained (re-attempted below) */
             if (cb->qjs_h_fired) {
                 cb->qjs_driven = 1;
                 uint64_t fid = qjs_deep_ids ? qjs_deep_ids[_ci] : 0;
@@ -60579,7 +60625,36 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
                 better = qjs_priority_live_orphan_better(cb, b);
             if (better) { b = cb; _ix = _ci; }
         }
-        if (b == NULL) break;   /* residue exhausted */
+        if (b == NULL) {
+            /* Non-deferred orphans exhausted. Re-attempt the spin-deferred set:
+               drives since may have established their state (a producer populated
+               a worklist) so they now terminate on re-drive. If a re-attempt
+               cycle COMPLETED something (g_grind_completions advanced since the
+               last clear), clear the skip markers and give them another pass
+               (defer_comp is preserved, so the per-orphan abandon fixpoint stays
+               correct). If a cycle completed NOTHING, the remaining deferred set
+               is provably unhelpable (no-global-progress fixpoint) → abandon them
+               (mark driven) so the grind reaches rem==0. */
+            int _any_def = 0;
+            if (qjs_deep_deferred)
+                for (int _di = 0; _di < qjs_deep_rb_n; _di++)
+                    if (qjs_deep_deferred[_di] && qjs_deep_rb[_di] && !qjs_deep_rb[_di]->qjs_driven) { _any_def = 1; break; }
+            if (!_any_def) break;   /* truly exhausted */
+            if (g_grind_completions != _last_clear_comp) {
+                _last_clear_comp = g_grind_completions;
+                for (int _di = 0; _di < qjs_deep_rb_n; _di++) qjs_deep_deferred[_di] = 0;   /* clear skip markers; defer_comp preserved */
+                continue;
+            }
+            for (int _di = 0; _di < qjs_deep_rb_n; _di++) {   /* unhelpable → abandon */
+                if (qjs_deep_deferred[_di] && qjs_deep_rb[_di] && !qjs_deep_rb[_di]->qjs_driven) {
+                    qjs_deep_rb[_di]->qjs_driven = 1;
+                    uint64_t _fd = qjs_deep_ids ? qjs_deep_ids[_di] : 0;
+                    if (_fd) printf("@DD %llx\n", (unsigned long long)_fd);
+                }
+            }
+            fflush(stdout);
+            break;
+        }
         /* HEAD-ONLY stop: the live-pick orders net-reaching (endpoint) orphans
            FIRST, so the first pick whose net-bit is 0 means the net HEAD is
            fully driven — return so the worker can rotate to another open page's
@@ -60647,6 +60722,7 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
            captured with the real instance) instead of a wasted throw. */
         int _is_cls_ctor = 0;
         for (int cp = 0; cp < len && cp < 8; ) { int cop = b->byte_code_buf[cp]; if (cop == OP_check_ctor) { _is_cls_ctor = 1; break; } int csz = short_opcode_info(cop).size; if (csz < 1) break; cp += csz; }
+        g_grind_drive_active = 1; g_defer_fired = 0; g_noprog_polls = 0; g_progress_seen = qjs_fe_seen_n;   /* arm spin-defer for BOTH paths (targeted path's per-site catch cuts a spinning host site) */
         if (!has_host_in_b) {
             JSValue *args3 = nargs > 0 ? js_mallocz(ctx, nargs * sizeof(JSValue)) : NULL;
             if (nargs > 0 && !args3) { JS_FreeValue(ctx, fo); continue; }
@@ -60655,6 +60731,7 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
             JSValue this_opq2 = qjs_opq_make(ctx, 1, "deep-drive-this", qjs_t_opaque());
             qjs_dir_active = 0; qjs_dir_b = NULL; qjs_dir_target = -1;   /* no host site to steer to */
             qjs_fe_seen_reset();   /* fresh loop-revisit bound per drive (one execution unit) */
+            g_grind_drive_active = 1; g_defer_fired = 0; g_noprog_polls = 0; g_progress_seen = 0;   /* arm spin-defer for this drive (seen_n just reset to 0) */
             /* A class constructor's bytecode starts with OP_check_ctor, which
                THROWS "must be invoked with 'new'" on a plain JS_Call — so the
                body never runs, no real instance exists, and its methods/arrows
@@ -60675,17 +60752,38 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
 #endif
                 }
             }
-            if (JS_IsException(r2)) { JSValue e2 = JS_GetException(ctx); JS_FreeValue(ctx, e2); }
+            g_grind_drive_active = 0;   /* disarm: drive returned (or was yielded) */
+            int _was_exc2 = JS_IsException(r2);
+            if (_was_exc2) { JSValue e2 = JS_GetException(ctx); JS_FreeValue(ctx, e2); }
             JS_FreeValue(ctx, r2);
             JS_FreeValue(ctx, this_opq2);
             for (int ai = 0; ai < nargs; ai++) JS_FreeValue(ctx, args3[ai]);
             if (args3) js_free(ctx, args3);
             JS_FreeValue(ctx, fo);
             qjs_drop_pending_jobs(rt);
+            /* Spin-defer: the interrupt YIELDED this drive (g_defer_fired) and it
+               unwound (_was_exc2) ⇒ a no-forced-progress concrete spin. DEFER it
+               (don't mark driven) so a producer orphan can establish its module
+               state first — UNLESS the no-global-progress fixpoint fires (this
+               orphan already deferred AND no other orphan completed since ⇒
+               provably unhelpable ⇒ fall through and abandon). */
+            if (g_defer_fired && _was_exc2 && qjs_deep_defer_comp && _ix >= 0 &&
+                qjs_deep_defer_comp[_ix] != g_grind_completions) {
+                /* Progress since this orphan last deferred (defer_comp != current
+                   completions; UINT_MAX sentinel = never deferred) → DEFER. The
+                   fixpoint keys on defer_comp vs completions, NOT the deferred
+                   bit (the bit is only the phase-1 skip marker, cleared on
+                   re-attempt) — so abandon stays correct after the bit clears. */
+                qjs_deep_defer_comp[_ix] = g_grind_completions;
+                if (qjs_deep_deferred) qjs_deep_deferred[_ix] = 1;
+                g_spin_n = 0;
+                continue;   /* re-queued; skipped until non-deferred drained, then re-attempted */
+            }
             b->qjs_driven = 1;   /* mark on the bytecode for O(1) skip on next pick */
             b->qjs_driven_opaque = !_from_real;   /* opaque fallback -> eligible for one real-instance re-drive when a factory instantiates it */
             if (_id) { printf("@DD %llx\n", (unsigned long long)_id); fflush(stdout); }
-            g_spin_n = 0;   /* orphan boundary: reset the non-termination surface so a terminating deep grind never false-fires (only a segment blowing past 500k without a boundary does) */
+            g_spin_n = 0;   /* orphan boundary: reset the non-termination surface */
+            if (!(g_defer_fired && _was_exc2)) g_grind_completions++;   /* genuine completion (not an abandoned spin) → progress for the fixpoint */
             driven++;
             /* Per-orphan JSPI yield — give the host scheduler a turn to
                (a) pick a higher-priority fiber across pages via priority.js
@@ -60831,9 +60929,11 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
         /* Drop this orphan's leftover continuation jobs (post-fetch .then
            chain); the @H is already emitted. */
         qjs_drop_pending_jobs(rt);
+        g_grind_drive_active = 0;   /* disarm (targeted path: the per-site catch already cut any spinning host site) */
         b->qjs_driven = 1;   /* mark on the bytecode for O(1) skip on next pick */
         b->qjs_driven_opaque = !_from_real;   /* opaque fallback -> eligible for one real-instance re-drive when a factory instantiates it */
         if (_id) printf("@DD %llx\n", (unsigned long long)_id);   /* attempted — worker persists; next resume skips this id */
+        if (!g_defer_fired) g_grind_completions++;   /* completion progress (a cut targeted spin doesn't count) */
         driven++;
         /* Per-orphan JSPI yield — same rationale as the host-less caller
            path above: scheduler picks higher-priority fiber across pages,
@@ -60857,6 +60957,27 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
        initial residue size after a live-pick batch. The worker's deep
        loop relies on rem==0 to declare the grind done; a stale non-zero
        would force an unnecessary recycle. */
+    /* Final resolution backstop: an orphan still spin-deferred when the batch
+       ends (W4b's in-batch re-attempt was cut by the maxN boundary, and the
+       worker may stop before another batch) is ABANDONED — its in-batch
+       producers already ran, so it is provably unhelpable WITHIN reach; a
+       deferred orphan is by construction a no-forced-progress (net:0/no-value)
+       spinner, so abandoning loses no endpoint. This guarantees the grind
+       reaches rem==0 (pause-and-resume ENDS in termination-by-abandon, never an
+       infinite loop) instead of stalling forever-deferred at a batch boundary. */
+    if (qjs_deep_deferred) {
+        int _ab = 0;
+        for (int _ri = 0; _ri < qjs_deep_rb_n; _ri++) {
+            if (qjs_deep_rb[_ri] && qjs_deep_rb[_ri]->byte_code_buf &&
+                !qjs_deep_rb[_ri]->qjs_driven && qjs_deep_deferred[_ri]) {
+                qjs_deep_rb[_ri]->qjs_driven = 1;
+                uint64_t _fd = qjs_deep_ids ? qjs_deep_ids[_ri] : 0;
+                if (_fd) printf("@DD %llx\n", (unsigned long long)_fd);
+                _ab++;
+            }
+        }
+        if (_ab) fflush(stdout);
+    }
     int rem = 0;
     for (int _ri = 0; _ri < qjs_deep_rb_n; _ri++) {
         JSFunctionBytecode *cb = qjs_deep_rb[_ri];
