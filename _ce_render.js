@@ -1,11 +1,13 @@
-// Render-cycle test: a custom element whose connectedCallback fetches, but the
-// element is CREATED by an orphan function that itself reaches NO host edge
-// (createElement+appendChild only) — models React/Catalyst rendering an injected
-// element after hydration. The deep grind drives @T functions (those with a
-// host-edge get_var/get_field); a pure CE-creator has none, so it may be SKIPPED
-// → the element is never created → its connectedCallback fetch never fires.
-// If GET /api/rendered_frag is NOT learned, the render-cycle gap is confirmed:
-// the fix is to extend the driven set to CE-creating functions.
+// Render-cycle-in-deep-context gate. VERIFIED GREEN (2026-06-02, --deep): the
+// residue grind drives EVERY un-fired function (incl. no-host-edge wrapper-
+// callers), so __renderInjected IS driven (GET /api/creator_ran proves it), and
+// the DEEP-GRIND context (g_deep_ctx) drives the full createElement → setAttribute
+// → appendChild → CE-upgrade → connectedCallback → fetch chain to a CONCRETE src
+// (GET /api/rendered_frag). So the earlier "the CE-upgrade chain may not fire in
+// g_deep_ctx" hypothesis is DISPROVEN — the deep runtime's QuickJS↔Lexbor DOM is
+// wired the same as boot. A regression here = the deep ctx lost CE-upgrade or
+// connectedCallback driving. EXPECT (--deep): GET /api/creator_ran AND
+// GET /api/rendered_frag, both concrete, 0 phantoms.
 customElements.define('rnd-frag', class extends HTMLElement {
   connectedCallback() {
     if (!this.isConnected) return;
@@ -14,9 +16,9 @@ customElements.define('rnd-frag', class extends HTMLElement {
   }
 });
 function __renderInjected() {
+  fetch('/api/creator_ran');                       // proves __renderInjected was driven
   var el = document.createElement('rnd-frag');
-  el.setAttribute('src', '/api/rendered_frag');
-  document.body.appendChild(el);
+  el.setAttribute('src', '/api/rendered_frag');    // concrete src
+  document.body.appendChild(el);                   // connect → should upgrade → connectedCallback → fetch
 }
-// __renderInjected is never called at top level — only the deep grind can drive it.
 globalThis.__keepRef = __renderInjected;
