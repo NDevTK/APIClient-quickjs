@@ -57,12 +57,6 @@
   // never-dynamically-reached residue. Not a cap: the static phase is
   // complete, it just isn't redundantly repeated.
   var feSeed = (typeof __feLen === "function") ? (__feLen() === 0) : true;
-  // JAW static half: read-only bytecode scan for host-edge call sites
-  // in ALL compiled functions, incl. ones no forced path reached
-  // (unrequired modules). No execution — emits @T structural
-  // candidates only; the loop above already supplied @H values for the
-  // reached subset.
-  if (feSeed && typeof __feStaticSites === "function") { try { __feStaticSites(); } catch (e) {} }
   // JAW @T → @H promotion via forced static-function driving (J-Force
   // §3.1.3 generalised to non-global functions). Calls every bytecode
   // function containing a host-edge atom with opaque args matching its
@@ -107,5 +101,14 @@
     // run's core. The boot above (incl. this static/loader drive) marks the
     // reached set, so the stepped deep pass only drives the true residue.
   }
+  // JAW static half: read-only bytecode scan emitting @T structural
+  // candidates (file:line:col) for host-edge sites in functions NO forced
+  // path reached. Run LAST — AFTER __hostDrive and __feDriveStatic — so a
+  // function those phases reached/drove is already qjs_h_fired=1 and is
+  // SKIPPED by js_fe_static_sites (which now skips the reached subset). That
+  // leaves @T as ONLY the truly-unreached residue, with no duplicate
+  // structural endpoint (`GET ?`/`POST ?`) shadowing a concrete @H from the
+  // same function. The reached/driven subset already supplied real @H values.
+  if (feSeed && typeof __feStaticSites === "function") { try { __feStaticSites(); } catch (e) {} }
   } finally { bfsActive(0); }
 })();

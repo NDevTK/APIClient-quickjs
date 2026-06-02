@@ -59944,6 +59944,18 @@ static JSValue js_fe_static_sites(JSContext *ctx, JSValueConst this_val,
         JSFunctionBytecode *b = (JSFunctionBytecode *)gp;
         if (!b->byte_code_buf) { dbg_skipped_nobuf++; continue; }
         if (qjs_is_host_model_file(b->filename)) { dbg_skipped_host++; continue; }   /* our shim, not the page */
+        /* Skip the REACHED subset: a function whose host site already FIRED
+           (qjs_h_fired) has a concrete @H with real values — emitting a
+           location-only @T for it too makes the adapter create a DUPLICATE
+           structural endpoint (rendered `GET ?`, no url) alongside the
+           concrete one. The doc intent is exactly "the reached subset gets
+           concrete values; the unreached residue stays a structural
+           candidate" — so @T is the UNREACHED residue only. (__feDriveStatic
+           already skips reached fns via qjs_executed; this aligns the @T
+           emitter with that.) qjs_h_fired (site fired), not qjs_executed
+           (body ran), so the preheat shape — ran but site guard-skipped,
+           qjs_h_fired=0 — still emits its @T candidate. */
+        if (b->qjs_h_fired) continue;
         const uint8_t *bc = b->byte_code_buf;
         int len = b->byte_code_len, pos = 0;
         while (pos < len) {
