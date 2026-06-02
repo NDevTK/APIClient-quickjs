@@ -61441,6 +61441,50 @@ static JSValue js_fe_drive_static(JSContext *ctx, JSValueConst this_val,
         }
         targets[n_targets++] = JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, p));
     }
+    /* Receiver map: for each @T orphan that is a METHOD, find a heap instance
+       whose PROTOTYPE owns it, so the drive can run it with a REAL `this`
+       (this.cfg.endpointUrl → the literal the page set when it constructed the
+       client at boot) instead of opaque. Without this, a boot-constructed
+       config-bearing client (telemetry/analytics/API-SDK/auth `new
+       Client({endpoint:"…"})`) fires its send() with an OPAQUE url HERE, marks
+       qjs_h_fired, and is then excluded from the deep residue — so the concrete
+       url is never recovered (value-depth structurally capped). Tag each target
+       bytecode with its index in qjs_deep_ix for an O(1) lookup; safe at boot
+       because qjs_deep_capture_inst is gated on qjs_deep_rb (NULL here) and
+       verifies qjs_deep_rb[ix]==b, so any stale tag is a safe miss. */
+    JSValue *target_this = n_targets > 0 ? js_mallocz(ctx, (size_t)n_targets * sizeof(JSValue)) : NULL;
+    if (target_this) {
+        for (int i = 0; i < n_targets; i++) {
+            target_this[i] = JS_UNDEFINED;
+            JSFunctionBytecode *tb = JS_VALUE_GET_OBJ(targets[i])->u.func.function_bytecode;
+            if (tb) tb->qjs_deep_ix = i;
+        }
+        struct list_head *iel2;
+        list_for_each(iel2, &rt->gc_obj_list) {
+            JSGCObjectHeader *igp2 = list_entry(iel2, JSGCObjectHeader, link);
+            if (igp2->gc_obj_type != JS_GC_OBJ_TYPE_JS_OBJECT) continue;
+            JSObject *inst = (JSObject *)igp2;
+            if (inst->class_id != JS_CLASS_OBJECT) continue;
+            for (JSObject *po = inst->shape ? inst->shape->proto : NULL; po; po = po->shape ? po->shape->proto : NULL) {
+                JSShape *psh = po->shape;
+                if (!psh) break;
+                for (int pi = 0; pi < psh->prop_count; pi++) {
+                    JSShapeProperty *prs = &psh->prop[pi];
+                    if (prs->atom == JS_ATOM_NULL || (prs->flags & JS_PROP_TMASK)) continue;
+                    JSValue mv = po->prop[pi].u.value;
+                    if (JS_VALUE_GET_TAG(mv) != JS_TAG_OBJECT) continue;
+                    JSObject *mo = JS_VALUE_GET_OBJ(mv);
+                    if (mo->class_id != JS_CLASS_BYTECODE_FUNCTION && mo->class_id != JS_CLASS_GENERATOR_FUNCTION &&
+                        mo->class_id != JS_CLASS_ASYNC_FUNCTION && mo->class_id != JS_CLASS_ASYNC_GENERATOR_FUNCTION) continue;
+                    JSFunctionBytecode *mfb = mo->u.func.function_bytecode;
+                    if (!mfb) continue;
+                    int ix = mfb->qjs_deep_ix;
+                    if (ix >= 0 && ix < n_targets && JS_VALUE_GET_OBJ(targets[ix])->u.func.function_bytecode == mfb && JS_IsUndefined(target_this[ix]))
+                        target_this[ix] = JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, inst));
+                }
+            }
+        }
+    }
     int n_called = 0;
     for (int i = 0; i < n_targets; i++) {
         /* arg_count is the function's real ECMA-declared parameter count
@@ -61468,6 +61512,32 @@ static JSValue js_fe_drive_static(JSContext *ctx, JSValueConst this_val,
            function reachability). The within-page priority scheduler
            (deep-bypass first, shorter prefix, anti-starvation tiebreak)
            keeps the BFS productive even as the work queue grows. */
+        /* Real-receiver precursor: run the method once with its heap instance
+           as `this`, so this.X resolves to the instance's CONCRETE boot state
+           (the config-client URL literal) and a concrete @H is emitted before
+           qjs_h_fired excludes it from the deep residue. ADDITIVE — the opaque
+           drive below still runs for `this`-gated-arm reachability (the unused
+           surface). Borrows targets[i] and the array-owned `this`; a ctor
+           target just throws OP_check_ctor here (harmless, caught). */
+        if (target_this && !JS_IsUndefined(target_this[i])) {
+            /* Only worth a real-receiver drive if the method READS `this`
+               (OP_push_this, emitted once at function start) — otherwise it is
+               identical to the opaque drive, so skip the redundant concrete run.
+               Keeps the (real-code-executing) drive on the methods it can help. */
+            int _reads_this = 0;
+            for (int tp = 0; tp < len; ) { int top = b->byte_code_buf[tp]; if (top == OP_push_this) { _reads_this = 1; break; } int tsz = short_opcode_info(top).size; if (tsz < 1) break; tp += tsz; }
+            JSValue *argsR = (_reads_this && nargs > 0) ? js_mallocz(ctx, nargs * sizeof(JSValue)) : NULL;
+            if (_reads_this && (nargs <= 0 || argsR)) {
+                for (int ai = 0; ai < nargs; ai++) argsR[ai] = qjs_fe_named_arg(ctx, b, ai, "static-real-this");
+                qjs_dir_active = 0; qjs_dir_b = NULL; qjs_dir_target = -1;
+                JSValue rr = JS_Call(ctx, targets[i], target_this[i], nargs, argsR);
+                if (JS_IsException(rr)) { JSValue eR = JS_GetException(ctx); JS_FreeValue(ctx, eR); }
+                JS_FreeValue(ctx, rr);
+                for (int ai = 0; ai < nargs; ai++) JS_FreeValue(ctx, argsR[ai]);
+                if (argsR) js_free(ctx, argsR);
+                n_called++;
+            }
+        }
         if (1) {
             JSValue *args2 = nargs > 0 ? js_mallocz(ctx, nargs * sizeof(JSValue)) : NULL;
             if (nargs > 0 && !args2) goto skip_host;
@@ -61515,6 +61585,7 @@ static JSValue js_fe_drive_static(JSContext *ctx, JSValueConst this_val,
     }
     for (int i = 0; i < n_targets; i++) JS_FreeValue(ctx, targets[i]);
     js_free(ctx, targets);
+    if (target_this) { for (int i = 0; i < n_targets; i++) if (!JS_IsUndefined(target_this[i])) JS_FreeValue(ctx, target_this[i]); js_free(ctx, target_this); }
     qjs_reach_memo_free(ctx);
     return JS_NewInt32(ctx, n_called);
 }
