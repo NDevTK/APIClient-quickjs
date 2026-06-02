@@ -30,7 +30,20 @@
   // (Catalyst/Turbo/React `then`-chained fetches on github otherwise
   // wait until js_std_loop after driver.js exits — too late).
   var pump = (typeof __hostMicrotaskDrain === "function") ? __hostMicrotaskDrain : function () { return 0; };
+  // Spin-defer the BFS drive (the analogue of the deep grind's defer): a
+  // force-invoked global that hits a CONCRETE spin — a cold-state loop like
+  // MathJax's `for(;t.length>0;)` over an empty worklist, which the opaque
+  // loop-revisit fixpoint can't key and the deep-grind's seen_n-flat signal
+  // is gated off for here — would otherwise hang the entire analysis (the
+  // seed schedule never returns; runs:1, no endpoints). __feBfsActive(1)
+  // arms a same-back-edge spin signal; the interrupt throws out of the
+  // spinning global into __hostDrive's per-global catch, which skips it and
+  // continues. Brackets BOTH the __hostDrive fixpoint and the @T static
+  // drive below. Pause-and-defer, never a cap.
+  var bfsActive = (typeof __feBfsActive === "function") ? __feBfsActive : function () {};
   var n = -1, m = ran();
+  bfsActive(1);
+  try {
   while (m !== n) { n = m; drive(); flush(); pump(); m = ran(); }
   // The JAW static half (site scan + @T→@H drive) is SCHEDULE-INDEPENDENT:
   // it enumerates the whole compiled-function set and drives the unreached
@@ -94,4 +107,5 @@
     // run's core. The boot above (incl. this static/loader drive) marks the
     // reached set, so the stepped deep pass only drives the true residue.
   }
+  } finally { bfsActive(0); }
 })();

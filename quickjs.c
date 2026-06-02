@@ -60208,6 +60208,21 @@ static int g_defer_fired = 0;         /* the handler yielded the current drive *
 static unsigned g_grind_completions = 0;   /* orphans that completed (no defer) this grind — the progress fixpoint */
 static int g_progress_seen = 0;       /* qjs_fe_seen_n at last forced-progress */
 static int g_noprog_polls = 0;        /* interrupt polls since last forced-progress */
+/* BFS-driver spin defense (distinct from the deep grind). The deep grind's
+   seen_n-flat signal CANNOT be reused for the BFS __hostDrive: that loop
+   force-invokes many handlers, and legit concrete handler work keeps seen_n
+   flat too, so seen_n-flat would false-cut real work (why the deep-grind
+   handler is gated `never boot/BFS`). The BFS instead uses a SPIN-SPECIFIC
+   signal: a tight concrete spin hammers the SAME back-edge (cur_pc) with
+   seen_n flat (an opaque loop grows seen_n and the loop-revisit fixpoint
+   bounds it; legit BFS progress moves to a different back-edge/handler, so
+   cur_pc changes). The throw unwinds to __hostDrive's per-invocation catch,
+   which skips the spinning global and continues the BFS — the same
+   pause-and-defer principle as the deep grind, never a cap. */
+static int g_bfs_drive_active = 0;    /* 1 while the BFS __hostDrive loop is driving */
+static uint8_t *g_bfs_last_pc = NULL; /* back-edge pc at last poll (spin = same pc) */
+static int g_bfs_last_seen = 0;       /* qjs_fe_seen_n at last poll (spin = flat) */
+static int g_bfs_noprog = 0;          /* consecutive same-pc + flat-seen polls */
 static uint8_t *qjs_deep_deferred = NULL;     /* parallel to qjs_deep_rb: 1 = spin-deferred (skip until non-deferred drained, then re-attempt) */
 static unsigned *qjs_deep_defer_comp = NULL;  /* parallel: g_grind_completions snapshot at last defer (no-progress fixpoint) */
 /* The deep-grind interrupt handler (op-counted via js_poll_interrupts, so it
@@ -60217,12 +60232,34 @@ static unsigned *qjs_deep_defer_comp = NULL;  /* parallel: g_grind_completions s
    explored); a spinning concrete loop revisits the SAME state so it stays flat,
    while a legitimately-long orphan keeps exploring → it is NOT false-deferred. */
 static int qjs_grind_interrupt(JSRuntime *rt, void *opaque) {
-    (void)rt; (void)opaque;
-    if (!g_grind_drive_active) return 0;                 /* only yield orphan drives, never boot/BFS */
-    if (qjs_fe_seen_n != g_progress_seen) { g_progress_seen = qjs_fe_seen_n; g_noprog_polls = 0; return 0; }
-    if (++g_noprog_polls < QJS_DEFER_QUANTUM) return 0;  /* still within the fair slice */
-    g_defer_fired = 1; g_noprog_polls = 0;
-    return 1;                                            /* yield: throws → unwinds the drive → grind defers */
+    (void)opaque;
+    if (g_grind_drive_active) {                          /* deep grind: seen_n-flat = spin (orphans fork) */
+        if (qjs_fe_seen_n != g_progress_seen) { g_progress_seen = qjs_fe_seen_n; g_noprog_polls = 0; return 0; }
+        if (++g_noprog_polls < QJS_DEFER_QUANTUM) return 0;  /* still within the fair slice */
+        g_defer_fired = 1; g_noprog_polls = 0;
+        return 1;                                        /* yield: throws → unwinds the drive → grind defers */
+    }
+    if (g_bfs_drive_active) {                            /* BFS drive: same-back-edge + flat-seen = concrete spin */
+        JSStackFrame *sf = rt->current_stack_frame;
+        uint8_t *pc = sf ? sf->cur_pc : NULL;
+        if (pc == g_bfs_last_pc && qjs_fe_seen_n == g_bfs_last_seen) {
+            if (++g_bfs_noprog >= QJS_DEFER_QUANTUM) { g_bfs_noprog = 0; return 1; }  /* throw → __hostDrive's per-global catch skips it */
+        } else {                                         /* moved to a new back-edge OR forked = real progress */
+            g_bfs_last_pc = pc; g_bfs_last_seen = qjs_fe_seen_n; g_bfs_noprog = 0;
+        }
+        return 0;
+    }
+    return 0;                                            /* boot / static-site scan: never interrupt */
+}
+/* driver.js brackets its __hostDrive fixpoint with __feBfsActive(1)/(0) so a
+   concrete spin in a force-invoked global is deferred (skipped) instead of
+   hanging the whole BFS — the BFS analogue of the deep grind's defer. Reset
+   the spin tracker on each arm/disarm so a prior drive's pc can't pre-trip it. */
+static JSValue js_fe_bfs_active(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv) {
+    g_bfs_drive_active = (argc > 0 && JS_ToBool(ctx, argv[0]));
+    g_bfs_last_pc = NULL; g_bfs_last_seen = qjs_fe_seen_n; g_bfs_noprog = 0;
+    return JS_UNDEFINED;
 }
 static void qjs_dd_free(JSContext *ctx);   /* fwd: driven-set + ids reset (defined below) */
 /* Capture a REAL closure instance the moment a driven factory orphan
@@ -61251,6 +61288,7 @@ static const JSCFunctionListEntry js_global_funcs[] = {
     JS_CFUNC_DEF("__isOpaque", 1, js_is_opaque ),
     JS_CFUNC_DEF("__isOpaqueAny", 1, js_is_opaque_any ),
     JS_CFUNC_DEF("__feMute", 1, js_fe_mute ),
+    JS_CFUNC_DEF("__feBfsActive", 1, js_fe_bfs_active ),
     JS_CFUNC_DEF("__fePhiMute", 1, js_fe_phi_mute ),
     JS_CFUNC_DEF("__feCursor", 0, js_fe_cursor ),
     JS_CFUNC_DEF("__feLen", 0, js_fe_len ),
