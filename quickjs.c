@@ -59555,8 +59555,15 @@ static int qjs_sink_n = 0;
    always /b.js (/b.bc); these names are fixed by the native harness and by
    ast-thread.js (/h.js shim, /d.js driver). Interned once for O(1) atom
    compare in the per-function GC walk. */
-static const char *QJS_HOSTMODEL_NM[] = { "<qjs-dom-prelude>", "hostedge.js", "/h.js", "hostedge.gen.js", "driver.js", "/d.js", NULL };
-static JSAtom qjs_hostmodel_atoms[8];
+/* Infrastructure (non-bundle) MEMFS files — our shim/page-bootstrap, NOT the
+   analyzed bundle. Excluded from the @T scan AND the deep-grind residue so forced
+   execution never drives them. MUST match ast-thread.js's INFRA_PATHS
+   {/h.js,/d.js,/pre.js,/p.js} (+ the engine's own hostedge/driver source names):
+   /pre.js (SSR-HTML stash wrapper) and /p.js (page-data-island bootstrap) were
+   MISSING, so /pre.js leaked into the residue and the deep grind force-drove it
+   cold — wasted work on every SSR page. */
+static const char *QJS_HOSTMODEL_NM[] = { "<qjs-dom-prelude>", "hostedge.js", "/h.js", "hostedge.gen.js", "driver.js", "/d.js", "/pre.js", "/p.js", NULL };
+static JSAtom qjs_hostmodel_atoms[12];
 static int qjs_hostmodel_n = 0;
 static JSRuntime *qjs_host_atoms_rt = NULL;
 static void qjs_init_host_atoms(JSContext *ctx) {
