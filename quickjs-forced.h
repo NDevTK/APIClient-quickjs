@@ -30,6 +30,18 @@ static const char *qjs_fe_sched = "";
 static size_t qjs_fe_len = 0, qjs_fe_cur = 0;
 static FILE  *qjs_fe_trace = NULL;
 
+/* Per-orphan LOCAL branch-enumeration capture (qjs_drive_orphan_enum, quickjs.c).
+   When qjs_fe_lcap is set, qjs_forced_decide_k_p records per cursor: decision +
+   frontier-ness + branch KEY, so the local driver enqueues each frontier's flip
+   GATED ON edge-coverage (key,!decision) — ~2x distinct branches, LINEAR.
+   Helper-owned buffers grow to fit (no cap), freed at exit. */
+static int    qjs_fe_lcap = 0;
+static unsigned char *qjs_fe_lcap_dec = NULL;
+static unsigned char *qjs_fe_lcap_isf = NULL;
+static unsigned long long *qjs_fe_lcap_key = NULL;
+static size_t qjs_fe_lcap_cap = 0, qjs_fe_lcap_n = 0;
+static int    qjs_fe_lcap_of = 0;
+
 /* Explicit config (argv) — reliable in native, node-wasm and
    browser-worker alike (emscripten getenv is not). qjsmain calls
    this; getenv is only a fallback. sched is copied (caller's argv
@@ -251,6 +263,17 @@ static int qjs_forced_decide_k_p(int orig, unsigned long long key, qjs_term *pt,
         }
     }
     if (qjs_fe_trace) { fprintf(qjs_fe_trace, "B %zu %d %llu\n", qjs_fe_cur, d, key); fflush(qjs_fe_trace); }
+    if (qjs_fe_lcap) {
+        size_t pos = qjs_fe_cur;
+        if (pos < qjs_fe_lcap_cap) {
+            qjs_fe_lcap_dec[pos] = (unsigned char)d;
+            qjs_fe_lcap_isf[pos] = (qjs_fe_cur >= qjs_fe_len) ? 1 : 0;
+            qjs_fe_lcap_key[pos] = key;
+            qjs_fe_lcap_n = pos + 1;
+        } else {
+            qjs_fe_lcap_of = 1;
+        }
+    }
     qjs_fe_cur++;
     /* NO per-branch yield: the op-poll heartbeat (js_poll_interrupts, called
        by every OP_if handler) already gives the host a turn every

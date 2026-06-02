@@ -94,6 +94,17 @@
       try { _dn = __feDriveStatic(); } catch (e) { _dn = 0; }
       if (typeof __hostMicrotaskDrain === "function") { try { __hostMicrotaskDrain(); } catch (e) {} }
     }
+    // VALUE-SPREAD pass: after the drives have FIRED their default-arm host calls,
+    // recover the OTHER arm(s) of value-determining branches (role=guest|admin,
+    // the conditional-body arm) — the spread the single drive collapsed. GATED to
+    // fired + branchy functions (qjs_has_value_branch), so the set is small; the
+    // edge-coverage enumeration bounds each to ~2x its branches. This is the moat
+    // depth (example KEYS+VALUES for the unused/branch surface) the boot drive
+    // alone misses. Drain after so its fetch().then callbacks fire.
+    if (feSeed && typeof __feValueSpread === "function") {
+      try { __feValueSpread(); } catch (e) {}
+      if (typeof __hostMicrotaskDrain === "function") { try { __hostMicrotaskDrain(); } catch (e) {} }
+    }
     // The DEEP pass (orphan @T drive for render-gated chunk endpoints like
     // preheat) is NOT run here — it's stepped from the worker via qjsmain's
     // persistent-runtime --fe-deep-step batches with sleeps between, so it

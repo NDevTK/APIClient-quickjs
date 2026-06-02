@@ -92,6 +92,10 @@ static int qjs_is_sink_atom(JSAtom a);
 static JSFunctionBytecode *qjs_dir_b = NULL;
 static int qjs_dir_target = -1;
 static int qjs_dir_active = 0;
+/* fwd: cold edge-coverage value-spread enumeration (defined near
+   js_fe_drive_static), called from the deep grind which precedes it. */
+static void qjs_drive_orphan_enum(JSContext *ctx, JSValueConst fn, JSValueConst this_val,
+                                  int nargs, JSValue *args, int is_ctor);
 /* "Can forward control flow FROM from_pc reach the SPECIFIC bytecode
    offset target_pc within b?" — the directed refinement of
    qjs_host_reach_from (which asks about ANY host edge). Same CFG walk +
@@ -59702,6 +59706,37 @@ done:
     return reach;
 }
 
+/* Cheap STATIC gate for the deep-grind value-spread enumeration: does `b` have
+   an opaque branch whose BOTH arms reach a host edge? Such a branch is either
+   value-determining (role=admin vs guest, both into the same fetch) or a guard
+   between two sites — either way exploring both arms recovers something the
+   single boot drive (which took one arm) missed: the value SPREAD, or the
+   other-arm endpoint. A FIRED function (qjs_h_fired=1) with such a branch is the
+   exact set the residue grind EXCLUDES (it only collects never-fired functions),
+   so this is the complementary value-SPREAD set. Read-only reachability (reuses
+   qjs_host_reach_from), NOT value-extraction — the same machinery the host-reach
+   prune already runs per branch. Conservative: an undecodable op stops the walk
+   (returns whatever was found). */
+static int qjs_has_value_branch(JSContext *ctx, JSFunctionBytecode *b) {
+    if (!b || !b->byte_code_buf) return 0;
+    int len = b->byte_code_len, pos = 0;
+    const uint8_t *bc = b->byte_code_buf;
+    while (pos < len) {
+        int op = bc[pos];
+        int osz = short_opcode_info(op).size;
+        if (osz < 1) break;
+        if (op == OP_if_true || op == OP_if_false || op == OP_if_true8 || op == OP_if_false8) {
+            int jpc = (op == OP_if_true8 || op == OP_if_false8)
+                ? pos + 1 + (int8_t)bc[pos + 1]
+                : pos + 1 + (int32_t)get_u32(bc + pos + 1);
+            int fpc = pos + osz;
+            if (qjs_host_reach_from(ctx, b, jpc) && qjs_host_reach_from(ctx, b, fpc)) return 1;
+        }
+        pos += osz;
+    }
+    return 0;
+}
+
 /* Network-only refinement of qjs_host_reach_from: returns 1 iff control
    from start_pc reaches a NETWORK-edge host atom (fetch/XHR/WebSocket/
    EventSource/sendBeacon/send) — i.e. an atom that is NOT a sink. Used
@@ -61174,6 +61209,154 @@ static JSValue js_fe_mark_handler(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
+/* Per-orphan COLD edge-coverage branch enumeration — the value-SPREAD view.
+   Driving COLD (opaque this/args) is what makes a value-determining branch
+   (cond?a:b into the same fetch) FORK into both literal arms (role=guest|admin)
+   — the spread the boot/directed real-instance drive collapses to one value.
+   BOUNDED by X-Force EDGE-COVERAGE: a frontier's flip is enqueued only if its
+   branch-edge (key,!decision) is UNCOVERED → ~2x distinct branches (LINEAR), not
+   2^n. Capture grows to fit (no cap). Each re-drive resets the loop-revisit
+   seen-set (a fresh execution unit). Called from the deep grind (preemptible) for
+   FIRED functions with a value-branch — the set the residue grind excludes.
+   Saves/restores global FE state. PURE forced execution (runs the bundle's
+   bytecode); serves BOTH API value-spread @H and XSS sinks-behind-branches @S. */
+static void qjs_drive_orphan_enum(JSContext *ctx, JSValueConst fn, JSValueConst this_val,
+                                  int nargs, JSValue *args, int is_ctor) {
+    const char *sv_sched = qjs_fe_sched; size_t sv_len = qjs_fe_len, sv_cur = qjs_fe_cur;
+    int sv_lcap = qjs_fe_lcap;
+    qjs_fe_lcap_cap = 256;
+    qjs_fe_lcap_dec = (unsigned char *)js_malloc(ctx, qjs_fe_lcap_cap);
+    qjs_fe_lcap_isf = (unsigned char *)js_malloc(ctx, qjs_fe_lcap_cap);
+    qjs_fe_lcap_key = (unsigned long long *)js_malloc(ctx, qjs_fe_lcap_cap * sizeof(unsigned long long));
+    char **seen = (char **)js_malloc(ctx, sizeof(char *));
+    int *wl = (int *)js_malloc(ctx, sizeof(int));
+    unsigned long long *cov = NULL; int cov_n = 0, cov_cap = 0;   /* covered edges: key<<1 | arm */
+    int seen_n = 0, seen_cap = 1, wl_n = 0, wl_cap = 1;
+    if (qjs_fe_lcap_dec && qjs_fe_lcap_isf && qjs_fe_lcap_key && seen && wl &&
+        (seen[0] = (char *)js_malloc(ctx, 1)) != NULL) {
+        seen[0][0] = 0; seen_n = 1; wl[0] = 0; wl_n = 1;
+        while (wl_n > 0) {
+            const char *S = seen[wl[--wl_n]];
+            int overflowed;
+            do {
+                overflowed = 0;
+                qjs_fe_sched = S; qjs_fe_len = strlen(S); qjs_fe_cur = 0;
+                qjs_fe_lcap = 1; qjs_fe_lcap_n = 0; qjs_fe_lcap_of = 0;
+                qjs_fe_seen_reset();
+                JSValue r = is_ctor ? JS_CallConstructor(ctx, fn, nargs, args)
+                                    : JS_Call(ctx, fn, this_val, nargs, args);
+                qjs_fe_lcap = 0;
+                if (JS_IsException(r)) { JSValue e = JS_GetException(ctx); JS_FreeValue(ctx, e); }
+                JS_FreeValue(ctx, r);
+                if (qjs_fe_lcap_of) {
+                    size_t nc = qjs_fe_lcap_cap * 2;
+                    unsigned char *nd = (unsigned char *)js_realloc(ctx, qjs_fe_lcap_dec, nc);
+                    unsigned char *ni = (unsigned char *)js_realloc(ctx, qjs_fe_lcap_isf, nc);
+                    unsigned long long *nk = (unsigned long long *)js_realloc(ctx, qjs_fe_lcap_key, nc * sizeof(unsigned long long));
+                    if (nd) qjs_fe_lcap_dec = nd;
+                    if (ni) qjs_fe_lcap_isf = ni;
+                    if (nk) qjs_fe_lcap_key = nk;
+                    if (nd && ni && nk) { qjs_fe_lcap_cap = nc; overflowed = 1; }
+                }
+            } while (overflowed);
+            size_t cn = qjs_fe_lcap_n;
+            for (size_t p = 0; p < cn; p++) {
+                if (!qjs_fe_lcap_isf[p]) continue;
+                unsigned long long k = qjs_fe_lcap_key[p];
+                unsigned long long e_taken = (k << 1) | (qjs_fe_lcap_dec[p] & 1);
+                unsigned long long e_flip  = (k << 1) | ((qjs_fe_lcap_dec[p] & 1) ^ 1);
+                int ci, covd = 0;
+                for (ci = 0; ci < cov_n; ci++) if (cov[ci] == e_taken) { covd = 1; break; }
+                if (!covd) {
+                    if (cov_n == cov_cap) { int ncap = cov_cap ? cov_cap * 2 : 16; unsigned long long *n2 = (unsigned long long *)js_realloc(ctx, cov, ncap * sizeof(unsigned long long)); if (n2) { cov = n2; cov_cap = ncap; } }
+                    if (cov_n < cov_cap) cov[cov_n++] = e_taken;
+                }
+                covd = 0;
+                for (ci = 0; ci < cov_n; ci++) if (cov[ci] == e_flip) { covd = 1; break; }
+                if (covd) continue;   /* EDGE-COVERAGE: flip edge already explored — the linear bound */
+                if (cov_n == cov_cap) { int ncap = cov_cap ? cov_cap * 2 : 16; unsigned long long *n2 = (unsigned long long *)js_realloc(ctx, cov, ncap * sizeof(unsigned long long)); if (n2) { cov = n2; cov_cap = ncap; } }
+                if (cov_n < cov_cap) cov[cov_n++] = e_flip;
+                char *nS = (char *)js_malloc(ctx, p + 2);
+                if (!nS) continue;
+                for (size_t j = 0; j < p; j++) nS[j] = qjs_fe_lcap_dec[j] ? '1' : '0';
+                nS[p] = qjs_fe_lcap_dec[p] ? '0' : '1';
+                nS[p + 1] = 0;
+                int dup = 0, kk;
+                for (kk = 0; kk < seen_n; kk++) if (!strcmp(seen[kk], nS)) { dup = 1; break; }
+                if (dup) { js_free(ctx, nS); continue; }
+                if (seen_n == seen_cap) { char **ns = (char **)js_realloc(ctx, seen, (seen_cap * 2) * sizeof(char *)); if (!ns) { js_free(ctx, nS); break; } seen = ns; seen_cap *= 2; }
+                if (wl_n == wl_cap) { int *nw = (int *)js_realloc(ctx, wl, (wl_cap * 2) * sizeof(int)); if (!nw) { js_free(ctx, nS); break; } wl = nw; wl_cap *= 2; }
+                seen[seen_n] = nS; wl[wl_n++] = seen_n; seen_n++;
+            }
+        }
+        for (int kk = 0; kk < seen_n; kk++) js_free(ctx, seen[kk]);
+    }
+    if (seen) js_free(ctx, seen);
+    if (wl) js_free(ctx, wl);
+    if (cov) js_free(ctx, cov);
+    js_free(ctx, qjs_fe_lcap_dec); js_free(ctx, qjs_fe_lcap_isf); js_free(ctx, qjs_fe_lcap_key);
+    qjs_fe_lcap_dec = qjs_fe_lcap_isf = NULL; qjs_fe_lcap_key = NULL; qjs_fe_lcap_cap = 0;
+    qjs_fe_lcap = sv_lcap; qjs_fe_sched = sv_sched; qjs_fe_len = sv_len; qjs_fe_cur = sv_cur;
+}
+
+/* The value-SPREAD pass (driver.js calls __feValueSpread after __feDriveStatic).
+   For every function whose host site FIRED (qjs_h_fired=1) AND that has a value-
+   determining branch, run the cold edge-coverage enumeration to recover the
+   OTHER arm(s) — the spread (role=guest|admin) / other-arm endpoint that the
+   single boot drive collapsed. This is the COMPLEMENT of the residue grind: the
+   residue collects never-fired functions (coverage); this collects fired ones
+   with branches (value depth). GATED so the set is SMALL (only fired + branchy
+   functions) — NOT the all-orphans boot enumeration that measured 27.6s; the gate
+   (qjs_has_value_branch) is the difference. Collect-then-drive so the enumeration
+   instantiating closures can't invalidate the gc_obj_list iterator. */
+static JSValue js_fe_value_spread(JSContext *ctx, JSValueConst this_val,
+                                  int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    qjs_init_host_atoms(ctx);
+    JSValue *targets = NULL; int n = 0, cap = 0;
+    struct list_head *el;
+    list_for_each(el, &rt->gc_obj_list) {
+        JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
+        if (gp->gc_obj_type != JS_GC_OBJ_TYPE_JS_OBJECT) continue;
+        JSObject *p = (JSObject *)gp;
+        if (p->class_id != JS_CLASS_BYTECODE_FUNCTION &&
+            p->class_id != JS_CLASS_GENERATOR_FUNCTION &&
+            p->class_id != JS_CLASS_ASYNC_FUNCTION &&
+            p->class_id != JS_CLASS_ASYNC_GENERATOR_FUNCTION) continue;
+        JSFunctionBytecode *b = p->u.func.function_bytecode;
+        if (!b || !b->byte_code_buf) continue;
+        if (!b->qjs_h_fired) continue;                      /* fired only (residue handles never-fired) */
+        if (qjs_is_host_model_file(b->filename)) continue;
+        if (!qjs_has_value_branch(ctx, b)) continue;        /* GATE: must have a value/guard branch */
+        if (n == cap) { int nc = cap ? cap * 2 : 16; JSValue *nt = js_realloc(ctx, targets, nc * sizeof *nt); if (!nt) break; targets = nt; cap = nc; }
+        targets[n++] = JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, p));
+    }
+    int enumerated = 0;
+    for (int i = 0; i < n; i++) {
+        JSObject *p = JS_VALUE_GET_OBJ(targets[i]);
+        JSFunctionBytecode *b = p->u.func.function_bytecode;
+        if (!b || !b->byte_code_buf) continue;
+        int nargs = b->arg_count, is_ctor = 0;
+        for (int cp = 0; cp < b->byte_code_len && cp < 8; ) { int cop = b->byte_code_buf[cp]; if (cop == OP_check_ctor) { is_ctor = 1; break; } int csz = short_opcode_info(cop).size; if (csz < 1) break; cp += csz; }
+        JSValue *args = nargs > 0 ? js_mallocz(ctx, nargs * sizeof(JSValue)) : NULL;
+        if (nargs > 0 && !args) continue;
+        for (int ai = 0; ai < nargs; ai++) args[ai] = qjs_fe_named_arg(ctx, b, ai, "vspread");
+        qjs_fe_taint_event_arg0(ctx, b, args, nargs);
+        JSValue this_v = qjs_opq_make(ctx, 1, "vspread-this", qjs_t_opaque());
+        qjs_drive_orphan_enum(ctx, targets[i], this_v, nargs, args, is_ctor);
+        JS_FreeValue(ctx, this_v);
+        for (int ai = 0; ai < nargs; ai++) JS_FreeValue(ctx, args[ai]);
+        if (args) js_free(ctx, args);
+        enumerated++;
+        fprintf(stderr, "@WHY {\"phase\":\"vspread_enum\"}\n");
+    }
+    for (int i = 0; i < n; i++) JS_FreeValue(ctx, targets[i]);
+    js_free(ctx, targets);
+    fflush(stderr);
+    return JS_NewInt32(ctx, enumerated);
+}
+
 static JSValue js_fe_drive_static(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv) {
     (void)this_val; (void)argc; (void)argv;
@@ -61305,6 +61488,7 @@ static const JSCFunctionListEntry js_global_funcs[] = {
     JS_CFUNC_DEF("__feCursor", 0, js_fe_cursor ),
     JS_CFUNC_DEF("__feLen", 0, js_fe_len ),
     JS_CFUNC_DEF("__feDriveStatic", 0, js_fe_drive_static ),
+    JS_CFUNC_DEF("__feValueSpread", 0, js_fe_value_spread ),
     JS_CFUNC_DEF("__feMarkHandler", 1, js_fe_mark_handler ),
     JS_CFUNC_DEF("__feStaticSites", 0, js_fe_static_sites ),
     JS_CFUNC_DEF("__feTerm", 1, js_fe_term ),
