@@ -1365,6 +1365,7 @@ static const char *qjs_z3_solve_sec_inner(void *psi_v, const char *sinkType, cha
     zc.str_sort = Z3_mk_string_sort(c);
     zc.int_sort = Z3_mk_int_sort(c);
     Z3_model phiModel = NULL;   /* Φ-feasible model (gate fields) for the concat-breakout path; declared pre-goto so z3_err can free it */
+    Z3_solver sx = NULL;        /* fresh exploit-query (Φ∧es) solver; declared pre-goto for z3_err cleanup */
     for (int i = 0; i < qjs_pc_n; i++) {
         Z3_ast p = qjs_z3_pred(qjs_pc_t[i], &zc);
         if (qjs_z3_check_err(c, sinkType, "build-pred")) goto z3_err;
@@ -1374,10 +1375,13 @@ static const char *qjs_z3_solve_sec_inner(void *psi_v, const char *sinkType, cha
     Z3_lbool r = Z3_solver_check(c, s);
     if (qjs_z3_check_err(c, sinkType, "check-phi")) goto z3_err;
     const char *verdict;
-    /* Capture the Φ-feasible model BEFORE the exploit shape is asserted — the
-       constructive concat-breakout path needs the gate-field values
-       (data.type=="set", …) and an UNDEF exploit check leaves no usable model. */
-    if (r != Z3_L_FALSE) { phiModel = Z3_solver_get_model(c, s); if (phiModel) Z3_model_inc_ref(c, phiModel); }
+    /* phiModel (Φ-feasible gate values for the concat-breakout PoC) is NOT
+       captured here. A Z3_solver_get_model on a solver in this context BEFORE
+       the exploit check makes a subsequent check return a STALE SAT (the cached
+       Φ-only model), so a gated sink `if(taint===lit) sink(taint)` falsely
+       verdicts REAL_EXPLOIT instead of TAINT_REACH (verified: _xss_drive1). It
+       is recovered later (concat-breakout path) on a DEDICATED Φ-only solver,
+       AFTER the exploit determination, so nothing it touches is re-checked. */
     if (r == Z3_L_FALSE) {
         verdict = "INFEASIBLE";
     } else {
@@ -1389,9 +1393,21 @@ static const char *qjs_z3_solve_sec_inner(void *psi_v, const char *sinkType, cha
         if (!es) {
             verdict = "TAINT_REACH";
         } else {
-            Z3_solver_assert(c, s, es);
+            /* Exploit query (Φ ∧ es) on a FRESH solver. Re-checking the main solver
+               `s` after its Φ-only check + asserting es returns a STALE SAT in this
+               Z3 build (assert does not dirty an already-checked solver) — the
+               gated-sink false-positive (`if(taint===lit) sink(taint)` → REAL_EXPLOIT
+               instead of TAINT_REACH). A fresh solver's first check always solves;
+               re-translating Φ reuses the cached zc leaf vars so es and Φ share the
+               same s_i, keeping the gate↔sink coupling that makes it correctly UNSAT. */
+            sx = Z3_mk_solver(c); Z3_solver_inc_ref(c, sx);
+            for (int _xj = 0; _xj < qjs_pc_n; _xj++) {
+                Z3_ast _xp = qjs_z3_pred(qjs_pc_t[_xj], &zc);
+                Z3_solver_assert(c, sx, qjs_pc_d[_xj] ? _xp : Z3_mk_not(c, _xp));
+            }
+            Z3_solver_assert(c, sx, es);
             if (qjs_z3_check_err(c, sinkType, "assert-exploit")) goto z3_err;
-            r = Z3_solver_check(c, s);
+            r = Z3_solver_check(c, sx);
             if (qjs_z3_check_err(c, sinkType, "check-exploit")) goto z3_err;
             if (r == Z3_L_TRUE) {
                 /* SAT exploit. Only a SOUND solve is a proven PoC: if the
@@ -1408,7 +1424,7 @@ static const char *qjs_z3_solve_sec_inner(void *psi_v, const char *sinkType, cha
                    If rlimit gets hit during tightening, the solver's
                    internal state can stop returning models; preserving
                    the original guarantees a non-null witness. */
-                Z3_model originalModel = Z3_solver_get_model(c, s);
+                Z3_model originalModel = Z3_solver_get_model(c, sx);
                 if (originalModel) Z3_model_inc_ref(c, originalModel);
                 /* Tightening pass — Z3's first model satisfies the
                    disjunction `contains(Ψ,p1) ∨ … ∨ prefixof(pN,Ψ)`
@@ -1461,17 +1477,17 @@ static const char *qjs_z3_solve_sec_inner(void *psi_v, const char *sinkType, cha
                                        e.data.html — even contains/len-≥ go UNDEF).
                                        NOT a refutation — remember it for the clean-
                                        reflection fallback below. */
-                        Z3_solver_push(c, s);
-                        Z3_solver_assert(c, s, Z3_mk_eq(c, psi_str, Z3_mk_string(c, TIGHT[ti].p)));
-                        Z3_lbool rr = (qjs_z3_last_err == Z3_OK) ? Z3_solver_check(c, s) : Z3_L_UNDEF;
+                        Z3_solver_push(c, sx);
+                        Z3_solver_assert(c, sx, Z3_mk_eq(c, psi_str, Z3_mk_string(c, TIGHT[ti].p)));
+                        Z3_lbool rr = (qjs_z3_last_err == Z3_OK) ? Z3_solver_check(c, sx) : Z3_L_UNDEF;
                         if (rr == Z3_L_TRUE) {
-                            bestModel = Z3_solver_get_model(c, s);
+                            bestModel = Z3_solver_get_model(c, sx);
                             if (bestModel) Z3_model_inc_ref(c, bestModel);
                             chosenPayload = TIGHT[ti].p;
                         } else if (rr == Z3_L_UNDEF && !undefVec) {
                             undefVec = TIGHT[ti].p;
                         }
-                        Z3_solver_pop(c, s, 1);
+                        Z3_solver_pop(c, sx, 1);
                         qjs_z3_last_err = Z3_OK;   /* a tightening miss/undef is not an error */
                     }
                     /* No exact fit CONFIRMED, but none REFUTED either (UNDEF) — for a
@@ -1500,20 +1516,39 @@ static const char *qjs_z3_solve_sec_inner(void *psi_v, const char *sinkType, cha
                 if (bestModel) Z3_model_dec_ref(c, bestModel);
                 if (originalModel) Z3_model_dec_ref(c, originalModel);
             } else {
-                /* Exploit shape UNDEF/FALSE. Z3's seq solver routinely returns
-                   UNDEF on contains() over a concat that embeds an attacker
-                   MEMBER var (`"<div class='" + e.data.x + "'>"`), so a bare
-                   TAINT_REACH would UNDER-report a real reflected XSS. Try the
-                   CONSTRUCTIVE breakout: pull the concrete literal prefix the
-                   bundle wraps the value in, find its HTML injection context, and
-                   synthesize <breakout> + <executable vector>. A context-correct
-                   breakout that EXISTS is the proof — Φ is feasible (r≠FALSE) and
-                   the attacker leaf is free. html family only (url/code embedded
-                   in a literal need a different breakout grammar — documented gap,
-                   stays TAINT_REACH); over-approx solves never take this path. */
+                /* r is UNDEF (Z3's seq solver couldn't DECIDE) or FALSE (exploit
+                   PROVEN impossible under Φ). TAINT_REACH for both. The constructive
+                   breakout fires ONLY for UNDEF — the seq solver routinely returns
+                   UNDEF on contains() over a concat embedding an attacker MEMBER
+                   (`"<div class='" + e.data.x + "'>"`), and a bare TAINT_REACH would
+                   UNDER-report that real reflected XSS; the breakout pulls the
+                   concrete literal prefix, finds its HTML injection context, and
+                   synthesizes <breakout>+<vector>, with Φ feasible and the leaf free.
+                   For r==FALSE the gate PINS the value (e.g. `if(taint==="admin")
+                   sink(taint)` → "admin" carries no payload), so the exploit is
+                   proven unreachable — firing the breakout there is a FALSE POSITIVE
+                   (the gated-sink bug). html family only; over-approx never here. */
                 verdict = "TAINT_REACH";
                 const char *fam3 = qjs_z3_family(sinkType);
-                if (fam3 && !strcmp(fam3, "html") && !zc.overapprox && phiModel) {
+                if (r == Z3_L_UNDEF && fam3 && !strcmp(fam3, "html") && !zc.overapprox) {
+                    /* Recover the Φ-feasible gate model on a DEDICATED fresh solver
+                       (Φ-only, never es). A get_model on the MAIN solver `s` — or
+                       anything in this context — BEFORE its exploit check staled the
+                       re-check into a false SAT (the whole gated-sink false-positive
+                       bug). This solver is built AFTER `s`'s exploit check, so its
+                       get_model can't stale anything; `s` is not re-checked. */
+                    Z3_solver sphi = Z3_mk_solver(c); Z3_solver_inc_ref(c, sphi);
+                    for (int _pj = 0; _pj < qjs_pc_n; _pj++) {
+                        Z3_ast _pp = qjs_z3_pred(qjs_pc_t[_pj], &zc);
+                        Z3_solver_assert(c, sphi, qjs_pc_d[_pj] ? _pp : Z3_mk_not(c, _pp));
+                    }
+                    if (qjs_z3_last_err == Z3_OK && Z3_solver_check(c, sphi) == Z3_L_TRUE) {
+                        phiModel = Z3_solver_get_model(c, sphi);
+                        if (phiModel) Z3_model_inc_ref(c, phiModel);
+                    }
+                    Z3_solver_dec_ref(c, sphi);
+                }
+                if (r == Z3_L_UNDEF && fam3 && !strcmp(fam3, "html") && !zc.overapprox && phiModel) {
                     char pre[1024] = {0}; size_t preLen = 0; int found = 0;
                     int bLeaf = -1; char bPath[256] = {0};
                     qjs_concat_prefix(psi, pre, sizeof pre, &preLen, &bLeaf, bPath, sizeof bPath, &found);
@@ -1531,6 +1566,7 @@ static const char *qjs_z3_solve_sec_inner(void *psi_v, const char *sinkType, cha
         }
     }
     if (phiModel) Z3_model_dec_ref(c, phiModel);
+    if (sx) Z3_solver_dec_ref(c, sx);
     for (int mi = 0; mi < zc.n_mem; mi++) free(zc.members[mi].path);
     free(zc.members);
     free(zc.leaves);
@@ -1543,6 +1579,7 @@ z3_err:
        return Z3_ERROR (a distinct verdict — drive.mjs / ast-thread
        MUST NOT collapse this into TAINT_REACH). */
     if (phiModel) Z3_model_dec_ref(c, phiModel);
+    if (sx) Z3_solver_dec_ref(c, sx);
     for (int mi = 0; mi < zc.n_mem; mi++) free(zc.members[mi].path);
     free(zc.members);
     free(zc.leaves);
