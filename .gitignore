@@ -15,9 +15,10 @@ microbench*.txt
 
 # ── APIClient fork: scratch + regenerable artifacts ──────────────────
 # The forced-execution work generates many throwaway fixtures, capture
-# dumps, and rebuildable wasm. None belong in history. The real
-# green-gate fixtures are force-added (git add -f) so they survive the
-# `_*` blanket below — see the "Fork version-control system" section in
+# dumps, and rebuildable wasm. None belong in history. The polarity
+# scenarios were MOVED to APIClient `testing/fixtures/*.html` (the
+# approved HTML form, served + visited live); the fork tracks NO `_*`
+# fixtures — see the "Fork version-control system" section in
 # APIClient/CLAUDE.md.
 #
 # Regenerable build outputs (node engine/build.mjs ...):
@@ -36,8 +37,8 @@ pre.gen.js
 t.tr
 diag.txt
 # Scratch fixtures, probes, and multi-MB site captures (regenerable via
-# `harness dumpscripts`). Blanket — the named gate fixtures are tracked
-# via `git add -f`, which overrides this.
+# `harness dumpscripts`). Blanket: nothing under `_*` is tracked — the
+# polarity scenarios live in APIClient `testing/fixtures/*.html`.
 _*
 # Stray one-offs:
 .t.gh
