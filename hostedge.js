@@ -1145,6 +1145,34 @@
   // behind unrun modules is forced execution at the function level.
   var PRE = Object.create(null);
   var FEMUTE = (typeof __feMute === "function") ? __feMute : function () {};
+  // Drain the queued event-handler registrations (FH): fire each registered
+  // handler ONCE with its REAL instance — `hf` is the exact closure passed to
+  // addEventListener, so closure-var reads (e.g. `btn.getAttribute('data-op')`
+  // in a click handler) resolve through the real created element, and `this` =
+  // the registration target. Extracted from __hostDrive so the DEEP GRIND can
+  // drain it too: a never-called factory (login/click/route-gated boot fn — the
+  // moat's unused-API target) registers its handler DURING the grind, AFTER the
+  // boot drain already ran; without a post-grind drain that real-instance
+  // handler sits in FH unfired and its click-gated endpoint is lost (it only
+  // ever runs as a cold opaque residue orphan). Structural termination via the
+  // schedule cursor (re-queue only while a handler keeps advancing the forced
+  // window, else retire its source key) — no cap, same invariant as before.
+  G.__feDrainHandlers = function () {
+    var FECUR = (typeof __feCursor === "function") ? __feCursor : function () { return 0; };
+    var FELEN = (typeof __feLen === "function") ? __feLen : function () { return 0; };
+    while (FH.length) {
+      var hfe = FH.shift();
+      var hf = hfe.fn, ht = hfe.target;
+      var hk = keyOf(hf);
+      var _curBefore = FECUR();
+      var thisArg = ht != null ? ht : G;
+      var hev = ht != null ? mkHandlerEvent(ht) : OPQ("handler.event");
+      try { hf.call(thisArg, hev); } catch (x) {}
+      var _curAfter = FECUR();
+      if (_curAfter > _curBefore && _curBefore <= FELEN()) FH.push(hfe);
+      else ranKeys.add(hk);
+    }
+  };
   G.__hostDrive = function () {
     var names;
     try { names = Object.getOwnPropertyNames(G); } catch (e) { return; }
@@ -1309,55 +1337,11 @@
     // event.target attribute VALUES, and those are attacker-opaque for
     // the security view and structural for the API view anyway.
 
-    // J-Force §3.1.3 + multi-message coverage: every registered event
-    // handler runs against fresh opaque events in sequence so
-    // multi-message PoCs (postMessage init→render with cross-state
-    // via _cfg, custom-event chains) accumulate the dependency in Φ.
-    //
-    // Structural termination (no HMAX cap): re-queue while the
-    // schedule cursor hasn't OVERSHOT the forced part (cur_after
-    // <= FELEN). The "<=" lets one call go ONE step past the schedule
-    // — that call's branches emit F-frontiers the BFS extends from,
-    // without that the multi-message search dies after the first
-    // run. Beyond `+1`, the call would be deep in default-mode with
-    // no new info; BFS picks up new schedules from the F-emitting
-    // run instead. Finite: cursor monotone, FELEN fixed per run.
-    var FECUR = (typeof __feCursor === "function") ? __feCursor : function () { return 0; };
-    var FELEN = (typeof __feLen === "function") ? __feLen : function () { return 0; };
-    // Re-fire condition is "the handler contributed new forced
-    // decisions AND is still inside the forced window". Compare
-    // cursor BEFORE and AFTER the call: if it didn't advance, the
-    // handler has no opaque branches reachable from the schedule
-    // prefix it just saw — re-firing would just re-run the same
-    // concrete path forever (the actual github hang: 7.7 MB bundle
-    // with handlers that, on the current schedule, exercise concrete
-    // code that synchronously re-dispatches statechange, never
-    // touching an opaque branch). Cousot-Cousot monotone bounded set:
-    // a handler contributes by advancing the cursor, otherwise its
-    // source identity gets added to ranKeys and it's done for this
-    // run. No cap, no magic number — structural termination keyed
-    // on the schedule-cursor invariant.
-    while (FH.length) {
-      var hfe = FH.shift();
-      var hf = hfe.fn, ht = hfe.target;
-      var hk = keyOf(hf);
-      var _curBefore = FECUR();
-      // `this` = registration target when known (CE element bound via
-      // el.addEventListener) so concrete attribute reads inside the
-      // handler resolve through real Lexbor nodes. Window-level
-      // listeners (G.addEventListener) registered with target=null
-      // fall back to G, matching WHATWG window-handler semantics.
-      var thisArg = ht != null ? ht : G;
-      // Element handler → event with concrete target = its registration
-      // element (concrete DOM-derived request parts = example usages);
-      // window-level handler (no target) → fully-opaque event (its
-      // inputs ARE the attacker surface: message data, etc.).
-      var hev = ht != null ? mkHandlerEvent(ht) : OPQ("handler.event");
-      try { hf.call(thisArg, hev); } catch (x) {}
-      var _curAfter = FECUR();
-      if (_curAfter > _curBefore && _curBefore <= FELEN()) FH.push(hfe);
-      else ranKeys.add(hk);
-    }
+    // J-Force §3.1.3 + multi-message coverage: fire every registered event
+    // handler against fresh opaque events so multi-message PoCs accumulate in Φ.
+    // Extracted to G.__feDrainHandlers (defined above) so the deep grind drains
+    // it too — see that function for the structural-termination rationale.
+    G.__feDrainHandlers();
   };
   var __feCBSeq = 0;
   try { Object.getOwnPropertyNames(G).forEach(function (k) { PRE[k] = 1; }); } catch (e) {}

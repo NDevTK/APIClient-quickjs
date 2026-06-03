@@ -61077,6 +61077,30 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
     printf("@DLOOP_DONE %d\n", driven); fflush(stdout);
     qjs_reach_memo_free(ctx);
     fflush(stdout);
+    /* Fire event handlers a factory REGISTERED during this batch's drives. A
+       never-called factory (a login/click/route-gated boot fn — the moat's
+       unused-API target) runs `el.addEventListener(t, handler)` while being
+       grind-driven; hostedge.js's addEventListener queues the REAL handler
+       closure (closing over the real created element) into FH via __feHandler.
+       The boot drain (__hostDrive) already ran BEFORE the grind, so without this
+       post-batch drain that real-instance handler sits in FH unfired and its
+       click-gated endpoint (concrete operationName/dataset values) is lost — the
+       reddit/gitlab render→interaction value-depth gap. Drains with its REAL
+       closure (so btn.getAttribute(...) reads the real element), NOT a cold
+       opaque orphan. Armed so a spinning handler hits the same spin-defer
+       interrupt as an orphan drive; stack re-baselined like the orphan drives. */
+    { JSValue _g = JS_GetGlobalObject(ctx);
+      JSValue _dh = JS_GetPropertyStr(ctx, _g, "__feDrainHandlers");
+      if (JS_IsFunction(ctx, _dh)) {
+          JS_UpdateStackTop(rt);
+          g_grind_drive_active = 1;
+          JSValue _r = JS_Call(ctx, _dh, JS_UNDEFINED, 0, NULL);
+          g_grind_drive_active = 0;
+          if (JS_IsException(_r)) { JSValue _e = JS_GetException(ctx); JS_FreeValue(ctx, _e); }
+          JS_FreeValue(ctx, _r);
+          qjs_drop_pending_jobs(rt);   /* handler-spawned fetch .then chains; @H already emitted */
+      }
+      JS_FreeValue(ctx, _dh); JS_FreeValue(ctx, _g); }
     /* Remaining work = residue entries not yet driven AND not yet host-
        fired naturally. The live-pick loop above doesn't advance
        qjs_deep_cursor (an index-based cursor is meaningless when picks
