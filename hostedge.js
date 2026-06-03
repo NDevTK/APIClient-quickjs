@@ -146,7 +146,32 @@
     }
     return fr.length ? fr : null;
   }
-  function H(api, args) { EPRINT("@H " + JSON.stringify({ api: api, args: args, at: siteOf() })); }
+  function deepConcretize(v) {
+    if (ISOPQANY(v)) return "[object Object]";
+    if (v && typeof v === "object") {
+      if (Array.isArray(v)) { var a = []; for (var i = 0; i < v.length; i++) a.push(deepConcretize(v[i])); return a; }
+      var o = {}; for (var k in v) { try { o[k] = deepConcretize(v[k]); } catch (e) {} } return o;
+    }
+    return v;
+  }
+  function H(api, args) {
+    var rec = { api: api, args: args, at: siteOf() };
+    var s;
+    try { s = JSON.stringify(rec); } catch (e) { s = null; }
+    // String()/JSON.stringify are opaque-infectious, so a fully-opaque arg (a
+    // URL the drive couldn't ground to a literal) makes the WHOLE "@H {…}"
+    // string opaque → it renders "[object Object]" and the worker DROPS it (no
+    // @H prefix, no resolverError). Per "No silent failure" + "a fully-opaque
+    // URL is a resolverError, never dropped", concretize opaque leaves to the
+    // "[object Object]" marker (as S() does for @S) and re-emit, so the call
+    // site surfaces as a resolverError instead of vanishing. ISOPQANY is a
+    // concrete bool ⇒ no fork, and is tested FIRST so `s == null` never
+    // compares an opaque (which would fork).
+    if (ISOPQANY(s) || s == null) {
+      try { s = JSON.stringify(deepConcretize(rec)); } catch (e2) { return; }
+    }
+    EPRINT("@H " + s);
+  }
   function tainted(v) {
     if (ISOPQ(v)) return true;
     return typeof v === "string" && v.indexOf("[object Object]") >= 0;
