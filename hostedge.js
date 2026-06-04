@@ -59,7 +59,22 @@
   // __feUrlShape returns undefined) fall through to String(); the
   // adapter's isUnresolved files the latter as a resolverError, never a
   // fabricated endpoint.
-  function urlOf(v) { var s = URLSHAPE(v); return (typeof s === "string") ? s : String(v); }
+  function urlOf(v) {
+    var s = URLSHAPE(v); s = (typeof s === "string") ? s : String(v);
+    // Resolve EVERY concrete fetch/XHR target against the page base (WHATWG
+    // URL), exactly as the browser does: "/api/x", "api/x", "../x", "./x",
+    // "?q=1", "#h", and "" (fetch(location.hash) → the host page) all become the
+    // real request URL — a relative target no longer records a malformed
+    // "api/x". The fragment is dropped (never sent to the server). Skips opaque
+    // URL TEMPLATES (a "{id}" hole carries "{", which new URL would percent-
+    // encode away) and a fully-opaque "[object Object]" (no concrete shape —
+    // stays a resolverError, never fabricated into "/[object Object]").
+    if (s.indexOf("{") < 0 && s.indexOf("[object Object]") < 0) {
+      try { var u = new URL(s, loc._href); return u.origin + u.pathname + u.search; }
+      catch (e) {}
+    }
+    return s;
+  }
   /* WHATWG URL constructor preserves opacity. The C-side url_ctor in
      qjs_dom.c calls JS_ToCString on its first argument, which lowers an
      opaque value via the qjs_opq class's Object.prototype.toString to
@@ -326,8 +341,13 @@
   // location.origin/host resolve to the actual site, not a placeholder
   // — github routes the landing vs app bundle on location.hostname, and
   // `fetch(location.origin + "/api/...")` is wrong against example.com.
-  // hash/search stay opaque: they are the attacker-controlled navigation
-  // surface (the taint sources the security path forks on).
+  // hash/search carry their CONCRETE value (the page's real hash/search, from
+  // the parsed page URL) as the opaque's example shape AND keep the attacker-
+  // source leaf term: API learning resolves fetch(location.hash) to a concrete
+  // endpoint (never a resolverError — a resolverError on a drivable value is a
+  // gap, not acceptable), while Z3/security still treats them as the attacker-
+  // controlled navigation surface. Concrete-for-learning + attacker-for-Z3 on
+  // one value (qjs_opq carries both term and shape).
   var _pageUrl = (typeof G.__pageUrl === "string" && G.__pageUrl) ? G.__pageUrl : "https://example.com/";
   var _pu = null; try { _pu = new URL(_pageUrl); } catch (e) { _pu = null; }
   var loc = { origin: _pu ? _pu.origin : "https://example.com",
@@ -339,8 +359,8 @@
     reload: function () {}, toString: function () { return this._href; },
     ancestorOrigins: { length: 0, item: function () { return null; }, contains: function () { return false; } } };
   defAccessor(loc, "href", function () { return this._href; }, function (v) { S("open-redirect", "location.href", v); });
-  defAccessor(loc, "hash", function () { return OPQ("location.hash"); }, function (v) { S("open-redirect", "location.hash", v); });
-  defAccessor(loc, "search", function () { return OPQ("location.search"); }, function (v) { S("open-redirect", "location.search", v); });
+  defAccessor(loc, "hash", function () { return OPQ("location.hash", _pu ? _pu.hash : ""); }, function (v) { S("open-redirect", "location.hash", v); });
+  defAccessor(loc, "search", function () { return OPQ("location.search", _pu ? _pu.search : ""); }, function (v) { S("open-redirect", "location.search", v); });
   defAccessor(G, "location", function () { return loc; }, function (v) { S("open-redirect", "window.location", v); });
   defAccessor(G, "name", function () { return OPQ("window.name"); }, function () {});
 

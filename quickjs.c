@@ -1611,11 +1611,22 @@ static int qjs_z3_check_flip_sat(qjs_term *flip_term) {
 #endif
 static JSValue js_make_opaque(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv) {
-    /* __opaque("location.search") — the label is the Z3 LEAF identity
-       (interned per distinct source) for the security path solve. */
+    /* __opaque("location.search"[, exampleValue]) — the label is the Z3 LEAF
+       identity (interned per distinct source) for the security path solve.
+       The optional 2nd arg is the CONCRETE EXAMPLE value (e.g. the page's real
+       location.hash): the value is attacker-controlled for Z3 (the leaf term)
+       AND has a known example for API learning (the shape), so fetch(location
+       .hash) resolves to a concrete endpoint instead of a resolverError while
+       still being a tainted SSRF/redirect source. A shape of "" is a valid
+       known example (an unset hash), distinct from NULL (genuinely unknown,
+       e.g. responseText — stays a resolverError, never invented). */
     const char *lab = NULL;
     if (argc > 0 && JS_IsString(argv[0])) lab = JS_ToCString(ctx, argv[0]);
     JSValue r = qjs_opq_make(ctx, 0, lab, qjs_t_leaf(lab));
+    if (argc > 1 && JS_IsString(argv[1])) {
+        const char *ex = JS_ToCString(ctx, argv[1]);
+        if (ex) { qjs_opq_set_shape(r, ex); JS_FreeCString(ctx, ex); }
+    }
     if (lab) JS_FreeCString(ctx, lab);
     return r;
 }
@@ -1708,12 +1719,27 @@ static void qjs_sb_url0(qjs_sb *b, qjs_term *t, int *lits, int *holes) {
 static JSValue js_fe_url_shape(JSContext *ctx, JSValueConst this_val,
                                int argc, JSValueConst *argv) {
     if (argc < 1 || !qjs_is_opaque(argv[0])) return JS_UNDEFINED;
-    qjs_term *t = qjs_opq_of(argv[0])->term;
+    qjs_opq *o = qjs_opq_of(argv[0]);
+    qjs_term *t = o->term;
     if (!t) return JS_UNDEFINED;
     qjs_sb b = {0}; int lits = 0, holes = 0;
     qjs_sb_url0(&b, t, &lits, &holes);
     qjs_sb_putc(&b, 0);
-    JSValue r = (lits > 0 && b.p) ? JS_NewString(ctx, b.p) : JS_UNDEFINED;
+    JSValue r;
+    if (lits > 0 && b.p) {
+        r = JS_NewString(ctx, b.p);
+    } else if (o->shape && t->op == 'L') {
+        /* A bare attacker-SOURCE leaf (location.hash/search) seeded with the
+           page's real value as a concrete example: resolve to it so the URL is
+           learnable (empty "" → fetch("") resolves to the page URL via base
+           resolution), while the leaf term keeps the value attacker-tainted for
+           Z3. Genuinely-unknown leaves (responseText) carry no shape → still
+           undefined → resolverError, never invented. Concat/template terms
+           (>=1 literal above) and JSON body-shapes (non-leaf op) are unaffected. */
+        r = JS_NewString(ctx, o->shape);
+    } else {
+        r = JS_UNDEFINED;
+    }
     qjs_sb_free(&b);
     return r;
 }
