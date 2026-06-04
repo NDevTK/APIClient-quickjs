@@ -10259,8 +10259,15 @@ static JSValue JS_ThrowStackOverflow(JSContext *ctx)
     }
     if (_recb && _recb->filename && _depth >= 2) {
         const char *fn = JS_AtomToCString(ctx, _recb->filename);
-        printf("@WHY {\"phase\":\"stack_overflow_recursion\",\"file\":\"%s\",\"line\":%d,\"col\":%d,\"recurDepth\":%d}\n",
-               fn ? fn : "?", _recb->line_num, _recb->col_num, _depth);
+        /* DIAG: does the recurring fn have its OWN loop? If 1, the OP_if recursion-
+           revisit qjs_looped gate (quickjs.c ~21188) disabled recursion-collapse for
+           it (loop+recursion, e.g. Sentry normalize/visit) so the opaque recursion
+           never collapsed -> overflow. Pins the gate as the root vs an unrelated cause. */
+        int _rlooped = 0;
+        for (JSStackFrame *_a = sf0; _a; _a = _a->prev_frame)
+            if (JS_GetFunctionBytecode(_a->cur_func) == _recb && _a->qjs_looped) { _rlooped = 1; break; }
+        printf("@WHY {\"phase\":\"stack_overflow_recursion\",\"file\":\"%s\",\"line\":%d,\"col\":%d,\"recurDepth\":%d,\"recurLooped\":%d}\n",
+               fn ? fn : "?", _recb->line_num, _recb->col_num, _depth, _rlooped);
         fflush(stdout);
         if (fn) JS_FreeCString(ctx, fn);
     } else {
