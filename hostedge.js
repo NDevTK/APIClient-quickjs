@@ -1018,10 +1018,20 @@
   if (!G.URLSearchParams) {
     G.URLSearchParams = function URLSearchParams(init) {
       var m = [];
+      // location.search/hash arrive as an attacker-tainted opaque carrying the
+      // page's real query as the concrete SHAPE. Parse the shape (typeof opaque
+      // !== "string" previously dropped EVERY URL param) so .get(k) yields the
+      // concrete param VALUE for API learning, re-wrapped as a tainted opaque
+      // (Z3 attacker source, sub-labelled by key). A literal-string init stays
+      // concrete (no taint) — only an opaque source contributes attacker taint.
+      var _tk = null;
+      if (ISOPQANY(init)) { var _sh = OPQSHAPE(init); init = (typeof _sh === "string") ? _sh : ""; _tk = "location.search"; }
       if (typeof init === "string") {
         init.replace(/^\?/, "").split("&").forEach(function (p) {
           if (!p) return; var i = p.indexOf("=");
-          m.push([decodeURIComponent(i < 0 ? p : p.slice(0, i)), i < 0 ? "" : decodeURIComponent(p.slice(i + 1))]);
+          var k = decodeURIComponent(i < 0 ? p : p.slice(0, i));
+          var v = i < 0 ? "" : decodeURIComponent(p.slice(i + 1));
+          m.push([k, _tk ? OPQ(_tk + "." + k, v) : v]);
         });
       } else if (init && typeof init.forEach === "function") {
         init.forEach(function (v, k) { m.push([k, String(v)]); });
