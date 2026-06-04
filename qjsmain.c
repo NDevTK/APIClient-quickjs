@@ -174,6 +174,34 @@ static char *readfile(const char *p, size_t *n) {
     b[s] = 0; if (n) *n = (size_t)s; fclose(f); return b;
 }
 
+/* Spec-correct module dispatch (HTML §4.12.1): a <script> is a CLASSIC script
+   (GLOBAL scope) unless it uses module-only syntax (import / export / top-level
+   await). QuickJS's JS_DetectModule (quickjs.c) defaults AMBIGUOUS sources —
+   valid as EITHER, i.e. nearly every minified bundle — to MODULE: it compiles
+   the source AS a module and only returns false on a NON-import compile error,
+   so any strict-clean script is mis-flagged a module. Run as a module, a
+   slice's top-level `var X` is module-local, so a CDN <script src> bundle's
+   `var Sentry` never becomes the global a later inline <script> reads (the
+   measured cross-slice-global moat gap; an IIFE/UMD bundle with zero top-level
+   import/export came back isModule:1). We probe the SCRIPT grammar instead: a
+   source is a module IFF it CANNOT compile as a classic script (import /
+   export / top-level await are script syntax errors). Ambiguous sources compile
+   fine as a script -> CLASSIC — matching the <script> default and restoring
+   top-level `this`=globalThis for UMD bundles. COMPILE_ONLY in the live ctx:
+   no eval, no new runtime, side-effect-free; the pending compile error is
+   cleared before return. */
+static int qjs_source_is_module(JSContext *ctx, const char *src, size_t n,
+                                const char *filename) {
+    JSEvalOptions opt = { JS_EVAL_OPTIONS_VERSION,
+                          JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY,
+                          filename ? filename : "<probe>", 1 };
+    JSValue v = JS_Eval2(ctx, src, n, &opt);
+    int is_mod = JS_IsException(v);
+    if (is_mod) { JSValue e = JS_GetException(ctx); JS_FreeValue(ctx, e); }
+    JS_FreeValue(ctx, v);
+    return is_mod;
+}
+
 /* Evaluate a script the way real browsers do: classic scripts run in
    GLOBAL scope; ES module scripts (`<script type="module">`, or any source
    with top-level `export`/`import`) compile+run in MODULE scope.
@@ -206,8 +234,13 @@ static JSValue qjs_eval_script(JSContext *ctx, const char *src, size_t n,
        a missing /d.js eval line is the signal that an earlier
        script's eval blocked the loop. Cheap stderr; doesn't pollute
        the stdout protocol. */
-    fprintf(stderr, "@WHY {\"phase\":\"eval_script\",\"file\":\"%s\",\"len\":%zu}\n",
-            filename ? filename : "(null)", n);
+    /* Module-vs-classic dispatch via the script-grammar probe (see
+       qjs_source_is_module): ambiguous sources -> CLASSIC/GLOBAL so a slice's
+       top-level `var X` is a shared global the next slice reads. isModule is
+       logged for verification (it should read 0 for a classic CDN bundle). */
+    int _is_mod = qjs_source_is_module(ctx, src, n, filename);
+    fprintf(stderr, "@WHY {\"phase\":\"eval_script\",\"file\":\"%s\",\"len\":%zu,\"isModule\":%d}\n",
+            filename ? filename : "(null)", n, _is_mod);
     fflush(stderr);
     /* Set __feCurFile before the eval so the /p.js-installed
        document.currentScript live getter returns THIS script's
@@ -222,7 +255,7 @@ static JSValue qjs_eval_script(JSContext *ctx, const char *src, size_t n,
         JS_SetPropertyStr(ctx, g, "__feCurFile", JS_NewString(ctx, filename));
         JS_FreeValue(ctx, g);
     }
-    if (JS_DetectModule(src, n)) {
+    if (_is_mod) {
         JSEvalOptions opt = { JS_EVAL_OPTIONS_VERSION,
                               JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY,
                               filename, start_line };
@@ -795,7 +828,16 @@ int main(int argc, char **argv) {
                line numbers into the .bc's debug info so stack frames at
                run-time report combined-bundle line numbers without further
                offset math. */
-            int bc_module = JS_DetectModule(s, sn);
+            int bc_module = qjs_source_is_module(ctx, s, sn, argv[i + 1]);
+            /* @WHY: the per-slice module-vs-classic dispatch is baked into the
+               .bc HERE (the bundle takes the bytecode path, not qjs_eval_script).
+               isModule=1 ⇒ top-level `var X` is module-local: a CDN <script src>
+               defining `var Sentry` would be INVISIBLE to a later inline slice.
+               After the script-grammar fix this reads 0 for a classic bundle —
+               the verification signal that the cross-slice global is restored. */
+            fprintf(stderr, "@WHY {\"phase\":\"bc_emit\",\"file\":\"%s\",\"len\":%zu,\"isModule\":%d}\n",
+                    argv[i + 1] ? argv[i + 1] : "(null)", sn, bc_module);
+            fflush(stderr);
             int bc_start = qjs_lookup_start_line(argv[i + 1]);
             JSEvalOptions bcopt = { JS_EVAL_OPTIONS_VERSION,
                                     (bc_module ? JS_EVAL_TYPE_MODULE : JS_EVAL_TYPE_GLOBAL)
