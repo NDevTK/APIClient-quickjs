@@ -59866,6 +59866,44 @@ static int qjs_has_value_branch(JSContext *ctx, JSFunctionBytecode *b) {
     return 0;
 }
 
+/* A body-builder for the value-spread: an opaque/guard branch whose arms BOTH
+   reach a host edge AND whose conditional region STORES a property — the appwrite
+   `if(typeof email!=='undefined')payload.email=email` → client.call shape. Tighter
+   than qjs_has_value_branch alone: it excludes pure URL-string branches (concat,
+   no store), so spreading a caller on a huge bundle neither emits junk
+   `…/undefined` endpoints nor drives non-builders. */
+static int qjs_is_cond_body_builder(JSContext *ctx, JSFunctionBytecode *b) {
+    if (!b || !b->byte_code_buf) return 0;
+    int len = b->byte_code_len, pos = 0;
+    const uint8_t *bc = b->byte_code_buf;
+    while (pos < len) {
+        int op = bc[pos];
+        int osz = short_opcode_info(op).size;
+        if (osz < 1) break;
+        if (op == OP_if_true || op == OP_if_false || op == OP_if_true8 || op == OP_if_false8) {
+            int jpc = (op == OP_if_true8 || op == OP_if_false8)
+                ? pos + 1 + (int8_t)bc[pos + 1]
+                : pos + 1 + (int32_t)get_u32(bc + pos + 1);
+            int fpc = pos + osz;
+            if (qjs_host_reach_from(ctx, b, jpc) && qjs_host_reach_from(ctx, b, fpc)) {
+                /* The conditional body is the bytes between the two arm targets;
+                   a property/element store there is the body-key assignment. */
+                int lo = fpc < jpc ? fpc : jpc;
+                int hi = fpc < jpc ? jpc : fpc;
+                if (hi > len) hi = len;
+                for (int q = lo; q >= 0 && q < hi; ) {
+                    int o2 = bc[q]; int s2 = short_opcode_info(o2).size; if (s2 < 1) break;
+                    if (o2 == OP_put_field || o2 == OP_define_field ||
+                        o2 == OP_put_array_el || o2 == OP_define_array_el) return 1;
+                    q += s2;
+                }
+            }
+        }
+        pos += osz;
+    }
+    return 0;
+}
+
 /* Network-only refinement of qjs_host_reach_from: returns 1 iff control
    from start_pc reaches a NETWORK-edge host atom (fetch/XHR/WebSocket/
    EventSource/sendBeacon/send) — i.e. an atom that is NOT a sink. Used
@@ -61479,11 +61517,56 @@ static JSValue js_fe_value_spread(JSContext *ctx, JSValueConst this_val,
             p->class_id != JS_CLASS_ASYNC_GENERATOR_FUNCTION) continue;
         JSFunctionBytecode *b = p->u.func.function_bytecode;
         if (!b || !b->byte_code_buf) continue;
-        if (!b->qjs_h_fired) continue;                      /* fired only (residue handles never-fired) */
+        /* Two complementary targets: (1) the ORIGINAL own-fired fn with a value
+           branch (role=guest|admin URL spread), gated cheaply by qjs_h_fired; and
+           (2) a body-building CALLER — a conditional that STORES a body key feeding
+           a shared fetch helper (appwrite createEmailPasswordSession→client.call).
+           (2) must be STATIC (qjs_h_fired/qjs_executed are wiped by the per-schedule
+           memory restore) but is tightened to the property-store shape so it doesn't
+           drive junk URL-builders on a huge bundle. */
         if (qjs_is_host_model_file(b->filename)) continue;
-        if (!qjs_has_value_branch(ctx, b)) continue;        /* GATE: must have a value/guard branch */
+        if (!((b->qjs_h_fired && qjs_has_value_branch(ctx, b)) || qjs_is_cond_body_builder(ctx, b))) continue;
         if (n == cap) { int nc = cap ? cap * 2 : 16; JSValue *nt = js_realloc(ctx, targets, nc * sizeof *nt); if (!nt) break; targets = nt; cap = nc; }
         targets[n++] = JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, p));
+    }
+    /* Real-receiver map: a METHOD body-builder (appwrite createEmailPasswordSession
+       → this.client.call) must be spread with a heap instance whose prototype owns
+       it as `this`, else this.client is opaque and the conditional body keys never
+       reach the real fetch. Mirrors js_fe_drive_static's mapping (tag each target's
+       bytecode with qjs_deep_ix; scan instances, walk the proto chain, map the
+       owner). qjs_deep_rb is NULL during boot so qjs_deep_ix is safe scratch. */
+    JSValue *target_this = n > 0 ? js_mallocz(ctx, (size_t)n * sizeof(JSValue)) : NULL;
+    if (target_this) {
+        for (int i = 0; i < n; i++) {
+            target_this[i] = JS_UNDEFINED;
+            JSFunctionBytecode *tb = JS_VALUE_GET_OBJ(targets[i])->u.func.function_bytecode;
+            if (tb) tb->qjs_deep_ix = i;
+        }
+        struct list_head *iel;
+        list_for_each(iel, &rt->gc_obj_list) {
+            JSGCObjectHeader *igp = list_entry(iel, JSGCObjectHeader, link);
+            if (igp->gc_obj_type != JS_GC_OBJ_TYPE_JS_OBJECT) continue;
+            JSObject *inst = (JSObject *)igp;
+            if (inst->class_id != JS_CLASS_OBJECT) continue;
+            for (JSObject *po = inst->shape ? inst->shape->proto : NULL; po; po = po->shape ? po->shape->proto : NULL) {
+                JSShape *psh = po->shape;
+                if (!psh) break;
+                for (int pi = 0; pi < psh->prop_count; pi++) {
+                    JSShapeProperty *prs = &psh->prop[pi];
+                    if (prs->atom == JS_ATOM_NULL || (prs->flags & JS_PROP_TMASK)) continue;
+                    JSValue mv = po->prop[pi].u.value;
+                    if (JS_VALUE_GET_TAG(mv) != JS_TAG_OBJECT) continue;
+                    JSObject *mo = JS_VALUE_GET_OBJ(mv);
+                    if (mo->class_id != JS_CLASS_BYTECODE_FUNCTION && mo->class_id != JS_CLASS_GENERATOR_FUNCTION &&
+                        mo->class_id != JS_CLASS_ASYNC_FUNCTION && mo->class_id != JS_CLASS_ASYNC_GENERATOR_FUNCTION) continue;
+                    JSFunctionBytecode *mfb = mo->u.func.function_bytecode;
+                    if (!mfb) continue;
+                    int ix = mfb->qjs_deep_ix;
+                    if (ix >= 0 && ix < n && JS_VALUE_GET_OBJ(targets[ix])->u.func.function_bytecode == mfb && JS_IsUndefined(target_this[ix]))
+                        target_this[ix] = JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, inst));
+                }
+            }
+        }
     }
     int enumerated = 0;
     for (int i = 0; i < n; i++) {
@@ -61496,7 +61579,10 @@ static JSValue js_fe_value_spread(JSContext *ctx, JSValueConst this_val,
         if (nargs > 0 && !args) continue;
         for (int ai = 0; ai < nargs; ai++) args[ai] = qjs_fe_named_arg(ctx, b, ai, "vspread");
         qjs_fe_taint_event_arg0(ctx, b, args, nargs);
-        JSValue this_v = qjs_opq_make(ctx, 1, "vspread-this", qjs_t_opaque());
+        /* Real instance for a method (this.X concrete), opaque otherwise. */
+        JSValue this_v = (target_this && !JS_IsUndefined(target_this[i]))
+                         ? JS_DupValue(ctx, target_this[i])
+                         : qjs_opq_make(ctx, 1, "vspread-this", qjs_t_opaque());
         qjs_drive_orphan_enum(ctx, targets[i], this_v, nargs, args, is_ctor);
         JS_FreeValue(ctx, this_v);
         for (int ai = 0; ai < nargs; ai++) JS_FreeValue(ctx, args[ai]);
@@ -61506,6 +61592,7 @@ static JSValue js_fe_value_spread(JSContext *ctx, JSValueConst this_val,
     }
     for (int i = 0; i < n; i++) JS_FreeValue(ctx, targets[i]);
     js_free(ctx, targets);
+    if (target_this) { for (int i = 0; i < n; i++) JS_FreeValue(ctx, target_this[i]); js_free(ctx, target_this); }
     fflush(stderr);
     return JS_NewInt32(ctx, enumerated);
 }
