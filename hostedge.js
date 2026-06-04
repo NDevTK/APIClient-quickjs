@@ -125,7 +125,12 @@
         typeof document.__feLoadPage === "function") {
       document.__feLoadPage(_ph);
     }
-  } catch (e) {}
+  } catch (e) {
+    // NO SILENT FAILURE: a throw here zeroes the DOM-gated surface (CE
+    // connectedCallback / querySelector-on-SSR fetches — the moat) with no @H;
+    // surface it so a 0-endpoint run carries a reason instead of looking clean.
+    if (typeof printErr === "function") printErr('@WHY {"phase":"feLoadPage_throw","len":' + ((G.__pageHtml && G.__pageHtml.length) | 0) + ',"err":' + JSON.stringify(String(e && e.message || e)) + '}');
+  }
 
   function siteOf() {
     var s; try { s = new Error().stack || ""; } catch (e) { return null; }
