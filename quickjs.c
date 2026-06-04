@@ -92,6 +92,14 @@ static int qjs_is_sink_atom(JSAtom a);
 static JSFunctionBytecode *qjs_dir_b = NULL;
 static int qjs_dir_target = -1;
 static int qjs_dir_active = 0;
+/* The current value-spread target (qjs_drive_orphan_enum): a known body-builder
+   that provably reaches a host edge via a CALL (qjs_is_cond_body_builder gated
+   it in). qjs_host_reach_check below only sees DIRECT/closure-literal host edges,
+   so it would PRUNE (no-fork) a builder whose fetch is in a GLOBAL helper —
+   leaving its conditional body-key arm (`void 0!==x&&(p.k=x)` / `if(x)p.k=x`)
+   unexplored. The OP_if handlers bypass that per-function prune for this one
+   function so both arms of its guard fork. */
+static JSFunctionBytecode *qjs_vspread_b = NULL;
 /* fwd: cold edge-coverage value-spread enumeration (defined near
    js_fe_drive_static), called from the deep grind which precedes it. */
 static void qjs_drive_orphan_enum(JSContext *ctx, JSValueConst fn, JSValueConst this_val,
@@ -21305,7 +21313,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (_pinned >= 0) {
                         res = _pinned;
                         qjs_t_free(_pt);
-                    } else if (!qjs_host_reach_check(ctx, b)) {
+                    } else if (b != qjs_vspread_b && !qjs_host_reach_check(ctx, b)) {
                         /* Per-function scope pruning: this function's
                            bytecode reaches no host-edge atom (direct or
                            via closure-literal). Flipping its opaque
@@ -21493,7 +21501,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (_pinned >= 0) {
                         res = _pinned;
                         qjs_t_free(_pt);
-                    } else if (!qjs_host_reach_check(ctx, b)) {
+                    } else if (b != qjs_vspread_b && !qjs_host_reach_check(ctx, b)) {
                         /* Per-function scope pruning: this function's
                            bytecode reaches no host-edge atom (direct or
                            via closure-literal). Flipping its opaque
@@ -21665,7 +21673,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (_pinned >= 0) {
                         res = _pinned;
                         qjs_t_free(_pt);
-                    } else if (!qjs_host_reach_check(ctx, b)) {
+                    } else if (b != qjs_vspread_b && !qjs_host_reach_check(ctx, b)) {
                         /* Per-function scope pruning: this function's
                            bytecode reaches no host-edge atom (direct or
                            via closure-literal). Flipping its opaque
@@ -21832,7 +21840,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (_pinned >= 0) {
                         res = _pinned;
                         qjs_t_free(_pt);
-                    } else if (!qjs_host_reach_check(ctx, b)) {
+                    } else if (b != qjs_vspread_b && !qjs_host_reach_check(ctx, b)) {
                         /* Per-function scope pruning: this function's
                            bytecode reaches no host-edge atom (direct or
                            via closure-literal). Flipping its opaque
@@ -61415,6 +61423,7 @@ static void qjs_drive_orphan_enum(JSContext *ctx, JSValueConst fn, JSValueConst 
                                   int nargs, JSValue *args, int is_ctor) {
     const char *sv_sched = qjs_fe_sched; size_t sv_len = qjs_fe_len, sv_cur = qjs_fe_cur;
     int sv_lcap = qjs_fe_lcap;
+    JSFunctionBytecode *sv_vspread = qjs_vspread_b; qjs_vspread_b = JS_GetFunctionBytecode(fn);   /* this target's guards fork even though its host edge is a global-callee */
     qjs_fe_lcap_cap = 256;
     qjs_fe_lcap_dec = (unsigned char *)js_malloc(ctx, qjs_fe_lcap_cap);
     qjs_fe_lcap_isf = (unsigned char *)js_malloc(ctx, qjs_fe_lcap_cap);
@@ -61488,6 +61497,7 @@ static void qjs_drive_orphan_enum(JSContext *ctx, JSValueConst fn, JSValueConst 
     js_free(ctx, qjs_fe_lcap_dec); js_free(ctx, qjs_fe_lcap_isf); js_free(ctx, qjs_fe_lcap_key);
     qjs_fe_lcap_dec = qjs_fe_lcap_isf = NULL; qjs_fe_lcap_key = NULL; qjs_fe_lcap_cap = 0;
     qjs_fe_lcap = sv_lcap; qjs_fe_sched = sv_sched; qjs_fe_len = sv_len; qjs_fe_cur = sv_cur;
+    qjs_vspread_b = sv_vspread;
 }
 
 /* The value-SPREAD pass (driver.js calls __feValueSpread after __feDriveStatic).
