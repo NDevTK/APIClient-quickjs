@@ -60,7 +60,14 @@
   // adapter's isUnresolved files the latter as a resolverError, never a
   // fabricated endpoint.
   function urlOf(v) {
-    var s = URLSHAPE(v); s = (typeof s === "string") ? s : String(v);
+    // A concrete URL OBJECT's .href is its CURRENT serialization, reflecting
+    // url.searchParams.set / url.search mutations (the supabase/axios query
+    // builder) — prefer it over __feUrlShape, which is the structural/opaque-
+    // template shape and drops a query built after construction. Opaque URLs
+    // (ISOPQANY) and non-URL inputs keep the shape/String path.
+    var s;
+    if (v && typeof v === "object" && typeof v.href === "string" && !ISOPQANY(v)) s = v.href;
+    else { s = URLSHAPE(v); s = (typeof s === "string") ? s : String(v); }
     // Resolve EVERY concrete fetch/XHR target against the page base (WHATWG
     // URL), exactly as the browser does: "/api/x", "api/x", "../x", "./x",
     // "?q=1", "#h", and "" (fetch(location.hash) → the host page) all become the
@@ -1041,13 +1048,19 @@
       this._m = m;
     };
     var USPp = G.URLSearchParams.prototype;
-    USPp.append = function (k, v) { this._m.push([k, String(v)]); };
-    USPp.set = function (k, v) { this._m = this._m.filter(function (e) { return e[0] !== k; }); this._m.push([k, String(v)]); };
+    /* Live two-way bind: params obtained from url.searchParams carry a _feUrl
+       back-ref (qjs_dom g_u_search_params sets it); a mutation re-serializes into
+       url.search so `url.searchParams.set("select", cols); fetch(url)` records the
+       query — the supabase/axios builder pattern. Detached `new URLSearchParams()`
+       has no _feUrl → no-op. Re-parse keeps both sides exact (encoding round-trip). */
+    USPp._sync = function () { if (this._feUrl) { try { this._feUrl.search = this.toString(); } catch (e) {} } };
+    USPp.append = function (k, v) { this._m.push([k, String(v)]); this._sync(); };
+    USPp.set = function (k, v) { this._m = this._m.filter(function (e) { return e[0] !== k; }); this._m.push([k, String(v)]); this._sync(); };
     USPp.get = function (k) { for (var i = 0; i < this._m.length; i++) if (this._m[i][0] === k) return this._m[i][1]; return null; };
     USPp.getAll = function (k) { return this._m.filter(function (e) { return e[0] === k; }).map(function (e) { return e[1]; }); };
     USPp.has = function (k) { return this._m.some(function (e) { return e[0] === k; }); };
-    USPp["delete"] = function (k) { this._m = this._m.filter(function (e) { return e[0] !== k; }); };
-    USPp.sort = function () { this._m.sort(function (a, b) { return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0; }); };
+    USPp["delete"] = function (k) { this._m = this._m.filter(function (e) { return e[0] !== k; }); this._sync(); };
+    USPp.sort = function () { this._m.sort(function (a, b) { return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0; }); this._sync(); };
     USPp.forEach = function (cb) { var mm = this._m.slice(); for (var i = 0; i < mm.length; i++) cb(mm[i][1], mm[i][0], this); };
     USPp.toString = function () { return this._m.map(function (e) { return encodeURIComponent(e[0]) + "=" + encodeURIComponent(e[1]); }).join("&"); };
     USPp.entries = function () { return this._m.slice()[Symbol.iterator](); };

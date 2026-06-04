@@ -956,9 +956,11 @@ static JSValue g_u_origin(JSContext *ctx, JSValueConst t) {
 static JSValue g_u_search_params(JSContext *ctx, JSValueConst t) {
     /* URLSearchParams over the query. hostedge defines URLSearchParams
        (it runs before any bundle code, after this install), so resolve
-       it at call time. Read-mostly: code that mutates then reassigns
-       `url.search = params.toString()` is exact; a live two-way bind is
-       not modelled (documented, not silently wrong). */
+       it at call time. LIVE two-way bind: the params carry a _feUrl
+       back-ref to THIS url, so hostedge's URLSearchParams._sync
+       re-serializes a mutation (url.searchParams.set("select", cols))
+       into url.search — the supabase/axios query-builder pattern that a
+       detached snapshot silently dropped (lost moat query params). */
     JSValue q = g_u_search(ctx, t);
     const char *qs = JS_ToCString(ctx, q);
     JSValue arg = JS_NewString(ctx, (qs && qs[0] == '?') ? qs + 1 : (qs ? qs : ""));
@@ -971,6 +973,7 @@ static JSValue g_u_search_params(JSContext *ctx, JSValueConst t) {
     if (JS_IsConstructor(ctx, USP)) {
         JSValueConst a[1] = { arg };
         r = JS_CallConstructor(ctx, USP, 1, a);
+        if (!JS_IsException(r)) JS_SetPropertyStr(ctx, r, "_feUrl", JS_DupValue(ctx, t));
     } else r = JS_NewObject(ctx);
     JS_FreeValue(ctx, USP); JS_FreeValue(ctx, arg);
     return r;
