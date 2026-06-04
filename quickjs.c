@@ -20063,6 +20063,45 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     }
     b = p->u.func.function_bytecode;
 
+    /* No-progress opaque-recursion collapse — the branchless-recursion fixpoint
+       (loop3 / deep_recurse). A function re-entering itself with structurally-
+       identical arguments (an OPAQUE arg of the same identity; concrete args the
+       same value) makes no progress — its result is a pure function of args that
+       repeat — and recurses until the native stack overflows. The OP_if recursion
+       fixpoint can't see it: that one keys only OPAQUE BRANCHES, and a for-in
+       recursion on an opaque value has none. Detect it HERE, before the frame is
+       allocated (so an early return needs no teardown): if this bytecode is
+       already on the caller chain AND every arg SameValue-matches the nearest
+       same-bytecode ancestor's, return opaque — bounding the recursion at the
+       fixpoint instead of the native stack. The FIRST entry already ran (its body
+       explored host edges); only the no-progress re-entry collapses (mirrors the
+       OP_if _recur "arms explored once"). Gated on an opaque arg so concrete-arg
+       calls (the hot path) skip the chain walk, and short-circuits at the nearest
+       same-bytecode ancestor. Skipped for generator/async resume (same logical
+       args, not a new call). */
+    if (!(flags & JS_CALL_FLAG_GENERATOR) && argc > 0) {
+        int _hopq = 0;
+        for (i = 0; i < argc; i++) if (qjs_is_opaque(argv[i])) { _hopq = 1; break; }
+        if (_hopq) {
+            for (JSStackFrame *_anc = rt->current_stack_frame; _anc; _anc = _anc->prev_frame) {
+                if (JS_GetFunctionBytecode(_anc->cur_func) != b) continue;
+                int _same = (_anc->arg_count == argc);
+                for (i = 0; _same && i < argc; i++)
+                    if (!js_same_value(caller_ctx, argv[i], _anc->arg_buf[i])) _same = 0;
+                if (_same) {
+                    static long _rcN = 0;
+                    if (_rcN++ < 100) {
+                        printf("@WHY {\"phase\":\"recur_collapse\",\"line\":%d,\"col\":%d,\"argc\":%d}\n",
+                               b->line_num, b->col_num, argc);
+                        fflush(stdout);
+                    }
+                    return qjs_opq_make(caller_ctx, 1, "recur-fixpoint", qjs_t_opaque());
+                }
+                break;   /* only the nearest same-bytecode ancestor matters */
+            }
+        }
+    }
+
     if (unlikely(argc < b->arg_count || (flags & JS_CALL_FLAG_COPY_ARGV))) {
         arg_allocated_size = b->arg_count;
     } else {
