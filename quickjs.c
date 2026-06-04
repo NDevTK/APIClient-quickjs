@@ -1782,7 +1782,13 @@ static void qjs_sb_holes(qjs_sb *b, qjs_term *t, int *n) {
 }
 static JSValue js_fe_url_holes(JSContext *ctx, JSValueConst this_val,
                                int argc, JSValueConst *argv) {
-    return JS_UNDEFINED; /* DISABLED with the rest of the read-site capture (wasm OOB on real bundles); the source-map relabel runs from the finding's call-site loc in background.js, needing no engine hole code */
+    /* RE-ENABLED 2026-06-04. This URL-hole term walk (qjs_sb_holes over t->a/t->b)
+       was stubbed behind an un-rooted wasm OOB; MEASURED that the OOB no longer
+       reproduces — learn.microsoft.com (6486 orphans, 72 endpoints / 47 templated),
+       github, gitlab all ran clean with this AND qjs_stamp_rd enabled (0
+       wasm_abort, 0 urlHolesOf_throw). Emits each opaque URL-param hole's
+       {name,line,col} so background.js resolves the declared param name via the
+       source map — restores per-param URL naming that was entirely off. */
     if (argc < 1 || !qjs_is_opaque(argv[0])) return JS_UNDEFINED;
     qjs_term *t = qjs_opq_of(argv[0])->term;
     if (!t) return JS_UNDEFINED;
@@ -9829,7 +9835,14 @@ static int qjs_cur_loc(JSContext *ctx, int *line, int *col) {
    way, so the source-map library can name each path param distinctly. Opaque-
    only; the caller gates on a cheap tag check so non-object reads pay nothing. */
 static void qjs_stamp_rd(JSContext *ctx, JSFunctionBytecode *b, const uint8_t *pc, JSValueConst v) {
-    return; /* DISABLED: read-site position stamping caused a wasm "memory access out of bounds" on real Chrome bundles (not reproduced in the _wdeep fixture). Relabel deferred pending root-cause; grind restored. */
+    /* Read-site URL-param position stamping. RE-ENABLED 2026-06-04 — the
+       historical wasm "memory access out of bounds" was MEASURED to no longer
+       reproduce (learn.microsoft.com drove 6486 orphans + 73 endpoints with many
+       templated params, github, gitlab — all clean with this AND js_fe_url_holes
+       enabled; 0 wasm_abort, 0 urlHolesOf_throw). Stamps o->term->line/col
+       (metadata only — never read by the Z3 path: op/leaf/s/a/b) so a URL-param
+       hole carries its precise READ-site bundle position for source-map naming.
+       Guarded below: only an opaque LEAF/MEMBER term, not yet stamped. */
     qjs_opq *o = qjs_opq_of(v);
     if (!o || !o->term || o->term->line || !b || !b->byte_code_buf || !b->pc2line_buf) return;
     /* Only LEAF/MEMBER terms ever become a URL-hole NAME (qjs_url_hole_name);
