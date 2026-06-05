@@ -61539,6 +61539,22 @@ static JSValue js_fe_value_spread(JSContext *ctx, JSValueConst this_val,
         if (n == cap) { int nc = cap ? cap * 2 : 16; JSValue *nt = js_realloc(ctx, targets, nc * sizeof *nt); if (!nt) break; targets = nt; cap = nc; }
         targets[n++] = JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, p));
     }
+    /* Productive paths first (resume-by-relevance): drive CONFIRMED-fired value-
+       branch targets before the speculative body-building callers, so a huge
+       bundle (github ~500 body-builders) surfaces its known-reaching endpoints
+       first while the preemptible spread keeps grinding. Stable partition, fired
+       to the front — done BEFORE the qjs_deep_ix tagging so the receiver map and
+       drive order agree. */
+    if (n > 1) {
+        JSValue *_ord = js_malloc(ctx, (size_t)n * sizeof(JSValue));
+        if (_ord) {
+            int _w = 0;
+            for (int _r = 0; _r < n; _r++) { JSFunctionBytecode *_rb = JS_VALUE_GET_OBJ(targets[_r])->u.func.function_bytecode; if (_rb && _rb->qjs_h_fired) _ord[_w++] = targets[_r]; }
+            for (int _r = 0; _r < n; _r++) { JSFunctionBytecode *_rb = JS_VALUE_GET_OBJ(targets[_r])->u.func.function_bytecode; if (!(_rb && _rb->qjs_h_fired)) _ord[_w++] = targets[_r]; }
+            for (int _r = 0; _r < n; _r++) targets[_r] = _ord[_r];
+            js_free(ctx, _ord);
+        }
+    }
     /* Real-receiver map: a METHOD body-builder (appwrite createEmailPasswordSession
        → this.client.call) must be spread with a heap instance whose prototype owns
        it as `this`, else this.client is opaque and the conditional body keys never
