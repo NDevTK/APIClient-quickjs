@@ -19315,6 +19315,24 @@ static __exception int js_iterator_get_value_done(JSContext *ctx, JSValue *sp)
     JSValue obj, value;
     int done;
     obj = sp[-1];
+    /* Forced-exec: an OPAQUE iterator result must yield an OPAQUE `done`.
+       JS_IteratorGetCompleteValue extracts done into a concrete C int (pushed as
+       js_bool), so an opaque done becomes concrete-false — making `for await
+       (chunk of wrapper)` (whose next() resolved to an opaque stream read, e.g.
+       openai stream-utils ReadableStreamToAsyncIterable) a CONCRETE infinite loop
+       with no opaque branch for the revisit fixpoint to key (the spin). Yield
+       value=opaque (the element, drives the body once) + done=OPAQUE so the loop's
+       `if(done)` forks and the loop-revisit exit-arm terminates it. The direct-
+       opaque case (`for await (x of OPAQUE)`) is already bounded by JS_GetIterator
+       (one element then a real done:true); this covers the concrete-iterator-
+       yielding-opaque case its bounded Array Iterator can't reach. */
+    if (qjs_is_opaque(obj)) {
+        value = qjs_like(ctx, obj);
+        JS_FreeValue(ctx, obj);
+        sp[-1] = value;
+        sp[0] = qjs_opaque_new(ctx);
+        return 0;
+    }
     if (!JS_IsObject(obj)) {
         JS_ThrowTypeError(ctx, "iterator must return an object");
         return -1;
