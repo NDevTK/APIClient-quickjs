@@ -208,6 +208,14 @@ struct qjs_term {
        the declared name (e→owner) via originalPositionFor().name. 0 = unset.
        Metadata only — never read by the Z3 path (op/leaf/s/a/b). */
     int      line, col;
+    /* op=='L' only: the CONCRETE EXAMPLE the source carried at mint
+       (location.search → the page's real "?a=1"; URLSearchParams.get → "42").
+       For API learning — emitted per URL hole in qjs_sb_holes so a templated
+       endpoint surfaces /api/user/{userId} WITH example 42 even when the value
+       rode through a concat (the opaque's `shape` is only reachable for a bare
+       leaf, lost the moment it's interpolated). Never read by Z3 (the leaf
+       stays attacker-tainted). NULL = no known example. */
+    char    *ex;
 };
 /* Leaf id table. Entries are indexed by id; each row is the source
    label as a heap-allocated string. Two interning policies coexist:
@@ -262,14 +270,14 @@ static void qjs_t_free(qjs_term *t) {
         qjs_term *kid[2]; int nk = 0;
         if (t->a && --t->a->ref <= 0) kid[nk++] = t->a;
         if (t->b && --t->b->ref <= 0) kid[nk++] = t->b;
-        free(t->s); free(t);
+        free(t->s); free(t->ex); free(t);
         for (int i = 0; i < nk; i++) {
             if (top == cap) {
                 size_t nc = cap * 2;
                 qjs_term **ns = (stk == inl) ? (qjs_term **)malloc(nc * sizeof *ns)
                                              : (qjs_term **)realloc(stk, nc * sizeof *ns);
                 if (!ns) {   /* OOM (rare): free this node shallow, leak its kids — beats a crash */
-                    qjs_term *c = kid[i]; free(c->s); free(c); continue;
+                    qjs_term *c = kid[i]; free(c->s); free(c->ex); free(c); continue;
                 }
                 if (stk == inl) memcpy(ns, inl, top * sizeof *ns);
                 stk = ns; cap = nc;
@@ -1719,7 +1727,20 @@ static JSValue js_make_opaque(JSContext *ctx, JSValueConst this_val,
     JSValue r = qjs_opq_make(ctx, 0, lab, qjs_t_leaf(lab));
     if (argc > 1 && JS_IsString(argv[1])) {
         const char *ex = JS_ToCString(ctx, argv[1]);
-        if (ex) { qjs_opq_set_shape(r, ex); JS_FreeCString(ctx, ex); }
+        if (ex) {
+            qjs_opq_set_shape(r, ex);
+            /* Also carry the example ON THE LEAF TERM: the opaque's shape is
+               only reachable for a bare leaf (js_fe_url_shape line ~1825), but
+               the leaf term rides into every CONCAT that interpolates this
+               source (fetch("/api/raw"+location.search)), so qjs_sb_holes can
+               surface the per-param example there too. */
+            qjs_opq *_o = qjs_opq_of(r);
+            if (_o && _o->term && _o->term->op == 'L' && !_o->term->ex) {
+                size_t _n = strlen(ex) + 1; _o->term->ex = malloc(_n);
+                if (_o->term->ex) memcpy(_o->term->ex, ex, _n);
+            }
+            JS_FreeCString(ctx, ex);
+        }
     }
     if (lab) JS_FreeCString(ctx, lab);
     return r;
@@ -1853,8 +1874,28 @@ static JSValue js_opaque_shape(JSContext *ctx, JSValueConst this_val,
     if (o && o->shape) return JS_NewString(ctx, o->shape);
     return JS_UNDEFINED;
 }
+/* The concrete EXAMPLE behind a URL hole, mirroring qjs_url_hole_name's walk: a
+   source leaf (location.search / URLSearchParams.get result) carries it on
+   t->ex; a pass-through F (encodeURIComponent(x)) digs into the arg. NULL for a
+   genuinely-opaque hole (a bare {id} with no seeded source) — stays a value-less
+   template, never a fabricated example. */
+static const char *qjs_url_hole_example(qjs_term *t) {
+    if (!t) return NULL;
+    if (t->op == 'L') return t->ex;
+    if (t->op == 'F') { const char *e = qjs_url_hole_example(t->b); return e ? e : qjs_url_hole_example(t->a); }
+    return NULL;
+}
+/* JSON-escape a C string into the sb (the example is a real query string / value
+   — may contain " \ or controls, unlike the identifier hole names). */
+static void qjs_sb_json_str(qjs_sb *out, const char *s) {
+    for (; s && *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '"' || c == '\\') qjs_sb_putc(out, '\\');
+        if (c < 0x20) qjs_sb_printf(out, "\\u%04x", c); else qjs_sb_putc(out, c);
+    }
+}
 /* Parallel to qjs_sb_url0 — same hole order. Each opaque URL hole emits a JSON
-   {name,line,col} where line/col is the generated bundle position where the
+   {name,example?,line,col} where line/col is the generated bundle position where the
    value was interpolated into the URL (stamped in js_add_slow). background.js
    pairs each path param with its position and resolves the declared name
    (e→owner) through a standard source-map library — the engine supplies only
@@ -1868,11 +1909,14 @@ static void qjs_sb_holes(qjs_sb *b, qjs_term *t, int *n) {
         return;
     }
     const char *nm = qjs_url_hole_name(t);
+    const char *ex = qjs_url_hole_example(t);
     if (*n) qjs_sb_putc(b, ',');
     (*n)++;
     qjs_sb_puts(b, "{\"name\":\"");
     if (nm) qjs_sb_puts(b, nm);   /* hole names are identifiers/property names — JSON-safe ASCII */
-    qjs_sb_printf(b, "\",\"line\":%d,\"col\":%d}", t->line, t->col);
+    qjs_sb_putc(b, '"');
+    if (ex) { qjs_sb_puts(b, ",\"example\":\""); qjs_sb_json_str(b, ex); qjs_sb_putc(b, '"'); }
+    qjs_sb_printf(b, ",\"line\":%d,\"col\":%d}", t->line, t->col);
 }
 static JSValue js_fe_url_holes(JSContext *ctx, JSValueConst this_val,
                                int argc, JSValueConst *argv) {
