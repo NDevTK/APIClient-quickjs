@@ -676,6 +676,42 @@
     this[Symbol.iterator] = function () { return Object.keys(m).map(function (k) { return [k, m[k]]; })[Symbol.iterator](); };
   }
   G.Headers = Headers;
+  // A response body is a WHATWG ReadableStream. Leaving it null/opaque made EVERY
+  // stream consumer SPIN: `response.body.getReader().read()` (and the openai
+  // stream-utils `for await`) never reached `done`, looping forever. We do NOT
+  // issue the request (SECURITY.md:69 — recorded-not-issued), and a real COOKIELESS
+  // GET would 401 an auth endpoint, pushing the bundle onto its error branch and
+  // off the success/feature path the moat learns. So model the body CONCRETE +
+  // TERMINATING: ONE chunk then done. The chunk DATA stays OPAQUE (genuine server
+  // input — preserves any chained-request shape); only the stream PROTOCOL (`done`)
+  // is concrete, so a stream loop runs its chunk handler ONCE and ENDS.
+  function _bodyStream() {
+    function rdr() {
+      var pulled = false;
+      return {
+        closed: Promise.resolve(),
+        read: function () { var d = pulled; pulled = true; return Promise.resolve(d ? { done: true, value: undefined } : { done: false, value: OPQ("fetch.body.chunk") }); },
+        releaseLock: function () {}, cancel: function () { return Promise.resolve(); }
+      };
+    }
+    var s = {
+      locked: false,
+      getReader: function () { return rdr(); },
+      cancel: function () { return Promise.resolve(); },
+      tee: function () { return [_bodyStream(), _bodyStream()]; },
+      pipeTo: function () { return Promise.resolve(); },
+      pipeThrough: function (t) { return (t && t.readable) || _bodyStream(); }
+    };
+    s.values = function () {
+      var r = rdr();
+      var it = { next: function () { return r.read(); } };
+      it["return"] = function () { return Promise.resolve({ done: true, value: undefined }); };
+      it[Symbol.asyncIterator] = function () { return this; };
+      return it;
+    };
+    s[Symbol.asyncIterator] = function () { return s.values(); };
+    return s;
+  }
   function bodyMethods(o) {
     o.bodyUsed = false;
     o.json = function () { return Promise.resolve(OPQ("fetch.body.json")); };
@@ -685,7 +721,7 @@
     o.formData = function () { return Promise.resolve(OPQ("fetch.body.formData")); };
     o.bytes = function () { return Promise.resolve(new Uint8Array(0)); };
     o.clone = function () { return o; };
-    o.body = null;
+    o.body = _bodyStream();   // concrete + terminating (was null → stream consumers spun)
     return o;
   }
   function Response(body, init) {
