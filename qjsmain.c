@@ -418,11 +418,25 @@ static char *qjs_module_normalize(JSContext *ctx, const char *base_name,
     if (!name || !name[0]) return js_strdup(ctx, name ? name : "");
     if (name[0] == '/') return js_strdup(ctx, name);   /* absolute MEMFS */
     /* Absolute CDN-URL import (`import x from "https://cdn/auth.js"`, how modular
-       ESM apps pull deps): keep the URL verbatim as its own canonical name. The
-       bare-specifier branch below would mangle it to "/https://…" (MEMFS miss),
-       and the loader hook emits the verbatim URL for discovery → fetch → re-run. */
-    if (!strncmp(name, "http://", 7) || !strncmp(name, "https://", 8))
-        return js_strdup(ctx, name);
+       ESM apps pull deps). The worker downloads such a module and registers it as a
+       slice at its URL BASENAME ("/firebase-auth.js" — ast-thread slice naming), so
+       map the URL to that basename: the import then LINKS to the fetched slice on
+       the re-boot. Discovery of the full URL is js_resolve_module's up-front pass
+       (it reads the raw pre-normalize specifier, before this mapping). */
+    if (!strncmp(name, "http://", 7) || !strncmp(name, "https://", 8)) {
+        const char *slash = strrchr(name, '/');
+        const char *base = slash ? slash + 1 : name;
+        size_t blen = strcspn(base, "?#");   /* drop ?query / #frag from the basename */
+        if (blen) {
+            char *out = js_malloc(ctx, blen + 2);
+            if (!out) return NULL;
+            out[0] = '/';
+            memcpy(out + 1, base, blen);
+            out[blen + 1] = '\0';
+            return out;
+        }
+        return js_strdup(ctx, name);   /* directory-style URL, no basename — keep */
+    }
     if (name[0] != '.') {
         size_t nlen = strlen(name);
         char *abs = js_malloc(ctx, nlen + 2);
@@ -465,15 +479,10 @@ extern JSModuleDef *js_module_loader(JSContext *ctx, const char *module_name,
    means this fires at most once per canonical name. */
 static JSModuleDef *qjs_module_loader_hook(JSContext *ctx, const char *module_name,
                                            void *opaque, JSValueConst attributes) {
-    /* CDN-URL import: emit the URL so the worker's discover→fetch→re-run loop
-       pulls the module into MEMFS (then this loader resolves it on the re-boot).
-       Emitted on every boot until resolved; the worker dedups. js_module_loader
-       still runs — it succeeds once the module is in MEMFS, fails (as today) until
-       then, so this never regresses a bundle that ships its modules inline. */
-    if (module_name && (!strncmp(module_name, "http://", 7) || !strncmp(module_name, "https://", 8))) {
-        printf("@MODURL %s\n", module_name);
-        fflush(stdout);
-    }
+    /* CDN-URL import discovery is js_resolve_module's up-front pass (it emits the
+       raw URL before this loader runs); qjs_module_normalize then maps the URL to
+       the downloaded slice's basename, so by here module_name is already MEMFS-
+       local and js_module_loader resolves it directly. */
     return js_module_loader(ctx, module_name, opaque, attributes);
 }
 

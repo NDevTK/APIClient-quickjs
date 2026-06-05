@@ -33852,6 +33852,22 @@ static int js_resolve_module(JSContext *ctx, JSModuleDef *m)
     }
 #endif
     m->resolved = true;
+    /* Emit EVERY CDN-URL import of this module up front — the resolve loop below
+       returns -1 on the FIRST unresolved import (a not-yet-fetched CDN module), so
+       a multi-import module (`import a from "https://…/app.js"; import b from
+       "https://…/auth.js"`) would otherwise only ever surface app.js; auth.js's
+       resolve never runs. This separate read-only pass lets the worker's chunk-
+       discovery fetch ALL deps. Pure emission — no resolution-logic change. */
+    for(i = 0; i < m->req_module_entries_count; i++) {
+        const char *_rn = JS_AtomToCString(ctx, m->req_module_entries[i].module_name);
+        if (_rn) {
+            if (!strncmp(_rn, "http://", 7) || !strncmp(_rn, "https://", 8)) {
+                printf("@MODURL %s\n", _rn);
+                fflush(stdout);
+            }
+            JS_FreeCString(ctx, _rn);
+        }
+    }
     /* resolve each requested module */
     for(i = 0; i < m->req_module_entries_count; i++) {
         JSReqModuleEntry *rme = &m->req_module_entries[i];
