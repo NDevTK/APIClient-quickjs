@@ -33864,6 +33864,18 @@ static int js_resolve_module(JSContext *ctx, JSModuleDef *m)
             if (!strncmp(_rn, "http://", 7) || !strncmp(_rn, "https://", 8)) {
                 printf("@MODURL %s\n", _rn);
                 fflush(stdout);
+            } else if (_rn[0] == '/' || _rn[0] == '.') {
+                /* Relative/absolute-path import — esm.sh-style: a fetched CDN module
+                   importing `/@supabase/auth-js.mjs` relative to its OWN origin, which
+                   normalize would treat as MEMFS-absolute and never surface. Emit it
+                   WITH the importing module's name (TAB-separated) so the worker can
+                   WHATWG-resolve the specifier against that module's real URL. */
+                const char *_imp = JS_AtomToCString(ctx, m->module_name);
+                if (_imp) {
+                    printf("@MODURL %s\t%s\n", _imp, _rn);
+                    fflush(stdout);
+                    JS_FreeCString(ctx, _imp);
+                }
             }
             JS_FreeCString(ctx, _rn);
         }
