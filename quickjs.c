@@ -24299,8 +24299,28 @@ static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
         js_async_function_terminate(ctx->rt, s);
     } else {
         JSValue value;
-        value = s->func_state.frame.cur_sp[-1];
-        s->func_state.frame.cur_sp[-1] = JS_UNDEFINED;
+        /* Bound-check the async value-stack before the await/return read. A
+           forced-exec cold-drive of an async orphan (seen on the OpenAI SDK deep
+           grind: main→qjs_deep_step_c_h→…→js_async_function_resume) can leave
+           cur_sp outside the frame's value-stack region, so cur_sp[-1] traps
+           UNCATCHABLY ("memory access out of bounds") and recycles the instance.
+           Surface the bad pointer + continue with an undefined await/return value
+           instead of trapping. No-op for a normally-suspended frame. */
+        JSStackFrame *_af = &s->func_state.frame;
+        JSValue *_base = _af->var_buf +
+            JS_VALUE_GET_OBJ(_af->cur_func)->u.func.function_bytecode->var_count;
+        if (_af->cur_sp <= _base || _af->cur_sp > (JSValue *)_af->var_refs) {
+            static int _async_bad_sp_n;
+            if (_async_bad_sp_n < 20) { _async_bad_sp_n++;
+                printf("@WHY {\"phase\":\"async_resume_bad_sp\",\"sp_off\":%lld,\"base_off\":%lld,\"top_off\":%lld,\"argc\":%d}\n",
+                       (long long)(_af->cur_sp - _af->arg_buf), (long long)(_base - _af->arg_buf),
+                       (long long)((JSValue *)_af->var_refs - _af->arg_buf), _af->arg_count);
+                fflush(stdout); }
+            value = JS_UNDEFINED;
+        } else {
+            value = _af->cur_sp[-1];
+            _af->cur_sp[-1] = JS_UNDEFINED;
+        }
         if (JS_IsUndefined(func_ret)) {
             /* function returned */
             ret2 = JS_Call(ctx, s->resolving_funcs[0], JS_UNDEFINED,
