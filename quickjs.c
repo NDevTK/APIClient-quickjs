@@ -60606,6 +60606,7 @@ static JSValue qjs_fe_inst_opaque(JSContext *ctx, JSFunctionBytecode *b) {
    qjsmain), so the bundle is booted ONCE, not re-parsed per batch. */
 static JSFunctionBytecode **qjs_deep_rb = NULL;
 static JSValue *qjs_deep_insts = NULL;   /* parallel to qjs_deep_rb: real function-instance JSObject when one exists on the heap (so its closure var_refs carry through to the drive); JS_UNDEFINED otherwise → fall back to qjs_fe_inst_opaque (opaque var_refs). Real var_refs let a closure-private CALLER reach its sibling wrapper concretely instead of collapsing to opaque on `M(literal)`. */
+static JSValue *qjs_deep_recv = NULL;   /* parallel to qjs_deep_rb: the real heap RECEIVER — an instance whose prototype chain owns the orphan as a method — so a `this.client.call(...)` body-builder (appwrite createEmailPasswordSession) drives with a CONCRETE `this` instead of opaque (else this.client is opaque and the conditional body keys never reach the real fetch). Ported from js_fe_value_spread's receiver map into the PREEMPTIBLE deep grind: the reverted seed-drive wrapper-gate overloaded github by driving hundreds of wrappers per re-boot; this adds NO orphans, only a concrete `this` to drives that already happen. JS_UNDEFINED when no receiver instance exists → opaque `this` fallback. */
 /* Cached STATIC reach-bits parallel to qjs_deep_rb. net/sink are pure
    functions of bytecode (they never change as the grind runs), so the
    per-pick comparator reads them in O(1) instead of re-walking the
@@ -60730,6 +60731,12 @@ void qjs_deep_free(JSContext *ctx) {
             if (!JS_IsUndefined(qjs_deep_insts[i])) JS_FreeValue(ctx, qjs_deep_insts[i]);
         }
         js_free(ctx, qjs_deep_insts); qjs_deep_insts = NULL;
+    }
+    if (qjs_deep_recv) {
+        for (int i = 0; i < qjs_deep_rb_n; i++) {
+            if (!JS_IsUndefined(qjs_deep_recv[i])) JS_FreeValue(ctx, qjs_deep_recv[i]);
+        }
+        js_free(ctx, qjs_deep_recv); qjs_deep_recv = NULL;
     }
     if (qjs_deep_rb) { js_free(ctx, qjs_deep_rb); qjs_deep_rb = NULL; }
     if (qjs_deep_net) { js_free(ctx, qjs_deep_net); qjs_deep_net = NULL; }
@@ -61057,6 +61064,40 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
                 }
             }
         }
+        /* Real-receiver map (parallel scan): an instance whose prototype chain owns an
+           orphan as a method becomes its drive `this`, so a `this.client.call(...)`
+           body-builder runs concrete instead of opaque. qjs_deep_ix was tagged above;
+           match a proto method's bytecode to its orphan index. Mirrors
+           js_fe_value_spread's map, but here (deep grind) it adds no orphans. */
+        qjs_deep_recv = js_malloc(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1) * sizeof(JSValue));
+        if (qjs_deep_recv) {
+            for (int i = 0; i < qjs_deep_rb_n; i++) qjs_deep_recv[i] = JS_UNDEFINED;
+            struct list_head *rel;
+            list_for_each(rel, &rt->gc_obj_list) {
+                JSGCObjectHeader *rgp = list_entry(rel, JSGCObjectHeader, link);
+                if (rgp->gc_obj_type != JS_GC_OBJ_TYPE_JS_OBJECT) continue;
+                JSObject *inst = (JSObject *)rgp;
+                if (inst->class_id != JS_CLASS_OBJECT) continue;
+                for (JSObject *po = inst->shape ? inst->shape->proto : NULL; po; po = po->shape ? po->shape->proto : NULL) {
+                    JSShape *psh = po->shape;
+                    if (!psh) break;
+                    for (int pi = 0; pi < psh->prop_count; pi++) {
+                        JSShapeProperty *prs = &psh->prop[pi];
+                        if (prs->atom == JS_ATOM_NULL || (prs->flags & JS_PROP_TMASK)) continue;
+                        JSValue mv = po->prop[pi].u.value;
+                        if (JS_VALUE_GET_TAG(mv) != JS_TAG_OBJECT) continue;
+                        JSObject *mo = JS_VALUE_GET_OBJ(mv);
+                        if (mo->class_id != JS_CLASS_BYTECODE_FUNCTION && mo->class_id != JS_CLASS_GENERATOR_FUNCTION &&
+                            mo->class_id != JS_CLASS_ASYNC_FUNCTION && mo->class_id != JS_CLASS_ASYNC_GENERATOR_FUNCTION) continue;
+                        JSFunctionBytecode *mfb = mo->u.func.function_bytecode;
+                        if (!mfb) continue;
+                        int rix = mfb->qjs_deep_ix;
+                        if (rix >= 0 && rix < qjs_deep_rb_n && qjs_deep_rb[rix] == mfb && JS_IsUndefined(qjs_deep_recv[rix]))
+                            qjs_deep_recv[rix] = JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, inst));
+                    }
+                }
+            }
+        }
         JS_RunGC(rt);
     }
     int driven = 0;
@@ -61219,7 +61260,7 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
                search component `this._input=$0e(async()=>this.fetch())`). */
             JSValue r2 = _is_cls_ctor
                 ? JS_CallConstructor(ctx, fo, nargs, args3)
-                : JS_Call(ctx, fo, this_opq2, nargs, args3);
+                : JS_Call(ctx, fo, (qjs_deep_recv && !JS_IsUndefined(qjs_deep_recv[_ix])) ? qjs_deep_recv[_ix] : this_opq2, nargs, args3);
             if (b->func_kind & JS_FUNC_ASYNC) { JSContext *c2;
                 while (JS_ExecutePendingJob(rt, &c2) > 0) {
 #if defined(__EMSCRIPTEN__) && defined(QJS_HAS_JSPI)
@@ -61289,7 +61330,7 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
             qjs_fe_seen_reset();   /* fresh loop-revisit bound per directed drive (one execution unit) */
             JSValue r = _is_cls_ctor
                 ? JS_CallConstructor(ctx, fo, nargs, args2)
-                : JS_Call(ctx, fo, this_opq, nargs, args2);
+                : JS_Call(ctx, fo, (qjs_deep_recv && !JS_IsUndefined(qjs_deep_recv[_ix])) ? qjs_deep_recv[_ix] : this_opq, nargs, args2);
             /* An async @T method suspends at an `await` BEFORE its gated
                fetch (`if(await this.#e.getItem(o))return; …await fetch(…)`);
                the call above only runs it to that point. Resume the
