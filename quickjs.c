@@ -281,6 +281,39 @@ static void qjs_t_free(qjs_term *t) {
     }
     if (stk != inl) free(stk);
 }
+/* True iff `needle` (by identity) appears anywhere in `hay`'s term tree — i.e.
+   `hay` was DERIVED from `needle` by member/concat/call ops (the engine ref's the
+   SAME term pointer as a child: object[key] → member(key, object_term)). The
+   recursion-collapse fixpoint uses this to recognise the unbounded "infinitely-
+   nested opaque" recursion (qs/stringify descending object[key] forever): the new
+   arg's opaque term CONTAINS the prior arg's term even though they aren't SameValue.
+   Iterative — the term tree grows one level per recursion so it can be deep. */
+static int qjs_term_has_subterm(qjs_term *hay, qjs_term *needle) {
+    if (!hay || !needle) return 0;
+    qjs_term *inl[64]; qjs_term **stk = inl; size_t top = 0, cap = 64;
+    int found = 0;
+    stk[top++] = hay;
+    while (top > 0 && !found) {
+        qjs_term *t = stk[--top];
+        if (!t) continue;
+        if (t == needle) { found = 1; break; }
+        for (int k = 0; k < 2; k++) {
+            qjs_term *c = k ? t->b : t->a;
+            if (!c) continue;
+            if (top == cap) {
+                size_t nc = cap * 2;
+                qjs_term **ns = (stk == inl) ? (qjs_term **)malloc(nc * sizeof *ns)
+                                             : (qjs_term **)realloc(stk, nc * sizeof *ns);
+                if (!ns) { top = 0; break; }   /* OOM: stop the walk → conservatively "not derived" (no collapse) */
+                if (stk == inl) memcpy(ns, inl, top * sizeof *ns);
+                stk = ns; cap = nc;
+            }
+            stk[top++] = c;
+        }
+    }
+    if (stk != inl) free(stk);
+    return found;
+}
 static qjs_term *qjs_t_alloc(char op) {
     qjs_term *t = calloc(1, sizeof *t); if (!t) return NULL;
     t->ref = 1; t->op = op; return t;
@@ -20159,10 +20192,35 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         if (_hopq) {
             for (JSStackFrame *_anc = rt->current_stack_frame; _anc; _anc = _anc->prev_frame) {
                 if (JS_GetFunctionBytecode(_anc->cur_func) != b) continue;
-                int _same = (_anc->arg_count == argc);
-                for (i = 0; _same && i < argc; i++)
-                    if (!js_same_value(caller_ctx, argv[i], _anc->arg_buf[i])) _same = 0;
-                if (_same) {
+                /* Collapse a NO-PROGRESS re-entry. A recursion can only be BOUNDED
+                   by a concrete-PRIMITIVE arg that changes (a counter / shrinking
+                   index). So collapse when (every arg is SameValue — the original
+                   branchless no-progress case) OR (no changed arg is a concrete
+                   primitive AND at least one changed arg is an opaque value DERIVED
+                   from the ancestor's, its term CONTAINING the ancestor arg's term:
+                   object[key], prefix+key — descent into UNBOUNDED opaque nesting,
+                   e.g. qs/stringify). A fresh non-primitive object per level (qs
+                   passes a new sideChannel WeakMap) is NOT a bound, so it must not
+                   block the collapse; f(opaque, n-1) IS bounded (n-1 = a changed
+                   concrete primitive = real progress) so it is NOT collapsed. */
+                int _collapse = 0;
+                if (_anc->arg_count == argc) {
+                    int _allsame = 1, _hasderived = 0, _progprim = 0;
+                    for (i = 0; i < argc; i++) {
+                        if (js_same_value(caller_ctx, argv[i], _anc->arg_buf[i])) continue;
+                        _allsame = 0;
+                        qjs_opq *_oi = qjs_opq_of(argv[i]);
+                        if (_oi) {   /* opaque arg — never a concrete bound */
+                            qjs_opq *_oa = qjs_opq_of(_anc->arg_buf[i]);
+                            if (_oa && qjs_term_has_subterm(_oi->term, _oa->term)) _hasderived = 1;
+                            continue;
+                        }
+                        if (JS_VALUE_GET_TAG(argv[i]) == JS_TAG_OBJECT) continue;   /* fresh helper object, not a bound */
+                        _progprim = 1;   /* a changed concrete primitive = the real bound */
+                    }
+                    _collapse = _allsame || (_hasderived && !_progprim);
+                }
+                if (_collapse) {
                     static long _rcN = 0;
                     if (_rcN++ < 100) {
                         printf("@WHY {\"phase\":\"recur_collapse\",\"line\":%d,\"col\":%d,\"argc\":%d}\n",
