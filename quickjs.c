@@ -246,7 +246,40 @@ static int qjs_leaf_id(const char *label) {
 static qjs_term *qjs_t_ref(qjs_term *t) { if (t) t->ref++; return t; }
 static void qjs_t_free(qjs_term *t) {
     if (!t || --t->ref > 0) return;
-    qjs_t_free(t->a); qjs_t_free(t->b); free(t->s); free(t);
+    /* Iterative post-order free via an explicit worklist. The recursive form
+       (free a, free b, free self) overflows the C stack on a deep term chain:
+       a bundle's `s = s + x` loop (e.g. node/buffer.mjs base64 padding
+       `for(;t.length%4;)t=t+"="`) builds a left-leaning concat chain thousands
+       deep, and driving it under forced exec overflowed qjs_t_free into an
+       UNCATCHABLE wasm trap that recycled the whole instance (the abandoned
+       deep-grind orphans were exactly these buffer.mjs drives). Refcounts make
+       the term graph a bottom-up DAG (no cycles), so a worklist that frees a
+       node and queues each child whose ref reaches 0 terminates in O(1)
+       C-stack frames — the depth moves to the heap worklist, which stays ~1
+       entry for a chain. NOT a cap: every reachable node is still freed. */
+    qjs_term *inl[64]; qjs_term **stk = inl; size_t top = 0, cap = 64;
+    for (;;) {
+        qjs_term *kid[2]; int nk = 0;
+        if (t->a && --t->a->ref <= 0) kid[nk++] = t->a;
+        if (t->b && --t->b->ref <= 0) kid[nk++] = t->b;
+        free(t->s); free(t);
+        for (int i = 0; i < nk; i++) {
+            if (top == cap) {
+                size_t nc = cap * 2;
+                qjs_term **ns = (stk == inl) ? (qjs_term **)malloc(nc * sizeof *ns)
+                                             : (qjs_term **)realloc(stk, nc * sizeof *ns);
+                if (!ns) {   /* OOM (rare): free this node shallow, leak its kids — beats a crash */
+                    qjs_term *c = kid[i]; free(c->s); free(c); continue;
+                }
+                if (stk == inl) memcpy(ns, inl, top * sizeof *ns);
+                stk = ns; cap = nc;
+            }
+            stk[top++] = kid[i];
+        }
+        if (top == 0) break;
+        t = stk[--top];
+    }
+    if (stk != inl) free(stk);
 }
 static qjs_term *qjs_t_alloc(char op) {
     qjs_term *t = calloc(1, sizeof *t); if (!t) return NULL;
