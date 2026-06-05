@@ -416,34 +416,43 @@ static char *qjs_module_normalize(JSContext *ctx, const char *base_name,
                                   const char *name, void *opaque) {
     (void)opaque;
     if (!name || !name[0]) return js_strdup(ctx, name ? name : "");
-    if (name[0] == '/') return js_strdup(ctx, name);   /* absolute MEMFS */
-    /* Absolute CDN-URL import (`import x from "https://cdn/auth.js"`, how modular
-       ESM apps pull deps). The worker downloads such a module and registers it as a
-       slice at its URL BASENAME ("/firebase-auth.js" — ast-thread slice naming), so
-       map the URL to that basename: the import then LINKS to the fetched slice on
-       the re-boot. Discovery of the full URL is js_resolve_module's up-front pass
-       (it reads the raw pre-normalize specifier, before this mapping). */
+    /* Fetched-CDN-module identity is a URL ENCODED as "/x/<host><pathname>" (scheme +
+       ?query/#frag stripped) — collision-free (unlike a basename: esm.sh ships many
+       same-basename modules) and relative imports resolve against it by path ops.
+       Already-encoded "/x/…", inline "/b.N.js", and infra "/h.js"/"/d.js"/"/p.js"/
+       "/pre.js" slice paths pass through untouched. */
+    if (!strncmp(name, "/x/", 3) || !strncmp(name, "/b.", 3) ||
+        !strcmp(name, "/h.js") || !strcmp(name, "/d.js") ||
+        !strcmp(name, "/p.js") || !strcmp(name, "/pre.js"))
+        return js_strdup(ctx, name);
     if (!strncmp(name, "http://", 7) || !strncmp(name, "https://", 8)) {
-        /* Discovery: emit the RAW URL here too. normalize is invoked for every
-           import that actually gets resolved and sees the pre-mapping specifier,
-           so this reliably catches a single-import dep that js_resolve_module's
-           all-imports pass missed (measured: esm_cdn_main received:0 with the pass
-           alone). Deduped by the worker; the pass still covers the multi-import
-           case where the resolve loop aborts before normalize runs on dep #2. */
+        /* Discovery emit (normalize sees every resolved import's raw specifier — a
+           reliable complement to js_resolve_module's all-imports pass), then encode. */
         printf("@MODURL %s\n", name);
         fflush(stdout);
-        const char *slash = strrchr(name, '/');
-        const char *base = slash ? slash + 1 : name;
-        size_t blen = strcspn(base, "?#");   /* drop ?query / #frag from the basename */
-        if (blen) {
-            char *out = js_malloc(ctx, blen + 2);
+        const char *p = name + (name[4] == ':' ? 7 : 8);   /* skip "http://" / "https://" */
+        size_t hlen = strcspn(p, "?#");                     /* host + path, drop query/frag */
+        char *out = js_malloc(ctx, hlen + 4);
+        if (!out) return NULL;
+        out[0] = '/'; out[1] = 'x'; out[2] = '/';
+        memcpy(out + 3, p, hlen); out[hlen + 3] = '\0';
+        return out;
+    }
+    if (name[0] == '/') {
+        /* Absolute-path import (esm.sh: a fetched module importing "/@supabase/auth-js.mjs"
+           relative to its own origin). Resolve against the importer's ORIGIN: base_name is
+           the importer's encoded "/x/<host>/…", so keep its "/x/<host>" prefix + the abs path. */
+        if (base_name && !strncmp(base_name, "/x/", 3)) {
+            const char *hs = strchr(base_name + 3, '/');   /* first '/' after the host */
+            size_t olen = hs ? (size_t)(hs - base_name) : strlen(base_name);
+            size_t nlen = strlen(name);
+            char *out = js_malloc(ctx, olen + nlen + 1);
             if (!out) return NULL;
-            out[0] = '/';
-            memcpy(out + 1, base, blen);
-            out[blen + 1] = '\0';
+            memcpy(out, base_name, olen);
+            memcpy(out + olen, name, nlen + 1);
             return out;
         }
-        return js_strdup(ctx, name);   /* directory-style URL, no basename — keep */
+        return js_strdup(ctx, name);   /* real absolute MEMFS path (page-relative) */
     }
     if (name[0] != '.') {
         size_t nlen = strlen(name);
