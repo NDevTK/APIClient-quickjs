@@ -424,6 +424,14 @@ static char *qjs_module_normalize(JSContext *ctx, const char *base_name,
        the re-boot. Discovery of the full URL is js_resolve_module's up-front pass
        (it reads the raw pre-normalize specifier, before this mapping). */
     if (!strncmp(name, "http://", 7) || !strncmp(name, "https://", 8)) {
+        /* Discovery: emit the RAW URL here too. normalize is invoked for every
+           import that actually gets resolved and sees the pre-mapping specifier,
+           so this reliably catches a single-import dep that js_resolve_module's
+           all-imports pass missed (measured: esm_cdn_main received:0 with the pass
+           alone). Deduped by the worker; the pass still covers the multi-import
+           case where the resolve loop aborts before normalize runs on dep #2. */
+        printf("@MODURL %s\n", name);
+        fflush(stdout);
         const char *slash = strrchr(name, '/');
         const char *base = slash ? slash + 1 : name;
         size_t blen = strcspn(base, "?#");   /* drop ?query / #frag from the basename */
