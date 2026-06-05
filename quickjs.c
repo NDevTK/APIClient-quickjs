@@ -62076,6 +62076,25 @@ static JSValue js_fe_drive_static(JSContext *ctx, JSValueConst this_val,
                 for (int ai = 0; ai < nargs; ai++) argsR[ai] = qjs_fe_named_arg(ctx, b, ai, "static-real-this");
                 qjs_dir_active = 0; qjs_dir_b = NULL; qjs_dir_target = -1;
                 JSValue rr = JS_Call(ctx, targets[i], target_this[i], nargs, argsR);
+                /* An async real-receiver method (`async exchange(){ var c =
+                   await this._svc.getConfig(); return fetch(c.url) }`, oidc-
+                   client-ts's token exchange) suspends at the await; WITHOUT a
+                   pump the precursor stops at the first suspend and the reply-
+                   gated fetch never fires from the REAL receiver — so `c` stays a
+                   bare opaque and the chained reply-example is cold (the directed
+                   drive HAS a pump but uses qjs_deep_recv, opaque for this method;
+                   the gap was that the path with the real `this` had no pump).
+                   Drain the continuation so the nested chain resolves and the
+                   outer await receives the real reply. Gateless full drain (not
+                   `!qjs_h_fired`) so a method firing a DIRECT host edge before the
+                   await-gated one still reaches the gated site. Preemptible per
+                   job (same as the directed-drive pump). Oracle: chain_method_2await. */
+                if (b->func_kind & JS_FUNC_ASYNC) { JSContext *cp;
+                  while (JS_ExecutePendingJob(rt, &cp) > 0) {
+#if defined(__EMSCRIPTEN__) && defined(QJS_HAS_JSPI)
+                    qjs_host_yield();
+#endif
+                  } }
                 if (JS_IsException(rr)) { JSValue eR = JS_GetException(ctx); JS_FreeValue(ctx, eR); }
                 JS_FreeValue(ctx, rr);
                 for (int ai = 0; ai < nargs; ai++) JS_FreeValue(ctx, argsR[ai]);
