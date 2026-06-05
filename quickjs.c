@@ -23796,6 +23796,31 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         sf->cur_sp = sp;
     } else {
     done:
+        if (unlikely(b->func_kind != JS_FUNC_NORMAL)) {
+            /* A generator/async function reached the NORMAL `done` exit — the
+               comment above states this must NEVER happen: a generator/async
+               frame's locals are owned and freed by the CALLER (async_func_free),
+               and its value-stack pointer must be saved (done_generator) for the
+               next resume. It DOES happen when forced exec drives a module
+               top-level (`<eval>`, func_kind=ASYNC — see js_parse_eval 40918) as a
+               deep-grind orphan: an early OP_return_undef / OP_tail_call routes to
+               `done`, which (1) leaves cur_sp=NULL so the next resume mis-reads
+               cur_sp[-1], and (2) frees the locals that async_func_free frees AGAIN
+               — the frame holds the whole module closure, so it leaks ~the entire
+               graph (FreeRuntime_residue obj:1972/bc:1393) → the JS_FreeRuntime
+               list_empty(gc_obj_list) assert + an instance recycle storm. Recover
+               per the upstream invariant: exit via done_generator (save cur_sp,
+               leave the locals for the caller), never the local-freeing done. */
+            static int _adN;
+            if (_adN++ < 20) {
+                const char *_f = b->filename ? JS_AtomToCString(ctx, b->filename) : NULL;
+                printf("@WHY {\"phase\":\"async_reached_done\",\"file\":\"%s\",\"line\":%d,\"func_kind\":%d}\n",
+                       _f?_f:"?", b->line_num, b->func_kind);
+                if (_f) JS_FreeCString(ctx, _f);
+                fflush(stdout);
+            }
+            goto done_generator;
+        }
         if (unlikely(sf->var_ref_count != 0)) {
             /* variable references reference the stack: must close them */
             close_var_refs(rt, sf);
@@ -24370,9 +24395,23 @@ static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
         if (_af->cur_sp <= _base || _af->cur_sp > (JSValue *)_af->var_refs) {
             static int _async_bad_sp_n;
             if (_async_bad_sp_n < 20) { _async_bad_sp_n++;
-                printf("@WHY {\"phase\":\"async_resume_bad_sp\",\"sp_off\":%lld,\"base_off\":%lld,\"top_off\":%lld,\"argc\":%d}\n",
+                /* Name the VICTIM async (fn/file/line) + log absolute pointers so
+                   the corruptor can be located: cur_sp wild relative to var_buf
+                   tells whether the bad write is frame-relative or a fixed addr. */
+                JSFunctionBytecode *_vb = JS_VALUE_GET_OBJ(_af->cur_func)->u.func.function_bytecode;
+                const char *_vfn = _vb->func_name ? JS_AtomToCString(ctx, _vb->func_name) : NULL;
+                const char *_vfile = _vb->filename ? JS_AtomToCString(ctx, _vb->filename) : NULL;
+                uint32_t _vpc = _af->cur_pc ? (uint32_t)(_af->cur_pc - _vb->byte_code_buf - 1) : 0;
+                int _vcol = 1, _vline = find_line_num(ctx, _vb, _vpc, &_vcol);
+                printf("@WHY {\"phase\":\"async_resume_bad_sp\",\"sp_off\":%lld,\"base_off\":%lld,\"top_off\":%lld,\"argc\":%d,\"fn\":\"%s\",\"file\":\"%s\",\"line\":%d,\"pc\":%u,\"cur_sp\":\"%llx\",\"var_buf\":\"%llx\",\"var_refs\":\"%llx\"}\n",
                        (long long)(_af->cur_sp - _af->arg_buf), (long long)(_base - _af->arg_buf),
-                       (long long)((JSValue *)_af->var_refs - _af->arg_buf), _af->arg_count);
+                       (long long)((JSValue *)_af->var_refs - _af->arg_buf), _af->arg_count,
+                       _vfn ? _vfn : "?", _vfile ? _vfile : "?", _vline, _vpc,
+                       (unsigned long long)(uintptr_t)_af->cur_sp,
+                       (unsigned long long)(uintptr_t)_af->var_buf,
+                       (unsigned long long)(uintptr_t)_af->var_refs);
+                if (_vfn) JS_FreeCString(ctx, _vfn);
+                if (_vfile) JS_FreeCString(ctx, _vfile);
                 fflush(stdout); }
             value = JS_UNDEFINED;
         } else {
