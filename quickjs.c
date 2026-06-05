@@ -59912,25 +59912,6 @@ static int qjs_is_cond_body_builder(JSContext *ctx, JSFunctionBytecode *b) {
     return 0;
 }
 
-/* Transpiled-async WRAPPER: a fn whose cpool holds a cond_body_builder closure
-   — appwrite compiles `async m(){…}` to `m(){return t(this,…,function*(){…})}`,
-   so the conditional body-key stores live in the inner generator, not the branch-
-   less wrapper. The generator CANNOT be value-spread-driven directly (JS_Call on
-   a generator fn returns a generator OBJECT and never runs the body); the wrapper
-   CAN (it's a prototype method with a real receiver, and the runner steps the
-   generator synchronously to the fetch). Returns the inner builder so the drive
-   can target the wrapper while the fork-bypass (qjs_vspread_b) points at the
-   generator. */
-static JSFunctionBytecode *qjs_wraps_cond_body_builder(JSContext *ctx, JSFunctionBytecode *b) {
-    if (!b || b->cpool_count <= 0) return NULL;
-    for (int i = 0; i < b->cpool_count; i++) {
-        if (JS_VALUE_GET_TAG(b->cpool[i]) != JS_TAG_FUNCTION_BYTECODE) continue;
-        JSFunctionBytecode *c = JS_VALUE_GET_PTR(b->cpool[i]);
-        if (c && qjs_is_cond_body_builder(ctx, c)) return c;
-    }
-    return NULL;
-}
-
 /* Network-only refinement of qjs_host_reach_from: returns 1 iff control
    from start_pc reaches a NETWORK-edge host atom (fetch/XHR/WebSocket/
    EventSource/sendBeacon/send) — i.e. an atom that is NOT a sink. Used
@@ -61442,13 +61423,7 @@ static void qjs_drive_orphan_enum(JSContext *ctx, JSValueConst fn, JSValueConst 
                                   int nargs, JSValue *args, int is_ctor) {
     const char *sv_sched = qjs_fe_sched; size_t sv_len = qjs_fe_len, sv_cur = qjs_fe_cur;
     int sv_lcap = qjs_fe_lcap;
-    JSFunctionBytecode *sv_vspread = qjs_vspread_b; JSFunctionBytecode *_tb = JS_GetFunctionBytecode(fn);
-    /* If fn WRAPS a transpiled-async generator builder, the body-key guards live
-       in that inner generator (the runner steps it during fn's drive) — point the
-       fork-bypass there; else fn is the builder itself. Either way this target's
-       guards fork despite their host edge being a global/method callee. */
-    JSFunctionBytecode *_inner_bb = qjs_wraps_cond_body_builder(ctx, _tb);
-    qjs_vspread_b = _inner_bb ? _inner_bb : _tb;
+    JSFunctionBytecode *sv_vspread = qjs_vspread_b; qjs_vspread_b = JS_GetFunctionBytecode(fn);   /* this target's guards fork even though its host edge is a global-callee */
     qjs_fe_lcap_cap = 256;
     qjs_fe_lcap_dec = (unsigned char *)js_malloc(ctx, qjs_fe_lcap_cap);
     qjs_fe_lcap_isf = (unsigned char *)js_malloc(ctx, qjs_fe_lcap_cap);
@@ -61560,7 +61535,7 @@ static JSValue js_fe_value_spread(JSContext *ctx, JSValueConst this_val,
            memory restore) but is tightened to the property-store shape so it doesn't
            drive junk URL-builders on a huge bundle. */
         if (qjs_is_host_model_file(b->filename)) continue;
-        if (!((b->qjs_h_fired && qjs_has_value_branch(ctx, b)) || qjs_is_cond_body_builder(ctx, b) || qjs_wraps_cond_body_builder(ctx, b))) continue;
+        if (!((b->qjs_h_fired && qjs_has_value_branch(ctx, b)) || qjs_is_cond_body_builder(ctx, b))) continue;
         if (n == cap) { int nc = cap ? cap * 2 : 16; JSValue *nt = js_realloc(ctx, targets, nc * sizeof *nt); if (!nt) break; targets = nt; cap = nc; }
         targets[n++] = JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, p));
     }
