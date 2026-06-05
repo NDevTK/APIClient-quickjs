@@ -712,13 +712,19 @@
     s[Symbol.asyncIterator] = function () { return s.values(); };
     return s;
   }
-  function bodyMethods(o) {
+  function bodyMethods(o, srcUrl) {
     o.bodyUsed = false;
-    o.json = function () { return Promise.resolve(OPQ("fetch.body.json")); };
-    o.text = function () { return Promise.resolve(OPQ("fetch.body.text")); };
+    // The reply opaque carries its SOURCE endpoint in the label (space-separated
+    // after the tag — a URL never contains a raw space), so a reply->request
+    // chain (fetch(reply.field)) records WHICH endpoint a bounded reply-GET must
+    // fetch for the real example value (the fromReply seed, per CLAUDE.md policy).
+    // Concrete source URL only; an opaque/templated fetch URL contributes none.
+    var rs = (typeof srcUrl === "string" && srcUrl && srcUrl.indexOf("{") < 0 && srcUrl.indexOf("[object") < 0) ? (" " + srcUrl) : "";
+    o.json = function () { return Promise.resolve(OPQ("fetch.body.json" + rs)); };
+    o.text = function () { return Promise.resolve(OPQ("fetch.body.text" + rs)); };
     o.arrayBuffer = function () { return Promise.resolve(new ArrayBuffer(0)); };
-    o.blob = function () { return Promise.resolve(OPQ("fetch.body.blob")); };
-    o.formData = function () { return Promise.resolve(OPQ("fetch.body.formData")); };
+    o.blob = function () { return Promise.resolve(OPQ("fetch.body.blob" + rs)); };
+    o.formData = function () { return Promise.resolve(OPQ("fetch.body.formData" + rs)); };
     o.bytes = function () { return Promise.resolve(new Uint8Array(0)); };
     o.clone = function () { return o; };
     o.body = _bodyStream();   // concrete + terminating (was null → stream consumers spun)
@@ -726,7 +732,7 @@
   }
   function Response(body, init) {
     init = init || {};
-    bodyMethods(this);
+    bodyMethods(this, init.url);
     // Concrete success status (see XHR note) — body stays opaque.
     this.status = init.status != null ? init.status : 200;
     this.statusText = init.statusText != null ? init.statusText : "OK";
