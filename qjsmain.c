@@ -417,6 +417,12 @@ static char *qjs_module_normalize(JSContext *ctx, const char *base_name,
     (void)opaque;
     if (!name || !name[0]) return js_strdup(ctx, name ? name : "");
     if (name[0] == '/') return js_strdup(ctx, name);   /* absolute MEMFS */
+    /* Absolute CDN-URL import (`import x from "https://cdn/auth.js"`, how modular
+       ESM apps pull deps): keep the URL verbatim as its own canonical name. The
+       bare-specifier branch below would mangle it to "/https://…" (MEMFS miss),
+       and the loader hook emits the verbatim URL for discovery → fetch → re-run. */
+    if (!strncmp(name, "http://", 7) || !strncmp(name, "https://", 8))
+        return js_strdup(ctx, name);
     if (name[0] != '.') {
         size_t nlen = strlen(name);
         char *abs = js_malloc(ctx, nlen + 2);
@@ -459,6 +465,15 @@ extern JSModuleDef *js_module_loader(JSContext *ctx, const char *module_name,
    means this fires at most once per canonical name. */
 static JSModuleDef *qjs_module_loader_hook(JSContext *ctx, const char *module_name,
                                            void *opaque, JSValueConst attributes) {
+    /* CDN-URL import: emit the URL so the worker's discover→fetch→re-run loop
+       pulls the module into MEMFS (then this loader resolves it on the re-boot).
+       Emitted on every boot until resolved; the worker dedups. js_module_loader
+       still runs — it succeeds once the module is in MEMFS, fails (as today) until
+       then, so this never regresses a bundle that ships its modules inline. */
+    if (module_name && (!strncmp(module_name, "http://", 7) || !strncmp(module_name, "https://", 8))) {
+        printf("@MODURL %s\n", module_name);
+        fflush(stdout);
+    }
     return js_module_loader(ctx, module_name, opaque, attributes);
 }
 
