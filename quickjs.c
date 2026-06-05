@@ -61599,6 +61599,14 @@ static JSValue js_fe_value_spread(JSContext *ctx, JSValueConst this_val,
         if (args) js_free(ctx, args);
         enumerated++;
         fprintf(stderr, "@WHY {\"phase\":\"vspread_enum\"}\n");
+#if defined(__EMSCRIPTEN__) && defined(QJS_HAS_JSPI)
+        /* Preemptible: yield to the host between targets so the per-yield stdout
+           drain flushes @H -> endpoints and the scheduler can interleave. A huge
+           API surface (github: hundreds of body-builders) must not block result
+           production while the value-spread grinds — without this the seed drive
+           runs all N targets before any endpoint surfaces (the endpoints:0 stall). */
+        qjs_host_yield();
+#endif
     }
     for (int i = 0; i < n; i++) JS_FreeValue(ctx, targets[i]);
     js_free(ctx, targets);
