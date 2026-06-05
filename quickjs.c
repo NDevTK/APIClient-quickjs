@@ -1885,6 +1885,18 @@ static const char *qjs_url_hole_example(qjs_term *t) {
     if (t->op == 'F') { const char *e = qjs_url_hole_example(t->b); return e ? e : qjs_url_hole_example(t->a); }
     return NULL;
 }
+/* The deepest SOURCE-LEAF label behind a URL hole — the provenance: a
+   location.search/hash hole carries "location.search"; a reply->request chain
+   (oidc metadata.token_endpoint) carries "fetch.body.json", the server-response
+   the URL came from. The ONLY honest signal for "a fetch flows into a fetch":
+   the worker tests this for a "fetch."/"XHR." prefix. NULL for a bare opaque. */
+static const char *qjs_url_hole_label(qjs_term *t) {
+    if (!t) return NULL;
+    if (t->op == 'L') return t->s;
+    if (t->op == 'M') return qjs_url_hole_label(t->a);
+    if (t->op == 'F') { const char *l = qjs_url_hole_label(t->b); return l ? l : qjs_url_hole_label(t->a); }
+    return NULL;
+}
 /* JSON-escape a C string into the sb (the example is a real query string / value
    — may contain " \ or controls, unlike the identifier hole names). */
 static void qjs_sb_json_str(qjs_sb *out, const char *s) {
@@ -1910,12 +1922,14 @@ static void qjs_sb_holes(qjs_sb *b, qjs_term *t, int *n) {
     }
     const char *nm = qjs_url_hole_name(t);
     const char *ex = qjs_url_hole_example(t);
+    const char *src = qjs_url_hole_label(t);
     if (*n) qjs_sb_putc(b, ',');
     (*n)++;
     qjs_sb_puts(b, "{\"name\":\"");
     if (nm) qjs_sb_puts(b, nm);   /* hole names are identifiers/property names — JSON-safe ASCII */
     qjs_sb_putc(b, '"');
     if (ex) { qjs_sb_puts(b, ",\"example\":\""); qjs_sb_json_str(b, ex); qjs_sb_putc(b, '"'); }
+    if (src) { qjs_sb_puts(b, ",\"src\":\""); qjs_sb_json_str(b, src); qjs_sb_putc(b, '"'); }
     qjs_sb_printf(b, ",\"line\":%d,\"col\":%d}", t->line, t->col);
 }
 static JSValue js_fe_url_holes(JSContext *ctx, JSValueConst this_val,
