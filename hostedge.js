@@ -1088,6 +1088,12 @@
         for (var k in init) m.push([k, String(init[k])]);
       }
       this._m = m;
+      // Source provenance: when built from an opaque (attacker-controlled
+      // location.search/hash), a param ABSENT from the concrete shape must still
+      // read as opaque — the attacker could supply it — so a `.get(k)`-gated arm
+      // (oidc signinCallback's `if(!params.get("code"))return`) FORKS and its
+      // gated endpoint surfaces, instead of bailing on a concrete null.
+      this._opq = _tk;
     };
     var USPp = G.URLSearchParams.prototype;
     /* Live two-way bind: params obtained from url.searchParams carry a _feUrl
@@ -1098,9 +1104,9 @@
     USPp._sync = function () { if (this._feUrl) { try { this._feUrl.search = this.toString(); } catch (e) {} } };
     USPp.append = function (k, v) { this._m.push([k, String(v)]); this._sync(); };
     USPp.set = function (k, v) { this._m = this._m.filter(function (e) { return e[0] !== k; }); this._m.push([k, String(v)]); this._sync(); };
-    USPp.get = function (k) { for (var i = 0; i < this._m.length; i++) if (this._m[i][0] === k) return this._m[i][1]; return null; };
-    USPp.getAll = function (k) { return this._m.filter(function (e) { return e[0] === k; }).map(function (e) { return e[1]; }); };
-    USPp.has = function (k) { return this._m.some(function (e) { return e[0] === k; }); };
+    USPp.get = function (k) { for (var i = 0; i < this._m.length; i++) if (this._m[i][0] === k) return this._m[i][1]; return this._opq ? OPQ(this._opq + "." + k) : null; };
+    USPp.getAll = function (k) { var r = this._m.filter(function (e) { return e[0] === k; }).map(function (e) { return e[1]; }); return (r.length === 0 && this._opq) ? [OPQ(this._opq + "." + k)] : r; };
+    USPp.has = function (k) { for (var i = 0; i < this._m.length; i++) if (this._m[i][0] === k) return true; return this._opq ? OPQ(this._opq + ".has." + k) : false; };
     USPp["delete"] = function (k) { this._m = this._m.filter(function (e) { return e[0] !== k; }); this._sync(); };
     USPp.sort = function () { this._m.sort(function (a, b) { return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0; }); this._sync(); };
     USPp.forEach = function (cb) { var mm = this._m.slice(); for (var i = 0; i < mm.length; i++) cb(mm[i][1], mm[i][0], this); };
