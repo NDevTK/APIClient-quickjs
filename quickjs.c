@@ -589,42 +589,62 @@ static void qjs_sb_printf(qjs_sb *b, const char *fmt, ...) {
     va_start(ap, fmt); vsnprintf(big, (size_t)n + 1, fmt, ap); va_end(ap);
     qjs_sb_puts(b, big); free(big);
 }
-static void qjs_sb_term0(qjs_sb *b, qjs_term *t) {
-    if (!t) { qjs_sb_putc(b, '?'); return; }
-    switch (t->op) {
-    case 'L': qjs_sb_printf(b, "$%d:%s", t->leaf, t->s ? t->s : "?"); return;
-    case 'K':
-        qjs_sb_putc(b, '"');
-        for (const char *p = t->s ? t->s : ""; *p; p++) {
-            if (*p == '"' || *p == '\\') qjs_sb_putc(b, '\\');
-            qjs_sb_putc(b, (unsigned char)*p);
+/* Iterative — was recursive on ->a/->b like qjs_t_free, so the same deep-chain
+   C-stack overflow could trap it on a security sink that builds a long concat/op
+   chain. A work-stack of (term, phase) items re-visits each interior node at its
+   child boundaries to emit the infix/suffix, so the output is BYTE-FOR-BYTE the
+   recursive form's while using O(1) C-stack frames regardless of term depth. */
+static void qjs_sb_term0(qjs_sb *b, qjs_term *root) {
+    struct sbti { qjs_term *t; int ph; };
+    struct sbti inl[128], *stk = inl; size_t top = 0, cap = 128;
+#define QJS_SBT_PUSH(T, P) do { \
+        if (top == cap) { size_t nc = cap * 2; \
+            struct sbti *ns = (stk == inl) ? (struct sbti *)malloc(nc * sizeof *ns) \
+                                           : (struct sbti *)realloc(stk, nc * sizeof *ns); \
+            if (!ns) break; \
+            if (stk == inl) memcpy(ns, inl, top * sizeof *ns); \
+            stk = ns; cap = nc; } \
+        stk[top].t = (T); stk[top].ph = (P); top++; \
+    } while (0)
+    QJS_SBT_PUSH(root, 0);
+    while (top > 0) {
+        struct sbti it = stk[--top];
+        qjs_term *t = it.t;
+        if (!t) { qjs_sb_putc(b, '?'); continue; }
+        switch (t->op) {
+        case 'L': qjs_sb_printf(b, "$%d:%s", t->leaf, t->s ? t->s : "?"); break;
+        case 'K':
+            qjs_sb_putc(b, '"');
+            for (const char *p = t->s ? t->s : ""; *p; p++) {
+                if (*p == '"' || *p == '\\') qjs_sb_putc(b, '\\');
+                qjs_sb_putc(b, (unsigned char)*p);
+            }
+            qjs_sb_putc(b, '"');
+            break;
+        case 'N': qjs_sb_printf(b, "%g", t->n); break;
+        case 'O': qjs_sb_putc(b, '?'); break;
+        case 'M':                          /* MEMBER: (. base "name") */
+            if (it.ph == 0) { qjs_sb_puts(b, "(. "); QJS_SBT_PUSH(t, 1); QJS_SBT_PUSH(t->a, 0); }
+            else qjs_sb_printf(b, " \"%s\")", t->s ? t->s : "?");
+            break;
+        case 'F':                          /* CALL: (name base arg) */
+            if (it.ph == 0) { qjs_sb_putc(b, '('); qjs_sb_puts(b, t->s ? t->s : "?"); qjs_sb_putc(b, ' '); QJS_SBT_PUSH(t, 1); QJS_SBT_PUSH(t->a, 0); }
+            else if (it.ph == 1) { qjs_sb_putc(b, ' '); QJS_SBT_PUSH(t, 2); QJS_SBT_PUSH(t->b, 0); }
+            else qjs_sb_putc(b, ')');
+            break;
+        case 'U':                          /* UNARY NOT: (! base) */
+            if (it.ph == 0) { qjs_sb_puts(b, "(! "); QJS_SBT_PUSH(t, 1); QJS_SBT_PUSH(t->a, 0); }
+            else qjs_sb_putc(b, ')');
+            break;
+        default:                           /* CMP etc.: (op a b) */
+            if (it.ph == 0) { qjs_sb_putc(b, '('); qjs_sb_putc(b, t->op); qjs_sb_putc(b, ' '); QJS_SBT_PUSH(t, 1); QJS_SBT_PUSH(t->a, 0); }
+            else if (it.ph == 1) { qjs_sb_putc(b, ' '); QJS_SBT_PUSH(t, 2); QJS_SBT_PUSH(t->b, 0); }
+            else qjs_sb_putc(b, ')');
+            break;
         }
-        qjs_sb_putc(b, '"');
-        return;
-    case 'N': qjs_sb_printf(b, "%g", t->n); return;
-    case 'O': qjs_sb_putc(b, '?'); return;
-    case 'M':                          /* MEMBER: (. base "name") */
-        qjs_sb_puts(b, "(. ");
-        qjs_sb_term0(b, t->a);
-        qjs_sb_printf(b, " \"%s\")", t->s ? t->s : "?");
-        return;
-    case 'F':                          /* CALL: (name base arg) */
-        qjs_sb_putc(b, '(');
-        qjs_sb_puts(b, t->s ? t->s : "?"); qjs_sb_putc(b, ' ');
-        qjs_sb_term0(b, t->a); qjs_sb_putc(b, ' '); qjs_sb_term0(b, t->b);
-        qjs_sb_putc(b, ')');
-        return;
-    case 'U':                          /* UNARY NOT: (! base) */
-        qjs_sb_puts(b, "(! ");
-        qjs_sb_term0(b, t->a);
-        qjs_sb_putc(b, ')');
-        return;
-    default:
-        qjs_sb_putc(b, '('); qjs_sb_putc(b, t->op); qjs_sb_putc(b, ' ');
-        qjs_sb_term0(b, t->a); qjs_sb_putc(b, ' '); qjs_sb_term0(b, t->b);
-        qjs_sb_putc(b, ')');
-        return;
     }
+    if (stk != inl) free(stk);
+#undef QJS_SBT_PUSH
 }
 static void qjs_sb_pc(qjs_sb *b) {
     qjs_sb_putc(b, '[');
