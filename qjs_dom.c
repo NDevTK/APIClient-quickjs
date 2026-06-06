@@ -1473,6 +1473,34 @@ static int qjs_is_js_script_type(const lxb_char_t *ty, size_t tl) {
             !strcmp(buf, "module"));   /* type=module: qjs_eval_script compiles it as an ES module */
 }
 
+/* HTML-relative line offset for an INLINE script: the engine evals each script at
+   line 1, but a finding/@H from an inline <script> should carry the line in the
+   SERVED HTML (popup click-through), not the script-local line. Lexbor keeps no
+   element source position, so locate the script's verbatim text in the stashed raw
+   page HTML (globalThis.__pageHtml, set by /pre.js) and return the count of '\n'
+   before it. qjs_run_doc_scripts prepends that many newlines so eval lines align
+   with the HTML. 0 if __pageHtml/the text isn't found (no shift — safe fallback);
+   external scripts are their own file and need no shift. */
+static int qjs_inline_html_line_offset(JSContext *ctx, const char *code, size_t cl) {
+    if (!code || cl == 0) return 0;
+    JSValue g = JS_GetGlobalObject(ctx);
+    JSValue hv = JS_GetPropertyStr(ctx, g, "__pageHtml");
+    JS_FreeValue(ctx, g);
+    int off = 0;
+    size_t hl = 0;
+    const char *html = JS_ToCStringLen(ctx, &hl, hv);
+    if (html && cl <= hl) {
+        const char *found = NULL;
+        for (size_t i = 0; i + cl <= hl; i++) {
+            if (html[i] == code[0] && !memcmp(html + i, code, cl)) { found = html + i; break; }
+        }
+        if (found) for (const char *p = html; p < found; p++) if (*p == '\n') off++;
+    }
+    if (html) JS_FreeCString(ctx, html);
+    JS_FreeValue(ctx, hv);
+    return off;
+}
+
 /* qjs_run_doc_scripts: run the parsed document's scripts as QuickJS DRIVEN bundle
    code — a browser runs the page's scripts on its JS engine; here that's QuickJS's
    job (forced multi-path), NOT Lexbor's and NOT a hostedge SSR _eval. Called from
@@ -1525,9 +1553,21 @@ void qjs_run_doc_scripts(JSContext *ctx) {
             size_t cl = 0;
             lxb_char_t *code = lxb_dom_node_text_content(n, &cl);
             if (code && cl) {
-                JSValue r = qjs_eval_script(ctx, (const char *)code, cl, "/b.inline.js", 1);
+                /* Prepend (lines-before-this-script-in-the-HTML) newlines so @S/@H
+                   line numbers from an inline <script> are HTML-relative (the line
+                   in the served page), matching the popup's click-through. */
+                int pre = qjs_inline_html_line_offset(ctx, (const char *)code, cl);
+                const char *evcode = (const char *)code; size_t evlen = cl; char *shifted = NULL;
+                if (pre > 0 && (shifted = js_malloc(ctx, (size_t)pre + cl + 1))) {
+                    memset(shifted, '\n', (size_t)pre);
+                    memcpy(shifted + pre, code, cl);
+                    shifted[pre + cl] = 0;
+                    evcode = shifted; evlen = (size_t)pre + cl;
+                }
+                JSValue r = qjs_eval_script(ctx, evcode, evlen, "/b.inline.js", 1);
                 if (JS_IsException(r)) { JSValue ex = JS_GetException(ctx); JS_FreeValue(ctx, ex); }
                 JS_FreeValue(ctx, r);
+                if (shifted) js_free(ctx, shifted);
             }
         }
         JS_FreeValue(ctx, el);
