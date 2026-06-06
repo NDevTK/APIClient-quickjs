@@ -1459,6 +1459,88 @@ static int fe_loadscript_install(JSContext *ctx, JSValue glob) {
     return 0;
 }
 
+#if defined(__EMSCRIPTEN__) && defined(QJS_HAS_JSPI)
+extern JSValue qjs_eval_script(JSContext *ctx, const char *src, size_t n,
+                               const char *filename, int start_line);   /* qjsmain.c — the DRIVEN bundle eval */
+
+static int qjs_is_js_script_type(const lxb_char_t *ty, size_t tl) {
+    if (!ty || tl == 0) return 1;                 /* no type = classic JS */
+    char buf[40]; if (tl >= sizeof buf) return 0;
+    for (size_t i = 0; i < tl; i++) buf[i] = (char)((ty[i] >= 'A' && ty[i] <= 'Z') ? ty[i] + 32 : ty[i]);
+    buf[tl] = 0;
+    return (!strcmp(buf, "text/javascript") || !strcmp(buf, "application/javascript") ||
+            !strcmp(buf, "text/ecmascript") || !strcmp(buf, "application/ecmascript"));
+}
+
+/* qjs_run_doc_scripts: run the parsed document's scripts as QuickJS DRIVEN bundle
+   code — a browser runs the page's scripts on its JS engine; here that's QuickJS's
+   job (forced multi-path), NOT Lexbor's and NOT a hostedge SSR _eval. Called from
+   qjsmain's TOP-LEVEL boot loop right after the DOM is parsed — crucially NOT
+   re-entrantly from inside a JS eval (running qjs_eval_script while /h.js is still
+   on the stack breaks the forced-exec function registration; that was the SSR
+   phase's bug). Inline bodies + external <script src> (fetched through the
+   __feLoadScript safeFetch bridge) run in document order via qjs_eval_script,
+   identically to a /b.N.js bundle slice — so the BFS + value-spread + deep grind
+   drive them and their instance-bound methods. Lexbor only parses; QuickJS runs. */
+void qjs_run_doc_scripts(JSContext *ctx) {
+    if (!g_doc) return;
+    lxb_dom_node_t *root = lxb_dom_interface_node(g_doc);
+    if (!root) return;
+    JSValue arr = do_query(ctx, root, "script", 6, 0);   /* document order */
+    if (!JS_IsObject(arr)) { JS_FreeValue(ctx, arr); return; }
+    uint32_t len = 0;
+    { JSValue lv = JS_GetPropertyStr(ctx, arr, "length"); JS_ToUint32(ctx, &len, lv); JS_FreeValue(ctx, lv); }
+    for (uint32_t i = 0; i < len; i++) {
+        JSValue el = JS_GetPropertyUint32(ctx, arr, i);
+        lxb_dom_node_t *n = self_node(el);
+        lxb_dom_element_t *e = n ? el_of(n) : NULL;
+        if (!e) { JS_FreeValue(ctx, el); continue; }
+        size_t tl = 0;
+        const lxb_char_t *ty = lxb_dom_element_get_attribute(e, (const lxb_char_t *)"type", 4, &tl);
+        if (ty && tl == 6 && memcmp(ty, "module", 6) == 0) {   /* type=module: ESM graph, not here */
+            fprintf(stderr, "@WHY {\"phase\":\"doc_script_module\"}\n"); fflush(stderr);
+            JS_FreeValue(ctx, el); continue;
+        }
+        if (!qjs_is_js_script_type(ty, tl)) { JS_FreeValue(ctx, el); continue; }   /* JSON/importmap = data */
+        size_t sl = 0;
+        const lxb_char_t *src = lxb_dom_element_get_attribute(e, (const lxb_char_t *)"src", 3, &sl);
+        if (src && sl) {
+            char *url = js_malloc(ctx, sl + 1);
+            if (url) {
+                memcpy(url, src, sl); url[sl] = 0;
+                int h = qjs_load_script_begin(url);   /* JSPI suspend → worker safeFetch */
+                if (h >= 0) {
+                    int cn = qjs_load_script_len(h);
+                    if (cn >= 0) {
+                        char *code = js_malloc(ctx, (size_t)cn + 1);
+                        if (code) {
+                            qjs_load_script_take(h, (uint8_t *)code, cn); code[cn] = 0;
+                            JSValue r = qjs_eval_script(ctx, code, (size_t)cn, url, 1);
+                            if (JS_IsException(r)) { JSValue ex = JS_GetException(ctx); JS_FreeValue(ctx, ex); }
+                            JS_FreeValue(ctx, r);
+                            js_free(ctx, code);
+                        }
+                    } else { qjs_load_script_take(h, NULL, 0); }
+                }
+                js_free(ctx, url);
+            }
+        } else {
+            size_t cl = 0;
+            lxb_char_t *code = lxb_dom_node_text_content(n, &cl);
+            if (code && cl) {
+                JSValue r = qjs_eval_script(ctx, (const char *)code, cl, "/b.inline.js", 1);
+                if (JS_IsException(r)) { JSValue ex = JS_GetException(ctx); JS_FreeValue(ctx, ex); }
+                JS_FreeValue(ctx, r);
+            }
+        }
+        JS_FreeValue(ctx, el);
+    }
+    JS_FreeValue(ctx, arr);
+}
+#else
+void qjs_run_doc_scripts(JSContext *ctx) { (void)ctx; }
+#endif
+
 static int txt_install(JSContext *ctx, JSValue glob) {
     JSValue tep = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, tep, "encode", JS_NewCFunction(ctx, te_encode, "encode", 1));

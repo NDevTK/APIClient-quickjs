@@ -1155,77 +1155,9 @@
   G.Function = function () { var a = [].slice.call(arguments); S("code-exec", "Function", a.length ? a[a.length - 1] : "", { argc: a.length }); try { return _Fn.apply(null, a); } catch (e) { return function () { return OPQ("Function.exception"); }; } };
   G.Function.prototype = _Fn.prototype;
 
-  // ── inline SSR <script> execution ───────────────────────────────
-  // __feLoadPage parsed the server HTML into the Lexbor DOM above, but a
-  // PARSER does not run scripts. The real browser executes the page's own
-  // inline <script> blocks — the config / preloaded-state seeders the
-  // bundle then reads (`var msDocs = {…}`, window.__INITIAL_STATE__,
-  // __NEXT_DATA__, Redux preloaded state). Without running them the DOM
-  // tree exists but those globals are undefined, so the bundle's
-  // config-derived URLs resolve opaque or coerce "undefined" into the
-  // path (learn.microsoft.com `M`: `${b.data.userLocale}/content-nav/…`
-  // → `{userLocale}`/`/undefined/`). We already run the page's EXTERNAL
-  // scripts (the chunk pipeline); running its INLINE scripts is the same
-  // faithfulness — running the page's own code, not a heuristic. Only
-  // inline (no src) JS-typed scripts run, per the HTML spec's executable
-  // type set; type="application/json"/"importmap"/"speculationrules" are
-  // DATA, not executed. The saved unhooked `_eval` is used so the page's
-  // own static code is not mis-recorded as an attacker `eval` sink; a
-  // fetch/XHR INSIDE one still traces as a host edge normally. `_eval` is
-  // an indirect call ⇒ runs in GLOBAL scope ⇒ `var msDocs` becomes a
-  // global the (later) bundle eval sees. Runs before the PRE snapshot so
-  // these page globals are NOT mistaken for bundle-introduced functions.
-  try {
-    var _ssrJsType = { "": 1, "text/javascript": 1, "application/javascript": 1,
-                       "text/ecmascript": 1, "application/ecmascript": 1, "module": 1 };
-    var _ssrScripts = (G.document && typeof G.document.querySelectorAll === "function")
-        ? G.document.querySelectorAll("script") : null;
-    if (_ssrScripts && _ssrScripts.length) {
-      var _ssrRan = 0, _ssrThrew = 0;
-      for (var _ssi = 0; _ssi < _ssrScripts.length; _ssi++) {
-        var _ssEl = _ssrScripts[_ssi];
-        try {
-          if (!_ssEl || typeof _ssEl.getAttribute !== "function") continue;
-          var _ssSrc = _ssEl.getAttribute("src");
-          if (_ssSrc) {
-            // The document's OWN external <script src>, discovered from the Lexbor
-            // DOM. Fetch it through the offscreen safeFetch chokepoint (JSPI-suspend
-            // via __feLoadScript) and RUN it HERE, in document order, in this realm —
-            // the single quickjs+lexbor flow executing the page's <script src> like
-            // an import, so a later inline script sees the global it defines. One
-            // message per document: the engine loads the externals; content.js ships
-            // only the HTML.
-            var _ssAbs = urlOf(_ssSrc);
-            var _ssMod = String(_ssEl.getAttribute("type") || "").toLowerCase().trim() === "module";
-            if (_ssMod) {
-              // type=module <script src> is the ESM dependency-graph path (import/
-              // export semantics), not a classic global eval — routed through the
-              // engine's module resolver, not handled here. Surface, don't drop.
-              try { EPRINT('@WHY {"phase":"script_src_module","url":' + JSON.stringify(_ssAbs) + '}'); } catch (e) {}
-              continue;
-            }
-            var _ssCode = (typeof G.__feLoadScript === "function") ? G.__feLoadScript(_ssAbs) : null;
-            if (typeof _ssCode === "string" && _ssCode) {
-              try { _eval(_ssCode); _ssrRan++; } catch (e) { _ssrThrew++; }
-            } else {
-              // Fetch failed / blocked subresource / no host bridge — no silent
-              // failure: name the external that could not be loaded.
-              try { EPRINT('@WHY {"phase":"script_src_load_failed","url":' + JSON.stringify(_ssAbs) + '}'); } catch (e) {}
-            }
-            continue;
-          }
-          var _ssTy = String(_ssEl.getAttribute("type") || "").toLowerCase().trim();
-          if (!_ssrJsType[_ssTy]) continue;         // JSON/importmap/etc. are data
-          var _ssTx = _ssEl.textContent || "";
-          if (!_ssTx) continue;
-          _eval(_ssTx); _ssrRan++;
-        } catch (e) { _ssrThrew++; }
-      }
-      EPRINT('@WHY {"phase":"inline_ssr_scripts","ran":' + _ssrRan + ',"threw":' + _ssrThrew + ',"total":' + _ssrScripts.length + '}');
-    }
-  } catch (e) {
-    if (typeof printErr === "function") printErr('@WHY {"phase":"inline_ssr_scripts_throw","err":' + JSON.stringify(String(e && e.message || e)) + '}');
-  }
+  // SSR-phase deleted: hostedge does NOT run the page's scripts. Lexbor parses the
+  // HTML into the DOM; QuickJS runs the document's scripts via the engine's driven
+  // bundle path (qjsmain), not a separate unhooked _eval here.
 
   // ── event-loop flush: window lifecycle + dispatch on the Lexbor
   //    document (its prelude added addEventListener/dispatchEvent), so

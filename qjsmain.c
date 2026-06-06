@@ -160,6 +160,12 @@ int qjs_dom_install(JSContext *ctx);
 /* Defined in quickjs.c's TU via quickjs-forced.h. */
 void qjs_forced_config(int en, const char *sch, const char *tr);
 
+/* Defined in qjs_dom.c — run the parsed document's scripts (inline + external
+   <script src>) as DRIVEN bundle code. Called from the top-level boot loop AFTER
+   /h.js parsed the HTML into the Lexbor DOM (NOT re-entrantly from inside a JS
+   eval). Replaces the deleted hostedge SSR _eval phase. */
+void qjs_run_doc_scripts(JSContext *ctx);
+
 /* Resumable/throttled deep orphan drive (quickjs.c). qjs_deep_step_c drives
    the next maxN unreached @T host functions and returns how many remain;
    qjs_deep_free releases its cached orphan list. Driven across callMains on a
@@ -279,7 +285,7 @@ static int qjs_source_is_module(JSContext *ctx, const char *src, size_t n,
    globalThis.X = Y, custom-element registrations, fetch IIFEs) actually
    run before we return to the driver loop. use_realpath=false:
    in-memory worker scripts have no filesystem path. */
-static JSValue qjs_eval_script(JSContext *ctx, const char *src, size_t n,
+JSValue qjs_eval_script(JSContext *ctx, const char *src, size_t n,
                                const char *filename, int start_line) {
     if (start_line < 1) start_line = 1;
     /* @WHY breadcrumb: every per-file eval emits its filename so the
@@ -724,6 +730,10 @@ int main(int argc, char **argv) {
                     JS_FreeValue(g_deep_ctx, v);
                 }
             }
+            /* SSR-phase replacement (deep-grind boot): /h.js parsed the HTML; run
+               the document's scripts as DRIVEN code so the residue includes their
+               instance-bound methods, top-level (not re-entrant). */
+            qjs_run_doc_scripts(g_deep_ctx);
             /* grind mode → unbounded; engine drives every remaining orphan,
                yielding per-orphan via JSPI so the host scheduler can rotate
                fibers. step mode → bounded batch (legacy/debug path). */
@@ -809,6 +819,10 @@ int main(int argc, char **argv) {
                 if (!strncmp(argv[i], "--fe-", 5)) continue;
                 if (qjs_se_eval_one(g_boot_ctx, argv[i])) rc = 1;
             }
+            /* SSR-phase replacement: /h.js parsed the HTML into the Lexbor DOM
+               above; now run the document's scripts as DRIVEN bundle code, from
+               this TOP-LEVEL boot frame (not re-entrantly from inside a JS eval). */
+            qjs_run_doc_scripts(g_boot_ctx);
             /* Settle module-init microtasks so the snapshot captures quiescent
                boot state (mirrors the normal path's post-eval js_std_loop). */
             if (rc == 0) js_std_loop(g_boot_ctx);
