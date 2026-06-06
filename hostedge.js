@@ -1188,26 +1188,29 @@
           if (!_ssEl || typeof _ssEl.getAttribute !== "function") continue;
           var _ssSrc = _ssEl.getAttribute("src");
           if (_ssSrc) {
-            // The document's OWN external bundle, discovered from the Lexbor DOM
-            // (one-message-per-document — content.js need not ship it). If the
-            // offscreen already safeFetched it (the security chokepoint) and handed
-            // back its source via G.__feScriptSources, RUN it HERE in document order
-            // — the single quickjs+lexbor flow executing the page's <script src>
-            // like an import (a <script src> is just a different source). Otherwise
-            // emit @SCRIPTSRC so the offscreen fetches it and re-feeds. type=module
-            // takes the ESM path; classic is global _eval.
+            // The document's OWN external <script src>, discovered from the Lexbor
+            // DOM. Fetch it through the offscreen safeFetch chokepoint (JSPI-suspend
+            // via __feLoadScript) and RUN it HERE, in document order, in this realm —
+            // the single quickjs+lexbor flow executing the page's <script src> like
+            // an import, so a later inline script sees the global it defines. One
+            // message per document: the engine loads the externals; content.js ships
+            // only the HTML.
             var _ssAbs = urlOf(_ssSrc);
-            var _ssMap = G.__feScriptSources;
-            var _ssCode = (_ssMap && typeof _ssMap === "object") ? _ssMap[_ssAbs] : null;
+            var _ssMod = String(_ssEl.getAttribute("type") || "").toLowerCase().trim() === "module";
+            if (_ssMod) {
+              // type=module <script src> is the ESM dependency-graph path (import/
+              // export semantics), not a classic global eval — routed through the
+              // engine's module resolver, not handled here. Surface, don't drop.
+              try { EPRINT('@WHY {"phase":"script_src_module","url":' + JSON.stringify(_ssAbs) + '}'); } catch (e) {}
+              continue;
+            }
+            var _ssCode = (typeof G.__feLoadScript === "function") ? G.__feLoadScript(_ssAbs) : null;
             if (typeof _ssCode === "string" && _ssCode) {
               try { _eval(_ssCode); _ssrRan++; } catch (e) { _ssrThrew++; }
             } else {
-              var _ssMod = String(_ssEl.getAttribute("type") || "").toLowerCase().trim() === "module";
-              // Carry the DOM order (_ssi = index in querySelectorAll("script"), which
-              // IS document order) so the offscreen folds this external into the page
-              // bundle at the right spot relative to the inline scripts that read its
-              // globals. Format: "@SCRIPTSRC <c|m> <domOrder> <url>".
-              try { EPRINT('@SCRIPTSRC ' + (_ssMod ? 'm ' : 'c ') + _ssi + ' ' + _ssAbs); } catch (e) {}
+              // Fetch failed / blocked subresource / no host bridge — no silent
+              // failure: name the external that could not be loaded.
+              try { EPRINT('@WHY {"phase":"script_src_load_failed","url":' + JSON.stringify(_ssAbs) + '}'); } catch (e) {}
             }
             continue;
           }
