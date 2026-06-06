@@ -76,6 +76,48 @@ EM_ASYNC_JS(int, qjs_host_digest, (const char *algName, const uint8_t *data, int
 #endif
 
 
+/* qjs_load_script_begin / _take: the in-run, in-context external-script loader
+   bridge (the one-message-per-document keystone). The forced-exec engine, on
+   reaching an external <script src> (parsed from the Lexbor DOM) or a
+   programmatically-inserted <script> whose src it discovered mid-drive, calls
+   the native __feLoadScript binding (qjs_dom.c), which suspends the wasm stack
+   via JSPI here while THIS worker safeFetches the page's own subresource — the
+   same single chokepoint that loads source maps (_smGetParsed) + chunks;
+   principal = the analysis sourceUrl. Two phases so the variable-length body is
+   sized before the copy WITHOUT a JS-side _malloc (only HEAPU8 + UTF8ToString,
+   both already in the worker's EM_JS scope): begin() suspends, fetches, stashes
+   the UTF-8 bytes + returns the byte length (-1 on failure/blocked); the C
+   binding js_malloc's len+1 and take() copies the bytes into wasm memory.
+   Single-fiber (SSR/boot phase): the stash is consumed synchronously by the
+   paired take() with no JS between, so there is no reentrancy window. A
+   reentrancy-safe handle version is required before this is wired into the
+   multi-fiber deep-grind (the createElement-inserted-chunk path). */
+#if defined(__EMSCRIPTEN__) && defined(QJS_HAS_JSPI)
+EM_ASYNC_JS(int, qjs_load_script_begin, (const char *url), {
+    if (!Module.qjs_load_script) return -1;
+    try {
+        var u = UTF8ToString(Number(url));
+        if (!u) return -1;
+        var code = await Module.qjs_load_script(u);
+        if (code == null) { Module.__feLoadBytes = null; return -1; }
+        Module.__feLoadBytes = new TextEncoder().encode(code);
+        return Module.__feLoadBytes.length;
+    } catch (e) {
+        Module.__feLoadBytes = null;
+        var rec = '@WHY {"phase":"qjs_load_script_begin_throw","err":' + JSON.stringify(String(e && e.message || e)) + "}";
+        if (typeof printErr === "function") printErr(rec);
+        return -1;
+    }
+});
+EM_JS(void, qjs_load_script_take, (uint8_t *out, int cap), {
+    var b = Module.__feLoadBytes; Module.__feLoadBytes = null;
+    if (!b) return;
+    var n = Math.min(cap, b.length);
+    HEAPU8.set(b.subarray(0, Number(n)), Number(out));
+});
+#endif
+
+
 /* --fe-timer: wall-clock instrumentation. Gated by an explicit argv flag so
    production runs (worker fast path) are byte-identical; the diagnostic
    profile path turns it on. Phase boundaries print one TIMER line each to

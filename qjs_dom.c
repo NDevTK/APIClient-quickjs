@@ -1413,6 +1413,49 @@ static int crypto_install(JSContext *ctx, JSValue glob) {
     return 0;
 }
 
+#if defined(__EMSCRIPTEN__) && defined(QJS_HAS_JSPI)
+extern int qjs_load_script_begin(const char *url);
+extern void qjs_load_script_take(uint8_t *out, int cap);
+#endif
+
+/* __feLoadScript(url) — the realm-facing half of the in-run external-script
+   loader (the one-message-per-document keystone). hostedge.js calls this when
+   forced exec reaches an external <script src> / a programmatically-discovered
+   src; the wasm stack suspends via JSPI (qjs_load_script_begin) while the worker
+   safeFetches the page's own subresource, then resumes with the code returned
+   here as a JS string — so hostedge can _eval it IN THE SAME REALM, in document
+   order. Returns null on the native build (no JSPI host) or on a fetch failure /
+   blocked subresource, so hostedge falls back to its @SCRIPTSRC emit (no
+   regression). The engine stays sandboxed: this binding cannot fetch — only the
+   worker's safeFetch (the single chokepoint) can, under the document principal. */
+static JSValue js_fe_load_script(JSContext *ctx, JSValueConst this_val, int ac, JSValueConst *av) {
+    (void)this_val;
+#if defined(__EMSCRIPTEN__) && defined(QJS_HAS_JSPI)
+    if (ac < 1) return JS_NULL;
+    const char *url = JS_ToCString(ctx, av[0]);
+    if (!url) return JS_NULL;
+    int n = qjs_load_script_begin(url);
+    JS_FreeCString(ctx, url);
+    if (n < 0) return JS_NULL;
+    uint8_t *buf = js_malloc(ctx, (size_t)n + 1);
+    if (!buf) return JS_NULL;
+    qjs_load_script_take(buf, n);
+    buf[n] = 0;
+    JSValue s = JS_NewStringLen(ctx, (const char *)buf, (size_t)n);
+    js_free(ctx, buf);
+    return s;
+#else
+    (void)ctx; (void)ac; (void)av;
+    return JS_NULL;
+#endif
+}
+
+static int fe_loadscript_install(JSContext *ctx, JSValue glob) {
+    JS_SetPropertyStr(ctx, glob, "__feLoadScript",
+        JS_NewCFunction(ctx, js_fe_load_script, "__feLoadScript", 1));
+    return 0;
+}
+
 static int txt_install(JSContext *ctx, JSValue glob) {
     JSValue tep = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, tep, "encode", JS_NewCFunction(ctx, te_encode, "encode", 1));
@@ -1572,6 +1615,8 @@ int qjs_dom_install(JSContext *ctx) {
         fprintf(stderr, "warning: txt_install failed\n");
     if (crypto_install(ctx, glob) != 0)
         fprintf(stderr, "warning: crypto_install failed\n");
+    if (fe_loadscript_install(ctx, glob) != 0)
+        fprintf(stderr, "warning: fe_loadscript_install failed\n");
     JS_FreeValue(ctx, glob);
 
     /* Scriptable layer Lexbor doesn't provide (it's a parser/DOM, not
