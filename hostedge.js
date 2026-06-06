@@ -1203,7 +1203,11 @@
               try { _eval(_ssCode); _ssrRan++; } catch (e) { _ssrThrew++; }
             } else {
               var _ssMod = String(_ssEl.getAttribute("type") || "").toLowerCase().trim() === "module";
-              try { EPRINT('@SCRIPTSRC ' + (_ssMod ? 'm ' : 'c ') + _ssAbs); } catch (e) {}
+              // Carry the DOM order (_ssi = index in querySelectorAll("script"), which
+              // IS document order) so the offscreen folds this external into the page
+              // bundle at the right spot relative to the inline scripts that read its
+              // globals. Format: "@SCRIPTSRC <c|m> <domOrder> <url>".
+              try { EPRINT('@SCRIPTSRC ' + (_ssMod ? 'm ' : 'c ') + _ssi + ' ' + _ssAbs); } catch (e) {}
             }
             continue;
           }
