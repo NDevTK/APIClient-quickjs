@@ -1186,7 +1186,18 @@
         var _ssEl = _ssrScripts[_ssi];
         try {
           if (!_ssEl || typeof _ssEl.getAttribute !== "function") continue;
-          if (_ssEl.getAttribute("src")) continue; // external → chunk pipeline
+          var _ssSrc = _ssEl.getAttribute("src");
+          if (_ssSrc) {
+            // The engine DISCOVERS the document's own external bundle from the
+            // Lexbor DOM (the one-message-per-document model — content.js need not
+            // ship it). Emit @SCRIPTSRC so the offscreen safeFetches it (the
+            // security chokepoint) and feeds the source back to be RUN in order
+            // here, like an import — `<script src>` is just a different source.
+            // type=module → the ESM module path; otherwise classic global _eval.
+            var _ssMod = String(_ssEl.getAttribute("type") || "").toLowerCase().trim() === "module";
+            try { EPRINT('@SCRIPTSRC ' + (_ssMod ? 'm ' : 'c ') + urlOf(_ssSrc)); } catch (e) {}
+            continue;
+          }
           var _ssTy = String(_ssEl.getAttribute("type") || "").toLowerCase().trim();
           if (!_ssrJsType[_ssTy]) continue;         // JSON/importmap/etc. are data
           var _ssTx = _ssEl.textContent || "";
