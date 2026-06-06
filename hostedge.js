@@ -1188,14 +1188,23 @@
           if (!_ssEl || typeof _ssEl.getAttribute !== "function") continue;
           var _ssSrc = _ssEl.getAttribute("src");
           if (_ssSrc) {
-            // The engine DISCOVERS the document's own external bundle from the
-            // Lexbor DOM (the one-message-per-document model — content.js need not
-            // ship it). Emit @SCRIPTSRC so the offscreen safeFetches it (the
-            // security chokepoint) and feeds the source back to be RUN in order
-            // here, like an import — `<script src>` is just a different source.
-            // type=module → the ESM module path; otherwise classic global _eval.
-            var _ssMod = String(_ssEl.getAttribute("type") || "").toLowerCase().trim() === "module";
-            try { EPRINT('@SCRIPTSRC ' + (_ssMod ? 'm ' : 'c ') + urlOf(_ssSrc)); } catch (e) {}
+            // The document's OWN external bundle, discovered from the Lexbor DOM
+            // (one-message-per-document — content.js need not ship it). If the
+            // offscreen already safeFetched it (the security chokepoint) and handed
+            // back its source via G.__feScriptSources, RUN it HERE in document order
+            // — the single quickjs+lexbor flow executing the page's <script src>
+            // like an import (a <script src> is just a different source). Otherwise
+            // emit @SCRIPTSRC so the offscreen fetches it and re-feeds. type=module
+            // takes the ESM path; classic is global _eval.
+            var _ssAbs = urlOf(_ssSrc);
+            var _ssMap = G.__feScriptSources;
+            var _ssCode = (_ssMap && typeof _ssMap === "object") ? _ssMap[_ssAbs] : null;
+            if (typeof _ssCode === "string" && _ssCode) {
+              try { _eval(_ssCode); _ssrRan++; } catch (e) { _ssrThrew++; }
+            } else {
+              var _ssMod = String(_ssEl.getAttribute("type") || "").toLowerCase().trim() === "module";
+              try { EPRINT('@SCRIPTSRC ' + (_ssMod ? 'm ' : 'c ') + _ssAbs); } catch (e) {}
+            }
             continue;
           }
           var _ssTy = String(_ssEl.getAttribute("type") || "").toLowerCase().trim();
