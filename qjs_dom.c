@@ -1469,7 +1469,8 @@ static int qjs_is_js_script_type(const lxb_char_t *ty, size_t tl) {
     for (size_t i = 0; i < tl; i++) buf[i] = (char)((ty[i] >= 'A' && ty[i] <= 'Z') ? ty[i] + 32 : ty[i]);
     buf[tl] = 0;
     return (!strcmp(buf, "text/javascript") || !strcmp(buf, "application/javascript") ||
-            !strcmp(buf, "text/ecmascript") || !strcmp(buf, "application/ecmascript"));
+            !strcmp(buf, "text/ecmascript") || !strcmp(buf, "application/ecmascript") ||
+            !strcmp(buf, "module"));   /* type=module: qjs_eval_script compiles it as an ES module */
 }
 
 /* qjs_run_doc_scripts: run the parsed document's scripts as QuickJS DRIVEN bundle
@@ -1497,11 +1498,7 @@ void qjs_run_doc_scripts(JSContext *ctx) {
         if (!e) { JS_FreeValue(ctx, el); continue; }
         size_t tl = 0;
         const lxb_char_t *ty = lxb_dom_element_get_attribute(e, (const lxb_char_t *)"type", 4, &tl);
-        if (ty && tl == 6 && memcmp(ty, "module", 6) == 0) {   /* type=module: ESM graph, not here */
-            fprintf(stderr, "@WHY {\"phase\":\"doc_script_module\"}\n"); fflush(stderr);
-            JS_FreeValue(ctx, el); continue;
-        }
-        if (!qjs_is_js_script_type(ty, tl)) { JS_FreeValue(ctx, el); continue; }   /* JSON/importmap = data */
+        if (!qjs_is_js_script_type(ty, tl)) { JS_FreeValue(ctx, el); continue; }   /* JSON/importmap = data; module + classic run */
         size_t sl = 0;
         const lxb_char_t *src = lxb_dom_element_get_attribute(e, (const lxb_char_t *)"src", 3, &sl);
         if (src && sl) {
