@@ -86,12 +86,15 @@ EM_ASYNC_JS(int, qjs_host_digest, (const char *algName, const uint8_t *data, int
    principal = the analysis sourceUrl. Two phases so the variable-length body is
    sized before the copy WITHOUT a JS-side _malloc (only HEAPU8 + UTF8ToString,
    both already in the worker's EM_JS scope): begin() suspends, fetches, stashes
-   the UTF-8 bytes + returns the byte length (-1 on failure/blocked); the C
-   binding js_malloc's len+1 and take() copies the bytes into wasm memory.
-   Single-fiber (SSR/boot phase): the stash is consumed synchronously by the
-   paired take() with no JS between, so there is no reentrancy window. A
-   reentrancy-safe handle version is required before this is wired into the
-   multi-fiber deep-grind (the createElement-inserted-chunk path). */
+   the UTF-8 bytes under a fresh integer HANDLE + returns it (-1 on
+   failure/blocked); the C binding reads the length (qjs_load_script_len),
+   js_malloc's len+1, and take() copies the bytes into wasm memory + frees the
+   handle. The handle map (Module.__feLoad[id], id from a monotonic counter) is
+   REENTRANCY-SAFE: under JSPI two fibers can be suspended in begin() at once
+   (the multi-fiber deep-grind drives createElement-inserted <script> loads
+   concurrently), and each gets its own id, so neither clobbers the other's
+   bytes — unlike a single shared stash. begin() is the only suspending phase;
+   len()/take() are synchronous. */
 #if defined(__EMSCRIPTEN__) && defined(QJS_HAS_JSPI)
 EM_ASYNC_JS(int, qjs_load_script_begin, (const char *url), {
     if (!Module.qjs_load_script) return -1;
@@ -99,19 +102,27 @@ EM_ASYNC_JS(int, qjs_load_script_begin, (const char *url), {
         var u = UTF8ToString(Number(url));
         if (!u) return -1;
         var code = await Module.qjs_load_script(u);
-        if (code == null) { Module.__feLoadBytes = null; return -1; }
-        Module.__feLoadBytes = new TextEncoder().encode(code);
-        return Module.__feLoadBytes.length;
+        if (code == null) return -1;
+        var bytes = new TextEncoder().encode(code);
+        if (!Module.__feLoad) { Module.__feLoad = {}; Module.__feLoadNext = 1; }
+        var h = Module.__feLoadNext++;
+        Module.__feLoad[h] = bytes;
+        return h;
     } catch (e) {
-        Module.__feLoadBytes = null;
         var rec = '@WHY {"phase":"qjs_load_script_begin_throw","err":' + JSON.stringify(String(e && e.message || e)) + "}";
         if (typeof printErr === "function") printErr(rec);
         return -1;
     }
 });
-EM_JS(void, qjs_load_script_take, (uint8_t *out, int cap), {
-    var b = Module.__feLoadBytes; Module.__feLoadBytes = null;
-    if (!b) return;
+EM_JS(int, qjs_load_script_len, (int h), {
+    var b = Module.__feLoad && Module.__feLoad[h];
+    return b ? b.length : -1;
+});
+EM_JS(void, qjs_load_script_take, (int h, uint8_t *out, int cap), {
+    if (!Module.__feLoad) return;
+    var b = Module.__feLoad[h];
+    delete Module.__feLoad[h];
+    if (!b || !out) return;
     var n = Math.min(cap, b.length);
     HEAPU8.set(b.subarray(0, Number(n)), Number(out));
 });

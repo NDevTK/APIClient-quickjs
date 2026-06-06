@@ -1414,8 +1414,9 @@ static int crypto_install(JSContext *ctx, JSValue glob) {
 }
 
 #if defined(__EMSCRIPTEN__) && defined(QJS_HAS_JSPI)
-extern int qjs_load_script_begin(const char *url);
-extern void qjs_load_script_take(uint8_t *out, int cap);
+extern int qjs_load_script_begin(const char *url);   /* suspends; returns handle id or -1 */
+extern int qjs_load_script_len(int h);
+extern void qjs_load_script_take(int h, uint8_t *out, int cap);  /* copies + frees the handle */
 #endif
 
 /* __feLoadScript(url) — the realm-facing half of the in-run external-script
@@ -1434,12 +1435,14 @@ static JSValue js_fe_load_script(JSContext *ctx, JSValueConst this_val, int ac, 
     if (ac < 1) return JS_NULL;
     const char *url = JS_ToCString(ctx, av[0]);
     if (!url) return JS_NULL;
-    int n = qjs_load_script_begin(url);
+    int h = qjs_load_script_begin(url);   /* JSPI suspend → worker safeFetch */
     JS_FreeCString(ctx, url);
+    if (h < 0) return JS_NULL;
+    int n = qjs_load_script_len(h);
     if (n < 0) return JS_NULL;
     uint8_t *buf = js_malloc(ctx, (size_t)n + 1);
-    if (!buf) return JS_NULL;
-    qjs_load_script_take(buf, n);
+    if (!buf) { qjs_load_script_take(h, NULL, 0); return JS_NULL; }  /* still free the handle */
+    qjs_load_script_take(h, buf, n);
     buf[n] = 0;
     JSValue s = JS_NewStringLen(ctx, (const char *)buf, (size_t)n);
     js_free(ctx, buf);
