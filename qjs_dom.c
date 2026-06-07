@@ -151,6 +151,24 @@ static void qjs_ce_connect(JSContext *ctx, JSValueConst node) {
     JS_FreeValue(ctx, fn);
     JS_FreeValue(ctx, glob);
 }
+/* Fire the custom-element attributeChangedCallback reaction for a just-changed
+   attribute. The JS-side __ceAttr (prelude) checks the CE class's
+   observedAttributes and runs attributeChangedCallback(name,old,new) under
+   forced execution -- so a loader that fetches on a src/data-* change
+   (include-fragment src, and many web components) is driven, not just ones that
+   fetch in connectedCallback. No-ops when no custom element is registered. */
+static void qjs_ce_attr(JSContext *ctx, JSValueConst node, JSValueConst name,
+                        JSValueConst oldv, JSValueConst newv) {
+    JSValue glob = JS_GetGlobalObject(ctx);
+    JSValue fn = JS_GetPropertyStr(ctx, glob, "__ceAttr");
+    if (JS_IsFunction(ctx, fn)) {
+        JSValueConst args[4] = { node, name, oldv, newv };
+        JSValue r = JS_Call(ctx, fn, JS_UNDEFINED, 4, args);
+        JS_FreeValue(ctx, r);
+    }
+    JS_FreeValue(ctx, fn);
+    JS_FreeValue(ctx, glob);
+}
 /* WHATWG "ensure pre-insertion validity": is `anc` an INCLUSIVE ancestor of
    `node` (anc == node, or anc contains node)? Inserting `anc` under `node`
    would make `node` its own descendant — the spec throws HierarchyRequestError.
@@ -248,8 +266,22 @@ static JSValue m_setAttribute(JSContext *ctx, JSValueConst t, int ac, JSValueCon
     lxb_dom_element_t *el = el_of(self_node(t)); if (!el) return JS_UNDEFINED;
     size_t kl, vl; const char *k = JS_ToCStringLen(ctx, &kl, av[0]);
     const char *v = JS_ToCStringLen(ctx, &vl, av[1]);
-    if (k && v) lxb_dom_element_set_attribute(el,
-        (const lxb_char_t *)k, kl, (const lxb_char_t *)v, vl);
+    if (k && v) {
+        /* Snapshot the prior value (a copy, valid after the set) for the
+           attributeChangedCallback(name, oldValue, newValue) reaction below. */
+        size_t ovl = 0;
+        const lxb_char_t *ov = lxb_dom_element_get_attribute(el,
+            (const lxb_char_t *)k, kl, &ovl);
+        JSValue oldv = ov ? JS_NewStringLen(ctx, (const char *)ov, ovl) : JS_NULL;
+        lxb_dom_element_set_attribute(el,
+            (const lxb_char_t *)k, kl, (const lxb_char_t *)v, vl);
+        /* Custom-element attribute reaction: a defined CE with this attribute in
+           its observedAttributes runs attributeChangedCallback under forced exec
+           (the include-fragment src mechanism + many web components fetch on an
+           attribute change, not just in connectedCallback). */
+        qjs_ce_attr(ctx, t, av[0], oldv, av[1]);
+        JS_FreeValue(ctx, oldv);
+    }
     if (k) JS_FreeCString(ctx, k); if (v) JS_FreeCString(ctx, v);
     return JS_UNDEFINED;
 }
@@ -2129,6 +2161,19 @@ int qjs_dom_install(JSContext *ctx) {
     "globalThis.__ceConnect=function(node){if(!node)return;var rk=0;for(var z in R){rk=1;break;}if(!rk)return;try{"
     "var tn=(node.tagName||'').toLowerCase();if(R[tn])up(node,R[tn]);"
     "if(node.querySelectorAll){var d=node.querySelectorAll('*');for(var i=0;i<d.length;i++){var e=d[i],t=(e.tagName||'').toLowerCase();if(R[t])up(e,R[t]);}}"
+    "}catch(e){}};"
+    /* CE-reactions on ATTRIBUTE CHANGE: the C DOM binding calls __ceAttr(node,
+       name, old, new) after setAttribute so a defined custom element runs its
+       attributeChangedCallback under forced exec. include-fragment (and many web
+       components) fetch on a `src`/`data-*` change via attributeChangedCallback,
+       not only connectedCallback -- without this the concrete value set through
+       setAttribute never reaches the fetch (the orphan drive only yields an
+       opaque arg). Spec-aligned: fires only for attrs in observedAttributes of
+       an already-upgraded element. Cheap-guarded: returns when no CE registered. */
+    "globalThis.__ceAttr=function(node,name,old,val){if(!node)return;var rk=0;for(var z in R){rk=1;break;}if(!rk)return;try{"
+    "var tn=(node.tagName||'').toLowerCase();var C=R[tn];if(!C)return;"
+    "var ob;try{ob=C.observedAttributes;}catch(e){}if(!(ob&&ob.indexOf&&ob.indexOf(name)>=0))return;"
+    "if(typeof node.attributeChangedCallback==='function'){try{node.attributeChangedCallback(name,old,val);}catch(e){}}"
     "}catch(e){}};"
     /* Capture the real `print` NOW (prelude eval, before any bundle clobbers
        the global — same trick hostedge.js uses for EPRINT) so the ce_define
