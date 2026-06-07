@@ -734,6 +734,30 @@ int main(int argc, char **argv) {
                the document's scripts as DRIVEN code so the residue includes their
                instance-bound methods, top-level (not re-entrant). */
             qjs_run_doc_scripts(g_deep_ctx);
+            /* Fire page-lifecycle events (DOMContentLoaded/load/pageshow) in the DEEP
+               ctx so DEFERRED, event-gated inits RUN and build their transports —
+               otherwise the residue grind drives their send()/request() COLD (no real
+               transport instance on the heap to capture) and the URL stays opaque.
+               gitlab.com: Sentry.init + the Apollo client boot on DOMContentLoaded/app-
+               mount, so __SENTRY__ was never created in the deep ctx (gap2 probe:
+               sentry:0 even at rem:0) and the envelope + /api/graphql stayed [object
+               Object]. The BOOT ctx fires these via driver.js's __hostFlush; the deep
+               ctx (a separate recycled instance) must fire them itself, AFTER the doc
+               scripts registered their handlers and BEFORE the residue grind. Drain
+               queued jobs so the inits' async setup (transport creation) completes. */
+            {
+                JSValue _gg = JS_GetGlobalObject(g_deep_ctx);
+                JSValue _hf = JS_GetPropertyStr(g_deep_ctx, _gg, "__hostFlush");
+                if (JS_IsFunction(g_deep_ctx, _hf)) {
+                    JSValue _r = JS_Call(g_deep_ctx, _hf, _gg, 0, NULL);
+                    if (JS_IsException(_r)) { JSValue _e = JS_GetException(g_deep_ctx); JS_FreeValue(g_deep_ctx, _e); }
+                    JS_FreeValue(g_deep_ctx, _r);
+                }
+                JS_FreeValue(g_deep_ctx, _hf);
+                JS_FreeValue(g_deep_ctx, _gg);
+                JSContext *_c1; int _dd = 0;
+                while (JS_ExecutePendingJob(g_deep_rt, &_c1) > 0 && _dd < 200000) _dd++;
+            }
             /* grind mode → unbounded; engine drives every remaining orphan,
                yielding per-orphan via JSPI so the host scheduler can rotate
                fibers. step mode → bounded batch (legacy/debug path). */
