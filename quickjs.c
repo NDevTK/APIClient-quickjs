@@ -24047,6 +24047,16 @@ static JSValue JS_CallConstructorInternal(JSContext *ctx,
 
     if (js_poll_interrupts(ctx))
         return JS_EXCEPTION;
+    if (unlikely(qjs_is_opaque(func_obj))) {
+        /* `new <opaque>()` — forced exec: the constructor is an OPAQUE value (a
+           cold/cross-module imported class the drive hasn't concretized), which is
+           not flagged is_constructor, so the normal path throws "X is not a
+           constructor". That throw ABORTS the app's init/render before its real
+           fetches fire (gitlab's webpack app crashed exactly here, leaving its API
+           clients opaque -> envelope/graphql unlearned). Opaque-infectivity for the
+           `new` operator: the instance of an opaque constructor is opaque. */
+        return qjs_opq_make(ctx, 1, "new-opaque", qjs_t_opaque());
+    }
     flags |= JS_CALL_FLAG_CONSTRUCTOR;
     if (unlikely(JS_VALUE_GET_TAG(func_obj) != JS_TAG_OBJECT))
         goto not_a_function;

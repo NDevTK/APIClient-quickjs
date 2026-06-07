@@ -184,6 +184,7 @@ static int dom_is_inclusive_ancestor(lxb_dom_node_t *anc, lxb_dom_node_t *node) 
         if (q == anc) return 1;
     return 0;
 }
+static void qjs_load_dynamic_script(JSContext *ctx, JSValueConst scriptVal);   /* dyn <script src> loader (def. near qjs_run_doc_scripts) */
 static JSValue m_appendChild(JSContext *ctx, JSValueConst t, int ac, JSValueConst *av) {
     lxb_dom_node_t *p = self_node(t), *c = self_node(av[0]);
     if (!p || !c) return JS_NULL;
@@ -214,7 +215,7 @@ static JSValue m_appendChild(JSContext *ctx, JSValueConst t, int ac, JSValueCons
        subtree to the document fires qjs_ce_connect. createElement of a CE is no
        longer the "broken null-tagName path" — dom_ctor builds a real element and
        up() upgrades it. */
-    { lxb_dom_node_t *q = p; while (q) { if (q->type == LXB_DOM_NODE_TYPE_DOCUMENT) { qjs_ce_connect(ctx, av[0]); break; } q = q->parent; } }
+    { lxb_dom_node_t *q = p; while (q) { if (q->type == LXB_DOM_NODE_TYPE_DOCUMENT) { qjs_ce_connect(ctx, av[0]); qjs_load_dynamic_script(ctx, av[0]); break; } q = q->parent; } }
     return JS_DupValue(ctx, av[0]);
 }
 static JSValue m_insertBefore(JSContext *ctx, JSValueConst t, int ac, JSValueConst *av) {
@@ -233,7 +234,7 @@ static JSValue m_insertBefore(JSContext *ctx, JSValueConst t, int ac, JSValueCon
     if (r) lxb_dom_node_insert_before(r, c); else lxb_dom_node_append_child(p, c);
     /* CE connection reactions on document-connecting insert — same rationale +
        perf gate as m_appendChild. */
-    { lxb_dom_node_t *q = p; while (q) { if (q->type == LXB_DOM_NODE_TYPE_DOCUMENT) { qjs_ce_connect(ctx, av[0]); break; } q = q->parent; } }
+    { lxb_dom_node_t *q = p; while (q) { if (q->type == LXB_DOM_NODE_TYPE_DOCUMENT) { qjs_ce_connect(ctx, av[0]); qjs_load_dynamic_script(ctx, av[0]); break; } q = q->parent; } }
     return JS_DupValue(ctx, av[0]);
 }
 static JSValue m_removeChild(JSContext *ctx, JSValueConst t, int ac, JSValueConst *av) {
@@ -1542,6 +1543,75 @@ static int qjs_inline_html_line_offset(JSContext *ctx, const char *code, size_t 
     return off;
 }
 
+/* The actual work of loading a dynamically-injected <script src> — runs as a JOB
+   (enqueued by qjs_load_dynamic_script), so qjs_eval_script is NOT re-entrant with
+   the eval that did the appendChild (re-entrant eval breaks forced-exec function
+   registration — the old SSR-phase bug; see qjs_run_doc_scripts). Fetch via the same
+   JSPI safeFetch bridge as the static path, eval (so a webpack/rollup chunk's
+   self.webpackChunk.push runs → its modules register → the gated entry startup runs),
+   then fire the load event for onload-gated chunk-promise resolution. */
+static JSValue qjs_dyn_script_job(JSContext *ctx, int argc, JSValueConst *argv) {
+    if (argc < 1) return JS_UNDEFINED;
+    JSValueConst scriptVal = argv[0];
+    lxb_dom_node_t *n = self_node(scriptVal);
+    if (!n || n->local_name != LXB_TAG_SCRIPT) return JS_UNDEFINED;
+    lxb_dom_element_t *e = el_of(n);
+    if (!e) return JS_UNDEFINED;
+    size_t sl = 0;
+    const lxb_char_t *src = lxb_dom_element_get_attribute(e, (const lxb_char_t *)"src", 3, &sl);
+    if (!src || !sl) return JS_UNDEFINED;
+    char *url = js_malloc(ctx, sl + 1);
+    if (!url) return JS_UNDEFINED;
+    memcpy(url, src, sl); url[sl] = 0;
+    int h = qjs_load_script_begin(url);   /* JSPI suspend → worker safeFetch (one-per-URL cached) */
+    if (h >= 0) {
+        int cn = qjs_load_script_len(h);
+        if (cn >= 0) {
+            char *code = js_malloc(ctx, (size_t)cn + 1);
+            if (code) {
+                qjs_load_script_take(h, (uint8_t *)code, cn); code[cn] = 0;
+                JSValue r = qjs_eval_script(ctx, code, (size_t)cn, url, 1);
+                if (JS_IsException(r)) { JSValue ex = JS_GetException(ctx); JS_FreeValue(ctx, ex); }
+                JS_FreeValue(ctx, r);
+                js_free(ctx, code);
+            }
+        } else { qjs_load_script_take(h, NULL, 0); }
+    }
+    js_free(ctx, url);
+    /* Fire load: an onload-gated startup (jsonp resolving its chunk promise on the
+       script's load event) then runs. Both the .onload property and dispatchEvent. */
+    JSValue onload = JS_GetPropertyStr(ctx, scriptVal, "onload");
+    if (JS_IsFunction(ctx, onload)) { JSValue r = JS_Call(ctx, onload, scriptVal, 0, NULL); if (JS_IsException(r)) { JSValue ex = JS_GetException(ctx); JS_FreeValue(ctx, ex); } JS_FreeValue(ctx, r); }
+    JS_FreeValue(ctx, onload);
+    JSValue de = JS_GetPropertyStr(ctx, scriptVal, "dispatchEvent");
+    if (JS_IsFunction(ctx, de)) { JSValue ev = JS_NewObject(ctx); JS_SetPropertyStr(ctx, ev, "type", JS_NewString(ctx, "load")); JSValueConst a1[1] = { ev }; JSValue r = JS_Call(ctx, de, scriptVal, 1, a1); if (JS_IsException(r)) { JSValue ex = JS_GetException(ctx); JS_FreeValue(ctx, ex); } JS_FreeValue(ctx, r); JS_FreeValue(ctx, ev); }
+    JS_FreeValue(ctx, de);
+    return JS_UNDEFINED;
+}
+/* Hooked from m_appendChild/m_insertBefore when a <script src> connects to the
+   document — the webpack/rollup JSONP lazy-CHUNK mechanism. Static <script src> in the
+   parsed HTML run via qjs_run_doc_scripts; a script element created + connected at
+   RUNTIME was NOT loaded, so its chunk never evaluated, its modules never registered,
+   the gated entry startup never ran, and the lazy chunk's endpoints (route/feature
+   code — the moat's lazy-chunk surface) were never learned (testing/fixtures/
+   webpack_jsonp.html learned 0 until this). Per-element dedup; webpack's installedChunks
+   guard handles same-URL re-pushes. Deferred via a job (qjs_dyn_script_job). */
+static void qjs_load_dynamic_script(JSContext *ctx, JSValueConst scriptVal) {
+    lxb_dom_node_t *n = self_node(scriptVal);
+    if (!n || n->local_name != LXB_TAG_SCRIPT) return;
+    lxb_dom_element_t *e = el_of(n);
+    if (!e) return;
+    size_t sl = 0;
+    const lxb_char_t *src = lxb_dom_element_get_attribute(e, (const lxb_char_t *)"src", 3, &sl);
+    if (!src || !sl) return;   /* only src scripts need a fetch; inline run via their text content */
+    JSValue _ld = JS_GetPropertyStr(ctx, scriptVal, "__feDynLoaded");
+    int already = JS_ToBool(ctx, _ld);
+    JS_FreeValue(ctx, _ld);
+    if (already) return;
+    JS_SetPropertyStr(ctx, scriptVal, "__feDynLoaded", JS_NewBool(ctx, 1));
+    JSValueConst a[1] = { scriptVal };
+    JS_EnqueueJob(ctx, qjs_dyn_script_job, 1, a);
+}
 /* qjs_run_doc_scripts: run the parsed document's scripts as QuickJS DRIVEN bundle
    code — a browser runs the page's scripts on its JS engine; here that's QuickJS's
    job (forced multi-path), NOT Lexbor's and NOT a hostedge SSR _eval. Called from
