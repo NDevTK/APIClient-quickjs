@@ -23713,6 +23713,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         CASE(OP_await):
+            /* await of an OPAQUE value: the host NEVER settles an opaque
+               promise (external input stays opaque by the model), so
+               suspending here pins the async frame FOREVER. On gitlab.com 3
+               module-top-level `await <opaque>` frames each held a ctx ref →
+               context survived JS_FreeContext → the global rooted all 52943
+               bundle functions → --fe-deep-end's JS_FreeRuntime tripped
+               assert(list_empty(gc_obj_list)) → recoverable abort + the doc
+               stuck at rem:1. The resolved value of `await opaque` IS opaque
+               anyway (infectious), so resolve it INLINE: leave sp[-1] (the
+               awaited value = the opaque result, same stack slot the resume
+               path writes) and continue. No suspended frame (no teardown
+               leak) AND the continuation after the await is now explored
+               (coverage win). for-await over an opaque stream stays bounded
+               via the done-opaque iterator + loop-revisit fixpoint. */
+            if (qjs_is_opaque(sp[-1])) { BREAK; }
             ret_val = js_int32(FUNC_RET_AWAIT);
             goto done_generator;
         CASE(OP_yield):
