@@ -359,6 +359,51 @@
   ["load", "DOMContentLoaded", "message", "popstate", "hashchange", "resize", "scroll", "error", "unhandledrejection", "beforeunload", "pageshow", "online", "offline", "readystatechange"].forEach(function (t) { defAccessor(G, "on" + t, function () { return (WLIS[t] && WLIS[t]._on) || null; }, function (v) { (WLIS[t] || (WLIS[t] = []))._on = v; if (typeof v === "function") { WLIS[t].push(v); G.__feHandler(v); } }); });
   G.postMessage = function (m, o) { H("postMessage", [m == null ? null : (typeof m === "object" ? JSON.stringify(m) : String(m)), o == null ? null : String(o)]); };
 
+  // Forced-exec coverage for PROMISE REACTIONS. A .then/.catch/.finally callback
+  // registered on a promise that never SETTLES during the analysis is un-fired
+  // code the residue does NOT reach — it was consumed by .then (a promise
+  // reaction), not left a free orphan, and forced exec has no event to fire it.
+  // The canonical case: a webpack JSONP chunk-load Promise, `new Promise(r => {
+  // script.onload = r })`, whose load event the analysis cannot faithfully fire
+  // (the dynamically-injected <script>'s onload is not engine-readable at the
+  // deferred load job) — so `.then(() => init())` never runs, the lazy
+  // Sentry.init / Apollo client never builds its configured transport, and the
+  // envelope + /api/graphql URLs stay opaque (send()/request() only ever drive
+  // COLD). Funnel the callbacks into the SAME __feHandler sink as event handlers
+  // so the entry-point driver runs the continuation as an orphan (reading the
+  // page's concrete `gon`/state -> building the real instance -> concrete URL).
+  // ranKeys dedups, so a callback that ALSO settles for real is not re-driven;
+  // the original then/catch/finally still runs for naturally-settling promises
+  // (transparent delegation). Only an explicit .then is hooked here — engine-side
+  // `await` continuations need the OP_await path; this covers the .then form
+  // (webpack chunk loads, SDK init chains) that is the bulk of the moat surface.
+  (function () {
+    if (!G.Promise || !G.Promise.prototype) return;
+    var PP = G.Promise.prototype;
+    var _then = PP.then;
+    if (typeof _then === "function") {
+      PP.then = function (onF, onR) {
+        try { if (typeof onF === "function" && G.__feHandler) G.__feHandler(onF, null); } catch (e) {}
+        try { if (typeof onR === "function" && G.__feHandler) G.__feHandler(onR, null); } catch (e) {}
+        return _then.call(this, onF, onR);
+      };
+    }
+    var _catch = PP.catch;
+    if (typeof _catch === "function") {
+      PP.catch = function (onR) {
+        try { if (typeof onR === "function" && G.__feHandler) G.__feHandler(onR, null); } catch (e) {}
+        return _catch.call(this, onR);
+      };
+    }
+    var _finally = PP.finally;
+    if (typeof _finally === "function") {
+      PP.finally = function (onFin) {
+        try { if (typeof onFin === "function" && G.__feHandler) G.__feHandler(onFin, null); } catch (e) {}
+        return _finally.call(this, onFin);
+      };
+    }
+  })();
+
   // ── location: real page URL when content.js shipped it (G.__pageUrl,
   // parsed via the WHATWG URL bound to Lexbor). Structure concrete so
   // origin-gated init runs and same-origin URLs the bundle builds from
