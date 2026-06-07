@@ -41,10 +41,21 @@
   // continues. Brackets BOTH the __hostDrive fixpoint and the @T static
   // drive below. Pause-and-defer, never a cap.
   var bfsActive = (typeof __feBfsActive === "function") ? __feBfsActive : function () {};
-  var n = -1, m = ran();
+  // Distinct-@H progress counter (hostedge). The drive-grows fixpoint below is
+  // necessary but NOT sufficient: an await->macrotask loop
+  // (`for(..){ await new Promise(r=>setTimeout(r,0)); fetch(distinctUrl); }`)
+  // re-enters ONE async function across resumptions, so __hostRan (distinct
+  // functions) is flat after iteration 0 and the pump would exit having learned
+  // only the first distinct endpoint -- the rest's timers never drain. _hProg
+  // (distinct host edges) is the missing signal: a cycle that drains a timer and
+  // fires a NEW endpoint advances it. Loop while EITHER grows; both flat is
+  // genuine event-loop quiescence (a same-endpoint poll loop has flat _hProg, so
+  // it still terminates). Not a cap -- only distinct progress keeps it running.
+  var hprog = (typeof __feHProg === "function") ? __feHProg : function () { return 0; };
+  var n = -1, m = ran(), hp = -1, hm = hprog();
   bfsActive(1);
   try {
-  while (m !== n) { n = m; drive(); flush(); pump(); m = ran(); }
+  while (m !== n || hm !== hp) { n = m; hp = hm; drive(); flush(); pump(); m = ran(); hm = hprog(); }
   // The JAW static half (site scan + @T→@H drive) is SCHEDULE-INDEPENDENT:
   // it enumerates the whole compiled-function set and drives the unreached
   // host-bearing ones, identically regardless of the forced decision

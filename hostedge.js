@@ -270,6 +270,11 @@
   G.queueMicrotask = function (f) { enq(f); };
   G.clearTimeout = G.clearInterval = G.cancelAnimationFrame = G.cancelIdleCallback = function () {};
   G.__hostRan = function () { return ranKeys.size; };
+  // Distinct @H host edges emitted so far (monotone). The driver pump loops while
+  // this grows so an await->macrotask loop over DISTINCT endpoints (one async fn,
+  // so __hostRan is flat) still drains every iteration's timer. Flat = no new
+  // endpoint this cycle (a same-endpoint poll loop) -> the pump can quiesce.
+  G.__feHProg = function () { return _hProg; };
 
   // ── events factory ────────────────────────────────────────────────
   function mkEvent(type, init) {
