@@ -60685,10 +60685,6 @@ static uint8_t *qjs_deep_sink = NULL;   /* 1 = reaches a security sink */
    the residue is rebuilt (qjs_deep_free). */
 static int qjs_dnf_threw = 0, qjs_dnf_ret = 0;
 static int qjs_deep_rb_n = 0, qjs_deep_cursor = 0;
-/* Run the value-spread depth pass once per residue, AFTER the orphan grind (rem==0),
-   so endpoints (breadth) precede depth. Reset when the residue is (re)built. */
-static int qjs_deep_vspread_done = 0;
-static JSValue js_fe_value_spread(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 static JSRuntime *qjs_deep_cache_rt = NULL;
 /* Spin-DEFER scheduling (pause-and-resume; NEVER a cap). The grind installs an
    interrupt handler that YIELDS an orphan drive making NO forced-progress
@@ -60992,7 +60988,6 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
            a consistent index across batches. */
         qjs_deep_free(ctx);
         qjs_deep_cache_rt = rt;
-        qjs_deep_vspread_done = 0;   /* fresh residue -> re-arm the post-grind value-spread */
         int cap = 0;
         struct list_head *el;
         list_for_each(el, &rt->gc_obj_list) {
@@ -61588,20 +61583,6 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
         if (cb->qjs_driven) continue;
         if (cb->qjs_h_fired) continue;
         rem++;
-    }
-    /* PRIORITISATION (breadth before depth): the value-SPREAD depth pass runs HERE,
-       after the residue orphan grind has driven endpoints (rem==0), instead of in the
-       seed drive's driver.js epilogue. There it ran hundreds of cond-body-builder
-       targets BEFORE the BFS returned, so on a branchy real site (learn.microsoft.com)
-       the BFS never completed and the deep grind never ran -> 0 endpoints. Endpoints
-       (deep grind) now come FIRST; the spread runs once per residue on g_deep_ctx
-       (boot fired-state preserved -- no per-schedule restore), JSPI-yielding per target,
-       so depth never starves breadth. The cond-body-builder moat targets (logged-out
-       auth body keys) are STATIC, so they survive the move. */
-    if (rem == 0 && !qjs_deep_vspread_done) {
-        qjs_deep_vspread_done = 1;
-        JSValue _vr = js_fe_value_spread(ctx, JS_UNDEFINED, 0, NULL);
-        JS_FreeValue(ctx, _vr);
     }
     return rem;
 }
