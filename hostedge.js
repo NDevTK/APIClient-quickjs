@@ -1201,11 +1201,22 @@
     // dispatchEvent path, losing coverage of any wrapper that
     // distinguishes dispatch-fire from direct-call.
     G.dispatchEvent(mkMessageEvent()); dispatchDoc(mkMessageEvent());
-    var _idle = 0, _lastProg = _hProg;
+    var _idle = 0, _lastProg = _hProg, _flushStartProg = _hProg, _drained = 0;
     while (TQ.length) {
       var fn = TQ.shift();
       try { fn.call(G); } catch (e) {}
-      if (_hProg > _lastProg) { _lastProg = _hProg; _idle = 0; } else if (++_idle >= 512) break;
+      _drained++;
+      if (_hProg > _lastProg) { _lastProg = _hProg; _idle = 0; }
+      else if (++_idle >= 512) {
+        // VESTIGIAL BOUND (CLAUDE.md: a count that STOPS work is a scheduler decision in
+        // disguise) — pending until timer-spinners are provably DEFERrable (a reaches=0
+        // structural proof, the timer analogue of the deep-grind same-back-edge defer).
+        // NEVER silent: emit @WHY so real-site data shows whether it ever truncates
+        // PRODUCTIVE work (progressed>0 = a flush that emitted @H then spun = a quality
+        // risk to prioritise) vs only bounds a pure no-output spin (progressed==0).
+        try { EPRINT('@WHY {"phase":"pump_idle_break","drained":' + _drained + ',"pending":' + TQ.length + ',"progressed":' + (_hProg - _flushStartProg) + '}'); } catch (e) {}
+        break;
+      }
     }
   };
 
