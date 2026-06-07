@@ -1497,6 +1497,15 @@ extern JSValue qjs_eval_script(JSContext *ctx, const char *src, size_t n,
 
 static int qjs_is_js_script_type(const lxb_char_t *ty, size_t tl) {
     if (!ty || tl == 0) return 1;                 /* no type = classic JS */
+    /* No type attribute (tl==0) or empty type = a CLASSIC JS script per the HTML
+       spec — the most common inline shape. Skipping these (the old behaviour: an
+       empty buf matches none of the literals below) dropped page-config SEEDERS like
+       gitlab.com's `<script nonce="">window.gon={};gon.sentry_dsn="...@new-sentry.
+       gitlab.net/4";gon.api_version="v4"</script>`, so `gon` stayed OPAQUE and the
+       gon-gated Sentry init + Apollo client built OPAQUE URLs (the envelope and
+       /api/graphql never resolved). Run them. (type="module" and non-JS types like
+       application/json / importmap are still classified by the literals below.) */
+    if (tl == 0) return 1;
     char buf[40]; if (tl >= sizeof buf) return 0;
     for (size_t i = 0; i < tl; i++) buf[i] = (char)((ty[i] >= 'A' && ty[i] <= 'Z') ? ty[i] + 32 : ty[i]);
     buf[tl] = 0;
