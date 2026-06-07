@@ -197,6 +197,7 @@
     if (ISOPQANY(s) || s == null) {
       try { s = JSON.stringify(deepConcretize(rec)); } catch (e2) { return; }
     }
+    if (!_hSeen.has(s)) { _hSeen.add(s); _hProg++; }
     EPRINT("@H " + s);
   }
   function tainted(v) {
@@ -247,9 +248,20 @@
   // ── event-loop pump (source-identity dedup → finite fixpoint) ─────
   var TQ = [];
   var ranKeys = new Set();
+  var _enqSeen = new Set();        // IDENTITY dedup: each distinct callback object enqueues once
+  var _hProg = 0;                  // monotone progress: count of DISTINCT @H host edges emitted (see H)
+  var _hSeen = new Set();
   var fnsrc = Function.prototype.toString;
   function keyOf(fn) { try { return fnsrc.call(fn); } catch (e) { return String(fn); } }
-  function enq(fn) { if (typeof fn === "function" && !ranKeys.has(keyOf(fn))) TQ.push(fn); }
+  // Timer dedup is by IDENTITY (each distinct callback object runs once). The old
+  // source-keyed dedup wrongly dropped every distinct callback sharing a source -- the
+  // native Promise resolve from new Promise(r=>setTimeout(r,0)) that include-fragment and
+  // most await->macrotask code defer their fetch behind (all "[native code]") -- losing
+  // every CE/timer instance fetch but the first, and each iteration of an await-loop over
+  // DISTINCT endpoints. The drain (__hostFlush) additionally stops once a stretch is
+  // genuinely dry (no new @H): a no-progress fixpoint that bounds distinct-object spin
+  // loops WITHOUT dropping productive ones. No depth/step cap -- progress resets dry.
+  function enq(fn) { if (typeof fn === "function" && !_enqSeen.has(fn)) { _enqSeen.add(fn); TQ.push(fn); } }
   var _tid = 0;
   G.setTimeout = function (f) { if (typeof f === "string") { S("code-exec", "setTimeout", f); return ++_tid; } enq(f); return ++_tid; };
   G.setInterval = function (f) { if (typeof f === "string") { S("code-exec", "setInterval", f); return ++_tid; } enq(f); return ++_tid; };
@@ -1184,7 +1196,12 @@
     // dispatchEvent path, losing coverage of any wrapper that
     // distinguishes dispatch-fire from direct-call.
     G.dispatchEvent(mkMessageEvent()); dispatchDoc(mkMessageEvent());
-    while (TQ.length) { var fn = TQ.shift(), k = keyOf(fn); if (ranKeys.has(k)) continue; ranKeys.add(k); try { fn.call(G); } catch (e) {} }
+    var _idle = 0, _lastProg = _hProg;
+    while (TQ.length) {
+      var fn = TQ.shift();
+      try { fn.call(G); } catch (e) {}
+      if (_hProg > _lastProg) { _lastProg = _hProg; _idle = 0; } else if (++_idle >= 512) break;
+    }
   };
 
   // ── entry-point driver (J-Force §3.1.3 / X-Force) ────────────────
