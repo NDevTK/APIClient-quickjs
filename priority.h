@@ -42,6 +42,13 @@ static inline int qjs_priority_deep_relcmp(const void *a, const void *b, void *o
     /* GOAL #1: API-endpoint (network fetch) orphans first — the deep grind's
        whole purpose is lazy-chunk fetch recovery (github preheat etc.). */
     if (x->net != y->net) return y->net - x->net;
+    /* CONCRETE-URL CALLER: transitively reaches a network edge (the fetch is in
+       a callee, so the flat net-bit is 0) AND has a real heap instance, so the
+       drive resolves a CONCRETE URL where an opaque wrapper only gives `GET ?`.
+       Ordered immediately after net so these join the endpoint HEAD instead of
+       sinking behind the entire net=0 tail. (At qsort time instances are not
+       yet known, so this field is 0 there; the live-pick computes it for real.) */
+    if (x->net2 != y->net2) return y->net2 - x->net2;
     /* QUALITY: a fn whose body RAN (concrete closure/module state) but whose
        host site was guard-skipped (preheat shape) resolves CONCRETE values;
        a cold orphan only an opaque shape. */
@@ -84,9 +91,10 @@ static inline int qjs_priority_live_orphan_better(JSFunctionBytecode *x,
    them per comparison (O(bytecode) × O(N²) picks) was pure waste. exec
    stays live (a function whose body runs mid-grind promotes immediately);
    size is a static struct field. Returns 1 if x outranks y. */
-static inline int qjs_priority_live_orphan_better_bits(int xnet, int xexec, int xsink, int xsize,
-                                                       int ynet, int yexec, int ysink, int ysize) {
+static inline int qjs_priority_live_orphan_better_bits(int xnet, int xnet2, int xexec, int xsink, int xsize,
+                                                       int ynet, int ynet2, int yexec, int ysink, int ysize) {
     if (xnet != ynet) return xnet > ynet;
+    if (xnet2 != ynet2) return xnet2 > ynet2;
     if (xexec != yexec) return xexec > yexec;
     if (xsink != ysink) return xsink > ysink;
     if (xsize != ysize) return xsize < ysize;

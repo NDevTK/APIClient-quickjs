@@ -60895,6 +60895,7 @@ static JSValue *qjs_deep_recv = NULL;   /* parallel to qjs_deep_rb: the real hea
    loop was O(N²·bytecode) — the real cost the "non-FIFO is slow" worry
    was actually measuring. */
 static uint8_t *qjs_deep_net = NULL;    /* 1 = reaches a network host edge */
+static uint8_t *qjs_deep_net2 = NULL;   /* 1 = TRANSITIVELY reaches a network edge (fetch is in a callee, flat net-bit=0) AND has a concrete heap instance → a concrete-URL caller that must join the endpoint HEAD */
 static uint8_t *qjs_deep_sink = NULL;   /* 1 = reaches a security sink */
 /* Driving-completeness counters (per grind): a host-bearing @T function was
    directed-driven but fired no host call. threw = an opaque op before the
@@ -61022,6 +61023,7 @@ void qjs_deep_free(JSContext *ctx) {
     }
     if (qjs_deep_rb) { js_free(ctx, qjs_deep_rb); qjs_deep_rb = NULL; }
     if (qjs_deep_net) { js_free(ctx, qjs_deep_net); qjs_deep_net = NULL; }
+    if (qjs_deep_net2) { js_free(ctx, qjs_deep_net2); qjs_deep_net2 = NULL; }
     if (qjs_deep_sink) { js_free(ctx, qjs_deep_sink); qjs_deep_sink = NULL; }
     if (qjs_deep_deferred) { js_free(ctx, qjs_deep_deferred); qjs_deep_deferred = NULL; }
     if (qjs_deep_defer_comp) { js_free(ctx, qjs_deep_defer_comp); qjs_deep_defer_comp = NULL; }
@@ -61162,7 +61164,7 @@ static int qjs_fn_reaches_net(JSFunctionBytecode *b) {
     }
     return 0;
 }
-typedef struct { JSFunctionBytecode *b; int net; int exec; int sink; int size; int idx; } qjs_deep_ent;
+typedef struct { JSFunctionBytecode *b; int net; int net2; int exec; int sink; int size; int idx; } qjs_deep_ent;
 /* Comparator extracted to priority.h — see that file for the lexicographic
    dimensions. Header-only inline; the struct layout above must precede the
    include since the comparator dereferences it. */
@@ -61179,7 +61181,11 @@ static void qjs_deep_relevance_sort(JSContext *ctx, JSFunctionBytecode **rb, int
         fflush(stderr);
         return;
     }
-    for (int i = 0; i < n; i++) { e[i].b = rb[i]; e[i].net = qjs_fn_reaches_net(rb[i]); e[i].exec = rb[i]->qjs_executed; e[i].sink = qjs_fn_reaches_sink(rb[i]); e[i].size = rb[i]->byte_code_len; e[i].idx = i; }
+    /* net2 (transitive-reach AND concrete-instance) needs qjs_deep_insts, which
+       is populated AFTER this sort — so it is 0 here (inert dimension). The
+       live-pick computes the real net2 from the cached bits once instances are
+       known; this initial order is only a starting point the live scan reranks. */
+    for (int i = 0; i < n; i++) { e[i].b = rb[i]; e[i].net = qjs_fn_reaches_net(rb[i]); e[i].net2 = 0; e[i].exec = rb[i]->qjs_executed; e[i].sink = qjs_fn_reaches_sink(rb[i]); e[i].size = rb[i]->byte_code_len; e[i].idx = i; }
     rqsort(e, n, sizeof *e, qjs_priority_deep_relcmp, NULL);
     for (int i = 0; i < n; i++) rb[i] = e[i].b;
     js_free(ctx, e);
@@ -61270,10 +61276,12 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
            per-pick comparator is O(1) — net/sink never change as the grind
            runs, so walking them per comparison was the O(N²·bytecode) cost. */
         if (qjs_deep_net) { js_free(ctx, qjs_deep_net); qjs_deep_net = NULL; }
+        if (qjs_deep_net2) { js_free(ctx, qjs_deep_net2); qjs_deep_net2 = NULL; }
         if (qjs_deep_sink) { js_free(ctx, qjs_deep_sink); qjs_deep_sink = NULL; }
         if (qjs_deep_deferred) { js_free(ctx, qjs_deep_deferred); qjs_deep_deferred = NULL; }
         if (qjs_deep_defer_comp) { js_free(ctx, qjs_deep_defer_comp); qjs_deep_defer_comp = NULL; }
         qjs_deep_net = js_malloc(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1));
+        qjs_deep_net2 = js_mallocz(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1));   /* 0 until the post-insts fill loop below; insts aren't populated yet here */
         qjs_deep_sink = js_malloc(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1));
         qjs_deep_deferred = js_mallocz(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1));   /* 0 = not spin-deferred */
         qjs_deep_defer_comp = js_malloc(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1) * sizeof(unsigned));
@@ -61347,6 +61355,21 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
                 }
             }
         }
+        /* net2 = concrete-URL caller bit. The flat net-bit (qjs_deep_net) only
+           sees a host atom in the function's OWN bytecode, so a wrapper like
+           `function mxe(){ return M("/site-header.json") }` whose fetch lives in
+           the callee `M` has net=0 and would sort behind the whole net=0 tail.
+           net2 promotes it to the endpoint HEAD when (a) a network edge is
+           TRANSITIVELY reachable (qjs_host_reach_net_from follows OP_call/
+           OP_fclosure) AND (b) a real heap instance exists (qjs_deep_insts[i]) so
+           the drive resolves a CONCRETE URL rather than an opaque `GET ?`.
+           Computed HERE — after both the net/sink fill and the qjs_deep_insts
+           population above — because the instance gate reads qjs_deep_insts[i]. */
+        if (qjs_deep_net2 && qjs_deep_net && qjs_deep_insts) {
+            for (int i = 0; i < qjs_deep_rb_n; i++) {
+                qjs_deep_net2[i] = (uint8_t)((qjs_deep_net[i] || qjs_host_reach_net_from(ctx, qjs_deep_rb[i], 0)) && !JS_IsUndefined(qjs_deep_insts[i]));
+            }
+        }
         /* Real-receiver map (parallel scan): an instance whose prototype chain owns an
            orphan as a method becomes its drive `this`, so a `this.client.call(...)`
            body-builder runs concrete instead of opaque. qjs_deep_ix was tagged above;
@@ -61397,7 +61420,7 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
        back EARLY even on a 1100-orphan residue. Falls back to the
        bytecode-walking comparator only if the bit arrays failed to alloc
        (OOM) — correctness preserved either way. */
-    int _have_bits = (qjs_deep_net != NULL && qjs_deep_sink != NULL);
+    int _have_bits = (qjs_deep_net != NULL && qjs_deep_net2 != NULL && qjs_deep_sink != NULL);
     unsigned _last_clear_comp = (unsigned)-1;   /* g_grind_completions at the last deferred-set re-attempt (no-progress fixpoint) */
     JS_SetInterruptHandler(rt, qjs_grind_interrupt, NULL);   /* spin-defer yield (gated by g_grind_drive_active, off during boot/BFS); runtime-free clears it */
     while (driven < maxN) {
@@ -61418,8 +61441,8 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
             if (b == NULL) better = 1;
             else if (_have_bits)
                 better = qjs_priority_live_orphan_better_bits(
-                    qjs_deep_net[_ci], cb->qjs_executed, qjs_deep_sink[_ci], cb->byte_code_len,
-                    qjs_deep_net[_ix], b->qjs_executed, qjs_deep_sink[_ix], b->byte_code_len);
+                    qjs_deep_net[_ci], qjs_deep_net2[_ci], cb->qjs_executed, qjs_deep_sink[_ci], cb->byte_code_len,
+                    qjs_deep_net[_ix], qjs_deep_net2[_ix], b->qjs_executed, qjs_deep_sink[_ix], b->byte_code_len);
             else
                 better = qjs_priority_live_orphan_better(cb, b);
             if (better) { b = cb; _ix = _ci; }
@@ -61460,7 +61483,7 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
            head before this page's completeness tail (continuous-session
            scheduler). qjs_h_fired orphans were already marked+skipped above, so
            _ix here is a genuine to-drive pick. */
-        if (head_only && _have_bits && !qjs_deep_net[_ix]) break;
+        if (head_only && _have_bits && !qjs_deep_net[_ix] && !qjs_deep_net2[_ix]) break;
         uint64_t _id = qjs_deep_ids ? qjs_deep_ids[_ix] : 0;
         /* Re-baseline the JS recursion guard to THIS frame before driving.
            js_check_stack_overflow compares the live SP against
