@@ -23737,31 +23737,63 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                (coverage win). for-await over an opaque stream stays bounded
                via the done-opaque iterator + loop-revisit fixpoint. */
             if (qjs_is_opaque(sp[-1])) { BREAK; }
-            /* `await <already-FULFILLED promise whose result is opaque-infected>`:
-               an async generator's next() promise, synchronously fulfilled with
-               {value:opaque,done:false} during a cold drive (Sentry's
-               `for await(item of forEachEnvelopeItem-gen)` over an opaque
-               envelope). The awaited value is a CONCRETE JS_CLASS_PROMISE, so the
-               opaque arm above misses it and the frame would SUSPEND FOREVER (no
-               pumped microtask resumes it in forced exec) — the post-loop
-               makeRequest → fetch(envelopeUrl) is never reached and the envelope
-               endpoint is lost (the suspended async-gen also pinned the ctx ref:
-               see qjs_free_suspended_generators). Resolve INLINE: leave the
-               promise's result on the stack and continue, exactly as the opaque
-               arm does. A fulfilled promise would resume on the very next
-               microtask anyway, so for an opaque-carrying result this only drops
-               the round-trip (and the leak). Gated FULFILLED + opaque-infected so
+            /* (1) PENDING promise during a grind orphan drive: an async
+               GENERATOR's next() ALWAYS returns a pending promise (it defers the
+               generator body to a microtask), so the FULFILLED-inline arm below
+               misses it and the frame would SUSPEND FOREVER — no microtask resumes
+               a suspended frame in forced exec, so a `for await(item of asyncGen)`
+               never reaches the post-loop fetch (Sentry transport's makeRequest →
+               fetch(envelopeUrl)). PUMP pending jobs in a BOUNDED loop until this
+               promise leaves PENDING: the async-gen's own opaque loop is bounded by
+               the loop-revisit fixpoint + js_iterator_get_value_done's done-opaque
+               fork, so it yields/returns in finite jobs and the next() promise
+               settles. Then fall into the FULFILLED arm. If still PENDING after the
+               safety bound (mirrors the 200000-drain cap elsewhere; a SAFETY bound,
+               NOT a silent cap — emit @WHY), fall through to the normal suspend so
+               we never hang. Gated on g_grind_drive_active so normal concrete async
+               ordering is untouched (a real pending promise still suspends). The
+               pump resumes the GENERATOR frame (a different frame); this frame is
+               mid-OP_await, not yet suspended, so no job re-enters it. */
+            if (g_grind_drive_active && JS_IsObject(sp[-1]) &&
+                JS_PromiseState(ctx, sp[-1]) == JS_PROMISE_PENDING) {
+                JSContext *_pjc; int _pn = 0;
+                while (JS_PromiseState(ctx, sp[-1]) == JS_PROMISE_PENDING &&
+                       _pn < 200000 && JS_ExecutePendingJob(rt, &_pjc) > 0)
+                    _pn++;
+                if (JS_PromiseState(ctx, sp[-1]) == JS_PROMISE_PENDING) {
+                    printf("@WHY {\"phase\":\"await_pump_unfulfilled\",\"turns\":%d}\n", _pn);
+                    fflush(stdout);
+                }
+            }
+            /* (2) FULFILLED promise: resolve INLINE (leave the result on the stack
+               and continue, no suspend) when EITHER the result carries an
+               opaque-infected value (the async-gen yielded an opaque item from an
+               opaque envelope) OR — during a grind drive — it is a TERMINAL
+               iterator result whose `done` is truthy ({value:undefined,done:true},
+               the for-await's exit iteration). Keeping the for-await inside the
+               synchronous forced-exec explorer lets js_iterator_get_value_done fork
+               `done` opaque and the loop-revisit fixpoint reach the post-loop fetch;
+               the terminal-done arm lets the loop ALSO exit cleanly (no dangling
+               suspended async-gen frame pinning the ctx — see
+               qjs_free_suspended_generators). A fulfilled promise would resume on
+               the very next microtask anyway, so this only drops the round-trip
+               (and the teardown leak). Gated FULFILLED + (opaque | grind-done) so
                concrete async ordering is untouched. */
             if (JS_IsObject(sp[-1]) &&
                 JS_PromiseState(ctx, sp[-1]) == JS_PROMISE_FULFILLED) {
                 JSValue _res = JS_PromiseResult(ctx, sp[-1]);   /* dup'd */
-                int _opq = qjs_is_opaque(_res);
-                if (!_opq && JS_IsObject(_res)) {
+                int _inl = qjs_is_opaque(_res);
+                if (!_inl && JS_IsObject(_res)) {
                     JSValue _v = JS_GetPropertyStr(ctx, _res, "value");
-                    _opq = qjs_is_opaque(_v);
+                    _inl = qjs_is_opaque(_v);
                     JS_FreeValue(ctx, _v);
+                    if (!_inl && g_grind_drive_active) {
+                        JSValue _d = JS_GetPropertyStr(ctx, _res, "done");
+                        _inl = (JS_ToBool(ctx, _d) > 0);
+                        JS_FreeValue(ctx, _d);
+                    }
                 }
-                if (_opq) { JS_FreeValue(ctx, sp[-1]); sp[-1] = _res; BREAK; }
+                if (_inl) { JS_FreeValue(ctx, sp[-1]); sp[-1] = _res; BREAK; }
                 JS_FreeValue(ctx, _res);
             }
             ret_val = js_int32(FUNC_RET_AWAIT);
@@ -61744,9 +61776,9 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
            rule. async flag distinguishes the await-continuation case. */
         if (!b->qjs_h_fired) {
             if (_drv_threw) qjs_dnf_threw++; else qjs_dnf_ret++;
-            fprintf(stderr, "@WHY {\"phase\":\"driven_no_fire\",\"fn\":\"%llx\",\"threw\":%d,\"async\":%d}\n",
+            printf("@WHY {\"phase\":\"driven_no_fire\",\"fn\":\"%llx\",\"threw\":%d,\"async\":%d}\n",
                     (unsigned long long)_id, _drv_threw, (b->func_kind & JS_FUNC_ASYNC) ? 1 : 0);
-            fflush(stderr);
+            fflush(stdout);
         }
         /* Drop this orphan's leftover continuation jobs (post-fetch .then
            chain); the @H is already emitted. */
