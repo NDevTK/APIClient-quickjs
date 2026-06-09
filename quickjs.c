@@ -61659,6 +61659,39 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
         while (JS_ExecutePendingJob(rt, &_sc) > 0 && _sd < 200000) _sd++;
         if (_settled == 0 && _sd == 0) break;
     }
+    /* Frame-cleanup INVARIANT (proactive, per the suspended-frame family the
+       settle above closes for plain pending-promise awaits): after the settle
+       sweep NO async frame should remain ACTIVE (suspended mid-await). One that
+       does is a NEW member the settle can't reach — a generator/for-await
+       suspended on something other than a plain pending-promise reaction, an
+       await on a thenable the resolve-thenable job left mid-flight — and it WILL
+       hold the ctx ref into --fe-deep-end's JS_FreeRuntime, where it surfaces
+       ONLY as the opaque gc_obj_list abort + abandoned residue. Name it HERE,
+       where the suspended frame's source is still readable, so the next vendor's
+       leak is self-diagnosing (file:line of the stuck async fn) instead of a
+       silent recoverable-abort. Emitted on STDOUT so the unfiltered @WHY parser
+       captures it (the stderr path is phase-whitelisted to bc_emit/eval_script).
+       Silent when 0 — the common case, confirming convergence. */
+    {
+        int _surv = 0;
+        struct list_head *_el;
+        list_for_each(_el, &rt->gc_obj_list) {
+            JSGCObjectHeader *_gp = list_entry(_el, JSGCObjectHeader, link);
+            if (_gp->gc_obj_type != JS_GC_OBJ_TYPE_ASYNC_FUNCTION) continue;
+            JSAsyncFunctionData *_af = (JSAsyncFunctionData *)_gp;
+            if (!_af->is_active) continue;   /* completed frame, just a live object — not a leak */
+            _surv++;
+            if (_surv <= 4) {
+                JSFunctionBytecode *_b = JS_GetFunctionBytecode(_af->func_state.frame.cur_func);
+                const char *_fn = (_b && _b->filename) ? JS_AtomToCString(ctx, _b->filename) : NULL;
+                printf("@WHY {\"phase\":\"suspended_frame_survives\",\"file\":\"%s\",\"line\":%d,\"col\":%d}\n",
+                       _fn ? _fn : "?", _b ? _b->line_num : -1, _b ? _b->col_num : -1);
+                fflush(stdout);
+                if (_fn) JS_FreeCString(ctx, _fn);
+            }
+        }
+        if (_surv) { printf("@WHY {\"phase\":\"suspended_frames_total\",\"count\":%d}\n", _surv); fflush(stdout); }
+    }
     /* Remaining work = residue entries not yet driven AND not yet host-
        fired naturally. The live-pick loop above doesn't advance
        qjs_deep_cursor (an index-based cursor is meaningless when picks
