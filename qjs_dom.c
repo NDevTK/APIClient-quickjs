@@ -1894,6 +1894,18 @@ int qjs_dom_install(JSContext *ctx) {
     "if(ev.bubbles!==false)for(i=1;i<path.length&&!ev._s;i++){a=(LIS.get(path[i])||{})[ev.type];if(a)for(l=0;l<a.length;l++)if(!a[l].cap){ev.currentTarget=path[i];try{(a[l].fn.handleEvent||a[l].fn).call(path[i],ev);}catch(e){}}var bh=path[i]['on'+ev.type];if(typeof bh==='function'){try{bh.call(path[i],ev);}catch(e){}}}"
     "return !ev.defaultPrevented;};"
     "P.click=function(){this.dispatchEvent({type:'click',bubbles:true});};"
+    /* Element on* handler properties (s.onload = fn) funnel into the SAME
+       __feHandler forced-handler sink as addEventListener + window on* — without
+       this a handler assigned as a property (not addEventListener) and not a
+       top-level residue function is NEVER driven. The canonical miss: webpack's
+       `script.onload = onScriptComplete` (set inside __webpack_require__.l, a
+       nested fn) — onScriptComplete resolves the chunk-load Promise from
+       installedChunks; undriven, the Promise never settles and the lazy init that
+       awaits the chunk stays suspended (gitlab Sentry/Apollo → no transport →
+       opaque envelope/graphql). The accessor stores the handler so dispatchEvent's
+       `this['on'+type]` and the load-event path still read it (get), and registers
+       it for the driver on set. Broad event list = drive what the bundle wired. */
+    "['load','error','loadend','readystatechange','abort','message','click','submit','change','input','keydown','play','open'].forEach(function(t){var key='__on'+t;Object.defineProperty(P,'on'+t,{configurable:true,enumerable:false,get:function(){var m=LIS.get(this);return m&&(key in m)?m[key]:null;},set:function(v){lst(this)[key]=v;if(typeof v==='function'){ALLT[t]=1;try{if(globalThis.__feHandler)globalThis.__feHandler(v,this);}catch(e){}}}});});"
     /* HTMLFormElement.prototype.submit per WHATWG forms spec, defined
        here in the Lexbor binding layer (not as a hostedge.js monkey-
        patch). Effective only on FORM elements. Walks Lexbor input
