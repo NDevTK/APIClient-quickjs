@@ -746,17 +746,52 @@ int main(int argc, char **argv) {
                scripts registered their handlers and BEFORE the residue grind. Drain
                queued jobs so the inits' async setup (transport creation) completes. */
             {
+                /* Complete the doc scripts' DEFERRED inits before the grind, via a
+                   drive/flush/pump FIXPOINT (mirrors driver.js). __hostFlush alone
+                   only fires page-lifecycle events — enough for a DOMContentLoaded-
+                   gated init, but NOT for an `await loadChunk()`-gated transport: the
+                   post-await global (e.g. createClient) is defined in the doc scripts
+                   (qjs_run_doc_scripts above), which run AFTER driver.js already did
+                   its one __hostDrive, so NOTHING ever drives createClient before the
+                   grind — it then drives the transport's send() COLD (opaque
+                   options.url, the gitlab sentry-envelope / factory shape). __hostDrive
+                   force-invokes the doc-script globals so createClient RUNS and builds
+                   the real transport on the heap (captured for the residue drive);
+                   __hostFlush drives the chunk onload (resolves the await) and lifecycle
+                   handlers; the pending-job drain runs the resumed continuations. Loop
+                   until __hostRan stops growing AND no job drained (quiescence) — the
+                   same finite seen-set fixpoint as driver.js, bounded, never a cap. */
                 JSValue _gg = JS_GetGlobalObject(g_deep_ctx);
+                JSValue _hd = JS_GetPropertyStr(g_deep_ctx, _gg, "__hostDrive");
                 JSValue _hf = JS_GetPropertyStr(g_deep_ctx, _gg, "__hostFlush");
-                if (JS_IsFunction(g_deep_ctx, _hf)) {
-                    JSValue _r = JS_Call(g_deep_ctx, _hf, _gg, 0, NULL);
-                    if (JS_IsException(_r)) { JSValue _e = JS_GetException(g_deep_ctx); JS_FreeValue(g_deep_ctx, _e); }
-                    JS_FreeValue(g_deep_ctx, _r);
+                JSValue _hr = JS_GetPropertyStr(g_deep_ctx, _gg, "__hostRan");
+                int _prevRan = -1;
+                for (int _it = 0; _it < 64; _it++) {
+                    if (JS_IsFunction(g_deep_ctx, _hd)) {
+                        JSValue _r = JS_Call(g_deep_ctx, _hd, _gg, 0, NULL);
+                        if (JS_IsException(_r)) { JSValue _e = JS_GetException(g_deep_ctx); JS_FreeValue(g_deep_ctx, _e); }
+                        JS_FreeValue(g_deep_ctx, _r);
+                    }
+                    if (JS_IsFunction(g_deep_ctx, _hf)) {
+                        JSValue _r = JS_Call(g_deep_ctx, _hf, _gg, 0, NULL);
+                        if (JS_IsException(_r)) { JSValue _e = JS_GetException(g_deep_ctx); JS_FreeValue(g_deep_ctx, _e); }
+                        JS_FreeValue(g_deep_ctx, _r);
+                    }
+                    JSContext *_c1; int _dd = 0;
+                    while (JS_ExecutePendingJob(g_deep_rt, &_c1) > 0 && _dd < 200000) _dd++;
+                    int _ran = -1;
+                    if (JS_IsFunction(g_deep_ctx, _hr)) {
+                        JSValue _rv = JS_Call(g_deep_ctx, _hr, _gg, 0, NULL);
+                        JS_ToInt32(g_deep_ctx, &_ran, _rv);
+                        JS_FreeValue(g_deep_ctx, _rv);
+                    }
+                    if (_ran == _prevRan && _dd == 0) break;   /* quiescence */
+                    _prevRan = _ran;
                 }
+                JS_FreeValue(g_deep_ctx, _hr);
                 JS_FreeValue(g_deep_ctx, _hf);
+                JS_FreeValue(g_deep_ctx, _hd);
                 JS_FreeValue(g_deep_ctx, _gg);
-                JSContext *_c1; int _dd = 0;
-                while (JS_ExecutePendingJob(g_deep_rt, &_c1) > 0 && _dd < 200000) _dd++;
             }
             /* grind mode → unbounded; engine drives every remaining orphan,
                yielding per-orphan via JSPI so the host scheduler can rotate
