@@ -76,6 +76,11 @@ static int qjs_host_reach_net_from(JSContext *ctx, JSFunctionBytecode *b, int st
 static int qjs_fn_reaches_net(JSFunctionBytecode *b);
 static uint64_t qjs_fn_id(JSContext *ctx, JSFunctionBytecode *b);   /* defined ~60029; used by the caught_throw diagnostic in JS_CallInternal */
 static int qjs_is_sink_atom(JSAtom a);
+/* Forward-declared: the OP_await grind pump (async-generator for-await drive)
+   reads this gate well before its definition (~60974, near the spin-defer
+   scheduler). Without the forward decl the use in JS_CallInternal is a
+   compile error. */
+static int g_grind_drive_active;
 /* Directed-drive state — the principled answer to "which branches to
    follow". When active, the OP_if_* handlers in the TARGET function
    (qjs_dir_b) fork ONLY value-determining branches (both arms can reach
@@ -60269,6 +60274,17 @@ static int qjs_host_reach_check(JSContext *ctx, JSFunctionBytecode *b) {
         int sz = short_opcode_info(op).size;
         if (sz < 1) break;
         if (qjs_host_atom_at(b, pos) != JS_ATOM_NULL) { b->qjs_host_reach = 1; return 1; }
+        /* A real value-yield escapes to a (possibly host-reaching) consumer:
+           the COUNT of items a generator yields decides whether the
+           consumer's `if(filtered.length===0)return` guard passes and the
+           fetch fires. A yield-only generator has no host atom of its own,
+           so without this it reads as non-host-reaching and its opaque loop
+           predicate gets pruned to the exit arm at iteration 0 (zero items
+           yielded), killing the consumer's fetch. Treat yield/yield* as a
+           reach (mirrors OP_call in qjs_host_reach_from). OP_initial_yield is
+           the implicit generator/async suspend, NOT a value escape — exclude
+           it so this doesn't defeat pruning for every async function. */
+        if (op == OP_yield || op == OP_yield_star || op == OP_async_yield_star) { b->qjs_host_reach = 1; return 1; }
         if (op == OP_fclosure || op == OP_fclosure8) {
             int cidx = (op == OP_fclosure) ? (int)get_u32(bc + pos + 1) : (int)bc[pos + 1];
             if (cidx >= 0 && cidx < b->cpool_count) {
@@ -60343,6 +60359,9 @@ static int qjs_host_reach_from(JSContext *ctx, JSFunctionBytecode *b, int start_
                 op == OP_call3 || op == OP_call_method || op == OP_tail_call ||
                 op == OP_tail_call_method || op == OP_call_constructor ||
                 op == OP_apply || op == OP_apply_eval || op == OP_eval) { reach = 1; goto done; }
+            /* A real value-yield escapes to a (possibly host-reaching)
+               consumer — see qjs_host_reach_check. Keep the arm. */
+            if (op == OP_yield || op == OP_yield_star || op == OP_async_yield_star) { reach = 1; goto done; }
             if (op == OP_return || op == OP_return_undef || op == OP_return_async ||
                 op == OP_throw || op == OP_throw_error) break;   /* terminal arm */
             int fmt = short_opcode_info(op).fmt;
