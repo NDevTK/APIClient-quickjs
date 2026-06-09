@@ -166,6 +166,28 @@ void qjs_forced_config(int en, const char *sch, const char *tr);
    eval). Replaces the deleted hostedge SSR _eval phase. */
 void qjs_run_doc_scripts(JSContext *ctx);
 int qjs_settle_pending_promises(JSContext *ctx);   /* unwind await-on-never-settling-promise frames */
+int qjs_free_suspended_generators(JSContext *ctx); /* unwind suspended-generator frames (same teardown leak) */
+
+/* Unwind every suspended frame the runtime still holds before JS_FreeContext —
+   a forced-exec `await <never-settling promise>` (resolve with opaque, running
+   the continuation) and a suspended `function*` (a for-of over an opaque the
+   consumer never exhausts; complete it, freeing the frame). Either kind pins a
+   ctx ref → JS_FreeContext can't free the context → it roots the whole bundle →
+   JS_FreeRuntime's list_empty(gc_obj_list) assert. Both the BOOT and DEEP ctx
+   run the page's scripts (qjs_run_doc_scripts), so both teardowns need this;
+   the per-batch grind-end sweep is skipped on a no-progress break, so the
+   teardown is the GUARANTEED cleanup point. Loop with the job drain to a
+   settle-nothing/free-nothing/drain-nothing fixpoint. */
+static void qjs_unwind_suspended(JSContext *ctx, JSRuntime *rt) {
+    if (!ctx || !rt) return;
+    for (int _u = 0; _u < 64; _u++) {
+        int _s = qjs_settle_pending_promises(ctx);
+        int _g = qjs_free_suspended_generators(ctx);
+        JSContext *_c; int _d = 0;
+        while (JS_ExecutePendingJob(rt, &_c) > 0 && _d < 200000) _d++;
+        if (_s == 0 && _g == 0 && _d == 0) break;
+    }
+}
 
 /* Resumable/throttled deep orphan drive (quickjs.c). qjs_deep_step_c drives
    the next maxN unreached @T host functions and returns how many remain;
@@ -661,6 +683,7 @@ int main(int argc, char **argv) {
                    assert). learn.microsoft.com's heavy async init trips both;
                    github doesn't. Spec-legitimate teardown drain, not a GC mask. */
                 qjs_deep_drain_jobs(g_deep_ctx);
+                qjs_unwind_suspended(g_deep_ctx, g_deep_rt);   /* drop suspended-frame ctx refs before free */
                 JS_FreeContext(g_deep_ctx);
                 js_std_free_handlers(g_deep_rt);
                 JS_FreeRuntime(g_deep_rt);
@@ -798,7 +821,9 @@ int main(int argc, char **argv) {
                            teardown (the gc_obj_list leak → rem:-1 grind stop). Loop
                            again to drain the resume reactions; only truly done when
                            nothing remains to settle. */
-                        if (qjs_settle_pending_promises(g_deep_ctx) == 0) break;
+                        int _settledN = qjs_settle_pending_promises(g_deep_ctx);
+                        int _gensN = qjs_free_suspended_generators(g_deep_ctx);
+                        if (_settledN == 0 && _gensN == 0) break;
                         _prevRan = -1;   /* re-pump: run the resumed continuations */
                     } else {
                         _prevRan = _ran;
@@ -839,6 +864,7 @@ int main(int argc, char **argv) {
         if (do_boot_end) {
             if (g_boot_ctx) {
                 qjs_deep_drain_jobs(g_boot_ctx);
+                qjs_unwind_suspended(g_boot_ctx, g_boot_rt);   /* drop suspended-frame ctx refs before free */
                 JS_FreeContext(g_boot_ctx);
                 js_std_free_handlers(g_boot_rt);
                 JS_FreeRuntime(g_boot_rt);
@@ -855,6 +881,7 @@ int main(int argc, char **argv) {
                lost). */
             if (g_boot_ctx) {
                 qjs_deep_drain_jobs(g_boot_ctx);
+                qjs_unwind_suspended(g_boot_ctx, g_boot_rt);   /* drop suspended-frame ctx refs before free */
                 JS_FreeContext(g_boot_ctx);
                 js_std_free_handlers(g_boot_rt);
                 JS_FreeRuntime(g_boot_rt);

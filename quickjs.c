@@ -58369,6 +58369,56 @@ int qjs_settle_pending_promises(JSContext *ctx) {
     return settled;
 }
 
+/* Companion to qjs_settle_pending_promises for the GENERATOR form of the
+   suspended-frame leak: a `function*` that forced exec drove and that suspended
+   at a `yield` — a for-of over an opaque the consumer never exhausts (Sentry's
+   forEachEnvelopeItem over the cold-driven opaque envelope leaves 6 such on
+   gitlab) — keeps its JSAsyncFunctionState frame alive → a ctx ref → context:1
+   survives JS_FreeContext → it roots the whole bundle → the gc_obj_list assert
+   aborts the grind, abandoning the residue. Unlike a promise (resolve → run the
+   continuation for coverage), a suspended generator has no awaiter to resume at
+   quiescence and its remaining iterations are over opaque (no concrete
+   endpoint), so UNWIND it: free_generator_stack_rt completes it (frees the
+   frame, drops the ctx ref). Freeing a frame decrefs its locals, which can free
+   OTHER gc objects mid-walk — so COLLECT + hold a ref on every suspended
+   generator first (none freed underfoot), free all their stacks, then release.
+   Returns the count unwound. Quiescence-only. */
+int qjs_free_suspended_generators(JSContext *ctx) {
+    JSRuntime *rt = ctx->rt;
+    struct list_head *el;
+    int n = 0, cap = 0;
+    JSValue *held = NULL;
+    list_for_each(el, &rt->gc_obj_list) {
+        JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
+        if (gp->gc_obj_type != JS_GC_OBJ_TYPE_JS_OBJECT)
+            continue;
+        JSObject *p = (JSObject *)gp;
+        if (p->class_id != JS_CLASS_GENERATOR)
+            continue;
+        JSGeneratorData *s = p->u.generator_data;
+        if (!s || s->state == JS_GENERATOR_STATE_COMPLETED ||
+            s->state == JS_GENERATOR_STATE_EXECUTING)
+            continue;
+        if (n == cap) {
+            int nc = cap ? cap * 2 : 16;
+            JSValue *nt = js_realloc(ctx, held, nc * sizeof(JSValue));
+            if (!nt) break;   /* OOM — unwind what we collected */
+            held = nt; cap = nc;
+        }
+        held[n++] = JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, p));
+    }
+    for (int i = 0; i < n; i++) {
+        JSObject *p = JS_VALUE_GET_OBJ(held[i]);
+        JSGeneratorData *s = p->u.generator_data;
+        if (s && s->state != JS_GENERATOR_STATE_COMPLETED &&
+            s->state != JS_GENERATOR_STATE_EXECUTING)
+            free_generator_stack_rt(rt, s);
+        JS_FreeValue(ctx, held[i]);
+    }
+    if (held) js_free(ctx, held);
+    return n;
+}
+
 static JSValue js_promise_resolve_thenable_job(JSContext *ctx,
                                                int argc, JSValueConst *argv)
 {
@@ -61655,9 +61705,10 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
        boot pump's bounded fixpoint (a convergence sweep, not a work cap). */
     for (int _sp = 0; _sp < 64; _sp++) {
         int _settled = qjs_settle_pending_promises(ctx);
+        int _gens = qjs_free_suspended_generators(ctx);   /* generator form of the same leak */
         JSContext *_sc; int _sd = 0;
         while (JS_ExecutePendingJob(rt, &_sc) > 0 && _sd < 200000) _sd++;
-        if (_settled == 0 && _sd == 0) break;
+        if (_settled == 0 && _gens == 0 && _sd == 0) break;
     }
     /* Frame-cleanup INVARIANT (proactive, per the suspended-frame family the
        settle above closes for plain pending-promise awaits): after the settle
@@ -61673,24 +61724,47 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
        captures it (the stderr path is phase-whitelisted to bc_emit/eval_script).
        Silent when 0 — the common case, confirming convergence. */
     {
-        int _surv = 0;
+        int _surv = 0, _gen = 0;
         struct list_head *_el;
         list_for_each(_el, &rt->gc_obj_list) {
             JSGCObjectHeader *_gp = list_entry(_el, JSGCObjectHeader, link);
-            if (_gp->gc_obj_type != JS_GC_OBJ_TYPE_ASYNC_FUNCTION) continue;
-            JSAsyncFunctionData *_af = (JSAsyncFunctionData *)_gp;
-            if (!_af->is_active) continue;   /* completed frame, just a live object — not a leak */
-            _surv++;
-            if (_surv <= 4) {
-                JSFunctionBytecode *_b = JS_GetFunctionBytecode(_af->func_state.frame.cur_func);
-                const char *_fn = (_b && _b->filename) ? JS_AtomToCString(ctx, _b->filename) : NULL;
-                printf("@WHY {\"phase\":\"suspended_frame_survives\",\"file\":\"%s\",\"line\":%d,\"col\":%d}\n",
-                       _fn ? _fn : "?", _b ? _b->line_num : -1, _b ? _b->col_num : -1);
-                fflush(stdout);
-                if (_fn) JS_FreeCString(ctx, _fn);
+            if (_gp->gc_obj_type == JS_GC_OBJ_TYPE_ASYNC_FUNCTION) {
+                JSAsyncFunctionData *_af = (JSAsyncFunctionData *)_gp;
+                if (!_af->is_active) continue;   /* completed frame, just a live object — not a leak */
+                _surv++;
+                if (_surv <= 4) {
+                    JSFunctionBytecode *_b = JS_GetFunctionBytecode(_af->func_state.frame.cur_func);
+                    const char *_fn = (_b && _b->filename) ? JS_AtomToCString(ctx, _b->filename) : NULL;
+                    printf("@WHY {\"phase\":\"suspended_frame_survives\",\"file\":\"%s\",\"line\":%d,\"col\":%d}\n",
+                           _fn ? _fn : "?", _b ? _b->line_num : -1, _b ? _b->col_num : -1);
+                    fflush(stdout);
+                    if (_fn) JS_FreeCString(ctx, _fn);
+                }
+            } else if (_gp->gc_obj_type == JS_GC_OBJ_TYPE_JS_OBJECT) {
+                /* A suspended GENERATOR holds the same JSAsyncFunctionState frame
+                   (→ a ctx ref) but is a JS_OBJECT/JS_CLASS_GENERATOR, so it shows
+                   as `obj` not `async` in the FreeRuntime_residue — the prime
+                   non-async holder of the surviving context (gitlab: async:0 yet
+                   context:1 rooting all bytecode). Count it so the next fix targets
+                   the right construct (a for-of over an opaque the consumer never
+                   exhausts leaves a SUSPENDED_YIELD generator). */
+                JSObject *_o = (JSObject *)_gp;
+                if (_o->class_id == JS_CLASS_GENERATOR && _o->u.generator_data &&
+                    _o->u.generator_data->state != JS_GENERATOR_STATE_COMPLETED &&
+                    _o->u.generator_data->state != JS_GENERATOR_STATE_EXECUTING) {
+                    _gen++;
+                    if (_gen <= 4) {
+                        JSFunctionBytecode *_b = JS_GetFunctionBytecode(_o->u.generator_data->func_state.frame.cur_func);
+                        const char *_fn = (_b && _b->filename) ? JS_AtomToCString(ctx, _b->filename) : NULL;
+                        printf("@WHY {\"phase\":\"suspended_generator_survives\",\"file\":\"%s\",\"line\":%d,\"col\":%d}\n",
+                               _fn ? _fn : "?", _b ? _b->line_num : -1, _b ? _b->col_num : -1);
+                        fflush(stdout);
+                        if (_fn) JS_FreeCString(ctx, _fn);
+                    }
+                }
             }
         }
-        if (_surv) { printf("@WHY {\"phase\":\"suspended_frames_total\",\"count\":%d}\n", _surv); fflush(stdout); }
+        if (_surv || _gen) { printf("@WHY {\"phase\":\"suspended_frames_total\",\"async\":%d,\"gen\":%d}\n", _surv, _gen); fflush(stdout); }
     }
     /* Remaining work = residue entries not yet driven AND not yet host-
        fired naturally. The live-pick loop above doesn't advance
