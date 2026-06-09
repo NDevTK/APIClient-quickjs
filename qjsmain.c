@@ -180,13 +180,16 @@ int qjs_free_suspended_generators(JSContext *ctx); /* unwind suspended-generator
    settle-nothing/free-nothing/drain-nothing fixpoint. */
 static void qjs_unwind_suspended(JSContext *ctx, JSRuntime *rt) {
     if (!ctx || !rt) return;
+    int _tp = 0, _tg = 0;
     for (int _u = 0; _u < 64; _u++) {
         int _s = qjs_settle_pending_promises(ctx);
         int _g = qjs_free_suspended_generators(ctx);
+        _tp += _s; _tg += _g;
         JSContext *_c; int _d = 0;
         while (JS_ExecutePendingJob(rt, &_c) > 0 && _d < 200000) _d++;
         if (_s == 0 && _g == 0 && _d == 0) break;
     }
+    if (_tp || _tg) { printf("@WHY {\"phase\":\"teardown_unwind\",\"promises\":%d,\"gens\":%d}\n", _tp, _tg); fflush(stdout); }   /* observability: how many frames the teardown dropped */
 }
 
 /* Resumable/throttled deep orphan drive (quickjs.c). qjs_deep_step_c drives

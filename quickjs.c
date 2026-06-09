@@ -58383,6 +58383,30 @@ int qjs_settle_pending_promises(JSContext *ctx) {
    OTHER gc objects mid-walk — so COLLECT + hold a ref on every suspended
    generator first (none freed underfoot), free all their stacks, then release.
    Returns the count unwound. Quiescence-only. */
+/* Mirror of free_generator_stack_rt for an ASYNC generator (`async function*`):
+   drain its pending request queue (freeing each request's promise/result/
+   resolving funcs) then free its suspended frame, marking it COMPLETED so the
+   finalizer (js_async_generator_free) does not double-free the frame (its guard
+   skips COMPLETED/AWAITING_RETURN). Frees the FRAME only, never the object — the
+   GC finalizer still owns that. */
+static void qjs_free_async_gen_frame(JSRuntime *rt, JSAsyncGeneratorData *s) {
+    struct list_head *el, *el1;
+    JSAsyncGeneratorRequest *req;
+    list_for_each_safe(el, el1, &s->queue) {
+        req = list_entry(el, JSAsyncGeneratorRequest, link);
+        list_del(&req->link);
+        JS_FreeValueRT(rt, req->result);
+        JS_FreeValueRT(rt, req->promise);
+        JS_FreeValueRT(rt, req->resolving_funcs[0]);
+        JS_FreeValueRT(rt, req->resolving_funcs[1]);
+        js_free_rt(rt, req);
+    }
+    if (s->state != JS_ASYNC_GENERATOR_STATE_COMPLETED &&
+        s->state != JS_ASYNC_GENERATOR_STATE_AWAITING_RETURN)
+        async_func_free(rt, &s->func_state);
+    s->state = JS_ASYNC_GENERATOR_STATE_COMPLETED;
+}
+
 int qjs_free_suspended_generators(JSContext *ctx) {
     JSRuntime *rt = ctx->rt;
     struct list_head *el;
@@ -58393,11 +58417,27 @@ int qjs_free_suspended_generators(JSContext *ctx) {
         if (gp->gc_obj_type != JS_GC_OBJ_TYPE_JS_OBJECT)
             continue;
         JSObject *p = (JSObject *)gp;
-        if (p->class_id != JS_CLASS_GENERATOR)
-            continue;
-        JSGeneratorData *s = p->u.generator_data;
-        if (!s || s->state == JS_GENERATOR_STATE_COMPLETED ||
-            s->state == JS_GENERATOR_STATE_EXECUTING)
+        /* A plain generator (`function*` suspended at yield) AND an ASYNC
+           generator (`async function*` — a for-await over an opaque stream the
+           consumer never exhausts, Sentry's forEachEnvelopeItem pattern) BOTH
+           embed a live JSAsyncFunctionState frame whose cur_func → realm → the
+           deep ctx, so either pins the whole bundle at teardown. The async
+           generator is a DISTINCT class (JS_CLASS_ASYNC_GENERATOR) that shows as
+           `obj` not `async` in the residue, so it slipped past BOTH the
+           async-frame settle and the plain-generator filter — the invisible
+           context:1 holder on gitlab's Sentry chunk. */
+        int susp = 0;
+        if (p->class_id == JS_CLASS_GENERATOR) {
+            JSGeneratorData *s = p->u.generator_data;
+            susp = s && s->state != JS_GENERATOR_STATE_COMPLETED &&
+                        s->state != JS_GENERATOR_STATE_EXECUTING;
+        } else if (p->class_id == JS_CLASS_ASYNC_GENERATOR) {
+            JSAsyncGeneratorData *s = JS_GetOpaque(JS_MKPTR(JS_TAG_OBJECT, p), JS_CLASS_ASYNC_GENERATOR);
+            susp = s && (s->state == JS_ASYNC_GENERATOR_STATE_SUSPENDED_START ||
+                         s->state == JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD ||
+                         s->state == JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD_STAR);
+        }
+        if (!susp)
             continue;
         if (n == cap) {
             int nc = cap ? cap * 2 : 16;
@@ -58409,10 +58449,18 @@ int qjs_free_suspended_generators(JSContext *ctx) {
     }
     for (int i = 0; i < n; i++) {
         JSObject *p = JS_VALUE_GET_OBJ(held[i]);
-        JSGeneratorData *s = p->u.generator_data;
-        if (s && s->state != JS_GENERATOR_STATE_COMPLETED &&
-            s->state != JS_GENERATOR_STATE_EXECUTING)
-            free_generator_stack_rt(rt, s);
+        if (p->class_id == JS_CLASS_GENERATOR) {
+            JSGeneratorData *s = p->u.generator_data;
+            if (s && s->state != JS_GENERATOR_STATE_COMPLETED &&
+                s->state != JS_GENERATOR_STATE_EXECUTING)
+                free_generator_stack_rt(rt, s);
+        } else if (p->class_id == JS_CLASS_ASYNC_GENERATOR) {
+            JSAsyncGeneratorData *s = JS_GetOpaque(held[i], JS_CLASS_ASYNC_GENERATOR);
+            if (s && s->state != JS_ASYNC_GENERATOR_STATE_COMPLETED &&
+                s->state != JS_ASYNC_GENERATOR_STATE_AWAITING_RETURN &&
+                s->state != JS_ASYNC_GENERATOR_STATE_EXECUTING)
+                qjs_free_async_gen_frame(rt, s);
+        }
         JS_FreeValue(ctx, held[i]);
     }
     if (held) js_free(ctx, held);
@@ -61749,12 +61797,25 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
                    the right construct (a for-of over an opaque the consumer never
                    exhausts leaves a SUSPENDED_YIELD generator). */
                 JSObject *_o = (JSObject *)_gp;
+                JSStackFrame *_gf = NULL;
                 if (_o->class_id == JS_CLASS_GENERATOR && _o->u.generator_data &&
                     _o->u.generator_data->state != JS_GENERATOR_STATE_COMPLETED &&
                     _o->u.generator_data->state != JS_GENERATOR_STATE_EXECUTING) {
+                    _gf = &_o->u.generator_data->func_state.frame;
+                } else if (_o->class_id == JS_CLASS_ASYNC_GENERATOR) {
+                    /* async function* — same JSAsyncFunctionState frame, distinct
+                       class, the invisible context:1 holder the async settle and
+                       the plain-generator filter both miss. */
+                    JSAsyncGeneratorData *_ag = JS_GetOpaque(JS_MKPTR(JS_TAG_OBJECT, _o), JS_CLASS_ASYNC_GENERATOR);
+                    if (_ag && (_ag->state == JS_ASYNC_GENERATOR_STATE_SUSPENDED_START ||
+                                _ag->state == JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD ||
+                                _ag->state == JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD_STAR))
+                        _gf = &_ag->func_state.frame;
+                }
+                if (_gf) {
                     _gen++;
                     if (_gen <= 4) {
-                        JSFunctionBytecode *_b = JS_GetFunctionBytecode(_o->u.generator_data->func_state.frame.cur_func);
+                        JSFunctionBytecode *_b = JS_GetFunctionBytecode(_gf->cur_func);
                         const char *_fn = (_b && _b->filename) ? JS_AtomToCString(ctx, _b->filename) : NULL;
                         printf("@WHY {\"phase\":\"suspended_generator_survives\",\"file\":\"%s\",\"line\":%d,\"col\":%d}\n",
                                _fn ? _fn : "?", _b ? _b->line_num : -1, _b ? _b->col_num : -1);
