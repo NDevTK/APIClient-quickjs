@@ -165,6 +165,7 @@ void qjs_forced_config(int en, const char *sch, const char *tr);
    /h.js parsed the HTML into the Lexbor DOM (NOT re-entrantly from inside a JS
    eval). Replaces the deleted hostedge SSR _eval phase. */
 void qjs_run_doc_scripts(JSContext *ctx);
+int qjs_settle_pending_promises(JSContext *ctx);   /* unwind await-on-never-settling-promise frames */
 
 /* Resumable/throttled deep orphan drive (quickjs.c). qjs_deep_step_c drives
    the next maxN unreached @T host functions and returns how many remain;
@@ -785,8 +786,23 @@ int main(int argc, char **argv) {
                         JS_ToInt32(g_deep_ctx, &_ran, _rv);
                         JS_FreeValue(g_deep_ctx, _rv);
                     }
-                    if (_ran == _prevRan && _dd == 0) break;   /* quiescence */
-                    _prevRan = _ran;
+                    if (_ran == _prevRan && _dd == 0) {
+                        /* Natural quiescence: drive+flush+drain reached a fixpoint,
+                           yet a suspended `await <pending promise>` (a webpack
+                           chunk-load whose onload never fires, etc.) still pins its
+                           async frame — __hostFlush can't fire that event. Fulfill
+                           those never-settling promises with OPAQUE so the frames
+                           UNWIND: the continuation past the await RUNS (coverage —
+                           the lazy Sentry.init / Apollo client builds its real
+                           transport) and no frame survives to hold the ctx ref at
+                           teardown (the gc_obj_list leak → rem:-1 grind stop). Loop
+                           again to drain the resume reactions; only truly done when
+                           nothing remains to settle. */
+                        if (qjs_settle_pending_promises(g_deep_ctx) == 0) break;
+                        _prevRan = -1;   /* re-pump: run the resumed continuations */
+                    } else {
+                        _prevRan = _ran;
+                    }
                 }
                 JS_FreeValue(g_deep_ctx, _hr);
                 JS_FreeValue(g_deep_ctx, _hf);

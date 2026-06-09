@@ -58327,6 +58327,48 @@ static void fulfill_or_reject_promise(JSContext *ctx, JSValueConst promise,
     }
 }
 
+/* Forced-exec quiescence helper: fulfill every still-PENDING promise that has
+   an unfired reaction with an OPAQUE value, and return how many were settled.
+   In forced exec the host never settles a promise whose resolver is stashed on
+   an event that won't fire — a webpack JSONP chunk-load `new Promise(r =>
+   script.onload = r)`, a manual deferred — so an `await` on it SUSPENDS the
+   async frame FOREVER: the frame holds a ctx ref → the context survives
+   JS_FreeContext → it roots the whole bundle → JS_FreeRuntime's
+   list_empty(gc_obj_list) assert fires (recoverable abort, but it stops the
+   grind at rem:-1, abandoning the residue — gitlab's lazy Sentry transport
+   send() among it). hostedge funnels the `.then` form to __feHandler and
+   OP_await resolves `await <opaque>` inline; this is the missing third form,
+   `await <real pending promise>`. Fulfilling with opaque queues the reaction
+   (the async resume) so the continuation RUNS with opaque — coverage: the
+   lazy init PAST the chunk-load await builds its real transport — and no async
+   frame survives to leak. MUST be called only at pump quiescence (no natural
+   job would settle these); the caller drains jobs and loops until it returns 0
+   (a resumed frame may create a fresh pending await). */
+int qjs_settle_pending_promises(JSContext *ctx) {
+    JSRuntime *rt = ctx->rt;
+    struct list_head *el, *el1;
+    int settled = 0;
+    JSValue opq = qjs_opaque_new(ctx);
+    list_for_each_safe(el, el1, &rt->gc_obj_list) {
+        JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
+        if (gp->gc_obj_type != JS_GC_OBJ_TYPE_JS_OBJECT)
+            continue;
+        JSObject *p = (JSObject *)gp;
+        if (p->class_id != JS_CLASS_PROMISE)
+            continue;
+        JSPromiseData *s = p->u.promise_data;
+        if (!s || s->promise_state != JS_PROMISE_PENDING)
+            continue;
+        if (list_empty(&s->promise_reactions[0]) &&
+            list_empty(&s->promise_reactions[1]))
+            continue;   /* no awaiter/then — nothing to unwind */
+        fulfill_or_reject_promise(ctx, JS_MKPTR(JS_TAG_OBJECT, p), opq, false);
+        settled++;
+    }
+    JS_FreeValue(ctx, opq);
+    return settled;
+}
+
 static JSValue js_promise_resolve_thenable_job(JSContext *ctx,
                                                int argc, JSValueConst *argv)
 {
@@ -61596,6 +61638,27 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
           qjs_drop_pending_jobs(rt);   /* handler-spawned fetch .then chains; @H already emitted */
       }
       JS_FreeValue(ctx, _dh); JS_FreeValue(ctx, _g); }
+    /* Unwind async frames this batch's drives left SUSPENDED on a never-
+       settling promise — a webpack chunk-load `new Promise(r=>script.onload=r)`
+       awaited by a lazy init, whose load event forced exec can't fire, so the
+       per-drive JS_ExecutePendingJob loops above never advance it. Fulfill those
+       still-PENDING promises with OPAQUE: the continuation PAST the await runs
+       (the lazy Sentry.init / Apollo client builds its REAL transport on the
+       heap — qjs_deep_capture_inst pairs it with the cold-driven send() orphan,
+       so a later batch re-drives send() with the real instance to the CONCRETE
+       envelope / graphql URL instead of opaque), AND no async frame survives to
+       hold a ctx ref at teardown (the gc_obj_list-not-empty leak that aborted
+       the grind at rem:-1, abandoning the residue — gitlab's whole unused-API
+       tail). Fixpoint: settling queues the resume reactions, draining runs them,
+       a resumed frame may await a fresh never-settling promise; done when a
+       round settles nothing and drains nothing. The 64/200000 guards mirror the
+       boot pump's bounded fixpoint (a convergence sweep, not a work cap). */
+    for (int _sp = 0; _sp < 64; _sp++) {
+        int _settled = qjs_settle_pending_promises(ctx);
+        JSContext *_sc; int _sd = 0;
+        while (JS_ExecutePendingJob(rt, &_sc) > 0 && _sd < 200000) _sd++;
+        if (_settled == 0 && _sd == 0) break;
+    }
     /* Remaining work = residue entries not yet driven AND not yet host-
        fired naturally. The live-pick loop above doesn't advance
        qjs_deep_cursor (an index-based cursor is meaningless when picks
