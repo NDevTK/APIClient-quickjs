@@ -67,6 +67,7 @@ static int qjs_z3_check_flip_sat(qjs_term *flip_term);
    lives near js_fe_static_sites which shares the host-edge atom set. */
 typedef struct JSFunctionBytecode JSFunctionBytecode;
 static int qjs_host_reach_check(JSContext *ctx, JSFunctionBytecode *b);
+static void qjs_host_reach_prune_log(JSContext *ctx, JSFunctionBytecode *b);
 /* Branch-level refinement: "can forward control flow FROM start_pc reach a
    host-edge site?" Used by the OP_if_* handlers to force ONLY branches
    whose flipped arm can change which API call fires — the proper answer
@@ -2863,6 +2864,13 @@ typedef struct JSFunctionBytecode {
        lazy-init done; set inside qjs_host_reach_check on first use. */
     uint8_t qjs_host_reach : 1;
     uint8_t qjs_host_reach_computed : 1;
+    /* qjs_host_reach_pruned_logged: set once this function has emitted a
+       @WHY host_reach_prune at an opaque OP_if prune site (dedup — a hot
+       function hits the prune on MANY opaque branches; per-function dedup is
+       what makes the emitted "n" count DISTINCT functions, not branches).
+       Like qjs_caught_logged, relies on zero-alloc init of the bytecode
+       struct (never explicitly set 0 — only set to 1 on first emit). */
+    uint8_t qjs_host_reach_pruned_logged : 1;
     /* qjs_executed: set the first time this function's bytecode actually
        RUNS (natural execution, an event-loop/handler drive, or a forced
        schedule). __feDriveStatic drives only functions where this is 0 —
@@ -21544,6 +21552,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            scale. Take default 0, pin so subsequent
                            uses of this opaque agree. */
                         res = 0;
+                        qjs_host_reach_prune_log(ctx, b);
                         if (_pt) { qjs_pc_push(_pt, res); qjs_t_free(_pt); }
                     } else if (qjs_dir_active && b == qjs_dir_b) {
                         /* Directed drive — this IS the force-driven target
@@ -21732,6 +21741,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            scale. Take default 0, pin so subsequent
                            uses of this opaque agree. */
                         res = 0;
+                        qjs_host_reach_prune_log(ctx, b);
                         if (_pt) { qjs_pc_push(_pt, res); qjs_t_free(_pt); }
                     } else if (qjs_dir_active && b == qjs_dir_b) {
                         /* Directed drive — fork only a both-arms-reach
@@ -21904,6 +21914,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            scale. Take default 0, pin so subsequent
                            uses of this opaque agree. */
                         res = 0;
+                        qjs_host_reach_prune_log(ctx, b);
                         if (_pt) { qjs_pc_push(_pt, res); qjs_t_free(_pt); }
                     } else if (qjs_dir_active && b == qjs_dir_b) {
                         /* Directed drive — fork only a both-arms-reach
@@ -22071,6 +22082,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            scale. Take default 0, pin so subsequent
                            uses of this opaque agree. */
                         res = 0;
+                        qjs_host_reach_prune_log(ctx, b);
                         if (_pt) { qjs_pc_push(_pt, res); qjs_t_free(_pt); }
                     } else if (qjs_dir_active && b == qjs_dir_b) {
                         /* Directed drive — fork only a both-arms-reach
@@ -60301,6 +60313,45 @@ static int qjs_host_reach_check(JSContext *ctx, JSFunctionBytecode *b) {
         pos += sz;
     }
     return 0;
+}
+
+/* qjs_host_reach_prune_log: emit a @WHY the FIRST time function `b` is
+   pruned at an opaque OP_if site because qjs_host_reach_check(b)==0 — the
+   opaque branch gets concretized to the DEFAULT arm with no frontier.
+   Without this the prune is a SILENT coverage drop (violates "no silent
+   failure"): a function whose opaque-branch outcome actually feeds a
+   downstream host call is under-covered with zero signal. Deduped to one
+   record per function via the qjs_host_reach_pruned_logged bit (a hot
+   function hits this on many opaque branches).
+   BOUNDED emit (the PERFORMANCE invariant — a researcher visits many large
+   sites per session, and gitlab alone prunes ~10k distinct functions in one
+   load: 10k printf + 10k JSON.parse + 10k records per page is unacceptable):
+   keep file:line:col for the first 128 distinct pruned fns (a locatability
+   SAMPLE to target the transitive-reach refinement) then only the running
+   total every 1024 (the MAGNITUDE that makes that fix measurable before/
+   after). ~140 lines for a 10k-fn load, not 10k. The dedup bit still marks
+   every pruned fn — only the EMIT is bounded, never the prune accounting;
+   the worker takes max "n" across records as the page total. `_n` is a
+   per-instance (one WASM instance == one page) counter, reset on the next
+   page's fresh instance. STDOUT + fflush so the worker's stdout @WHY parser
+   captures it (a stderr @WHY without bc_emit/eval_script is dropped).
+   EMIT-ONLY — does NOT change the prune decision; the fn id resolves to
+   file:line:col via the srcloc harness (same convention as caught_throw). */
+static void qjs_host_reach_prune_log(JSContext *ctx, JSFunctionBytecode *b) {
+    static uint32_t _n = 0;
+    if (!b || b->qjs_host_reach_pruned_logged) return;
+    b->qjs_host_reach_pruned_logged = 1;
+    _n++;
+    if (_n <= 128) {
+        const char *_pfn = b->filename ? JS_AtomToCString(ctx, b->filename) : NULL;
+        printf("@WHY {\"phase\":\"host_reach_prune\",\"fn\":\"%llx\",\"file\":\"%s\",\"line\":%d,\"col\":%d,\"n\":%u}\n",
+               (unsigned long long)qjs_fn_id(ctx, b), _pfn ? _pfn : "?", b->line_num, b->col_num, _n);
+        fflush(stdout);
+        if (_pfn) JS_FreeCString(ctx, _pfn);
+    } else if ((_n & 1023) == 0) {
+        printf("@WHY {\"phase\":\"host_reach_prune\",\"n\":%u}\n", _n);
+        fflush(stdout);
+    }
 }
 
 /* Branch-level refinement of qjs_host_reach_check — the hard problem:
