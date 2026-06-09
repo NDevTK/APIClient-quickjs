@@ -19419,7 +19419,16 @@ static __exception int js_iterator_get_value_done(JSContext *ctx, JSValue *sp)
         return -1;
     JS_FreeValue(ctx, obj);
     sp[-1] = value;
-    sp[0] = js_bool(done);
+    /* A CONCRETE iterator result {value:OPAQUE, done:false} — an async
+       generator's next() promise resolved (synchronously, during a cold drive)
+       to an opaque element. Force `done` OPAQUE so the consumer's `if(done)`
+       FORKS: the exit arm reaches the code AFTER the for-await loop (the Sentry
+       transport's makeRequest → fetch(envelopeUrl)), the continue arm is bounded
+       by the loop-revisit exit-arm fixpoint — instead of a concrete done:false
+       spin that the revisit fixpoint can't key. Pairs with the OP_await
+       inline-on-fulfilled-opaque arm. Inert for a real done:true sentinel (its
+       value is not opaque), so concrete iteration is untouched. */
+    sp[0] = qjs_is_opaque(value) ? qjs_opaque_new(ctx) : js_bool(done);
     return 0;
 }
 
@@ -23728,6 +23737,33 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                (coverage win). for-await over an opaque stream stays bounded
                via the done-opaque iterator + loop-revisit fixpoint. */
             if (qjs_is_opaque(sp[-1])) { BREAK; }
+            /* `await <already-FULFILLED promise whose result is opaque-infected>`:
+               an async generator's next() promise, synchronously fulfilled with
+               {value:opaque,done:false} during a cold drive (Sentry's
+               `for await(item of forEachEnvelopeItem-gen)` over an opaque
+               envelope). The awaited value is a CONCRETE JS_CLASS_PROMISE, so the
+               opaque arm above misses it and the frame would SUSPEND FOREVER (no
+               pumped microtask resumes it in forced exec) — the post-loop
+               makeRequest → fetch(envelopeUrl) is never reached and the envelope
+               endpoint is lost (the suspended async-gen also pinned the ctx ref:
+               see qjs_free_suspended_generators). Resolve INLINE: leave the
+               promise's result on the stack and continue, exactly as the opaque
+               arm does. A fulfilled promise would resume on the very next
+               microtask anyway, so for an opaque-carrying result this only drops
+               the round-trip (and the leak). Gated FULFILLED + opaque-infected so
+               concrete async ordering is untouched. */
+            if (JS_IsObject(sp[-1]) &&
+                JS_PromiseState(ctx, sp[-1]) == JS_PROMISE_FULFILLED) {
+                JSValue _res = JS_PromiseResult(ctx, sp[-1]);   /* dup'd */
+                int _opq = qjs_is_opaque(_res);
+                if (!_opq && JS_IsObject(_res)) {
+                    JSValue _v = JS_GetPropertyStr(ctx, _res, "value");
+                    _opq = qjs_is_opaque(_v);
+                    JS_FreeValue(ctx, _v);
+                }
+                if (_opq) { JS_FreeValue(ctx, sp[-1]); sp[-1] = _res; BREAK; }
+                JS_FreeValue(ctx, _res);
+            }
             ret_val = js_int32(FUNC_RET_AWAIT);
             goto done_generator;
         CASE(OP_yield):
