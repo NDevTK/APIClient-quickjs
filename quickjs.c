@@ -61110,6 +61110,11 @@ static int qjs_dnf_threw = 0, qjs_dnf_ret = 0;
    throwing before their first `yield` (e.g. `new URL(this.client.config.endpoint+…)` when
    the synth client is wrong/unconfigured). Carried on @DS. */
 static int qjs_recv_thr = 0;
+/* Cold-constructor receiver-synthesis funnel (carried on @DS): synCol = cold service classes
+   COLLECTED (own .prototype owns a cold orphan), synAsn = receivers ASSIGNED to cold orphan
+   methods. With the suspend->learn stage now closed, the 82->synAsn drop is the dominant
+   appwrite loss — these expose it. */
+static int qjs_syn_col = 0, qjs_syn_asn = 0;
 /* Classify the FIRST receiver-drive throw: 1 = required-param guard ("Missing required
    parameter" — opaque method arg), 2 = client/undefined ("config"/"undefined" — wrong
    synth client), 3 = other. Distinguishes "the receiver is wrong" from "the ARGS are the
@@ -61247,7 +61252,7 @@ void qjs_deep_free(JSContext *ctx) {
     if (qjs_deep_deferred) { js_free(ctx, qjs_deep_deferred); qjs_deep_deferred = NULL; }
     if (qjs_deep_defer_comp) { js_free(ctx, qjs_deep_defer_comp); qjs_deep_defer_comp = NULL; }
     qjs_deep_rb_n = 0; qjs_deep_cursor = 0; qjs_deep_cache_rt = NULL;
-    qjs_dnf_threw = 0; qjs_dnf_ret = 0; qjs_recv_thr = 0; g_recv_exc_kind = 0;
+    qjs_dnf_threw = 0; qjs_dnf_ret = 0; qjs_recv_thr = 0; g_recv_exc_kind = 0; qjs_syn_col = 0; qjs_syn_asn = 0;
     qjs_gen_susp_drv = 0; qjs_gen_susp_recv = 0; qjs_gen_susp_drained = 0;
     qjs_dd_free(ctx);
 }
@@ -61256,6 +61261,8 @@ void qjs_deep_free(JSContext *ctx) {
 int qjs_deep_dnf_threw_c(void) { return qjs_dnf_threw; }
 int qjs_deep_dnf_ret_c(void) { return qjs_dnf_ret; }
 int qjs_deep_recv_thr_c(void) { return qjs_recv_thr; }
+int qjs_deep_syn_col_c(void) { return qjs_syn_col; }
+int qjs_deep_syn_asn_c(void) { return qjs_syn_asn; }
 int qjs_deep_recv_exc_kind_c(void) { return g_recv_exc_kind; }
 const char *qjs_deep_recv_exc_msg_c(void) { return g_recv_exc_msg; }
 int qjs_deep_gen_susp_drv_c(void) { return qjs_gen_susp_drv; }
@@ -61750,6 +61757,7 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
                     if (_nct == _cct) { int _g = _cct ? _cct * 2 : 16; JSValue *_nt = js_realloc(ctx, _cts, (size_t)_g * sizeof(JSValue)); if (!_nt) break; _cts = _nt; _cct = _g; }
                     _cts[_nct++] = JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, _cf));
                 }
+                qjs_syn_col = _nct;
                 /* A FRESH `new Client()` carries the bundle's DEFAULT base — concrete+absolute
                    for appwrite ("https://cloud.appwrite.io/v1"), so its services produce real
                    endpoints (the PAGE's client has an opaque setEndpoint() value → "Invalid
@@ -61769,7 +61777,7 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
                     if (!JS_IsUndefined(_cli)) {
                         JSValue _inst = JS_CallConstructor(ctx, _cts[_ci], 1, (JSValueConst *)&_cli);
                         if (!JS_IsException(_inst) && JS_VALUE_GET_TAG(_inst) == JS_TAG_OBJECT)
-                            qjs_proto_cold_recv(ctx, qjs_own_proto(JS_VALUE_GET_OBJ(_cts[_ci])), _inst);
+                            qjs_syn_asn += qjs_proto_cold_recv(ctx, qjs_own_proto(JS_VALUE_GET_OBJ(_cts[_ci])), _inst);
                         else if (JS_IsException(_inst)) { JSValue _e = JS_GetException(ctx); JS_FreeValue(ctx, _e); }
                         JS_FreeValue(ctx, _inst);
                     }
