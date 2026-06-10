@@ -61962,15 +61962,32 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
        hold a ctx ref at teardown (the gc_obj_list-not-empty leak that aborted
        the grind at rem:-1, abandoning the residue — gitlab's whole unused-API
        tail). Fixpoint: settling queues the resume reactions, draining runs them,
-       a resumed frame may await a fresh never-settling promise; done when a
-       round settles nothing and drains nothing. The 64/200000 guards mirror the
-       boot pump's bounded fixpoint (a convergence sweep, not a work cap). */
-    for (int _sp = 0; _sp < 64; _sp++) {
-        int _settled = qjs_settle_pending_promises(ctx);
-        int _gens = qjs_free_suspended_generators(ctx);   /* generator form of the same leak */
-        JSContext *_sc; int _sd = 0;
-        while (JS_ExecutePendingJob(rt, &_sc) > 0 && _sd < 200000) _sd++;
-        if (_settled == 0 && _gens == 0 && _sd == 0) break;
+       a resumed frame may await a fresh never-settling promise; done when a round
+       settles nothing and drains nothing (the FIXPOINT — the only legitimate stop).
+       NO COUNT CAPS (policy: a drain/round count is a vestigial bound — dissolved):
+       arm g_grind_drive_active so the loop-revisit fixpoint COLLAPSES any self-
+       perpetuating await/yield loop in a resumed continuation, so the rounds
+       converge in finite passes (the bundle's max await-depth); the per-job
+       qjs_host_yield keeps the drain PREEMPTIBLE so a pathological non-converging
+       sweep is STARVED by the scheduler (value-of-information), never an
+       unrecoverable hang. Bonus: a resumed continuation that reaches a fetch now
+       RECORDS it — a final coverage pass, not just cleanup. */
+    {
+        int _gda_save = g_grind_drive_active;
+        g_grind_drive_active = 1; qjs_fe_seen_reset();
+        for (;;) {
+            int _settled = qjs_settle_pending_promises(ctx);
+            int _gens = qjs_free_suspended_generators(ctx);   /* generator form of the same leak */
+            JSContext *_sc; int _sd = 0;
+            while (JS_ExecutePendingJob(rt, &_sc) > 0) {
+                _sd++;
+#if defined(__EMSCRIPTEN__) && defined(QJS_HAS_JSPI)
+                qjs_host_yield();
+#endif
+            }
+            if (_settled == 0 && _gens == 0 && _sd == 0) break;
+        }
+        g_grind_drive_active = _gda_save;
     }
     /* Frame-cleanup INVARIANT (proactive, per the suspended-frame family the
        settle above closes for plain pending-promise awaits): after the settle
