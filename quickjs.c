@@ -60470,6 +60470,35 @@ static int qjs_has_value_branch(JSContext *ctx, JSFunctionBytecode *b) {
     return 0;
 }
 
+/* Call-aware variant: both arms reach a host edge TRANSITIVELY (qjs_host_reach_net_from
+   follows OP_call), catching the shared-fetch-helper picker shape that qjs_has_value_branch
+   (atom-only) misses — `pick(flag){ if(flag)return M('/admin'); return M('/public') }` has
+   no host atom of its own, only an OP_call to a global helper M, so the FLAT host-reach
+   prune drops `pick` and the gated /admin arm is never explored. Selecting such COLD
+   callers for the value-spread (which BYPASSES the prune via qjs_vspread_b, runs in the
+   preemptible fired-first-ordered residue pass — NOT the BFS, so no path explosion)
+   recovers the gated arm. net_from is the every-OP_call=reach over-approximation, which
+   would explode the BFS prune but is safe HERE because the value-spread is bounded. */
+static int qjs_has_value_branch_net(JSContext *ctx, JSFunctionBytecode *b) {
+    if (!b || !b->byte_code_buf) return 0;
+    int len = b->byte_code_len, pos = 0;
+    const uint8_t *bc = b->byte_code_buf;
+    while (pos < len) {
+        int op = bc[pos];
+        int osz = short_opcode_info(op).size;
+        if (osz < 1) break;
+        if (op == OP_if_true || op == OP_if_false || op == OP_if_true8 || op == OP_if_false8) {
+            int jpc = (op == OP_if_true8 || op == OP_if_false8)
+                ? pos + 1 + (int8_t)bc[pos + 1]
+                : pos + 1 + (int32_t)get_u32(bc + pos + 1);
+            int fpc = pos + osz;
+            if (qjs_host_reach_net_from(ctx, b, jpc) && qjs_host_reach_net_from(ctx, b, fpc)) return 1;
+        }
+        pos += osz;
+    }
+    return 0;
+}
+
 /* A body-builder for the value-spread: an opaque/guard branch whose arms BOTH
    reach a host edge AND whose conditional region STORES a property — the appwrite
    `if(typeof email!=='undefined')payload.email=email` → client.call shape. Tighter
@@ -62305,7 +62334,7 @@ static JSValue js_fe_value_spread(JSContext *ctx, JSValueConst this_val,
            memory restore) but is tightened to the property-store shape so it doesn't
            drive junk URL-builders on a huge bundle. */
         if (qjs_is_host_model_file(b->filename)) continue;
-        if (!((b->qjs_h_fired && qjs_has_value_branch(ctx, b)) || qjs_is_cond_body_builder(ctx, b))) continue;
+        if (!((b->qjs_h_fired && qjs_has_value_branch(ctx, b)) || qjs_is_cond_body_builder(ctx, b) || qjs_has_value_branch_net(ctx, b))) continue;
         if (n == cap) { int nc = cap ? cap * 2 : 16; JSValue *nt = js_realloc(ctx, targets, nc * sizeof *nt); if (!nt) break; targets = nt; cap = nc; }
         targets[n++] = JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, p));
     }
