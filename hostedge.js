@@ -249,6 +249,20 @@
   var TQ = [];
   var ranKeys = new Set();
   var _enqSeen = new Set();        // IDENTITY dedup: each distinct callback object enqueues once
+  // Timer-spinner DEFER (the across-flush analogue of the per-flush 512 idle break):
+  // a re-queuing task that schedules a NEW closure each tick — setTimeout(()=>tick(),0)
+  // inside tick — has a new object identity every time, so _enqSeen never dedups it and
+  // it churns the pump (github round-1: 1278 flushes × up to 512 drains = ~650k wasted
+  // drains, so round-1 never completes and the deep round never starts). Key by SOURCE
+  // TEXT (fn.toString(), identical across the spinner's ticks); once a key has run K
+  // times WITHOUT advancing host-progress (_hProg / @H), it is a proven NO-OUTPUT spinner
+  // — defer future enqueues of it. Safe: a no-@H-progress task produces no endpoints, so
+  // dropping it loses nothing (the starve-don't-bound principle); a legit same-source loop
+  // (for(i)setTimeout(()=>f(i))) whose f DOES emit @H keeps resetting its stale count and
+  // is never deferred. NOT the per-flush cap (which truncates late progress).
+  var _spinKeys = new Set();       // source-text keys proven to be no-output spinners
+  var _taskProg = new Map();       // source-text key -> { h:_hProg at last progress, s:stale-run count }
+  var _SPIN_K = 64;                // K no-@H-progress runs of a key => defer it
   var _hProg = 0;                  // monotone progress: count of DISTINCT @H host edges emitted (see H)
   var _hSeen = new Set();
   var fnsrc = Function.prototype.toString;
@@ -261,7 +275,11 @@
   // DISTINCT endpoints. The drain (__hostFlush) additionally stops once a stretch is
   // genuinely dry (no new @H): a no-progress fixpoint that bounds distinct-object spin
   // loops WITHOUT dropping productive ones. No depth/step cap -- progress resets dry.
-  function enq(fn) { if (typeof fn === "function" && !_enqSeen.has(fn)) { _enqSeen.add(fn); TQ.push(fn); } }
+  function enq(fn) {
+    if (typeof fn !== "function" || _enqSeen.has(fn)) return;
+    try { if (_spinKeys.has(fn.toString())) return; } catch (e) {}   // defer a proven no-output spinner
+    _enqSeen.add(fn); TQ.push(fn);
+  }
   var _tid = 0;
   G.setTimeout = function (f) { if (typeof f === "string") { S("code-exec", "setTimeout", f); return ++_tid; } enq(f); return ++_tid; };
   G.setInterval = function (f) { if (typeof f === "string") { S("code-exec", "setInterval", f); return ++_tid; } enq(f); return ++_tid; };
@@ -1249,8 +1267,19 @@
     var _idle = 0, _lastProg = _hProg, _flushStartProg = _hProg, _drained = 0;
     while (TQ.length) {
       var fn = TQ.shift();
+      var _sk; try { _sk = fn.toString(); } catch (e) { _sk = null; }
       try { fn.call(G); } catch (e) {}
       _drained++;
+      // Per-key spinner accounting (ACROSS flushes): a source-text key that runs
+      // _SPIN_K times without advancing _hProg is a no-output spinner — record it in
+      // _spinKeys so enq() defers its future re-queues (a tick that schedules a NEW
+      // closure each time evades _enqSeen, so identity dedup alone never stops it).
+      if (_sk) {
+        var _tp = _taskProg.get(_sk);
+        if (!_tp) _taskProg.set(_sk, { h: _hProg, s: 0 });
+        else if (_hProg > _tp.h) { _tp.h = _hProg; _tp.s = 0; }
+        else if (++_tp.s >= _SPIN_K) _spinKeys.add(_sk);
+      }
       if (_hProg > _lastProg) { _lastProg = _hProg; _idle = 0; }
       else if (++_idle >= 512) {
         // VESTIGIAL BOUND (CLAUDE.md: a count that STOPS work is a scheduler decision in
