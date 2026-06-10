@@ -1277,7 +1277,7 @@
     // dispatchEvent path, losing coverage of any wrapper that
     // distinguishes dispatch-fire from direct-call.
     G.dispatchEvent(mkMessageEvent()); dispatchDoc(mkMessageEvent());
-    var _idle = 0, _lastProg = _hProg, _flushStartProg = _hProg, _drained = 0;
+    var _drained = 0;
     while (TQ.length) {
       var fn = TQ.shift();
       var _sk; try { _sk = fn.toString(); } catch (e) { _sk = null; }
@@ -1293,17 +1293,13 @@
         else if (_hProg > _tp.h) { _tp.h = _hProg; _tp.s = 0; }
         else if (++_tp.s >= _SPIN_K) _spinKeys.add(_sk);
       }
-      if (_hProg > _lastProg) { _lastProg = _hProg; _idle = 0; }
-      else if (++_idle >= 512) {
-        // VESTIGIAL BOUND (CLAUDE.md: a count that STOPS work is a scheduler decision in
-        // disguise) — pending until timer-spinners are provably DEFERrable (a reaches=0
-        // structural proof, the timer analogue of the deep-grind same-back-edge defer).
-        // NEVER silent: emit @WHY so real-site data shows whether it ever truncates
-        // PRODUCTIVE work (progressed>0 = a flush that emitted @H then spun = a quality
-        // risk to prioritise) vs only bounds a pure no-output spin (progressed==0).
-        try { EPRINT('@WHY {"phase":"pump_idle_break","drained":' + _drained + ',"pending":' + TQ.length + ',"progressed":' + (_hProg - _flushStartProg) + '}'); } catch (e) {}
-        break;
-      }
+      // NO per-flush idle CAP — the old 512-idle break is DISSOLVED (policy: a count
+      // that STOPS work is a vestigial bound). The _SPIN_K per-source-text-key defer
+      // above IS the structural replacement it was a placeholder for: a no-@H-progress
+      // key is added to _spinKeys so enq() SKIPS its future re-queues, so the TQ
+      // provably DRAINS (a fixpoint — re-queues stop) instead of being truncated by a
+      // count. A genuine producing loop keeps resetting its key's stale count via @H
+      // progress, so it is never deferred; only a pure no-output spinner is.
     }
   };
 
