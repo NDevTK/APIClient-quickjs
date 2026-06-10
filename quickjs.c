@@ -23760,23 +23760,32 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                misses it and the frame would SUSPEND FOREVER — no microtask resumes
                a suspended frame in forced exec, so a `for await(item of asyncGen)`
                never reaches the post-loop fetch (Sentry transport's makeRequest →
-               fetch(envelopeUrl)). PUMP pending jobs in a BOUNDED loop until this
-               promise leaves PENDING: the async-gen's own opaque loop is bounded by
-               the loop-revisit fixpoint + js_iterator_get_value_done's done-opaque
-               fork, so it yields/returns in finite jobs and the next() promise
-               settles. Then fall into the FULFILLED arm. If still PENDING after the
-               safety bound (mirrors the 200000-drain cap elsewhere; a SAFETY bound,
-               NOT a silent cap — emit @WHY), fall through to the normal suspend so
-               we never hang. Gated on g_grind_drive_active so normal concrete async
-               ordering is untouched (a real pending promise still suspends). The
-               pump resumes the GENERATOR frame (a different frame); this frame is
-               mid-OP_await, not yet suspended, so no job re-enters it. */
+               fetch(envelopeUrl)). DRAIN pending jobs until the promise leaves
+               PENDING OR the job queue EMPTIES (JS_ExecutePendingJob == 0 — the
+               legitimate FIXPOINT termination: a proof that no remaining work can
+               settle it, "reaches=0 over a whole cycle", NOT a count). NO COUNT CAP
+               (policy: a drain cap is a vestigial bound — dissolved): a self-
+               perpetuating job loop is MADE to terminate by the forced-exec loop-
+               revisit fixpoint (it collapses revisited state so the queue drains in
+               finite jobs — the async-gen's opaque loop + js_iterator_get_value_done's
+               done-opaque fork already do this), and the per-job qjs_host_yield keeps
+               the drain PREEMPTIBLE so the scheduler STARVES an unproductive pump by
+               value-of-information (PRIORITISATION) — the analysis never hangs because
+               other fibers/the live review keep running while this one is parked.
+               Gated on g_grind_drive_active so normal concrete async ordering is
+               untouched (a real pending promise still suspends). The pump resumes the
+               GENERATOR frame (a different frame); this frame is mid-OP_await, not yet
+               suspended, so no job re-enters it. */
             if (g_grind_drive_active && JS_IsObject(sp[-1]) &&
                 JS_PromiseState(ctx, sp[-1]) == JS_PROMISE_PENDING) {
                 JSContext *_pjc; int _pn = 0;
                 while (JS_PromiseState(ctx, sp[-1]) == JS_PROMISE_PENDING &&
-                       _pn < 200000 && JS_ExecutePendingJob(rt, &_pjc) > 0)
+                       JS_ExecutePendingJob(rt, &_pjc) > 0) {
                     _pn++;
+#if defined(__EMSCRIPTEN__) && defined(QJS_HAS_JSPI)
+                    qjs_host_yield();   /* preemptible drain — scheduler starves an unproductive pump (no count cap) */
+#endif
+                }
                 if (JS_PromiseState(ctx, sp[-1]) == JS_PROMISE_PENDING) {
                     printf("@WHY {\"phase\":\"await_pump_unfulfilled\",\"turns\":%d}\n", _pn);
                     fflush(stdout);
