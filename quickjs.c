@@ -23780,6 +23780,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (JS_PromiseState(ctx, sp[-1]) == JS_PROMISE_PENDING) {
                     printf("@WHY {\"phase\":\"await_pump_unfulfilled\",\"turns\":%d}\n", _pn);
                     fflush(stdout);
+                    /* The promise never settles in forced exec (an external/IO
+                       dependency — a transport build, an auth-token fetch, a host-retry
+                       timer). Its eventual resolved value is UNKNOWN = opaque, so resolve
+                       INLINE with an opaque (mirrors the await-OPAQUE arm at the top of
+                       OP_await) and continue — DRIVING the continuation AFTER the await
+                       instead of suspending the frame forever. Composable / transport
+                       SDKs (Algolia transporter->requester, Directus .with(rest()) ->
+                       client.request) await an unresolvable build/auth promise BEFORE the
+                       fetch, so the old suspend pinned the frame and the fetch was never
+                       reached (atH:0, 0 endpoints). Gated by g_grind_drive_active above
+                       (normal concrete async ordering untouched); the continuation's own
+                       loops stay bounded by the loop-revisit fixpoint. */
+                    JS_FreeValue(ctx, sp[-1]);
+                    sp[-1] = qjs_opaque_new(ctx);
+                    BREAK;
                 }
             }
             /* (2) FULFILLED promise: resolve INLINE (leave the result on the stack
