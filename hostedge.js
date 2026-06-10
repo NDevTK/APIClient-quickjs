@@ -1025,10 +1025,23 @@
   }
   G.fetch = function (input, init) {
     init = init || {};
-    var url = (input && typeof input === "object" && PRESENT(input.url)) ? input.url : input;
-    var method = (init.method || (input && input.method) || "GET");
-    var body = PRESENT(init.body) ? init.body : (input && typeof input === "object" ? input.body : null);
-    var headers = PRESENT(init.headers) ? init.headers : (input && typeof input === "object" ? input.headers : null);
+    // `input` may be a URL string, an OPAQUE url value (a qjs_opq object — its
+    // typeof is "object" but it is NOT a Request), or a real Request. Reading
+    // .method/.body/.headers off an opaque url is a property-get on opaque →
+    // opaque → the recorded method became "[object Object]", blocking the call
+    // as reached-but-opaque (github netdiff: template-literal urls like
+    // fetch(`/${owner}/${repo}/...`) produce an opaque url whose method was lost).
+    // A genuine Request is a CONCRETE object with a concrete .url. An opaque url
+    // is ISOPQANY-true even when its typeof happens to read "object" (flaky), and
+    // PRESENT(opaque) is TRUE — so `typeof==="object" && PRESENT(input.url)` alone
+    // wrongly classifies an opaque url as a Request and reads opaque .url/.method
+    // off it. Exclude opaque inputs: only a NON-opaque object with a concrete .url
+    // is a Request; an opaque url falls through to urlOf(input) with method "GET".
+    var _isReq = input && typeof input === "object" && !ISOPQANY(input) && PRESENT(input.url);
+    var url = _isReq ? input.url : input;
+    var method = (init.method || (_isReq && input.method) || "GET");
+    var body = PRESENT(init.body) ? init.body : (_isReq ? input.body : null);
+    var headers = PRESENT(init.headers) ? init.headers : (_isReq ? input.headers : null);
     var bodyStr = recBody(body);
     // bodyShape/headersShape are null- AND opaque-safe (ISOPQANY-first); calling
     // them directly avoids a `body == null` fork on an opaque body.
