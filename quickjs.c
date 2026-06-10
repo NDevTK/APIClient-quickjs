@@ -61091,6 +61091,17 @@ static uint8_t *qjs_deep_sink = NULL;   /* 1 = reaches a security sink */
    surfaces the frontier shape (stderr @WHY isn't visible there). Reset when
    the residue is rebuilt (qjs_deep_free). */
 static int qjs_dnf_threw = 0, qjs_dnf_ret = 0;
+/* Cold-constructor receiver-synthesis diagnostic: drives that USED a captured receiver
+   and THREW. Warm receivers don't throw (they work), so a high count == the synth methods
+   throwing before their first `yield` (e.g. `new URL(this.client.config.endpoint+…)` when
+   the synth client is wrong/unconfigured). Carried on @DS. */
+static int qjs_recv_thr = 0;
+/* Classify the FIRST receiver-drive throw: 1 = required-param guard ("Missing required
+   parameter" — opaque method arg), 2 = client/undefined ("config"/"undefined" — wrong
+   synth client), 3 = other. Distinguishes "the receiver is wrong" from "the ARGS are the
+   blocker" without a full per-orphan trace. */
+static int g_recv_exc_kind = 0;
+static char g_recv_exc_msg[96] = {0};   /* first receiver-throw message (sanitized for JSON) — the actual reason, classification kept missing it */
 /* __awaiter generator-resume drive-trace (carried on @DS). A NON-async drive that
    newly SUSPENDED a generator (the TS-ES5 __awaiter shape) → gen_susp_drv; of those,
    driven with a CONCRETE receiver (qjs_deep_recv, not opaque `this`) → gen_susp_recv;
@@ -61222,7 +61233,7 @@ void qjs_deep_free(JSContext *ctx) {
     if (qjs_deep_deferred) { js_free(ctx, qjs_deep_deferred); qjs_deep_deferred = NULL; }
     if (qjs_deep_defer_comp) { js_free(ctx, qjs_deep_defer_comp); qjs_deep_defer_comp = NULL; }
     qjs_deep_rb_n = 0; qjs_deep_cursor = 0; qjs_deep_cache_rt = NULL;
-    qjs_dnf_threw = 0; qjs_dnf_ret = 0;
+    qjs_dnf_threw = 0; qjs_dnf_ret = 0; qjs_recv_thr = 0; g_recv_exc_kind = 0;
     qjs_gen_susp_drv = 0; qjs_gen_susp_recv = 0; qjs_gen_susp_drained = 0;
     qjs_dd_free(ctx);
 }
@@ -61230,6 +61241,9 @@ void qjs_deep_free(JSContext *ctx) {
    status line so the extension surfaces the per-grind frontier shape. */
 int qjs_deep_dnf_threw_c(void) { return qjs_dnf_threw; }
 int qjs_deep_dnf_ret_c(void) { return qjs_dnf_ret; }
+int qjs_deep_recv_thr_c(void) { return qjs_recv_thr; }
+int qjs_deep_recv_exc_kind_c(void) { return g_recv_exc_kind; }
+const char *qjs_deep_recv_exc_msg_c(void) { return g_recv_exc_msg; }
 int qjs_deep_gen_susp_drv_c(void) { return qjs_gen_susp_drv; }
 int qjs_deep_gen_susp_recv_c(void) { return qjs_gen_susp_recv; }
 int qjs_deep_gen_susp_drained_c(void) { return qjs_gen_susp_drained; }
@@ -61396,6 +61410,97 @@ static void qjs_deep_relevance_sort(JSContext *ctx, JSFunctionBytecode **rb, int
    GC order ⇒ same orphan indices) and continues from the IndexedDB-saved
    cursor instead of re-driving the done orphans. */
 int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only);
+
+/* --- Cold-constructor receiver synthesis (project_appwrite_receiver_synthesis_attempt).
+   appwrite@16 (READ: ES6 classes, awaiter minified to `t`) ships ~76 cold service methods
+   the page never instantiated → opaque `this` → opaque url. Synthesize an instance for
+   each cold class and assign it as those methods' receiver. --- */
+
+/* Own .prototype object of a function — DIRECT shape read, no lazy alloc (safe in a live
+   gc_obj_list walk). NULL if absent / not an object. */
+static JSObject *qjs_own_proto(JSObject *f) {
+    JSShape *sh = f ? f->shape : NULL;
+    if (sh) for (int i = 0; i < sh->prop_count; i++)
+        if (sh->prop[i].atom == JS_ATOM_prototype && !(sh->prop[i].flags & JS_PROP_TMASK)) {
+            JSValue v = f->prop[i].u.value;
+            return JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT ? JS_VALUE_GET_OBJ(v) : NULL;
+        }
+    return NULL;
+}
+
+/* For each method on `pro` that is a deep-grind orphan with NO captured receiver, assign
+   `inst` as its receiver (+ the method fn object as its qjs_deep_insts var_ref source, +
+   net2=1 so the live-pick drives it), and count it. inst==JS_UNDEFINED only COUNTS the
+   cold orphans (phase-1 probe, no mutation). */
+static int qjs_proto_cold_recv(JSContext *ctx, JSObject *pro, JSValueConst inst) {
+    JSShape *sh = pro ? pro->shape : NULL;
+    int n = 0;
+    if (sh) for (int i = 0; i < sh->prop_count; i++) {
+        JSShapeProperty *prs = &sh->prop[i];
+        if (prs->atom == JS_ATOM_NULL || (prs->flags & JS_PROP_TMASK)) continue;
+        if (prs->atom == JS_ATOM_constructor) continue;   /* pro.constructor is the CLASS itself — a receiver on it makes the grind JS_Call a class ctor → "must be invoked with 'new'"; methods only */
+        JSValue mv = pro->prop[i].u.value;
+        if (JS_VALUE_GET_TAG(mv) != JS_TAG_OBJECT) continue;
+        JSObject *mo = JS_VALUE_GET_OBJ(mv);
+        JSFunctionBytecode *mfb = (mo->class_id == JS_CLASS_BYTECODE_FUNCTION || mo->class_id == JS_CLASS_GENERATOR_FUNCTION ||
+            mo->class_id == JS_CLASS_ASYNC_FUNCTION || mo->class_id == JS_CLASS_ASYNC_GENERATOR_FUNCTION) ? mo->u.func.function_bytecode : NULL;
+        if (!mfb) continue;
+        int rix = mfb->qjs_deep_ix;
+        if (rix >= 0 && rix < qjs_deep_rb_n && qjs_deep_rb[rix] == mfb && JS_IsUndefined(qjs_deep_recv[rix])) {
+            if (JS_VALUE_GET_TAG(inst) == JS_TAG_OBJECT) {
+                qjs_deep_recv[rix] = JS_DupValue(ctx, inst);
+                if (qjs_deep_insts && JS_IsUndefined(qjs_deep_insts[rix])) qjs_deep_insts[rix] = JS_DupValue(ctx, mv);
+                /* NO net2 force-promotion: it force-drives EVERY cold method, which on a
+                   relative-base client (pocketbase) fabricates malformed `/`//`-rooted
+                   garbage endpoints. The methods that genuinely reach a host edge are
+                   driven on their own merits; the receiver just makes `this` concrete. */
+            }
+            n++;
+        }
+    }
+    return n;
+}
+
+/* Does `pro` (a function's .prototype) own a NET-REACHING orphan method? Identifies the
+   HTTP-client class — its prototype owns the `.call`/dispatch that reaches the fetch. */
+static int qjs_proto_net_reaching(JSObject *pro) {
+    JSShape *sh = pro ? pro->shape : NULL;
+    if (sh) for (int i = 0; i < sh->prop_count; i++) {
+        JSShapeProperty *prs = &sh->prop[i];
+        if (prs->atom == JS_ATOM_NULL || prs->atom == JS_ATOM_constructor || (prs->flags & JS_PROP_TMASK)) continue;
+        JSValue mv = pro->prop[i].u.value;
+        if (JS_VALUE_GET_TAG(mv) != JS_TAG_OBJECT) continue;
+        JSObject *mo = JS_VALUE_GET_OBJ(mv);
+        JSFunctionBytecode *mfb = (mo->class_id == JS_CLASS_BYTECODE_FUNCTION || mo->class_id == JS_CLASS_GENERATOR_FUNCTION ||
+            mo->class_id == JS_CLASS_ASYNC_FUNCTION || mo->class_id == JS_CLASS_ASYNC_GENERATOR_FUNCTION) ? mo->u.func.function_bytecode : NULL;
+        if (!mfb) continue;
+        int rix = mfb->qjs_deep_ix;
+        if (rix >= 0 && rix < qjs_deep_rb_n && qjs_deep_rb[rix] == mfb && (qjs_deep_net[rix] || (qjs_deep_net2 && qjs_deep_net2[rix]))) return 1;
+    }
+    return 0;
+}
+
+/* Does `v` (recursing into object props up to `depth`) hold a string with a "scheme://"
+   — i.e. is this synth client ABSOLUTE-configured? Only then do its services produce
+   host-bearing endpoints; a relative/empty base (pocketbase) would fabricate malformed
+   `/`//`-rooted garbage, so the synthesis is gated on this. */
+static int qjs_val_has_abs_url(JSContext *ctx, JSValueConst v, int depth) {
+    if (JS_VALUE_GET_TAG(v) == JS_TAG_STRING) {
+        const char *s = JS_ToCString(ctx, v);
+        int r = s && strstr(s, "://") != NULL;
+        if (s) JS_FreeCString(ctx, s);
+        return r;
+    }
+    if (depth <= 0 || JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT) return 0;
+    JSObject *o = JS_VALUE_GET_OBJ(v);
+    JSShape *sh = o->shape;
+    if (sh) for (int i = 0; i < sh->prop_count; i++) {
+        if (sh->prop[i].atom == JS_ATOM_NULL || (sh->prop[i].flags & JS_PROP_TMASK)) continue;
+        if (qjs_val_has_abs_url(ctx, o->prop[i].u.value, depth - 1)) return 1;
+    }
+    return 0;
+}
+
 int qjs_deep_step_c(JSContext *ctx, int maxN, int fromCursor) {
     return qjs_deep_step_c_h(ctx, maxN, fromCursor, 0);
 }
@@ -61601,6 +61706,64 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
                     }
                 }
             }
+            /* Cold-constructor receiver synthesis: a class the PAGE never instantiated left
+               its prototype methods (orphans) with NO receiver above → opaque `this` → opaque
+               url. Synthesize `new Ctor(client)` (client = a FRESH instance of the HTTP-client
+               class — 0-arg ctor + net-reaching prototype — gated on an ABSOLUTE base) and assign
+               it as the cold orphans' receiver. Two-phase (collect ctors via the NON-allocating
+               qjs_own_proto, THEN construct) so JS_CallConstructor's allocation can't invalidate
+               the live gc walk. */
+            {
+                JSValue *_cts = NULL; int _nct = 0, _cct = 0;
+                JSValue _clientCls = JS_UNDEFINED;   /* the HTTP-client class: net-reaching proto + 0-arg ctor */
+                struct list_head *_cel;
+                list_for_each(_cel, &rt->gc_obj_list) {
+                    JSGCObjectHeader *_cgp = list_entry(_cel, JSGCObjectHeader, link);
+                    if (_cgp->gc_obj_type != JS_GC_OBJ_TYPE_JS_OBJECT) continue;
+                    JSObject *_cf = (JSObject *)_cgp;
+                    if (_cf->class_id != JS_CLASS_BYTECODE_FUNCTION) continue;
+                    JSObject *_pro = qjs_own_proto(_cf);
+                    if (!_pro) continue;
+                    /* The Client class: a NET-REACHING prototype (owns the .call dispatch) + a
+                       0-ARG constructor (services take `(client)`; the Client takes none and its
+                       ctor sets the DEFAULT config.endpoint). `new`-ing it FRESH gives the synth
+                       services a `this.client` with a valid config.endpoint (else the method's
+                       `new URL(this.client.config.endpoint+…)` throws "Invalid URL"). */
+                    if (JS_IsUndefined(_clientCls) && _cf->u.func.function_bytecode &&
+                        _cf->u.func.function_bytecode->arg_count == 0 && qjs_proto_net_reaching(_pro))
+                        _clientCls = JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, _cf));
+                    if (qjs_proto_cold_recv(ctx, _pro, JS_UNDEFINED) == 0) continue;
+                    if (_nct == _cct) { int _g = _cct ? _cct * 2 : 16; JSValue *_nt = js_realloc(ctx, _cts, (size_t)_g * sizeof(JSValue)); if (!_nt) break; _cts = _nt; _cct = _g; }
+                    _cts[_nct++] = JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, _cf));
+                }
+                /* A FRESH `new Client()` carries the bundle's DEFAULT base — concrete+absolute
+                   for appwrite ("https://cloud.appwrite.io/v1"), so its services produce real
+                   endpoints (the PAGE's client has an opaque setEndpoint() value → "Invalid
+                   URL"). GATE on that base being ABSOLUTE: a relative/empty default (pocketbase)
+                   would have its synth services fabricate malformed `/`//`-rooted garbage, and
+                   such bundles have no async cold methods to gain — so skip them entirely. */
+                JSValue _cli = JS_UNDEFINED;
+                if (!JS_IsUndefined(_clientCls)) {
+                    JSValue _ci2 = JS_CallConstructor(ctx, _clientCls, 0, NULL);
+                    if (!JS_IsException(_ci2) && JS_VALUE_GET_TAG(_ci2) == JS_TAG_OBJECT && qjs_val_has_abs_url(ctx, _ci2, 4)) _cli = _ci2;
+                    else { if (JS_IsException(_ci2)) { JSValue _e = JS_GetException(ctx); JS_FreeValue(ctx, _e); } JS_FreeValue(ctx, _ci2); }
+                    JS_FreeValue(ctx, _clientCls);
+                }
+                /* Synthesize ONLY when a real configured client was found — else leave the cold
+                   methods untouched (never fabricate from an opaque/empty base). */
+                for (int _ci = 0; _ci < _nct; _ci++) {
+                    if (!JS_IsUndefined(_cli)) {
+                        JSValue _inst = JS_CallConstructor(ctx, _cts[_ci], 1, (JSValueConst *)&_cli);
+                        if (!JS_IsException(_inst) && JS_VALUE_GET_TAG(_inst) == JS_TAG_OBJECT)
+                            qjs_proto_cold_recv(ctx, qjs_own_proto(JS_VALUE_GET_OBJ(_cts[_ci])), _inst);
+                        else if (JS_IsException(_inst)) { JSValue _e = JS_GetException(ctx); JS_FreeValue(ctx, _e); }
+                        JS_FreeValue(ctx, _inst);
+                    }
+                    JS_FreeValue(ctx, _cts[_ci]);
+                }
+                JS_FreeValue(ctx, _cli);
+                if (_cts) js_free(ctx, _cts);
+            }
         }
         JS_RunGC(rt);
     }
@@ -61801,7 +61964,25 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
             }
             g_grind_drive_active = 0;   /* disarm: drive returned (or was yielded) */
             int _was_exc2 = JS_IsException(r2);
-            if (_was_exc2) { JSValue e2 = JS_GetException(ctx); JS_FreeValue(ctx, e2); }
+            if (_was_exc2) {
+                JSValue e2 = JS_GetException(ctx);
+                if (qjs_deep_recv && _ix >= 0 && !JS_IsUndefined(qjs_deep_recv[_ix])) {
+                    qjs_recv_thr++;   /* a receiver-drive that threw */
+                    if (!g_recv_exc_kind) {   /* classify the FIRST one: guard-on-args vs wrong-client */
+                        const char *_m = JS_ToCString(ctx, e2);
+                        if (_m) {
+                            g_recv_exc_kind = (strstr(_m, "Missing") || strstr(_m, "required") || strstr(_m, "param")) ? 1
+                                            : (strstr(_m, "config") || strstr(_m, "undefined") || strstr(_m, "client")) ? 2 : 3;
+                            int _j = 0; for (const char *_p = _m; *_p && _j < (int)sizeof(g_recv_exc_msg) - 1; _p++) {
+                                char _c = *_p; g_recv_exc_msg[_j++] = (_c == '"' || _c == '\\' || _c == '\n' || _c == '\r' || _c == '\t') ? ' ' : _c;
+                            }
+                            g_recv_exc_msg[_j] = 0;
+                            JS_FreeCString(ctx, _m);
+                        }
+                    }
+                }
+                JS_FreeValue(ctx, e2);
+            }
             JS_FreeValue(ctx, r2);
             JS_FreeValue(ctx, this_opq2);
             for (int ai = 0; ai < nargs; ai++) JS_FreeValue(ctx, args3[ai]);

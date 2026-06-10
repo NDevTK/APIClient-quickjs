@@ -202,6 +202,9 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only);
 int qjs_deep_cursor_c(void);
 int qjs_deep_dnf_threw_c(void);
 int qjs_deep_dnf_ret_c(void);
+int qjs_deep_recv_thr_c(void);
+int qjs_deep_recv_exc_kind_c(void);
+const char *qjs_deep_recv_exc_msg_c(void);
 int qjs_deep_gen_susp_drv_c(void);
 int qjs_deep_gen_susp_recv_c(void);
 int qjs_deep_gen_susp_drained_c(void);
@@ -845,9 +848,9 @@ int main(int argc, char **argv) {
                fibers. step mode → bounded batch (legacy/debug path). */
             int maxN = deep_grind ? INT_MAX : (deep_step > 0 ? deep_step : 1);
             int rem = qjs_deep_step_c_h(g_deep_ctx, maxN, deep_from, deep_head);
-            printf("@DS {\"rem\":%d,\"cur\":%d,\"dnfThrew\":%d,\"dnfRet\":%d,\"head\":%d,\"gsDrv\":%d,\"gsRecv\":%d,\"gsDrn\":%d}\n",
+            printf("@DS {\"rem\":%d,\"cur\":%d,\"dnfThrew\":%d,\"dnfRet\":%d,\"head\":%d,\"gsDrv\":%d,\"gsRecv\":%d,\"gsDrn\":%d,\"recvThr\":%d,\"recvExcK\":%d,\"recvExcMsg\":\"%s\"}\n",
                    rem, qjs_deep_cursor_c(), qjs_deep_dnf_threw_c(), qjs_deep_dnf_ret_c(), deep_head,
-                   qjs_deep_gen_susp_drv_c(), qjs_deep_gen_susp_recv_c(), qjs_deep_gen_susp_drained_c());
+                   qjs_deep_gen_susp_drv_c(), qjs_deep_gen_susp_recv_c(), qjs_deep_gen_susp_drained_c(), qjs_deep_recv_thr_c(), qjs_deep_recv_exc_kind_c(), qjs_deep_recv_exc_msg_c());
             fflush(stdout);
             return 0;
         }
