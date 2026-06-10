@@ -58516,6 +58516,37 @@ static void qjs_free_async_gen_frame(JSRuntime *rt, JSAsyncGeneratorData *s) {
     s->state = JS_ASYNC_GENERATOR_STATE_COMPLETED;
 }
 
+/* Count (do NOT free) currently-suspended generators. The deep grind takes the
+   before/after delta across an orphan drive to detect the TS-ES5 __awaiter shape:
+   a NON-async function that suspends a `function*` (or `async function*`) whose
+   post-yield fetch must be resumed. Mirrors the `susp` test in
+   qjs_free_suspended_generators exactly, but counts instead of freeing — so the
+   live generator stays resumable. */
+static int qjs_count_suspended_generators(JSContext *ctx) {
+    JSRuntime *rt = ctx->rt;
+    struct list_head *el;
+    int n = 0;
+    list_for_each(el, &rt->gc_obj_list) {
+        JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
+        if (gp->gc_obj_type != JS_GC_OBJ_TYPE_JS_OBJECT)
+            continue;
+        JSObject *p = (JSObject *)gp;
+        if (p->class_id == JS_CLASS_GENERATOR) {
+            JSGeneratorData *s = p->u.generator_data;
+            if (s && s->state != JS_GENERATOR_STATE_COMPLETED &&
+                     s->state != JS_GENERATOR_STATE_EXECUTING)
+                n++;
+        } else if (p->class_id == JS_CLASS_ASYNC_GENERATOR) {
+            JSAsyncGeneratorData *s = JS_GetOpaque(JS_MKPTR(JS_TAG_OBJECT, p), JS_CLASS_ASYNC_GENERATOR);
+            if (s && (s->state == JS_ASYNC_GENERATOR_STATE_SUSPENDED_START ||
+                      s->state == JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD ||
+                      s->state == JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD_STAR))
+                n++;
+        }
+    }
+    return n;
+}
+
 int qjs_free_suspended_generators(JSContext *ctx) {
     JSRuntime *rt = ctx->rt;
     struct list_head *el;
@@ -61060,6 +61091,14 @@ static uint8_t *qjs_deep_sink = NULL;   /* 1 = reaches a security sink */
    surfaces the frontier shape (stderr @WHY isn't visible there). Reset when
    the residue is rebuilt (qjs_deep_free). */
 static int qjs_dnf_threw = 0, qjs_dnf_ret = 0;
+/* __awaiter generator-resume drive-trace (carried on @DS). A NON-async drive that
+   newly SUSPENDED a generator (the TS-ES5 __awaiter shape) → gen_susp_drv; of those,
+   driven with a CONCRETE receiver (qjs_deep_recv, not opaque `this`) → gen_susp_recv;
+   of those, the resume-drain ran >=1 queued job → gen_susp_drained. Distinguishes
+   "the generator is never created by a drive" (drv=0) from "created + resumed but the
+   continuation reaches no fetch" (drv>0, endpoints flat) in ONE run — no printf+rebuild
+   guess. Reset with qjs_dnf_* when the residue is rebuilt. */
+static int qjs_gen_susp_drv = 0, qjs_gen_susp_recv = 0, qjs_gen_susp_drained = 0;
 static int qjs_deep_rb_n = 0, qjs_deep_cursor = 0;
 /* Run the value-spread depth pass once per residue, AFTER the orphan grind (rem==0),
    so endpoints (breadth) precede depth. Reset when the residue is (re)built. */
@@ -61184,12 +61223,16 @@ void qjs_deep_free(JSContext *ctx) {
     if (qjs_deep_defer_comp) { js_free(ctx, qjs_deep_defer_comp); qjs_deep_defer_comp = NULL; }
     qjs_deep_rb_n = 0; qjs_deep_cursor = 0; qjs_deep_cache_rt = NULL;
     qjs_dnf_threw = 0; qjs_dnf_ret = 0;
+    qjs_gen_susp_drv = 0; qjs_gen_susp_recv = 0; qjs_gen_susp_drained = 0;
     qjs_dd_free(ctx);
 }
 /* Driving-completeness counters — see qjs_dnf_threw decl. Carried on the @DS
    status line so the extension surfaces the per-grind frontier shape. */
 int qjs_deep_dnf_threw_c(void) { return qjs_dnf_threw; }
 int qjs_deep_dnf_ret_c(void) { return qjs_dnf_ret; }
+int qjs_deep_gen_susp_drv_c(void) { return qjs_gen_susp_drv; }
+int qjs_deep_gen_susp_recv_c(void) { return qjs_gen_susp_recv; }
+int qjs_deep_gen_susp_drained_c(void) { return qjs_gen_susp_drained; }
 /* Drop the runtime's pending-job queue (unsettled Promise / fetch().then
    continuations the bundle's async init left behind). Called before
    JS_FreeContext/JS_FreeRuntime at --fe-deep-end: those jobs hold object
@@ -61719,6 +61762,7 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
                (qjs_deep_capture_inst) → their re-drive resolves this.X
                CONCRETELY (the cold-instance class gap; learn.microsoft.com
                search component `this._input=$0e(async()=>this.fetch())`). */
+            int _susp_before = qjs_count_suspended_generators(ctx);
             JSValue r2 = _is_cls_ctor
                 ? JS_CallConstructor(ctx, fo, nargs, args3)
                 : JS_Call(ctx, fo, (qjs_deep_recv && !JS_IsUndefined(qjs_deep_recv[_ix])) ? qjs_deep_recv[_ix] : this_opq2, nargs, args3);
@@ -61728,6 +61772,32 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
                     qjs_host_yield();   /* preemptible drain — same-script re-pick (live review wins) per the targeted-drive path */
 #endif
                 }
+            }
+            /* TS-ES5 __awaiter (TypeScript downleveled to ES5): a NON-async fn
+               returns __awaiter(...) — a manually-.then-driven generator whose
+               fetch sits AFTER a `yield`. The async drain above misses it (the
+               fn isn't JS_FUNC_ASYNC), then qjs_drop_pending_jobs below would
+               DROP the .then chain, so the generator never resumes to its fetch
+               (appwrite: 82 cold `this.client.call` service methods, learned 5).
+               If this drive NEWLY suspended a generator (the __awaiter shape),
+               resume it by draining the .then chain to the queue-empty fixpoint
+               so the post-yield fetch fires + records. Gated on a GENERATOR delta
+               (qjs_count_suspended_generators counts only `function*` /
+               `async function*`, NOT native async-function frames) so firebase's
+               native-async continuations are untouched — the precise scope that
+               avoids the prior unconditional-pump -4 firebase regression.
+               Preemptible per-job (NO CAPS: drain to the fixpoint; an
+               unproductive resume is starved by the scheduler, never counted). */
+            else if (qjs_count_suspended_generators(ctx) > _susp_before) { JSContext *cg; int _gdrained = 0;
+                qjs_gen_susp_drv++;   /* drive-trace: this drive newly suspended a generator (the __awaiter gate fired) */
+                if (qjs_deep_recv && _ix >= 0 && !JS_IsUndefined(qjs_deep_recv[_ix])) qjs_gen_susp_recv++;
+                while (JS_ExecutePendingJob(rt, &cg) > 0) {
+                    _gdrained = 1;
+#if defined(__EMSCRIPTEN__) && defined(QJS_HAS_JSPI)
+                    qjs_host_yield();
+#endif
+                }
+                if (_gdrained) qjs_gen_susp_drained++;
             }
             g_grind_drive_active = 0;   /* disarm: drive returned (or was yielded) */
             int _was_exc2 = JS_IsException(r2);
