@@ -50495,6 +50495,20 @@ static JSValue js_string_replace(JSContext *ctx, JSValueConst this_val,
     if (JS_IsException(search_str))
         goto exception;
     functionalReplace = JS_IsFunction(ctx, replaceValue);
+    if (!functionalReplace && qjs_is_opaque(replaceValue)) {
+        /* OPAQUE replacement = external input substituted into a string template, e.g.
+           appwrite's path-param methods: "/avatars/browsers/{code}".replace("{code}",
+           opaqueArg), chained for multi-param paths. JS_ToString below would lower the
+           opaque to the literal "[object Object]", DESTROYING the URL shape (the fetch
+           then records "/avatars/browsers/[object Object]" instead of a learnable
+           param-keyed endpoint). Leave the SUBJECT (and its "{code}" placeholders) INTACT
+           so urlOf shapes it to "/v1/avatars/browsers/{code}" — the moat's per-param KEY,
+           value opaque. A subsequent .replace of another opaque param keeps ITS key too.
+           This is the opaque-infectious OP_* transfer String.replace was missing. */
+        string_buffer_free(b);
+        JS_FreeValue(ctx, search_str);
+        return str;   /* unchanged — placeholders preserved as the shape */
+    }
     if (!functionalReplace) {
         replaceValue_str = JS_ToString(ctx, replaceValue);
         if (JS_IsException(replaceValue_str))
