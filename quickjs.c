@@ -62676,6 +62676,14 @@ static __exception int JS_ThisTimeValue(JSContext *ctx, double *valp,
         JSObject *p = JS_VALUE_GET_OBJ(this_val);
         if (p->class_id == JS_CLASS_DATE && JS_IsNumber(p->u.object_data))
             return JS_ToFloat64(ctx, valp, p->u.object_data);
+        if (p->class_id == JS_CLASS_DATE && qjs_is_opaque(p->u.object_data)) {
+            /* SYNTH-opaque time (argless new Date() under forced exec): numeric
+               field getters (getFullYear/getTimezoneOffset/toString) degrade to
+               NaN rather than throw; getTime/valueOf return the opaque directly
+               (js_date_getTime handles that before reaching here). */
+            *valp = NAN;
+            return 0;
+        }
     }
     JS_ThrowTypeError(ctx, "not a Date object");
     return -1;
@@ -63042,6 +63050,7 @@ static JSValue js_date_constructor(JSContext *ctx, JSValueConst new_target,
     JSValue rv;
     int i, n;
     double a, val;
+    int opaque_time = 0;
 
     if (JS_IsUndefined(new_target)) {
         /* invoked as function */
@@ -63049,7 +63058,14 @@ static JSValue js_date_constructor(JSContext *ctx, JSValueConst new_target,
     }
     n = argc;
     if (n == 0) {
-        val = date_now();
+        /* argless new Date() reads the current clock — a nondeterministic source.
+           Under forced exec store a SYNTH-opaque time (same rationale as
+           js_Date_now / js_math_random) so +new Date() / .getTime() / .valueOf()
+           are dynamic, not a per-request timestamp baked into a learned endpoint
+           (?ts=1780170627094). A fixed-arg Date (new Date(2020,0,1) / "2020-...")
+           is deterministic → stays concrete. */
+        if (qjs_fe_enabled) opaque_time = 1;
+        else val = date_now();
     } else if (n == 1) {
         JSValue v, dv;
         if (JS_VALUE_GET_TAG(argv[0]) == JS_TAG_OBJECT) {
@@ -63092,7 +63108,7 @@ static JSValue js_date_constructor(JSContext *ctx, JSValueConst new_target,
 has_val:
     rv = js_create_from_ctor(ctx, new_target, JS_CLASS_DATE);
     if (!JS_IsException(rv))
-        JS_SetObjectData(ctx, rv, js_float64(val));
+        JS_SetObjectData(ctx, rv, opaque_time ? qjs_synth_new(ctx) : js_float64(val));
     if (!JS_IsException(rv) && JS_IsUndefined(new_target)) {
         /* invoked as a function, return (new Date()).toString(); */
         JSValue s;
@@ -63653,6 +63669,14 @@ static JSValue js_date_getTime(JSContext *ctx, JSValueConst this_val,
     // getTime()
     double v;
 
+    /* getTime()/valueOf() on an argless new Date() (SYNTH-opaque time) returns
+       the opaque directly so +new Date() and .getTime() stay dynamic rather than
+       baking a per-request timestamp into a learned endpoint. */
+    if (JS_VALUE_GET_TAG(this_val) == JS_TAG_OBJECT) {
+        JSObject *p = JS_VALUE_GET_OBJ(this_val);
+        if (p->class_id == JS_CLASS_DATE && qjs_is_opaque(p->u.object_data))
+            return js_dup(p->u.object_data);
+    }
     if (JS_ThisTimeValue(ctx, &v, this_val))
         return JS_EXCEPTION;
     return js_float64(v);
