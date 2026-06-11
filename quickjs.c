@@ -61939,6 +61939,18 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
            captured with the real instance) instead of a wasted throw. */
         int _is_cls_ctor = 0;
         for (int cp = 0; cp < len && cp < 8; ) { int cop = b->byte_code_buf[cp]; if (cop == OP_check_ctor) { _is_cls_ctor = 1; break; } int csz = short_opcode_info(cop).size; if (csz < 1) break; cp += csz; }
+        /* Per-orphan drive diagnostic: inst = a real function-instance with
+           closure var_refs (qjs_deep_insts) vs the opaque fallback; recv = a
+           CONCRETE receiver `this` (qjs_deep_recv from the heap-instance proto
+           walk / cold-ctor synth) vs opaque. A this.X-derived url (meili
+           `indexes/${this.uid}/search`) stays opaque without recv, and the
+           caller (!has_host_in_b) path has no chain-reach signal, so an
+           opaque-`this` method drive was otherwise invisible. Bounded 256. */
+        { static long _odN = 0; if (_odN++ < 256) {
+            int _hasrecv = (qjs_deep_recv && _ix >= 0 && !JS_IsUndefined(qjs_deep_recv[_ix])) ? 1 : 0;
+            printf("@WHY {\"phase\":\"orphan_drive\",\"inst\":%d,\"recv\":%d,\"host\":%d,\"async\":%d,\"ctor\":%d,\"line\":%d,\"col\":%d}\n",
+                   _from_real, _hasrecv, has_host_in_b, (b->func_kind & JS_FUNC_ASYNC) ? 1 : 0, _is_cls_ctor, b->line_num, b->col_num);
+            fflush(stdout); } }
         g_grind_drive_active = 1; g_defer_fired = 0; g_noprog_polls = 0; g_progress_seen = qjs_fe_seen_n;   /* arm spin-defer for BOTH paths (targeted path's per-site catch cuts a spinning host site) */
         if (!has_host_in_b) {
             JSValue *args3 = nargs > 0 ? js_mallocz(ctx, nargs * sizeof(JSValue)) : NULL;
