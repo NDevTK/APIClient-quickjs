@@ -61989,8 +61989,28 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
            opaque-`this` method drive was otherwise invisible. Bounded 256. */
         { static long _odN = 0; if (_odN++ < 256) {
             int _hasrecv = (qjs_deep_recv && _ix >= 0 && !JS_IsUndefined(qjs_deep_recv[_ix])) ? 1 : 0;
-            printf("@WHY {\"phase\":\"orphan_drive\",\"inst\":%d,\"recv\":%d,\"host\":%d,\"async\":%d,\"ctor\":%d,\"line\":%d,\"col\":%d}\n",
-                   _from_real, _hasrecv, has_host_in_b, (b->func_kind & JS_FUNC_ASYNC) ? 1 : 0, _is_cls_ctor, b->line_num, b->col_num);
+            /* recvCS = count of CONCRETE (non-opaque) own STRING props on the drive
+               receiver; uid = the first such string (truncated). A this.X-derived url
+               (meili `indexes/${this.uid}/search`) is concrete ONLY if the receiver
+               carries the real string — so recvCS=0/uid="" on a recv=1 drive means the
+               captured receiver is a stateless/opaque instance, not the boot one, and
+               the endpoint resolves opaque. Cap-independent (unlike recv_candidate). */
+            int _recvCS = 0; char _ruid[24]; _ruid[0] = 0;
+            if (_hasrecv && JS_VALUE_GET_TAG(qjs_deep_recv[_ix]) == JS_TAG_OBJECT) {
+                JSObject *_ro = JS_VALUE_GET_OBJ(qjs_deep_recv[_ix]);
+                JSShape *_rsh = _ro ? _ro->shape : NULL;
+                if (_rsh) for (int _rp = 0; _rp < _rsh->prop_count; _rp++) {
+                    JSShapeProperty *_rpp = &_rsh->prop[_rp];
+                    if (_rpp->atom == JS_ATOM_NULL || (_rpp->flags & JS_PROP_TMASK)) continue;
+                    JSValue _rv = _ro->prop[_rp].u.value;
+                    if (JS_VALUE_GET_TAG(_rv) == JS_TAG_STRING) {
+                        _recvCS++;
+                        if (!_ruid[0]) { const char *_s = JS_ToCString(ctx, _rv); if (_s) { int _j = 0; for (const char *_p = _s; *_p && _j < 23; _p++) _ruid[_j++] = (*_p == '"' || *_p == '\\' || *_p == '\n') ? ' ' : *_p; _ruid[_j] = 0; JS_FreeCString(ctx, _s); } }
+                    }
+                }
+            }
+            printf("@WHY {\"phase\":\"orphan_drive\",\"inst\":%d,\"recv\":%d,\"recvCS\":%d,\"uid\":\"%s\",\"host\":%d,\"async\":%d,\"ctor\":%d,\"line\":%d,\"col\":%d}\n",
+                   _from_real, _hasrecv, _recvCS, _ruid, has_host_in_b, (b->func_kind & JS_FUNC_ASYNC) ? 1 : 0, _is_cls_ctor, b->line_num, b->col_num);
             fflush(stdout); } }
         g_grind_drive_active = 1; g_defer_fired = 0; g_noprog_polls = 0; g_progress_seen = qjs_fe_seen_n;   /* arm spin-defer for BOTH paths (targeted path's per-site catch cuts a spinning host site) */
         if (!has_host_in_b) {
