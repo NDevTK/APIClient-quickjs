@@ -20309,6 +20309,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         if (_hopq) {
             for (JSStackFrame *_anc = rt->current_stack_frame; _anc; _anc = _anc->prev_frame) {
                 if (JS_GetFunctionBytecode(_anc->cur_func) != b) continue;
+                /* Same bytecode but a DIFFERENT closure instance is a DIFFERENT
+                   invocation, NOT self-recursion: a userland-regenerator `invoke`
+                   is a FRESH closure per generator (makeInvokeMethod closing over
+                   self/_context), so a NESTED-generator chain — an SDK's
+                   search -> this.httpRequest.post -> request -> this.httpClient,
+                   each its own _asyncToGenerator — recurses on the SAME invoke
+                   bytecode with SameValue args (method "next", arg undefined) yet
+                   a different closure each level. Collapsing that bounds a BOUNDED
+                   chain short of the deep INDIRECT fetch (meili index methods
+                   1/12: the wrapper has a real receiver but the chain never
+                   reaches this.httpClient). Only a SAME-closure re-entry is a true
+                   no-progress self-recursion (qs/stringify) — skip past a
+                   different-closure ancestor to look for a same-closure one. */
+                if (JS_VALUE_GET_OBJ(_anc->cur_func) != JS_VALUE_GET_OBJ(func_obj)) continue;
                 /* Collapse a NO-PROGRESS re-entry. A recursion can only be BOUNDED
                    by a concrete-PRIMITIVE arg that changes (a counter / shrinking
                    index). So collapse when (every arg is SameValue — the original
