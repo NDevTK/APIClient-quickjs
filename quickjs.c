@@ -62099,8 +62099,12 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
                     }
                 }
             }
-            printf("@WHY {\"phase\":\"orphan_drive\",\"inst\":%d,\"recv\":%d,\"recvCS\":%d,\"uid\":\"%s\",\"ix\":%d,\"dix\":%d,\"dixCS\":%d,\"dixuid\":\"%s\",\"host\":%d,\"async\":%d,\"ctor\":%d,\"line\":%d,\"col\":%d}\n",
-                   _from_real, _hasrecv, _recvCS, _ruid, _ix, _dix, _dixCS, _dixuid, has_host_in_b, (b->func_kind & JS_FUNC_ASYNC) ? 1 : 0, _is_cls_ctor, b->line_num, b->col_num);
+            char _ofile[44]; _ofile[0] = 0;
+            if (b->filename != JS_ATOM_NULL) { const char *_fn = JS_AtomToCString(ctx, b->filename);
+                if (_fn) { const char *_bn = strrchr(_fn, '/'); _bn = _bn ? _bn + 1 : _fn; int _j = 0;
+                    for (; _bn[_j] && _j < 43; _j++) _ofile[_j] = (_bn[_j] == '"' || _bn[_j] == '\\') ? '_' : _bn[_j]; _ofile[_j] = 0; JS_FreeCString(ctx, _fn); } }
+            printf("@WHY {\"phase\":\"orphan_drive\",\"inst\":%d,\"recv\":%d,\"recvCS\":%d,\"uid\":\"%s\",\"ix\":%d,\"dix\":%d,\"dixCS\":%d,\"dixuid\":\"%s\",\"host\":%d,\"async\":%d,\"ctor\":%d,\"line\":%d,\"col\":%d,\"file\":\"%s\"}\n",
+                   _from_real, _hasrecv, _recvCS, _ruid, _ix, _dix, _dixCS, _dixuid, has_host_in_b, (b->func_kind & JS_FUNC_ASYNC) ? 1 : 0, _is_cls_ctor, b->line_num, b->col_num, _ofile);
             fflush(stdout); } }
         g_grind_drive_active = 1; g_defer_fired = 0; g_noprog_polls = 0; g_progress_seen = qjs_fe_seen_n;   /* arm spin-defer for BOTH paths (targeted path's per-site catch cuts a spinning host site) */
         if (!has_host_in_b) {
