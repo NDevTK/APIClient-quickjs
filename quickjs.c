@@ -61755,8 +61755,28 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
                         JSFunctionBytecode *mfb = mo->u.func.function_bytecode;
                         if (!mfb) continue;
                         int rix = mfb->qjs_deep_ix;
-                        if (rix >= 0 && rix < qjs_deep_rb_n && qjs_deep_rb[rix] == mfb && JS_IsUndefined(qjs_deep_recv[rix]))
-                            qjs_deep_recv[rix] = JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, inst));
+                        if (rix >= 0 && rix < qjs_deep_rb_n && qjs_deep_rb[rix] == mfb) {
+                            /* PURE diagnostic (capture logic unchanged below): for each
+                               candidate instance of a method's receiver, log the method
+                               line, the instance class, its CONCRETE own-prop count, and
+                               whether this is the first (winning) capture. Resolves why
+                               search@1742 captures a PARTIAL Index (low concreteProps)
+                               vs the complete boot index. Bounded 220. */
+                            { static long _rcN = 0; if (_rcN++ < 220) {
+                                int _cp = 0; JSShape *_ish = inst->shape;
+                                if (_ish) for (int _pi = 0; _pi < _ish->prop_count; _pi++) {
+                                    JSShapeProperty *_p = &_ish->prop[_pi];
+                                    if (_p->atom == JS_ATOM_NULL || (_p->flags & JS_PROP_TMASK)) continue;
+                                    JSValue _pv = inst->prop[_pi].u.value;
+                                    if (!JS_IsUndefined(_pv) && !qjs_is_opaque(_pv)) _cp++;
+                                }
+                                printf("@WHY {\"phase\":\"recv_candidate\",\"methLine\":%d,\"instClass\":%d,\"concreteProps\":%d,\"firstCap\":%d}\n",
+                                       mfb->line_num, (int)inst->class_id, _cp, JS_IsUndefined(qjs_deep_recv[rix]) ? 1 : 0);
+                                fflush(stdout);
+                            } }
+                            if (JS_IsUndefined(qjs_deep_recv[rix]))
+                                qjs_deep_recv[rix] = JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, inst));
+                        }
                     }
                 }
             }
