@@ -62028,6 +62028,19 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
                 JSValue e2 = JS_GetException(ctx);
                 if (qjs_deep_recv && _ix >= 0 && !JS_IsUndefined(qjs_deep_recv[_ix])) {
                     qjs_recv_thr++;   /* a receiver-drive that threw */
+                    /* Per-throw @WHY (line of the driven orphan + truncated
+                       message) — g_recv_exc_msg keeps only the FIRST, hiding
+                       whether a SPECIFIC method (meili search@1742) throws in
+                       its deep async chain and why. Bounded 64. */
+                    { static long _rtN = 0; if (_rtN++ < 64) {
+                        const char *_rm = JS_ToCString(ctx, e2);
+                        char _rb[80]; int _rj = 0;
+                        if (_rm) { for (const char *_rp = _rm; *_rp && _rj < 79; _rp++) { char _rc = *_rp; _rb[_rj++] = (_rc == '"' || _rc == '\\' || _rc == '\n' || _rc == '\r' || _rc == '\t') ? ' ' : _rc; } }
+                        _rb[_rj] = 0;
+                        printf("@WHY {\"phase\":\"recv_throw\",\"line\":%d,\"col\":%d,\"msg\":\"%s\"}\n", b->line_num, b->col_num, _rb);
+                        fflush(stdout);
+                        if (_rm) JS_FreeCString(ctx, _rm);
+                    } }
                     if (!g_recv_exc_kind) {   /* classify the FIRST one: guard-on-args vs wrong-client */
                         const char *_m = JS_ToCString(ctx, e2);
                         if (_m) {
