@@ -46117,6 +46117,18 @@ static JSValue js_array_isArray(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv)
 {
     int ret;
+    /* Forced-exec: Array.isArray of an OPAQUE value — its array-ness is
+       UNKNOWN, so return opaque (infectious, pass-through term) instead of
+       concrete false. The opaque sentinel is a JS-level truthy non-array
+       object, so without this an SDK config/arg validation guard like meili
+       createHeaders' `if (x && !Array.isArray(x)) throw "...array of
+       string(s)"` evaluates `truthy && !false` CONCRETELY and throws BEFORE
+       the request — the fetch is never reached (measured: 7 receiver-drives
+       threw that exact MeiliSearchError, search 1/12). Opaque here makes the
+       guard FORK so the non-throw arm reaches the endpoint, and the taint
+       term carries through for security. */
+    if (qjs_is_opaque(argv[0]))
+        return qjs_like(ctx, argv[0]);
     ret = js_is_array(ctx, argv[0]);
     if (ret < 0)
         return JS_EXCEPTION;
