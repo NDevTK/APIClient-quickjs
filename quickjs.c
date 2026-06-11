@@ -20867,7 +20867,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        SDK chain (meili search -> this.httpRequest.post). Log the
                        containing function's line + whether the receiver vs method
                        is opaque. Bounded 80. */
-                    { static long _omN = 0; if (_omN++ < 80) { printf("@WHY {\"phase\":\"opaque_method_call\",\"line\":%d,\"col\":%d,\"recvOpq\":%d,\"methOpq\":%d}\n", b ? b->line_num : -1, b ? b->col_num : -1, qjs_is_opaque(call_argv[-2]) ? 1 : 0, qjs_is_opaque(call_argv[-1]) ? 1 : 0); fflush(stdout); } }
+                    { static long _omN = 0; if (_omN++ < 80) { qjs_opq *_mo = qjs_is_opaque(call_argv[-1]) ? qjs_opq_of(call_argv[-1]) : NULL; JSObject *_ro = (!qjs_is_opaque(call_argv[-2]) && JS_VALUE_GET_TAG(call_argv[-2]) == JS_TAG_OBJECT) ? JS_VALUE_GET_OBJ(call_argv[-2]) : NULL; printf("@WHY {\"phase\":\"opaque_method_call\",\"line\":%d,\"col\":%d,\"recvOpq\":%d,\"methOpq\":%d,\"recvClass\":%d,\"methLabel\":\"%s\"}\n", b ? b->line_num : -1, b ? b->col_num : -1, qjs_is_opaque(call_argv[-2]) ? 1 : 0, qjs_is_opaque(call_argv[-1]) ? 1 : 0, _ro ? (int)_ro->class_id : -1, (_mo && _mo->label) ? _mo->label : ""); fflush(stdout); } }
                     ret_val = qjs_call(ctx, call_argv[-2], call_argv[-1], call_argc, vc(call_argv));
                     /* opaque receiver/method dropped any callback args — drive
                        them so `data.rows.forEach(cb)` / `sel.ids.map(cb)` fire
