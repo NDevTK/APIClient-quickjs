@@ -1070,10 +1070,16 @@ int main(int argc, char **argv) {
             if (JS_IsException(fn)) {
                 JSValue e = JS_GetException(ctx); const char *em = JS_ToCString(ctx, e);
                 printf("@E {\"file\":\"%s\",\"message\":\"emit-bc: %s\"}\n", argv[i + 1], em ? em : "(throw)");
-                fflush(stdout); if (em) JS_FreeCString(ctx, em); JS_FreeValue(ctx, e);
+                fflush(stdout);
+                /* Also to stderr so it lands in ast-thread's per-module emitErr snapshot
+                   (the @E stdout line is deduped/aggregated separately and was invisible
+                   for the directus modular-SDK empty-compile triage). */
+                fprintf(stderr, "EMITBC_THROW %s :: %s\n", argv[i + 1] ? argv[i + 1] : "?", em ? em : "(throw)");
+                fflush(stderr);
+                if (em) JS_FreeCString(ctx, em); JS_FreeValue(ctx, e);
                 JS_FreeValue(ctx, fn); rc = 1; break;
             }
-            size_t bn; uint8_t *bc = JS_WriteObject(ctx, &bn, fn, JS_WRITE_OBJ_BYTECODE);
+            size_t bn = 0; uint8_t *bc = JS_WriteObject(ctx, &bn, fn, JS_WRITE_OBJ_BYTECODE);
             JS_FreeValue(ctx, fn);
             if (!bc) { fprintf(stderr, "emit-bc: write failed\n"); rc = 1; break; }
             FILE *bf = fopen(argv[i + 2], "wb");
