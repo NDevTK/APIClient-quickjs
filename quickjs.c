@@ -34262,58 +34262,91 @@ static int js_resolve_module(JSContext *ctx, JSModuleDef *m)
 {
     int i;
     JSModuleDef *m1;
+    /* Iterative DFS via an explicit worklist instead of recursion. The recursive
+       form self-called js_resolve_module(m1) for every resolved import — one C-stack
+       frame per import-graph LEVEL — which overflows the (bounded) wasm stack on a
+       deep multi-file ESM SDK (directus: index→rest→commands→cmd→utils, hundreds of
+       modules deep). js_module_load compiles each imported module with COMPILE_ONLY
+       (quickjs-libc.c), so the LOADER never recurses into resolution — this self-call
+       was the ONLY recursion, so a worklist removes the depth entirely with identical
+       semantics: m->resolved dedups + breaks cycles, and every reachable module is
+       resolved (its req_module_entries[].module set) before return, so
+       js_link_module/js_evaluate_module still see a fully-resolved graph. */
+    JSModuleDef **work;
+    int n = 0, cap;
 
     if (m->resolved)
         return 0;
+    cap = 16;
+    work = js_malloc(ctx, cap * sizeof(*work));
+    if (!work)
+        return -1;
+    work[n++] = m;
+    while (n > 0) {
+        JSModuleDef *cur = work[--n];
+        if (cur->resolved)
+            continue;
 #ifdef ENABLE_DUMPS // JS_DUMP_MODULE_RESOLVE
-    if (check_dump_flag(ctx->rt, JS_DUMP_MODULE_RESOLVE)) {
-        char buf1[ATOM_GET_STR_BUF_SIZE];
-        printf("resolving module '%s':\n", JS_AtomGetStr(ctx, buf1, sizeof(buf1), m->module_name));
-    }
+        if (check_dump_flag(ctx->rt, JS_DUMP_MODULE_RESOLVE)) {
+            char buf1[ATOM_GET_STR_BUF_SIZE];
+            printf("resolving module '%s':\n", JS_AtomGetStr(ctx, buf1, sizeof(buf1), cur->module_name));
+        }
 #endif
-    m->resolved = true;
-    /* Emit EVERY CDN-URL import of this module up front — the resolve loop below
-       returns -1 on the FIRST unresolved import (a not-yet-fetched CDN module), so
-       a multi-import module (`import a from "https://…/app.js"; import b from
-       "https://…/auth.js"`) would otherwise only ever surface app.js; auth.js's
-       resolve never runs. This separate read-only pass lets the worker's chunk-
-       discovery fetch ALL deps. Pure emission — no resolution-logic change. */
-    for(i = 0; i < m->req_module_entries_count; i++) {
-        const char *_rn = JS_AtomToCString(ctx, m->req_module_entries[i].module_name);
-        if (_rn) {
-            if (!strncmp(_rn, "http://", 7) || !strncmp(_rn, "https://", 8)) {
-                printf("@MODURL %s\n", _rn);
-                fflush(stdout);
-            } else if (_rn[0] == '/' || _rn[0] == '.') {
-                /* Relative/absolute-path import — esm.sh-style: a fetched CDN module
-                   importing `/@supabase/auth-js.mjs` relative to its OWN origin, which
-                   normalize would treat as MEMFS-absolute and never surface. Emit it
-                   WITH the importing module's name (TAB-separated) so the worker can
-                   WHATWG-resolve the specifier against that module's real URL. */
-                const char *_imp = JS_AtomToCString(ctx, m->module_name);
-                if (_imp) {
-                    printf("@MODURL %s\t%s\n", _imp, _rn);
+        cur->resolved = true;
+        /* Emit EVERY CDN-URL import of this module up front — the resolve loop below
+           returns -1 on the FIRST unresolved import (a not-yet-fetched CDN module), so
+           a multi-import module (`import a from "https://…/app.js"; import b from
+           "https://…/auth.js"`) would otherwise only ever surface app.js; auth.js's
+           resolve never runs. This separate read-only pass lets the worker's chunk-
+           discovery fetch ALL deps. Pure emission — no resolution-logic change. */
+        for (i = 0; i < cur->req_module_entries_count; i++) {
+            const char *_rn = JS_AtomToCString(ctx, cur->req_module_entries[i].module_name);
+            if (_rn) {
+                if (!strncmp(_rn, "http://", 7) || !strncmp(_rn, "https://", 8)) {
+                    printf("@MODURL %s\n", _rn);
                     fflush(stdout);
-                    JS_FreeCString(ctx, _imp);
+                } else if (_rn[0] == '/' || _rn[0] == '.') {
+                    /* Relative/absolute-path import — esm.sh-style: a fetched CDN module
+                       importing `/@supabase/auth-js.mjs` relative to its OWN origin, which
+                       normalize would treat as MEMFS-absolute and never surface. Emit it
+                       WITH the importing module's name (TAB-separated) so the worker can
+                       WHATWG-resolve the specifier against that module's real URL. */
+                    const char *_imp = JS_AtomToCString(ctx, cur->module_name);
+                    if (_imp) {
+                        printf("@MODURL %s\t%s\n", _imp, _rn);
+                        fflush(stdout);
+                        JS_FreeCString(ctx, _imp);
+                    }
                 }
+                JS_FreeCString(ctx, _rn);
             }
-            JS_FreeCString(ctx, _rn);
+        }
+        /* resolve each requested module, then queue it for its own resolution */
+        for (i = 0; i < cur->req_module_entries_count; i++) {
+            JSReqModuleEntry *rme = &cur->req_module_entries[i];
+            m1 = js_host_resolve_imported_module_atom(ctx, cur->module_name,
+                                                      rme->module_name,
+                                                      rme->attributes);
+            if (!m1) {
+                js_free(ctx, work);
+                return -1;
+            }
+            rme->module = m1;
+            /* already done in js_host_resolve_imported_module() except if
+               the module was loaded with JS_EvalBinary() */
+            if (!m1->resolved) {
+                if (n >= cap) {
+                    int nc = cap * 2;
+                    JSModuleDef **nw = js_realloc(ctx, work, nc * sizeof(*work));
+                    if (!nw) { js_free(ctx, work); return -1; }
+                    work = nw;
+                    cap = nc;
+                }
+                work[n++] = m1;
+            }
         }
     }
-    /* resolve each requested module */
-    for(i = 0; i < m->req_module_entries_count; i++) {
-        JSReqModuleEntry *rme = &m->req_module_entries[i];
-        m1 = js_host_resolve_imported_module_atom(ctx, m->module_name,
-                                                  rme->module_name,
-                                                  rme->attributes);
-        if (!m1)
-            return -1;
-        rme->module = m1;
-        /* already done in js_host_resolve_imported_module() except if
-           the module was loaded with JS_EvalBinary() */
-        if (js_resolve_module(ctx, m1) < 0)
-            return -1;
-    }
+    js_free(ctx, work);
     return 0;
 }
 
