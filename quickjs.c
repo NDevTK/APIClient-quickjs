@@ -21541,7 +21541,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (_pinned >= 0) {
                         res = _pinned;
                         qjs_t_free(_pt);
-                    } else if (b != qjs_vspread_b && !qjs_host_reach_check(ctx, b)) {
+                    } else if (0 /* per-function reach-prune REMOVED: call-BLIND (only DIRECT host atoms / closure-literals, never a CALL), so it dropped any function whose fetch OR XSS sink is one call deep — e.g. a regenerator-transpiled SDK method's this.httpRequest.X(). A static reachability guess is a hacky separate analysis; the engine RUNS the branch, the host hooks record ACTUAL reach, the fixpoint bounds it. */ && b != qjs_vspread_b && !qjs_host_reach_check(ctx, b)) {
                         /* Per-function scope pruning: this function's
                            bytecode reaches no host-edge atom (direct or
                            via closure-literal). Flipping its opaque
@@ -21586,11 +21586,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             res = _rj ? 1 : 0;   /* if_true: res=1 takes the jump toward target */
                         }
                         if (_pt) { qjs_pc_push(_pt, res); qjs_t_free(_pt); }
-                    } else if (!qjs_host_reach_from(ctx, b, (int)((pc - b->byte_code_buf) + (int32_t)get_u32(pc - 4) - 4))) {
+                    } else if (0 /* per-branch reach-prune REMOVED: pruning is a CAP — the WFQ scheduler starves dead arms by ACTUAL @H-rate, it isn't dropped on a static guess */ && !qjs_host_reach_from(ctx, b,(int)((pc - b->byte_code_buf) + (int32_t)get_u32(pc - 4) - 4))) {
                         /* JUMP arm dead → default 0 (fall-through), no frontier. */
                         res = 0;
                         if (_pt) { qjs_pc_push(_pt, res); qjs_t_free(_pt); }
-                    } else if (!qjs_host_reach_from(ctx, b, (int)(pc - b->byte_code_buf))) {
+                    } else if (0 /* per-branch reach-prune REMOVED: pruning is a CAP — the WFQ scheduler starves dead arms by ACTUAL @H-rate, it isn't dropped on a static guess */ && !qjs_host_reach_from(ctx, b,(int)(pc - b->byte_code_buf))) {
                         /* FALL-THROUGH arm dead → default 1 (jump), no frontier.
                            Symmetric prune: until now the engine only pruned the
                            flipped-dead case (above); the default-dead case fell
@@ -21730,7 +21730,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (_pinned >= 0) {
                         res = _pinned;
                         qjs_t_free(_pt);
-                    } else if (b != qjs_vspread_b && !qjs_host_reach_check(ctx, b)) {
+                    } else if (0 /* per-function reach-prune REMOVED: call-BLIND (only DIRECT host atoms / closure-literals, never a CALL), so it dropped any function whose fetch OR XSS sink is one call deep — e.g. a regenerator-transpiled SDK method's this.httpRequest.X(). A static reachability guess is a hacky separate analysis; the engine RUNS the branch, the host hooks record ACTUAL reach, the fixpoint bounds it. */ && b != qjs_vspread_b && !qjs_host_reach_check(ctx, b)) {
                         /* Per-function scope pruning: this function's
                            bytecode reaches no host-edge atom (direct or
                            via closure-literal). Flipping its opaque
@@ -21770,12 +21770,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             res = _rj ? 0 : (_rf ? 1 : 0);   /* if_false: res=0 takes the jump toward target */
                         }
                         if (_pt) { qjs_pc_push(_pt, res); qjs_t_free(_pt); }
-                    } else if (!qjs_host_reach_from(ctx, b, (int)(pc - b->byte_code_buf))) {
+                    } else if (0 /* per-branch reach-prune REMOVED: pruning is a CAP — the WFQ scheduler starves dead arms by ACTUAL @H-rate, it isn't dropped on a static guess */ && !qjs_host_reach_from(ctx, b,(int)(pc - b->byte_code_buf))) {
                         /* FALL-THROUGH arm dead → default 0 (which for OP_if_false
                            takes the jump), no frontier. */
                         res = 0;
                         if (_pt) { qjs_pc_push(_pt, res); qjs_t_free(_pt); }
-                    } else if (!qjs_host_reach_from(ctx, b, (int)((pc - b->byte_code_buf) + (int32_t)get_u32(pc - 4) - 4))) {
+                    } else if (0 /* per-branch reach-prune REMOVED: pruning is a CAP — the WFQ scheduler starves dead arms by ACTUAL @H-rate, it isn't dropped on a static guess */ && !qjs_host_reach_from(ctx, b,(int)((pc - b->byte_code_buf) + (int32_t)get_u32(pc - 4) - 4))) {
                         /* JUMP arm dead → default 1 (fall-through for OP_if_false
                            since the jump fires on res=0), no frontier. Symmetric
                            prune mirroring OP_if_true's added case above. */
@@ -21903,7 +21903,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (_pinned >= 0) {
                         res = _pinned;
                         qjs_t_free(_pt);
-                    } else if (b != qjs_vspread_b && !qjs_host_reach_check(ctx, b)) {
+                    } else if (0 /* per-function reach-prune REMOVED: call-BLIND (only DIRECT host atoms / closure-literals, never a CALL), so it dropped any function whose fetch OR XSS sink is one call deep — e.g. a regenerator-transpiled SDK method's this.httpRequest.X(). A static reachability guess is a hacky separate analysis; the engine RUNS the branch, the host hooks record ACTUAL reach, the fixpoint bounds it. */ && b != qjs_vspread_b && !qjs_host_reach_check(ctx, b)) {
                         /* Per-function scope pruning: this function's
                            bytecode reaches no host-edge atom (direct or
                            via closure-literal). Flipping its opaque
@@ -21942,11 +21942,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             res = _rj ? 1 : 0;   /* if_true8: res=1 takes the jump toward target */
                         }
                         if (_pt) { qjs_pc_push(_pt, res); qjs_t_free(_pt); }
-                    } else if (!qjs_host_reach_from(ctx, b, (int)((pc - b->byte_code_buf) + (int8_t)pc[-1] - 1))) {
+                    } else if (0 /* per-branch reach-prune REMOVED: pruning is a CAP — the WFQ scheduler starves dead arms by ACTUAL @H-rate, it isn't dropped on a static guess */ && !qjs_host_reach_from(ctx, b,(int)((pc - b->byte_code_buf) + (int8_t)pc[-1] - 1))) {
                         /* JUMP arm dead → default 0 (fall-through), no frontier. */
                         res = 0;
                         if (_pt) { qjs_pc_push(_pt, res); qjs_t_free(_pt); }
-                    } else if (!qjs_host_reach_from(ctx, b, (int)(pc - b->byte_code_buf))) {
+                    } else if (0 /* per-branch reach-prune REMOVED: pruning is a CAP — the WFQ scheduler starves dead arms by ACTUAL @H-rate, it isn't dropped on a static guess */ && !qjs_host_reach_from(ctx, b,(int)(pc - b->byte_code_buf))) {
                         /* FALL-THROUGH arm dead → default 1 (jump), no frontier.
                            Symmetric prune (8-bit-offset variant of OP_if_true). */
                         res = 1;
@@ -22071,7 +22071,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (_pinned >= 0) {
                         res = _pinned;
                         qjs_t_free(_pt);
-                    } else if (b != qjs_vspread_b && !qjs_host_reach_check(ctx, b)) {
+                    } else if (0 /* per-function reach-prune REMOVED: call-BLIND (only DIRECT host atoms / closure-literals, never a CALL), so it dropped any function whose fetch OR XSS sink is one call deep — e.g. a regenerator-transpiled SDK method's this.httpRequest.X(). A static reachability guess is a hacky separate analysis; the engine RUNS the branch, the host hooks record ACTUAL reach, the fixpoint bounds it. */ && b != qjs_vspread_b && !qjs_host_reach_check(ctx, b)) {
                         /* Per-function scope pruning: this function's
                            bytecode reaches no host-edge atom (direct or
                            via closure-literal). Flipping its opaque
@@ -22110,12 +22110,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             res = _rj ? 0 : (_rf ? 1 : 0);   /* if_false8: res=0 takes the jump toward target */
                         }
                         if (_pt) { qjs_pc_push(_pt, res); qjs_t_free(_pt); }
-                    } else if (!qjs_host_reach_from(ctx, b, (int)(pc - b->byte_code_buf))) {
+                    } else if (0 /* per-branch reach-prune REMOVED: pruning is a CAP — the WFQ scheduler starves dead arms by ACTUAL @H-rate, it isn't dropped on a static guess */ && !qjs_host_reach_from(ctx, b,(int)(pc - b->byte_code_buf))) {
                         /* FALL-THROUGH arm dead → default 0 (jump for OP_if_false8),
                            no frontier. */
                         res = 0;
                         if (_pt) { qjs_pc_push(_pt, res); qjs_t_free(_pt); }
-                    } else if (!qjs_host_reach_from(ctx, b, (int)((pc - b->byte_code_buf) + (int8_t)pc[-1] - 1))) {
+                    } else if (0 /* per-branch reach-prune REMOVED: pruning is a CAP — the WFQ scheduler starves dead arms by ACTUAL @H-rate, it isn't dropped on a static guess */ && !qjs_host_reach_from(ctx, b,(int)((pc - b->byte_code_buf) + (int8_t)pc[-1] - 1))) {
                         /* JUMP arm dead → default 1 (fall-through), no frontier.
                            Symmetric prune (8-bit-offset variant of OP_if_false). */
                         res = 1;
