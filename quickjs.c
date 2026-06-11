@@ -61759,9 +61759,7 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
                             /* PURE diagnostic (capture logic unchanged below): for each
                                candidate instance of a method's receiver, log the method
                                line, the instance class, its CONCRETE own-prop count, and
-                               whether this is the first (winning) capture. Resolves why
-                               search@1742 captures a PARTIAL Index (low concreteProps)
-                               vs the complete boot index. Bounded 220. */
+                               whether this is the first (winning) capture. Bounded 220. */
                             { static long _rcN = 0; if (_rcN++ < 220) {
                                 int _cp = 0; JSShape *_ish = inst->shape;
                                 if (_ish) for (int _pi = 0; _pi < _ish->prop_count; _pi++) {
@@ -61838,6 +61836,45 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
                 }
                 JS_FreeValue(ctx, _cli);
                 if (_cts) js_free(ctx, _cts);
+            }
+            /* DRIVE ISOLATION — root fix for cross-drive receiver corruption.
+               The walk/synth above stored qjs_deep_recv[rix] = JS_DupValue(inst):
+               the SAME object is shared by every method rix that resolved to one
+               instance (the boot meili index won search@1742, getStats@1697, … all
+               pointing at one object). A drive that writes `this.X = <opaque arg>`
+               (a constructor / setter orphan driven with opaque args) then OPAQUES
+               that shared object for every LATER drive — measured: index.uid flips
+               "movies"→opaque between drive #24 (1697, concrete) and #91 (1742,
+               opaque), so only the first-driven method keeps its real receiver.
+               Give each rix its OWN shallow clone (same prototype so `this.method()`
+               / proto lookups still resolve; own data props copied so concrete state
+               — uid, base url — is preserved) so one drive's mutation cannot leak
+               into another method's captured `this`. Done HERE, after the gc-list
+               walk + synth, because JS_NewObject allocates and would invalidate the
+               live gc_obj_list iterator if done inside the walk. Shallow by design:
+               nested objects (this.client) stay shared refs — the observed
+               corruption is a top-level scalar prop, and a per-rix deep copy would
+               be far more costly for no measured gain. */
+            for (int _ri = 0; _ri < qjs_deep_rb_n; _ri++) {
+                if (JS_VALUE_GET_TAG(qjs_deep_recv[_ri]) != JS_TAG_OBJECT) continue;
+                JSValue _orig = qjs_deep_recv[_ri];
+                JSValue _proto = JS_GetPrototype(ctx, _orig);
+                JSValue _clone = JS_NewObjectProtoClass(ctx, _proto, JS_CLASS_OBJECT);
+                JS_FreeValue(ctx, _proto);
+                if (JS_VALUE_GET_TAG(_clone) != JS_TAG_OBJECT) { JS_FreeValue(ctx, _clone); continue; }
+                /* Faithful shallow copy = `{ ..._orig }` onto the same prototype: own
+                   enumerable props snapshotted as data props, INVOKING getters so a
+                   computed accessor (e.g. `get dsn()`/`get url()`) resolves to its
+                   concrete value at clone time — a dropped getter would read back
+                   `undefined` and fabricate junk URLs. setprop=false defines OWN data
+                   props directly (bypassing any proto setter). Nested objects stay
+                   shared refs (shallow — the observed corruption is a top-level scalar
+                   and a deep copy would cost far more for no measured gain). */
+                if (JS_CopyDataProperties(ctx, _clone, _orig, JS_UNDEFINED, false) < 0) {
+                    JSValue _e = JS_GetException(ctx); JS_FreeValue(ctx, _e);
+                }
+                qjs_deep_recv[_ri] = _clone;
+                JS_FreeValue(ctx, _orig);
             }
         }
         JS_RunGC(rt);
@@ -62009,8 +62046,28 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
                     }
                 }
             }
-            printf("@WHY {\"phase\":\"orphan_drive\",\"inst\":%d,\"recv\":%d,\"recvCS\":%d,\"uid\":\"%s\",\"host\":%d,\"async\":%d,\"ctor\":%d,\"line\":%d,\"col\":%d}\n",
-                   _from_real, _hasrecv, _recvCS, _ruid, has_host_in_b, (b->func_kind & JS_FUNC_ASYNC) ? 1 : 0, _is_cls_ctor, b->line_num, b->col_num);
+            /* CROSS-CHECK (Gap B desync): the receiver at THIS bytecode's OWN
+               qjs_deep_ix slot (where the heap-walk WROTE) vs recv[_ix] the
+               live-pick read above. Distinguishes wrapper-vs-inner (same line,
+               different col/ix — a proto method got the receiver, the cold inner
+               orphan driven here did not) from a true ix/walk-slot desync. */
+            int _dix = b->qjs_deep_ix;
+            int _dixCS = 0; char _dixuid[24]; _dixuid[0] = 0;
+            if (qjs_deep_recv && _dix >= 0 && _dix < qjs_deep_rb_n && JS_VALUE_GET_TAG(qjs_deep_recv[_dix]) == JS_TAG_OBJECT) {
+                JSObject *_dro = JS_VALUE_GET_OBJ(qjs_deep_recv[_dix]);
+                JSShape *_drsh = _dro ? _dro->shape : NULL;
+                if (_drsh) for (int _drp = 0; _drp < _drsh->prop_count; _drp++) {
+                    JSShapeProperty *_drpp = &_drsh->prop[_drp];
+                    if (_drpp->atom == JS_ATOM_NULL || (_drpp->flags & JS_PROP_TMASK)) continue;
+                    JSValue _drv = _dro->prop[_drp].u.value;
+                    if (JS_VALUE_GET_TAG(_drv) == JS_TAG_STRING) {
+                        _dixCS++;
+                        if (!_dixuid[0]) { const char *_s = JS_ToCString(ctx, _drv); if (_s) { int _j = 0; for (const char *_p = _s; *_p && _j < 23; _p++) _dixuid[_j++] = (*_p == '"' || *_p == '\\' || *_p == '\n') ? ' ' : *_p; _dixuid[_j] = 0; JS_FreeCString(ctx, _s); } }
+                    }
+                }
+            }
+            printf("@WHY {\"phase\":\"orphan_drive\",\"inst\":%d,\"recv\":%d,\"recvCS\":%d,\"uid\":\"%s\",\"ix\":%d,\"dix\":%d,\"dixCS\":%d,\"dixuid\":\"%s\",\"host\":%d,\"async\":%d,\"ctor\":%d,\"line\":%d,\"col\":%d}\n",
+                   _from_real, _hasrecv, _recvCS, _ruid, _ix, _dix, _dixCS, _dixuid, has_host_in_b, (b->func_kind & JS_FUNC_ASYNC) ? 1 : 0, _is_cls_ctor, b->line_num, b->col_num);
             fflush(stdout); } }
         g_grind_drive_active = 1; g_defer_fired = 0; g_noprog_polls = 0; g_progress_seen = qjs_fe_seen_n;   /* arm spin-defer for BOTH paths (targeted path's per-site catch cuts a spinning host site) */
         if (!has_host_in_b) {
