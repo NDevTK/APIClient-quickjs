@@ -2919,6 +2919,15 @@ typedef struct JSFunctionBytecode {
        so the per-catch diagnostic dedups to one record per host-edge function
        (a try/catch in a hot loop won't flood). */
     uint8_t qjs_caught_logged : 1;
+    /* qjs_is_module: this bytecode is a MODULE's top-level <eval> function
+       (js_create_module_bytecode_function). It runs ONCE at module instantiation;
+       it has no host edge of its own (qjs_h_fired stays 0) so the deep residue would
+       otherwise DRIVE it — but JS_Call-ing a module top-level RE-INSTANTIATES the
+       module (re-defines its exports, re-runs side effects) creating orphaned closures
+       that are NOT in loaded_modules, so JS_MarkContext can't mark them → external GC
+       roots at teardown → the gc_obj_list assert (directus utils/error.js). Excluded
+       from the residue: re-running module init finds no new endpoint, only leaks. */
+    uint8_t qjs_is_module : 1;
     /* qjs_deep_ix: post-sort back-index into qjs_deep_rb during an active
        grind (set when the residue is built) so qjs_deep_capture_inst is O(1).
        The qjs_deep_rb[ix]==b guard makes a stale/zero-init index a safe miss. */
@@ -34444,6 +34453,7 @@ static int js_create_module_bytecode_function(JSContext *ctx, JSModuleDef *m)
     if (JS_IsException(func_obj))
         return -1;
     b = JS_VALUE_GET_PTR(bfunc);
+    b->qjs_is_module = 1;   /* module top-level: exclude from the deep residue (re-driving re-instantiates -> teardown leak) */
 
     p = JS_VALUE_GET_OBJ(func_obj);
     p->u.func.function_bytecode = b;
@@ -61703,6 +61713,7 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
                qjs_h_fired stays 0 forever for a non-host function (no site to
                fire), so the driven-SET is the sole "done" mark for them. */
             if (!b->byte_code_buf || b->qjs_h_fired) continue;
+            if (b->qjs_is_module) continue;   /* module top-level <eval>: re-driving re-instantiates the module (orphan closures -> teardown GC-root leak), never a new endpoint */
             if (qjs_is_host_model_file(b->filename)) continue;
             if (qjs_deep_rb_n == cap) {
                 int nc = cap ? cap * 2 : 64;
