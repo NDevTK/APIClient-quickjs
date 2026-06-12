@@ -9073,6 +9073,15 @@ static void add_gc_object(JSRuntime *rt, JSGCObjectHeader *h,
 {
     h->mark = 0;
     h->gc_obj_type = type;
+    /* Teardown leak catcher: a GC object CREATED during the cycle-free sweep
+       (gc_phase REMOVE_CYCLES, in_free) lands in gc_obj_list but never in
+       tmp_obj_list, so it survives gc_free_cycles -> the FreeRuntime residue.
+       This is a finalizer resurrecting/allocating during teardown; naming the
+       type points at the culprit. Bounded log; zero cost off the teardown path. */
+    if (rt->in_free && rt->gc_phase == JS_GC_PHASE_REMOVE_CYCLES) {
+        static int _grn = 0;
+        if (_grn++ < 10) { fprintf(stderr, "@WHY {\"phase\":\"gc_resurrect_alloc\",\"type\":%d}\n", type); fflush(stderr); }
+    }
     list_add_tail(&h->link, &rt->gc_obj_list);
 }
 
