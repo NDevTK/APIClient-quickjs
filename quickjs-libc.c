@@ -747,9 +747,12 @@ int js_module_set_import_meta(JSContext *ctx, JSValueConst func_val,
         if (use_realpath) {
             char *res = realpath(module_name, buf + strlen(buf));
             if (!res) {
-                JS_ThrowTypeError(ctx, "realpath failure");
-                JS_FreeCString(ctx, module_name);
-                return -1;
+                /* realpath needs a real FS entry; module sources live in the in-memory
+                   map (Module.__feMap), not on a filesystem, so there is nothing for it
+                   to resolve. import.meta.url is a best-effort canonicalization, NEVER a
+                   load requirement — fall back to the lexical module name (identical to
+                   the use_realpath=false branch) rather than failing the whole module. */
+                js__pstrcat(buf, sizeof(buf), module_name);
             }
         } else
 #endif
