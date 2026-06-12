@@ -747,8 +747,13 @@ int main(int argc, char **argv) {
                    github doesn't. Spec-legitimate teardown drain, not a GC mask. */
                 qjs_deep_drain_jobs(g_deep_ctx);
                 qjs_unwind_suspended(g_deep_ctx, g_deep_rt);   /* drop suspended-frame ctx refs before free */
-                JS_FreeContext(g_deep_ctx);
+                /* Free os timers/handlers BEFORE the context (canonical qjs.c order):
+                   a still-pending os.setTimeout holds its callback (+ captured scope)
+                   AND a ctx ref, so freeing handlers AFTER JS_FreeContext strands the
+                   context and roots the whole bundle → JS_FreeRuntime's gc_obj_list
+                   assert. directus's SDK leaves such a timer at deep-end teardown. */
                 js_std_free_handlers(g_deep_rt);
+                JS_FreeContext(g_deep_ctx);
                 JS_FreeRuntime(g_deep_rt);
                 g_deep_ctx = NULL; g_deep_rt = NULL;
             }
@@ -929,8 +934,8 @@ int main(int argc, char **argv) {
             if (g_boot_ctx) {
                 qjs_deep_drain_jobs(g_boot_ctx);
                 qjs_unwind_suspended(g_boot_ctx, g_boot_rt);   /* drop suspended-frame ctx refs before free */
+                js_std_free_handlers(g_boot_rt);   /* timers/handlers before the context (canonical order; a pending timer's ctx ref strands the context otherwise) */
                 JS_FreeContext(g_boot_ctx);
-                js_std_free_handlers(g_boot_rt);
                 JS_FreeRuntime(g_boot_rt);
                 g_boot_ctx = NULL; g_boot_rt = NULL;
             }
@@ -946,8 +951,8 @@ int main(int argc, char **argv) {
             if (g_boot_ctx) {
                 qjs_deep_drain_jobs(g_boot_ctx);
                 qjs_unwind_suspended(g_boot_ctx, g_boot_rt);   /* drop suspended-frame ctx refs before free */
+                js_std_free_handlers(g_boot_rt);   /* timers/handlers before the context (canonical order; a pending timer's ctx ref strands the context otherwise) */
                 JS_FreeContext(g_boot_ctx);
-                js_std_free_handlers(g_boot_rt);
                 JS_FreeRuntime(g_boot_rt);
                 g_boot_ctx = NULL; g_boot_rt = NULL;
             }
@@ -1243,8 +1248,8 @@ int main(int argc, char **argv) {
         qjs_timer_log("js_std_loop", "(host)", t_loop0);
     }
     double t_free0 = qjs_timer_ms_since_start();
+    js_std_free_handlers(rt);   /* before JS_FreeContext (canonical order): a pending timer's callback + ctx ref would otherwise strand the context */
     JS_FreeContext(ctx);
-    js_std_free_handlers(rt);
     JS_FreeRuntime(rt);
     qjs_timer_log("teardown", "(host)", t_free0);
     qjs_timer_log("TOTAL", "(host)", 0.0);

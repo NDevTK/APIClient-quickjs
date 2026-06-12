@@ -4547,22 +4547,36 @@ void JS_FreeRuntime(JSRuntime *rt)
         /* Diagnostic before the assertion fires: dump what type of GC
            objects remain. This is the leak we need to fix (NOT mask). */
         int n_obj = 0, n_bc = 0, n_shape = 0, n_var = 0, n_async = 0, n_ctx = 0, n_other = 0;
+        int ctx_rc = 0, n_promise = 0, n_resolve = 0, n_cfunc = 0, n_bndfn = 0;
         struct list_head *el;
         list_for_each(el, &rt->gc_obj_list) {
             JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
             switch (gp->gc_obj_type) {
-            case JS_GC_OBJ_TYPE_JS_OBJECT: n_obj++; break;
+            case JS_GC_OBJ_TYPE_JS_OBJECT: {
+                n_obj++;
+                /* class breakdown pinpoints the root holding the context: a pending
+                   Promise (+ its resolve/reject async_function_data, which holds a ctx
+                   ref) vs a C function vs a bound function. */
+                JSObject *o = (JSObject *)gp;
+                if (o->class_id == JS_CLASS_PROMISE) n_promise++;
+                else if (o->class_id == JS_CLASS_ASYNC_FUNCTION_RESOLVE ||
+                         o->class_id == JS_CLASS_ASYNC_FUNCTION_REJECT) n_resolve++;
+                else if (o->class_id == JS_CLASS_C_FUNCTION ||
+                         o->class_id == JS_CLASS_C_FUNCTION_DATA) n_cfunc++;
+                else if (o->class_id == JS_CLASS_BOUND_FUNCTION) n_bndfn++;
+                break;
+            }
             case JS_GC_OBJ_TYPE_FUNCTION_BYTECODE: n_bc++; break;
             case JS_GC_OBJ_TYPE_SHAPE: n_shape++; break;
             case JS_GC_OBJ_TYPE_VAR_REF: n_var++; break;
             case JS_GC_OBJ_TYPE_ASYNC_FUNCTION: n_async++; break;
-            case JS_GC_OBJ_TYPE_JS_CONTEXT: n_ctx++; break;
+            case JS_GC_OBJ_TYPE_JS_CONTEXT: n_ctx++; ctx_rc = gp->ref_count; break;
             default: n_other++; break;
             }
         }
         fprintf(stderr,
-            "@WHY {\"phase\":\"FreeRuntime_residue\",\"obj\":%d,\"bytecode\":%d,\"shape\":%d,\"varref\":%d,\"async\":%d,\"context\":%d,\"other\":%d}\n",
-            n_obj, n_bc, n_shape, n_var, n_async, n_ctx, n_other);
+            "@WHY {\"phase\":\"FreeRuntime_residue\",\"obj\":%d,\"bytecode\":%d,\"shape\":%d,\"varref\":%d,\"async\":%d,\"context\":%d,\"ctxRc\":%d,\"promise\":%d,\"resolve\":%d,\"cfunc\":%d,\"bndfn\":%d,\"other\":%d}\n",
+            n_obj, n_bc, n_shape, n_var, n_async, n_ctx, ctx_rc, n_promise, n_resolve, n_cfunc, n_bndfn, n_other);
         fflush(stderr);
     }
     assert(list_empty(&rt->gc_obj_list));
