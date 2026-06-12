@@ -449,8 +449,8 @@ static void qjs_deep_capture_inst(JSContext *ctx, struct JSFunctionBytecode *b, 
    g_comp_last_ret_ptr is IDENTITY only (never deref'd, may dangle harmlessly);
    the sink/recv arrays hold DupValue refs, freed in JS_FreeRuntime. */
 static void *g_comp_last_ret_ptr = NULL;
-static JSValue *g_comp_sink = NULL, *g_comp_recv = NULL;
-static int g_comp_n = 0, g_comp_cap = 0;
+static JSValue *g_comp_sink = NULL, *g_comp_recv = NULL, *g_comp_pend = NULL;
+static int g_comp_n = 0, g_comp_cap = 0, g_comp_pend_n = 0, g_comp_pend_cap = 0;
 static void qjs_comp_capture(JSContext *ctx, JSValueConst func, JSValueConst this_val);
 /* flavor + taint-source label + symbolic term propagate through
    derivation so a value reaching a sink names which attacker input it
@@ -4517,7 +4517,9 @@ void JS_FreeRuntime(JSRuntime *rt)
     for (i = 0; i < g_comp_n; i++) { JS_FreeValueRT(rt, g_comp_sink[i]); JS_FreeValueRT(rt, g_comp_recv[i]); }
     if (g_comp_sink) { js_free_rt(rt, g_comp_sink); g_comp_sink = NULL; }
     if (g_comp_recv) { js_free_rt(rt, g_comp_recv); g_comp_recv = NULL; }
-    g_comp_n = 0; g_comp_cap = 0; g_comp_last_ret_ptr = NULL;
+    for (i = 0; i < g_comp_pend_n; i++) JS_FreeValueRT(rt, g_comp_pend[i]);
+    if (g_comp_pend) { js_free_rt(rt, g_comp_pend); g_comp_pend = NULL; }
+    g_comp_n = 0; g_comp_cap = 0; g_comp_pend_n = 0; g_comp_pend_cap = 0; g_comp_last_ret_ptr = NULL;
     JS_FreeValueRT(rt, rt->current_exception);
 
     list_for_each_safe(el, el1, &rt->job_list) {
@@ -62345,26 +62347,45 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
                    PRODUCER (directus readFiles→{path}), not a method that already IS an
                    endpoint (meili search fetches → qjs_h_fired=1, excluded). The run-fact
                    that targets the composition at descriptor SDKs without a shape heuristic. */
-                int _sv_df = g_defer_fired, _sv_sn = g_spin_n, _sv_np = g_noprog_polls, _sv_ps = g_progress_seen;
-                for (int _ci = 0; _ci < g_comp_n; _ci++) {
-                    JSFunctionBytecode *_sfb = JS_GetFunctionBytecode(g_comp_sink[_ci]);
-                    if (!_sfb || !_sfb->qjs_h_fired) continue;   /* drive ONLY a sink that ACTUALLY fetches (a real endpoint sink, e.g. directus request); a spuriously-captured non-fetching chain link (meili index()/getTask) is skipped — no shared-state churn */
-                    JSValueConst _ca = r2;
-                    g_grind_drive_active = 1;
-                    JSValue _cr = JS_Call(ctx, g_comp_sink[_ci], g_comp_recv[_ci], 1, &_ca);
-                    if (!JS_IsException(_cr) && JS_VALUE_GET_TAG(_cr) == JS_TAG_OBJECT) {
-                        JSContext *_cc;
-                        while (JS_ExecutePendingJob(rt, &_cc) > 0) {
+                int _anyF = 0;
+                for (int _fi = 0; _fi < g_comp_n; _fi++) { JSFunctionBytecode *_s = JS_GetFunctionBytecode(g_comp_sink[_fi]); if (_s && _s->qjs_h_fired) { _anyF = 1; break; } }
+                if (!_anyF) {
+                    /* No captured sink has fetched YET (the page's client.request(cmd()) drove
+                       LATER than this producer) — SAVE the descriptor; it's drained the instant
+                       a sink fetches, making the composition ORDER-INDEPENDENT (no lost command). */
+                    if (g_comp_pend_n == g_comp_pend_cap) { int _pg = g_comp_pend_cap ? g_comp_pend_cap * 2 : 16; JSValue *_pp = js_realloc(ctx, g_comp_pend, (size_t)_pg * sizeof(JSValue)); if (_pp) { g_comp_pend = _pp; g_comp_pend_cap = _pg; } }
+                    if (g_comp_pend_n < g_comp_pend_cap) g_comp_pend[g_comp_pend_n++] = JS_DupValue(ctx, r2);
+                } else {
+                    /* A sink has fetched — drive the DEFERRED descriptors (saved before any sink
+                       fetched) THEN this one, through each sink that actually fetches. Self-gated;
+                       the orphan's spin-defer state is saved/restored so a composition fetch's
+                       own spin can't perturb the orphan's defer decision below. */
+                    int _sv_df = g_defer_fired, _sv_sn = g_spin_n, _sv_np = g_noprog_polls, _sv_ps = g_progress_seen;
+                    for (int _pi = 0; _pi <= g_comp_pend_n; _pi++) {
+                        JSValueConst _desc = (_pi < g_comp_pend_n) ? g_comp_pend[_pi] : (JSValueConst)r2;
+                        for (int _ci = 0; _ci < g_comp_n; _ci++) {
+                            JSFunctionBytecode *_sfb = JS_GetFunctionBytecode(g_comp_sink[_ci]);
+                            if (!_sfb || !_sfb->qjs_h_fired) continue;
+                            JSValueConst _ca = _desc;
+                            g_grind_drive_active = 1;
+                            JSValue _cr = JS_Call(ctx, g_comp_sink[_ci], g_comp_recv[_ci], 1, &_ca);
+                            if (!JS_IsException(_cr) && JS_VALUE_GET_TAG(_cr) == JS_TAG_OBJECT) {
+                                JSContext *_cc;
+                                while (JS_ExecutePendingJob(rt, &_cc) > 0) {
 #if defined(__EMSCRIPTEN__) && defined(QJS_HAS_JSPI)
-                            qjs_host_yield();
+                                    qjs_host_yield();
 #endif
+                                }
+                            }
+                            g_grind_drive_active = 0;
+                            if (JS_IsException(_cr)) { JSValue _ce = JS_GetException(ctx); JS_FreeValue(ctx, _ce); }
+                            JS_FreeValue(ctx, _cr);
                         }
                     }
-                    g_grind_drive_active = 0;
-                    if (JS_IsException(_cr)) { JSValue _ce = JS_GetException(ctx); JS_FreeValue(ctx, _ce); }
-                    JS_FreeValue(ctx, _cr);
+                    for (int _pi = 0; _pi < g_comp_pend_n; _pi++) JS_FreeValue(ctx, g_comp_pend[_pi]);
+                    g_comp_pend_n = 0;
+                    g_defer_fired = _sv_df; g_spin_n = _sv_sn; g_noprog_polls = _sv_np; g_progress_seen = _sv_ps;
                 }
-                g_defer_fired = _sv_df; g_spin_n = _sv_sn; g_noprog_polls = _sv_np; g_progress_seen = _sv_ps;
             }
             JS_FreeValue(ctx, r2);
             JS_FreeValue(ctx, this_opq2);
