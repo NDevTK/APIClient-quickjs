@@ -1361,6 +1361,22 @@
       if (typeof v === "function") {
         var fk = keyOf(v); if (ranKeys.has(fk)) continue; ranKeys.add(fk);
         try { v.call(G, OPQ("handler.arg0"), OPQ("handler.arg1"), OPQ("handler.arg2")); } catch (x) {}
+      } else if (v && typeof v === "object") {
+        /* A bundle-introduced global OBJECT is an API namespace, not a handler —
+           modern ESM SPAs expose their surface as `window.__d = {read, create,
+           update, del, me, users, …}` (directus) rather than loose global functions.
+           __hostDrive must reach ONE level into it and invoke each METHOD (this=the
+           namespace, opaque args) or the whole logged-out API surface stays dark
+           (the directus CRUD 6->10 gap: only the methods reached by other paths fire).
+           Deduped via ranKeys + frontier-muted like the function loop; one level only
+           (no recursion) so a deep object graph can't explode the drive. */
+        var mns; try { mns = Object.getOwnPropertyNames(v); } catch (e) { mns = null; }
+        if (mns) for (var mi = 0; mi < mns.length; mi++) {
+          var mv; try { mv = v[mns[mi]]; } catch (e) { continue; }
+          if (typeof mv !== "function") continue;
+          var mfk = keyOf(mv); if (ranKeys.has(mfk)) continue; ranKeys.add(mfk);
+          try { mv.call(v, OPQ("handler.arg0"), OPQ("handler.arg1"), OPQ("handler.arg2")); } catch (x) {}
+        }
       }
     }
     } finally { FEMUTE(0); }
