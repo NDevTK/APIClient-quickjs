@@ -30,6 +30,22 @@ EM_ASYNC_JS(void, qjs_host_yield, (), {
     await Module.qjs_host_yield();
 });
 
+/* qjs_load_module_host: in-run ESM module fetch. js_module_load (quickjs-libc.c)
+   calls this when an `import` target is NOT yet staged in the in-memory map. The
+   wasm stack suspends via JSPI (real stack switching, no depth cap — IDENTICAL
+   mechanism to qjs_host_yield) while the host safeFetches the module + stages its
+   SOURCE in _feMap under the SAME canonical id the loader reads; then the engine
+   resumes and re-reads. This loads a deep ESM import graph (directus
+   index→rest→commands→utils→auth) ON DEMAND in ONE analysis pass — no multi-round
+   re-analysis, no link deadlock, no cap. module_name is a NUL-terminated wasm
+   linear-memory pointer (MEMORY64: arrives as a BigInt i64, Number()-coerced for
+   UTF8ToString). See ast-thread.js Module.qjs_load_module. */
+EM_ASYNC_JS(void, qjs_load_module_host, (const char *module_name), {
+    if (!Module.qjs_load_module) return;
+    var nm = UTF8ToString(Number(module_name));
+    await Module.qjs_load_module(nm);
+});
+
 /* qjs_host_digest: JSPI bridge to the host worker's real WebCrypto
    (Chromium's BoringSSL when the wasm runs in a Chrome extension). Called
    from qjs_dom.c's crypto.subtle.digest binding; the wasm stack suspends
@@ -871,14 +887,21 @@ int main(int argc, char **argv) {
                    the real transport on the heap (captured for the residue drive);
                    __hostFlush drives the chunk onload (resolves the await) and lifecycle
                    handlers; the pending-job drain runs the resumed continuations. Loop
-                   until __hostRan stops growing AND no job drained (quiescence) — the
-                   same finite seen-set fixpoint as driver.js, bounded, never a cap. */
+                   until __hostRan stops growing AND no job drained AND nothing settles
+                   (quiescence) — the same fixpoint as driver.js. UNBOUNDED: quiescence,
+                   not a count, is the stop (the prior _it<64 / _dd<200000 backstops were
+                   caps that truncated distinct driving — removed). */
                 JSValue _gg = JS_GetGlobalObject(g_deep_ctx);
                 JSValue _hd = JS_GetPropertyStr(g_deep_ctx, _gg, "__hostDrive");
                 JSValue _hf = JS_GetPropertyStr(g_deep_ctx, _gg, "__hostFlush");
                 JSValue _hr = JS_GetPropertyStr(g_deep_ctx, _gg, "__hostRan");
                 int _prevRan = -1;
-                for (int _it = 0; _it < 64; _it++) {
+                /* Unbounded: the quiescence check below (no new __hostRan, no job
+                   drained, nothing settling) is the ONLY stop — a count backstop
+                   here would TRUNCATE distinct driving the fixpoint hasn't reached
+                   yet. __hostRan is monotone over the bundle's finite function set,
+                   so quiescence is reached without a count. */
+                for (;;) {
                     if (JS_IsFunction(g_deep_ctx, _hd)) {
                         JSValue _r = JS_Call(g_deep_ctx, _hd, _gg, 0, NULL);
                         if (JS_IsException(_r)) { JSValue _e = JS_GetException(g_deep_ctx); JS_FreeValue(g_deep_ctx, _e); }
@@ -890,7 +913,7 @@ int main(int argc, char **argv) {
                         JS_FreeValue(g_deep_ctx, _r);
                     }
                     JSContext *_c1; int _dd = 0;
-                    while (JS_ExecutePendingJob(g_deep_rt, &_c1) > 0 && _dd < 200000) _dd++;
+                    while (JS_ExecutePendingJob(g_deep_rt, &_c1) > 0) _dd++;   /* drain to empty — a count would strand queued continuations */
                     int _ran = -1;
                     if (JS_IsFunction(g_deep_ctx, _hr)) {
                         JSValue _rv = JS_Call(g_deep_ctx, _hr, _gg, 0, NULL);

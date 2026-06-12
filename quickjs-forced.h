@@ -21,6 +21,11 @@
    in quickjs.c resolve. */
 #if defined(__EMSCRIPTEN__) && defined(QJS_HAS_JSPI)
 void qjs_host_yield(void);
+/* qjs_load_module_host: in-run ESM module fetch (defined in qjsmain.c under
+   EM_ASYNC_JS). js_module_load calls it on a module-map MISS so the host can
+   safeFetch + stage the imported module, then the loader re-reads — on-demand
+   deep ESM graph loading via the SAME JSPI suspend as qjs_host_yield. */
+void qjs_load_module_host(const char *module_name);
 #endif
 
 static void qjs_fe_seen_reset(void);   /* fwd: per-unit loop-revisit seen-set, defined below; qjs_forced_config resets it */

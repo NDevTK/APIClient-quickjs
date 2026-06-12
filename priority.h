@@ -39,24 +39,15 @@
 static inline int qjs_priority_deep_relcmp(const void *a, const void *b, void *o) {
     const qjs_deep_ent *x = (const qjs_deep_ent *)a;
     const qjs_deep_ent *y = (const qjs_deep_ent *)b;
-    /* GOAL #1: API-endpoint (network fetch) orphans first — the deep grind's
-       whole purpose is lazy-chunk fetch recovery (github preheat etc.). */
-    if (x->net != y->net) return y->net - x->net;
-    /* CONCRETE-URL CALLER: transitively reaches a network edge (the fetch is in
-       a callee, so the flat net-bit is 0) AND has a real heap instance, so the
-       drive resolves a CONCRETE URL where an opaque wrapper only gives `GET ?`.
-       Ordered immediately after net so these join the endpoint HEAD instead of
-       sinking behind the entire net=0 tail. (At qsort time instances are not
-       yet known, so this field is 0 there; the live-pick computes it for real.) */
-    if (x->net2 != y->net2) return y->net2 - x->net2;
-    /* QUALITY: a fn whose body RAN (concrete closure/module state) but whose
-       host site was guard-skipped (preheat shape) resolves CONCRETE values;
-       a cold orphan only an opaque shape. */
+    /* No static reachability flag (net/net2/sink REMOVED). "This orphan transitively
+       reaches a network/sink edge" is a prediction only RUNNING its recursion +
+       interprocedural calls can make, and it is network-blind to XSS (DOM/eval sinks
+       aren't network edges) — a flag that can't do its job isn't kept. Order by
+       OBSERVED quality only:
+       QUALITY — a fn whose body RAN (qjs_executed) has concrete closure/module state,
+       so it resolves CONCRETE values where a cold orphan gives only an opaque shape;
+       drive those first. */
     if (x->exec != y->exec) return y->exec - x->exec;
-    /* SECURITY (#10): sink-reaching next — same forced-execution pass as
-       endpoint learning ("one execution, two views" per CLAUDE.md), just
-       ordered after endpoints in the live-pick. */
-    if (x->sink != y->sink) return y->sink - x->sink;
     /* EFFORT: cheaper (smaller) first so more orphans get driven per cycle. */
     if (x->size != y->size) return x->size - y->size;
     /* Stable tiebreak so the sort is deterministic across batches. */
@@ -73,12 +64,11 @@ static inline int qjs_priority_deep_relcmp(const void *a, const void *b, void *o
    caller can do a single linear scan to find the maximum. */
 static inline int qjs_priority_live_orphan_better(JSFunctionBytecode *x,
                                                   JSFunctionBytecode *y) {
-    int xn = qjs_fn_reaches_net(x), yn = qjs_fn_reaches_net(y);
-    if (xn != yn) return xn > yn;
+    /* No static net/sink reachability (removed — only running its calls determines
+       reach, and it is XSS-blind). OBSERVED quality first: a body that RAN has
+       concrete state; then cheaper first. */
     int xe = x->qjs_executed, ye = y->qjs_executed;
     if (xe != ye) return xe > ye;
-    int xs = qjs_fn_reaches_sink(x), ys = qjs_fn_reaches_sink(y);
-    if (xs != ys) return xs > ys;
     if (x->byte_code_len != y->byte_code_len) return x->byte_code_len < y->byte_code_len;
     return 0;   /* equal priority — caller's iteration order (idx) breaks ties */
 }
@@ -93,10 +83,10 @@ static inline int qjs_priority_live_orphan_better(JSFunctionBytecode *x,
    size is a static struct field. Returns 1 if x outranks y. */
 static inline int qjs_priority_live_orphan_better_bits(int xnet, int xnet2, int xexec, int xsink, int xsize,
                                                        int ynet, int ynet2, int yexec, int ysink, int ysize) {
-    if (xnet != ynet) return xnet > ynet;
-    if (xnet2 != ynet2) return xnet2 > ynet2;
+    /* net/net2/sink params retained for ABI but UNUSED — static reachability removed
+       (only running determines reach; it is XSS-blind). Observed: exec first, size next. */
+    (void)xnet; (void)xnet2; (void)xsink; (void)ynet; (void)ynet2; (void)ysink;
     if (xexec != yexec) return xexec > yexec;
-    if (xsink != ysink) return xsink > ysink;
     if (xsize != ysize) return xsize < ysize;
     return 0;
 }

@@ -867,6 +867,14 @@ static int js_module_import_type(JSContext *ctx, JSValueConst attributes)
     return res;
 }
 
+#if defined(__EMSCRIPTEN__) && defined(QJS_HAS_JSPI)
+/* fwd: in-run ESM module fetch (qjsmain.c EM_ASYNC_JS). Suspends the wasm stack
+   so the host can safeFetch + stage a not-yet-loaded import, then the loader
+   below re-reads it. Declared locally (quickjs-libc.c does not pull in
+   quickjs-forced.h, which holds the canonical declaration). */
+void qjs_load_module_host(const char *module_name);
+#endif
+
 JSModuleDef *js_module_load(JSContext *ctx, const char *module_name,
                             void *opaque, JSValueConst attributes,
                             JSLoadFileFunc *load_file)
@@ -884,6 +892,20 @@ JSModuleDef *js_module_load(JSContext *ctx, const char *module_name,
         if (js__has_suffix(module_name, ".json"))
             type = JS_IMPORT_TYPE_JSON;
     buf = (char *)load_file(ctx, &buf_len, module_name);
+#if defined(__EMSCRIPTEN__) && defined(QJS_HAS_JSPI)
+    if (!buf) {
+        /* In-run module fetch: this import target isn't staged yet (a deep ESM
+           import graph — directus index→rest→commands→utils→auth). Suspend via
+           JSPI, let the host safeFetch + stage it in the in-memory map, then
+           re-read. Each newly-compiled module's OWN imports recurse back through
+           here, so the WHOLE graph loads on demand in ONE analysis pass — no
+           multi-round re-analysis, no link deadlock, no cap. A STILL-missing
+           module after the fetch is the only genuine failure (real 404/CORB/
+           non-fetchable id), recorded by the @WHY below. */
+        qjs_load_module_host(module_name);
+        buf = (char *)load_file(ctx, &buf_len, module_name);
+    }
+#endif
     { static long _ml_n = 0; static long _ml_ok = 0; _ml_n++; if (buf) _ml_ok++;
       else { fprintf(stderr, "@WHY {\"phase\":\"modload_fail\",\"n\":%ld,\"okBefore\":%ld,\"path\":\"%s\"}\n", _ml_n, _ml_ok, module_name); fflush(stderr); } }
     if (!buf) {
