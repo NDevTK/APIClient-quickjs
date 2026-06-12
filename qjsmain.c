@@ -630,6 +630,26 @@ static char *qjs_module_normalize(JSContext *ctx, const char *base_name,
     size_t out_len = strlen(out);
     out[out_len++] = '/';
     strcpy(out + out_len, p);
+    /* If the relative walk started from a RAW-URL base (a module whose own name is
+       "https://host/…", not yet "/x/host/…"), the result is a raw URL too. Re-encode it
+       to the canonical "/x/<host><path>" form — the SAME encoding the https:// branch
+       above applies to a direct import — so this module dedups (js_find_loaded_module,
+       by name) with the identical file reached via a /x/ base. Without this, directus's
+       utils/error.js loads under BOTH /x/.../error.js and https://.../error.js → two
+       JSModuleDefs → the duplicate's module function is C-held but NOT in loaded_modules
+       (so JS_MarkContext can't mark it) → an external root at teardown that blocks the
+       gc_obj_list cycle collection → the deep-grind FreeRuntime assert + lost progress. */
+    if (!strncmp(out, "http://", 7) || !strncmp(out, "https://", 8)) {
+        const char *q = out + (out[4] == ':' ? 7 : 8);   /* skip scheme */
+        size_t qlen = strcspn(q, "?#");                   /* host + path, drop query/frag */
+        char *enc = js_malloc(ctx, qlen + 4);
+        if (enc) {
+            enc[0] = '/'; enc[1] = 'x'; enc[2] = '/';
+            memcpy(enc + 3, q, qlen); enc[qlen + 3] = '\0';
+            js_free(ctx, out);
+            return enc;
+        }
+    }
     return out;
 }
 
