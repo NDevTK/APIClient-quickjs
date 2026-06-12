@@ -9307,23 +9307,40 @@ static void gc_scan(JSRuntime *rt)
 
     if (rt->in_free) {
         /* Teardown leak ROOT finder: after gc_decref, gc_obj_list holds ONLY the
-           objects with an EXTERNAL (non-cycle) refcount — the true C-held roots that
-           keep the graph alive. The residue diag reports the reachable graph; THIS
-           names its holder. Silent on a clean teardown (no roots → empty list). */
+           objects with an EXTERNAL (non-cycle) refcount — the true roots that keep the
+           graph alive (the residue is what's reachable FROM them). printf→stdout so the
+           worker reliably captures it; ALWAYS emit the count so an empty list (clean
+           teardown) is distinguishable from a non-firing probe. */
         int _nroot = 0;
         for (el = rt->gc_obj_list.next; el != &rt->gc_obj_list; el = el->next) _nroot++;
-        if (_nroot) {
-            int _shown = 0;
-            for (el = rt->gc_obj_list.next; el != &rt->gc_obj_list && _shown < 16; el = el->next) {
-                JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
-                int _cls = -1;
-                if (gp->gc_obj_type == JS_GC_OBJ_TYPE_JS_OBJECT) _cls = ((JSObject *)gp)->class_id;
-                fprintf(stderr, "@WHY {\"phase\":\"gc_root\",\"n\":%d,\"type\":%d,\"class\":%d,\"rc\":%d}\n",
-                        _nroot, gp->gc_obj_type, _cls, gp->ref_count);
-                _shown++;
+        fprintf(stderr, "@WHY {\"phase\":\"gc_scan_roots\",\"n\":%d}\n", _nroot);
+        int _shown = 0;
+        for (el = rt->gc_obj_list.next; el != &rt->gc_obj_list && _shown < 20; el = el->next) {
+            JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
+            int _cls = -1;
+            if (gp->gc_obj_type == JS_GC_OBJ_TYPE_JS_OBJECT) {
+                JSObject *_o = (JSObject *)gp;
+                _cls = _o->class_id;
+                /* A closure root: name the function (file:line + name) so the C ref
+                   holding it is identifiable. Gated on a func class so u.func is valid. */
+                if ((_cls == JS_CLASS_BYTECODE_FUNCTION || _cls == JS_CLASS_GENERATOR_FUNCTION ||
+                     _cls == JS_CLASS_ASYNC_FUNCTION || _cls == JS_CLASS_ASYNC_GENERATOR_FUNCTION) &&
+                    _o->u.func.function_bytecode) {
+                    JSFunctionBytecode *_fb = _o->u.func.function_bytecode;
+                    char _ff[160], _fnm[80];
+                    JS_AtomGetStrRT(rt, _ff, sizeof _ff, _fb->filename);
+                    JS_AtomGetStrRT(rt, _fnm, sizeof _fnm, _fb->func_name);
+                    fprintf(stderr, "@WHY {\"phase\":\"gc_root_fn\",\"file\":\"%s\",\"line\":%d,\"name\":\"%s\",\"rc\":%d}\n",
+                            _ff, _fb->line_num, _fnm, gp->ref_count);
+                    _shown++;
+                    continue;
+                }
             }
-            fflush(stderr);
+            fprintf(stderr, "@WHY {\"phase\":\"gc_root\",\"type\":%d,\"class\":%d,\"rc\":%d}\n",
+                    gp->gc_obj_type, _cls, gp->ref_count);
+            _shown++;
         }
+        fflush(stderr);
     }
 
     /* keep the objects with a refcount > 0 and their children. */
