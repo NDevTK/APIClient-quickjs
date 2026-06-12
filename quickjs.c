@@ -440,6 +440,18 @@ static JSValue qjs_fe_named_arg(JSContext *ctx, struct JSFunctionBytecode *b, in
    chunk) is driven with its REAL closure when its factory orphan is driven. */
 static struct JSFunctionBytecode **qjs_deep_rb;
 static void qjs_deep_capture_inst(JSContext *ctx, struct JSFunctionBytecode *b, JSValue func_obj);
+/* Cold-composition data-flow (descriptor SDKs, e.g. directus). `client.request(cmd())`
+   is a nested call: the SINK G's arg IS the producer F's just-returned descriptor.
+   When JS_CallInternal sees a call whose arg === the immediately-preceding call's
+   return, G is a descriptor sink — capture (G, its receiver). The deep grind then
+   feeds the OTHER ~90 unused-command descriptors through G, learning their endpoints.
+   Excludes meili (search('batman') takes a literal, never a producer's return).
+   g_comp_last_ret_ptr is IDENTITY only (never deref'd, may dangle harmlessly);
+   the sink/recv arrays hold DupValue refs, freed in JS_FreeRuntime. */
+static void *g_comp_last_ret_ptr = NULL;
+static JSValue *g_comp_sink = NULL, *g_comp_recv = NULL;
+static int g_comp_n = 0, g_comp_cap = 0;
+static void qjs_comp_capture(JSContext *ctx, JSValueConst func, JSValueConst this_val);
 /* flavor + taint-source label + symbolic term propagate through
    derivation so a value reaching a sink names which attacker input it
    came from and how. qjs_like is pass-through (member-get / generic
@@ -4499,6 +4511,13 @@ void JS_FreeRuntime(JSRuntime *rt)
     int i;
 
     rt->in_free = true;
+    /* Cold-composition: release captured descriptor-sink refs before the GC walks the
+       object list (they held DupValue refs into THIS runtime); reset for the next
+       instance. g_comp_last_ret_ptr is identity-only — just cleared. */
+    for (i = 0; i < g_comp_n; i++) { JS_FreeValueRT(rt, g_comp_sink[i]); JS_FreeValueRT(rt, g_comp_recv[i]); }
+    if (g_comp_sink) { js_free_rt(rt, g_comp_sink); g_comp_sink = NULL; }
+    if (g_comp_recv) { js_free_rt(rt, g_comp_recv); g_comp_recv = NULL; }
+    g_comp_n = 0; g_comp_cap = 0; g_comp_last_ret_ptr = NULL;
     JS_FreeValueRT(rt, rt->current_exception);
 
     list_for_each_safe(el, el1, &rt->job_list) {
@@ -20275,6 +20294,27 @@ static bool needs_backtrace(JSValue exc)
     return !find_own_property1(p, JS_ATOM_stack);
 }
 
+/* Capture a descriptor sink (see g_comp_last_ret_ptr): dedup by bytecode, hold
+   DupValue refs (freed in JS_FreeRuntime). */
+static void qjs_comp_capture(JSContext *ctx, JSValueConst func, JSValueConst this_val) {
+    JSFunctionBytecode *fb = JS_GetFunctionBytecode(func);
+    if (!fb) return;
+    for (int i = 0; i < g_comp_n; i++) if (JS_GetFunctionBytecode(g_comp_sink[i]) == fb) return;
+    if (g_comp_n == g_comp_cap) {
+        int ng = g_comp_cap ? g_comp_cap * 2 : 8;
+        JSValue *ns = js_realloc(ctx, g_comp_sink, (size_t)ng * sizeof(JSValue));
+        if (!ns) return;
+        g_comp_sink = ns;
+        JSValue *nr = js_realloc(ctx, g_comp_recv, (size_t)ng * sizeof(JSValue));
+        if (!nr) return;
+        g_comp_recv = nr;
+        g_comp_cap = ng;
+    }
+    g_comp_sink[g_comp_n] = JS_DupValue(ctx, func);
+    g_comp_recv[g_comp_n] = JS_DupValue(ctx, this_val);
+    g_comp_n++;
+}
+
 /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
 static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                JSValueConst this_obj, JSValueConst new_target,
@@ -20318,6 +20358,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
     if (js_poll_interrupts(caller_ctx))
         return JS_EXCEPTION;
+    /* Cold-composition data-flow: this call's arg === the immediately-preceding call's
+       return ⇒ func_obj is a descriptor SINK (the page's own client.request(cmd())).
+       Capture (sink, receiver) so the deep grind feeds the OTHER unused commands'
+       descriptors through it. Gated on an active grind (qjs_deep_rb) → inert outside
+       analysis; identity match only (g_comp_last_ret_ptr is never deref'd). */
+    if (g_comp_last_ret_ptr && qjs_deep_rb && argc > 0) {
+        for (i = 0; i < argc; i++) {
+            if (JS_VALUE_GET_TAG(argv[i]) == JS_TAG_OBJECT && JS_VALUE_GET_OBJ(argv[i]) == g_comp_last_ret_ptr) {
+                qjs_comp_capture(caller_ctx, func_obj, this_obj);
+                break;
+            }
+        }
+    }
     if (unlikely(JS_VALUE_GET_TAG(func_obj) != JS_TAG_OBJECT)) {
         if (flags & JS_CALL_FLAG_GENERATOR) {
             JSAsyncFunctionState *s = JS_VALUE_GET_PTR(func_obj);
@@ -24141,6 +24194,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         }
     }
     rt->current_stack_frame = sf->prev_frame;
+    /* Cold-composition: remember this call's return-object as the candidate
+       producer output for the NEXT call's entry CHECK (identity only, never
+       deref'd; gated on a grind). client.request(readItems()) — readItems
+       exits here setting this; request's entry CHECK then matches its arg. */
+    if (qjs_deep_rb)
+        g_comp_last_ret_ptr = (JS_VALUE_GET_TAG(ret_val) == JS_TAG_OBJECT) ? JS_VALUE_GET_OBJ(ret_val) : NULL;
     return ret_val;
 }
 
@@ -62275,6 +62334,37 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
                     }
                 }
                 JS_FreeValue(ctx, e2);
+            }
+            /* Cold-composition: feed this command's descriptor r2 through each captured
+               descriptor sink (client.request) so the UNUSED directus commands fetch +
+               record. Self-gated: a non-descriptor r2 makes the sink throw → no endpoint.
+               The orphan's spin-defer state is saved/restored so a composition fetch's
+               own spin can't perturb the orphan's defer decision below. */
+            if (g_comp_n > 0 && !_was_exc2 && !b->qjs_h_fired && JS_VALUE_GET_TAG(r2) == JS_TAG_OBJECT && !qjs_is_opaque(r2)) {
+                /* !qjs_h_fired: this orphan returned a value WITHOUT fetching — a descriptor
+                   PRODUCER (directus readFiles→{path}), not a method that already IS an
+                   endpoint (meili search fetches → qjs_h_fired=1, excluded). The run-fact
+                   that targets the composition at descriptor SDKs without a shape heuristic. */
+                int _sv_df = g_defer_fired, _sv_sn = g_spin_n, _sv_np = g_noprog_polls, _sv_ps = g_progress_seen;
+                for (int _ci = 0; _ci < g_comp_n; _ci++) {
+                    JSFunctionBytecode *_sfb = JS_GetFunctionBytecode(g_comp_sink[_ci]);
+                    if (!_sfb || !_sfb->qjs_h_fired) continue;   /* drive ONLY a sink that ACTUALLY fetches (a real endpoint sink, e.g. directus request); a spuriously-captured non-fetching chain link (meili index()/getTask) is skipped — no shared-state churn */
+                    JSValueConst _ca = r2;
+                    g_grind_drive_active = 1;
+                    JSValue _cr = JS_Call(ctx, g_comp_sink[_ci], g_comp_recv[_ci], 1, &_ca);
+                    if (!JS_IsException(_cr) && JS_VALUE_GET_TAG(_cr) == JS_TAG_OBJECT) {
+                        JSContext *_cc;
+                        while (JS_ExecutePendingJob(rt, &_cc) > 0) {
+#if defined(__EMSCRIPTEN__) && defined(QJS_HAS_JSPI)
+                            qjs_host_yield();
+#endif
+                        }
+                    }
+                    g_grind_drive_active = 0;
+                    if (JS_IsException(_cr)) { JSValue _ce = JS_GetException(ctx); JS_FreeValue(ctx, _ce); }
+                    JS_FreeValue(ctx, _cr);
+                }
+                g_defer_fired = _sv_df; g_spin_n = _sv_sn; g_noprog_polls = _sv_np; g_progress_seen = _sv_ps;
             }
             JS_FreeValue(ctx, r2);
             JS_FreeValue(ctx, this_opq2);
