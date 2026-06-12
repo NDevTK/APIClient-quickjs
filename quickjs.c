@@ -9296,6 +9296,27 @@ static void gc_scan(JSRuntime *rt)
     struct list_head *el;
     JSGCObjectHeader *p;
 
+    if (rt->in_free) {
+        /* Teardown leak ROOT finder: after gc_decref, gc_obj_list holds ONLY the
+           objects with an EXTERNAL (non-cycle) refcount — the true C-held roots that
+           keep the graph alive. The residue diag reports the reachable graph; THIS
+           names its holder. Silent on a clean teardown (no roots → empty list). */
+        int _nroot = 0;
+        for (el = rt->gc_obj_list.next; el != &rt->gc_obj_list; el = el->next) _nroot++;
+        if (_nroot) {
+            int _shown = 0;
+            for (el = rt->gc_obj_list.next; el != &rt->gc_obj_list && _shown < 16; el = el->next) {
+                JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
+                int _cls = -1;
+                if (gp->gc_obj_type == JS_GC_OBJ_TYPE_JS_OBJECT) _cls = ((JSObject *)gp)->class_id;
+                fprintf(stderr, "@WHY {\"phase\":\"gc_root\",\"n\":%d,\"type\":%d,\"class\":%d,\"rc\":%d}\n",
+                        _nroot, gp->gc_obj_type, _cls, gp->ref_count);
+                _shown++;
+            }
+            fflush(stderr);
+        }
+    }
+
     /* keep the objects with a refcount > 0 and their children. */
     list_for_each(el, &rt->gc_obj_list) {
         p = list_entry(el, JSGCObjectHeader, link);
