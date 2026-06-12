@@ -62443,8 +62443,15 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
            rule. async flag distinguishes the await-continuation case. */
         if (!b->qjs_h_fired) {
             if (_drv_threw) qjs_dnf_threw++; else qjs_dnf_ret++;
-            printf("@WHY {\"phase\":\"driven_no_fire\",\"fn\":\"%llx\",\"threw\":%d,\"async\":%d}\n",
-                    (unsigned long long)_id, _drv_threw, (b->func_kind & JS_FUNC_ASYNC) ? 1 : 0);
+            /* file:line:name pinpoints WHICH unreached function drove-but-didn't-fire —
+               the driving-gap locator (e.g. directus window.__d.update/del/me/users:
+               async, returned, no fetch reached). JS_AtomGetStr is rt-safe here. */
+            char _dnf_f[140], _dnf_n[64];
+            JS_AtomGetStr(ctx, _dnf_f, sizeof _dnf_f, b->filename);
+            JS_AtomGetStr(ctx, _dnf_n, sizeof _dnf_n, b->func_name);
+            printf("@WHY {\"phase\":\"driven_no_fire\",\"fn\":\"%llx\",\"threw\":%d,\"async\":%d,\"file\":\"%s\",\"line\":%d,\"name\":\"%s\"}\n",
+                    (unsigned long long)_id, _drv_threw, (b->func_kind & JS_FUNC_ASYNC) ? 1 : 0,
+                    _dnf_f, b->line_num, _dnf_n);
             fflush(stdout);
         }
         /* Drop this orphan's leftover continuation jobs (post-fetch .then
