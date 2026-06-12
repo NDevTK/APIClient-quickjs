@@ -28,7 +28,14 @@ static void qjs_fe_seen_reset(void);   /* fwd: per-unit loop-revisit seen-set, d
 static int    qjs_fe_init = 0, qjs_fe_enabled = 0;
 static const char *qjs_fe_sched = "";
 static size_t qjs_fe_len = 0, qjs_fe_cur = 0;
-static FILE  *qjs_fe_trace = NULL;
+/* Trace is an in-memory append buffer (Module.__feTrace[path]) — NOT a FILE*. The
+   B/F lines the forced controller emits go through fe_trace_append (qjsmain.c EM_JS);
+   the worker reads them back from the buffer. qjs_fe_trace holds the active trace
+   PATH ("" → muted/off) into a stable static buffer so the argv pointer can't dangle. */
+extern void fe_trace_clear(const char *path);
+extern void fe_trace_append(const char *path, const char *line);
+static char   qjs_fe_trbuf[260];
+static const char *qjs_fe_trace = NULL;
 
 /* Per-orphan LOCAL branch-enumeration capture (qjs_drive_orphan_enum, quickjs.c).
    When qjs_fe_lcap is set, qjs_forced_decide_k_p records per cursor: decision +
@@ -60,14 +67,18 @@ void qjs_forced_config(int en, const char *sch, const char *tr) {
         qjs_fe_sched = qjs_fe_sbuf; qjs_fe_len = n;
     }
     qjs_fe_cur = 0;                          /* schedule cursor restarts each run (stale across callMain otherwise) */
-    if (qjs_fe_trace && qjs_fe_trace != stderr) fclose(qjs_fe_trace);   /* don't leak the prior run's trace handle */
-    /* "w" (not "a") so each forced run TRUNCATES the trace file at
-       open. drive.mjs reuses one fixed path across all forced runs;
-       this lets it read the fresh trace per iteration without
-       accumulating prior runs' lines, and avoids generating a unique
-       file per schedule (the old "per-run unique path to dodge EPERM
-       on rmSync" pattern was producing hundreds of trace files). */
-    qjs_fe_trace = (tr && tr[0]) ? fopen(tr, "w") : stderr;
+    /* "w" semantics: each forced run TRUNCATES the trace at open. The worker reuses
+       one fixed path (/t.tr, /boot.tr) across all forced runs, so clearing the buffer
+       here lets it read the fresh trace per iteration without accumulating prior runs'
+       lines (no per-schedule unique path, no leaked FILE* handle). */
+    if (tr && tr[0]) {
+        size_t tn = strlen(tr); if (tn >= sizeof(qjs_fe_trbuf)) tn = sizeof(qjs_fe_trbuf) - 1;
+        memcpy(qjs_fe_trbuf, tr, tn); qjs_fe_trbuf[tn] = 0;
+        qjs_fe_trace = qjs_fe_trbuf;
+        fe_trace_clear(qjs_fe_trace);
+    } else {
+        qjs_fe_trace = NULL;
+    }
     qjs_fe_init = 1;
     qjs_pc_reset();                          /* fresh Φ per forced run */
     qjs_fe_seen_reset();                     /* fresh loop-revisit seen-set per forced run */
@@ -78,8 +89,14 @@ static void qjs_fe_setup(void) {
     qjs_fe_enabled = (e && e[0] == '1');
     const char *s = getenv("FORCED_SCHEDULE");
     if (s) { qjs_fe_sched = s; qjs_fe_len = strlen(s); }
-    const char *t = getenv("FORCED_TRACE");
-    qjs_fe_trace = (t && t[0]) ? fopen(t, "a") : stderr;
+    const char *t = getenv("FORCED_TRACE");   /* dev fallback; the worker always uses qjs_forced_config */
+    if (t && t[0]) {
+        size_t tn = strlen(t); if (tn >= sizeof(qjs_fe_trbuf)) tn = sizeof(qjs_fe_trbuf) - 1;
+        memcpy(qjs_fe_trbuf, t, tn); qjs_fe_trbuf[tn] = 0;
+        qjs_fe_trace = qjs_fe_trbuf;           /* "a" append: do NOT clear */
+    } else {
+        qjs_fe_trace = NULL;
+    }
     qjs_fe_init = 1;
 }
 /* When muted, forced decisions still happen (default path) but NO
@@ -259,10 +276,10 @@ static int qjs_forced_decide_k_p(int orig, unsigned long long key, qjs_term *pt,
                    — priority within a function, not FIFO over its branches.
                    ORDER only; every frontier still enqueues (coverage
                    unchanged). */
-                fprintf(qjs_fe_trace, "F %zu %llu %d\n", qjs_fe_cur, key, frontier_sig);
+            { char _tl[80]; snprintf(_tl, sizeof(_tl), "F %zu %llu %d\n", qjs_fe_cur, key, frontier_sig); fe_trace_append(qjs_fe_trace, _tl); }
         }
     }
-    if (qjs_fe_trace) { fprintf(qjs_fe_trace, "B %zu %d %llu\n", qjs_fe_cur, d, key); fflush(qjs_fe_trace); }
+    if (qjs_fe_trace) { char _tl[80]; snprintf(_tl, sizeof(_tl), "B %zu %d %llu\n", qjs_fe_cur, d, key); fe_trace_append(qjs_fe_trace, _tl); }
     if (qjs_fe_lcap) {
         size_t pos = qjs_fe_cur;
         if (pos < qjs_fe_lcap_cap) {

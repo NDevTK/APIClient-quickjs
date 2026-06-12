@@ -61392,11 +61392,18 @@ static void qjs_dd_add(JSContext *ctx, uint64_t id) {
     qjs_dd[qjs_dd_n++] = id;
 }
 static void qjs_dd_free(JSContext *ctx) { if (qjs_dd) js_free(ctx, qjs_dd); qjs_dd = NULL; qjs_dd_n = qjs_dd_cap = 0; if (qjs_deep_ids) js_free(ctx, qjs_deep_ids); qjs_deep_ids = NULL; }
-static void qjs_dd_load(JSContext *ctx) {   /* /driven = newline-separated hex ids the worker persisted */
-    FILE *f = fopen("/driven", "r"); if (!f) return;
-    char ln[64];
-    while (fgets(ln, sizeof ln, f)) { uint64_t id = strtoull(ln, NULL, 16); if (id) qjs_dd_add(ctx, id); }
-    fclose(f);
+static void qjs_dd_load(JSContext *ctx) {   /* /driven = newline-separated hex ids the worker persisted (in-memory map, no fopen) */
+    extern long fe_map_len(const char *path);
+    extern void fe_map_copy(const char *path, char *out);
+    long n = fe_map_len("/driven"); if (n <= 0) return;
+    char *buf = js_malloc(ctx, (size_t)n + 1); if (!buf) return;
+    fe_map_copy("/driven", buf); buf[n] = 0;
+    for (char *p = buf; p && *p; ) {
+        char *nl = strchr(p, '\n'); if (nl) *nl = 0;
+        uint64_t id = strtoull(p, NULL, 16); if (id) qjs_dd_add(ctx, id);
+        p = nl ? nl + 1 : NULL;
+    }
+    js_free(ctx, buf);
 }
 /* Usefulness ordering for the deep residue — drive the MOST USEFUL unused
    functions first. Lexicographic tiers, no magic weights. Relevance (page
@@ -62679,7 +62686,7 @@ static void qjs_drive_opaque_call_cbs(JSContext *ctx, JSValueConst *call_argv, i
            cb's own branch/Φ exploration is the deep grind's job (cb is
            residue), so suppressing it here loses no coverage. */
         size_t save_cur = qjs_fe_cur;
-        FILE *save_trace = qjs_fe_trace;
+        const char *save_trace = qjs_fe_trace;   /* trace is now a path sentinel, not a FILE* */
         int save_phi = qjs_fe_phi_mute, save_mute = qjs_fe_mute;
         qjs_fe_trace = NULL; qjs_fe_phi_mute = 1; qjs_fe_mute = 1;
         JSValue r = JS_Call(ctx, a, this_opq, nargs, args2);

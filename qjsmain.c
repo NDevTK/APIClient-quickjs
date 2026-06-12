@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <limits.h>
 #include "quickjs.h"
@@ -258,13 +259,64 @@ static JSValue js_host_microtask_drain(JSContext *ctx, JSValueConst this_val,
     return JS_NewInt32(ctx, n);
 }
 
+/* In-memory file bridge — replaces the worker's legacy inst.FS.* JS API, which WASMFS
+   does NOT expose (no FORCE_FILESYSTEM, the legacy-compat layer we don't want). The
+   worker stages a file's bytes in a JS-side Map (Module.__feMap: path → Uint8Array)
+   passed INTO createQJS; the engine reads them STRAIGHT from that Map (readfile,
+   js_load_file, qjs_dd_load, the .bc loader) and writes outputs (.bc via fe_map_set,
+   the execution trace via fe_trace_append) back to JS — no fopen, no filesystem round-
+   trip for JS-originated data. The 64-bit buffer pointers arrive as BigInt under
+   MEMORY64, so the shims Number()-coerce them and BigInt()-coerce the i64 length
+   return; genuine C POSIX I/O (std.open) still routes through WASMFS unchanged. */
+EM_JS(long, fe_map_len, (const char *path), {
+    var p = UTF8ToString(Number(path));
+    var m = Module.__feMap;
+    /* Reusable wiring diagnostic — SILENT on success, fires once per instance only when
+       the in-memory map is missing/empty (the __feMap-not-merged-onto-Module failure that
+       would dark every source read). Names the first requested path for context. */
+    if (!Module.__feLogged && (!m || m.size === 0)) { Module.__feLogged = 1;
+        err("@WHY {\"phase\":\"feMap\",\"hasMap\":" + (!!m) + ",\"size\":" + (m ? m.size : -1) + ",\"first\":" + JSON.stringify(p) + "}"); }
+    if (!m) return -1n;
+    var d = m.get(p); return (d === undefined) ? -1n : BigInt(d.length);
+});
+EM_JS(void, fe_map_copy, (const char *path, char *out), {
+    var d = Module.__feMap.get(UTF8ToString(Number(path))); if (d) HEAPU8.set(d, Number(out));
+});
+EM_JS(void, fe_map_set, (const char *path, const char *data, long len), {
+    if (!Module.__feMap) Module.__feMap = new Map();
+    Module.__feMap.set(UTF8ToString(Number(path)), HEAPU8.slice(Number(data), Number(data) + Number(len)));
+});
+/* In-memory execution-trace sink (replaces the streaming `fopen` FILE* the forced
+   controller used to fwrite B/F lines to). The engine appends each trace line here;
+   the worker reads Module.__feTrace[path].join("") and never touches a filesystem.
+   Keyed by path so /boot.tr and /t.tr stay separate. __feTrace is passed INTO
+   createQJS (worker) so the EM_JS Module ref and the worker handle are one object. */
+EM_JS(void, fe_trace_clear, (const char *path), {
+    if (Module.__feTrace) delete Module.__feTrace[UTF8ToString(Number(path))];
+});
+EM_JS(void, fe_trace_append, (const char *path, const char *line), {
+    if (!Module.__feTrace) Module.__feTrace = {};
+    var p = UTF8ToString(Number(path));
+    (Module.__feTrace[p] || (Module.__feTrace[p] = [])).push(UTF8ToString(Number(line)));
+});
+/* Read a slice STRAIGHT from the in-memory map into a malloc'd, NUL-terminated buffer
+   — no fopen, no filesystem. The sources originate in JS (the worker's inMem), so
+   reading them directly is the right path; fopen would only round-trip JS bytes
+   through a backend. Non-static so the libc module loader (quickjs-libc.c) shares it.
+   Returns NULL when the path isn't staged in Module.__feMap. */
+char *fe_mem_read(const char *path, size_t *n) {
+    long len = fe_map_len(path);
+    if (len < 0) return NULL;
+    char *b = (char *)malloc((size_t)len + 1);
+    if (!b) return NULL;
+    if (len > 0) fe_map_copy(path, b);
+    b[len] = 0;
+    if (n) *n = (size_t)len;
+    return b;
+}
+
 static char *readfile(const char *p, size_t *n) {
-    FILE *f = fopen(p, "rb");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END); long s = ftell(f); fseek(f, 0, SEEK_SET);
-    char *b = malloc(s + 1);
-    if (fread(b, 1, s, f) != (size_t)s) { fclose(f); free(b); return NULL; }
-    b[s] = 0; if (n) *n = (size_t)s; fclose(f); return b;
+    return fe_mem_read(p, n);
 }
 
 /* Spec-correct module dispatch (HTML §4.12.1): a <script> is a CLASSIC script
@@ -1082,8 +1134,7 @@ int main(int argc, char **argv) {
             size_t bn = 0; uint8_t *bc = JS_WriteObject(ctx, &bn, fn, JS_WRITE_OBJ_BYTECODE);
             JS_FreeValue(ctx, fn);
             if (!bc) { fprintf(stderr, "emit-bc: write failed\n"); rc = 1; break; }
-            FILE *bf = fopen(argv[i + 2], "wb");
-            if (bf) { fwrite(bc, 1, bn, bf); fclose(bf); } else { fprintf(stderr, "emit-bc: cannot write %s\n", argv[i + 2]); rc = 1; }
+            fe_map_set(argv[i + 2], (const char *)bc, (long)bn);   /* compiled .bc → in-memory map (worker reads it back); no fopen */
             js_free(ctx, bc);
             break;   /* compile-only: done */
         }

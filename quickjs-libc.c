@@ -451,40 +451,25 @@ fail:
 #pragma GCC diagnostic pop // ignored "-Wformat-nonliteral"
 #endif // __GNUC__ || __clang__
 
+/* In-memory module loader: read the slice STRAIGHT from the JS-side map (the worker's
+   inMem, staged in Module.__feMap) via the EM_JS shims defined in qjsmain.c — no fopen,
+   no WASMFS file. The buffer is ctx-allocated (js_malloc) so the module-load caller's
+   js_free(ctx, buf) matches; NULL when the path isn't staged. */
+extern long fe_map_len(const char *path);
+extern void fe_map_copy(const char *path, char *out);
 uint8_t *js_load_file(JSContext *ctx, size_t *pbuf_len, const char *filename)
 {
-    FILE *f;
-    size_t n, len;
-    uint8_t *p, *buf, tmp[8192];
-
-    f = fopen(filename, "rb");
-    if (!f)
+    long n = fe_map_len(filename);
+    if (n < 0)
         return NULL;
-    buf = NULL;
-    len = 0;
-    do {
-        n = fread(tmp, 1, sizeof(tmp), f);
-        if (ctx) {
-            p = js_realloc(ctx, buf, len + n + 1);
-        } else {
-            p = realloc(buf, len + n + 1);
-        }
-        if (!p) {
-            if (ctx) {
-                js_free(ctx, buf);
-            } else {
-                free(buf);
-            }
-            fclose(f);
-            return NULL;
-        }
-        memcpy(&p[len], tmp, n);
-        buf = p;
-        len += n;
-        buf[len] = '\0';
-    } while (n == sizeof(tmp));
-    fclose(f);
-    *pbuf_len = len;
+    uint8_t *buf = ctx ? js_malloc(ctx, (size_t)n + 1) : malloc((size_t)n + 1);
+    if (!buf)
+        return NULL;
+    if (n > 0)
+        fe_map_copy(filename, (char *)buf);
+    buf[n] = '\0';
+    if (pbuf_len)
+        *pbuf_len = (size_t)n;
     return buf;
 }
 
@@ -896,6 +881,8 @@ JSModuleDef *js_module_load(JSContext *ctx, const char *module_name,
         if (js__has_suffix(module_name, ".json"))
             type = JS_IMPORT_TYPE_JSON;
     buf = (char *)load_file(ctx, &buf_len, module_name);
+    { static long _ml_n = 0; static long _ml_ok = 0; _ml_n++; if (buf) _ml_ok++;
+      else { fprintf(stderr, "@WHY {\"phase\":\"modload_fail\",\"n\":%ld,\"okBefore\":%ld,\"path\":\"%s\"}\n", _ml_n, _ml_ok, module_name); fflush(stderr); } }
     if (!buf) {
         JS_ThrowReferenceError(ctx, "could not load module filename '%s'",
                                module_name);
