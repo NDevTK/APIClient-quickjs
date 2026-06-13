@@ -2458,6 +2458,18 @@ typedef struct JSStackFrame {
     /* only used in generators. Current stack pointer value. NULL if
        the function is running. */
     JSValue *cur_sp;
+    /* Trampolined interpreter (step 3): per-frame state so OP_return can free
+       this frame's locals, pop its heap JS-stack segment, and splice the result
+       into the caller WITHOUT C-recursion. Populated at NORMAL-frame setup; the
+       generator/async RESUME path (sf = &s->frame) leaves them unused, and the
+       pop stays guarded on the C-local _arena_chunk (correctly NULL there).
+       qjs_call_* are stamped by the caller at OP_call for the in-progress call. */
+    JSValue *qjs_local_buf;                 /* free-loop start (the arena block's locals) */
+    struct JSStackChunk *qjs_arena_chunk;   /* this frame's heap-stack segment, for the pop */
+    uint8_t *qjs_arena_save;                /* bump pointer to restore on pop */
+    int qjs_call_argc;                      /* args the caller pushed for the in-progress call */
+    uint8_t qjs_call_extra;                 /* 1 = OP_call (func), 2 = OP_call_method (this+func) */
+    uint8_t qjs_is_tail;                    /* the in-progress call was a tail call */
 } JSStackFrame;
 
 typedef enum {
@@ -20583,6 +20595,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             return JS_ThrowOutOfMemory(caller_ctx);
         sf = (JSStackFrame *)_blk;
         local_buf = (JSValue *)(_blk + _fsz);
+        sf->qjs_local_buf = local_buf;        /* free-loop start, for OP_return (step 3b) */
+        sf->qjs_arena_chunk = _arena_chunk;   /* this frame's segment, for the per-frame pop */
+        sf->qjs_arena_save = _arena_save;
+        sf->qjs_call_argc = 0;                /* set by the caller at OP_call (step 3b) */
+        sf->qjs_call_extra = 0;
+        sf->qjs_is_tail = 0;
     }
 
     sf->is_strict_mode = b->is_strict_mode;
@@ -24272,8 +24290,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             /* variable references reference the stack: must close them */
             close_var_refs(rt, sf);
         }
-        /* free the local variables and stack */
-        for(pval = local_buf; pval < sp; pval++) {
+        /* free the local variables and stack (sf->qjs_local_buf == local_buf;
+           reading the field here exercises it so step 3b can rely on it for the
+           cross-frame case where the C-local local_buf is the wrong frame's). */
+        for(pval = sf->qjs_local_buf; pval < sp; pval++) {
             JS_FreeValue(ctx, *pval);
         }
     }
