@@ -2346,6 +2346,11 @@ struct JSRuntime {
     bool in_free;
 
     struct JSStackFrame *current_stack_frame;
+    /* Heap JS call-stack (segmented). Each interpreter frame's locals live in
+       these chunks instead of a C-stack alloca — foundation for the trampolined
+       interpreter (overflow-proof recursion + snapshot-able path state). NULL
+       until the first call; segments chained via ->prev, freed LIFO. */
+    struct JSStackChunk *js_stack;
 
     JSInterruptHandler *interrupt_handler;
     void *interrupt_opaque;
@@ -4145,6 +4150,62 @@ static inline bool js_check_stack_overflow(JSRuntime *rt, size_t alloca_size)
     return unlikely(sp < rt->stack_limit);
 }
 
+/* ---- Heap JS call-stack (segmented) -------------------------------------
+   A page's UNMODIFIED bundle is driven under forced multi-path execution with
+   unbounded recursion + interprocedural calls. Each call frame's locals
+   (args + vars + value-stack) were alloca'd on the C stack; they are moved HERE
+   so a deep path's state lives on the heap. This is step 1 of the trampolined
+   interpreter — the prerequisite for (1) overflow-proof recursion (the C stack
+   stops growing per JS frame's value storage) and (2) snapshot-forking a paused
+   forced-execution state instead of re-boot+replay. SEGMENTED and never
+   realloc'd, so a caller's raw pointers into a lower segment stay valid while a
+   deeper frame allocates a new one. Strict LIFO: push on frame setup, pop on
+   teardown (same reach as the per-frame local-free loop). */
+#define JS_STACK_SEG_BYTES (1u << 20)   /* 1 MiB segments; an oversized frame gets its own */
+typedef struct JSStackChunk {
+    struct JSStackChunk *prev;   /* the caller's segment (the one below this) */
+    uint8_t *top;                /* bump pointer within data[] */
+    uint8_t *limit;              /* data + capacity */
+    uint8_t data[];
+} JSStackChunk;
+
+static void *js_stack_push(JSRuntime *rt, size_t sz,
+                           JSStackChunk **save_chunk, uint8_t **save_top)
+{
+    JSStackChunk *c = rt->js_stack;
+    void *p;
+    sz = (sz + 15) & ~(size_t)15;   /* keep JSValue alignment */
+    if (!c || (size_t)(c->limit - c->top) < sz) {
+        size_t cap = sz > JS_STACK_SEG_BYTES ? sz : JS_STACK_SEG_BYTES;
+        JSStackChunk *nc = js_malloc_rt(rt, sizeof(JSStackChunk) + cap);
+        if (!nc) return NULL;       /* nothing pushed; caller throws OOM */
+        nc->prev = c;
+        nc->top = nc->data;
+        nc->limit = nc->data + cap;
+        rt->js_stack = nc;
+        c = nc;
+    }
+    *save_chunk = c;                /* the segment this frame lives in */
+    *save_top = c->top;             /* restore point for the pop */
+    p = c->top;
+    c->top += sz;
+    return p;
+}
+
+/* LIFO pop: free any segments above the saved one (a deeper frame may have
+   spilled into new segments already popped back to here), then restore. */
+static void js_stack_pop(JSRuntime *rt, JSStackChunk *save_chunk, uint8_t *save_top)
+{
+    JSStackChunk *c = rt->js_stack;
+    while (c != save_chunk) {
+        JSStackChunk *prev = c->prev;
+        js_free_rt(rt, c);
+        c = prev;
+    }
+    rt->js_stack = save_chunk;
+    save_chunk->top = save_top;
+}
+
 JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
 {
     JSRuntime *rt;
@@ -4520,6 +4581,9 @@ void JS_FreeRuntime(JSRuntime *rt)
     for (i = 0; i < g_comp_pend_n; i++) JS_FreeValueRT(rt, g_comp_pend[i]);
     if (g_comp_pend) { js_free_rt(rt, g_comp_pend); g_comp_pend = NULL; }
     g_comp_n = 0; g_comp_cap = 0; g_comp_pend_n = 0; g_comp_pend_cap = 0; g_comp_last_ret_ptr = NULL;
+    /* Heap JS call-stack: free any retained segments (the stack is empty at
+       teardown — no interpreter frame is running). */
+    { JSStackChunk *_c = rt->js_stack; while (_c) { JSStackChunk *_p = _c->prev; js_free_rt(rt, _c); _c = _p; } rt->js_stack = NULL; }
     JS_FreeValueRT(rt, rt->current_exception);
 
     list_for_each_safe(el, el1, &rt->job_list) {
@@ -20332,6 +20396,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSValue *local_buf, *stack_buf, *var_buf, *arg_buf, *sp, ret_val, *pval;
     JSVarRef **var_refs;
     size_t alloca_size;
+    JSStackChunk *_arena_chunk = NULL;   /* heap JS-stack segment for this frame */
+    uint8_t *_arena_save = NULL;         /* bump pointer to restore on teardown */
 
 #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_STEP
 #define DUMP_BYTECODE_OR_DONT(pc) \
@@ -20508,7 +20574,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     sf->cur_func = unsafe_unconst(func_obj);
     var_refs = p->u.func.var_refs;
 
-    local_buf = alloca(alloca_size);
+    /* Frame locals on the heap JS-stack, not the C stack (see js_stack_push).
+       sf is not yet linked into current_stack_frame, so an OOM here returns
+       cleanly like the stack-overflow throw above. */
+    local_buf = js_stack_push(rt, alloca_size, &_arena_chunk, &_arena_save);
+    if (unlikely(!local_buf))
+        return JS_ThrowOutOfMemory(caller_ctx);
     if (unlikely(arg_allocated_size)) {
         int n = min_int(argc, b->arg_count);
         arg_buf = local_buf;
@@ -24196,6 +24267,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         }
     }
     rt->current_stack_frame = sf->prev_frame;
+    /* Release this frame's heap JS-stack segment (LIFO). Reached by BOTH the
+       normal done: and the done_generator exits, so a grind-driven async
+       module-eval orphan that pushed (20511) then redirected to done_generator
+       still reclaims its segment. Guarded on _arena_chunk: a true async-resume
+       frame reuses async_func_init's buffer (never pushes → NULL → skipped), so
+       only frames that actually pushed pop, and those have no async_func_free to
+       touch the bytes afterward. The trampoline (next diff) reloads the caller
+       from here instead of returning to C. */
+    if (_arena_chunk)
+        js_stack_pop(rt, _arena_chunk, _arena_save);
     /* Cold-composition: remember this call's return-object as the candidate
        producer output for the NEXT call's entry CHECK (identity only, never
        deref'd; gated on a grind). client.request(readItems()) — readItems
