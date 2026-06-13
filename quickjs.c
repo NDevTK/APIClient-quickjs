@@ -20390,7 +20390,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSContext *ctx;
     JSObject *p;
     JSFunctionBytecode *b;
-    JSStackFrame sf_s, *sf = &sf_s;
+    JSStackFrame *sf = NULL;   /* set per-path: &s->frame (resume) or the heap arena block (normal) */
     uint8_t *pc;
     int opcode, arg_allocated_size, i;
     JSValue *local_buf, *stack_buf, *var_buf, *arg_buf, *sp, ret_val, *pval;
@@ -20568,18 +20568,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     if (js_check_stack_overflow(rt, alloca_size))
         return JS_ThrowStackOverflow(caller_ctx);
 
+    /* Step 2 of the trampolined interpreter: the JSStackFrame ITSELF and the
+       frame locals live in ONE segmented heap JS-stack block, not a C-stack sf_s
+       + alloca. sf must persist across a (future) non-recursive call so the
+       caller can be reloaded from it on return; until step 3 wires that, this is
+       behaviour-identical — sf merely moves from a C local into the arena. _fsz
+       rounds the frame header up so local_buf lands on a JSValue boundary. sf is
+       not yet linked into current_stack_frame, so an OOM returns cleanly like the
+       stack-overflow throw above; the single pop frees the whole block (sf+locals). */
+    {
+        size_t _fsz = (sizeof(JSStackFrame) + 15) & ~(size_t)15;
+        uint8_t *_blk = js_stack_push(rt, _fsz + alloca_size, &_arena_chunk, &_arena_save);
+        if (unlikely(!_blk))
+            return JS_ThrowOutOfMemory(caller_ctx);
+        sf = (JSStackFrame *)_blk;
+        local_buf = (JSValue *)(_blk + _fsz);
+    }
+
     sf->is_strict_mode = b->is_strict_mode;
     arg_buf = (JSValue *)argv;
     sf->arg_count = argc;
     sf->cur_func = unsafe_unconst(func_obj);
     var_refs = p->u.func.var_refs;
 
-    /* Frame locals on the heap JS-stack, not the C stack (see js_stack_push).
-       sf is not yet linked into current_stack_frame, so an OOM here returns
-       cleanly like the stack-overflow throw above. */
-    local_buf = js_stack_push(rt, alloca_size, &_arena_chunk, &_arena_save);
-    if (unlikely(!local_buf))
-        return JS_ThrowOutOfMemory(caller_ctx);
     if (unlikely(arg_allocated_size)) {
         int n = min_int(argc, b->arg_count);
         arg_buf = local_buf;
@@ -24267,14 +24278,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         }
     }
     rt->current_stack_frame = sf->prev_frame;
-    /* Release this frame's heap JS-stack segment (LIFO). Reached by BOTH the
-       normal done: and the done_generator exits, so a grind-driven async
-       module-eval orphan that pushed (20511) then redirected to done_generator
-       still reclaims its segment. Guarded on _arena_chunk: a true async-resume
-       frame reuses async_func_init's buffer (never pushes → NULL → skipped), so
-       only frames that actually pushed pop, and those have no async_func_free to
-       touch the bytes afterward. The trampoline (next diff) reloads the caller
-       from here instead of returning to C. */
+    /* Release this frame's heap JS-stack block (sf + locals), LIFO. Guarded on
+       _arena_chunk so it fires for exactly the frames that pushed — normal
+       functions. Async/generator RESUME frames reuse async_func_init's buffer
+       (sf = &s->frame), never push (NULL → skipped), and are freed by
+       async_func_free; that is why async_reached_done frames are NOT an arena
+       leak. Reached by both the done: and done_generator exits, so any pushed
+       frame that redirects still reclaims its block. Step 3 (trampoline) reloads
+       the caller from here instead of returning to C. */
     if (_arena_chunk)
         js_stack_pop(rt, _arena_chunk, _arena_save);
     /* Cold-composition: remember this call's return-object as the candidate
