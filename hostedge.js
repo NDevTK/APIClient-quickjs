@@ -834,8 +834,20 @@
   G.Response = Response;
   function Request(input, init) {
     init = init || {};
-    this.url = (input && typeof input === "object" && input.url != null) ? String(input.url) : String(input);
-    this.method = (init.method || (input && input.method) || "GET").toUpperCase();
+    // A JS undefined/null URL arg is an UNRESOLVED value (an unset var / a driving
+    // gap), NOT a real endpoint: String(undefined)="undefined" resolves to a fake
+    // "<principal>/undefined" the brain records (the supabase localhost/undefined
+    // noise rows). Substitute an opaque marker so the adapter files a resolverError,
+    // matching URL_wrap (CLAUDE.md: a placeholder URL is a resolverError, never INVENTED).
+    this.url = (input == null) ? String(OPQ("url.unresolved"))
+             : (typeof input === "object" && input.url != null) ? String(input.url)
+             : String(input);
+    // A non-string method (a forced/opaque object — Promise, BlobDownloadBuilder, an
+    // Error) coerced via .toUpperCase() became "[OBJECT X]", a garbage method on the
+    // recorded endpoint. A method that isn't a string is unresolved → default to GET
+    // (the spec default for the endpoint shape), never a fabricated "[object …]".
+    var _meth = init.method != null ? init.method : (input && input.method);
+    this.method = (typeof _meth === "string" ? _meth : "GET").toUpperCase();
     this.headers = new Headers(init.headers || (input && input.headers));
     this.body = init.body != null ? init.body : (input && input.body) || null;
     this.credentials = init.credentials || "same-origin";

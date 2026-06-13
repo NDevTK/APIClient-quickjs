@@ -195,6 +195,8 @@ int qjs_free_suspended_generators(JSContext *ctx); /* unwind suspended-generator
    the per-batch grind-end sweep is skipped on a no-progress break, so the
    teardown is the GUARANTEED cleanup point. Loop with the job drain to a
    settle-nothing/free-nothing/drain-nothing fixpoint. */
+void qjs_free_suspended_trampoline_frames(JSContext *ctx);   /* quickjs.c: heap call-stack teardown */
+
 static void qjs_unwind_suspended(JSContext *ctx, JSRuntime *rt) {
     if (!ctx || !rt) return;
     int _tp = 0, _tg = 0;
@@ -206,6 +208,12 @@ static void qjs_unwind_suspended(JSContext *ctx, JSRuntime *rt) {
         while (JS_ExecutePendingJob(rt, &_c) > 0 && _d < 200000) _d++;
         if (_s == 0 && _g == 0 && _d == 0) break;
     }
+    /* Promises/generators settled; now free any trampolined NORMAL frames still
+       suspended on the heap call-stack (a per-call JSPI yield left them mid-run).
+       The settle loop above can't reach them — they are neither — yet they pin the
+       same ctx refs, so this must run BEFORE JS_FreeContext or the bundle stays
+       rooted (the supabase list_empty(gc_obj_list) abort). */
+    qjs_free_suspended_trampoline_frames(ctx);
     if (_tp || _tg) { printf("@WHY {\"phase\":\"teardown_unwind\",\"promises\":%d,\"gens\":%d}\n", _tp, _tg); fflush(stdout); }   /* observability: how many frames the teardown dropped */
 }
 
@@ -387,6 +395,11 @@ static int qjs_source_is_module(JSContext *ctx, const char *src, size_t n,
    globalThis.X = Y, custom-element registrations, fetch IIFEs) actually
    run before we return to the driver loop. use_realpath=false:
    in-memory worker scripts have no filesystem path. */
+/* Return-to-scheduler driver hooks (quickjs.c). */
+JSValue qjs_resume_chain_call(JSContext *ctx);
+void qjs_set_driving(JSContext *ctx, int v);
+int  qjs_take_yielded(JSContext *ctx);
+
 JSValue qjs_eval_script(JSContext *ctx, const char *src, size_t n,
                                const char *filename, int start_line) {
     if (start_line < 1) start_line = 1;
@@ -426,23 +439,34 @@ JSValue qjs_eval_script(JSContext *ctx, const char *src, size_t n,
             JS_FreeValue(ctx, v);
             return JS_EXCEPTION;
         }
-        v = JS_EvalFunction(ctx, v);
-        /* Drain the microtask queue once so module-body Promise jobs
-           (the .then chains the module's top-level queued, the import-
-           link resolution callbacks) actually fire and their host-edge
-           side effects emit @H. NOT js_std_await: js_std_await loops
-           UNTIL the eval-promise reaches FULFILLED/REJECTED — but a
-           module with a top-level `await opaque-value` produces an
-           eval-promise that stays PENDING under our host model,
-           leaving 1 async function + ~1800 closure objects pinned in
-           the gc_obj_list across JS_FreeContext (verified via
-           FreeRuntime_residue @WHY). The microtask drain fires all
-           queued jobs (side effects emit normally) then returns;
-           pending promises with no external refs are freeable. */
+        /* Return-to-scheduler DRIVER. The module body + its async continuations
+           yield-RETURN here (qjs_take_yielded) at the dispatch cadence instead of
+           JSPI-suspending the heap chain (which can't be torn down). Drive to
+           quiescence: deliver host work (qjs_host_yield: fetches + @H aggregate),
+           drain microtasks, and RESUME any yield-returned chain
+           (qjs_resume_chain_call). This replaces the old single microtask drain. */
         JSRuntime *rt = JS_GetRuntime(ctx);
         JSContext *ctx1;
         long _drained = 0;
-        while (JS_ExecutePendingJob(rt, &ctx1) > 0) { _drained++; }
+        /* Opcode-level preemption is ON during the bundle's exec (qjs_driving). The
+           per-async-frame re-drive lives INSIDE js_async_function_resume (it holds the
+           JSAsyncFunctionData), so here we only drain the microtask queue + deliver
+           host work (qjs_host_yield) to quiescence; the async resumes that run as jobs
+           re-drive their own parked chains internally. */
+        /* Opcode-preemption is OFF on the boot path (qjs_driving=0): the imaged
+           boot is C-recursion (the trampoline is gated to the grind via
+           g_grind_drive_active), so the post-boot HEAPU8 snapshot has an EMPTY heap
+           arena — no orphan trampolined frames to be restored + leaked. The drain
+           below handles the bundle's awaits/fetches. */
+        qjs_set_driving(ctx, 0);
+        v = JS_EvalFunction(ctx, v);
+        for (;;) {
+            long _n = 0;
+            qjs_host_yield();                     /* deliver fetches / host work */
+            while (JS_ExecutePendingJob(rt, &ctx1) > 0) { _n++; _drained++; }
+            if (_n == 0) break;                   /* no microtask ran → quiescent */
+        }
+        qjs_set_driving(ctx, 0);
         fprintf(stderr, "@WHY {\"phase\":\"eval_done\",\"file\":\"%s\",\"drained\":%ld}\n",
                 filename ? filename : "(null)", _drained);
         fflush(stderr);

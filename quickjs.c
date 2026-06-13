@@ -98,6 +98,14 @@ static int g_grind_drive_active;
 static JSFunctionBytecode *qjs_dir_b = NULL;
 static int qjs_dir_target = -1;
 static int qjs_dir_active = 0;
+/* 1 only while a deep-grind orphan JS_Call is in flight (defined with the grind
+   below). Read by the trampoline gate in JS_CallInternal: trampoline (heap-arena
+   frames) ONLY during a grind drive, NEVER the imaged boot — the post-boot HEAPU8
+   snapshot would otherwise capture the boot's heap frames and restore them as
+   un-freeable orphans (the supabase list_empty leak). The boot's real recursion is
+   bounded (overflow is a forced-exec/grind artifact, CLAUDE.md), so C-recursion is
+   correct there until the snapshot-fork (build-order step 5) replaces the image. */
+static int g_grind_drive_active;
 /* The current value-spread target (qjs_drive_orphan_enum): a known body-builder
    that provably reaches a host edge via a CALL (qjs_is_cond_body_builder gated
    it in). qjs_host_reach_check below only sees DIRECT/closure-literal host edges,
@@ -2351,6 +2359,16 @@ struct JSRuntime {
        interpreter (overflow-proof recursion + snapshot-able path state). NULL
        until the first call; segments chained via ->prev, freed LIFO. */
     struct JSStackChunk *js_stack;
+    /* Return-to-scheduler yield (trampoline preemption). The deep heap chain
+       can't be JSPI-suspended mid-flight (the fiber saves the C stack, the frames
+       are on the arena → teardown desync). Instead JS_CallInternal RETURNS to the
+       shallow driver leaving the chain on js_stack/current_stack_frame; the driver
+       does the host work (qjs_host_yield) and RE-ENTERS to resume. */
+    struct JSStackFrame *qjs_yield_entry;   /* entry_frame saved across a yield */
+    uint8_t qjs_yielded;                    /* JS_CallInternal returned via a yield, not a real return */
+    uint8_t qjs_resume_chain;               /* driver requests a resume-entry (reload current_stack_frame) */
+    uint8_t qjs_yield_req;                  /* host requests the engine yield at the next safe point */
+    uint8_t qjs_driving;                    /* set by the driver around bundle exec: only then does the dispatch yield-RETURN (an arbitrary internal eval's caller doesn't loop) */
 
     JSInterruptHandler *interrupt_handler;
     void *interrupt_opaque;
@@ -2470,6 +2488,8 @@ typedef struct JSStackFrame {
     int qjs_call_argc;                      /* args the caller pushed for the in-progress call */
     uint8_t qjs_call_extra;                 /* 1 = OP_call (func), 2 = OP_call_method (this+func) */
     uint8_t qjs_is_tail;                    /* the in-progress call was a tail call */
+    JSValue qjs_this;                       /* this_obj for this frame (reloaded on a trampoline return) */
+    JSValue qjs_new_target;                 /* new_target for this frame (reloaded on a trampoline return) */
 } JSStackFrame;
 
 typedef enum {
@@ -4204,11 +4224,24 @@ static void *js_stack_push(JSRuntime *rt, size_t sz,
     return p;
 }
 
+static void close_var_refs(JSRuntime *rt, JSStackFrame *sf);   /* defined with the interpreter; used by JS_FreeRuntime's mid-execution teardown */
+
 /* LIFO pop: free any segments above the saved one (a deeper frame may have
    spilled into new segments already popped back to here), then restore. */
 static void js_stack_pop(JSRuntime *rt, JSStackChunk *save_chunk, uint8_t *save_top)
 {
+    /* DIAGNOSTIC GUARD: verify save_chunk is reachable from the current top before
+       freeing. If it is NOT (a segment-management bug), the original loop would
+       walk past NULL → c->prev OOB ("memory access out of bounds"). Check first,
+       log, and bail without corrupting. */
     JSStackChunk *c = rt->js_stack;
+    while (c && c != save_chunk) c = c->prev;
+    if (c != save_chunk) {
+        static long _spl = 0;
+        if (_spl++ < 30) { printf("@WHY {\"phase\":\"stack_pop_lost\",\"top\":%p,\"save\":%p}\n", (void*)rt->js_stack, (void*)save_chunk); fflush(stdout); }
+        return;
+    }
+    c = rt->js_stack;
     while (c != save_chunk) {
         JSStackChunk *prev = c->prev;
         js_free_rt(rt, c);
@@ -4593,8 +4626,29 @@ void JS_FreeRuntime(JSRuntime *rt)
     for (i = 0; i < g_comp_pend_n; i++) JS_FreeValueRT(rt, g_comp_pend[i]);
     if (g_comp_pend) { js_free_rt(rt, g_comp_pend); g_comp_pend = NULL; }
     g_comp_n = 0; g_comp_cap = 0; g_comp_pend_n = 0; g_comp_pend_cap = 0; g_comp_last_ret_ptr = NULL;
-    /* Heap JS call-stack: free any retained segments (the stack is empty at
-       teardown — no interpreter frame is running). */
+    /* Heap JS call-stack teardown. If the runtime is freed MID-EXECUTION (the
+       grind recycles the instance while a trampolined call chain is suspended at a
+       call-yield), the suspended NORMAL frames on the arena still hold their live
+       values — free them (same as the done: teardown) or the whole bundle leaks
+       (bytecode:1771) and the list_empty(gc_obj_list) assert fires. A suspended
+       arena frame has qjs_arena_chunk set and cur_sp captured; close its var-refs
+       then free [qjs_local_buf, cur_sp). At a CLEAN teardown the chain is empty so
+       this is a no-op. THEN release the segment memory. */
+    {
+        JSStackFrame *_sf = rt->current_stack_frame;
+        while (_sf) {
+            JSStackFrame *_prev = _sf->prev_frame;
+            if (_sf->qjs_arena_chunk && _sf->cur_sp) {
+                JSValue *_p;
+                if (_sf->var_ref_count) close_var_refs(rt, _sf);
+                for (_p = _sf->qjs_local_buf; _p < _sf->cur_sp; _p++)
+                    JS_FreeValueRT(rt, *_p);
+                _sf->cur_sp = _sf->qjs_local_buf;   /* mark freed — guard against a double-free */
+            }
+            _sf = _prev;
+        }
+        rt->current_stack_frame = NULL;
+    }
     { JSStackChunk *_c = rt->js_stack; while (_c) { JSStackChunk *_p = _c->prev; js_free_rt(rt, _c); _c = _p; } rt->js_stack = NULL; }
     JS_FreeValueRT(rt, rt->current_exception);
 
@@ -9084,6 +9138,14 @@ static void free_zero_refcount(JSRuntime *rt)
         if (el == &rt->gc_zero_ref_count_list)
             break;
         p = list_entry(el, JSGCObjectHeader, link);
+        if (p->ref_count != 0) {
+            static long _fzb = 0;
+            if (_fzb++ < 30) {
+                int _cid = (p->gc_obj_type == JS_GC_OBJ_TYPE_JS_OBJECT) ? (int)((JSObject *)p)->class_id : -1;
+                printf("@WHY {\"phase\":\"free_zero_bad\",\"rc\":%d,\"gctype\":%d,\"classId\":%d}\n", p->ref_count, (int)p->gc_obj_type, _cid);
+                fflush(stdout);
+            }
+        }
         assert(p->ref_count == 0);
         free_gc_object(rt, p);
     }
@@ -20145,6 +20207,78 @@ static void close_var_ref(JSRuntime *rt, JSVarRef *var_ref)
     add_gc_object(rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
 }
 
+/* Teardown: free trampolined NORMAL frames still suspended on the heap call-stack
+   (a per-call JSPI yield left one mid-execution at the final teardown). They are
+   neither promises nor generators, so qjs_unwind_suspended's settle loop never
+   reaches them; each pins ctx refs via its live locals → JS_FreeContext can't free
+   the context → the whole bundle stays rooted → JS_FreeRuntime's
+   list_empty(gc_obj_list) assert. Free each one's captured values (close var-refs
+   first, exactly like the done: teardown) and its cur_func, then drop the chain so
+   the context can be released. Called from qjs_unwind_suspended BEFORE
+   JS_FreeContext (the only point that works — JS_FreeRuntime is too late). */
+/* Return-to-scheduler RESUME entry (public; JS_CallInternal is static). The driver
+   calls this after doing host work (qjs_host_yield) on a yield-return: it re-enters
+   the interpreter on the intact heap chain (current_stack_frame) — func/args are
+   ignored, the resume-entry reloads the top frame. Returns the chain's eventual
+   real result (or yields again, leaving rt->qjs_yielded set for the driver loop). */
+JSValue qjs_resume_chain_call(JSContext *ctx)
+{
+    ctx->rt->qjs_resume_chain = 1;
+    return JS_CallInternal(ctx, JS_UNDEFINED, JS_UNDEFINED, JS_UNDEFINED, 0, NULL, 0);
+}
+
+/* Driver accessors (the qjs_driving/qjs_yielded fields are private to quickjs.c). */
+void qjs_set_driving(JSContext *ctx, int v) { ctx->rt->qjs_driving = (uint8_t)(v ? 1 : 0); }
+int  qjs_take_yielded(JSContext *ctx) { int y = ctx->rt->qjs_yielded; ctx->rt->qjs_yielded = 0; return y; }
+
+/* ---- Per-flow heap (context switch) -------------------------------------
+   A FLOW is one code path (the boot, a grind orphan, a forced branch-arm). Each
+   owns its OWN heap call-stack (js_stack segments) + frame chain — context
+   switching SAVES the active flow's and RESTORES the target's, never reusing
+   another path's heap (the shared-state fix). The active flow's state lives in
+   rt->{js_stack,current_stack_frame}; save/restore swap it with a JSFlow handle.
+   A fresh flow has NULL fields (its first push allocates its own segment). */
+typedef struct JSFlow {
+    JSStackChunk *js_stack;             /* this flow's own segmented heap call-stack */
+    struct JSStackFrame *current_stack_frame;  /* this flow's frame chain */
+} JSFlow;
+
+void qjs_flow_save(JSContext *ctx, JSFlow *f) {
+    f->js_stack = ctx->rt->js_stack;
+    f->current_stack_frame = ctx->rt->current_stack_frame;
+}
+void qjs_flow_restore(JSContext *ctx, JSFlow *f) {
+    ctx->rt->js_stack = f->js_stack;
+    ctx->rt->current_stack_frame = f->current_stack_frame;
+}
+
+void qjs_free_suspended_trampoline_frames(JSContext *ctx)
+{
+    JSRuntime *rt = ctx->rt;
+    JSStackFrame *sf = rt->current_stack_frame;
+    while (sf) {
+        JSStackFrame *prev = sf->prev_frame;
+        JSFunctionBytecode *_fb = JS_GetFunctionBytecode(sf->cur_func);
+        /* ONLY NORMAL trampolined frames. An async/generator (or a module-eval
+           ASYNC orphan that happened to arena-push) is owned by the async
+           machinery / the settle loop above — freeing it here double-frees
+           (free_zero_refcount). */
+        if (sf->qjs_arena_chunk && sf->cur_sp && _fb && _fb->func_kind == JS_FUNC_NORMAL) {
+            JSValue *p;
+            if (sf->var_ref_count) close_var_refs(rt, sf);
+            /* Free exactly what the done: teardown frees — the frame's locals +
+               value stack. NOT cur_func: it is BORROWED (the caller's func_obj on
+               its stack), freed by the caller's own values below / by the C caller;
+               freeing it here double-frees (free_zero_refcount assert). */
+            for (p = sf->qjs_local_buf; p < sf->cur_sp; p++)
+                JS_FreeValue(ctx, *p);
+            sf->cur_sp = sf->qjs_local_buf;   /* guard against a double-free */
+        }
+        sf = prev;
+    }
+    rt->current_stack_frame = NULL;
+}
+
 static void close_var_refs(JSRuntime *rt, JSStackFrame *sf)
 {
     JSVarRef *var_ref;
@@ -20408,8 +20542,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSValue *local_buf, *stack_buf, *var_buf, *arg_buf, *sp, ret_val, *pval;
     JSVarRef **var_refs;
     size_t alloca_size;
-    JSStackChunk *_arena_chunk = NULL;   /* heap JS-stack segment for this frame */
+    JSStackChunk *_arena_chunk = NULL;   /* heap JS-stack segment for the CURRENT frame (reloaded on a trampoline return) */
     uint8_t *_arena_save = NULL;         /* bump pointer to restore on teardown */
+    JSStackFrame *entry_frame = NULL;    /* the frame this C-invocation owns; its OP_return goes back to C (step 3b) */
 
 #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_STEP
 #define DUMP_BYTECODE_OR_DONT(pc) \
@@ -20436,6 +20571,54 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #define BREAK           SWITCH(pc)
 #endif
 
+/* Return-to-scheduler preemption at the OLD js_poll_interrupts cadence, but WITHOUT
+   a JSPI suspend: the heap call chain can't be JSPI-suspended mid-flight (the fiber
+   saves the C stack while the frames are on the arena → teardown leak / double-free).
+   Instead SAVE this frame's resume point and RETURN to the driver, leaving the chain
+   intact on current_stack_frame; the driver does host work (qjs_host_yield) and
+   re-enters via qjs_resume_chain_call. Keeps the interrupt-handler check. Used at the
+   loop backedges + reenter_dispatch (sf/pc/sp/entry_frame in scope). */
+#define YIELD_POLL() do {                                                       \
+    if (unlikely(--ctx->interrupt_counter <= 0)) {                              \
+        ctx->interrupt_counter = JS_INTERRUPT_COUNTER_INIT;                     \
+        if (rt->interrupt_handler &&                                           \
+            rt->interrupt_handler(rt, rt->interrupt_opaque)) {                  \
+            JS_ThrowInterrupted(ctx); goto exception;                           \
+        }                                                                       \
+        if (rt->qjs_driving) {                                                  \
+            sf->cur_pc = pc; sf->cur_sp = sp;                                   \
+            rt->qjs_yield_entry = entry_frame; rt->qjs_yielded = 1;             \
+            return JS_UNDEFINED;                                                \
+        }                                                                       \
+    }                                                                           \
+} while (0)
+
+    /* Return-to-scheduler RESUME: the driver re-entered to continue a chain that
+       yielded. Reload the saved top frame + its entry and jump straight into the
+       dispatch loop (NOT a new frame) — the heap chain on js_stack /
+       current_stack_frame was left intact by the yield-return. BEFORE
+       js_poll_interrupts so a resume does not re-yield. */
+    if (unlikely(rt->qjs_resume_chain)) {
+        rt->qjs_resume_chain = 0;
+        rt->qjs_yielded = 0;
+        sf = rt->current_stack_frame;
+        entry_frame = rt->qjs_yield_entry;
+        { JSObject *_rp = JS_VALUE_GET_OBJ(sf->cur_func); b = _rp->u.func.function_bytecode; }
+        ctx = b->realm;
+        var_buf = sf->var_buf;
+        arg_buf = sf->arg_buf;
+        var_refs = sf->var_refs;
+        stack_buf = var_buf + b->var_count;
+        local_buf = sf->qjs_local_buf;
+        _arena_chunk = sf->qjs_arena_chunk;
+        _arena_save = sf->qjs_arena_save;
+        this_obj = sf->qjs_this;
+        new_target = sf->qjs_new_target;
+        pc = sf->cur_pc;
+        sp = sf->cur_sp;
+        sf->cur_sp = NULL;
+        goto reenter_dispatch;
+    }
     if (js_poll_interrupts(caller_ctx))
         return JS_EXCEPTION;
     /* Cold-composition data-flow: this call's arg === the immediately-preceding call's
@@ -20464,6 +20647,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             local_buf = arg_buf = sf->arg_buf;
             var_buf = sf->var_buf;
             stack_buf = sf->var_buf + b->var_count;
+            /* step 3b: an async/generator frame can be the CALLER of a trampolined
+               OP_call (async f calls a NORMAL helper, which returns through the
+               done: teardown reloading THIS frame). It never passed through
+               setup_callee, so initialize the fields that teardown reads — above
+               all qjs_arena_chunk = NULL, so a reloaded async caller never pops a
+               GARBAGE heap segment when it finishes (the wasm_abort storm on
+               async-heavy bundles). It owns no arena segment; its locals live in
+               the async state's own buffer. qjs_call_* are stamped by its OP_call. */
+            sf->qjs_arena_chunk = NULL;
+            sf->qjs_arena_save = NULL;
+            sf->qjs_local_buf = local_buf;
+            sf->qjs_this = this_obj;
+            sf->qjs_new_target = new_target;
             sp = sf->cur_sp;
             sf->cur_sp = NULL; /* cur_sp is NULL if the function is running */
             pc = sf->cur_pc;
@@ -20568,6 +20764,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         }
     }
 
+ setup_callee:   /* step 3b: OP_call jumps here with p, b, func_obj, this_obj, new_target,
+                    argc, argv, flags set for a NORMAL bytecode callee — no C-recursion */
     if (unlikely(argc < b->arg_count || (flags & JS_CALL_FLAG_COPY_ARGV))) {
         arg_allocated_size = b->arg_count;
     } else {
@@ -20601,6 +20799,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         sf->qjs_call_argc = 0;                /* set by the caller at OP_call (step 3b) */
         sf->qjs_call_extra = 0;
         sf->qjs_is_tail = 0;
+        sf->qjs_this = this_obj;              /* reloaded on a trampoline return so the caller's this is restored */
+        sf->qjs_new_target = new_target;
     }
 
     sf->is_strict_mode = b->is_strict_mode;
@@ -20644,6 +20844,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #endif
 
  restart:
+    if (!entry_frame) entry_frame = sf;   /* first frame of this C-invocation; OP_return of it goes back to C */
     b->qjs_executed = 1;   /* reached: __feDriveStatic drives only unreached functions */
     /* A generator/async RESUME re-enters here (goto restart from the
        JS_CALL_FLAG_GENERATOR path) with the SAME logical invocation — its
@@ -20664,6 +20865,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         int call_argc;
         JSValue *call_argv;
 
+    reenter_dispatch:   /* step 3b: a trampoline return reloads the caller then jumps here
+                           (NOT restart: — that would re-stamp qjs_inv for the same frame) */
+        /* Cadence yield-return so a tight call loop (no backedge) still preempts. */
+        YIELD_POLL();
         SWITCH(pc) {
         CASE(OP_push_i32):
             *sp++ = js_int32(get_u32(pc));
@@ -21041,6 +21246,45 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        fetch inside `unknownFactory(cb)` still fires (see helper). */
                     qjs_drive_opaque_call_cbs(ctx, vc(call_argv), call_argc);
                 } else {
+                    /* step 3b: trampoline a non-tail call to a NORMAL bytecode
+                       callee — set up its frame on the heap JS-stack and continue
+                       the dispatch loop instead of C-recursing, so a deep JS->JS
+                       chain never grows the C stack. The per-call yield is KEPT
+                       (js_poll_interrupts) so the scheduler still gets control at
+                       every recursion level and can starve a forced recursion.
+                       Tail calls, native/bound callees and async/generator stay on
+                       the proven C-recursion path below; the result is spliced when
+                       the callee returns via the done: teardown. */
+                    JSValue _fo = call_argv[-1];
+                    JSObject *_fp = (JS_VALUE_GET_TAG(_fo) == JS_TAG_OBJECT)
+                                    ? JS_VALUE_GET_OBJ(_fo) : NULL;
+                    /* Trampoline only CONCRETE-arg calls. An OPAQUE arg is the
+                       recur_collapse trigger: a forced/opaque-driven recursion
+                       never terminates (the base-case branch is forced both ways),
+                       so trampolining it would grow the heap stack to OOM. Route
+                       those to the C path, where recur_collapse still collapses the
+                       no-progress re-entry. (recur_collapse is retired only once the
+                       scheduler can STARVE+EVICT such a recursion — not by a depth
+                       cap.) Concrete-arg recursion is bounded and is exactly the
+                       overflow case the heap stack fixes. */
+                    int _hasopq = 0;
+                    { int _k; for (_k = 0; _k < call_argc; _k++) if (qjs_is_opaque(call_argv[_k])) { _hasopq = 1; break; } }
+                    if (opcode == OP_call && !_hasopq && g_grind_drive_active && _fp &&
+                        _fp->class_id == JS_CLASS_BYTECODE_FUNCTION &&
+                        _fp->u.func.function_bytecode->func_kind == JS_FUNC_NORMAL) {
+                        /* No JSPI suspend and no inline job-drain here: preemption
+                           + host-drive are the driver's job now (YIELD_POLL returns
+                           to it at the cadence). cur_sp is the caller's resume point
+                           for the trampoline reload. */
+                        sf->cur_sp = sp;
+                        sf->qjs_call_argc = call_argc;
+                        sf->qjs_call_extra = 1;     /* OP_call: free func + args on return */
+                        sf->qjs_is_tail = 0;
+                        func_obj = _fo; this_obj = JS_UNDEFINED; new_target = JS_UNDEFINED;
+                        argc = call_argc; argv = vc(call_argv); flags = 0;
+                        p = _fp; b = _fp->u.func.function_bytecode;
+                        goto setup_callee;
+                    }
                     ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
                                               JS_UNDEFINED, call_argc,
                                               vc(call_argv), 0);
@@ -21691,18 +21935,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
         CASE(OP_goto):
             { int32_t _o = (int32_t)get_u32(pc); if (_o < 0) { sf->qjs_looped = 1; sf->qjs_loop_src = (int)(pc - b->byte_code_buf) - 1; } pc += _o; if (_o < 0) sf->qjs_loop_pc = (int)(pc - b->byte_code_buf); }
-            if (unlikely(js_poll_interrupts(ctx)))
-                goto exception;
+            YIELD_POLL();
             BREAK;
         CASE(OP_goto16):
             { int16_t _o = (int16_t)get_u16(pc); if (_o < 0) { sf->qjs_looped = 1; sf->qjs_loop_src = (int)(pc - b->byte_code_buf) - 1; } pc += _o; if (_o < 0) sf->qjs_loop_pc = (int)(pc - b->byte_code_buf); }
-            if (unlikely(js_poll_interrupts(ctx)))
-                goto exception;
+            YIELD_POLL();
             BREAK;
         CASE(OP_goto8):
             { int8_t _o = (int8_t)pc[0]; if (_o < 0) { sf->qjs_looped = 1; sf->qjs_loop_src = (int)(pc - b->byte_code_buf) - 1; } pc += _o; if (_o < 0) sf->qjs_loop_pc = (int)(pc - b->byte_code_buf); }
-            if (unlikely(js_poll_interrupts(ctx)))
-                goto exception;
+            YIELD_POLL();
             BREAK;
         CASE(OP_if_true):
             {
@@ -21889,8 +22130,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (_bo < 0) { sf->qjs_looped = 1; sf->qjs_loop_src = (int)(pc - b->byte_code_buf) - 5; sf->qjs_loop_pc = (int)(pc - b->byte_code_buf) + _bo; }
                     pc += _bo;
                 }
-                if (unlikely(js_poll_interrupts(ctx)))
-                    goto exception;
+                YIELD_POLL();
             }
             BREAK;
         CASE(OP_if_false):
@@ -22062,8 +22302,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (_bo < 0) { sf->qjs_looped = 1; sf->qjs_loop_src = (int)(pc - b->byte_code_buf) - 5; sf->qjs_loop_pc = (int)(pc - b->byte_code_buf) + _bo; }
                     pc += _bo;
                 }
-                if (unlikely(js_poll_interrupts(ctx)))
-                    goto exception;
+                YIELD_POLL();
             }
             BREAK;
         CASE(OP_if_true8):
@@ -22230,8 +22469,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (_bo < 0) { sf->qjs_looped = 1; sf->qjs_loop_src = (int)(pc - b->byte_code_buf) - 2; sf->qjs_loop_pc = (int)(pc - b->byte_code_buf) + _bo; }
                     pc += _bo;
                 }
-                if (unlikely(js_poll_interrupts(ctx)))
-                    goto exception;
+                YIELD_POLL();
             }
             BREAK;
         CASE(OP_if_false8):
@@ -22399,8 +22637,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (_bo < 0) { sf->qjs_looped = 1; sf->qjs_loop_src = (int)(pc - b->byte_code_buf) - 2; sf->qjs_loop_pc = (int)(pc - b->byte_code_buf) + _bo; }
                     pc += _bo;
                 }
-                if (unlikely(js_poll_interrupts(ctx)))
-                    goto exception;
+                YIELD_POLL();
             }
             BREAK;
         CASE(OP_catch):
@@ -24298,23 +24535,67 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         }
     }
     rt->current_stack_frame = sf->prev_frame;
-    /* Release this frame's heap JS-stack block (sf + locals), LIFO. Guarded on
-       _arena_chunk so it fires for exactly the frames that pushed — normal
-       functions. Async/generator RESUME frames reuse async_func_init's buffer
-       (sf = &s->frame), never push (NULL → skipped), and are freed by
-       async_func_free; that is why async_reached_done frames are NOT an arena
-       leak. Reached by both the done: and done_generator exits, so any pushed
-       frame that redirects still reclaims its block. Step 3 (trampoline) reloads
-       the caller from here instead of returning to C. */
-    if (_arena_chunk)
-        js_stack_pop(rt, _arena_chunk, _arena_save);
-    /* Cold-composition: remember this call's return-object as the candidate
-       producer output for the NEXT call's entry CHECK (identity only, never
-       deref'd; gated on a grind). client.request(readItems()) — readItems
-       exits here setting this; request's entry CHECK then matches its arg. */
-    if (qjs_deep_rb)
-        g_comp_last_ret_ptr = (JS_VALUE_GET_TAG(ret_val) == JS_TAG_OBJECT) ? JS_VALUE_GET_OBJ(ret_val) : NULL;
-    return ret_val;
+    /* --- step 3b trampoline teardown ---------------------------------------
+       A NORMAL non-entry frame is a trampolined OP_call callee (set up at
+       setup_callee, never C-recursed): pop its heap segment, reload its caller,
+       and either splice the result (normal return) or continue the exception
+       search in the caller — all WITHOUT returning to C, so a deep JS->JS chain
+       never grows the C stack. The entry frame this C-invocation owns, and any
+       async/generator frame reached via done_generator (b->func_kind != NORMAL),
+       return to C as before. Async/generator RESUME frames reuse async_func_init's
+       buffer (never push → _arena_chunk NULL → not popped; async_func_free owns
+       them) — that is why async_reached_done is not an arena leak. */
+    {
+        JSStackChunk *_cc = _arena_chunk;   /* the just-finished frame's segment */
+        uint8_t *_cs = _arena_save;
+        if (sf == entry_frame || b->func_kind != JS_FUNC_NORMAL) {
+            if (_cc)
+                js_stack_pop(rt, _cc, _cs);
+            /* Cold-composition: the return-object is the candidate producer output
+               for the NEXT call's entry CHECK (identity only, gated on a grind). */
+            if (qjs_deep_rb)
+                g_comp_last_ret_ptr = (JS_VALUE_GET_TAG(ret_val) == JS_TAG_OBJECT) ? JS_VALUE_GET_OBJ(ret_val) : NULL;
+            return ret_val;
+        }
+        /* reload the caller (qjs_call_* were stamped on IT at OP_call) and resume */
+        sf = sf->prev_frame;
+        {
+            int _cargc = sf->qjs_call_argc, _cextra = sf->qjs_call_extra;
+            uint8_t _tail = sf->qjs_is_tail;
+            JSObject *_cp = JS_VALUE_GET_OBJ(sf->cur_func);
+            b = _cp->u.func.function_bytecode;
+            ctx = b->realm;
+            var_buf = sf->var_buf;
+            arg_buf = sf->arg_buf;
+            var_refs = sf->var_refs;
+            stack_buf = var_buf + b->var_count;
+            local_buf = sf->qjs_local_buf;
+            _arena_chunk = sf->qjs_arena_chunk;
+            _arena_save = sf->qjs_arena_save;
+            this_obj = sf->qjs_this;
+            new_target = sf->qjs_new_target;
+            pc = sf->cur_pc;
+            sp = sf->cur_sp;
+            sf->cur_sp = NULL;            /* caller is running again (not suspended) */
+            js_stack_pop(rt, _cc, _cs);   /* free the callee's segment (caller restored) */
+            /* Match the C-return semantics: a trampolined callee's return-object is
+               still the candidate producer output for the NEXT call's cold-composition
+               entry CHECK (identity only). Without this, client.request(cmd()) chains
+               across a trampolined cmd() are missed (the supabase -7). */
+            if (qjs_deep_rb)
+                g_comp_last_ret_ptr = (JS_VALUE_GET_TAG(ret_val) == JS_TAG_OBJECT) ? JS_VALUE_GET_OBJ(ret_val) : NULL;
+            if (JS_IsException(ret_val))
+                goto exception;           /* propagate the throw into the caller */
+            if (_tail)
+                goto done;                /* (tail calls not trampolined in this slice) */
+            /* splice the callee's result into the caller's stack */
+            for (i = -_cextra; i < _cargc; i++)
+                JS_FreeValue(ctx, (sp - _cargc)[i]);
+            sp -= _cargc + _cextra;
+            *sp++ = ret_val;
+            goto reenter_dispatch;
+        }
+    }
 }
 
 JSValue JS_Call(JSContext *ctx, JSValueConst func_obj, JSValueConst this_obj,
@@ -24853,6 +25134,22 @@ static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
     JSValue func_ret, ret2;
 
     func_ret = async_func_resume(ctx, &s->func_state);
+    /* Opcode-level preemption: a trampolined callee inside this async frame
+       yield-RETURNED at the dispatch cadence (func_ret is JS_UNDEFINED, the parked
+       callee chain is on rt->js_stack / current_stack_frame). Re-drive it here —
+       this function holds the JSAsyncFunctionData, so the eventual AWAIT/return is
+       handled by the normal code below. async_func_resume's JS_CallInternal takes
+       the resume-entry (qjs_resume_chain) and continues the parked chain instead of
+       restarting the frame. The host hand-off (qjs_host_yield: deliver fetches,
+       rotate the scheduler) is at THIS shallow loop — the deep chain lives on the
+       heap arena, not this C frame — so teardown stays clean. Loop until the frame
+       genuinely awaits or completes. */
+    while (ctx->rt->qjs_yielded) {
+        ctx->rt->qjs_yielded = 0;
+        qjs_host_yield();
+        ctx->rt->qjs_resume_chain = 1;
+        func_ret = async_func_resume(ctx, &s->func_state);
+    }
     if (JS_IsException(func_ret)) {
     fail:
         if (unlikely(JS_IsUncatchableError(ctx->rt->current_exception))) {
