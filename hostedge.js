@@ -104,6 +104,13 @@
        that test `URL.length === 1` or `URL.name === "URL"` keep working because
        the static-property copy below preserves those intrinsics. */
     var URL_wrap = function URL(input, base) {
+      // A JS undefined/null used as the URL template is an UNRESOLVED value — an unset
+      // config.endpoint / a command's path computed from a missing field. Coercing it
+      // gives a CONCRETE "<base>/undefined" placeholder that the brain records as a fake
+      // endpoint (directus /undefined, supabase localhost/undefined). Substitute an
+      // opaque marker so isUnresolved files a resolverError instead (CLAUDE.md: a
+      // placeholder URL is a resolverError, never emitted — and never INVENTED).
+      if (input === undefined || input === null) input = OPQ("url.unresolved");
       if (input && typeof input === "object" && ISOPQANY(input)) {
         var sh = URLSHAPE(input);
         if (typeof sh === "string") input = sh;
