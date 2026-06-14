@@ -3119,6 +3119,17 @@ typedef struct JSAsyncFunctionState {
     int argc; /* number of function arguments */
     bool throw_flag; /* used to throw an exception in JS_CallInternal() */
     JSStackFrame frame;
+    /* #4 per-flow heap (the shared-state fix): THIS flow's own three-value state —
+       a PRIVATE arena chunk list + its frame chain + its scheduler re-entry —
+       saved/restored AS ONE UNIT across each resume (async_func_resume) so
+       concurrent parked async/generator flows never share one bump allocator or
+       desync frame-vs-arena (attempt 1 swapped js_stack alone -> corruption).
+       flow_started=0 until the first resume creates &frame chaining onto the
+       caller (don't restore current_stack_frame while fresh). */
+    struct JSStackChunk *flow_js_stack;
+    struct JSStackFrame *flow_frame;
+    struct JSStackFrame *flow_yield_entry;
+    uint8_t flow_started;
 } JSAsyncFunctionState;
 
 /* XXX: could use an object instead to avoid the
@@ -24991,6 +25002,10 @@ static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s,
     n = arg_buf_len + b->var_count;
     for(i = argc; i < n; i++)
         sf->arg_buf[i] = JS_UNDEFINED;
+    s->flow_js_stack = NULL;        /* #4: fresh private arena (first nested call allocates its own) */
+    s->flow_frame = NULL;
+    s->flow_yield_entry = NULL;
+    s->flow_started = 0;
     return 0;
 }
 
@@ -25034,20 +25049,58 @@ static void async_func_free(JSRuntime *rt, JSAsyncFunctionState *s)
     }
     JS_FreeValueRT(rt, sf->cur_func);
     JS_FreeValueRT(rt, s->this_val);
+    /* #4: reclaim this flow's private arena chunks. Normally NULL — a completed flow
+       popped them via the done: teardown. Non-NULL = freed while parked mid-call
+       (a parked flow is kept alive by its pending job, so this should not happen);
+       surface it and free the chunk memory. */
+    if (s->flow_js_stack) {
+        static long _ffn = 0;
+        if (_ffn++ < 20) { fprintf(stderr, "@WHY {\"phase\":\"async_flow_abandon\"}\n"); fflush(stderr); }
+        { JSStackChunk *_c = s->flow_js_stack; while (_c) { JSStackChunk *_p = _c->prev; js_free_rt(rt, _c); _c = _p; } s->flow_js_stack = NULL; }
+    }
 }
 
 static JSValue async_func_resume(JSContext *ctx, JSAsyncFunctionState *s)
 {
-    JSValue func_obj;
+    JSValue func_obj, ret;
+    JSRuntime *rt = ctx->rt;
+    JSStackChunk *save_js_stack;
+    JSStackFrame *save_frame, *save_yield_entry;
 
-    if (js_check_stack_overflow(ctx->rt, 0))
+    if (js_check_stack_overflow(rt, 0))
         return JS_ThrowStackOverflow(ctx);
 
     /* the tag does not matter provided it is not an object */
     func_obj = JS_MKPTR(JS_TAG_INT, s);
-    return JS_CallInternal(ctx, func_obj, s->this_val, JS_UNDEFINED,
-                           s->argc, vc(s->frame.arg_buf),
-                           JS_CALL_FLAG_GENERATOR);
+    /* #4 per-flow heap: switch the FULL flow state (arena chunks + frame chain +
+       scheduler re-entry) FROM the caller TO this flow, run, then switch back — all
+       THREE together so they never desync (attempt 1 swapped js_stack here but left
+       the frame to a band-aid elsewhere -> inconsistent across qjs_host_yield ->
+       concurrent flows corrupted each other). This flow's arena is a PRIVATE chunk
+       list (NULL the first time = fresh), so a parked flow's segments are never on
+       the same bump allocator as another flow's. On the FIRST resume the frame chain
+       does not exist yet (the generator-path entry creates &frame chaining onto the
+       caller), so leave current_stack_frame as the caller's; from the first save on,
+       restore this flow's parked chain. */
+    save_js_stack = rt->js_stack;
+    save_frame = rt->current_stack_frame;
+    save_yield_entry = rt->qjs_yield_entry;
+    rt->js_stack = s->flow_js_stack;
+    if (s->flow_started) {
+        rt->current_stack_frame = s->flow_frame;
+        rt->qjs_yield_entry = s->flow_yield_entry;
+    }
+    ret = JS_CallInternal(ctx, func_obj, s->this_val, JS_UNDEFINED,
+                          s->argc, vc(s->frame.arg_buf),
+                          JS_CALL_FLAG_GENERATOR);
+    s->flow_js_stack = rt->js_stack;
+    s->flow_frame = rt->current_stack_frame;
+    s->flow_yield_entry = rt->qjs_yield_entry;
+    s->flow_started = 1;
+    rt->js_stack = save_js_stack;
+    rt->current_stack_frame = save_frame;
+    rt->qjs_yield_entry = save_yield_entry;
+    return ret;
 }
 
 
