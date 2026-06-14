@@ -21481,17 +21481,33 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        their per-element fetch (see helper). */
                     qjs_drive_opaque_call_cbs(ctx, vc(call_argv), call_argc);
                 } else {
-                    /* NEXT (unified trampoline): method trampoline reverted to protect
-                       directus. PINNED (crash-surviving self.__mtl ring): the trampoline
-                       FIRES on directus (~100x) and OOBs at a tight set of hot methods —
-                       373:19 (immediate pre-OOB), 418:18, 1216:18, 1225:21, 410:17 in the
-                       combined-bundle line space. NOT a runaway (100 frames is tiny) and
-                       NOT a synthetic-reproducible pattern (14 chain_* fixtures pass). So a
-                       SPECIFIC construct in method 373:19 corrupts under the trampoline.
-                       Next: map 373:19 to the directus source via _findScriptForLine, read
-                       what that method does (likely an exotic receiver / spread / Reflect /
-                       getter), and handle it in the unified path. The crash-surviving
-                       diagnostic (qjs_note_mtramp -> self.__mtramp/__mtl) is the tool. */
+                    /* Method call on the heap trampoline (overflow-impossible for a.b()
+                       chains; pause/resume-able). Mirrors the OP_call trampoline EXACTLY
+                       — concrete bytecode NORMAL callee, no opaque arg, driving/grind —
+                       with extra=2 (free this + func) and this_obj = the receiver at
+                       call_argv[-2]. ONLY OP_call_method: a TAIL method call must REPLACE
+                       the frame (goto done), not push+splice; trampolining it as a normal
+                       call was the directus boot OOB (sp mismatch on the tail path, where
+                       driving=1 makes YIELD_POLL live — the 14 classic synthetics never
+                       hit it). Tail method calls stay on the C path below. */
+                    JSValue _fo = call_argv[-1];
+                    JSObject *_fp = (JS_VALUE_GET_TAG(_fo) == JS_TAG_OBJECT)
+                                    ? JS_VALUE_GET_OBJ(_fo) : NULL;
+                    int _hasopq = 0;
+                    { int _k; for (_k = 0; _k < call_argc; _k++) if (qjs_is_opaque(call_argv[_k])) { _hasopq = 1; break; } }
+                    if (opcode == OP_call_method && !_hasopq && (g_grind_drive_active || rt->qjs_driving) && _fp &&
+                        _fp->class_id == JS_CLASS_BYTECODE_FUNCTION &&
+                        _fp->u.func.function_bytecode->func_kind == JS_FUNC_NORMAL) {
+                        sf->cur_sp = sp;
+                        sf->qjs_call_argc = call_argc;
+                        sf->qjs_call_extra = 2;     /* OP_call_method: free this + func on return */
+                        sf->qjs_is_tail = 0;
+                        sf->qjs_call_ctor = 0;
+                        func_obj = _fo; this_obj = call_argv[-2]; new_target = JS_UNDEFINED;
+                        argc = call_argc; argv = vc(call_argv); flags = 0;
+                        p = _fp; b = _fp->u.func.function_bytecode;
+                        goto setup_callee;
+                    }
                     ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
                                               JS_UNDEFINED, call_argc,
                                               vc(call_argv), 0);
@@ -25367,18 +25383,13 @@ static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
        genuinely awaits or completes. */
     while (ctx->rt->qjs_yielded) {
         ctx->rt->qjs_yielded = 0;
-        /* #4 per-flow resume state: qjs_host_yield can run a DIFFERENT async frame
-           (a pending job), whose YIELD_POLL overwrites the GLOBAL qjs_yield_entry /
-           current_stack_frame. Without saving THIS frame's resume target across the
-           host hand-off, async_func_resume below would resume a DIFFERENT code path's
-           parked chain (the resume-entry reads those globals) — esm's many concurrent
-           async frames (auth-js/postgrest-js/realtime-js) OOB'd on exactly this
-           cross-contamination. Snapshot + restore makes the resume per-flow. */
-        JSStackFrame *_savedEntry = ctx->rt->qjs_yield_entry;
-        JSStackFrame *_savedTop = ctx->rt->current_stack_frame;
+        /* #4 per-flow: NO manual global save/restore here. async_func_resume does the
+           FULL per-flow switch (js_stack + current_stack_frame + yield_entry as ONE
+           unit), keeping THIS flow's resume target in s->func_state.flow — so
+           qjs_host_yield running other async flows can't clobber it (the resume-entry
+           reads the flow restored by the next async_func_resume, not a shared global).
+           The save/restore band-aid that lived here is subsumed by that switch. */
         qjs_host_yield();
-        ctx->rt->qjs_yield_entry = _savedEntry;
-        ctx->rt->current_stack_frame = _savedTop;
         ctx->rt->qjs_resume_chain = 1;
         ctx->rt->qjs_yield_ok = 1;   /* driver re-drive: this async invocation may yield-RETURN again */
         func_ret = async_func_resume(ctx, &s->func_state);
