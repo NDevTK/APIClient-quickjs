@@ -4244,7 +4244,7 @@ static void js_stack_pop(JSRuntime *rt, JSStackChunk *save_chunk, uint8_t *save_
     c = rt->js_stack;
     while (c != save_chunk) {
         JSStackChunk *prev = c->prev;
-        js_free_rt(rt, c);
+        js_free_rt(rt, c);   /* (arena-chunk-reuse hypothesis DISPROVEN by a leak test: leak still corrupted) */
         c = prev;
     }
     rt->js_stack = save_chunk;
@@ -9189,6 +9189,14 @@ static void js_free_value_rt(JSRuntime *rt, JSValue v)
     case JS_TAG_FUNCTION_BYTECODE:
         {
             JSGCObjectHeader *p = JS_VALUE_GET_PTR(v);
+            if (unlikely(p->ref_count < 0)) {
+                /* L1 INVARIANT (permanent, cheap): a rc 0->-1 double-decref is a UAF — the
+                   trampoline left a dangling reference. This must NEVER fire on a value-correct
+                   trampoline; if it does, the analysis-worker self-reports (self.__dfree) so a
+                   regression surfaces immediately instead of as a silent storm. */
+                extern void qjs_note_dfree(int site, int line);
+                qjs_note_dfree((int)rt->gc_phase, (int)p->gc_obj_type);
+            }
             if (rt->gc_phase != JS_GC_PHASE_REMOVE_CYCLES) {
                 list_del(&p->link);
                 list_add(&p->link, &rt->gc_zero_ref_count_list);
@@ -20607,7 +20615,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         ctx = b->realm;
         var_buf = sf->var_buf;
         arg_buf = sf->arg_buf;
-        var_refs = sf->var_refs;
+        var_refs = JS_VALUE_GET_OBJ(sf->cur_func)->u.func.var_refs;   /* L1 FIX: closure refs (what OP_get_var_ref* read), NOT sf->var_refs (this frame's own capturable slots). See the trampoline-reload fix. */
         stack_buf = var_buf + b->var_count;
         local_buf = sf->qjs_local_buf;
         _arena_chunk = sf->qjs_arena_chunk;
@@ -21269,7 +21277,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        overflow case the heap stack fixes. */
                     int _hasopq = 0;
                     { int _k; for (_k = 0; _k < call_argc; _k++) if (qjs_is_opaque(call_argv[_k])) { _hasopq = 1; break; } }
-                    if (opcode == OP_call && !_hasopq && g_grind_drive_active && _fp &&
+                    if (opcode == OP_call && !_hasopq && _fp &&
+                        b->func_kind == JS_FUNC_NORMAL &&   /* L1 universal (un-gated): trampoline a NORMAL->NORMAL call. async/generator CALLERS stay on the proven C path — their frames live in async_func_init's malloc buffer (not the arena), so the reload's arena pop/cur_sp semantics don't apply to them. Deep SYNCHRONOUS recursion (the C-stack-overflow case) is normal->normal and IS trampolined; async recursion is bounded by the microtask loop, so this restriction keeps overflow-proofing while staying value-correct. The value-correctness blocker (free_zero UAF) was the reload restoring the WRONG var_refs (sf->var_refs = this frame's own capturable slots) instead of p->u.func.var_refs (the closure refs OP_get_var_ref* deref) — fixed at the reload (var_refs = _cp->u.func.var_refs) + resume-entry. */
                         _fp->class_id == JS_CLASS_BYTECODE_FUNCTION &&
                         _fp->u.func.function_bytecode->func_kind == JS_FUNC_NORMAL) {
                         /* No JSPI suspend and no inline job-drain here: preemption
@@ -24567,7 +24576,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             ctx = b->realm;
             var_buf = sf->var_buf;
             arg_buf = sf->arg_buf;
-            var_refs = sf->var_refs;
+            var_refs = _cp->u.func.var_refs;   /* L1 FIX: the C-local var_refs is the CLOSURE refs that OP_get_var_ref* read (21800: *var_refs[0]->pvalue) — NOT sf->var_refs, which is this frame's OWN capturable slots (stack_buf+stack_size, NULL-init). Restoring sf->var_refs made a reloaded caller's closure access deref a NULL/garbage var-ref => garbage JSValue => the free_zero UAF. setup_callee (20858) + generator-resume (20694) set p->u.func.var_refs; the reload must match. */
             stack_buf = var_buf + b->var_count;
             local_buf = sf->qjs_local_buf;
             _arena_chunk = sf->qjs_arena_chunk;

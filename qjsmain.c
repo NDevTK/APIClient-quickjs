@@ -323,6 +323,13 @@ EM_JS(void, fe_trace_append, (const char *path, const char *line), {
     var p = UTF8ToString(Number(path));
     (Module.__feTrace[p] || (Module.__feTrace[p] = [])).push(UTF8ToString(Number(line)));
 });
+/* PERMANENT L1 invariant tooling: crash-surviving double-free capture. The
+   value-correctness of the heap trampoline (no rc 0->-1 double-decref) is the L1
+   gate; this counter survives a boot abort so the corrupting (freeSite:funcLine)
+   is readable via the worker (self.__dfree count + self.__dfl ring). */
+EM_JS(void, qjs_note_dfree, (int site, int line), {
+    try { self.__dfree = (self.__dfree | 0) + 1; var r = (self.__dfl || (self.__dfl = [])); r.push(Number(site) + ":" + Number(line)); if (r.length > 24) r.shift(); } catch (e) {}
+});
 /* Read a slice STRAIGHT from the in-memory map into a malloc'd, NUL-terminated buffer
    — no fopen, no filesystem. The sources originate in JS (the worker's inMem), so
    reading them directly is the right path; fopen would only round-trip JS bytes
