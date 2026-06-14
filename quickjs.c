@@ -106,13 +106,6 @@ static int qjs_dir_active = 0;
    bounded (overflow is a forced-exec/grind artifact, CLAUDE.md), so C-recursion is
    correct there until the snapshot-fork (build-order step 5) replaces the image. */
 static int g_grind_drive_active;
-/* Output-based progress signal (CLAUDE.md step 4 — output-based starvation):
-   the running count of @H (endpoint) and @S (XSS) EMISSIONS — the ACTUAL moat
-   output a flow produces. js_print (quickjs-libc.c) bumps it on every "@H "/"@S "
-   record. The trampoline reads it to STARVE a recursion that emits nothing new
-   (qjs_output_n flat across a re-entry) — sound, unlike the args-fixpoint
-   recur_collapse or the forced-state seen-set (both flat on a concrete boot). */
-int qjs_output_n = 0;
 /* The current value-spread target (qjs_drive_orphan_enum): a known body-builder
    that provably reaches a host edge via a CALL (qjs_is_cond_body_builder gated
    it in). qjs_host_reach_check below only sees DIRECT/closure-literal host edges,
@@ -2376,7 +2369,6 @@ struct JSRuntime {
     uint8_t qjs_resume_chain;               /* driver requests a resume-entry (reload current_stack_frame) */
     uint8_t qjs_yield_req;                  /* host requests the engine yield at the next safe point */
     uint8_t qjs_driving;                    /* set by the driver around bundle exec: only then does the dispatch yield-RETURN (an arbitrary internal eval's caller doesn't loop) */
-    uint8_t qjs_yield_ok;                   /* a DRIVER set this before its JS_CallInternal: only that invocation may yield-RETURN. JS_CallInternal reads it once into a C local then CLEARS it, so a NESTED non-driver call (constructor/native/method) reads 0 and never yields into a C caller that can't resume it (the boot-OOB root). */
 
     JSInterruptHandler *interrupt_handler;
     void *interrupt_opaque;
@@ -2494,12 +2486,10 @@ typedef struct JSStackFrame {
     struct JSStackChunk *qjs_arena_chunk;   /* this frame's heap-stack segment, for the pop */
     uint8_t *qjs_arena_save;                /* bump pointer to restore on pop */
     int qjs_call_argc;                      /* args the caller pushed for the in-progress call */
-    uint8_t qjs_call_extra;                 /* 1 = OP_call (func), 2 = OP_call_method/constructor (this|new_target + func) */
+    uint8_t qjs_call_extra;                 /* 1 = OP_call (func), 2 = OP_call_method (this+func) */
     uint8_t qjs_is_tail;                    /* the in-progress call was a tail call */
-    uint8_t qjs_call_ctor;                  /* in-progress call is a base/legacy constructor — apply return-munging at done: */
     JSValue qjs_this;                       /* this_obj for this frame (reloaded on a trampoline return) */
     JSValue qjs_new_target;                 /* new_target for this frame (reloaded on a trampoline return) */
-    int qjs_entry_seen;                     /* qjs_fe_seen_n watermark at this frame's entry (output-based recursion starvation) */
 } JSStackFrame;
 
 typedef enum {
@@ -3119,17 +3109,6 @@ typedef struct JSAsyncFunctionState {
     int argc; /* number of function arguments */
     bool throw_flag; /* used to throw an exception in JS_CallInternal() */
     JSStackFrame frame;
-    /* #4 per-flow heap (the shared-state fix): THIS flow's own three-value state —
-       a PRIVATE arena chunk list + its frame chain + its scheduler re-entry —
-       saved/restored AS ONE UNIT across each resume (async_func_resume) so
-       concurrent parked async/generator flows never share one bump allocator or
-       desync frame-vs-arena (attempt 1 swapped js_stack alone -> corruption).
-       flow_started=0 until the first resume creates &frame chaining onto the
-       caller (don't restore current_stack_frame while fresh). */
-    struct JSStackChunk *flow_js_stack;
-    struct JSStackFrame *flow_frame;
-    struct JSStackFrame *flow_yield_entry;
-    uint8_t flow_started;
 } JSAsyncFunctionState;
 
 /* XXX: could use an object instead to avoid the
@@ -3450,8 +3429,6 @@ static JSValue JS_CallConstructorInternal(JSContext *ctx,
                                           JSValueConst func_obj,
                                           JSValueConst new_target,
                                           int argc, JSValueConst *argv, int flags);
-static JSValue js_create_from_ctor(JSContext *ctx, JSValueConst ctor,
-                                   int class_id);   /* used by the base-ctor trampoline (OP_call_constructor) before its definition */
 static JSValue JS_CallFree(JSContext *ctx, JSValue func_obj, JSValueConst this_obj,
                            int argc, JSValueConst *argv);
 static JSValue JS_InvokeFree(JSContext *ctx, JSValue this_val, JSAtom atom,
@@ -11013,16 +10990,7 @@ static no_inline __exception int __js_poll_interrupts(JSContext *ctx)
 #if defined(__EMSCRIPTEN__) && defined(QJS_HAS_JSPI)
     qjs_emit_yield_status(ctx);
 #endif
-    /* When DRIVING (return-to-scheduler ON), preemption is the trampoline's
-       YIELD_POLL job: it saves cur_sp/cur_pc (the heap-arena frame becomes
-       SUSPENDED → freeable/resumable) and yield-RETURNS to the driver. A JSPI
-       suspend here instead would unwind the wasm stack while the arena frame
-       stays live (cur_sp == NULL → "running"), and the boot image then captures
-       that orphan (list_empty leak at teardown). So skip the JSPI suspend when
-       driving — the driver (qjs_eval_script / js_async_function_resume) delivers
-       host work at the yield-return points. driving==0 (grind/classic boot) keeps
-       the JSPI suspend: those callers resume it in-place, never image it. */
-    if (!rt->qjs_driving) QJS_DO_YIELD();
+    QJS_DO_YIELD();
     if (rt->interrupt_handler) {
         if (rt->interrupt_handler(rt, rt->interrupt_opaque)) {
             JS_ThrowInterrupted(ctx);
@@ -20256,13 +20224,11 @@ static void close_var_ref(JSRuntime *rt, JSVarRef *var_ref)
 JSValue qjs_resume_chain_call(JSContext *ctx)
 {
     ctx->rt->qjs_resume_chain = 1;
-    ctx->rt->qjs_yield_ok = 1;   /* driver re-entry: this invocation may yield-RETURN again */
     return JS_CallInternal(ctx, JS_UNDEFINED, JS_UNDEFINED, JS_UNDEFINED, 0, NULL, 0);
 }
 
 /* Driver accessors (the qjs_driving/qjs_yielded fields are private to quickjs.c). */
 void qjs_set_driving(JSContext *ctx, int v) { ctx->rt->qjs_driving = (uint8_t)(v ? 1 : 0); }
-int  qjs_get_driving(JSContext *ctx) { return ctx->rt->qjs_driving; }
 int  qjs_take_yielded(JSContext *ctx) { int y = ctx->rt->qjs_yielded; ctx->rt->qjs_yielded = 0; return y; }
 
 /* ---- Per-flow heap (context switch) -------------------------------------
@@ -20619,7 +20585,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             rt->interrupt_handler(rt, rt->interrupt_opaque)) {                  \
             JS_ThrowInterrupted(ctx); goto exception;                           \
         }                                                                       \
-        if (rt->qjs_driving && _yield_safe) {                                   \
+        if (rt->qjs_driving) {                                                  \
             sf->cur_pc = pc; sf->cur_sp = sp;                                   \
             rt->qjs_yield_entry = entry_frame; rt->qjs_yielded = 1;             \
             return JS_UNDEFINED;                                                \
@@ -20632,12 +20598,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        dispatch loop (NOT a new frame) — the heap chain on js_stack /
        current_stack_frame was left intact by the yield-return. BEFORE
        js_poll_interrupts so a resume does not re-yield. */
-    /* Read-once the driver's yield permission into a C local, then CLEAR it so a
-       NESTED JS_CallInternal (constructor/native/method this invocation makes)
-       sees 0 and never yield-RETURNs into a C caller that can't resume it (the
-       boot-OOB root). Drivers (js_async_function_resume, qjs_resume_chain_call)
-       re-arm it before each (re-)entry. */
-    int _yield_safe = rt->qjs_yield_ok; rt->qjs_yield_ok = 0;
     if (unlikely(rt->qjs_resume_chain)) {
         rt->qjs_resume_chain = 0;
         rt->qjs_yielded = 0;
@@ -20653,21 +20613,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         _arena_chunk = sf->qjs_arena_chunk;
         _arena_save = sf->qjs_arena_save;
         this_obj = sf->qjs_this;
-        if (JS_VALUE_GET_TAG(this_obj) == JS_TAG_OBJECT) { JSObject *_dto = JS_VALUE_GET_OBJ(this_obj); if (!_dto || _dto->header.ref_count <= 0) { static long _dtn = 0; if (_dtn++ < 40) { fprintf(stderr, "@WHY {\"phase\":\"dead_this\",\"at\":\"resume\",\"line\":%d,\"rc\":%d}\n", b ? b->line_num : -1, _dto ? _dto->header.ref_count : -1); fflush(stderr); } } }
         new_target = sf->qjs_new_target;
         pc = sf->cur_pc;
         sp = sf->cur_sp;
-        /* DIAG (shared-resume-state hypothesis): the resume reloads the frame named by
-           the GLOBAL qjs_yield_entry / current_stack_frame. If a DIFFERENT async flow
-           overwrote that global state (esm's many concurrent async frames), sf is the
-           wrong/freed frame → cur_sp is NULL or outside this frame's value stack
-           [stack_buf, stack_buf+stack_size] → the wild-pointer "memory access out of
-           bounds". Catch it before the dispatch dereferences sp. */
-        { JSValue *_lo = stack_buf, *_hi = stack_buf + b->stack_size;
-          if (sf->cur_sp == NULL || sp < _lo || sp > _hi) {
-            static long _rbsp = 0;
-            if (_rbsp++ < 40) { fprintf(stderr, "@WHY {\"phase\":\"resume_bad_sp\",\"line\":%d,\"col\":%d,\"nullsp\":%d,\"ss\":%d}\n", b->line_num, b->col_num, sf->cur_sp == NULL ? 1 : 0, b->stack_size); fflush(stderr); }
-          } }
         sf->cur_sp = NULL;
         goto reenter_dispatch;
     }
@@ -20851,7 +20799,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         sf->qjs_call_argc = 0;                /* set by the caller at OP_call (step 3b) */
         sf->qjs_call_extra = 0;
         sf->qjs_is_tail = 0;
-        sf->qjs_call_ctor = 0;                /* set by the caller at OP_call_constructor */
         sf->qjs_this = this_obj;              /* reloaded on a trampoline return so the caller's this is restored */
         sf->qjs_new_target = new_target;
     }
@@ -20887,7 +20834,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     pc = b->byte_code_buf;
     /* sf->cur_pc must we set to pc before any recursive calls to JS_CallInternal. */
     sf->cur_pc = NULL;
-    sf->qjs_entry_seen = qjs_output_n;   /* output watermark for recursion starvation */
     sf->prev_frame = rt->current_stack_frame;
     rt->current_stack_frame = sf;
     ctx = b->realm; /* set the current realm */
@@ -21323,41 +21269,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        overflow case the heap stack fixes. */
                     int _hasopq = 0;
                     { int _k; for (_k = 0; _k < call_argc; _k++) if (qjs_is_opaque(call_argv[_k])) { _hasopq = 1; break; } }
-                    /* OUTPUT-BASED RECURSION STARVATION (CLAUDE.md step 4 — the sound
-                       replacement for recur_collapse + the banned C-stack-overflow cap).
-                       A driven boot trampolines its real recursion on the heap arena; a
-                       runaway (a node-polyfill / SDK init recursing on the incomplete
-                       environment) would grow the arena to OOB. Detect it by EMITTED
-                       OUTPUT, not depth: a re-entry of the SAME closure that has produced
-                       NO new @H/@S (qjs_output_n flat since the ancestor's entry) makes no
-                       moat progress, so STARVE its deep arm — resolve it to opaque so the
-                       caller proceeds (forced-exec opacity) and BREADTH reaches the base
-                       case. Sound: trigger is real output, never the args-fixpoint
-                       (unsound) nor a no-progress count (banned). Gated to qjs_driving
-                       (the boot) — the grind keeps its own recur_collapse below. The
-                       FIRST entry already ran its body; only the no-output re-entry
-                       collapses. (Build-order step 5 turns this opaque collapse into a
-                       RESUMABLE per-flow snapshot; for now the deep arm is opaque.) */
-                    /* OUTPUT SIGNAL (CLAUDE.md step 4) is plumbed (qjs_output_n bumped on
-                       each @H/@S emission; qjs_entry_seen watermarks every frame). The
-                       output-based STARVATION ACTION is NOT wired here: an opaque COLLAPSE
-                       of a no-output recursion is unsound — it permanently loses a
-                       productive recursion that emits its @H only AFTER recursing (verified:
-                       it regressed sdk_firebase 13->8). The sound action is a RESUMABLE
-                       per-flow PAUSE (build-order step 5): the deep arm is snapshot + parked
-                       and RESUMED when higher-value flows quiesce, never collapsed. Until
-                       step 5 lands, the boot's recursion runs as plain trampoline. (esm's
-                       regression is a separate cause: modload_fail under driving=1, not a
-                       trampoline recursion — the trampoline never fires on its async boot.) */
-                    /* Trampoline when DRIVING (the boot's module branch sets
-                       qjs_driving=1) as well as during the grind. Driving wires the
-                       full return-to-scheduler loop (YIELD_POLL saves cur_sp, the
-                       driver resumes via qjs_resume_chain_call, QJS_DO_YIELD is
-                       disabled) — so a driven boot trampolines on the heap arena and
-                       tears down cleanly (every frame either returned or is suspended,
-                       never an imaged orphan). This is the universal-trampoline step:
-                       the boot is no longer special-cased to C-recursion. */
-                    if (opcode == OP_call && !_hasopq && (g_grind_drive_active || rt->qjs_driving) && _fp &&
+                    if (opcode == OP_call && !_hasopq && g_grind_drive_active && _fp &&
                         _fp->class_id == JS_CLASS_BYTECODE_FUNCTION &&
                         _fp->u.func.function_bytecode->func_kind == JS_FUNC_NORMAL) {
                         /* No JSPI suspend and no inline job-drain here: preemption
@@ -21368,7 +21280,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         sf->qjs_call_argc = call_argc;
                         sf->qjs_call_extra = 1;     /* OP_call: free func + args on return */
                         sf->qjs_is_tail = 0;
-                        sf->qjs_call_ctor = 0;      /* not a constructor — no return-munging */
                         func_obj = _fo; this_obj = JS_UNDEFINED; new_target = JS_UNDEFINED;
                         argc = call_argc; argv = vc(call_argv); flags = 0;
                         p = _fp; b = _fp->u.func.function_bytecode;
@@ -21394,55 +21305,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc += 2;
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
-                /* Unified base/legacy constructor ON THE TRAMPOLINE (build-order 3u):
-                   create `this` (js_create_from_ctor — exactly JS_CallConstructorInternal's
-                   legacy branch) and run the constructor body in THIS dispatch loop on the
-                   heap arena, never a nested C-recursive JS_CallConstructorInternal. That
-                   nested call was the boot-OOB root: its body's YIELD_POLL returned
-                   JS_UNDEFINED into a C frame that could not resume it. On the trampoline
-                   the body yields/resumes cleanly like any frame, so driving stays ON — no
-                   suppression, no lost constructor-internal drive (the firebase 13->6 trade
-                   is recovered) — and the constructor return-munging (ret is object -> ret;
-                   else -> the created this) runs at the done: teardown. Only the BASE
-                   bytecode case trampolines; derived-class (super()-created this), native,
-                   bound, proxy and opaque constructors fall through to the C-recursive
-                   JS_CallConstructorInternal — under driving=1, but a nested JS_CallInternal
-                   reads-once-and-clears qjs_yield_ok so it never yield-returns into that
-                   non-resumable C caller (the suppression hack is no longer needed). */
-                {
-                    JSValue _cfo = call_argv[-2], _cnt = call_argv[-1];
-                    JSObject *_cfp = (JS_VALUE_GET_TAG(_cfo) == JS_TAG_OBJECT)
-                                     ? JS_VALUE_GET_OBJ(_cfo) : NULL;
-                    /* UNIVERSAL (grind + boot), same gate as OP_call: the boot (driving=1) is
-                       where the OOB lives — a ctor body that yield-RETURNs JS_UNDEFINED into a
-                       non-resumable JS_CallConstructorInternal C caller; the trampoline runs the
-                       body in THIS dispatch loop so it yields/resumes cleanly (esm 9->24). The
-                       grind (g_grind_drive_active, driving=0) has no yield, so no OOB there — it
-                       trampolines purely to overflow-proof deep `new` chains on the heap arena.
-                       A driving-only scope was tested and made ZERO difference to firebase (5),
-                       esm (24), directus (42), supabase (23) — so the universal gate is kept (no
-                       legacy fallback). firebase's old "13" baseline was stale: with the ctor path
-                       made HEAD-identical it still measured 5, so there is no ctor regression. */
-                    if ((g_grind_drive_active || rt->qjs_driving) && _cfp &&
-                        _cfp->is_constructor &&
-                        _cfp->class_id == JS_CLASS_BYTECODE_FUNCTION &&
-                        _cfp->u.func.function_bytecode->func_kind == JS_FUNC_NORMAL &&
-                        !_cfp->u.func.function_bytecode->is_derived_class_constructor &&
-                        !qjs_is_opaque(_cfo) && !qjs_is_opaque(_cnt)) {
-                        JSValue _cthis = js_create_from_ctor(ctx, _cnt, JS_CLASS_OBJECT);
-                        if (unlikely(JS_IsException(_cthis)))
-                            goto exception;
-                        sf->cur_sp = sp;
-                        sf->qjs_call_argc = call_argc;
-                        sf->qjs_call_extra = 2;     /* constructor: free func + new_target on return */
-                        sf->qjs_is_tail = 0;
-                        sf->qjs_call_ctor = 1;      /* done: applies constructor return-munging */
-                        func_obj = _cfo; this_obj = _cthis; new_target = _cnt;
-                        argc = call_argc; argv = vc(call_argv); flags = JS_CALL_FLAG_CONSTRUCTOR;
-                        p = _cfp; b = _cfp->u.func.function_bytecode;
-                        goto setup_callee;
-                    }
-                }
                 ret_val = JS_CallConstructorInternal(ctx, call_argv[-2],
                                                      call_argv[-1], call_argc,
                                                      vc(call_argv), 0);
@@ -21481,33 +21343,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        their per-element fetch (see helper). */
                     qjs_drive_opaque_call_cbs(ctx, vc(call_argv), call_argc);
                 } else {
-                    /* Method call on the heap trampoline (overflow-impossible for a.b()
-                       chains; pause/resume-able). Mirrors the OP_call trampoline EXACTLY
-                       — concrete bytecode NORMAL callee, no opaque arg, driving/grind —
-                       with extra=2 (free this + func) and this_obj = the receiver at
-                       call_argv[-2]. ONLY OP_call_method: a TAIL method call must REPLACE
-                       the frame (goto done), not push+splice; trampolining it as a normal
-                       call was the directus boot OOB (sp mismatch on the tail path, where
-                       driving=1 makes YIELD_POLL live — the 14 classic synthetics never
-                       hit it). Tail method calls stay on the C path below. */
-                    JSValue _fo = call_argv[-1];
-                    JSObject *_fp = (JS_VALUE_GET_TAG(_fo) == JS_TAG_OBJECT)
-                                    ? JS_VALUE_GET_OBJ(_fo) : NULL;
-                    int _hasopq = 0;
-                    { int _k; for (_k = 0; _k < call_argc; _k++) if (qjs_is_opaque(call_argv[_k])) { _hasopq = 1; break; } }
-                    if (opcode == OP_call_method && !_hasopq && (g_grind_drive_active || rt->qjs_driving) && _fp &&
-                        _fp->class_id == JS_CLASS_BYTECODE_FUNCTION &&
-                        _fp->u.func.function_bytecode->func_kind == JS_FUNC_NORMAL) {
-                        sf->cur_sp = sp;
-                        sf->qjs_call_argc = call_argc;
-                        sf->qjs_call_extra = 2;     /* OP_call_method: free this + func on return */
-                        sf->qjs_is_tail = 0;
-                        sf->qjs_call_ctor = 0;
-                        func_obj = _fo; this_obj = call_argv[-2]; new_target = JS_UNDEFINED;
-                        argc = call_argc; argv = vc(call_argv); flags = 0;
-                        p = _fp; b = _fp->u.func.function_bytecode;
-                        goto setup_callee;
-                    }
                     ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
                                               JS_UNDEFINED, call_argc,
                                               vc(call_argv), 0);
@@ -24713,7 +24548,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     {
         JSStackChunk *_cc = _arena_chunk;   /* the just-finished frame's segment */
         uint8_t *_cs = _arena_save;
-        JSValue _callee_this = sf->qjs_this; /* a base-ctor callee's CREATED this (munged below); borrowed otherwise */
         if (sf == entry_frame || b->func_kind != JS_FUNC_NORMAL) {
             if (_cc)
                 js_stack_pop(rt, _cc, _cs);
@@ -24728,7 +24562,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         {
             int _cargc = sf->qjs_call_argc, _cextra = sf->qjs_call_extra;
             uint8_t _tail = sf->qjs_is_tail;
-            uint8_t _ctor = sf->qjs_call_ctor;
             JSObject *_cp = JS_VALUE_GET_OBJ(sf->cur_func);
             b = _cp->u.func.function_bytecode;
             ctx = b->realm;
@@ -24740,28 +24573,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             _arena_chunk = sf->qjs_arena_chunk;
             _arena_save = sf->qjs_arena_save;
             this_obj = sf->qjs_this;
-            if (JS_VALUE_GET_TAG(this_obj) == JS_TAG_OBJECT) { JSObject *_dto = JS_VALUE_GET_OBJ(this_obj); if (!_dto || _dto->header.ref_count <= 0) { static long _dtn2 = 0; if (_dtn2++ < 40) { JSObject *_cp2 = JS_VALUE_GET_OBJ(sf->cur_func); JSFunctionBytecode *_b2 = _cp2 ? _cp2->u.func.function_bytecode : NULL; fprintf(stderr, "@WHY {\"phase\":\"dead_this\",\"at\":\"return\",\"line\":%d,\"rc\":%d}\n", _b2 ? _b2->line_num : -1, _dto ? _dto->header.ref_count : -1); fflush(stderr); } } }
             new_target = sf->qjs_new_target;
             pc = sf->cur_pc;
             sp = sf->cur_sp;
             sf->cur_sp = NULL;            /* caller is running again (not suspended) */
             js_stack_pop(rt, _cc, _cs);   /* free the callee's segment (caller restored) */
-            if (_ctor) {
-                /* Legacy constructor return-munging (JS_CallConstructorInternal's legacy
-                   branch): the callee's CREATED this was sf->qjs_this (_callee_this), NOT
-                   on the caller's stack — the splice's extra=2 frees only func+new_target.
-                   ret is object (or exception) -> use ret, drop the created this; else ->
-                   drop ret, return the created this. Refcount: js_create_from_ctor gave
-                   _callee_this rc=1 held by the frame; we either free that ref or transfer
-                   it to ret_val (pushed by the splice). Exception falls through to the
-                   goto exception below with the created this already freed. */
-                if (JS_IsException(ret_val) || JS_VALUE_GET_TAG(ret_val) == JS_TAG_OBJECT) {
-                    JS_FreeValue(ctx, _callee_this);
-                } else {
-                    JS_FreeValue(ctx, ret_val);
-                    ret_val = _callee_this;
-                }
-            }
             /* Match the C-return semantics: a trampolined callee's return-object is
                still the candidate producer output for the NEXT call's cold-composition
                entry CHECK (identity only). Without this, client.request(cmd()) chains
@@ -24777,16 +24593,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JS_FreeValue(ctx, (sp - _cargc)[i]);
             sp -= _cargc + _cextra;
             *sp++ = ret_val;
-            /* DIAG: after splicing a trampolined return, the caller's sp must be within
-               its value stack [stack_buf, stack_buf+stack_size]. If a method/constructor
-               trampoline stamped the wrong extra/argc, sp lands out of bounds and the
-               next dispatch op OOBs (directus method-trampoline OOB @0x347c3). Catch it
-               here with the caller's line. */
-            { JSValue *_csb = var_buf + b->var_count;
-              if (sp < _csb || sp > _csb + b->stack_size) {
-                static long _bsn = 0;
-                if (_bsn++ < 50) { fprintf(stderr, "@WHY {\"phase\":\"splice_bad_sp\",\"line\":%d,\"col\":%d,\"extra\":%d,\"argc\":%d,\"off\":%ld,\"ss\":%d}\n", b->line_num, b->col_num, _cextra, _cargc, (long)(sp - _csb), b->stack_size); fflush(stderr); }
-              } }
             goto reenter_dispatch;
         }
     }
@@ -25018,10 +24824,6 @@ static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s,
     n = arg_buf_len + b->var_count;
     for(i = argc; i < n; i++)
         sf->arg_buf[i] = JS_UNDEFINED;
-    s->flow_js_stack = NULL;        /* #4: fresh private arena (first nested call allocates its own) */
-    s->flow_frame = NULL;
-    s->flow_yield_entry = NULL;
-    s->flow_started = 0;
     return 0;
 }
 
@@ -25065,58 +24867,20 @@ static void async_func_free(JSRuntime *rt, JSAsyncFunctionState *s)
     }
     JS_FreeValueRT(rt, sf->cur_func);
     JS_FreeValueRT(rt, s->this_val);
-    /* #4: reclaim this flow's private arena chunks. Normally NULL — a completed flow
-       popped them via the done: teardown. Non-NULL = freed while parked mid-call
-       (a parked flow is kept alive by its pending job, so this should not happen);
-       surface it and free the chunk memory. */
-    if (s->flow_js_stack) {
-        static long _ffn = 0;
-        if (_ffn++ < 20) { fprintf(stderr, "@WHY {\"phase\":\"async_flow_abandon\"}\n"); fflush(stderr); }
-        { JSStackChunk *_c = s->flow_js_stack; while (_c) { JSStackChunk *_p = _c->prev; js_free_rt(rt, _c); _c = _p; } s->flow_js_stack = NULL; }
-    }
 }
 
 static JSValue async_func_resume(JSContext *ctx, JSAsyncFunctionState *s)
 {
-    JSValue func_obj, ret;
-    JSRuntime *rt = ctx->rt;
-    JSStackChunk *save_js_stack;
-    JSStackFrame *save_frame, *save_yield_entry;
+    JSValue func_obj;
 
-    if (js_check_stack_overflow(rt, 0))
+    if (js_check_stack_overflow(ctx->rt, 0))
         return JS_ThrowStackOverflow(ctx);
 
     /* the tag does not matter provided it is not an object */
     func_obj = JS_MKPTR(JS_TAG_INT, s);
-    /* #4 per-flow heap: switch the FULL flow state (arena chunks + frame chain +
-       scheduler re-entry) FROM the caller TO this flow, run, then switch back — all
-       THREE together so they never desync (attempt 1 swapped js_stack here but left
-       the frame to a band-aid elsewhere -> inconsistent across qjs_host_yield ->
-       concurrent flows corrupted each other). This flow's arena is a PRIVATE chunk
-       list (NULL the first time = fresh), so a parked flow's segments are never on
-       the same bump allocator as another flow's. On the FIRST resume the frame chain
-       does not exist yet (the generator-path entry creates &frame chaining onto the
-       caller), so leave current_stack_frame as the caller's; from the first save on,
-       restore this flow's parked chain. */
-    save_js_stack = rt->js_stack;
-    save_frame = rt->current_stack_frame;
-    save_yield_entry = rt->qjs_yield_entry;
-    rt->js_stack = s->flow_js_stack;
-    if (s->flow_started) {
-        rt->current_stack_frame = s->flow_frame;
-        rt->qjs_yield_entry = s->flow_yield_entry;
-    }
-    ret = JS_CallInternal(ctx, func_obj, s->this_val, JS_UNDEFINED,
-                          s->argc, vc(s->frame.arg_buf),
-                          JS_CALL_FLAG_GENERATOR);
-    s->flow_js_stack = rt->js_stack;
-    s->flow_frame = rt->current_stack_frame;
-    s->flow_yield_entry = rt->qjs_yield_entry;
-    s->flow_started = 1;
-    rt->js_stack = save_js_stack;
-    rt->current_stack_frame = save_frame;
-    rt->qjs_yield_entry = save_yield_entry;
-    return ret;
+    return JS_CallInternal(ctx, func_obj, s->this_val, JS_UNDEFINED,
+                           s->argc, vc(s->frame.arg_buf),
+                           JS_CALL_FLAG_GENERATOR);
 }
 
 
@@ -25369,7 +25133,6 @@ static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
     bool is_success = true;
     JSValue func_ret, ret2;
 
-    ctx->rt->qjs_yield_ok = 1;   /* driver: this async invocation may yield-RETURN to us */
     func_ret = async_func_resume(ctx, &s->func_state);
     /* Opcode-level preemption: a trampolined callee inside this async frame
        yield-RETURNED at the dispatch cadence (func_ret is JS_UNDEFINED, the parked
@@ -25383,15 +25146,8 @@ static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
        genuinely awaits or completes. */
     while (ctx->rt->qjs_yielded) {
         ctx->rt->qjs_yielded = 0;
-        /* #4 per-flow: NO manual global save/restore here. async_func_resume does the
-           FULL per-flow switch (js_stack + current_stack_frame + yield_entry as ONE
-           unit), keeping THIS flow's resume target in s->func_state.flow — so
-           qjs_host_yield running other async flows can't clobber it (the resume-entry
-           reads the flow restored by the next async_func_resume, not a shared global).
-           The save/restore band-aid that lived here is subsumed by that switch. */
         qjs_host_yield();
         ctx->rt->qjs_resume_chain = 1;
-        ctx->rt->qjs_yield_ok = 1;   /* driver re-drive: this async invocation may yield-RETURN again */
         func_ret = async_func_resume(ctx, &s->func_state);
     }
     if (JS_IsException(func_ret)) {
@@ -53279,11 +53035,7 @@ int lre_check_timeout(void *opaque)
        priority fibers, then the regex resumes. NOT an abort/cap — what the
        regex computes is unchanged; native/non-JSPI builds compile it to a
        no-op. */
-    /* Same desync guard as __js_poll_interrupts: a JSPI suspend while driving
-       would strand the caller's live heap-arena frames. While driving, the regex
-       runs to its result between op-heartbeats (libregexp's own poll just checks
-       the interrupt handler); the scheduler preempts at the next JS-op YIELD_POLL. */
-    if (!rt->qjs_driving) QJS_DO_YIELD();
+    QJS_DO_YIELD();
     return (rt->interrupt_handler &&
             rt->interrupt_handler(rt, rt->interrupt_opaque));
 }

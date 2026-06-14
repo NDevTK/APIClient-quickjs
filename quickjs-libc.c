@@ -891,7 +891,6 @@ JSModuleDef *js_module_load(JSContext *ctx, const char *module_name,
     if (type != JS_IMPORT_TYPE_BYTES)
         if (js__has_suffix(module_name, ".json"))
             type = JS_IMPORT_TYPE_JSON;
-    static int _mld = 0; _mld++;   /* DIAG: js_module_load C-nesting depth (transitive import recursion) */
     buf = (char *)load_file(ctx, &buf_len, module_name);
 #if defined(__EMSCRIPTEN__) && defined(QJS_HAS_JSPI)
     if (!buf) {
@@ -908,12 +907,8 @@ JSModuleDef *js_module_load(JSContext *ctx, const char *module_name,
     }
 #endif
     { static long _ml_n = 0; static long _ml_ok = 0; _ml_n++; if (buf) _ml_ok++;
-      else { extern long fe_map_id(void); extern long fe_map_size(void);
-             fprintf(stderr, "@WHY {\"phase\":\"modload_fail\",\"n\":%ld,\"okBefore\":%ld,\"depth\":%d,\"mapId\":%ld,\"mapSize\":%ld,\"path\":\"%s\"}\n", _ml_n, _ml_ok, _mld, fe_map_id(), fe_map_size(), module_name); fflush(stderr); }
-      { extern int qjs_get_driving(JSContext *);
-        if (_ml_n <= 80) { fprintf(stderr, "@WHY {\"phase\":\"modload_trace\",\"n\":%ld,\"ok\":%d,\"drv\":%d,\"mod\":\"%s\"}\n", _ml_n, buf ? 1 : 0, qjs_get_driving(ctx), module_name); fflush(stderr); } } }
+      else { fprintf(stderr, "@WHY {\"phase\":\"modload_fail\",\"n\":%ld,\"okBefore\":%ld,\"path\":\"%s\"}\n", _ml_n, _ml_ok, module_name); fflush(stderr); } }
     if (!buf) {
-        _mld--;
         JS_ThrowReferenceError(ctx, "could not load module filename '%s'",
                                module_name);
         return NULL;
@@ -965,7 +960,6 @@ JSModuleDef *js_module_load(JSContext *ctx, const char *module_name,
         JS_AddModuleExport(ctx, m, "default");
         JS_SetModulePrivateValue(ctx, m, val);
     }
-    _mld--;
     return m;
 }
 
@@ -4589,16 +4583,6 @@ static JSValue js_print(JSContext *ctx, JSValueConst this_val,
         }
     }
     dbuf_putc(&b, '\n');
-    /* Output-based starvation signal (CLAUDE.md step 4): count @H (endpoint) and
-       @S (XSS) EMISSIONS — the real moat output. The interpreter's trampoline
-       reads qjs_output_n to starve a recursion that produces nothing new, instead
-       of running it to arena OOM. This is the ACTUAL output, not a forced-state
-       seen-set (flat on a concrete boot) nor a depth cap (banned). */
-    {
-        extern int qjs_output_n;
-        if (b.size >= 3 && b.buf[0] == '@' && (b.buf[1] == 'H' || b.buf[1] == 'S') && b.buf[2] == ' ')
-            qjs_output_n++;
-    }
 #ifdef _WIN32
     // use WriteConsoleA with CP_UTF8 for better Unicode handling vis-a-vis
     // the mangling that happens when going through msvcrt's stdio layer,
