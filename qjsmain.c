@@ -301,7 +301,13 @@ EM_JS(long, fe_map_len, (const char *path), {
     if (!Module.__feLogged && (!m || m.size === 0)) { Module.__feLogged = 1;
         err("@WHY {\"phase\":\"feMap\",\"hasMap\":" + (!!m) + ",\"size\":" + (m ? m.size : -1) + ",\"first\":" + JSON.stringify(p) + "}"); }
     if (!m) return -1n;
-    var d = m.get(p); return (d === undefined) ? -1n : BigInt(d.length);
+    var d = m.get(p);
+    if (d === undefined) {
+        Module.__feMiss = (Module.__feMiss || 0) + 1;
+        if (Module.__feMiss <= 40) err("@WHY {\"phase\":\"feMiss\",\"path\":" + JSON.stringify(p) + ",\"size\":" + m.size + ",\"hasAuth\":" + (m.has("/@supabase/auth-js@2.108.1/es2022/auth-js.mjs")) + "}");
+        return -1n;
+    }
+    return BigInt(d.length);
 });
 EM_JS(void, fe_map_copy, (const char *path, char *out), {
     var d = Module.__feMap.get(UTF8ToString(Number(path))); if (d) HEAPU8.set(d, Number(out));
@@ -310,6 +316,16 @@ EM_JS(void, fe_map_set, (const char *path, const char *data, long len), {
     if (!Module.__feMap) Module.__feMap = new Map();
     Module.__feMap.set(UTF8ToString(Number(path)), HEAPU8.slice(Number(data), Number(data) + Number(len)));
 });
+/* DIAG: identity (the host marks each instance's _feMap with __feId) + size of the
+   map the ENGINE actually reads — to tell a host/engine map DESYNC (engine reads a
+   different/fresh map than the host stages into) from a real key miss. */
+EM_JS(long, fe_map_id, (void), { var m = Module.__feMap; return BigInt(m ? (m.__feId || 0) : -1); });
+EM_JS(long, fe_map_size, (void), { var m = Module.__feMap; return BigInt(m ? m.size : -1); });
+/* DIAG: crash-surviving counter on the worker global (self), used to settle whether
+   the method trampoline FIRES on a given bundle when capped stderr @WHY logs are lost
+   to an immediate-crash boot. self persists across instance recycles, so the worker can
+   read self.__mtramp after the boot regardless of crashes. */
+EM_JS(void, qjs_note_mtramp, (int line, int col), { try { self.__mtramp = (self.__mtramp | 0) + 1; var r = (self.__mtl || (self.__mtl = [])); r.push(Number(line) + ":" + Number(col)); if (r.length > 24) r.shift(); } catch (e) {} });
 /* In-memory execution-trace sink (replaces the streaming `fopen` FILE* the forced
    controller used to fwrite B/F lines to). The engine appends each trace line here;
    the worker reads Module.__feTrace[path].join("") and never touches a filesystem.
@@ -448,27 +464,44 @@ JSValue qjs_eval_script(JSContext *ctx, const char *src, size_t n,
         JSRuntime *rt = JS_GetRuntime(ctx);
         JSContext *ctx1;
         long _drained = 0;
-        /* Opcode-level preemption is ON during the bundle's exec (qjs_driving). The
-           per-async-frame re-drive lives INSIDE js_async_function_resume (it holds the
-           JSAsyncFunctionData), so here we only drain the microtask queue + deliver
-           host work (qjs_host_yield) to quiescence; the async resumes that run as jobs
-           re-drive their own parked chains internally. */
-        /* Opcode-preemption is OFF on the boot path (qjs_driving=0): the imaged
-           boot is C-recursion (the trampoline is gated to the grind via
-           g_grind_drive_active), so the post-boot HEAPU8 snapshot has an EMPTY heap
-           arena — no orphan trampolined frames to be restored + leaked. The drain
-           below handles the bundle's awaits/fetches. */
-        qjs_set_driving(ctx, 0);
+        /* UNIVERSAL TRAMPOLINE (boot included): opcode-preemption ON (qjs_driving=1).
+           The module body + every callee trampoline on the heap arena and yield-RETURN
+           at the dispatch cadence (YIELD_POLL) instead of JSPI-suspending — so the
+           post-boot HEAPU8 image is taken with the chain either fully returned or
+           cleanly SUSPENDED (cur_sp set, freeable), never a "running" (cur_sp==NULL)
+           orphan that the image would capture (the list_empty leak). Drive to
+           quiescence in three nested loops:
+             (a) resume the top-level body's parked chain to its real return;
+             (b) drain microtasks — async resumes run as jobs and re-drive their own
+                 parked chains inside js_async_function_resume;
+             (c) catch a raw (non-async) job that itself yield-returned, and resume it.
+           qjs_host_yield at each step delivers fetches / @H aggregate. */
+        long _loopA = 0, _forIters = 0, _loopC = 0;   /* DIAG: spin localization (counters only, no cap) */
+        qjs_set_driving(ctx, 1);
+        fprintf(stderr, "@WHY {\"phase\":\"eval_evalfn_pre\",\"file\":\"%s\"}\n", filename ? filename : "(null)"); fflush(stderr);
         v = JS_EvalFunction(ctx, v);
+        fprintf(stderr, "@WHY {\"phase\":\"eval_evalfn_post\",\"file\":\"%s\",\"exc\":%d,\"undef\":%d}\n",
+                filename ? filename : "(null)", JS_IsException(v) ? 1 : 0, JS_IsUndefined(v) ? 1 : 0); fflush(stderr);
+        while (qjs_take_yielded(ctx)) {           /* (a) top-level body → real return */
+            qjs_host_yield();
+            v = qjs_resume_chain_call(ctx);
+            if ((++_loopA % 5000) == 0) { fprintf(stderr, "@WHY {\"phase\":\"eval_spin_A\",\"iters\":%ld}\n", _loopA); fflush(stderr); }
+        }
         for (;;) {
             long _n = 0;
             qjs_host_yield();                     /* deliver fetches / host work */
-            while (JS_ExecutePendingJob(rt, &ctx1) > 0) { _n++; _drained++; }
+            while (JS_ExecutePendingJob(rt, &ctx1) > 0) { _n++; _drained++; }   /* (b) */
+            while (qjs_take_yielded(ctx)) {       /* (c) a raw job yield-returned */
+                qjs_host_yield();
+                qjs_resume_chain_call(ctx);
+                _n++; _loopC++;
+            }
+            if ((++_forIters % 5000) == 0) { fprintf(stderr, "@WHY {\"phase\":\"eval_spin_BC\",\"forIters\":%ld,\"drained\":%ld,\"loopC\":%ld}\n", _forIters, _drained, _loopC); fflush(stderr); }
             if (_n == 0) break;                   /* no microtask ran → quiescent */
         }
         qjs_set_driving(ctx, 0);
-        fprintf(stderr, "@WHY {\"phase\":\"eval_done\",\"file\":\"%s\",\"drained\":%ld}\n",
-                filename ? filename : "(null)", _drained);
+        fprintf(stderr, "@WHY {\"phase\":\"eval_done\",\"file\":\"%s\",\"drained\":%ld,\"loopA\":%ld,\"forIters\":%ld,\"loopC\":%ld}\n",
+                filename ? filename : "(null)", _drained, _loopA, _forIters, _loopC);
         fflush(stderr);
         return v;
     }
