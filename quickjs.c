@@ -20229,15 +20229,26 @@ static void close_var_ref(JSRuntime *rt, JSVarRef *var_ref)
    the interpreter on the intact heap chain (current_stack_frame) — func/args are
    ignored, the resume-entry reloads the top frame. Returns the chain's eventual
    real result (or yields again, leaving rt->qjs_yielded set for the driver loop). */
-JSValue qjs_resume_chain_call(JSContext *ctx)
+/* #8: JS-exported (Module.ccall) so the HOST scheduler drives return-to-scheduler
+   resume — set qjs_driving around bundle exec, read the yield flag after callMain
+   returns, resume the parked heap chain by emitted-output priority (NOT a JSPI
+   suspend; the per-flow image captures the heap frames at the quiescent point). */
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#define QJS_JSEXPORT EMSCRIPTEN_KEEPALIVE
+#else
+#define QJS_JSEXPORT
+#endif
+
+QJS_JSEXPORT JSValue qjs_resume_chain_call(JSContext *ctx)
 {
     ctx->rt->qjs_resume_chain = 1;
     return JS_CallInternal(ctx, JS_UNDEFINED, JS_UNDEFINED, JS_UNDEFINED, 0, NULL, 0);
 }
 
 /* Driver accessors (the qjs_driving/qjs_yielded fields are private to quickjs.c). */
-void qjs_set_driving(JSContext *ctx, int v) { ctx->rt->qjs_driving = (uint8_t)(v ? 1 : 0); }
-int  qjs_take_yielded(JSContext *ctx) { int y = ctx->rt->qjs_yielded; ctx->rt->qjs_yielded = 0; return y; }
+QJS_JSEXPORT void qjs_set_driving(JSContext *ctx, int v) { ctx->rt->qjs_driving = (uint8_t)(v ? 1 : 0); }
+QJS_JSEXPORT int  qjs_take_yielded(JSContext *ctx) { int y = ctx->rt->qjs_yielded; ctx->rt->qjs_yielded = 0; return y; }
 
 /* ---- Per-flow heap (context switch) -------------------------------------
    A FLOW is one code path (the boot, a grind orphan, a forced branch-arm). Each
@@ -20694,83 +20705,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     }
     b = p->u.func.function_bytecode;
 
-    /* No-progress opaque-recursion collapse — the branchless-recursion fixpoint
-       (loop3 / deep_recurse). A function re-entering itself with structurally-
-       identical arguments (an OPAQUE arg of the same identity; concrete args the
-       same value) makes no progress — its result is a pure function of args that
-       repeat — and recurses until the native stack overflows. The OP_if recursion
-       fixpoint can't see it: that one keys only OPAQUE BRANCHES, and a for-in
-       recursion on an opaque value has none. Detect it HERE, before the frame is
-       allocated (so an early return needs no teardown): if this bytecode is
-       already on the caller chain AND every arg SameValue-matches the nearest
-       same-bytecode ancestor's, return opaque — bounding the recursion at the
-       fixpoint instead of the native stack. The FIRST entry already ran (its body
-       explored host edges); only the no-progress re-entry collapses (mirrors the
-       OP_if _recur "arms explored once"). Gated on an opaque arg so concrete-arg
-       calls (the hot path) skip the chain walk, and short-circuits at the nearest
-       same-bytecode ancestor. Skipped for generator/async resume (same logical
-       args, not a new call). */
-    if (!(flags & JS_CALL_FLAG_GENERATOR) && argc > 0) {
-        int _hopq = 0;
-        for (i = 0; i < argc; i++) if (qjs_is_opaque(argv[i])) { _hopq = 1; break; }
-        if (_hopq) {
-            for (JSStackFrame *_anc = rt->current_stack_frame; _anc; _anc = _anc->prev_frame) {
-                if (JS_GetFunctionBytecode(_anc->cur_func) != b) continue;
-                /* Same bytecode but a DIFFERENT closure instance is a DIFFERENT
-                   invocation, NOT self-recursion: a userland-regenerator `invoke`
-                   is a FRESH closure per generator (makeInvokeMethod closing over
-                   self/_context), so a NESTED-generator chain — an SDK's
-                   search -> this.httpRequest.post -> request -> this.httpClient,
-                   each its own _asyncToGenerator — recurses on the SAME invoke
-                   bytecode with SameValue args (method "next", arg undefined) yet
-                   a different closure each level. Collapsing that bounds a BOUNDED
-                   chain short of the deep INDIRECT fetch (meili index methods
-                   1/12: the wrapper has a real receiver but the chain never
-                   reaches this.httpClient). Only a SAME-closure re-entry is a true
-                   no-progress self-recursion (qs/stringify) — skip past a
-                   different-closure ancestor to look for a same-closure one. */
-                if (JS_VALUE_GET_OBJ(_anc->cur_func) != JS_VALUE_GET_OBJ(func_obj)) continue;
-                /* Collapse a NO-PROGRESS re-entry. A recursion can only be BOUNDED
-                   by a concrete-PRIMITIVE arg that changes (a counter / shrinking
-                   index). So collapse when (every arg is SameValue — the original
-                   branchless no-progress case) OR (no changed arg is a concrete
-                   primitive AND at least one changed arg is an opaque value DERIVED
-                   from the ancestor's, its term CONTAINING the ancestor arg's term:
-                   object[key], prefix+key — descent into UNBOUNDED opaque nesting,
-                   e.g. qs/stringify). A fresh non-primitive object per level (qs
-                   passes a new sideChannel WeakMap) is NOT a bound, so it must not
-                   block the collapse; f(opaque, n-1) IS bounded (n-1 = a changed
-                   concrete primitive = real progress) so it is NOT collapsed. */
-                int _collapse = 0;
-                if (_anc->arg_count == argc) {
-                    int _allsame = 1, _hasderived = 0, _progprim = 0;
-                    for (i = 0; i < argc; i++) {
-                        if (js_same_value(caller_ctx, argv[i], _anc->arg_buf[i])) continue;
-                        _allsame = 0;
-                        qjs_opq *_oi = qjs_opq_of(argv[i]);
-                        if (_oi) {   /* opaque arg — never a concrete bound */
-                            qjs_opq *_oa = qjs_opq_of(_anc->arg_buf[i]);
-                            if (_oa && qjs_term_has_subterm(_oi->term, _oa->term)) _hasderived = 1;
-                            continue;
-                        }
-                        if (JS_VALUE_GET_TAG(argv[i]) == JS_TAG_OBJECT) continue;   /* fresh helper object, not a bound */
-                        _progprim = 1;   /* a changed concrete primitive = the real bound */
-                    }
-                    _collapse = _allsame || (_hasderived && !_progprim);
-                }
-                if (_collapse) {
-                    static long _rcN = 0;
-                    if (_rcN++ < 100) {
-                        printf("@WHY {\"phase\":\"recur_collapse\",\"line\":%d,\"col\":%d,\"argc\":%d}\n",
-                               b->line_num, b->col_num, argc);
-                        fflush(stdout);
-                    }
-                    return qjs_opq_make(caller_ctx, 1, "recur-fixpoint", qjs_t_opaque());
-                }
-                break;   /* only the nearest same-bytecode ancestor matters */
-            }
-        }
-    }
+    /* recur_collapse DELETED (objective #9: remove the bound, replace with attention).
+       It truncated a same-bytecode/same-closure re-entry to an opaque "recur-fixpoint"
+       on a SAME-ARGS / derived-opaque FIXPOINT — a cap wearing a proof: shared state
+       means byte-identical args can still PROGRESS, so only EMITTED OUTPUT proves a
+       recursion is unproductive, never a same-args check. The recursion now RUNS on the
+       segmented heap call-stack (overflow-impossible) and yields per-call to the
+       scheduler (YIELD_POLL); a no-output recursion is STARVED to ~0 CPU (paused,
+       resumable, evictable), never collapsed. The forced-exec ARTIFACT case (an opaque
+       OP_if driving a continue-arm into an orphan recursion real JS could never reach)
+       is the scheduler's to starve by output, not a fixpoint's to truncate. */
 
  setup_callee:   /* step 3b: OP_call jumps here with p, b, func_obj, this_obj, new_target,
                     argc, argv, flags set for a NORMAL bytecode callee — no C-recursion */
@@ -21266,18 +21210,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JSValue _fo = call_argv[-1];
                     JSObject *_fp = (JS_VALUE_GET_TAG(_fo) == JS_TAG_OBJECT)
                                     ? JS_VALUE_GET_OBJ(_fo) : NULL;
-                    /* Trampoline only CONCRETE-arg calls. An OPAQUE arg is the
-                       recur_collapse trigger: a forced/opaque-driven recursion
-                       never terminates (the base-case branch is forced both ways),
-                       so trampolining it would grow the heap stack to OOM. Route
-                       those to the C path, where recur_collapse still collapses the
-                       no-progress re-entry. (recur_collapse is retired only once the
-                       scheduler can STARVE+EVICT such a recursion — not by a depth
-                       cap.) Concrete-arg recursion is bounded and is exactly the
-                       overflow case the heap stack fixes. */
-                    int _hasopq = 0;
-                    { int _k; for (_k = 0; _k < call_argc; _k++) if (qjs_is_opaque(call_argv[_k])) { _hasopq = 1; break; } }
-                    if (opcode == OP_call && !_hasopq && _fp &&
+                    /* Trampoline ALL NORMAL->NORMAL calls, INCLUDING opaque-arg ones
+                       (recur_collapse is DELETED, objective #9). A forced/opaque-driven
+                       recursion now RUNS on the segmented heap call-stack (overflow-
+                       impossible) and yields per-call to the scheduler (YIELD_POLL), which
+                       STARVES it by emitted output — no new @H/@S => ~0 CPU, paused,
+                       resumable, evictable — never a depth cap, never a same-args fixpoint.
+                       (A terminating opaque recursion now reaches its deep base case, e.g.
+                       meili's wrapper chain to this.httpClient, instead of being truncated.) */
+                    if (opcode == OP_call && _fp &&
                         b->func_kind == JS_FUNC_NORMAL &&   /* L1 universal (un-gated): trampoline a NORMAL->NORMAL call. async/generator CALLERS stay on the proven C path — their frames live in async_func_init's malloc buffer (not the arena), so the reload's arena pop/cur_sp semantics don't apply to them. Deep SYNCHRONOUS recursion (the C-stack-overflow case) is normal->normal and IS trampolined; async recursion is bounded by the microtask loop, so this restriction keeps overflow-proofing while staying value-correct. The value-correctness blocker (free_zero UAF) was the reload restoring the WRONG var_refs (sf->var_refs = this frame's own capturable slots) instead of p->u.func.var_refs (the closure refs OP_get_var_ref* deref) — fixed at the reload (var_refs = _cp->u.func.var_refs) + resume-entry. */
                         _fp->class_id == JS_CLASS_BYTECODE_FUNCTION &&
                         _fp->u.func.function_bytecode->func_kind == JS_FUNC_NORMAL) {
@@ -25153,9 +25094,16 @@ static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
        rotate the scheduler) is at THIS shallow loop — the deep chain lives on the
        heap arena, not this C frame — so teardown stays clean. Loop until the frame
        genuinely awaits or completes. */
+    /* #8: the internal opcode-yields of THIS async frame's trampolined callees are
+       TRANSPARENT re-drives to its next genuine await/return — NOT host hand-off
+       points. The old qjs_host_yield() here was a JSPI suspend PER opcode-yield,
+       which reordered the bundle's pending microtasks (the documented supabase
+       51->23 regression). Host work (fetches) is delivered at AWAIT boundaries by
+       the promise machinery + the outer drive's js_std_loop; cross-flow preemption
+       is the host scheduler's return-to-scheduler job (do_drive), not this shallow
+       loop. So just re-drive the parked callee chain to the await/return. */
     while (ctx->rt->qjs_yielded) {
         ctx->rt->qjs_yielded = 0;
-        qjs_host_yield();
         ctx->rt->qjs_resume_chain = 1;
         func_ret = async_func_resume(ctx, &s->func_state);
     }
@@ -61766,6 +61714,15 @@ static JSRuntime *qjs_deep_cache_rt = NULL;
    (g_grind_completions only rises), so it terminates without a magic limit. */
 #define QJS_DEFER_QUANTUM 64          /* no-forced-progress interrupt polls (×10000 ops) before yielding a drive */
 static int g_grind_drive_active = 0;  /* 1 only while an orphan JS_Call is in flight — gates the handler */
+/* objective #9 attention signal: the count of EMITTED OUTPUT lines (@H endpoints + @S
+   findings). This is the ONLY sound progress signal — a flow makes progress iff it emits
+   new output, NEVER a seen-set / fixpoint / count. Non-static so js_print (the @H/@S
+   choke point in quickjs-libc.c) increments it. Replaces qjs_fe_seen_n for starvation. */
+int g_emit_n = 0;
+void qjs_note_emit_line(const char *line) {
+    /* called by js_print for every printed line; count only the emitted-output records */
+    if (line && line[0] == '@' && (line[1] == 'H' || line[1] == 'S') && line[2] == ' ') g_emit_n++;
+}
 static int g_defer_fired = 0;         /* the handler yielded the current drive */
 static unsigned g_grind_completions = 0;   /* orphans that completed (no defer) this grind — the progress fixpoint */
 static int g_progress_seen = 0;       /* qjs_fe_seen_n at last forced-progress */
@@ -61795,11 +61752,11 @@ static unsigned *qjs_deep_defer_comp = NULL;  /* parallel: g_grind_completions s
    while a legitimately-long orphan keeps exploring → it is NOT false-deferred. */
 static int qjs_grind_interrupt(JSRuntime *rt, void *opaque) {
     (void)opaque;
-    if (g_grind_drive_active) {                          /* deep grind: seen_n-flat = spin (orphans fork) */
+    if (g_grind_drive_active) {                          /* LEGACY spin-defer — being REPLACED by the per-flow WFQ output-starvation (pause/resume, not throw/re-drive). Kept inert-equivalent only until the flow loop below lands, then deleted. */
         if (qjs_fe_seen_n != g_progress_seen) { g_progress_seen = qjs_fe_seen_n; g_noprog_polls = 0; return 0; }
-        if (++g_noprog_polls < QJS_DEFER_QUANTUM) return 0;  /* still within the fair slice */
+        if (++g_noprog_polls < QJS_DEFER_QUANTUM) return 0;
         g_defer_fired = 1; g_noprog_polls = 0;
-        return 1;                                        /* yield: throws → unwinds the drive → grind defers */
+        return 1;
     }
     if (g_bfs_drive_active) {                            /* BFS drive: same-back-edge + flat-seen = concrete spin */
         JSStackFrame *sf = rt->current_stack_frame;

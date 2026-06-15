@@ -4583,6 +4583,8 @@ static JSValue js_print(JSContext *ctx, JSValueConst this_val,
         }
     }
     dbuf_putc(&b, '\n');
+    /* objective #9: count emitted output (@H/@S) — the scheduler's only progress signal */
+    { extern void qjs_note_emit_line(const char *line); if (b.size >= 3) qjs_note_emit_line((const char *)b.buf); }
 #ifdef _WIN32
     // use WriteConsoleA with CP_UTF8 for better Unicode handling vis-a-vis
     // the mangling that happens when going through msvcrt's stdio layer,

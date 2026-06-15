@@ -1068,19 +1068,59 @@ int main(int argc, char **argv) {
                above; now run the document's scripts as DRIVEN bundle code, from
                this TOP-LEVEL boot frame (not re-entrantly from inside a JS eval). */
             qjs_run_doc_scripts(g_boot_ctx);
-            /* Settle module-init microtasks so the snapshot captures quiescent
-               boot state (mirrors the normal path's post-eval js_std_loop). */
-            if (rc == 0) js_std_loop(g_boot_ctx);
+            /* #9: OUTPUT-STARVATION boot drain (replaces a plain js_std_loop that
+               recur_collapse used to make terminate). With recur_collapse gone, a
+               forced-artifact recursion (firebase's branchless auth retry on an
+               OPAQUE response) would spin forever. The trampoline makes it
+               overflow-impossible; the SCHEDULER starves it BY EMITTED OUTPUT — a
+               job that opcode-yields without emitting a new @H/@S is silent, so stop
+               resuming it and free its paused artifact chain (keeps the boot base-
+               image clean) and move on; productive jobs finish to quiescence. NOT a
+               bound: the recursion RUNS on the heap stack and is paused by output,
+               never collapsed to a same-args fixpoint. (TODO: detach the silent flow
+               to a resumable per-flow handle instead of free — the full #5/#7 form.) */
+            if (rc == 0) {
+                extern int g_emit_n;
+                qjs_set_driving(g_boot_ctx, 1);
+                JSContext *_c1;
+                for (;;) {
+                    int _r = JS_ExecutePendingJob(g_boot_rt, &_c1);
+                    while (qjs_take_yielded(g_boot_ctx)) {
+                        int _mark = g_emit_n;
+                        JSValue _v = qjs_resume_chain_call(g_boot_ctx);
+                        JS_FreeValue(g_boot_ctx, _v);
+                        if (g_emit_n == _mark) {            /* silent resume -> STARVE */
+                            qjs_free_suspended_trampoline_frames(g_boot_ctx);
+                            break;
+                        }
+                    }
+                    if (_r <= 0) break;                     /* no more pending jobs */
+                }
+                qjs_set_driving(g_boot_ctx, 0);
+                js_std_loop(g_boot_ctx);                    /* final settle (timers/os) at driving=0 */
+            }
             return rc;
         }
         if (do_drive) {
             if (!g_boot_ctx) { printf("@E {\"phase\":\"drive_no_boot\"}\n"); fflush(stdout); return 1; }
             qjs_forced_config(1, drive_sched, drive_trace);
+            qjs_set_driving(g_boot_ctx, 1);   /* #8: opcode-level return-to-scheduler ON for the drive */
             int rc = 0;
             for (int i = 1; i < argc; i++) {
                 if (!strncmp(argv[i], "--fe-", 5)) continue;
                 if (qjs_se_eval_one(g_boot_ctx, argv[i])) rc = 1;
+                /* #8: drive a yield-RETURNED top-level chain to completion via
+                   return-to-scheduler resume (heap-frame-safe; NOT a JSPI suspend —
+                   the regression-free path the async loop now also uses). Drive-to-
+                   completion for now to VERIFY the mechanism is non-regressing; the
+                   per-flow snapshot + output-starvation scheduler replaces this loop
+                   with preempt-and-pick-by-emitted-output (#9). */
+                while (qjs_take_yielded(g_boot_ctx)) {
+                    JSValue _r = qjs_resume_chain_call(g_boot_ctx);
+                    JS_FreeValue(g_boot_ctx, _r);
+                }
             }
+            qjs_set_driving(g_boot_ctx, 0);   /* async job re-drives in js_std_loop run normally (no opcode-yield) */
             if (rc == 0) js_std_loop(g_boot_ctx);
             fflush(stdout);
             return rc;
