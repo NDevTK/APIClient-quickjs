@@ -20298,10 +20298,22 @@ static size_t qjs_cow_pagelen(size_t pg) {   /* clamp the final (partial) page t
     if (off >= qjs_cow_len) return 0;
     return (off + QJS_COW_PAGE <= qjs_cow_len) ? QJS_COW_PAGE : (qjs_cow_len - off);
 }
-/* The write-barrier (binaryen pass, NEXT) calls this on every store; addr = offset. */
-QJS_JSEXPORT void qjs_cow_mark_dirty(uint32_t addr) {
+/* The write-barrier (binaryen pass, NEXT) calls this on every store; addr = the wasm
+   linear-memory offset. MUST be size_t (uintptr_t), NOT uint32_t: under -sMEMORY64
+   the store ptr is i64, so the barrier import signature is (i64)->void and a uint32_t
+   param would truncate the address (ABI mismatch + wrong page for any addr >= 4 GiB). */
+QJS_JSEXPORT void qjs_cow_mark_dirty(size_t addr) {
     size_t pg = addr / QJS_COW_PAGE;
     if (qjs_cow_dirty && pg < qjs_cow_pages) qjs_cow_dirty[pg] = 1;
+}
+/* Range variant for the bulk-memory ops the barrier must also instrument:
+   memory.copy / memory.fill / memory.init (emscripten lowers memcpy/memset to these
+   under -mbulk-memory), which write [addr, addr+size) — every page in the span. */
+QJS_JSEXPORT void qjs_cow_mark_dirty_range(size_t addr, size_t size) {
+    size_t p, p0, p1;
+    if (!qjs_cow_dirty || !size) return;
+    p0 = addr / QJS_COW_PAGE; p1 = (addr + size - 1) / QJS_COW_PAGE;
+    for (p = p0; p <= p1 && p < qjs_cow_pages; p++) qjs_cow_dirty[p] = 1;
 }
 /* Capture the post-boot baseline at the boot->forced-grind boundary. Uses the JS
    runtime allocator (raw malloc/free are forbidden in this TU). */
