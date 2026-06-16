@@ -20260,15 +20260,18 @@ QJS_JSEXPORT int  qjs_take_yielded(JSContext *ctx) { int y = ctx->rt->qjs_yielde
 typedef struct JSFlow {
     JSStackChunk *js_stack;             /* this flow's own segmented heap call-stack */
     struct JSStackFrame *current_stack_frame;  /* this flow's frame chain */
+    struct JSStackFrame *qjs_yield_entry;  /* this flow's resume-entry boundary (the YIELD_POLL entry_frame). MUST be per-flow: it is a single rt field that the NEXT flow's yield overwrites, so a cross-flow pause/resume would resume on the wrong dispatch boundary -> corruption. */
 } JSFlow;
 
 void qjs_flow_save(JSContext *ctx, JSFlow *f) {
     f->js_stack = ctx->rt->js_stack;
     f->current_stack_frame = ctx->rt->current_stack_frame;
+    f->qjs_yield_entry = ctx->rt->qjs_yield_entry;
 }
 void qjs_flow_restore(JSContext *ctx, JSFlow *f) {
     ctx->rt->js_stack = f->js_stack;
     ctx->rt->current_stack_frame = f->current_stack_frame;
+    ctx->rt->qjs_yield_entry = f->qjs_yield_entry;
 }
 
 void qjs_free_suspended_trampoline_frames(JSContext *ctx)
@@ -61743,8 +61746,14 @@ static int g_bfs_drive_active = 0;    /* 1 while the BFS __hostDrive loop is dri
 static uint8_t *g_bfs_last_pc = NULL; /* back-edge pc at last poll (spin = same pc) */
 static int g_bfs_last_seen = 0;       /* qjs_fe_seen_n at last poll (spin = flat) */
 static int g_bfs_noprog = 0;          /* consecutive same-pc + flat-seen polls */
-static uint8_t *qjs_deep_deferred = NULL;     /* parallel to qjs_deep_rb: 1 = spin-deferred (skip until non-deferred drained, then re-attempt) */
-static unsigned *qjs_deep_defer_comp = NULL;  /* parallel: g_grind_completions snapshot at last defer (no-progress fixpoint) */
+static uint8_t *qjs_deep_deferred = NULL;     /* parallel to qjs_deep_rb: 1 = PAUSED (WFQ: skip until higher-output flows drained, then resume by output) */
+static unsigned *qjs_deep_defer_comp = NULL;  /* parallel: g_emit_n snapshot at last pause (output-priority: lower = more starved) */
+/* WFQ per-orphan PAUSED heap-stack snapshot (qjs_flow_save), parallel to qjs_deep_rb.
+   A spin-flat forced flow (g_emit_n flat over its yield window) is PAUSED here with its
+   frames intact on the heap (~0 CPU, resumable by output), never thrown/abandoned — the
+   deferred bit means "paused", and qjs_flow_restore + resume replaces the throw/re-drive/
+   abandon path. NULL js_stack = no paused flow for this orphan. */
+static JSFlow *qjs_deep_flow = NULL;
 /* The deep-grind interrupt handler (op-counted via js_poll_interrupts, so it
    fires at every OP_if/back-edge — catches CONCRETE spins the opaque-only spin
    probe misses). Returns 1 to interrupt (throw) the spinning drive so the grind
@@ -61755,7 +61764,15 @@ static unsigned *qjs_deep_defer_comp = NULL;  /* parallel: g_grind_completions s
    quantum emits → resets → runs on. (seen-set growth is NOT progress.) */
 static int qjs_grind_interrupt(JSRuntime *rt, void *opaque) {
     (void)opaque;
-    if (g_grind_drive_active) {                          /* OUTPUT-STARVATION spin-defer (interim form of the per-flow WFQ): a drive emitting NO new @H/@S (g_emit_n flat) for QJS_DEFER_QUANTUM polls is deferred (pause/resume — re-driven later, abandoned only at the no-global-progress fixpoint). Keyed on EMITTED OUTPUT, never the seen-set it used to use: firebase's opaque-call recursion grows qjs_fe_seen_n forever (new opaque states) while emitting nothing, so the old seen-set signal read it as progress and never fired → spin. */
+    if (g_grind_drive_active) {                          /* OUTPUT-STARVATION spin-defer. */
+        /* WFQ ON (qjs_driving): the per-flow yield-loop in the deep grind PAUSES a
+           silent drive (qjs_flow_save, frames intact) by emitted output and resumes
+           it later — pause/resume, NEVER a throw/abandon. So the interrupt must NOT
+           throw here; the YIELD_POLL yield (frames intact) + the loop's g_emit_n
+           check own starvation. */
+        if (rt->qjs_driving) return 0;
+        /* WFQ OFF fallback (qjs_deep_flow alloc failed): the legacy output-starvation
+           throw-defer. Keyed on EMITTED OUTPUT, never the seen-set it used to use. */
         if (g_emit_n != g_progress_seen) { g_progress_seen = g_emit_n; g_noprog_polls = 0; return 0; }
         if (++g_noprog_polls < QJS_DEFER_QUANTUM) return 0;
         g_defer_fired = 1; g_noprog_polls = 0;
@@ -62188,12 +62205,14 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
         if (qjs_deep_sink) { js_free(ctx, qjs_deep_sink); qjs_deep_sink = NULL; }
         if (qjs_deep_deferred) { js_free(ctx, qjs_deep_deferred); qjs_deep_deferred = NULL; }
         if (qjs_deep_defer_comp) { js_free(ctx, qjs_deep_defer_comp); qjs_deep_defer_comp = NULL; }
+        if (qjs_deep_flow) { js_free(ctx, qjs_deep_flow); qjs_deep_flow = NULL; }   /* WFQ: array only (zeroed = no live paused chunks on fresh-residue reset) */
         qjs_deep_net = js_malloc(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1));
         qjs_deep_net2 = js_mallocz(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1));   /* 0 until the post-insts fill loop below; insts aren't populated yet here */
         qjs_deep_sink = js_malloc(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1));
         qjs_deep_deferred = js_mallocz(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1));   /* 0 = not spin-deferred */
         qjs_deep_defer_comp = js_malloc(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1) * sizeof(unsigned));
         if (qjs_deep_defer_comp) for (int _i = 0; _i < qjs_deep_rb_n; _i++) qjs_deep_defer_comp[_i] = (unsigned)-1;   /* UINT_MAX sentinel = never deferred */
+        qjs_deep_flow = js_mallocz(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1) * sizeof(JSFlow));   /* WFQ: zeroed = no paused flow yet (NULL js_stack/current_stack_frame) */
         g_grind_completions = 0;   /* per-grind progress counter (the defer fixpoint) */
         int _head_net = 0;
         if (qjs_deep_net && qjs_deep_sink) {
@@ -62645,9 +62664,54 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
                CONCRETELY (the cold-instance class gap; learn.microsoft.com
                search component `this._input=$0e(async()=>this.fetch())`). */
             int _susp_before = qjs_count_suspended_generators(ctx);
-            JSValue r2 = _is_cls_ctor
-                ? JS_CallConstructor(ctx, fo, nargs, args3)
-                : JS_Call(ctx, fo, (qjs_deep_recv && !JS_IsUndefined(qjs_deep_recv[_ix])) ? qjs_deep_recv[_ix] : this_opq2, nargs, args3);
+            /* WFQ: drive forced with opcode-level PAUSE (qjs_driving) so a spin-flat
+               flow PAUSES on the heap (frames intact, ~0 CPU, resumable by output)
+               instead of running to overflow/throw. Resume a flow PAUSED on a prior
+               pick (qjs_deep_flow[_ix]) instead of re-driving cold. The yield-loop
+               resumes WHILE the flow emits new @H/@S; the first SILENT yield window
+               STARVES it (qjs_flow_save snapshot, marked paused, NEVER abandoned — the
+               deferred re-attempt re-picks + resumes by output). Gated on qjs_deep_flow
+               being allocated (else the legacy throw-defer runs, qjs_grind_interrupt). */
+            int _wfq_on = (qjs_deep_flow != NULL), _wfq_paused = 0, _wfq_e0 = g_emit_n;
+            if (_wfq_on) qjs_set_driving(ctx, 1);
+            JSValue r2;
+            if (_wfq_on && qjs_deep_flow[_ix].js_stack) {
+                qjs_flow_restore(ctx, &qjs_deep_flow[_ix]);
+                qjs_deep_flow[_ix].js_stack = NULL; qjs_deep_flow[_ix].current_stack_frame = NULL;
+                rt->qjs_resume_chain = 1;
+                r2 = qjs_resume_chain_call(ctx);
+            } else {
+                r2 = _is_cls_ctor
+                    ? JS_CallConstructor(ctx, fo, nargs, args3)
+                    : JS_Call(ctx, fo, (qjs_deep_recv && !JS_IsUndefined(qjs_deep_recv[_ix])) ? qjs_deep_recv[_ix] : this_opq2, nargs, args3);
+            }
+            int _wfq_silent = 0;
+            while (_wfq_on && rt->qjs_yielded) {
+                rt->qjs_yielded = 0;
+                if (g_emit_n != _wfq_e0) {                  /* emitted new @H/@S -> productive -> resume, reset silence */
+                    _wfq_e0 = g_emit_n; _wfq_silent = 0;
+                    rt->qjs_resume_chain = 1; r2 = qjs_resume_chain_call(ctx);
+                } else if (++_wfq_silent < QJS_DEFER_QUANTUM) {  /* give it the quantum to REACH its emit (a fetch can be many ops in) before starving — same window the old throw-defer used */
+                    rt->qjs_resume_chain = 1; r2 = qjs_resume_chain_call(ctx);
+                } else {                                    /* QUANTUM silent windows, no @H/@S -> STARVE: pause on the heap */
+                    qjs_flow_save(ctx, &qjs_deep_flow[_ix]);
+                    qjs_deep_deferred[_ix] = 1; qjs_deep_defer_comp[_ix] = (unsigned)g_emit_n;
+                    rt->js_stack = NULL; rt->current_stack_frame = NULL;
+                    _wfq_paused = 1; break;
+                }
+            }
+            if (_wfq_on) qjs_set_driving(ctx, 0);
+            if (_wfq_paused) {
+                /* paused (resumable) — free the CALL locals (the frame owns its own
+                   copies), keep the snapshot in qjs_deep_flow[_ix], re-pick + resume later. */
+                g_grind_drive_active = 0;
+                JS_FreeValue(ctx, r2); JS_FreeValue(ctx, this_opq2);
+                for (int ai = 0; ai < nargs; ai++) JS_FreeValue(ctx, args3[ai]);
+                if (args3) js_free(ctx, args3);
+                JS_FreeValue(ctx, fo);
+                qjs_drop_pending_jobs(rt);
+                continue;
+            }
             if (b->func_kind & JS_FUNC_ASYNC) { JSContext *c2;
                 while (JS_ExecutePendingJob(rt, &c2) > 0) {
 #if defined(__EMSCRIPTEN__) && defined(QJS_HAS_JSPI)
