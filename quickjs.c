@@ -20323,6 +20323,7 @@ static volatile int g_cow_busy = 0;
    captured-object pages, or re-derive receivers per-orphan from the baseline), then set
    this 1 + ship the instrumented wasm. Until then the substrate/pass/wiring are inert. */
 static int g_cow_enabled = 0;
+static int g_cow_orphan_creates_inst = 0;   /* set during a drive that captures a real instance (qjs_deep_capture_inst) -> that orphan's delta is COMMITTED to the baseline (the instance is shared cross-orphan state), not discarded */
 /* Reserved metadata pool. The COW baseline/bitmap/deltas CANNOT live in the COW'd heap:
    a parked flow's delta, allocated from the shared js_malloc free-list, would be
    "freed" by another flow's restore-to-baseline of that free-list and then reused +
@@ -20442,6 +20443,23 @@ QJS_JSEXPORT void qjs_cow_discard(uint8_t *mem) {
     g_cow_busy = 1;   /* restore writes the HEAP; the barrier must not re-mark */
     for (i = 0; i < qjs_cow_pages; i++) if (qjs_cow_dirty[i]) {
         memcpy(mem + i * QJS_COW_PAGE, qjs_cow_base + i * QJS_COW_PAGE, qjs_cow_pagelen(i));
+        qjs_cow_dirty[i] = 0;
+    }
+    g_cow_busy = 0;
+}
+/* SNAPSHOT-FORK / shared-resource promote: commit the current dirty pages INTO the
+   baseline (current heap -> baseline, clear dirty). Used when a constructor orphan
+   creates a CAPTURED INSTANCE (qjs_deep_capture_inst): that instance is intentional
+   cross-orphan shared state, so it BECOMES baseline every subsequent orphan forks from
+   — preserving the receiver under FULL DOM+JS COW (not a DOM-only carve-out), while each
+   orphan's OWN mutations still revert. The deep-tree artifact that overflows do_query is
+   a DIFFERENT orphan's delta, never committed -> still isolated. */
+QJS_JSEXPORT void qjs_cow_commit(const uint8_t *mem) {
+    size_t i;
+    if (!qjs_cow_dirty || !qjs_cow_base) return;
+    g_cow_busy = 1;
+    for (i = 0; i < qjs_cow_pages; i++) if (qjs_cow_dirty[i]) {
+        memcpy(qjs_cow_base + i * QJS_COW_PAGE, mem + i * QJS_COW_PAGE, qjs_cow_pagelen(i));
         qjs_cow_dirty[i] = 0;
     }
     g_cow_busy = 0;
@@ -62264,6 +62282,7 @@ static int qjs_proto_cold_recv(JSContext *ctx, JSObject *pro, JSValueConst inst)
         if (rix >= 0 && rix < qjs_deep_rb_n && qjs_deep_rb[rix] == mfb && JS_IsUndefined(qjs_deep_recv[rix])) {
             if (JS_VALUE_GET_TAG(inst) == JS_TAG_OBJECT) {
                 qjs_deep_recv[rix] = JS_DupValue(ctx, inst);
+                g_cow_orphan_creates_inst = 1;   /* COW: this drive made a cross-orphan instance -> commit its delta, don't discard */
                 if (qjs_deep_insts && JS_IsUndefined(qjs_deep_insts[rix])) qjs_deep_insts[rix] = JS_DupValue(ctx, mv);
                 /* NO net2 force-promotion: it force-drives EVERY cold method, which on a
                    relative-base client (pocketbase) fabricates malformed `/`//`-rooted
@@ -62899,6 +62918,7 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
                being allocated (else the legacy throw-defer runs, qjs_grind_interrupt). */
             int _wfq_on = (qjs_deep_flow != NULL), _wfq_paused = 0, _wfq_e0 = g_emit_n;
             if (_wfq_on) qjs_set_driving(ctx, 1);
+            g_cow_orphan_creates_inst = 0;   /* COW: per-drive flag; set if this drive captures an instance */
             JSValue r2;
             if (_wfq_on && qjs_deep_flow[_ix].js_stack) {
                 qjs_flow_restore(ctx, &qjs_deep_flow[_ix]);
@@ -63066,6 +63086,14 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
             if (args3) js_free(ctx, args3);
             JS_FreeValue(ctx, fo);
             qjs_drop_pending_jobs(rt);
+            /* COW: this orphan COMPLETED. Commit its delta to the baseline if it created
+               a cross-orphan captured instance (preserve it for the method orphans), else
+               DISCARD — revert its heap mutations (incl. any forced-built deep DOM) so the
+               next orphan forks clean (#7 full DOM+JS isolation). Inert while gated off. */
+            if (qjs_deep_cow) {
+                if (g_cow_orphan_creates_inst) qjs_cow_commit(qjs_cow_heap_base());
+                else qjs_cow_discard(qjs_cow_heap_base());
+            }
             /* Spin-defer: the interrupt YIELDED this drive (g_defer_fired) and it
                unwound (_was_exc2) ⇒ a no-forced-progress concrete spin. DEFER it
                (don't mark driven) so a producer orphan can establish its module
