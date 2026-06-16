@@ -62122,6 +62122,26 @@ static int qjs_val_has_abs_url(JSContext *ctx, JSValueConst v, int depth) {
     return 0;
 }
 
+/* WFQ #5 (floor): free a PAUSED flow's heap (frame locals + its OWN arena chunks)
+   when it is abandoned — bounds the within-grind paused-flow memory. Reuses the
+   NORMAL-frame teardown on the DETACHED flow: make it active, free, restore the
+   caller's flow. qjs_free_suspended_trampoline_frames frees frame LOCALS only, so
+   the js_stack chunks are freed explicitly after (no double-free). The WFQ pauses
+   at a sync YIELD_POLL, so the paused frames are NORMAL (the only kind that
+   teardown frees). The PEAK (flows held before abandon) is the IDB-eviction job. */
+static void qjs_deep_free_paused_flow(JSContext *ctx, int ix) {
+    if (!qjs_deep_flow || ix < 0 || !qjs_deep_flow[ix].js_stack) return;
+    JSRuntime *rt = ctx->rt;
+    JSFlow _cur;
+    qjs_flow_save(ctx, &_cur);
+    qjs_flow_restore(ctx, &qjs_deep_flow[ix]);
+    qjs_free_suspended_trampoline_frames(ctx);   /* frees NORMAL frame locals; current_stack_frame=NULL */
+    { JSStackChunk *c = rt->js_stack; while (c) { JSStackChunk *p = c->prev; js_free_rt(rt, c); c = p; } }
+    rt->js_stack = NULL;
+    qjs_deep_flow[ix].js_stack = NULL; qjs_deep_flow[ix].current_stack_frame = NULL; qjs_deep_flow[ix].qjs_yield_entry = NULL;
+    qjs_flow_restore(ctx, &_cur);
+}
+
 int qjs_deep_step_c(JSContext *ctx, int maxN, int fromCursor) {
     return qjs_deep_step_c_h(ctx, maxN, fromCursor, 0);
 }
@@ -62515,6 +62535,7 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
                     qjs_deep_rb[_di]->qjs_driven = 1;
                     uint64_t _fd = qjs_deep_ids ? qjs_deep_ids[_di] : 0;
                     if (_fd) printf("@DD %llx\n", (unsigned long long)_fd);
+                    qjs_deep_free_paused_flow(ctx, _di);   /* WFQ #5 floor: reclaim the abandoned paused flow's heap */
                 }
             }
             fflush(stdout);
