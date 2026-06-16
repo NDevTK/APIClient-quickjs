@@ -139,7 +139,7 @@ static JSValue m_createTextNode(JSContext *ctx, JSValueConst t, int ac, JSValueC
    any registered custom element in `node`'s subtree — so a JS-injected loader
    like <include-fragment src> runs its fetch under forced execution. Cheap:
    __ceConnect returns immediately when no custom element is registered. */
-static void qjs_ce_connect(JSContext *ctx, JSValueConst node) {
+static void qjs_ce_connect_one(JSContext *ctx, JSValueConst node) {
     JSValue glob = JS_GetGlobalObject(ctx);
     JSValue fn = JS_GetPropertyStr(ctx, glob, "__ceConnect");
     if (JS_IsFunction(ctx, fn)) {
@@ -150,6 +150,38 @@ static void qjs_ce_connect(JSContext *ctx, JSValueConst node) {
     }
     JS_FreeValue(ctx, fn);
     JS_FreeValue(ctx, glob);
+}
+/* #6 overflow-impossible: the CE render-cycle (appendChild -> connectedCallback ->
+   appendChild -> ...) recurses in C over a forced-built deep tree, exhausting the C
+   stack (stack_overflow_nonrecursive, dominant <qjs-dom-prelude> over a shallow JS
+   chain = deep native re-entrancy). Make it ITERATIVE BY CONSTRUCTION: a re-entrant
+   connect ENQUEUES its node and returns; the TOP-LEVEL connect drains the queue. No C
+   recursion -> no overflow (not a depth cap — the work all runs, just flattened).
+   Coverage preserved (every node's connectedCallback still runs); order becomes BFS
+   not DFS, irrelevant to forced-exec coverage. The queue is memory (freed per
+   render-cycle), not stack; the WFQ bounds the tree-building loop so it can't grow
+   unboundedly. One render-cycle at a time per runtime (worker is single-document). */
+static JSValue *g_ce_q = NULL; static int g_ce_q_n = 0, g_ce_q_cap = 0, g_ce_active = 0;
+static void qjs_ce_connect(JSContext *ctx, JSValueConst node) {
+    if (g_ce_active) {   /* re-entrant: defer to the top-level drain */
+        if (g_ce_q_n == g_ce_q_cap) {
+            int nc = g_ce_q_cap ? g_ce_q_cap * 2 : 16;
+            JSValue *nq = realloc(g_ce_q, (size_t)nc * sizeof(JSValue));
+            if (!nq) return;   /* OOM: drop this connect, never crash */
+            g_ce_q = nq; g_ce_q_cap = nc;
+        }
+        g_ce_q[g_ce_q_n++] = JS_DupValue(ctx, node);
+        return;
+    }
+    g_ce_active = 1;
+    qjs_ce_connect_one(ctx, node);
+    for (int i = 0; i < g_ce_q_n; i++) {   /* drain; connects may enqueue more -> g_ce_q_n grows */
+        JSValue n = g_ce_q[i];
+        qjs_ce_connect_one(ctx, n);
+        JS_FreeValue(ctx, n);
+    }
+    g_ce_q_n = 0;
+    g_ce_active = 0;
 }
 /* Fire the custom-element attributeChangedCallback reaction for a just-changed
    attribute. The JS-side __ceAttr (prelude) checks the CE class's
