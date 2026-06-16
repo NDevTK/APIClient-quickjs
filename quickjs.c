@@ -10746,8 +10746,9 @@ static JSValue JS_ThrowStackOverflow(JSContext *ctx)
         }
         if (_leaf) {
             const char *fn = JS_AtomToCString(ctx, _leaf->filename);
-            printf("@WHY {\"phase\":\"stack_overflow_nonrecursive\",\"leafFile\":\"%s\",\"leafLine\":%d,\"leafCol\":%d,\"jsChainDepth\":%d}\n",
-                   fn ? fn : "?", _leaf->line_num, _leaf->col_num, _chain);
+            extern const char *g_cur_dom_op;
+            printf("@WHY {\"phase\":\"stack_overflow_nonrecursive\",\"leafFile\":\"%s\",\"leafLine\":%d,\"leafCol\":%d,\"jsChainDepth\":%d,\"domop\":\"%s\"}\n",
+                   fn ? fn : "?", _leaf->line_num, _leaf->col_num, _chain, g_cur_dom_op);
             fflush(stdout);
             if (fn) JS_FreeCString(ctx, fn);
         }
@@ -61723,6 +61724,12 @@ static int g_grind_drive_active = 0;  /* 1 only while an orphan JS_Call is in fl
    new output, NEVER a seen-set / fixpoint / count. Non-static so js_print (the @H/@S
    choke point in quickjs-libc.c) increments it. Replaces qjs_fe_seen_n for starvation. */
 int g_emit_n = 0;
+/* #6 MEASURE (no guess): the DOM-op binding active when a stack overflow fires. The
+   935 firebase stack_overflow_nonrecursive are a native (Lexbor) recursion re-entering
+   QuickJS via a callback; this names WHICH op so the fix is targeted, not guessed. Set
+   by qjs_dom.c bindings (do_query/find_cb, serialize, appendChild), read in
+   JS_ThrowStackOverflow. */
+const char *g_cur_dom_op = "";
 void qjs_note_emit_line(const char *line) {
     /* called by js_print for every printed line; count only the emitted-output records */
     if (line && line[0] == '@' && (line[1] == 'H' || line[1] == 'S') && line[2] == ' ') g_emit_n++;

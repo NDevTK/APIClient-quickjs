@@ -107,7 +107,9 @@ static JSValue make_nodelist(JSContext *ctx) {
         JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE);
     return a;
 }
+extern const char *g_cur_dom_op;   /* #6 measure: which DOM op is active when a stack overflow fires */
 static JSValue do_query(JSContext *ctx, lxb_dom_node_t *root, const char *sel, size_t slen, int one) {
+    g_cur_dom_op = "do_query";
     lxb_css_selector_list_t *list = lxb_css_selectors_parse(g_cssp, (const lxb_char_t *)sel, slen);
     if (list == NULL) return one ? JS_NULL : make_nodelist(ctx);
     findctx_t f = { ctx, JS_UNDEFINED, 0, one, NULL };
@@ -140,6 +142,7 @@ static JSValue m_createTextNode(JSContext *ctx, JSValueConst t, int ac, JSValueC
    like <include-fragment src> runs its fetch under forced execution. Cheap:
    __ceConnect returns immediately when no custom element is registered. */
 static void qjs_ce_connect_one(JSContext *ctx, JSValueConst node) {
+    g_cur_dom_op = "ce_connect";
     JSValue glob = JS_GetGlobalObject(ctx);
     JSValue fn = JS_GetPropertyStr(ctx, glob, "__ceConnect");
     if (JS_IsFunction(ctx, fn)) {
@@ -218,6 +221,7 @@ static int dom_is_inclusive_ancestor(lxb_dom_node_t *anc, lxb_dom_node_t *node) 
 }
 static void qjs_load_dynamic_script(JSContext *ctx, JSValueConst scriptVal);   /* dyn <script src> loader (def. near qjs_run_doc_scripts) */
 static JSValue m_appendChild(JSContext *ctx, JSValueConst t, int ac, JSValueConst *av) {
+    g_cur_dom_op = "appendChild";
     lxb_dom_node_t *p = self_node(t), *c = self_node(av[0]);
     if (!p || !c) return JS_NULL;
     if (dom_is_inclusive_ancestor(c, p))
