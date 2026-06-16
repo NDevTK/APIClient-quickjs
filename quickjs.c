@@ -20275,6 +20275,88 @@ void qjs_flow_restore(JSContext *ctx, JSFlow *f) {
     ctx->rt->qjs_yield_entry = f->qjs_yield_entry;
 }
 
+/* ===== #5/#7/#10 per-flow COW snapshot substrate ================================
+   The shared linear memory (the JS object graph + the Lexbor DOM) is the "reused
+   heap of a different code path" (#10): a forced flow mutates it, the next flow sees
+   the mutation (the measured do_query deep-tree overflow = shared-state #7). COW fix:
+   a read-only BASELINE (post-boot image) + a per-flow DELTA of only the 64KB pages a
+   flow dirtied. Context switch = restore baseline for the outgoing flow's pages, then
+   apply the incoming flow's delta -> each flow sees baseline + ITS OWN mutations,
+   never another path's heap. Eviction (#5): a cold flow's delta serializes to
+   IndexedDB + frees RAM; the baseline (one copy) stays, so RAM = baseline + hot
+   deltas, never N x full-image. INERT until the write-barrier (a binaryen pass, the
+   keystone NEXT step) wires qjs_cow_mark_dirty into every store with no O(memory)
+   diff. These primitives are reviewed in isolation; the flow integration + barrier
+   are the wiring. */
+#define QJS_COW_PAGE 65536u
+static uint8_t *qjs_cow_base = NULL;    /* post-boot baseline image (read-only base) */
+static uint8_t *qjs_cow_dirty = NULL;   /* 1 byte/page: written since the last capture */
+static size_t   qjs_cow_len = 0, qjs_cow_pages = 0;
+
+static size_t qjs_cow_pagelen(size_t pg) {   /* clamp the final (partial) page to the image */
+    size_t off = pg * QJS_COW_PAGE;
+    if (off >= qjs_cow_len) return 0;
+    return (off + QJS_COW_PAGE <= qjs_cow_len) ? QJS_COW_PAGE : (qjs_cow_len - off);
+}
+/* The write-barrier (binaryen pass, NEXT) calls this on every store; addr = offset. */
+QJS_JSEXPORT void qjs_cow_mark_dirty(uint32_t addr) {
+    size_t pg = addr / QJS_COW_PAGE;
+    if (qjs_cow_dirty && pg < qjs_cow_pages) qjs_cow_dirty[pg] = 1;
+}
+/* Capture the post-boot baseline at the boot->forced-grind boundary. Uses the JS
+   runtime allocator (raw malloc/free are forbidden in this TU). */
+static int qjs_cow_baseline(JSRuntime *rt, const uint8_t *mem, size_t len) {
+    js_free_rt(rt, qjs_cow_base); js_free_rt(rt, qjs_cow_dirty);
+    qjs_cow_len = len; qjs_cow_pages = (len + QJS_COW_PAGE - 1) / QJS_COW_PAGE;
+    qjs_cow_base = js_malloc_rt(rt, len ? len : 1);
+    qjs_cow_dirty = js_malloc_rt(rt, qjs_cow_pages ? qjs_cow_pages : 1);
+    if (!qjs_cow_base || !qjs_cow_dirty) {
+        js_free_rt(rt, qjs_cow_base); js_free_rt(rt, qjs_cow_dirty);
+        qjs_cow_base = NULL; qjs_cow_dirty = NULL; qjs_cow_len = qjs_cow_pages = 0;
+        return -1;
+    }
+    memset(qjs_cow_dirty, 0, qjs_cow_pages);
+    memcpy(qjs_cow_base, mem, len);
+    return 0;
+}
+
+typedef struct JSCowDelta { uint32_t *pages; uint8_t *bytes; size_t n; } JSCowDelta;
+
+/* Capture the currently-dirty pages into d (the pausing flow's delta); clear dirty. */
+static int qjs_cow_capture(JSRuntime *rt, const uint8_t *mem, JSCowDelta *d) {
+    size_t i, n = 0, k = 0;
+    for (i = 0; i < qjs_cow_pages; i++) if (qjs_cow_dirty[i]) n++;
+    d->n = n;
+    d->pages = n ? js_malloc_rt(rt, n * sizeof(uint32_t)) : NULL;
+    d->bytes = n ? js_malloc_rt(rt, n * QJS_COW_PAGE) : NULL;
+    if (n && (!d->pages || !d->bytes)) {
+        js_free_rt(rt, d->pages); js_free_rt(rt, d->bytes);
+        d->pages = NULL; d->bytes = NULL; d->n = 0; return -1;
+    }
+    for (i = 0; i < qjs_cow_pages; i++) if (qjs_cow_dirty[i]) {
+        d->pages[k] = (uint32_t)i;
+        memcpy(d->bytes + k * QJS_COW_PAGE, mem + i * QJS_COW_PAGE, qjs_cow_pagelen(i));
+        qjs_cow_dirty[i] = 0; k++;
+    }
+    return 0;
+}
+/* Restore baseline for the pages d touched (undo the outgoing flow's mutations). */
+static void qjs_cow_to_baseline(uint8_t *mem, const JSCowDelta *d) {
+    size_t k;
+    for (k = 0; k < d->n; k++) { uint32_t pg = d->pages[k];
+        memcpy(mem + (size_t)pg * QJS_COW_PAGE, qjs_cow_base + (size_t)pg * QJS_COW_PAGE, qjs_cow_pagelen(pg)); }
+}
+/* Apply d (a resuming flow's delta) over current memory; the flow re-owns those pages. */
+static void qjs_cow_apply(uint8_t *mem, const JSCowDelta *d) {
+    size_t k;
+    for (k = 0; k < d->n; k++) { uint32_t pg = d->pages[k];
+        memcpy(mem + (size_t)pg * QJS_COW_PAGE, d->bytes + k * QJS_COW_PAGE, qjs_cow_pagelen(pg));
+        if (pg < qjs_cow_pages) qjs_cow_dirty[pg] = 1; }
+}
+static void qjs_cow_delta_free(JSRuntime *rt, JSCowDelta *d) {
+    js_free_rt(rt, d->pages); js_free_rt(rt, d->bytes); d->pages = NULL; d->bytes = NULL; d->n = 0;
+}
+
 void qjs_free_suspended_trampoline_frames(JSContext *ctx)
 {
     JSRuntime *rt = ctx->rt;
