@@ -20289,7 +20289,7 @@ void qjs_flow_restore(JSContext *ctx, JSFlow *f) {
    diff. These primitives are reviewed in isolation; the flow integration + barrier
    are the wiring. */
 #define QJS_COW_PAGE 65536u
-static uint8_t *qjs_cow_base = NULL;    /* post-boot baseline image (read-only base) */
+static uint8_t **qjs_cow_orig = NULL;   /* per-page saved original (lazy copy-on-FIRST-write); orig[pg]==NULL => page untouched since baseline. NOT a full-heap image — only touched pages cost memory. */
 static uint8_t *qjs_cow_dirty = NULL;   /* 1 byte/page: written since the last capture */
 static size_t   qjs_cow_len = 0, qjs_cow_pages = 0;
 
@@ -20322,8 +20322,14 @@ static volatile int g_cow_busy = 0;
    dangle the receivers (regress captured-instance learning). Reconcile first (exempt the
    captured-object pages, or re-derive receivers per-orphan from the baseline), then set
    this 1 + ship the instrumented wasm. Until then the substrate/pass/wiring are inert. */
-static int g_cow_enabled = 0;
+static int g_cow_enabled =
+#ifdef QJS_COW
+    1;   /* COW build (build.mjs COW pipeline: standalone wasm + cow-barrier instrument + Module.wasmBinary) */
+#else
+    0;   /* production: COW inert (un-instrumented wasm never calls mark_dirty anyway) */
+#endif
 static int g_cow_orphan_creates_inst = 0;   /* set during a drive that captures a real instance (qjs_deep_capture_inst) -> that orphan's delta is COMMITTED to the baseline (the instance is shared cross-orphan state), not discarded */
+static long g_cow_saved = 0, g_cow_commits = 0, g_cow_discards = 0, g_cow_captures = 0, g_cow_applies = 0;   /* #6 measure: COW activity (distinct pages tracked / instances committed / orphans reverted / flows paused / flows resumed) — emitted at grind teardown, never inferred */
 /* Reserved metadata pool. The COW baseline/bitmap/deltas CANNOT live in the COW'd heap:
    a parked flow's delta, allocated from the shared js_malloc free-list, would be
    "freed" by another flow's restore-to-baseline of that free-list and then reused +
@@ -20346,18 +20352,36 @@ QJS_JSEXPORT void qjs_cow_mark_dirty(size_t addr) {
     if (g_cow_busy || addr < hb || !qjs_cow_dirty) return;
     if (g_cow_pool && addr >= (size_t)g_cow_pool && addr < (size_t)g_cow_pool + g_cow_pool_sz) return; /* metadata pool */
     pg = (addr - hb) / QJS_COW_PAGE;
-    if (pg < qjs_cow_pages) qjs_cow_dirty[pg] = 1;
+    if (pg >= qjs_cow_pages) return;
+    if (!qjs_cow_orig[pg]) {            /* copy-on-FIRST-write: barrier runs BEFORE the store, so mem[pg] is still the original */
+        uint8_t *slot;
+        g_cow_busy = 1;                /* the save memcpy writes the pool -> the barrier must not re-enter */
+        slot = qjs_cow_palloc(QJS_COW_PAGE);
+        if (slot) { memcpy(slot, (const uint8_t *)(hb + pg * QJS_COW_PAGE), qjs_cow_pagelen(pg)); qjs_cow_orig[pg] = slot; g_cow_saved++; }
+        g_cow_busy = 0;                /* slot==NULL (pool full) -> orig stays NULL: page not revertible until #5 IDB eviction frees the pool (degrade, never corruption) */
+    }
+    qjs_cow_dirty[pg] = 1;
 }
 /* Range variant for bulk-memory (memory.copy/fill/init = memcpy/memset under
    -mbulk-memory), which write [addr, addr+size) — every heap page in the span. */
 QJS_JSEXPORT void qjs_cow_mark_dirty_range(size_t addr, size_t size) {
     size_t hb = (size_t)&__heap_base, p, p0, p1, end;
-    if (!qjs_cow_dirty || !size) return;
+    if (g_cow_busy || !qjs_cow_dirty || !size) return;   /* g_cow_busy: a COW op's own memcpy compiles to a bulk memory.copy -> must not re-enter */
     end = addr + size;
     if (end <= hb) return;                 /* entirely below the heap */
+    if (g_cow_pool && addr >= (size_t)g_cow_pool && end <= (size_t)g_cow_pool + g_cow_pool_sz) return; /* metadata pool */
     if (addr < hb) addr = hb;              /* clamp the heap part */
     p0 = (addr - hb) / QJS_COW_PAGE; p1 = (end - 1 - hb) / QJS_COW_PAGE;
-    for (p = p0; p <= p1 && p < qjs_cow_pages; p++) qjs_cow_dirty[p] = 1;
+    for (p = p0; p <= p1 && p < qjs_cow_pages; p++) {
+        if (!qjs_cow_orig[p]) {            /* copy-on-FIRST-write per page in the bulk span (pre-write content) */
+            uint8_t *slot;
+            g_cow_busy = 1;
+            slot = qjs_cow_palloc(QJS_COW_PAGE);
+            if (slot) { memcpy(slot, (const uint8_t *)(hb + p * QJS_COW_PAGE), qjs_cow_pagelen(p)); qjs_cow_orig[p] = slot; g_cow_saved++; }
+            g_cow_busy = 0;
+        }
+        qjs_cow_dirty[p] = 1;
+    }
 }
 /* Capture the post-boot baseline at the boot->forced-grind boundary. Uses the JS
    runtime allocator (raw malloc/free are forbidden in this TU). */
@@ -20372,20 +20396,20 @@ QJS_JSEXPORT int qjs_cow_pool_init(JSRuntime *rt, size_t sz) {
     return 0;
 }
 QJS_JSEXPORT int qjs_cow_baseline(JSRuntime *rt, const uint8_t *mem, size_t len) {
-    (void)rt;
-    g_cow_pool_used = 0;   /* bump-reset: free the prior grind's baseline/bitmap/deltas */
+    (void)rt; (void)mem;   /* mem unused: NO full-heap copy — each page's original is saved lazily on its first write (copy-on-write). Only TOUCHED pages cost pool memory; the old full memcpy needed len(>=pool_sz) and always failed. */
+    g_cow_pool_used = 0;   /* bump-reset: free the prior grind's orig-slots/deltas */
     qjs_cow_len = len; qjs_cow_pages = (len + QJS_COW_PAGE - 1) / QJS_COW_PAGE;
-    qjs_cow_base = qjs_cow_palloc(len ? len : 1);
+    qjs_cow_orig  = (uint8_t **)qjs_cow_palloc((qjs_cow_pages ? qjs_cow_pages : 1) * sizeof(uint8_t *));
     qjs_cow_dirty = qjs_cow_palloc(qjs_cow_pages ? qjs_cow_pages : 1);
-    if (!qjs_cow_base || !qjs_cow_dirty) {
-        qjs_cow_base = NULL; qjs_cow_dirty = NULL; qjs_cow_len = qjs_cow_pages = 0;
+    if (!qjs_cow_orig || !qjs_cow_dirty) {
+        qjs_cow_orig = NULL; qjs_cow_dirty = NULL; qjs_cow_len = qjs_cow_pages = 0;
         return -1;
     }
-    g_cow_pool_keep = g_cow_pool_used;   /* baseline+bitmap survive per-grind resets; deltas after */
     g_cow_busy = 1;
+    memset(qjs_cow_orig, 0, qjs_cow_pages * sizeof(uint8_t *));   /* every page unsaved -> lazy COW on first write */
     memset(qjs_cow_dirty, 0, qjs_cow_pages);
-    memcpy(qjs_cow_base, mem, len);   /* dest in the pool (excluded); g_cow_busy belt-and-suspenders */
     g_cow_busy = 0;
+    g_cow_pool_keep = g_cow_pool_used;   /* orig-array + bitmap survive per-grind resets; orig-slots + deltas come after */
     return 0;
 }
 
@@ -20395,6 +20419,7 @@ typedef struct JSCowDelta { uint32_t *pages; uint8_t *bytes; size_t n; } JSCowDe
 QJS_JSEXPORT int qjs_cow_capture(JSRuntime *rt, const uint8_t *mem, JSCowDelta *d) {
     size_t i, n = 0, k = 0;
     (void)rt;
+    g_cow_captures++;
     for (i = 0; i < qjs_cow_pages; i++) if (qjs_cow_dirty[i]) n++;
     d->n = n;
     d->pages = n ? qjs_cow_palloc(n * sizeof(uint32_t)) : NULL;
@@ -20416,12 +20441,14 @@ QJS_JSEXPORT void qjs_cow_to_baseline(uint8_t *mem, const JSCowDelta *d) {
     size_t k;
     g_cow_busy = 1;   /* restore writes the HEAP; the barrier must not re-mark those pages */
     for (k = 0; k < d->n; k++) { uint32_t pg = d->pages[k];
-        memcpy(mem + (size_t)pg * QJS_COW_PAGE, qjs_cow_base + (size_t)pg * QJS_COW_PAGE, qjs_cow_pagelen(pg)); }
+        if (pg < qjs_cow_pages && qjs_cow_orig[pg])
+            memcpy(mem + (size_t)pg * QJS_COW_PAGE, qjs_cow_orig[pg], qjs_cow_pagelen(pg)); }
     g_cow_busy = 0;
 }
 /* Apply d (a resuming flow's delta) over current memory; the flow re-owns those pages. */
 QJS_JSEXPORT void qjs_cow_apply(uint8_t *mem, const JSCowDelta *d) {
     size_t k;
+    g_cow_applies++;
     g_cow_busy = 1;   /* writes the HEAP; the flow re-owns these pages (set dirty BELOW, not via the barrier) */
     for (k = 0; k < d->n; k++) { uint32_t pg = d->pages[k];
         memcpy(mem + (size_t)pg * QJS_COW_PAGE, d->bytes + k * QJS_COW_PAGE, qjs_cow_pagelen(pg));
@@ -20439,10 +20466,11 @@ static void qjs_cow_delta_free(JSRuntime *rt, JSCowDelta *d) {
    so undoing the heap loses nothing). */
 QJS_JSEXPORT void qjs_cow_discard(uint8_t *mem) {
     size_t i;
-    if (!qjs_cow_dirty || !qjs_cow_base) return;
+    if (!qjs_cow_dirty || !qjs_cow_orig) return;
+    g_cow_discards++;
     g_cow_busy = 1;   /* restore writes the HEAP; the barrier must not re-mark */
     for (i = 0; i < qjs_cow_pages; i++) if (qjs_cow_dirty[i]) {
-        memcpy(mem + i * QJS_COW_PAGE, qjs_cow_base + i * QJS_COW_PAGE, qjs_cow_pagelen(i));
+        if (qjs_cow_orig[i]) memcpy(mem + i * QJS_COW_PAGE, qjs_cow_orig[i], qjs_cow_pagelen(i));
         qjs_cow_dirty[i] = 0;
     }
     g_cow_busy = 0;
@@ -20456,10 +20484,11 @@ QJS_JSEXPORT void qjs_cow_discard(uint8_t *mem) {
    a DIFFERENT orphan's delta, never committed -> still isolated. */
 QJS_JSEXPORT void qjs_cow_commit(const uint8_t *mem) {
     size_t i;
-    if (!qjs_cow_dirty || !qjs_cow_base) return;
+    if (!qjs_cow_dirty || !qjs_cow_orig) return;
+    g_cow_commits++;
     g_cow_busy = 1;
     for (i = 0; i < qjs_cow_pages; i++) if (qjs_cow_dirty[i]) {
-        memcpy(qjs_cow_base + i * QJS_COW_PAGE, mem + i * QJS_COW_PAGE, qjs_cow_pagelen(i));
+        if (qjs_cow_orig[i]) memcpy(qjs_cow_orig[i], mem + i * QJS_COW_PAGE, qjs_cow_pagelen(i));   /* promote mutated page INTO its saved original: the captured instance becomes baseline */
         qjs_cow_dirty[i] = 0;
     }
     g_cow_busy = 0;
@@ -20468,7 +20497,13 @@ QJS_JSEXPORT void qjs_cow_commit(const uint8_t *mem) {
    not js_malloc blocks — never js_free them; the pool stays allocated for reuse. */
 static void qjs_cow_reset(JSRuntime *rt) {
     (void)rt;
-    qjs_cow_base = NULL; qjs_cow_dirty = NULL; qjs_cow_len = qjs_cow_pages = 0;
+    if (g_cow_saved || g_cow_commits || g_cow_discards) {   /* #6 NO-SILENT-FAILURE: COW isolation MEASURED, never inferred from activity */
+        printf("@WHY {\"phase\":\"cow_stats\",\"pagesSaved\":%ld,\"commits\":%ld,\"discards\":%ld,\"captures\":%ld,\"applies\":%ld,\"poolUsedMB\":%zu}\n",
+               g_cow_saved, g_cow_commits, g_cow_discards, g_cow_captures, g_cow_applies, g_cow_pool_used / (size_t)1048576);
+        fflush(stdout);
+    }
+    g_cow_saved = g_cow_commits = g_cow_discards = g_cow_captures = g_cow_applies = 0;
+    qjs_cow_orig = NULL; qjs_cow_dirty = NULL; qjs_cow_len = qjs_cow_pages = 0;
     g_cow_pool_used = g_cow_pool_keep = 0;
 }
 /* Heap base + current linear-memory length (the COW region is [__heap_base, mem_end)). */
@@ -62454,8 +62489,13 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
            from. If pool/baseline fail, qjs_cow_dirty stays NULL -> the barrier no-ops ->
            the WFQ runs un-isolated (graceful), never a crash. */
         qjs_deep_cow = js_mallocz(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1) * sizeof(JSCowDelta));
-        if (g_cow_enabled && qjs_deep_cow && qjs_cow_pool_init(rt, (size_t)256 * 1024 * 1024) == 0)
-            qjs_cow_baseline(rt, qjs_cow_heap_base(), qjs_cow_heap_len());   /* gated: see g_cow_enabled */
+        if (g_cow_enabled && qjs_deep_cow) {   /* gated: see g_cow_enabled */
+            int _pi = qjs_cow_pool_init(rt, (size_t)256 * 1024 * 1024);
+            int _br = (_pi == 0) ? qjs_cow_baseline(rt, qjs_cow_heap_base(), qjs_cow_heap_len()) : -1;
+            printf("@WHY {\"phase\":\"cow_baseline\",\"poolOk\":%d,\"baselineOk\":%d,\"pages\":%zu,\"heapMB\":%zu}\n",
+                   _pi == 0, _br == 0, qjs_cow_pages, qjs_cow_heap_len() / (size_t)1048576);   /* #6 NO-SILENT-FAILURE: COW engagement must be observable */
+            fflush(stdout);
+        }
         g_grind_completions = 0;   /* per-grind progress counter (the defer fixpoint) */
         int _head_net = 0;
         if (qjs_deep_net && qjs_deep_sink) {
