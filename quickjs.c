@@ -24187,53 +24187,54 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                (coverage win). for-await over an opaque stream stays bounded
                via the done-opaque iterator + loop-revisit fixpoint. */
             if (qjs_is_opaque(sp[-1])) { BREAK; }
-            /* (1) PENDING promise during a grind orphan drive: an async
-               GENERATOR's next() ALWAYS returns a pending promise (it defers the
-               generator body to a microtask), so the FULFILLED-inline arm below
-               misses it and the frame would SUSPEND FOREVER — no microtask resumes
-               a suspended frame in forced exec, so a `for await(item of asyncGen)`
-               never reaches the post-loop fetch (Sentry transport's makeRequest →
-               fetch(envelopeUrl)). DRAIN pending jobs until the promise leaves
-               PENDING OR the job queue EMPTIES (JS_ExecutePendingJob == 0 — the
-               legitimate FIXPOINT termination: a proof that no remaining work can
-               settle it, "reaches=0 over a whole cycle", NOT a count). NO COUNT CAP
-               (policy: a drain cap is a vestigial bound — dissolved): a self-
-               perpetuating job loop is MADE to terminate by the forced-exec loop-
-               revisit fixpoint (it collapses revisited state so the queue drains in
-               finite jobs — the async-gen's opaque loop + js_iterator_get_value_done's
-               done-opaque fork already do this), and the per-job qjs_host_yield keeps
-               the drain PREEMPTIBLE so the scheduler STARVES an unproductive pump by
-               value-of-information (PRIORITISATION) — the analysis never hangs because
-               other fibers/the live review keep running while this one is parked.
-               Gated on g_grind_drive_active so normal concrete async ordering is
-               untouched (a real pending promise still suspends). The pump resumes the
-               GENERATOR frame (a different frame); this frame is mid-OP_await, not yet
-               suspended, so no job re-enters it. */
             if (g_grind_drive_active && JS_IsObject(sp[-1]) &&
                 JS_PromiseState(ctx, sp[-1]) == JS_PROMISE_PENDING) {
-                JSContext *_pjc; int _pn = 0;
-                while (JS_PromiseState(ctx, sp[-1]) == JS_PROMISE_PENDING &&
-                       JS_ExecutePendingJob(rt, &_pjc) > 0) {
-                    _pn++;
-#if defined(__EMSCRIPTEN__) && defined(QJS_HAS_JSPI)
-                    qjs_host_yield();   /* preemptible drain — scheduler starves an unproductive pump (no count cap) */
-#endif
+                /* OUTPUT-GOVERNED drain (replaces a blind `while ExecutePendingJob>0`
+                   + JSPI qjs_host_yield — two CLAUDE.md-named sins: an unpreemptible
+                   synchronous drive that can't be starved, and a JSPI-suspend-with-
+                   heap-frames desync, the supabase teardown aborts). An async
+                   generator's next() returns a PENDING promise (it defers the body to
+                   a microtask), so a `for await` needs jobs drained to reach the
+                   post-loop fetch; but firebase's silent async recursion re-spawns
+                   .then jobs forever, so the old blind drain spun the FIFO depth-first.
+                   Drain ONE CYCLE at a time (a cycle = the jobs present at its start,
+                   each run in full — a boundary, never a truncating cap). Stop when
+                   sp[-1] settles (productive await), the queue empties, OR a full cycle
+                   advances NO emitted @H/@S — the sanctioned "reaches=0 over a whole
+                   cycle" fixpoint: the pending work isn't moving the moat, so a SILENT
+                   forced recursion is STARVED here (resolve opaque + drive the
+                   post-await path) rather than spinning. Only emitted output proves
+                   progress. Gated on g_grind_drive_active (normal concrete async
+                   ordering untouched — a real pending promise still suspends). */
+                extern int g_emit_n;
+                JSContext *_pjc;
+                for (;;) {
+                    if (JS_PromiseState(ctx, sp[-1]) != JS_PROMISE_PENDING)
+                        break;                              /* settled: productive await */
+                    int _cyc = 0; struct list_head *_el;
+                    list_for_each(_el, &rt->job_list) _cyc++;
+                    if (_cyc == 0)
+                        break;                              /* queue empty: nothing can settle it */
+                    int _emit0 = g_emit_n;
+                    while (_cyc-- > 0 && JS_ExecutePendingJob(rt, &_pjc) > 0) {
+                        if (JS_PromiseState(ctx, sp[-1]) != JS_PROMISE_PENDING)
+                            break;                          /* settled mid-cycle */
+                    }
+                    if (JS_PromiseState(ctx, sp[-1]) != JS_PROMISE_PENDING)
+                        break;
+                    if (g_emit_n == _emit0)
+                        break;                              /* full cycle, no new @H/@S → unproductive */
                 }
                 if (JS_PromiseState(ctx, sp[-1]) == JS_PROMISE_PENDING) {
-                    printf("@WHY {\"phase\":\"await_pump_unfulfilled\",\"turns\":%d}\n", _pn);
-                    fflush(stdout);
-                    /* The promise never settles in forced exec (an external/IO
-                       dependency — a transport build, an auth-token fetch, a host-retry
-                       timer). Its eventual resolved value is UNKNOWN = opaque, so resolve
+                    /* starved (silent cycle) or unfulfilled (queue drained without
+                       settling): the resolved value is UNKNOWN = opaque, so resolve
                        INLINE with an opaque (mirrors the await-OPAQUE arm at the top of
-                       OP_await) and continue — DRIVING the continuation AFTER the await
-                       instead of suspending the frame forever. Composable / transport
-                       SDKs (Algolia transporter->requester, Directus .with(rest()) ->
-                       client.request) await an unresolvable build/auth promise BEFORE the
-                       fetch, so the old suspend pinned the frame and the fetch was never
-                       reached (atH:0, 0 endpoints). Gated by g_grind_drive_active above
-                       (normal concrete async ordering untouched); the continuation's own
-                       loops stay bounded by the loop-revisit fixpoint. */
+                       OP_await) and DRIVE the continuation AFTER the await instead of
+                       pinning the frame forever. Composable/transport SDKs (Algolia
+                       transporter->requester, Directus .with(rest())->client.request)
+                       await an unresolvable build/auth promise BEFORE the fetch. */
+                    printf("@WHY {\"phase\":\"await_pump_starved\",\"reason\":\"cycle_no_emit_or_drained\"}\n");
+                    fflush(stdout);
                     JS_FreeValue(ctx, sp[-1]);
                     sp[-1] = qjs_opaque_new(ctx);
                     BREAK;
@@ -61725,7 +61726,7 @@ void qjs_note_emit_line(const char *line) {
 }
 static int g_defer_fired = 0;         /* the handler yielded the current drive */
 static unsigned g_grind_completions = 0;   /* orphans that completed (no defer) this grind — the progress fixpoint */
-static int g_progress_seen = 0;       /* qjs_fe_seen_n at last forced-progress */
+static int g_progress_seen = 0;       /* g_emit_n at last emitted-output progress */
 static int g_noprog_polls = 0;        /* interrupt polls since last forced-progress */
 /* BFS-driver spin defense (distinct from the deep grind). The deep grind's
    seen_n-flat signal CANNOT be reused for the BFS __hostDrive: that loop
@@ -61747,13 +61748,15 @@ static unsigned *qjs_deep_defer_comp = NULL;  /* parallel: g_grind_completions s
 /* The deep-grind interrupt handler (op-counted via js_poll_interrupts, so it
    fires at every OP_if/back-edge — catches CONCRETE spins the opaque-only spin
    probe misses). Returns 1 to interrupt (throw) the spinning drive so the grind
-   can yield/defer it. Forced-progress = qjs_fe_seen_n grew (a new forced state
-   explored); a spinning concrete loop revisits the SAME state so it stays flat,
-   while a legitimately-long orphan keeps exploring → it is NOT false-deferred. */
+   can yield/defer it. Progress = g_emit_n grew (a new @H/@S EMITTED — the only
+   sound signal); a drive that explores opaque states without emitting (firebase's
+   opaque-call recursion, sentry's silent tail) stays flat on g_emit_n and is
+   deferred by output-starvation, while a drive that reaches a fetch within the
+   quantum emits → resets → runs on. (seen-set growth is NOT progress.) */
 static int qjs_grind_interrupt(JSRuntime *rt, void *opaque) {
     (void)opaque;
-    if (g_grind_drive_active) {                          /* LEGACY spin-defer — being REPLACED by the per-flow WFQ output-starvation (pause/resume, not throw/re-drive). Kept inert-equivalent only until the flow loop below lands, then deleted. */
-        if (qjs_fe_seen_n != g_progress_seen) { g_progress_seen = qjs_fe_seen_n; g_noprog_polls = 0; return 0; }
+    if (g_grind_drive_active) {                          /* OUTPUT-STARVATION spin-defer (interim form of the per-flow WFQ): a drive emitting NO new @H/@S (g_emit_n flat) for QJS_DEFER_QUANTUM polls is deferred (pause/resume — re-driven later, abandoned only at the no-global-progress fixpoint). Keyed on EMITTED OUTPUT, never the seen-set it used to use: firebase's opaque-call recursion grows qjs_fe_seen_n forever (new opaque states) while emitting nothing, so the old seen-set signal read it as progress and never fired → spin. */
+        if (g_emit_n != g_progress_seen) { g_progress_seen = g_emit_n; g_noprog_polls = 0; return 0; }
         if (++g_noprog_polls < QJS_DEFER_QUANTUM) return 0;
         g_defer_fired = 1; g_noprog_polls = 0;
         return 1;
@@ -62621,7 +62624,7 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
             printf("@WHY {\"phase\":\"orphan_drive\",\"inst\":%d,\"recv\":%d,\"recvCS\":%d,\"uid\":\"%s\",\"ix\":%d,\"dix\":%d,\"dixCS\":%d,\"dixuid\":\"%s\",\"host\":%d,\"async\":%d,\"ctor\":%d,\"line\":%d,\"col\":%d,\"file\":\"%s\"}\n",
                    _from_real, _hasrecv, _recvCS, _ruid, _ix, _dix, _dixCS, _dixuid, has_host_in_b, (b->func_kind & JS_FUNC_ASYNC) ? 1 : 0, _is_cls_ctor, b->line_num, b->col_num, _ofile);
             fflush(stdout); } }
-        g_grind_drive_active = 1; g_defer_fired = 0; g_noprog_polls = 0; g_progress_seen = qjs_fe_seen_n;   /* arm spin-defer for BOTH paths (targeted path's per-site catch cuts a spinning host site) */
+        g_grind_drive_active = 1; g_defer_fired = 0; g_noprog_polls = 0; g_progress_seen = g_emit_n;   /* arm output-starvation spin-defer for BOTH paths: seed the emitted-output mark (the handler reads g_emit_n) */
         if (!has_host_in_b) {
             JSValue *args3 = nargs > 0 ? js_mallocz(ctx, nargs * sizeof(JSValue)) : NULL;
             if (nargs > 0 && !args3) { JS_FreeValue(ctx, fo); continue; }
@@ -62630,7 +62633,7 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
             JSValue this_opq2 = qjs_opq_make(ctx, 1, "deep-drive-this", qjs_t_opaque());
             qjs_dir_active = 0; qjs_dir_b = NULL; qjs_dir_target = -1;   /* no host site to steer to */
             qjs_fe_seen_reset();   /* fresh loop-revisit bound per drive (one execution unit) */
-            g_grind_drive_active = 1; g_defer_fired = 0; g_noprog_polls = 0; g_progress_seen = 0;   /* arm spin-defer for this drive (seen_n just reset to 0) */
+            g_grind_drive_active = 1; g_defer_fired = 0; g_noprog_polls = 0; g_progress_seen = g_emit_n;   /* arm output-starvation spin-defer for this drive: seed the emitted-output mark (the handler reads g_emit_n) */
             /* A class constructor's bytecode starts with OP_check_ctor, which
                THROWS "must be invoked with 'new'" on a plain JS_Call — so the
                body never runs, no real instance exists, and its methods/arrows
