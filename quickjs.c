@@ -9408,7 +9408,6 @@ static int qjs_cow_dbg_dirtynow(size_t addr);  /* DIAG: is addr's page currently
 static long qjs_cow_dbg_disc(void);            /* DIAG: g_cow_discards so far (how many reverts ran before this underflow) */
 static size_t qjs_cow_dbg_pageof(size_t addr); /* DIAG: addr's page index (vs qjs_cow_pages baseline count -> grown-page detection) */
 static size_t qjs_cow_dbg_npages(void);        /* DIAG: qjs_cow_pages (baseline page count); cPg >= this => a page grown during the drive */
-static void qjs_empty_shape_audit(JSRuntime *rt, int orphanLine);   /* DIAG: empty-shape under-ref locator (defined below JS_RunGC; forward-declared so gc_decref can call it) */
 static void gc_decref_child(JSRuntime *rt, JSGCObjectHeader *p)
 {
     if (p->ref_count <= 0) {
@@ -9598,41 +9597,6 @@ static void gc_free_cycles(JSRuntime *rt)
     }
 
     init_list_head(&rt->gc_zero_ref_count_list);
-}
-
-/* DIAG (root-hunt for the latent forced-exec empty-shape under-ref): before each GC
-   DURING a forced-exec orphan drive, count the live referrers of every empty
-   (prop_count==0) shape and compare to its refcount. refs>rc IS the under-ref that
-   gc_decref then turns into the underflow (and production into a teardown leak). Log
-   ONCE with the executing bytecode fn (line + ptr) so the culprit window is named,
-   THEN let the GC proceed. Gated on g_grind_drive_active so boot GCs pay nothing. */
-static int g_esa_reported = 0;
-/* orphanLine: the bytecode line of the just-completed forced-exec orphan (so a post-drive
-   audit names the CREATING orphan), or -1 when called from a GC (uses the executing frame). */
-static void qjs_empty_shape_audit(JSRuntime *rt, int orphanLine) {
-    struct list_head *el, *el2;
-    if (g_esa_reported) return;
-    list_for_each(el, &rt->gc_obj_list) {
-        JSGCObjectHeader *h = list_entry(el, JSGCObjectHeader, link);
-        if (h->gc_obj_type != JS_GC_OBJ_TYPE_SHAPE) continue;
-        JSShape *sh = (JSShape *)h;
-        if (sh->prop_count != 0) continue;
-        int refs = 0;
-        list_for_each(el2, &rt->gc_obj_list) {
-            JSGCObjectHeader *h2 = list_entry(el2, JSGCObjectHeader, link);
-            if (h2->gc_obj_type == JS_GC_OBJ_TYPE_JS_OBJECT && ((JSObject *)h2)->shape == sh) refs++;
-        }
-        if (refs > (int)sh->header.ref_count) {
-            JSStackFrame *sf = rt->current_stack_frame;
-            JSFunctionBytecode *b = (sf && JS_VALUE_GET_TAG(sf->cur_func) == JS_TAG_OBJECT)
-                                    ? JS_GetFunctionBytecode(sf->cur_func) : NULL;
-            printf("@WHY {\"phase\":\"empty_shape_underref\",\"refs\":%d,\"rc\":%d,\"isHashed\":%d,\"driving\":%d,\"orphanLine\":%d,\"fnLine\":%d}\n",
-                   refs, (int)sh->header.ref_count, sh->is_hashed, g_grind_drive_active, orphanLine, b ? b->line_num : -1);
-            fflush(stdout);
-            g_esa_reported = 1;
-            return;
-        }
-    }
 }
 
 void JS_RunGC(JSRuntime *rt)
