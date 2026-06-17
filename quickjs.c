@@ -2493,6 +2493,7 @@ typedef struct JSStackFrame {
     JSValue qjs_new_target;                 /* new_target for this frame (reloaded on a trampoline return) */
     void *qjs_tramp_async;                  /* #6: non-NULL (the JSAsyncFunctionData) marks a trampolined ASYNC callee being run on the CALLER's loop instead of via a nested js_async_function_resume. At done_generator teardown the loop settles it (register await / resolve) + reloads the caller (whose stack already holds the result promise) rather than returning to C. NULL for every normal/generator/resume frame. */
     uint8_t qjs_tramp_caller;               /* #6: 1 = this async frame is a trampoline CALLER currently waiting for a callee running deeper on the SAME heap loop (cur_sp is saved for restoration, but the frame is logically RUNNING, not suspended-at-await). async_func_mark must treat it like a running frame (skip stack marking → its values stay external roots), or the cycle collector wrongly treats the chained-but-live frame as cycle-collectable and over-frees a shared shape. Set in the OP_call async entry, cleared when the callee returns and reloads this frame. */
+    void *qjs_tramp_gen;                    /* #6: non-NULL (the JSGeneratorData) marks a trampolined GENERATOR body run on the CALLER's loop via OP_call_method-to-.next(), instead of nested js_generator_next -> async_func_resume -> JS_CallInternal. At done_generator teardown the loop settles it (js_generator_settle), builds the {value,done} result, reloads the caller, and splices the result. NULL for every other frame. */
 } JSStackFrame;
 
 typedef enum {
@@ -3429,6 +3430,8 @@ static JSValue JS_CallInternal(JSContext *ctx, JSValueConst func_obj,
                                int argc, JSValueConst *argv, int flags);
 static bool js_async_function_settle(JSContext *ctx, JSAsyncFunctionData *s, JSValue func_ret);   /* #6: settle a trampolined async callee from the interpreter teardown (defined with the async machinery) */
 static JSAsyncFunctionData *js_async_function_setup(JSContext *ctx, JSValueConst func_obj, JSValueConst this_obj, int argc, JSValueConst *argv, JSValue *promise);   /* #6: build the async callee's promise + buffered frame so OP_call can run it trampolined */
+static JSStackFrame *qjs_gen_tramp_entry(JSContext *ctx, JSValueConst this_val, JSValueConst callee, JSValueConst arg);   /* #6: if callee is a generator's .next() on a SUSPENDED generator, set up its body for resume + return the body frame to switch the loop into; else NULL (defined with the generator machinery) */
+static JSValue qjs_gen_tramp_settle(JSContext *ctx, void *gen_data, JSValue func_ret);   /* #6: settle a trampolined generator body at done_generator -> the {value,done} iterator-result spliced to the caller */
 static void qjs_drive_opaque_call_cbs(JSContext *ctx, JSValueConst *call_argv, int call_argc);
 static JSValue JS_CallConstructorInternal(JSContext *ctx,
                                           JSValueConst func_obj,
@@ -21672,6 +21675,38 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         p = _fp; b = _fp->u.func.function_bytecode;
                         goto setup_callee;
                     }
+                    if (opcode == OP_call_method && _fp) {
+                        JSStackFrame *_gf = qjs_gen_tramp_entry(ctx, call_argv[-2], _fo, call_argc > 0 ? call_argv[0] : JS_UNDEFINED);
+                        if (_gf) {
+                            /* #6 generator-.next() trampoline: run the body on THIS loop instead of
+                               nesting js_generator_next -> async_func_resume -> JS_CallInternal. Stamp
+                               the caller for the teardown splice (this+func+args), switch into the body
+                               frame (mirrors the async piece-3 entry). The done_generator teardown
+                               settles it, builds {value,done}, and splices it as the .next() result. */
+                            sf->qjs_call_argc = call_argc;
+                            sf->qjs_call_extra = 2;
+                            sf->cur_sp = sp;            /* caller resume: stack still holds [this, func, args] */
+                            sf->qjs_tramp_caller = 1;   /* #6: this caller is mid-call (running), not suspended — async_func_mark must skip its stack (same GC fix as the async-callee chained-caller case) */
+                            _gf->prev_frame = sf;
+                            rt->current_stack_frame = _gf;
+                            sf = _gf;
+                            p = JS_VALUE_GET_OBJ(_gf->cur_func);
+                            b = p->u.func.function_bytecode;
+                            ctx = b->realm;
+                            var_refs = p->u.func.var_refs;
+                            local_buf = arg_buf = _gf->arg_buf;
+                            var_buf = _gf->var_buf;
+                            stack_buf = _gf->var_buf + b->var_count;
+                            _gf->qjs_arena_chunk = NULL; _gf->qjs_arena_save = NULL;
+                            _gf->qjs_local_buf = local_buf;
+                            this_obj = _gf->qjs_this;
+                            new_target = _gf->qjs_new_target;
+                            pc = _gf->cur_pc;
+                            sp = _gf->cur_sp;
+                            _gf->cur_sp = NULL;
+                            goto restart;
+                        }
+                    }
                     ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
                                               JS_UNDEFINED, call_argc,
                                               vc(call_argv), 0);
@@ -24916,6 +24951,43 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto reenter_dispatch;    /* X resumes; the promise is already its call result */
                 }
             }
+            if (sf != entry_frame && sf->qjs_tramp_gen) {
+                /* #6 generator-.next() trampoline teardown: the body yielded or returned on the
+                   caller's loop. Settle -> the {value,done} iterator result, reload the caller,
+                   and splice it as the .next() call result. The body frame is the generator's own
+                   malloc buffer (NOT the arena, _cc NULL here), so it is not js_stack_pop'd. */
+                void *_gd = sf->qjs_tramp_gen;
+                sf->qjs_tramp_gen = NULL;
+                JSStackFrame *_caller = sf->prev_frame;   /* capture BEFORE settle (iterator-end frees the body frame) */
+                JSValue _gresult = qjs_gen_tramp_settle(ctx, _gd, ret_val);
+                sf = _caller;
+                sf->qjs_tramp_caller = 0;   /* #6: the caller resumes running (its callee finished) */
+                {
+                    JSObject *_cp = JS_VALUE_GET_OBJ(sf->cur_func);
+                    int _cargc = sf->qjs_call_argc, _cextra = sf->qjs_call_extra;
+                    b = _cp->u.func.function_bytecode;
+                    ctx = b->realm;
+                    var_buf = sf->var_buf;
+                    arg_buf = sf->arg_buf;
+                    var_refs = _cp->u.func.var_refs;
+                    stack_buf = var_buf + b->var_count;
+                    local_buf = sf->qjs_local_buf;
+                    _arena_chunk = sf->qjs_arena_chunk;
+                    _arena_save = sf->qjs_arena_save;
+                    this_obj = sf->qjs_this;
+                    new_target = sf->qjs_new_target;
+                    pc = sf->cur_pc;
+                    sp = sf->cur_sp;
+                    sf->cur_sp = NULL;
+                    for (i = -_cextra; i < _cargc; i++)
+                        JS_FreeValue(ctx, (sp - _cargc)[i]);   /* free this+func+args */
+                    sp -= _cargc + _cextra;
+                    if (JS_IsException(_gresult))
+                        goto exception;
+                    *sp++ = _gresult;
+                    goto reenter_dispatch;
+                }
+            }
             if (_cc)
                 js_stack_pop(rt, _cc, _cs);
             /* Cold-composition: the return-object is the candidate producer output
@@ -25186,6 +25258,7 @@ static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s,
     sf->var_ref_count = b->var_ref_count;
     sf->qjs_tramp_async = NULL;           /* #6: NULL by default; piece 3 (OP_call async-callee entry) sets it when this frame is run trampolined on the caller's loop */
     sf->qjs_tramp_caller = 0;             /* #6: not waiting for a trampolined callee yet */
+    sf->qjs_tramp_gen = NULL;             /* #6: NULL unless the generator-.next() trampoline runs this body on the caller's loop */
     for(i = 0; i < b->var_ref_count; i++)
         sf->var_refs[i] = NULL;
     for(i = 0; i < argc; i++)
@@ -25313,6 +25386,39 @@ static void js_generator_mark(JSRuntime *rt, JSValueConst val,
 #define GEN_MAGIC_RETURN 1
 #define GEN_MAGIC_THROW  2
 
+/* #6 generators trampoline: the POST-resume settle, extracted from js_generator_next so an
+   OP_call_method-to-.next() trampoline can run the generator body on the caller's heap loop and
+   settle at the done_generator teardown (mirrors the async-callee setup/settle split). Sets the
+   suspend state + extracts the yield value / finalizes on iterator-end. Behavior-neutral. */
+static JSValue js_generator_settle(JSContext *ctx, JSGeneratorData *s, JSValue func_ret, int *pdone) {
+    JSStackFrame *sf = &s->func_state.frame;
+    JSValue ret;
+    s->state = JS_GENERATOR_STATE_SUSPENDED_YIELD;
+    if (JS_IsException(func_ret)) {
+        /* finalize the execution in case of exception */
+        free_generator_stack(ctx, s);
+        return func_ret;
+    }
+    if (JS_VALUE_GET_TAG(func_ret) == JS_TAG_INT) {
+        /* get the returned yield value at the top of the stack */
+        ret = sf->cur_sp[-1];
+        sf->cur_sp[-1] = JS_UNDEFINED;
+        if (JS_VALUE_GET_INT(func_ret) == FUNC_RET_YIELD_STAR) {
+            s->state = JS_GENERATOR_STATE_SUSPENDED_YIELD_STAR;
+            *pdone = 2;   /* return (value, done) object */
+        } else {
+            *pdone = false;
+        }
+    } else {
+        /* end of iterator */
+        ret = sf->cur_sp[-1];
+        sf->cur_sp[-1] = JS_UNDEFINED;
+        JS_FreeValue(ctx, func_ret);
+        free_generator_stack(ctx, s);
+    }
+    return ret;
+}
+
 static JSValue js_generator_next(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv,
                                  int *pdone, int magic)
@@ -25352,30 +25458,7 @@ static JSValue js_generator_next(JSContext *ctx, JSValueConst this_val,
         }
         s->state = JS_GENERATOR_STATE_EXECUTING;
         func_ret = async_func_resume(ctx, &s->func_state);
-        s->state = JS_GENERATOR_STATE_SUSPENDED_YIELD;
-        if (JS_IsException(func_ret)) {
-            /* finalize the execution in case of exception */
-            free_generator_stack(ctx, s);
-            return func_ret;
-        }
-        if (JS_VALUE_GET_TAG(func_ret) == JS_TAG_INT) {
-            /* get the returned yield value at the top of the stack */
-            ret = sf->cur_sp[-1];
-            sf->cur_sp[-1] = JS_UNDEFINED;
-            if (JS_VALUE_GET_INT(func_ret) == FUNC_RET_YIELD_STAR) {
-                s->state = JS_GENERATOR_STATE_SUSPENDED_YIELD_STAR;
-                /* return (value, done) object */
-                *pdone = 2;
-            } else {
-                *pdone = false;
-            }
-        } else {
-            /* end of iterator */
-            ret = sf->cur_sp[-1];
-            sf->cur_sp[-1] = JS_UNDEFINED;
-            JS_FreeValue(ctx, func_ret);
-            free_generator_stack(ctx, s);
-        }
+        ret = js_generator_settle(ctx, s, func_ret, pdone);   /* #6: same handling, extracted for the trampoline teardown */
         break;
     case JS_GENERATOR_STATE_COMPLETED:
     done:
@@ -25397,6 +25480,53 @@ static JSValue js_generator_next(JSContext *ctx, JSValueConst this_val,
         ret = JS_ThrowTypeError(ctx, "cannot invoke a running generator");
         break;
     }
+    return ret;
+}
+
+/* #6 generator-.next() trampoline ENTRY: if `callee` is Generator.prototype.next
+   (the js_generator_next C function with GEN_MAGIC_NEXT) and `this_val` is a SUSPENDED
+   generator, set its body up to resume (mirroring js_generator_next's pre-resume setup)
+   and return the body frame so the OP_call_method dispatcher switches its loop INTO it,
+   instead of nesting js_generator_next -> async_func_resume -> JS_CallInternal (so deep
+   recursive g.next() is overflow-impossible + preemptible). Returns NULL (take the normal
+   C path) for non-generators, throw/return magics, or a non-resumable state. */
+static JSStackFrame *qjs_gen_tramp_entry(JSContext *ctx, JSValueConst this_val, JSValueConst callee, JSValueConst arg) {
+    JSObject *fp = JS_VALUE_GET_OBJ(callee);
+    if (fp->class_id != JS_CLASS_C_FUNCTION ||
+        fp->u.cfunc.cproto != JS_CFUNC_iterator_next ||
+        fp->u.cfunc.c_function.iterator_next != js_generator_next ||
+        fp->u.cfunc.magic != GEN_MAGIC_NEXT)
+        return NULL;
+    JSObject *gp = (JS_VALUE_GET_TAG(this_val) == JS_TAG_OBJECT) ? JS_VALUE_GET_OBJ(this_val) : NULL;
+    if (!gp || gp->class_id != JS_CLASS_GENERATOR)
+        return NULL;
+    JSGeneratorData *s = gp->u.generator_data;
+    if (!s || (s->state != JS_GENERATOR_STATE_SUSPENDED_START &&
+               s->state != JS_GENERATOR_STATE_SUSPENDED_YIELD &&
+               s->state != JS_GENERATOR_STATE_SUSPENDED_YIELD_STAR))
+        return NULL;
+    JSStackFrame *gf = &s->func_state.frame;
+    if (s->state != JS_GENERATOR_STATE_SUSPENDED_START) {
+        /* a resume value was expected at cur_sp[-1] (set to UNDEFINED on the prior yield) */
+        gf->cur_sp[-1] = js_dup(arg);
+        gf->cur_sp[0] = js_int32(GEN_MAGIC_NEXT);
+        gf->cur_sp++;
+    }
+    s->func_state.throw_flag = false;
+    s->state = JS_GENERATOR_STATE_EXECUTING;
+    gf->qjs_this = s->func_state.this_val;
+    gf->qjs_new_target = JS_UNDEFINED;
+    gf->qjs_tramp_gen = s;
+    return gf;
+}
+/* #6 generator-.next() trampoline SETTLE: build the {value,done} iterator result from the
+   body's func_ret (mirrors the JS_CFUNC_iterator_next cproto wrapping of js_generator_next). */
+static JSValue qjs_gen_tramp_settle(JSContext *ctx, void *gen_data, JSValue func_ret) {
+    JSGeneratorData *s = gen_data;
+    int pdone = true;
+    JSValue ret = js_generator_settle(ctx, s, func_ret, &pdone);
+    if (!JS_IsException(ret) && pdone != 2)
+        ret = js_create_iterator_result(ctx, ret, pdone);
     return ret;
 }
 
