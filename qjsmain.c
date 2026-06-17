@@ -1099,10 +1099,12 @@ int main(int argc, char **argv) {
                 qjs_set_driving(g_boot_ctx, 0);
                 js_std_loop(g_boot_ctx);                    /* final settle (timers/os) at driving=0 */
             }
+            { extern void qjs_cow_boot_baseline(JSRuntime *); qjs_cow_boot_baseline(JS_GetRuntime(g_boot_ctx)); }   /* COW-as-snapshot: the post-boot heap is the base every DRIVE forks from */
             return rc;
         }
         if (do_drive) {
             if (!g_boot_ctx) { printf("@E {\"phase\":\"drive_no_boot\"}\n"); fflush(stdout); return 1; }
+            { extern void qjs_cow_drive_restore(JSRuntime *); qjs_cow_drive_restore(JS_GetRuntime(g_boot_ctx)); }   /* COW-as-snapshot: replay the undo log to revert the PREVIOUS drive's mutations back to the boot baseline (exact-write words) */
             qjs_forced_config(1, drive_sched, drive_trace);
             qjs_set_driving(g_boot_ctx, 1);   /* #8: opcode-level return-to-scheduler ON for the drive */
             int rc = 0;
@@ -1122,6 +1124,7 @@ int main(int argc, char **argv) {
             }
             qjs_set_driving(g_boot_ctx, 0);   /* async job re-drives in js_std_loop run normally (no opcode-yield) */
             if (rc == 0) js_std_loop(g_boot_ctx);
+            { extern void qjs_cow_stats_emit(void); qjs_cow_stats_emit(); }   /* COW: within-drive activity, emitted BEFORE the next drive's image-restore wipes the linear-memory counters */
             fflush(stdout);
             return rc;
         }
