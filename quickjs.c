@@ -2491,6 +2491,8 @@ typedef struct JSStackFrame {
     uint8_t qjs_is_tail;                    /* the in-progress call was a tail call */
     JSValue qjs_this;                       /* this_obj for this frame (reloaded on a trampoline return) */
     JSValue qjs_new_target;                 /* new_target for this frame (reloaded on a trampoline return) */
+    void *qjs_tramp_async;                  /* #6: non-NULL (the JSAsyncFunctionData) marks a trampolined ASYNC callee being run on the CALLER's loop instead of via a nested js_async_function_resume. At done_generator teardown the loop settles it (register await / resolve) + reloads the caller (whose stack already holds the result promise) rather than returning to C. NULL for every normal/generator/resume frame. */
+    uint8_t qjs_tramp_caller;               /* #6: 1 = this async frame is a trampoline CALLER currently waiting for a callee running deeper on the SAME heap loop (cur_sp is saved for restoration, but the frame is logically RUNNING, not suspended-at-await). async_func_mark must treat it like a running frame (skip stack marking → its values stay external roots), or the cycle collector wrongly treats the chained-but-live frame as cycle-collectable and over-frees a shared shape. Set in the OP_call async entry, cleared when the callee returns and reloads this frame. */
 } JSStackFrame;
 
 typedef enum {
@@ -3425,6 +3427,8 @@ static JSValue js_call_bound_function(JSContext *ctx, JSValueConst func_obj,
 static JSValue JS_CallInternal(JSContext *ctx, JSValueConst func_obj,
                                JSValueConst this_obj, JSValueConst new_target,
                                int argc, JSValueConst *argv, int flags);
+static bool js_async_function_settle(JSContext *ctx, JSAsyncFunctionData *s, JSValue func_ret);   /* #6: settle a trampolined async callee from the interpreter teardown (defined with the async machinery) */
+static JSAsyncFunctionData *js_async_function_setup(JSContext *ctx, JSValueConst func_obj, JSValueConst this_obj, int argc, JSValueConst *argv, JSValue *promise);   /* #6: build the async callee's promise + buffered frame so OP_call can run it trampolined */
 static void qjs_drive_opaque_call_cbs(JSContext *ctx, JSValueConst *call_argv, int call_argc);
 static JSValue JS_CallConstructorInternal(JSContext *ctx,
                                           JSValueConst func_obj,
@@ -21059,6 +21063,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         sf->qjs_is_tail = 0;
         sf->qjs_this = this_obj;              /* reloaded on a trampoline return so the caller's this is restored */
         sf->qjs_new_target = new_target;
+        sf->qjs_tramp_async = NULL;           /* #6: a normal trampolined callee, never an async-callee */
+        sf->qjs_tramp_caller = 0;             /* #6: a freshly set-up callee is running, not waiting on a deeper callee */
     }
 
     sf->is_strict_mode = b->is_strict_mode;
@@ -21541,6 +21547,50 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         p = _fp; b = _fp->u.func.function_bytecode;
                         goto setup_callee;
                     }
+                    if (opcode == OP_call && _fp && _fp->class_id == JS_CLASS_ASYNC_FUNCTION) {
+                        /* #6 async-callee trampoline: run the async callee's FIRST execution
+                           (until its first await/return) on THIS loop instead of nesting
+                           js_async_function_call -> js_async_function_resume -> JS_CallInternal,
+                           so a deep recursive-async chain no longer grows the C stack.
+                           js_async_function_setup builds the result promise + the buffered frame;
+                           splice the promise as the call result NOW (GC-rooted on the caller's
+                           stack during the run), then switch the loop into the async frame. Its
+                           first await/return hits the done_generator teardown, which settles it +
+                           reloads the caller (piece 4). Resumes stay microtask-driven. */
+                        JSValue _ap;
+                        JSAsyncFunctionData *_as = js_async_function_setup(ctx, _fo, JS_UNDEFINED,
+                                                                           call_argc, vc(call_argv), &_ap);
+                        if (!_as) { ret_val = _ap; goto exception; }   /* _ap == JS_EXCEPTION */
+                        for (i = -1; i < call_argc; i++)
+                            JS_FreeValue(ctx, call_argv[i]);           /* free func + args (async_func_init dup'd them) */
+                        sp -= call_argc + 1;
+                        *sp++ = _ap;                                   /* the result promise = the call result */
+                        sf->cur_sp = sp;                               /* caller's resume point (promise already its result) */
+                        sf->qjs_tramp_caller = 1;                      /* #6: this caller is now mid-call (running), not suspended-at-await: async_func_mark must treat it as running (skip stack marking) */
+                        {
+                            JSStackFrame *_af = &_as->func_state.frame;
+                            _af->qjs_tramp_async = _as;                /* mark: teardown settles + reloads the caller */
+                            _af->qjs_tramp_caller = 0;                 /* #6: the callee starts running, not yet waiting on a deeper callee */
+                            _af->prev_frame = sf;
+                            rt->current_stack_frame = _af;
+                            sf = _af;
+                            p = JS_VALUE_GET_OBJ(_af->cur_func);
+                            b = p->u.func.function_bytecode;
+                            ctx = b->realm;
+                            var_refs = p->u.func.var_refs;
+                            local_buf = arg_buf = _af->arg_buf;
+                            var_buf = _af->var_buf;
+                            stack_buf = _af->var_buf + b->var_count;
+                            _af->qjs_arena_chunk = NULL; _af->qjs_arena_save = NULL;
+                            _af->qjs_local_buf = local_buf;
+                            this_obj = _af->qjs_this = _as->func_state.this_val;
+                            new_target = _af->qjs_new_target = JS_UNDEFINED;
+                            pc = _af->cur_pc;
+                            sp = _af->cur_sp;
+                            _af->cur_sp = NULL;
+                            goto restart;
+                        }
+                    }
                     ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
                                               JS_UNDEFINED, call_argc,
                                               vc(call_argv), 0);
@@ -21599,6 +21649,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        their per-element fetch (see helper). */
                     qjs_drive_opaque_call_cbs(ctx, vc(call_argv), call_argc);
                 } else {
+                    JSValue _fo = call_argv[-1];
+                    JSObject *_fp = (JS_VALUE_GET_TAG(_fo) == JS_TAG_OBJECT) ? JS_VALUE_GET_OBJ(_fo) : NULL;
+                    if (opcode == OP_call_method && _fp &&
+                        b->func_kind == JS_FUNC_NORMAL &&
+                        _fp->class_id == JS_CLASS_BYTECODE_FUNCTION &&
+                        _fp->u.func.function_bytecode->func_kind == JS_FUNC_NORMAL) {
+                        /* Heap-stack trampoline for normal-bytecode method calls (#6): route the
+                           call onto the segmented heap arena (goto setup_callee) instead of native
+                           C recursion, so deep method recursion is overflow-impossible and every
+                           level stays preemptible (per-call YIELD_POLL). Same normal->normal
+                           routing condition as the committed OP_call trampoline; async/generator
+                           callers + native/bound callees splice their result at done: on the C
+                           path (their frames are not on the arena). qjs_call_extra=2 frees
+                           receiver+func+args on return. */
+                        sf->cur_sp = sp;
+                        sf->qjs_call_argc = call_argc;
+                        sf->qjs_call_extra = 2;
+                        sf->qjs_is_tail = 0;
+                        func_obj = _fo; this_obj = call_argv[-2]; new_target = JS_UNDEFINED;
+                        argc = call_argc; argv = vc(call_argv); flags = 0;
+                        p = _fp; b = _fp->u.func.function_bytecode;
+                        goto setup_callee;
+                    }
                     ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
                                               JS_UNDEFINED, call_argc,
                                               vc(call_argv), 0);
@@ -24806,6 +24879,43 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         JSStackChunk *_cc = _arena_chunk;   /* the just-finished frame's segment */
         uint8_t *_cs = _arena_save;
         if (sf == entry_frame || b->func_kind != JS_FUNC_NORMAL) {
+            if (sf != entry_frame && sf->qjs_tramp_async) {
+                /* #6 async-callee trampoline: a trampolined ASYNC callee suspended (await) or
+                   returned on the CALLER's loop. Settle it (register the await continuation /
+                   resolve-reject the result promise), then reload the caller X — whose stack
+                   ALREADY holds the result promise (spliced at the OP_call entry). The async
+                   frame lives in async_func_free's malloc buffer, NOT the arena (_cc is NULL
+                   here), so it is NOT js_stack_pop'd. After this first run, resumes are
+                   microtask-driven via the normal async_func_resume path (marker cleared). */
+                JSAsyncFunctionData *_as = sf->qjs_tramp_async;
+                sf->qjs_tramp_async = NULL;
+                JSStackFrame *_caller = sf->prev_frame;   /* capture X BEFORE settle/free can free this frame (the return case terminates it) */
+                bool _aok = js_async_function_settle(ctx, _as, ret_val);
+                if (--_as->header.ref_count == 0)         /* drop the setup's creator ref, as js_async_function_call does after the resume (else s + its frame leak) */
+                    js_async_function_free0(ctx->rt, _as);
+                sf = _caller;                 /* the caller X */
+                sf->qjs_tramp_caller = 0;     /* #6: X resumes running (its callee finished) — no longer a waiting caller */
+                {
+                    JSObject *_cp = JS_VALUE_GET_OBJ(sf->cur_func);
+                    b = _cp->u.func.function_bytecode;
+                    ctx = b->realm;
+                    var_buf = sf->var_buf;
+                    arg_buf = sf->arg_buf;
+                    var_refs = _cp->u.func.var_refs;
+                    stack_buf = var_buf + b->var_count;
+                    local_buf = sf->qjs_local_buf;
+                    _arena_chunk = sf->qjs_arena_chunk;
+                    _arena_save = sf->qjs_arena_save;
+                    this_obj = sf->qjs_this;
+                    new_target = sf->qjs_new_target;
+                    pc = sf->cur_pc;
+                    sp = sf->cur_sp;
+                    sf->cur_sp = NULL;
+                    if (!_aok)
+                        goto exception;       /* uncatchable error in settle -> propagate into X */
+                    goto reenter_dispatch;    /* X resumes; the promise is already its call result */
+                }
+            }
             if (_cc)
                 js_stack_pop(rt, _cc, _cs);
             /* Cold-composition: the return-object is the candidate producer output
@@ -25074,6 +25184,8 @@ static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s,
     sf->cur_sp = sf->var_buf + b->var_count;
     sf->var_refs = (JSVarRef **)(sf->cur_sp + b->stack_size);
     sf->var_ref_count = b->var_ref_count;
+    sf->qjs_tramp_async = NULL;           /* #6: NULL by default; piece 3 (OP_call async-callee entry) sets it when this frame is run trampolined on the caller's loop */
+    sf->qjs_tramp_caller = 0;             /* #6: not waiting for a trampolined callee yet */
     for(i = 0; i < b->var_ref_count; i++)
         sf->var_refs[i] = NULL;
     for(i = 0; i < argc; i++)
@@ -25093,11 +25205,17 @@ static void async_func_mark(JSRuntime *rt, JSAsyncFunctionState *s,
     sf = &s->frame;
     JS_MarkValue(rt, sf->cur_func, mark_func);
     JS_MarkValue(rt, s->this_val, mark_func);
-    if (sf->cur_sp) {
+    if (sf->cur_sp && !sf->qjs_tramp_caller) {
         /* if the function is running, cur_sp is not known so we
            cannot mark the stack. Marking the variables is not needed
            because a running function cannot be part of a removable
-           cycle */
+           cycle.
+           #6: qjs_tramp_caller frames ARE running (mid-call, waiting for a
+           callee deeper on the same heap loop) even though cur_sp was saved
+           for restoration. Treat them as running too: skip marking so their
+           stack values stay EXTERNAL roots. Otherwise the cycle collector
+           treats the chained-but-live caller as cycle-collectable and
+           over-frees a shape shared with the running descent. */
         for(sp = sf->arg_buf; sp < sf->cur_sp; sp++)
             JS_MarkValue(rt, *sp, mark_func);
     }
@@ -25385,10 +25503,11 @@ static int js_async_function_resolve_create(JSContext *ctx,
     return 0;
 }
 
+static bool js_async_function_settle(JSContext *ctx, JSAsyncFunctionData *s, JSValue func_ret);
+
 static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
 {
-    bool is_success = true;
-    JSValue func_ret, ret2;
+    JSValue func_ret;
 
     func_ret = async_func_resume(ctx, &s->func_state);
     /* Opcode-level preemption: a trampolined callee inside this async frame
@@ -25414,6 +25533,18 @@ static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
         ctx->rt->qjs_resume_chain = 1;
         func_ret = async_func_resume(ctx, &s->func_state);
     }
+    return js_async_function_settle(ctx, s, func_ret);
+}
+
+/* Settle an async frame's genuine await/return/exception (func_ret from async_func_resume,
+   after any trampolined-callee re-drives): register the await continuation, or resolve/reject
+   the result promise. Factored out so the #6 async-callee trampoline can settle the frame from
+   the interpreter's done: teardown (the frame's OWN OP_await/OP_return_async) instead of a
+   nested js_async_function_resume. Behaviour-neutral for the existing nested path. */
+static bool js_async_function_settle(JSContext *ctx, JSAsyncFunctionData *s, JSValue func_ret)
+{
+    bool is_success = true;
+    JSValue ret2;
     if (JS_IsException(func_ret)) {
     fail:
         if (unlikely(JS_IsUncatchableError(ctx->rt->current_exception))) {
@@ -25538,39 +25669,51 @@ static JSValue js_async_function_resolve_call(JSContext *ctx,
     return JS_UNDEFINED;
 }
 
-static JSValue js_async_function_call(JSContext *ctx, JSValueConst func_obj,
-                                      JSValueConst this_obj,
-                                      int argc, JSValueConst *argv, int flags)
+/* Create the result promise + JSAsyncFunctionData + the (buffered) frame for an async
+   invocation WITHOUT running it. Returns s (is_active=true) with *promise set, or NULL with
+   *promise=JS_EXCEPTION on failure. Factored out of js_async_function_call so the #6
+   async-callee trampoline can reuse the setup and then run the frame on the interpreter
+   loop instead of nesting a JS_CallInternal via js_async_function_resume. Behaviour-neutral. */
+static JSAsyncFunctionData *js_async_function_setup(JSContext *ctx, JSValueConst func_obj,
+                                                    JSValueConst this_obj, int argc,
+                                                    JSValueConst *argv, JSValue *promise)
 {
-    JSValue promise;
-    JSAsyncFunctionData *s;
-
-    s = js_mallocz(ctx, sizeof(*s));
-    if (!s)
-        return JS_EXCEPTION;
+    JSAsyncFunctionData *s = js_mallocz(ctx, sizeof(*s));
+    if (!s) { *promise = JS_EXCEPTION; return NULL; }
     s->header.ref_count = 1;
     add_gc_object(ctx->rt, &s->header, JS_GC_OBJ_TYPE_ASYNC_FUNCTION);
     s->is_active = false;
     s->resolving_funcs[0] = JS_UNDEFINED;
     s->resolving_funcs[1] = JS_UNDEFINED;
-
-    promise = JS_NewPromiseCapability(ctx, s->resolving_funcs);
-    if (JS_IsException(promise))
-        goto fail;
-
+    *promise = JS_NewPromiseCapability(ctx, s->resolving_funcs);
+    if (JS_IsException(*promise)) {
+        js_async_function_free(ctx->rt, s);
+        return NULL;
+    }
     if (async_func_init(ctx, &s->func_state, func_obj, this_obj, argc, argv)) {
-    fail:
+        JS_FreeValue(ctx, *promise);
+        *promise = JS_EXCEPTION;
+        js_async_function_free(ctx->rt, s);
+        return NULL;
+    }
+    s->is_active = true;
+    return s;
+}
+
+static JSValue js_async_function_call(JSContext *ctx, JSValueConst func_obj,
+                                      JSValueConst this_obj,
+                                      int argc, JSValueConst *argv, int flags)
+{
+    JSValue promise;
+    JSAsyncFunctionData *s = js_async_function_setup(ctx, func_obj, this_obj, argc, argv, &promise);
+    if (!s)
+        return promise;   /* JS_EXCEPTION */
+    if (!js_async_function_resume(ctx, s)) {
         JS_FreeValue(ctx, promise);
         js_async_function_free(ctx->rt, s);
         return JS_EXCEPTION;
     }
-    s->is_active = true;
-
-    if (!js_async_function_resume(ctx, s))
-        goto fail;
-
     js_async_function_free(ctx->rt, s);
-
     return promise;
 }
 
