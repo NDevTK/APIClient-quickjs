@@ -62207,6 +62207,74 @@ static unsigned *qjs_deep_defer_comp = NULL;  /* parallel: g_emit_n snapshot at 
    abandon path. NULL js_stack = no paused flow for this orphan. */
 static JSFlow *qjs_deep_flow = NULL;
 static JSCowDelta *qjs_deep_cow = NULL;   /* COW: per-flow page delta, parallel to qjs_deep_flow (#7/#10) */
+
+/* ===== #5/#7/#8/#9/#10 per-SCHEDULE DRIVE park registry ==========================
+   The per-schedule drive loop (qjsmain.c do_drive) drives a forced-decision chain.
+   When a chain hits a QUANTUM-silent window (no new @H/@S) it is PARKED here — a
+   resumable snapshot (heap-stack via qjs_flow_save + its OWN page delta via COW),
+   NEVER freed/abandoned (objective #9) — and re-picked by output at the next drive
+   (qjs_drive_repick). This is the deep grind's qjs_deep_flow park (~63204) applied to
+   the drive: a forced/opaque deep recursion that emits nothing is STARVED to ~0 CPU
+   (paused) instead of running to the heap's end, yet stays resumable in case shared
+   state later lets it progress. Dynamic array (no fixed bound) — grows by one per
+   parked schedule, freed at grind reset; IDB cross-session eviction (#5) layers on. */
+static JSFlow *qjs_drive_flow = NULL;
+static JSCowDelta *qjs_drive_cow = NULL;
+static unsigned *qjs_drive_mark = NULL;   /* g_emit_n at park time (output-order tiebreak / resume e0) */
+static int qjs_drive_n = 0, qjs_drive_cap = 0;
+static int qjs_drive_park_grow(JSContext *ctx) {
+    if (qjs_drive_n < qjs_drive_cap) return 1;
+    int nc = qjs_drive_cap ? qjs_drive_cap * 2 : 8;
+    JSFlow *nf = js_realloc(ctx, qjs_drive_flow, (size_t)nc * sizeof(JSFlow)); if (!nf) return 0; qjs_drive_flow = nf;
+    JSCowDelta *nd = js_realloc(ctx, qjs_drive_cow, (size_t)nc * sizeof(JSCowDelta)); if (!nd) return 0; qjs_drive_cow = nd;
+    unsigned *nm = js_realloc(ctx, qjs_drive_mark, (size_t)nc * sizeof(unsigned)); if (!nm) return 0; qjs_drive_mark = nm;
+    qjs_drive_cap = nc; return 1;
+}
+/* Run the ACTIVE drive chain under the WFQ: resume WHILE it emits new @H/@S; on the
+   first QUANTUM-silent window PARK it (snapshot + per-flow COW capture, never free).
+   e0 = the emitted-output mark BEFORE the chain started so its own emissions count
+   productive. Returns 1 if parked (resumable later), 0 if it ran to completion. */
+QJS_JSEXPORT int qjs_drive_run(JSContext *ctx, int e0) {
+    JSRuntime *rt = ctx->rt;
+    extern int g_emit_n;
+    int silent = 0;
+    while (rt->qjs_yielded) {
+        rt->qjs_yielded = 0;
+        if (g_emit_n != e0) { e0 = g_emit_n; silent = 0; }
+        else if (++silent >= QJS_DEFER_QUANTUM) {
+            if (!qjs_drive_park_grow(ctx)) return 0;   /* OOM: leave the chain on current_stack_frame; the next drive's cow_restore reverts it */
+            int ix = qjs_drive_n++;
+            qjs_flow_save(ctx, &qjs_drive_flow[ix]);
+            if (g_cow_enabled) { qjs_cow_capture(rt, qjs_cow_heap_base(), &qjs_drive_cow[ix]); qjs_cow_to_baseline(qjs_cow_heap_base(), &qjs_drive_cow[ix]); }
+            qjs_drive_mark[ix] = (unsigned)g_emit_n;
+            rt->js_stack = NULL; rt->current_stack_frame = NULL; rt->qjs_yield_entry = NULL;
+            return 1;
+        }
+        rt->qjs_resume_chain = 1;
+        JSValue r = qjs_resume_chain_call(ctx); JS_FreeValue(ctx, r);
+    }
+    return 0;
+}
+/* Re-pick parked drive flows at a new drive: resume each on ITS OWN heap (apply its
+   COW delta), run it under the WFQ (re-parks to the freshly-emptied registry for the
+   NEXT drive, or completes). A completed flow's mutations are DISCARDED to baseline so
+   the next flow / schedule forks clean (#7 isolation), mirroring the grind's per-orphan
+   commit/discard. Called once at do_drive start, AFTER cow_drive_restore (heap = baseline). */
+QJS_JSEXPORT void qjs_drive_repick(JSContext *ctx) {
+    JSRuntime *rt = ctx->rt;
+    if (qjs_drive_n == 0) return;
+    int pn = qjs_drive_n;
+    JSFlow *pf = qjs_drive_flow; JSCowDelta *pc = qjs_drive_cow; unsigned *pm = qjs_drive_mark;
+    qjs_drive_flow = NULL; qjs_drive_cow = NULL; qjs_drive_mark = NULL; qjs_drive_n = 0; qjs_drive_cap = 0;
+    for (int i = 0; i < pn; i++) {
+        if (g_cow_enabled) { qjs_cow_apply(qjs_cow_heap_base(), &pc[i]); qjs_cow_delta_free(rt, &pc[i]); }
+        qjs_flow_restore(ctx, &pf[i]);
+        rt->qjs_yielded = 1;   /* the restored flow is at a yield point — qjs_drive_run resumes it */
+        int parked = qjs_drive_run(ctx, (int)pm[i]);
+        if (!parked && g_cow_enabled) qjs_cow_discard(qjs_cow_heap_base());
+    }
+    js_free(ctx, pf); js_free(ctx, pc); js_free(ctx, pm);
+}
 /* The deep-grind interrupt handler (op-counted via js_poll_interrupts, so it
    fires at every OP_if/back-edge — catches CONCRETE spins the opaque-only spin
    probe misses). Returns 1 to interrupt (throw) the spinning drive so the grind
@@ -62695,6 +62763,10 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
         if (qjs_deep_defer_comp) { js_free(ctx, qjs_deep_defer_comp); qjs_deep_defer_comp = NULL; }
         if (qjs_deep_flow) { js_free(ctx, qjs_deep_flow); qjs_deep_flow = NULL; }   /* WFQ: array only */
         if (qjs_deep_cow) { js_free(ctx, qjs_deep_cow); qjs_deep_cow = NULL; }   /* COW deltas are POOL memory (reset below), this frees only the array */
+        if (qjs_drive_flow) { js_free(ctx, qjs_drive_flow); qjs_drive_flow = NULL; }   /* #5/#9 drive park registry */
+        if (qjs_drive_cow) { js_free(ctx, qjs_drive_cow); qjs_drive_cow = NULL; }
+        if (qjs_drive_mark) { js_free(ctx, qjs_drive_mark); qjs_drive_mark = NULL; }
+        qjs_drive_n = 0; qjs_drive_cap = 0;
         if (!g_cow_boot_mode) qjs_cow_reset(JS_GetRuntime(ctx));   /* COW-as-snapshot: the boot-once baseline persists; don't wipe it per-drive */
         qjs_deep_net = js_malloc(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1));
         qjs_deep_net2 = js_mallocz(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1));   /* 0 until the post-insts fill loop below; insts aren't populated yet here */
