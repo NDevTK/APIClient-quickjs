@@ -448,6 +448,7 @@ static JSValue qjs_fe_named_arg(JSContext *ctx, struct JSFunctionBytecode *b, in
    chunk) is driven with its REAL closure when its factory orphan is driven. */
 static struct JSFunctionBytecode **qjs_deep_rb;
 static void qjs_deep_capture_inst(JSContext *ctx, struct JSFunctionBytecode *b, JSValue func_obj);
+static void qjs_deep_free_rt(JSRuntime *rt);   /* release the grind's C-rooted captured instances/receivers at RUNTIME teardown (they are dup'd into static arrays + never freed otherwise -> the gc_obj_list teardown leak / COW underflow). Runtime-guarded. */
 /* Cold-composition data-flow (descriptor SDKs, e.g. directus). `client.request(cmd())`
    is a nested call: the SINK G's arg IS the producer F's just-returned descriptor.
    When JS_CallInternal sees a call whose arg === the immediately-preceding call's
@@ -4660,6 +4661,7 @@ void JS_FreeRuntime(JSRuntime *rt)
     }
     init_list_head(&rt->job_list);
 
+    qjs_deep_free_rt(rt);   /* release C-rooted grind captures BEFORE the teardown GC, else they leak into gc_obj_list (the teardown leak / COW underflow) */
     JS_RunGC(rt);
 
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
@@ -9400,6 +9402,13 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
    child itself has class_id 0 (says nothing), but the parent's type points
    straight at the fork patch that over-freed. */
 static JSGCObjectHeader *g_gc_decref_parent = NULL;
+static int qjs_cow_dbg_tracked(size_t addr);   /* DIAG: was this addr's COW page tracked (orig saved)? -1 no-COW/below-heap, -2 beyond, 0 untracked (the gap), 1 tracked */
+static int qjs_cow_dbg_origrc(size_t addr);    /* DIAG: the refcount stored in the SAVED original of addr's page (what the revert would restore), or -999 if no orig */
+static int qjs_cow_dbg_dirtynow(size_t addr);  /* DIAG: is addr's page currently dirty (unreverted)? -1 n/a, else 0/1 */
+static long qjs_cow_dbg_disc(void);            /* DIAG: g_cow_discards so far (how many reverts ran before this underflow) */
+static size_t qjs_cow_dbg_pageof(size_t addr); /* DIAG: addr's page index (vs qjs_cow_pages baseline count -> grown-page detection) */
+static size_t qjs_cow_dbg_npages(void);        /* DIAG: qjs_cow_pages (baseline page count); cPg >= this => a page grown during the drive */
+static void qjs_empty_shape_audit(JSRuntime *rt, int orphanLine);   /* DIAG: empty-shape under-ref locator (defined below JS_RunGC; forward-declared so gc_decref can call it) */
 static void gc_decref_child(JSRuntime *rt, JSGCObjectHeader *p)
 {
     if (p->ref_count <= 0) {
@@ -9418,14 +9427,20 @@ static void gc_decref_child(JSRuntime *rt, JSGCObjectHeader *p)
            (emscripten's stderr/stdout buffers are lost on abort, so a printf/
            fprintf diagnostic here never arrives). Names the culprit so the
            recurring Chrome-only teardown abort is diagnosable, not a bare assert. */
-        int pgt = -1, pcid = -1;
+        int pgt = -1, pcid = -1, ptrk = -9, strk = -9, npr = -1;
         if (g_gc_decref_parent) {
             pgt = (int)g_gc_decref_parent->gc_obj_type;
-            if (pgt == JS_GC_OBJ_TYPE_JS_OBJECT) pcid = (int)((JSObject *)g_gc_decref_parent)->class_id;
+            if (pgt == JS_GC_OBJ_TYPE_JS_OBJECT) { JSObject *po = (JSObject *)g_gc_decref_parent; pcid = (int)po->class_id; ptrk = qjs_cow_dbg_tracked((size_t)po->prop); strk = qjs_cow_dbg_tracked((size_t)po->shape); if (po->shape) npr = po->shape->prop_count; }
         }
-        static char gcmsg[200];
-        snprintf(gcmsg, sizeof gcmsg, "gc_decref_underflow child[gcType=%d classId=%d line=%d] parent[gcType=%d classId=%d] rc=%d",
-                 (int)p->gc_obj_type, cid, lnum, pgt, pcid, (int)p->ref_count);
+        static char gcmsg[340];
+        /* COW revert forensics on the CHILD (the over-decref'd object/shape): origRc = the
+           refcount its page's SAVED ORIGINAL holds (what a revert restores); dirtyNow = is
+           its page still dirty (mutated, un-reverted); cPg vs pages = grown-page detection;
+           disc = how many reverts ran. Distinguishes "orig captured a wrong (non-boot-end)
+           refcount" from "the page was never reverted" from "a stale referrer survived". */
+        snprintf(gcmsg, sizeof gcmsg, "gc_decref_underflow child[gt=%d cid=%d ln=%d trk=%d origRc=%d dirtyNow=%d cPg=%zu] parent[gt=%d cid=%d trk=%d propTrk=%d shapeTrk=%d nprop=%d] rc=%d pages=%zu disc=%ld",
+                 (int)p->gc_obj_type, cid, lnum, qjs_cow_dbg_tracked((size_t)p), qjs_cow_dbg_origrc((size_t)p), qjs_cow_dbg_dirtynow((size_t)p), qjs_cow_dbg_pageof((size_t)p),
+                 pgt, pcid, qjs_cow_dbg_tracked(g_gc_decref_parent ? (size_t)g_gc_decref_parent : 0), ptrk, strk, npr, (int)p->ref_count, qjs_cow_dbg_npages(), qjs_cow_dbg_disc());
         __assert_fail(gcmsg, __FILE__, __LINE__, __func__);
     }
     assert(p->ref_count > 0);
@@ -9583,6 +9598,41 @@ static void gc_free_cycles(JSRuntime *rt)
     }
 
     init_list_head(&rt->gc_zero_ref_count_list);
+}
+
+/* DIAG (root-hunt for the latent forced-exec empty-shape under-ref): before each GC
+   DURING a forced-exec orphan drive, count the live referrers of every empty
+   (prop_count==0) shape and compare to its refcount. refs>rc IS the under-ref that
+   gc_decref then turns into the underflow (and production into a teardown leak). Log
+   ONCE with the executing bytecode fn (line + ptr) so the culprit window is named,
+   THEN let the GC proceed. Gated on g_grind_drive_active so boot GCs pay nothing. */
+static int g_esa_reported = 0;
+/* orphanLine: the bytecode line of the just-completed forced-exec orphan (so a post-drive
+   audit names the CREATING orphan), or -1 when called from a GC (uses the executing frame). */
+static void qjs_empty_shape_audit(JSRuntime *rt, int orphanLine) {
+    struct list_head *el, *el2;
+    if (g_esa_reported) return;
+    list_for_each(el, &rt->gc_obj_list) {
+        JSGCObjectHeader *h = list_entry(el, JSGCObjectHeader, link);
+        if (h->gc_obj_type != JS_GC_OBJ_TYPE_SHAPE) continue;
+        JSShape *sh = (JSShape *)h;
+        if (sh->prop_count != 0) continue;
+        int refs = 0;
+        list_for_each(el2, &rt->gc_obj_list) {
+            JSGCObjectHeader *h2 = list_entry(el2, JSGCObjectHeader, link);
+            if (h2->gc_obj_type == JS_GC_OBJ_TYPE_JS_OBJECT && ((JSObject *)h2)->shape == sh) refs++;
+        }
+        if (refs > (int)sh->header.ref_count) {
+            JSStackFrame *sf = rt->current_stack_frame;
+            JSFunctionBytecode *b = (sf && JS_VALUE_GET_TAG(sf->cur_func) == JS_TAG_OBJECT)
+                                    ? JS_GetFunctionBytecode(sf->cur_func) : NULL;
+            printf("@WHY {\"phase\":\"empty_shape_underref\",\"refs\":%d,\"rc\":%d,\"isHashed\":%d,\"driving\":%d,\"orphanLine\":%d,\"fnLine\":%d}\n",
+                   refs, (int)sh->header.ref_count, sh->is_hashed, g_grind_drive_active, orphanLine, b ? b->line_num : -1);
+            fflush(stdout);
+            g_esa_reported = 1;
+            return;
+        }
+    }
 }
 
 void JS_RunGC(JSRuntime *rt)
@@ -20289,6 +20339,8 @@ void qjs_flow_restore(JSContext *ctx, JSFlow *f) {
    diff. These primitives are reviewed in isolation; the flow integration + barrier
    are the wiring. */
 #define QJS_COW_PAGE 65536u
+static size_t qjs_cow_heap_len(void);   /* fwd: COW growth re-reads the grown heap length */
+static void   qjs_cow_grow(size_t need); /* fwd: extend the page arrays to a GROWN heap — NO cap, capacity tracks actual wasm memory */
 static uint8_t **qjs_cow_orig = NULL;   /* per-page saved original (lazy copy-on-FIRST-write); orig[pg]==NULL => page untouched since baseline. NOT a full-heap image — only touched pages cost memory. */
 static uint8_t *qjs_cow_dirty = NULL;   /* 1 byte/page: written since the last capture */
 static size_t   qjs_cow_len = 0, qjs_cow_pages = 0;
@@ -20330,29 +20382,65 @@ static int g_cow_enabled =
 #endif
 static int g_cow_orphan_creates_inst = 0;   /* set during a drive that captures a real instance (qjs_deep_capture_inst) -> that orphan's delta is COMMITTED to the baseline (the instance is shared cross-orphan state), not discarded */
 static long g_cow_saved = 0, g_cow_commits = 0, g_cow_discards = 0, g_cow_captures = 0, g_cow_applies = 0;   /* #6 measure: COW activity (distinct pages tracked / instances committed / orphans reverted / flows paused / flows resumed) — emitted at grind teardown, never inferred */
-/* Reserved metadata pool. The COW baseline/bitmap/deltas CANNOT live in the COW'd heap:
-   a parked flow's delta, allocated from the shared js_malloc free-list, would be
-   "freed" by another flow's restore-to-baseline of that free-list and then reused +
-   corrupted. The pool is allocated ONCE before the baseline (so it is allocated in the
-   baseline free-list -> survives every restore); the barrier EXCLUDES its range (writes
-   to it never mark, which also breaks the bitmap-store recursion); a bump sub-allocator
-   serves it, reset per grind (deltas leak within a grind -> #5 IDB eviction reclaims;
-   pool-full degrades to no-capture, never corruption). palloc's own bookkeeping stores
-   hit static globals (< __heap_base), already skipped by the barrier. */
-static uint8_t *g_cow_pool = NULL;
-static size_t   g_cow_pool_sz = 0, g_cow_pool_used = 0, g_cow_pool_keep = 0;
+/* Reserved metadata pool (COW originals/deltas). CANNOT live in the COW'd js_malloc heap:
+   a restore-to-baseline of the free-list would "free" a parked delta -> reuse + corrupt.
+   A GROWABLE block list, js_malloc_rt'd, NEVER a fixed cap: when the current block fills, a
+   2x-bigger one is linked (g_cow_rt set at pool_init). Blocks are allocated UNDER g_cow_busy
+   so their own free-list mutation isn't COW-tracked -> they persist across every discard
+   (consistent: real memory, reflected in malloc_size). The barrier skips pool writes via
+   g_cow_busy (every COW op + palloc set it), so no per-block range test is needed. Growth
+   OOM = the PLATFORM bound -> #5 IDB eviction is the fix; never a degrade, never a cap. */
+typedef struct JSCowBlk { struct JSCowBlk *next; size_t sz, used; } JSCowBlk;   /* page data follows the header */
+static JSCowBlk *g_cow_blk0 = NULL, *g_cow_blk = NULL;   /* list head + current bump block */
+static JSRuntime *g_cow_rt = NULL;
 static void *qjs_cow_palloc(size_t n) {
-    void *p; n = (n + 15) & ~(size_t)15;
-    if (!g_cow_pool || g_cow_pool_used + n > g_cow_pool_sz) return NULL;  /* full -> degrade */
-    p = g_cow_pool + g_cow_pool_used; g_cow_pool_used += n; return p;
+    n = (n + 15) & ~(size_t)15;
+    int sv = g_cow_busy; g_cow_busy = 1;   /* block headers + the bump `used` live in the COW region; the barrier must never mark them (else a discard reverts the pool) */
+    void *ret = NULL;
+    for (;;) {
+        if (g_cow_blk && g_cow_blk->used + n <= g_cow_blk->sz) {
+            ret = (uint8_t *)(g_cow_blk + 1) + g_cow_blk->used; g_cow_blk->used += n; break;
+        }
+        if (g_cow_blk && g_cow_blk->next) { g_cow_blk = g_cow_blk->next; continue; }
+        size_t bsz = g_cow_blk ? g_cow_blk->sz * 2 : (size_t)16 * 1024 * 1024;   /* geometric growth */
+        if (bsz < n) bsz = n;
+        JSCowBlk *nb = (JSCowBlk *)js_malloc_rt(g_cow_rt, sizeof(JSCowBlk) + bsz);
+        nb->next = NULL; nb->sz = bsz; nb->used = 0;   /* OOM -> crash (platform bound) -> drives #5; never a degrade */
+        if (g_cow_blk) g_cow_blk->next = nb; else g_cow_blk0 = nb;
+        g_cow_blk = nb;
+    }
+    g_cow_busy = sv;
+    return ret;
+}
+static void qjs_cow_pool_reset(void) { int sv = g_cow_busy; g_cow_busy = 1; for (JSCowBlk *b = g_cow_blk0; b; b = b->next) b->used = 0; g_cow_blk = g_cow_blk0; g_cow_busy = sv; }   /* this fn is instrumented (static, not a qjs_cow_ export) -> guard the header writes */
+static size_t qjs_cow_pool_used(void) { size_t u = 0; for (JSCowBlk *b = g_cow_blk0; b; b = b->next) u += b->used; return u; }
+/* Extend the page arrays (orig/dirty) to cover page `need` after the heap GREW. NO CAP:
+   capacity follows the actual wasm linear memory — the platform bounds it, never a constant.
+   Geometric (>=2x) to amortize re-allocs; the old arrays leak into the growable pool
+   (reclaimed at the next baseline). palloc grows on demand (never NULL), so no degrade. */
+static void qjs_cow_grow(size_t need) {
+    size_t want = qjs_cow_heap_len() / QJS_COW_PAGE + 1;
+    size_t dbl = qjs_cow_pages ? qjs_cow_pages * 2 : 16;
+    if (want < dbl) want = dbl;
+    if (want <= need) want = need + 1;
+    if (want <= qjs_cow_pages) return;
+    g_cow_busy = 1;   /* the copy writes the pool; the barrier must not re-enter */
+    uint8_t **no = (uint8_t **)qjs_cow_palloc(want * sizeof(uint8_t *));
+    uint8_t  *nd = (uint8_t *)qjs_cow_palloc(want);
+    memcpy(no, qjs_cow_orig, qjs_cow_pages * sizeof(uint8_t *));
+    memset(no + qjs_cow_pages, 0, (want - qjs_cow_pages) * sizeof(uint8_t *));
+    memcpy(nd, qjs_cow_dirty, qjs_cow_pages);
+    memset(nd + qjs_cow_pages, 0, want - qjs_cow_pages);
+    qjs_cow_orig = no; qjs_cow_dirty = nd;
+    qjs_cow_len = qjs_cow_heap_len(); qjs_cow_pages = want;
+    g_cow_busy = 0;
 }
 extern char __heap_base;
 QJS_JSEXPORT void qjs_cow_mark_dirty(size_t addr) {
     size_t hb = (size_t)&__heap_base, pg;
     if (g_cow_busy || addr < hb || !qjs_cow_dirty) return;
-    if (g_cow_pool && addr >= (size_t)g_cow_pool && addr < (size_t)g_cow_pool + g_cow_pool_sz) return; /* metadata pool */
     pg = (addr - hb) / QJS_COW_PAGE;
-    if (pg >= qjs_cow_pages) return;
+    if (pg >= qjs_cow_pages) qjs_cow_grow(pg);   /* heap grew -> extend arrays (no cap, grow can't fail short of platform OOM) */
     if (!qjs_cow_orig[pg]) {            /* copy-on-FIRST-write: barrier runs BEFORE the store, so mem[pg] is still the original */
         uint8_t *slot;
         g_cow_busy = 1;                /* the save memcpy writes the pool -> the barrier must not re-enter */
@@ -20369,9 +20457,9 @@ QJS_JSEXPORT void qjs_cow_mark_dirty_range(size_t addr, size_t size) {
     if (g_cow_busy || !qjs_cow_dirty || !size) return;   /* g_cow_busy: a COW op's own memcpy compiles to a bulk memory.copy -> must not re-enter */
     end = addr + size;
     if (end <= hb) return;                 /* entirely below the heap */
-    if (g_cow_pool && addr >= (size_t)g_cow_pool && end <= (size_t)g_cow_pool + g_cow_pool_sz) return; /* metadata pool */
     if (addr < hb) addr = hb;              /* clamp the heap part */
     p0 = (addr - hb) / QJS_COW_PAGE; p1 = (end - 1 - hb) / QJS_COW_PAGE;
+    if (p1 >= qjs_cow_pages) qjs_cow_grow(p1);   /* heap grew -> extend (no cap, grow can't fail short of platform OOM) */
     for (p = p0; p <= p1 && p < qjs_cow_pages; p++) {
         if (!qjs_cow_orig[p]) {            /* copy-on-FIRST-write per page in the bulk span (pre-write content) */
             uint8_t *slot;
@@ -20385,112 +20473,116 @@ QJS_JSEXPORT void qjs_cow_mark_dirty_range(size_t addr, size_t size) {
 }
 /* Capture the post-boot baseline at the boot->forced-grind boundary. Uses the JS
    runtime allocator (raw malloc/free are forbidden in this TU). */
-/* Allocate the metadata pool ONCE (before any baseline). bitmap is NULL here so the
-   js_malloc_rt of the pool isn't tracked; the baseline (captured after) records the
-   pool as allocated, so restores never reclaim it. */
+/* Allocate the metadata pool's FIRST block (before any baseline). It GROWS on demand
+   thereafter via qjs_cow_palloc — never a fixed cap. */
 QJS_JSEXPORT int qjs_cow_pool_init(JSRuntime *rt, size_t sz) {
-    if (g_cow_pool) return 0;
-    g_cow_pool = js_malloc_rt(rt, sz);
-    if (!g_cow_pool) return -1;
-    g_cow_pool_sz = sz; g_cow_pool_used = g_cow_pool_keep = 0;
+    g_cow_rt = rt;
+    if (g_cow_blk0) return 0;
+    g_cow_busy = 1;
+    g_cow_blk0 = (JSCowBlk *)js_malloc_rt(rt, sizeof(JSCowBlk) + sz);
+    g_cow_blk0->next = NULL; g_cow_blk0->sz = sz; g_cow_blk0->used = 0;   /* OOM -> crash (platform bound) -> drives #5 */
+    g_cow_blk = g_cow_blk0;
+    g_cow_busy = 0;
     return 0;
 }
 QJS_JSEXPORT int qjs_cow_baseline(JSRuntime *rt, const uint8_t *mem, size_t len) {
-    (void)rt; (void)mem;   /* mem unused: NO full-heap copy — each page's original is saved lazily on its first write (copy-on-write). Only TOUCHED pages cost pool memory; the old full memcpy needed len(>=pool_sz) and always failed. */
-    g_cow_pool_used = 0;   /* bump-reset: free the prior grind's orig-slots/deltas */
+    (void)rt; (void)mem;   /* mem unused: NO full-heap copy — each page's original is saved lazily on its first write (copy-on-write). EAGER full-capture is impossible here: orig lives in the growable pool, which is IN the js_malloc heap, so capturing the whole heap captures the pool -> each re-baseline doubles it -> OOM (MEASURED: 53->1013MB in 6 boots). Lazy only saves WRITTEN pages; the pool is never JS-written so it is never captured. */
+    qjs_cow_pool_reset();   /* free the prior grind's orig-slots/deltas (bump-reset all blocks) */
     qjs_cow_len = len; qjs_cow_pages = (len + QJS_COW_PAGE - 1) / QJS_COW_PAGE;
-    qjs_cow_orig  = (uint8_t **)qjs_cow_palloc((qjs_cow_pages ? qjs_cow_pages : 1) * sizeof(uint8_t *));
-    qjs_cow_dirty = qjs_cow_palloc(qjs_cow_pages ? qjs_cow_pages : 1);
-    if (!qjs_cow_orig || !qjs_cow_dirty) {
-        qjs_cow_orig = NULL; qjs_cow_dirty = NULL; qjs_cow_len = qjs_cow_pages = 0;
-        return -1;
-    }
+    size_t _np = qjs_cow_pages ? qjs_cow_pages : 1;   /* size to the CURRENT heap; qjs_cow_grow extends it as the heap grows */
+    qjs_cow_orig  = (uint8_t **)qjs_cow_palloc(_np * sizeof(uint8_t *));
+    qjs_cow_dirty = qjs_cow_palloc(_np);
     g_cow_busy = 1;
-    memset(qjs_cow_orig, 0, qjs_cow_pages * sizeof(uint8_t *));   /* every page unsaved -> lazy COW on first write */
-    memset(qjs_cow_dirty, 0, qjs_cow_pages);
+    memset(qjs_cow_orig, 0, _np * sizeof(uint8_t *));   /* every page unsaved -> lazy COW on first write */
+    memset(qjs_cow_dirty, 0, _np);
     g_cow_busy = 0;
-    g_cow_pool_keep = g_cow_pool_used;   /* orig-array + bitmap survive per-grind resets; orig-slots + deltas come after */
     return 0;
 }
 
-typedef struct JSCowDelta { uint32_t *pages; uint8_t *bytes; size_t n; } JSCowDelta;
+/* Undo-log snapshot state (the GC-consistent COW). Declared here so the per-flow delta ops
+   below can use it; the grow/log/revert functions are DEFINED after qjs_cow_heap_len(). One
+   entry = a written word index + its pre-flow 8 bytes. */
+typedef struct { uint64_t widx; uint64_t old; } JSCowUndo;
+static JSCowUndo *qjs_cow_undo = NULL;
+static size_t qjs_cow_undo_n = 0, qjs_cow_undo_cap = 0, qjs_cow_words = 0;
+static uint8_t *qjs_cow_shadow = NULL;
+static void qjs_cow_shadow_grow(size_t need);
+static void qjs_cow_undo_grow(void);
+QJS_JSEXPORT void qjs_cow_undo_revert(void);
 
-/* Capture the currently-dirty pages into d (the pausing flow's delta); clear dirty. */
+typedef struct JSCowDelta { uint64_t *widx; uint64_t *oldw; uint64_t *neww; size_t n; } JSCowDelta;
+
+/* Capture the active flow's undo log into d (the pausing flow's delta): each word it wrote,
+   with its pre-flow value (oldw -> revert) and current value (neww -> re-apply on resume).
+   Does NOT revert — qjs_cow_to_baseline does, immediately after. Word-granular = GC-consistent. */
 QJS_JSEXPORT int qjs_cow_capture(JSRuntime *rt, const uint8_t *mem, JSCowDelta *d) {
-    size_t i, n = 0, k = 0;
-    (void)rt;
+    size_t hb = (size_t)&__heap_base, k, n = qjs_cow_undo_n;
+    (void)rt; (void)mem;
     g_cow_captures++;
-    for (i = 0; i < qjs_cow_pages; i++) if (qjs_cow_dirty[i]) n++;
     d->n = n;
-    d->pages = n ? qjs_cow_palloc(n * sizeof(uint32_t)) : NULL;
-    d->bytes = n ? qjs_cow_palloc(n * QJS_COW_PAGE) : NULL;
-    if (n && (!d->pages || !d->bytes)) {   /* pool full -> degrade: caller leaves the heap as-is, logs @WHY */
-        d->pages = NULL; d->bytes = NULL; d->n = 0; return -1;
-    }
+    d->widx = n ? (uint64_t *)qjs_cow_palloc(n * sizeof(uint64_t)) : NULL;
+    d->oldw = n ? (uint64_t *)qjs_cow_palloc(n * sizeof(uint64_t)) : NULL;
+    d->neww = n ? (uint64_t *)qjs_cow_palloc(n * sizeof(uint64_t)) : NULL;
     g_cow_busy = 1;
-    for (i = 0; i < qjs_cow_pages; i++) if (qjs_cow_dirty[i]) {
-        d->pages[k] = (uint32_t)i;
-        memcpy(d->bytes + k * QJS_COW_PAGE, mem + i * QJS_COW_PAGE, qjs_cow_pagelen(i)); /* dest in pool */
-        qjs_cow_dirty[i] = 0; k++;
+    for (k = 0; k < n; k++) {
+        uint64_t w = qjs_cow_undo[k].widx;
+        d->widx[k] = w; d->oldw[k] = qjs_cow_undo[k].old;
+        d->neww[k] = *(uint64_t *)(hb + (w << 3));
     }
     g_cow_busy = 0;
     return 0;
 }
-/* Restore baseline for the pages d touched (undo the outgoing flow's mutations). */
+/* Revert the outgoing flow to baseline: the live undo log restores EXACTLY the words it wrote. */
 QJS_JSEXPORT void qjs_cow_to_baseline(uint8_t *mem, const JSCowDelta *d) {
-    size_t k;
-    g_cow_busy = 1;   /* restore writes the HEAP; the barrier must not re-mark those pages */
-    for (k = 0; k < d->n; k++) { uint32_t pg = d->pages[k];
-        if (pg < qjs_cow_pages && qjs_cow_orig[pg])
-            memcpy(mem + (size_t)pg * QJS_COW_PAGE, qjs_cow_orig[pg], qjs_cow_pagelen(pg)); }
-    g_cow_busy = 0;
+    (void)mem; (void)d;
+    qjs_cow_undo_revert();
 }
-/* Apply d (a resuming flow's delta) over current memory; the flow re-owns those pages. */
+/* Re-apply a resuming flow's delta: write its mutated words back, and rebuild the live undo
+   log (with the pre-flow values) so further writes dedup and the flow can pause again. */
 QJS_JSEXPORT void qjs_cow_apply(uint8_t *mem, const JSCowDelta *d) {
-    size_t k;
+    size_t hb = (size_t)&__heap_base, k;
+    (void)mem;
     g_cow_applies++;
-    g_cow_busy = 1;   /* writes the HEAP; the flow re-owns these pages (set dirty BELOW, not via the barrier) */
-    for (k = 0; k < d->n; k++) { uint32_t pg = d->pages[k];
-        memcpy(mem + (size_t)pg * QJS_COW_PAGE, d->bytes + k * QJS_COW_PAGE, qjs_cow_pagelen(pg));
-        if (pg < qjs_cow_pages) qjs_cow_dirty[pg] = 1; }
+    g_cow_busy = 1;
+    for (k = 0; k < d->n; k++) {
+        uint64_t w = d->widx[k];
+        if (w >= qjs_cow_words) qjs_cow_shadow_grow(w);
+        *(uint64_t *)(hb + (w << 3)) = d->neww[k];
+        if (!(qjs_cow_shadow[w >> 3] & (uint8_t)(1u << (w & 7)))) {
+            if (qjs_cow_undo_n >= qjs_cow_undo_cap) qjs_cow_undo_grow();
+            qjs_cow_undo[qjs_cow_undo_n].widx = w;
+            qjs_cow_undo[qjs_cow_undo_n].old  = d->oldw[k];
+            qjs_cow_undo_n++;
+            qjs_cow_shadow[w >> 3] |= (uint8_t)(1u << (w & 7));
+        }
+    }
     g_cow_busy = 0;
 }
 static void qjs_cow_delta_free(JSRuntime *rt, JSCowDelta *d) {
-    (void)rt;   /* pool-allocated (bump) — reclaimed by qjs_cow_baseline's reset, not freed here */
-    d->pages = NULL; d->bytes = NULL; d->n = 0;
+    (void)rt;   /* pool-allocated (bump) — reclaimed at reset, not freed here */
+    d->widx = NULL; d->oldw = NULL; d->neww = NULL; d->n = 0;
 }
-/* Discard the current flow's mutations: restore baseline for EVERY dirty page + clear
-   the bitmap, keeping no delta. Used after a COMPLETED orphan so the next flow starts
-   from baseline — #7 per-flow isolation extends to completed flows, not just paused
-   ones (the learned @H/@S are emitted output captured by the host, never heap state,
-   so undoing the heap loses nothing). */
+/* Discard a COMPLETED flow's mutations: revert the live undo log to baseline (#7: the next
+   flow forks clean; learned @H/@S are emitted output, not heap state, so undoing loses nothing). */
 QJS_JSEXPORT void qjs_cow_discard(uint8_t *mem) {
-    size_t i;
-    if (!qjs_cow_dirty || !qjs_cow_orig) return;
+    (void)mem;
     g_cow_discards++;
-    g_cow_busy = 1;   /* restore writes the HEAP; the barrier must not re-mark */
-    for (i = 0; i < qjs_cow_pages; i++) if (qjs_cow_dirty[i]) {
-        if (qjs_cow_orig[i]) memcpy(mem + i * QJS_COW_PAGE, qjs_cow_orig[i], qjs_cow_pagelen(i));
-        qjs_cow_dirty[i] = 0;
-    }
-    g_cow_busy = 0;
+    qjs_cow_undo_revert();
 }
-/* SNAPSHOT-FORK / shared-resource promote: commit the current dirty pages INTO the
-   baseline (current heap -> baseline, clear dirty). Used when a constructor orphan
-   creates a CAPTURED INSTANCE (qjs_deep_capture_inst): that instance is intentional
-   cross-orphan shared state, so it BECOMES baseline every subsequent orphan forks from
-   — preserving the receiver under FULL DOM+JS COW (not a DOM-only carve-out), while each
-   orphan's OWN mutations still revert. The deep-tree artifact that overflows do_query is
-   a DIFFERENT orphan's delta, never committed -> still isolated. */
+/* COMMIT the flow's mutations INTO the baseline: KEEP them on the live heap (a captured
+   cross-orphan instance becomes shared baseline every subsequent orphan forks from) — just
+   drop the undo log + clear the shadow so they are no longer revertible (they ARE baseline now). */
 QJS_JSEXPORT void qjs_cow_commit(const uint8_t *mem) {
-    size_t i;
-    if (!qjs_cow_dirty || !qjs_cow_orig) return;
+    size_t k;
+    (void)mem;
+    if (!qjs_cow_undo) return;
     g_cow_commits++;
     g_cow_busy = 1;
-    for (i = 0; i < qjs_cow_pages; i++) if (qjs_cow_dirty[i]) {
-        if (qjs_cow_orig[i]) memcpy(qjs_cow_orig[i], mem + i * QJS_COW_PAGE, qjs_cow_pagelen(i));   /* promote mutated page INTO its saved original: the captured instance becomes baseline */
-        qjs_cow_dirty[i] = 0;
+    for (k = 0; k < qjs_cow_undo_n; k++) {
+        uint64_t w = qjs_cow_undo[k].widx;
+        qjs_cow_shadow[w >> 3] &= (uint8_t)~(1u << (w & 7));
     }
+    qjs_cow_undo_n = 0;
     g_cow_busy = 0;
 }
 /* Reset the COW state (grind teardown). The baseline/bitmap are POOL memory (bump),
@@ -20499,12 +20591,13 @@ static void qjs_cow_reset(JSRuntime *rt) {
     (void)rt;
     if (g_cow_saved || g_cow_commits || g_cow_discards) {   /* #6 NO-SILENT-FAILURE: COW isolation MEASURED, never inferred from activity */
         printf("@WHY {\"phase\":\"cow_stats\",\"pagesSaved\":%ld,\"commits\":%ld,\"discards\":%ld,\"captures\":%ld,\"applies\":%ld,\"poolUsedMB\":%zu}\n",
-               g_cow_saved, g_cow_commits, g_cow_discards, g_cow_captures, g_cow_applies, g_cow_pool_used / (size_t)1048576);
+               g_cow_saved, g_cow_commits, g_cow_discards, g_cow_captures, g_cow_applies, qjs_cow_pool_used() / (size_t)1048576);
         fflush(stdout);
     }
     g_cow_saved = g_cow_commits = g_cow_discards = g_cow_captures = g_cow_applies = 0;
     qjs_cow_orig = NULL; qjs_cow_dirty = NULL; qjs_cow_len = qjs_cow_pages = 0;
-    g_cow_pool_used = g_cow_pool_keep = 0;
+    qjs_cow_undo = NULL; qjs_cow_shadow = NULL; qjs_cow_undo_n = qjs_cow_undo_cap = qjs_cow_words = 0;   /* undo-log state lives in the pool just reset -> drop the dangling pointers */
+    qjs_cow_pool_reset();
 }
 /* Heap base + current linear-memory length (the COW region is [__heap_base, mem_end)). */
 static uint8_t *qjs_cow_heap_base(void) { return (uint8_t *)(size_t)&__heap_base; }
@@ -20512,6 +20605,135 @@ static size_t   qjs_cow_heap_len(void) {
     size_t hb = (size_t)&__heap_base;
     size_t memsz = (size_t)__builtin_wasm_memory_size(0) * QJS_COW_PAGE;
     return memsz > hb ? memsz - hb : 0;
+}
+
+/* ===== EXACT-WRITE undo log (the GC-consistent snapshot; replaces page-COW) =======
+   Page revert is unsound: a 64KB page spans object boundaries, so restoring it
+   resurrects/clobbers objects by physical adjacency and never reverts an object
+   together with its cross-page refcount/children. The undo log instead records the
+   EXACT pre-flow value of every heap WORD a flow writes (deduped 1 bit/word), so
+   revert restores precisely what changed -> GC-consistent BY CONSTRUCTION. The live
+   heap IS the baseline (no copy -> no eager-OOM); the delta is the flow's real writes
+   (small, evictable to IDB). One word entry = (index, pre-flow 8 bytes). State + prototypes
+   are hoisted above the per-flow delta ops; the bodies follow (they need qjs_cow_heap_len). */
+static void qjs_cow_shadow_grow(size_t need) {
+    size_t want = qjs_cow_heap_len() / 8 + 1;
+    if (want < qjs_cow_words * 2) want = qjs_cow_words * 2;
+    if (want <= need) want = need + 1;
+    if (want <= qjs_cow_words) return;
+    int sv = g_cow_busy; g_cow_busy = 1;
+    size_t nbo = (qjs_cow_words + 7) / 8, nbn = (want + 7) / 8;
+    uint8_t *no = (uint8_t *)qjs_cow_palloc(nbn);
+    if (qjs_cow_shadow) memcpy(no, qjs_cow_shadow, nbo);
+    memset(no + nbo, 0, nbn - nbo);
+    qjs_cow_shadow = no; qjs_cow_words = want;
+    g_cow_busy = sv;
+}
+static void qjs_cow_undo_grow(void) {
+    int sv = g_cow_busy; g_cow_busy = 1;
+    size_t cap2 = qjs_cow_undo_cap ? qjs_cow_undo_cap * 2 : 8192;
+    JSCowUndo *no = (JSCowUndo *)qjs_cow_palloc(cap2 * sizeof(JSCowUndo));
+    if (qjs_cow_undo) memcpy(no, qjs_cow_undo, qjs_cow_undo_n * sizeof(JSCowUndo));
+    qjs_cow_undo = no; qjs_cow_undo_cap = cap2;
+    g_cow_busy = sv;
+}
+/* Barrier target (runs BEFORE the store): log the pre-flow value of each WORD the
+   store [addr, addr+size) touches, once per word (per-word first-write captures the
+   pre-flow value of all 8 bytes, so sub-word/multi-store on one word stays correct). */
+QJS_JSEXPORT void qjs_cow_undo_log(size_t addr, size_t size) {
+    size_t hb = (size_t)&__heap_base, w, w0, w1;
+    if (g_cow_busy || !qjs_cow_shadow || addr < hb || !size) return;
+    w0 = (addr - hb) >> 3; w1 = (addr + size - 1 - hb) >> 3;
+    for (w = w0; w <= w1; w++) {
+        if (w >= qjs_cow_words) qjs_cow_shadow_grow(w);
+        if (qjs_cow_shadow[w >> 3] & (uint8_t)(1u << (w & 7))) continue;
+        if (qjs_cow_undo_n >= qjs_cow_undo_cap) qjs_cow_undo_grow();
+        qjs_cow_undo[qjs_cow_undo_n].widx = w;
+        qjs_cow_undo[qjs_cow_undo_n].old  = *(uint64_t *)(hb + (w << 3));
+        qjs_cow_undo_n++;
+        qjs_cow_shadow[w >> 3] |= (uint8_t)(1u << (w & 7));
+    }
+}
+/* Revert the active flow to baseline: restore every logged word to its pre-flow value,
+   clear the shadow, empty the log. The exact inverse of the flow's writes. */
+QJS_JSEXPORT void qjs_cow_undo_revert(void) {
+    size_t hb = (size_t)&__heap_base, i;
+    if (!qjs_cow_undo) return;
+    g_cow_busy = 1;
+    for (i = 0; i < qjs_cow_undo_n; i++) {
+        uint64_t w = qjs_cow_undo[i].widx;
+        *(uint64_t *)(hb + (w << 3)) = qjs_cow_undo[i].old;
+        qjs_cow_shadow[w >> 3] &= (uint8_t)~(1u << (w & 7));
+    }
+    qjs_cow_undo_n = 0;
+    g_cow_busy = 0;
+}
+static int qjs_cow_dbg_tracked(size_t addr) {   /* DIAG: was addr's COW page tracked (orig saved)? names the untracked-write gap behind gc_decref_underflow */
+    size_t hb = (size_t)&__heap_base, pg;
+    if (!qjs_cow_orig || addr < hb) return -1;
+    pg = (addr - hb) / QJS_COW_PAGE;
+    if (pg >= qjs_cow_pages) return -2;
+    return qjs_cow_orig[pg] ? 1 : 0;
+}
+static int qjs_cow_dbg_origrc(size_t addr) {   /* DIAG: refcount inside the SAVED original of addr's page (the value the revert restores) */
+    size_t hb = (size_t)&__heap_base, pg, off;
+    if (!qjs_cow_orig || addr < hb) return -999;
+    pg = (addr - hb) / QJS_COW_PAGE;
+    if (pg >= qjs_cow_pages || !qjs_cow_orig[pg]) return -999;
+    off = (addr - hb) % QJS_COW_PAGE;           /* JSRefCountHeader.ref_count is the FIRST field of every GC header */
+    return *(int *)(qjs_cow_orig[pg] + off);
+}
+static int qjs_cow_dbg_dirtynow(size_t addr) {  /* DIAG: is addr's page currently dirty (mutated, not yet reverted)? */
+    size_t hb = (size_t)&__heap_base, pg;
+    if (!qjs_cow_dirty || addr < hb) return -1;
+    pg = (addr - hb) / QJS_COW_PAGE;
+    if (pg >= qjs_cow_pages) return -1;
+    return qjs_cow_dirty[pg] ? 1 : 0;
+}
+static long qjs_cow_dbg_disc(void) { return g_cow_discards; }
+static size_t qjs_cow_dbg_pageof(size_t addr) {
+    size_t hb = (size_t)&__heap_base;
+    return addr < hb ? (size_t)-1 : (addr - hb) / QJS_COW_PAGE;
+}
+static size_t qjs_cow_dbg_npages(void) { return qjs_cow_pages; }
+/* Emit the COW activity counters WITHOUT resetting — called at a DRIVE's END (qjsmain
+   do_drive) so the within-drive activity is observed BEFORE the next drive's HEAPU8 image
+   restore reverts the linear-memory counters (which left qjs_cow_reset always reading 0).
+   This distinguishes "COW inert" from "COW tracks within a drive but is unmeasurable". */
+QJS_JSEXPORT void qjs_cow_stats_emit(void) {
+    if (!g_cow_enabled) return;
+    printf("@WHY {\"phase\":\"cow_stats\",\"pagesSaved\":%ld,\"commits\":%ld,\"discards\":%ld,\"captures\":%ld,\"applies\":%ld,\"poolUsedMB\":%zu,\"baselined\":%d}\n",
+           g_cow_saved, g_cow_commits, g_cow_discards, g_cow_captures, g_cow_applies,
+           qjs_cow_pool_used() / (size_t)1048576, qjs_cow_orig != NULL);
+    fflush(stdout);
+}
+/* ===== COW-as-snapshot (replaces the host HEAPU8 image restore; gated g_cow_enabled) =====
+   When g_cow_boot_mode is set, the boot-once baseline + per-drive discard ARE the per-drive
+   isolation: the deep-grind's own per-drive COW setup is skipped, and the host stops imaging/
+   restoring HEAPU8 (a full HEAPU8.set that wiped the COW's linear-memory state every drive). */
+static int g_cow_boot_mode = 0;
+/* do_boot END (qjsmain), BEFORE the host would image: the post-boot heap is the base every
+   DRIVE forks from. Re-baselines each boot (a boot-frontier re-boot is a distinct post-boot
+   state; the LAST boot before the drives wins). Pool persists (allocated once). */
+QJS_JSEXPORT void qjs_cow_boot_baseline(JSRuntime *rt) {
+    if (!g_cow_enabled) return;
+    g_cow_boot_mode = 1;
+    qjs_cow_pool_init(rt, (size_t)16 * 1024 * 1024);
+    /* Undo-log snapshot: NO baseline copy — the LIVE post-boot heap IS the baseline; a flow's
+       writes are logged and reverted exactly (word-granular, GC-consistent). Just size the
+       shadow bitmap to the heap; the undo log grows on demand. Empty log = at baseline. */
+    qjs_cow_shadow_grow(qjs_cow_heap_len() / 8 + 1);
+    qjs_cow_undo_n = 0;
+    printf("@WHY {\"phase\":\"cow_boot_baseline\",\"undolog\":1,\"heapMB\":%zu,\"shadowKB\":%zu}\n",
+           qjs_cow_heap_len() / (size_t)1048576, (qjs_cow_words / 8) / (size_t)1024);
+    fflush(stdout);
+}
+/* do_drive START (qjsmain): revert the PREVIOUS drive's mutations to the boot baseline
+   (replay the undo log — exactly the words written, GC-consistent vs the old page revert). */
+QJS_JSEXPORT void qjs_cow_drive_restore(JSRuntime *rt) {
+    (void)rt;
+    if (!g_cow_enabled || !g_cow_boot_mode || !qjs_cow_shadow) return;
+    qjs_cow_undo_revert();
 }
 
 void qjs_free_suspended_trampoline_frames(JSContext *ctx)
@@ -62096,6 +62318,20 @@ void qjs_deep_free(JSContext *ctx) {
     qjs_gen_susp_drv = 0; qjs_gen_susp_recv = 0; qjs_gen_susp_drained = 0;
     qjs_dd_free(ctx);
 }
+/* Runtime-teardown release of the grind's C-rooted captured instances/receivers. They
+   are JS_DupValue'd into static arrays for cross-orphan reuse and otherwise only freed at
+   the NEXT grind's setup — so the LAST runtime's captures leak into JS_FreeRuntime's
+   gc_obj_list (production's teardown leak; the COW build surfaces it as a gc_decref
+   underflow on the shared empty shape they reference). Release them BEFORE the teardown GC.
+   Runtime-guarded so a captures array left from a prior runtime is never touched (uses
+   JS_FreeValueRT — JS_FreeRuntime has no JSContext). */
+static void qjs_deep_free_rt(JSRuntime *rt) {
+    if (qjs_deep_cache_rt != rt) return;
+    if (qjs_deep_insts) for (int i = 0; i < qjs_deep_rb_n; i++)
+        if (!JS_IsUndefined(qjs_deep_insts[i])) { JS_FreeValueRT(rt, qjs_deep_insts[i]); qjs_deep_insts[i] = JS_UNDEFINED; }
+    if (qjs_deep_recv) for (int i = 0; i < qjs_deep_rb_n; i++)
+        if (!JS_IsUndefined(qjs_deep_recv[i])) { JS_FreeValueRT(rt, qjs_deep_recv[i]); qjs_deep_recv[i] = JS_UNDEFINED; }
+}
 /* Driving-completeness counters — see qjs_dnf_threw decl. Carried on the @DS
    status line so the extension surfaces the per-grind frontier shape. */
 int qjs_deep_dnf_threw_c(void) { return qjs_dnf_threw; }
@@ -62473,9 +62709,9 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
         if (qjs_deep_sink) { js_free(ctx, qjs_deep_sink); qjs_deep_sink = NULL; }
         if (qjs_deep_deferred) { js_free(ctx, qjs_deep_deferred); qjs_deep_deferred = NULL; }
         if (qjs_deep_defer_comp) { js_free(ctx, qjs_deep_defer_comp); qjs_deep_defer_comp = NULL; }
-        if (qjs_deep_flow) { js_free(ctx, qjs_deep_flow); qjs_deep_flow = NULL; }   /* WFQ: array only (zeroed = no live paused chunks on fresh-residue reset) */
+        if (qjs_deep_flow) { js_free(ctx, qjs_deep_flow); qjs_deep_flow = NULL; }   /* WFQ: array only */
         if (qjs_deep_cow) { js_free(ctx, qjs_deep_cow); qjs_deep_cow = NULL; }   /* COW deltas are POOL memory (reset below), this frees only the array */
-        qjs_cow_reset(JS_GetRuntime(ctx));
+        if (!g_cow_boot_mode) qjs_cow_reset(JS_GetRuntime(ctx));   /* COW-as-snapshot: the boot-once baseline persists; don't wipe it per-drive */
         qjs_deep_net = js_malloc(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1));
         qjs_deep_net2 = js_mallocz(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1));   /* 0 until the post-insts fill loop below; insts aren't populated yet here */
         qjs_deep_sink = js_malloc(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1));
@@ -62489,8 +62725,8 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
            from. If pool/baseline fail, qjs_cow_dirty stays NULL -> the barrier no-ops ->
            the WFQ runs un-isolated (graceful), never a crash. */
         qjs_deep_cow = js_mallocz(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1) * sizeof(JSCowDelta));
-        if (g_cow_enabled && qjs_deep_cow) {   /* gated: see g_cow_enabled */
-            int _pi = qjs_cow_pool_init(rt, (size_t)256 * 1024 * 1024);
+        if (g_cow_enabled && qjs_deep_cow && !g_cow_boot_mode) {   /* gated; skipped under COW-as-snapshot (boot baseline is the base) */
+            int _pi = qjs_cow_pool_init(rt, (size_t)16 * 1024 * 1024);
             int _br = (_pi == 0) ? qjs_cow_baseline(rt, qjs_cow_heap_base(), qjs_cow_heap_len()) : -1;
             printf("@WHY {\"phase\":\"cow_baseline\",\"poolOk\":%d,\"baselineOk\":%d,\"pages\":%zu,\"heapMB\":%zu}\n",
                    _pi == 0, _br == 0, qjs_cow_pages, qjs_cow_heap_len() / (size_t)1048576);   /* #6 NO-SILENT-FAILURE: COW engagement must be observable */
