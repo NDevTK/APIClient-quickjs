@@ -243,24 +243,40 @@ struct qjs_term {
      stored label is the same string for grouping in the @P record;
      only the id is distinct.
    Bounded by attacker-source × event-count per run. */
-static char **qjs_leaf_tab; static int qjs_leaf_n, qjs_leaf_cap;
-static volatile int g_cow_busy;   /* fwd (defined in the COW section): the leaf table is built mid-drive */
-static int qjs_leaf_append(const char *L) {
-    /* The leaf table is SHARED Z3/opaque metadata (entries live across flows), but its array +
-       string entries are heap (>= __heap_base) while the COUNT qjs_leaf_n is static (< __heap_base).
-       A per-flow COW revert reverts the heap entries but NOT the static count -> qjs_leaf_id then
-       strcmp()s a reverted/stale slot -> OOB (the secondary cold-orphan-drive trap). Allocate the
-       table OUT of the COW (g_cow_busy) so it stays consistent with its static count. */
-    int _sv = g_cow_busy; g_cow_busy = 1;
-    if (qjs_leaf_n == qjs_leaf_cap) {
-        int nc = qjs_leaf_cap ? qjs_leaf_cap * 2 : 16;
-        char **nt = realloc(qjs_leaf_tab, nc * sizeof *nt);
-        if (!nt) { g_cow_busy = _sv; return 0; }
-        qjs_leaf_tab = nt; qjs_leaf_cap = nc;
+static volatile int g_cow_busy;   /* fwd (defined in the COW section) */
+static void *qjs_cow_palloc(size_t);   /* fwd: persistent metadata pool (bump, NEVER freed, OUT of the COW heap; malloc pre-init) */
+/* Leaf-table state lives in the COW persistent metadata POOL (qjs_cow_palloc), exactly like
+   the COW deltas: bump-allocated, NEVER freed, never logged/reverted (under g_cow_busy), reset
+   only at grind teardown. The OOB was qjs_t_leaf->strcmp reading a leaf STRING whose dlmalloc
+   chunk had been handed out twice: a leaf realloc during a drive freed the old array O (logged),
+   a guarded alloc reused O's chunk (not logged), and the discard reverted T->tab back to O and
+   un-freed it -> O held the reuse's bytes -> wild pointer. Because the pool NEVER frees, no chunk
+   is reused; the guard keeps count+entries persistent+consistent. Interning is per-GRIND (one Z3
+   var per attacker source across the composition) -- exactly the pool's lifetime. */
+typedef struct { char **tab; int n, cap; } QjsLeafTab;
+static QjsLeafTab *qjs_leaf;
+static QjsLeafTab *qjs_leaf_get(void) {
+    if (!qjs_leaf) {
+        int _sv = g_cow_busy; g_cow_busy = 1;
+        qjs_leaf = (QjsLeafTab *)qjs_cow_palloc(sizeof *qjs_leaf);
+        if (qjs_leaf) { qjs_leaf->tab = NULL; qjs_leaf->n = 0; qjs_leaf->cap = 0; }
+        g_cow_busy = _sv;
     }
-    size_t n = strlen(L) + 1; char *d = malloc(n); if (!d) { g_cow_busy = _sv; return 0; } memcpy(d, L, n);
-    qjs_leaf_tab[qjs_leaf_n] = d;
-    int id = qjs_leaf_n++;
+    return qjs_leaf;
+}
+static int qjs_leaf_append(const char *L) {
+    QjsLeafTab *T = qjs_leaf_get(); if (!T) return 0;
+    int _sv = g_cow_busy; g_cow_busy = 1;
+    if (T->n == T->cap) {
+        int nc = T->cap ? T->cap * 2 : 16;
+        char **nt = (char **)qjs_cow_palloc((size_t)nc * sizeof *nt);   /* grow: new pool array, copy, abandon old (pool never frees -> old chunk never reused) */
+        if (!nt) { g_cow_busy = _sv; return 0; }
+        if (T->tab) memcpy(nt, T->tab, (size_t)T->n * sizeof *nt);
+        T->tab = nt; T->cap = nc;
+    }
+    size_t n = strlen(L) + 1; char *d = (char *)qjs_cow_palloc(n); if (!d) { g_cow_busy = _sv; return 0; } memcpy(d, L, n);
+    T->tab[T->n] = d;
+    int id = T->n++;
     g_cow_busy = _sv;
     return id;
 }
@@ -269,8 +285,9 @@ static int qjs_leaf_is_event(const char *L) {
 }
 static int qjs_leaf_id(const char *label) {
     const char *L = (label && label[0]) ? label : "?";
+    QjsLeafTab *T = qjs_leaf_get(); if (!T) return 0;
     if (!qjs_leaf_is_event(L)) {
-        for (int i = 0; i < qjs_leaf_n; i++) if (!strcmp(qjs_leaf_tab[i], L)) return i;
+        for (int i = 0; i < T->n; i++) if (!strcmp(T->tab[i], L)) return i;
     }
     return qjs_leaf_append(L);
 }
@@ -1304,8 +1321,8 @@ static void qjs_z3_emit_poc(Z3_context c, Z3_model m, qjs_z3_ctx *zc, const char
         Z3_string val_str = NULL;
         if (Z3_model_eval(c, m, var, true, &assigned) && assigned)
             val_str = Z3_get_string(c, assigned);
-        const char *label = (leaf_id >= 0 && leaf_id < qjs_leaf_n && qjs_leaf_tab)
-                            ? qjs_leaf_tab[leaf_id] : "?";
+        const char *label = (qjs_leaf && leaf_id >= 0 && leaf_id < qjs_leaf->n && qjs_leaf->tab)
+                            ? qjs_leaf->tab[leaf_id] : "?";
         char key_buf[128] = {0};
         const char *action = qjs_poc_action(label, key_buf, sizeof key_buf);
         if (!first) qjs_sb_putc(&p, ',');
@@ -4235,6 +4252,7 @@ static void js_stack_pop(JSRuntime *rt, JSStackChunk *save_chunk, uint8_t *save_
     save_chunk->top = save_top;
 }
 
+static JSRuntime *g_cow_rt;   /* fwd (defined in the COW section): set at runtime creation so the COW metadata pool (qjs_cow_palloc) is usable before pool_init, incl. the non-COW build */
 JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
 {
     JSRuntime *rt;
@@ -4257,6 +4275,7 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     ms.malloc_size += rt->mf.js_malloc_usable_size(rt) + MALLOC_OVERHEAD;
     rt->malloc_state = ms;
     rt->malloc_gc_threshold = 256 * 1024;
+    g_cow_rt = rt;   /* the COW metadata pool (qjs_cow_palloc) can now js_malloc_rt its blocks (leaf table + deltas) */
 
     init_list_head(&rt->context_list);
     init_list_head(&rt->gc_obj_list);
@@ -20318,6 +20337,7 @@ typedef struct JSCowBlk { struct JSCowBlk *next; size_t sz, used; } JSCowBlk;   
 static JSCowBlk *g_cow_blk0 = NULL, *g_cow_blk = NULL;   /* list head + current bump block */
 static JSRuntime *g_cow_rt = NULL;
 static void *qjs_cow_palloc(size_t n) {
+    if (!g_cow_rt) return NULL;   /* g_cow_rt is set at JS_NewRuntime2 (both builds), before any leaf/delta alloc -> unreachable in practice; a NULL here just fails the alloc gracefully rather than deref a null rt. */
     n = (n + 15) & ~(size_t)15;
     int sv = g_cow_busy; g_cow_busy = 1;   /* block headers + the bump `used` live in the COW region; the barrier must never mark them (else a discard reverts the pool) */
     void *ret = NULL;
@@ -20453,6 +20473,7 @@ static void qjs_cow_reset(JSRuntime *rt) {
     }
     g_cow_saved = g_cow_commits = g_cow_discards = g_cow_captures = g_cow_applies = 0;
     qjs_cow_undo = NULL; qjs_cow_shadow = NULL; qjs_cow_undo_n = qjs_cow_undo_cap = qjs_cow_words = 0;   /* undo-log state lives in the pool just reset -> drop the dangling pointers */
+    qjs_leaf = NULL;   /* leaf table lives in the pool too -> drop the dangling pointer so it re-allocs from the fresh pool next grind */
     qjs_cow_pool_reset();
 }
 /* Heap base + current linear-memory length (the COW region is [__heap_base, mem_end)). */
@@ -20524,6 +20545,13 @@ static void qjs_cow_pool_warm(JSContext *ctx) {
    pre-flow value of all 8 bytes, so sub-word/multi-store on one word stays correct). */
 QJS_JSEXPORT void qjs_cow_undo_log(size_t addr, size_t size) {
     size_t hb = (size_t)&__heap_base, w, w0, w1;
+    /* Log ONLY the orphan's own bundle execution (a drive in flight). Between drives the grind's
+       C code writes PERSISTENT engine/scheduler metadata (the orphan registry, the captured-sink
+       and leaf-id tables, instance/receiver captures) — that is NOT flow-state, and logging it let
+       a per-flow revert dangle those structures -> free-list corruption -> the cold-orphan-drive
+       OOB. g_grind_drive_active brackets exactly the drive (both paths + composition + resume), so
+       this is the principled "only the drive is flow-state" rule at zero new bracketing. */
+    if (!g_grind_drive_active) return;
     if (g_cow_busy || !qjs_cow_shadow || addr < hb || !size) return;
     w0 = (addr - hb) >> 3; w1 = (addr + size - 1 - hb) >> 3;
     for (w = w0; w <= w1; w++) {
@@ -20850,19 +20878,25 @@ static void qjs_comp_capture(JSContext *ctx, JSValueConst func, JSValueConst thi
     JSFunctionBytecode *fb = JS_GetFunctionBytecode(func);
     if (!fb) return;
     for (int i = 0; i < g_comp_n; i++) if (JS_GetFunctionBytecode(g_comp_sink[i]) == fb) return;
+    /* g_comp_sink/recv are PERSISTENT cross-orphan metadata (captured-sink registry) with
+       static counts — same class as the leaf table. Build them OUT of the COW (g_cow_busy) so a
+       per-flow revert can't revert the array/refcounts while g_comp_n persists -> dangling array
+       -> free-list corruption -> the downstream malloc OOB. */
+    int _sv = g_cow_busy; g_cow_busy = 1;
     if (g_comp_n == g_comp_cap) {
         int ng = g_comp_cap ? g_comp_cap * 2 : 8;
         JSValue *ns = js_realloc(ctx, g_comp_sink, (size_t)ng * sizeof(JSValue));
-        if (!ns) return;
+        if (!ns) { g_cow_busy = _sv; return; }
         g_comp_sink = ns;
         JSValue *nr = js_realloc(ctx, g_comp_recv, (size_t)ng * sizeof(JSValue));
-        if (!nr) return;
+        if (!nr) { g_cow_busy = _sv; return; }
         g_comp_recv = nr;
         g_comp_cap = ng;
     }
     g_comp_sink[g_comp_n] = JS_DupValue(ctx, func);
     g_comp_recv[g_comp_n] = JS_DupValue(ctx, this_val);
     g_comp_n++;
+    g_cow_busy = _sv;
 }
 
 /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
@@ -63519,8 +63553,10 @@ int qjs_deep_step_c(JSContext *ctx, int maxN, int fromCursor) {
                     /* No captured sink has fetched YET (the page's client.request(cmd()) drove
                        LATER than this producer) — SAVE the descriptor; it's drained the instant
                        a sink fetches, making the composition ORDER-INDEPENDENT (no lost command). */
+                    int _csv = g_cow_busy; g_cow_busy = 1;   /* g_comp_pend is persistent cross-orphan metadata (deferred descriptors) — its realloc + DupValue writes stay OUT of the COW (leaf-table class) so a per-flow revert can't dangle it */
                     if (g_comp_pend_n == g_comp_pend_cap) { int _pg = g_comp_pend_cap ? g_comp_pend_cap * 2 : 16; JSValue *_pp = js_realloc(ctx, g_comp_pend, (size_t)_pg * sizeof(JSValue)); if (_pp) { g_comp_pend = _pp; g_comp_pend_cap = _pg; } }
                     if (g_comp_pend_n < g_comp_pend_cap) g_comp_pend[g_comp_pend_n++] = JS_DupValue(ctx, r2);
+                    g_cow_busy = _csv;
                 } else {
                     /* A sink has fetched — drive the DEFERRED descriptors (saved before any sink
                        fetched) THEN this one, through each sink that actually fetches. Self-gated;
