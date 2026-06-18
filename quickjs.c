@@ -244,16 +244,25 @@ struct qjs_term {
      only the id is distinct.
    Bounded by attacker-source × event-count per run. */
 static char **qjs_leaf_tab; static int qjs_leaf_n, qjs_leaf_cap;
+static volatile int g_cow_busy;   /* fwd (defined in the COW section): the leaf table is built mid-drive */
 static int qjs_leaf_append(const char *L) {
+    /* The leaf table is SHARED Z3/opaque metadata (entries live across flows), but its array +
+       string entries are heap (>= __heap_base) while the COUNT qjs_leaf_n is static (< __heap_base).
+       A per-flow COW revert reverts the heap entries but NOT the static count -> qjs_leaf_id then
+       strcmp()s a reverted/stale slot -> OOB (the secondary cold-orphan-drive trap). Allocate the
+       table OUT of the COW (g_cow_busy) so it stays consistent with its static count. */
+    int _sv = g_cow_busy; g_cow_busy = 1;
     if (qjs_leaf_n == qjs_leaf_cap) {
         int nc = qjs_leaf_cap ? qjs_leaf_cap * 2 : 16;
         char **nt = realloc(qjs_leaf_tab, nc * sizeof *nt);
-        if (!nt) return 0;
+        if (!nt) { g_cow_busy = _sv; return 0; }
         qjs_leaf_tab = nt; qjs_leaf_cap = nc;
     }
-    size_t n = strlen(L) + 1; char *d = malloc(n); if (!d) return 0; memcpy(d, L, n);
+    size_t n = strlen(L) + 1; char *d = malloc(n); if (!d) { g_cow_busy = _sv; return 0; } memcpy(d, L, n);
     qjs_leaf_tab[qjs_leaf_n] = d;
-    return qjs_leaf_n++;
+    int id = qjs_leaf_n++;
+    g_cow_busy = _sv;
+    return id;
 }
 static int qjs_leaf_is_event(const char *L) {
     return L && (!strncmp(L, "postMessage.", 12) || !strncmp(L, "handler.", 8));
