@@ -303,39 +303,6 @@ static void qjs_t_free(qjs_term *t) {
     }
     if (stk != inl) free(stk);
 }
-/* True iff `needle` (by identity) appears anywhere in `hay`'s term tree — i.e.
-   `hay` was DERIVED from `needle` by member/concat/call ops (the engine ref's the
-   SAME term pointer as a child: object[key] → member(key, object_term)). The
-   recursion-collapse fixpoint uses this to recognise the unbounded "infinitely-
-   nested opaque" recursion (qs/stringify descending object[key] forever): the new
-   arg's opaque term CONTAINS the prior arg's term even though they aren't SameValue.
-   Iterative — the term tree grows one level per recursion so it can be deep. */
-static int qjs_term_has_subterm(qjs_term *hay, qjs_term *needle) {
-    if (!hay || !needle) return 0;
-    qjs_term *inl[64]; qjs_term **stk = inl; size_t top = 0, cap = 64;
-    int found = 0;
-    stk[top++] = hay;
-    while (top > 0 && !found) {
-        qjs_term *t = stk[--top];
-        if (!t) continue;
-        if (t == needle) { found = 1; break; }
-        for (int k = 0; k < 2; k++) {
-            qjs_term *c = k ? t->b : t->a;
-            if (!c) continue;
-            if (top == cap) {
-                size_t nc = cap * 2;
-                qjs_term **ns = (stk == inl) ? (qjs_term **)malloc(nc * sizeof *ns)
-                                             : (qjs_term **)realloc(stk, nc * sizeof *ns);
-                if (!ns) { top = 0; break; }   /* OOM: stop the walk → conservatively "not derived" (no collapse) */
-                if (stk == inl) memcpy(ns, inl, top * sizeof *ns);
-                stk = ns; cap = nc;
-            }
-            stk[top++] = c;
-        }
-    }
-    if (stk != inl) free(stk);
-    return found;
-}
 static qjs_term *qjs_t_alloc(char op) {
     qjs_term *t = calloc(1, sizeof *t); if (!t) return NULL;
     t->ref = 1; t->op = op; return t;
