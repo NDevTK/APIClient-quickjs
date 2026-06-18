@@ -63202,8 +63202,13 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
                last clear), clear the skip markers and give them another pass
                (defer_comp is preserved, so the per-orphan abandon fixpoint stays
                correct). If a cycle completed NOTHING, the remaining deferred set
-               is provably unhelpable (no-global-progress fixpoint) → abandon them
-               (mark driven) so the grind reaches rem==0. */
+               is provably unhelpable THIS PASS (no new global output) → PAUSE them,
+               never abandon: #9 prioritization, not fixpoint termination. Leave them
+               UN-driven so they re-drive next invocation (shared state — a producer that
+               populates a worklist later, or a fresh session — may let them progress); the
+               WFQ starves them by emitted output meanwhile. Freeing the heap is the existing
+               #5 RAM floor (re-derived on re-drive; IDB-evict will later resume them EXACTLY
+               instead of re-deriving). The host exits the grind loop on @DPAUSE. */
             int _any_def = 0;
             if (qjs_deep_deferred)
                 for (int _di = 0; _di < qjs_deep_rb_n; _di++)
@@ -63214,14 +63219,14 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
                 for (int _di = 0; _di < qjs_deep_rb_n; _di++) qjs_deep_deferred[_di] = 0;   /* clear skip markers; defer_comp preserved */
                 continue;
             }
-            for (int _di = 0; _di < qjs_deep_rb_n; _di++) {   /* unhelpable → abandon */
+            for (int _di = 0; _di < qjs_deep_rb_n; _di++) {   /* no new output → PAUSE (re-drivable), never abandon */
                 if (qjs_deep_deferred[_di] && qjs_deep_rb[_di] && !qjs_deep_rb[_di]->qjs_driven) {
-                    qjs_deep_rb[_di]->qjs_driven = 1;
                     uint64_t _fd = qjs_deep_ids ? qjs_deep_ids[_di] : 0;
-                    if (_fd) printf("@DD %llx\n", (unsigned long long)_fd);
-                    qjs_deep_free_paused_flow(ctx, _di);   /* WFQ #5 floor: reclaim the abandoned paused flow's heap */
+                    if (_fd) printf("@DG %llx\n", (unsigned long long)_fd);   /* paused, re-drivable — NOT @DD driven */
+                    qjs_deep_free_paused_flow(ctx, _di);   /* #5 RAM floor (re-derive on re-drive; IDB-evict resumes exactly later) */
                 }
             }
+            printf("@DPAUSE\n");   /* host: grind paused with re-drivable residue — exit the loop, do NOT recycle/abandon */
             fflush(stdout);
             break;
         }
