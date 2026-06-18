@@ -20507,6 +20507,10 @@ static void qjs_cow_pool_warm(JSContext *ctx) {
     if (!g_cow_enabled || !qjs_cow_shadow) return;
     qjs_cow_shadow_grow(qjs_cow_heap_len() / 8 + 1);   /* re-cover a heap that grew since the last warm */
     if (g_cow_saturated) {
+        /* SATURATION here is a wild-store SYMPTOM, not a shadow shortfall: shadow_grow keeps
+           qjs_cow_words >= heap_len/8, so w >= words means addr >= memsz — an OOB store from a
+           corrupted free-list pointer (the remaining cold-orphan-drive trap: a COW-allocator
+           desync on some still-unguarded persistent C-side allocation). Surfaced, not silent. */
         printf("@WHY {\"phase\":\"cow_saturated\",\"undoCap\":%zu,\"undoN\":%zu,\"words\":%zu}\n",
                qjs_cow_undo_cap, qjs_cow_undo_n, qjs_cow_words);
         fflush(stdout);
