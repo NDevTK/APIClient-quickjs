@@ -204,8 +204,15 @@
     if (ISOPQANY(s) || s == null) {
       try { s = JSON.stringify(deepConcretize(rec)); } catch (e2) { return; }
     }
-    if (!_hSeen.has(s)) { _hSeen.add(s); _hProg++; }
-    EPRINT("@H " + s);
+    // g_emit_n (the WFQ's ONLY sound progress signal) counts emitted @H lines via
+    // js_print. Emitting @H on every call — including a DUPLICATE record (same
+    // endpoint+args+site) — would falsely grow g_emit_n on a re-emitting opaque loop,
+    // so it never starves and a BOUND (loop-revisit fixpoint) is needed to stop it.
+    // Gate the emit on the NEW-distinct check (the CLAUDE.md "new @H, never a count")
+    // so g_emit_n tracks NEW output and the scheduler starves duplicate-emitting loops
+    // by attention. Moat-neutral: every distinct endpoint+args+site still emits once
+    // (different example values = different `s` = still emitted); only exact re-emits drop.
+    if (!_hSeen.has(s)) { _hSeen.add(s); _hProg++; EPRINT("@H " + s); }
   }
   function tainted(v) {
     if (ISOPQ(v)) return true;
