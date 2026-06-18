@@ -20319,7 +20319,7 @@ static void *qjs_cow_palloc(size_t n) {
         if (g_cow_blk && g_cow_blk->next) { g_cow_blk = g_cow_blk->next; continue; }
         size_t bsz = g_cow_blk ? g_cow_blk->sz * 2 : (size_t)16 * 1024 * 1024;   /* geometric growth */
         if (bsz < n) bsz = n;
-        JSCowBlk *nb = (JSCowBlk *)js_malloc_rt(g_cow_rt, sizeof(JSCowBlk) + bsz);
+        JSCowBlk *nb = (JSCowBlk *)js_malloc_rt(g_cow_rt, sizeof(JSCowBlk) + bsz);   /* safe: the allocator runs under g_cow_busy, so the barrier never fires inside it -> qjs_cow_palloc is never re-entered during an allocation */
         nb->next = NULL; nb->sz = bsz; nb->used = 0;   /* OOM -> crash (platform bound) -> drives #5; never a degrade */
         if (g_cow_blk) g_cow_blk->next = nb; else g_cow_blk0 = nb;
         g_cow_blk = nb;
@@ -20350,6 +20350,10 @@ typedef struct { uint64_t widx; uint64_t old; } JSCowUndo;
 static JSCowUndo *qjs_cow_undo = NULL;
 static size_t qjs_cow_undo_n = 0, qjs_cow_undo_cap = 0, qjs_cow_words = 0;
 static uint8_t *qjs_cow_shadow = NULL;
+/* Set when the barrier hits the undo/shadow limit MID-FLOW: it must NOT grow there (growth
+   re-enters the non-reentrant allocator -> OOB), so it SATURATES (skips logging) and the
+   scheduler grows the pool at the next SAFE point (qjs_cow_pool_warm). Surfaced via @WHY. */
+static int g_cow_saturated = 0;
 static void qjs_cow_shadow_grow(size_t need);
 static void qjs_cow_undo_grow(void);
 QJS_JSEXPORT void qjs_cow_undo_revert(void);
@@ -20480,6 +20484,28 @@ static void qjs_cow_undo_grow(void) {
     qjs_cow_undo = no; qjs_cow_undo_cap = cap2;
     g_cow_busy = sv;
 }
+/* SCHEDULER-WARMED COW pool (#5/#10): grow the shadow to cover the live heap and the undo
+   array to hold the largest flow seen, at a SAFE point (the grind's drive-loop boundary,
+   no allocator mid-operation). The write-barrier then only ever BUMPS this pre-reserved
+   space and NEVER grows it mid-flow — which would re-enter the non-reentrant allocator.
+   Attention, not a bound: the shadow tracks the live heap (the platform floor); the undo
+   array DOUBLES whenever a flow saturated it (g_cow_saturated), so it converges to the real
+   working-set with no fixed cap. A flow that saturates before the next warm degrades its
+   OWN isolation (skips logging some words) but still drives + emits — output is preserved,
+   the regression is surfaced (@WHY), and the next warm absorbs it. */
+static void qjs_cow_pool_warm(JSContext *ctx) {
+    (void)ctx;
+    if (!g_cow_enabled || !qjs_cow_shadow) return;
+    qjs_cow_shadow_grow(qjs_cow_heap_len() / 8 + 1);   /* re-cover a heap that grew since the last warm */
+    if (g_cow_saturated) {
+        printf("@WHY {\"phase\":\"cow_saturated\",\"undoCap\":%zu,\"undoN\":%zu,\"words\":%zu}\n",
+               qjs_cow_undo_cap, qjs_cow_undo_n, qjs_cow_words);
+        fflush(stdout);
+        qjs_cow_undo_grow();   /* a prior flow outgrew the array -> double it (converges to the working set) */
+        g_cow_saturated = 0;
+    }
+    if (qjs_cow_undo_cap < 8192) qjs_cow_undo_grow();   /* first warm: seed a base reserve so small flows never saturate */
+}
 /* Barrier target (runs BEFORE the store): log the pre-flow value of each WORD the
    store [addr, addr+size) touches, once per word (per-word first-write captures the
    pre-flow value of all 8 bytes, so sub-word/multi-store on one word stays correct). */
@@ -20488,9 +20514,9 @@ QJS_JSEXPORT void qjs_cow_undo_log(size_t addr, size_t size) {
     if (g_cow_busy || !qjs_cow_shadow || addr < hb || !size) return;
     w0 = (addr - hb) >> 3; w1 = (addr + size - 1 - hb) >> 3;
     for (w = w0; w <= w1; w++) {
-        if (w >= qjs_cow_words) qjs_cow_shadow_grow(w);
+        if (w >= qjs_cow_words) { g_cow_saturated = 1; continue; }   /* heap grew past the shadow -> saturate (never grow mid-barrier: re-enters the allocator). qjs_cow_pool_warm re-covers it at the next safe point. */
         if (qjs_cow_shadow[w >> 3] & (uint8_t)(1u << (w & 7))) continue;
-        if (qjs_cow_undo_n >= qjs_cow_undo_cap) qjs_cow_undo_grow();
+        if (qjs_cow_undo_n >= qjs_cow_undo_cap) { g_cow_saturated = 1; return; }   /* undo array full -> saturate (skip the rest of this flow's logging); the scheduler doubles it at the next warm */
         qjs_cow_undo[qjs_cow_undo_n].widx = w;
         qjs_cow_undo[qjs_cow_undo_n].old  = *(uint64_t *)(hb + (w << 3));
         qjs_cow_undo_n++;
@@ -25666,7 +25692,7 @@ static bool js_async_function_settle(JSContext *ctx, JSAsyncFunctionData *s, JSV
         JSValue value;
         /* Bound-check the async value-stack before the await/return read. A
            forced-exec cold-drive of an async orphan (seen on the OpenAI SDK deep
-           grind: main→qjs_deep_step_c_h→…→js_async_function_resume) can leave
+           grind: main→qjs_deep_step_c→…→js_async_function_resume) can leave
            cur_sp outside the frame's value-stack region, so cur_sp[-1] traps
            UNCATCHABLY ("memory access out of bounds") and recycles the instance.
            Surface the bad pointer + continue with an undefined await/return value
@@ -62304,6 +62330,7 @@ static unsigned *qjs_deep_defer_comp = NULL;  /* parallel: g_emit_n snapshot at 
    abandon path. NULL js_stack = no paused flow for this orphan. */
 static JSFlow *qjs_deep_flow = NULL;
 static JSCowDelta *qjs_deep_cow = NULL;   /* COW: per-flow page delta, parallel to qjs_deep_flow (#7/#10) */
+static unsigned long long *qjs_deep_vt = NULL;   /* WFQ virtual time, parallel to qjs_deep_rb: the live-pick runs the LEAST-served orphan (min vt), advancing its vt per drive — a fair-share round-robin REPLACING the static net/sink reach-PRIORITY guess (policy: value = run output, never a static reaches-a-network-edge prediction). A firing orphan is removed from the pick via qjs_driven, so EMITTED output (firing) does the weighting; the unfired residue round-robins, never net-first-predicted. */
 
 /* ===== #5/#7/#8/#9/#10 per-SCHEDULE DRIVE park registry ==========================
    The per-schedule drive loop (qjsmain.c do_drive) drives a forced-decision chain.
@@ -62662,7 +62689,6 @@ static void qjs_deep_relevance_sort(JSContext *ctx, JSFunctionBytecode **rb, int
    fresh worker (after MV3 eviction) re-boots the same combined bundle (stable
    GC order ⇒ same orphan indices) and continues from the IndexedDB-saved
    cursor instead of re-driving the done orphans. */
-int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only);
 
 /* --- Cold-constructor receiver synthesis (project_appwrite_receiver_synthesis_attempt).
    appwrite@16 (READ: ES6 classes, awaiter minified to `t`) ships ~76 cold service methods
@@ -62776,17 +62802,10 @@ static void qjs_deep_free_paused_flow(JSContext *ctx, int ix) {
 }
 
 int qjs_deep_step_c(JSContext *ctx, int maxN, int fromCursor) {
-    return qjs_deep_step_c_h(ctx, maxN, fromCursor, 0);
-}
-/* head_only: drive ONLY the net-reaching (endpoint) HEAD then return, so the
-   worker can rotate to another open page's head before this page's tail
-   (continuous-session scheduler). The live-pick already orders net-reaching
-   first; head_only just stops the loop when the best remaining pick is NOT
-   net-reaching. */
-int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
     if (maxN < 1) maxN = 1;
     JSRuntime *rt = JS_GetRuntime(ctx);
     qjs_init_host_atoms(ctx);
+    qjs_cow_pool_warm(ctx);   /* #5/#10 SAFE point: pre-grow the COW undo/shadow here so the barrier never grows (re-enters the allocator) during the enumeration's metadata allocs or the drive loop below */
     if (qjs_deep_cache_rt != rt) {
         /* First batch on this runtime: enumerate the UNREACHED host-bearing
            bytecodes (the boot, incl. the driver's static/loader drive, has
@@ -62796,6 +62815,11 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
         qjs_deep_free(ctx);
         qjs_deep_cache_rt = rt;
         qjs_deep_vspread_done = 0;   /* fresh residue -> re-arm the post-grind value-spread */
+        /* Build the grind metadata (orphan registry + parallel arrays) under g_cow_busy: it is
+           SCHEDULER state read by the pick across drives, NOT a flow's heap mutation — a per-flow
+           COW revert must never reset it (and a store inside the array allocs must not fire the
+           barrier -> qjs_cow_palloc re-entrancy). Restored before the per-flow baseline. */
+        int _grind_cow_sv = g_cow_busy; g_cow_busy = 1;
         int cap = 0;
         struct list_head *el;
         list_for_each(el, &rt->gc_obj_list) {
@@ -62860,6 +62884,7 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
         if (qjs_deep_defer_comp) { js_free(ctx, qjs_deep_defer_comp); qjs_deep_defer_comp = NULL; }
         if (qjs_deep_flow) { js_free(ctx, qjs_deep_flow); qjs_deep_flow = NULL; }   /* WFQ: array only */
         if (qjs_deep_cow) { js_free(ctx, qjs_deep_cow); qjs_deep_cow = NULL; }   /* COW deltas are POOL memory (reset below), this frees only the array */
+        if (qjs_deep_vt) { js_free(ctx, qjs_deep_vt); qjs_deep_vt = NULL; }   /* WFQ virtual-time array */
         if (qjs_drive_flow) { js_free(ctx, qjs_drive_flow); qjs_drive_flow = NULL; }   /* #5/#9 drive park registry */
         if (qjs_drive_cow) { js_free(ctx, qjs_drive_cow); qjs_drive_cow = NULL; }
         if (qjs_drive_mark) { js_free(ctx, qjs_drive_mark); qjs_drive_mark = NULL; }
@@ -62878,6 +62903,8 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
            from. If pool/baseline fail, qjs_cow_dirty stays NULL -> the barrier no-ops ->
            the WFQ runs un-isolated (graceful), never a crash. */
         qjs_deep_cow = js_mallocz(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1) * sizeof(JSCowDelta));
+        qjs_deep_vt = js_mallocz(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1) * sizeof(unsigned long long));   /* WFQ: zeroed = all orphans start at virtual time 0 (round-robin from equal) */
+        g_cow_busy = _grind_cow_sv;   /* metadata built; resume COW tracking for the per-flow baseline + the drive loop */
         if (g_cow_enabled && qjs_deep_cow && !g_cow_boot_mode) {   /* gated; skipped under COW-as-snapshot (boot baseline is the base) */
             qjs_cow_pool_init(rt, (size_t)16 * 1024 * 1024);
             qjs_cow_shadow_grow(qjs_cow_heap_len() / 8 + 1); qjs_cow_undo_n = 0;   /* undo-log snapshot: size the shadow, empty the log = at baseline */
@@ -63138,6 +63165,7 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
     unsigned _last_clear_comp = (unsigned)-1;   /* g_grind_completions at the last deferred-set re-attempt (no-progress fixpoint) */
     JS_SetInterruptHandler(rt, qjs_grind_interrupt, NULL);   /* spin-defer yield (gated by g_grind_drive_active, off during boot/BFS); runtime-free clears it */
     while (driven < maxN) {
+        qjs_cow_pool_warm(ctx);   /* #5/#10: re-warm each iteration (SAFE point) so a heap that grew during the prior drive is re-covered before the next drive's barrier fires */
         int _ix = -1;
         JSFunctionBytecode *b = NULL;
         for (int _ci = 0; _ci < qjs_deep_rb_n; _ci++) {
@@ -63153,6 +63181,13 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
             }
             int better;
             if (b == NULL) better = 1;
+            else if (qjs_deep_vt)
+                /* WFQ: run the LEAST-served orphan (min virtual time). A firing orphan is
+                   removed from the pick via qjs_driven, so EMITTED output does the weighting;
+                   the unfired residue round-robins by vt — never net-first PREDICTED (policy:
+                   value = run output, never a static reaches-a-network-edge guess). Equal vt
+                   keeps the earlier (registry order). */
+                better = (qjs_deep_vt[_ci] < qjs_deep_vt[_ix]);
             else if (_have_bits)
                 better = qjs_priority_live_orphan_better_bits(
                     qjs_deep_net[_ci], qjs_deep_net2[_ci], cb->qjs_executed, qjs_deep_sink[_ci], cb->byte_code_len,
@@ -63197,13 +63232,6 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
             fflush(stdout);
             break;
         }
-        /* HEAD-ONLY stop: the live-pick orders net-reaching (endpoint) orphans
-           FIRST, so the first pick whose net-bit is 0 means the net HEAD is
-           fully driven — return so the worker can rotate to another open page's
-           head before this page's completeness tail (continuous-session
-           scheduler). qjs_h_fired orphans were already marked+skipped above, so
-           _ix here is a genuine to-drive pick. */
-        if (head_only && _have_bits && !qjs_deep_net[_ix] && !qjs_deep_net2[_ix]) break;
         uint64_t _id = qjs_deep_ids ? qjs_deep_ids[_ix] : 0;
         /* Re-baseline the JS recursion guard to THIS frame before driving.
            js_check_stack_overflow compares the live SP against
@@ -63366,20 +63394,19 @@ int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only) {
                     ? JS_CallConstructor(ctx, fo, nargs, args3)
                     : JS_Call(ctx, fo, (qjs_deep_recv && !JS_IsUndefined(qjs_deep_recv[_ix])) ? qjs_deep_recv[_ix] : this_opq2, nargs, args3);
             }
-            int _wfq_silent = 0;
+            int _wfq_slice = 0;
             while (_wfq_on && rt->qjs_yielded) {
                 rt->qjs_yielded = 0;
-                if (g_emit_n != _wfq_e0) {                  /* emitted new @H/@S -> productive -> resume, reset silence */
-                    _wfq_e0 = g_emit_n; _wfq_silent = 0;
+                if (g_emit_n != _wfq_e0) _wfq_e0 = g_emit_n;   /* track output (for defer_comp) but do NOT reset the counter: the TICK counts WINDOWS (preemption granularity, the slice that gives a fetch room to be reached), never consecutive SILENCE (a banned no-progress count) */
+                if (++_wfq_slice < QJS_DEFER_QUANTUM) {      /* run one slice of windows, then yield to the WFQ regardless of silence */
                     rt->qjs_resume_chain = 1; r2 = qjs_resume_chain_call(ctx);
-                } else if (++_wfq_silent < QJS_DEFER_QUANTUM) {  /* give it the quantum to REACH its emit (a fetch can be many ops in) before starving — same window the old throw-defer used */
-                    rt->qjs_resume_chain = 1; r2 = qjs_resume_chain_call(ctx);
-                } else {                                    /* QUANTUM silent windows, no @H/@S -> STARVE: pause on the heap */
+                } else {                                    /* slice done -> pause on the heap; vt advances so the least-served orphan runs next (firing orphans are removed via qjs_driven, so emitted output weights the residue) */
                     qjs_flow_save(ctx, &qjs_deep_flow[_ix]);
                     /* COW: store this flow's page delta, then restore the heap to baseline
                        so the NEXT flow forks clean (#7 shared-state isolation). */
                     if (qjs_deep_cow) { qjs_cow_capture(rt, qjs_cow_heap_base(), &qjs_deep_cow[_ix]); qjs_cow_to_baseline(qjs_cow_heap_base(), &qjs_deep_cow[_ix]); }
                     qjs_deep_deferred[_ix] = 1; qjs_deep_defer_comp[_ix] = (unsigned)g_emit_n;
+                    if (qjs_deep_vt) qjs_deep_vt[_ix]++;   /* WFQ: advance this orphan's virtual time so the least-served orphan runs next (round-robin; emitted output weights via qjs_driven removing firing orphans from the pick) */
                     rt->js_stack = NULL; rt->current_stack_frame = NULL;
                     _wfq_paused = 1; break;
                 }

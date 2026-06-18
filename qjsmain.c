@@ -223,7 +223,6 @@ static void qjs_unwind_suspended(JSContext *ctx, JSRuntime *rt) {
    PERSISTENT runtime (g_deep_*) so the bundle boots once and the worker can
    sleep between batches — low CPU duty, no overheating. */
 int qjs_deep_step_c(JSContext *ctx, int maxN, int fromCursor);
-int qjs_deep_step_c_h(JSContext *ctx, int maxN, int fromCursor, int head_only);
 int qjs_deep_cursor_c(void);
 int qjs_deep_dnf_threw_c(void);
 int qjs_deep_dnf_ret_c(void);
@@ -790,18 +789,20 @@ int main(int argc, char **argv) {
             advance the residue one batch at a time still work.
          --fe-deep-end             — free the persistent runtime. */
     {
-        int deep_step = -1, deep_end = 0, deep_from = -1, deep_grind = 0, deep_head = 0;
+        int deep_step = -1, deep_end = 0, deep_from = -1, deep_grind = 0;
         for (int i = 1; i < argc; i++) {
             if (!strncmp(argv[i], "--fe-deep-step=", 15)) deep_step = atoi(argv[i] + 15);
             else if (!strncmp(argv[i], "--fe-deep-from=", 15)) deep_from = atoi(argv[i] + 15);
             else if (!strcmp(argv[i], "--fe-deep-end")) deep_end = 1;
             else if (!strcmp(argv[i], "--fe-deep-grind")) deep_grind = 1;
-            /* Head-first scheduling: drive ONLY the net-reaching (endpoint) HEAD
-               then return, so the worker can rotate to another open page's head
-               before grinding THIS page's completeness tail (continuous-session
-               scheduler). Same drive as --fe-deep-grind but qjs_deep_step_c
-               stops once no net-reaching orphan remains undriven. */
-            else if (!strcmp(argv[i], "--fe-deep-grind-head")) { deep_grind = 1; deep_head = 1; }
+            /* The host's continuous-session scheduler still issues a first "head"
+               call then a "tail" call, but the engine no longer early-stops on a
+               static net-reach prefix (the banned reaches-a-network-edge guess):
+               qjs_deep_step_c drives the full residue ordered by the in-engine
+               WFQ (qjs_deep_vt, emitted-output weighted), which front-loads
+               firing orphans on its own. So --fe-deep-grind-head is a plain alias
+               — the head/tail split is now purely host-side ordering. */
+            else if (!strcmp(argv[i], "--fe-deep-grind-head")) deep_grind = 1;
         }
         if (deep_end) {
             if (g_deep_ctx) {
@@ -980,9 +981,9 @@ int main(int argc, char **argv) {
                yielding per-orphan via JSPI so the host scheduler can rotate
                fibers. step mode → bounded batch (legacy/debug path). */
             int maxN = deep_grind ? INT_MAX : (deep_step > 0 ? deep_step : 1);
-            int rem = qjs_deep_step_c_h(g_deep_ctx, maxN, deep_from, deep_head);
+            int rem = qjs_deep_step_c(g_deep_ctx, maxN, deep_from);
             printf("@DS {\"rem\":%d,\"cur\":%d,\"dnfThrew\":%d,\"dnfRet\":%d,\"head\":%d,\"gsDrv\":%d,\"gsRecv\":%d,\"gsDrn\":%d,\"recvThr\":%d,\"recvExcK\":%d,\"recvExcMsg\":\"%s\",\"synCol\":%d,\"synAsn\":%d}\n",
-                   rem, qjs_deep_cursor_c(), qjs_deep_dnf_threw_c(), qjs_deep_dnf_ret_c(), deep_head,
+                   rem, qjs_deep_cursor_c(), qjs_deep_dnf_threw_c(), qjs_deep_dnf_ret_c(), 0,
                    qjs_deep_gen_susp_drv_c(), qjs_deep_gen_susp_recv_c(), qjs_deep_gen_susp_drained_c(), qjs_deep_recv_thr_c(), qjs_deep_recv_exc_kind_c(), qjs_deep_recv_exc_msg_c(), qjs_deep_syn_col_c(), qjs_deep_syn_asn_c());
             fflush(stdout);
             return 0;
