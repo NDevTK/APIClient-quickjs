@@ -386,7 +386,7 @@ static JSClassID qjs_opq_cid;
 static JSRuntime *qjs_opq_rt = NULL;   /* runtime the opaque class is registered in */
 static void qjs_opq_fin(JSRuntime *rt, JSValue v) {
     qjs_opq *o = JS_GetOpaque(v, qjs_opq_cid);
-    if (o) { qjs_t_free(o->term); }   /* o + label + shape are COW-pool (qjs_cow_palloc), recycled at grind teardown, never dlmalloc-freed -> no flow-boundary straddle */
+    if (o) { qjs_t_free(o->term); free(o->label); free(o->shape); free(o); }
 }
 static qjs_opq *qjs_opq_of(JSValueConst v) {
     if (!JS_IsObject(v)) return NULL;
@@ -421,22 +421,24 @@ static JSValue qjs_opq_make(JSContext *ctx, int flavor, const char *label, qjs_t
     }
     JSValue v = JS_NewObjectClass(ctx, qjs_opq_cid);
     if (JS_IsException(v)) { qjs_t_free(term); return v; }
-    qjs_opq *o = (qjs_opq *)qjs_cow_palloc(sizeof(*o)); if (o) memset(o, 0, sizeof(*o));
+    qjs_opq *o = calloc(1, sizeof(*o));
     if (!o) { qjs_t_free(term); JS_FreeValue(ctx, v); return JS_ThrowOutOfMemory(ctx); }
     o->flavor = flavor;
-    if (label && label[0]) { o->label = (char *)qjs_cow_palloc(strlen(label) + 1); if (o->label) strcpy(o->label, label); }
+    if (label && label[0]) { o->label = malloc(strlen(label) + 1); if (o->label) strcpy(o->label, label); }
     o->term = term;
     JS_SetOpaque(v, o);
     return v;
 }
 /* Attach the rendered concrete-keyed JSON shape to an opaque (see
-   JS_JSONStringify's seen_term path). o->shape is COW-pool memory
-   (qjs_cow_palloc), like o + o->label -- never dlmalloc-freed, so it cannot
-   straddle a flow boundary into the per-flow revert. */
+   JS_JSONStringify's seen_term path). Defined here, BEFORE the js_malloc
+   forbidden-macro poison (quickjs.c ~line 4034), so it uses the real libc
+   allocator that qjs_opq_fin's free(o->shape) matches; the stringify capture
+   site is past the poison and cannot call malloc directly. */
 static void qjs_opq_set_shape(JSValueConst v, const char *s) {
     qjs_opq *o = qjs_opq_of(v);
     if (!o || !s) return;
-    o->shape = (char *)qjs_cow_palloc(strlen(s) + 1);   /* old shape is pool (leak, bounded per-grind); never dlmalloc-freed */
+    free(o->shape);
+    o->shape = malloc(strlen(s) + 1);
     if (o->shape) strcpy(o->shape, s);
 }
 static JSValue qjs_opaque_new(JSContext *ctx) { return qjs_opq_make(ctx, 0, NULL, qjs_t_opaque()); }
