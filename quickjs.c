@@ -291,6 +291,7 @@ static int qjs_leaf_id(const char *label) {
     }
     return qjs_leaf_append(L);
 }
+static qjs_term *g_term_free;   /* free-list of recycled qjs_term structs (next reuses ->a); declared before qjs_t_free which recycles into it */
 static qjs_term *qjs_t_ref(qjs_term *t) { if (t) t->ref++; return t; }
 static void qjs_t_free(qjs_term *t) {
     if (!t || --t->ref > 0) return;
@@ -310,14 +311,14 @@ static void qjs_t_free(qjs_term *t) {
         qjs_term *kid[2]; int nk = 0;
         if (t->a && --t->a->ref <= 0) kid[nk++] = t->a;
         if (t->b && --t->b->ref <= 0) kid[nk++] = t->b;
-        free(t->s); free(t->ex); free(t);
+        { int _fsv = g_cow_busy; g_cow_busy = 1; t->a = g_term_free; g_term_free = t; g_cow_busy = _fsv; }   /* recycle struct (s/ex are pool, not freed) */
         for (int i = 0; i < nk; i++) {
             if (top == cap) {
                 size_t nc = cap * 2;
                 qjs_term **ns = (stk == inl) ? (qjs_term **)malloc(nc * sizeof *ns)
                                              : (qjs_term **)realloc(stk, nc * sizeof *ns);
-                if (!ns) {   /* OOM (rare): free this node shallow, leak its kids — beats a crash */
-                    qjs_term *c = kid[i]; free(c->s); free(c->ex); free(c); continue;
+                if (!ns) {   /* OOM (rare): recycle this node shallow, leak its kids — beats a crash */
+                    qjs_term *c = kid[i]; int _osv = g_cow_busy; g_cow_busy = 1; c->a = g_term_free; g_term_free = c; g_cow_busy = _osv; continue;
                 }
                 if (stk == inl) memcpy(ns, inl, top * sizeof *ns);
                 stk = ns; cap = nc;
@@ -329,20 +330,30 @@ static void qjs_t_free(qjs_term *t) {
     }
     if (stk != inl) free(stk);
 }
+/* qjs_term + its strings live in the COW persistent pool (qjs_cow_palloc), like the leaf
+   table: the STRUCT MEMORY is recycled buffer (a g_term_free free-list, managed under
+   g_cow_busy so it never touches dlmalloc's free-list -> no flow-boundary straddle that a
+   per-flow revert would corrupt into the cold-orphan OOB). The term's FIELD CONTENT
+   (ref/a/b/leaf/...) stays logged+reverted by the COW -- correct, it IS flow state. */
 static qjs_term *qjs_t_alloc(char op) {
-    qjs_term *t = calloc(1, sizeof *t); if (!t) return NULL;
+    int _sv = g_cow_busy; g_cow_busy = 1;
+    qjs_term *t = g_term_free;
+    if (t) g_term_free = t->a; else t = (qjs_term *)qjs_cow_palloc(sizeof *t);
+    g_cow_busy = _sv;
+    if (!t) return NULL;
+    memset(t, 0, sizeof *t);
     t->ref = 1; t->op = op; return t;
 }
 static qjs_term *qjs_t_leaf(const char *label) {
     qjs_term *t = qjs_t_alloc('L'); if (!t) return NULL;
     const char *L = (label && label[0]) ? label : "?";
-    size_t n = strlen(L) + 1; t->s = malloc(n); if (t->s) memcpy(t->s, L, n);
+    size_t n = strlen(L) + 1; t->s = (char *)qjs_cow_palloc(n); if (t->s) memcpy(t->s, L, n);
     t->leaf = qjs_leaf_id(L);
     return t;
 }
 static qjs_term *qjs_t_kstr(const char *v) {
     qjs_term *t = qjs_t_alloc('K'); if (!t) return NULL;
-    size_t n = strlen(v ? v : "") + 1; t->s = malloc(n); if (t->s) memcpy(t->s, v ? v : "", n);
+    size_t n = strlen(v ? v : "") + 1; t->s = (char *)qjs_cow_palloc(n); if (t->s) memcpy(t->s, v ? v : "", n);
     return t;
 }
 static qjs_term *qjs_t_knum(double v) {
@@ -359,14 +370,14 @@ static qjs_term *qjs_t_cmp(char op, qjs_term *a, qjs_term *b) {
    precise Z3 query (str.len, etc.) instead of a free var. */
 static qjs_term *qjs_t_member(const char *name, qjs_term *base) {
     qjs_term *t = qjs_t_alloc('M'); if (!t) { qjs_t_free(base); return NULL; }
-    if (name) { size_t n = strlen(name) + 1; t->s = malloc(n); if (t->s) memcpy(t->s, name, n); }
+    if (name) { size_t n = strlen(name) + 1; t->s = (char *)qjs_cow_palloc(n); if (t->s) memcpy(t->s, name, n); }
     t->a = base; return t;
 }
 /* Method-call term: x.startsWith(arg), x.indexOf(arg), …. `name` is
    the method name extracted from the callee's MEMBER term. */
 static qjs_term *qjs_t_call(const char *name, qjs_term *base, qjs_term *arg) {
     qjs_term *t = qjs_t_alloc('F'); if (!t) { qjs_t_free(base); qjs_t_free(arg); return NULL; }
-    if (name) { size_t n = strlen(name) + 1; t->s = malloc(n); if (t->s) memcpy(t->s, name, n); }
+    if (name) { size_t n = strlen(name) + 1; t->s = (char *)qjs_cow_palloc(n); if (t->s) memcpy(t->s, name, n); }
     t->a = base; t->b = arg; return t;
 }
 
@@ -375,7 +386,7 @@ static JSClassID qjs_opq_cid;
 static JSRuntime *qjs_opq_rt = NULL;   /* runtime the opaque class is registered in */
 static void qjs_opq_fin(JSRuntime *rt, JSValue v) {
     qjs_opq *o = JS_GetOpaque(v, qjs_opq_cid);
-    if (o) { qjs_t_free(o->term); free(o->label); free(o->shape); free(o); }
+    if (o) { qjs_t_free(o->term); }   /* o + label + shape are COW-pool (qjs_cow_palloc), recycled at grind teardown, never dlmalloc-freed -> no flow-boundary straddle */
 }
 static qjs_opq *qjs_opq_of(JSValueConst v) {
     if (!JS_IsObject(v)) return NULL;
@@ -410,24 +421,22 @@ static JSValue qjs_opq_make(JSContext *ctx, int flavor, const char *label, qjs_t
     }
     JSValue v = JS_NewObjectClass(ctx, qjs_opq_cid);
     if (JS_IsException(v)) { qjs_t_free(term); return v; }
-    qjs_opq *o = calloc(1, sizeof(*o));
+    qjs_opq *o = (qjs_opq *)qjs_cow_palloc(sizeof(*o)); if (o) memset(o, 0, sizeof(*o));
     if (!o) { qjs_t_free(term); JS_FreeValue(ctx, v); return JS_ThrowOutOfMemory(ctx); }
     o->flavor = flavor;
-    if (label && label[0]) { o->label = malloc(strlen(label) + 1); if (o->label) strcpy(o->label, label); }
+    if (label && label[0]) { o->label = (char *)qjs_cow_palloc(strlen(label) + 1); if (o->label) strcpy(o->label, label); }
     o->term = term;
     JS_SetOpaque(v, o);
     return v;
 }
 /* Attach the rendered concrete-keyed JSON shape to an opaque (see
-   JS_JSONStringify's seen_term path). Defined here, BEFORE the js_malloc
-   forbidden-macro poison (quickjs.c ~line 4034), so it uses the real libc
-   allocator that qjs_opq_fin's free(o->shape) matches; the stringify capture
-   site is past the poison and cannot call malloc directly. */
+   JS_JSONStringify's seen_term path). o->shape is COW-pool memory
+   (qjs_cow_palloc), like o + o->label -- never dlmalloc-freed, so it cannot
+   straddle a flow boundary into the per-flow revert. */
 static void qjs_opq_set_shape(JSValueConst v, const char *s) {
     qjs_opq *o = qjs_opq_of(v);
     if (!o || !s) return;
-    free(o->shape);
-    o->shape = malloc(strlen(s) + 1);
+    o->shape = (char *)qjs_cow_palloc(strlen(s) + 1);   /* old shape is pool (leak, bounded per-grind); never dlmalloc-freed */
     if (o->shape) strcpy(o->shape, s);
 }
 static JSValue qjs_opaque_new(JSContext *ctx) { return qjs_opq_make(ctx, 0, NULL, qjs_t_opaque()); }
@@ -1756,7 +1765,7 @@ static JSValue js_make_opaque(JSContext *ctx, JSValueConst this_val,
                surface the per-param example there too. */
             qjs_opq *_o = qjs_opq_of(r);
             if (_o && _o->term && _o->term->op == 'L' && !_o->term->ex) {
-                size_t _n = strlen(ex) + 1; _o->term->ex = malloc(_n);
+                size_t _n = strlen(ex) + 1; _o->term->ex = (char *)qjs_cow_palloc(_n);
                 if (_o->term->ex) memcpy(_o->term->ex, ex, _n);
             }
             JS_FreeCString(ctx, ex);
