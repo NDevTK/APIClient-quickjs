@@ -20336,6 +20336,18 @@ static long g_cow_saved = 0, g_cow_commits = 0, g_cow_discards = 0, g_cow_captur
 typedef struct JSCowBlk { struct JSCowBlk *next; size_t sz, used; } JSCowBlk;   /* page data follows the header */
 static JSCowBlk *g_cow_blk0 = NULL, *g_cow_blk = NULL;   /* list head + current bump block */
 static JSRuntime *g_cow_rt = NULL;
+/* COW METADATA SOUNDNESS RULE (hard-won — the qjs_term free-list violated it and the reverted
+   commit's comment wrongly called it a "clean fit"): any engine metadata mutated during a flow
+   must be EITHER
+     (a) ENTIRELY-PERSISTENT + APPEND-ONLY  — every mutation under g_cow_busy, never logged,
+         never reverted, ids stable (this pool; the leaf table). A discard leaves it untouched, OR
+     (b) PER-FLOW-RESET — bumped above the live heap and reset on discard (the alloc arena, TODO).
+   The FATAL middle is a SPLIT: a structure whose head/allocator escapes the undo-log (unlogged,
+   under g_cow_busy) while its links/content are logged and reverted. After a flow allocs a node,
+   frees it (persistent head now points at the node), and discards, the node's link reverts to
+   pre-alloc garbage -> the next allocator walk follows a wild pointer -> OOB. dlmalloc's own
+   allocator-state-reverted-during-forks (the fork-snapshot residual) is the SAME split bug, which
+   is why the per-flow arena (b) is the single fix for BOTH term reclaim and the fork-snapshot. */
 static void *qjs_cow_palloc(size_t n) {
     if (!g_cow_rt) return NULL;   /* g_cow_rt is set at JS_NewRuntime2 (both builds), before any leaf/delta alloc -> unreachable in practice; a NULL here just fails the alloc gracefully rather than deref a null rt. */
     n = (n + 15) & ~(size_t)15;
