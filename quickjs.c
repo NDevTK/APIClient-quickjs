@@ -291,7 +291,6 @@ static int qjs_leaf_id(const char *label) {
     }
     return qjs_leaf_append(L);
 }
-static qjs_term *g_term_free;   /* free-list of recycled qjs_term structs (next reuses ->a); declared before qjs_t_free which recycles into it */
 static qjs_term *qjs_t_ref(qjs_term *t) { if (t) t->ref++; return t; }
 static void qjs_t_free(qjs_term *t) {
     if (!t || --t->ref > 0) return;
@@ -311,14 +310,14 @@ static void qjs_t_free(qjs_term *t) {
         qjs_term *kid[2]; int nk = 0;
         if (t->a && --t->a->ref <= 0) kid[nk++] = t->a;
         if (t->b && --t->b->ref <= 0) kid[nk++] = t->b;
-        { int _fsv = g_cow_busy; g_cow_busy = 1; t->a = g_term_free; g_term_free = t; g_cow_busy = _fsv; }   /* recycle struct (s/ex are pool, not freed) */
+        free(t->s); free(t->ex); free(t);
         for (int i = 0; i < nk; i++) {
             if (top == cap) {
                 size_t nc = cap * 2;
                 qjs_term **ns = (stk == inl) ? (qjs_term **)malloc(nc * sizeof *ns)
                                              : (qjs_term **)realloc(stk, nc * sizeof *ns);
-                if (!ns) {   /* OOM (rare): recycle this node shallow, leak its kids — beats a crash */
-                    qjs_term *c = kid[i]; int _osv = g_cow_busy; g_cow_busy = 1; c->a = g_term_free; g_term_free = c; g_cow_busy = _osv; continue;
+                if (!ns) {   /* OOM (rare): free this node shallow, leak its kids — beats a crash */
+                    qjs_term *c = kid[i]; free(c->s); free(c->ex); free(c); continue;
                 }
                 if (stk == inl) memcpy(ns, inl, top * sizeof *ns);
                 stk = ns; cap = nc;
@@ -330,30 +329,20 @@ static void qjs_t_free(qjs_term *t) {
     }
     if (stk != inl) free(stk);
 }
-/* qjs_term + its strings live in the COW persistent pool (qjs_cow_palloc), like the leaf
-   table: the STRUCT MEMORY is recycled buffer (a g_term_free free-list, managed under
-   g_cow_busy so it never touches dlmalloc's free-list -> no flow-boundary straddle that a
-   per-flow revert would corrupt into the cold-orphan OOB). The term's FIELD CONTENT
-   (ref/a/b/leaf/...) stays logged+reverted by the COW -- correct, it IS flow state. */
 static qjs_term *qjs_t_alloc(char op) {
-    int _sv = g_cow_busy; g_cow_busy = 1;
-    qjs_term *t = g_term_free;
-    if (t) g_term_free = t->a; else t = (qjs_term *)qjs_cow_palloc(sizeof *t);
-    g_cow_busy = _sv;
-    if (!t) return NULL;
-    memset(t, 0, sizeof *t);
+    qjs_term *t = calloc(1, sizeof *t); if (!t) return NULL;
     t->ref = 1; t->op = op; return t;
 }
 static qjs_term *qjs_t_leaf(const char *label) {
     qjs_term *t = qjs_t_alloc('L'); if (!t) return NULL;
     const char *L = (label && label[0]) ? label : "?";
-    size_t n = strlen(L) + 1; t->s = (char *)qjs_cow_palloc(n); if (t->s) memcpy(t->s, L, n);
+    size_t n = strlen(L) + 1; t->s = malloc(n); if (t->s) memcpy(t->s, L, n);
     t->leaf = qjs_leaf_id(L);
     return t;
 }
 static qjs_term *qjs_t_kstr(const char *v) {
     qjs_term *t = qjs_t_alloc('K'); if (!t) return NULL;
-    size_t n = strlen(v ? v : "") + 1; t->s = (char *)qjs_cow_palloc(n); if (t->s) memcpy(t->s, v ? v : "", n);
+    size_t n = strlen(v ? v : "") + 1; t->s = malloc(n); if (t->s) memcpy(t->s, v ? v : "", n);
     return t;
 }
 static qjs_term *qjs_t_knum(double v) {
@@ -370,14 +359,14 @@ static qjs_term *qjs_t_cmp(char op, qjs_term *a, qjs_term *b) {
    precise Z3 query (str.len, etc.) instead of a free var. */
 static qjs_term *qjs_t_member(const char *name, qjs_term *base) {
     qjs_term *t = qjs_t_alloc('M'); if (!t) { qjs_t_free(base); return NULL; }
-    if (name) { size_t n = strlen(name) + 1; t->s = (char *)qjs_cow_palloc(n); if (t->s) memcpy(t->s, name, n); }
+    if (name) { size_t n = strlen(name) + 1; t->s = malloc(n); if (t->s) memcpy(t->s, name, n); }
     t->a = base; return t;
 }
 /* Method-call term: x.startsWith(arg), x.indexOf(arg), …. `name` is
    the method name extracted from the callee's MEMBER term. */
 static qjs_term *qjs_t_call(const char *name, qjs_term *base, qjs_term *arg) {
     qjs_term *t = qjs_t_alloc('F'); if (!t) { qjs_t_free(base); qjs_t_free(arg); return NULL; }
-    if (name) { size_t n = strlen(name) + 1; t->s = (char *)qjs_cow_palloc(n); if (t->s) memcpy(t->s, name, n); }
+    if (name) { size_t n = strlen(name) + 1; t->s = malloc(n); if (t->s) memcpy(t->s, name, n); }
     t->a = base; t->b = arg; return t;
 }
 
@@ -1767,7 +1756,7 @@ static JSValue js_make_opaque(JSContext *ctx, JSValueConst this_val,
                surface the per-param example there too. */
             qjs_opq *_o = qjs_opq_of(r);
             if (_o && _o->term && _o->term->op == 'L' && !_o->term->ex) {
-                size_t _n = strlen(ex) + 1; _o->term->ex = (char *)qjs_cow_palloc(_n);
+                size_t _n = strlen(ex) + 1; _o->term->ex = malloc(_n);
                 if (_o->term->ex) memcpy(_o->term->ex, ex, _n);
             }
             JS_FreeCString(ctx, ex);
