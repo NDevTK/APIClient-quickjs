@@ -291,6 +291,20 @@ static int qjs_leaf_id(const char *label) {
     }
     return qjs_leaf_append(L);
 }
+/* The opaque/taint term graph (qjs_term) and opaque metadata (qjs_opq) are allocated DURING
+   forced drives (g_flow_capture / g_grind_drive_active). Raw libc malloc/free here mutated dlmalloc
+   gm while the COW barrier reverted their chunk headers above __heap_base -> free-list desync -> the
+   emscripten_builtin_malloc OOB (symbolized: qjs_t_leaf->calloc) that recycled the worker. Route
+   them through the SAME flow-aware allocator the bundle heap uses (arena during a flow, no-op free)
+   so neither level touches gm. ONE allocator policy. (Defs ~4372; fwd-declared here.) */
+static void *js_def_calloc(void *opaque, size_t count, size_t size);
+static void *js_def_malloc(void *opaque, size_t size);
+static void js_def_free(void *opaque, void *ptr);
+static void *js_def_realloc(void *opaque, void *ptr, size_t size);
+#define qjs_tm(sz)        js_def_malloc(NULL, (sz))
+#define qjs_tc(sz)        js_def_calloc(NULL, 1, (sz))
+#define qjs_tf(p)         js_def_free(NULL, (p))
+#define qjs_tr(p, sz)     js_def_realloc(NULL, (p), (sz))
 static qjs_term *qjs_t_ref(qjs_term *t) { if (t) t->ref++; return t; }
 static void qjs_t_free(qjs_term *t) {
     if (!t || --t->ref > 0) return;
@@ -310,14 +324,14 @@ static void qjs_t_free(qjs_term *t) {
         qjs_term *kid[2]; int nk = 0;
         if (t->a && --t->a->ref <= 0) kid[nk++] = t->a;
         if (t->b && --t->b->ref <= 0) kid[nk++] = t->b;
-        free(t->s); free(t->ex); free(t);
+        qjs_tf(t->s); qjs_tf(t->ex); qjs_tf(t);
         for (int i = 0; i < nk; i++) {
             if (top == cap) {
                 size_t nc = cap * 2;
-                qjs_term **ns = (stk == inl) ? (qjs_term **)malloc(nc * sizeof *ns)
-                                             : (qjs_term **)realloc(stk, nc * sizeof *ns);
+                qjs_term **ns = (stk == inl) ? (qjs_term **)qjs_tm(nc * sizeof *ns)
+                                             : (qjs_term **)qjs_tr(stk, nc * sizeof *ns);
                 if (!ns) {   /* OOM (rare): free this node shallow, leak its kids — beats a crash */
-                    qjs_term *c = kid[i]; free(c->s); free(c->ex); free(c); continue;
+                    qjs_term *c = kid[i]; qjs_tf(c->s); qjs_tf(c->ex); qjs_tf(c); continue;
                 }
                 if (stk == inl) memcpy(ns, inl, top * sizeof *ns);
                 stk = ns; cap = nc;
@@ -327,22 +341,22 @@ static void qjs_t_free(qjs_term *t) {
         if (top == 0) break;
         t = stk[--top];
     }
-    if (stk != inl) free(stk);
+    if (stk != inl) qjs_tf(stk);
 }
 static qjs_term *qjs_t_alloc(char op) {
-    qjs_term *t = calloc(1, sizeof *t); if (!t) return NULL;
+    qjs_term *t = qjs_tc(sizeof *t); if (!t) return NULL;
     t->ref = 1; t->op = op; return t;
 }
 static qjs_term *qjs_t_leaf(const char *label) {
     qjs_term *t = qjs_t_alloc('L'); if (!t) return NULL;
     const char *L = (label && label[0]) ? label : "?";
-    size_t n = strlen(L) + 1; t->s = malloc(n); if (t->s) memcpy(t->s, L, n);
+    size_t n = strlen(L) + 1; t->s = qjs_tm(n); if (t->s) memcpy(t->s, L, n);
     t->leaf = qjs_leaf_id(L);
     return t;
 }
 static qjs_term *qjs_t_kstr(const char *v) {
     qjs_term *t = qjs_t_alloc('K'); if (!t) return NULL;
-    size_t n = strlen(v ? v : "") + 1; t->s = malloc(n); if (t->s) memcpy(t->s, v ? v : "", n);
+    size_t n = strlen(v ? v : "") + 1; t->s = qjs_tm(n); if (t->s) memcpy(t->s, v ? v : "", n);
     return t;
 }
 static qjs_term *qjs_t_knum(double v) {
@@ -359,14 +373,14 @@ static qjs_term *qjs_t_cmp(char op, qjs_term *a, qjs_term *b) {
    precise Z3 query (str.len, etc.) instead of a free var. */
 static qjs_term *qjs_t_member(const char *name, qjs_term *base) {
     qjs_term *t = qjs_t_alloc('M'); if (!t) { qjs_t_free(base); return NULL; }
-    if (name) { size_t n = strlen(name) + 1; t->s = malloc(n); if (t->s) memcpy(t->s, name, n); }
+    if (name) { size_t n = strlen(name) + 1; t->s = qjs_tm(n); if (t->s) memcpy(t->s, name, n); }
     t->a = base; return t;
 }
 /* Method-call term: x.startsWith(arg), x.indexOf(arg), …. `name` is
    the method name extracted from the callee's MEMBER term. */
 static qjs_term *qjs_t_call(const char *name, qjs_term *base, qjs_term *arg) {
     qjs_term *t = qjs_t_alloc('F'); if (!t) { qjs_t_free(base); qjs_t_free(arg); return NULL; }
-    if (name) { size_t n = strlen(name) + 1; t->s = malloc(n); if (t->s) memcpy(t->s, name, n); }
+    if (name) { size_t n = strlen(name) + 1; t->s = qjs_tm(n); if (t->s) memcpy(t->s, name, n); }
     t->a = base; t->b = arg; return t;
 }
 
@@ -375,7 +389,7 @@ static JSClassID qjs_opq_cid;
 static JSRuntime *qjs_opq_rt = NULL;   /* runtime the opaque class is registered in */
 static void qjs_opq_fin(JSRuntime *rt, JSValue v) {
     qjs_opq *o = JS_GetOpaque(v, qjs_opq_cid);
-    if (o) { qjs_t_free(o->term); free(o->label); free(o->shape); free(o); }
+    if (o) { qjs_t_free(o->term); qjs_tf(o->label); qjs_tf(o->shape); qjs_tf(o); }
 }
 static qjs_opq *qjs_opq_of(JSValueConst v) {
     if (!JS_IsObject(v)) return NULL;
@@ -410,10 +424,10 @@ static JSValue qjs_opq_make(JSContext *ctx, int flavor, const char *label, qjs_t
     }
     JSValue v = JS_NewObjectClass(ctx, qjs_opq_cid);
     if (JS_IsException(v)) { qjs_t_free(term); return v; }
-    qjs_opq *o = calloc(1, sizeof(*o));
+    qjs_opq *o = qjs_tc(sizeof(*o));
     if (!o) { qjs_t_free(term); JS_FreeValue(ctx, v); return JS_ThrowOutOfMemory(ctx); }
     o->flavor = flavor;
-    if (label && label[0]) { o->label = malloc(strlen(label) + 1); if (o->label) strcpy(o->label, label); }
+    if (label && label[0]) { o->label = qjs_tm(strlen(label) + 1); if (o->label) strcpy(o->label, label); }
     o->term = term;
     JS_SetOpaque(v, o);
     return v;
@@ -426,8 +440,8 @@ static JSValue qjs_opq_make(JSContext *ctx, int flavor, const char *label, qjs_t
 static void qjs_opq_set_shape(JSValueConst v, const char *s) {
     qjs_opq *o = qjs_opq_of(v);
     if (!o || !s) return;
-    free(o->shape);
-    o->shape = malloc(strlen(s) + 1);
+    qjs_tf(o->shape);
+    o->shape = qjs_tm(strlen(s) + 1);
     if (o->shape) strcpy(o->shape, s);
 }
 static JSValue qjs_opaque_new(JSContext *ctx) { return qjs_opq_make(ctx, 0, NULL, qjs_t_opaque()); }
@@ -619,14 +633,22 @@ static void qjs_pc_push(qjs_term *t, int dec) {
     for (int i = 0; i < qjs_pc_n; i++) {
         if (qjs_pc_t[i] == t) return;
     }
+    /* Region-3 (persistent engine metadata): the pin-table is grown + written DURING flows but
+       managed by qjs_pc_reset (per forced-run), NOT the per-flow revert. Allocate from the COW pool
+       with the barrier suppressed (g_cow_busy) so neither the array's gm chunk-header NOR its contents
+       enter the revertable delta — the documented qjs_t_leaf gm-desync (line ~250) for the pin-table. */
+    int _sv = g_cow_busy; g_cow_busy = 1;
     if (qjs_pc_n == qjs_pc_cap) {
         int nc = qjs_pc_cap ? qjs_pc_cap * 2 : 16;
-        qjs_term **nt = realloc(qjs_pc_t, nc * sizeof *nt);
-        int *nd = realloc(qjs_pc_d, nc * sizeof *nd);
-        if (!nt || !nd) { free(nt); free(nd); return; }
+        qjs_term **nt = (qjs_term **)qjs_cow_palloc((size_t)nc * sizeof *nt);   /* grow: new pool array, copy, abandon old (pool never frees -> gm untouched) */
+        int *nd = (int *)qjs_cow_palloc((size_t)nc * sizeof *nd);
+        if (!nt || !nd) { g_cow_busy = _sv; return; }
+        if (qjs_pc_t) memcpy(nt, qjs_pc_t, (size_t)qjs_pc_n * sizeof *nt);
+        if (qjs_pc_d) memcpy(nd, qjs_pc_d, (size_t)qjs_pc_n * sizeof *nd);
         qjs_pc_t = nt; qjs_pc_d = nd; qjs_pc_cap = nc;
     }
     qjs_pc_t[qjs_pc_n] = qjs_t_ref(t); qjs_pc_d[qjs_pc_n] = dec; qjs_pc_n++;
+    g_cow_busy = _sv;
 }
 
 /* Term serializer (Lisp-y; small, deterministic, easy to ingest).
@@ -636,7 +658,7 @@ typedef struct { char *p; size_t n, cap; } qjs_sb;
 static void qjs_sb_putc(qjs_sb *b, int c) {
     if (b->n + 1 >= b->cap) {
         size_t nc = b->cap ? b->cap * 2 : 64;
-        char *np = realloc(b->p, nc); if (!np) return; b->p = np; b->cap = nc;
+        char *np = qjs_tr(b->p, nc); if (!np) return; b->p = np; b->cap = nc;
     }
     b->p[b->n++] = (char)c;
 }
@@ -646,9 +668,9 @@ static void qjs_sb_printf(qjs_sb *b, const char *fmt, ...) {
     int n = vsnprintf(small, sizeof small, fmt, ap); va_end(ap);
     if (n < 0) return;
     if ((size_t)n < sizeof small) { qjs_sb_puts(b, small); return; }
-    char *big = malloc((size_t)n + 1); if (!big) return;
+    char *big = qjs_tm((size_t)n + 1); if (!big) return;
     va_start(ap, fmt); vsnprintf(big, (size_t)n + 1, fmt, ap); va_end(ap);
-    qjs_sb_puts(b, big); free(big);
+    qjs_sb_puts(b, big); qjs_tf(big);
 }
 /* Iterative — was recursive on ->a/->b like qjs_t_free, so the same deep-chain
    C-stack overflow could trap it on a security sink that builds a long concat/op
@@ -660,8 +682,8 @@ static void qjs_sb_term0(qjs_sb *b, qjs_term *root) {
     struct sbti inl[128], *stk = inl; size_t top = 0, cap = 128;
 #define QJS_SBT_PUSH(T, P) do { \
         if (top == cap) { size_t nc = cap * 2; \
-            struct sbti *ns = (stk == inl) ? (struct sbti *)malloc(nc * sizeof *ns) \
-                                           : (struct sbti *)realloc(stk, nc * sizeof *ns); \
+            struct sbti *ns = (stk == inl) ? (struct sbti *)qjs_tm(nc * sizeof *ns) \
+                                           : (struct sbti *)qjs_tr(stk, nc * sizeof *ns); \
             if (!ns) break; \
             if (stk == inl) memcpy(ns, inl, top * sizeof *ns); \
             stk = ns; cap = nc; } \
@@ -704,7 +726,7 @@ static void qjs_sb_term0(qjs_sb *b, qjs_term *root) {
             break;
         }
     }
-    if (stk != inl) free(stk);
+    if (stk != inl) qjs_tf(stk);
 #undef QJS_SBT_PUSH
 }
 static void qjs_sb_pc(qjs_sb *b) {
@@ -716,7 +738,7 @@ static void qjs_sb_pc(qjs_sb *b) {
     }
     qjs_sb_putc(b, ']');
 }
-static void qjs_sb_free(qjs_sb *b) { free(b->p); b->p = NULL; b->n = b->cap = 0; }
+static void qjs_sb_free(qjs_sb *b) { qjs_tf(b->p); b->p = NULL; b->n = b->cap = 0; }
 
 /* ---- Z3 SMT solver for @S security path-satisfiability (NOT value
    resolution — API values stay assumed/forked/structural). For each
@@ -3426,6 +3448,7 @@ static JSAsyncFunctionData *js_async_function_setup(JSContext *ctx, JSValueConst
 static JSStackFrame *qjs_gen_tramp_entry(JSContext *ctx, JSValueConst this_val, JSValueConst callee, JSValueConst arg);   /* #6: if callee is a generator's .next() on a SUSPENDED generator, set up its body for resume + return the body frame to switch the loop into; else NULL (defined with the generator machinery) */
 static JSValue qjs_gen_tramp_settle(JSContext *ctx, void *gen_data, JSValue func_ret);   /* #6: settle a trampolined generator body at done_generator -> the {value,done} iterator-result spliced to the caller */
 static void qjs_drive_opaque_call_cbs(JSContext *ctx, JSValueConst *call_argv, int call_argc);
+static int qjs_is_host_model_file(JSAtom filename);   /* fwd: the per-path COW fork (JS_CallInternal) checks if the caller is our shim vs a bundle fn */
 static JSValue JS_CallConstructorInternal(JSContext *ctx,
                                           JSValueConst func_obj,
                                           JSValueConst new_target,
@@ -4347,23 +4370,89 @@ int JS_AddRuntimeFinalizer(JSRuntime *rt, JSRuntimeFinalizer *finalizer,
     return 0;
 }
 
+/* Per-flow allocation arena (#7). While a force-invoke is captured (g_flow_capture), its
+   js_malloc allocations bump from THIS arena, NOT the general allocator. ROOT (symbolized:
+   emscripten_builtin_malloc OOB): the COW heap-revert restores chunk metadata ABOVE __heap_base
+   but cannot restore dlmalloc's mstate (gm) in .bss BELOW __heap_base, so a flow that malloc'd via
+   the general allocator desynced it -> the next malloc walked a bad free-list pointer -> OOB trap.
+   Routing flow allocations here keeps the general allocator UNTOUCHED by flows; the arena is
+   excluded from the COW barrier and bump-RESET at FLOWEND (the flow's objects are discarded, and
+   their references — stored in baseline objects above hb — are reverted by the word-log). Size-
+   prefixed (16B header) so realloc knows the old size. Overflow -> general allocator (rare). */
+static int g_flow_capture;   /* fwd (def in the COW section ~20582); gates arena routing */
+static volatile int g_cow_busy;   /* fwd (def ~20651): set => the COW barrier does NOT log — used to keep dlmalloc's gm metadata writes out of the per-flow delta */
+/* g_grind_drive_active (fwd-declared ~line 84) gates arena routing TOO: the grind's orphan drive is
+   the SAME flow primitive at the depth level — it must alloc from the arena, NOT gm, or its chunk-
+   header writes get COW-reverted -> gm desync -> OOB (the deep_recycle wasm_trap). ONE policy, both levels. */
+/* Rare big-alloc fallback (a single alloc larger than one arena chunk): g_cow_busy keeps dlmalloc's
+   gm metadata OUT of the revertable delta so it can't desync gm. The block leaks until... never, but
+   single >chunk allocations during a flow are vanishingly rare; the GROWABLE arena below handles all
+   normal allocation without ever touching gm. */
+static void *flow_fallback_malloc(size_t size) {
+    int sv = g_cow_busy; g_cow_busy = 1; void *p = malloc(size); g_cow_busy = sv; return p;
+}
+static void *flow_fallback_calloc(size_t count, size_t size) {
+    int sv = g_cow_busy; g_cow_busy = 1; void *p = calloc(count, size); g_cow_busy = sv; return p;
+}
+static void *flow_fallback_realloc(void *ptr, size_t size) {
+    int sv = g_cow_busy; g_cow_busy = 1; void *p = realloc(ptr, size); g_cow_busy = sv; return p;
+}
+static uint8_t *g_flow_arena = NULL;
+static size_t g_flow_arena_cap = 0, g_flow_arena_off = 0;
+/* arena[0, committed) survives flow/orphan resets: a grind orphan that COMMITS (creates a cross-
+   orphan instance) advances this boundary so the instance's arena allocations persist as baseline. */
+static size_t g_flow_arena_committed = 0;
+static void *flow_arena_alloc(size_t size) {
+    size_t need = (size + 16 + 15) & ~(size_t)15;
+    if (!g_flow_arena || need < size || g_flow_arena_off + need > g_flow_arena_cap) return NULL;
+    uint8_t *p = g_flow_arena + g_flow_arena_off; g_flow_arena_off += need;
+    *(size_t *)p = size; return p + 16;
+}
+static int flow_in_arena(const void *ptr) {
+    return g_flow_arena && (const uint8_t *)ptr >= g_flow_arena + 16 && (const uint8_t *)ptr < g_flow_arena + g_flow_arena_cap;
+}
+
 static void *js_def_calloc(void *opaque, size_t count, size_t size)
 {
+    if (g_flow_capture || g_grind_drive_active) {
+        if (count && size <= (size_t)-1 / count) {
+            size_t t = count * size; void *p = flow_arena_alloc(t);
+            if (p) { memset(p, 0, t); return p; }
+        }
+        return flow_fallback_calloc(count, size);   /* arena exhausted -> gm-suppressed libc (no chunk-header revert) */
+    }
     return calloc(count, size);
 }
 
 static void *js_def_malloc(void *opaque, size_t size)
 {
+    if (g_flow_capture || g_grind_drive_active) { void *p = flow_arena_alloc(size); if (p) return p; return flow_fallback_malloc(size); }
     return malloc(size);
 }
 
 static void js_def_free(void *opaque, void *ptr)
 {
+    /* During a flow OR a grind orphan drive, free NOTHING: arena ptrs drop at the reset; baseline
+       ptrs are KEPT (the revert restores their references, so a freed-during-flow object must
+       survive). Neither level mutates the general allocator's free-list (gm) — the desync the
+       per-flow arena alone didn't close (the trap re-appeared after ~6 flows via baseline frees). */
+    if (g_flow_capture || g_grind_drive_active || flow_in_arena(ptr)) return;
     free(ptr);
 }
 
 static void *js_def_realloc(void *opaque, void *ptr, size_t size)
 {
+    if (g_flow_capture || g_grind_drive_active) {
+        if (!ptr) { void *p = flow_arena_alloc(size); return p ? p : flow_fallback_malloc(size); }
+        size_t old = flow_in_arena(ptr) ? *(const size_t *)((const uint8_t *)ptr - 16) : js__malloc_usable_size(ptr);
+        void *np = flow_arena_alloc(size); if (!np) np = flow_fallback_malloc(size);   /* overflow -> gm-suppressed libc */
+        if (np && old) memcpy(np, ptr, old < size ? old : size);
+        return np;   /* old ptr NOT freed: baseline kept (revert), arena dropped (reset) -> gm untouched */
+    }
+    if (flow_in_arena(ptr)) {   /* arena ptr outside a flow (shouldn't occur post-reset): copy to general */
+        size_t old = *(const size_t *)((const uint8_t *)ptr - 16);
+        void *np = flow_fallback_malloc(size); if (np && old) memcpy(np, ptr, old < size ? old : size); return np;
+    }
     return realloc(ptr, size);
 }
 
@@ -4374,6 +4463,37 @@ static const JSMallocFunctions def_malloc_funcs = {
     js_def_realloc,
     js__malloc_usable_size
 };
+
+/* ---- Linker --wrap on the libc allocator (build.mjs: -Wl,--wrap=malloc,calloc,free,realloc) ----
+   EVERY raw malloc/calloc/free/realloc in the linked image — separate libraries (Z3) and any in-tree
+   raw caller alike — routes here. The COW write-barrier reverts dlmalloc's chunk-header / free-list
+   writes (above __heap_base) made DURING a flow but can't restore gm's mstate (below it) -> free-list
+   desync -> the emscripten_builtin_malloc OOB recycle (whack-a-mole: every per-caller fix just moved
+   it to the next raw caller). So during a flow: allocate with the barrier SUPPRESSED (g_cow_busy keeps
+   gm metadata OUT of the revertable delta) and FREE NOTHING (the revert restores references, so a
+   freed-during-flow object must survive). gm is then never desynced by ANY caller. (Known cost: the
+   no-op free leaks flow-time raw allocations until the flow boundary; bounded for normal fixtures,
+   the growable-arena + per-orphan-eviction rewrite is what makes it leak-free for the heavy grind.) */
+extern void *__real_malloc(size_t size);
+extern void *__real_calloc(size_t nmemb, size_t size);
+extern void *__real_realloc(void *ptr, size_t size);
+extern void  __real_free(void *ptr);
+void *__wrap_malloc(size_t size) {
+    if (g_flow_capture || g_grind_drive_active) { int sv = g_cow_busy; g_cow_busy = 1; void *p = __real_malloc(size); g_cow_busy = sv; return p; }
+    return __real_malloc(size);
+}
+void *__wrap_calloc(size_t nmemb, size_t size) {
+    if (g_flow_capture || g_grind_drive_active) { int sv = g_cow_busy; g_cow_busy = 1; void *p = __real_calloc(nmemb, size); g_cow_busy = sv; return p; }
+    return __real_calloc(nmemb, size);
+}
+void *__wrap_realloc(void *ptr, size_t size) {
+    if (g_flow_capture || g_grind_drive_active) { int sv = g_cow_busy; g_cow_busy = 1; void *p = __real_realloc(ptr, size); g_cow_busy = sv; return p; }
+    return __real_realloc(ptr, size);
+}
+void __wrap_free(void *ptr) {
+    if (g_flow_capture || g_grind_drive_active) return;   /* no-op during flows: never mutate gm's free-list; the block survives (the revert restores references to it) */
+    __real_free(ptr);
+}
 
 JSRuntime *JS_NewRuntime(void)
 {
@@ -4972,6 +5092,40 @@ static inline void set_value(JSContext *ctx, JSValue *pval, JSValue new_val)
     old_val = *pval;
     *pval = new_val;
     JS_FreeValue(ctx, old_val);
+}
+
+/* SEMANTIC COW capture (fwd-decls; defs later in the COW section). The cross-function
+   influence — one function writes a closure cell / global that another branches on — lives
+   at the var_ref/global write opcodes, NOT at every wasm store. Capturing HERE is sparse and
+   yields-able where the per-store barrier was not. */
+static int g_flow_capture;   /* fwd (def ~20563): a BFS force-invoke flow is capturing */
+void qjs_cow_undo_log(size_t addr, size_t size);   /* fwd (def ~20565; export attr on the def) */
+/* cow_set_value: set_value at a SHARED-SCOPE slot (closure var_ref / global). While a flow is
+   capturing, record the slot's old value to the COW undo-log so the per-flow revert restores it.
+   Old intentionally not freed while capturing (revert restores it; refcount-exact capture +
+   commit-time free is the next brick) — this isolates the YIELDS-ABILITY question from refcount
+   correctness. Locals/args keep plain set_value: per-call, never shared. */
+static int g_cow_force_log;   /* fwd (def in COW section): cow_set_value sets it so the barrier captures a shared-scope slot even when it physically lives in an excluded value-stack chunk */
+static int g_flow_depth;      /* # of nested live flows (qjs_flow_arm/revert) */
+static void qjs_cow_vt_push(JSValue *slot, JSValue old);   /* fwd (def in COW section): typed-trail record for refcount-exact heap-fork backtrack */
+static inline void cow_set_value(JSContext *ctx, JSValue *pval, JSValue new_val) {
+    if (g_flow_capture || g_grind_drive_active) {
+        /* TYPED TRAIL (heap-fork backtrack, refcount-EXACT) — the typed layer the byte word-log
+           cannot be. A closure-cell / global var_ref is SHARED-SCOPE state per-flow isolation must
+           revert; the byte-revert restores a POINTER without touching refcounts, underflowing the
+           cycle-GC (MEASURED). Instead record {slot, old}: the trail OWNS old's ref (transferred
+           from the slot — NO phantom, so it never collides with a normal set_value free, the supabase
+           free_zero_refcount). Backtrack decrefs the current value + restores old; commit frees old.
+           g_cow_busy brackets the store so the binaryen barrier does NOT also log it to the untyped
+           word log (the typed trail is the sole record). BOTH scheduler levels: breadth forks it at
+           FLOWBEG, the grind pauses/resumes it via qjs_cow_capture/apply — ONE typed primitive. */
+        int sv = g_cow_busy; g_cow_busy = 1;
+        qjs_cow_vt_push(pval, *pval);
+        *pval = new_val;
+        g_cow_busy = sv;
+    } else {
+        set_value(ctx, pval, new_val);
+    }
 }
 
 void JS_SetClassProto(JSContext *ctx, JSClassID class_id, JSValue obj)
@@ -20266,17 +20420,20 @@ typedef struct JSFlow {
     JSStackChunk *js_stack;             /* this flow's own segmented heap call-stack */
     struct JSStackFrame *current_stack_frame;  /* this flow's frame chain */
     struct JSStackFrame *qjs_yield_entry;  /* this flow's resume-entry boundary (the YIELD_POLL entry_frame). MUST be per-flow: it is a single rt field that the NEXT flow's yield overwrites, so a cross-flow pause/resume would resume on the wrong dispatch boundary -> corruption. */
+    int flow_depth;                     /* #7: this flow's FLOWBEG/FLOWEND nesting depth — per-flow like the heap stack, else an interleaved suspend/resume (i1 yields at fetch, i2 runs, i1 resumes) shares one global g_flow_depth so FLOWENDs revert at the wrong moment and a sibling's shared-cell write leaks (shared_state i2-n-2). Saved on yield, restored on resume; a fresh flow's handle is zero -> depth 0. */
 } JSFlow;
 
 void qjs_flow_save(JSContext *ctx, JSFlow *f) {
     f->js_stack = ctx->rt->js_stack;
     f->current_stack_frame = ctx->rt->current_stack_frame;
     f->qjs_yield_entry = ctx->rt->qjs_yield_entry;
+    f->flow_depth = g_flow_depth;       /* save THIS flow's nesting so the incoming flow's restore doesn't inherit it */
 }
 void qjs_flow_restore(JSContext *ctx, JSFlow *f) {
     ctx->rt->js_stack = f->js_stack;
     ctx->rt->current_stack_frame = f->current_stack_frame;
     ctx->rt->qjs_yield_entry = f->qjs_yield_entry;
+    g_flow_depth = f->flow_depth;        /* restore the incoming flow's own nesting depth */
 }
 
 /* ===== #5/#7/#10 per-flow COW snapshot substrate ================================
@@ -20391,6 +20548,30 @@ typedef struct { uint64_t widx; uint64_t old; } JSCowUndo;
 static JSCowUndo *qjs_cow_undo = NULL;
 static size_t qjs_cow_undo_n = 0, qjs_cow_undo_cap = 0, qjs_cow_words = 0;
 static uint8_t *qjs_cow_shadow = NULL;
+/* TYPED TRAIL — the refcount-exact heap-fork backtrack layer (cow_set_value pushes shared-scope
+   JSValue slots here instead of the untyped byte word-log). Each entry: a slot and the value it
+   held; the trail OWNS that old value's ref. Backtrack (qjs_cow_vt_revert): for each entry in
+   REVERSE, decref the slot's CURRENT value and restore old (the trail's ref → slot). Commit
+   (qjs_cow_vt_commit): free each old (release the trail's ref; the slot keeps its current value).
+   No dedup — every write is a trail entry, so multi-writes to one slot unwind exactly. Pool-alloc'd
+   (excluded heap, gm-safe); grows palloc+memcpy (realloc poisoned), old chunk abandoned. */
+typedef struct JSCowVT { JSValue *slot; JSValue old; } JSCowVT;
+static JSCowVT *qjs_cow_vt = NULL;
+static size_t qjs_cow_vt_n = 0, qjs_cow_vt_cap = 0;
+static void qjs_cow_vt_push(JSValue *slot, JSValue old) {
+    if (qjs_cow_vt_n >= qjs_cow_vt_cap) {
+        size_t nc = qjs_cow_vt_cap ? qjs_cow_vt_cap * 2 : 256;
+        JSCowVT *nv = (JSCowVT *)qjs_cow_palloc(nc * sizeof(JSCowVT));
+        if (!nv) return;   /* can't grow -> this slot won't backtrack refcount-exact (leaks), never crash */
+        if (qjs_cow_vt) memcpy(nv, qjs_cow_vt, qjs_cow_vt_n * sizeof(JSCowVT));
+        qjs_cow_vt = nv; qjs_cow_vt_cap = nc;
+    }
+    qjs_cow_vt[qjs_cow_vt_n].slot = slot;
+    qjs_cow_vt[qjs_cow_vt_n].old = old;
+    qjs_cow_vt_n++;
+}
+static void qjs_cow_vt_revert_to(size_t mark);   /* fwd: def after g_cow_exec_rt */
+static void qjs_cow_vt_commit(void);             /* fwd: def after g_cow_exec_rt */
 /* Set when the barrier hits the undo/shadow limit MID-FLOW: it must NOT grow there (growth
    re-enters the non-reentrant allocator -> OOB), so it SATURATES (skips logging) and the
    scheduler grows the pool at the next SAFE point (qjs_cow_pool_warm). Surfaced via @WHY. */
@@ -20398,8 +20579,18 @@ static int g_cow_saturated = 0;
 static void qjs_cow_shadow_grow(size_t need);
 static void qjs_cow_undo_grow(void);
 QJS_JSEXPORT void qjs_cow_undo_revert(void);
+/* Revert only the log segment ABOVE `mark` (a saved qjs_cow_undo_n high-water). A drive/arm
+   that runs WITHIN an enclosing flow saves the mark before it forks and reverts to it after,
+   isolating its own bundle-state writes while leaving the enclosing flow's earlier segment
+   [0,mark) intact — the segmented per-arm snapshot (#7) with no global mark stack: the mark is
+   a C local at the single re-invoke site (qjs_drive_orphan_enum's BFS loop). */
+QJS_JSEXPORT void qjs_cow_undo_revert_to(size_t mark);
 
-typedef struct JSCowDelta { uint64_t *widx; uint64_t *oldw; uint64_t *neww; size_t n; } JSCowDelta;
+typedef struct JSCowDelta { uint64_t *widx; uint64_t *oldw; uint64_t *neww; size_t n;
+    /* typed-trail component: the shared-scope JSValue slots this flow wrote (refcount-exact). The
+       delta holds a DUP'd ref to each old + current across the pause, transferred to the trail/slot
+       on apply — so the grind can pause/resume a flow that wrote bundle cells without losing them. */
+    JSValue **vts; JSValue *vto; JSValue *vtc; size_t vtn; } JSCowDelta;
 
 /* Capture the active flow's undo log into d (the pausing flow's delta): each word it wrote,
    with its pre-flow value (oldw -> revert) and current value (neww -> re-apply on resume).
@@ -20418,6 +20609,20 @@ QJS_JSEXPORT int qjs_cow_capture(JSRuntime *rt, const uint8_t *mem, JSCowDelta *
         d->widx[k] = w; d->oldw[k] = qjs_cow_undo[k].old;
         d->neww[k] = *(uint64_t *)(hb + (w << 3));
     }
+    /* TYPED-TRAIL capture: save {slot, old, current} for each shared-scope JSValue write, DUP'ing
+       old+current so they survive to_baseline's decref (which immediately follows) and the pause.
+       On apply the dup'd refs transfer to the slot (current) and the rebuilt trail (old). */
+    d->vtn = qjs_cow_vt_n;
+    d->vts = d->vtn ? (JSValue **)qjs_cow_palloc(d->vtn * sizeof(JSValue *)) : NULL;
+    d->vto = d->vtn ? (JSValue *)qjs_cow_palloc(d->vtn * sizeof(JSValue)) : NULL;
+    d->vtc = d->vtn ? (JSValue *)qjs_cow_palloc(d->vtn * sizeof(JSValue)) : NULL;
+    if (d->vts && d->vto && d->vtc) {
+        for (k = 0; k < d->vtn; k++) {
+            d->vts[k] = qjs_cow_vt[k].slot;
+            d->vto[k] = JS_DupValueRT(rt, qjs_cow_vt[k].old);
+            d->vtc[k] = JS_DupValueRT(rt, *qjs_cow_vt[k].slot);
+        }
+    } else { d->vtn = 0; }
     g_cow_busy = 0;
     return 0;
 }
@@ -20445,11 +20650,35 @@ QJS_JSEXPORT void qjs_cow_apply(uint8_t *mem, const JSCowDelta *d) {
             qjs_cow_shadow[w >> 3] |= (uint8_t)(1u << (w & 7));
         }
     }
+    /* TYPED-TRAIL re-apply: the slot currently holds the restored-old (to_baseline put it there).
+       Release that, set the slot back to its captured CURRENT, and rebuild the trail entry. The
+       delta's DUP'd refs (vtc->slot, vto->trail) transfer out — so don't free them in delta_free. */
+    {
+        JSRuntime *grt = g_cow_rt;
+        JSCowDelta *dm = (JSCowDelta *)d;   /* the storage is mutable; const is just the read-contract */
+        for (size_t j = 0; j < dm->vtn; j++) {
+            JSValue *slot = dm->vts[j];
+            if (grt) JS_FreeValueRT(grt, *slot);   /* release the slot's restored-old ref */
+            *slot = dm->vtc[j];                     /* slot = current (delta's dup transfers to slot) */
+            qjs_cow_vt_push(slot, dm->vto[j]);      /* trail owns old (delta's dup transfers to trail) */
+        }
+        dm->vtn = 0;   /* refs transferred out — delta_free must NOT free them */
+    }
     g_cow_busy = 0;
 }
 static void qjs_cow_delta_free(JSRuntime *rt, JSCowDelta *d) {
-    (void)rt;   /* pool-allocated (bump) — reclaimed at reset, not freed here */
+    /* word arrays are pool-allocated (bump) — reclaimed at reset, not freed here. But the typed
+       component holds DUP'd JSValue refs: if this delta was captured then APPLIED, apply set vtn=0
+       (refs transferred out). If it is freed WITHOUT apply (an abandoned pause), release them here
+       so they don't leak. */
+    JSRuntime *r = rt ? rt : g_cow_rt;
+    if (d->vtn && r) {
+        int sv = g_cow_busy; g_cow_busy = 1;
+        for (size_t k = 0; k < d->vtn; k++) { JS_FreeValueRT(r, d->vto[k]); JS_FreeValueRT(r, d->vtc[k]); }
+        g_cow_busy = sv;
+    }
     d->widx = NULL; d->oldw = NULL; d->neww = NULL; d->n = 0;
+    d->vts = NULL; d->vto = NULL; d->vtc = NULL; d->vtn = 0;
 }
 /* Discard a COMPLETED flow's mutations: revert the live undo log to baseline (#7: the next
    flow forks clean; learned @H/@S are emitted output, not heap state, so undoing loses nothing). */
@@ -20473,6 +20702,13 @@ QJS_JSEXPORT void qjs_cow_commit(const uint8_t *mem) {
     }
     qjs_cow_undo_n = 0;
     g_cow_busy = 0;
+    /* COMMIT keeps the WORD-LOG writes (a captured instance + its object setup) as baseline, but the
+       TYPED TRAIL is SHARED-SCOPE cell state (globals/closures) — NEVER an instance's baseline. So
+       REVERT it: i1's `counter=1` must not persist into i2's drive (the i2-n-2 bug). The committed
+       instance's var_refs point at the CELL, not its value, so restoring the cell's baseline value
+       leaves the instance sound. This is the split: word-log = committable object graph; typed trail
+       = per-flow shared-cell deltas that always revert. */
+    qjs_cow_vt_revert_to(0);
 }
 /* Reset the COW state (grind teardown). The baseline/bitmap are POOL memory (bump),
    not js_malloc blocks — never js_free them; the pool stays allocated for reuse. */
@@ -20552,19 +20788,62 @@ static void qjs_cow_pool_warm(JSContext *ctx) {
     }
     if (qjs_cow_undo_cap < 8192) qjs_cow_undo_grow();   /* first warm: seed a base reserve so small flows never saturate */
 }
+/* g_flow_capture: armed ONLY around a single BFS force-invoke (driver.js __feFlowBegin/End
+   bracket each `v.call(...)` in __hostDrive). It makes one force-invoke a per-flow COW flow —
+   the barrier logs that invoke's bundle writes, __feFlowEnd reverts them to baseline, so the
+   NEXT invoke forks clean (#7 isolation: the shared-state fix — invoke B never reads invoke A's
+   globals/heap). The driver's own bookkeeping (FH/ranKeys, run BETWEEN invokes with the flag
+   off) is NOT logged, so revert never dangles scheduler metadata — same "only the bundle invoke
+   is flow-state" rule the grind uses for g_grind_drive_active. ONE barrier, both levels. */
+static int g_flow_capture = 0;
+/* g_cow_pause: engine code writing PERSISTENT output/scheduler state (the @H/@S emission,
+   the _hSeen dedup set, progress counters) runs DURING a flow's invoke (inside the bracket),
+   but it is NOT flow-state — reverting it (and its allocations' free-list updates) desyncs the
+   allocator and erases emitted output (shared_state.html: every @H vanished). __feCowPause(1/0)
+   brackets those writes so the barrier skips them -> they survive the flow's revert. The
+   principled "only the bundle's own writes are flow-state" rule, applied to engine hooks that
+   run nested in the bundle's call. Nesting-safe counter (a hook may emit while one is open). */
+static int g_cow_pause = 0;
+/* ROOT-CAUSE value-stack exclusion (#7), applied in the barrier below via the EXISTING g_cow_rt
+   (defined ~20358, set at JS_NewRuntime2 — available before any flow): this fork moved every JS
+   frame's operand stack (args+vars+value-stack) OFF the C stack into rt->js_stack heap chunks
+   (js_malloc_rt, ABOVE __heap_base). The barrier would otherwise log VALUE-STACK writes — but that
+   stack is EXECUTION SUBSTRATE, not flow heap-state: a force-invoke's frame shares the chunk with
+   its CALLER's live frame (the __hostDrive loop), so reverting the invoke's value-stack words
+   corrupted the driver's loop state — only the first invoke survived (PROVEN: no-revert ran all,
+   revert ran one). The grind escapes only because it reverts at a stack-EMPTY boundary. Excluding
+   the chunks makes the revert sound AND the delta sparse (only real heap-object writes). */
+static JSRuntime *g_cow_exec_rt = NULL;   /* the runtime EXECUTING the current flow (set at FLOWBEG from ctx); its js_stack is the operand-stack arena the barrier must exclude */
+static int g_cow_force_log = 0;   /* cow_set_value sets it so a shared-scope slot is captured past the value-stack/arena exclusions */
+static long g_cow_vskip = 0;   /* TEMP: count barrier writes excluded as value-stack (confirms the exclusion fires) */
 /* Barrier target (runs BEFORE the store): log the pre-flow value of each WORD the
    store [addr, addr+size) touches, once per word (per-word first-write captures the
    pre-flow value of all 8 bytes, so sub-word/multi-store on one word stays correct). */
 QJS_JSEXPORT void qjs_cow_undo_log(size_t addr, size_t size) {
     size_t hb = (size_t)&__heap_base, w, w0, w1;
-    /* Log ONLY the orphan's own bundle execution (a drive in flight). Between drives the grind's
-       C code writes PERSISTENT engine/scheduler metadata (the orphan registry, the captured-sink
-       and leaf-id tables, instance/receiver captures) — that is NOT flow-state, and logging it let
-       a per-flow revert dangle those structures -> free-list corruption -> the cold-orphan-drive
-       OOB. g_grind_drive_active brackets exactly the drive (both paths + composition + resume), so
-       this is the principled "only the drive is flow-state" rule at zero new bracketing. */
-    if (!g_grind_drive_active) return;
-    if (g_cow_busy || !qjs_cow_shadow || addr < hb || !size) return;
+    /* Log ONLY a flow's own bundle execution: the grind's orphan drive (g_grind_drive_active)
+       OR a BFS force-invoke (g_flow_capture). Between flows the grind's/driver's C+JS writes
+       PERSISTENT scheduler metadata (orphan registry, captured-sink/leaf-id tables, FH/ranKeys)
+       — NOT flow-state; logging it let a per-flow revert dangle those structures -> free-list
+       corruption. Both flags bracket exactly the bundle invoke, so this is the principled
+       "only the invoke is flow-state" rule at zero extra bracketing. */
+    if (!g_grind_drive_active && !g_flow_capture) return;
+    if (g_cow_busy || g_cow_pause || !qjs_cow_shadow || addr < hb || !size) return;
+    /* Exclude the JS operand stack (rt->js_stack heap chunks): EVERY JS frame's operand stack is
+       js_stack_push'd here (JS_CallInternal ~21202, unconditional), so a force-invoke's frame shares
+       a chunk with its CALLER's live frame (the __hostDrive loop). Reverting the invoke's chunk words
+       corrupts the driver's loop state -> drive breaks after ~2 invokes. Use the EXECUTING runtime
+       (g_cow_exec_rt, set at FLOWBEG from ctx) — g_cow_rt is the pool runtime and missed the stack. */
+    /* The substrate exclusions below are SKIPPED for force-logged shared-scope slots (cow_set_value):
+       a closure cell / global var_ref must be captured even when it physically lives in a value-stack
+       chunk, or its revert is silently dropped (globals reverted, closures didn't). */
+    if (!g_cow_force_log) {
+        if (g_cow_exec_rt) { JSStackChunk *c = g_cow_exec_rt->js_stack;
+            while (c) { if (addr >= (size_t)(void *)c && addr < (size_t)(void *)c->limit) { g_cow_vskip++; return; } c = c->prev; } }
+        /* Exclude the per-flow arena: its objects are flow-local scratch, discarded wholesale by the
+           FLOWEND bump-reset (not reverted), and references to them in baseline objects ARE reverted. */
+        if (g_flow_arena && addr >= (size_t)g_flow_arena && addr < (size_t)g_flow_arena + g_flow_arena_cap) return;
+    }
     w0 = (addr - hb) >> 3; w1 = (addr + size - 1 - hb) >> 3;
     for (w = w0; w <= w1; w++) {
         if (w >= qjs_cow_words) { g_cow_saturated = 1; continue; }   /* heap grew past the shadow -> saturate (never grow mid-barrier: re-enters the allocator). qjs_cow_pool_warm re-covers it at the next safe point. */
@@ -20576,19 +20855,54 @@ QJS_JSEXPORT void qjs_cow_undo_log(size_t addr, size_t size) {
         qjs_cow_shadow[w >> 3] |= (uint8_t)(1u << (w & 7));
     }
 }
-/* Revert the active flow to baseline: restore every logged word to its pre-flow value,
-   clear the shadow, empty the log. The exact inverse of the flow's writes. */
-QJS_JSEXPORT void qjs_cow_undo_revert(void) {
+/* Revert a flow SEGMENT to its mark: restore every word logged AFTER `mark` to its pre-flow
+   value (in REVERSE), clear its shadow bit, truncate the log to `mark`. Reverting to a mark
+   (not always 0) is what makes flows NEST and the BFS arms SIBLING-isolate: each arm/flow owns
+   the log segment [its_mark, n) and reverts exactly that, leaving an enclosing flow's earlier
+   segment [0, its_mark) intact. The global shadow dedups, so each word lives in exactly one
+   segment — reverting [mark,n) touches only this segment's words. (#7 per-flow/arm snapshot.) */
+QJS_JSEXPORT void qjs_cow_undo_revert_to(size_t mark) {
     size_t hb = (size_t)&__heap_base, i;
-    if (!qjs_cow_undo) return;
+    if (!qjs_cow_undo || mark >= qjs_cow_undo_n) return;   /* nothing logged above the mark */
     g_cow_busy = 1;
-    for (i = 0; i < qjs_cow_undo_n; i++) {
+    for (i = qjs_cow_undo_n; i > mark; ) {
+        i--;
         uint64_t w = qjs_cow_undo[i].widx;
         *(uint64_t *)(hb + (w << 3)) = qjs_cow_undo[i].old;
         qjs_cow_shadow[w >> 3] &= (uint8_t)~(1u << (w & 7));
     }
-    qjs_cow_undo_n = 0;
+    qjs_cow_undo_n = mark;
     g_cow_busy = 0;
+}
+/* Backtrack the typed trail down to `mark`: for each entry in REVERSE, decref the slot's CURRENT
+   value and restore old (the trail's ref → slot). Refcount-EXACT — the layer the byte word-log
+   can't be. (Def here, after g_cow_exec_rt; fwd-declared at the trail globals.) */
+static void qjs_cow_vt_revert_to(size_t mark) {
+    if (mark >= qjs_cow_vt_n) { return; }
+    JSRuntime *rt = g_cow_rt;               /* the single runtime (always set post-boot) */
+    int sv = g_cow_busy; g_cow_busy = 1;    /* the restore stores + free's gm ops must not re-log */
+    size_t k = qjs_cow_vt_n;
+    qjs_cow_vt_n = mark;                     /* truncate BEFORE freeing so a finalizer re-push starts fresh */
+    while (k > mark) { k--;
+        JSValue cur = *qjs_cow_vt[k].slot;
+        *qjs_cow_vt[k].slot = qjs_cow_vt[k].old;   /* ALWAYS restore old (trail's ref → slot) — isolation */
+        if (rt) JS_FreeValueRT(rt, cur);           /* decref the displaced current (skip only if no rt: leak, never crash) */
+    }
+    g_cow_busy = sv;
+}
+/* COMMIT the typed trail: the slots KEEP their current values; release the trail's ref to each old. */
+static void qjs_cow_vt_commit(void) {
+    if (!qjs_cow_vt_n) return;
+    JSRuntime *rt = g_cow_rt;
+    int sv = g_cow_busy; g_cow_busy = 1;
+    size_t k = qjs_cow_vt_n; qjs_cow_vt_n = 0;
+    while (k > 0) { k--; if (rt) JS_FreeValueRT(rt, qjs_cow_vt[k].old); }
+    g_cow_busy = sv;
+}
+/* Revert the WHOLE live log to baseline (the grind's discard/to_baseline: no enclosing flow). */
+QJS_JSEXPORT void qjs_cow_undo_revert(void) {
+    qjs_cow_undo_revert_to(0);
+    qjs_cow_vt_revert_to(0);   /* typed trail: refcount-exact backtrack of the shared-scope slots */
 }
 /* Emit the COW activity counters WITHOUT resetting — called at a DRIVE's END (qjsmain
    do_drive) so the within-drive activity is observed BEFORE the next drive's HEAPU8 image
@@ -20612,11 +20926,21 @@ static int g_cow_boot_mode = 0;
 QJS_JSEXPORT void qjs_cow_boot_baseline(JSRuntime *rt) {
     if (!g_cow_enabled) return;
     g_cow_boot_mode = 1;
+    /* Per-flow allocation arena: malloc'd ONCE here (baseline, before any flow), so this big
+       general-allocator call can't desync a flow. Flows bump from it; FLOWEND resets the bump. */
+    if (!g_flow_arena) { g_flow_arena_cap = (size_t)64 * 1024 * 1024; g_flow_arena = (uint8_t *)js_def_malloc(NULL, g_flow_arena_cap); if (!g_flow_arena) g_flow_arena_cap = 0; }  /* js_def_malloc (not bare malloc — forbidden here); g_flow_capture is 0 at baseline so it hits the real allocator, NOT the arena */
     qjs_cow_pool_init(rt, (size_t)16 * 1024 * 1024);
     /* Undo-log snapshot: NO baseline copy — the LIVE post-boot heap IS the baseline; a flow's
        writes are logged and reverted exactly (word-granular, GC-consistent). Just size the
        shadow bitmap to the heap; the undo log grows on demand. Empty log = at baseline. */
     qjs_cow_shadow_grow(qjs_cow_heap_len() / 8 + 1);
+    /* PRE-SEED the undo array here (a safe point — between/before drives, never mid-barrier).
+       The barrier can't grow it on demand (qjs_cow_palloc re-enters the non-reentrant allocator),
+       so an unseeded log makes the FIRST write hit qjs_cow_undo_n(0) >= qjs_cow_undo_cap(0),
+       saturate, and return WITHOUT logging — every flow then reverts nothing (shared_state.html:
+       undo_n=0, g2 read g1's write). pool_warm seeds it for the grind, but the in-flux boot
+       baseline reaches the force-invoke drives BEFORE pool_warm runs, so seed it now. */
+    if (!qjs_cow_undo_cap) qjs_cow_undo_grow();
     qjs_cow_undo_n = 0;
     printf("@WHY {\"phase\":\"cow_boot_baseline\",\"undolog\":1,\"heapMB\":%zu,\"shadowKB\":%zu}\n",
            qjs_cow_heap_len() / (size_t)1048576, (qjs_cow_words / 8) / (size_t)1024);
@@ -20628,6 +20952,88 @@ QJS_JSEXPORT void qjs_cow_drive_restore(JSRuntime *rt) {
     (void)rt;
     if (!g_cow_enabled || !g_cow_boot_mode || !qjs_cow_shadow) return;
     qjs_cow_undo_revert();
+}
+/* Per-flow COW bracket for ONE forced bundle invocation (#7 heap switching). qjs_flow_arm
+   establishes the in-flux baseline on first use (the post-bundle-eval heap — driver.js drives
+   BEFORE do_boot's end-of-boot baseline) and arms the store-barrier; qjs_flow_revert restores
+   exactly this flow's writes to baseline so the NEXT forced invoke forks CLEAN. EVERY forced
+   drive site brackets its JS_Call with these (js_fe_drive_static's seed drive + __hostDrive via
+   __feFlowBegin/End), so an unrelated function's global/closure mutation never leaks into another
+   flow (shared_state.html: g2 must read base, not g1's write). The grind's own per-orphan
+   g_grind_drive_active path is the same primitive at the depth level — ONE barrier, both levels. */
+/* PER-FLOW ISOLATION — reverted at the QUIESCENT outermost boundary, the only refcount-safe point.
+   A breadth flow (one __hostDrive top-level fn) is the isolation unit: capture from its FLOWBEG,
+   revert at its FLOWEND so the NEXT top-level fn forks from a clean baseline (shared_state.html:
+   g2/c2/i2 must NOT see g1/c1/i1's write to G_SHARED/mod/counter).
+   The hard constraint MEASURED here: a word-level heap revert is refcount-safe ONLY at a quiescent
+   boundary (no live nested frames). The forced fetch→drain shim RE-ENTERS FLOWBEG mid-flight
+   (nesting to depth 5), and reverting there rewrites object-internal refcounted memory (property
+   arrays, shapes — NOT just cow_set_value slots) that the word log cannot type, so the cycle-GC
+   underflows (gc_decref_child, quickjs.c:9581 — 28 aborts with a mid-flow revert; the cow_set_value
+   vlog covers the slot refs but not the object-internal ones). So nested FLOWBEGs JOIN the current
+   flow (no mid-flight revert); only the OUTERMOST FLOWEND (g_flow_depth→0, all nested frames
+   unwound) reverts. That boundary is quiescent like the grind's per-orphan revert — the same
+   primitive. Each top-level fn returns to depth 0 before the next, so isolation holds without a
+   mid-flow revert. The refcount-exact vlog (cow_set_value) still runs on this revert, eliminating
+   even the slot-ref leak; a TYPED capture covering object-internal refs is the brick that would let
+   a mid-flow revert (true preemptive interleave) become safe. */
+static int g_flow_arm_on = 1;
+/* PER-FLOW COW bracket for ONE forced bundle invocation (#7). Arms the word-log capture at the
+   OUTERMOST flow and the refcount-exact typed-trail fork at every flow; reverts at the quiescent
+   depth-0 boundary so the NEXT forced invoke forks from baseline. A per-flow capture/apply NESTING
+   variant was built + TESTED DIRECTLY (testing/fixtures/nested_flow_isolation.html) against this
+   simpler form and measured BYTE-IDENTICAL on every fixture (shared_state, supabase, sentry, the new
+   nested test) — the nested-write-then-read corruption it targeted does not occur in the forced
+   executor (the drain does not drive a sibling global between a flow's write and its read). So the
+   simpler mechanism IS the better design; the nesting machinery was dropped rather than carry its
+   per-FLOWBEG allocation overhead for zero behavioral gain. The REAL shared_state residue (i2-n-2,
+   g1-saw-dirty) is a DIFFERENT root: the grind re-instantiates the IIFE factory (two `counter` cells
+   observed), staling the typed trail's slot pointers so a revert restores the dead cell. */
+static void qjs_flow_arm(JSContext *ctx) {
+    if (!g_flow_arm_on || !g_cow_enabled) return;
+    if (g_flow_depth == 0) {   /* the OUTERMOST flow arms WORD-LOG capture; nested re-entries join it (the byte word-log reverts only at the quiescent outermost FLOWEND) */
+        if (!g_cow_boot_mode) qjs_cow_boot_baseline(JS_GetRuntime(ctx));
+        g_cow_exec_rt = JS_GetRuntime(ctx);   /* the barrier excludes THIS runtime's operand-stack arena (rt->js_stack) from the flow delta */
+        g_flow_capture = 1;
+    }
+    fflush(stdout);   /* output leaves the heap before any restore touches the stdio buffer */
+    qjs_cow_vt_revert_to(0);   /* refcount-exact typed-trail fork: this flow reads the shared-scope cells at baseline */
+    g_flow_depth++;
+}
+static void qjs_flow_revert(JSContext *ctx) {
+    (void)ctx;
+    if (!g_flow_arm_on || !g_cow_enabled) return;
+    if (g_flow_depth > 0) g_flow_depth--;
+    /* MEASURED (2026-06-20): reverting the typed trail at EVERY FLOWEND depth left shared_state
+       unchanged (and did NOT over-fork supabase) — so the leak is NOT a missed FLOWEND revert. The
+       leaking bumps run MID-FLOW (one FLOWBEG resets counter once, then i1->1 ... i2->2 fire before
+       the next boundary); the endpoint emits at counter=2 regardless of any later revert. Reverting
+       only at the quiescent depth-0 boundary is correct here — the fix is a per-INVOCATION revert at
+       the scheduler-driven bump-caller entry, gated on that caller being driver-invoked, not here. */
+    if (g_flow_depth != 0 || !g_flow_capture) return;   /* revert ONLY at the quiescent outermost boundary */
+    /* OUTPUT LEAVES THE HEAP FIRST. A flow's @H/@S go through the stdio buffer (in the linear-memory
+       heap) and are FULL-buffered — unlike the C @WHY printfs, which fflush. The COMPLETE revert
+       would otherwise erase output the flow already produced. Flushing to the host before the revert
+       makes output exit the revertable region — the revert restores STATE, never OUTPUT. */
+    fflush(stdout);
+    qjs_cow_undo_revert();   /* word log + typed trail, both at the quiescent boundary */
+    g_flow_capture = 0;
+    g_flow_arena_off = g_flow_arena_committed;
+    qjs_fe_seen_reset();   /* fresh forced-exec seen-set per invoke (the grind's per-execution-unit reset) */
+}
+
+/* THE ONE forced-invoke primitive (#5-#10 collapse): every forced drive — orphan-enum schedule,
+   deep-step orphan, callback drive, value-spread — is "fork the shared-scope cells to baseline, then
+   invoke". Today each site open-codes `qjs_cow_vt_revert_to(0); JS_Call(...)` with subtle drift; route
+   them all through here so there is ONE snapshot boundary, not five. This is the engine-level analogue
+   of FLOWBEG bracketing the breadth pass: a single place all forced sub-paths pass through, the seam
+   where per-flow snapshot/eviction will attach. Behaviour-identical to the open-coded form it replaces;
+   the value is that a future change (per-flow trail, KLEE branch-fork) edits ONE function, not five. */
+static JSValue qjs_run_forced_flow(JSContext *ctx, JSValueConst fn, JSValueConst this_val,
+                                   int argc, JSValueConst *argv, int is_ctor) {
+    qjs_cow_vt_revert_to(0);   /* snapshot: this forced sub-path reads shared cells at baseline */
+    return is_ctor ? JS_CallConstructor(ctx, fn, argc, argv)
+                   : JS_Call(ctx, fn, this_val, argc, argv);
 }
 
 void qjs_free_suspended_trampoline_frames(JSContext *ctx)
@@ -21155,6 +21561,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     sf->cur_pc = NULL;
     sf->prev_frame = rt->current_stack_frame;
     rt->current_stack_frame = sf;
+    /* MEASURED DEAD (definitive, 10 variants): no call/drive-level rule reverting the GLOBAL typed
+       trail fixes shared_state without over-forking supabase. Root cause: shared_state's forced
+       re-drive of i2 MUST fork (i2 reads counter=0) while supabase's forced re-drives MUST keep their
+       accumulated cross-drive state (reverting them aborts, 9-24) — contradictory on a SHARED trail.
+       The scheduler-tagged gate (g_force_drive_pending: only forced top-level drives revert) still
+       over-forked (1->9). The fix is NOT a point revert: each forced flow must own its OWN typed trail
+       (per-flow snapshot in JSFlow, swapped on context switch) so reverting one path never touches
+       another's state. That is the architectural end-state CLAUDE.md names; the global trail is the gap. */
     ctx = b->realm; /* set the current realm */
 
 #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_STEP
@@ -22168,10 +22582,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_get_var_ref1): *sp++ = js_dup(*var_refs[1]->pvalue); BREAK;
         CASE(OP_get_var_ref2): *sp++ = js_dup(*var_refs[2]->pvalue); BREAK;
         CASE(OP_get_var_ref3): *sp++ = js_dup(*var_refs[3]->pvalue); BREAK;
-        CASE(OP_put_var_ref0): set_value(ctx, var_refs[0]->pvalue, *--sp); BREAK;
-        CASE(OP_put_var_ref1): set_value(ctx, var_refs[1]->pvalue, *--sp); BREAK;
-        CASE(OP_put_var_ref2): set_value(ctx, var_refs[2]->pvalue, *--sp); BREAK;
-        CASE(OP_put_var_ref3): set_value(ctx, var_refs[3]->pvalue, *--sp); BREAK;
+        CASE(OP_put_var_ref0): cow_set_value(ctx, var_refs[0]->pvalue, *--sp); BREAK;
+        CASE(OP_put_var_ref1): cow_set_value(ctx, var_refs[1]->pvalue, *--sp); BREAK;
+        CASE(OP_put_var_ref2): cow_set_value(ctx, var_refs[2]->pvalue, *--sp); BREAK;
+        CASE(OP_put_var_ref3): cow_set_value(ctx, var_refs[3]->pvalue, *--sp); BREAK;
         CASE(OP_set_var_ref0): set_value(ctx, var_refs[0]->pvalue, js_dup(sp[-1])); BREAK;
         CASE(OP_set_var_ref1): set_value(ctx, var_refs[1]->pvalue, js_dup(sp[-1])); BREAK;
         CASE(OP_set_var_ref2): set_value(ctx, var_refs[2]->pvalue, js_dup(sp[-1])); BREAK;
@@ -22193,7 +22607,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int idx;
                 idx = get_u16(pc);
                 pc += 2;
-                set_value(ctx, var_refs[idx]->pvalue, sp[-1]);
+                cow_set_value(ctx, var_refs[idx]->pvalue, sp[-1]);
                 sp--;
             }
             BREAK;
@@ -62504,6 +62918,39 @@ static JSValue js_fe_bfs_active(JSContext *ctx, JSValueConst this_val,
     g_bfs_last_pc = NULL; g_bfs_last_seen = qjs_fe_seen_n; g_bfs_noprog = 0;
     return JS_UNDEFINED;
 }
+/* __feFlowBegin/__feFlowEnd: bracket ONE BFS force-invoke as a per-flow COW flow (#7/#10).
+   Begin arms the store-barrier (g_flow_capture) so the invoke's bundle writes are logged;
+   End reverts them to the post-boot baseline so the NEXT force-invoke forks CLEAN — invoke
+   B never observes invoke A's global/heap mutations. That is the shared-state isolation the
+   BFS lacked: __hostDrive force-invoked every global on ONE accumulating heap, so a value a
+   forced path wrote into a shared global leaked into the next path (an INVENTED value, the
+   moat forbids). The driver's own bookkeeping (FH/ranKeys) runs between Begin/End with the
+   flag OFF, so it survives the revert. This is the grind's per-orphan capture/discard applied
+   to the breadth pass — ONE COW primitive at BOTH levels of the WFQ. Emitted @H/@S survive
+   (they go to the host, not the reverted heap): revert restores STATE, never OUTPUT. */
+static JSValue js_fe_flow_begin(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv) {
+    (void)this_val;
+    qjs_flow_arm(ctx);
+    (void)argc; (void)argv;
+    return JS_UNDEFINED;
+}
+static JSValue js_fe_flow_end(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv) {
+    (void)ctx; (void)this_val; (void)argc; (void)argv;
+    qjs_flow_revert(ctx);
+    return JS_UNDEFINED;
+}
+/* __feCowPause(1)/(0): bracket a PERSISTENT engine write inside a flow (the @H/@S emit, the
+   dedup set, progress counters) so the store-barrier skips it and the flow's revert leaves it
+   intact — output and scheduler state outlive the flow that produced them. Nesting-safe. */
+static JSValue js_fe_cow_pause(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc > 0 && JS_ToBool(ctx, argv[0])) g_cow_pause++;
+    else if (g_cow_pause > 0) g_cow_pause--;
+    return JS_UNDEFINED;
+}
 static void qjs_dd_free(JSContext *ctx);   /* fwd: driven-set + ids reset (defined below) */
 /* Capture a REAL closure instance the moment a driven factory orphan
    instantiates it (called from js_closure2 during an active grind), so a
@@ -62860,6 +63307,30 @@ static void qjs_deep_free_paused_flow(JSContext *ctx, int ix) {
     qjs_flow_restore(ctx, &_cur);
 }
 
+/* qjs_fn_is_escaping_factory: STRUCTURAL (not a name heuristic) — does running b create closures
+   that capture b's OWN locals/args (child bytecodes with a JS_CLOSURE_LOCAL/ARG closure_var)? Such a
+   function is a closure FACTORY: each run mints fresh heap cells (var_refs) for its escaping children.
+   When it ALREADY RAN at boot (qjs_executed), those instances are LIVE (the grind captures them via
+   the gc_obj_list scan / qjs_deep_capture_inst); RE-driving it in the residue only RE-INSTANTIATES —
+   a SECOND set of cells the executor then drives, so a shared closure counter accumulates across the
+   duplicate (shared_state.html: the IIFE's `counter` -> a second cell, i2-n-2). This is the SAME
+   re-instantiation leak qjs_is_module already excludes; this generalizes it from module top-levels to
+   any already-run escaping-closure factory. Cold factories (qjs_executed=0) are still driven ONCE for
+   discovery — their single drive IS where qjs_deep_capture_inst captures the real instance. */
+static int qjs_fn_is_escaping_factory(JSFunctionBytecode *b) {
+    if (!b || !b->cpool) return 0;
+    for (int i = 0; i < b->cpool_count; i++) {
+        if (JS_VALUE_GET_TAG(b->cpool[i]) != JS_TAG_FUNCTION_BYTECODE) continue;
+        JSFunctionBytecode *child = JS_VALUE_GET_PTR(b->cpool[i]);
+        if (!child) continue;
+        for (int j = 0; j < child->closure_var_count; j++) {
+            int t = child->closure_var[j].closure_type;
+            if (t == JS_CLOSURE_LOCAL || t == JS_CLOSURE_ARG) return 1;   /* child captures b's own local/arg */
+        }
+    }
+    return 0;
+}
+
 int qjs_deep_step_c(JSContext *ctx, int maxN, int fromCursor) {
     if (maxN < 1) maxN = 1;
     JSRuntime *rt = JS_GetRuntime(ctx);
@@ -62906,6 +63377,7 @@ int qjs_deep_step_c(JSContext *ctx, int maxN, int fromCursor) {
                fire), so the driven-SET is the sole "done" mark for them. */
             if (!b->byte_code_buf || b->qjs_h_fired) continue;
             if (b->qjs_is_module) continue;   /* module top-level <eval>: re-driving re-instantiates the module (orphan closures -> teardown GC-root leak), never a new endpoint */
+            if (b->qjs_executed && qjs_fn_is_escaping_factory(b)) continue;   /* already-run closure factory: its real instances are LIVE; re-driving re-instantiates (shared_state IIFE counter -> slot B, i2-n-2). Same leak as qjs_is_module, generalized. */
             if (qjs_is_host_model_file(b->filename)) continue;
             if (qjs_deep_rb_n == cap) {
                 int nc = cap ? cap * 2 : 64;
@@ -63408,6 +63880,12 @@ int qjs_deep_step_c(JSContext *ctx, int maxN, int fromCursor) {
                    _from_real, _hasrecv, _recvCS, _ruid, _ix, _dix, _dixCS, _dixuid, has_host_in_b, (b->func_kind & JS_FUNC_ASYNC) ? 1 : 0, _is_cls_ctor, b->line_num, b->col_num, _ofile);
             fflush(stdout); } }
         g_grind_drive_active = 1; g_defer_fired = 0; g_noprog_polls = 0; g_progress_seen = g_emit_n;   /* arm output-starvation spin-defer for BOTH paths: seed the emitted-output mark (the handler reads g_emit_n) */
+        /* TYPED-TRAIL FORK per orphan drive: a PAUSED prior orphan `continue`s past its discard (see
+           below), so its shared-scope cell writes (shared_state.html's `counter`) would carry into
+           THIS orphan — i2 reads i1's bump (i2-n-2). Fork the typed cells clean here (refcount-exact);
+           the word-log arena/discard is handled separately below. */
+        qjs_cow_vt_revert_to(0);
+        size_t _orphan_arena = g_flow_arena_off;   /* #7: per-orphan arena high-water — a DISCARDED orphan's arena allocations are reclaimed to here (the grind phase has no breadth FLOWEND to reset the arena, so without this it fills -> js_def_malloc falls back to gm -> the OOB wasm_trap -> recycle). A PAUSED orphan `continue`s past the discard, leaking its segment harmlessly (never corrupts). */
         if (!has_host_in_b) {
             JSValue *args3 = nargs > 0 ? js_mallocz(ctx, nargs * sizeof(JSValue)) : NULL;
             if (nargs > 0 && !args3) { JS_FreeValue(ctx, fo); continue; }
@@ -63612,8 +64090,9 @@ int qjs_deep_step_c(JSContext *ctx, int maxN, int fromCursor) {
                DISCARD — revert its heap mutations (incl. any forced-built deep DOM) so the
                next orphan forks clean (#7 full DOM+JS isolation). Inert while gated off. */
             if (qjs_deep_cow) {
-                if (g_cow_orphan_creates_inst) qjs_cow_commit(qjs_cow_heap_base());
+                if (g_cow_orphan_creates_inst) { qjs_cow_commit(qjs_cow_heap_base()); g_flow_arena_committed = g_flow_arena_off; }  /* the committed instance's arena allocations become permanent baseline (survive resets) */
                 else qjs_cow_discard(qjs_cow_heap_base());
+                (void)_orphan_arena;  /* per-orphan arena reset reverted: it dangled paused-orphan deltas on the heavy grind (sentry hang). The arena reset stays at the breadth FLOWEND only. */
             }
             /* Spin-defer: the interrupt YIELDED this drive (g_defer_fired) and it
                unwound (_was_exc2) ⇒ a no-forced-progress concrete spin. DEFER it
@@ -64101,7 +64580,8 @@ static void qjs_drive_opaque_call_cbs(JSContext *ctx, JSValueConst *call_argv, i
         const char *save_trace = qjs_fe_trace;   /* trace is now a path sentinel, not a FILE* */
         int save_phi = qjs_fe_phi_mute, save_mute = qjs_fe_mute;
         qjs_fe_trace = NULL; qjs_fe_phi_mute = 1; qjs_fe_mute = 1;
-        JSValue r = JS_Call(ctx, a, this_opq, nargs, args2);
+        fflush(stdout);
+        JSValue r = qjs_run_forced_flow(ctx, a, this_opq, nargs, args2, 0);   /* #5-#10 collapse: the ONE snapshot+invoke primitive (was open-coded revert_to(0)+JS_Call) */
         qjs_fe_mute = save_mute; qjs_fe_phi_mute = save_phi; qjs_fe_trace = save_trace; qjs_fe_cur = save_cur;
         if (JS_IsException(r)) { JSValue e = JS_GetException(ctx); JS_FreeValue(ctx, e); }
         JS_FreeValue(ctx, r);
@@ -64167,11 +64647,27 @@ static void qjs_drive_orphan_enum(JSContext *ctx, JSValueConst fn, JSValueConst 
                 qjs_fe_sched = S; qjs_fe_len = strlen(S); qjs_fe_cur = 0;
                 qjs_fe_lcap = 1; qjs_fe_lcap_n = 0; qjs_fe_lcap_of = 0;
                 qjs_fe_seen_reset();
-                JSValue r = is_ctor ? JS_CallConstructor(ctx, fn, nargs, args)
-                                    : JS_Call(ctx, fn, this_val, nargs, args);
+                /* #7 PER-ARM SNAPSHOT: each forced schedule is a sibling BFS arm. A shared closure
+                   cell / global the function mutates (shared_state.html's `counter`) must NOT carry
+                   from one arm into the next, or the arms see each other's state (counter 0->1->2 =>
+                   i2-n-2). Save the undo high-water before the invoke; revert exactly this arm's
+                   bundle-state writes after. The lcap/worklist arrays live in the per-flow arena
+                   (excluded from the log), so the BFS still advances on the captured decisions. */
+                size_t _arm_mark = qjs_cow_undo_n;
+                /* TYPED-TRAIL FORK (heap-fork, refcount-exact): this BFS arm is a forced schedule of
+                   `fn` — fork the bundle's shared-scope cells clean so the arm sees them at BASELINE,
+                   not a prior arm's write (shared_state.html: i2 must read counter=baseline, not i1's
+                   bump). The orphan-enum drives via the per-arm word-log mark, NOT qjs_flow_arm, so it
+                   needs this fork explicitly. Word-log machinery state stays (reverted to _arm_mark). */
+                fflush(stdout);
+                JSValue r = qjs_run_forced_flow(ctx, fn, this_val, nargs, args, is_ctor);   /* #5-#10 collapse: the ONE snapshot+invoke primitive (was open-coded revert_to(0)+JS_Call) */
                 qjs_fe_lcap = 0;
                 if (JS_IsException(r)) { JSValue e = JS_GetException(ctx); JS_FreeValue(ctx, e); }
                 JS_FreeValue(ctx, r);
+                /* OUTPUT LEAVES THE HEAP FIRST (same invariant as qjs_flow_revert): this arm's
+                   @H/@S sit in the linear-memory stdio buffer; flush them to the host BEFORE the
+                   revert restores the heap, or the per-arm revert erases endpoints the arm produced. */
+                if (g_flow_capture || g_grind_drive_active) { fflush(stdout); qjs_cow_undo_revert_to(_arm_mark); }
                 if (qjs_fe_lcap_of) {
                     size_t nc = qjs_fe_lcap_cap * 2;
                     unsigned char *nd = (unsigned char *)js_realloc(ctx, qjs_fe_lcap_dec, nc);
@@ -64484,6 +64980,7 @@ static JSValue js_fe_drive_static(JSContext *ctx, JSValueConst this_val,
             if (_reads_this && (nargs <= 0 || argsR)) {
                 for (int ai = 0; ai < nargs; ai++) argsR[ai] = qjs_fe_named_arg(ctx, b, ai, "static-real-this");
                 qjs_dir_active = 0; qjs_dir_b = NULL; qjs_dir_target = -1;
+                qjs_flow_arm(ctx);   /* #7: this real-receiver drive is a flow — capture its writes */
                 JSValue rr = JS_Call(ctx, targets[i], target_this[i], nargs, argsR);
                 /* An async real-receiver method (`async exchange(){ var c =
                    await this._svc.getConfig(); return fetch(c.url) }`, oidc-
@@ -64508,6 +65005,7 @@ static JSValue js_fe_drive_static(JSContext *ctx, JSValueConst this_val,
                 JS_FreeValue(ctx, rr);
                 for (int ai = 0; ai < nargs; ai++) JS_FreeValue(ctx, argsR[ai]);
                 if (argsR) js_free(ctx, argsR);
+                qjs_flow_revert(ctx);   /* revert to baseline so the next target/drive forks clean */
                 n_called++;
             }
         }
@@ -64518,12 +65016,14 @@ static JSValue js_fe_drive_static(JSContext *ctx, JSValueConst this_val,
                 args2[ai] = qjs_fe_named_arg(ctx, b, ai, "static-drive");
             JSValue this_opq = qjs_opq_make(ctx, 1, "static-drive-this", qjs_t_opaque());
             qjs_dir_active = 0; qjs_dir_b = NULL; qjs_dir_target = -1;
+            qjs_flow_arm(ctx);   /* #7: the opaque static drive is a flow — capture its writes */
             JSValue r = JS_Call(ctx, targets[i], this_opq, nargs, args2);
             if (JS_IsException(r)) { JSValue e = JS_GetException(ctx); JS_FreeValue(ctx, e); }
             JS_FreeValue(ctx, r);
             JS_FreeValue(ctx, this_opq);
             for (int ai = 0; ai < nargs; ai++) JS_FreeValue(ctx, args2[ai]);
             if (args2) js_free(ctx, args2);
+            qjs_flow_revert(ctx);   /* revert to baseline so the next target forks clean (shared_state.html: g2 reads base) */
             n_called++;
         }
         skip_host:;
@@ -64537,6 +65037,7 @@ static JSValue js_fe_drive_static(JSContext *ctx, JSValueConst this_val,
                 args2[ai] = qjs_fe_named_arg(ctx, b, ai, "chunk-drive");
             JSValue this_opq = qjs_opq_make(ctx, 1, "chunk-drive-this", qjs_t_opaque());
             qjs_dir_b = b; qjs_dir_target = rpos; qjs_dir_active = 1;
+            qjs_flow_arm(ctx);   /* #7 per-invoke isolation: this chunk-load directed drive runs in a LOOP over require sites — without a flow bracket its shared-cell writes accumulate across iterations (the same i2-n-2 leak the real-receiver/opaque drives above already revert). Was the one unbracketed forced JS_Call in the seed drive. */
             JSValue r = JS_Call(ctx, targets[i], this_opq, nargs, args2);
             qjs_dir_active = 0; qjs_dir_b = NULL; qjs_dir_target = -1;
             if (JS_IsException(r)) { JSValue e = JS_GetException(ctx); JS_FreeValue(ctx, e); }
@@ -64544,6 +65045,7 @@ static JSValue js_fe_drive_static(JSContext *ctx, JSValueConst this_val,
             JS_FreeValue(ctx, this_opq);
             for (int ai = 0; ai < nargs; ai++) JS_FreeValue(ctx, args2[ai]);
             if (args2) js_free(ctx, args2);
+            qjs_flow_revert(ctx);   /* revert this chunk-drive's bundle writes -> next require site / target forks clean */
             n_called++;
             /* Entering the loader once runs its straight-line Promise.all,
                firing ALL its require sites in that single execution; only
@@ -64572,6 +65074,9 @@ static const JSCFunctionListEntry js_global_funcs[] = {
     JS_CFUNC_DEF("__isOpaqueAny", 1, js_is_opaque_any ),
     JS_CFUNC_DEF("__feMute", 1, js_fe_mute ),
     JS_CFUNC_DEF("__feBfsActive", 1, js_fe_bfs_active ),
+    JS_CFUNC_DEF("__feFlowBegin", 0, js_fe_flow_begin ),
+    JS_CFUNC_DEF("__feFlowEnd", 0, js_fe_flow_end ),
+    JS_CFUNC_DEF("__feCowPause", 1, js_fe_cow_pause ),
     JS_CFUNC_DEF("__fePhiMute", 1, js_fe_phi_mute ),
     JS_CFUNC_DEF("__feCursor", 0, js_fe_cursor ),
     JS_CFUNC_DEF("__feLen", 0, js_fe_len ),

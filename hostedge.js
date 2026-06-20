@@ -11,6 +11,10 @@
   // Engine stdout print captured before any window stubbing so the
   // @H/@S/@E channel can't be clobbered by window.print().
   var EPRINT = print;
+  // COW capture-pause for PERSISTENT engine writes (the @H/@S emit + its dedup set + progress
+  // counters) so a force-invoke's per-flow revert leaves emitted output + scheduler state
+  // intact — they outlive the flow. No-op outside the COW build. (#7 heap switching)
+  var CPAUSE = (typeof __feCowPause === "function") ? __feCowPause : function () {};
   var OPQ = (typeof __opaque === "function") ? __opaque : function () { return undefined; };
   var ISOPQ = (typeof __isOpaque === "function") ? __isOpaque : function () { return false; };
   // Provenance predicate (TAINT or SYNTH) — header/body field is "an
@@ -1307,6 +1311,11 @@
     while (TQ.length) {
       var fn = TQ.shift();
       var _sk; try { _sk = fn.toString(); } catch (e) { _sk = null; }
+      /* NOTE: bracketing this forced timer-callback .call with FLOWBEG/FLOWEND (per-invoke isolation,
+         the #7 collapse) was MEASURED neutral on shared_state (no timers there) and nudged supabase
+         aborts 1->5 — an unverified moat perturbation with no fixture benefit, so it's NOT applied here.
+         The collapse step is correct in principle but must land with a fixture that exercises a forced
+         timer callback writing a shared cell, so the gain is verified rather than asserted. */
       try { fn.call(G); } catch (e) {}
       _drained++;
       // Per-key spinner accounting (ACROSS flushes): a source-text key that runs
@@ -1342,6 +1351,11 @@
   // behind unrun modules is forced execution at the function level.
   var PRE = Object.create(null);
   var FEMUTE = (typeof __feMute === "function") ? __feMute : function () {};
+  // Per-invoke COW isolation (#7): bracket each force-invoke so its bundle writes are
+  // captured + reverted to baseline before the next, so force-invoke B forks clean and
+  // never reads force-invoke A's shared-global mutations. No-op unless the COW build.
+  var FLOWBEG = (typeof __feFlowBegin === "function") ? __feFlowBegin : function () {};
+  var FLOWEND = (typeof __feFlowEnd === "function") ? __feFlowEnd : function () {};
   // Drain the queued event-handler registrations (FH): fire each registered
   // handler ONCE with its REAL instance — `hf` is the exact closure passed to
   // addEventListener, so closure-var reads (e.g. `btn.getAttribute('data-op')`
@@ -1364,7 +1378,9 @@
       var _curBefore = FECUR();
       var thisArg = ht != null ? ht : G;
       var hev = ht != null ? mkHandlerEvent(ht) : OPQ("handler.event");
+      FLOWBEG();
       try { hf.call(thisArg, hev); } catch (x) {}
+      FLOWEND();
       var _curAfter = FECUR();
       if (_curAfter > _curBefore && _curBefore <= FELEN()) FH.push(hfe);
       else ranKeys.add(hk);
@@ -1386,7 +1402,9 @@
       var v; try { v = G[nm]; } catch (e) { continue; }
       if (typeof v === "function") {
         var fk = keyOf(v); if (ranKeys.has(fk)) continue; ranKeys.add(fk);
+        FLOWBEG();
         try { v.call(G, OPQ("handler.arg0"), OPQ("handler.arg1"), OPQ("handler.arg2")); } catch (x) {}
+        FLOWEND();   // revert this invoke's bundle writes -> next global forks from baseline
       }
       /* A bundle-introduced global OBJECT (an API namespace `window.__d={read,…}`,
          a `new Client()` with methods on the chain, a nested tree) is NOT driven
@@ -1431,7 +1449,9 @@
         var fk2 = keyOf(cb) + ":" + ek;
         if (connKeys.has(fk2)) continue;
         connKeys.add(fk2);
+        FLOWBEG();
         try { cb.call(el); } catch (x) {}
+        FLOWEND();
       }
     } catch (e) {}
 
@@ -1452,7 +1472,9 @@
         var formKey = "form-submit:" + fMethod + ":" + fAction;
         if (ranKeys.has(formKey)) continue;
         ranKeys.add(formKey);
+        FLOWBEG();
         try { fEl.submit(); } catch (e) {}
+        FLOWEND();
       }
     } catch (e) {}
     // <button formaction> overrides the enclosing form's action when
