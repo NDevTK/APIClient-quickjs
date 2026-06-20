@@ -14395,7 +14395,13 @@ static inline int JS_SetGlobalVar(JSContext *ctx, JSAtom prop, JSValue val,
                 return JS_ThrowTypeErrorReadOnly(ctx, JS_PROP_THROW, prop);
             }
         }
-        set_value(ctx, &pr->u.value, val);
+        /* COW: a global is SHARED-SCOPE state (shared_state's G_SHARED, written by g1 and read by g2).
+           Route through the typed trail so per-flow isolation reverts it, exactly like a closure var_ref
+           — else an unrelated forced flow observes the mutation (g1-saw-dirty). The property array is
+           stable during a forced invoke (new globals are only defined at script-top eval via
+           OP_define_var, never inside a function call), so &pr->u.value does not realloc-dangle before
+           the FLOWEND revert. (global_var_obj branch: classic-script `var`.) */
+        cow_set_value(ctx, &pr->u.value, val);
         return 0;
     }
 
@@ -14404,8 +14410,9 @@ static inline int JS_SetGlobalVar(JSContext *ctx, JSAtom prop, JSValue val,
     if (prs) {
         if (likely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
                                   JS_PROP_LENGTH)) == JS_PROP_WRITABLE)) {
-            /* fast path */
-            set_value(ctx, &pr->u.value, val);
+            /* fast path — global_obj property (host-defined global, MEASURED: shared_state's G_SHARED
+               lands here, not global_var_obj). Same shared-scope isolation: route through the trail. */
+            cow_set_value(ctx, &pr->u.value, val);
             return 0;
         }
     }
