@@ -5107,7 +5107,8 @@ void qjs_cow_undo_log(size_t addr, size_t size);   /* fwd (def ~20565; export at
    correctness. Locals/args keep plain set_value: per-call, never shared. */
 static int g_cow_force_log;   /* fwd (def in COW section): cow_set_value sets it so the barrier captures a shared-scope slot even when it physically lives in an excluded value-stack chunk */
 static int g_flow_depth;      /* # of nested live flows (qjs_flow_arm/revert) */
-static void qjs_cow_vt_push(JSValue *slot, JSValue old);   /* fwd (def in COW section): typed-trail record for refcount-exact heap-fork backtrack */
+struct JSVarRef;
+static void qjs_cow_vt_push(JSValue *slot, JSValue old, struct JSVarRef *vref);   /* fwd (def in COW section): typed-trail record for refcount-exact heap-fork backtrack */
 static inline void cow_set_value(JSContext *ctx, JSValue *pval, JSValue new_val) {
     if (g_flow_capture || g_grind_drive_active) {
         /* TYPED TRAIL (heap-fork backtrack, refcount-EXACT) — the typed layer the byte word-log
@@ -5120,11 +5121,39 @@ static inline void cow_set_value(JSContext *ctx, JSValue *pval, JSValue new_val)
            word log (the typed trail is the sole record). BOTH scheduler levels: breadth forks it at
            FLOWBEG, the grind pauses/resumes it via qjs_cow_capture/apply — ONE typed primitive. */
         int sv = g_cow_busy; g_cow_busy = 1;
-        qjs_cow_vt_push(pval, *pval);
+        qjs_cow_vt_push(pval, *pval, NULL);
         *pval = new_val;
         g_cow_busy = sv;
     } else {
         set_value(ctx, pval, new_val);
+    }
+}
+/* var_ref capture with PIN. OP_put_var_ref/OP_set_var_ref write a SHARED closure cell. Capturing its
+   raw slot (&vr->value) would dangle if the var_ref were freed before the flow reverts — the revert
+   would write/free through freed memory. So when capturing a CLOSED var_ref (pvalue == &value, a stable
+   heap cell), PIN it (ref_count++) so it outlives the revert; the trail unpins on revert/commit. OPEN
+   var_refs (pvalue -> a live stack slot close_var_refs relocates) are NOT captured — they are flow-local
+   until closed, and their slot moves on teardown. (The supabase ref_count==0 regression that surfaced
+   when OP_set_var_ref started capturing was NOT this dangle — it was the FLOWEND revert ORDER; see
+   qjs_cow_undo_revert. The pin remains the correct guard against a genuinely GC'd-mid-flow closure.) */
+static inline void cow_put_var_ref(JSContext *ctx, struct JSVarRef *vr, JSValue new_val) {
+    JSValue *pv = ((JSVarRef *)vr)->pvalue;
+    if ((g_flow_capture || g_grind_drive_active) && pv == &((JSVarRef *)vr)->value) {
+        /* INDEPENDENT-OWNERSHIP capture (refcount-EXACT for object values, e.g. supabase's function-
+           valued closure cells, gctype FUNCTION_BYTECODE). The trail owns a REAL js_dup of old (not a
+           "phantom" transfer of the slot's ref), and the write goes through set_value — the SAME path
+           the non-capturing original used, so the displaced old's refcount is handled correctly and the
+           trail's owned ref never aliases another owner (the prior raw `*pv = new_val` left old un-freed
+           and double-decref'd functions on revert -> free_zero_bad rc=-1). Plus PIN the var_ref so its
+           &value slot can't dangle if the closure is GC'd before the flow reverts. Revert: old (owned)
+           transfers back to the slot, the displaced current is freed, the pin released. */
+        int sv = g_cow_busy; g_cow_busy = 1;
+        ((JSVarRef *)vr)->header.ref_count++;      /* pin: &value slot must stay live until revert */
+        qjs_cow_vt_push(pv, js_dup(*pv), (struct JSVarRef *)vr);   /* trail owns an independent ref to old */
+        set_value(ctx, pv, new_val);               /* normal write: frees the slot's old-ref, installs new */
+        g_cow_busy = sv;
+    } else {
+        set_value(ctx, pv, new_val);
     }
 }
 
@@ -20555,10 +20584,12 @@ static uint8_t *qjs_cow_shadow = NULL;
    (qjs_cow_vt_commit): free each old (release the trail's ref; the slot keeps its current value).
    No dedup — every write is a trail entry, so multi-writes to one slot unwind exactly. Pool-alloc'd
    (excluded heap, gm-safe); grows palloc+memcpy (realloc poisoned), old chunk abandoned. */
-typedef struct JSCowVT { JSValue *slot; JSValue old; } JSCowVT;
+/* vref (when non-NULL) is a var_ref the trail PINNED (ref_count++) at capture: its &value slot must
+   not dangle if the closure is GC'd mid-flow before the revert. revert/commit unpin it. */
+typedef struct JSCowVT { JSValue *slot; JSValue old; JSVarRef *vref; } JSCowVT;
 static JSCowVT *qjs_cow_vt = NULL;
 static size_t qjs_cow_vt_n = 0, qjs_cow_vt_cap = 0;
-static void qjs_cow_vt_push(JSValue *slot, JSValue old) {
+static void qjs_cow_vt_push(JSValue *slot, JSValue old, JSVarRef *vref) {
     if (qjs_cow_vt_n >= qjs_cow_vt_cap) {
         size_t nc = qjs_cow_vt_cap ? qjs_cow_vt_cap * 2 : 256;
         JSCowVT *nv = (JSCowVT *)qjs_cow_palloc(nc * sizeof(JSCowVT));
@@ -20568,6 +20599,7 @@ static void qjs_cow_vt_push(JSValue *slot, JSValue old) {
     }
     qjs_cow_vt[qjs_cow_vt_n].slot = slot;
     qjs_cow_vt[qjs_cow_vt_n].old = old;
+    qjs_cow_vt[qjs_cow_vt_n].vref = vref;
     qjs_cow_vt_n++;
 }
 static void qjs_cow_vt_revert_to(size_t mark);   /* fwd: def after g_cow_exec_rt */
@@ -20660,7 +20692,7 @@ QJS_JSEXPORT void qjs_cow_apply(uint8_t *mem, const JSCowDelta *d) {
             JSValue *slot = dm->vts[j];
             if (grt) JS_FreeValueRT(grt, *slot);   /* release the slot's restored-old ref */
             *slot = dm->vtc[j];                     /* slot = current (delta's dup transfers to slot) */
-            qjs_cow_vt_push(slot, dm->vto[j]);      /* trail owns old (delta's dup transfers to trail) */
+            qjs_cow_vt_push(slot, dm->vto[j], NULL);   /* trail owns old (delta's dup transfers); no var_ref pin (grind delta tracks its own COW) */
         }
         dm->vtn = 0;   /* refs transferred out — delta_free must NOT free them */
     }
@@ -20886,7 +20918,11 @@ static void qjs_cow_vt_revert_to(size_t mark) {
     while (k > mark) { k--;
         JSValue cur = *qjs_cow_vt[k].slot;
         *qjs_cow_vt[k].slot = qjs_cow_vt[k].old;   /* ALWAYS restore old (trail's ref → slot) — isolation */
-        if (rt) JS_FreeValueRT(rt, cur);           /* decref the displaced current (skip only if no rt: leak, never crash) */
+        if (rt) JS_FreeValueRT(rt, cur);           /* decref the displaced current */
+        /* UNPIN the var_ref captured with this entry (cow_put_var_ref pinned it so &value couldn't
+           dangle). free_var_ref decrefs+frees: if the pin was its LAST ref (its closure died mid-flow),
+           it frees the var_ref and old too — correct, a dead cell is unobservable; else old stays. */
+        if (qjs_cow_vt[k].vref && rt) free_var_ref(rt, qjs_cow_vt[k].vref);
     }
     g_cow_busy = sv;
 }
@@ -20896,13 +20932,24 @@ static void qjs_cow_vt_commit(void) {
     JSRuntime *rt = g_cow_rt;
     int sv = g_cow_busy; g_cow_busy = 1;
     size_t k = qjs_cow_vt_n; qjs_cow_vt_n = 0;
-    while (k > 0) { k--; if (rt) JS_FreeValueRT(rt, qjs_cow_vt[k].old); }
+    while (k > 0) { k--;
+        if (rt) JS_FreeValueRT(rt, qjs_cow_vt[k].old);   /* release the trail's ref to old */
+        if (qjs_cow_vt[k].vref && rt) free_var_ref(rt, qjs_cow_vt[k].vref);   /* unpin (keeps current) */
+    }
     g_cow_busy = sv;
 }
 /* Revert the WHOLE live log to baseline (the grind's discard/to_baseline: no enclosing flow). */
 QJS_JSEXPORT void qjs_cow_undo_revert(void) {
+    /* ORDER IS LOAD-BEARING: typed trail FIRST, then the raw word log. A shared closure cell
+       (var_ref->value) is covered by BOTH logs; the typed trail is refcount-EXACT and must do its
+       accounting on the GENUINE slot value (free the displaced current, restore old with correct
+       refcounts) BEFORE the word log's raw byte-restore touches the slot. The reverse order let the
+       word log byte-clobber the slot to the old pointer (no incref), after which the typed trail freed
+       that under-referenced value -> ref_count underflow to -1 (supabase free_zero_bad, MEASURED
+       2026-06-20: word-first abort 25-39 / fzb 24-28; typed-first abort 2-3 / fzb 0). The word log's
+       subsequent restore of those same slots is then an idempotent same-pointer byte-write. */
+    qjs_cow_vt_revert_to(0);
     qjs_cow_undo_revert_to(0);
-    qjs_cow_vt_revert_to(0);   /* typed trail: refcount-exact backtrack of the shared-scope slots */
 }
 /* Emit the COW activity counters WITHOUT resetting — called at a DRIVE's END (qjsmain
    do_drive) so the within-drive activity is observed BEFORE the next drive's HEAPU8 image
@@ -22582,14 +22629,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_get_var_ref1): *sp++ = js_dup(*var_refs[1]->pvalue); BREAK;
         CASE(OP_get_var_ref2): *sp++ = js_dup(*var_refs[2]->pvalue); BREAK;
         CASE(OP_get_var_ref3): *sp++ = js_dup(*var_refs[3]->pvalue); BREAK;
-        CASE(OP_put_var_ref0): cow_set_value(ctx, var_refs[0]->pvalue, *--sp); BREAK;
-        CASE(OP_put_var_ref1): cow_set_value(ctx, var_refs[1]->pvalue, *--sp); BREAK;
-        CASE(OP_put_var_ref2): cow_set_value(ctx, var_refs[2]->pvalue, *--sp); BREAK;
-        CASE(OP_put_var_ref3): cow_set_value(ctx, var_refs[3]->pvalue, *--sp); BREAK;
-        CASE(OP_set_var_ref0): set_value(ctx, var_refs[0]->pvalue, js_dup(sp[-1])); BREAK;
-        CASE(OP_set_var_ref1): set_value(ctx, var_refs[1]->pvalue, js_dup(sp[-1])); BREAK;
-        CASE(OP_set_var_ref2): set_value(ctx, var_refs[2]->pvalue, js_dup(sp[-1])); BREAK;
-        CASE(OP_set_var_ref3): set_value(ctx, var_refs[3]->pvalue, js_dup(sp[-1])); BREAK;
+        CASE(OP_put_var_ref0): cow_put_var_ref(ctx, var_refs[0], *--sp); BREAK;
+        CASE(OP_put_var_ref1): cow_put_var_ref(ctx, var_refs[1], *--sp); BREAK;
+        CASE(OP_put_var_ref2): cow_put_var_ref(ctx, var_refs[2], *--sp); BREAK;
+        CASE(OP_put_var_ref3): cow_put_var_ref(ctx, var_refs[3], *--sp); BREAK;
+        /* COW: OP_set_var_ref writes the SAME shared closure cell as OP_put_var_ref, differing only in
+           keeping the value on the stack (emitted for `++x` whose result is USED: shared_state's
+           `send("i2-n-"+bump())`). Route it through cow_put_var_ref too, so the per-flow revert can undo
+           it — only OP_put_var_ref was captured before, so `mod=..` isolated but `++counter` leaked
+           (i2-n-2). cow_put_var_ref captures+pins only a CLOSED var_ref (see its definition). */
+        CASE(OP_set_var_ref0): cow_put_var_ref(ctx, var_refs[0], js_dup(sp[-1])); BREAK;
+        CASE(OP_set_var_ref1): cow_put_var_ref(ctx, var_refs[1], js_dup(sp[-1])); BREAK;
+        CASE(OP_set_var_ref2): cow_put_var_ref(ctx, var_refs[2], js_dup(sp[-1])); BREAK;
+        CASE(OP_set_var_ref3): cow_put_var_ref(ctx, var_refs[3], js_dup(sp[-1])); BREAK;
 
         CASE(OP_get_var_ref):
             {
@@ -22607,7 +22659,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int idx;
                 idx = get_u16(pc);
                 pc += 2;
-                cow_set_value(ctx, var_refs[idx]->pvalue, sp[-1]);
+                cow_put_var_ref(ctx, var_refs[idx], sp[-1]);
                 sp--;
             }
             BREAK;
@@ -22616,7 +22668,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int idx;
                 idx = get_u16(pc);
                 pc += 2;
-                set_value(ctx, var_refs[idx]->pvalue, js_dup(sp[-1]));
+                cow_put_var_ref(ctx, var_refs[idx], js_dup(sp[-1]));   /* COW: capture+pin a CLOSED shared cell (see cow_put_var_ref) */
             }
             BREAK;
         CASE(OP_get_var_ref_check):
