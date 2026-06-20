@@ -61981,6 +61981,13 @@ static int qjs_is_host_model_file(JSAtom filename) {
 static JSAtom qjs_host_atom_at(JSFunctionBytecode *b, int pos) {
     const uint8_t *bc = b->byte_code_buf;
     int op = bc[pos];
+    /* OP_get_var/get_field/get_field2/put_field carry a 4-byte atom operand at pos+1, so the read
+       spans [pos, pos+5). Bound it to byte_code_len: a forced-exec scanner can land on such an opcode
+       at the buffer tail (or mid-instruction after an opaque drive mutated the code), and get_u32 then
+       reads PAST byte_code_buf -> "memory access out of bounds" wasm trap that crashes the whole
+       deep-grind instance and forces a recycle (the dominant recycle cause; MEASURED js_fe_drive_static
+       scan, esm_cdn). Out-of-range operand = not a host atom. */
+    if (pos + 5 > b->byte_code_len) return JS_ATOM_NULL;
     if (op == OP_get_var || op == OP_get_field || op == OP_get_field2) {
         JSAtom a = (JSAtom)get_u32(bc + pos + 1);
         for (int k = 0; k < qjs_host_atoms_n; k++)
@@ -64927,11 +64934,25 @@ static JSValue js_fe_drive_static(JSContext *ctx, JSValueConst this_val,
             p->class_id != JS_CLASS_ASYNC_FUNCTION &&
             p->class_id != JS_CLASS_ASYNC_GENERATOR_FUNCTION) continue;
         JSFunctionBytecode *b = p->u.func.function_bytecode;
-        if (!b || !b->byte_code_buf) continue;
-        if (b->qjs_executed) continue;   /* reached by the dynamic frontier — its real values are already captured */
-        if (qjs_is_host_model_file(b->filename)) continue;   /* never force-drive our own shim */
-        int has_host = 0;
+        if (!b) continue;
+        /* GHOST GUARD (comprehensive, BEFORE any deep field read). A COW forced-flow revert restores
+           heap BYTES to baseline but cannot unlink a function object the flow created from rt->gc_obj_list,
+           so the next scan can reach a GHOST whose fields (byte_code_buf/len, filename atom) are stale
+           garbage — dereferencing any of them -> "memory access out of bounds" wasm trap that crashes the
+           deep-grind instance and forces a recycle (MEASURED dominant recycle cause; the header guard
+           alone halved it, so the rest are ghosts with a coincidentally-valid type but garbage later
+           fields). Validate the GC header (type + live refcount) and that the bytecode buffer + its full
+           scan extent lie inside live linear memory [__heap_base, mem_end), THEN it is safe to read
+           filename / scan opcodes. A ghost fails one of these and is skipped, not dereferenced. */
+        if (b->header.gc_obj_type != JS_GC_OBJ_TYPE_FUNCTION_BYTECODE) continue;
+        if (b->header.ref_count <= 0) continue;
+        if (!b->byte_code_buf) continue;
         int len = b->byte_code_len, pos = 0;
+        { size_t _bc = (size_t)b->byte_code_buf, _hb = (size_t)&__heap_base, _me = (size_t)__builtin_wasm_memory_size(0) * 65536;
+          if (len < 0 || _bc < _hb || _bc + (size_t)len > _me) continue; }
+        if (b->qjs_executed) continue;   /* reached by the dynamic frontier — its real values are already captured */
+        if (qjs_is_host_model_file(b->filename)) continue;   /* never force-drive our own shim (filename read now ghost-safe) */
+        int has_host = 0;
         while (pos < len) {
             int op = b->byte_code_buf[pos];
             int sz = short_opcode_info(op).size;
