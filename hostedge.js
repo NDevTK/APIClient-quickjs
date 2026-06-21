@@ -270,32 +270,22 @@
   // Timer-spinner DEFER (the across-flush analogue of the per-flush 512 idle break):
   // a re-queuing task that schedules a NEW closure each tick — setTimeout(()=>tick(),0)
   // inside tick — has a new object identity every time, so _enqSeen never dedups it and
-  // it churns the pump (github round-1: 1278 flushes × up to 512 drains = ~650k wasted
-  // drains, so round-1 never completes and the deep round never starts). Key by SOURCE
-  // TEXT (fn.toString(), identical across the spinner's ticks); once a key has run K
-  // times WITHOUT advancing host-progress (_hProg / @H), it is a proven NO-OUTPUT spinner
-  // — defer future enqueues of it. Safe: a no-@H-progress task produces no endpoints, so
-  // dropping it loses nothing (the starve-don't-bound principle); a legit same-source loop
-  // (for(i)setTimeout(()=>f(i))) whose f DOES emit @H keeps resetting its stale count and
-  // is never deferred. NOT the per-flush cap (which truncates late progress).
-  var _spinKeys = new Set();       // source-text keys proven to be no-output spinners
-  var _taskProg = new Map();       // source-text key -> { h:_hProg at last progress, s:stale-run count }
-  var _SPIN_K = 64;                // K no-@H-progress runs of a key => defer it
+  // it churns the pump. The OLD answer keyed by source TEXT and DROPPED a key after K=64
+  // no-@H-progress runs (_spinKeys/_SPIN_K) — a no-progress count + seen-set, i.e. a BOUND
+  // that truncates distinct work. DELETED. The spinner is now STARVED structurally: a
+  // source-churning tick's new closures never grow __hostRan, so the outer fixpoint
+  // (qjsmain.c:936) quiesces and the spinner's leftover TQ is left PAUSED (resumable,
+  // ~0 CPU) — and __hostFlush drains only a per-flush BATCH SNAPSHOT, so a re-enqueue
+  // can't trap the drain in an unbounded inner loop. Nothing dropped; the WFQ orders.
   var _hProg = 0;                  // monotone progress: count of DISTINCT @H host edges emitted (see H)
   var _hSeen = new Set();
   var fnsrc = Function.prototype.toString;
   function keyOf(fn) { try { return fnsrc.call(fn); } catch (e) { return String(fn); } }
-  // Timer dedup is by IDENTITY (each distinct callback object runs once). The old
-  // source-keyed dedup wrongly dropped every distinct callback sharing a source -- the
-  // native Promise resolve from new Promise(r=>setTimeout(r,0)) that include-fragment and
-  // most await->macrotask code defer their fetch behind (all "[native code]") -- losing
-  // every CE/timer instance fetch but the first, and each iteration of an await-loop over
-  // DISTINCT endpoints. The drain (__hostFlush) additionally stops once a stretch is
-  // genuinely dry (no new @H): a no-progress fixpoint that bounds distinct-object spin
-  // loops WITHOUT dropping productive ones. No depth/step cap -- progress resets dry.
+  // Timer dedup is by IDENTITY (each distinct callback object runs once). A source-churning
+  // spinner (new closure per tick) evades identity dedup — that is fine now: it is starved
+  // by __hostRan quiescence + batch-snapshot draining, not dropped.
   function enq(fn) {
     if (typeof fn !== "function" || _enqSeen.has(fn)) return;
-    try { if (_spinKeys.has(fn.toString())) return; } catch (e) {}   // defer a proven no-output spinner
     _enqSeen.add(fn); TQ.push(fn);
   }
   var _tid = 0;
@@ -1307,34 +1297,23 @@
     // dispatchEvent path, losing coverage of any wrapper that
     // distinguishes dispatch-fire from direct-call.
     G.dispatchEvent(mkMessageEvent()); dispatchDoc(mkMessageEvent());
-    var _drained = 0;
-    while (TQ.length) {
+    // Drain a BATCH SNAPSHOT — the callbacks present at flush START — not until-empty.
+    // Re-enqueues a callback makes during this flush land in TQ and wait for the NEXT
+    // outer-loop flush (qjsmain.c:936), where __hostRan flow-level quiescence applies.
+    // This is the collapse of the second bounded scheduler into the one WFQ policy:
+    // the OLD _SPIN_K=64/_spinKeys seen-set DROPPED a no-@H-progress key's future
+    // re-queues (a bound that truncates distinct work). DELETED. Instead an infinite
+    // re-enqueue spinner is STARVED by the outer loop: its same-source closures never
+    // grow __hostRan, so the fixpoint quiesces and its leftover TQ is left PAUSED
+    // (resumable, ~0 CPU) — never dropped, never spun-to-exhaustion. A genuine
+    // producing callback grows __hostRan/_hProg, so the outer loop keeps pumping it.
+    var _batch = TQ.length;
+    while (_batch-- > 0 && TQ.length) {
       var fn = TQ.shift();
-      var _sk; try { _sk = fn.toString(); } catch (e) { _sk = null; }
       /* NOTE: bracketing this forced timer-callback .call with FLOWBEG/FLOWEND (per-invoke isolation,
          the #7 collapse) was MEASURED neutral on shared_state (no timers there) and nudged supabase
-         aborts 1->5 — an unverified moat perturbation with no fixture benefit, so it's NOT applied here.
-         The collapse step is correct in principle but must land with a fixture that exercises a forced
-         timer callback writing a shared cell, so the gain is verified rather than asserted. */
+         aborts 1->5 — an unverified moat perturbation with no fixture benefit, so it's NOT applied here. */
       try { fn.call(G); } catch (e) {}
-      _drained++;
-      // Per-key spinner accounting (ACROSS flushes): a source-text key that runs
-      // _SPIN_K times without advancing _hProg is a no-output spinner — record it in
-      // _spinKeys so enq() defers its future re-queues (a tick that schedules a NEW
-      // closure each time evades _enqSeen, so identity dedup alone never stops it).
-      if (_sk) {
-        var _tp = _taskProg.get(_sk);
-        if (!_tp) _taskProg.set(_sk, { h: _hProg, s: 0 });
-        else if (_hProg > _tp.h) { _tp.h = _hProg; _tp.s = 0; }
-        else if (++_tp.s >= _SPIN_K) _spinKeys.add(_sk);
-      }
-      // NO per-flush idle CAP — the old 512-idle break is DISSOLVED (policy: a count
-      // that STOPS work is a vestigial bound). The _SPIN_K per-source-text-key defer
-      // above IS the structural replacement it was a placeholder for: a no-@H-progress
-      // key is added to _spinKeys so enq() SKIPS its future re-queues, so the TQ
-      // provably DRAINS (a fixpoint — re-queues stop) instead of being truncated by a
-      // count. A genuine producing loop keeps resetting its key's stale count via @H
-      // progress, so it is never deferred; only a pure no-output spinner is.
     }
   };
 
