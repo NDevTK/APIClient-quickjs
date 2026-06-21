@@ -3473,6 +3473,8 @@ static __maybe_unused void JS_DumpShapes(JSRuntime *rt);
 
 static JSValue js_function_apply(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv, int magic);
+static JSValue js_function_call(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv);   /* fwd: the OP_call_method .call C-re-entry trampoline detects it */
 static void js_array_finalizer(JSRuntime *rt, JSValueConst val);
 static void js_array_mark(JSRuntime *rt, JSValueConst val,
                           JS_MarkFunc *mark_func);
@@ -22225,6 +22227,40 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 } else {
                     JSValue _fo = call_argv[-1];
                     JSObject *_fp = (JS_VALUE_GET_TAG(_fo) == JS_TAG_OBJECT) ? JS_VALUE_GET_OBJ(_fo) : NULL;
+                    /* C-RE-ENTRY trampoline for Function.prototype.call: `fn.call(this, …args)` routes
+                       through the C builtin js_function_call -> JS_Call -> JS_CallInternal, growing the
+                       C stack per level (infinite .call-recursion overflows/spins, un-preemptible — the
+                       last C-stack-growth re-entry). Detect the method IS js_function_call and REDIRECT
+                       to the real target (the receiver call_argv[-2]) on the heap stack: reshape
+                       [recv=fn, method, arg0=this, arg1…] -> [this, fn, arg1…] and route via setup_callee
+                       (qjs_call_extra=2 frees this+func+args). Now .call-recursion is heap-stacked and
+                       per-opcode preemptible like any normal/method call. NORMAL-bytecode target only;
+                       native/bound stay on the proven C path. Handles tail (`return fn.call(…)`). */
+                    if ((opcode == OP_call_method || opcode == OP_tail_call_method) && _fp &&
+                        _fp->class_id == JS_CLASS_C_FUNCTION &&
+                        _fp->u.cfunc.c_function.generic == js_function_call) {
+                        JSValue _rcv = call_argv[-2];   /* the receiver = the real target fn */
+                        JSObject *_rp = (JS_VALUE_GET_TAG(_rcv) == JS_TAG_OBJECT) ? JS_VALUE_GET_OBJ(_rcv) : NULL;
+                        if (_rp && _rp->class_id == JS_CLASS_BYTECODE_FUNCTION &&
+                            _rp->u.func.function_bytecode->func_kind == JS_FUNC_NORMAL) {
+                            JSValue _cthis = (call_argc >= 1) ? call_argv[0] : JS_UNDEFINED;
+                            JS_FreeValue(ctx, call_argv[-1]);            /* free the js_function_call method object */
+                            call_argv[-2] = _cthis;                     /* this slot */
+                            call_argv[-1] = _rcv;                       /* func slot = real target */
+                            for (int _ci = 1; _ci < call_argc; _ci++)   /* drop arg0 (the this), shift args left */
+                                call_argv[_ci - 1] = call_argv[_ci];
+                            if (call_argc >= 1) { sp -= 1; call_argc -= 1; }
+                            call_argv = sp - call_argc;                 /* unchanged address; recompute for clarity */
+                            sf->cur_sp = sp;
+                            sf->qjs_call_argc = call_argc;
+                            sf->qjs_call_extra = 2;
+                            sf->qjs_is_tail = (opcode == OP_tail_call_method);
+                            func_obj = _rcv; this_obj = call_argv[-2]; new_target = JS_UNDEFINED;
+                            argc = call_argc; argv = vc(call_argv); flags = 0;
+                            p = _rp; b = _rp->u.func.function_bytecode;
+                            goto setup_callee;
+                        }
+                    }
                     if (opcode == OP_call_method && _fp &&
                         b->func_kind == JS_FUNC_NORMAL &&
                         _fp->class_id == JS_CLASS_BYTECODE_FUNCTION &&
