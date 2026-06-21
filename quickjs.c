@@ -9392,10 +9392,20 @@ static void js_free_value_rt(JSRuntime *rt, JSValue v)
                 qjs_note_dfree((int)rt->gc_phase, (int)p->gc_obj_type);
             }
             if (rt->gc_phase != JS_GC_PHASE_REMOVE_CYCLES) {
-                list_del(&p->link);
-                list_add(&p->link, &rt->gc_zero_ref_count_list);
-                if (rt->gc_phase == JS_GC_PHASE_NONE) {
-                    free_zero_refcount(rt);
+                if ((g_flow_capture || g_grind_drive_active) && qjs_cow_undo_n != 0) {
+                    /* A FLOW IS A GC-FREE TRANSACTION (the heap-switching core): while a per-flow
+                       word-log revert is pending, do NOT queue/finalize an object that reached
+                       ref_count 0 — the revert may byte-restore its ref_count and a finalized-then-
+                       resurrected object aborts (free_zero_refcount). Left at rc 0 in gc_obj_list; the
+                       next cycle GC (undo_n==0, between flows) collects it. This completes the
+                       transactional model the shipped GC-undo-guard started, eliminating the crash-
+                       recycles entirely (the recycle becomes dead code). */
+                } else {
+                    list_del(&p->link);
+                    list_add(&p->link, &rt->gc_zero_ref_count_list);
+                    if (rt->gc_phase == JS_GC_PHASE_NONE) {
+                        free_zero_refcount(rt);
+                    }
                 }
             }
         }
