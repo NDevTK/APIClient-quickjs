@@ -9781,6 +9781,12 @@ static void gc_free_cycles(JSRuntime *rt)
 
 void JS_RunGC(JSRuntime *rt)
 {
+    /* Never run the cycle GC while a flow revert is PENDING (a BFS flow capturing, or the word-log
+       non-empty): the GC would queue zero-refcount objects on gc_zero_ref_count_list and the pending
+       revert then byte-restores their ref_count -> the drain aborts (free_zero_refcount). js_trigger_gc
+       guards the malloc-threshold path; this covers the EXPLICIT JS_RunGC callers (the grind setup at
+       ~63754). in_free (teardown) bypasses — teardown MUST collect, and no flow is live then. */
+    if (!rt->in_free && (g_flow_capture || qjs_cow_undo_n != 0)) return;
     /* decrement the reference of the children of each object. mark =
        1 after this pass. */
     gc_decref(rt);
@@ -64953,9 +64959,10 @@ static JSValue js_fe_drive_static(JSContext *ctx, JSValueConst this_val,
            fields). Validate the GC header (type + live refcount) and that the bytecode buffer + its full
            scan extent lie inside live linear memory [__heap_base, mem_end), THEN it is safe to read
            filename / scan opcodes. A ghost fails one of these and is skipped, not dereferenced. */
-        if (b->header.gc_obj_type != JS_GC_OBJ_TYPE_FUNCTION_BYTECODE) continue;
-        if (b->header.ref_count <= 0) continue;
-        if (!b->byte_code_buf) continue;
+        /* GHOST HEADER GUARDS REMOVED: the complete per-flow revert (engine 284c923 — grow shadow/undo,
+           never drop) reverts the gc_obj_list link so no flow node is left linked-but-zeroed. If recycles
+           spike, a residual ghost survives the revert (investigate); if flat, these were dead. */
+        if (!b->byte_code_buf) continue;   /* general null safety (also catches a ghost), kept */
         int len = b->byte_code_len, pos = 0;
         { size_t _bc = (size_t)b->byte_code_buf, _hb = (size_t)&__heap_base, _me = (size_t)__builtin_wasm_memory_size(0) * 65536;
           if (len < 0 || _bc < _hb || _bc + (size_t)len > _me) continue; }
