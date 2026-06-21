@@ -22261,6 +22261,52 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             goto setup_callee;
                         }
                     }
+                    /* Same for Function.prototype.apply: `fn.apply(this, argsArray)` -> the C builtin
+                       js_function_apply (magic 0) C-re-enters. SPREAD the args array onto the value stack
+                       (build_arg_list dup's the elements; MOVE them in, free only the array) and redirect
+                       to the receiver on the heap stack — completing the C-re-entry trampoline for the
+                       function-call builtins. Falls back to the C path for Reflect/construct (magic!=0), a
+                       null/undefined/non-object or oversized array, or a non-normal receiver. */
+                    if ((opcode == OP_call_method || opcode == OP_tail_call_method) && _fp &&
+                        _fp->class_id == JS_CLASS_C_FUNCTION &&
+                        _fp->u.cfunc.c_function.generic_magic == js_function_apply &&
+                        _fp->u.cfunc.magic == 0) {
+                        JSValue _rcv = call_argv[-2];
+                        JSObject *_rp = (JS_VALUE_GET_TAG(_rcv) == JS_TAG_OBJECT) ? JS_VALUE_GET_OBJ(_rcv) : NULL;
+                        JSValue _arr = (call_argc >= 2) ? call_argv[1] : JS_UNDEFINED;
+                        if (_rp && _rp->class_id == JS_CLASS_BYTECODE_FUNCTION &&
+                            _rp->u.func.function_bytecode->func_kind == JS_FUNC_NORMAL &&
+                            (call_argc < 2 || JS_VALUE_GET_TAG(_arr) == JS_TAG_OBJECT)) {
+                            uint32_t _alen = 0; JSValue *_atab = NULL;
+                            if (call_argc >= 2) {              /* _arr is an object here */
+                                _atab = build_arg_list(ctx, &_alen, _arr);
+                                if (!_atab) goto exception;    /* a getter threw — propagate */
+                            }
+                            if ((int)_alen <= (int)(stack_buf + b->stack_size - call_argv)) {
+                                JSValue *_abase = call_argv - 2;   /* [recv, method, (this), (arr)] */
+                                JSValue _afn = _abase[0];
+                                JSValue _athis = (call_argc >= 1) ? _abase[2] : JS_UNDEFINED;
+                                JS_FreeValue(ctx, _abase[1]);                          /* method */
+                                if (call_argc >= 2) JS_FreeValue(ctx, _abase[3]);      /* array (elems moved into _atab) */
+                                _abase[0] = _athis;            /* this slot */
+                                _abase[1] = _afn;              /* func slot = real target */
+                                for (uint32_t _ai = 0; _ai < _alen; _ai++) _abase[2 + _ai] = _atab[_ai];  /* MOVE owned elems */
+                                if (_atab) js_free(ctx, _atab);                        /* free the array, not the elems */
+                                sp = _abase + 2 + _alen;
+                                call_argc = (int)_alen;
+                                call_argv = _abase + 2;
+                                sf->cur_sp = sp;
+                                sf->qjs_call_argc = call_argc;
+                                sf->qjs_call_extra = 2;
+                                sf->qjs_is_tail = (opcode == OP_tail_call_method);
+                                func_obj = _afn; this_obj = _abase[0]; new_target = JS_UNDEFINED;
+                                argc = call_argc; argv = vc(call_argv); flags = 0;
+                                p = _rp; b = _rp->u.func.function_bytecode;
+                                goto setup_callee;
+                            }
+                            if (_atab) free_arg_list(ctx, _atab, _alen);   /* headroom insufficient -> C path */
+                        }
+                    }
                     if (opcode == OP_call_method && _fp &&
                         b->func_kind == JS_FUNC_NORMAL &&
                         _fp->class_id == JS_CLASS_BYTECODE_FUNCTION &&
