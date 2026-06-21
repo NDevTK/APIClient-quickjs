@@ -22089,9 +22089,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        chain never grows the C stack. The per-call yield is KEPT
                        (js_poll_interrupts) so the scheduler still gets control at
                        every recursion level and can starve a forced recursion.
-                       Tail calls, native/bound callees and async/generator stay on
-                       the proven C-recursion path below; the result is spliced when
-                       the callee returns via the done: teardown. */
+                       NORMAL->NORMAL tail calls trampoline too (their result is
+                       returned straight up at teardown); native/bound callees and
+                       async/generator stay on the proven C-recursion path below; the
+                       result is spliced when the callee returns via the done: teardown. */
                     JSValue _fo = call_argv[-1];
                     JSObject *_fp = (JS_VALUE_GET_TAG(_fo) == JS_TAG_OBJECT)
                                     ? JS_VALUE_GET_OBJ(_fo) : NULL;
@@ -22103,8 +22104,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        resumable, evictable — never a depth cap, never a same-args fixpoint.
                        (A terminating opaque recursion now reaches its deep base case, e.g.
                        meili's wrapper chain to this.httpClient, instead of being truncated.) */
-                    if (opcode == OP_call && _fp &&
-                        b->func_kind == JS_FUNC_NORMAL &&   /* L1 universal (un-gated): trampoline a NORMAL->NORMAL call. async/generator CALLERS stay on the proven C path — their frames live in async_func_init's malloc buffer (not the arena), so the reload's arena pop/cur_sp semantics don't apply to them. Deep SYNCHRONOUS recursion (the C-stack-overflow case) is normal->normal and IS trampolined; async recursion is bounded by the microtask loop, so this restriction keeps overflow-proofing while staying value-correct. The value-correctness blocker (free_zero UAF) was the reload restoring the WRONG var_refs (sf->var_refs = this frame's own capturable slots) instead of p->u.func.var_refs (the closure refs OP_get_var_ref* deref) — fixed at the reload (var_refs = _cp->u.func.var_refs) + resume-entry. */
+                    if ((opcode == OP_call || opcode == OP_tail_call) && _fp &&
+                        b->func_kind == JS_FUNC_NORMAL &&   /* L1 universal (un-gated): trampoline a NORMAL->NORMAL call. async/generator CALLERS stay on the proven C path — their frames live in async_func_init's malloc buffer (not the arena), so the reload's arena pop/cur_sp semantics don't apply to them. Deep SYNCHRONOUS recursion (the C-stack-overflow case) is normal->normal and IS trampolined; async recursion is bounded by the microtask loop, so this restriction keeps overflow-proofing while staying value-correct. The value-correctness blocker (free_zero UAF) was the reload restoring the WRONG var_refs (sf->var_refs = this frame's own capturable slots) instead of p->u.func.var_refs (the closure refs OP_get_var_ref* deref) — fixed at the reload (var_refs = _cp->u.func.var_refs) + resume-entry. TAIL calls (OP_tail_call: `return f(x)`) trampoline too — a tail-recursive loop (`return rec(n-1)`) was the one NORMAL->NORMAL chain still C-recursing (the overflow@depth-80 root); its callee is set up on the heap arena exactly like OP_call, and the teardown's `if(_tail) goto done` (25607) propagates the callee's result straight up instead of splicing+resuming, giving correct tail semantics with the C stack flat. */
                         _fp->class_id == JS_CLASS_BYTECODE_FUNCTION &&
                         _fp->u.func.function_bytecode->func_kind == JS_FUNC_NORMAL) {
                         /* No JSPI suspend and no inline job-drain here: preemption
@@ -22113,8 +22114,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            for the trampoline reload. */
                         sf->cur_sp = sp;
                         sf->qjs_call_argc = call_argc;
-                        sf->qjs_call_extra = 1;     /* OP_call: free func + args on return */
-                        sf->qjs_is_tail = 0;
+                        sf->qjs_call_extra = 1;     /* OP_call/OP_tail_call: free func + args on return */
+                        sf->qjs_is_tail = (opcode == OP_tail_call);   /* tail: teardown returns the result up (goto done), no splice */
                         func_obj = _fo; this_obj = JS_UNDEFINED; new_target = JS_UNDEFINED;
                         argc = call_argc; argv = vc(call_argv); flags = 0;
                         p = _fp; b = _fp->u.func.function_bytecode;
@@ -25601,7 +25602,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             if (JS_IsException(ret_val))
                 goto exception;           /* propagate the throw into the caller */
             if (_tail)
-                goto done;                /* (tail calls not trampolined in this slice) */
+                goto done;                /* trampolined tail call: the caller's only act was `return callee(...)`, so its result IS the caller's result — tear the caller down too (no splice/resume), C stack flat for unbounded tail recursion. */
             /* splice the callee's result into the caller's stack */
             for (i = -_cextra; i < _cargc; i++)
                 JS_FreeValue(ctx, (sp - _cargc)[i]);
