@@ -63109,6 +63109,46 @@ static JSValue js_fe_cow_pause(JSContext *ctx, JSValueConst this_val,
     else if (g_cow_pause > 0) g_cow_pause--;
     return JS_UNDEFINED;
 }
+/* __feDriveBreadth(fn, a0, a1, a2): the boot BREADTH force-invoke, made PREEMPTIBLE.
+   The boot epilogue force-invokes every bundle global with opaque args to surface its
+   frontiers — but a plain `fn.call(G, opaque)` has no preemption point, so a function that
+   recurses/loops unbounded on its opaque arg spins the worker dead (the synchronous-loop
+   trap). Drive it under rt->qjs_driving instead: YIELD_POLL then returns to HERE every
+   ~quantum with the heap call-chain intact. A FINITE function completes within the quantum
+   (its @H/frontiers surfaced — react effect, etc.); a NON-TERMINATING one is PREEMPTED after
+   a fair quantum (QJS_DEFER_QUANTUM yield-windows) and its suspended chain freed — it is an
+   orphan the deep grind then drives THROUGH the WFQ pause (qjs_flow_save), where it is starved
+   (~0 CPU, resumable). So breadth no longer blocks on an infinite-on-opaque global, WITHOUT a
+   throw (which can't tell infinite from slow-productive) and WITHOUT dropping breadth coverage.
+   Preemption is a fixed WINDOW count (granularity), not a no-progress/output count. */
+static JSValue js_fe_drive_breadth(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv) {
+    JSRuntime *rt = ctx->rt;
+    if (argc < 1) return JS_UNDEFINED;
+    JSValueConst fn = argv[0];
+    JSValueConst cargs[3];
+    cargs[0] = argc > 1 ? argv[1] : JS_UNDEFINED;
+    cargs[1] = argc > 2 ? argv[2] : JS_UNDEFINED;
+    cargs[2] = argc > 3 ? argv[3] : JS_UNDEFINED;
+    int _sv_driving = rt->qjs_driving;
+    qjs_set_driving(ctx, 1);
+    JSValue r = JS_Call(ctx, fn, this_val, 3, cargs);
+    int _slice = 0;
+    while (rt->qjs_yielded) {
+        rt->qjs_yielded = 0;
+        if (++_slice < QJS_DEFER_QUANTUM) {
+            rt->qjs_resume_chain = 1;
+            r = qjs_resume_chain_call(ctx);
+        } else {
+            JS_FreeValue(ctx, r);
+            qjs_free_suspended_trampoline_frames(ctx);   /* drop the non-terminating chain; the grind re-drives it (paused/starved) */
+            r = JS_UNDEFINED;
+            break;
+        }
+    }
+    if (!_sv_driving) qjs_set_driving(ctx, 0);
+    return r;
+}
 static void qjs_dd_free(JSContext *ctx);   /* fwd: driven-set + ids reset (defined below) */
 /* Capture a REAL closure instance the moment a driven factory orphan
    instantiates it (called from js_closure2 during an active grind), so a
@@ -65248,6 +65288,7 @@ static const JSCFunctionListEntry js_global_funcs[] = {
     JS_CFUNC_DEF("__feBfsActive", 1, js_fe_bfs_active ),
     JS_CFUNC_DEF("__feFlowBegin", 0, js_fe_flow_begin ),
     JS_CFUNC_DEF("__feFlowEnd", 0, js_fe_flow_end ),
+    JS_CFUNC_DEF("__feDriveBreadth", 4, js_fe_drive_breadth ),
     JS_CFUNC_DEF("__feCowPause", 1, js_fe_cow_pause ),
     JS_CFUNC_DEF("__fePhiMute", 1, js_fe_phi_mute ),
     JS_CFUNC_DEF("__feCursor", 0, js_fe_cursor ),

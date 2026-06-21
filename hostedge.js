@@ -16,6 +16,7 @@
   // intact — they outlive the flow. No-op outside the COW build. (#7 heap switching)
   var CPAUSE = (typeof __feCowPause === "function") ? __feCowPause : function () {};
   var OPQ = (typeof __opaque === "function") ? __opaque : function () { return undefined; };
+  var DRIVEBREADTH = (typeof __feDriveBreadth === "function") ? __feDriveBreadth : null;   // preemptible breadth force-invoke (engine build only)
   var ISOPQ = (typeof __isOpaque === "function") ? __isOpaque : function () { return false; };
   // Provenance predicate (TAINT or SYNTH) — header/body field is "an
   // unknown the bundle computed", not a concrete literal. ISOPQ stays
@@ -1403,7 +1404,15 @@
       if (typeof v === "function") {
         var fk = keyOf(v); if (ranKeys.has(fk)) continue; ranKeys.add(fk);
         FLOWBEG();
-        try { v.call(G, OPQ("handler.arg0"), OPQ("handler.arg1"), OPQ("handler.arg2")); } catch (x) {}
+        // PREEMPTIBLE breadth drive: __feDriveBreadth runs v(opaque…) under qjs_driving with a
+        // quantum-resume loop, so a finite global completes (surfaces its frontiers) while a
+        // NON-TERMINATING one (infinite recursion/loop on the opaque arg) is preempted after a
+        // fair quantum and handed to the grind to starve — no synchronous-loop hang, no lost
+        // breadth. Falls back to a plain call on native/non-fe builds (intrinsic absent).
+        try {
+          if (DRIVEBREADTH) DRIVEBREADTH(v, OPQ("handler.arg0"), OPQ("handler.arg1"), OPQ("handler.arg2"));
+          else v.call(G, OPQ("handler.arg0"), OPQ("handler.arg1"), OPQ("handler.arg2"));
+        } catch (x) {}
         FLOWEND();   // revert this invoke's bundle writes -> next global forks from baseline
       }
       /* A bundle-introduced global OBJECT (an API namespace `window.__d={read,…}`,
