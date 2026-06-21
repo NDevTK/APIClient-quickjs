@@ -63851,7 +63851,7 @@ int qjs_deep_step_c(JSContext *ctx, int maxN, int fromCursor) {
        bytecode-walking comparator only if the bit arrays failed to alloc
        (OOM) — correctness preserved either way. */
     int _have_bits = (qjs_deep_net != NULL && qjs_deep_net2 != NULL && qjs_deep_sink != NULL);
-    unsigned _last_clear_comp = (unsigned)-1;   /* g_grind_completions at the last deferred-set re-attempt (no-progress fixpoint) */
+    unsigned _last_clear_emit = (unsigned)-1;   /* g_emit_n at the last deferred-set re-attempt. WFQ principle: revive a deferred (paused, no-output) flow ONLY when EMITTED OUTPUT advanced — new @H/@S => shared state changed => a paused flow MAY now progress. Reviving on a COMPLETION COUNT instead resurrected lone no-output spinners forever (an infinite opaque recursion re-driven on every unrelated completion → never starved). Output, never a count. */
     JS_SetInterruptHandler(rt, qjs_grind_interrupt, NULL);   /* spin-defer yield (gated by g_grind_drive_active, off during boot/BFS); runtime-free clears it */
     while (driven < maxN) {
         qjs_cow_pool_warm(ctx);   /* #5/#10: re-warm each iteration (SAFE point) so a heap that grew during the prior drive is re-covered before the next drive's barrier fires */
@@ -63887,27 +63887,26 @@ int qjs_deep_step_c(JSContext *ctx, int maxN, int fromCursor) {
         }
         if (b == NULL) {
             /* Non-deferred orphans exhausted. Re-attempt the spin-deferred set:
-               drives since may have established their state (a producer populated
-               a worklist) so they now terminate on re-drive. If a re-attempt
-               cycle COMPLETED something (g_grind_completions advanced since the
-               last clear), clear the skip markers and give them another pass
-               (defer_comp is preserved, so the per-orphan abandon fixpoint stays
-               correct). If a cycle completed NOTHING, the remaining deferred set
-               is provably unhelpable THIS PASS (no new global output) → PAUSE them,
-               never abandon: #9 prioritization, not fixpoint termination. Leave them
-               UN-driven so they re-drive next invocation (shared state — a producer that
-               populates a worklist later, or a fresh session — may let them progress); the
-               WFQ starves them by emitted output meanwhile. Freeing the heap is the existing
-               #5 RAM floor (re-derived on re-drive; IDB-evict will later resume them EXACTLY
-               instead of re-deriving). The host exits the grind loop on @DPAUSE. */
+               other drives since may have changed shared state so a paused flow now
+               progresses. The ONLY sound signal that state changed in a way worth a
+               re-drive is EMITTED OUTPUT (g_emit_n): a new @H/@S means a producer
+               actually surfaced a capability. If output advanced since the last clear,
+               clear the skip markers and give the deferred set another pass (defer_comp
+               preserved). If NO new output, the remaining deferred set is provably
+               unhelpable THIS PASS → PAUSE them (re-drivable next invocation / session /
+               IDB-resume), never abandon: #9 prioritization, not fixpoint termination.
+               (Reviving on a COMPLETION COUNT instead — g_grind_completions — resurrected
+               a lone infinite no-output recursion forever: it pauses per quantum but every
+               unrelated completion un-deferred it, so it never stayed starved. Output,
+               never a count.) Freeing the heap is the existing #5 RAM floor. @DPAUSE exits. */
             int _any_def = 0;
             if (qjs_deep_deferred)
                 for (int _di = 0; _di < qjs_deep_rb_n; _di++)
                     if (qjs_deep_deferred[_di] && qjs_deep_rb[_di] && !qjs_deep_rb[_di]->qjs_driven) { _any_def = 1; break; }
             if (!_any_def) break;   /* truly exhausted */
-            if (g_grind_completions != _last_clear_comp) {
-                _last_clear_comp = g_grind_completions;
-                for (int _di = 0; _di < qjs_deep_rb_n; _di++) qjs_deep_deferred[_di] = 0;   /* clear skip markers; defer_comp preserved */
+            if ((unsigned)g_emit_n != _last_clear_emit) {
+                _last_clear_emit = (unsigned)g_emit_n;
+                for (int _di = 0; _di < qjs_deep_rb_n; _di++) qjs_deep_deferred[_di] = 0;   /* new output → state changed → re-attempt the paused set */
                 continue;
             }
             for (int _di = 0; _di < qjs_deep_rb_n; _di++) {   /* no new output → PAUSE (re-drivable), never abandon */
