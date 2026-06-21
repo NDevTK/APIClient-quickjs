@@ -3830,6 +3830,8 @@ JSValue JS_DupValueRT(JSRuntime *rt, JSValueConst v)
     return js_dup(v);
 }
 
+static int g_flow_capture;   /* fwd (def ~20842): a BFS force-invoke flow is capturing */
+static size_t qjs_cow_undo_n; /* fwd (def ~20593): # words logged but NOT yet reverted = a revert is pending */
 static void js_trigger_gc(JSRuntime *rt, size_t size)
 {
     bool force_gc;
@@ -3839,7 +3841,12 @@ static void js_trigger_gc(JSRuntime *rt, size_t size)
     force_gc = ((rt->malloc_state.malloc_size + size) >
                 rt->malloc_gc_threshold);
 #endif
-    if (force_gc) {
+    /* Never run the cycle GC while a flow revert is PENDING (undo-log non-empty or a BFS flow
+       capturing): the GC walks the half-mutated graph, queues objects on gc_zero_ref_count_list, and
+       the pending word-log revert byte-reverts their ref_count to a non-zero pre-flow value -> the
+       next drain aborts (free_zero_refcount). Guarding on the undo depth (not the whole grind) keeps
+       GC running BETWEEN orphan drives (undo drained to 0), so the long grind never bloats. */
+    if (force_gc && !g_flow_capture && qjs_cow_undo_n == 0) {
 #ifdef ENABLE_DUMPS // JS_DUMP_GC
         if (check_dump_flag(rt, JS_DUMP_GC)) {
             printf("GC: size=%zd\n", rt->malloc_state.malloc_size);
@@ -20792,18 +20799,15 @@ static void qjs_cow_shadow_grow(size_t need) {
     if (want <= qjs_cow_words) return;
     int sv = g_cow_busy; g_cow_busy = 1;
     size_t nbo = (qjs_cow_words + 7) / 8, nbn = (want + 7) / 8;
-    uint8_t *no = (uint8_t *)qjs_cow_palloc(nbn);
-    if (qjs_cow_shadow) memcpy(no, qjs_cow_shadow, nbo);
-    memset(no + nbo, 0, nbn - nbo);
-    qjs_cow_shadow = no; qjs_cow_words = want;
+    uint8_t *no = (uint8_t *)__real_malloc(nbn);   /* gm-backed (NOT palloc/arena which resets mid-grind); safe to call mid-barrier — the barrier never fires inside dlmalloc (those stores are g_cow_busy-suppressed), so __real_malloc here is not re-entrant. */
+    if (no) { if (qjs_cow_shadow) memcpy(no, qjs_cow_shadow, nbo); memset(no + nbo, 0, nbn - nbo); qjs_cow_shadow = no; qjs_cow_words = want; }
     g_cow_busy = sv;
 }
 static void qjs_cow_undo_grow(void) {
     int sv = g_cow_busy; g_cow_busy = 1;
     size_t cap2 = qjs_cow_undo_cap ? qjs_cow_undo_cap * 2 : 8192;
-    JSCowUndo *no = (JSCowUndo *)qjs_cow_palloc(cap2 * sizeof(JSCowUndo));
-    if (qjs_cow_undo) memcpy(no, qjs_cow_undo, qjs_cow_undo_n * sizeof(JSCowUndo));
-    qjs_cow_undo = no; qjs_cow_undo_cap = cap2;
+    JSCowUndo *no = (JSCowUndo *)__real_malloc(cap2 * sizeof(JSCowUndo));   /* gm-backed: survives the arena reset */
+    if (no) { if (qjs_cow_undo) memcpy(no, qjs_cow_undo, qjs_cow_undo_n * sizeof(JSCowUndo)); qjs_cow_undo = no; qjs_cow_undo_cap = cap2; }
     g_cow_busy = sv;
 }
 /* SCHEDULER-WARMED COW pool (#5/#10): grow the shadow to cover the live heap and the undo
@@ -20890,9 +20894,9 @@ QJS_JSEXPORT void qjs_cow_undo_log(size_t addr, size_t size) {
     }
     w0 = (addr - hb) >> 3; w1 = (addr + size - 1 - hb) >> 3;
     for (w = w0; w <= w1; w++) {
-        if (w >= qjs_cow_words) { g_cow_saturated = 1; continue; }   /* heap grew past the shadow -> saturate (never grow mid-barrier: re-enters the allocator). qjs_cow_pool_warm re-covers it at the next safe point. */
+        if (w >= qjs_cow_words) { qjs_cow_shadow_grow(w); if (w >= qjs_cow_words) { g_cow_saturated = 1; continue; } }   /* heap grew past shadow -> GROW (gm-backed) to cover w, never drop -> the gc_obj_list link reverts -> no ghost */
         if (qjs_cow_shadow[w >> 3] & (uint8_t)(1u << (w & 7))) continue;
-        if (qjs_cow_undo_n >= qjs_cow_undo_cap) { g_cow_saturated = 1; return; }   /* undo array full -> saturate (skip the rest of this flow's logging); the scheduler doubles it at the next warm */
+        if (qjs_cow_undo_n >= qjs_cow_undo_cap) { qjs_cow_undo_grow(); if (qjs_cow_undo_n >= qjs_cow_undo_cap) { g_cow_saturated = 1; return; } }   /* grow (gm-backed) instead of dropping -> revert stays complete -> no ghost */
         qjs_cow_undo[qjs_cow_undo_n].widx = w;
         qjs_cow_undo[qjs_cow_undo_n].old  = *(uint64_t *)(hb + (w << 3));
         qjs_cow_undo_n++;
