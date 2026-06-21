@@ -109,12 +109,14 @@ static JSValue make_nodelist(JSContext *ctx) {
 }
 extern const char *g_cur_dom_op;   /* #6 measure: which DOM op is active when a stack overflow fires */
 static JSValue do_query(JSContext *ctx, lxb_dom_node_t *root, const char *sel, size_t slen, int one) {
+    const char *_prev_op = g_cur_dom_op;   /* save/restore: g_cur_dom_op was set-only, so a stale value mis-attributed EVERY later stack-overflow (the c_normal "domop:do_query" was suspect for exactly this). Reflect the truly-active op, nested-safe. */
     g_cur_dom_op = "do_query";
     lxb_css_selector_list_t *list = lxb_css_selectors_parse(g_cssp, (const lxb_char_t *)sel, slen);
-    if (list == NULL) return one ? JS_NULL : make_nodelist(ctx);
+    if (list == NULL) { g_cur_dom_op = _prev_op; return one ? JS_NULL : make_nodelist(ctx); }
     findctx_t f = { ctx, JS_UNDEFINED, 0, one, NULL };
     if (!one) f.arr = make_nodelist(ctx);
     lxb_selectors_find(g_sel, root, list, find_cb, &f);
+    g_cur_dom_op = _prev_op;
     if (one) return f.first ? dom_wrap(ctx, f.first) : JS_NULL;
     return f.arr;
 }
