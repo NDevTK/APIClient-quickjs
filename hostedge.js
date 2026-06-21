@@ -1379,22 +1379,18 @@
       var nm = names[i];
       if (PRE[nm]) continue;
       var v; try { v = G[nm]; } catch (e) { continue; }
-      if (typeof v === "function") {
-        var fk = keyOf(v); if (ranKeys.has(fk)) continue; ranKeys.add(fk);
-        FLOWBEG();
-        try { v.call(G, OPQ("handler.arg0"), OPQ("handler.arg1"), OPQ("handler.arg2")); } catch (x) {}
-        FLOWEND();   // revert this invoke's bundle writes -> next global forks from baseline
-      }
-      /* A bundle-introduced global OBJECT (an API namespace `window.__d={read,…}`,
-         a `new Client()` with methods on the chain, a nested tree) is NOT driven
-         here. Walking that whole call/object graph SYNCHRONOUSLY in this boot
-         epilogue is the synchronous-loop trap (CLAUDE.md): it can't be preempted,
-         prioritised, or starved, so on a client holding host refs / a deep chain
-         (supabase-js) it blocks the boot from ever completing. Those methods are
-         ORPHANS (defined, not called) — the BREADTH-then-DEPTH scheduler's deep
-         grind drives them per-orphan (yielding, net-reaching first, with the real
-         captured instance via qjs_deep_capture_inst), spread over time. Boot does
-         BREADTH (top-level fns + the BFS); the grind does DEPTH (the object graph). */
+      /* A bundle-introduced global FUNCTION is NOT force-invoked here anymore.
+         Driving it SYNCHRONOUSLY in this boot epilogue is the synchronous-loop trap
+         (CLAUDE.md): `v.call(G, opaque…)` has no preemption point (YIELD_POLL only
+         yields under rt->qjs_driving, which this boot path does not set), so a function
+         that recurses unbounded on its opaque arg (or loops) BLOCKS boot forever — it
+         can't be paused, prioritised, or starved. Top-level functions are ORPHANS
+         (defined, not called); the deep grind already drives them per-orphan THROUGH
+         the WFQ pause (qjs_set_driving + qjs_flow_save: an infinite recursion PAUSES on
+         the heap after a quantum, ~0 CPU, resumable, never blocks). So defer them to the
+         grind exactly as global OBJECTS already are — boot does the BFS + event/CE drive
+         (which surface frontiers), the grind does the per-orphan function/object DEPTH. */
+      /* (typeof v === "function") => deferred to the grind; nothing to do here. */
     }
     } finally { FEMUTE(0); }
     // Mute lifted for the rest — frontier records from user
