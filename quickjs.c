@@ -63851,7 +63851,7 @@ int qjs_deep_step_c(JSContext *ctx, int maxN, int fromCursor) {
        bytecode-walking comparator only if the bit arrays failed to alloc
        (OOM) — correctness preserved either way. */
     int _have_bits = (qjs_deep_net != NULL && qjs_deep_net2 != NULL && qjs_deep_sink != NULL);
-    unsigned _last_clear_emit = (unsigned)-1;   /* g_emit_n at the last deferred-set re-attempt. WFQ principle: revive a deferred (paused, no-output) flow ONLY when EMITTED OUTPUT advanced — new @H/@S => shared state changed => a paused flow MAY now progress. Reviving on a COMPLETION COUNT instead resurrected lone no-output spinners forever (an infinite opaque recursion re-driven on every unrelated completion → never starved). Output, never a count. */
+    unsigned _last_clear_comp = (unsigned)-1;   /* g_grind_completions at the last deferred-set re-attempt. REVIVAL (not termination) signal: re-attempt a deferred flow when another orphan COMPLETED since the last clear — a completion changes shared state (populates a worklist a consumer reads) EVEN WHEN the producer emits no @H of its own, so sentry_cdn's producer→consumer chain needs it (revive-on-emitted-output alone took sentry 3→0). This is a revival heuristic, NOT a termination count: nothing STOPS on it; the per-orphan WFQ pause still starves a true no-output spinner by emitted output. */
     JS_SetInterruptHandler(rt, qjs_grind_interrupt, NULL);   /* spin-defer yield (gated by g_grind_drive_active, off during boot/BFS); runtime-free clears it */
     while (driven < maxN) {
         qjs_cow_pool_warm(ctx);   /* #5/#10: re-warm each iteration (SAFE point) so a heap that grew during the prior drive is re-covered before the next drive's barrier fires */
@@ -63886,27 +63886,27 @@ int qjs_deep_step_c(JSContext *ctx, int maxN, int fromCursor) {
             if (better) { b = cb; _ix = _ci; }
         }
         if (b == NULL) {
-            /* Non-deferred orphans exhausted. Re-attempt the spin-deferred set:
-               other drives since may have changed shared state so a paused flow now
-               progresses. The ONLY sound signal that state changed in a way worth a
-               re-drive is EMITTED OUTPUT (g_emit_n): a new @H/@S means a producer
-               actually surfaced a capability. If output advanced since the last clear,
-               clear the skip markers and give the deferred set another pass (defer_comp
-               preserved). If NO new output, the remaining deferred set is provably
-               unhelpable THIS PASS → PAUSE them (re-drivable next invocation / session /
-               IDB-resume), never abandon: #9 prioritization, not fixpoint termination.
-               (Reviving on a COMPLETION COUNT instead — g_grind_completions — resurrected
-               a lone infinite no-output recursion forever: it pauses per quantum but every
-               unrelated completion un-deferred it, so it never stayed starved. Output,
-               never a count.) Freeing the heap is the existing #5 RAM floor. @DPAUSE exits. */
+            /* Non-deferred orphans exhausted. Re-attempt the spin-deferred set: other drives
+               since may have changed shared state (a producer populated a worklist a deferred
+               consumer reads) so it now progresses. Signal = a COMPLETION since the last clear
+               (g_grind_completions): a producer that finished may have enabled a consumer EVEN
+               IF it emitted no @H itself (sentry_cdn's chain — revive-on-emitted-output-only
+               took it 3→0). If a cycle completed something, clear the skip markers and give the
+               deferred set another pass (defer_comp preserved). If a cycle completed NOTHING,
+               the remaining deferred set is provably unhelpable THIS PASS → PAUSE them
+               (re-drivable next invocation / session / IDB-resume), never abandon: #9
+               prioritization, not fixpoint termination. This is a REVIVAL heuristic, not a
+               termination count — nothing stops on it; the per-orphan WFQ pause still starves a
+               genuine no-output spinner by emitted output. Freeing the heap is the #5 RAM floor;
+               @DPAUSE exits. */
             int _any_def = 0;
             if (qjs_deep_deferred)
                 for (int _di = 0; _di < qjs_deep_rb_n; _di++)
                     if (qjs_deep_deferred[_di] && qjs_deep_rb[_di] && !qjs_deep_rb[_di]->qjs_driven) { _any_def = 1; break; }
             if (!_any_def) break;   /* truly exhausted */
-            if ((unsigned)g_emit_n != _last_clear_emit) {
-                _last_clear_emit = (unsigned)g_emit_n;
-                for (int _di = 0; _di < qjs_deep_rb_n; _di++) qjs_deep_deferred[_di] = 0;   /* new output → state changed → re-attempt the paused set */
+            if (g_grind_completions != _last_clear_comp) {
+                _last_clear_comp = g_grind_completions;
+                for (int _di = 0; _di < qjs_deep_rb_n; _di++) qjs_deep_deferred[_di] = 0;   /* a completion changed state → re-attempt the paused set */
                 continue;
             }
             for (int _di = 0; _di < qjs_deep_rb_n; _di++) {   /* no new output → PAUSE (re-drivable), never abandon */

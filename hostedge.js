@@ -1379,18 +1379,30 @@
       var nm = names[i];
       if (PRE[nm]) continue;
       var v; try { v = G[nm]; } catch (e) { continue; }
-      /* A bundle-introduced global FUNCTION is NOT force-invoked here anymore.
-         Driving it SYNCHRONOUSLY in this boot epilogue is the synchronous-loop trap
-         (CLAUDE.md): `v.call(G, opaque…)` has no preemption point (YIELD_POLL only
-         yields under rt->qjs_driving, which this boot path does not set), so a function
-         that recurses unbounded on its opaque arg (or loops) BLOCKS boot forever — it
-         can't be paused, prioritised, or starved. Top-level functions are ORPHANS
-         (defined, not called); the deep grind already drives them per-orphan THROUGH
-         the WFQ pause (qjs_set_driving + qjs_flow_save: an infinite recursion PAUSES on
-         the heap after a quantum, ~0 CPU, resumable, never blocks). So defer them to the
-         grind exactly as global OBJECTS already are — boot does the BFS + event/CE drive
-         (which surface frontiers), the grind does the per-orphan function/object DEPTH. */
-      /* (typeof v === "function") => deferred to the grind; nothing to do here. */
+      if (typeof v === "function") {
+        /* BREADTH: force-invoke each bundle global function with opaque args so its
+           frontiers (registered handlers, an effect closure that fetches, the nested
+           call graph) are surfaced for the BFS — this is what gives an inline-script SPA
+           (a React component `function C(props){ useEffect(()=>fetch(...)) }`, whose fetch
+           lives in a NESTED closure with no direct host atom, so the directed grind drive
+           never targets it) its coverage. KNOWN LIMITATION (the 'boot is the hard gap'):
+           this synchronous drive has no preemption/pause point, so a function that
+           recurses unbounded on its opaque arg (`function r(n){ return r(n) }`) blocks
+           boot. Deferring it to the grind (which CAN pause) loses the breadth above
+           (inline-script pages go to zero). The correct fix is a snapshot-PAUSE of the
+           breadth drive (qjs_flow_save), NOT a throw — a throw can't tell an infinite
+           recursion from a slow-but-productive init, so it skips real endpoints. Until
+           that lands, breadth coverage is kept and the rare infinite-on-opaque global is
+           the cost. */
+        var fk = keyOf(v); if (ranKeys.has(fk)) continue; ranKeys.add(fk);
+        FLOWBEG();
+        try { v.call(G, OPQ("handler.arg0"), OPQ("handler.arg1"), OPQ("handler.arg2")); } catch (x) {}
+        FLOWEND();   // revert this invoke's bundle writes -> next global forks from baseline
+      }
+      /* A bundle-introduced global OBJECT (an API namespace, a `new Client()` chain) is
+         NOT walked here (the object-graph synchronous-loop trap) — its methods are
+         ORPHANS the deep grind drives per-orphan (yielding, with the captured instance).
+         Boot does BREADTH (top-level fns + the BFS); the grind does DEPTH. */
     }
     } finally { FEMUTE(0); }
     // Mute lifted for the rest — frontier records from user
