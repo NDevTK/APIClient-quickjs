@@ -5124,6 +5124,7 @@ static void qjs_cow_vt_push(JSValue *slot, JSValue old, struct JSVarRef *vref); 
 void cow_set_array_append(JSContext *ctx, JSValue *pval, JSValue val);   /* fwd (def in COW section): typed capture of a fast-array append (the next brick) */
 void cow_set_array_el(JSContext *ctx, JSValue *pval, JSValue val);        /* fwd: typed capture of a fast-array element OVERWRITE (set_value analogue) */
 static JSValue *cow_realloc_array(JSContext *ctx, JSObject *p, size_t newbytes, size_t *pslack);   /* fwd: flow-aware fast-array buffer realloc (buffer-trail brick) */
+static void *cow_realloc_buf(JSContext *ctx, void **pfield, size_t oldbytes, size_t newbytes);     /* fwd: flow-aware realloc of an object-internal buffer field (p->prop) */
 static inline void cow_set_value(JSContext *ctx, JSValue *pval, JSValue new_val) {
     if (g_flow_capture || g_grind_drive_active) {
         /* TYPED TRAIL (heap-fork backtrack, refcount-EXACT) — the typed layer the byte word-log
@@ -8093,7 +8094,8 @@ static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
        in case of memory allocation failure */
     if (p) {
         JSProperty *new_prop;
-        new_prop = js_realloc(ctx, p->prop, sizeof(new_prop[0]) * new_size);
+        new_prop = cow_realloc_buf(ctx, (void **)&p->prop, sizeof(new_prop[0]) * sh->prop_size,
+                                   sizeof(new_prop[0]) * new_size);   /* buffer-trail for a baseline object's property array */
         if (unlikely(!new_prop))
             return -1;
         p->prop = new_prop;
@@ -12764,8 +12766,8 @@ static JSProperty *add_property(JSContext *ctx,
             /*  the property array may need to be resized */
             if (new_sh->prop_size != sh->prop_size) {
                 JSProperty *new_prop;
-                new_prop = js_realloc(ctx, p->prop, sizeof(p->prop[0]) *
-                                      new_sh->prop_size);
+                new_prop = cow_realloc_buf(ctx, (void **)&p->prop, sizeof(p->prop[0]) * sh->prop_size,
+                                           sizeof(p->prop[0]) * new_sh->prop_size);   /* buffer-trail for a baseline object's property array */
                 if (!new_prop)
                     return NULL;
                 p->prop = new_prop;
@@ -21083,6 +21085,22 @@ static JSValue *cow_realloc_array(JSContext *ctx, JSObject *p, size_t newbytes, 
         return nb;
     }
     return js_realloc2(ctx, oldbuf, newbytes, pslack);
+}
+/* Generic flow-aware buffer realloc for an object-internal pointer FIELD (*pfield) — the property
+   array p->prop, the same use-after-free class as the values buffer: js_realloc frees the old block
+   while the field is byte-logged, so a forced-flow revert dangles. For a BASELINE field: js_malloc +
+   memcpy + KEEP old + buffer-trail; flow-local / not capturing: plain js_realloc. oldbytes need only
+   bound the live old contents (min(old,new) is copied), so a shrink may pass newbytes. */
+static void *cow_realloc_buf(JSContext *ctx, void **pfield, size_t oldbytes, size_t newbytes) {
+    void *oldbuf = *pfield;
+    if ((g_flow_capture || g_grind_drive_active) && cow_slot_baseline(pfield)) {
+        void *nb = js_malloc(ctx, newbytes);
+        if (!nb) return NULL;
+        if (oldbuf) memcpy(nb, oldbuf, oldbytes < newbytes ? oldbytes : newbytes);
+        qjs_cow_buf_push(ctx, oldbuf, nb);   /* KEEP old; the trail manages both lifetimes */
+        return nb;
+    }
+    return js_realloc(ctx, oldbuf, newbytes);
 }
 /* Backtrack the typed trail down to `mark`: for each entry in REVERSE, decref the slot's CURRENT
    value and restore old (the trail's ref → slot). Refcount-EXACT — the layer the byte word-log
