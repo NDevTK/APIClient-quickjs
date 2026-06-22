@@ -5125,6 +5125,7 @@ void cow_set_array_append(JSContext *ctx, JSValue *pval, JSValue val);   /* fwd 
 void cow_set_array_el(JSContext *ctx, JSValue *pval, JSValue val);        /* fwd: typed capture of a fast-array element OVERWRITE (set_value analogue) */
 static JSValue *cow_realloc_array(JSContext *ctx, JSObject *p, size_t newbytes, size_t *pslack);   /* fwd: flow-aware fast-array buffer realloc (buffer-trail brick) */
 static void *cow_realloc_buf(JSContext *ctx, void **pfield, size_t oldbytes, size_t newbytes);     /* fwd: flow-aware realloc of an object-internal buffer field (p->prop) */
+static void cow_shape_transition(JSContext *ctx, JSObject *p, JSShape *new_sh);                    /* fwd: refcount-exact p->shape transition (shape-trail brick) */
 static inline void cow_set_value(JSContext *ctx, JSValue *pval, JSValue new_val) {
     if (g_flow_capture || g_grind_drive_active) {
         /* TYPED TRAIL (heap-fork backtrack, refcount-EXACT) — the typed layer the byte word-log
@@ -12772,8 +12773,7 @@ static JSProperty *add_property(JSContext *ctx,
                     return NULL;
                 p->prop = new_prop;
             }
-            p->shape = js_dup_shape(new_sh);
-            js_free_shape(ctx->rt, sh);
+            cow_shape_transition(ctx, p, js_dup_shape(new_sh));   /* baseline obj: trail old shape (sh); else js_free_shape(sh) */
             return &p->prop[new_sh->prop_count - 1];
         } else if (sh->header.ref_count != 1) {
             /* if the shape is shared, clone it */
@@ -12783,8 +12783,7 @@ static JSProperty *add_property(JSContext *ctx,
             /* hash the cloned shape */
             new_sh->is_hashed = true;
             js_shape_hash_link(ctx->rt, new_sh);
-            js_free_shape(ctx->rt, p->shape);
-            p->shape = new_sh;
+            cow_shape_transition(ctx, p, new_sh);   /* baseline obj: trail old shape; else js_free_shape(old) */
         }
     }
     assert(p->shape->header.ref_count == 1);
@@ -20671,6 +20670,12 @@ static size_t qjs_cow_vt_n = 0, qjs_cow_vt_cap = 0;
 typedef struct { void *oldb; void *newb; size_t wpos; } JSCowBuf;
 static JSCowBuf *qjs_cow_buf = NULL;
 static size_t qjs_cow_buf_n = 0, qjs_cow_buf_cap = 0;
+/* SHAPE-TRAIL state (deferred p->shape transitions — refcount-exact, like the vt phantom transfer).
+   Stores (old,new) SHAPES, never the object: the word log restores the p->shape POINTER, the trail
+   only fixes shape refcounts — so the revert never dereferences a possibly-freed object. */
+typedef struct { JSShape *old; JSShape *neww; size_t wpos; } JSCowShape;
+static JSCowShape *qjs_cow_shp = NULL;
+static size_t qjs_cow_shp_n = 0, qjs_cow_shp_cap = 0;
 static void qjs_cow_vt_push(JSValue *slot, JSValue old, JSVarRef *vref) {
     if (qjs_cow_vt_n >= qjs_cow_vt_cap) {
         size_t nc = qjs_cow_vt_cap ? qjs_cow_vt_cap * 2 : 256;
@@ -20701,6 +20706,9 @@ QJS_JSEXPORT void qjs_cow_undo_revert(void);
 QJS_JSEXPORT void qjs_cow_undo_revert_to(size_t mark);
 static void qjs_cow_buf_revert_to(size_t wmark);   /* fwd: buffer-trail (deferred-realloc) revert, hooked into qjs_cow_undo_revert_to */
 static void qjs_cow_buf_commit(void);              /* fwd: buffer-trail commit, hooked into qjs_cow_commit */
+static void qjs_cow_shp_revert_to(size_t wmark);   /* fwd: shape-trail revert (BEFORE the byte-restore — refcount-exact) */
+static void qjs_cow_shp_commit(void);              /* fwd: shape-trail commit */
+static void js_free_shape(JSRuntime *rt, JSShape *sh);   /* fwd: shape-trail revert/commit decref */
 
 typedef struct JSCowDelta { uint64_t *widx; uint64_t *oldw; uint64_t *neww; size_t n;
     /* typed-trail component: the shared-scope JSValue slots this flow wrote (refcount-exact). The
@@ -20826,6 +20834,7 @@ QJS_JSEXPORT void qjs_cow_commit(const uint8_t *mem) {
        = per-flow shared-cell deltas that always revert. */
     qjs_cow_vt_revert_to(0);
     qjs_cow_buf_commit();   /* the new buffers are baseline now; free the deferred OLD buffers (dead) */
+    qjs_cow_shp_commit();   /* the new shapes are baseline now; release the trail's OLD shape refs */
 }
 /* Reset the COW state (grind teardown). The baseline/bitmap are POOL memory (bump),
    not js_malloc blocks — never js_free them; the pool stays allocated for reuse. */
@@ -20839,6 +20848,7 @@ static void qjs_cow_reset(JSRuntime *rt) {
     g_cow_saved = g_cow_commits = g_cow_discards = g_cow_captures = g_cow_applies = 0;
     qjs_cow_undo = NULL; qjs_cow_shadow = NULL; qjs_cow_undo_n = qjs_cow_undo_cap = qjs_cow_words = 0;   /* undo-log state lives in the pool just reset -> drop the dangling pointers */
     qjs_cow_buf_n = 0;   /* buffer-trail (deferred reallocs): drop stale entries — the trailed buffers live in the heap the runtime teardown frees; the trail array itself is reused */
+    qjs_cow_shp_n = 0;   /* shape-trail: drop stale entries (shapes live in the heap the teardown frees) */
     qjs_leaf = NULL;   /* leaf table lives in the pool too -> drop the dangling pointer so it re-allocs from the fresh pool next grind */
     qjs_cow_pool_reset();
 }
@@ -20988,6 +20998,7 @@ QJS_JSEXPORT void qjs_cow_undo_revert_to(size_t mark) {
     }
     qjs_cow_undo_n = mark;
     qjs_cow_buf_revert_to(mark);   /* drop deferred-realloc buffers whose field write reverts (orphaned new leaks; old stays live) */
+    qjs_cow_shp_revert_to(mark);   /* AFTER the byte-restore (p->shape is now old): release the orphaned new shape's p-ref */
     g_cow_busy = 0;
 }
 /* THE NEXT BRICK (lines 5118/5154): refcount-exact typed capture of an OBJECT-INTERNAL JSValue ref —
@@ -21101,6 +21112,56 @@ static void *cow_realloc_buf(JSContext *ctx, void **pfield, size_t oldbytes, siz
         return nb;
     }
     return js_realloc(ctx, oldbuf, newbytes);
+}
+/* SHAPE-TRAIL — the object-internal brick for refcounted p->shape transitions. A property add/clone
+   does `p->shape = new; js_free_shape(old)`: the shape FIELD is byte-logged, so a forced-flow revert
+   restores the OLD shape pointer — but js_free_shape already DECREF'd old (freeing it outright if it
+   was exclusive => use-after-free; under-ref'ing it if shared). cow_shape_transition instead KEEPS
+   old's ref (the trail owns it, phantom transfer like cow_set_value) for a BASELINE object. REVERT
+   (run BEFORE the byte-restore, so it reads the genuine current=new): js_free_shape(new) + restore
+   p->shape = old. COMMIT: js_free_shape(old) (new is baseline). Stepwise-correct across multiple
+   transitions of one object (old->A->B reverts B then A then old, each intermediate freed once). */
+static void qjs_cow_shp_push(JSContext *ctx, JSShape *old, JSShape *neww) {
+    if (qjs_cow_shp_n >= qjs_cow_shp_cap) {
+        size_t nc = qjs_cow_shp_cap ? qjs_cow_shp_cap * 2 : 16;
+        JSCowShape *nv = js_realloc(ctx, qjs_cow_shp, nc * sizeof(JSCowShape));
+        if (!nv) { js_free_shape(ctx->rt, old); return; }   /* OOM: fall back to the normal decref */
+        qjs_cow_shp = nv; qjs_cow_shp_cap = nc;
+    }
+    qjs_cow_shp[qjs_cow_shp_n].old = old;           /* KEEP old's ref (not decref'd) — the trail owns it for the slot's restore */
+    qjs_cow_shp[qjs_cow_shp_n].neww = neww;
+    qjs_cow_shp[qjs_cow_shp_n].wpos = qjs_cow_undo_n;
+    qjs_cow_shp_n++;
+}
+/* Run AFTER the word-log byte-restore (it already restored p->shape = old). Release the new shape's
+   p-ref (decref). old's kept ref is now the slot's reference (the word-log restored the pointer raw,
+   without incref — the trail's kept ref accounts for it). No object deref => no UAF on a freed obj. */
+static void qjs_cow_shp_revert_to(size_t wmark) {
+    JSRuntime *rt = g_cow_rt;
+    int sv = g_cow_busy; g_cow_busy = 1;   /* js_free_shape's hash-unlink writes must NOT re-log */
+    while (qjs_cow_shp_n > 0 && qjs_cow_shp[qjs_cow_shp_n - 1].wpos >= wmark) {
+        qjs_cow_shp_n--;
+        if (rt) js_free_shape(rt, qjs_cow_shp[qjs_cow_shp_n].neww);   /* drop the new shape's p-ref */
+    }
+    g_cow_busy = sv;
+}
+static void qjs_cow_shp_commit(void) {
+    JSRuntime *rt = g_cow_rt;
+    int sv = g_cow_busy; g_cow_busy = 1;
+    for (size_t k = 0; k < qjs_cow_shp_n; k++) if (rt) js_free_shape(rt, qjs_cow_shp[k].old);   /* new is baseline; release the trail's orphaned old ref */
+    qjs_cow_shp_n = 0;
+    g_cow_busy = sv;
+}
+/* Set p->shape = new_sh, releasing old's ref — but for a BASELINE object during a flow TRAIL (old,new)
+   and KEEP old's ref, so the revert (word log restores the pointer; trail fixes refcounts) is exact. */
+static void cow_shape_transition(JSContext *ctx, JSObject *p, JSShape *new_sh) {
+    JSShape *old = p->shape;
+    p->shape = new_sh;
+    if ((g_flow_capture || g_grind_drive_active) && cow_slot_baseline(&p->shape)) {
+        qjs_cow_shp_push(ctx, old, new_sh);
+    } else {
+        js_free_shape(ctx->rt, old);
+    }
 }
 /* Backtrack the typed trail down to `mark`: for each entry in REVERSE, decref the slot's CURRENT
    value and restore old (the trail's ref → slot). Refcount-EXACT — the layer the byte word-log
