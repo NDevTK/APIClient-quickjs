@@ -5122,6 +5122,7 @@ static int g_flow_depth;      /* # of nested live flows (qjs_flow_arm/revert) */
 struct JSVarRef;
 static void qjs_cow_vt_push(JSValue *slot, JSValue old, struct JSVarRef *vref);   /* fwd (def in COW section): typed-trail record for refcount-exact heap-fork backtrack */
 void cow_set_array_append(JSContext *ctx, JSValue *pval, JSValue val);   /* fwd (def in COW section): typed capture of a fast-array append (the next brick) */
+void cow_set_array_el(JSContext *ctx, JSValue *pval, JSValue val);        /* fwd: typed capture of a fast-array element OVERWRITE (set_value analogue) */
 static inline void cow_set_value(JSContext *ctx, JSValue *pval, JSValue new_val) {
     if (g_flow_capture || g_grind_drive_active) {
         /* TYPED TRAIL (heap-fork backtrack, refcount-EXACT) — the typed layer the byte word-log
@@ -20986,22 +20987,43 @@ QJS_JSEXPORT void qjs_cow_undo_revert_to(size_t mark) {
    arena) or value-stack array is discarded wholesale, never reverted, so it stays a raw write — same
    discrimination the word-log barrier uses. append => old is UNDEFINED (no ref), so the phantom
    transfer is trivially exact. */
+/* Is the slot `pval` a BASELINE heap slot a forced flow must revert refcount-exactly (vs a flow-LOCAL
+   arena / value-stack slot that is discarded wholesale, never reverted)? Same discrimination the
+   word-log barrier (qjs_cow_undo_log) uses. Only meaningful while a flow is capturing. */
+static inline int cow_slot_baseline(void *pval) {
+    size_t hb = (size_t)&__heap_base, a = (size_t)pval;
+    if (a < hb) return 0;
+    if (g_flow_arena && a >= (size_t)g_flow_arena && a < (size_t)g_flow_arena + g_flow_arena_cap) return 0;
+    if (g_cow_exec_rt) { JSStackChunk *c = g_cow_exec_rt->js_stack;
+        while (c) { if (a >= (size_t)(void *)c && a < (size_t)(void *)c->limit) return 0; c = c->prev; } }
+    return 1;
+}
+/* APPEND to a fast array (fresh slot, old = UNDEFINED): type it for a baseline array so the revert
+   decref's val (the byte-log left it un-decref'd -> leak). Flow-local: raw write (no free — slot is
+   freshly UNDEFINED, expand_fast_array-initialised). */
 void cow_set_array_append(JSContext *ctx, JSValue *pval, JSValue val) {
-    if (g_flow_capture || g_grind_drive_active) {
-        size_t hb = (size_t)&__heap_base, a = (size_t)pval;
-        int baseline = (a >= hb);
-        if (baseline && g_flow_arena && a >= (size_t)g_flow_arena && a < (size_t)g_flow_arena + g_flow_arena_cap) baseline = 0;
-        if (baseline && g_cow_exec_rt) { JSStackChunk *c = g_cow_exec_rt->js_stack;
-            while (c) { if (a >= (size_t)(void *)c && a < (size_t)(void *)c->limit) { baseline = 0; break; } c = c->prev; } }
-        if (baseline) {
-            int sv = g_cow_busy; g_cow_busy = 1;
-            qjs_cow_vt_push(pval, *pval, NULL);   /* old = UNDEFINED on a fresh append slot — phantom transfer is exact */
-            *pval = val;
-            g_cow_busy = sv;
-            return;
-        }
+    if ((g_flow_capture || g_grind_drive_active) && cow_slot_baseline(pval)) {
+        int sv = g_cow_busy; g_cow_busy = 1;
+        qjs_cow_vt_push(pval, *pval, NULL);   /* old = UNDEFINED on a fresh append slot — phantom transfer is exact */
+        *pval = val;
+        g_cow_busy = sv;
+        return;
     }
     *pval = val;
+}
+/* OVERWRITE a fast-array element (old is a real ref): type it for a baseline array — the trail OWNS
+   old (transferred from the slot, no free, like cow_set_value), so the revert restores old + decref's
+   the displaced current, refcount-exact. Flow-local / not capturing: plain set_value (free old +
+   install). The object-internal analogue of cow_set_value for array elements. */
+void cow_set_array_el(JSContext *ctx, JSValue *pval, JSValue val) {
+    if ((g_flow_capture || g_grind_drive_active) && cow_slot_baseline(pval)) {
+        int sv = g_cow_busy; g_cow_busy = 1;
+        qjs_cow_vt_push(pval, *pval, NULL);   /* trail owns old (phantom transfer); revert decref's current */
+        *pval = val;
+        g_cow_busy = sv;
+        return;
+    }
+    set_value(ctx, pval, val);
 }
 /* Backtrack the typed trail down to `mark`: for each entry in REVERSE, decref the slot's CURRENT
    value and restore old (the trail's ref → slot). Refcount-EXACT — the layer the byte word-log
@@ -24540,7 +24562,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         p = JS_VALUE_GET_OBJ(sp[-3]);
                         if (likely(p->class_id == JS_CLASS_ARRAY &&
                                    idx < (uint32_t)p->u.array.count)) {
-                            set_value(ctx, &p->u.array.u.values[idx], val);
+                            cow_set_array_el(ctx, &p->u.array.u.values[idx], val);   /* typed overwrite for a baseline array (the next brick) */
                             JS_FreeValue(ctx, sp[-3]);
                             sp -= 3;
                             BREAK;
@@ -24557,7 +24579,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 uint32_t new_len = idx + 1;
                                 array_len = JS_VALUE_GET_INT(p->prop[0].u.value);
                                 if (likely(new_len <= p->u.array.u1.size)) {
-                                    p->u.array.u.values[idx] = val;
+                                    cow_set_array_append(ctx, &p->u.array.u.values[idx], val);   /* typed append (baseline) / raw (flow-local) */
                                     p->u.array.count = new_len;
                                     if (new_len > array_len)
                                         p->prop[0].u.value = js_int32(new_len);
