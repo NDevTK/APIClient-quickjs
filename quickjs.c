@@ -21193,7 +21193,17 @@ static JSValue qjs_run_forced_flow(JSContext *ctx, JSValueConst fn, JSValueConst
                                    int argc, JSValueConst *argv, int is_ctor) {
     JSRuntime *rt = ctx->rt;
     qjs_cow_vt_revert_to(0);   /* snapshot: this forced sub-path reads shared cells at baseline */
-    JSStackFrame *boundary = rt->current_stack_frame;   /* re-entrancy: free only THIS flow's sub-chain on preempt */
+    /* Run this forced sub-flow as a FIRST-CLASS ISOLATED flow (the WFQ substrate): SAVE the
+       caller's flow (its heap call-stack chunk chain + frame chain) and start the sub-flow on
+       a FRESH (NULL) stack, so its frames + arena segments never share a chunk with the
+       caller's. An isolated, NULL-bottomed sub-flow is snapshot-able/park-able exactly like a
+       grind orphan (qjs_drive_run) — vs the old in-place splice into the caller's chunks, which
+       could only be FREED in place (qjs_free_suspended_upto to a boundary frame), never parked.
+       On preempt we free THIS flow's whole isolated chain; the caller's flow is restored intact.
+       (The shared-heap word-log undo is orthogonal to the call-stack, so the caller's per-arm
+       revert still covers this flow's heap writes — isolation is of the CALL STACK only.) */
+    JSFlow outer; qjs_flow_save(ctx, &outer);
+    rt->js_stack = NULL; rt->current_stack_frame = NULL; rt->qjs_yield_entry = NULL;
     int sv_driving = rt->qjs_driving;
     qjs_set_driving(ctx, 1);
     JSValue r = is_ctor ? JS_CallConstructor(ctx, fn, argc, argv)
@@ -21205,12 +21215,16 @@ static JSValue qjs_run_forced_flow(JSContext *ctx, JSValueConst fn, JSValueConst
             rt->qjs_resume_chain = 1;
             r = qjs_resume_chain_call(ctx);
         } else {
-            JS_FreeValue(ctx, r);
-            qjs_free_suspended_upto(ctx, boundary);   /* starve: drop this flow's chain to the caller boundary; the grind re-drives it */
-            r = JS_UNDEFINED;
+            JS_FreeValue(ctx, r); r = JS_UNDEFINED;
+            qjs_free_suspended_trampoline_frames(ctx);   /* free the isolated sub-chain (current_stack_frame -> NULL) */
             break;
         }
     }
+    /* The sub-flow finished (returned or was freed): reclaim its now-empty arena segment(s),
+       then restore the caller's flow. The sub-flow is NULL-bottomed, so its chunk chain ends
+       at NULL — free it all. */
+    { JSStackChunk *c = rt->js_stack; while (c) { JSStackChunk *p = c->prev; js_free_rt(rt, c); c = p; } rt->js_stack = NULL; }
+    qjs_flow_restore(ctx, &outer);
     if (!sv_driving) qjs_set_driving(ctx, 0);
     return r;
 }
