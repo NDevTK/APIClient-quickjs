@@ -5123,6 +5123,7 @@ struct JSVarRef;
 static void qjs_cow_vt_push(JSValue *slot, JSValue old, struct JSVarRef *vref);   /* fwd (def in COW section): typed-trail record for refcount-exact heap-fork backtrack */
 void cow_set_array_append(JSContext *ctx, JSValue *pval, JSValue val);   /* fwd (def in COW section): typed capture of a fast-array append (the next brick) */
 void cow_set_array_el(JSContext *ctx, JSValue *pval, JSValue val);        /* fwd: typed capture of a fast-array element OVERWRITE (set_value analogue) */
+static JSValue *cow_realloc_array(JSContext *ctx, JSObject *p, size_t newbytes, size_t *pslack);   /* fwd: flow-aware fast-array buffer realloc (buffer-trail brick) */
 static inline void cow_set_value(JSContext *ctx, JSValue *pval, JSValue new_val) {
     if (g_flow_capture || g_grind_drive_active) {
         /* TYPED TRAIL (heap-fork backtrack, refcount-EXACT) — the typed layer the byte word-log
@@ -13057,7 +13058,7 @@ static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len)
         return -1;
     }
     new_size = max_uint32(new_len, new_size);
-    new_array_prop = js_realloc2(ctx, p->u.array.u.values, sizeof(JSValue) * new_size, &slack);
+    new_array_prop = cow_realloc_array(ctx, p, sizeof(JSValue) * new_size, &slack);   /* flow-aware: buffer-trail brick for a baseline array, plain realloc otherwise */
     if (!new_array_prop)
         return -1;
     new_size += slack / sizeof(*new_array_prop);
@@ -20663,6 +20664,11 @@ static uint8_t *qjs_cow_shadow = NULL;
 typedef struct JSCowVT { JSValue *slot; JSValue old; JSVarRef *vref; } JSCowVT;
 static JSCowVT *qjs_cow_vt = NULL;
 static size_t qjs_cow_vt_n = 0, qjs_cow_vt_cap = 0;
+/* BUFFER-TRAIL state (deferred fast-array reallocs — defined here so qjs_cow_reset can clear it; the
+   push/revert/commit/realloc functions are below with the other COW helpers). */
+typedef struct { void *oldb; void *newb; size_t wpos; } JSCowBuf;
+static JSCowBuf *qjs_cow_buf = NULL;
+static size_t qjs_cow_buf_n = 0, qjs_cow_buf_cap = 0;
 static void qjs_cow_vt_push(JSValue *slot, JSValue old, JSVarRef *vref) {
     if (qjs_cow_vt_n >= qjs_cow_vt_cap) {
         size_t nc = qjs_cow_vt_cap ? qjs_cow_vt_cap * 2 : 256;
@@ -20691,6 +20697,8 @@ QJS_JSEXPORT void qjs_cow_undo_revert(void);
    [0,mark) intact — the segmented per-arm snapshot (#7) with no global mark stack: the mark is
    a C local at the single re-invoke site (qjs_drive_orphan_enum's BFS loop). */
 QJS_JSEXPORT void qjs_cow_undo_revert_to(size_t mark);
+static void qjs_cow_buf_revert_to(size_t wmark);   /* fwd: buffer-trail (deferred-realloc) revert, hooked into qjs_cow_undo_revert_to */
+static void qjs_cow_buf_commit(void);              /* fwd: buffer-trail commit, hooked into qjs_cow_commit */
 
 typedef struct JSCowDelta { uint64_t *widx; uint64_t *oldw; uint64_t *neww; size_t n;
     /* typed-trail component: the shared-scope JSValue slots this flow wrote (refcount-exact). The
@@ -20815,6 +20823,7 @@ QJS_JSEXPORT void qjs_cow_commit(const uint8_t *mem) {
        leaves the instance sound. This is the split: word-log = committable object graph; typed trail
        = per-flow shared-cell deltas that always revert. */
     qjs_cow_vt_revert_to(0);
+    qjs_cow_buf_commit();   /* the new buffers are baseline now; free the deferred OLD buffers (dead) */
 }
 /* Reset the COW state (grind teardown). The baseline/bitmap are POOL memory (bump),
    not js_malloc blocks — never js_free them; the pool stays allocated for reuse. */
@@ -20827,6 +20836,7 @@ static void qjs_cow_reset(JSRuntime *rt) {
     }
     g_cow_saved = g_cow_commits = g_cow_discards = g_cow_captures = g_cow_applies = 0;
     qjs_cow_undo = NULL; qjs_cow_shadow = NULL; qjs_cow_undo_n = qjs_cow_undo_cap = qjs_cow_words = 0;   /* undo-log state lives in the pool just reset -> drop the dangling pointers */
+    qjs_cow_buf_n = 0;   /* buffer-trail (deferred reallocs): drop stale entries — the trailed buffers live in the heap the runtime teardown frees; the trail array itself is reused */
     qjs_leaf = NULL;   /* leaf table lives in the pool too -> drop the dangling pointer so it re-allocs from the fresh pool next grind */
     qjs_cow_pool_reset();
 }
@@ -20975,6 +20985,7 @@ QJS_JSEXPORT void qjs_cow_undo_revert_to(size_t mark) {
         qjs_cow_shadow[w >> 3] &= (uint8_t)~(1u << (w & 7));
     }
     qjs_cow_undo_n = mark;
+    qjs_cow_buf_revert_to(mark);   /* drop deferred-realloc buffers whose field write reverts (orphaned new leaks; old stays live) */
     g_cow_busy = 0;
 }
 /* THE NEXT BRICK (lines 5118/5154): refcount-exact typed capture of an OBJECT-INTERNAL JSValue ref —
@@ -21024,6 +21035,54 @@ void cow_set_array_el(JSContext *ctx, JSValue *pval, JSValue val) {
         return;
     }
     set_value(ctx, pval, val);
+}
+/* BUFFER-TRAIL — the object-internal brick for fast-array buffer REALLOCS. expand_fast_array reallocs
+   p->u.array.u.values via js_realloc2, which FREES the old buffer; the values-pointer FIELD is byte-
+   logged, so a forced-flow revert restores the OLD pointer — DANGLING (use-after-free), the pre-existing
+   object-internal hazard the word log cannot type (a buffer is not a JSValue, so the vt trail can't
+   cover it). cow_realloc_array instead js_malloc's the new buffer, memcpy's, KEEPS the old, and trails
+   (old,new). Lifetimes: on REVERT the values-pointer field reverts to old (word log) and old stays live
+   — drop the trail entry; the orphaned new leaks (rare: only a BASELINE array grown in a forced flow,
+   and a strict improvement over the prior use-after-free). On COMMIT the pointer stays new (baseline),
+   old is dead — free old. wpos = the word-log position the (pending) field write will occupy, so
+   revert_to(wmark) drops exactly the entries whose field reverts. CONSERVATIVE: revert frees nothing
+   (only pops), so any boundary/shadow-dedup mismatch can only LEAK, never double-free / use-after-free.
+   (State JSCowBuf/qjs_cow_buf/_n/_cap is declared up with the vt-trail vars so qjs_cow_reset sees it.) */
+static void qjs_cow_buf_push(JSContext *ctx, void *oldb, void *newb) {
+    if (qjs_cow_buf_n >= qjs_cow_buf_cap) {
+        size_t nc = qjs_cow_buf_cap ? qjs_cow_buf_cap * 2 : 16;
+        JSCowBuf *nb = js_realloc(ctx, qjs_cow_buf, nc * sizeof(JSCowBuf));
+        if (!nb) return;   /* OOM: drop the entry -> old leaks at commit, never corrupts */
+        qjs_cow_buf = nb; qjs_cow_buf_cap = nc;
+    }
+    qjs_cow_buf[qjs_cow_buf_n].oldb = oldb;
+    qjs_cow_buf[qjs_cow_buf_n].newb = newb;
+    qjs_cow_buf[qjs_cow_buf_n].wpos = qjs_cow_undo_n;   /* the pending values-pointer field write logs here */
+    qjs_cow_buf_n++;
+}
+static void qjs_cow_buf_revert_to(size_t wmark) {
+    while (qjs_cow_buf_n > 0 && qjs_cow_buf[qjs_cow_buf_n - 1].wpos >= wmark) qjs_cow_buf_n--;   /* pointer reverts to old (live); new leaks */
+}
+static void qjs_cow_buf_commit(void) {
+    JSRuntime *rt = g_cow_rt;
+    for (size_t k = 0; k < qjs_cow_buf_n; k++) if (rt && qjs_cow_buf[k].oldb) js_free_rt(rt, qjs_cow_buf[k].oldb);
+    qjs_cow_buf_n = 0;
+}
+/* Flow-aware fast-array buffer realloc: defer the old-buffer free + trail it for a BASELINE array
+   (so its field-pointer revert never dangles); plain js_realloc2 for a flow-local array / outside a
+   flow. */
+static JSValue *cow_realloc_array(JSContext *ctx, JSObject *p, size_t newbytes, size_t *pslack) {
+    JSValue *oldbuf = p->u.array.u.values;
+    if ((g_flow_capture || g_grind_drive_active) && cow_slot_baseline(&p->u.array.u.values)) {
+        size_t oldbytes = sizeof(JSValue) * (size_t)p->u.array.u1.size;
+        JSValue *nb = js_malloc(ctx, newbytes);
+        if (!nb) return NULL;
+        memcpy(nb, oldbuf, oldbytes < newbytes ? oldbytes : newbytes);
+        if (pslack) *pslack = 0;
+        qjs_cow_buf_push(ctx, oldbuf, nb);   /* KEEP old; the trail manages both buffers' lifetimes */
+        return nb;
+    }
+    return js_realloc2(ctx, oldbuf, newbytes, pslack);
 }
 /* Backtrack the typed trail down to `mark`: for each entry in REVERSE, decref the slot's CURRENT
    value and restore old (the trail's ref → slot). Refcount-EXACT — the layer the byte word-log
