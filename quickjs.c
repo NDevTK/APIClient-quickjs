@@ -5121,6 +5121,7 @@ static int g_cow_force_log;   /* fwd (def in COW section): cow_set_value sets it
 static int g_flow_depth;      /* # of nested live flows (qjs_flow_arm/revert) */
 struct JSVarRef;
 static void qjs_cow_vt_push(JSValue *slot, JSValue old, struct JSVarRef *vref);   /* fwd (def in COW section): typed-trail record for refcount-exact heap-fork backtrack */
+void cow_set_array_append(JSContext *ctx, JSValue *pval, JSValue val);   /* fwd (def in COW section): typed capture of a fast-array append (the next brick) */
 static inline void cow_set_value(JSContext *ctx, JSValue *pval, JSValue new_val) {
     if (g_flow_capture || g_grind_drive_active) {
         /* TYPED TRAIL (heap-fork backtrack, refcount-EXACT) — the typed layer the byte word-log
@@ -13091,7 +13092,7 @@ static int add_fast_array_element(JSContext *ctx, JSObject *p,
             return -1;
         }
     }
-    p->u.array.u.values[new_len - 1] = val;
+    cow_set_array_append(ctx, &p->u.array.u.values[new_len - 1], val);   /* typed for a baseline array (the next brick); raw for flow-local */
     p->u.array.count = new_len;
     return true;
 }
@@ -20974,6 +20975,33 @@ QJS_JSEXPORT void qjs_cow_undo_revert_to(size_t mark) {
     }
     qjs_cow_undo_n = mark;
     g_cow_busy = 0;
+}
+/* THE NEXT BRICK (lines 5118/5154): refcount-exact typed capture of an OBJECT-INTERNAL JSValue ref —
+   a fast-array element — the same typed-trail layer cow_set_value gives shared-scope/property-value
+   slots. Without it a flow's append to a BASELINE array is byte-logged: a mid-flow / park revert
+   restores the slot's old word (UNDEFINED) WITHOUT decref'ing the appended val, so val's refcount is
+   left too high (leak) and a true mid-flow revert underflows the cycle-GC on object-internal refs.
+   Routing add_fast_array_element through here records {slot, old} on the typed trail so the revert is
+   refcount-exact (restore old, decref current). Scoped to BASELINE arrays: a flow-LOCAL (per-flow
+   arena) or value-stack array is discarded wholesale, never reverted, so it stays a raw write — same
+   discrimination the word-log barrier uses. append => old is UNDEFINED (no ref), so the phantom
+   transfer is trivially exact. */
+void cow_set_array_append(JSContext *ctx, JSValue *pval, JSValue val) {
+    if (g_flow_capture || g_grind_drive_active) {
+        size_t hb = (size_t)&__heap_base, a = (size_t)pval;
+        int baseline = (a >= hb);
+        if (baseline && g_flow_arena && a >= (size_t)g_flow_arena && a < (size_t)g_flow_arena + g_flow_arena_cap) baseline = 0;
+        if (baseline && g_cow_exec_rt) { JSStackChunk *c = g_cow_exec_rt->js_stack;
+            while (c) { if (a >= (size_t)(void *)c && a < (size_t)(void *)c->limit) { baseline = 0; break; } c = c->prev; } }
+        if (baseline) {
+            int sv = g_cow_busy; g_cow_busy = 1;
+            qjs_cow_vt_push(pval, *pval, NULL);   /* old = UNDEFINED on a fresh append slot — phantom transfer is exact */
+            *pval = val;
+            g_cow_busy = sv;
+            return;
+        }
+    }
+    *pval = val;
 }
 /* Backtrack the typed trail down to `mark`: for each entry in REVERSE, decref the slot's CURRENT
    value and restore old (the trail's ref → slot). Refcount-EXACT — the layer the byte word-log
