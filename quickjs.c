@@ -2509,6 +2509,7 @@ typedef struct JSStackFrame {
     void *qjs_tramp_async;                  /* #6: non-NULL (the JSAsyncFunctionData) marks a trampolined ASYNC callee being run on the CALLER's loop instead of via a nested js_async_function_resume. At done_generator teardown the loop settles it (register await / resolve) + reloads the caller (whose stack already holds the result promise) rather than returning to C. NULL for every normal/generator/resume frame. */
     uint8_t qjs_tramp_caller;               /* #6: 1 = this async frame is a trampoline CALLER currently waiting for a callee running deeper on the SAME heap loop (cur_sp is saved for restoration, but the frame is logically RUNNING, not suspended-at-await). async_func_mark must treat it like a running frame (skip stack marking → its values stay external roots), or the cycle collector wrongly treats the chained-but-live frame as cycle-collectable and over-frees a shared shape. Set in the OP_call async entry, cleared when the callee returns and reloads this frame. */
     void *qjs_tramp_gen;                    /* #6: non-NULL (the JSGeneratorData) marks a trampolined GENERATOR body run on the CALLER's loop via OP_call_method-to-.next(), instead of nested js_generator_next -> async_func_resume -> JS_CallInternal. At done_generator teardown the loop settles it (js_generator_settle), builds the {value,done} result, reloads the caller, and splices the result. NULL for every other frame. */
+    void *qjs_tramp_map;                    /* (void*)(intptr_t)(special+1) marks an Array.map/forEach callback run as a HEAP frame (single-element fast-array case) via the map-trampoline — heap-switches the last C-re-entry so map-recursion never grows the C stack. NULL otherwise. */
 } JSStackFrame;
 
 typedef enum {
@@ -3475,6 +3476,8 @@ static JSValue js_function_apply(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv, int magic);
 static JSValue js_function_call(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv);   /* fwd: the OP_call_method .call C-re-entry trampoline detects it */
+static JSValue js_array_every(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv, int special);   /* fwd: the OP_call_method map/forEach trampoline detects it (special_map=3, special_forEach=2) */
 static void js_array_finalizer(JSRuntime *rt, JSValueConst val);
 static void js_array_mark(JSRuntime *rt, JSValueConst val,
                           JS_MarkFunc *mark_func);
@@ -21135,25 +21138,18 @@ static void qjs_flow_revert(JSContext *ctx) {
     qjs_fe_seen_reset();   /* fresh forced-exec seen-set per invoke (the grind's per-execution-unit reset) */
 }
 
-/* THE ONE forced-invoke primitive (#5-#10 collapse): every forced drive — orphan-enum schedule,
-   deep-step orphan, callback drive, value-spread — is "fork the shared-scope cells to baseline, then
-   invoke". Today each site open-codes `qjs_cow_vt_revert_to(0); JS_Call(...)` with subtle drift; route
-   them all through here so there is ONE snapshot boundary, not five. This is the engine-level analogue
-   of FLOWBEG bracketing the breadth pass: a single place all forced sub-paths pass through, the seam
-   where per-flow snapshot/eviction will attach. Behaviour-identical to the open-coded form it replaces;
-   the value is that a future change (per-flow trail, KLEE branch-fork) edits ONE function, not five. */
-static JSValue qjs_run_forced_flow(JSContext *ctx, JSValueConst fn, JSValueConst this_val,
-                                   int argc, JSValueConst *argv, int is_ctor) {
-    qjs_cow_vt_revert_to(0);   /* snapshot: this forced sub-path reads shared cells at baseline */
-    return is_ctor ? JS_CallConstructor(ctx, fn, argc, argv)
-                   : JS_Call(ctx, fn, this_val, argc, argv);
-}
+#define QJS_DEFER_QUANTUM 64          /* yield-windows (×10000 ops) a forced flow runs before it is preempted + starved */
 
-void qjs_free_suspended_trampoline_frames(JSContext *ctx)
+/* Free the trampolined NORMAL frames from current_stack_frame DOWN TO (but not
+   including) `stop`, then set current_stack_frame = stop. `stop`=NULL frees the
+   whole chain (boot-breadth / grind, called at the top). A re-entrant forced flow
+   (a callback driven mid-dispatch) passes its CALLER's frame so only THIS flow's
+   sub-chain is dropped — the outer flow's frames are preserved. */
+static void qjs_free_suspended_upto(JSContext *ctx, JSStackFrame *stop)
 {
     JSRuntime *rt = ctx->rt;
     JSStackFrame *sf = rt->current_stack_frame;
-    while (sf) {
+    while (sf && sf != stop) {
         JSStackFrame *prev = sf->prev_frame;
         JSFunctionBytecode *_fb = JS_GetFunctionBytecode(sf->cur_func);
         /* ONLY NORMAL trampolined frames. An async/generator (or a module-eval
@@ -21173,7 +21169,50 @@ void qjs_free_suspended_trampoline_frames(JSContext *ctx)
         }
         sf = prev;
     }
-    rt->current_stack_frame = NULL;
+    rt->current_stack_frame = stop;
+}
+
+void qjs_free_suspended_trampoline_frames(JSContext *ctx)
+{
+    qjs_free_suspended_upto(ctx, NULL);
+}
+
+/* THE ONE forced-invoke primitive (#5-#10 collapse): every forced drive — orphan-enum schedule,
+   deep-step orphan, callback drive, value-spread, boot breadth — is "fork the shared-scope cells to
+   baseline, then invoke UNDER THE SCHEDULER". qjs_driving makes YIELD_POLL return-to-here every
+   ~quantum with the heap call-chain intact: a TERMINATING flow completes within the quantum-resume
+   (its @H/frontiers surfaced); a NON-TERMINATING one (infinite recursion/loop on an opaque arg —
+   exactly c_map's rec->cb->rec) is PREEMPTED after a fair quantum and its suspended sub-chain freed,
+   to be re-driven (paused/starved) by the grind. Without this, only js_fe_drive_breadth was
+   preemptible, so a cb-driven or orphan-enum-driven recursion spun the worker dead. Re-entrancy-safe:
+   a callback driven mid-dispatch saves the caller's frame as the free boundary, so preempting it does
+   not nuke the outer flow's frames. ONE preempt loop here, used everywhere — not five open-coded sites,
+   not a separate breadth path. Preemption is a fixed WINDOW count (granularity), never a no-progress
+   or output count (that would be a banned fixpoint/bound). */
+static JSValue qjs_run_forced_flow(JSContext *ctx, JSValueConst fn, JSValueConst this_val,
+                                   int argc, JSValueConst *argv, int is_ctor) {
+    JSRuntime *rt = ctx->rt;
+    qjs_cow_vt_revert_to(0);   /* snapshot: this forced sub-path reads shared cells at baseline */
+    JSStackFrame *boundary = rt->current_stack_frame;   /* re-entrancy: free only THIS flow's sub-chain on preempt */
+    int sv_driving = rt->qjs_driving;
+    qjs_set_driving(ctx, 1);
+    JSValue r = is_ctor ? JS_CallConstructor(ctx, fn, argc, argv)
+                        : JS_Call(ctx, fn, this_val, argc, argv);
+    int slice = 0;
+    while (rt->qjs_yielded) {
+        rt->qjs_yielded = 0;
+        if (++slice < QJS_DEFER_QUANTUM) {
+            rt->qjs_resume_chain = 1;
+            r = qjs_resume_chain_call(ctx);
+        } else {
+            JS_FreeValue(ctx, r);
+            qjs_free_suspended_upto(ctx, boundary);   /* starve: drop this flow's chain to the caller boundary; the grind re-drives it */
+            r = JS_UNDEFINED;
+            break;
+        }
+    }
+    if (!sv_driving) qjs_set_driving(ctx, 0);
+    return r;
 }
 
 static void close_var_refs(JSRuntime *rt, JSStackFrame *sf)
@@ -21441,6 +21480,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSStackChunk *_arena_chunk = NULL;   /* heap JS-stack segment for the CURRENT frame (reloaded on a trampoline return) */
     uint8_t *_arena_save = NULL;         /* bump pointer to restore on teardown */
     JSStackFrame *entry_frame = NULL;    /* the frame this C-invocation owns; its OP_return goes back to C (step 3b) */
+    void *_pending_map_tramp = NULL;     /* the map-trampoline entry stashes (void*)(intptr_t)(special+1) here; setup_callee moves it onto the callee frame's qjs_tramp_map */
 
 #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_STEP
 #define DUMP_BYTECODE_OR_DONT(pc) \
@@ -21632,6 +21672,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         sf->qjs_new_target = new_target;
         sf->qjs_tramp_async = NULL;           /* #6: a normal trampolined callee, never an async-callee */
         sf->qjs_tramp_caller = 0;             /* #6: a freshly set-up callee is running, not waiting on a deeper callee */
+        sf->qjs_tramp_map = _pending_map_tramp; _pending_map_tramp = NULL;   /* map-trampoline: this callee IS a map/forEach callback (else NULL) */
     }
 
     sf->is_strict_mode = b->is_strict_mode;
@@ -22305,6 +22346,45 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 goto setup_callee;
                             }
                             if (_atab) free_arg_list(ctx, _atab, _alen);   /* headroom insufficient -> C path */
+                        }
+                    }
+                    /* MAP-TRAMPOLINE (single-element fast array): `arr.map(cb)` / `arr.forEach(cb)` to a
+                       NORMAL bytecode callback runs cb(arr[0],0,arr) as a HEAP frame instead of through
+                       js_array_every's C loop (which C-recurses per recursion level). Reshape
+                       [arr, method, cb] -> [undefined, cb, arr[0], 0, arr] + setup_callee with
+                       qjs_tramp_map=magic+1; teardown builds the result ([cb_ret]/undefined), reloads,
+                       splices. Heap-switched => map-recursion never grows the C stack, yields per opcode. */
+                    if ((opcode == OP_call_method || opcode == OP_tail_call_method) && _fp && call_argc == 1 &&
+                        _fp->class_id == JS_CLASS_C_FUNCTION &&
+                        _fp->u.cfunc.c_function.generic_magic == js_array_every &&
+                        (_fp->u.cfunc.magic == 3 /* special_map */ || _fp->u.cfunc.magic == 2 /* special_forEach */)) {
+                        JSValue _marr = call_argv[-2], _mcb = call_argv[0];
+                        JSObject *_map_ap = (JS_VALUE_GET_TAG(_marr) == JS_TAG_OBJECT) ? JS_VALUE_GET_OBJ(_marr) : NULL;
+                        JSObject *_mcbp = (JS_VALUE_GET_TAG(_mcb) == JS_TAG_OBJECT) ? JS_VALUE_GET_OBJ(_mcb) : NULL;
+                        if (_map_ap && _map_ap->class_id == JS_CLASS_ARRAY && _map_ap->fast_array && _map_ap->u.array.count == 1 &&
+                            _mcbp && _mcbp->class_id == JS_CLASS_BYTECODE_FUNCTION &&
+                            _mcbp->u.func.function_bytecode->func_kind == JS_FUNC_NORMAL &&
+                            (int)(stack_buf + b->stack_size - sp) >= 2) {
+                            JSValue _e0 = js_dup(_map_ap->u.array.u.values[0]);
+                            JSValue *_mbase = call_argv - 2;        /* [arr, method, cb] */
+                            JSValue _marr_owned = _mbase[0];        /* arr -> args[2] */
+                            JS_FreeValue(ctx, _mbase[1]);           /* the js_array_every method object */
+                            _mbase[0] = JS_UNDEFINED;               /* this */
+                            _mbase[1] = _mcb;                       /* func = the callback */
+                            _mbase[2] = _e0;                        /* arg0 = arr[0] */
+                            _mbase[3] = js_int32(0);                /* arg1 = index */
+                            _mbase[4] = _marr_owned;                /* arg2 = arr */
+                            sp = _mbase + 5;
+                            call_argc = 3; call_argv = _mbase + 2;
+                            sf->cur_sp = sp;
+                            sf->qjs_call_argc = call_argc;
+                            sf->qjs_call_extra = 2;
+                            sf->qjs_is_tail = (opcode == OP_tail_call_method);
+                            _pending_map_tramp = (void *)(intptr_t)((int)_fp->u.cfunc.magic + 1);
+                            func_obj = _mcb; this_obj = JS_UNDEFINED; new_target = JS_UNDEFINED;
+                            argc = call_argc; argv = vc(call_argv); flags = 0;
+                            p = _mcbp; b = _mcbp->u.func.function_bytecode;
+                            goto setup_callee;
                         }
                     }
                     if (opcode == OP_call_method && _fp &&
@@ -25653,6 +25733,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             if (qjs_deep_rb)
                 g_comp_last_ret_ptr = (JS_VALUE_GET_TAG(ret_val) == JS_TAG_OBJECT) ? JS_VALUE_GET_OBJ(ret_val) : NULL;
             return ret_val;
+        }
+        /* MAP-TRAMPOLINE settle: this returning NORMAL frame was a map/forEach callback run as a heap
+           frame. Transform its return into the HOF result (map -> [cb_ret]; forEach -> undefined) BEFORE
+           the normal teardown reloads the caller + splices, so `arr.map(cb)` gets the right value. */
+        if (sf->qjs_tramp_map) {
+            int _msp = (int)(intptr_t)sf->qjs_tramp_map - 1;
+            sf->qjs_tramp_map = NULL;
+            if (!JS_IsException(ret_val)) {
+                if (_msp == 3 /* special_map */) {
+                    JSValue _mret = JS_NewArray(ctx);
+                    if (JS_IsException(_mret)) { JS_FreeValue(ctx, ret_val); ret_val = _mret; }
+                    else { JS_SetPropertyUint32(ctx, _mret, 0, ret_val); ret_val = _mret; }   /* consumes ret_val */
+                } else {   /* special_forEach */
+                    JS_FreeValue(ctx, ret_val);
+                    ret_val = JS_UNDEFINED;
+                }
+            }
         }
         /* reload the caller (qjs_call_* were stamped on IT at OP_call) and resume */
         sf = sf->prev_frame;
@@ -62998,7 +63095,6 @@ static JSRuntime *qjs_deep_cache_rt = NULL;
    no-global-progress fixpoint (a deferred orphan re-spins while NO other orphan
    completed since its last defer ⇒ provably unhelpable ⇒ mark driven). Monotone
    (g_grind_completions only rises), so it terminates without a magic limit. */
-#define QJS_DEFER_QUANTUM 64          /* no-forced-progress interrupt polls (×10000 ops) before yielding a drive */
 static int g_grind_drive_active = 0;  /* 1 only while an orphan JS_Call is in flight — gates the handler */
 /* objective #9 attention signal: the count of EMITTED OUTPUT lines (@H endpoints + @S
    findings). This is the ONLY sound progress signal — a flow makes progress iff it emits
