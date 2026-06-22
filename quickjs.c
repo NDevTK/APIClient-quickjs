@@ -21177,6 +21177,8 @@ void qjs_free_suspended_trampoline_frames(JSContext *ctx)
     qjs_free_suspended_upto(ctx, NULL);
 }
 
+static int qjs_park_forced_flow(JSContext *ctx, size_t cow_mark, size_t vt_mark);   /* fwd: defined with the grind WFQ registry below */
+
 /* THE ONE forced-invoke primitive (#5-#10 collapse): every forced drive — orphan-enum schedule,
    deep-step orphan, callback drive, value-spread, boot breadth — is "fork the shared-scope cells to
    baseline, then invoke UNDER THE SCHEDULER". qjs_driving makes YIELD_POLL return-to-here every
@@ -21202,6 +21204,8 @@ static JSValue qjs_run_forced_flow(JSContext *ctx, JSValueConst fn, JSValueConst
        On preempt we free THIS flow's whole isolated chain; the caller's flow is restored intact.
        (The shared-heap word-log undo is orthogonal to the call-stack, so the caller's per-arm
        revert still covers this flow's heap writes — isolation is of the CALL STACK only.) */
+    size_t cow_mark = qjs_cow_undo_n;     /* undo-log high-water at entry: this flow's heap writes are the segment [cow_mark, n) */
+    size_t vt_mark = qjs_cow_vt_n;
     JSFlow outer; qjs_flow_save(ctx, &outer);
     rt->js_stack = NULL; rt->current_stack_frame = NULL; rt->qjs_yield_entry = NULL;
     int sv_driving = rt->qjs_driving;
@@ -21216,7 +21220,16 @@ static JSValue qjs_run_forced_flow(JSContext *ctx, JSValueConst fn, JSValueConst
             r = qjs_resume_chain_call(ctx);
         } else {
             JS_FreeValue(ctx, r); r = JS_UNDEFINED;
-            qjs_free_suspended_trampoline_frames(ctx);   /* free the isolated sub-chain (current_stack_frame -> NULL) */
+            /* PARK (not free): snapshot this isolated flow + its COW delta into the grind's WFQ
+               registry so qjs_drive_repick resumes it later, output-ordered, instead of dropping
+               its progress. Both callers discard r, so resuming when the outer context is gone only
+               needs its @H/@S to surface. Falls back to free if the flow wrote shared-scope JSValue
+               slots (the refcount-exact typed-trail capture-from-mark is the next increment). */
+            if (qjs_park_forced_flow(ctx, cow_mark, vt_mark)) {
+                rt->js_stack = NULL; rt->current_stack_frame = NULL; rt->qjs_yield_entry = NULL;  /* detached into the registry — do NOT free its chunks */
+            } else {
+                qjs_free_suspended_trampoline_frames(ctx);   /* free the isolated sub-chain (current_stack_frame -> NULL) */
+            }
             break;
         }
     }
@@ -63176,6 +63189,44 @@ static int qjs_drive_park_grow(JSContext *ctx) {
     JSCowDelta *nd = js_realloc(ctx, qjs_drive_cow, (size_t)nc * sizeof(JSCowDelta)); if (!nd) return 0; qjs_drive_cow = nd;
     unsigned *nm = js_realloc(ctx, qjs_drive_mark, (size_t)nc * sizeof(unsigned)); if (!nm) return 0; qjs_drive_mark = nm;
     qjs_drive_cap = nc; return 1;
+}
+/* PARK a re-entrant forced sub-flow (qjs_run_forced_flow) into the SAME WFQ registry the grind uses,
+   so qjs_drive_repick resumes it later (output-ordered) instead of qjs_run_forced_flow FREEING it.
+   The sub-flow is already a first-class isolated flow (its own NULL-bottomed stack — see
+   qjs_run_forced_flow), so this is qjs_flow_save + a COW capture. The capture is FROM cow_mark (the
+   undo-log high-water at sub-flow entry), NOT from 0 as qjs_cow_capture does: the log below cow_mark
+   is the OUTER flow's writes, which must stay live. Reverting only [cow_mark, n) isolates the parked
+   flow's heap writes to baseline (re-applied on resume by qjs_cow_apply); the caller's own
+   revert_to(_arm_mark) is then idempotent since _arm_mark == cow_mark. Returns 1 if parked (caller
+   detaches rt and must NOT free the chunks), 0 to fall back to free. SCOPE (honest): parks only when
+   the flow wrote NO shared-scope JSValue slots (typed-trail unchanged) — the refcount-exact trail
+   capture-from-mark is the next increment; a vt-writing flow safely frees as before (no regression). */
+static int qjs_park_forced_flow(JSContext *ctx, size_t cow_mark, size_t vt_mark) {
+    JSRuntime *rt = ctx->rt;
+    extern int g_emit_n;
+    if (qjs_cow_vt_n != vt_mark) return 0;            /* wrote a shared-scope JSValue slot -> not yet parkable */
+    if (!qjs_drive_park_grow(ctx)) return 0;
+    int ix = qjs_drive_n++;
+    JSCowDelta *d = &qjs_drive_cow[ix];
+    size_t n = qjs_cow_undo_n, cnt = (n > cow_mark) ? (n - cow_mark) : 0;
+    size_t hb = (size_t)&__heap_base, k;
+    d->n = cnt;
+    d->widx = cnt ? (uint64_t *)qjs_cow_palloc(cnt * sizeof(uint64_t)) : NULL;
+    d->oldw = cnt ? (uint64_t *)qjs_cow_palloc(cnt * sizeof(uint64_t)) : NULL;
+    d->neww = cnt ? (uint64_t *)qjs_cow_palloc(cnt * sizeof(uint64_t)) : NULL;
+    for (k = 0; k < cnt; k++) {                        /* capture current (neww) BEFORE reverting */
+        uint64_t w = qjs_cow_undo[cow_mark + k].widx;
+        d->widx[k] = w; d->oldw[k] = qjs_cow_undo[cow_mark + k].old;
+        d->neww[k] = *(uint64_t *)(hb + (w << 3));
+    }
+    d->vtn = 0; d->vts = NULL; d->vto = NULL; d->vtc = NULL;
+    if (g_cow_enabled) qjs_cow_undo_revert_to(cow_mark);   /* revert ONLY this flow's words; the outer flow's stay live */
+    qjs_drive_flow[ix].js_stack = rt->js_stack;
+    qjs_drive_flow[ix].current_stack_frame = rt->current_stack_frame;
+    qjs_drive_flow[ix].qjs_yield_entry = rt->qjs_yield_entry;
+    qjs_drive_flow[ix].flow_depth = g_flow_depth;
+    qjs_drive_mark[ix] = (unsigned)g_emit_n;
+    return 1;
 }
 /* Run the ACTIVE drive chain under the WFQ: resume WHILE it emits new @H/@S; on the
    first QUANTUM-silent window PARK it (snapshot + per-flow COW capture, never free).
