@@ -5122,7 +5122,7 @@ static int g_flow_depth;      /* # of nested live flows (qjs_flow_arm/revert) */
 struct JSVarRef;
 static void qjs_cow_vt_push(JSValue *slot, JSValue old, struct JSVarRef *vref);   /* fwd (def in COW section): typed-trail record for refcount-exact heap-fork backtrack */
 void cow_set_array_append(JSContext *ctx, JSValue *pval, JSValue val);   /* fwd (def in COW section): typed capture of a fast-array append (the next brick) */
-void cow_set_array_el(JSContext *ctx, JSValue *pval, JSValue val);        /* fwd: typed capture of a fast-array element OVERWRITE (set_value analogue) */
+void cow_set_slot(JSContext *ctx, JSValue *pval, JSValue val);        /* fwd: typed capture of a fast-array element OVERWRITE (set_value analogue) */
 static JSValue *cow_realloc_array(JSContext *ctx, JSObject *p, size_t newbytes, size_t *pslack);   /* fwd: flow-aware fast-array buffer realloc (buffer-trail brick) */
 static void *cow_realloc_buf(JSContext *ctx, void **pfield, size_t oldbytes, size_t newbytes);     /* fwd: flow-aware realloc of an object-internal buffer field (p->prop) */
 static void cow_shape_transition(JSContext *ctx, JSObject *p, JSShape *new_sh);                    /* fwd: refcount-exact p->shape transition (shape-trail brick) */
@@ -11966,7 +11966,7 @@ static int JS_SetPrivateField(JSContext *ctx, JSValueConst obj,
         JS_FreeValue(ctx, val);
         return -1;
     }
-    set_value(ctx, &pr->u.value, val);
+    cow_set_slot(ctx, &pr->u.value, val);   /* refcount-exact under a forced flow on a baseline property value (else set_value) */
     return 0;
 }
 
@@ -13179,7 +13179,7 @@ retry:
         if (likely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
                                   JS_PROP_LENGTH)) == JS_PROP_WRITABLE)) {
             /* fast case */
-            set_value(ctx, &pr->u.value, val);
+            cow_set_slot(ctx, &pr->u.value, val);   /* refcount-exact under a forced flow on a baseline property value (else set_value) */
             return true;
         } else if (prs->flags & JS_PROP_LENGTH) {
             assert(p->class_id == JS_CLASS_ARRAY);
@@ -13429,12 +13429,12 @@ static int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
                 /* add element */
                 return add_fast_array_element(ctx, p, val, flags);
             }
-            set_value(ctx, &p->u.array.u.values[idx], val);
+            cow_set_slot(ctx, &p->u.array.u.values[idx], val);   /* refcount-exact under a forced flow on a baseline fast-array element (else set_value) */
             break;
         case JS_CLASS_ARGUMENTS:
             if (unlikely(idx >= (uint32_t)p->u.array.count))
                 goto slow_path;
-            set_value(ctx, &p->u.array.u.values[idx], val);
+            cow_set_slot(ctx, &p->u.array.u.values[idx], val);   /* refcount-exact under a forced flow on a baseline fast-array element (else set_value) */
             break;
         case JS_CLASS_MAPPED_ARGUMENTS:
             if (unlikely(idx >= (uint32_t)p->u.array.count))
@@ -14013,7 +14013,7 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
                             goto redo_prop_update;
                     }
                     if (flags & JS_PROP_HAS_VALUE) {
-                        set_value(ctx, &p->u.array.u.values[idx], js_dup(val));
+                        cow_set_slot(ctx, &p->u.array.u.values[idx], js_dup(val));   /* refcount-exact under a forced flow on a baseline fast-array element (else set_value) */
                     }
                     return true;
                 }
@@ -21069,11 +21069,13 @@ void cow_set_array_append(JSContext *ctx, JSValue *pval, JSValue val) {
     }
     *pval = val;
 }
-/* OVERWRITE a fast-array element (old is a real ref): type it for a baseline array — the trail OWNS
-   old (transferred from the slot, no free, like cow_set_value), so the revert restores old + decref's
-   the displaced current, refcount-exact. Flow-local / not capturing: plain set_value (free old +
-   install). The object-internal analogue of cow_set_value for array elements. */
-void cow_set_array_el(JSContext *ctx, JSValue *pval, JSValue val) {
+/* OVERWRITE any baseline JSValue heap slot (fast-array element OR property value; old is a real ref):
+   the trail OWNS old (transferred from the slot, no free), so the revert restores old + decref's the
+   displaced current, refcount-exact. Baseline-CHECKED, so it is the generic setter for slots that may be
+   flow-local (a property/element on an object created during the flow): flow-local / not capturing ->
+   plain set_value (free old + install), since flow-local heap is discarded wholesale, never reverted.
+   (cow_set_value is the unchecked variant for known-baseline shared-scope slots.) */
+void cow_set_slot(JSContext *ctx, JSValue *pval, JSValue val) {
     if ((g_flow_capture || g_grind_drive_active) && cow_slot_baseline(pval)) {
         int sv = g_cow_busy; g_cow_busy = 1;
         qjs_cow_vt_push(pval, *pval, NULL);   /* trail owns old (phantom transfer); revert decref's current */
@@ -24729,7 +24731,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         p = JS_VALUE_GET_OBJ(sp[-3]);
                         if (likely(p->class_id == JS_CLASS_ARRAY &&
                                    idx < (uint32_t)p->u.array.count)) {
-                            cow_set_array_el(ctx, &p->u.array.u.values[idx], val);   /* typed overwrite for a baseline array (the next brick) */
+                            cow_set_slot(ctx, &p->u.array.u.values[idx], val);   /* typed overwrite for a baseline array (the next brick) */
                             JS_FreeValue(ctx, sp[-3]);
                             sp -= 3;
                             BREAK;
