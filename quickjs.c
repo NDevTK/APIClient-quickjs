@@ -21121,7 +21121,17 @@ static void qjs_cow_buf_push(void *oldb, void *newb) {
     qjs_cow_buf_n++;
 }
 static void qjs_cow_buf_revert_to(size_t wmark) {
-    while (qjs_cow_buf_n > 0 && qjs_cow_buf[qjs_cow_buf_n - 1].wpos >= wmark) qjs_cow_buf_n--;   /* pointer reverts to old (live); new leaks */
+    JSRuntime *rt = g_cow_rt;
+    int sv = g_cow_busy; g_cow_busy = 1;   /* the free must not re-log (mirrors qjs_cow_shp_revert_to) */
+    while (qjs_cow_buf_n > 0 && qjs_cow_buf[qjs_cow_buf_n - 1].wpos >= wmark) {
+        qjs_cow_buf_n--;
+        /* The word-log already restored the field pointer to old (it runs FIRST in
+           qjs_cow_undo_revert_to), so new is orphaned — free it. Symmetric with commit (frees old,
+           keeps new): revert keeps old, frees new. Stepwise-exact across old->A->B (each new freed
+           once; olds untouched). Was leaking new outright. */
+        if (rt && qjs_cow_buf[qjs_cow_buf_n].newb) js_free_rt(rt, qjs_cow_buf[qjs_cow_buf_n].newb);
+    }
+    g_cow_busy = sv;
 }
 static void qjs_cow_buf_commit(void) {
     JSRuntime *rt = g_cow_rt;
