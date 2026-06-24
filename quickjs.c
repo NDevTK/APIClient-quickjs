@@ -21365,7 +21365,7 @@ void qjs_free_suspended_trampoline_frames(JSContext *ctx)
     qjs_free_suspended_upto(ctx, NULL);
 }
 
-static int qjs_park_forced_flow(JSContext *ctx, size_t cow_mark, size_t vt_mark);   /* fwd: defined with the grind WFQ registry below */
+static int qjs_park_forced_flow(JSContext *ctx, size_t cow_mark, size_t vt_mark, size_t buf_mark, size_t shp_mark);   /* fwd: defined with the grind WFQ registry below */
 
 /* THE ONE forced-invoke primitive (#5-#10 collapse): every forced drive — orphan-enum schedule,
    deep-step orphan, callback drive, value-spread, boot breadth — is "fork the shared-scope cells to
@@ -21393,7 +21393,8 @@ static JSValue qjs_run_forced_flow(JSContext *ctx, JSValueConst fn, JSValueConst
        (The shared-heap word-log undo is orthogonal to the call-stack, so the caller's per-arm
        revert still covers this flow's heap writes — isolation is of the CALL STACK only.) */
     size_t cow_mark = qjs_cow_undo_n;     /* undo-log high-water at entry: this flow's heap writes are the segment [cow_mark, n) */
-    size_t vt_mark = qjs_cow_vt_n;
+    size_t vt_mark = qjs_cow_vt_n;        /* typed-trail high-water (0 after the entry vt-revert, but track generally) */
+    size_t buf_mark = qjs_cow_buf_n, shp_mark = qjs_cow_shp_n;   /* buffer/shape-trail high-waters: park falls back to free if this flow grows them (not yet in the delta) */
     JSFlow outer; qjs_flow_save(ctx, &outer);
     rt->js_stack = NULL; rt->current_stack_frame = NULL; rt->qjs_yield_entry = NULL;
     int sv_driving = rt->qjs_driving;
@@ -21413,7 +21414,7 @@ static JSValue qjs_run_forced_flow(JSContext *ctx, JSValueConst fn, JSValueConst
                its progress. Both callers discard r, so resuming when the outer context is gone only
                needs its @H/@S to surface. Falls back to free if the flow wrote shared-scope JSValue
                slots (the refcount-exact typed-trail capture-from-mark is the next increment). */
-            if (qjs_park_forced_flow(ctx, cow_mark, vt_mark)) {
+            if (qjs_park_forced_flow(ctx, cow_mark, vt_mark, buf_mark, shp_mark)) {
                 rt->js_stack = NULL; rt->current_stack_frame = NULL; rt->qjs_yield_entry = NULL;  /* detached into the registry — do NOT free its chunks */
             } else {
                 qjs_free_suspended_trampoline_frames(ctx);   /* free the isolated sub-chain (current_stack_frame -> NULL) */
@@ -63389,10 +63390,15 @@ static int qjs_drive_park_grow(JSContext *ctx) {
    detaches rt and must NOT free the chunks), 0 to fall back to free. SCOPE (honest): parks only when
    the flow wrote NO shared-scope JSValue slots (typed-trail unchanged) — the refcount-exact trail
    capture-from-mark is the next increment; a vt-writing flow safely frees as before (no regression). */
-static int qjs_park_forced_flow(JSContext *ctx, size_t cow_mark, size_t vt_mark) {
+static int qjs_park_forced_flow(JSContext *ctx, size_t cow_mark, size_t vt_mark, size_t buf_mark, size_t shp_mark) {
     JSRuntime *rt = ctx->rt;
     extern int g_emit_n;
-    if (qjs_cow_vt_n != vt_mark) return 0;            /* wrote a shared-scope JSValue slot -> not yet parkable */
+    /* The buffer-trail / shape-trail segments aren't carried in the delta yet, so they can't be
+       re-applied on resume — fall back to FREE if THIS flow did any deferred realloc / shape
+       transition (rarer than shared-cell writes). The word-log + typed-trail (vt) capture below now
+       FIRES the park for the common shared-scope-writing flow (the supabase value-spread arms), which
+       previously hit the vt fallback and were freed (their progress lost). */
+    if (qjs_cow_buf_n != buf_mark || qjs_cow_shp_n != shp_mark) return 0;
     if (!qjs_drive_park_grow(ctx)) return 0;
     int ix = qjs_drive_n++;
     JSCowDelta *d = &qjs_drive_cow[ix];
@@ -63407,8 +63413,27 @@ static int qjs_park_forced_flow(JSContext *ctx, size_t cow_mark, size_t vt_mark)
         d->widx[k] = w; d->oldw[k] = qjs_cow_undo[cow_mark + k].old;
         d->neww[k] = *(uint64_t *)(hb + (w << 3));
     }
-    d->vtn = 0; d->vts = NULL; d->vto = NULL; d->vtc = NULL;
-    if (g_cow_enabled) qjs_cow_undo_revert_to(cow_mark);   /* revert ONLY this flow's words; the outer flow's stay live */
+    /* TYPED-TRAIL capture-from-mark [vt_mark, vt_n): dup old+current so they survive the pause; on
+       resume qjs_cow_apply transfers them back to slot/trail. Mirrors qjs_cow_capture's vt block but
+       from vt_mark — the segment below vt_mark is the OUTER flow's. */
+    size_t vcnt = (qjs_cow_vt_n > vt_mark) ? (qjs_cow_vt_n - vt_mark) : 0;
+    d->vtn = vcnt;
+    d->vts = vcnt ? (JSValue **)qjs_cow_palloc(vcnt * sizeof(JSValue *)) : NULL;
+    d->vto = vcnt ? (JSValue *)qjs_cow_palloc(vcnt * sizeof(JSValue)) : NULL;
+    d->vtc = vcnt ? (JSValue *)qjs_cow_palloc(vcnt * sizeof(JSValue)) : NULL;
+    if (d->vts && d->vto && d->vtc) {
+        int sv = g_cow_busy; g_cow_busy = 1;
+        for (k = 0; k < vcnt; k++) {
+            d->vts[k] = qjs_cow_vt[vt_mark + k].slot;
+            d->vto[k] = JS_DupValueRT(rt, qjs_cow_vt[vt_mark + k].old);
+            d->vtc[k] = JS_DupValueRT(rt, *qjs_cow_vt[vt_mark + k].slot);
+        }
+        g_cow_busy = sv;
+    } else { d->vtn = 0; }
+    if (g_cow_enabled) {
+        qjs_cow_vt_revert_to(vt_mark);        /* typed trail FIRST (the load-bearing order — refcount-exact on the genuine slot) */
+        qjs_cow_undo_revert_to(cow_mark);     /* then the word log (buf/shp hooks no-op: fallback guaranteed them unchanged) */
+    }
     qjs_drive_flow[ix].js_stack = rt->js_stack;
     qjs_drive_flow[ix].current_stack_frame = rt->current_stack_frame;
     qjs_drive_flow[ix].qjs_yield_entry = rt->qjs_yield_entry;
