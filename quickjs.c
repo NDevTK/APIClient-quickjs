@@ -20754,6 +20754,26 @@ QJS_JSEXPORT int qjs_cow_capture(JSRuntime *rt, const uint8_t *mem, JSCowDelta *
             d->vtc[k] = JS_DupValueRT(rt, *qjs_cow_vt[k].slot);
         }
     } else { d->vtn = 0; }
+    /* BUFFER/SHAPE-TRAIL capture (from 0 — the grind orphan starts at baseline): transfer ownership of
+       the deferred buffers / shape transitions into the delta and TRUNCATE the live trail, so the
+       immediately-following to_baseline revert's buf/shp hooks find nothing and don't free the kept
+       new buffers/shapes (the delta owns them; re-pushed on apply). Same mechanism as the forced-flow
+       park (qjs_park_forced_flow) — the grind park and the forced-flow park are now ONE park over all
+       four trails. */
+    d->bfn = qjs_cow_buf_n;
+    d->bf_old = d->bfn ? (void **)qjs_cow_palloc(d->bfn * sizeof(void *)) : NULL;
+    d->bf_new = d->bfn ? (void **)qjs_cow_palloc(d->bfn * sizeof(void *)) : NULL;
+    if (d->bf_old && d->bf_new) {
+        for (k = 0; k < d->bfn; k++) { d->bf_old[k] = qjs_cow_buf[k].oldb; d->bf_new[k] = qjs_cow_buf[k].newb; }
+        qjs_cow_buf_n = 0;
+    } else { d->bfn = 0; }
+    d->spn = qjs_cow_shp_n;
+    d->sp_old = d->spn ? (struct JSShape **)qjs_cow_palloc(d->spn * sizeof(struct JSShape *)) : NULL;
+    d->sp_new = d->spn ? (struct JSShape **)qjs_cow_palloc(d->spn * sizeof(struct JSShape *)) : NULL;
+    if (d->sp_old && d->sp_new) {
+        for (k = 0; k < d->spn; k++) { d->sp_old[k] = qjs_cow_shp[k].old; d->sp_new[k] = qjs_cow_shp[k].neww; }
+        qjs_cow_shp_n = 0;
+    } else { d->spn = 0; }
     g_cow_busy = 0;
     return 0;
 }
