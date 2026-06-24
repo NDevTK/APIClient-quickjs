@@ -13193,7 +13193,7 @@ retry:
                spaces. */
             if (p->class_id == JS_CLASS_MODULE_NS)
                 goto read_only_prop;
-            set_value(ctx, pr->u.var_ref->pvalue, val);
+            cow_put_var_ref(ctx, pr->u.var_ref, val);   /* refcount-exact under a forced flow (closed var_ref): a global/module binding written via property access is shared-scope state the per-flow revert must undo exactly — the raw set_value byte-reverted the POINTER and underflowed the cycle-GC (same class as the OP_put_var_ref fix). Non-flow / open var_ref: falls through to set_value, unchanged. */
             return true;
         } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT) {
             /* Instantiate property and retry (potentially useless) */
@@ -13936,7 +13936,7 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
                                 goto not_configurable;
                         }
                         /* update the reference */
-                        set_value(ctx, pr->u.var_ref->pvalue, js_dup(val));
+                        cow_put_var_ref(ctx, pr->u.var_ref, js_dup(val));   /* refcount-exact under a forced flow (closed baseline var_ref): the defineProperty path to a global/module binding, same shared-scope target as the plain set above. Non-flow / open: falls through to set_value. */
                     }
                     /* if writable is set to false, no longer a
                        reference (for mapped arguments) */
