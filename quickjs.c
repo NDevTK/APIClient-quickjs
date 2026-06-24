@@ -65252,7 +65252,10 @@ static void qjs_drive_opaque_call_cbs(JSContext *ctx, JSValueConst *call_argv, i
             p->class_id != JS_CLASS_ASYNC_GENERATOR_FUNCTION) continue;
         JSFunctionBytecode *b = p->u.func.function_bytecode;
         if (!b || !b->byte_code_buf) continue;
-        if (b->qjs_executed) continue;                        /* already ran (concrete or driven) — fixpoint guard */
+        /* DELETED the `if (b->qjs_executed) continue` identity fixpoint (CLAUDE.md: only EMITTED
+           OUTPUT, never identity, proves a flow is done). A concretely-run callback still has UNFORCED
+           branches a forced re-drive explores; with the park now COMPLETE+UNIFIED (all four trails), a
+           re-driven callback PARKS+resumes and is starved by output rather than skipped by identity. */
         if (qjs_is_host_model_file(b->filename)) continue;    /* never drive our own shim */
         int nargs = b->arg_count;
         JSValue *args2 = nargs > 0 ? js_mallocz(ctx, nargs * sizeof(JSValue)) : NULL;
