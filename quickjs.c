@@ -63539,21 +63539,10 @@ static void *qjs_reloc_ptr(void *p, JSChunkMap *map, int nmap) {
     }
     return p;   /* not chunk-internal -> COW heap, unchanged */
 }
-static void qjs_drive_relocate(JSContext *ctx, JSFlow *f) {
-    JSRuntime *rt = ctx->rt;
-    if (!f->js_stack) return;
-    int nc = 0; for (JSStackChunk *c = f->js_stack; c; c = c->prev) nc++;
-    JSChunkMap *map = js_malloc(ctx, (size_t)nc * sizeof(JSChunkMap));
-    if (!map) return;
-    int i = 0;
-    for (JSStackChunk *c = f->js_stack; c; c = c->prev, i++) {
-        size_t cap = (size_t)(c->limit - c->data);
-        JSStackChunk *n2 = js_malloc_rt(rt, sizeof(JSStackChunk) + cap);
-        if (!n2) { for (int j = 0; j < i; j++) js_free_rt(rt, map[j].newc); js_free(ctx, map); return; }
-        memcpy(n2, c, sizeof(JSStackChunk) + cap);
-        map[i].oldc = c; map[i].newc = n2; map[i].cap = cap;
-    }
-    for (i = 0; i < nc; i++) {
+/* Apply the chunk-internal pointer fixup to a flow whose chunks have moved (map: old base -> new
+   chunk). Shared by the RAM->RAM relocate and the blob deserialize. */
+static void qjs_drive_fixup(JSFlow *f, JSChunkMap *map, int nc) {
+    for (int i = 0; i < nc; i++) {
         JSStackChunk *n2 = map[i].newc;
         n2->prev  = qjs_reloc_ptr(n2->prev,  map, nc);
         n2->top   = qjs_reloc_ptr(n2->top,   map, nc);
@@ -63561,7 +63550,7 @@ static void qjs_drive_relocate(JSContext *ctx, JSFlow *f) {
     }
     for (JSStackFrame *of = f->current_stack_frame; of; ) {
         JSStackFrame *nf = qjs_reloc_ptr(of, map, nc);
-        JSStackFrame *next_old = nf->prev_frame;   /* still the OLD addr (memcpy'd, not yet fixed) */
+        JSStackFrame *next_old = nf->prev_frame;   /* OLD addr (copied, not yet fixed) */
         nf->prev_frame      = qjs_reloc_ptr(nf->prev_frame,      map, nc);
         nf->arg_buf         = qjs_reloc_ptr(nf->arg_buf,         map, nc);
         nf->var_buf         = qjs_reloc_ptr(nf->var_buf,         map, nc);
@@ -63574,6 +63563,66 @@ static void qjs_drive_relocate(JSContext *ctx, JSFlow *f) {
     f->js_stack            = qjs_reloc_ptr(f->js_stack,            map, nc);
     f->current_stack_frame = qjs_reloc_ptr(f->current_stack_frame, map, nc);
     f->qjs_yield_entry     = qjs_reloc_ptr(f->qjs_yield_entry,     map, nc);
+}
+/* SERIALIZE a parked flow's stack chunks to a flat malloc'd blob (the IDB-ready form): the chunk
+   chain's OLD base addresses + capacities + raw bytes. Frees the live chunks (eviction). Returns the
+   blob (caller frees / hands to IDB) or NULL. The flow handle's pointers stay as the OLD addresses;
+   deserialize rebuilds the map and fixes them. */
+static __maybe_unused uint8_t *qjs_drive_serialize(JSContext *ctx, JSFlow *f, size_t *plen) {
+    JSRuntime *rt = ctx->rt;
+    int nc = 0; for (JSStackChunk *c = f->js_stack; c; c = c->prev) nc++;
+    size_t len = sizeof(int);
+    for (JSStackChunk *c = f->js_stack; c; c = c->prev) len += 2 * sizeof(uint64_t) + sizeof(JSStackChunk) + (size_t)(c->limit - c->data);
+    uint8_t *blob = js_malloc(ctx, len ? len : 1); if (!blob) return NULL;
+    uint8_t *w = blob; memcpy(w, &nc, sizeof(int)); w += sizeof(int);
+    for (JSStackChunk *c = f->js_stack; c; ) {
+        JSStackChunk *prev = c->prev;
+        uint64_t ob = (uint64_t)(size_t)c, cap = (uint64_t)(c->limit - c->data);
+        size_t full = sizeof(JSStackChunk) + (size_t)cap;   /* header (prev/top/limit) + data region */
+        memcpy(w, &ob, sizeof ob); w += sizeof ob;
+        memcpy(w, &cap, sizeof cap); w += sizeof cap;
+        memcpy(w, c, full); w += full;
+        js_free_rt(rt, c);   /* EVICT: drop the RAM chunk */
+        c = prev;
+    }
+    *plen = len; return blob;
+}
+/* DESERIALIZE: rebuild the chunk chain from the blob into fresh chunks, fix up the flow's pointers. */
+static __maybe_unused int qjs_drive_deserialize(JSContext *ctx, JSFlow *f, const uint8_t *blob, size_t len) {
+    JSRuntime *rt = ctx->rt; (void)len;
+    const uint8_t *r = blob; int nc = 0; memcpy(&nc, r, sizeof(int)); r += sizeof(int);
+    if (nc <= 0) return 0;
+    JSChunkMap *map = js_malloc(ctx, (size_t)nc * sizeof(JSChunkMap)); if (!map) return -1;
+    for (int i = 0; i < nc; i++) {
+        uint64_t ob, cap; memcpy(&ob, r, sizeof ob); r += sizeof ob; memcpy(&cap, r, sizeof cap); r += sizeof cap;
+        size_t full = sizeof(JSStackChunk) + (size_t)cap;
+        JSStackChunk *n2 = js_malloc_rt(rt, full);
+        if (!n2) { for (int j = 0; j < i; j++) js_free_rt(rt, map[j].newc); js_free(ctx, map); return -1; }
+        memcpy(n2, r, full); r += full;
+        map[i].oldc = (JSStackChunk *)(size_t)ob; map[i].newc = n2; map[i].cap = (size_t)cap;
+    }
+    qjs_drive_fixup(f, map, nc);
+    js_free(ctx, map);
+    return 0;
+}
+/* RAM->RAM relocation (cheap, per-chunk — no contiguous blob): exercised on every resume to keep the
+   pointer fixup continuously verified WITHOUT the deep-stack blowup that an unconditional contiguous
+   blob serialize causes for an unbounded spinner (c_normal). The blob serialize/deserialize above is
+   the host-triggered EVICTION path (RAM pressure, selectively, to IDB), not an every-resume operation. */
+static void qjs_drive_relocate(JSContext *ctx, JSFlow *f) {
+    JSRuntime *rt = ctx->rt;
+    if (!f->js_stack) return;
+    int nc = 0; for (JSStackChunk *c = f->js_stack; c; c = c->prev) nc++;
+    JSChunkMap *map = js_malloc(ctx, (size_t)nc * sizeof(JSChunkMap)); if (!map) return;
+    int i = 0;
+    for (JSStackChunk *c = f->js_stack; c; c = c->prev, i++) {
+        size_t cap = (size_t)(c->limit - c->data);
+        JSStackChunk *n2 = js_malloc_rt(rt, sizeof(JSStackChunk) + cap);
+        if (!n2) { for (int j = 0; j < i; j++) js_free_rt(rt, map[j].newc); js_free(ctx, map); return; }
+        memcpy(n2, c, sizeof(JSStackChunk) + cap);
+        map[i].oldc = c; map[i].newc = n2; map[i].cap = cap;
+    }
+    qjs_drive_fixup(f, map, nc);
     for (i = 0; i < nc; i++) js_free_rt(rt, map[i].oldc);
     js_free(ctx, map);
 }
