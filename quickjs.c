@@ -63635,31 +63635,16 @@ static JSValue js_fe_cow_pause(JSContext *ctx, JSValueConst this_val,
    Preemption is a fixed WINDOW count (granularity), not a no-progress/output count. */
 static JSValue js_fe_drive_breadth(JSContext *ctx, JSValueConst this_val,
                                    int argc, JSValueConst *argv) {
-    JSRuntime *rt = ctx->rt;
     if (argc < 1) return JS_UNDEFINED;
-    JSValueConst fn = argv[0];
     JSValueConst cargs[3];
     cargs[0] = argc > 1 ? argv[1] : JS_UNDEFINED;
     cargs[1] = argc > 2 ? argv[2] : JS_UNDEFINED;
     cargs[2] = argc > 3 ? argv[3] : JS_UNDEFINED;
-    int _sv_driving = rt->qjs_driving;
-    qjs_set_driving(ctx, 1);
-    JSValue r = JS_Call(ctx, fn, this_val, 3, cargs);
-    int _slice = 0;
-    while (rt->qjs_yielded) {
-        rt->qjs_yielded = 0;
-        if (++_slice < QJS_DEFER_QUANTUM) {
-            rt->qjs_resume_chain = 1;
-            r = qjs_resume_chain_call(ctx);
-        } else {
-            JS_FreeValue(ctx, r);
-            qjs_free_suspended_trampoline_frames(ctx);   /* drop the non-terminating chain; the grind re-drives it (paused/starved) */
-            r = JS_UNDEFINED;
-            break;
-        }
-    }
-    if (!_sv_driving) qjs_set_driving(ctx, 0);
-    return r;
+    /* ONE SCHEDULER: boot breadth is no longer a separate free-on-preempt loop — route it through the
+       single forced-invoke primitive, so a boot global that doesn't terminate PARKS (snapshot all four
+       trails) and resumes via the grind's repick, exactly like a cb-drive / orphan-enum flow, instead
+       of being freed-and-lost. (Breadth runs under FLOWBEG, so the COW baseline is already armed.) */
+    return qjs_run_forced_flow(ctx, argv[0], this_val, 3, cargs, 0);
 }
 static void qjs_dd_free(JSContext *ctx);   /* fwd: driven-set + ids reset (defined below) */
 /* Capture a REAL closure instance the moment a driven factory orphan
