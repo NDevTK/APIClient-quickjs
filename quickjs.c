@@ -5112,12 +5112,6 @@ static inline void set_value(JSContext *ctx, JSValue *pval, JSValue new_val)
    yields-able where the per-store barrier was not. */
 static int g_flow_capture;   /* fwd (def ~20563): a BFS force-invoke flow is capturing */
 void qjs_cow_undo_log(size_t addr, size_t size);   /* fwd (def ~20565; export attr on the def) */
-/* cow_set_value: set_value at a SHARED-SCOPE slot (closure var_ref / global). While a flow is
-   capturing, record the slot's old value to the COW undo-log so the per-flow revert restores it.
-   Old intentionally not freed while capturing (revert restores it; refcount-exact capture +
-   commit-time free is the next brick) — this isolates the YIELDS-ABILITY question from refcount
-   correctness. Locals/args keep plain set_value: per-call, never shared. */
-static int g_cow_force_log;   /* fwd (def in COW section): cow_set_value sets it so the barrier captures a shared-scope slot even when it physically lives in an excluded value-stack chunk */
 static int g_flow_depth;      /* # of nested live flows (qjs_flow_arm/revert) */
 struct JSVarRef;
 static void qjs_cow_vt_push(JSValue *slot, JSValue old, struct JSVarRef *vref);   /* fwd (def in COW section): typed-trail record for refcount-exact heap-fork backtrack */
@@ -5126,25 +5120,6 @@ void cow_set_slot(JSContext *ctx, JSValue *pval, JSValue val);        /* fwd: ty
 static JSValue *cow_realloc_array(JSContext *ctx, JSObject *p, size_t newbytes, size_t *pslack);   /* fwd: flow-aware fast-array buffer realloc (buffer-trail brick) */
 static void *cow_realloc_buf(JSContext *ctx, void **pfield, size_t oldbytes, size_t newbytes);     /* fwd: flow-aware realloc of an object-internal buffer field (p->prop) */
 static void cow_shape_transition(JSContext *ctx, JSObject *p, JSShape *new_sh);                    /* fwd: refcount-exact p->shape transition (shape-trail brick) */
-static inline void cow_set_value(JSContext *ctx, JSValue *pval, JSValue new_val) {
-    if (g_flow_capture || g_grind_drive_active) {
-        /* TYPED TRAIL (heap-fork backtrack, refcount-EXACT) — the typed layer the byte word-log
-           cannot be. A closure-cell / global var_ref is SHARED-SCOPE state per-flow isolation must
-           revert; the byte-revert restores a POINTER without touching refcounts, underflowing the
-           cycle-GC (MEASURED). Instead record {slot, old}: the trail OWNS old's ref (transferred
-           from the slot — NO phantom, so it never collides with a normal set_value free, the supabase
-           free_zero_refcount). Backtrack decrefs the current value + restores old; commit frees old.
-           g_cow_busy brackets the store so the binaryen barrier does NOT also log it to the untyped
-           word log (the typed trail is the sole record). BOTH scheduler levels: breadth forks it at
-           FLOWBEG, the grind pauses/resumes it via qjs_cow_capture/apply — ONE typed primitive. */
-        int sv = g_cow_busy; g_cow_busy = 1;
-        qjs_cow_vt_push(pval, *pval, NULL);
-        *pval = new_val;
-        g_cow_busy = sv;
-    } else {
-        set_value(ctx, pval, new_val);
-    }
-}
 /* var_ref capture with PIN. OP_put_var_ref/OP_set_var_ref write a SHARED closure cell. Capturing its
    raw slot (&vr->value) would dangle if the var_ref were freed before the flow reverts — the revert
    would write/free through freed memory. So when capturing a CLOSED var_ref (pvalue == &value, a stable
@@ -14465,7 +14440,7 @@ static inline int JS_SetGlobalVar(JSContext *ctx, JSAtom prop, JSValue val,
            stable during a forced invoke (new globals are only defined at script-top eval via
            OP_define_var, never inside a function call), so &pr->u.value does not realloc-dangle before
            the FLOWEND revert. (global_var_obj branch: classic-script `var`.) */
-        cow_set_value(ctx, &pr->u.value, val);
+        cow_set_slot(ctx, &pr->u.value, val);   /* the one generic baseline-slot setter (global/property value is baseline heap, so the baseline-check always passes here) */
         return 0;
     }
 
@@ -14476,7 +14451,7 @@ static inline int JS_SetGlobalVar(JSContext *ctx, JSAtom prop, JSValue val,
                                   JS_PROP_LENGTH)) == JS_PROP_WRITABLE)) {
             /* fast path — global_obj property (host-defined global, MEASURED: shared_state's G_SHARED
                lands here, not global_var_obj). Same shared-scope isolation: route through the trail. */
-            cow_set_value(ctx, &pr->u.value, val);
+            cow_set_slot(ctx, &pr->u.value, val);   /* the one generic baseline-slot setter (global/property value is baseline heap, so the baseline-check always passes here) */
             return 0;
         }
     }
@@ -20974,7 +20949,6 @@ static int g_cow_pause = 0;
    revert ran one). The grind escapes only because it reverts at a stack-EMPTY boundary. Excluding
    the chunks makes the revert sound AND the delta sparse (only real heap-object writes). */
 static JSRuntime *g_cow_exec_rt = NULL;   /* the runtime EXECUTING the current flow (set at FLOWBEG from ctx); its js_stack is the operand-stack arena the barrier must exclude */
-static int g_cow_force_log = 0;   /* cow_set_value sets it so a shared-scope slot is captured past the value-stack/arena exclusions */
 static long g_cow_vskip = 0;   /* TEMP: count barrier writes excluded as value-stack (confirms the exclusion fires) */
 /* Barrier target (runs BEFORE the store): log the pre-flow value of each WORD the
    store [addr, addr+size) touches, once per word (per-word first-write captures the
@@ -20994,16 +20968,11 @@ QJS_JSEXPORT void qjs_cow_undo_log(size_t addr, size_t size) {
        a chunk with its CALLER's live frame (the __hostDrive loop). Reverting the invoke's chunk words
        corrupts the driver's loop state -> drive breaks after ~2 invokes. Use the EXECUTING runtime
        (g_cow_exec_rt, set at FLOWBEG from ctx) — g_cow_rt is the pool runtime and missed the stack. */
-    /* The substrate exclusions below are SKIPPED for force-logged shared-scope slots (cow_set_value):
-       a closure cell / global var_ref must be captured even when it physically lives in a value-stack
-       chunk, or its revert is silently dropped (globals reverted, closures didn't). */
-    if (!g_cow_force_log) {
-        if (g_cow_exec_rt) { JSStackChunk *c = g_cow_exec_rt->js_stack;
-            while (c) { if (addr >= (size_t)(void *)c && addr < (size_t)(void *)c->limit) { g_cow_vskip++; return; } c = c->prev; } }
-        /* Exclude the per-flow arena: its objects are flow-local scratch, discarded wholesale by the
-           FLOWEND bump-reset (not reverted), and references to them in baseline objects ARE reverted. */
-        if (g_flow_arena && addr >= (size_t)g_flow_arena && addr < (size_t)g_flow_arena + g_flow_arena_cap) return;
-    }
+    if (g_cow_exec_rt) { JSStackChunk *c = g_cow_exec_rt->js_stack;
+        while (c) { if (addr >= (size_t)(void *)c && addr < (size_t)(void *)c->limit) { g_cow_vskip++; return; } c = c->prev; } }
+    /* Exclude the per-flow arena: its objects are flow-local scratch, discarded wholesale by the
+       FLOWEND bump-reset (not reverted), and references to them in baseline objects ARE reverted. */
+    if (g_flow_arena && addr >= (size_t)g_flow_arena && addr < (size_t)g_flow_arena + g_flow_arena_cap) return;
     w0 = (addr - hb) >> 3; w1 = (addr + size - 1 - hb) >> 3;
     for (w = w0; w <= w1; w++) {
         if (w >= qjs_cow_words) { qjs_cow_shadow_grow(w); if (w >= qjs_cow_words) { g_cow_saturated = 1; continue; } }   /* heap grew past shadow -> GROW (gm-backed) to cover w, never drop -> the gc_obj_list link reverts -> no ghost */
@@ -21074,7 +21043,9 @@ void cow_set_array_append(JSContext *ctx, JSValue *pval, JSValue val) {
    displaced current, refcount-exact. Baseline-CHECKED, so it is the generic setter for slots that may be
    flow-local (a property/element on an object created during the flow): flow-local / not capturing ->
    plain set_value (free old + install), since flow-local heap is discarded wholesale, never reverted.
-   (cow_set_value is the unchecked variant for known-baseline shared-scope slots.) */
+   THE one baseline-slot setter: closure/global var_refs go through cow_put_var_ref (pinned), array
+   appends through cow_set_array_append; every other baseline JSValue overwrite (property value or
+   element) comes here. */
 void cow_set_slot(JSContext *ctx, JSValue *pval, JSValue val) {
     if ((g_flow_capture || g_grind_drive_active) && cow_slot_baseline(pval)) {
         int sv = g_cow_busy; g_cow_busy = 1;
