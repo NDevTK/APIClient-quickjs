@@ -23159,7 +23159,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JS_ThrowReferenceErrorUninitialized2(ctx, b, idx, true);
                     goto exception;
                 }
-                set_value(ctx, var_refs[idx]->pvalue, sp[-1]);
+                cow_put_var_ref(ctx, var_refs[idx], sp[-1]);   /* refcount-exact under a forced flow (closed baseline closure cell): the TDZ-checked variant of OP_put_var_ref, same slot type — raw set_value byte-reverted the pointer and underflowed the cycle-GC. Non-flow / open: falls through to set_value. */
                 sp--;
             }
             BREAK;
@@ -23172,7 +23172,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JS_ThrowReferenceErrorUninitialized2(ctx, b, idx, true);
                     goto exception;
                 }
-                set_value(ctx, var_refs[idx]->pvalue, sp[-1]);
+                cow_put_var_ref(ctx, var_refs[idx], sp[-1]);   /* refcount-exact under a forced flow (closed baseline closure cell): the TDZ-checked variant of OP_put_var_ref, same slot type — raw set_value byte-reverted the pointer and underflowed the cycle-GC. Non-flow / open: falls through to set_value. */
                 sp--;
             }
             BREAK;
