@@ -20665,17 +20665,20 @@ static uint8_t *qjs_cow_shadow = NULL;
 typedef struct JSCowVT { JSValue *slot; JSValue old; JSVarRef *vref; } JSCowVT;
 static JSCowVT *qjs_cow_vt = NULL;
 static size_t qjs_cow_vt_n = 0, qjs_cow_vt_cap = 0;
-/* BUFFER-TRAIL state (deferred fast-array reallocs — defined here so qjs_cow_reset can clear it; the
-   push/revert/commit/realloc functions are below with the other COW helpers). */
-typedef struct { void *oldb; void *newb; size_t wpos; } JSCowBuf;
-static JSCowBuf *qjs_cow_buf = NULL;
-static size_t qjs_cow_buf_n = 0, qjs_cow_buf_cap = 0;
-/* SHAPE-TRAIL state (deferred p->shape transitions — refcount-exact, like the vt phantom transfer).
-   Stores (old,new) SHAPES, never the object: the word log restores the p->shape POINTER, the trail
-   only fixes shape refcounts — so the revert never dereferences a possibly-freed object. */
-typedef struct { JSShape *old; JSShape *neww; size_t wpos; } JSCowShape;
-static JSCowShape *qjs_cow_shp = NULL;
-static size_t qjs_cow_shp_n = 0, qjs_cow_shp_cap = 0;
+/* DEFERRED-RESTORE TRAIL state (defined here so qjs_cow_reset can clear it; push/revert/commit/realloc
+   below with the other COW helpers). ONE kind-tagged trail over the two object-internal deferred-free
+   bricks that were structurally identical {old, new, wpos}, differing only in the typed free:
+     - is_shape=0  BUFFER  (deferred fast-array / property-array realloc): new = a js_malloc'd buffer.
+     - is_shape=1  SHAPE   (deferred p->shape transition, refcount-exact): old/new are SHAPES, never the
+                           object — the word log restores the p->shape POINTER; the trail only fixes
+                           shape refcounts, so the revert never dereferences a possibly-freed object.
+   The word log restores the FIELD pointer (to old); this trail carries the lifetime ownership the field
+   pointer cannot. REVERT (after the byte-restore — field is now old): free new by kind. COMMIT (new is
+   baseline): free old by kind. One push, one revert, one commit — folds the buffer-trail + shape-trail
+   into the single deferred log (REWRITE.md core #2). */
+typedef struct { void *old; void *neww; size_t wpos; uint8_t is_shape; } JSCowDefer;
+static JSCowDefer *qjs_cow_defer = NULL;
+static size_t qjs_cow_defer_n = 0, qjs_cow_defer_cap = 0;
 static void qjs_cow_vt_push(JSValue *slot, JSValue old, JSVarRef *vref) {
     if (qjs_cow_vt_n >= qjs_cow_vt_cap) {
         size_t nc = qjs_cow_vt_cap ? qjs_cow_vt_cap * 2 : 256;
@@ -20704,26 +20707,23 @@ QJS_JSEXPORT void qjs_cow_undo_revert(void);
    [0,mark) intact — the segmented per-arm snapshot (#7) with no global mark stack: the mark is
    a C local at the single re-invoke site (qjs_drive_orphan_enum's BFS loop). */
 QJS_JSEXPORT void qjs_cow_undo_revert_to(size_t mark);
-static void qjs_cow_buf_push(void *oldb, void *newb);   /* fwd: buffer-trail push (rt-based, no ctx — qjs_cow_apply re-pushes) */
-static void qjs_cow_shp_push(JSShape *old, JSShape *neww);   /* fwd: shape-trail push (rt-based, no ctx) */
-static void qjs_cow_buf_revert_to(size_t wmark);   /* fwd: buffer-trail (deferred-realloc) revert, hooked into qjs_cow_undo_revert_to */
-static void qjs_cow_buf_commit(void);              /* fwd: buffer-trail commit, hooked into qjs_cow_commit */
-static void qjs_cow_shp_revert_to(size_t wmark);   /* fwd: shape-trail revert (BEFORE the byte-restore — refcount-exact) */
-static void qjs_cow_shp_commit(void);              /* fwd: shape-trail commit */
-static void js_free_shape(JSRuntime *rt, JSShape *sh);   /* fwd: shape-trail revert/commit decref */
+static void qjs_cow_defer_push(void *old, void *neww, int is_shape);   /* fwd: deferred-restore trail push (rt-based, no ctx — qjs_cow_apply re-pushes) */
+static void qjs_cow_defer_revert_to(size_t wmark);   /* fwd: deferred-restore revert (after the byte-restore — field is now old; free new by kind) */
+static void qjs_cow_defer_commit(void);              /* fwd: deferred-restore commit (new is baseline; free old by kind) */
+static void js_free_shape(JSRuntime *rt, JSShape *sh);   /* fwd: shape-kind revert/commit decref */
 
 typedef struct JSCowDelta { uint64_t *widx; uint64_t *oldw; uint64_t *neww; size_t n;
     /* typed-trail component: the shared-scope JSValue slots this flow wrote (refcount-exact). The
        delta holds a DUP'd ref to each old + current across the pause, transferred to the trail/slot
        on apply — so the grind can pause/resume a flow that wrote bundle cells without losing them. */
     JSValue **vts; JSValue *vto; JSValue *vtc; size_t vtn;
-    /* buffer-trail + shape-trail segments (object-internal): the (old,new) buffers / shapes this flow
-       deferred-realloc'd / shape-transitioned. Captured at park (ownership transferred from the live
-       trail to the delta), re-pushed to the live trail on apply — so a flow that mutated array/property
-       buffers or object shapes parks+resumes uniformly instead of falling back to free. The word log
-       re-applies the FIELD pointers; these carry the refcount/lifetime ownership across the pause. */
-    void **bf_old; void **bf_new; size_t bfn;
-    struct JSShape **sp_old; struct JSShape **sp_new; size_t spn; } JSCowDelta;
+    /* deferred-restore segment (object-internal): the (old,new,kind) buffers / shapes this flow
+       deferred-realloc'd / shape-transitioned, captured from the ONE kind-tagged trail. Captured at
+       park (ownership transferred from the live trail to the delta), re-pushed to the live trail on
+       apply — so a flow that mutated array/property buffers or object shapes parks+resumes uniformly
+       instead of falling back to free. The word log re-applies the FIELD pointers; these carry the
+       refcount/lifetime ownership across the pause. df_kind[k] = is_shape (1 = SHAPE, 0 = BUFFER). */
+    void **df_old; void **df_new; uint8_t *df_kind; size_t dfn; } JSCowDelta;
 
 /* Capture the active flow's undo log into d (the pausing flow's delta): each word it wrote,
    with its pre-flow value (oldw -> revert) and current value (neww -> re-apply on resume).
@@ -20756,26 +20756,19 @@ QJS_JSEXPORT int qjs_cow_capture(JSRuntime *rt, const uint8_t *mem, JSCowDelta *
             d->vtc[k] = JS_DupValueRT(rt, *qjs_cow_vt[k].slot);
         }
     } else { d->vtn = 0; }
-    /* BUFFER/SHAPE-TRAIL capture (from 0 — the grind orphan starts at baseline): transfer ownership of
-       the deferred buffers / shape transitions into the delta and TRUNCATE the live trail, so the
-       immediately-following to_baseline revert's buf/shp hooks find nothing and don't free the kept
+    /* DEFERRED-RESTORE capture (from 0 — the grind orphan starts at baseline): transfer ownership of the
+       deferred buffers / shape transitions into the delta and TRUNCATE the live trail, so the
+       immediately-following to_baseline revert's defer hook finds nothing and doesn't free the kept
        new buffers/shapes (the delta owns them; re-pushed on apply). Same mechanism as the forced-flow
-       park (qjs_park_forced_flow) — the grind park and the forced-flow park are now ONE park over all
-       four trails. */
-    d->bfn = qjs_cow_buf_n;
-    d->bf_old = d->bfn ? (void **)qjs_cow_palloc(d->bfn * sizeof(void *)) : NULL;
-    d->bf_new = d->bfn ? (void **)qjs_cow_palloc(d->bfn * sizeof(void *)) : NULL;
-    if (d->bf_old && d->bf_new) {
-        for (k = 0; k < d->bfn; k++) { d->bf_old[k] = qjs_cow_buf[k].oldb; d->bf_new[k] = qjs_cow_buf[k].newb; }
-        qjs_cow_buf_n = 0;
-    } else { d->bfn = 0; }
-    d->spn = qjs_cow_shp_n;
-    d->sp_old = d->spn ? (struct JSShape **)qjs_cow_palloc(d->spn * sizeof(struct JSShape *)) : NULL;
-    d->sp_new = d->spn ? (struct JSShape **)qjs_cow_palloc(d->spn * sizeof(struct JSShape *)) : NULL;
-    if (d->sp_old && d->sp_new) {
-        for (k = 0; k < d->spn; k++) { d->sp_old[k] = qjs_cow_shp[k].old; d->sp_new[k] = qjs_cow_shp[k].neww; }
-        qjs_cow_shp_n = 0;
-    } else { d->spn = 0; }
+       park — the grind park and the forced-flow park are ONE park over all the trails. */
+    d->dfn = qjs_cow_defer_n;
+    d->df_old  = d->dfn ? (void **)qjs_cow_palloc(d->dfn * sizeof(void *)) : NULL;
+    d->df_new  = d->dfn ? (void **)qjs_cow_palloc(d->dfn * sizeof(void *)) : NULL;
+    d->df_kind = d->dfn ? (uint8_t *)qjs_cow_palloc(d->dfn * sizeof(uint8_t)) : NULL;
+    if (d->df_old && d->df_new && d->df_kind) {
+        for (k = 0; k < d->dfn; k++) { d->df_old[k] = qjs_cow_defer[k].old; d->df_new[k] = qjs_cow_defer[k].neww; d->df_kind[k] = qjs_cow_defer[k].is_shape; }
+        qjs_cow_defer_n = 0;
+    } else { d->dfn = 0; }
     g_cow_busy = 0;
     return 0;
 }
@@ -20823,10 +20816,8 @@ QJS_JSEXPORT void qjs_cow_apply(uint8_t *mem, const JSCowDelta *d) {
            delta) — the one park primitive, so EVERY caller (forced-flow park AND deep-grind resume) is
            uniform. Without it the deep-grind path (qjs_cow_apply; qjs_cow_delta_free) left bfn!=0, so
            delta_free js_free'd bf_new — the very buffer the live field now points at (use-after-free). */
-        for (size_t j = 0; j < dm->bfn; j++) qjs_cow_buf_push(dm->bf_old[j], dm->bf_new[j]);
-        dm->bfn = 0;   /* ownership transferred to the live trail -> delta_free must NOT free bf_new */
-        for (size_t j = 0; j < dm->spn; j++) qjs_cow_shp_push(dm->sp_old[j], dm->sp_new[j]);
-        dm->spn = 0;
+        for (size_t j = 0; j < dm->dfn; j++) qjs_cow_defer_push(dm->df_old[j], dm->df_new[j], dm->df_kind[j]);
+        dm->dfn = 0;   /* ownership transferred to the live trail -> delta_free must NOT free df_new */
     }
     g_cow_busy = 0;
 }
@@ -20841,15 +20832,14 @@ static void qjs_cow_delta_free(JSRuntime *rt, JSCowDelta *d) {
         for (size_t k = 0; k < d->vtn; k++) { JS_FreeValueRT(r, d->vto[k]); JS_FreeValueRT(r, d->vtc[k]); }
         g_cow_busy = sv;
     }
-    /* buffer/shape segments: on APPLY they were re-pushed and bfn/spn set to 0 (ownership to the live
-       trail). If freed WITHOUT apply (an abandoned pause: eviction / teardown), the NEW buffers are
-       orphaned (the field reverted to old) -> free them so they don't leak; the shapes' refs leak
-       (rare abandon path, leak-not-corrupt — a correct release would re-derive the field's owner). */
-    if (d->bfn && r) for (size_t k = 0; k < d->bfn; k++) if (d->bf_new[k]) js_free_rt(r, d->bf_new[k]);
+    /* deferred-restore segment: on APPLY it was re-pushed and dfn set to 0 (ownership to the live trail).
+       If freed WITHOUT apply (an abandoned pause: eviction / teardown), a BUFFER's new is orphaned (the
+       field reverted to old) -> free it so it doesn't leak; a SHAPE's ref leaks (rare abandon path,
+       leak-not-corrupt — a correct release would re-derive the field's owner). */
+    if (d->dfn && r) for (size_t k = 0; k < d->dfn; k++) if (!d->df_kind[k] && d->df_new[k]) js_free_rt(r, d->df_new[k]);
     d->widx = NULL; d->oldw = NULL; d->neww = NULL; d->n = 0;
     d->vts = NULL; d->vto = NULL; d->vtc = NULL; d->vtn = 0;
-    d->bf_old = NULL; d->bf_new = NULL; d->bfn = 0;
-    d->sp_old = NULL; d->sp_new = NULL; d->spn = 0;
+    d->df_old = NULL; d->df_new = NULL; d->df_kind = NULL; d->dfn = 0;
 }
 /* Discard a COMPLETED flow's mutations: revert the live undo log to baseline (#7: the next
    flow forks clean; learned @H/@S are emitted output, not heap state, so undoing loses nothing). */
@@ -20880,8 +20870,7 @@ QJS_JSEXPORT void qjs_cow_commit(const uint8_t *mem) {
        leaves the instance sound. This is the split: word-log = committable object graph; typed trail
        = per-flow shared-cell deltas that always revert. */
     qjs_cow_vt_revert_to(0);
-    qjs_cow_buf_commit();   /* the new buffers are baseline now; free the deferred OLD buffers (dead) */
-    qjs_cow_shp_commit();   /* the new shapes are baseline now; release the trail's OLD shape refs */
+    qjs_cow_defer_commit();   /* the new buffers/shapes are baseline now; free the deferred OLD by kind */
 }
 /* Reset the COW state (grind teardown). The baseline/bitmap are POOL memory (bump),
    not js_malloc blocks — never js_free them; the pool stays allocated for reuse. */
@@ -20894,8 +20883,7 @@ static void qjs_cow_reset(JSRuntime *rt) {
     }
     g_cow_saved = g_cow_commits = g_cow_discards = g_cow_captures = g_cow_applies = 0;
     qjs_cow_undo = NULL; qjs_cow_shadow = NULL; qjs_cow_undo_n = qjs_cow_undo_cap = qjs_cow_words = 0;   /* undo-log state lives in the pool just reset -> drop the dangling pointers */
-    qjs_cow_buf_n = 0;   /* buffer-trail (deferred reallocs): drop stale entries — the trailed buffers live in the heap the runtime teardown frees; the trail array itself is reused */
-    qjs_cow_shp_n = 0;   /* shape-trail: drop stale entries (shapes live in the heap the teardown frees) */
+    qjs_cow_defer_n = 0;   /* deferred-restore trail: drop stale entries — the trailed buffers/shapes live in the heap the teardown frees; the trail array itself is reused */
     qjs_leaf = NULL;   /* leaf table lives in the pool too -> drop the dangling pointer so it re-allocs from the fresh pool next grind */
     qjs_cow_pool_reset();
 }
@@ -21044,8 +21032,7 @@ QJS_JSEXPORT void qjs_cow_undo_revert_to(size_t mark) {
         qjs_cow_shadow[w >> 3] &= (uint8_t)~(1u << (w & 7));
     }
     qjs_cow_undo_n = mark;
-    qjs_cow_buf_revert_to(mark);   /* drop deferred-realloc buffers whose field write reverts (orphaned new leaks; old stays live) */
-    qjs_cow_shp_revert_to(mark);   /* AFTER the byte-restore (p->shape is now old): release the orphaned new shape's p-ref */
+    qjs_cow_defer_revert_to(mark);   /* AFTER the byte-restore (field is now old): free the orphaned new buffer/shape by kind */
     g_cow_busy = 0;
 }
 /* THE NEXT BRICK (lines 5118/5154): refcount-exact typed capture of an OBJECT-INTERNAL JSValue ref —
@@ -21107,36 +21094,51 @@ void cow_set_array_el(JSContext *ctx, JSValue *pval, JSValue val) {
    old is dead — free old. wpos = the word-log position the (pending) field write will occupy, so
    revert_to(wmark) drops exactly the entries whose field reverts. CONSERVATIVE: revert frees nothing
    (only pops), so any boundary/shadow-dedup mismatch can only LEAK, never double-free / use-after-free.
-   (State JSCowBuf/qjs_cow_buf/_n/_cap is declared up with the vt-trail vars so qjs_cow_reset sees it.) */
-static void qjs_cow_buf_push(void *oldb, void *newb) {
-    if (qjs_cow_buf_n >= qjs_cow_buf_cap) {
-        size_t nc = qjs_cow_buf_cap ? qjs_cow_buf_cap * 2 : 16;
-        JSCowBuf *nb = js_realloc_rt(g_cow_rt, qjs_cow_buf, nc * sizeof(JSCowBuf));   /* rt-based: no ctx, so qjs_cow_apply (the one park primitive) can re-push without a context */
-        if (!nb) return;   /* OOM: drop the entry -> old leaks at commit, never corrupts */
-        qjs_cow_buf = nb; qjs_cow_buf_cap = nc;
+   (State JSCowDefer/qjs_cow_defer/_n/_cap is declared up with the vt-trail vars so qjs_cow_reset sees it.)
+   ONE push/revert/commit over both kinds — is_shape dispatches the typed free. */
+static void qjs_cow_defer_push(void *old, void *neww, int is_shape) {
+    if (qjs_cow_defer_n >= qjs_cow_defer_cap) {
+        size_t nc = qjs_cow_defer_cap ? qjs_cow_defer_cap * 2 : 16;
+        JSCowDefer *nb = js_realloc_rt(g_cow_rt, qjs_cow_defer, nc * sizeof(JSCowDefer));   /* rt-based: no ctx, so qjs_cow_apply (the one park primitive) can re-push without a context */
+        if (!nb) { if (is_shape) js_free_shape(g_cow_rt, (JSShape *)old); return; }   /* OOM: SHAPE falls back to the normal old-decref; BUFFER drops (old leaks at commit), never corrupts */
+        qjs_cow_defer = nb; qjs_cow_defer_cap = nc;
     }
-    qjs_cow_buf[qjs_cow_buf_n].oldb = oldb;
-    qjs_cow_buf[qjs_cow_buf_n].newb = newb;
-    qjs_cow_buf[qjs_cow_buf_n].wpos = qjs_cow_undo_n;   /* the pending values-pointer field write logs here */
-    qjs_cow_buf_n++;
+    qjs_cow_defer[qjs_cow_defer_n].old = old;        /* SHAPE: KEEP old's ref (the trail owns it for the slot restore). BUFFER: old kept live for the field revert. */
+    qjs_cow_defer[qjs_cow_defer_n].neww = neww;
+    qjs_cow_defer[qjs_cow_defer_n].wpos = qjs_cow_undo_n;   /* the pending field-pointer write logs here */
+    qjs_cow_defer[qjs_cow_defer_n].is_shape = (uint8_t)is_shape;
+    qjs_cow_defer_n++;
 }
-static void qjs_cow_buf_revert_to(size_t wmark) {
+/* Run AFTER the word-log byte-restore (it already restored the FIELD pointer to old). Free the orphaned
+   new by kind — BUFFER: js_free_rt (the malloc'd copy); SHAPE: js_free_shape (drop new's p-ref; old's
+   kept ref is now the slot's reference, the word-log restored the pointer raw without incref). No object
+   deref => no UAF on a freed obj. Symmetric with commit (frees old, keeps new). Stepwise-exact across
+   old->A->B (each new freed once; olds untouched). */
+static void qjs_cow_defer_revert_to(size_t wmark) {
     JSRuntime *rt = g_cow_rt;
-    int sv = g_cow_busy; g_cow_busy = 1;   /* the free must not re-log (mirrors qjs_cow_shp_revert_to) */
-    while (qjs_cow_buf_n > 0 && qjs_cow_buf[qjs_cow_buf_n - 1].wpos >= wmark) {
-        qjs_cow_buf_n--;
-        /* The word-log already restored the field pointer to old (it runs FIRST in
-           qjs_cow_undo_revert_to), so new is orphaned — free it. Symmetric with commit (frees old,
-           keeps new): revert keeps old, frees new. Stepwise-exact across old->A->B (each new freed
-           once; olds untouched). Was leaking new outright. */
-        if (rt && qjs_cow_buf[qjs_cow_buf_n].newb) js_free_rt(rt, qjs_cow_buf[qjs_cow_buf_n].newb);
+    int sv = g_cow_busy; g_cow_busy = 1;   /* the free's writes (js_free_shape hash-unlink) must NOT re-log */
+    while (qjs_cow_defer_n > 0 && qjs_cow_defer[qjs_cow_defer_n - 1].wpos >= wmark) {
+        qjs_cow_defer_n--;
+        void *nw = qjs_cow_defer[qjs_cow_defer_n].neww;
+        if (rt && nw) {
+            if (qjs_cow_defer[qjs_cow_defer_n].is_shape) js_free_shape(rt, (JSShape *)nw);
+            else js_free_rt(rt, nw);
+        }
     }
     g_cow_busy = sv;
 }
-static void qjs_cow_buf_commit(void) {
+static void qjs_cow_defer_commit(void) {
     JSRuntime *rt = g_cow_rt;
-    for (size_t k = 0; k < qjs_cow_buf_n; k++) if (rt && qjs_cow_buf[k].oldb) js_free_rt(rt, qjs_cow_buf[k].oldb);
-    qjs_cow_buf_n = 0;
+    int sv = g_cow_busy; g_cow_busy = 1;
+    for (size_t k = 0; k < qjs_cow_defer_n; k++) {   /* new is baseline; release the trail's old by kind */
+        void *od = qjs_cow_defer[k].old;
+        if (rt && od) {
+            if (qjs_cow_defer[k].is_shape) js_free_shape(rt, (JSShape *)od);
+            else js_free_rt(rt, od);
+        }
+    }
+    qjs_cow_defer_n = 0;
+    g_cow_busy = sv;
 }
 /* Flow-aware fast-array buffer realloc: defer the old-buffer free + trail it for a BASELINE array
    (so its field-pointer revert never dangles); plain js_realloc2 for a flow-local array / outside a
@@ -21149,7 +21151,7 @@ static JSValue *cow_realloc_array(JSContext *ctx, JSObject *p, size_t newbytes, 
         if (!nb) return NULL;
         memcpy(nb, oldbuf, oldbytes < newbytes ? oldbytes : newbytes);
         if (pslack) *pslack = 0;
-        qjs_cow_buf_push(oldbuf, nb);   /* KEEP old; the trail manages both buffers' lifetimes */
+        qjs_cow_defer_push(oldbuf, nb, 0);   /* BUFFER kind; KEEP old, the trail manages both lifetimes */
         return nb;
     }
     return js_realloc2(ctx, oldbuf, newbytes, pslack);
@@ -21165,57 +21167,26 @@ static void *cow_realloc_buf(JSContext *ctx, void **pfield, size_t oldbytes, siz
         void *nb = js_malloc(ctx, newbytes);
         if (!nb) return NULL;
         if (oldbuf) memcpy(nb, oldbuf, oldbytes < newbytes ? oldbytes : newbytes);
-        qjs_cow_buf_push(oldbuf, nb);   /* KEEP old; the trail manages both lifetimes */
+        qjs_cow_defer_push(oldbuf, nb, 0);   /* BUFFER kind; KEEP old, the trail manages both lifetimes */
         return nb;
     }
     return js_realloc(ctx, oldbuf, newbytes);
 }
-/* SHAPE-TRAIL — the object-internal brick for refcounted p->shape transitions. A property add/clone
-   does `p->shape = new; js_free_shape(old)`: the shape FIELD is byte-logged, so a forced-flow revert
-   restores the OLD shape pointer — but js_free_shape already DECREF'd old (freeing it outright if it
-   was exclusive => use-after-free; under-ref'ing it if shared). cow_shape_transition instead KEEPS
-   old's ref (the trail owns it, phantom transfer like cow_set_value) for a BASELINE object. REVERT
-   (run BEFORE the byte-restore, so it reads the genuine current=new): js_free_shape(new) + restore
-   p->shape = old. COMMIT: js_free_shape(old) (new is baseline). Stepwise-correct across multiple
-   transitions of one object (old->A->B reverts B then A then old, each intermediate freed once). */
-static void qjs_cow_shp_push(JSShape *old, JSShape *neww) {
-    if (qjs_cow_shp_n >= qjs_cow_shp_cap) {
-        size_t nc = qjs_cow_shp_cap ? qjs_cow_shp_cap * 2 : 16;
-        JSCowShape *nv = js_realloc_rt(g_cow_rt, qjs_cow_shp, nc * sizeof(JSCowShape));   /* rt-based: no ctx (see qjs_cow_buf_push) */
-        if (!nv) { js_free_shape(g_cow_rt, old); return; }   /* OOM: fall back to the normal decref */
-        qjs_cow_shp = nv; qjs_cow_shp_cap = nc;
-    }
-    qjs_cow_shp[qjs_cow_shp_n].old = old;           /* KEEP old's ref (not decref'd) — the trail owns it for the slot's restore */
-    qjs_cow_shp[qjs_cow_shp_n].neww = neww;
-    qjs_cow_shp[qjs_cow_shp_n].wpos = qjs_cow_undo_n;
-    qjs_cow_shp_n++;
-}
-/* Run AFTER the word-log byte-restore (it already restored p->shape = old). Release the new shape's
-   p-ref (decref). old's kept ref is now the slot's reference (the word-log restored the pointer raw,
-   without incref — the trail's kept ref accounts for it). No object deref => no UAF on a freed obj. */
-static void qjs_cow_shp_revert_to(size_t wmark) {
-    JSRuntime *rt = g_cow_rt;
-    int sv = g_cow_busy; g_cow_busy = 1;   /* js_free_shape's hash-unlink writes must NOT re-log */
-    while (qjs_cow_shp_n > 0 && qjs_cow_shp[qjs_cow_shp_n - 1].wpos >= wmark) {
-        qjs_cow_shp_n--;
-        if (rt) js_free_shape(rt, qjs_cow_shp[qjs_cow_shp_n].neww);   /* drop the new shape's p-ref */
-    }
-    g_cow_busy = sv;
-}
-static void qjs_cow_shp_commit(void) {
-    JSRuntime *rt = g_cow_rt;
-    int sv = g_cow_busy; g_cow_busy = 1;
-    for (size_t k = 0; k < qjs_cow_shp_n; k++) if (rt) js_free_shape(rt, qjs_cow_shp[k].old);   /* new is baseline; release the trail's orphaned old ref */
-    qjs_cow_shp_n = 0;
-    g_cow_busy = sv;
-}
-/* Set p->shape = new_sh, releasing old's ref — but for a BASELINE object during a flow TRAIL (old,new)
+/* SHAPE kind of the deferred-restore trail — the object-internal brick for refcounted p->shape
+   transitions. A property add/clone does `p->shape = new; js_free_shape(old)`: the shape FIELD is
+   byte-logged, so a forced-flow revert restores the OLD shape pointer — but js_free_shape already
+   DECREF'd old (freeing it outright if it was exclusive => use-after-free; under-ref'ing it if shared).
+   cow_shape_transition instead KEEPS old's ref (the trail owns it, phantom transfer like cow_set_value)
+   for a BASELINE object, pushing a SHAPE-kind entry. The shared defer revert/commit do the typed free
+   (revert frees new's p-ref after the byte-restore; commit frees old). Stepwise-correct across multiple
+   transitions of one object (old->A->B reverts B then A then old, each intermediate freed once).
+   Set p->shape = new_sh, releasing old's ref — but for a BASELINE object during a flow TRAIL (old,new)
    and KEEP old's ref, so the revert (word log restores the pointer; trail fixes refcounts) is exact. */
 static void cow_shape_transition(JSContext *ctx, JSObject *p, JSShape *new_sh) {
     JSShape *old = p->shape;
     p->shape = new_sh;
     if ((g_flow_capture || g_grind_drive_active) && cow_slot_baseline(&p->shape)) {
-        qjs_cow_shp_push(old, new_sh);
+        qjs_cow_defer_push(old, new_sh, 1);   /* SHAPE kind */
     } else {
         js_free_shape(ctx->rt, old);
     }
@@ -21422,7 +21393,7 @@ void qjs_free_suspended_trampoline_frames(JSContext *ctx)
     qjs_free_suspended_upto(ctx, NULL);
 }
 
-static int qjs_park_forced_flow(JSContext *ctx, size_t cow_mark, size_t vt_mark, size_t buf_mark, size_t shp_mark);   /* fwd: defined with the grind WFQ registry below */
+static int qjs_park_forced_flow(JSContext *ctx, size_t cow_mark, size_t vt_mark, size_t defer_mark);   /* fwd: defined with the grind WFQ registry below */
 
 /* THE ONE forced-invoke primitive (#5-#10 collapse): every forced drive — orphan-enum schedule,
    deep-step orphan, callback drive, value-spread, boot breadth — is "fork the shared-scope cells to
@@ -21451,7 +21422,7 @@ static JSValue qjs_run_forced_flow(JSContext *ctx, JSValueConst fn, JSValueConst
        revert still covers this flow's heap writes — isolation is of the CALL STACK only.) */
     size_t cow_mark = qjs_cow_undo_n;     /* undo-log high-water at entry: this flow's heap writes are the segment [cow_mark, n) */
     size_t vt_mark = qjs_cow_vt_n;        /* typed-trail high-water (0 after the entry vt-revert, but track generally) */
-    size_t buf_mark = qjs_cow_buf_n, shp_mark = qjs_cow_shp_n;   /* buffer/shape-trail high-waters: park falls back to free if this flow grows them (not yet in the delta) */
+    size_t defer_mark = qjs_cow_defer_n;   /* deferred-restore trail high-water: this flow's buffer/shape transitions are the segment [defer_mark, n) */
     JSFlow outer; qjs_flow_save(ctx, &outer);
     rt->js_stack = NULL; rt->current_stack_frame = NULL; rt->qjs_yield_entry = NULL;
     int sv_driving = rt->qjs_driving;
@@ -21471,7 +21442,7 @@ static JSValue qjs_run_forced_flow(JSContext *ctx, JSValueConst fn, JSValueConst
                its progress. Both callers discard r, so resuming when the outer context is gone only
                needs its @H/@S to surface. Falls back to free if the flow wrote shared-scope JSValue
                slots (the refcount-exact typed-trail capture-from-mark is the next increment). */
-            if (qjs_park_forced_flow(ctx, cow_mark, vt_mark, buf_mark, shp_mark)) {
+            if (qjs_park_forced_flow(ctx, cow_mark, vt_mark, defer_mark)) {
                 rt->js_stack = NULL; rt->current_stack_frame = NULL; rt->qjs_yield_entry = NULL;  /* detached into the registry — do NOT free its chunks */
             } else {
                 qjs_free_suspended_trampoline_frames(ctx);   /* free the isolated sub-chain (current_stack_frame -> NULL) */
@@ -63447,7 +63418,7 @@ static int qjs_drive_park_grow(JSContext *ctx) {
    detaches rt and must NOT free the chunks), 0 to fall back to free. SCOPE (honest): parks only when
    the flow wrote NO shared-scope JSValue slots (typed-trail unchanged) — the refcount-exact trail
    capture-from-mark is the next increment; a vt-writing flow safely frees as before (no regression). */
-static int qjs_park_forced_flow(JSContext *ctx, size_t cow_mark, size_t vt_mark, size_t buf_mark, size_t shp_mark) {
+static int qjs_park_forced_flow(JSContext *ctx, size_t cow_mark, size_t vt_mark, size_t defer_mark) {
     JSRuntime *rt = ctx->rt;
     extern int g_emit_n;
     /* The buffer-trail / shape-trail segments aren't carried in the delta yet, so they can't be
@@ -63486,26 +63457,21 @@ static int qjs_park_forced_flow(JSContext *ctx, size_t cow_mark, size_t vt_mark,
         }
         g_cow_busy = sv;
     } else { d->vtn = 0; }
-    /* BUFFER-TRAIL + SHAPE-TRAIL capture-from-mark: transfer ownership of this flow's deferred buffers
-       / shape transitions [mark, n) from the LIVE trail to the delta, then TRUNCATE the live trail to
-       the mark — so the word-log revert's buf/shp hooks find nothing above the mark and DON'T free the
-       kept new buffers / shapes (the delta owns them now; re-pushed on resume). The word log restores
-       the FIELD pointers; these carry the lifetime/refcount ownership across the pause. */
-    size_t bcnt = (qjs_cow_buf_n > buf_mark) ? (qjs_cow_buf_n - buf_mark) : 0;
-    d->bfn = bcnt;
-    d->bf_old = bcnt ? (void **)qjs_cow_palloc(bcnt * sizeof(void *)) : NULL;
-    d->bf_new = bcnt ? (void **)qjs_cow_palloc(bcnt * sizeof(void *)) : NULL;
-    for (k = 0; k < bcnt; k++) { d->bf_old[k] = qjs_cow_buf[buf_mark + k].oldb; d->bf_new[k] = qjs_cow_buf[buf_mark + k].newb; }
-    qjs_cow_buf_n = buf_mark;   /* ownership -> delta; the kept new buffers are NOT freed by the revert hook */
-    size_t scnt = (qjs_cow_shp_n > shp_mark) ? (qjs_cow_shp_n - shp_mark) : 0;
-    d->spn = scnt;
-    d->sp_old = scnt ? (struct JSShape **)qjs_cow_palloc(scnt * sizeof(struct JSShape *)) : NULL;
-    d->sp_new = scnt ? (struct JSShape **)qjs_cow_palloc(scnt * sizeof(struct JSShape *)) : NULL;
-    for (k = 0; k < scnt; k++) { d->sp_old[k] = qjs_cow_shp[shp_mark + k].old; d->sp_new[k] = qjs_cow_shp[shp_mark + k].neww; }
-    qjs_cow_shp_n = shp_mark;   /* ownership -> delta; new shapes NOT js_free_shape'd by the revert hook */
+    /* DEFERRED-RESTORE capture-from-mark: transfer ownership of this flow's deferred buffers / shape
+       transitions [defer_mark, n) from the LIVE trail to the delta, then TRUNCATE the live trail to the
+       mark — so the word-log revert's defer hook finds nothing above the mark and DOESN'T free the kept
+       new buffers / shapes (the delta owns them now; re-pushed on resume). The word log restores the
+       FIELD pointers; these carry the lifetime/refcount ownership across the pause. */
+    size_t dcnt = (qjs_cow_defer_n > defer_mark) ? (qjs_cow_defer_n - defer_mark) : 0;
+    d->dfn = dcnt;
+    d->df_old  = dcnt ? (void **)qjs_cow_palloc(dcnt * sizeof(void *)) : NULL;
+    d->df_new  = dcnt ? (void **)qjs_cow_palloc(dcnt * sizeof(void *)) : NULL;
+    d->df_kind = dcnt ? (uint8_t *)qjs_cow_palloc(dcnt * sizeof(uint8_t)) : NULL;
+    for (k = 0; k < dcnt; k++) { d->df_old[k] = qjs_cow_defer[defer_mark + k].old; d->df_new[k] = qjs_cow_defer[defer_mark + k].neww; d->df_kind[k] = qjs_cow_defer[defer_mark + k].is_shape; }
+    qjs_cow_defer_n = defer_mark;   /* ownership -> delta; the kept new buffers/shapes are NOT freed by the revert hook */
     if (g_cow_enabled) {
         qjs_cow_vt_revert_to(vt_mark);        /* typed trail FIRST (the load-bearing order — refcount-exact on the genuine slot) */
-        qjs_cow_undo_revert_to(cow_mark);     /* then the word log: restores field pointers; buf/shp hooks no-op (trails truncated to the mark) */
+        qjs_cow_undo_revert_to(cow_mark);     /* then the word log: restores field pointers; defer hook no-ops (trail truncated to the mark) */
     }
     qjs_drive_flow[ix].js_stack = rt->js_stack;
     qjs_drive_flow[ix].current_stack_frame = rt->current_stack_frame;
