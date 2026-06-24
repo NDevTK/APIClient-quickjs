@@ -63521,6 +63521,62 @@ QJS_JSEXPORT int qjs_drive_run(JSContext *ctx, int e0) {
    NEXT drive, or completes). A completed flow's mutations are DISCARDED to baseline so
    the next flow / schedule forks clean (#7 isolation), mirroring the grind's per-orphan
    commit/discard. Called once at do_drive start, AFTER cow_drive_restore (heap = baseline). */
+/* #5 OOM eviction core (in-session): relocate a parked flow's heap-stack chunk chain to FRESH
+   addresses, fixing up every CHUNK-INTERNAL pointer; COW-heap pointers (cur_func/cur_pc/the JSValues
+   in var_buf+operand stack/qjs_this/...) are left untouched because the COW heap persists in-session.
+   This proves a parked flow's RAM can be moved (serialize->free->reload) WITHOUT serializing the object
+   graph. The IDB blob is just where the bytes sit between free and reload. Forced on every resume here
+   to exercise the fixup; the OPEN var_ref case (a closure's JSVarRef.pvalue pointing into the stack) is
+   NOT yet handled — this round-trip tells us empirically whether parked forced-flow frames hit it. */
+typedef struct { JSStackChunk *oldc; JSStackChunk *newc; size_t cap; } JSChunkMap;
+static void *qjs_reloc_ptr(void *p, JSChunkMap *map, int nmap) {
+    if (!p) return p;
+    size_t a = (size_t)p;
+    for (int i = 0; i < nmap; i++) {
+        size_t ob = (size_t)map[i].oldc;
+        if (a >= ob && a < ob + sizeof(JSStackChunk) + map[i].cap)
+            return (void *)(a - ob + (size_t)map[i].newc);
+    }
+    return p;   /* not chunk-internal -> COW heap, unchanged */
+}
+static void qjs_drive_relocate(JSContext *ctx, JSFlow *f) {
+    JSRuntime *rt = ctx->rt;
+    if (!f->js_stack) return;
+    int nc = 0; for (JSStackChunk *c = f->js_stack; c; c = c->prev) nc++;
+    JSChunkMap *map = js_malloc(ctx, (size_t)nc * sizeof(JSChunkMap));
+    if (!map) return;
+    int i = 0;
+    for (JSStackChunk *c = f->js_stack; c; c = c->prev, i++) {
+        size_t cap = (size_t)(c->limit - c->data);
+        JSStackChunk *n2 = js_malloc_rt(rt, sizeof(JSStackChunk) + cap);
+        if (!n2) { for (int j = 0; j < i; j++) js_free_rt(rt, map[j].newc); js_free(ctx, map); return; }
+        memcpy(n2, c, sizeof(JSStackChunk) + cap);
+        map[i].oldc = c; map[i].newc = n2; map[i].cap = cap;
+    }
+    for (i = 0; i < nc; i++) {
+        JSStackChunk *n2 = map[i].newc;
+        n2->prev  = qjs_reloc_ptr(n2->prev,  map, nc);
+        n2->top   = qjs_reloc_ptr(n2->top,   map, nc);
+        n2->limit = qjs_reloc_ptr(n2->limit, map, nc);
+    }
+    for (JSStackFrame *of = f->current_stack_frame; of; ) {
+        JSStackFrame *nf = qjs_reloc_ptr(of, map, nc);
+        JSStackFrame *next_old = nf->prev_frame;   /* still the OLD addr (memcpy'd, not yet fixed) */
+        nf->prev_frame      = qjs_reloc_ptr(nf->prev_frame,      map, nc);
+        nf->arg_buf         = qjs_reloc_ptr(nf->arg_buf,         map, nc);
+        nf->var_buf         = qjs_reloc_ptr(nf->var_buf,         map, nc);
+        nf->cur_sp          = qjs_reloc_ptr(nf->cur_sp,          map, nc);
+        nf->qjs_local_buf   = qjs_reloc_ptr(nf->qjs_local_buf,   map, nc);
+        nf->qjs_arena_chunk = qjs_reloc_ptr(nf->qjs_arena_chunk, map, nc);
+        nf->qjs_arena_save  = qjs_reloc_ptr(nf->qjs_arena_save,  map, nc);
+        of = next_old;
+    }
+    f->js_stack            = qjs_reloc_ptr(f->js_stack,            map, nc);
+    f->current_stack_frame = qjs_reloc_ptr(f->current_stack_frame, map, nc);
+    f->qjs_yield_entry     = qjs_reloc_ptr(f->qjs_yield_entry,     map, nc);
+    for (i = 0; i < nc; i++) js_free_rt(rt, map[i].oldc);
+    js_free(ctx, map);
+}
 QJS_JSEXPORT void qjs_drive_repick(JSContext *ctx) {
     JSRuntime *rt = ctx->rt;
     if (qjs_drive_n == 0) return;
@@ -63528,6 +63584,7 @@ QJS_JSEXPORT void qjs_drive_repick(JSContext *ctx) {
     JSFlow *pf = qjs_drive_flow; JSCowDelta *pc = qjs_drive_cow; unsigned *pm = qjs_drive_mark;
     qjs_drive_flow = NULL; qjs_drive_cow = NULL; qjs_drive_mark = NULL; qjs_drive_n = 0; qjs_drive_cap = 0;
     for (int i = 0; i < pn; i++) {
+        qjs_drive_relocate(ctx, &pf[i]);   /* #5 eviction round-trip: relocate this parked flow's stack chunks to fresh addresses (in-session, COW heap persists) before resuming — exercises the chunk-internal pointer fixup */
         if (g_cow_enabled) {
             qjs_cow_apply(qjs_cow_heap_base(), &pc[i]);   /* word log (field pointers -> new) + vt */
             for (size_t k = 0; k < pc[i].bfn; k++) qjs_cow_buf_push(ctx, pc[i].bf_old[k], pc[i].bf_new[k]);   /* re-establish the buffer-trail (resumed flow owns the lifetimes) */
