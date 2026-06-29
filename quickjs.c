@@ -21397,7 +21397,7 @@ static void qjs_flow_revert(JSContext *ctx) {
     qjs_fe_seen_reset();   /* fresh forced-exec seen-set per invoke (the grind's per-execution-unit reset) */
 }
 
-#define QJS_DEFER_QUANTUM 64          /* yield-windows (×10000 ops) a forced flow runs before it is preempted + starved */
+#define QJS_DEFER_QUANTUM 16          /* yield-windows (×10000 ops) a forced flow runs before it is preempted + starved — SMALL = parks sooner = more BREADTH-first (the goal), the WFQ switches to siblings faster */
 
 /* Free the trampolined NORMAL frames from current_stack_frame DOWN TO (but not
    including) `stop`, then set current_stack_frame = stop. `stop`=NULL frees the
