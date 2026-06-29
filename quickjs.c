@@ -21397,7 +21397,7 @@ static void qjs_flow_revert(JSContext *ctx) {
     qjs_fe_seen_reset();   /* fresh forced-exec seen-set per invoke (the grind's per-execution-unit reset) */
 }
 
-#define QJS_DEFER_QUANTUM 16          /* yield-windows (×10000 ops) a forced flow runs before it is preempted + starved — SMALL = parks sooner = more BREADTH-first (the goal), the WFQ switches to siblings faster */
+#define QJS_DEFER_QUANTUM 64          /* yield-windows (×10000 ops) a forced flow runs before it is preempted + starved */
 
 /* Free the trampolined NORMAL frames from current_stack_frame DOWN TO (but not
    including) `stop`, then set current_stack_frame = stop. `stop`=NULL frees the
@@ -63770,7 +63770,7 @@ QJS_JSEXPORT int qjs_drive_reload_session(JSContext *ctx) {
 extern int qjs_idb_put(uint64_t key, const uint8_t *data, int len);
 extern int qjs_idb_get(uint64_t key, uint8_t *out, int maxlen);
 static uint64_t g_evic_seq = 1;
-static size_t g_evic_floor = (size_t)16 * 1024 * 1024;   /* parked-stack RAM high-water: aggressive -> the cold WFQ tail evicts to the DISK floor early, RAM stays the hot working set (UNBOUNDED-until-disk) */
+static size_t g_evic_floor = (size_t)128 * 1024 * 1024;   /* parked-stack RAM high-water = the platform floor; the cold WFQ-value tail evicts to the IDB disk floor above it */
 static size_t qjs_drive_parked_ram(void) {
     size_t total = 0;
     for (int i = 0; i < qjs_drive_n; i++) {
