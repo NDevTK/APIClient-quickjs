@@ -90,6 +90,36 @@ EM_ASYNC_JS(int, qjs_host_digest, (const char *algName, const uint8_t *data, int
         return -1;
     }
 });
+
+/* qjs_idb_put / qjs_idb_get: #5 eviction-to-IDB JSPI bridge (mirrors qjs_host_digest). The engine's
+   RAM-pressure policy serializes a cold parked flow's stack (qjs_drive_evict) and SUSPENDS here while
+   the worker persists the bytes to feEvictDB under the per-flow key; resume fetches them back into a
+   pre-sized buffer (qjs_drive_restore_buf, length = the stored evic_len). MEMORY64: key arrives as a
+   BigInt, data/out as i64 pointers — Number()-coerce for all HEAPU8 indexing; String(key) is the IDB
+   key both sides. The bytes are copied OUT of HEAPU8 before the await (the heap may grow during it). */
+EM_ASYNC_JS(int, qjs_idb_put, (uint64_t key, const uint8_t *data, int len), {
+    if (!Module.qjs_idb_put) return -1;
+    try {
+        var bytes = HEAPU8.slice(Number(data), Number(data) + len);
+        await Module.qjs_idb_put(String(key), bytes);
+        return 0;
+    } catch (e) {
+        if (typeof printErr === "function") printErr('@WHY {"phase":"idb_put_throw","err":' + JSON.stringify(String(e && e.message || e)) + "}");
+        return -1;
+    }
+});
+EM_ASYNC_JS(int, qjs_idb_get, (uint64_t key, uint8_t *out, int maxlen), {
+    if (!Module.qjs_idb_get) return -1;
+    try {
+        var bytes = await Module.qjs_idb_get(String(key));   /* Uint8Array or null */
+        if (!bytes || bytes.length > maxlen) return -1;
+        HEAPU8.set(bytes, Number(out));
+        return bytes.length;
+    } catch (e) {
+        if (typeof printErr === "function") printErr('@WHY {"phase":"idb_get_throw","err":' + JSON.stringify(String(e && e.message || e)) + "}");
+        return -1;
+    }
+});
 #endif
 
 

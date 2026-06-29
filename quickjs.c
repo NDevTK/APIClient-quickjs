@@ -20503,6 +20503,7 @@ typedef struct JSFlow {
     int flow_depth;                     /* #7: this flow's FLOWBEG/FLOWEND nesting depth — per-flow like the heap stack, else an interleaved suspend/resume (i1 yields at fetch, i2 runs, i1 resumes) shares one global g_flow_depth so FLOWENDs revert at the wrong moment and a sibling's shared-cell write leaks (shared_state i2-n-2). Saved on yield, restored on resume; a fresh flow's handle is zero -> depth 0. */
     uint8_t *evic_blob;                 /* #5 eviction: non-NULL while this flow's serialized-stack blob is held in wasm RAM during the host<->IDB handoff (set by qjs_drive_evict / qjs_drive_restore_buf). NULL = blob not resident here (live, or already copied to IDB). */
     size_t   evic_len;                  /* != 0 marks the flow EVICTED (stack chunks freed, bytes in IDB) until qjs_drive_restore rebuilds them; 0 = live in RAM. */
+    uint64_t evic_key;                  /* the IDB key (monotonic, assigned at evict) — travels with the flow across repick reordering so restore fetches the right blob. */
 } JSFlow;
 
 void qjs_flow_save(JSContext *ctx, JSFlow *f) {
@@ -20510,7 +20511,7 @@ void qjs_flow_save(JSContext *ctx, JSFlow *f) {
     f->current_stack_frame = ctx->rt->current_stack_frame;
     f->qjs_yield_entry = ctx->rt->qjs_yield_entry;
     f->flow_depth = g_flow_depth;       /* save THIS flow's nesting so the incoming flow's restore doesn't inherit it */
-    f->evic_blob = NULL; f->evic_len = 0;   /* a freshly-saved flow is RAM-resident, never evicted */
+    f->evic_blob = NULL; f->evic_len = 0; f->evic_key = 0;   /* a freshly-saved flow is RAM-resident, never evicted */
 }
 void qjs_flow_restore(JSContext *ctx, JSFlow *f) {
     ctx->rt->js_stack = f->js_stack;
@@ -63608,6 +63609,46 @@ QJS_JSEXPORT int qjs_drive_restore(JSContext *ctx, int ix) {
     qjs_drive_flow[ix].evic_blob = NULL; qjs_drive_flow[ix].evic_len = 0;   /* live in RAM again */
     return r;
 }
+/* ===== #5 eviction-to-IDB POLICY (engine-internal, JSPI-suspending) ================================
+   The JSPI IDB bridge (qjsmain.c). The policy runs after a re-park (RAM only grows then): while the
+   non-evicted parked stacks exceed the platform RAM FLOOR, evict the COLDEST flow (lowest mark = the
+   WFQ tail) to IDB. Floor management, NOT a work bound — nothing is truncated; the cold tail moves to
+   the slower disk floor, resumable. (The mark is a crude value proxy for v1; the WFQ-value-ordered
+   selection by emitted output is the next refinement, shared with the WFQ unification.) */
+extern int qjs_idb_put(uint64_t key, const uint8_t *data, int len);
+extern int qjs_idb_get(uint64_t key, uint8_t *out, int maxlen);
+static uint64_t g_evic_seq = 1;
+static size_t g_evic_floor = (size_t)128 * 1024 * 1024;   /* parked-stack RAM high-water = the platform floor */
+static size_t qjs_drive_parked_ram(void) {
+    size_t total = 0;
+    for (int i = 0; i < qjs_drive_n; i++) {
+        if (qjs_drive_flow[i].evic_len) continue;   /* already in IDB, not in RAM */
+        for (JSStackChunk *c = qjs_drive_flow[i].js_stack; c; c = c->prev)
+            total += sizeof(JSStackChunk) + (size_t)(c->limit - c->data);
+    }
+    return total;
+}
+static void qjs_drive_evict_pressure(JSContext *ctx) {
+    while (qjs_drive_parked_ram() > g_evic_floor) {
+        int best = -1; unsigned best_mark = 0;
+        for (int i = 0; i < qjs_drive_n; i++) {
+            if (qjs_drive_flow[i].evic_len) continue;
+            if (best < 0 || qjs_drive_mark[i] < best_mark) { best = i; best_mark = qjs_drive_mark[i]; }   /* coldest = lowest mark */
+        }
+        if (best < 0) break;   /* only the hot working set remains — can't reduce below it */
+        size_t len = 0;
+        uint8_t *blob = qjs_drive_evict(ctx, best, &len);   /* serialize + FREE the chunks */
+        if (!blob) break;
+        uint64_t key = g_evic_seq++;
+        qjs_drive_flow[best].evic_key = key;
+        if (qjs_idb_put(key, blob, (int)len) != 0) { qjs_drive_restore(ctx, best); break; }   /* IDB store failed -> rebuild from the still-held blob (un-evict), stop */
+        qjs_drive_evict_done(ctx, best);   /* free the wasm RAM copy — the actual relief */
+    }
+}
+/* Set the parked-stack RAM floor (bytes) above which the policy evicts the cold tail to IDB. The real
+   value is the platform RAM ceiling; a targeted design-correctness test lowers it to force an
+   evict->IDB->restore round-trip on a small scenario. */
+QJS_JSEXPORT void qjs_set_evic_floor(size_t bytes) { g_evic_floor = bytes; }
 /* RAM->RAM relocation (cheap, per-chunk — no contiguous blob): exercised on every resume to keep the
    pointer fixup continuously verified WITHOUT the deep-stack blowup that an unconditional contiguous
    blob serialize causes for an unbounded spinner (c_normal). The blob serialize/deserialize above is
@@ -63636,11 +63677,22 @@ QJS_JSEXPORT void qjs_drive_repick(JSContext *ctx) {
     JSFlow *pf = qjs_drive_flow; JSCowDelta *pc = qjs_drive_cow; unsigned *pm = qjs_drive_mark;
     qjs_drive_flow = NULL; qjs_drive_cow = NULL; qjs_drive_mark = NULL; qjs_drive_n = 0; qjs_drive_cap = 0;
     for (int i = 0; i < pn; i++) {
-        if (pf[i].evic_len) {   /* #5 still EVICTED (stack in IDB, chunks freed) — keep it parked, never relocate/run a freed stack; the host restores it (qjs_drive_restore) when the WFQ picks it to resume */
-            if (qjs_drive_park_grow(ctx)) { int ix = qjs_drive_n++; qjs_drive_flow[ix] = pf[i]; qjs_drive_cow[ix] = pc[i]; qjs_drive_mark[ix] = pm[i]; }
-            continue;   /* COW delta (pool-resident) + handle preserved via the struct move; pc[i]'s internal arrays stay valid after js_free(pc) */
+        int just_restored = 0;
+        if (pf[i].evic_len) {   /* #5 EVICTED (stack in IDB) — fetch it back into fresh chunks so the WFQ can resume it */
+            uint8_t *buf = js_malloc(ctx, pf[i].evic_len);
+            int got = buf ? qjs_idb_get(pf[i].evic_key, buf, (int)pf[i].evic_len) : -1;   /* JSPI suspend -> IDB */
+            if (got == (int)pf[i].evic_len) {
+                qjs_drive_deserialize(ctx, &pf[i], buf, pf[i].evic_len);   /* rebuild the chunk chain + fix the flow's pointers */
+                js_free(ctx, buf);
+                pf[i].evic_blob = NULL; pf[i].evic_len = 0; just_restored = 1;   /* live again; chunks are fresh -> skip relocate */
+            } else {   /* IDB fetch failed: no stack to run -> keep parked (handle+delta preserved), surface @WHY, retry next repick */
+                if (buf) js_free(ctx, buf);
+                printf("@WHY {\"phase\":\"idb_get_fail\",\"key\":%llu}\n", (unsigned long long)pf[i].evic_key);
+                if (qjs_drive_park_grow(ctx)) { int ix = qjs_drive_n++; qjs_drive_flow[ix] = pf[i]; qjs_drive_cow[ix] = pc[i]; qjs_drive_mark[ix] = pm[i]; }
+                continue;
+            }
         }
-        qjs_drive_relocate(ctx, &pf[i]);   /* #5 eviction round-trip: relocate this parked flow's stack chunks to fresh addresses (in-session, COW heap persists) before resuming — exercises the chunk-internal pointer fixup */
+        if (!just_restored) qjs_drive_relocate(ctx, &pf[i]);   /* #5 eviction round-trip: relocate this parked flow's stack chunks to fresh addresses (a just-restored flow already has fresh chunks) — exercises the chunk-internal pointer fixup */
         if (g_cow_enabled) {
             qjs_cow_apply(qjs_cow_heap_base(), &pc[i]);   /* the one park primitive: word-log (field pointers -> new) + vt + buffer/shape trails — the full inverse of qjs_cow_capture */
             qjs_cow_delta_free(rt, &pc[i]);
@@ -63650,6 +63702,7 @@ QJS_JSEXPORT void qjs_drive_repick(JSContext *ctx) {
         int parked = qjs_drive_run(ctx, (int)pm[i]);
         if (!parked && g_cow_enabled) qjs_cow_discard(qjs_cow_heap_base());
     }
+    qjs_drive_evict_pressure(ctx);   /* #5 after the re-parks: evict the cold tail to IDB if parked-stack RAM is over the floor */
     js_free(ctx, pf); js_free(ctx, pc); js_free(ctx, pm);
 }
 /* The deep-grind interrupt handler (op-counted via js_poll_interrupts, so it
