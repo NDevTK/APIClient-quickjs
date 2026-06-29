@@ -20504,6 +20504,8 @@ typedef struct JSFlow {
     uint8_t *evic_blob;                 /* #5 eviction: non-NULL while this flow's serialized-stack blob is held in wasm RAM during the host<->IDB handoff (set by qjs_drive_evict / qjs_drive_restore_buf). NULL = blob not resident here (live, or already copied to IDB). */
     size_t   evic_len;                  /* != 0 marks the flow EVICTED (stack chunks freed, bytes in IDB) until qjs_drive_restore rebuilds them; 0 = live in RAM. */
     uint64_t evic_key;                  /* the IDB key (monotonic, assigned at evict) — travels with the flow across repick reordering so restore fetches the right blob. */
+    unsigned value;                     /* WFQ value-of-information: emitted-output (@H/@S) this flow produced on its last run (g_emit_n delta). The ONE scheduler reads this to order resume + choose the eviction tail — emitted output, never identity/RAM/a static guess. */
+    uint8_t cross_session;              /* 1 = reloaded from IDB in a NEW session (qjs_drive_reload_flow) — its COW delta has no in-session dup'd refs, so repick re-establishes its heap via qjs_cow_apply_xsession (re-apply word-log) not qjs_cow_apply. */
 } JSFlow;
 
 void qjs_flow_save(JSContext *ctx, JSFlow *f) {
@@ -20511,7 +20513,7 @@ void qjs_flow_save(JSContext *ctx, JSFlow *f) {
     f->current_stack_frame = ctx->rt->current_stack_frame;
     f->qjs_yield_entry = ctx->rt->qjs_yield_entry;
     f->flow_depth = g_flow_depth;       /* save THIS flow's nesting so the incoming flow's restore doesn't inherit it */
-    f->evic_blob = NULL; f->evic_len = 0; f->evic_key = 0;   /* a freshly-saved flow is RAM-resident, never evicted */
+    f->evic_blob = NULL; f->evic_len = 0; f->evic_key = 0; f->value = 0; f->cross_session = 0;   /* a freshly-saved flow is RAM-resident, in-session; value set by qjs_drive_run on park */
 }
 void qjs_flow_restore(JSContext *ctx, JSFlow *f) {
     ctx->rt->js_stack = f->js_stack;
@@ -20819,6 +20821,70 @@ static void qjs_cow_delta_free(JSRuntime *rt, JSCowDelta *d) {
     d->widx = NULL; d->oldw = NULL; d->neww = NULL; d->n = 0;
     d->vts = NULL; d->vto = NULL; d->vtc = NULL; d->vtn = 0;
     d->df_old = NULL; d->df_new = NULL; d->df_kind = NULL; d->dfn = 0;
+}
+/* ===== Cross-session resume: serialize a flow's COW delta (refcount-FREE data) to a flat blob ========
+   Serializes the word-log (widx/oldw/neww) + the vt SLOT addresses + defer (old/new/kind), NOT the vt
+   dup'd refs (vto/vtc). Refcounts are HEAP WORDS, so re-applying the word-log on a deterministic re-boot
+   restores them; the vt ownership is re-derived from the slots' baseline values on reload, so carrying
+   the in-session dups would double-count. Pointers (vts/df_*) are valid next session because the re-boot
+   reproduces the same heap addresses (the forced-exec determinism the engine already requires). */
+QJS_JSEXPORT uint8_t *qjs_cow_delta_serialize(const JSCowDelta *d, size_t *plen) {
+    uint32_t n = (uint32_t)d->n, vtn = (uint32_t)d->vtn, dfn = (uint32_t)d->dfn;
+    size_t len = 3 * sizeof(uint32_t) + (size_t)n * 3 * 8 + (size_t)vtn * 8 + (size_t)dfn * (8 + 8 + 1);
+    uint8_t *b = js_malloc_rt(g_cow_rt, len ? len : 1); if (!b) { if (plen) *plen = 0; return NULL; }
+    uint8_t *w = b;
+    memcpy(w, &n, 4); w += 4; memcpy(w, &vtn, 4); w += 4; memcpy(w, &dfn, 4); w += 4;
+    if (n) { memcpy(w, d->widx, (size_t)n * 8); w += (size_t)n * 8; memcpy(w, d->oldw, (size_t)n * 8); w += (size_t)n * 8; memcpy(w, d->neww, (size_t)n * 8); w += (size_t)n * 8; }
+    for (uint32_t k = 0; k < vtn; k++) { uint64_t p = (uint64_t)(size_t)d->vts[k]; memcpy(w, &p, 8); w += 8; }
+    for (uint32_t k = 0; k < dfn; k++) { uint64_t a = (uint64_t)(size_t)d->df_old[k], c = (uint64_t)(size_t)d->df_new[k]; memcpy(w, &a, 8); w += 8; memcpy(w, &c, 8); w += 8; *w++ = d->df_kind[k]; }
+    if (plen) *plen = len; return b;
+}
+/* Rebuild a delta from a cross-session blob; vto/vtc left NULL (re-derived from the slots' baseline
+   values by the cross-session apply, which the next increment adds). */
+QJS_JSEXPORT int qjs_cow_delta_deserialize(const uint8_t *b, JSCowDelta *d) {
+    const uint8_t *r = b;
+    uint32_t n, vtn, dfn; memcpy(&n, r, 4); r += 4; memcpy(&vtn, r, 4); r += 4; memcpy(&dfn, r, 4); r += 4;
+    d->n = n; d->vtn = vtn; d->dfn = dfn;
+    d->widx = n ? (uint64_t *)qjs_cow_palloc((size_t)n * 8) : NULL;
+    d->oldw = n ? (uint64_t *)qjs_cow_palloc((size_t)n * 8) : NULL;
+    d->neww = n ? (uint64_t *)qjs_cow_palloc((size_t)n * 8) : NULL;
+    if (n) { memcpy(d->widx, r, (size_t)n * 8); r += (size_t)n * 8; memcpy(d->oldw, r, (size_t)n * 8); r += (size_t)n * 8; memcpy(d->neww, r, (size_t)n * 8); r += (size_t)n * 8; }
+    d->vts = vtn ? (JSValue **)qjs_cow_palloc((size_t)vtn * sizeof(JSValue *)) : NULL;
+    d->vto = NULL; d->vtc = NULL;
+    for (uint32_t k = 0; k < vtn; k++) { uint64_t p; memcpy(&p, r, 8); r += 8; if (d->vts) d->vts[k] = (JSValue *)(size_t)p; }
+    d->df_old = dfn ? (void **)qjs_cow_palloc((size_t)dfn * sizeof(void *)) : NULL;
+    d->df_new = dfn ? (void **)qjs_cow_palloc((size_t)dfn * sizeof(void *)) : NULL;
+    d->df_kind = dfn ? (uint8_t *)qjs_cow_palloc((size_t)dfn * sizeof(uint8_t)) : NULL;
+    for (uint32_t k = 0; k < dfn; k++) { uint64_t a, c; memcpy(&a, r, 8); r += 8; memcpy(&c, r, 8); r += 8; uint8_t kd = *r++; if (d->df_old) { d->df_old[k] = (void *)(size_t)a; d->df_new[k] = (void *)(size_t)c; d->df_kind[k] = kd; } }
+    return 0;
+}
+/* Cross-session apply: re-establish a deserialized flow's heap state on a fresh, re-booted-to-baseline
+   engine. Runs with the heap AT BASELINE (caller re-booted the same bundle -> same addresses). The
+   word-log carries refcounts (they are heap words) — including the vt-trail's KEEP ref on each old,
+   which qjs_cow_capture recorded — so re-applying it restores every refcount exactly. The vt-trail is
+   then re-pushed {slot, old} with NO incref: old's count already includes the trail's ownership (the
+   word-log bytes hold it). old is never freed during the flow (the trail's ref pinned it), so the
+   slot's baseline value is its valid old. */
+QJS_JSEXPORT void qjs_cow_apply_xsession(uint8_t *mem, JSCowDelta *d) {
+    size_t hb = (size_t)&__heap_base, k; (void)mem;
+    g_cow_busy = 1;
+    JSValue *base_old = d->vtn ? (JSValue *)qjs_cow_palloc(d->vtn * sizeof(JSValue)) : NULL;
+    for (k = 0; k < d->vtn && base_old; k++) base_old[k] = *d->vts[k];   /* slot's baseline value (heap is at baseline, pre-word-log) = its pre-flow old */
+    for (k = 0; k < d->n; k++) {                                          /* re-apply the word-log: heap -> flow-state, every refcount (heap word) restored exactly */
+        uint64_t w = d->widx[k];
+        if (w >= qjs_cow_words) qjs_cow_shadow_grow(w);
+        *(uint64_t *)(hb + (w << 3)) = d->neww[k];
+        if (!(qjs_cow_shadow[w >> 3] & (uint8_t)(1u << (w & 7)))) {
+            if (qjs_cow_undo_n >= qjs_cow_undo_cap) qjs_cow_undo_grow();
+            qjs_cow_undo[qjs_cow_undo_n].widx = w; qjs_cow_undo[qjs_cow_undo_n].old = d->oldw[k]; qjs_cow_undo_n++;
+            qjs_cow_shadow[w >> 3] |= (uint8_t)(1u << (w & 7));
+        }
+    }
+    for (k = 0; k < d->vtn && base_old; k++) qjs_cow_vt_push(d->vts[k], base_old[k], NULL);   /* trail owns old; its ref is already in old's restored refcount byte -> NO incref */
+    d->vtn = 0;
+    for (k = 0; k < d->dfn; k++) qjs_cow_defer_push(d->df_old[k], d->df_new[k], d->df_kind[k]);   /* re-establish the deferred buffer/shape trail (one kind-tagged push, mirrors qjs_cow_apply) */
+    d->dfn = 0;
+    g_cow_busy = 0;
 }
 /* Discard a COMPLETED flow's mutations: revert the live undo log to baseline (#7: the next
    flow forks clean; learned @H/@S are emitted output, not heap state, so undoing loses nothing). */
@@ -63466,6 +63532,7 @@ QJS_JSEXPORT int qjs_drive_run(JSContext *ctx, int e0) {
     JSRuntime *rt = ctx->rt;
     extern int g_emit_n;
     int silent = 0;
+    int e0_start = e0;   /* WFQ value: emit mark at this run's START -> productivity = g_emit_n - e0_start */
     while (rt->qjs_yielded) {
         rt->qjs_yielded = 0;
         if (g_emit_n != e0) { e0 = g_emit_n; silent = 0; }
@@ -63475,6 +63542,7 @@ QJS_JSEXPORT int qjs_drive_run(JSContext *ctx, int e0) {
             qjs_flow_save(ctx, &qjs_drive_flow[ix]);
             if (g_cow_enabled) { qjs_cow_capture(rt, qjs_cow_heap_base(), &qjs_drive_cow[ix]); qjs_cow_to_baseline(qjs_cow_heap_base(), &qjs_drive_cow[ix]); }
             qjs_drive_mark[ix] = (unsigned)g_emit_n;
+            qjs_drive_flow[ix].value = (unsigned)(g_emit_n - e0_start);   /* WFQ value-of-information: @H/@S this run produced (it parked because it then went silent) */
             rt->js_stack = NULL; rt->current_stack_frame = NULL; rt->qjs_yield_entry = NULL;
             return 1;
         }
@@ -63535,7 +63603,7 @@ static void qjs_drive_fixup(JSFlow *f, JSChunkMap *map, int nc) {
    chain's OLD base addresses + capacities + raw bytes. Frees the live chunks (eviction). Returns the
    blob (caller frees / hands to IDB) or NULL. The flow handle's pointers stay as the OLD addresses;
    deserialize rebuilds the map and fixes them. */
-static uint8_t *qjs_drive_serialize(JSContext *ctx, JSFlow *f, size_t *plen) {
+static uint8_t *qjs_drive_serialize(JSContext *ctx, JSFlow *f, size_t *plen, int free_chunks) {
     JSRuntime *rt = ctx->rt;
     int nc = 0; for (JSStackChunk *c = f->js_stack; c; c = c->prev) nc++;
     size_t len = sizeof(int);
@@ -63549,7 +63617,7 @@ static uint8_t *qjs_drive_serialize(JSContext *ctx, JSFlow *f, size_t *plen) {
         memcpy(w, &ob, sizeof ob); w += sizeof ob;
         memcpy(w, &cap, sizeof cap); w += sizeof cap;
         memcpy(w, c, full); w += full;
-        js_free_rt(rt, c);   /* EVICT: drop the RAM chunk */
+        if (free_chunks) js_free_rt(rt, c);   /* EVICT frees the RAM chunk; cross-session persist COPIES (keep the hot flow live) */
         c = prev;
     }
     *plen = len; return blob;
@@ -63580,7 +63648,7 @@ static int qjs_drive_deserialize(JSContext *ctx, JSFlow *f, const uint8_t *blob,
    restored (qjs_drive_restore) before qjs_drive_repick resumes it. */
 QJS_JSEXPORT uint8_t *qjs_drive_evict(JSContext *ctx, int ix, size_t *plen) {
     if (ix < 0 || ix >= qjs_drive_n || qjs_drive_flow[ix].evic_len) return NULL;   /* OOB or already evicted */
-    uint8_t *b = qjs_drive_serialize(ctx, &qjs_drive_flow[ix], plen);              /* serialize the stack + FREE the RAM chunks */
+    uint8_t *b = qjs_drive_serialize(ctx, &qjs_drive_flow[ix], plen, 1);           /* serialize the stack + FREE the RAM chunks (eviction) */
     if (!b) return NULL;
     qjs_drive_flow[ix].evic_blob = b; qjs_drive_flow[ix].evic_len = *plen;          /* held in RAM for the host to copy to IDB */
     return b;
@@ -63609,6 +63677,90 @@ QJS_JSEXPORT int qjs_drive_restore(JSContext *ctx, int ix) {
     qjs_drive_flow[ix].evic_blob = NULL; qjs_drive_flow[ix].evic_len = 0;   /* live in RAM again */
     return r;
 }
+/* ===== Cross-session persist/reload (survive a browser restart) ====================================
+   serialize_flow writes ONE blob per RAM-resident parked flow: [handle: js_stack/current_stack_frame/
+   qjs_yield_entry as old addrs + flow_depth + value + chunk-blob-len] + [stack chunks] + [COW delta].
+   The host stores it in IDB keyed by bundle-hash (non-consuming). reload_flow (NEW session, after the
+   same bundle re-booted to baseline) re-injects it: set the old handle addrs, deserialize the chunks
+   (fixup remaps the handle), deserialize the delta, flag cross_session so repick uses apply_xsession. */
+QJS_JSEXPORT uint8_t *qjs_drive_serialize_flow(JSContext *ctx, int ix, size_t *plen) {
+    if (ix < 0 || ix >= qjs_drive_n || qjs_drive_flow[ix].evic_len) { if (plen) *plen = 0; return NULL; }   /* evicted flows already live in IDB (handled separately) */
+    JSFlow *f = &qjs_drive_flow[ix];
+    uint64_t a = (uint64_t)(size_t)f->js_stack, c = (uint64_t)(size_t)f->current_stack_frame, y = (uint64_t)(size_t)f->qjs_yield_entry;
+    int32_t fd = f->flow_depth; uint32_t v = f->value;
+    size_t slen = 0; uint8_t *stack = qjs_drive_serialize(ctx, f, &slen, 0); if (!stack) { if (plen) *plen = 0; return NULL; }   /* COPY the chunks (keep the hot flow live in RAM; persist is non-destructive) */
+    size_t dlen = 0; uint8_t *delta = qjs_cow_delta_serialize(&qjs_drive_cow[ix], &dlen);
+    size_t total = 36 + slen + dlen;
+    uint8_t *b = js_malloc(ctx, total);
+    if (!b) { js_free(ctx, stack); if (delta) js_free_rt(g_cow_rt, delta); if (plen) *plen = 0; return NULL; }
+    uint8_t *w = b; uint32_t sl = (uint32_t)slen;
+    memcpy(w, &a, 8); w += 8; memcpy(w, &c, 8); w += 8; memcpy(w, &y, 8); w += 8; memcpy(w, &fd, 4); w += 4; memcpy(w, &v, 4); w += 4; memcpy(w, &sl, 4); w += 4;
+    memcpy(w, stack, slen); w += slen;
+    if (delta && dlen) memcpy(w, delta, dlen);
+    js_free(ctx, stack); if (delta) js_free_rt(g_cow_rt, delta);
+    if (plen) *plen = total; return b;
+}
+QJS_JSEXPORT int qjs_drive_reload_flow(JSContext *ctx, const uint8_t *blob, size_t len) {
+    if (!blob || len < 36 || !qjs_drive_park_grow(ctx)) return -1;
+    int ix = qjs_drive_n++;
+    JSFlow *f = &qjs_drive_flow[ix]; memset(f, 0, sizeof(JSFlow));
+    const uint8_t *r = blob;
+    uint64_t a, c, y; int32_t fd; uint32_t v, sl;
+    memcpy(&a, r, 8); r += 8; memcpy(&c, r, 8); r += 8; memcpy(&y, r, 8); r += 8; memcpy(&fd, r, 4); r += 4; memcpy(&v, r, 4); r += 4; memcpy(&sl, r, 4); r += 4;
+    f->js_stack = (JSStackChunk *)(size_t)a; f->current_stack_frame = (struct JSStackFrame *)(size_t)c; f->qjs_yield_entry = (struct JSStackFrame *)(size_t)y;
+    f->flow_depth = fd; f->value = v;
+    if (qjs_drive_deserialize(ctx, f, r, sl) != 0) { qjs_drive_n--; return -1; }   /* rebuild chunks + fixup remaps the handle addrs */
+    r += sl;
+    qjs_cow_delta_deserialize(r, &qjs_drive_cow[ix]);
+    f->cross_session = 1; qjs_drive_mark[ix] = 0;
+    return ix;
+}
+/* Cross-session orchestration over the JSPI IDB bridge. The host sets the bundle hash (SHA of the
+   page's scripts) so a CHANGED bundle never resumes a stale frontier. persist_session writes a marker
+   at <hash>:0xFFFFFFFF = [count, len0, len1, ...] then each flow blob at <hash>:<seq>; reload_session
+   (called at boot, after the same bundle re-booted to baseline) reads the marker and re-injects each.
+   v1 uses the freeing serialize (call at session end / for the design test); a non-freeing checkpoint
+   copy is the follow-up. */
+extern int qjs_idb_put(uint64_t key, const uint8_t *data, int len);
+extern int qjs_idb_get(uint64_t key, uint8_t *out, int maxlen);
+static uint32_t g_bundle_hash = 0;
+QJS_JSEXPORT void qjs_set_bundle_hash(uint32_t h) { g_bundle_hash = h; }
+QJS_JSEXPORT int qjs_drive_persist_session(JSContext *ctx) {
+    uint32_t bh = g_bundle_hash; if (!bh || qjs_drive_n == 0) return 0;
+    int n = qjs_drive_n;
+    uint8_t **blobs = (uint8_t **)js_malloc(ctx, (size_t)n * sizeof(uint8_t *));
+    uint32_t *lens = (uint32_t *)js_malloc(ctx, (size_t)(n + 1) * sizeof(uint32_t));
+    if (!blobs || !lens) { if (blobs) js_free(ctx, blobs); if (lens) js_free(ctx, lens); return -1; }
+    int seq = 0;
+    for (int ix = 0; ix < n; ix++) {
+        if (qjs_drive_flow[ix].evic_len) continue;   /* evicted (already in IDB) — follow-up */
+        size_t len = 0; uint8_t *b = qjs_drive_serialize_flow(ctx, ix, &len);
+        if (!b) continue;
+        blobs[seq] = b; lens[seq + 1] = (uint32_t)len; seq++;
+    }
+    lens[0] = (uint32_t)seq;
+    qjs_idb_put(((uint64_t)bh << 32) | 0xFFFFFFFFu, (const uint8_t *)lens, (int)((size_t)(seq + 1) * 4));   /* marker: count + per-flow lens */
+    for (int s = 0; s < seq; s++) { qjs_idb_put(((uint64_t)bh << 32) | (uint32_t)s, blobs[s], (int)lens[s + 1]); js_free(ctx, blobs[s]); }
+    js_free(ctx, blobs); js_free(ctx, lens);
+    return seq;
+}
+QJS_JSEXPORT int qjs_drive_reload_session(JSContext *ctx) {
+    uint32_t bh = g_bundle_hash; if (!bh) return 0;
+    uint32_t cnt = 0; int got = qjs_idb_get(((uint64_t)bh << 32) | 0xFFFFFFFFu, (uint8_t *)&cnt, 4);
+    if (got < 4 || cnt == 0 || cnt > 1000000) return 0;
+    uint32_t *lens = (uint32_t *)js_malloc(ctx, (size_t)(cnt + 1) * 4); if (!lens) return 0;
+    qjs_idb_get(((uint64_t)bh << 32) | 0xFFFFFFFFu, (uint8_t *)lens, (int)((size_t)(cnt + 1) * 4));   /* full marker */
+    int loaded = 0;
+    for (uint32_t s = 0; s < cnt; s++) {
+        uint32_t blen = lens[s + 1]; uint8_t *buf = (uint8_t *)js_malloc(ctx, blen ? blen : 1);
+        if (!buf) break;
+        int g = qjs_idb_get(((uint64_t)bh << 32) | s, buf, (int)blen);
+        if (g == (int)blen && qjs_drive_reload_flow(ctx, buf, blen) >= 0) loaded++;
+        js_free(ctx, buf);
+    }
+    js_free(ctx, lens);
+    return loaded;
+}
 /* ===== #5 eviction-to-IDB POLICY (engine-internal, JSPI-suspending) ================================
    The JSPI IDB bridge (qjsmain.c). The policy runs after a re-park (RAM only grows then): while the
    non-evicted parked stacks exceed the platform RAM FLOOR, evict the COLDEST flow (lowest mark = the
@@ -63618,7 +63770,7 @@ QJS_JSEXPORT int qjs_drive_restore(JSContext *ctx, int ix) {
 extern int qjs_idb_put(uint64_t key, const uint8_t *data, int len);
 extern int qjs_idb_get(uint64_t key, uint8_t *out, int maxlen);
 static uint64_t g_evic_seq = 1;
-static size_t g_evic_floor = (size_t)128 * 1024 * 1024;   /* parked-stack RAM high-water = the platform floor */
+static size_t g_evic_floor = (size_t)16 * 1024 * 1024;   /* parked-stack RAM high-water: aggressive -> the cold WFQ tail evicts to the DISK floor early, RAM stays the hot working set (UNBOUNDED-until-disk) */
 static size_t qjs_drive_parked_ram(void) {
     size_t total = 0;
     for (int i = 0; i < qjs_drive_n; i++) {
@@ -63630,10 +63782,10 @@ static size_t qjs_drive_parked_ram(void) {
 }
 static void qjs_drive_evict_pressure(JSContext *ctx) {
     while (qjs_drive_parked_ram() > g_evic_floor) {
-        int best = -1; unsigned best_mark = 0;
+        int best = -1; unsigned best_val = 0;
         for (int i = 0; i < qjs_drive_n; i++) {
             if (qjs_drive_flow[i].evic_len) continue;
-            if (best < 0 || qjs_drive_mark[i] < best_mark) { best = i; best_mark = qjs_drive_mark[i]; }   /* coldest = lowest mark */
+            if (best < 0 || qjs_drive_flow[i].value < best_val) { best = i; best_val = qjs_drive_flow[i].value; }   /* lowest emitted-output value = the WFQ tail (one metric for resume-order AND eviction) */
         }
         if (best < 0) break;   /* only the hot working set remains — can't reduce below it */
         size_t len = 0;
@@ -63676,7 +63828,17 @@ QJS_JSEXPORT void qjs_drive_repick(JSContext *ctx) {
     int pn = qjs_drive_n;
     JSFlow *pf = qjs_drive_flow; JSCowDelta *pc = qjs_drive_cow; unsigned *pm = qjs_drive_mark;
     qjs_drive_flow = NULL; qjs_drive_cow = NULL; qjs_drive_mark = NULL; qjs_drive_n = 0; qjs_drive_cap = 0;
-    for (int i = 0; i < pn; i++) {
+    /* WFQ value-of-information ordering: resume highest-emitted-output flows first (insertion sort by
+       value, descending; pn is small). The ONE scheduler reads emitted output to order resume — never
+       a RAM gate or a static guess. Nothing is dropped (every flow still resumes this pass); ordering
+       only sets WHICH runs first, so the productive frontier advances before the starved tail. */
+    int *order = js_malloc(ctx, (size_t)pn * sizeof(int));
+    if (order) {
+        for (int k = 0; k < pn; k++) order[k] = k;
+        for (int a = 1; a < pn; a++) { int t = order[a], b = a - 1; while (b >= 0 && pf[order[b]].value < pf[t].value) { order[b + 1] = order[b]; b--; } order[b + 1] = t; }
+    }
+    for (int k = 0; k < pn; k++) {
+        int i = order ? order[k] : k;
         int just_restored = 0;
         if (pf[i].evic_len) {   /* #5 EVICTED (stack in IDB) — fetch it back into fresh chunks so the WFQ can resume it */
             uint8_t *buf = js_malloc(ctx, pf[i].evic_len);
@@ -63694,7 +63856,8 @@ QJS_JSEXPORT void qjs_drive_repick(JSContext *ctx) {
         }
         if (!just_restored) qjs_drive_relocate(ctx, &pf[i]);   /* #5 eviction round-trip: relocate this parked flow's stack chunks to fresh addresses (a just-restored flow already has fresh chunks) — exercises the chunk-internal pointer fixup */
         if (g_cow_enabled) {
-            qjs_cow_apply(qjs_cow_heap_base(), &pc[i]);   /* the one park primitive: word-log (field pointers -> new) + vt + buffer/shape trails — the full inverse of qjs_cow_capture */
+            if (pf[i].cross_session) qjs_cow_apply_xsession(qjs_cow_heap_base(), &pc[i]);   /* #5 reloaded in a NEW session: re-establish the heap via the word-log (no in-session dups) — heap is at baseline here, the precondition apply_xsession needs */
+            else qjs_cow_apply(qjs_cow_heap_base(), &pc[i]);   /* the one park primitive: word-log (field pointers -> new) + vt + buffer/shape trails — the full inverse of qjs_cow_capture */
             qjs_cow_delta_free(rt, &pc[i]);
         }
         qjs_flow_restore(ctx, &pf[i]);
@@ -63703,6 +63866,7 @@ QJS_JSEXPORT void qjs_drive_repick(JSContext *ctx) {
         if (!parked && g_cow_enabled) qjs_cow_discard(qjs_cow_heap_base());
     }
     qjs_drive_evict_pressure(ctx);   /* #5 after the re-parks: evict the cold tail to IDB if parked-stack RAM is over the floor */
+    if (order) js_free(ctx, order);
     js_free(ctx, pf); js_free(ctx, pc); js_free(ctx, pm);
 }
 /* The deep-grind interrupt handler (op-counted via js_poll_interrupts, so it

@@ -1026,14 +1026,31 @@ int main(int argc, char **argv) {
        on g_boot_ctx — the host restores the memory image between drives.
        --fe-boot-end frees it. */
     {
-        int do_boot = 0, do_boot_end = 0, do_drive = 0;
+        int do_boot = 0, do_boot_end = 0, do_drive = 0, do_persist = 0, do_reload = 0;
         const char *drive_sched = "", *drive_trace = NULL, *boot_sched = "";
         for (int i = 1; i < argc; i++) {
             if (!strcmp(argv[i], "--fe-boot")) do_boot = 1;
             else if (!strcmp(argv[i], "--fe-boot-end")) do_boot_end = 1;
+            else if (!strcmp(argv[i], "--fe-persist")) do_persist = 1;   /* #5 cross-session: serialize the parked frontier to IDB (keyed by the host-set bundle hash) before the session ends */
+            else if (!strcmp(argv[i], "--fe-reload")) do_reload = 1;     /* #5 cross-session: re-inject this bundle-hash's persisted frontier from IDB. EXPLICIT (host-triggered after boot), NOT on the boot path -> a normal boot/drive is untouched. */
             else if (!strncmp(argv[i], "--fe-drive=", 11)) { do_drive = 1; drive_sched = argv[i] + 11; }
             else if (!strncmp(argv[i], "--fe-sched=", 11)) boot_sched = argv[i] + 11;
             else if (!strncmp(argv[i], "--fe-trace=", 11)) drive_trace = argv[i] + 11;
+            else if (!strncmp(argv[i], "--fe-bundle-hash=", 17)) { extern void qjs_set_bundle_hash(uint32_t); qjs_set_bundle_hash((uint32_t)strtoul(argv[i] + 17, NULL, 10)); }   /* #5 cross-session: the host's content hash of this bundle -> the IDB frontier key (a changed bundle gets a new key, never resumes stale state). Global persists across same-instance callMains (boot sets it; persist/drive read it). */
+        }
+        if (do_persist) {
+            if (!g_boot_ctx) { printf("@E {\"phase\":\"persist_no_boot\"}\n"); fflush(stdout); return 1; }
+            extern int qjs_drive_persist_session(JSContext *);
+            int _n = qjs_drive_persist_session(g_boot_ctx);
+            printf("@WHY {\"phase\":\"xsession_persist\",\"flows\":%d}\n", _n); fflush(stdout);
+            return 0;
+        }
+        if (do_reload) {
+            if (!g_boot_ctx) { printf("@E {\"phase\":\"reload_no_boot\"}\n"); fflush(stdout); return 1; }
+            extern int qjs_drive_reload_session(JSContext *);
+            int _rl = qjs_drive_reload_session(g_boot_ctx);
+            printf("@WHY {\"phase\":\"xsession_reload\",\"flows\":%d}\n", _rl); fflush(stdout);
+            return 0;
         }
         if (do_boot_end) {
             if (g_boot_ctx) {
@@ -1131,6 +1148,8 @@ int main(int argc, char **argv) {
                 js_std_loop(g_boot_ctx);                    /* final settle (timers/os) at driving=0 */
             }
             { extern void qjs_cow_boot_baseline(JSRuntime *); qjs_cow_boot_baseline(JS_GetRuntime(g_boot_ctx)); }   /* COW-as-snapshot: the post-boot heap is the base every DRIVE forks from */
+            { extern int qjs_drive_reload_session(JSContext *); int _rl = qjs_drive_reload_session(g_boot_ctx);   /* #5 cross-session: AUTO re-inject this bundle-hash's persisted frontier at boot so exploration resumes across browser restarts (unbounded-across-sessions). */
+              if (_rl > 0) { printf("@WHY {\"phase\":\"xsession_reload\",\"flows\":%d}\n", _rl); fflush(stdout); } }
             return rc;
         }
         if (do_drive) {
