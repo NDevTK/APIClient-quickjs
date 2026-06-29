@@ -20501,6 +20501,8 @@ typedef struct JSFlow {
     struct JSStackFrame *current_stack_frame;  /* this flow's frame chain */
     struct JSStackFrame *qjs_yield_entry;  /* this flow's resume-entry boundary (the YIELD_POLL entry_frame). MUST be per-flow: it is a single rt field that the NEXT flow's yield overwrites, so a cross-flow pause/resume would resume on the wrong dispatch boundary -> corruption. */
     int flow_depth;                     /* #7: this flow's FLOWBEG/FLOWEND nesting depth — per-flow like the heap stack, else an interleaved suspend/resume (i1 yields at fetch, i2 runs, i1 resumes) shares one global g_flow_depth so FLOWENDs revert at the wrong moment and a sibling's shared-cell write leaks (shared_state i2-n-2). Saved on yield, restored on resume; a fresh flow's handle is zero -> depth 0. */
+    uint8_t *evic_blob;                 /* #5 eviction: non-NULL while this flow's serialized-stack blob is held in wasm RAM during the host<->IDB handoff (set by qjs_drive_evict / qjs_drive_restore_buf). NULL = blob not resident here (live, or already copied to IDB). */
+    size_t   evic_len;                  /* != 0 marks the flow EVICTED (stack chunks freed, bytes in IDB) until qjs_drive_restore rebuilds them; 0 = live in RAM. */
 } JSFlow;
 
 void qjs_flow_save(JSContext *ctx, JSFlow *f) {
@@ -20508,6 +20510,7 @@ void qjs_flow_save(JSContext *ctx, JSFlow *f) {
     f->current_stack_frame = ctx->rt->current_stack_frame;
     f->qjs_yield_entry = ctx->rt->qjs_yield_entry;
     f->flow_depth = g_flow_depth;       /* save THIS flow's nesting so the incoming flow's restore doesn't inherit it */
+    f->evic_blob = NULL; f->evic_len = 0;   /* a freshly-saved flow is RAM-resident, never evicted */
 }
 void qjs_flow_restore(JSContext *ctx, JSFlow *f) {
     ctx->rt->js_stack = f->js_stack;
@@ -63378,6 +63381,7 @@ static int qjs_drive_park_grow(JSContext *ctx) {
     JSFlow *nf = js_realloc(ctx, qjs_drive_flow, (size_t)nc * sizeof(JSFlow)); if (!nf) return 0; qjs_drive_flow = nf;
     JSCowDelta *nd = js_realloc(ctx, qjs_drive_cow, (size_t)nc * sizeof(JSCowDelta)); if (!nd) return 0; qjs_drive_cow = nd;
     unsigned *nm = js_realloc(ctx, qjs_drive_mark, (size_t)nc * sizeof(unsigned)); if (!nm) return 0; qjs_drive_mark = nm;
+    memset(qjs_drive_flow + qjs_drive_cap, 0, (size_t)(nc - qjs_drive_cap) * sizeof(JSFlow));   /* new slots zero -> evic_blob NULL / evic_len 0 (live) for park sites that assign fields directly */
     qjs_drive_cap = nc; return 1;
 }
 /* PARK a re-entrant forced sub-flow (qjs_run_forced_flow) into the SAME WFQ registry the grind uses,
@@ -63530,7 +63534,7 @@ static void qjs_drive_fixup(JSFlow *f, JSChunkMap *map, int nc) {
    chain's OLD base addresses + capacities + raw bytes. Frees the live chunks (eviction). Returns the
    blob (caller frees / hands to IDB) or NULL. The flow handle's pointers stay as the OLD addresses;
    deserialize rebuilds the map and fixes them. */
-static __maybe_unused uint8_t *qjs_drive_serialize(JSContext *ctx, JSFlow *f, size_t *plen) {
+static uint8_t *qjs_drive_serialize(JSContext *ctx, JSFlow *f, size_t *plen) {
     JSRuntime *rt = ctx->rt;
     int nc = 0; for (JSStackChunk *c = f->js_stack; c; c = c->prev) nc++;
     size_t len = sizeof(int);
@@ -63550,7 +63554,7 @@ static __maybe_unused uint8_t *qjs_drive_serialize(JSContext *ctx, JSFlow *f, si
     *plen = len; return blob;
 }
 /* DESERIALIZE: rebuild the chunk chain from the blob into fresh chunks, fix up the flow's pointers. */
-static __maybe_unused int qjs_drive_deserialize(JSContext *ctx, JSFlow *f, const uint8_t *blob, size_t len) {
+static int qjs_drive_deserialize(JSContext *ctx, JSFlow *f, const uint8_t *blob, size_t len) {
     JSRuntime *rt = ctx->rt; (void)len;
     const uint8_t *r = blob; int nc = 0; memcpy(&nc, r, sizeof(int)); r += sizeof(int);
     if (nc <= 0) return 0;
@@ -63566,6 +63570,43 @@ static __maybe_unused int qjs_drive_deserialize(JSContext *ctx, JSFlow *f, const
     qjs_drive_fixup(f, map, nc);
     js_free(ctx, map);
     return 0;
+}
+/* ===== #5 eviction-to-IDB: host-callable evict/restore of a parked flow's stack ====================
+   The drive is engine-internal, so the host can't address individual flows mid-drive; these exports are
+   driven by the engine's own RAM-pressure policy via JSPI-suspending IDB imports (the safeFetch async
+   mechanism). serialize/deserialize handle the STACK chunks (a deep flow's bulk RAM); the COW delta
+   stays pool-resident. A flow with evic_len != 0 is EVICTED (chunks freed, bytes in IDB) and MUST be
+   restored (qjs_drive_restore) before qjs_drive_repick resumes it. */
+QJS_JSEXPORT uint8_t *qjs_drive_evict(JSContext *ctx, int ix, size_t *plen) {
+    if (ix < 0 || ix >= qjs_drive_n || qjs_drive_flow[ix].evic_len) return NULL;   /* OOB or already evicted */
+    uint8_t *b = qjs_drive_serialize(ctx, &qjs_drive_flow[ix], plen);              /* serialize the stack + FREE the RAM chunks */
+    if (!b) return NULL;
+    qjs_drive_flow[ix].evic_blob = b; qjs_drive_flow[ix].evic_len = *plen;          /* held in RAM for the host to copy to IDB */
+    return b;
+}
+/* The host copied the blob (HEAPU8[ptr..ptr+evic_len]) into IDB — free the wasm RAM copy (the actual
+   relief). The flow stays evicted (evic_len kept) until restored; only the redundant in-RAM blob goes. */
+QJS_JSEXPORT void qjs_drive_evict_done(JSContext *ctx, int ix) {
+    if (ix < 0 || ix >= qjs_drive_n || !qjs_drive_flow[ix].evic_blob) return;
+    js_free(ctx, qjs_drive_flow[ix].evic_blob);
+    qjs_drive_flow[ix].evic_blob = NULL;   /* evic_len kept -> still evicted, bytes only in IDB */
+}
+/* Resume prep: allocate a buffer (length = the stored evic_len) for the host to write flow ix's IDB
+   bytes back into. Returns the ptr; the host fills HEAPU8[ptr..ptr+len], then calls qjs_drive_restore. */
+QJS_JSEXPORT uint8_t *qjs_drive_restore_buf(JSContext *ctx, int ix, size_t len) {
+    if (ix < 0 || ix >= qjs_drive_n || !qjs_drive_flow[ix].evic_len) return NULL;   /* not evicted */
+    uint8_t *b = js_malloc(ctx, len ? len : 1); if (!b) return NULL;
+    qjs_drive_flow[ix].evic_blob = b;   /* evic_len already holds the length */
+    return b;
+}
+/* The host wrote the IDB bytes into the buffer — deserialize the stack into fresh chunks, fix up the
+   flow's pointers, mark it live (evic_len 0). Returns 0 on success. */
+QJS_JSEXPORT int qjs_drive_restore(JSContext *ctx, int ix) {
+    if (ix < 0 || ix >= qjs_drive_n || !qjs_drive_flow[ix].evic_blob) return -1;
+    int r = qjs_drive_deserialize(ctx, &qjs_drive_flow[ix], qjs_drive_flow[ix].evic_blob, qjs_drive_flow[ix].evic_len);
+    js_free(ctx, qjs_drive_flow[ix].evic_blob);
+    qjs_drive_flow[ix].evic_blob = NULL; qjs_drive_flow[ix].evic_len = 0;   /* live in RAM again */
+    return r;
 }
 /* RAM->RAM relocation (cheap, per-chunk — no contiguous blob): exercised on every resume to keep the
    pointer fixup continuously verified WITHOUT the deep-stack blowup that an unconditional contiguous
@@ -63595,6 +63636,10 @@ QJS_JSEXPORT void qjs_drive_repick(JSContext *ctx) {
     JSFlow *pf = qjs_drive_flow; JSCowDelta *pc = qjs_drive_cow; unsigned *pm = qjs_drive_mark;
     qjs_drive_flow = NULL; qjs_drive_cow = NULL; qjs_drive_mark = NULL; qjs_drive_n = 0; qjs_drive_cap = 0;
     for (int i = 0; i < pn; i++) {
+        if (pf[i].evic_len) {   /* #5 still EVICTED (stack in IDB, chunks freed) — keep it parked, never relocate/run a freed stack; the host restores it (qjs_drive_restore) when the WFQ picks it to resume */
+            if (qjs_drive_park_grow(ctx)) { int ix = qjs_drive_n++; qjs_drive_flow[ix] = pf[i]; qjs_drive_cow[ix] = pc[i]; qjs_drive_mark[ix] = pm[i]; }
+            continue;   /* COW delta (pool-resident) + handle preserved via the struct move; pc[i]'s internal arrays stay valid after js_free(pc) */
+        }
         qjs_drive_relocate(ctx, &pf[i]);   /* #5 eviction round-trip: relocate this parked flow's stack chunks to fresh addresses (in-session, COW heap persists) before resuming — exercises the chunk-internal pointer fixup */
         if (g_cow_enabled) {
             qjs_cow_apply(qjs_cow_heap_base(), &pc[i]);   /* the one park primitive: word-log (field pointers -> new) + vt + buffer/shape trails — the full inverse of qjs_cow_capture */
