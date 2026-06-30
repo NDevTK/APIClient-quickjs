@@ -4024,6 +4024,8 @@ static no_inline void *arena_calloc_large(JSRuntime *rt, size_t size)
     return b->user_data;
 }
 
+static int flow_in_arena(const void *ptr);   /* fwd (def ~4773): #7 flow-arena membership — js_arena_malloc/free route flow allocs to the flow arena */
+
 static void *js_arena_malloc(JSRuntime *rt, size_t size)
 {
     size_t total_size;
@@ -4043,7 +4045,15 @@ static void *js_arena_malloc(JSRuntime *rt, size_t size)
         block_size = arena_block_sizes[block_size_idx];
         head = &rt->arena_state.free_arena_list[block_size_idx];
         el = head->next;
-        if (unlikely(el == head)) {
+        /* #arena COW: during a forced flow, a NEW object must NOT land in a BASELINE arena — its block
+           header (ref_count at p-8) would be written in the byte-reverted heap, and the FLOWEND revert
+           would corrupt it (shape underflow / arena double-free, drive=0). Force a flow-arena-backed
+           arena_new (arena_new -> rt->mf.js_malloc = js_def_malloc -> g_flow_arena, which is EXCLUDED from
+           the COW barrier + bump-reset at FLOWEND); the free_arena_list ADD lives in the baseline heap so
+           it byte-reverts cleanly (no dangling). Only REUSE an arena that is itself flow-arena-backed. */
+        if (unlikely(el == head) ||
+            ((g_flow_capture || g_grind_drive_active) &&
+             !flow_in_arena(list_entry(el, JSArena, free_link)))) {
             ar = arena_new(rt, block_size_idx);
             if (!ar)
                 return NULL;
@@ -4069,13 +4079,13 @@ static void js_arena_free(JSRuntime *rt, void *ptr)
 
     if (!ptr)
         return;
-    /* #5/#7 COW: NO-OP during a forced flow — never mutate the arena's block free-list while the COW
-       word-log is capturing. The block-header word packs allocator metadata (block_idx/free_next, low
-       bytes) AND the GC ref_count (high bytes, COW-tracked); a real arena-free here writes the allocator
-       bytes mid-flow, and the word-granular revert of the refcount then clobbers the free-list (observed:
-       js_free_shape0 `JS_REF_COUNT(sh)==0` abort, drive=0). Mirror __wrap_free: the block SURVIVES, the
-       revert restores references to it; it is reclaimed after the flow when capture is off. */
-    if (g_flow_capture || g_grind_drive_active)
+    /* #5/#7 COW: NO-OP during a forced flow, and ALWAYS for a flow-arena block. Mirror __wrap_free:
+       (a) flow-arena blocks (flow_in_arena) are bump-reset at FLOWEND, never individually freed; (b) a
+       BASELINE block freed during a flow must SURVIVE (the revert restores references to it) and the
+       arena free-list must not be mutated mid-flow. Flow-CREATED objects now live in flow-arena-backed
+       arenas (see js_arena_malloc), so the byte-restore + defer-trail only ever touch baseline objects —
+       the inline-layout invariant — and no js_free_shape change is needed. */
+    if (g_flow_capture || g_grind_drive_active || flow_in_arena(ptr))
         return;
     b = container_of(ptr, JSMallocBlockHeader, user_data);
     if (unlikely(b->u.block_idx == JS_ARENA_FREE_NIL)) {
