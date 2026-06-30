@@ -21435,6 +21435,29 @@ QJS_JSEXPORT void qjs_cow_undo_log(size_t addr, size_t size) {
         qjs_cow_shadow[w >> 3] |= (uint8_t)(1u << (w & 7));
     }
 }
+/* SINGLE-OWNER REFCOUNT: is `addr` an arena block-START word — a JSMallocBlockHeader whose high 4
+   bytes are an object's ref_count (the int at header offset 4)? Sound (no false positives): only a true
+   block start matches an arena's block stride. The word log must NOT byte-revert that ref_count: a
+   baseline object's refcount is reconstructed by the refcount-EXACT typed trail (cow_set_slot /
+   cow_put_var_ref) plus the balanced incref/decref of live execution, so reverting it as raw bytes
+   CLOBBERED the count the typed trail had set -> the cycle collector decref'd past 0 (gc_decref_child
+   underflow, MEASURED: word-log restored rc=1 while the object had 2 live in-edges). The low 4 bytes
+   (block_idx/block_size_idx/gc_type/mark) ARE restored — constant post-alloc (frees are flow-suppressed)
+   or GC-transient (mark, re-derived each collection). */
+static int cow_is_header_word(JSRuntime *rt, size_t addr) {
+    if (!rt) return 0;
+    for (int si = 0; si < JS_ARENA_BLOCK_SIZE_COUNT; si++) {
+        size_t bs = arena_block_sizes[si];
+        if (!bs) continue;
+        struct list_head *el;
+        list_for_each(el, &rt->arena_state.arena_list[si]) {
+            JSArena *ar = list_entry(el, JSArena, link);
+            size_t base = (size_t)ar->blocks, end = base + (size_t)ar->n_blocks * bs;
+            if (addr >= base && addr < end) return ((addr - base) % bs == 0);
+        }
+    }
+    return 0;
+}
 /* Revert a flow SEGMENT to its mark: restore every word logged AFTER `mark` to its pre-flow
    value (in REVERSE), clear its shadow bit, truncate the log to `mark`. Reverting to a mark
    (not always 0) is what makes flows NEST and the BFS arms SIBLING-isolate: each arm/flow owns
@@ -21448,7 +21471,18 @@ QJS_JSEXPORT void qjs_cow_undo_revert_to(size_t mark) {
     for (i = qjs_cow_undo_n; i > mark; ) {
         i--;
         uint64_t w = qjs_cow_undo[i].widx;
-        *(uint64_t *)(hb + (w << 3)) = qjs_cow_undo[i].old;
+        size_t addr = hb + (w << 3);
+        if (cow_is_header_word(g_cow_rt, addr) && JS_GC_TYPE((void *)(addr + 8)) != JS_GC_OBJ_TYPE_SHAPE) {
+            /* SINGLE-OWNER: preserve the live ref_count (high 4B); restore block metadata (low 4B).
+               EXCLUDE shapes: a shape's ref_count is owned by the word log (every js_dup_shape/
+               js_free_shape is a direct untyped write; the defer trail reverts only the p->shape
+               POINTER), so it must byte-revert. Objects/functions/strings are JSValue-referenced and
+               their refcount is owned by the typed trail + balanced live execution. */
+            uint64_t cur = *(uint64_t *)addr;
+            *(uint64_t *)addr = (cur & 0xFFFFFFFF00000000ULL) | (qjs_cow_undo[i].old & 0x00000000FFFFFFFFULL);
+        } else {
+            *(uint64_t *)addr = qjs_cow_undo[i].old;
+        }
         qjs_cow_shadow[w >> 3] &= (uint8_t)~(1u << (w & 7));
     }
     qjs_cow_undo_n = mark;
