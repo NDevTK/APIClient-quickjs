@@ -595,6 +595,14 @@ static inline double uint64_as_float64(uint64_t u64)
     return u.d;
 }
 
+/* #5 cross-session determinism: a deterministic monotonic clock replaces real wall-clock for
+   quickjs's time primitives. Real time is pure entropy in an always-forced-exec analysis engine —
+   it breaks the byte-identical re-boot that cross-session resume replays an (address,word) delta
+   against. Timers need only monotonic ORDER, which the counter gives. Defined once in quickjs.c;
+   default ON (qjs_det_time=1) so it is independent of qjs_forced_config's late init ordering. */
+extern uint64_t qjs_det_time_ns;
+extern int qjs_det_time;
+
 static inline int64_t js__gettimeofday_us(void);
 static inline uint64_t js__hrtime_ns(void);
 
@@ -1561,6 +1569,7 @@ static int gettimeofday_msvc(struct timeval *tp)
 }
 
 static inline uint64_t js__hrtime_ns(void) {
+    if (qjs_det_time) { qjs_det_time_ns += 1000000; return qjs_det_time_ns; }   /* #5 deterministic monotonic clock */
     LARGE_INTEGER counter, frequency;
     double scaled_freq;
     double result;
@@ -1583,6 +1592,7 @@ static inline uint64_t js__hrtime_ns(void) {
 }
 #else
 static inline uint64_t js__hrtime_ns(void) {
+  if (qjs_det_time) { qjs_det_time_ns += 1000000; return qjs_det_time_ns; }   /* #5 deterministic monotonic clock */
 #ifdef __DJGPP
   struct timeval tv;
   if (gettimeofday(&tv, NULL))
@@ -1600,6 +1610,7 @@ static inline uint64_t js__hrtime_ns(void) {
 #endif
 
 static inline int64_t js__gettimeofday_us(void) {
+    if (qjs_det_time) { qjs_det_time_ns += 1000000; return (int64_t)(qjs_det_time_ns / 1000); }   /* #5 deterministic monotonic clock */
     struct timeval tv;
 #ifdef _WIN32
     gettimeofday_msvc(&tv);

@@ -21298,6 +21298,7 @@ static int g_cow_boot_mode = 0;
 /* do_boot END (qjsmain), BEFORE the host would image: the post-boot heap is the base every
    DRIVE forks from. Re-baselines each boot (a boot-frontier re-boot is a distinct post-boot
    state; the LAST boot before the drives wins). Pool persists (allocated once). */
+static uint64_t g_boot_heap_hash = 0;   /* #5 cross-session: FNV-1a of the post-boot baseline heap (determinism guard for resume) */
 QJS_JSEXPORT void qjs_cow_boot_baseline(JSRuntime *rt) {
     if (!g_cow_enabled) return;
     g_cow_boot_mode = 1;
@@ -21317,8 +21318,21 @@ QJS_JSEXPORT void qjs_cow_boot_baseline(JSRuntime *rt) {
        baseline reaches the force-invoke drives BEFORE pool_warm runs, so seed it now. */
     if (!qjs_cow_undo_cap) qjs_cow_undo_grow();
     qjs_cow_undo_n = 0;
-    printf("@WHY {\"phase\":\"cow_boot_baseline\",\"undolog\":1,\"heapMB\":%zu,\"shadowKB\":%zu}\n",
-           qjs_cow_heap_len() / (size_t)1048576, (qjs_cow_words / 8) / (size_t)1024);
+    /* #5 cross-session determinism guard: hash the post-boot baseline heap. Cross-session resume
+       replays an (address,word) delta against THIS baseline, so it is only valid if a re-boot of the
+       same bundle reproduces a byte-identical heap. reload_session compares this hash and REFUSES on
+       mismatch (a non-deterministic re-boot) instead of applying a delta to an incompatible baseline. */
+    size_t boot_heap_bytes = qjs_cow_heap_len();
+    { uint64_t h = 1469598103934665603ULL; const uint64_t *hw = (const uint64_t *)(size_t)&__heap_base;
+      size_t nw = boot_heap_bytes / 8;
+      for (size_t k = 0; k < nw; k++) { h ^= hw[k]; h *= 1099511628211ULL; }
+      g_boot_heap_hash = h; }
+    /* bootHash is the standing determinism guard: reload_session refuses cross-session resume on a
+       mismatch (a non-deterministic re-boot would corrupt the address-delta replay). Verified
+       byte-reproducible across two boots after closing the three entropy layers (PRNG seed, quickjs
+       wall-clock, emscripten _emscripten_date_now / WASMFS file timestamps). */
+    printf("@WHY {\"phase\":\"cow_boot_baseline\",\"undolog\":1,\"heapMB\":%zu,\"bootHash\":%llu}\n",
+           boot_heap_bytes / (size_t)1048576, (unsigned long long)g_boot_heap_hash);
     fflush(stdout);
 }
 /* do_drive START (qjsmain): revert the PREVIOUS drive's mutations to the boot baseline
@@ -54010,12 +54024,27 @@ static uint64_t xorshift64star(uint64_t *pstate)
     return x * 0x2545F4914F6CDD1D;
 }
 
+/* #5 cross-session determinism: the deterministic monotonic clock backing js__hrtime_ns /
+   js__gettimeofday_us (declared extern in cutils.h). Real wall-clock is pure entropy in an
+   always-forced-exec analysis engine — it breaks the byte-identical re-boot that cross-session
+   resume replays an (address,word) delta against. Both primitives advance this ONE counter, so
+   time is globally monotonic AND reproducible across boots. Default ON (no dependency on
+   qjs_forced_config's late init); set 0 only for a genuine real-time native build. */
+uint64_t qjs_det_time_ns = 1000000000ULL;
+int qjs_det_time = 1;
+
 static void js_random_init(JSContext *ctx)
 {
-    ctx->random_state = js__gettimeofday_us();
-    /* the state must be non zero */
-    if (ctx->random_state == 0)
-        ctx->random_state = 1;
+    /* #5 cross-session determinism: seed DETERMINISTICALLY, not from real wall-clock. Under forced
+       execution (this fork's only mode) js_math_random returns qjs_synth_new and never reads
+       random_state, so a gettimeofday seed is pure entropy injected into the post-boot baseline heap.
+       Measured: it made two boots of the same bundle hash differently (rtAddr/heapBytes/nzWords were
+       byte-identical — only VALUES differed), which breaks cross-session resume (it replays an
+       (address,word) delta against a baseline that must be reproducible). Seeding here (at every
+       JS_NewContext, for every runtime) is complete and ordering-independent; a fixed seed is harmless
+       (dead under FE; natively it only de-randomizes Math.random, which the analysis engine wants
+       reproducible anyway). */
+    ctx->random_state = 0x2545F4914F6CDD1DULL;
 }
 
 static JSValue js_math_random(JSContext *ctx, JSValueConst this_val,
@@ -63739,6 +63768,7 @@ QJS_JSEXPORT int qjs_drive_persist_session(JSContext *ctx) {
         blobs[seq] = b; lens[seq + 1] = (uint32_t)len; seq++;
     }
     lens[0] = (uint32_t)seq;
+    qjs_idb_put(((uint64_t)bh << 32) | 0xFFFFFFFEu, (const uint8_t *)&g_boot_heap_hash, 8);   /* #5 determinism guard: the baseline hash this frontier's (address,word) deltas replay against */
     qjs_idb_put(((uint64_t)bh << 32) | 0xFFFFFFFFu, (const uint8_t *)lens, (int)((size_t)(seq + 1) * 4));   /* marker: count + per-flow lens */
     for (int s = 0; s < seq; s++) { qjs_idb_put(((uint64_t)bh << 32) | (uint32_t)s, blobs[s], (int)lens[s + 1]); js_free(ctx, blobs[s]); }
     js_free(ctx, blobs); js_free(ctx, lens);
@@ -63746,6 +63776,8 @@ QJS_JSEXPORT int qjs_drive_persist_session(JSContext *ctx) {
 }
 QJS_JSEXPORT int qjs_drive_reload_session(JSContext *ctx) {
     uint32_t bh = g_bundle_hash; if (!bh) return 0;
+    uint64_t saved = 0; int gh = qjs_idb_get(((uint64_t)bh << 32) | 0xFFFFFFFEu, (uint8_t *)&saved, 8);
+    if (gh == 8 && saved != g_boot_heap_hash) { printf("@WHY {\"phase\":\"xsession_boot_mismatch\"}\n"); fflush(stdout); return 0; }   /* #5 the re-boot was not byte-identical -> the persisted deltas' addresses are invalid -> REFUSE resume rather than corrupt */
     uint32_t cnt = 0; int got = qjs_idb_get(((uint64_t)bh << 32) | 0xFFFFFFFFu, (uint8_t *)&cnt, 4);
     if (got < 4 || cnt == 0 || cnt > 1000000) return 0;
     uint32_t *lens = (uint32_t *)js_malloc(ctx, (size_t)(cnt + 1) * 4); if (!lens) return 0;
