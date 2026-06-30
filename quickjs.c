@@ -21473,13 +21473,13 @@ QJS_JSEXPORT void qjs_cow_undo_revert_to(size_t mark) {
         uint64_t w = qjs_cow_undo[i].widx;
         size_t addr = hb + (w << 3);
         if (cow_is_header_word(g_cow_rt, addr) && JS_GC_TYPE((void *)(addr + 8)) != JS_GC_OBJ_TYPE_SHAPE) {
-            /* SINGLE-OWNER: preserve the live ref_count (high 4B); restore block metadata (low 4B).
-               EXCLUDE shapes: a shape's ref_count is owned by the word log (every js_dup_shape/
-               js_free_shape is a direct untyped write; the defer trail reverts only the p->shape
-               POINTER), so it must byte-revert. Objects/functions/strings are JSValue-referenced and
-               their refcount is owned by the typed trail + balanced live execution. */
-            uint64_t cur = *(uint64_t *)addr;
-            *(uint64_t *)addr = (cur & 0xFFFFFFFF00000000ULL) | (qjs_cow_undo[i].old & 0x00000000FFFFFFFFULL);
+            /* SINGLE-OWNER: preserve the ENTIRE live header word (no write). High 4B = ref_count (owned
+               by the typed trail + balanced live execution); low 4B = block metadata (block_idx/
+               block_size_idx/gc_obj_type — constant post-alloc since frees are flow-suppressed) and the
+               GC mark (transient, re-derived each collection). NONE needs byte-reverting, and restoring
+               the low bytes would risk clobbering a live object's gc_obj_type/mark. EXCLUDE shapes: a
+               shape's ref_count is word-log-owned (every js_dup_shape/js_free_shape is a direct untyped
+               write; the defer trail reverts only the p->shape POINTER), so its header MUST byte-revert. */
         } else {
             *(uint64_t *)addr = qjs_cow_undo[i].old;
         }
