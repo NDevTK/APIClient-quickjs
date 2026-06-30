@@ -4069,6 +4069,14 @@ static void js_arena_free(JSRuntime *rt, void *ptr)
 
     if (!ptr)
         return;
+    /* #5/#7 COW: NO-OP during a forced flow — never mutate the arena's block free-list while the COW
+       word-log is capturing. The block-header word packs allocator metadata (block_idx/free_next, low
+       bytes) AND the GC ref_count (high bytes, COW-tracked); a real arena-free here writes the allocator
+       bytes mid-flow, and the word-granular revert of the refcount then clobbers the free-list (observed:
+       js_free_shape0 `JS_REF_COUNT(sh)==0` abort, drive=0). Mirror __wrap_free: the block SURVIVES, the
+       revert restores references to it; it is reclaimed after the flow when capture is off. */
+    if (g_flow_capture || g_grind_drive_active)
+        return;
     b = container_of(ptr, JSMallocBlockHeader, user_data);
     if (unlikely(b->u.block_idx == JS_ARENA_FREE_NIL)) {
         /* large or zero-size block */
