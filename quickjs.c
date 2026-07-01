@@ -64003,16 +64003,9 @@ static int g_bfs_drive_active = 0;    /* 1 while the BFS __hostDrive loop is dri
 static uint8_t *g_bfs_last_pc = NULL; /* back-edge pc at last poll (spin = same pc) */
 static int g_bfs_last_seen = 0;       /* qjs_fe_seen_n at last poll (spin = flat) */
 static int g_bfs_noprog = 0;          /* consecutive same-pc + flat-seen polls */
-static uint8_t *qjs_deep_deferred = NULL;     /* parallel to qjs_deep_rb: 1 = PAUSED (WFQ: skip until higher-output flows drained, then resume by output) */
-static unsigned *qjs_deep_defer_comp = NULL;  /* parallel: g_emit_n snapshot at last pause (output-priority: lower = more starved) */
-/* WFQ per-orphan PAUSED heap-stack snapshot (qjs_flow_save), parallel to qjs_deep_rb.
-   A spin-flat forced flow (g_emit_n flat over its yield window) is PAUSED here with its
-   frames intact on the heap (~0 CPU, resumable by output), never thrown/abandoned — the
-   deferred bit means "paused", and qjs_flow_restore + resume replaces the throw/re-drive/
-   abandon path. NULL js_stack = no paused flow for this orphan. */
-static JSFlow *qjs_deep_flow = NULL;
-static JSCowDelta *qjs_deep_cow = NULL;   /* COW: per-flow page delta, parallel to qjs_deep_flow (#7/#10) */
-static unsigned long long *qjs_deep_vt = NULL;   /* WFQ virtual time, parallel to qjs_deep_rb: the live-pick runs the LEAST-served orphan (min vt), advancing its vt per drive — a fair-share round-robin REPLACING the static net/sink reach-PRIORITY guess (policy: value = run output, never a static reaches-a-network-edge prediction). A firing orphan is removed from the pick via qjs_driven, so EMITTED output (firing) does the weighting; the unfired residue round-robins, never net-first-predicted. */
+/* #one-BFS: the separate per-orphan WFQ registry (qjs_deep_deferred/defer_comp/flow/cow/vt) is DELETED.
+   Orphans drive through the ONE primitive qjs_run_forced_flow into the ONE registry qjs_drive_flow,
+   preempted/parked by its quantum and drained by qjs_drive_repick — no second scheduler. */
 
 /* ===== #5/#7/#8/#9/#10 per-SCHEDULE DRIVE park registry ==========================
    The per-schedule drive loop (qjsmain.c do_drive) drives a forced-decision chain.
@@ -64604,8 +64597,6 @@ void qjs_deep_free(JSContext *ctx) {
     if (qjs_deep_net) { js_free(ctx, qjs_deep_net); qjs_deep_net = NULL; }
     if (qjs_deep_net2) { js_free(ctx, qjs_deep_net2); qjs_deep_net2 = NULL; }
     if (qjs_deep_sink) { js_free(ctx, qjs_deep_sink); qjs_deep_sink = NULL; }
-    if (qjs_deep_deferred) { js_free(ctx, qjs_deep_deferred); qjs_deep_deferred = NULL; }
-    if (qjs_deep_defer_comp) { js_free(ctx, qjs_deep_defer_comp); qjs_deep_defer_comp = NULL; }
     qjs_deep_rb_n = 0; qjs_deep_cursor = 0; qjs_deep_cache_rt = NULL;
     qjs_dnf_threw = 0; qjs_dnf_ret = 0; qjs_recv_thr = 0; g_recv_exc_kind = 0; qjs_syn_col = 0; qjs_syn_asn = 0;
     qjs_gen_susp_drv = 0; qjs_gen_susp_recv = 0; qjs_gen_susp_drained = 0;
@@ -64905,18 +64896,7 @@ static int qjs_val_has_abs_url(JSContext *ctx, JSValueConst v, int depth) {
    the js_stack chunks are freed explicitly after (no double-free). The WFQ pauses
    at a sync YIELD_POLL, so the paused frames are NORMAL (the only kind that
    teardown frees). The PEAK (flows held before abandon) is the IDB-eviction job. */
-static void qjs_deep_free_paused_flow(JSContext *ctx, int ix) {
-    if (!qjs_deep_flow || ix < 0 || !qjs_deep_flow[ix].js_stack) return;
-    JSRuntime *rt = ctx->rt;
-    JSFlow _cur;
-    qjs_flow_save(ctx, &_cur);
-    qjs_flow_restore(ctx, &qjs_deep_flow[ix]);
-    qjs_free_suspended_trampoline_frames(ctx);   /* frees NORMAL frame locals; current_stack_frame=NULL */
-    { JSStackChunk *c = rt->js_stack; while (c) { JSStackChunk *p = c->prev; js_free_rt(rt, c); c = p; } }
-    rt->js_stack = NULL;
-    qjs_deep_flow[ix].js_stack = NULL; qjs_deep_flow[ix].current_stack_frame = NULL; qjs_deep_flow[ix].qjs_yield_entry = NULL;
-    qjs_flow_restore(ctx, &_cur);
-}
+/* #one-BFS: qjs_deep_free_paused_flow DELETED — no separate qjs_deep_flow registry to free. */
 
 /* qjs_fn_is_escaping_factory: STRUCTURAL (not a name heuristic) — does running b create closures
    that capture b's OWN locals/args (child bytecodes with a JS_CLOSURE_LOCAL/ARG closure_var)? Such a
@@ -65022,11 +65002,6 @@ int qjs_deep_step_c(JSContext *ctx, int maxN, int fromCursor) {
         if (qjs_deep_net) { js_free(ctx, qjs_deep_net); qjs_deep_net = NULL; }
         if (qjs_deep_net2) { js_free(ctx, qjs_deep_net2); qjs_deep_net2 = NULL; }
         if (qjs_deep_sink) { js_free(ctx, qjs_deep_sink); qjs_deep_sink = NULL; }
-        if (qjs_deep_deferred) { js_free(ctx, qjs_deep_deferred); qjs_deep_deferred = NULL; }
-        if (qjs_deep_defer_comp) { js_free(ctx, qjs_deep_defer_comp); qjs_deep_defer_comp = NULL; }
-        if (qjs_deep_flow) { js_free(ctx, qjs_deep_flow); qjs_deep_flow = NULL; }   /* WFQ: array only */
-        if (qjs_deep_cow) { js_free(ctx, qjs_deep_cow); qjs_deep_cow = NULL; }   /* COW deltas are POOL memory (reset below), this frees only the array */
-        if (qjs_deep_vt) { js_free(ctx, qjs_deep_vt); qjs_deep_vt = NULL; }   /* WFQ virtual-time array */
         if (qjs_drive_flow) { js_free(ctx, qjs_drive_flow); qjs_drive_flow = NULL; }   /* #5/#9 drive park registry */
         if (qjs_drive_cow) { js_free(ctx, qjs_drive_cow); qjs_drive_cow = NULL; }
         if (qjs_drive_mark) { js_free(ctx, qjs_drive_mark); qjs_drive_mark = NULL; }
@@ -65035,19 +65010,12 @@ int qjs_deep_step_c(JSContext *ctx, int maxN, int fromCursor) {
         qjs_deep_net = js_malloc(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1));
         qjs_deep_net2 = js_mallocz(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1));   /* 0 until the post-insts fill loop below; insts aren't populated yet here */
         qjs_deep_sink = js_malloc(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1));
-        qjs_deep_deferred = js_mallocz(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1));   /* 0 = not spin-deferred */
-        qjs_deep_defer_comp = js_malloc(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1) * sizeof(unsigned));
-        if (qjs_deep_defer_comp) for (int _i = 0; _i < qjs_deep_rb_n; _i++) qjs_deep_defer_comp[_i] = (unsigned)-1;   /* UINT_MAX sentinel = never deferred */
-        qjs_deep_flow = js_mallocz(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1) * sizeof(JSFlow));   /* WFQ: zeroed = no paused flow yet (NULL js_stack/current_stack_frame) */
-        /* COW (#7/#10): per-flow delta array + the reserved metadata pool + the post-boot
-           baseline. THIS is the boot->grind boundary: the residue orphans have not yet
-           mutated the heap, so the baseline is the clean shared state every flow forks
-           from. If pool/baseline fail, qjs_cow_dirty stays NULL -> the barrier no-ops ->
-           the WFQ runs un-isolated (graceful), never a crash. */
-        qjs_deep_cow = js_mallocz(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1) * sizeof(JSCowDelta));
-        qjs_deep_vt = js_mallocz(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1) * sizeof(unsigned long long));   /* WFQ: zeroed = all orphans start at virtual time 0 (round-robin from equal) */
+        /* #one-BFS: the separate per-orphan WFQ arrays (deferred/defer_comp/flow/cow/vt) are DELETED —
+           the ONE registry (qjs_drive_flow) + ONE primitive (qjs_run_forced_flow) handle park/resume. THIS is
+           the boot->grind boundary: the residue orphans have not yet mutated the heap, so the baseline is the
+           clean shared state every flow forks from. */
         g_cow_busy = _grind_cow_sv;   /* metadata built; resume COW tracking for the per-flow baseline + the drive loop */
-        if (g_cow_enabled && qjs_deep_cow && !g_cow_boot_mode) {   /* gated; skipped under COW-as-snapshot (boot baseline is the base) */
+        if (g_cow_enabled && !g_cow_boot_mode) {   /* gated; skipped under COW-as-snapshot (boot baseline is the base) */
             qjs_cow_pool_init(rt, (size_t)16 * 1024 * 1024);
             qjs_cow_shadow_grow(qjs_cow_heap_len() / 8 + 1); qjs_cow_undo_n = 0;   /* undo-log snapshot: size the shadow, empty the log = at baseline */
             printf("@WHY {\"phase\":\"cow_baseline\",\"undolog\":1,\"heapMB\":%zu}\n", qjs_cow_heap_len() / (size_t)1048576);   /* #6 NO-SILENT-FAILURE: COW engagement must be observable */
@@ -65303,9 +65271,8 @@ int qjs_deep_step_c(JSContext *ctx, int maxN, int fromCursor) {
        back EARLY even on a 1100-orphan residue. Falls back to the
        bytecode-walking comparator only if the bit arrays failed to alloc
        (OOM) — correctness preserved either way. */
-    int _have_bits = (qjs_deep_net != NULL && qjs_deep_net2 != NULL && qjs_deep_sink != NULL);
-    unsigned _last_clear_comp = (unsigned)-1;   /* g_grind_completions at the last deferred-set re-attempt. REVIVAL (not termination) signal: re-attempt a deferred flow when another orphan COMPLETED since the last clear — a completion changes shared state (populates a worklist a consumer reads) EVEN WHEN the producer emits no @H of its own, so sentry_cdn's producer→consumer chain needs it (revive-on-emitted-output alone took sentry 3→0). This is a revival heuristic, NOT a termination count: nothing STOPS on it; the per-orphan WFQ pause still starves a true no-output spinner by emitted output. */
-    JS_SetInterruptHandler(rt, qjs_grind_interrupt, NULL);   /* spin-defer yield (gated by g_grind_drive_active, off during boot/BFS); runtime-free clears it */
+    int _have_bits = (qjs_deep_net != NULL && qjs_deep_net2 != NULL && qjs_deep_sink != NULL); (void)_have_bits;
+    JS_SetInterruptHandler(rt, qjs_grind_interrupt, NULL);   /* preemption yield gate (g_grind_drive_active, off during boot/BFS); runtime-free clears it */
     while (driven < maxN) {
         qjs_cow_pool_warm(ctx);   /* #5/#10: re-warm each iteration (SAFE point) so a heap that grew during the prior drive is re-covered before the next drive's barrier fires */
         int _ix = -1;
@@ -65314,63 +65281,18 @@ int qjs_deep_step_c(JSContext *ctx, int maxN, int fromCursor) {
             JSFunctionBytecode *cb = qjs_deep_rb[_ci];
             if (!cb || !cb->byte_code_buf) continue;
             if (cb->qjs_driven) continue;   /* O(1) skip via the flag */
-            if (qjs_deep_deferred && qjs_deep_deferred[_ci]) continue;   /* spin-deferred: skip until non-deferred drained (re-attempted below) */
             if (cb->qjs_h_fired) {
                 cb->qjs_driven = 1;
                 uint64_t fid = qjs_deep_ids ? qjs_deep_ids[_ci] : 0;
                 if (fid) printf("@DD %llx\n", (unsigned long long)fid);
                 continue;   /* already fired naturally — don't drive */
             }
-            int better;
-            if (b == NULL) better = 1;
-            else if (qjs_deep_vt)
-                /* WFQ: run the LEAST-served orphan (min virtual time). A firing orphan is
-                   removed from the pick via qjs_driven, so EMITTED output does the weighting;
-                   the unfired residue round-robins by vt — never net-first PREDICTED (policy:
-                   value = run output, never a static reaches-a-network-edge guess). Equal vt
-                   keeps the earlier (registry order). */
-                better = (qjs_deep_vt[_ci] < qjs_deep_vt[_ix]);
-            else if (_have_bits)
-                better = qjs_priority_live_orphan_better_bits(
-                    qjs_deep_net[_ci], qjs_deep_net2[_ci], cb->qjs_executed, qjs_deep_sink[_ci], cb->byte_code_len,
-                    qjs_deep_net[_ix], qjs_deep_net2[_ix], b->qjs_executed, qjs_deep_sink[_ix], b->byte_code_len);
-            else
-                better = qjs_priority_live_orphan_better(cb, b);
-            if (better) { b = cb; _ix = _ci; }
+            b = cb; _ix = _ci; break;   /* #one-BFS: sequential pick (first un-driven); the ONE WFQ (qjs_run_forced_flow quantum + host priority.js) does the scheduling — no separate vt/net-guess ordering */
         }
         if (b == NULL) {
-            /* Non-deferred orphans exhausted. Re-attempt the spin-deferred set: other drives
-               since may have changed shared state (a producer populated a worklist a deferred
-               consumer reads) so it now progresses. Signal = a COMPLETION since the last clear
-               (g_grind_completions): a producer that finished may have enabled a consumer EVEN
-               IF it emitted no @H itself (sentry_cdn's chain — revive-on-emitted-output-only
-               took it 3→0). If a cycle completed something, clear the skip markers and give the
-               deferred set another pass (defer_comp preserved). If a cycle completed NOTHING,
-               the remaining deferred set is provably unhelpable THIS PASS → PAUSE them
-               (re-drivable next invocation / session / IDB-resume), never abandon: #9
-               prioritization, not fixpoint termination. This is a REVIVAL heuristic, not a
-               termination count — nothing stops on it; the per-orphan WFQ pause still starves a
-               genuine no-output spinner by emitted output. Freeing the heap is the #5 RAM floor;
-               @DPAUSE exits. */
-            int _any_def = 0;
-            if (qjs_deep_deferred)
-                for (int _di = 0; _di < qjs_deep_rb_n; _di++)
-                    if (qjs_deep_deferred[_di] && qjs_deep_rb[_di] && !qjs_deep_rb[_di]->qjs_driven) { _any_def = 1; break; }
-            if (!_any_def) break;   /* truly exhausted */
-            if (g_grind_completions != _last_clear_comp) {
-                _last_clear_comp = g_grind_completions;
-                for (int _di = 0; _di < qjs_deep_rb_n; _di++) qjs_deep_deferred[_di] = 0;   /* a completion changed state → re-attempt the paused set */
-                continue;
-            }
-            for (int _di = 0; _di < qjs_deep_rb_n; _di++) {   /* no new output → PAUSE (re-drivable), never abandon */
-                if (qjs_deep_deferred[_di] && qjs_deep_rb[_di] && !qjs_deep_rb[_di]->qjs_driven) {
-                    uint64_t _fd = qjs_deep_ids ? qjs_deep_ids[_di] : 0;
-                    if (_fd) printf("@DG %llx\n", (unsigned long long)_fd);   /* paused, re-drivable — NOT @DD driven */
-                    qjs_deep_free_paused_flow(ctx, _di);   /* #5 RAM floor (re-derive on re-drive; IDB-evict resumes exactly later) */
-                }
-            }
-            printf("@DPAUSE\n");   /* host: grind paused with re-drivable residue — exit the loop, do NOT recycle/abandon */
-            fflush(stdout);
+            /* #one-BFS: all orphans driven once (parked ones drain via qjs_drive_repick). No separate
+               spin-defer/pause-set second scheduler. */
+            printf("@DPAUSE\n"); fflush(stdout);
             break;
         }
         uint64_t _id = qjs_deep_ids ? qjs_deep_ids[_ix] : 0;
@@ -65516,60 +65438,14 @@ int qjs_deep_step_c(JSContext *ctx, int maxN, int fromCursor) {
                CONCRETELY (the cold-instance class gap; learn.microsoft.com
                search component `this._input=$0e(async()=>this.fetch())`). */
             int _susp_before = qjs_count_suspended_generators(ctx);
-            /* WFQ: drive forced with opcode-level PAUSE (qjs_driving) so a spin-flat
-               flow PAUSES on the heap (frames intact, ~0 CPU, resumable by output)
-               instead of running to overflow/throw. Resume a flow PAUSED on a prior
-               pick (qjs_deep_flow[_ix]) instead of re-driving cold. The yield-loop
-               resumes WHILE the flow emits new @H/@S; the first SILENT yield window
-               STARVES it (qjs_flow_save snapshot, marked paused, NEVER abandoned — the
-               deferred re-attempt re-picks + resumes by output). Gated on qjs_deep_flow
-               being allocated (else the legacy throw-defer runs, qjs_grind_interrupt). */
-            int _wfq_on = (qjs_deep_flow != NULL), _wfq_paused = 0, _wfq_e0 = g_emit_n;
-            if (_wfq_on) qjs_set_driving(ctx, 1);
             g_cow_orphan_creates_inst = 0;   /* COW: per-drive flag; set if this drive captures an instance */
-            JSValue r2;
-            if (_wfq_on && qjs_deep_flow[_ix].js_stack) {
-                qjs_flow_restore(ctx, &qjs_deep_flow[_ix]);
-                qjs_deep_flow[_ix].js_stack = NULL; qjs_deep_flow[_ix].current_stack_frame = NULL;
-                /* COW: heap is at baseline (the last orphan left it there) — apply THIS
-                   flow's delta so it resumes on ITS OWN heap, not another path's (#10). */
-                if (qjs_deep_cow) { qjs_cow_apply(qjs_cow_heap_base(), &qjs_deep_cow[_ix]); qjs_cow_delta_free(rt, &qjs_deep_cow[_ix]); }
-                rt->qjs_resume_chain = 1;
-                r2 = qjs_resume_chain_call(ctx);
-            } else {
-                r2 = _is_cls_ctor
-                    ? JS_CallConstructor(ctx, fo, nargs, args3)
-                    : JS_Call(ctx, fo, (qjs_deep_recv && !JS_IsUndefined(qjs_deep_recv[_ix])) ? qjs_deep_recv[_ix] : this_opq2, nargs, args3);
-            }
-            int _wfq_slice = 0;
-            while (_wfq_on && rt->qjs_yielded) {
-                rt->qjs_yielded = 0;
-                if (g_emit_n != _wfq_e0) _wfq_e0 = g_emit_n;   /* track output (for defer_comp) but do NOT reset the counter: the TICK counts WINDOWS (preemption granularity, the slice that gives a fetch room to be reached), never consecutive SILENCE (a banned no-progress count) */
-                if (++_wfq_slice < QJS_DEFER_QUANTUM) {      /* run one slice of windows, then yield to the WFQ regardless of silence */
-                    rt->qjs_resume_chain = 1; r2 = qjs_resume_chain_call(ctx);
-                } else {                                    /* slice done -> pause on the heap; vt advances so the least-served orphan runs next (firing orphans are removed via qjs_driven, so emitted output weights the residue) */
-                    qjs_flow_save(ctx, &qjs_deep_flow[_ix]);
-                    /* COW: store this flow's page delta, then restore the heap to baseline
-                       so the NEXT flow forks clean (#7 shared-state isolation). */
-                    if (qjs_deep_cow) { qjs_cow_capture(rt, qjs_cow_heap_base(), &qjs_deep_cow[_ix]); qjs_cow_to_baseline(qjs_cow_heap_base(), &qjs_deep_cow[_ix]); }
-                    qjs_deep_deferred[_ix] = 1; qjs_deep_defer_comp[_ix] = (unsigned)g_emit_n;
-                    if (qjs_deep_vt) qjs_deep_vt[_ix]++;   /* WFQ: advance this orphan's virtual time so the least-served orphan runs next (round-robin; emitted output weights via qjs_driven removing firing orphans from the pick) */
-                    rt->js_stack = NULL; rt->current_stack_frame = NULL;
-                    _wfq_paused = 1; break;
-                }
-            }
-            if (_wfq_on) qjs_set_driving(ctx, 0);
-            if (_wfq_paused) {
-                /* paused (resumable) — free the CALL locals (the frame owns its own
-                   copies), keep the snapshot in qjs_deep_flow[_ix], re-pick + resume later. */
-                g_grind_drive_active = 0;
-                JS_FreeValue(ctx, r2); JS_FreeValue(ctx, this_opq2);
-                for (int ai = 0; ai < nargs; ai++) JS_FreeValue(ctx, args3[ai]);
-                if (args3) js_free(ctx, args3);
-                JS_FreeValue(ctx, fo);
-                qjs_drop_pending_jobs(rt);
-                continue;
-            }
+            /* #one-BFS collapse: drive this orphan through THE ONE primitive (qjs_run_forced_flow) — it drives
+               under qjs_driving, yields per quantum, and PARKS into the single qjs_drive_flow registry (drained
+               by qjs_drive_repick), like the breadth force-invoke + sibling grind sites (66197/66276). The
+               separate qjs_deep_flow WFQ/park/resume is DELETED: one registry, one primitive, one loop. */
+            JSValue r2 = qjs_run_forced_flow(ctx, fo,
+                (qjs_deep_recv && !JS_IsUndefined(qjs_deep_recv[_ix])) ? qjs_deep_recv[_ix] : this_opq2,
+                nargs, args3, _is_cls_ctor);
             if (b->func_kind & JS_FUNC_ASYNC) { JSContext *c2;
                 while (JS_ExecutePendingJob(rt, &c2) > 0) {
 #if defined(__EMSCRIPTEN__) && defined(QJS_HAS_JSPI)
@@ -65699,29 +65575,13 @@ int qjs_deep_step_c(JSContext *ctx, int maxN, int fromCursor) {
                a cross-orphan captured instance (preserve it for the method orphans), else
                DISCARD — revert its heap mutations (incl. any forced-built deep DOM) so the
                next orphan forks clean (#7 full DOM+JS isolation). Inert while gated off. */
-            if (qjs_deep_cow) {
-                if (g_cow_orphan_creates_inst) { qjs_cow_commit(qjs_cow_heap_base()); g_flow_arena_committed = g_flow_arena_off; }  /* the committed instance's arena allocations become permanent baseline (survive resets) */
+            if (g_cow_enabled) {   /* #one-BFS: orphan COMPLETED — commit a captured instance to baseline, else discard its heap mutations (isolation). qjs_run_forced_flow already reverted a PARKED orphan's sub-chain. */
+                if (g_cow_orphan_creates_inst) { qjs_cow_commit(qjs_cow_heap_base()); g_flow_arena_committed = g_flow_arena_off; }
                 else qjs_cow_discard(qjs_cow_heap_base());
-                (void)_orphan_arena;  /* per-orphan arena reset reverted: it dangled paused-orphan deltas on the heavy grind (sentry hang). The arena reset stays at the breadth FLOWEND only. */
+                (void)_orphan_arena;
             }
-            /* Spin-defer: the interrupt YIELDED this drive (g_defer_fired) and it
-               unwound (_was_exc2) ⇒ a no-forced-progress concrete spin. DEFER it
-               (don't mark driven) so a producer orphan can establish its module
-               state first — UNLESS the no-global-progress fixpoint fires (this
-               orphan already deferred AND no other orphan completed since ⇒
-               provably unhelpable ⇒ fall through and abandon). */
-            if (g_defer_fired && _was_exc2 && qjs_deep_defer_comp && _ix >= 0 &&
-                qjs_deep_defer_comp[_ix] != g_grind_completions) {
-                /* Progress since this orphan last deferred (defer_comp != current
-                   completions; UINT_MAX sentinel = never deferred) → DEFER. The
-                   fixpoint keys on defer_comp vs completions, NOT the deferred
-                   bit (the bit is only the phase-1 skip marker, cleared on
-                   re-attempt) — so abandon stays correct after the bit clears. */
-                qjs_deep_defer_comp[_ix] = g_grind_completions;
-                if (qjs_deep_deferred) qjs_deep_deferred[_ix] = 1;
-                g_spin_n = 0;
-                continue;   /* re-queued; skipped until non-deferred drained, then re-attempted */
-            }
+            /* #one-BFS: NO spin-defer second scheduler. A non-terminating orphan is PREEMPTED + parked by the
+               ONE primitive (qjs_run_forced_flow quantum) and drained by qjs_drive_repick — not deferred here. */
             b->qjs_driven = 1;   /* mark on the bytecode for O(1) skip on next pick */
             b->qjs_driven_opaque = !_from_real;   /* opaque fallback -> eligible for one real-instance re-drive when a factory instantiates it */
             if (_id) { printf("@DD %llx\n", (unsigned long long)_id); fflush(stdout); }
@@ -66039,27 +65899,7 @@ int qjs_deep_step_c(JSContext *ctx, int maxN, int fromCursor) {
        initial residue size after a live-pick batch. The worker's deep
        loop relies on rem==0 to declare the grind done; a stale non-zero
        would force an unnecessary recycle. */
-    /* Final resolution backstop: an orphan still spin-deferred when the batch
-       ends (W4b's in-batch re-attempt was cut by the maxN boundary, and the
-       worker may stop before another batch) is ABANDONED — its in-batch
-       producers already ran, so it is provably unhelpable WITHIN reach; a
-       deferred orphan is by construction a no-forced-progress (net:0/no-value)
-       spinner, so abandoning loses no endpoint. This guarantees the grind
-       reaches rem==0 (pause-and-resume ENDS in termination-by-abandon, never an
-       infinite loop) instead of stalling forever-deferred at a batch boundary. */
-    if (qjs_deep_deferred) {
-        int _ab = 0;
-        for (int _ri = 0; _ri < qjs_deep_rb_n; _ri++) {
-            if (qjs_deep_rb[_ri] && qjs_deep_rb[_ri]->byte_code_buf &&
-                !qjs_deep_rb[_ri]->qjs_driven && qjs_deep_deferred[_ri]) {
-                qjs_deep_rb[_ri]->qjs_driven = 1;
-                uint64_t _fd = qjs_deep_ids ? qjs_deep_ids[_ri] : 0;
-                if (_fd) printf("@DD %llx\n", (unsigned long long)_fd);
-                _ab++;
-            }
-        }
-        if (_ab) fflush(stdout);
-    }
+    /* #one-BFS: the spin-deferred abandon-backstop (a banned fixpoint termination) is DELETED. */
     int rem = 0;
     for (int _ri = 0; _ri < qjs_deep_rb_n; _ri++) {
         JSFunctionBytecode *cb = qjs_deep_rb[_ri];
