@@ -66331,7 +66331,7 @@ static JSValue js_fe_drive_static(JSContext *ctx, JSValueConst this_val,
         int len = b->byte_code_len, pos = 0;
         { size_t _bc = (size_t)b->byte_code_buf, _hb = (size_t)&__heap_base, _me = (size_t)__builtin_wasm_memory_size(0) * 65536;
           if (len < 0 || _bc < _hb || _bc + (size_t)len > _me) continue; }
-        if (b->qjs_executed) continue;   /* reached by the dynamic frontier — its real values are already captured */
+        if (b->qjs_executed || b->qjs_driven) continue;   /* reached by the dynamic frontier (real values captured), OR already force-driven this session (qjs_driven persists OUTSIDE the flow revert) — don't re-collect, else the BFS never converges */
         if (qjs_is_host_model_file(b->filename)) continue;   /* never force-drive our own shim (filename read now ghost-safe) */
         int has_host = 0;
         while (pos < len) {
@@ -66406,6 +66406,11 @@ static JSValue js_fe_drive_static(JSContext *ctx, JSValueConst this_val,
         JSFunctionBytecode *b = p->u.func.function_bytecode;
         if (!b || !b->byte_code_buf) continue;
         if (b->qjs_executed) continue;   /* executed by a prior drive/side-effect — its sites already fired */
+        /* #one-BFS: mark this target force-driven BEFORE the drives, OUTSIDE any qjs_flow_arm/revert window (so
+           it persists where the in-drive qjs_executed write is reverted). The collection filter above then skips
+           it next schedule → the BFS drive-count goes flat → convergence. Mirrors the grind's post-flow marking;
+           qjs_driven_opaque=1 keeps it eligible for the grind's real-instance re-drive (qjs_deep_capture_inst). */
+        b->qjs_driven = 1; b->qjs_driven_opaque = 1;
         int nargs = b->arg_count;
         int len = b->byte_code_len, pos = 0;
         (void)pos;
@@ -66442,7 +66447,7 @@ static JSValue js_fe_drive_static(JSContext *ctx, JSValueConst this_val,
                 for (int ai = 0; ai < nargs; ai++) argsR[ai] = qjs_fe_named_arg(ctx, b, ai, "static-real-this");
                 qjs_dir_active = 0; qjs_dir_b = NULL; qjs_dir_target = -1;
                 qjs_flow_arm(ctx);   /* #7: this real-receiver drive is a flow — capture its writes */
-                JSValue rr = JS_Call(ctx, targets[i], target_this[i], nargs, argsR);
+                JSValue rr = qjs_run_forced_flow(ctx, targets[i], target_this[i], nargs, argsR, 0);   /* #one-BFS: preemptible — a spinning real-receiver static drive PARKS, not the g_bfs throw */
                 /* An async real-receiver method (`async exchange(){ var c =
                    await this._svc.getConfig(); return fetch(c.url) }`, oidc-
                    client-ts's token exchange) suspends at the await; WITHOUT a
@@ -66478,7 +66483,7 @@ static JSValue js_fe_drive_static(JSContext *ctx, JSValueConst this_val,
             JSValue this_opq = qjs_opq_make(ctx, 1, "static-drive-this", qjs_t_opaque());
             qjs_dir_active = 0; qjs_dir_b = NULL; qjs_dir_target = -1;
             qjs_flow_arm(ctx);   /* #7: the opaque static drive is a flow — capture its writes */
-            JSValue r = JS_Call(ctx, targets[i], this_opq, nargs, args2);
+            JSValue r = qjs_run_forced_flow(ctx, targets[i], this_opq, nargs, args2, 0);   /* #one-BFS: preemptible — a spinning opaque static drive PARKS, not the g_bfs throw */
             if (JS_IsException(r)) { JSValue e = JS_GetException(ctx); JS_FreeValue(ctx, e); }
             JS_FreeValue(ctx, r);
             JS_FreeValue(ctx, this_opq);
@@ -66499,7 +66504,7 @@ static JSValue js_fe_drive_static(JSContext *ctx, JSValueConst this_val,
             JSValue this_opq = qjs_opq_make(ctx, 1, "chunk-drive-this", qjs_t_opaque());
             qjs_dir_b = b; qjs_dir_target = rpos; qjs_dir_active = 1;
             qjs_flow_arm(ctx);   /* #7 per-invoke isolation: this chunk-load directed drive runs in a LOOP over require sites — without a flow bracket its shared-cell writes accumulate across iterations (the same i2-n-2 leak the real-receiver/opaque drives above already revert). Was the one unbracketed forced JS_Call in the seed drive. */
-            JSValue r = JS_Call(ctx, targets[i], this_opq, nargs, args2);
+            JSValue r = qjs_run_forced_flow(ctx, targets[i], this_opq, nargs, args2, 0);   /* #one-BFS: preemptible — a spinning chunk-load directed drive PARKS (resume drives opaque, qjs_dir cleared below) */
             qjs_dir_active = 0; qjs_dir_b = NULL; qjs_dir_target = -1;
             if (JS_IsException(r)) { JSValue e = JS_GetException(ctx); JS_FreeValue(ctx, e); }
             JS_FreeValue(ctx, r);
