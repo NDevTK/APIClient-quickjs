@@ -1380,7 +1380,9 @@
       var thisArg = ht != null ? ht : G;
       var hev = ht != null ? mkHandlerEvent(ht) : OPQ("handler.event");
       FLOWBEG();
-      try { hf.call(thisArg, hev); } catch (x) {}
+      // #one-BFS: drive the handler through the preemptible primitive (this=thisArg, arg0=hev) so a
+      // spinning handler PARKS + resumes via the grind, never hangs boot or is thrown away.
+      try { if (DRIVEBREADTH) DRIVEBREADTH.call(thisArg, hf, hev); else hf.call(thisArg, hev); } catch (x) {}
       FLOWEND();
       var _curAfter = FECUR();
       if (_curAfter > _curBefore && _curBefore <= FELEN()) FH.push(hfe);
@@ -1459,7 +1461,9 @@
         if (connKeys.has(fk2)) continue;
         connKeys.add(fk2);
         FLOWBEG();
-        try { cb.call(el); } catch (x) {}
+        // #one-BFS: drive the upgrade callback through the preemptible primitive (this=el) so a
+        // spinning connectedCallback PARKS + resumes via the grind, never hangs boot or is thrown away.
+        try { if (DRIVEBREADTH) DRIVEBREADTH.call(el, cb); else cb.call(el); } catch (x) {}
         FLOWEND();
       }
     } catch (e) {}
