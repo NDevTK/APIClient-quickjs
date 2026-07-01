@@ -64463,13 +64463,22 @@ static int qjs_grind_interrupt(JSRuntime *rt, void *opaque) {
            spinner — snapshot all four trails, resume via the grind's repick — never throws it away. Defer to
            the YIELD_POLL park; the throw below would DEFEAT the park (a thrown flow is lost, not resumable). */
         if (rt->qjs_driving) return 0;
-        /* Non-preemptible fallback: plain fn.call BFS drives (connectedCallback/form/handler) not yet routed
-           through the primitive. same-back-edge + flat-seen throw-skip so a spinner can't hang boot. TODO route
-           those through DRIVEBREADTH.call(recv, fn, …), then this whole no-progress count is dead — delete it. */
+        /* Non-preemptible fallback for the BFS execution paths NOT yet routed through the primitive:
+           js_fe_drive_static's forced JS_Calls + the boot event-loop job pump (JS_ExecutePendingJob
+           continuations). same-back-edge + flat-seen throw-skip so a spinner can't hang boot. TODO make the
+           job pump preemptible (route those continuations under qjs_driving), then this no-progress count is
+           dead — delete it. (connectedCallback + handler-drain are already routed; they take the park above.) */
         JSStackFrame *sf = rt->current_stack_frame;
         uint8_t *pc = sf ? sf->cur_pc : NULL;
         if (pc == g_bfs_last_pc && qjs_fe_seen_n == g_bfs_last_seen) {
-            if (++g_bfs_noprog >= QJS_DEFER_QUANTUM) { g_bfs_noprog = 0; return 1; }  /* throw → per-global catch skips it */
+            if (++g_bfs_noprog >= QJS_DEFER_QUANTUM) {
+                g_bfs_noprog = 0;
+                /* NOT SILENT (#no-silent-failure): a spun BFS drive is thrown out and skipped by the caller's
+                   catch — surface it so its LOST distinct work is measurable, not invisible. Names the boot
+                   non-preemptible residue (js_fe_drive_static / job pump) whose fix retires this throw. */
+                printf("@WHY {\"phase\":\"bfs_spin_skip\",\"pc\":%zu}\n", (size_t)pc); fflush(stdout);
+                return 1;   /* throw → per-global catch skips it */
+            }
         } else {                                         /* moved to a new back-edge OR forked = real progress */
             g_bfs_last_pc = pc; g_bfs_last_seen = qjs_fe_seen_n; g_bfs_noprog = 0;
         }
