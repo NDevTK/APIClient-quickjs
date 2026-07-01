@@ -21069,7 +21069,7 @@ QJS_JSEXPORT void qjs_cow_undo_revert(void);
    [0,mark) intact — the segmented per-arm snapshot (#7) with no global mark stack: the mark is
    a C local at the single re-invoke site (qjs_drive_orphan_enum's BFS loop). */
 QJS_JSEXPORT void qjs_cow_undo_revert_to(size_t mark);
-static void qjs_cow_defer_push(void *old, void *neww, int is_shape);   /* fwd: deferred-restore trail push (rt-based, no ctx — qjs_cow_apply re-pushes) */
+QJS_JSEXPORT void qjs_cow_defer_push(void *old, void *neww, int is_shape);   /* fwd. EXPORTED (KEEPALIVE) so the cow-barrier pass SKIPS instrumenting its stores (cow-barrier.mjs:85 skips qjs_cow_ EXPORTS) — its gm trail-array writes must not be barrier-logged-then-reverted, exactly like the export-skipped qjs_cow_undo_log's word-log writes. */
 static void qjs_cow_defer_revert_to(size_t wmark);   /* fwd: deferred-restore revert (after the byte-restore — field is now old; free new by kind) */
 static void qjs_cow_defer_commit(void);              /* fwd: deferred-restore commit (new is baseline; free old by kind) */
 static void js_free_shape(JSRuntime *rt, JSShape *sh);   /* fwd: shape-kind revert/commit decref */
@@ -21554,12 +21554,22 @@ void cow_set_slot(JSContext *ctx, JSValue *pval, JSValue val) {
    (only pops), so any boundary/shadow-dedup mismatch can only LEAK, never double-free / use-after-free.
    (State JSCowDefer/qjs_cow_defer/_n/_cap is declared up with the vt-trail vars so qjs_cow_reset sees it.)
    ONE push/revert/commit over both kinds — is_shape dispatches the typed free. */
-static void qjs_cow_defer_push(void *old, void *neww, int is_shape) {
+QJS_JSEXPORT void qjs_cow_defer_push(void *old, void *neww, int is_shape) {
     if (qjs_cow_defer_n >= qjs_cow_defer_cap) {
         size_t nc = qjs_cow_defer_cap ? qjs_cow_defer_cap * 2 : 16;
-        JSCowDefer *nb = js_realloc_rt(g_cow_rt, qjs_cow_defer, nc * sizeof(JSCowDefer));   /* rt-based: no ctx, so qjs_cow_apply (the one park primitive) can re-push without a context */
-        if (!nb) { if (is_shape) js_free_shape(g_cow_rt, (JSShape *)old); return; }   /* OOM: SHAPE falls back to the normal old-decref; BUFFER drops (old leaks at commit), never corrupts */
-        qjs_cow_defer = nb; qjs_cow_defer_cap = nc;
+        /* gm-backed (__real_malloc + memcpy, LEAK old) — NOT js_realloc_rt, which routes the array to the flow
+           ARENA during a flow; the arena bump-RESETS at FLOWEND so an arena-backed trail array's stale pointer
+           overlaps the NEXT flow's objects -> defer_revert reads a CORRUPT entry (neww -> a reused JS object,
+           gt=0) -> js_free_shape on garbage (the shape_overdecref, MEASURED deferSite=1/gt=0). gm survives arena
+           resets, like qjs_cow_undo/shadow. This function is now EXPORTED (KEEPALIVE) so the cow-barrier pass
+           SKIPS it (cow-barrier.mjs:85) — its gm stores are NOT instrumented, so no barrier-log/revert of the
+           trail and no g_cow_busy dance / cow_g-scratch clobber (the unmeasured hang the earlier INSTRUMENTED
+           gm attempts hit). Mirrors qjs_cow_undo_grow (export-skipped writer, gm, mid-flow __real_malloc). */
+        int sv = g_cow_busy; g_cow_busy = 1;
+        JSCowDefer *no = (JSCowDefer *)__real_malloc(nc * sizeof(JSCowDefer));
+        if (no) { if (qjs_cow_defer) memcpy(no, qjs_cow_defer, qjs_cow_defer_n * sizeof(JSCowDefer)); qjs_cow_defer = no; qjs_cow_defer_cap = nc; }
+        g_cow_busy = sv;
+        if (qjs_cow_defer_n >= qjs_cow_defer_cap) { if (is_shape) js_free_shape(g_cow_rt, (JSShape *)old); return; }   /* alloc failed: SHAPE falls back to normal old-decref; BUFFER drops (old leaks at commit) */
     }
     qjs_cow_defer[qjs_cow_defer_n].old = old;        /* SHAPE: KEEP old's ref (the trail owns it for the slot restore). BUFFER: old kept live for the field revert. */
     qjs_cow_defer[qjs_cow_defer_n].neww = neww;
