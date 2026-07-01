@@ -63955,19 +63955,12 @@ static int qjs_deep_rb_n = 0, qjs_deep_cursor = 0;
 static int qjs_deep_vspread_done = 0;
 static JSValue js_fe_value_spread(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 static JSRuntime *qjs_deep_cache_rt = NULL;
-/* Spin-DEFER scheduling (pause-and-resume; NEVER a cap). The grind installs an
-   interrupt handler that YIELDS an orphan drive making NO forced-progress
-   (qjs_fe_seen_n flat — a CONCRETE infinite loop the opaque-loop fixpoint can't
-   key, e.g. MathJax m()'s for(;t.length>0;) under a cold-empty worklist) for a
-   scheduling QUANTUM, so the grind DEFERS it and drives other orphans first —
-   one of which may establish the module/heap state (a producer that populates
-   the worklist) that lets the deferred orphan TERMINATE on re-drive (the loop
-   re-reads the now-populated state → l.pop() opaque → loop opaque → existing
-   fixpoint). The quantum is a fair-scheduling slice, NOT a work bound: the
-   orphan completes across re-drives, or is abandoned ONLY at the
-   no-global-progress fixpoint (a deferred orphan re-spins while NO other orphan
-   completed since its last defer ⇒ provably unhelpable ⇒ mark driven). Monotone
-   (g_grind_completions only rises), so it terminates without a magic limit. */
+/* #one-BFS: a non-terminating orphan drive is PREEMPTED + parked by the ONE primitive
+   (qjs_run_forced_flow's per-opcode quantum → qjs_park_forced_flow into qjs_drive_flow,
+   drained by qjs_drive_repick), NEVER a spin-defer/abandon fixpoint here. The old
+   no-global-progress abandon (g_defer_fired/g_grind_completions/g_noprog_polls/g_progress_seen)
+   is DELETED — those were a banned no-progress count. Only g_grind_drive_active remains, a
+   simple in-flight gate for the interrupt handler. */
 static int g_grind_drive_active = 0;  /* 1 only while an orphan JS_Call is in flight — gates the handler */
 /* objective #9 attention signal: the count of EMITTED OUTPUT lines (@H endpoints + @S
    findings). This is the ONLY sound progress signal — a flow makes progress iff it emits
@@ -63984,10 +63977,7 @@ void qjs_note_emit_line(const char *line) {
     /* called by js_print for every printed line; count only the emitted-output records */
     if (line && line[0] == '@' && (line[1] == 'H' || line[1] == 'S') && line[2] == ' ') g_emit_n++;
 }
-static int g_defer_fired = 0;         /* the handler yielded the current drive */
-static unsigned g_grind_completions = 0;   /* orphans that completed (no defer) this grind — the progress fixpoint */
-static int g_progress_seen = 0;       /* g_emit_n at last emitted-output progress */
-static int g_noprog_polls = 0;        /* interrupt polls since last forced-progress */
+/* #one-BFS: g_defer_fired/g_grind_completions/g_progress_seen/g_noprog_polls DELETED (banned no-progress count). */
 /* BFS-driver spin defense (distinct from the deep grind). The deep grind's
    seen_n-flat signal CANNOT be reused for the BFS __hostDrive: that loop
    force-invokes many handlers, and legit concrete handler work keeps seen_n
@@ -64461,19 +64451,12 @@ QJS_JSEXPORT void qjs_drive_repick(JSContext *ctx) {
    quantum emits → resets → runs on. (seen-set growth is NOT progress.) */
 static int qjs_grind_interrupt(JSRuntime *rt, void *opaque) {
     (void)opaque;
-    if (g_grind_drive_active) {                          /* OUTPUT-STARVATION spin-defer. */
-        /* WFQ ON (qjs_driving): the per-flow yield-loop in the deep grind PAUSES a
-           silent drive (qjs_flow_save, frames intact) by emitted output and resumes
-           it later — pause/resume, NEVER a throw/abandon. So the interrupt must NOT
-           throw here; the YIELD_POLL yield (frames intact) + the loop's g_emit_n
-           check own starvation. */
-        if (rt->qjs_driving) return 0;
-        /* WFQ OFF fallback (qjs_deep_flow alloc failed): the legacy output-starvation
-           throw-defer. Keyed on EMITTED OUTPUT, never the seen-set it used to use. */
-        if (g_emit_n != g_progress_seen) { g_progress_seen = g_emit_n; g_noprog_polls = 0; return 0; }
-        if (++g_noprog_polls < QJS_DEFER_QUANTUM) return 0;
-        g_defer_fired = 1; g_noprog_polls = 0;
-        return 1;
+    if (g_grind_drive_active) {
+        /* #one-BFS: the WFQ (qjs_driving) per-flow yield-loop PAUSES a silent drive by emitted output and
+           resumes it — never a throw/abandon here. The WFQ-OFF no-progress throw-defer (g_noprog_polls ->
+           g_defer_fired, a banned no-progress count) is DELETED: qjs_deep_flow is gone, so grind drives always
+           run under qjs_driving and starvation is owned by the YIELD_POLL park + the drive loop's output check. */
+        return 0;
     }
     if (g_bfs_drive_active) {                            /* BFS drive: same-back-edge + flat-seen = concrete spin */
         JSStackFrame *sf = rt->current_stack_frame;
@@ -65021,7 +65004,6 @@ int qjs_deep_step_c(JSContext *ctx, int maxN, int fromCursor) {
             printf("@WHY {\"phase\":\"cow_baseline\",\"undolog\":1,\"heapMB\":%zu}\n", qjs_cow_heap_len() / (size_t)1048576);   /* #6 NO-SILENT-FAILURE: COW engagement must be observable */
             fflush(stdout);
         }
-        g_grind_completions = 0;   /* per-grind progress counter (the defer fixpoint) */
         int _head_net = 0;
         if (qjs_deep_net && qjs_deep_sink) {
             for (int i = 0; i < qjs_deep_rb_n; i++) {
@@ -65411,7 +65393,7 @@ int qjs_deep_step_c(JSContext *ctx, int maxN, int fromCursor) {
             printf("@WHY {\"phase\":\"orphan_drive\",\"inst\":%d,\"recv\":%d,\"recvCS\":%d,\"uid\":\"%s\",\"ix\":%d,\"dix\":%d,\"dixCS\":%d,\"dixuid\":\"%s\",\"host\":%d,\"async\":%d,\"ctor\":%d,\"line\":%d,\"col\":%d,\"file\":\"%s\"}\n",
                    _from_real, _hasrecv, _recvCS, _ruid, _ix, _dix, _dixCS, _dixuid, has_host_in_b, (b->func_kind & JS_FUNC_ASYNC) ? 1 : 0, _is_cls_ctor, b->line_num, b->col_num, _ofile);
             fflush(stdout); } }
-        g_grind_drive_active = 1; g_defer_fired = 0; g_noprog_polls = 0; g_progress_seen = g_emit_n;   /* arm output-starvation spin-defer for BOTH paths: seed the emitted-output mark (the handler reads g_emit_n) */
+        g_grind_drive_active = 1;   /* #one-BFS: interrupt-handler in-flight gate (spin-defer arm deleted) */
         /* TYPED-TRAIL FORK per orphan drive: a PAUSED prior orphan `continue`s past its discard (see
            below), so its shared-scope cell writes (shared_state.html's `counter`) would carry into
            THIS orphan — i2 reads i1's bump (i2-n-2). Fork the typed cells clean here (refcount-exact);
@@ -65426,7 +65408,7 @@ int qjs_deep_step_c(JSContext *ctx, int maxN, int fromCursor) {
             JSValue this_opq2 = qjs_opq_make(ctx, 1, "deep-drive-this", qjs_t_opaque());
             qjs_dir_active = 0; qjs_dir_b = NULL; qjs_dir_target = -1;   /* no host site to steer to */
             qjs_fe_seen_reset();   /* fresh loop-revisit bound per drive (one execution unit) */
-            g_grind_drive_active = 1; g_defer_fired = 0; g_noprog_polls = 0; g_progress_seen = g_emit_n;   /* arm output-starvation spin-defer for this drive: seed the emitted-output mark (the handler reads g_emit_n) */
+            g_grind_drive_active = 1;   /* #one-BFS: interrupt-handler in-flight gate (spin-defer arm deleted) */
             /* A class constructor's bytecode starts with OP_check_ctor, which
                THROWS "must be invoked with 'new'" on a plain JS_Call — so the
                body never runs, no real instance exists, and its methods/arrows
@@ -65535,10 +65517,8 @@ int qjs_deep_step_c(JSContext *ctx, int maxN, int fromCursor) {
                     g_cow_busy = _csv;
                 } else {
                     /* A sink has fetched — drive the DEFERRED descriptors (saved before any sink
-                       fetched) THEN this one, through each sink that actually fetches. Self-gated;
-                       the orphan's spin-defer state is saved/restored so a composition fetch's
-                       own spin can't perturb the orphan's defer decision below. */
-                    int _sv_df = g_defer_fired, _sv_sn = g_spin_n, _sv_np = g_noprog_polls, _sv_ps = g_progress_seen;
+                       fetched) THEN this one, through each sink that actually fetches. Self-gated.
+                       #one-BFS: the spin-defer save/restore is GONE (no defer decision below to protect). */
                     for (int _pi = 0; _pi <= g_comp_pend_n; _pi++) {
                         JSValueConst _desc = (_pi < g_comp_pend_n) ? g_comp_pend[_pi] : (JSValueConst)r2;
                         for (int _ci = 0; _ci < g_comp_n; _ci++) {
@@ -65562,7 +65542,6 @@ int qjs_deep_step_c(JSContext *ctx, int maxN, int fromCursor) {
                     }
                     for (int _pi = 0; _pi < g_comp_pend_n; _pi++) JS_FreeValue(ctx, g_comp_pend[_pi]);
                     g_comp_pend_n = 0;
-                    g_defer_fired = _sv_df; g_spin_n = _sv_sn; g_noprog_polls = _sv_np; g_progress_seen = _sv_ps;
                 }
             }
             JS_FreeValue(ctx, r2);
@@ -65586,7 +65565,6 @@ int qjs_deep_step_c(JSContext *ctx, int maxN, int fromCursor) {
             b->qjs_driven_opaque = !_from_real;   /* opaque fallback -> eligible for one real-instance re-drive when a factory instantiates it */
             if (_id) { printf("@DD %llx\n", (unsigned long long)_id); fflush(stdout); }
             g_spin_n = 0;   /* orphan boundary: reset the non-termination surface */
-            if (!(g_defer_fired && _was_exc2)) g_grind_completions++;   /* genuine completion (not an abandoned spin) → progress for the fixpoint */
             driven++;
             /* Per-orphan JSPI yield — give the host scheduler a turn to
                (a) pick a higher-priority fiber across pages via priority.js
@@ -65743,7 +65721,6 @@ int qjs_deep_step_c(JSContext *ctx, int maxN, int fromCursor) {
         b->qjs_driven = 1;   /* mark on the bytecode for O(1) skip on next pick */
         b->qjs_driven_opaque = !_from_real;   /* opaque fallback -> eligible for one real-instance re-drive when a factory instantiates it */
         if (_id) printf("@DD %llx\n", (unsigned long long)_id);   /* attempted — worker persists; next resume skips this id */
-        if (!g_defer_fired) g_grind_completions++;   /* completion progress (a cut targeted spin doesn't count) */
         driven++;
         /* Per-orphan JSPI yield — same rationale as the host-less caller
            path above: scheduler picks higher-priority fiber across pages,
