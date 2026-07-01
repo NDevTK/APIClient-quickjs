@@ -64458,11 +64458,18 @@ static int qjs_grind_interrupt(JSRuntime *rt, void *opaque) {
            run under qjs_driving and starvation is owned by the YIELD_POLL park + the drive loop's output check. */
         return 0;
     }
-    if (g_bfs_drive_active) {                            /* BFS drive: same-back-edge + flat-seen = concrete spin */
+    if (g_bfs_drive_active) {
+        /* #one-BFS: a PREEMPTIBLE BFS drive (DRIVEBREADTH -> qjs_run_forced_flow, qjs_driving set) PARKS a
+           spinner — snapshot all four trails, resume via the grind's repick — never throws it away. Defer to
+           the YIELD_POLL park; the throw below would DEFEAT the park (a thrown flow is lost, not resumable). */
+        if (rt->qjs_driving) return 0;
+        /* Non-preemptible fallback: plain fn.call BFS drives (connectedCallback/form/handler) not yet routed
+           through the primitive. same-back-edge + flat-seen throw-skip so a spinner can't hang boot. TODO route
+           those through DRIVEBREADTH.call(recv, fn, …), then this whole no-progress count is dead — delete it. */
         JSStackFrame *sf = rt->current_stack_frame;
         uint8_t *pc = sf ? sf->cur_pc : NULL;
         if (pc == g_bfs_last_pc && qjs_fe_seen_n == g_bfs_last_seen) {
-            if (++g_bfs_noprog >= QJS_DEFER_QUANTUM) { g_bfs_noprog = 0; return 1; }  /* throw → __hostDrive's per-global catch skips it */
+            if (++g_bfs_noprog >= QJS_DEFER_QUANTUM) { g_bfs_noprog = 0; return 1; }  /* throw → per-global catch skips it */
         } else {                                         /* moved to a new back-edge OR forked = real progress */
             g_bfs_last_pc = pc; g_bfs_last_seen = qjs_fe_seen_n; g_bfs_noprog = 0;
         }
