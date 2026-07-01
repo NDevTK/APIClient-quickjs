@@ -64091,6 +64091,10 @@ static int qjs_park_forced_flow(JSContext *ctx, size_t cow_mark, size_t vt_mark,
     qjs_drive_flow[ix].qjs_yield_entry = rt->qjs_yield_entry;
     qjs_drive_flow[ix].flow_depth = g_flow_depth;
     qjs_drive_mark[ix] = (unsigned)g_emit_n;
+    /* OBSERVABILITY (#no-silent, #core-mechanism): a PARK is the foundation of "UNBOUNDED, resumable" — surface
+       it so park->resume is verifiable and the WFQ's parking is measurable, not invisible. cowN = heap words this
+       flow's delta carries; emitN = emitted-output mark at park (its resume e0). */
+    printf("@WHY {\"phase\":\"flow_park\",\"ix\":%d,\"cowWords\":%zu,\"emitN\":%d}\n", ix, cnt, g_emit_n); fflush(stdout);
     return 1;
 }
 /* Run the ACTIVE drive chain under the WFQ: resume WHILE it emits new @H/@S; on the
@@ -64113,6 +64117,7 @@ QJS_JSEXPORT int qjs_drive_run(JSContext *ctx, int e0) {
             qjs_drive_mark[ix] = (unsigned)g_emit_n;
             qjs_drive_flow[ix].value = (unsigned)(g_emit_n - e0_start);   /* WFQ value-of-information: @H/@S this run produced (it parked because it then went silent) */
             rt->js_stack = NULL; rt->current_stack_frame = NULL; rt->qjs_yield_entry = NULL;
+            printf("@WHY {\"phase\":\"grind_park\",\"ix\":%d,\"value\":%u,\"emitN\":%d}\n", ix, qjs_drive_flow[ix].value, g_emit_n); fflush(stdout);   /* OBSERVABILITY: grind-side park (see flow_park) */
             return 1;
         }
         rt->qjs_resume_chain = 1;
@@ -64434,6 +64439,9 @@ QJS_JSEXPORT void qjs_drive_repick(JSContext *ctx) {
         }
         qjs_flow_restore(ctx, &pf[i]);
         rt->qjs_yielded = 1;   /* the restored flow is at a yield point — qjs_drive_run resumes it */
+        /* OBSERVABILITY: a parked flow is being RESUMED (pairs with flow_park/grind_park). fromIDB=1 means it
+           round-tripped through eviction; xsession=1 means it reloaded from a PRIOR session (cross-restart resume). */
+        printf("@WHY {\"phase\":\"flow_resume\",\"ix\":%d,\"value\":%u,\"fromIDB\":%d,\"xsession\":%d}\n", i, pf[i].value, just_restored, (int)pf[i].cross_session); fflush(stdout);
         int parked = qjs_drive_run(ctx, (int)pm[i]);
         if (!parked && g_cow_enabled) qjs_cow_discard(qjs_cow_heap_base());
     }
