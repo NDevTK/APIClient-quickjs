@@ -4763,6 +4763,18 @@ static void *flow_fallback_realloc(void *ptr, size_t size) {
 }
 static uint8_t *g_flow_arena = NULL;
 static size_t g_flow_arena_cap = 0, g_flow_arena_off = 0;
+/* WFQ drive-registry array bounds (qjs_drive_flow/_cow/_mark, js_realloc'd ABOVE __heap_base so
+   otherwise COW-tracked). These arrays are SCHEDULER METADATA, not flow state: a park writes them
+   WHILE a flow is capturing (g_flow_capture set), so without this exclusion qjs_cow_undo_log would log
+   the registry bookkeeping and a per-flow heap revert would REVERT it — reading stale evic_len/handle
+   pointers and corrupting park/resume (the flow_resume-never-fires root). Excluded exactly like the
+   flow arena + js_stack chunks. Updated on every (re)alloc in qjs_drive_park_grow. */
+static size_t g_drive_reg_lo[3] = {0,0,0}, g_drive_reg_hi[3] = {0,0,0};
+static int qjs_drive_reg_contains(size_t addr) {
+    return (addr >= g_drive_reg_lo[0] && addr < g_drive_reg_hi[0]) ||
+           (addr >= g_drive_reg_lo[1] && addr < g_drive_reg_hi[1]) ||
+           (addr >= g_drive_reg_lo[2] && addr < g_drive_reg_hi[2]);
+}
 /* arena[0, committed) survives flow/orphan resets: a grind orphan that COMMITS (creates a cross-
    orphan instance) advances this boundary so the instance's arena allocations persist as baseline. */
 static size_t g_flow_arena_committed = 0;
@@ -21424,6 +21436,9 @@ QJS_JSEXPORT void qjs_cow_undo_log(size_t addr, size_t size) {
     /* Exclude the per-flow arena: its objects are flow-local scratch, discarded wholesale by the
        FLOWEND bump-reset (not reverted), and references to them in baseline objects ARE reverted. */
     if (g_flow_arena && addr >= (size_t)g_flow_arena && addr < (size_t)g_flow_arena + g_flow_arena_cap) return;
+    /* Exclude the WFQ drive-registry arrays: scheduler metadata, NOT flow state — reverting a park's
+       registry bookkeeping mid-flow reads stale evic_len/handle and breaks park/resume. */
+    if (qjs_drive_reg_contains(addr)) return;
     w0 = (addr - hb) >> 3; w1 = (addr + size - 1 - hb) >> 3;
     for (w = w0; w <= w1; w++) {
         if (w >= qjs_cow_words) { qjs_cow_shadow_grow(w); if (w >= qjs_cow_words) { g_cow_saturated = 1; continue; } }   /* heap grew past shadow -> GROW (gm-backed) to cover w, never drop -> the gc_obj_list link reverts -> no ghost */
@@ -21480,6 +21495,11 @@ QJS_JSEXPORT void qjs_cow_undo_revert_to(size_t mark) {
                the low bytes would risk clobbering a live object's gc_obj_type/mark. EXCLUDE shapes: a
                shape's ref_count is word-log-owned (every js_dup_shape/js_free_shape is a direct untyped
                write; the defer trail reverts only the p->shape POINTER), so its header MUST byte-revert. */
+        } else if (qjs_drive_reg_contains(addr)) {
+            /* This heap word is now inside a WFQ drive-registry array (js_realloc reused a freed flow
+               object's memory for it). The undo entry is the flow object's stale value; restoring it would
+               clobber live scheduler state (evic_len/handle) and break park/resume. Skip the restore —
+               the registry owns these bytes now (excluded on the log side too, in qjs_cow_undo_log). */
         } else {
             *(uint64_t *)addr = qjs_cow_undo[i].old;
         }
@@ -64011,14 +64031,46 @@ static JSFlow *qjs_drive_flow = NULL;
 static JSCowDelta *qjs_drive_cow = NULL;
 static unsigned *qjs_drive_mark = NULL;   /* g_emit_n at park time (output-order tiebreak / resume e0) */
 static int qjs_drive_n = 0, qjs_drive_cap = 0;
+/* PING-PONG spare: the previous drain's now-empty registry buffer, reused as repick's rebuild target so
+   the pool registry is never abandoned per call (it only GROWS geometrically, like the leaf/term tables). */
+static JSFlow *qjs_drive_flow_b = NULL;
+static JSCowDelta *qjs_drive_cow_b = NULL;
+static unsigned *qjs_drive_mark_b = NULL;
+static int qjs_drive_cap_b = 0;
+QJS_JSEXPORT int qjs_drive_pending(void) { return qjs_drive_n; }   /* registry-survival probe / future host-pump API */
+/* Publish the ACTIVE registry's address bounds so qjs_cow_undo_log/revert exclude its (scheduler-metadata)
+   words. Called after every (re)alloc AND every ping-pong swap — the active buffer changed. */
+static void qjs_drive_publish_bounds(void) {
+    g_drive_reg_lo[0] = (size_t)qjs_drive_flow; g_drive_reg_hi[0] = (size_t)qjs_drive_flow + (size_t)qjs_drive_cap * sizeof(JSFlow);
+    g_drive_reg_lo[1] = (size_t)qjs_drive_cow;  g_drive_reg_hi[1] = (size_t)qjs_drive_cow  + (size_t)qjs_drive_cap * sizeof(JSCowDelta);
+    g_drive_reg_lo[2] = (size_t)qjs_drive_mark; g_drive_reg_hi[2] = (size_t)qjs_drive_mark + (size_t)qjs_drive_cap * sizeof(unsigned);
+}
 static int qjs_drive_park_grow(JSContext *ctx) {
+    (void)ctx;
     if (qjs_drive_n < qjs_drive_cap) return 1;
     int nc = qjs_drive_cap ? qjs_drive_cap * 2 : 8;
-    JSFlow *nf = js_realloc(ctx, qjs_drive_flow, (size_t)nc * sizeof(JSFlow)); if (!nf) return 0; qjs_drive_flow = nf;
-    JSCowDelta *nd = js_realloc(ctx, qjs_drive_cow, (size_t)nc * sizeof(JSCowDelta)); if (!nd) return 0; qjs_drive_cow = nd;
-    unsigned *nm = js_realloc(ctx, qjs_drive_mark, (size_t)nc * sizeof(unsigned)); if (!nm) return 0; qjs_drive_mark = nm;
-    memset(qjs_drive_flow + qjs_drive_cap, 0, (size_t)(nc - qjs_drive_cap) * sizeof(JSFlow));   /* new slots zero -> evic_blob NULL / evic_len 0 (live) for park sites that assign fields directly */
-    qjs_drive_cap = nc; return 1;
+    /* Allocate the WFQ registry from the COW PERSISTENT POOL (qjs_cow_palloc), NOT js_realloc. A park
+       writes the registry mid-flow, and a flow's revert desyncs dlmalloc's mstate (the COW heap-revert
+       can't restore gm below __heap_base) — so js_realloc'd registry memory got HANDED OUT AGAIN to a
+       later flow object, whose write corrupted evic_len/handle (measured: evic_len 0 at park -> a stale
+       address at repick, same location). Pool memory is NEVER freed (no free-list churn -> no double-
+       alloc) and written under g_cow_busy (never barrier-logged). Grow = new pool block + copy + abandon
+       old (bounded leak, doublings only), exactly like the leaf-table / term-table scheduler metadata. */
+    JSFlow *nf = (JSFlow *)qjs_cow_palloc((size_t)nc * sizeof(JSFlow)); if (!nf) return 0;
+    JSCowDelta *nd = (JSCowDelta *)qjs_cow_palloc((size_t)nc * sizeof(JSCowDelta)); if (!nd) return 0;
+    unsigned *nm = (unsigned *)qjs_cow_palloc((size_t)nc * sizeof(unsigned)); if (!nm) return 0;
+    int _sv = g_cow_busy; g_cow_busy = 1;   /* registry bookkeeping must never be barrier-logged/reverted */
+    memset(nf, 0, (size_t)nc * sizeof(JSFlow));
+    if (qjs_drive_cap) {
+        memcpy(nf, qjs_drive_flow, (size_t)qjs_drive_cap * sizeof(JSFlow));
+        memcpy(nd, qjs_drive_cow,  (size_t)qjs_drive_cap * sizeof(JSCowDelta));
+        memcpy(nm, qjs_drive_mark, (size_t)qjs_drive_cap * sizeof(unsigned));
+    }
+    g_cow_busy = _sv;
+    qjs_drive_flow = nf; qjs_drive_cow = nd; qjs_drive_mark = nm;
+    qjs_drive_cap = nc;
+    qjs_drive_publish_bounds();   /* exclude the (grown) registry from COW log/revert */
+    return 1;
 }
 /* PARK a re-entrant forced sub-flow (qjs_run_forced_flow) into the SAME WFQ registry the grind uses,
    so qjs_drive_repick resumes it later (output-ordered) instead of qjs_run_forced_flow FREEING it.
@@ -64090,6 +64142,13 @@ static int qjs_park_forced_flow(JSContext *ctx, size_t cow_mark, size_t vt_mark,
     qjs_drive_flow[ix].current_stack_frame = rt->current_stack_frame;
     qjs_drive_flow[ix].qjs_yield_entry = rt->qjs_yield_entry;
     qjs_drive_flow[ix].flow_depth = g_flow_depth;
+    /* Fully initialize the eviction/value fields — park_grow's memset only covers NEWLY-grown slots
+       [old_cap,new_cap), so a REUSED slot (ix < old_cap, previously held a resumed flow) would retain
+       stale evic_len/evic_key here and repick would mis-read this RAM-live flow as EVICTED, fetch a
+       garbage IDB key, fail, and never resume it (the flow_resume-never-fires root). qjs_flow_save
+       zeroes these for the grind_park path; this flow_park path must too. */
+    qjs_drive_flow[ix].evic_blob = NULL; qjs_drive_flow[ix].evic_len = 0; qjs_drive_flow[ix].evic_key = 0;
+    qjs_drive_flow[ix].value = 0; qjs_drive_flow[ix].cross_session = 0;
     qjs_drive_mark[ix] = (unsigned)g_emit_n;
     /* OBSERVABILITY (#no-silent, #core-mechanism): a PARK is the foundation of "UNBOUNDED, resumable" — surface
        it so park->resume is verifiable and the WFQ's parking is measurable, not invisible. cowN = heap words this
@@ -64378,33 +64437,16 @@ static void qjs_drive_evict_pressure(JSContext *ctx) {
    value is the platform RAM ceiling; a targeted design-correctness test lowers it to force an
    evict->IDB->restore round-trip on a small scenario. */
 QJS_JSEXPORT void qjs_set_evic_floor(size_t bytes) { g_evic_floor = bytes; }
-/* RAM->RAM relocation (cheap, per-chunk — no contiguous blob): exercised on every resume to keep the
-   pointer fixup continuously verified WITHOUT the deep-stack blowup that an unconditional contiguous
-   blob serialize causes for an unbounded spinner (c_normal). The blob serialize/deserialize above is
-   the host-triggered EVICTION path (RAM pressure, selectively, to IDB), not an every-resume operation. */
-static void qjs_drive_relocate(JSContext *ctx, JSFlow *f) {
-    JSRuntime *rt = ctx->rt;
-    if (!f->js_stack) return;
-    int nc = 0; for (JSStackChunk *c = f->js_stack; c; c = c->prev) nc++;
-    JSChunkMap *map = js_malloc(ctx, (size_t)nc * sizeof(JSChunkMap)); if (!map) return;
-    int i = 0;
-    for (JSStackChunk *c = f->js_stack; c; c = c->prev, i++) {
-        size_t cap = (size_t)(c->limit - c->data);
-        JSStackChunk *n2 = js_malloc_rt(rt, sizeof(JSStackChunk) + cap);
-        if (!n2) { for (int j = 0; j < i; j++) js_free_rt(rt, map[j].newc); js_free(ctx, map); return; }
-        memcpy(n2, c, sizeof(JSStackChunk) + cap);
-        map[i].oldc = c; map[i].newc = n2; map[i].cap = cap;
-    }
-    qjs_drive_fixup(f, map, nc);
-    for (i = 0; i < nc; i++) js_free_rt(rt, map[i].oldc);
-    js_free(ctx, map);
-}
 QJS_JSEXPORT void qjs_drive_repick(JSContext *ctx) {
     JSRuntime *rt = ctx->rt;
-    if (qjs_drive_n == 0) return;
+    if (qjs_drive_n == 0) { printf("@WHY {\"phase\":\"repick_empty\"}\n"); fflush(stdout); return; }   /* #no-silent-failure: repick found NO parked flows to resume — surface it so "park happened but registry didn't survive to repick" is visible, not invisible */
     int pn = qjs_drive_n;
-    JSFlow *pf = qjs_drive_flow; JSCowDelta *pc = qjs_drive_cow; unsigned *pm = qjs_drive_mark;
-    qjs_drive_flow = NULL; qjs_drive_cow = NULL; qjs_drive_mark = NULL; qjs_drive_n = 0; qjs_drive_cap = 0;
+    JSFlow *pf = qjs_drive_flow; JSCowDelta *pc = qjs_drive_cow; unsigned *pm = qjs_drive_mark; int pcap = qjs_drive_cap;
+    /* PING-PONG: swap in the SPARE buffer as the rebuild target (re-parks fill it); pf becomes the next
+       spare below. Reused, never abandoned per repick — only park_grow's geometric growth allocates. */
+    qjs_drive_flow = qjs_drive_flow_b; qjs_drive_cow = qjs_drive_cow_b; qjs_drive_mark = qjs_drive_mark_b; qjs_drive_cap = qjs_drive_cap_b;
+    qjs_drive_n = 0;
+    qjs_drive_publish_bounds();   /* bounds now cover the spare (active) buffer — or [0,0) if the spare is still NULL */
     /* WFQ value-of-information ordering: resume highest-emitted-output flows first (insertion sort by
        value, descending; pn is small). The ONE scheduler reads emitted output to order resume — never
        a RAM gate or a static guess. Nothing is dropped (every flow still resumes this pass); ordering
@@ -64431,7 +64473,10 @@ QJS_JSEXPORT void qjs_drive_repick(JSContext *ctx) {
                 continue;
             }
         }
-        if (!just_restored) qjs_drive_relocate(ctx, &pf[i]);   /* #5 eviction round-trip: relocate this parked flow's stack chunks to fresh addresses (a just-restored flow already has fresh chunks) — exercises the chunk-internal pointer fixup */
+        /* In-session resume runs on the SAME chunks the flow parked on (they were never freed — park
+           NULLs rt->js_stack but keeps the chain), so no relocation: cow_apply + flow_restore resume in
+           place. A from-IDB flow (just_restored) already holds freshly-deserialized chunks. Relocation is
+           the EVICTION round-trip's job (serialize→free→reload), not an every-resume operation. */
         if (g_cow_enabled) {
             if (pf[i].cross_session) qjs_cow_apply_xsession(qjs_cow_heap_base(), &pc[i]);   /* #5 reloaded in a NEW session: re-establish the heap via the word-log (no in-session dups) — heap is at baseline here, the precondition apply_xsession needs */
             else qjs_cow_apply(qjs_cow_heap_base(), &pc[i]);   /* the one park primitive: word-log (field pointers -> new) + vt + buffer/shape trails — the full inverse of qjs_cow_capture */
@@ -64447,7 +64492,8 @@ QJS_JSEXPORT void qjs_drive_repick(JSContext *ctx) {
     }
     qjs_drive_evict_pressure(ctx);   /* #5 after the re-parks: evict the cold tail to IDB if parked-stack RAM is over the floor */
     if (order) js_free(ctx, order);
-    js_free(ctx, pf); js_free(ctx, pc); js_free(ctx, pm);
+    /* pf/pc/pm (the fully-drained set) become the SPARE for the next repick — reused, not abandoned. */
+    qjs_drive_flow_b = pf; qjs_drive_cow_b = pc; qjs_drive_mark_b = pm; qjs_drive_cap_b = pcap;
 }
 /* The deep-grind interrupt handler (op-counted via js_poll_interrupts, so it
    fires at every OP_if/back-edge — catches CONCRETE spins the opaque-only spin
@@ -65014,10 +65060,10 @@ int qjs_deep_step_c(JSContext *ctx, int maxN, int fromCursor) {
            them first (qjs_drive_repick = cow_apply/heap-switch IN, WFQ-ordered); repick drains + NULLs the
            registry so the frees below are no-ops. A still-heavy flow re-parks (resumable — UNBOUNDED). */
         if (qjs_drive_n > 0) qjs_drive_repick(ctx);
-        if (qjs_drive_flow) { js_free(ctx, qjs_drive_flow); qjs_drive_flow = NULL; }   /* no-op if repick drained */
-        if (qjs_drive_cow) { js_free(ctx, qjs_drive_cow); qjs_drive_cow = NULL; }
-        if (qjs_drive_mark) { js_free(ctx, qjs_drive_mark); qjs_drive_mark = NULL; }
+        /* Registry arrays are COW-POOL memory now (never js_free'd) — abandon the pointers, don't free. */
+        qjs_drive_flow = NULL; qjs_drive_cow = NULL; qjs_drive_mark = NULL;
         qjs_drive_n = 0; qjs_drive_cap = 0;
+        g_drive_reg_lo[0] = g_drive_reg_hi[0] = g_drive_reg_lo[1] = g_drive_reg_hi[1] = g_drive_reg_lo[2] = g_drive_reg_hi[2] = 0;
         if (!g_cow_boot_mode) qjs_cow_reset(JS_GetRuntime(ctx));   /* COW-as-snapshot: the boot-once baseline persists; don't wipe it per-drive */
         qjs_deep_net = js_malloc(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1));
         qjs_deep_net2 = js_mallocz(ctx, (size_t)(qjs_deep_rb_n > 0 ? qjs_deep_rb_n : 1));   /* 0 until the post-insts fill loop below; insts aren't populated yet here */

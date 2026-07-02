@@ -1158,11 +1158,7 @@ int main(int argc, char **argv) {
             extern int g_emit_n;   /* #9: emitted-output mark the WFQ reads (same global the boot path + the deep grind read) */
             extern int qjs_drive_run(JSContext *, int);
             extern void qjs_drive_repick(JSContext *);
-            /* #5/#7/#8/#9/#10: re-pick drive flows PARKED on a prior drive's silent window —
-               resume each on ITS OWN heap (per-flow COW) by output, BEFORE this drive's
-               schedule, so a flow that becomes productive (shared state changed) resumes
-               rather than being abandoned. Heap is at the boot baseline here (cow_drive_restore). */
-            qjs_drive_repick(g_boot_ctx);
+            extern int qjs_drive_pending(void);
             for (int i = 1; i < argc; i++) {
                 if (!strncmp(argv[i], "--fe-", 5)) continue;
                 int _e0 = g_emit_n;
@@ -1171,10 +1167,17 @@ int main(int argc, char **argv) {
                    resume this chain WHILE it emits new @H/@S; on the first QUANTUM-silent
                    window PARK it — snapshot (qjs_flow_save) + its own page delta (COW),
                    NEVER freed/abandoned — so a forced/opaque deep recursion that emits
-                   nothing is starved to ~0 CPU yet stays resumable (re-picked next drive by
-                   output). The deep-grind's proven form (quickjs.c ~63204), now on the drive. */
+                   nothing is starved to ~0 CPU yet stays resumable (re-picked below by output). */
                 qjs_drive_run(g_boot_ctx, _e0);
             }
+            /* #5/#7/#8/#9/#10 in-callMain RESUME of the parked residue. The registry does NOT survive
+               across the --fe-drive callMain boundary (measured: nAtEntry==0 every drive), so resume MUST
+               happen HERE, in the SAME callMain that parked the flows, while their heap-stack chunks + COW
+               deltas are live. The OLD repick at do_drive START saw an empty registry EVERY time
+               (repick_empty). Each park already reverted its own writes to baseline (qjs_cow_to_baseline),
+               so the heap is at baseline for repick's per-flow cow_apply. ONE round for now (proof the
+               core resume fires + is non-corrupting); the full preemptible residue drain is the next step. */
+            if (qjs_drive_pending() > 0) qjs_drive_repick(g_boot_ctx);
             qjs_set_driving(g_boot_ctx, 0);   /* async job re-drives in js_std_loop run normally (no opcode-yield) */
             if (rc == 0) js_std_loop(g_boot_ctx);
             { extern void qjs_cow_stats_emit(void); qjs_cow_stats_emit(); }   /* COW: within-drive activity, emitted BEFORE the next drive's image-restore wipes the linear-memory counters */
