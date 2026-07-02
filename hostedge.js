@@ -1317,7 +1317,9 @@
          aborts 1->5 — an unverified moat perturbation with no fixture benefit, so it's NOT applied here.
          The collapse step is correct in principle but must land with a fixture that exercises a forced
          timer callback writing a shared cell, so the gain is verified rather than asserted. */
-      try { fn.call(G); } catch (e) {}
+      /* #one-BFS: a forced timer callback must run through the ONE preemptible primitive (park/resume via
+         heap switching), not a plain driving:0 fn.call that runs it to completion non-preemptibly. */
+      try { if (DRIVEBREADTH) DRIVEBREADTH.call(G, fn); else fn.call(G); } catch (e) {}
       _drained++;
       // Per-key spinner accounting (ACROSS flushes): a source-text key that runs
       // _SPIN_K times without advancing _hProg is a no-output spinner — record it in
