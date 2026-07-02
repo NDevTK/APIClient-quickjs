@@ -1127,27 +1127,24 @@ int main(int argc, char **argv) {
                bound: the recursion RUNS on the heap stack and is paused by output,
                never collapsed to a same-args fixpoint. (TODO: detach the silent flow
                to a resumable per-flow handle instead of free — the full #5/#7 form.) */
+            /* #boot-hard-gap ERASED (frees-on-silent -> PARK): establish the COW baseline BEFORE the drain (the
+               IN-FLUX baseline CLAUDE.md calls for) so a boot flow that opcode-yields is SNAPSHOT-ABLE; then
+               drain via qjs_drive_run, which RESUMES while emitting and PARKS on silence into the drive registry
+               (resumable via repick) — instead of qjs_free_suspended_trampoline_frames ABANDONING it (the
+               depth-cap-in-disguise that lost a silent-heavy flow's work + forced a redundant driving:0 re-drive). */
+            { extern void qjs_cow_boot_baseline(JSRuntime *); qjs_cow_boot_baseline(JS_GetRuntime(g_boot_ctx)); }
             if (rc == 0) {
-                extern int g_emit_n;
+                extern int g_emit_n; extern int qjs_drive_run(JSContext *, int);
                 qjs_set_driving(g_boot_ctx, 1);
                 JSContext *_c1;
                 for (;;) {
                     int _r = JS_ExecutePendingJob(g_boot_rt, &_c1);
-                    while (qjs_take_yielded(g_boot_ctx)) {
-                        int _mark = g_emit_n;
-                        JSValue _v = qjs_resume_chain_call(g_boot_ctx);
-                        JS_FreeValue(g_boot_ctx, _v);
-                        if (g_emit_n == _mark) {            /* silent resume -> STARVE */
-                            qjs_free_suspended_trampoline_frames(g_boot_ctx);
-                            break;
-                        }
-                    }
-                    if (_r <= 0) break;                     /* no more pending jobs */
+                    qjs_drive_run(g_boot_ctx, g_emit_n);    /* resume the yielded chain; PARK silent (resumable), NOT free */
+                    if (_r <= 0) break;
                 }
                 qjs_set_driving(g_boot_ctx, 0);
                 js_std_loop(g_boot_ctx);                    /* final settle (timers/os) at driving=0 */
             }
-            { extern void qjs_cow_boot_baseline(JSRuntime *); qjs_cow_boot_baseline(JS_GetRuntime(g_boot_ctx)); }   /* COW-as-snapshot: the post-boot heap is the base every DRIVE forks from */
             { extern int qjs_drive_reload_session(JSContext *); int _rl = qjs_drive_reload_session(g_boot_ctx);   /* #5 cross-session: AUTO re-inject this bundle-hash's persisted frontier at boot so exploration resumes across browser restarts (unbounded-across-sessions). */
               if (_rl > 0) { printf("@WHY {\"phase\":\"xsession_reload\",\"flows\":%d}\n", _rl); fflush(stdout); } }
             return rc;
