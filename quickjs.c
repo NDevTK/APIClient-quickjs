@@ -65347,8 +65347,15 @@ int qjs_deep_step_c(JSContext *ctx, int maxN, int fromCursor) {
             b = cb; _ix = _ci; break;   /* #one-BFS: sequential pick (first un-driven); the ONE WFQ (qjs_run_forced_flow quantum + host priority.js) does the scheduling — no separate vt/net-guess ordering */
         }
         if (b == NULL) {
-            /* #one-BFS: all orphans driven once (parked ones drain via qjs_drive_repick). No separate
-               spin-defer/pause-set second scheduler. */
+            /* #one-BFS: all orphans driven once. DRAIN the parked residue HERE — resume each forced-flow
+               that quantum-PARKED (a heavy/silent orphan, e.g. a 20M-iter compute before its fetch) to
+               completion via the WFQ, in THIS grind callMain where its heap-stack + COW delta are live
+               (the registry doesn't survive the callMain boundary). Now that resume works (registry in
+               the flow-immune pool), this carries the heavy orphan to its emitted @H — replacing the old
+               driving:0 drive-to-completion. A finite orphan completes; an over-forced opaque infinite
+               recursion is the ROOT bug (opaque-branch soundness), never capped here. (EXPERIMENTAL:
+               synchronous; the preemptible JSPI-yielding form is the next step.) */
+            while (qjs_drive_pending() > 0) qjs_drive_repick(ctx);
             printf("@DPAUSE\n"); fflush(stdout);
             break;
         }
@@ -65668,9 +65675,13 @@ int qjs_deep_step_c(JSContext *ctx, int maxN, int fromCursor) {
             JSValue this_opq = qjs_opq_make(ctx, 1, "deep-drive-this", qjs_t_opaque());
             qjs_dir_b = b; qjs_dir_target = pos; qjs_dir_active = 1;
             qjs_fe_seen_reset();   /* fresh loop-revisit bound per directed drive (one execution unit) */
-            JSValue r = _is_cls_ctor
-                ? JS_CallConstructor(ctx, fo, nargs, args2)
-                : JS_Call(ctx, fo, (qjs_deep_recv && !JS_IsUndefined(qjs_deep_recv[_ix])) ? qjs_deep_recv[_ix] : this_opq, nargs, args2);
+            /* Drive the orphan through the PREEMPTIBLE forced-flow primitive (driving:1), NOT a raw
+               driving:0 JS_Call. A long/silent orphan (e.g. a 20M-iter compute before its fetch) then
+               PARKS on its quantum and RESUMES across the WFQ drain instead of pegging the drive to
+               completion non-preemptibly. This is the driving:0 violation the pause/resume design exists
+               to delete — now that resume works (registry in the flow-immune pool), the forced flow
+               carries the heavy orphan to its emitted @H via repick. */
+            JSValue r = qjs_run_forced_flow(ctx, fo, (qjs_deep_recv && !JS_IsUndefined(qjs_deep_recv[_ix])) ? qjs_deep_recv[_ix] : this_opq, nargs, args2, _is_cls_ctor);
             /* An async @T method suspends at an `await` BEFORE its gated
                fetch (`if(await this.#e.getItem(o))return; …await fetch(…)`);
                the call above only runs it to that point. Resume the

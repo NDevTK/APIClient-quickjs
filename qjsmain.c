@@ -1175,8 +1175,13 @@ int main(int argc, char **argv) {
                happen HERE, in the SAME callMain that parked the flows, while their heap-stack chunks + COW
                deltas are live. The OLD repick at do_drive START saw an empty registry EVERY time
                (repick_empty). Each park already reverted its own writes to baseline (qjs_cow_to_baseline),
-               so the heap is at baseline for repick's per-flow cow_apply. ONE round for now (proof the
-               core resume fires + is non-corrupting); the full preemptible residue drain is the next step. */
+               so the heap is at baseline for repick's per-flow cow_apply. ONE round: resume each BFS-arm
+               parked flow a quantum. NOT a while-drain here — a forced-opaque BFS arm can be infinite, and
+               (unlike a grind orphan, whose finiteness the old driving:0 drive already relied on) these
+               arms were simply LOST before, so a single round is strictly better without risking a new
+               synchronous hang. The heavy long-silent residue is the GRIND's orphan, drained there. The
+               preemptible JSPI-yielding multi-round form (evicting a persistently-silent arm to IDB) is
+               the next step. */
             if (qjs_drive_pending() > 0) qjs_drive_repick(g_boot_ctx);
             qjs_set_driving(g_boot_ctx, 0);   /* async job re-drives in js_std_loop run normally (no opcode-yield) */
             if (rc == 0) js_std_loop(g_boot_ctx);
