@@ -65009,7 +65009,12 @@ int qjs_deep_step_c(JSContext *ctx, int maxN, int fromCursor) {
         if (qjs_deep_net) { js_free(ctx, qjs_deep_net); qjs_deep_net = NULL; }
         if (qjs_deep_net2) { js_free(ctx, qjs_deep_net2); qjs_deep_net2 = NULL; }
         if (qjs_deep_sink) { js_free(ctx, qjs_deep_sink); qjs_deep_sink = NULL; }
-        if (qjs_drive_flow) { js_free(ctx, qjs_drive_flow); qjs_drive_flow = NULL; }   /* #5/#9 drive park registry */
+        /* VIOLATION ERASED: this js_free DISCARDED parked flows (their COW-snapshotted heap-switch state) —
+           a direct violation of the pause/resume design (parked work must RESUME, never be thrown away). RESUME
+           them first (qjs_drive_repick = cow_apply/heap-switch IN, WFQ-ordered); repick drains + NULLs the
+           registry so the frees below are no-ops. A still-heavy flow re-parks (resumable — UNBOUNDED). */
+        if (qjs_drive_n > 0) qjs_drive_repick(ctx);
+        if (qjs_drive_flow) { js_free(ctx, qjs_drive_flow); qjs_drive_flow = NULL; }   /* no-op if repick drained */
         if (qjs_drive_cow) { js_free(ctx, qjs_drive_cow); qjs_drive_cow = NULL; }
         if (qjs_drive_mark) { js_free(ctx, qjs_drive_mark); qjs_drive_mark = NULL; }
         qjs_drive_n = 0; qjs_drive_cap = 0;
