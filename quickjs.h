@@ -1168,6 +1168,14 @@ JS_EXTERN void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, voi
    (the interpreter falls through to the normal ToBool). Set once at engine init. */
 typedef int (*JSBranchHook)(JSContext *ctx, JSValueConst cond);
 JS_EXTERN void JS_SetBranchHook(JSBranchHook h);
+
+/* APIClient forced-execution COW: per-flow isolation. JS_SetFlowLocalMark(1) stamps objects created while a
+   flow runs as flow-local (discarded with the run); mark 0 (setup) makes them baseline. JS_SetCowHook installs
+   a callback invoked BEFORE a property write to a baseline object, so the host records the old state and reverts
+   it between flows. */
+typedef void (*JSCowHook)(JSContext *ctx, JSValueConst obj, JSAtom prop);
+JS_EXTERN void JS_SetFlowLocalMark(int m);
+JS_EXTERN void JS_SetCowHook(JSCowHook h);
 /* if can_block is true, Atomics.wait() can be used */
 JS_EXTERN void JS_SetCanBlock(JSRuntime *rt, bool can_block);
 /* set the [IsHTMLDDA] internal slot */

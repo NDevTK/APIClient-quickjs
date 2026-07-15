@@ -1106,6 +1106,9 @@ struct JSObject {
     uint8_t is_uncatchable_error : 1; /* if true, error is not catchable */
     uint8_t tmp_mark : 1; /* used in JS_WriteObjectRec() */
     uint8_t is_HTMLDDA : 1; /* specific annex B IsHtmlDDA behavior */
+    uint8_t flow_local : 1; /* APIClient forced-exec: created DURING a flow run (not baseline). Writes to a
+                               baseline object (flow_local=0) are COW-captured + reverted between flows; a
+                               flow-local object is discarded with its run, so its writes are never captured. */
     uint16_t class_id; /* see JS_CLASS_x */
     /* byte offsets: 16/24 */
     JSShape *shape; /* prototype and property names + flag */
@@ -6104,6 +6107,15 @@ static __maybe_unused void JS_DumpShapes(JSRuntime *rt)
 
 /* 'props[]' is used to initialized the object properties. The number
    of elements depends on the shape. */
+uint8_t g_flow_local_mark = 0;   /* forced-exec: stamps new objects baseline(0)/flow-local(1); see JS_SetFlowLocalMark */
+static JSCowHook g_cow_hook = NULL;   /* forced-exec: called before a write to a baseline object (COW capture) */
+/* Ask the host to record a baseline object's pre-write state (for per-flow revert). A flow-local object is
+   discarded with its run, so its writes are never captured. Defined early — the write sites are earlier. */
+static inline void cow_capture(JSContext *ctx, JSValueConst obj, JSAtom prop) {
+    if (g_cow_hook && JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT && !JS_VALUE_GET_OBJ(obj)->flow_local)
+        g_cow_hook(ctx, obj, prop);
+}
+
 static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID class_id,
                                      JSProperty *props)
 {
@@ -6124,6 +6136,7 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
     p->tmp_mark = 0;
     p->is_HTMLDDA = 0;
     p->is_prototype = 0;
+    p->flow_local = g_flow_local_mark;   /* forced-exec: 0 during setup (baseline), 1 while a flow runs */
     p->first_weak_ref = NULL;
     p->u.opaque = NULL;
     p->shape = sh;
@@ -10508,6 +10521,8 @@ static int JS_SetPropertyInternal2(JSContext *ctx, JSValueConst obj, JSAtom prop
     JSPropertyDescriptor desc;
     int desc_flags;
     int ret;
+
+    cow_capture(ctx, obj, prop);   /* forced-exec: record the baseline object's pre-write state for per-flow revert */
 
     switch(JS_VALUE_GET_TAG(this_obj)) {
     case JS_TAG_NULL:
@@ -17949,6 +17964,13 @@ static bool needs_backtrace(JSValue exc)
    (0/1) for a concolic cond, or -1 to fall through to the normal ToBool (the value is not concolic). */
 static JSBranchHook g_branch_hook = NULL;
 void JS_SetBranchHook(JSBranchHook h) { g_branch_hook = h; }
+
+/* forced-exec COW: baseline vs flow-local marking + a write-capture hook. g_flow_local_mark stamps every new
+   object (0 during setup = baseline, 1 while a flow runs = flow-local/discarded). g_cow_hook is called BEFORE a
+   property write to a BASELINE object so the host records the old state and reverts it between flows (per-flow
+   isolation). This is the ONLY interpreter delta for COW — the delta buffer + revert live host-side (cow.c). */
+void JS_SetFlowLocalMark(int m) { g_flow_local_mark = m ? 1 : 0; }
+void JS_SetCowHook(JSCowHook h) { g_cow_hook = h; }
 
 /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
 static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
