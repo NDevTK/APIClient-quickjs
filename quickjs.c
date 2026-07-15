@@ -17992,6 +17992,9 @@ typedef struct TrampFrame {
     int call_first;                  /* first caller-stack slot to free on return: -1 call, -2 method */
     int call_argc;
     uint8_t is_tail;
+    /* the CALLEE's own interpreter locals (for deep-preempt resume — the caller's are above). */
+    JSValueConst this_val, new_target;
+    int arg_allocated, callee_argc;
 } TrampFrame;
 
 /* Only a NORMAL bytecode function trampolines (the common deep-recursion case). */
@@ -18091,6 +18094,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             pc = sf->cur_pc;
             sf->prev_frame = rt->current_stack_frame;
             rt->current_stack_frame = sf;
+            if (s->tramp_top) {
+                /* DEEP resume: the flow was parked at a loop back-edge INSIDE a called function. The base
+                   frame is restored above (and its prev_frame linked to the new caller); the stashed chain's
+                   bottom prev_frame still points at &s->frame, so the whole chain deepest->...->base is intact.
+                   Re-enter the DEEPEST frame at its saved pc/sp. */
+                TrampFrame *dtf = s->tramp_top;
+                JSStackFrame *dsf = &dtf->sf;
+                JSObject *dp = JS_VALUE_GET_OBJ(dsf->cur_func);
+                s->tramp_top = NULL;
+                tf_top = dtf;
+                rt->current_stack_frame = dsf;
+                b = dtf->b; ctx = dtf->ctx;
+                local_buf = dtf->local_buf;
+                arg_buf = dsf->arg_buf; var_buf = dsf->var_buf;
+                stack_buf = dsf->var_buf + b->var_count;
+                var_refs = dp->u.func.var_refs;
+                this_obj = dtf->this_val; new_target = dtf->new_target;
+                arg_allocated_size = dtf->arg_allocated;
+                argc = dtf->callee_argc; argv = (JSValueConst *)dsf->arg_buf;
+                sf = dsf; pc = dsf->cur_pc; sp = dsf->cur_sp;
+                dsf->cur_sp = NULL;   /* running */
+                goto restart;
+            }
             if (s->throw_flag)
                 goto exception;
             else
@@ -18675,6 +18701,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 tf_top = ntf;
                 this_obj = (tramp_first == -2) ? call_argv[-2] : JS_UNDEFINED;
                 new_target = JS_UNDEFINED;
+                ntf->this_val = this_obj; ntf->new_target = new_target;
+                ntf->arg_allocated = narg_alloc; ntf->callee_argc = eff_argc;
                 sf = nsf; b = nb; ctx = nb->realm;
                 arg_buf = narg_buf; var_buf = nvar_buf; stack_buf = nstack_buf;
                 var_refs = np->u.func.var_refs;
@@ -18713,6 +18741,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 BREAK;
             }
             goto done;
+
+        do_preempt:
+            /* Park this flow for the scheduler at a loop back-edge. Save the CURRENT (deepest) frame's
+               resume point; then either unwind the base (shallow) or stash the heap-frame chain (deep). */
+            sf->cur_pc = pc; sf->cur_sp = sp;
+            if (tf_top) {
+                /* DEEP: the loop is inside a called function. The whole TrampFrame chain is heap-resident,
+                   so stash its top into the generator base and unwind the C stack to the base's caller.
+                   The chain (deepest -> ... -> bottom -> &gen_state->frame) stays linked for the rebuild. */
+                gen_state->tramp_top = tf_top;
+                rt->current_stack_frame = gen_state->frame.prev_frame;
+                return js_int32(FUNC_RET_PREEMPT);
+            }
+            ret_val = js_int32(FUNC_RET_PREEMPT);
+            goto done_generator;
 
         CASE(OP_check_ctor_return):
             /* return true if 'this' should be returned */
@@ -19249,29 +19292,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             if (unlikely(js_poll_interrupts(ctx)))
                 goto exception;
             /* forced-exec PREEMPTION at a loop back-edge: if the scheduler wants to interleave, park this flow.
-               Base-level for now (tf_top==NULL): a top-level loop yields here even if its body called functions
-               (they've returned, so tf_top is NULL at the back-edge). Deep-loop preempt (stash the tf_top chain)
-               is the next diff. */
-            if (unlikely(g_preempt_hook != NULL) && gen_state && !tf_top && g_preempt_hook()) {
-                ret_val = js_int32(FUNC_RET_PREEMPT);
-                goto done_generator;
-            }
+               do_preempt parks at ANY depth — a base-level loop (tf_top==NULL) unwinds via done_generator;
+               a loop INSIDE a called function (tf_top!=NULL) stashes the whole TrampFrame chain into the
+               generator base and rebuilds it on resume (the trampoline made the chain heap-resident). */
+            if (unlikely(g_preempt_hook != NULL) && gen_state && g_preempt_hook())
+                goto do_preempt;
             BREAK;
         CASE(OP_goto16):
             pc += (int16_t)get_u16(pc);
             if (unlikely(js_poll_interrupts(ctx)))
                 goto exception;
-            if (unlikely(g_preempt_hook != NULL) && gen_state && !tf_top && g_preempt_hook()) {
-                ret_val = js_int32(FUNC_RET_PREEMPT); goto done_generator;   /* loop back-edge preempt */
-            }
+            if (unlikely(g_preempt_hook != NULL) && gen_state && g_preempt_hook())
+                goto do_preempt;   /* loop back-edge preempt (any depth) */
             BREAK;
         CASE(OP_goto8):
             pc += (int8_t)pc[0];
             if (unlikely(js_poll_interrupts(ctx)))
                 goto exception;
-            if (unlikely(g_preempt_hook != NULL) && gen_state && !tf_top && g_preempt_hook()) {
-                ret_val = js_int32(FUNC_RET_PREEMPT); goto done_generator;   /* loop back-edge preempt */
-            }
+            if (unlikely(g_preempt_hook != NULL) && gen_state && g_preempt_hook())
+                goto do_preempt;   /* loop back-edge preempt (any depth) */
             BREAK;
         CASE(OP_if_true):
             {
