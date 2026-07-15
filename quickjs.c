@@ -17481,6 +17481,45 @@ static JSVarRef *js_create_var_ref(JSContext *ctx, bool is_gc_object)
     return var_ref;
 }
 
+/* The frame-OWNED closed heap cell for a captured local at var_ref_idx (V8 Context model). Created CLOSED on
+   first access (owning frame's loc op OR a capturing closure), holding a copy of the current value; refcount 1
+   is the FRAME's ownership, released by close_var_refs on return. Both the owning frame (via redirected loc
+   ops) and closures (via get_var_ref) use this one cell, so the captured var is a single COW-swappable heap
+   slot — a snapshot fork isolates it and the escaped closure sees the per-flow value. */
+static JSVarRef *get_captured_cell(JSContext *ctx, JSStackFrame *sf, JSValue *pvalue, int var_ref_idx)
+{
+    JSVarRef *vr = sf->var_refs[var_ref_idx];
+    if (vr)
+        return vr;
+    vr = js_malloc(ctx, sizeof(JSVarRef));
+    if (!vr)
+        return NULL;
+    JS_REF_COUNT(vr) = 1;                 /* the FRAME owns this ref */
+    vr->is_detached = true;               /* CLOSED: heap value, not a stack pointer -> COW-swappable */
+    vr->is_lexical = false;
+    vr->is_const = false;
+    vr->value = js_dup(*pvalue);          /* seed with the current var_buf value */
+    vr->pvalue = &vr->value;
+    add_gc_object(ctx->rt, &vr->header, JS_GC_OBJ_TYPE_VAR_REF);
+    sf->var_refs[var_ref_idx] = vr;
+    return vr;
+}
+
+/* Value slot for a local `idx`: var_buf[idx] normally, but for a CAPTURED local the frame-owned heap cell
+   (redirects the owning frame's loc ops to the same cell its closures use — the V8 Context model). */
+static inline JSValue *loc_pv(JSContext *ctx, JSStackFrame *sf, JSFunctionBytecode *b, JSValue *var_buf, int idx)
+{
+    if (unlikely(b->vardefs && b->vardefs[b->arg_count + idx].is_captured)) {
+        JSVarRef *vr = get_captured_cell(ctx, sf, &var_buf[idx], b->vardefs[b->arg_count + idx].var_ref_idx);
+        if (vr) {
+            cow_capture_vr(ctx, vr);   /* record the cell in the running flow's delta so a snapshot fork
+                                          isolates the captured var (dedup'd; a no-op when not forced-exec) */
+            return &vr->value;
+        }
+    }
+    return &var_buf[idx];
+}
+
 static JSVarRef *get_var_ref(JSContext *ctx, JSStackFrame *sf, int var_idx,
                              bool is_arg)
 {
@@ -17502,28 +17541,13 @@ static JSVarRef *get_var_ref(JSContext *ctx, JSStackFrame *sf, int var_idx,
         pvalue = &sf->var_buf[var_idx];
     }
 
-    /* If the variable is captured, use the pre-computed index for O(1) lookup */
+    /* CAPTURED locals live in a frame-owned CLOSED heap cell (V8 Context model) — heap-resident from creation,
+       so COW-swappable and a snapshot fork isolates them. get_captured_cell makes the cell closed on first
+       access (owning frame OR capturing closure); here the closure adds ITS ref on top of the frame's. */
     if (vd->is_captured) {
-        var_ref_idx = vd->var_ref_idx;
-        var_ref = sf->var_refs[var_ref_idx];
-        if (var_ref) {
-            /* reference to the already created local variable */
-            JS_REF_COUNT(var_ref)++;
-            return var_ref;
-        }
-
-        /* create a new one */
-        var_ref = js_malloc(ctx, sizeof(JSVarRef));
-        if (!var_ref)
-            return NULL;
-        JS_REF_COUNT(var_ref) = 1;
-        var_ref->is_detached = false;
-        var_ref->is_lexical = false;
-        var_ref->is_const = false;
-        var_ref->var_ref_idx = var_ref_idx;
-        var_ref->stack_frame = sf;
-        sf->var_refs[var_ref_idx] = var_ref;
-        var_ref->pvalue = pvalue;
+        var_ref = get_captured_cell(ctx, sf, pvalue, vd->var_ref_idx);
+        if (!var_ref) return NULL;
+        JS_REF_COUNT(var_ref)++;   /* the closure's own ref (the frame keeps its ownership ref) */
         return var_ref;
     } else {
         /* Variable is not captured (e.g., from eval closures on uncaptured vars).
@@ -17790,10 +17814,15 @@ static void close_var_refs(JSRuntime *rt, JSStackFrame *sf)
     JSVarRef *var_ref;
     int i;
 
+    /* Captured locals are now frame-owned CLOSED cells (V8 Context model): on frame return the frame RELEASES
+       its ownership ref (free_var_ref decrefs — the cell survives while any capturing closure holds a ref).
+       They are already closed, so there is nothing to detach. */
     for (i = 0; i < sf->var_ref_count; i++) {
         var_ref = sf->var_refs[i];
-        if (var_ref)
-            close_var_ref(rt, var_ref);
+        if (var_ref) {
+            close_var_ref(rt, var_ref);   /* idempotent no-op on an already-closed cell */
+            free_var_ref(rt, var_ref);    /* release the frame's ownership ref */
+        }
     }
 }
 
@@ -19079,7 +19108,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int idx;
                 idx = get_u16(pc);
                 pc += 2;
-                sp[0] = js_dup(var_buf[idx]);
+                sp[0] = js_dup(*loc_pv(ctx, sf, b, var_buf, idx));
                 sp++;
             }
             BREAK;
@@ -19088,7 +19117,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int idx;
                 idx = get_u16(pc);
                 pc += 2;
-                set_value(ctx, &var_buf[idx], sp[-1]);
+                set_value(ctx, loc_pv(ctx, sf, b, var_buf, idx), sp[-1]);
                 sp--;
             }
             BREAK;
@@ -19097,7 +19126,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int idx;
                 idx = get_u16(pc);
                 pc += 2;
-                set_value(ctx, &var_buf[idx], js_dup(sp[-1]));
+                set_value(ctx, loc_pv(ctx, sf, b, var_buf, idx), js_dup(sp[-1]));
             }
             BREAK;
         CASE(OP_get_arg):
@@ -19127,30 +19156,30 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
 
-        CASE(OP_get_loc8): *sp++ = js_dup(var_buf[*pc++]); BREAK;
-        CASE(OP_put_loc8): set_value(ctx, &var_buf[*pc++], *--sp); BREAK;
-        CASE(OP_set_loc8): set_value(ctx, &var_buf[*pc++], js_dup(sp[-1])); BREAK;
+        CASE(OP_get_loc8): *sp++ = js_dup(*loc_pv(ctx, sf, b, var_buf, *pc++)); BREAK;
+        CASE(OP_put_loc8): { int i8 = *pc++; set_value(ctx, loc_pv(ctx, sf, b, var_buf, i8), *--sp); } BREAK;
+        CASE(OP_set_loc8): { int i8 = *pc++; set_value(ctx, loc_pv(ctx, sf, b, var_buf, i8), js_dup(sp[-1])); } BREAK;
 
         // Observation: get_loc0 and get_loc1 are individually very
         // frequent opcodes _and_ they are very often paired together,
         // making them ideal candidates for opcode fusion.
         CASE(OP_get_loc0_loc1):
-            *sp++ = js_dup(var_buf[0]);
-            *sp++ = js_dup(var_buf[1]);
+            *sp++ = js_dup(*loc_pv(ctx, sf, b, var_buf, 0));
+            *sp++ = js_dup(*loc_pv(ctx, sf, b, var_buf, 1));
             BREAK;
 
-        CASE(OP_get_loc0): *sp++ = js_dup(var_buf[0]); BREAK;
-        CASE(OP_get_loc1): *sp++ = js_dup(var_buf[1]); BREAK;
-        CASE(OP_get_loc2): *sp++ = js_dup(var_buf[2]); BREAK;
-        CASE(OP_get_loc3): *sp++ = js_dup(var_buf[3]); BREAK;
-        CASE(OP_put_loc0): set_value(ctx, &var_buf[0], *--sp); BREAK;
-        CASE(OP_put_loc1): set_value(ctx, &var_buf[1], *--sp); BREAK;
-        CASE(OP_put_loc2): set_value(ctx, &var_buf[2], *--sp); BREAK;
-        CASE(OP_put_loc3): set_value(ctx, &var_buf[3], *--sp); BREAK;
-        CASE(OP_set_loc0): set_value(ctx, &var_buf[0], js_dup(sp[-1])); BREAK;
-        CASE(OP_set_loc1): set_value(ctx, &var_buf[1], js_dup(sp[-1])); BREAK;
-        CASE(OP_set_loc2): set_value(ctx, &var_buf[2], js_dup(sp[-1])); BREAK;
-        CASE(OP_set_loc3): set_value(ctx, &var_buf[3], js_dup(sp[-1])); BREAK;
+        CASE(OP_get_loc0): *sp++ = js_dup(*loc_pv(ctx, sf, b, var_buf, 0)); BREAK;
+        CASE(OP_get_loc1): *sp++ = js_dup(*loc_pv(ctx, sf, b, var_buf, 1)); BREAK;
+        CASE(OP_get_loc2): *sp++ = js_dup(*loc_pv(ctx, sf, b, var_buf, 2)); BREAK;
+        CASE(OP_get_loc3): *sp++ = js_dup(*loc_pv(ctx, sf, b, var_buf, 3)); BREAK;
+        CASE(OP_put_loc0): set_value(ctx, loc_pv(ctx, sf, b, var_buf, 0), *--sp); BREAK;
+        CASE(OP_put_loc1): set_value(ctx, loc_pv(ctx, sf, b, var_buf, 1), *--sp); BREAK;
+        CASE(OP_put_loc2): set_value(ctx, loc_pv(ctx, sf, b, var_buf, 2), *--sp); BREAK;
+        CASE(OP_put_loc3): set_value(ctx, loc_pv(ctx, sf, b, var_buf, 3), *--sp); BREAK;
+        CASE(OP_set_loc0): set_value(ctx, loc_pv(ctx, sf, b, var_buf, 0), js_dup(sp[-1])); BREAK;
+        CASE(OP_set_loc1): set_value(ctx, loc_pv(ctx, sf, b, var_buf, 1), js_dup(sp[-1])); BREAK;
+        CASE(OP_set_loc2): set_value(ctx, loc_pv(ctx, sf, b, var_buf, 2), js_dup(sp[-1])); BREAK;
+        CASE(OP_set_loc3): set_value(ctx, loc_pv(ctx, sf, b, var_buf, 3), js_dup(sp[-1])); BREAK;
         CASE(OP_get_arg0): *sp++ = js_dup(arg_buf[0]); BREAK;
         CASE(OP_get_arg1): *sp++ = js_dup(arg_buf[1]); BREAK;
         CASE(OP_get_arg2): *sp++ = js_dup(arg_buf[2]); BREAK;
@@ -19258,42 +19287,48 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_get_loc_check):
             {
                 int idx;
+                JSValue *pv;
                 idx = get_u16(pc);
                 pc += 2;
-                if (unlikely(JS_IsUninitialized(var_buf[idx]))) {
+                pv = loc_pv(ctx, sf, b, var_buf, idx);
+                if (unlikely(JS_IsUninitialized(*pv))) {
                     JS_ThrowReferenceErrorUninitialized2(caller_ctx, b, idx,
                                                          false);
                     goto exception;
                 }
-                sp[0] = js_dup(var_buf[idx]);
+                sp[0] = js_dup(*pv);
                 sp++;
             }
             BREAK;
         CASE(OP_put_loc_check):
             {
                 int idx;
+                JSValue *pv;
                 idx = get_u16(pc);
                 pc += 2;
-                if (unlikely(JS_IsUninitialized(var_buf[idx]))) {
+                pv = loc_pv(ctx, sf, b, var_buf, idx);
+                if (unlikely(JS_IsUninitialized(*pv))) {
                     JS_ThrowReferenceErrorUninitialized2(caller_ctx, b, idx,
                                                          false);
                     goto exception;
                 }
-                set_value(ctx, &var_buf[idx], sp[-1]);
+                set_value(ctx, pv, sp[-1]);
                 sp--;
             }
             BREAK;
         CASE(OP_put_loc_check_init):
             {
                 int idx;
+                JSValue *pv;
                 idx = get_u16(pc);
                 pc += 2;
-                if (unlikely(!JS_IsUninitialized(var_buf[idx]))) {
+                pv = loc_pv(ctx, sf, b, var_buf, idx);
+                if (unlikely(!JS_IsUninitialized(*pv))) {
                     JS_ThrowReferenceError(caller_ctx,
                                            "'this' can be initialized only once");
                     goto exception;
                 }
-                set_value(ctx, &var_buf[idx], sp[-1]);
+                set_value(ctx, pv, sp[-1]);
                 sp--;
             }
             BREAK;
@@ -20366,7 +20401,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 idx = *pc;
                 pc += 1;
 
-                pv = &var_buf[idx];
+                pv = loc_pv(ctx, sf, b, var_buf, idx);   /* captured local -> its heap cell */
                 if (likely(JS_VALUE_IS_BOTH_INT(*pv, sp[-1]))) {
                     int64_t r;
                     r = (int64_t)JS_VALUE_GET_INT(*pv) +
@@ -20667,17 +20702,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_inc_loc):
             {
                 JSValue op1;
+                JSValue *pv;
                 int val;
                 int idx;
                 idx = *pc;
                 pc += 1;
 
-                op1 = var_buf[idx];
+                pv = loc_pv(ctx, sf, b, var_buf, idx);   /* captured local -> its heap cell */
+                op1 = *pv;
                 if (JS_VALUE_GET_TAG(op1) == JS_TAG_INT) {
                     val = JS_VALUE_GET_INT(op1);
                     if (unlikely(val == INT32_MAX))
                         goto inc_loc_slow;
-                    var_buf[idx] = js_int32(val + 1);
+                    *pv = js_int32(val + 1);
                 } else {
                 inc_loc_slow:
                     sf->cur_pc = pc;
@@ -20686,24 +20723,26 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     op1 = js_dup(op1);
                     if (js_unary_arith_slow(ctx, &op1 + 1, OP_inc))
                         goto exception;
-                    set_value(ctx, &var_buf[idx], op1);
+                    set_value(ctx, pv, op1);
                 }
             }
             BREAK;
         CASE(OP_dec_loc):
             {
                 JSValue op1;
+                JSValue *pv;
                 int val;
                 int idx;
                 idx = *pc;
                 pc += 1;
 
-                op1 = var_buf[idx];
+                pv = loc_pv(ctx, sf, b, var_buf, idx);   /* captured local -> its heap cell */
+                op1 = *pv;
                 if (JS_VALUE_GET_TAG(op1) == JS_TAG_INT) {
                     val = JS_VALUE_GET_INT(op1);
                     if (unlikely(val == INT32_MIN))
                         goto dec_loc_slow;
-                    var_buf[idx] = js_int32(val - 1);
+                    *pv = js_int32(val - 1);
                 } else {
                 dec_loc_slow:
                     sf->cur_pc = pc;
@@ -20712,7 +20751,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     op1 = js_dup(op1);
                     if (js_unary_arith_slow(ctx, &op1 + 1, OP_dec))
                         goto exception;
-                    set_value(ctx, &var_buf[idx], op1);
+                    set_value(ctx, pv, op1);
                 }
             }
             BREAK;
@@ -21561,12 +21600,8 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
     TrampFrame **ca = js_mallocz(ctx, (size_t)n * sizeof(TrampFrame *));
     if (!oa || !ca) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
     { int k = 0; for (TrampFrame *t = (TrampFrame *)s->tramp_top; t; t = t->up) oa[k++] = t; }
-    /* var_ref_count here is a frame's OWN open cells (locals captured by INNER closures it created) — NOT its
-       incoming captures (those live on the shared function object and are handled by COW). So a plain closure
-       (reads/writes captured vars, no inner closures) has 0 and clones fine; only an inner-closure FACTORY
-       hits this — its open cells alias the live stack + any escaped inner closure (a heap-graph problem). */
-    DCHECK(ob->var_ref_count == 0, "deep clone: base creates inner closures (own open cells) — escaping-closure case");
-    for (int i = 0; i < n; i++) DCHECK(oa[i]->sf.var_ref_count == 0, "deep clone: frame creates inner closures (own open cells) — escaping-closure case");
+    /* Captured-local cells are CLOSED heap cells (V8 Context model): each frame SHARES them (COW-swappable,
+       isolated per-flow by the delta) and takes an ownership ref — no per-frame open-cell aliasing. */
 
     /* ---- clone the base frame (dormant, mid-call): live end = the bottom frame's caller_sp ---- */
     JSObject *bp = JS_VALUE_GET_OBJ(ob->cur_func);
@@ -21585,8 +21620,9 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
     c->argc = s->argc; c->throw_flag = s->throw_flag;
     cb->arg_count = ob->arg_count;
     cb->var_buf = cb->arg_buf + bal;
-    cb->var_ref_count = 0;
     cb->var_refs = (JSVarRef **)(cb->arg_buf + blc);
+    cb->var_ref_count = ob->var_ref_count;   /* share the base's closed cells + take a ref */
+    for (int vi = 0; vi < ob->var_ref_count; vi++) { cb->var_refs[vi] = ob->var_refs[vi]; if (cb->var_refs[vi]) JS_REF_COUNT(cb->var_refs[vi])++; }
     cb->cur_pc = ob->cur_pc;   /* base resumes here after the chain returns to it */
     cb->cur_sp = NULL;         /* dormant: the live point is in the chain */
     cb->prev_frame = NULL;
@@ -21619,7 +21655,8 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
         ct->sf.var_buf  = XL(otf->sf.var_buf, otf->local_buf, ct->local_buf);
         ct->sf.var_refs = (JSVarRef **)XL((JSValue *)otf->sf.var_refs, otf->local_buf, ct->local_buf);
         ct->sf.cur_sp   = (i == 0) ? XL(otf->sf.cur_sp, otf->local_buf, ct->local_buf) : NULL;   /* only deepest runs */
-        ct->sf.var_ref_count = 0;
+        ct->sf.var_ref_count = otf->sf.var_ref_count;   /* share this frame's closed cells + take a ref */
+        for (int vi = 0; vi < otf->sf.var_ref_count; vi++) { ct->sf.var_refs[vi] = otf->sf.var_refs[vi]; if (ct->sf.var_refs[vi]) JS_REF_COUNT(ct->sf.var_refs[vi])++; }
         ct->sf.prev_frame = NULL;
         ct->up = (i == n - 1) ? NULL : ca[i + 1];
         ct->caller_sf        = caller_clone;
@@ -21644,10 +21681,8 @@ JSValue *JS_FlowClone(JSContext *ctx, JSValue *flow) {
        suspend leaves the BASE cur_sp NULL — its live point is in the chain, not the base). */
     DCHECK(sf->cur_sp != NULL || s->tramp_top != NULL, "JS_FlowClone: flow is not SUSPENDED (only a paused frame can be snapshot-forked)");
     if (s->tramp_top != NULL) return clone_deep_flow(ctx, s);   /* deep: base + tramp chain */
-    /* var_ref_count = the frame's OWN open cells (inner closures over its locals), NOT incoming captures (COW-
-       handled). A plain closure clones fine (0); only an inner-closure factory hits this — the escaping case. */
-    DCHECK(sf->var_ref_count == 0, "JS_FlowClone: frame creates inner closures (own open cells) — escaping-closure case");
-
+    /* Captured-local cells are CLOSED heap cells now (V8 Context model) — the clone SHARES them (one COW-
+       swappable cell per captured var, isolated per-flow by the delta) and takes its own ownership ref. */
     JSObject *p = JS_VALUE_GET_OBJ(sf->cur_func);
     JSFunctionBytecode *b = p->u.func.function_bytecode;
     int arg_buf_len = sf->arg_count;
@@ -21667,8 +21702,12 @@ JSValue *JS_FlowClone(JSContext *ctx, JSValue *flow) {
     c->throw_flag = s->throw_flag;
     cf->arg_count = sf->arg_count;
     cf->var_buf = cf->arg_buf + arg_buf_len;
-    cf->var_ref_count = 0;
     cf->var_refs = (JSVarRef **)(cf->arg_buf + local_count);
+    cf->var_ref_count = sf->var_ref_count;   /* share the closed cells; take an ownership ref on each */
+    for (int vi = 0; vi < sf->var_ref_count; vi++) {
+        cf->var_refs[vi] = sf->var_refs[vi];
+        if (cf->var_refs[vi]) JS_REF_COUNT(cf->var_refs[vi])++;
+    }
     cf->cur_pc = sf->cur_pc;   /* same bytecode, resume at the same instruction */
     cf->prev_frame = NULL;
 
