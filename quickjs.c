@@ -938,6 +938,8 @@ typedef struct JSAsyncFunctionState {
     int argc; /* number of function arguments */
     bool throw_flag; /* used to throw an exception in JS_CallInternal() */
     JSStackFrame frame;
+    void *tramp_top;  /* APIClient forced-exec: the stashed heap-frame (TrampFrame) chain when this flow was
+                         PREEMPTED mid-execution at depth; NULL when suspended at the base or not suspended. */
 } JSAsyncFunctionState;
 
 /* XXX: could use an object instead to avoid the
@@ -17952,6 +17954,7 @@ typedef enum {
 #define FUNC_RET_AWAIT      0
 #define FUNC_RET_YIELD      1
 #define FUNC_RET_YIELD_STAR 2
+#define FUNC_RET_PREEMPT    3   /* APIClient forced-exec: the scheduler preempted this flow mid-execution */
 
 #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_*
 static void dump_single_byte_code(JSContext *ctx, const uint8_t *pc,
@@ -18008,6 +18011,12 @@ static inline bool tramp_can_call(JSValueConst func) {
 static JSBranchHook g_branch_hook = NULL;
 void JS_SetBranchHook(JSBranchHook h) { g_branch_hook = h; }
 
+/* forced-exec PREEMPTION: the scheduler sets this hook; when it returns 1 at a yield point (a loop back-edge),
+   the interpreter unwinds the whole heap-frame chain into the generator base and returns FUNC_RET_PREEMPT, so
+   the flow parks mid-execution at ANY depth. Resume rebuilds the chain. */
+static JSPreemptHook g_preempt_hook = NULL;
+void JS_SetPreemptHook(JSPreemptHook h) { g_preempt_hook = h; }
+
 /* forced-exec COW: baseline vs flow-local marking + a write-capture hook. g_flow_local_mark stamps every new
    object (0 during setup = baseline, 1 while a flow runs = flow-local/discarded). g_cow_hook is called BEFORE a
    property write to a BASELINE object so the host records the old state and reverts it between flows (per-flow
@@ -18034,6 +18043,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     size_t alloca_size;
     TrampFrame *tf_top = NULL;         /* heap stack of trampolined NORMAL callees (this activation's base = C stack) */
     int tramp_first = -1; uint8_t tramp_is_tail = 0;   /* set before goto do_tramp_call */
+    JSAsyncFunctionState *gen_state = NULL;   /* the generator/async base state IF this activation is preemptible */
 
 #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_STEP
 #define DUMP_BYTECODE_OR_DONT(pc) \
@@ -18065,6 +18075,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     if (unlikely(JS_VALUE_GET_TAG(func_obj) != JS_TAG_OBJECT)) {
         if (flags & JS_CALL_FLAG_GENERATOR) {
             JSAsyncFunctionState *s = JS_VALUE_GET_PTR(func_obj);
+            gen_state = s;   /* this activation is preemptible: a yield unwinds to this base */
             /* func_obj get contains a pointer to JSFuncAsyncState */
             /* the stack frame is already allocated */
             sf = &s->frame;
@@ -19237,16 +19248,30 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             pc += (int32_t)get_u32(pc);
             if (unlikely(js_poll_interrupts(ctx)))
                 goto exception;
+            /* forced-exec PREEMPTION at a loop back-edge: if the scheduler wants to interleave, park this flow.
+               Base-level for now (tf_top==NULL): a top-level loop yields here even if its body called functions
+               (they've returned, so tf_top is NULL at the back-edge). Deep-loop preempt (stash the tf_top chain)
+               is the next diff. */
+            if (unlikely(g_preempt_hook != NULL) && gen_state && !tf_top && g_preempt_hook()) {
+                ret_val = js_int32(FUNC_RET_PREEMPT);
+                goto done_generator;
+            }
             BREAK;
         CASE(OP_goto16):
             pc += (int16_t)get_u16(pc);
             if (unlikely(js_poll_interrupts(ctx)))
                 goto exception;
+            if (unlikely(g_preempt_hook != NULL) && gen_state && !tf_top && g_preempt_hook()) {
+                ret_val = js_int32(FUNC_RET_PREEMPT); goto done_generator;   /* loop back-edge preempt */
+            }
             BREAK;
         CASE(OP_goto8):
             pc += (int8_t)pc[0];
             if (unlikely(js_poll_interrupts(ctx)))
                 goto exception;
+            if (unlikely(g_preempt_hook != NULL) && gen_state && !tf_top && g_preempt_hook()) {
+                ret_val = js_int32(FUNC_RET_PREEMPT); goto done_generator;   /* loop back-edge preempt */
+            }
             BREAK;
         CASE(OP_if_true):
             {
@@ -21332,6 +21357,41 @@ static JSValue async_func_resume(JSContext *ctx, JSAsyncFunctionState *s)
     return JS_CallInternal(ctx, func_obj, s->this_val, JS_UNDEFINED,
                            s->argc, vc(s->frame.arg_buf),
                            JS_CALL_FLAG_GENERATOR);
+}
+
+/* APIClient forced-execution FLOW API: a flow is a preemptible activation. Its program runs as an async
+   function frame (heap-resident, suspendable), so the scheduler can preempt it mid-execution (at a loop
+   back-edge, via the preempt hook) and resume it later — the substrate for value-ordered interleaving. */
+JSValue *JS_FlowNew(JSContext *ctx, const char *src, size_t len) {
+    size_t wl = len + 40;
+    char *w = js_malloc(ctx, wl);
+    if (!w) return NULL;
+    int n = snprintf(w, wl, "(async function(){%.*s})", (int)len, src);
+    JSValue fn = JS_Eval(ctx, w, n, "<flow>", JS_EVAL_TYPE_GLOBAL);
+    js_free(ctx, w);
+    if (JS_IsException(fn)) { JS_FreeValue(ctx, fn); return NULL; }
+    JSAsyncFunctionState *s = js_mallocz(ctx, sizeof(*s));
+    if (!s) { JS_FreeValue(ctx, fn); return NULL; }
+    if (async_func_init(ctx, s, fn, JS_UNDEFINED, 0, NULL)) { js_free(ctx, s); JS_FreeValue(ctx, fn); return NULL; }
+    JS_FreeValue(ctx, fn);
+    return (JSValue *)s;   /* opaque handle */
+}
+/* Resume the flow until it PREEMPTS (returns 1) or COMPLETES/throws (returns 0). */
+int JS_FlowResume(JSContext *ctx, JSValue *flow) {
+    JSAsyncFunctionState *s = (JSAsyncFunctionState *)flow;
+    JSValue r = async_func_resume(ctx, s);
+    if (JS_VALUE_GET_TAG(r) == JS_TAG_INT) {
+        int fr = JS_VALUE_GET_INT(r);
+        if (fr == FUNC_RET_PREEMPT || fr == FUNC_RET_AWAIT || fr == FUNC_RET_YIELD || fr == FUNC_RET_YIELD_STAR)
+            return 1;   /* suspended */
+    }
+    JS_FreeValue(ctx, r);
+    return 0;   /* completed (or threw — the exception is pending) */
+}
+void JS_FlowFree(JSContext *ctx, JSValue *flow) {
+    JSAsyncFunctionState *s = (JSAsyncFunctionState *)flow;
+    if (s->frame.cur_sp != NULL) async_func_free(ctx->rt, s);   /* free the suspended frame; a completed one already unwound */
+    js_free(ctx, s);
 }
 
 

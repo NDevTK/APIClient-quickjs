@@ -1188,6 +1188,15 @@ JS_EXTERN void JS_SetConcolicAddHook(JSConcolicAddHook h);
    is_neq flips the recorded op. Returns 0 (normal compare) when neither operand is concolic. */
 typedef int (*JSConcolicCmpHook)(JSContext *ctx, JSValue *sp, int is_neq);
 JS_EXTERN void JS_SetConcolicCmpHook(JSConcolicCmpHook h);
+
+/* Forced-execution PREEMPTION + FLOW API. A flow runs as a preemptible (heap-resident) async-function frame;
+   the preempt hook (returns 1) parks it at a loop back-edge and it resumes later — the substrate for the WFQ
+   to interleave flows by value instead of running each to completion. */
+typedef int (*JSPreemptHook)(void);
+JS_EXTERN void JS_SetPreemptHook(JSPreemptHook h);
+JS_EXTERN JSValue *JS_FlowNew(JSContext *ctx, const char *src, size_t len);   /* opaque flow handle (NULL on error) */
+JS_EXTERN int      JS_FlowResume(JSContext *ctx, JSValue *flow);              /* 1 = suspended (preempted), 0 = completed */
+JS_EXTERN void     JS_FlowFree(JSContext *ctx, JSValue *flow);
 /* if can_block is true, Atomics.wait() can be used */
 JS_EXTERN void JS_SetCanBlock(JSRuntime *rt, bool can_block);
 /* set the [IsHTMLDDA] internal slot */
