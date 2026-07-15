@@ -19815,7 +19815,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         goto put_field_slow_path;
                     if (likely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
                                               JS_PROP_LENGTH)) == JS_PROP_WRITABLE)) {
-                        /* fast path */
+                        /* fast path — MUST still COW-capture: overwriting an existing baseline slot here
+                           bypasses JS_SetPropertyInternal2, so without this a shared-state write (state.x=…)
+                           is invisible to the per-flow delta and leaks across a context switch. */
+                        cow_capture(ctx, obj, atom);
                         set_value(ctx, &pr->u.value, sp[-1]);
                     } else {
                         goto put_field_slow_path;
