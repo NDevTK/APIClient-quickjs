@@ -21418,17 +21418,41 @@ JSValue *JS_FlowNew(JSContext *ctx, const char *src, size_t len) {
     JS_FreeValue(ctx, fn);
     return (JSValue *)s;   /* opaque handle */
 }
-/* Resume the flow until it PREEMPTS (returns 1) or COMPLETES/throws (returns 0). */
+/* Resume the flow until it PREEMPTS (returns 1) or COMPLETES/throws (returns 0). An AWAIT does NOT return to
+   the caller as "suspended": its result is DELIVERED (the continuation resumes WITH the settled value, or
+   RE-THROWS a rejection into it) and the flow continues, because a settled/opaque await is available at once.
+   Only a PREEMPT (scheduler wants to interleave) or a generator YIELD returns 1. */
 int JS_FlowResume(JSContext *ctx, JSValue *flow) {
     JSAsyncFunctionState *s = (JSAsyncFunctionState *)flow;
-    JSValue r = async_func_resume(ctx, s);
-    if (JS_VALUE_GET_TAG(r) == JS_TAG_INT) {
+    for (;;) {
+        JSValue r = async_func_resume(ctx, s);
+        if (JS_VALUE_GET_TAG(r) != JS_TAG_INT) { JS_FreeValue(ctx, r); return 0; }   /* completed / threw */
         int fr = JS_VALUE_GET_INT(r);
-        if (fr == FUNC_RET_PREEMPT || fr == FUNC_RET_AWAIT || fr == FUNC_RET_YIELD || fr == FUNC_RET_YIELD_STAR)
-            return 1;   /* suspended */
+        if (fr == FUNC_RET_PREEMPT || fr == FUNC_RET_YIELD || fr == FUNC_RET_YIELD_STAR)
+            return 1;   /* suspended — the scheduler (preempt) or generator consumer resumes it */
+        if (fr == FUNC_RET_AWAIT) {
+            /* OP_await left the awaited operand at cur_sp[-1]. Settle it and deliver the result. */
+            JSValue awaited = s->frame.cur_sp[-1];
+            JSPromiseStateEnum st = JS_PromiseState(ctx, awaited);
+            JSValue settled;
+            if (st == JS_PROMISE_FULFILLED)      { settled = JS_PromiseResult(ctx, awaited); s->throw_flag = false; }
+            else if (st == JS_PROMISE_REJECTED)  { settled = JS_PromiseResult(ctx, awaited); s->throw_flag = true; }
+            else if (st == JS_PROMISE_NOT_A_PROMISE) { settled = JS_DupValue(ctx, awaited); s->throw_flag = false; }
+            else {
+                /* PENDING: a real async result not yet available (e.g. a live fetch). Parking this flow until
+                   the host provides the value is the fetch-await integration — not yet built. Fail LOUD
+                   (fork idiom, like the async-generator driver's abort) rather than silently deliver a wrong
+                   value; delivering undefined here would be the exact silent-failure the design forbids. */
+                fprintf(stderr, "@WHY JS_FlowResume: await on PENDING promise — fetch-await parking not built (%s:%d)\n", __FILE__, __LINE__);
+                abort();
+            }
+            JS_FreeValue(ctx, awaited);
+            s->frame.cur_sp[-1] = settled;
+            continue;   /* re-resume: the continuation reads the settled value from cur_sp[-1] */
+        }
+        JS_FreeValue(ctx, r);
+        return 0;
     }
-    JS_FreeValue(ctx, r);
-    return 0;   /* completed (or threw — the exception is pending) */
 }
 void JS_FlowFree(JSContext *ctx, JSValue *flow) {
     JSAsyncFunctionState *s = (JSAsyncFunctionState *)flow;
