@@ -21530,21 +21530,27 @@ void JS_FlowFree(JSContext *ctx, JSValue *flow) {
    (do_tramp_call did not dup it) — so the base dup's, the tramp does not. Single-level, closure-free, in-frame
    args for now; every other shape DCHECKs (no fallback). */
 static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
-    TrampFrame *otf = (TrampFrame *)s->tramp_top;
     JSStackFrame *ob = &s->frame;
-    DCHECK(otf->up == NULL, "deep clone: multi-level tramp chain not built yet");
-    DCHECK(otf->sf.var_ref_count == 0 && ob->var_ref_count == 0, "deep clone: closure var_refs not built yet");
+    /* Collect the chain deepest(tramp_top)-first .. bottom-last. arr[i].up == arr[i+1]; bottom.up == NULL. */
+    int n = 0;
+    for (TrampFrame *t = (TrampFrame *)s->tramp_top; t; t = t->up) n++;
+    TrampFrame **oa = js_malloc(ctx, (size_t)n * sizeof(TrampFrame *));
+    TrampFrame **ca = js_mallocz(ctx, (size_t)n * sizeof(TrampFrame *));
+    if (!oa || !ca) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
+    { int k = 0; for (TrampFrame *t = (TrampFrame *)s->tramp_top; t; t = t->up) oa[k++] = t; }
+    DCHECK(ob->var_ref_count == 0, "deep clone: base closure var_refs not built yet");
+    for (int i = 0; i < n; i++) DCHECK(oa[i]->sf.var_ref_count == 0, "deep clone: closure var_refs in chain not built yet");
 
+    /* ---- clone the base frame (dormant, mid-call): live end = the bottom frame's caller_sp ---- */
     JSObject *bp = JS_VALUE_GET_OBJ(ob->cur_func);
     JSFunctionBytecode *bb = bp->u.func.function_bytecode;
     int bal = ob->arg_count, blc = bal + bb->var_count + bb->stack_size;
-    ptrdiff_t blive = otf->caller_sp - ob->arg_buf;   /* base was here when it called into the chain */
-
+    ptrdiff_t blive = oa[n - 1]->caller_sp - ob->arg_buf;
     JSAsyncFunctionState *c = js_mallocz(ctx, sizeof(*c));
-    if (!c) return NULL;
+    if (!c) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
     JSStackFrame *cb = &c->frame;
     cb->arg_buf = js_malloc(ctx, sizeof(JSValue) * (blc > 0 ? blc : 1) + sizeof(JSVarRef *) * bb->var_ref_count);
-    if (!cb->arg_buf) { js_free(ctx, c); return NULL; }
+    if (!cb->arg_buf) { js_free(ctx, c); js_free(ctx, oa); js_free(ctx, ca); return NULL; }
     for (ptrdiff_t i = 0; i < blive; i++) cb->arg_buf[i] = js_dup(ob->arg_buf[i]);
     cb->is_strict_mode = ob->is_strict_mode;
     cb->cur_func = js_dup(ob->cur_func);   /* base OWNS cur_func */
@@ -21558,38 +21564,49 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
     cb->cur_sp = NULL;         /* dormant: the live point is in the chain */
     cb->prev_frame = NULL;
 
-    JSObject *wp = JS_VALUE_GET_OBJ(otf->sf.cur_func);
-    JSFunctionBytecode *wb = wp->u.func.function_bytecode;
-    int wal = otf->sf.arg_count, wlc = wal + wb->var_count + wb->stack_size;
-    int arg_in_frame = (otf->sf.arg_buf >= otf->local_buf && otf->sf.arg_buf < otf->local_buf + wlc + 1);
-    TrampFrame *ct = js_malloc(ctx, sizeof(TrampFrame));
-    if (!ct) { js_free_rt(ctx->rt, cb->arg_buf); JS_FreeValue(ctx, cb->cur_func); JS_FreeValue(ctx, c->this_val); js_free(ctx, c); return NULL; }
-    *ct = *otf;   /* copy scalars + borrowed values (cur_func, this_val, new_target stay borrowed); fix pointers */
-    ct->local_buf = js_malloc(ctx, sizeof(JSValue) * (wlc > 0 ? wlc : 1) + sizeof(JSVarRef *) * wb->var_ref_count);
-    if (!ct->local_buf) { js_free_rt(ctx->rt, cb->arg_buf); JS_FreeValue(ctx, cb->cur_func); JS_FreeValue(ctx, c->this_val); js_free(ctx, c); js_free(ctx, ct); return NULL; }
-    ptrdiff_t wlive = otf->sf.cur_sp - otf->local_buf;
-    for (ptrdiff_t i = 0; i < wlive; i++) ct->local_buf[i] = js_dup(otf->local_buf[i]);
-    #define XL(p, ob_, cb_) ((p) ? (cb_) + ((p) - (ob_)) : NULL)   /* translate a JSValue* from ob_ buffer to cb_ buffer */
-    /* args are in-frame (narg_alloc>0) OR borrowed from the caller (base) stack (0-arg / enough-args callee) */
-    ct->sf.arg_buf   = arg_in_frame ? XL(otf->sf.arg_buf, otf->local_buf, ct->local_buf)
-                                     : XL(otf->sf.arg_buf, ob->arg_buf, cb->arg_buf);
-    ct->sf.var_buf   = XL(otf->sf.var_buf, otf->local_buf, ct->local_buf);
-    ct->sf.var_refs  = (JSVarRef **)XL((JSValue *)otf->sf.var_refs, otf->local_buf, ct->local_buf);
-    ct->sf.cur_sp    = XL(otf->sf.cur_sp, otf->local_buf, ct->local_buf);
-    ct->sf.var_ref_count = 0;
-    ct->sf.prev_frame = NULL;
-    /* the callee's cur_func is BORROWED (no dup) — already copied by *ct = *otf. */
-    ct->up = NULL;
-    ct->caller_sf        = cb;
-    ct->caller_local_buf = XL(otf->caller_local_buf, ob->arg_buf, cb->arg_buf);
-    ct->caller_stack_buf = XL(otf->caller_stack_buf, ob->arg_buf, cb->arg_buf);
-    ct->caller_var_buf   = XL(otf->caller_var_buf, ob->arg_buf, cb->arg_buf);
-    ct->caller_arg_buf   = XL(otf->caller_arg_buf, ob->arg_buf, cb->arg_buf);
-    ct->caller_var_refs  = cb->var_refs;
-    ct->caller_sp        = XL(otf->caller_sp, ob->arg_buf, cb->arg_buf);
-    ct->caller_argv      = (JSValueConst *)XL((JSValue *)otf->caller_argv, ob->arg_buf, cb->arg_buf);
+    /* ---- clone each TrampFrame BOTTOM-UP, relinking its caller_* into the cloned caller ---- */
+    #define XL(p, ob_, cb_) ((p) ? (cb_) + ((p) - (ob_)) : NULL)   /* translate a JSValue* between buffers */
+    for (int i = n - 1; i >= 0; i--) {
+        TrampFrame *otf = oa[i];
+        /* the caller is the base (bottom frame, i==n-1) or the next-shallower frame's clone (already built) */
+        JSStackFrame *caller_clone; JSValue *cob, *ccb;
+        if (i == n - 1) { caller_clone = cb;             cob = ob->arg_buf;          ccb = cb->arg_buf; }
+        else            { caller_clone = &ca[i + 1]->sf; cob = oa[i + 1]->local_buf; ccb = ca[i + 1]->local_buf; }
+        /* live end: the deepest (i==0) is running -> cur_sp; a mid-call frame -> the sp it called its callee at */
+        JSValue *live_end = (i == 0) ? otf->sf.cur_sp : oa[i - 1]->caller_sp;
+
+        JSObject *wp = JS_VALUE_GET_OBJ(otf->sf.cur_func);
+        JSFunctionBytecode *wb = wp->u.func.function_bytecode;
+        int wal = otf->sf.arg_count, wlc = wal + wb->var_count + wb->stack_size;
+        int arg_in_frame = (otf->sf.arg_buf >= otf->local_buf && otf->sf.arg_buf < otf->local_buf + wlc + 1);
+        TrampFrame *ct = js_malloc(ctx, sizeof(TrampFrame));
+        if (!ct) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }   /* OOM: partial leak on the abort path */
+        ca[i] = ct;
+        *ct = *otf;   /* scalars + BORROWED values (cur_func/this_val/new_target stay borrowed); fix pointers below */
+        ct->local_buf = js_malloc(ctx, sizeof(JSValue) * (wlc > 0 ? wlc : 1) + sizeof(JSVarRef *) * wb->var_ref_count);
+        if (!ct->local_buf) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
+        ptrdiff_t wlive = live_end - otf->local_buf;
+        for (ptrdiff_t k = 0; k < wlive; k++) ct->local_buf[k] = js_dup(otf->local_buf[k]);
+        ct->sf.arg_buf  = arg_in_frame ? XL(otf->sf.arg_buf, otf->local_buf, ct->local_buf)
+                                       : XL(otf->sf.arg_buf, cob, ccb);   /* borrowed from the caller's stack */
+        ct->sf.var_buf  = XL(otf->sf.var_buf, otf->local_buf, ct->local_buf);
+        ct->sf.var_refs = (JSVarRef **)XL((JSValue *)otf->sf.var_refs, otf->local_buf, ct->local_buf);
+        ct->sf.cur_sp   = (i == 0) ? XL(otf->sf.cur_sp, otf->local_buf, ct->local_buf) : NULL;   /* only deepest runs */
+        ct->sf.var_ref_count = 0;
+        ct->sf.prev_frame = NULL;
+        ct->up = (i == n - 1) ? NULL : ca[i + 1];
+        ct->caller_sf        = caller_clone;
+        ct->caller_local_buf = XL(otf->caller_local_buf, cob, ccb);
+        ct->caller_stack_buf = XL(otf->caller_stack_buf, cob, ccb);
+        ct->caller_var_buf   = XL(otf->caller_var_buf, cob, ccb);
+        ct->caller_arg_buf   = XL(otf->caller_arg_buf, cob, ccb);
+        ct->caller_sp        = XL(otf->caller_sp, cob, ccb);
+        ct->caller_argv      = (JSValueConst *)XL((JSValue *)otf->caller_argv, cob, ccb);
+        ct->caller_var_refs  = caller_clone->var_refs;
+    }
     #undef XL
-    c->tramp_top = ct;
+    c->tramp_top = ca[0];
+    js_free(ctx, oa); js_free(ctx, ca);
     return (JSValue *)c;
 }
 
