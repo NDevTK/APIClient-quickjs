@@ -18031,6 +18031,29 @@ static inline bool tramp_can_call(JSValueConst func) {
 static JSBranchHook g_branch_hook = NULL;
 void JS_SetBranchHook(JSBranchHook h) { g_branch_hook = h; }
 
+/* forced-exec FRAME-SNAPSHOT FORK hook: the scheduler sets this; the interpreter hands it a CLONE of the flow
+   frame taken at a forking branch, and the host builds the hot sibling. */
+static JSForkHook g_fork_hook = NULL;
+void JS_SetForkHook(JSForkHook h) { g_fork_hook = h; }
+
+/* Concolic branch arm + snapshot fork. The branch hook returns the arm (0/1), ORed with 0x100 when it forked
+   a sibling here. On a fork we snapshot the CURRENT frame AT the OP_if (cond still on the stack) so the
+   sibling resumes HERE and replays the other arm — never a re-run. NO FALLBACK: a deep (tramp-chain) or
+   nested (non-generator activation) branch is a not-yet-built capability that crashes loud. */
+static int branch_arm_fork(JSContext *ctx, JSValueConst op1, uint8_t *if_pc,
+                           JSStackFrame *sf, JSValue *sp, void *tf_top, JSAsyncFunctionState *gen_state) {
+    int harm = (g_branch_hook && JS_VALUE_GET_TAG(op1) == JS_TAG_OBJECT) ? g_branch_hook(ctx, op1) : -1;
+    if (harm >= 0 && (harm & 0x100)) {
+        harm &= 0xff;
+        DCHECK(tf_top == NULL && gen_state != NULL, "OP_if fork: deep/nested-branch snapshot not built yet");
+        sf->cur_pc = if_pc; sf->cur_sp = sp;   /* frame at the branch, cond at sp[-1] — for the clone to read */
+        if (g_fork_hook) { JSValue *cl = JS_FlowClone(ctx, (JSValue *)gen_state); g_fork_hook(ctx, cl); }
+        sf->cur_sp = NULL;   /* the PARENT keeps running via C locals; restore "running" so a later done: is
+                                detected as completion (a stale non-NULL cur_sp would double-free its locals) */
+    }
+    return harm;
+}
+
 /* forced-exec PREEMPTION: the scheduler sets this hook; when it returns 1 at a yield point (a loop back-edge),
    the interpreter unwinds the whole heap-frame chain into the generator base and returns FUNC_RET_PREEMPT, so
    the flow parks mid-execution at ANY depth. Resume rebuilds the chain. */
@@ -19334,12 +19357,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int res;
                 JSValue op1;
 
+                uint8_t *if_pc = pc - 1;   /* the OP_if opcode — a forked sibling resumes HERE and replays the other arm */
                 op1 = sp[-1];
                 pc += 4;
                 {
-                    /* forced-exec: a concolic cond (always a TAG_OBJECT) -> the host takes an arm + forks the
-                       sibling flow; harm<0 means not concolic -> the normal ToBool. */
-                    int harm = (g_branch_hook && JS_VALUE_GET_TAG(op1) == JS_TAG_OBJECT) ? g_branch_hook(ctx, op1) : -1;
+                    int harm = branch_arm_fork(ctx, op1, if_pc, sf, sp, tf_top, gen_state);
                     if (harm >= 0) { res = harm; JS_FreeValue(ctx, op1); }
                     else if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) res = JS_VALUE_GET_INT(op1);
                     else res = JS_ToBoolFree(ctx, op1);
@@ -19357,12 +19379,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int res;
                 JSValue op1;
 
+                uint8_t *if_pc = pc - 1;   /* the OP_if opcode — a forked sibling resumes HERE and replays the other arm */
                 op1 = sp[-1];
                 pc += 4;
                 {
-                    /* forced-exec: a concolic cond (always a TAG_OBJECT) -> the host takes an arm + forks the
-                       sibling flow; harm<0 means not concolic -> the normal ToBool. */
-                    int harm = (g_branch_hook && JS_VALUE_GET_TAG(op1) == JS_TAG_OBJECT) ? g_branch_hook(ctx, op1) : -1;
+                    int harm = branch_arm_fork(ctx, op1, if_pc, sf, sp, tf_top, gen_state);
                     if (harm >= 0) { res = harm; JS_FreeValue(ctx, op1); }
                     else if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) res = JS_VALUE_GET_INT(op1);
                     else res = JS_ToBoolFree(ctx, op1);
@@ -19380,12 +19401,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int res;
                 JSValue op1;
 
+                uint8_t *if_pc = pc - 1;   /* the OP_if opcode — a forked sibling resumes HERE and replays the other arm */
                 op1 = sp[-1];
                 pc += 1;
                 {
-                    /* forced-exec: a concolic cond (always a TAG_OBJECT) -> the host takes an arm + forks the
-                       sibling flow; harm<0 means not concolic -> the normal ToBool. */
-                    int harm = (g_branch_hook && JS_VALUE_GET_TAG(op1) == JS_TAG_OBJECT) ? g_branch_hook(ctx, op1) : -1;
+                    int harm = branch_arm_fork(ctx, op1, if_pc, sf, sp, tf_top, gen_state);
                     if (harm >= 0) { res = harm; JS_FreeValue(ctx, op1); }
                     else if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) res = JS_VALUE_GET_INT(op1);
                     else res = JS_ToBoolFree(ctx, op1);
@@ -19403,12 +19423,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int res;
                 JSValue op1;
 
+                uint8_t *if_pc = pc - 1;   /* the OP_if opcode — a forked sibling resumes HERE and replays the other arm */
                 op1 = sp[-1];
                 pc += 1;
                 {
-                    /* forced-exec: a concolic cond (always a TAG_OBJECT) -> the host takes an arm + forks the
-                       sibling flow; harm<0 means not concolic -> the normal ToBool. */
-                    int harm = (g_branch_hook && JS_VALUE_GET_TAG(op1) == JS_TAG_OBJECT) ? g_branch_hook(ctx, op1) : -1;
+                    int harm = branch_arm_fork(ctx, op1, if_pc, sf, sp, tf_top, gen_state);
                     if (harm >= 0) { res = harm; JS_FreeValue(ctx, op1); }
                     else if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) res = JS_VALUE_GET_INT(op1);
                     else res = JS_ToBoolFree(ctx, op1);

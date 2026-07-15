@@ -1168,6 +1168,10 @@ JS_EXTERN void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, voi
    (the interpreter falls through to the normal ToBool). Set once at engine init. */
 typedef int (*JSBranchHook)(JSContext *ctx, JSValueConst cond);
 JS_EXTERN void JS_SetBranchHook(JSBranchHook h);
+/* forced-exec frame-snapshot fork: the interpreter hands the host a CLONE of the flow frame taken at a forking
+   branch (the branch hook returned its arm | 0x100); the host builds the hot sibling from it. */
+typedef void (*JSForkHook)(JSContext *ctx, JSValue *clone);
+JS_EXTERN void JS_SetForkHook(JSForkHook h);
 
 /* APIClient forced-execution COW: per-flow isolation. JS_SetFlowLocalMark(1) stamps objects created while a
    flow runs as flow-local (discarded with the run); mark 0 (setup) makes them baseline. JS_SetCowHook installs
