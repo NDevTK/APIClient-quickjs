@@ -1182,6 +1182,12 @@ JS_EXTERN void JS_SetCowHook(JSCowHook h);
    the normal add runs. This is how `'/api/' + id` carries the URL shape. */
 typedef int (*JSConcolicAddHook)(JSContext *ctx, JSValue *sp);
 JS_EXTERN void JS_SetConcolicAddHook(JSConcolicAddHook h);
+
+/* Concolic propagation through == / === : a concolic operand yields a concolic bool carrying the {src,op,tok}
+   constraint into sp[-2] (returns 1), so `if (x === 'admin')` FORKS instead of collapsing to concrete false.
+   is_neq flips the recorded op. Returns 0 (normal compare) when neither operand is concolic. */
+typedef int (*JSConcolicCmpHook)(JSContext *ctx, JSValue *sp, int is_neq);
+JS_EXTERN void JS_SetConcolicCmpHook(JSConcolicCmpHook h);
 /* if can_block is true, Atomics.wait() can be used */
 JS_EXTERN void JS_SetCanBlock(JSRuntime *rt, bool can_block);
 /* set the [IsHTMLDDA] internal slot */

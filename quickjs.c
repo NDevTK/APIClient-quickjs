@@ -6110,6 +6110,7 @@ static __maybe_unused void JS_DumpShapes(JSRuntime *rt)
 uint8_t g_flow_local_mark = 0;   /* forced-exec: stamps new objects baseline(0)/flow-local(1); see JS_SetFlowLocalMark */
 static JSCowHook g_cow_hook = NULL;   /* forced-exec: called before a write to a baseline object (COW capture) */
 static JSConcolicAddHook g_concolic_add = NULL;   /* forced-exec: concolic propagation through `+` (js_add_slow) */
+static JSConcolicCmpHook g_concolic_cmp = NULL;   /* forced-exec: concolic propagation through == / === */
 /* Ask the host to record a baseline object's pre-write state (for per-flow revert). A flow-local object is
    discarded with its run, so its writes are never captured. Defined early — the write sites are earlier. */
 static inline void cow_capture(JSContext *ctx, JSValueConst obj, JSAtom prop) {
@@ -16061,6 +16062,8 @@ static no_inline __exception int js_eq_slow(JSContext *ctx, JSValue *sp,
     int res;
     uint32_t tag1, tag2;
 
+    if (g_concolic_cmp && g_concolic_cmp(ctx, sp, is_neq)) return 0;   /* forced-exec: concolic == -> concolic bool (forks) */
+
     op1 = sp[-2];
     op2 = sp[-1];
  redo:
@@ -16356,6 +16359,7 @@ static no_inline int js_strict_eq_slow(JSContext *ctx, JSValue *sp,
                                        bool is_neq)
 {
     bool res;
+    if (g_concolic_cmp && g_concolic_cmp(ctx, sp, is_neq)) return 0;   /* forced-exec: concolic === -> concolic bool (forks) */
     res = js_strict_eq(ctx, sp[-2], sp[-1]);
     JS_FreeValue(ctx, sp[-2]);
     JS_FreeValue(ctx, sp[-1]);
@@ -17975,6 +17979,7 @@ void JS_SetBranchHook(JSBranchHook h) { g_branch_hook = h; }
 void JS_SetFlowLocalMark(int m) { g_flow_local_mark = m ? 1 : 0; }
 void JS_SetCowHook(JSCowHook h) { g_cow_hook = h; }
 void JS_SetConcolicAddHook(JSConcolicAddHook h) { g_concolic_add = h; }
+void JS_SetConcolicCmpHook(JSConcolicCmpHook h) { g_concolic_cmp = h; }
 
 /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
 static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
