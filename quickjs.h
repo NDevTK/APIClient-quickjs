@@ -1162,6 +1162,12 @@ JS_EXTERN void JS_SetHostPromiseRejectionTracker(JSRuntime *rt, JSHostPromiseRej
 /* return != 0 if the JS code needs to be interrupted */
 typedef int JSInterruptHandler(JSRuntime *rt, void *opaque);
 JS_EXTERN void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque);
+
+/* APIClient forced-execution: the frame-agnostic branch decision. Returns the arm (0/1) to take when branching
+   on a concolic value (the hook forks the other arm as a sibling flow), or -1 if the value is not concolic
+   (the interpreter falls through to the normal ToBool). Set once at engine init. */
+typedef int (*JSBranchHook)(JSContext *ctx, JSValueConst cond);
+JS_EXTERN void JS_SetBranchHook(JSBranchHook h);
 /* if can_block is true, Atomics.wait() can be used */
 JS_EXTERN void JS_SetCanBlock(JSRuntime *rt, bool can_block);
 /* set the [IsHTMLDDA] internal slot */

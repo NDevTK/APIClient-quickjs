@@ -17942,6 +17942,14 @@ static bool needs_backtrace(JSValue exc)
     return can_store_error_stack(exc) || can_add_backtrace(exc);
 }
 
+/* APIClient forced-execution — the ONLY interpreter delta for branching. When the interpreter is about to
+   branch on a CONCOLIC value (a solver-owned host object), it asks the host which arm to take. The hook FORKS
+   by appending a sibling decision vector to the frontier (flow.c), NEVER by rewinding this OP_if — so a native
+   builtin loop-back calls the SAME hook to the same effect (frame-agnostic by construction). Returns the arm
+   (0/1) for a concolic cond, or -1 to fall through to the normal ToBool (the value is not concolic). */
+static JSBranchHook g_branch_hook = NULL;
+void JS_SetBranchHook(JSBranchHook h) { g_branch_hook = h; }
+
 /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
 static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                JSValueConst this_obj, JSValueConst new_target,
@@ -19079,10 +19087,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
                 op1 = sp[-1];
                 pc += 4;
-                if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) {
-                    res = JS_VALUE_GET_INT(op1);
-                } else {
-                    res = JS_ToBoolFree(ctx, op1);
+                {
+                    /* forced-exec: a concolic cond (always a TAG_OBJECT) -> the host takes an arm + forks the
+                       sibling flow; harm<0 means not concolic -> the normal ToBool. */
+                    int harm = (g_branch_hook && JS_VALUE_GET_TAG(op1) == JS_TAG_OBJECT) ? g_branch_hook(ctx, op1) : -1;
+                    if (harm >= 0) { res = harm; JS_FreeValue(ctx, op1); }
+                    else if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) res = JS_VALUE_GET_INT(op1);
+                    else res = JS_ToBoolFree(ctx, op1);
                 }
                 sp--;
                 if (res) {
@@ -19099,10 +19110,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
                 op1 = sp[-1];
                 pc += 4;
-                if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) {
-                    res = JS_VALUE_GET_INT(op1);
-                } else {
-                    res = JS_ToBoolFree(ctx, op1);
+                {
+                    /* forced-exec: a concolic cond (always a TAG_OBJECT) -> the host takes an arm + forks the
+                       sibling flow; harm<0 means not concolic -> the normal ToBool. */
+                    int harm = (g_branch_hook && JS_VALUE_GET_TAG(op1) == JS_TAG_OBJECT) ? g_branch_hook(ctx, op1) : -1;
+                    if (harm >= 0) { res = harm; JS_FreeValue(ctx, op1); }
+                    else if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) res = JS_VALUE_GET_INT(op1);
+                    else res = JS_ToBoolFree(ctx, op1);
                 }
                 sp--;
                 if (!res) {
@@ -19119,10 +19133,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
                 op1 = sp[-1];
                 pc += 1;
-                if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) {
-                    res = JS_VALUE_GET_INT(op1);
-                } else {
-                    res = JS_ToBoolFree(ctx, op1);
+                {
+                    /* forced-exec: a concolic cond (always a TAG_OBJECT) -> the host takes an arm + forks the
+                       sibling flow; harm<0 means not concolic -> the normal ToBool. */
+                    int harm = (g_branch_hook && JS_VALUE_GET_TAG(op1) == JS_TAG_OBJECT) ? g_branch_hook(ctx, op1) : -1;
+                    if (harm >= 0) { res = harm; JS_FreeValue(ctx, op1); }
+                    else if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) res = JS_VALUE_GET_INT(op1);
+                    else res = JS_ToBoolFree(ctx, op1);
                 }
                 sp--;
                 if (res) {
@@ -19139,10 +19156,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
                 op1 = sp[-1];
                 pc += 1;
-                if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) {
-                    res = JS_VALUE_GET_INT(op1);
-                } else {
-                    res = JS_ToBoolFree(ctx, op1);
+                {
+                    /* forced-exec: a concolic cond (always a TAG_OBJECT) -> the host takes an arm + forks the
+                       sibling flow; harm<0 means not concolic -> the normal ToBool. */
+                    int harm = (g_branch_hook && JS_VALUE_GET_TAG(op1) == JS_TAG_OBJECT) ? g_branch_hook(ctx, op1) : -1;
+                    if (harm >= 0) { res = harm; JS_FreeValue(ctx, op1); }
+                    else if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) res = JS_VALUE_GET_INT(op1);
+                    else res = JS_ToBoolFree(ctx, op1);
                 }
                 sp--;
                 if (!res) {
