@@ -21556,8 +21556,12 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
     TrampFrame **ca = js_mallocz(ctx, (size_t)n * sizeof(TrampFrame *));
     if (!oa || !ca) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
     { int k = 0; for (TrampFrame *t = (TrampFrame *)s->tramp_top; t; t = t->up) oa[k++] = t; }
-    DCHECK(ob->var_ref_count == 0, "deep clone: base closure var_refs not built yet");
-    for (int i = 0; i < n; i++) DCHECK(oa[i]->sf.var_ref_count == 0, "deep clone: closure var_refs in chain not built yet");
+    /* var_ref_count here is a frame's OWN open cells (locals captured by INNER closures it created) — NOT its
+       incoming captures (those live on the shared function object and are handled by COW). So a plain closure
+       (reads/writes captured vars, no inner closures) has 0 and clones fine; only an inner-closure FACTORY
+       hits this — its open cells alias the live stack + any escaped inner closure (a heap-graph problem). */
+    DCHECK(ob->var_ref_count == 0, "deep clone: base creates inner closures (own open cells) — escaping-closure case");
+    for (int i = 0; i < n; i++) DCHECK(oa[i]->sf.var_ref_count == 0, "deep clone: frame creates inner closures (own open cells) — escaping-closure case");
 
     /* ---- clone the base frame (dormant, mid-call): live end = the bottom frame's caller_sp ---- */
     JSObject *bp = JS_VALUE_GET_OBJ(ob->cur_func);
@@ -21635,7 +21639,9 @@ JSValue *JS_FlowClone(JSContext *ctx, JSValue *flow) {
        suspend leaves the BASE cur_sp NULL — its live point is in the chain, not the base). */
     DCHECK(sf->cur_sp != NULL || s->tramp_top != NULL, "JS_FlowClone: flow is not SUSPENDED (only a paused frame can be snapshot-forked)");
     if (s->tramp_top != NULL) return clone_deep_flow(ctx, s);   /* deep: base + tramp chain */
-    DCHECK(sf->var_ref_count == 0, "JS_FlowClone: live closure var_refs clone not built yet — the next capability");
+    /* var_ref_count = the frame's OWN open cells (inner closures over its locals), NOT incoming captures (COW-
+       handled). A plain closure clones fine (0); only an inner-closure factory hits this — the escaping case. */
+    DCHECK(sf->var_ref_count == 0, "JS_FlowClone: frame creates inner closures (own open cells) — escaping-closure case");
 
     JSObject *p = JS_VALUE_GET_OBJ(sf->cur_func);
     JSFunctionBytecode *b = p->u.func.function_bytecode;
