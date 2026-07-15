@@ -21523,13 +21523,83 @@ void JS_FlowFree(JSContext *ctx, JSValue *flow) {
    diverge, isolated by their own COW deltas (cloned separately by the host). NO FALLBACK: an un-handled shape
    is a not-yet-built capability that CRASHES LOUD (forcing the root fix), never a silent degrade to re-run.
    Base-level closure-free frames are built; DEEP tramp chains + live var_refs are the next capability. */
+/* DEEP clone: a flow suspended INSIDE a called function (tramp_top holds the heap call chain). Clones the base
+   frame (dormant, mid-call) + the tramp chain, relinking every caller_* pointer into the cloned frames, so the
+   clone resumes at the deep branch and unwinds through its OWN chain. Refcount discipline: the base OWNS its
+   cur_func (async_func_init dup'd it) and this_val; a TrampFrame BORROWS its cur_func from the caller stack
+   (do_tramp_call did not dup it) — so the base dup's, the tramp does not. Single-level, closure-free, in-frame
+   args for now; every other shape DCHECKs (no fallback). */
+static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
+    TrampFrame *otf = (TrampFrame *)s->tramp_top;
+    JSStackFrame *ob = &s->frame;
+    DCHECK(otf->up == NULL, "deep clone: multi-level tramp chain not built yet");
+    DCHECK(otf->sf.var_ref_count == 0 && ob->var_ref_count == 0, "deep clone: closure var_refs not built yet");
+
+    JSObject *bp = JS_VALUE_GET_OBJ(ob->cur_func);
+    JSFunctionBytecode *bb = bp->u.func.function_bytecode;
+    int bal = ob->arg_count, blc = bal + bb->var_count + bb->stack_size;
+    ptrdiff_t blive = otf->caller_sp - ob->arg_buf;   /* base was here when it called into the chain */
+
+    JSAsyncFunctionState *c = js_mallocz(ctx, sizeof(*c));
+    if (!c) return NULL;
+    JSStackFrame *cb = &c->frame;
+    cb->arg_buf = js_malloc(ctx, sizeof(JSValue) * (blc > 0 ? blc : 1) + sizeof(JSVarRef *) * bb->var_ref_count);
+    if (!cb->arg_buf) { js_free(ctx, c); return NULL; }
+    for (ptrdiff_t i = 0; i < blive; i++) cb->arg_buf[i] = js_dup(ob->arg_buf[i]);
+    cb->is_strict_mode = ob->is_strict_mode;
+    cb->cur_func = js_dup(ob->cur_func);   /* base OWNS cur_func */
+    c->this_val = js_dup(s->this_val);
+    c->argc = s->argc; c->throw_flag = s->throw_flag;
+    cb->arg_count = ob->arg_count;
+    cb->var_buf = cb->arg_buf + bal;
+    cb->var_ref_count = 0;
+    cb->var_refs = (JSVarRef **)(cb->arg_buf + blc);
+    cb->cur_pc = ob->cur_pc;   /* base resumes here after the chain returns to it */
+    cb->cur_sp = NULL;         /* dormant: the live point is in the chain */
+    cb->prev_frame = NULL;
+
+    JSObject *wp = JS_VALUE_GET_OBJ(otf->sf.cur_func);
+    JSFunctionBytecode *wb = wp->u.func.function_bytecode;
+    int wal = otf->sf.arg_count, wlc = wal + wb->var_count + wb->stack_size;
+    int arg_in_frame = (otf->sf.arg_buf >= otf->local_buf && otf->sf.arg_buf < otf->local_buf + wlc + 1);
+    TrampFrame *ct = js_malloc(ctx, sizeof(TrampFrame));
+    if (!ct) { js_free_rt(ctx->rt, cb->arg_buf); JS_FreeValue(ctx, cb->cur_func); JS_FreeValue(ctx, c->this_val); js_free(ctx, c); return NULL; }
+    *ct = *otf;   /* copy scalars + borrowed values (cur_func, this_val, new_target stay borrowed); fix pointers */
+    ct->local_buf = js_malloc(ctx, sizeof(JSValue) * (wlc > 0 ? wlc : 1) + sizeof(JSVarRef *) * wb->var_ref_count);
+    if (!ct->local_buf) { js_free_rt(ctx->rt, cb->arg_buf); JS_FreeValue(ctx, cb->cur_func); JS_FreeValue(ctx, c->this_val); js_free(ctx, c); js_free(ctx, ct); return NULL; }
+    ptrdiff_t wlive = otf->sf.cur_sp - otf->local_buf;
+    for (ptrdiff_t i = 0; i < wlive; i++) ct->local_buf[i] = js_dup(otf->local_buf[i]);
+    #define XL(p, ob_, cb_) ((p) ? (cb_) + ((p) - (ob_)) : NULL)   /* translate a JSValue* from ob_ buffer to cb_ buffer */
+    /* args are in-frame (narg_alloc>0) OR borrowed from the caller (base) stack (0-arg / enough-args callee) */
+    ct->sf.arg_buf   = arg_in_frame ? XL(otf->sf.arg_buf, otf->local_buf, ct->local_buf)
+                                     : XL(otf->sf.arg_buf, ob->arg_buf, cb->arg_buf);
+    ct->sf.var_buf   = XL(otf->sf.var_buf, otf->local_buf, ct->local_buf);
+    ct->sf.var_refs  = (JSVarRef **)XL((JSValue *)otf->sf.var_refs, otf->local_buf, ct->local_buf);
+    ct->sf.cur_sp    = XL(otf->sf.cur_sp, otf->local_buf, ct->local_buf);
+    ct->sf.var_ref_count = 0;
+    ct->sf.prev_frame = NULL;
+    /* the callee's cur_func is BORROWED (no dup) — already copied by *ct = *otf. */
+    ct->up = NULL;
+    ct->caller_sf        = cb;
+    ct->caller_local_buf = XL(otf->caller_local_buf, ob->arg_buf, cb->arg_buf);
+    ct->caller_stack_buf = XL(otf->caller_stack_buf, ob->arg_buf, cb->arg_buf);
+    ct->caller_var_buf   = XL(otf->caller_var_buf, ob->arg_buf, cb->arg_buf);
+    ct->caller_arg_buf   = XL(otf->caller_arg_buf, ob->arg_buf, cb->arg_buf);
+    ct->caller_var_refs  = cb->var_refs;
+    ct->caller_sp        = XL(otf->caller_sp, ob->arg_buf, cb->arg_buf);
+    ct->caller_argv      = (JSValueConst *)XL((JSValue *)otf->caller_argv, ob->arg_buf, cb->arg_buf);
+    #undef XL
+    c->tramp_top = ct;
+    return (JSValue *)c;
+}
+
 JSValue *JS_FlowClone(JSContext *ctx, JSValue *flow) {
     JSAsyncFunctionState *s = (JSAsyncFunctionState *)flow;
     JSStackFrame *sf = &s->frame;
     /* A flow is SUSPENDED iff a base frame saved cur_sp OR a deep chain is stashed in tramp_top (a deep
        suspend leaves the BASE cur_sp NULL — its live point is in the chain, not the base). */
     DCHECK(sf->cur_sp != NULL || s->tramp_top != NULL, "JS_FlowClone: flow is not SUSPENDED (only a paused frame can be snapshot-forked)");
-    DCHECK(s->tramp_top == NULL, "JS_FlowClone: DEEP tramp-chain clone not built yet — the next capability");
+    if (s->tramp_top != NULL) return clone_deep_flow(ctx, s);   /* deep: base + tramp chain */
     DCHECK(sf->var_ref_count == 0, "JS_FlowClone: live closure var_refs clone not built yet — the next capability");
 
     JSObject *p = JS_VALUE_GET_OBJ(sf->cur_func);
