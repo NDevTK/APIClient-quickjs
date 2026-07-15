@@ -21526,7 +21526,9 @@ void JS_FlowFree(JSContext *ctx, JSValue *flow) {
 JSValue *JS_FlowClone(JSContext *ctx, JSValue *flow) {
     JSAsyncFunctionState *s = (JSAsyncFunctionState *)flow;
     JSStackFrame *sf = &s->frame;
-    DCHECK(sf->cur_sp != NULL, "JS_FlowClone: flow is not SUSPENDED (only a paused frame can be snapshot-forked)");
+    /* A flow is SUSPENDED iff a base frame saved cur_sp OR a deep chain is stashed in tramp_top (a deep
+       suspend leaves the BASE cur_sp NULL — its live point is in the chain, not the base). */
+    DCHECK(sf->cur_sp != NULL || s->tramp_top != NULL, "JS_FlowClone: flow is not SUSPENDED (only a paused frame can be snapshot-forked)");
     DCHECK(s->tramp_top == NULL, "JS_FlowClone: DEEP tramp-chain clone not built yet — the next capability");
     DCHECK(sf->var_ref_count == 0, "JS_FlowClone: live closure var_refs clone not built yet — the next capability");
 
