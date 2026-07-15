@@ -6135,6 +6135,17 @@ static inline void cow_capture(JSContext *ctx, JSValueConst obj, JSAtom prop) {
         g_cow_hook(ctx, obj, prop);
 }
 
+/* forced-exec COW for CLOSURE CELLS: a closure variable is a shared JSVarRef, not a property, so a write to it
+   (OP_put_var_ref) bypasses the object-write capture above. This hook records the cell's pre-write value into
+   the running flow's delta so a snapshot-forked sibling that shares the cell stays isolated. The cell is an
+   opaque void* to the host (JSVarRef is engine-internal); the host reads/writes its value via
+   JS_VarRefGetValue/SetValue below. */
+static JSCowVarRefHook g_cow_vr_hook = NULL;
+void JS_SetCowVarRefHook(JSCowVarRefHook h) { g_cow_vr_hook = h; }
+static inline void cow_capture_vr(JSContext *ctx, void *vref) {
+    if (g_cow_vr_hook && vref) g_cow_vr_hook(ctx, vref);
+}
+
 static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID class_id,
                                      JSProperty *props)
 {
@@ -17529,6 +17540,11 @@ static JSVarRef *get_var_ref(JSContext *ctx, JSStackFrame *sf, int var_idx,
     }
 }
 
+/* forced-exec COW closure-cell accessors — cow.c reads/writes a shared JSVarRef's value through these (the
+   type is engine-internal). Get returns an OWNED dup (caller frees); Set consumes val. */
+JSValue JS_VarRefGetValue(void *vref) { return js_dup(*((JSVarRef *)vref)->pvalue); }
+void JS_VarRefSetValue(JSContext *ctx, void *vref, JSValue val) { set_value(ctx, ((JSVarRef *)vref)->pvalue, val); }
+
 static JSValue js_closure2(JSContext *ctx, JSValue func_obj,
                            JSFunctionBytecode *b,
                            JSVarRef **cur_var_refs,
@@ -19146,14 +19162,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_get_var_ref1): *sp++ = js_dup(*var_refs[1]->pvalue); BREAK;
         CASE(OP_get_var_ref2): *sp++ = js_dup(*var_refs[2]->pvalue); BREAK;
         CASE(OP_get_var_ref3): *sp++ = js_dup(*var_refs[3]->pvalue); BREAK;
-        CASE(OP_put_var_ref0): set_value(ctx, var_refs[0]->pvalue, *--sp); BREAK;
-        CASE(OP_put_var_ref1): set_value(ctx, var_refs[1]->pvalue, *--sp); BREAK;
-        CASE(OP_put_var_ref2): set_value(ctx, var_refs[2]->pvalue, *--sp); BREAK;
-        CASE(OP_put_var_ref3): set_value(ctx, var_refs[3]->pvalue, *--sp); BREAK;
-        CASE(OP_set_var_ref0): set_value(ctx, var_refs[0]->pvalue, js_dup(sp[-1])); BREAK;
-        CASE(OP_set_var_ref1): set_value(ctx, var_refs[1]->pvalue, js_dup(sp[-1])); BREAK;
-        CASE(OP_set_var_ref2): set_value(ctx, var_refs[2]->pvalue, js_dup(sp[-1])); BREAK;
-        CASE(OP_set_var_ref3): set_value(ctx, var_refs[3]->pvalue, js_dup(sp[-1])); BREAK;
+        CASE(OP_put_var_ref0): cow_capture_vr(ctx, var_refs[0]); set_value(ctx, var_refs[0]->pvalue, *--sp); BREAK;
+        CASE(OP_put_var_ref1): cow_capture_vr(ctx, var_refs[1]); set_value(ctx, var_refs[1]->pvalue, *--sp); BREAK;
+        CASE(OP_put_var_ref2): cow_capture_vr(ctx, var_refs[2]); set_value(ctx, var_refs[2]->pvalue, *--sp); BREAK;
+        CASE(OP_put_var_ref3): cow_capture_vr(ctx, var_refs[3]); set_value(ctx, var_refs[3]->pvalue, *--sp); BREAK;
+        CASE(OP_set_var_ref0): cow_capture_vr(ctx, var_refs[0]); set_value(ctx, var_refs[0]->pvalue, js_dup(sp[-1])); BREAK;
+        CASE(OP_set_var_ref1): cow_capture_vr(ctx, var_refs[1]); set_value(ctx, var_refs[1]->pvalue, js_dup(sp[-1])); BREAK;
+        CASE(OP_set_var_ref2): cow_capture_vr(ctx, var_refs[2]); set_value(ctx, var_refs[2]->pvalue, js_dup(sp[-1])); BREAK;
+        CASE(OP_set_var_ref3): cow_capture_vr(ctx, var_refs[3]); set_value(ctx, var_refs[3]->pvalue, js_dup(sp[-1])); BREAK;
 
         CASE(OP_get_var_ref):
             {
@@ -19171,6 +19187,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int idx;
                 idx = get_u16(pc);
                 pc += 2;
+                cow_capture_vr(ctx, var_refs[idx]);
                 set_value(ctx, var_refs[idx]->pvalue, sp[-1]);
                 sp--;
             }
@@ -19180,6 +19197,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int idx;
                 idx = get_u16(pc);
                 pc += 2;
+                cow_capture_vr(ctx, var_refs[idx]);
                 set_value(ctx, var_refs[idx]->pvalue, js_dup(sp[-1]));
             }
             BREAK;

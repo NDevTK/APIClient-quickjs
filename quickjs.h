@@ -1180,6 +1180,13 @@ JS_EXTERN void JS_SetForkHook(JSForkHook h);
 typedef void (*JSCowHook)(JSContext *ctx, JSValueConst obj, JSAtom prop);
 JS_EXTERN void JS_SetFlowLocalMark(int m);
 JS_EXTERN void JS_SetCowHook(JSCowHook h);
+/* COW for CLOSURE CELLS: called before a write to a shared closure variable (JSVarRef, opaque here). The host
+   records the cell's pre-write value so a snapshot-forked sibling sharing the cell stays isolated; it reads/
+   writes the cell's value via JS_VarRefGet/SetValue. */
+typedef void (*JSCowVarRefHook)(JSContext *ctx, void *vref);
+JS_EXTERN void   JS_SetCowVarRefHook(JSCowVarRefHook h);
+JS_EXTERN JSValue JS_VarRefGetValue(void *vref);
+JS_EXTERN void   JS_VarRefSetValue(JSContext *ctx, void *vref, JSValue val);
 
 /* APIClient forced-execution: concolic PROPAGATION through `+`. When an operand of a slow-path add is a concolic
    value, this hook produces the concolic result (derived shape + example) into sp[-2] and returns 1; else 0 and
