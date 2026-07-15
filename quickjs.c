@@ -6107,6 +6107,19 @@ static __maybe_unused void JS_DumpShapes(JSRuntime *rt)
     printf("}\n");
 }
 
+/* Forced-exec fork-local assert — MIRRORS engine/host/check.h (the quickjs submodule is a separate repo and
+   cannot include the host header, exactly as extension/check.js mirrors the same law on the JS side). Same
+   semantics: DFAIL = a DEV-ONLY should-never-happen (design invariant / not-yet-built capability) — emits
+   @WHY at the origin then aborts; QJS_CHECK_FAIL = ALWAYS fatal (dev AND release) for a "must-not-proceed
+   even in production" invariant. DFAIL compiles out in release (APICLIENT_DEV=0); its condition must be
+   side-effect-free and never recoverable control flow. */
+#if defined(APICLIENT_DEV) && APICLIENT_DEV == 0
+#define DFAIL(msg)         ((void)0)
+#else
+#define DFAIL(msg)         do { fprintf(stderr, "@WHY %s (%s:%d)\n", (msg), __FILE__, __LINE__); abort(); } while (0)
+#endif
+#define QJS_CHECK_FAIL(msg) do { fprintf(stderr, "@E %s (%s:%d)\n", (msg), __FILE__, __LINE__); abort(); } while (0)
+
 /* 'props[]' is used to initialized the object properties. The number
    of elements depends on the shape. */
 uint8_t g_flow_local_mark = 0;   /* forced-exec: stamps new objects baseline(0)/flow-local(1); see JS_SetFlowLocalMark */
@@ -11835,6 +11848,7 @@ static inline int JS_SetGlobalVar(JSContext *ctx, JSAtom prop, JSValue val,
                 return JS_ThrowTypeErrorReadOnly(ctx, JS_PROP_THROW, prop);
             }
         }
+        cow_capture(ctx, ctx->global_var_obj, prop);   /* a global var/let/const IS shared baseline state */
         set_value(ctx, &pr->u.value, val);
         return 0;
     }
@@ -11844,7 +11858,8 @@ static inline int JS_SetGlobalVar(JSContext *ctx, JSAtom prop, JSValue val,
     if (prs) {
         if (likely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
                                   JS_PROP_LENGTH)) == JS_PROP_WRITABLE)) {
-            /* fast path */
+            /* fast path — capture: a write to an existing global-object property is shared-state too. */
+            cow_capture(ctx, ctx->global_obj, prop);
             set_value(ctx, &pr->u.value, val);
             return 0;
         }
@@ -21405,16 +21420,22 @@ static JSValue async_func_resume(JSContext *ctx, JSAsyncFunctionState *s)
    function frame (heap-resident, suspendable), so the scheduler can preempt it mid-execution (at a loop
    back-edge, via the preempt hook) and resume it later — the substrate for value-ordered interleaving. */
 JSValue *JS_FlowNew(JSContext *ctx, const char *src, size_t len) {
-    size_t wl = len + 40;
-    char *w = js_malloc(ctx, wl);
-    if (!w) return NULL;
-    int n = snprintf(w, wl, "(async function(){%.*s})", (int)len, src);
-    JSValue fn = JS_Eval(ctx, w, n, "<flow>", JS_EVAL_TYPE_GLOBAL);
-    js_free(ctx, w);
+    /* Compile as a GLOBAL program (NOT an async-function wrapper): boot is a classic script, so top-level
+       `var`/function must create GLOBAL bindings (window.d = …, the moat surface) — an async wrapper would
+       scope them to the function and break that. The compiled global program runs through the same async-
+       frame machinery (async_func_init / async_func_resume), so it is preemptible all the same; it simply
+       cannot have top-level await (invalid in a classic script anyway — boot-time async is async functions
+       CALLED at top level, whose bodies are their own frames). */
+    JSValue bc = JS_Eval(ctx, src, len, "<flow>", JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+    if (JS_IsException(bc)) { JS_FreeValue(ctx, bc); return NULL; }
+    /* COMPILE_ONLY yields raw JS_TAG_FUNCTION_BYTECODE — wrap it in a closure with the global scope (var_refs
+       NULL) exactly as JS_EvalFunctionInternal does, so it is a runnable JS_CLASS_BYTECODE_FUNCTION whose
+       prologue defines globals on execution. async_func_init then makes that frame preemptible. */
+    JSValue fn = js_closure(ctx, bc, NULL, NULL);   /* consumes bc */
     if (JS_IsException(fn)) { JS_FreeValue(ctx, fn); return NULL; }
     JSAsyncFunctionState *s = js_mallocz(ctx, sizeof(*s));
     if (!s) { JS_FreeValue(ctx, fn); return NULL; }
-    if (async_func_init(ctx, s, fn, JS_UNDEFINED, 0, NULL)) { js_free(ctx, s); JS_FreeValue(ctx, fn); return NULL; }
+    if (async_func_init(ctx, s, fn, ctx->global_obj, 0, NULL)) { js_free(ctx, s); JS_FreeValue(ctx, fn); return NULL; }
     JS_FreeValue(ctx, fn);
     return (JSValue *)s;   /* opaque handle */
 }
@@ -21426,7 +21447,11 @@ int JS_FlowResume(JSContext *ctx, JSValue *flow) {
     JSAsyncFunctionState *s = (JSAsyncFunctionState *)flow;
     for (;;) {
         JSValue r = async_func_resume(ctx, s);
-        if (JS_VALUE_GET_TAG(r) != JS_TAG_INT) { JS_FreeValue(ctx, r); return 0; }   /* completed / threw */
+        /* Completion is signalled by the FRAME, not the return value (which could be a small int colliding
+           with a FUNC_RET_* code): a NORMAL-func_kind program completes via `done:` leaving BOTH cur_sp NULL
+           AND the tramp chain empty. A BASE suspend (done_generator) saves cur_sp (non-null); a DEEP suspend
+           returns directly with cur_sp NULL but stashes the chain in tramp_top. So suspended iff either is set. */
+        if (s->frame.cur_sp == NULL && s->tramp_top == NULL) { JS_FreeValue(ctx, r); return 0; }   /* completed / threw */
         int fr = JS_VALUE_GET_INT(r);
         if (fr == FUNC_RET_PREEMPT || fr == FUNC_RET_YIELD || fr == FUNC_RET_YIELD_STAR)
             return 1;   /* suspended — the scheduler (preempt) or generator consumer resumes it */
@@ -21441,10 +21466,9 @@ int JS_FlowResume(JSContext *ctx, JSValue *flow) {
             else {
                 /* PENDING: a real async result not yet available (e.g. a live fetch). Parking this flow until
                    the host provides the value is the fetch-await integration — not yet built. Fail LOUD
-                   (fork idiom, like the async-generator driver's abort) rather than silently deliver a wrong
-                   value; delivering undefined here would be the exact silent-failure the design forbids. */
-                fprintf(stderr, "@WHY JS_FlowResume: await on PENDING promise — fetch-await parking not built (%s:%d)\n", __FILE__, __LINE__);
-                abort();
+                   rather than silently deliver a wrong value (the exact silent-failure the design forbids). */
+                DFAIL("JS_FlowResume: await on PENDING promise — fetch-await parking not built");
+                settled = JS_UNDEFINED; s->throw_flag = false;
             }
             JS_FreeValue(ctx, awaited);
             s->frame.cur_sp[-1] = settled;
@@ -21456,7 +21480,19 @@ int JS_FlowResume(JSContext *ctx, JSValue *flow) {
 }
 void JS_FlowFree(JSContext *ctx, JSValue *flow) {
     JSAsyncFunctionState *s = (JSAsyncFunctionState *)flow;
-    if (s->frame.cur_sp != NULL) async_func_free(ctx->rt, s);   /* free the suspended frame; a completed one already unwound */
+    if (s->frame.cur_sp != NULL) {
+        async_func_free(ctx->rt, s);   /* never-run or BASE-suspended: full generator-frame cleanup */
+    } else if (s->tramp_top != NULL) {
+        /* DEEP-suspended (evicted mid-descent): the stashed TrampFrame chain must be torn down
+           (free_tramp_chain) — not yet built. Fail LOUD rather than leak the chain. */
+        DFAIL("JS_FlowFree: evicting a DEEP-suspended flow — free_tramp_chain not built");
+    } else {
+        /* COMPLETED via `done:` (NORMAL func_kind): the stack values + var_refs were freed inline there, but
+           the heap frame buffer + cur_func + this_val were not (done: assumes an alloca'd frame). Free them. */
+        js_free_rt(ctx->rt, s->frame.arg_buf);
+        JS_FreeValue(ctx, s->frame.cur_func);
+        JS_FreeValue(ctx, s->this_val);
+    }
     js_free(ctx, s);
 }
 
