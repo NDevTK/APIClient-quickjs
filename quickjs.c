@@ -6115,8 +6115,10 @@ static __maybe_unused void JS_DumpShapes(JSRuntime *rt)
    side-effect-free and never recoverable control flow. */
 #if defined(APICLIENT_DEV) && APICLIENT_DEV == 0
 #define DFAIL(msg)         ((void)0)
+#define DCHECK(cond, msg)  ((void)0)
 #else
 #define DFAIL(msg)         do { fprintf(stderr, "@WHY %s (%s:%d)\n", (msg), __FILE__, __LINE__); abort(); } while (0)
+#define DCHECK(cond, msg)  do { if (!(cond)) DFAIL(msg); } while (0)
 #endif
 #define QJS_CHECK_FAIL(msg) do { fprintf(stderr, "@E %s (%s:%d)\n", (msg), __FILE__, __LINE__); abort(); } while (0)
 
@@ -21494,6 +21496,51 @@ void JS_FlowFree(JSContext *ctx, JSValue *flow) {
         JS_FreeValue(ctx, s->this_val);
     }
     js_free(ctx, s);
+}
+
+/* FRAME-SNAPSHOT FORK: deep-copy a SUSPENDED flow so the clone resumes INDEPENDENTLY from the same point (the
+   branch), instead of re-running from the start. This is the hot-fork half of "COW snapshot on the heap call-
+   stack": the clone shares no frame state with the original — every live frame value is dup'd — and the two
+   diverge, isolated by their own COW deltas (cloned separately by the host). NO FALLBACK: an un-handled shape
+   is a not-yet-built capability that CRASHES LOUD (forcing the root fix), never a silent degrade to re-run.
+   Base-level closure-free frames are built; DEEP tramp chains + live var_refs are the next capability. */
+JSValue *JS_FlowClone(JSContext *ctx, JSValue *flow) {
+    JSAsyncFunctionState *s = (JSAsyncFunctionState *)flow;
+    JSStackFrame *sf = &s->frame;
+    DCHECK(sf->cur_sp != NULL, "JS_FlowClone: flow is not SUSPENDED (only a paused frame can be snapshot-forked)");
+    DCHECK(s->tramp_top == NULL, "JS_FlowClone: DEEP tramp-chain clone not built yet — the next capability");
+    DCHECK(sf->var_ref_count == 0, "JS_FlowClone: live closure var_refs clone not built yet — the next capability");
+
+    JSObject *p = JS_VALUE_GET_OBJ(sf->cur_func);
+    JSFunctionBytecode *b = p->u.func.function_bytecode;
+    int arg_buf_len = sf->arg_count;
+    int local_count = arg_buf_len + b->var_count + b->stack_size;
+    size_t alloc_size = sizeof(JSValue) * (local_count > 0 ? local_count : 1) + sizeof(JSVarRef *) * b->var_ref_count;
+
+    JSAsyncFunctionState *c = js_mallocz(ctx, sizeof(*c));
+    if (!c) return NULL;
+    JSStackFrame *cf = &c->frame;
+    cf->arg_buf = js_malloc(ctx, alloc_size);
+    if (!cf->arg_buf) { js_free(ctx, c); return NULL; }
+
+    cf->is_strict_mode = sf->is_strict_mode;
+    cf->cur_func = js_dup(sf->cur_func);
+    c->this_val = js_dup(s->this_val);
+    c->argc = s->argc;
+    c->throw_flag = s->throw_flag;
+    cf->arg_count = sf->arg_count;
+    cf->var_buf = cf->arg_buf + arg_buf_len;
+    cf->var_ref_count = 0;
+    cf->var_refs = (JSVarRef **)(cf->arg_buf + local_count);
+    cf->cur_pc = sf->cur_pc;   /* same bytecode, resume at the same instruction */
+    cf->prev_frame = NULL;
+
+    /* deep-copy the LIVE frame slots [arg_buf, cur_sp): args + vars + live stack — each value dup'd, so the
+       clone owns its own state and the two frames never alias. */
+    ptrdiff_t live = sf->cur_sp - sf->arg_buf;
+    for (ptrdiff_t i = 0; i < live; i++) cf->arg_buf[i] = js_dup(sf->arg_buf[i]);
+    cf->cur_sp = cf->arg_buf + live;
+    return (JSValue *)c;
 }
 
 

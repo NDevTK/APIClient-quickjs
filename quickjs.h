@@ -1197,6 +1197,9 @@ JS_EXTERN void JS_SetPreemptHook(JSPreemptHook h);
 JS_EXTERN JSValue *JS_FlowNew(JSContext *ctx, const char *src, size_t len);   /* opaque flow handle (NULL on error) */
 JS_EXTERN int      JS_FlowResume(JSContext *ctx, JSValue *flow);              /* 1 = suspended (preempted), 0 = completed */
 JS_EXTERN void     JS_FlowFree(JSContext *ctx, JSValue *flow);
+/* Frame-snapshot fork: deep-copy a SUSPENDED flow into an INDEPENDENT clone that resumes from the same point.
+   No fallback — an un-built frame shape (deep tramp chain / live closures) crashes loud. */
+JS_EXTERN JSValue *JS_FlowClone(JSContext *ctx, JSValue *flow);
 /* if can_block is true, Atomics.wait() can be used */
 JS_EXTERN void JS_SetCanBlock(JSRuntime *rt, bool can_block);
 /* set the [IsHTMLDDA] internal slot */
