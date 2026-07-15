@@ -1176,6 +1176,12 @@ JS_EXTERN void JS_SetBranchHook(JSBranchHook h);
 typedef void (*JSCowHook)(JSContext *ctx, JSValueConst obj, JSAtom prop);
 JS_EXTERN void JS_SetFlowLocalMark(int m);
 JS_EXTERN void JS_SetCowHook(JSCowHook h);
+
+/* APIClient forced-execution: concolic PROPAGATION through `+`. When an operand of a slow-path add is a concolic
+   value, this hook produces the concolic result (derived shape + example) into sp[-2] and returns 1; else 0 and
+   the normal add runs. This is how `'/api/' + id` carries the URL shape. */
+typedef int (*JSConcolicAddHook)(JSContext *ctx, JSValue *sp);
+JS_EXTERN void JS_SetConcolicAddHook(JSConcolicAddHook h);
 /* if can_block is true, Atomics.wait() can be used */
 JS_EXTERN void JS_SetCanBlock(JSRuntime *rt, bool can_block);
 /* set the [IsHTMLDDA] internal slot */
