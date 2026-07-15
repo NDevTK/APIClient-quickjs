@@ -17964,6 +17964,42 @@ static bool needs_backtrace(JSValue exc)
     return can_store_error_stack(exc) || can_add_backtrace(exc);
 }
 
+/* APIClient forced-execution — the TRAMPOLINE. To suspend/resume a flow at ANY depth (not just its base), the
+   whole JS call stack must be HEAP-resident, not on the C stack. So a NORMAL bytecode call pushes a heap
+   TrampFrame and `goto restart`s into the callee IN THE SAME JS_CallInternal loop (no C recursion); OP_return
+   pops it. The C stack stays flat, deep recursion never overflows, and (with the generator base + a per-opcode
+   yield, next) the entire chain can be unwound at a yield and rebuilt on resume. Non-NORMAL callees (C funcs,
+   bound/proxy, generators) keep the recursive path for now — the common deep case is NORMAL. */
+typedef struct TrampFrame {
+    JSStackFrame sf;                 /* the callee's own frame (heap-resident) */
+    JSFunctionBytecode *b;
+    JSContext *ctx;
+    JSValue *local_buf;
+    /* resume-the-caller record: */
+    struct TrampFrame *up;           /* caller TrampFrame, or NULL if the caller is the C-stack base */
+    JSStackFrame *caller_sf;
+    JSValue *caller_sp;
+    JSFunctionBytecode *caller_b;
+    JSContext *caller_ctx;
+    JSValue *caller_local_buf, *caller_stack_buf, *caller_var_buf, *caller_arg_buf;
+    JSValueConst caller_this, caller_new_target;
+    JSVarRef **caller_var_refs;
+    int caller_argc; JSValueConst *caller_argv;
+    int caller_arg_allocated_size;
+    int call_first;                  /* first caller-stack slot to free on return: -1 call, -2 method */
+    int call_argc;
+    uint8_t is_tail;
+} TrampFrame;
+
+/* Only a NORMAL bytecode function trampolines (the common deep-recursion case). */
+static inline bool tramp_can_call(JSValueConst func) {
+    JSObject *fp;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
+    fp = JS_VALUE_GET_OBJ(func);
+    if (fp->class_id != JS_CLASS_BYTECODE_FUNCTION) return false;
+    return fp->u.func.function_bytecode->func_kind == JS_FUNC_NORMAL;
+}
+
 /* APIClient forced-execution — the ONLY interpreter delta for branching. When the interpreter is about to
    branch on a CONCOLIC value (a solver-owned host object), it asks the host which arm to take. The hook FORKS
    by appending a sibling decision vector to the frontier (flow.c), NEVER by rewinding this OP_if — so a native
@@ -17996,6 +18032,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSValue *local_buf, *stack_buf, *var_buf, *arg_buf, *sp, ret_val, *pval;
     JSVarRef **var_refs;
     size_t alloca_size;
+    TrampFrame *tf_top = NULL;         /* heap stack of trampolined NORMAL callees (this activation's base = C stack) */
+    int tramp_first = -1; uint8_t tramp_is_tail = 0;   /* set before goto do_tramp_call */
 
 #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_STEP
 #define DUMP_BYTECODE_OR_DONT(pc) \
@@ -18479,6 +18517,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             has_call_argc:
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
+                if (tramp_can_call(call_argv[-1])) {   /* NORMAL bytecode fn -> heap frame, no C recursion */
+                    tramp_first = -1; tramp_is_tail = (opcode == OP_tail_call);
+                    goto do_tramp_call;
+                }
                 ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
                                           JS_UNDEFINED, call_argc,
                                           vc(call_argv), 0);
@@ -18516,6 +18558,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc += 2;
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
+                if (tramp_can_call(call_argv[-1])) {   /* NORMAL bytecode method -> heap frame (this = call_argv[-2]) */
+                    tramp_first = -2; tramp_is_tail = (opcode == OP_tail_call_method);
+                    goto do_tramp_call;
+                }
                 ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
                                           JS_UNDEFINED, call_argc,
                                           vc(call_argv), 0);
@@ -18561,9 +18607,100 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
         CASE(OP_return):
             ret_val = *--sp;
-            goto done;
+            goto do_return;
         CASE(OP_return_undef):
             ret_val = JS_UNDEFINED;
+            goto do_return;
+
+        do_tramp_call:
+            /* push a HEAP frame for a NORMAL bytecode callee and continue in-place (no C recursion). */
+            {
+                JSValueConst nfunc = call_argv[-1];
+                JSObject *np = JS_VALUE_GET_OBJ(nfunc);
+                JSFunctionBytecode *nb = np->u.func.function_bytecode;
+                int eff_argc = call_argc;
+                int narg_alloc = (eff_argc < nb->arg_count) ? nb->arg_count : 0;
+                size_t asize = sizeof(JSValue) * (narg_alloc + nb->var_count + nb->stack_size)
+                             + sizeof(JSVarRef *) * nb->var_ref_count;
+                TrampFrame *ntf; JSValue *nlb, *narg_buf, *nvar_buf, *nstack_buf; JSStackFrame *nsf; int k;
+                ntf = js_malloc_rt(rt, sizeof(TrampFrame));
+                if (unlikely(!ntf)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                nlb = js_malloc_rt(rt, asize ? asize : sizeof(JSValue));
+                if (unlikely(!nlb)) { js_free_rt(rt, ntf); JS_ThrowOutOfMemory(ctx); goto exception; }
+                ntf->up = tf_top;
+                ntf->caller_sf = sf; ntf->caller_b = b; ntf->caller_ctx = ctx;
+                ntf->caller_local_buf = local_buf; ntf->caller_stack_buf = stack_buf;
+                ntf->caller_var_buf = var_buf; ntf->caller_arg_buf = arg_buf;
+                ntf->caller_this = this_obj; ntf->caller_new_target = new_target;
+                ntf->caller_var_refs = var_refs;
+                ntf->caller_argc = argc; ntf->caller_argv = argv;
+                ntf->caller_arg_allocated_size = arg_allocated_size;
+                ntf->caller_sp = sp;
+                ntf->call_first = tramp_first; ntf->call_argc = call_argc; ntf->is_tail = tramp_is_tail;
+                ntf->b = nb; ntf->ctx = nb->realm; ntf->local_buf = nlb;
+                nsf = &ntf->sf;
+                nsf->is_strict_mode = nb->is_strict_mode;
+                nsf->cur_func = unsafe_unconst(nfunc);
+                nsf->arg_count = eff_argc;
+                if (narg_alloc) {
+                    int n = min_int(eff_argc, narg_alloc);
+                    narg_buf = nlb;
+                    for (k = 0; k < n; k++) narg_buf[k] = js_dup(call_argv[k]);
+                    for (; k < narg_alloc; k++) narg_buf[k] = JS_UNDEFINED;
+                    nsf->arg_count = narg_alloc;
+                } else {
+                    narg_buf = (JSValue *)call_argv;   /* args live on the caller stack (borrowed) */
+                }
+                nvar_buf = nlb + narg_alloc;
+                for (k = 0; k < nb->var_count; k++) nvar_buf[k] = JS_UNDEFINED;
+                nstack_buf = nvar_buf + nb->var_count;
+                nsf->arg_buf = narg_buf; nsf->var_buf = nvar_buf;
+                nsf->var_refs = (JSVarRef **)(nstack_buf + nb->stack_size);
+                nsf->var_ref_count = nb->var_ref_count;
+                for (k = 0; k < nb->var_ref_count; k++) nsf->var_refs[k] = NULL;
+                nsf->cur_pc = NULL; nsf->cur_sp = NULL;
+                nsf->prev_frame = rt->current_stack_frame;
+                rt->current_stack_frame = nsf;
+                tf_top = ntf;
+                this_obj = (tramp_first == -2) ? call_argv[-2] : JS_UNDEFINED;
+                new_target = JS_UNDEFINED;
+                sf = nsf; b = nb; ctx = nb->realm;
+                arg_buf = narg_buf; var_buf = nvar_buf; stack_buf = nstack_buf;
+                var_refs = np->u.func.var_refs;
+                argc = eff_argc; argv = (JSValueConst *)narg_buf;
+                arg_allocated_size = narg_alloc;
+                local_buf = nlb; sp = nstack_buf; pc = nb->byte_code_buf;
+                goto restart;
+            }
+        do_return:
+            /* ret_val is owned. If in a trampolined callee, pop to the caller in-place; else base -> done. */
+            if (tf_top) {
+                TrampFrame *rtf = tf_top;
+                int cfirst, cargc; uint8_t itail;
+                if (unlikely(sf->var_ref_count != 0)) close_var_refs(rt, sf);
+                for (pval = local_buf; pval < sp; pval++) JS_FreeValue(ctx, *pval);
+                js_free_rt(rt, local_buf);
+                rt->current_stack_frame = sf->prev_frame;
+                tf_top = rtf->up;
+                sf = rtf->caller_sf; b = rtf->caller_b; ctx = rtf->caller_ctx;
+                local_buf = rtf->caller_local_buf; stack_buf = rtf->caller_stack_buf;
+                var_buf = rtf->caller_var_buf; arg_buf = rtf->caller_arg_buf;
+                this_obj = rtf->caller_this; new_target = rtf->caller_new_target;
+                var_refs = rtf->caller_var_refs;
+                argc = rtf->caller_argc; argv = rtf->caller_argv;
+                arg_allocated_size = rtf->caller_arg_allocated_size;
+                pc = sf->cur_pc; sp = rtf->caller_sp;
+                cfirst = rtf->call_first; cargc = rtf->call_argc; itail = rtf->is_tail;
+                js_free_rt(rt, rtf);
+                if (itail) goto do_return;   /* caller was a tail-caller: propagate */
+                {
+                    JSValue *cargv = sp - cargc;
+                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
+                    sp += cfirst - cargc;
+                    *sp++ = ret_val;
+                }
+                BREAK;
+            }
             goto done;
 
         CASE(OP_check_ctor_return):
@@ -20879,6 +21016,26 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
             }
         }
+    }
+    /* uncaught in THIS frame: if trampolined, pop to the caller + re-raise there (its stack still holds the
+       call operands, which the caller's catch-search frees) — never leak tf_top by returning to the C base. */
+    if (tf_top) {
+        TrampFrame *rtf = tf_top;
+        if (unlikely(sf->var_ref_count != 0)) close_var_refs(rt, sf);
+        for (pval = local_buf; pval < sp; pval++) JS_FreeValue(ctx, *pval);
+        js_free_rt(rt, local_buf);
+        rt->current_stack_frame = sf->prev_frame;
+        tf_top = rtf->up;
+        sf = rtf->caller_sf; b = rtf->caller_b; ctx = rtf->caller_ctx;
+        local_buf = rtf->caller_local_buf; stack_buf = rtf->caller_stack_buf;
+        var_buf = rtf->caller_var_buf; arg_buf = rtf->caller_arg_buf;
+        this_obj = rtf->caller_this; new_target = rtf->caller_new_target;
+        var_refs = rtf->caller_var_refs;
+        argc = rtf->caller_argc; argv = rtf->caller_argv;
+        arg_allocated_size = rtf->caller_arg_allocated_size;
+        pc = sf->cur_pc; sp = rtf->caller_sp;
+        js_free_rt(rt, rtf);
+        goto exception;
     }
     ret_val = JS_EXCEPTION;
     /* the local variables are freed by the caller in the generator
