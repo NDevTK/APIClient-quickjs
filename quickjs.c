@@ -17773,6 +17773,11 @@ static int js_op_define_class(JSContext *ctx, JSValue *sp,
 
 static void close_var_ref(JSRuntime *rt, JSVarRef *var_ref)
 {
+    if (var_ref->is_detached) return;   /* idempotent — prerequisite for eager-CLOSED captured-local cells
+                                           (V8-Context model): a cell already closed at creation must not be
+                                           re-closed on frame return (that would js_dup its own value + double
+                                           add_gc_object, corrupting the GC list). No-op for the current lazy
+                                           model (cells are open until return), so safe to land ahead. */
     var_ref->value = js_dup(*var_ref->pvalue);
     var_ref->pvalue = &var_ref->value;
     /* the reference is no longer to a local variable */
