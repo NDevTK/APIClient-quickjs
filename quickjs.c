@@ -18300,6 +18300,17 @@ static inline bool tramp_is_function_call(JSValueConst method) {
     return mp->class_id == JS_CLASS_C_FUNCTION && mp->u.cfunc.cproto == JS_CFUNC_generic
         && mp->u.cfunc.c_function.generic == js_function_call;
 }
+/* Function.prototype.apply — call-site-resolved like .call, but its args live in an ARRAY (arbitrary length),
+   so they cannot be spread onto the fixed-size caller frame; do_apply_tramp reads them with build_arg_list
+   into the callee's OWN arg_buf. magic must be 0 (plain apply, not Reflect.apply which has a different shape). */
+static JSValue js_function_apply(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
+static inline bool tramp_is_function_apply(JSValueConst method) {
+    JSObject *mp;
+    if (JS_VALUE_GET_TAG(method) != JS_TAG_OBJECT) return false;
+    mp = JS_VALUE_GET_OBJ(method);
+    return mp->class_id == JS_CLASS_C_FUNCTION && mp->u.cfunc.cproto == JS_CFUNC_generic_magic
+        && mp->u.cfunc.c_function.generic_magic == js_function_apply && mp->u.cfunc.magic == 0;
+}
 
 /* Helpers defined later — needed by the heap-resident async call path inside JS_CallInternal. */
 static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s, JSValueConst func_obj,
@@ -19101,10 +19112,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_is_function_call(call_argv[-1])) {   /* f.call(thisArg,...) -> resolve + dispatch f here */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_forward_call;
                 }
-                /* NOTE: f.apply(this, arr) routing is intentionally OMITTED for now — do_apply_tramp corrupted
-                   the heap in an exception-unwind edge case (surfaced by a broad test262 sweep, a SIGSEGV in
-                   do_return's local_buf free). Until root-caused, apply takes the C js_function_apply path (a
-                   loop in an applied function still DFAILs — an honest gap, not a crash). */
+                if (tramp_is_function_apply(call_argv[-1]) && tramp_can_call(call_argv[-2])) {   /* f.apply(this,arr), f NORMAL */
+                    /* only when arr is undefined/null (0 args) or an object (array-like); a primitive arr must
+                       throw a realm-correct TypeError from the C js_function_apply BEFORE the target runs. */
+                    JSValueConst aa = (call_argc >= 2) ? call_argv[1] : JS_UNDEFINED;
+                    int atag = JS_VALUE_GET_TAG(aa);
+                    if (atag == JS_TAG_UNDEFINED || atag == JS_TAG_NULL || atag == JS_TAG_OBJECT) {
+                        tramp_is_tail = (opcode == OP_tail_call_method); goto do_apply_tramp;
+                    }
+                }
                 {   /* generator .next()/.throw()/.return() -> body runs on THIS chain (loop preempts the base) */
                     int gmag = tramp_gen_method_magic(call_argv[-1], call_argv[-2]);
                     if (gmag >= 0) { tramp_gen_magic = gmag; goto do_generator_tramp; }
@@ -19343,6 +19359,79 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 sp -= call_argc + 2;
                 *sp++ = ret_val;
                 BREAK;
+            }
+
+        do_apply_tramp:
+            /* f.apply(thisArg, array), f a NORMAL bytecode function. Mirrors do_tramp_call, but the args come
+               from `array` (via build_arg_list) into f's OWN arg_buf — never borrowed from / spread onto the
+               caller stack, since the array can be arbitrarily long. Operand shape [f, apply, thisArg, array]:
+               f=call_argv[-2]; do_return frees those call_argc+2 operands (call_first=-2) and pushes the result,
+               exactly like a method call. The callee's arg_count comes from the ARRAY (callee_argc), decoupled
+               from the operand count (call_argc). */
+            {
+                JSValueConst nfunc = call_argv[-2];
+                JSValueConst thisArg = (call_argc >= 1) ? call_argv[0] : JS_UNDEFINED;
+                JSValueConst arrayArg = (call_argc >= 2) ? call_argv[1] : JS_UNDEFINED;
+                JSObject *np = JS_VALUE_GET_OBJ(nfunc);
+                JSFunctionBytecode *nb = np->u.func.function_bytecode;
+                uint32_t alen = 0; JSValue *atab = NULL;
+                int eff_argc, narg_alloc; size_t asize;
+                TrampFrame *ntf; JSValue *nlb, *narg_buf, *nvar_buf, *nstack_buf; JSStackFrame *nsf; int k;
+                if (JS_VALUE_GET_TAG(arrayArg) != JS_TAG_UNDEFINED && JS_VALUE_GET_TAG(arrayArg) != JS_TAG_NULL) {
+                    atab = build_arg_list(ctx, &alen, arrayArg);   /* reads the array (may throw) */
+                    if (unlikely(!atab)) goto exception;
+                }
+                eff_argc = (int)alen;
+                narg_alloc = (eff_argc < nb->arg_count) ? nb->arg_count : eff_argc;   /* always own the args (in atab, not the stack) */
+                asize = sizeof(JSValue) * (narg_alloc + nb->var_count + nb->stack_size)
+                      + sizeof(JSVarRef *) * nb->var_ref_count;
+                ntf = js_malloc_rt(rt, sizeof(TrampFrame));
+                if (unlikely(!ntf)) { if (atab) free_arg_list(ctx, atab, alen); JS_ThrowOutOfMemory(ctx); goto exception; }
+                nlb = js_malloc_rt(rt, asize ? asize : sizeof(JSValue));
+                if (unlikely(!nlb)) { js_free_rt(rt, ntf); if (atab) free_arg_list(ctx, atab, alen); JS_ThrowOutOfMemory(ctx); goto exception; }
+                ntf->up = tf_top;
+                ntf->caller_sf = sf; ntf->caller_b = b; ntf->caller_ctx = ctx;
+                ntf->caller_local_buf = local_buf; ntf->caller_stack_buf = stack_buf;
+                ntf->caller_var_buf = var_buf; ntf->caller_arg_buf = arg_buf;
+                ntf->caller_this = this_obj; ntf->caller_new_target = new_target;
+                ntf->caller_var_refs = var_refs;
+                ntf->caller_argc = argc; ntf->caller_argv = argv;
+                ntf->caller_arg_allocated_size = arg_allocated_size;
+                ntf->caller_sp = sp;
+                ntf->call_first = -2; ntf->call_argc = call_argc; ntf->is_tail = tramp_is_tail;
+                ntf->b = nb; ntf->ctx = nb->realm; ntf->local_buf = nlb;
+                nsf = &ntf->sf;
+                nsf->is_strict_mode = nb->is_strict_mode;
+                nsf->cur_func = unsafe_unconst(nfunc);
+                narg_buf = nlb;
+                for (k = 0; k < eff_argc; k++) narg_buf[k] = js_dup(atab[k]);
+                for (; k < narg_alloc; k++) narg_buf[k] = JS_UNDEFINED;
+                nsf->arg_count = narg_alloc;
+                if (atab) free_arg_list(ctx, atab, alen);   /* dup'd into the frame; drop the temp list */
+                nvar_buf = nlb + narg_alloc;
+                for (k = 0; k < nb->var_count; k++) nvar_buf[k] = JS_UNDEFINED;
+                nstack_buf = nvar_buf + nb->var_count;
+                nsf->arg_buf = narg_buf; nsf->var_buf = nvar_buf;
+                nsf->var_refs = (JSVarRef **)(nstack_buf + nb->stack_size);
+                nsf->var_ref_count = nb->var_ref_count;
+                for (k = 0; k < nb->var_ref_count; k++) nsf->var_refs[k] = NULL;
+                nsf->cur_pc = NULL; nsf->cur_sp = NULL;
+                nsf->prev_frame = rt->current_stack_frame;
+                rt->current_stack_frame = nsf;
+                tf_top = ntf;
+                this_obj = thisArg;   /* borrowed from the caller stack; freed by do_return's operand cleanup */
+                new_target = JS_UNDEFINED;
+                ntf->this_val = this_obj; ntf->new_target = new_target;
+                ntf->arg_allocated = narg_alloc; ntf->callee_argc = eff_argc;
+                ntf->async_data = NULL; ntf->async_promise = JS_UNDEFINED; ntf->gen_data = NULL;
+                ntf->cont_state = NULL; ntf->cont_kind = CONT_NONE;
+                sf = nsf; b = nb; ctx = nb->realm;
+                arg_buf = narg_buf; var_buf = nvar_buf; stack_buf = nstack_buf;
+                var_refs = np->u.func.var_refs;
+                argc = eff_argc; argv = (JSValueConst *)narg_buf;
+                arg_allocated_size = narg_alloc;
+                local_buf = nlb; sp = nstack_buf; pc = nb->byte_code_buf;
+                goto restart;
             }
 
         do_array_reduce_tramp:
