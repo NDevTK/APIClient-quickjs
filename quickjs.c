@@ -22880,6 +22880,45 @@ static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
     return js_async_function_post(ctx, s, async_func_resume(ctx, &s->func_state));
 }
 
+static JSValue js_async_resume_job(JSContext *ctx, int argc, JSValueConst *argv);
+
+/* Resume a SUSPENDED async continuation AS A FLOW (the post-await body). Such a continuation is not a nested
+   activation of anything — it IS the running flow — so it becomes its own base while it runs; its loops then
+   PARK at a back-edge (do_preempt) instead of being an unroutable nested activation. A park RE-ENTERS THE JOB
+   PUMP via a resume job, so the flow is suspended and resumed BY THE SCHEDULER — never self-resumed to
+   completion (that would be the forbidden drive-to-completion). This is the first step of "every runtime job is
+   a scheduler flow": the job queue drives the continuation, parking between slices. */
+static bool js_async_function_resume_as_flow(JSContext *ctx, JSAsyncFunctionData *s)
+{
+    JSAsyncFunctionState *prev_base = g_flow_base_gen;
+    JSValue func_ret, jv;
+
+    g_flow_base_gen = &s->func_state;
+    func_ret = async_func_resume(ctx, &s->func_state);
+    g_flow_base_gen = prev_base;
+    if (JS_VALUE_GET_TAG(func_ret) == JS_TAG_INT && JS_VALUE_GET_INT(func_ret) == FUNC_RET_PREEMPT) {
+        jv = JS_MKPTR(JS_TAG_INT, s);   /* not refcounted by the queue: we take an explicit ref below */
+        JS_REF_COUNT(s)++;
+        if (JS_EnqueueJob(ctx, js_async_resume_job, 1, (JSValueConst *)&jv) < 0) {
+            js_async_function_free(ctx->rt, s);
+            return false;
+        }
+        return true;   /* PARKED: the pump resumes it */
+    }
+    return js_async_function_post(ctx, s, func_ret);
+}
+
+static JSValue js_async_resume_job(JSContext *ctx, int argc, JSValueConst *argv)
+{
+    JSAsyncFunctionData *s = JS_VALUE_GET_PTR(argv[0]);
+    bool ok;
+    /* a preempt-resume is a CONTINUATION, never a re-throw: the throw (if any) was consumed on the first resume */
+    s->func_state.throw_flag = false;
+    ok = js_async_function_resume_as_flow(ctx, s);
+    js_async_function_free(ctx->rt, s);   /* release the ref taken at enqueue */
+    return ok ? JS_UNDEFINED : JS_EXCEPTION;
+}
+
 static JSValue js_async_function_resolve_call(JSContext *ctx,
                                               JSValueConst func_obj,
                                               JSValueConst this_obj,
@@ -22902,7 +22941,8 @@ static JSValue js_async_function_resolve_call(JSContext *ctx,
         /* return value of await */
         s->func_state.frame.cur_sp[-1] = js_dup(arg);
     }
-    if (!js_async_function_resume(ctx, s))
+    /* the post-await body is a FLOW the scheduler drives, not a C job run to completion */
+    if (!js_async_function_resume_as_flow(ctx, s))
         return JS_EXCEPTION;
     return JS_UNDEFINED;
 }
