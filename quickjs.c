@@ -21315,7 +21315,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                 }
                 sf->cur_pc = pc;
-                if (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT) {
+                /* non-object key only: ToPropertyKey on an object runs user toPrimitive, and the fallback
+                   JS_GetPropertyValue converts again — probing here would double the side effect. */
+                if (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT && JS_VALUE_GET_TAG(sp[-1]) != JS_TAG_OBJECT) {
                     JSAtom katom = JS_ValueToAtom(ctx, sp[-1]);   /* ToPropertyKey (may throw) */
                     if (unlikely(katom == JS_ATOM_NULL))
                         goto exception;
@@ -21450,6 +21452,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                 }
                 sf->cur_pc = pc;
+                /* A non-object computed key that resolves to a bytecode setter -> route as a 1-arg method call so
+                   the setter body preempts. Guard on a non-object key: ToPropertyKey on an object runs user
+                   toPrimitive, and the fallback path converts again — only a primitive key is safe to probe here
+                   without a double side effect. */
+                if (JS_VALUE_GET_TAG(sp[-3]) == JS_TAG_OBJECT && JS_VALUE_GET_TAG(sp[-2]) != JS_TAG_OBJECT) {
+                    JSAtom katom = JS_ValueToAtom(ctx, sp[-2]);
+                    if (unlikely(katom == JS_ATOM_NULL))
+                        goto exception;
+                    JSObject *st = tramp_bytecode_setter(JS_VALUE_GET_OBJ(sp[-3]), katom);
+                    JS_FreeAtom(ctx, katom);
+                    if (st) {
+                        JS_FreeValue(ctx, sp[-2]);                       /* the key is consumed */
+                        sp[-2] = js_dup(JS_MKPTR(JS_TAG_OBJECT, st));    /* stack: [receiver][setter][value] */
+                        call_argc = 1; call_argv = sp - call_argc;
+                        tramp_first = -2; tramp_is_tail = 0;
+                        tramp_cont_state = NULL; tramp_cont_kind = CONT_SETTER;
+                        goto do_tramp_call;
+                    }
+                }
                 ret = JS_SetPropertyValue(ctx, sp[-3], sp[-2], sp[-1], JS_PROP_THROW_STRICT);
                 JS_FreeValue(ctx, sp[-3]);
                 sp -= 3;
