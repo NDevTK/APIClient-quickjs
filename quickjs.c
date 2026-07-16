@@ -18130,11 +18130,15 @@ static JSAsyncFunctionState *g_flow_base_gen = NULL;
    these (JS_FlowPreemptStats) and FAILS a run whose tests pass but whose engagement < 100% — so a category the
    feature silently skips can never masquerade as green, REGARDLESS of codebase state. This makes the gate a
    MEASURED gap, not a hidden one. */
+/* ATOMIC: run-test262 increments these from many worker threads; a non-atomic ++ races so fired can overtake
+   requested (a bogus >100% + underflowed gap) or undercount (a false gap on a true-100% category). Relaxed
+   ordering is enough — they are pure counters, never a synchronization point. Portable to gcc + emcc. */
 static uint64_t g_flow_preempt_requested = 0;
 static uint64_t g_flow_preempt_fired = 0;
+#define FLOW_PREEMPT_COUNT(c) __atomic_fetch_add(&(c), 1, __ATOMIC_RELAXED)
 void JS_FlowPreemptStats(uint64_t *requested, uint64_t *fired) {
-    if (requested) *requested = g_flow_preempt_requested;
-    if (fired)     *fired     = g_flow_preempt_fired;
+    if (requested) *requested = __atomic_load_n(&g_flow_preempt_requested, __ATOMIC_RELAXED);
+    if (fired)     *fired     = __atomic_load_n(&g_flow_preempt_fired, __ATOMIC_RELAXED);
 }
 
 /* Can this activation ROUTE a FUNC_RET_PREEMPT back to a driver that re-resumes it? An activation is
@@ -19520,8 +19524,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                gap the harness reads (JS_FlowPreemptStats) to fail any fake-green. The root fix stays "route the
                nested FUNC_RET_PREEMPT onto the caller's tramp chain", now with a metric proving when it lands. */
             if (unlikely(g_flow_control.preempt != NULL) && g_flow_control.preempt()) {
-                g_flow_preempt_requested++;
-                if (flow_preempt_routable(gen_state)) { g_flow_preempt_fired++; goto do_preempt; }
+                FLOW_PREEMPT_COUNT(g_flow_preempt_requested);
+                if (flow_preempt_routable(gen_state)) { FLOW_PREEMPT_COUNT(g_flow_preempt_fired); goto do_preempt; }
             }
             BREAK;
         CASE(OP_goto16):
@@ -19529,8 +19533,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             if (unlikely(js_poll_interrupts(ctx)))
                 goto exception;
             if (unlikely(g_flow_control.preempt != NULL) && g_flow_control.preempt()) {   /* measured back-edge preempt; nested-activation gap is counted, see OP_goto */
-                g_flow_preempt_requested++;
-                if (flow_preempt_routable(gen_state)) { g_flow_preempt_fired++; goto do_preempt; }
+                FLOW_PREEMPT_COUNT(g_flow_preempt_requested);
+                if (flow_preempt_routable(gen_state)) { FLOW_PREEMPT_COUNT(g_flow_preempt_fired); goto do_preempt; }
             }
             BREAK;
         CASE(OP_goto8):
@@ -19538,8 +19542,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             if (unlikely(js_poll_interrupts(ctx)))
                 goto exception;
             if (unlikely(g_flow_control.preempt != NULL) && g_flow_control.preempt()) {   /* measured back-edge preempt; nested-activation gap is counted, see OP_goto */
-                g_flow_preempt_requested++;
-                if (flow_preempt_routable(gen_state)) { g_flow_preempt_fired++; goto do_preempt; }
+                FLOW_PREEMPT_COUNT(g_flow_preempt_requested);
+                if (flow_preempt_routable(gen_state)) { FLOW_PREEMPT_COUNT(g_flow_preempt_fired); goto do_preempt; }
             }
             BREAK;
         CASE(OP_if_true):
@@ -45143,7 +45147,7 @@ static int js_array_cmp_generic(const void *a, const void *b, void *opaque) {
             goto cmp_same;
         argv[0] = ap->val;
         argv[1] = bp->val;
-        res = JS_Call(ctx, psc->method, JS_UNDEFINED, 2, argv);
+        res = js_call_as_flow(ctx, psc->method, JS_UNDEFINED, 2, argv);   /* hook: comparator body is preemptible */
         if (JS_IsException(res))
             goto exception;
         if (JS_VALUE_GET_TAG(res) == JS_TAG_INT) {
@@ -61332,7 +61336,7 @@ static int js_TA_cmp_generic(const void *a, const void *b, void *opaque) {
                               a_idx * (size_t)psc->elt_size);
         argv[1] = psc->getfun(ctx, (char *)p->u.array.u.ptr +
                               b_idx * (size_t)(psc->elt_size));
-        res = JS_Call(ctx, psc->cmp, JS_UNDEFINED, 2, vc(argv));
+        res = js_call_as_flow(ctx, psc->cmp, JS_UNDEFINED, 2, vc(argv));   /* hook: comparator body is preemptible */
         if (JS_IsException(res)) {
             psc->exception = 1;
             goto done;
