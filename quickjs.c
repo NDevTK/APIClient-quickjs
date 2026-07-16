@@ -21682,7 +21682,11 @@ static JSValue js_call_as_flow(JSContext *ctx, JSValueConst func_obj, JSValueCon
 {
     JSAsyncFunctionState fs;
     JSValue r;
-    if (!tramp_can_call(func_obj))
+    /* Fast path (perf): with NO preempt hook installed (production, or any non-forced eval) no back-edge can ever
+       preempt, so running the callback as a flow is pure overhead — a direct call is byte-identical behavior. The
+       flow machinery (a heap func_state per call) is ONLY needed under forced execution. A non-NORMAL callback
+       (async/generator routes via its class call; C/bound/proxy has no preemptible body) also takes JS_Call. */
+    if (g_flow_control.preempt == NULL || !tramp_can_call(func_obj))
         return JS_Call(ctx, func_obj, this_obj, argc, argv);
     /* zero FIRST: async_func_init does not set tramp_top/throw_flag (JS_FlowNew relies on js_mallocz); an
        uninitialized stack fs would make the first resume see a garbage tramp_top and take the deep-resume path. */
