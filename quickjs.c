@@ -19290,9 +19290,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 atf->caller_argc = argc; atf->caller_argv = argv;
                 atf->caller_arg_allocated_size = arg_allocated_size;
                 /* async_func_init dup'd func + args into as->func_state; free the caller-stack copies + callee ref,
-                   then the caller resumes with the PROMISE where the callee + args were. */
-                for (i = -1; i < call_argc; i++) JS_FreeValue(ctx, call_argv[i]);
-                atf->caller_sp = call_argv - 1;
+                   then the caller resumes with the PROMISE where the callee + args were. Use tramp_first, NOT a
+                   hardcoded -1: a METHOD call (obj.asyncM(), tramp_first == -2) also has `this` at call_argv[-2],
+                   so hardcoding leaked it AND left sp one slot high — corrupting the caller's stack. */
+                for (i = tramp_first; i < call_argc; i++) JS_FreeValue(ctx, call_argv[i]);
+                atf->caller_sp = call_argv + tramp_first;
                 atf->call_first = -1; atf->call_argc = 0; atf->is_tail = tramp_is_tail;
                 atf->async_data = as; atf->async_promise = aprom; atf->gen_data = NULL; atf->cont_state = NULL; atf->cont_kind = CONT_NONE;
                 atf->b = NULL; atf->local_buf = NULL;   /* async frame owns its buffers via as->func_state */
