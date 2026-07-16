@@ -18160,6 +18160,9 @@ typedef struct TrampFrame {
 #define CONT_SETTER        5   /* cont_state = NULL: a `set x(v){…}` bytecode-setter body runs on this chain as a
                                   1-arg method call; do_return frees the operands like a normal method call but
                                   DISCARDS the setter's return value (a property write yields nothing). */
+#define CONT_SORT          6   /* cont_state = JSArraySort: arr.sort(cmp) drives a SUSPENDABLE bottom-up merge
+                                  sort whose comparator runs on this chain, so a comparator body loop preempts the
+                                  base flow. do_return re-enters js_array_sort_step with the comparison result. */
 
 /* A bytecode constructor's body run on the trampoline chain; holds the created `this` across the body so
    do_return can apply the constructor return-value rule (use `this` when the body returns a non-object).
@@ -18299,6 +18302,27 @@ static int js_array_reduce_step(JSContext *ctx, struct JSArrayReduce *s, JSValue
 static void js_array_reduce_end(JSContext *ctx, struct JSArrayReduce *s, bool take_acc);
 static JSValue js_array_reduce(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int special);
 static bool tramp_can_call_array_reduce(JSValueConst func, int *out_special);
+/* arr.sort(cmpFn) with a NORMAL bytecode comparator: a SUSPENDABLE bottom-up (iterative) stable merge sort whose
+   ONLY suspension point is cmp(array[l], array[r]) inside the inner merge. All algorithm state (width, block
+   index, merge cursors) lives in the heap struct, so no C-stack recursion — a comparator body loop preempts and
+   the sort resumes byte-identically. O(n log n), stable. Default/native-comparator sorts stay on rqsort. */
+struct ValueSlot;
+typedef struct JSArraySort {
+    JSValue obj;                    /* the array object (owned) */
+    JSValueConst method;            /* the comparator (borrowed from the caller's live stack) */
+    struct ValueSlot *array, *tmp;  /* present-non-undefined elements + merge scratch */
+    int64_t n;                      /* count in array[] */
+    int64_t len, undefined_count;
+    int64_t width, i, lo, mid, hi, l, r, k;   /* bottom-up merge-sort cursors */
+    uint8_t pending;                /* a cmp(array[l],array[r]) result is awaited */
+    JSValue cb_args[4];             /* [this=undefined, method, array[l].val, array[r].val]; call_argv=&cb_args[2], argc=2 */
+    int orig_cfirst, orig_cargc; uint8_t orig_is_tail;
+} JSArraySort;
+static JSValue js_array_sort(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static int js_array_sort_init(JSContext *ctx, struct JSArraySort *s, JSValueConst this_val, JSValueConst method);
+static int js_array_sort_step(JSContext *ctx, struct JSArraySort *s, JSValue res, JSValueConst out_args[2]);
+static JSValue js_array_sort_end(JSContext *ctx, struct JSArraySort *s, bool ok);
+static bool tramp_can_call_array_sort(JSValueConst func, int argc, JSValueConst *argv);
 /* Function.prototype.call is CALL-SITE-RESOLVED: it holds no continuation, so rather than C-recursing
    js_function_call (which would run the ultimate target's body off the chain, unable to preempt), the
    interpreter reslices the operands at the call site and dispatches the target directly (do_forward_call). */
@@ -19136,6 +19160,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_array_reduce(call_argv[-1], &iter_special)) {   /* arr.reduce/reduceRight -> callback drive on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_array_reduce_tramp;
                 }
+                if (tramp_can_call_array_sort(call_argv[-1], call_argc, vc(call_argv))) {   /* arr.sort(cmp) -> merge-sort drive on THIS chain */
+                    tramp_is_tail = (opcode == OP_tail_call_method); goto do_sort_tramp;
+                }
                 if (tramp_is_function_call(call_argv[-1])) {   /* f.call(thisArg,...) -> resolve + dispatch f here */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_forward_call;
                 }
@@ -19592,6 +19619,48 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     js_array_reduce_end(ctx, s, false); js_free_rt(rt, s); goto exception;
                 }
                 goto do_array_reduce_step;
+            }
+
+        do_sort_tramp:
+            /* arr.sort(cmp): drive a suspendable bottom-up merge sort whose comparator runs HERE on the chain, so
+               a comparator body loop preempts the base. Operands [arr, sortfn, cmp] (call_first=-2). */
+            {
+                JSArraySort *s = js_malloc(ctx, sizeof(*s));
+                if (unlikely(!s)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                if (js_array_sort_init(ctx, s, call_argv[-2], call_argv[0])) {
+                    js_array_sort_end(ctx, s, false); js_free_rt(rt, s); goto exception;
+                }
+                s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
+                cont_st = s; cont_kind_cur = CONT_SORT;
+                ret_val = JS_UNDEFINED;
+                goto do_sort_step;
+            }
+
+        do_sort_step:
+            {
+                JSArraySort *s = (JSArraySort *)cont_st;
+                int st = js_array_sort_step(ctx, s, ret_val, (JSValueConst *)&s->cb_args[2]);
+                if (unlikely(st < 0)) { js_array_sort_end(ctx, s, false); js_free_rt(rt, s); goto exception; }
+                if (st == 0) {   /* DONE: the sorted array object is the result */
+                    int cfirst = s->orig_cfirst, cargc = s->orig_cargc;
+                    uint8_t itail = s->orig_is_tail;
+                    JSValue r = js_array_sort_end(ctx, s, true);   /* writes back; may throw */
+                    JSValue *cargv = sp - cargc;
+                    js_free_rt(rt, s);
+                    if (unlikely(JS_IsException(r))) goto exception;
+                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
+                    sp += cfirst - cargc;
+                    if (itail) { ret_val = r; goto do_return; }
+                    *sp++ = r;
+                    BREAK;
+                }
+                /* st == 1: compare the two elements — the comparator runs on the chain (borrowed cb_args). */
+                s->cb_args[0] = JS_UNDEFINED;   /* comparator this = undefined */
+                s->cb_args[1] = s->method;
+                call_argv = (JSValueConst *)&s->cb_args[2];
+                call_argc = 2; tramp_first = -2; tramp_is_tail = 0;
+                tramp_cont_state = s; tramp_cont_kind = CONT_SORT;   /* method is a NORMAL bytecode fn (gated at admission) */
+                goto do_tramp_call;
             }
 
         do_array_iter_tramp:
@@ -20128,6 +20197,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        that builtin's STEP instead of pushing it. The step drives the next element or finishes. */
                     cont_st = rcs; cont_kind_cur = rck;
                     if (rck == CONT_ARRAY_REDUCE) goto do_array_reduce_step;
+                    if (rck == CONT_SORT) goto do_sort_step;
                     goto do_array_iter_step;
                 }
                 if (itail) goto do_return;   /* caller was a tail-caller: propagate */
@@ -22720,6 +22790,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                the OP_call operands for its own catch-search to free. */
             if (xck == CONT_ARRAY_ITER)
                 js_array_every_end(ctx, (struct JSArrayEvery *)xcs, false);
+            else if (xck == CONT_SORT)
+                js_array_sort_end(ctx, (struct JSArraySort *)xcs, false);
             else
                 js_array_reduce_end(ctx, (struct JSArrayReduce *)xcs, false);
             js_free_rt(rt, xcs);
@@ -46625,6 +46697,123 @@ cmp_same:
 exception:
     psc->exception = 1;
     return 0;
+}
+
+/* read the present, non-undefined elements into s->array (undefined -> the end, holes -> after that), alloc tmp,
+   set up the first merge block. Returns 0 ok / -1 exception (safe to js_array_sort_end). */
+static int js_array_sort_init(JSContext *ctx, JSArraySort *s, JSValueConst this_val, JSValueConst method)
+{
+    int64_t i, pos = 0; int present;
+    s->obj = JS_UNDEFINED; s->method = method; s->array = NULL; s->tmp = NULL;
+    s->n = 0; s->len = 0; s->undefined_count = 0; s->pending = 0;
+    s->width = 1; s->i = 0; s->lo = s->mid = s->hi = s->l = s->r = s->k = 0;
+    for (i = 0; i < 4; i++) s->cb_args[i] = JS_UNDEFINED;
+    s->obj = JS_ToObject(ctx, this_val);
+    if (js_get_length64(ctx, &s->len, s->obj)) return -1;
+    if (s->len > 0) {
+        s->array = js_malloc(ctx, (size_t)s->len * sizeof(ValueSlot));
+        if (!s->array) return -1;
+    }
+    for (i = 0; i < s->len; i++) {
+        JSValue v;
+        present = JS_TryGetPropertyInt64(ctx, s->obj, i, &v);
+        if (present < 0) { s->n = pos; return -1; }
+        if (present == 0) continue;
+        if (JS_IsUndefined(v)) { s->undefined_count++; continue; }
+        s->array[pos].val = v; s->array[pos].str = NULL; s->array[pos].pos = i; pos++;
+    }
+    s->n = pos;
+    if (s->n > 1) {
+        s->tmp = js_malloc(ctx, (size_t)s->n * sizeof(ValueSlot));
+        if (!s->tmp) return -1;
+        s->lo = 0; s->mid = 1 < s->n ? 1 : s->n; s->hi = 2 < s->n ? 2 : s->n;   /* first block, width=1 */
+        s->l = 0; s->r = s->mid; s->k = 0;
+    }
+    return 0;
+}
+
+/* Drive the merge until the next comparison is needed (return 1, out_args = the two element values) or the sort
+   is complete (return 0). `res` (owned) is the comparator's return value for the pending comparison, or JS_UNDEFINED
+   on the first call. Returns -1 on exception. */
+static int js_array_sort_step(JSContext *ctx, JSArraySort *s, JSValue res, JSValueConst out_args[2])
+{
+    if (s->pending) {
+        double v;
+        if (JS_ToFloat64Free(ctx, &v, res) < 0) return -1;   /* consumes res */
+        s->pending = 0;
+        if (v <= 0) s->tmp[s->k++] = s->array[s->l++];   /* stable: <= keeps the left (earlier) element first */
+        else        s->tmp[s->k++] = s->array[s->r++];
+    } else {
+        JS_FreeValue(ctx, res);   /* JS_UNDEFINED on the first call, or a stray value */
+    }
+    for (;;) {
+        if (s->width >= s->n) break;                 /* fully sorted (n<=1 lands here immediately) */
+        if (s->i >= s->n) {                          /* this width pass done -> next width */
+            s->width *= 2; s->i = 0;
+            if (s->width >= s->n) break;
+            s->lo = 0; s->mid = s->width < s->n ? s->width : s->n;
+            s->hi = 2 * s->width < s->n ? 2 * s->width : s->n;
+            s->l = 0; s->r = s->mid; s->k = 0;
+            continue;
+        }
+        if (s->l < s->mid && s->r < s->hi) {         /* the ONE suspension point */
+            out_args[0] = s->array[s->l].val;
+            out_args[1] = s->array[s->r].val;
+            s->pending = 1;
+            return 1;
+        }
+        while (s->l < s->mid) s->tmp[s->k++] = s->array[s->l++];   /* drain remainders */
+        while (s->r < s->hi)  s->tmp[s->k++] = s->array[s->r++];
+        { int64_t t; for (t = s->lo; t < s->hi; t++) s->array[t] = s->tmp[t]; }   /* copy block back */
+        s->i += 2 * s->width;                        /* next block at this width */
+        if (s->i < s->n) {
+            s->lo = s->i; s->mid = s->i + s->width < s->n ? s->i + s->width : s->n;
+            s->hi = s->i + 2 * s->width < s->n ? s->i + 2 * s->width : s->n;
+            s->l = s->lo; s->r = s->mid; s->k = s->lo;
+        }
+    }
+    return 0;   /* caller writes the sorted array back in js_array_sort_end */
+}
+
+/* On ok: write the sorted elements back to obj, then the undefineds, then delete the holes; return obj (owned,
+   transferred to caller). On failure: free everything, return JS_EXCEPTION. Either way the state is released. */
+static JSValue js_array_sort_end(JSContext *ctx, JSArraySort *s, bool ok)
+{
+    int64_t i, w = 0;
+    if (!ok) goto fail;
+    while (w < s->n) {                               /* sorted present elements back in place */
+        if (s->array[w].pos == w) { JS_FreeValue(ctx, s->array[w].val); }
+        else if (JS_SetPropertyInt64(ctx, s->obj, w, s->array[w].val) < 0) { w++; goto fail; }
+        w++;
+    }
+    js_free(ctx, s->array); s->array = NULL;
+    js_free(ctx, s->tmp); s->tmp = NULL;
+    for (i = w; s->undefined_count-- > 0; i++)
+        if (JS_SetPropertyInt64(ctx, s->obj, i, JS_UNDEFINED) < 0) goto fail2;
+    for (; i < s->len; i++)
+        if (JS_DeletePropertyInt64(ctx, s->obj, i, JS_PROP_THROW) < 0) goto fail2;
+    return s->obj;
+fail:
+    for (; w < s->n; w++) JS_FreeValue(ctx, s->array[w].val);
+    js_free(ctx, s->array); s->array = NULL;
+    js_free(ctx, s->tmp); s->tmp = NULL;
+fail2:
+    JS_FreeValue(ctx, s->obj); s->obj = JS_UNDEFINED;
+    return JS_EXCEPTION;
+}
+
+/* arr.sort(cmp) where cmp (argv[0]) is a NORMAL bytecode function -> route to the suspendable coroutine. A
+   default sort (no cmp) or a native/bound comparator has no preemptible JS body and stays on rqsort. */
+static bool tramp_can_call_array_sort(JSValueConst func, int argc, JSValueConst *argv)
+{
+    JSObject *mp, *cp;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
+    mp = JS_VALUE_GET_OBJ(func);
+    if (!(mp->class_id == JS_CLASS_C_FUNCTION && mp->u.cfunc.c_function.generic == js_array_sort)) return false;
+    if (argc < 1 || JS_VALUE_GET_TAG(argv[0]) != JS_TAG_OBJECT) return false;
+    cp = JS_VALUE_GET_OBJ(argv[0]);
+    return cp->class_id == JS_CLASS_BYTECODE_FUNCTION
+        && cp->u.func.function_bytecode->func_kind == JS_FUNC_NORMAL;
 }
 
 static JSValue js_array_sort(JSContext *ctx, JSValueConst this_val,
