@@ -18181,6 +18181,17 @@ static int js_array_every_step(JSContext *ctx, struct JSArrayEvery *s, JSValue r
 static void js_array_every_end(JSContext *ctx, struct JSArrayEvery *s, bool take_ret);
 static JSValue js_array_every(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int special);
 static bool tramp_can_call_array_iter(JSValueConst func, int *out_special);
+/* Function.prototype.call is CALL-SITE-RESOLVED: it holds no continuation, so rather than C-recursing
+   js_function_call (which would run the ultimate target's body off the chain, unable to preempt), the
+   interpreter reslices the operands at the call site and dispatches the target directly (do_forward_call). */
+static JSValue js_function_call(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static inline bool tramp_is_function_call(JSValueConst method) {
+    JSObject *mp;
+    if (JS_VALUE_GET_TAG(method) != JS_TAG_OBJECT) return false;
+    mp = JS_VALUE_GET_OBJ(method);
+    return mp->class_id == JS_CLASS_C_FUNCTION && mp->u.cfunc.cproto == JS_CFUNC_generic
+        && mp->u.cfunc.c_function.generic == js_function_call;
+}
 
 /* Helpers defined later — needed by the heap-resident async call path inside JS_CallInternal. */
 static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s, JSValueConst func_obj,
@@ -18887,6 +18898,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_array_iter(call_argv[-1], &iter_special)) {   /* arr.forEach/map/... -> callback drive on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_array_iter_tramp;
                 }
+                if (tramp_is_function_call(call_argv[-1])) {   /* f.call(thisArg,...) -> resolve + dispatch f here */
+                    tramp_is_tail = (opcode == OP_tail_call_method); goto do_forward_call;
+                }
                 {   /* generator .next()/.throw()/.return() -> body runs on THIS chain (loop preempts the base) */
                     int gmag = tramp_gen_method_magic(call_argv[-1], call_argv[-2]);
                     if (gmag >= 0) { tramp_gen_magic = gmag; goto do_generator_tramp; }
@@ -19004,6 +19018,42 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 arg_allocated_size = narg_alloc;
                 local_buf = nlb; sp = nstack_buf; pc = nb->byte_code_buf;
                 goto restart;
+            }
+
+        do_forward_call:
+            /* f.call(thisArg, ...args): Function.prototype.call holds NO continuation, so RESOLVE it at the
+               operator site and dispatch the ultimate target f on THIS chain (its body — normal / async /
+               generator / array-iteration — then preempts the base like any other). Reslice the operands from
+               the .call shape [f, call, thisArg, a0..aN-1] to the method-call shape [thisArg, f, a0..aN-1]:
+               one slot narrower, so the target's do_return pops exactly where `f` sat and pushes the result. */
+            {
+                JSValue fv = (JSValue)call_argv[-2];                               /* the target f */
+                JSValue tv = (call_argc >= 1) ? (JSValue)call_argv[0] : JS_UNDEFINED;  /* the new this */
+                int n = (call_argc >= 1) ? call_argc - 1 : 0;
+                JS_FreeValue(ctx, (JSValue)call_argv[-1]);   /* Function.prototype.call itself: done with it */
+                if (call_argc >= 1) {
+                    memmove((JSValue *)&call_argv[0], (JSValue *)&call_argv[1], n * sizeof(JSValue));
+                    sp--;                                     /* the thisArg slot is consumed by the reshape */
+                }
+                ((JSValue *)call_argv)[-2] = tv;
+                ((JSValue *)call_argv)[-1] = fv;
+                call_argc = n;
+                tramp_first = -2;
+                if (tramp_can_call(call_argv[-1])) goto do_tramp_call;
+                if (tramp_can_call_async(call_argv[-1])) goto do_async_tramp_call;
+                if (tramp_can_call_gen_create(call_argv[-1])) goto do_generator_create_tramp;
+                if (tramp_can_call_array_iter(call_argv[-1], &iter_special)) goto do_array_iter_tramp;
+                /* a C-function / bound / proxy target has no preemptible body — plain call, nothing to park */
+                ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2], JS_UNDEFINED,
+                                          call_argc, vc(call_argv), 0);
+                if (unlikely(JS_IsException(ret_val)))
+                    goto exception;
+                if (tramp_is_tail)
+                    goto do_return;
+                for (i = -2; i < call_argc; i++) JS_FreeValue(ctx, (JSValue)call_argv[i]);
+                sp -= call_argc + 2;
+                *sp++ = ret_val;
+                BREAK;
             }
 
         do_array_iter_tramp:
