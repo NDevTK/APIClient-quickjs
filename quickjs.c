@@ -18095,6 +18095,13 @@ typedef struct TrampFrame {
     /* the CALLEE's own interpreter locals (for deep-preempt resume — the caller's are above). */
     JSValueConst this_val, new_target;
     int arg_allocated, callee_argc;
+    /* ASYNC frame on the tramp chain: an async function body runs HERE (gen_state stays the caller's base) so its
+       sync-prefix loop preempts the BASE flow like any tramp-depth loop — never drive-to-completion. When
+       async_data != NULL this frame's sf IS async_data->func_state.frame (not the embedded ntf->sf); at OP_await /
+       completion / exception the body settles async_promise via js_async_function_post, this frame pops, and the
+       PROMISE is placed on the caller's stack (the async call's synchronous result). */
+    struct JSAsyncFunctionData *async_data;
+    JSValue async_promise;
 } TrampFrame;
 
 /* Only a NORMAL bytecode function trampolines (the common deep-recursion case). */
@@ -18105,11 +18112,20 @@ static inline bool tramp_can_call(JSValueConst func) {
     if (fp->class_id != JS_CLASS_BYTECODE_FUNCTION) return false;
     return fp->u.func.function_bytecode->func_kind == JS_FUNC_NORMAL;
 }
+/* An ASYNC function runs its body on the CALLER's tramp chain (do_async_tramp_call) so its sync-prefix loop
+   preempts the base flow at any depth — never a nested C-recursion that would drive to completion. */
+static inline bool tramp_can_call_async(JSValueConst func) {
+    JSObject *fp;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
+    fp = JS_VALUE_GET_OBJ(func);
+    return fp->class_id == JS_CLASS_ASYNC_FUNCTION;
+}
 /* Helpers defined later — needed by the heap-resident async call path inside JS_CallInternal. */
 static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s, JSValueConst func_obj,
                                        JSValueConst this_obj, int argc, JSValueConst *argv);
 static void js_async_function_free(JSRuntime *rt, JSAsyncFunctionData *s);
 static bool js_async_function_post(JSContext *ctx, JSAsyncFunctionData *s, JSValue func_ret);
+JSValue JS_NewPromiseCapability(JSContext *ctx, JSValue *resolving_funcs);
 
 /* forced-exec FLOW-CONTROL hooks (see JSFlowControlHooks in quickjs.h) — the scheduler's control over
    interpreter execution: .branch (which arm to take when branching on a CONCOLIC value; the hook FORKS the
@@ -18139,23 +18155,6 @@ static uint64_t g_flow_preempt_fired = 0;
 void JS_FlowPreemptStats(uint64_t *requested, uint64_t *fired) {
     if (requested) *requested = __atomic_load_n(&g_flow_preempt_requested, __ATOMIC_RELAXED);
     if (fired)     *fired     = __atomic_load_n(&g_flow_preempt_fired, __ATOMIC_RELAXED);
-}
-
-/* Can this activation ROUTE a FUNC_RET_PREEMPT back to a driver that re-resumes it? An activation is
-   preemptible iff whoever called async_func_resume on it loops on FUNC_RET_PREEMPT:
-     - the flow BASE (JS_FlowResume)                 -> yes
-     - a synchronous generator body (js_generator_next) -> yes
-     - async / async-generator bodies                -> NOT YET (their drivers do not loop yet; the metric
-       counts the gap). A C-reentry callback frame (gs==NULL: sort/forEach comparator) has no flow driver.
-   The gate fires the preempt only where it is routable, so an unroutable FUNC_RET_PREEMPT is never emitted. */
-static bool flow_preempt_routable(JSAsyncFunctionState *gs) {
-    /* gs != NULL IFF this activation was entered via async_func_resume (JS_CALL_FLAG_GENERATOR sets gen_state),
-       and EVERY async_func_resume caller is a driver that handles FUNC_RET_PREEMPT (JS_FlowResume, the generator/
-       async drivers, and js_call_as_flow — all via async_func_resume_run). So any flow-driven activation is
-       routable, of ANY func_kind: a sync generator, an async body, or a plain callback HOOKED as a flow by
-       js_call_as_flow. A C-reentry frame NOT run as a flow (gs==NULL: a raw JS_Call from a C builtin) has no
-       driver and stays non-routable — hooking that call into js_call_as_flow is what makes it routable. */
-    return gs != NULL;
 }
 
 /* Concolic branch arm + snapshot fork. The branch hook returns the arm (0/1), ORed with 0x100 when it forked
@@ -18271,19 +18270,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    bottom prev_frame still points at &s->frame, so the whole chain deepest->...->base is intact.
                    Re-enter the DEEPEST frame at its saved pc/sp. */
                 TrampFrame *dtf = s->tramp_top;
-                JSStackFrame *dsf = &dtf->sf;
+                /* An ASYNC frame's sf IS its async_data->func_state.frame (not the embedded dtf->sf); re-enter it
+                   there so a preempted async sync-prefix loop resumes correctly. */
+                JSStackFrame *dsf = dtf->async_data ? &dtf->async_data->func_state.frame : &dtf->sf;
                 JSObject *dp = JS_VALUE_GET_OBJ(dsf->cur_func);
                 s->tramp_top = NULL;
                 tf_top = dtf;
                 rt->current_stack_frame = dsf;
-                b = dtf->b; ctx = dtf->ctx;
-                local_buf = dtf->local_buf;
+                b = dp->u.func.function_bytecode; ctx = b->realm;
+                local_buf = dtf->async_data ? dsf->arg_buf : dtf->local_buf;
                 arg_buf = dsf->arg_buf; var_buf = dsf->var_buf;
                 stack_buf = dsf->var_buf + b->var_count;
                 var_refs = dp->u.func.var_refs;
-                this_obj = dtf->this_val; new_target = dtf->new_target;
-                arg_allocated_size = dtf->arg_allocated;
-                argc = dtf->callee_argc; argv = (JSValueConst *)dsf->arg_buf;
+                this_obj = dtf->async_data ? dtf->async_data->func_state.this_val : dtf->this_val;
+                new_target = dtf->new_target;
+                arg_allocated_size = dtf->async_data ? dsf->arg_count : dtf->arg_allocated;
+                argc = dtf->async_data ? dtf->async_data->func_state.argc : dtf->callee_argc;
+                argv = (JSValueConst *)dsf->arg_buf;
                 sf = dsf; pc = dsf->cur_pc; sp = dsf->cur_sp;
                 dsf->cur_sp = NULL;   /* running */
                 goto restart;
@@ -18729,6 +18732,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     tramp_first = -1; tramp_is_tail = (opcode == OP_tail_call);
                     goto do_tramp_call;
                 }
+                if (tramp_can_call_async(call_argv[-1])) {   /* ASYNC fn -> body runs on THIS chain (base gen_state) */
+                    tramp_first = -1; tramp_is_tail = (opcode == OP_tail_call); goto do_async_tramp_call;
+                }
                 ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
                                           JS_UNDEFINED, call_argc,
                                           vc(call_argv), 0);
@@ -18772,6 +18778,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call(call_argv[-1])) {   /* NORMAL bytecode method -> heap frame (this = call_argv[-2]) */
                     tramp_first = -2; tramp_is_tail = (opcode == OP_tail_call_method);
                     goto do_tramp_call;
+                }
+                if (tramp_can_call_async(call_argv[-1])) {   /* ASYNC method -> body runs on THIS chain (this=call_argv[-2]) */
+                    tramp_first = -2; tramp_is_tail = (opcode == OP_tail_call_method); goto do_async_tramp_call;
                 }
                 ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
                                           JS_UNDEFINED, call_argc,
@@ -18877,6 +18886,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 new_target = JS_UNDEFINED;
                 ntf->this_val = this_obj; ntf->new_target = new_target;
                 ntf->arg_allocated = narg_alloc; ntf->callee_argc = eff_argc;
+                ntf->async_data = NULL; ntf->async_promise = JS_UNDEFINED;   /* NORMAL frame, not async */
                 sf = nsf; b = nb; ctx = nb->realm;
                 arg_buf = narg_buf; var_buf = nvar_buf; stack_buf = nstack_buf;
                 var_refs = np->u.func.var_refs;
@@ -18884,6 +18894,102 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 arg_allocated_size = narg_alloc;
                 local_buf = nlb; sp = nstack_buf; pc = nb->byte_code_buf;
                 goto restart;
+            }
+
+        do_async_tramp_call:
+            /* ASYNC callee: run its body HERE on the tramp chain (gen_state stays the caller's base) so a sync-
+               prefix loop preempts the base flow at any depth — never a nested C-recursion that drives to
+               completion. At OP_await / return / exception (do_async_settle) the body settles its promise, this
+               frame pops, and the promise becomes the caller's synchronous result. */
+            {
+                JSValueConst afunc = call_argv[-1];
+                JSAsyncFunctionData *as;
+                JSValue aprom;
+                TrampFrame *atf;
+                JSStackFrame *asf;
+                JSObject *ap;
+                JSFunctionBytecode *ab;
+                as = js_mallocz(ctx, sizeof(*as));
+                if (unlikely(!as)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                JS_REF_COUNT(as) = 1;
+                add_gc_object(rt, &as->header, JS_GC_OBJ_TYPE_ASYNC_FUNCTION);
+                as->is_active = false;
+                as->resolving_funcs[0] = JS_UNDEFINED;
+                as->resolving_funcs[1] = JS_UNDEFINED;
+                aprom = JS_NewPromiseCapability(ctx, as->resolving_funcs);
+                if (unlikely(JS_IsException(aprom))) { js_async_function_free(rt, as); goto exception; }
+                if (async_func_init(ctx, &as->func_state, afunc,
+                                    (tramp_first == -2) ? call_argv[-2] : JS_UNDEFINED, call_argc, vc(call_argv))) {
+                    JS_FreeValue(ctx, aprom); js_async_function_free(rt, as); goto exception;
+                }
+                as->is_active = true;
+                atf = js_malloc_rt(rt, sizeof(TrampFrame));
+                if (unlikely(!atf)) { JS_FreeValue(ctx, aprom); js_async_function_free(rt, as); JS_ThrowOutOfMemory(ctx); goto exception; }
+                atf->up = tf_top;
+                atf->caller_sf = sf; atf->caller_b = b; atf->caller_ctx = ctx;
+                atf->caller_local_buf = local_buf; atf->caller_stack_buf = stack_buf;
+                atf->caller_var_buf = var_buf; atf->caller_arg_buf = arg_buf;
+                atf->caller_this = this_obj; atf->caller_new_target = new_target;
+                atf->caller_var_refs = var_refs;
+                atf->caller_argc = argc; atf->caller_argv = argv;
+                atf->caller_arg_allocated_size = arg_allocated_size;
+                /* async_func_init dup'd func + args into as->func_state; free the caller-stack copies + callee ref,
+                   then the caller resumes with the PROMISE where the callee + args were. */
+                for (i = -1; i < call_argc; i++) JS_FreeValue(ctx, call_argv[i]);
+                atf->caller_sp = call_argv - 1;
+                atf->call_first = -1; atf->call_argc = 0; atf->is_tail = tramp_is_tail;
+                atf->async_data = as; atf->async_promise = aprom;
+                atf->b = NULL; atf->local_buf = NULL;   /* async frame owns its buffers via as->func_state */
+                /* enter the async body frame (mirror the generator-resume entry; gen_state stays the base) */
+                asf = &as->func_state.frame;
+                ap = JS_VALUE_GET_OBJ(afunc);
+                ab = ap->u.func.function_bytecode;
+                atf->ctx = ab->realm;
+                asf->prev_frame = rt->current_stack_frame;
+                rt->current_stack_frame = asf;
+                tf_top = atf;
+                sf = asf; b = ab; ctx = ab->realm;
+                var_refs = ap->u.func.var_refs;
+                local_buf = arg_buf = asf->arg_buf;
+                var_buf = asf->var_buf;
+                stack_buf = asf->var_buf + ab->var_count;
+                this_obj = as->func_state.this_val; new_target = JS_UNDEFINED;
+                argc = as->func_state.argc; argv = (JSValueConst *)asf->arg_buf;
+                arg_allocated_size = asf->arg_count;
+                sp = asf->cur_sp; pc = asf->cur_pc;
+                asf->cur_sp = NULL;   /* running */
+                goto restart;
+            }
+
+        do_async_settle:
+            /* An async body on the tramp chain reached AWAIT / return / exception (ret_val carries which:
+               js_int32(FUNC_RET_AWAIT) / JS_UNDEFINED / JS_EXCEPTION). Settle its promise (js_async_function_post),
+               pop this frame, and place the PROMISE where the caller's OP_call expects its result. */
+            {
+                TrampFrame *atf = tf_top;
+                JSAsyncFunctionData *as = atf->async_data;
+                JSValue aprom = atf->async_promise;
+                uint8_t aitail = atf->is_tail;
+                bool ok;
+                sf->cur_pc = pc; sf->cur_sp = sp;   /* the async frame state js_async_function_post reads */
+                ok = js_async_function_post(ctx, as, ret_val);
+                js_async_function_free(rt, as);     /* drop the creation ref; a suspended continuation keeps its own */
+                /* pop: the async frame's buffers belong to `as` (freed by post/terminate) — free ONLY the TrampFrame */
+                rt->current_stack_frame = sf->prev_frame;
+                tf_top = atf->up;
+                sf = atf->caller_sf; b = atf->caller_b; ctx = atf->caller_ctx;
+                local_buf = atf->caller_local_buf; stack_buf = atf->caller_stack_buf;
+                var_buf = atf->caller_var_buf; arg_buf = atf->caller_arg_buf;
+                this_obj = atf->caller_this; new_target = atf->caller_new_target;
+                var_refs = atf->caller_var_refs;
+                argc = atf->caller_argc; argv = atf->caller_argv;
+                arg_allocated_size = atf->caller_arg_allocated_size;
+                pc = sf->cur_pc; sp = atf->caller_sp;
+                js_free_rt(rt, atf);
+                if (unlikely(!ok)) { JS_FreeValue(ctx, aprom); goto exception; }   /* uncatchable error propagates */
+                if (aitail) { ret_val = aprom; goto do_return; }   /* `return asyncFn()` — the promise IS the caller's return */
+                *sp++ = aprom;
+                BREAK;
             }
         do_return:
             /* ret_val is owned. If in a trampolined callee, pop to the caller in-place; else base -> done. */
@@ -19506,44 +19612,41 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             pc += (int32_t)get_u32(pc);
             if (unlikely(js_poll_interrupts(ctx)))
                 goto exception;
-            /* forced-exec PREEMPTION at a loop back-edge: if the scheduler wants to interleave, park this flow.
-               ROUTING (the honest capability boundary — NOT a design choice): a preempt must reach the flow's
-               BASE driver (JS_FlowResume). The BASE activation (gen_state == g_flow_base_gen) is routable — a
-               base-level loop (tf_top==NULL) unwinds via done_generator; a loop inside a tramp-CALLED function
-               shares the base gen_state (tramp calls do NOT open a new func_state), so tf_top!=NULL stashes the
-               whole TrampFrame chain into the base and rebuilds on resume, preemptible at ANY tramp depth. A
-               NESTED async/generator activation is a DIFFERENT func_state (async_func_resume's own C-recursed
-               JS_CallInternal), so its FUNC_RET_PREEMPT would return into js_async_*_resume, NOT the base flow
-               loop — it is NOT YET ROUTABLE. That is a NOT-YET-BUILT capability (make the async/generator CALL
-               heap-resident on the caller's tramp chain — extend func_state onto the chain), so requesting a
-               preempt there is a should-never-happen-until-built => DFAIL loud in dev. Release strips the DFAIL
-               and runs the body to its natural yield (the feature is unsupportable outside dev anyway). The gate
-               was the SHORTCUT that faked a green by silently skipping the feature inside nested bodies. It is no
-               longer HIDDEN: g_flow_preempt_requested counts the suspend point, g_flow_preempt_fired counts the
-               actual park — their divergence (a nested activation increments requested, not fired) is the MEASURED
-               gap the harness reads (JS_FlowPreemptStats) to fail any fake-green. The root fix stays "route the
-               nested FUNC_RET_PREEMPT onto the caller's tramp chain", now with a metric proving when it lands. */
+            /* forced-exec PREEMPTION at a loop back-edge. A preempt SUSPENDS this flow and YIELDS to the ONE
+               scheduler (JS_FlowResume), which resumes it when it is top-ranked again — suspend/resume at any
+               depth, NEVER drive-to-completion. The BASE activation (gen_state == g_flow_base_gen) yields
+               correctly: a base-level loop unwinds via done_generator; a loop inside a tramp-CALLED function
+               shares the base gen_state (tramp calls open no new func_state), so the whole TrampFrame chain
+               stashes into the base and rebuilds on resume — preemptible at ANY tramp depth. A NESTED activation
+               (a generator/async body, or a C-builtin callback run as a flow) has its OWN func_state; yielding it
+               to the scheduler — extend its func_state onto the caller's tramp chain so the whole nested flow
+               suspends as ONE snapshot and resumes at the same point — is the best-advanced-design mechanism being
+               built. Until it lands, a nested loop preempt CRASHES (never self-resumes it, which is the drive-to-
+               completion this forbids; never silently skips the feature). */
             if (unlikely(g_flow_control.preempt != NULL) && g_flow_control.preempt()) {
                 FLOW_PREEMPT_COUNT(g_flow_preempt_requested);
-                if (flow_preempt_routable(gen_state)) { FLOW_PREEMPT_COUNT(g_flow_preempt_fired); goto do_preempt; }
+                if (gen_state == g_flow_base_gen) { FLOW_PREEMPT_COUNT(g_flow_preempt_fired); goto do_preempt; }
+                DFAIL("nested-flow loop preempted — yield-to-scheduler at depth (suspend the whole nested flow as one snapshot, resume it in place) NOT YET BUILT; never drive to completion");
             }
             BREAK;
         CASE(OP_goto16):
             pc += (int16_t)get_u16(pc);
             if (unlikely(js_poll_interrupts(ctx)))
                 goto exception;
-            if (unlikely(g_flow_control.preempt != NULL) && g_flow_control.preempt()) {   /* measured back-edge preempt; nested-activation gap is counted, see OP_goto */
+            if (unlikely(g_flow_control.preempt != NULL) && g_flow_control.preempt()) {
                 FLOW_PREEMPT_COUNT(g_flow_preempt_requested);
-                if (flow_preempt_routable(gen_state)) { FLOW_PREEMPT_COUNT(g_flow_preempt_fired); goto do_preempt; }
+                if (gen_state == g_flow_base_gen) { FLOW_PREEMPT_COUNT(g_flow_preempt_fired); goto do_preempt; }
+                DFAIL("nested-flow loop preempted — yield-to-scheduler at depth NOT YET BUILT; never drive to completion");
             }
             BREAK;
         CASE(OP_goto8):
             pc += (int8_t)pc[0];
             if (unlikely(js_poll_interrupts(ctx)))
                 goto exception;
-            if (unlikely(g_flow_control.preempt != NULL) && g_flow_control.preempt()) {   /* measured back-edge preempt; nested-activation gap is counted, see OP_goto */
+            if (unlikely(g_flow_control.preempt != NULL) && g_flow_control.preempt()) {
                 FLOW_PREEMPT_COUNT(g_flow_preempt_requested);
-                if (flow_preempt_routable(gen_state)) { FLOW_PREEMPT_COUNT(g_flow_preempt_fired); goto do_preempt; }
+                if (gen_state == g_flow_base_gen) { FLOW_PREEMPT_COUNT(g_flow_preempt_fired); goto do_preempt; }
+                DFAIL("nested-flow loop preempted — yield-to-scheduler at depth NOT YET BUILT; never drive to completion");
             }
             BREAK;
         CASE(OP_if_true):
@@ -21225,6 +21328,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
         CASE(OP_await):
             ret_val = js_int32(FUNC_RET_AWAIT);
+            if (tf_top && tf_top->async_data) goto do_async_settle;   /* async body on the tramp chain */
             goto done_generator;
         CASE(OP_yield):
             ret_val = js_int32(FUNC_RET_YIELD);
@@ -21234,6 +21338,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             ret_val = js_int32(FUNC_RET_YIELD_STAR);
             goto done_generator;
         CASE(OP_return_async):
+            if (tf_top && tf_top->async_data) { ret_val = JS_UNDEFINED; goto do_async_settle; }   /* async body on the tramp chain */
             ret_val = JS_UNDEFINED;
             goto done_generator;
         CASE(OP_initial_yield):
@@ -21319,6 +21424,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
             }
         }
+    }
+    /* uncaught in an ASYNC body on the tramp chain: the async CALL does not throw — it settles a REJECTED promise
+       and returns it to the caller (do_async_settle: js_async_function_post rejects, or propagates an uncatchable). */
+    if (tf_top && tf_top->async_data) {
+        ret_val = JS_EXCEPTION;
+        goto do_async_settle;
     }
     /* uncaught in THIS frame: if trampolined, pop to the caller + re-raise there (its stack still holds the
        call operands, which the caller's catch-search frees) — never leak tf_top by returning to the C base. */
@@ -21639,68 +21750,6 @@ static JSValue async_func_resume(JSContext *ctx, JSAsyncFunctionState *s)
                            JS_CALL_FLAG_GENERATOR);
 }
 
-/* Resume a body, transparently self-resuming through FORCED-EXEC PREEMPTS. A loop back-edge inside the body may
-   park+save the frame and return FUNC_RET_PREEMPT (a scheduler artifact, NOT an ECMAScript result); the frame is
-   already rebuilt by do_preempt, so we simply re-resume and continue. The body's SEMANTICS are unchanged — the
-   caller sees only the first real yield / await / yield_star / completion / exception — while every back-edge
-   went through the snapshot->rebuild machinery. THIS is the single well-defined seam that makes any activation
-   preemptible: every driver (js_generator_next, js_call_generator_function, the async drivers as they become
-   routable) calls THIS instead of async_func_resume so a forced preempt is never mistaken for a yield. */
-static JSValue async_func_resume_run(JSContext *ctx, JSAsyncFunctionState *s)
-{
-    JSValue r = async_func_resume(ctx, s);
-    /* A PREEMPT leaves the flow SUSPENDED (shallow: cur_sp saved non-NULL; deep: tramp_top stashed); a COMPLETION
-       leaves BOTH NULL. The return VALUE alone is AMBIGUOUS — a function returning the integer 3 collides with
-       js_int32(FUNC_RET_PREEMPT) — so a preempt MUST be detected by the FRAME (exactly as JS_FlowResume does),
-       never by the value, or a callback returning 3 (e.g. map's `2*val+1`) re-resumes a torn-down frame. */
-    while ((s->frame.cur_sp != NULL || s->tramp_top != NULL) &&
-           JS_VALUE_GET_TAG(r) == JS_TAG_INT && JS_VALUE_GET_INT(r) == FUNC_RET_PREEMPT) {
-        /* A preempt-resume is a CONTINUATION, never a re-throw. The driver set throw_flag for the FIRST resume
-           (a generator .throw() or an await rejection); that throw was already delivered+consumed by the first
-           async_func_resume (goto exception). JS_CallInternal's generator entry does not clear throw_flag, so
-           leaving it set would make the re-resume `goto exception` a SECOND time on a stale/NULL exception —
-           losing the continuation (the await-rejection-then-preempt-in-catch bug). Clear it: only a real throw
-           returns JS_EXCEPTION (which exits this loop), so if we are here the body is mid-run, not throwing. */
-        s->throw_flag = false;
-        r = async_func_resume(ctx, s);
-    }
-    return r;
-}
-
-/* HOOK a C builtin's callback invocation into the flow machinery so the callback's body is PREEMPTIBLE — the
-   suspend/resume that `forEach`/`map`/`sort`/`reduce` (and any C builtin that calls back into JS) get WITHOUT
-   being re-hosted in JS (§C-stack). A plain callback invoked by C's JS_Call runs with gen_state==NULL (no flow
-   driver, unroutable); running it AS A FLOW gives it its own func_state + the async_func_resume_run driver, so
-   its loop back-edges preempt+rebuild like a directly-called function. Only a NORMAL bytecode function needs
-   this: an async/generator callback already routes through its own class call, and a C-function/bound/proxy
-   callback has no preemptible body — those take the plain JS_Call. A NORMAL function has no await/yield, so the
-   flow always COMPLETES (or throws) in one drive: async_func_resume_run collapses every preempt and returns the
-   real value/exception, leaving the frame at the completed shape (cur_sp==NULL, tramp_top==NULL) — freed here
-   exactly as JS_FlowFree frees a completed flow. */
-static JSValue js_call_as_flow(JSContext *ctx, JSValueConst func_obj, JSValueConst this_obj,
-                               int argc, JSValueConst *argv)
-{
-    JSAsyncFunctionState fs;
-    JSValue r;
-    /* Fast path (perf): with NO preempt hook installed (production, or any non-forced eval) no back-edge can ever
-       preempt, so running the callback as a flow is pure overhead — a direct call is byte-identical behavior. The
-       flow machinery (a heap func_state per call) is ONLY needed under forced execution. A non-NORMAL callback
-       (async/generator routes via its class call; C/bound/proxy has no preemptible body) also takes JS_Call. */
-    if (g_flow_control.preempt == NULL || !tramp_can_call(func_obj))
-        return JS_Call(ctx, func_obj, this_obj, argc, argv);
-    /* zero FIRST: async_func_init does not set tramp_top/throw_flag (JS_FlowNew relies on js_mallocz); an
-       uninitialized stack fs would make the first resume see a garbage tramp_top and take the deep-resume path. */
-    memset(&fs, 0, sizeof(fs));
-    if (async_func_init(ctx, &fs, func_obj, this_obj, argc, argv))
-        return JS_EXCEPTION;
-    r = async_func_resume_run(ctx, &fs);
-    DCHECK(fs.frame.cur_sp == NULL && fs.tramp_top == NULL,
-           "js_call_as_flow: a NORMAL callback flow did not COMPLETE in one drive (no await/yield exists to suspend it)");
-    js_free_rt(ctx->rt, fs.frame.arg_buf);
-    JS_FreeValue(ctx, fs.frame.cur_func);
-    JS_FreeValue(ctx, fs.this_val);
-    return r;
-}
 
 /* APIClient forced-execution FLOW API: a flow is a preemptible activation. Its program runs as an async
    function frame (heap-resident, suspendable), so the scheduler can preempt it mid-execution (at a loop
@@ -22020,7 +22069,7 @@ static JSValue js_generator_next(JSContext *ctx, JSValueConst this_val,
             s->func_state.throw_flag = false;
         }
         s->state = JS_GENERATOR_STATE_EXECUTING;
-        func_ret = async_func_resume_run(ctx, &s->func_state);   /* self-resumes through forced back-edge preempts */
+        func_ret = async_func_resume(ctx, &s->func_state);
         s->state = JS_GENERATOR_STATE_SUSPENDED_YIELD;
         if (JS_IsException(func_ret)) {
             /* finalize the execution in case of exception */
@@ -22088,7 +22137,7 @@ static JSValue js_call_generator_function(JSContext *ctx, JSValueConst func_obj,
 
     /* execute the function up to 'OP_initial_yield' — self-resuming through any forced preempt at a back-edge in
        the PARAM DESTRUCTURING that runs before initial_yield (else the body is abandoned mid-destructuring). */
-    func_ret = async_func_resume_run(ctx, &s->func_state);
+    func_ret = async_func_resume(ctx, &s->func_state);
     if (JS_IsException(func_ret))
         goto fail;
     JS_FreeValue(ctx, func_ret);
@@ -22258,9 +22307,11 @@ static bool js_async_function_post(JSContext *ctx, JSAsyncFunctionData *s, JSVal
    out-of-order step that corrupted the heap; it was removed. */
 static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
 {
-    /* async_func_resume_run self-resumes through forced back-edge preempts, so js_async_function_post only ever
-       sees a real AWAIT / return / exception (never a FUNC_RET_PREEMPT its await path would misfire). */
-    return js_async_function_post(ctx, s, async_func_resume_run(ctx, &s->func_state));
+    /* A preempt inside the async body cannot reach js_async_function_post: the back-edge gate CRASHES a nested
+       loop preempt (yield-to-scheduler at depth is not yet built), so post only ever sees a real AWAIT / return /
+       exception. Once the nested flow suspends onto the caller's tramp chain, the preempt will unwind to the base
+       scheduler like any tramp-depth loop — never self-resumed here (that would be drive-to-completion). */
+    return js_async_function_post(ctx, s, async_func_resume(ctx, &s->func_state));
 }
 
 static JSValue js_async_function_resolve_call(JSContext *ctx,
@@ -22604,7 +22655,7 @@ static void js_async_generator_resume_next(JSContext *ctx,
             }
             s->state = JS_ASYNC_GENERATOR_STATE_EXECUTING;
         resume_exec:
-            func_ret = async_func_resume_run(ctx, &s->func_state);   /* self-resume through forced back-edge preempts */
+            func_ret = async_func_resume(ctx, &s->func_state);
             if (JS_IsException(func_ret)) {
                 value = JS_GetException(ctx);
                 js_async_generator_complete(ctx, s);
@@ -22754,7 +22805,7 @@ static JSValue js_async_generator_function_call(JSContext *ctx,
 
     /* execute the function up to 'OP_initial_yield' (no yield nor await are possible) — self-resume through any
        forced preempt at a PARAM-DESTRUCTURING back-edge that runs before initial_yield (see js_call_generator_function). */
-    func_ret = async_func_resume_run(ctx, &s->func_state);
+    func_ret = async_func_resume(ctx, &s->func_state);
     if (JS_IsException(func_ret))
         goto fail;
     JS_FreeValue(ctx, func_ret);
@@ -44051,7 +44102,7 @@ static JSValue js_array_every(JSContext *ctx, JSValueConst this_val,
             args[0] = val;
             args[1] = index_val;
             args[2] = obj;
-            res = js_call_as_flow(ctx, func, this_arg, 3, args);   /* hook: callback body is preemptible */
+            res = JS_Call(ctx, func, this_arg, 3, args);
             JS_FreeValue(ctx, index_val);
             if (JS_IsException(res))
                 goto exception;
@@ -44195,7 +44246,7 @@ static JSValue js_array_reduce(JSContext *ctx, JSValueConst this_val,
             args[1] = val;
             args[2] = index_val;
             args[3] = obj;
-            acc1 = js_call_as_flow(ctx, func, JS_UNDEFINED, 4, args);   /* hook: reducer body is preemptible */
+            acc1 = JS_Call(ctx, func, JS_UNDEFINED, 4, args);
             JS_FreeValue(ctx, index_val);
             JS_FreeValue(ctx, val);
             val = JS_UNDEFINED;
@@ -44444,7 +44495,7 @@ static JSValue js_array_find(JSContext *ctx, JSValueConst this_val,
         args[0] = val;
         args[1] = index_val;
         args[2] = this_val;
-        res = js_call_as_flow(ctx, func, this_arg, 3, args);   /* hook: predicate body is preemptible */
+        res = JS_Call(ctx, func, this_arg, 3, args);
         if (JS_IsException(res))
             goto exception;
         if (JS_ToBoolFree(ctx, res)) {
@@ -45151,7 +45202,7 @@ static int js_array_cmp_generic(const void *a, const void *b, void *opaque) {
             goto cmp_same;
         argv[0] = ap->val;
         argv[1] = bp->val;
-        res = js_call_as_flow(ctx, psc->method, JS_UNDEFINED, 2, argv);   /* hook: comparator body is preemptible */
+        res = JS_Call(ctx, psc->method, JS_UNDEFINED, 2, argv);
         if (JS_IsException(res))
             goto exception;
         if (JS_VALUE_GET_TAG(res) == JS_TAG_INT) {
@@ -47924,7 +47975,7 @@ static JSValue js_string_replace(JSContext *ctx, JSValueConst this_val,
             args[0] = search_str;
             args[1] = js_int32(pos);
             args[2] = str;
-            repl_str = JS_ToStringFree(ctx, js_call_as_flow(ctx, replaceValue, JS_UNDEFINED, 3, args));   /* hook: replacer body preemptible */
+            repl_str = JS_ToStringFree(ctx, JS_Call(ctx, replaceValue, JS_UNDEFINED, 3, args));
         } else {
             args[0] = search_str;
             args[1] = str;
@@ -51476,7 +51527,7 @@ static JSValue internalize_json_property(JSContext *ctx, JSValueConst holder,
     args[0] = name_val;
     args[1] = val;
     args[2] = context;
-    res = js_call_as_flow(ctx, reviver, holder, 3, args);   /* hook: reviver body preemptible */
+    res = JS_Call(ctx, reviver, holder, 3, args);
     JS_FreeValue(ctx, name_val);
     JS_FreeValue(ctx, val);
     JS_FreeValue(ctx, context);
@@ -51636,7 +51687,7 @@ static JSValue js_json_check(JSContext *ctx, JSONStringifyContext *jsc,
     if (!JS_IsUndefined(jsc->replacer_func)) {
         args[0] = key;
         args[1] = val;
-        v = js_call_as_flow(ctx, jsc->replacer_func, holder, 2, args);   /* hook: replacer body preemptible */
+        v = JS_Call(ctx, jsc->replacer_func, holder, 2, args);
         JS_FreeValue(ctx, val);
         val = v;
         if (JS_IsException(val))
@@ -60592,7 +60643,7 @@ static JSValue js_typed_array_find(JSContext *ctx, JSValueConst this_val,
         args[0] = val;
         args[1] = index_val;
         args[2] = this_val;
-        res = js_call_as_flow(ctx, func, this_arg, 3, args);   /* hook: predicate body is preemptible */
+        res = JS_Call(ctx, func, this_arg, 3, args);
         if (JS_IsException(res))
             goto exception;
         if (JS_ToBoolFree(ctx, res)) {
@@ -61340,7 +61391,7 @@ static int js_TA_cmp_generic(const void *a, const void *b, void *opaque) {
                               a_idx * (size_t)psc->elt_size);
         argv[1] = psc->getfun(ctx, (char *)p->u.array.u.ptr +
                               b_idx * (size_t)(psc->elt_size));
-        res = js_call_as_flow(ctx, psc->cmp, JS_UNDEFINED, 2, vc(argv));   /* hook: comparator body is preemptible */
+        res = JS_Call(ctx, psc->cmp, JS_UNDEFINED, 2, vc(argv));
         if (JS_IsException(res)) {
             psc->exception = 1;
             goto done;
