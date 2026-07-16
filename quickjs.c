@@ -18148,9 +18148,10 @@ static bool flow_preempt_routable(JSAsyncFunctionState *gs) {
     if (gs == NULL) return false;
     if (gs == g_flow_base_gen) return true;
     JSFunctionKindEnum k = JS_VALUE_GET_OBJ(gs->frame.cur_func)->u.func.function_bytecode->func_kind;
-    /* sync generator (js_generator_next / js_call_generator_function) and async function (js_async_function_resume)
-       drivers self-resume via async_func_resume_run. ASYNC_GENERATOR is the remaining gap (its driver next). */
-    return k == JS_FUNC_GENERATOR || k == JS_FUNC_ASYNC;
+    /* Every generator/async body driver self-resumes via async_func_resume_run, so all func_kinds are routable.
+       The only remaining preempt gap is a C-reentry callback frame (gs==NULL, handled above): a forEach/sort
+       comparator has no flow driver until the builtin is self-hosted as bytecode. */
+    return k == JS_FUNC_GENERATOR || k == JS_FUNC_ASYNC || k == JS_FUNC_ASYNC_GENERATOR;
 }
 
 /* Concolic branch arm + snapshot fork. The branch hook returns the arm (0/1), ORed with 0x100 when it forked
@@ -22559,7 +22560,7 @@ static void js_async_generator_resume_next(JSContext *ctx,
             }
             s->state = JS_ASYNC_GENERATOR_STATE_EXECUTING;
         resume_exec:
-            func_ret = async_func_resume(ctx, &s->func_state);
+            func_ret = async_func_resume_run(ctx, &s->func_state);   /* self-resume through forced back-edge preempts */
             if (JS_IsException(func_ret)) {
                 value = JS_GetException(ctx);
                 js_async_generator_complete(ctx, s);
@@ -22707,9 +22708,9 @@ static JSValue js_async_generator_function_call(JSContext *ctx,
         goto fail;
     }
 
-    /* execute the function up to 'OP_initial_yield' (no yield nor
-       await are possible) */
-    func_ret = async_func_resume(ctx, &s->func_state);
+    /* execute the function up to 'OP_initial_yield' (no yield nor await are possible) — self-resume through any
+       forced preempt at a PARAM-DESTRUCTURING back-edge that runs before initial_yield (see js_call_generator_function). */
+    func_ret = async_func_resume_run(ctx, &s->func_state);
     if (JS_IsException(func_ret))
         goto fail;
     JS_FreeValue(ctx, func_ret);
