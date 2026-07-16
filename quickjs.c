@@ -18163,6 +18163,10 @@ typedef struct TrampFrame {
 #define CONT_SORT          6   /* cont_state = JSArraySort: arr.sort(cmp) drives a SUSPENDABLE bottom-up merge
                                   sort whose comparator runs on this chain, so a comparator body loop preempts the
                                   base flow. do_return re-enters js_array_sort_step with the comparison result. */
+#define CONT_JSON_REVIVE   7   /* cont_state = JSJsonReviver: JSON.parse(str, reviver) walks the parsed tree with
+                                  an EXPLICIT DFS stack (no C recursion) and calls the reviver on this chain at
+                                  each node (post-order), so a reviver body loop preempts. do_return re-enters
+                                  js_json_reviver_step with the reviver's result. */
 
 /* A bytecode constructor's body run on the trampoline chain; holds the created `this` across the body so
    do_return can apply the constructor return-value rule (use `this` when the body returns a non-object).
@@ -18323,6 +18327,39 @@ static int js_array_sort_init(JSContext *ctx, struct JSArraySort *s, JSValueCons
 static int js_array_sort_step(JSContext *ctx, struct JSArraySort *s, JSValue res, JSValueConst out_args[2]);
 static JSValue js_array_sort_end(JSContext *ctx, struct JSArraySort *s, bool ok);
 static bool tramp_can_call_array_sort(JSValueConst func, int argc, JSValueConst *argv);
+
+/* JSON.parse(text, reviver): a SUSPENDABLE post-order tree walk. internalize_json_property recurses on the C
+   stack and calls the reviver deep in that recursion; this coroutine flattens the recursion into an explicit
+   DFS stack (JRFrame[]) so the reviver runs on the tramp chain and a reviver body loop preempts. Each frame is
+   one node: its holder/name, its value, its own-key list, the cursor into that list, its parse-record and the
+   JSON-source `context`. The ONE suspension point is reviver.call(holder, name, val, context). */
+struct JSPropertyEnum; struct JSONParseRecord;
+typedef struct JRFrame {
+    JSValue holder, val, context;   /* holder (borrowed from parent's val), val (owned), context (owned) */
+    JSValue name_val;               /* JS_AtomToValue(name), owned, held across the reviver call */
+    JSAtom name;                    /* the key of val in holder (owned) */
+    struct JSPropertyEnum *atoms;   /* own enumerable keys of val (object case) */
+    uint32_t len, i;                /* key count + cursor */
+    int is_array;
+    struct JSONParseRecord *fpr;    /* holder's parse record (borrowed); vpr = val's, resolved in phase 0 */
+    struct JSONParseRecord *vpr;
+    uint8_t phase;                  /* 0=needs init, 1=iterating children, 2=reviver called (awaiting result) */
+} JRFrame;
+typedef struct JSJsonReviver {
+    JSValueConst reviver;           /* borrowed from the caller stack */
+    const char *text;               /* JSON source (owned CString; freed at end) */
+    JSValue root;                   /* {"" : parsed} holder (owned) */
+    struct JSONParseRecord *pr;     /* root parse record (owned; json_free_parse_record at end) */
+    JRFrame *stack; int sp, cap;
+    JSValue result;                 /* final revived value */
+    JSValue cb_args[5];             /* [holder(this), reviver, name_val, val, context]; call_argv=&cb_args[2], argc=3 */
+    int orig_cfirst, orig_cargc; uint8_t orig_is_tail;
+} JSJsonReviver;
+static JSValue js_json_parse(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static int js_json_reviver_init(JSContext *ctx, struct JSJsonReviver *s, JSValueConst text_arg, JSValueConst reviver);
+static int js_json_reviver_step(JSContext *ctx, struct JSJsonReviver *s, JSValue res, JSValueConst out_args[3]);
+static JSValue js_json_reviver_end(JSContext *ctx, struct JSJsonReviver *s, bool ok);
+static bool tramp_can_call_json_parse(JSValueConst func, int argc, JSValueConst *argv);
 /* Function.prototype.call is CALL-SITE-RESOLVED: it holds no continuation, so rather than C-recursing
    js_function_call (which would run the ultimate target's body off the chain, unable to preempt), the
    interpreter reslices the operands at the call site and dispatches the target directly (do_forward_call). */
@@ -19163,6 +19200,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_array_sort(call_argv[-1], call_argc, vc(call_argv))) {   /* arr.sort(cmp) -> merge-sort drive on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_sort_tramp;
                 }
+                if (tramp_can_call_json_parse(call_argv[-1], call_argc, vc(call_argv))) {   /* JSON.parse(s,reviver) -> reviver walk on THIS chain */
+                    tramp_is_tail = (opcode == OP_tail_call_method); goto do_json_revive_tramp;
+                }
                 if (tramp_is_function_call(call_argv[-1])) {   /* f.call(thisArg,...) -> resolve + dispatch f here */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_forward_call;
                 }
@@ -19660,6 +19700,49 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 call_argv = (JSValueConst *)&s->cb_args[2];
                 call_argc = 2; tramp_first = -2; tramp_is_tail = 0;
                 tramp_cont_state = s; tramp_cont_kind = CONT_SORT;   /* method is a NORMAL bytecode fn (gated at admission) */
+                goto do_tramp_call;
+            }
+
+        do_json_revive_tramp:
+            /* JSON.parse(text, reviver): parse synchronously, then walk the tree with an explicit DFS stack whose
+               reviver call runs HERE on the chain (so a reviver body loop preempts). Operands [JSON, parse, text,
+               reviver] (call_first=-2). */
+            {
+                JSJsonReviver *s = js_malloc(ctx, sizeof(*s));
+                if (unlikely(!s)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                if (js_json_reviver_init(ctx, s, call_argv[0], call_argv[1])) {
+                    js_json_reviver_end(ctx, s, false); js_free_rt(rt, s); goto exception;
+                }
+                s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
+                cont_st = s; cont_kind_cur = CONT_JSON_REVIVE;
+                ret_val = JS_UNDEFINED;
+                goto do_json_revive_step;
+            }
+
+        do_json_revive_step:
+            {
+                JSJsonReviver *s = (JSJsonReviver *)cont_st;
+                int st = js_json_reviver_step(ctx, s, ret_val, (JSValueConst *)&s->cb_args[2]);
+                if (unlikely(st < 0)) { js_json_reviver_end(ctx, s, false); js_free_rt(rt, s); goto exception; }
+                if (st == 0) {   /* DONE: the revived value */
+                    int cfirst = s->orig_cfirst, cargc = s->orig_cargc;
+                    uint8_t itail = s->orig_is_tail;
+                    JSValue r = js_json_reviver_end(ctx, s, true);
+                    JSValue *cargv = sp - cargc;
+                    js_free_rt(rt, s);
+                    if (unlikely(JS_IsException(r))) goto exception;
+                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
+                    sp += cfirst - cargc;
+                    if (itail) { ret_val = r; goto do_return; }
+                    *sp++ = r;
+                    BREAK;
+                }
+                /* st == 1: call reviver.call(holder, name, val, context) on the chain. cb_args[0]=holder set by
+                   the step; [2..4]=name,val,context; set [1]=reviver here. */
+                s->cb_args[1] = s->reviver;
+                call_argv = (JSValueConst *)&s->cb_args[2];
+                call_argc = 3; tramp_first = -2; tramp_is_tail = 0;
+                tramp_cont_state = s; tramp_cont_kind = CONT_JSON_REVIVE;   /* reviver is a NORMAL bytecode fn (gated) */
                 goto do_tramp_call;
             }
 
@@ -20198,6 +20281,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     cont_st = rcs; cont_kind_cur = rck;
                     if (rck == CONT_ARRAY_REDUCE) goto do_array_reduce_step;
                     if (rck == CONT_SORT) goto do_sort_step;
+                    if (rck == CONT_JSON_REVIVE) goto do_json_revive_step;
                     goto do_array_iter_step;
                 }
                 if (itail) goto do_return;   /* caller was a tail-caller: propagate */
@@ -22792,6 +22876,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 js_array_every_end(ctx, (struct JSArrayEvery *)xcs, false);
             else if (xck == CONT_SORT)
                 js_array_sort_end(ctx, (struct JSArraySort *)xcs, false);
+            else if (xck == CONT_JSON_REVIVE)
+                js_json_reviver_end(ctx, (struct JSJsonReviver *)xcs, false);
             else
                 js_array_reduce_end(ctx, (struct JSArrayReduce *)xcs, false);
             js_free_rt(rt, xcs);
@@ -53110,6 +53196,146 @@ static JSValue internalize_json_property(JSContext *ctx, JSValueConst holder,
     JS_FreeValue(ctx, context);
     JS_FreeValue(ctx, val);
     return JS_EXCEPTION;
+}
+
+/* ---- Suspendable JSON.parse reviver (explicit-stack post-order walk; see JSJsonReviver) ---- */
+static int jr_push(JSContext *ctx, JSJsonReviver *s) {
+    if (s->sp >= s->cap) {
+        int nc = s->cap ? s->cap * 2 : 16;
+        JRFrame *ns = js_realloc(ctx, s->stack, (size_t)nc * sizeof(JRFrame));
+        if (!ns) return -1;
+        s->stack = ns; s->cap = nc;
+    }
+    JRFrame *f = &s->stack[s->sp++];
+    f->holder = JS_UNDEFINED; f->val = JS_UNDEFINED; f->context = JS_UNDEFINED;
+    f->name = JS_ATOM_NULL; f->name_val = JS_UNDEFINED; f->atoms = NULL;
+    f->len = 0; f->i = 0; f->is_array = 0; f->fpr = NULL; f->vpr = NULL; f->phase = 0;
+    return 0;
+}
+/* descend a HOLDER's parse-record to the child `name` whose value is `cval`, mirroring internalize's pr walk. */
+static JSONParseRecord *jr_child_pr(JSContext *ctx, JSONParseRecord *holder_pr, JSAtom name, JSValueConst cval) {
+    JSONParseRecord *pr = holder_pr;
+    if (!pr) return NULL;
+    if (js_is_array(ctx, pr->value)) {
+        if (__JS_AtomIsTaggedInt(name)) {
+            uint32_t idx = __JS_AtomToUInt32(name);
+            pr = (idx < (uint32_t)pr->u.array.count) ? &pr->u.array.elements[idx] : NULL;
+        } else pr = NULL;
+    } else {
+        pr = json_parse_record_find(pr, name);
+    }
+    if (pr && !js_same_value(ctx, pr->value, cval)) pr = NULL;
+    return pr;
+}
+static int js_json_reviver_init(JSContext *ctx, JSJsonReviver *s, JSValueConst text_arg, JSValueConst reviver) {
+    size_t len; JSValue parsed; JSONParseRecord *pr1; int size = 0;
+    s->reviver = reviver; s->text = NULL; s->root = JS_UNDEFINED; s->pr = NULL;
+    s->stack = NULL; s->sp = 0; s->cap = 0; s->result = JS_UNDEFINED;
+    for (int i = 0; i < 5; i++) s->cb_args[i] = JS_UNDEFINED;
+    s->text = JS_ToCStringLen(ctx, &len, text_arg);
+    if (!s->text) return -1;
+    s->pr = js_mallocz(ctx, sizeof(JSONParseRecord));
+    if (!s->pr) return -1;
+    s->root = JS_NewObject(ctx);
+    if (JS_IsException(s->root)) return -1;
+    json_parse_record_init_obj(ctx, s->pr, s->root);
+    pr1 = json_parse_record_add(ctx, s->pr, JS_ATOM_empty_string, &size);
+    if (!pr1) return -1;
+    parsed = JS_ParseJSON_internal(ctx, s->text, len, "<input>", pr1);
+    if (JS_IsException(parsed)) return -1;
+    if (JS_DefinePropertyValue(ctx, s->root, JS_ATOM_empty_string, parsed, JS_PROP_C_W_E) < 0) return -1;
+    if (jr_push(ctx, s) < 0) return -1;                 /* the root frame: holder={""}, name="", holder-record=pr */
+    s->stack[0].holder = s->root; s->stack[0].name = JS_DupAtom(ctx, JS_ATOM_empty_string);
+    s->stack[0].fpr = s->pr;
+    return 0;
+}
+/* Drive the DFS until the next reviver call is needed (return 1, out_args=[name,val,context]) or done (0).
+   `res` (owned) is the reviver's result for the just-completed node, or JS_UNDEFINED on the first call. */
+static int js_json_reviver_step(JSContext *ctx, JSJsonReviver *s, JSValue res, JSValueConst out_args[3]) {
+    if (s->sp > 0 && s->stack[s->sp - 1].phase == 2) {   /* a node's reviver just returned `res` */
+        JRFrame *f = &s->stack[s->sp - 1];
+        JSAtom fname = f->name;                          /* keep for the parent apply */
+        if (f->atoms) js_free_prop_enum(ctx, f->atoms, f->len);
+        JS_FreeValue(ctx, f->name_val);
+        JS_FreeValue(ctx, f->val);
+        JS_FreeValue(ctx, f->context);
+        s->sp--;
+        if (s->sp == 0) { JS_FreeAtom(ctx, fname); s->result = res; return 0; }   /* root: done */
+        JRFrame *p = &s->stack[s->sp - 1];
+        int ret;
+        if (JS_IsUndefined(res)) { JS_FreeValue(ctx, res); ret = JS_DeleteProperty(ctx, p->val, fname, 0); }
+        else ret = JS_DefinePropertyValue(ctx, p->val, fname, res, JS_PROP_C_W_E);   /* consumes res */
+        JS_FreeAtom(ctx, fname);
+        if (ret < 0) return -1;
+        p->i++;
+    } else {
+        JS_FreeValue(ctx, res);                          /* JS_UNDEFINED on the first call */
+    }
+    while (s->sp > 0) {
+        JRFrame *f = &s->stack[s->sp - 1];
+        if (f->phase == 0) {
+            f->val = JS_GetProperty(ctx, f->holder, f->name);
+            if (JS_IsException(f->val)) return -1;
+            f->vpr = jr_child_pr(ctx, f->fpr, f->name, f->val);   /* val's own parse record */
+            f->context = JS_NewObject(ctx);
+            if (JS_IsException(f->context)) return -1;
+            if (JS_IsObject(f->val)) {
+                f->is_array = js_is_array(ctx, f->val);
+                if (f->is_array < 0) return -1;
+                if (f->is_array) { if (js_get_length32(ctx, &f->len, f->val)) return -1; }
+                else { int r = JS_GetOwnPropertyNamesInternal(ctx, &f->atoms, &f->len, JS_VALUE_GET_OBJ(f->val),
+                                                              JS_GPN_ENUM_ONLY | JS_GPN_STRING_MASK); if (r < 0) return -1; }
+            } else if (f->vpr) {   /* primitive with a source record -> context.source */
+                JSValue src = JS_NewStringLen(ctx, s->text + f->vpr->u.primitive.source_pos, f->vpr->u.primitive.source_len);
+                if (JS_IsException(src)) return -1;
+                if (JS_DefinePropertyValue(ctx, f->context, JS_ATOM_source, src, JS_PROP_C_W_E) < 0) return -1;
+            }
+            f->phase = 1;
+        }
+        if ((int64_t)f->i < (int64_t)f->len) {           /* descend into child i */
+            JSAtom prop;
+            if (f->is_array) { prop = JS_NewAtomUInt32(ctx, f->i); if (prop == JS_ATOM_NULL) return -1; }
+            else prop = JS_DupAtom(ctx, f->atoms[f->i].atom);
+            JSValueConst pval = f->val; JSONParseRecord *pvpr = f->vpr;   /* snapshot before push may realloc s->stack */
+            if (jr_push(ctx, s) < 0) { JS_FreeAtom(ctx, prop); return -1; }
+            JRFrame *child = &s->stack[s->sp - 1];
+            child->holder = pval; child->name = prop; child->fpr = pvpr;   /* child's holder-record = this val's record */
+            continue;
+        }
+        /* children done -> call the reviver on this node (SUSPEND) */
+        f->name_val = JS_AtomToValue(ctx, f->name);
+        if (JS_IsException(f->name_val)) return -1;
+        s->cb_args[0] = f->holder;                       /* this = holder (borrowed) */
+        out_args[0] = f->name_val; out_args[1] = f->val; out_args[2] = f->context;
+        f->phase = 2;
+        return 1;
+    }
+    return 0;
+}
+static JSValue js_json_reviver_end(JSContext *ctx, JSJsonReviver *s, bool ok) {
+    while (s->sp > 0) {   /* free any frames still open (exception mid-walk) */
+        JRFrame *f = &s->stack[--s->sp];
+        if (f->atoms) js_free_prop_enum(ctx, f->atoms, f->len);
+        JS_FreeValue(ctx, f->name_val);
+        JS_FreeValue(ctx, f->val);
+        JS_FreeValue(ctx, f->context);
+        JS_FreeAtom(ctx, f->name);
+    }
+    js_free(ctx, s->stack); s->stack = NULL;
+    if (s->pr) { json_free_parse_record(ctx, s->pr); js_free(ctx, s->pr); s->pr = NULL; }
+    JS_FreeValue(ctx, s->root); s->root = JS_UNDEFINED;
+    if (s->text) { JS_FreeCString(ctx, s->text); s->text = NULL; }
+    if (!ok) { JS_FreeValue(ctx, s->result); return JS_EXCEPTION; }
+    return s->result;
+}
+static bool tramp_can_call_json_parse(JSValueConst func, int argc, JSValueConst *argv) {
+    JSObject *mp, *rp;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
+    mp = JS_VALUE_GET_OBJ(func);
+    if (!(mp->class_id == JS_CLASS_C_FUNCTION && mp->u.cfunc.c_function.generic == js_json_parse)) return false;
+    if (argc < 2 || JS_VALUE_GET_TAG(argv[1]) != JS_TAG_OBJECT) return false;
+    rp = JS_VALUE_GET_OBJ(argv[1]);
+    return rp->class_id == JS_CLASS_BYTECODE_FUNCTION && rp->u.func.function_bytecode->func_kind == JS_FUNC_NORMAL;
 }
 
 static JSValue js_json_parse(JSContext *ctx, JSValueConst this_val,
