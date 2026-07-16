@@ -21005,6 +21005,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 } else {
                 get_field2_slow_path:
                     sf->cur_pc = pc;
+                    if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) {
+                        JSObject *g = tramp_bytecode_getter(JS_VALUE_GET_OBJ(sp[-1]), atom);
+                        if (g) {   /* bytecode getter -> 0-arg method call; obj STAYS on the stack (get_field2) */
+                            *sp++ = js_dup(sp[-1]);   /* `this` copy on top of the retained receiver */
+                            *sp++ = js_dup(JS_MKPTR(JS_TAG_OBJECT, g));   /* stack: [receiver][this][getter] */
+                            call_argv = sp; call_argc = 0;
+                            tramp_first = -2; tramp_is_tail = 0;
+                            goto do_tramp_call;   /* do_return pops this+getter, pushes value -> [receiver][value] */
+                        }
+                    }
                     val = JS_GetPropertyInternal(ctx, obj, atom, sp[-1], false);
                     if (unlikely(JS_IsException(val)))
                         goto exception;
@@ -21259,6 +21269,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                 }
                 sf->cur_pc = pc;
+                if (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT) {
+                    JSAtom katom = JS_ValueToAtom(ctx, sp[-1]);   /* ToPropertyKey (may throw) */
+                    if (unlikely(katom == JS_ATOM_NULL))
+                        goto exception;
+                    JSObject *g = tramp_bytecode_getter(JS_VALUE_GET_OBJ(sp[-2]), katom);
+                    JS_FreeAtom(ctx, katom);
+                    if (g) {   /* obj[key] resolves to a bytecode getter -> 0-arg method call on THIS chain */
+                        JS_FreeValue(ctx, sp[-1]);   /* the key is consumed */
+                        sp[-1] = js_dup(JS_MKPTR(JS_TAG_OBJECT, g));   /* stack: [receiver][getter] */
+                        call_argv = sp; call_argc = 0;
+                        tramp_first = -2; tramp_is_tail = 0;
+                        goto do_tramp_call;   /* do_return pops receiver+getter, pushes value -> [value] */
+                    }
+                }
                 val = JS_GetPropertyValue(ctx, sp[-2], sp[-1]);
                 JS_FreeValue(ctx, sp[-2]);
                 sp[-2] = val;
