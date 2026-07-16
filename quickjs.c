@@ -18526,14 +18526,25 @@ static int branch_arm_fork(JSContext *ctx, JSValueConst op1, uint8_t *if_pc,
             sf->cur_pc = if_pc; sf->cur_sp = sp;
             if (g_flow_control.fork) { JSValue *cl = JS_FlowClone(ctx, (JSValue *)gen_state); g_flow_control.fork(ctx, cl); }
             sf->cur_sp = NULL;
+        } else if (gen_state == g_flow_base_gen) {
+            /* BASE flow, DEEP: the branch is inside a called function on this flow's live tramp chain — the common
+               case being an async body's initial synchronous chunk (it runs HERE, gen_state stays the base, tf_top
+               is its async frame). SNAPSHOT-fork the WHOLE chain: sync the deepest frame's resume point, stash the
+               live chain into the base so clone_deep_flow can walk it (mirroring a deep preempt-suspend), clone,
+               then un-stash (the parent's chain stays live in the interpreter's tf_top). The clone gives each async
+               frame a FRESH promise capability; since the fork also cloned the caller's mid-OP_call, each arm awaits
+               its OWN promise — no shared-promise conflict. A SNAPSHOT, never a re-run. */
+            sf->cur_pc = if_pc; sf->cur_sp = sp;
+            gen_state->tramp_top = (TrampFrame *)tf_top;
+            if (g_flow_control.fork) { JSValue *cl = JS_FlowClone(ctx, (JSValue *)gen_state); g_flow_control.fork(ctx, cl); }
+            gen_state->tramp_top = NULL;   /* the parent's chain is still live in tf_top, not stashed */
+            sf->cur_sp = NULL;
         } else {
-            /* A concolic branch inside an ASYNC body on this chain (base flow, one async frame). The SOUND fork is
-               a SNAPSHOT, which needs (1) cloning the async frame from async_data->func_state.frame and (2) the
-               async frame's PROMISE / resolve-capability isolated on the per-flow COW delta (the host COW captures
-               JS property writes, not a promise's C-internal resolution state). Neither is built. Re-run-from-start
-               REPLAY is BANNED (not byte-identical: shared state can differ between the run and the re-run), so it
-               is NOT kept as a fallback — the gap CRASHES to force the async-state-on-COW-delta + snapshot build. */
-            DFAIL("async-body concolic branch: sound snapshot fork not built (needs async/promise state on the per-flow COW delta); replay-from-start is banned");
+            /* gen_state != g_flow_base_gen: a truly NESTED preemptible activation (a generator driven by .next()
+               synchronously inside this flow, whose base is its own func_state). Snapshot-forking it needs the
+               nested activation's own suspend/clone identity resolved against the driving flow — not built. REPLAY
+               is BANNED (not byte-identical), so the gap CRASHES rather than degrading to a re-run. */
+            DFAIL("nested-activation concolic branch (gen_state != base): snapshot fork across a synchronous generator drive not built; replay is banned");
         }
     }
     return harm;
@@ -23284,6 +23295,42 @@ void JS_FlowFree(JSContext *ctx, JSValue *flow) {
    cur_func (async_func_init dup'd it) and this_val; a TrampFrame BORROWS its cur_func from the caller stack
    (do_tramp_call did not dup it) — so the base dup's, the tramp does not. Single-level, closure-free, in-frame
    args for now; every other shape DCHECKs (no fallback). */
+/* Clone a SUSPENDED func-frame's live buffer into cf (a zeroed JSStackFrame). Dups the [0,live) live values,
+   SHARES the closed var_ref cells (+ref, COW-isolated per-flow by the delta), dups cur_func, and copies
+   is_strict/pc/arg_count. The caller sets cur_sp (deepest=live point via XL; a dormant/mid-call frame=NULL).
+   ONE contract used by BOTH the base frame and an async-body frame — never two copies of the frame-clone logic. */
+static int clone_susp_frame(JSContext *ctx, JSStackFrame *cf, const JSStackFrame *of, ptrdiff_t live) {
+    JSObject *p = JS_VALUE_GET_OBJ(of->cur_func);
+    JSFunctionBytecode *b = p->u.func.function_bytecode;
+    int al = of->arg_count, lc = al + b->var_count + b->stack_size;
+    cf->arg_buf = js_malloc(ctx, sizeof(JSValue) * (lc > 0 ? lc : 1) + sizeof(JSVarRef *) * b->var_ref_count);
+    if (!cf->arg_buf) return -1;
+    for (ptrdiff_t i = 0; i < live; i++) cf->arg_buf[i] = js_dup(of->arg_buf[i]);
+    cf->is_strict_mode = of->is_strict_mode;
+    cf->cur_func = js_dup(of->cur_func);   /* the frame OWNS its cur_func */
+    cf->arg_count = al;
+    cf->var_buf = cf->arg_buf + al;
+    cf->var_refs = (JSVarRef **)(cf->arg_buf + lc);
+    cf->var_ref_count = of->var_ref_count;   /* share the frame's closed cells + take a ref */
+    for (int vi = 0; vi < of->var_ref_count; vi++) { cf->var_refs[vi] = of->var_refs[vi]; if (cf->var_refs[vi]) JS_REF_COUNT(cf->var_refs[vi])++; }
+    cf->cur_pc = of->cur_pc;
+    cf->prev_frame = NULL;
+    return 0;
+}
+
+/* A TrampFrame's LIVE frame: an async/generator body keeps its state in func_state.frame (NOT the embedded sf) —
+   the same frame-source rule the deep-resume path uses. */
+static JSStackFrame *tramp_live_sf(TrampFrame *t) {
+    if (t->async_data) return &t->async_data->func_state.frame;
+    if (t->gen_data)   return &t->gen_data->func_state.frame;
+    return &t->sf;
+}
+/* The base of a TrampFrame's local buffer (args..vars..stack), for translating a callee's caller_* pointers. An
+   async/generator frame's buffer is its func_state.frame.arg_buf; a normal frame's is local_buf. */
+static JSValue *tramp_buf_base(TrampFrame *t) {
+    return (t->async_data || t->gen_data) ? tramp_live_sf(t)->arg_buf : t->local_buf;
+}
+
 static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
     JSStackFrame *ob = &s->frame;
     /* Collect the chain deepest(tramp_top)-first .. bottom-last. arr[i].up == arr[i+1]; bottom.up == NULL. */
@@ -23297,60 +23344,78 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
        isolated per-flow by the delta) and takes an ownership ref — no per-frame open-cell aliasing. */
 
     /* ---- clone the base frame (dormant, mid-call): live end = the bottom frame's caller_sp ---- */
-    JSObject *bp = JS_VALUE_GET_OBJ(ob->cur_func);
-    JSFunctionBytecode *bb = bp->u.func.function_bytecode;
-    int bal = ob->arg_count, blc = bal + bb->var_count + bb->stack_size;
     ptrdiff_t blive = oa[n - 1]->caller_sp - ob->arg_buf;
     JSAsyncFunctionState *c = js_mallocz(ctx, sizeof(*c));
     if (!c) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
     JSStackFrame *cb = &c->frame;
-    cb->arg_buf = js_malloc(ctx, sizeof(JSValue) * (blc > 0 ? blc : 1) + sizeof(JSVarRef *) * bb->var_ref_count);
-    if (!cb->arg_buf) { js_free(ctx, c); js_free(ctx, oa); js_free(ctx, ca); return NULL; }
-    for (ptrdiff_t i = 0; i < blive; i++) cb->arg_buf[i] = js_dup(ob->arg_buf[i]);
-    cb->is_strict_mode = ob->is_strict_mode;
-    cb->cur_func = js_dup(ob->cur_func);   /* base OWNS cur_func */
+    if (clone_susp_frame(ctx, cb, ob, blive) < 0) { js_free(ctx, c); js_free(ctx, oa); js_free(ctx, ca); return NULL; }
     c->this_val = js_dup(s->this_val);
     c->argc = s->argc; c->throw_flag = s->throw_flag;
-    cb->arg_count = ob->arg_count;
-    cb->var_buf = cb->arg_buf + bal;
-    cb->var_refs = (JSVarRef **)(cb->arg_buf + blc);
-    cb->var_ref_count = ob->var_ref_count;   /* share the base's closed cells + take a ref */
-    for (int vi = 0; vi < ob->var_ref_count; vi++) { cb->var_refs[vi] = ob->var_refs[vi]; if (cb->var_refs[vi]) JS_REF_COUNT(cb->var_refs[vi])++; }
-    cb->cur_pc = ob->cur_pc;   /* base resumes here after the chain returns to it */
     cb->cur_sp = NULL;         /* dormant: the live point is in the chain */
-    cb->prev_frame = NULL;
 
     /* ---- clone each TrampFrame BOTTOM-UP, relinking its caller_* into the cloned caller ---- */
     #define XL(p, ob_, cb_) ((p) ? (cb_) + ((p) - (ob_)) : NULL)   /* translate a JSValue* between buffers */
     for (int i = n - 1; i >= 0; i--) {
         TrampFrame *otf = oa[i];
-        /* the caller is the base (bottom frame, i==n-1) or the next-shallower frame's clone (already built) */
+        /* the caller is the base (bottom frame, i==n-1) or the next-shallower frame's clone (already built),
+           sourced async-aware: an async/generator caller's stack is its func_state.frame, not local_buf. */
         JSStackFrame *caller_clone; JSValue *cob, *ccb;
-        if (i == n - 1) { caller_clone = cb;             cob = ob->arg_buf;          ccb = cb->arg_buf; }
-        else            { caller_clone = &ca[i + 1]->sf; cob = oa[i + 1]->local_buf; ccb = ca[i + 1]->local_buf; }
+        if (i == n - 1) { caller_clone = cb;                    cob = ob->arg_buf;               ccb = cb->arg_buf; }
+        else            { caller_clone = tramp_live_sf(ca[i+1]); cob = tramp_buf_base(oa[i + 1]); ccb = tramp_buf_base(ca[i + 1]); }
+        JSStackFrame *osf = tramp_live_sf(otf);
         /* live end: the deepest (i==0) is running -> cur_sp; a mid-call frame -> the sp it called its callee at */
-        JSValue *live_end = (i == 0) ? otf->sf.cur_sp : oa[i - 1]->caller_sp;
+        JSValue *live_end = (i == 0) ? osf->cur_sp : oa[i - 1]->caller_sp;
 
-        JSObject *wp = JS_VALUE_GET_OBJ(otf->sf.cur_func);
-        JSFunctionBytecode *wb = wp->u.func.function_bytecode;
-        int wal = otf->sf.arg_count, wlc = wal + wb->var_count + wb->stack_size;
-        int arg_in_frame = (otf->sf.arg_buf >= otf->local_buf && otf->sf.arg_buf < otf->local_buf + wlc + 1);
         TrampFrame *ct = js_malloc(ctx, sizeof(TrampFrame));
         if (!ct) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }   /* OOM: partial leak on the abort path */
         ca[i] = ct;
         *ct = *otf;   /* scalars + BORROWED values (cur_func/this_val/new_target stay borrowed); fix pointers below */
-        ct->local_buf = js_malloc(ctx, sizeof(JSValue) * (wlc > 0 ? wlc : 1) + sizeof(JSVarRef *) * wb->var_ref_count);
-        if (!ct->local_buf) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
-        ptrdiff_t wlive = live_end - otf->local_buf;
-        for (ptrdiff_t k = 0; k < wlive; k++) ct->local_buf[k] = js_dup(otf->local_buf[k]);
-        ct->sf.arg_buf  = arg_in_frame ? XL(otf->sf.arg_buf, otf->local_buf, ct->local_buf)
-                                       : XL(otf->sf.arg_buf, cob, ccb);   /* borrowed from the caller's stack */
-        ct->sf.var_buf  = XL(otf->sf.var_buf, otf->local_buf, ct->local_buf);
-        ct->sf.var_refs = (JSVarRef **)XL((JSValue *)otf->sf.var_refs, otf->local_buf, ct->local_buf);
-        ct->sf.cur_sp   = (i == 0) ? XL(otf->sf.cur_sp, otf->local_buf, ct->local_buf) : NULL;   /* only deepest runs */
-        ct->sf.var_ref_count = otf->sf.var_ref_count;   /* share this frame's closed cells + take a ref */
-        for (int vi = 0; vi < otf->sf.var_ref_count; vi++) { ct->sf.var_refs[vi] = otf->sf.var_refs[vi]; if (ct->sf.var_refs[vi]) JS_REF_COUNT(ct->sf.var_refs[vi])++; }
-        ct->sf.prev_frame = NULL;
+
+        if (otf->async_data) {
+            /* ASYNC body on the chain: clone a FRESH async_data with its OWN return-promise capability. The fork
+               also cloned the caller's mid-OP_call (the async call site), so each arm re-derives and awaits ITS
+               OWN promise — no shared-promise conflict, so no promise-state-on-COW is needed. The body's live
+               state is as2->func_state.frame; the embedded ct->sf stays dead (resume reads via async_data). */
+            JSAsyncFunctionData *as = otf->async_data;
+            JSStackFrame *aof = &as->func_state.frame;
+            JSAsyncFunctionData *as2 = js_mallocz(ctx, sizeof(*as2));
+            if (!as2) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
+            JS_REF_COUNT(as2) = 1;
+            add_gc_object(ctx->rt, &as2->header, JS_GC_OBJ_TYPE_ASYNC_FUNCTION);
+            as2->is_active = true;
+            as2->resolving_funcs[0] = JS_UNDEFINED; as2->resolving_funcs[1] = JS_UNDEFINED;
+            JSValue aprom2 = JS_NewPromiseCapability(ctx, as2->resolving_funcs);
+            if (JS_IsException(aprom2)) { js_async_function_free(ctx->rt, as2); js_free(ctx, oa); js_free(ctx, ca); return NULL; }
+            if (clone_susp_frame(ctx, &as2->func_state.frame, aof, live_end - aof->arg_buf) < 0) {
+                JS_FreeValue(ctx, aprom2); js_async_function_free(ctx->rt, as2); js_free(ctx, oa); js_free(ctx, ca); return NULL;
+            }
+            as2->func_state.this_val = js_dup(as->func_state.this_val);
+            as2->func_state.argc = as->func_state.argc;
+            as2->func_state.throw_flag = as->func_state.throw_flag;
+            as2->func_state.tramp_top = NULL;
+            as2->func_state.frame.cur_sp = (i == 0) ? as2->func_state.frame.arg_buf + (osf->cur_sp - aof->arg_buf) : NULL;
+            ct->async_data = as2;
+            ct->async_promise = aprom2;        /* fresh capability's promise (owned by this frame) */
+            ct->local_buf = NULL; ct->b = NULL; /* async frame owns its buffers via as2->func_state */
+        } else {
+            DCHECK(otf->gen_data == NULL && otf->cont_kind == CONT_NONE,
+                   "clone_deep_flow: deep-fork of a generator / C-continuation frame not built");
+            JSFunctionBytecode *wb = JS_VALUE_GET_OBJ(otf->sf.cur_func)->u.func.function_bytecode;
+            int wal = otf->sf.arg_count, wlc = wal + wb->var_count + wb->stack_size;
+            int arg_in_frame = (otf->sf.arg_buf >= otf->local_buf && otf->sf.arg_buf < otf->local_buf + wlc + 1);
+            ct->local_buf = js_malloc(ctx, sizeof(JSValue) * (wlc > 0 ? wlc : 1) + sizeof(JSVarRef *) * wb->var_ref_count);
+            if (!ct->local_buf) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
+            ptrdiff_t wlive = live_end - otf->local_buf;
+            for (ptrdiff_t k = 0; k < wlive; k++) ct->local_buf[k] = js_dup(otf->local_buf[k]);
+            ct->sf.arg_buf  = arg_in_frame ? XL(otf->sf.arg_buf, otf->local_buf, ct->local_buf)
+                                           : XL(otf->sf.arg_buf, cob, ccb);   /* borrowed from the caller's stack */
+            ct->sf.var_buf  = XL(otf->sf.var_buf, otf->local_buf, ct->local_buf);
+            ct->sf.var_refs = (JSVarRef **)XL((JSValue *)otf->sf.var_refs, otf->local_buf, ct->local_buf);
+            ct->sf.cur_sp   = (i == 0) ? XL(otf->sf.cur_sp, otf->local_buf, ct->local_buf) : NULL;   /* only deepest runs */
+            ct->sf.var_ref_count = otf->sf.var_ref_count;   /* share this frame's closed cells + take a ref */
+            for (int vi = 0; vi < otf->sf.var_ref_count; vi++) { ct->sf.var_refs[vi] = otf->sf.var_refs[vi]; if (ct->sf.var_refs[vi]) JS_REF_COUNT(ct->sf.var_refs[vi])++; }
+            ct->sf.prev_frame = NULL;
+        }
         ct->up = (i == n - 1) ? NULL : ca[i + 1];
         ct->caller_sf        = caller_clone;
         ct->caller_local_buf = XL(otf->caller_local_buf, cob, ccb);
