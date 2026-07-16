@@ -18254,6 +18254,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     TrampFrame *tf_top = NULL;         /* heap stack of trampolined NORMAL callees (this activation's base = C stack) */
     int tramp_first = -1; uint8_t tramp_is_tail = 0;   /* set before goto do_tramp_call */
     int tramp_gen_magic = 0;                            /* set before goto do_generator_tramp */
+    int tramp_gen_forof = 1;                            /* <0 = for-of iterator stack offset (always -3-.. ); 1 = direct .next() (no valid offset is positive) */
     JSAsyncFunctionState *gen_state = NULL;   /* the generator/async base state IF this activation is preemptible */
 
 #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_STEP
@@ -19046,10 +19047,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                C-recursing async_func_resume; OP_yield / OP_return_async / exception -> do_generator_settle. The
                receiver + method + args sit on the caller stack at [call_argv-2 .. call_argv+call_argc). */
             {
-                JSValueConst gthis = call_argv[-2];
+                bool forof = (tramp_gen_forof < 0);   /* a real for-of offset is always negative (-3-..) */
+                int fofoff = tramp_gen_forof;
+                tramp_gen_forof = 1;   /* reset to the direct-call sentinel */
+                JSValueConst gthis = forof ? sp[fofoff] : call_argv[-2];
                 JSGeneratorData *gs = JS_VALUE_GET_OBJ(gthis)->u.generator_data;
                 int gmagic = tramp_gen_magic;
-                JSValueConst garg = (call_argc >= 1) ? call_argv[0] : JS_UNDEFINED;
+                JSValueConst garg = forof ? JS_UNDEFINED : ((call_argc >= 1) ? call_argv[0] : JS_UNDEFINED);
                 JSStackFrame *gsf = &gs->func_state.frame;
                 TrampFrame *gtf; JSObject *gfp; JSFunctionBytecode *gb;
                 bool run_body = true, do_throw = false;
@@ -19071,10 +19075,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                 }
                 if (!run_body) {
-                    /* COMPLETED / not-started throw|return: result is inline, no body run. */
+                    /* COMPLETED / not-started throw|return: result is inline, no body run. for-of only ever sends
+                       NEXT, so it lands here on COMPLETED -> {undefined, done:true} (loop ends). */
                     JSValue gv = (!do_throw && gmagic == GEN_MAGIC_RETURN) ? js_dup(garg) : JS_UNDEFINED;
                     JSValue thr = do_throw ? js_dup(garg) : JS_UNDEFINED;
                     JSValue giter;
+                    if (forof) {
+                        JS_FreeValue(ctx, gv);
+                        if (do_throw) { JS_Throw(ctx, thr); goto exception; }
+                        sp[0] = JS_UNDEFINED; sp[1] = JS_TRUE; sp += 2;
+                        BREAK;
+                    }
                     for (i = -2; i < call_argc; i++) JS_FreeValue(ctx, call_argv[i]);
                     sp = call_argv - 2;
                     if (do_throw) { JS_FreeValue(ctx, gv); JS_Throw(ctx, thr); goto exception; }
@@ -19084,13 +19095,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     BREAK;
                 }
                 gs->state = JS_GENERATOR_STATE_EXECUTING;
-                {   /* HOLD a ref to the generator OBJECT across the body run: for `g().next()` the stack receiver
-                       is the only ref, and gs is its opaque — freeing it before the body would UAF gs. */
-                    JSValue ghold = js_dup(gthis);
+                gtf = js_malloc_rt(rt, sizeof(TrampFrame));
+                if (unlikely(!gtf)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                if (forof) {
+                    /* the iterator STAYS on the caller stack (reused each loop) — no ref to hold, nothing to free;
+                       value+done are written above sp at settle. is_tail marks for-of mode. */
+                    gtf->async_promise = JS_UNDEFINED;
+                    gtf->caller_sp = sp;
+                    gtf->is_tail = 1;
+                } else {
+                    /* HOLD a ref to the generator across the body run: for `g().next()` the stack receiver is the
+                       only ref and gs is its opaque, so freeing it before the body would UAF gs. */
+                    gtf->async_promise = js_dup(gthis);
                     for (i = -2; i < call_argc; i++) JS_FreeValue(ctx, call_argv[i]);   /* free receiver+method+args */
-                    gtf = js_malloc_rt(rt, sizeof(TrampFrame));
-                    if (unlikely(!gtf)) { JS_FreeValue(ctx, ghold); JS_ThrowOutOfMemory(ctx); goto exception; }
-                    gtf->async_promise = ghold;   /* freed at do_generator_settle / exception when the body yields/ends */
+                    gtf->caller_sp = call_argv - 2;
+                    gtf->is_tail = 0;
                 }
                 gtf->up = tf_top;
                 gtf->caller_sf = sf; gtf->caller_b = b; gtf->caller_ctx = ctx;
@@ -19100,9 +19119,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 gtf->caller_var_refs = var_refs;
                 gtf->caller_argc = argc; gtf->caller_argv = argv;
                 gtf->caller_arg_allocated_size = arg_allocated_size;
-                gtf->caller_sp = call_argv - 2;
-                gtf->call_first = -2; gtf->call_argc = 0; gtf->is_tail = 0;
-                gtf->async_data = NULL;   /* async_promise already holds the generator ref (ghold) */
+                gtf->call_first = -2; gtf->call_argc = 0;
+                gtf->async_data = NULL;   /* async_promise holds ghold (direct) or UNDEFINED (for-of) */
                 gtf->gen_data = gs; gtf->gen_magic = (uint8_t)gmagic;
                 gtf->b = NULL; gtf->local_buf = NULL;   /* the body frame owns its buffers via gs->func_state */
                 gfp = JS_VALUE_GET_OBJ(gsf->cur_func);
@@ -19132,7 +19150,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 TrampFrame *gtf = tf_top;
                 JSGeneratorData *gs = gtf->gen_data;
-                JSValue ghold = gtf->async_promise;   /* the held generator-object ref */
+                JSValue ghold = gtf->async_promise;   /* held generator ref (direct) or UNDEFINED (for-of) */
+                bool forof = gtf->is_tail;
                 JSStackFrame *gsf = &gs->func_state.frame;
                 JSValue value, giter;
                 bool is_yield = (JS_VALUE_GET_TAG(ret_val) == JS_TAG_INT);
@@ -19147,7 +19166,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     free_generator_stack_rt(rt, gs);   /* completion: the frame is torn down; value survives (dup'd out) */
                     gdone = true;
                 }
-                giter = (gdone == 2) ? value : js_create_iterator_result(ctx, value, gdone);
                 rt->current_stack_frame = gtf->caller_sf;
                 tf_top = gtf->up;
                 sf = gtf->caller_sf; b = gtf->caller_b; ctx = gtf->caller_ctx;
@@ -19159,7 +19177,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 arg_allocated_size = gtf->caller_arg_allocated_size;
                 pc = sf->cur_pc; sp = gtf->caller_sp;
                 js_free_rt(rt, gtf);
-                JS_FreeValue(ctx, ghold);   /* drop the body-run ref; a suspended gen stays alive via the caller's ref */
+                JS_FreeValue(ctx, ghold);   /* direct: drop the body-run ref; for-of: UNDEFINED (iterator on stack) */
+                if (forof) {
+                    /* OP_for_of_next protocol: value at sp[0], done at sp[1], then sp += 2. A yield* (gdone==2)
+                       delivered an iterator-result object; unpack it into (value, done). */
+                    if (gdone == 2) {
+                        int d; JSValue v = JS_IteratorGetCompleteValue(ctx, value, &d);
+                        JS_FreeValue(ctx, value);
+                        if (JS_IsException(v)) goto exception;
+                        sp[0] = v; sp[1] = js_bool(d);
+                    } else {
+                        sp[0] = value; sp[1] = js_bool(gdone);
+                    }
+                    sp += 2;
+                    BREAK;
+                }
+                giter = (gdone == 2) ? value : js_create_iterator_result(ctx, value, gdone);
                 if (JS_IsException(giter)) goto exception;
                 *sp++ = giter;
                 BREAK;
@@ -19970,6 +20003,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int offset = -3 - pc[0];
                 pc += 1;
                 sf->cur_pc = pc;
+                /* a GENERATOR iterator's .next() runs its body on THIS chain (do_generator_tramp for-of mode) so a
+                   body loop preempts the base flow — never the C-recursion js_for_of_next -> JS_Call would use. */
+                if (tramp_gen_method_magic(sp[offset + 1], sp[offset]) == GEN_MAGIC_NEXT) {
+                    tramp_gen_magic = GEN_MAGIC_NEXT; tramp_gen_forof = offset; goto do_generator_tramp;
+                }
                 if (js_for_of_next(ctx, sp, offset))
                     goto exception;
                 sp += 2;
