@@ -11787,6 +11787,12 @@ static int JS_DefineGlobalVar(JSContext *ctx, JSAtom prop, int def_flags)
         return 0;
     if (!p->extensible)
         return 0;
+    /* Forced-exec: a top-level let/const/class/var DEFINITION on the shared global_var_obj/global_obj is
+       per-flow state. Capture the ABSENT baseline so cow_unapply DELETES this binding when the defining flow
+       switches out — else the creation leaks into snapshot-forked siblings, whose own re-definition then hits
+       the redeclaration check (JS_CheckDefineGlobalVar) and throws SyntaxError, killing the sibling and every
+       downstream fork it would have produced. The PUT/init path already captures; the DEFINE path must too. */
+    cow_capture(ctx, JS_MKPTR(JS_TAG_OBJECT, p), prop);
     pr = add_property(ctx, p, prop, flags);
     if (unlikely(!pr))
         return -1;
