@@ -18720,6 +18720,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 } else {
                 get_length_slow_path:
                     sf->cur_pc = pc;
+                    if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) {
+                        JSObject *g = tramp_bytecode_getter(JS_VALUE_GET_OBJ(sp[-1]), atom);
+                        if (g) {   /* a bytecode `get length()` -> 0-arg method call on THIS chain */
+                            *sp++ = js_dup(JS_MKPTR(JS_TAG_OBJECT, g));   /* stack: [receiver][getter] */
+                            call_argv = sp; call_argc = 0;
+                            tramp_first = -2; tramp_is_tail = 0;
+                            goto do_tramp_call;
+                        }
+                    }
                     val = JS_GetPropertyInternal(ctx, obj, atom, sp[-1], false);
                     if (unlikely(JS_IsException(val)))
                         goto exception;
