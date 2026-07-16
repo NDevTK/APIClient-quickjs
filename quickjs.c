@@ -44341,155 +44341,169 @@ static JSValue js_typed_array___speciesCreate(JSContext *ctx,
                                               int argc, JSValueConst *argv,
                                               bool require_mutable);
 
+/* Resumable state for js_array_every (forEach/every/some/map/filter). Factored so the per-element callback drive
+   becomes a coroutine STEP — the prerequisite for running the callback on the base tramp chain (a callback body
+   loop then preempts the base flow) instead of the C-recursive JS_Call. `pending_k` = the index whose callback
+   result is currently awaited (-1 = none); `val` = that element (freed once its result is processed). */
+typedef struct JSArrayEvery {
+    JSValue obj, ret, val;
+    int64_t len, k, n;
+    int special, pending_k;
+    JSValueConst func, this_arg;
+} JSArrayEvery;
+
+/* One coroutine step: PROCESS the previous callback's `res` (for element pending_k), then ADVANCE to the next
+   present element and fill out_args with (value, index, obj). Returns 1 = CALL (invoke func on out_args), 0 = DONE
+   (s->ret is the final result), -1 = EXCEPTION. Consumes `res`. Identical semantics to the original C loop. */
+static int js_array_every_step(JSContext *ctx, JSArrayEvery *s, JSValue res, JSValueConst out_args[3])
+{
+    if (s->pending_k >= 0) {
+        int64_t k = s->pending_k;
+        s->pending_k = -1;
+        switch (s->special) {
+        case special_every:
+        case special_every | special_TA:
+            if (!JS_ToBoolFree(ctx, res)) { s->ret = JS_FALSE; goto done; }
+            break;
+        case special_some:
+        case special_some | special_TA:
+            if (JS_ToBoolFree(ctx, res)) { s->ret = JS_TRUE; goto done; }
+            break;
+        case special_map:
+            if (JS_DefinePropertyValueInt64(ctx, s->ret, k, res, JS_PROP_C_W_E | JS_PROP_THROW) < 0) return -1;
+            break;
+        case special_map | special_TA:
+            if (JS_SetPropertyValue(ctx, s->ret, js_int32(k), res, JS_PROP_THROW) < 0) return -1;
+            break;
+        case special_filter:
+        case special_filter | special_TA:
+            if (JS_ToBoolFree(ctx, res)) {
+                if (JS_DefinePropertyValueInt64Const(ctx, s->ret, s->n++, s->val, JS_PROP_C_W_E | JS_PROP_THROW) < 0) return -1;
+            }
+            break;
+        default:
+            JS_FreeValue(ctx, res);
+            break;
+        }
+        JS_FreeValue(ctx, s->val);
+        s->val = JS_UNDEFINED;
+    }
+    while (s->k < s->len) {
+        int64_t k = s->k++;
+        int present;
+        JSValue val;
+        if (s->special & special_TA) {
+            val = JS_GetPropertyInt64(ctx, s->obj, k);
+            if (JS_IsException(val)) return -1;
+            present = true;
+        } else {
+            present = JS_TryGetPropertyInt64(ctx, s->obj, k, &val);
+            if (present < 0) return -1;
+        }
+        if (present) {
+            s->val = val;
+            s->pending_k = k;
+            out_args[0] = val;
+            out_args[1] = js_int64(k);
+            out_args[2] = s->obj;
+            return 1;
+        }
+    }
+done:
+    if (s->special == (special_filter | special_TA)) {
+        JSValue arr, res2;
+        JSValueConst a2[2];
+        a2[0] = s->obj;
+        a2[1] = js_int32(s->n);
+        arr = js_typed_array___speciesCreate(ctx, JS_UNDEFINED, 2, a2, true);
+        if (JS_IsException(arr)) return -1;
+        a2[0] = s->ret;
+        res2 = JS_Invoke(ctx, arr, JS_ATOM_set, 1, a2);
+        if (check_exception_free(ctx, res2)) { JS_FreeValue(ctx, arr); return -1; }
+        JS_FreeValue(ctx, s->ret);
+        s->ret = arr;
+    }
+    return 0;
+}
+
 static JSValue js_array_every(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv, int special)
 {
-    JSValue obj, val, index_val, res, ret;
+    JSArrayEvery s;
     JSValueConst args[3];
-    JSValueConst func, this_arg;
-    int64_t len, k, n;
-    int present;
+    JSValue res = JS_UNDEFINED;
+    int st;
 
-    ret = JS_UNDEFINED;
-    val = JS_UNDEFINED;
+    s.obj = JS_UNDEFINED; s.ret = JS_UNDEFINED; s.val = JS_UNDEFINED;
+    s.len = 0; s.k = 0; s.n = 0; s.special = special; s.pending_k = -1;
     if (special & special_TA) {
-        obj = js_dup(this_val);
-        len = js_typed_array_get_length_unsafe(ctx, obj);
-        if (len < 0)
+        s.obj = js_dup(this_val);
+        s.len = js_typed_array_get_length_unsafe(ctx, s.obj);
+        if (s.len < 0)
             goto exception;
     } else {
-        obj = JS_ToObject(ctx, this_val);
-        if (js_get_length64(ctx, &len, obj))
+        s.obj = JS_ToObject(ctx, this_val);
+        if (js_get_length64(ctx, &s.len, s.obj))
             goto exception;
     }
-    func = argv[0];
-    this_arg = JS_UNDEFINED;
-    if (argc > 1)
-        this_arg = argv[1];
-
-    if (check_function(ctx, func))
+    s.func = argv[0];
+    s.this_arg = (argc > 1) ? argv[1] : JS_UNDEFINED;
+    if (check_function(ctx, s.func))
         goto exception;
 
     switch (special) {
     case special_every:
     case special_every | special_TA:
-        ret = JS_TRUE;
+        s.ret = JS_TRUE;
         break;
     case special_some:
     case special_some | special_TA:
-        ret = JS_FALSE;
+        s.ret = JS_FALSE;
         break;
     case special_map:
-        /* XXX: JS_ArraySpeciesCreate should take int64_t */
-        ret = JS_ArraySpeciesCreate(ctx, obj, js_int64(len));
-        if (JS_IsException(ret))
+        s.ret = JS_ArraySpeciesCreate(ctx, s.obj, js_int64(s.len));
+        if (JS_IsException(s.ret))
             goto exception;
         break;
     case special_filter:
-        ret = JS_ArraySpeciesCreate(ctx, obj, js_int32(0));
-        if (JS_IsException(ret))
+        s.ret = JS_ArraySpeciesCreate(ctx, s.obj, js_int32(0));
+        if (JS_IsException(s.ret))
             goto exception;
         break;
     case special_map | special_TA:
-        args[0] = obj;
-        args[1] = js_int32(len);
-        ret = js_typed_array___speciesCreate(ctx, JS_UNDEFINED, 2, args, true);
-        if (JS_IsException(ret))
+        args[0] = s.obj;
+        args[1] = js_int32(s.len);
+        s.ret = js_typed_array___speciesCreate(ctx, JS_UNDEFINED, 2, args, true);
+        if (JS_IsException(s.ret))
             goto exception;
         break;
     case special_filter | special_TA:
-        ret = JS_NewArray(ctx);
-        if (JS_IsException(ret))
+        s.ret = JS_NewArray(ctx);
+        if (JS_IsException(s.ret))
             goto exception;
         break;
     }
-    n = 0;
 
-    for(k = 0; k < len; k++) {
-        if (special & special_TA) {
-            val = JS_GetPropertyInt64(ctx, obj, k);
-            if (JS_IsException(val))
-                goto exception;
-            present = true;
-        } else {
-            present = JS_TryGetPropertyInt64(ctx, obj, k, &val);
-            if (present < 0)
-                goto exception;
-        }
-        if (present) {
-            index_val = js_int64(k);
-            args[0] = val;
-            args[1] = index_val;
-            args[2] = obj;
-            res = JS_Call(ctx, func, this_arg, 3, args);
-            JS_FreeValue(ctx, index_val);
-            if (JS_IsException(res))
-                goto exception;
-            switch (special) {
-            case special_every:
-            case special_every | special_TA:
-                if (!JS_ToBoolFree(ctx, res)) {
-                    ret = JS_FALSE;
-                    goto done;
-                }
-                break;
-            case special_some:
-            case special_some | special_TA:
-                if (JS_ToBoolFree(ctx, res)) {
-                    ret = JS_TRUE;
-                    goto done;
-                }
-                break;
-            case special_map:
-                if (JS_DefinePropertyValueInt64(ctx, ret, k, res,
-                                                JS_PROP_C_W_E | JS_PROP_THROW) < 0)
-                    goto exception;
-                break;
-            case special_map | special_TA:
-                if (JS_SetPropertyValue(ctx, ret, js_int32(k), res, JS_PROP_THROW) < 0)
-                    goto exception;
-                break;
-            case special_filter:
-            case special_filter | special_TA:
-                if (JS_ToBoolFree(ctx, res)) {
-                    if (JS_DefinePropertyValueInt64Const(ctx, ret, n++, val,
-                                                         JS_PROP_C_W_E | JS_PROP_THROW) < 0)
-                        goto exception;
-                }
-                break;
-            default:
-                JS_FreeValue(ctx, res);
-                break;
-            }
-            JS_FreeValue(ctx, val);
-            val = JS_UNDEFINED;
-        }
-    }
-done:
-    if (special == (special_filter | special_TA)) {
-        JSValue arr;
-        args[0] = obj;
-        args[1] = js_int32(n);
-        arr = js_typed_array___speciesCreate(ctx, JS_UNDEFINED, 2, args, true);
-        if (JS_IsException(arr))
+    for (;;) {
+        st = js_array_every_step(ctx, &s, res, args);   /* consumes res */
+        res = JS_UNDEFINED;
+        if (st < 0)
             goto exception;
-        args[0] = ret;
-        res = JS_Invoke(ctx, arr, JS_ATOM_set, 1, args);
-        if (check_exception_free(ctx, res)) {
-            JS_FreeValue(ctx, arr);
+        if (st == 0)
+            break;
+        res = JS_Call(ctx, s.func, s.this_arg, 3, args);
+        if (JS_IsException(res))
             goto exception;
-        }
-        JS_FreeValue(ctx, ret);
-        ret = arr;
     }
-    JS_FreeValue(ctx, val);
-    JS_FreeValue(ctx, obj);
-    return ret;
+    JS_FreeValue(ctx, s.val);
+    JS_FreeValue(ctx, s.obj);
+    return s.ret;
 
 exception:
-    JS_FreeValue(ctx, ret);
-    JS_FreeValue(ctx, val);
-    JS_FreeValue(ctx, obj);
+    JS_FreeValue(ctx, res);
+    JS_FreeValue(ctx, s.ret);
+    JS_FreeValue(ctx, s.val);
+    JS_FreeValue(ctx, s.obj);
     return JS_EXCEPTION;
 }
 
