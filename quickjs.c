@@ -18125,6 +18125,13 @@ typedef struct TrampFrame {
        gen_data->func_state.frame IS this frame's sf (like async_data). gen_magic is NEXT/RETURN/THROW. */
     struct JSGeneratorData *gen_data;
     uint8_t gen_magic;
+    /* C-CONTINUATION frame: a C builtin whose iteration drives a JS callback (forEach/map/every/some/filter) runs
+       its loop HERE on the chain instead of C-recursing JS_Call. iter_state holds the builtin's resumable state
+       (JSArrayEvery). This frame has NO bytecode (b==NULL); its local_buf is a small stack holding the next
+       callback + its args. When the callback frame above it returns, do_return re-enters js_array_every_step with
+       the result (do_array_iter_step) instead of dispatching bytecode. The callback runs with gen_state unchanged
+       (the base), so a callback BODY LOOP preempts the BASE flow at any depth — never drive-to-completion. */
+    struct JSArrayEvery *iter_state;
 } TrampFrame;
 
 /* Only a NORMAL bytecode function trampolines (the common deep-recursion case). */
@@ -18949,7 +18956,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 new_target = JS_UNDEFINED;
                 ntf->this_val = this_obj; ntf->new_target = new_target;
                 ntf->arg_allocated = narg_alloc; ntf->callee_argc = eff_argc;
-                ntf->async_data = NULL; ntf->async_promise = JS_UNDEFINED; ntf->gen_data = NULL;   /* NORMAL frame */
+                ntf->async_data = NULL; ntf->async_promise = JS_UNDEFINED; ntf->gen_data = NULL; ntf->iter_state = NULL;   /* NORMAL frame */
                 sf = nsf; b = nb; ctx = nb->realm;
                 arg_buf = narg_buf; var_buf = nvar_buf; stack_buf = nstack_buf;
                 var_refs = np->u.func.var_refs;
@@ -19001,7 +19008,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 for (i = -1; i < call_argc; i++) JS_FreeValue(ctx, call_argv[i]);
                 atf->caller_sp = call_argv - 1;
                 atf->call_first = -1; atf->call_argc = 0; atf->is_tail = tramp_is_tail;
-                atf->async_data = as; atf->async_promise = aprom; atf->gen_data = NULL;
+                atf->async_data = as; atf->async_promise = aprom; atf->gen_data = NULL; atf->iter_state = NULL;
                 atf->b = NULL; atf->local_buf = NULL;   /* async frame owns its buffers via as->func_state */
                 /* enter the async body frame (mirror the generator-resume entry; gen_state stays the base) */
                 asf = &as->func_state.frame;
@@ -19137,7 +19144,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 gtf->caller_arg_allocated_size = arg_allocated_size;
                 gtf->call_first = -2; gtf->call_argc = 0;
                 gtf->async_data = NULL;   /* async_promise holds ghold (direct) or UNDEFINED (for-of) */
-                gtf->gen_data = gs; gtf->gen_magic = (uint8_t)gmagic;
+                gtf->gen_data = gs; gtf->gen_magic = (uint8_t)gmagic; gtf->iter_state = NULL;
                 gtf->b = NULL; gtf->local_buf = NULL;   /* the body frame owns its buffers via gs->func_state */
                 gfp = JS_VALUE_GET_OBJ(gsf->cur_func);
                 gb = gfp->u.func.function_bytecode;
@@ -19244,7 +19251,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 gtf->caller_sp = call_argv + tramp_first;   /* below func(+this)+args; the generator object goes here */
                 gtf->call_first = -1; gtf->call_argc = 0; gtf->is_tail = tramp_is_tail;
                 gtf->async_data = NULL;
-                gtf->gen_data = s; gtf->gen_magic = 0xFF;   /* 0xFF = CREATING (run-to-initial_yield), not a GEN_MAGIC */
+                gtf->gen_data = s; gtf->gen_magic = 0xFF; gtf->iter_state = NULL;   /* 0xFF = CREATING (run-to-initial_yield), not a GEN_MAGIC */
                 gtf->b = NULL; gtf->local_buf = NULL;
                 gsf = &s->func_state.frame;
                 gfp = JS_VALUE_GET_OBJ(gsf->cur_func);
@@ -44426,64 +44433,82 @@ done:
     return 0;
 }
 
+/* Initialize the resumable state (the pre-loop setup: obj/len/func/this_arg + the per-special `ret` seed).
+   Returns 0 = ok, -1 = exception (state is safe to js_array_every_end). Shared by the plain C driver
+   (js_array_every) and the tramp-chain coroutine (do_array_iter_tramp) — ONE source of truth. */
+static int js_array_every_init(JSContext *ctx, JSArrayEvery *s, JSValueConst this_val,
+                               int argc, JSValueConst *argv, int special)
+{
+    JSValueConst args[2];
+
+    s->obj = JS_UNDEFINED; s->ret = JS_UNDEFINED; s->val = JS_UNDEFINED;
+    s->len = 0; s->k = 0; s->n = 0; s->special = special; s->pending_k = -1;
+    if (special & special_TA) {
+        s->obj = js_dup(this_val);
+        s->len = js_typed_array_get_length_unsafe(ctx, s->obj);
+        if (s->len < 0)
+            return -1;
+    } else {
+        s->obj = JS_ToObject(ctx, this_val);
+        if (js_get_length64(ctx, &s->len, s->obj))
+            return -1;
+    }
+    s->func = argv[0];
+    s->this_arg = (argc > 1) ? argv[1] : JS_UNDEFINED;
+    if (check_function(ctx, s->func))
+        return -1;
+
+    switch (special) {
+    case special_every:
+    case special_every | special_TA:
+        s->ret = JS_TRUE;
+        break;
+    case special_some:
+    case special_some | special_TA:
+        s->ret = JS_FALSE;
+        break;
+    case special_map:
+        s->ret = JS_ArraySpeciesCreate(ctx, s->obj, js_int64(s->len));
+        if (JS_IsException(s->ret)) return -1;
+        break;
+    case special_filter:
+        s->ret = JS_ArraySpeciesCreate(ctx, s->obj, js_int32(0));
+        if (JS_IsException(s->ret)) return -1;
+        break;
+    case special_map | special_TA:
+        args[0] = s->obj;
+        args[1] = js_int32(s->len);
+        s->ret = js_typed_array___speciesCreate(ctx, JS_UNDEFINED, 2, args, true);
+        if (JS_IsException(s->ret)) return -1;
+        break;
+    case special_filter | special_TA:
+        s->ret = JS_NewArray(ctx);
+        if (JS_IsException(s->ret)) return -1;
+        break;
+    }
+    return 0;
+}
+
+/* Release the transient state. The caller takes s->ret on success (pass take_ret=true); on failure it is freed. */
+static void js_array_every_end(JSContext *ctx, JSArrayEvery *s, bool take_ret)
+{
+    if (!take_ret)
+        JS_FreeValue(ctx, s->ret);
+    JS_FreeValue(ctx, s->val);
+    JS_FreeValue(ctx, s->obj);
+    s->ret = JS_UNDEFINED; s->val = JS_UNDEFINED; s->obj = JS_UNDEFINED;
+}
+
 static JSValue js_array_every(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv, int special)
 {
     JSArrayEvery s;
     JSValueConst args[3];
-    JSValue res = JS_UNDEFINED;
+    JSValue res = JS_UNDEFINED, ret;
     int st;
 
-    s.obj = JS_UNDEFINED; s.ret = JS_UNDEFINED; s.val = JS_UNDEFINED;
-    s.len = 0; s.k = 0; s.n = 0; s.special = special; s.pending_k = -1;
-    if (special & special_TA) {
-        s.obj = js_dup(this_val);
-        s.len = js_typed_array_get_length_unsafe(ctx, s.obj);
-        if (s.len < 0)
-            goto exception;
-    } else {
-        s.obj = JS_ToObject(ctx, this_val);
-        if (js_get_length64(ctx, &s.len, s.obj))
-            goto exception;
-    }
-    s.func = argv[0];
-    s.this_arg = (argc > 1) ? argv[1] : JS_UNDEFINED;
-    if (check_function(ctx, s.func))
+    if (js_array_every_init(ctx, &s, this_val, argc, argv, special))
         goto exception;
-
-    switch (special) {
-    case special_every:
-    case special_every | special_TA:
-        s.ret = JS_TRUE;
-        break;
-    case special_some:
-    case special_some | special_TA:
-        s.ret = JS_FALSE;
-        break;
-    case special_map:
-        s.ret = JS_ArraySpeciesCreate(ctx, s.obj, js_int64(s.len));
-        if (JS_IsException(s.ret))
-            goto exception;
-        break;
-    case special_filter:
-        s.ret = JS_ArraySpeciesCreate(ctx, s.obj, js_int32(0));
-        if (JS_IsException(s.ret))
-            goto exception;
-        break;
-    case special_map | special_TA:
-        args[0] = s.obj;
-        args[1] = js_int32(s.len);
-        s.ret = js_typed_array___speciesCreate(ctx, JS_UNDEFINED, 2, args, true);
-        if (JS_IsException(s.ret))
-            goto exception;
-        break;
-    case special_filter | special_TA:
-        s.ret = JS_NewArray(ctx);
-        if (JS_IsException(s.ret))
-            goto exception;
-        break;
-    }
-
     for (;;) {
         st = js_array_every_step(ctx, &s, res, args);   /* consumes res */
         res = JS_UNDEFINED;
@@ -44495,15 +44520,13 @@ static JSValue js_array_every(JSContext *ctx, JSValueConst this_val,
         if (JS_IsException(res))
             goto exception;
     }
-    JS_FreeValue(ctx, s.val);
-    JS_FreeValue(ctx, s.obj);
-    return s.ret;
+    ret = s.ret;
+    js_array_every_end(ctx, &s, true);
+    return ret;
 
 exception:
     JS_FreeValue(ctx, res);
-    JS_FreeValue(ctx, s.ret);
-    JS_FreeValue(ctx, s.val);
-    JS_FreeValue(ctx, s.obj);
+    js_array_every_end(ctx, &s, false);
     return JS_EXCEPTION;
 }
 
