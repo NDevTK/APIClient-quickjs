@@ -47920,7 +47920,7 @@ static JSValue js_string_replace(JSContext *ctx, JSValueConst this_val,
             args[0] = search_str;
             args[1] = js_int32(pos);
             args[2] = str;
-            repl_str = JS_ToStringFree(ctx, JS_Call(ctx, replaceValue, JS_UNDEFINED, 3, args));
+            repl_str = JS_ToStringFree(ctx, js_call_as_flow(ctx, replaceValue, JS_UNDEFINED, 3, args));   /* hook: replacer body preemptible */
         } else {
             args[0] = search_str;
             args[1] = str;
@@ -51472,7 +51472,7 @@ static JSValue internalize_json_property(JSContext *ctx, JSValueConst holder,
     args[0] = name_val;
     args[1] = val;
     args[2] = context;
-    res = JS_Call(ctx, reviver, holder, 3, args);
+    res = js_call_as_flow(ctx, reviver, holder, 3, args);   /* hook: reviver body preemptible */
     JS_FreeValue(ctx, name_val);
     JS_FreeValue(ctx, val);
     JS_FreeValue(ctx, context);
@@ -51632,7 +51632,7 @@ static JSValue js_json_check(JSContext *ctx, JSONStringifyContext *jsc,
     if (!JS_IsUndefined(jsc->replacer_func)) {
         args[0] = key;
         args[1] = val;
-        v = JS_Call(ctx, jsc->replacer_func, holder, 2, args);
+        v = js_call_as_flow(ctx, jsc->replacer_func, holder, 2, args);   /* hook: replacer body preemptible */
         JS_FreeValue(ctx, val);
         val = v;
         if (JS_IsException(val))
