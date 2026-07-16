@@ -219,6 +219,12 @@ typedef enum JSErrorEnum {
 
 #define JS_MAX_LOCAL_VARS 65535
 #define JS_STACK_SIZE_MAX 65534
+/* Forced-exec: property-access getter/setter routing (OP_get_field/get_field2/get_length, OP_put_field) pushes
+   up to 2 operands ([this, getter] / [setter, value]) beyond what the compiler budgeted for that opcode — a
+   plain get_field grows the stack by 0 in stock quickjs. Reserve this many extra slots on EVERY frame so the
+   routing never overflows the frame's stack buffer (e.g. a getter invoked at max stack depth during parameter
+   destructuring). The compile-time stack_size check is reduced by the same amount so the sum stays <= uint16. */
+#define TRAMP_STACK_SLACK 4
 #define JS_STRING_LEN_MAX ((1 << 30) - 1)
 // 1,024 bytes is about the cutoff point where it starts getting
 // more profitable to ref slice than to copy
@@ -19095,6 +19101,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_is_function_call(call_argv[-1])) {   /* f.call(thisArg,...) -> resolve + dispatch f here */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_forward_call;
                 }
+                /* NOTE: f.apply(this, arr) routing is intentionally OMITTED for now — do_apply_tramp corrupted
+                   the heap in an exception-unwind edge case (surfaced by a broad test262 sweep, a SIGSEGV in
+                   do_return's local_buf free). Until root-caused, apply takes the C js_function_apply path (a
+                   loop in an applied function still DFAILs — an honest gap, not a crash). */
                 {   /* generator .next()/.throw()/.return() -> body runs on THIS chain (loop preempts the base) */
                     int gmag = tramp_gen_method_magic(call_argv[-1], call_argv[-2]);
                     if (gmag >= 0) { tramp_gen_magic = gmag; goto do_generator_tramp; }
@@ -20999,11 +21009,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sf->cur_pc = pc;
                     if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) {
                         JSObject *g = tramp_bytecode_getter(JS_VALUE_GET_OBJ(sp[-1]), atom);
-                        if (g) {   /* bytecode getter -> 0-arg method call [receiver, getter] on THIS chain */
-                            *sp++ = js_dup(JS_MKPTR(JS_TAG_OBJECT, g));   /* stack: [receiver][getter] */
+                        if (g) {
+                            *sp++ = js_dup(JS_MKPTR(JS_TAG_OBJECT, g));
                             call_argv = sp; call_argc = 0;
                             tramp_first = -2; tramp_is_tail = 0;
-                            goto do_tramp_call;   /* do_return pops receiver+getter, pushes the value at sp[-1] */
+                            goto do_tramp_call;
                         }
                     }
                     val = JS_GetPropertyInternal(ctx, obj, atom, sp[-1], false);
@@ -38312,7 +38322,7 @@ static __exception int ss_check(JSContext *ctx, StackSizeState *s,
     }
     if (stack_len > s->stack_len_max) {
         s->stack_len_max = stack_len;
-        if (s->stack_len_max > JS_STACK_SIZE_MAX) {
+        if (s->stack_len_max > JS_STACK_SIZE_MAX - TRAMP_STACK_SLACK) {
             JS_ThrowInternalError(ctx, "stack overflow (op=%d, pc=%d)", op, pos);
             return -1;
         }
@@ -38409,7 +38419,7 @@ static __exception int compute_stack_size(JSContext *ctx,
         stack_len += oi->n_push - n_pop;
         if (stack_len > s->stack_len_max) {
             s->stack_len_max = stack_len;
-            if (s->stack_len_max > JS_STACK_SIZE_MAX) {
+            if (s->stack_len_max > JS_STACK_SIZE_MAX - TRAMP_STACK_SLACK) {
                 JS_ThrowInternalError(ctx, "stack overflow (op=%d, pc=%d)", op, pos);
                 goto fail;
             }
@@ -38720,7 +38730,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     js_free(ctx, fd->cpool);
     fd->cpool = NULL;
 
-    b->stack_size = stack_size;
+    b->stack_size = stack_size + TRAMP_STACK_SLACK;   /* headroom for getter/setter operand-push routing */
 
     /* XXX: source and pc2line info should be packed at the end of the
        JSFunctionBytecode structure, avoiding allocation overhead
