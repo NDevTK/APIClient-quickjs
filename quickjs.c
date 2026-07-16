@@ -18499,6 +18499,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSValueConst con_func = JS_UNDEFINED, con_ntgt = JS_UNDEFINED;
     JSValueConst *con_args = NULL; int con_argc = 0;
     uint8_t con_from_super = 0; JSValue con_super_ref = JS_UNDEFINED;
+    /* apply/spread trampoline (do_apply_tramp): set by the .apply method call or the OP_apply spread before goto.
+       ap_cfirst/ap_cargc parameterize do_return's operand cleanup for the two operand shapes. */
+    JSValueConst ap_func = JS_UNDEFINED, ap_this = JS_UNDEFINED, ap_array = JS_UNDEFINED;
+    int ap_cfirst = -2, ap_cargc = 0;
     /* array-iteration coroutine (do_array_iter_tramp): tramp_iter_state is handed to the callback frame that
        do_tramp_call pushes, so its do_return re-enters js_array_every_step instead of returning to bytecode. */
     void *tramp_cont_state = NULL, *cont_st = NULL;
@@ -19131,6 +19135,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JSValueConst aa = (call_argc >= 2) ? call_argv[1] : JS_UNDEFINED;
                     int atag = JS_VALUE_GET_TAG(aa);
                     if (atag == JS_TAG_UNDEFINED || atag == JS_TAG_NULL || atag == JS_TAG_OBJECT) {
+                        ap_func = call_argv[-2];
+                        ap_this = (call_argc >= 1) ? call_argv[0] : JS_UNDEFINED;
+                        ap_array = aa; ap_cfirst = -2; ap_cargc = call_argc;
                         tramp_is_tail = (opcode == OP_tail_call_method); goto do_apply_tramp;
                     }
                 }
@@ -19171,6 +19178,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc += 2;
                 sf->cur_pc = pc;
 
+                if (magic == 0 && tramp_can_call(sp[-3])) {   /* f(...arr) / f.apply-spread, f NORMAL -> body on THIS chain */
+                    int atag = JS_VALUE_GET_TAG(sp[-1]);   /* the spread array */
+                    if (atag == JS_TAG_UNDEFINED || atag == JS_TAG_NULL || atag == JS_TAG_OBJECT) {
+                        ap_func = sp[-3]; ap_this = sp[-2]; ap_array = sp[-1];
+                        ap_cfirst = -2; ap_cargc = 1;   /* caller_sp=sp; do_return frees [func,this,array]=sp[-3..-1], pushes result */
+                        tramp_is_tail = 0; goto do_apply_tramp;
+                    }
+                }
                 ret_val = js_function_apply(ctx, sp[-3], 2, vc(&sp[-2]), magic);
                 if (unlikely(JS_IsException(ret_val)))
                     goto exception;
@@ -19382,9 +19397,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                exactly like a method call. The callee's arg_count comes from the ARRAY (callee_argc), decoupled
                from the operand count (call_argc). */
             {
-                JSValueConst nfunc = call_argv[-2];
-                JSValueConst thisArg = (call_argc >= 1) ? call_argv[0] : JS_UNDEFINED;
-                JSValueConst arrayArg = (call_argc >= 2) ? call_argv[1] : JS_UNDEFINED;
+                JSValueConst nfunc = ap_func;
+                JSValueConst thisArg = ap_this;
+                JSValueConst arrayArg = ap_array;
                 JSObject *np = JS_VALUE_GET_OBJ(nfunc);
                 JSFunctionBytecode *nb = np->u.func.function_bytecode;
                 uint32_t alen = 0; JSValue *atab = NULL;
@@ -19411,7 +19426,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 ntf->caller_argc = argc; ntf->caller_argv = argv;
                 ntf->caller_arg_allocated_size = arg_allocated_size;
                 ntf->caller_sp = sp;
-                ntf->call_first = -2; ntf->call_argc = call_argc; ntf->is_tail = tramp_is_tail;
+                ntf->call_first = ap_cfirst; ntf->call_argc = ap_cargc; ntf->is_tail = tramp_is_tail;
                 ntf->b = nb; ntf->ctx = nb->realm; ntf->local_buf = nlb;
                 nsf = &ntf->sf;
                 nsf->is_strict_mode = nb->is_strict_mode;
