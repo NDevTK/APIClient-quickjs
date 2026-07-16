@@ -18974,8 +18974,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 sf->cur_pc = pc; sf->cur_sp = sp;   /* the async frame state js_async_function_post reads */
                 ok = js_async_function_post(ctx, as, ret_val);
                 js_async_function_free(rt, as);     /* drop the creation ref; a suspended continuation keeps its own */
-                /* pop: the async frame's buffers belong to `as` (freed by post/terminate) — free ONLY the TrampFrame */
-                rt->current_stack_frame = sf->prev_frame;
+                /* pop: the async frame's buffers belong to `as` (freed by post/terminate on completion) — so read the
+                   caller frame from atf (NOT sf->prev_frame, which would be a use-after-free of the freed async frame;
+                   the async frame's prev_frame IS atf->caller_sf, set when it was pushed). Free ONLY the TrampFrame. */
+                rt->current_stack_frame = atf->caller_sf;
                 tf_top = atf->up;
                 sf = atf->caller_sf; b = atf->caller_b; ctx = atf->caller_ctx;
                 local_buf = atf->caller_local_buf; stack_buf = atf->caller_stack_buf;
