@@ -18176,6 +18176,16 @@ static inline bool tramp_can_call(JSValueConst func) {
     if (fp->class_id != JS_CLASS_BYTECODE_FUNCTION) return false;
     return fp->u.func.function_bytecode->func_kind == JS_FUNC_NORMAL;
 }
+/* A BOUND function (f.bind(t, ...a)) whose DIRECT target is a normal bytecode fn: do_bound_tramp assembles the
+   bound args ++ the call args into the target's frame and dispatches it on the chain, so a loop in the bound
+   target preempts. Nested binds (target itself bound) / native targets fall back to js_call_bound_function. */
+static inline bool tramp_can_call_bound(JSValueConst func) {
+    JSObject *fp;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
+    fp = JS_VALUE_GET_OBJ(func);
+    if (fp->class_id != JS_CLASS_BOUND_FUNCTION) return false;
+    return tramp_can_call(fp->u.bound_function->func_obj);
+}
 /* A bytecode CONSTRUCTOR (`new C()`) runs its body on the caller's tramp chain (do_construct_tramp) so a loop
    in the constructor body preempts the base flow at any depth — never a C-recursion through
    JS_CallConstructorInternal that would drive it to completion. Native/bound/proxy constructors have no
@@ -19043,6 +19053,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_agen_create(call_argv[-1])) {   /* async generator ag() -> params-to-initial_yield here */
                     tramp_first = -1; tramp_is_tail = (opcode == OP_tail_call); goto do_agen_create_tramp;
                 }
+                if (tramp_can_call_bound(call_argv[-1])) {   /* f.bind(...)(...) -> assemble bound+call args, dispatch target */
+                    tramp_is_tail = (opcode == OP_tail_call); goto do_bound_tramp;
+                }
                 ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
                                           JS_UNDEFINED, call_argc,
                                           vc(call_argv), 0);
@@ -19420,6 +19433,73 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 rt->current_stack_frame = nsf;
                 tf_top = ntf;
                 this_obj = thisArg;   /* borrowed from the caller stack; freed by do_return's operand cleanup */
+                new_target = JS_UNDEFINED;
+                ntf->this_val = this_obj; ntf->new_target = new_target;
+                ntf->arg_allocated = narg_alloc; ntf->callee_argc = eff_argc;
+                ntf->async_data = NULL; ntf->async_promise = JS_UNDEFINED; ntf->gen_data = NULL;
+                ntf->cont_state = NULL; ntf->cont_kind = CONT_NONE;
+                sf = nsf; b = nb; ctx = nb->realm;
+                arg_buf = narg_buf; var_buf = nvar_buf; stack_buf = nstack_buf;
+                var_refs = np->u.func.var_refs;
+                argc = eff_argc; argv = (JSValueConst *)narg_buf;
+                arg_allocated_size = narg_alloc;
+                local_buf = nlb; sp = nstack_buf; pc = nb->byte_code_buf;
+                goto restart;
+            }
+
+        do_bound_tramp:
+            /* boundfn(...callArgs), boundfn = target.bind(thisVal, ...boundArgs), target a NORMAL bytecode fn.
+               Mirrors do_apply_tramp: assemble boundArgs ++ callArgs into the target's OWN arg_buf (the total is
+               arbitrary), this = bf->this_val (borrowed — the bound-function object stays live on the caller
+               stack until do_return frees it). Operand shape is the plain-call shape [boundfn, callArgs…]:
+               boundfn = call_argv[-1], call_first = -1; do_return frees boundfn + callArgs and pushes the result. */
+            {
+                JSObject *bp = JS_VALUE_GET_OBJ(call_argv[-1]);
+                JSBoundFunction *bf = bp->u.bound_function;
+                JSValueConst nfunc = bf->func_obj;
+                JSObject *np = JS_VALUE_GET_OBJ(nfunc);
+                JSFunctionBytecode *nb = np->u.func.function_bytecode;
+                int nbound = bf->argc;
+                int eff_argc = nbound + call_argc;
+                int narg_alloc = (eff_argc < nb->arg_count) ? nb->arg_count : eff_argc;
+                size_t asize = sizeof(JSValue) * (narg_alloc + nb->var_count + nb->stack_size)
+                             + sizeof(JSVarRef *) * nb->var_ref_count;
+                TrampFrame *ntf; JSValue *nlb, *narg_buf, *nvar_buf, *nstack_buf; JSStackFrame *nsf; int k;
+                ntf = js_malloc_rt(rt, sizeof(TrampFrame));
+                if (unlikely(!ntf)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                nlb = js_malloc_rt(rt, asize ? asize : sizeof(JSValue));
+                if (unlikely(!nlb)) { js_free_rt(rt, ntf); JS_ThrowOutOfMemory(ctx); goto exception; }
+                ntf->up = tf_top;
+                ntf->caller_sf = sf; ntf->caller_b = b; ntf->caller_ctx = ctx;
+                ntf->caller_local_buf = local_buf; ntf->caller_stack_buf = stack_buf;
+                ntf->caller_var_buf = var_buf; ntf->caller_arg_buf = arg_buf;
+                ntf->caller_this = this_obj; ntf->caller_new_target = new_target;
+                ntf->caller_var_refs = var_refs;
+                ntf->caller_argc = argc; ntf->caller_argv = argv;
+                ntf->caller_arg_allocated_size = arg_allocated_size;
+                ntf->caller_sp = sp;
+                ntf->call_first = -1; ntf->call_argc = call_argc; ntf->is_tail = tramp_is_tail;
+                ntf->b = nb; ntf->ctx = nb->realm; ntf->local_buf = nlb;
+                nsf = &ntf->sf;
+                nsf->is_strict_mode = nb->is_strict_mode;
+                nsf->cur_func = unsafe_unconst(nfunc);
+                narg_buf = nlb;
+                for (k = 0; k < nbound; k++) narg_buf[k] = js_dup(bf->argv[k]);            /* bound args first */
+                for (k = 0; k < call_argc; k++) narg_buf[nbound + k] = js_dup(call_argv[k]);  /* then call args */
+                for (k = eff_argc; k < narg_alloc; k++) narg_buf[k] = JS_UNDEFINED;
+                nsf->arg_count = narg_alloc;
+                nvar_buf = nlb + narg_alloc;
+                for (k = 0; k < nb->var_count; k++) nvar_buf[k] = JS_UNDEFINED;
+                nstack_buf = nvar_buf + nb->var_count;
+                nsf->arg_buf = narg_buf; nsf->var_buf = nvar_buf;
+                nsf->var_refs = (JSVarRef **)(nstack_buf + nb->stack_size);
+                nsf->var_ref_count = nb->var_ref_count;
+                for (k = 0; k < nb->var_ref_count; k++) nsf->var_refs[k] = NULL;
+                nsf->cur_pc = NULL; nsf->cur_sp = NULL;
+                nsf->prev_frame = rt->current_stack_frame;
+                rt->current_stack_frame = nsf;
+                tf_top = ntf;
+                this_obj = bf->this_val;   /* borrowed via the bound-function object (live on the stack until do_return) */
                 new_target = JS_UNDEFINED;
                 ntf->this_val = this_obj; ntf->new_target = new_target;
                 ntf->arg_allocated = narg_alloc; ntf->callee_argc = eff_argc;
