@@ -18456,7 +18456,7 @@ static inline int tramp_gen_method_magic(JSValueConst method, JSValueConst this_
    sibling by appending a decision vector, NEVER by rewinding OP_if, so a native builtin loop-back calls the SAME
    hook — frame-agnostic by construction), .fork (build the hot sibling from a frame CLONE), .preempt (park the
    running flow at a yield point). One struct, installed by JS_SetFlowControlHooks. */
-static JSFlowControlHooks g_flow_control = { NULL, NULL, NULL, NULL };
+static JSFlowControlHooks g_flow_control = { NULL, NULL, NULL };
 /* The flow's BASE async activation, set by JS_FlowResume around the base run. A concolic branch may frame-
    snapshot-fork ONLY when the running activation IS this base and flat (tf_top==NULL); a branch in a NESTED
    async function call (its own gen_state) or a deep trampolined frame forks by decision-vector replay instead. */
@@ -18527,10 +18527,13 @@ static int branch_arm_fork(JSContext *ctx, JSValueConst op1, uint8_t *if_pc,
             if (g_flow_control.fork) { JSValue *cl = JS_FlowClone(ctx, (JSValue *)gen_state); g_flow_control.fork(ctx, cl); }
             sf->cur_sp = NULL;
         } else {
-            /* NESTED async / DEEP trampolined branch: clone_deep_flow does not yet snapshot an async tramp frame,
-               so this currently uses replay — which is BANNED. The real fix is to make clone_deep_flow snapshot
-               the deep/async frame so this path also time-travels instead of re-running. */
-            if (g_flow_control.replay) g_flow_control.replay(ctx);
+            /* A concolic branch inside an ASYNC body on this chain (base flow, one async frame). The SOUND fork is
+               a SNAPSHOT, which needs (1) cloning the async frame from async_data->func_state.frame and (2) the
+               async frame's PROMISE / resolve-capability isolated on the per-flow COW delta (the host COW captures
+               JS property writes, not a promise's C-internal resolution state). Neither is built. Re-run-from-start
+               REPLAY is BANNED (not byte-identical: shared state can differ between the run and the re-run), so it
+               is NOT kept as a fallback — the gap CRASHES to force the async-state-on-COW-delta + snapshot build. */
+            DFAIL("async-body concolic branch: sound snapshot fork not built (needs async/promise state on the per-flow COW delta); replay-from-start is banned");
         }
     }
     return harm;

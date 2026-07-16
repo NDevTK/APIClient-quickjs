@@ -1176,9 +1176,10 @@ JS_EXTERN void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, voi
                 the substrate for the WFQ to interleave flows by value instead of running each to completion. */
 typedef struct JSFlowControlHooks {
     int  (*branch)(JSContext *ctx, JSValueConst cond);
-    void (*fork)(JSContext *ctx, JSValue *clone);       /* BASE-activation fork: build the hot sibling from a frame clone */
-    void (*replay)(JSContext *ctx);                     /* NESTED/deep-activation fork: build a decision-vector REPLAY sibling
-                                                           (no frame clone — it re-runs from the flow's fn). Frame-agnostic. */
+    void (*fork)(JSContext *ctx, JSValue *clone);       /* BASE-activation fork: build the hot sibling from a frame clone.
+                                                           (The deleted `replay` hook re-ran a nested/deep flow from its
+                                                           start — BANNED, not byte-identical; that fork now DFAILs until a
+                                                           sound async-frame snapshot is built.) */
     int  (*preempt)(void);
 } JSFlowControlHooks;
 JS_EXTERN void JS_SetFlowControlHooks(const JSFlowControlHooks *hooks);
