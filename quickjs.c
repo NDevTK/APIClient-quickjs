@@ -18518,11 +18518,11 @@ static int branch_arm_fork(JSContext *ctx, JSValueConst op1, uint8_t *if_pc,
     if (harm >= 0 && (harm & 0x100)) {
         harm &= 0xff;
         if (gen_state == g_flow_base_gen && tf_top == NULL) {
-            /* BASE activation, flat frame: SNAPSHOT-fork it (time-travel, not re-run). NOTE (open, unsound): the
-               snapshot SHARES the parent frame's flow_local objects with the sibling, so a flow_local object
-               MUTATED (write or delete) by one sibling after the fork leaks — the flow-local privacy invariant is
-               violated by snapshot sharing. The fix is a SOUND snapshot: flow_local objects reachable at the fork
-               must become shared (captured on mutation), NOT deep-copied and NOT re-run. */
+            /* BASE activation, flat frame: SNAPSHOT-fork it (time-travel, not re-run). The snapshot SHARES the
+               parent frame's flow_local objects with the sibling; that is SOUND because cow_delta_fork sets both
+               deltas' forked=1, after which cow_capture stops skipping flow_local — so a flow_local object MUTATED
+               (write or delete) by either sibling post-fork is captured per-flow and swapped on context-switch.
+               Verified by /api/floc (flocADMIN vs flocPUBLIC isolated across the two arms). */
             sf->cur_pc = if_pc; sf->cur_sp = sp;
             if (g_flow_control.fork) { JSValue *cl = JS_FlowClone(ctx, (JSValue *)gen_state); g_flow_control.fork(ctx, cl); }
             sf->cur_sp = NULL;
