@@ -1163,51 +1163,76 @@ JS_EXTERN void JS_SetHostPromiseRejectionTracker(JSRuntime *rt, JSHostPromiseRej
 typedef int JSInterruptHandler(JSRuntime *rt, void *opaque);
 JS_EXTERN void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque);
 
-/* APIClient forced-execution: the frame-agnostic branch decision. Returns the arm (0/1) to take when branching
-   on a concolic value (the hook forks the other arm as a sibling flow), or -1 if the value is not concolic
-   (the interpreter falls through to the normal ToBool). Set once at engine init. */
-typedef int (*JSBranchHook)(JSContext *ctx, JSValueConst cond);
-JS_EXTERN void JS_SetBranchHook(JSBranchHook h);
-/* forced-exec frame-snapshot fork: the interpreter hands the host a CLONE of the flow frame taken at a forking
-   branch (the branch hook returned its arm | 0x100); the host builds the hot sibling from it. */
-typedef void (*JSForkHook)(JSContext *ctx, JSValue *clone);
-JS_EXTERN void JS_SetForkHook(JSForkHook h);
+/* APIClient forced-execution FLOW-CONTROL hooks — the scheduler's control over interpreter execution: the three
+   points where the forced-exec engine steers a running flow. One concern, one owner (the scheduler), one
+   registration (JS_SetFlowControlHooks); not optional, a NULL argument crashes.
+     - branch:  the frame-agnostic branch decision. Returns the arm (0/1) to take when branching on a concolic
+                value (the hook forks the OTHER arm as a sibling flow; arm | 0x100 additionally requests a
+                frame-snapshot fork), or -1 if the value is not concolic (fall through to the normal ToBool).
+     - fork:    the frame-snapshot fork. When branch returned arm | 0x100, the interpreter hands the host a
+                CLONE of the flow frame taken at the forking branch; the host builds the hot sibling from it.
+     - preempt: the preemption yield. A flow runs as a preemptible (heap-resident) async-function frame; when
+                preempt returns 1 at a yield point (loop back-edge / call), the flow parks and resumes later —
+                the substrate for the WFQ to interleave flows by value instead of running each to completion. */
+typedef struct JSFlowControlHooks {
+    int  (*branch)(JSContext *ctx, JSValueConst cond);
+    void (*fork)(JSContext *ctx, JSValue *clone);       /* BASE-activation fork: build the hot sibling from a frame clone */
+    void (*replay)(JSContext *ctx);                     /* NESTED/deep-activation fork: build a decision-vector REPLAY sibling
+                                                           (no frame clone — it re-runs from the flow's fn). Frame-agnostic. */
+    int  (*preempt)(void);
+} JSFlowControlHooks;
+JS_EXTERN void JS_SetFlowControlHooks(const JSFlowControlHooks *hooks);
 
-/* APIClient forced-execution COW: per-flow isolation. JS_SetFlowLocalMark(1) stamps objects created while a
-   flow runs as flow-local (discarded with the run); mark 0 (setup) makes them baseline. JS_SetCowHook installs
-   a callback invoked BEFORE a property write to a baseline object, so the host records the old state and reverts
-   it between flows. */
-typedef void (*JSCowHook)(JSContext *ctx, JSValueConst obj, JSAtom prop);
+/* APIClient TIME-TRAVEL (record/replay) hooks — the RECORD boundary of the COW time-travel executor.
+   A flow's live state is (shared baseline ∘ its per-flow COW delta); rewinding a flow reverses that delta,
+   replaying re-applies it. For that to be EXACT the delta must observe every mutation of SHARED baseline state
+   at the instant it happens, and these callbacks ARE that observation boundary: the interpreter invokes them
+   immediately BEFORE it mutates shared heap state, so the host records the pre-write value into the running
+   flow's delta. Two mutation classes cover the JS heap: a normal property write (obj[atom]) and a closure CELL
+   write (a captured local's V8-Context cell — a JSVarRef, not a property, so it needs its own edge). Object
+   CREATION needs no separate hook: prop_write also fires before a creating write, and the host records the slot
+   as "absent" so a rewind DELETES it. A flow-LOCAL object (created after the baseline, stamped via
+   JS_SetFlowLocalMark(1)) is never shared and is skipped in prop_write's gate, so a delta stays O(shared state
+   actually written). Install the whole boundary ONCE with JS_SetTimeTravelHooks at engine setup — it is not
+   optional and a NULL argument crashes. Baseline setup runs uncaptured NOT by leaving the hooks unset but
+   because there is no CURRENT flow to capture into yet (the host routes captures to the running flow's delta). */
+typedef struct JSTimeTravelHooks {
+    void (*prop_write)(JSContext *ctx, JSValueConst obj, JSAtom atom);  /* before writing a shared obj[atom] */
+    void (*cell_write)(JSContext *ctx, void *cell);                     /* before writing a shared closure cell */
+} JSTimeTravelHooks;
 JS_EXTERN void JS_SetFlowLocalMark(int m);
-JS_EXTERN void JS_SetCowHook(JSCowHook h);
-/* COW for CLOSURE CELLS: called before a write to a shared closure variable (JSVarRef, opaque here). The host
-   records the cell's pre-write value so a snapshot-forked sibling sharing the cell stays isolated; it reads/
-   writes the cell's value via JS_VarRefGet/SetValue. */
-typedef void (*JSCowVarRefHook)(JSContext *ctx, void *vref);
-JS_EXTERN void   JS_SetCowVarRefHook(JSCowVarRefHook h);
-JS_EXTERN JSValue JS_VarRefGetValue(void *vref);
-JS_EXTERN void   JS_VarRefSetValue(JSContext *ctx, void *vref, JSValue val);
+/* Whether obj was created flow-local. The COW hook consults this: a never-forked flow skips its flow_local
+   writes (truly private), but AFTER a fork those objects are shared with the snapshot sibling and must be captured. */
+JS_EXTERN int  JS_IsFlowLocal(JSValueConst obj);
+JS_EXTERN void JS_SetTimeTravelHooks(const JSTimeTravelHooks *hooks);
+/* A closure cell is opaque here (JSVarRef is engine-internal); the host reads/writes its value via these. */
+JS_EXTERN JSValue JS_VarRefGetValue(void *cell);
+JS_EXTERN void    JS_VarRefSetValue(JSContext *ctx, void *cell, JSValue val);
 
-/* APIClient forced-execution: concolic PROPAGATION through `+`. When an operand of a slow-path add is a concolic
-   value, this hook produces the concolic result (derived shape + example) into sp[-2] and returns 1; else 0 and
-   the normal add runs. This is how `'/api/' + id` carries the URL shape. */
-typedef int (*JSConcolicAddHook)(JSContext *ctx, JSValue *sp);
-JS_EXTERN void JS_SetConcolicAddHook(JSConcolicAddHook h);
+/* APIClient forced-execution CONCOLIC-VALUE hooks — how a concolic (symbolic + carried example) value
+   PROPAGATES through the two interpreter operators that must carry it. One concern, one owner (the concolic
+   component), one registration (JS_SetConcolicHooks); not optional, a NULL argument crashes. Each returns 1 when
+   it handled a concolic operand (result already placed in sp[-2]) and 0 to let the normal operator run.
+     - add: propagation through `+`. A concolic operand yields the concolic result (derived shape + example) in
+            sp[-2] — this is how `'/api/' + id` carries the URL shape.
+     - cmp: propagation through == / === . A concolic operand yields a concolic BOOL carrying the {src,op,tok}
+            constraint, so `if (x === 'admin')` FORKS instead of collapsing to a concrete false. is_neq flips
+            the recorded op. */
+typedef struct JSConcolicHooks {
+    int (*add)(JSContext *ctx, JSValue *sp);
+    int (*cmp)(JSContext *ctx, JSValue *sp, int is_neq);
+} JSConcolicHooks;
+JS_EXTERN void JS_SetConcolicHooks(const JSConcolicHooks *hooks);
 
-/* Concolic propagation through == / === : a concolic operand yields a concolic bool carrying the {src,op,tok}
-   constraint into sp[-2] (returns 1), so `if (x === 'admin')` FORKS instead of collapsing to concrete false.
-   is_neq flips the recorded op. Returns 0 (normal compare) when neither operand is concolic. */
-typedef int (*JSConcolicCmpHook)(JSContext *ctx, JSValue *sp, int is_neq);
-JS_EXTERN void JS_SetConcolicCmpHook(JSConcolicCmpHook h);
-
-/* Forced-execution PREEMPTION + FLOW API. A flow runs as a preemptible (heap-resident) async-function frame;
-   the preempt hook (returns 1) parks it at a loop back-edge and it resumes later — the substrate for the WFQ
-   to interleave flows by value instead of running each to completion. */
-typedef int (*JSPreemptHook)(void);
-JS_EXTERN void JS_SetPreemptHook(JSPreemptHook h);
-JS_EXTERN JSValue *JS_FlowNew(JSContext *ctx, const char *src, size_t len);   /* opaque flow handle (NULL on error) */
+/* Forced-execution FLOW API — the host CALLS these to create / drive / snapshot / free flows. (The preempt
+   CALLBACK that parks a running flow lives in JSFlowControlHooks above; these are the host-driven counterpart.)
+   A flow runs as a preemptible heap-resident async-function frame, so it interleaves under the WFQ. */
+JS_EXTERN JSValue *JS_FlowNew(JSContext *ctx, const char *src, size_t len, int eval_flags);   /* eval_flags: JS_EVAL_FLAG_STRICT threaded through; opaque flow handle (NULL on error) */
 JS_EXTERN int      JS_FlowResume(JSContext *ctx, JSValue *flow);              /* 1 = suspended (preempted), 0 = completed */
 JS_EXTERN void     JS_FlowFree(JSContext *ctx, JSValue *flow);
+/* Feature-engagement counters (anti-fake-green): requested = back-edge preempt points reached; fired = actually
+   parked+rebuilt. requested>fired iff the feature is gated somewhere (nested async/generator activation). */
+JS_EXTERN void     JS_FlowPreemptStats(uint64_t *requested, uint64_t *fired);
 /* Frame-snapshot fork: deep-copy a SUSPENDED flow into an INDEPENDENT clone that resumes from the same point.
    No fallback — an un-built frame shape (deep tramp chain / live closures) crashes loud. */
 JS_EXTERN JSValue *JS_FlowClone(JSContext *ctx, JSValue *flow);
@@ -1271,6 +1296,16 @@ JS_EXTERN JSValue JS_GetModulePrivateValue(JSContext *ctx, JSModuleDef *m);
 typedef JSValue JSJobFunc(JSContext *ctx, int argc, JSValueConst *argv);
 JS_EXTERN int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
                             int argc, JSValueConst *argv);
+
+/* forced-exec ASYNC-AS-FLOW: every enqueued job (a promise .then/.catch/.finally reaction, queueMicrotask, a
+   thenable-resolve, a dynamic-import continuation) is routed to the SCHEDULER as a first-class flow instead of a
+   global drain loop. This hook is called at JS_EnqueueJob time; it returns 1 if the host took OWNERSHIP of the
+   job (the fork then does NOT add it to the global job list), or 0 to fall back to the default global enqueue.
+   The host dups argv and later invokes job_func(ctx, argc, argv) under the enqueuing flow's per-flow COW — so a
+   reaction runs in its flow's timeline (correct microtask ordering) and is isolated from other flows' reactions.
+   job_func is an opaque JSJobFunc pointer the host calls back through; it never needs the quickjs-internal symbol. */
+typedef int (*JSJobEnqueueHook)(JSContext *ctx, JSJobFunc *job_func, int argc, JSValueConst *argv);
+JS_EXTERN void JS_SetJobEnqueueHook(JSJobEnqueueHook h);
 
 JS_EXTERN bool JS_IsJobPending(JSRuntime *rt);
 JS_EXTERN JSContext *JS_GetPendingJobContext(JSRuntime *rt);

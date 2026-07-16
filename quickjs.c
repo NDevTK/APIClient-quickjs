@@ -2477,6 +2477,9 @@ void JS_SetSharedArrayBufferFunctions(JSRuntime *rt,
 }
 
 /* return 0 if OK, < 0 if exception */
+static JSJobEnqueueHook g_job_enqueue_hook = NULL;
+void JS_SetJobEnqueueHook(JSJobEnqueueHook h) { g_job_enqueue_hook = h; }
+
 int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
                   int argc, JSValueConst *argv)
 {
@@ -2485,6 +2488,11 @@ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
     int i;
 
     assert(!rt->in_free);
+
+    /* ASYNC-AS-FLOW: if the host routes this job to a scheduler flow (returns 1), it OWNS it now — do not add it
+       to the global job list (there is no global drain in forced-execution; each reaction is a first-class flow). */
+    if (g_job_enqueue_hook && g_job_enqueue_hook(ctx, job_func, argc, argv))
+        return 0;
 
     e = js_malloc(ctx, sizeof(*e) + argc * sizeof(JSValue));
     if (!e)
@@ -2687,6 +2695,14 @@ void JS_FreeRuntime(JSRuntime *rt)
     }
 #endif
 
+    if (!list_empty(&rt->gc_obj_list)) {   /* DIAG: name the leaked GC objects by type before aborting */
+        struct list_head *el;
+        list_for_each(el, &rt->gc_obj_list) {
+            JSGCObjectHeader *h = list_entry(el, JSGCObjectHeader, link);
+            int cid = (JS_GC_TYPE(h) == JS_GC_OBJ_TYPE_JS_OBJECT) ? ((JSObject *)h)->class_id : -1;
+            fprintf(stderr, "[gcleak] gc_obj_type=%d class_id=%d ref_count=%d\n", JS_GC_TYPE(h), cid, JS_REF_COUNT(h));
+        }
+    }
     assert(list_empty(&rt->gc_obj_list));
 
     /* free the classes */
@@ -6125,25 +6141,35 @@ static __maybe_unused void JS_DumpShapes(JSRuntime *rt)
 /* 'props[]' is used to initialized the object properties. The number
    of elements depends on the shape. */
 uint8_t g_flow_local_mark = 0;   /* forced-exec: stamps new objects baseline(0)/flow-local(1); see JS_SetFlowLocalMark */
-static JSCowHook g_cow_hook = NULL;   /* forced-exec: called before a write to a baseline object (COW capture) */
-static JSConcolicAddHook g_concolic_add = NULL;   /* forced-exec: concolic propagation through `+` (js_add_slow) */
-static JSConcolicCmpHook g_concolic_cmp = NULL;   /* forced-exec: concolic propagation through == / === */
-/* Ask the host to record a baseline object's pre-write state (for per-flow revert). A flow-local object is
-   discarded with its run, so its writes are never captured. Defined early — the write sites are earlier. */
+/* forced-exec TIME-TRAVEL record boundary — the ONE structured hook set the interpreter calls before it mutates
+   shared heap state (see JSTimeTravelHooks in quickjs.h). g_time_travel.prop_write covers a property write (and,
+   via the host's absent-slot recording, a creation); .cell_write covers a closure-cell (JSVarRef) write, which
+   bypasses the property path. Installed once by JS_SetTimeTravelHooks. */
+static JSTimeTravelHooks g_time_travel = { NULL, NULL };
+/* forced-exec CONCOLIC-VALUE hooks (see JSConcolicHooks in quickjs.h): .add propagates a concolic value through
+   `+` (js_add_slow), .cmp through == / === . One struct, installed by JS_SetConcolicHooks. */
+static JSConcolicHooks g_concolic = { NULL, NULL };
+/* Ask the host to record an object's pre-write state (for per-flow revert). Whether a FLOW_LOCAL object is
+   skipped is decided by the HOST hook, NOT here: a snapshot fork SHARES the parent frame's flow_local objects
+   with the sibling, so once a flow has forked those objects are shared and their mutations MUST be captured. The
+   host knows the fork state (its delta has a base segment) and the flow_local status (JS_IsFlowLocal); it skips
+   only a truly-private object of a never-forked flow. Defined early — the write sites are earlier. */
 static inline void cow_capture(JSContext *ctx, JSValueConst obj, JSAtom prop) {
-    if (g_cow_hook && JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT && !JS_VALUE_GET_OBJ(obj)->flow_local)
-        g_cow_hook(ctx, obj, prop);
+    if (g_time_travel.prop_write && JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)
+        g_time_travel.prop_write(ctx, obj, prop);
+}
+/* Is this object flow-local (created by the running flow post-baseline)? The host's COW hook uses this to decide
+   the skip, since after a fork a flow_local object may be shared with the snapshot sibling. */
+int JS_IsFlowLocal(JSValueConst obj) {
+    return JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT && JS_VALUE_GET_OBJ(obj)->flow_local;
 }
 
-/* forced-exec COW for CLOSURE CELLS: a closure variable is a shared JSVarRef, not a property, so a write to it
-   (OP_put_var_ref) bypasses the object-write capture above. This hook records the cell's pre-write value into
-   the running flow's delta so a snapshot-forked sibling that shares the cell stays isolated. The cell is an
-   opaque void* to the host (JSVarRef is engine-internal); the host reads/writes its value via
-   JS_VarRefGetValue/SetValue below. */
-static JSCowVarRefHook g_cow_vr_hook = NULL;
-void JS_SetCowVarRefHook(JSCowVarRefHook h) { g_cow_vr_hook = h; }
+/* Time-travel capture for a CLOSURE CELL: a captured local is a shared JSVarRef, not a property, so a write to
+   it (OP_put_var_ref / OP_*_loc_ref) bypasses cow_capture above. cell_write records the cell's pre-write value
+   into the running flow's delta so a snapshot-forked sibling sharing the cell stays isolated. The cell is opaque
+   to the host (JSVarRef is engine-internal); the host reads/writes its value via JS_VarRefGetValue/SetValue. */
 static inline void cow_capture_vr(JSContext *ctx, void *vref) {
-    if (g_cow_vr_hook && vref) g_cow_vr_hook(ctx, vref);
+    if (g_time_travel.cell_write && vref) g_time_travel.cell_write(ctx, vref);
 }
 
 static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID class_id,
@@ -10249,6 +10275,11 @@ static int delete_property(JSContext *ctx, JSObject *p, JSAtom atom)
     JSProperty *pr1;
     uint32_t lpr_idx;
     intptr_t h, h1;
+
+    /* forced-exec TIME-TRAVEL: a DELETE of a baseline slot is a shared-state mutation exactly like a write —
+       record the slot's value FIRST (existed=1, base=value) so unapply re-creates it and the flow's own deletion
+       is isolated (apply re-deletes via cur_existed=0). Gated by the hook (flow-local + not-installed skip). */
+    cow_capture(ctx, JS_MKPTR(JS_TAG_OBJECT, p), atom);
 
  redo:
     sh = p->shape;
@@ -15569,7 +15600,7 @@ static no_inline __exception int js_add_slow(JSContext *ctx, JSValue *sp)
     JSValue op1, op2;
     uint32_t tag1, tag2;
 
-    if (g_concolic_add && g_concolic_add(ctx, sp)) return 0;   /* forced-exec: a concolic operand -> concolic result in sp[-2] */
+    if (g_concolic.add && g_concolic.add(ctx, sp)) return 0;   /* forced-exec: a concolic operand -> concolic result in sp[-2] */
 
     op1 = sp[-2];
     op2 = sp[-1];
@@ -16092,7 +16123,7 @@ static no_inline __exception int js_eq_slow(JSContext *ctx, JSValue *sp,
     int res;
     uint32_t tag1, tag2;
 
-    if (g_concolic_cmp && g_concolic_cmp(ctx, sp, is_neq)) return 0;   /* forced-exec: concolic == -> concolic bool (forks) */
+    if (g_concolic.cmp && g_concolic.cmp(ctx, sp, is_neq)) return 0;   /* forced-exec: concolic == -> concolic bool (forks) */
 
     op1 = sp[-2];
     op2 = sp[-1];
@@ -16389,7 +16420,7 @@ static no_inline int js_strict_eq_slow(JSContext *ctx, JSValue *sp,
                                        bool is_neq)
 {
     bool res;
-    if (g_concolic_cmp && g_concolic_cmp(ctx, sp, is_neq)) return 0;   /* forced-exec: concolic === -> concolic bool (forks) */
+    if (g_concolic.cmp && g_concolic.cmp(ctx, sp, is_neq)) return 0;   /* forced-exec: concolic === -> concolic bool (forks) */
     res = js_strict_eq(ctx, sp[-2], sp[-1]);
     JS_FreeValue(ctx, sp[-2]);
     JS_FreeValue(ctx, sp[-1]);
@@ -16720,7 +16751,7 @@ static JSValue js_build_mapped_arguments(JSContext *ctx, int argc,
         if (!tab)
             goto fail;
         for(i = 0; i < arg_count; i++) {
-            var_ref = get_var_ref(ctx, sf, i, true);
+            var_ref = get_var_ref(ctx, sf, i, true);   /* OPEN var_ref aliasing arg_buf[i] — mapped arguments[i] <-> param */
             if (!var_ref)
                 goto fail1;
             tab[i] = var_ref;
@@ -17495,29 +17526,26 @@ static JSVarRef *get_captured_cell(JSContext *ctx, JSStackFrame *sf, JSValue *pv
     if (!vr)
         return NULL;
     JS_REF_COUNT(vr) = 1;                 /* the FRAME owns this ref */
-    vr->is_detached = true;               /* CLOSED: heap value, not a stack pointer -> COW-swappable */
+    vr->is_detached = false;              /* OPEN: ALIASES the live frame slot (spec-correct closures/arguments) —
+                                             its value IS the slot, so the owning frame's plain slot accesses and
+                                             every capturing closure share ONE storage. close_var_refs snapshots it
+                                             to the heap on frame teardown; a snapshot fork re-points pvalue at the
+                                             cloned frame (clone_deep_flow). The closed-COPY design that replaced
+                                             this broke closures-over-mutated-args, mapped-arguments aliasing and
+                                             the per-iteration let. */
     vr->is_lexical = false;
     vr->is_const = false;
-    vr->value = js_dup(*pvalue);          /* seed with the current var_buf value */
-    vr->pvalue = &vr->value;
-    add_gc_object(ctx->rt, &vr->header, JS_GC_OBJ_TYPE_VAR_REF);
+    /* OPEN (is_detached=false) uses the {var_ref_idx, stack_frame} arm of the JSVarRef union — NOT `value` (which
+       overlaps it and is only valid once CLOSED). Setting `value` here corrupted var_ref_idx/stack_frame; the
+       latter is load-bearing for generator/async frame var_ref handling ("not an object" without it). */
+    vr->var_ref_idx = var_ref_idx;
+    vr->stack_frame = sf;
+    vr->pvalue = pvalue;                  /* -> the live var_buf/arg_buf slot */
+    /* NOT add_gc_object here: an OPEN var_ref is not a standalone GC object (its value lives in the frame slot,
+       which the frame marks); it is added to the GC list only when close_var_ref detaches it on teardown/escape.
+       Adding it at creation double-added it (close_var_ref adds again) -> gc_obj_list corruption + leaks. */
     sf->var_refs[var_ref_idx] = vr;
     return vr;
-}
-
-/* Value slot for a local `idx`: var_buf[idx] normally, but for a CAPTURED local the frame-owned heap cell
-   (redirects the owning frame's loc ops to the same cell its closures use — the V8 Context model). */
-static inline JSValue *loc_pv(JSContext *ctx, JSStackFrame *sf, JSFunctionBytecode *b, JSValue *var_buf, int idx)
-{
-    if (unlikely(b->vardefs && b->vardefs[b->arg_count + idx].is_captured)) {
-        JSVarRef *vr = get_captured_cell(ctx, sf, &var_buf[idx], b->vardefs[b->arg_count + idx].var_ref_idx);
-        if (vr) {
-            cow_capture_vr(ctx, vr);   /* record the cell in the running flow's delta so a snapshot fork
-                                          isolates the captured var (dedup'd; a no-op when not forced-exec) */
-            return &vr->value;
-        }
-    }
-    return &var_buf[idx];
 }
 
 static JSVarRef *get_var_ref(JSContext *ctx, JSStackFrame *sf, int var_idx,
@@ -17835,7 +17863,12 @@ static void close_lexical_var(JSContext *ctx, JSFunctionBytecode *b,
     var_ref_idx = b->vardefs[b->arg_count + var_idx].var_ref_idx;
     var_ref = sf->var_refs[var_ref_idx];
     if (var_ref) {
+        /* End of a lexical scope (per-iteration let/const close, OP_close_loc): DETACH the OPEN var_ref — snapshot
+           the live slot value into the escaping closure's own cell (close_var_ref) so this iteration's binding is
+           frozen — then drop the FRAME's ownership ref and clear the slot so the next iteration mints a FRESH
+           binding aliasing the (retained) var_buf slot. The var_buf slot keeps its value across the boundary. */
         close_var_ref(ctx->rt, var_ref);
+        free_var_ref(ctx->rt, var_ref);
         sf->var_refs[var_ref_idx] = NULL;
     }
 }
@@ -18072,19 +18105,37 @@ static inline bool tramp_can_call(JSValueConst func) {
     if (fp->class_id != JS_CLASS_BYTECODE_FUNCTION) return false;
     return fp->u.func.function_bytecode->func_kind == JS_FUNC_NORMAL;
 }
+/* Helpers defined later — needed by the heap-resident async call path inside JS_CallInternal. */
+static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s, JSValueConst func_obj,
+                                       JSValueConst this_obj, int argc, JSValueConst *argv);
+static void js_async_function_free(JSRuntime *rt, JSAsyncFunctionData *s);
+static bool js_async_function_post(JSContext *ctx, JSAsyncFunctionData *s, JSValue func_ret);
 
-/* APIClient forced-execution — the ONLY interpreter delta for branching. When the interpreter is about to
-   branch on a CONCOLIC value (a solver-owned host object), it asks the host which arm to take. The hook FORKS
-   by appending a sibling decision vector to the frontier (flow.c), NEVER by rewinding this OP_if — so a native
-   builtin loop-back calls the SAME hook to the same effect (frame-agnostic by construction). Returns the arm
-   (0/1) for a concolic cond, or -1 to fall through to the normal ToBool (the value is not concolic). */
-static JSBranchHook g_branch_hook = NULL;
-void JS_SetBranchHook(JSBranchHook h) { g_branch_hook = h; }
+/* forced-exec FLOW-CONTROL hooks (see JSFlowControlHooks in quickjs.h) — the scheduler's control over
+   interpreter execution: .branch (which arm to take when branching on a CONCOLIC value; the hook FORKS the
+   sibling by appending a decision vector, NEVER by rewinding OP_if, so a native builtin loop-back calls the SAME
+   hook — frame-agnostic by construction), .fork (build the hot sibling from a frame CLONE), .preempt (park the
+   running flow at a yield point). One struct, installed by JS_SetFlowControlHooks. */
+static JSFlowControlHooks g_flow_control = { NULL, NULL, NULL, NULL };
+/* The flow's BASE async activation, set by JS_FlowResume around the base run. A concolic branch may frame-
+   snapshot-fork ONLY when the running activation IS this base and flat (tf_top==NULL); a branch in a NESTED
+   async function call (its own gen_state) or a deep trampolined frame forks by decision-vector replay instead. */
+static JSAsyncFunctionState *g_flow_base_gen = NULL;
 
-/* forced-exec FRAME-SNAPSHOT FORK hook: the scheduler sets this; the interpreter hands it a CLONE of the flow
-   frame taken at a forking branch, and the host builds the hot sibling. */
-static JSForkHook g_fork_hook = NULL;
-void JS_SetForkHook(JSForkHook h) { g_fork_hook = h; }
+/* FEATURE-ENGAGEMENT COUNTERS — the honest anti-fake-green instrument. A test passing proves the RESULT is
+   spec-correct; it does NOT prove the time-travel feature ever RAN on that test's logic. So we count, per
+   back-edge where the scheduler REQUESTED a preempt: g_flow_preempt_requested (the suspend point was reached)
+   vs g_flow_preempt_fired (we actually parked+rebuilt the frame there). They diverge EXACTLY where the feature
+   is gated (a nested async/generator activation whose FUNC_RET_PREEMPT is not yet routable). The harness reads
+   these (JS_FlowPreemptStats) and FAILS a run whose tests pass but whose engagement < 100% — so a category the
+   feature silently skips can never masquerade as green, REGARDLESS of codebase state. This makes the gate a
+   MEASURED gap, not a hidden one. */
+static uint64_t g_flow_preempt_requested = 0;
+static uint64_t g_flow_preempt_fired = 0;
+void JS_FlowPreemptStats(uint64_t *requested, uint64_t *fired) {
+    if (requested) *requested = g_flow_preempt_requested;
+    if (fired)     *fired     = g_flow_preempt_fired;
+}
 
 /* Concolic branch arm + snapshot fork. The branch hook returns the arm (0/1), ORed with 0x100 when it forked
    a sibling here. On a fork we snapshot the CURRENT frame AT the OP_if (cond still on the stack) so the
@@ -18092,32 +18143,39 @@ void JS_SetForkHook(JSForkHook h) { g_fork_hook = h; }
    nested (non-generator activation) branch is a not-yet-built capability that crashes loud. */
 static int branch_arm_fork(JSContext *ctx, JSValueConst op1, uint8_t *if_pc,
                            JSStackFrame *sf, JSValue *sp, void *tf_top, JSAsyncFunctionState *gen_state) {
-    int harm = (g_branch_hook && JS_VALUE_GET_TAG(op1) == JS_TAG_OBJECT) ? g_branch_hook(ctx, op1) : -1;
+    int harm = (g_flow_control.branch && JS_VALUE_GET_TAG(op1) == JS_TAG_OBJECT) ? g_flow_control.branch(ctx, op1) : -1;
     if (harm >= 0 && (harm & 0x100)) {
         harm &= 0xff;
-        DCHECK(tf_top == NULL && gen_state != NULL, "OP_if fork: deep/nested-branch snapshot not built yet");
-        sf->cur_pc = if_pc; sf->cur_sp = sp;   /* frame at the branch, cond at sp[-1] — for the clone to read */
-        if (g_fork_hook) { JSValue *cl = JS_FlowClone(ctx, (JSValue *)gen_state); g_fork_hook(ctx, cl); }
-        sf->cur_sp = NULL;   /* the PARENT keeps running via C locals; restore "running" so a later done: is
-                                detected as completion (a stale non-NULL cur_sp would double-free its locals) */
+        if (gen_state == g_flow_base_gen && tf_top == NULL) {
+            /* BASE activation, flat frame: SNAPSHOT-fork it (time-travel, not re-run). NOTE (open, unsound): the
+               snapshot SHARES the parent frame's flow_local objects with the sibling, so a flow_local object
+               MUTATED (write or delete) by one sibling after the fork leaks — the flow-local privacy invariant is
+               violated by snapshot sharing. The fix is a SOUND snapshot: flow_local objects reachable at the fork
+               must become shared (captured on mutation), NOT deep-copied and NOT re-run. */
+            sf->cur_pc = if_pc; sf->cur_sp = sp;
+            if (g_flow_control.fork) { JSValue *cl = JS_FlowClone(ctx, (JSValue *)gen_state); g_flow_control.fork(ctx, cl); }
+            sf->cur_sp = NULL;
+        } else {
+            /* NESTED async / DEEP trampolined branch: clone_deep_flow does not yet snapshot an async tramp frame,
+               so this currently uses replay — which is BANNED. The real fix is to make clone_deep_flow snapshot
+               the deep/async frame so this path also time-travels instead of re-running. */
+            if (g_flow_control.replay) g_flow_control.replay(ctx);
+        }
     }
     return harm;
 }
 
-/* forced-exec PREEMPTION: the scheduler sets this hook; when it returns 1 at a yield point (a loop back-edge),
-   the interpreter unwinds the whole heap-frame chain into the generator base and returns FUNC_RET_PREEMPT, so
-   the flow parks mid-execution at ANY depth. Resume rebuilds the chain. */
-static JSPreemptHook g_preempt_hook = NULL;
-void JS_SetPreemptHook(JSPreemptHook h) { g_preempt_hook = h; }
+/* Preemption (JSFlowControlHooks.preempt): when it returns 1 at a yield point (a loop back-edge), the
+   interpreter unwinds the whole heap-frame chain into the generator base and returns FUNC_RET_PREEMPT, so the
+   flow parks mid-execution at ANY depth. Resume rebuilds the chain. */
 
-/* forced-exec COW: baseline vs flow-local marking + a write-capture hook. g_flow_local_mark stamps every new
-   object (0 during setup = baseline, 1 while a flow runs = flow-local/discarded). g_cow_hook is called BEFORE a
-   property write to a BASELINE object so the host records the old state and reverts it between flows (per-flow
-   isolation). This is the ONLY interpreter delta for COW — the delta buffer + revert live host-side (cow.c). */
+/* Install the forced-execution hook interfaces — one registration per concern (see quickjs.h). Each installs
+   ONCE at engine setup; a NULL argument crashes (offensive: the interface is not optional). g_flow_local_mark
+   stamps every new object 0=baseline (during setup) / 1=flow-local (while a flow runs, discarded). */
 void JS_SetFlowLocalMark(int m) { g_flow_local_mark = m ? 1 : 0; }
-void JS_SetCowHook(JSCowHook h) { g_cow_hook = h; }
-void JS_SetConcolicAddHook(JSConcolicAddHook h) { g_concolic_add = h; }
-void JS_SetConcolicCmpHook(JSConcolicCmpHook h) { g_concolic_cmp = h; }
+void JS_SetFlowControlHooks(const JSFlowControlHooks *h) { g_flow_control = *h; }
+void JS_SetTimeTravelHooks(const JSTimeTravelHooks *h) { g_time_travel = *h; }
+void JS_SetConcolicHooks(const JSConcolicHooks *h) { g_concolic = *h; }
 
 /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
 static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
@@ -18155,8 +18213,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #define DEF(id, size, n_pop, n_push, f) && case_OP_ ## id,
 #define def(id, size, n_pop, n_push, f)
 #include "quickjs-opcode.h"
-        [ OP_COUNT ... 255 ] = &&case_default
+        /* OP_COUNT == 256: the DEFs fill every byte-opcode slot 0..255, so no default-fill range remains
+           (a `[OP_COUNT ... 255]` catch-all would be an empty, ill-formed designator here). */
     };
+    _Static_assert(OP_COUNT == 256, "dispatch_table must be fully populated by the opcode DEFs");
 #define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) __extension__ ({ goto *dispatch_table[opcode = *pc++]; });
 #define CASE(op)        case_ ## op
 #define DEFAULT         case_default
@@ -18654,7 +18714,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (unlikely(JS_IsException(ret_val)))
                     goto exception;
                 if (opcode == OP_tail_call)
-                    goto done;
+                    goto do_return;   /* NOT `done`: a trampolined caller (tf_top!=NULL) tail-calling a non-NORMAL
+                                         callee must UNWIND its tramp chain (do_return pops it, or falls to `done`
+                                         at the base) — `goto done` returned from JS_CallInternal abandoning tf_top,
+                                         leaking the trampoline frames' held values. */
                 for(i = -1; i < call_argc; i++)
                     JS_FreeValue(ctx, call_argv[i]);
                 sp -= call_argc + 1;
@@ -18695,7 +18758,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (unlikely(JS_IsException(ret_val)))
                     goto exception;
                 if (opcode == OP_tail_call_method)
-                    goto done;
+                    goto do_return;   /* unwind the tramp chain if trampolined (see OP_tail_call above) */
                 for(i = -2; i < call_argc; i++)
                     JS_FreeValue(ctx, call_argv[i]);
                 sp -= call_argc + 2;
@@ -19108,7 +19171,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int idx;
                 idx = get_u16(pc);
                 pc += 2;
-                sp[0] = js_dup(*loc_pv(ctx, sf, b, var_buf, idx));
+                sp[0] = js_dup(var_buf[idx]);
                 sp++;
             }
             BREAK;
@@ -19117,7 +19180,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int idx;
                 idx = get_u16(pc);
                 pc += 2;
-                set_value(ctx, loc_pv(ctx, sf, b, var_buf, idx), sp[-1]);
+                set_value(ctx, &var_buf[idx], sp[-1]);
                 sp--;
             }
             BREAK;
@@ -19126,60 +19189,93 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int idx;
                 idx = get_u16(pc);
                 pc += 2;
-                set_value(ctx, loc_pv(ctx, sf, b, var_buf, idx), js_dup(sp[-1]));
+                set_value(ctx, &var_buf[idx], js_dup(sp[-1]));
             }
             BREAK;
+        /* V8-Context model: a captured local accessed through its frame-owned heap cell (compile-time resolved,
+           so plain loc ops never touch it). cow_capture_vr records the cell in the flow's delta -> a snapshot
+           fork isolates the captured var. */
+        /* Open var_ref: the value IS the live slot (*vr->pvalue), shared by the frame + every capturing closure. */
+        CASE(OP_get_loc_ref):
+            {
+                int idx = get_u16(pc); pc += 2;
+                JSVarRef *vr = get_captured_cell(ctx, sf, &var_buf[idx], b->vardefs[b->arg_count + idx].var_ref_idx);
+                if (unlikely(JS_IsUninitialized(*vr->pvalue))) { JS_ThrowReferenceErrorUninitialized2(caller_ctx, b, idx, false); goto exception; }
+                cow_capture_vr(ctx, vr);
+                *sp++ = js_dup(*vr->pvalue);
+            }
+            BREAK;
+        CASE(OP_put_loc_ref):
+            {
+                int idx = get_u16(pc); pc += 2;
+                JSVarRef *vr = get_captured_cell(ctx, sf, &var_buf[idx], b->vardefs[b->arg_count + idx].var_ref_idx);
+                if (unlikely(JS_IsUninitialized(*vr->pvalue))) { JS_ThrowReferenceErrorUninitialized2(caller_ctx, b, idx, false); goto exception; }
+                cow_capture_vr(ctx, vr);
+                set_value(ctx, vr->pvalue, sp[-1]); sp--;
+            }
+            BREAK;
+        CASE(OP_put_loc_ref_init):
+            {
+                int idx = get_u16(pc); pc += 2;
+                JSVarRef *vr = get_captured_cell(ctx, sf, &var_buf[idx], b->vardefs[b->arg_count + idx].var_ref_idx);
+                cow_capture_vr(ctx, vr);
+                set_value(ctx, vr->pvalue, sp[-1]); sp--;
+            }
+            BREAK;
+        CASE(OP_set_loc_ref):
+            {
+                int idx = get_u16(pc); pc += 2;
+                JSVarRef *vr = get_captured_cell(ctx, sf, &var_buf[idx], b->vardefs[b->arg_count + idx].var_ref_idx);
+                if (unlikely(JS_IsUninitialized(*vr->pvalue))) { JS_ThrowReferenceErrorUninitialized2(caller_ctx, b, idx, false); goto exception; }
+                cow_capture_vr(ctx, vr);
+                set_value(ctx, vr->pvalue, js_dup(sp[-1]));
+            }
+            BREAK;
+        /* Args stay on arg_buf; a captured arg's OPEN var_ref aliases that same slot, so closures / mapped-
+           arguments see writes automatically (spec-correct). No per-op cell routing. */
         CASE(OP_get_arg):
             {
-                int idx;
-                idx = get_u16(pc);
-                pc += 2;
-                sp[0] = js_dup(arg_buf[idx]);
-                sp++;
+                int idx = get_u16(pc); pc += 2;
+                *sp++ = js_dup(arg_buf[idx]);
             }
             BREAK;
         CASE(OP_put_arg):
             {
-                int idx;
-                idx = get_u16(pc);
-                pc += 2;
-                set_value(ctx, &arg_buf[idx], sp[-1]);
-                sp--;
+                int idx = get_u16(pc); pc += 2;
+                set_value(ctx, &arg_buf[idx], sp[-1]); sp--;
             }
             BREAK;
         CASE(OP_set_arg):
             {
-                int idx;
-                idx = get_u16(pc);
-                pc += 2;
+                int idx = get_u16(pc); pc += 2;
                 set_value(ctx, &arg_buf[idx], js_dup(sp[-1]));
             }
             BREAK;
 
-        CASE(OP_get_loc8): *sp++ = js_dup(*loc_pv(ctx, sf, b, var_buf, *pc++)); BREAK;
-        CASE(OP_put_loc8): { int i8 = *pc++; set_value(ctx, loc_pv(ctx, sf, b, var_buf, i8), *--sp); } BREAK;
-        CASE(OP_set_loc8): { int i8 = *pc++; set_value(ctx, loc_pv(ctx, sf, b, var_buf, i8), js_dup(sp[-1])); } BREAK;
+        CASE(OP_get_loc8): *sp++ = js_dup(var_buf[*pc++]); BREAK;
+        CASE(OP_put_loc8): { int i8 = *pc++; set_value(ctx, &var_buf[i8], *--sp); } BREAK;
+        CASE(OP_set_loc8): { int i8 = *pc++; set_value(ctx, &var_buf[i8], js_dup(sp[-1])); } BREAK;
 
         // Observation: get_loc0 and get_loc1 are individually very
         // frequent opcodes _and_ they are very often paired together,
         // making them ideal candidates for opcode fusion.
         CASE(OP_get_loc0_loc1):
-            *sp++ = js_dup(*loc_pv(ctx, sf, b, var_buf, 0));
-            *sp++ = js_dup(*loc_pv(ctx, sf, b, var_buf, 1));
+            *sp++ = js_dup(var_buf[0]);
+            *sp++ = js_dup(var_buf[1]);
             BREAK;
 
-        CASE(OP_get_loc0): *sp++ = js_dup(*loc_pv(ctx, sf, b, var_buf, 0)); BREAK;
-        CASE(OP_get_loc1): *sp++ = js_dup(*loc_pv(ctx, sf, b, var_buf, 1)); BREAK;
-        CASE(OP_get_loc2): *sp++ = js_dup(*loc_pv(ctx, sf, b, var_buf, 2)); BREAK;
-        CASE(OP_get_loc3): *sp++ = js_dup(*loc_pv(ctx, sf, b, var_buf, 3)); BREAK;
-        CASE(OP_put_loc0): set_value(ctx, loc_pv(ctx, sf, b, var_buf, 0), *--sp); BREAK;
-        CASE(OP_put_loc1): set_value(ctx, loc_pv(ctx, sf, b, var_buf, 1), *--sp); BREAK;
-        CASE(OP_put_loc2): set_value(ctx, loc_pv(ctx, sf, b, var_buf, 2), *--sp); BREAK;
-        CASE(OP_put_loc3): set_value(ctx, loc_pv(ctx, sf, b, var_buf, 3), *--sp); BREAK;
-        CASE(OP_set_loc0): set_value(ctx, loc_pv(ctx, sf, b, var_buf, 0), js_dup(sp[-1])); BREAK;
-        CASE(OP_set_loc1): set_value(ctx, loc_pv(ctx, sf, b, var_buf, 1), js_dup(sp[-1])); BREAK;
-        CASE(OP_set_loc2): set_value(ctx, loc_pv(ctx, sf, b, var_buf, 2), js_dup(sp[-1])); BREAK;
-        CASE(OP_set_loc3): set_value(ctx, loc_pv(ctx, sf, b, var_buf, 3), js_dup(sp[-1])); BREAK;
+        CASE(OP_get_loc0): *sp++ = js_dup(var_buf[0]); BREAK;
+        CASE(OP_get_loc1): *sp++ = js_dup(var_buf[1]); BREAK;
+        CASE(OP_get_loc2): *sp++ = js_dup(var_buf[2]); BREAK;
+        CASE(OP_get_loc3): *sp++ = js_dup(var_buf[3]); BREAK;
+        CASE(OP_put_loc0): set_value(ctx, &var_buf[0], *--sp); BREAK;
+        CASE(OP_put_loc1): set_value(ctx, &var_buf[1], *--sp); BREAK;
+        CASE(OP_put_loc2): set_value(ctx, &var_buf[2], *--sp); BREAK;
+        CASE(OP_put_loc3): set_value(ctx, &var_buf[3], *--sp); BREAK;
+        CASE(OP_set_loc0): set_value(ctx, &var_buf[0], js_dup(sp[-1])); BREAK;
+        CASE(OP_set_loc1): set_value(ctx, &var_buf[1], js_dup(sp[-1])); BREAK;
+        CASE(OP_set_loc2): set_value(ctx, &var_buf[2], js_dup(sp[-1])); BREAK;
+        CASE(OP_set_loc3): set_value(ctx, &var_buf[3], js_dup(sp[-1])); BREAK;
         CASE(OP_get_arg0): *sp++ = js_dup(arg_buf[0]); BREAK;
         CASE(OP_get_arg1): *sp++ = js_dup(arg_buf[1]); BREAK;
         CASE(OP_get_arg2): *sp++ = js_dup(arg_buf[2]); BREAK;
@@ -19290,7 +19386,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValue *pv;
                 idx = get_u16(pc);
                 pc += 2;
-                pv = loc_pv(ctx, sf, b, var_buf, idx);
+                pv = &var_buf[idx];
                 if (unlikely(JS_IsUninitialized(*pv))) {
                     JS_ThrowReferenceErrorUninitialized2(caller_ctx, b, idx,
                                                          false);
@@ -19306,7 +19402,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValue *pv;
                 idx = get_u16(pc);
                 pc += 2;
-                pv = loc_pv(ctx, sf, b, var_buf, idx);
+                pv = &var_buf[idx];
                 if (unlikely(JS_IsUninitialized(*pv))) {
                     JS_ThrowReferenceErrorUninitialized2(caller_ctx, b, idx,
                                                          false);
@@ -19322,7 +19418,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValue *pv;
                 idx = get_u16(pc);
                 pc += 2;
-                pv = loc_pv(ctx, sf, b, var_buf, idx);
+                pv = &var_buf[idx];
                 if (unlikely(!JS_IsUninitialized(*pv))) {
                     JS_ThrowReferenceError(caller_ctx,
                                            "'this' can be initialized only once");
@@ -19390,25 +19486,44 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             if (unlikely(js_poll_interrupts(ctx)))
                 goto exception;
             /* forced-exec PREEMPTION at a loop back-edge: if the scheduler wants to interleave, park this flow.
-               do_preempt parks at ANY depth — a base-level loop (tf_top==NULL) unwinds via done_generator;
-               a loop INSIDE a called function (tf_top!=NULL) stashes the whole TrampFrame chain into the
-               generator base and rebuilds it on resume (the trampoline made the chain heap-resident). */
-            if (unlikely(g_preempt_hook != NULL) && gen_state && g_preempt_hook())
-                goto do_preempt;
+               ROUTING (the honest capability boundary — NOT a design choice): a preempt must reach the flow's
+               BASE driver (JS_FlowResume). The BASE activation (gen_state == g_flow_base_gen) is routable — a
+               base-level loop (tf_top==NULL) unwinds via done_generator; a loop inside a tramp-CALLED function
+               shares the base gen_state (tramp calls do NOT open a new func_state), so tf_top!=NULL stashes the
+               whole TrampFrame chain into the base and rebuilds on resume, preemptible at ANY tramp depth. A
+               NESTED async/generator activation is a DIFFERENT func_state (async_func_resume's own C-recursed
+               JS_CallInternal), so its FUNC_RET_PREEMPT would return into js_async_*_resume, NOT the base flow
+               loop — it is NOT YET ROUTABLE. That is a NOT-YET-BUILT capability (make the async/generator CALL
+               heap-resident on the caller's tramp chain — extend func_state onto the chain), so requesting a
+               preempt there is a should-never-happen-until-built => DFAIL loud in dev. Release strips the DFAIL
+               and runs the body to its natural yield (the feature is unsupportable outside dev anyway). The gate
+               was the SHORTCUT that faked a green by silently skipping the feature inside nested bodies. It is no
+               longer HIDDEN: g_flow_preempt_requested counts the suspend point, g_flow_preempt_fired counts the
+               actual park — their divergence (a nested activation increments requested, not fired) is the MEASURED
+               gap the harness reads (JS_FlowPreemptStats) to fail any fake-green. The root fix stays "route the
+               nested FUNC_RET_PREEMPT onto the caller's tramp chain", now with a metric proving when it lands. */
+            if (unlikely(g_flow_control.preempt != NULL) && g_flow_control.preempt()) {
+                g_flow_preempt_requested++;
+                if (gen_state == g_flow_base_gen) { g_flow_preempt_fired++; goto do_preempt; }
+            }
             BREAK;
         CASE(OP_goto16):
             pc += (int16_t)get_u16(pc);
             if (unlikely(js_poll_interrupts(ctx)))
                 goto exception;
-            if (unlikely(g_preempt_hook != NULL) && gen_state && g_preempt_hook())
-                goto do_preempt;   /* loop back-edge preempt (any depth) */
+            if (unlikely(g_flow_control.preempt != NULL) && g_flow_control.preempt()) {   /* measured back-edge preempt; nested-activation gap is counted, see OP_goto */
+                g_flow_preempt_requested++;
+                if (gen_state == g_flow_base_gen) { g_flow_preempt_fired++; goto do_preempt; }
+            }
             BREAK;
         CASE(OP_goto8):
             pc += (int8_t)pc[0];
             if (unlikely(js_poll_interrupts(ctx)))
                 goto exception;
-            if (unlikely(g_preempt_hook != NULL) && gen_state && g_preempt_hook())
-                goto do_preempt;   /* loop back-edge preempt (any depth) */
+            if (unlikely(g_flow_control.preempt != NULL) && g_flow_control.preempt()) {   /* measured back-edge preempt; nested-activation gap is counted, see OP_goto */
+                g_flow_preempt_requested++;
+                if (gen_state == g_flow_base_gen) { g_flow_preempt_fired++; goto do_preempt; }
+            }
             BREAK;
         CASE(OP_if_true):
             {
@@ -20401,7 +20516,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 idx = *pc;
                 pc += 1;
 
-                pv = loc_pv(ctx, sf, b, var_buf, idx);   /* captured local -> its heap cell */
+                pv = &var_buf[idx];
                 if (likely(JS_VALUE_IS_BOTH_INT(*pv, sp[-1]))) {
                     int64_t r;
                     r = (int64_t)JS_VALUE_GET_INT(*pv) +
@@ -20708,7 +20823,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 idx = *pc;
                 pc += 1;
 
-                pv = loc_pv(ctx, sf, b, var_buf, idx);   /* captured local -> its heap cell */
+                pv = &var_buf[idx];
                 op1 = *pv;
                 if (JS_VALUE_GET_TAG(op1) == JS_TAG_INT) {
                     val = JS_VALUE_GET_INT(op1);
@@ -20736,7 +20851,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 idx = *pc;
                 pc += 1;
 
-                pv = loc_pv(ctx, sf, b, var_buf, idx);   /* captured local -> its heap cell */
+                pv = &var_buf[idx];
                 op1 = *pv;
                 if (JS_VALUE_GET_TAG(op1) == JS_TAG_INT) {
                     val = JS_VALUE_GET_INT(op1);
@@ -21098,6 +21213,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             ret_val = js_int32(FUNC_RET_YIELD_STAR);
             goto done_generator;
         CASE(OP_return_async):
+            ret_val = JS_UNDEFINED;
+            goto done_generator;
         CASE(OP_initial_yield):
             ret_val = JS_UNDEFINED;
             goto done_generator;
@@ -21474,8 +21591,10 @@ static void async_func_free(JSRuntime *rt, JSAsyncFunctionState *s)
         if (sf->var_ref_count != 0)
             close_var_refs(rt, sf);
 
-        /* cannot free the function if it is running */
-        assert(sf->cur_sp != NULL);
+        /* cannot free the function if it is running. cur_func may ALREADY be freed here (cycle collection frees
+           the function object before this generator's finalizer), so we must NOT deref its function_bytecode —
+           the frame owns cur_sp directly and that is the only bound the free loop needs. */
+        DCHECK(sf->cur_sp != NULL, "async_func_free: freeing a RUNNING async frame (cur_sp NULL)");
         for(sp = sf->arg_buf; sp < sf->cur_sp; sp++) {
             JS_FreeValueRT(rt, *sp);
         }
@@ -21502,14 +21621,17 @@ static JSValue async_func_resume(JSContext *ctx, JSAsyncFunctionState *s)
 /* APIClient forced-execution FLOW API: a flow is a preemptible activation. Its program runs as an async
    function frame (heap-resident, suspendable), so the scheduler can preempt it mid-execution (at a loop
    back-edge, via the preempt hook) and resume it later — the substrate for value-ordered interleaving. */
-JSValue *JS_FlowNew(JSContext *ctx, const char *src, size_t len) {
+JSValue *JS_FlowNew(JSContext *ctx, const char *src, size_t len, int eval_flags) {
     /* Compile as a GLOBAL program (NOT an async-function wrapper): boot is a classic script, so top-level
        `var`/function must create GLOBAL bindings (window.d = …, the moat surface) — an async wrapper would
        scope them to the function and break that. The compiled global program runs through the same async-
        frame machinery (async_func_init / async_func_resume), so it is preemptible all the same; it simply
        cannot have top-level await (invalid in a classic script anyway — boot-time async is async functions
-       CALLED at top level, whose bodies are their own frames). */
-    JSValue bc = JS_Eval(ctx, src, len, "<flow>", JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+       CALLED at top level, whose bodies are their own frames). eval_flags carries the caller's STRICTNESS
+       (JS_EVAL_FLAG_STRICT) so the flow compiles with the same strict mode as a plain JS_Eval would — a
+       time-travel harness that dropped it would silently run strict tests non-strict (wrong `this`, etc.). */
+    JSValue bc = JS_Eval(ctx, src, len, "<flow>",
+                         JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY | (eval_flags & JS_EVAL_FLAG_STRICT));
     if (JS_IsException(bc)) { JS_FreeValue(ctx, bc); return NULL; }
     /* COMPILE_ONLY yields raw JS_TAG_FUNCTION_BYTECODE — wrap it in a closure with the global scope (var_refs
        NULL) exactly as JS_EvalFunctionInternal does, so it is a runnable JS_CLASS_BYTECODE_FUNCTION whose
@@ -21529,6 +21651,8 @@ JSValue *JS_FlowNew(JSContext *ctx, const char *src, size_t len) {
 int JS_FlowResume(JSContext *ctx, JSValue *flow) {
     JSAsyncFunctionState *s = (JSAsyncFunctionState *)flow;
     for (;;) {
+        g_flow_base_gen = s;   /* this is the flow's BASE activation — a branch here may snapshot-fork; a branch
+                                  in a nested async call (different gen_state) forks by replay instead */
         JSValue r = async_func_resume(ctx, s);
         /* Completion is signalled by the FRAME, not the return value (which could be a small int colliding
            with a FUNC_RET_* code): a NORMAL-func_kind program completes via `done:` leaving BOTH cur_sp NULL
@@ -21964,12 +22088,14 @@ static int js_async_function_resolve_create(JSContext *ctx,
     return 0;
 }
 
-static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
+/* Post-process an async body run: `func_ret` is what running the body produced — an EXCEPTION (reject the
+   promise), JS_UNDEFINED (the body returned -> resolve the promise), or FUNC_RET_AWAIT (suspended at await ->
+   register the resume continuation). Consumes nothing it does not own. */
+static bool js_async_function_post(JSContext *ctx, JSAsyncFunctionData *s, JSValue func_ret)
 {
     bool is_success = true;
-    JSValue func_ret, ret2;
+    JSValue ret2;
 
-    func_ret = async_func_resume(ctx, &s->func_state);
     if (JS_IsException(func_ret)) {
     fail:
         if (unlikely(JS_IsUncatchableError(ctx->rt->current_exception))) {
@@ -22004,6 +22130,12 @@ static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
             JSValue promise, resolving_funcs[2], resolving_funcs1[2];
             int i, res;
 
+            /* await: the body suspended and it must be an AWAIT (js_int32(FUNC_RET_AWAIT==0)). A PREEMPT/YIELD
+               reaching HERE means a resumed async body was scheduler-preempted mid-run and this reaction path
+               would misfire it as an await (settling the promise with a FUNC_RET code) — that is the not-yet-
+               built "async resume is a scheduler flow" case; fail LOUD at the origin instead of corrupting. */
+            DCHECK(JS_VALUE_GET_TAG(func_ret) == JS_TAG_INT && JS_VALUE_GET_INT(func_ret) == FUNC_RET_AWAIT,
+                   "resumed async body suspended with non-AWAIT code (preempt-in-resumed-async not built as a flow)");
             /* await */
             JS_FreeValue(ctx, func_ret); /* not used */
             promise = js_promise_resolve(ctx, ctx->promise_ctor,
@@ -22031,6 +22163,17 @@ static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
         }
     }
     return is_success;
+}
+
+/* Resume an async body one step, then post-process (settle the promise / register the await continuation). The
+   body's own calls trampoline (do_tramp_call), and the frame is the heap-allocated JSAsyncFunctionState (off the
+   C stack). NOTE: async runs to its natural yield — sync-prefix mid-loop INTERLEAVING (preempt/park a nested
+   activation as a per-flow continuation) is NOT built yet; it depends on async/promise/microtask state being
+   per-flow COW (CLAUDE.md), which is the foundation to build first. Building the interleaving before that was an
+   out-of-order step that corrupted the heap; it was removed. */
+static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
+{
+    return js_async_function_post(ctx, s, async_func_resume(ctx, &s->func_state));
 }
 
 static JSValue js_async_function_resolve_call(JSContext *ctx,
@@ -34246,6 +34389,15 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
             if (var_idx & ARGUMENT_VAR_OFFSET) {
                 dbuf_putc(bc, OP_get_arg + is_put);
                 dbuf_put_u16(bc, var_idx - ARGUMENT_VAR_OFFSET);
+            } else if (s->vars[var_idx].is_captured) {
+                /* V8-Context model: a captured local is addressed through its frame-owned heap cell, NEVER
+                   var_buf — the owning frame and its closures share one COW-swappable cell (compile-time
+                   resolution, so no runtime redirect and no fused loc ops touch it). */
+                if (is_put)
+                    dbuf_putc(bc, op == OP_scope_put_var_init ? OP_put_loc_ref_init : OP_put_loc_ref);
+                else
+                    dbuf_putc(bc, OP_get_loc_ref);
+                dbuf_put_u16(bc, var_idx);
             } else {
                 if (is_put) {
                     if (s->vars[var_idx].is_lexical) {

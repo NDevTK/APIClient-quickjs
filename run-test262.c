@@ -1328,6 +1328,30 @@ int longest_match(const char *str, const char *find, int pos, int *ppos, int lin
     return maxlen;
 }
 
+/* FORK-FEATURE TEST262 HARNESS (env FORK_PREEMPT=1): run each SCRIPT test through the time-travel flow machinery
+   under FORCED preemption — suspend + rebuild the heap-frame chain at EVERY loop back-edge (quantum=1). test262's
+   own expected result is the oracle: if the ECMAScript outcome diverges from a plain JS_Eval, deep-preempt/resume
+   corrupted state — a fork-feature bug conformance testing can never surface. This is the point of test262 here:
+   NOT "does QuickJS run JS" (known), but "does our time-travel preserve JS across thousands of suspend/resumes".
+   Modules + async ($DONE) fall back to JS_Eval for now (JS_FlowNew is a global program; that surface is next). */
+static int fork_preempt_always(void) { return 1; }
+static int fork_preempt_enabled(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("FORK_PREEMPT") ? 1 : 0;
+    return v;
+}
+static JSValue fork_preempt_eval(JSContext *ctx, const char *buf, size_t buf_len, int eval_flags) {
+    static const JSFlowControlHooks ON  = { NULL, NULL, NULL, fork_preempt_always };
+    static const JSFlowControlHooks OFF = { NULL, NULL, NULL, NULL };
+    JSValue *flow = JS_FlowNew(ctx, buf, buf_len, eval_flags);   /* thread STRICTNESS so strict tests run strict */
+    if (!flow) return JS_EXCEPTION;   /* compile error: exception already pending */
+    JS_SetFlowControlHooks(&ON);
+    while (JS_FlowResume(ctx, flow)) { }   /* park + rebuild the whole frame chain on every back-edge */
+    JS_SetFlowControlHooks(&OFF);
+    JS_FlowFree(ctx, flow);
+    return JS_HasException(ctx) ? JS_EXCEPTION : JS_UNDEFINED;
+}
+
 static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,
                     const char *filename, int is_test, int is_negative,
                     const char *error_type, int eval_flags, int is_async,
@@ -1351,7 +1375,15 @@ static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,
     tls->async_done = 0; /* counter of "Test262:AsyncTestComplete" messages */
 
     start = get_clock_ms();
-    res_val = JS_Eval(ctx, buf, buf_len, filename, eval_flags);
+    if (fork_preempt_enabled())
+        /* FORK-FEATURE run: EVERY test goes through the time-travel machinery — NO fallback. No async carve-out,
+           NO module carve-out: the project is never run without its features, so a fallback to plain JS_Eval tests
+           something that never runs and hides feature gaps. A construct the feature does not yet support (module
+           top-level, async interleaving) must FAIL LOUD here (an honest gap to build at the root: module support
+           in JS_FlowNew), never be papered over by JS_Eval. */
+        res_val = fork_preempt_eval(ctx, buf, buf_len, eval_flags);
+    else
+        res_val = JS_Eval(ctx, buf, buf_len, filename, eval_flags);   /* only when the feature is OFF entirely */
 
     if ((is_async || ret_promise) && !JS_IsException(res_val)) {
         JSValue promise = JS_UNDEFINED;
@@ -2350,6 +2382,18 @@ int main(int argc, char **argv)
                 fprintf(stderr, ", %d fixed", fixed_errors);
         }
         fprintf(stderr, "\n");
+        /* FEATURE ENGAGEMENT (anti-fake-green): a passing result does NOT prove the time-travel feature ran on the
+           test's logic. requested = back-edge preempt points reached; fired = actually parked+rebuilt. They diverge
+           EXACTLY where the feature is gated (nested async/generator activations), so <100% engagement means the
+           run passed tests the feature silently skipped — a fake green the harness must flag, for ALL categories. */
+        if (fork_preempt_enabled()) {
+            uint64_t req = 0, fired = 0;
+            JS_FlowPreemptStats(&req, &fired);
+            double eng = req ? (100.0 * (double)fired / (double)req) : 100.0;
+            fprintf(stderr, "Feature: %llu preempt-requested, %llu fired (%.1f%% engaged), %llu nested-gap%s\n",
+                    (unsigned long long)req, (unsigned long long)fired, eng,
+                    (unsigned long long)(req - fired), (req - fired) != 1 ? "s" : "");
+        }
     }
 
     if (error_out && error_out != stdout) {

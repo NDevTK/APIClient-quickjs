@@ -165,6 +165,12 @@ DEF(   define_class_computed, 6, 3, 3, atom_u8) /* field_name parent ctor -> fie
 DEF(        get_loc, 3, 0, 1, loc)
 DEF(        put_loc, 3, 1, 0, loc) /* must come after get_loc */
 DEF(        set_loc, 3, 1, 1, loc) /* must come after put_loc */
+/* V8-Context model: a CAPTURED local is resolved (at compile time) to these — access its frame-owned heap
+   cell (sf->var_refs) directly, never var_buf. Operand is the LOC index; the handler maps to var_ref_idx. */
+DEF(    get_loc_ref, 3, 0, 1, loc)      /* read the cell (TDZ-checked) */
+DEF(    put_loc_ref, 3, 1, 0, loc)      /* assign to the cell (TDZ-checked) */
+DEF(put_loc_ref_init, 3, 1, 0, loc)     /* initialize the cell (no TDZ check) */
+DEF(    set_loc_ref, 3, 1, 1, loc)      /* assign + keep on stack (TDZ-checked) */
 DEF(        get_arg, 3, 0, 1, arg)
 DEF(        put_arg, 3, 1, 0, arg) /* must come after get_arg */
 DEF(        set_arg, 3, 1, 1, arg) /* must come after put_arg */
