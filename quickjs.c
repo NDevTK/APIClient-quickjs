@@ -18454,8 +18454,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 TrampFrame *dtf = s->tramp_top;
                 /* An ASYNC or GENERATOR frame's sf IS its func_state.frame (not the embedded dtf->sf); re-enter it
                    there so a preempted async/generator body loop resumes correctly. */
+                /* An agen-CREATE frame likewise keeps its sf in its state (cont_state), not the embedded sf —
+                   omitting it here made a preempted param-binding resume from a garbage frame. */
                 JSAsyncFunctionState *dfs = dtf->async_data ? &dtf->async_data->func_state
-                                          : dtf->gen_data ? &dtf->gen_data->func_state : NULL;
+                                          : dtf->gen_data ? &dtf->gen_data->func_state
+                                          : dtf->cont_kind == CONT_AGEN_CREATE
+                                              ? &((JSAsyncGeneratorData *)dtf->cont_state)->func_state
+                                          : NULL;
                 JSStackFrame *dsf = dfs ? &dfs->frame : &dtf->sf;
                 JSObject *dp = JS_VALUE_GET_OBJ(dsf->cur_func);
                 s->tramp_top = NULL;
@@ -22148,6 +22153,30 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         js_free_rt(rt, gtf);
         goto exception;   /* re-raise the pending exception in the caller */
     }
+    /* uncaught while BINDING an async generator's params (the object does not exist yet). This frame's buffers
+       belong to its STATE, not the frame (local_buf == NULL), so it must NOT go through the generic pop below —
+       that walks `local_buf .. sp` and frees local_buf, which would walk from NULL. Tear the state down here
+       (restoring cur_sp first, as the sync-generator creation path does, so async_func_free can bound its
+       teardown), pop to the caller, and re-raise there. */
+    if (tf_top && tf_top->cont_kind == CONT_AGEN_CREATE) {
+        TrampFrame *ctf2 = tf_top;
+        JSValue afn2 = ctf2->async_promise;
+        sf->cur_sp = sp;                                  /* the body frame was RUNNING (cur_sp NULL) */
+        js_async_generator_free(rt, (JSAsyncGeneratorData *)ctf2->cont_state);
+        JS_FreeValue(ctx, afn2);                          /* the held function ref */
+        rt->current_stack_frame = ctf2->caller_sf;
+        tf_top = ctf2->up;
+        sf = ctf2->caller_sf; b = ctf2->caller_b; ctx = ctf2->caller_ctx;
+        local_buf = ctf2->caller_local_buf; stack_buf = ctf2->caller_stack_buf;
+        var_buf = ctf2->caller_var_buf; arg_buf = ctf2->caller_arg_buf;
+        this_obj = ctf2->caller_this; new_target = ctf2->caller_new_target;
+        var_refs = ctf2->caller_var_refs;
+        argc = ctf2->caller_argc; argv = ctf2->caller_argv;
+        arg_allocated_size = ctf2->caller_arg_allocated_size;
+        pc = sf->cur_pc; sp = ctf2->caller_sp;
+        js_free_rt(rt, ctf2);
+        goto exception;
+    }
     /* uncaught in THIS frame: if trampolined, pop to the caller + re-raise there (its stack still holds the
        call operands, which the caller's catch-search frees) — never leak tf_top by returning to the C base. */
     if (tf_top) {
@@ -22167,10 +22196,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         arg_allocated_size = rtf->caller_arg_allocated_size;
         pc = sf->cur_pc; sp = rtf->caller_sp;
         js_free_rt(rt, rtf);
-        if (xck == CONT_AGEN_CREATE) {
-            /* a param-binding throw before the async-generator object exists: drop the state */
-            js_async_generator_free(rt, (struct JSAsyncGeneratorData *)xcs);
-        } else if (xck != CONT_NONE) {
+        if (xck != CONT_NONE) {
             /* the throwing frame was a C-builtin-driven CALLBACK: abandon the iteration (its state owns the
                object/accumulator/element) and re-raise in the builtin's ORIGINAL caller, whose stack still holds
                the OP_call operands for its own catch-search to free. */
