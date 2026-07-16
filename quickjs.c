@@ -18145,13 +18145,13 @@ void JS_FlowPreemptStats(uint64_t *requested, uint64_t *fired) {
        counts the gap). A C-reentry callback frame (gs==NULL: sort/forEach comparator) has no flow driver.
    The gate fires the preempt only where it is routable, so an unroutable FUNC_RET_PREEMPT is never emitted. */
 static bool flow_preempt_routable(JSAsyncFunctionState *gs) {
-    if (gs == NULL) return false;
-    if (gs == g_flow_base_gen) return true;
-    JSFunctionKindEnum k = JS_VALUE_GET_OBJ(gs->frame.cur_func)->u.func.function_bytecode->func_kind;
-    /* Every generator/async body driver self-resumes via async_func_resume_run, so all func_kinds are routable.
-       The only remaining preempt gap is a C-reentry callback frame (gs==NULL, handled above): a forEach/sort
-       comparator has no flow driver until the builtin is self-hosted as bytecode. */
-    return k == JS_FUNC_GENERATOR || k == JS_FUNC_ASYNC || k == JS_FUNC_ASYNC_GENERATOR;
+    /* gs != NULL IFF this activation was entered via async_func_resume (JS_CALL_FLAG_GENERATOR sets gen_state),
+       and EVERY async_func_resume caller is a driver that handles FUNC_RET_PREEMPT (JS_FlowResume, the generator/
+       async drivers, and js_call_as_flow — all via async_func_resume_run). So any flow-driven activation is
+       routable, of ANY func_kind: a sync generator, an async body, or a plain callback HOOKED as a flow by
+       js_call_as_flow. A C-reentry frame NOT run as a flow (gs==NULL: a raw JS_Call from a C builtin) has no
+       driver and stays non-routable — hooking that call into js_call_as_flow is what makes it routable. */
+    return gs != NULL;
 }
 
 /* Concolic branch arm + snapshot fork. The branch hook returns the arm (0/1), ORed with 0x100 when it forked
@@ -21645,7 +21645,12 @@ static JSValue async_func_resume(JSContext *ctx, JSAsyncFunctionState *s)
 static JSValue async_func_resume_run(JSContext *ctx, JSAsyncFunctionState *s)
 {
     JSValue r = async_func_resume(ctx, s);
-    while (JS_VALUE_GET_TAG(r) == JS_TAG_INT && JS_VALUE_GET_INT(r) == FUNC_RET_PREEMPT) {
+    /* A PREEMPT leaves the flow SUSPENDED (shallow: cur_sp saved non-NULL; deep: tramp_top stashed); a COMPLETION
+       leaves BOTH NULL. The return VALUE alone is AMBIGUOUS — a function returning the integer 3 collides with
+       js_int32(FUNC_RET_PREEMPT) — so a preempt MUST be detected by the FRAME (exactly as JS_FlowResume does),
+       never by the value, or a callback returning 3 (e.g. map's `2*val+1`) re-resumes a torn-down frame. */
+    while ((s->frame.cur_sp != NULL || s->tramp_top != NULL) &&
+           JS_VALUE_GET_TAG(r) == JS_TAG_INT && JS_VALUE_GET_INT(r) == FUNC_RET_PREEMPT) {
         /* A preempt-resume is a CONTINUATION, never a re-throw. The driver set throw_flag for the FIRST resume
            (a generator .throw() or an await rejection); that throw was already delivered+consumed by the first
            async_func_resume (goto exception). JS_CallInternal's generator entry does not clear throw_flag, so
@@ -21655,6 +21660,37 @@ static JSValue async_func_resume_run(JSContext *ctx, JSAsyncFunctionState *s)
         s->throw_flag = false;
         r = async_func_resume(ctx, s);
     }
+    return r;
+}
+
+/* HOOK a C builtin's callback invocation into the flow machinery so the callback's body is PREEMPTIBLE — the
+   suspend/resume that `forEach`/`map`/`sort`/`reduce` (and any C builtin that calls back into JS) get WITHOUT
+   being re-hosted in JS (§C-stack). A plain callback invoked by C's JS_Call runs with gen_state==NULL (no flow
+   driver, unroutable); running it AS A FLOW gives it its own func_state + the async_func_resume_run driver, so
+   its loop back-edges preempt+rebuild like a directly-called function. Only a NORMAL bytecode function needs
+   this: an async/generator callback already routes through its own class call, and a C-function/bound/proxy
+   callback has no preemptible body — those take the plain JS_Call. A NORMAL function has no await/yield, so the
+   flow always COMPLETES (or throws) in one drive: async_func_resume_run collapses every preempt and returns the
+   real value/exception, leaving the frame at the completed shape (cur_sp==NULL, tramp_top==NULL) — freed here
+   exactly as JS_FlowFree frees a completed flow. */
+static JSValue js_call_as_flow(JSContext *ctx, JSValueConst func_obj, JSValueConst this_obj,
+                               int argc, JSValueConst *argv)
+{
+    JSAsyncFunctionState fs;
+    JSValue r;
+    if (!tramp_can_call(func_obj))
+        return JS_Call(ctx, func_obj, this_obj, argc, argv);
+    /* zero FIRST: async_func_init does not set tramp_top/throw_flag (JS_FlowNew relies on js_mallocz); an
+       uninitialized stack fs would make the first resume see a garbage tramp_top and take the deep-resume path. */
+    memset(&fs, 0, sizeof(fs));
+    if (async_func_init(ctx, &fs, func_obj, this_obj, argc, argv))
+        return JS_EXCEPTION;
+    r = async_func_resume_run(ctx, &fs);
+    DCHECK(fs.frame.cur_sp == NULL && fs.tramp_top == NULL,
+           "js_call_as_flow: a NORMAL callback flow did not COMPLETE in one drive (no await/yield exists to suspend it)");
+    js_free_rt(ctx->rt, fs.frame.arg_buf);
+    JS_FreeValue(ctx, fs.frame.cur_func);
+    JS_FreeValue(ctx, fs.this_val);
     return r;
 }
 
@@ -44007,7 +44043,7 @@ static JSValue js_array_every(JSContext *ctx, JSValueConst this_val,
             args[0] = val;
             args[1] = index_val;
             args[2] = obj;
-            res = JS_Call(ctx, func, this_arg, 3, args);
+            res = js_call_as_flow(ctx, func, this_arg, 3, args);   /* hook: callback body is preemptible */
             JS_FreeValue(ctx, index_val);
             if (JS_IsException(res))
                 goto exception;
