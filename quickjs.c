@@ -18172,6 +18172,30 @@ static inline bool tramp_can_construct(JSValueConst func) {
     if (fp->class_id != JS_CLASS_BYTECODE_FUNCTION) return false;
     return fp->is_constructor;
 }
+/* A property read whose value is a bytecode GETTER (get x(){…}) invokes the getter — currently via a C-recursive
+   JS_CallFree inside JS_GetPropertyInternal, so a loop in the getter body cannot preempt (drives to completion).
+   Detect that case at the read OPCODE so it can be routed onto the tramp chain as a 0-arg method call
+   (this=receiver): walk the receiver's proto chain like JS_GetPropertyInternal, return the getter JSObject when
+   the first own `atom` slot is a GETSET whose getter is a NORMAL bytecode function, else NULL (data prop / C
+   getter / exotic / absent → the plain slow path). */
+static JSShapeProperty *find_own_property(JSProperty **ppr, JSObject *p, JSAtom atom);
+static inline JSObject *tramp_bytecode_getter(JSObject *p, JSAtom atom) {
+    for (;;) {
+        JSProperty *pr; JSShapeProperty *prs = find_own_property(&pr, p, atom);
+        if (prs) {
+            if ((prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
+                JSObject *g = pr->u.getset.getter;
+                if (g && g->class_id == JS_CLASS_BYTECODE_FUNCTION &&
+                    g->u.func.function_bytecode->func_kind == JS_FUNC_NORMAL)
+                    return g;
+            }
+            return NULL;
+        }
+        if (p->is_exotic) return NULL;
+        p = p->shape->proto;
+        if (!p) return NULL;
+    }
+}
 /* An ASYNC function runs its body on the CALLER's tramp chain (do_async_tramp_call) so its sync-prefix loop
    preempts the base flow at any depth — never a nested C-recursion that would drive to completion. */
 static inline bool tramp_can_call_async(JSValueConst func) {
@@ -20924,6 +20948,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 } else {
                 get_field_slow_path:
                     sf->cur_pc = pc;
+                    if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) {
+                        JSObject *g = tramp_bytecode_getter(JS_VALUE_GET_OBJ(sp[-1]), atom);
+                        if (g) {   /* bytecode getter -> 0-arg method call [receiver, getter] on THIS chain */
+                            *sp++ = js_dup(JS_MKPTR(JS_TAG_OBJECT, g));   /* stack: [receiver][getter] */
+                            call_argv = sp; call_argc = 0;
+                            tramp_first = -2; tramp_is_tail = 0;
+                            goto do_tramp_call;   /* do_return pops receiver+getter, pushes the value at sp[-1] */
+                        }
+                    }
                     val = JS_GetPropertyInternal(ctx, obj, atom, sp[-1], false);
                     if (unlikely(JS_IsException(val)))
                         goto exception;
