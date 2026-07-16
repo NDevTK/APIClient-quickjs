@@ -18149,13 +18149,15 @@ void JS_FlowPreemptStats(uint64_t *requested, uint64_t *fired) {
        counts the gap). A C-reentry callback frame (gs==NULL: sort/forEach comparator) has no flow driver.
    The gate fires the preempt only where it is routable, so an unroutable FUNC_RET_PREEMPT is never emitted. */
 static bool flow_preempt_routable(JSAsyncFunctionState *gs) {
-    /* gs != NULL IFF this activation was entered via async_func_resume (JS_CALL_FLAG_GENERATOR sets gen_state),
-       and EVERY async_func_resume caller is a driver that handles FUNC_RET_PREEMPT (JS_FlowResume, the generator/
-       async drivers, and js_call_as_flow — all via async_func_resume_run). So any flow-driven activation is
-       routable, of ANY func_kind: a sync generator, an async body, or a plain callback HOOKED as a flow by
-       js_call_as_flow. A C-reentry frame NOT run as a flow (gs==NULL: a raw JS_Call from a C builtin) has no
-       driver and stays non-routable — hooking that call into js_call_as_flow is what makes it routable. */
-    return gs != NULL;
+    if (gs == NULL) return false;
+    if (gs == g_flow_base_gen) return true;
+    JSFunctionKindEnum k = JS_VALUE_GET_OBJ(gs->frame.cur_func)->u.func.function_bytecode->func_kind;
+    /* Every generator/async body has a driver (js_generator_next / js_call_generator_function /
+       js_async_function_resume / js_async_generator_resume) that self-resumes to its next natural YIELD/AWAIT via
+       async_func_resume_run — a bounded suspension point, NOT run-to-completion. A plain-function callback has no
+       such point, so it can only be driven to completion; it is therefore NOT routed here (an honest unrouted gap
+       the metric shows) until a resumable builtin loop parks the whole iteration as one WFQ flow. */
+    return k == JS_FUNC_GENERATOR || k == JS_FUNC_ASYNC || k == JS_FUNC_ASYNC_GENERATOR;
 }
 
 /* Concolic branch arm + snapshot fork. The branch hook returns the arm (0/1), ORed with 0x100 when it forked
@@ -21667,40 +21669,17 @@ static JSValue async_func_resume_run(JSContext *ctx, JSAsyncFunctionState *s)
     return r;
 }
 
-/* HOOK a C builtin's callback invocation into the flow machinery so the callback's body is PREEMPTIBLE — the
-   suspend/resume that `forEach`/`map`/`sort`/`reduce` (and any C builtin that calls back into JS) get WITHOUT
-   being re-hosted in JS (§C-stack). A plain callback invoked by C's JS_Call runs with gen_state==NULL (no flow
-   driver, unroutable); running it AS A FLOW gives it its own func_state + the async_func_resume_run driver, so
-   its loop back-edges preempt+rebuild like a directly-called function. Only a NORMAL bytecode function needs
-   this: an async/generator callback already routes through its own class call, and a C-function/bound/proxy
-   callback has no preemptible body — those take the plain JS_Call. A NORMAL function has no await/yield, so the
-   flow always COMPLETES (or throws) in one drive: async_func_resume_run collapses every preempt and returns the
-   real value/exception, leaving the frame at the completed shape (cur_sp==NULL, tramp_top==NULL) — freed here
-   exactly as JS_FlowFree frees a completed flow. */
-static JSValue js_call_as_flow(JSContext *ctx, JSValueConst func_obj, JSValueConst this_obj,
-                               int argc, JSValueConst *argv)
-{
-    JSAsyncFunctionState fs;
-    JSValue r;
-    /* Fast path (perf): with NO preempt hook installed (production, or any non-forced eval) no back-edge can ever
-       preempt, so running the callback as a flow is pure overhead — a direct call is byte-identical behavior. The
-       flow machinery (a heap func_state per call) is ONLY needed under forced execution. A non-NORMAL callback
-       (async/generator routes via its class call; C/bound/proxy has no preemptible body) also takes JS_Call. */
-    if (g_flow_control.preempt == NULL || !tramp_can_call(func_obj))
-        return JS_Call(ctx, func_obj, this_obj, argc, argv);
-    /* zero FIRST: async_func_init does not set tramp_top/throw_flag (JS_FlowNew relies on js_mallocz); an
-       uninitialized stack fs would make the first resume see a garbage tramp_top and take the deep-resume path. */
-    memset(&fs, 0, sizeof(fs));
-    if (async_func_init(ctx, &fs, func_obj, this_obj, argc, argv))
-        return JS_EXCEPTION;
-    r = async_func_resume_run(ctx, &fs);
-    DCHECK(fs.frame.cur_sp == NULL && fs.tramp_top == NULL,
-           "js_call_as_flow: a NORMAL callback flow did not COMPLETE in one drive (no await/yield exists to suspend it)");
-    js_free_rt(ctx->rt, fs.frame.arg_buf);
-    JS_FreeValue(ctx, fs.frame.cur_func);
-    JS_FreeValue(ctx, fs.this_val);
-    return r;
-}
+/* A C builtin that calls back into JS (forEach/map/sort/reduce, replace/stringify callbacks, getters, Proxy
+   traps) is a CONTINUATION-HOLDING re-entrant: its loop/accumulator state lives on the C stack between callback
+   invocations, so the callback CANNOT be parked mid-iteration — the C loop that resumes it is not itself
+   resumable. Running the callback as a self-completing flow (js_call_as_flow) was REMOVED: it made the callback
+   BODY preemptible, but only by DRIVING IT TO COMPLETION (async_func_resume_run self-resuming through every
+   preempt), which is the run-to-completion this project forbids — a callback flow that ignores the WFQ instead
+   of yielding to a higher-value flow. The honest state is that these callbacks are an UNROUTED gap (gs==NULL,
+   the engagement metric shows it) until the real fix lands: a RESUMABLE builtin loop (capture its iteration
+   state onto a heap record so a callback preempt parks the WHOLE operation as one WFQ flow and resumes at the
+   next index) — hooking the ENGINE, never re-hosting the builtin in JS. Do NOT reintroduce a drive-to-complete
+   wrapper to make the metric read 100%; that is a fake green the policy rejects. */
 
 /* APIClient forced-execution FLOW API: a flow is a preemptible activation. Its program runs as an async
    function frame (heap-resident, suspendable), so the scheduler can preempt it mid-execution (at a loop
@@ -44051,7 +44030,7 @@ static JSValue js_array_every(JSContext *ctx, JSValueConst this_val,
             args[0] = val;
             args[1] = index_val;
             args[2] = obj;
-            res = js_call_as_flow(ctx, func, this_arg, 3, args);   /* hook: callback body is preemptible */
+            res = JS_Call(ctx, func, this_arg, 3, args);
             JS_FreeValue(ctx, index_val);
             if (JS_IsException(res))
                 goto exception;
@@ -44195,7 +44174,7 @@ static JSValue js_array_reduce(JSContext *ctx, JSValueConst this_val,
             args[1] = val;
             args[2] = index_val;
             args[3] = obj;
-            acc1 = js_call_as_flow(ctx, func, JS_UNDEFINED, 4, args);   /* hook: reducer body is preemptible */
+            acc1 = JS_Call(ctx, func, JS_UNDEFINED, 4, args);
             JS_FreeValue(ctx, index_val);
             JS_FreeValue(ctx, val);
             val = JS_UNDEFINED;
@@ -44444,7 +44423,7 @@ static JSValue js_array_find(JSContext *ctx, JSValueConst this_val,
         args[0] = val;
         args[1] = index_val;
         args[2] = this_val;
-        res = js_call_as_flow(ctx, func, this_arg, 3, args);   /* hook: predicate body is preemptible */
+        res = JS_Call(ctx, func, this_arg, 3, args);
         if (JS_IsException(res))
             goto exception;
         if (JS_ToBoolFree(ctx, res)) {
@@ -45151,7 +45130,7 @@ static int js_array_cmp_generic(const void *a, const void *b, void *opaque) {
             goto cmp_same;
         argv[0] = ap->val;
         argv[1] = bp->val;
-        res = js_call_as_flow(ctx, psc->method, JS_UNDEFINED, 2, argv);   /* hook: comparator body is preemptible */
+        res = JS_Call(ctx, psc->method, JS_UNDEFINED, 2, argv);
         if (JS_IsException(res))
             goto exception;
         if (JS_VALUE_GET_TAG(res) == JS_TAG_INT) {
@@ -47924,7 +47903,7 @@ static JSValue js_string_replace(JSContext *ctx, JSValueConst this_val,
             args[0] = search_str;
             args[1] = js_int32(pos);
             args[2] = str;
-            repl_str = JS_ToStringFree(ctx, js_call_as_flow(ctx, replaceValue, JS_UNDEFINED, 3, args));   /* hook: replacer body preemptible */
+            repl_str = JS_ToStringFree(ctx, JS_Call(ctx, replaceValue, JS_UNDEFINED, 3, args));
         } else {
             args[0] = search_str;
             args[1] = str;
@@ -51476,7 +51455,7 @@ static JSValue internalize_json_property(JSContext *ctx, JSValueConst holder,
     args[0] = name_val;
     args[1] = val;
     args[2] = context;
-    res = js_call_as_flow(ctx, reviver, holder, 3, args);   /* hook: reviver body preemptible */
+    res = JS_Call(ctx, reviver, holder, 3, args);
     JS_FreeValue(ctx, name_val);
     JS_FreeValue(ctx, val);
     JS_FreeValue(ctx, context);
@@ -51636,7 +51615,7 @@ static JSValue js_json_check(JSContext *ctx, JSONStringifyContext *jsc,
     if (!JS_IsUndefined(jsc->replacer_func)) {
         args[0] = key;
         args[1] = val;
-        v = js_call_as_flow(ctx, jsc->replacer_func, holder, 2, args);   /* hook: replacer body preemptible */
+        v = JS_Call(ctx, jsc->replacer_func, holder, 2, args);
         JS_FreeValue(ctx, val);
         val = v;
         if (JS_IsException(val))
@@ -60592,7 +60571,7 @@ static JSValue js_typed_array_find(JSContext *ctx, JSValueConst this_val,
         args[0] = val;
         args[1] = index_val;
         args[2] = this_val;
-        res = js_call_as_flow(ctx, func, this_arg, 3, args);   /* hook: predicate body is preemptible */
+        res = JS_Call(ctx, func, this_arg, 3, args);
         if (JS_IsException(res))
             goto exception;
         if (JS_ToBoolFree(ctx, res)) {
@@ -61340,7 +61319,7 @@ static int js_TA_cmp_generic(const void *a, const void *b, void *opaque) {
                               a_idx * (size_t)psc->elt_size);
         argv[1] = psc->getfun(ctx, (char *)p->u.array.u.ptr +
                               b_idx * (size_t)(psc->elt_size));
-        res = js_call_as_flow(ctx, psc->cmp, JS_UNDEFINED, 2, vc(argv));   /* hook: comparator body is preemptible */
+        res = JS_Call(ctx, psc->cmp, JS_UNDEFINED, 2, vc(argv));
         if (JS_IsException(res)) {
             psc->exception = 1;
             goto done;
