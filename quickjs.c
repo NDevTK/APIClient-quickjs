@@ -18141,6 +18141,17 @@ typedef struct TrampFrame {
 #define CONT_AGEN_CREATE   3   /* cont_state = JSAsyncGeneratorData: an async generator's params are binding on
                                   this chain (run-to-initial_yield); settles at OP_initial_yield by creating the
                                   async-generator object. Mirrors the sync gen_magic==0xFF creation frame. */
+#define CONT_CONSTRUCT     4   /* cont_state = JSConstruct: a `new C()` bytecode-constructor body runs on this
+                                  chain (so a loop in the constructor body preempts the base). The created `this`
+                                  rides the continuation and is substituted for a non-object body result at
+                                  do_return, exactly as JS_CallConstructorInternal would. */
+
+/* A bytecode constructor's body run on the trampoline chain; holds the created `this` across the body so
+   do_return can apply the constructor return-value rule (use `this` when the body returns a non-object).
+   from_super distinguishes the two entry shapes: `new C()` (OP_call_constructor) has its operands on the
+   caller stack and cleans them at do_return; super() (OP_init_ctor) takes args from the derived frame's argv,
+   owns a `super_ref` to free, and pushes its bound object with no operand cleanup. */
+struct JSConstruct { JSValue created_obj; JSValue super_ref; uint8_t from_super; };
 
 /* Only a NORMAL bytecode function trampolines (the common deep-recursion case). */
 static inline bool tramp_can_call(JSValueConst func) {
@@ -18149,6 +18160,17 @@ static inline bool tramp_can_call(JSValueConst func) {
     fp = JS_VALUE_GET_OBJ(func);
     if (fp->class_id != JS_CLASS_BYTECODE_FUNCTION) return false;
     return fp->u.func.function_bytecode->func_kind == JS_FUNC_NORMAL;
+}
+/* A bytecode CONSTRUCTOR (`new C()`) runs its body on the caller's tramp chain (do_construct_tramp) so a loop
+   in the constructor body preempts the base flow at any depth — never a C-recursion through
+   JS_CallConstructorInternal that would drive it to completion. Native/bound/proxy constructors have no
+   preemptible body and fall back to JS_CallConstructorInternal at the call site. */
+static inline bool tramp_can_construct(JSValueConst func) {
+    JSObject *fp;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
+    fp = JS_VALUE_GET_OBJ(func);
+    if (fp->class_id != JS_CLASS_BYTECODE_FUNCTION) return false;
+    return fp->is_constructor;
 }
 /* An ASYNC function runs its body on the CALLER's tramp chain (do_async_tramp_call) so its sync-prefix loop
    preempts the base flow at any depth — never a nested C-recursion that would drive to completion. */
@@ -18389,6 +18411,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     size_t alloca_size;
     TrampFrame *tf_top = NULL;         /* heap stack of trampolined NORMAL callees (this activation's base = C stack) */
     int tramp_first = -1; uint8_t tramp_is_tail = 0;   /* set before goto do_tramp_call */
+    /* constructor trampoline (do_construct_tramp): con_func/con_ntgt/con_args/con_argc + con_from_super are set
+       by OP_call_constructor (new C()) or OP_init_ctor (super()) before the goto. */
+    JSValueConst con_func = JS_UNDEFINED, con_ntgt = JS_UNDEFINED;
+    JSValueConst *con_args = NULL; int con_argc = 0;
+    uint8_t con_from_super = 0; JSValue con_super_ref = JS_UNDEFINED;
     /* array-iteration coroutine (do_array_iter_tramp): tramp_iter_state is handed to the callback frame that
        do_tramp_call pushes, so its do_return re-enters js_array_every_step instead of returning to bytecode. */
     void *tramp_cont_state = NULL, *cont_st = NULL;
@@ -18711,8 +18738,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     break;
                 case OP_SPECIAL_OBJECT_HOME_OBJECT:
                     {
+                        /* the RUNNING function's home object (for super.x): read sf->cur_func, not the `p` of the
+                           base flow's func_obj — a trampolined method/constructor body switches sf->cur_func but
+                           leaves `p` pointing at the base function, so `p` would give the wrong (or no) home
+                           object and super.x would resolve against null. */
                         JSObject *p1;
-                        p1 = p->u.func.home_object;
+                        p1 = JS_VALUE_GET_OBJ(sf->cur_func)->u.func.home_object;
                         if (unlikely(!p1))
                             *sp++ = JS_UNDEFINED;
                         else
@@ -18952,6 +18983,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc += 2;
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
+                if (tramp_can_construct(call_argv[-2])) {   /* bytecode ctor -> body on THIS chain (loop preempts base) */
+                    con_func = call_argv[-2]; con_ntgt = call_argv[-1];
+                    con_args = vc(call_argv); con_argc = call_argc;
+                    con_from_super = 0; con_super_ref = JS_UNDEFINED;
+                    tramp_first = -2; tramp_is_tail = 0;
+                    goto do_construct_tramp;
+                }
                 ret_val = JS_CallConstructorInternal(ctx, call_argv[-2],
                                                      call_argv[-1], call_argc,
                                                      vc(call_argv), 0);
@@ -19102,6 +19140,90 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 ntf->arg_allocated = narg_alloc; ntf->callee_argc = eff_argc;
                 ntf->async_data = NULL; ntf->async_promise = JS_UNDEFINED; ntf->gen_data = NULL;
                 ntf->cont_state = tramp_cont_state; ntf->cont_kind = tramp_cont_kind; tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;   /* NORMAL frame; iter_state set only for an array-iteration callback */
+                sf = nsf; b = nb; ctx = nb->realm;
+                arg_buf = narg_buf; var_buf = nvar_buf; stack_buf = nstack_buf;
+                var_refs = np->u.func.var_refs;
+                argc = eff_argc; argv = (JSValueConst *)narg_buf;
+                arg_allocated_size = narg_alloc;
+                local_buf = nlb; sp = nstack_buf; pc = nb->byte_code_buf;
+                goto restart;
+            }
+
+        do_construct_tramp:
+            /* Run a bytecode CONSTRUCTOR body on THIS chain (so a loop in the constructor body preempts the base
+               flow) instead of C-recursing through JS_CallConstructorInternal. Two entry shapes feed it via the
+               con_* locals: `new C()` (OP_call_constructor, con_from_super=0, args + func/new_target on the caller
+               stack) and super() (OP_init_ctor, con_from_super=1, args from the derived frame's argv, con_super_ref
+               owned). A base (non-derived) constructor gets a freshly-created `this`; a derived one binds `this`
+               via super() and its body's own return-value machinery yields the object (created_obj = undefined).
+               The created obj rides a CONT_CONSTRUCT continuation and is substituted at do_return when the body
+               returns a non-object. Layout otherwise mirrors do_tramp_call. */
+            {
+                JSValueConst nfunc = con_func;
+                JSValueConst ntgt = con_ntgt;
+                JSObject *np = JS_VALUE_GET_OBJ(nfunc);
+                JSFunctionBytecode *nb = np->u.func.function_bytecode;
+                struct JSConstruct *cs; JSValue cthis;
+                int eff_argc = con_argc;
+                int narg_alloc = (eff_argc < nb->arg_count) ? nb->arg_count : 0;
+                size_t asize = sizeof(JSValue) * (narg_alloc + nb->var_count + nb->stack_size)
+                             + sizeof(JSVarRef *) * nb->var_ref_count;
+                TrampFrame *ntf; JSValue *nlb, *narg_buf, *nvar_buf, *nstack_buf; JSStackFrame *nsf; int k;
+                if (nb->is_derived_class_constructor) {
+                    cthis = JS_UNDEFINED;   /* bound by super(); body returns the object itself */
+                } else {
+                    cthis = js_create_from_ctor(ctx, ntgt, JS_CLASS_OBJECT);
+                    if (unlikely(JS_IsException(cthis))) { JS_FreeValue(ctx, con_super_ref); goto exception; }
+                }
+                cs = js_malloc_rt(rt, sizeof(*cs));
+                if (unlikely(!cs)) { JS_FreeValue(ctx, cthis); JS_FreeValue(ctx, con_super_ref); JS_ThrowOutOfMemory(ctx); goto exception; }
+                cs->created_obj = cthis;   /* owned here; substituted or freed at do_return / exception unwind */
+                cs->super_ref = con_super_ref; cs->from_super = con_from_super;
+                ntf = js_malloc_rt(rt, sizeof(TrampFrame));
+                if (unlikely(!ntf)) { JS_FreeValue(ctx, cthis); JS_FreeValue(ctx, con_super_ref); js_free_rt(rt, cs); JS_ThrowOutOfMemory(ctx); goto exception; }
+                nlb = js_malloc_rt(rt, asize ? asize : sizeof(JSValue));
+                if (unlikely(!nlb)) { JS_FreeValue(ctx, cthis); JS_FreeValue(ctx, con_super_ref); js_free_rt(rt, cs); js_free_rt(rt, ntf); JS_ThrowOutOfMemory(ctx); goto exception; }
+                ntf->up = tf_top;
+                ntf->caller_sf = sf; ntf->caller_b = b; ntf->caller_ctx = ctx;
+                ntf->caller_local_buf = local_buf; ntf->caller_stack_buf = stack_buf;
+                ntf->caller_var_buf = var_buf; ntf->caller_arg_buf = arg_buf;
+                ntf->caller_this = this_obj; ntf->caller_new_target = new_target;
+                ntf->caller_var_refs = var_refs;
+                ntf->caller_argc = argc; ntf->caller_argv = argv;
+                ntf->caller_arg_allocated_size = arg_allocated_size;
+                ntf->caller_sp = sp;
+                ntf->call_first = tramp_first; ntf->call_argc = con_argc; ntf->is_tail = tramp_is_tail;
+                ntf->b = nb; ntf->ctx = nb->realm; ntf->local_buf = nlb;
+                nsf = &ntf->sf;
+                nsf->is_strict_mode = nb->is_strict_mode;
+                nsf->cur_func = unsafe_unconst(nfunc);
+                nsf->arg_count = eff_argc;
+                if (narg_alloc) {
+                    int n = min_int(eff_argc, narg_alloc);
+                    narg_buf = nlb;
+                    for (k = 0; k < n; k++) narg_buf[k] = js_dup(con_args[k]);
+                    for (; k < narg_alloc; k++) narg_buf[k] = JS_UNDEFINED;
+                    nsf->arg_count = narg_alloc;
+                } else {
+                    narg_buf = (JSValue *)con_args;
+                }
+                nvar_buf = nlb + narg_alloc;
+                for (k = 0; k < nb->var_count; k++) nvar_buf[k] = JS_UNDEFINED;
+                nstack_buf = nvar_buf + nb->var_count;
+                nsf->arg_buf = narg_buf; nsf->var_buf = nvar_buf;
+                nsf->var_refs = (JSVarRef **)(nstack_buf + nb->stack_size);
+                nsf->var_ref_count = nb->var_ref_count;
+                for (k = 0; k < nb->var_ref_count; k++) nsf->var_refs[k] = NULL;
+                nsf->cur_pc = NULL; nsf->cur_sp = NULL;
+                nsf->prev_frame = rt->current_stack_frame;
+                rt->current_stack_frame = nsf;
+                tf_top = ntf;
+                this_obj = cthis;        /* borrowed alias of cs->created_obj during the body */
+                new_target = ntgt;
+                ntf->this_val = this_obj; ntf->new_target = new_target;
+                ntf->arg_allocated = narg_alloc; ntf->callee_argc = eff_argc;
+                ntf->async_data = NULL; ntf->async_promise = JS_UNDEFINED; ntf->gen_data = NULL;
+                ntf->cont_state = cs; ntf->cont_kind = CONT_CONSTRUCT;
                 sf = nsf; b = nb; ctx = nb->realm;
                 arg_buf = narg_buf; var_buf = nvar_buf; stack_buf = nstack_buf;
                 var_refs = np->u.func.var_refs;
@@ -19694,7 +19816,30 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc = sf->cur_pc; sp = rtf->caller_sp;
                 cfirst = rtf->call_first; cargc = rtf->call_argc; itail = rtf->is_tail;
                 js_free_rt(rt, rtf);
-                if (rck != CONT_NONE) {
+                if (rck == CONT_CONSTRUCT) {
+                    /* constructor body returned: apply the constructor rule — use the body result if it is an
+                       object, else the created `this`. */
+                    struct JSConstruct *cs = rcs;
+                    JSValue created = cs->created_obj;
+                    uint8_t from_super = cs->from_super;
+                    JSValue super_ref = cs->super_ref;
+                    js_free_rt(rt, cs);
+                    if (JS_VALUE_GET_TAG(ret_val) == JS_TAG_OBJECT) {
+                        JS_FreeValue(ctx, created);
+                    } else {
+                        JS_FreeValue(ctx, ret_val);
+                        ret_val = created;
+                    }
+                    if (from_super) {
+                        /* super(): no operands on the caller stack — free the super ctor ref and push the bound
+                           object where the derived body expects it (caller_sp). */
+                        JS_FreeValue(ctx, super_ref);
+                        *sp++ = ret_val;
+                        BREAK;
+                    }
+                    /* new C(): operands (func,new_target,args) live on the caller stack — fall through to the
+                       normal cargv cleanup + push. */
+                } else if (rck != CONT_NONE) {
                     /* A C-builtin-driven CALLBACK returned: its operands live in the state's own buffer
                        (borrowed), NOT on the caller's stack — so skip the cargv arg-free, and feed the result to
                        that builtin's STEP instead of pushing it. The step drives the next element or finishes. */
@@ -19754,9 +19899,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 sf->cur_pc = pc;
                 if (JS_IsUndefined(new_target))
                     goto non_ctor_call;
-                super = JS_GetPrototype(ctx, func_obj);
+                /* super = the parent class = prototype of the RUNNING constructor. Use sf->cur_func, not the
+                   func_obj C-parameter: a trampolined constructor body switches sf->cur_func but leaves the
+                   parameter pointing at the base flow's function (they diverge once a `new C()` runs on the
+                   chain), which would resolve super() against the wrong class. */
+                super = JS_GetPrototype(ctx, sf->cur_func);
                 if (JS_IsException(super))
                     goto exception;
+                if (tramp_can_construct(super)) {   /* bytecode super -> body on THIS chain (loop preempts base) */
+                    con_func = super; con_ntgt = new_target;
+                    con_args = argv; con_argc = argc;
+                    con_from_super = 1; con_super_ref = super;   /* owned; freed in the CONT_CONSTRUCT return/unwind */
+                    tramp_first = 0; tramp_is_tail = 0;   /* caller_sp = current sp: super() pushes its object there */
+                    goto do_construct_tramp;
+                }
                 ret = JS_CallConstructor2(ctx, super, new_target, argc, argv);
                 JS_FreeValue(ctx, super);
                 if (JS_IsException(ret))
@@ -22198,7 +22354,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         arg_allocated_size = rtf->caller_arg_allocated_size;
         pc = sf->cur_pc; sp = rtf->caller_sp;
         js_free_rt(rt, rtf);
-        if (xck != CONT_NONE) {
+        if (xck == CONT_CONSTRUCT) {
+            /* the throwing frame was a constructor body: drop the created `this` and the super ctor ref. For
+               new C() the operands on the caller stack are freed by the caller's own catch-search; for super()
+               there are no caller-stack operands (args are the derived frame's argv). */
+            struct JSConstruct *cs = xcs;
+            JS_FreeValue(ctx, cs->created_obj);
+            JS_FreeValue(ctx, cs->super_ref);
+            js_free_rt(rt, cs);
+        } else if (xck != CONT_NONE) {
             /* the throwing frame was a C-builtin-driven CALLBACK: abandon the iteration (its state owns the
                object/accumulator/element) and re-raise in the builtin's ORIGINAL caller, whose stack still holds
                the OP_call operands for its own catch-search to free. */
