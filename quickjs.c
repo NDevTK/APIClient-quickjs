@@ -18147,8 +18147,10 @@ void JS_FlowPreemptStats(uint64_t *requested, uint64_t *fired) {
 static bool flow_preempt_routable(JSAsyncFunctionState *gs) {
     if (gs == NULL) return false;
     if (gs == g_flow_base_gen) return true;
-    JSObject *p = JS_VALUE_GET_OBJ(gs->frame.cur_func);
-    return p->u.func.function_bytecode->func_kind == JS_FUNC_GENERATOR;
+    JSFunctionKindEnum k = JS_VALUE_GET_OBJ(gs->frame.cur_func)->u.func.function_bytecode->func_kind;
+    /* sync generator (js_generator_next / js_call_generator_function) and async function (js_async_function_resume)
+       drivers self-resume via async_func_resume_run. ASYNC_GENERATOR is the remaining gap (its driver next). */
+    return k == JS_FUNC_GENERATOR || k == JS_FUNC_ASYNC;
 }
 
 /* Concolic branch arm + snapshot fork. The branch hook returns the arm (0/1), ORed with 0x100 when it forked
@@ -21642,8 +21644,16 @@ static JSValue async_func_resume(JSContext *ctx, JSAsyncFunctionState *s)
 static JSValue async_func_resume_run(JSContext *ctx, JSAsyncFunctionState *s)
 {
     JSValue r = async_func_resume(ctx, s);
-    while (JS_VALUE_GET_TAG(r) == JS_TAG_INT && JS_VALUE_GET_INT(r) == FUNC_RET_PREEMPT)
+    while (JS_VALUE_GET_TAG(r) == JS_TAG_INT && JS_VALUE_GET_INT(r) == FUNC_RET_PREEMPT) {
+        /* A preempt-resume is a CONTINUATION, never a re-throw. The driver set throw_flag for the FIRST resume
+           (a generator .throw() or an await rejection); that throw was already delivered+consumed by the first
+           async_func_resume (goto exception). JS_CallInternal's generator entry does not clear throw_flag, so
+           leaving it set would make the re-resume `goto exception` a SECOND time on a stale/NULL exception —
+           losing the continuation (the await-rejection-then-preempt-in-catch bug). Clear it: only a real throw
+           returns JS_EXCEPTION (which exits this loop), so if we are here the body is mid-run, not throwing. */
+        s->throw_flag = false;
         r = async_func_resume(ctx, s);
+    }
     return r;
 }
 
@@ -22203,7 +22213,9 @@ static bool js_async_function_post(JSContext *ctx, JSAsyncFunctionData *s, JSVal
    out-of-order step that corrupted the heap; it was removed. */
 static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
 {
-    return js_async_function_post(ctx, s, async_func_resume(ctx, &s->func_state));
+    /* async_func_resume_run self-resumes through forced back-edge preempts, so js_async_function_post only ever
+       sees a real AWAIT / return / exception (never a FUNC_RET_PREEMPT its await path would misfire). */
+    return js_async_function_post(ctx, s, async_func_resume_run(ctx, &s->func_state));
 }
 
 static JSValue js_async_function_resolve_call(JSContext *ctx,
