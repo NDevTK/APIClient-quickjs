@@ -45497,6 +45497,10 @@ static JSValue js_typed_array___speciesCreate(JSContext *ctx,
    (s->ret is the final result), -1 = EXCEPTION. Consumes `res`. Identical semantics to the original C loop. */
 static int js_array_every_step(JSContext *ctx, JSArrayEvery *s, JSValue res, JSValueConst out_args[3])
 {
+    /* the element cursor never runs past the length; pending_k is either -1 (no callback in flight) or the
+       index whose callback result is `res` now — a drift would double-process or skip an element. */
+    assert(s->k >= 0 && s->k <= s->len);
+    assert(s->pending_k == -1 || (s->pending_k >= 0 && s->pending_k < s->len));
     if (s->pending_k >= 0) {
         int64_t k = s->pending_k;
         s->pending_k = -1;
@@ -45722,6 +45726,8 @@ static int js_array_reduce_init(JSContext *ctx, JSArrayReduce *s, JSValueConst t
    element and fill out_args with (acc, value, index, obj). 1 = CALL, 0 = DONE (s->acc is the result), -1 = EXC. */
 static int js_array_reduce_step(JSContext *ctx, JSArrayReduce *s, JSValue acc1, JSValueConst out_args[4])
 {
+    /* the scan cursor stays within the array; pending is 0/1 (at most one callback in flight). */
+    assert(s->k >= -1 && s->k <= s->len && (s->pending == 0 || s->pending == 1));
     if (s->pending) {
         s->pending = 0;
         JS_FreeValue(ctx, s->acc);
