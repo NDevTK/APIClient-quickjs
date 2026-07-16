@@ -18125,14 +18125,19 @@ typedef struct TrampFrame {
        gen_data->func_state.frame IS this frame's sf (like async_data). gen_magic is NEXT/RETURN/THROW. */
     struct JSGeneratorData *gen_data;
     uint8_t gen_magic;
-    /* C-CONTINUATION frame: a C builtin whose iteration drives a JS callback (forEach/map/every/some/filter) runs
-       its loop HERE on the chain instead of C-recursing JS_Call. iter_state holds the builtin's resumable state
-       (JSArrayEvery). This frame has NO bytecode (b==NULL); its local_buf is a small stack holding the next
-       callback + its args. When the callback frame above it returns, do_return re-enters js_array_every_step with
-       the result (do_array_iter_step) instead of dispatching bytecode. The callback runs with gen_state unchanged
-       (the base), so a callback BODY LOOP preempts the BASE flow at any depth — never drive-to-completion. */
-    struct JSArrayEvery *iter_state;
+    /* C-CONTINUATION: this frame IS a JS callback driven by a C builtin's iteration (forEach/map/every/some/
+       filter, reduce, ...) that runs on the chain instead of C-recursing JS_Call. cont_state is the builtin's
+       resumable state, tagged by cont_kind; its operands live in a buffer OWNED BY THAT STATE (never the caller's
+       compiler-sized stack). When this frame returns, do_return skips its `cargv = sp - cargc` arg-free and
+       re-enters the builtin's STEP with the result. The callback runs with gen_state unchanged (the base), so a
+       callback BODY LOOP preempts the BASE flow at any depth — never drive-to-completion. */
+    void *cont_state;
+    uint8_t cont_kind;   /* CONT_NONE / CONT_ARRAY_ITER / CONT_ARRAY_REDUCE */
 } TrampFrame;
+
+#define CONT_NONE          0
+#define CONT_ARRAY_ITER    1   /* cont_state = JSArrayEvery  (forEach/map/every/some/filter) */
+#define CONT_ARRAY_REDUCE  2   /* cont_state = JSArrayReduce (reduce/reduceRight) */
 
 /* Only a NORMAL bytecode function trampolines (the common deep-recursion case). */
 static inline bool tramp_can_call(JSValueConst func) {
@@ -18181,6 +18186,22 @@ static int js_array_every_step(JSContext *ctx, struct JSArrayEvery *s, JSValue r
 static void js_array_every_end(JSContext *ctx, struct JSArrayEvery *s, bool take_ret);
 static JSValue js_array_every(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int special);
 static bool tramp_can_call_array_iter(JSValueConst func, int *out_special);
+/* reduce/reduceRight: the same continuation-holding shape as js_array_every, with the accumulator as the state. */
+typedef struct JSArrayReduce {
+    JSValue obj, acc, val;
+    int64_t len, k;
+    int special, pending;        /* pending = a callback result (the next accumulator) is awaited */
+    JSValueConst func;
+    JSValue cb_args[6];          /* [this=undefined, func, acc, val, index, obj]; call_argv = &cb_args[2], argc=4 */
+    int orig_cfirst, orig_cargc;
+    uint8_t orig_is_tail;
+} JSArrayReduce;
+static int js_array_reduce_init(JSContext *ctx, struct JSArrayReduce *s, JSValueConst this_val,
+                                int argc, JSValueConst *argv, int special);
+static int js_array_reduce_step(JSContext *ctx, struct JSArrayReduce *s, JSValue acc1, JSValueConst out_args[4]);
+static void js_array_reduce_end(JSContext *ctx, struct JSArrayReduce *s, bool take_acc);
+static JSValue js_array_reduce(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int special);
+static bool tramp_can_call_array_reduce(JSValueConst func, int *out_special);
 /* Function.prototype.call is CALL-SITE-RESOLVED: it holds no continuation, so rather than C-recursing
    js_function_call (which would run the ultimate target's body off the chain, unable to preempt), the
    interpreter reslices the operands at the call site and dispatches the target directly (do_forward_call). */
@@ -18315,7 +18336,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     int tramp_first = -1; uint8_t tramp_is_tail = 0;   /* set before goto do_tramp_call */
     /* array-iteration coroutine (do_array_iter_tramp): tramp_iter_state is handed to the callback frame that
        do_tramp_call pushes, so its do_return re-enters js_array_every_step instead of returning to bytecode. */
-    struct JSArrayEvery *tramp_iter_state = NULL, *iter_st = NULL;
+    void *tramp_cont_state = NULL, *cont_st = NULL;
+    uint8_t tramp_cont_kind = CONT_NONE, cont_kind_cur = CONT_NONE;
     int iter_special = 0;
     int tramp_gen_magic = 0;                            /* set before goto do_generator_tramp */
     int tramp_gen_forof = 1;                            /* <0 = for-of iterator stack offset (always -3-.. ); 1 = direct .next() (no valid offset is positive) */
@@ -18898,6 +18920,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_array_iter(call_argv[-1], &iter_special)) {   /* arr.forEach/map/... -> callback drive on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_array_iter_tramp;
                 }
+                if (tramp_can_call_array_reduce(call_argv[-1], &iter_special)) {   /* arr.reduce/reduceRight -> callback drive on THIS chain */
+                    tramp_is_tail = (opcode == OP_tail_call_method); goto do_array_reduce_tramp;
+                }
                 if (tramp_is_function_call(call_argv[-1])) {   /* f.call(thisArg,...) -> resolve + dispatch f here */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_forward_call;
                 }
@@ -19010,7 +19035,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 ntf->this_val = this_obj; ntf->new_target = new_target;
                 ntf->arg_allocated = narg_alloc; ntf->callee_argc = eff_argc;
                 ntf->async_data = NULL; ntf->async_promise = JS_UNDEFINED; ntf->gen_data = NULL;
-                ntf->iter_state = tramp_iter_state; tramp_iter_state = NULL;   /* NORMAL frame; iter_state set only for an array-iteration callback */
+                ntf->cont_state = tramp_cont_state; ntf->cont_kind = tramp_cont_kind; tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;   /* NORMAL frame; iter_state set only for an array-iteration callback */
                 sf = nsf; b = nb; ctx = nb->realm;
                 arg_buf = narg_buf; var_buf = nvar_buf; stack_buf = nstack_buf;
                 var_refs = np->u.func.var_refs;
@@ -19043,6 +19068,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_async(call_argv[-1])) goto do_async_tramp_call;
                 if (tramp_can_call_gen_create(call_argv[-1])) goto do_generator_create_tramp;
                 if (tramp_can_call_array_iter(call_argv[-1], &iter_special)) goto do_array_iter_tramp;
+                if (tramp_can_call_array_reduce(call_argv[-1], &iter_special)) goto do_array_reduce_tramp;
                 /* a C-function / bound / proxy target has no preemptible body — plain call, nothing to park */
                 ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2], JS_UNDEFINED,
                                           call_argc, vc(call_argv), 0);
@@ -19054,6 +19080,55 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 sp -= call_argc + 2;
                 *sp++ = ret_val;
                 BREAK;
+            }
+
+        do_array_reduce_tramp:
+            /* arr.reduce/reduceRight: same shape as do_array_iter_tramp — the callback drive runs HERE so a
+               callback body loop preempts the base flow; operands live in the state's cb_args. */
+            {
+                struct JSArrayReduce *s = js_malloc(ctx, sizeof(*s));
+                if (unlikely(!s)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                if (js_array_reduce_init(ctx, s, call_argv[-2], call_argc, vc(call_argv), iter_special)) {
+                    js_array_reduce_end(ctx, s, false); js_free_rt(rt, s); goto exception;
+                }
+                for (i = 0; i < 6; i++) s->cb_args[i] = JS_UNDEFINED;
+                s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
+                cont_st = s; cont_kind_cur = CONT_ARRAY_REDUCE;
+                ret_val = JS_UNDEFINED;
+                goto do_array_reduce_step;
+            }
+
+        do_array_reduce_step:
+            {
+                struct JSArrayReduce *s = (struct JSArrayReduce *)cont_st;
+                int st = js_array_reduce_step(ctx, s, ret_val, (JSValueConst *)&s->cb_args[2]);
+                if (unlikely(st < 0)) { js_array_reduce_end(ctx, s, false); js_free_rt(rt, s); goto exception; }
+                if (st == 0) {   /* DONE: the accumulator is the result */
+                    JSValue r = s->acc;
+                    int cfirst = s->orig_cfirst, cargc = s->orig_cargc;
+                    uint8_t itail = s->orig_is_tail;
+                    JSValue *cargv = sp - cargc;
+                    js_array_reduce_end(ctx, s, true);
+                    js_free_rt(rt, s);
+                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
+                    sp += cfirst - cargc;
+                    if (itail) { ret_val = r; goto do_return; }
+                    *sp++ = r;
+                    BREAK;
+                }
+                s->cb_args[0] = JS_UNDEFINED;   /* reduce's callback gets this = undefined */
+                s->cb_args[1] = s->func;
+                call_argv = (JSValueConst *)&s->cb_args[2];
+                call_argc = 4; tramp_first = -2; tramp_is_tail = 0;
+                if (tramp_can_call(s->cb_args[1])) {
+                    tramp_cont_state = s; tramp_cont_kind = CONT_ARRAY_REDUCE;
+                    goto do_tramp_call;
+                }
+                ret_val = JS_Call(ctx, s->cb_args[1], JS_UNDEFINED, 4, (JSValueConst *)&s->cb_args[2]);
+                if (unlikely(JS_IsException(ret_val))) {
+                    js_array_reduce_end(ctx, s, false); js_free_rt(rt, s); goto exception;
+                }
+                goto do_array_reduce_step;
             }
 
         do_array_iter_tramp:
@@ -19069,7 +19144,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 for (i = 0; i < 5; i++) s->cb_args[i] = JS_UNDEFINED;
                 s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
-                iter_st = s;
+                cont_st = s; cont_kind_cur = CONT_ARRAY_ITER;
                 ret_val = JS_UNDEFINED;   /* first step has no previous callback result */
                 goto do_array_iter_step;
             }
@@ -19078,7 +19153,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             /* ret_val = the previous callback's result (JS_UNDEFINED on the first step); iter_st = the state.
                Feed it to the step, then either drive the next callback or finish the builtin. */
             {
-                struct JSArrayEvery *s = iter_st;
+                struct JSArrayEvery *s = (struct JSArrayEvery *)cont_st;
                 int st = js_array_every_step(ctx, s, ret_val, (JSValueConst *)&s->cb_args[2]);
                 if (unlikely(st < 0)) { js_array_every_end(ctx, s, false); js_free_rt(rt, s); goto exception; }
                 if (st == 0) {   /* DONE: pop the ORIGINAL OP_call operands, yield the builtin's result */
@@ -19099,7 +19174,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 call_argv = (JSValueConst *)&s->cb_args[2];
                 call_argc = 3; tramp_first = -2; tramp_is_tail = 0;
                 if (tramp_can_call(s->cb_args[1])) {
-                    tramp_iter_state = s;   /* the pushed frame carries the state; its do_return re-enters the step */
+                    tramp_cont_state = s; tramp_cont_kind = CONT_ARRAY_ITER;   /* the pushed frame carries the state; its do_return re-enters the step */
                     goto do_tramp_call;
                 }
                 /* A non-NORMAL callback (C function / bound / proxy) has no preemptible body — call it directly
@@ -19153,7 +19228,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 for (i = -1; i < call_argc; i++) JS_FreeValue(ctx, call_argv[i]);
                 atf->caller_sp = call_argv - 1;
                 atf->call_first = -1; atf->call_argc = 0; atf->is_tail = tramp_is_tail;
-                atf->async_data = as; atf->async_promise = aprom; atf->gen_data = NULL; atf->iter_state = NULL;
+                atf->async_data = as; atf->async_promise = aprom; atf->gen_data = NULL; atf->cont_state = NULL; atf->cont_kind = CONT_NONE;
                 atf->b = NULL; atf->local_buf = NULL;   /* async frame owns its buffers via as->func_state */
                 /* enter the async body frame (mirror the generator-resume entry; gen_state stays the base) */
                 asf = &as->func_state.frame;
@@ -19289,7 +19364,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 gtf->caller_arg_allocated_size = arg_allocated_size;
                 gtf->call_first = -2; gtf->call_argc = 0;
                 gtf->async_data = NULL;   /* async_promise holds ghold (direct) or UNDEFINED (for-of) */
-                gtf->gen_data = gs; gtf->gen_magic = (uint8_t)gmagic; gtf->iter_state = NULL;
+                gtf->gen_data = gs; gtf->gen_magic = (uint8_t)gmagic; gtf->cont_state = NULL; gtf->cont_kind = CONT_NONE;
                 gtf->b = NULL; gtf->local_buf = NULL;   /* the body frame owns its buffers via gs->func_state */
                 gfp = JS_VALUE_GET_OBJ(gsf->cur_func);
                 gb = gfp->u.func.function_bytecode;
@@ -19396,7 +19471,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 gtf->caller_sp = call_argv + tramp_first;   /* below func(+this)+args; the generator object goes here */
                 gtf->call_first = -1; gtf->call_argc = 0; gtf->is_tail = tramp_is_tail;
                 gtf->async_data = NULL;
-                gtf->gen_data = s; gtf->gen_magic = 0xFF; gtf->iter_state = NULL;   /* 0xFF = CREATING (run-to-initial_yield), not a GEN_MAGIC */
+                gtf->gen_data = s; gtf->gen_magic = 0xFF; gtf->cont_state = NULL; gtf->cont_kind = CONT_NONE;   /* 0xFF = CREATING (run-to-initial_yield), not a GEN_MAGIC */
                 gtf->b = NULL; gtf->local_buf = NULL;
                 gsf = &s->func_state.frame;
                 gfp = JS_VALUE_GET_OBJ(gsf->cur_func);
@@ -19452,7 +19527,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             if (tf_top) {
                 TrampFrame *rtf = tf_top;
                 int cfirst, cargc; uint8_t itail;
-                struct JSArrayEvery *rist = rtf->iter_state;
+                void *rcs = rtf->cont_state; uint8_t rck = rtf->cont_kind;
                 if (unlikely(sf->var_ref_count != 0)) close_var_refs(rt, sf);
                 for (pval = local_buf; pval < sp; pval++) JS_FreeValue(ctx, *pval);
                 js_free_rt(rt, local_buf);
@@ -19468,11 +19543,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc = sf->cur_pc; sp = rtf->caller_sp;
                 cfirst = rtf->call_first; cargc = rtf->call_argc; itail = rtf->is_tail;
                 js_free_rt(rt, rtf);
-                if (rist) {
-                    /* An array-iteration CALLBACK returned: its operands live in the state's cb_args (borrowed),
-                       NOT on the caller's stack — so skip the cargv arg-free, and feed the result to the step
-                       instead of pushing it. The step drives the next element or finishes the builtin. */
-                    iter_st = rist;
+                if (rck != CONT_NONE) {
+                    /* A C-builtin-driven CALLBACK returned: its operands live in the state's own buffer
+                       (borrowed), NOT on the caller's stack — so skip the cargv arg-free, and feed the result to
+                       that builtin's STEP instead of pushing it. The step drives the next element or finishes. */
+                    cont_st = rcs; cont_kind_cur = rck;
+                    if (rck == CONT_ARRAY_REDUCE) goto do_array_reduce_step;
                     goto do_array_iter_step;
                 }
                 if (itail) goto do_return;   /* caller was a tail-caller: propagate */
@@ -21931,7 +22007,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        call operands, which the caller's catch-search frees) — never leak tf_top by returning to the C base. */
     if (tf_top) {
         TrampFrame *rtf = tf_top;
-        struct JSArrayEvery *xist = rtf->iter_state;
+        void *xcs = rtf->cont_state; uint8_t xck = rtf->cont_kind;
         if (unlikely(sf->var_ref_count != 0)) close_var_refs(rt, sf);
         for (pval = local_buf; pval < sp; pval++) JS_FreeValue(ctx, *pval);
         js_free_rt(rt, local_buf);
@@ -21946,12 +22022,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         arg_allocated_size = rtf->caller_arg_allocated_size;
         pc = sf->cur_pc; sp = rtf->caller_sp;
         js_free_rt(rt, rtf);
-        if (xist) {
-            /* the throwing frame was an array-iteration CALLBACK: abandon the iteration (its state owns obj/ret/
-               val) and re-raise in the builtin's ORIGINAL caller, whose stack still holds the OP_call operands
-               for its own catch-search to free. */
-            js_array_every_end(ctx, xist, false);
-            js_free_rt(rt, xist);
+        if (xck != CONT_NONE) {
+            /* the throwing frame was a C-builtin-driven CALLBACK: abandon the iteration (its state owns the
+               object/accumulator/element) and re-raise in the builtin's ORIGINAL caller, whose stack still holds
+               the OP_call operands for its own catch-search to free. */
+            if (xck == CONT_ARRAY_ITER)
+                js_array_every_end(ctx, (struct JSArrayEvery *)xcs, false);
+            else
+                js_array_reduce_end(ctx, (struct JSArrayReduce *)xcs, false);
+            js_free_rt(rt, xcs);
         }
         goto exception;
     }
@@ -44698,93 +44777,132 @@ static bool tramp_can_call_array_iter(JSValueConst func, int *out_special)
 #define special_reduce       0
 #define special_reduceRight  1
 
+/* Seed the accumulator: argv[1] if given, else the first present element (spec: empty + no seed -> TypeError). */
+static int js_array_reduce_init(JSContext *ctx, JSArrayReduce *s, JSValueConst this_val,
+                                int argc, JSValueConst *argv, int special)
+{
+    int64_t k1;
+    int present;
+
+    s->obj = JS_UNDEFINED; s->acc = JS_UNDEFINED; s->val = JS_UNDEFINED;
+    s->len = 0; s->k = 0; s->special = special; s->pending = 0;
+    if (special & special_TA) {
+        s->obj = js_dup(this_val);
+        s->len = js_typed_array_get_length_unsafe(ctx, s->obj);
+        if (s->len < 0) return -1;
+    } else {
+        s->obj = JS_ToObject(ctx, this_val);
+        if (js_get_length64(ctx, &s->len, s->obj)) return -1;
+    }
+    s->func = argv[0];
+    if (check_function(ctx, s->func)) return -1;
+    if (argc > 1) {
+        s->acc = js_dup(argv[1]);
+        return 0;
+    }
+    for (;;) {
+        if (s->k >= s->len) { JS_ThrowTypeError(ctx, "empty array"); return -1; }
+        k1 = (special & special_reduceRight) ? s->len - s->k - 1 : s->k;
+        s->k++;
+        if (special & special_TA) {
+            s->acc = JS_GetPropertyInt64(ctx, s->obj, k1);
+            if (JS_IsException(s->acc)) return -1;
+            return 0;
+        }
+        present = JS_TryGetPropertyInt64(ctx, s->obj, k1, &s->acc);
+        if (present < 0) return -1;
+        if (present) return 0;
+    }
+}
+
+/* One coroutine step: adopt the previous callback's result as the accumulator, then advance to the next present
+   element and fill out_args with (acc, value, index, obj). 1 = CALL, 0 = DONE (s->acc is the result), -1 = EXC. */
+static int js_array_reduce_step(JSContext *ctx, JSArrayReduce *s, JSValue acc1, JSValueConst out_args[4])
+{
+    if (s->pending) {
+        s->pending = 0;
+        JS_FreeValue(ctx, s->acc);
+        s->acc = acc1;                 /* the callback's result IS the next accumulator (owned) */
+        JS_FreeValue(ctx, s->val);
+        s->val = JS_UNDEFINED;
+    }
+    while (s->k < s->len) {
+        int64_t k1 = (s->special & special_reduceRight) ? s->len - s->k - 1 : s->k;
+        int present;
+        JSValue val;
+        s->k++;
+        if (s->special & special_TA) {
+            val = JS_GetPropertyInt64(ctx, s->obj, k1);
+            if (JS_IsException(val)) return -1;
+            present = true;
+        } else {
+            present = JS_TryGetPropertyInt64(ctx, s->obj, k1, &val);
+            if (present < 0) return -1;
+        }
+        if (present) {
+            s->val = val;
+            s->pending = 1;
+            out_args[0] = s->acc;
+            out_args[1] = val;
+            out_args[2] = js_int64(k1);
+            out_args[3] = s->obj;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void js_array_reduce_end(JSContext *ctx, JSArrayReduce *s, bool take_acc)
+{
+    if (!take_acc)
+        JS_FreeValue(ctx, s->acc);
+    JS_FreeValue(ctx, s->val);
+    JS_FreeValue(ctx, s->obj);
+    s->acc = JS_UNDEFINED; s->val = JS_UNDEFINED; s->obj = JS_UNDEFINED;
+}
+
 static JSValue js_array_reduce(JSContext *ctx, JSValueConst this_val,
                                int argc, JSValueConst *argv, int special)
 {
-    JSValue obj, val, index_val, acc, acc1;
+    JSArrayReduce s;
     JSValueConst args[4];
-    JSValueConst func;
-    int64_t len, k, k1;
-    int present;
+    JSValue acc1 = JS_UNDEFINED, ret;
+    int st;
 
-    acc = JS_UNDEFINED;
-    val = JS_UNDEFINED;
-    if (special & special_TA) {
-        obj = js_dup(this_val);
-        len = js_typed_array_get_length_unsafe(ctx, obj);
-        if (len < 0)
-            goto exception;
-    } else {
-        obj = JS_ToObject(ctx, this_val);
-        if (js_get_length64(ctx, &len, obj))
-            goto exception;
-    }
-    func = argv[0];
-
-    if (check_function(ctx, func))
+    if (js_array_reduce_init(ctx, &s, this_val, argc, argv, special))
         goto exception;
-
-    k = 0;
-    if (argc > 1) {
-        acc = js_dup(argv[1]);
-    } else {
-        for(;;) {
-            if (k >= len) {
-                JS_ThrowTypeError(ctx, "empty array");
-                goto exception;
-            }
-            k1 = (special & special_reduceRight) ? len - k - 1 : k;
-            k++;
-            if (special & special_TA) {
-                acc = JS_GetPropertyInt64(ctx, obj, k1);
-                if (JS_IsException(acc))
-                    goto exception;
-                break;
-            } else {
-                present = JS_TryGetPropertyInt64(ctx, obj, k1, &acc);
-                if (present < 0)
-                    goto exception;
-                if (present)
-                    break;
-            }
-        }
+    for (;;) {
+        st = js_array_reduce_step(ctx, &s, acc1, args);   /* consumes acc1 */
+        acc1 = JS_UNDEFINED;
+        if (st < 0)
+            goto exception;
+        if (st == 0)
+            break;
+        acc1 = JS_Call(ctx, s.func, JS_UNDEFINED, 4, args);
+        if (JS_IsException(acc1))
+            goto exception;
     }
-    for (; k < len; k++) {
-        k1 = (special & special_reduceRight) ? len - k - 1 : k;
-        if (special & special_TA) {
-            val = JS_GetPropertyInt64(ctx, obj, k1);
-            if (JS_IsException(val))
-                goto exception;
-            present = true;
-        } else {
-            present = JS_TryGetPropertyInt64(ctx, obj, k1, &val);
-            if (present < 0)
-                goto exception;
-        }
-        if (present) {
-            index_val = js_int64(k1);
-            args[0] = acc;
-            args[1] = val;
-            args[2] = index_val;
-            args[3] = obj;
-            acc1 = JS_Call(ctx, func, JS_UNDEFINED, 4, args);
-            JS_FreeValue(ctx, index_val);
-            JS_FreeValue(ctx, val);
-            val = JS_UNDEFINED;
-            if (JS_IsException(acc1))
-                goto exception;
-            JS_FreeValue(ctx, acc);
-            acc = acc1;
-        }
-    }
-    JS_FreeValue(ctx, obj);
-    return acc;
+    ret = s.acc;
+    js_array_reduce_end(ctx, &s, true);
+    return ret;
 
 exception:
-    JS_FreeValue(ctx, acc);
-    JS_FreeValue(ctx, val);
-    JS_FreeValue(ctx, obj);
+    JS_FreeValue(ctx, acc1);
+    js_array_reduce_end(ctx, &s, false);
     return JS_EXCEPTION;
+}
+
+/* Exact C-function identity + magic, as with js_array_every. */
+static bool tramp_can_call_array_reduce(JSValueConst func, int *out_special)
+{
+    JSObject *fp;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
+    fp = JS_VALUE_GET_OBJ(func);
+    if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
+    if (fp->u.cfunc.cproto != JS_CFUNC_generic_magic) return false;
+    if (fp->u.cfunc.c_function.generic_magic != js_array_reduce) return false;
+    *out_special = fp->u.cfunc.magic;
+    return true;
 }
 
 static JSValue js_array_fill(JSContext *ctx, JSValueConst this_val,
