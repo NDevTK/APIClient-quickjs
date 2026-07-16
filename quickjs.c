@@ -18152,6 +18152,16 @@ JSValue JS_NewPromiseCapability(JSContext *ctx, JSValue *resolving_funcs);
 static JSValue js_generator_next(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv,
                                  int *pdone, int magic);
 static void free_generator_stack_rt(JSRuntime *rt, JSGeneratorData *s);
+static JSValue js_create_from_ctor(JSContext *ctx, JSValueConst ctor, int class_id);
+/* A generator FUNCTION call (g()) runs its params to OP_initial_yield on the caller's tramp chain
+   (do_generator_create_tramp) so a PARAM-DEFAULT loop preempts the base flow; at initial_yield the generator
+   object is created and returned. */
+static inline bool tramp_can_call_gen_create(JSValueConst func) {
+    JSObject *fp;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
+    fp = JS_VALUE_GET_OBJ(func);
+    return fp->class_id == JS_CLASS_GENERATOR_FUNCTION;
+}
 /* A generator .next()/.throw()/.return() runs its body on the caller's tramp chain (do_generator_tramp) so a
    body loop preempts the base flow. Returns the magic (NEXT/RETURN/THROW) if `method` is the generator iterator
    method and `this` is a live generator, else -1. */
@@ -18778,6 +18788,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_async(call_argv[-1])) {   /* ASYNC fn -> body runs on THIS chain (base gen_state) */
                     tramp_first = -1; tramp_is_tail = (opcode == OP_tail_call); goto do_async_tramp_call;
                 }
+                if (tramp_can_call_gen_create(call_argv[-1])) {   /* generator fn g() -> params-to-initial_yield on THIS chain */
+                    tramp_first = -1; tramp_is_tail = (opcode == OP_tail_call); goto do_generator_create_tramp;
+                }
                 ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
                                           JS_UNDEFINED, call_argc,
                                           vc(call_argv), 0);
@@ -18824,6 +18837,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 if (tramp_can_call_async(call_argv[-1])) {   /* ASYNC method -> body runs on THIS chain (this=call_argv[-2]) */
                     tramp_first = -2; tramp_is_tail = (opcode == OP_tail_call_method); goto do_async_tramp_call;
+                }
+                if (tramp_can_call_gen_create(call_argv[-1])) {   /* generator method -> params-to-initial_yield on THIS chain */
+                    tramp_first = -2; tramp_is_tail = (opcode == OP_tail_call_method); goto do_generator_create_tramp;
                 }
                 {   /* generator .next()/.throw()/.return() -> body runs on THIS chain (loop preempts the base) */
                     int gmag = tramp_gen_method_magic(call_argv[-1], call_argv[-2]);
@@ -19195,6 +19211,88 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 giter = (gdone == 2) ? value : js_create_iterator_result(ctx, value, gdone);
                 if (JS_IsException(giter)) goto exception;
                 *sp++ = giter;
+                BREAK;
+            }
+
+        do_generator_create_tramp:
+            /* A generator FUNCTION call g() runs its params up to OP_initial_yield HERE on the tramp chain (so a
+               PARAM-DEFAULT loop preempts the base flow), then at initial_yield (do_generator_create_settle)
+               creates the generator object and returns it. Mirrors js_call_generator_function. */
+            {
+                JSValueConst gfunc = call_argv[-1];
+                JSGeneratorData *s = js_mallocz(ctx, sizeof(*s));
+                TrampFrame *gtf; JSStackFrame *gsf; JSObject *gfp; JSFunctionBytecode *gb;
+                if (unlikely(!s)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                s->state = JS_GENERATOR_STATE_SUSPENDED_START;
+                if (async_func_init(ctx, &s->func_state, gfunc,
+                                    (tramp_first == -2) ? call_argv[-2] : JS_UNDEFINED, call_argc, vc(call_argv))) {
+                    s->state = JS_GENERATOR_STATE_COMPLETED;
+                    free_generator_stack_rt(rt, s); js_free_rt(rt, s); goto exception;
+                }
+                gtf = js_malloc_rt(rt, sizeof(TrampFrame));
+                if (unlikely(!gtf)) { free_generator_stack_rt(rt, s); js_free_rt(rt, s); JS_ThrowOutOfMemory(ctx); goto exception; }
+                gtf->async_promise = js_dup(gfunc);   /* held for js_create_from_ctor at initial_yield */
+                for (i = tramp_first; i < call_argc; i++) JS_FreeValue(ctx, call_argv[i]);   /* free func(+this)+args (dup'd into s) */
+                gtf->up = tf_top;
+                gtf->caller_sf = sf; gtf->caller_b = b; gtf->caller_ctx = ctx;
+                gtf->caller_local_buf = local_buf; gtf->caller_stack_buf = stack_buf;
+                gtf->caller_var_buf = var_buf; gtf->caller_arg_buf = arg_buf;
+                gtf->caller_this = this_obj; gtf->caller_new_target = new_target;
+                gtf->caller_var_refs = var_refs;
+                gtf->caller_argc = argc; gtf->caller_argv = argv;
+                gtf->caller_arg_allocated_size = arg_allocated_size;
+                gtf->caller_sp = call_argv + tramp_first;   /* below func(+this)+args; the generator object goes here */
+                gtf->call_first = -1; gtf->call_argc = 0; gtf->is_tail = tramp_is_tail;
+                gtf->async_data = NULL;
+                gtf->gen_data = s; gtf->gen_magic = 0xFF;   /* 0xFF = CREATING (run-to-initial_yield), not a GEN_MAGIC */
+                gtf->b = NULL; gtf->local_buf = NULL;
+                gsf = &s->func_state.frame;
+                gfp = JS_VALUE_GET_OBJ(gsf->cur_func);
+                gb = gfp->u.func.function_bytecode;
+                gtf->ctx = gb->realm;
+                gsf->prev_frame = rt->current_stack_frame;
+                rt->current_stack_frame = gsf;
+                tf_top = gtf;
+                sf = gsf; b = gb; ctx = gb->realm;
+                var_refs = gfp->u.func.var_refs;
+                local_buf = arg_buf = gsf->arg_buf;
+                var_buf = gsf->var_buf;
+                stack_buf = gsf->var_buf + gb->var_count;
+                this_obj = s->func_state.this_val; new_target = JS_UNDEFINED;
+                argc = s->func_state.argc; argv = (JSValueConst *)gsf->arg_buf;
+                arg_allocated_size = gsf->arg_count;
+                sp = gsf->cur_sp; pc = gsf->cur_pc;
+                gsf->cur_sp = NULL;   /* running */
+                goto restart;
+            }
+
+        do_generator_create_settle:
+            /* the generator body reached OP_initial_yield: params are bound, the body is suspended (SUSPENDED_START).
+               Create the generator object, attach the state, pop this frame, and return the object to the caller. */
+            {
+                TrampFrame *gtf = tf_top;
+                JSGeneratorData *s = gtf->gen_data;
+                JSValue gfunc = gtf->async_promise;
+                uint8_t gitail = gtf->is_tail;
+                JSValue obj;
+                sf->cur_pc = pc; sf->cur_sp = sp;   /* suspend at initial_yield (state stays SUSPENDED_START) */
+                obj = js_create_from_ctor(ctx, gfunc, JS_CLASS_GENERATOR);   /* uses the ctor's realm */
+                rt->current_stack_frame = gtf->caller_sf;
+                tf_top = gtf->up;
+                sf = gtf->caller_sf; b = gtf->caller_b; ctx = gtf->caller_ctx;
+                local_buf = gtf->caller_local_buf; stack_buf = gtf->caller_stack_buf;
+                var_buf = gtf->caller_var_buf; arg_buf = gtf->caller_arg_buf;
+                this_obj = gtf->caller_this; new_target = gtf->caller_new_target;
+                var_refs = gtf->caller_var_refs;
+                argc = gtf->caller_argc; argv = gtf->caller_argv;
+                arg_allocated_size = gtf->caller_arg_allocated_size;
+                pc = sf->cur_pc; sp = gtf->caller_sp;
+                js_free_rt(rt, gtf);
+                JS_FreeValue(ctx, gfunc);
+                if (unlikely(JS_IsException(obj))) { free_generator_stack_rt(rt, s); js_free_rt(rt, s); goto exception; }
+                JS_SetOpaqueInternal(obj, s);   /* the object now owns the suspended generator state */
+                if (gitail) { ret_val = obj; goto do_return; }
+                *sp++ = obj;
                 BREAK;
             }
         do_return:
@@ -21556,6 +21654,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             ret_val = JS_UNDEFINED;
             goto done_generator;
         CASE(OP_initial_yield):
+            if (tf_top && tf_top->gen_data && tf_top->gen_magic == 0xFF) goto do_generator_create_settle;   /* g() creation on the chain */
             ret_val = JS_UNDEFINED;
             goto done_generator;
 
@@ -21650,9 +21749,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     if (tf_top && tf_top->gen_data) {
         TrampFrame *gtf = tf_top;
         JSValue ghold = gtf->async_promise;
+        bool creating = (gtf->gen_magic == 0xFF);   /* a param-binding throw before the generator object exists */
         sf->cur_sp = sp;   /* the body frame is "running" (cur_sp NULL); restore it so async_func_free can tear down */
         free_generator_stack_rt(rt, gtf->gen_data);
-        JS_FreeValue(ctx, ghold);   /* drop the body-run ref (the generator throw ends it) */
+        if (creating) js_free_rt(rt, gtf->gen_data);   /* not yet owned by a generator object -> free the orphan */
+        JS_FreeValue(ctx, ghold);   /* drop the held ref (creating: the function; running: the generator object) */
         rt->current_stack_frame = gtf->caller_sf;
         tf_top = gtf->up;
         sf = gtf->caller_sf; b = gtf->caller_b; ctx = gtf->caller_ctx;
