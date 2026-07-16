@@ -45492,7 +45492,321 @@ static JSValue js_typed_array___speciesCreate(JSContext *ctx,
                                               bool require_mutable);
 
 
-#include "array_iter.inc.c"   /* forEach/map/reduce/... callback drive: a suspendable component */
+/* One coroutine step: PROCESS the previous callback's `res` (for element pending_k), then ADVANCE to the next
+   present element and fill out_args with (value, index, obj). Returns 1 = CALL (invoke func on out_args), 0 = DONE
+   (s->ret is the final result), -1 = EXCEPTION. Consumes `res`. Identical semantics to the original C loop. */
+static int js_array_every_step(JSContext *ctx, JSArrayEvery *s, JSValue res, JSValueConst out_args[3])
+{
+    if (s->pending_k >= 0) {
+        int64_t k = s->pending_k;
+        s->pending_k = -1;
+        switch (s->special) {
+        case special_every:
+        case special_every | special_TA:
+            if (!JS_ToBoolFree(ctx, res)) { s->ret = JS_FALSE; goto done; }
+            break;
+        case special_some:
+        case special_some | special_TA:
+            if (JS_ToBoolFree(ctx, res)) { s->ret = JS_TRUE; goto done; }
+            break;
+        case special_map:
+            if (JS_DefinePropertyValueInt64(ctx, s->ret, k, res, JS_PROP_C_W_E | JS_PROP_THROW) < 0) return -1;
+            break;
+        case special_map | special_TA:
+            if (JS_SetPropertyValue(ctx, s->ret, js_int32(k), res, JS_PROP_THROW) < 0) return -1;
+            break;
+        case special_filter:
+        case special_filter | special_TA:
+            if (JS_ToBoolFree(ctx, res)) {
+                if (JS_DefinePropertyValueInt64Const(ctx, s->ret, s->n++, s->val, JS_PROP_C_W_E | JS_PROP_THROW) < 0) return -1;
+            }
+            break;
+        default:
+            JS_FreeValue(ctx, res);
+            break;
+        }
+        JS_FreeValue(ctx, s->val);
+        s->val = JS_UNDEFINED;
+    }
+    while (s->k < s->len) {
+        int64_t k = s->k++;
+        int present;
+        JSValue val;
+        if (s->special & special_TA) {
+            val = JS_GetPropertyInt64(ctx, s->obj, k);
+            if (JS_IsException(val)) return -1;
+            present = true;
+        } else {
+            present = JS_TryGetPropertyInt64(ctx, s->obj, k, &val);
+            if (present < 0) return -1;
+        }
+        if (present) {
+            s->val = val;
+            s->pending_k = k;
+            out_args[0] = val;
+            out_args[1] = js_int64(k);
+            out_args[2] = s->obj;
+            return 1;
+        }
+    }
+done:
+    if (s->special == (special_filter | special_TA)) {
+        JSValue arr, res2;
+        JSValueConst a2[2];
+        a2[0] = s->obj;
+        a2[1] = js_int32(s->n);
+        arr = js_typed_array___speciesCreate(ctx, JS_UNDEFINED, 2, a2, true);
+        if (JS_IsException(arr)) return -1;
+        a2[0] = s->ret;
+        res2 = JS_Invoke(ctx, arr, JS_ATOM_set, 1, a2);
+        if (check_exception_free(ctx, res2)) { JS_FreeValue(ctx, arr); return -1; }
+        JS_FreeValue(ctx, s->ret);
+        s->ret = arr;
+    }
+    return 0;
+}
+
+/* Initialize the resumable state (the pre-loop setup: obj/len/func/this_arg + the per-special `ret` seed).
+   Returns 0 = ok, -1 = exception (state is safe to js_array_every_end). Shared by the plain C driver
+   (js_array_every) and the tramp-chain coroutine (do_array_iter_tramp) — ONE source of truth. */
+static int js_array_every_init(JSContext *ctx, JSArrayEvery *s, JSValueConst this_val,
+                               int argc, JSValueConst *argv, int special)
+{
+    JSValueConst args[2];
+
+    s->obj = JS_UNDEFINED; s->ret = JS_UNDEFINED; s->val = JS_UNDEFINED;
+    s->len = 0; s->k = 0; s->n = 0; s->special = special; s->pending_k = -1;
+    if (special & special_TA) {
+        s->obj = js_dup(this_val);
+        s->len = js_typed_array_get_length_unsafe(ctx, s->obj);
+        if (s->len < 0)
+            return -1;
+    } else {
+        s->obj = JS_ToObject(ctx, this_val);
+        if (js_get_length64(ctx, &s->len, s->obj))
+            return -1;
+    }
+    s->func = argv[0];
+    s->this_arg = (argc > 1) ? argv[1] : JS_UNDEFINED;
+    if (check_function(ctx, s->func))
+        return -1;
+
+    switch (special) {
+    case special_every:
+    case special_every | special_TA:
+        s->ret = JS_TRUE;
+        break;
+    case special_some:
+    case special_some | special_TA:
+        s->ret = JS_FALSE;
+        break;
+    case special_map:
+        s->ret = JS_ArraySpeciesCreate(ctx, s->obj, js_int64(s->len));
+        if (JS_IsException(s->ret)) return -1;
+        break;
+    case special_filter:
+        s->ret = JS_ArraySpeciesCreate(ctx, s->obj, js_int32(0));
+        if (JS_IsException(s->ret)) return -1;
+        break;
+    case special_map | special_TA:
+        args[0] = s->obj;
+        args[1] = js_int32(s->len);
+        s->ret = js_typed_array___speciesCreate(ctx, JS_UNDEFINED, 2, args, true);
+        if (JS_IsException(s->ret)) return -1;
+        break;
+    case special_filter | special_TA:
+        s->ret = JS_NewArray(ctx);
+        if (JS_IsException(s->ret)) return -1;
+        break;
+    }
+    return 0;
+}
+
+/* Release the transient state. The caller takes s->ret on success (pass take_ret=true); on failure it is freed. */
+static void js_array_every_end(JSContext *ctx, JSArrayEvery *s, bool take_ret)
+{
+    if (!take_ret)
+        JS_FreeValue(ctx, s->ret);
+    JS_FreeValue(ctx, s->val);
+    JS_FreeValue(ctx, s->obj);
+    s->ret = JS_UNDEFINED; s->val = JS_UNDEFINED; s->obj = JS_UNDEFINED;
+}
+
+static JSValue js_array_every(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv, int special)
+{
+    JSArrayEvery s;
+    JSValueConst args[3];
+    JSValue res = JS_UNDEFINED, ret;
+    int st;
+
+    if (js_array_every_init(ctx, &s, this_val, argc, argv, special))
+        goto exception;
+    for (;;) {
+        st = js_array_every_step(ctx, &s, res, args);   /* consumes res */
+        res = JS_UNDEFINED;
+        if (st < 0)
+            goto exception;
+        if (st == 0)
+            break;
+        res = JS_Call(ctx, s.func, s.this_arg, 3, args);
+        if (JS_IsException(res))
+            goto exception;
+    }
+    ret = s.ret;
+    js_array_every_end(ctx, &s, true);
+    return ret;
+
+exception:
+    JS_FreeValue(ctx, res);
+    js_array_every_end(ctx, &s, false);
+    return JS_EXCEPTION;
+}
+
+/* Is `func` one of the array iteration builtins whose callback drive runs on the tramp chain? Exact C-function
+   identity + its magic (the `special`) — the same dispatch quickjs itself uses, never a name/shape match. */
+static bool tramp_can_call_array_iter(JSValueConst func, int *out_special)
+{
+    JSObject *fp;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
+    fp = JS_VALUE_GET_OBJ(func);
+    if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
+    if (fp->u.cfunc.cproto != JS_CFUNC_generic_magic) return false;
+    if (fp->u.cfunc.c_function.generic_magic != js_array_every) return false;
+    *out_special = fp->u.cfunc.magic;
+    return true;
+}
+
+#define special_reduce       0
+#define special_reduceRight  1
+
+/* Seed the accumulator: argv[1] if given, else the first present element (spec: empty + no seed -> TypeError). */
+static int js_array_reduce_init(JSContext *ctx, JSArrayReduce *s, JSValueConst this_val,
+                                int argc, JSValueConst *argv, int special)
+{
+    int64_t k1;
+    int present;
+
+    s->obj = JS_UNDEFINED; s->acc = JS_UNDEFINED; s->val = JS_UNDEFINED;
+    s->len = 0; s->k = 0; s->special = special; s->pending = 0;
+    if (special & special_TA) {
+        s->obj = js_dup(this_val);
+        s->len = js_typed_array_get_length_unsafe(ctx, s->obj);
+        if (s->len < 0) return -1;
+    } else {
+        s->obj = JS_ToObject(ctx, this_val);
+        if (js_get_length64(ctx, &s->len, s->obj)) return -1;
+    }
+    s->func = argv[0];
+    if (check_function(ctx, s->func)) return -1;
+    if (argc > 1) {
+        s->acc = js_dup(argv[1]);
+        return 0;
+    }
+    for (;;) {
+        if (s->k >= s->len) { JS_ThrowTypeError(ctx, "empty array"); return -1; }
+        k1 = (special & special_reduceRight) ? s->len - s->k - 1 : s->k;
+        s->k++;
+        if (special & special_TA) {
+            s->acc = JS_GetPropertyInt64(ctx, s->obj, k1);
+            if (JS_IsException(s->acc)) return -1;
+            return 0;
+        }
+        present = JS_TryGetPropertyInt64(ctx, s->obj, k1, &s->acc);
+        if (present < 0) return -1;
+        if (present) return 0;
+    }
+}
+
+/* One coroutine step: adopt the previous callback's result as the accumulator, then advance to the next present
+   element and fill out_args with (acc, value, index, obj). 1 = CALL, 0 = DONE (s->acc is the result), -1 = EXC. */
+static int js_array_reduce_step(JSContext *ctx, JSArrayReduce *s, JSValue acc1, JSValueConst out_args[4])
+{
+    if (s->pending) {
+        s->pending = 0;
+        JS_FreeValue(ctx, s->acc);
+        s->acc = acc1;                 /* the callback's result IS the next accumulator (owned) */
+        JS_FreeValue(ctx, s->val);
+        s->val = JS_UNDEFINED;
+    }
+    while (s->k < s->len) {
+        int64_t k1 = (s->special & special_reduceRight) ? s->len - s->k - 1 : s->k;
+        int present;
+        JSValue val;
+        s->k++;
+        if (s->special & special_TA) {
+            val = JS_GetPropertyInt64(ctx, s->obj, k1);
+            if (JS_IsException(val)) return -1;
+            present = true;
+        } else {
+            present = JS_TryGetPropertyInt64(ctx, s->obj, k1, &val);
+            if (present < 0) return -1;
+        }
+        if (present) {
+            s->val = val;
+            s->pending = 1;
+            out_args[0] = s->acc;
+            out_args[1] = val;
+            out_args[2] = js_int64(k1);
+            out_args[3] = s->obj;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void js_array_reduce_end(JSContext *ctx, JSArrayReduce *s, bool take_acc)
+{
+    if (!take_acc)
+        JS_FreeValue(ctx, s->acc);
+    JS_FreeValue(ctx, s->val);
+    JS_FreeValue(ctx, s->obj);
+    s->acc = JS_UNDEFINED; s->val = JS_UNDEFINED; s->obj = JS_UNDEFINED;
+}
+
+static JSValue js_array_reduce(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv, int special)
+{
+    JSArrayReduce s;
+    JSValueConst args[4];
+    JSValue acc1 = JS_UNDEFINED, ret;
+    int st;
+
+    if (js_array_reduce_init(ctx, &s, this_val, argc, argv, special))
+        goto exception;
+    for (;;) {
+        st = js_array_reduce_step(ctx, &s, acc1, args);   /* consumes acc1 */
+        acc1 = JS_UNDEFINED;
+        if (st < 0)
+            goto exception;
+        if (st == 0)
+            break;
+        acc1 = JS_Call(ctx, s.func, JS_UNDEFINED, 4, args);
+        if (JS_IsException(acc1))
+            goto exception;
+    }
+    ret = s.acc;
+    js_array_reduce_end(ctx, &s, true);
+    return ret;
+
+exception:
+    JS_FreeValue(ctx, acc1);
+    js_array_reduce_end(ctx, &s, false);
+    return JS_EXCEPTION;
+}
+
+/* Exact C-function identity + magic, as with js_array_every. */
+static bool tramp_can_call_array_reduce(JSValueConst func, int *out_special)
+{
+    JSObject *fp;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
+    fp = JS_VALUE_GET_OBJ(func);
+    if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
+    if (fp->u.cfunc.cproto != JS_CFUNC_generic_magic) return false;
+    if (fp->u.cfunc.c_function.generic_magic != js_array_reduce) return false;
+    *out_special = fp->u.cfunc.magic;
+    return true;
+}
 
 static JSValue js_array_fill(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
@@ -46471,7 +46785,127 @@ exception:
     return 0;
 }
 
-#include "array_sort.inc.c"   /* the merge-sort comparator drive: a suspendable component */
+/* read the present, non-undefined elements into s->array (undefined -> the end, holes -> after that), alloc tmp,
+   set up the first merge block. Returns 0 ok / -1 exception (safe to js_array_sort_end). */
+static int js_array_sort_init(JSContext *ctx, JSArraySort *s, JSValueConst this_val, JSValueConst method)
+{
+    int64_t i, pos = 0; int present;
+    s->obj = JS_UNDEFINED; s->method = method; s->array = NULL; s->tmp = NULL;
+    s->n = 0; s->len = 0; s->undefined_count = 0; s->pending = 0;
+    s->width = 1; s->i = 0; s->lo = s->mid = s->hi = s->l = s->r = s->k = 0;
+    for (i = 0; i < 4; i++) s->cb_args[i] = JS_UNDEFINED;
+    s->obj = JS_ToObject(ctx, this_val);
+    if (js_get_length64(ctx, &s->len, s->obj)) return -1;
+    if (s->len > 0) {
+        s->array = js_malloc(ctx, (size_t)s->len * sizeof(ValueSlot));
+        if (!s->array) return -1;
+    }
+    for (i = 0; i < s->len; i++) {
+        JSValue v;
+        present = JS_TryGetPropertyInt64(ctx, s->obj, i, &v);
+        if (present < 0) { s->n = pos; return -1; }
+        if (present == 0) continue;
+        if (JS_IsUndefined(v)) { s->undefined_count++; continue; }
+        s->array[pos].val = v; s->array[pos].str = NULL; s->array[pos].pos = i; pos++;
+    }
+    s->n = pos;
+    if (s->n > 1) {
+        s->tmp = js_malloc(ctx, (size_t)s->n * sizeof(ValueSlot));
+        if (!s->tmp) return -1;
+        s->lo = 0; s->mid = 1 < s->n ? 1 : s->n; s->hi = 2 < s->n ? 2 : s->n;   /* first block, width=1 */
+        s->l = 0; s->r = s->mid; s->k = 0;
+    }
+    return 0;
+}
+
+/* Drive the merge until the next comparison is needed (return 1, out_args = the two element values) or the sort
+   is complete (return 0). `res` (owned) is the comparator's return value for the pending comparison, or JS_UNDEFINED
+   on the first call. Returns -1 on exception. */
+static int js_array_sort_step(JSContext *ctx, JSArraySort *s, JSValue res, JSValueConst out_args[2])
+{
+    if (s->pending) {
+        double v;
+        if (JS_ToFloat64Free(ctx, &v, res) < 0) return -1;   /* consumes res */
+        s->pending = 0;
+        if (v <= 0) s->tmp[s->k++] = s->array[s->l++];   /* stable: <= keeps the left (earlier) element first */
+        else        s->tmp[s->k++] = s->array[s->r++];
+    } else {
+        JS_FreeValue(ctx, res);   /* JS_UNDEFINED on the first call, or a stray value */
+    }
+    for (;;) {
+        if (s->width >= s->n) break;                 /* fully sorted (n<=1 lands here immediately) */
+        if (s->i >= s->n) {                          /* this width pass done -> next width */
+            s->width *= 2; s->i = 0;
+            if (s->width >= s->n) break;
+            s->lo = 0; s->mid = s->width < s->n ? s->width : s->n;
+            s->hi = 2 * s->width < s->n ? 2 * s->width : s->n;
+            s->l = 0; s->r = s->mid; s->k = 0;
+            continue;
+        }
+        /* merge invariants — an active block [lo,hi) with ordered cursors, and the exactly-conserved output
+           count (each element placed into tmp is consumed from exactly one run). A violation is a state-machine
+           bug; crash at its origin (offensive programming) rather than silently mis-sorting. */
+        assert(s->lo <= s->l && s->l <= s->mid && s->mid <= s->r && s->r <= s->hi && s->hi <= s->n);
+        assert(s->k - s->lo == (s->l - s->lo) + (s->r - s->mid));
+        if (s->l < s->mid && s->r < s->hi) {         /* the ONE suspension point */
+            out_args[0] = s->array[s->l].val;
+            out_args[1] = s->array[s->r].val;
+            s->pending = 1;
+            return 1;
+        }
+        while (s->l < s->mid) s->tmp[s->k++] = s->array[s->l++];   /* drain remainders */
+        while (s->r < s->hi)  s->tmp[s->k++] = s->array[s->r++];
+        { int64_t t; for (t = s->lo; t < s->hi; t++) s->array[t] = s->tmp[t]; }   /* copy block back */
+        s->i += 2 * s->width;                        /* next block at this width */
+        if (s->i < s->n) {
+            s->lo = s->i; s->mid = s->i + s->width < s->n ? s->i + s->width : s->n;
+            s->hi = s->i + 2 * s->width < s->n ? s->i + 2 * s->width : s->n;
+            s->l = s->lo; s->r = s->mid; s->k = s->lo;
+        }
+    }
+    return 0;   /* caller writes the sorted array back in js_array_sort_end */
+}
+
+/* On ok: write the sorted elements back to obj, then the undefineds, then delete the holes; return obj (owned,
+   transferred to caller). On failure: free everything, return JS_EXCEPTION. Either way the state is released. */
+static JSValue js_array_sort_end(JSContext *ctx, JSArraySort *s, bool ok)
+{
+    int64_t i, w = 0;
+    if (!ok) goto fail;
+    while (w < s->n) {                               /* sorted present elements back in place */
+        if (s->array[w].pos == w) { JS_FreeValue(ctx, s->array[w].val); }
+        else if (JS_SetPropertyInt64(ctx, s->obj, w, s->array[w].val) < 0) { w++; goto fail; }
+        w++;
+    }
+    js_free(ctx, s->array); s->array = NULL;
+    js_free(ctx, s->tmp); s->tmp = NULL;
+    for (i = w; s->undefined_count-- > 0; i++)
+        if (JS_SetPropertyInt64(ctx, s->obj, i, JS_UNDEFINED) < 0) goto fail2;
+    for (; i < s->len; i++)
+        if (JS_DeletePropertyInt64(ctx, s->obj, i, JS_PROP_THROW) < 0) goto fail2;
+    return s->obj;
+fail:
+    for (; w < s->n; w++) JS_FreeValue(ctx, s->array[w].val);
+    js_free(ctx, s->array); s->array = NULL;
+    js_free(ctx, s->tmp); s->tmp = NULL;
+fail2:
+    JS_FreeValue(ctx, s->obj); s->obj = JS_UNDEFINED;
+    return JS_EXCEPTION;
+}
+
+/* arr.sort(cmp) where cmp (argv[0]) is a NORMAL bytecode function -> route to the suspendable coroutine. A
+   default sort (no cmp) or a native/bound comparator has no preemptible JS body and stays on rqsort. */
+static bool tramp_can_call_array_sort(JSValueConst func, int argc, JSValueConst *argv)
+{
+    JSObject *mp, *cp;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
+    mp = JS_VALUE_GET_OBJ(func);
+    if (!(mp->class_id == JS_CLASS_C_FUNCTION && mp->u.cfunc.c_function.generic == js_array_sort)) return false;
+    if (argc < 1 || JS_VALUE_GET_TAG(argv[0]) != JS_TAG_OBJECT) return false;
+    cp = JS_VALUE_GET_OBJ(argv[0]);
+    return cp->class_id == JS_CLASS_BYTECODE_FUNCTION
+        && cp->u.func.function_bytecode->func_kind == JS_FUNC_NORMAL;
+}
 
 static JSValue js_array_sort(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
@@ -52769,7 +53203,149 @@ static JSValue internalize_json_property(JSContext *ctx, JSValueConst holder,
     return JS_EXCEPTION;
 }
 
-#include "json_reviver.inc.c"   /* the reviver walk: a suspendable component, not inlined here */
+/* ---- Suspendable JSON.parse reviver (explicit-stack post-order walk; see JSJsonReviver) ---- */
+static int jr_push(JSContext *ctx, JSJsonReviver *s) {
+    if (s->sp >= s->cap) {
+        int nc = s->cap ? s->cap * 2 : 16;
+        JRFrame *ns = js_realloc(ctx, s->stack, (size_t)nc * sizeof(JRFrame));
+        if (!ns) return -1;
+        s->stack = ns; s->cap = nc;
+    }
+    JRFrame *f = &s->stack[s->sp++];
+    f->holder = JS_UNDEFINED; f->val = JS_UNDEFINED; f->context = JS_UNDEFINED;
+    f->name = JS_ATOM_NULL; f->name_val = JS_UNDEFINED; f->atoms = NULL;
+    f->len = 0; f->i = 0; f->is_array = 0; f->fpr = NULL; f->vpr = NULL; f->phase = 0;
+    return 0;
+}
+/* descend a HOLDER's parse-record to the child `name` whose value is `cval`, mirroring internalize's pr walk. */
+static JSONParseRecord *jr_child_pr(JSContext *ctx, JSONParseRecord *holder_pr, JSAtom name, JSValueConst cval) {
+    JSONParseRecord *pr = holder_pr;
+    if (!pr) return NULL;
+    if (js_is_array(ctx, pr->value)) {
+        if (__JS_AtomIsTaggedInt(name)) {
+            uint32_t idx = __JS_AtomToUInt32(name);
+            pr = (idx < (uint32_t)pr->u.array.count) ? &pr->u.array.elements[idx] : NULL;
+        } else pr = NULL;
+    } else {
+        pr = json_parse_record_find(pr, name);
+    }
+    if (pr && !js_same_value(ctx, pr->value, cval)) pr = NULL;
+    return pr;
+}
+static int js_json_reviver_init(JSContext *ctx, JSJsonReviver *s, JSValueConst text_arg, JSValueConst reviver) {
+    size_t len; JSValue parsed; JSONParseRecord *pr1; int size = 0;
+    s->reviver = reviver; s->text = NULL; s->root = JS_UNDEFINED; s->pr = NULL;
+    s->stack = NULL; s->sp = 0; s->cap = 0; s->result = JS_UNDEFINED;
+    for (int i = 0; i < 5; i++) s->cb_args[i] = JS_UNDEFINED;
+    s->text = JS_ToCStringLen(ctx, &len, text_arg);
+    if (!s->text) return -1;
+    s->pr = js_mallocz(ctx, sizeof(JSONParseRecord));
+    if (!s->pr) return -1;
+    s->root = JS_NewObject(ctx);
+    if (JS_IsException(s->root)) return -1;
+    json_parse_record_init_obj(ctx, s->pr, s->root);
+    pr1 = json_parse_record_add(ctx, s->pr, JS_ATOM_empty_string, &size);
+    if (!pr1) return -1;
+    parsed = JS_ParseJSON_internal(ctx, s->text, len, "<input>", pr1);
+    if (JS_IsException(parsed)) return -1;
+    if (JS_DefinePropertyValue(ctx, s->root, JS_ATOM_empty_string, parsed, JS_PROP_C_W_E) < 0) return -1;
+    if (jr_push(ctx, s) < 0) return -1;                 /* the root frame: holder={""}, name="", holder-record=pr */
+    s->stack[0].holder = s->root; s->stack[0].name = JS_DupAtom(ctx, JS_ATOM_empty_string);
+    s->stack[0].fpr = s->pr;
+    return 0;
+}
+/* Drive the DFS until the next reviver call is needed (return 1, out_args=[name,val,context]) or done (0).
+   `res` (owned) is the reviver's result for the just-completed node, or JS_UNDEFINED on the first call. */
+static int js_json_reviver_step(JSContext *ctx, JSJsonReviver *s, JSValue res, JSValueConst out_args[3]) {
+    if (s->sp > 0 && s->stack[s->sp - 1].phase == 2) {   /* a node's reviver just returned `res` */
+        JRFrame *f = &s->stack[s->sp - 1];
+        JSAtom fname = f->name;                          /* keep for the parent apply */
+        if (f->atoms) js_free_prop_enum(ctx, f->atoms, f->len);
+        JS_FreeValue(ctx, f->name_val);
+        JS_FreeValue(ctx, f->val);
+        JS_FreeValue(ctx, f->context);
+        s->sp--;
+        if (s->sp == 0) { JS_FreeAtom(ctx, fname); s->result = res; return 0; }   /* root: done */
+        JRFrame *p = &s->stack[s->sp - 1];
+        int ret;
+        if (JS_IsUndefined(res)) { JS_FreeValue(ctx, res); ret = JS_DeleteProperty(ctx, p->val, fname, 0); }
+        else ret = JS_DefinePropertyValue(ctx, p->val, fname, res, JS_PROP_C_W_E);   /* consumes res */
+        JS_FreeAtom(ctx, fname);
+        if (ret < 0) return -1;
+        p->i++;
+    } else {
+        JS_FreeValue(ctx, res);                          /* JS_UNDEFINED on the first call */
+    }
+    while (s->sp > 0) {
+        JRFrame *f = &s->stack[s->sp - 1];
+        /* DFS invariants: a live frame stack within its allocation, a valid phase, and (once past init) a child
+           cursor that never runs past the key count. A violation is a walk-state bug; crash at its origin. */
+        assert(s->sp <= s->cap && f->phase <= 2);
+        assert(f->phase == 0 || f->i <= f->len);
+        if (f->phase == 0) {
+            f->val = JS_GetProperty(ctx, f->holder, f->name);
+            if (JS_IsException(f->val)) return -1;
+            f->vpr = jr_child_pr(ctx, f->fpr, f->name, f->val);   /* val's own parse record */
+            f->context = JS_NewObject(ctx);
+            if (JS_IsException(f->context)) return -1;
+            if (JS_IsObject(f->val)) {
+                f->is_array = js_is_array(ctx, f->val);
+                if (f->is_array < 0) return -1;
+                if (f->is_array) { if (js_get_length32(ctx, &f->len, f->val)) return -1; }
+                else { int r = JS_GetOwnPropertyNamesInternal(ctx, &f->atoms, &f->len, JS_VALUE_GET_OBJ(f->val),
+                                                              JS_GPN_ENUM_ONLY | JS_GPN_STRING_MASK); if (r < 0) return -1; }
+            } else if (f->vpr) {   /* primitive with a source record -> context.source */
+                JSValue src = JS_NewStringLen(ctx, s->text + f->vpr->u.primitive.source_pos, f->vpr->u.primitive.source_len);
+                if (JS_IsException(src)) return -1;
+                if (JS_DefinePropertyValue(ctx, f->context, JS_ATOM_source, src, JS_PROP_C_W_E) < 0) return -1;
+            }
+            f->phase = 1;
+        }
+        if ((int64_t)f->i < (int64_t)f->len) {           /* descend into child i */
+            JSAtom prop;
+            if (f->is_array) { prop = JS_NewAtomUInt32(ctx, f->i); if (prop == JS_ATOM_NULL) return -1; }
+            else prop = JS_DupAtom(ctx, f->atoms[f->i].atom);
+            JSValueConst pval = f->val; JSONParseRecord *pvpr = f->vpr;   /* snapshot before push may realloc s->stack */
+            if (jr_push(ctx, s) < 0) { JS_FreeAtom(ctx, prop); return -1; }
+            JRFrame *child = &s->stack[s->sp - 1];
+            child->holder = pval; child->name = prop; child->fpr = pvpr;   /* child's holder-record = this val's record */
+            continue;
+        }
+        /* children done -> call the reviver on this node (SUSPEND) */
+        f->name_val = JS_AtomToValue(ctx, f->name);
+        if (JS_IsException(f->name_val)) return -1;
+        s->cb_args[0] = f->holder;                       /* this = holder (borrowed) */
+        out_args[0] = f->name_val; out_args[1] = f->val; out_args[2] = f->context;
+        f->phase = 2;
+        return 1;
+    }
+    return 0;
+}
+static JSValue js_json_reviver_end(JSContext *ctx, JSJsonReviver *s, bool ok) {
+    while (s->sp > 0) {   /* free any frames still open (exception mid-walk) */
+        JRFrame *f = &s->stack[--s->sp];
+        if (f->atoms) js_free_prop_enum(ctx, f->atoms, f->len);
+        JS_FreeValue(ctx, f->name_val);
+        JS_FreeValue(ctx, f->val);
+        JS_FreeValue(ctx, f->context);
+        JS_FreeAtom(ctx, f->name);
+    }
+    js_free(ctx, s->stack); s->stack = NULL;
+    if (s->pr) { json_free_parse_record(ctx, s->pr); js_free(ctx, s->pr); s->pr = NULL; }
+    JS_FreeValue(ctx, s->root); s->root = JS_UNDEFINED;
+    if (s->text) { JS_FreeCString(ctx, s->text); s->text = NULL; }
+    if (!ok) { JS_FreeValue(ctx, s->result); return JS_EXCEPTION; }
+    return s->result;
+}
+static bool tramp_can_call_json_parse(JSValueConst func, int argc, JSValueConst *argv) {
+    JSObject *mp, *rp;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
+    mp = JS_VALUE_GET_OBJ(func);
+    if (!(mp->class_id == JS_CLASS_C_FUNCTION && mp->u.cfunc.c_function.generic == js_json_parse)) return false;
+    if (argc < 2 || JS_VALUE_GET_TAG(argv[1]) != JS_TAG_OBJECT) return false;
+    rp = JS_VALUE_GET_OBJ(argv[1]);
+    return rp->class_id == JS_CLASS_BYTECODE_FUNCTION && rp->u.func.function_bytecode->func_kind == JS_FUNC_NORMAL;
+}
 
 static JSValue js_json_parse(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
