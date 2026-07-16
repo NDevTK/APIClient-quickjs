@@ -18137,6 +18137,20 @@ void JS_FlowPreemptStats(uint64_t *requested, uint64_t *fired) {
     if (fired)     *fired     = g_flow_preempt_fired;
 }
 
+/* Can this activation ROUTE a FUNC_RET_PREEMPT back to a driver that re-resumes it? An activation is
+   preemptible iff whoever called async_func_resume on it loops on FUNC_RET_PREEMPT:
+     - the flow BASE (JS_FlowResume)                 -> yes
+     - a synchronous generator body (js_generator_next) -> yes
+     - async / async-generator bodies                -> NOT YET (their drivers do not loop yet; the metric
+       counts the gap). A C-reentry callback frame (gs==NULL: sort/forEach comparator) has no flow driver.
+   The gate fires the preempt only where it is routable, so an unroutable FUNC_RET_PREEMPT is never emitted. */
+static bool flow_preempt_routable(JSAsyncFunctionState *gs) {
+    if (gs == NULL) return false;
+    if (gs == g_flow_base_gen) return true;
+    JSObject *p = JS_VALUE_GET_OBJ(gs->frame.cur_func);
+    return p->u.func.function_bytecode->func_kind == JS_FUNC_GENERATOR;
+}
+
 /* Concolic branch arm + snapshot fork. The branch hook returns the arm (0/1), ORed with 0x100 when it forked
    a sibling here. On a fork we snapshot the CURRENT frame AT the OP_if (cond still on the stack) so the
    sibling resumes HERE and replays the other arm — never a re-run. NO FALLBACK: a deep (tramp-chain) or
@@ -19504,7 +19518,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                nested FUNC_RET_PREEMPT onto the caller's tramp chain", now with a metric proving when it lands. */
             if (unlikely(g_flow_control.preempt != NULL) && g_flow_control.preempt()) {
                 g_flow_preempt_requested++;
-                if (gen_state == g_flow_base_gen) { g_flow_preempt_fired++; goto do_preempt; }
+                if (flow_preempt_routable(gen_state)) { g_flow_preempt_fired++; goto do_preempt; }
             }
             BREAK;
         CASE(OP_goto16):
@@ -19513,7 +19527,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 goto exception;
             if (unlikely(g_flow_control.preempt != NULL) && g_flow_control.preempt()) {   /* measured back-edge preempt; nested-activation gap is counted, see OP_goto */
                 g_flow_preempt_requested++;
-                if (gen_state == g_flow_base_gen) { g_flow_preempt_fired++; goto do_preempt; }
+                if (flow_preempt_routable(gen_state)) { g_flow_preempt_fired++; goto do_preempt; }
             }
             BREAK;
         CASE(OP_goto8):
@@ -19522,7 +19536,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 goto exception;
             if (unlikely(g_flow_control.preempt != NULL) && g_flow_control.preempt()) {   /* measured back-edge preempt; nested-activation gap is counted, see OP_goto */
                 g_flow_preempt_requested++;
-                if (gen_state == g_flow_base_gen) { g_flow_preempt_fired++; goto do_preempt; }
+                if (flow_preempt_routable(gen_state)) { g_flow_preempt_fired++; goto do_preempt; }
             }
             BREAK;
         CASE(OP_if_true):
@@ -21618,6 +21632,21 @@ static JSValue async_func_resume(JSContext *ctx, JSAsyncFunctionState *s)
                            JS_CALL_FLAG_GENERATOR);
 }
 
+/* Resume a body, transparently self-resuming through FORCED-EXEC PREEMPTS. A loop back-edge inside the body may
+   park+save the frame and return FUNC_RET_PREEMPT (a scheduler artifact, NOT an ECMAScript result); the frame is
+   already rebuilt by do_preempt, so we simply re-resume and continue. The body's SEMANTICS are unchanged — the
+   caller sees only the first real yield / await / yield_star / completion / exception — while every back-edge
+   went through the snapshot->rebuild machinery. THIS is the single well-defined seam that makes any activation
+   preemptible: every driver (js_generator_next, js_call_generator_function, the async drivers as they become
+   routable) calls THIS instead of async_func_resume so a forced preempt is never mistaken for a yield. */
+static JSValue async_func_resume_run(JSContext *ctx, JSAsyncFunctionState *s)
+{
+    JSValue r = async_func_resume(ctx, s);
+    while (JS_VALUE_GET_TAG(r) == JS_TAG_INT && JS_VALUE_GET_INT(r) == FUNC_RET_PREEMPT)
+        r = async_func_resume(ctx, s);
+    return r;
+}
+
 /* APIClient forced-execution FLOW API: a flow is a preemptible activation. Its program runs as an async
    function frame (heap-resident, suspendable), so the scheduler can preempt it mid-execution (at a loop
    back-edge, via the preempt hook) and resume it later — the substrate for value-ordered interleaving. */
@@ -21936,7 +21965,7 @@ static JSValue js_generator_next(JSContext *ctx, JSValueConst this_val,
             s->func_state.throw_flag = false;
         }
         s->state = JS_GENERATOR_STATE_EXECUTING;
-        func_ret = async_func_resume(ctx, &s->func_state);
+        func_ret = async_func_resume_run(ctx, &s->func_state);   /* self-resumes through forced back-edge preempts */
         s->state = JS_GENERATOR_STATE_SUSPENDED_YIELD;
         if (JS_IsException(func_ret)) {
             /* finalize the execution in case of exception */
@@ -22002,8 +22031,9 @@ static JSValue js_call_generator_function(JSContext *ctx, JSValueConst func_obj,
         goto fail;
     }
 
-    /* execute the function up to 'OP_initial_yield' */
-    func_ret = async_func_resume(ctx, &s->func_state);
+    /* execute the function up to 'OP_initial_yield' — self-resuming through any forced preempt at a back-edge in
+       the PARAM DESTRUCTURING that runs before initial_yield (else the body is abandoned mid-destructuring). */
+    func_ret = async_func_resume_run(ctx, &s->func_state);
     if (JS_IsException(func_ret))
         goto fail;
     JS_FreeValue(ctx, func_ret);
