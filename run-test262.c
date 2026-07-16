@@ -1340,14 +1340,25 @@ static int fork_preempt_enabled(void) {
     if (v < 0) v = getenv("FORK_PREEMPT") ? 1 : 0;
     return v;
 }
+static const JSFlowControlHooks fork_hooks_ON  = { NULL, NULL, NULL, fork_preempt_always };
+static const JSFlowControlHooks fork_hooks_OFF = { NULL, NULL, NULL, NULL };
+
+/* The feature must stay ON for the WHOLE test, including the JOB DRAIN. A promise reaction, a post-await
+   continuation, a .then callback and an async-generator resume are all test code that the project runs under
+   forced execution — switching the hooks off when the base flow returns would run them with the feature
+   DISABLED, and the engagement metric could not see it (no preempt REQUESTED there means no gap counted). That
+   is a fake-green the metric exists to prevent, so the hooks are released only after the jobs are drained
+   (fork_preempt_hooks_off, called at the end of eval_buf). */
+static void fork_preempt_hooks_off(void) {
+    if (fork_preempt_enabled())
+        JS_SetFlowControlHooks(&fork_hooks_OFF);
+}
+
 static JSValue fork_preempt_eval(JSContext *ctx, const char *buf, size_t buf_len, int eval_flags) {
-    static const JSFlowControlHooks ON  = { NULL, NULL, NULL, fork_preempt_always };
-    static const JSFlowControlHooks OFF = { NULL, NULL, NULL, NULL };
     JSValue *flow = JS_FlowNew(ctx, buf, buf_len, eval_flags);   /* thread STRICTNESS so strict tests run strict */
     if (!flow) return JS_EXCEPTION;   /* compile error: exception already pending */
-    JS_SetFlowControlHooks(&ON);
+    JS_SetFlowControlHooks(&fork_hooks_ON);
     while (JS_FlowResume(ctx, flow)) { }   /* park + rebuild the whole frame chain on every back-edge */
-    JS_SetFlowControlHooks(&OFF);
     JS_FlowFree(ctx, flow);
     return JS_HasException(ctx) ? JS_EXCEPTION : JS_UNDEFINED;
 }
@@ -1421,6 +1432,7 @@ static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,
         }
         JS_FreeValue(ctx, promise);
     }
+    fork_preempt_hooks_off();   /* jobs are drained: the whole test ran WITH the feature, reactions included */
 
     duration = get_clock_ms() - start;
     *msec += duration;
