@@ -56408,6 +56408,70 @@ static void promise_reaction_data_free(JSRuntime *rt,
 #define promise_trace(...)
 #endif
 
+/* A promise REACTION HANDLER is test/app code the project runs under forced execution, so it must be a FLOW: it
+   is the running flow (its own base), a back-edge PARKS it, and the park re-enters the JOB PUMP — the scheduler
+   resumes it across job slices, never a C job driven to completion. Its completion (or throw) settles the derived
+   promise, so that settlement is DEFERRED across parks and carried in this state. */
+typedef struct JSReactionFlow {
+    JSAsyncFunctionState fs;
+    JSValue resolve, reject;   /* the derived promise's capability (owned; may be undefined) */
+} JSReactionFlow;
+
+static JSValue js_reaction_resume_job(JSContext *ctx, int argc, JSValueConst *argv);
+
+/* Settle the derived promise with the handler's completion `res` (consumed), free the flow state. */
+static JSValue reaction_flow_settle(JSContext *ctx, JSReactionFlow *rf, JSValue res)
+{
+    JSValue func, res2;
+    bool is_reject = JS_IsException(res);
+
+    if (is_reject) {
+        if (unlikely(JS_IsUncatchableError(ctx->rt->current_exception))) {
+            JS_FreeValue(ctx, rf->resolve); JS_FreeValue(ctx, rf->reject);
+            js_free_rt(ctx->rt, rf);
+            return JS_EXCEPTION;
+        }
+        res = JS_GetException(ctx);
+    }
+    func = is_reject ? rf->reject : rf->resolve;
+    res2 = JS_IsUndefined(func) ? JS_UNDEFINED : JS_Call(ctx, func, JS_UNDEFINED, 1, vc(&res));
+    JS_FreeValue(ctx, res);
+    JS_FreeValue(ctx, rf->resolve); JS_FreeValue(ctx, rf->reject);
+    js_free_rt(ctx->rt, rf);
+    return res2;
+}
+
+/* One slice of the handler flow: resume it as its own base; a preempt parks it back into the job pump. */
+static JSValue reaction_flow_step(JSContext *ctx, JSReactionFlow *rf)
+{
+    JSAsyncFunctionState *prev_base = g_flow_base_gen;
+    JSValue res, jv;
+
+    rf->fs.throw_flag = false;   /* a preempt-resume is a continuation, never a re-throw */
+    g_flow_base_gen = &rf->fs;
+    res = async_func_resume(ctx, &rf->fs);
+    g_flow_base_gen = prev_base;
+    /* SUSPENDED (a NORMAL handler has no yield/await, so this is a forced preempt) — detect by the FRAME, never
+       the value: a handler returning the integer 3 would collide with js_int32(FUNC_RET_PREEMPT). */
+    if (rf->fs.frame.cur_sp != NULL || rf->fs.tramp_top != NULL) {
+        JS_FreeValue(ctx, res);
+        jv = JS_MKPTR(JS_TAG_INT, rf);
+        if (JS_EnqueueJob(ctx, js_reaction_resume_job, 1, (JSValueConst *)&jv) < 0)
+            return JS_EXCEPTION;
+        return JS_UNDEFINED;   /* PARKED: the pump resumes it; the promise settles when it completes */
+    }
+    /* COMPLETED via `done:` — that path frees the stack/vars inline but not the frame buffer + cur_func/this */
+    js_free_rt(ctx->rt, rf->fs.frame.arg_buf);
+    JS_FreeValue(ctx, rf->fs.frame.cur_func);
+    JS_FreeValue(ctx, rf->fs.this_val);
+    return reaction_flow_settle(ctx, rf, res);
+}
+
+static JSValue js_reaction_resume_job(JSContext *ctx, int argc, JSValueConst *argv)
+{
+    return reaction_flow_step(ctx, (JSReactionFlow *)JS_VALUE_GET_PTR(argv[0]));
+}
+
 static JSValue promise_reaction_job(JSContext *ctx, int argc,
                                     JSValueConst *argv)
 {
@@ -56429,7 +56493,21 @@ static JSValue promise_reaction_job(JSContext *ctx, int argc,
         } else {
             res = js_dup(arg);
         }
+    } else if (tramp_can_call(handler)) {
+        /* a NORMAL handler has a preemptible body: run it as a FLOW so its loops park into the pump */
+        JSReactionFlow *rf = js_malloc(ctx, sizeof(*rf));
+        if (unlikely(!rf))
+            return JS_EXCEPTION;
+        memset(rf, 0, sizeof(*rf));
+        if (async_func_init(ctx, &rf->fs, handler, JS_UNDEFINED, 1, &arg)) {
+            js_free_rt(ctx->rt, rf);
+            return JS_EXCEPTION;
+        }
+        rf->resolve = js_dup(argv[0]);
+        rf->reject = js_dup(argv[1]);
+        return reaction_flow_step(ctx, rf);
     } else {
+        /* a C-function / bound / proxy handler has no preemptible body */
         res = JS_Call(ctx, handler, JS_UNDEFINED, 1, &arg);
     }
     is_reject = JS_IsException(res);
