@@ -18150,6 +18150,38 @@ static inline bool tramp_can_call_async(JSValueConst func) {
     fp = JS_VALUE_GET_OBJ(func);
     return fp->class_id == JS_CLASS_ASYNC_FUNCTION;
 }
+/* Resumable state for js_array_every (forEach/every/some/map/filter). Factored so the per-element callback drive
+   becomes a coroutine STEP — the prerequisite for running the callback on the base tramp chain (a callback body
+   loop then preempts the base flow) instead of the C-recursive JS_Call. `pending_k` = the index whose callback
+   result is currently awaited (-1 = none); `val` = that element (freed once its result is processed). */
+typedef struct JSArrayEvery {
+    JSValue obj, ret, val;
+    int64_t len, k, n;
+    int special, pending_k;
+    JSValueConst func, this_arg;
+    /* Tramp-chain coroutine (do_array_iter_tramp) fields. cb_args is the callback's operand buffer OWNED BY THE
+       STATE — the callback args must NOT go on the caller's stack (its stack_size is compiler-computed for the
+       caller's own needs) and must NOT need a bytecode-less continuation frame (the exception handler rightly
+       assumes every frame has bytecode). Layout mirrors a method call so do_tramp_call reads it directly:
+       [0]=this_arg [1]=func [2..4]=(val,index,obj); call_argv = &cb_args[2], tramp_first=-2, call_argc=3. All
+       entries are BORROWED (val/obj from this state, func/this_arg from the caller's live stack), so do_return
+       must skip its `cargv = sp - cargc` arg-free for an iter_state frame. orig_* are the ORIGINAL OP_call's
+       operand shape, used once when the iteration finishes to pop them and push the builtin's result. */
+    JSValue cb_args[5];
+    int orig_cfirst, orig_cargc;
+    uint8_t orig_is_tail;
+} JSArrayEvery;
+/* Array iteration builtins (forEach/map/every/some/filter) drive a JS callback from a C loop — the
+   CONTINUATION-HOLDING re-entrant. do_array_iter_tramp runs that drive on the tramp chain: each callback is a
+   NORMAL frame carrying iter_state (no bytecode-less frame), so the callback runs with gen_state == the base and
+   a callback BODY LOOP preempts the base flow — never a C-recursive JS_Call that could only drive to completion. */
+static int js_array_every_init(JSContext *ctx, struct JSArrayEvery *s, JSValueConst this_val,
+                               int argc, JSValueConst *argv, int special);
+static int js_array_every_step(JSContext *ctx, struct JSArrayEvery *s, JSValue res, JSValueConst out_args[3]);
+static void js_array_every_end(JSContext *ctx, struct JSArrayEvery *s, bool take_ret);
+static JSValue js_array_every(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int special);
+static bool tramp_can_call_array_iter(JSValueConst func, int *out_special);
+
 /* Helpers defined later — needed by the heap-resident async call path inside JS_CallInternal. */
 static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s, JSValueConst func_obj,
                                        JSValueConst this_obj, int argc, JSValueConst *argv);
@@ -18270,6 +18302,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     size_t alloca_size;
     TrampFrame *tf_top = NULL;         /* heap stack of trampolined NORMAL callees (this activation's base = C stack) */
     int tramp_first = -1; uint8_t tramp_is_tail = 0;   /* set before goto do_tramp_call */
+    /* array-iteration coroutine (do_array_iter_tramp): tramp_iter_state is handed to the callback frame that
+       do_tramp_call pushes, so its do_return re-enters js_array_every_step instead of returning to bytecode. */
+    struct JSArrayEvery *tramp_iter_state = NULL, *iter_st = NULL;
+    int iter_special = 0;
     int tramp_gen_magic = 0;                            /* set before goto do_generator_tramp */
     int tramp_gen_forof = 1;                            /* <0 = for-of iterator stack offset (always -3-.. ); 1 = direct .next() (no valid offset is positive) */
     JSAsyncFunctionState *gen_state = NULL;   /* the generator/async base state IF this activation is preemptible */
@@ -18848,6 +18884,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_gen_create(call_argv[-1])) {   /* generator method -> params-to-initial_yield on THIS chain */
                     tramp_first = -2; tramp_is_tail = (opcode == OP_tail_call_method); goto do_generator_create_tramp;
                 }
+                if (tramp_can_call_array_iter(call_argv[-1], &iter_special)) {   /* arr.forEach/map/... -> callback drive on THIS chain */
+                    tramp_is_tail = (opcode == OP_tail_call_method); goto do_array_iter_tramp;
+                }
                 {   /* generator .next()/.throw()/.return() -> body runs on THIS chain (loop preempts the base) */
                     int gmag = tramp_gen_method_magic(call_argv[-1], call_argv[-2]);
                     if (gmag >= 0) { tramp_gen_magic = gmag; goto do_generator_tramp; }
@@ -18956,7 +18995,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 new_target = JS_UNDEFINED;
                 ntf->this_val = this_obj; ntf->new_target = new_target;
                 ntf->arg_allocated = narg_alloc; ntf->callee_argc = eff_argc;
-                ntf->async_data = NULL; ntf->async_promise = JS_UNDEFINED; ntf->gen_data = NULL; ntf->iter_state = NULL;   /* NORMAL frame */
+                ntf->async_data = NULL; ntf->async_promise = JS_UNDEFINED; ntf->gen_data = NULL;
+                ntf->iter_state = tramp_iter_state; tramp_iter_state = NULL;   /* NORMAL frame; iter_state set only for an array-iteration callback */
                 sf = nsf; b = nb; ctx = nb->realm;
                 arg_buf = narg_buf; var_buf = nvar_buf; stack_buf = nstack_buf;
                 var_refs = np->u.func.var_refs;
@@ -18964,6 +19004,61 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 arg_allocated_size = narg_alloc;
                 local_buf = nlb; sp = nstack_buf; pc = nb->byte_code_buf;
                 goto restart;
+            }
+
+        do_array_iter_tramp:
+            /* arr.forEach/map/every/some/filter: run the CALLBACK DRIVE here on the chain. The state owns the
+               callback's operand buffer (cb_args), so no bytecode-less frame and no growth of the caller's
+               compiler-sized stack. Each callback is a NORMAL frame carrying iter_state; gen_state is unchanged
+               (the base), so a callback BODY LOOP preempts the BASE flow at any depth. */
+            {
+                struct JSArrayEvery *s = js_malloc(ctx, sizeof(*s));
+                if (unlikely(!s)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                if (js_array_every_init(ctx, s, call_argv[-2], call_argc, vc(call_argv), iter_special)) {
+                    js_array_every_end(ctx, s, false); js_free_rt(rt, s); goto exception;
+                }
+                for (i = 0; i < 5; i++) s->cb_args[i] = JS_UNDEFINED;
+                s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
+                iter_st = s;
+                ret_val = JS_UNDEFINED;   /* first step has no previous callback result */
+                goto do_array_iter_step;
+            }
+
+        do_array_iter_step:
+            /* ret_val = the previous callback's result (JS_UNDEFINED on the first step); iter_st = the state.
+               Feed it to the step, then either drive the next callback or finish the builtin. */
+            {
+                struct JSArrayEvery *s = iter_st;
+                int st = js_array_every_step(ctx, s, ret_val, (JSValueConst *)&s->cb_args[2]);
+                if (unlikely(st < 0)) { js_array_every_end(ctx, s, false); js_free_rt(rt, s); goto exception; }
+                if (st == 0) {   /* DONE: pop the ORIGINAL OP_call operands, yield the builtin's result */
+                    JSValue r = s->ret;
+                    int cfirst = s->orig_cfirst, cargc = s->orig_cargc;
+                    uint8_t itail = s->orig_is_tail;
+                    JSValue *cargv = sp - cargc;
+                    js_array_every_end(ctx, s, true);   /* takes r */
+                    js_free_rt(rt, s);
+                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
+                    sp += cfirst - cargc;
+                    if (itail) { ret_val = r; goto do_return; }
+                    *sp++ = r;
+                    BREAK;
+                }
+                /* CALL: drive this element's callback. cb_args is [this,func,val,idx,obj] — a method-call shape. */
+                s->cb_args[0] = s->this_arg; s->cb_args[1] = s->func;
+                call_argv = (JSValueConst *)&s->cb_args[2];
+                call_argc = 3; tramp_first = -2; tramp_is_tail = 0;
+                if (tramp_can_call(s->cb_args[1])) {
+                    tramp_iter_state = s;   /* the pushed frame carries the state; its do_return re-enters the step */
+                    goto do_tramp_call;
+                }
+                /* A non-NORMAL callback (C function / bound / proxy) has no preemptible body — call it directly
+                   and step again; nothing to park. */
+                ret_val = JS_Call(ctx, s->cb_args[1], s->cb_args[0], 3, (JSValueConst *)&s->cb_args[2]);
+                if (unlikely(JS_IsException(ret_val))) {
+                    js_array_every_end(ctx, s, false); js_free_rt(rt, s); goto exception;
+                }
+                goto do_array_iter_step;
             }
 
         do_async_tramp_call:
@@ -19307,6 +19402,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             if (tf_top) {
                 TrampFrame *rtf = tf_top;
                 int cfirst, cargc; uint8_t itail;
+                struct JSArrayEvery *rist = rtf->iter_state;
                 if (unlikely(sf->var_ref_count != 0)) close_var_refs(rt, sf);
                 for (pval = local_buf; pval < sp; pval++) JS_FreeValue(ctx, *pval);
                 js_free_rt(rt, local_buf);
@@ -19322,6 +19418,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc = sf->cur_pc; sp = rtf->caller_sp;
                 cfirst = rtf->call_first; cargc = rtf->call_argc; itail = rtf->is_tail;
                 js_free_rt(rt, rtf);
+                if (rist) {
+                    /* An array-iteration CALLBACK returned: its operands live in the state's cb_args (borrowed),
+                       NOT on the caller's stack — so skip the cargv arg-free, and feed the result to the step
+                       instead of pushing it. The step drives the next element or finishes the builtin. */
+                    iter_st = rist;
+                    goto do_array_iter_step;
+                }
                 if (itail) goto do_return;   /* caller was a tail-caller: propagate */
                 {
                     JSValue *cargv = sp - cargc;
@@ -21778,6 +21881,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        call operands, which the caller's catch-search frees) — never leak tf_top by returning to the C base. */
     if (tf_top) {
         TrampFrame *rtf = tf_top;
+        struct JSArrayEvery *xist = rtf->iter_state;
         if (unlikely(sf->var_ref_count != 0)) close_var_refs(rt, sf);
         for (pval = local_buf; pval < sp; pval++) JS_FreeValue(ctx, *pval);
         js_free_rt(rt, local_buf);
@@ -21792,6 +21896,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         arg_allocated_size = rtf->caller_arg_allocated_size;
         pc = sf->cur_pc; sp = rtf->caller_sp;
         js_free_rt(rt, rtf);
+        if (xist) {
+            /* the throwing frame was an array-iteration CALLBACK: abandon the iteration (its state owns obj/ret/
+               val) and re-raise in the builtin's ORIGINAL caller, whose stack still holds the OP_call operands
+               for its own catch-search to free. */
+            js_array_every_end(ctx, xist, false);
+            js_free_rt(rt, xist);
+        }
         goto exception;
     }
     ret_val = JS_EXCEPTION;
@@ -44348,16 +44459,6 @@ static JSValue js_typed_array___speciesCreate(JSContext *ctx,
                                               int argc, JSValueConst *argv,
                                               bool require_mutable);
 
-/* Resumable state for js_array_every (forEach/every/some/map/filter). Factored so the per-element callback drive
-   becomes a coroutine STEP — the prerequisite for running the callback on the base tramp chain (a callback body
-   loop then preempts the base flow) instead of the C-recursive JS_Call. `pending_k` = the index whose callback
-   result is currently awaited (-1 = none); `val` = that element (freed once its result is processed). */
-typedef struct JSArrayEvery {
-    JSValue obj, ret, val;
-    int64_t len, k, n;
-    int special, pending_k;
-    JSValueConst func, this_arg;
-} JSArrayEvery;
 
 /* One coroutine step: PROCESS the previous callback's `res` (for element pending_k), then ADVANCE to the next
    present element and fill out_args with (value, index, obj). Returns 1 = CALL (invoke func on out_args), 0 = DONE
@@ -44528,6 +44629,20 @@ exception:
     JS_FreeValue(ctx, res);
     js_array_every_end(ctx, &s, false);
     return JS_EXCEPTION;
+}
+
+/* Is `func` one of the array iteration builtins whose callback drive runs on the tramp chain? Exact C-function
+   identity + its magic (the `special`) — the same dispatch quickjs itself uses, never a name/shape match. */
+static bool tramp_can_call_array_iter(JSValueConst func, int *out_special)
+{
+    JSObject *fp;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
+    fp = JS_VALUE_GET_OBJ(func);
+    if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
+    if (fp->u.cfunc.cproto != JS_CFUNC_generic_magic) return false;
+    if (fp->u.cfunc.c_function.generic_magic != js_array_every) return false;
+    *out_special = fp->u.cfunc.magic;
+    return true;
 }
 
 #define special_reduce       0
