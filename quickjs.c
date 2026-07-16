@@ -18145,6 +18145,9 @@ typedef struct TrampFrame {
                                   chain (so a loop in the constructor body preempts the base). The created `this`
                                   rides the continuation and is substituted for a non-object body result at
                                   do_return, exactly as JS_CallConstructorInternal would. */
+#define CONT_SETTER        5   /* cont_state = NULL: a `set x(v){…}` bytecode-setter body runs on this chain as a
+                                  1-arg method call; do_return frees the operands like a normal method call but
+                                  DISCARDS the setter's return value (a property write yields nothing). */
 
 /* A bytecode constructor's body run on the trampoline chain; holds the created `this` across the body so
    do_return can apply the constructor return-value rule (use `this` when the body returns a non-object).
@@ -18190,6 +18193,29 @@ static inline JSObject *tramp_bytecode_getter(JSObject *p, JSAtom atom) {
                     return g;
             }
             return NULL;
+        }
+        if (p->is_exotic) return NULL;
+        p = p->shape->proto;
+        if (!p) return NULL;
+    }
+}
+/* The setter twin of tramp_bytecode_getter: a property WRITE whose slot is a `set x(v){…}` invokes the setter
+   (C-recursively inside JS_SetPropertyInternal2 today), so a loop in the setter body drives to completion.
+   Return the setter JSObject when the first own `atom` slot on the proto chain is a GETSET with a NORMAL
+   bytecode setter, else NULL. Symmetric caveat: an own NON-GETSET writable data slot shadows inherited setters,
+   so stop (return NULL) at the first own slot exactly as the property-write lookup would. */
+static inline JSObject *tramp_bytecode_setter(JSObject *p, JSAtom atom) {
+    for (;;) {
+        JSProperty *pr; JSShapeProperty *prs = find_own_property(&pr, p, atom);
+        if (prs) {
+            if ((prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
+                JSObject *s = pr->u.getset.setter;
+                if (s && s->class_id == JS_CLASS_BYTECODE_FUNCTION &&
+                    s->u.func.function_bytecode->func_kind == JS_FUNC_NORMAL)
+                    return s;
+                return NULL;   /* getset but C/absent setter -> slow path */
+            }
+            return NULL;   /* own data slot shadows inherited setters -> slow path */
         }
         if (p->is_exotic) return NULL;
         p = p->shape->proto;
@@ -19863,6 +19889,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                     /* new C(): operands (func,new_target,args) live on the caller stack — fall through to the
                        normal cargv cleanup + push. */
+                } else if (rck == CONT_SETTER) {
+                    /* setter returned: free the operands (this,setter,value) on the caller stack exactly like a
+                       method call, but DISCARD the return value — a property write pushes nothing. */
+                    JSValue *cargv = sp - cargc;
+                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
+                    sp += cfirst - cargc;
+                    JS_FreeValue(ctx, ret_val);
+                    BREAK;
                 } else if (rck != CONT_NONE) {
                     /* A C-builtin-driven CALLBACK returned: its operands live in the state's own buffer
                        (borrowed), NOT on the caller's stack — so skip the cargv arg-free, and feed the result to
@@ -21056,6 +21090,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 } else {
                 put_field_slow_path:
                     sf->cur_pc = pc;
+                    if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
+                        JSObject *st = tramp_bytecode_setter(JS_VALUE_GET_OBJ(obj), atom);
+                        if (st) {   /* bytecode setter -> 1-arg method call [receiver, setter, value] on THIS chain */
+                            JSValue v = sp[-1];                      /* the value being written */
+                            sp[-1] = js_dup(JS_MKPTR(JS_TAG_OBJECT, st));   /* stack: [receiver][setter] */
+                            *sp++ = v;                               /* stack: [receiver][setter][value] */
+                            call_argc = 1; call_argv = sp - call_argc;   /* call_argv[0]=value, [-1]=setter, [-2]=receiver */
+                            tramp_first = -2; tramp_is_tail = 0;
+                            tramp_cont_state = NULL; tramp_cont_kind = CONT_SETTER;   /* do_return discards the result */
+                            goto do_tramp_call;
+                        }
+                    }
                     ret = JS_SetPropertyInternal2(ctx, obj, atom, sp[-1], obj,
                                                   JS_PROP_THROW_STRICT);
                     JS_FreeValue(ctx, obj);
@@ -22419,6 +22465,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JS_FreeValue(ctx, cs->created_obj);
             JS_FreeValue(ctx, cs->super_ref);
             js_free_rt(rt, cs);
+        } else if (xck == CONT_SETTER) {
+            /* a throwing setter body: no continuation state; its operands (this,setter,value) are on the caller
+               stack and freed by the caller's own catch-search, exactly like a normal method call. */
         } else if (xck != CONT_NONE) {
             /* the throwing frame was a C-builtin-driven CALLBACK: abandon the iteration (its state owns the
                object/accumulator/element) and re-raise in the builtin's ORIGINAL caller, whose stack still holds
