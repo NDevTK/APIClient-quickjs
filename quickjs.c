@@ -23398,8 +23398,7 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
             ct->async_promise = aprom2;        /* fresh capability's promise (owned by this frame) */
             ct->local_buf = NULL; ct->b = NULL; /* async frame owns its buffers via as2->func_state */
         } else {
-            DCHECK(otf->gen_data == NULL && otf->cont_kind == CONT_NONE,
-                   "clone_deep_flow: deep-fork of a generator / C-continuation frame not built");
+            DCHECK(otf->gen_data == NULL, "clone_deep_flow: deep-fork of a generator frame not built");
             JSFunctionBytecode *wb = JS_VALUE_GET_OBJ(otf->sf.cur_func)->u.func.function_bytecode;
             int wal = otf->sf.arg_count, wlc = wal + wb->var_count + wb->stack_size;
             int arg_in_frame = (otf->sf.arg_buf >= otf->local_buf && otf->sf.arg_buf < otf->local_buf + wlc + 1);
@@ -23415,6 +23414,42 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
             ct->sf.var_ref_count = otf->sf.var_ref_count;   /* share this frame's closed cells + take a ref */
             for (int vi = 0; vi < otf->sf.var_ref_count; vi++) { ct->sf.var_refs[vi] = otf->sf.var_refs[vi]; if (ct->sf.var_refs[vi]) JS_REF_COUNT(ct->sf.var_refs[vi])++; }
             ct->sf.prev_frame = NULL;
+            if (otf->cont_kind == CONT_ARRAY_ITER) {
+                /* C-CONTINUATION callback frame (forEach/map/every/some/filter): clone the builtin's iteration
+                   state so the sibling iterates INDEPENDENTLY from the fork point. obj/ret/val are OWNED (dup);
+                   func/this_arg are BORROWED object values kept alive by the clone's own caller-stack dup (plain
+                   copy — XL would corrupt an object value). The map/filter result array (ret) is SHARED and
+                   COW-isolated per-flow, like any post-fork object mutation.
+                   CRITICAL: the callback's args live in cb_args (an EXTERNAL buffer owned by the state), so the
+                   in-flight callback's sf.arg_buf points at &os->cb_args[2] — NOT the caller's stack. The generic
+                   XL(cob,ccb) above mis-relocated it (a wild pointer); repoint it into the CLONE's cb_args, and
+                   rebuild cb_args as the borrowed [this,func,val,idx,obj] shape referencing ns's owned fields so
+                   the running callback reads the correct element. */
+                struct JSArrayEvery *os = (struct JSArrayEvery *)otf->cont_state;
+                struct JSArrayEvery *ns = js_malloc(ctx, sizeof(*ns));
+                if (!ns) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
+                /* map/filter (special 3/4) build a RESULT-ARRAY accumulator whose sound per-flow fork is an open
+                   design question: the array is private per-flow (so it can't be COW-SHARED — DefineProperty array
+                   writes bypass the capture hook, contaminating arms), yet a per-flow element COPY interacts with
+                   the forked=1 capture (which then treats the private accumulator as shared and reverts it on a
+                   context-switch, dropping an element). forEach/every/some have no such accumulator. DFAIL the
+                   array-builders — never emit a wrong @H value — until the accumulator-under-COW piece is built. */
+                DCHECK((os->special & ~8 /*special_TA*/) != 3 /*special_map*/ && (os->special & ~8) != 4 /*special_filter*/,
+                       "clone_deep_flow: deep-fork of map/filter (result-array accumulator) not built — the per-flow accumulator-vs-COW piece is next");
+                *ns = *os;
+                ns->obj = js_dup(os->obj);
+                ns->val = js_dup(os->val);
+                ns->ret = js_dup(os->ret);   /* forEach=undefined, every/some=bool: immutable, plain dup */
+                ns->func = os->func; ns->this_arg = os->this_arg;
+                ns->cb_args[0] = ns->this_arg; ns->cb_args[1] = ns->func;
+                ns->cb_args[2] = ns->val; ns->cb_args[3] = os->cb_args[3]; ns->cb_args[4] = ns->obj;
+                ct->cont_state = ns;
+                if (otf->sf.arg_buf == &os->cb_args[2])   /* the callback's args are external cb_args -> repoint */
+                    ct->sf.arg_buf = &ns->cb_args[2];
+            } else {
+                DCHECK(otf->cont_kind == CONT_NONE,
+                       "clone_deep_flow: deep-fork of this C-continuation kind (sort/reduce/json-revive/construct/agen) not built");
+            }
         }
         ct->up = (i == n - 1) ? NULL : ca[i + 1];
         ct->caller_sf        = caller_clone;
