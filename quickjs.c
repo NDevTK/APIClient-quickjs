@@ -18138,6 +18138,9 @@ typedef struct TrampFrame {
 #define CONT_NONE          0
 #define CONT_ARRAY_ITER    1   /* cont_state = JSArrayEvery  (forEach/map/every/some/filter) */
 #define CONT_ARRAY_REDUCE  2   /* cont_state = JSArrayReduce (reduce/reduceRight) */
+#define CONT_AGEN_CREATE   3   /* cont_state = JSAsyncGeneratorData: an async generator's params are binding on
+                                  this chain (run-to-initial_yield); settles at OP_initial_yield by creating the
+                                  async-generator object. Mirrors the sync gen_magic==0xFF creation frame. */
 
 /* Only a NORMAL bytecode function trampolines (the common deep-recursion case). */
 static inline bool tramp_can_call(JSValueConst func) {
@@ -18233,6 +18236,31 @@ static inline bool tramp_can_call_gen_create(JSValueConst func) {
     fp = JS_VALUE_GET_OBJ(func);
     return fp->class_id == JS_CLASS_GENERATOR_FUNCTION;
 }
+typedef enum JSAsyncGeneratorStateEnum {
+    JS_ASYNC_GENERATOR_STATE_SUSPENDED_START,
+    JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD,
+    JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD_STAR,
+    JS_ASYNC_GENERATOR_STATE_EXECUTING,
+    JS_ASYNC_GENERATOR_STATE_AWAITING_RETURN,
+    JS_ASYNC_GENERATOR_STATE_COMPLETED,
+} JSAsyncGeneratorStateEnum;
+typedef struct JSAsyncGeneratorData {
+    JSObject *generator; /* back pointer to the object (const) */
+    JSAsyncGeneratorStateEnum state;
+    JSAsyncFunctionState func_state;
+    struct list_head queue; /* list of JSAsyncGeneratorRequest.link */
+} JSAsyncGeneratorData;
+
+/* An ASYNC generator function call ag() likewise binds its params up to OP_initial_yield; run that on the chain
+   so a param-default loop preempts the base flow instead of DFAILing inside js_async_generator_function_call. */
+static inline bool tramp_can_call_agen_create(JSValueConst func) {
+    JSObject *fp;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
+    fp = JS_VALUE_GET_OBJ(func);
+    return fp->class_id == JS_CLASS_ASYNC_GENERATOR_FUNCTION;
+}
+struct JSAsyncGeneratorData;
+static void js_async_generator_free(JSRuntime *rt, struct JSAsyncGeneratorData *s);
 /* A generator .next()/.throw()/.return() runs its body on the caller's tramp chain (do_generator_tramp) so a
    body loop preempts the base flow. Returns the magic (NEXT/RETURN/THROW) if `method` is the generator iterator
    method and `this` is a live generator, else -1. */
@@ -18867,6 +18895,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_gen_create(call_argv[-1])) {   /* generator fn g() -> params-to-initial_yield on THIS chain */
                     tramp_first = -1; tramp_is_tail = (opcode == OP_tail_call); goto do_generator_create_tramp;
                 }
+                if (tramp_can_call_agen_create(call_argv[-1])) {   /* async generator ag() -> params-to-initial_yield here */
+                    tramp_first = -1; tramp_is_tail = (opcode == OP_tail_call); goto do_agen_create_tramp;
+                }
                 ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
                                           JS_UNDEFINED, call_argc,
                                           vc(call_argv), 0);
@@ -18916,6 +18947,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 if (tramp_can_call_gen_create(call_argv[-1])) {   /* generator method -> params-to-initial_yield on THIS chain */
                     tramp_first = -2; tramp_is_tail = (opcode == OP_tail_call_method); goto do_generator_create_tramp;
+                }
+                if (tramp_can_call_agen_create(call_argv[-1])) {   /* async generator method -> params here */
+                    tramp_first = -2; tramp_is_tail = (opcode == OP_tail_call_method); goto do_agen_create_tramp;
                 }
                 if (tramp_can_call_array_iter(call_argv[-1], &iter_special)) {   /* arr.forEach/map/... -> callback drive on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_array_iter_tramp;
@@ -19438,6 +19472,89 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 giter = (gdone == 2) ? value : js_create_iterator_result(ctx, value, gdone);
                 if (JS_IsException(giter)) goto exception;
                 *sp++ = giter;
+                BREAK;
+            }
+
+        do_agen_create_tramp:
+            /* async generator ag(): bind params up to OP_initial_yield HERE (a param-default loop then preempts
+               the base flow), then create the async-generator object at do_agen_create_settle. Mirrors
+               js_async_generator_function_call. */
+            {
+                JSValueConst afn = call_argv[-1];
+                struct JSAsyncGeneratorData *s = js_mallocz(ctx, sizeof(JSAsyncGeneratorData));
+                TrampFrame *atf2; JSStackFrame *asf2; JSObject *afp; JSFunctionBytecode *ab2;
+                if (unlikely(!s)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                ((JSAsyncGeneratorData *)s)->state = JS_ASYNC_GENERATOR_STATE_SUSPENDED_START;
+                init_list_head(&((JSAsyncGeneratorData *)s)->queue);
+                if (async_func_init(ctx, &((JSAsyncGeneratorData *)s)->func_state, afn,
+                                    (tramp_first == -2) ? call_argv[-2] : JS_UNDEFINED, call_argc, vc(call_argv))) {
+                    ((JSAsyncGeneratorData *)s)->state = JS_ASYNC_GENERATOR_STATE_COMPLETED;
+                    js_async_generator_free(rt, s); goto exception;
+                }
+                atf2 = js_malloc_rt(rt, sizeof(TrampFrame));
+                if (unlikely(!atf2)) { js_async_generator_free(rt, s); JS_ThrowOutOfMemory(ctx); goto exception; }
+                atf2->async_promise = js_dup(afn);   /* held for js_create_from_ctor at initial_yield */
+                for (i = tramp_first; i < call_argc; i++) JS_FreeValue(ctx, call_argv[i]);
+                atf2->up = tf_top;
+                atf2->caller_sf = sf; atf2->caller_b = b; atf2->caller_ctx = ctx;
+                atf2->caller_local_buf = local_buf; atf2->caller_stack_buf = stack_buf;
+                atf2->caller_var_buf = var_buf; atf2->caller_arg_buf = arg_buf;
+                atf2->caller_this = this_obj; atf2->caller_new_target = new_target;
+                atf2->caller_var_refs = var_refs;
+                atf2->caller_argc = argc; atf2->caller_argv = argv;
+                atf2->caller_arg_allocated_size = arg_allocated_size;
+                atf2->caller_sp = call_argv + tramp_first;
+                atf2->call_first = -1; atf2->call_argc = 0; atf2->is_tail = tramp_is_tail;
+                atf2->async_data = NULL; atf2->gen_data = NULL; atf2->gen_magic = 0;
+                atf2->cont_state = s; atf2->cont_kind = CONT_AGEN_CREATE;
+                atf2->b = NULL; atf2->local_buf = NULL;
+                asf2 = &((JSAsyncGeneratorData *)s)->func_state.frame;
+                afp = JS_VALUE_GET_OBJ(asf2->cur_func);
+                ab2 = afp->u.func.function_bytecode;
+                atf2->ctx = ab2->realm;
+                asf2->prev_frame = rt->current_stack_frame;
+                rt->current_stack_frame = asf2;
+                tf_top = atf2;
+                sf = asf2; b = ab2; ctx = ab2->realm;
+                var_refs = afp->u.func.var_refs;
+                local_buf = arg_buf = asf2->arg_buf;
+                var_buf = asf2->var_buf;
+                stack_buf = asf2->var_buf + ab2->var_count;
+                this_obj = ((JSAsyncGeneratorData *)s)->func_state.this_val; new_target = JS_UNDEFINED;
+                argc = ((JSAsyncGeneratorData *)s)->func_state.argc; argv = (JSValueConst *)asf2->arg_buf;
+                arg_allocated_size = asf2->arg_count;
+                sp = asf2->cur_sp; pc = asf2->cur_pc;
+                asf2->cur_sp = NULL;
+                goto restart;
+            }
+
+        do_agen_create_settle:
+            /* params bound, body suspended at initial_yield: create the async-generator object and return it */
+            {
+                TrampFrame *atf2 = tf_top;
+                JSAsyncGeneratorData *s = (JSAsyncGeneratorData *)atf2->cont_state;
+                JSValue afn = atf2->async_promise;
+                uint8_t aitail = atf2->is_tail;
+                JSValue obj;
+                sf->cur_pc = pc; sf->cur_sp = sp;   /* SUSPENDED_START */
+                obj = js_create_from_ctor(ctx, afn, JS_CLASS_ASYNC_GENERATOR);
+                rt->current_stack_frame = atf2->caller_sf;
+                tf_top = atf2->up;
+                sf = atf2->caller_sf; b = atf2->caller_b; ctx = atf2->caller_ctx;
+                local_buf = atf2->caller_local_buf; stack_buf = atf2->caller_stack_buf;
+                var_buf = atf2->caller_var_buf; arg_buf = atf2->caller_arg_buf;
+                this_obj = atf2->caller_this; new_target = atf2->caller_new_target;
+                var_refs = atf2->caller_var_refs;
+                argc = atf2->caller_argc; argv = atf2->caller_argv;
+                arg_allocated_size = atf2->caller_arg_allocated_size;
+                pc = sf->cur_pc; sp = atf2->caller_sp;
+                js_free_rt(rt, atf2);
+                JS_FreeValue(ctx, afn);
+                if (unlikely(JS_IsException(obj))) { js_async_generator_free(rt, s); goto exception; }
+                s->generator = JS_VALUE_GET_OBJ(obj);
+                JS_SetOpaqueInternal(obj, s);
+                if (aitail) { ret_val = obj; goto do_return; }
+                *sp++ = obj;
                 BREAK;
             }
 
@@ -21891,6 +22008,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             goto done_generator;
         CASE(OP_initial_yield):
             if (tf_top && tf_top->gen_data && tf_top->gen_magic == 0xFF) goto do_generator_create_settle;   /* g() creation on the chain */
+            if (tf_top && tf_top->cont_kind == CONT_AGEN_CREATE) goto do_agen_create_settle;   /* ag() creation on the chain */
             ret_val = JS_UNDEFINED;
             goto done_generator;
 
@@ -22022,7 +22140,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         arg_allocated_size = rtf->caller_arg_allocated_size;
         pc = sf->cur_pc; sp = rtf->caller_sp;
         js_free_rt(rt, rtf);
-        if (xck != CONT_NONE) {
+        if (xck == CONT_AGEN_CREATE) {
+            /* a param-binding throw before the async-generator object exists: drop the state */
+            js_async_generator_free(rt, (struct JSAsyncGeneratorData *)xcs);
+        } else if (xck != CONT_NONE) {
             /* the throwing frame was a C-builtin-driven CALLBACK: abandon the iteration (its state owns the
                object/accumulator/element) and re-raise in the builtin's ORIGINAL caller, whose stack still holds
                the OP_call operands for its own catch-search to free. */
@@ -22985,14 +23106,6 @@ static JSValue js_async_function_call(JSContext *ctx, JSValueConst func_obj,
 
 /* AsyncGenerator */
 
-typedef enum JSAsyncGeneratorStateEnum {
-    JS_ASYNC_GENERATOR_STATE_SUSPENDED_START,
-    JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD,
-    JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD_STAR,
-    JS_ASYNC_GENERATOR_STATE_EXECUTING,
-    JS_ASYNC_GENERATOR_STATE_AWAITING_RETURN,
-    JS_ASYNC_GENERATOR_STATE_COMPLETED,
-} JSAsyncGeneratorStateEnum;
 
 typedef struct JSAsyncGeneratorRequest {
     struct list_head link;
@@ -23004,12 +23117,6 @@ typedef struct JSAsyncGeneratorRequest {
     JSValue resolving_funcs[2];
 } JSAsyncGeneratorRequest;
 
-typedef struct JSAsyncGeneratorData {
-    JSObject *generator; /* back pointer to the object (const) */
-    JSAsyncGeneratorStateEnum state;
-    JSAsyncFunctionState func_state;
-    struct list_head queue; /* list of JSAsyncGeneratorRequest.link */
-} JSAsyncGeneratorData;
 
 static void js_async_generator_free(JSRuntime *rt,
                                     JSAsyncGeneratorData *s)
