@@ -44187,7 +44187,7 @@ static JSValue js_array_reduce(JSContext *ctx, JSValueConst this_val,
             args[1] = val;
             args[2] = index_val;
             args[3] = obj;
-            acc1 = JS_Call(ctx, func, JS_UNDEFINED, 4, args);
+            acc1 = js_call_as_flow(ctx, func, JS_UNDEFINED, 4, args);   /* hook: reducer body is preemptible */
             JS_FreeValue(ctx, index_val);
             JS_FreeValue(ctx, val);
             val = JS_UNDEFINED;
@@ -44436,7 +44436,7 @@ static JSValue js_array_find(JSContext *ctx, JSValueConst this_val,
         args[0] = val;
         args[1] = index_val;
         args[2] = this_val;
-        res = JS_Call(ctx, func, this_arg, 3, args);
+        res = js_call_as_flow(ctx, func, this_arg, 3, args);   /* hook: predicate body is preemptible */
         if (JS_IsException(res))
             goto exception;
         if (JS_ToBoolFree(ctx, res)) {
@@ -60584,7 +60584,7 @@ static JSValue js_typed_array_find(JSContext *ctx, JSValueConst this_val,
         args[0] = val;
         args[1] = index_val;
         args[2] = this_val;
-        res = JS_Call(ctx, func, this_arg, 3, args);
+        res = js_call_as_flow(ctx, func, this_arg, 3, args);   /* hook: predicate body is preemptible */
         if (JS_IsException(res))
             goto exception;
         if (JS_ToBoolFree(ctx, res)) {
