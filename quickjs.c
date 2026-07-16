@@ -18321,6 +18321,16 @@ static inline bool tramp_is_function_apply(JSValueConst method) {
     return mp->class_id == JS_CLASS_C_FUNCTION && mp->u.cfunc.cproto == JS_CFUNC_generic_magic
         && mp->u.cfunc.c_function.generic_magic == js_function_apply && mp->u.cfunc.magic == 0;
 }
+/* Reflect.apply(target, thisArg, argsList) — js_reflect_apply forwards to js_function_apply; route it into
+   do_apply_tramp with the Reflect operand shape ([Reflect, apply, target, thisArg, argsList]). */
+static JSValue js_reflect_apply(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static inline bool tramp_is_reflect_apply(JSValueConst method) {
+    JSObject *mp;
+    if (JS_VALUE_GET_TAG(method) != JS_TAG_OBJECT) return false;
+    mp = JS_VALUE_GET_OBJ(method);
+    return mp->class_id == JS_CLASS_C_FUNCTION && mp->u.cfunc.cproto == JS_CFUNC_generic
+        && mp->u.cfunc.c_function.generic == js_reflect_apply;
+}
 
 /* Helpers defined later — needed by the heap-resident async call path inside JS_CallInternal. */
 static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s, JSValueConst func_obj,
@@ -19140,6 +19150,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         ap_array = aa; ap_cfirst = -2; ap_cargc = call_argc;
                         tramp_is_tail = (opcode == OP_tail_call_method); goto do_apply_tramp;
                     }
+                }
+                if (tramp_is_reflect_apply(call_argv[-1]) && call_argc >= 3 && tramp_can_call(call_argv[0])
+                    && JS_VALUE_GET_TAG(call_argv[2]) == JS_TAG_OBJECT) {   /* Reflect.apply(target, this, argsList) */
+                    ap_func = call_argv[0]; ap_this = call_argv[1]; ap_array = call_argv[2];
+                    ap_cfirst = -2; ap_cargc = call_argc;   /* operands [Reflect, apply, target, this, argsList] */
+                    tramp_is_tail = (opcode == OP_tail_call_method); goto do_apply_tramp;
                 }
                 {   /* generator .next()/.throw()/.return() -> body runs on THIS chain (loop preempts the base) */
                     int gmag = tramp_gen_method_magic(call_argv[-1], call_argv[-2]);
