@@ -1405,6 +1405,11 @@ static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,
         }
         for(;;) {
             JSContext *ctx1;
+            /* THE PUMP: a flow parked inside job-driven code resumes BEFORE any queued job — a forced preempt
+               must not reorder observable microtasks. With one flow that is immediately, which is exactly what
+               the scheduler decides when nothing else is runnable. */
+            while (JS_ResumeParkedFlow(JS_GetRuntime(ctx)))
+                ;
             ret = JS_ExecutePendingJob(JS_GetRuntime(ctx), &ctx1);
             if (ret < 0) {
                 res_val = JS_EXCEPTION;
@@ -2084,6 +2089,11 @@ int run_test262_harness_test(ThreadLocalStorage *tls, const char *filename,
         }
         for(;;) {
             JSContext *ctx1;
+            /* THE PUMP: a flow parked inside job-driven code resumes BEFORE any queued job — a forced preempt
+               must not reorder observable microtasks. With one flow that is immediately, which is exactly what
+               the scheduler decides when nothing else is runnable. */
+            while (JS_ResumeParkedFlow(JS_GetRuntime(ctx)))
+                ;
             ret = JS_ExecutePendingJob(JS_GetRuntime(ctx), &ctx1);
             if (ret < 0) {
                 js_std_dump_error(ctx1);

@@ -1233,6 +1233,15 @@ JS_EXTERN void     JS_FlowFree(JSContext *ctx, JSValue *flow);
 /* Feature-engagement counters (anti-fake-green): requested = back-edge preempt points reached; fired = actually
    parked+rebuilt. requested>fired iff the feature is gated somewhere (nested async/generator activation). */
 JS_EXTERN void     JS_FlowPreemptStats(uint64_t *requested, uint64_t *fired);
+
+/* THE PUMP. A flow that preempts inside job-driven code (an async-generator body) parks here instead of
+   re-queuing behind the job FIFO — re-queuing lets other microtasks run first and CHANGES observable
+   interleaving. The host must resume parked flows BEFORE draining a job, so a forced preempt stays transparent
+   to ordering:  while (JS_ResumeParkedFlow(rt)) ;  then run one job. */
+typedef void JSFlowParkFn(JSContext *ctx, void *opaque);
+JS_EXTERN void     JS_ParkFlow(JSContext *ctx, JSFlowParkFn *fn, void *opaque);
+JS_EXTERN bool     JS_HasParkedFlow(JSRuntime *rt);
+JS_EXTERN bool     JS_ResumeParkedFlow(JSRuntime *rt);
 /* Frame-snapshot fork: deep-copy a SUSPENDED flow into an INDEPENDENT clone that resumes from the same point.
    No fallback — an un-built frame shape (deep tramp chain / live closures) crashes loud. */
 JS_EXTERN JSValue *JS_FlowClone(JSContext *ctx, JSValue *flow);

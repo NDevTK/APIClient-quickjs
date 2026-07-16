@@ -18297,6 +18297,33 @@ static JSAsyncFunctionState *g_flow_base_gen = NULL;
 /* ATOMIC: run-test262 increments these from many worker threads; a non-atomic ++ races so fired can overtake
    requested (a bogus >100% + underflowed gap) or undercount (a false gap on a true-100% category). Relaxed
    ordering is enough — they are pure counters, never a synchronization point. Portable to gcc + emcc. */
+/* THE PUMP'S PARKED SLOT. A forced preempt must be TRANSPARENT to observable ordering: the flow suspends, and the
+   scheduler resumes it BEFORE any queued job — with one flow that is immediately, so no microtask interleaving
+   changes. Re-queuing the resume through JS_EnqueueJob is NOT that: a FIFO puts it behind every pending job and
+   reorders them (proven: async-generator-interleaved / for-await-of-interleaved fail that way). So a flow that
+   preempts inside job-driven code parks HERE, and the host pump (JS_ResumeParkedFlow, called before draining a
+   job) resumes it. One slot is what a single-flow engine needs today; the solver's ranked frontier replaces the
+   slot, not the contract — "resume the top-ranked parked flow before starting new work" holds at both sizes. */
+static JSFlowParkFn *g_parked_fn = NULL;
+static void *g_parked_opaque = NULL;
+static JSContext *g_parked_ctx = NULL;
+
+void JS_ParkFlow(JSContext *ctx, JSFlowParkFn *fn, void *opaque) {
+    assert(g_parked_fn == NULL);   /* one parked flow at a time: it resumes before any other work runs */
+    g_parked_ctx = ctx; g_parked_fn = fn; g_parked_opaque = opaque;
+}
+bool JS_HasParkedFlow(JSRuntime *rt) { (void)rt; return g_parked_fn != NULL; }
+bool JS_ResumeParkedFlow(JSRuntime *rt) {
+    JSFlowParkFn *fn = g_parked_fn;
+    JSContext *ctx = g_parked_ctx;
+    void *op = g_parked_opaque;
+    (void)rt;
+    if (!fn) return false;
+    g_parked_fn = NULL; g_parked_opaque = NULL; g_parked_ctx = NULL;
+    fn(ctx, op);   /* may park again at the next back-edge — the pump loops */
+    return true;
+}
+
 static uint64_t g_flow_preempt_requested = 0;
 static uint64_t g_flow_preempt_fired = 0;
 #define FLOW_PREEMPT_COUNT(c) __atomic_fetch_add(&(c), 1, __ATOMIC_RELAXED)
@@ -23316,6 +23343,19 @@ static int js_async_generator_completed_return(JSContext *ctx,
     return res;
 }
 
+static void js_async_generator_resume_next(JSContext *ctx, JSAsyncGeneratorData *s);
+/* The pump resumes a parked async-generator body: re-enter the drive at its saved point (state == EXECUTING).
+   The park HOLDS A REF to the generator object — a suspended body is live state, and without the ref the object
+   could be collected while parked, freeing the frame mid-suspension (async_func_free would see a RUNNING frame). */
+static void js_async_gen_park_resume(JSContext *ctx, void *opaque)
+{
+    JSValue gobj = JS_MKPTR(JS_TAG_OBJECT, (JSObject *)opaque);
+    JSAsyncGeneratorData *s = JS_GetOpaque(gobj, JS_CLASS_ASYNC_GENERATOR);
+    if (s)
+        js_async_generator_resume_next(ctx, s);
+    JS_FreeValue(ctx, gobj);   /* release the ref taken at park */
+}
+
 static void js_async_generator_resume_next(JSContext *ctx,
                                            JSAsyncGeneratorData *s)
 {
@@ -23368,7 +23408,21 @@ static void js_async_generator_resume_next(JSContext *ctx,
             }
             s->state = JS_ASYNC_GENERATOR_STATE_EXECUTING;
         resume_exec:
-            func_ret = async_func_resume(ctx, &s->func_state);
+            {
+                /* the async-generator BODY is a flow: its own base, so a back-edge PARKS it */
+                JSAsyncFunctionState *prev_base = g_flow_base_gen;
+                g_flow_base_gen = &s->func_state;
+                func_ret = async_func_resume(ctx, &s->func_state);
+                g_flow_base_gen = prev_base;
+            }
+            if (JS_VALUE_GET_TAG(func_ret) == JS_TAG_INT && JS_VALUE_GET_INT(func_ret) == FUNC_RET_PREEMPT &&
+                (s->func_state.frame.cur_sp != NULL || s->func_state.tramp_top != NULL)) {
+                /* PARKED mid-body: park into THE PUMP, never the job FIFO (that reorders microtasks). The state
+                   stays EXECUTING, so the pump's resume re-enters here at the saved point. */
+                js_dup(JS_MKPTR(JS_TAG_OBJECT, s->generator));   /* the park keeps the suspended body alive */
+                JS_ParkFlow(ctx, js_async_gen_park_resume, s->generator);
+                return;
+            }
             if (JS_IsException(func_ret)) {
                 value = JS_GetException(ctx);
                 js_async_generator_complete(ctx, s);
