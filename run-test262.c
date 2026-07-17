@@ -2415,6 +2415,10 @@ int main(int argc, char **argv)
             fprintf(stderr, "Feature: %llu preempt-requested, %llu fired (%.1f%% engaged), %llu nested-gap%s\n",
                     (unsigned long long)req, (unsigned long long)fired, eng,
                     (unsigned long long)(req - fired), (req - fired) != 1 ? "s" : "");
+            /* DRIVE-TO-COMPLETION detector: any coroutine body run to completion instead of suspend/resume on the
+               tramp chain. 0 across the corpus = pure suspend/resume-at-any-depth; >0 names remaining bypasses. */
+            fprintf(stderr, "DriveToCompletion: %llu (0 = pure suspend/resume; >0 = tests ran a coroutine to completion off-tramp)\n",
+                    (unsigned long long)JS_DriveToCompletionCount());
         }
     }
 

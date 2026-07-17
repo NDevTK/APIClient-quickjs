@@ -18512,8 +18512,12 @@ static inline int tramp_gen_method_magic(JSValueConst method, JSValueConst this_
 static JSFlowControlHooks g_flow_control = { NULL, NULL, NULL };
 /* The flow's BASE async activation, set by JS_FlowResume around the base run. A concolic branch may frame-
    snapshot-fork ONLY when the running activation IS this base and flat (tf_top==NULL); a branch in a NESTED
-   async function call (its own gen_state) or a deep trampolined frame forks by decision-vector replay instead. */
-static JSAsyncFunctionState *g_flow_base_gen = NULL;
+   async function call (its own gen_state) or a deep trampolined frame forks by decision-vector replay instead.
+   THREAD-LOCAL: the real engine is single-threaded (one WASM instance per document), but run-test262 drives many
+   tests on parallel OS threads. The drive-to-completion guard reads this on EVERY async_func_resume, so a shared
+   global would race across threads (test A's base vs test B's, spuriously firing s != base). Per-thread makes each
+   test's base its own; single-threaded it is just a global. */
+static _Thread_local JSAsyncFunctionState *g_flow_base_gen = NULL;
 
 /* FEATURE-ENGAGEMENT COUNTERS — the honest anti-fake-green instrument. A test passing proves the RESULT is
    spec-correct; it does NOT prove the time-travel feature ever RAN on that test's logic. So we count, per
@@ -18555,11 +18559,18 @@ bool JS_ResumeParkedFlow(JSRuntime *rt) {
 
 static uint64_t g_flow_preempt_requested = 0;
 static uint64_t g_flow_preempt_fired = 0;
+/* DRIVE-TO-COMPLETION DETECTOR: bumped at every site where a coroutine body WOULD run to completion instead of
+   suspending/resuming on the tramp chain (a generator/async body driven off-tramp). A test262 run over the whole
+   corpus reports this count; ANY non-zero value means some test ran to completion instead of suspend/resume — a
+   drive-to-completion the tramp routing has not yet subsumed. The goal is 0 across the corpus (pure suspend/resume
+   at any depth). Unlike a per-test crash it aggregates ALL sites in one bulk run rather than aborting at the first. */
+static uint64_t g_drive_to_completion = 0;
 #define FLOW_PREEMPT_COUNT(c) __atomic_fetch_add(&(c), 1, __ATOMIC_RELAXED)
 void JS_FlowPreemptStats(uint64_t *requested, uint64_t *fired) {
     if (requested) *requested = __atomic_load_n(&g_flow_preempt_requested, __ATOMIC_RELAXED);
     if (fired)     *fired     = __atomic_load_n(&g_flow_preempt_fired, __ATOMIC_RELAXED);
 }
+uint64_t JS_DriveToCompletionCount(void) { return __atomic_load_n(&g_drive_to_completion, __ATOMIC_RELAXED); }
 
 /* Concolic branch arm + snapshot fork. The branch hook returns the arm (0/1), ORed with 0x100 when it forked
    a sibling here. On a fork we snapshot the CURRENT frame AT the OP_if (cond still on the stack) so the
@@ -18661,6 +18672,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     int iter_special = 0;
     int tramp_gen_magic = 0;                            /* set before goto do_generator_tramp */
     int tramp_gen_forof = 1;                            /* <0 = for-of iterator stack offset (always -3-.. ); 1 = direct .next() (no valid offset is positive) */
+    int tramp_gen_iternext = 0;                         /* 1 = OP_iterator_next drive (yield* / destructuring): iterator at sp[-4], arg at sp[-1], result OBJECT replaces sp[-1] */
     JSAsyncFunctionState *gen_state = NULL;   /* the generator/async base state IF this activation is preemptible */
 
 #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_STEP
@@ -18696,6 +18708,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         if (flags & JS_CALL_FLAG_GENERATOR) {
             JSAsyncFunctionState *s = JS_VALUE_GET_PTR(func_obj);
             gen_state = s;   /* this activation is preemptible: a yield unwinds to this base */
+            /* NOTE: a nested (off-tramp) coroutine drive is COUNTED + rejected one frame earlier, at the single
+               chokepoint async_func_resume (the only caller that reaches here with JS_CALL_FLAG_GENERATOR), so it
+               never gets this far — see the DRIVE-TO-COMPLETION guard there. */
             /* func_obj get contains a pointer to JSFuncAsyncState */
             /* the stack frame is already allocated */
             sf = &s->frame;
@@ -19987,13 +20002,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                C-recursing async_func_resume; OP_yield / OP_return_async / exception -> do_generator_settle. The
                receiver + method + args sit on the caller stack at [call_argv-2 .. call_argv+call_argc). */
             {
+                bool iternext = tramp_gen_iternext; tramp_gen_iternext = 0;   /* OP_iterator_next drive (yield-star + destructuring) */
                 bool forof = (tramp_gen_forof < 0);   /* a real for-of offset is always negative (-3-..) */
                 int fofoff = tramp_gen_forof;
                 tramp_gen_forof = 1;   /* reset to the direct-call sentinel */
-                JSValueConst gthis = forof ? sp[fofoff] : call_argv[-2];
+                /* iternext: iterator at sp[-4], resume arg at sp[-1] (OP_iterator_next stack shape). for-of:
+                   iterator at sp[fofoff]. direct: receiver at call_argv[-2], arg at call_argv[0]. */
+                JSValueConst gthis = iternext ? sp[-4] : (forof ? sp[fofoff] : call_argv[-2]);
                 JSGeneratorData *gs = JS_VALUE_GET_OBJ(gthis)->u.generator_data;
                 int gmagic = tramp_gen_magic;
-                JSValueConst garg = forof ? JS_UNDEFINED : ((call_argc >= 1) ? call_argv[0] : JS_UNDEFINED);
+                JSValueConst garg = iternext ? sp[-1] : (forof ? JS_UNDEFINED : ((call_argc >= 1) ? call_argv[0] : JS_UNDEFINED));
                 JSStackFrame *gsf = &gs->func_state.frame;
                 TrampFrame *gtf; JSObject *gfp; JSFunctionBytecode *gb;
                 bool run_body = true, do_throw = false;
@@ -20020,6 +20038,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JSValue gv = (!do_throw && gmagic == GEN_MAGIC_RETURN) ? js_dup(garg) : JS_UNDEFINED;
                     JSValue thr = do_throw ? js_dup(garg) : JS_UNDEFINED;
                     JSValue giter;
+                    if (iternext) {   /* OP_iterator_next: the iterator-result OBJECT replaces the resume arg at sp[-1] */
+                        if (do_throw) { JS_FreeValue(ctx, gv); JS_Throw(ctx, thr); goto exception; }
+                        giter = js_create_iterator_result(ctx, gv, true);
+                        if (JS_IsException(giter)) goto exception;
+                        JS_FreeValue(ctx, sp[-1]); sp[-1] = giter;
+                        BREAK;
+                    }
                     if (forof) {
                         JS_FreeValue(ctx, gv);
                         if (do_throw) { JS_Throw(ctx, thr); goto exception; }
@@ -20037,7 +20062,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 gs->state = JS_GENERATOR_STATE_EXECUTING;
                 gtf = js_malloc_rt(rt, sizeof(TrampFrame));
                 if (unlikely(!gtf)) { JS_ThrowOutOfMemory(ctx); goto exception; }
-                if (forof) {
+                if (iternext) {
+                    /* OP_iterator_next (yield* / destructuring): the iterator STAYS on the caller stack at sp[-4]
+                       (no ref to hold). At settle the iterator-result OBJECT replaces sp[-1], sp unchanged. is_tail=2
+                       marks iternext mode; forof_off=-4 records the iterator slot so a concolic body fork recovers
+                       the generator (the same caller_sp[forof_off] recovery the for-of path uses). */
+                    gtf->async_promise = JS_UNDEFINED;
+                    gtf->caller_sp = sp;
+                    gtf->is_tail = 2;
+                    gtf->forof_off = -4;
+                } else if (forof) {
                     /* the iterator STAYS on the caller stack (reused each loop) — no ref to hold, nothing to free;
                        value+done are written above sp at settle. is_tail marks for-of mode. forof_off records the
                        iterator's stack slot (caller_sp[fofoff] == gthis) so a concolic fork inside the body can
@@ -20093,8 +20127,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 TrampFrame *gtf = tf_top;
                 JSGeneratorData *gs = gtf->gen_data;
-                JSValue ghold = gtf->async_promise;   /* held generator ref (direct) or UNDEFINED (for-of) */
-                bool forof = gtf->is_tail;
+                JSValue ghold = gtf->async_promise;   /* held generator ref (direct) or UNDEFINED (for-of/iternext) */
+                int gmode = gtf->is_tail;   /* 0 = direct .next(); 1 = for-of; 2 = OP_iterator_next (yield-star + destructuring) */
+                bool forof = (gmode == 1);
                 JSStackFrame *gsf = &gs->func_state.frame;
                 JSValue value, giter;
                 bool is_yield = (JS_VALUE_GET_TAG(ret_val) == JS_TAG_INT);
@@ -20133,6 +20168,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         sp[0] = value; sp[1] = js_bool(gdone);
                     }
                     sp += 2;
+                    BREAK;
+                }
+                if (gmode == 2) {   /* OP_iterator_next: the iterator-result OBJECT replaces the resume arg at sp[-1] */
+                    giter = (gdone == 2) ? value : js_create_iterator_result(ctx, value, gdone);
+                    if (JS_IsException(giter)) goto exception;
+                    JS_FreeValue(ctx, sp[-1]); sp[-1] = giter;
                     BREAK;
                 }
                 giter = (gdone == 2) ? value : js_create_iterator_result(ctx, value, gdone);
@@ -21348,6 +21389,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 JSValue ret;
                 sf->cur_pc = pc;
+                /* a GENERATOR iterator's .next() (yield* delegation, destructuring) runs its body on THIS chain
+                   (do_generator_tramp iternext mode) so a body loop/branch preempts + forks the base flow — never
+                   the C-recursion JS_Call -> js_generator_next drive-to-completion (deleted). */
+                if (tramp_gen_method_magic(sp[-3], sp[-4]) == GEN_MAGIC_NEXT) {
+                    tramp_gen_magic = GEN_MAGIC_NEXT; tramp_gen_iternext = 1; goto do_generator_tramp;
+                }
                 ret = JS_Call(ctx, sp[-3], sp[-4], 1, vc(sp - 1));
                 if (JS_IsException(ret))
                     goto exception;
@@ -23259,6 +23306,19 @@ static JSValue async_func_resume(JSContext *ctx, JSAsyncFunctionState *s)
     if (js_check_stack_overflow(ctx->rt, 0))
         return JS_ThrowStackOverflow(ctx);
 
+    /* DRIVE-TO-COMPLETION DELETED — structural, single chokepoint. async_func_resume runs a coroutine body to its
+       next suspend via a NESTED JS_CallInternal; that is drive-to-completion (the body cannot yield to the
+       scheduler / park mid-run). The ONLY legitimate resume is the flow BASE: JS_FlowResume and *_resume_as_flow
+       set g_flow_base_gen = &s->func_state first, after which the body runs on the tramp chain and preempts back to
+       the base. Any OTHER (nested) resume is an off-tramp drive — it is COUNTED by the automatic bulk detector
+       (no reliance on hand-marking each caller) and then FAILS; there is NO drive-to-completion fallback. Route the
+       bypassing .next()/yield-star/destructuring/await/reaction onto do_generator_tramp / the tramp chain at the root.
+       (g_flow_base_gen NULL = baseline setup, before any flow: not a drive-to-completion.) */
+    if (g_flow_base_gen && s != g_flow_base_gen) {
+        FLOW_PREEMPT_COUNT(g_drive_to_completion);
+        return JS_ThrowTypeError(ctx, "drive-to-completion deleted: coroutine body resumed off the tramp chain (route it onto do_generator_tramp / the tramp)");
+    }
+
     /* the tag does not matter provided it is not an object */
     func_obj = JS_MKPTR(JS_TAG_INT, s);
     return JS_CallInternal(ctx, func_obj, s->this_val, JS_UNDEFINED,
@@ -23706,6 +23766,11 @@ static JSValue js_generator_next(JSContext *ctx, JSValueConst this_val,
         break;
     case JS_GENERATOR_STATE_SUSPENDED_YIELD_STAR:
     case JS_GENERATOR_STATE_SUSPENDED_YIELD:
+        /* DRIVE-TO-COMPLETION (temporary): the body is driven to its next suspend via a nested async_func_resume
+           rather than on the tramp chain. This is COUNTED automatically by the drive-to-completion detector (the
+           nested JS_CALL_FLAG_GENERATOR entry in JS_CallInternal), and is the residual path to eliminate by routing
+           every generator .next() bypass (yield* / destructuring / .call/.apply / C-builtin consumers) onto
+           do_generator_tramp. When the corpus-wide count is 0, this block becomes dead and is deleted. */
         /* cur_sp[-1] was set to JS_UNDEFINED in the previous call */
         ret = js_dup(argv[0]);
         if (magic == GEN_MAGIC_THROW &&
