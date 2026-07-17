@@ -1211,6 +1211,12 @@ typedef struct JSTimeTravelHooks {
        genobj->[[GeneratorState]] resolves to cur_gd while the sibling runs and to base_gd otherwise; the sibling
        delta OWNS cur_gd (JS_GenDataRef/Unref). Only fires for a direct .next() drive (genobj is a generator). */
     void (*gen_fork)(JSContext *ctx, JSValueConst genobj, void *base_gd, void *cur_gd);
+    /* Before a NEW record (key not already present) is added to a shared Set/Map (Set.add / Map.set of a fresh
+       key). The host records the KNOWN-NEW add on the current flow's delta so a snapshot-forked sibling stays
+       isolated: unapply deletes the flow's added record, apply re-adds it (JS_MapAddRecord / JS_MapDeleteRecord).
+       O(1), the accumulator hot path for `new Set(gen)` / `[...set]`-building — mirrors arr_append for arrays.
+       Only fires for a genuinely new record; an overwrite/delete of a baseline record is not yet captured. */
+    void (*map_add)(JSContext *ctx, JSValueConst obj, JSValueConst key, JSValueConst val);
 } JSTimeTravelHooks;
 JS_EXTERN void JS_SetFlowLocalMark(int m);
 /* Whether obj was created flow-local. The COW hook consults this: a never-forked flow skips its flow_local
@@ -1234,6 +1240,11 @@ JS_EXTERN void  JS_GenDataUnref(JSContext *ctx, void *gd);
 /* A closure cell is opaque here (JSVarRef is engine-internal); the host reads/writes its value via these. */
 JS_EXTERN JSValue JS_VarRefGetValue(void *cell);
 JS_EXTERN void    JS_VarRefSetValue(JSContext *ctx, void *cell, JSValue val);
+/* Per-flow Set/Map COW: manipulate a Set/Map's internal record directly (bypassing any JS-level method override),
+   so the host's cow apply/unapply can re-add / remove the per-flow record for JSTimeTravelHooks.map_add. `obj`
+   must be a Set or Map. Add sets/overwrites the record for `key` (val ignored for a Set); Delete removes it. */
+JS_EXTERN int JS_MapAddRecord(JSContext *ctx, JSValueConst obj, JSValueConst key, JSValueConst val);
+JS_EXTERN int JS_MapDeleteRecord(JSContext *ctx, JSValueConst obj, JSValueConst key);
 
 /* APIClient forced-execution CONCOLIC-VALUE hooks — how a concolic (symbolic + carried example) value
    PROPAGATES through the two interpreter operators that must carry it. One concern, one owner (the concolic

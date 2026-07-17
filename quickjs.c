@@ -56211,9 +56211,48 @@ static JSValue js_map_set(JSContext *ctx, JSValueConst this_val,
         mr = map_add_record(ctx, s, key);
         if (!mr)
             return JS_EXCEPTION;
+        /* a genuinely NEW record on a shared Set/Map: capture it per-flow so a snapshot-forked sibling stays
+           isolated (unapply deletes it, apply re-adds). Weak collections are never snapshot-shared this way. */
+        if (g_time_travel.map_add && !s->is_weak)
+            g_time_travel.map_add(ctx, this_val, key, value);
     }
     mr->value = js_dup(value);
     return js_dup(this_val);
+}
+
+/* Per-flow Set/Map COW record primitives (JS_MapAddRecord / JS_MapDeleteRecord) — see quickjs.h. Manipulate the
+   internal JSMapState record directly so cow apply/unapply bypass any JS-level add/set/delete override. */
+int JS_MapAddRecord(JSContext *ctx, JSValueConst obj, JSValueConst key, JSValueConst val)
+{
+    JSObject *p;
+    JSMapState *s;
+    JSMapRecord *mr;
+    JSValueConst nkey;
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT) return -1;
+    p = JS_VALUE_GET_OBJ(obj);
+    if (p->class_id != JS_CLASS_MAP && p->class_id != JS_CLASS_SET) return -1;
+    s = p->u.opaque;
+    if (!s) return -1;
+    nkey = map_normalize_key_const(ctx, key);
+    mr = map_find_record(ctx, s, nkey);
+    if (mr) { JS_FreeValue(ctx, mr->value); }
+    else { mr = map_add_record(ctx, s, nkey); if (!mr) return -1; }
+    mr->value = js_dup(val);
+    return 0;
+}
+int JS_MapDeleteRecord(JSContext *ctx, JSValueConst obj, JSValueConst key)
+{
+    JSObject *p;
+    JSMapState *s;
+    JSMapRecord *mr;
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT) return -1;
+    p = JS_VALUE_GET_OBJ(obj);
+    if (p->class_id != JS_CLASS_MAP && p->class_id != JS_CLASS_SET) return -1;
+    s = p->u.opaque;
+    if (!s) return -1;
+    mr = map_find_record(ctx, s, map_normalize_key_const(ctx, key));
+    if (mr) map_delete_record(ctx->rt, s, mr);
+    return 0;
 }
 
 static JSValue js_map_get(JSContext *ctx, JSValueConst this_val,
