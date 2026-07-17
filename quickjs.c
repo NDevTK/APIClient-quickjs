@@ -18418,11 +18418,12 @@ typedef struct JSPromiseAll {
     JSValue values;              /* the result values array (owned) */
     JSValue resolve_element_env; /* [remainingElementsCount] holder (owned) */
     int index;                   /* next element index */
+    int magic;                   /* PROMISE_MAGIC_all / allSettled (per-element reject handling differs) */
     int orig_cfirst, orig_cargc; uint8_t orig_is_tail;   /* the ORIGINAL OP_call_method operand shape */
 } JSPromiseAll;
 static int js_promise_all_step(JSContext *ctx, struct JSPromiseAll *s, JSValue res);
 static void js_promise_all_end(JSContext *ctx, struct JSPromiseAll *s);
-static bool tramp_can_call_promise_all(JSValueConst func, JSValueConst *call_argv, int call_argc);
+static bool tramp_can_call_promise_all(JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_magic);
 static JSValue js_promise_all(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
 static JSValue js_promise_all_resolve_element(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValueConst *func_data);
 static __exception int remainingElementsCount_add(JSContext *ctx, JSValueConst resolve_element_env, int addend);
@@ -18753,6 +18754,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     int smc_magic = 0;                                  /* new Set(gen)/new Map(gen) recognition: 0 = Map, MAGIC_SET = Set (read at OP_call_constructor, consumed by do_setmap_consume_tramp) */
     int ta_classid = 0;                                 /* new TypedArray(gen) recognition: the TA class (read at OP_call_constructor, consumed by do_ta_consume_tramp) */
     int ta_from = 0;                                    /* 1 = TypedArray.from(gen) (OP_call_method): new_target is this_val at call_argv[-2], not call_argv[-1] */
+    int pa_magic = 0;                                   /* Promise.all/allSettled(gen) recognition: the PROMISE_MAGIC (read at OP_call_method, consumed by do_promise_all_consume_tramp) */
     JSAsyncFunctionState *gen_state = NULL;   /* the generator/async base state IF this activation is preemptible */
 
 #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_STEP
@@ -19393,7 +19395,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_ta_from_consume(ctx, call_argv[-1], call_argv[-2], vc(call_argv), call_argc, &ta_classid)) {   /* TypedArray.from(gen) -> collect on THIS chain */
                     tramp_is_tail = 0; ta_from = 1; goto do_ta_consume_tramp;
                 }
-                if (tramp_can_call_promise_all(call_argv[-1], vc(call_argv), call_argc)) {   /* Promise.all(gen) -> consume on THIS chain */
+                if (tramp_can_call_promise_all(call_argv[-1], vc(call_argv), call_argc, &pa_magic)) {   /* Promise.all(gen) -> consume on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_promise_all_consume_tramp;
                 }
                 if (tramp_is_function_call(call_argv[-1])) {   /* f.call(thisArg,...) -> resolve + dispatch f here */
@@ -20218,6 +20220,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->values = JS_NewArray(ctx);
                 s->resolve_element_env = JS_NewArray(ctx);
                 s->index = 0;
+                s->magic = pa_magic;
                 s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
                 if (JS_IsException(s->promise_resolve) || !JS_IsFunction(ctx, s->promise_resolve)
                     || JS_IsException(s->values) || JS_IsException(s->resolve_element_env)
@@ -59546,17 +59549,28 @@ static int js_promise_all_step(JSContext *ctx, JSPromiseAll *s, JSValue res)
     resolve_element_data[3] = s->resolving_funcs[0];   /* `all`: is_promise_any==0 -> the resolve func */
     resolve_element_data[4] = s->resolve_element_env;
     resolve_element = JS_NewCFunctionData(ctx, js_promise_all_resolve_element, 1,
-                                          PROMISE_MAGIC_all, 5, resolve_element_data);
+                                          s->magic, 5, resolve_element_data);
     if (JS_IsException(resolve_element)) { JS_FreeValue(ctx, next_promise); return -1; }
-    if (remainingElementsCount_add(ctx, s->resolve_element_env, 1) < 0) {
-        JS_FreeValue(ctx, next_promise); JS_FreeValue(ctx, resolve_element); return -1;
+    {
+        JSValue reject_element;
+        if (s->magic == PROMISE_MAGIC_allSettled) {
+            /* allSettled: a rejection is ALSO recorded (as {status:'rejected', reason}) — a second element closure. */
+            reject_element = JS_NewCFunctionData(ctx, js_promise_all_resolve_element, 1,
+                                                 s->magic | 4, 5, resolve_element_data);
+            if (JS_IsException(reject_element)) { JS_FreeValue(ctx, next_promise); JS_FreeValue(ctx, resolve_element); return -1; }
+        } else {
+            reject_element = js_dup(s->resolving_funcs[1]);   /* `all`: reject the aggregate on first rejection */
+        }
+        if (remainingElementsCount_add(ctx, s->resolve_element_env, 1) < 0) {
+            JS_FreeValue(ctx, next_promise); JS_FreeValue(ctx, resolve_element); JS_FreeValue(ctx, reject_element); return -1;
+        }
+        then_args[0] = resolve_element;
+        then_args[1] = reject_element;
+        rr = JS_InvokeFree(ctx, next_promise, JS_ATOM_then, 2, then_args);
+        JS_FreeValue(ctx, resolve_element); JS_FreeValue(ctx, reject_element);
+        if (JS_IsException(rr)) return -1;
+        JS_FreeValue(ctx, rr);
     }
-    then_args[0] = resolve_element;
-    then_args[1] = s->resolving_funcs[1];   /* `all`: reject with the aggregate's reject */
-    rr = JS_InvokeFree(ctx, next_promise, JS_ATOM_then, 2, then_args);
-    JS_FreeValue(ctx, resolve_element);
-    if (JS_IsException(rr)) return -1;
-    JS_FreeValue(ctx, rr);
     s->index++;
     return 1;   /* drive the next .next() */
 }
@@ -59575,20 +59589,25 @@ static void js_promise_all_end(JSContext *ctx, JSPromiseAll *s)
     JS_FreeValue(ctx, s->resolve_element_env);
 }
 
-/* Route Promise.all(gen) ONLY (magic all; allSettled/any/race stay on the normal path) with a direct-generator arg. */
-static bool tramp_can_call_promise_all(JSValueConst func, JSValueConst *call_argv, int call_argc)
+/* Route Promise.all(gen) / Promise.allSettled(gen) (they share the resolve+values finalize; only the per-element
+   reject differs) with a direct-generator arg. `any` (AggregateError finalize) and `race` stay on the normal path. */
+static bool tramp_can_call_promise_all(JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_magic)
 {
     JSObject *fp, *ip;
+    int magic;
     if (call_argc != 1) return false;
     if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
     fp = JS_VALUE_GET_OBJ(func);
     if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
     if (fp->u.cfunc.cproto != JS_CFUNC_generic_magic) return false;
     if (fp->u.cfunc.c_function.generic_magic != js_promise_all) return false;
-    if (fp->u.cfunc.magic != PROMISE_MAGIC_all) return false;
+    magic = fp->u.cfunc.magic;
+    if (magic != PROMISE_MAGIC_all && magic != PROMISE_MAGIC_allSettled) return false;
     if (JS_VALUE_GET_TAG(call_argv[0]) != JS_TAG_OBJECT) return false;
     ip = JS_VALUE_GET_OBJ(call_argv[0]);
-    return ip->class_id == JS_CLASS_GENERATOR && ip->u.generator_data != NULL;
+    if (ip->class_id != JS_CLASS_GENERATOR || !ip->u.generator_data) return false;
+    *out_magic = magic;
+    return true;
 }
 
 static JSValue js_promise_race(JSContext *ctx, JSValueConst this_val,
