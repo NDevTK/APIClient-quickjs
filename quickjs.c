@@ -967,6 +967,11 @@ typedef enum JSGeneratorStateEnum {
 
 typedef struct JSGeneratorData {
     JSGeneratorStateEnum state;
+    /* cow_ref: 0 = the ORIGINAL gen_data, owned by its generator object (freed by js_generator_finalizer);
+       >0 = a per-flow CLONE produced by a concolic fork inside the body (clone_deep_flow), owned by that many
+       COW deltas (JS_GenDataRef/Unref), freed at 0. The generator OBJECT is shared across a fork; only its
+       u.generator_data POINTER is swapped per-flow (a COW gendata entry), so each arm advances its own state. */
+    int cow_ref;
     JSAsyncFunctionState func_state;
 } JSGeneratorData;
 
@@ -18572,9 +18577,11 @@ static int branch_arm_fork(JSContext *ctx, JSValueConst op1, uint8_t *if_pc,
             if (g_flow_control.fork) { JSValue *cl = JS_FlowClone(ctx, (JSValue *)gen_state); g_flow_control.fork(ctx, cl); }
             sf->cur_sp = NULL;
         } else if (gen_state == g_flow_base_gen) {
-            /* BASE flow, DEEP: the branch is inside a called function on this flow's live tramp chain — the common
-               case being an async body's initial synchronous chunk (it runs HERE, gen_state stays the base, tf_top
-               is its async frame). SNAPSHOT-fork the WHOLE chain: sync the deepest frame's resume point, stash the
+            /* BASE flow, DEEP: the branch is inside a called function on this flow's live tramp chain — an async
+               body's initial synchronous chunk OR a synchronously-driven generator body (both run HERE with
+               gen_state staying the base and their async/gen frame in tf_top; clone_deep_flow clones each frame
+               kind, giving an async frame a fresh promise and a generator frame a per-flow gen_data clone).
+               SNAPSHOT-fork the WHOLE chain: sync the deepest frame's resume point, stash the
                live chain into the base so clone_deep_flow can walk it (mirroring a deep preempt-suspend), clone,
                then un-stash (the parent's chain stays live in the interpreter's tf_top). The clone gives each async
                frame a FRESH promise capability; since the fork also cloned the caller's mid-OP_call, each arm awaits
@@ -23452,8 +23459,37 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
             ct->async_data = as2;
             ct->async_promise = aprom2;        /* fresh capability's promise (owned by this frame) */
             ct->local_buf = NULL; ct->b = NULL; /* async frame owns its buffers via as2->func_state */
+        } else if (otf->gen_data) {
+            /* GENERATOR body on the chain: clone a FRESH gen_data with its OWN cloned body frame so the sibling's
+               generator advances on an independent timeline (mirrors the async_data branch, minus the promise —
+               a generator hands results back via the .next() protocol, not a return-promise). The generator
+               OBJECT is shared (created pre-fork); its u.generator_data POINTER is made per-flow by a COW gendata
+               swap recorded on the sibling's delta (gen_fork hook -> engine_fork_finalize), so each arm's
+               generator resolves to its own state across context switches. Only a DIRECT .next() drive is built:
+               the held ref (async_promise) is the generator object; a for-of drive holds the generator on the
+               caller stack (async_promise UNDEFINED), and forking its body is a separate not-yet-built capability. */
+            JSValueConst genobj = otf->async_promise;
+            DCHECK(JS_VALUE_GET_TAG(genobj) == JS_TAG_OBJECT,
+                   "clone_deep_flow: for-of generator-body concolic fork not built (held ref is not a generator object)");
+            JSGeneratorData *g0 = otf->gen_data;
+            JSStackFrame *gof = &g0->func_state.frame;
+            JSGeneratorData *g1 = js_mallocz(ctx, sizeof(*g1));
+            if (!g1) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
+            g1->state = g0->state;
+            g1->cow_ref = 1;   /* the sibling delta's gendata entry owns this clone (creation ref transfers there) */
+            if (clone_susp_frame(ctx, &g1->func_state.frame, gof, live_end - gof->arg_buf) < 0) {
+                js_free(ctx, g1); js_free(ctx, oa); js_free(ctx, ca); return NULL;
+            }
+            g1->func_state.this_val = js_dup(g0->func_state.this_val);
+            g1->func_state.argc = g0->func_state.argc;
+            g1->func_state.throw_flag = g0->func_state.throw_flag;
+            g1->func_state.tramp_top = NULL;
+            g1->func_state.frame.cur_sp = (i == 0) ? g1->func_state.frame.arg_buf + (osf->cur_sp - gof->arg_buf) : NULL;
+            ct->gen_data = g1;
+            ct->async_promise = js_dup(genobj);   /* the clone's OWN held ref to the shared generator object */
+            ct->local_buf = NULL; ct->b = NULL;   /* the gen frame owns its buffers via g1->func_state */
+            if (g_time_travel.gen_fork) g_time_travel.gen_fork(ctx, genobj, g0, g1);
         } else {
-            DCHECK(otf->gen_data == NULL, "clone_deep_flow: deep-fork of a generator frame not built");
             JSFunctionBytecode *wb = JS_VALUE_GET_OBJ(otf->sf.cur_func)->u.func.function_bytecode;
             int wal = otf->sf.arg_count, wlc = wal + wb->var_count + wb->stack_size;
             int arg_in_frame = (otf->sf.arg_buf >= otf->local_buf && otf->sf.arg_buf < otf->local_buf + wlc + 1);
@@ -23580,9 +23616,36 @@ static void js_generator_finalizer(JSRuntime *rt, JSValueConst obj)
     JSGeneratorData *s = JS_GetOpaque(obj, JS_CLASS_GENERATOR);
 
     if (s) {
+        /* The object always owns its ORIGINAL gen_data (cow_ref 0). A per-flow CLONE (cow_ref>0) is owned by a
+           COW delta and is only ever installed into u.generator_data while that flow is APPLIED; the scheduler
+           unapplies every delta before teardown, so a finalized generator must be back on its original. */
+        DCHECK(s->cow_ref == 0, "js_generator_finalizer: generator finalized while a per-flow gen_data clone is installed (delta not unapplied)");
         free_generator_stack_rt(rt, s);
         js_free_rt(rt, s);
     }
+}
+
+/* Per-flow generator-state COW (see JSGeneratorData.cow_ref). The generator object is shared across a concolic
+   fork; these let the host swap its u.generator_data pointer per flow and own the clones by refcount. */
+void JS_SetObjGenData(JSValueConst genobj, void *gd) {
+    JSObject *p = JS_VALUE_GET_OBJ(genobj);
+    DCHECK(p->class_id == JS_CLASS_GENERATOR, "JS_SetObjGenData: not a generator object");
+    p->u.generator_data = (JSGeneratorData *)gd;
+}
+void *JS_GetObjGenData(JSValueConst genobj) {
+    JSObject *p = JS_VALUE_GET_OBJ(genobj);
+    DCHECK(p->class_id == JS_CLASS_GENERATOR, "JS_GetObjGenData: not a generator object");
+    return p->u.generator_data;
+}
+void JS_GenDataRef(void *gd) {
+    JSGeneratorData *s = (JSGeneratorData *)gd;
+    DCHECK(s->cow_ref > 0, "JS_GenDataRef: ref of a non-clone gen_data (the original is object-owned)");
+    s->cow_ref++;
+}
+void JS_GenDataUnref(JSContext *ctx, void *gd) {
+    JSGeneratorData *s = (JSGeneratorData *)gd;
+    DCHECK(s->cow_ref > 0, "JS_GenDataUnref: unref of a non-clone / over-released gen_data");
+    if (--s->cow_ref == 0) { free_generator_stack_rt(ctx->rt, s); js_free_rt(ctx->rt, s); }
 }
 
 static void free_generator_stack(JSContext *ctx, JSGeneratorData *s)

@@ -1205,6 +1205,12 @@ typedef struct JSTimeTravelHooks {
        accumulator built one element at a time); routing it through prop_write's O(n) dedup scan makes building an
        N-element array O(N^2). */
     void (*arr_append)(JSContext *ctx, JSValueConst obj, JSAtom atom);
+    /* A concolic branch inside a synchronously-driven GENERATOR body forked the flow: clone_deep_flow built a
+       fresh per-flow gen_data CLONE (cur_gd) of the shared generator object's execution state (base_gd is its
+       current, object-owned state). The host records a per-flow gendata swap on the forking sibling's delta so
+       genobj->[[GeneratorState]] resolves to cur_gd while the sibling runs and to base_gd otherwise; the sibling
+       delta OWNS cur_gd (JS_GenDataRef/Unref). Only fires for a direct .next() drive (genobj is a generator). */
+    void (*gen_fork)(JSContext *ctx, JSValueConst genobj, void *base_gd, void *cur_gd);
 } JSTimeTravelHooks;
 JS_EXTERN void JS_SetFlowLocalMark(int m);
 /* Whether obj was created flow-local. The COW hook consults this: a never-forked flow skips its flow_local
@@ -1219,6 +1225,12 @@ JS_EXTERN uint32_t JS_FlowBumpGen(void);
 JS_EXTERN int  JS_IsArrayIndexSlot(JSValueConst obj, JSAtom atom, uint32_t *idx);
 JS_EXTERN int  JS_ArraySetLength(JSContext *ctx, JSValueConst obj, uint32_t len);
 JS_EXTERN void JS_SetTimeTravelHooks(const JSTimeTravelHooks *hooks);
+/* Per-flow generator-state COW: swap a shared generator object's execution-state pointer and own clones by
+   refcount (see JSTimeTravelHooks.gen_fork). The clone is opaque to the host (JSGeneratorData is engine-internal). */
+JS_EXTERN void  JS_SetObjGenData(JSValueConst genobj, void *gd);
+JS_EXTERN void *JS_GetObjGenData(JSValueConst genobj);
+JS_EXTERN void  JS_GenDataRef(void *gd);
+JS_EXTERN void  JS_GenDataUnref(JSContext *ctx, void *gd);
 /* A closure cell is opaque here (JSVarRef is engine-internal); the host reads/writes its value via these. */
 JS_EXTERN JSValue JS_VarRefGetValue(void *cell);
 JS_EXTERN void    JS_VarRefSetValue(JSContext *ctx, void *cell, JSValue val);
