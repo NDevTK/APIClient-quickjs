@@ -23663,6 +23663,8 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                generator resolves to its own state across context switches. A DIRECT .next() drive holds the
                generator object in async_promise; a FOR-OF drive holds it on the caller stack (async_promise
                UNDEFINED) at caller_sp[forof_off] — recover it there so both drives fork identically. */
+            DCHECK(otf->cont_kind == CONT_NONE,
+                   "clone_deep_flow: a generator-drive frame carries a C-continuation (cont_kind != NONE) — this branch clones gen_data but the *ct=*otf struct-copy SHARES cont_state (never reaching the else-branch clone), so a consumer step (CONT_ITER_CONSUME) attached to a generator .next() drive would silently corrupt on fork. Clone cont_state HERE (mirror the CONT_ARRAY_ITER case) before attaching any step to a generator drive.");
             int gen_forof = (JS_VALUE_GET_TAG(otf->async_promise) != JS_TAG_OBJECT);
             JSValueConst genobj = otf->async_promise;
             if (gen_forof) {
