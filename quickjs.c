@@ -6168,7 +6168,7 @@ uint8_t g_flow_local_mark = 0;   /* forced-exec: stamps new objects baseline(0)/
    shared heap state (see JSTimeTravelHooks in quickjs.h). g_time_travel.prop_write covers a property write (and,
    via the host's absent-slot recording, a creation); .cell_write covers a closure-cell (JSVarRef) write, which
    bypasses the property path. Installed once by JS_SetTimeTravelHooks. */
-static JSTimeTravelHooks g_time_travel = { NULL, NULL };
+static JSTimeTravelHooks g_time_travel = { NULL, NULL, NULL };
 /* forced-exec CONCOLIC-VALUE hooks (see JSConcolicHooks in quickjs.h): .add propagates a concolic value through
    `+` (js_add_slow), .cmp through == / === . One struct, installed by JS_SetConcolicHooks. */
 static JSConcolicHooks g_concolic = { NULL, NULL };
@@ -6180,6 +6180,12 @@ static JSConcolicHooks g_concolic = { NULL, NULL };
 static inline void cow_capture(JSContext *ctx, JSValueConst obj, JSAtom prop) {
     if (g_time_travel.prop_write && JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)
         g_time_travel.prop_write(ctx, obj, prop);
+}
+/* Record a KNOWN-NEW fast-array append slot (idx == length). O(1): the host skips the dedup scan and baseline
+   lookup (existed=0 always). The hot path for a shared accumulator — see JSTimeTravelHooks.arr_append. */
+static inline void cow_capture_append(JSContext *ctx, JSValueConst obj, JSAtom idx) {
+    if (g_time_travel.arr_append)
+        g_time_travel.arr_append(ctx, obj, idx);
 }
 /* Is this object flow-local (created by the running flow post-baseline)? The host's COW hook uses this to decide
    the skip, since after a fork a flow_local object may be shared with the snapshot sibling. */
@@ -10548,8 +10554,9 @@ static int add_fast_array_element(JSContext *ctx, JSObject *p,
        Record the created element slot (index == old count, existed=0) so a snapshot-forked sibling that SHARES
        this array (a map/filter/push accumulator) is isolated. cow_unapply removes it by TRUNCATING the array to
        that index (set_array_length), not JS_DeleteProperty. cow_capture skips a flow_local (freshly-built,
-       unshared) array — a literal build pays only the cheap skip; only a genuinely shared array is captured. */
-    cow_capture(ctx, JS_MKPTR(JS_TAG_OBJECT, p), __JS_AtomFromUInt32(p->u.array.count));
+       unshared) array — a literal build pays only the cheap skip; only a genuinely shared array is captured.
+       O(1) append capture (known-new slot: no dedup scan / baseline lookup). */
+    cow_capture_append(ctx, JS_MKPTR(JS_TAG_OBJECT, p), __JS_AtomFromUInt32(p->u.array.count));
     /* update the length if necessary. We assume that if the length is
        not an integer, then if it >= 2^31.  */
     if (likely(JS_VALUE_GET_TAG(p->prop[0].u.value) == JS_TAG_INT)) {
@@ -46351,9 +46358,9 @@ static JSValue js_array_push(JSContext *ctx, JSValueConst this_val,
                     }
                     /* Forced-exec COW: this fast path writes values[] directly (bypassing add_fast_array_element's
                        capture), so record each created element slot so a shared array's per-flow push is isolated
-                       (cow_unapply truncates it away). Cheap-skips a flow_local array. */
+                       (cow_unapply truncates it away). O(1) append capture; cheap-skips a flow_local array. */
                     for(i = 0; i < argc; i++)
-                        cow_capture(ctx, this_val, __JS_AtomFromUInt32(array_len + i));
+                        cow_capture_append(ctx, this_val, __JS_AtomFromUInt32(array_len + i));
                     for(i = 0; i < argc; i++) {
                         p->u.array.u.values[array_len + i] = js_dup(argv[i]);
                     }

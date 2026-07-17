@@ -1200,6 +1200,11 @@ JS_EXTERN void JS_SetFlowControlHooks(const JSFlowControlHooks *hooks);
 typedef struct JSTimeTravelHooks {
     void (*prop_write)(JSContext *ctx, JSValueConst obj, JSAtom atom);  /* before writing a shared obj[atom] */
     void (*cell_write)(JSContext *ctx, void *cell);                     /* before writing a shared closure cell */
+    /* Before a fast-array APPEND creates obj[idx] (idx == current length). The slot is KNOWN-NEW, so the host
+       records it O(1) — no dedup scan and no baseline lookup (existed=0 always). This is the hot path (a shared
+       accumulator built one element at a time); routing it through prop_write's O(n) dedup scan makes building an
+       N-element array O(N^2). */
+    void (*arr_append)(JSContext *ctx, JSValueConst obj, JSAtom atom);
 } JSTimeTravelHooks;
 JS_EXTERN void JS_SetFlowLocalMark(int m);
 /* Whether obj was created flow-local. The COW hook consults this: a never-forked flow skips its flow_local
