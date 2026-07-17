@@ -18425,6 +18425,8 @@ static int js_promise_all_step(JSContext *ctx, struct JSPromiseAll *s, JSValue r
 static void js_promise_all_end(JSContext *ctx, struct JSPromiseAll *s);
 static bool tramp_can_call_promise_all(JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_magic);
 static JSValue js_promise_all(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
+static JSValue js_promise_race(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static bool tramp_can_call_promise_race(JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_magic);
 static JSValue js_promise_all_resolve_element(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValueConst *func_data);
 static __exception int remainingElementsCount_add(JSContext *ctx, JSValueConst resolve_element_env, int addend);
 static JSValue js_typed_array_from(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
@@ -19395,7 +19397,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_ta_from_consume(ctx, call_argv[-1], call_argv[-2], vc(call_argv), call_argc, &ta_classid)) {   /* TypedArray.from(gen) -> collect on THIS chain */
                     tramp_is_tail = 0; ta_from = 1; goto do_ta_consume_tramp;
                 }
-                if (tramp_can_call_promise_all(call_argv[-1], vc(call_argv), call_argc, &pa_magic)) {   /* Promise.all(gen) -> consume on THIS chain */
+                if (tramp_can_call_promise_all(call_argv[-1], vc(call_argv), call_argc, &pa_magic)) {   /* Promise.all/allSettled/any(gen) -> consume on THIS chain */
+                    tramp_is_tail = (opcode == OP_tail_call_method); goto do_promise_all_consume_tramp;
+                }
+                if (tramp_can_call_promise_race(call_argv[-1], vc(call_argv), call_argc, &pa_magic)) {   /* Promise.race(gen) -> consume on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_promise_all_consume_tramp;
                 }
                 if (tramp_is_function_call(call_argv[-1])) {   /* f.call(thisArg,...) -> resolve + dispatch f here */
@@ -59295,6 +59300,7 @@ static __exception int remainingElementsCount_add(JSContext *ctx,
 #define PROMISE_MAGIC_all        0
 #define PROMISE_MAGIC_allSettled 1
 #define PROMISE_MAGIC_any        2
+#define PROMISE_MAGIC_race       3   /* not a js_promise_all magic — a CONT_PROMISE_ALL sentinel for Promise.race (no aggregation) */
 
 static JSValue js_promise_all_resolve_element(JSContext *ctx,
                                               JSValueConst this_val,
@@ -59528,6 +59534,8 @@ static int js_promise_all_step(JSContext *ctx, JSPromiseAll *s, JSValue res)
     if (done) {
         int is_zero;
         JS_FreeValue(ctx, res);
+        if (s->magic == PROMISE_MAGIC_race)
+            return 0;   /* race: no aggregation/finalize — the aggregate already settled (or stays pending if empty) */
         is_zero = remainingElementsCount_add(ctx, s->resolve_element_env, -1);
         if (is_zero < 0) return -1;
         if (is_zero) {
@@ -59551,6 +59559,17 @@ static int js_promise_all_step(JSContext *ctx, JSPromiseAll *s, JSValue res)
     next_promise = JS_Call(ctx, s->promise_resolve, s->this_val, 1, vc(&value));
     JS_FreeValue(ctx, value);
     if (JS_IsException(next_promise)) return -1;
+    if (s->magic == PROMISE_MAGIC_race) {
+        /* race: attach the aggregate's own resolve/reject directly — the FIRST element to settle wins; no per-element
+           closure, no values/remainingElementsCount. */
+        then_args[0] = s->resolving_funcs[0];
+        then_args[1] = s->resolving_funcs[1];
+        rr = JS_InvokeFree(ctx, next_promise, JS_ATOM_then, 2, then_args);
+        if (JS_IsException(rr)) return -1;
+        JS_FreeValue(ctx, rr);
+        s->index++;
+        return 1;
+    }
     resolve_element_data[0] = JS_FALSE;
     resolve_element_data[1] = js_int32(s->index);
     resolve_element_data[2] = s->values;
@@ -59623,6 +59642,23 @@ static bool tramp_can_call_promise_all(JSValueConst func, JSValueConst *call_arg
     ip = JS_VALUE_GET_OBJ(call_argv[0]);
     if (ip->class_id != JS_CLASS_GENERATOR || !ip->u.generator_data) return false;
     *out_magic = magic;
+    return true;
+}
+
+/* Route Promise.race(gen) (no aggregation: each element's settle resolves/rejects the aggregate directly). */
+static bool tramp_can_call_promise_race(JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_magic)
+{
+    JSObject *fp, *ip;
+    if (call_argc != 1) return false;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
+    fp = JS_VALUE_GET_OBJ(func);
+    if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
+    if (fp->u.cfunc.cproto != JS_CFUNC_generic) return false;
+    if (fp->u.cfunc.c_function.generic != js_promise_race) return false;
+    if (JS_VALUE_GET_TAG(call_argv[0]) != JS_TAG_OBJECT) return false;
+    ip = JS_VALUE_GET_OBJ(call_argv[0]);
+    if (ip->class_id != JS_CLASS_GENERATOR || !ip->u.generator_data) return false;
+    *out_magic = PROMISE_MAGIC_race;
     return true;
 }
 
