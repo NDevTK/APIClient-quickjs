@@ -18379,6 +18379,7 @@ static int js_array_reduce_step(JSContext *ctx, struct JSArrayReduce *s, JSValue
 #define ITERCONS_SPREAD  1   /* [...gen] (OP_append): r is the literal's array on the caller stack; finish writes pos back to sp[-2] and pops the iterable */
 #define ITERCONS_SET     2   /* new Set(gen): r is the empty Set; sink calls the `add` adder with the value */
 #define ITERCONS_MAP     3   /* new Map(gen): r is the empty Map; sink calls the `set` adder with the entry's [0],[1] */
+#define ITERCONS_OBJENTRIES 4 /* Object.fromEntries(gen): r is the empty object; sink defines r[entry[0]] = entry[1] */
 typedef struct JSIterConsume {
     JSValue r;       /* the result being built (owned; ARRAY for FROM/SPREAD, the Set/Map instance for SET/MAP) */
     JSValue iter;    /* the generator object being consumed (owned) — .next() drives its body */
@@ -18395,6 +18396,8 @@ static void js_iter_consume_end(JSContext *ctx, struct JSIterConsume *s);
 static bool tramp_can_call_iter_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc);
 static JSValue js_map_constructor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv, int magic);
 static bool tramp_can_call_setmap_consume(JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_magic);
+static JSValue js_object_fromEntries(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static bool tramp_can_call_objentries_consume(JSValueConst func, JSValueConst *call_argv, int call_argc);
 static void js_array_reduce_end(JSContext *ctx, struct JSArrayReduce *s, bool take_acc);
 static JSValue js_array_reduce(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int special);
 static bool tramp_can_call_array_reduce(JSValueConst func, int *out_special);
@@ -19348,6 +19351,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_iter_consume(ctx, call_argv[-1], vc(call_argv), call_argc)) {   /* Array.from(gen) -> consume the generator on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_iter_consume_tramp;
                 }
+                if (tramp_can_call_objentries_consume(call_argv[-1], vc(call_argv), call_argc)) {   /* Object.fromEntries(gen) -> consume on THIS chain */
+                    tramp_is_tail = (opcode == OP_tail_call_method); goto do_objentries_consume_tramp;
+                }
                 if (tramp_is_function_call(call_argv[-1])) {   /* f.call(thisArg,...) -> resolve + dispatch f here */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_forward_call;
                 }
@@ -19605,6 +19611,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_array_iter(call_argv[-1], &iter_special)) goto do_array_iter_tramp;
                 if (tramp_can_call_array_reduce(call_argv[-1], &iter_special)) goto do_array_reduce_tramp;
                 if (tramp_can_call_iter_consume(ctx, call_argv[-1], vc(call_argv), call_argc)) goto do_iter_consume_tramp;
+                if (tramp_can_call_objentries_consume(call_argv[-1], vc(call_argv), call_argc)) goto do_objentries_consume_tramp;
                 /* a C-function / bound / proxy target has no preemptible body — plain call, nothing to park */
                 ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2], JS_UNDEFINED,
                                           call_argc, vc(call_argv), 0);
@@ -20007,6 +20014,27 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->mapfn = JS_UNDEFINED; s->mapfn_this = JS_UNDEFINED;
                 s->k = 0;
                 s->sink = (magic & MAGIC_SET) ? ITERCONS_SET : ITERCONS_MAP;
+                s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
+                cont_st = s; cont_kind_cur = CONT_ITER_CONSUME;
+                ret_val = JS_UNINITIALIZED;
+                goto do_iter_consume_step;
+            }
+
+        do_objentries_consume_tramp:
+            /* Object.fromEntries(gen): create the empty result object and consume the generator, defining
+               r[entry[0]] = entry[1] per element on THIS chain. call_argv[0] = the generator. */
+            {
+                JSValueConst gen = call_argv[0];
+                JSIterConsume *s;
+                JSValue obj = JS_NewObject(ctx);
+                if (JS_IsException(obj)) goto exception;
+                s = js_mallocz(ctx, sizeof(*s));
+                if (unlikely(!s)) { JS_FreeValue(ctx, obj); JS_ThrowOutOfMemory(ctx); goto exception; }
+                s->r = obj;
+                s->iter = js_dup(gen);
+                s->adder = JS_UNDEFINED; s->mapfn = JS_UNDEFINED; s->mapfn_this = JS_UNDEFINED;
+                s->k = 0;
+                s->sink = ITERCONS_OBJENTRIES;
                 s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
                 cont_st = s; cont_kind_cur = CONT_ITER_CONSUME;
                 ret_val = JS_UNINITIALIZED;
@@ -45869,6 +45897,17 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
             JS_FreeValue(ctx, value);
             if (JS_IsException(ret)) return -1;
             JS_FreeValue(ctx, ret);
+        } else if (s->sink == ITERCONS_OBJENTRIES) {
+            /* Object.fromEntries(gen): the entry must be an object; r[entry[0]] = entry[1]. Mirrors js_object_fromEntries. */
+            JSValue key, val;
+            if (!JS_IsObject(value)) { JS_FreeValue(ctx, value); JS_ThrowTypeErrorNotAnObject(ctx); return -1; }
+            key = JS_GetPropertyUint32(ctx, value, 0);
+            if (JS_IsException(key)) { JS_FreeValue(ctx, value); return -1; }
+            val = JS_GetPropertyUint32(ctx, value, 1);
+            JS_FreeValue(ctx, value);
+            if (JS_IsException(val)) { JS_FreeValue(ctx, key); return -1; }
+            if (JS_DefinePropertyValueValue(ctx, s->r, key, val, JS_PROP_C_W_E | JS_PROP_THROW) < 0)
+                return -1;   /* consumes key + val */
         } else if (s->sink == ITERCONS_MAP) {
             /* new Map(gen): the entry must be an object; adder(entry[0], entry[1]). Mirrors js_map_constructor. */
             JSValue key, val, ret; JSValueConst args[2];
@@ -45955,6 +45994,22 @@ static bool tramp_can_call_setmap_consume(JSValueConst func, JSValueConst *call_
     if (ip->class_id != JS_CLASS_GENERATOR || !ip->u.generator_data) return false;
     *out_magic = magic;
     return true;
+}
+
+/* Route Object.fromEntries(gen) — its C loop drives the argument generator's .next(). Scoped to the direct-generator
+   case; every other shape stays on the normal cfunc path. Fork-safe (the result object's writes are COW-captured). */
+static bool tramp_can_call_objentries_consume(JSValueConst func, JSValueConst *call_argv, int call_argc)
+{
+    JSObject *fp, *ip;
+    if (call_argc < 1) return false;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
+    fp = JS_VALUE_GET_OBJ(func);
+    if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
+    if (fp->u.cfunc.cproto != JS_CFUNC_generic) return false;
+    if (fp->u.cfunc.c_function.generic != js_object_fromEntries) return false;
+    if (JS_VALUE_GET_TAG(call_argv[0]) != JS_TAG_OBJECT) return false;
+    ip = JS_VALUE_GET_OBJ(call_argv[0]);
+    return ip->class_id == JS_CLASS_GENERATOR && ip->u.generator_data != NULL;
 }
 
 static JSValue js_array_of(JSContext *ctx, JSValueConst this_val,
