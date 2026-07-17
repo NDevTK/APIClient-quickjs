@@ -23784,8 +23784,8 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                generator resolves to its own state across context switches. A DIRECT .next() drive holds the
                generator object in async_promise; a FOR-OF drive holds it on the caller stack (async_promise
                UNDEFINED) at caller_sp[forof_off] — recover it there so both drives fork identically. */
-            DCHECK(otf->cont_kind == CONT_NONE,
-                   "clone_deep_flow: a generator-drive frame carries a C-continuation (cont_kind != NONE) — this branch clones gen_data but the *ct=*otf struct-copy SHARES cont_state (never reaching the else-branch clone), so a consumer step (CONT_ITER_CONSUME) attached to a generator .next() drive would silently corrupt on fork. Clone cont_state HERE (mirror the CONT_ARRAY_ITER case) before attaching any step to a generator drive.");
+            DCHECK(otf->cont_kind == CONT_NONE || otf->cont_kind == CONT_ITER_CONSUME,
+                   "clone_deep_flow: a generator-drive frame carries an unexpected C-continuation kind — the *ct=*otf struct-copy SHARES cont_state, so only CONT_ITER_CONSUME (cloned below) is handled; any other consumer step on a generator .next() drive must clone its state HERE first.");
             int gen_forof = (JS_VALUE_GET_TAG(otf->async_promise) != JS_TAG_OBJECT);
             JSValueConst genobj = otf->async_promise;
             if (gen_forof) {
@@ -23813,6 +23813,20 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                (async_promise stays UNDEFINED from *ct=*otf); the iterator rides the cloned caller stack instead. */
             if (!gen_forof) ct->async_promise = js_dup(genobj);
             ct->local_buf = NULL; ct->b = NULL;   /* the gen frame owns its buffers via g1->func_state */
+            if (otf->cont_kind == CONT_ITER_CONSUME) {
+                /* Array.from(gen) forked mid-consume: clone the consumer state so the sibling accumulates
+                   INDEPENDENTLY. r is the SHARED result array (js_dup, COW-isolated per-flow like any post-fork
+                   object mutation — each arm's DefinePropertyValueInt64 is captured on its own delta). iter is the
+                   SHARED generator object (== genobj), COW-gendata-isolated by the gen_fork above. k/orig are copied
+                   by the struct assignment. */
+                JSIterConsume *os = (JSIterConsume *)otf->cont_state;
+                JSIterConsume *ns = js_malloc(ctx, sizeof(*ns));
+                if (!ns) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
+                *ns = *os;
+                ns->r = js_dup(os->r);
+                ns->iter = js_dup(os->iter);
+                ct->cont_state = ns;
+            }
             if (g_time_travel.gen_fork) g_time_travel.gen_fork(ctx, genobj, g0, g1);
         } else {
             JSFunctionBytecode *wb = JS_VALUE_GET_OBJ(otf->sf.cur_func)->u.func.function_bytecode;
