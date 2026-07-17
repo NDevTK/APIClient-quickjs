@@ -18223,6 +18223,9 @@ typedef struct TrampFrame {
                                   an EXPLICIT DFS stack (no C recursion) and calls the reviver on this chain at
                                   each node (post-order), so a reviver body loop preempts. do_return re-enters
                                   js_json_reviver_step with the reviver's result. */
+#define CONT_ASYNC_FROM_SYNC 10 /* cont_state = JSAsyncFromSync: `for await (x of syncGen)` — the async-from-sync
+                                  wrapper's .next() drives syncGen.next() on the chain, then wraps {value,done} in
+                                  Promise.resolve(value).then(unwrap) at the settle. No fork-clone yet (DFAIL-guarded). */
 #define CONT_PROMISE_ALL   9   /* cont_state = JSPromiseAll: Promise.all(gen) drives the generator's .next() on the
                                   chain, per element wrapping Promise.resolve(value).then(resolve_element). Reuses the
                                   generator drive; the settle re-enters do_promise_all_step. No promise-state
@@ -18424,6 +18427,24 @@ typedef struct JSPromiseAll {
 static int js_promise_all_step(JSContext *ctx, struct JSPromiseAll *s, JSValue res);
 static void js_promise_all_end(JSContext *ctx, struct JSPromiseAll *s);
 static bool tramp_can_call_promise_all(JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_magic);
+typedef struct JSAsyncFromSyncIteratorData {   /* JS_CLASS_ASYNC_FROM_SYNC_ITERATOR opaque (hoisted for the for-await consumer) */
+    JSValue sync_iter;
+    JSValue next_method;
+} JSAsyncFromSyncIteratorData;
+/* `for await (x of syncGen)`: the async-from-sync iterator's .next() wraps a sync .next() in a promise. When the
+   sync iterator is a generator, drive its .next() on the tramp and do the promise-wrap at the settle. */
+typedef struct JSAsyncFromSync {
+    JSValue promise;             /* the wrapper's result promise, delivered to the for-await OP_await (owned) */
+    JSValue resolving_funcs[2];  /* its [resolve, reject] (owned) */
+    JSValue sync_iter;           /* the sync generator being driven (owned) */
+    int orig_cfirst, orig_cargc; /* the ORIGINAL OP_call_method operand shape (pop at finish) */
+    uint8_t orig_is_tail;
+} JSAsyncFromSync;
+static JSValue js_promise_resolve(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
+static __exception int perform_promise_then(JSContext *ctx, JSValueConst promise, JSValueConst *resolve_reject, JSValueConst *cap_resolving_funcs);
+static JSValue js_async_from_sync_iterator_unwrap_func_create(JSContext *ctx, bool done);
+static void js_async_from_sync_end(JSContext *ctx, struct JSAsyncFromSync *s);
+static JSValue js_async_from_sync_iterator_next(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
 static JSValue js_promise_all(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
 static JSValue js_promise_race(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 static bool tramp_can_call_promise_race(JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_magic);
@@ -19403,6 +19424,27 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_promise_race(call_argv[-1], vc(call_argv), call_argc, &pa_magic)) {   /* Promise.race(gen) -> consume on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_promise_all_consume_tramp;
                 }
+                /* for await (x of syncGen): the async-from-sync wrapper's .next() (no arg) over a sync GENERATOR — its
+                   .next() would drive syncGen.next() to completion. Route syncGen.next() onto the tramp; the settle
+                   wraps {value,done} in a promise (do_async_from_sync_step). call_argv[-2]=wrapper, [-1]=its .next. */
+                if (call_argc == 0 && JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT) {
+                    JSObject *mp = JS_VALUE_GET_OBJ(call_argv[-1]);
+                    if (mp->class_id == JS_CLASS_C_FUNCTION && mp->u.cfunc.cproto == JS_CFUNC_generic_magic
+                        && mp->u.cfunc.c_function.generic_magic == js_async_from_sync_iterator_next
+                        && mp->u.cfunc.magic == GEN_MAGIC_NEXT
+                        && JS_VALUE_GET_TAG(call_argv[-2]) == JS_TAG_OBJECT) {
+                        JSObject *wp = JS_VALUE_GET_OBJ(call_argv[-2]);
+                        if (wp->class_id == JS_CLASS_ASYNC_FROM_SYNC_ITERATOR && wp->u.async_from_sync_iterator_data) {
+                            JSValueConst si = ((JSAsyncFromSyncIteratorData *)wp->u.async_from_sync_iterator_data)->sync_iter;
+                            if (JS_VALUE_GET_TAG(si) == JS_TAG_OBJECT) {
+                                JSObject *sip = JS_VALUE_GET_OBJ(si);
+                                if (sip->class_id == JS_CLASS_GENERATOR && sip->u.generator_data) {
+                                    tramp_is_tail = (opcode == OP_tail_call_method); goto do_async_from_sync_tramp;
+                                }
+                            }
+                        }
+                    }
+                }
                 if (tramp_is_function_call(call_argv[-1])) {   /* f.call(thisArg,...) -> resolve + dispatch f here */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_forward_call;
                 }
@@ -20278,6 +20320,81 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 goto do_generator_tramp;
             }
 
+        do_async_from_sync_tramp:
+            /* for await (x of syncGen): OP_call_method on the async-from-sync wrapper's .next(). Create the wrapper's
+               result promise + drive syncGen.next() on THIS chain; the settle wraps it and yields the promise (which
+               OP_await then awaits). call_argv[-2] = the wrapper (its sync_iter is the generator). */
+            {
+                JSObject *wp = JS_VALUE_GET_OBJ(call_argv[-2]);
+                JSAsyncFromSyncIteratorData *ws = wp->u.async_from_sync_iterator_data;
+                JSAsyncFromSync *s = js_mallocz(ctx, sizeof(*s));
+                JSValue prom;
+                if (unlikely(!s)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                prom = JS_NewPromiseCapability(ctx, s->resolving_funcs);
+                if (JS_IsException(prom)) { js_free_rt(rt, s); goto exception; }
+                s->promise = prom;
+                s->sync_iter = js_dup(ws->sync_iter);
+                s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
+                tramp_cont_state = s; tramp_cont_kind = CONT_ASYNC_FROM_SYNC; tramp_gen_cont_iter = s->sync_iter;
+                tramp_gen_cont_consume = 1; tramp_gen_magic = GEN_MAGIC_NEXT;
+                goto do_generator_tramp;
+            }
+
+        do_async_from_sync_step:
+            /* ret_val = the {value,done} from syncGen.next() (direct-mode settle). Wrap it as the async-from-sync
+               .next() would — value_wrapper = Promise.resolve(value); result settles via then(unwrap) — then pop the
+               ORIGINAL OP_call_method operands and yield the wrapper's promise. */
+            {
+                JSAsyncFromSync *s = (JSAsyncFromSync *)cont_st;
+                JSValue giter = ret_val;
+                JSValue value, done_val, value_wrapper, unwrap;
+                int done;
+                done_val = JS_GetProperty(ctx, giter, JS_ATOM_done);
+                if (JS_IsException(done_val)) { JS_FreeValue(ctx, giter); goto async_from_sync_reject; }
+                done = JS_ToBoolFree(ctx, done_val);
+                value = JS_GetProperty(ctx, giter, JS_ATOM_value);
+                JS_FreeValue(ctx, giter);
+                if (JS_IsException(value)) goto async_from_sync_reject;
+                value_wrapper = js_promise_resolve(ctx, ctx->promise_ctor, 1, vc(&value), 0);
+                JS_FreeValue(ctx, value);
+                if (JS_IsException(value_wrapper)) goto async_from_sync_reject;
+                unwrap = js_async_from_sync_iterator_unwrap_func_create(ctx, done);
+                if (JS_IsException(unwrap)) { JS_FreeValue(ctx, value_wrapper); goto async_from_sync_reject; }
+                {
+                    JSValueConst rr[2]; rr[0] = unwrap; rr[1] = JS_UNDEFINED;
+                    perform_promise_then(ctx, value_wrapper, rr, vc(s->resolving_funcs));
+                }
+                JS_FreeValue(ctx, value_wrapper); JS_FreeValue(ctx, unwrap);
+                {
+                    JSValue r = js_dup(s->promise);
+                    int cfirst = s->orig_cfirst, cargc = s->orig_cargc; uint8_t itail = s->orig_is_tail;
+                    JSValue *cargv;
+                    js_async_from_sync_end(ctx, s); js_free_rt(rt, s);
+                    cargv = sp - cargc;
+                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
+                    sp += cfirst - cargc;
+                    if (itail) { ret_val = r; goto do_return; }
+                    *sp++ = r;
+                    BREAK;
+                }
+            async_from_sync_reject:
+                {
+                    JSValue err = JS_GetException(ctx), rr2, r;
+                    int cfirst = s->orig_cfirst, cargc = s->orig_cargc; uint8_t itail = s->orig_is_tail;
+                    JSValue *cargv;
+                    rr2 = JS_Call(ctx, s->resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
+                    JS_FreeValue(ctx, err); JS_FreeValue(ctx, rr2);
+                    r = js_dup(s->promise);
+                    js_async_from_sync_end(ctx, s); js_free_rt(rt, s);
+                    cargv = sp - cargc;
+                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
+                    sp += cfirst - cargc;
+                    if (itail) { ret_val = r; goto do_return; }
+                    *sp++ = r;
+                    BREAK;
+                }
+            }
+
         do_async_tramp_call:
             /* ASYNC callee: run its body HERE on the tramp chain (gen_state stays the caller's base) so a sync-
                prefix loop preempts the base flow at any depth — never a nested C-recursion that drives to
@@ -20456,6 +20573,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         cont_st = cc_state; cont_kind_cur = cc_kind;
                         ret_val = giter;
                         if (cc_kind == CONT_PROMISE_ALL) goto do_promise_all_step;
+                        if (cc_kind == CONT_ASYNC_FROM_SYNC) goto do_async_from_sync_step;
                         goto do_iter_consume_step;
                     }
                     if (forof) {
@@ -20632,10 +20750,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 giter = (gdone == 2) ? value : js_create_iterator_result(ctx, value, gdone);
                 if (JS_IsException(giter)) goto exception;
-                if (gck == CONT_ITER_CONSUME || gck == CONT_PROMISE_ALL) {   /* consumer drive: feed {value,done} back to its step (caller stack untouched: sp == caller_sp) */
+                if (gck == CONT_ITER_CONSUME || gck == CONT_PROMISE_ALL || gck == CONT_ASYNC_FROM_SYNC) {   /* consumer drive: feed {value,done} back to its step (caller stack untouched: sp == caller_sp) */
                     cont_st = gcont; cont_kind_cur = gck;
                     ret_val = giter;
                     if (gck == CONT_PROMISE_ALL) goto do_promise_all_step;
+                    if (gck == CONT_ASYNC_FROM_SYNC) goto do_async_from_sync_step;
                     goto do_iter_consume_step;
                 }
                 *sp++ = giter;
@@ -23472,6 +23591,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             ctx->error_back_trace = JS_UNDEFINED;
         }
         JSPromiseAll *pa_throw = (gtf->cont_kind == CONT_PROMISE_ALL) ? (JSPromiseAll *)gtf->cont_state : NULL;
+        JSAsyncFromSync *afs_throw = (gtf->cont_kind == CONT_ASYNC_FROM_SYNC) ? (JSAsyncFromSync *)gtf->cont_state : NULL;
         if (gtf->cont_kind == CONT_ITER_CONSUME) {   /* Array.from consumer: the generator body threw -> abandon the half-built array (its own ref to the generator is dropped here; the drive ref is dropped below) */
             js_iter_consume_end(ctx, (struct JSIterConsume *)gtf->cont_state);
             js_free_rt(rt, gtf->cont_state);
@@ -23504,6 +23624,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             rr = JS_Call(ctx, pa_throw->resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
             JS_FreeValue(ctx, err); JS_FreeValue(ctx, rr);
             js_promise_all_end(ctx, pa_throw); js_free_rt(rt, pa_throw);
+            cargv = sp - cargc;
+            for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
+            sp += cfirst - cargc;
+            if (itail) { ret_val = r; goto do_return; }
+            *sp++ = r;
+            BREAK;
+        }
+        if (afs_throw) {
+            /* for await (x of syncGen): a throw from the sync generator REJECTS the wrapper's result promise (which
+               OP_await then rejects into the async body), never propagates. Pop the OP_call_method operands + yield it. */
+            JSValue err = JS_GetException(ctx), rr, r;
+            int cfirst = afs_throw->orig_cfirst, cargc = afs_throw->orig_cargc; uint8_t itail = afs_throw->orig_is_tail;
+            JSValue *cargv;
+            rr = JS_Call(ctx, afs_throw->resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
+            JS_FreeValue(ctx, err); JS_FreeValue(ctx, rr);
+            r = js_dup(afs_throw->promise);
+            js_async_from_sync_end(ctx, afs_throw); js_free_rt(rt, afs_throw);
             cargv = sp - cargc;
             for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
             sp += cfirst - cargc;
@@ -59610,6 +59747,15 @@ static int js_promise_all_step(JSContext *ctx, JSPromiseAll *s, JSValue res)
     return 1;   /* drive the next .next() */
 }
 
+/* Free a for-await async-from-sync state's owned fields (promise dup'd out by the caller before this). */
+static void js_async_from_sync_end(JSContext *ctx, JSAsyncFromSync *s)
+{
+    JS_FreeValue(ctx, s->promise);
+    JS_FreeValue(ctx, s->resolving_funcs[0]);
+    JS_FreeValue(ctx, s->resolving_funcs[1]);
+    JS_FreeValue(ctx, s->sync_iter);
+}
+
 /* Free a Promise.all(gen) state's owned fields (result_promise moved out by the caller before this on the happy path). */
 static void js_promise_all_end(JSContext *ctx, JSPromiseAll *s)
 {
@@ -59959,11 +60105,6 @@ static const JSCFunctionListEntry js_async_iterator_proto_funcs[] = {
 };
 
 /* AsyncFromSyncIteratorPrototype */
-
-typedef struct JSAsyncFromSyncIteratorData {
-    JSValue sync_iter;
-    JSValue next_method;
-} JSAsyncFromSyncIteratorData;
 
 static void js_async_from_sync_iterator_finalizer(JSRuntime *rt,
                                                   JSValueConst val)
