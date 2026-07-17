@@ -24247,8 +24247,9 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                generator resolves to its own state across context switches. A DIRECT .next() drive holds the
                generator object in async_promise; a FOR-OF drive holds it on the caller stack (async_promise
                UNDEFINED) at caller_sp[forof_off] — recover it there so both drives fork identically. */
-            DCHECK(otf->cont_kind == CONT_NONE || otf->cont_kind == CONT_ITER_CONSUME,
-                   "clone_deep_flow: a generator-drive frame carries an unexpected C-continuation kind — the *ct=*otf struct-copy SHARES cont_state, so only CONT_ITER_CONSUME (cloned below) is handled; any other consumer step on a generator .next() drive must clone its state HERE first.");
+            DCHECK(otf->cont_kind == CONT_NONE || otf->cont_kind == CONT_ITER_CONSUME
+                   || otf->cont_kind == CONT_ASYNC_FROM_SYNC || otf->cont_kind == CONT_PROMISE_ALL,
+                   "clone_deep_flow: a generator-drive frame carries an unexpected C-continuation kind — the *ct=*otf struct-copy SHARES cont_state, so each consumer kind that can ride a generator .next() drive must clone its state HERE first.");
             int gen_forof = (JS_VALUE_GET_TAG(otf->async_promise) != JS_TAG_OBJECT);
             JSValueConst genobj = otf->async_promise;
             if (gen_forof) {
@@ -24291,6 +24292,48 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                 ns->adder = js_dup(os->adder);   /* SET/MAP add/set method (UNDEFINED for FROM/SPREAD) */
                 ns->mapfn = js_dup(os->mapfn);   /* Array.from(gen, fn) mapfn + thisArg (UNDEFINED otherwise) */
                 ns->mapfn_this = js_dup(os->mapfn_this);
+                ct->cont_state = ns;
+            } else if (otf->cont_kind == CONT_ASYNC_FROM_SYNC) {
+                /* `for await (x of syncGen)` forked mid-syncGen.next(): each .next() is INDEPENDENT (no cross-element
+                   accumulation), so the sibling just needs its OWN wrapper promise — the fork mid-drive means neither
+                   arm has delivered its promise to the caller's OP_await yet, so a fresh capability is conflict-free.
+                   sync_iter == genobj (gen-COW-isolated above). orig_* copied by *ns=*os. */
+                JSAsyncFromSync *os = (JSAsyncFromSync *)otf->cont_state;
+                JSAsyncFromSync *ns = js_mallocz(ctx, sizeof(*ns));
+                if (!ns) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
+                *ns = *os;   /* copies os's OWNED promise/resolving_funcs/sync_iter as borrowed — reassign each below */
+                ns->promise = JS_NewPromiseCapability(ctx, ns->resolving_funcs);   /* fresh (overwrites the copied funcs): sibling delivers ITS own promise */
+                if (JS_IsException(ns->promise)) { js_free(ctx, ns); js_free(ctx, oa); js_free(ctx, ca); return NULL; }
+                ns->sync_iter = js_dup(os->sync_iter);
+                ct->cont_state = ns;
+            } else if (otf->cont_kind == CONT_PROMISE_ALL) {
+                /* Promise.all(gen) forked mid-consume. At index==0 the fork happened during the FIRST .next() BEFORE any
+                   element promise's resolve_element .then was attached (values empty, remainingElementsCount==1), so the
+                   sibling starts a fresh aggregate cleanly. At index>0 elements 0..k-1 carry resolve_element .then's bound
+                   to the PARENT's values/resolving_funcs — the sibling would need each re-attached to its OWN aggregate;
+                   that re-attachment is not yet built, so DFAIL loud (never a silent cross-arm aggregate share). */
+                JSPromiseAll *os = (JSPromiseAll *)otf->cont_state;
+                DCHECK(os->index == 0,
+                       "clone_deep_flow: Promise.all(gen) forked after pulling element(s) — re-attaching pre-fork element .then's onto the sibling aggregate is not yet built; only a fork before the first element (index==0) is fork-safe.");
+                JSPromiseAll *ns = js_mallocz(ctx, sizeof(*ns));
+                if (!ns) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
+                *ns = *os;   /* copies os's OWNED aggregate fields as borrowed; null the fresh ones so an error path frees safely */
+                ns->result_promise = JS_UNDEFINED;
+                ns->resolving_funcs[0] = ns->resolving_funcs[1] = JS_UNDEFINED;
+                ns->values = JS_UNDEFINED; ns->resolve_element_env = JS_UNDEFINED;
+                ns->iter = js_dup(os->iter);              /* == genobj, gen-COW-isolated */
+                ns->next = js_dup(os->next);
+                ns->this_val = js_dup(os->this_val);
+                ns->promise_resolve = js_dup(os->promise_resolve);
+                ns->result_promise = js_new_promise_capability(ctx, ns->resolving_funcs, os->this_val);   /* fresh aggregate + [resolve,reject] */
+                ns->values = JS_NewArray(ctx);
+                ns->resolve_element_env = JS_NewArray(ctx);
+                if (JS_IsException(ns->result_promise) || JS_IsException(ns->values)
+                    || JS_IsException(ns->resolve_element_env)
+                    || JS_DefinePropertyValueUint32(ctx, ns->resolve_element_env, 0, js_int32(1),
+                                                    JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE | JS_PROP_WRITABLE) < 0) {
+                    js_promise_all_end(ctx, ns); js_free(ctx, ns); js_free(ctx, oa); js_free(ctx, ca); return NULL;
+                }
                 ct->cont_state = ns;
             }
             if (g_time_travel.gen_fork) g_time_travel.gen_fork(ctx, genobj, g0, g1);
