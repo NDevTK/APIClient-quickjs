@@ -18371,12 +18371,15 @@ static int js_array_reduce_step(JSContext *ctx, struct JSArrayReduce *s, JSValue
    normal cfunc path. The generator DRIVE frame carries this state (cont_kind CONT_ITER_CONSUME); its settle
    re-enters js_iter_consume_step with the {value,done} result. NO cb_args: the drive IS the generator, its
    receiver is s->iter (in the state), so nothing rides the caller stack. */
+#define ITERCONS_FROM    0   /* Array.from(gen): fresh result array; finish pops the call operands + pushes r */
+#define ITERCONS_SPREAD  1   /* [...gen] (OP_append): r is the literal's array on the caller stack; finish writes pos back to sp[-2] and pops the iterable */
 typedef struct JSIterConsume {
-    JSValue r;       /* the result array being built (owned) */
+    JSValue r;       /* the result array being built (owned; SPREAD: a dup of the caller-stack array being appended to) */
     JSValue iter;    /* the generator object being consumed (owned) — .next() drives its body */
-    int64_t k;       /* next index to define */
-    int orig_cfirst, orig_cargc;   /* the ORIGINAL OP_call_method operand shape (pop at finish) */
+    int64_t k;       /* next index to define (SPREAD: the running append position) */
+    int orig_cfirst, orig_cargc;   /* FROM: the ORIGINAL OP_call_method operand shape (pop at finish) */
     uint8_t orig_is_tail;
+    uint8_t sink;    /* ITERCONS_FROM / ITERCONS_SPREAD — the per-element sink is identical; only setup + finish differ */
 } JSIterConsume;
 static int js_iter_consume_step(JSContext *ctx, struct JSIterConsume *s, JSValue res);
 static void js_iter_consume_end(JSContext *ctx, struct JSIterConsume *s);
@@ -19948,9 +19951,26 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->r = result;
                 s->iter = js_dup(gen);
                 s->k = 0;
+                s->sink = ITERCONS_FROM;
                 s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
                 cont_st = s; cont_kind_cur = CONT_ITER_CONSUME;
                 ret_val = JS_UNINITIALIZED;   /* first step: no previous next() result */
+                goto do_iter_consume_step;
+            }
+
+        do_spread_consume_tramp:
+            /* [...gen] (OP_append): CONSUME the generator on this chain, appending to the array literal being built
+               at sp[-3] from position sp[-2]. sp[-1] IS the generator (checked at OP_append). Mirrors
+               js_append_enumerate's general_case loop, but the .next() body runs on the tramp (suspend/resume). */
+            {
+                JSIterConsume *s = js_mallocz(ctx, sizeof(*s));
+                if (unlikely(!s)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                s->r = js_dup(sp[-3]);            /* the array being built — a shared ref; appends land on sp[-3] too */
+                s->iter = js_dup(sp[-1]);         /* the generator */
+                s->k = JS_VALUE_GET_INT(sp[-2]);  /* the current append position */
+                s->sink = ITERCONS_SPREAD;
+                cont_st = s; cont_kind_cur = CONT_ITER_CONSUME;
+                ret_val = JS_UNINITIALIZED;
                 goto do_iter_consume_step;
             }
 
@@ -19961,7 +19981,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSIterConsume *s = (JSIterConsume *)cont_st;
                 int st = js_iter_consume_step(ctx, s, ret_val);
                 if (unlikely(st < 0)) { js_iter_consume_end(ctx, s); js_free_rt(rt, s); goto exception; }
-                if (st == 0) {   /* DONE: set length, pop the ORIGINAL operands, yield the array */
+                if (st == 0) {   /* DONE */
+                    if (s->sink == ITERCONS_SPREAD) {
+                        /* [...gen] (OP_append): the elements were appended to s->r == the caller-stack array at
+                           sp[-3] (same object). Match js_append_enumerate + OP_append's tail: write the new position
+                           back to sp[-2], drop the iterable at sp[-1], and pop it. r/iter are the state's own refs. */
+                        int64_t n = s->k;
+                        JS_FreeValue(ctx, s->r); JS_FreeValue(ctx, s->iter);
+                        js_free_rt(rt, s);
+                        sp[-2] = js_int32((int32_t)n);
+                        JS_FreeValue(ctx, sp[-1]);   /* the spread iterable (generator) */
+                        sp--;
+                        BREAK;
+                    }
+                    /* ITERCONS_FROM: set length, pop the ORIGINAL call operands, yield the fresh array */
                     JSValue r = s->r;
                     int cfirst = s->orig_cfirst, cargc = s->orig_cargc;
                     uint8_t itail = s->orig_is_tail;
@@ -22275,6 +22308,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_append):    /* array pos enumobj -- array pos */
             {
                 sf->cur_pc = pc;
+                /* [...gen]: consume the generator on THIS chain (its .next() body suspend/resumes) rather than the
+                   C-recursion drive-to-completion js_append_enumerate's loop would use. sp[-1] a generator => its
+                   @@iterator returns itself; the spread consumer appends to sp[-3] from sp[-2] and pops the iterable. */
+                if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) {
+                    JSObject *ip = JS_VALUE_GET_OBJ(sp[-1]);
+                    if (ip->class_id == JS_CLASS_GENERATOR && ip->u.generator_data)
+                        goto do_spread_consume_tramp;
+                }
                 if (js_append_enumerate(ctx, sp))
                     goto exception;
                 JS_FreeValue(ctx, *--sp);
