@@ -18190,6 +18190,9 @@ typedef struct TrampFrame {
     int forof_off;   /* for a FOR-OF generator drive (is_tail, async_promise UNDEFINED): the iterator's caller-stack
                         offset (caller_sp[forof_off] is the generator object). Lets a concolic fork inside a for-of
                         body recover the shared generator to record its per-flow gen_data swap. Unused otherwise. */
+    JSValue close_saved_exc;   /* CLOSE-DURING-EXCEPTION-UNWIND (is_tail==4): the in-flight exception, saved+cleared
+                                  before the generator's .return()/finally runs, restored after so the finally's own
+                                  outcome never overwrites the propagating exception (spec IteratorClose completion). */
     /* C-CONTINUATION: this frame IS a JS callback driven by a C builtin's iteration (forEach/map/every/some/
        filter, reduce, ...) that runs on the chain instead of C-recursing JS_Call. cont_state is the builtin's
        resumable state, tagged by cont_kind; its operands live in a buffer OWNED BY THAT STATE (never the caller's
@@ -18674,6 +18677,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     int tramp_gen_forof = 1;                            /* <0 = for-of iterator stack offset (always -3-.. ); 1 = direct .next() (no valid offset is positive) */
     int tramp_gen_iternext = 0;                         /* 1 = OP_iterator_next drive (yield* / destructuring): iterator at sp[-4], arg at sp[-1], result OBJECT replaces sp[-1] */
     int tramp_gen_close = 0;                            /* 1 = OP_iterator_close drive (.return() on an unconsumed generator iterator at sp[-1]): body runs finally on the tramp, result DISCARDED */
+    int tramp_gen_close_exc = 0;                        /* 1 = the close is happening DURING exception unwind (JS_IteratorClose(iter,true)): after the finally runs, restore the in-flight exception and continue unwinding (goto exception), never overwrite it */
+    int tramp_gen_create_forof = 0;                     /* 1 = this do_generator_create_tramp is a for-of iterator-getter (OP_for_of_start): at settle, finish the enum_rec ([iterator, next, catch_offset]) instead of pushing the bare object */
     JSAsyncFunctionState *gen_state = NULL;   /* the generator/async base state IF this activation is preemptible */
 
 #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_STEP
@@ -20005,6 +20010,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 bool iternext = tramp_gen_iternext; tramp_gen_iternext = 0;   /* OP_iterator_next drive (yield-star + destructuring) */
                 bool close = tramp_gen_close; tramp_gen_close = 0;            /* OP_iterator_close drive (.return()) */
+                bool close_exc = tramp_gen_close_exc; tramp_gen_close_exc = 0; /* close mid-exception-unwind */
+                JSValue close_exc_e = JS_UNINITIALIZED;   /* the saved in-flight exception (close_exc only) */
+                if (close_exc) { close_exc_e = rt->current_exception; rt->current_exception = JS_UNINITIALIZED; }
                 bool forof = (tramp_gen_forof < 0);   /* a real for-of offset is always negative (-3-..) */
                 int fofoff = tramp_gen_forof;
                 tramp_gen_forof = 1;   /* reset to the direct-call sentinel */
@@ -20041,8 +20049,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JSValue gv = (!do_throw && gmagic == GEN_MAGIC_RETURN) ? js_dup(garg) : JS_UNDEFINED;
                     JSValue thr = do_throw ? js_dup(garg) : JS_UNDEFINED;
                     JSValue giter;
-                    if (close) {   /* OP_iterator_close on a completed/not-started generator: no body run; discard + pop */
+                    if (close) {   /* OP_iterator_close on a completed/not-started generator: no body run; discard */
                         JS_FreeValue(ctx, gv); JS_FreeValue(ctx, thr);
+                        if (close_exc) {   /* mid-unwind: restore the exception, continue; iterator stays on the stack */
+                            rt->current_exception = close_exc_e;
+                            goto exception;
+                        }
                         JS_FreeValue(ctx, sp[-1]);   /* the generator iterator */
                         sp--;
                         BREAK;
@@ -20073,13 +20085,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (unlikely(!gtf)) { JS_ThrowOutOfMemory(ctx); goto exception; }
                 if (close) {
                     /* OP_iterator_close (.return()): HOLD the generator across its finally run (like the direct
-                       drive), then the settle discards the result and pops sp[-1]. is_tail=3 marks close; a concolic
-                       fork in the finally recovers the generator from async_promise (an object), like the direct path. */
+                       drive), then the settle discards the result. A concolic fork in the finally recovers the
+                       generator from async_promise (an object), like the direct path. */
                     gtf->async_promise = js_dup(gthis);
-                    JS_FreeValue(ctx, sp[-1]);   /* free the stack operand; async_promise holds the drive ref */
-                    gtf->caller_sp = sp - 1;      /* the close consumes the iterator slot */
-                    gtf->is_tail = 3;
                     gtf->forof_off = 1;
+                    if (close_exc) {
+                        /* mid-exception-unwind: the iterator STAYS on the stack (the unwind frees it next); save the
+                           in-flight exception in the frame so it survives finally preempts, restored at settle. */
+                        gtf->caller_sp = sp;
+                        gtf->is_tail = 4;
+                        gtf->close_saved_exc = close_exc_e;
+                    } else {
+                        JS_FreeValue(ctx, sp[-1]);   /* free the stack operand; async_promise holds the drive ref */
+                        gtf->caller_sp = sp - 1;      /* the close consumes the iterator slot */
+                        gtf->is_tail = 3;
+                        gtf->close_saved_exc = JS_UNINITIALIZED;
+                    }
                 } else if (iternext) {
                     /* OP_iterator_next (yield* / destructuring): the iterator STAYS on the caller stack at sp[-4]
                        (no ref to hold). At settle the iterator-result OBJECT replaces sp[-1], sp unchanged. is_tail=2
@@ -20145,8 +20166,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 TrampFrame *gtf = tf_top;
                 JSGeneratorData *gs = gtf->gen_data;
-                JSValue ghold = gtf->async_promise;   /* held generator ref (direct) or UNDEFINED (for-of/iternext) */
-                int gmode = gtf->is_tail;   /* 0 = direct .next(); 1 = for-of; 2 = OP_iterator_next (yield-star + destructuring) */
+                JSValue ghold = gtf->async_promise;   /* held generator ref (direct/close) or UNDEFINED (for-of/iternext) */
+                int gmode = gtf->is_tail;   /* 0=direct .next(); 1=for-of; 2=OP_iterator_next; 3=close; 4=close-during-unwind */
+                JSValue close_e = (gmode == 4) ? gtf->close_saved_exc : JS_UNINITIALIZED;   /* saved before gtf is freed */
                 bool forof = (gmode == 1);
                 JSStackFrame *gsf = &gs->func_state.frame;
                 JSValue value, giter;
@@ -20177,6 +20199,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (gmode == 3) {   /* OP_iterator_close: .return() ran (finally); its result is DISCARDED, sp = caller_sp (iterator popped) */
                     JS_FreeValue(ctx, value);
                     BREAK;
+                }
+                if (gmode == 4) {   /* OP_iterator_close DURING exception unwind: finally ran (completed normally);
+                                       discard its result, restore the in-flight exception, and continue unwinding.
+                                       (A finally that THREW is handled on the exception path — see the close-exc gen
+                                       frame handling there.) */
+                    JS_FreeValue(ctx, value);
+                    rt->current_exception = close_e;   /* restore the propagating exception (never overwritten by the finally) */
+                    goto exception;
                 }
                 if (forof) {
                     /* OP_for_of_next protocol: value at sp[0], done at sp[1], then sp += 2. A yield* (gdone==2)
@@ -20318,6 +20348,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 gtf->call_first = -1; gtf->call_argc = 0; gtf->is_tail = tramp_is_tail;
                 gtf->async_data = NULL;
                 gtf->gen_data = s; gtf->gen_magic = 0xFF; gtf->cont_state = NULL; gtf->cont_kind = CONT_NONE;   /* 0xFF = CREATING (run-to-initial_yield), not a GEN_MAGIC */
+                gtf->forof_off = tramp_gen_create_forof;   /* 1 = OP_for_of_start iterator-getter: finish the enum_rec at settle; 0 = ordinary g() create */
+                tramp_gen_create_forof = 0;
                 gtf->b = NULL; gtf->local_buf = NULL;
                 gsf = &s->func_state.frame;
                 gfp = JS_VALUE_GET_OBJ(gsf->cur_func);
@@ -20347,6 +20379,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSGeneratorData *s = gtf->gen_data;
                 JSValue gfunc = gtf->async_promise;
                 uint8_t gitail = gtf->is_tail;
+                bool gforof_create = gtf->forof_off;   /* 1 = OP_for_of_start iterator-getter: finish the enum_rec */
                 JSValue obj;
                 sf->cur_pc = pc; sf->cur_sp = sp;   /* suspend at initial_yield (state stays SUSPENDED_START) */
                 obj = js_create_from_ctor(ctx, gfunc, JS_CLASS_GENERATOR);   /* uses the ctor's realm */
@@ -20364,6 +20397,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JS_FreeValue(ctx, gfunc);
                 if (unlikely(JS_IsException(obj))) { free_generator_stack_rt(rt, s); js_free_rt(rt, s); goto exception; }
                 JS_SetOpaqueInternal(obj, s);   /* the object now owns the suspended generator state */
+                if (gforof_create) {
+                    /* OP_for_of_start: the @@iterator getter (a generator function) produced this iterator generator
+                       on the chain; finish the enum_rec exactly as OP_for_of_start's tail — [iterator, next, catch]. */
+                    JSValue nextm;
+                    *sp++ = obj;   /* sp[-1] = iterator (the generator) */
+                    nextm = JS_GetProperty(ctx, obj, JS_ATOM_next);
+                    if (JS_IsException(nextm)) goto exception;   /* obj on the stack; the unwind frees it */
+                    *sp++ = nextm;                       /* sp[-1]=next, sp[-2]=iterator */
+                    *sp++ = JS_NewCatchOffset(ctx, 0);   /* sp[-1]=catch, sp[-2]=next, sp[-3]=iterator */
+                    BREAK;
+                }
                 if (gitail) { ret_val = obj; goto do_return; }
                 *sp++ = obj;
                 BREAK;
@@ -21217,10 +21261,39 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
         CASE(OP_for_of_start):
             sf->cur_pc = pc;
-            if (js_for_of_start(ctx, sp, false))
-                goto exception;
-            sp += 1;
-            *sp++ = JS_NewCatchOffset(ctx, 0);
+            {
+                /* GetIterator(obj, sync) done at the OPCODE (not the C js_for_of_start) so a GENERATOR-FUNCTION
+                   @@iterator getter creates its iterator on THIS tramp chain — its params-to-initial_yield preempt
+                   the base flow, never the C-recursion drive-to-completion js_call_generator_function would use.
+                   The @@iterator getter is fetched ONCE (a spec GetMethod), so an accessor @@iterator is not re-run. */
+                JSValue itbl = sp[-1];
+                JSValue m = JS_GetProperty(ctx, itbl, JS_ATOM_Symbol_iterator);
+                if (JS_IsException(m)) goto exception;
+                if (tramp_can_call_gen_create(m)) {
+                    *sp++ = m;                     /* sp[-1]=gen fn, sp[-2]=iterable(this) */
+                    call_argc = 0; call_argv = sp;
+                    tramp_first = -2; tramp_is_tail = 0;
+                    tramp_gen_create_forof = 1;
+                    goto do_generator_create_tramp;   /* settle finishes the enum_rec */
+                }
+                if (!JS_IsFunction(ctx, m)) {
+                    JS_FreeValue(ctx, m);
+                    JS_ThrowTypeError(ctx, "value is not iterable");
+                    goto exception;
+                }
+                {
+                    JSValue iter = JS_GetIterator2(ctx, itbl, m);
+                    JSValue nextm;
+                    JS_FreeValue(ctx, m);
+                    if (JS_IsException(iter)) goto exception;
+                    JS_FreeValue(ctx, itbl);
+                    sp[-1] = iter;
+                    nextm = JS_GetProperty(ctx, iter, JS_ATOM_next);
+                    if (JS_IsException(nextm)) goto exception;
+                    *sp++ = nextm;                       /* sp[-1]=next, sp[-2]=iterator */
+                    *sp++ = JS_NewCatchOffset(ctx, 0);   /* sp[-1]=catch, sp[-2]=next, sp[-3]=iterator */
+                }
+            }
             BREAK;
         CASE(OP_for_of_next):
             {
@@ -22934,6 +23007,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     /* enumerator: close it with a throw */
                     JS_FreeValue(ctx, sp[-1]); /* drop the next method */
                     sp--;
+                    /* a GENERATOR iterator's .return() (its finally) runs on THIS chain even mid-exception-unwind,
+                       never the C-recursion JS_IteratorClose drive-to-completion. do_generator_tramp close-exc mode
+                       saves the in-flight exception, runs the finally (preemptible), restores the exception, and
+                       re-enters this unwind. The iterator STAYS on the stack (freed by the next unwind iteration). */
+                    if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) {
+                        JSObject *ip = JS_VALUE_GET_OBJ(sp[-1]);
+                        if (ip->class_id == JS_CLASS_GENERATOR && ip->u.generator_data
+                            && ((JSGeneratorData *)ip->u.generator_data)->state != JS_GENERATOR_STATE_EXECUTING) {
+                            tramp_gen_magic = GEN_MAGIC_RETURN; tramp_gen_close = 1; tramp_gen_close_exc = 1;
+                            goto do_generator_tramp;
+                        }
+                    }
                     JS_IteratorClose(ctx, sp[-1], true);
                 } else {
                     *sp++ = rt->current_exception;
@@ -22958,6 +23043,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         TrampFrame *gtf = tf_top;
         JSValue ghold = gtf->async_promise;
         bool creating = (gtf->gen_magic == 0xFF);   /* a param-binding throw before the generator object exists */
+        if (gtf->is_tail == 4) {   /* CLOSE-DURING-UNWIND: the .return()/finally THREW. Per spec IteratorClose with a
+                                      throw completion, the finally's own exception is IGNORED — the original
+                                      propagating exception wins. Discard the finally throw, restore the saved one. */
+            JS_FreeValueRT(rt, rt->current_exception);
+            rt->current_exception = gtf->close_saved_exc;
+            JS_FreeValueRT(rt, ctx->error_back_trace);
+            ctx->error_back_trace = JS_UNDEFINED;
+        }
         sf->cur_sp = sp;   /* the body frame is "running" (cur_sp NULL); restore it so async_func_free can tear down */
         free_generator_stack_rt(rt, gtf->gen_data);
         if (creating) js_free_rt(rt, gtf->gen_data);   /* not yet owned by a generator object -> free the orphan */
