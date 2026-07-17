@@ -59531,7 +59531,15 @@ static int js_promise_all_step(JSContext *ctx, JSPromiseAll *s, JSValue res)
         is_zero = remainingElementsCount_add(ctx, s->resolve_element_env, -1);
         if (is_zero < 0) return -1;
         if (is_zero) {
-            rr = JS_Call(ctx, s->resolving_funcs[0], JS_UNDEFINED, 1, vc(&s->values));
+            if (s->magic == PROMISE_MAGIC_any) {
+                /* any: every element rejected -> reject the aggregate with AggregateError(the collected errors). */
+                JSValue err = js_aggregate_error_constructor(ctx, s->values);
+                if (JS_IsException(err)) return -1;
+                rr = JS_Call(ctx, s->resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
+                JS_FreeValue(ctx, err);
+            } else {
+                rr = JS_Call(ctx, s->resolving_funcs[0], JS_UNDEFINED, 1, vc(&s->values));
+            }
             if (JS_IsException(rr)) return -1;
             JS_FreeValue(ctx, rr);
         }
@@ -59546,7 +59554,7 @@ static int js_promise_all_step(JSContext *ctx, JSPromiseAll *s, JSValue res)
     resolve_element_data[0] = JS_FALSE;
     resolve_element_data[1] = js_int32(s->index);
     resolve_element_data[2] = s->values;
-    resolve_element_data[3] = s->resolving_funcs[0];   /* `all`: is_promise_any==0 -> the resolve func */
+    resolve_element_data[3] = s->resolving_funcs[s->magic == PROMISE_MAGIC_any ? 1 : 0];   /* any: the aggregate REJECT (called when all reject); all/allSettled: resolve */
     resolve_element_data[4] = s->resolve_element_env;
     resolve_element = JS_NewCFunctionData(ctx, js_promise_all_resolve_element, 1,
                                           s->magic, 5, resolve_element_data);
@@ -59558,6 +59566,14 @@ static int js_promise_all_step(JSContext *ctx, JSPromiseAll *s, JSValue res)
             reject_element = JS_NewCFunctionData(ctx, js_promise_all_resolve_element, 1,
                                                  s->magic | 4, 5, resolve_element_data);
             if (JS_IsException(reject_element)) { JS_FreeValue(ctx, next_promise); JS_FreeValue(ctx, resolve_element); return -1; }
+        } else if (s->magic == PROMISE_MAGIC_any) {
+            /* any: the element CLOSURE is the REJECT handler (records the error at index); a FULFILLMENT resolves the
+               aggregate directly. Pre-fill values[index] so a later rejection has a slot. */
+            if (JS_DefinePropertyValueUint32(ctx, s->values, s->index, JS_UNDEFINED, JS_PROP_C_W_E) < 0) {
+                JS_FreeValue(ctx, next_promise); JS_FreeValue(ctx, resolve_element); return -1;
+            }
+            reject_element = resolve_element;
+            resolve_element = js_dup(s->resolving_funcs[0]);
         } else {
             reject_element = js_dup(s->resolving_funcs[1]);   /* `all`: reject the aggregate on first rejection */
         }
@@ -59602,7 +59618,7 @@ static bool tramp_can_call_promise_all(JSValueConst func, JSValueConst *call_arg
     if (fp->u.cfunc.cproto != JS_CFUNC_generic_magic) return false;
     if (fp->u.cfunc.c_function.generic_magic != js_promise_all) return false;
     magic = fp->u.cfunc.magic;
-    if (magic != PROMISE_MAGIC_all && magic != PROMISE_MAGIC_allSettled) return false;
+    if (magic != PROMISE_MAGIC_all && magic != PROMISE_MAGIC_allSettled && magic != PROMISE_MAGIC_any) return false;
     if (JS_VALUE_GET_TAG(call_argv[0]) != JS_TAG_OBJECT) return false;
     ip = JS_VALUE_GET_OBJ(call_argv[0]);
     if (ip->class_id != JS_CLASS_GENERATOR || !ip->u.generator_data) return false;
