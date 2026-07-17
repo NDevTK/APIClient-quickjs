@@ -10925,6 +10925,11 @@ static int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
                 /* add element */
                 return add_fast_array_element(ctx, p, val, flags);
             }
+            /* Forced-exec COW: OVERWRITE of an existing fast-array element writes values[] directly, bypassing the
+               property-set capture. Record the slot's baseline (existed=1, old value) so a shared array's per-flow
+               element write is isolated — unapply restores the old value. (An APPEND above is captured O(1) inside
+               add_fast_array_element; this is the in-bounds overwrite path.) */
+            cow_capture(ctx, JS_MKPTR(JS_TAG_OBJECT, p), __JS_AtomFromUInt32(idx));
             set_value(ctx, &p->u.array.u.values[idx], val);
             break;
         case JS_CLASS_ARGUMENTS:
