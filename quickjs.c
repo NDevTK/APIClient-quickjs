@@ -18402,6 +18402,8 @@ static JSValue js_object_fromEntries(JSContext *ctx, JSValueConst this_val, int 
 static bool tramp_can_call_objentries_consume(JSValueConst func, JSValueConst *call_argv, int call_argc);
 static JSValue js_typed_array_constructor_obj(JSContext *ctx, JSValueConst new_target, JSValueConst obj, int classid);
 static bool tramp_can_call_ta_consume(JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_classid);
+static JSValue js_typed_array_from(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static bool tramp_can_call_ta_from_consume(JSValueConst func, JSValueConst this_val, JSValueConst *call_argv, int call_argc, int *out_classid);
 static void js_array_reduce_end(JSContext *ctx, struct JSArrayReduce *s, bool take_acc);
 static JSValue js_array_reduce(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int special);
 static bool tramp_can_call_array_reduce(JSValueConst func, int *out_special);
@@ -18725,6 +18727,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     int tramp_gen_cont_consume = 0;                     /* 1 = this do_generator_tramp drive is an iterator-CONSUMER (Array.from) driving s->iter.next(): gthis comes from tramp_cont_state->iter, caller_sp stays put (nothing on the caller stack), and the direct-mode settle re-enters do_iter_consume_step instead of pushing the result */
     int smc_magic = 0;                                  /* new Set(gen)/new Map(gen) recognition: 0 = Map, MAGIC_SET = Set (read at OP_call_constructor, consumed by do_setmap_consume_tramp) */
     int ta_classid = 0;                                 /* new TypedArray(gen) recognition: the TA class (read at OP_call_constructor, consumed by do_ta_consume_tramp) */
+    int ta_from = 0;                                    /* 1 = TypedArray.from(gen) (OP_call_method): new_target is this_val at call_argv[-2], not call_argv[-1] */
     JSAsyncFunctionState *gen_state = NULL;   /* the generator/async base state IF this activation is preemptible */
 
 #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_STEP
@@ -19361,6 +19364,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 if (tramp_can_call_objentries_consume(call_argv[-1], vc(call_argv), call_argc)) {   /* Object.fromEntries(gen) -> consume on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_objentries_consume_tramp;
+                }
+                if (tramp_can_call_ta_from_consume(call_argv[-1], call_argv[-2], vc(call_argv), call_argc, &ta_classid)) {   /* TypedArray.from(gen) -> collect on THIS chain */
+                    tramp_is_tail = 0; ta_from = 1; goto do_ta_consume_tramp;
                 }
                 if (tramp_is_function_call(call_argv[-1])) {   /* f.call(thisArg,...) -> resolve + dispatch f here */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_forward_call;
@@ -20053,10 +20059,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             /* new TypedArray(gen): collect the generator into a temp array on THIS chain (FROM sink), then create the
                typed array of class ta_classid from it at the finish. call_argv[-1]=new.target, [0]=the generator. */
             {
-                JSValueConst ntgt = call_argv[-1];
+                /* new TypedArray(gen): new_target at call_argv[-1]. TypedArray.from(gen): the ctor IS this_val at
+                   call_argv[-2] (ta_from). Either way it is the create target passed to the TA finish. */
+                JSValueConst ntgt = ta_from ? call_argv[-2] : call_argv[-1];
                 JSValueConst gen = call_argv[0];
                 JSIterConsume *s = js_mallocz(ctx, sizeof(*s));
                 JSValue tmp;
+                ta_from = 0;
                 if (unlikely(!s)) { JS_ThrowOutOfMemory(ctx); goto exception; }
                 tmp = JS_NewArray(ctx);
                 if (JS_IsException(tmp)) { js_free_rt(rt, s); goto exception; }
@@ -46072,6 +46081,30 @@ static bool tramp_can_call_ta_consume(JSValueConst func, JSValueConst *call_argv
     ip = JS_VALUE_GET_OBJ(call_argv[0]);
     if (ip->class_id != JS_CLASS_GENERATOR || !ip->u.generator_data) return false;
     *out_classid = fp->u.cfunc.magic;   /* JS_CLASS_UINT8C_ARRAY .. (nonzero) */
+    return true;
+}
+
+/* Route TypedArray.from(gen) (no mapfn) — js_typed_array_from's IterableToList drives the generator. this_val is the
+   TypedArray ctor (the class + create target); *out_classid = its magic. A mapfn (call_argc>1) is left to the normal
+   path (from applies it during element-set, a different finish). */
+static bool tramp_can_call_ta_from_consume(JSValueConst func, JSValueConst this_val, JSValueConst *call_argv, int call_argc, int *out_classid)
+{
+    JSObject *fp, *tp, *ip;
+    if (call_argc != 1) return false;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
+    fp = JS_VALUE_GET_OBJ(func);
+    if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
+    if (fp->u.cfunc.cproto != JS_CFUNC_generic) return false;
+    if (fp->u.cfunc.c_function.generic != js_typed_array_from) return false;
+    if (JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT) return false;
+    tp = JS_VALUE_GET_OBJ(this_val);   /* the TypedArray ctor supplies the class + create target */
+    if (tp->class_id != JS_CLASS_C_FUNCTION) return false;
+    if (tp->u.cfunc.cproto != JS_CFUNC_constructor_magic) return false;
+    if (tp->u.cfunc.c_function.constructor_magic != js_typed_array_constructor) return false;
+    if (JS_VALUE_GET_TAG(call_argv[0]) != JS_TAG_OBJECT) return false;
+    ip = JS_VALUE_GET_OBJ(call_argv[0]);
+    if (ip->class_id != JS_CLASS_GENERATOR || !ip->u.generator_data) return false;
+    *out_classid = tp->u.cfunc.magic;
     return true;
 }
 
