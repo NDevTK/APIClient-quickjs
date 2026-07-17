@@ -18403,7 +18403,7 @@ static bool tramp_can_call_objentries_consume(JSValueConst func, JSValueConst *c
 static JSValue js_typed_array_constructor_obj(JSContext *ctx, JSValueConst new_target, JSValueConst obj, int classid);
 static bool tramp_can_call_ta_consume(JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_classid);
 static JSValue js_typed_array_from(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
-static bool tramp_can_call_ta_from_consume(JSValueConst func, JSValueConst this_val, JSValueConst *call_argv, int call_argc, int *out_classid);
+static bool tramp_can_call_ta_from_consume(JSContext *ctx, JSValueConst func, JSValueConst this_val, JSValueConst *call_argv, int call_argc, int *out_classid);
 static void js_array_reduce_end(JSContext *ctx, struct JSArrayReduce *s, bool take_acc);
 static JSValue js_array_reduce(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int special);
 static bool tramp_can_call_array_reduce(JSValueConst func, int *out_special);
@@ -19365,7 +19365,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_objentries_consume(call_argv[-1], vc(call_argv), call_argc)) {   /* Object.fromEntries(gen) -> consume on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_objentries_consume_tramp;
                 }
-                if (tramp_can_call_ta_from_consume(call_argv[-1], call_argv[-2], vc(call_argv), call_argc, &ta_classid)) {   /* TypedArray.from(gen) -> collect on THIS chain */
+                if (tramp_can_call_ta_from_consume(ctx, call_argv[-1], call_argv[-2], vc(call_argv), call_argc, &ta_classid)) {   /* TypedArray.from(gen) -> collect on THIS chain */
                     tramp_is_tail = 0; ta_from = 1; goto do_ta_consume_tramp;
                 }
                 if (tramp_is_function_call(call_argv[-1])) {   /* f.call(thisArg,...) -> resolve + dispatch f here */
@@ -20061,7 +20061,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 /* new TypedArray(gen): new_target at call_argv[-1]. TypedArray.from(gen): the ctor IS this_val at
                    call_argv[-2] (ta_from). Either way it is the create target passed to the TA finish. */
-                JSValueConst ntgt = ta_from ? call_argv[-2] : call_argv[-1];
+                int is_from = ta_from;
+                JSValueConst ntgt = is_from ? call_argv[-2] : call_argv[-1];
                 JSValueConst gen = call_argv[0];
                 JSIterConsume *s = js_mallocz(ctx, sizeof(*s));
                 JSValue tmp;
@@ -20072,7 +20073,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->r = tmp;
                 s->iter = js_dup(gen);
                 s->adder = js_dup(ntgt);   /* the new_target/ctor, used at the finish to create the typed array */
-                s->mapfn = JS_UNDEFINED; s->mapfn_this = JS_UNDEFINED;
+                /* TypedArray.from(gen, mapfn, thisArg): carry the mapfn; it is applied at the finish (via
+                   js_typed_array_from on the collected array — spec map-after-create order), NOT during the collect. */
+                s->mapfn = (is_from && call_argc >= 2) ? js_dup(call_argv[1]) : JS_UNDEFINED;
+                s->mapfn_this = (is_from && call_argc >= 3) ? js_dup(call_argv[2]) : JS_UNDEFINED;
                 s->ta_classid = ta_classid;
                 s->k = 0;
                 s->sink = ITERCONS_FROM;
@@ -20128,20 +20132,28 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     uint8_t sink = s->sink;
                     int ta_cid = s->ta_classid;
                     JSValue ta_ntgt = s->adder;   /* new TypedArray(gen): the new_target/ctor; else the add/set method or UNDEFINED */
+                    JSValue ta_mapfn = s->mapfn, ta_mapfn_this = s->mapfn_this;   /* TypedArray.from(gen, mapfn): applied here */
                     JS_FreeValue(ctx, s->iter);
-                    JS_FreeValue(ctx, s->mapfn);   /* the map function (UNDEFINED unless Array.from(gen, fn)) */
-                    JS_FreeValue(ctx, s->mapfn_this);
                     js_free_rt(rt, s);
                     if (ta_cid != 0) {
-                        /* new TypedArray(gen): create the typed array of class ta_cid from the collected array (its
-                           native iteration does not drive). Reuses the ctor's object path — spec IterableToList
-                           done on the tramp, then the same buffer create + element copy. */
-                        JSValue ta = js_typed_array_constructor_obj(ctx, ta_ntgt, r, ta_cid);
+                        JSValue ta;
+                        if (JS_VALUE_GET_TAG(ta_mapfn) != JS_TAG_UNDEFINED) {
+                            /* TypedArray.from(gen, mapfn): reuse from on the collected array (native iteration, no
+                               drive) so the mapfn is applied AFTER the typed array is created, in spec order. */
+                            JSValueConst fargs[3] = { r, ta_mapfn, ta_mapfn_this };
+                            ta = js_typed_array_from(ctx, ta_ntgt, 3, fargs);
+                        } else {
+                            /* new TypedArray(gen) / TypedArray.from(gen): create from the collected array via the ctor
+                               object path — spec IterableToList done on the tramp, then buffer create + element copy. */
+                            ta = js_typed_array_constructor_obj(ctx, ta_ntgt, r, ta_cid);
+                        }
                         JS_FreeValue(ctx, ta_ntgt); JS_FreeValue(ctx, r);
+                        JS_FreeValue(ctx, ta_mapfn); JS_FreeValue(ctx, ta_mapfn_this);
                         if (JS_IsException(ta)) goto exception;   /* operands freed by the exception unwind */
                         r = ta;
                     } else {
                         JS_FreeValue(ctx, ta_ntgt);   /* the add/set method (UNDEFINED for plain FROM) */
+                        JS_FreeValue(ctx, ta_mapfn); JS_FreeValue(ctx, ta_mapfn_this);   /* Array.from's mapfn (applied during collect) */
                         if (sink == ITERCONS_FROM && JS_SetProperty(ctx, r, JS_ATOM_length, js_uint32((uint32_t)n)) < 0) {
                             JS_FreeValue(ctx, r); goto exception;   /* operands freed by the exception unwind */
                         }
@@ -45976,7 +45988,7 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
             if (JS_IsException(ret)) return -1;
             JS_FreeValue(ctx, ret);
         } else {   /* ITERCONS_FROM / ITERCONS_SPREAD: append at the running index */
-            if (s->sink == ITERCONS_FROM && JS_VALUE_GET_TAG(s->mapfn) != JS_TAG_UNDEFINED) {
+            if (s->sink == ITERCONS_FROM && s->ta_classid == 0 && JS_VALUE_GET_TAG(s->mapfn) != JS_TAG_UNDEFINED) {
                 /* Array.from(gen, mapfn): map each value by mapfn(value, index). A generator/async mapfn returns an
                    object/promise (no body-drive), so a direct call is faithful — only iter.next() rides the tramp. */
                 JSValueConst margs[2]; JSValue mapped;
@@ -46087,10 +46099,10 @@ static bool tramp_can_call_ta_consume(JSValueConst func, JSValueConst *call_argv
 /* Route TypedArray.from(gen) (no mapfn) — js_typed_array_from's IterableToList drives the generator. this_val is the
    TypedArray ctor (the class + create target); *out_classid = its magic. A mapfn (call_argc>1) is left to the normal
    path (from applies it during element-set, a different finish). */
-static bool tramp_can_call_ta_from_consume(JSValueConst func, JSValueConst this_val, JSValueConst *call_argv, int call_argc, int *out_classid)
+static bool tramp_can_call_ta_from_consume(JSContext *ctx, JSValueConst func, JSValueConst this_val, JSValueConst *call_argv, int call_argc, int *out_classid)
 {
     JSObject *fp, *tp, *ip;
-    if (call_argc != 1) return false;
+    if (call_argc < 1) return false;
     if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
     fp = JS_VALUE_GET_OBJ(func);
     if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
@@ -46104,6 +46116,9 @@ static bool tramp_can_call_ta_from_consume(JSValueConst func, JSValueConst this_
     if (JS_VALUE_GET_TAG(call_argv[0]) != JS_TAG_OBJECT) return false;
     ip = JS_VALUE_GET_OBJ(call_argv[0]);
     if (ip->class_id != JS_CLASS_GENERATOR || !ip->u.generator_data) return false;
+    /* a mapfn arg, if present and not undefined, MUST be callable — else from throws EARLY; leave that to the
+       normal path. When present it is applied at the finish (via js_typed_array_from), not during the collect. */
+    if (call_argc >= 2 && !JS_IsUndefined(call_argv[1]) && !JS_IsFunction(ctx, call_argv[1])) return false;
     *out_classid = tp->u.cfunc.magic;
     return true;
 }
