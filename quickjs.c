@@ -23279,6 +23279,21 @@ JSValue *JS_FlowNew(JSContext *ctx, const char *src, size_t len, int eval_flags)
    the caller as "suspended": its result is DELIVERED (the continuation resumes WITH the settled value, or
    RE-THROWS a rejection into it) and the flow continues, because a settled/opaque await is available at once.
    Only a PREEMPT (scheduler wants to interleave) or a generator YIELD returns 1. */
+/* Settle a flow's parked await from its awaited promise (frame.cur_sp[-1]). Returns 1 if settled (cur_sp[-1] now
+   holds the value, throw_flag set for a rejection), 0 if the promise is STILL pending (keep the flow parked). */
+static int flow_settle_await(JSContext *ctx, JSAsyncFunctionState *s) {
+    JSValue awaited = s->frame.cur_sp[-1];
+    JSPromiseStateEnum st = JS_PromiseState(ctx, awaited);
+    JSValue settled;
+    if (st == JS_PROMISE_PENDING) return 0;
+    if (st == JS_PROMISE_FULFILLED)          { settled = JS_PromiseResult(ctx, awaited); s->throw_flag = false; }
+    else if (st == JS_PROMISE_REJECTED)      { settled = JS_PromiseResult(ctx, awaited); s->throw_flag = true; }
+    else /* NOT_A_PROMISE */                 { settled = JS_DupValue(ctx, awaited); s->throw_flag = false; }
+    JS_FreeValue(ctx, awaited);
+    s->frame.cur_sp[-1] = settled;
+    return 1;
+}
+
 int JS_FlowResume(JSContext *ctx, JSValue *flow) {
     JSAsyncFunctionState *s = (JSAsyncFunctionState *)flow;
     for (;;) {
@@ -23294,22 +23309,11 @@ int JS_FlowResume(JSContext *ctx, JSValue *flow) {
         if (fr == FUNC_RET_PREEMPT || fr == FUNC_RET_YIELD || fr == FUNC_RET_YIELD_STAR)
             return 1;   /* suspended — the scheduler (preempt) or generator consumer resumes it */
         if (fr == FUNC_RET_AWAIT) {
-            /* OP_await left the awaited operand at cur_sp[-1]. Settle it and deliver the result. */
-            JSValue awaited = s->frame.cur_sp[-1];
-            JSPromiseStateEnum st = JS_PromiseState(ctx, awaited);
-            JSValue settled;
-            if (st == JS_PROMISE_FULFILLED)      { settled = JS_PromiseResult(ctx, awaited); s->throw_flag = false; }
-            else if (st == JS_PROMISE_REJECTED)  { settled = JS_PromiseResult(ctx, awaited); s->throw_flag = true; }
-            else if (st == JS_PROMISE_NOT_A_PROMISE) { settled = JS_DupValue(ctx, awaited); s->throw_flag = false; }
-            else {
-                /* PENDING: a real async result not yet available (e.g. a live fetch). Parking this flow until
-                   the host provides the value is the fetch-await integration — not yet built. Fail LOUD
-                   rather than silently deliver a wrong value (the exact silent-failure the design forbids). */
-                DFAIL("JS_FlowResume: await on PENDING promise — fetch-await parking not built");
-                settled = JS_UNDEFINED; s->throw_flag = false;
-            }
-            JS_FreeValue(ctx, awaited);
-            s->frame.cur_sp[-1] = settled;
+            /* OP_await left the awaited operand at cur_sp[-1]. Settle it + continue. A BASE flow is a CLASSIC
+               script (no top-level await), so a base-level await is only ever an already-settled promise; a
+               genuinely-pending one here is a should-never-happen (a live-fetch await lives in a NESTED async body,
+               which suspends via a reaction + the flow_step fetch-drain, never this base path). */
+            if (!flow_settle_await(ctx, s)) DFAIL("JS_FlowResume: base-flow await on a pending promise (impossible for a classic script)");
             continue;   /* re-resume: the continuation reads the settled value from cur_sp[-1] */
         }
         JS_FreeValue(ctx, r);
