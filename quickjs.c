@@ -18673,6 +18673,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     int tramp_gen_magic = 0;                            /* set before goto do_generator_tramp */
     int tramp_gen_forof = 1;                            /* <0 = for-of iterator stack offset (always -3-.. ); 1 = direct .next() (no valid offset is positive) */
     int tramp_gen_iternext = 0;                         /* 1 = OP_iterator_next drive (yield* / destructuring): iterator at sp[-4], arg at sp[-1], result OBJECT replaces sp[-1] */
+    int tramp_gen_close = 0;                            /* 1 = OP_iterator_close drive (.return() on an unconsumed generator iterator at sp[-1]): body runs finally on the tramp, result DISCARDED */
     JSAsyncFunctionState *gen_state = NULL;   /* the generator/async base state IF this activation is preemptible */
 
 #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_STEP
@@ -20003,15 +20004,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                receiver + method + args sit on the caller stack at [call_argv-2 .. call_argv+call_argc). */
             {
                 bool iternext = tramp_gen_iternext; tramp_gen_iternext = 0;   /* OP_iterator_next drive (yield-star + destructuring) */
+                bool close = tramp_gen_close; tramp_gen_close = 0;            /* OP_iterator_close drive (.return()) */
                 bool forof = (tramp_gen_forof < 0);   /* a real for-of offset is always negative (-3-..) */
                 int fofoff = tramp_gen_forof;
                 tramp_gen_forof = 1;   /* reset to the direct-call sentinel */
-                /* iternext: iterator at sp[-4], resume arg at sp[-1] (OP_iterator_next stack shape). for-of:
-                   iterator at sp[fofoff]. direct: receiver at call_argv[-2], arg at call_argv[0]. */
-                JSValueConst gthis = iternext ? sp[-4] : (forof ? sp[fofoff] : call_argv[-2]);
+                /* close: generator iterator at sp[-1], .return() with no arg, result discarded. iternext: iterator at
+                   sp[-4], resume arg at sp[-1]. for-of: iterator at sp[fofoff]. direct: receiver at call_argv[-2]. */
+                JSValueConst gthis = close ? sp[-1] : (iternext ? sp[-4] : (forof ? sp[fofoff] : call_argv[-2]));
                 JSGeneratorData *gs = JS_VALUE_GET_OBJ(gthis)->u.generator_data;
                 int gmagic = tramp_gen_magic;
-                JSValueConst garg = iternext ? sp[-1] : (forof ? JS_UNDEFINED : ((call_argc >= 1) ? call_argv[0] : JS_UNDEFINED));
+                JSValueConst garg = (close || iternext) ? (iternext ? sp[-1] : JS_UNDEFINED)
+                                                        : (forof ? JS_UNDEFINED : ((call_argc >= 1) ? call_argv[0] : JS_UNDEFINED));
                 JSStackFrame *gsf = &gs->func_state.frame;
                 TrampFrame *gtf; JSObject *gfp; JSFunctionBytecode *gb;
                 bool run_body = true, do_throw = false;
@@ -20038,6 +20041,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JSValue gv = (!do_throw && gmagic == GEN_MAGIC_RETURN) ? js_dup(garg) : JS_UNDEFINED;
                     JSValue thr = do_throw ? js_dup(garg) : JS_UNDEFINED;
                     JSValue giter;
+                    if (close) {   /* OP_iterator_close on a completed/not-started generator: no body run; discard + pop */
+                        JS_FreeValue(ctx, gv); JS_FreeValue(ctx, thr);
+                        JS_FreeValue(ctx, sp[-1]);   /* the generator iterator */
+                        sp--;
+                        BREAK;
+                    }
                     if (iternext) {   /* OP_iterator_next: the iterator-result OBJECT replaces the resume arg at sp[-1] */
                         if (do_throw) { JS_FreeValue(ctx, gv); JS_Throw(ctx, thr); goto exception; }
                         giter = js_create_iterator_result(ctx, gv, true);
@@ -20062,7 +20071,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 gs->state = JS_GENERATOR_STATE_EXECUTING;
                 gtf = js_malloc_rt(rt, sizeof(TrampFrame));
                 if (unlikely(!gtf)) { JS_ThrowOutOfMemory(ctx); goto exception; }
-                if (iternext) {
+                if (close) {
+                    /* OP_iterator_close (.return()): HOLD the generator across its finally run (like the direct
+                       drive), then the settle discards the result and pops sp[-1]. is_tail=3 marks close; a concolic
+                       fork in the finally recovers the generator from async_promise (an object), like the direct path. */
+                    gtf->async_promise = js_dup(gthis);
+                    JS_FreeValue(ctx, sp[-1]);   /* free the stack operand; async_promise holds the drive ref */
+                    gtf->caller_sp = sp - 1;      /* the close consumes the iterator slot */
+                    gtf->is_tail = 3;
+                    gtf->forof_off = 1;
+                } else if (iternext) {
                     /* OP_iterator_next (yield* / destructuring): the iterator STAYS on the caller stack at sp[-4]
                        (no ref to hold). At settle the iterator-result OBJECT replaces sp[-1], sp unchanged. is_tail=2
                        marks iternext mode; forof_off=-4 records the iterator slot so a concolic body fork recovers
@@ -20155,7 +20173,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 arg_allocated_size = gtf->caller_arg_allocated_size;
                 pc = sf->cur_pc; sp = gtf->caller_sp;
                 js_free_rt(rt, gtf);
-                JS_FreeValue(ctx, ghold);   /* direct: drop the body-run ref; for-of: UNDEFINED (iterator on stack) */
+                JS_FreeValue(ctx, ghold);   /* direct/close: drop the body-run ref; for-of/iternext: UNDEFINED (iterator on stack) */
+                if (gmode == 3) {   /* OP_iterator_close: .return() ran (finally); its result is DISCARDED, sp = caller_sp (iterator popped) */
+                    JS_FreeValue(ctx, value);
+                    BREAK;
+                }
                 if (forof) {
                     /* OP_for_of_next protocol: value at sp[0], done at sp[1], then sp += 2. A yield* (gdone==2)
                        delivered an iterator-result object; unpack it into (value, done). */
@@ -21242,6 +21264,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             sp--;
             if (!JS_IsUndefined(sp[-1])) {
                 sf->cur_pc = pc;
+                /* a GENERATOR iterator's .return() (destructuring early-close, break out of for-of) runs its finally
+                   handling on THIS chain (do_generator_tramp close mode) so a finally loop preempts the base flow —
+                   never the C-recursion JS_IteratorClose -> JS_Call -> js_generator_next drive-to-completion. */
+                if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) {
+                    JSObject *ip = JS_VALUE_GET_OBJ(sp[-1]);
+                    if (ip->class_id == JS_CLASS_GENERATOR && ip->u.generator_data) {
+                        tramp_gen_magic = GEN_MAGIC_RETURN; tramp_gen_close = 1; goto do_generator_tramp;
+                    }
+                }
                 if (JS_IteratorClose(ctx, sp[-1], false))
                     goto exception;
                 JS_FreeValue(ctx, sp[-1]);
