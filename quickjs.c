@@ -18223,6 +18223,10 @@ typedef struct TrampFrame {
                                   an EXPLICIT DFS stack (no C recursion) and calls the reviver on this chain at
                                   each node (post-order), so a reviver body loop preempts. do_return re-enters
                                   js_json_reviver_step with the reviver's result. */
+#define CONT_PROMISE_ALL   9   /* cont_state = JSPromiseAll: Promise.all(gen) drives the generator's .next() on the
+                                  chain, per element wrapping Promise.resolve(value).then(resolve_element). Reuses the
+                                  generator drive; the settle re-enters do_promise_all_step. No promise-state
+                                  fork-clone yet — a fork mid-consume DFAILs at the clone (guarded), never silent. */
 #define CONT_ITER_CONSUME  8   /* cont_state = JSIterConsume: a builtin that CONSUMES an iterator in a loop
                                   (Array.from) drives the iterator's .next() on this chain — when the iterator is a
                                   GENERATOR its body runs on the chain (suspend/resume at any depth), never the
@@ -18402,6 +18406,26 @@ static JSValue js_object_fromEntries(JSContext *ctx, JSValueConst this_val, int 
 static bool tramp_can_call_objentries_consume(JSValueConst func, JSValueConst *call_argv, int call_argc);
 static JSValue js_typed_array_constructor_obj(JSContext *ctx, JSValueConst new_target, JSValueConst obj, int classid);
 static bool tramp_can_call_ta_consume(JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_classid);
+/* Promise.all(gen): drive the generator's .next() on the tramp chain, wrapping each yielded value in
+   Promise.resolve(v).then(resolve_element) as js_promise_all's own loop does. iter/next drive the generator;
+   result_promise is the returned aggregate; the other fields are the spec's per-call accumulation state. */
+typedef struct JSPromiseAll {
+    JSValue iter, next;          /* the generator being consumed (owned) + its .next method */
+    JSValue this_val;            /* the Promise constructor (for %Promise%.resolve) (owned) */
+    JSValue promise_resolve;     /* this_val.resolve (owned) */
+    JSValue result_promise;      /* the aggregate promise returned to the caller (owned) */
+    JSValue resolving_funcs[2];  /* result_promise's [resolve, reject] (owned) */
+    JSValue values;              /* the result values array (owned) */
+    JSValue resolve_element_env; /* [remainingElementsCount] holder (owned) */
+    int index;                   /* next element index */
+    int orig_cfirst, orig_cargc; uint8_t orig_is_tail;   /* the ORIGINAL OP_call_method operand shape */
+} JSPromiseAll;
+static int js_promise_all_step(JSContext *ctx, struct JSPromiseAll *s, JSValue res);
+static void js_promise_all_end(JSContext *ctx, struct JSPromiseAll *s);
+static bool tramp_can_call_promise_all(JSValueConst func, JSValueConst *call_argv, int call_argc);
+static JSValue js_promise_all(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
+static JSValue js_promise_all_resolve_element(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValueConst *func_data);
+static __exception int remainingElementsCount_add(JSContext *ctx, JSValueConst resolve_element_env, int addend);
 static JSValue js_typed_array_from(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 static bool tramp_can_call_ta_from_consume(JSContext *ctx, JSValueConst func, JSValueConst this_val, JSValueConst *call_argv, int call_argc, int *out_classid);
 static void js_array_reduce_end(JSContext *ctx, struct JSArrayReduce *s, bool take_acc);
@@ -18724,7 +18748,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     int tramp_gen_close = 0;                            /* 1 = OP_iterator_close drive (.return() on an unconsumed generator iterator at sp[-1]): body runs finally on the tramp, result DISCARDED */
     int tramp_gen_close_exc = 0;                        /* 1 = the close is happening DURING exception unwind (JS_IteratorClose(iter,true)): after the finally runs, restore the in-flight exception and continue unwinding (goto exception), never overwrite it */
     int tramp_gen_create_forof = 0;                     /* 1 = this do_generator_create_tramp is a for-of iterator-getter (OP_for_of_start): at settle, finish the enum_rec ([iterator, next, catch_offset]) instead of pushing the bare object */
-    int tramp_gen_cont_consume = 0;                     /* 1 = this do_generator_tramp drive is an iterator-CONSUMER (Array.from) driving s->iter.next(): gthis comes from tramp_cont_state->iter, caller_sp stays put (nothing on the caller stack), and the direct-mode settle re-enters do_iter_consume_step instead of pushing the result */
+    int tramp_gen_cont_consume = 0;                     /* 1 = this do_generator_tramp drive is a CONSUMER (Array.from / Promise.all) driving a generator held in the consumer state; caller_sp stays put; the direct-mode settle re-enters the consumer's step (by cont_kind) instead of pushing the result */
+    JSValueConst tramp_gen_cont_iter = JS_UNDEFINED;    /* the generator the consumer step wants driven (set before goto do_generator_tramp) */
     int smc_magic = 0;                                  /* new Set(gen)/new Map(gen) recognition: 0 = Map, MAGIC_SET = Set (read at OP_call_constructor, consumed by do_setmap_consume_tramp) */
     int ta_classid = 0;                                 /* new TypedArray(gen) recognition: the TA class (read at OP_call_constructor, consumed by do_ta_consume_tramp) */
     int ta_from = 0;                                    /* 1 = TypedArray.from(gen) (OP_call_method): new_target is this_val at call_argv[-2], not call_argv[-1] */
@@ -19367,6 +19392,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 if (tramp_can_call_ta_from_consume(ctx, call_argv[-1], call_argv[-2], vc(call_argv), call_argc, &ta_classid)) {   /* TypedArray.from(gen) -> collect on THIS chain */
                     tramp_is_tail = 0; ta_from = 1; goto do_ta_consume_tramp;
+                }
+                if (tramp_can_call_promise_all(call_argv[-1], vc(call_argv), call_argc)) {   /* Promise.all(gen) -> consume on THIS chain */
+                    tramp_is_tail = (opcode == OP_tail_call_method); goto do_promise_all_consume_tramp;
                 }
                 if (tramp_is_function_call(call_argv[-1])) {   /* f.call(thisArg,...) -> resolve + dispatch f here */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_forward_call;
@@ -20167,7 +20195,77 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 /* CALL: drive s->iter.next() — a generator, so its body runs on this chain (do_generator_tramp
                    cont-consume mode); the generator settle re-enters this step with the {value,done} result. */
-                tramp_cont_state = s; tramp_cont_kind = CONT_ITER_CONSUME;
+                tramp_cont_state = s; tramp_cont_kind = CONT_ITER_CONSUME; tramp_gen_cont_iter = s->iter;
+                tramp_gen_cont_consume = 1; tramp_gen_magic = GEN_MAGIC_NEXT;
+                goto do_generator_tramp;
+            }
+
+        do_promise_all_consume_tramp:
+            /* Promise.all(gen): create the aggregate promise + accumulation state, then drive the generator's
+               .next() on THIS chain. call_argv[-2] = the Promise ctor (this_val), call_argv[0] = the generator. */
+            {
+                JSValueConst thisv = call_argv[-2];
+                JSValueConst gen = call_argv[0];
+                JSPromiseAll *s = js_mallocz(ctx, sizeof(*s));
+                JSValue rp;
+                if (unlikely(!s)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                rp = js_new_promise_capability(ctx, s->resolving_funcs, thisv);   /* result_promise + [resolve,reject] */
+                if (JS_IsException(rp)) { js_free_rt(rt, s); goto exception; }
+                s->result_promise = rp;
+                s->this_val = js_dup(thisv);
+                s->promise_resolve = JS_GetProperty(ctx, thisv, JS_ATOM_resolve);
+                s->iter = js_dup(gen);
+                s->values = JS_NewArray(ctx);
+                s->resolve_element_env = JS_NewArray(ctx);
+                s->index = 0;
+                s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
+                if (JS_IsException(s->promise_resolve) || !JS_IsFunction(ctx, s->promise_resolve)
+                    || JS_IsException(s->values) || JS_IsException(s->resolve_element_env)
+                    || JS_IsException(s->next = JS_GetProperty(ctx, gen, JS_ATOM_next))
+                    || JS_DefinePropertyValueUint32(ctx, s->resolve_element_env, 0, js_int32(1),
+                                                    JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE | JS_PROP_WRITABLE) < 0) {
+                    /* setup failed: reject the aggregate promise with the pending error and yield it */
+                    JSValue err = JS_GetException(ctx), rr;
+                    rr = JS_Call(ctx, s->resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
+                    JS_FreeValue(ctx, err); JS_FreeValue(ctx, rr);
+                    { JSValue r = js_dup(s->result_promise); int cf = s->orig_cfirst, cg = s->orig_cargc; uint8_t it = s->orig_is_tail;
+                      js_promise_all_end(ctx, s); js_free_rt(rt, s);
+                      JSValue *cv = sp - cg; for (i = cf; i < cg; i++) JS_FreeValue(ctx, cv[i]); sp += cf - cg;
+                      if (it) { ret_val = r; goto do_return; } *sp++ = r; BREAK; }
+                }
+                cont_st = s; cont_kind_cur = CONT_PROMISE_ALL;
+                ret_val = JS_UNINITIALIZED;
+                goto do_promise_all_step;
+            }
+
+        do_promise_all_step:
+            /* ret_val = the previous .next() result {value,done} (UNINITIALIZED on the first step). Feed it in, then
+               either wrap the next value into Promise.resolve(v).then(resolve_element) and drive the next .next(), or
+               finalize (decrement remainingElementsCount; resolve with `values` when it hits 0) and yield the promise. */
+            {
+                JSPromiseAll *s = (JSPromiseAll *)cont_st;
+                int st = js_promise_all_step(ctx, s, ret_val);
+                if (unlikely(st < 0)) {   /* an error: reject the aggregate, yield it (do not throw out of Promise.all) */
+                    JSValue err = JS_GetException(ctx), rr;
+                    JS_IteratorClose(ctx, s->iter, true);
+                    rr = JS_Call(ctx, s->resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
+                    JS_FreeValue(ctx, err); JS_FreeValue(ctx, rr);
+                    st = 0;   /* fall through to DONE, yielding the (now rejected) promise */
+                }
+                if (st == 0) {   /* DONE: pop the ORIGINAL operands, yield the aggregate promise */
+                    JSValue r = js_dup(s->result_promise);
+                    int cfirst = s->orig_cfirst, cargc = s->orig_cargc;
+                    uint8_t itail = s->orig_is_tail;
+                    js_promise_all_end(ctx, s); js_free_rt(rt, s);
+                    JSValue *cargv = sp - cargc;
+                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
+                    sp += cfirst - cargc;
+                    if (itail) { ret_val = r; goto do_return; }
+                    *sp++ = r;
+                    BREAK;
+                }
+                /* CALL: drive s->iter.next() on this chain; the settle re-enters this step. */
+                tramp_cont_state = s; tramp_cont_kind = CONT_PROMISE_ALL; tramp_gen_cont_iter = s->iter;
                 tramp_gen_cont_consume = 1; tramp_gen_magic = GEN_MAGIC_NEXT;
                 goto do_generator_tramp;
             }
@@ -20281,9 +20379,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 bool iternext = tramp_gen_iternext; tramp_gen_iternext = 0;   /* OP_iterator_next drive (yield-star + destructuring) */
                 bool close = tramp_gen_close; tramp_gen_close = 0;            /* OP_iterator_close drive (.return()) */
                 bool close_exc = tramp_gen_close_exc; tramp_gen_close_exc = 0; /* close mid-exception-unwind */
-                bool cont_consume = tramp_gen_cont_consume; tramp_gen_cont_consume = 0;   /* iterator-consumer (Array.from) drive */
-                JSIterConsume *cc_s = cont_consume ? (JSIterConsume *)tramp_cont_state : NULL;
-                tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;   /* consumed into cc_s + the frame's cont fields; never leak onto an inner call the generator body makes (else its do_return misdispatches to do_array_iter_step) */
+                bool cont_consume = tramp_gen_cont_consume; tramp_gen_cont_consume = 0;   /* consumer drive (Array.from / Promise.all): state carries the generator, settle re-enters the step */
+                void *cc_state = cont_consume ? tramp_cont_state : NULL;   /* the consumer state (JSIterConsume or JSPromiseAll) */
+                uint8_t cc_kind = cont_consume ? tramp_cont_kind : CONT_NONE;   /* CONT_ITER_CONSUME / CONT_PROMISE_ALL */
+                JSValueConst cc_iter = cont_consume ? tramp_gen_cont_iter : JS_UNDEFINED;   /* the generator to drive (from the step) */
+                tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;   /* consumed into cc_* + the frame's cont fields; never leak onto an inner call the generator body makes (else its do_return misdispatches) */
                 JSValue close_exc_e = JS_UNINITIALIZED;   /* the saved in-flight exception (close_exc only) */
                 if (close_exc) { close_exc_e = rt->current_exception; rt->current_exception = JS_UNINITIALIZED; }
                 bool forof = (tramp_gen_forof < 0);   /* a real for-of offset is always negative (-3-..) */
@@ -20292,7 +20392,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 /* close: generator iterator at sp[-1], .return() with no arg, result discarded. iternext: iterator at
                    sp[-4], resume arg at sp[-1]. for-of: iterator at sp[fofoff]. cont-consume: generator in the state.
                    direct: receiver at call_argv[-2]. */
-                JSValueConst gthis = cont_consume ? cc_s->iter
+                JSValueConst gthis = cont_consume ? cc_iter
                                    : (close ? sp[-1] : (iternext ? sp[-4] : (forof ? sp[fofoff] : call_argv[-2])));
                 JSGeneratorData *gs = JS_VALUE_GET_OBJ(gthis)->u.generator_data;
                 int gmagic = tramp_gen_magic;
@@ -20341,12 +20441,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         JS_FreeValue(ctx, sp[-1]); sp[-1] = giter;
                         BREAK;
                     }
-                    if (cont_consume) {   /* Array.from consumer: completed generator -> {undefined,true}; re-enter the step (caller stack untouched) */
+                    if (cont_consume) {   /* consumer: completed generator -> {undefined,true}; re-enter the step (caller stack untouched) */
                         if (do_throw) { JS_FreeValue(ctx, gv); JS_Throw(ctx, thr); goto exception; }
                         giter = js_create_iterator_result(ctx, gv, true);
                         if (JS_IsException(giter)) goto exception;
-                        cont_st = cc_s; cont_kind_cur = CONT_ITER_CONSUME;
+                        cont_st = cc_state; cont_kind_cur = cc_kind;
                         ret_val = giter;
+                        if (cc_kind == CONT_PROMISE_ALL) goto do_promise_all_step;
                         goto do_iter_consume_step;
                     }
                     if (forof) {
@@ -20428,8 +20529,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 gtf->call_first = -2; gtf->call_argc = 0;
                 gtf->async_data = NULL;   /* async_promise holds ghold (direct) or UNDEFINED (for-of) */
                 gtf->gen_data = gs; gtf->gen_magic = (uint8_t)gmagic;
-                gtf->cont_state = cont_consume ? (void *)cc_s : NULL;   /* a consumer drive carries its state so the settle re-enters the step */
-                gtf->cont_kind = cont_consume ? CONT_ITER_CONSUME : CONT_NONE;
+                gtf->cont_state = cont_consume ? cc_state : NULL;   /* a consumer drive carries its state so the settle re-enters the step */
+                gtf->cont_kind = cont_consume ? cc_kind : CONT_NONE;
                 gtf->b = NULL; gtf->local_buf = NULL;   /* the body frame owns its buffers via gs->func_state */
                 gfp = JS_VALUE_GET_OBJ(gsf->cur_func);
                 gb = gfp->u.func.function_bytecode;
@@ -20523,9 +20624,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 giter = (gdone == 2) ? value : js_create_iterator_result(ctx, value, gdone);
                 if (JS_IsException(giter)) goto exception;
-                if (gck == CONT_ITER_CONSUME) {   /* Array.from consumer drive: feed {value,done} back to its step (caller stack untouched: sp == caller_sp) */
-                    cont_st = gcont; cont_kind_cur = CONT_ITER_CONSUME;
+                if (gck == CONT_ITER_CONSUME || gck == CONT_PROMISE_ALL) {   /* consumer drive: feed {value,done} back to its step (caller stack untouched: sp == caller_sp) */
+                    cont_st = gcont; cont_kind_cur = gck;
                     ret_val = giter;
+                    if (gck == CONT_PROMISE_ALL) goto do_promise_all_step;
                     goto do_iter_consume_step;
                 }
                 *sp++ = giter;
@@ -23361,10 +23463,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JS_FreeValueRT(rt, ctx->error_back_trace);
             ctx->error_back_trace = JS_UNDEFINED;
         }
+        JSPromiseAll *pa_throw = (gtf->cont_kind == CONT_PROMISE_ALL) ? (JSPromiseAll *)gtf->cont_state : NULL;
         if (gtf->cont_kind == CONT_ITER_CONSUME) {   /* Array.from consumer: the generator body threw -> abandon the half-built array (its own ref to the generator is dropped here; the drive ref is dropped below) */
             js_iter_consume_end(ctx, (struct JSIterConsume *)gtf->cont_state);
             js_free_rt(rt, gtf->cont_state);
         }
+        /* CONT_PROMISE_ALL: handled AFTER the frame pop — the throw REJECTS the aggregate promise (not propagates). */
         sf->cur_sp = sp;   /* the body frame is "running" (cur_sp NULL); restore it so async_func_free can tear down */
         free_generator_stack_rt(rt, gtf->gen_data);
         if (creating) js_free_rt(rt, gtf->gen_data);   /* not yet owned by a generator object -> free the orphan */
@@ -23380,6 +23484,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         arg_allocated_size = gtf->caller_arg_allocated_size;
         pc = sf->cur_pc; sp = gtf->caller_sp;
         js_free_rt(rt, gtf);
+        if (pa_throw) {
+            /* Promise.all(gen): a throw from the consumed generator REJECTS the aggregate promise and yields it to
+               the caller (js_promise_all's fail_reject), never propagates. sp is now the caller's stack with the
+               original Promise.all operands; pop them and push the rejected aggregate. */
+            JSValue err = JS_GetException(ctx), rr;
+            JSValue r = js_dup(pa_throw->result_promise);
+            int cfirst = pa_throw->orig_cfirst, cargc = pa_throw->orig_cargc; uint8_t itail = pa_throw->orig_is_tail;
+            JSValue *cargv;
+            JS_IteratorClose(ctx, pa_throw->iter, true);
+            rr = JS_Call(ctx, pa_throw->resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
+            JS_FreeValue(ctx, err); JS_FreeValue(ctx, rr);
+            js_promise_all_end(ctx, pa_throw); js_free_rt(rt, pa_throw);
+            cargv = sp - cargc;
+            for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
+            sp += cfirst - cargc;
+            if (itail) { ret_val = r; goto do_return; }
+            *sp++ = r;
+            BREAK;
+        }
         goto exception;   /* re-raise the pending exception in the caller */
     }
     /* uncaught while BINDING an async generator's params (the object does not exist yet). This frame's buffers
@@ -59382,6 +59505,90 @@ static JSValue js_promise_all(JSContext *ctx, JSValueConst this_val,
     JS_FreeValue(ctx, result_promise);
     result_promise = JS_EXCEPTION;
     goto done;
+}
+
+/* Advance Promise.all(gen): `res` = the previous .next() result {value,done} (UNINITIALIZED on the first step).
+   Returns 1 = drive the next .next(), 0 = DONE (s->result_promise settled/settling), -1 = exception. Consumes res.
+   Mirrors js_promise_all's per-element loop for the `all` variant: Promise.resolve(v).then(resolve_element). */
+static int js_promise_all_step(JSContext *ctx, JSPromiseAll *s, JSValue res)
+{
+    JSValue value, next_promise, resolve_element, rr;
+    JSValueConst resolve_element_data[5], then_args[2];
+    int done;
+    if (JS_VALUE_GET_TAG(res) == JS_TAG_UNINITIALIZED)
+        return 1;   /* first step: nothing to process, drive .next() */
+    {
+        JSValue done_val = JS_GetProperty(ctx, res, JS_ATOM_done);
+        if (JS_IsException(done_val)) { JS_FreeValue(ctx, res); return -1; }
+        done = JS_ToBoolFree(ctx, done_val);
+    }
+    if (done) {
+        int is_zero;
+        JS_FreeValue(ctx, res);
+        is_zero = remainingElementsCount_add(ctx, s->resolve_element_env, -1);
+        if (is_zero < 0) return -1;
+        if (is_zero) {
+            rr = JS_Call(ctx, s->resolving_funcs[0], JS_UNDEFINED, 1, vc(&s->values));
+            if (JS_IsException(rr)) return -1;
+            JS_FreeValue(ctx, rr);
+        }
+        return 0;   /* DONE */
+    }
+    value = JS_GetProperty(ctx, res, JS_ATOM_value);
+    JS_FreeValue(ctx, res);
+    if (JS_IsException(value)) return -1;
+    next_promise = JS_Call(ctx, s->promise_resolve, s->this_val, 1, vc(&value));
+    JS_FreeValue(ctx, value);
+    if (JS_IsException(next_promise)) return -1;
+    resolve_element_data[0] = JS_FALSE;
+    resolve_element_data[1] = js_int32(s->index);
+    resolve_element_data[2] = s->values;
+    resolve_element_data[3] = s->resolving_funcs[0];   /* `all`: is_promise_any==0 -> the resolve func */
+    resolve_element_data[4] = s->resolve_element_env;
+    resolve_element = JS_NewCFunctionData(ctx, js_promise_all_resolve_element, 1,
+                                          PROMISE_MAGIC_all, 5, resolve_element_data);
+    if (JS_IsException(resolve_element)) { JS_FreeValue(ctx, next_promise); return -1; }
+    if (remainingElementsCount_add(ctx, s->resolve_element_env, 1) < 0) {
+        JS_FreeValue(ctx, next_promise); JS_FreeValue(ctx, resolve_element); return -1;
+    }
+    then_args[0] = resolve_element;
+    then_args[1] = s->resolving_funcs[1];   /* `all`: reject with the aggregate's reject */
+    rr = JS_InvokeFree(ctx, next_promise, JS_ATOM_then, 2, then_args);
+    JS_FreeValue(ctx, resolve_element);
+    if (JS_IsException(rr)) return -1;
+    JS_FreeValue(ctx, rr);
+    s->index++;
+    return 1;   /* drive the next .next() */
+}
+
+/* Free a Promise.all(gen) state's owned fields (result_promise moved out by the caller before this on the happy path). */
+static void js_promise_all_end(JSContext *ctx, JSPromiseAll *s)
+{
+    JS_FreeValue(ctx, s->iter);
+    JS_FreeValue(ctx, s->next);
+    JS_FreeValue(ctx, s->this_val);
+    JS_FreeValue(ctx, s->promise_resolve);
+    JS_FreeValue(ctx, s->result_promise);
+    JS_FreeValue(ctx, s->resolving_funcs[0]);
+    JS_FreeValue(ctx, s->resolving_funcs[1]);
+    JS_FreeValue(ctx, s->values);
+    JS_FreeValue(ctx, s->resolve_element_env);
+}
+
+/* Route Promise.all(gen) ONLY (magic all; allSettled/any/race stay on the normal path) with a direct-generator arg. */
+static bool tramp_can_call_promise_all(JSValueConst func, JSValueConst *call_argv, int call_argc)
+{
+    JSObject *fp, *ip;
+    if (call_argc != 1) return false;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
+    fp = JS_VALUE_GET_OBJ(func);
+    if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
+    if (fp->u.cfunc.cproto != JS_CFUNC_generic_magic) return false;
+    if (fp->u.cfunc.c_function.generic_magic != js_promise_all) return false;
+    if (fp->u.cfunc.magic != PROMISE_MAGIC_all) return false;
+    if (JS_VALUE_GET_TAG(call_argv[0]) != JS_TAG_OBJECT) return false;
+    ip = JS_VALUE_GET_OBJ(call_argv[0]);
+    return ip->class_id == JS_CLASS_GENERATOR && ip->u.generator_data != NULL;
 }
 
 static JSValue js_promise_race(JSContext *ctx, JSValueConst this_val,
