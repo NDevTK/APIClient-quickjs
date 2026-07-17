@@ -1131,10 +1131,14 @@ struct JSObject {
     uint8_t is_uncatchable_error : 1; /* if true, error is not catchable */
     uint8_t tmp_mark : 1; /* used in JS_WriteObjectRec() */
     uint8_t is_HTMLDDA : 1; /* specific annex B IsHtmlDDA behavior */
-    uint8_t flow_local : 1; /* APIClient forced-exec: created DURING a flow run (not baseline). Writes to a
-                               baseline object (flow_local=0) are COW-captured + reverted between flows; a
-                               flow-local object is discarded with its run, so its writes are never captured. */
     uint16_t class_id; /* see JS_CLASS_x */
+    /* APIClient forced-exec: the FORK GENERATION at which this object was created (0 = baseline, pre-flow). An
+       object is SHARED with a snapshot-forked sibling iff it existed at that flow's fork (flow_gen <= the flow's
+       fork_gen); an object created AFTER the fork (flow_gen > fork_gen) is flow-PRIVATE and its writes are never
+       captured — the load-bearing invariant that keeps a per-flow delta O(shared-state-touched), not O(transients).
+       A single "have I forked" bit could not tell a pre-fork shared object from a post-fork private one, so it
+       over-captured every post-fork transient; the generation distinguishes them. */
+    uint32_t flow_gen;
     /* byte offsets: 16/24 */
     JSShape *shape; /* prototype and property names + flag */
     JSProperty *prop; /* array of properties */
@@ -6164,6 +6168,16 @@ static __maybe_unused void JS_DumpShapes(JSRuntime *rt)
 /* 'props[]' is used to initialized the object properties. The number
    of elements depends on the shape. */
 uint8_t g_flow_local_mark = 0;   /* forced-exec: stamps new objects baseline(0)/flow-local(1); see JS_SetFlowLocalMark */
+/* forced-exec: the current FORK GENERATION stamped onto new objects. 0 during setup (baseline). Set to 1 when
+   flows start (JS_SetFlowLocalMark(1)); INCREMENTED at every snapshot fork (JS_FlowBumpGen) so an object created
+   after a fork gets a strictly-higher generation than the fork's — marking it flow-private. Monotonic while flows
+   run (the mark only returns to 0 at final teardown). */
+uint32_t g_flow_gen = 0;
+uint32_t JS_FlowGen(void) { return g_flow_gen; }
+uint32_t JS_FlowBumpGen(void) { return ++g_flow_gen; }
+uint32_t JS_ObjFlowGen(JSValueConst obj) {
+    return JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT ? JS_VALUE_GET_OBJ(obj)->flow_gen : 0;
+}
 /* forced-exec TIME-TRAVEL record boundary — the ONE structured hook set the interpreter calls before it mutates
    shared heap state (see JSTimeTravelHooks in quickjs.h). g_time_travel.prop_write covers a property write (and,
    via the host's absent-slot recording, a creation); .cell_write covers a closure-cell (JSVarRef) write, which
@@ -6190,7 +6204,7 @@ static inline void cow_capture_append(JSContext *ctx, JSValueConst obj, JSAtom i
 /* Is this object flow-local (created by the running flow post-baseline)? The host's COW hook uses this to decide
    the skip, since after a fork a flow_local object may be shared with the snapshot sibling. */
 int JS_IsFlowLocal(JSValueConst obj) {
-    return JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT && JS_VALUE_GET_OBJ(obj)->flow_local;
+    return JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT && JS_VALUE_GET_OBJ(obj)->flow_gen > 0;
 }
 
 /* Host COW helper: is this an ARRAY element slot (obj is an array, atom an integer index)? On a hit *idx is the
@@ -6234,7 +6248,7 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
     p->tmp_mark = 0;
     p->is_HTMLDDA = 0;
     p->is_prototype = 0;
-    p->flow_local = g_flow_local_mark;   /* forced-exec: 0 during setup (baseline), 1 while a flow runs */
+    p->flow_gen = g_flow_gen;   /* forced-exec: 0 during setup (baseline), else the current fork generation */
     p->first_weak_ref = NULL;
     p->u.opaque = NULL;
     p->shape = sh;
@@ -18583,7 +18597,13 @@ static int branch_arm_fork(JSContext *ctx, JSValueConst op1, uint8_t *if_pc,
 /* Install the forced-execution hook interfaces — one registration per concern (see quickjs.h). Each installs
    ONCE at engine setup; a NULL argument crashes (offensive: the interface is not optional). g_flow_local_mark
    stamps every new object 0=baseline (during setup) / 1=flow-local (while a flow runs, discarded). */
-void JS_SetFlowLocalMark(int m) { g_flow_local_mark = m ? 1 : 0; }
+void JS_SetFlowLocalMark(int m) {
+    g_flow_local_mark = m ? 1 : 0;
+    /* Entering flow mode from baseline starts the generation at 1; staying in flow mode keeps the monotonic
+       counter (forks have bumped it); leaving (final teardown) resets to 0. */
+    if (m) { if (g_flow_gen == 0) g_flow_gen = 1; }
+    else   { g_flow_gen = 0; }
+}
 void JS_SetFlowControlHooks(const JSFlowControlHooks *h) { g_flow_control = *h; }
 void JS_SetTimeTravelHooks(const JSTimeTravelHooks *h) { g_time_travel = *h; }
 void JS_SetConcolicHooks(const JSConcolicHooks *h) { g_concolic = *h; }
