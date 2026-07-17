@@ -56304,6 +56304,10 @@ static JSValue js_map_set(JSContext *ctx, JSValueConst this_val,
         value = argv[1];
     mr = map_find_record(ctx, s, key);
     if (mr) {
+        /* OVERWRITE of an existing record (Map.set of a present key): capture the old value so a snapshot-forked
+           sibling restores it on unapply. A Set re-add is a no-op (same value) — nothing to capture. */
+        if (g_time_travel.map_mutate && !s->is_weak && !is_set)
+            g_time_travel.map_mutate(ctx, this_val, key, mr->value, value, JS_MAP_MUTATE_OVERWRITE);
         JS_FreeValue(ctx, mr->value);
     } else {
         mr = map_add_record(ctx, s, key);
@@ -56436,6 +56440,10 @@ static JSValue js_map_delete(JSContext *ctx, JSValueConst this_val,
     mr = map_find_record(ctx, s, key);
     if (!mr)
         return JS_FALSE;
+    /* DELETE of a present record on a shared Set/Map: capture the key+old value so a snapshot-forked sibling
+       re-adds it on unapply (a Set's value is UNDEFINED, harmless). */
+    if (g_time_travel.map_mutate && !s->is_weak)
+        g_time_travel.map_mutate(ctx, this_val, key, mr->value, JS_UNDEFINED, JS_MAP_MUTATE_DELETE);
     map_delete_record(ctx->rt, s, mr);
     return JS_TRUE;
 }
