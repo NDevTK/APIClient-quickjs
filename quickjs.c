@@ -18383,6 +18383,8 @@ typedef struct JSIterConsume {
     JSValue r;       /* the result being built (owned; ARRAY for FROM/SPREAD, the Set/Map instance for SET/MAP) */
     JSValue iter;    /* the generator object being consumed (owned) — .next() drives its body */
     JSValue adder;   /* SET/MAP: the instance's add/set method (owned); JS_UNDEFINED for FROM/SPREAD */
+    JSValue mapfn;   /* FROM with a mapfn (Array.from(gen, fn)): the per-element map function (owned); UNDEFINED otherwise */
+    JSValue mapfn_this;  /* FROM: the mapfn's thisArg (owned; UNDEFINED) */
     int64_t k;       /* next index to define (SPREAD: the running append position; unused for SET/MAP) */
     int orig_cfirst, orig_cargc;   /* FROM/SET/MAP: the ORIGINAL call/ctor operand shape (pop at finish) */
     uint8_t orig_is_tail;
@@ -18390,7 +18392,7 @@ typedef struct JSIterConsume {
 } JSIterConsume;
 static int js_iter_consume_step(JSContext *ctx, struct JSIterConsume *s, JSValue res);
 static void js_iter_consume_end(JSContext *ctx, struct JSIterConsume *s);
-static bool tramp_can_call_iter_consume(JSValueConst func, JSValueConst *call_argv, int call_argc);
+static bool tramp_can_call_iter_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc);
 static JSValue js_map_constructor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv, int magic);
 static bool tramp_can_call_setmap_consume(JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_magic);
 static void js_array_reduce_end(JSContext *ctx, struct JSArrayReduce *s, bool take_acc);
@@ -19343,7 +19345,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_json_parse(call_argv[-1], call_argc, vc(call_argv))) {   /* JSON.parse(s,reviver) -> reviver walk on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_json_revive_tramp;
                 }
-                if (tramp_can_call_iter_consume(call_argv[-1], vc(call_argv), call_argc)) {   /* Array.from(gen) -> consume the generator on THIS chain */
+                if (tramp_can_call_iter_consume(ctx, call_argv[-1], vc(call_argv), call_argc)) {   /* Array.from(gen) -> consume the generator on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_iter_consume_tramp;
                 }
                 if (tramp_is_function_call(call_argv[-1])) {   /* f.call(thisArg,...) -> resolve + dispatch f here */
@@ -19602,7 +19604,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_gen_create(call_argv[-1])) goto do_generator_create_tramp;
                 if (tramp_can_call_array_iter(call_argv[-1], &iter_special)) goto do_array_iter_tramp;
                 if (tramp_can_call_array_reduce(call_argv[-1], &iter_special)) goto do_array_reduce_tramp;
-                if (tramp_can_call_iter_consume(call_argv[-1], vc(call_argv), call_argc)) goto do_iter_consume_tramp;
+                if (tramp_can_call_iter_consume(ctx, call_argv[-1], vc(call_argv), call_argc)) goto do_iter_consume_tramp;
                 /* a C-function / bound / proxy target has no preemptible body — plain call, nothing to park */
                 ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2], JS_UNDEFINED,
                                           call_argc, vc(call_argv), 0);
@@ -19964,6 +19966,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->r = result;
                 s->iter = js_dup(gen);
                 s->adder = JS_UNDEFINED;
+                /* Array.from(gen, mapfn, thisArg): dup the mapfn + thisArg (recognition already checked mapfn is a
+                   function when present; an absent/undefined mapfn stays UNDEFINED = no mapping). */
+                s->mapfn = (call_argc >= 2) ? js_dup(call_argv[1]) : JS_UNDEFINED;
+                s->mapfn_this = (call_argc >= 3) ? js_dup(call_argv[2]) : JS_UNDEFINED;
                 s->k = 0;
                 s->sink = ITERCONS_FROM;
                 s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
@@ -19998,6 +20004,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->r = obj;
                 s->iter = js_dup(gen);
                 s->adder = adder;
+                s->mapfn = JS_UNDEFINED; s->mapfn_this = JS_UNDEFINED;
                 s->k = 0;
                 s->sink = (magic & MAGIC_SET) ? ITERCONS_SET : ITERCONS_MAP;
                 s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
@@ -20016,6 +20023,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->r = js_dup(sp[-3]);            /* the array being built — a shared ref; appends land on sp[-3] too */
                 s->iter = js_dup(sp[-1]);         /* the generator */
                 s->adder = JS_UNDEFINED;
+                s->mapfn = JS_UNDEFINED; s->mapfn_this = JS_UNDEFINED;
                 s->k = JS_VALUE_GET_INT(sp[-2]);  /* the current append position */
                 s->sink = ITERCONS_SPREAD;
                 cont_st = s; cont_kind_cur = CONT_ITER_CONSUME;
@@ -20051,6 +20059,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     uint8_t sink = s->sink;
                     JS_FreeValue(ctx, s->iter);
                     JS_FreeValue(ctx, s->adder);   /* the add/set method (UNDEFINED for FROM) */
+                    JS_FreeValue(ctx, s->mapfn);   /* the map function (UNDEFINED unless Array.from(gen, fn)) */
+                    JS_FreeValue(ctx, s->mapfn_this);
                     js_free_rt(rt, s);
                     if (sink == ITERCONS_FROM && JS_SetProperty(ctx, r, JS_ATOM_length, js_uint32((uint32_t)n)) < 0) {
                         JS_FreeValue(ctx, r); goto exception;   /* operands freed by the exception unwind */
@@ -23918,6 +23928,8 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                 ns->r = js_dup(os->r);
                 ns->iter = js_dup(os->iter);
                 ns->adder = js_dup(os->adder);   /* SET/MAP add/set method (UNDEFINED for FROM/SPREAD) */
+                ns->mapfn = js_dup(os->mapfn);   /* Array.from(gen, fn) mapfn + thisArg (UNDEFINED otherwise) */
+                ns->mapfn_this = js_dup(os->mapfn_this);
                 ct->cont_state = ns;
             }
             if (g_time_travel.gen_fork) g_time_travel.gen_fork(ctx, genobj, g0, g1);
@@ -45872,6 +45884,16 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
             if (JS_IsException(ret)) return -1;
             JS_FreeValue(ctx, ret);
         } else {   /* ITERCONS_FROM / ITERCONS_SPREAD: append at the running index */
+            if (s->sink == ITERCONS_FROM && JS_VALUE_GET_TAG(s->mapfn) != JS_TAG_UNDEFINED) {
+                /* Array.from(gen, mapfn): map each value by mapfn(value, index). A generator/async mapfn returns an
+                   object/promise (no body-drive), so a direct call is faithful — only iter.next() rides the tramp. */
+                JSValueConst margs[2]; JSValue mapped;
+                margs[0] = value; margs[1] = js_int32((int32_t)s->k);
+                mapped = JS_Call(ctx, s->mapfn, s->mapfn_this, 2, margs);
+                JS_FreeValue(ctx, value);
+                if (JS_IsException(mapped)) return -1;
+                value = mapped;
+            }
             if (JS_DefinePropertyValueInt64(ctx, s->r, s->k, value, JS_PROP_C_W_E | JS_PROP_THROW) < 0)
                 return -1;   /* DefinePropertyValueInt64 consumed `value` */
         }
@@ -45887,15 +45909,17 @@ static void js_iter_consume_end(JSContext *ctx, JSIterConsume *s)
     JS_FreeValue(ctx, s->r);
     JS_FreeValue(ctx, s->iter);
     JS_FreeValue(ctx, s->adder);
+    JS_FreeValue(ctx, s->mapfn);
+    JS_FreeValue(ctx, s->mapfn_this);
 }
 
 /* Route Array.from ONLY for the direct-generator, single-arg (no mapfn) shape — the case whose C loop drives the
    generator .next() to completion. Every other Array.from (array-like, non-generator iterable, with mapfn) stays on
    the normal cfunc path (no generator body => no drive). Runtime-arg-aware: call_argv[0] is the items argument. */
-static bool tramp_can_call_iter_consume(JSValueConst func, JSValueConst *call_argv, int call_argc)
+static bool tramp_can_call_iter_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc)
 {
     JSObject *fp, *ip;
-    if (call_argc != 1) return false;
+    if (call_argc < 1) return false;
     if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
     fp = JS_VALUE_GET_OBJ(func);
     if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
@@ -45903,7 +45927,11 @@ static bool tramp_can_call_iter_consume(JSValueConst func, JSValueConst *call_ar
     if (fp->u.cfunc.c_function.generic != js_array_from) return false;
     if (JS_VALUE_GET_TAG(call_argv[0]) != JS_TAG_OBJECT) return false;
     ip = JS_VALUE_GET_OBJ(call_argv[0]);
-    return ip->class_id == JS_CLASS_GENERATOR && ip->u.generator_data != NULL;
+    if (ip->class_id != JS_CLASS_GENERATOR || ip->u.generator_data == NULL) return false;
+    /* a mapfn arg, if present and not undefined, MUST be callable — else Array.from throws EARLY (before GetIterator);
+       leave that to the normal path rather than routing (recognition must not throw). thisArg (argv[2]) is free. */
+    if (call_argc >= 2 && !JS_IsUndefined(call_argv[1]) && !JS_IsFunction(ctx, call_argv[1])) return false;
+    return true;
 }
 
 /* Route new Set(gen) / new Map(gen) — the js_map_constructor C loop drives the argument generator's .next(). Scoped
