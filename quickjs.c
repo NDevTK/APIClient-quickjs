@@ -18187,6 +18187,9 @@ typedef struct TrampFrame {
        gen_data->func_state.frame IS this frame's sf (like async_data). gen_magic is NEXT/RETURN/THROW. */
     struct JSGeneratorData *gen_data;
     uint8_t gen_magic;
+    int forof_off;   /* for a FOR-OF generator drive (is_tail, async_promise UNDEFINED): the iterator's caller-stack
+                        offset (caller_sp[forof_off] is the generator object). Lets a concolic fork inside a for-of
+                        body recover the shared generator to record its per-flow gen_data swap. Unused otherwise. */
     /* C-CONTINUATION: this frame IS a JS callback driven by a C builtin's iteration (forEach/map/every/some/
        filter, reduce, ...) that runs on the chain instead of C-recursing JS_Call. cont_state is the builtin's
        resumable state, tagged by cont_kind; its operands live in a buffer OWNED BY THAT STATE (never the caller's
@@ -20031,10 +20034,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (unlikely(!gtf)) { JS_ThrowOutOfMemory(ctx); goto exception; }
                 if (forof) {
                     /* the iterator STAYS on the caller stack (reused each loop) — no ref to hold, nothing to free;
-                       value+done are written above sp at settle. is_tail marks for-of mode. */
+                       value+done are written above sp at settle. is_tail marks for-of mode. forof_off records the
+                       iterator's stack slot (caller_sp[fofoff] == gthis) so a concolic fork inside the body can
+                       recover the shared generator object (it is not held in the frame). */
                     gtf->async_promise = JS_UNDEFINED;
                     gtf->caller_sp = sp;
                     gtf->is_tail = 1;
+                    gtf->forof_off = fofoff;
                 } else {
                     /* HOLD a ref to the generator across the body run: for `g().next()` the stack receiver is the
                        only ref and gs is its opaque, so freeing it before the body would UAF gs. */
@@ -23465,12 +23471,17 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                a generator hands results back via the .next() protocol, not a return-promise). The generator
                OBJECT is shared (created pre-fork); its u.generator_data POINTER is made per-flow by a COW gendata
                swap recorded on the sibling's delta (gen_fork hook -> engine_fork_finalize), so each arm's
-               generator resolves to its own state across context switches. Only a DIRECT .next() drive is built:
-               the held ref (async_promise) is the generator object; a for-of drive holds the generator on the
-               caller stack (async_promise UNDEFINED), and forking its body is a separate not-yet-built capability. */
+               generator resolves to its own state across context switches. A DIRECT .next() drive holds the
+               generator object in async_promise; a FOR-OF drive holds it on the caller stack (async_promise
+               UNDEFINED) at caller_sp[forof_off] — recover it there so both drives fork identically. */
+            int gen_forof = (JS_VALUE_GET_TAG(otf->async_promise) != JS_TAG_OBJECT);
             JSValueConst genobj = otf->async_promise;
+            if (gen_forof) {
+                DCHECK(otf->is_tail, "clone_deep_flow: generator frame with no held ref is not a for-of drive");
+                genobj = otf->caller_sp[otf->forof_off];   /* the for-of iterator (shared generator object) on the caller stack */
+            }
             DCHECK(JS_VALUE_GET_TAG(genobj) == JS_TAG_OBJECT,
-                   "clone_deep_flow: for-of generator-body concolic fork not built (held ref is not a generator object)");
+                   "clone_deep_flow: generator-body fork could not resolve the generator object");
             JSGeneratorData *g0 = otf->gen_data;
             JSStackFrame *gof = &g0->func_state.frame;
             JSGeneratorData *g1 = js_mallocz(ctx, sizeof(*g1));
@@ -23486,7 +23497,9 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
             g1->func_state.tramp_top = NULL;
             g1->func_state.frame.cur_sp = (i == 0) ? g1->func_state.frame.arg_buf + (osf->cur_sp - gof->arg_buf) : NULL;
             ct->gen_data = g1;
-            ct->async_promise = js_dup(genobj);   /* the clone's OWN held ref to the shared generator object */
+            /* direct .next(): the clone holds its OWN ref to the generator (settle frees it). for-of: no held ref
+               (async_promise stays UNDEFINED from *ct=*otf); the iterator rides the cloned caller stack instead. */
+            if (!gen_forof) ct->async_promise = js_dup(genobj);
             ct->local_buf = NULL; ct->b = NULL;   /* the gen frame owns its buffers via g1->func_state */
             if (g_time_travel.gen_fork) g_time_travel.gen_fork(ctx, genobj, g0, g1);
         } else {
