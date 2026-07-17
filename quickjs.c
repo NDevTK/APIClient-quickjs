@@ -18223,6 +18223,12 @@ typedef struct TrampFrame {
                                   an EXPLICIT DFS stack (no C recursion) and calls the reviver on this chain at
                                   each node (post-order), so a reviver body loop preempts. do_return re-enters
                                   js_json_reviver_step with the reviver's result. */
+#define CONT_ITER_CONSUME  8   /* cont_state = JSIterConsume: a builtin that CONSUMES an iterator in a loop
+                                  (Array.from) drives the iterator's .next() on this chain — when the iterator is a
+                                  GENERATOR its body runs on the chain (suspend/resume at any depth), never the
+                                  C-recursion drive-to-completion JS_IteratorNext would use. The generator drive
+                                  frame carries this cont; its direct-mode settle re-enters js_iter_consume_step
+                                  with the {value,done} result. */
 
 /* A bytecode constructor's body run on the trampoline chain; holds the created `this` across the body so
    do_return can apply the constructor return-value rule (use `this` when the body returns a non-object).
@@ -18359,6 +18365,22 @@ typedef struct JSArrayReduce {
 static int js_array_reduce_init(JSContext *ctx, struct JSArrayReduce *s, JSValueConst this_val,
                                 int argc, JSValueConst *argv, int special);
 static int js_array_reduce_step(JSContext *ctx, struct JSArrayReduce *s, JSValue acc1, JSValueConst out_args[4]);
+/* Array.from(GENERATOR): CONSUME the generator on the tramp chain — each .next() runs the generator body HERE so
+   a body loop suspend/resumes at any depth, never the C-recursion drive-to-completion js_array_from's loop uses.
+   Only the direct-generator, no-mapfn case is routed (the metric drive); every other Array.from shape stays on the
+   normal cfunc path. The generator DRIVE frame carries this state (cont_kind CONT_ITER_CONSUME); its settle
+   re-enters js_iter_consume_step with the {value,done} result. NO cb_args: the drive IS the generator, its
+   receiver is s->iter (in the state), so nothing rides the caller stack. */
+typedef struct JSIterConsume {
+    JSValue r;       /* the result array being built (owned) */
+    JSValue iter;    /* the generator object being consumed (owned) — .next() drives its body */
+    int64_t k;       /* next index to define */
+    int orig_cfirst, orig_cargc;   /* the ORIGINAL OP_call_method operand shape (pop at finish) */
+    uint8_t orig_is_tail;
+} JSIterConsume;
+static int js_iter_consume_step(JSContext *ctx, struct JSIterConsume *s, JSValue res);
+static void js_iter_consume_end(JSContext *ctx, struct JSIterConsume *s);
+static bool tramp_can_call_iter_consume(JSValueConst func, JSValueConst *call_argv, int call_argc);
 static void js_array_reduce_end(JSContext *ctx, struct JSArrayReduce *s, bool take_acc);
 static JSValue js_array_reduce(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int special);
 static bool tramp_can_call_array_reduce(JSValueConst func, int *out_special);
@@ -18679,6 +18701,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     int tramp_gen_close = 0;                            /* 1 = OP_iterator_close drive (.return() on an unconsumed generator iterator at sp[-1]): body runs finally on the tramp, result DISCARDED */
     int tramp_gen_close_exc = 0;                        /* 1 = the close is happening DURING exception unwind (JS_IteratorClose(iter,true)): after the finally runs, restore the in-flight exception and continue unwinding (goto exception), never overwrite it */
     int tramp_gen_create_forof = 0;                     /* 1 = this do_generator_create_tramp is a for-of iterator-getter (OP_for_of_start): at settle, finish the enum_rec ([iterator, next, catch_offset]) instead of pushing the bare object */
+    int tramp_gen_cont_consume = 0;                     /* 1 = this do_generator_tramp drive is an iterator-CONSUMER (Array.from) driving s->iter.next(): gthis comes from tramp_cont_state->iter, caller_sp stays put (nothing on the caller stack), and the direct-mode settle re-enters do_iter_consume_step instead of pushing the result */
     JSAsyncFunctionState *gen_state = NULL;   /* the generator/async base state IF this activation is preemptible */
 
 #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_STEP
@@ -19304,6 +19327,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_json_parse(call_argv[-1], call_argc, vc(call_argv))) {   /* JSON.parse(s,reviver) -> reviver walk on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_json_revive_tramp;
                 }
+                if (tramp_can_call_iter_consume(call_argv[-1], vc(call_argv), call_argc)) {   /* Array.from(gen) -> consume the generator on THIS chain */
+                    tramp_is_tail = (opcode == OP_tail_call_method); goto do_iter_consume_tramp;
+                }
                 if (tramp_is_function_call(call_argv[-1])) {   /* f.call(thisArg,...) -> resolve + dispatch f here */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_forward_call;
                 }
@@ -19560,6 +19586,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_gen_create(call_argv[-1])) goto do_generator_create_tramp;
                 if (tramp_can_call_array_iter(call_argv[-1], &iter_special)) goto do_array_iter_tramp;
                 if (tramp_can_call_array_reduce(call_argv[-1], &iter_special)) goto do_array_reduce_tramp;
+                if (tramp_can_call_iter_consume(call_argv[-1], vc(call_argv), call_argc)) goto do_iter_consume_tramp;
                 /* a C-function / bound / proxy target has no preemptible body — plain call, nothing to park */
                 ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2], JS_UNDEFINED,
                                           call_argc, vc(call_argv), 0);
@@ -19902,6 +19929,62 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 goto do_array_iter_step;
             }
 
+        do_iter_consume_tramp:
+            /* Array.from(GENERATOR): build the result array, seed the state, and consume the generator by driving
+               its .next() on THIS chain. call_argv[-2] = Array (from's `this`/constructor), call_argv[0] = the
+               generator (guaranteed by tramp_can_call_iter_consume). */
+            {
+                JSValueConst thisv = call_argv[-2];
+                JSValueConst gen = call_argv[0];
+                JSIterConsume *s;
+                JSValue result;
+                if (JS_IsConstructor(ctx, thisv))
+                    result = JS_CallConstructor(ctx, thisv, 0, NULL);
+                else
+                    result = JS_NewArray(ctx);
+                if (JS_IsException(result)) goto exception;
+                s = js_mallocz(ctx, sizeof(*s));
+                if (unlikely(!s)) { JS_FreeValue(ctx, result); JS_ThrowOutOfMemory(ctx); goto exception; }
+                s->r = result;
+                s->iter = js_dup(gen);
+                s->k = 0;
+                s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
+                cont_st = s; cont_kind_cur = CONT_ITER_CONSUME;
+                ret_val = JS_UNINITIALIZED;   /* first step: no previous next() result */
+                goto do_iter_consume_step;
+            }
+
+        do_iter_consume_step:
+            /* ret_val = the previous .next() result object (UNINITIALIZED on the first step). Feed it to the step,
+               then either drive the next .next() (generator body on this chain) or finish the array. */
+            {
+                JSIterConsume *s = (JSIterConsume *)cont_st;
+                int st = js_iter_consume_step(ctx, s, ret_val);
+                if (unlikely(st < 0)) { js_iter_consume_end(ctx, s); js_free_rt(rt, s); goto exception; }
+                if (st == 0) {   /* DONE: set length, pop the ORIGINAL operands, yield the array */
+                    JSValue r = s->r;
+                    int cfirst = s->orig_cfirst, cargc = s->orig_cargc;
+                    uint8_t itail = s->orig_is_tail;
+                    int64_t n = s->k;
+                    JS_FreeValue(ctx, s->iter);
+                    js_free_rt(rt, s);
+                    if (JS_SetProperty(ctx, r, JS_ATOM_length, js_uint32((uint32_t)n)) < 0) {
+                        JS_FreeValue(ctx, r); goto exception;   /* operands freed by the exception unwind */
+                    }
+                    JSValue *cargv = sp - cargc;
+                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
+                    sp += cfirst - cargc;
+                    if (itail) { ret_val = r; goto do_return; }
+                    *sp++ = r;
+                    BREAK;
+                }
+                /* CALL: drive s->iter.next() — a generator, so its body runs on this chain (do_generator_tramp
+                   cont-consume mode); the generator settle re-enters this step with the {value,done} result. */
+                tramp_cont_state = s; tramp_cont_kind = CONT_ITER_CONSUME;
+                tramp_gen_cont_consume = 1; tramp_gen_magic = GEN_MAGIC_NEXT;
+                goto do_generator_tramp;
+            }
+
         do_async_tramp_call:
             /* ASYNC callee: run its body HERE on the tramp chain (gen_state stays the caller's base) so a sync-
                prefix loop preempts the base flow at any depth — never a nested C-recursion that drives to
@@ -20011,18 +20094,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 bool iternext = tramp_gen_iternext; tramp_gen_iternext = 0;   /* OP_iterator_next drive (yield-star + destructuring) */
                 bool close = tramp_gen_close; tramp_gen_close = 0;            /* OP_iterator_close drive (.return()) */
                 bool close_exc = tramp_gen_close_exc; tramp_gen_close_exc = 0; /* close mid-exception-unwind */
+                bool cont_consume = tramp_gen_cont_consume; tramp_gen_cont_consume = 0;   /* iterator-consumer (Array.from) drive */
+                JSIterConsume *cc_s = cont_consume ? (JSIterConsume *)tramp_cont_state : NULL;
+                tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;   /* consumed into cc_s + the frame's cont fields; never leak onto an inner call the generator body makes (else its do_return misdispatches to do_array_iter_step) */
                 JSValue close_exc_e = JS_UNINITIALIZED;   /* the saved in-flight exception (close_exc only) */
                 if (close_exc) { close_exc_e = rt->current_exception; rt->current_exception = JS_UNINITIALIZED; }
                 bool forof = (tramp_gen_forof < 0);   /* a real for-of offset is always negative (-3-..) */
                 int fofoff = tramp_gen_forof;
                 tramp_gen_forof = 1;   /* reset to the direct-call sentinel */
                 /* close: generator iterator at sp[-1], .return() with no arg, result discarded. iternext: iterator at
-                   sp[-4], resume arg at sp[-1]. for-of: iterator at sp[fofoff]. direct: receiver at call_argv[-2]. */
-                JSValueConst gthis = close ? sp[-1] : (iternext ? sp[-4] : (forof ? sp[fofoff] : call_argv[-2]));
+                   sp[-4], resume arg at sp[-1]. for-of: iterator at sp[fofoff]. cont-consume: generator in the state.
+                   direct: receiver at call_argv[-2]. */
+                JSValueConst gthis = cont_consume ? cc_s->iter
+                                   : (close ? sp[-1] : (iternext ? sp[-4] : (forof ? sp[fofoff] : call_argv[-2])));
                 JSGeneratorData *gs = JS_VALUE_GET_OBJ(gthis)->u.generator_data;
                 int gmagic = tramp_gen_magic;
                 JSValueConst garg = (close || iternext) ? (iternext ? sp[-1] : JS_UNDEFINED)
-                                                        : (forof ? JS_UNDEFINED : ((call_argc >= 1) ? call_argv[0] : JS_UNDEFINED));
+                                                        : ((forof || cont_consume) ? JS_UNDEFINED : ((call_argc >= 1) ? call_argv[0] : JS_UNDEFINED));
                 JSStackFrame *gsf = &gs->func_state.frame;
                 TrampFrame *gtf; JSObject *gfp; JSFunctionBytecode *gb;
                 bool run_body = true, do_throw = false;
@@ -20065,6 +20153,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (JS_IsException(giter)) goto exception;
                         JS_FreeValue(ctx, sp[-1]); sp[-1] = giter;
                         BREAK;
+                    }
+                    if (cont_consume) {   /* Array.from consumer: completed generator -> {undefined,true}; re-enter the step (caller stack untouched) */
+                        if (do_throw) { JS_FreeValue(ctx, gv); JS_Throw(ctx, thr); goto exception; }
+                        giter = js_create_iterator_result(ctx, gv, true);
+                        if (JS_IsException(giter)) goto exception;
+                        cont_st = cc_s; cont_kind_cur = CONT_ITER_CONSUME;
+                        ret_val = giter;
+                        goto do_iter_consume_step;
                     }
                     if (forof) {
                         JS_FreeValue(ctx, gv);
@@ -20119,6 +20215,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     gtf->caller_sp = sp;
                     gtf->is_tail = 1;
                     gtf->forof_off = fofoff;
+                } else if (cont_consume) {
+                    /* Array.from consumer: the generator (gthis) lives in the state (s->iter), NOT on the caller
+                       stack, so HOLD a body-run ref and leave the caller stack UNTOUCHED (caller_sp = sp). is_tail=0
+                       => direct-mode settle; cont_kind (set below) makes that settle re-enter do_iter_consume_step. */
+                    gtf->async_promise = js_dup(gthis);
+                    gtf->caller_sp = sp;
+                    gtf->is_tail = 0;
                 } else {
                     /* HOLD a ref to the generator across the body run: for `g().next()` the stack receiver is the
                        only ref and gs is its opaque, so freeing it before the body would UAF gs. */
@@ -20137,7 +20240,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 gtf->caller_arg_allocated_size = arg_allocated_size;
                 gtf->call_first = -2; gtf->call_argc = 0;
                 gtf->async_data = NULL;   /* async_promise holds ghold (direct) or UNDEFINED (for-of) */
-                gtf->gen_data = gs; gtf->gen_magic = (uint8_t)gmagic; gtf->cont_state = NULL; gtf->cont_kind = CONT_NONE;
+                gtf->gen_data = gs; gtf->gen_magic = (uint8_t)gmagic;
+                gtf->cont_state = cont_consume ? (void *)cc_s : NULL;   /* a consumer drive carries its state so the settle re-enters the step */
+                gtf->cont_kind = cont_consume ? CONT_ITER_CONSUME : CONT_NONE;
                 gtf->b = NULL; gtf->local_buf = NULL;   /* the body frame owns its buffers via gs->func_state */
                 gfp = JS_VALUE_GET_OBJ(gsf->cur_func);
                 gb = gfp->u.func.function_bytecode;
@@ -20169,6 +20274,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValue ghold = gtf->async_promise;   /* held generator ref (direct/close) or UNDEFINED (for-of/iternext) */
                 int gmode = gtf->is_tail;   /* 0=direct .next(); 1=for-of; 2=OP_iterator_next; 3=close; 4=close-during-unwind */
                 JSValue close_e = (gmode == 4) ? gtf->close_saved_exc : JS_UNINITIALIZED;   /* saved before gtf is freed */
+                void *gcont = gtf->cont_state; uint8_t gck = gtf->cont_kind;   /* consumer drive: re-enter its step with the result */
                 bool forof = (gmode == 1);
                 JSStackFrame *gsf = &gs->func_state.frame;
                 JSValue value, giter;
@@ -20230,6 +20336,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 giter = (gdone == 2) ? value : js_create_iterator_result(ctx, value, gdone);
                 if (JS_IsException(giter)) goto exception;
+                if (gck == CONT_ITER_CONSUME) {   /* Array.from consumer drive: feed {value,done} back to its step (caller stack untouched: sp == caller_sp) */
+                    cont_st = gcont; cont_kind_cur = CONT_ITER_CONSUME;
+                    ret_val = giter;
+                    goto do_iter_consume_step;
+                }
                 *sp++ = giter;
                 BREAK;
             }
@@ -20472,6 +20583,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (rck == CONT_ARRAY_REDUCE) goto do_array_reduce_step;
                     if (rck == CONT_SORT) goto do_sort_step;
                     if (rck == CONT_JSON_REVIVE) goto do_json_revive_step;
+                    /* CONT_ITER_CONSUME settles via do_generator_settle (its callback IS a generator drive), never
+                       here — a leaked kind (e.g. a stale tramp_cont_kind stamped onto an inner call) would misread
+                       its state as a JSArrayEvery. Assert the fallthrough's sole remaining kind at its origin. */
+                    DCHECK(rck == CONT_ARRAY_ITER, "do_return: C-continuation fallthrough expects CONT_ARRAY_ITER; a stray cont_kind would misdispatch to do_array_iter_step");
                     goto do_array_iter_step;
                 }
                 if (itail) goto do_return;   /* caller was a tail-caller: propagate */
@@ -23051,6 +23166,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JS_FreeValueRT(rt, ctx->error_back_trace);
             ctx->error_back_trace = JS_UNDEFINED;
         }
+        if (gtf->cont_kind == CONT_ITER_CONSUME) {   /* Array.from consumer: the generator body threw -> abandon the half-built array (its own ref to the generator is dropped here; the drive ref is dropped below) */
+            js_iter_consume_end(ctx, (struct JSIterConsume *)gtf->cont_state);
+            js_free_rt(rt, gtf->cont_state);
+        }
         sf->cur_sp = sp;   /* the body frame is "running" (cur_sp NULL); restore it so async_func_free can tear down */
         free_generator_stack_rt(rt, gtf->gen_data);
         if (creating) js_free_rt(rt, gtf->gen_data);   /* not yet owned by a generator object -> free the orphan */
@@ -23132,6 +23251,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 js_array_sort_end(ctx, (struct JSArraySort *)xcs, false);
             else if (xck == CONT_JSON_REVIVE)
                 js_json_reviver_end(ctx, (struct JSJsonReviver *)xcs, false);
+            else if (xck == CONT_ITER_CONSUME)
+                js_iter_consume_end(ctx, (struct JSIterConsume *)xcs);
             else
                 js_array_reduce_end(ctx, (struct JSArrayReduce *)xcs, false);
             js_free_rt(rt, xcs);
@@ -45605,6 +45726,54 @@ static JSValue js_array_from(JSContext *ctx, JSValueConst this_val,
     JS_FreeValue(ctx, stack[0]);
     JS_FreeValue(ctx, stack[1]);
     return r;
+}
+
+/* Advance Array.from(generator): `res` is the previous .next() iterator-result {value,done}, or UNINITIALIZED on
+   the first step. Returns 1 = drive iter.next() again, 0 = DONE (s->r is the finished array), -1 = exception.
+   Consumes `res`. The generator's .next() body runs on the tramp chain (the caller re-enters this step at the
+   generator settle), so a generator loop over opaque input suspend/resumes here instead of driving to completion. */
+static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
+{
+    if (JS_VALUE_GET_TAG(res) != JS_TAG_UNINITIALIZED) {
+        JSValue done_val = JS_GetProperty(ctx, res, JS_ATOM_done);
+        int done;
+        JSValue value;
+        if (JS_IsException(done_val)) { JS_FreeValue(ctx, res); return -1; }
+        done = JS_ToBoolFree(ctx, done_val);
+        if (done) { JS_FreeValue(ctx, res); return 0; }   /* iterator exhausted: s->r is complete */
+        value = JS_GetProperty(ctx, res, JS_ATOM_value);
+        JS_FreeValue(ctx, res);
+        if (JS_IsException(value)) return -1;
+        if (JS_DefinePropertyValueInt64(ctx, s->r, s->k, value, JS_PROP_C_W_E | JS_PROP_THROW) < 0)
+            return -1;   /* DefinePropertyValueInt64 consumed `value` */
+        s->k++;
+    }
+    return 1;   /* drive iter.next() */
+}
+
+/* Abandon a half-run Array.from(generator) (exception / fork-unwind): free the owned array + generator. On the
+   normal DONE finish the caller instead MOVES s->r out and frees s->iter inline, so this is the error path only. */
+static void js_iter_consume_end(JSContext *ctx, JSIterConsume *s)
+{
+    JS_FreeValue(ctx, s->r);
+    JS_FreeValue(ctx, s->iter);
+}
+
+/* Route Array.from ONLY for the direct-generator, single-arg (no mapfn) shape — the case whose C loop drives the
+   generator .next() to completion. Every other Array.from (array-like, non-generator iterable, with mapfn) stays on
+   the normal cfunc path (no generator body => no drive). Runtime-arg-aware: call_argv[0] is the items argument. */
+static bool tramp_can_call_iter_consume(JSValueConst func, JSValueConst *call_argv, int call_argc)
+{
+    JSObject *fp, *ip;
+    if (call_argc != 1) return false;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
+    fp = JS_VALUE_GET_OBJ(func);
+    if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
+    if (fp->u.cfunc.cproto != JS_CFUNC_generic) return false;
+    if (fp->u.cfunc.c_function.generic != js_array_from) return false;
+    if (JS_VALUE_GET_TAG(call_argv[0]) != JS_TAG_OBJECT) return false;
+    ip = JS_VALUE_GET_OBJ(call_argv[0]);
+    return ip->class_id == JS_CLASS_GENERATOR && ip->u.generator_data != NULL;
 }
 
 static JSValue js_array_of(JSContext *ctx, JSValueConst this_val,
