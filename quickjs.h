@@ -1205,6 +1205,8 @@ JS_EXTERN void JS_SetFlowLocalMark(int m);
 /* Whether obj was created flow-local. The COW hook consults this: a never-forked flow skips its flow_local
    writes (truly private), but AFTER a fork those objects are shared with the snapshot sibling and must be captured. */
 JS_EXTERN int  JS_IsFlowLocal(JSValueConst obj);
+JS_EXTERN int  JS_IsArrayIndexSlot(JSValueConst obj, JSAtom atom, uint32_t *idx);
+JS_EXTERN int  JS_ArraySetLength(JSContext *ctx, JSValueConst obj, uint32_t len);
 JS_EXTERN void JS_SetTimeTravelHooks(const JSTimeTravelHooks *hooks);
 /* A closure cell is opaque here (JSVarRef is engine-internal); the host reads/writes its value via these. */
 JS_EXTERN JSValue JS_VarRefGetValue(void *cell);

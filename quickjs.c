@@ -6187,6 +6187,19 @@ int JS_IsFlowLocal(JSValueConst obj) {
     return JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT && JS_VALUE_GET_OBJ(obj)->flow_local;
 }
 
+/* Host COW helper: is this an ARRAY element slot (obj is an array, atom an integer index)? On a hit *idx is the
+   index. cow_unapply removes a flow-CREATED array append by TRUNCATING the array to *idx (set_array_length frees
+   the tail) instead of JS_DeleteProperty, which would convert the fast array to slow and leave the element. */
+int JS_IsArrayIndexSlot(JSValueConst obj, JSAtom atom, uint32_t *idx) {
+    if (JS_IsArray(obj) && __JS_AtomIsTaggedInt(atom)) { *idx = __JS_AtomToUInt32(atom); return 1; }
+    return 0;
+}
+/* Host COW helper: set an array's length (truncating a fast array frees the freed tail's elements). Used by
+   cow_unapply to remove a flow-created append without a fast-array->slow conversion. */
+int JS_ArraySetLength(JSContext *ctx, JSValueConst obj, uint32_t len) {
+    return JS_SetProperty(ctx, obj, JS_ATOM_length, js_uint32(len));
+}
+
 /* Time-travel capture for a CLOSURE CELL: a captured local is a shared JSVarRef, not a property, so a write to
    it (OP_put_var_ref / OP_*_loc_ref) bypasses cow_capture above. cell_write records the cell's pre-write value
    into the running flow's delta so a snapshot-forked sibling sharing the cell stays isolated. The cell is opaque
@@ -10531,6 +10544,12 @@ static int add_fast_array_element(JSContext *ctx, JSObject *p,
     /* extend the array by one */
     /* XXX: convert to slow array if new_len > 2^31-1 elements */
     new_len = p->u.array.count + 1;
+    /* Forced-exec COW: a fast-array APPEND writes values[] + length directly, bypassing the property-set capture.
+       Record the created element slot (index == old count, existed=0) so a snapshot-forked sibling that SHARES
+       this array (a map/filter/push accumulator) is isolated. cow_unapply removes it by TRUNCATING the array to
+       that index (set_array_length), not JS_DeleteProperty. cow_capture skips a flow_local (freshly-built,
+       unshared) array — a literal build pays only the cheap skip; only a genuinely shared array is captured. */
+    cow_capture(ctx, JS_MKPTR(JS_TAG_OBJECT, p), __JS_AtomFromUInt32(p->u.array.count));
     /* update the length if necessary. We assume that if the length is
        not an integer, then if it >= 2^31.  */
     if (likely(JS_VALUE_GET_TAG(p->prop[0].u.value) == JS_TAG_INT)) {
@@ -23428,18 +23447,14 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                 struct JSArrayEvery *os = (struct JSArrayEvery *)otf->cont_state;
                 struct JSArrayEvery *ns = js_malloc(ctx, sizeof(*ns));
                 if (!ns) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
-                /* map/filter (special 3/4) build a RESULT-ARRAY accumulator whose sound per-flow fork is an open
-                   design question: the array is private per-flow (so it can't be COW-SHARED — DefineProperty array
-                   writes bypass the capture hook, contaminating arms), yet a per-flow element COPY interacts with
-                   the forked=1 capture (which then treats the private accumulator as shared and reverts it on a
-                   context-switch, dropping an element). forEach/every/some have no such accumulator. DFAIL the
-                   array-builders — never emit a wrong @H value — until the accumulator-under-COW piece is built. */
-                DCHECK((os->special & ~8 /*special_TA*/) != 3 /*special_map*/ && (os->special & ~8) != 4 /*special_filter*/,
-                       "clone_deep_flow: deep-fork of map/filter (result-array accumulator) not built — the per-flow accumulator-vs-COW piece is next");
                 *ns = *os;
                 ns->obj = js_dup(os->obj);
                 ns->val = js_dup(os->val);
-                ns->ret = js_dup(os->ret);   /* forEach=undefined, every/some=bool: immutable, plain dup */
+                /* ret: forEach=undefined / every/some=bool (immutable) OR map/filter's result ARRAY. The array is
+                   SHARED (js_dup) and COW-isolated per-flow like any other shared array — the fast-array-append
+                   capture (add_fast_array_element / push fast path) records each arm's element write, so the two
+                   accumulators diverge and cow_unapply truncates each arm's appends away on context-switch. */
+                ns->ret = js_dup(os->ret);
                 ns->func = os->func; ns->this_arg = os->this_arg;
                 ns->cb_args[0] = ns->this_arg; ns->cb_args[1] = ns->func;
                 ns->cb_args[2] = ns->val; ns->cb_args[3] = os->cb_args[3]; ns->cb_args[4] = ns->obj;
@@ -46334,6 +46349,11 @@ static JSValue js_array_push(JSContext *ctx, JSValueConst this_val,
                         if (expand_fast_array(ctx, p, new_len))
                             return JS_EXCEPTION;
                     }
+                    /* Forced-exec COW: this fast path writes values[] directly (bypassing add_fast_array_element's
+                       capture), so record each created element slot so a shared array's per-flow push is isolated
+                       (cow_unapply truncates it away). Cheap-skips a flow_local array. */
+                    for(i = 0; i < argc; i++)
+                        cow_capture(ctx, this_val, __JS_AtomFromUInt32(array_len + i));
                     for(i = 0; i < argc; i++) {
                         p->u.array.u.values[array_len + i] = js_dup(argv[i]);
                     }
