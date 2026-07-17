@@ -18595,11 +18595,16 @@ static int branch_arm_fork(JSContext *ctx, JSValueConst op1, uint8_t *if_pc,
             gen_state->tramp_top = NULL;   /* the parent's chain is still live in tf_top, not stashed */
             sf->cur_sp = NULL;
         } else {
-            /* gen_state != g_flow_base_gen: a truly NESTED preemptible activation (a generator driven by .next()
-               synchronously inside this flow, whose base is its own func_state). Snapshot-forking it needs the
-               nested activation's own suspend/clone identity resolved against the driving flow — not built. REPLAY
-               is BANNED (not byte-identical), so the gap CRASHES rather than degrading to a re-run. */
-            DFAIL("nested-activation concolic branch (gen_state != base): snapshot fork across a synchronous generator drive not built; replay is banned");
+            /* gen_state != g_flow_base_gen: the branch is in a generator body driven by js_generator_next's
+               async_func_resume (a nested JS_CallInternal(GENERATOR)) rather than on the tramp chain. This is the
+               residual DRIVE-TO-COMPLETION path, reached ONLY when a generator .next()/.return()/.throw() call
+               BYPASSES the OP_call_method / OP_for_of_next tramp interception — i.e. Reflect.apply(g.next, g),
+               g.next.call(g), or a C builtin invoking the iterator method directly. That path also mishandles a
+               preempt (js_generator_next:23725 would read FUNC_RET_PREEMPT as a yield), so it is doubly wrong under
+               the flow machinery. The ROOT fix is to route those bypassing drives onto the tramp chain too (as
+               OP_call_method already does), deleting js_generator_next's async_func_resume drive — NOT to teach the
+               fork a second nested-activation identity. Until then this CRASHES loud (replay is banned). */
+            DFAIL("generator .next() driven off the tramp chain (Reflect.apply/.call bypass) — route it through do_generator_tramp; the js_generator_next drive-to-completion is the residue to delete");
         }
     }
     return harm;
