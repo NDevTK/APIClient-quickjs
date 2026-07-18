@@ -18265,9 +18265,10 @@ typedef struct JSIteratorHelperData {
     uint8_t consumer_kind;   /* CONT_* of `consumer`: CONT_ITER_HELPER / CONT_ITER_CONSUME / ... — how to re-enter it */
     JSValue inner_next;      /* flatMap: the inner iterator's .next method (its source runs on the tramp too) */
     uint8_t drive_inner;     /* flatMap: 1 = the next DRIVE targets it->inner (not it->obj) */
+    uint8_t drive_close;     /* take: 1 = the next DRIVE calls the source's .return() (close-on-limit) instead of .next() */
 } JSIteratorHelperData;
 enum { ITH_DIRECT = 0, ITH_FOROF, ITH_ITERNEXT, ITH_CONSUME };
-enum { ITHP_START = 0, ITHP_DROP_SKIP, ITHP_EMIT, ITHP_FLATMAP_SRC, ITHP_FLATMAP_INNER };   /* resume_pc values */
+enum { ITHP_START = 0, ITHP_DROP_SKIP, ITHP_EMIT, ITHP_FLATMAP_SRC, ITHP_FLATMAP_INNER, ITHP_TAKE_CLOSE };   /* resume_pc values */
 static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue res, JSValue *out);
 static bool tramp_can_call_iter_helper(JSValueConst func, JSValueConst this_val);
 static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int *pdone, int magic);
@@ -20748,7 +20749,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                     /* st == 1: DRIVE the current target's .next() — the SOURCE (it->obj/it->next), or for flatMap
                        iterating an inner iterable, the INNER (it->inner/it->inner_next). Either can be a generator
-                       (runs on the tramp), a helper (ITH_CONSUME chain), or a plain iterator (in-loop call). */
+                       (runs on the tramp), a helper (ITH_CONSUME chain), or a plain iterator (in-loop call). take's
+                       close-on-limit instead drives the source's .return() (drive_close) as a generator RETURN. */
+                    if (it->drive_close) {   /* take limit: close the GENERATOR source (.return() finally) on the tramp */
+                        it->drive_close = 0;
+                        tramp_cont_state = it; tramp_cont_kind = CONT_ITER_HELPER; tramp_gen_cont_iter = it->obj;
+                        tramp_gen_cont_consume = 1; tramp_gen_magic = GEN_MAGIC_RETURN;
+                        goto do_generator_tramp;
+                    }
                     JSValueConst drive_obj  = it->drive_inner ? it->inner : it->obj;
                     JSValueConst drive_next = it->drive_inner ? it->inner_next : it->next;
                     if (tramp_gen_method_magic(drive_next, drive_obj) == GEN_MAGIC_NEXT) {
@@ -49643,15 +49651,19 @@ static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue
             else it->resume_pc = ITHP_EMIT;
             return 1;
         case JS_ITERATOR_HELPER_KIND_TAKE:
-            if (it->count == 0) {   /* limit reached: close the source, done. */
+            if (it->count == 0) {   /* limit reached: close the source (spec IteratorClose), then deliver done. */
                 it->done = 1;
-                /* Close the source (spec: IteratorClose on the limit). A PLAIN source closes inline and its .return()
-                   throw PROPAGATES (never swallowed). A GENERATOR/HELPER source's .return() must run on the tramp
-                   (js_generator_next is a DFAIL) — a close-then-deliver follow-up; left suspended here for now. */
-                if (tramp_gen_method_magic(it->next, it->obj) != GEN_MAGIC_NEXT
-                    && !tramp_can_call_iter_helper(it->next, it->obj)) {
-                    if (JS_IteratorClose(ctx, it->obj, false)) return -1;
+                if (tramp_gen_method_magic(it->next, it->obj) == GEN_MAGIC_NEXT) {
+                    /* GENERATOR source: run its .return() (finally) on the tramp, then deliver {undefined,true} at
+                       ITHP_TAKE_CLOSE. Never a drive-to-completion, never left suspended. */
+                    it->drive_close = 1;
+                    it->resume_pc = ITHP_TAKE_CLOSE;
+                    return 1;
                 }
+                /* PLAIN / HELPER source: close inline, propagating its .return() throw. A helper chain that bottoms out
+                   at a GENERATOR hits the js_generator_next DFAIL — the forcing function to route that close onto the
+                   tramp too (not papered over). */
+                if (JS_IteratorClose(ctx, it->obj, false)) return -1;
                 *out = js_create_iterator_result(ctx, JS_UNDEFINED, true);
                 return JS_IsException(*out) ? -1 : 0;
             }
@@ -49681,6 +49693,11 @@ static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue
         it->resume_pc = ITHP_EMIT;
         return 1;
     }
+    case ITHP_TAKE_CLOSE:   /* take limit: the source's .return() (finally) ran on the tramp; discard it, deliver done */
+        JS_FreeValue(ctx, res);
+        it->resume_pc = ITHP_START;
+        *out = js_create_iterator_result(ctx, JS_UNDEFINED, true);
+        return JS_IsException(*out) ? -1 : 0;
     case ITHP_EMIT: {
         JSValue dv = JS_GetProperty(ctx, res, JS_ATOM_done);
         int d;
