@@ -22422,7 +22422,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             if (unlikely(g_flow_control.preempt != NULL) && g_flow_control.preempt()) {
                 FLOW_PREEMPT_COUNT(g_flow_preempt_requested);
                 if (gen_state == g_flow_base_gen) { FLOW_PREEMPT_COUNT(g_flow_preempt_fired); goto do_preempt; }
-                DFAIL("nested-flow loop preempted — yield-to-scheduler at depth (suspend the whole nested flow as one snapshot, resume it in place) NOT YET BUILT; never drive to completion");
+                if (gen_state == NULL)
+                    DFAIL("loop preempted in a NON-coroutine activation (gen_state NULL): its C entry never became a flow base — route that caller onto the tramp chain");
+                DFAIL("loop preempted in a coroutine activation that is not the flow base: give that resume path a resume-as-flow driver (park + resume job), never drive to completion");
             }
             BREAK;
         CASE(OP_goto16):
@@ -22432,7 +22434,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             if (unlikely(g_flow_control.preempt != NULL) && g_flow_control.preempt()) {
                 FLOW_PREEMPT_COUNT(g_flow_preempt_requested);
                 if (gen_state == g_flow_base_gen) { FLOW_PREEMPT_COUNT(g_flow_preempt_fired); goto do_preempt; }
-                DFAIL("nested-flow loop preempted — yield-to-scheduler at depth NOT YET BUILT; never drive to completion");
+                /* Name WHICH activation cannot park, so the missing driver is identified rather than guessed:
+                   a NON-coroutine frame (gen_state NULL — reached via a C entry that never established a flow
+                   base) needs its caller routed onto the tramp; a coroutine frame that simply is not the base
+                   needs its own resume-as-flow driver (park + re-enter via a resume job). */
+                if (gen_state == NULL)
+                    DFAIL("loop preempted in a NON-coroutine activation (gen_state NULL): its C entry never became a flow base — route that caller onto the tramp chain");
+                DFAIL("loop preempted in a coroutine activation that is not the flow base: give that resume path a resume-as-flow driver (park + resume job), never drive to completion");
             }
             BREAK;
         CASE(OP_goto8):
@@ -22442,7 +22450,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             if (unlikely(g_flow_control.preempt != NULL) && g_flow_control.preempt()) {
                 FLOW_PREEMPT_COUNT(g_flow_preempt_requested);
                 if (gen_state == g_flow_base_gen) { FLOW_PREEMPT_COUNT(g_flow_preempt_fired); goto do_preempt; }
-                DFAIL("nested-flow loop preempted — yield-to-scheduler at depth NOT YET BUILT; never drive to completion");
+                /* Name WHICH activation cannot park, so the missing driver is identified rather than guessed:
+                   a NON-coroutine frame (gen_state NULL — reached via a C entry that never established a flow
+                   base) needs its caller routed onto the tramp; a coroutine frame that simply is not the base
+                   needs its own resume-as-flow driver (park + re-enter via a resume job). */
+                if (gen_state == NULL)
+                    DFAIL("loop preempted in a NON-coroutine activation (gen_state NULL): its C entry never became a flow base — route that caller onto the tramp chain");
+                DFAIL("loop preempted in a coroutine activation that is not the flow base: give that resume path a resume-as-flow driver (park + resume job), never drive to completion");
             }
             BREAK;
         CASE(OP_if_true):
