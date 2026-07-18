@@ -461,6 +461,10 @@ static inline bool JS_VALUE_IS_NAN(JSValue v)
 /* allow top-level await in normal script. JS_Eval() returns a
    promise. Only allowed with JS_EVAL_TYPE_GLOBAL */
 #define JS_EVAL_FLAG_ASYNC (1 << 7)
+/* INTERNAL: return the eval'd program as a CLOSURE instead of calling it, so the interpreter can dispatch it on the
+   trampoline chain. Without this the eval body runs in its own activation off the chain, and a loop inside it cannot
+   park for the scheduler (gen_state != flow base). */
+#define JS_EVAL_FLAG_TRAMP_CLOSURE (1 << 8)
 
 typedef JSValue JSCFunction(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 typedef JSValue JSCFunctionMagic(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);

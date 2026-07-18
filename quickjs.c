@@ -18487,8 +18487,12 @@ typedef struct JSIterConsume {
     uint8_t orig_is_tail;
     uint8_t sink;    /* ITERCONS_FROM / _SPREAD / _SET / _MAP / _OBJENTRIES / _SETOP — the drive is identical; only the per-element sink + setup + finish differ */
     uint8_t setop;   /* SETOP_* — which Set.prototype set-operation rule ITERCONS_SETOP applies per element */
+    /* ITERCONS_OWNED lists EVERY owned JSValue field exactly once: clone_deep_flow dups each and js_iter_consume_end
+       frees each, so the two can never drift. A field added to the struct but not to this list is shared by a fork
+       and refcount-underflows on the second teardown. */
     uint8_t closing; /* 1 = the sink short-circuited: close the iterator on the tramp, then finish */
 } JSIterConsume;
+#define ITERCONS_OWNED(F) F(r) F(iter) F(next) F(adder) F(mapfn) F(mapfn_this)
 static int js_iter_consume_step(JSContext *ctx, struct JSIterConsume *s, JSValue res);
 static void js_iter_consume_end(JSContext *ctx, struct JSIterConsume *s);
 /* Set-record primitives — ITERCONS_SETOP folds setlike.keys() straight into the result's [[SetData]] (the spec
@@ -18629,6 +18633,18 @@ static JSValue js_function_call(JSContext *ctx, JSValueConst this_val, int argc,
    an input iterator's .next). It holds NO continuation, so like f.call it is RESOLVED at the operator site and the
    ultimate target dispatched on this chain; JS_Call'ing it from C would drive a generator .next off the tramp. */
 static JSValue js_call_function(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+/* INDIRECT eval — (0,eval)(src) reaches the js_global_eval C builtin, which would run the program in its own
+   activation off the chain (a loop inside it then has no base to park into). Recognize it at the call site and
+   trampoline the compiled closure, exactly as OP_eval does for direct eval. */
+static JSValue js_global_eval(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static inline bool tramp_is_global_eval(JSValueConst method) {
+    JSObject *mp;
+    if (JS_VALUE_GET_TAG(method) != JS_TAG_OBJECT) return false;
+    mp = JS_VALUE_GET_OBJ(method);
+    return mp->class_id == JS_CLASS_C_FUNCTION
+        && mp->u.cfunc.cproto == JS_CFUNC_generic
+        && mp->u.cfunc.c_function.generic == js_global_eval;
+}
 static inline bool tramp_is_call_function(JSValueConst method) {
     JSObject *mp;
     if (JS_VALUE_GET_TAG(method) != JS_TAG_OBJECT) return false;
@@ -19475,6 +19491,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 if (tramp_is_call_function(call_argv[-1]) && call_argc >= 2) {   /* builtins' call(thisArg,f,...) -> dispatch f here */
                     tramp_is_tail = (opcode == OP_tail_call); goto do_forward_callfn;
+                }
+                /* Same-realm only: js_call_c_function would switch to the eval function's realm, so a cross-realm
+                   (0,evalFromOtherRealm)(src) must keep the C path — its program belongs to THAT realm's global. */
+                if (tramp_is_global_eval(call_argv[-1]) && call_argc >= 1 && JS_IsString(call_argv[0])
+                    && js_same_value(ctx, call_argv[-1], ctx->eval_obj)) {
+                    /* INDIRECT eval: compile to a closure and run its body on THIS chain so its loops park. */
+                    JSValue eclo = JS_EvalObject(ctx, ctx->global_obj, call_argv[0],
+                                                 JS_EVAL_TYPE_INDIRECT | JS_EVAL_FLAG_TRAMP_CLOSURE, -1);
+                    if (unlikely(JS_IsException(eclo))) goto exception;
+                    DCHECK(tramp_can_call(eclo), "indirect eval closure is not a trampolinable bytecode function");
+                    for (i = -1; i < call_argc; i++) JS_FreeValue(ctx, call_argv[i]);
+                    sp = (JSValue *)call_argv;
+                    ((JSValue *)call_argv)[-1] = eclo;
+                    call_argc = 0; tramp_first = -1; tramp_is_tail = (opcode == OP_tail_call);
+                    goto do_tramp_call;
                 }
                 ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
                                           JS_UNDEFINED, call_argc,
@@ -21891,8 +21922,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         obj = call_argv[0];
                     else
                         obj = JS_UNDEFINED;
-                    ret_val = JS_EvalObject(ctx, JS_UNDEFINED, obj,
-                                            JS_EVAL_TYPE_DIRECT, scope_idx);
+                    if (JS_IsString(obj)) {
+                        /* DIRECT eval: compile to a CLOSURE and run its body on THIS tramp chain, so a loop inside
+                           the eval'd program parks for the scheduler exactly like one in any other function. Running
+                           it via JS_CallFree would give it its own activation off the chain, where a back-edge
+                           preempt has no base to park into. */
+                        JSValue eclo = JS_EvalObject(ctx, JS_UNDEFINED, obj,
+                                                     JS_EVAL_TYPE_DIRECT | JS_EVAL_FLAG_TRAMP_CLOSURE, scope_idx);
+                        if (unlikely(JS_IsException(eclo))) goto exception;
+                        DCHECK(tramp_can_call(eclo), "direct eval closure is not a trampolinable bytecode function");
+                        /* reshape [eval, args..] -> the plain-call shape [closure] with 0 args */
+                        for (i = -1; i < call_argc; i++) JS_FreeValue(ctx, call_argv[i]);
+                        sp = (JSValue *)call_argv;
+                        ((JSValue *)call_argv)[-1] = eclo;
+                        call_argc = 0; tramp_first = -1; tramp_is_tail = 0;
+                        goto do_tramp_call;
+                    }
+                    ret_val = js_dup(obj);   /* non-string direct eval yields its argument unchanged */
                 } else {
                     ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
                                               JS_UNDEFINED, call_argc,
@@ -25081,13 +25127,15 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                 JSIterConsume *os = (JSIterConsume *)otf->cont_state;
                 JSIterConsume *ns = js_malloc(ctx, sizeof(*ns));
                 if (!ns) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
+                /* The struct copy SHARES every field, so each OWNED JSValue must be re-dup'd. That list lives in ONE
+                   place (ITERCONS_OWNED) which js_iter_consume_end also frees, so a new field cannot be dup'd here
+                   and left unfreed there (or vice versa) — the omission that co-owned `next` across two flows and
+                   underflowed its refcount. r is the SHARED result (COW-isolated per flow); iter is the SHARED
+                   generator (gen-COW-isolated above); k/orig are copied by the assignment. */
                 *ns = *os;
-                ns->r = js_dup(os->r);
-                ns->iter = js_dup(os->iter);
-                ns->next = js_dup(os->next);     /* the iterator's .next method — the struct copy SHARES it otherwise */
-                ns->adder = js_dup(os->adder);   /* SET/MAP add/set method (UNDEFINED for FROM/SPREAD) */
-                ns->mapfn = js_dup(os->mapfn);   /* Array.from(gen, fn) mapfn + thisArg (UNDEFINED otherwise) */
-                ns->mapfn_this = js_dup(os->mapfn_this);
+                #define ITERCONS_DUP_ONE(f) ns->f = js_dup(os->f);
+                ITERCONS_OWNED(ITERCONS_DUP_ONE)
+                #undef ITERCONS_DUP_ONE
                 ct->cont_state = ns;
             } else if (otf->cont_kind == CONT_ASYNC_FROM_SYNC) {
                 /* `for await (x of syncGen)` forked mid-syncGen.next(): each .next() is INDEPENDENT (no cross-element
@@ -42184,6 +42232,11 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
     }
     if (flags & JS_EVAL_FLAG_COMPILE_ONLY) {
         ret_val = fun_obj;
+    } else if ((flags & JS_EVAL_FLAG_TRAMP_CLOSURE) && m == NULL
+               && JS_VALUE_GET_TAG(fun_obj) == JS_TAG_FUNCTION_BYTECODE) {
+        /* Hand the CLOSURE back so the caller can trampoline the body on its own chain (a loop inside the eval then
+           parks for the scheduler like any other flow). Module eval keeps the promise-returning path. */
+        ret_val = js_closure(ctx, fun_obj, var_refs, sf);
     } else {
         ret_val = JS_EvalFunctionInternal(ctx, fun_obj, this_obj, var_refs, sf);
     }
@@ -47304,12 +47357,9 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
    DONE finish the caller instead MOVES s->r out and frees s->iter/s->adder inline, so this is the error path only. */
 static void js_iter_consume_end(JSContext *ctx, JSIterConsume *s)
 {
-    JS_FreeValue(ctx, s->r);
-    JS_FreeValue(ctx, s->iter);
-    JS_FreeValue(ctx, s->next);
-    JS_FreeValue(ctx, s->adder);
-    JS_FreeValue(ctx, s->mapfn);
-    JS_FreeValue(ctx, s->mapfn_this);
+    #define ITERCONS_FREE_ONE(f) JS_FreeValue(ctx, s->f);
+    ITERCONS_OWNED(ITERCONS_FREE_ONE)
+    #undef ITERCONS_FREE_ONE
 }
 
 /* Route Array.from ONLY for the direct-generator, single-arg (no mapfn) shape — the case whose C loop drives the
