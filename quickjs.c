@@ -18824,6 +18824,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     int tramp_gen_close = 0;                            /* 1 = OP_iterator_close drive (.return() on an unconsumed generator iterator at sp[-1]): body runs finally on the tramp, result DISCARDED */
     int tramp_gen_close_exc = 0;                        /* 1 = the close is happening DURING exception unwind (JS_IteratorClose(iter,true)): after the finally runs, restore the in-flight exception and continue unwinding (goto exception), never overwrite it */
     JSValueConst tramp_gen_close_slot_gen = JS_UNINITIALIZED; /* close mode: the generator to close comes from ctx->pending_close_gen (an IfAbruptCloseIterator deferral), NOT sp[-1]; caller_sp stays put (nothing on the stack). read+reset in do_generator_tramp */
+    JSValue tramp_gen_close_deliver = JS_UNINITIALIZED;  /* close-then-deliver (helper .return()): after the source generator closes, PUSH this pre-built {value,done:true} as the helper.return() result instead of discarding. read+reset in do_generator_tramp */
     int tramp_gen_create_forof = 0;                     /* 1 = this do_generator_create_tramp is a for-of iterator-getter (OP_for_of_start): at settle, finish the enum_rec ([iterator, next, catch_offset]) instead of pushing the bare object */
     void *tramp_gen_create_cont_it = NULL;              /* non-NULL = this do_generator_create_tramp creates an iterator from a generator-function @@iterator called by a driver (flatMap inner or a C consumer): the settle stores the created iterator on that driver and re-enters its step, never pushes it. read+reset in do_generator_create_tramp */
     uint8_t tramp_gen_create_cont_kind = 0;             /* CONT_* of tramp_gen_create_cont_it: CONT_ITER_HELPER (flatMap inner) / CONT_ITER_CONSUME (Array.from etc.) */
@@ -19530,6 +19531,44 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 if (tramp_can_call_iter_helper(call_argv[-1], call_argv[-2])) {   /* lazy Iterator Helper .next() over a generator source -> drive it on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_iter_helper_tramp;
+                }
+                /* iter.return(v) on a lazy Iterator Helper whose SOURCE is a generator: close the source (its finally
+                   runs on the tramp), then deliver {value:v, done:true}. call_argv[-2]=helper, [-1]=return method. A
+                   generator INNER (flatMap mid-iteration) or a tail-call return() is a follow-up (not routed here). */
+                if (opcode != OP_tail_call_method
+                    && JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT && JS_VALUE_GET_TAG(call_argv[-2]) == JS_TAG_OBJECT) {
+                    JSObject *rmp = JS_VALUE_GET_OBJ(call_argv[-1]);
+                    JSObject *rhp = JS_VALUE_GET_OBJ(call_argv[-2]);
+                    if (rmp->class_id == JS_CLASS_C_FUNCTION && rmp->u.cfunc.cproto == JS_CFUNC_iterator_next
+                        && rmp->u.cfunc.c_function.iterator_next == js_iterator_helper_next
+                        && rmp->u.cfunc.magic == GEN_MAGIC_RETURN
+                        && rhp->class_id == JS_CLASS_ITERATOR_HELPER && rhp->u.iterator_helper_data) {
+                        JSIteratorHelperData *it = rhp->u.iterator_helper_data;
+                        JSObject *srcp = (JS_VALUE_GET_TAG(it->obj) == JS_TAG_OBJECT) ? JS_VALUE_GET_OBJ(it->obj) : NULL;
+                        bool inner_is_gen = JS_VALUE_GET_TAG(it->inner) == JS_TAG_OBJECT
+                            && JS_VALUE_GET_OBJ(it->inner)->class_id == JS_CLASS_GENERATOR;
+                        if (!it->executing && !it->done && !inner_is_gen
+                            && srcp && srcp->class_id == JS_CLASS_GENERATOR && srcp->u.generator_data
+                            && ((JSGeneratorData *)srcp->u.generator_data)->state != JS_GENERATOR_STATE_EXECUTING) {
+                            JSValue arg = (call_argc >= 1) ? js_dup(call_argv[0]) : JS_UNDEFINED;
+                            JSValue result, gen;
+                            it->done = 1;
+                            if (!JS_IsUndefined(it->inner)) {   /* flatMap active PLAIN inner: close it inline */
+                                JS_IteratorClose(ctx, it->inner, false);
+                                JS_FreeValue(ctx, it->inner); it->inner = JS_UNDEFINED;
+                                JS_FreeValue(ctx, it->inner_next); it->inner_next = JS_UNDEFINED;
+                            }
+                            result = js_create_iterator_result(ctx, arg, true);   /* {value:arg, done:true} (consumes arg) */
+                            if (JS_IsException(result)) goto exception;
+                            gen = js_dup(it->obj);   /* the source generator (survives freeing the helper operand) */
+                            for (i = -2; i < call_argc; i++) JS_FreeValue(ctx, call_argv[i]);   /* free helper + method + args */
+                            sp = call_argv - 2;
+                            *sp++ = gen;   /* sp[-1] = the generator for do_generator_tramp close mode */
+                            tramp_gen_close_deliver = result;   /* the settle pushes this at call_argv[-2] (the call result slot) */
+                            tramp_gen_magic = GEN_MAGIC_RETURN; tramp_gen_close = 1;
+                            goto do_generator_tramp;
+                        }
+                    }
                 }
                 /* generator .next() via APPLY reflection — the two forms whose C-function target the apply site above
                    rejects (tramp_can_call is false for js_generator_next), so they'd fall to the js_generator_next
@@ -20801,6 +20840,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 tramp_gen_forof = 1;   /* reset to the direct-call sentinel */
                 JSValueConst close_slot = tramp_gen_close_slot_gen; tramp_gen_close_slot_gen = JS_UNINITIALIZED;   /* read+reset */
                 bool close_from_slot = !JS_IsUninitialized(close_slot);   /* IfAbruptCloseIterator deferral: generator NOT on the stack */
+                JSValue close_deliver = tramp_gen_close_deliver; tramp_gen_close_deliver = JS_UNINITIALIZED;   /* helper .return(): {value,done:true} to PUSH after the close (owned), instead of discarding */
                 /* close: generator iterator at sp[-1] (or from close_slot when a C deferral), .return() with no arg,
                    result discarded. iternext: iterator at sp[-4], resume arg at sp[-1]. for-of: iterator at sp[fofoff].
                    cont-consume: generator in the state. direct: receiver at call_argv[-2]. */
@@ -20847,6 +20887,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         }
                         JS_FreeValue(ctx, sp[-1]);   /* the generator iterator */
                         sp--;
+                        if (!JS_IsUninitialized(close_deliver)) { *sp++ = close_deliver; }   /* helper .return(): the {value,done:true} result */
                         BREAK;
                     }
                     if (iternext) {   /* OP_iterator_next: the iterator-result OBJECT replaces the resume arg at sp[-1] */
@@ -20903,7 +20944,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         JS_FreeValue(ctx, sp[-1]);   /* free the stack operand; async_promise holds the drive ref */
                         gtf->caller_sp = sp - 1;      /* the close consumes the iterator slot */
                         gtf->is_tail = 3;
-                        gtf->close_saved_exc = JS_UNINITIALIZED;
+                        gtf->close_saved_exc = close_deliver;   /* UNINITIALIZED, or helper .return()'s {value,done:true} to push at settle */
                     }
                 } else if (iternext) {
                     /* OP_iterator_next (yield* / destructuring): the iterator STAYS on the caller stack at sp[-4]
@@ -20986,6 +21027,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int gmode = gtf->is_tail;   /* 0=direct .next(); 1=for-of; 2=OP_iterator_next; 3=close; 4=close-during-unwind */
                 uint8_t gtail = gtf->gen_tailcall;   /* direct drive via `return g.next()` — result is the caller's return value */
                 JSValue close_e = (gmode == 4) ? gtf->close_saved_exc : JS_UNINITIALIZED;   /* saved before gtf is freed */
+                JSValue gclose_deliver = (gmode == 3) ? gtf->close_saved_exc : JS_UNINITIALIZED;   /* helper .return(): {value,done:true} to push after close */
                 void *gcont = gtf->cont_state; uint8_t gck = gtf->cont_kind;   /* consumer drive: re-enter its step with the result */
                 bool forof = (gmode == 1);
                 JSStackFrame *gsf = &gs->func_state.frame;
@@ -21014,8 +21056,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc = sf->cur_pc; sp = gtf->caller_sp;
                 js_free_rt(rt, gtf);
                 JS_FreeValue(ctx, ghold);   /* direct/close: drop the body-run ref; for-of/iternext: UNDEFINED (iterator on stack) */
-                if (gmode == 3) {   /* OP_iterator_close: .return() ran (finally); its result is DISCARDED, sp = caller_sp (iterator popped) */
+                if (gmode == 3) {   /* OP_iterator_close: .return() ran (finally); result DISCARDED, sp = caller_sp (iterator popped) */
                     JS_FreeValue(ctx, value);
+                    if (!JS_IsUninitialized(gclose_deliver)) { *sp++ = gclose_deliver; }   /* helper .return(): the {value,done:true} result */
                     BREAK;
                 }
                 if (gmode == 4) {   /* OP_iterator_close DURING exception unwind: finally ran (completed normally);
