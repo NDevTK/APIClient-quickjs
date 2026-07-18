@@ -20346,18 +20346,31 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
 
         do_spread_consume_tramp:
-            /* [...gen] (OP_append): CONSUME the generator on this chain, appending to the array literal being built
-               at sp[-3] from position sp[-2]. sp[-1] IS the generator (checked at OP_append). Mirrors
-               js_append_enumerate's general_case loop, but the .next() body runs on the tramp (suspend/resume). */
+            /* [...iterable] (OP_append): GetIterator(iterable) via the @@iterator method (from tramp_iter_getiter),
+               then CONSUME it on this chain, appending to the array being built at sp[-3] from position sp[-2].
+               A generator-function @@iterator is created on the tramp; else GetIterator2 inline. The spread operands
+               [array, pos, iterable] at sp[-3..-1] stay put below any transient create push. */
             {
+                JSValueConst iterable = sp[-1];
+                JSValue method = tramp_iter_getiter; tramp_iter_getiter = JS_UNDEFINED;
                 JSIterConsume *s = js_mallocz(ctx, sizeof(*s));
-                if (unlikely(!s)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                if (unlikely(!s)) { JS_FreeValue(ctx, method); JS_ThrowOutOfMemory(ctx); goto exception; }
                 s->r = js_dup(sp[-3]);            /* the array being built — a shared ref; appends land on sp[-3] too */
-                s->iter = js_dup(sp[-1]);         /* the generator */
+                s->iter = JS_UNDEFINED;
                 s->adder = JS_UNDEFINED;
                 s->mapfn = JS_UNDEFINED; s->mapfn_this = JS_UNDEFINED;
                 s->k = JS_VALUE_GET_INT(sp[-2]);  /* the current append position */
                 s->sink = ITERCONS_SPREAD;
+                if (tramp_can_call_gen_create(method)) {
+                    *sp++ = js_dup(iterable);   /* this */
+                    *sp++ = method;             /* gfunc (owned, transferred) */
+                    call_argv = sp; call_argc = 0; tramp_first = -2; tramp_is_tail = 0;
+                    tramp_gen_create_cont_it = s; tramp_gen_create_cont_kind = CONT_ITER_CONSUME;
+                    goto do_generator_create_tramp;
+                }
+                s->iter = JS_GetIterator2(ctx, iterable, method);
+                JS_FreeValue(ctx, method);
+                if (JS_IsException(s->iter)) { s->iter = JS_UNDEFINED; js_iter_consume_end(ctx, s); js_free_rt(rt, s); goto exception; }
                 cont_st = s; cont_kind_cur = CONT_ITER_CONSUME;
                 ret_val = JS_UNINITIALIZED;
                 goto do_iter_consume_step;
@@ -23091,13 +23104,24 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_append):    /* array pos enumobj -- array pos */
             {
                 sf->cur_pc = pc;
-                /* [...gen]: consume the generator on THIS chain (its .next() body suspend/resumes) rather than the
-                   C-recursion drive-to-completion js_append_enumerate's loop would use. sp[-1] a generator => its
-                   @@iterator returns itself; the spread consumer appends to sp[-3] from sp[-2] and pops the iterable. */
+                /* [...iterable]: consume on THIS chain (the .next() body suspend/resumes) rather than the C-recursion
+                   drive-to-completion js_append_enumerate's loop would use — WHEN the iterator will be a generator/
+                   helper: a generator-function @@iterator (created on the tramp) or a direct generator/helper (its
+                   @@iterator returns itself). Read @@iterator once (Spread's own GetIterator step); do_spread_consume_tramp
+                   reuses it. Plain-C iterables (arrays/sets) + array-likes stay on the C js_append_enumerate path. */
                 if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) {
                     JSObject *ip = JS_VALUE_GET_OBJ(sp[-1]);
-                    if (ip->class_id == JS_CLASS_GENERATOR && ip->u.generator_data)
+                    JSValue m = JS_GetProperty(ctx, sp[-1], JS_ATOM_Symbol_iterator);
+                    if (JS_IsException(m)) goto exception;
+                    if (JS_IsFunction(ctx, m)
+                        && (tramp_can_call_gen_create(m)
+                            || (ip->class_id == JS_CLASS_GENERATOR && ip->u.generator_data)
+                            || (ip->class_id == JS_CLASS_ITERATOR_HELPER && ip->u.iterator_helper_data
+                                && !ip->u.iterator_helper_data->executing && !ip->u.iterator_helper_data->done))) {
+                        tramp_iter_getiter = m;
                         goto do_spread_consume_tramp;
+                    }
+                    JS_FreeValue(ctx, m);
                 }
                 if (js_append_enumerate(ctx, sp))
                     goto exception;
