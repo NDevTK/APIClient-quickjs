@@ -18255,7 +18255,9 @@ typedef struct JSIteratorHelperData {
     uint8_t drive_mode;  /* how helper.next() was invoked: ITH_DIRECT / ITH_FOROF / ITH_ITERNEXT (finish differs) */
     int forof_off;       /* for-of/iternext: the helper iterator's caller-stack offset */
     int orig_cargc; uint8_t orig_is_tail;   /* direct-mode operand shape for the finish */
-    struct JSIteratorHelperData *consumer;   /* ITH_CONSUME: the OUTER helper whose step awaits this one's {value,done} */
+    void *consumer;          /* ITH_CONSUME: the consumer step awaiting this helper's {value,done} — a JSIteratorHelperData
+                                (helper-drives-helper), a JSIterConsume (Array.from/spread/Set/Map), etc. per consumer_kind */
+    uint8_t consumer_kind;   /* CONT_* of `consumer`: CONT_ITER_HELPER / CONT_ITER_CONSUME / ... — how to re-enter it */
 } JSIteratorHelperData;
 enum { ITH_DIRECT = 0, ITH_FOROF, ITH_ITERNEXT, ITH_CONSUME };
 enum { ITHP_START = 0, ITHP_DROP_SKIP, ITHP_EMIT };   /* resume_pc values */
@@ -20360,8 +20362,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     *sp++ = r;
                     BREAK;
                 }
-                /* CALL: drive s->iter.next() — a generator, so its body runs on this chain (do_generator_tramp
-                   cont-consume mode); the generator settle re-enters this step with the {value,done} result. */
+                /* CALL: drive s->iter.next() on this chain. A HELPER source drives via the helper tramp (ITH_CONSUME,
+                   delivering {value,done} back to THIS step); a GENERATOR source runs its body via do_generator_tramp
+                   cont-consume. Either settle re-enters do_iter_consume_step with the result. */
+                if (JS_VALUE_GET_TAG(s->iter) == JS_TAG_OBJECT
+                    && JS_VALUE_GET_OBJ(s->iter)->class_id == JS_CLASS_ITERATOR_HELPER) {
+                    JSIteratorHelperData *hs = JS_VALUE_GET_OBJ(s->iter)->u.iterator_helper_data;
+                    hs->executing = 1; hs->resume_pc = ITHP_START;
+                    hs->drive_mode = ITH_CONSUME; hs->consumer = s; hs->consumer_kind = CONT_ITER_CONSUME;
+                    cont_st = hs; cont_kind_cur = CONT_ITER_HELPER;
+                    ret_val = JS_UNINITIALIZED;
+                    goto do_iter_helper_step;
+                }
                 tramp_cont_state = s; tramp_cont_kind = CONT_ITER_CONSUME; tramp_gen_cont_iter = s->iter;
                 tramp_gen_cont_consume = 1; tramp_gen_magic = GEN_MAGIC_NEXT;
                 goto do_generator_tramp;
@@ -20570,14 +20582,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (st == 0) {   /* DONE: deliver `out` per drive_mode */
                         it->executing = 0;
                         if (it->drive_mode == ITH_CONSUME) {
-                            /* SOURCE-helper of a chain (map(filter(...))): feed the {value,done} to the OUTER helper's
-                               step. The generator frames below provide suspension; the chain is just cont_st walking
-                               consumer links — no extra frame, no legacy fallback. */
-                            JSIteratorHelperData *outer = it->consumer;
+                            /* This helper is a SOURCE being consumed: feed its {value,done} back to the awaiting consumer
+                               step (another helper for a chain map(filter(..)), or a C consumer Array.from/spread/Set/Map).
+                               The generator frames below provide suspension; no extra frame, no legacy fallback. */
+                            void *cons = it->consumer; uint8_t ck = it->consumer_kind;
                             it->consumer = NULL;
-                            it = outer;
                             ret_val = out;
-                            continue;
+                            if (ck == CONT_ITER_HELPER) { it = (JSIteratorHelperData *)cons; continue; }
+                            cont_st = cons; cont_kind_cur = ck;
+                            if (ck == CONT_ITER_CONSUME) goto do_iter_consume_step;
+                            if (ck == CONT_PROMISE_ALL) goto do_promise_all_step;
+                            if (ck == CONT_ASYNC_FROM_SYNC) goto do_async_from_sync_step;
+                            DFAIL("do_iter_helper_step: ITH_CONSUME consumer_kind not routed");
+                            goto exception;
                         }
                         if (it->drive_mode == ITH_DIRECT) {
                             uint8_t itail = it->orig_is_tail;
@@ -20612,7 +20629,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            whose consumer is this helper; walk down (its DONE re-enters here for `it`). */
                         JSIteratorHelperData *inner = JS_VALUE_GET_OBJ(it->obj)->u.iterator_helper_data;
                         inner->executing = 1; inner->resume_pc = ITHP_START;
-                        inner->drive_mode = ITH_CONSUME; inner->consumer = it;
+                        inner->drive_mode = ITH_CONSUME; inner->consumer = it; inner->consumer_kind = CONT_ITER_HELPER;
                         it = inner;
                         continue;
                     }
@@ -46596,7 +46613,11 @@ static bool tramp_can_call_iter_consume(JSContext *ctx, JSValueConst func, JSVal
     if (fp->u.cfunc.c_function.generic != js_array_from) return false;
     if (JS_VALUE_GET_TAG(call_argv[0]) != JS_TAG_OBJECT) return false;
     ip = JS_VALUE_GET_OBJ(call_argv[0]);
-    if (ip->class_id != JS_CLASS_GENERATOR || ip->u.generator_data == NULL) return false;
+    /* source must be a GENERATOR or a live ITERATOR HELPER (both drive their .next() on the tramp). */
+    if (!((ip->class_id == JS_CLASS_GENERATOR && ip->u.generator_data)
+          || (ip->class_id == JS_CLASS_ITERATOR_HELPER && ip->u.iterator_helper_data
+              && !ip->u.iterator_helper_data->executing && !ip->u.iterator_helper_data->done)))
+        return false;
     /* a mapfn arg, if present and not undefined, MUST be callable — else Array.from throws EARLY (before GetIterator);
        leave that to the normal path rather than routing (recognition must not throw). thisArg (argv[2]) is free. */
     if (call_argc >= 2 && !JS_IsUndefined(call_argv[1]) && !JS_IsFunction(ctx, call_argv[1])) return false;
