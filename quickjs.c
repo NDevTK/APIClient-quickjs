@@ -18258,9 +18258,11 @@ typedef struct JSIteratorHelperData {
     void *consumer;          /* ITH_CONSUME: the consumer step awaiting this helper's {value,done} — a JSIteratorHelperData
                                 (helper-drives-helper), a JSIterConsume (Array.from/spread/Set/Map), etc. per consumer_kind */
     uint8_t consumer_kind;   /* CONT_* of `consumer`: CONT_ITER_HELPER / CONT_ITER_CONSUME / ... — how to re-enter it */
+    JSValue inner_next;      /* flatMap: the inner iterator's .next method (its source runs on the tramp too) */
+    uint8_t drive_inner;     /* flatMap: 1 = the next DRIVE targets it->inner (not it->obj) */
 } JSIteratorHelperData;
 enum { ITH_DIRECT = 0, ITH_FOROF, ITH_ITERNEXT, ITH_CONSUME };
-enum { ITHP_START = 0, ITHP_DROP_SKIP, ITHP_EMIT };   /* resume_pc values */
+enum { ITHP_START = 0, ITHP_DROP_SKIP, ITHP_EMIT, ITHP_FLATMAP_SRC, ITHP_FLATMAP_INNER };   /* resume_pc values */
 static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue res, JSValue *out);
 static bool tramp_can_call_iter_helper(JSValueConst func, JSValueConst this_val);
 static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int *pdone, int magic);
@@ -20617,24 +20619,28 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         DFAIL("do_iter_helper_step: iternext delivery not built yet");
                         JS_FreeValue(ctx, out); goto exception;
                     }
-                    /* st == 1: DRIVE source.next(). */
-                    if (tramp_gen_method_magic(it->next, it->obj) == GEN_MAGIC_NEXT) {
-                        /* GENERATOR source: run its body on the tramp; the settle re-enters do_iter_helper_step. */
-                        tramp_cont_state = it; tramp_cont_kind = CONT_ITER_HELPER; tramp_gen_cont_iter = it->obj;
+                    /* st == 1: DRIVE the current target's .next() — the SOURCE (it->obj/it->next), or for flatMap
+                       iterating an inner iterable, the INNER (it->inner/it->inner_next). Either can be a generator
+                       (runs on the tramp), a helper (ITH_CONSUME chain), or a plain iterator (in-loop call). */
+                    JSValueConst drive_obj  = it->drive_inner ? it->inner : it->obj;
+                    JSValueConst drive_next = it->drive_inner ? it->inner_next : it->next;
+                    if (tramp_gen_method_magic(drive_next, drive_obj) == GEN_MAGIC_NEXT) {
+                        /* GENERATOR: run its body on the tramp; the settle re-enters do_iter_helper_step. */
+                        tramp_cont_state = it; tramp_cont_kind = CONT_ITER_HELPER; tramp_gen_cont_iter = drive_obj;
                         tramp_gen_cont_consume = 1; tramp_gen_magic = GEN_MAGIC_NEXT;
                         goto do_generator_tramp;
                     }
-                    if (tramp_can_call_iter_helper(it->next, it->obj)) {
-                        /* HELPER source (chaining, e.g. map(filter(g))): drive the inner helper as an ITH_CONSUME
-                           whose consumer is this helper; walk down (its DONE re-enters here for `it`). */
-                        JSIteratorHelperData *inner = JS_VALUE_GET_OBJ(it->obj)->u.iterator_helper_data;
+                    if (tramp_can_call_iter_helper(drive_next, drive_obj)) {
+                        /* HELPER (chaining map(filter(g)), or a flatMap inner that is itself a helper): drive it as an
+                           ITH_CONSUME whose consumer is this helper; walk down (its DONE re-enters here for `it`). */
+                        JSIteratorHelperData *inner = JS_VALUE_GET_OBJ(drive_obj)->u.iterator_helper_data;
                         inner->executing = 1; inner->resume_pc = ITHP_START;
                         inner->drive_mode = ITH_CONSUME; inner->consumer = it; inner->consumer_kind = CONT_ITER_HELPER;
                         it = inner;
                         continue;
                     }
-                    /* PLAIN source: call source.next() (non-suspending) and feed the result back to the step. */
-                    ret_val = JS_Call(ctx, it->next, it->obj, 0, NULL);
+                    /* PLAIN: call .next() (non-suspending) and feed the result back to the step. */
+                    ret_val = JS_Call(ctx, drive_next, drive_obj, 0, NULL);
                     if (JS_IsException(ret_val)) { ret_val = JS_UNINITIALIZED; it->executing = 0; goto exception; }
                     if (!JS_IsObject(ret_val)) { JS_FreeValue(ctx, ret_val); ret_val = JS_UNINITIALIZED; it->executing = 0; JS_ThrowTypeError(ctx, "iterator result not an object"); goto exception; }
                 }
@@ -49262,6 +49268,7 @@ static JSValue js_create_iterator_helper(JSContext *ctx, JSValueConst this_val,
     it->func = js_dup(func);
     it->next = method;
     it->inner = JS_UNDEFINED;
+    it->inner_next = JS_UNDEFINED;
     it->count = count;
     it->executing = 0;
     it->done = 0;
@@ -49318,6 +49325,10 @@ static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue
         case JS_ITERATOR_HELPER_KIND_MAP:
         case JS_ITERATOR_HELPER_KIND_FILTER:
             it->resume_pc = ITHP_EMIT;   /* drive the source; EMIT applies the callback */
+            return 1;
+        case JS_ITERATOR_HELPER_KIND_FLAT_MAP:
+            if (!JS_IsUndefined(it->inner)) { it->drive_inner = 1; it->resume_pc = ITHP_FLATMAP_INNER; }   /* continue the active inner */
+            else { it->drive_inner = 0; it->resume_pc = ITHP_FLATMAP_SRC; }   /* pull the next source value */
             return 1;
         default:
             DFAIL("js_iter_helper_step: kind not built on the tramp");
@@ -49376,6 +49387,61 @@ static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue
             return 1;
         }
     }
+    case ITHP_FLATMAP_SRC: {
+        /* res = SOURCE {value,done}. Map the value to an inner iterable, get its iterator, then drive the inner. */
+        JSValue dv = JS_GetProperty(ctx, res, JS_ATOM_done);
+        int d;
+        if (JS_IsException(dv)) { JS_FreeValue(ctx, res); return -1; }
+        d = JS_ToBoolFree(ctx, dv);
+        if (d) { it->done = 1; it->resume_pc = ITHP_START; JS_FreeValue(ctx, res); *out = js_create_iterator_result(ctx, JS_UNDEFINED, true); return JS_IsException(*out) ? -1 : 0; }
+        {
+            JSValue v = JS_GetProperty(ctx, res, JS_ATOM_value);
+            JSValue idx, mapped, method, iter;
+            JSValueConst args[2];
+            JS_FreeValue(ctx, res);
+            if (JS_IsException(v)) return -1;
+            idx = js_int64(it->count++);
+            args[0] = v; args[1] = idx;
+            mapped = JS_Call(ctx, it->func, JS_UNDEFINED, 2, args);
+            JS_FreeValue(ctx, v); JS_FreeValue(ctx, idx);
+            if (JS_IsException(mapped)) return -1;
+            if (!JS_IsObject(mapped)) { JS_FreeValue(ctx, mapped); JS_ThrowTypeError(ctx, "flatMap mapper did not return an object"); return -1; }
+            method = JS_GetProperty(ctx, mapped, JS_ATOM_Symbol_iterator);
+            if (JS_IsException(method)) { JS_FreeValue(ctx, mapped); return -1; }
+            if (JS_IsNull(method) || JS_IsUndefined(method)) {
+                JS_FreeValue(ctx, method);
+                iter = mapped;   /* no [Symbol.iterator]: the mapped object IS the iterator */
+            } else {
+                iter = JS_GetIterator2(ctx, mapped, method);
+                JS_FreeValue(ctx, method); JS_FreeValue(ctx, mapped);
+                if (JS_IsException(iter)) return -1;
+            }
+            it->inner = iter;
+            it->inner_next = JS_GetProperty(ctx, iter, JS_ATOM_next);
+            if (JS_IsException(it->inner_next)) { JS_FreeValue(ctx, it->inner); it->inner = JS_UNDEFINED; it->inner_next = JS_UNDEFINED; return -1; }
+            it->drive_inner = 1;
+            it->resume_pc = ITHP_FLATMAP_INNER;
+            return 1;   /* drive the inner iterator */
+        }
+    }
+    case ITHP_FLATMAP_INNER: {
+        /* res = INNER {value,done}. Emit each inner value; on inner exhaustion drop it and pull the next source value. */
+        JSValue dv = JS_GetProperty(ctx, res, JS_ATOM_done);
+        int d;
+        if (JS_IsException(dv)) { JS_FreeValue(ctx, res); return -1; }
+        d = JS_ToBoolFree(ctx, dv);
+        if (d) {   /* inner exhausted: a naturally-done iterator needs no close; go back to the source */
+            JS_FreeValue(ctx, res);
+            JS_FreeValue(ctx, it->inner); it->inner = JS_UNDEFINED;
+            JS_FreeValue(ctx, it->inner_next); it->inner_next = JS_UNDEFINED;
+            it->drive_inner = 0;
+            it->resume_pc = ITHP_FLATMAP_SRC;
+            return 1;   /* drive the source for the next inner iterable */
+        }
+        it->resume_pc = ITHP_START;   /* the next .next() continues this inner (START re-checks it->inner) */
+        *out = res;   /* emit the inner {value, done:false} */
+        return 0;
+    }
     }
     DFAIL("js_iter_helper_step: bad resume_pc");
     return -1;
@@ -49398,7 +49464,8 @@ static bool tramp_can_call_iter_helper(JSValueConst func, JSValueConst this_val)
     it = tp->u.iterator_helper_data;
     if (!it || it->executing || it->done) return false;
     return it->kind == JS_ITERATOR_HELPER_KIND_DROP || it->kind == JS_ITERATOR_HELPER_KIND_TAKE
-        || it->kind == JS_ITERATOR_HELPER_KIND_MAP || it->kind == JS_ITERATOR_HELPER_KIND_FILTER;   /* built (the step dispatches gen vs plain) */
+        || it->kind == JS_ITERATOR_HELPER_KIND_MAP || it->kind == JS_ITERATOR_HELPER_KIND_FILTER
+        || it->kind == JS_ITERATOR_HELPER_KIND_FLAT_MAP;   /* built (the step dispatches gen vs plain vs inner) */
 }
 
 static void js_iterator_helper_finalizer(JSRuntime *rt, JSValueConst val)
@@ -49410,6 +49477,7 @@ static void js_iterator_helper_finalizer(JSRuntime *rt, JSValueConst val)
         JS_FreeValueRT(rt, it->func);
         JS_FreeValueRT(rt, it->next);
         JS_FreeValueRT(rt, it->inner);
+        JS_FreeValueRT(rt, it->inner_next);
         js_free_rt(rt, it);
     }
 }
@@ -49424,6 +49492,7 @@ static void js_iterator_helper_mark(JSRuntime *rt, JSValueConst val,
         JS_MarkValue(rt, it->func, mark_func);
         JS_MarkValue(rt, it->next, mark_func);
         JS_MarkValue(rt, it->inner, mark_func);
+        JS_MarkValue(rt, it->inner_next, mark_func);
     }
 }
 
