@@ -24564,8 +24564,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 js_json_reviver_end(ctx, (struct JSJsonReviver *)xcs, false);
             else if (xck == CONT_ITER_CONSUME)
                 js_iter_consume_end(ctx, (struct JSIterConsume *)xcs);
-            else
+            else if (xck == CONT_ARRAY_REDUCE)
                 js_array_reduce_end(ctx, (struct JSArrayReduce *)xcs, false);
+            else
+                /* A bare `else` here used to tear the state down AS a JSArrayReduce. Any callback cont kind added
+                   without an arm above would be freed through the wrong struct — silent heap corruption on the
+                   error path only. Name it instead: the missing arm is the bug. */
+                DFAIL("callback frame threw with a cont kind that has no teardown arm — add it here (freeing it as another struct corrupts the heap)");
             js_free_rt(rt, xcs);
         }
         goto exception;
