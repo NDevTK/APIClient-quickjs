@@ -18711,16 +18711,16 @@ static int branch_arm_fork(JSContext *ctx, JSValueConst op1, uint8_t *if_pc,
             /* gen_state != g_flow_base_gen: the branch is in a generator body driven by js_generator_next's
                async_func_resume (a nested JS_CallInternal(GENERATOR)) rather than on the tramp chain. This is the
                residual DRIVE-TO-COMPLETION path, reached ONLY when a generator .next()/.return()/.throw() call
-               BYPASSES the tramp interception. `g.next.call(g)` is now ROUTED (do_forward_call recognizes the
-               reshaped generator-method shape -> do_generator_tramp), as are OP_call_method / OP_for_of_next /
-               OP_iterator_next. The REMAINING bypasses are the APPLY forms whose target flows through the real
-               Function.prototype.apply / Reflect.apply C builtin (tramp_can_call rejects the C-function g.next, so
-               the apply site can't reshape it) and a C builtin invoking the iterator method directly. That path also
-               mishandles a preempt (js_generator_next:23725 would read FUNC_RET_PREEMPT as a yield), so it is doubly
-               wrong under the flow machinery. The ROOT fix is to route those apply drives onto the tramp too (teach
-               the apply sites the generator-method shape), deleting js_generator_next's async_func_resume drive —
-               NOT to teach the fork a second nested-activation identity. Until then this CRASHES loud (replay banned). */
-            DFAIL("generator .next() driven off the tramp chain (Function.prototype.apply / Reflect.apply bypass) — route it through do_generator_tramp; the js_generator_next drive-to-completion is the residue to delete");
+               BYPASSES the tramp interception. All the SCRIPT-LEVEL drives are now routed onto do_generator_tramp:
+               OP_call_method / OP_for_of_next / OP_iterator_next, `g.next.call(g)` (do_forward_call reshape), and
+               `g.next.apply(g,a)` / `Reflect.apply(g.next,g,a)` (OP_call_method apply-reflection reshape). The only
+               remaining bypass is a C BUILTIN invoking the iterator method directly (an internal protocol calling
+               js_generator_next without an interpreter call site to intercept). That path also mishandles a preempt
+               (js_generator_next:23725 would read FUNC_RET_PREEMPT as a yield), so it is doubly wrong under the flow
+               machinery. The ROOT fix is to route that last C-internal drive onto the tramp too, deleting
+               js_generator_next's async_func_resume drive — NOT to teach the fork a second nested-activation
+               identity. Until then this CRASHES loud (replay is banned). */
+            DFAIL("generator .next() driven off the tramp chain (C-builtin-internal drive of js_generator_next) — route it through do_generator_tramp; the js_generator_next drive-to-completion is the residue to delete");
         }
     }
     return harm;
@@ -19478,6 +19478,61 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 {   /* generator .next()/.throw()/.return() -> body runs on THIS chain (loop preempts the base) */
                     int gmag = tramp_gen_method_magic(call_argv[-1], call_argv[-2]);
                     if (gmag >= 0) { tramp_gen_magic = gmag; goto do_generator_tramp; }
+                }
+                /* generator .next() via APPLY reflection — the two forms whose C-function target the apply site above
+                   rejects (tramp_can_call is false for js_generator_next), so they'd fall to the js_generator_next
+                   drive-to-completion. Reshape to the [this=generator, method, resumeArg] shape do_generator_tramp
+                   reads and route it. The args array is read faithfully (build_arg_list = CreateListFromArrayLike,
+                   firing every element getter) though a generator consumes only arg0. */
+                if (tramp_is_function_apply(call_argv[-1])) {   /* g.next.apply(gen, argsArray) */
+                    JSValueConst gen_at = (call_argc >= 1) ? call_argv[0] : JS_UNDEFINED;
+                    JSValueConst arr = (call_argc >= 2) ? call_argv[1] : JS_UNDEFINED;
+                    int arrtag = JS_VALUE_GET_TAG(arr);
+                    int gmag;
+                    if ((arrtag == JS_TAG_UNDEFINED || arrtag == JS_TAG_NULL || arrtag == JS_TAG_OBJECT)
+                        && (gmag = tramp_gen_method_magic(call_argv[-2], gen_at)) >= 0) {
+                        JSValue gnext = (JSValue)call_argv[-2];   /* -> method operand */
+                        JSValue genv = (JSValue)gen_at;           /* -> `this` operand */
+                        JSValue resumeVal = JS_UNDEFINED;
+                        if (arrtag == JS_TAG_OBJECT) {
+                            uint32_t alen = 0; JSValue *atab = build_arg_list(ctx, &alen, arr);
+                            if (!atab) goto exception;
+                            if (alen >= 1) resumeVal = js_dup(atab[0]);
+                            for (uint32_t k = 0; k < alen; k++) JS_FreeValue(ctx, atab[k]);
+                            js_free(ctx, atab);
+                        }
+                        JS_FreeValue(ctx, (JSValue)call_argv[-1]);              /* Function.prototype.apply */
+                        for (int k = 1; k < call_argc; k++) JS_FreeValue(ctx, (JSValue)call_argv[k]);  /* args array + any extra operands */
+                        ((JSValue *)call_argv)[-2] = genv;
+                        ((JSValue *)call_argv)[-1] = gnext;
+                        ((JSValue *)call_argv)[0]  = resumeVal;
+                        sp = (JSValue *)&call_argv[1];
+                        call_argc = 1; tramp_first = -2; tramp_gen_magic = gmag;
+                        goto do_generator_tramp;
+                    }
+                }
+                if (tramp_is_reflect_apply(call_argv[-1]) && call_argc >= 3
+                    && JS_VALUE_GET_TAG(call_argv[2]) == JS_TAG_OBJECT) {   /* Reflect.apply(g.next, gen, argsList) */
+                    int gmag = tramp_gen_method_magic(call_argv[0], call_argv[1]);
+                    if (gmag >= 0) {
+                        JSValue gnext = (JSValue)call_argv[0];   /* target -> method operand */
+                        JSValue genv = (JSValue)call_argv[1];    /* thisArg -> `this` operand */
+                        JSValue resumeVal = JS_UNDEFINED;
+                        { uint32_t alen = 0; JSValue *atab = build_arg_list(ctx, &alen, call_argv[2]);
+                          if (!atab) goto exception;
+                          if (alen >= 1) resumeVal = js_dup(atab[0]);
+                          for (uint32_t k = 0; k < alen; k++) JS_FreeValue(ctx, atab[k]);
+                          js_free(ctx, atab); }
+                        JS_FreeValue(ctx, (JSValue)call_argv[-2]);   /* Reflect */
+                        JS_FreeValue(ctx, (JSValue)call_argv[-1]);   /* apply */
+                        for (int k = 2; k < call_argc; k++) JS_FreeValue(ctx, (JSValue)call_argv[k]);  /* argsList + any extra operands */
+                        ((JSValue *)call_argv)[-2] = genv;
+                        ((JSValue *)call_argv)[-1] = gnext;
+                        ((JSValue *)call_argv)[0]  = resumeVal;
+                        sp = (JSValue *)&call_argv[1];
+                        call_argc = 1; tramp_first = -2; tramp_gen_magic = gmag;
+                        goto do_generator_tramp;
+                    }
                 }
                 ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
                                           JS_UNDEFINED, call_argc,
