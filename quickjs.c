@@ -18806,6 +18806,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     int iter_special = 0;
     int tramp_gen_magic = 0;                            /* set before goto do_generator_tramp */
     int tramp_gen_forof = 1;                            /* <0 = for-of iterator stack offset (always -3-.. ); 1 = direct .next() (no valid offset is positive) */
+    int tramp_ith_forof = 1;                            /* Iterator Helper for-of drive: <0 = iterator stack offset; 1 = direct. read+reset by do_iter_helper_tramp */
     int tramp_gen_iternext = 0;                         /* 1 = OP_iterator_next drive (yield* / destructuring): iterator at sp[-4], arg at sp[-1], result OBJECT replaces sp[-1] */
     int tramp_gen_close = 0;                            /* 1 = OP_iterator_close drive (.return() on an unconsumed generator iterator at sp[-1]): body runs finally on the tramp, result DISCARDED */
     int tramp_gen_close_exc = 0;                        /* 1 = the close is happening DURING exception unwind (JS_IteratorClose(iter,true)): after the finally runs, restore the in-flight exception and continue unwinding (goto exception), never overwrite it */
@@ -20519,15 +20520,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
 
         do_iter_helper_tramp:
-            /* A lazy Iterator Helper's .next() (call_argv[-2]=the helper, call_argv[-1]=js_iterator_helper_next) over
-               a GENERATOR source: drive the source's .next() on THIS chain via the resumable do_iter_helper_step. */
+            /* A lazy Iterator Helper's .next(): drive the source's .next() on THIS chain via do_iter_helper_step.
+               DIRECT: helper at call_argv[-2]. FOR-OF: helper at sp[tramp_ith_forof] (stays on the caller stack). */
             {
-                JSObject *hp = JS_VALUE_GET_OBJ(call_argv[-2]);
+                int ith_off = tramp_ith_forof; tramp_ith_forof = 1;   /* read + reset */
+                JSValueConst hval = (ith_off < 0) ? sp[ith_off] : call_argv[-2];
+                JSObject *hp = JS_VALUE_GET_OBJ(hval);
                 JSIteratorHelperData *it = hp->u.iterator_helper_data;
                 it->executing = 1;
                 it->resume_pc = ITHP_START;
-                it->drive_mode = ITH_DIRECT;
-                it->orig_cargc = call_argc; it->orig_is_tail = tramp_is_tail;
+                if (ith_off < 0) { it->drive_mode = ITH_FOROF; it->forof_off = ith_off; }
+                else { it->drive_mode = ITH_DIRECT; it->orig_cargc = call_argc; it->orig_is_tail = tramp_is_tail; }
                 cont_st = it; cont_kind_cur = CONT_ITER_HELPER;
                 ret_val = JS_UNINITIALIZED;
                 goto do_iter_helper_step;
@@ -20556,7 +20559,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             *sp++ = out;
                             BREAK;
                         }
-                        DFAIL("do_iter_helper_step: for-of/iternext delivery not built yet");
+                        if (it->drive_mode == ITH_FOROF) {
+                            /* OP_for_of_next protocol: unpack {value,done} to sp[0],sp[1]; sp += 2 (helper stays at sp[forof_off]). */
+                            JSValue v = JS_GetProperty(ctx, out, JS_ATOM_value);
+                            JSValue dv = JS_GetProperty(ctx, out, JS_ATOM_done);
+                            JS_FreeValue(ctx, out);
+                            if (JS_IsException(v) || JS_IsException(dv)) { JS_FreeValue(ctx, v); JS_FreeValue(ctx, dv); goto exception; }
+                            sp[0] = v; sp[1] = js_bool(JS_ToBoolFree(ctx, dv)); sp += 2;
+                            BREAK;
+                        }
+                        DFAIL("do_iter_helper_step: iternext delivery not built yet");
                         JS_FreeValue(ctx, out); goto exception;
                     }
                     /* st == 1: DRIVE source.next(). */
@@ -22030,6 +22042,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    body loop preempts the base flow — never the C-recursion js_for_of_next -> JS_Call would use. */
                 if (tramp_gen_method_magic(sp[offset + 1], sp[offset]) == GEN_MAGIC_NEXT) {
                     tramp_gen_magic = GEN_MAGIC_NEXT; tramp_gen_forof = offset; goto do_generator_tramp;
+                }
+                if (tramp_can_call_iter_helper(sp[offset + 1], sp[offset])) {   /* for-of over a lazy Iterator Helper -> drive on THIS chain */
+                    tramp_ith_forof = offset; goto do_iter_helper_tramp;
                 }
                 if (js_for_of_next(ctx, sp, offset))
                     goto exception;
@@ -49270,12 +49285,20 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
                                       int argc, JSValueConst *argv,
                                       int *pdone, int magic)
 {
-    /* NO legacy drive: every lazy Iterator Helper .next() runs on the tramp (do_iter_helper_tramp), recognized at
-       the call site for ALL source types. This C entry keeps only its IDENTITY (tramp_can_call_iter_helper matches
-       this address). Reaching its body means a source/kind whose tramp drive is not built yet (or an off-tramp
-       bypass) — a should-never-happen; crash loud rather than fall back to a drive-to-completion C loop. */
-    (void)ctx; (void)this_val; (void)argc; (void)argv; (void)magic;
-    *pdone = true;
+    /* The DRIVE runs on the tramp (do_iter_helper_tramp), recognized at the call site — the recognition declines
+       (and this C entry runs) only for the TRIVIAL non-drive cases: a DONE helper (.next() -> {undefined,true}) and
+       .return()/.throw() (close). Those iterate nothing, so no drive-to-completion. Any OTHER reason to be here is a
+       source/kind whose tramp drive is not built — DFAIL, never a legacy C-loop fallback. */
+    JSIteratorHelperData *it = JS_GetOpaque2(ctx, this_val, JS_CLASS_ITERATOR_HELPER);
+    *pdone = false;
+    if (!it) return JS_EXCEPTION;
+    if (magic == GEN_MAGIC_RETURN) {   /* .return(): close the source, mark done, return {value|undefined, done:true} */
+        JSValue ret = (argc > 0) ? js_dup(argv[0]) : JS_UNDEFINED;
+        if (!it->done) { JS_IteratorClose(ctx, it->obj, false); it->done = 1; }
+        *pdone = true;
+        return ret;
+    }
+    if (it->done) { *pdone = true; return JS_UNDEFINED; }   /* exhausted helper: .next() -> {undefined, done:true} */
     DFAIL("js_iterator_helper_next: helper source/kind not yet driven on the tramp — build do_iter_helper_step for it, never a legacy C-loop fallback");
     return JS_ThrowTypeError(ctx, "Iterator Helper .next() not on the tramp");
 }
