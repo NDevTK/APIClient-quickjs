@@ -24414,9 +24414,31 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                 ct->cont_state = ns;
                 if (otf->sf.arg_buf == &os->cb_args[2])   /* the callback's args are external cb_args -> repoint */
                     ct->sf.arg_buf = &ns->cb_args[2];
+            } else if (otf->cont_kind == CONT_ARRAY_REDUCE) {
+                /* reduce/reduceRight callback frame: clone the ACCUMULATOR state so the sibling reduces INDEPENDENTLY
+                   from the fork point (the accumulator sibling of the CONT_ARRAY_ITER case above). acc/val/obj are
+                   OWNED (dup); func is BORROWED (plain copy, kept alive by the clone's own caller-stack dup). `acc` is
+                   the PRE-callback accumulator at the fork (the in-flight reducer's result isn't computed yet); each
+                   arm reassigns its OWN ns->acc going forward, so a primitive accumulator diverges by value and a
+                   shared-object accumulator is COW-isolated per-flow like any post-fork mutation. cb_args mirror the
+                   [this,func,acc,val,idx,obj] shape referencing ns's owned fields so the running reducer reads right. */
+                struct JSArrayReduce *os = (struct JSArrayReduce *)otf->cont_state;
+                struct JSArrayReduce *ns = js_malloc(ctx, sizeof(*ns));
+                if (!ns) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
+                *ns = *os;
+                ns->obj = js_dup(os->obj);
+                ns->acc = js_dup(os->acc);
+                ns->val = js_dup(os->val);
+                ns->func = os->func;
+                ns->cb_args[0] = JS_UNDEFINED; ns->cb_args[1] = ns->func;
+                ns->cb_args[2] = ns->acc; ns->cb_args[3] = ns->val;
+                ns->cb_args[4] = os->cb_args[4]; ns->cb_args[5] = ns->obj;   /* [4]=index number (plain copy) */
+                ct->cont_state = ns;
+                if (otf->sf.arg_buf == &os->cb_args[2])   /* the reducer's args are external cb_args -> repoint */
+                    ct->sf.arg_buf = &ns->cb_args[2];
             } else {
                 DCHECK(otf->cont_kind == CONT_NONE,
-                       "clone_deep_flow: deep-fork of this C-continuation kind (sort/reduce/json-revive/construct/agen) not built");
+                       "clone_deep_flow: deep-fork of this C-continuation kind (sort/json-revive/construct/agen) not built");
             }
         }
         ct->up = (i == n - 1) ? NULL : ca[i + 1];
