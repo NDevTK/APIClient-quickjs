@@ -18420,11 +18420,17 @@ typedef struct JSPromiseAll {
     JSValue resolving_funcs[2];  /* result_promise's [resolve, reject] (owned) */
     JSValue values;              /* the result values array (owned) */
     JSValue resolve_element_env; /* [remainingElementsCount] holder (owned) */
+    JSValue elem_promises;       /* retained resolved element wrappers [0..index) — a mid-consume FORK re-attaches a
+                                    sibling resolve_element to each (the sibling's gen fork is past them). O(n). (owned) */
+    int reattach_pending;        /* >0 on a freshly-forked sibling: re-attach elements [0..reattach_pending) to THIS
+                                    aggregate on the sibling's first do_promise_all_step entry (deferred out of the
+                                    clone so no interpreter re-entry — .then — happens mid-clone_deep_flow). */
     int index;                   /* next element index */
     int magic;                   /* PROMISE_MAGIC_all / allSettled (per-element reject handling differs) */
     int orig_cfirst, orig_cargc; uint8_t orig_is_tail;   /* the ORIGINAL OP_call_method operand shape */
 } JSPromiseAll;
 static int js_promise_all_step(JSContext *ctx, struct JSPromiseAll *s, JSValue res);
+static int js_promise_all_attach(JSContext *ctx, struct JSPromiseAll *s, int index, JSValue next_promise);
 static void js_promise_all_end(JSContext *ctx, struct JSPromiseAll *s);
 static bool tramp_can_call_promise_all(JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_magic);
 typedef struct JSAsyncFromSyncIteratorData {   /* JS_CLASS_ASYNC_FROM_SYNC_ITERATOR opaque (hoisted for the for-await consumer) */
@@ -20266,11 +20272,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->iter = js_dup(gen);
                 s->values = JS_NewArray(ctx);
                 s->resolve_element_env = JS_NewArray(ctx);
+                s->elem_promises = JS_NewArray(ctx);
                 s->index = 0;
                 s->magic = pa_magic;
                 s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
                 if (JS_IsException(s->promise_resolve) || !JS_IsFunction(ctx, s->promise_resolve)
                     || JS_IsException(s->values) || JS_IsException(s->resolve_element_env)
+                    || JS_IsException(s->elem_promises)
                     || JS_IsException(s->next = JS_GetProperty(ctx, gen, JS_ATOM_next))
                     || JS_DefinePropertyValueUint32(ctx, s->resolve_element_env, 0, js_int32(1),
                                                     JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE | JS_PROP_WRITABLE) < 0) {
@@ -20294,8 +20302,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                finalize (decrement remainingElementsCount; resolve with `values` when it hits 0) and yield the promise. */
             {
                 JSPromiseAll *s = (JSPromiseAll *)cont_st;
-                int st = js_promise_all_step(ctx, s, ret_val);
+                int st;
+                if (unlikely(s->reattach_pending > 0)) {
+                    /* freshly-forked sibling: re-attach the retained pre-fork element wrappers [0..reattach_pending) to
+                       THIS aggregate now (deferred out of clone_deep_flow so the .then re-entry runs in the sibling's
+                       own context). Each attach does remainingElementsCount_add(+1), matching the parent's count. */
+                    int rp = s->reattach_pending, rfail = 0;
+                    s->reattach_pending = 0;
+                    for (int ei = 0; ei < rp; ei++) {
+                        JSValue ep = JS_GetPropertyInt64(ctx, s->elem_promises, ei);
+                        if (JS_IsException(ep) || js_promise_all_attach(ctx, s, ei, ep) < 0) { rfail = 1; break; }  /* consumes ep */
+                    }
+                    if (rfail) { st = -1; goto promise_all_err; }
+                }
+                st = js_promise_all_step(ctx, s, ret_val);
                 if (unlikely(st < 0)) {   /* an error: reject the aggregate, yield it (do not throw out of Promise.all) */
+                promise_all_err:;
                     JSValue err = JS_GetException(ctx), rr;
                     JS_IteratorClose(ctx, s->iter, true);
                     rr = JS_Call(ctx, s->resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
@@ -24307,20 +24329,19 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                 ns->sync_iter = js_dup(os->sync_iter);
                 ct->cont_state = ns;
             } else if (otf->cont_kind == CONT_PROMISE_ALL) {
-                /* Promise.all(gen) forked mid-consume. At index==0 the fork happened during the FIRST .next() BEFORE any
-                   element promise's resolve_element .then was attached (values empty, remainingElementsCount==1), so the
-                   sibling starts a fresh aggregate cleanly. At index>0 elements 0..k-1 carry resolve_element .then's bound
-                   to the PARENT's values/resolving_funcs — the sibling would need each re-attached to its OWN aggregate;
-                   that re-attachment is not yet built, so DFAIL loud (never a silent cross-arm aggregate share). */
+                /* Promise.all(gen) forked mid-consume. The sibling gets a FRESH aggregate (own result_promise +
+                   resolving_funcs + values + remainingElementsCount env), and each pre-fork element wrapper [0..index)
+                   — retained in elem_promises precisely for this — is RE-ATTACHED to the sibling aggregate via
+                   js_promise_all_attach (the sibling's gen fork is past those elements and cannot re-pull them). The
+                   sibling then continues driving from ns->index (== os->index) on its own gen fork. At index==0 the
+                   re-attach loop is empty (fork before the first element) — the clean base case. */
                 JSPromiseAll *os = (JSPromiseAll *)otf->cont_state;
-                DCHECK(os->index == 0,
-                       "clone_deep_flow: Promise.all(gen) forked after pulling element(s) — re-attaching pre-fork element .then's onto the sibling aggregate is not yet built; only a fork before the first element (index==0) is fork-safe.");
                 JSPromiseAll *ns = js_mallocz(ctx, sizeof(*ns));
                 if (!ns) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
                 *ns = *os;   /* copies os's OWNED aggregate fields as borrowed; null the fresh ones so an error path frees safely */
                 ns->result_promise = JS_UNDEFINED;
                 ns->resolving_funcs[0] = ns->resolving_funcs[1] = JS_UNDEFINED;
-                ns->values = JS_UNDEFINED; ns->resolve_element_env = JS_UNDEFINED;
+                ns->values = JS_UNDEFINED; ns->resolve_element_env = JS_UNDEFINED; ns->elem_promises = JS_UNDEFINED;
                 ns->iter = js_dup(os->iter);              /* == genobj, gen-COW-isolated */
                 ns->next = js_dup(os->next);
                 ns->this_val = js_dup(os->this_val);
@@ -24328,12 +24349,24 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                 ns->result_promise = js_new_promise_capability(ctx, ns->resolving_funcs, os->this_val);   /* fresh aggregate + [resolve,reject] */
                 ns->values = JS_NewArray(ctx);
                 ns->resolve_element_env = JS_NewArray(ctx);
+                ns->elem_promises = JS_NewArray(ctx);
                 if (JS_IsException(ns->result_promise) || JS_IsException(ns->values)
-                    || JS_IsException(ns->resolve_element_env)
+                    || JS_IsException(ns->resolve_element_env) || JS_IsException(ns->elem_promises)
                     || JS_DefinePropertyValueUint32(ctx, ns->resolve_element_env, 0, js_int32(1),
                                                     JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE | JS_PROP_WRITABLE) < 0) {
                     js_promise_all_end(ctx, ns); js_free(ctx, ns); js_free(ctx, oa); js_free(ctx, ca); return NULL;
                 }
+                { int fail = 0;   /* COPY the retained element wrappers; DEFER the .then re-attach to the sibling's first
+                                    do_promise_all_step (no interpreter re-entry inside clone_deep_flow — array ops only). */
+                  for (int ei = 0; ei < os->index; ei++) {
+                      JSValue ep = JS_GetPropertyInt64(ctx, os->elem_promises, ei);
+                      if (JS_IsException(ep)
+                          || JS_DefinePropertyValueInt64(ctx, ns->elem_promises, ei, ep, JS_PROP_C_W_E) < 0) {
+                          fail = 1; break; }   /* JS_DefinePropertyValueInt64 consumes ep */
+                  }
+                  if (fail) { js_promise_all_end(ctx, ns); js_free(ctx, ns); js_free(ctx, oa); js_free(ctx, ca); return NULL; }
+                }
+                ns->reattach_pending = os->index;   /* the sibling re-attaches [0..index) on its first step */
                 ct->cont_state = ns;
             }
             if (g_time_travel.gen_fork) g_time_travel.gen_fork(ctx, genobj, g0, g1);
@@ -59699,10 +59732,65 @@ static JSValue js_promise_all(JSContext *ctx, JSValueConst this_val,
 /* Advance Promise.all(gen): `res` = the previous .next() result {value,done} (UNINITIALIZED on the first step).
    Returns 1 = drive the next .next(), 0 = DONE (s->result_promise settled/settling), -1 = exception. Consumes res.
    Mirrors js_promise_all's per-element loop for the `all` variant: Promise.resolve(v).then(resolve_element). */
+/* Attach the per-element then() for element `index` of aggregate `s` onto its resolved wrapper `next_promise`
+   (CONSUMED). This is the attach half of the per-element loop, factored out so the fork-clone can re-bind the
+   retained pre-fork element wrappers onto a sibling aggregate. Returns 0 / -1 (frees next_promise on the error path). */
+static int js_promise_all_attach(JSContext *ctx, JSPromiseAll *s, int index, JSValue next_promise)
+{
+    JSValue resolve_element, rr;
+    JSValueConst resolve_element_data[5], then_args[2];
+    if (s->magic == PROMISE_MAGIC_race) {
+        /* race: attach the aggregate's own resolve/reject directly — the FIRST element to settle wins; no per-element
+           closure, no values/remainingElementsCount. */
+        then_args[0] = s->resolving_funcs[0];
+        then_args[1] = s->resolving_funcs[1];
+        rr = JS_InvokeFree(ctx, next_promise, JS_ATOM_then, 2, then_args);
+        if (JS_IsException(rr)) return -1;
+        JS_FreeValue(ctx, rr);
+        return 0;
+    }
+    resolve_element_data[0] = JS_FALSE;
+    resolve_element_data[1] = js_int32(index);
+    resolve_element_data[2] = s->values;
+    resolve_element_data[3] = s->resolving_funcs[s->magic == PROMISE_MAGIC_any ? 1 : 0];   /* any: the aggregate REJECT (called when all reject); all/allSettled: resolve */
+    resolve_element_data[4] = s->resolve_element_env;
+    resolve_element = JS_NewCFunctionData(ctx, js_promise_all_resolve_element, 1,
+                                          s->magic, 5, resolve_element_data);
+    if (JS_IsException(resolve_element)) { JS_FreeValue(ctx, next_promise); return -1; }
+    {
+        JSValue reject_element;
+        if (s->magic == PROMISE_MAGIC_allSettled) {
+            /* allSettled: a rejection is ALSO recorded (as {status:'rejected', reason}) — a second element closure. */
+            reject_element = JS_NewCFunctionData(ctx, js_promise_all_resolve_element, 1,
+                                                 s->magic | 4, 5, resolve_element_data);
+            if (JS_IsException(reject_element)) { JS_FreeValue(ctx, next_promise); JS_FreeValue(ctx, resolve_element); return -1; }
+        } else if (s->magic == PROMISE_MAGIC_any) {
+            /* any: the element CLOSURE is the REJECT handler (records the error at index); a FULFILLMENT resolves the
+               aggregate directly. Pre-fill values[index] so a later rejection has a slot. */
+            if (JS_DefinePropertyValueUint32(ctx, s->values, index, JS_UNDEFINED, JS_PROP_C_W_E) < 0) {
+                JS_FreeValue(ctx, next_promise); JS_FreeValue(ctx, resolve_element); return -1;
+            }
+            reject_element = resolve_element;
+            resolve_element = js_dup(s->resolving_funcs[0]);
+        } else {
+            reject_element = js_dup(s->resolving_funcs[1]);   /* `all`: reject the aggregate on first rejection */
+        }
+        if (remainingElementsCount_add(ctx, s->resolve_element_env, 1) < 0) {
+            JS_FreeValue(ctx, next_promise); JS_FreeValue(ctx, resolve_element); JS_FreeValue(ctx, reject_element); return -1;
+        }
+        then_args[0] = resolve_element;
+        then_args[1] = reject_element;
+        rr = JS_InvokeFree(ctx, next_promise, JS_ATOM_then, 2, then_args);
+        JS_FreeValue(ctx, resolve_element); JS_FreeValue(ctx, reject_element);
+        if (JS_IsException(rr)) return -1;
+        JS_FreeValue(ctx, rr);
+    }
+    return 0;
+}
+
 static int js_promise_all_step(JSContext *ctx, JSPromiseAll *s, JSValue res)
 {
-    JSValue value, next_promise, resolve_element, rr;
-    JSValueConst resolve_element_data[5], then_args[2];
+    JSValue value, next_promise, rr;
     int done;
     if (JS_VALUE_GET_TAG(res) == JS_TAG_UNINITIALIZED)
         return 1;   /* first step: nothing to process, drive .next() */
@@ -59739,53 +59827,12 @@ static int js_promise_all_step(JSContext *ctx, JSPromiseAll *s, JSValue res)
     next_promise = JS_Call(ctx, s->promise_resolve, s->this_val, 1, vc(&value));
     JS_FreeValue(ctx, value);
     if (JS_IsException(next_promise)) return -1;
-    if (s->magic == PROMISE_MAGIC_race) {
-        /* race: attach the aggregate's own resolve/reject directly — the FIRST element to settle wins; no per-element
-           closure, no values/remainingElementsCount. */
-        then_args[0] = s->resolving_funcs[0];
-        then_args[1] = s->resolving_funcs[1];
-        rr = JS_InvokeFree(ctx, next_promise, JS_ATOM_then, 2, then_args);
-        if (JS_IsException(rr)) return -1;
-        JS_FreeValue(ctx, rr);
-        s->index++;
-        return 1;
+    /* Retain the resolved element wrapper so a mid-consume FORK can re-attach a sibling resolve_element to it (the
+       sibling's gen fork is already past elements [0..index) and cannot re-pull them). O(n), same order as `values`. */
+    if (JS_DefinePropertyValueInt64(ctx, s->elem_promises, s->index, js_dup(next_promise), JS_PROP_C_W_E) < 0) {
+        JS_FreeValue(ctx, next_promise); return -1;
     }
-    resolve_element_data[0] = JS_FALSE;
-    resolve_element_data[1] = js_int32(s->index);
-    resolve_element_data[2] = s->values;
-    resolve_element_data[3] = s->resolving_funcs[s->magic == PROMISE_MAGIC_any ? 1 : 0];   /* any: the aggregate REJECT (called when all reject); all/allSettled: resolve */
-    resolve_element_data[4] = s->resolve_element_env;
-    resolve_element = JS_NewCFunctionData(ctx, js_promise_all_resolve_element, 1,
-                                          s->magic, 5, resolve_element_data);
-    if (JS_IsException(resolve_element)) { JS_FreeValue(ctx, next_promise); return -1; }
-    {
-        JSValue reject_element;
-        if (s->magic == PROMISE_MAGIC_allSettled) {
-            /* allSettled: a rejection is ALSO recorded (as {status:'rejected', reason}) — a second element closure. */
-            reject_element = JS_NewCFunctionData(ctx, js_promise_all_resolve_element, 1,
-                                                 s->magic | 4, 5, resolve_element_data);
-            if (JS_IsException(reject_element)) { JS_FreeValue(ctx, next_promise); JS_FreeValue(ctx, resolve_element); return -1; }
-        } else if (s->magic == PROMISE_MAGIC_any) {
-            /* any: the element CLOSURE is the REJECT handler (records the error at index); a FULFILLMENT resolves the
-               aggregate directly. Pre-fill values[index] so a later rejection has a slot. */
-            if (JS_DefinePropertyValueUint32(ctx, s->values, s->index, JS_UNDEFINED, JS_PROP_C_W_E) < 0) {
-                JS_FreeValue(ctx, next_promise); JS_FreeValue(ctx, resolve_element); return -1;
-            }
-            reject_element = resolve_element;
-            resolve_element = js_dup(s->resolving_funcs[0]);
-        } else {
-            reject_element = js_dup(s->resolving_funcs[1]);   /* `all`: reject the aggregate on first rejection */
-        }
-        if (remainingElementsCount_add(ctx, s->resolve_element_env, 1) < 0) {
-            JS_FreeValue(ctx, next_promise); JS_FreeValue(ctx, resolve_element); JS_FreeValue(ctx, reject_element); return -1;
-        }
-        then_args[0] = resolve_element;
-        then_args[1] = reject_element;
-        rr = JS_InvokeFree(ctx, next_promise, JS_ATOM_then, 2, then_args);
-        JS_FreeValue(ctx, resolve_element); JS_FreeValue(ctx, reject_element);
-        if (JS_IsException(rr)) return -1;
-        JS_FreeValue(ctx, rr);
-    }
+    if (js_promise_all_attach(ctx, s, s->index, next_promise) < 0) return -1;   /* consumes next_promise */
     s->index++;
     return 1;   /* drive the next .next() */
 }
@@ -59811,6 +59858,7 @@ static void js_promise_all_end(JSContext *ctx, JSPromiseAll *s)
     JS_FreeValue(ctx, s->resolving_funcs[1]);
     JS_FreeValue(ctx, s->values);
     JS_FreeValue(ctx, s->resolve_element_env);
+    JS_FreeValue(ctx, s->elem_promises);
 }
 
 /* Route Promise.all(gen) / Promise.allSettled(gen) (they share the resolve+values finalize; only the per-element
