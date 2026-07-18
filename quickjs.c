@@ -23196,23 +23196,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 sf->cur_pc = pc;
                 /* [...iterable]: consume on THIS chain (the .next() body suspend/resumes) rather than the C-recursion
                    drive-to-completion js_append_enumerate's loop would use — WHEN the iterator will be a generator/
-                   helper: a generator-function @@iterator (created on the tramp) or a direct generator/helper (its
-                   @@iterator returns itself). Read @@iterator once (Spread's own GetIterator step); do_spread_consume_tramp
-                   reuses it. Plain-C iterables (arrays/sets) + array-likes stay on the C js_append_enumerate path. */
-                if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) {
-                    JSObject *ip = JS_VALUE_GET_OBJ(sp[-1]);
-                    JSValue m = JS_GetProperty(ctx, sp[-1], JS_ATOM_Symbol_iterator);
-                    if (JS_IsException(m)) goto exception;
-                    if (JS_IsFunction(ctx, m)
-                        && (tramp_can_call_gen_create(m)
-                            || (ip->class_id == JS_CLASS_GENERATOR && ip->u.generator_data)
-                            || (ip->class_id == JS_CLASS_ITERATOR_HELPER && ip->u.iterator_helper_data
-                                && !ip->u.iterator_helper_data->executing && !ip->u.iterator_helper_data->done))) {
-                        tramp_iter_getiter = m;
-                        goto do_spread_consume_tramp;
-                    }
-                    JS_FreeValue(ctx, m);
-                }
+                   helper (the ONE shared side-effect-free gate). Plain-C iterables (arrays/sets) + array-likes stay on
+                   the C js_append_enumerate path. */
+                if (iter_consume_gen_backed(ctx, sp[-1], &tramp_iter_getiter))
+                    goto do_spread_consume_tramp;
                 if (js_append_enumerate(ctx, sp))
                     goto exception;
                 JS_FreeValue(ctx, *--sp);
@@ -46950,27 +46937,57 @@ static void js_iter_consume_end(JSContext *ctx, JSIterConsume *s)
 /* Route Array.from ONLY for the direct-generator, single-arg (no mapfn) shape — the case whose C loop drives the
    generator .next() to completion. Every other Array.from (array-like, non-generator iterable, with mapfn) stays on
    the normal cfunc path (no generator body => no drive). Runtime-arg-aware: call_argv[0] is the items argument. */
-/* Shared @@iterator gate for the tramp iterable consumers (Array.from / spread / Set / Map / Object.fromEntries /
-   TypedArray): accept `items` only when its ITERATOR will be a generator or helper — a generator-function @@iterator
-   (created on the tramp) or a direct generator/helper (its @@iterator returns itself). Both drive on the tramp; the
-   consume tramp reuses *out_getiter as the GetIterator method. Reads @@iterator ONCE (the consumer's own GetMethod
-   step). *out_getiter = the method (owned), or JS_EXCEPTION if the read threw (caller accepts + propagates on the
-   tramp). Returns false for plain-C iterables (Array/Set), array-likes, and non-iterables — those use the C path. */
+/* The ONE side-effect-free @@iterator probe for every tramp iterable consumer (Array.from / spread / Set / Map /
+   Object.fromEntries / TypedArray / Promise.all): the callable @@iterator DATA-property method (dup'd in *out),
+   searching items and its INTERNAL prototype chain (a primitive is boxed for the walk). A GETTER @@iterator, a Proxy,
+   a non-callable value, or none -> false, *out UNDEFINED — the consumer keeps its own observable order by falling to
+   its C path (which runs a getter at the right step). No speculative getter/trap execution in recognition. */
+static bool iter_data_at_iterator(JSContext *ctx, JSValueConst items, JSValue *out)
+{
+    JSValue boxed = JS_UNDEFINED;
+    JSObject *p;
+    bool found = false;
+    *out = JS_UNDEFINED;
+    if (JS_VALUE_GET_TAG(items) == JS_TAG_OBJECT) {
+        p = JS_VALUE_GET_OBJ(items);
+    } else {
+        if (JS_IsUndefined(items) || JS_IsNull(items)) return false;
+        boxed = JS_ToObject(ctx, items);   /* primitive wrapper; its @@iterator lives on the prototype (Array.from(5)) */
+        if (JS_IsException(boxed)) return false;
+        p = JS_VALUE_GET_OBJ(boxed);
+    }
+    for (; p != NULL; p = p->shape->proto) {
+        JSPropertyDescriptor desc;
+        int ret;
+        if (p->class_id == JS_CLASS_PROXY) break;   /* a proxy own-property query is a trap (side effect) — decline */
+        ret = JS_GetOwnPropertyInternal(ctx, &desc, p, JS_ATOM_Symbol_iterator);
+        if (ret < 0) break;
+        if (ret) {
+            if (!(desc.flags & JS_PROP_GETSET) && JS_IsFunction(ctx, desc.value)) { *out = js_dup(desc.value); found = true; }
+            if (desc.flags & JS_PROP_GETSET) { JS_FreeValue(ctx, desc.getter); JS_FreeValue(ctx, desc.setter); }
+            else JS_FreeValue(ctx, desc.value);
+            break;
+        }
+    }
+    JS_FreeValue(ctx, boxed);
+    return found;
+}
+
+/* Consumers that drive a generator OR helper (Array.from / spread / Set / Map / Object.fromEntries / TypedArray):
+   accept when the iterator will be a generator/helper — a generator-function @@iterator (created on the tramp) or a
+   direct generator/helper (its @@iterator returns itself). *out_getiter = the method (owned) for the consume tramp. */
 static bool iter_consume_gen_backed(JSContext *ctx, JSValueConst items, JSValue *out_getiter)
 {
     JSValue m;
     *out_getiter = JS_UNDEFINED;
-    m = JS_GetProperty(ctx, items, JS_ATOM_Symbol_iterator);   /* a primitive boxes (Array.from(5)) */
-    if (JS_IsException(m)) { *out_getiter = JS_EXCEPTION; return true; }
-    if (JS_IsFunction(ctx, m)) {
-        if (tramp_can_call_gen_create(m)) { *out_getiter = m; return true; }
-        if (JS_VALUE_GET_TAG(items) == JS_TAG_OBJECT) {
-            JSObject *ip = JS_VALUE_GET_OBJ(items);
-            if ((ip->class_id == JS_CLASS_GENERATOR && ip->u.generator_data)
-                || (ip->class_id == JS_CLASS_ITERATOR_HELPER && ip->u.iterator_helper_data
-                    && !ip->u.iterator_helper_data->executing && !ip->u.iterator_helper_data->done)) {
-                *out_getiter = m; return true;
-            }
+    if (!iter_data_at_iterator(ctx, items, &m)) return false;
+    if (tramp_can_call_gen_create(m)) { *out_getiter = m; return true; }
+    if (JS_VALUE_GET_TAG(items) == JS_TAG_OBJECT) {
+        JSObject *ip = JS_VALUE_GET_OBJ(items);
+        if ((ip->class_id == JS_CLASS_GENERATOR && ip->u.generator_data)
+            || (ip->class_id == JS_CLASS_ITERATOR_HELPER && ip->u.iterator_helper_data
+                && !ip->u.iterator_helper_data->executing && !ip->u.iterator_helper_data->done)) {
+            *out_getiter = m; return true;
         }
     }
     JS_FreeValue(ctx, m);
@@ -60284,29 +60301,16 @@ static void js_promise_all_end(JSContext *ctx, JSPromiseAll *s)
 
 /* Route Promise.all(gen) / Promise.allSettled(gen) (they share the resolve+values finalize; only the per-element
    reject differs) with a direct-generator arg. `any` (AggregateError finalize) and `race` stay on the normal path. */
-/* Side-effect-free: does items[@@iterator] resolve, via a DATA property on items or its INTERNAL prototype chain,
-   to a GENERATOR FUNCTION? Returns the method dup'd in *out. A GETTER @@iterator (or a Proxy) declines WITHOUT
-   running anything — so a consumer whose GetIterator step is NOT its first observable step (Promise.all reads
-   .resolve before @@iterator) keeps the correct order by falling to its C path. `items` must be an object. */
+/* Promise.all: accept a DATA-property generator-function @@iterator (created on the tramp), via the ONE shared
+   side-effect-free probe. A getter @@iterator declines, so Promise.all's read-.resolve-before-@@iterator order holds.
+   (A direct-generator arg is handled by the caller's class_id check; a helper is not driven by do_promise_all_step.) */
 static bool iter_at_gen_func_method(JSContext *ctx, JSValueConst items, JSValue *out)
 {
-    JSObject *p;
+    JSValue m;
     *out = JS_UNDEFINED;
-    if (JS_VALUE_GET_TAG(items) != JS_TAG_OBJECT) return false;
-    for (p = JS_VALUE_GET_OBJ(items); p != NULL; p = p->shape->proto) {
-        JSPropertyDescriptor desc;
-        int ret;
-        if (p->class_id == JS_CLASS_PROXY) return false;   /* a proxy own-property query is a trap (side effect) — decline */
-        ret = JS_GetOwnPropertyInternal(ctx, &desc, p, JS_ATOM_Symbol_iterator);
-        if (ret < 0) return false;
-        if (ret) {
-            bool is_gf = !(desc.flags & JS_PROP_GETSET) && tramp_can_call_gen_create(desc.value);
-            if (is_gf) *out = js_dup(desc.value);
-            if (desc.flags & JS_PROP_GETSET) { JS_FreeValue(ctx, desc.getter); JS_FreeValue(ctx, desc.setter); }
-            else JS_FreeValue(ctx, desc.value);
-            return is_gf;
-        }
-    }
+    if (!iter_data_at_iterator(ctx, items, &m)) return false;
+    if (tramp_can_call_gen_create(m)) { *out = m; return true; }
+    JS_FreeValue(ctx, m);
     return false;
 }
 
