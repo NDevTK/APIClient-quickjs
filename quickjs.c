@@ -24128,6 +24128,12 @@ static JSValue async_func_resume(JSContext *ctx, JSAsyncFunctionState *s)
        (g_flow_base_gen NULL = baseline setup, before any flow: not a drive-to-completion.) */
     if (g_flow_base_gen && s != g_flow_base_gen) {
         FLOW_PREEMPT_COUNT(g_drive_to_completion);
+        /* DCHECK, not a recoverable throw: a coroutine body resumed OFF the tramp (nested async_func_resume) is a
+           should-never-happen once every drive is routed onto do_generator_tramp / the tramp. Crash loud in dev so
+           the bypassing path (.next()/yield-star/destructuring/await/reaction/module) is fixed at the ROOT; there is
+           no drive-to-completion fallback. Release keeps the throw (the capability is not supportable off-tramp, but
+           production must not abort for it). */
+        DFAIL("drive-to-completion: coroutine body resumed off the tramp chain — route it onto do_generator_tramp / the tramp at the root");
         return JS_ThrowTypeError(ctx, "drive-to-completion deleted: coroutine body resumed off the tramp chain (route it onto do_generator_tramp / the tramp)");
     }
 
