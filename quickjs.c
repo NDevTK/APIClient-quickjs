@@ -49203,6 +49203,19 @@ static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue
             if (it->count > 0) { it->count--; it->resume_pc = ITHP_DROP_SKIP; }
             else it->resume_pc = ITHP_EMIT;
             return 1;
+        case JS_ITERATOR_HELPER_KIND_TAKE:
+            if (it->count == 0) {   /* limit reached: close the source, done. */
+                it->done = 1;
+                /* Close is safe for a PLAIN source (.return() is a plain call). A GENERATOR source's .return() must
+                   run on the tramp (js_generator_next is a DFAIL) — routed as a follow-up; leave it suspended here. */
+                if (tramp_gen_method_magic(it->next, it->obj) != GEN_MAGIC_NEXT)
+                    JS_IteratorClose(ctx, it->obj, false);
+                *out = js_create_iterator_result(ctx, JS_UNDEFINED, true);
+                return JS_IsException(*out) ? -1 : 0;
+            }
+            it->count--;
+            it->resume_pc = ITHP_EMIT;
+            return 1;
         default:
             DFAIL("js_iter_helper_step: kind not built on the tramp");
             return -1;
@@ -49249,7 +49262,7 @@ static bool tramp_can_call_iter_helper(JSValueConst func, JSValueConst this_val)
     if (tp->class_id != JS_CLASS_ITERATOR_HELPER) return false;
     it = tp->u.iterator_helper_data;
     if (!it || it->executing || it->done) return false;
-    return it->kind == JS_ITERATOR_HELPER_KIND_DROP;   /* DROP built for ALL source types (the step dispatches gen vs plain) */
+    return it->kind == JS_ITERATOR_HELPER_KIND_DROP || it->kind == JS_ITERATOR_HELPER_KIND_TAKE;   /* built (the step dispatches gen vs plain) */
 }
 
 static void js_iterator_helper_finalizer(JSRuntime *rt, JSValueConst val)
