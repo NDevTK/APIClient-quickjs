@@ -24928,14 +24928,9 @@ static bool js_async_function_post(JSContext *ctx, JSAsyncFunctionData *s, JSVal
    activation as a per-flow continuation) is NOT built yet; it depends on async/promise/microtask state being
    per-flow COW (CLAUDE.md), which is the foundation to build first. Building the interleaving before that was an
    out-of-order step that corrupted the heap; it was removed. */
-static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
-{
-    /* A preempt inside the async body cannot reach js_async_function_post: the back-edge gate CRASHES a nested
-       loop preempt (yield-to-scheduler at depth is not yet built), so post only ever sees a real AWAIT / return /
-       exception. Once the nested flow suspends onto the caller's tramp chain, the preempt will unwind to the base
-       scheduler like any tramp-depth loop — never self-resumed here (that would be drive-to-completion). */
-    return js_async_function_post(ctx, s, async_func_resume(ctx, &s->func_state));
-}
+/* js_async_function_resume — the DRIVE-TO-COMPLETION async resume — is DELETED. An async/module body is only ever
+   resumed AS A FLOW (js_async_function_resume_as_flow): a loop/await PARKS at a back-edge and re-enters via the job
+   pump, never self-resumed to completion. There is no drive-to-completion resume to fall back to. */
 
 static JSValue js_async_resume_job(JSContext *ctx, int argc, JSValueConst *argv);
 
@@ -25032,7 +25027,11 @@ static JSValue js_async_function_call(JSContext *ctx, JSValueConst func_obj,
     }
     s->is_active = true;
 
-    if (!js_async_function_resume(ctx, s))
+    /* Run the body AS A FLOW: a loop/await PARKS at a back-edge and re-enters via the job pump — never driven to
+       completion (that resume is DELETED). This is the only caller path for module bodies (js_execute_sync_module /
+       js_execute_async_module), so module evaluation suspend/resumes on the flow machinery; a parked body leaves
+       `promise` PENDING, which js_execute_sync_module treats as async evaluation. */
+    if (!js_async_function_resume_as_flow(ctx, s))
         goto fail;
 
     js_async_function_free(ctx->rt, s);
@@ -35445,15 +35444,29 @@ static int js_execute_sync_module(JSContext *ctx, JSModuleDef *m,
             JS_FreeValue(ctx, promise);
             return -1;
         } else {
+            /* PENDING: the module body PARKED as a flow (a loop/await preempt yielded to the scheduler). It becomes
+               async-evaluating — attach the async completion handlers so the module graph resumes when the flow
+               finishes, and mark it async so the caller records EVALUATING_ASYNC. Mirrors js_execute_async_module;
+               this is what makes module evaluation suspend/resume on the tramp instead of driving to completion. */
+            JSValue m_obj, resolve_funcs[2], ret_val;
+            m->async_evaluation = true;
+            m->async_evaluation_timestamp = ctx->rt->module_async_evaluation_next_timestamp++;
+            m_obj = JS_NewModuleValue(ctx, m);
+            resolve_funcs[0] = JS_NewCFunctionData(ctx, js_async_module_execution_fulfilled, 0, 0, 1, vc(&m_obj));
+            resolve_funcs[1] = JS_NewCFunctionData(ctx, js_async_module_execution_rejected, 0, 0, 1, vc(&m_obj));
+            ret_val = js_promise_then(ctx, promise, 2, vc(resolve_funcs));
+            JS_FreeValue(ctx, ret_val);
+            JS_FreeValue(ctx, m_obj);
+            JS_FreeValue(ctx, resolve_funcs[0]);
+            JS_FreeValue(ctx, resolve_funcs[1]);
             JS_FreeValue(ctx, promise);
-            JS_ThrowTypeError(ctx, "promise is pending");
-        fail:
-            *pvalue = JS_GetException(ctx);
-            return -1;
         }
     }
     *pvalue = JS_UNDEFINED;
     return 0;
+fail:
+    *pvalue = JS_GetException(ctx);
+    return -1;
 }
 
 /* spec: InnerModuleEvaluation. Return (index, JS_UNDEFINED) or (-1,
@@ -35539,13 +35552,18 @@ static int js_inner_module_evaluation(JSContext *ctx, JSModuleDef *m,
         m->async_evaluation = true;
         m->async_evaluation_timestamp =
             ctx->rt->module_async_evaluation_next_timestamp++;
-    } else if (m->has_tla) {
+    } else if (m->has_tla || !m->init_func) {
+        /* EVERY bytecode module body is an async function that can PARK on the flow machinery (a loop/await
+           back-edge), so it is async-evaluated even without top-level await — the only truly-synchronous modules are
+           C init_func modules (no parking). Treating them all as async from the DFS keeps pending_async_dependencies
+           correct when a "sync" body parks (a runtime-discovered async-ness would corrupt the parents' counts). */
         assert(!m->async_evaluation);
         m->async_evaluation = true;
         m->async_evaluation_timestamp =
             ctx->rt->module_async_evaluation_next_timestamp++;
         js_execute_async_module(ctx, m);
     } else {
+        /* C init_func module: truly synchronous, never parks. */
         if (js_execute_sync_module(ctx, m, pvalue) < 0)
             return -1;
     }
