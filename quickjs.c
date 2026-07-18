@@ -18439,6 +18439,15 @@ static int js_array_reduce_step(JSContext *ctx, struct JSArrayReduce *s, JSValue
 #define SETOP_UNION      0   /* add each key to r (internal append — spec forbids calling r.add) */
 #define SETOP_SYMDIFF    1   /* key in THIS -> delete from r; key in neither -> add to r (insertion order preserved) */
 #define SETOP_SUPERSET   2   /* every key must be in THIS; a miss short-circuits false and CLOSES the iterator */
+#define ITERCONS_ITERTERM 6  /* Iterator.prototype EAGER terminal (toArray/forEach/reduce/some/every/find): GetIteratorDirect(this)
+                                — `this` IS the iterator (no @@iterator call) — then drive it on the tramp. `setop` holds
+                                the ITERTERM_* rule; `mapfn` the predicate/reducer; `k` the visit counter. */
+#define ITERTERM_TOARRAY 0
+#define ITERTERM_FOREACH 1
+#define ITERTERM_REDUCE  2
+#define ITERTERM_SOME    3
+#define ITERTERM_EVERY   4
+#define ITERTERM_FIND    5
 typedef struct JSIterConsume {
     JSValue r;       /* the result being built (owned; ARRAY for FROM/SPREAD, the Set/Map instance for SET/MAP) */
     JSValue iter;    /* the iterator being consumed (owned) — a generator/helper drives on the tramp, a plain one in-loop */
@@ -18474,6 +18483,9 @@ static bool tramp_can_call_setmap_consume(JSContext *ctx, JSValueConst func, JSV
 static JSValue js_object_fromEntries(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 static bool tramp_can_call_objentries_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, JSValue *out_getiter);
 static bool tramp_can_call_setop_consume(JSValueConst func, JSValueConst this_val, JSValueConst *call_argv, int call_argc, uint8_t *out_setop);
+static int check_function(JSContext *ctx, JSValueConst obj);
+static bool tramp_can_call_iterterm(JSContext *ctx, JSValueConst func, JSValueConst this_val, int call_argc, uint8_t *out_term);
+static JSValue js_iterator_proto_terminal(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
 static JSValue js_typed_array_constructor_obj(JSContext *ctx, JSValueConst new_target, JSValueConst obj, int classid);
 static bool tramp_can_call_ta_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_classid, JSValue *out_getiter);
 /* Promise.all(gen): drive the generator's .next() on the tramp chain, wrapping each yielded value in
@@ -18867,6 +18879,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     int smc_magic = 0;                                  /* new Set(gen)/new Map(gen) recognition: 0 = Map, MAGIC_SET = Set (read at OP_call_constructor, consumed by do_setmap_consume_tramp) */
     int ta_classid = 0;                                 /* new TypedArray(gen) recognition: the TA class (read at OP_call_constructor, consumed by do_ta_consume_tramp) */
     uint8_t setop_kind = 0;                             /* s.union/symmetricDifference recognition: SETOP_* (consumed by do_setop_consume_tramp) */
+    uint8_t iterterm_kind = 0;                          /* Iterator.prototype terminal recognition: ITERTERM_* (consumed by do_iterterm_tramp) */
     int ta_from = 0;                                    /* 1 = TypedArray.from(gen) (OP_call_method): new_target is this_val at call_argv[-2], not call_argv[-1] */
     int pa_magic = 0;                                   /* Promise.all/allSettled(gen) recognition: the PROMISE_MAGIC (read at OP_call_method, consumed by do_promise_all_consume_tramp) */
     JSAsyncFunctionState *gen_state = NULL;   /* the generator/async base state IF this activation is preemptible */
@@ -19507,6 +19520,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_setop_consume(call_argv[-1], call_argv[-2], vc(call_argv), call_argc, &setop_kind)) {   /* s.union/symmetricDifference(setlike) -> setlike.keys() on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_setop_consume_tramp;
                 }
+                if (tramp_can_call_iterterm(ctx, call_argv[-1], call_argv[-2], call_argc, &iterterm_kind)) {   /* it.toArray/forEach/reduce/some/every/find -> consume on THIS chain */
+                    tramp_is_tail = (opcode == OP_tail_call_method); goto do_iterterm_tramp;
+                }
                 if (tramp_can_call_objentries_consume(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter)) {   /* Object.fromEntries(iterable) -> GetIterator + consume on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_objentries_consume_tramp;
                 }
@@ -19896,6 +19912,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_array_reduce(call_argv[-1], &iter_special)) goto do_array_reduce_tramp;
                 if (tramp_can_call_iter_consume(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter)) goto do_iter_consume_tramp;
                 if (tramp_can_call_objentries_consume(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter)) goto do_objentries_consume_tramp;
+                if (tramp_can_call_setop_consume(call_argv[-1], call_argv[-2], vc(call_argv), call_argc, &setop_kind)) goto do_setop_consume_tramp;
+                if (tramp_can_call_iterterm(ctx, call_argv[-1], call_argv[-2], call_argc, &iterterm_kind)) goto do_iterterm_tramp;
                 {   /* g.next.call(g) / g.throw.call(g,e) / g.return.call(g,v): the reshape produced the exact
                        [this=generator, f=js_generator_next] method-call shape do_generator_tramp reads, so route the
                        body onto THIS chain (loop preempts + forks the base) — never the js_generator_next
@@ -20275,6 +20293,50 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 goto do_consume_acquire_iterator;
             }
 
+        do_iterterm_tramp:
+            /* Iterator.prototype eager terminal: validate the callback, GetIteratorDirect(this) — `this` IS the
+               iterator, so NO @@iterator call — and consume it on this chain. call_argv[-2] = the iterator. */
+            {
+                JSValueConst iterobj = call_argv[-2];
+                JSIterConsume *s;
+                JSValue nextm, acc;
+                if (iterterm_kind != ITERTERM_TOARRAY
+                    && check_function(ctx, (call_argc >= 1) ? call_argv[0] : JS_UNDEFINED)) {
+                    /* IfAbruptCloseIterator: an invalid callback still closes the underlying iterator. A GENERATOR's
+                       .return() must run on the tramp, so defer it to the exception label. */
+                    if (JS_VALUE_GET_TAG(iterobj) == JS_TAG_OBJECT
+                        && JS_VALUE_GET_OBJ(iterobj)->class_id == JS_CLASS_GENERATOR
+                        && JS_VALUE_GET_OBJ(iterobj)->u.generator_data
+                        && JS_IsUninitialized(ctx->pending_close_gen))
+                        ctx->pending_close_gen = js_dup(iterobj);
+                    else
+                        JS_IteratorClose(ctx, iterobj, true);
+                    goto exception;
+                }
+                nextm = JS_GetProperty(ctx, iterobj, JS_ATOM_next);   /* GetIteratorDirect's nextMethod */
+                if (JS_IsException(nextm)) goto exception;
+                if (iterterm_kind == ITERTERM_TOARRAY) acc = JS_NewArray(ctx);
+                else if (iterterm_kind == ITERTERM_REDUCE)
+                    acc = (call_argc >= 2) ? js_dup(call_argv[1]) : JS_UNINITIALIZED;   /* UNINITIALIZED = seed from the first element */
+                else acc = JS_UNDEFINED;
+                if (JS_IsException(acc)) { JS_FreeValue(ctx, nextm); goto exception; }
+                s = js_mallocz(ctx, sizeof(*s));
+                if (unlikely(!s)) { JS_FreeValue(ctx, nextm); JS_FreeValue(ctx, acc); JS_ThrowOutOfMemory(ctx); goto exception; }
+                s->r = acc;
+                s->iter = js_dup(iterobj);
+                s->next = nextm;
+                s->adder = JS_UNDEFINED;
+                s->mapfn = (call_argc >= 1) ? js_dup(call_argv[0]) : JS_UNDEFINED;
+                s->mapfn_this = JS_UNDEFINED;
+                s->k = 0;
+                s->sink = ITERCONS_ITERTERM;
+                s->setop = iterterm_kind;
+                s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
+                cont_st = s; cont_kind_cur = CONT_ITER_CONSUME;
+                ret_val = JS_UNINITIALIZED;
+                goto do_iter_consume_step;
+            }
+
         do_setop_consume_tramp:
             /* s.union(setlike) / s.symmetricDifference(setlike): read setlike's props in SPEC ORDER (size, has, keys),
                seed the result Set with THIS set's records (a direct [[SetData]] copy — the spec forbids calling .add),
@@ -20510,7 +20572,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 JSIterConsume *s = (JSIterConsume *)cont_st;
                 int st = js_iter_consume_step(ctx, s, ret_val);
-                if (unlikely(st < 0)) { js_iter_consume_end(ctx, s); js_free_rt(rt, s); goto exception; }
+                if (unlikely(st < 0)) {
+                    /* An Iterator.prototype terminal whose predicate/reducer threw must CLOSE the underlying iterator
+                       (the close's own throw is discarded — the original wins). A generator closes on the tramp via
+                       the exception label's deferral. */
+                    if (s->sink == ITERCONS_ITERTERM && !JS_IsUndefined(s->iter)) {
+                        if (JS_VALUE_GET_TAG(s->iter) == JS_TAG_OBJECT
+                            && JS_VALUE_GET_OBJ(s->iter)->class_id == JS_CLASS_GENERATOR
+                            && JS_VALUE_GET_OBJ(s->iter)->u.generator_data
+                            && JS_IsUninitialized(ctx->pending_close_gen))
+                            ctx->pending_close_gen = js_dup(s->iter);
+                        else
+                            JS_IteratorClose(ctx, s->iter, true);
+                    }
+                    js_iter_consume_end(ctx, s); js_free_rt(rt, s); goto exception;
+                }
                 if (st == 2) {
                     /* the sink short-circuited (Set.prototype.isSupersetOf found a miss): spec IteratorClose, then
                        finish. A GENERATOR iterator's .return() (its finally) runs ON THE TRAMP and re-enters this
@@ -46949,6 +47025,17 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
         if (done) {   /* iterator exhausted: s->r is complete */
             JS_FreeValue(ctx, res);
             if (s->sink == ITERCONS_SETOP && s->setop == SETOP_SUPERSET) s->r = js_bool(s->k != 0);
+            if (s->sink == ITERCONS_ITERTERM) {
+                if (s->setop == ITERTERM_SOME) s->r = js_bool(false);
+                else if (s->setop == ITERTERM_EVERY) s->r = js_bool(true);
+                else if (s->setop == ITERTERM_FIND) s->r = JS_UNDEFINED;
+                else if (s->setop == ITERTERM_REDUCE && JS_IsUninitialized(s->r)) {
+                    s->r = JS_UNDEFINED;   /* reduce of an empty iterator with no initial value is a TypeError */
+                    JS_ThrowTypeError(ctx, "reduce of empty iterator with no initial value");
+                    return -1;
+                }
+                else if (s->setop == ITERTERM_FOREACH) s->r = JS_UNDEFINED;
+            }
             return 0;
         }
         value = JS_GetProperty(ctx, res, JS_ATOM_value);
@@ -46985,6 +47072,54 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
             JS_FreeValue(ctx, key); JS_FreeValue(ctx, val);
             if (JS_IsException(ret)) return -1;
             JS_FreeValue(ctx, ret);
+        } else if (s->sink == ITERCONS_ITERTERM) {
+            /* Iterator.prototype eager terminal. `r` accumulates the answer; `mapfn` is the predicate/reducer, called
+               with (value, counter) — or (accumulator, value, counter) for reduce. A deciding element short-circuits
+               and returns 2 so the shared close-then-finish runs the spec IteratorClose ON THE TRAMP. */
+            JSValue idx = js_int64(s->k++);
+            JSValue fret;
+            JSValueConst args[3];
+            if (s->setop == ITERTERM_TOARRAY) {
+                JS_FreeValue(ctx, idx);
+                if (JS_DefinePropertyValueInt64(ctx, s->r, s->k - 1, value, JS_PROP_C_W_E | JS_PROP_THROW) < 0) return -1;
+                return 1;
+            }
+            if (s->setop == ITERTERM_REDUCE) {
+                if (JS_IsUninitialized(s->r)) {   /* no initial value: the first element seeds the accumulator */
+                    JS_FreeValue(ctx, idx);
+                    s->r = value;
+                    return 1;
+                }
+                args[0] = s->r; args[1] = value; args[2] = idx;
+                fret = JS_Call(ctx, s->mapfn, JS_UNDEFINED, 3, args);
+                JS_FreeValue(ctx, value); JS_FreeValue(ctx, idx);
+                if (JS_IsException(fret)) return -1;
+                JS_FreeValue(ctx, s->r);
+                s->r = fret;
+                return 1;
+            }
+            args[0] = value; args[1] = idx;
+            fret = JS_Call(ctx, s->mapfn, JS_UNDEFINED, 2, args);
+            JS_FreeValue(ctx, idx);
+            if (JS_IsException(fret)) { JS_FreeValue(ctx, value); return -1; }
+            switch (s->setop) {
+            case ITERTERM_FOREACH:
+                JS_FreeValue(ctx, fret); JS_FreeValue(ctx, value);
+                return 1;
+            case ITERTERM_SOME:
+                JS_FreeValue(ctx, value);
+                if (!JS_ToBoolFree(ctx, fret)) return 1;
+                s->r = js_bool(true); s->closing = 1; return 2;
+            case ITERTERM_EVERY:
+                JS_FreeValue(ctx, value);
+                if (JS_ToBoolFree(ctx, fret)) return 1;
+                s->r = js_bool(false); s->closing = 1; return 2;
+            default:   /* ITERTERM_FIND */
+                DCHECK(s->setop == ITERTERM_FIND, "ITERTERM: unknown terminal rule");
+                if (!JS_ToBoolFree(ctx, fret)) { JS_FreeValue(ctx, value); return 1; }
+                JS_FreeValue(ctx, s->r);
+                s->r = value; s->closing = 1; return 2;
+            }
         } else if (s->sink == ITERCONS_SETOP) {
             /* Set.prototype.union / symmetricDifference: fold setlike.keys() into r (already seeded with THIS set's
                records). The spec mutates r's [[SetData]] directly — an observable r.add must NOT be called. */
@@ -47179,6 +47314,23 @@ static bool tramp_can_call_setop_consume(JSValueConst func, JSValueConst this_va
     if (JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT) return false;
     if (JS_VALUE_GET_OBJ(this_val)->class_id != JS_CLASS_SET) return false;
     return JS_VALUE_GET_TAG(call_argv[0]) == JS_TAG_OBJECT;
+}
+
+/* it.toArray()/forEach/reduce/some/every/find: run the terminal as a consume on the tramp. Recognition reads nothing —
+   do_iterterm_tramp performs the spec's argument validation and GetIteratorDirect(this) itself. */
+static bool tramp_can_call_iterterm(JSContext *ctx, JSValueConst func, JSValueConst this_val, int call_argc, uint8_t *out_term)
+{
+    JSObject *fp;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
+    fp = JS_VALUE_GET_OBJ(func);
+    if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
+    if (fp->u.cfunc.cproto != JS_CFUNC_generic_magic) return false;
+    if (fp->u.cfunc.c_function.generic_magic != js_iterator_proto_terminal) return false;
+    if (!JS_IsObject(this_val)) return false;   /* the C entry throws TypeError — leave it there */
+    /* A MISSING callback is accepted too: the spec still closes the underlying iterator on that TypeError, and only
+       do_iterterm_tramp can route a generator's close onto the tramp. */
+    *out_term = (uint8_t)fp->u.cfunc.magic;
+    return true;
 }
 
 static bool tramp_can_call_objentries_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, JSValue *out_getiter)
@@ -50110,15 +50262,36 @@ static const JSCFunctionListEntry js_iterator_funcs[] = {
     JS_CFUNC_DEF("from", 1, js_iterator_from ),
 };
 
+/* Iterator.prototype eager terminals. Every real call is intercepted at the call site and run as an
+   ITERCONS_ITERTERM consume on the tramp (do_iterterm_tramp), so the iterator — commonly a GENERATOR — suspends and
+   resumes like any other flow. This function exists to give each terminal an ADDRESS the recognition matches, and to
+   perform the argument validation the spec does before GetIteratorDirect. Reaching the drive below means an
+   un-routed off-tramp call: a should-never-happen to route at its root, never a C loop. */
+static JSValue js_iterator_proto_terminal(JSContext *ctx, JSValueConst this_val,
+                                          int argc, JSValueConst *argv, int magic)
+{
+    if (!JS_IsObject(this_val))
+        return JS_ThrowTypeErrorNotAnObject(ctx);
+    if (magic != ITERTERM_TOARRAY && check_function(ctx, argv[0]))
+        return JS_EXCEPTION;
+    DFAIL("Iterator.prototype eager terminal driven off the tramp chain — route the caller onto do_iterterm_tramp");
+    return JS_ThrowTypeError(ctx, "Iterator terminal not on the tramp");
+}
+
 static const JSCFunctionListEntry js_iterator_proto_funcs[] = {
-    /* LAZY helpers re-added: create a helper object (no drive-to-completion). Its .next() runs on the tramp for a
-       generator source (do_iter_helper_tramp), on the plain-iterator C path otherwise. The EAGER terminals
-       (every/find/forEach/some/reduce/toArray) stay absent until re-coded (they were C loops to the source .next()). */
+    /* LAZY helpers create a helper object; its .next() drives the source on the tramp. The EAGER terminals consume
+       the iterator to completion — they run as ITERCONS_ITERTERM on the tramp (do_iterterm_tramp), never a C loop. */
     JS_CFUNC_MAGIC_DEF("drop", 1, js_create_iterator_helper, JS_ITERATOR_HELPER_KIND_DROP ),
     JS_CFUNC_MAGIC_DEF("take", 1, js_create_iterator_helper, JS_ITERATOR_HELPER_KIND_TAKE ),
     JS_CFUNC_MAGIC_DEF("map", 1, js_create_iterator_helper, JS_ITERATOR_HELPER_KIND_MAP ),
     JS_CFUNC_MAGIC_DEF("filter", 1, js_create_iterator_helper, JS_ITERATOR_HELPER_KIND_FILTER ),
     JS_CFUNC_MAGIC_DEF("flatMap", 1, js_create_iterator_helper, JS_ITERATOR_HELPER_KIND_FLAT_MAP ),
+    JS_CFUNC_MAGIC_DEF("toArray", 0, js_iterator_proto_terminal, ITERTERM_TOARRAY ),
+    JS_CFUNC_MAGIC_DEF("forEach", 1, js_iterator_proto_terminal, ITERTERM_FOREACH ),
+    JS_CFUNC_MAGIC_DEF("reduce", 1, js_iterator_proto_terminal, ITERTERM_REDUCE ),
+    JS_CFUNC_MAGIC_DEF("some", 1, js_iterator_proto_terminal, ITERTERM_SOME ),
+    JS_CFUNC_MAGIC_DEF("every", 1, js_iterator_proto_terminal, ITERTERM_EVERY ),
+    JS_CFUNC_MAGIC_DEF("find", 1, js_iterator_proto_terminal, ITERTERM_FIND ),
     JS_CFUNC_DEF("[Symbol.dispose]", 0, js_iterator_proto_dispose ),
     JS_CFUNC_DEF("[Symbol.iterator]", 0, js_iterator_proto_iterator ),
     JS_CGETSET_DEF("[Symbol.toStringTag]", js_iterator_proto_get_toStringTag, js_iterator_proto_set_toStringTag),
