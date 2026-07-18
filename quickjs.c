@@ -18787,6 +18787,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     int tramp_gen_create_forof = 0;                     /* 1 = this do_generator_create_tramp is a for-of iterator-getter (OP_for_of_start): at settle, finish the enum_rec ([iterator, next, catch_offset]) instead of pushing the bare object */
     int tramp_gen_cont_consume = 0;                     /* 1 = this do_generator_tramp drive is a CONSUMER (Array.from / Promise.all) driving a generator held in the consumer state; caller_sp stays put; the direct-mode settle re-enters the consumer's step (by cont_kind) instead of pushing the result */
     JSValueConst tramp_gen_cont_iter = JS_UNDEFINED;    /* the generator the consumer step wants driven (set before goto do_generator_tramp) */
+    JSValueConst tramp_gen_cont_arg = JS_UNDEFINED;     /* the RESUME arg a consumer drive forwards to gen.next(v) (async-from-sync .next(v)); UNDEFINED for Array.from/Promise.all. read+reset in do_generator_tramp so it never leaks to the next drive */
     int smc_magic = 0;                                  /* new Set(gen)/new Map(gen) recognition: 0 = Map, MAGIC_SET = Set (read at OP_call_constructor, consumed by do_setmap_consume_tramp) */
     int ta_classid = 0;                                 /* new TypedArray(gen) recognition: the TA class (read at OP_call_constructor, consumed by do_ta_consume_tramp) */
     int ta_from = 0;                                    /* 1 = TypedArray.from(gen) (OP_call_method): new_target is this_val at call_argv[-2], not call_argv[-1] */
@@ -19440,7 +19441,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 /* for await (x of syncGen): the async-from-sync wrapper's .next() (no arg) over a sync GENERATOR — its
                    .next() would drive syncGen.next() to completion. Route syncGen.next() onto the tramp; the settle
                    wraps {value,done} in a promise (do_async_from_sync_step). call_argv[-2]=wrapper, [-1]=its .next. */
-                if (call_argc == 0 && JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT) {
+                if (JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT) {   /* async-from-sync .next() or .next(v) over a sync GENERATOR */
                     JSObject *mp = JS_VALUE_GET_OBJ(call_argv[-1]);
                     if (mp->class_id == JS_CLASS_C_FUNCTION && mp->u.cfunc.cproto == JS_CFUNC_generic_magic
                         && mp->u.cfunc.c_function.generic_magic == js_async_from_sync_iterator_next
@@ -20429,6 +20430,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->sync_iter = js_dup(ws->sync_iter);
                 s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
                 tramp_cont_state = s; tramp_cont_kind = CONT_ASYNC_FROM_SYNC; tramp_gen_cont_iter = s->sync_iter;
+                tramp_gen_cont_arg = (call_argc >= 1) ? call_argv[0] : JS_UNDEFINED;   /* forward .next(v)'s v to syncGen.next(v) */
                 tramp_gen_cont_consume = 1; tramp_gen_magic = GEN_MAGIC_NEXT;
                 goto do_generator_tramp;
             }
@@ -20601,6 +20603,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 void *cc_state = cont_consume ? tramp_cont_state : NULL;   /* the consumer state (JSIterConsume or JSPromiseAll) */
                 uint8_t cc_kind = cont_consume ? tramp_cont_kind : CONT_NONE;   /* CONT_ITER_CONSUME / CONT_PROMISE_ALL */
                 JSValueConst cc_iter = cont_consume ? tramp_gen_cont_iter : JS_UNDEFINED;   /* the generator to drive (from the step) */
+                JSValueConst cc_arg = cont_consume ? tramp_gen_cont_arg : JS_UNDEFINED;   /* the resume arg forwarded to gen.next(v) (async-from-sync .next(v)) */
+                tramp_gen_cont_arg = JS_UNDEFINED;   /* reset so it never leaks to the next consumer drive (Array.from/Promise.all forward no arg) */
                 tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;   /* consumed into cc_* + the frame's cont fields; never leak onto an inner call the generator body makes (else its do_return misdispatches) */
                 JSValue close_exc_e = JS_UNINITIALIZED;   /* the saved in-flight exception (close_exc only) */
                 if (close_exc) { close_exc_e = rt->current_exception; rt->current_exception = JS_UNINITIALIZED; }
@@ -20615,7 +20619,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSGeneratorData *gs = JS_VALUE_GET_OBJ(gthis)->u.generator_data;
                 int gmagic = tramp_gen_magic;
                 JSValueConst garg = (close || iternext) ? (iternext ? sp[-1] : JS_UNDEFINED)
-                                                        : ((forof || cont_consume) ? JS_UNDEFINED : ((call_argc >= 1) ? call_argv[0] : JS_UNDEFINED));
+                                  : (forof ? JS_UNDEFINED
+                                  : (cont_consume ? cc_arg   /* async-from-sync .next(v) forwards v; Array.from/Promise.all = UNDEFINED */
+                                  : ((call_argc >= 1) ? call_argv[0] : JS_UNDEFINED)));
                 JSStackFrame *gsf = &gs->func_state.frame;
                 TrampFrame *gtf; JSObject *gfp; JSFunctionBytecode *gb;
                 bool run_body = true, do_throw = false;
