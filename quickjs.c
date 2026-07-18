@@ -18433,9 +18433,16 @@ static int js_array_reduce_step(JSContext *ctx, struct JSArrayReduce *s, JSValue
 #define ITERCONS_SET     2   /* new Set(gen): r is the empty Set; sink calls the `add` adder with the value */
 #define ITERCONS_MAP     3   /* new Map(gen): r is the empty Map; sink calls the `set` adder with the entry's [0],[1] */
 #define ITERCONS_OBJENTRIES 4 /* Object.fromEntries(gen): r is the empty object; sink defines r[entry[0]] = entry[1] */
+#define ITERCONS_SETOP   5   /* Set.prototype.union/symmetricDifference(setlike): r is the new Set pre-seeded with THIS
+                                set's records; `adder` holds the THIS set (symmetricDifference consults it per element);
+                                the iterated values come from setlike.keys(). `setop` selects the per-element rule. */
+#define SETOP_UNION      0   /* add each key to r (internal append — spec forbids calling r.add) */
+#define SETOP_SYMDIFF    1   /* key in THIS -> delete from r; key in neither -> add to r (insertion order preserved) */
+#define SETOP_SUPERSET   2   /* every key must be in THIS; a miss short-circuits false and CLOSES the iterator */
 typedef struct JSIterConsume {
     JSValue r;       /* the result being built (owned; ARRAY for FROM/SPREAD, the Set/Map instance for SET/MAP) */
-    JSValue iter;    /* the generator object being consumed (owned) — .next() drives its body */
+    JSValue iter;    /* the iterator being consumed (owned) — a generator/helper drives on the tramp, a plain one in-loop */
+    JSValue next;    /* iter's .next method (owned) — GetIterator's nextMethod; drives a PLAIN (non-coroutine) iterator */
     JSValue adder;   /* SET/MAP: the instance's add/set method (owned); JS_UNDEFINED for FROM/SPREAD */
     JSValue mapfn;   /* FROM with a mapfn (Array.from(gen, fn)): the per-element map function (owned); UNDEFINED otherwise */
     JSValue mapfn_this;  /* FROM: the mapfn's thisArg (owned; UNDEFINED) */
@@ -18444,16 +18451,29 @@ typedef struct JSIterConsume {
     int64_t k;       /* next index to define (SPREAD: the running append position; unused for SET/MAP) */
     int orig_cfirst, orig_cargc;   /* FROM/SET/MAP: the ORIGINAL call/ctor operand shape (pop at finish) */
     uint8_t orig_is_tail;
-    uint8_t sink;    /* ITERCONS_FROM / _SPREAD / _SET / _MAP — the drive is identical; only the per-element sink + setup + finish differ */
+    uint8_t sink;    /* ITERCONS_FROM / _SPREAD / _SET / _MAP / _OBJENTRIES / _SETOP — the drive is identical; only the per-element sink + setup + finish differ */
+    uint8_t setop;   /* SETOP_* — which Set.prototype set-operation rule ITERCONS_SETOP applies per element */
+    uint8_t closing; /* 1 = the sink short-circuited: close the iterator on the tramp, then finish */
 } JSIterConsume;
 static int js_iter_consume_step(JSContext *ctx, struct JSIterConsume *s, JSValue res);
 static void js_iter_consume_end(JSContext *ctx, struct JSIterConsume *s);
+/* Set-record primitives — ITERCONS_SETOP folds setlike.keys() straight into the result's [[SetData]] (the spec
+   forbids calling the observable .add), so the consume step needs them before their definitions. */
+static JSValue map_normalize_key(JSContext *ctx, JSValue key);
+static int js_setlike_get_props(JSContext *ctx, JSValueConst setlike, uint64_t *psize, JSValue *phas, JSValue *pkeys);
+static JSValue js_set_union(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static JSValue js_set_symmetricDifference(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static JSValue js_set_isSupersetOf(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static JSMapRecord *map_find_record(JSContext *ctx, JSMapState *s, JSValueConst key);
+static JSMapRecord *map_add_record(JSContext *ctx, JSMapState *s, JSValue key);
+static void map_delete_record(JSRuntime *rt, JSMapState *s, JSMapRecord *mr);
 static bool iter_consume_gen_backed(JSContext *ctx, JSValueConst items, JSValue *out_getiter);
 static bool tramp_can_call_iter_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, JSValue *out_getiter);
 static JSValue js_map_constructor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv, int magic);
 static bool tramp_can_call_setmap_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_magic, JSValue *out_getiter);
 static JSValue js_object_fromEntries(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 static bool tramp_can_call_objentries_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, JSValue *out_getiter);
+static bool tramp_can_call_setop_consume(JSValueConst func, JSValueConst this_val, JSValueConst *call_argv, int call_argc, uint8_t *out_setop);
 static JSValue js_typed_array_constructor_obj(JSContext *ctx, JSValueConst new_target, JSValueConst obj, int classid);
 static bool tramp_can_call_ta_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_classid, JSValue *out_getiter);
 /* Promise.all(gen): drive the generator's .next() on the tramp chain, wrapping each yielded value in
@@ -18846,6 +18866,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSValueConst tramp_gen_cont_arg = JS_UNDEFINED;     /* the RESUME arg a consumer drive forwards to gen.next(v) (async-from-sync .next(v)); UNDEFINED for Array.from/Promise.all. read+reset in do_generator_tramp so it never leaks to the next drive */
     int smc_magic = 0;                                  /* new Set(gen)/new Map(gen) recognition: 0 = Map, MAGIC_SET = Set (read at OP_call_constructor, consumed by do_setmap_consume_tramp) */
     int ta_classid = 0;                                 /* new TypedArray(gen) recognition: the TA class (read at OP_call_constructor, consumed by do_ta_consume_tramp) */
+    uint8_t setop_kind = 0;                             /* s.union/symmetricDifference recognition: SETOP_* (consumed by do_setop_consume_tramp) */
     int ta_from = 0;                                    /* 1 = TypedArray.from(gen) (OP_call_method): new_target is this_val at call_argv[-2], not call_argv[-1] */
     int pa_magic = 0;                                   /* Promise.all/allSettled(gen) recognition: the PROMISE_MAGIC (read at OP_call_method, consumed by do_promise_all_consume_tramp) */
     JSAsyncFunctionState *gen_state = NULL;   /* the generator/async base state IF this activation is preemptible */
@@ -19482,6 +19503,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 if (tramp_can_call_iter_consume(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter)) {   /* Array.from(iterable) -> GetIterator + consume on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_iter_consume_tramp;
+                }
+                if (tramp_can_call_setop_consume(call_argv[-1], call_argv[-2], vc(call_argv), call_argc, &setop_kind)) {   /* s.union/symmetricDifference(setlike) -> setlike.keys() on THIS chain */
+                    tramp_is_tail = (opcode == OP_tail_call_method); goto do_setop_consume_tramp;
                 }
                 if (tramp_can_call_objentries_consume(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter)) {   /* Object.fromEntries(iterable) -> GetIterator + consume on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_objentries_consume_tramp;
@@ -20239,6 +20263,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (unlikely(!s)) { JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED; JS_FreeValue(ctx, result); JS_ThrowOutOfMemory(ctx); goto exception; }
                 s->r = result;
                 s->iter = JS_UNDEFINED;
+                s->next = JS_UNDEFINED;
                 s->adder = JS_UNDEFINED;
                 /* Array.from(items, mapfn, thisArg): dup the mapfn + thisArg (recognition checked mapfn callable). */
                 s->mapfn = (call_argc >= 2) ? js_dup(call_argv[1]) : JS_UNDEFINED;
@@ -20247,6 +20272,61 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->sink = ITERCONS_FROM;
                 s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
                 tramp_consume_iterable = call_argv[0]; tramp_consume_state = s; tramp_consume_kind = CONT_ITER_CONSUME;
+                goto do_consume_acquire_iterator;
+            }
+
+        do_setop_consume_tramp:
+            /* s.union(setlike) / s.symmetricDifference(setlike): read setlike's props in SPEC ORDER (size, has, keys),
+               seed the result Set with THIS set's records (a direct [[SetData]] copy — the spec forbids calling .add),
+               then hand `keys` to the shared acquire so a generator `*keys()` runs on the tramp.
+               call_argv[-2] = the THIS set, call_argv[0] = setlike. */
+            {
+                JSValueConst thisset = call_argv[-2];
+                JSValueConst setlike = call_argv[0];
+                JSMapState *ss = JS_GetOpaque(thisset, JS_CLASS_SET), *ts;
+                JSValue has, keys, newset;
+                uint64_t size;
+                struct list_head *el;
+                JSIterConsume *s;
+                DCHECK(ss != NULL, "setop consume: `this` must be a Set (recognition guaranteed)");
+                if (js_setlike_get_props(ctx, setlike, &size, &has, &keys) < 0) goto exception;
+                JS_FreeValue(ctx, has);   /* these three consult THIS, never setlike.has */
+                newset = JS_UNDEFINED;
+                if (setop_kind == SETOP_SUPERSET) {
+                    /* isSupersetOf: no result Set — THIS must contain every key. A smaller THIS cannot be a superset,
+                       and the spec decides that BEFORE touching keys(). */
+                    if (ss->record_count < size) {
+                        JS_FreeValue(ctx, keys);
+                        { JSValue *cv = sp - call_argc; for (i = -2; i < call_argc; i++) JS_FreeValue(ctx, cv[i]); sp += -2 - call_argc; }
+                        if (tramp_is_tail) { ret_val = js_bool(false); goto do_return; }
+                        *sp++ = js_bool(false);
+                        BREAK;
+                    }
+                } else {
+                    newset = js_map_constructor(ctx, JS_UNDEFINED, 0, NULL, MAGIC_SET);
+                    if (JS_IsException(newset)) { JS_FreeValue(ctx, keys); goto exception; }
+                    ts = JS_GetOpaque(newset, JS_CLASS_SET);
+                    list_for_each(el, &ss->records) {
+                        JSMapRecord *mr = list_entry(el, JSMapRecord, link), *nr;
+                        if (mr->empty) continue;
+                        nr = map_add_record(ctx, ts, mr->key);
+                        if (!nr) { JS_FreeValue(ctx, keys); JS_FreeValue(ctx, newset); goto exception; }
+                        nr->value = JS_UNDEFINED;
+                    }
+                }
+                s = js_mallocz(ctx, sizeof(*s));
+                if (unlikely(!s)) { JS_FreeValue(ctx, keys); JS_FreeValue(ctx, newset); JS_ThrowOutOfMemory(ctx); goto exception; }
+                s->r = newset;                /* UNDEFINED for isSupersetOf — its boolean result is set at finish */
+                s->iter = JS_UNDEFINED;
+                s->next = JS_UNDEFINED;
+                s->adder = js_dup(thisset);   /* symmetricDifference / isSupersetOf consult THIS per element */
+                s->mapfn = JS_UNDEFINED; s->mapfn_this = JS_UNDEFINED;
+                s->k = 1;                     /* isSupersetOf: found-so-far = true (unused by union/symmetricDifference) */
+                s->sink = ITERCONS_SETOP;
+                s->setop = setop_kind;
+                s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
+                tramp_iter_getiter = keys;   /* the acquire CALLS it on setlike (create-on-tramp if it is a generator fn) */
+                tramp_consume_iterable = setlike; tramp_consume_state = s; tramp_consume_kind = CONT_ITER_CONSUME;
                 goto do_consume_acquire_iterator;
             }
 
@@ -20284,6 +20364,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JSIterConsume *cs = (JSIterConsume *)cst;
                     if (JS_IsException(acq)) { js_iter_consume_end(ctx, cs); js_free_rt(rt, cs); goto exception; }
                     cs->iter = acq;
+                    cs->next = JS_GetProperty(ctx, acq, JS_ATOM_next);   /* GetIterator's nextMethod (drives a plain iterator) */
+                    if (JS_IsException(cs->next)) { cs->next = JS_UNDEFINED; js_iter_consume_end(ctx, cs); js_free_rt(rt, cs); goto exception; }
                     cont_st = cs; cont_kind_cur = CONT_ITER_CONSUME;
                     ret_val = JS_UNINITIALIZED;   /* first step: no previous next() result */
                     goto do_iter_consume_step;
@@ -20342,6 +20424,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (unlikely(!s)) { JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED; JS_FreeValue(ctx, adder); JS_FreeValue(ctx, obj); JS_ThrowOutOfMemory(ctx); goto exception; }
                 s->r = obj;
                 s->iter = JS_UNDEFINED;
+                s->next = JS_UNDEFINED;
                 s->adder = adder;
                 s->mapfn = JS_UNDEFINED; s->mapfn_this = JS_UNDEFINED;
                 s->k = 0;
@@ -20362,6 +20445,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (unlikely(!s)) { JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED; JS_FreeValue(ctx, obj); JS_ThrowOutOfMemory(ctx); goto exception; }
                 s->r = obj;
                 s->iter = JS_UNDEFINED;
+                s->next = JS_UNDEFINED;
                 s->adder = JS_UNDEFINED; s->mapfn = JS_UNDEFINED; s->mapfn_this = JS_UNDEFINED;
                 s->k = 0;
                 s->sink = ITERCONS_OBJENTRIES;
@@ -20387,6 +20471,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (JS_IsException(tmp)) { JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED; js_free_rt(rt, s); goto exception; }
                 s->r = tmp;
                 s->iter = JS_UNDEFINED;
+                s->next = JS_UNDEFINED;
                 s->adder = js_dup(ntgt);   /* the new_target/ctor, used at the finish to create the typed array */
                 /* TypedArray.from(gen, mapfn, thisArg): carry the mapfn; it is applied at the finish (via
                    js_typed_array_from on the collected array — spec map-after-create order), NOT during the collect. */
@@ -20410,6 +20495,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (unlikely(!s)) { JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED; JS_ThrowOutOfMemory(ctx); goto exception; }
                 s->r = js_dup(sp[-3]);            /* the array being built — a shared ref; appends land on sp[-3] too */
                 s->iter = JS_UNDEFINED;
+                s->next = JS_UNDEFINED;
                 s->adder = JS_UNDEFINED;
                 s->mapfn = JS_UNDEFINED; s->mapfn_this = JS_UNDEFINED;
                 s->k = JS_VALUE_GET_INT(sp[-2]);  /* the current append position */
@@ -20425,6 +20511,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSIterConsume *s = (JSIterConsume *)cont_st;
                 int st = js_iter_consume_step(ctx, s, ret_val);
                 if (unlikely(st < 0)) { js_iter_consume_end(ctx, s); js_free_rt(rt, s); goto exception; }
+                if (st == 2) {
+                    /* the sink short-circuited (Set.prototype.isSupersetOf found a miss): spec IteratorClose, then
+                       finish. A GENERATOR iterator's .return() (its finally) runs ON THE TRAMP and re-enters this
+                       step, which then finishes; a plain iterator closes inline. */
+                    ret_val = JS_UNINITIALIZED;
+                    if (tramp_gen_method_magic(s->next, s->iter) == GEN_MAGIC_NEXT) {
+                        tramp_cont_state = s; tramp_cont_kind = CONT_ITER_CONSUME; tramp_gen_cont_iter = s->iter;
+                        tramp_gen_cont_consume = 1; tramp_gen_magic = GEN_MAGIC_RETURN;
+                        goto do_generator_tramp;
+                    }
+                    if (JS_IteratorClose(ctx, s->iter, false) < 0) { js_iter_consume_end(ctx, s); js_free_rt(rt, s); goto exception; }
+                    goto do_iter_consume_step;
+                }
                 if (st == 0) {   /* DONE */
                     if (s->sink == ITERCONS_SPREAD) {
                         /* [...gen] (OP_append): the elements were appended to s->r == the caller-stack array at
@@ -20479,9 +20578,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     *sp++ = r;
                     BREAK;
                 }
-                /* CALL: drive s->iter.next() on this chain. A HELPER source drives via the helper tramp (ITH_CONSUME,
-                   delivering {value,done} back to THIS step); a GENERATOR source runs its body via do_generator_tramp
-                   cont-consume. Either settle re-enters do_iter_consume_step with the result. */
+                /* CALL: drive s->iter.next() on this chain — the same three-way dispatch the helper step uses. A
+                   HELPER drives via the helper tramp (ITH_CONSUME, delivering {value,done} back to THIS step); a
+                   GENERATOR runs its body via do_generator_tramp cont-consume; a PLAIN iterator's .next() is a
+                   non-suspending call made in-loop. Any settle re-enters do_iter_consume_step with the result. */
                 if (JS_VALUE_GET_TAG(s->iter) == JS_TAG_OBJECT
                     && JS_VALUE_GET_OBJ(s->iter)->class_id == JS_CLASS_ITERATOR_HELPER) {
                     JSIteratorHelperData *hs = JS_VALUE_GET_OBJ(s->iter)->u.iterator_helper_data;
@@ -20491,9 +20591,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     ret_val = JS_UNINITIALIZED;
                     goto do_iter_helper_step;
                 }
-                tramp_cont_state = s; tramp_cont_kind = CONT_ITER_CONSUME; tramp_gen_cont_iter = s->iter;
-                tramp_gen_cont_consume = 1; tramp_gen_magic = GEN_MAGIC_NEXT;
-                goto do_generator_tramp;
+                if (tramp_gen_method_magic(s->next, s->iter) == GEN_MAGIC_NEXT) {
+                    tramp_cont_state = s; tramp_cont_kind = CONT_ITER_CONSUME; tramp_gen_cont_iter = s->iter;
+                    tramp_gen_cont_consume = 1; tramp_gen_magic = GEN_MAGIC_NEXT;
+                    goto do_generator_tramp;
+                }
+                ret_val = JS_Call(ctx, s->next, s->iter, 0, NULL);
+                if (JS_IsException(ret_val)) { ret_val = JS_UNINITIALIZED; js_iter_consume_end(ctx, s); js_free_rt(rt, s); goto exception; }
+                if (!JS_IsObject(ret_val)) {
+                    JS_FreeValue(ctx, ret_val); ret_val = JS_UNINITIALIZED;
+                    js_iter_consume_end(ctx, s); js_free_rt(rt, s);
+                    JS_ThrowTypeError(ctx, "iterator result not an object");
+                    goto exception;
+                }
+                goto do_iter_consume_step;
             }
 
         do_promise_all_consume_tramp:
@@ -46824,13 +46935,22 @@ static JSValue js_array_from(JSContext *ctx, JSValueConst this_val,
    generator settle), so a generator loop over opaque input suspend/resumes here instead of driving to completion. */
 static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
 {
+    if (s->closing) {   /* the short-circuit close has run (result already decided): finish */
+        if (JS_VALUE_GET_TAG(res) != JS_TAG_UNINITIALIZED) JS_FreeValue(ctx, res);
+        if (s->sink == ITERCONS_SETOP && s->setop == SETOP_SUPERSET) s->r = js_bool(s->k != 0);
+        return 0;
+    }
     if (JS_VALUE_GET_TAG(res) != JS_TAG_UNINITIALIZED) {
         JSValue done_val = JS_GetProperty(ctx, res, JS_ATOM_done);
         int done;
         JSValue value;
         if (JS_IsException(done_val)) { JS_FreeValue(ctx, res); return -1; }
         done = JS_ToBoolFree(ctx, done_val);
-        if (done) { JS_FreeValue(ctx, res); return 0; }   /* iterator exhausted: s->r is complete */
+        if (done) {   /* iterator exhausted: s->r is complete */
+            JS_FreeValue(ctx, res);
+            if (s->sink == ITERCONS_SETOP && s->setop == SETOP_SUPERSET) s->r = js_bool(s->k != 0);
+            return 0;
+        }
         value = JS_GetProperty(ctx, res, JS_ATOM_value);
         JS_FreeValue(ctx, res);
         if (JS_IsException(value)) return -1;
@@ -46865,6 +46985,49 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
             JS_FreeValue(ctx, key); JS_FreeValue(ctx, val);
             if (JS_IsException(ret)) return -1;
             JS_FreeValue(ctx, ret);
+        } else if (s->sink == ITERCONS_SETOP) {
+            /* Set.prototype.union / symmetricDifference: fold setlike.keys() into r (already seeded with THIS set's
+               records). The spec mutates r's [[SetData]] directly — an observable r.add must NOT be called. */
+            JSMapState *rs = (s->setop == SETOP_SUPERSET) ? NULL : JS_GetOpaque(s->r, JS_CLASS_SET);
+            JSMapState *ts = JS_GetOpaque(s->adder, JS_CLASS_SET);   /* THIS set */
+            JSMapRecord *mr;
+            DCHECK(ts != NULL, "SETOP consume: adder must hold the THIS Set");
+            DCHECK(rs != NULL || s->setop == SETOP_SUPERSET, "SETOP consume: r must be the result Set");
+            value = map_normalize_key(ctx, value);
+            if (s->setop == SETOP_SUPERSET) {
+                bool found = (NULL != map_find_record(ctx, ts, value));
+                JS_FreeValue(ctx, value);
+                if (found) return 1;
+                s->k = 0;            /* a miss decides false */
+                s->closing = 1;      /* spec: IteratorClose before returning */
+                return 2;            /* close the iterator (on the tramp if it is a generator), then finish */
+            }
+            if (s->setop == SETOP_UNION) {
+                if (!map_find_record(ctx, rs, value)) {
+                    mr = map_add_record(ctx, rs, value);
+                    if (!mr) { JS_FreeValue(ctx, value); return -1; }
+                    mr->value = JS_UNDEFINED;
+                    JS_FreeValue(ctx, value);   /* map_add_record dups the key */
+                    return 1;
+                }
+                JS_FreeValue(ctx, value);
+                return 1;
+            }
+            /* SETOP_SYMDIFF: present in THIS -> remove from r; absent from both -> add to r. A mutating iterator can
+               erase a key mid-iteration, so consult THIS first and r second (insertion order is preserved). */
+            {
+                bool present = (NULL != map_find_record(ctx, ts, value));
+                mr = map_find_record(ctx, rs, value);
+                if (present) {
+                    if (mr) map_delete_record(ctx->rt, rs, mr);
+                } else if (!mr) {
+                    mr = map_add_record(ctx, rs, value);
+                    if (!mr) { JS_FreeValue(ctx, value); return -1; }
+                    mr->value = JS_UNDEFINED;
+                }
+                JS_FreeValue(ctx, value);
+                return 1;
+            }
         } else {   /* ITERCONS_FROM / ITERCONS_SPREAD: append at the running index */
             if (s->sink == ITERCONS_FROM && s->ta_classid == 0 && JS_VALUE_GET_TAG(s->mapfn) != JS_TAG_UNDEFINED) {
                 /* Array.from(gen, mapfn): map each value by mapfn(value, index). A generator/async mapfn returns an
@@ -46890,6 +47053,7 @@ static void js_iter_consume_end(JSContext *ctx, JSIterConsume *s)
 {
     JS_FreeValue(ctx, s->r);
     JS_FreeValue(ctx, s->iter);
+    JS_FreeValue(ctx, s->next);
     JS_FreeValue(ctx, s->adder);
     JS_FreeValue(ctx, s->mapfn);
     JS_FreeValue(ctx, s->mapfn_this);
@@ -46996,6 +47160,27 @@ static bool tramp_can_call_setmap_consume(JSContext *ctx, JSValueConst func, JSV
 
 /* Route Object.fromEntries(gen) — its C loop drives the argument generator's .next(). Scoped to the direct-generator
    case; every other shape stays on the normal cfunc path. Fork-safe (the result object's writes are COW-captured). */
+/* s.union(setlike) / s.symmetricDifference(setlike): both seed a new Set from THIS, then fold in setlike.keys() — whose
+   iterator may be a GENERATOR (a `*keys()` method), which the C loop would drive to completion. Recognition reads NO
+   property of setlike: the spec order is size, then has, then keys, and do_setop_consume_tramp performs that read in
+   order before handing `keys` to the shared acquire. *out_setop selects the per-element rule. */
+static bool tramp_can_call_setop_consume(JSValueConst func, JSValueConst this_val, JSValueConst *call_argv, int call_argc, uint8_t *out_setop)
+{
+    JSObject *fp;
+    if (call_argc != 1) return false;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
+    fp = JS_VALUE_GET_OBJ(func);
+    if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
+    if (fp->u.cfunc.cproto != JS_CFUNC_generic) return false;
+    if (fp->u.cfunc.c_function.generic == js_set_union) *out_setop = SETOP_UNION;
+    else if (fp->u.cfunc.c_function.generic == js_set_symmetricDifference) *out_setop = SETOP_SYMDIFF;
+    else if (fp->u.cfunc.c_function.generic == js_set_isSupersetOf) *out_setop = SETOP_SUPERSET;
+    else return false;
+    if (JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT) return false;
+    if (JS_VALUE_GET_OBJ(this_val)->class_id != JS_CLASS_SET) return false;
+    return JS_VALUE_GET_TAG(call_argv[0]) == JS_TAG_OBJECT;
+}
+
 static bool tramp_can_call_objentries_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, JSValue *out_getiter)
 {
     JSObject *fp;
