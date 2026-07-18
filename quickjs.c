@@ -18187,6 +18187,10 @@ typedef struct TrampFrame {
        gen_data->func_state.frame IS this frame's sf (like async_data). gen_magic is NEXT/RETURN/THROW. */
     struct JSGeneratorData *gen_data;
     uint8_t gen_magic;
+    uint8_t gen_tailcall;   /* a DIRECT generator .next()/.throw()/.return() drive reached via a TAIL call
+                               (`return g.next()`): OP_tail_call had no following OP_return, so at settle the
+                               {value,done} result IS the caller's return value (goto do_return) — pushing it and
+                               continuing at pc would run off the bytecode end (heap over-read). 0 otherwise. */
     int forof_off;   /* for a FOR-OF generator drive (is_tail, async_promise UNDEFINED): the iterator's caller-stack
                         offset (caller_sp[forof_off] is the generator object). Lets a concolic fork inside a for-of
                         body recover the shared generator to record its per-flow gen_data swap. Unused otherwise. */
@@ -19477,7 +19481,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 {   /* generator .next()/.throw()/.return() -> body runs on THIS chain (loop preempts the base) */
                     int gmag = tramp_gen_method_magic(call_argv[-1], call_argv[-2]);
-                    if (gmag >= 0) { tramp_gen_magic = gmag; goto do_generator_tramp; }
+                    if (gmag >= 0) { tramp_gen_magic = gmag; tramp_is_tail = (opcode == OP_tail_call_method); goto do_generator_tramp; }
                 }
                 /* generator .next() via APPLY reflection — the two forms whose C-function target the apply site above
                    rejects (tramp_can_call is false for js_generator_next), so they'd fall to the js_generator_next
@@ -19508,6 +19512,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         ((JSValue *)call_argv)[0]  = resumeVal;
                         sp = (JSValue *)&call_argv[1];
                         call_argc = 1; tramp_first = -2; tramp_gen_magic = gmag;
+                        tramp_is_tail = (opcode == OP_tail_call_method);
                         goto do_generator_tramp;
                     }
                 }
@@ -19531,6 +19536,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         ((JSValue *)call_argv)[0]  = resumeVal;
                         sp = (JSValue *)&call_argv[1];
                         call_argc = 1; tramp_first = -2; tramp_gen_magic = gmag;
+                        tramp_is_tail = (opcode == OP_tail_call_method);
                         goto do_generator_tramp;
                     }
                 }
@@ -20674,6 +20680,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (do_throw) { JS_FreeValue(ctx, gv); JS_Throw(ctx, thr); goto exception; }
                     giter = js_create_iterator_result(ctx, gv, true);
                     if (JS_IsException(giter)) goto exception;
+                    if (tramp_is_tail) { ret_val = giter; goto do_return; }   /* `return g.next()` on a completed gen: result IS the return value */
                     *sp++ = giter;
                     BREAK;
                 }
@@ -20740,6 +20747,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 gtf->caller_argc = argc; gtf->caller_argv = argv;
                 gtf->caller_arg_allocated_size = arg_allocated_size;
                 gtf->call_first = -2; gtf->call_argc = 0;
+                /* Only a DIRECT user .next() drive (is_tail==0, not a consumer) can be a `return g.next()` tail call;
+                   for-of/iternext/close and consumer drives are never user tail-return positions. */
+                gtf->gen_tailcall = (gtf->is_tail == 0 && !cont_consume) ? tramp_is_tail : 0;
                 gtf->async_data = NULL;   /* async_promise holds ghold (direct) or UNDEFINED (for-of) */
                 gtf->gen_data = gs; gtf->gen_magic = (uint8_t)gmagic;
                 gtf->cont_state = cont_consume ? cc_state : NULL;   /* a consumer drive carries its state so the settle re-enters the step */
@@ -20774,6 +20784,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSGeneratorData *gs = gtf->gen_data;
                 JSValue ghold = gtf->async_promise;   /* held generator ref (direct/close) or UNDEFINED (for-of/iternext) */
                 int gmode = gtf->is_tail;   /* 0=direct .next(); 1=for-of; 2=OP_iterator_next; 3=close; 4=close-during-unwind */
+                uint8_t gtail = gtf->gen_tailcall;   /* direct drive via `return g.next()` — result is the caller's return value */
                 JSValue close_e = (gmode == 4) ? gtf->close_saved_exc : JS_UNINITIALIZED;   /* saved before gtf is freed */
                 void *gcont = gtf->cont_state; uint8_t gck = gtf->cont_kind;   /* consumer drive: re-enter its step with the result */
                 bool forof = (gmode == 1);
@@ -20843,6 +20854,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (gck == CONT_PROMISE_ALL) goto do_promise_all_step;
                     if (gck == CONT_ASYNC_FROM_SYNC) goto do_async_from_sync_step;
                     goto do_iter_consume_step;
+                }
+                if (gtail) {   /* `return g.next()`: OP_tail_call_method had NO following OP_return — the {value,done}
+                                  result IS the caller's return value. Pushing it and continuing at pc would run off the
+                                  bytecode end (heap-buffer over-read). Return it like the Promise.all-step tail path. */
+                    ret_val = giter;
+                    goto do_return;
                 }
                 *sp++ = giter;
                 BREAK;
