@@ -49420,6 +49420,10 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
     JSIteratorHelperData *it = JS_GetOpaque2(ctx, this_val, JS_CLASS_ITERATOR_HELPER);
     *pdone = false;
     if (!it) return JS_EXCEPTION;
+    if (it->executing) {   /* GeneratorValidate: resuming a helper whose drive is already running (a source .next()
+                              re-entered this helper) is a TypeError for every magic — a trivial guard, no drive. */
+        return JS_ThrowTypeError(ctx, "Iterator Helper is already running");
+    }
     if (magic == GEN_MAGIC_RETURN) {   /* .return(): close the source, mark done, return {value|undefined, done:true} */
         JSValue ret = (argc > 0) ? js_dup(argv[0]) : JS_UNDEFINED;
         if (!it->done) { JS_IteratorClose(ctx, it->obj, false); it->done = 1; }
