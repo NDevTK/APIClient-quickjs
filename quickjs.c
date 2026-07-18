@@ -49614,6 +49614,24 @@ fail:
    {value,done} from the previous tramp drive (UNINITIALIZED at the start; owned by this fn). On DONE *out receives
    the {value,done} to deliver. Returns 0 = DONE, 1 = DRIVE the source .next() again. DROP built (skip `count`, then
    pass values through); other kinds still use the plain-iterator js_iterator_helper_next path. */
+/* IfAbruptCloseIterator: close a helper's SOURCE on an abrupt completion (mapper/predicate throw), PRESERVING the
+   pending exception. A GENERATOR source closes on the tramp (the exception label drains pending_close_gen in
+   close_exc mode, saving+restoring the exception); a plain source closes inline as a throw completion (its own
+   return() error is ignored, spec-correct). Call with the pending exception set, then return -1. */
+static void iter_helper_close_source_abrupt(JSContext *ctx, JSIteratorHelperData *it)
+{
+    if (JS_VALUE_GET_TAG(it->obj) == JS_TAG_OBJECT) {
+        JSObject *srcp = JS_VALUE_GET_OBJ(it->obj);
+        if (srcp->class_id == JS_CLASS_GENERATOR && srcp->u.generator_data
+            && ((JSGeneratorData *)srcp->u.generator_data)->state != JS_GENERATOR_STATE_EXECUTING
+            && JS_IsUninitialized(ctx->pending_close_gen)) {
+            ctx->pending_close_gen = js_dup(it->obj);
+            return;
+        }
+    }
+    JS_IteratorClose(ctx, it->obj, true);
+}
+
 static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue res, JSValue *out)
 {
     *out = JS_UNDEFINED;
@@ -49627,12 +49645,13 @@ static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue
         case JS_ITERATOR_HELPER_KIND_TAKE:
             if (it->count == 0) {   /* limit reached: close the source, done. */
                 it->done = 1;
-                /* Close is safe only for a genuinely-PLAIN source (.return() is a plain call). A GENERATOR source, or
-                   a HELPER source whose .return() recurses to a generator, must close via the tramp (js_generator_next
-                   is a DFAIL) — routed as a follow-up; leave it suspended here rather than a drive-to-completion. */
+                /* Close the source (spec: IteratorClose on the limit). A PLAIN source closes inline and its .return()
+                   throw PROPAGATES (never swallowed). A GENERATOR/HELPER source's .return() must run on the tramp
+                   (js_generator_next is a DFAIL) — a close-then-deliver follow-up; left suspended here for now. */
                 if (tramp_gen_method_magic(it->next, it->obj) != GEN_MAGIC_NEXT
-                    && !tramp_can_call_iter_helper(it->next, it->obj))
-                    JS_IteratorClose(ctx, it->obj, false);
+                    && !tramp_can_call_iter_helper(it->next, it->obj)) {
+                    if (JS_IteratorClose(ctx, it->obj, false)) return -1;
+                }
                 *out = js_create_iterator_result(ctx, JS_UNDEFINED, true);
                 return JS_IsException(*out) ? -1 : 0;
             }
@@ -49669,9 +49688,14 @@ static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue
         d = JS_ToBoolFree(ctx, dv);
         if (d) { it->done = 1; it->resume_pc = ITHP_START; JS_FreeValue(ctx, res); *out = js_create_iterator_result(ctx, JS_UNDEFINED, true); return JS_IsException(*out) ? -1 : 0; }
         if (it->kind == JS_ITERATOR_HELPER_KIND_DROP || it->kind == JS_ITERATOR_HELPER_KIND_TAKE) {
+            /* spec: value = IteratorValue(result) — READ .value (fires a value getter, may throw), then yield a fresh
+               {value, done:false}; never pass the source result object through unread. */
+            JSValue v = JS_GetProperty(ctx, res, JS_ATOM_value);
+            JS_FreeValue(ctx, res);
+            if (JS_IsException(v)) return -1;
             it->resume_pc = ITHP_START;
-            *out = res;   /* pass the source {value,done:false} through */
-            return 0;
+            *out = js_create_iterator_result(ctx, v, false);   /* consumes v */
+            return JS_IsException(*out) ? -1 : 0;
         }
         /* MAP / FILTER: apply the callback to the source value. The callback runs via JS_Call — a sync
            mapper/predicate needs no drive; a looping-bytecode callback is the same residual as a plain
@@ -49681,12 +49705,17 @@ static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue
             JSValue idx, fret;
             JSValueConst args[2];
             JS_FreeValue(ctx, res);
-            if (JS_IsException(v)) return -1;
+            if (JS_IsException(v)) { it->done = 1; return -1; }   /* IteratorStepValue threw: iterator is done, propagate */
             idx = js_int64(it->count++);
             args[0] = v; args[1] = idx;
             fret = JS_Call(ctx, it->func, JS_UNDEFINED, 2, args);
             JS_FreeValue(ctx, idx);
-            if (JS_IsException(fret)) { JS_FreeValue(ctx, v); return -1; }
+            if (JS_IsException(fret)) {   /* IfAbruptCloseIterator: mapper/predicate threw -> close the source */
+                JS_FreeValue(ctx, v);
+                it->done = 1;
+                iter_helper_close_source_abrupt(ctx, it);
+                return -1;
+            }
             if (it->kind == JS_ITERATOR_HELPER_KIND_MAP) {
                 JS_FreeValue(ctx, v);
                 it->resume_pc = ITHP_START;
@@ -49716,15 +49745,17 @@ static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue
             JSValue idx, mapped, method, iter;
             JSValueConst args[2];
             JS_FreeValue(ctx, res);
-            if (JS_IsException(v)) return -1;
+            if (JS_IsException(v)) { it->done = 1; return -1; }   /* IteratorStepValue threw: done, propagate (no close) */
             idx = js_int64(it->count++);
             args[0] = v; args[1] = idx;
             mapped = JS_Call(ctx, it->func, JS_UNDEFINED, 2, args);
             JS_FreeValue(ctx, v); JS_FreeValue(ctx, idx);
-            if (JS_IsException(mapped)) return -1;
-            if (!JS_IsObject(mapped)) { JS_FreeValue(ctx, mapped); JS_ThrowTypeError(ctx, "flatMap mapper did not return an object"); return -1; }
+            /* IfAbruptCloseIterator on the mapper throw, a non-object result (GetIteratorFlattenable rejects it), and a
+               throwing @@iterator: each closes the SOURCE preserving the exception. */
+            if (JS_IsException(mapped)) { it->done = 1; iter_helper_close_source_abrupt(ctx, it); return -1; }
+            if (!JS_IsObject(mapped)) { JS_FreeValue(ctx, mapped); JS_ThrowTypeError(ctx, "flatMap mapper did not return an object"); it->done = 1; iter_helper_close_source_abrupt(ctx, it); return -1; }
             method = JS_GetProperty(ctx, mapped, JS_ATOM_Symbol_iterator);
-            if (JS_IsException(method)) { JS_FreeValue(ctx, mapped); return -1; }
+            if (JS_IsException(method)) { JS_FreeValue(ctx, mapped); it->done = 1; iter_helper_close_source_abrupt(ctx, it); return -1; }
             if (JS_IsNull(method) || JS_IsUndefined(method)) {
                 JS_FreeValue(ctx, method);
                 iter = mapped;   /* no [Symbol.iterator]: the mapped object IS the iterator */
@@ -49840,7 +49871,11 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
     }
     if (magic == GEN_MAGIC_RETURN) {   /* .return(): close the source, mark done, return {value|undefined, done:true} */
         JSValue ret = (argc > 0) ? js_dup(argv[0]) : JS_UNDEFINED;
-        if (!it->done) { JS_IteratorClose(ctx, it->obj, false); it->done = 1; }
+        if (!it->done) {
+            it->done = 1;
+            /* IteratorClose PROPAGATES a throw from GetMethod(return)/the return call — never swallow it. */
+            if (JS_IteratorClose(ctx, it->obj, false)) { JS_FreeValue(ctx, ret); return JS_EXCEPTION; }
+        }
         *pdone = true;
         return ret;
     }
