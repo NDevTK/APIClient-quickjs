@@ -18711,13 +18711,16 @@ static int branch_arm_fork(JSContext *ctx, JSValueConst op1, uint8_t *if_pc,
             /* gen_state != g_flow_base_gen: the branch is in a generator body driven by js_generator_next's
                async_func_resume (a nested JS_CallInternal(GENERATOR)) rather than on the tramp chain. This is the
                residual DRIVE-TO-COMPLETION path, reached ONLY when a generator .next()/.return()/.throw() call
-               BYPASSES the OP_call_method / OP_for_of_next tramp interception — i.e. Reflect.apply(g.next, g),
-               g.next.call(g), or a C builtin invoking the iterator method directly. That path also mishandles a
-               preempt (js_generator_next:23725 would read FUNC_RET_PREEMPT as a yield), so it is doubly wrong under
-               the flow machinery. The ROOT fix is to route those bypassing drives onto the tramp chain too (as
-               OP_call_method already does), deleting js_generator_next's async_func_resume drive — NOT to teach the
-               fork a second nested-activation identity. Until then this CRASHES loud (replay is banned). */
-            DFAIL("generator .next() driven off the tramp chain (Reflect.apply/.call bypass) — route it through do_generator_tramp; the js_generator_next drive-to-completion is the residue to delete");
+               BYPASSES the tramp interception. `g.next.call(g)` is now ROUTED (do_forward_call recognizes the
+               reshaped generator-method shape -> do_generator_tramp), as are OP_call_method / OP_for_of_next /
+               OP_iterator_next. The REMAINING bypasses are the APPLY forms whose target flows through the real
+               Function.prototype.apply / Reflect.apply C builtin (tramp_can_call rejects the C-function g.next, so
+               the apply site can't reshape it) and a C builtin invoking the iterator method directly. That path also
+               mishandles a preempt (js_generator_next:23725 would read FUNC_RET_PREEMPT as a yield), so it is doubly
+               wrong under the flow machinery. The ROOT fix is to route those apply drives onto the tramp too (teach
+               the apply sites the generator-method shape), deleting js_generator_next's async_func_resume drive —
+               NOT to teach the fork a second nested-activation identity. Until then this CRASHES loud (replay banned). */
+            DFAIL("generator .next() driven off the tramp chain (Function.prototype.apply / Reflect.apply bypass) — route it through do_generator_tramp; the js_generator_next drive-to-completion is the residue to delete");
         }
     }
     return harm;
@@ -19709,6 +19712,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_array_reduce(call_argv[-1], &iter_special)) goto do_array_reduce_tramp;
                 if (tramp_can_call_iter_consume(ctx, call_argv[-1], vc(call_argv), call_argc)) goto do_iter_consume_tramp;
                 if (tramp_can_call_objentries_consume(call_argv[-1], vc(call_argv), call_argc)) goto do_objentries_consume_tramp;
+                {   /* g.next.call(g) / g.throw.call(g,e) / g.return.call(g,v): the reshape produced the exact
+                       [this=generator, f=js_generator_next] method-call shape do_generator_tramp reads, so route the
+                       body onto THIS chain (loop preempts + forks the base) — never the js_generator_next
+                       drive-to-completion the plain fallback would hit (the Reflect.apply/.call bypass DFAIL). */
+                    int gmag = tramp_gen_method_magic(call_argv[-1], call_argv[-2]);
+                    if (gmag >= 0) { tramp_gen_magic = gmag; goto do_generator_tramp; }
+                }
                 /* a C-function / bound / proxy target has no preemptible body — plain call, nothing to park */
                 ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2], JS_UNDEFINED,
                                           call_argc, vc(call_argv), 0);
