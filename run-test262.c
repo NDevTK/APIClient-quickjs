@@ -1340,8 +1340,11 @@ static int fork_preempt_enabled(void) {
     if (v < 0) v = getenv("FORK_PREEMPT") ? 1 : 0;
     return v;
 }
-static const JSFlowControlHooks fork_hooks_ON  = { NULL, NULL, NULL, fork_preempt_always };
-static const JSFlowControlHooks fork_hooks_OFF = { NULL, NULL, NULL, NULL };
+/* JSFlowControlHooks is {branch, fork, preempt} — THREE fields. A fourth initializer silently left `preempt` NULL,
+   so the forced back-edge preemption never armed and the engagement metric read a vacuous 0/0. Designated
+   initializers so the field can never drift again. */
+static const JSFlowControlHooks fork_hooks_ON  = { .branch = NULL, .fork = NULL, .preempt = fork_preempt_always };
+static const JSFlowControlHooks fork_hooks_OFF = { .branch = NULL, .fork = NULL, .preempt = NULL };
 
 /* The feature must stay ON for the WHOLE test, including the JOB DRAIN. A promise reaction, a post-await
    continuation, a .then callback and an async-generator resume are all test code that the project runs under
@@ -2411,10 +2414,18 @@ int main(int argc, char **argv)
         if (fork_preempt_enabled()) {
             uint64_t req = 0, fired = 0;
             JS_FlowPreemptStats(&req, &fired);
-            double eng = req ? (100.0 * (double)fired / (double)req) : 100.0;
-            fprintf(stderr, "Feature: %llu preempt-requested, %llu fired (%.1f%% engaged), %llu nested-gap%s\n",
-                    (unsigned long long)req, (unsigned long long)fired, eng,
-                    (unsigned long long)(req - fired), (req - fired) != 1 ? "s" : "");
+            /* ZERO back-edges is NOT 100% engaged — it PROVES NOTHING: no suspend/resume happened at all (an
+               unarmed hook, or a corpus with no loop). Reporting 100% for 0/0 is exactly how an unarmed preempt
+               hook stayed invisible; engagement only means something once a back-edge actually parked+rebuilt. */
+            if (req == 0) {
+                fprintf(stderr, "Feature: NOT ENGAGED — 0 back-edge preempts reached; suspend/resume was never "
+                                "exercised, so this run proves nothing\n");
+            } else {
+                fprintf(stderr, "Feature: %llu preempt-requested, %llu fired (%.1f%% engaged), %llu nested-gap%s\n",
+                        (unsigned long long)req, (unsigned long long)fired,
+                        100.0 * (double)fired / (double)req,
+                        (unsigned long long)(req - fired), (req - fired) != 1 ? "s" : "");
+            }
             /* DRIVE-TO-COMPLETION detector: any coroutine body run to completion instead of suspend/resume on the
                tramp chain. 0 across the corpus = pure suspend/resume-at-any-depth; >0 names remaining bypasses. */
             fprintf(stderr, "DriveToCompletion: %llu (0 = pure suspend/resume; >0 = tests ran a coroutine to completion off-tramp)\n",

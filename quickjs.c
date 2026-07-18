@@ -18241,6 +18241,31 @@ typedef struct TrampFrame {
 #define CONT_ASYNC_FROM_SYNC 10 /* cont_state = JSAsyncFromSync: `for await (x of syncGen)` — the async-from-sync
                                   wrapper's .next() drives syncGen.next() on the chain, then wraps {value,done} in
                                   Promise.resolve(value).then(unwrap) at the settle. No fork-clone yet (DFAIL-guarded). */
+#define CONT_ITER_FROM     12  /* cont_state = JSIterFrom: Iterator.from(obj) — GetIterator(obj) is performed by the
+                                  shared acquire (so a generator-function @@iterator is created ON THE TRAMP) and the
+                                  resulting iterator IS the call's result; the deliver just yields it. */
+typedef struct JSIterFrom { int orig_cfirst, orig_cargc; uint8_t orig_is_tail; } JSIterFrom;
+static JSValue js_iterator_from(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static bool iter_data_at_iterator(JSContext *ctx, JSValueConst items, JSValue *out);
+static bool tramp_can_call_gen_create(JSValueConst func);
+/* Iterator.from(obj) whose @@iterator is a generator function: that call creates a coroutine, so it must run on the
+   tramp. Probe is side-effect-free (descriptor only), so it cannot disturb Iterator.from's own read order. */
+static bool tramp_can_call_iterator_from(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, JSValue *out_getiter)
+{
+    JSObject *fp;
+    *out_getiter = JS_UNDEFINED;
+    if (call_argc < 1) return false;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
+    fp = JS_VALUE_GET_OBJ(func);
+    if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
+    if (fp->u.cfunc.cproto != JS_CFUNC_generic) return false;
+    if (fp->u.cfunc.c_function.generic != js_iterator_from) return false;
+    if (JS_VALUE_GET_TAG(call_argv[0]) != JS_TAG_OBJECT) return false;   /* string/primitive: plain C path */
+    if (!iter_data_at_iterator(ctx, call_argv[0], out_getiter)) return false;
+    if (tramp_can_call_gen_create(*out_getiter)) return true;
+    JS_FreeValue(ctx, *out_getiter); *out_getiter = JS_UNDEFINED;
+    return false;
+}
 #define CONT_ITER_HELPER   11  /* cont_state = JSIteratorHelperData: a lazy Iterator Helper (drop/take/map/filter/
                                   flatMap) whose .next() drives the SOURCE iterator's .next() on the chain (a generator
                                   source runs on the tramp), applies the per-kind transform, and delivers per call
@@ -19538,6 +19563,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_iterterm(ctx, call_argv[-1], call_argv[-2], call_argc, &iterterm_kind)) {   /* it.toArray/forEach/reduce/some/every/find -> consume on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_iterterm_tramp;
                 }
+                if (tramp_can_call_iterator_from(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter)) {   /* Iterator.from(obj) -> GetIterator on THIS chain */
+                    tramp_is_tail = (opcode == OP_tail_call_method); goto do_iterfrom_tramp;
+                }
                 if (tramp_can_call_objentries_consume(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter)) {   /* Object.fromEntries(iterable) -> GetIterator + consume on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_objentries_consume_tramp;
                 }
@@ -19951,6 +19979,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_objentries_consume(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter)) goto do_objentries_consume_tramp;
                 if (tramp_can_call_setop_consume(call_argv[-1], call_argv[-2], vc(call_argv), call_argc, &setop_kind)) goto do_setop_consume_tramp;
                 if (tramp_can_call_iterterm(ctx, call_argv[-1], call_argv[-2], call_argc, &iterterm_kind)) goto do_iterterm_tramp;
+                if (tramp_can_call_iterator_from(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter)) goto do_iterfrom_tramp;
                 {   /* g.next.call(g) / g.throw.call(g,e) / g.return.call(g,v): the reshape produced the exact
                        [this=generator, f=js_generator_next] method-call shape do_generator_tramp reads, so route the
                        body onto THIS chain (loop preempts + forks the base) — never the js_generator_next
@@ -20429,6 +20458,36 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 goto do_consume_acquire_iterator;
             }
 
+        do_iterfrom_tramp:
+            /* Iterator.from(obj) whose @@iterator is a generator function: perform Iterator.from's own steps in order
+               (the already-an-Iterator short-circuit, then the real Get), and hand the method to the shared acquire so
+               the coroutine is CREATED on the tramp. The acquired iterator IS the result. */
+            {
+                JSValueConst obj = call_argv[0];
+                JSIterFrom *s;
+                JSValue method;
+                int isit = JS_OrdinaryIsInstanceOf(ctx, obj, ctx->iterator_ctor);
+                if (isit < 0) { JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED; goto exception; }
+                if (isit) {   /* already an Iterator: Iterator.from returns it unchanged */
+                    JSValue r = js_dup(obj);
+                    JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED;
+                    { JSValue *cv = sp - call_argc; for (i = -2; i < call_argc; i++) JS_FreeValue(ctx, cv[i]); sp += -2 - call_argc; }
+                    if (tramp_is_tail) { ret_val = r; goto do_return; }
+                    *sp++ = r;
+                    BREAK;
+                }
+                method = JS_GetProperty(ctx, obj, JS_ATOM_Symbol_iterator);   /* the REAL Get, in Iterator.from's order */
+                JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED;
+                if (JS_IsException(method)) goto exception;
+                DCHECK(tramp_can_call_gen_create(method), "Iterator.from: probe said generator-function @@iterator");
+                s = js_mallocz(ctx, sizeof(*s));
+                if (unlikely(!s)) { JS_FreeValue(ctx, method); JS_ThrowOutOfMemory(ctx); goto exception; }
+                s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
+                tramp_iter_getiter = method;
+                tramp_consume_iterable = obj; tramp_consume_state = s; tramp_consume_kind = CONT_ITER_FROM;
+                goto do_consume_acquire_iterator;
+            }
+
         do_consume_acquire_iterator:
             /* GetIterator for EVERY iterable-consuming builtin (Array.from / new Set|Map / Object.fromEntries /
                TypedArray(.from) / spread / Promise.all): CALL the @@iterator method the recognition probed
@@ -20440,6 +20499,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValueConst iterable = tramp_consume_iterable;
                 DCHECK(JS_IsFunction(ctx, method), "consume @@iterator must be callable (the probe accepts only a callable data property)");
                 if (tramp_can_call_gen_create(method)) {
+                    DCHECK(sp + 2 <= stack_buf + b->stack_size,
+                           "consume acquire: create operand push exceeds the frame's compiled stack_size");
                     *sp++ = js_dup(iterable);   /* this */
                     *sp++ = method;             /* gfunc (owned, transferred) */
                     call_argv = sp; call_argc = 0; tramp_first = -2; tramp_is_tail = 0;
@@ -20468,6 +20529,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     cont_st = cs; cont_kind_cur = CONT_ITER_CONSUME;
                     ret_val = JS_UNINITIALIZED;   /* first step: no previous next() result */
                     goto do_iter_consume_step;
+                }
+                if (ckind == CONT_ITER_FROM) {
+                    JSIterFrom *fs = (JSIterFrom *)cst;
+                    int cf = fs->orig_cfirst, cg = fs->orig_cargc; uint8_t itl = fs->orig_is_tail;
+                    js_free_rt(rt, fs);
+                    if (JS_IsException(acq)) goto exception;
+                    { JSValue *cv = sp - cg; for (i = cf; i < cg; i++) JS_FreeValue(ctx, cv[i]); sp += cf - cg; }
+                    if (itl) { ret_val = acq; goto do_return; }
+                    *sp++ = acq;
+                    BREAK;
                 }
                 DCHECK(ckind == CONT_PROMISE_ALL, "consume deliver: unknown consumer kind");
                 {
@@ -21558,7 +21629,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 bool gforof_create = gtf->forof_off;   /* 1 = OP_for_of_start iterator-getter: finish the enum_rec */
                 uint8_t gcreate_cont_kind = gtf->cont_kind;   /* CONT_ITER_HELPER / CONT_ITER_CONSUME / CONT_PROMISE_ALL / CONT_NONE */
                 void *gcreate_cont = (gcreate_cont_kind == CONT_ITER_HELPER || gcreate_cont_kind == CONT_ITER_CONSUME
-                                      || gcreate_cont_kind == CONT_PROMISE_ALL) ? gtf->cont_state : NULL;
+                                      || gcreate_cont_kind == CONT_PROMISE_ALL
+                                      || gcreate_cont_kind == CONT_ITER_FROM) ? gtf->cont_state : NULL;
                 JSValue obj;
                 sf->cur_pc = pc; sf->cur_sp = sp;   /* suspend at initial_yield (state stays SUSPENDED_START) */
                 obj = js_create_from_ctor(ctx, gfunc, JS_CLASS_GENERATOR);   /* uses the ctor's realm */
@@ -21589,7 +21661,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     ret_val = JS_UNINITIALIZED;
                     goto do_iter_helper_step;
                 }
-                if (gcreate_cont && (gcreate_cont_kind == CONT_ITER_CONSUME || gcreate_cont_kind == CONT_PROMISE_ALL)) {
+                if (gcreate_cont && (gcreate_cont_kind == CONT_ITER_CONSUME || gcreate_cont_kind == CONT_PROMISE_ALL
+                                     || gcreate_cont_kind == CONT_ITER_FROM)) {
                     /* A consumer's generator-function @@iterator was called on the tramp: hand the created iterator to
                        the SAME deliver the inline acquire uses, so both arrive identically. */
                     tramp_consume_state = gcreate_cont; tramp_consume_kind = gcreate_cont_kind;
