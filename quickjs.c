@@ -18442,7 +18442,7 @@ typedef struct JSIterConsume {
 } JSIterConsume;
 static int js_iter_consume_step(JSContext *ctx, struct JSIterConsume *s, JSValue res);
 static void js_iter_consume_end(JSContext *ctx, struct JSIterConsume *s);
-static bool tramp_can_call_iter_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc);
+static bool tramp_can_call_iter_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, JSValue *out_getiter);
 static JSValue js_map_constructor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv, int magic);
 static bool tramp_can_call_setmap_consume(JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_magic);
 static JSValue js_object_fromEntries(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
@@ -18825,7 +18825,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     int tramp_gen_close_exc = 0;                        /* 1 = the close is happening DURING exception unwind (JS_IteratorClose(iter,true)): after the finally runs, restore the in-flight exception and continue unwinding (goto exception), never overwrite it */
     JSValueConst tramp_gen_close_slot_gen = JS_UNINITIALIZED; /* close mode: the generator to close comes from ctx->pending_close_gen (an IfAbruptCloseIterator deferral), NOT sp[-1]; caller_sp stays put (nothing on the stack). read+reset in do_generator_tramp */
     int tramp_gen_create_forof = 0;                     /* 1 = this do_generator_create_tramp is a for-of iterator-getter (OP_for_of_start): at settle, finish the enum_rec ([iterator, next, catch_offset]) instead of pushing the bare object */
-    void *tramp_gen_create_cont_it = NULL;              /* non-NULL = this do_generator_create_tramp creates a flatMap INNER (a generator-function Symbol.iterator called from the step): the settle stores the created generator as the helper's inner and re-enters do_iter_helper_step, never pushes it. read+reset in do_generator_create_tramp */
+    void *tramp_gen_create_cont_it = NULL;              /* non-NULL = this do_generator_create_tramp creates an iterator from a generator-function @@iterator called by a driver (flatMap inner or a C consumer): the settle stores the created iterator on that driver and re-enters its step, never pushes it. read+reset in do_generator_create_tramp */
+    uint8_t tramp_gen_create_cont_kind = 0;             /* CONT_* of tramp_gen_create_cont_it: CONT_ITER_HELPER (flatMap inner) / CONT_ITER_CONSUME (Array.from etc.) */
+    JSValue tramp_iter_getiter = JS_UNDEFINED;          /* Array.from(iterable): the @@iterator method the recognition read (owned); do_iter_consume_tramp calls it to get the iterator. UNINITIALIZED = the read threw (propagate). */
     int tramp_afs_close = 0;                            /* 1 = enter do_async_from_sync_tramp in CLOSE mode: OP_iterator_close of a for-await wrapper over a sync gen — drive syncGen.return() (magic RETURN) on the tramp, wrap per spec, then DISCARD the promise and pop sp[-1]. read+reset in do_async_from_sync_tramp */
     int tramp_gen_cont_consume = 0;                     /* 1 = this do_generator_tramp drive is a CONSUMER (Array.from / Promise.all) driving a generator held in the consumer state; caller_sp stays put; the direct-mode settle re-enters the consumer's step (by cont_kind) instead of pushing the result */
     JSValueConst tramp_gen_cont_iter = JS_UNDEFINED;    /* the generator the consumer step wants driven (set before goto do_generator_tramp) */
@@ -19465,7 +19467,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_json_parse(call_argv[-1], call_argc, vc(call_argv))) {   /* JSON.parse(s,reviver) -> reviver walk on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_json_revive_tramp;
                 }
-                if (tramp_can_call_iter_consume(ctx, call_argv[-1], vc(call_argv), call_argc)) {   /* Array.from(gen) -> consume the generator on THIS chain */
+                if (tramp_can_call_iter_consume(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter)) {   /* Array.from(iterable) -> GetIterator + consume on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_iter_consume_tramp;
                 }
                 if (tramp_can_call_objentries_consume(call_argv[-1], vc(call_argv), call_argc)) {   /* Object.fromEntries(gen) -> consume on THIS chain */
@@ -19817,7 +19819,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_gen_create(call_argv[-1])) goto do_generator_create_tramp;
                 if (tramp_can_call_array_iter(call_argv[-1], &iter_special)) goto do_array_iter_tramp;
                 if (tramp_can_call_array_reduce(call_argv[-1], &iter_special)) goto do_array_reduce_tramp;
-                if (tramp_can_call_iter_consume(ctx, call_argv[-1], vc(call_argv), call_argc)) goto do_iter_consume_tramp;
+                if (tramp_can_call_iter_consume(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter)) goto do_iter_consume_tramp;
                 if (tramp_can_call_objentries_consume(call_argv[-1], vc(call_argv), call_argc)) goto do_objentries_consume_tramp;
                 {   /* g.next.call(g) / g.throw.call(g,e) / g.return.call(g,v): the reshape produced the exact
                        [this=generator, f=js_generator_next] method-call shape do_generator_tramp reads, so route the
@@ -20169,31 +20171,49 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
 
         do_iter_consume_tramp:
-            /* Array.from(GENERATOR): build the result array, seed the state, and consume the generator by driving
-               its .next() on THIS chain. call_argv[-2] = Array (from's `this`/constructor), call_argv[0] = the
-               generator (guaranteed by tramp_can_call_iter_consume). */
+            /* Array.from(iterable): GetIterator(items) via the @@iterator method the recognition read, then consume
+               the iterator on THIS chain. call_argv[-2] = Array (from's `this`/ctor), call_argv[0] = items. The
+               recognition accepted only when the iterator will be a GENERATOR (generator-function @@iterator, created
+               here on the tramp) or the source is a direct generator/helper (its @@iterator returns itself). */
             {
                 JSValueConst thisv = call_argv[-2];
-                JSValueConst gen = call_argv[0];
+                JSValueConst items = call_argv[0];
+                JSValue method = tramp_iter_getiter; tramp_iter_getiter = JS_UNDEFINED;   /* @@iterator (owned) or JS_EXCEPTION if the read threw */
                 JSIterConsume *s;
                 JSValue result;
+                if (JS_IsException(method)) goto exception;   /* the recognition's @@iterator read threw (pending) */
+                DCHECK(JS_IsFunction(ctx, method), "iter-consume @@iterator method must be callable (recognition guaranteed)");
                 if (JS_IsConstructor(ctx, thisv))
                     result = JS_CallConstructor(ctx, thisv, 0, NULL);
                 else
                     result = JS_NewArray(ctx);
-                if (JS_IsException(result)) goto exception;
+                if (JS_IsException(result)) { JS_FreeValue(ctx, method); goto exception; }
                 s = js_mallocz(ctx, sizeof(*s));
-                if (unlikely(!s)) { JS_FreeValue(ctx, result); JS_ThrowOutOfMemory(ctx); goto exception; }
+                if (unlikely(!s)) { JS_FreeValue(ctx, method); JS_FreeValue(ctx, result); JS_ThrowOutOfMemory(ctx); goto exception; }
                 s->r = result;
-                s->iter = js_dup(gen);
+                s->iter = JS_UNDEFINED;
                 s->adder = JS_UNDEFINED;
-                /* Array.from(gen, mapfn, thisArg): dup the mapfn + thisArg (recognition already checked mapfn is a
-                   function when present; an absent/undefined mapfn stays UNDEFINED = no mapping). */
+                /* Array.from(items, mapfn, thisArg): dup the mapfn + thisArg (recognition checked mapfn callable). */
                 s->mapfn = (call_argc >= 2) ? js_dup(call_argv[1]) : JS_UNDEFINED;
                 s->mapfn_this = (call_argc >= 3) ? js_dup(call_argv[2]) : JS_UNDEFINED;
                 s->k = 0;
                 s->sink = ITERCONS_FROM;
                 s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
+                if (tramp_can_call_gen_create(method)) {
+                    /* @@iterator is a generator function: create the iterator on the tramp (params-to-initial_yield).
+                       Push [items, method] as the create's call operands; the settle stores the created generator as
+                       s->iter and re-enters do_iter_consume_step. */
+                    *sp++ = js_dup(items);   /* this */
+                    *sp++ = method;          /* gfunc (owned, transferred) */
+                    call_argv = sp; call_argc = 0; tramp_first = -2; tramp_is_tail = 0;
+                    tramp_gen_create_cont_it = s; tramp_gen_create_cont_kind = CONT_ITER_CONSUME;
+                    goto do_generator_create_tramp;
+                }
+                /* @@iterator is a non-generator function (a direct generator/helper's prototype @@iterator returns
+                   itself): call it inline to get the iterator — no coroutine to suspend. */
+                s->iter = JS_GetIterator2(ctx, items, method);
+                JS_FreeValue(ctx, method);
+                if (JS_IsException(s->iter)) { s->iter = JS_UNDEFINED; js_iter_consume_end(ctx, s); js_free_rt(rt, s); goto exception; }
                 cont_st = s; cont_kind_cur = CONT_ITER_CONSUME;
                 ret_val = JS_UNINITIALIZED;   /* first step: no previous next() result */
                 goto do_iter_consume_step;
@@ -20590,7 +20610,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         *sp++ = it->inner_next;   /* sp[-1] = gfunc (the generator function) */
                         it->inner = JS_UNDEFINED; it->inner_next = JS_UNDEFINED;
                         call_argv = sp; call_argc = 0; tramp_first = -2; tramp_is_tail = 0;
-                        tramp_gen_create_cont_it = it;   /* settle re-enters this step instead of pushing the generator */
+                        tramp_gen_create_cont_it = it; tramp_gen_create_cont_kind = CONT_ITER_HELPER;   /* settle re-enters do_iter_helper_step */
                         goto do_generator_create_tramp;
                     }
                     if (st == 0) {   /* DONE: deliver `out` per drive_mode */
@@ -21134,19 +21154,26 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                PARAM-DEFAULT loop preempts the base flow), then at initial_yield (do_generator_create_settle)
                creates the generator object and returns it. Mirrors js_call_generator_function. */
             {
-                void *gcreate_cont = tramp_gen_create_cont_it; tramp_gen_create_cont_it = NULL;   /* flatMap inner create? (settle re-enters the step) */
+                void *gcreate_cont = tramp_gen_create_cont_it; tramp_gen_create_cont_it = NULL;   /* driver create? (settle re-enters its step) */
+                uint8_t gcreate_cont_kind = tramp_gen_create_cont_kind; tramp_gen_create_cont_kind = 0;
                 JSValueConst gfunc = call_argv[-1];
                 JSGeneratorData *s = js_mallocz(ctx, sizeof(*s));
                 TrampFrame *gtf; JSStackFrame *gsf; JSObject *gfp; JSFunctionBytecode *gb;
-                if (unlikely(!s)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                /* A create failure BEFORE the frame is pushed can't reach the gen-frame exception unwind (which frees a
+                   CONT_ITER_CONSUME cont); free that driver state here. A CONT_ITER_HELPER cont is a GC object. */
+                #define GEN_CREATE_FAIL_FREE_CONT() do { \
+                    if (gcreate_cont && gcreate_cont_kind == CONT_ITER_CONSUME) { \
+                        js_iter_consume_end(ctx, (JSIterConsume *)gcreate_cont); js_free_rt(rt, gcreate_cont); } } while (0)
+                if (unlikely(!s)) { GEN_CREATE_FAIL_FREE_CONT(); JS_ThrowOutOfMemory(ctx); goto exception; }
                 s->state = JS_GENERATOR_STATE_SUSPENDED_START;
                 if (async_func_init(ctx, &s->func_state, gfunc,
                                     (tramp_first == -2) ? call_argv[-2] : JS_UNDEFINED, call_argc, vc(call_argv))) {
                     s->state = JS_GENERATOR_STATE_COMPLETED;
-                    free_generator_stack_rt(rt, s); js_free_rt(rt, s); goto exception;
+                    free_generator_stack_rt(rt, s); js_free_rt(rt, s); GEN_CREATE_FAIL_FREE_CONT(); goto exception;
                 }
                 gtf = js_malloc_rt(rt, sizeof(TrampFrame));
-                if (unlikely(!gtf)) { free_generator_stack_rt(rt, s); js_free_rt(rt, s); JS_ThrowOutOfMemory(ctx); goto exception; }
+                if (unlikely(!gtf)) { free_generator_stack_rt(rt, s); js_free_rt(rt, s); GEN_CREATE_FAIL_FREE_CONT(); JS_ThrowOutOfMemory(ctx); goto exception; }
+                #undef GEN_CREATE_FAIL_FREE_CONT
                 gtf->async_promise = js_dup(gfunc);   /* held for js_create_from_ctor at initial_yield */
                 for (i = tramp_first; i < call_argc; i++) JS_FreeValue(ctx, call_argv[i]);   /* free func(+this)+args (dup'd into s) */
                 gtf->up = tf_top;
@@ -21163,7 +21190,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 /* 0xFF = CREATING (run-to-initial_yield), not a GEN_MAGIC. cont (flatMap inner): the settle stores the
                    created generator as the helper's inner and re-enters do_iter_helper_step instead of pushing it. */
                 gtf->gen_data = s; gtf->gen_magic = 0xFF;
-                gtf->cont_state = gcreate_cont; gtf->cont_kind = gcreate_cont ? CONT_ITER_HELPER : CONT_NONE;
+                gtf->cont_state = gcreate_cont; gtf->cont_kind = gcreate_cont ? gcreate_cont_kind : CONT_NONE;
                 gtf->forof_off = tramp_gen_create_forof;   /* 1 = OP_for_of_start iterator-getter: finish the enum_rec at settle; 0 = ordinary g() create */
                 tramp_gen_create_forof = 0;
                 gtf->b = NULL; gtf->local_buf = NULL;
@@ -21196,7 +21223,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValue gfunc = gtf->async_promise;
                 uint8_t gitail = gtf->is_tail;
                 bool gforof_create = gtf->forof_off;   /* 1 = OP_for_of_start iterator-getter: finish the enum_rec */
-                void *gcreate_cont = (gtf->cont_kind == CONT_ITER_HELPER) ? gtf->cont_state : NULL;   /* flatMap inner create */
+                uint8_t gcreate_cont_kind = gtf->cont_kind;   /* CONT_ITER_HELPER (flatMap inner) / CONT_ITER_CONSUME (Array.from) / CONT_NONE */
+                void *gcreate_cont = (gcreate_cont_kind == CONT_ITER_HELPER || gcreate_cont_kind == CONT_ITER_CONSUME) ? gtf->cont_state : NULL;
                 JSValue obj;
                 sf->cur_pc = pc; sf->cur_sp = sp;   /* suspend at initial_yield (state stays SUSPENDED_START) */
                 obj = js_create_from_ctor(ctx, gfunc, JS_CLASS_GENERATOR);   /* uses the ctor's realm */
@@ -21214,7 +21242,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JS_FreeValue(ctx, gfunc);
                 if (unlikely(JS_IsException(obj))) { free_generator_stack_rt(rt, s); js_free_rt(rt, s); goto exception; }
                 JS_SetOpaqueInternal(obj, s);   /* the object now owns the suspended generator state */
-                if (gcreate_cont) {
+                if (gcreate_cont && gcreate_cont_kind == CONT_ITER_HELPER) {
                     /* flatMap inner: the mapped iterable's [Symbol.iterator] generator was created on the tramp.
                        Store it as the helper's inner and re-enter do_iter_helper_step; ITHP_START drives the inner. */
                     JSIteratorHelperData *cit = (JSIteratorHelperData *)gcreate_cont;
@@ -21226,6 +21254,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     cont_st = cit; cont_kind_cur = CONT_ITER_HELPER;
                     ret_val = JS_UNINITIALIZED;
                     goto do_iter_helper_step;
+                }
+                if (gcreate_cont && gcreate_cont_kind == CONT_ITER_CONSUME) {
+                    /* Array.from(iterable): the source's generator-function @@iterator was called on the tramp,
+                       creating the iterator. Store it and re-enter do_iter_consume_step to drive it. */
+                    JSIterConsume *s2 = (JSIterConsume *)gcreate_cont;
+                    DCHECK(JS_IsUndefined(s2->iter), "consume iterator already set before create-on-tramp settle");
+                    s2->iter = obj;
+                    cont_st = s2; cont_kind_cur = CONT_ITER_CONSUME;
+                    ret_val = JS_UNINITIALIZED;
+                    goto do_iter_consume_step;
                 }
                 if (gforof_create) {
                     /* OP_for_of_start: the @@iterator getter (a generator function) produced this iterator generator
@@ -46659,26 +46697,38 @@ static void js_iter_consume_end(JSContext *ctx, JSIterConsume *s)
 /* Route Array.from ONLY for the direct-generator, single-arg (no mapfn) shape — the case whose C loop drives the
    generator .next() to completion. Every other Array.from (array-like, non-generator iterable, with mapfn) stays on
    the normal cfunc path (no generator body => no drive). Runtime-arg-aware: call_argv[0] is the items argument. */
-static bool tramp_can_call_iter_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc)
+static bool tramp_can_call_iter_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, JSValue *out_getiter)
 {
-    JSObject *fp, *ip;
+    JSObject *fp;
+    JSValue m;
+    *out_getiter = JS_UNDEFINED;
     if (call_argc < 1) return false;
     if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
     fp = JS_VALUE_GET_OBJ(func);
     if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
     if (fp->u.cfunc.cproto != JS_CFUNC_generic) return false;
     if (fp->u.cfunc.c_function.generic != js_array_from) return false;
-    if (JS_VALUE_GET_TAG(call_argv[0]) != JS_TAG_OBJECT) return false;
-    ip = JS_VALUE_GET_OBJ(call_argv[0]);
-    /* source must be a GENERATOR or a live ITERATOR HELPER (both drive their .next() on the tramp). */
-    if (!((ip->class_id == JS_CLASS_GENERATOR && ip->u.generator_data)
-          || (ip->class_id == JS_CLASS_ITERATOR_HELPER && ip->u.iterator_helper_data
-              && !ip->u.iterator_helper_data->executing && !ip->u.iterator_helper_data->done)))
-        return false;
     /* a mapfn arg, if present and not undefined, MUST be callable — else Array.from throws EARLY (before GetIterator);
-       leave that to the normal path rather than routing (recognition must not throw). thisArg (argv[2]) is free. */
+       leave that to the normal path rather than routing. thisArg (argv[2]) is free. */
     if (call_argc >= 2 && !JS_IsUndefined(call_argv[1]) && !JS_IsFunction(ctx, call_argv[1])) return false;
-    return true;
+    /* Read @@iterator once (Array.from's own first step is GetMethod(items,@@iterator)); do_iter_consume_tramp reuses
+       it, so no double read on the accept path. Accept only when the ITERATOR will be a generator (generator-function
+       @@iterator, created on the tramp) or the source is a direct generator/helper (its @@iterator returns itself) —
+       those drive on the tramp. Plain-iterator iterables (Array/Set) and array-likes drive fine on the C path. */
+    m = JS_GetProperty(ctx, call_argv[0], JS_ATOM_Symbol_iterator);
+    if (JS_IsException(m)) { *out_getiter = JS_EXCEPTION; return true; }   /* the read threw: accept + propagate on the tramp */
+    if (!JS_IsFunction(ctx, m)) { JS_FreeValue(ctx, m); return false; }
+    if (tramp_can_call_gen_create(m)) { *out_getiter = m; return true; }
+    if (JS_VALUE_GET_TAG(call_argv[0]) == JS_TAG_OBJECT) {
+        JSObject *ip = JS_VALUE_GET_OBJ(call_argv[0]);
+        if ((ip->class_id == JS_CLASS_GENERATOR && ip->u.generator_data)
+            || (ip->class_id == JS_CLASS_ITERATOR_HELPER && ip->u.iterator_helper_data
+                && !ip->u.iterator_helper_data->executing && !ip->u.iterator_helper_data->done)) {
+            *out_getiter = m; return true;
+        }
+    }
+    JS_FreeValue(ctx, m);
+    return false;
 }
 
 /* Route new Set(gen) / new Map(gen) — the js_map_constructor C loop drives the argument generator's .next(). Scoped
