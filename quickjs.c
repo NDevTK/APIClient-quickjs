@@ -571,6 +571,10 @@ struct JSContext {
     JSValue native_error_proto[JS_NATIVE_ERROR_COUNT];
     JSValue error_ctor;
     JSValue error_back_trace;
+    JSValue pending_close_gen;   /* a C builtin (IfAbruptCloseIterator) deferred a GENERATOR-source close to its
+                                    interpreter caller: the JS_CallInternal exception label routes it onto
+                                    do_generator_tramp (close_exc) so the finally runs on the tramp, never a
+                                    JS_IteratorClose->js_generator_next drive-to-completion. UNINITIALIZED when idle. */
     JSValue error_prepare_stack;
     JSValue error_stack_trace_limit;
     JSValue iterator_ctor;
@@ -2911,6 +2915,7 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
     ctx->promise_ctor = JS_NULL;
     ctx->error_ctor = JS_NULL;
     ctx->error_back_trace = JS_UNDEFINED;
+    ctx->pending_close_gen = JS_UNINITIALIZED;
     ctx->error_prepare_stack = JS_UNDEFINED;
     ctx->error_stack_trace_limit = js_int32(10);
     init_list_head(&ctx->loaded_modules);
@@ -3116,6 +3121,7 @@ void JS_FreeContext(JSContext *ctx)
         JS_FreeValue(ctx, ctx->native_error_proto[i]);
     }
     JS_FreeValue(ctx, ctx->error_ctor);
+    JS_FreeValue(ctx, ctx->pending_close_gen);   /* normally UNINITIALIZED (drained at the exception label); free defensively */
     JS_FreeValue(ctx, ctx->error_back_trace);
     JS_FreeValue(ctx, ctx->error_prepare_stack);
     JS_FreeValue(ctx, ctx->error_stack_trace_limit);
@@ -18813,6 +18819,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     int tramp_gen_iternext = 0;                         /* 1 = OP_iterator_next drive (yield* / destructuring): iterator at sp[-4], arg at sp[-1], result OBJECT replaces sp[-1] */
     int tramp_gen_close = 0;                            /* 1 = OP_iterator_close drive (.return() on an unconsumed generator iterator at sp[-1]): body runs finally on the tramp, result DISCARDED */
     int tramp_gen_close_exc = 0;                        /* 1 = the close is happening DURING exception unwind (JS_IteratorClose(iter,true)): after the finally runs, restore the in-flight exception and continue unwinding (goto exception), never overwrite it */
+    JSValueConst tramp_gen_close_slot_gen = JS_UNINITIALIZED; /* close mode: the generator to close comes from ctx->pending_close_gen (an IfAbruptCloseIterator deferral), NOT sp[-1]; caller_sp stays put (nothing on the stack). read+reset in do_generator_tramp */
     int tramp_gen_create_forof = 0;                     /* 1 = this do_generator_create_tramp is a for-of iterator-getter (OP_for_of_start): at settle, finish the enum_rec ([iterator, next, catch_offset]) instead of pushing the bare object */
     int tramp_afs_close = 0;                            /* 1 = enter do_async_from_sync_tramp in CLOSE mode: OP_iterator_close of a for-await wrapper over a sync gen — drive syncGen.return() (magic RETURN) on the tramp, wrap per spec, then DISCARD the promise and pop sp[-1]. read+reset in do_async_from_sync_tramp */
     int tramp_gen_cont_consume = 0;                     /* 1 = this do_generator_tramp drive is a CONSUMER (Array.from / Promise.all) driving a generator held in the consumer state; caller_sp stays put; the direct-mode settle re-enters the consumer's step (by cont_kind) instead of pushing the result */
@@ -20737,11 +20744,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 bool forof = (tramp_gen_forof < 0);   /* a real for-of offset is always negative (-3-..) */
                 int fofoff = tramp_gen_forof;
                 tramp_gen_forof = 1;   /* reset to the direct-call sentinel */
-                /* close: generator iterator at sp[-1], .return() with no arg, result discarded. iternext: iterator at
-                   sp[-4], resume arg at sp[-1]. for-of: iterator at sp[fofoff]. cont-consume: generator in the state.
-                   direct: receiver at call_argv[-2]. */
+                JSValueConst close_slot = tramp_gen_close_slot_gen; tramp_gen_close_slot_gen = JS_UNINITIALIZED;   /* read+reset */
+                bool close_from_slot = !JS_IsUninitialized(close_slot);   /* IfAbruptCloseIterator deferral: generator NOT on the stack */
+                /* close: generator iterator at sp[-1] (or from close_slot when a C deferral), .return() with no arg,
+                   result discarded. iternext: iterator at sp[-4], resume arg at sp[-1]. for-of: iterator at sp[fofoff].
+                   cont-consume: generator in the state. direct: receiver at call_argv[-2]. */
                 JSValueConst gthis = cont_consume ? cc_iter
-                                   : (close ? sp[-1] : (iternext ? sp[-4] : (forof ? sp[fofoff] : call_argv[-2])));
+                                   : (close ? (close_from_slot ? close_slot : sp[-1]) : (iternext ? sp[-4] : (forof ? sp[fofoff] : call_argv[-2])));
                 JSGeneratorData *gs = JS_VALUE_GET_OBJ(gthis)->u.generator_data;
                 int gmagic = tramp_gen_magic;
                 JSValueConst garg = (close || iternext) ? (iternext ? sp[-1] : JS_UNDEFINED)
@@ -20776,7 +20785,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JSValue giter;
                     if (close) {   /* OP_iterator_close on a completed/not-started generator: no body run; discard */
                         JS_FreeValue(ctx, gv); JS_FreeValue(ctx, thr);
-                        if (close_exc) {   /* mid-unwind: restore the exception, continue; iterator stays on the stack */
+                        if (close_from_slot) JS_FreeValue(ctx, (JSValue)close_slot);   /* no frame allocated here: drop the transferred slot ref */
+                        if (close_exc) {   /* mid-unwind: restore the exception, continue; slot: nothing on the stack */
                             rt->current_exception = close_exc_e;
                             goto exception;
                         }
@@ -20823,9 +20833,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (close) {
                     /* OP_iterator_close (.return()): HOLD the generator across its finally run (like the direct
                        drive), then the settle discards the result. A concolic fork in the finally recovers the
-                       generator from async_promise (an object), like the direct path. */
-                    gtf->async_promise = js_dup(gthis);
+                       generator from async_promise (an object), like the direct path. For a slot-sourced deferral the
+                       slot's owned ref is TRANSFERRED into async_promise (no dup, nothing on the stack to free). */
+                    gtf->async_promise = close_from_slot ? (JSValue)close_slot : js_dup(gthis);
                     gtf->forof_off = 1;
+                    if (close_from_slot) DCHECK(close_exc, "slot-sourced generator close must be an exception-unwind close");
                     if (close_exc) {
                         /* mid-exception-unwind: the iterator STAYS on the stack (the unwind frees it next); save the
                            in-flight exception in the frame so it survives finally preempts, restored at settle. */
@@ -23784,6 +23796,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         }
     }
  exception:
+    if (unlikely(!JS_IsUninitialized(ctx->pending_close_gen))) {
+        /* A C builtin (IfAbruptCloseIterator) deferred a generator-source close: route it onto do_generator_tramp
+           (close_exc) so the finally runs on the tramp; the in-flight exception is saved+restored across the close. */
+        tramp_gen_close_slot_gen = ctx->pending_close_gen;
+        ctx->pending_close_gen = JS_UNINITIALIZED;
+        tramp_gen_magic = GEN_MAGIC_RETURN; tramp_gen_close = 1; tramp_gen_close_exc = 1;
+        goto do_generator_tramp;
+    }
     if (needs_backtrace(rt->current_exception)
     || JS_IsUndefined(ctx->error_back_trace)) {
         sf->cur_pc = pc;
@@ -49229,6 +49249,18 @@ static JSValue js_create_iterator_helper(JSContext *ctx, JSValueConst this_val,
 range_error:
     JS_ThrowRangeError(ctx, "must be positive");
 fail:
+    /* IfAbruptCloseIterator: close the source. A GENERATOR source's .return() must run its finally on the tramp
+       (js_generator_next is a DFAIL) — DEFER it to the interpreter caller via ctx->pending_close_gen, which its
+       exception label routes onto do_generator_tramp. A non-generator source's .return() is a plain call — close now. */
+    if (JS_VALUE_GET_TAG(this_val) == JS_TAG_OBJECT) {
+        JSObject *tp = JS_VALUE_GET_OBJ(this_val);
+        if (tp->class_id == JS_CLASS_GENERATOR && tp->u.generator_data
+            && ((JSGeneratorData *)tp->u.generator_data)->state != JS_GENERATOR_STATE_EXECUTING) {
+            DCHECK(JS_IsUninitialized(ctx->pending_close_gen), "pending_close_gen already set — nested IfAbruptCloseIterator");
+            ctx->pending_close_gen = js_dup(this_val);
+            return JS_EXCEPTION;
+        }
+    }
     JS_IteratorClose(ctx, this_val, true);
     return JS_EXCEPTION;
 }
