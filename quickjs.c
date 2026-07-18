@@ -24659,92 +24659,15 @@ static JSValue js_generator_next(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv,
                                  int *pdone, int magic)
 {
-    JSGeneratorData *s = JS_GetOpaque(this_val, JS_CLASS_GENERATOR);
-    JSStackFrame *sf;
-    JSValue ret, func_ret;
-
+    /* DELETED: the generator .next()/.throw()/.return() DRIVE-TO-COMPLETION body (async_func_resume in a nested
+       C call). Every real generator method call is intercepted by the tramp (do_generator_tramp) and runs the body
+       on the flow machinery. This function keeps only its IDENTITY (tramp_gen_method_magic recognizes a generator
+       .next by its address); reaching its body means an un-routed off-tramp bypass drove the generator directly —
+       a should-never-happen to route onto do_generator_tramp at the root. */
+    (void)this_val; (void)argc; (void)argv; (void)magic;
     *pdone = true;
-    if (!s)
-        return JS_ThrowTypeError(ctx, "not a generator");
-    sf = &s->func_state.frame;
-    switch(s->state) {
-    default:
-    case JS_GENERATOR_STATE_SUSPENDED_START:
-        if (magic == GEN_MAGIC_NEXT) {
-            goto exec_no_arg;
-        } else {
-            free_generator_stack(ctx, s);
-            goto done;
-        }
-        break;
-    case JS_GENERATOR_STATE_SUSPENDED_YIELD_STAR:
-    case JS_GENERATOR_STATE_SUSPENDED_YIELD:
-        /* DRIVE-TO-COMPLETION (temporary): the body is driven to its next suspend via a nested async_func_resume
-           rather than on the tramp chain. This is COUNTED automatically by the drive-to-completion detector (the
-           nested JS_CALL_FLAG_GENERATOR entry in JS_CallInternal), and is the residual path to eliminate by routing
-           every generator .next() bypass (yield* / destructuring / .call/.apply / C-builtin consumers) onto
-           do_generator_tramp. When the corpus-wide count is 0, this block becomes dead and is deleted. */
-        /* cur_sp[-1] was set to JS_UNDEFINED in the previous call */
-        ret = js_dup(argv[0]);
-        if (magic == GEN_MAGIC_THROW &&
-            s->state == JS_GENERATOR_STATE_SUSPENDED_YIELD) {
-            JS_Throw(ctx, ret);
-            s->func_state.throw_flag = true;
-        } else {
-            sf->cur_sp[-1] = ret;
-            sf->cur_sp[0] = js_int32(magic);
-            sf->cur_sp++;
-        exec_no_arg:
-            s->func_state.throw_flag = false;
-        }
-        s->state = JS_GENERATOR_STATE_EXECUTING;
-        func_ret = async_func_resume(ctx, &s->func_state);
-        s->state = JS_GENERATOR_STATE_SUSPENDED_YIELD;
-        if (JS_IsException(func_ret)) {
-            /* finalize the execution in case of exception */
-            free_generator_stack(ctx, s);
-            return func_ret;
-        }
-        if (JS_VALUE_GET_TAG(func_ret) == JS_TAG_INT) {
-            /* get the returned yield value at the top of the stack */
-            ret = sf->cur_sp[-1];
-            sf->cur_sp[-1] = JS_UNDEFINED;
-            if (JS_VALUE_GET_INT(func_ret) == FUNC_RET_YIELD_STAR) {
-                s->state = JS_GENERATOR_STATE_SUSPENDED_YIELD_STAR;
-                /* return (value, done) object */
-                *pdone = 2;
-            } else {
-                *pdone = false;
-            }
-        } else {
-            /* end of iterator */
-            ret = sf->cur_sp[-1];
-            sf->cur_sp[-1] = JS_UNDEFINED;
-            JS_FreeValue(ctx, func_ret);
-            free_generator_stack(ctx, s);
-        }
-        break;
-    case JS_GENERATOR_STATE_COMPLETED:
-    done:
-        /* execution is finished */
-        switch(magic) {
-        default:
-        case GEN_MAGIC_NEXT:
-            ret = JS_UNDEFINED;
-            break;
-        case GEN_MAGIC_RETURN:
-            ret = js_dup(argv[0]);
-            break;
-        case GEN_MAGIC_THROW:
-            ret = JS_Throw(ctx, js_dup(argv[0]));
-            break;
-        }
-        break;
-    case JS_GENERATOR_STATE_EXECUTING:
-        ret = JS_ThrowTypeError(ctx, "cannot invoke a running generator");
-        break;
-    }
-    return ret;
+    DFAIL("js_generator_next: generator body driven off the tramp chain — route the caller onto do_generator_tramp");
+    return JS_ThrowTypeError(ctx, "generator driven off the tramp chain (drive-to-completion deleted)");
 }
 
 static JSValue js_call_generator_function(JSContext *ctx, JSValueConst func_obj,
