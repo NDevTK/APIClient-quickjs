@@ -18479,7 +18479,7 @@ typedef struct JSPromiseAll {
 static int js_promise_all_step(JSContext *ctx, struct JSPromiseAll *s, JSValue res);
 static int js_promise_all_attach(JSContext *ctx, struct JSPromiseAll *s, int index, JSValue next_promise);
 static void js_promise_all_end(JSContext *ctx, struct JSPromiseAll *s);
-static bool tramp_can_call_promise_all(JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_magic);
+static bool tramp_can_call_promise_all(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_magic, JSValue *out_getiter);
 typedef struct JSAsyncFromSyncIteratorData {   /* JS_CLASS_ASYNC_FROM_SYNC_ITERATOR opaque (hoisted for the for-await consumer) */
     JSValue sync_iter;
     JSValue next_method;
@@ -19485,7 +19485,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_ta_from_consume(ctx, call_argv[-1], call_argv[-2], vc(call_argv), call_argc, &ta_classid, &tramp_iter_getiter)) {   /* TypedArray.from(iterable) -> collect on THIS chain */
                     tramp_is_tail = 0; ta_from = 1; goto do_ta_consume_tramp;
                 }
-                if (tramp_can_call_promise_all(call_argv[-1], vc(call_argv), call_argc, &pa_magic)) {   /* Promise.all/allSettled/any(gen) -> consume on THIS chain */
+                if (tramp_can_call_promise_all(ctx, call_argv[-1], vc(call_argv), call_argc, &pa_magic, &tramp_iter_getiter)) {   /* Promise.all/allSettled/any(iterable) -> GetIterator + consume on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_promise_all_consume_tramp;
                 }
                 if (tramp_can_call_promise_race(call_argv[-1], vc(call_argv), call_argc, &pa_magic)) {   /* Promise.race(gen) -> consume on THIS chain */
@@ -20499,20 +20499,24 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
 
         do_promise_all_consume_tramp:
-            /* Promise.all(gen): create the aggregate promise + accumulation state, then drive the generator's
-               .next() on THIS chain. call_argv[-2] = the Promise ctor (this_val), call_argv[0] = the generator. */
+            /* Promise.all(iterable): create the aggregate promise + accumulation state, GetIterator(iterable) on the
+               tramp (a generator-function @@iterator is created on the tramp via the create-cont, else GetIterator2
+               inline), then drive the iterator's .next() on THIS chain. call_argv[-2] = the Promise ctor, [0] = items. */
             {
                 JSValueConst thisv = call_argv[-2];
-                JSValueConst gen = call_argv[0];
-                JSPromiseAll *s = js_mallocz(ctx, sizeof(*s));
+                JSValueConst iterable = call_argv[0];
+                JSValue method = tramp_iter_getiter; tramp_iter_getiter = JS_UNDEFINED;   /* UNDEFINED = direct generator; else a generator-function @@iterator */
+                JSPromiseAll *s;
                 JSValue rp;
-                if (unlikely(!s)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                s = js_mallocz(ctx, sizeof(*s));
+                if (unlikely(!s)) { JS_FreeValue(ctx, method); JS_ThrowOutOfMemory(ctx); goto exception; }
                 rp = js_new_promise_capability(ctx, s->resolving_funcs, thisv);   /* result_promise + [resolve,reject] */
-                if (JS_IsException(rp)) { js_free_rt(rt, s); goto exception; }
+                if (JS_IsException(rp)) { JS_FreeValue(ctx, method); js_free_rt(rt, s); goto exception; }
                 s->result_promise = rp;
                 s->this_val = js_dup(thisv);
                 s->promise_resolve = JS_GetProperty(ctx, thisv, JS_ATOM_resolve);
-                s->iter = js_dup(gen);
+                s->iter = JS_UNDEFINED;   /* set below (inline) or by the create-cont settle */
+                s->next = JS_UNDEFINED;
                 s->values = JS_NewArray(ctx);
                 s->resolve_element_env = JS_NewArray(ctx);
                 s->elem_promises = JS_NewArray(ctx);
@@ -20522,11 +20526,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (JS_IsException(s->promise_resolve) || !JS_IsFunction(ctx, s->promise_resolve)
                     || JS_IsException(s->values) || JS_IsException(s->resolve_element_env)
                     || JS_IsException(s->elem_promises)
-                    || JS_IsException(s->next = JS_GetProperty(ctx, gen, JS_ATOM_next))
                     || JS_DefinePropertyValueUint32(ctx, s->resolve_element_env, 0, js_int32(1),
                                                     JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE | JS_PROP_WRITABLE) < 0) {
                     /* setup failed: reject the aggregate promise with the pending error and yield it */
                     JSValue err = JS_GetException(ctx), rr;
+                    JS_FreeValue(ctx, method);
                     rr = JS_Call(ctx, s->resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
                     JS_FreeValue(ctx, err); JS_FreeValue(ctx, rr);
                     { JSValue r = js_dup(s->result_promise); int cf = s->orig_cfirst, cg = s->orig_cargc; uint8_t it = s->orig_is_tail;
@@ -20534,9 +20538,28 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                       JSValue *cv = sp - cg; for (i = cf; i < cg; i++) JS_FreeValue(ctx, cv[i]); sp += cf - cg;
                       if (it) { ret_val = r; goto do_return; } *sp++ = r; BREAK; }
                 }
+                if (!JS_IsUndefined(method)) {   /* generator-function @@iterator: create the iterator on the tramp */
+                    *sp++ = js_dup(iterable); *sp++ = method;
+                    call_argv = sp; call_argc = 0; tramp_first = -2; tramp_is_tail = 0;
+                    tramp_gen_create_cont_it = s; tramp_gen_create_cont_kind = CONT_PROMISE_ALL;
+                    goto do_generator_create_tramp;
+                }
+                s->iter = js_dup(iterable);   /* DIRECT generator: it is its own iterator (@@iterator returns this) */
+                s->next = JS_GetProperty(ctx, s->iter, JS_ATOM_next);   /* Generator.prototype.next — never throws */
+                if (JS_IsException(s->next)) { s->next = JS_UNDEFINED; goto promise_all_setup_reject; }
                 cont_st = s; cont_kind_cur = CONT_PROMISE_ALL;
                 ret_val = JS_UNINITIALIZED;
                 goto do_promise_all_step;
+            promise_all_setup_reject:
+                {   /* GetIterator/GetProperty(next) threw: reject the aggregate and yield it */
+                    JSValue err = JS_GetException(ctx), rr;
+                    rr = JS_Call(ctx, s->resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
+                    JS_FreeValue(ctx, err); JS_FreeValue(ctx, rr);
+                    JSValue r = js_dup(s->result_promise); int cf = s->orig_cfirst, cg = s->orig_cargc; uint8_t it = s->orig_is_tail;
+                    js_promise_all_end(ctx, s); js_free_rt(rt, s);
+                    JSValue *cv = sp - cg; for (i = cf; i < cg; i++) JS_FreeValue(ctx, cv[i]); sp += cf - cg;
+                    if (it) { ret_val = r; goto do_return; } *sp++ = r; BREAK;
+                }
             }
 
         do_promise_all_step:
@@ -21267,10 +21290,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSGeneratorData *s = js_mallocz(ctx, sizeof(*s));
                 TrampFrame *gtf; JSStackFrame *gsf; JSObject *gfp; JSFunctionBytecode *gb;
                 /* A create failure BEFORE the frame is pushed can't reach the gen-frame exception unwind (which frees a
-                   CONT_ITER_CONSUME cont); free that driver state here. A CONT_ITER_HELPER cont is a GC object. */
+                   CONT_ITER_CONSUME/CONT_PROMISE_ALL cont); free that driver state here. A CONT_ITER_HELPER cont is a
+                   GC object. */
                 #define GEN_CREATE_FAIL_FREE_CONT() do { \
                     if (gcreate_cont && gcreate_cont_kind == CONT_ITER_CONSUME) { \
-                        js_iter_consume_end(ctx, (JSIterConsume *)gcreate_cont); js_free_rt(rt, gcreate_cont); } } while (0)
+                        js_iter_consume_end(ctx, (JSIterConsume *)gcreate_cont); js_free_rt(rt, gcreate_cont); } \
+                    else if (gcreate_cont && gcreate_cont_kind == CONT_PROMISE_ALL) { \
+                        js_promise_all_end(ctx, (JSPromiseAll *)gcreate_cont); js_free_rt(rt, gcreate_cont); } } while (0)
                 if (unlikely(!s)) { GEN_CREATE_FAIL_FREE_CONT(); JS_ThrowOutOfMemory(ctx); goto exception; }
                 s->state = JS_GENERATOR_STATE_SUSPENDED_START;
                 if (async_func_init(ctx, &s->func_state, gfunc,
@@ -21330,8 +21356,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValue gfunc = gtf->async_promise;
                 uint8_t gitail = gtf->is_tail;
                 bool gforof_create = gtf->forof_off;   /* 1 = OP_for_of_start iterator-getter: finish the enum_rec */
-                uint8_t gcreate_cont_kind = gtf->cont_kind;   /* CONT_ITER_HELPER (flatMap inner) / CONT_ITER_CONSUME (Array.from) / CONT_NONE */
-                void *gcreate_cont = (gcreate_cont_kind == CONT_ITER_HELPER || gcreate_cont_kind == CONT_ITER_CONSUME) ? gtf->cont_state : NULL;
+                uint8_t gcreate_cont_kind = gtf->cont_kind;   /* CONT_ITER_HELPER / CONT_ITER_CONSUME / CONT_PROMISE_ALL / CONT_NONE */
+                void *gcreate_cont = (gcreate_cont_kind == CONT_ITER_HELPER || gcreate_cont_kind == CONT_ITER_CONSUME
+                                      || gcreate_cont_kind == CONT_PROMISE_ALL) ? gtf->cont_state : NULL;
                 JSValue obj;
                 sf->cur_pc = pc; sf->cur_sp = sp;   /* suspend at initial_yield (state stays SUSPENDED_START) */
                 obj = js_create_from_ctor(ctx, gfunc, JS_CLASS_GENERATOR);   /* uses the ctor's realm */
@@ -21371,6 +21398,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     cont_st = s2; cont_kind_cur = CONT_ITER_CONSUME;
                     ret_val = JS_UNINITIALIZED;
                     goto do_iter_consume_step;
+                }
+                if (gcreate_cont && gcreate_cont_kind == CONT_PROMISE_ALL) {
+                    /* Promise.all(iterable): the source's generator-function @@iterator was created on the tramp.
+                       Store the iterator + its .next (Generator.prototype.next, never throws) and drive it. */
+                    JSPromiseAll *s2 = (JSPromiseAll *)gcreate_cont;
+                    DCHECK(JS_IsUndefined(s2->iter), "promise-all iterator already set before create-on-tramp settle");
+                    s2->iter = obj;
+                    s2->next = JS_GetProperty(ctx, obj, JS_ATOM_next);
+                    if (JS_IsException(s2->next)) { s2->next = JS_UNDEFINED; goto exception; }
+                    cont_st = s2; cont_kind_cur = CONT_PROMISE_ALL;
+                    ret_val = JS_UNINITIALIZED;
+                    goto do_promise_all_step;
                 }
                 if (gforof_create) {
                     /* OP_for_of_start: the @@iterator getter (a generator function) produced this iterator generator
@@ -60245,10 +60284,37 @@ static void js_promise_all_end(JSContext *ctx, JSPromiseAll *s)
 
 /* Route Promise.all(gen) / Promise.allSettled(gen) (they share the resolve+values finalize; only the per-element
    reject differs) with a direct-generator arg. `any` (AggregateError finalize) and `race` stay on the normal path. */
-static bool tramp_can_call_promise_all(JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_magic)
+/* Side-effect-free: does items[@@iterator] resolve, via a DATA property on items or its INTERNAL prototype chain,
+   to a GENERATOR FUNCTION? Returns the method dup'd in *out. A GETTER @@iterator (or a Proxy) declines WITHOUT
+   running anything — so a consumer whose GetIterator step is NOT its first observable step (Promise.all reads
+   .resolve before @@iterator) keeps the correct order by falling to its C path. `items` must be an object. */
+static bool iter_at_gen_func_method(JSContext *ctx, JSValueConst items, JSValue *out)
+{
+    JSObject *p;
+    *out = JS_UNDEFINED;
+    if (JS_VALUE_GET_TAG(items) != JS_TAG_OBJECT) return false;
+    for (p = JS_VALUE_GET_OBJ(items); p != NULL; p = p->shape->proto) {
+        JSPropertyDescriptor desc;
+        int ret;
+        if (p->class_id == JS_CLASS_PROXY) return false;   /* a proxy own-property query is a trap (side effect) — decline */
+        ret = JS_GetOwnPropertyInternal(ctx, &desc, p, JS_ATOM_Symbol_iterator);
+        if (ret < 0) return false;
+        if (ret) {
+            bool is_gf = !(desc.flags & JS_PROP_GETSET) && tramp_can_call_gen_create(desc.value);
+            if (is_gf) *out = js_dup(desc.value);
+            if (desc.flags & JS_PROP_GETSET) { JS_FreeValue(ctx, desc.getter); JS_FreeValue(ctx, desc.setter); }
+            else JS_FreeValue(ctx, desc.value);
+            return is_gf;
+        }
+    }
+    return false;
+}
+
+static bool tramp_can_call_promise_all(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_magic, JSValue *out_getiter)
 {
     JSObject *fp, *ip;
     int magic;
+    *out_getiter = JS_UNDEFINED;
     if (call_argc != 1) return false;
     if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
     fp = JS_VALUE_GET_OBJ(func);
@@ -60259,9 +60325,13 @@ static bool tramp_can_call_promise_all(JSValueConst func, JSValueConst *call_arg
     if (magic != PROMISE_MAGIC_all && magic != PROMISE_MAGIC_allSettled && magic != PROMISE_MAGIC_any) return false;
     if (JS_VALUE_GET_TAG(call_argv[0]) != JS_TAG_OBJECT) return false;
     ip = JS_VALUE_GET_OBJ(call_argv[0]);
-    if (ip->class_id != JS_CLASS_GENERATOR || !ip->u.generator_data) return false;
-    *out_magic = magic;
-    return true;
+    /* Promise.all reads .resolve BEFORE @@iterator, so the recognition must NOT run a @@iterator getter early. A DIRECT
+       generator drives as-is (out_getiter UNDEFINED; @@iterator untouched); a DATA-property generator-function
+       @@iterator is created on the tramp (probed side-effect-free). A getter @@iterator / helper / anything else falls
+       to the C path (correct order; DFAILs cleanly if it drives a generator off-tramp). */
+    if (ip->class_id == JS_CLASS_GENERATOR && ip->u.generator_data) { *out_magic = magic; *out_getiter = JS_UNDEFINED; return true; }
+    if (iter_at_gen_func_method(ctx, call_argv[0], out_getiter)) { *out_magic = magic; return true; }
+    return false;
 }
 
 /* Route Promise.race(gen) (no aggregation: each element's settle resolves/rejects the aggregate directly). */
