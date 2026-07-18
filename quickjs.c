@@ -25084,6 +25084,7 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                 *ns = *os;
                 ns->r = js_dup(os->r);
                 ns->iter = js_dup(os->iter);
+                ns->next = js_dup(os->next);     /* the iterator's .next method — the struct copy SHARES it otherwise */
                 ns->adder = js_dup(os->adder);   /* SET/MAP add/set method (UNDEFINED for FROM/SPREAD) */
                 ns->mapfn = js_dup(os->mapfn);   /* Array.from(gen, fn) mapfn + thisArg (UNDEFINED otherwise) */
                 ns->mapfn_this = js_dup(os->mapfn_this);
