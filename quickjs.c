@@ -18600,6 +18600,18 @@ static bool tramp_can_call_json_parse(JSValueConst func, int argc, JSValueConst 
    js_function_call (which would run the ultimate target's body off the chain, unable to preempt), the
    interpreter reslices the operands at the call site and dispatches the target directly (do_forward_call). */
 static JSValue js_function_call(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+/* js_call_function — the builtins' monkey-patch-proof Function.prototype.call (Iterator.zip/zipKeyed use it to invoke
+   an input iterator's .next). It holds NO continuation, so like f.call it is RESOLVED at the operator site and the
+   ultimate target dispatched on this chain; JS_Call'ing it from C would drive a generator .next off the tramp. */
+static JSValue js_call_function(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static inline bool tramp_is_call_function(JSValueConst method) {
+    JSObject *mp;
+    if (JS_VALUE_GET_TAG(method) != JS_TAG_OBJECT) return false;
+    mp = JS_VALUE_GET_OBJ(method);
+    return mp->class_id == JS_CLASS_C_FUNCTION
+        && mp->u.cfunc.cproto == JS_CFUNC_generic
+        && mp->u.cfunc.c_function.generic == js_call_function;
+}
 static inline bool tramp_is_function_call(JSValueConst method) {
     JSObject *mp;
     if (JS_VALUE_GET_TAG(method) != JS_TAG_OBJECT) return false;
@@ -19436,6 +19448,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_bound(call_argv[-1])) {   /* f.bind(...)(...) -> assemble bound+call args, dispatch target */
                     tramp_is_tail = (opcode == OP_tail_call); goto do_bound_tramp;
                 }
+                if (tramp_is_call_function(call_argv[-1]) && call_argc >= 2) {   /* builtins' call(thisArg,f,...) -> dispatch f here */
+                    tramp_is_tail = (opcode == OP_tail_call); goto do_forward_callfn;
+                }
                 ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
                                           JS_UNDEFINED, call_argc,
                                           vc(call_argv), 0);
@@ -19886,6 +19901,24 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 goto restart;
             }
 
+        do_forward_callfn:
+            /* js_call_function(thisArg, f, ...args) called as a plain function: operands are
+               [js_call_function, thisArg, f, a0..]. Reshape IN PLACE to the method-call shape [thisArg, f, a0..] —
+               one slot narrower — then dispatch f exactly like f.call would. */
+            {
+                JSValue *A = (JSValue *)call_argv;   /* A[-1]=js_call_function, A[0]=thisArg, A[1]=f, A[2..]=args */
+                int n = call_argc - 2;
+                JS_FreeValue(ctx, A[-1]);
+                A[-1] = A[0];                        /* thisArg */
+                A[0]  = A[1];                        /* f */
+                if (n > 0) memmove(&A[1], &A[2], n * sizeof(JSValue));
+                sp--;
+                call_argv = A + 1;                   /* call_argv[-2]=thisArg, [-1]=f, [0..]=args */
+                call_argc = n;
+                tramp_first = -2;
+                goto do_forward_dispatch;
+            }
+
         do_forward_call:
             /* f.call(thisArg, ...args): Function.prototype.call holds NO continuation, so RESOLVE it at the
                operator site and dispatch the ultimate target f on THIS chain (its body — normal / async /
@@ -19905,6 +19938,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 ((JSValue *)call_argv)[-1] = fv;
                 call_argc = n;
                 tramp_first = -2;
+            }
+        do_forward_dispatch:
+            /* operands are now the method-call shape [this, f, a0..]: dispatch f on THIS chain. */
+            {
                 if (tramp_can_call(call_argv[-1])) goto do_tramp_call;
                 if (tramp_can_call_async(call_argv[-1])) goto do_async_tramp_call;
                 if (tramp_can_call_gen_create(call_argv[-1])) goto do_generator_create_tramp;
