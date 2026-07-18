@@ -23854,6 +23854,27 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             tramp_gen_magic = GEN_MAGIC_RETURN; tramp_gen_close = 1; tramp_gen_close_exc = 1;
                             goto do_generator_tramp;
                         }
+                        /* A lazy Iterator Helper closed mid-unwind: close its SOURCE. A generator source's .return()
+                           must run on the tramp (js_generator_next is a DFAIL) — route it via the close slot; the
+                           helper stays on the stack (freed by the next unwind). A non-generator source closes inline. */
+                        if (ip->class_id == JS_CLASS_ITERATOR_HELPER && ip->u.iterator_helper_data) {
+                            JSIteratorHelperData *it = ip->u.iterator_helper_data;
+                            if (!it->done && JS_VALUE_GET_TAG(it->obj) == JS_TAG_OBJECT) {
+                                JSObject *srcp = JS_VALUE_GET_OBJ(it->obj);
+                                if (srcp->class_id == JS_CLASS_GENERATOR && srcp->u.generator_data
+                                    && ((JSGeneratorData *)srcp->u.generator_data)->state != JS_GENERATOR_STATE_EXECUTING) {
+                                    it->done = 1;
+                                    if (!JS_IsUndefined(it->inner)) {   /* flatMap active inner: close it (plain inline) */
+                                        JS_IteratorClose(ctx, it->inner, false);
+                                        JS_FreeValue(ctx, it->inner); it->inner = JS_UNDEFINED;
+                                        JS_FreeValue(ctx, it->inner_next); it->inner_next = JS_UNDEFINED;
+                                    }
+                                    tramp_gen_close_slot_gen = js_dup(it->obj);
+                                    tramp_gen_magic = GEN_MAGIC_RETURN; tramp_gen_close = 1; tramp_gen_close_exc = 1;
+                                    goto do_generator_tramp;
+                                }
+                            }
+                        }
                     }
                     JS_IteratorClose(ctx, sp[-1], true);
                 } else {
