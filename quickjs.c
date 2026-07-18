@@ -20583,9 +20583,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     ret_val = JS_UNINITIALIZED;
                     if (unlikely(st < 0)) { it->executing = 0; goto exception; }
                     if (st == 2) {   /* CREATE_INNER (flatMap): the inner's [Symbol.iterator] is a generator function.
-                                        Create it on the tramp (params-to-initial_yield); the settle stores it as the
-                                        inner and re-enters here. Operands ride the helper (it->inner=this, inner_next=fn). */
-                        tramp_gen_create_cont_it = it;
+                                        Push [this, gfunc] as the create's call operands — the SAME stack shape an
+                                        OP-level g() create uses — and route onto do_generator_create_tramp; the settle
+                                        stores the created generator as the inner and re-enters here. */
+                        *sp++ = it->inner;        /* sp[-2] = this (mapped) */
+                        *sp++ = it->inner_next;   /* sp[-1] = gfunc (the generator function) */
+                        it->inner = JS_UNDEFINED; it->inner_next = JS_UNDEFINED;
+                        call_argv = sp; call_argc = 0; tramp_first = -2; tramp_is_tail = 0;
+                        tramp_gen_create_cont_it = it;   /* settle re-enters this step instead of pushing the generator */
                         goto do_generator_create_tramp;
                     }
                     if (st == 0) {   /* DONE: deliver `out` per drive_mode */
@@ -21129,31 +21134,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                PARAM-DEFAULT loop preempts the base flow), then at initial_yield (do_generator_create_settle)
                creates the generator object and returns it. Mirrors js_call_generator_function. */
             {
-                void *gcreate_cont = tramp_gen_create_cont_it; tramp_gen_create_cont_it = NULL;   /* flatMap inner create? */
-                JSIteratorHelperData *cit = (JSIteratorHelperData *)gcreate_cont;
-                /* cont case (flatMap inner): the generator function + `this` ride the helper (inner_next/inner), nothing
-                   on the stack. Ordinary case: they are call_argv[-1] (+ [-2] for a method) with any args. */
-                JSValueConst gfunc  = cit ? cit->inner_next : call_argv[-1];
-                JSValueConst gthis  = cit ? cit->inner : ((tramp_first == -2) ? call_argv[-2] : JS_UNDEFINED);
-                int gcargc          = cit ? 0 : call_argc;
-                JSValueConst *gcargv = cit ? NULL : vc(call_argv);
+                void *gcreate_cont = tramp_gen_create_cont_it; tramp_gen_create_cont_it = NULL;   /* flatMap inner create? (settle re-enters the step) */
+                JSValueConst gfunc = call_argv[-1];
                 JSGeneratorData *s = js_mallocz(ctx, sizeof(*s));
                 TrampFrame *gtf; JSStackFrame *gsf; JSObject *gfp; JSFunctionBytecode *gb;
                 if (unlikely(!s)) { JS_ThrowOutOfMemory(ctx); goto exception; }
                 s->state = JS_GENERATOR_STATE_SUSPENDED_START;
-                if (async_func_init(ctx, &s->func_state, gfunc, gthis, gcargc, gcargv)) {
+                if (async_func_init(ctx, &s->func_state, gfunc,
+                                    (tramp_first == -2) ? call_argv[-2] : JS_UNDEFINED, call_argc, vc(call_argv))) {
                     s->state = JS_GENERATOR_STATE_COMPLETED;
                     free_generator_stack_rt(rt, s); js_free_rt(rt, s); goto exception;
                 }
                 gtf = js_malloc_rt(rt, sizeof(TrampFrame));
                 if (unlikely(!gtf)) { free_generator_stack_rt(rt, s); js_free_rt(rt, s); JS_ThrowOutOfMemory(ctx); goto exception; }
                 gtf->async_promise = js_dup(gfunc);   /* held for js_create_from_ctor at initial_yield */
-                if (cit) {   /* free the helper's stashed operands (dup'd into s); caller stack untouched */
-                    JS_FreeValue(ctx, cit->inner); cit->inner = JS_UNDEFINED;
-                    JS_FreeValue(ctx, cit->inner_next); cit->inner_next = JS_UNDEFINED;
-                } else {
-                    for (i = tramp_first; i < call_argc; i++) JS_FreeValue(ctx, call_argv[i]);   /* free func(+this)+args (dup'd into s) */
-                }
+                for (i = tramp_first; i < call_argc; i++) JS_FreeValue(ctx, call_argv[i]);   /* free func(+this)+args (dup'd into s) */
                 gtf->up = tf_top;
                 gtf->caller_sf = sf; gtf->caller_b = b; gtf->caller_ctx = ctx;
                 gtf->caller_local_buf = local_buf; gtf->caller_stack_buf = stack_buf;
@@ -21162,13 +21157,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 gtf->caller_var_refs = var_refs;
                 gtf->caller_argc = argc; gtf->caller_argv = argv;
                 gtf->caller_arg_allocated_size = arg_allocated_size;
-                gtf->caller_sp = cit ? sp : (call_argv + tramp_first);   /* cont: stack untouched. else: below func(+this)+args */
-                gtf->call_first = -1; gtf->call_argc = 0; gtf->is_tail = cit ? 0 : tramp_is_tail;
+                gtf->caller_sp = call_argv + tramp_first;   /* below func(+this)+args; the generator object goes here (or the cont re-enters the step, popping to here) */
+                gtf->call_first = -1; gtf->call_argc = 0; gtf->is_tail = gcreate_cont ? 0 : tramp_is_tail;
                 gtf->async_data = NULL;
                 /* 0xFF = CREATING (run-to-initial_yield), not a GEN_MAGIC. cont (flatMap inner): the settle stores the
                    created generator as the helper's inner and re-enters do_iter_helper_step instead of pushing it. */
                 gtf->gen_data = s; gtf->gen_magic = 0xFF;
-                gtf->cont_state = cit; gtf->cont_kind = cit ? CONT_ITER_HELPER : CONT_NONE;
+                gtf->cont_state = gcreate_cont; gtf->cont_kind = gcreate_cont ? CONT_ITER_HELPER : CONT_NONE;
                 gtf->forof_off = tramp_gen_create_forof;   /* 1 = OP_for_of_start iterator-getter: finish the enum_rec at settle; 0 = ordinary g() create */
                 tramp_gen_create_forof = 0;
                 gtf->b = NULL; gtf->local_buf = NULL;
