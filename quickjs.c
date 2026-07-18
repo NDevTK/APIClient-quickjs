@@ -20643,7 +20643,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            sp[-3] (same object). Match js_append_enumerate + OP_append's tail: write the new position
                            back to sp[-2], drop the iterable at sp[-1], and pop it. r/iter are the state's own refs. */
                         int64_t n = s->k;
-                        JS_FreeValue(ctx, s->r); JS_FreeValue(ctx, s->iter);
+                        JS_FreeValue(ctx, s->r); JS_FreeValue(ctx, s->iter); JS_FreeValue(ctx, s->next);
                         js_free_rt(rt, s);
                         sp[-2] = js_int32((int32_t)n);
                         JS_FreeValue(ctx, sp[-1]);   /* the spread iterable (generator) */
@@ -20659,7 +20659,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     int ta_cid = s->ta_classid;
                     JSValue ta_ntgt = s->adder;   /* new TypedArray(gen): the new_target/ctor; else the add/set method or UNDEFINED */
                     JSValue ta_mapfn = s->mapfn, ta_mapfn_this = s->mapfn_this;   /* TypedArray.from(gen, mapfn): applied here */
-                    JS_FreeValue(ctx, s->iter);
+                    JS_FreeValue(ctx, s->iter); JS_FreeValue(ctx, s->next);
                     js_free_rt(rt, s);
                     if (ta_cid != 0) {
                         JSValue ta;
@@ -25274,10 +25274,17 @@ static JSValue js_generator_next(JSContext *ctx, JSValueConst this_val,
     /* DELETED: the generator .next()/.throw()/.return() DRIVE-TO-COMPLETION body (async_func_resume in a nested
        C call). Every real generator method call is intercepted by the tramp (do_generator_tramp) and runs the body
        on the flow machinery. This function keeps only its IDENTITY (tramp_gen_method_magic recognizes a generator
-       .next by its address); reaching its body means an un-routed off-tramp bypass drove the generator directly —
+       .next by its address); reaching its body WITH A REAL GENERATOR means an un-routed off-tramp bypass drove it —
        a should-never-happen to route onto do_generator_tramp at the root. */
-    (void)this_val; (void)argc; (void)argv; (void)magic;
+    (void)argc; (void)argv; (void)magic;
     *pdone = true;
+    /* GeneratorValidate runs FIRST and is not a drive: GeneratorPrototype.next.call(nonGenerator) is a plain spec
+       TypeError with no body to run, so the tramp legitimately declines to route it. Only a genuine generator
+       reaching here is the off-tramp bypass the DFAIL exists to catch. */
+    if (JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT
+        || JS_VALUE_GET_OBJ(this_val)->class_id != JS_CLASS_GENERATOR
+        || !JS_VALUE_GET_OBJ(this_val)->u.generator_data)
+        return JS_ThrowTypeError(ctx, "not a generator");
     DFAIL("js_generator_next: generator body driven off the tramp chain — route the caller onto do_generator_tramp");
     return JS_ThrowTypeError(ctx, "generator driven off the tramp chain (drive-to-completion deleted)");
 }
