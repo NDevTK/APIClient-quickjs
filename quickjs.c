@@ -18444,7 +18444,7 @@ static int js_iter_consume_step(JSContext *ctx, struct JSIterConsume *s, JSValue
 static void js_iter_consume_end(JSContext *ctx, struct JSIterConsume *s);
 static bool tramp_can_call_iter_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, JSValue *out_getiter);
 static JSValue js_map_constructor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv, int magic);
-static bool tramp_can_call_setmap_consume(JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_magic);
+static bool tramp_can_call_setmap_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_magic, JSValue *out_getiter);
 static JSValue js_object_fromEntries(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 static bool tramp_can_call_objentries_consume(JSValueConst func, JSValueConst *call_argv, int call_argc);
 static JSValue js_typed_array_constructor_obj(JSContext *ctx, JSValueConst new_target, JSValueConst obj, int classid);
@@ -19419,7 +19419,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     tramp_first = -2; tramp_is_tail = 0;
                     goto do_construct_tramp;
                 }
-                if (tramp_can_call_setmap_consume(call_argv[-2], vc(call_argv), call_argc, &smc_magic)) {   /* new Set(gen)/new Map(gen) -> consume on THIS chain */
+                if (tramp_can_call_setmap_consume(ctx, call_argv[-2], vc(call_argv), call_argc, &smc_magic, &tramp_iter_getiter)) {   /* new Set/Map(iterable) -> GetIterator + consume on THIS chain */
                     tramp_is_tail = 0; goto do_setmap_consume_tramp;
                 }
                 if (tramp_can_call_ta_consume(call_argv[-2], vc(call_argv), call_argc, &ta_classid)) {   /* new TypedArray(gen) -> collect on THIS chain */
@@ -20266,28 +20266,40 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                each arm's adder call is COW-isolated by the map_add capture. */
             {
                 JSValueConst ntgt = call_argv[-1];
-                JSValueConst gen = call_argv[0];
+                JSValueConst iterable = call_argv[0];
+                JSValue method = tramp_iter_getiter; tramp_iter_getiter = JS_UNDEFINED;
                 int magic = smc_magic;
                 JSIterConsume *s;
                 JSValue obj, adder;
+                if (JS_IsException(method)) goto exception;   /* the recognition's @@iterator read threw (pending) */
                 obj = js_map_constructor(ctx, ntgt, 0, NULL, magic);   /* empty Set/Map */
-                if (JS_IsException(obj)) goto exception;
+                if (JS_IsException(obj)) { JS_FreeValue(ctx, method); goto exception; }
                 adder = JS_GetProperty(ctx, obj, (magic & MAGIC_SET) ? JS_ATOM_add : JS_ATOM_set);
-                if (JS_IsException(adder)) { JS_FreeValue(ctx, obj); goto exception; }
+                if (JS_IsException(adder)) { JS_FreeValue(ctx, method); JS_FreeValue(ctx, obj); goto exception; }
                 if (!JS_IsFunction(ctx, adder)) {
-                    JS_FreeValue(ctx, adder); JS_FreeValue(ctx, obj);
+                    JS_FreeValue(ctx, method); JS_FreeValue(ctx, adder); JS_FreeValue(ctx, obj);
                     JS_ThrowTypeError(ctx, "%s is not a function", (magic & MAGIC_SET) ? "add" : "set");
                     goto exception;
                 }
                 s = js_mallocz(ctx, sizeof(*s));
-                if (unlikely(!s)) { JS_FreeValue(ctx, adder); JS_FreeValue(ctx, obj); JS_ThrowOutOfMemory(ctx); goto exception; }
+                if (unlikely(!s)) { JS_FreeValue(ctx, method); JS_FreeValue(ctx, adder); JS_FreeValue(ctx, obj); JS_ThrowOutOfMemory(ctx); goto exception; }
                 s->r = obj;
-                s->iter = js_dup(gen);
+                s->iter = JS_UNDEFINED;
                 s->adder = adder;
                 s->mapfn = JS_UNDEFINED; s->mapfn_this = JS_UNDEFINED;
                 s->k = 0;
                 s->sink = (magic & MAGIC_SET) ? ITERCONS_SET : ITERCONS_MAP;
                 s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
+                if (tramp_can_call_gen_create(method)) {   /* @@iterator is a generator function: create on the tramp */
+                    *sp++ = js_dup(iterable);   /* this */
+                    *sp++ = method;             /* gfunc (owned, transferred) */
+                    call_argv = sp; call_argc = 0; tramp_first = -2; tramp_is_tail = 0;
+                    tramp_gen_create_cont_it = s; tramp_gen_create_cont_kind = CONT_ITER_CONSUME;
+                    goto do_generator_create_tramp;
+                }
+                s->iter = JS_GetIterator2(ctx, iterable, method);   /* direct generator/helper's @@iterator returns itself */
+                JS_FreeValue(ctx, method);
+                if (JS_IsException(s->iter)) { s->iter = JS_UNDEFINED; js_iter_consume_end(ctx, s); js_free_rt(rt, s); goto exception; }
                 cont_st = s; cont_kind_cur = CONT_ITER_CONSUME;
                 ret_val = JS_UNINITIALIZED;
                 goto do_iter_consume_step;
@@ -46802,10 +46814,12 @@ static bool tramp_can_call_iter_consume(JSContext *ctx, JSValueConst func, JSVal
    to the direct-generator, non-weak case (WeakSet/WeakMap keys must be objects and are rarer); every other shape
    stays on the normal constructor path. *out_magic receives 0 (Map) or MAGIC_SET. Fork-safe now that a shared
    Set/Map's add is COW-isolated per flow (JSTimeTravelHooks.map_add). call_argv[0] is the iterable. */
-static bool tramp_can_call_setmap_consume(JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_magic)
+static bool tramp_can_call_setmap_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_magic, JSValue *out_getiter)
 {
     JSObject *fp, *ip;
     int magic;
+    JSValue m;
+    *out_getiter = JS_UNDEFINED;
     if (call_argc < 1) return false;
     if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
     fp = JS_VALUE_GET_OBJ(func);
@@ -46816,9 +46830,20 @@ static bool tramp_can_call_setmap_consume(JSValueConst func, JSValueConst *call_
     if (magic & MAGIC_WEAK) return false;   /* WeakSet/WeakMap: out of scope */
     if (JS_VALUE_GET_TAG(call_argv[0]) != JS_TAG_OBJECT) return false;
     ip = JS_VALUE_GET_OBJ(call_argv[0]);
-    if (ip->class_id != JS_CLASS_GENERATOR || !ip->u.generator_data) return false;
-    *out_magic = magic;
-    return true;
+    /* Accept only when the iterator will be a generator/helper (drives on the tramp): a generator-function @@iterator
+       (created on the tramp) or a direct generator/helper (its @@iterator returns itself). Read @@iterator once; the
+       tramp reuses it. Plain-C iterables / array-likes stay on the normal js_map_constructor path. */
+    m = JS_GetProperty(ctx, call_argv[0], JS_ATOM_Symbol_iterator);
+    if (JS_IsException(m)) { *out_magic = magic; *out_getiter = JS_EXCEPTION; return true; }   /* the read threw: accept + propagate on the tramp */
+    if (JS_IsFunction(ctx, m)
+        && (tramp_can_call_gen_create(m)
+            || (ip->class_id == JS_CLASS_GENERATOR && ip->u.generator_data)
+            || (ip->class_id == JS_CLASS_ITERATOR_HELPER && ip->u.iterator_helper_data
+                && !ip->u.iterator_helper_data->executing && !ip->u.iterator_helper_data->done))) {
+        *out_magic = magic; *out_getiter = m; return true;
+    }
+    JS_FreeValue(ctx, m);
+    return false;
 }
 
 /* Route Object.fromEntries(gen) — its C loop drives the argument generator's .next(). Scoped to the direct-generator
