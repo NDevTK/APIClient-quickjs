@@ -18306,7 +18306,7 @@ typedef struct JSIteratorHelperData {
 } JSIteratorHelperData;
 enum { ITH_DIRECT = 0, ITH_FOROF, ITH_ITERNEXT, ITH_CONSUME };
 enum { ITHP_START = 0, ITHP_DROP_SKIP, ITHP_EMIT, ITHP_FLATMAP_SRC, ITHP_FLATMAP_INNER, ITHP_TAKE_CLOSE,
-       ITHP_CB_DONE };   /* ITHP_CB_DONE: the map/filter callback ran ON THE TRAMP; `res` is its result */
+       ITHP_CB_DONE, ITHP_FLATMAP_CB };   /* ITHP_FLATMAP_CB: `res` is the flatMap mapper's result */   /* ITHP_CB_DONE: the map/filter callback ran ON THE TRAMP; `res` is its result */
 static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue res, JSValue *out);
 static bool tramp_can_call_iter_helper(JSValueConst func, JSValueConst this_val);
 static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int *pdone, int magic);
@@ -20985,14 +20985,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        re-enters this step (CONT_ITER_CONSUME) with the callback's result. */
                     DCHECK(sp + 4 <= TRAMP_SP_LIMIT(stack_buf, b),
                            "iterterm callback: operand push exceeds the frame's compiled stack_size");
-                    { int nargs = (s->setop == ITERTERM_REDUCE) ? 3 : 2;
+                    { bool from_mapfn = (s->cb_pending == 2);
+                      int nargs = (!from_mapfn && s->setop == ITERTERM_REDUCE) ? 3 : 2;
                       DCHECK(sp + 2 + nargs <= TRAMP_SP_LIMIT(stack_buf, b),
-                             "iterterm callback: operand push exceeds the frame's compiled stack_size");
-                      *sp++ = JS_UNDEFINED;
+                             "consume callback: operand push exceeds the frame's compiled stack_size");
+                      *sp++ = from_mapfn ? js_dup(s->mapfn_this) : JS_UNDEFINED;   /* Array.from's thisArg */
                       *sp++ = js_dup(s->mapfn);
                       if (nargs == 3) *sp++ = js_dup(s->r);      /* reduce: accumulator first */
                       *sp++ = js_dup(s->cb_value);
-                      *sp++ = js_int64(s->k - 1);
+                      *sp++ = js_int64(from_mapfn ? s->k : s->k - 1);   /* FROM has not incremented k yet */
                       call_argv = sp - nargs; call_argc = nargs; tramp_first = -2; tramp_is_tail = 0; }
                     tramp_cont_state = s; tramp_cont_kind = CONT_ITER_CONSUME;
                     if (tramp_can_call(call_argv[-1])) goto do_tramp_call;
@@ -47572,8 +47573,16 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
     if (s->cb_pending) {
         /* `res` is the ITERTERM callback's RESULT (it ran on the tramp), not an iterator result. */
         JSValue value = s->cb_value, fret = res;
+        uint8_t which = s->cb_pending;
         s->cb_pending = 0; s->cb_value = JS_UNDEFINED;
         if (JS_IsException(fret)) { JS_FreeValue(ctx, value); return -1; }
+        if (which == 2) {   /* Array.from's mapfn: the RESULT is the element to append */
+            JS_FreeValue(ctx, value);
+            if (JS_DefinePropertyValueInt64(ctx, s->r, s->k, fret, JS_PROP_C_W_E | JS_PROP_THROW) < 0)
+                return -1;   /* consumed fret */
+            s->k++;
+            return 1;
+        }
         switch (s->setop) {
         case ITERTERM_FOREACH:
             JS_FreeValue(ctx, fret); JS_FreeValue(ctx, value);
@@ -47735,14 +47744,13 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
             }
         } else {   /* ITERCONS_FROM / ITERCONS_SPREAD: append at the running index */
             if (s->sink == ITERCONS_FROM && s->ta_classid == 0 && JS_VALUE_GET_TAG(s->mapfn) != JS_TAG_UNDEFINED) {
-                /* Array.from(gen, mapfn): map each value by mapfn(value, index). A generator/async mapfn returns an
-                   object/promise (no body-drive), so a direct call is faithful — only iter.next() rides the tramp. */
-                JSValueConst margs[2]; JSValue mapped;
-                margs[0] = value; margs[1] = js_int32((int32_t)s->k);
-                mapped = JS_Call(ctx, s->mapfn, s->mapfn_this, 2, margs);
-                JS_FreeValue(ctx, value);
-                if (JS_IsException(mapped)) return -1;
-                value = mapped;
+                /* Array.from(items, mapfn): the mapfn must run ON THE TRAMP like every other callback — a loop
+                   inside it has to park. Hold the element and hand the call to do_iter_consume_step (cb_pending 2
+                   selects mapfn_this as the receiver and the not-yet-incremented index). */
+                DCHECK(JS_IsUndefined(s->cb_value), "Array.from mapfn value already held");
+                s->cb_value = value;
+                s->cb_pending = 2;
+                return 3;
             }
             if (JS_DefinePropertyValueInt64(ctx, s->r, s->k, value, JS_PROP_C_W_E | JS_PROP_THROW) < 0)
                 return -1;   /* DefinePropertyValueInt64 consumed `value` */
@@ -50687,14 +50695,21 @@ static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue
         if (d) { it->done = 1; it->resume_pc = ITHP_START; JS_FreeValue(ctx, res); *out = js_create_iterator_result(ctx, JS_UNDEFINED, true); return JS_IsException(*out) ? -1 : 0; }
         {
             JSValue v = JS_GetProperty(ctx, res, JS_ATOM_value);
-            JSValue idx, mapped, method, iter;
-            JSValueConst args[2];
             JS_FreeValue(ctx, res);
             if (JS_IsException(v)) { it->done = 1; return -1; }   /* IteratorStepValue threw: done, propagate (no close) */
-            idx = js_int64(it->count++);
-            args[0] = v; args[1] = idx;
-            mapped = JS_Call(ctx, it->func, JS_UNDEFINED, 2, args);
-            JS_FreeValue(ctx, v); JS_FreeValue(ctx, idx);
+            /* the mapper must run ON THE TRAMP (a loop inside it has to park): hold the element, hand the call to
+               do_iter_helper_step, and resume at ITHP_FLATMAP_CB with its result. */
+            DCHECK(JS_IsUndefined(it->cb_value), "flatMap mapper value already held");
+            it->cb_value = v;
+            it->resume_pc = ITHP_FLATMAP_CB;
+            return 3;
+        }
+    }
+    case ITHP_FLATMAP_CB: {
+        {
+            JSValue v = it->cb_value, mapped = res, method, iter;
+            it->cb_value = JS_UNDEFINED;
+            JS_FreeValue(ctx, v);
             /* IfAbruptCloseIterator on the mapper throw, a non-object result (GetIteratorFlattenable rejects it), and a
                throwing @@iterator: each closes the SOURCE preserving the exception. */
             if (JS_IsException(mapped)) { it->done = 1; iter_helper_close_source_abrupt(ctx, it); return -1; }
