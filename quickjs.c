@@ -47944,35 +47944,16 @@ static JSValue js_array_from(JSContext *ctx, JSValueConst this_val,
     if (JS_IsException(iter))
         goto exception;
     if (!JS_IsUndefined(iter)) {
+        /* DELETED: the ITERABLE branch. Array.from over any callable @@iterator — including one on a primitive —
+           is driven by the ONE consume machine (ITERCONS_FROM), which acquires the iterator on the tramp and
+           performs IfAbruptCloseIterator itself. This loop drove .next and the mapfn from C, which is exactly
+           where a coroutine cannot suspend. An iterable source reaching here means a call site was not routed.
+           The ARRAY-LIKE branch below is NOT a fallback for this: it is a different algorithm (length + indices,
+           no iterator at all) and legitimately stays. */
         JS_FreeValue(ctx, iter);
-        if (JS_IsConstructor(ctx, this_val))
-            r = JS_CallConstructor(ctx, this_val, 0, NULL);
-        else
-            r = JS_NewArray(ctx);
-        if (JS_IsException(r))
-            goto exception;
-        stack[0] = js_dup(items);
-        if (js_for_of_start(ctx, &stack[1], false))
-            goto exception;
-        for (k = 0;; k++) {
-            v = JS_IteratorNext(ctx, stack[0], stack[1], 0, NULL, &done);
-            if (JS_IsException(v))
-                goto exception_close;
-            if (done)
-                break;
-            if (mapping) {
-                args[0] = v;
-                args[1] = js_int32(k);
-                v2 = JS_Call(ctx, mapfn, this_arg, 2, args);
-                JS_FreeValue(ctx, v);
-                v = v2;
-                if (JS_IsException(v))
-                    goto exception_close;
-            }
-            if (JS_DefinePropertyValueInt64(ctx, r, k, v,
-                                            JS_PROP_C_W_E | JS_PROP_THROW) < 0)
-                goto exception_close;
-        }
+        DFAIL("Array.from reached its C entry with an ITERABLE source — route that call site onto the consume "
+              "machine; the iteration loop here no longer exists");
+        goto exception;
     } else {
         arrayLike = JS_ToObject(ctx, items);
         if (JS_IsException(arrayLike))
