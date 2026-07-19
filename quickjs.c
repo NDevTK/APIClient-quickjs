@@ -18296,9 +18296,11 @@ typedef struct JSIteratorHelperData {
     JSValue inner_next;      /* flatMap: the inner iterator's .next method (its source runs on the tramp too) */
     uint8_t drive_inner;     /* flatMap: 1 = the next DRIVE targets it->inner (not it->obj) */
     uint8_t drive_close;     /* take: 1 = the next DRIVE calls the source's .return() (close-on-limit) instead of .next() */
+    JSValue cb_value;        /* map/filter: the source value held across a callback that runs on the tramp (owned) */
 } JSIteratorHelperData;
 enum { ITH_DIRECT = 0, ITH_FOROF, ITH_ITERNEXT, ITH_CONSUME };
-enum { ITHP_START = 0, ITHP_DROP_SKIP, ITHP_EMIT, ITHP_FLATMAP_SRC, ITHP_FLATMAP_INNER, ITHP_TAKE_CLOSE };   /* resume_pc values */
+enum { ITHP_START = 0, ITHP_DROP_SKIP, ITHP_EMIT, ITHP_FLATMAP_SRC, ITHP_FLATMAP_INNER, ITHP_TAKE_CLOSE,
+       ITHP_CB_DONE };   /* ITHP_CB_DONE: the map/filter callback ran ON THE TRAMP; `res` is its result */
 static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue res, JSValue *out);
 static bool tramp_can_call_iter_helper(JSValueConst func, JSValueConst this_val);
 static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int *pdone, int magic);
@@ -18498,6 +18500,7 @@ typedef struct JSIterConsume {
     uint8_t closing; /* 1 = the sink short-circuited: close the iterator on the tramp, then finish */
 } JSIterConsume;
 #define ITERCONS_OWNED(F) F(r) F(iter) F(next) F(adder) F(mapfn) F(mapfn_this)
+/* NOTE: JSIteratorHelperData::cb_value is owned too — freed by the finalizer and cleared on every path below. */
 static int js_iter_consume_step(JSContext *ctx, struct JSIterConsume *s, JSValue res);
 static void js_iter_consume_end(JSContext *ctx, struct JSIterConsume *s);
 /* Set-record primitives — ITERCONS_SETOP folds setlike.keys() straight into the result's [[SetData]] (the spec
@@ -21259,6 +21262,28 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     int st = js_iter_helper_step(ctx, it, ret_val, &out);
                     ret_val = JS_UNINITIALIZED;
                     if (unlikely(st < 0)) { it->executing = 0; goto exception; }
+                    if (st == 3) {
+                        /* run the map/filter callback ON THE TRAMP: [this=undefined, func, value, index]. do_return
+                           re-enters this step (CONT_ITER_HELPER) with the callback's result. */
+                        DCHECK(sp + 4 <= stack_buf + b->stack_size,
+                               "helper callback: operand push exceeds the frame's compiled stack_size");
+                        *sp++ = JS_UNDEFINED;                 /* this */
+                        *sp++ = js_dup(it->func);             /* callee */
+                        *sp++ = js_dup(it->cb_value);         /* arg0: value */
+                        *sp++ = js_int64(it->count++);        /* arg1: index */
+                        call_argv = sp - 2; call_argc = 2; tramp_first = -2; tramp_is_tail = 0;
+                        tramp_cont_state = it; tramp_cont_kind = CONT_ITER_HELPER;
+                        if (tramp_can_call(call_argv[-1])) goto do_tramp_call;
+                        /* a C/bound callback has no preemptible body: call it here and feed the result back */
+                        tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;
+                        { JSValueConst cargs[2]; JSValue cr;
+                          cargs[0] = call_argv[0]; cargs[1] = call_argv[1];
+                          cr = JS_Call(ctx, call_argv[-1], JS_UNDEFINED, 2, cargs);
+                          for (i = -2; i < 2; i++) JS_FreeValue(ctx, call_argv[i]);
+                          sp -= 4;
+                          ret_val = cr;   /* may be an exception; ITHP_CB_DONE handles it */
+                          continue; }
+                    }
                     if (st == 2) {   /* CREATE_INNER (flatMap): the inner's [Symbol.iterator] is a generator function.
                                         Push [this, gfunc] as the create's call operands — the SAME stack shape an
                                         OP-level g() create uses — and route onto do_generator_create_tramp; the settle
@@ -21981,6 +22006,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc = sf->cur_pc; sp = rtf->caller_sp;
                 cfirst = rtf->call_first; cargc = rtf->call_argc; itail = rtf->is_tail;
                 js_free_rt(rt, rtf);
+                if (rck == CONT_ITER_HELPER) {
+                    /* the map/filter callback returned: resume the helper step with its result. do_tramp_call DUPS
+                       the args, so the caller-stack operands are still owned here — free them BEFORE re-entering,
+                       since jumping past the shared cleanup below would leak all four and corrupt refcounts. */
+                    JSValue *cargv = sp - cargc;   /* do_tramp_call recorded caller_sp = sp ABOVE the operands */
+                    DCHECK(cargc - cfirst == 4, "helper callback frame has an unexpected operand shape");
+                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
+                    sp += cfirst - cargc;          /* drop [this, func, value, index] */
+                    cont_st = rcs; cont_kind_cur = CONT_ITER_HELPER;
+                    goto do_iter_helper_step;
+                }
                 if (rck == CONT_PROXY_GET) {
                     /* the proxy [[Get]] trap returned: enforce the target's invariants on its result, then let the
                        normal placement below drop the operands and push it. */
@@ -24813,7 +24849,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         arg_allocated_size = rtf->caller_arg_allocated_size;
         pc = sf->cur_pc; sp = rtf->caller_sp;
         js_free_rt(rt, rtf);
-        if (xck == CONT_PROXY_GET) {
+        if (xck == CONT_ITER_HELPER) {
+            /* the map/filter callback threw: the helper is a GC object, so only its held value needs releasing;
+               the abrupt close of the source is the step's job and already ran for the throwing path. */
+            JSIteratorHelperData *cit = (JSIteratorHelperData *)xcs;
+            JS_FreeValue(ctx, cit->cb_value); cit->cb_value = JS_UNDEFINED;
+            cit->executing = 0;
+        } else if (xck == CONT_PROXY_GET) {
             JSProxyGet *pg = xcs;
             JS_FreeValue(ctx, pg->target); JS_FreeAtom(ctx, pg->atom); js_free_rt(rt, pg);
         } else if (xck == CONT_CONSTRUCT) {
@@ -50410,6 +50452,7 @@ static JSValue js_create_iterator_helper(JSContext *ctx, JSValueConst this_val,
     it->next = method;
     it->inner = JS_UNDEFINED;
     it->inner_next = JS_UNDEFINED;
+    it->cb_value = JS_UNDEFINED;
     it->count = count;
     it->executing = 0;
     it->done = 0;
@@ -50530,19 +50573,25 @@ static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue
             *out = js_create_iterator_result(ctx, v, false);   /* consumes v */
             return JS_IsException(*out) ? -1 : 0;
         }
-        /* MAP / FILTER: apply the callback to the source value. The callback runs via JS_Call — a sync
-           mapper/predicate needs no drive; a looping-bytecode callback is the same residual as a plain
-           source's looping .next() (a follow-up onto the tramp, never a legacy C-loop fallback). */
+        /* MAP / FILTER: the callback must run ON THE TRAMP so a loop inside it parks like any other flow. Hold the
+           source value on the helper and hand the call back to do_iter_helper_step (st==3); it re-enters here at
+           ITHP_CB_DONE with the callback's result in `res`. */
         {
             JSValue v = JS_GetProperty(ctx, res, JS_ATOM_value);
-            JSValue idx, fret;
-            JSValueConst args[2];
             JS_FreeValue(ctx, res);
             if (JS_IsException(v)) { it->done = 1; return -1; }   /* IteratorStepValue threw: iterator is done, propagate */
-            idx = js_int64(it->count++);
-            args[0] = v; args[1] = idx;
-            fret = JS_Call(ctx, it->func, JS_UNDEFINED, 2, args);
-            JS_FreeValue(ctx, idx);
+            DCHECK(JS_IsUndefined(it->cb_value), "helper callback value already held — a step overlapped its callback");
+            it->cb_value = v;
+            it->resume_pc = ITHP_CB_DONE;
+            return 3;   /* CALL it->func(v, count++) on the tramp */
+        }
+    }
+    case ITHP_CB_DONE: {
+        /* `res` is the map/filter callback's RESULT (it ran on the tramp). */
+        {
+            JSValue v = it->cb_value;
+            JSValue fret = res;
+            it->cb_value = JS_UNDEFINED;
             if (JS_IsException(fret)) {   /* IfAbruptCloseIterator: mapper/predicate threw -> close the source */
                 JS_FreeValue(ctx, v);
                 it->done = 1;
@@ -50666,6 +50715,7 @@ static void js_iterator_helper_finalizer(JSRuntime *rt, JSValueConst val)
         JS_FreeValueRT(rt, it->next);
         JS_FreeValueRT(rt, it->inner);
         JS_FreeValueRT(rt, it->inner_next);
+        JS_FreeValueRT(rt, it->cb_value);
         js_free_rt(rt, it);
     }
 }
@@ -50681,6 +50731,7 @@ static void js_iterator_helper_mark(JSRuntime *rt, JSValueConst val,
         JS_MarkValue(rt, it->next, mark_func);
         JS_MarkValue(rt, it->inner, mark_func);
         JS_MarkValue(rt, it->inner_next, mark_func);
+        JS_MarkValue(rt, it->cb_value, mark_func);
     }
 }
 
