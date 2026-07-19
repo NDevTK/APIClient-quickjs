@@ -18126,21 +18126,14 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
                machine — this is not a second implementation, there is no other one. A callback invoked from here
                cannot suspend (no tramp frame above us), which is exactly why the interpreter drives these on the
                chain instead; reaching this driver during a flow means a call path bypassed that. */
-            const JSTrampStepDef *sd = tramp_step_def_of(func_obj);
-            void *stt;
-            JSValue cb_res = JS_UNDEFINED;
-            DCHECK(sd != NULL, "JS_CFUNC_step callee with no step definition");
-            stt = sd->init(ctx, this_obj, argc, arg_buf, sd->arg);
-            if (!stt) { ret_val = JS_EXCEPTION; break; }
-            for (;;) {
-                JSValue *cb = NULL; int cbn = 0;
-                int st = sd->step(ctx, stt, cb_res, &cb, &cbn);
-                if (st < 0) { sd->fini(ctx, stt, false); ret_val = JS_EXCEPTION; break; }
-                if (st == 0) { ret_val = sd->fini(ctx, stt, true); break; }
-                DCHECK(st == 3, "step builtin: unknown step code");
-                cb_res = JS_Call(ctx, cb[1], cb[0], cbn, (JSValueConst *)&cb[2]);
-                if (JS_IsException(cb_res)) { sd->fini(ctx, stt, false); ret_val = JS_EXCEPTION; break; }
-            }
+            /* DELETED: the inline JS_Call driver. It was a SECOND driver for the same step machine and a
+               non-suspending one — a callback with a loop preempts inside it and aborts anyway, so it never
+               degraded gracefully, it just moved where the crash surfaced. With it gone, every call site must
+               route to do_step_tramp; one that does not crashes HERE, naming itself, instead of silently
+               driving a callback to completion. */
+            DFAIL("a step builtin was invoked outside the interpreter's dispatch — route that call site onto "
+                  "do_step_tramp (see the .apply / spread / Reflect.apply gates); there is no second driver");
+            ret_val = JS_EXCEPTION;
         }
         break;
     default:
@@ -18337,6 +18330,11 @@ static bool tramp_can_call_promise_exec(JSValueConst func, JSValueConst *call_ar
                                   C) — replaceAll's loop is preemptible at every callback boundary, and the
                                   replacer's own body at every back-edge. */
 typedef struct JSStrReplace {
+    JSStepHdr hdr;           /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    uint8_t mode;            /* 0 = string walk, 1 = call a USER @@replace, 2 = finished, 3 = delegate to the built-in @@replace machine */
+    const JSTrampStepDef *inner_def; void *inner;   /* mode 3: the delegated machine */
+    uint8_t functional;      /* mode 0: 1 = callable replacer (step-code 3), 0 = GetSubstitution in the same walk */
+    JSValue rep_val;         /* mode 0 non-functional: the ToString'd replacement (owned) */
     JSValue str;            /* the subject string (owned) */
     JSValue search_str;     /* the search string (owned) */
     JSValue result;         /* DONE: the finished string (owned, handed to the caller) */
@@ -18349,13 +18347,17 @@ typedef struct JSStrReplace {
     uint8_t cb_pending;     /* 1 = the value delivered to the next step is the replacer's result */
     int orig_cfirst, orig_cargc; uint8_t orig_is_tail;   /* the ORIGINAL OP_call_method operand shape */
 } JSStrReplace;
-static JSValue js_string_replace(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int is_replaceAll);
+static void *js_str_replace_init(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int is_replaceAll);
+static int js_str_replace_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_str_replace_fini(JSContext *ctx, void *st, bool take_result);
 #define CONT_RE_REPLACE    16  /* cont_state = JSReRep: str.replace(/re/g, fn) — RegExp.prototype[@@replace] with a
                                   FUNCTION replacer. Phase 1 (collect every match) runs in C at setup because the
                                   recognizer demands a STANDARD regexp; phase 2 (substitute each match) holds the
                                   StringBuffer + nextSourcePosition + result index across each callback, so it is
                                   driven one match per step on the tramp. */
 typedef struct JSReRep {
+    JSStepHdr hdr;           /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    uint8_t functional;      /* 1 = callable replacer (step-code 3); 0 = GetSubstitution inside the same walk */
     JSValue rx;              /* the regexp (owned) */
     JSValue str;             /* the subject string (owned) */
     JSValue rep;             /* the replacer function (owned) */
@@ -18374,19 +18376,15 @@ typedef struct JSReRep {
 } JSReRep;
 static int js_re_rep_step(JSContext *ctx, struct JSReRep *s, JSValue cb_result);
 static void js_re_rep_end(JSContext *ctx, struct JSReRep *s, bool take_result);
-static bool tramp_can_call_re_replace(JSContext *ctx, JSValueConst func, JSValueConst this_val,
-                                      JSValueConst *call_argv, int call_argc);
-static bool tramp_can_call_re_symbol_replace(JSContext *ctx, JSValueConst func, JSValueConst this_val,
-                                             JSValueConst *call_argv, int call_argc);
-static JSValue js_regexp_Symbol_replace(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static void *js_re_rep_init(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int arg);
+static int js_re_rep_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_re_rep_fini(JSContext *ctx, void *st, bool take_result);
 static int js_is_standard_regexp(JSContext *ctx, JSValueConst rx);
 static int string_indexof_char(JSString *p, int c, int from);
 static int64_t string_advance_index(JSString *p, int64_t idx, bool unicode);
 static JSValue JS_RegExpExec(JSContext *ctx, JSValueConst r, JSValueConst s);
 static int js_str_replace_step(JSContext *ctx, JSStrReplace *s, JSValue cb_result);
 static void js_str_replace_end(JSContext *ctx, JSStrReplace *s, bool take_result);
-static bool tramp_can_call_str_replace(JSContext *ctx, JSValueConst func, JSValueConst this_val,
-                                       JSValueConst *call_argv, int call_argc, int *out_is_all);
 static JSValue js_promise_constructor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv);
 static JSValue js_promise_new(JSContext *ctx, JSValueConst new_target, JSValue *resolving_funcs);
 #define CONT_ITER_FROM     12  /* cont_state = JSIterFrom: Iterator.from(obj) — GetIterator(obj) is performed by the
@@ -19916,17 +19914,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_step_def_of(call_argv[-1])) {   /* a builtin DEFINED as a step machine: drive it on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_step_tramp;
                 }
-                if (tramp_can_call_str_replace(ctx, call_argv[-1], call_argv[-2], vc(call_argv), call_argc, &srep_is_all)) {   /* str.replace(s,fn) -> replacer drive on THIS chain */
-                    tramp_is_tail = (opcode == OP_tail_call_method); goto do_str_replace_tramp;
-                }
-                if (tramp_can_call_re_replace(ctx, call_argv[-1], call_argv[-2], vc(call_argv), call_argc)) {   /* str.replace(/re/g,fn) -> @@replace phase 2 on THIS chain */
-                    srep_is_all = JS_VALUE_GET_OBJ(call_argv[-1])->u.cfunc.magic; rerep_direct = 0;
-                    tramp_is_tail = (opcode == OP_tail_call_method); goto do_re_replace_tramp;
-                }
-                if (tramp_can_call_re_symbol_replace(ctx, call_argv[-1], call_argv[-2], vc(call_argv), call_argc)) {   /* re[@@replace](str,fn) */
-                    srep_is_all = 0; rerep_direct = 1;
-                    tramp_is_tail = (opcode == OP_tail_call_method); goto do_re_replace_tramp;
-                }
                 if (tramp_can_call_iter_consume(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter)) {   /* Array.from(iterable) -> GetIterator + consume on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_iter_consume_tramp;
                 }
@@ -19992,7 +19979,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         }
                     }
                 }
-                if (tramp_is_function_apply(call_argv[-1]) && tramp_can_call(call_argv[-2])) {   /* f.apply(this,arr), f NORMAL */
+                if (tramp_is_function_apply(call_argv[-1]) && (tramp_can_call(call_argv[-2]) || tramp_step_def_of(call_argv[-2]))) {   /* f.apply(this,arr), f NORMAL */
                     /* only when arr is undefined/null (0 args) or an object (array-like); a primitive arr must
                        throw a realm-correct TypeError from the C js_function_apply BEFORE the target runs. */
                     JSValueConst aa = (call_argc >= 2) ? call_argv[1] : JS_UNDEFINED;
@@ -20027,7 +20014,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         goto do_generator_create_tramp;
                     }
                 }
-                if (tramp_is_reflect_apply(call_argv[-1]) && call_argc >= 3 && tramp_can_call(call_argv[0])
+                if (tramp_is_reflect_apply(call_argv[-1]) && call_argc >= 3 && (tramp_can_call(call_argv[0]) || tramp_step_def_of(call_argv[0]))
                     && JS_VALUE_GET_TAG(call_argv[2]) == JS_TAG_OBJECT) {   /* Reflect.apply(target, this, argsList) */
                     ap_func = call_argv[0]; ap_this = call_argv[1]; ap_array = call_argv[2];
                     ap_cfirst = -2; ap_cargc = call_argc;   /* operands [Reflect, apply, target, this, argsList] */
@@ -20168,7 +20155,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc += 2;
                 sf->cur_pc = pc;
 
-                if (magic == 0 && tramp_can_call(sp[-3])) {   /* f(...arr) / f.apply-spread, f NORMAL -> body on THIS chain */
+                if (magic == 0 && (tramp_can_call(sp[-3]) || tramp_step_def_of(sp[-3]))) {   /* f(...arr) / f.apply-spread, f NORMAL -> body on THIS chain */
                     int atag = JS_VALUE_GET_TAG(sp[-1]);   /* the spread array */
                     if (atag == JS_TAG_UNDEFINED || atag == JS_TAG_NULL || atag == JS_TAG_OBJECT) {
                         ap_func = sp[-3]; ap_this = sp[-2]; ap_array = sp[-1];
@@ -20459,17 +20446,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 /* The forwarded shape is identical to the direct one, so it must ask the SAME questions. This list
                    having fallen behind the OP_call_method list is why replace.call(123, "2", fn) reached the C
                    entry: same builtin, same callback, different answer depending on how the call was spelled. */
-                if (tramp_can_call_str_replace(ctx, call_argv[-1], call_argv[-2], vc(call_argv), call_argc, &srep_is_all)) {
-                    tramp_is_tail = 0; goto do_str_replace_tramp;
-                }
-                if (tramp_can_call_re_replace(ctx, call_argv[-1], call_argv[-2], vc(call_argv), call_argc)) {
-                    srep_is_all = JS_VALUE_GET_OBJ(call_argv[-1])->u.cfunc.magic; rerep_direct = 0;
-                    tramp_is_tail = 0; goto do_re_replace_tramp;
-                }
-                if (tramp_can_call_re_symbol_replace(ctx, call_argv[-1], call_argv[-2], vc(call_argv), call_argc)) {
-                    srep_is_all = 0; rerep_direct = 1;
-                    tramp_is_tail = 0; goto do_re_replace_tramp;
-                }
                 if (tramp_can_call_array_sort(call_argv[-1], call_argc, vc(call_argv))) { tramp_is_tail = 0; goto do_sort_tramp; }
                 if (tramp_can_call_json_parse(call_argv[-1], call_argc, vc(call_argv))) { tramp_is_tail = 0; goto do_json_revive_tramp; }
                 {   /* g.next.call(g) / g.throw.call(g,e) / g.return.call(g,v): the reshape produced the exact
@@ -20503,7 +20479,31 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValueConst nfunc = ap_func;
                 JSValueConst thisArg = ap_this;
                 JSValueConst arrayArg = ap_array;
-                JSObject *np = JS_VALUE_GET_OBJ(nfunc);
+                JSObject *np;
+                {   /* the target may be a STEP builtin (f.apply / Reflect.apply / the spread). It has no bytecode
+                       body, so the code below does not apply — route it onto the one step driver here. There is no
+                       fallback to fall through TO: js_call_c_function now DFAILs on a step builtin, so a call
+                       shape that is not routed crashes loud instead of quietly losing suspension. */
+                    const JSTrampStepDef *sd = tramp_step_def_of(nfunc);
+                    if (sd) {
+                        uint32_t alen2 = 0; JSValue *atab2 = NULL; void *stt;
+                        if (JS_VALUE_GET_TAG(arrayArg) != JS_TAG_UNDEFINED && JS_VALUE_GET_TAG(arrayArg) != JS_TAG_NULL) {
+                            atab2 = build_arg_list(ctx, &alen2, arrayArg);
+                            if (unlikely(!atab2)) goto exception;
+                        }
+                        stt = sd->init(ctx, thisArg, (int)alen2, (JSValueConst *)atab2, sd->arg);
+                        free_arg_list(ctx, atab2, alen2);
+                        if (unlikely(!stt)) goto exception;
+                        ((JSStepHdr *)stt)->def = sd;
+                        ((JSStepHdr *)stt)->orig_cfirst = ap_cfirst;   /* the APPLY operand shape, not a method call's */
+                        ((JSStepHdr *)stt)->orig_cargc = ap_cargc;
+                        ((JSStepHdr *)stt)->orig_is_tail = tramp_is_tail;
+                        cont_st = stt;
+                        ret_val = JS_UNDEFINED;
+                        goto do_step_step;
+                    }
+                }
+                np = JS_VALUE_GET_OBJ(nfunc);
                 JSFunctionBytecode *nb = np->u.func.function_bytecode;
                 uint32_t alen = 0; JSValue *atab = NULL;
                 int eff_argc, narg_alloc; size_t asize;
@@ -20648,111 +20648,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 goto do_array_reduce_step;
             }
 
-        do_re_replace_tramp:
-            /* 22.2.6.11 phase 1: set lastIndex, then collect EVERY match. The recognizer guarantees a standard
-               regexp, so JS_RegExpExec runs the built-in exec and no user code runs here — the first re-entry into
-               JS is the replacer, which phase 2 drives on the tramp. */
-            {
-                JSReRep *s;
-                /* two spellings, one walk: str.replace(re, fn) has the regexp at argv[0] and the subject as the
-                   receiver; re[@@replace](str, fn) mirrors them. */
-                JSValue rxv = rerep_direct ? call_argv[-2] : call_argv[0];
-                JSValue flags, sv;
-                JSString *fp2;
-                int is_global2, fullUnicode2 = 0;
-                JSValue *res = NULL; int nres = 0, rcap = 0;
-
-                flags = JS_GetProperty(ctx, rxv, JS_ATOM_flags);
-                if (unlikely(JS_IsException(flags))) goto exception;
-                flags = JS_ToStringFree(ctx, flags);
-                if (unlikely(JS_IsException(flags))) goto exception;
-                fp2 = JS_VALUE_GET_STRING(flags);
-                is_global2 = (-1 != string_indexof_char(fp2, 'g', 0));
-                if (is_global2) {
-                    fullUnicode2 = (string_indexof_char(fp2, 'u', 0) >= 0 || string_indexof_char(fp2, 'v', 0) >= 0);
-                    if (JS_SetProperty(ctx, rxv, JS_ATOM_lastIndex, js_int32(0)) < 0) { JS_FreeValue(ctx, flags); goto exception; }
-                }
-                JS_FreeValue(ctx, flags);
-                if (srep_is_all && !is_global2) {   /* replaceAll demands the g flag, as check_regexp_g_flag does */
-                    JS_ThrowTypeError(ctx, "replaceAll must be called with a global RegExp");
-                    goto exception;
-                }
-                sv = JS_ToString(ctx, rerep_direct ? call_argv[0] : call_argv[-2]);
-                if (unlikely(JS_IsException(sv))) goto exception;
-                for (;;) {
-                    JSValue mres = JS_RegExpExec(ctx, rxv, sv);
-                    if (unlikely(JS_IsException(mres))) goto re_rep_collect_fail;
-                    if (JS_IsNull(mres)) { JS_FreeValue(ctx, mres); break; }
-                    if (nres == rcap) {
-                        JSValue *nr;
-                        rcap = rcap ? rcap * 2 : 8;
-                        nr = js_realloc_rt(rt, res, sizeof(JSValue) * rcap);
-                        if (unlikely(!nr)) { JS_FreeValue(ctx, mres); JS_ThrowOutOfMemory(ctx); goto re_rep_collect_fail; }
-                        res = nr;
-                    }
-                    res[nres++] = mres;
-                    if (!is_global2) break;
-                    {   /* an EMPTY match must always advance at least one char, or the collect never terminates */
-                        JSValue m0 = JS_ToStringFree(ctx, JS_GetPropertyInt64(ctx, mres, 0));
-                        if (unlikely(JS_IsException(m0))) goto re_rep_collect_fail;
-                        if (JS_IsEmptyString(m0)) {
-                            int64_t thisIndex, nextIndex;
-                            JS_FreeValue(ctx, m0);
-                            if (JS_ToLengthFree(ctx, &thisIndex, JS_GetProperty(ctx, rxv, JS_ATOM_lastIndex)) < 0)
-                                goto re_rep_collect_fail;
-                            nextIndex = string_advance_index(JS_VALUE_GET_STRING(sv), thisIndex, fullUnicode2);
-                            if (JS_SetProperty(ctx, rxv, JS_ATOM_lastIndex, js_int64(nextIndex)) < 0)
-                                goto re_rep_collect_fail;
-                        } else {
-                            JS_FreeValue(ctx, m0);
-                        }
-                    }
-                }
-                s = js_mallocz_rt(rt, sizeof(*s));
-                if (unlikely(!s)) { JS_ThrowOutOfMemory(ctx); goto re_rep_collect_fail; }
-                s->rx = js_dup(rxv);
-                s->str = sv;                       /* ownership moves into the state */
-                s->rep = js_dup(call_argv[1]);
-                s->results = res; s->nresults = nres;
-                s->matched = JS_UNDEFINED; s->result = JS_UNDEFINED;
-                string_buffer_init(ctx, &s->b, 0);
-                s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
-                cont_st = s; cont_kind_cur = CONT_RE_REPLACE;
-                ret_val = JS_UNDEFINED;
-                goto do_re_replace_step;
-
-            re_rep_collect_fail:
-                { int q; for (q = 0; q < nres; q++) JS_FreeValue(ctx, res[q]); }
-                js_free_rt(rt, res);
-                JS_FreeValue(ctx, sv);
-                goto exception;
-            }
-
-        do_re_replace_step:
-            {
-                JSReRep *s = (JSReRep *)cont_st;
-                int st = js_re_rep_step(ctx, s, ret_val);
-                if (unlikely(st < 0)) { js_re_rep_end(ctx, s, false); js_free_rt(rt, s); goto exception; }
-                if (st == 0) {
-                    JSValue r = s->result;
-                    int cfirst = s->orig_cfirst, cargc = s->orig_cargc;
-                    uint8_t itail = s->orig_is_tail;
-                    JSValue *cargv = sp - cargc;
-                    js_re_rep_end(ctx, s, true);
-                    js_free_rt(rt, s);
-                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
-                    sp += cfirst - cargc;
-                    if (itail) { ret_val = r; goto do_return; }
-                    *sp++ = r;
-                    BREAK;
-                }
-                DCHECK(st == 3, "regexp replace step: unknown step code");
-                call_argv = (JSValueConst *)&s->cb_buf[2];
-                call_argc = s->cb_nargs; tramp_first = -2; tramp_is_tail = 0;
-                tramp_cont_state = s; tramp_cont_kind = CONT_RE_REPLACE;
-                goto do_tramp_call;   /* the recognizer guarantees a bytecode replacer */
-            }
-
         do_step_tramp:
             /* ONE generic entry for every builtin DEFINED as a step machine. Nothing here names a builtin: the
                callee carries its own init/step/fini, so this path never grows an entry per builtin. */
@@ -20802,55 +20697,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (unlikely(JS_IsException(ret_val))) { h->def->fini(ctx, stt, false); goto exception; }
                 cont_st = stt;
                 goto do_step_step;
-            }
-
-        do_str_replace_tramp:
-            /* 22.1.3.19 with a function replacer: build the state, then let the shared step decide the first match.
-               The args live in the state (cb_args), so sp is untouched and the ORIGINAL operands stay where the
-               finish pops them. */
-            {
-                JSStrReplace *s = js_mallocz_rt(rt, sizeof(*s));
-                if (unlikely(!s)) { JS_ThrowOutOfMemory(ctx); goto exception; }
-                /* steps 3-4: ToString(O) then ToString(searchValue). These can run user code (toString/valueOf);
-                   the walk itself never sees anything but the resulting primitive strings. */
-                s->str = JS_ToString(ctx, call_argv[-2]);
-                if (unlikely(JS_IsException(s->str))) { js_free_rt(rt, s); goto exception; }
-                s->search_str = JS_ToString(ctx, call_argv[0]);
-                if (unlikely(JS_IsException(s->search_str))) { JS_FreeValue(ctx, s->str); js_free_rt(rt, s); goto exception; }
-                s->result = JS_UNDEFINED;
-                string_buffer_init(ctx, &s->b, 0);
-                s->endOfLastMatch = 0; s->pos = 0;
-                s->is_first = 1; s->is_replaceAll = srep_is_all; s->cb_pending = 0;
-                s->cb_args[1] = call_argv[1];   /* the replacer (borrowed: an original operand) */
-                s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
-                cont_st = s; cont_kind_cur = CONT_STR_REPLACE;
-                ret_val = JS_UNDEFINED;
-                goto do_str_replace_step;
-            }
-
-        do_str_replace_step:
-            {
-                JSStrReplace *s = (JSStrReplace *)cont_st;
-                int st = js_str_replace_step(ctx, s, ret_val);
-                if (unlikely(st < 0)) { js_str_replace_end(ctx, s, false); js_free_rt(rt, s); goto exception; }
-                if (st == 0) {   /* DONE: the rebuilt string is the result */
-                    JSValue r = s->result;
-                    int cfirst = s->orig_cfirst, cargc = s->orig_cargc;
-                    uint8_t itail = s->orig_is_tail;
-                    JSValue *cargv = sp - cargc;
-                    js_str_replace_end(ctx, s, true);
-                    js_free_rt(rt, s);
-                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
-                    sp += cfirst - cargc;
-                    if (itail) { ret_val = r; goto do_return; }
-                    *sp++ = r;
-                    BREAK;
-                }
-                DCHECK(st == 3, "str.replace step: unknown step code");
-                call_argv = (JSValueConst *)&s->cb_args[2];
-                call_argc = 3; tramp_first = -2; tramp_is_tail = 0;
-                tramp_cont_state = s; tramp_cont_kind = CONT_STR_REPLACE;
-                goto do_tramp_call;   /* the recognizer guarantees a bytecode replacer */
             }
 
         do_array_reduce_step:
@@ -22580,8 +22426,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        that builtin's STEP instead of pushing it. The step drives the next element or finishes. */
                     cont_st = rcs; cont_kind_cur = rck;
                     if (rck == CONT_STEP) goto do_step_step;
-                    if (rck == CONT_STR_REPLACE) goto do_str_replace_step;
-                    if (rck == CONT_RE_REPLACE) goto do_re_replace_step;
                     if (rck == CONT_ARRAY_REDUCE) goto do_array_reduce_step;
                     if (rck == CONT_SORT) goto do_sort_step;
                     if (rck == CONT_JSON_REVIVE) goto do_json_revive_step;
@@ -49424,6 +49268,9 @@ static const JSTrampStepDef js_tramp_step_defs[] = {
     { js_array_find_init, js_array_find_step, js_array_find_fini, ArrayFindIndex },
     { js_array_find_init, js_array_find_step, js_array_find_fini, ArrayFindLast },
     { js_array_find_init, js_array_find_step, js_array_find_fini, ArrayFindLastIndex },
+    { js_re_rep_init,     js_re_rep_vstep,    js_re_rep_fini,     0 },   /* RegExp.prototype[@@replace] */
+    { js_str_replace_init, js_str_replace_vstep, js_str_replace_fini, 0 },   /* String.prototype.replace */
+    { js_str_replace_init, js_str_replace_vstep, js_str_replace_fini, 1 },   /* String.prototype.replaceAll */
 };
 
 static const JSTrampStepDef *tramp_step_def_of(JSValueConst func)
@@ -52833,6 +52680,24 @@ static int js_str_replace_step(JSContext *ctx, JSStrReplace *s, JSValue cb_resul
             }
             break;
         }
+        if (!s->functional) {
+            /* same walk, different substitution SOURCE: GetSubstitution instead of a callback, spliced here and
+               on to the next match. Not a separate no-callback body. */
+            JSValueConst gargs[6];
+            JSValue repl;
+            gargs[0] = s->search_str; gargs[1] = s->str;    gargs[2] = js_int32(s->pos);
+            gargs[3] = JS_UNDEFINED;  gargs[4] = JS_UNDEFINED; gargs[5] = s->rep_val;
+            repl = js_string___GetSubstitution(ctx, JS_UNDEFINED, 6, gargs);
+            if (JS_IsException(repl))
+                return -1;
+            string_buffer_concat(&s->b, sp, s->endOfLastMatch, s->pos);
+            string_buffer_concat_value_free(&s->b, repl);
+            s->endOfLastMatch = s->pos + searchp->len;
+            s->is_first = 0;
+            if (!s->is_replaceAll)
+                goto finish;
+            continue;
+        }
         s->cb_args[0] = JS_UNDEFINED;                /* thisArgument */
         s->cb_args[2] = s->search_str;               /* borrowed: matched */
         s->cb_args[3] = js_int32(s->pos);            /* position */
@@ -52851,155 +52716,130 @@ finish:
 /* Recognized only when every operand is already a primitive of the right type: this_val a STRING (so no ToString
    side effect is skipped), searchValue a STRING (an object would dispatch to @@replace), and the replacer a plain
    bytecode function (a C/bound replacer has no preemptible body, so the ordinary path is already correct). */
-static bool tramp_can_call_str_replace(JSContext *ctx, JSValueConst func, JSValueConst this_val,
-                                       JSValueConst *call_argv, int call_argc, int *out_is_all)
+
+/* String.prototype.replace/replaceAll IS a step machine. The @@replace dispatch below used to be a JS_CallFree
+   straight out of C, which is exactly what kept "aaa".replace(/a/g, fn) driving to completion: the callee is
+   itself a step builtin, so calling it from C ran its callbacks through an inline JS_Call that cannot suspend.
+   The dispatch is now step code 3 — @@replace is invoked ON THE TRAMP like any other call — so the whole chain
+   (str.replace -> @@replace -> the replacer) is preemptible end to end, and no recognizer is involved anywhere. */
+static void *js_str_replace_init(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int is_replaceAll)
 {
-    JSObject *fp;
-    if (call_argc < 2) return false;
-    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
-    fp = JS_VALUE_GET_OBJ(func);
-    if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
-    if (fp->u.cfunc.cproto != JS_CFUNC_generic_magic) return false;
-    if (fp->u.cfunc.c_function.generic_magic != js_string_replace) return false;
-    /* 22.1.3.19 steps 1-4: the receiver only has to be object-coercible and searchValue only has to be
-       ToString-able — the setup performs both coercions. Demanding primitive STRINGS here is what left
-       new String(s).replace(..), replace.call(123, ..) and a {toString(){}} searchValue falling through to the
-       duplicate walk. An OBJECT searchValue is still declined when it carries @@replace (step 2b delegates to it;
-       that is a different operation, not this walk). */
-    if (JS_IsUndefined(this_val) || JS_IsNull(this_val)) return false;
-    if (JS_VALUE_GET_TAG(call_argv[0]) == JS_TAG_OBJECT) {
-        JSValue rp = JS_GetProperty(ctx, call_argv[0], JS_ATOM_Symbol_replace);
-        bool has;
-        if (JS_IsException(rp)) { JS_FreeValue(ctx, rp); return false; }
-        has = !JS_IsUndefined(rp) && !JS_IsNull(rp);
-        JS_FreeValue(ctx, rp);
-        if (has) return false;
+    JSStrReplace *s;
+    JSValueConst searchValue = argc > 0 ? argv[0] : JS_UNDEFINED;
+
+    if (JS_IsUndefined(this_val) || JS_IsNull(this_val)) {
+        JS_ThrowTypeError(ctx, "cannot convert to object");
+        return NULL;
     }
-    /* ANY callable replacer, not just a bytecode one. Requiring tramp_can_call here was the fallback in disguise:
-       a C/bound replacer fell through to a SECOND implementation of the same walk inside js_string_replace. The
-       step machine dispatches a non-tramp callback inline (it has no preemptible body, so nothing is lost), which
-       is what lets that legacy branch be deleted outright rather than fenced off. */
-    if (!JS_IsFunction(ctx, call_argv[1])) return false;
-    *out_is_all = fp->u.cfunc.magic;
-    return true;
-}
-
-static JSValue js_string_replace(JSContext *ctx, JSValueConst this_val,
-                                 int argc, JSValueConst *argv,
-                                 int is_replaceAll)
-{
-    // replace(rx, rep)
-    JSValueConst O = this_val, searchValue = argv[0], replaceValue = argv[1];
-    JSValueConst args[6];
-    JSValue str, search_str, replaceValue_str, repl_str;
-    JSString *sp, *searchp;
-    StringBuffer b_s, *b = &b_s;
-    int pos, functionalReplace, endOfLastMatch;
-    bool is_first;
-
-    if (JS_IsUndefined(O) || JS_IsNull(O))
-        return JS_ThrowTypeError(ctx, "cannot convert to object");
-
-    search_str = JS_UNDEFINED;
-    replaceValue_str = JS_UNDEFINED;
-    repl_str = JS_UNDEFINED;
+    s = js_mallocz(ctx, sizeof(*s));
+    if (!s) { JS_ThrowOutOfMemory(ctx); return NULL; }
+    s->str = JS_UNDEFINED; s->search_str = JS_UNDEFINED; s->result = JS_UNDEFINED;
+    s->is_replaceAll = is_replaceAll;
 
     if (JS_IsObject(searchValue)) {
         JSValue replacer;
-        if (is_replaceAll) {
-            if (check_regexp_g_flag(ctx, searchValue) < 0)
-                return JS_EXCEPTION;
-        }
+        if (is_replaceAll && check_regexp_g_flag(ctx, searchValue) < 0) { js_free(ctx, s); return NULL; }
         replacer = JS_GetProperty(ctx, searchValue, JS_ATOM_Symbol_replace);
-        if (JS_IsException(replacer))
-            return JS_EXCEPTION;
+        if (JS_IsException(replacer)) { js_free(ctx, s); return NULL; }
         if (!JS_IsUndefined(replacer) && !JS_IsNull(replacer)) {
-            args[0] = O;
-            args[1] = replaceValue;
-            return JS_CallFree(ctx, replacer, searchValue, 2, args);
-        }
-    }
-    string_buffer_init(ctx, b, 0);
-
-    str = JS_ToString(ctx, O);
-    if (JS_IsException(str))
-        goto exception;
-    search_str = JS_ToString(ctx, searchValue);
-    if (JS_IsException(search_str))
-        goto exception;
-    functionalReplace = JS_IsFunction(ctx, replaceValue);
-    if (!functionalReplace) {
-        replaceValue_str = JS_ToString(ctx, replaceValue);
-        if (JS_IsException(replaceValue_str))
-            goto exception;
-    }
-
-    sp = JS_VALUE_GET_STRING(str);
-    searchp = JS_VALUE_GET_STRING(search_str);
-    endOfLastMatch = 0;
-    is_first = true;
-    for(;;) {
-        if (unlikely(searchp->len == 0)) {
-            if (is_first)
-                pos = 0;
-            else if (endOfLastMatch >= sp->len)
-                pos = -1;
-            else
-                pos = endOfLastMatch + 1;
-        } else {
-            pos = string_indexof(sp, searchp, endOfLastMatch);
-        }
-        if (pos < 0) {
-            if (is_first) {
-                string_buffer_free(b);
-                JS_FreeValue(ctx, search_str);
-                JS_FreeValue(ctx, replaceValue_str);
-                return str;
-            } else {
-                break;
+            const JSTrampStepDef *isd = tramp_step_def_of(replacer);
+            if (isd) {
+                /* the BUILT-IN @@replace, which is itself a step machine. Calling it would mean a step builtin
+                   invoking a step builtin — the inline JS_Call in the driver cannot suspend, which is exactly the
+                   drive-to-completion being removed. DELEGATE instead: run that one machine directly, so the whole
+                   str.replace -> @@replace -> replacer chain is a single preemptible walk. */
+                JSValueConst iargv[2];
+                iargv[0] = this_val;                                  /* the subject */
+                iargv[1] = argc > 1 ? argv[1] : JS_UNDEFINED;         /* the replacer */
+                s->inner_def = isd;
+                s->inner = isd->init(ctx, searchValue, 2, iargv, isd->arg);
+                JS_FreeValue(ctx, replacer);
+                if (!s->inner) { js_free(ctx, s); return NULL; }
+                s->mode = 3;
+                return s;
             }
+            /* a USER-DEFINED @@replace: an ordinary callable, invoked on the tramp like any other call */
+            s->mode = 1;
+            s->cb_args[0] = js_dup(searchValue);                     /* this = the searchValue */
+            s->cb_args[1] = replacer;                                /* owned */
+            s->cb_args[2] = js_dup(this_val);                        /* the subject */
+            s->cb_args[3] = js_dup(argc > 1 ? argv[1] : JS_UNDEFINED);
+            return s;
         }
-        if (functionalReplace) {
-            /* DELETED: the second implementation of this walk. A function replacer over a string searchValue is
-               driven ONLY by js_str_replace_step now — the recognizer accepts any callable, so nothing reaches
-               here. If something does, a call path bypassed the dispatch and must be routed, not re-implemented:
-               keeping a JS_Call loop here as the "not recognized" case is exactly the dual system that hides the
-               new machine's gaps. */
-            DFAIL("String.prototype.replace reached the C entry with a FUNCTION replacer — route that call site "
-                  "onto the step machine (js_str_replace_step); this branch no longer exists");
-            repl_str = JS_EXCEPTION;
-        } else {
-            args[0] = search_str;
-            args[1] = str;
-            args[2] = js_int32(pos);
-            args[3] = JS_UNDEFINED;
-            args[4] = JS_UNDEFINED;
-            args[5] = replaceValue_str;
-            repl_str = js_string___GetSubstitution(ctx, JS_UNDEFINED, 6, args);
-        }
-        if (JS_IsException(repl_str))
-            goto exception;
-
-        string_buffer_concat(b, sp, endOfLastMatch, pos);
-        string_buffer_concat_value_free(b, repl_str);
-        endOfLastMatch = pos + searchp->len;
-        is_first = false;
-        if (!is_replaceAll)
-            break;
+        JS_FreeValue(ctx, replacer);
     }
-    string_buffer_concat(b, sp, endOfLastMatch, sp->len);
-    JS_FreeValue(ctx, search_str);
-    JS_FreeValue(ctx, replaceValue_str);
-    JS_FreeValue(ctx, str);
-    return string_buffer_end(b);
-
-exception:
-    string_buffer_free(b);
-    JS_FreeValue(ctx, search_str);
-    JS_FreeValue(ctx, replaceValue_str);
-    JS_FreeValue(ctx, str);
-    return JS_EXCEPTION;
+    /* The plain string-search walk — ONE walk for both replacer kinds. A callable drives step-code 3; anything
+       else is ToString'd once and fed to GetSubstitution inside the same loop. There is no separate no-callback
+       body: that duplicate walk is deleted. */
+    s->rep_val = JS_UNDEFINED;
+    s->str = JS_ToString(ctx, this_val);
+    if (JS_IsException(s->str)) { js_free(ctx, s); return NULL; }
+    s->search_str = JS_ToString(ctx, searchValue);
+    if (JS_IsException(s->search_str)) { JS_FreeValue(ctx, s->str); js_free(ctx, s); return NULL; }
+    s->functional = (argc > 1 && JS_IsFunction(ctx, argv[1]));
+    if (s->functional) {
+        s->cb_args[1] = js_dup(argv[1]);
+    } else {
+        s->rep_val = JS_ToString(ctx, argc > 1 ? argv[1] : JS_UNDEFINED);
+        if (JS_IsException(s->rep_val)) {
+            s->rep_val = JS_UNDEFINED;
+            JS_FreeValue(ctx, s->str); JS_FreeValue(ctx, s->search_str); js_free(ctx, s); return NULL;
+        }
+    }
+    string_buffer_init(ctx, &s->b, 0);
+    s->endOfLastMatch = 0; s->pos = 0; s->is_first = 1; s->cb_pending = 0;
+    s->mode = 0;
+    return s;
 }
+
+static int js_str_replace_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSStrReplace *s = st;
+    if (s->mode == 3)   /* delegated: the built-in @@replace machine IS the walk */
+        return s->inner_def->step(ctx, s->inner, cb_result, out_cb, out_argc);
+    if (s->mode == 2)
+        return 0;
+    if (s->mode == 1) {
+        if (s->cb_pending) {          /* @@replace returned: its result IS the answer */
+            s->result = cb_result;
+            s->cb_pending = 0;
+            return 0;
+        }
+        s->cb_pending = 1;
+        *out_cb = s->cb_args; *out_argc = 2;
+        return 3;
+    }
+    {   /* mode 0: the string-search walk, one match per step */
+        int r = js_str_replace_step(ctx, s, cb_result);
+        if (r == 3) { *out_cb = s->cb_args; *out_argc = 3; }
+        return r;
+    }
+}
+
+static JSValue js_str_replace_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSStrReplace *s = st;
+    JSValue r;
+    if (s->mode == 3) {
+        r = s->inner_def->fini(ctx, s->inner, take_result);
+        JS_FreeValue(ctx, s->str); JS_FreeValue(ctx, s->search_str);
+        js_free(ctx, s);
+        return r;
+    }
+    r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    if (s->mode == 1) {
+        JS_FreeValue(ctx, s->cb_args[0]); JS_FreeValue(ctx, s->cb_args[1]);
+        JS_FreeValue(ctx, s->cb_args[2]); JS_FreeValue(ctx, s->cb_args[3]);
+    } else if (s->mode == 0) {
+        if (s->functional) JS_FreeValue(ctx, s->cb_args[1]);   /* the replacer dup'd by init */
+        string_buffer_free(&s->b);                             /* unconsumed on the error path */
+    }
+    JS_FreeValue(ctx, s->str); JS_FreeValue(ctx, s->search_str); JS_FreeValue(ctx, s->rep_val);
+    js_free(ctx, s);
+    return r;
+}
+
 
 static JSValue js_string_split(JSContext *ctx, JSValueConst this_val,
                                int argc, JSValueConst *argv)
@@ -53722,8 +53562,8 @@ static const JSCFunctionListEntry js_string_proto_funcs[] = {
     JS_CFUNC_DEF("substr", 2, js_string_substr ),
     JS_CFUNC_DEF("slice", 2, js_string_slice ),
     JS_CFUNC_DEF("repeat", 1, js_string_repeat ),
-    JS_CFUNC_MAGIC_DEF("replace", 2, js_string_replace, 0 ),
-    JS_CFUNC_MAGIC_DEF("replaceAll", 2, js_string_replace, 1 ),
+    JS_CFUNC_STEP_DEF("replace", 2, 5 ),
+    JS_CFUNC_STEP_DEF("replaceAll", 2, 6 ),
     JS_CFUNC_MAGIC_DEF("padEnd", 1, js_string_pad, 1 ),
     JS_CFUNC_MAGIC_DEF("padStart", 1, js_string_pad, 0 ),
     JS_CFUNC_MAGIC_DEF("trim", 0, js_string_trim, 3 ),
@@ -55640,6 +55480,48 @@ static int js_re_rep_step(JSContext *ctx, struct JSReRep *s, JSValue cb_result)
         /* Call(replaceValue, undefined, «matched, ...captures, position, string, groups?»). The spec builds a
            LIST, not an array — the JS array the C path materializes is never observable, so the args go straight
            into the call buffer. Layout is [this, fn, args...] so do_tramp_call reads fn at call_argv[-1]. */
+        if (!s->functional) {
+            /* A NON-callable replacement is the same walk with a different substitution SOURCE — GetSubstitution
+               instead of a callback — so it runs HERE, in the one machine, and continues to the next match. It is
+               not a separate no-callback body: that duplicate walk is deleted. */
+            JSValueConst gargs[6];
+            JSValue tab, ncap1, rep_str;
+            int gn;
+            tab = JS_NewArray(ctx);
+            if (JS_IsException(tab)) { JS_FreeValue(ctx, namedCaptures); return -1; }
+            if (JS_DefinePropertyValueInt64Const(ctx, tab, 0, js_dup(s->matched), JS_PROP_C_W_E | JS_PROP_THROW) < 0) {
+                JS_FreeValue(ctx, tab); JS_FreeValue(ctx, namedCaptures); return -1;
+            }
+            for (gn = 1; gn < nCaptures; gn++) {
+                JSValue capN = JS_GetPropertyInt64(ctx, result, gn);
+                if (JS_IsException(capN)) { JS_FreeValue(ctx, tab); JS_FreeValue(ctx, namedCaptures); return -1; }
+                if (!JS_IsUndefined(capN)) {
+                    capN = JS_ToStringFree(ctx, capN);
+                    if (JS_IsException(capN)) { JS_FreeValue(ctx, tab); JS_FreeValue(ctx, namedCaptures); return -1; }
+                }
+                if (JS_DefinePropertyValueInt64(ctx, tab, gn, capN, JS_PROP_C_W_E | JS_PROP_THROW) < 0) {
+                    JS_FreeValue(ctx, tab); JS_FreeValue(ctx, namedCaptures); return -1;
+                }
+            }
+            if (!JS_IsUndefined(namedCaptures)) {
+                ncap1 = JS_ToObject(ctx, namedCaptures);
+                if (JS_IsException(ncap1)) { JS_FreeValue(ctx, tab); JS_FreeValue(ctx, namedCaptures); return -1; }
+            } else {
+                ncap1 = JS_UNDEFINED;
+            }
+            gargs[0] = s->matched; gargs[1] = s->str; gargs[2] = js_int32(s->position);
+            gargs[3] = tab;        gargs[4] = ncap1;  gargs[5] = s->rep;
+            rep_str = js_string___GetSubstitution(ctx, JS_UNDEFINED, 6, gargs);
+            JS_FreeValue(ctx, tab); JS_FreeValue(ctx, ncap1); JS_FreeValue(ctx, namedCaptures);
+            if (JS_IsException(rep_str)) return -1;
+            if (s->position >= s->nextSourcePosition) {
+                string_buffer_concat(&s->b, sp, s->nextSourcePosition, s->position);
+                string_buffer_concat_value(&s->b, rep_str);
+                s->nextSourcePosition = s->position + JS_VALUE_GET_STRING(s->matched)->len;
+            }
+            JS_FreeValue(ctx, rep_str);
+            continue;
+        }
         s->cb_nargs = 0;
         s->cb_buf = js_malloc(ctx, sizeof(JSValue) * (2 + nCaptures + 3));
         if (!s->cb_buf) { JS_FreeValue(ctx, namedCaptures); return -1; }
@@ -55687,6 +55569,106 @@ static void js_re_rep_free_cb(JSContext *ctx, struct JSReRep *s)
     s->cb_buf = NULL; s->cb_nargs = 0;
 }
 
+/* RegExp.prototype[@@replace] IS this step machine — JS_CFUNC_STEP_DEF, no recognizer, no C entry to choose
+   against. init runs 22.2.6.11 phase 1 (lastIndex reset + collect EVERY match); step runs phase 2, one match per
+   step. A NON-functional replacer has no JS re-entry at all, so it is computed here in C and the machine reports
+   DONE immediately — that is the no-callback case, not a second copy of the callback walk. */
+static void *js_re_rep_init(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int arg)
+{
+    JSReRep *s;
+    JSValue flags, sv;
+    JSString *fp2;
+    int is_global2, fullUnicode2 = 0;
+    JSValue *res = NULL; int nres = 0, rcap = 0;
+
+    if (!JS_IsObject(this_val)) { JS_ThrowTypeErrorNotAnObject(ctx); return NULL; }
+
+    flags = JS_GetProperty(ctx, this_val, JS_ATOM_flags);
+    if (JS_IsException(flags)) return NULL;
+    flags = JS_ToStringFree(ctx, flags);
+    if (JS_IsException(flags)) return NULL;
+    fp2 = JS_VALUE_GET_STRING(flags);
+    is_global2 = (-1 != string_indexof_char(fp2, 'g', 0));
+    if (is_global2) {
+        fullUnicode2 = (string_indexof_char(fp2, 'u', 0) >= 0 || string_indexof_char(fp2, 'v', 0) >= 0);
+        if (JS_SetProperty(ctx, this_val, JS_ATOM_lastIndex, js_int32(0)) < 0) { JS_FreeValue(ctx, flags); return NULL; }
+    }
+    JS_FreeValue(ctx, flags);
+    sv = JS_ToString(ctx, argv[0]);
+    if (JS_IsException(sv)) return NULL;
+    for (;;) {
+        JSValue mres = JS_RegExpExec(ctx, this_val, sv);
+        if (JS_IsException(mres)) goto fail;
+        if (JS_IsNull(mres)) { JS_FreeValue(ctx, mres); break; }
+        if (nres == rcap) {
+            JSValue *nr;
+            rcap = rcap ? rcap * 2 : 8;
+            nr = js_realloc(ctx, res, sizeof(JSValue) * rcap);
+            if (!nr) { JS_FreeValue(ctx, mres); JS_ThrowOutOfMemory(ctx); goto fail; }
+            res = nr;
+        }
+        res[nres++] = mres;
+        if (!is_global2) break;
+        {   /* an EMPTY match must always advance at least one char, or the collect never terminates */
+            JSValue m0 = JS_ToStringFree(ctx, JS_GetPropertyInt64(ctx, mres, 0));
+            if (JS_IsException(m0)) goto fail;
+            if (JS_IsEmptyString(m0)) {
+                int64_t thisIndex, nextIndex;
+                JS_FreeValue(ctx, m0);
+                if (JS_ToLengthFree(ctx, &thisIndex, JS_GetProperty(ctx, this_val, JS_ATOM_lastIndex)) < 0) goto fail;
+                nextIndex = string_advance_index(JS_VALUE_GET_STRING(sv), thisIndex, fullUnicode2);
+                if (JS_SetProperty(ctx, this_val, JS_ATOM_lastIndex, js_int64(nextIndex)) < 0) goto fail;
+            } else {
+                JS_FreeValue(ctx, m0);
+            }
+        }
+    }
+    s = js_mallocz(ctx, sizeof(*s));
+    if (!s) { JS_ThrowOutOfMemory(ctx); goto fail; }
+    s->rx = js_dup(this_val);
+    s->str = sv;                  /* ownership moves into the state */
+    s->matched = JS_UNDEFINED; s->result = JS_UNDEFINED;
+    /* EVERY owned field must be on the state before anything that can fail below. The ToString on a non-callable
+       replacer runs user toString, and its failure path tears the state down through js_re_rep_end — which frees
+       only what the state holds. Handing `res` over late leaked the whole collected match array (361 objects);
+       leaving `b` uninitialized freed a NULL-ctx buffer. Both were the same mistake: state assigned after the
+       first thing that can throw. */
+    s->results = res; s->nresults = nres;
+    string_buffer_init(ctx, &s->b, 0);
+    /* ONE machine, both replacer kinds: a callable drives step-code 3, anything else is ToString'd once and fed
+       to GetSubstitution inside the same walk. */
+    s->functional = (argc > 1 && JS_IsFunction(ctx, argv[1]));
+    if (s->functional) {
+        s->rep = js_dup(argv[1]);
+    } else {
+        s->rep = JS_ToString(ctx, argc > 1 ? argv[1] : JS_UNDEFINED);
+        if (JS_IsException(s->rep)) { s->rep = JS_UNDEFINED; js_re_rep_end(ctx, s, false); js_free(ctx, s); return NULL; }
+    }
+    return s;
+fail:
+    { int q; for (q = 0; q < nres; q++) JS_FreeValue(ctx, res[q]); }
+    js_free(ctx, res);
+    JS_FreeValue(ctx, sv);
+    return NULL;
+}
+
+static int js_re_rep_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSReRep *s = st;
+    int r = js_re_rep_step(ctx, s, cb_result);
+    if (r == 3) { *out_cb = s->cb_buf; *out_argc = s->cb_nargs; }
+    return r;
+}
+
+static JSValue js_re_rep_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSReRep *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    js_re_rep_end(ctx, s, take_result);
+    js_free(ctx, s);
+    return r;
+}
+
 static void js_re_rep_end(JSContext *ctx, struct JSReRep *s, bool take_result)
 {
     int i;
@@ -55704,261 +55686,11 @@ static void js_re_rep_end(JSContext *ctx, struct JSReRep *s, bool take_result)
     JS_FreeValue(ctx, s->matched);
 }
 
-/* Recognized only for a STANDARD regexp (so phase 1 runs no user JS), a STRING subject, and a bytecode replacer.
-   replaceAll additionally requires the g flag, exactly as check_regexp_g_flag enforces on the C path. */
-static bool tramp_can_call_re_replace(JSContext *ctx, JSValueConst func, JSValueConst this_val,
-                                      JSValueConst *call_argv, int call_argc)
-{
-    JSObject *fp, *rp;
-    if (call_argc < 2) return false;
-    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
-    fp = JS_VALUE_GET_OBJ(func);
-    if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
-    if (fp->u.cfunc.cproto != JS_CFUNC_generic_magic) return false;
-    if (fp->u.cfunc.c_function.generic_magic != js_string_replace) return false;
-    if (JS_VALUE_GET_TAG(this_val) != JS_TAG_STRING) return false;
-    if (JS_VALUE_GET_TAG(call_argv[0]) != JS_TAG_OBJECT) return false;
-    rp = JS_VALUE_GET_OBJ(call_argv[0]);
-    if (rp->class_id != JS_CLASS_REGEXP) return false;
-    /* ANY callable replacer. Demanding a bytecode one routed a C/bound replacer into a SECOND copy of the phase-2
-       substitution inside js_regexp_Symbol_replace; the step machine dispatches a non-tramp callback inline, which
-       is what lets that copy be deleted rather than fenced off. */
-    if (!JS_IsFunction(ctx, call_argv[1])) return false;
-    /* the @@replace it would dispatch to must be the BUILT-IN one, else the semantics are not ours to reproduce */
-    {
-        JSValue replacer = JS_GetProperty(ctx, call_argv[0], JS_ATOM_Symbol_replace);
-        bool ok;
-        if (JS_IsException(replacer)) { JS_FreeValue(ctx, replacer); return false; }
-        ok = JS_VALUE_GET_TAG(replacer) == JS_TAG_OBJECT
-             && JS_VALUE_GET_OBJ(replacer)->class_id == JS_CLASS_C_FUNCTION
-             && JS_VALUE_GET_OBJ(replacer)->u.cfunc.cproto == JS_CFUNC_generic
-             && JS_VALUE_GET_OBJ(replacer)->u.cfunc.c_function.generic == js_regexp_Symbol_replace;
-        JS_FreeValue(ctx, replacer);
-        if (!ok) return false;
-    }
-    /* A PATCHED exec is not excluded. Phase 1 collects through JS_RegExpExec, which dispatches the object's own
-       exec exactly as the spec requires, so the walk is identical either way — excluding it only meant the case
-       had nowhere to go once the duplicate was deleted. The residual limitation is that a patched exec is invoked
-       from C, so a loop inside IT cannot suspend; that is the general C-entry-calls-JS gap (the same one the
-       ToString coercions have), not a second implementation. */
-    return true;
-}
 
-/* The SAME builtin invoked DIRECTLY as re[Symbol.replace](str, fn). The operand shape is mirrored (the regexp is
-   the receiver, the subject is argv[0]) but the walk is identical, so recognizing only the str.replace(re, fn)
-   spelling left the direct form reaching the deleted C branch — one builtin answering differently by spelling. */
-static bool tramp_can_call_re_symbol_replace(JSContext *ctx, JSValueConst func, JSValueConst this_val,
-                                             JSValueConst *call_argv, int call_argc)
-{
-    JSObject *fp;
-    if (call_argc < 2) return false;
-    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
-    fp = JS_VALUE_GET_OBJ(func);
-    if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
-    if (fp->u.cfunc.cproto != JS_CFUNC_generic) return false;
-    if (fp->u.cfunc.c_function.generic != js_regexp_Symbol_replace) return false;
-    /* 22.2.6.11 step 1 only requires the receiver to be an OBJECT — demanding JS_CLASS_REGEXP was stricter than
-       the spec and excluded a SUBCLASS reaching here through super[@@replace](...args), which then had nowhere to
-       go once the duplicate was deleted. Phase 1 goes through JS_RegExpExec, which handles any object. */
-    if (JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT) return false;
-    if (!JS_IsFunction(ctx, call_argv[1])) return false;
-    return true;   /* a patched exec is covered too — see the note on the str.replace recognizer */
-}
 
-static JSValue js_regexp_Symbol_replace(JSContext *ctx, JSValueConst this_val,
-                                        int argc, JSValueConst *argv)
-{
-    // [Symbol.replace](str, rep)
-    JSValueConst rx = this_val, rep = argv[1];
-    JSValueConst args[6];
-    JSValue flags, str, rep_val, matched, tab, rep_str, namedCaptures, res;
-    JSString *p, *sp, *rp;
-    StringBuffer b_s, *b = &b_s;
-    ValueBuffer v_b, *results = &v_b;
-    int nextSourcePosition, n, j, functionalReplace, is_global, fullUnicode;
-    uint32_t nCaptures;
-    int64_t position;
-
-    if (!JS_IsObject(rx))
-        return JS_ThrowTypeErrorNotAnObject(ctx);
-
-    string_buffer_init(ctx, b, 0);
-    value_buffer_init(ctx, results);
-
-    rep_val = JS_UNDEFINED;
-    matched = JS_UNDEFINED;
-    tab = JS_UNDEFINED;
-    flags = JS_UNDEFINED;
-    rep_str = JS_UNDEFINED;
-    namedCaptures = JS_UNDEFINED;
-
-    str = JS_ToString(ctx, argv[0]);
-    if (JS_IsException(str))
-        goto exception;
-
-    sp = JS_VALUE_GET_STRING(str);
-    rp = NULL;
-    functionalReplace = JS_IsFunction(ctx, rep);
-    if (!functionalReplace) {
-        rep_val = JS_ToString(ctx, rep);
-        if (JS_IsException(rep_val))
-            goto exception;
-        rp = JS_VALUE_GET_STRING(rep_val);
-    }
-
-    flags = JS_GetProperty(ctx, rx, JS_ATOM_flags);
-    if (JS_IsException(flags))
-        goto exception;
-    flags = JS_ToStringFree(ctx, flags);
-    if (JS_IsException(flags))
-        goto exception;
-    p = JS_VALUE_GET_STRING(flags);
-
-    fullUnicode = 0;
-    is_global = (-1 != string_indexof_char(p, 'g', 0));
-    if (is_global) {
-        // 'v' flag implies full Unicode, like 'u'
-        fullUnicode = (string_indexof_char(p, 'u', 0) >= 0 ||
-                       string_indexof_char(p, 'v', 0) >= 0);
-        if (JS_SetProperty(ctx, rx, JS_ATOM_lastIndex, js_int32(0)) < 0)
-            goto exception;
-    }
-
-    if (rp && rp->len == 0 && is_global && js_is_standard_regexp(ctx, rx)) {
-        /* use faster version for simple cases */
-        res = JS_RegExpDelete(ctx, rx, str);
-        goto done;
-    }
-    for(;;) {
-        JSValue result;
-        result = JS_RegExpExec(ctx, rx, str);
-        if (JS_IsException(result))
-            goto exception;
-        if (JS_IsNull(result))
-            break;
-        if (value_buffer_append(results, result) < 0)
-            goto exception;
-        if (!is_global)
-            break;
-        JS_FreeValue(ctx, matched);
-        matched = JS_ToStringFree(ctx, JS_GetPropertyInt64(ctx, result, 0));
-        if (JS_IsException(matched))
-            goto exception;
-        if (JS_IsEmptyString(matched)) {
-            /* always advance of at least one char */
-            int64_t thisIndex, nextIndex;
-            if (JS_ToLengthFree(ctx, &thisIndex, JS_GetProperty(ctx, rx, JS_ATOM_lastIndex)) < 0)
-                goto exception;
-            nextIndex = string_advance_index(sp, thisIndex, fullUnicode);
-            if (JS_SetProperty(ctx, rx, JS_ATOM_lastIndex, js_int64(nextIndex)) < 0)
-                goto exception;
-        }
-    }
-    nextSourcePosition = 0;
-    for(j = 0; j < results->len; j++) {
-        JSValue result;
-        result = results->arr[j];
-        if (js_get_length32(ctx, &nCaptures, result) < 0)
-            goto exception;
-        JS_FreeValue(ctx, matched);
-        matched = JS_ToStringFree(ctx, JS_GetPropertyInt64(ctx, result, 0));
-        if (JS_IsException(matched))
-            goto exception;
-        if (JS_ToLengthFree(ctx, &position, JS_GetProperty(ctx, result, JS_ATOM_index)))
-            goto exception;
-        if (position > sp->len)
-            position = sp->len;
-        else if (position < 0)
-            position = 0;
-        /* ignore substition if going backward (can happen
-           with custom regexp object) */
-        JS_FreeValue(ctx, tab);
-        tab = JS_NewArray(ctx);
-        if (JS_IsException(tab))
-            goto exception;
-        if (JS_DefinePropertyValueInt64Const(ctx, tab, 0, matched,
-                                             JS_PROP_C_W_E | JS_PROP_THROW) < 0)
-            goto exception;
-        for(n = 1; n < nCaptures; n++) {
-            JSValue capN;
-            capN = JS_GetPropertyInt64(ctx, result, n);
-            if (JS_IsException(capN))
-                goto exception;
-            if (!JS_IsUndefined(capN)) {
-                capN = JS_ToStringFree(ctx, capN);
-                if (JS_IsException(capN))
-                    goto exception;
-            }
-            if (JS_DefinePropertyValueInt64(ctx, tab, n, capN,
-                                            JS_PROP_C_W_E | JS_PROP_THROW) < 0)
-                goto exception;
-        }
-        JS_FreeValue(ctx, namedCaptures);
-        namedCaptures = JS_GetProperty(ctx, result, JS_ATOM_groups);
-        if (JS_IsException(namedCaptures))
-            goto exception;
-        if (functionalReplace) {
-            if (JS_DefinePropertyValueInt64(ctx, tab, n++, js_int32(position), JS_PROP_C_W_E | JS_PROP_THROW) < 0)
-                goto exception;
-            if (JS_DefinePropertyValueInt64Const(ctx, tab, n++, str, JS_PROP_C_W_E | JS_PROP_THROW) < 0)
-                goto exception;
-            if (!JS_IsUndefined(namedCaptures)) {
-                if (JS_DefinePropertyValueInt64Const(ctx, tab, n++, namedCaptures, JS_PROP_C_W_E | JS_PROP_THROW) < 0)
-                    goto exception;
-            }
-            /* DELETED: the second copy of the phase-2 substitution. A function replacer is driven ONLY by
-               js_re_rep_step — the dispatch accepts any callable and covers both spellings, so nothing reaches
-               here. Re-implementing the loop as the "not recognized" case is the dual system that hides the step
-               machine's gaps; a call path landing here must be ROUTED, never re-implemented. */
-            DFAIL("RegExp.prototype[@@replace] reached the C entry with a FUNCTION replacer — route that call site "
-                  "onto the step machine (js_re_rep_step); this branch no longer exists");
-            rep_str = JS_EXCEPTION;
-        } else {
-            JSValue namedCaptures1;
-            if (!JS_IsUndefined(namedCaptures)) {
-                namedCaptures1 = JS_ToObject(ctx, namedCaptures);
-                if (JS_IsException(namedCaptures1))
-                    goto exception;
-            } else {
-                namedCaptures1 = JS_UNDEFINED;
-            }
-            args[0] = matched;
-            args[1] = str;
-            args[2] = js_int32(position);
-            args[3] = tab;
-            args[4] = namedCaptures1;
-            args[5] = rep_val;
-            JS_FreeValue(ctx, rep_str);
-            rep_str = js_string___GetSubstitution(ctx, JS_UNDEFINED, 6, args);
-            JS_FreeValue(ctx, namedCaptures1);
-        }
-        if (JS_IsException(rep_str))
-            goto exception;
-        if (position >= nextSourcePosition) {
-            string_buffer_concat(b, sp, nextSourcePosition, position);
-            string_buffer_concat_value(b, rep_str);
-            nextSourcePosition = position + JS_VALUE_GET_STRING(matched)->len;
-        }
-    }
-    string_buffer_concat(b, sp, nextSourcePosition, sp->len);
-    res = string_buffer_end(b);
-    goto done1;
-
-exception:
-    res = JS_EXCEPTION;
-done:
-    string_buffer_free(b);
-done1:
-    value_buffer_free(results);
-    JS_FreeValue(ctx, rep_val);
-    JS_FreeValue(ctx, matched);
-    JS_FreeValue(ctx, flags);
-    JS_FreeValue(ctx, tab);
-    JS_FreeValue(ctx, rep_str);
-    JS_FreeValue(ctx, namedCaptures);
-    JS_FreeValue(ctx, str);
-    return res;
-}
+/* The NO-CALLBACK path of 22.2.6.11 only: a non-function replacer, reached solely from js_re_rep_init. The
+   functional walk that used to live here is gone — that one is js_re_rep_step, and there is no longer a second
+   copy for a recognizer to choose against. */
 
 static JSValue js_regexp_Symbol_search(JSContext *ctx, JSValueConst this_val,
                                        int argc, JSValueConst *argv)
@@ -56170,7 +55902,7 @@ static const JSCFunctionListEntry js_regexp_proto_funcs[] = {
     JS_CFUNC_DEF("compile", 2, js_regexp_compile ),
     JS_CFUNC_DEF("test", 1, js_regexp_test ),
     JS_CFUNC_DEF("toString", 0, js_regexp_toString ),
-    JS_CFUNC_DEF("[Symbol.replace]", 2, js_regexp_Symbol_replace ),
+    JS_CFUNC_STEP_DEF("[Symbol.replace]", 2, 4 ),
     JS_CFUNC_DEF("[Symbol.match]", 1, js_regexp_Symbol_match ),
     JS_CFUNC_DEF("[Symbol.matchAll]", 1, js_regexp_Symbol_matchAll ),
     JS_CFUNC_DEF("[Symbol.search]", 1, js_regexp_Symbol_search ),
