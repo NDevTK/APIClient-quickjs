@@ -1538,7 +1538,12 @@ typedef struct JSCFunctionListEntry {
 /* Note: c++ does not like nested designators */
 #define JS_CFUNC_DEF(name, length, func1) { name, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE, JS_DEF_CFUNC, 0, { .func = { length, JS_CFUNC_generic, { .generic = func1 } } } }
 #define JS_CFUNC_DEF2(name, length, func1, prop_flags) { name, prop_flags, JS_DEF_CFUNC, 0, { .func = { length, JS_CFUNC_generic, { .generic = func1 } } } }
-#define JS_CFUNC_STEP_DEF(name, length, stepidx) { name, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE, JS_DEF_CFUNC, stepidx, { .func = { length, JS_CFUNC_step, { .generic = NULL } } } }
+/* `stepid` is a NAMED STEPDEF_* constant, so the registration line says which machine runs — the same readability
+   as JS_CFUNC_MAGIC_DEF naming its C function — and a designated-initializer table makes inserting a row
+   incapable of silently repointing an existing one. The step def is NOT stored in JSCFunctionType: that union
+   holds function pointers, and putting a data pointer in it is a strict-aliasing violation that survives -O0 and
+   segfaults at -O1 (measured: -fno-strict-aliasing passed, plain -O1 crashed). */
+#define JS_CFUNC_STEP_DEF(name, length, stepid) { name, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE, JS_DEF_CFUNC, stepid, { .func = { length, JS_CFUNC_step, { .generic = NULL } } } }
 #define JS_CFUNC_MAGIC_DEF(name, length, func1, magic) { name, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE, JS_DEF_CFUNC, magic, { .func = { length, JS_CFUNC_generic_magic, { .generic_magic = func1 } } } }
 #define JS_CFUNC_SPECIAL_DEF(name, length, cproto, func1) { name, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE, JS_DEF_CFUNC, 0, { .func = { length, JS_CFUNC_ ## cproto, { .cproto = func1 } } } }
 #define JS_ITERATOR_NEXT_DEF(name, length, func1, magic) { name, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE, JS_DEF_CFUNC, magic, { .func = { length, JS_CFUNC_iterator_next, { .iterator_next = func1 } } } }

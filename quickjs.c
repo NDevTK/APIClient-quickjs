@@ -49269,16 +49269,31 @@ static JSValue js_array_find_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
-/* Not an allowlist: a row exists because the builtin IS a step machine, and its magic indexes its own row. There
-   is no legacy implementation for a missing row to fall back to — a builtin absent here simply has no definition. */
-static const JSTrampStepDef js_tramp_step_defs[] = {
-    { js_array_find_init, js_array_find_step, js_array_find_fini, ArrayFind },
-    { js_array_find_init, js_array_find_step, js_array_find_fini, ArrayFindIndex },
-    { js_array_find_init, js_array_find_step, js_array_find_fini, ArrayFindLast },
-    { js_array_find_init, js_array_find_step, js_array_find_fini, ArrayFindLastIndex },
-    { js_re_rep_init,     js_re_rep_vstep,    js_re_rep_fini,     0 },   /* RegExp.prototype[@@replace] */
-    { js_str_replace_init, js_str_replace_vstep, js_str_replace_fini, 0 },   /* String.prototype.replace */
-    { js_str_replace_init, js_str_replace_vstep, js_str_replace_fini, 1 },   /* String.prototype.replaceAll */
+enum {   /* the STEPDEF_* ids used at the registration sites */
+    STEPDEF_ARRAY_FIND, STEPDEF_ARRAY_FIND_INDEX, STEPDEF_ARRAY_FIND_LAST, STEPDEF_ARRAY_FIND_LAST_INDEX,
+    STEPDEF_RE_REPLACE, STEPDEF_STR_REPLACE, STEPDEF_STR_REPLACE_ALL, STEPDEF_COUNT
+};
+/* One NAMED definition per builtin, referenced by its JS_CFUNC_STEP_DEF registration through the id above — the same shape as
+   JS_CFUNC_MAGIC_DEF naming its C function, so the registration line tells you what runs. An index into a side
+   table would be a second list to keep in sync and a magic number that silently repoints when a row is inserted. */
+static const JSTrampStepDef js_array_find_def          = { js_array_find_init, js_array_find_step, js_array_find_fini, ArrayFind };
+static const JSTrampStepDef js_array_findIndex_def     = { js_array_find_init, js_array_find_step, js_array_find_fini, ArrayFindIndex };
+static const JSTrampStepDef js_array_findLast_def      = { js_array_find_init, js_array_find_step, js_array_find_fini, ArrayFindLast };
+static const JSTrampStepDef js_array_findLastIndex_def = { js_array_find_init, js_array_find_step, js_array_find_fini, ArrayFindLastIndex };
+static const JSTrampStepDef js_re_replace_def          = { js_re_rep_init, js_re_rep_vstep, js_re_rep_fini, 0 };
+static const JSTrampStepDef js_str_replace_def         = { js_str_replace_init, js_str_replace_vstep, js_str_replace_fini, 0 };
+static const JSTrampStepDef js_str_replaceAll_def      = { js_str_replace_init, js_str_replace_vstep, js_str_replace_fini, 1 };
+
+/* Designated initializers, so each row states WHICH id it serves. Inserting a builtin cannot silently repoint an
+   existing registration the way a positional table would. */
+static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
+    [STEPDEF_ARRAY_FIND]            = &js_array_find_def,
+    [STEPDEF_ARRAY_FIND_INDEX]      = &js_array_findIndex_def,
+    [STEPDEF_ARRAY_FIND_LAST]       = &js_array_findLast_def,
+    [STEPDEF_ARRAY_FIND_LAST_INDEX] = &js_array_findLastIndex_def,
+    [STEPDEF_RE_REPLACE]            = &js_re_replace_def,
+    [STEPDEF_STR_REPLACE]           = &js_str_replace_def,
+    [STEPDEF_STR_REPLACE_ALL]       = &js_str_replaceAll_def,
 };
 
 static const JSTrampStepDef *tramp_step_def_of(JSValueConst func)
@@ -49288,9 +49303,9 @@ static const JSTrampStepDef *tramp_step_def_of(JSValueConst func)
     fp = JS_VALUE_GET_OBJ(func);
     if (fp->class_id != JS_CLASS_C_FUNCTION) return NULL;
     if (fp->u.cfunc.cproto != JS_CFUNC_step) return NULL;
-    DCHECK((unsigned)fp->u.cfunc.magic < countof(js_tramp_step_defs),
-           "JS_CFUNC_STEP_DEF magic is out of range of the step table");
-    return &js_tramp_step_defs[fp->u.cfunc.magic];
+    DCHECK((unsigned)fp->u.cfunc.magic < STEPDEF_COUNT, "JS_CFUNC_STEP_DEF id is out of range");
+    DCHECK(js_tramp_step_defs[fp->u.cfunc.magic] != NULL, "STEPDEF id has no table row");
+    return js_tramp_step_defs[fp->u.cfunc.magic];
 }
 
 static JSValue js_array_toString(JSContext *ctx, JSValueConst this_val,
@@ -51360,10 +51375,10 @@ static const JSCFunctionListEntry js_array_proto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("reduce", 1, js_array_reduce, special_reduce ),
     JS_CFUNC_MAGIC_DEF("reduceRight", 1, js_array_reduce, special_reduceRight ),
     JS_CFUNC_DEF("fill", 1, js_array_fill ),
-    JS_CFUNC_STEP_DEF("find", 1, ArrayFind ),
-    JS_CFUNC_STEP_DEF("findIndex", 1, ArrayFindIndex ),
-    JS_CFUNC_STEP_DEF("findLast", 1, ArrayFindLast ),
-    JS_CFUNC_STEP_DEF("findLastIndex", 1, ArrayFindLastIndex ),
+    JS_CFUNC_STEP_DEF("find", 1, STEPDEF_ARRAY_FIND ),
+    JS_CFUNC_STEP_DEF("findIndex", 1, STEPDEF_ARRAY_FIND_INDEX ),
+    JS_CFUNC_STEP_DEF("findLast", 1, STEPDEF_ARRAY_FIND_LAST ),
+    JS_CFUNC_STEP_DEF("findLastIndex", 1, STEPDEF_ARRAY_FIND_LAST_INDEX ),
     JS_CFUNC_DEF("indexOf", 1, js_array_indexOf ),
     JS_CFUNC_DEF("lastIndexOf", 1, js_array_lastIndexOf ),
     JS_CFUNC_DEF("includes", 1, js_array_includes ),
@@ -53570,8 +53585,8 @@ static const JSCFunctionListEntry js_string_proto_funcs[] = {
     JS_CFUNC_DEF("substr", 2, js_string_substr ),
     JS_CFUNC_DEF("slice", 2, js_string_slice ),
     JS_CFUNC_DEF("repeat", 1, js_string_repeat ),
-    JS_CFUNC_STEP_DEF("replace", 2, 5 ),
-    JS_CFUNC_STEP_DEF("replaceAll", 2, 6 ),
+    JS_CFUNC_STEP_DEF("replace", 2, STEPDEF_STR_REPLACE ),
+    JS_CFUNC_STEP_DEF("replaceAll", 2, STEPDEF_STR_REPLACE_ALL ),
     JS_CFUNC_MAGIC_DEF("padEnd", 1, js_string_pad, 1 ),
     JS_CFUNC_MAGIC_DEF("padStart", 1, js_string_pad, 0 ),
     JS_CFUNC_MAGIC_DEF("trim", 0, js_string_trim, 3 ),
@@ -55910,7 +55925,7 @@ static const JSCFunctionListEntry js_regexp_proto_funcs[] = {
     JS_CFUNC_DEF("compile", 2, js_regexp_compile ),
     JS_CFUNC_DEF("test", 1, js_regexp_test ),
     JS_CFUNC_DEF("toString", 0, js_regexp_toString ),
-    JS_CFUNC_STEP_DEF("[Symbol.replace]", 2, 4 ),
+    JS_CFUNC_STEP_DEF("[Symbol.replace]", 2, STEPDEF_RE_REPLACE ),
     JS_CFUNC_DEF("[Symbol.match]", 1, js_regexp_Symbol_match ),
     JS_CFUNC_DEF("[Symbol.matchAll]", 1, js_regexp_Symbol_matchAll ),
     JS_CFUNC_DEF("[Symbol.search]", 1, js_regexp_Symbol_search ),
