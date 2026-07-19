@@ -18498,8 +18498,10 @@ typedef struct JSIterConsume {
        frees each, so the two can never drift. A field added to the struct but not to this list is shared by a fork
        and refcount-underflows on the second teardown. */
     uint8_t closing; /* 1 = the sink short-circuited: close the iterator on the tramp, then finish */
+    uint8_t cb_pending; /* ITERTERM: 1 = `res` on the next step entry is the CALLBACK's result, not an iterator result */
+    JSValue cb_value;   /* ITERTERM: the element held across a callback that runs on the tramp (owned) */
 } JSIterConsume;
-#define ITERCONS_OWNED(F) F(r) F(iter) F(next) F(adder) F(mapfn) F(mapfn_this)
+#define ITERCONS_OWNED(F) F(r) F(iter) F(next) F(adder) F(mapfn) F(mapfn_this) F(cb_value)
 /* NOTE: JSIteratorHelperData::cb_value is owned too — freed by the finalizer and cleared on every path below. */
 static int js_iter_consume_step(JSContext *ctx, struct JSIterConsume *s, JSValue res);
 static void js_iter_consume_end(JSContext *ctx, struct JSIterConsume *s);
@@ -20618,6 +20620,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->r = result;
                 s->iter = JS_UNDEFINED;
                 s->next = JS_UNDEFINED;
+                s->cb_value = JS_UNDEFINED;
                 s->adder = JS_UNDEFINED;
                 /* Array.from(items, mapfn, thisArg): dup the mapfn + thisArg (recognition checked mapfn callable). */
                 s->mapfn = (call_argc >= 2) ? js_dup(call_argv[1]) : JS_UNDEFINED;
@@ -20661,6 +20664,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->r = acc;
                 s->iter = js_dup(iterobj);
                 s->next = nextm;
+                s->cb_value = JS_UNDEFINED;   /* js_mallocz zero is NOT JS_UNDEFINED */
                 s->adder = JS_UNDEFINED;
                 s->mapfn = (call_argc >= 1) ? js_dup(call_argv[0]) : JS_UNDEFINED;
                 s->mapfn_this = JS_UNDEFINED;
@@ -20717,6 +20721,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->r = newset;                /* UNDEFINED for isSupersetOf — its boolean result is set at finish */
                 s->iter = JS_UNDEFINED;
                 s->next = JS_UNDEFINED;
+                s->cb_value = JS_UNDEFINED;
                 s->adder = js_dup(thisset);   /* symmetricDifference / isSupersetOf consult THIS per element */
                 s->mapfn = JS_UNDEFINED; s->mapfn_this = JS_UNDEFINED;
                 s->k = 1;                     /* isSupersetOf: found-so-far = true (unused by union/symmetricDifference) */
@@ -20865,6 +20870,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->r = obj;
                 s->iter = JS_UNDEFINED;
                 s->next = JS_UNDEFINED;
+                s->cb_value = JS_UNDEFINED;
                 s->adder = adder;
                 s->mapfn = JS_UNDEFINED; s->mapfn_this = JS_UNDEFINED;
                 s->k = 0;
@@ -20886,6 +20892,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->r = obj;
                 s->iter = JS_UNDEFINED;
                 s->next = JS_UNDEFINED;
+                s->cb_value = JS_UNDEFINED;
                 s->adder = JS_UNDEFINED; s->mapfn = JS_UNDEFINED; s->mapfn_this = JS_UNDEFINED;
                 s->k = 0;
                 s->sink = ITERCONS_OBJENTRIES;
@@ -20912,6 +20919,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->r = tmp;
                 s->iter = JS_UNDEFINED;
                 s->next = JS_UNDEFINED;
+                s->cb_value = JS_UNDEFINED;
                 s->adder = js_dup(ntgt);   /* the new_target/ctor, used at the finish to create the typed array */
                 /* TypedArray.from(gen, mapfn, thisArg): carry the mapfn; it is applied at the finish (via
                    js_typed_array_from on the collected array — spec map-after-create order), NOT during the collect. */
@@ -20936,6 +20944,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->r = js_dup(sp[-3]);            /* the array being built — a shared ref; appends land on sp[-3] too */
                 s->iter = JS_UNDEFINED;
                 s->next = JS_UNDEFINED;
+                s->cb_value = JS_UNDEFINED;
                 s->adder = JS_UNDEFINED;
                 s->mapfn = JS_UNDEFINED; s->mapfn_this = JS_UNDEFINED;
                 s->k = JS_VALUE_GET_INT(sp[-2]);  /* the current append position */
@@ -20964,6 +20973,27 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             JS_IteratorClose(ctx, s->iter, true);
                     }
                     js_iter_consume_end(ctx, s); js_free_rt(rt, s); goto exception;
+                }
+                if (st == 3) {
+                    /* run the ITERTERM callback ON THE TRAMP: [this=undefined, fn, element, index]. do_return
+                       re-enters this step (CONT_ITER_CONSUME) with the callback's result. */
+                    DCHECK(sp + 4 <= stack_buf + b->stack_size,
+                           "iterterm callback: operand push exceeds the frame's compiled stack_size");
+                    *sp++ = JS_UNDEFINED;
+                    *sp++ = js_dup(s->mapfn);
+                    *sp++ = js_dup(s->cb_value);
+                    *sp++ = js_int64(s->k - 1);
+                    call_argv = sp - 2; call_argc = 2; tramp_first = -2; tramp_is_tail = 0;
+                    tramp_cont_state = s; tramp_cont_kind = CONT_ITER_CONSUME;
+                    if (tramp_can_call(call_argv[-1])) goto do_tramp_call;
+                    tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;
+                    { JSValueConst cargs2[2]; JSValue cr;
+                      cargs2[0] = call_argv[0]; cargs2[1] = call_argv[1];
+                      cr = JS_Call(ctx, call_argv[-1], JS_UNDEFINED, 2, cargs2);
+                      for (i = -2; i < 2; i++) JS_FreeValue(ctx, call_argv[i]);
+                      sp -= 4;
+                      ret_val = cr;
+                      goto do_iter_consume_step; }
                 }
                 if (st == 2) {
                     /* the sink short-circuited (Set.prototype.isSupersetOf found a miss): spec IteratorClose, then
@@ -22006,6 +22036,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc = sf->cur_pc; sp = rtf->caller_sp;
                 cfirst = rtf->call_first; cargc = rtf->call_argc; itail = rtf->is_tail;
                 js_free_rt(rt, rtf);
+                if (rck == CONT_ITER_CONSUME) {
+                    /* the ITERTERM callback returned: drop its operands (do_tramp_call dup'd the args and recorded
+                       caller_sp ABOVE them) and resume the consume step with the result. */
+                    JSValue *cargv = sp - cargc;
+                    DCHECK(cargc - cfirst == 4, "iterterm callback frame has an unexpected operand shape");
+                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
+                    sp += cfirst - cargc;
+                    cont_st = rcs; cont_kind_cur = CONT_ITER_CONSUME;
+                    goto do_iter_consume_step;
+                }
                 if (rck == CONT_ITER_HELPER) {
                     /* the map/filter callback returned: resume the helper step with its result. do_tramp_call DUPS
                        the args, so the caller-stack operands are still owned here — free them BEFORE re-entering,
@@ -47518,6 +47558,35 @@ static JSValue js_array_from(JSContext *ctx, JSValueConst this_val,
    generator settle), so a generator loop over opaque input suspend/resumes here instead of driving to completion. */
 static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
 {
+    if (s->cb_pending) {
+        /* `res` is the ITERTERM callback's RESULT (it ran on the tramp), not an iterator result. */
+        JSValue value = s->cb_value, fret = res;
+        s->cb_pending = 0; s->cb_value = JS_UNDEFINED;
+        if (JS_IsException(fret)) { JS_FreeValue(ctx, value); return -1; }
+        switch (s->setop) {
+        case ITERTERM_FOREACH:
+            JS_FreeValue(ctx, fret); JS_FreeValue(ctx, value);
+            return 1;
+        case ITERTERM_REDUCE:
+            JS_FreeValue(ctx, value);
+            JS_FreeValue(ctx, s->r);
+            s->r = fret;
+            return 1;
+        case ITERTERM_SOME:
+            JS_FreeValue(ctx, value);
+            if (!JS_ToBoolFree(ctx, fret)) return 1;
+            s->r = js_bool(true); s->closing = 1; return 2;
+        case ITERTERM_EVERY:
+            JS_FreeValue(ctx, value);
+            if (JS_ToBoolFree(ctx, fret)) return 1;
+            s->r = js_bool(false); s->closing = 1; return 2;
+        default:
+            DCHECK(s->setop == ITERTERM_FIND, "ITERTERM callback resume: unknown terminal rule");
+            if (!JS_ToBoolFree(ctx, fret)) { JS_FreeValue(ctx, value); return 1; }
+            JS_FreeValue(ctx, s->r);
+            s->r = value; s->closing = 1; return 2;
+        }
+    }
     if (s->closing) {   /* the short-circuit close has run (result already decided): finish */
         if (JS_VALUE_GET_TAG(res) != JS_TAG_UNINITIALIZED) JS_FreeValue(ctx, res);
         if (s->sink == ITERCONS_SETOP && s->setop == SETOP_SUPERSET) s->r = js_bool(s->k != 0);
@@ -47605,28 +47674,12 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
                 s->r = fret;
                 return 1;
             }
-            args[0] = value; args[1] = idx;
-            fret = JS_Call(ctx, s->mapfn, JS_UNDEFINED, 2, args);
+            /* the callback must run ON THE TRAMP: hold the element and hand the call to do_iter_consume_step. */
             JS_FreeValue(ctx, idx);
-            if (JS_IsException(fret)) { JS_FreeValue(ctx, value); return -1; }
-            switch (s->setop) {
-            case ITERTERM_FOREACH:
-                JS_FreeValue(ctx, fret); JS_FreeValue(ctx, value);
-                return 1;
-            case ITERTERM_SOME:
-                JS_FreeValue(ctx, value);
-                if (!JS_ToBoolFree(ctx, fret)) return 1;
-                s->r = js_bool(true); s->closing = 1; return 2;
-            case ITERTERM_EVERY:
-                JS_FreeValue(ctx, value);
-                if (JS_ToBoolFree(ctx, fret)) return 1;
-                s->r = js_bool(false); s->closing = 1; return 2;
-            default:   /* ITERTERM_FIND */
-                DCHECK(s->setop == ITERTERM_FIND, "ITERTERM: unknown terminal rule");
-                if (!JS_ToBoolFree(ctx, fret)) { JS_FreeValue(ctx, value); return 1; }
-                JS_FreeValue(ctx, s->r);
-                s->r = value; s->closing = 1; return 2;
-            }
+            DCHECK(JS_IsUndefined(s->cb_value), "ITERTERM callback value already held");
+            s->cb_value = value;
+            s->cb_pending = 1;
+            return 3;
         } else if (s->sink == ITERCONS_SETOP) {
             /* Set.prototype.union / symmetricDifference: fold setlike.keys() into r (already seeded with THIS set's
                records). The spec mutates r's [[SetData]] directly — an observable r.add must NOT be called. */
