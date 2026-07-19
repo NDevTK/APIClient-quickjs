@@ -18687,6 +18687,72 @@ static int js_tramp_proxy_get(JSContext *ctx, JSValue *sp_obj_slot, JSAtom atom,
     out_extra[3] = recv;                     /* [2]  receiver */
     return 1;
 }
+/* PROXY [[Call]]: resolve the `apply` trap at the operator site and dispatch it on THIS chain as
+   trap(target, thisArg, argArray) with `this` = handler. With NO trap the call forwards to the TARGET, which is
+   itself re-dispatched here, so recursion through a proxy reference is unbounded. [[Call]] has no result invariant
+   (unlike [[Get]]/[[Construct]]), so no continuation is needed — do_return places the trap's result where the call's
+   result belongs. Returns 1 = routed as a 3-arg method call (operands written at out_slots[0..3]),
+   2 = no trap, forward to `*out_target`, 0 = not a proxy / non-bytecode trap, -1 = pending exception. */
+static bool tramp_resolve_proxy_callee(JSContext *ctx, JSValueConst func, JSValue *out);
+static int js_tramp_proxy_apply(JSContext *ctx, JSValueConst func_obj, JSValueConst this_obj,
+                                int argc, JSValueConst *argv,
+                                JSValue *out_slots /* 4: handler, trap, target, thisArg, argArray via [0..3] */,
+                                JSValue *out_target)
+{
+    JSProxyData *s;
+    JSValue method, arr;
+    *out_target = JS_UNDEFINED;
+    if (JS_VALUE_GET_TAG(func_obj) != JS_TAG_OBJECT
+        || JS_VALUE_GET_OBJ(func_obj)->class_id != JS_CLASS_PROXY) return 0;
+    s = get_proxy_method(ctx, &method, func_obj, JS_ATOM_apply);
+    if (!s) return -1;
+    if (!s->is_func) { JS_FreeValue(ctx, method); JS_ThrowTypeErrorNotAFunction(ctx); return -1; }
+    if (JS_IsUndefined(method)) {
+        /* no trap: forward to the target — and keep walking, so a proxy wrapping a proxy wrapping a function
+           resolves to the ultimate callee in one step instead of falling to the C path at the second hop. */
+        JS_FreeValue(ctx, method);
+        if (!tramp_resolve_proxy_callee(ctx, func_obj, out_target)) return -1;
+        DCHECK(!JS_IsUndefined(*out_target), "no-trap proxy walk must reach a callee");
+        return 2;
+    }
+    if (!tramp_can_call(method)) { JS_FreeValue(ctx, method); return 0; }   /* C/bound trap: no preemptible body */
+    arr = js_create_array(ctx, argc, argv);
+    if (JS_IsException(arr)) { JS_FreeValue(ctx, method); return -1; }
+    out_slots[0] = js_dup(s->handler);   /* this */
+    out_slots[1] = method;               /* trap (owned) */
+    out_slots[2] = js_dup(s->target);
+    out_slots[3] = js_dup(this_obj);
+    out_slots[4] = arr;
+    return 1;
+}
+/* Resolve a callee through PROXIES for the apply/Reflect.apply paths, which dispatch a normal bytecode target
+   directly. [[Call]] on a proxy reads its `apply` trap, so reading it here is the spec's own order; when the trap is
+   absent the call forwards to the target, and that walk continues (a proxy wrapping a proxy wrapping a function).
+   A PRESENT trap declines (*out stays JS_UNDEFINED) — that shape is routed at the call site instead.
+   Returns false on a revoked proxy / throwing handler-get, with the exception pending. */
+static bool tramp_resolve_proxy_callee(JSContext *ctx, JSValueConst func, JSValue *out)
+{
+    JSValueConst cur = func;
+    int guard = 0;
+    *out = JS_UNDEFINED;
+    while (JS_VALUE_GET_TAG(cur) == JS_TAG_OBJECT
+           && JS_VALUE_GET_OBJ(cur)->class_id == JS_CLASS_PROXY) {
+        JSProxyData *s;
+        JSValue method;
+        DCHECK(++guard < 10000, "proxy callee resolution did not terminate");
+        s = get_proxy_method(ctx, &method, cur, JS_ATOM_apply);
+        if (!s) return false;                       /* revoked / handler get threw */
+        if (!JS_IsUndefined(method)) { JS_FreeValue(ctx, method); break; }   /* trap here: stop AT this proxy */
+        JS_FreeValue(ctx, method);
+        if (!s->is_func) { JS_ThrowTypeErrorNotAFunction(ctx); return false; }
+        cur = s->target;
+    }
+    /* Always yields the node the walk STOPPED at — a plain callee, or the proxy whose trap must run. The caller
+       re-dispatches it, so a no-trap proxy wrapping a TRAP-bearing proxy routes the inner trap instead of being
+       collapsed past it. */
+    *out = js_dup(cur);
+    return true;
+}
 static inline bool tramp_is_call_function(JSValueConst method) {
     JSObject *mp;
     if (JS_VALUE_GET_TAG(method) != JS_TAG_OBJECT) return false;
@@ -19534,6 +19600,37 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_is_call_function(call_argv[-1]) && call_argc >= 2) {   /* builtins' call(thisArg,f,...) -> dispatch f here */
                     tramp_is_tail = (opcode == OP_tail_call); goto do_forward_callfn;
                 }
+                {   /* PROXY [[Call]]: run the apply trap (or the bare target) on THIS chain */
+                    JSValue px[5], ptgt; int px_ret;
+                    DCHECK(sp + 4 <= stack_buf + b->stack_size,
+                           "proxy apply trap: operand reshape exceeds the frame's compiled stack_size");
+                    px_ret = js_tramp_proxy_apply(ctx, call_argv[-1], JS_UNDEFINED,
+                                                  call_argc, vc(call_argv), px, &ptgt);
+                    while (px_ret == 2) {   /* no trap: forward to the resolved callee; it may itself be a proxy
+                                               whose trap must run, so re-resolve in THIS operand shape rather than
+                                               cross-jumping into the [this,f,args] dispatcher. */
+                        JSValue *A = (JSValue *)call_argv;
+                        JS_FreeValue(ctx, A[-1]);
+                        A[-1] = ptgt;
+                        px_ret = js_tramp_proxy_apply(ctx, call_argv[-1], JS_UNDEFINED,
+                                                      call_argc, vc(call_argv), px, &ptgt);
+                    }
+                    if (unlikely(px_ret < 0)) goto exception;
+                    if (px_ret == 1) {                      /* trap(target, thisArg, argArray), this = handler */
+                        JSValue *A = (JSValue *)call_argv;
+                        for (i = 0; i < call_argc; i++) JS_FreeValue(ctx, A[i]);
+                        JS_FreeValue(ctx, A[-1]);           /* the proxy itself */
+                        A[-1] = px[0];                      /* [-2] of the new shape: this = handler */
+                        A[0]  = px[1];                      /* [-1]: the trap */
+                        A[1]  = px[2];                      /* args: target */
+                        A[2]  = px[3];                      /*       thisArg */
+                        A[3]  = px[4];                      /*       argArray */
+                        sp = A + 4;
+                        call_argv = A + 1; call_argc = 3; tramp_first = -2;
+                        tramp_is_tail = (opcode == OP_tail_call);
+                        goto do_tramp_call;
+                    }
+                }
                 /* Same-realm only: js_call_c_function would switch to the eval function's realm, so a cross-realm
                    (0,evalFromOtherRealm)(src) must keep the C path — its program belongs to THAT realm's global. */
                 if (tramp_is_global_eval(call_argv[-1]) && call_argc >= 1 && JS_IsString(call_argv[0])
@@ -20043,6 +20140,36 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         do_forward_dispatch:
             /* operands are now the method-call shape [this, f, a0..]: dispatch f on THIS chain. */
             {
+                if (unlikely(JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT
+                             && JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_PROXY)) {
+                    /* PROXY [[Call]] reached through .call/.apply/Reflect.apply/js_call_function: resolve it HERE so
+                       every forwarded shape behaves like a direct call — no-trap proxies collapse to the ultimate
+                       callee, a trap becomes trap(target, thisArg, argArray) on this chain. */
+                    JSValue px[5], ptgt; int px_ret;
+                    DCHECK(sp + 3 <= stack_buf + b->stack_size,
+                           "proxy forward dispatch: operand reshape exceeds the frame's compiled stack_size");
+                    px_ret = js_tramp_proxy_apply(ctx, call_argv[-1], call_argv[-2],
+                                                  call_argc, vc(call_argv), px, &ptgt);
+                    while (px_ret == 2) {                   /* no trap: same shape, resolved callee (may be a
+                                                               trap-bearing proxy -> resolve again) */
+                        JS_FreeValue(ctx, (JSValue)call_argv[-1]);
+                        ((JSValue *)call_argv)[-1] = ptgt;
+                        px_ret = js_tramp_proxy_apply(ctx, call_argv[-1], call_argv[-2],
+                                                      call_argc, vc(call_argv), px, &ptgt);
+                    }
+                    if (unlikely(px_ret < 0)) goto exception;
+                    if (px_ret == 1) {
+                        JSValue *A = (JSValue *)call_argv;
+                        for (i = 0; i < call_argc; i++) JS_FreeValue(ctx, A[i]);
+                        JS_FreeValue(ctx, A[-2]);           /* old this */
+                        JS_FreeValue(ctx, A[-1]);           /* the proxy */
+                        A[-2] = px[0];                      /* this = handler */
+                        A[-1] = px[1];                      /* the trap */
+                        A[0]  = px[2]; A[1] = px[3]; A[2] = px[4];   /* target, thisArg, argArray */
+                        sp = A + 3;
+                        call_argc = 3; tramp_first = -2;
+                    }
+                }
                 if (tramp_can_call(call_argv[-1])) goto do_tramp_call;
                 if (tramp_can_call_async(call_argv[-1])) goto do_async_tramp_call;
                 if (tramp_can_call_gen_create(call_argv[-1])) goto do_generator_create_tramp;
