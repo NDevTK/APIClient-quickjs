@@ -48325,10 +48325,12 @@ static bool tramp_can_call_iter_consume(JSContext *ctx, JSValueConst func, JSVal
        currently fails ONE case: Iterator/prototype/flatMap/iterable-primitives-are-not-flattened, through
        Array.from(5) where Number.prototype[@@iterator] is a generator. The abort is
        'drive-to-completion: coroutine body resumed off the tramp chain', so the missing capability is
-       driving a PRIMITIVE-boxed source whose @@iterator is a generator function through the consume
-       machine. Everything else the widening exposed is already built: IfAbruptCloseIterator (4fa2d2f)
-       plus the abrupt close for the FROM sink and the mapfn. Build the boxed-primitive path, widen,
-       delete the loop. */
+       a source reached through Array.from(5). MEASURED, not inferred: only the widened build aborts, and
+       that one line reproduces it alone. NOT yet explained — the widening's own tag check rejects a
+       non-object/non-string argument, so a number should not route through it at all; the mechanism is
+       therefore still unknown and the first step is finding what actually routes it, NOT assuming the
+       boxed-primitive path. Everything else the widening exposed is already built: IfAbruptCloseIterator
+       (4fa2d2f) plus the abrupt close for the FROM sink and the mapfn. */
     return iter_consume_gen_backed(ctx, call_argv[0], out_getiter);
 }
 
