@@ -25373,8 +25373,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             /* the throwing frame was a C-builtin-driven CALLBACK: abandon the iteration (its state owns the
                object/accumulator/element) and re-raise in the builtin's ORIGINAL caller, whose stack still holds
                the OP_call operands for its own catch-search to free. */
-            if (xck == CONT_ITER_CONSUME && ((struct JSIterConsume *)xcs)->sink == ITERCONS_ITERTERM
-                && !JS_IsUndefined(((struct JSIterConsume *)xcs)->iter)) {
+            /* ANY consumer whose callback threw, not just an Iterator.prototype terminal: Array.from's mapfn is
+               equally an IfAbruptCloseIterator site (Array/from/iter-map-fn-err observes return() being called).
+               Restricting this to ITERTERM was safe only while the other sinks were narrowed to generator-backed
+               sources, which close through their own machinery — i.e. the restriction was part of the same
+               fallback the narrowing enforced. */
+            if (xck == CONT_ITER_CONSUME
+                && !JS_IsUndefined(((struct JSIterConsume *)xcs)->iter)
+                && (((struct JSIterConsume *)xcs)->sink == ITERCONS_ITERTERM
+                    || !(JS_VALUE_GET_TAG(((struct JSIterConsume *)xcs)->iter) == JS_TAG_OBJECT
+                         && JS_VALUE_GET_OBJ(((struct JSIterConsume *)xcs)->iter)->class_id == JS_CLASS_GENERATOR))) {
+                /* A GENERATOR source in a non-terminal sink already closes through its own machinery, and forcing
+                   IteratorClose on it here resumes its body OFF the tramp (the drive-to-completion DFAIL). Only a
+                   PLAIN iterator was being missed — which is the case Array/from/iter-map-fn-err observes. */
                 /* an Iterator.prototype terminal's callback THREW: same IfAbruptCloseIterator obligation. A generator
                    source closes on the tramp via the exception label's deferral; anything else closes inline. */
                 struct JSIterConsume *cs2 = (struct JSIterConsume *)xcs;
@@ -48025,11 +48036,19 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
         JSValue value = s->cb_value, fret = res;
         uint8_t which = s->cb_pending;
         s->cb_pending = 0; s->cb_value = JS_UNDEFINED;
-        if (JS_IsException(fret)) { JS_FreeValue(ctx, value); return -1; }
+        /* Array.from's mapfn threw: IfAbruptCloseIterator, close the source before propagating
+           (Array/from/iter-map-fn-err). An Iterator.prototype terminal's callback keeps returning -1 — its close
+           is already handled by the unwind arm's deferral, and routing it through this path instead resumed a
+           generator's return() off the tramp. */
+        if (JS_IsException(fret)) {
+            JS_FreeValue(ctx, value);
+            if (which == 2) { s->abrupt = 1; return 2; }
+            return -1;
+        }
         if (which == 2) {   /* Array.from's mapfn: the RESULT is the element to append */
             JS_FreeValue(ctx, value);
             if (JS_DefinePropertyValueInt64(ctx, s->r, s->k, fret, JS_PROP_C_W_E | JS_PROP_THROW) < 0)
-                return -1;   /* consumed fret */
+                { s->abrupt = 1; return 2; }   /* consumed fret; close before propagating */
             s->k++;
             return 1;
         }
@@ -48204,7 +48223,7 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
                 return 3;
             }
             if (JS_DefinePropertyValueInt64(ctx, s->r, s->k, value, JS_PROP_C_W_E | JS_PROP_THROW) < 0)
-                return -1;   /* DefinePropertyValueInt64 consumed `value` */
+                { s->abrupt = 1; return 2; }   /* consumed `value`; IfAbruptCloseIterator (Array/from/iter-set-elem-prop-err) */
         }
         s->k++;
     }
@@ -48298,6 +48317,18 @@ static bool tramp_can_call_iter_consume(JSContext *ctx, JSValueConst func, JSVal
     /* a mapfn arg, if present and not undefined, MUST be callable — else Array.from throws EARLY (before GetIterator);
        leave that to the normal path rather than routing. thisArg (argv[2]) is free. */
     if (call_argc >= 2 && !JS_IsUndefined(call_argv[1]) && !JS_IsFunction(ctx, call_argv[1])) return false;
+    /* ANY callable @@iterator. Array.from also accepts ARRAY-LIKES (no @@iterator at all, driven by length +
+       indices) — that is a different algorithm, not an iteration, so it stays in the C entry; the machine claims
+       only the iterable case. */
+    /* NAMED GAP - do not widen this again without building it first.
+       Widening Array.from to any callable @@iterator is correct and the C loop should die with it. It
+       currently fails ONE case: Iterator/prototype/flatMap/iterable-primitives-are-not-flattened, through
+       Array.from(5) where Number.prototype[@@iterator] is a generator. The abort is
+       'drive-to-completion: coroutine body resumed off the tramp chain', so the missing capability is
+       driving a PRIMITIVE-boxed source whose @@iterator is a generator function through the consume
+       machine. Everything else the widening exposed is already built: IfAbruptCloseIterator (4fa2d2f)
+       plus the abrupt close for the FROM sink and the mapfn. Build the boxed-primitive path, widen,
+       delete the loop. */
     return iter_consume_gen_backed(ctx, call_argv[0], out_getiter);
 }
 
