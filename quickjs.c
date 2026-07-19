@@ -18276,6 +18276,29 @@ typedef struct JSPromiseExec {
     int orig_cfirst, orig_cargc; /* the ORIGINAL OP_call_constructor operand shape (pop at finish) */
 } JSPromiseExec;
 static bool tramp_can_call_promise_exec(JSValueConst func, JSValueConst *call_argv, int call_argc);
+#define CONT_STR_REPLACE   15  /* cont_state = JSStrReplace: String.prototype.replace/replaceAll with a FUNCTION
+                                  replacer. The builtin holds a StringBuffer + endOfLastMatch across each callback,
+                                  so the callback dispatch is hooked into the flow machinery (the builtin stays in
+                                  C) — replaceAll's loop is preemptible at every callback boundary, and the
+                                  replacer's own body at every back-edge. */
+typedef struct JSStrReplace {
+    JSValue str;            /* the subject string (owned) */
+    JSValue search_str;     /* the search string (owned) */
+    JSValue result;         /* DONE: the finished string (owned, handed to the caller) */
+    StringBuffer b;         /* the accumulator */
+    JSValue cb_args[5];     /* [this=undefined, fn, search_str, pos, str] — args live HERE, so sp is untouched */
+    int endOfLastMatch;
+    int pos;
+    uint8_t is_first;
+    uint8_t is_replaceAll;
+    uint8_t cb_pending;     /* 1 = the value delivered to the next step is the replacer's result */
+    int orig_cfirst, orig_cargc; uint8_t orig_is_tail;   /* the ORIGINAL OP_call_method operand shape */
+} JSStrReplace;
+static JSValue js_string_replace(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int is_replaceAll);
+static int js_str_replace_step(JSContext *ctx, JSStrReplace *s, JSValue cb_result);
+static void js_str_replace_end(JSContext *ctx, JSStrReplace *s, bool take_result);
+static bool tramp_can_call_str_replace(JSValueConst func, JSValueConst this_val,
+                                       JSValueConst *call_argv, int call_argc, int *out_is_all);
 static JSValue js_promise_constructor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv);
 static JSValue js_promise_new(JSContext *ctx, JSValueConst new_target, JSValue *resolving_funcs);
 #define CONT_ITER_FROM     12  /* cont_state = JSIterFrom: Iterator.from(obj) — GetIterator(obj) is performed by the
@@ -19073,6 +19096,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        driving its executor to completion — the same builtin suspending on one path and not the other. */
     JSValueConst pe_ntgt = JS_UNDEFINED, pe_executor = JS_UNDEFINED;
     int pe_cfirst = 0, pe_cargc = 0; JSValue pe_super_ref = JS_UNDEFINED;
+    int srep_is_all = 0;                                /* str.replace vs replaceAll (the builtin's magic), read at OP_call_method */
     /* apply/spread trampoline (do_apply_tramp): set by the .apply method call or the OP_apply spread before goto.
        ap_cfirst/ap_cargc parameterize do_return's operand cleanup for the two operand shapes. */
     JSValueConst ap_func = JS_UNDEFINED, ap_this = JS_UNDEFINED, ap_array = JS_UNDEFINED;
@@ -19800,6 +19824,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_json_parse(call_argv[-1], call_argc, vc(call_argv))) {   /* JSON.parse(s,reviver) -> reviver walk on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_json_revive_tramp;
                 }
+                if (tramp_can_call_str_replace(call_argv[-1], call_argv[-2], vc(call_argv), call_argc, &srep_is_all)) {   /* str.replace(s,fn) -> replacer drive on THIS chain */
+                    tramp_is_tail = (opcode == OP_tail_call_method); goto do_str_replace_tramp;
+                }
                 if (tramp_can_call_iter_consume(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter)) {   /* Array.from(iterable) -> GetIterator + consume on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_iter_consume_tramp;
                 }
@@ -20502,6 +20529,51 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 cont_st = s; cont_kind_cur = CONT_ARRAY_REDUCE;
                 ret_val = JS_UNDEFINED;
                 goto do_array_reduce_step;
+            }
+
+        do_str_replace_tramp:
+            /* 22.1.3.19 with a function replacer: build the state, then let the shared step decide the first match.
+               The args live in the state (cb_args), so sp is untouched and the ORIGINAL operands stay where the
+               finish pops them. */
+            {
+                JSStrReplace *s = js_mallocz_rt(rt, sizeof(*s));
+                if (unlikely(!s)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                s->str = js_dup(call_argv[-2]);
+                s->search_str = js_dup(call_argv[0]);
+                s->result = JS_UNDEFINED;
+                string_buffer_init(ctx, &s->b, 0);
+                s->endOfLastMatch = 0; s->pos = 0;
+                s->is_first = 1; s->is_replaceAll = srep_is_all; s->cb_pending = 0;
+                s->cb_args[1] = call_argv[1];   /* the replacer (borrowed: an original operand) */
+                s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
+                cont_st = s; cont_kind_cur = CONT_STR_REPLACE;
+                ret_val = JS_UNDEFINED;
+                goto do_str_replace_step;
+            }
+
+        do_str_replace_step:
+            {
+                JSStrReplace *s = (JSStrReplace *)cont_st;
+                int st = js_str_replace_step(ctx, s, ret_val);
+                if (unlikely(st < 0)) { js_str_replace_end(ctx, s, false); js_free_rt(rt, s); goto exception; }
+                if (st == 0) {   /* DONE: the rebuilt string is the result */
+                    JSValue r = s->result;
+                    int cfirst = s->orig_cfirst, cargc = s->orig_cargc;
+                    uint8_t itail = s->orig_is_tail;
+                    JSValue *cargv = sp - cargc;
+                    js_str_replace_end(ctx, s, true);
+                    js_free_rt(rt, s);
+                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
+                    sp += cfirst - cargc;
+                    if (itail) { ret_val = r; goto do_return; }
+                    *sp++ = r;
+                    BREAK;
+                }
+                DCHECK(st == 3, "str.replace step: unknown step code");
+                call_argv = (JSValueConst *)&s->cb_args[2];
+                call_argc = 3; tramp_first = -2; tramp_is_tail = 0;
+                tramp_cont_state = s; tramp_cont_kind = CONT_STR_REPLACE;
+                goto do_tramp_call;   /* the recognizer guarantees a bytecode replacer */
             }
 
         do_array_reduce_step:
@@ -22230,6 +22302,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        (borrowed), NOT on the caller's stack — so skip the cargv arg-free, and feed the result to
                        that builtin's STEP instead of pushing it. The step drives the next element or finishes. */
                     cont_st = rcs; cont_kind_cur = rck;
+                    if (rck == CONT_STR_REPLACE) goto do_str_replace_step;
                     if (rck == CONT_ARRAY_REDUCE) goto do_array_reduce_step;
                     if (rck == CONT_SORT) goto do_sort_step;
                     if (rck == CONT_JSON_REVIVE) goto do_json_revive_step;
@@ -25104,6 +25177,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 js_iter_consume_end(ctx, (struct JSIterConsume *)xcs);
             else if (xck == CONT_ARRAY_REDUCE)
                 js_array_reduce_end(ctx, (struct JSArrayReduce *)xcs, false);
+            else if (xck == CONT_STR_REPLACE)
+                js_str_replace_end(ctx, (JSStrReplace *)xcs, false);
             else
                 /* A bare `else` here used to tear the state down AS a JSArrayReduce. Any callback cont kind added
                    without an arm above would be freed through the wrong struct — silent heap corruption on the
@@ -25841,7 +25916,7 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                     ct->sf.arg_buf = &ns->cb_args[2];
             } else {
                 DCHECK(otf->cont_kind == CONT_NONE,
-                       "clone_deep_flow: deep-fork of this C-continuation kind (sort/json-revive/construct/agen) not built");
+                       "clone_deep_flow: deep-fork of this C-continuation kind (sort/json-revive/construct/agen/str-replace) not built");
             }
         }
         ct->up = (i == n - 1) ? NULL : ca[i + 1];
@@ -52389,6 +52464,101 @@ static JSValue js_string___GetSubstitution(JSContext *ctx, JSValueConst this_val
 exception:
     string_buffer_free(b);
     return JS_EXCEPTION;
+}
+
+/* String.prototype.replace / replaceAll with a FUNCTION replacer (22.1.3.19). The builtin holds a StringBuffer
+   accumulator, endOfLastMatch and the is_first flag ACROSS each callback invocation, so it is continuation-holding:
+   it cannot be call-site-unwrapped, and per §C-stack it stays in C while its callback dispatch is hooked into the
+   flow machinery. Drives one match per step; replaceAll's loop is therefore preemptible at every callback boundary
+   AND inside the callback body at every back-edge.
+   Only the STRING-searchValue path lives here. An OBJECT searchValue dispatches to @@replace (a different function
+   with a two-phase structure) and is deliberately NOT recognized — a separate step in its own right. */
+
+
+static void js_str_replace_end(JSContext *ctx, JSStrReplace *s, bool take_result)
+{
+    if (!take_result) {
+        string_buffer_free(&s->b);
+        JS_FreeValue(ctx, s->result);
+    }
+    JS_FreeValue(ctx, s->str);
+    JS_FreeValue(ctx, s->search_str);
+}
+
+/* 0 = DONE (s->result is the answer), 3 = CALL the replacer on the tramp, -1 = error.
+   Mirrors the C loop exactly, split at the one point where it re-enters JS. */
+static int js_str_replace_step(JSContext *ctx, JSStrReplace *s, JSValue cb_result)
+{
+    JSString *sp = JS_VALUE_GET_STRING(s->str);
+    JSString *searchp = JS_VALUE_GET_STRING(s->search_str);
+
+    if (s->cb_pending) {
+        /* the replacer returned: ToString its result, then splice it in at the recorded position */
+        JSValue repl = JS_ToString(ctx, cb_result);
+        JS_FreeValue(ctx, cb_result);
+        s->cb_pending = 0;
+        if (JS_IsException(repl))
+            return -1;
+        string_buffer_concat(&s->b, sp, s->endOfLastMatch, s->pos);
+        string_buffer_concat_value_free(&s->b, repl);
+        s->endOfLastMatch = s->pos + searchp->len;
+        s->is_first = 0;
+        if (!s->is_replaceAll)
+            goto finish;
+    }
+    for (;;) {
+        if (unlikely(searchp->len == 0)) {
+            if (s->is_first)
+                s->pos = 0;
+            else if (s->endOfLastMatch >= sp->len)
+                s->pos = -1;
+            else
+                s->pos = s->endOfLastMatch + 1;
+        } else {
+            s->pos = string_indexof(sp, searchp, s->endOfLastMatch);
+        }
+        if (s->pos < 0) {
+            if (s->is_first) {
+                /* no match at all: the ORIGINAL string is returned untouched (not a rebuilt copy) */
+                string_buffer_free(&s->b);
+                s->result = js_dup(s->str);
+                return 0;
+            }
+            break;
+        }
+        s->cb_args[0] = JS_UNDEFINED;                /* thisArgument */
+        s->cb_args[2] = s->search_str;               /* borrowed: matched */
+        s->cb_args[3] = js_int32(s->pos);            /* position */
+        s->cb_args[4] = s->str;                      /* borrowed: the whole string */
+        s->cb_pending = 1;
+        return 3;
+    }
+finish:
+    string_buffer_concat(&s->b, sp, s->endOfLastMatch, sp->len);
+    s->result = string_buffer_end(&s->b);
+    if (JS_IsException(s->result))
+        return -1;
+    return 0;
+}
+
+/* Recognized only when every operand is already a primitive of the right type: this_val a STRING (so no ToString
+   side effect is skipped), searchValue a STRING (an object would dispatch to @@replace), and the replacer a plain
+   bytecode function (a C/bound replacer has no preemptible body, so the ordinary path is already correct). */
+static bool tramp_can_call_str_replace(JSValueConst func, JSValueConst this_val,
+                                       JSValueConst *call_argv, int call_argc, int *out_is_all)
+{
+    JSObject *fp;
+    if (call_argc < 2) return false;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
+    fp = JS_VALUE_GET_OBJ(func);
+    if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
+    if (fp->u.cfunc.cproto != JS_CFUNC_generic_magic) return false;
+    if (fp->u.cfunc.c_function.generic_magic != js_string_replace) return false;
+    if (JS_VALUE_GET_TAG(this_val) != JS_TAG_STRING) return false;
+    if (JS_VALUE_GET_TAG(call_argv[0]) != JS_TAG_STRING) return false;
+    if (!tramp_can_call(call_argv[1])) return false;
+    *out_is_all = fp->u.cfunc.magic;
+    return true;
 }
 
 static JSValue js_string_replace(JSContext *ctx, JSValueConst this_val,
