@@ -18753,6 +18753,26 @@ static bool tramp_resolve_proxy_callee(JSContext *ctx, JSValueConst func, JSValu
     *out = js_dup(cur);
     return true;
 }
+/* f.apply(this,arr) / Reflect.apply(f,this,arr) where f is a GENERATOR FUNCTION: build the arg list here (the
+   array can be arbitrarily long, so it never touches the caller stack) and hand it to the create in apply mode.
+   Returns 1 armed, 0 not our shape, -1 pending exception. */
+static int tramp_arm_gen_apply(JSContext *ctx, JSValueConst func, JSValueConst thisArg, JSValueConst arrayArg,
+                               JSValue **out_argv, uint32_t *out_argc)
+{
+    JSValue *atab = NULL;
+    uint32_t alen = 0;
+    (void)thisArg;
+    if (!tramp_can_call_gen_create(func)) return 0;
+    if (JS_VALUE_GET_TAG(arrayArg) != JS_TAG_UNDEFINED && JS_VALUE_GET_TAG(arrayArg) != JS_TAG_NULL) {
+        atab = build_arg_list(ctx, &alen, arrayArg);   /* reads the array (may throw) */
+        if (!atab) return -1;
+    } else {
+        atab = js_malloc(ctx, sizeof(JSValue));        /* never NULL: NULL is the "not armed" sentinel */
+        if (!atab) return -1;
+    }
+    *out_argv = atab; *out_argc = alen;
+    return 1;
+}
 static inline bool tramp_is_call_function(JSValueConst method) {
     JSObject *mp;
     if (JS_VALUE_GET_TAG(method) != JS_TAG_OBJECT) return false;
@@ -19040,6 +19060,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     int smc_magic = 0;                                  /* new Set(gen)/new Map(gen) recognition: 0 = Map, MAGIC_SET = Set (read at OP_call_constructor, consumed by do_setmap_consume_tramp) */
     int ta_classid = 0;                                 /* new TypedArray(gen) recognition: the TA class (read at OP_call_constructor, consumed by do_ta_consume_tramp) */
     uint8_t setop_kind = 0;                             /* s.union/symmetricDifference recognition: SETOP_* (consumed by do_setop_consume_tramp) */
+    /* APPLY-mode generator create: f.apply(this,arr)/Reflect.apply(f,this,arr) where f is a GENERATOR FUNCTION. The
+       args come from the array into the generator's OWN frame (never the caller stack, which the array length could
+       overflow), so do_generator_create_tramp takes them explicitly instead of from call_argv. */
+    JSValueConst gc_apply_func = JS_UNDEFINED;
+    JSValueConst gc_apply_this = JS_UNDEFINED;
+    JSValue *gc_apply_argv = NULL;
+    uint32_t gc_apply_argc = 0;
     uint8_t iterterm_kind = 0;                          /* Iterator.prototype terminal recognition: ITERTERM_* (consumed by do_iterterm_tramp) */
     int ta_from = 0;                                    /* 1 = TypedArray.from(gen) (OP_call_method): new_target is this_val at call_argv[-2], not call_argv[-1] */
     int pa_magic = 0;                                   /* Promise.all/allSettled(gen) recognition: the PROMISE_MAGIC (read at OP_call_method, consumed by do_promise_all_consume_tramp) */
@@ -19772,6 +19799,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_is_function_call(call_argv[-1])) {   /* f.call(thisArg,...) -> resolve + dispatch f here */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_forward_call;
                 }
+                if (tramp_is_function_apply(call_argv[-1]) && tramp_can_call_gen_create(call_argv[-2])) {
+                    /* g.apply(this, arr) with g a GENERATOR FUNCTION: create on the tramp with the arg list. */
+                    JSValueConst aa2 = (call_argc >= 2) ? call_argv[1] : JS_UNDEFINED;
+                    int atag2 = JS_VALUE_GET_TAG(aa2);
+                    if (atag2 == JS_TAG_UNDEFINED || atag2 == JS_TAG_NULL || atag2 == JS_TAG_OBJECT) {
+                        int ga = tramp_arm_gen_apply(ctx, call_argv[-2],
+                                                     (call_argc >= 1) ? call_argv[0] : JS_UNDEFINED, aa2,
+                                                     &gc_apply_argv, &gc_apply_argc);
+                        if (unlikely(ga < 0)) goto exception;
+                        if (ga > 0) {
+                            gc_apply_func = call_argv[-2];
+                            gc_apply_this = (call_argc >= 1) ? call_argv[0] : JS_UNDEFINED;
+                            tramp_first = -2; tramp_is_tail = (opcode == OP_tail_call_method);
+                            goto do_generator_create_tramp;
+                        }
+                    }
+                }
                 if (tramp_is_function_apply(call_argv[-1]) && tramp_can_call(call_argv[-2])) {   /* f.apply(this,arr), f NORMAL */
                     /* only when arr is undefined/null (0 args) or an object (array-like); a primitive arr must
                        throw a realm-correct TypeError from the C js_function_apply BEFORE the target runs. */
@@ -19782,6 +19826,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         ap_this = (call_argc >= 1) ? call_argv[0] : JS_UNDEFINED;
                         ap_array = aa; ap_cfirst = -2; ap_cargc = call_argc;
                         tramp_is_tail = (opcode == OP_tail_call_method); goto do_apply_tramp;
+                    }
+                }
+                if (tramp_is_reflect_apply(call_argv[-1]) && call_argc >= 3
+                    && JS_VALUE_GET_TAG(call_argv[0]) == JS_TAG_OBJECT
+                    && JS_VALUE_GET_OBJ(call_argv[0])->class_id == JS_CLASS_PROXY) {
+                    /* Reflect.apply(proxy, ...): collapse no-trap proxies to the ultimate callee IN the operand slot,
+                       so the generator-create / normal-apply routes below see it. [[Call]] reads the apply trap, so
+                       this is the spec's own order; a trap-bearing proxy stays put and takes the C path. */
+                    JSValue rtgt2;
+                    if (unlikely(!tramp_resolve_proxy_callee(ctx, call_argv[0], &rtgt2))) goto exception;
+                    JS_FreeValue(ctx, (JSValue)call_argv[0]);
+                    ((JSValue *)call_argv)[0] = rtgt2;
+                }
+                if (tramp_is_reflect_apply(call_argv[-1]) && call_argc >= 3
+                    && JS_VALUE_GET_TAG(call_argv[2]) == JS_TAG_OBJECT
+                    && tramp_can_call_gen_create(call_argv[0])) {   /* Reflect.apply(generatorFn, this, argsList) */
+                    int ga = tramp_arm_gen_apply(ctx, call_argv[0], call_argv[1], call_argv[2],
+                                                 &gc_apply_argv, &gc_apply_argc);
+                    if (unlikely(ga < 0)) goto exception;
+                    if (ga > 0) {
+                        gc_apply_func = call_argv[0]; gc_apply_this = call_argv[1];
+                        tramp_first = -2; tramp_is_tail = (opcode == OP_tail_call_method);
+                        goto do_generator_create_tramp;
                     }
                 }
                 if (tramp_is_reflect_apply(call_argv[-1]) && call_argc >= 3 && tramp_can_call(call_argv[0])
@@ -21757,7 +21824,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 void *gcreate_cont = tramp_gen_create_cont_it; tramp_gen_create_cont_it = NULL;   /* driver create? (settle re-enters its step) */
                 uint8_t gcreate_cont_kind = tramp_gen_create_cont_kind; tramp_gen_create_cont_kind = 0;
-                JSValueConst gfunc = call_argv[-1];
+                bool gapply = (gc_apply_argv != NULL);
+                JSValueConst gfunc = gapply ? gc_apply_func : call_argv[-1];
                 JSGeneratorData *s = js_mallocz(ctx, sizeof(*s));
                 TrampFrame *gtf; JSStackFrame *gsf; JSObject *gfp; JSFunctionBytecode *gb;
                 /* A create failure BEFORE the frame is pushed can't reach the gen-frame exception unwind (which frees a
@@ -21771,7 +21839,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (unlikely(!s)) { GEN_CREATE_FAIL_FREE_CONT(); JS_ThrowOutOfMemory(ctx); goto exception; }
                 s->state = JS_GENERATOR_STATE_SUSPENDED_START;
                 if (async_func_init(ctx, &s->func_state, gfunc,
-                                    (tramp_first == -2) ? call_argv[-2] : JS_UNDEFINED, call_argc, vc(call_argv))) {
+                                    gapply ? gc_apply_this : ((tramp_first == -2) ? call_argv[-2] : JS_UNDEFINED),
+                                    gapply ? (int)gc_apply_argc : call_argc,
+                                    gapply ? vc(gc_apply_argv) : vc(call_argv))) {
                     s->state = JS_GENERATOR_STATE_COMPLETED;
                     free_generator_stack_rt(rt, s); js_free_rt(rt, s); GEN_CREATE_FAIL_FREE_CONT(); goto exception;
                 }
@@ -21779,6 +21849,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (unlikely(!gtf)) { free_generator_stack_rt(rt, s); js_free_rt(rt, s); GEN_CREATE_FAIL_FREE_CONT(); JS_ThrowOutOfMemory(ctx); goto exception; }
                 #undef GEN_CREATE_FAIL_FREE_CONT
                 gtf->async_promise = js_dup(gfunc);   /* held for js_create_from_ctor at initial_yield */
+                if (gapply) {   /* the arg list was dup'd into the generator frame; drop our copy + leave apply mode */
+                    for (i = 0; i < (int)gc_apply_argc; i++) JS_FreeValue(ctx, gc_apply_argv[i]);
+                    js_free(ctx, gc_apply_argv);
+                    gc_apply_argv = NULL; gc_apply_argc = 0;
+                    gc_apply_func = JS_UNDEFINED; gc_apply_this = JS_UNDEFINED;
+                }
                 for (i = tramp_first; i < call_argc; i++) JS_FreeValue(ctx, call_argv[i]);   /* free func(+this)+args (dup'd into s) */
                 gtf->up = tf_top;
                 gtf->caller_sf = sf; gtf->caller_b = b; gtf->caller_ctx = ctx;
