@@ -50866,14 +50866,20 @@ static JSValue js_iterator_from(JSContext *ctx, JSValueConst this_val,
     int ret;
 
     JSValueConst obj = argv[0];
+    if (!JS_IsObject(obj) && !JS_IsString(obj))
+        return JS_ThrowTypeError(ctx, "Iterator.from called on non-object");
+    /* FALLBACK — Iterator.from ACQUIRES from C: it reads @@iterator (which may be an accessor, i.e. user JS) and
+       CALLS it, both off the tramp. Alive because tramp_can_call_iterator_from narrows to a generator-function
+       @@iterator. Acquisition belongs in the machine as its first step; until then this crashes rather than
+       quietly running a path that cannot suspend. */
+    DFAIL("Iterator.from is acquiring its iterator from C — route this call site onto the consume machine "
+          "(widen tramp_can_call_iterator_from past a generator-function @@iterator)");
     if (JS_IsString(obj)) {
         method = JS_GetProperty(ctx, obj, JS_ATOM_Symbol_iterator);
         if (JS_IsException(method))
             return JS_EXCEPTION;
         return JS_CallFree(ctx, method, obj, 0, NULL);
     }
-    if (!JS_IsObject(obj))
-        return JS_ThrowTypeError(ctx, "Iterator.from called on non-object");
     ret = JS_OrdinaryIsInstanceOf(ctx, obj, ctx->iterator_ctor);
     if (ret < 0)
         return JS_EXCEPTION;
@@ -60034,6 +60040,11 @@ static JSValue js_set_union(JSContext *ctx, JSValueConst this_val,
             goto exception;
         mr->value = JS_UNDEFINED;
     }
+    /* FALLBACK — the Set set-operations (union/intersection/difference/…) call the setlike's keys() and drive
+       .next from C, where a coroutine cannot suspend. Alive because tramp_can_call_setop_consume narrows to
+       generator-backed sources. Widen it, build what the failures name, delete this loop. */
+    DFAIL("a Set set-operation is iterating its setlike from C — route this call site onto the consume machine "
+          "(widen tramp_can_call_setop_consume past generator-backed sources)");
     iter = JS_Call(ctx, keys, setlike, 0, NULL);
     if (JS_IsException(iter))
         goto exception;
@@ -61682,6 +61693,13 @@ static JSValue js_promise_all(JSContext *ctx, JSValueConst this_val,
         check_function(ctx, promise_resolve))
         goto fail_reject;
     iter = JS_GetIterator(ctx, argv[0], false);
+    /* FALLBACK — Promise.all/allSettled/any/race drives .next from C, where a coroutine cannot suspend. Alive
+       because tramp_can_call_promise_all / _race narrow to generator-backed sources; every other iterable lands
+       here. Reaching this with a real iterator is the unbuilt case: widen the selector, build what the failures
+       name, delete the loop. The crash IS the tracking — a comment here is invisible to a green run. */
+    if (!JS_IsException(iter))
+        DFAIL("Promise combinator is iterating from C — route this call site onto the consume machine (widen "
+              "tramp_can_call_promise_all / tramp_can_call_promise_race past generator-backed sources)");
     if (JS_IsException(iter)) {
         JSValue error;
     fail_reject:
@@ -62023,6 +62041,13 @@ static JSValue js_promise_race(JSContext *ctx, JSValueConst this_val,
         check_function(ctx, promise_resolve))
         goto fail_reject;
     iter = JS_GetIterator(ctx, argv[0], false);
+    /* FALLBACK — Promise.all/allSettled/any/race drives .next from C, where a coroutine cannot suspend. Alive
+       because tramp_can_call_promise_all / _race narrow to generator-backed sources; every other iterable lands
+       here. Reaching this with a real iterator is the unbuilt case: widen the selector, build what the failures
+       name, delete the loop. The crash IS the tracking — a comment here is invisible to a green run. */
+    if (!JS_IsException(iter))
+        DFAIL("Promise combinator is iterating from C — route this call site onto the consume machine (widen "
+              "tramp_can_call_promise_all / tramp_can_call_promise_race past generator-backed sources)");
     if (JS_IsException(iter)) {
         JSValue error;
     fail_reject:
@@ -65930,6 +65955,11 @@ static JSValue js_typed_array_from(JSContext *ctx, JSValueConst this_val,
             JS_ThrowTypeError(ctx, "value is not iterable");
             goto exception;
         }
+        /* FALLBACK — TypedArray.from over an ITERABLE drives .next and the mapfn from C. Alive because
+           tramp_can_call_ta_from_consume narrows to generator-backed sources. The array-like path below is a
+           different algorithm (length + indices) and is not this. */
+        DFAIL("TypedArray.from is iterating from C — route this call site onto the consume machine (widen "
+              "tramp_can_call_ta_from_consume past generator-backed sources)");
         arr = JS_NewArray(ctx);
         if (JS_IsException(arr)) {
             JS_FreeValue(ctx, iter);
