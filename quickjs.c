@@ -18580,6 +18580,7 @@ static void js_array_every_end(JSContext *ctx, struct JSArrayEvery *s, bool take
 static JSValue js_array_every(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int special);
 /* reduce/reduceRight: the same continuation-holding shape as js_array_every, with the accumulator as the state. */
 typedef struct JSArrayReduce {
+    JSStepHdr hdr;           /* MUST be first: the generic step driver casts the state to JSStepHdr * */
     JSValue obj, acc, val;
     int64_t len, k;
     int special, pending;        /* pending = a callback result (the next accumulator) is awaited */
@@ -18722,7 +18723,6 @@ static JSValue js_typed_array_from(JSContext *ctx, JSValueConst this_val, int ar
 static bool tramp_can_call_ta_from_consume(JSContext *ctx, JSValueConst func, JSValueConst this_val, JSValueConst *call_argv, int call_argc, int *out_classid, JSValue *out_getiter);
 static void js_array_reduce_end(JSContext *ctx, struct JSArrayReduce *s, bool take_acc);
 static JSValue js_array_reduce(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int special);
-static bool tramp_can_call_array_reduce(JSValueConst func, int *out_special);
 /* arr.sort(cmpFn) with a NORMAL bytecode comparator: a SUSPENDABLE bottom-up (iterative) stable merge sort whose
    ONLY suspension point is cmp(array[l], array[r]) inside the inner merge. All algorithm state (width, block
    index, merge cursors) lives in the heap struct, so no C-stack recursion — a comparator body loop preempts and
@@ -19887,9 +19887,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_agen_create(call_argv[-1])) {   /* async generator method -> params here */
                     tramp_first = -2; tramp_is_tail = (opcode == OP_tail_call_method); goto do_agen_create_tramp;
                 }
-                if (tramp_can_call_array_reduce(call_argv[-1], &iter_special)) {   /* arr.reduce/reduceRight -> callback drive on THIS chain */
-                    tramp_is_tail = (opcode == OP_tail_call_method); goto do_array_reduce_tramp;
-                }
                 if (tramp_can_call_array_sort(call_argv[-1], call_argc, vc(call_argv))) {   /* arr.sort(cmp) -> merge-sort drive on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_sort_tramp;
                 }
@@ -20416,7 +20413,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call(call_argv[-1])) goto do_tramp_call;
                 if (tramp_can_call_async(call_argv[-1])) goto do_async_tramp_call;
                 if (tramp_can_call_gen_create(call_argv[-1])) goto do_generator_create_tramp;
-                if (tramp_can_call_array_reduce(call_argv[-1], &iter_special)) goto do_array_reduce_tramp;
                 if (tramp_can_call_iter_consume(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter)) goto do_iter_consume_tramp;
                 if (tramp_can_call_objentries_consume(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter)) goto do_objentries_consume_tramp;
                 if (tramp_can_call_setop_consume(call_argv[-1], call_argv[-2], vc(call_argv), call_argc, &setop_kind)) goto do_setop_consume_tramp;
@@ -48982,50 +48978,44 @@ static void js_array_reduce_end(JSContext *ctx, JSArrayReduce *s, bool take_acc)
     s->acc = JS_UNDEFINED; s->val = JS_UNDEFINED; s->obj = JS_UNDEFINED;
 }
 
-static JSValue js_array_reduce(JSContext *ctx, JSValueConst this_val,
-                               int argc, JSValueConst *argv, int special)
+/* reduce/reduceRight (+ TypedArray twins) as a STEP builtin. js_array_reduce_init/step/end already existed and
+   the C function was nothing but a JS_Call driver loop over them — the second, non-suspending driver. Deleted, so
+   the machine has ONE driver and tramp_can_call_array_reduce has nothing left to choose against. */
+static void *js_array_reduce_vinit(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int special)
 {
-    JSArrayReduce s;
-    JSValueConst args[4];
-    JSValue acc1 = JS_UNDEFINED, ret;
-    int st;
-
-    if (js_array_reduce_init(ctx, &s, this_val, argc, argv, special))
-        goto exception;
-    for (;;) {
-        st = js_array_reduce_step(ctx, &s, acc1, args);   /* consumes acc1 */
-        acc1 = JS_UNDEFINED;
-        if (st < 0)
-            goto exception;
-        if (st == 0)
-            break;
-        acc1 = JS_Call(ctx, s.func, JS_UNDEFINED, 4, args);
-        if (JS_IsException(acc1))
-            goto exception;
+    JSArrayReduce *s = js_mallocz(ctx, sizeof(*s));
+    if (!s) { JS_ThrowOutOfMemory(ctx); return NULL; }
+    /* init can fail AFTER taking refs; tear the partial state down through _end, never free the struct alone */
+    if (js_array_reduce_init(ctx, s, this_val, argc, argv, special)) {
+        js_array_reduce_end(ctx, s, false);
+        js_free(ctx, s);
+        return NULL;
     }
-    ret = s.acc;
-    js_array_reduce_end(ctx, &s, true);
-    return ret;
+    return s;
+}
 
-exception:
-    JS_FreeValue(ctx, acc1);
-    js_array_reduce_end(ctx, &s, false);
-    return JS_EXCEPTION;
+static int js_array_reduce_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSArrayReduce *s = st;
+    int r = js_array_reduce_step(ctx, s, cb_result, (JSValueConst *)&s->cb_args[2]);   /* consumes cb_result */
+    if (r < 0) return -1;
+    if (r == 0) return 0;
+    s->cb_args[0] = JS_UNDEFINED;            /* reduce's callback gets this = undefined */
+    s->cb_args[1] = s->func;
+    *out_cb = s->cb_args; *out_argc = 4;     /* [acc, val, index, obj] */
+    return 3;
+}
+
+static JSValue js_array_reduce_vfini(JSContext *ctx, void *st, bool take_result)
+{
+    JSArrayReduce *s = st;
+    JSValue r = take_result ? s->acc : JS_UNDEFINED;
+    js_array_reduce_end(ctx, s, take_result);
+    js_free(ctx, s);
+    return r;
 }
 
 /* Exact C-function identity + magic, as with js_array_every. */
-static bool tramp_can_call_array_reduce(JSValueConst func, int *out_special)
-{
-    JSObject *fp;
-    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
-    fp = JS_VALUE_GET_OBJ(func);
-    if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
-    if (fp->u.cfunc.cproto != JS_CFUNC_generic_magic) return false;
-    if (fp->u.cfunc.c_function.generic_magic != js_array_reduce) return false;
-    *out_special = fp->u.cfunc.magic;
-    return true;
-}
-
 static JSValue js_array_fill(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
 {
@@ -49293,6 +49283,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_RE_REPLACE, STEPDEF_STR_REPLACE, STEPDEF_STR_REPLACE_ALL,
     STEPDEF_ARRAY_EVERY, STEPDEF_ARRAY_SOME, STEPDEF_ARRAY_FOREACH, STEPDEF_ARRAY_MAP, STEPDEF_ARRAY_FILTER,
     STEPDEF_TA_EVERY, STEPDEF_TA_SOME, STEPDEF_TA_FOREACH, STEPDEF_TA_MAP, STEPDEF_TA_FILTER,
+    STEPDEF_ARRAY_REDUCE, STEPDEF_ARRAY_REDUCE_RIGHT, STEPDEF_TA_REDUCE, STEPDEF_TA_REDUCE_RIGHT,
     STEPDEF_COUNT
 };
 /* One NAMED definition per builtin, referenced by its JS_CFUNC_STEP_DEF registration through the id above — the same shape as
@@ -49314,6 +49305,10 @@ static const JSTrampStepDef js_ta_every_def        = { js_array_every_vinit, js_
 static const JSTrampStepDef js_ta_some_def         = { js_array_every_vinit, js_array_every_vstep, js_array_every_vfini, special_some | special_TA };
 static const JSTrampStepDef js_ta_forEach_def      = { js_array_every_vinit, js_array_every_vstep, js_array_every_vfini, special_forEach | special_TA };
 static const JSTrampStepDef js_ta_map_def          = { js_array_every_vinit, js_array_every_vstep, js_array_every_vfini, special_map | special_TA };
+static const JSTrampStepDef js_array_reduce_def  = { js_array_reduce_vinit, js_array_reduce_vstep, js_array_reduce_vfini, special_reduce };
+static const JSTrampStepDef js_array_reduceR_def = { js_array_reduce_vinit, js_array_reduce_vstep, js_array_reduce_vfini, special_reduceRight };
+static const JSTrampStepDef js_ta_reduce_def     = { js_array_reduce_vinit, js_array_reduce_vstep, js_array_reduce_vfini, special_reduce | special_TA };
+static const JSTrampStepDef js_ta_reduceR_def    = { js_array_reduce_vinit, js_array_reduce_vstep, js_array_reduce_vfini, special_reduceRight | special_TA };
 static const JSTrampStepDef js_ta_filter_def       = { js_array_every_vinit, js_array_every_vstep, js_array_every_vfini, special_filter | special_TA };
 
 /* Designated initializers, so each row states WHICH id it serves. Inserting a builtin cannot silently repoint an
@@ -49332,6 +49327,8 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_TA_EVERY]      = &js_ta_every_def,      [STEPDEF_TA_SOME]       = &js_ta_some_def,
     [STEPDEF_TA_FOREACH]    = &js_ta_forEach_def,    [STEPDEF_TA_MAP]        = &js_ta_map_def,
     [STEPDEF_TA_FILTER]     = &js_ta_filter_def,
+    [STEPDEF_ARRAY_REDUCE]  = &js_array_reduce_def,  [STEPDEF_ARRAY_REDUCE_RIGHT] = &js_array_reduceR_def,
+    [STEPDEF_TA_REDUCE]     = &js_ta_reduce_def,     [STEPDEF_TA_REDUCE_RIGHT]    = &js_ta_reduceR_def,
 };
 
 static const JSTrampStepDef *tramp_step_def_of(JSValueConst func)
@@ -51410,8 +51407,8 @@ static const JSCFunctionListEntry js_array_proto_funcs[] = {
     JS_CFUNC_STEP_DEF("forEach", 1, STEPDEF_ARRAY_FOREACH ),
     JS_CFUNC_STEP_DEF("map", 1, STEPDEF_ARRAY_MAP ),
     JS_CFUNC_STEP_DEF("filter", 1, STEPDEF_ARRAY_FILTER ),
-    JS_CFUNC_MAGIC_DEF("reduce", 1, js_array_reduce, special_reduce ),
-    JS_CFUNC_MAGIC_DEF("reduceRight", 1, js_array_reduce, special_reduceRight ),
+    JS_CFUNC_STEP_DEF("reduce", 1, STEPDEF_ARRAY_REDUCE ),
+    JS_CFUNC_STEP_DEF("reduceRight", 1, STEPDEF_ARRAY_REDUCE_RIGHT ),
     JS_CFUNC_DEF("fill", 1, js_array_fill ),
     JS_CFUNC_STEP_DEF("find", 1, STEPDEF_ARRAY_FIND ),
     JS_CFUNC_STEP_DEF("findIndex", 1, STEPDEF_ARRAY_FIND_INDEX ),
@@ -67101,8 +67098,8 @@ static const JSCFunctionListEntry js_typed_array_base_proto_funcs[] = {
     JS_CFUNC_STEP_DEF("forEach", 1, STEPDEF_TA_FOREACH ),
     JS_CFUNC_STEP_DEF("map", 1, STEPDEF_TA_MAP ),
     JS_CFUNC_STEP_DEF("filter", 1, STEPDEF_TA_FILTER ),
-    JS_CFUNC_MAGIC_DEF("reduce", 1, js_array_reduce, special_reduce | special_TA ),
-    JS_CFUNC_MAGIC_DEF("reduceRight", 1, js_array_reduce, special_reduceRight | special_TA ),
+    JS_CFUNC_STEP_DEF("reduce", 1, STEPDEF_TA_REDUCE ),
+    JS_CFUNC_STEP_DEF("reduceRight", 1, STEPDEF_TA_REDUCE_RIGHT ),
     JS_CFUNC_DEF("fill", 1, js_typed_array_fill ),
     JS_CFUNC_MAGIC_DEF("find", 1, js_typed_array_find, ArrayFind ),
     JS_CFUNC_MAGIC_DEF("findIndex", 1, js_typed_array_find, ArrayFindIndex ),
