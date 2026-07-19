@@ -48093,7 +48093,8 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
             /* new Set(gen): adder(value). Mirrors js_map_constructor's is_set branch. */
             JSValue ret = JS_Call(ctx, s->adder, s->r, 1, vc(&value));
             JS_FreeValue(ctx, value);
-            if (JS_IsException(ret)) return -1;
+            /* the adder threw: IfAbruptCloseIterator (Set/set-iterator-close-after-add-failure) */
+            if (JS_IsException(ret)) { s->abrupt = 1; return 2; }
             JS_FreeValue(ctx, ret);
         } else if (s->sink == ITERCONS_OBJENTRIES) {
             /* Object.fromEntries(gen): the entry must be an object; r[entry[0]] = entry[1]. Mirrors js_object_fromEntries. */
@@ -48112,16 +48113,19 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
         } else if (s->sink == ITERCONS_MAP) {
             /* new Map(gen): the entry must be an object; adder(entry[0], entry[1]). Mirrors js_map_constructor. */
             JSValue key, val, ret; JSValueConst args[2];
-            if (!JS_IsObject(value)) { JS_FreeValue(ctx, value); JS_ThrowTypeErrorNotAnObject(ctx); return -1; }
+            /* every abrupt exit is an IfAbruptCloseIterator site — a non-object entry, a key/value get, or
+               the adder throwing (Map/iterator-item-*-returns-abrupt, iterator-items-are-not-object-close-
+               iterator, iterator-close-after-set-failure) */
+            if (!JS_IsObject(value)) { JS_FreeValue(ctx, value); JS_ThrowTypeErrorNotAnObject(ctx); s->abrupt = 1; return 2; }
             key = JS_GetPropertyUint32(ctx, value, 0);
-            if (JS_IsException(key)) { JS_FreeValue(ctx, value); return -1; }
+            if (JS_IsException(key)) { JS_FreeValue(ctx, value); s->abrupt = 1; return 2; }
             val = JS_GetPropertyUint32(ctx, value, 1);
             JS_FreeValue(ctx, value);
-            if (JS_IsException(val)) { JS_FreeValue(ctx, key); return -1; }
+            if (JS_IsException(val)) { JS_FreeValue(ctx, key); s->abrupt = 1; return 2; }
             args[0] = key; args[1] = val;
             ret = JS_Call(ctx, s->adder, s->r, 2, args);
             JS_FreeValue(ctx, key); JS_FreeValue(ctx, val);
-            if (JS_IsException(ret)) return -1;
+            if (JS_IsException(ret)) { s->abrupt = 1; return 2; }
             JS_FreeValue(ctx, ret);
         } else if (s->sink == ITERCONS_ITERTERM) {
             /* Iterator.prototype eager terminal. `r` accumulates the answer; `mapfn` is the predicate/reducer, called
