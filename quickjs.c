@@ -18652,6 +18652,8 @@ typedef struct JSIterConsume {
                         Without this a plain (non-generator) source was never closed on a bad entry — the five
                         Object/fromEntries iterator-closed-for-* tests, and the reason the recognizer narrowed to
                         generator-backed sources and handed everything else to the C loop. */
+    JSValue super_ref;  /* super(iterable) entry: the owned parent-class ref, freed at finish; UNDEFINED
+                           for the OP_call_constructor entry which has no such ref */
 } JSIterConsume;
 #define ITERCONS_OWNED(F) F(r) F(iter) F(next) F(adder) F(mapfn) F(mapfn_this) F(cb_value)
 /* NOTE: JSIteratorHelperData::cb_value is owned too — freed by the finalizer and cleared on every path below. */
@@ -19216,6 +19218,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        driving its executor to completion — the same builtin suspending on one path and not the other. */
     JSValueConst pe_ntgt = JS_UNDEFINED, pe_executor = JS_UNDEFINED;
     int pe_cfirst = 0, pe_cargc = 0; JSValue pe_super_ref = JS_UNDEFINED;
+    JSValueConst smc_ntgt = JS_UNDEFINED, smc_items = JS_UNDEFINED;   /* new Map/Set(iterable): the two
+                                                                        entry shapes, ctor and super() */
+    int smc_cfirst = -2, smc_cargc = 0; JSValue smc_super_ref = JS_UNDEFINED;
     JSValue pe_executor_own = JS_UNDEFINED;   /* owned executor for the Reflect.construct spelling */
     JSPromiseExec *pexec_finish_state = NULL;   /* set by whichever dispatch shape reaches do_promise_exec_finish */
     uint8_t rerep_direct = 0;                           /* 1 = re[@@replace](str,fn) shape, 0 = str.replace(re,fn) */
@@ -19882,6 +19887,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto do_construct_tramp;
                 }
                 if (tramp_can_call_setmap_consume(ctx, call_argv[-2], vc(call_argv), call_argc, &smc_magic, &tramp_iter_getiter)) {   /* new Set/Map(iterable) -> GetIterator + consume on THIS chain */
+                    smc_ntgt = call_argv[-1]; smc_items = call_argv[0];
+                    smc_cfirst = -2; smc_cargc = call_argc; smc_super_ref = JS_UNDEFINED;
                     tramp_is_tail = 0; goto do_setmap_consume_tramp;
                 }
                 if (tramp_can_call_ta_consume(ctx, call_argv[-2], vc(call_argv), call_argc, &ta_classid, &tramp_iter_getiter)) {   /* new TypedArray(iterable) -> collect on THIS chain */
@@ -21010,6 +21017,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->mapfn_this = (call_argc >= 3) ? js_dup(call_argv[2]) : JS_UNDEFINED;
                 s->k = 0;
                 s->sink = ITERCONS_FROM;
+                s->super_ref = JS_UNDEFINED;   /* only the super(iterable) entry owns one */
                 s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
                 tramp_consume_iterable = call_argv[0]; tramp_consume_state = s; tramp_consume_kind = CONT_ITER_CONSUME;
                 goto do_consume_acquire_iterator;
@@ -21053,6 +21061,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->mapfn_this = JS_UNDEFINED;
                 s->k = 0;
                 s->sink = ITERCONS_ITERTERM;
+                s->super_ref = JS_UNDEFINED;   /* only the super(iterable) entry owns one */
                 s->setop = iterterm_kind;
                 s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
                 cont_st = s; cont_kind_cur = CONT_ITER_CONSUME;
@@ -21109,6 +21118,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->mapfn = JS_UNDEFINED; s->mapfn_this = JS_UNDEFINED;
                 s->k = 1;                     /* isSupersetOf: found-so-far = true (unused by union/symmetricDifference) */
                 s->sink = ITERCONS_SETOP;
+                s->super_ref = JS_UNDEFINED;   /* only the super(iterable) entry owns one */
                 s->setop = setop_kind;
                 s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
                 tramp_iter_getiter = keys;   /* the acquire CALLS it on setlike (create-on-tramp if it is a generator fn) */
@@ -21234,7 +21244,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                OP_call_constructor recognition; call_argv[-2]=ctor, [-1]=new.target, [0]=the generator. Fork-safe:
                each arm's adder call is COW-isolated by the map_add capture. */
             {
-                JSValueConst ntgt = call_argv[-1];
+                JSValueConst ntgt = smc_ntgt;
                 int magic = smc_magic;
                 JSIterConsume *s;
                 JSValue obj, adder;
@@ -21258,8 +21268,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->mapfn = JS_UNDEFINED; s->mapfn_this = JS_UNDEFINED;
                 s->k = 0;
                 s->sink = (magic & MAGIC_SET) ? ITERCONS_SET : ITERCONS_MAP;
-                s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
-                tramp_consume_iterable = call_argv[0]; tramp_consume_state = s; tramp_consume_kind = CONT_ITER_CONSUME;
+                s->orig_cfirst = smc_cfirst; s->orig_cargc = smc_cargc; s->orig_is_tail = tramp_is_tail;
+                s->super_ref = smc_super_ref; smc_super_ref = JS_UNDEFINED;   /* super() entry owns it */
+                tramp_consume_iterable = smc_items; tramp_consume_state = s; tramp_consume_kind = CONT_ITER_CONSUME;
                 goto do_consume_acquire_iterator;
             }
 
@@ -21279,6 +21290,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->adder = JS_UNDEFINED; s->mapfn = JS_UNDEFINED; s->mapfn_this = JS_UNDEFINED;
                 s->k = 0;
                 s->sink = ITERCONS_OBJENTRIES;
+                s->super_ref = JS_UNDEFINED;   /* only the super(iterable) entry owns one */
                 s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
                 tramp_consume_iterable = call_argv[0]; tramp_consume_state = s; tramp_consume_kind = CONT_ITER_CONSUME;
                 goto do_consume_acquire_iterator;
@@ -21311,6 +21323,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->ta_classid = ta_classid;
                 s->k = 0;
                 s->sink = ITERCONS_FROM;
+                s->super_ref = JS_UNDEFINED;   /* only the super(iterable) entry owns one */
                 s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
                 tramp_consume_iterable = call_argv[0]; tramp_consume_state = s; tramp_consume_kind = CONT_ITER_CONSUME;
                 goto do_consume_acquire_iterator;
@@ -21332,6 +21345,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->mapfn = JS_UNDEFINED; s->mapfn_this = JS_UNDEFINED;
                 s->k = JS_VALUE_GET_INT(sp[-2]);  /* the current append position */
                 s->sink = ITERCONS_SPREAD;
+                s->super_ref = JS_UNDEFINED;   /* only the super(iterable) entry owns one */
                 tramp_consume_iterable = sp[-1]; tramp_consume_state = s; tramp_consume_kind = CONT_ITER_CONSUME;
                 goto do_consume_acquire_iterator;
             }
@@ -21403,6 +21417,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            back to sp[-2], drop the iterable at sp[-1], and pop it. r/iter are the state's own refs. */
                         int64_t n = s->k;
                         JS_FreeValue(ctx, s->r); JS_FreeValue(ctx, s->iter); JS_FreeValue(ctx, s->next);
+                    JS_FreeValue(ctx, s->super_ref);   /* super() entry ref: the DONE path frees inline, not through _end */
                         js_free_rt(rt, s);
                         sp[-2] = js_int32((int32_t)n);
                         JS_FreeValue(ctx, sp[-1]);   /* the spread iterable (generator) */
@@ -21419,6 +21434,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JSValue ta_ntgt = s->adder;   /* new TypedArray(gen): the new_target/ctor; else the add/set method or UNDEFINED */
                     JSValue ta_mapfn = s->mapfn, ta_mapfn_this = s->mapfn_this;   /* TypedArray.from(gen, mapfn): applied here */
                     JS_FreeValue(ctx, s->iter); JS_FreeValue(ctx, s->next);
+                    JS_FreeValue(ctx, s->super_ref);   /* super() entry ref: the DONE path frees inline, not through _end */
                     js_free_rt(rt, s);
                     if (ta_cid != 0) {
                         JSValue ta;
@@ -22598,6 +22614,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     con_from_super = 1; con_super_ref = super;   /* owned; freed in the CONT_CONSTRUCT return/unwind */
                     tramp_first = 0; tramp_is_tail = 0;   /* caller_sp = current sp: super() pushes its object there */
                     goto do_construct_tramp;
+                }
+                if (tramp_can_call_setmap_consume(ctx, super, argv, argc, &smc_magic, &tramp_iter_getiter)) {
+                    /* super(iterable) into the Map/Set constructor from a subclass: same builtin, same walk.
+                       NewTarget stays the DERIVED class so the result gets the subclass prototype; the args
+                       are the derived frame's argv (nothing on the caller stack to pop); `super` is an owned
+                       ref the continuation frees. Without this the spelling reached the C entry, whose loop
+                       is deleted — the DFAIL that left Set/prototype/difference/subclass* red. */
+                    smc_ntgt = new_target; smc_items = (argc > 0) ? argv[0] : JS_UNDEFINED;
+                    smc_cfirst = 0; smc_cargc = 0; smc_super_ref = super;
+                    tramp_first = 0; tramp_is_tail = 0;
+                    goto do_setmap_consume_tramp;
                 }
                 if (tramp_can_call_promise_exec(ctx, super, argv, argc)) {
                     /* super(fn) into the Promise constructor from a subclass: same builtin, same 27.2.3.1 steps —
@@ -48221,6 +48248,7 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
    DONE finish the caller instead MOVES s->r out and frees s->iter/s->adder inline, so this is the error path only. */
 static void js_iter_consume_end(JSContext *ctx, JSIterConsume *s)
 {
+    JS_FreeValue(ctx, s->super_ref); s->super_ref = JS_UNDEFINED;   /* super() entry's parent-class ref */
     #define ITERCONS_FREE_ONE(f) JS_FreeValue(ctx, s->f);
     ITERCONS_OWNED(ITERCONS_FREE_ONE)
     #undef ITERCONS_FREE_ONE
