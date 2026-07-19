@@ -55736,7 +55736,11 @@ static bool tramp_can_call_re_replace(JSContext *ctx, JSValueConst func, JSValue
         JS_FreeValue(ctx, replacer);
         if (!ok) return false;
     }
-    if (!js_is_standard_regexp(ctx, call_argv[0])) return false;
+    /* A PATCHED exec is not excluded. Phase 1 collects through JS_RegExpExec, which dispatches the object's own
+       exec exactly as the spec requires, so the walk is identical either way — excluding it only meant the case
+       had nowhere to go once the duplicate was deleted. The residual limitation is that a patched exec is invoked
+       from C, so a loop inside IT cannot suspend; that is the general C-entry-calls-JS gap (the same one the
+       ToString coercions have), not a second implementation. */
     return true;
 }
 
@@ -55753,11 +55757,12 @@ static bool tramp_can_call_re_symbol_replace(JSContext *ctx, JSValueConst func, 
     if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
     if (fp->u.cfunc.cproto != JS_CFUNC_generic) return false;
     if (fp->u.cfunc.c_function.generic != js_regexp_Symbol_replace) return false;
+    /* 22.2.6.11 step 1 only requires the receiver to be an OBJECT — demanding JS_CLASS_REGEXP was stricter than
+       the spec and excluded a SUBCLASS reaching here through super[@@replace](...args), which then had nowhere to
+       go once the duplicate was deleted. Phase 1 goes through JS_RegExpExec, which handles any object. */
     if (JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT) return false;
-    if (JS_VALUE_GET_OBJ(this_val)->class_id != JS_CLASS_REGEXP) return false;
     if (!JS_IsFunction(ctx, call_argv[1])) return false;
-    if (!js_is_standard_regexp(ctx, this_val)) return false;
-    return true;
+    return true;   /* a patched exec is covered too — see the note on the str.replace recognizer */
 }
 
 static JSValue js_regexp_Symbol_replace(JSContext *ctx, JSValueConst this_val,
