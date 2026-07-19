@@ -1282,22 +1282,7 @@ JS_EXTERN void     JS_FlowFree(JSContext *ctx, JSValue *flow);
    parked+rebuilt. requested>fired iff the feature is gated somewhere (nested async/generator activation). */
 JS_EXTERN void     JS_FlowPreemptStats(uint64_t *requested, uint64_t *fired);
 
-/* LEGACY FALLBACK REGISTER.
-   A fallback is logic NOT designed for suspend/resume that still runs because the replacement does not yet cover
-   a case. Such a site must never be recorded only in a comment: a comment is invisible to the harness, survives
-   indefinitely, and is what let "the C path owns semantics this machinery does not reproduce" sit unexamined
-   while nobody knew which semantics. Every fallback SELF-DECLARES with LEGACY_FALLBACK(id, why) at the site, and
-   the count of sites HIT is reported by the test harness, so a run that silently took a non-suspending path is
-   visible in its output rather than only in a passing result.
-   A declared fallback has exactly three fates: tracked for removal, BUILT, or turned into a DCHECK crash. */
-typedef struct JSLegacyFallback {
-    const char *id;      /* stable identifier, e.g. "array_from.array_like" */
-    const char *why;     /* what is missing that keeps it alive */
-    uint64_t    hits;    /* times this site actually ran */
-} JSLegacyFallback;
-/* Enumerate declared fallbacks; returns the count, fills *out with the table (borrowed, do not free). */
-JS_EXTERN int      JS_LegacyFallbacks(const JSLegacyFallback **out);
-JS_EXTERN void     JS_LegacyFallbacksReset(void);
+
 /* DRIVE-TO-COMPLETION detector: total sites where a coroutine body ran to completion instead of suspend/resume on
    the tramp chain (a generator/async body driven off-tramp). 0 across a test262 corpus = pure suspend/resume. */
 JS_EXTERN uint64_t  JS_DriveToCompletionCount(void);

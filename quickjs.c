@@ -18393,40 +18393,7 @@ static JSValue js_promise_new(JSContext *ctx, JSValueConst new_target, JSValue *
                                   shared acquire (so a generator-function @@iterator is created ON THE TRAMP) and the
                                   resulting iterator IS the call's result; the deliver just yields it. */
 typedef struct JSIterFrom { int orig_cfirst, orig_cargc; uint8_t orig_is_tail; } JSIterFrom;
-/* The legacy-fallback register (quickjs.h JSLegacyFallback). Declaring a site here is not documentation — the
-   harness prints every site that RAN, so a green suite that quietly took a non-suspending path still says so.
-   Adding an entry is an admission with an exit condition attached; removing one is the goal. */
-#define LEGACY_FALLBACK_LIST(F)                                                                               \
-    F(map_set_ctor_iterate, "new Map/Set(iterable): the C loop drives .next and the adder off the tramp; alive because tramp_can_call_setmap_consume narrows to generator-backed sources") \
-    F(promise_all_iterate, "Promise.all/allSettled/any: the C loop drives .next off the tramp; alive because tramp_can_call_promise_all narrows to generator-backed sources") \
-    F(promise_race_iterate, "Promise.race: same narrowing as promise_all") \
-    F(iterator_from_acquire, "Iterator.from: acquisition calls @@iterator from C; alive because tramp_can_call_iterator_from narrows to a generator-function @@iterator") \
-    F(ta_from_iterate, "TypedArray.from over an iterable: the C loop drives .next off the tramp; alive because tramp_can_call_ta_from_consume narrows to generator-backed sources") \
-    F(array_from_array_like, "Array.from over an ARRAY-LIKE (no @@iterator): length+indices, a different "     \
-                             "algorithm rather than a second iteration path — kept deliberately, and listed "  \
-                             "so the claim stays visible and checkable instead of living in a comment")
 
-#define F_DECL(name, why) LF_##name,
-enum { LEGACY_FALLBACK_LIST(F_DECL) LEGACY_FALLBACK_COUNT };
-#undef F_DECL
-#define F_ROW(name, why) { #name, why, 0 },
-static JSLegacyFallback js_legacy_fallbacks[] = { LEGACY_FALLBACK_LIST(F_ROW) };
-#undef F_ROW
-/* Record a hit. Deliberately NOT dev-only: a fallback taken in a release build is precisely the thing that must
-   not become invisible. */
-#define LEGACY_FALLBACK(name) (js_legacy_fallbacks[LF_##name].hits++)
-
-int JS_LegacyFallbacks(const JSLegacyFallback **out)
-{
-    if (out) *out = js_legacy_fallbacks;
-    return LEGACY_FALLBACK_COUNT;
-}
-
-void JS_LegacyFallbacksReset(void)
-{
-    int i;
-    for (i = 0; i < LEGACY_FALLBACK_COUNT; i++) js_legacy_fallbacks[i].hits = 0;
-}
 
 static JSValue js_iterator_from(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 static bool iter_data_at_iterator(JSContext *ctx, JSValueConst items, JSValue *out);
@@ -47990,7 +47957,6 @@ static JSValue js_array_from(JSContext *ctx, JSValueConst this_val,
               "machine; the iteration loop here no longer exists");
         goto exception;
     } else {
-        LEGACY_FALLBACK(array_from_array_like);   /* self-declared: the harness reports this site if it runs */
         arrayLike = JS_ToObject(ctx, items);
         if (JS_IsException(arrayLike))
             goto exception;
@@ -48363,8 +48329,11 @@ static bool tramp_can_call_setmap_consume(JSContext *ctx, JSValueConst func, JSV
     if (fp->u.cfunc.c_function.constructor_magic != js_map_constructor) return false;
     magic = fp->u.cfunc.magic;
     if (magic & MAGIC_WEAK) return false;   /* WeakSet/WeakMap: out of scope */
-    if (JS_VALUE_GET_TAG(call_argv[0]) != JS_TAG_OBJECT) return false;
-    if (!iter_consume_gen_backed(ctx, call_argv[0], out_getiter)) return false;
+    /* ANY callable @@iterator, primitives included — the same widening Array.from took in cf07b09, where the
+       primitive exclusion turned out to CAUSE the abort it looked like it avoided (acquisition ran from C, the
+       one place a generator @@iterator cannot suspend). */
+    if (!iter_data_at_iterator(ctx, call_argv[0], out_getiter)) return false;
+    if (!JS_IsFunction(ctx, *out_getiter)) { JS_FreeValue(ctx, *out_getiter); *out_getiter = JS_UNDEFINED; return false; }
     *out_magic = magic;
     return true;
 }
@@ -50860,7 +50829,6 @@ fail:
 static JSValue js_iterator_from(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv)
 {
-    LEGACY_FALLBACK(iterator_from_acquire);   /* self-declared; the harness reports this site if it runs */
     JSValue method, iter;
     JSIteratorWrapData *it;
     int ret;
@@ -58610,7 +58578,6 @@ static const JSCFunctionListEntry js_symbol_funcs[] = {
 static JSValue js_map_constructor(JSContext *ctx, JSValueConst new_target,
                                   int argc, JSValueConst *argv, int magic)
 {
-    LEGACY_FALLBACK(map_set_ctor_iterate);   /* self-declared; the harness reports this site if it runs */
     JSMapState *s;
     JSValue obj, adder = JS_UNDEFINED, iter = JS_UNDEFINED, next_method = JS_UNDEFINED;
     JSValueConst arr;
@@ -61690,7 +61657,6 @@ static JSValue js_promise_all_resolve_element(JSContext *ctx,
 static JSValue js_promise_all(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv, int magic)
 {
-    LEGACY_FALLBACK(promise_all_iterate);   /* self-declared; the harness reports this site if it runs */
     JSValue result_promise, resolving_funcs[2], item, next_promise, ret;
     JSValue next_method = JS_UNDEFINED, values = JS_UNDEFINED;
     JSValue resolve_element_env = JS_UNDEFINED, resolve_element, reject_element;
@@ -62034,7 +62000,6 @@ static bool tramp_can_call_promise_exec(JSContext *ctx, JSValueConst func, JSVal
 static JSValue js_promise_race(JSContext *ctx, JSValueConst this_val,
                                int argc, JSValueConst *argv)
 {
-    LEGACY_FALLBACK(promise_race_iterate);   /* self-declared; the harness reports this site if it runs */
     JSValue result_promise, resolving_funcs[2], item, next_promise, ret;
     JSValue next_method = JS_UNDEFINED, iter = JS_UNDEFINED;
     JSValue promise_resolve = JS_UNDEFINED;
@@ -65922,7 +65887,6 @@ static JSValue js_typed_array___speciesCreate(JSContext *ctx,
 static JSValue js_typed_array_from(JSContext *ctx, JSValueConst this_val,
                                    int argc, JSValueConst *argv)
 {
-    LEGACY_FALLBACK(ta_from_iterate);   /* self-declared; the harness reports this site if it runs */
     // from(items, mapfn = void 0, this_arg = void 0)
     JSValueConst items = argv[0], mapfn, this_arg;
     JSValueConst args[2];
