@@ -18316,6 +18316,8 @@ static JSValue js_proxy_get_invariant(JSContext *ctx, JSValueConst target, JSAto
                                   activation that was not the flow base. */
 typedef struct JSPromiseExec {
     JSValue promise;             /* step 3-7: the promise under construction (owned) */
+    JSValue executor_own;        /* Reflect.construct spelling: the executor came from an argsList element,
+                                    not a caller-stack operand, so the state owns it (JS_UNDEFINED otherwise) */
     JSValue resolving_funcs[2];  /* step 8: [resolve, reject] (owned) */
     JSValue super_ref;           /* super(fn) entry: the owned parent-class ref (freed at finish); UNDEFINED for `new Promise(fn)` */
     JSValue cb_args[4];          /* [this=undefined, executor, resolve, reject] — BORROWED views for the tramp call.
@@ -18323,7 +18325,7 @@ typedef struct JSPromiseExec {
                                     ORIGINAL ctor operands stay exactly where the finish pops them (as reduce does). */
     int orig_cfirst, orig_cargc; /* the ORIGINAL OP_call_constructor operand shape (pop at finish) */
 } JSPromiseExec;
-static bool tramp_can_call_promise_exec(JSValueConst func, JSValueConst *call_argv, int call_argc);
+static bool tramp_can_call_promise_exec(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc);
 #define CONT_STR_REPLACE   15  /* cont_state = JSStrReplace: String.prototype.replace/replaceAll with a FUNCTION
                                   replacer. The builtin holds a StringBuffer + endOfLastMatch across each callback,
                                   so the callback dispatch is hooked into the flow machinery (the builtin stays in
@@ -18959,6 +18961,20 @@ static inline bool tramp_is_function_apply(JSValueConst method) {
 /* Reflect.apply(target, thisArg, argsList) — js_reflect_apply forwards to js_function_apply; route it into
    do_apply_tramp with the Reflect operand shape ([Reflect, apply, target, thisArg, argsList]). */
 static JSValue js_reflect_apply(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+/* Reflect.construct is CALL-SITE-RESOLVED, exactly as Reflect.apply already is: it holds no continuation, so the
+   operator site resolves it to the ultimate construct rather than letting a C entry perform it. Without this,
+   Reflect.construct(Promise, [fn]) reaches js_promise_constructor — which no longer has an executor body to run,
+   because that body was the second implementation. Routing the spelling is the replacement; leaving the body
+   there for it would be the fallback. */
+static JSValue js_reflect_construct(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static inline bool tramp_is_reflect_construct(JSValueConst method) {
+    JSObject *mp;
+    if (JS_VALUE_GET_TAG(method) != JS_TAG_OBJECT) return false;
+    mp = JS_VALUE_GET_OBJ(method);
+    return mp->class_id == JS_CLASS_C_FUNCTION && mp->u.cfunc.cproto == JS_CFUNC_generic
+        && mp->u.cfunc.c_function.generic == js_reflect_construct;
+}
+
 static inline bool tramp_is_reflect_apply(JSValueConst method) {
     JSObject *mp;
     if (JS_VALUE_GET_TAG(method) != JS_TAG_OBJECT) return false;
@@ -19192,6 +19208,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        driving its executor to completion — the same builtin suspending on one path and not the other. */
     JSValueConst pe_ntgt = JS_UNDEFINED, pe_executor = JS_UNDEFINED;
     int pe_cfirst = 0, pe_cargc = 0; JSValue pe_super_ref = JS_UNDEFINED;
+    JSValue pe_executor_own = JS_UNDEFINED;   /* owned executor for the Reflect.construct spelling */
+    JSPromiseExec *pexec_finish_state = NULL;   /* set by whichever dispatch shape reaches do_promise_exec_finish */
     uint8_t rerep_direct = 0;                           /* 1 = re[@@replace](str,fn) shape, 0 = str.replace(re,fn) */
     int srep_is_all = 0;                                /* str.replace vs replaceAll (the builtin's magic), read at OP_call_method */
     /* apply/spread trampoline (do_apply_tramp): set by the .apply method call or the OP_apply spread before goto.
@@ -19861,9 +19879,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_ta_consume(ctx, call_argv[-2], vc(call_argv), call_argc, &ta_classid, &tramp_iter_getiter)) {   /* new TypedArray(iterable) -> collect on THIS chain */
                     tramp_is_tail = 0; goto do_ta_consume_tramp;
                 }
-                if (tramp_can_call_promise_exec(call_argv[-2], vc(call_argv), call_argc)) {   /* new Promise(fn) -> executor body on THIS chain */
+                if (tramp_can_call_promise_exec(ctx, call_argv[-2], vc(call_argv), call_argc)) {   /* new Promise(fn) -> executor body on THIS chain */
                     pe_ntgt = call_argv[-1]; pe_executor = call_argv[0];
-                    pe_cfirst = -2; pe_cargc = call_argc; pe_super_ref = JS_UNDEFINED;
+                    pe_cfirst = -2; pe_cargc = call_argc; pe_super_ref = JS_UNDEFINED; pe_executor_own = JS_UNDEFINED;
                     tramp_is_tail = 0; goto do_promise_exec_tramp;
                 }
                 ret_val = JS_CallConstructorInternal(ctx, call_argv[-2],
@@ -19973,6 +19991,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         ap_array = aa; ap_cfirst = -2; ap_cargc = call_argc;
                         tramp_is_tail = (opcode == OP_tail_call_method); goto do_apply_tramp;
                     }
+                }
+                if (tramp_is_reflect_construct(call_argv[-1]) && call_argc >= 2
+                    && tramp_can_call_promise_exec(ctx, call_argv[0], NULL, 0)) {
+                    /* Reflect.construct(Promise, argsList[, newTarget]): resolve it HERE, like Reflect.apply.
+                       The Promise constructor's executor body was deleted, so this spelling has nothing to fall
+                       to — routing it is the replacement. Only the executor and the operand-cleanup shape are
+                       needed; the args never have to reach the stack, because the constructor reads argv[0]. */
+                    JSValue ex = JS_GetPropertyUint32(ctx, call_argv[1], 0);
+                    if (unlikely(JS_IsException(ex))) goto exception;
+                    if (JS_IsFunction(ctx, ex)) {
+                        pe_ntgt = (call_argc >= 3) ? call_argv[2] : call_argv[0];
+                        pe_executor = ex; pe_executor_own = ex;   /* the state owns it: no operand to borrow */
+                        pe_cfirst = -2; pe_cargc = call_argc; pe_super_ref = JS_UNDEFINED;
+                        tramp_is_tail = 0;
+                        goto do_promise_exec_tramp;
+                    }
+                    JS_FreeValue(ctx, ex);   /* non-callable: fall through so step 2 throws in the C entry */
                 }
                 if (tramp_is_reflect_apply(call_argv[-1]) && call_argc >= 3
                     && JS_VALUE_GET_TAG(call_argv[0]) == JS_TAG_OBJECT
@@ -20248,6 +20283,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->resolving_funcs[0] = rfuncs[0];
                 s->resolving_funcs[1] = rfuncs[1];
                 s->super_ref = pe_super_ref; pe_super_ref = JS_UNDEFINED;   /* ownership moves to the continuation */
+                s->executor_own = pe_executor_own; pe_executor_own = JS_UNDEFINED;
                 s->orig_cfirst = pe_cfirst; s->orig_cargc = pe_cargc;
                 s->cb_args[0] = JS_UNDEFINED;          /* step 9: thisArgument is undefined */
                 s->cb_args[1] = pe_executor;           /* the executor (borrowed: a ctor operand / the derived argv) */
@@ -20255,9 +20291,55 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->cb_args[3] = s->resolving_funcs[1];
                 call_argv = (JSValueConst *)&s->cb_args[2];
                 call_argc = 2; tramp_first = -2; tramp_is_tail = 0;
-                tramp_cont_state = s; tramp_cont_kind = CONT_PROMISE_EXEC;
-                goto do_tramp_call;
+                if (tramp_can_call(pe_executor)) {
+                    tramp_cont_state = s; tramp_cont_kind = CONT_PROMISE_EXEC;
+                    goto do_tramp_call;   /* bytecode executor: its body runs on THIS chain and can park */
+                }
+                /* a C/bound executor has no preemptible body, so running it here suspends nothing — and handling
+                   it HERE is what lets js_promise_constructor's JS_Call version be deleted rather than kept as the
+                   not-recognized path. Both shapes converge on the one completion below. */
+                ret_val = JS_Call(ctx, pe_executor, JS_UNDEFINED, 2, (JSValueConst *)&s->cb_args[2]);
+                pexec_finish_state = s;
+                goto do_promise_exec_finish;
             }
+
+        do_promise_exec_finish:
+            /* 27.2.3.1 steps 10-11, ONE implementation. Reached from the tramp return (a bytecode executor ran on
+               the chain) and from the inline dispatch of a C/bound executor. ret_val is the executor's completion:
+               a normal value is DISCARDED (step 9 keeps it only to test abruptness) and the promise is the result;
+               an abrupt one REJECTS the promise and still yields it — `new Promise(function(){throw e})` evaluates
+               to a rejected promise, it does not raise. Having both callers land here is the point: a second copy
+               of this is how the executor's two dispatch shapes would drift apart. */
+            {
+                JSPromiseExec *ps = pexec_finish_state;
+                JSValue r = ps->promise;
+                int cfirst = ps->orig_cfirst, cargc = ps->orig_cargc;
+                JSValue *cargv = sp - cargc;
+                pexec_finish_state = NULL;
+                if (unlikely(JS_IsException(ret_val))) {
+                    JSValue err = JS_GetException(ctx), rr;
+                    rr = JS_Call(ctx, ps->resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
+                    JS_FreeValue(ctx, err);
+                    if (unlikely(JS_IsException(rr))) {   /* step 10 is a ? call: a throwing reject DOES propagate */
+                        JS_FreeValue(ctx, ps->resolving_funcs[0]); JS_FreeValue(ctx, ps->resolving_funcs[1]);
+                        JS_FreeValue(ctx, ps->super_ref); JS_FreeValue(ctx, ps->executor_own);
+                        JS_FreeValue(ctx, r); js_free_rt(rt, ps);
+                        goto exception;
+                    }
+                    JS_FreeValue(ctx, rr);
+                } else {
+                    JS_FreeValue(ctx, ret_val);
+                }
+                JS_FreeValue(ctx, ps->resolving_funcs[0]);
+                JS_FreeValue(ctx, ps->resolving_funcs[1]);
+                JS_FreeValue(ctx, ps->super_ref);   /* super() entry: the parent-class ref */
+                JS_FreeValue(ctx, ps->executor_own);   /* Reflect.construct entry: the argsList element */
+                js_free_rt(rt, ps);
+                for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
+                sp += cfirst - cargc;
+                *sp++ = r;
+            }
+            BREAK;
 
         do_construct_tramp:
             /* Run a bytecode CONSTRUCTOR body on THIS chain (so a loop in the constructor body preempts the base
@@ -22418,22 +22500,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     /* new C(): operands (func,new_target,args) live on the caller stack — fall through to the
                        normal cargv cleanup + push. */
                 } else if (rck == CONT_PROMISE_EXEC) {
-                    /* 27.2.3.1 step 11: the executor returned NORMALLY — its result is discarded (step 9 keeps the
-                       completion only to test for abruptness) and `new Promise` evaluates to the promise. The args
-                       lived in the state, so sp still sits just past the ORIGINAL ctor operands. */
-                    JSPromiseExec *ps = rcs;
-                    JSValue r = ps->promise;
-                    int cfirst = ps->orig_cfirst, cargc = ps->orig_cargc;
-                    JSValue *cargv = sp - cargc;
-                    JS_FreeValue(ctx, ret_val);
-                    JS_FreeValue(ctx, ps->resolving_funcs[0]);
-                    JS_FreeValue(ctx, ps->resolving_funcs[1]);
-                    JS_FreeValue(ctx, ps->super_ref);   /* super() entry: the parent-class ref */
-                    js_free_rt(rt, ps);
-                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
-                    sp += cfirst - cargc;
-                    *sp++ = r;
-                    BREAK;
+                    pexec_finish_state = rcs;
+                    goto do_promise_exec_finish;   /* ONE completion, shared with the inline-executor path */
                 } else if (rck == CONT_SETTER) {
                     /* setter returned: free the operands (this,setter,value) on the caller stack exactly like a
                        method call, but DISCARD the return value — a property write pushes nothing. */
@@ -22523,14 +22591,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     tramp_first = 0; tramp_is_tail = 0;   /* caller_sp = current sp: super() pushes its object there */
                     goto do_construct_tramp;
                 }
-                if (tramp_can_call_promise_exec(super, argv, argc)) {
+                if (tramp_can_call_promise_exec(ctx, super, argv, argc)) {
                     /* super(fn) into the Promise constructor from a subclass: same builtin, same 27.2.3.1 steps —
                        run the executor on THIS chain too. NewTarget stays the DERIVED class (so the promise gets the
                        subclass prototype), the args are the derived frame's argv (nothing on the caller stack to
                        pop), and `super` is an owned ref the continuation frees at finish. The promise super()
                        yields is pushed at the current sp, exactly as the JS_CallConstructor2 path below does. */
                     pe_ntgt = new_target; pe_executor = argv[0];
-                    pe_cfirst = 0; pe_cargc = 0; pe_super_ref = super;
+                    pe_cfirst = 0; pe_cargc = 0; pe_super_ref = super; pe_executor_own = JS_UNDEFINED;
                     tramp_first = 0; tramp_is_tail = 0;
                     goto do_promise_exec_tramp;
                 }
@@ -61337,30 +61405,16 @@ static JSValue js_promise_constructor(JSContext *ctx, JSValueConst new_target,
     JSValue obj;
     JSValue args[2], ret;
 
+    /* Only 27.2.3.1 step 2 remains here: a NON-callable executor throws before anything is created. Every callable
+       executor — bytecode, C, or bound — is driven by the one step machine (do_promise_exec_tramp), whose
+       completion implements steps 10-11. The JS_Call version that used to live here was the second
+       implementation the recognizer chose against; deleting it is what leaves a single walk. */
     executor = argv[0];
     if (check_function(ctx, executor))
         return JS_EXCEPTION;
-    obj = js_promise_new(ctx, new_target, args);
-    if (JS_IsException(obj))
-        return JS_EXCEPTION;
-    ret = JS_Call(ctx, executor, JS_UNDEFINED, 2, vc(args));
-    if (JS_IsException(ret)) {
-        JSValue ret2, error;
-        error = JS_GetException(ctx);
-        ret2 = JS_Call(ctx, args[1], JS_UNDEFINED, 1, vc(&error));
-        JS_FreeValue(ctx, error);
-        if (JS_IsException(ret2))
-            goto fail;
-        JS_FreeValue(ctx, ret2);
-    }
-    JS_FreeValue(ctx, ret);
-    JS_FreeValue(ctx, args[0]);
-    JS_FreeValue(ctx, args[1]);
-    return obj;
- fail:
-    JS_FreeValue(ctx, args[0]);
-    JS_FreeValue(ctx, args[1]);
-    JS_FreeValue(ctx, obj);
+    DFAIL("Promise constructor reached its C entry with a CALLABLE executor — that call site must route to "
+          "do_promise_exec_tramp; there is no JS_Call version here any more");
+    (void)obj; (void)args; (void)ret;
     return JS_EXCEPTION;
 }
 
@@ -61945,16 +61999,18 @@ static bool tramp_can_call_promise_race(JSValueConst func, JSValueConst *call_ar
    A non-callable executor is NOT recognized — it must reach js_promise_constructor so step 2 throws the TypeError
    in spec order, BEFORE step 3 creates anything. A C/bound executor is not recognized either: it has no
    preemptible body, so the ordinary C path is already correct for it. */
-static bool tramp_can_call_promise_exec(JSValueConst func, JSValueConst *call_argv, int call_argc)
+static bool tramp_can_call_promise_exec(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc)
 {
     JSObject *fp;
-    if (call_argc < 1) return false;
+    if (call_argv && call_argc < 1) return false;   /* NULL call_argv = callee-only query (Reflect.construct) */
     if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
     fp = JS_VALUE_GET_OBJ(func);
     if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
     if (fp->u.cfunc.cproto != JS_CFUNC_constructor) return false;
     if (fp->u.cfunc.c_function.constructor != js_promise_constructor) return false;
-    return tramp_can_call(call_argv[0]);
+    if (!call_argv) return true;   /* callee-only query (the Reflect.construct resolver): args live in an array */
+    return JS_IsFunction(ctx, call_argv[0]);   /* ANY callable executor; a non-callable falls through so
+                                                  js_promise_constructor throws the step-2 TypeError */
 }
 
 static JSValue js_promise_race(JSContext *ctx, JSValueConst this_val,
