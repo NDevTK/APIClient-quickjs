@@ -18645,6 +18645,36 @@ static inline bool tramp_is_global_eval(JSValueConst method) {
         && mp->u.cfunc.cproto == JS_CFUNC_generic
         && mp->u.cfunc.c_function.generic == js_global_eval;
 }
+/* PROXY traps are call-site-resolved: a trap holds no surviving continuation, so the interpreter re-dispatches the
+   trap's normal handler on THIS chain and lets do_return place its one result. js_tramp_proxy_get reshapes the
+   operator's operands into the method-call shape [handler, trap, target, key, receiver] whose caller_sp is exactly
+   the slot the operator's result belongs in — the "stack-shape descriptor" is that reshape. Returns 1 when it routed
+   (caller must goto do_tramp_call), 0 to fall through to the C path, -1 on a pending exception. */
+static JSProxyData *get_proxy_method(JSContext *ctx, JSValue *pmethod, JSValueConst obj, JSAtom name);
+static inline bool tramp_can_call(JSValueConst func);
+static int js_tramp_proxy_get(JSContext *ctx, JSValue *sp_obj_slot, JSAtom atom,
+                              JSValue *out_extra /* 4 slots written on success */)
+{
+    JSProxyData *s;
+    JSValue method, keyval, recv;
+    if (JS_VALUE_GET_TAG(*sp_obj_slot) != JS_TAG_OBJECT
+        || JS_VALUE_GET_OBJ(*sp_obj_slot)->class_id != JS_CLASS_PROXY) return 0;
+    s = get_proxy_method(ctx, &method, *sp_obj_slot, JS_ATOM_get);
+    if (!s) return -1;                       /* revoked / handler get threw */
+    if (JS_IsUndefined(method) || !tramp_can_call(method)) {
+        JS_FreeValue(ctx, method);           /* no trap, or a C/bound trap with no preemptible body */
+        return 0;
+    }
+    keyval = JS_AtomToValue(ctx, atom);
+    if (JS_IsException(keyval)) { JS_FreeValue(ctx, method); return -1; }
+    recv = *sp_obj_slot;                     /* receiver IS the proxy; the slot's ref transfers to it */
+    *sp_obj_slot = js_dup(s->handler);       /* [-2] this = handler */
+    out_extra[0] = method;                   /* [-1] the trap (owned) */
+    out_extra[1] = js_dup(s->target);        /* [0]  target */
+    out_extra[2] = keyval;                   /* [1]  key */
+    out_extra[3] = recv;                     /* [2]  receiver */
+    return 1;
+}
 static inline bool tramp_is_call_function(JSValueConst method) {
     JSObject *mp;
     if (JS_VALUE_GET_TAG(method) != JS_TAG_OBJECT) return false;
@@ -22920,6 +22950,24 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc += 4;
 
                 obj = sp[-1];
+                if (unlikely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT
+                             && JS_VALUE_GET_OBJ(obj)->class_id == JS_CLASS_PROXY)) {
+                    /* proxy [[Get]]: run the trap on THIS chain so a loop inside it preempts. The reshape leaves
+                       [handler, trap, target, key, receiver] whose caller_sp IS this operand slot, so do_return
+                       drops the operands and lands the trap's one result exactly where the field value belongs. */
+                    int pr_ret;
+                    sf->cur_pc = pc;
+                    DCHECK(sp + 4 <= stack_buf + b->stack_size,
+                           "proxy get trap: operand reshape exceeds the frame's compiled stack_size");
+                    pr_ret = js_tramp_proxy_get(ctx, &sp[-1], atom, sp);
+                    if (unlikely(pr_ret < 0)) goto exception;
+                    if (pr_ret > 0) {
+                        sp += 4;
+                        call_argv = sp - 3; call_argc = 3; tramp_first = -2; tramp_is_tail = 0;
+                        goto do_tramp_call;
+                    }
+                    obj = sp[-1];   /* untouched: no trap, or a C/bound trap -> the normal path below */
+                }
                 if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
                     p = JS_VALUE_GET_OBJ(obj);
                     for(;;) {
