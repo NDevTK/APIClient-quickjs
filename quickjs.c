@@ -18269,6 +18269,7 @@ static JSValue js_proxy_get_invariant(JSContext *ctx, JSValueConst target, JSAto
 typedef struct JSPromiseExec {
     JSValue promise;             /* step 3-7: the promise under construction (owned) */
     JSValue resolving_funcs[2];  /* step 8: [resolve, reject] (owned) */
+    JSValue super_ref;           /* super(fn) entry: the owned parent-class ref (freed at finish); UNDEFINED for `new Promise(fn)` */
     JSValue cb_args[4];          /* [this=undefined, executor, resolve, reject] — BORROWED views for the tramp call.
                                     Args live in the STATE, not pushed as operands, so sp is untouched and the
                                     ORIGINAL ctor operands stay exactly where the finish pops them (as reduce does). */
@@ -19065,6 +19066,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSValueConst con_func = JS_UNDEFINED, con_ntgt = JS_UNDEFINED;
     JSValueConst *con_args = NULL; int con_argc = 0;
     uint8_t con_from_super = 0; JSValue con_super_ref = JS_UNDEFINED;
+    /* Promise-executor trampoline (do_promise_exec_tramp): the SAME builtin is reached by two entry shapes, so both
+       set these before the goto — `new Promise(fn)` (OP_call_constructor: operands on the caller stack, popped at
+       finish) and `super(fn)` from a Promise subclass (OP_init_ctor: args are the derived frame's argv, nothing to
+       pop, and the parent-class ref is owned). Hooking only the first would leave `new (class extends Promise)`
+       driving its executor to completion — the same builtin suspending on one path and not the other. */
+    JSValueConst pe_ntgt = JS_UNDEFINED, pe_executor = JS_UNDEFINED;
+    int pe_cfirst = 0, pe_cargc = 0; JSValue pe_super_ref = JS_UNDEFINED;
     /* apply/spread trampoline (do_apply_tramp): set by the .apply method call or the OP_apply spread before goto.
        ap_cfirst/ap_cargc parameterize do_return's operand cleanup for the two operand shapes. */
     JSValueConst ap_func = JS_UNDEFINED, ap_this = JS_UNDEFINED, ap_array = JS_UNDEFINED;
@@ -19745,6 +19753,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     tramp_is_tail = 0; goto do_ta_consume_tramp;
                 }
                 if (tramp_can_call_promise_exec(call_argv[-2], vc(call_argv), call_argc)) {   /* new Promise(fn) -> executor body on THIS chain */
+                    pe_ntgt = call_argv[-1]; pe_executor = call_argv[0];
+                    pe_cfirst = -2; pe_cargc = call_argc; pe_super_ref = JS_UNDEFINED;
                     tramp_is_tail = 0; goto do_promise_exec_tramp;
                 }
                 ret_val = JS_CallConstructorInternal(ctx, call_argv[-2],
@@ -20130,19 +20140,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 JSPromiseExec *s;
                 JSValue rfuncs[2], pobj;
-                pobj = js_promise_new(ctx, call_argv[-1], rfuncs);   /* steps 3-8 */
-                if (unlikely(JS_IsException(pobj))) goto exception;
+                pobj = js_promise_new(ctx, pe_ntgt, rfuncs);   /* steps 3-8 (OrdinaryCreateFromConstructor uses NewTarget) */
+                if (unlikely(JS_IsException(pobj))) { JS_FreeValue(ctx, pe_super_ref); goto exception; }
                 s = js_malloc_rt(rt, sizeof(*s));
                 if (unlikely(!s)) {
                     JS_FreeValue(ctx, pobj); JS_FreeValue(ctx, rfuncs[0]); JS_FreeValue(ctx, rfuncs[1]);
+                    JS_FreeValue(ctx, pe_super_ref);
                     JS_ThrowOutOfMemory(ctx); goto exception;
                 }
                 s->promise = pobj;
                 s->resolving_funcs[0] = rfuncs[0];
                 s->resolving_funcs[1] = rfuncs[1];
-                s->orig_cfirst = -2; s->orig_cargc = call_argc;
+                s->super_ref = pe_super_ref; pe_super_ref = JS_UNDEFINED;   /* ownership moves to the continuation */
+                s->orig_cfirst = pe_cfirst; s->orig_cargc = pe_cargc;
                 s->cb_args[0] = JS_UNDEFINED;          /* step 9: thisArgument is undefined */
-                s->cb_args[1] = call_argv[0];          /* the executor (borrowed: an original ctor operand) */
+                s->cb_args[1] = pe_executor;           /* the executor (borrowed: a ctor operand / the derived argv) */
                 s->cb_args[2] = s->resolving_funcs[0]; /* borrowed views of the owned pair */
                 s->cb_args[3] = s->resolving_funcs[1];
                 call_argv = (JSValueConst *)&s->cb_args[2];
@@ -22199,6 +22211,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JS_FreeValue(ctx, ret_val);
                     JS_FreeValue(ctx, ps->resolving_funcs[0]);
                     JS_FreeValue(ctx, ps->resolving_funcs[1]);
+                    JS_FreeValue(ctx, ps->super_ref);   /* super() entry: the parent-class ref */
                     js_free_rt(rt, ps);
                     for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
                     sp += cfirst - cargc;
@@ -22291,6 +22304,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     con_from_super = 1; con_super_ref = super;   /* owned; freed in the CONT_CONSTRUCT return/unwind */
                     tramp_first = 0; tramp_is_tail = 0;   /* caller_sp = current sp: super() pushes its object there */
                     goto do_construct_tramp;
+                }
+                if (tramp_can_call_promise_exec(super, argv, argc)) {
+                    /* super(fn) into the Promise constructor from a subclass: same builtin, same 27.2.3.1 steps —
+                       run the executor on THIS chain too. NewTarget stays the DERIVED class (so the promise gets the
+                       subclass prototype), the args are the derived frame's argv (nothing on the caller stack to
+                       pop), and `super` is an owned ref the continuation frees at finish. The promise super()
+                       yields is pushed at the current sp, exactly as the JS_CallConstructor2 path below does. */
+                    pe_ntgt = new_target; pe_executor = argv[0];
+                    pe_cfirst = 0; pe_cargc = 0; pe_super_ref = super;
+                    tramp_first = 0; tramp_is_tail = 0;
+                    goto do_promise_exec_tramp;
                 }
                 ret = JS_CallConstructor2(ctx, super, new_target, argc, argv);
                 JS_FreeValue(ctx, super);
@@ -25030,6 +25054,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JS_FreeValue(ctx, err);
             JS_FreeValue(ctx, ps->resolving_funcs[0]);
             JS_FreeValue(ctx, ps->resolving_funcs[1]);
+            JS_FreeValue(ctx, ps->super_ref);   /* super() entry: the parent-class ref */
             js_free_rt(rt, ps);
             cargv = sp - cargc;
             for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
@@ -25806,6 +25831,7 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                 ns->promise = js_dup(os->promise);
                 ns->resolving_funcs[0] = js_dup(os->resolving_funcs[0]);
                 ns->resolving_funcs[1] = js_dup(os->resolving_funcs[1]);
+                ns->super_ref = js_dup(os->super_ref);   /* each arm's continuation frees its own */
                 ns->cb_args[0] = JS_UNDEFINED;
                 ns->cb_args[1] = os->cb_args[1];   /* the executor: borrowed, kept alive by the cloned caller stack */
                 ns->cb_args[2] = ns->resolving_funcs[0];
