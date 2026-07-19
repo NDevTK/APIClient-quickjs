@@ -18241,6 +18241,11 @@ typedef struct TrampFrame {
 #define CONT_ASYNC_FROM_SYNC 10 /* cont_state = JSAsyncFromSync: `for await (x of syncGen)` — the async-from-sync
                                   wrapper's .next() drives syncGen.next() on the chain, then wraps {value,done} in
                                   Promise.resolve(value).then(unwrap) at the settle. No fork-clone yet (DFAIL-guarded). */
+#define CONT_PROXY_GET     13  /* cont_state = JSProxyGet: a trampolined proxy [[Get]] trap. The trap's RESULT must
+                                  still satisfy the target's non-configurable invariants, so the check rides a
+                                  continuation and runs at do_return, before the result is placed. */
+typedef struct JSProxyGet { JSValue target; JSAtom atom; } JSProxyGet;
+static JSValue js_proxy_get_invariant(JSContext *ctx, JSValueConst target, JSAtom atom, JSValue ret);
 #define CONT_ITER_FROM     12  /* cont_state = JSIterFrom: Iterator.from(obj) — GetIterator(obj) is performed by the
                                   shared acquire (so a generator-function @@iterator is created ON THE TRAMP) and the
                                   resulting iterator IS the call's result; the deliver just yields it. */
@@ -18653,7 +18658,7 @@ static inline bool tramp_is_global_eval(JSValueConst method) {
 static JSProxyData *get_proxy_method(JSContext *ctx, JSValue *pmethod, JSValueConst obj, JSAtom name);
 static inline bool tramp_can_call(JSValueConst func);
 static int js_tramp_proxy_get(JSContext *ctx, JSValue *sp_obj_slot, JSAtom atom,
-                              JSValue *out_extra /* 4 slots written on success */)
+                              JSValue *out_extra /* 4 slots written on success */, void **out_cont)
 {
     JSProxyData *s;
     JSValue method, keyval, recv;
@@ -18667,6 +18672,13 @@ static int js_tramp_proxy_get(JSContext *ctx, JSValue *sp_obj_slot, JSAtom atom,
     }
     keyval = JS_AtomToValue(ctx, atom);
     if (JS_IsException(keyval)) { JS_FreeValue(ctx, method); return -1; }
+    {   /* the invariant check needs (target, key) AFTER the trap returns -> carry them on a continuation */
+        JSProxyGet *pg = js_malloc(ctx, sizeof(*pg));
+        if (!pg) { JS_FreeValue(ctx, method); JS_FreeValue(ctx, keyval); return -1; }
+        pg->target = js_dup(s->target);
+        pg->atom = JS_DupAtom(ctx, atom);
+        *out_cont = pg;
+    }
     recv = *sp_obj_slot;                     /* receiver IS the proxy; the slot's ref transfers to it */
     *sp_obj_slot = js_dup(s->handler);       /* [-2] this = handler */
     out_extra[0] = method;                   /* [-1] the trap (owned) */
@@ -21766,7 +21778,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc = sf->cur_pc; sp = rtf->caller_sp;
                 cfirst = rtf->call_first; cargc = rtf->call_argc; itail = rtf->is_tail;
                 js_free_rt(rt, rtf);
-                if (rck == CONT_CONSTRUCT) {
+                if (rck == CONT_PROXY_GET) {
+                    /* the proxy [[Get]] trap returned: enforce the target's invariants on its result, then let the
+                       normal placement below drop the operands and push it. */
+                    JSProxyGet *pg = rcs;
+                    ret_val = js_proxy_get_invariant(ctx, pg->target, pg->atom, ret_val);
+                    JS_FreeValue(ctx, pg->target); JS_FreeAtom(ctx, pg->atom); js_free_rt(rt, pg);
+                    if (unlikely(JS_IsException(ret_val))) goto exception;
+                } else if (rck == CONT_CONSTRUCT) {
                     /* constructor body returned: apply the constructor rule — use the body result if it is an
                        object, else the created `this`. */
                     struct JSConstruct *cs = rcs;
@@ -22959,13 +22978,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sf->cur_pc = pc;
                     DCHECK(sp + 4 <= stack_buf + b->stack_size,
                            "proxy get trap: operand reshape exceeds the frame's compiled stack_size");
-                    pr_ret = js_tramp_proxy_get(ctx, &sp[-1], atom, sp);
-                    if (unlikely(pr_ret < 0)) goto exception;
-                    if (pr_ret > 0) {
+                    { void *pg_cont = NULL;
+                      pr_ret = js_tramp_proxy_get(ctx, &sp[-1], atom, sp, &pg_cont);
+                      if (unlikely(pr_ret < 0)) goto exception;
+                      if (pr_ret > 0) {
                         sp += 4;
                         call_argv = sp - 3; call_argc = 3; tramp_first = -2; tramp_is_tail = 0;
+                        tramp_cont_state = pg_cont; tramp_cont_kind = CONT_PROXY_GET;
                         goto do_tramp_call;
-                    }
+                      } }
                     obj = sp[-1];   /* untouched: no trap, or a C/bound trap -> the normal path below */
                 }
                 if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
@@ -24589,7 +24610,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         arg_allocated_size = rtf->caller_arg_allocated_size;
         pc = sf->cur_pc; sp = rtf->caller_sp;
         js_free_rt(rt, rtf);
-        if (xck == CONT_CONSTRUCT) {
+        if (xck == CONT_PROXY_GET) {
+            JSProxyGet *pg = xcs;
+            JS_FreeValue(ctx, pg->target); JS_FreeAtom(ctx, pg->atom); js_free_rt(rt, pg);
+        } else if (xck == CONT_CONSTRUCT) {
             /* the throwing frame was a constructor body: drop the created `this` and the super ctor ref. For
                new C() the operands on the caller stack are freed by the caller's own catch-search; for super()
                there are no caller-stack operands (args are the derived frame's argv). */
@@ -56583,6 +56607,35 @@ static int js_proxy_has(JSContext *ctx, JSValueConst obj, JSAtom atom)
     return ret;
 }
 
+/* [[Get]] invariant: a trap result for a non-configurable/non-writable own property of the target must be SameValue
+   as the target's value, and must be undefined for a non-configurable accessor with no getter. ONE implementation,
+   shared by the C path and by the trampolined trap's continuation — the check runs on the trap's RESULT, so the
+   tramp path can only honour it from a continuation, which is what CONT_PROXY_GET carries. Consumes `ret`. */
+static JSValue js_proxy_get_invariant(JSContext *ctx, JSValueConst target, JSAtom atom, JSValue ret)
+{
+    JSPropertyDescriptor desc;
+    int res = JS_GetOwnPropertyInternal(ctx, &desc, JS_VALUE_GET_OBJ(target), atom);
+    if (res < 0) {
+        JS_FreeValue(ctx, ret);
+        return JS_EXCEPTION;
+    }
+    if (res) {
+        if ((desc.flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)) == 0) {
+            if (!js_same_value(ctx, desc.value, ret))
+                goto fail;
+        } else if ((desc.flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE)) == JS_PROP_GETSET) {
+            if (JS_IsUndefined(desc.getter) && !JS_IsUndefined(ret)) {
+            fail:
+                js_free_desc(ctx, &desc);
+                JS_FreeValue(ctx, ret);
+                return JS_ThrowTypeError(ctx, "proxy: inconsistent get");
+            }
+        }
+        js_free_desc(ctx, &desc);
+    }
+    return ret;
+}
+
 static JSValue js_proxy_get(JSContext *ctx, JSValueConst obj, JSAtom atom,
                             JSValueConst receiver)
 {
@@ -56610,27 +56663,7 @@ static JSValue js_proxy_get(JSContext *ctx, JSValueConst obj, JSAtom atom,
     JS_FreeValue(ctx, atom_val);
     if (JS_IsException(ret))
         return JS_EXCEPTION;
-    res = JS_GetOwnPropertyInternal(ctx, &desc, JS_VALUE_GET_OBJ(s->target), atom);
-    if (res < 0) {
-        JS_FreeValue(ctx, ret);
-        return JS_EXCEPTION;
-    }
-    if (res) {
-        if ((desc.flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)) == 0) {
-            if (!js_same_value(ctx, desc.value, ret)) {
-                goto fail;
-            }
-        } else if ((desc.flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE)) == JS_PROP_GETSET) {
-            if (JS_IsUndefined(desc.getter) && !JS_IsUndefined(ret)) {
-            fail:
-                js_free_desc(ctx, &desc);
-                JS_FreeValue(ctx, ret);
-                return JS_ThrowTypeError(ctx, "proxy: inconsistent get");
-            }
-        }
-        js_free_desc(ctx, &desc);
-    }
-    return ret;
+    return js_proxy_get_invariant(ctx, s->target, atom, ret);
 }
 
 static int js_proxy_set(JSContext *ctx, JSValueConst obj, JSAtom atom,
