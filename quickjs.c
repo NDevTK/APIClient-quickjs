@@ -18552,6 +18552,7 @@ static inline bool tramp_can_call_async(JSValueConst func) {
    loop then preempts the base flow) instead of the C-recursive JS_Call. `pending_k` = the index whose callback
    result is currently awaited (-1 = none); `val` = that element (freed once its result is processed). */
 typedef struct JSArrayEvery {
+    JSStepHdr hdr;           /* MUST be first: the generic step driver casts the state to JSStepHdr * */
     JSValue obj, ret, val;
     int64_t len, k, n;
     int special, pending_k;
@@ -18577,7 +18578,6 @@ static int js_array_every_init(JSContext *ctx, struct JSArrayEvery *s, JSValueCo
 static int js_array_every_step(JSContext *ctx, struct JSArrayEvery *s, JSValue res, JSValueConst out_args[3]);
 static void js_array_every_end(JSContext *ctx, struct JSArrayEvery *s, bool take_ret);
 static JSValue js_array_every(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int special);
-static bool tramp_can_call_array_iter(JSValueConst func, int *out_special);
 /* reduce/reduceRight: the same continuation-holding shape as js_array_every, with the accumulator as the state. */
 typedef struct JSArrayReduce {
     JSValue obj, acc, val;
@@ -19770,6 +19770,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_async(call_argv[-1])) {   /* ASYNC fn -> body runs on THIS chain (base gen_state) */
                     tramp_first = -1; tramp_is_tail = (opcode == OP_tail_call); goto do_async_tramp_call;
                 }
+                if (tramp_step_def_of(call_argv[-1])) {   /* a STEP builtin called PLAINLY: f(), receiver undefined */
+                    tramp_first = -1; tramp_is_tail = (opcode == OP_tail_call); goto do_step_tramp;
+                }
                 if (tramp_can_call_gen_create(call_argv[-1])) {   /* generator fn g() -> params-to-initial_yield on THIS chain */
                     tramp_first = -1; tramp_is_tail = (opcode == OP_tail_call); goto do_generator_create_tramp;
                 }
@@ -19899,9 +19902,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_agen_create(call_argv[-1])) {   /* async generator method -> params here */
                     tramp_first = -2; tramp_is_tail = (opcode == OP_tail_call_method); goto do_agen_create_tramp;
                 }
-                if (tramp_can_call_array_iter(call_argv[-1], &iter_special)) {   /* arr.forEach/map/... -> callback drive on THIS chain */
-                    tramp_is_tail = (opcode == OP_tail_call_method); goto do_array_iter_tramp;
-                }
                 if (tramp_can_call_array_reduce(call_argv[-1], &iter_special)) {   /* arr.reduce/reduceRight -> callback drive on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_array_reduce_tramp;
                 }
@@ -19912,6 +19912,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_json_revive_tramp;
                 }
                 if (tramp_step_def_of(call_argv[-1])) {   /* a builtin DEFINED as a step machine: drive it on THIS chain */
+                    tramp_first = -2;   /* METHOD shape: receiver at call_argv[-2]. Never inherit a STALE
+                                           tramp_first — the driver reads it to find the receiver, so a leftover
+                                           -1 hands the builtin this=undefined and ToObject throws. */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_step_tramp;
                 }
                 if (tramp_can_call_iter_consume(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter)) {   /* Array.from(iterable) -> GetIterator + consume on THIS chain */
@@ -20443,14 +20446,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call(call_argv[-1])) goto do_tramp_call;
                 if (tramp_can_call_async(call_argv[-1])) goto do_async_tramp_call;
                 if (tramp_can_call_gen_create(call_argv[-1])) goto do_generator_create_tramp;
-                if (tramp_can_call_array_iter(call_argv[-1], &iter_special)) goto do_array_iter_tramp;
                 if (tramp_can_call_array_reduce(call_argv[-1], &iter_special)) goto do_array_reduce_tramp;
                 if (tramp_can_call_iter_consume(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter)) goto do_iter_consume_tramp;
                 if (tramp_can_call_objentries_consume(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter)) goto do_objentries_consume_tramp;
                 if (tramp_can_call_setop_consume(call_argv[-1], call_argv[-2], vc(call_argv), call_argc, &setop_kind)) goto do_setop_consume_tramp;
                 if (tramp_can_call_iterterm(ctx, call_argv[-1], call_argv[-2], call_argc, &iterterm_kind)) goto do_iterterm_tramp;
                 if (tramp_can_call_iterator_from(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter)) goto do_iterfrom_tramp;
-                if (tramp_step_def_of(call_argv[-1])) goto do_step_tramp;   /* same capability check as the direct-call site */
+                if (tramp_step_def_of(call_argv[-1])) { tramp_first = -2; goto do_step_tramp; }   /* reshaped to method shape */
                 /* The forwarded shape is identical to the direct one, so it must ask the SAME questions. This list
                    having fallen behind the OP_call_method list is why replace.call(123, "2", fn) reached the C
                    entry: same builtin, same callback, different answer depending on how the call was spelled. */
@@ -20663,7 +20665,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 const JSTrampStepDef *sd = tramp_step_def_of(call_argv[-1]);
                 void *stt;
                 DCHECK(sd != NULL, "do_step_tramp reached for a callee with no step definition");
-                stt = sd->init(ctx, call_argv[-2], call_argc, vc(call_argv), sd->arg);
+                /* tramp_first is -2 for a METHOD shape ([this, f, args]) and -1 for a PLAIN call ([f, args]),
+                   where the receiver is undefined — `TypedArray.prototype.forEach()` must reach init with
+                   this=undefined so it throws TypeError, not read an operand that is not there. */
+                stt = sd->init(ctx, tramp_first == -2 ? call_argv[-2] : JS_UNDEFINED,
+                               call_argc, vc(call_argv), sd->arg);
                 if (unlikely(!stt)) goto exception;
                 ((JSStepHdr *)stt)->def = sd;
                 ((JSStepHdr *)stt)->orig_cfirst = -2;
@@ -25308,8 +25314,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 js_iter_consume_end(ctx, (struct JSIterConsume *)xcs);
             else if (xck == CONT_ARRAY_REDUCE)
                 js_array_reduce_end(ctx, (struct JSArrayReduce *)xcs, false);
-            else if (xck == CONT_STEP)
+            else if (xck == CONT_STEP) {
+                /* fini OWNS the state allocation (every driver path calls it and expects the free), so the
+                   trailing js_free_rt below must not run — it was a DOUBLE FREE on the callback-throws path for
+                   every step builtin. NULL it so the shared free is skipped. */
                 ((JSStepHdr *)xcs)->def->fini(ctx, xcs, false);
+                xcs = NULL;
+            }
             else if (xck == CONT_STR_REPLACE)
                 js_str_replace_end(ctx, (JSStrReplace *)xcs, false);
             else if (xck == CONT_RE_REPLACE)
@@ -25319,7 +25330,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    without an arm above would be freed through the wrong struct — silent heap corruption on the
                    error path only. Name it instead: the missing arm is the bug. */
                 DFAIL("callback frame threw with a cont kind that has no teardown arm — add it here (freeing it as another struct corrupts the heap)");
-            js_free_rt(rt, xcs);
+            js_free_rt(rt, xcs);   /* xcs is NULL for CONT_STEP: its fini already freed the state */
         }
         goto exception;
     }
@@ -48829,49 +48840,47 @@ static void js_array_every_end(JSContext *ctx, JSArrayEvery *s, bool take_ret)
     s->ret = JS_UNDEFINED; s->val = JS_UNDEFINED; s->obj = JS_UNDEFINED;
 }
 
-static JSValue js_array_every(JSContext *ctx, JSValueConst this_val,
-                              int argc, JSValueConst *argv, int special)
+/* every/some/forEach/map/filter (and their TypedArray twins) as a STEP builtin. js_array_every was ALREADY split
+   into init/step/end — the C function was nothing but a JS_Call driver loop over that same machine, i.e. the
+   second, non-suspending driver. It is deleted, so the machine has exactly one driver and the recognizer that
+   chose between them has nothing left to choose. */
+static void *js_array_every_vinit(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int special)
 {
-    JSArrayEvery s;
-    JSValueConst args[3];
-    JSValue res = JS_UNDEFINED, ret;
-    int st;
-
-    if (js_array_every_init(ctx, &s, this_val, argc, argv, special))
-        goto exception;
-    for (;;) {
-        st = js_array_every_step(ctx, &s, res, args);   /* consumes res */
-        res = JS_UNDEFINED;
-        if (st < 0)
-            goto exception;
-        if (st == 0)
-            break;
-        res = JS_Call(ctx, s.func, s.this_arg, 3, args);
-        if (JS_IsException(res))
-            goto exception;
+    JSArrayEvery *s = js_mallocz(ctx, sizeof(*s));
+    if (!s) { JS_ThrowOutOfMemory(ctx); return NULL; }
+    /* init can fail AFTER taking refs (ToObject, LengthOfArrayLike): tear the partial state down through _end,
+       which frees exactly what it holds. Freeing the struct alone leaks those refs — the same failure-path
+       ownership mistake as the str/re replace inits. */
+    if (js_array_every_init(ctx, s, this_val, argc, argv, special)) {
+        js_array_every_end(ctx, s, false);
+        js_free(ctx, s);
+        return NULL;
     }
-    ret = s.ret;
-    js_array_every_end(ctx, &s, true);
-    return ret;
-
-exception:
-    JS_FreeValue(ctx, res);
-    js_array_every_end(ctx, &s, false);
-    return JS_EXCEPTION;
+    return s;
 }
 
-/* Is `func` one of the array iteration builtins whose callback drive runs on the tramp chain? Exact C-function
-   identity + its magic (the `special`) — the same dispatch quickjs itself uses, never a name/shape match. */
-static bool tramp_can_call_array_iter(JSValueConst func, int *out_special)
+static int js_array_every_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    JSObject *fp;
-    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
-    fp = JS_VALUE_GET_OBJ(func);
-    if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
-    if (fp->u.cfunc.cproto != JS_CFUNC_generic_magic) return false;
-    if (fp->u.cfunc.c_function.generic_magic != js_array_every) return false;
-    *out_special = fp->u.cfunc.magic;
-    return true;
+    JSArrayEvery *s = st;
+    int r = js_array_every_step(ctx, s, cb_result, (JSValueConst *)&s->cb_args[2]);   /* consumes cb_result */
+    if (r < 0)
+        return -1;
+    if (r == 0)
+        return 0;
+    /* cb_args is [this, func, val, idx, obj] — already the method-call shape the driver wants */
+    s->cb_args[0] = s->this_arg;
+    s->cb_args[1] = s->func;
+    *out_cb = s->cb_args; *out_argc = 3;
+    return 3;
+}
+
+static JSValue js_array_every_vfini(JSContext *ctx, void *st, bool take_result)
+{
+    JSArrayEvery *s = st;
+    JSValue r = take_result ? s->ret : JS_UNDEFINED;
+    js_array_every_end(ctx, s, take_result);
+    js_free(ctx, s);
+    return r;
 }
 
 #define special_reduce       0
@@ -49271,7 +49280,10 @@ static JSValue js_array_find_fini(JSContext *ctx, void *st, bool take_result)
 
 enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_ARRAY_FIND, STEPDEF_ARRAY_FIND_INDEX, STEPDEF_ARRAY_FIND_LAST, STEPDEF_ARRAY_FIND_LAST_INDEX,
-    STEPDEF_RE_REPLACE, STEPDEF_STR_REPLACE, STEPDEF_STR_REPLACE_ALL, STEPDEF_COUNT
+    STEPDEF_RE_REPLACE, STEPDEF_STR_REPLACE, STEPDEF_STR_REPLACE_ALL,
+    STEPDEF_ARRAY_EVERY, STEPDEF_ARRAY_SOME, STEPDEF_ARRAY_FOREACH, STEPDEF_ARRAY_MAP, STEPDEF_ARRAY_FILTER,
+    STEPDEF_TA_EVERY, STEPDEF_TA_SOME, STEPDEF_TA_FOREACH, STEPDEF_TA_MAP, STEPDEF_TA_FILTER,
+    STEPDEF_COUNT
 };
 /* One NAMED definition per builtin, referenced by its JS_CFUNC_STEP_DEF registration through the id above — the same shape as
    JS_CFUNC_MAGIC_DEF naming its C function, so the registration line tells you what runs. An index into a side
@@ -49283,6 +49295,16 @@ static const JSTrampStepDef js_array_findLastIndex_def = { js_array_find_init, j
 static const JSTrampStepDef js_re_replace_def          = { js_re_rep_init, js_re_rep_vstep, js_re_rep_fini, 0 };
 static const JSTrampStepDef js_str_replace_def         = { js_str_replace_init, js_str_replace_vstep, js_str_replace_fini, 0 };
 static const JSTrampStepDef js_str_replaceAll_def      = { js_str_replace_init, js_str_replace_vstep, js_str_replace_fini, 1 };
+static const JSTrampStepDef js_array_every_def     = { js_array_every_vinit, js_array_every_vstep, js_array_every_vfini, special_every };
+static const JSTrampStepDef js_array_some_def      = { js_array_every_vinit, js_array_every_vstep, js_array_every_vfini, special_some };
+static const JSTrampStepDef js_array_forEach_def   = { js_array_every_vinit, js_array_every_vstep, js_array_every_vfini, special_forEach };
+static const JSTrampStepDef js_array_map_def       = { js_array_every_vinit, js_array_every_vstep, js_array_every_vfini, special_map };
+static const JSTrampStepDef js_array_filter_def    = { js_array_every_vinit, js_array_every_vstep, js_array_every_vfini, special_filter };
+static const JSTrampStepDef js_ta_every_def        = { js_array_every_vinit, js_array_every_vstep, js_array_every_vfini, special_every | special_TA };
+static const JSTrampStepDef js_ta_some_def         = { js_array_every_vinit, js_array_every_vstep, js_array_every_vfini, special_some | special_TA };
+static const JSTrampStepDef js_ta_forEach_def      = { js_array_every_vinit, js_array_every_vstep, js_array_every_vfini, special_forEach | special_TA };
+static const JSTrampStepDef js_ta_map_def          = { js_array_every_vinit, js_array_every_vstep, js_array_every_vfini, special_map | special_TA };
+static const JSTrampStepDef js_ta_filter_def       = { js_array_every_vinit, js_array_every_vstep, js_array_every_vfini, special_filter | special_TA };
 
 /* Designated initializers, so each row states WHICH id it serves. Inserting a builtin cannot silently repoint an
    existing registration the way a positional table would. */
@@ -49294,6 +49316,12 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_RE_REPLACE]            = &js_re_replace_def,
     [STEPDEF_STR_REPLACE]           = &js_str_replace_def,
     [STEPDEF_STR_REPLACE_ALL]       = &js_str_replaceAll_def,
+    [STEPDEF_ARRAY_EVERY]   = &js_array_every_def,   [STEPDEF_ARRAY_SOME]    = &js_array_some_def,
+    [STEPDEF_ARRAY_FOREACH] = &js_array_forEach_def, [STEPDEF_ARRAY_MAP]     = &js_array_map_def,
+    [STEPDEF_ARRAY_FILTER]  = &js_array_filter_def,
+    [STEPDEF_TA_EVERY]      = &js_ta_every_def,      [STEPDEF_TA_SOME]       = &js_ta_some_def,
+    [STEPDEF_TA_FOREACH]    = &js_ta_forEach_def,    [STEPDEF_TA_MAP]        = &js_ta_map_def,
+    [STEPDEF_TA_FILTER]     = &js_ta_filter_def,
 };
 
 static const JSTrampStepDef *tramp_step_def_of(JSValueConst func)
@@ -51367,11 +51395,11 @@ static const JSCFunctionListEntry js_array_proto_funcs[] = {
     JS_CFUNC_DEF("at", 1, js_array_at ),
     JS_CFUNC_DEF("with", 2, js_array_with ),
     JS_CFUNC_DEF("concat", 1, js_array_concat ),
-    JS_CFUNC_MAGIC_DEF("every", 1, js_array_every, special_every ),
-    JS_CFUNC_MAGIC_DEF("some", 1, js_array_every, special_some ),
-    JS_CFUNC_MAGIC_DEF("forEach", 1, js_array_every, special_forEach ),
-    JS_CFUNC_MAGIC_DEF("map", 1, js_array_every, special_map ),
-    JS_CFUNC_MAGIC_DEF("filter", 1, js_array_every, special_filter ),
+    JS_CFUNC_STEP_DEF("every", 1, STEPDEF_ARRAY_EVERY ),
+    JS_CFUNC_STEP_DEF("some", 1, STEPDEF_ARRAY_SOME ),
+    JS_CFUNC_STEP_DEF("forEach", 1, STEPDEF_ARRAY_FOREACH ),
+    JS_CFUNC_STEP_DEF("map", 1, STEPDEF_ARRAY_MAP ),
+    JS_CFUNC_STEP_DEF("filter", 1, STEPDEF_ARRAY_FILTER ),
     JS_CFUNC_MAGIC_DEF("reduce", 1, js_array_reduce, special_reduce ),
     JS_CFUNC_MAGIC_DEF("reduceRight", 1, js_array_reduce, special_reduceRight ),
     JS_CFUNC_DEF("fill", 1, js_array_fill ),
@@ -67058,11 +67086,11 @@ static const JSCFunctionListEntry js_typed_array_base_proto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("entries", 0, js_create_typed_array_iterator, JS_ITERATOR_KIND_KEY_AND_VALUE ),
     JS_CGETSET_DEF("[Symbol.toStringTag]", js_typed_array_get_toStringTag, NULL ),
     JS_CFUNC_DEF("copyWithin", 2, js_typed_array_copyWithin ),
-    JS_CFUNC_MAGIC_DEF("every", 1, js_array_every, special_every | special_TA ),
-    JS_CFUNC_MAGIC_DEF("some", 1, js_array_every, special_some | special_TA ),
-    JS_CFUNC_MAGIC_DEF("forEach", 1, js_array_every, special_forEach | special_TA ),
-    JS_CFUNC_MAGIC_DEF("map", 1, js_array_every, special_map | special_TA ),
-    JS_CFUNC_MAGIC_DEF("filter", 1, js_array_every, special_filter | special_TA ),
+    JS_CFUNC_STEP_DEF("every", 1, STEPDEF_TA_EVERY ),
+    JS_CFUNC_STEP_DEF("some", 1, STEPDEF_TA_SOME ),
+    JS_CFUNC_STEP_DEF("forEach", 1, STEPDEF_TA_FOREACH ),
+    JS_CFUNC_STEP_DEF("map", 1, STEPDEF_TA_MAP ),
+    JS_CFUNC_STEP_DEF("filter", 1, STEPDEF_TA_FILTER ),
     JS_CFUNC_MAGIC_DEF("reduce", 1, js_array_reduce, special_reduce | special_TA ),
     JS_CFUNC_MAGIC_DEF("reduceRight", 1, js_array_reduce, special_reduceRight | special_TA ),
     JS_CFUNC_DEF("fill", 1, js_typed_array_fill ),
