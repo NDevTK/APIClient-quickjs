@@ -18383,7 +18383,7 @@ static int64_t string_advance_index(JSString *p, int64_t idx, bool unicode);
 static JSValue JS_RegExpExec(JSContext *ctx, JSValueConst r, JSValueConst s);
 static int js_str_replace_step(JSContext *ctx, JSStrReplace *s, JSValue cb_result);
 static void js_str_replace_end(JSContext *ctx, JSStrReplace *s, bool take_result);
-static bool tramp_can_call_str_replace(JSValueConst func, JSValueConst this_val,
+static bool tramp_can_call_str_replace(JSContext *ctx, JSValueConst func, JSValueConst this_val,
                                        JSValueConst *call_argv, int call_argc, int *out_is_all);
 static JSValue js_promise_constructor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv);
 static JSValue js_promise_new(JSContext *ctx, JSValueConst new_target, JSValue *resolving_funcs);
@@ -19913,7 +19913,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_step_def_of(call_argv[-1])) {   /* a builtin DEFINED as a step machine: drive it on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_step_tramp;
                 }
-                if (tramp_can_call_str_replace(call_argv[-1], call_argv[-2], vc(call_argv), call_argc, &srep_is_all)) {   /* str.replace(s,fn) -> replacer drive on THIS chain */
+                if (tramp_can_call_str_replace(ctx, call_argv[-1], call_argv[-2], vc(call_argv), call_argc, &srep_is_all)) {   /* str.replace(s,fn) -> replacer drive on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_str_replace_tramp;
                 }
                 if (tramp_can_call_re_replace(ctx, call_argv[-1], call_argv[-2], vc(call_argv), call_argc)) {   /* str.replace(/re/g,fn) -> @@replace phase 2 on THIS chain */
@@ -52821,7 +52821,7 @@ finish:
 /* Recognized only when every operand is already a primitive of the right type: this_val a STRING (so no ToString
    side effect is skipped), searchValue a STRING (an object would dispatch to @@replace), and the replacer a plain
    bytecode function (a C/bound replacer has no preemptible body, so the ordinary path is already correct). */
-static bool tramp_can_call_str_replace(JSValueConst func, JSValueConst this_val,
+static bool tramp_can_call_str_replace(JSContext *ctx, JSValueConst func, JSValueConst this_val,
                                        JSValueConst *call_argv, int call_argc, int *out_is_all)
 {
     JSObject *fp;
@@ -52833,7 +52833,11 @@ static bool tramp_can_call_str_replace(JSValueConst func, JSValueConst this_val,
     if (fp->u.cfunc.c_function.generic_magic != js_string_replace) return false;
     if (JS_VALUE_GET_TAG(this_val) != JS_TAG_STRING) return false;
     if (JS_VALUE_GET_TAG(call_argv[0]) != JS_TAG_STRING) return false;
-    if (!tramp_can_call(call_argv[1])) return false;
+    /* ANY callable replacer, not just a bytecode one. Requiring tramp_can_call here was the fallback in disguise:
+       a C/bound replacer fell through to a SECOND implementation of the same walk inside js_string_replace. The
+       step machine dispatches a non-tramp callback inline (it has no preemptible body, so nothing is lost), which
+       is what lets that legacy branch be deleted outright rather than fenced off. */
+    if (!JS_IsFunction(ctx, call_argv[1])) return false;
     *out_is_all = fp->u.cfunc.magic;
     return true;
 }
@@ -52914,10 +52918,14 @@ static JSValue js_string_replace(JSContext *ctx, JSValueConst this_val,
             }
         }
         if (functionalReplace) {
-            args[0] = search_str;
-            args[1] = js_int32(pos);
-            args[2] = str;
-            repl_str = JS_ToStringFree(ctx, JS_Call(ctx, replaceValue, JS_UNDEFINED, 3, args));
+            /* DELETED: the second implementation of this walk. A function replacer over a string searchValue is
+               driven ONLY by js_str_replace_step now — the recognizer accepts any callable, so nothing reaches
+               here. If something does, a call path bypassed the dispatch and must be routed, not re-implemented:
+               keeping a JS_Call loop here as the "not recognized" case is exactly the dual system that hides the
+               new machine's gaps. */
+            DFAIL("String.prototype.replace reached the C entry with a FUNCTION replacer — route that call site "
+                  "onto the step machine (js_str_replace_step); this branch no longer exists");
+            repl_str = JS_EXCEPTION;
         } else {
             args[0] = search_str;
             args[1] = str;
