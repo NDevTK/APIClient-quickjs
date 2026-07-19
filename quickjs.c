@@ -46929,67 +46929,20 @@ int JS_FreezeObject(JSContext *ctx, JSValueConst obj)
 static JSValue js_object_fromEntries(JSContext *ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv)
 {
-    JSValue obj, iter, next_method = JS_UNDEFINED;
-    JSValueConst iterable;
-    int done;
+    /* The iteration loop is DELETED. Object.fromEntries over any callable @@iterator is driven by the ONE consume
+       machine (ITERCONS_OBJENTRIES), which performs IfAbruptCloseIterator itself since 4fa2d2f. What remains here
+       is the case with no iteration at all: a source with no callable @@iterator, where GetIterator throws. A
+       source that DOES iterate reaching this entry means a call site was not routed — that is a bug to fix at the
+       call site, not a loop to keep for it. */
+    JSValue iter;
 
-    /*  RequireObjectCoercible() not necessary because it is tested in
-        JS_GetIterator() by JS_GetProperty() */
-    iterable = argv[0];
-
-    obj = JS_NewObject(ctx);
-    if (JS_IsException(obj))
-        return obj;
-
-    iter = JS_GetIterator(ctx, iterable, false);
+    iter = JS_GetIterator(ctx, argv[0], false);   /* throws for a non-iterable, which is the whole job left here */
     if (JS_IsException(iter))
-        goto fail;
-    next_method = JS_GetProperty(ctx, iter, JS_ATOM_next);
-    if (JS_IsException(next_method))
-        goto fail;
-
-    for(;;) {
-        JSValue key, value, item;
-        item = JS_IteratorNext(ctx, iter, next_method, 0, NULL, &done);
-        if (JS_IsException(item))
-            goto fail;
-        if (done)
-            break;
-
-        key = JS_UNDEFINED;
-        value = JS_UNDEFINED;
-        if (!JS_IsObject(item)) {
-            JS_ThrowTypeErrorNotAnObject(ctx);
-            goto fail1;
-        }
-        key = JS_GetPropertyUint32(ctx, item, 0);
-        if (JS_IsException(key))
-            goto fail1;
-        value = JS_GetPropertyUint32(ctx, item, 1);
-        if (JS_IsException(value)) {
-            JS_FreeValue(ctx, key);
-            goto fail1;
-        }
-        if (JS_DefinePropertyValueValue(ctx, obj, key, value,
-                                        JS_PROP_C_W_E | JS_PROP_THROW) < 0) {
-        fail1:
-            JS_FreeValue(ctx, item);
-            goto fail;
-        }
-        JS_FreeValue(ctx, item);
-    }
-    JS_FreeValue(ctx, next_method);
+        return JS_EXCEPTION;
     JS_FreeValue(ctx, iter);
-    return obj;
- fail:
-    if (JS_IsObject(iter)) {
-        /* close the iterator object, preserving pending exception */
-        JS_IteratorClose(ctx, iter, true);
-    }
-    JS_FreeValue(ctx, next_method);
-    JS_FreeValue(ctx, iter);
-    JS_FreeValue(ctx, obj);
-    return JS_EXCEPTION;
+    DFAIL("Object.fromEntries reached its C entry with an ITERABLE source — route that call site onto the consume "
+          "machine; the iteration loop here no longer exists");
+    return JS_ThrowTypeError(ctx, "Object.fromEntries not on the consume machine");
 }
 
 static JSValue js_object_is(JSContext *ctx, JSValueConst this_val,
