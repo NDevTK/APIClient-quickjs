@@ -20187,7 +20187,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSObject *np = JS_VALUE_GET_OBJ(nfunc);
                 JSFunctionBytecode *nb = np->u.func.function_bytecode;
                 int eff_argc = call_argc;
+                /* narg_alloc 0 = BORROW the args in place. That is only sound when the borrowed slots are the
+                   caller's operand stack, which the caller frees. A C-builtin CALLBACK borrows from the step
+                   state's own cb_args buffer instead, and a callee with a REST parameter builds its rest array
+                   out of those slots — which leaked the whole graph on every continuation-holding builtin
+                   (forEach/map/sort/reduce/find, and not getters, proxy traps, .call or .apply, which borrow from
+                   the stack). A callback frame therefore OWNS its arguments. */
                 int narg_alloc = (eff_argc < nb->arg_count) ? nb->arg_count : 0;
+                if (tramp_cont_kind != CONT_NONE && eff_argc > narg_alloc)
+                    narg_alloc = eff_argc;
                 size_t asize = sizeof(JSValue) * TRAMP_FRAME_SLOTS(narg_alloc, nb)
                              + sizeof(JSVarRef *) * nb->var_ref_count;
                 TrampFrame *ntf; JSValue *nlb, *narg_buf, *nvar_buf, *nstack_buf; JSStackFrame *nsf; int k;
