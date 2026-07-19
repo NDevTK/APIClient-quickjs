@@ -18729,6 +18729,10 @@ static JSValue js_array_reduce(JSContext *ctx, JSValueConst this_val, int argc, 
    the sort resumes byte-identically. O(n log n), stable. Default/native-comparator sorts stay on rqsort. */
 struct ValueSlot;
 typedef struct JSArraySort {
+    JSStepHdr hdr;                  /* MUST be first: the generic step driver casts the state to JSStepHdr * and
+                                       writes def/orig_c* through it. Without this the driver overwrote `obj`
+                                       with the step-def pointer, and the corruption only surfaced far away in
+                                       js_array_sort_end's teardown. */
     JSValue obj;                    /* the array object (owned) */
     JSValueConst method;            /* the comparator (borrowed from the caller's live stack) */
     struct ValueSlot *array, *tmp;  /* present-non-undefined elements + merge scratch */
@@ -18743,7 +18747,10 @@ static JSValue js_array_sort(JSContext *ctx, JSValueConst this_val, int argc, JS
 static int js_array_sort_init(JSContext *ctx, struct JSArraySort *s, JSValueConst this_val, JSValueConst method);
 static int js_array_sort_step(JSContext *ctx, struct JSArraySort *s, JSValue res, JSValueConst out_args[2]);
 static JSValue js_array_sort_end(JSContext *ctx, struct JSArraySort *s, bool ok);
-static bool tramp_can_call_array_sort(JSValueConst func, int argc, JSValueConst *argv);
+static void *js_array_sort_vinit(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int unused);
+static void *js_array_toSorted_vinit(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int unused);
+static int js_array_sort_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_array_sort_vfini(JSContext *ctx, void *st, bool take_result);
 
 /* JSON.parse(text, reviver): a SUSPENDABLE post-order tree walk. internalize_json_property recurses on the C
    stack and calls the reviver deep in that recursion; this coroutine flattens the recursion into an explicit
@@ -19887,9 +19894,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_agen_create(call_argv[-1])) {   /* async generator method -> params here */
                     tramp_first = -2; tramp_is_tail = (opcode == OP_tail_call_method); goto do_agen_create_tramp;
                 }
-                if (tramp_can_call_array_sort(call_argv[-1], call_argc, vc(call_argv))) {   /* arr.sort(cmp) -> merge-sort drive on THIS chain */
-                    tramp_is_tail = (opcode == OP_tail_call_method); goto do_sort_tramp;
-                }
                 if (tramp_can_call_json_parse(call_argv[-1], call_argc, vc(call_argv))) {   /* JSON.parse(s,reviver) -> reviver walk on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_json_revive_tramp;
                 }
@@ -20421,7 +20425,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 /* The forwarded shape is identical to the direct one, so it must ask the SAME questions. This list
                    having fallen behind the OP_call_method list is why replace.call(123, "2", fn) reached the C
                    entry: same builtin, same callback, different answer depending on how the call was spelled. */
-                if (tramp_can_call_array_sort(call_argv[-1], call_argc, vc(call_argv))) { tramp_is_tail = 0; goto do_sort_tramp; }
                 if (tramp_can_call_json_parse(call_argv[-1], call_argc, vc(call_argv))) { tramp_is_tail = 0; goto do_json_revive_tramp; }
                 {   /* g.next.call(g) / g.throw.call(g,e) / g.return.call(g,v): the reshape produced the exact
                        [this=generator, f=js_generator_next] method-call shape do_generator_tramp reads, so route the
@@ -49284,6 +49287,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_ARRAY_EVERY, STEPDEF_ARRAY_SOME, STEPDEF_ARRAY_FOREACH, STEPDEF_ARRAY_MAP, STEPDEF_ARRAY_FILTER,
     STEPDEF_TA_EVERY, STEPDEF_TA_SOME, STEPDEF_TA_FOREACH, STEPDEF_TA_MAP, STEPDEF_TA_FILTER,
     STEPDEF_ARRAY_REDUCE, STEPDEF_ARRAY_REDUCE_RIGHT, STEPDEF_TA_REDUCE, STEPDEF_TA_REDUCE_RIGHT,
+    STEPDEF_ARRAY_SORT, STEPDEF_ARRAY_TOSORTED,
     STEPDEF_COUNT
 };
 /* One NAMED definition per builtin, referenced by its JS_CFUNC_STEP_DEF registration through the id above — the same shape as
@@ -49305,6 +49309,8 @@ static const JSTrampStepDef js_ta_every_def        = { js_array_every_vinit, js_
 static const JSTrampStepDef js_ta_some_def         = { js_array_every_vinit, js_array_every_vstep, js_array_every_vfini, special_some | special_TA };
 static const JSTrampStepDef js_ta_forEach_def      = { js_array_every_vinit, js_array_every_vstep, js_array_every_vfini, special_forEach | special_TA };
 static const JSTrampStepDef js_ta_map_def          = { js_array_every_vinit, js_array_every_vstep, js_array_every_vfini, special_map | special_TA };
+static const JSTrampStepDef js_array_sort_def    = { js_array_sort_vinit, js_array_sort_vstep, js_array_sort_vfini, 0 };
+static const JSTrampStepDef js_array_toSorted_def = { js_array_toSorted_vinit, js_array_sort_vstep, js_array_sort_vfini, 0 };
 static const JSTrampStepDef js_array_reduce_def  = { js_array_reduce_vinit, js_array_reduce_vstep, js_array_reduce_vfini, special_reduce };
 static const JSTrampStepDef js_array_reduceR_def = { js_array_reduce_vinit, js_array_reduce_vstep, js_array_reduce_vfini, special_reduceRight };
 static const JSTrampStepDef js_ta_reduce_def     = { js_array_reduce_vinit, js_array_reduce_vstep, js_array_reduce_vfini, special_reduce | special_TA };
@@ -49327,6 +49333,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_TA_EVERY]      = &js_ta_every_def,      [STEPDEF_TA_SOME]       = &js_ta_some_def,
     [STEPDEF_TA_FOREACH]    = &js_ta_forEach_def,    [STEPDEF_TA_MAP]        = &js_ta_map_def,
     [STEPDEF_TA_FILTER]     = &js_ta_filter_def,
+    [STEPDEF_ARRAY_SORT]    = &js_array_sort_def,   [STEPDEF_ARRAY_TOSORTED] = &js_array_toSorted_def,
     [STEPDEF_ARRAY_REDUCE]  = &js_array_reduce_def,  [STEPDEF_ARRAY_REDUCE_RIGHT] = &js_array_reduceR_def,
     [STEPDEF_TA_REDUCE]     = &js_ta_reduce_def,     [STEPDEF_TA_REDUCE_RIGHT]    = &js_ta_reduceR_def,
 };
@@ -50129,8 +50136,32 @@ static int js_array_sort_step(JSContext *ctx, JSArraySort *s, JSValue res, JSVal
            bug; crash at its origin (offensive programming) rather than silently mis-sorting. */
         assert(s->lo <= s->l && s->l <= s->mid && s->mid <= s->r && s->r <= s->hi && s->hi <= s->n);
         assert(s->k - s->lo == (s->l - s->lo) + (s->r - s->mid));
-        if (s->l < s->mid && s->r < s->hi) {         /* the ONE suspension point */
-            out_args[0] = s->array[s->l].val;
+        if (s->l < s->mid && s->r < s->hi) {
+            if (JS_IsUndefined(s->method)) {
+                /* DEFAULT ordering: ToString both and compare — no callback, so no suspension point. It lives HERE
+                   so ONE machine covers both comparator kinds; leaving it in a second C body is the seam every bug
+                   this session came from. ToString is not bypassed for identical values (test262
+                   Array/prototype/sort/bug_596_1.js), and ties fall back to original position for stability. */
+                ValueSlot *ap = &s->array[s->l], *bp = &s->array[s->r];
+                int cmp;
+                if (!ap->str) {
+                    JSValue str = JS_ToString(ctx, ap->val);
+                    if (JS_IsException(str)) return -1;
+                    ap->str = JS_VALUE_GET_STRING(str);
+                }
+                if (!bp->str) {
+                    JSValue str = JS_ToString(ctx, bp->val);
+                    if (JS_IsException(str)) return -1;
+                    bp->str = JS_VALUE_GET_STRING(str);
+                }
+                cmp = js_string_compare(ap->str, bp->str);
+                if (cmp == 0)
+                    cmp = (ap->pos > bp->pos) - (ap->pos < bp->pos);
+                if (cmp <= 0) s->tmp[s->k++] = s->array[s->l++];
+                else          s->tmp[s->k++] = s->array[s->r++];
+                continue;
+            }
+            out_args[0] = s->array[s->l].val;   /* the ONE suspension point (a comparator was supplied) */
             out_args[1] = s->array[s->r].val;
             s->pending = 1;
             return 1;
@@ -50155,6 +50186,10 @@ static JSValue js_array_sort_end(JSContext *ctx, JSArraySort *s, bool ok)
     int64_t i, w = 0;
     if (!ok) goto fail;
     while (w < s->n) {                               /* sorted present elements back in place */
+        /* the default-ordering path caches each element's ToString in .str; release it here, exactly as the
+           rqsort writeback did. Nothing populated .str while only comparator sorts reached this machine, which
+           is why its absence was invisible until the default path was folded in. */
+        if (s->array[w].str) { JS_FreeValue(ctx, JS_MKPTR(JS_TAG_STRING, s->array[w].str)); s->array[w].str = NULL; }
         if (s->array[w].pos == w) { JS_FreeValue(ctx, s->array[w].val); }
         else if (JS_SetPropertyInt64(ctx, s->obj, w, s->array[w].val) < 0) { w++; goto fail; }
         w++;
@@ -50167,7 +50202,10 @@ static JSValue js_array_sort_end(JSContext *ctx, JSArraySort *s, bool ok)
         if (JS_DeletePropertyInt64(ctx, s->obj, i, JS_PROP_THROW) < 0) goto fail2;
     return s->obj;
 fail:
-    for (; w < s->n; w++) JS_FreeValue(ctx, s->array[w].val);
+    for (; w < s->n; w++) {
+        if (s->array[w].str) JS_FreeValue(ctx, JS_MKPTR(JS_TAG_STRING, s->array[w].str));
+        JS_FreeValue(ctx, s->array[w].val);
+    }
     js_free(ctx, s->array); s->array = NULL;
     js_free(ctx, s->tmp); s->tmp = NULL;
 fail2:
@@ -50175,131 +50213,76 @@ fail2:
     return JS_EXCEPTION;
 }
 
-/* arr.sort(cmp) where cmp (argv[0]) is a NORMAL bytecode function -> route to the suspendable coroutine. A
-   default sort (no cmp) or a native/bound comparator has no preemptible JS body and stays on rqsort. */
-static bool tramp_can_call_array_sort(JSValueConst func, int argc, JSValueConst *argv)
+/* The sort recognizer is DELETED. Its comment used to say a default sort or a native comparator "stays on rqsort"
+   — that sentence WAS the dual system: it named the second implementation the recognizer existed to select. With
+   rqsort's body gone and the default ordering folded into js_array_sort_step, there is nothing to select. */
+
+/* DELETED: the rqsort-based js_array_sort. It was a SECOND full implementation of sort — its own collection loop
+   with slack growth, its own undefined/hole ordering, its own writeback — duplicating js_array_sort_init /
+   _step / _end, which the trampoline already drives. Sort is now that one machine (STEPDEF_ARRAY_SORT), and with
+   the default-comparison branch in js_array_sort_step there is no case left for a C body to serve. */
+static void *js_array_sort_vinit(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int unused)
 {
-    JSObject *mp, *cp;
-    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
-    mp = JS_VALUE_GET_OBJ(func);
-    if (!(mp->class_id == JS_CLASS_C_FUNCTION && mp->u.cfunc.c_function.generic == js_array_sort)) return false;
-    if (argc < 1 || JS_VALUE_GET_TAG(argv[0]) != JS_TAG_OBJECT) return false;
-    cp = JS_VALUE_GET_OBJ(argv[0]);
-    return cp->class_id == JS_CLASS_BYTECODE_FUNCTION
-        && cp->u.func.function_bytecode->func_kind == JS_FUNC_NORMAL;
+    JSArraySort *s;
+    JSValueConst method = (argc > 0) ? argv[0] : JS_UNDEFINED;
+    if (!JS_IsUndefined(method) && check_function(ctx, method))
+        return NULL;   /* spec: a non-callable comparator throws BEFORE anything is read */
+    s = js_mallocz(ctx, sizeof(*s));
+    if (!s) { JS_ThrowOutOfMemory(ctx); return NULL; }
+    if (js_array_sort_init(ctx, s, this_val, method)) {
+        js_array_sort_end(ctx, s, false);
+        js_free(ctx, s);
+        return NULL;
+    }
+    return s;
 }
 
-static JSValue js_array_sort(JSContext *ctx, JSValueConst this_val,
-                             int argc, JSValueConst *argv)
+static int js_array_sort_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    struct array_sort_context asc = { ctx, 0, 0, argv[0] };
-    JSValue obj = JS_UNDEFINED;
-    ValueSlot *array = NULL;
-    size_t array_size = 0, pos = 0, n = 0;
-    int64_t i, len, undefined_count = 0;
-    int present;
+    JSArraySort *s = st;
+    int r = js_array_sort_step(ctx, s, cb_result, (JSValueConst *)&s->cb_args[2]);   /* consumes cb_result */
+    if (r < 0) return -1;
+    if (r == 0) return 0;
+    s->cb_args[0] = JS_UNDEFINED;            /* the comparator gets this = undefined */
+    s->cb_args[1] = s->method;
+    *out_cb = s->cb_args; *out_argc = 2;
+    return 3;
+}
 
-    if (!JS_IsUndefined(asc.method)) {
-        if (check_function(ctx, asc.method))
-            goto exception;
-        asc.has_method = 1;
-    }
-    obj = JS_ToObject(ctx, this_val);
-    if (js_get_length64(ctx, &len, obj))
-        goto exception;
-
-    /* XXX: should special case fast arrays */
-    for (i = 0; i < len; i++) {
-        if (pos >= array_size) {
-            size_t new_size, slack;
-            ValueSlot *new_array;
-            new_size = (array_size + (array_size >> 1) + 31) & ~15;
-            new_array = js_realloc2(ctx, array, new_size * sizeof(*array), &slack);
-            if (new_array == NULL)
-                goto exception;
-            new_size += slack / sizeof(*new_array);
-            array = new_array;
-            array_size = new_size;
-        }
-        present = JS_TryGetPropertyInt64(ctx, obj, i, &array[pos].val);
-        if (present < 0)
-            goto exception;
-        if (present == 0)
-            continue;
-        if (JS_IsUndefined(array[pos].val)) {
-            undefined_count++;
-            continue;
-        }
-        array[pos].str = NULL;
-        array[pos].pos = i;
-        pos++;
-    }
-    rqsort(array, pos, sizeof(*array), js_array_cmp_generic, &asc);
-    if (asc.exception)
-        goto exception;
-
-    /* XXX: should special case fast arrays */
-    while (n < pos) {
-        if (array[n].str)
-            JS_FreeValue(ctx, JS_MKPTR(JS_TAG_STRING, array[n].str));
-        if (array[n].pos == n) {
-            JS_FreeValue(ctx, array[n].val);
-        } else {
-            if (JS_SetPropertyInt64(ctx, obj, n, array[n].val) < 0) {
-                n++;
-                goto exception;
-            }
-        }
-        n++;
-    }
-    js_free(ctx, array);
-    for (i = n; undefined_count-- > 0; i++) {
-        if (JS_SetPropertyInt64(ctx, obj, i, JS_UNDEFINED) < 0)
-            goto fail;
-    }
-    for (; i < len; i++) {
-        if (JS_DeletePropertyInt64(ctx, obj, i, JS_PROP_THROW) < 0)
-            goto fail;
-    }
-    return obj;
-
-exception:
-    for (; n < pos; n++) {
-        JS_FreeValue(ctx, array[n].val);
-        if (array[n].str)
-            JS_FreeValue(ctx, JS_MKPTR(JS_TAG_STRING, array[n].str));
-    }
-    js_free(ctx, array);
-fail:
-    JS_FreeValue(ctx, obj);
-    return JS_EXCEPTION;
+static JSValue js_array_sort_vfini(JSContext *ctx, void *st, bool take_result)
+{
+    JSArraySort *s = st;
+    JSValue r = js_array_sort_end(ctx, s, take_result);   /* writes back and yields the array */
+    js_free(ctx, s);
+    if (!take_result) { JS_FreeValue(ctx, r); return JS_UNDEFINED; }
+    return r;
 }
 
 // Note: a.toSorted() is a.slice().sort() with the twist that a.slice()
 // leaves holes in sparse arrays intact whereas a.toSorted() replaces them
 // with undefined, thus in effect creating a dense array.
 // Does not use Array[@@species], always returns a base Array.
-static JSValue js_array_toSorted(JSContext *ctx, JSValueConst this_val,
-                                 int argc, JSValueConst *argv)
+/* toSorted is sort over a COPY, so it IS the sort machine — only its init differs (build the copy, then hand that
+   to js_array_sort_init). js_array_sort_end already writes back into that copy and yields it, which is exactly
+   toSorted's result, so vstep/vfini are sort's own and there is no second driver. */
+static void *js_array_toSorted_vinit(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int unused)
 {
-    JSValue arr, obj, ret, *arrp, *pval;
+    JSArraySort *s;
+    JSValue arr, obj, *arrp, *pval;
     JSObject *p;
     int64_t i, len;
     uint32_t count32;
+    JSValueConst method = (argc > 0) ? argv[0] : JS_UNDEFINED;
 
-    if (!JS_IsUndefined(argv[0]))
-        if (check_function(ctx, argv[0]))
-            return JS_EXCEPTION;
-
-    ret = JS_EXCEPTION;
-    arr = JS_UNDEFINED;
+    if (!JS_IsUndefined(method) && check_function(ctx, method))
+        return NULL;
     obj = JS_ToObject(ctx, this_val);
-    if (js_get_length64(ctx, &len, obj))
-        goto exception;
+    if (JS_IsException(obj))
+        return NULL;
+    if (js_get_length64(ctx, &len, obj)) { JS_FreeValue(ctx, obj); return NULL; }
 
     arr = js_allocate_fast_array(ctx, len);
-    if (JS_IsException(arr))
-        goto exception;
+    if (JS_IsException(arr)) { JS_FreeValue(ctx, obj); return NULL; }
 
     if (len > 0) {
         p = JS_VALUE_GET_OBJ(arr);
@@ -50310,24 +50293,27 @@ static JSValue js_array_toSorted(JSContext *ctx, JSValueConst this_val,
                 *pval = js_dup(arrp[i]);
         } else {
             for (; i < len; i++, pval++) {
-                if (-1 == JS_TryGetPropertyInt64(ctx, obj, i, pval))
-                    goto exception;
+                if (-1 == JS_TryGetPropertyInt64(ctx, obj, i, pval)) {
+                    p->u.array.count = i;   /* only the slots written so far are initialised */
+                    JS_FreeValue(ctx, arr); JS_FreeValue(ctx, obj);
+                    return NULL;
+                }
             }
         }
+        p->u.array.count = len;
     }
-
-    ret = js_array_sort(ctx, arr, argc, argv);
-    if (JS_IsException(ret))
-        goto exception;
-    JS_FreeValue(ctx, ret);
-
-    ret = arr;
-    arr = JS_UNDEFINED;
-
-exception:
-    JS_FreeValue(ctx, arr);
     JS_FreeValue(ctx, obj);
-    return ret;
+
+    s = js_mallocz(ctx, sizeof(*s));
+    if (!s) { JS_FreeValue(ctx, arr); JS_ThrowOutOfMemory(ctx); return NULL; }
+    if (js_array_sort_init(ctx, s, arr, method)) {
+        js_array_sort_end(ctx, s, false);
+        js_free(ctx, s);
+        JS_FreeValue(ctx, arr);
+        return NULL;
+    }
+    JS_FreeValue(ctx, arr);   /* js_array_sort_init took its own ref via JS_ToObject */
+    return s;
 }
 
 typedef struct JSArrayIteratorData {
@@ -51426,8 +51412,8 @@ static const JSCFunctionListEntry js_array_proto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("unshift", 1, js_array_push, 1 ),
     JS_CFUNC_DEF("reverse", 0, js_array_reverse ),
     JS_CFUNC_DEF("toReversed", 0, js_array_toReversed ),
-    JS_CFUNC_DEF("sort", 1, js_array_sort ),
-    JS_CFUNC_DEF("toSorted", 1, js_array_toSorted ),
+    JS_CFUNC_STEP_DEF("sort", 1, STEPDEF_ARRAY_SORT ),
+    JS_CFUNC_STEP_DEF("toSorted", 1, STEPDEF_ARRAY_TOSORTED ),
     JS_CFUNC_MAGIC_DEF("slice", 2, js_array_slice, 0 ),
     JS_CFUNC_MAGIC_DEF("splice", 2, js_array_slice, 1 ),
     JS_CFUNC_DEF("toSpliced", 2, js_array_toSpliced ),
