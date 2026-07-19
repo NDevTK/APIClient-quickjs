@@ -18529,6 +18529,7 @@ static JSValue js_object_fromEntries(JSContext *ctx, JSValueConst this_val, int 
 static bool tramp_can_call_objentries_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, JSValue *out_getiter);
 static bool tramp_can_call_setop_consume(JSValueConst func, JSValueConst this_val, JSValueConst *call_argv, int call_argc, uint8_t *out_setop);
 static int check_function(JSContext *ctx, JSValueConst obj);
+static void iter_helper_close_source_abrupt(JSContext *ctx, JSIteratorHelperData *it);
 static bool tramp_can_call_iterterm(JSContext *ctx, JSValueConst func, JSValueConst this_val, int call_argc, uint8_t *out_term);
 static JSValue js_iterator_proto_terminal(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
 static JSValue js_typed_array_constructor_obj(JSContext *ctx, JSValueConst new_target, JSValueConst obj, int classid);
@@ -21091,15 +21092,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     tramp_gen_cont_consume = 1; tramp_gen_magic = GEN_MAGIC_NEXT;
                     goto do_generator_tramp;
                 }
-                ret_val = JS_Call(ctx, s->next, s->iter, 0, NULL);
-                if (JS_IsException(ret_val)) { ret_val = JS_UNINITIALIZED; js_iter_consume_end(ctx, s); js_free_rt(rt, s); goto exception; }
-                if (!JS_IsObject(ret_val)) {
-                    JS_FreeValue(ctx, ret_val); ret_val = JS_UNINITIALIZED;
-                    js_iter_consume_end(ctx, s); js_free_rt(rt, s);
-                    JS_ThrowTypeError(ctx, "iterator result not an object");
-                    goto exception;
-                }
-                goto do_iter_consume_step;
+                /* PLAIN iterator: drive its .next() on the tramp as well - [this=iterator, next], no args. */
+                DCHECK(sp + 2 <= TRAMP_SP_LIMIT(stack_buf, b),
+                       "plain .next() drive: operand push exceeds the frame's compiled stack_size");
+                *sp++ = js_dup(s->iter);
+                *sp++ = js_dup(s->next);
+                call_argv = sp; call_argc = 0; tramp_first = -2; tramp_is_tail = 0;
+                tramp_cont_state = s; tramp_cont_kind = CONT_ITER_CONSUME;
+                if (tramp_can_call(call_argv[-1])) goto do_tramp_call;
+                tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;
+                { JSValue nr = JS_Call(ctx, call_argv[-1], call_argv[-2], 0, NULL);
+                  JS_FreeValue(ctx, call_argv[-1]); JS_FreeValue(ctx, call_argv[-2]); sp -= 2;
+                  if (JS_IsException(nr)) { js_iter_consume_end(ctx, s); js_free_rt(rt, s); goto exception; }
+                  if (!JS_IsObject(nr)) { JS_FreeValue(ctx, nr); js_iter_consume_end(ctx, s); js_free_rt(rt, s);
+                                          JS_ThrowTypeError(ctx, "iterator result not an object"); goto exception; }
+                  ret_val = nr; goto do_iter_consume_step; }
             }
 
         do_promise_all_consume_tramp:
@@ -21401,10 +21408,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         it = inner;
                         continue;
                     }
-                    /* PLAIN: call .next() (non-suspending) and feed the result back to the step. */
-                    ret_val = JS_Call(ctx, drive_next, drive_obj, 0, NULL);
-                    if (JS_IsException(ret_val)) { ret_val = JS_UNINITIALIZED; it->executing = 0; goto exception; }
-                    if (!JS_IsObject(ret_val)) { JS_FreeValue(ctx, ret_val); ret_val = JS_UNINITIALIZED; it->executing = 0; JS_ThrowTypeError(ctx, "iterator result not an object"); goto exception; }
+                    /* PLAIN iterator: its .next is frequently a JS function with a loop of its own, so it runs ON
+                       THE TRAMP too - [this=iterator, next] with no args; do_return re-enters this step with the
+                       iterator result and validates it is an object. */
+                    DCHECK(sp + 2 <= TRAMP_SP_LIMIT(stack_buf, b),
+                           "plain .next() drive: operand push exceeds the frame's compiled stack_size");
+                    *sp++ = js_dup(drive_obj);
+                    *sp++ = js_dup(drive_next);
+                    call_argv = sp; call_argc = 0; tramp_first = -2; tramp_is_tail = 0;
+                    tramp_cont_state = it; tramp_cont_kind = CONT_ITER_HELPER;
+                    if (tramp_can_call(call_argv[-1])) goto do_tramp_call;
+                    tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;
+                    { JSValue nr = JS_Call(ctx, call_argv[-1], call_argv[-2], 0, NULL);
+                      JS_FreeValue(ctx, call_argv[-1]); JS_FreeValue(ctx, call_argv[-2]); sp -= 2;
+                      if (JS_IsException(nr)) { it->executing = 0; goto exception; }
+                      if (!JS_IsObject(nr)) { JS_FreeValue(ctx, nr); it->executing = 0; JS_ThrowTypeError(ctx, "iterator result not an object"); goto exception; }
+                      ret_val = nr; continue; }
                 }
             }
 
@@ -22051,10 +22070,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     /* the ITERTERM callback returned: drop its operands (do_tramp_call dup'd the args and recorded
                        caller_sp ABOVE them) and resume the consume step with the result. */
                     JSValue *cargv = sp - cargc;
-                    DCHECK(cargc - cfirst == 4 || cargc - cfirst == 5,
-                           "iterterm callback frame has an unexpected operand shape");
+                    int nops = cargc - cfirst;
+                    DCHECK(nops == 2 || nops == 4 || nops == 5, "consume cont frame has an unexpected operand shape");
                     for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
                     sp += cfirst - cargc;
+                    if (nops == 2 && !JS_IsException(ret_val) && !JS_IsObject(ret_val)) {
+                        JS_FreeValue(ctx, ret_val); ret_val = JS_UNINITIALIZED;
+                        js_iter_consume_end(ctx, (JSIterConsume *)rcs); js_free_rt(rt, rcs);
+                        JS_ThrowTypeError(ctx, "iterator result not an object");
+                        goto exception;
+                    }
                     cont_st = rcs; cont_kind_cur = CONT_ITER_CONSUME;
                     goto do_iter_consume_step;
                 }
@@ -22063,9 +22088,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        the args, so the caller-stack operands are still owned here — free them BEFORE re-entering,
                        since jumping past the shared cleanup below would leak all four and corrupt refcounts. */
                     JSValue *cargv = sp - cargc;   /* do_tramp_call recorded caller_sp = sp ABOVE the operands */
-                    DCHECK(cargc - cfirst == 4, "helper callback frame has an unexpected operand shape");
+                    int nops = cargc - cfirst;
+                    DCHECK(nops == 2 || nops == 4, "helper cont frame has an unexpected operand shape");
                     for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
-                    sp += cfirst - cargc;          /* drop [this, func, value, index] */
+                    sp += cfirst - cargc;          /* drop [this, next] or [this, func, value, index] */
+                    if (nops == 2 && !JS_IsException(ret_val) && !JS_IsObject(ret_val)) {
+                        JS_FreeValue(ctx, ret_val); ret_val = JS_UNINITIALIZED;
+                        ((JSIteratorHelperData *)rcs)->executing = 0;
+                        JS_ThrowTypeError(ctx, "iterator result not an object");
+                        goto exception;
+                    }
                     cont_st = rcs; cont_kind_cur = CONT_ITER_HELPER;
                     goto do_iter_helper_step;
                 }
@@ -24902,11 +24934,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         pc = sf->cur_pc; sp = rtf->caller_sp;
         js_free_rt(rt, rtf);
         if (xck == CONT_ITER_HELPER) {
-            /* the map/filter callback threw: the helper is a GC object, so only its held value needs releasing;
-               the abrupt close of the source is the step's job and already ran for the throwing path. */
+            /* the map/filter/flatMap callback THREW. Control never reaches the step's resume, so IfAbruptCloseIterator
+               must happen HERE - the spec closes the underlying iterator when the callback throws, and skipping it is
+               what mapper-throws / mapper-throws-then-closing-iterator-also-throws detect. */
             JSIteratorHelperData *cit = (JSIteratorHelperData *)xcs;
             JS_FreeValue(ctx, cit->cb_value); cit->cb_value = JS_UNDEFINED;
+            cit->done = 1;
             cit->executing = 0;
+            iter_helper_close_source_abrupt(ctx, cit);
         } else if (xck == CONT_PROXY_GET) {
             JSProxyGet *pg = xcs;
             JS_FreeValue(ctx, pg->target); JS_FreeAtom(ctx, pg->atom); js_free_rt(rt, pg);
@@ -24925,6 +24960,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             /* the throwing frame was a C-builtin-driven CALLBACK: abandon the iteration (its state owns the
                object/accumulator/element) and re-raise in the builtin's ORIGINAL caller, whose stack still holds
                the OP_call operands for its own catch-search to free. */
+            if (xck == CONT_ITER_CONSUME && ((struct JSIterConsume *)xcs)->sink == ITERCONS_ITERTERM
+                && !JS_IsUndefined(((struct JSIterConsume *)xcs)->iter)) {
+                /* an Iterator.prototype terminal's callback THREW: same IfAbruptCloseIterator obligation. A generator
+                   source closes on the tramp via the exception label's deferral; anything else closes inline. */
+                struct JSIterConsume *cs2 = (struct JSIterConsume *)xcs;
+                if (JS_VALUE_GET_TAG(cs2->iter) == JS_TAG_OBJECT
+                    && JS_VALUE_GET_OBJ(cs2->iter)->class_id == JS_CLASS_GENERATOR
+                    && JS_VALUE_GET_OBJ(cs2->iter)->u.generator_data
+                    && JS_IsUninitialized(ctx->pending_close_gen))
+                    ctx->pending_close_gen = js_dup(cs2->iter);
+                else
+                    JS_IteratorClose(ctx, cs2->iter, true);
+            }
             if (xck == CONT_ARRAY_ITER)
                 js_array_every_end(ctx, (struct JSArrayEvery *)xcs, false);
             else if (xck == CONT_SORT)
@@ -47673,8 +47721,6 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
                with (value, counter) — or (accumulator, value, counter) for reduce. A deciding element short-circuits
                and returns 2 so the shared close-then-finish runs the spec IteratorClose ON THE TRAMP. */
             JSValue idx = js_int64(s->k++);
-            JSValue fret;
-            JSValueConst args[3];
             if (s->setop == ITERTERM_TOARRAY) {
                 JS_FreeValue(ctx, idx);
                 if (JS_DefinePropertyValueInt64(ctx, s->r, s->k - 1, value, JS_PROP_C_W_E | JS_PROP_THROW) < 0) return -1;
@@ -47811,6 +47857,11 @@ static bool iter_data_at_iterator(JSContext *ctx, JSValueConst items, JSValue *o
 /* Consumers that drive a generator OR helper (Array.from / spread / Set / Map / Object.fromEntries / TypedArray):
    accept when the iterator will be a generator/helper — a generator-function @@iterator (created on the tramp) or a
    direct generator/helper (its @@iterator returns itself). *out_getiter = the method (owned) for the consume tramp. */
+/* GENERATOR-BACKED sources only. Broadening this to every callable @@iterator was tried and REVERTED: routing all
+   iterables through the consume machinery regressed 12 tests (Array.from 2, Set 1, Map 4, Object.fromEntries 5),
+   so the C path still owns semantics this machinery does not reproduce. Consequence, stated rather than hidden: a
+   PLAIN iterator consumed by Array.from/spread/Set/Map still drives its .next from C, so a loop in that .next
+   cannot park - unlike the same iterator consumed by an Iterator.prototype method, which now can. */
 static bool iter_consume_gen_backed(JSContext *ctx, JSValueConst items, JSValue *out_getiter)
 {
     JSValue m;
@@ -56973,9 +57024,7 @@ static JSValue js_proxy_get(JSContext *ctx, JSValueConst obj, JSAtom atom,
 {
     JSProxyData *s;
     JSValue method, ret, atom_val;
-    int res;
     JSValueConst args[3];
-    JSPropertyDescriptor desc;
 
     s = get_proxy_method(ctx, &method, obj, JS_ATOM_get);
     if (!s)
