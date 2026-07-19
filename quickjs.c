@@ -19770,9 +19770,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_async(call_argv[-1])) {   /* ASYNC fn -> body runs on THIS chain (base gen_state) */
                     tramp_first = -1; tramp_is_tail = (opcode == OP_tail_call); goto do_async_tramp_call;
                 }
-                if (tramp_step_def_of(call_argv[-1])) {   /* a STEP builtin called PLAINLY: f(), receiver undefined */
-                    tramp_first = -1; tramp_is_tail = (opcode == OP_tail_call); goto do_step_tramp;
-                }
                 if (tramp_can_call_gen_create(call_argv[-1])) {   /* generator fn g() -> params-to-initial_yield on THIS chain */
                     tramp_first = -1; tramp_is_tail = (opcode == OP_tail_call); goto do_generator_create_tramp;
                 }
@@ -19831,20 +19828,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     call_argc = 0; tramp_first = -1; tramp_is_tail = (opcode == OP_tail_call);
                     goto do_tramp_call;
                 }
-                ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
-                                          JS_UNDEFINED, call_argc,
-                                          vc(call_argv), 0);
-                if (unlikely(JS_IsException(ret_val)))
-                    goto exception;
-                if (opcode == OP_tail_call)
-                    goto do_return;   /* NOT `done`: a trampolined caller (tf_top!=NULL) tail-calling a non-NORMAL
-                                         callee must UNWIND its tramp chain (do_return pops it, or falls to `done`
-                                         at the base) — `goto done` returned from JS_CallInternal abandoning tf_top,
-                                         leaking the trampoline frames' held values. */
-                for(i = -1; i < call_argc; i++)
-                    JS_FreeValue(ctx, call_argv[i]);
-                sp -= call_argc + 1;
-                *sp++ = ret_val;
+                tramp_first = -1; tramp_is_tail = (opcode == OP_tail_call);
+                goto do_generic_callee;
             }
             BREAK;
         CASE(OP_call_constructor):
@@ -19910,12 +19895,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 if (tramp_can_call_json_parse(call_argv[-1], call_argc, vc(call_argv))) {   /* JSON.parse(s,reviver) -> reviver walk on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_json_revive_tramp;
-                }
-                if (tramp_step_def_of(call_argv[-1])) {   /* a builtin DEFINED as a step machine: drive it on THIS chain */
-                    tramp_first = -2;   /* METHOD shape: receiver at call_argv[-2]. Never inherit a STALE
-                                           tramp_first — the driver reads it to find the receiver, so a leftover
-                                           -1 hands the builtin this=undefined and ToObject throws. */
-                    tramp_is_tail = (opcode == OP_tail_call_method); goto do_step_tramp;
                 }
                 if (tramp_can_call_iter_consume(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter)) {   /* Array.from(iterable) -> GetIterator + consume on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_iter_consume_tramp;
@@ -20125,17 +20104,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         goto do_generator_tramp;
                     }
                 }
-                ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
-                                          JS_UNDEFINED, call_argc,
-                                          vc(call_argv), 0);
-                if (unlikely(JS_IsException(ret_val)))
-                    goto exception;
-                if (opcode == OP_tail_call_method)
-                    goto do_return;   /* unwind the tramp chain if trampolined (see OP_tail_call above) */
-                for(i = -2; i < call_argc; i++)
-                    JS_FreeValue(ctx, call_argv[i]);
-                sp -= call_argc + 2;
-                *sp++ = ret_val;
+                tramp_first = -2; tramp_is_tail = (opcode == OP_tail_call_method);
+                goto do_generic_callee;
             }
             BREAK;
         CASE(OP_array_from):
@@ -20452,7 +20422,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_setop_consume(call_argv[-1], call_argv[-2], vc(call_argv), call_argc, &setop_kind)) goto do_setop_consume_tramp;
                 if (tramp_can_call_iterterm(ctx, call_argv[-1], call_argv[-2], call_argc, &iterterm_kind)) goto do_iterterm_tramp;
                 if (tramp_can_call_iterator_from(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter)) goto do_iterfrom_tramp;
-                if (tramp_step_def_of(call_argv[-1])) { tramp_first = -2; goto do_step_tramp; }   /* reshaped to method shape */
                 /* The forwarded shape is identical to the direct one, so it must ask the SAME questions. This list
                    having fallen behind the OP_call_method list is why replace.call(123, "2", fn) reached the C
                    entry: same builtin, same callback, different answer depending on how the call was spelled. */
@@ -20465,17 +20434,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     int gmag = tramp_gen_method_magic(call_argv[-1], call_argv[-2]);
                     if (gmag >= 0) { tramp_gen_magic = gmag; goto do_generator_tramp; }
                 }
-                /* a C-function / bound / proxy target has no preemptible body — plain call, nothing to park */
-                ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2], JS_UNDEFINED,
-                                          call_argc, vc(call_argv), 0);
-                if (unlikely(JS_IsException(ret_val)))
-                    goto exception;
-                if (tramp_is_tail)
-                    goto do_return;
-                for (i = -2; i < call_argc; i++) JS_FreeValue(ctx, (JSValue)call_argv[i]);
-                sp -= call_argc + 2;
-                *sp++ = ret_val;
-                BREAK;
+                /* no bytecode body: same convergence point as every other call shape (shape already -2) */
+                tramp_first = -2;
+                goto do_generic_callee;
             }
 
         do_apply_tramp:
@@ -20657,6 +20618,32 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 ret_val = JS_UNDEFINED;
                 goto do_array_reduce_step;
             }
+
+        do_generic_callee:
+            /* THE convergence point for a callee with no bytecode body. Every call shape arrives having declared
+               only its OPERAND SHAPE (tramp_first: -1 plain [f,args], -2 method [this,f,args]) — the cleanup below
+               is fully determined by it, which is why these were duplicate blocks. The step-machine question is
+               asked HERE, ONCE: a per-call-site predicate is the recognizer allowlist in its final costume, since
+               it must be re-added per call opcode and each omission is a silent gap (routing plain f() was exactly
+               that gap, and each copy then needed its own tramp_first). */
+            {
+                JSValueConst gthis = (tramp_first == -2) ? call_argv[-2] : JS_UNDEFINED;
+                if (tramp_step_def_of(call_argv[-1]))
+                    goto do_step_tramp;
+                ret_val = JS_CallInternal(ctx, call_argv[-1], gthis, JS_UNDEFINED,
+                                          call_argc, vc(call_argv), 0);
+                if (unlikely(JS_IsException(ret_val)))
+                    goto exception;
+                if (tramp_is_tail)
+                    goto do_return;   /* NOT `done`: a trampolined caller must UNWIND its tramp chain (do_return
+                                         pops it, or falls to `done` at the base) — `goto done` would abandon
+                                         tf_top, leaking the trampoline frames' held values. */
+                for (i = tramp_first; i < call_argc; i++)
+                    JS_FreeValue(ctx, call_argv[i]);
+                sp += tramp_first - call_argc;
+                *sp++ = ret_val;
+            }
+            BREAK;
 
         do_step_tramp:
             /* ONE generic entry for every builtin DEFINED as a step machine. Nothing here names a builtin: the
