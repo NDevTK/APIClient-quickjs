@@ -2428,6 +2428,20 @@ int main(int argc, char **argv)
             }
             /* DRIVE-TO-COMPLETION detector: any coroutine body run to completion instead of suspend/resume on the
                tramp chain. 0 across the corpus = pure suspend/resume-at-any-depth; >0 names remaining bypasses. */
+            /* LEGACY FALLBACKS that actually RAN. A fallback recorded only in a comment is invisible to a green
+               run; printing every site that executed means a suite can pass and still say which non-suspending
+               paths it took. Each line is a debt with a name, not a note. */
+            {
+                const JSLegacyFallback *lf = NULL;
+                int n = JS_LegacyFallbacks(&lf), i, hit = 0;
+                for (i = 0; i < n; i++) if (lf[i].hits) hit++;
+                fprintf(stderr, "LegacyFallbacks: %d/%d site(s) HIT (0 = nothing ran logic that cannot suspend)\n",
+                        hit, n);
+                for (i = 0; i < n; i++)
+                    if (lf[i].hits)
+                        fprintf(stderr, "  [legacy] %-28s hits=%-8llu %s\n",
+                                lf[i].id, (unsigned long long)lf[i].hits, lf[i].why);
+            }
             fprintf(stderr, "DriveToCompletion: %llu (0 = pure suspend/resume; >0 = tests ran a coroutine to completion off-tramp)\n",
                     (unsigned long long)JS_DriveToCompletionCount());
         }

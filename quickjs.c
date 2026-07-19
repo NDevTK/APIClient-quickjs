@@ -19181,6 +19181,36 @@ void JS_SetFlowLocalMark(int m) {
     if (m) { if (g_flow_gen == 0) g_flow_gen = 1; }
     else   { g_flow_gen = 0; }
 }
+/* The legacy-fallback register (quickjs.h JSLegacyFallback). Declaring a site here is not documentation — the
+   harness prints every site that RAN, so a green suite that quietly took a non-suspending path still says so.
+   Adding an entry is an admission with an exit condition attached; removing one is the goal. */
+#define LEGACY_FALLBACK_LIST(F)                                                                               \
+    F(array_from_array_like, "Array.from over an ARRAY-LIKE (no @@iterator): length+indices, a different "     \
+                             "algorithm rather than a second iteration path — kept deliberately, and listed "  \
+                             "so the claim stays visible and checkable instead of living in a comment")
+
+#define F_DECL(name, why) LF_##name,
+enum { LEGACY_FALLBACK_LIST(F_DECL) LEGACY_FALLBACK_COUNT };
+#undef F_DECL
+#define F_ROW(name, why) { #name, why, 0 },
+static JSLegacyFallback js_legacy_fallbacks[] = { LEGACY_FALLBACK_LIST(F_ROW) };
+#undef F_ROW
+/* Record a hit. Deliberately NOT dev-only: a fallback taken in a release build is precisely the thing that must
+   not become invisible. */
+#define LEGACY_FALLBACK(name) (js_legacy_fallbacks[LF_##name].hits++)
+
+int JS_LegacyFallbacks(const JSLegacyFallback **out)
+{
+    if (out) *out = js_legacy_fallbacks;
+    return LEGACY_FALLBACK_COUNT;
+}
+
+void JS_LegacyFallbacksReset(void)
+{
+    int i;
+    for (i = 0; i < LEGACY_FALLBACK_COUNT; i++) js_legacy_fallbacks[i].hits = 0;
+}
+
 void JS_SetFlowControlHooks(const JSFlowControlHooks *h) { g_flow_control = *h; }
 void JS_SetTimeTravelHooks(const JSTimeTravelHooks *h) { g_time_travel = *h; }
 void JS_SetConcolicHooks(const JSConcolicHooks *h) { g_concolic = *h; }
@@ -47955,6 +47985,7 @@ static JSValue js_array_from(JSContext *ctx, JSValueConst this_val,
               "machine; the iteration loop here no longer exists");
         goto exception;
     } else {
+        LEGACY_FALLBACK(array_from_array_like);   /* self-declared: the harness reports this site if it runs */
         arrayLike = JS_ToObject(ctx, items);
         if (JS_IsException(arrayLike))
             goto exception;
