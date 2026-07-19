@@ -18376,6 +18376,8 @@ static int js_re_rep_step(JSContext *ctx, struct JSReRep *s, JSValue cb_result);
 static void js_re_rep_end(JSContext *ctx, struct JSReRep *s, bool take_result);
 static bool tramp_can_call_re_replace(JSContext *ctx, JSValueConst func, JSValueConst this_val,
                                       JSValueConst *call_argv, int call_argc);
+static bool tramp_can_call_re_symbol_replace(JSContext *ctx, JSValueConst func, JSValueConst this_val,
+                                             JSValueConst *call_argv, int call_argc);
 static JSValue js_regexp_Symbol_replace(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 static int js_is_standard_regexp(JSContext *ctx, JSValueConst rx);
 static int string_indexof_char(JSString *p, int c, int from);
@@ -19182,6 +19184,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        driving its executor to completion — the same builtin suspending on one path and not the other. */
     JSValueConst pe_ntgt = JS_UNDEFINED, pe_executor = JS_UNDEFINED;
     int pe_cfirst = 0, pe_cargc = 0; JSValue pe_super_ref = JS_UNDEFINED;
+    uint8_t rerep_direct = 0;                           /* 1 = re[@@replace](str,fn) shape, 0 = str.replace(re,fn) */
     int srep_is_all = 0;                                /* str.replace vs replaceAll (the builtin's magic), read at OP_call_method */
     /* apply/spread trampoline (do_apply_tramp): set by the .apply method call or the OP_apply spread before goto.
        ap_cfirst/ap_cargc parameterize do_return's operand cleanup for the two operand shapes. */
@@ -19917,7 +19920,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_str_replace_tramp;
                 }
                 if (tramp_can_call_re_replace(ctx, call_argv[-1], call_argv[-2], vc(call_argv), call_argc)) {   /* str.replace(/re/g,fn) -> @@replace phase 2 on THIS chain */
-                    srep_is_all = JS_VALUE_GET_OBJ(call_argv[-1])->u.cfunc.magic;
+                    srep_is_all = JS_VALUE_GET_OBJ(call_argv[-1])->u.cfunc.magic; rerep_direct = 0;
+                    tramp_is_tail = (opcode == OP_tail_call_method); goto do_re_replace_tramp;
+                }
+                if (tramp_can_call_re_symbol_replace(ctx, call_argv[-1], call_argv[-2], vc(call_argv), call_argc)) {   /* re[@@replace](str,fn) */
+                    srep_is_all = 0; rerep_direct = 1;
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_re_replace_tramp;
                 }
                 if (tramp_can_call_iter_consume(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter)) {   /* Array.from(iterable) -> GetIterator + consume on THIS chain */
@@ -20456,7 +20463,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     tramp_is_tail = 0; goto do_str_replace_tramp;
                 }
                 if (tramp_can_call_re_replace(ctx, call_argv[-1], call_argv[-2], vc(call_argv), call_argc)) {
-                    srep_is_all = JS_VALUE_GET_OBJ(call_argv[-1])->u.cfunc.magic;
+                    srep_is_all = JS_VALUE_GET_OBJ(call_argv[-1])->u.cfunc.magic; rerep_direct = 0;
+                    tramp_is_tail = 0; goto do_re_replace_tramp;
+                }
+                if (tramp_can_call_re_symbol_replace(ctx, call_argv[-1], call_argv[-2], vc(call_argv), call_argc)) {
+                    srep_is_all = 0; rerep_direct = 1;
                     tramp_is_tail = 0; goto do_re_replace_tramp;
                 }
                 if (tramp_can_call_array_sort(call_argv[-1], call_argc, vc(call_argv))) { tramp_is_tail = 0; goto do_sort_tramp; }
@@ -20643,7 +20654,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                JS is the replacer, which phase 2 drives on the tramp. */
             {
                 JSReRep *s;
-                JSValue rxv = call_argv[0];
+                /* two spellings, one walk: str.replace(re, fn) has the regexp at argv[0] and the subject as the
+                   receiver; re[@@replace](str, fn) mirrors them. */
+                JSValue rxv = rerep_direct ? call_argv[-2] : call_argv[0];
                 JSValue flags, sv;
                 JSString *fp2;
                 int is_global2, fullUnicode2 = 0;
@@ -20664,7 +20677,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JS_ThrowTypeError(ctx, "replaceAll must be called with a global RegExp");
                     goto exception;
                 }
-                sv = js_dup(call_argv[-2]);   /* the recognizer proved this is a string */
+                sv = JS_ToString(ctx, rerep_direct ? call_argv[0] : call_argv[-2]);
+                if (unlikely(JS_IsException(sv))) goto exception;
                 for (;;) {
                     JSValue mres = JS_RegExpExec(ctx, rxv, sv);
                     if (unlikely(JS_IsException(mres))) goto re_rep_collect_fail;
@@ -55706,7 +55720,10 @@ static bool tramp_can_call_re_replace(JSContext *ctx, JSValueConst func, JSValue
     if (JS_VALUE_GET_TAG(call_argv[0]) != JS_TAG_OBJECT) return false;
     rp = JS_VALUE_GET_OBJ(call_argv[0]);
     if (rp->class_id != JS_CLASS_REGEXP) return false;
-    if (!tramp_can_call(call_argv[1])) return false;
+    /* ANY callable replacer. Demanding a bytecode one routed a C/bound replacer into a SECOND copy of the phase-2
+       substitution inside js_regexp_Symbol_replace; the step machine dispatches a non-tramp callback inline, which
+       is what lets that copy be deleted rather than fenced off. */
+    if (!JS_IsFunction(ctx, call_argv[1])) return false;
     /* the @@replace it would dispatch to must be the BUILT-IN one, else the semantics are not ours to reproduce */
     {
         JSValue replacer = JS_GetProperty(ctx, call_argv[0], JS_ATOM_Symbol_replace);
@@ -55720,6 +55737,26 @@ static bool tramp_can_call_re_replace(JSContext *ctx, JSValueConst func, JSValue
         if (!ok) return false;
     }
     if (!js_is_standard_regexp(ctx, call_argv[0])) return false;
+    return true;
+}
+
+/* The SAME builtin invoked DIRECTLY as re[Symbol.replace](str, fn). The operand shape is mirrored (the regexp is
+   the receiver, the subject is argv[0]) but the walk is identical, so recognizing only the str.replace(re, fn)
+   spelling left the direct form reaching the deleted C branch — one builtin answering differently by spelling. */
+static bool tramp_can_call_re_symbol_replace(JSContext *ctx, JSValueConst func, JSValueConst this_val,
+                                             JSValueConst *call_argv, int call_argc)
+{
+    JSObject *fp;
+    if (call_argc < 2) return false;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
+    fp = JS_VALUE_GET_OBJ(func);
+    if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
+    if (fp->u.cfunc.cproto != JS_CFUNC_generic) return false;
+    if (fp->u.cfunc.c_function.generic != js_regexp_Symbol_replace) return false;
+    if (JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT) return false;
+    if (JS_VALUE_GET_OBJ(this_val)->class_id != JS_CLASS_REGEXP) return false;
+    if (!JS_IsFunction(ctx, call_argv[1])) return false;
+    if (!js_is_standard_regexp(ctx, this_val)) return false;
     return true;
 }
 
@@ -55864,10 +55901,13 @@ static JSValue js_regexp_Symbol_replace(JSContext *ctx, JSValueConst this_val,
                 if (JS_DefinePropertyValueInt64Const(ctx, tab, n++, namedCaptures, JS_PROP_C_W_E | JS_PROP_THROW) < 0)
                     goto exception;
             }
-            args[0] = JS_UNDEFINED;
-            args[1] = tab;
-            JS_FreeValue(ctx, rep_str);
-            rep_str = JS_ToStringFree(ctx, js_function_apply(ctx, rep, 2, args, 0));
+            /* DELETED: the second copy of the phase-2 substitution. A function replacer is driven ONLY by
+               js_re_rep_step — the dispatch accepts any callable and covers both spellings, so nothing reaches
+               here. Re-implementing the loop as the "not recognized" case is the dual system that hides the step
+               machine's gaps; a call path landing here must be ROUTED, never re-implemented. */
+            DFAIL("RegExp.prototype[@@replace] reached the C entry with a FUNCTION replacer — route that call site "
+                  "onto the step machine (js_re_rep_step); this branch no longer exists");
+            rep_str = JS_EXCEPTION;
         } else {
             JSValue namedCaptures1;
             if (!JS_IsUndefined(namedCaptures)) {
