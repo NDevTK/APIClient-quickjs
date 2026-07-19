@@ -18644,6 +18644,12 @@ typedef struct JSIterConsume {
     uint8_t closing; /* 1 = the sink short-circuited: close the iterator on the tramp, then finish */
     uint8_t cb_pending; /* ITERTERM: 1 = `res` on the next step entry is the CALLBACK's result, not an iterator result */
     JSValue cb_value;   /* ITERTERM: the element held across a callback that runs on the tramp (owned) */
+    uint8_t abrupt;  /* 1 = the sink completed ABRUPTLY with an exception pending. It returns 2 so the shared
+                        close-then-finish runs IteratorClose (spec IfAbruptCloseIterator), and the close must
+                        PRESERVE the pending exception rather than replace it; the next step then propagates.
+                        Without this a plain (non-generator) source was never closed on a bad entry — the five
+                        Object/fromEntries iterator-closed-for-* tests, and the reason the recognizer narrowed to
+                        generator-backed sources and handed everything else to the C loop. */
 } JSIterConsume;
 #define ITERCONS_OWNED(F) F(r) F(iter) F(next) F(adder) F(mapfn) F(mapfn_this) F(cb_value)
 /* NOTE: JSIteratorHelperData::cb_value is owned too — freed by the finalizer and cleared on every path below. */
@@ -21385,7 +21391,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         tramp_gen_cont_consume = 1; tramp_gen_magic = GEN_MAGIC_RETURN;
                         goto do_generator_tramp;
                     }
-                    if (JS_IteratorClose(ctx, s->iter, false) < 0) { js_iter_consume_end(ctx, s); js_free_rt(rt, s); goto exception; }
+                    if (JS_IteratorClose(ctx, s->iter, s->abrupt) < 0) { js_iter_consume_end(ctx, s); js_free_rt(rt, s); goto exception; }
                     goto do_iter_consume_step;
                 }
                 if (st == 0) {   /* DONE */
@@ -48060,6 +48066,7 @@ static JSValue js_array_from(JSContext *ctx, JSValueConst this_val,
    generator settle), so a generator loop over opaque input suspend/resumes here instead of driving to completion. */
 static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
 {
+    if (s->abrupt) { JS_FreeValue(ctx, res); return -1; }   /* close done; the original exception propagates */
     if (s->cb_pending) {
         /* `res` is the ITERTERM callback's RESULT (it ran on the tramp), not an iterator result. */
         JSValue value = s->cb_value, fret = res;
@@ -48136,14 +48143,17 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
         } else if (s->sink == ITERCONS_OBJENTRIES) {
             /* Object.fromEntries(gen): the entry must be an object; r[entry[0]] = entry[1]. Mirrors js_object_fromEntries. */
             JSValue key, val;
-            if (!JS_IsObject(value)) { JS_FreeValue(ctx, value); JS_ThrowTypeErrorNotAnObject(ctx); return -1; }
+            /* every abrupt exit here is an IfAbruptCloseIterator site: set abrupt and return 2 so the
+               shared close runs before the exception propagates. Returning -1 skipped the close, which is
+               exactly what the iterator-closed-for-* tests observe. */
+            if (!JS_IsObject(value)) { JS_FreeValue(ctx, value); JS_ThrowTypeErrorNotAnObject(ctx); s->abrupt = 1; return 2; }
             key = JS_GetPropertyUint32(ctx, value, 0);
-            if (JS_IsException(key)) { JS_FreeValue(ctx, value); return -1; }
+            if (JS_IsException(key)) { JS_FreeValue(ctx, value); s->abrupt = 1; return 2; }
             val = JS_GetPropertyUint32(ctx, value, 1);
             JS_FreeValue(ctx, value);
-            if (JS_IsException(val)) { JS_FreeValue(ctx, key); return -1; }
+            if (JS_IsException(val)) { JS_FreeValue(ctx, key); s->abrupt = 1; return 2; }
             if (JS_DefinePropertyValueValue(ctx, s->r, key, val, JS_PROP_C_W_E | JS_PROP_THROW) < 0)
-                return -1;   /* consumes key + val */
+                { s->abrupt = 1; return 2; }   /* consumes key + val */
         } else if (s->sink == ITERCONS_MAP) {
             /* new Map(gen): the entry must be an object; adder(entry[0], entry[1]). Mirrors js_map_constructor. */
             JSValue key, val, ret; JSValueConst args[2];
@@ -48412,7 +48422,14 @@ static bool tramp_can_call_objentries_consume(JSContext *ctx, JSValueConst func,
     if (fp->u.cfunc.cproto != JS_CFUNC_generic) return false;
     if (fp->u.cfunc.c_function.generic != js_object_fromEntries) return false;
     if (JS_VALUE_GET_TAG(call_argv[0]) != JS_TAG_OBJECT) return false;
-    return iter_consume_gen_backed(ctx, call_argv[0], out_getiter);
+    /* ANY callable @@iterator, not just a generator-backed one. The gen-backed narrowing is what hands every
+       other iterable to the live C loop in js_object_fromEntries — i.e. it is the fallback selector, and it has
+       to go before that loop can be deleted. Broadened here FIRST, alone, so whatever semantics the consume
+       machinery does not yet reproduce shows up as this consumer's failures rather than twelve mixed ones. */
+    if (!iter_data_at_iterator(ctx, call_argv[0], out_getiter)) return false;
+    if (JS_IsFunction(ctx, *out_getiter)) return true;
+    JS_FreeValue(ctx, *out_getiter); *out_getiter = JS_UNDEFINED;
+    return false;
 }
 
 /* Route new TypedArray(gen) — js_typed_array_constructor_obj collects the iterable (js_array_from_iterator) in a C
