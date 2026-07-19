@@ -18770,6 +18770,8 @@ typedef struct JRFrame {
     uint8_t phase;                  /* 0=needs init, 1=iterating children, 2=reviver called (awaiting result) */
 } JRFrame;
 typedef struct JSJsonReviver {
+    JSStepHdr hdr;                  /* MUST be first — enforced by STEP_STATE_HDR_FIRST below */
+    uint8_t early;                  /* 1 = NO reviver: no JS re-entry, so result was produced in init */
     JSValueConst reviver;           /* borrowed from the caller stack */
     const char *text;               /* JSON source (owned CString; freed at end) */
     JSValue root;                   /* {"" : parsed} holder (owned) */
@@ -18779,11 +18781,12 @@ typedef struct JSJsonReviver {
     JSValue cb_args[5];             /* [holder(this), reviver, name_val, val, context]; call_argv=&cb_args[2], argc=3 */
     int orig_cfirst, orig_cargc; uint8_t orig_is_tail;
 } JSJsonReviver;
-static JSValue js_json_parse(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static void *js_json_parse_vinit(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int unused);
+static int js_json_parse_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_json_parse_vfini(JSContext *ctx, void *st, bool take_result);
 static int js_json_reviver_init(JSContext *ctx, struct JSJsonReviver *s, JSValueConst text_arg, JSValueConst reviver);
 static int js_json_reviver_step(JSContext *ctx, struct JSJsonReviver *s, JSValue res, JSValueConst out_args[3]);
 static JSValue js_json_reviver_end(JSContext *ctx, struct JSJsonReviver *s, bool ok);
-static bool tramp_can_call_json_parse(JSValueConst func, int argc, JSValueConst *argv);
 /* Function.prototype.call is CALL-SITE-RESOLVED: it holds no continuation, so rather than C-recursing
    js_function_call (which would run the ultimate target's body off the chain, unable to preempt), the
    interpreter reslices the operands at the call site and dispatches the target directly (do_forward_call). */
@@ -19894,9 +19897,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_agen_create(call_argv[-1])) {   /* async generator method -> params here */
                     tramp_first = -2; tramp_is_tail = (opcode == OP_tail_call_method); goto do_agen_create_tramp;
                 }
-                if (tramp_can_call_json_parse(call_argv[-1], call_argc, vc(call_argv))) {   /* JSON.parse(s,reviver) -> reviver walk on THIS chain */
-                    tramp_is_tail = (opcode == OP_tail_call_method); goto do_json_revive_tramp;
-                }
                 if (tramp_can_call_iter_consume(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter)) {   /* Array.from(iterable) -> GetIterator + consume on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_iter_consume_tramp;
                 }
@@ -20425,7 +20425,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 /* The forwarded shape is identical to the direct one, so it must ask the SAME questions. This list
                    having fallen behind the OP_call_method list is why replace.call(123, "2", fn) reached the C
                    entry: same builtin, same callback, different answer depending on how the call was spelled. */
-                if (tramp_can_call_json_parse(call_argv[-1], call_argc, vc(call_argv))) { tramp_is_tail = 0; goto do_json_revive_tramp; }
                 {   /* g.next.call(g) / g.throw.call(g,e) / g.return.call(g,v): the reshape produced the exact
                        [this=generator, f=js_generator_next] method-call shape do_generator_tramp reads, so route the
                        body onto THIS chain (loop preempts + forks the base) — never the js_generator_next
@@ -49287,7 +49286,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_ARRAY_EVERY, STEPDEF_ARRAY_SOME, STEPDEF_ARRAY_FOREACH, STEPDEF_ARRAY_MAP, STEPDEF_ARRAY_FILTER,
     STEPDEF_TA_EVERY, STEPDEF_TA_SOME, STEPDEF_TA_FOREACH, STEPDEF_TA_MAP, STEPDEF_TA_FILTER,
     STEPDEF_ARRAY_REDUCE, STEPDEF_ARRAY_REDUCE_RIGHT, STEPDEF_TA_REDUCE, STEPDEF_TA_REDUCE_RIGHT,
-    STEPDEF_ARRAY_SORT, STEPDEF_ARRAY_TOSORTED,
+    STEPDEF_ARRAY_SORT, STEPDEF_ARRAY_TOSORTED, STEPDEF_JSON_PARSE,
     STEPDEF_COUNT
 };
 /* One NAMED definition per builtin, referenced by its JS_CFUNC_STEP_DEF registration through the id above — the same shape as
@@ -49311,6 +49310,7 @@ static const JSTrampStepDef js_ta_forEach_def      = { js_array_every_vinit, js_
 static const JSTrampStepDef js_ta_map_def          = { js_array_every_vinit, js_array_every_vstep, js_array_every_vfini, special_map | special_TA };
 static const JSTrampStepDef js_array_sort_def    = { js_array_sort_vinit, js_array_sort_vstep, js_array_sort_vfini, 0 };
 static const JSTrampStepDef js_array_toSorted_def = { js_array_toSorted_vinit, js_array_sort_vstep, js_array_sort_vfini, 0 };
+static const JSTrampStepDef js_json_parse_def    = { js_json_parse_vinit, js_json_parse_vstep, js_json_parse_vfini, 0 };
 static const JSTrampStepDef js_array_reduce_def  = { js_array_reduce_vinit, js_array_reduce_vstep, js_array_reduce_vfini, special_reduce };
 static const JSTrampStepDef js_array_reduceR_def = { js_array_reduce_vinit, js_array_reduce_vstep, js_array_reduce_vfini, special_reduceRight };
 static const JSTrampStepDef js_ta_reduce_def     = { js_array_reduce_vinit, js_array_reduce_vstep, js_array_reduce_vfini, special_reduce | special_TA };
@@ -49334,6 +49334,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_TA_FOREACH]    = &js_ta_forEach_def,    [STEPDEF_TA_MAP]        = &js_ta_map_def,
     [STEPDEF_TA_FILTER]     = &js_ta_filter_def,
     [STEPDEF_ARRAY_SORT]    = &js_array_sort_def,   [STEPDEF_ARRAY_TOSORTED] = &js_array_toSorted_def,
+    [STEPDEF_JSON_PARSE]    = &js_json_parse_def,
     [STEPDEF_ARRAY_REDUCE]  = &js_array_reduce_def,  [STEPDEF_ARRAY_REDUCE_RIGHT] = &js_array_reduceR_def,
     [STEPDEF_TA_REDUCE]     = &js_ta_reduce_def,     [STEPDEF_TA_REDUCE_RIGHT]    = &js_ta_reduceR_def,
 };
@@ -49352,6 +49353,7 @@ STEP_STATE_HDR_FIRST(JSArrayReduce);
 STEP_STATE_HDR_FIRST(JSArraySort);
 STEP_STATE_HDR_FIRST(JSStrReplace);
 STEP_STATE_HDR_FIRST(JSReRep);
+STEP_STATE_HDR_FIRST(JSJsonReviver);
 
 static const JSTrampStepDef *tramp_step_def_of(JSValueConst func)
 {
@@ -56540,6 +56542,63 @@ static JSONParseRecord *jr_child_pr(JSContext *ctx, JSONParseRecord *holder_pr, 
     if (pr && !js_same_value(ctx, pr->value, cval)) pr = NULL;
     return pr;
 }
+/* JSON.parse as a STEP builtin. The reviver walk is js_json_reviver_step; the NO-reviver case has no JS re-entry
+   at all, so init parses and reports DONE immediately. internalize_json_property — the recursive C walker that
+   called the reviver through JS_Call — is deleted, so there is one walk, not two. */
+static void *js_json_parse_vinit(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int unused)
+{
+    JSJsonReviver *s = js_mallocz(ctx, sizeof(*s));
+    if (!s) { JS_ThrowOutOfMemory(ctx); return NULL; }
+    s->root = JS_UNDEFINED; s->result = JS_UNDEFINED;
+    if (argc < 2 || !JS_IsFunction(ctx, argv[1])) {
+        const char *str; size_t len;
+        s->early = 1;
+        str = JS_ToCStringLen(ctx, &len, argc > 0 ? argv[0] : JS_UNDEFINED);
+        if (!str) { js_free(ctx, s); return NULL; }
+        s->result = JS_ParseJSON_internal(ctx, str, len, "<input>", NULL);
+        JS_FreeCString(ctx, str);
+        if (JS_IsException(s->result)) { js_free(ctx, s); return NULL; }
+        return s;
+    }
+    if (js_json_reviver_init(ctx, s, argc > 0 ? argv[0] : JS_UNDEFINED, argv[1])) {
+        js_json_reviver_end(ctx, s, false);
+        js_free(ctx, s);
+        return NULL;
+    }
+    return s;
+}
+
+static int js_json_parse_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSJsonReviver *s = st;
+    int r;
+    if (s->early) { JS_FreeValue(ctx, cb_result); return 0; }
+    r = js_json_reviver_step(ctx, s, cb_result, (JSValueConst *)&s->cb_args[2]);
+    if (r < 0) return -1;
+    if (r == 0) return 0;
+    /* cb_args[0] (the holder, i.e. `this`) is set by the step itself; cb_args[1] is the reviver, which the caller
+       supplies — omitting it left the driver calling an undefined callee, so the reviver was never invoked. */
+    s->cb_args[1] = s->reviver;
+    *out_cb = s->cb_args; *out_argc = 3;
+    return 3;
+}
+
+static JSValue js_json_parse_vfini(JSContext *ctx, void *st, bool take_result)
+{
+    JSJsonReviver *s = st;
+    JSValue r;
+    if (s->early) {
+        r = take_result ? s->result : JS_UNDEFINED;
+        if (!take_result) JS_FreeValue(ctx, s->result);
+        js_free(ctx, s);
+        return r;
+    }
+    r = js_json_reviver_end(ctx, s, take_result);
+    js_free(ctx, s);
+    if (!take_result) { JS_FreeValue(ctx, r); return JS_UNDEFINED; }
+    return r;
+}
+
 static int js_json_reviver_init(JSContext *ctx, JSJsonReviver *s, JSValueConst text_arg, JSValueConst reviver) {
     size_t len; JSValue parsed; JSONParseRecord *pr1; int size = 0;
     s->reviver = reviver; s->text = NULL; s->root = JS_UNDEFINED; s->pr = NULL;
@@ -56645,67 +56704,13 @@ static JSValue js_json_reviver_end(JSContext *ctx, JSJsonReviver *s, bool ok) {
     if (!ok) { JS_FreeValue(ctx, s->result); return JS_EXCEPTION; }
     return s->result;
 }
-static bool tramp_can_call_json_parse(JSValueConst func, int argc, JSValueConst *argv) {
-    JSObject *mp, *rp;
-    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
-    mp = JS_VALUE_GET_OBJ(func);
-    if (!(mp->class_id == JS_CLASS_C_FUNCTION && mp->u.cfunc.c_function.generic == js_json_parse)) return false;
-    if (argc < 2 || JS_VALUE_GET_TAG(argv[1]) != JS_TAG_OBJECT) return false;
-    rp = JS_VALUE_GET_OBJ(argv[1]);
-    return rp->class_id == JS_CLASS_BYTECODE_FUNCTION && rp->u.func.function_bytecode->func_kind == JS_FUNC_NORMAL;
-}
+/* The JSON.parse recognizer is DELETED — it existed only to pick the suspendable walk over
+   internalize_json_property, and that walker is gone. */
 
-static JSValue js_json_parse(JSContext *ctx, JSValueConst this_val,
-                             int argc, JSValueConst *argv)
-{
-    JSValue obj;
-    const char *str;
-    size_t len;
-
-    str = JS_ToCStringLen(ctx, &len, argv[0]);
-    if (!str)
-        return JS_EXCEPTION;
-    if (argc > 1 && JS_IsFunction(ctx, argv[1])) {
-        JSONParseRecord pr_s, *pr = &pr_s, *pr1;
-        JSValue root;
-        JSValueConst reviver;
-        int size;
-
-        reviver = argv[1];
-        root = JS_NewObject(ctx);
-        if (JS_IsException(root))
-            goto fail;
-        json_parse_record_init_obj(ctx, pr, root);
-        size = 0;
-        pr1 = json_parse_record_add(ctx, pr, JS_ATOM_empty_string, &size);
-        if (!pr1)
-            goto fail1;
-
-        obj = JS_ParseJSON_internal(ctx, str, len, "<input>", pr1);
-        if (JS_IsException(obj))
-            goto fail1;
-
-        if (JS_DefinePropertyValue(ctx, root, JS_ATOM_empty_string, obj,
-                                   JS_PROP_C_W_E) < 0) {
-        fail1:
-            json_free_parse_record(ctx, pr);
-            JS_FreeValue(ctx, root);
-            goto fail;
-        }
-
-        obj = internalize_json_property(ctx, root, JS_ATOM_empty_string,
-                                        reviver, str, pr);
-        json_free_parse_record(ctx, pr);
-        JS_FreeValue(ctx, root);
-    } else {
-        obj = JS_ParseJSON_internal(ctx, str, len, "<input>", NULL);
-    }
-    JS_FreeCString(ctx, str);
-    return obj;
- fail:
-    JS_FreeCString(ctx, str);
-    return JS_EXCEPTION;
-}
+/* DELETED: js_json_parse's C body. Its reviver branch called internalize_json_property — a recursive C walker
+   that invoked the reviver through JS_Call — which was a second implementation of the walk that
+   js_json_reviver_step already performs suspendably. Its no-reviver branch had no callback at all and now lives
+   in js_json_parse_vinit. JSON.parse IS the step machine (STEPDEF_JSON_PARSE). */
 
 static JSValue js_json_isRawJSON(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv)
@@ -56741,7 +56746,14 @@ static JSValue js_json_rawJSON(JSContext *ctx, JSValueConst this_val,
         !is_valid_raw_json_char(string_get(p, p->len - 1))) {
         goto syntax_error;
     }
-    res = js_json_parse(ctx, JS_UNDEFINED, 1, (JSValueConst *)&str);
+    /* rawJSON only validates: no reviver, so this is the plain parse — JS_ParseJSON_internal is the one parser,
+       reached directly rather than through a builtin entry that no longer exists. */
+    {
+        const char *cs; size_t cl;
+        cs = JS_ToCStringLen(ctx, &cl, str);
+        res = cs ? JS_ParseJSON_internal(ctx, cs, cl, "<input>", NULL) : JS_EXCEPTION;
+        if (cs) JS_FreeCString(ctx, cs);
+    }
     if (JS_IsException(res)) {
     syntax_error:
         JS_ThrowSyntaxError(ctx, "invalid rawJSON string");
@@ -57174,7 +57186,7 @@ static JSValue js_json_stringify(JSContext *ctx, JSValueConst this_val,
 
 static const JSCFunctionListEntry js_json_funcs[] = {
     JS_CFUNC_DEF("isRawJSON", 1, js_json_isRawJSON ),
-    JS_CFUNC_DEF("parse", 2, js_json_parse ),
+    JS_CFUNC_STEP_DEF("parse", 2, STEPDEF_JSON_PARSE ),
     JS_CFUNC_DEF("rawJSON", 1, js_json_rawJSON ),
     JS_CFUNC_DEF("stringify", 3, js_json_stringify ),
     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "JSON", JS_PROP_CONFIGURABLE ),
