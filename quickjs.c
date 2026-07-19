@@ -49338,6 +49338,21 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_TA_REDUCE]     = &js_ta_reduce_def,     [STEPDEF_TA_REDUCE_RIGHT]    = &js_ta_reduceR_def,
 };
 
+/* Every step state MUST begin with JSStepHdr — the driver casts the opaque state to JSStepHdr * and writes
+   def/orig_c* through it, so a state that forgets gets its first field overwritten by the step-def pointer.
+   That bug has now happened THREE times (JSArrayFind, JSArrayEvery, JSArraySort) and each time the corruption
+   surfaced far from the cause: the last one showed up as s->obj holding &js_array_sort_def, and I misread it
+   twice as a sort-semantics mismatch. A comment saying "MUST be first" did not prevent any of the three. This
+   does, at compile time. Adding a state to js_tramp_step_defs without a line here is itself the omission. */
+#define STEP_STATE_HDR_FIRST(T) \
+    _Static_assert(offsetof(T, hdr) == 0, #T " must begin with JSStepHdr (the step driver casts to it)")
+STEP_STATE_HDR_FIRST(JSArrayFind);
+STEP_STATE_HDR_FIRST(JSArrayEvery);
+STEP_STATE_HDR_FIRST(JSArrayReduce);
+STEP_STATE_HDR_FIRST(JSArraySort);
+STEP_STATE_HDR_FIRST(JSStrReplace);
+STEP_STATE_HDR_FIRST(JSReRep);
+
 static const JSTrampStepDef *tramp_step_def_of(JSValueConst func)
 {
     JSObject *fp;
