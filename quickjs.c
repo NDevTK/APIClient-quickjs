@@ -18241,6 +18241,12 @@ typedef struct TrampFrame {
 #define CONT_ASYNC_FROM_SYNC 10 /* cont_state = JSAsyncFromSync: `for await (x of syncGen)` — the async-from-sync
                                   wrapper's .next() drives syncGen.next() on the chain, then wraps {value,done} in
                                   Promise.resolve(value).then(unwrap) at the settle. No fork-clone yet (DFAIL-guarded). */
+/* The trampoline RESHAPES operands in place (proxy trap re-dispatch, helper/terminal callbacks): it pushes a few
+   slots above the compiler-computed operand stack. var_refs is allocated immediately AFTER that stack, so pushing
+   past b->stack_size would overwrite the var-ref array. Every interpreter frame reserves this scratch between the
+   two, and TRAMP_SP_LIMIT is the real ceiling those pushes assert against. */
+#define TRAMP_SCRATCH_SLOTS 8
+#define TRAMP_SP_LIMIT(sbuf, bc) ((sbuf) + (bc)->stack_size + TRAMP_SCRATCH_SLOTS)
 #define CONT_PROXY_GET     13  /* cont_state = JSProxyGet: a trampolined proxy [[Get]] trap. The trap's RESULT must
                                   still satisfy the target's non-configurable invariants, so the check rides a
                                   continuation and runs at do_return, before the result is placed. */
@@ -19190,7 +19196,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     }
 
     alloca_size = sizeof(JSValue) * (arg_allocated_size + b->var_count +
-                                     b->stack_size) +
+                                     b->stack_size + TRAMP_SCRATCH_SLOTS) +
         sizeof(JSVarRef *) * b->var_ref_count;
     if (js_check_stack_overflow(rt, alloca_size))
         return JS_ThrowStackOverflow(caller_ctx);
@@ -19220,7 +19226,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         var_buf[i] = JS_UNDEFINED;
 
     stack_buf = var_buf + b->var_count;
-    sf->var_refs = (JSVarRef **)(stack_buf + b->stack_size);
+    sf->var_refs = (JSVarRef **)(stack_buf + b->stack_size + TRAMP_SCRATCH_SLOTS);
     sf->var_ref_count = b->var_ref_count;
     for(i = 0; i < b->var_ref_count; i++)
         sf->var_refs[i] = NULL;
@@ -19634,7 +19640,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 {   /* PROXY [[Call]]: run the apply trap (or the bare target) on THIS chain */
                     JSValue px[5], ptgt; int px_ret;
-                    DCHECK(sp + 4 <= stack_buf + b->stack_size,
+                    DCHECK(sp + 4 <= TRAMP_SP_LIMIT(stack_buf, b),
                            "proxy apply trap: operand reshape exceeds the frame's compiled stack_size");
                     px_ret = js_tramp_proxy_apply(ctx, call_argv[-1], JS_UNDEFINED,
                                                   call_argc, vc(call_argv), px, &ptgt);
@@ -20030,7 +20036,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSFunctionBytecode *nb = np->u.func.function_bytecode;
                 int eff_argc = call_argc;
                 int narg_alloc = (eff_argc < nb->arg_count) ? nb->arg_count : 0;
-                size_t asize = sizeof(JSValue) * (narg_alloc + nb->var_count + nb->stack_size)
+                size_t asize = sizeof(JSValue) * (narg_alloc + nb->var_count + nb->stack_size + TRAMP_SCRATCH_SLOTS)
                              + sizeof(JSVarRef *) * nb->var_ref_count;
                 TrampFrame *ntf; JSValue *nlb, *narg_buf, *nvar_buf, *nstack_buf; JSStackFrame *nsf; int k;
                 ntf = js_malloc_rt(rt, sizeof(TrampFrame));
@@ -20065,7 +20071,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 for (k = 0; k < nb->var_count; k++) nvar_buf[k] = JS_UNDEFINED;
                 nstack_buf = nvar_buf + nb->var_count;
                 nsf->arg_buf = narg_buf; nsf->var_buf = nvar_buf;
-                nsf->var_refs = (JSVarRef **)(nstack_buf + nb->stack_size);
+                nsf->var_refs = (JSVarRef **)(nstack_buf + nb->stack_size + TRAMP_SCRATCH_SLOTS);
                 nsf->var_ref_count = nb->var_ref_count;
                 for (k = 0; k < nb->var_ref_count; k++) nsf->var_refs[k] = NULL;
                 nsf->cur_pc = NULL; nsf->cur_sp = NULL;
@@ -20104,7 +20110,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 struct JSConstruct *cs; JSValue cthis;
                 int eff_argc = con_argc;
                 int narg_alloc = (eff_argc < nb->arg_count) ? nb->arg_count : 0;
-                size_t asize = sizeof(JSValue) * (narg_alloc + nb->var_count + nb->stack_size)
+                size_t asize = sizeof(JSValue) * (narg_alloc + nb->var_count + nb->stack_size + TRAMP_SCRATCH_SLOTS)
                              + sizeof(JSVarRef *) * nb->var_ref_count;
                 TrampFrame *ntf; JSValue *nlb, *narg_buf, *nvar_buf, *nstack_buf; JSStackFrame *nsf; int k;
                 if (nb->is_derived_class_constructor) {
@@ -20149,7 +20155,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 for (k = 0; k < nb->var_count; k++) nvar_buf[k] = JS_UNDEFINED;
                 nstack_buf = nvar_buf + nb->var_count;
                 nsf->arg_buf = narg_buf; nsf->var_buf = nvar_buf;
-                nsf->var_refs = (JSVarRef **)(nstack_buf + nb->stack_size);
+                nsf->var_refs = (JSVarRef **)(nstack_buf + nb->stack_size + TRAMP_SCRATCH_SLOTS);
                 nsf->var_ref_count = nb->var_ref_count;
                 for (k = 0; k < nb->var_ref_count; k++) nsf->var_refs[k] = NULL;
                 nsf->cur_pc = NULL; nsf->cur_sp = NULL;
@@ -20218,7 +20224,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        every forwarded shape behaves like a direct call — no-trap proxies collapse to the ultimate
                        callee, a trap becomes trap(target, thisArg, argArray) on this chain. */
                     JSValue px[5], ptgt; int px_ret;
-                    DCHECK(sp + 3 <= stack_buf + b->stack_size,
+                    DCHECK(sp + 3 <= TRAMP_SP_LIMIT(stack_buf, b),
                            "proxy forward dispatch: operand reshape exceeds the frame's compiled stack_size");
                     px_ret = js_tramp_proxy_apply(ctx, call_argv[-1], call_argv[-2],
                                                   call_argc, vc(call_argv), px, &ptgt);
@@ -20294,7 +20300,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 eff_argc = (int)alen;
                 narg_alloc = (eff_argc < nb->arg_count) ? nb->arg_count : eff_argc;   /* always own the args (in atab, not the stack) */
-                asize = sizeof(JSValue) * (narg_alloc + nb->var_count + nb->stack_size)
+                asize = sizeof(JSValue) * (narg_alloc + nb->var_count + nb->stack_size + TRAMP_SCRATCH_SLOTS)
                       + sizeof(JSVarRef *) * nb->var_ref_count;
                 ntf = js_malloc_rt(rt, sizeof(TrampFrame));
                 if (unlikely(!ntf)) { if (atab) free_arg_list(ctx, atab, alen); JS_ThrowOutOfMemory(ctx); goto exception; }
@@ -20323,7 +20329,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 for (k = 0; k < nb->var_count; k++) nvar_buf[k] = JS_UNDEFINED;
                 nstack_buf = nvar_buf + nb->var_count;
                 nsf->arg_buf = narg_buf; nsf->var_buf = nvar_buf;
-                nsf->var_refs = (JSVarRef **)(nstack_buf + nb->stack_size);
+                nsf->var_refs = (JSVarRef **)(nstack_buf + nb->stack_size + TRAMP_SCRATCH_SLOTS);
                 nsf->var_ref_count = nb->var_ref_count;
                 for (k = 0; k < nb->var_ref_count; k++) nsf->var_refs[k] = NULL;
                 nsf->cur_pc = NULL; nsf->cur_sp = NULL;
@@ -20360,7 +20366,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int nbound = bf->argc;
                 int eff_argc = nbound + call_argc;
                 int narg_alloc = (eff_argc < nb->arg_count) ? nb->arg_count : eff_argc;
-                size_t asize = sizeof(JSValue) * (narg_alloc + nb->var_count + nb->stack_size)
+                size_t asize = sizeof(JSValue) * (narg_alloc + nb->var_count + nb->stack_size + TRAMP_SCRATCH_SLOTS)
                              + sizeof(JSVarRef *) * nb->var_ref_count;
                 TrampFrame *ntf; JSValue *nlb, *narg_buf, *nvar_buf, *nstack_buf; JSStackFrame *nsf; int k;
                 ntf = js_malloc_rt(rt, sizeof(TrampFrame));
@@ -20390,7 +20396,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 for (k = 0; k < nb->var_count; k++) nvar_buf[k] = JS_UNDEFINED;
                 nstack_buf = nvar_buf + nb->var_count;
                 nsf->arg_buf = narg_buf; nsf->var_buf = nvar_buf;
-                nsf->var_refs = (JSVarRef **)(nstack_buf + nb->stack_size);
+                nsf->var_refs = (JSVarRef **)(nstack_buf + nb->stack_size + TRAMP_SCRATCH_SLOTS);
                 nsf->var_ref_count = nb->var_ref_count;
                 for (k = 0; k < nb->var_ref_count; k++) nsf->var_refs[k] = NULL;
                 nsf->cur_pc = NULL; nsf->cur_sp = NULL;
@@ -20774,7 +20780,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValueConst iterable = tramp_consume_iterable;
                 DCHECK(JS_IsFunction(ctx, method), "consume @@iterator must be callable (the probe accepts only a callable data property)");
                 if (tramp_can_call_gen_create(method)) {
-                    DCHECK(sp + 2 <= stack_buf + b->stack_size,
+                    DCHECK(sp + 2 <= TRAMP_SP_LIMIT(stack_buf, b),
                            "consume acquire: create operand push exceeds the frame's compiled stack_size");
                     *sp++ = js_dup(iterable);   /* this */
                     *sp++ = method;             /* gfunc (owned, transferred) */
@@ -20977,13 +20983,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (st == 3) {
                     /* run the ITERTERM callback ON THE TRAMP: [this=undefined, fn, element, index]. do_return
                        re-enters this step (CONT_ITER_CONSUME) with the callback's result. */
-                    DCHECK(sp + 4 <= stack_buf + b->stack_size,
+                    DCHECK(sp + 4 <= TRAMP_SP_LIMIT(stack_buf, b),
                            "iterterm callback: operand push exceeds the frame's compiled stack_size");
-                    *sp++ = JS_UNDEFINED;
-                    *sp++ = js_dup(s->mapfn);
-                    *sp++ = js_dup(s->cb_value);
-                    *sp++ = js_int64(s->k - 1);
-                    call_argv = sp - 2; call_argc = 2; tramp_first = -2; tramp_is_tail = 0;
+                    { int nargs = (s->setop == ITERTERM_REDUCE) ? 3 : 2;
+                      DCHECK(sp + 2 + nargs <= TRAMP_SP_LIMIT(stack_buf, b),
+                             "iterterm callback: operand push exceeds the frame's compiled stack_size");
+                      *sp++ = JS_UNDEFINED;
+                      *sp++ = js_dup(s->mapfn);
+                      if (nargs == 3) *sp++ = js_dup(s->r);      /* reduce: accumulator first */
+                      *sp++ = js_dup(s->cb_value);
+                      *sp++ = js_int64(s->k - 1);
+                      call_argv = sp - nargs; call_argc = nargs; tramp_first = -2; tramp_is_tail = 0; }
                     tramp_cont_state = s; tramp_cont_kind = CONT_ITER_CONSUME;
                     if (tramp_can_call(call_argv[-1])) goto do_tramp_call;
                     tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;
@@ -21295,7 +21305,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (st == 3) {
                         /* run the map/filter callback ON THE TRAMP: [this=undefined, func, value, index]. do_return
                            re-enters this step (CONT_ITER_HELPER) with the callback's result. */
-                        DCHECK(sp + 4 <= stack_buf + b->stack_size,
+                        DCHECK(sp + 4 <= TRAMP_SP_LIMIT(stack_buf, b),
                                "helper callback: operand push exceeds the frame's compiled stack_size");
                         *sp++ = JS_UNDEFINED;                 /* this */
                         *sp++ = js_dup(it->func);             /* callee */
@@ -22040,7 +22050,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     /* the ITERTERM callback returned: drop its operands (do_tramp_call dup'd the args and recorded
                        caller_sp ABOVE them) and resume the consume step with the result. */
                     JSValue *cargv = sp - cargc;
-                    DCHECK(cargc - cfirst == 4, "iterterm callback frame has an unexpected operand shape");
+                    DCHECK(cargc - cfirst == 4 || cargc - cfirst == 5,
+                           "iterterm callback frame has an unexpected operand shape");
                     for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
                     sp += cfirst - cargc;
                     cont_st = rcs; cont_kind_cur = CONT_ITER_CONSUME;
@@ -23255,7 +23266,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        drops the operands and lands the trap's one result exactly where the field value belongs. */
                     int pr_ret;
                     sf->cur_pc = pc;
-                    DCHECK(sp + 4 <= stack_buf + b->stack_size,
+                    DCHECK(sp + 4 <= TRAMP_SP_LIMIT(stack_buf, b),
                            "proxy get trap: operand reshape exceeds the frame's compiled stack_size");
                     { void *pg_cont = NULL;
                       pr_ret = js_tramp_proxy_get(ctx, &sp[-1], atom, sp, &pg_cont);
@@ -47666,13 +47677,12 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
                     s->r = value;
                     return 1;
                 }
-                args[0] = s->r; args[1] = value; args[2] = idx;
-                fret = JS_Call(ctx, s->mapfn, JS_UNDEFINED, 3, args);
-                JS_FreeValue(ctx, value); JS_FreeValue(ctx, idx);
-                if (JS_IsException(fret)) return -1;
-                JS_FreeValue(ctx, s->r);
-                s->r = fret;
-                return 1;
+                /* same tramp protocol as the other terminals, with the accumulator as arg0 */
+                JS_FreeValue(ctx, idx);
+                DCHECK(JS_IsUndefined(s->cb_value), "reduce callback value already held");
+                s->cb_value = value;
+                s->cb_pending = 1;
+                return 3;
             }
             /* the callback must run ON THE TRAMP: hold the element and hand the call to do_iter_consume_step. */
             JS_FreeValue(ctx, idx);
