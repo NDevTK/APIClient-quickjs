@@ -17965,6 +17965,38 @@ static void close_lexical_var(JSContext *ctx, JSFunctionBytecode *b,
 #define JS_CALL_FLAG_COPY_ARGV   (1 << 1)
 #define JS_CALL_FLAG_GENERATOR   (1 << 2)
 
+/* A continuation-holding builtin holds loop state across a JS callback, and a C frame cannot be parked — so the
+   builtin IS a step machine, declared with JS_CFUNC_STEP_DEF. This is NOT an allowlist: there is no JS_Call-loop
+   implementation left for a missing row to fall back to, so a builtin either has a definition here or has none.
+     init -> opaque state (NULL + pending exception on error)
+     step -> 0 = DONE (fini yields the result), 3 = CALL (*out_cb is [this, fn, args...]), -1 = error
+     fini -> tear down; returns the result when take_result. */
+typedef struct JSTrampStepDef {
+    void   *(*init)(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int arg);
+    int     (*step)(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+    JSValue (*fini)(JSContext *ctx, void *st, bool take_result);
+    int      arg;
+} JSTrampStepDef;
+static const JSTrampStepDef *tramp_step_def_of(JSValueConst func);
+#define CONT_STEP          17  /* cont_state = a step builtin's state; ONE continuation kind for ALL of them. */
+/* EVERY step state begins with this header. The driver keeps NOTHING in a C local: a flow suspends and resumes
+   through async_func_resume, which re-enters JS_CallInternal with all locals reset — so the step definition and
+   the original operand shape must ride the state, exactly as every other continuation's orig_c* fields do. */
+typedef struct JSStepHdr {
+    const JSTrampStepDef *def;
+    int orig_cfirst, orig_cargc;
+    uint8_t orig_is_tail;
+} JSStepHdr;
+enum { ArrayFind, ArrayFindIndex, ArrayFindLast, ArrayFindLastIndex };
+typedef struct JSArrayFind {
+    JSStepHdr hdr;           /* MUST be first: the generic driver casts the state to JSStepHdr * */
+    JSValue obj, func, this_arg, this_val, val, result;
+    int64_t k, end;
+    int dir, mode;
+    uint8_t cb_pending;
+    JSValue cb_args[5];      /* [thisArg, fn, val, index, receiver] */
+} JSArrayFind;
+
 static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
                                   JSValueConst this_obj,
                                   int argc, JSValueConst *argv, int flags)
@@ -18085,6 +18117,29 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
                                          &done, p->u.cfunc.magic);
             if (!JS_IsException(ret_val) && done != 2) {
                 ret_val = js_create_iterator_result(ctx, ret_val, done);
+            }
+        }
+        break;
+    case JS_CFUNC_step:
+        {
+            /* A step builtin reached OUTSIDE the interpreter's dispatch (a host JS_Call). It runs the SAME step
+               machine — this is not a second implementation, there is no other one. A callback invoked from here
+               cannot suspend (no tramp frame above us), which is exactly why the interpreter drives these on the
+               chain instead; reaching this driver during a flow means a call path bypassed that. */
+            const JSTrampStepDef *sd = tramp_step_def_of(func_obj);
+            void *stt;
+            JSValue cb_res = JS_UNDEFINED;
+            DCHECK(sd != NULL, "JS_CFUNC_step callee with no step definition");
+            stt = sd->init(ctx, this_obj, argc, arg_buf, sd->arg);
+            if (!stt) { ret_val = JS_EXCEPTION; break; }
+            for (;;) {
+                JSValue *cb = NULL; int cbn = 0;
+                int st = sd->step(ctx, stt, cb_res, &cb, &cbn);
+                if (st < 0) { sd->fini(ctx, stt, false); ret_val = JS_EXCEPTION; break; }
+                if (st == 0) { ret_val = sd->fini(ctx, stt, true); break; }
+                DCHECK(st == 3, "step builtin: unknown step code");
+                cb_res = JS_Call(ctx, cb[1], cb[0], cbn, (JSValueConst *)&cb[2]);
+                if (JS_IsException(cb_res)) { sd->fini(ctx, stt, false); ret_val = JS_EXCEPTION; break; }
             }
         }
         break;
@@ -19855,6 +19910,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_json_parse(call_argv[-1], call_argc, vc(call_argv))) {   /* JSON.parse(s,reviver) -> reviver walk on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_json_revive_tramp;
                 }
+                if (tramp_step_def_of(call_argv[-1])) {   /* a builtin DEFINED as a step machine: drive it on THIS chain */
+                    tramp_is_tail = (opcode == OP_tail_call_method); goto do_step_tramp;
+                }
                 if (tramp_can_call_str_replace(call_argv[-1], call_argv[-2], vc(call_argv), call_argc, &srep_is_all)) {   /* str.replace(s,fn) -> replacer drive on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_str_replace_tramp;
                 }
@@ -20390,6 +20448,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_setop_consume(call_argv[-1], call_argv[-2], vc(call_argv), call_argc, &setop_kind)) goto do_setop_consume_tramp;
                 if (tramp_can_call_iterterm(ctx, call_argv[-1], call_argv[-2], call_argc, &iterterm_kind)) goto do_iterterm_tramp;
                 if (tramp_can_call_iterator_from(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter)) goto do_iterfrom_tramp;
+                if (tramp_step_def_of(call_argv[-1])) goto do_step_tramp;   /* same capability check as the direct-call site */
                 {   /* g.next.call(g) / g.throw.call(g,e) / g.return.call(g,v): the reshape produced the exact
                        [this=generator, f=js_generator_next] method-call shape do_generator_tramp reads, so route the
                        body onto THIS chain (loop preempts + forks the base) — never the js_generator_next
@@ -20666,6 +20725,57 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 call_argc = s->cb_nargs; tramp_first = -2; tramp_is_tail = 0;
                 tramp_cont_state = s; tramp_cont_kind = CONT_RE_REPLACE;
                 goto do_tramp_call;   /* the recognizer guarantees a bytecode replacer */
+            }
+
+        do_step_tramp:
+            /* ONE generic entry for every builtin DEFINED as a step machine. Nothing here names a builtin: the
+               callee carries its own init/step/fini, so this path never grows an entry per builtin. */
+            {
+                const JSTrampStepDef *sd = tramp_step_def_of(call_argv[-1]);
+                void *stt;
+                DCHECK(sd != NULL, "do_step_tramp reached for a callee with no step definition");
+                stt = sd->init(ctx, call_argv[-2], call_argc, vc(call_argv), sd->arg);
+                if (unlikely(!stt)) goto exception;
+                ((JSStepHdr *)stt)->def = sd;
+                ((JSStepHdr *)stt)->orig_cfirst = -2;
+                ((JSStepHdr *)stt)->orig_cargc = call_argc;
+                ((JSStepHdr *)stt)->orig_is_tail = tramp_is_tail;
+                cont_st = stt;
+                ret_val = JS_UNDEFINED;
+                goto do_step_step;
+            }
+
+        do_step_step:
+            {
+                void *stt = cont_st;
+                JSStepHdr *h = stt;
+                JSValue *cb = NULL; int cbn = 0;
+                int st = h->def->step(ctx, stt, ret_val, &cb, &cbn);
+                if (unlikely(st < 0)) { h->def->fini(ctx, stt, false); goto exception; }
+                if (st == 0) {
+                    JSValue r = h->def->fini(ctx, stt, true);
+                    int cfirst = h->orig_cfirst, cargc = h->orig_cargc;
+                    uint8_t itail = h->orig_is_tail;
+                    JSValue *cargv = sp - cargc;
+                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
+                    sp += cfirst - cargc;
+                    if (itail) { ret_val = r; goto do_return; }
+                    *sp++ = r;
+                    BREAK;
+                }
+                DCHECK(st == 3, "step builtin: unknown step code");
+                call_argv = (JSValueConst *)&cb[2];
+                call_argc = cbn; tramp_first = -2; tramp_is_tail = 0;
+                if (tramp_can_call(call_argv[-1])) {
+                    tramp_cont_state = stt; tramp_cont_kind = CONT_STEP;
+                    goto do_tramp_call;
+                }
+                /* a C/bound callback has no preemptible body, so running it inline suspends nothing — the step
+                   machine still owns the loop state, so the builtin stays parkable between callbacks. */
+                ret_val = JS_Call(ctx, call_argv[-1], call_argv[-2], call_argc, call_argv);
+                if (unlikely(JS_IsException(ret_val))) { h->def->fini(ctx, stt, false); goto exception; }
+                cont_st = stt;
+                goto do_step_step;
             }
 
         do_str_replace_tramp:
@@ -22439,6 +22549,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        (borrowed), NOT on the caller's stack — so skip the cargv arg-free, and feed the result to
                        that builtin's STEP instead of pushing it. The step drives the next element or finishes. */
                     cont_st = rcs; cont_kind_cur = rck;
+                    if (rck == CONT_STEP) goto do_step_step;
                     if (rck == CONT_STR_REPLACE) goto do_str_replace_step;
                     if (rck == CONT_RE_REPLACE) goto do_re_replace_step;
                     if (rck == CONT_ARRAY_REDUCE) goto do_array_reduce_step;
@@ -25315,6 +25426,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 js_iter_consume_end(ctx, (struct JSIterConsume *)xcs);
             else if (xck == CONT_ARRAY_REDUCE)
                 js_array_reduce_end(ctx, (struct JSArrayReduce *)xcs, false);
+            else if (xck == CONT_STEP)
+                ((JSStepHdr *)xcs)->def->fini(ctx, xcs, false);
             else if (xck == CONT_STR_REPLACE)
                 js_str_replace_end(ctx, (JSStrReplace *)xcs, false);
             else if (xck == CONT_RE_REPLACE)
@@ -49193,82 +49306,106 @@ static JSValue js_array_lastIndexOf(JSContext *ctx, JSValueConst this_val,
     return JS_EXCEPTION;
 }
 
-enum {
-    ArrayFind,
-    ArrayFindIndex,
-    ArrayFindLast,
-    ArrayFindLastIndex,
+/* find/findIndex/findLast/findLastIndex. There is no js_array_find C function: the walk exists ONCE, as a step
+   machine, and the JS_Call loop that used to live here is DELETED — not kept beside it. A recognizer only ever
+   existed to choose between the two implementations; with the legacy one gone there is nothing to choose, so the
+   builtin is simply DEFINED as a step machine (JS_CFUNC_STEP_DEF) and every caller drives that. */
+static void js_array_find_end(JSContext *ctx, JSArrayFind *s, bool take_result)
+{
+    if (!take_result)
+        JS_FreeValue(ctx, s->result);
+    JS_FreeValue(ctx, s->obj);
+    JS_FreeValue(ctx, s->func);
+    JS_FreeValue(ctx, s->this_arg);
+    JS_FreeValue(ctx, s->val);
+}
+
+static void *js_array_find_init(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int mode)
+{
+    JSArrayFind *s;
+    JSValue objv;
+    int64_t len;
+
+    objv = JS_ToObject(ctx, this_val);
+    if (JS_IsException(objv))
+        return NULL;
+    if (js_get_length64(ctx, &len, objv)) { JS_FreeValue(ctx, objv); return NULL; }
+    if (argc < 1 || check_function(ctx, argv[0])) { JS_FreeValue(ctx, objv); return NULL; }
+    s = js_mallocz(ctx, sizeof(*s));
+    if (!s) { JS_FreeValue(ctx, objv); JS_ThrowOutOfMemory(ctx); return NULL; }
+    s->obj = objv;
+    s->func = js_dup(argv[0]);
+    s->this_arg = (argc > 1) ? js_dup(argv[1]) : JS_UNDEFINED;
+    s->this_val = this_val;
+    s->val = JS_UNDEFINED;
+    s->result = JS_UNDEFINED;
+    s->mode = mode;
+    if (mode == ArrayFindLast || mode == ArrayFindLastIndex) { s->k = len - 1; s->dir = -1; s->end = -1; }
+    else                                                     { s->k = 0;       s->dir = 1;  s->end = len; }
+    return s;
+}
+
+static int js_array_find_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSArrayFind *s = st;
+    bool is_index = (s->mode == ArrayFindIndex || s->mode == ArrayFindLastIndex);
+
+    if (s->cb_pending) {
+        bool truthy = JS_ToBoolFree(ctx, cb_result);
+        s->cb_pending = 0;
+        if (truthy) {
+            s->result = is_index ? js_int64(s->k) : s->val;
+            if (!is_index) s->val = JS_UNDEFINED;   /* ownership moved into result */
+            return 0;
+        }
+        JS_FreeValue(ctx, s->val); s->val = JS_UNDEFINED;
+        s->k += s->dir;
+    }
+    for (; s->k != s->end; s->k += s->dir) {
+        s->val = JS_GetPropertyValue(ctx, s->obj, js_int64(s->k));
+        if (JS_IsException(s->val))
+            return -1;
+        s->cb_args[0] = s->this_arg;
+        s->cb_args[1] = s->func;
+        s->cb_args[2] = s->val;
+        s->cb_args[3] = js_int64(s->k);
+        s->cb_args[4] = s->this_val;
+        s->cb_pending = 1;
+        *out_cb = s->cb_args; *out_argc = 3;
+        return 3;
+    }
+    s->result = is_index ? js_int32(-1) : JS_UNDEFINED;
+    return 0;
+}
+
+static JSValue js_array_find_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSArrayFind *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    js_array_find_end(ctx, s, take_result);
+    js_free(ctx, s);
+    return r;
+}
+
+/* Not an allowlist: a row exists because the builtin IS a step machine, and its magic indexes its own row. There
+   is no legacy implementation for a missing row to fall back to — a builtin absent here simply has no definition. */
+static const JSTrampStepDef js_tramp_step_defs[] = {
+    { js_array_find_init, js_array_find_step, js_array_find_fini, ArrayFind },
+    { js_array_find_init, js_array_find_step, js_array_find_fini, ArrayFindIndex },
+    { js_array_find_init, js_array_find_step, js_array_find_fini, ArrayFindLast },
+    { js_array_find_init, js_array_find_step, js_array_find_fini, ArrayFindLastIndex },
 };
 
-static JSValue js_array_find(JSContext *ctx, JSValueConst this_val,
-                             int argc, JSValueConst *argv, int mode)
+static const JSTrampStepDef *tramp_step_def_of(JSValueConst func)
 {
-    JSValueConst func, this_arg;
-    JSValueConst args[3];
-    JSValue obj, val, index_val, res;
-    int64_t len, k, end;
-    int dir;
-
-    index_val = JS_UNDEFINED;
-    val = JS_UNDEFINED;
-    obj = JS_ToObject(ctx, this_val);
-    if (js_get_length64(ctx, &len, obj))
-        goto exception;
-
-    func = argv[0];
-    if (check_function(ctx, func))
-        goto exception;
-
-    this_arg = JS_UNDEFINED;
-    if (argc > 1)
-        this_arg = argv[1];
-
-    k = 0;
-    dir = 1;
-    end = len;
-    if (mode == ArrayFindLast || mode == ArrayFindLastIndex) {
-        k = len - 1;
-        dir = -1;
-        end = -1;
-    }
-
-    // TODO(bnoordhuis) add fast path for fast arrays
-    for(; k != end; k += dir) {
-        index_val = js_int64(k);
-        val = JS_GetPropertyValue(ctx, obj, index_val);
-        if (JS_IsException(val))
-            goto exception;
-        args[0] = val;
-        args[1] = index_val;
-        args[2] = this_val;
-        res = JS_Call(ctx, func, this_arg, 3, args);
-        if (JS_IsException(res))
-            goto exception;
-        if (JS_ToBoolFree(ctx, res)) {
-            if (mode == ArrayFindIndex || mode == ArrayFindLastIndex) {
-                JS_FreeValue(ctx, val);
-                JS_FreeValue(ctx, obj);
-                return index_val;
-            } else {
-                JS_FreeValue(ctx, index_val);
-                JS_FreeValue(ctx, obj);
-                return val;
-            }
-        }
-        JS_FreeValue(ctx, val);
-        JS_FreeValue(ctx, index_val);
-    }
-    JS_FreeValue(ctx, obj);
-    if (mode == ArrayFindIndex || mode == ArrayFindLastIndex)
-        return js_int32(-1);
-    else
-        return JS_UNDEFINED;
-
-exception:
-    JS_FreeValue(ctx, index_val);
-    JS_FreeValue(ctx, val);
-    JS_FreeValue(ctx, obj);
-    return JS_EXCEPTION;
+    JSObject *fp;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return NULL;
+    fp = JS_VALUE_GET_OBJ(func);
+    if (fp->class_id != JS_CLASS_C_FUNCTION) return NULL;
+    if (fp->u.cfunc.cproto != JS_CFUNC_step) return NULL;
+    DCHECK((unsigned)fp->u.cfunc.magic < countof(js_tramp_step_defs),
+           "JS_CFUNC_STEP_DEF magic is out of range of the step table");
+    return &js_tramp_step_defs[fp->u.cfunc.magic];
 }
 
 static JSValue js_array_toString(JSContext *ctx, JSValueConst this_val,
@@ -51338,10 +51475,10 @@ static const JSCFunctionListEntry js_array_proto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("reduce", 1, js_array_reduce, special_reduce ),
     JS_CFUNC_MAGIC_DEF("reduceRight", 1, js_array_reduce, special_reduceRight ),
     JS_CFUNC_DEF("fill", 1, js_array_fill ),
-    JS_CFUNC_MAGIC_DEF("find", 1, js_array_find, ArrayFind ),
-    JS_CFUNC_MAGIC_DEF("findIndex", 1, js_array_find, ArrayFindIndex ),
-    JS_CFUNC_MAGIC_DEF("findLast", 1, js_array_find, ArrayFindLast ),
-    JS_CFUNC_MAGIC_DEF("findLastIndex", 1, js_array_find, ArrayFindLastIndex ),
+    JS_CFUNC_STEP_DEF("find", 1, ArrayFind ),
+    JS_CFUNC_STEP_DEF("findIndex", 1, ArrayFindIndex ),
+    JS_CFUNC_STEP_DEF("findLast", 1, ArrayFindLast ),
+    JS_CFUNC_STEP_DEF("findLastIndex", 1, ArrayFindLastIndex ),
     JS_CFUNC_DEF("indexOf", 1, js_array_indexOf ),
     JS_CFUNC_DEF("lastIndexOf", 1, js_array_lastIndexOf ),
     JS_CFUNC_DEF("includes", 1, js_array_includes ),

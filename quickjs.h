@@ -1429,6 +1429,10 @@ typedef enum JSCFunctionEnum {  /* XXX: should rename for namespace isolation */
     JS_CFUNC_getter_magic,
     JS_CFUNC_setter_magic,
     JS_CFUNC_iterator_next,
+    /* A CONTINUATION-HOLDING builtin: it re-enters JS from a loop whose state lives in C locals, and a C frame
+       cannot be parked. So the builtin IS a step machine — there is no JS_Call loop version of it to fall back
+       to — and `magic` indexes its row in the step table. */
+    JS_CFUNC_step,
 } JSCFunctionEnum;
 
 typedef union JSCFunctionType {
@@ -1534,6 +1538,7 @@ typedef struct JSCFunctionListEntry {
 /* Note: c++ does not like nested designators */
 #define JS_CFUNC_DEF(name, length, func1) { name, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE, JS_DEF_CFUNC, 0, { .func = { length, JS_CFUNC_generic, { .generic = func1 } } } }
 #define JS_CFUNC_DEF2(name, length, func1, prop_flags) { name, prop_flags, JS_DEF_CFUNC, 0, { .func = { length, JS_CFUNC_generic, { .generic = func1 } } } }
+#define JS_CFUNC_STEP_DEF(name, length, stepidx) { name, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE, JS_DEF_CFUNC, stepidx, { .func = { length, JS_CFUNC_step, { .generic = NULL } } } }
 #define JS_CFUNC_MAGIC_DEF(name, length, func1, magic) { name, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE, JS_DEF_CFUNC, magic, { .func = { length, JS_CFUNC_generic_magic, { .generic_magic = func1 } } } }
 #define JS_CFUNC_SPECIAL_DEF(name, length, cproto, func1) { name, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE, JS_DEF_CFUNC, 0, { .func = { length, JS_CFUNC_ ## cproto, { .cproto = func1 } } } }
 #define JS_ITERATOR_NEXT_DEF(name, length, func1, magic) { name, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE, JS_DEF_CFUNC, magic, { .func = { length, JS_CFUNC_iterator_next, { .iterator_next = func1 } } } }
