@@ -48317,21 +48317,16 @@ static bool tramp_can_call_iter_consume(JSContext *ctx, JSValueConst func, JSVal
     /* a mapfn arg, if present and not undefined, MUST be callable — else Array.from throws EARLY (before GetIterator);
        leave that to the normal path rather than routing. thisArg (argv[2]) is free. */
     if (call_argc >= 2 && !JS_IsUndefined(call_argv[1]) && !JS_IsFunction(ctx, call_argv[1])) return false;
-    /* ANY callable @@iterator. Array.from also accepts ARRAY-LIKES (no @@iterator at all, driven by length +
-       indices) — that is a different algorithm, not an iteration, so it stays in the C entry; the machine claims
-       only the iterable case. */
-    /* NAMED GAP - do not widen this again without building it first.
-       Widening Array.from to any callable @@iterator is correct and the C loop should die with it. It
-       currently fails ONE case: Iterator/prototype/flatMap/iterable-primitives-are-not-flattened, through
-       Array.from(5) where Number.prototype[@@iterator] is a generator. The abort is
-       'drive-to-completion: coroutine body resumed off the tramp chain', so the missing capability is
-       a source reached through Array.from(5). MEASURED, not inferred: only the widened build aborts, and
-       that one line reproduces it alone. NOT yet explained — the widening's own tag check rejects a
-       non-object/non-string argument, so a number should not route through it at all; the mechanism is
-       therefore still unknown and the first step is finding what actually routes it, NOT assuming the
-       boxed-primitive path. Everything else the widening exposed is already built: IfAbruptCloseIterator
-       (4fa2d2f) plus the abrupt close for the FROM sink and the mapfn. */
-    return iter_consume_gen_backed(ctx, call_argv[0], out_getiter);
+    /* ANY callable @@iterator, INCLUDING on a primitive. Excluding primitives kept Array.from(5) on the C
+       path, where GetIterator invokes a generator @@iterator through JS_Call -> js_call_generator_function
+       -> async_func_resume, off the tramp — the drive-to-completion abort, confirmed by backtrace. The
+       exclusion CAUSED the failure it appeared to avoid: iter_data_at_iterator boxes for the lookup and the
+       machine acquires on the chain, so routing the primitive is the fix. Array-LIKES (no @@iterator at all,
+       driven by length + indices) are a different algorithm and stay in the C entry. */
+    if (!iter_data_at_iterator(ctx, call_argv[0], out_getiter)) return false;
+    if (JS_IsFunction(ctx, *out_getiter)) return true;
+    JS_FreeValue(ctx, *out_getiter); *out_getiter = JS_UNDEFINED;
+    return false;
 }
 
 /* Route new Set(gen) / new Map(gen) — the js_map_constructor C loop drives the argument generator's .next(). Scoped
