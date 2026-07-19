@@ -58620,56 +58620,16 @@ static JSValue js_map_constructor(JSContext *ctx, JSValueConst new_target,
             goto fail;
         }
 
-        iter = JS_GetIterator(ctx, arr, false);
+        /* DELETED: the iteration loop. new Map/Set(iterable) over any callable @@iterator is driven by the
+           ONE consume machine (ITERCONS_MAP / ITERCONS_SET), which acquires on the tramp and performs
+           IfAbruptCloseIterator itself. This loop drove .next and the adder from C, where a coroutine cannot
+           suspend. An iterable reaching here means a call site was not routed. */
+        iter = JS_GetIterator(ctx, arr, false);   /* throws for a non-iterable, which is all that is left */
         if (JS_IsException(iter))
             goto fail;
-        next_method = JS_GetProperty(ctx, iter, JS_ATOM_next);
-        if (JS_IsException(next_method))
-            goto fail;
-
-        for(;;) {
-            item = JS_IteratorNext(ctx, iter, next_method, 0, NULL, &done);
-            if (JS_IsException(item))
-                goto fail;
-            if (done)
-                break;
-            if (is_set) {
-                ret = JS_Call(ctx, adder, obj, 1, vc(&item));
-                if (JS_IsException(ret)) {
-                    JS_FreeValue(ctx, item);
-                    goto fail;
-                }
-            } else {
-                JSValue key, value;
-                JSValueConst args[2];
-                key = JS_UNDEFINED;
-                value = JS_UNDEFINED;
-                if (!JS_IsObject(item)) {
-                    JS_ThrowTypeErrorNotAnObject(ctx);
-                    goto fail1;
-                }
-                key = JS_GetPropertyUint32(ctx, item, 0);
-                if (JS_IsException(key))
-                    goto fail1;
-                value = JS_GetPropertyUint32(ctx, item, 1);
-                if (JS_IsException(value))
-                    goto fail1;
-                args[0] = key;
-                args[1] = value;
-                ret = JS_Call(ctx, adder, obj, 2, args);
-                if (JS_IsException(ret)) {
-                fail1:
-                    JS_FreeValue(ctx, item);
-                    JS_FreeValue(ctx, key);
-                    JS_FreeValue(ctx, value);
-                    goto fail;
-                }
-                JS_FreeValue(ctx, key);
-                JS_FreeValue(ctx, value);
-            }
-            JS_FreeValue(ctx, ret);
-            JS_FreeValue(ctx, item);
-        }
+        DFAIL("new Map/Set reached its C entry with an ITERABLE source - route that call site onto the consume "
+              "machine; the iteration loop here no longer exists");
+        goto fail;
         JS_FreeValue(ctx, next_method);
         JS_FreeValue(ctx, iter);
         JS_FreeValue(ctx, adder);
@@ -59850,10 +59810,26 @@ static JSValue js_set_difference(JSContext *ctx, JSValueConst this_val,
         next = JS_GetProperty(ctx, iter, JS_ATOM_next);
         if (JS_IsException(next))
             goto exception;
-        newset = js_map_constructor(ctx, JS_UNDEFINED, 1, &this_val, MAGIC_SET);
-        if (JS_IsException(newset))
-            goto exception;
-        t = JS_GetOpaque(newset, JS_CLASS_SET);
+        /* Copy this_val's records DIRECTLY rather than constructing from it as an iterable. The iterable form
+           re-entered js_map_constructor from C, which is the one path that cannot suspend — and it was the only
+           internal caller doing so, found by backtrace once the constructor's loop was deleted. A Set copying a
+           Set needs no JS iteration at all: the records are C data. Same shape as the tramp path already uses. */
+        {
+            struct list_head *el2;
+            newset = js_map_constructor(ctx, JS_UNDEFINED, 0, NULL, MAGIC_SET);
+            if (JS_IsException(newset))
+                goto exception;
+            t = JS_GetOpaque(newset, JS_CLASS_SET);
+            list_for_each(el2, &s->records) {
+                JSMapRecord *mr = list_entry(el2, JSMapRecord, link), *nr;
+                if (mr->empty)
+                    continue;
+                nr = map_add_record(ctx, t, mr->key);
+                if (!nr)
+                    goto exception;
+                nr->value = JS_UNDEFINED;
+            }
+        }
         for (;;) {
             item = JS_IteratorNext(ctx, iter, next, 0, NULL, &done);
             if (JS_IsException(item))
