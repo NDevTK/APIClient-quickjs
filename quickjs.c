@@ -18295,6 +18295,37 @@ typedef struct JSStrReplace {
     int orig_cfirst, orig_cargc; uint8_t orig_is_tail;   /* the ORIGINAL OP_call_method operand shape */
 } JSStrReplace;
 static JSValue js_string_replace(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int is_replaceAll);
+#define CONT_RE_REPLACE    16  /* cont_state = JSReRep: str.replace(/re/g, fn) — RegExp.prototype[@@replace] with a
+                                  FUNCTION replacer. Phase 1 (collect every match) runs in C at setup because the
+                                  recognizer demands a STANDARD regexp; phase 2 (substitute each match) holds the
+                                  StringBuffer + nextSourcePosition + result index across each callback, so it is
+                                  driven one match per step on the tramp. */
+typedef struct JSReRep {
+    JSValue rx;              /* the regexp (owned) */
+    JSValue str;             /* the subject string (owned) */
+    JSValue rep;             /* the replacer function (owned) */
+    JSValue *results;        /* phase-1 match results: an owned array of owned values */
+    int nresults;
+    int j;                   /* index of the match being substituted */
+    StringBuffer b;          /* the accumulator */
+    int nextSourcePosition;
+    int64_t position;        /* the current match's index, held ACROSS the callback */
+    JSValue matched;         /* the current matched string (owned), held across the callback */
+    JSValue *cb_buf;         /* [this, fn, matched, caps..., position, str, groups?] — args live HERE, sp untouched */
+    int cb_nargs;
+    uint8_t cb_pending;      /* 1 = the value delivered to the next step is the replacer's result */
+    JSValue result;          /* DONE: the finished string (owned) */
+    int orig_cfirst, orig_cargc; uint8_t orig_is_tail;
+} JSReRep;
+static int js_re_rep_step(JSContext *ctx, struct JSReRep *s, JSValue cb_result);
+static void js_re_rep_end(JSContext *ctx, struct JSReRep *s, bool take_result);
+static bool tramp_can_call_re_replace(JSContext *ctx, JSValueConst func, JSValueConst this_val,
+                                      JSValueConst *call_argv, int call_argc);
+static JSValue js_regexp_Symbol_replace(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static int js_is_standard_regexp(JSContext *ctx, JSValueConst rx);
+static int string_indexof_char(JSString *p, int c, int from);
+static int64_t string_advance_index(JSString *p, int64_t idx, bool unicode);
+static JSValue JS_RegExpExec(JSContext *ctx, JSValueConst r, JSValueConst s);
 static int js_str_replace_step(JSContext *ctx, JSStrReplace *s, JSValue cb_result);
 static void js_str_replace_end(JSContext *ctx, JSStrReplace *s, bool take_result);
 static bool tramp_can_call_str_replace(JSValueConst func, JSValueConst this_val,
@@ -19827,6 +19858,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_str_replace(call_argv[-1], call_argv[-2], vc(call_argv), call_argc, &srep_is_all)) {   /* str.replace(s,fn) -> replacer drive on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_str_replace_tramp;
                 }
+                if (tramp_can_call_re_replace(ctx, call_argv[-1], call_argv[-2], vc(call_argv), call_argc)) {   /* str.replace(/re/g,fn) -> @@replace phase 2 on THIS chain */
+                    srep_is_all = JS_VALUE_GET_OBJ(call_argv[-1])->u.cfunc.magic;
+                    tramp_is_tail = (opcode == OP_tail_call_method); goto do_re_replace_tramp;
+                }
                 if (tramp_can_call_iter_consume(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter)) {   /* Array.from(iterable) -> GetIterator + consume on THIS chain */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_iter_consume_tramp;
                 }
@@ -20529,6 +20564,108 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 cont_st = s; cont_kind_cur = CONT_ARRAY_REDUCE;
                 ret_val = JS_UNDEFINED;
                 goto do_array_reduce_step;
+            }
+
+        do_re_replace_tramp:
+            /* 22.2.6.11 phase 1: set lastIndex, then collect EVERY match. The recognizer guarantees a standard
+               regexp, so JS_RegExpExec runs the built-in exec and no user code runs here — the first re-entry into
+               JS is the replacer, which phase 2 drives on the tramp. */
+            {
+                JSReRep *s;
+                JSValue rxv = call_argv[0];
+                JSValue flags, sv;
+                JSString *fp2;
+                int is_global2, fullUnicode2 = 0;
+                JSValue *res = NULL; int nres = 0, rcap = 0;
+
+                flags = JS_GetProperty(ctx, rxv, JS_ATOM_flags);
+                if (unlikely(JS_IsException(flags))) goto exception;
+                flags = JS_ToStringFree(ctx, flags);
+                if (unlikely(JS_IsException(flags))) goto exception;
+                fp2 = JS_VALUE_GET_STRING(flags);
+                is_global2 = (-1 != string_indexof_char(fp2, 'g', 0));
+                if (is_global2) {
+                    fullUnicode2 = (string_indexof_char(fp2, 'u', 0) >= 0 || string_indexof_char(fp2, 'v', 0) >= 0);
+                    if (JS_SetProperty(ctx, rxv, JS_ATOM_lastIndex, js_int32(0)) < 0) { JS_FreeValue(ctx, flags); goto exception; }
+                }
+                JS_FreeValue(ctx, flags);
+                if (srep_is_all && !is_global2) {   /* replaceAll demands the g flag, as check_regexp_g_flag does */
+                    JS_ThrowTypeError(ctx, "replaceAll must be called with a global RegExp");
+                    goto exception;
+                }
+                sv = js_dup(call_argv[-2]);   /* the recognizer proved this is a string */
+                for (;;) {
+                    JSValue mres = JS_RegExpExec(ctx, rxv, sv);
+                    if (unlikely(JS_IsException(mres))) goto re_rep_collect_fail;
+                    if (JS_IsNull(mres)) { JS_FreeValue(ctx, mres); break; }
+                    if (nres == rcap) {
+                        JSValue *nr;
+                        rcap = rcap ? rcap * 2 : 8;
+                        nr = js_realloc_rt(rt, res, sizeof(JSValue) * rcap);
+                        if (unlikely(!nr)) { JS_FreeValue(ctx, mres); JS_ThrowOutOfMemory(ctx); goto re_rep_collect_fail; }
+                        res = nr;
+                    }
+                    res[nres++] = mres;
+                    if (!is_global2) break;
+                    {   /* an EMPTY match must always advance at least one char, or the collect never terminates */
+                        JSValue m0 = JS_ToStringFree(ctx, JS_GetPropertyInt64(ctx, mres, 0));
+                        if (unlikely(JS_IsException(m0))) goto re_rep_collect_fail;
+                        if (JS_IsEmptyString(m0)) {
+                            int64_t thisIndex, nextIndex;
+                            JS_FreeValue(ctx, m0);
+                            if (JS_ToLengthFree(ctx, &thisIndex, JS_GetProperty(ctx, rxv, JS_ATOM_lastIndex)) < 0)
+                                goto re_rep_collect_fail;
+                            nextIndex = string_advance_index(JS_VALUE_GET_STRING(sv), thisIndex, fullUnicode2);
+                            if (JS_SetProperty(ctx, rxv, JS_ATOM_lastIndex, js_int64(nextIndex)) < 0)
+                                goto re_rep_collect_fail;
+                        } else {
+                            JS_FreeValue(ctx, m0);
+                        }
+                    }
+                }
+                s = js_mallocz_rt(rt, sizeof(*s));
+                if (unlikely(!s)) { JS_ThrowOutOfMemory(ctx); goto re_rep_collect_fail; }
+                s->rx = js_dup(rxv);
+                s->str = sv;                       /* ownership moves into the state */
+                s->rep = js_dup(call_argv[1]);
+                s->results = res; s->nresults = nres;
+                s->matched = JS_UNDEFINED; s->result = JS_UNDEFINED;
+                string_buffer_init(ctx, &s->b, 0);
+                s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
+                cont_st = s; cont_kind_cur = CONT_RE_REPLACE;
+                ret_val = JS_UNDEFINED;
+                goto do_re_replace_step;
+
+            re_rep_collect_fail:
+                { int q; for (q = 0; q < nres; q++) JS_FreeValue(ctx, res[q]); }
+                js_free_rt(rt, res);
+                JS_FreeValue(ctx, sv);
+                goto exception;
+            }
+
+        do_re_replace_step:
+            {
+                JSReRep *s = (JSReRep *)cont_st;
+                int st = js_re_rep_step(ctx, s, ret_val);
+                if (unlikely(st < 0)) { js_re_rep_end(ctx, s, false); js_free_rt(rt, s); goto exception; }
+                if (st == 0) {
+                    JSValue r = s->result;
+                    int cfirst = s->orig_cfirst, cargc = s->orig_cargc;
+                    uint8_t itail = s->orig_is_tail;
+                    JSValue *cargv = sp - cargc;
+                    js_re_rep_end(ctx, s, true);
+                    js_free_rt(rt, s);
+                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
+                    sp += cfirst - cargc;
+                    if (itail) { ret_val = r; goto do_return; }
+                    *sp++ = r;
+                    BREAK;
+                }
+                DCHECK(st == 3, "regexp replace step: unknown step code");
+                call_argv = (JSValueConst *)&s->cb_buf[2];
+                call_argc = s->cb_nargs; tramp_first = -2; tramp_is_tail = 0;
+                tramp_cont_state = s; tramp_cont_kind = CONT_RE_REPLACE;
+                goto do_tramp_call;   /* the recognizer guarantees a bytecode replacer */
             }
 
         do_str_replace_tramp:
@@ -22303,6 +22440,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        that builtin's STEP instead of pushing it. The step drives the next element or finishes. */
                     cont_st = rcs; cont_kind_cur = rck;
                     if (rck == CONT_STR_REPLACE) goto do_str_replace_step;
+                    if (rck == CONT_RE_REPLACE) goto do_re_replace_step;
                     if (rck == CONT_ARRAY_REDUCE) goto do_array_reduce_step;
                     if (rck == CONT_SORT) goto do_sort_step;
                     if (rck == CONT_JSON_REVIVE) goto do_json_revive_step;
@@ -25179,6 +25317,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 js_array_reduce_end(ctx, (struct JSArrayReduce *)xcs, false);
             else if (xck == CONT_STR_REPLACE)
                 js_str_replace_end(ctx, (JSStrReplace *)xcs, false);
+            else if (xck == CONT_RE_REPLACE)
+                js_re_rep_end(ctx, (JSReRep *)xcs, false);
             else
                 /* A bare `else` here used to tear the state down AS a JSArrayReduce. Any callback cont kind added
                    without an arm above would be freed through the wrong struct — silent heap corruption on the
@@ -25916,7 +26056,7 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                     ct->sf.arg_buf = &ns->cb_args[2];
             } else {
                 DCHECK(otf->cont_kind == CONT_NONE,
-                       "clone_deep_flow: deep-fork of this C-continuation kind (sort/json-revive/construct/agen/str-replace) not built");
+                       "clone_deep_flow: deep-fork of this C-continuation kind (sort/json-revive/construct/agen/str-replace/re-replace) not built");
             }
         }
         ct->up = (i == n - 1) ? NULL : ca[i + 1];
@@ -55260,6 +55400,154 @@ static int js_is_standard_regexp(JSContext *ctx, JSValueConst rx)
         JS_FreeValue(ctx, val);
     }
     return res;
+}
+
+/* str.replace(/re/g, fn) — RegExp.prototype[@@replace] (22.2.6.11) with a FUNCTION replacer.
+   The builtin is two-phase: collect EVERY match, then substitute each one. Only phase 2 re-enters JS, and it holds
+   a StringBuffer + nextSourcePosition + the result index across each callback, so it is continuation-holding and
+   gets the same hook as the string path. Phase 1 runs entirely in C at SETUP because the recognizer requires a
+   STANDARD regexp — JS_RegExpExec then uses the built-in exec and no user code runs before the first callback.
+   A patched `exec` or a subclassed regexp is therefore NOT recognized and still takes the ordinary C path. */
+static void js_re_rep_free_cb(JSContext *ctx, struct JSReRep *s);
+static int js_re_rep_step(JSContext *ctx, struct JSReRep *s, JSValue cb_result)
+{
+    JSString *sp = JS_VALUE_GET_STRING(s->str);
+
+    if (s->cb_pending) {
+        /* the replacer returned: ToString it and splice at the recorded position */
+        JSValue rep_str = JS_ToString(ctx, cb_result);
+        JS_FreeValue(ctx, cb_result);
+        js_re_rep_free_cb(ctx, s);
+        s->cb_pending = 0;
+        if (JS_IsException(rep_str))
+            return -1;
+        /* a custom regexp can hand back a BACKWARD index; the substitution is then ignored (never rewinds) */
+        if (s->position >= s->nextSourcePosition) {
+            string_buffer_concat(&s->b, sp, s->nextSourcePosition, s->position);
+            string_buffer_concat_value(&s->b, rep_str);
+            s->nextSourcePosition = s->position + JS_VALUE_GET_STRING(s->matched)->len;
+        }
+        JS_FreeValue(ctx, rep_str);
+        s->j++;
+    }
+    for (; s->j < s->nresults; s->j++) {
+        JSValueConst result = s->results[s->j];
+        JSValue namedCaptures;
+        uint32_t nCaptures;
+        int n, k;
+        if (js_get_length32(ctx, &nCaptures, result) < 0)
+            return -1;
+        JS_FreeValue(ctx, s->matched);
+        s->matched = JS_ToStringFree(ctx, JS_GetPropertyInt64(ctx, result, 0));
+        if (JS_IsException(s->matched))
+            return -1;
+        if (JS_ToLengthFree(ctx, &s->position, JS_GetProperty(ctx, result, JS_ATOM_index)))
+            return -1;
+        if (s->position > sp->len)
+            s->position = sp->len;
+        else if (s->position < 0)
+            s->position = 0;
+        namedCaptures = JS_GetProperty(ctx, result, JS_ATOM_groups);
+        if (JS_IsException(namedCaptures))
+            return -1;
+        /* Call(replaceValue, undefined, «matched, ...captures, position, string, groups?»). The spec builds a
+           LIST, not an array — the JS array the C path materializes is never observable, so the args go straight
+           into the call buffer. Layout is [this, fn, args...] so do_tramp_call reads fn at call_argv[-1]. */
+        s->cb_nargs = 0;
+        s->cb_buf = js_malloc(ctx, sizeof(JSValue) * (2 + nCaptures + 3));
+        if (!s->cb_buf) { JS_FreeValue(ctx, namedCaptures); return -1; }
+        s->cb_buf[0] = JS_UNDEFINED;          /* thisArgument */
+        s->cb_buf[1] = js_dup(s->rep);
+        k = 2;
+        s->cb_buf[k++] = js_dup(s->matched);
+        s->cb_nargs = 1;
+        for (n = 1; n < nCaptures; n++) {
+            JSValue capN = JS_GetPropertyInt64(ctx, result, n);
+            if (JS_IsException(capN)) { JS_FreeValue(ctx, namedCaptures); s->cb_nargs = k - 2; return -1; }
+            if (!JS_IsUndefined(capN)) {
+                capN = JS_ToStringFree(ctx, capN);
+                if (JS_IsException(capN)) { JS_FreeValue(ctx, namedCaptures); s->cb_nargs = k - 2; return -1; }
+            }
+            s->cb_buf[k++] = capN;
+            s->cb_nargs++;
+        }
+        s->cb_buf[k++] = js_int32(s->position);   s->cb_nargs++;
+        s->cb_buf[k++] = js_dup(s->str);          s->cb_nargs++;
+        if (!JS_IsUndefined(namedCaptures)) {
+            s->cb_buf[k++] = namedCaptures;       s->cb_nargs++;   /* ownership moves into the buffer */
+        } else {
+            JS_FreeValue(ctx, namedCaptures);
+        }
+        s->cb_pending = 1;
+        return 3;
+    }
+    string_buffer_concat(&s->b, sp, s->nextSourcePosition, sp->len);
+    s->result = string_buffer_end(&s->b);
+    if (JS_IsException(s->result))
+        return -1;
+    return 0;
+}
+
+static void js_re_rep_free_cb(JSContext *ctx, struct JSReRep *s)
+{
+    int i;
+    if (!s->cb_buf)
+        return;
+    JS_FreeValue(ctx, s->cb_buf[1]);
+    for (i = 0; i < s->cb_nargs; i++)
+        JS_FreeValue(ctx, s->cb_buf[2 + i]);
+    js_free(ctx, s->cb_buf);
+    s->cb_buf = NULL; s->cb_nargs = 0;
+}
+
+static void js_re_rep_end(JSContext *ctx, struct JSReRep *s, bool take_result)
+{
+    int i;
+    js_re_rep_free_cb(ctx, s);
+    if (!take_result) {
+        string_buffer_free(&s->b);
+        JS_FreeValue(ctx, s->result);
+    }
+    for (i = 0; i < s->nresults; i++)
+        JS_FreeValue(ctx, s->results[i]);
+    js_free(ctx, s->results);
+    JS_FreeValue(ctx, s->rx);
+    JS_FreeValue(ctx, s->str);
+    JS_FreeValue(ctx, s->rep);
+    JS_FreeValue(ctx, s->matched);
+}
+
+/* Recognized only for a STANDARD regexp (so phase 1 runs no user JS), a STRING subject, and a bytecode replacer.
+   replaceAll additionally requires the g flag, exactly as check_regexp_g_flag enforces on the C path. */
+static bool tramp_can_call_re_replace(JSContext *ctx, JSValueConst func, JSValueConst this_val,
+                                      JSValueConst *call_argv, int call_argc)
+{
+    JSObject *fp, *rp;
+    if (call_argc < 2) return false;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
+    fp = JS_VALUE_GET_OBJ(func);
+    if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
+    if (fp->u.cfunc.cproto != JS_CFUNC_generic_magic) return false;
+    if (fp->u.cfunc.c_function.generic_magic != js_string_replace) return false;
+    if (JS_VALUE_GET_TAG(this_val) != JS_TAG_STRING) return false;
+    if (JS_VALUE_GET_TAG(call_argv[0]) != JS_TAG_OBJECT) return false;
+    rp = JS_VALUE_GET_OBJ(call_argv[0]);
+    if (rp->class_id != JS_CLASS_REGEXP) return false;
+    if (!tramp_can_call(call_argv[1])) return false;
+    /* the @@replace it would dispatch to must be the BUILT-IN one, else the semantics are not ours to reproduce */
+    {
+        JSValue replacer = JS_GetProperty(ctx, call_argv[0], JS_ATOM_Symbol_replace);
+        bool ok;
+        if (JS_IsException(replacer)) { JS_FreeValue(ctx, replacer); return false; }
+        ok = JS_VALUE_GET_TAG(replacer) == JS_TAG_OBJECT
+             && JS_VALUE_GET_OBJ(replacer)->class_id == JS_CLASS_C_FUNCTION
+             && JS_VALUE_GET_OBJ(replacer)->u.cfunc.cproto == JS_CFUNC_generic
+             && JS_VALUE_GET_OBJ(replacer)->u.cfunc.c_function.generic == js_regexp_Symbol_replace;
+        JS_FreeValue(ctx, replacer);
+        if (!ok) return false;
+    }
+    if (!js_is_standard_regexp(ctx, call_argv[0])) return false;
+    return true;
 }
 
 static JSValue js_regexp_Symbol_replace(JSContext *ctx, JSValueConst this_val,
