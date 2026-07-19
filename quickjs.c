@@ -19961,7 +19961,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         }
                     }
                 }
-                if (tramp_is_function_apply(call_argv[-1]) && (tramp_can_call(call_argv[-2]) || tramp_step_def_of(call_argv[-2]))) {   /* f.apply(this,arr), f NORMAL */
+                if (tramp_is_function_apply(call_argv[-1])) {   /* target kind is NOT a call-site question */   /* f.apply(this,arr), f NORMAL */
                     /* only when arr is undefined/null (0 args) or an object (array-like); a primitive arr must
                        throw a realm-correct TypeError from the C js_function_apply BEFORE the target runs. */
                     JSValueConst aa = (call_argc >= 2) ? call_argv[1] : JS_UNDEFINED;
@@ -20128,7 +20128,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc += 2;
                 sf->cur_pc = pc;
 
-                if (magic == 0 && (tramp_can_call(sp[-3]) || tramp_step_def_of(sp[-3]))) {   /* f(...arr) / f.apply-spread, f NORMAL -> body on THIS chain */
+                if (magic == 0) {   /* target kind is NOT a call-site question */   /* f(...arr) / f.apply-spread, f NORMAL -> body on THIS chain */
                     int atag = JS_VALUE_GET_TAG(sp[-1]);   /* the spread array */
                     if (atag == JS_TAG_UNDEFINED || atag == JS_TAG_NULL || atag == JS_TAG_OBJECT) {
                         ap_func = sp[-3]; ap_this = sp[-2]; ap_array = sp[-1];
@@ -20451,6 +20451,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValueConst thisArg = ap_this;
                 JSValueConst arrayArg = ap_array;
                 JSObject *np;
+                if (!tramp_can_call(nfunc) && !tramp_step_def_of(nfunc)) {
+                    /* a PLAIN C / bound / proxy target. It holds no continuation and has no preemptible body, so
+                       invoking it here is complete — and handling it HERE is what lets the three call-site gates
+                       drop their `(tramp_can_call(t) || tramp_step_def_of(t))` half. .apply is call-site-resolved
+                       (§C-stack): the operator site always reshapes, and what the TARGET happens to be is not a
+                       question the call site should be asking. */
+                    uint32_t alen3 = 0; JSValue *atab3 = NULL;
+                    int cf3 = ap_cfirst, ca3 = ap_cargc; uint8_t it3 = tramp_is_tail;
+                    JSValue *cargv3;
+                    if (JS_VALUE_GET_TAG(arrayArg) != JS_TAG_UNDEFINED && JS_VALUE_GET_TAG(arrayArg) != JS_TAG_NULL) {
+                        atab3 = build_arg_list(ctx, &alen3, arrayArg);
+                        if (unlikely(!atab3)) goto exception;
+                    }
+                    ret_val = JS_Call(ctx, nfunc, thisArg, (int)alen3, (JSValueConst *)atab3);
+                    free_arg_list(ctx, atab3, alen3);
+                    if (unlikely(JS_IsException(ret_val))) goto exception;
+                    cargv3 = sp - ca3;
+                    for (i = cf3; i < ca3; i++) JS_FreeValue(ctx, cargv3[i]);
+                    sp += cf3 - ca3;
+                    if (it3) goto do_return;
+                    *sp++ = ret_val;
+                    BREAK;
+                }
                 {   /* the target may be a STEP builtin (f.apply / Reflect.apply / the spread). It has no bytecode
                        body, so the code below does not apply — route it onto the one step driver here. There is no
                        fallback to fall through TO: js_call_c_function now DFAILs on a step builtin, so a call
