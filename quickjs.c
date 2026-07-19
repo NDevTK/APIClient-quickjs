@@ -20449,6 +20449,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_iterterm(ctx, call_argv[-1], call_argv[-2], call_argc, &iterterm_kind)) goto do_iterterm_tramp;
                 if (tramp_can_call_iterator_from(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter)) goto do_iterfrom_tramp;
                 if (tramp_step_def_of(call_argv[-1])) goto do_step_tramp;   /* same capability check as the direct-call site */
+                /* The forwarded shape is identical to the direct one, so it must ask the SAME questions. This list
+                   having fallen behind the OP_call_method list is why replace.call(123, "2", fn) reached the C
+                   entry: same builtin, same callback, different answer depending on how the call was spelled. */
+                if (tramp_can_call_str_replace(ctx, call_argv[-1], call_argv[-2], vc(call_argv), call_argc, &srep_is_all)) {
+                    tramp_is_tail = 0; goto do_str_replace_tramp;
+                }
+                if (tramp_can_call_re_replace(ctx, call_argv[-1], call_argv[-2], vc(call_argv), call_argc)) {
+                    srep_is_all = JS_VALUE_GET_OBJ(call_argv[-1])->u.cfunc.magic;
+                    tramp_is_tail = 0; goto do_re_replace_tramp;
+                }
+                if (tramp_can_call_array_sort(call_argv[-1], call_argc, vc(call_argv))) { tramp_is_tail = 0; goto do_sort_tramp; }
+                if (tramp_can_call_json_parse(call_argv[-1], call_argc, vc(call_argv))) { tramp_is_tail = 0; goto do_json_revive_tramp; }
                 {   /* g.next.call(g) / g.throw.call(g,e) / g.return.call(g,v): the reshape produced the exact
                        [this=generator, f=js_generator_next] method-call shape do_generator_tramp reads, so route the
                        body onto THIS chain (loop preempts + forks the base) — never the js_generator_next
@@ -20785,8 +20797,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 JSStrReplace *s = js_mallocz_rt(rt, sizeof(*s));
                 if (unlikely(!s)) { JS_ThrowOutOfMemory(ctx); goto exception; }
-                s->str = js_dup(call_argv[-2]);
-                s->search_str = js_dup(call_argv[0]);
+                /* steps 3-4: ToString(O) then ToString(searchValue). These can run user code (toString/valueOf);
+                   the walk itself never sees anything but the resulting primitive strings. */
+                s->str = JS_ToString(ctx, call_argv[-2]);
+                if (unlikely(JS_IsException(s->str))) { js_free_rt(rt, s); goto exception; }
+                s->search_str = JS_ToString(ctx, call_argv[0]);
+                if (unlikely(JS_IsException(s->search_str))) { JS_FreeValue(ctx, s->str); js_free_rt(rt, s); goto exception; }
                 s->result = JS_UNDEFINED;
                 string_buffer_init(ctx, &s->b, 0);
                 s->endOfLastMatch = 0; s->pos = 0;
@@ -52831,8 +52847,20 @@ static bool tramp_can_call_str_replace(JSContext *ctx, JSValueConst func, JSValu
     if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
     if (fp->u.cfunc.cproto != JS_CFUNC_generic_magic) return false;
     if (fp->u.cfunc.c_function.generic_magic != js_string_replace) return false;
-    if (JS_VALUE_GET_TAG(this_val) != JS_TAG_STRING) return false;
-    if (JS_VALUE_GET_TAG(call_argv[0]) != JS_TAG_STRING) return false;
+    /* 22.1.3.19 steps 1-4: the receiver only has to be object-coercible and searchValue only has to be
+       ToString-able — the setup performs both coercions. Demanding primitive STRINGS here is what left
+       new String(s).replace(..), replace.call(123, ..) and a {toString(){}} searchValue falling through to the
+       duplicate walk. An OBJECT searchValue is still declined when it carries @@replace (step 2b delegates to it;
+       that is a different operation, not this walk). */
+    if (JS_IsUndefined(this_val) || JS_IsNull(this_val)) return false;
+    if (JS_VALUE_GET_TAG(call_argv[0]) == JS_TAG_OBJECT) {
+        JSValue rp = JS_GetProperty(ctx, call_argv[0], JS_ATOM_Symbol_replace);
+        bool has;
+        if (JS_IsException(rp)) { JS_FreeValue(ctx, rp); return false; }
+        has = !JS_IsUndefined(rp) && !JS_IsNull(rp);
+        JS_FreeValue(ctx, rp);
+        if (has) return false;
+    }
     /* ANY callable replacer, not just a bytecode one. Requiring tramp_can_call here was the fallback in disguise:
        a C/bound replacer fell through to a SECOND implementation of the same walk inside js_string_replace. The
        step machine dispatches a non-tramp callback inline (it has no preemptible body, so nothing is lost), which
