@@ -21583,10 +21583,31 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     *sp++ = r;
                     BREAK;
                 }
-                /* CALL: drive s->iter.next() on this chain; the settle re-enters this step. */
-                tramp_cont_state = s; tramp_cont_kind = CONT_PROMISE_ALL; tramp_gen_cont_iter = s->iter;
-                tramp_gen_cont_consume = 1; tramp_gen_magic = GEN_MAGIC_NEXT;
-                goto do_generator_tramp;
+                /* CALL: drive s->iter.next() on this chain; the settle re-enters this step. The SAME three-way
+                   dispatch do_iter_consume_step uses — a GENERATOR runs its body via the gen tramp, anything else
+                   (an array iterator, a plain object iterator) has its .next() called on the tramp so a loop in it
+                   parks. This site used to jump straight to do_generator_tramp, which reads ->u.generator_data off
+                   the receiver with no class check: the generator-backed narrowing in the recognizer was the only
+                   thing keeping a non-generator out, so widening it segfaulted on Promise.all([]). */
+                if (tramp_gen_method_magic(s->next, s->iter) == GEN_MAGIC_NEXT) {
+                    tramp_cont_state = s; tramp_cont_kind = CONT_PROMISE_ALL; tramp_gen_cont_iter = s->iter;
+                    tramp_gen_cont_consume = 1; tramp_gen_magic = GEN_MAGIC_NEXT;
+                    goto do_generator_tramp;
+                }
+                DCHECK(sp + 2 <= TRAMP_SP_LIMIT(sf),
+                       "Promise combinator plain .next() drive: operand push exceeds the frame's compiled stack_size");
+                *sp++ = js_dup(s->iter);
+                *sp++ = js_dup(s->next);
+                call_argv = sp; call_argc = 0; tramp_first = -2; tramp_is_tail = 0;
+                tramp_cont_state = s; tramp_cont_kind = CONT_PROMISE_ALL;
+                if (tramp_can_call(call_argv[-1])) goto do_tramp_call;
+                tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;
+                { JSValue nr = JS_Call(ctx, call_argv[-1], call_argv[-2], 0, NULL);
+                  JS_FreeValue(ctx, call_argv[-1]); JS_FreeValue(ctx, call_argv[-2]); sp -= 2;
+                  if (JS_IsException(nr)) goto promise_all_err;
+                  if (!JS_IsObject(nr)) { JS_FreeValue(ctx, nr);
+                                          JS_ThrowTypeError(ctx, "iterator result not an object"); goto promise_all_err; }
+                  ret_val = nr; goto do_promise_all_step; }
             }
 
         do_async_from_sync_tramp:
@@ -21948,6 +21969,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    cont-consume: generator in the state. direct: receiver at call_argv[-2]. */
                 JSValueConst gthis = cont_consume ? cc_iter
                                    : (close ? (close_from_slot ? close_slot : sp[-1]) : (iternext ? sp[-4] : (forof ? sp[fofoff] : call_argv[-2])));
+                /* Every route here must have established the receiver IS a live generator — this reads the
+                   generator_data union member unconditionally, so a non-generator yields a garbage pointer and
+                   crashes thousands of lines away as a UAF (0xbaadf00d cur_sp) with nothing naming the caller.
+                   Assert it at the origin instead: the failing route is then in the message. */
+                DCHECK(JS_VALUE_GET_TAG(gthis) == JS_TAG_OBJECT
+                       && JS_VALUE_GET_OBJ(gthis)->class_id == JS_CLASS_GENERATOR
+                       && JS_VALUE_GET_OBJ(gthis)->u.generator_data != NULL,
+                       "do_generator_tramp entered with a receiver that is not a live generator — the route that "
+                       "set tramp_gen_* must dispatch a non-generator .next() through do_tramp_call instead");
                 JSGeneratorData *gs = JS_VALUE_GET_OBJ(gthis)->u.generator_data;
                 int gmagic = tramp_gen_magic;
                 JSValueConst garg = (close || iternext) ? (iternext ? sp[-1] : JS_UNDEFINED)
@@ -25447,6 +25477,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 js_str_replace_end(ctx, (JSStrReplace *)xcs, false);
             else if (xck == CONT_RE_REPLACE)
                 js_re_rep_end(ctx, (JSReRep *)xcs, false);
+            else if (xck == CONT_PROMISE_ALL)
+                js_promise_all_end(ctx, (JSPromiseAll *)xcs);
             else
                 /* A bare `else` here used to tear the state down AS a JSArrayReduce. Any callback cont kind added
                    without an arm above would be freed through the wrong struct — silent heap corruption on the
@@ -61976,10 +62008,12 @@ static bool tramp_can_call_promise_all(JSContext *ctx, JSValueConst func, JSValu
        so probing here is unobservable — the observable @@iterator CALL happens in do_consume_acquire_iterator, after
        the tramp has read .resolve. Accept a generator-backed source only (its .next() needs the tramp): a
        generator-function @@iterator, or a direct generator (whose @@iterator returns itself). Anything else — a getter
-       @@iterator, a helper, a plain iterator — takes the C path, which drives it correctly. */
+       @@iterator, a helper, a plain iterator — used to take the C path. That narrowing was the fallback selector:
+       the C path drives .next off the tramp, so "drives it correctly" was only true for sources that never need
+       to suspend. Widened to ANY callable @@iterator, as Object.fromEntries, Array.from and Map/Set already were. */
+    (void)ip;
     if (!iter_data_at_iterator(ctx, call_argv[0], out_getiter)) return false;
-    if (tramp_can_call_gen_create(*out_getiter)
-        || (ip->class_id == JS_CLASS_GENERATOR && ip->u.generator_data)) {
+    if (JS_IsFunction(ctx, *out_getiter)) {
         *out_magic = magic;
         return true;
     }
