@@ -18345,6 +18345,18 @@ typedef struct JSPromiseExec {
     int orig_cfirst, orig_cargc; /* the ORIGINAL OP_call_constructor operand shape (pop at finish) */
 } JSPromiseExec;
 static bool tramp_can_call_promise_exec(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc);
+#define CONT_PROMISE_TRY   18  /* cont_state = JSPromiseTry: Promise.try(fn, ...args). Creates the capability, drives
+                                  fn(...args) on THIS chain (so a loop in fn parks), then resolves with fn's return;
+                                  the exception arm rejects with an abrupt fn and yields the promise (Promise.try
+                                  returns a rejected promise, never raises) — the same shape as the executor. */
+typedef struct JSPromiseTry {
+    JSValue promise;             /* the result promise (owned) */
+    JSValue resolving_funcs[2];  /* [resolve, reject] (owned) */
+    int orig_cfirst, orig_cargc; uint8_t orig_is_tail;   /* ORIGINAL OP_call_method operand shape (pop at finish) */
+    int nargs;                   /* number of args passed to fn */
+    JSValue cb_args[];           /* [this=undefined, fn, arg0..arg(nargs-1)] — owned dups; the tramp reads &cb_args[2] */
+} JSPromiseTry;
+static bool tramp_can_call_promise_try(JSValueConst func, JSValueConst *call_argv, int call_argc);
 #define CONT_STR_REPLACE   15  /* cont_state = JSStrReplace: String.prototype.replace/replaceAll with a FUNCTION
                                   replacer. The builtin holds a StringBuffer + endOfLastMatch across each callback,
                                   so the callback dispatch is hooked into the flow machinery (the builtin stays in
@@ -19255,6 +19267,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     int smc_cfirst = -2, smc_cargc = 0; JSValue smc_super_ref = JS_UNDEFINED;
     JSValue pe_executor_own = JS_UNDEFINED;   /* owned executor for the Reflect.construct spelling */
     JSPromiseExec *pexec_finish_state = NULL;   /* set by whichever dispatch shape reaches do_promise_exec_finish */
+    JSPromiseTry *ptry_finish_state = NULL;     /* set by the CONT_PROMISE_TRY return that reaches do_promise_try_finish */
     uint8_t rerep_direct = 0;                           /* 1 = re[@@replace](str,fn) shape, 0 = str.replace(re,fn) */
     int srep_is_all = 0;                                /* str.replace vs replaceAll (the builtin's magic), read at OP_call_method */
     /* apply/spread trampoline (do_apply_tramp): set by the .apply method call or the OP_apply spread before goto.
@@ -20383,6 +20396,56 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
 
+        do_promise_try_tramp:
+            /* Promise.try(fn, ...args): create the capability, then drive fn(...args) on THIS chain so a loop in fn
+               parks. call_argv[-2] = the constructor C, [0] = fn, [1..] = args. The fn-call operands are dup'd into
+               the state (like the executor's cb_args) so the ORIGINAL Promise.try operands stay put for the finish
+               to pop. do_return -> do_promise_try_finish resolves with fn's return; the exception arm rejects. */
+            {
+                JSValueConst thisv = call_argv[-2];
+                JSValueConst fn = call_argv[0];
+                int nargs = call_argc - 1;
+                JSPromiseTry *s;
+                JSValue rp;
+                s = js_malloc_rt(rt, sizeof(*s) + (size_t)(nargs + 2) * sizeof(JSValue));
+                if (unlikely(!s)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                rp = js_new_promise_capability(ctx, s->resolving_funcs, thisv);
+                if (JS_IsException(rp)) { js_free_rt(rt, s); goto exception; }
+                s->promise = rp;
+                s->nargs = nargs;
+                s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
+                s->cb_args[0] = JS_UNDEFINED;          /* thisArgument for fn is undefined */
+                s->cb_args[1] = js_dup(fn);
+                for (i = 0; i < nargs; i++) s->cb_args[2 + i] = js_dup(call_argv[1 + i]);
+                call_argv = (JSValueConst *)&s->cb_args[2]; call_argc = nargs; tramp_first = -2; tramp_is_tail = 0;
+                tramp_cont_state = s; tramp_cont_kind = CONT_PROMISE_TRY;
+                goto do_tramp_call;   /* bytecode fn: its body runs on THIS chain and can park */
+            }
+
+        do_promise_try_finish:
+            /* fn returned (or, via the exception arm, threw). ret_val is fn's completion: resolve the promise with a
+               normal value, or the exception arm rejects with an abrupt one; either way yield the promise (pop the
+               ORIGINAL Promise.try operands). A throwing resolve/reject DOES propagate (Call is a ? step). */
+            {
+                JSPromiseTry *ps = ptry_finish_state;
+                JSValue r = ps->promise, rr;
+                int cfirst = ps->orig_cfirst, cargc = ps->orig_cargc; uint8_t itail = ps->orig_is_tail;
+                JSValue *cargv = sp - cargc;
+                ptry_finish_state = NULL;
+                rr = JS_Call(ctx, ps->resolving_funcs[0], JS_UNDEFINED, 1, vc(&ret_val));
+                JS_FreeValue(ctx, ret_val);
+                for (i = 0; i < ps->nargs + 2; i++) JS_FreeValue(ctx, ps->cb_args[i]);
+                JS_FreeValue(ctx, ps->resolving_funcs[0]); JS_FreeValue(ctx, ps->resolving_funcs[1]);
+                js_free_rt(rt, ps);
+                if (unlikely(JS_IsException(rr))) { JS_FreeValue(ctx, r); goto exception; }
+                JS_FreeValue(ctx, rr);
+                for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
+                sp += cfirst - cargc;
+                if (itail) { ret_val = r; goto do_return; }
+                *sp++ = r;
+            }
+            BREAK;
+
         do_construct_tramp:
             /* Run a bytecode CONSTRUCTOR body on THIS chain (so a loop in the constructor body preempts the base
                flow) instead of C-recursing through JS_CallConstructorInternal. Two entry shapes feed it via the
@@ -20788,6 +20851,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 if (tramp_can_call_promise_all(ctx, call_argv[-1], vc(call_argv), call_argc, &pa_magic, &tramp_iter_getiter))
                     goto do_promise_all_consume_tramp;          /* Promise.all/allSettled/any/race(iterable) */
+                if (tramp_can_call_promise_try(call_argv[-1], vc(call_argv), call_argc))
+                    goto do_promise_try_tramp;                  /* Promise.try(fn, ...args) */
                 /* no consumer matched: fall into the step/generic convergence below */
             }
 
@@ -22680,6 +22745,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 } else if (rck == CONT_PROMISE_EXEC) {
                     pexec_finish_state = rcs;
                     goto do_promise_exec_finish;   /* ONE completion, shared with the inline-executor path */
+                } else if (rck == CONT_PROMISE_TRY) {
+                    ptry_finish_state = rcs;
+                    goto do_promise_try_finish;   /* fn returned: resolve the promise with its value */
                 } else if (rck == CONT_SETTER) {
                     /* setter returned: free the operands (this,setter,value) on the caller stack exactly like a
                        method call, but DISCARD the return value — a property write pushes nothing. */
@@ -25536,6 +25604,28 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             sp += cfirst - cargc;
             if (unlikely(JS_IsException(rr))) { JS_FreeValue(ctx, r); goto exception; }
             JS_FreeValue(ctx, rr);
+            *sp++ = r;
+            BREAK;
+        } else if (xck == CONT_PROMISE_TRY) {
+            /* Promise.try's fn threw: reject the promise with the abrupt value and yield it (Promise.try returns a
+               rejected promise, never raises) — the same shape as the executor. */
+            JSPromiseTry *ps = xcs;
+            JSValue err = JS_GetException(ctx), rr;
+            JSValue r = ps->promise;
+            int cfirst = ps->orig_cfirst, cargc = ps->orig_cargc; uint8_t itail = ps->orig_is_tail;
+            JSValue *cargv;
+            rr = JS_Call(ctx, ps->resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
+            JS_FreeValue(ctx, err);
+            for (i = 0; i < ps->nargs + 2; i++) JS_FreeValue(ctx, ps->cb_args[i]);
+            JS_FreeValue(ctx, ps->resolving_funcs[0]);
+            JS_FreeValue(ctx, ps->resolving_funcs[1]);
+            js_free_rt(rt, ps);
+            cargv = sp - cargc;
+            for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
+            sp += cfirst - cargc;
+            if (unlikely(JS_IsException(rr))) { JS_FreeValue(ctx, r); JS_FreeValue(ctx, rr); goto exception; }
+            JS_FreeValue(ctx, rr);
+            if (itail) { ret_val = r; goto do_return; }
             *sp++ = r;
             BREAK;
         } else if (xck == CONT_PROXY_GET) {
@@ -62373,6 +62463,22 @@ static bool tramp_can_call_promise_exec(JSContext *ctx, JSValueConst func, JSVal
     if (!call_argv) return true;   /* callee-only query (the Reflect.construct resolver): args live in an array */
     return JS_IsFunction(ctx, call_argv[0]);   /* ANY callable executor; a non-callable falls through so
                                                   js_promise_constructor throws the step-2 TypeError */
+}
+
+/* Promise.try(fn, ...args): fn is called SYNCHRONOUSLY, so a loop in it must park. Route only a BYTECODE fn (can
+   loop) with an object receiver; a C/bound fn (no preemptible body), a non-callable fn, or a non-object receiver
+   fall through to js_promise_try, which handles them in spec order (reject / throw). */
+static bool tramp_can_call_promise_try(JSValueConst func, JSValueConst *call_argv, int call_argc)
+{
+    JSObject *fp;
+    if (call_argc < 1) return false;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
+    fp = JS_VALUE_GET_OBJ(func);
+    if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
+    if (fp->u.cfunc.cproto != JS_CFUNC_generic) return false;
+    if (fp->u.cfunc.c_function.generic != js_promise_try) return false;
+    if (JS_VALUE_GET_TAG(call_argv[-2]) != JS_TAG_OBJECT) return false;   /* receiver must be a constructor */
+    return tramp_can_call(call_argv[0]);   /* bytecode fn only */
 }
 
 static JSValue js_promise_race(JSContext *ctx, JSValueConst this_val,
