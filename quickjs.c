@@ -21572,7 +21572,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     || JS_IsException(s->elem_promises)
                     || JS_DefinePropertyValueUint32(ctx, s->resolve_element_env, 0, js_int32(1),
                                                     JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE | JS_PROP_WRITABLE) < 0) {
-                    /* setup failed: reject the aggregate promise with the pending error and yield it */
+                    /* setup failed: reject the aggregate promise with the pending error and yield it. A non-callable
+                       .resolve is NOT itself an exception (GetProperty succeeded), so synthesize the TypeError
+                       GetPromiseResolve's IsCallable check throws — else JS_GetException would reject with a stale
+                       value (resolve-not-callable-reject-with-typeerror). */
+                    if (JS_IsUninitialized(rt->current_exception))
+                        JS_ThrowTypeError(ctx, "Promise resolve is not a function");
                     JSValue err = JS_GetException(ctx), rr;
                     JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED;
                     rr = JS_Call(ctx, s->resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
@@ -62227,6 +62232,10 @@ static bool tramp_can_call_promise_all(JSContext *ctx, JSValueConst func, JSValu
     } else {
         return false;
     }
+    /* the receiver (the constructor `this`) must be an Object — NewPromiseCapability(C) requires it. A non-object
+       (Promise.all.call(5, x)) is rejected here so the C entry throws TypeErrorNotAnObject in spec order, BEFORE
+       any iteration; a side-effect-free tag check, so probing it changes nothing. */
+    if (JS_VALUE_GET_TAG(call_argv[-2]) != JS_TAG_OBJECT) return false;
     /* ANY argument, including a non-object and a non-iterable. The tag check was the last iterability gate: it
        handed Promise.all(1) / Promise.all(undefined) to the C body, whose whole remaining job there was to reject
        the aggregate with a TypeError — which do_consume_acquire_iterator now does itself, on the tramp.
