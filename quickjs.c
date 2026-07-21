@@ -19930,30 +19930,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_agen_create(call_argv[-1])) {   /* async generator method -> params here */
                     tramp_first = -2; tramp_is_tail = (opcode == OP_tail_call_method); goto do_agen_create_tramp;
                 }
-                if (tramp_can_call_iter_consume(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter)) {   /* Array.from(iterable) -> GetIterator + consume on THIS chain */
-                    tramp_is_tail = (opcode == OP_tail_call_method); goto do_iter_consume_tramp;
-                }
-                if (tramp_can_call_setop_consume(call_argv[-1], call_argv[-2], vc(call_argv), call_argc, &setop_kind)) {   /* s.union/symmetricDifference(setlike) -> setlike.keys() on THIS chain */
-                    tramp_is_tail = (opcode == OP_tail_call_method); goto do_setop_consume_tramp;
-                }
-                if (tramp_can_call_iterterm(ctx, call_argv[-1], call_argv[-2], call_argc, &iterterm_kind)) {   /* it.toArray/forEach/reduce/some/every/find -> consume on THIS chain */
-                    tramp_is_tail = (opcode == OP_tail_call_method); goto do_iterterm_tramp;
-                }
-                if (tramp_can_call_iterator_from(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter)) {   /* Iterator.from(obj) -> GetIterator on THIS chain */
-                    tramp_is_tail = (opcode == OP_tail_call_method); goto do_iterfrom_tramp;
-                }
-                if (tramp_can_call_objentries_consume(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter)) {   /* Object.fromEntries(iterable) -> GetIterator + consume on THIS chain */
-                    tramp_is_tail = (opcode == OP_tail_call_method); goto do_objentries_consume_tramp;
-                }
-                if (tramp_can_call_ta_from_consume(ctx, call_argv[-1], call_argv[-2], vc(call_argv), call_argc, &ta_classid, &tramp_iter_getiter)) {   /* TypedArray.from(iterable) -> collect on THIS chain */
-                    tramp_is_tail = 0; ta_from = 1; goto do_ta_consume_tramp;
-                }
-                if (tramp_can_call_promise_all(ctx, call_argv[-1], vc(call_argv), call_argc, &pa_magic, &tramp_iter_getiter)) {   /* Promise.all/allSettled/any(iterable) -> GetIterator + consume on THIS chain */
-                    tramp_is_tail = (opcode == OP_tail_call_method); goto do_promise_all_consume_tramp;
-                }
-                if (tramp_can_call_promise_race(call_argv[-1], vc(call_argv), call_argc, &pa_magic)) {   /* Promise.race(gen) -> consume on THIS chain */
-                    tramp_is_tail = (opcode == OP_tail_call_method); goto do_promise_all_consume_tramp;
-                }
+                /* the iterable-consuming builtins (Array.from / Object.fromEntries / Iterator.from / it.* / s.union /
+                   TypedArray.from / Promise.all|allSettled|any|race) are recognized in ONE place, do_consumer_dispatch,
+                   which this opcode's convergence (goto do_generic_callee below) passes through — see that label. */
                 /* for await (x of syncGen): the async-from-sync wrapper's .next() (no arg) over a sync GENERATOR — its
                    .next() would drive syncGen.next() to completion. Route syncGen.next() onto the tramp; the settle
                    wraps {value,done} in a promise (do_async_from_sync_step). call_argv[-2]=wrapper, [-1]=its .next. */
@@ -20156,7 +20135,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                 }
                 tramp_first = -2; tramp_is_tail = (opcode == OP_tail_call_method);
-                goto do_generic_callee;
+                goto do_consumer_dispatch;   /* consumers, then fall to do_generic_callee */
             }
             BREAK;
         CASE(OP_array_from):
@@ -20514,14 +20493,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call(call_argv[-1])) goto do_tramp_call;
                 if (tramp_can_call_async(call_argv[-1])) goto do_async_tramp_call;
                 if (tramp_can_call_gen_create(call_argv[-1])) goto do_generator_create_tramp;
-                if (tramp_can_call_iter_consume(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter)) goto do_iter_consume_tramp;
-                if (tramp_can_call_objentries_consume(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter)) goto do_objentries_consume_tramp;
-                if (tramp_can_call_setop_consume(call_argv[-1], call_argv[-2], vc(call_argv), call_argc, &setop_kind)) goto do_setop_consume_tramp;
-                if (tramp_can_call_iterterm(ctx, call_argv[-1], call_argv[-2], call_argc, &iterterm_kind)) goto do_iterterm_tramp;
-                if (tramp_can_call_iterator_from(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter)) goto do_iterfrom_tramp;
-                /* The forwarded shape is identical to the direct one, so it must ask the SAME questions. This list
-                   having fallen behind the OP_call_method list is why replace.call(123, "2", fn) reached the C
-                   entry: same builtin, same callback, different answer depending on how the call was spelled. */
+                /* The forwarded shape is identical to the direct one, so it must ask the SAME questions. The
+                   consumer recognizers used to be copied here and fell behind the OP_call_method list by five
+                   (promise_all, promise_race, ta_from, ...), which is why replace.call(123,"2",fn) and
+                   Promise.any.call(P,iter) reached the C entry — same builtin, different answer by spelling. They
+                   now live once at do_consumer_dispatch, which this block's convergence passes through. */
                 {   /* g.next.call(g) / g.throw.call(g,e) / g.return.call(g,v): the reshape produced the exact
                        [this=generator, f=js_generator_next] method-call shape do_generator_tramp reads, so route the
                        body onto THIS chain (loop preempts + forks the base) — never the js_generator_next
@@ -20529,9 +20505,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     int gmag = tramp_gen_method_magic(call_argv[-1], call_argv[-2]);
                     if (gmag >= 0) { tramp_gen_magic = gmag; goto do_generator_tramp; }
                 }
-                /* no bytecode body: same convergence point as every other call shape (shape already -2) */
+                /* no bytecode body: converge through the consumer recognizers, then do_generic_callee (shape -2) */
                 tramp_first = -2;
-                goto do_generic_callee;
+                goto do_consumer_dispatch;
             }
 
         do_apply_tramp:
@@ -20735,6 +20711,38 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 cont_st = s; cont_kind_cur = CONT_ARRAY_REDUCE;
                 ret_val = JS_UNDEFINED;
                 goto do_array_reduce_step;
+            }
+
+        do_consumer_dispatch:
+            /* THE single consultation of the iterable-CONSUMING builtins (Array.from / Object.fromEntries /
+               Iterator.from / it.toArray|forEach|... / s.union|... / TypedArray.from / Promise.all|allSettled|any|
+               race). Each drives a source's @@iterator/.next() on THIS chain so a loop in it parks. These are C
+               callees with a method operand shape [this, f, args] (tramp_first == -2), and — exactly like the step
+               question at do_generic_callee — the questions must be asked in ONE place: they used to be duplicated
+               at OP_call_method AND at do_forward_dispatch, and the forwarded (.call/.apply) copy fell behind by
+               five recognizers, so `Promise.any.call(P, iter)` reached the C body while `Promise.any(iter)` did
+               not — one builtin answering differently by how it was spelled. Both -2 sites now converge here.
+               tramp_first is -2 and tramp_is_tail is already set by the caller; a plain -1 call never routes here
+               (it jumps straight to do_generic_callee below, where call_argv[-2] is not a receiver). */
+            {
+                if (tramp_can_call_iter_consume(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter))
+                    goto do_iter_consume_tramp;                 /* Array.from(iterable) */
+                if (tramp_can_call_setop_consume(call_argv[-1], call_argv[-2], vc(call_argv), call_argc, &setop_kind))
+                    goto do_setop_consume_tramp;                /* s.union/symmetricDifference(setlike) */
+                if (tramp_can_call_iterterm(ctx, call_argv[-1], call_argv[-2], call_argc, &iterterm_kind))
+                    goto do_iterterm_tramp;                     /* it.toArray/forEach/reduce/some/every/find */
+                if (tramp_can_call_iterator_from(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter))
+                    goto do_iterfrom_tramp;                     /* Iterator.from(obj) */
+                if (tramp_can_call_objentries_consume(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter))
+                    goto do_objentries_consume_tramp;           /* Object.fromEntries(iterable) */
+                if (tramp_can_call_ta_from_consume(ctx, call_argv[-1], call_argv[-2], vc(call_argv), call_argc, &ta_classid, &tramp_iter_getiter)) {
+                    ta_from = 1; tramp_is_tail = 0; goto do_ta_consume_tramp;   /* TypedArray.from(iterable) — never tail */
+                }
+                if (tramp_can_call_promise_all(ctx, call_argv[-1], vc(call_argv), call_argc, &pa_magic, &tramp_iter_getiter))
+                    goto do_promise_all_consume_tramp;          /* Promise.all/allSettled/any(iterable) */
+                if (tramp_can_call_promise_race(call_argv[-1], vc(call_argv), call_argc, &pa_magic))
+                    goto do_promise_all_consume_tramp;          /* Promise.race(iterable) */
+                /* no consumer matched: fall into the step/generic convergence below */
             }
 
         do_generic_callee:
@@ -21165,7 +21173,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 JSValue method = tramp_iter_getiter; tramp_iter_getiter = JS_UNDEFINED;
                 JSValueConst iterable = tramp_consume_iterable;
-                DCHECK(JS_IsFunction(ctx, method), "consume @@iterator must be callable (the probe accepts only a callable data property)");
+                if (!JS_IsFunction(ctx, method)) {
+                    /* NOT-ITERABLE is part of GetIterator, not a reason to refuse the route. Requiring a callable
+                       @@iterator in each consumer's recognizer left the not-iterable case to the C body — which is
+                       the same fallback selection in another costume, and for a Promise combinator the C body must
+                       REJECT the aggregate rather than throw, so the two paths disagreed on semantics too. The
+                       acquire owns the whole of GetIterator now: the TypeError is delivered as an acquisition
+                       failure, and each consumer's deliver arm already knows how to finish one (Promise rejects,
+                       Array.from/Set/Map propagate). */
+                    JS_FreeValue(ctx, method);
+                    JS_ThrowTypeError(ctx, "value is not iterable");
+                    tramp_consume_acquired = JS_EXCEPTION;
+                    goto do_consume_deliver_iterator;
+                }
                 if (tramp_can_call_gen_create(method)) {
                     DCHECK(sp + 2 <= TRAMP_SP_LIMIT(sf),
                            "consume acquire: create operand push exceeds the frame's compiled stack_size");
@@ -21605,9 +21625,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 { JSValue nr = JS_Call(ctx, call_argv[-1], call_argv[-2], 0, NULL);
                   JS_FreeValue(ctx, call_argv[-1]); JS_FreeValue(ctx, call_argv[-2]); sp -= 2;
                   if (JS_IsException(nr)) goto promise_all_err;
-                  if (!JS_IsObject(nr)) { JS_FreeValue(ctx, nr);
-                                          JS_ThrowTypeError(ctx, "iterator result not an object"); goto promise_all_err; }
-                  ret_val = nr; goto do_promise_all_step; }
+                  ret_val = nr; goto do_promise_all_step; }   /* the non-object case is enforced by js_promise_all_step */
             }
 
         do_async_from_sync_tramp:
@@ -22504,6 +22522,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                     cont_st = rcs; cont_kind_cur = CONT_ITER_CONSUME;
                     goto do_iter_consume_step;
+                }
+                if (rck == CONT_PROMISE_ALL) {
+                    /* a Promise combinator's PLAIN-iterator .next() (a bytecode .next drove on the tramp) returned:
+                       drop the [iter, next] operands (do_tramp_call dup'd them with caller_sp above), then resume the
+                       combinator step with the {value,done}. A generator .next settles via do_generator_settle
+                       instead; this arm is only the plain-iterator drive. js_promise_all_step enforces object-ness. */
+                    JSValue *cargv = sp - cargc;
+                    DCHECK(cargc - cfirst == 2, "promise-all plain .next cont frame has an unexpected operand shape");
+                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
+                    sp += cfirst - cargc;
+                    cont_st = rcs; cont_kind_cur = CONT_PROMISE_ALL;
+                    goto do_promise_all_step;
                 }
                 if (rck == CONT_ITER_HELPER) {
                     /* the map/filter callback returned: resume the helper step with its result. do_tramp_call DUPS
@@ -61920,6 +61950,14 @@ static int js_promise_all_step(JSContext *ctx, JSPromiseAll *s, JSValue res)
     int done;
     if (JS_VALUE_GET_TAG(res) == JS_TAG_UNINITIALIZED)
         return 1;   /* first step: nothing to process, drive .next() */
+    if (!JS_IsObject(res)) {
+        /* IteratorNext requires the result be an Object (spec 27.1.3.4 step 3). JS_GetProperty on a primitive
+           boxes it and reads .done as undefined rather than throwing, so this must be enforced here — the ONE
+           point every drive (generator settle AND plain-iterator .next return) feeds its result through. */
+        JS_FreeValue(ctx, res);
+        JS_ThrowTypeError(ctx, "iterator result not an object");
+        return -1;
+    }
     {
         JSValue done_val = JS_GetProperty(ctx, res, JS_ATOM_done);
         if (JS_IsException(done_val)) { JS_FreeValue(ctx, res); return -1; }
@@ -62002,24 +62040,21 @@ static bool tramp_can_call_promise_all(JSContext *ctx, JSValueConst func, JSValu
     if (fp->u.cfunc.c_function.generic_magic != js_promise_all) return false;
     magic = fp->u.cfunc.magic;
     if (magic != PROMISE_MAGIC_all && magic != PROMISE_MAGIC_allSettled && magic != PROMISE_MAGIC_any) return false;
-    if (JS_VALUE_GET_TAG(call_argv[0]) != JS_TAG_OBJECT) return false;
-    ip = JS_VALUE_GET_OBJ(call_argv[0]);
+    /* ANY argument, including a non-object and a non-iterable. The tag check was the last iterability gate: it
+       handed Promise.all(1) / Promise.all(undefined) to the C body, whose whole remaining job there was to reject
+       the aggregate with a TypeError — which do_consume_acquire_iterator now does itself, on the tramp. */
     /* Promise.all reads .resolve BEFORE @@iterator, and the probe only INSPECTS the descriptor (never runs a getter),
        so probing here is unobservable — the observable @@iterator CALL happens in do_consume_acquire_iterator, after
        the tramp has read .resolve. Accept a generator-backed source only (its .next() needs the tramp): a
        generator-function @@iterator, or a direct generator (whose @@iterator returns itself). Anything else — a getter
-       @@iterator, a helper, a plain iterator — used to take the C path. That narrowing was the fallback selector:
-       the C path drives .next off the tramp, so "drives it correctly" was only true for sources that never need
-       to suspend. Widened to ANY callable @@iterator, as Object.fromEntries, Array.from and Map/Set already were. */
+       @@iterator, a helper, a plain iterator, a NON-iterable — used to take the C path. That narrowing was the
+       fallback selector: the C path drives .next off the tramp, so "drives it correctly" was only true for sources
+       that never need to suspend. There is now nothing left to select — the probe's result is passed along for the
+       acquire to use, and its ABSENCE is the acquire's TypeError, not a reason to refuse the route. */
     (void)ip;
-    if (!iter_data_at_iterator(ctx, call_argv[0], out_getiter)) return false;
-    if (JS_IsFunction(ctx, *out_getiter)) {
-        *out_magic = magic;
-        return true;
-    }
-    JS_FreeValue(ctx, *out_getiter);
-    *out_getiter = JS_UNDEFINED;
-    return false;
+    iter_data_at_iterator(ctx, call_argv[0], out_getiter);   /* JS_UNDEFINED when absent/uncallable => acquire throws */
+    *out_magic = magic;
+    return true;
 }
 
 /* Route Promise.race(gen) (no aggregation: each element's settle resolves/rejects the aggregate directly). */
