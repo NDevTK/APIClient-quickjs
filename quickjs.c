@@ -21589,11 +21589,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 st = js_promise_all_step(ctx, s, ret_val);
                 if (unlikely(st < 0)) {   /* an error: reject the aggregate, yield it (do not throw out of Promise.all) */
                 promise_all_err:;
-                    JSValue err = JS_GetException(ctx), rr;
-                    JS_IteratorClose(ctx, s->iter, true);
-                    rr = JS_Call(ctx, s->resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
-                    JS_FreeValue(ctx, err); JS_FreeValue(ctx, rr);
-                    st = 0;   /* fall through to DONE, yielding the (now rejected) promise */
+                    JSValue err = JS_GetException(ctx);
+                    JS_IteratorClose(ctx, s->iter, true);   /* best-effort; NB a user .return here still drives to completion — separate gap */
+                    /* reject(err) is USER bytecode for a custom Promise subclass — route it through the SAME tramp
+                       finalize drive as resolve, so a looping reject parks instead of driving to completion. reject
+                       is idempotent, so if it throws on the tramp the CONT_PROMISE_ALL exception arm's own reject is
+                       a harmless second call (no re-loop). */
+                    s->fin_arg = err; s->fin_is_reject = 1; s->finalizing = 1;
+                    st = 2;   /* fall through to the FINALIZE drive below, then DONE */
                 }
                 if (st == 2) {
                     /* FINALIZE: call resolving_funcs[fin_is_reject](fin_arg) — the aggregate settle. A user Promise
