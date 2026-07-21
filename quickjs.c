@@ -944,10 +944,20 @@ typedef struct JSTypedArray {
     bool track_rab; /* auto-track length of backing array buffer */
 } JSTypedArray;
 
+/* How a flow base COMPLETES — an explicit frame-KIND on the base, dispatched at ONE point, mirroring
+   TimeTravelJS's tt_frame_kind. Without it, completion was inferred from the base's bytecode (b->func_kind),
+   which a BODYLESS base (a call-root over a step closure, cur_func not bytecode) cannot answer — forcing a
+   b==NULL hack. The kind makes the bodyless case first-class: its entry dispatches through do_step_tramp and its
+   completion settles through its own arm, never touching b. */
+enum {
+    FLOW_BASE_BYTECODE = 0,   /* cur_func is a bytecode function; entry/completion use its b (the default) */
+    FLOW_BASE_STEP_ROOT,      /* cur_func is a STEP CLOSURE; the flow's whole body is one call handler(arg) */
+};
 typedef struct JSAsyncFunctionState {
     JSValue this_val; /* 'this' generator argument */
     int argc; /* number of function arguments */
     bool throw_flag; /* used to throw an exception in JS_CallInternal() */
+    uint8_t base_kind; /* FLOW_BASE_* — how this base enters and completes (see the enum above) */
     JSStackFrame frame;
     void *tramp_top;  /* APIClient forced-exec: the stashed heap-frame (TrampFrame) chain when this flow was
                          PREEMPTED mid-execution at depth; NULL when suspended at the base or not suspended. */
@@ -19226,6 +19236,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     size_t alloca_size;
     TrampFrame *tf_top = NULL;         /* heap stack of trampolined NORMAL callees (this activation's base = C stack) */
     int tramp_first = -1; uint8_t tramp_is_tail = 0;   /* set before goto do_tramp_call */
+    JSValue *call_argv; int call_argc;   /* the current call's operands; function-scope so the flow-base entry can
+                                            set up a call-root step base before `restart:` (see FLOW_BASE_STEP_ROOT) */
     /* constructor trampoline (do_construct_tramp): con_func/con_ntgt/con_args/con_argc + con_from_super are set
        by OP_call_constructor (new C()) or OP_init_ctor (super()) before the goto. */
     JSValueConst con_func = JS_UNDEFINED, con_ntgt = JS_UNDEFINED;
@@ -19328,6 +19340,24 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             /* func_obj get contains a pointer to JSFuncAsyncState */
             /* the stack frame is already allocated */
             sf = &s->frame;
+            if (unlikely(s->base_kind == FLOW_BASE_STEP_ROOT && !s->tramp_top)) {
+                /* FRESH call-root step base (reaction_step_flow_init): cur_func is a step closure, not bytecode, so
+                   there is no `b`. Dispatch the pre-pushed [this, closure, arg] through do_step_tramp; itail=1 routes
+                   completion via do_return -> done, and the STEP_ROOT arm at `done` settles without touching b. Once
+                   parked, the deepest (callback) frame resumes via tramp_top below, never through this branch. */
+                b = NULL;
+                ctx = caller_ctx;
+                local_buf = arg_buf = sf->arg_buf;
+                var_buf = stack_buf = sf->var_buf;
+                var_refs = NULL;
+                sp = sf->cur_sp;
+                sf->cur_sp = NULL;
+                sf->prev_frame = rt->current_stack_frame;
+                rt->current_stack_frame = sf;
+                gen_state = s;
+                call_argv = sp - 1; call_argc = 1; tramp_first = -2; tramp_is_tail = 1;
+                goto do_step_tramp;
+            }
             p = JS_VALUE_GET_OBJ(sf->cur_func);
             b = p->u.func.function_bytecode;
             ctx = b->realm;
@@ -19450,8 +19480,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
  restart:
     for(;;) {
-        int call_argc;
-        JSValue *call_argv;
 
         SWITCH(pc) {
         CASE(OP_push_i32):
@@ -25614,6 +25642,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         goto exception;
     }
     ret_val = JS_EXCEPTION;
+    /* A CALL-ROOT step base has no bytecode (b is NULL): it completes like a plain function — free the stack and
+       return ret_val (JS_EXCEPTION here) so the reaction flow settles as rejected. Checked by KIND, never by b. */
+    if (gen_state && gen_state->base_kind == FLOW_BASE_STEP_ROOT)
+        goto done;
     /* the local variables are freed by the caller in the generator
        case. Hence the label 'done' should never be reached in a
        generator function. */
@@ -25842,6 +25874,7 @@ static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s,
     sf->cur_func = js_dup(func_obj);
     s->this_val = js_dup(this_obj);
     s->argc = argc;
+    s->base_kind = FLOW_BASE_BYTECODE;   /* cur_func is bytecode; completion uses its b (the default) */
     sf->arg_count = arg_buf_len;
     sf->var_buf = sf->arg_buf + arg_buf_len;
     sf->cur_sp = sf->var_buf + b->var_count;
@@ -61157,6 +61190,40 @@ typedef struct JSReactionFlow {
 
 static JSValue js_reaction_resume_job(JSContext *ctx, int argc, JSValueConst *argv);
 
+/* Populate `fs` as a CALL-ROOT step flow base (FLOW_BASE_STEP_ROOT): a flow whose entire body is one call,
+   handler(arg), where `handler` is a STEP-MACHINE closure (a Promise reaction — resolve_element / then_finally).
+   cur_func is the closure (NOT bytecode); JS_CallInternal's flow-base entry sees base_kind and dispatches it
+   through do_step_tramp, so the callback the step drives (a user resolve/reject/onFinally) PARKS into this base —
+   the reaction runs as a first-class flow, never a JS_Call to completion. The frame's stack is pre-pushed with the
+   method-call operand shape [this=undefined, closure, arg] that do_step_tramp reads (call_argv = sp-1). */
+#define STEP_FLOW_SLOTS 16
+static int reaction_step_flow_init(JSContext *ctx, JSAsyncFunctionState *fs, JSValueConst handler, JSValueConst arg)
+{
+    JSStackFrame *sf = &fs->frame;
+    JSValue *blk = js_malloc(ctx, sizeof(JSValue) * STEP_FLOW_SLOTS);
+    if (unlikely(!blk))
+        return -1;
+    fs->this_val = JS_UNDEFINED;
+    fs->argc = 0;
+    fs->throw_flag = false;
+    fs->base_kind = FLOW_BASE_STEP_ROOT;
+    fs->tramp_top = NULL;
+    sf->arg_buf = blk;
+    sf->var_buf = blk;                                    /* 0 args, 0 vars: the stack starts at blk */
+    sf->var_refs = (JSVarRef **)(blk + STEP_FLOW_SLOTS);  /* TRAMP_SP_LIMIT(sf) = sf->var_refs = stack top */
+    sf->var_ref_count = 0;
+    sf->arg_count = 0;
+    sf->is_strict_mode = false;
+    sf->is_constructor = false;
+    sf->cur_func = js_dup(handler);
+    sf->cur_pc = NULL;
+    blk[0] = JS_UNDEFINED;         /* this */
+    blk[1] = js_dup(handler);      /* the step closure — call_argv[-1] */
+    blk[2] = js_dup(arg);          /* the sole argument — call_argv[0] */
+    sf->cur_sp = blk + 3;
+    return 0;
+}
+
 /* Settle the derived promise with the handler's completion `res` (consumed), free the flow state. */
 static JSValue reaction_flow_settle(JSContext *ctx, JSReactionFlow *rf, JSValue res)
 {
@@ -61238,6 +61305,21 @@ static JSValue promise_reaction_job(JSContext *ctx, int argc,
             return JS_EXCEPTION;
         memset(rf, 0, sizeof(*rf));
         if (async_func_init(ctx, &rf->fs, handler, JS_UNDEFINED, 1, &arg)) {
+            js_free_rt(ctx->rt, rf);
+            return JS_EXCEPTION;
+        }
+        rf->resolve = js_dup(argv[0]);
+        rf->reject = js_dup(argv[1]);
+        return reaction_flow_step(ctx, rf);
+    } else if (tramp_step_def_of(handler)) {
+        /* a STEP-MACHINE closure handler (a Promise reaction — resolve_element / then_finally): its C body drives a
+           user callback (resolve / onFinally) that must PARK, so run it as a CALL-ROOT flow (base_kind STEP_ROOT)
+           rather than a JS_Call to completion. Same flow machinery as a bytecode handler, different base entry. */
+        JSReactionFlow *rf = js_malloc(ctx, sizeof(*rf));
+        if (unlikely(!rf))
+            return JS_EXCEPTION;
+        memset(rf, 0, sizeof(*rf));
+        if (reaction_step_flow_init(ctx, &rf->fs, handler, arg)) {
             js_free_rt(ctx->rt, rf);
             return JS_EXCEPTION;
         }
@@ -61882,13 +61964,14 @@ static const JSTrampStepDef js_promise_resolve_elem_def = {
    dispatch runs on the tramp. The async job-queue dispatch still enters the C body below (js_call_c_function_data
    does not consult step_def) — a different entry point, not a fallback; converting the job queue to flows is the
    next build and will let that body delete. */
-static void promise_reaction_set_step(JSValueConst closure)
+static void promise_closure_set_step(JSValueConst closure, const JSTrampStepDef *def)
 {
     JSObject *fp = JS_VALUE_GET_OBJ(closure);
     DCHECK(fp->class_id == JS_CLASS_C_FUNCTION_DATA && fp->u.c_function_data_record,
-           "promise_reaction_set_step: not a C-function-data closure");
-    fp->u.c_function_data_record->step_def = &js_promise_resolve_elem_def;
+           "promise_closure_set_step: not a C-function-data closure");
+    fp->u.c_function_data_record->step_def = def;
 }
+#define promise_reaction_set_step(closure) promise_closure_set_step((closure), &js_promise_resolve_elem_def)
 
 /* The C-body dispatch of the reaction — reached via the job queue (JS_Call from C, not the bytecode tramp). Shares
    prep with the step machine; only the settle dispatch differs (JS_Call to completion vs tramp drive). */
@@ -62462,14 +62545,99 @@ static JSValue js_promise_finally_thrower(JSContext *ctx, JSValueConst this_val,
     return JS_Throw(ctx, js_dup(func_data[0]));
 }
 
+/* .finally's reaction as a TWO-CALLBACK STEP MACHINE. onFinally AND the subsequent Promise.resolve(...).then(...)
+   are BOTH user code that can loop (rejected-observable-then-calls-argument's loop is in the .then), so both are
+   driven on the tramp and park. Phase 0 drives onFinally(); phase 1 drives promise.then(thunk/thrower); phase 2 is
+   done, the .then's result IS the derived promise. Dispatched as a call-root flow by promise_reaction_job, like
+   resolve_element. The C body (js_promise_then_finally_func, the job path with no step routing) drives both
+   inline. */
+typedef struct JSPromiseThenFinally {
+    JSStepHdr hdr;         /* MUST be first */
+    JSValue value;         /* owned: the original settled value/reason (replayed by the thunk) */
+    JSValue result;        /* owned: the .then result (the derived promise), set at phase 2 */
+    int magic;             /* 0 = fulfil path (value thunk); 1 = reject path (thrower) */
+    uint8_t phase;         /* 0 = drive onFinally; 1 = drive .then; 2 = done */
+    JSValue ctor;          /* owned: the species constructor (needed at phase 1) */
+    JSValue cb_args[3];    /* phase 0: [undefined, onFinally]; phase 1: [promise, then_method, then_func] */
+} JSPromiseThenFinally;
+_Static_assert(offsetof(JSPromiseThenFinally, hdr) == 0, "JSStepHdr must be first in JSPromiseThenFinally");
+
+static void *js_promise_then_finally_init(JSContext *ctx, JSValueConst this_val, int argc,
+                                          JSValueConst *argv, int arg, JSValueConst func_obj)
+{
+    JSCFunctionDataRecord *rec = JS_VALUE_GET_OBJ(func_obj)->u.c_function_data_record;
+    JSPromiseThenFinally *s = js_mallocz(ctx, sizeof(*s));
+    if (unlikely(!s)) { JS_ThrowOutOfMemory(ctx); return NULL; }
+    s->ctor = js_dup(rec->data[0]);
+    s->cb_args[0] = JS_UNDEFINED;
+    s->cb_args[1] = js_dup(rec->data[1]);   /* onFinally */
+    s->cb_args[2] = JS_UNDEFINED;
+    s->value = js_dup(argc > 0 ? argv[0] : JS_UNDEFINED);
+    s->result = JS_UNDEFINED;
+    s->magic = rec->magic;
+    return s;
+}
+
+static int js_promise_then_finally_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSPromiseThenFinally *s = st;
+    if (s->phase == 0) {
+        s->phase = 1;
+        JS_FreeValue(ctx, cb_result);          /* UNDEFINED on the first step */
+        *out_cb = s->cb_args; *out_argc = 0;   /* onFinally() — no args */
+        return 3;
+    }
+    if (s->phase == 1) {
+        /* cb_result = onFinally's return. Build promise = Promise.resolve(ctor, res) and the value-thunk/thrower,
+           then drive promise.then(then_func) as the SECOND callback (its .then can be a user thenable that loops). */
+        JSValue promise, then_func, then_method;
+        s->phase = 2;
+        JS_FreeValue(ctx, s->cb_args[1]);      /* onFinally no longer needed (phase 0 consumed it) */
+        s->cb_args[1] = JS_UNDEFINED;
+        promise = js_promise_resolve(ctx, s->ctor, 1, vc(&cb_result), 0);
+        JS_FreeValue(ctx, cb_result);
+        if (JS_IsException(promise)) return -1;
+        then_func = JS_NewCFunctionData(ctx, s->magic == 0 ? js_promise_finally_value_thunk : js_promise_finally_thrower,
+                                        0, 0, 1, vc(&s->value));
+        if (JS_IsException(then_func)) { JS_FreeValue(ctx, promise); return -1; }
+        then_method = JS_GetProperty(ctx, promise, JS_ATOM_then);
+        if (JS_IsException(then_method)) { JS_FreeValue(ctx, promise); JS_FreeValue(ctx, then_func); return -1; }
+        s->cb_args[0] = promise;               /* this */
+        s->cb_args[1] = then_method;           /* the .then method */
+        s->cb_args[2] = then_func;             /* the thunk/thrower argument */
+        *out_cb = s->cb_args; *out_argc = 1;   /* promise.then(then_func) */
+        return 3;
+    }
+    /* phase 2: cb_result = the .then result — that IS the derived promise then_finally returns */
+    s->result = cb_result;
+    return 0;
+}
+
+static JSValue js_promise_then_finally_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSPromiseThenFinally *s = st;
+    JSValue r = take_result ? s->result : (JS_FreeValue(ctx, s->result), JS_UNDEFINED);
+    JS_FreeValue(ctx, s->cb_args[0]);
+    JS_FreeValue(ctx, s->cb_args[1]);
+    JS_FreeValue(ctx, s->cb_args[2]);
+    JS_FreeValue(ctx, s->ctor);
+    JS_FreeValue(ctx, s->value);
+    js_free_rt(ctx->rt, s);
+    return r;
+}
+
+static const JSTrampStepDef js_promise_then_finally_def = {
+    js_promise_then_finally_init, js_promise_then_finally_step, js_promise_then_finally_fini, 0
+};
+
+/* The C-body dispatch (job path, no step routing) — drives both onFinally and .then inline (to completion). */
 static JSValue js_promise_then_finally_func(JSContext *ctx, JSValueConst this_val,
                                             int argc, JSValueConst *argv,
                                             int magic, JSValueConst *func_data)
 {
     JSValueConst ctor = func_data[0];
     JSValueConst onFinally = func_data[1];
-    JSValue res, promise, ret, then_func;
-
+    JSValue res, promise, then_func, ret;
     res = JS_Call(ctx, onFinally, JS_UNDEFINED, 0, NULL);
     if (JS_IsException(res))
         return res;
@@ -62477,17 +62645,9 @@ static JSValue js_promise_then_finally_func(JSContext *ctx, JSValueConst this_va
     JS_FreeValue(ctx, res);
     if (JS_IsException(promise))
         return promise;
-    if (magic == 0) {
-        then_func = JS_NewCFunctionData(ctx, js_promise_finally_value_thunk, 0,
-                                        0, 1, argv);
-    } else {
-        then_func = JS_NewCFunctionData(ctx, js_promise_finally_thrower, 0,
-                                        0, 1, argv);
-    }
-    if (JS_IsException(then_func)) {
-        JS_FreeValue(ctx, promise);
-        return then_func;
-    }
+    then_func = JS_NewCFunctionData(ctx, magic == 0 ? js_promise_finally_value_thunk : js_promise_finally_thrower,
+                                    0, 0, 1, argv);
+    if (JS_IsException(then_func)) { JS_FreeValue(ctx, promise); return then_func; }
     ret = JS_InvokeFree(ctx, promise, JS_ATOM_then, 1, vc(&then_func));
     JS_FreeValue(ctx, then_func);
     return ret;
@@ -62519,6 +62679,7 @@ static JSValue js_promise_finally(JSContext *ctx, JSValueConst this_val,
                 JS_FreeValue(ctx, ctor);
                 return JS_EXCEPTION;
             }
+            promise_closure_set_step(then_funcs[i], &js_promise_then_finally_def);   /* onFinally parks on the tramp */
         }
     }
     JS_FreeValue(ctx, ctor);
