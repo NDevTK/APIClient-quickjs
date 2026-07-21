@@ -18728,7 +18728,6 @@ static void js_async_from_sync_end(JSContext *ctx, struct JSAsyncFromSync *s);
 static JSValue js_async_from_sync_iterator_next(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
 static JSValue js_promise_all(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
 static JSValue js_promise_race(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
-static bool tramp_can_call_promise_race(JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_magic);
 static JSValue js_promise_all_resolve_element(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValueConst *func_data);
 static __exception int remainingElementsCount_add(JSContext *ctx, JSValueConst resolve_element_env, int addend);
 static JSValue js_typed_array_from(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
@@ -20739,9 +20738,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     ta_from = 1; tramp_is_tail = 0; goto do_ta_consume_tramp;   /* TypedArray.from(iterable) — never tail */
                 }
                 if (tramp_can_call_promise_all(ctx, call_argv[-1], vc(call_argv), call_argc, &pa_magic, &tramp_iter_getiter))
-                    goto do_promise_all_consume_tramp;          /* Promise.all/allSettled/any(iterable) */
-                if (tramp_can_call_promise_race(call_argv[-1], vc(call_argv), call_argc, &pa_magic))
-                    goto do_promise_all_consume_tramp;          /* Promise.race(iterable) */
+                    goto do_promise_all_consume_tramp;          /* Promise.all/allSettled/any/race(iterable) */
                 /* no consumer matched: fall into the step/generic convergence below */
             }
 
@@ -62029,48 +62026,36 @@ static void js_promise_all_end(JSContext *ctx, JSPromiseAll *s)
    and every other shape stay on the normal C path, which drives them correctly. */
 static bool tramp_can_call_promise_all(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_magic, JSValue *out_getiter)
 {
-    JSObject *fp, *ip;
+    JSObject *fp;
     int magic;
     *out_getiter = JS_UNDEFINED;
     if (call_argc != 1) return false;
     if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
     fp = JS_VALUE_GET_OBJ(func);
     if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
-    if (fp->u.cfunc.cproto != JS_CFUNC_generic_magic) return false;
-    if (fp->u.cfunc.c_function.generic_magic != js_promise_all) return false;
-    magic = fp->u.cfunc.magic;
-    if (magic != PROMISE_MAGIC_all && magic != PROMISE_MAGIC_allSettled && magic != PROMISE_MAGIC_any) return false;
+    /* ONE recognizer for all four combinators. all/allSettled/any share js_promise_all (magic selects); race is
+       a distinct C function (js_promise_race, no magic) but consumes its iterable through the SAME tramp path
+       (do_promise_all_step branches on s->magic == PROMISE_MAGIC_race), so it belongs here, not in a second
+       recognizer with its own generator-only narrowing. */
+    if (fp->u.cfunc.cproto == JS_CFUNC_generic_magic
+        && fp->u.cfunc.c_function.generic_magic == js_promise_all) {
+        magic = fp->u.cfunc.magic;
+        if (magic != PROMISE_MAGIC_all && magic != PROMISE_MAGIC_allSettled && magic != PROMISE_MAGIC_any) return false;
+    } else if (fp->u.cfunc.cproto == JS_CFUNC_generic
+               && fp->u.cfunc.c_function.generic == js_promise_race) {
+        magic = PROMISE_MAGIC_race;
+    } else {
+        return false;
+    }
     /* ANY argument, including a non-object and a non-iterable. The tag check was the last iterability gate: it
        handed Promise.all(1) / Promise.all(undefined) to the C body, whose whole remaining job there was to reject
-       the aggregate with a TypeError — which do_consume_acquire_iterator now does itself, on the tramp. */
-    /* Promise.all reads .resolve BEFORE @@iterator, and the probe only INSPECTS the descriptor (never runs a getter),
-       so probing here is unobservable — the observable @@iterator CALL happens in do_consume_acquire_iterator, after
-       the tramp has read .resolve. Accept a generator-backed source only (its .next() needs the tramp): a
-       generator-function @@iterator, or a direct generator (whose @@iterator returns itself). Anything else — a getter
-       @@iterator, a helper, a plain iterator, a NON-iterable — used to take the C path. That narrowing was the
-       fallback selector: the C path drives .next off the tramp, so "drives it correctly" was only true for sources
-       that never need to suspend. There is now nothing left to select — the probe's result is passed along for the
+       the aggregate with a TypeError — which do_consume_acquire_iterator now does itself, on the tramp.
+       The probe only INSPECTS the @@iterator descriptor (never runs a getter) and Promise.all reads .resolve
+       BEFORE @@iterator, so probing here is unobservable — the observable @@iterator CALL happens later in
+       do_consume_acquire_iterator. There is nothing left to SELECT: the probe's result is passed along for the
        acquire to use, and its ABSENCE is the acquire's TypeError, not a reason to refuse the route. */
-    (void)ip;
     iter_data_at_iterator(ctx, call_argv[0], out_getiter);   /* JS_UNDEFINED when absent/uncallable => acquire throws */
     *out_magic = magic;
-    return true;
-}
-
-/* Route Promise.race(gen) (no aggregation: each element's settle resolves/rejects the aggregate directly). */
-static bool tramp_can_call_promise_race(JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_magic)
-{
-    JSObject *fp, *ip;
-    if (call_argc != 1) return false;
-    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
-    fp = JS_VALUE_GET_OBJ(func);
-    if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
-    if (fp->u.cfunc.cproto != JS_CFUNC_generic) return false;
-    if (fp->u.cfunc.c_function.generic != js_promise_race) return false;
-    if (JS_VALUE_GET_TAG(call_argv[0]) != JS_TAG_OBJECT) return false;
-    ip = JS_VALUE_GET_OBJ(call_argv[0]);
-    if (ip->class_id != JS_CLASS_GENERATOR || !ip->u.generator_data) return false;
-    *out_magic = PROMISE_MAGIC_race;
     return true;
 }
 
