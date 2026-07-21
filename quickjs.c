@@ -18714,6 +18714,11 @@ typedef struct JSPromiseAll {
                                     subclass's resolve/reject is USER bytecode whose loop must park, so it cannot be
                                     a JS_Call to completion from inside js_promise_all_step. */
     uint8_t fin_is_reject;       /* which resolving_funcs[] the finalize drives */
+    uint8_t driving_next;        /* 1 while a .next() is being driven / its result extracted: the iterator has NOT
+                                    yet successfully stepped, so an error here is an IteratorNext abrupt and must
+                                    NOT close it (spec fail_reject, not fail_reject1). Cleared once value is in hand. */
+    uint8_t iter_done;           /* 1 after {done:true}: the iterator is exhausted, so a finalize-stage error must
+                                    NOT close it either. Only a post-retrieval error (resolve/attach) closes. */
     JSValue fin_arg;             /* the finalize argument (values dup / AggregateError), owned only in the brief
                                     window before it is transferred onto the tramp operand stack */
     int orig_cfirst, orig_cargc; uint8_t orig_is_tail;   /* the ORIGINAL OP_call_method operand shape */
@@ -21604,7 +21609,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (unlikely(st < 0)) {   /* an error: reject the aggregate, yield it (do not throw out of Promise.all) */
                 promise_all_err:;
                     JSValue err = JS_GetException(ctx);
-                    JS_IteratorClose(ctx, s->iter, true);   /* best-effort; NB a user .return here still drives to completion — separate gap */
+                    /* Close ONLY when an element was retrieved and a LATER stage (Constructor.resolve / attach)
+                       threw — spec fail_reject1. An IteratorNext abrupt (driving_next) or a finalize-stage throw
+                       (iter_done) leaves [[Done]] true, so no close (spec fail_reject). */
+                    if (!s->driving_next && !s->iter_done)
+                        JS_IteratorClose(ctx, s->iter, true);
                     /* reject(err) is USER bytecode for a custom Promise subclass — route it through the SAME tramp
                        finalize drive as resolve, so a looping reject parks instead of driving to completion. reject
                        is idempotent, so if it throws on the tramp the CONT_PROMISE_ALL exception arm's own reject is
@@ -21650,6 +21659,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    parks. This site used to jump straight to do_generator_tramp, which reads ->u.generator_data off
                    the receiver with no class check: the generator-backed narrowing in the recognizer was the only
                    thing keeping a non-generator out, so widening it segfaulted on Promise.all([]). */
+                s->driving_next = 1;   /* an abrupt during this .next()/its result extraction must NOT close the iter */
                 if (tramp_gen_method_magic(s->next, s->iter) == GEN_MAGIC_NEXT) {
                     tramp_cont_state = s; tramp_cont_kind = CONT_PROMISE_ALL; tramp_gen_cont_iter = s->iter;
                     tramp_gen_cont_consume = 1; tramp_gen_magic = GEN_MAGIC_NEXT;
@@ -25514,7 +25524,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             int cfirst = ps->orig_cfirst, cargc = ps->orig_cargc;
             uint8_t itail = ps->orig_is_tail;
             JSValue *cargv;
-            if (!JS_IsUndefined(ps->iter))
+            /* Close ONLY for a post-retrieval throw (fail_reject1). A .next() drive that threw (driving_next) or a
+               finalize-stage settle that threw (iter_done) leaves the iterator [[Done]] — no close (fail_reject). */
+            if (!JS_IsUndefined(ps->iter) && !ps->driving_next && !ps->iter_done)
                 JS_IteratorClose(ctx, ps->iter, true);   /* best-effort per IfAbruptCloseIterator; its own throw is ignored */
             rr = JS_Call(ctx, ps->resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
             JS_FreeValue(ctx, err);
@@ -62127,6 +62139,7 @@ static int js_promise_all_step(JSContext *ctx, JSPromiseAll *s, JSValue res)
     if (done) {
         int is_zero;
         JS_FreeValue(ctx, res);
+        s->iter_done = 1;   /* exhausted: a finalize-stage error must not close it */
         if (s->magic == PROMISE_MAGIC_race)
             return 0;   /* race: no aggregation/finalize — the aggregate already settled (or stays pending if empty) */
         is_zero = remainingElementsCount_add(ctx, s->resolve_element_env, -1);
@@ -62150,7 +62163,8 @@ static int js_promise_all_step(JSContext *ctx, JSPromiseAll *s, JSValue res)
     }
     value = JS_GetProperty(ctx, res, JS_ATOM_value);
     JS_FreeValue(ctx, res);
-    if (JS_IsException(value)) return -1;
+    if (JS_IsException(value)) return -1;   /* value access threw: still an IteratorNext abrupt — no close */
+    s->driving_next = 0;   /* the iterator has fully stepped; from here an error closes it (fail_reject1) */
     next_promise = JS_Call(ctx, s->promise_resolve, s->this_val, 1, vc(&value));
     JS_FreeValue(ctx, value);
     if (JS_IsException(next_promise)) return -1;
