@@ -18700,6 +18700,13 @@ typedef struct JSPromiseAll {
                                     clone so no interpreter re-entry — .then — happens mid-clone_deep_flow). */
     int index;                   /* next element index */
     int magic;                   /* PROMISE_MAGIC_all / allSettled (per-element reject handling differs) */
+    uint8_t finalizing;          /* 1 while the aggregate resolve/reject callback is being driven on the tramp: the
+                                    settle re-enters the step, which then returns 0 (DONE) — a custom Promise
+                                    subclass's resolve/reject is USER bytecode whose loop must park, so it cannot be
+                                    a JS_Call to completion from inside js_promise_all_step. */
+    uint8_t fin_is_reject;       /* which resolving_funcs[] the finalize drives */
+    JSValue fin_arg;             /* the finalize argument (values dup / AggregateError), owned only in the brief
+                                    window before it is transferred onto the tramp operand stack */
     int orig_cfirst, orig_cargc; uint8_t orig_is_tail;   /* the ORIGINAL OP_call_method operand shape */
 } JSPromiseAll;
 static int js_promise_all_step(JSContext *ctx, struct JSPromiseAll *s, JSValue res);
@@ -21588,6 +21595,26 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JS_FreeValue(ctx, err); JS_FreeValue(ctx, rr);
                     st = 0;   /* fall through to DONE, yielding the (now rejected) promise */
                 }
+                if (st == 2) {
+                    /* FINALIZE: call resolving_funcs[fin_is_reject](fin_arg) — the aggregate settle. A user Promise
+                       subclass's resolve/reject is bytecode whose loop must park, so drive it on the tramp; a native
+                       (C) resolve has no loop and is called inline. Either way the settle re-enters the step, which
+                       returns 0 (finalizing) -> the DONE block below yields the aggregate. */
+                    JSValueConst fn = s->resolving_funcs[s->fin_is_reject];
+                    DCHECK(sp + 3 <= TRAMP_SP_LIMIT(sf),
+                           "Promise combinator finalize drive: operand push exceeds the frame's compiled stack_size");
+                    *sp++ = JS_UNDEFINED;                 /* this */
+                    *sp++ = js_dup(fn);                   /* the settle function */
+                    *sp++ = s->fin_arg; s->fin_arg = JS_UNDEFINED;   /* the arg (owned, transferred) */
+                    call_argv = sp - 1; call_argc = 1; tramp_first = -2; tramp_is_tail = 0;
+                    tramp_cont_state = s; tramp_cont_kind = CONT_PROMISE_ALL;
+                    if (tramp_can_call(call_argv[-1])) goto do_tramp_call;
+                    tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;
+                    { JSValue rr = JS_Call(ctx, call_argv[-1], call_argv[-2], 1, vc(&call_argv[0]));
+                      for (i = -2; i < 1; i++) JS_FreeValue(ctx, call_argv[i]); sp -= 3;
+                      if (JS_IsException(rr)) goto promise_all_err;
+                      JS_FreeValue(ctx, rr); st = 0; }   /* fall through to DONE */
+                }
                 if (st == 0) {   /* DONE: pop the ORIGINAL operands, yield the aggregate promise */
                     JSValue r = js_dup(s->result_promise);
                     int cfirst = s->orig_cfirst, cargc = s->orig_cargc;
@@ -22521,12 +22548,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto do_iter_consume_step;
                 }
                 if (rck == CONT_PROMISE_ALL) {
-                    /* a Promise combinator's PLAIN-iterator .next() (a bytecode .next drove on the tramp) returned:
-                       drop the [iter, next] operands (do_tramp_call dup'd them with caller_sp above), then resume the
-                       combinator step with the {value,done}. A generator .next settles via do_generator_settle
-                       instead; this arm is only the plain-iterator drive. js_promise_all_step enforces object-ness. */
+                    /* a Promise combinator's bytecode callback driven on the tramp returned: either the PLAIN-iterator
+                       .next() ([iter, next], nops 2) or the aggregate FINALIZE settle ([this, fn, arg], nops 3). Drop
+                       its operands and resume the step. For .next the step consumes the {value,done} in ret_val; for
+                       finalize the step's `finalizing` flag makes it return DONE, ignoring ret_val. A generator .next
+                       settles via do_generator_settle instead; this arm is only the non-generator tramp drives. */
                     JSValue *cargv = sp - cargc;
-                    DCHECK(cargc - cfirst == 2, "promise-all plain .next cont frame has an unexpected operand shape");
+                    DCHECK(cargc - cfirst == 2 || cargc - cfirst == 3, "promise-all cont frame has an unexpected operand shape");
                     for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
                     sp += cfirst - cargc;
                     cont_st = rcs; cont_kind_cur = CONT_PROMISE_ALL;
@@ -61945,6 +61973,12 @@ static int js_promise_all_step(JSContext *ctx, JSPromiseAll *s, JSValue res)
 {
     JSValue value, next_promise, rr;
     int done;
+    if (s->finalizing) {
+        /* the aggregate resolve/reject callback (driven on the tramp) returned: `res` is that callback's discarded
+           return value — free it here, since this early exit does not flow into the normal result-consuming code. */
+        JS_FreeValue(ctx, res);
+        return 0;   /* the combinator is DONE */
+    }
     if (JS_VALUE_GET_TAG(res) == JS_TAG_UNINITIALIZED)
         return 1;   /* first step: nothing to process, drive .next() */
     if (!JS_IsObject(res)) {
@@ -61968,19 +62002,21 @@ static int js_promise_all_step(JSContext *ctx, JSPromiseAll *s, JSValue res)
         is_zero = remainingElementsCount_add(ctx, s->resolve_element_env, -1);
         if (is_zero < 0) return -1;
         if (is_zero) {
+            /* Request the aggregate settle callback be DRIVEN ON THE TRAMP (return 2), not JS_Call'd here: for a
+               custom Promise subclass resolving_funcs[] is user bytecode whose loop must be able to park. The
+               finalize arg is built now (owned), transferred to the tramp operands by do_promise_all_step. */
             if (s->magic == PROMISE_MAGIC_any) {
                 /* any: every element rejected -> reject the aggregate with AggregateError(the collected errors). */
                 JSValue err = js_aggregate_error_constructor(ctx, s->values);
                 if (JS_IsException(err)) return -1;
-                rr = JS_Call(ctx, s->resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
-                JS_FreeValue(ctx, err);
+                s->fin_arg = err; s->fin_is_reject = 1;
             } else {
-                rr = JS_Call(ctx, s->resolving_funcs[0], JS_UNDEFINED, 1, vc(&s->values));
+                s->fin_arg = js_dup(s->values); s->fin_is_reject = 0;
             }
-            if (JS_IsException(rr)) return -1;
-            JS_FreeValue(ctx, rr);
+            s->finalizing = 1;
+            return 2;   /* FINALIZE: drive resolving_funcs[fin_is_reject](fin_arg) on the tramp, then DONE */
         }
-        return 0;   /* DONE */
+        return 0;   /* count not zero: another element still pending — DONE for this drive */
     }
     value = JS_GetProperty(ctx, res, JS_ATOM_value);
     JS_FreeValue(ctx, res);
