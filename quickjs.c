@@ -25483,6 +25483,33 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         } else if (xck == CONT_SETTER) {
             /* a throwing setter body: no continuation state; its operands (this,setter,value) are on the caller
                stack and freed by the caller's own catch-search, exactly like a normal method call. */
+        } else if (xck == CONT_PROMISE_ALL) {
+            /* a Promise combinator callback driven on the tramp threw — a plain iterator's .next(), or the
+               aggregate resolve/reject settle for a custom Promise subclass. PerformPromiseAll's abrupt handling
+               (spec 27.2.4.1 steps 8-9): if still iterating, IteratorClose; then IfAbruptRejectPromise — reject the
+               aggregate and YIELD it. The throw must NOT propagate: Promise.all(x) returns a REJECTED promise, it
+               does not raise. This mirrors CONT_PROMISE_EXEC exactly; before the finalize/settle moved onto the
+               tramp, js_promise_all_step caught this inline (return -1 -> promise_all_err), so routing the callback
+               onto the tramp made this the site that must reproduce that catch. */
+            JSPromiseAll *ps = xcs;
+            JSValue err = JS_GetException(ctx), rr;
+            JSValue r = js_dup(ps->result_promise);
+            int cfirst = ps->orig_cfirst, cargc = ps->orig_cargc;
+            uint8_t itail = ps->orig_is_tail;
+            JSValue *cargv;
+            if (!JS_IsUndefined(ps->iter))
+                JS_IteratorClose(ctx, ps->iter, true);   /* best-effort per IfAbruptCloseIterator; its own throw is ignored */
+            rr = JS_Call(ctx, ps->resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
+            JS_FreeValue(ctx, err);
+            js_promise_all_end(ctx, ps); js_free_rt(rt, ps);
+            cargv = sp - cargc;
+            for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
+            sp += cfirst - cargc;
+            if (unlikely(JS_IsException(rr))) { JS_FreeValue(ctx, r); JS_FreeValue(ctx, rr); goto exception; }
+            JS_FreeValue(ctx, rr);
+            if (itail) { ret_val = r; goto do_return; }
+            *sp++ = r;
+            BREAK;
         } else if (xck != CONT_NONE) {
             /* the throwing frame was a C-builtin-driven CALLBACK: abandon the iteration (its state owns the
                object/accumulator/element) and re-raise in the builtin's ORIGINAL caller, whose stack still holds
@@ -25532,8 +25559,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 js_str_replace_end(ctx, (JSStrReplace *)xcs, false);
             else if (xck == CONT_RE_REPLACE)
                 js_re_rep_end(ctx, (JSReRep *)xcs, false);
-            else if (xck == CONT_PROMISE_ALL)
-                js_promise_all_end(ctx, (JSPromiseAll *)xcs);
+            /* CONT_PROMISE_ALL is handled by its own arm above (reject-and-yield, never abandon-and-propagate) and
+               never reaches this generic teardown — a stray one here would be a bug, so the DFAIL guards it. */
             else
                 /* A bare `else` here used to tear the state down AS a JSArrayReduce. Any callback cont kind added
                    without an arm above would be freed through the wrong struct — silent heap corruption on the
