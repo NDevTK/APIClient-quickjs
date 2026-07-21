@@ -61424,6 +61424,23 @@ static JSValue js_promise_resolve_thenable_job(JSContext *ctx,
     if (js_create_resolving_functions(ctx, args, promise) < 0)
         return JS_EXCEPTION;
     rt = ctx->rt;
+    if (tramp_can_call(then) && !rt->promise_hook) {
+        /* the thenable's .then is USER bytecode that can loop — run then.call(thenable, resolve, reject) as a FLOW
+           so it parks into the job pump, never a JS_Call to completion. On success its result is DISCARDED (the
+           .then already settled the promise via resolve/reject); on throw, reaction_flow_settle calls rf->reject
+           (= the reject resolving function), which is exactly PromiseResolveThenableJob's abrupt step. The BEFORE/
+           AFTER promise hooks bracket a single synchronous call, so a hook forces the inline path below. */
+        JSReactionFlow *rf = js_malloc(ctx, sizeof(*rf));
+        if (unlikely(!rf)) { JS_FreeValue(ctx, args[0]); JS_FreeValue(ctx, args[1]); return JS_EXCEPTION; }
+        memset(rf, 0, sizeof(*rf));
+        if (async_func_init(ctx, &rf->fs, then, thenable, 2, vc(args))) {
+            js_free_rt(rt, rf); JS_FreeValue(ctx, args[0]); JS_FreeValue(ctx, args[1]); return JS_EXCEPTION;
+        }
+        rf->resolve = JS_UNDEFINED;     /* success: discard the .then result */
+        rf->reject = js_dup(args[1]);   /* throw: reject the promise */
+        JS_FreeValue(ctx, args[0]); JS_FreeValue(ctx, args[1]);
+        return reaction_flow_step(ctx, rf);
+    }
     if (rt->promise_hook) {
         rt->promise_hook(ctx, JS_PROMISE_HOOK_BEFORE, promise, JS_UNDEFINED,
                          rt->promise_hook_opaque);
