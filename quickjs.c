@@ -21197,17 +21197,26 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValue method = tramp_iter_getiter; tramp_iter_getiter = JS_UNDEFINED;
                 JSValueConst iterable = tramp_consume_iterable;
                 if (!JS_IsFunction(ctx, method)) {
-                    /* NOT-ITERABLE is part of GetIterator, not a reason to refuse the route. Requiring a callable
-                       @@iterator in each consumer's recognizer left the not-iterable case to the C body — which is
-                       the same fallback selection in another costume, and for a Promise combinator the C body must
-                       REJECT the aggregate rather than throw, so the two paths disagreed on semantics too. The
-                       acquire owns the whole of GetIterator now: the TypeError is delivered as an acquisition
-                       failure, and each consumer's deliver arm already knows how to finish one (Promise rejects,
+                    /* The probe is side-effect-free, so it DECLINES a getter @@iterator (and a non-function/absent
+                       value) — method is UNDEFINED here. Perform the REAL GetMethod now: read @@iterator, RUNNING a
+                       getter, which may THROW (a poisoned @@iterator must reject the aggregate with ITS error, not a
+                       synthesized "not iterable" — iter-arg-is-poisoned). Then apply GetIterator's checks. NOT-
+                       ITERABLE is part of GetIterator, not a reason to refuse the route; the acquire owns the whole
+                       of it, and each consumer's deliver arm finishes an acquisition failure (Promise rejects,
                        Array.from/Set/Map propagate). */
                     JS_FreeValue(ctx, method);
-                    JS_ThrowTypeError(ctx, "value is not iterable");
-                    tramp_consume_acquired = JS_EXCEPTION;
-                    goto do_consume_deliver_iterator;
+                    method = JS_GetProperty(ctx, iterable, JS_ATOM_Symbol_iterator);   /* runs a getter; may throw */
+                    if (JS_IsException(method)) {
+                        tramp_consume_acquired = JS_EXCEPTION;
+                        goto do_consume_deliver_iterator;
+                    }
+                    if (!JS_IsFunction(ctx, method)) {   /* undefined/null/non-callable => not iterable */
+                        JS_FreeValue(ctx, method);
+                        JS_ThrowTypeError(ctx, "value is not iterable");
+                        tramp_consume_acquired = JS_EXCEPTION;
+                        goto do_consume_deliver_iterator;
+                    }
+                    /* method is the real callable @@iterator — fall through to the generator-check + call below */
                 }
                 if (tramp_can_call_gen_create(method)) {
                     DCHECK(sp + 2 <= TRAMP_SP_LIMIT(sf),
