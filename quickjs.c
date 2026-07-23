@@ -21584,10 +21584,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (ta_cid != 0) {
                         JSValue ta;
                         if (JS_VALUE_GET_TAG(ta_mapfn) != JS_TAG_UNDEFINED) {
-                            /* TypedArray.from(gen, mapfn): reuse from on the collected array (native iteration, no
-                               drive) so the mapfn is applied AFTER the typed array is created, in spec order. */
-                            JSValueConst fargs[3] = { r, ta_mapfn, ta_mapfn_this };
-                            ta = js_typed_array_from(ctx, ta_ntgt, 3, fargs);
+                            /* TypedArray.from(iterable, mapfn): the iterable is now COLLECTED on the tramp (the
+                               recognizer is widened past generator-backed sources), but the mapfn is USER CODE that
+                               must run per-element WITHOUT drive-to-completion. Spec 22.2.2.1 is collect -> create the
+                               TA (length = collected count) -> map+set each element with the created TA as target.
+                               That map+set is a SECOND per-element tramp phase over the created TA; the old
+                               js_typed_array_from(r, mapfn) re-call did it in a C loop (drive-to-completion) AND
+                               re-iterated the collected array (its own @@iterator DFAIL). No-mapfn TypedArray.from is
+                               fully routed; only this second phase is unbuilt. */
+                            DFAIL("TypedArray.from(iterable, mapfn): collect is routed but the mapfn map+set is not yet "
+                                  "a tramp phase — create the TA from the collected count, then drive mapfn(v,i) per "
+                                  "element on the tramp (spec 22.2.2.1), never the finish js_typed_array_from re-call");
+                            ta = JS_EXCEPTION;
                         } else {
                             /* new TypedArray(gen) / TypedArray.from(gen): create from the collected array via the ctor
                                object path — spec IterableToList done on the tramp, then buffer create + element copy. */
@@ -48752,7 +48760,13 @@ static bool tramp_can_call_ta_from_consume(JSContext *ctx, JSValueConst func, JS
     /* a mapfn arg, if present and not undefined, MUST be callable — else from throws EARLY; leave that to the
        normal path. When present it is applied at the finish (via js_typed_array_from), not during the collect. */
     if (call_argc >= 2 && !JS_IsUndefined(call_argv[1]) && !JS_IsFunction(ctx, call_argv[1])) return false;
-    if (!iter_consume_gen_backed(ctx, call_argv[0], out_getiter)) return false;
+    /* ANY callable @@iterator, not just a generator-backed one: iter_consume_gen_backed was the fallback selector
+       that dropped a plain iterator onto js_typed_array_from's C drive-to-completion. Array-LIKES (no @@iterator,
+       driven by length+indices) are a genuinely different algorithm and correctly stay in the C entry. */
+    if (!iter_data_at_iterator(ctx, call_argv[0], out_getiter)) return false;
+    if (!JS_IsFunction(ctx, *out_getiter)) {
+        JS_FreeValue(ctx, *out_getiter); *out_getiter = JS_UNDEFINED; return false;
+    }
     *out_classid = tp->u.cfunc.magic;
     return true;
 }
