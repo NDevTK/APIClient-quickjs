@@ -18016,6 +18016,12 @@ typedef struct JSStepHdr {
     uint8_t orig_is_tail;
 } JSStepHdr;
 enum { ArrayFind, ArrayFindIndex, ArrayFindLast, ArrayFindLastIndex };
+/* ORed into the find family's mode for the TypedArray receivers. The find STEP is already receiver-agnostic (it
+   reads elements with JS_GetPropertyValue, which serves both), so the whole difference is how the length is
+   obtained — the same split js_array_every_init makes with special_TA, and the reason a separate
+   js_typed_array_find C loop never had to exist. That loop drove its callback with JS_Call, so a callback that
+   loops preempted in a C activation with no flow base. */
+#define FIND_TA 8
 typedef struct JSArrayFind {
     JSStepHdr hdr;           /* MUST be first: the generic driver casts the state to JSStepHdr * */
     JSValue obj, func, this_arg, this_val, val, result;
@@ -18666,6 +18672,28 @@ static int js_array_reduce_step(JSContext *ctx, struct JSArrayReduce *s, JSValue
 #define MAGIC_SET (1 << 0)   /* Map/Set family magic (hoisted for the Set/Map iterator-consumer recognition; re-defined identically at the Map impl) */
 #define MAGIC_WEAK (1 << 1)
 #endif
+/* Math.sumPrecise's accumulator, hoisted here because it lives ON the consume state: the sum runs ACROSS
+   suspensions, so it cannot stay a C local in js_math_sumPrecise's loop. Inline, not behind a pointer — a POD
+   field is copied by the flow clone and released with the state for free, where a pointer would be a new
+   dup-and-free obligation at every clone/finish/abrupt site, which is exactly the class of bug this file has
+   already paid for three times. */
+/* we add one extra limb to avoid having to test for overflows during the sum */
+#define SUM_PRECISE_ACC_LEN 34
+
+typedef enum {
+    SUM_PRECISE_STATE_MINUS_ZERO,
+    SUM_PRECISE_STATE_FINITE,
+    SUM_PRECISE_STATE_INFINITY,
+    SUM_PRECISE_STATE_MINUS_INFINITY, /* must be after SUM_PRECISE_STATE_INFINITY */
+    SUM_PRECISE_STATE_NAN, /* must be after SUM_PRECISE_STATE_MINUS_INFINITY */
+} SumPreciseStateEnum;
+
+typedef struct {
+    uint64_t acc[SUM_PRECISE_ACC_LEN];
+    int n_limbs; /* acc is not necessarily normalized */
+    SumPreciseStateEnum state;
+} SumPreciseState;
+
 #define ITERCONS_FROM    0   /* Array.from(gen): fresh result array; finish pops the call operands + pushes r */
 #define ITERCONS_SPREAD  1   /* [...gen] (OP_append): r is the literal's array on the caller stack; finish writes pos back to sp[-2] and pops the iterable */
 #define ITERCONS_SET     2   /* new Set(gen): r is the empty Set; sink calls the `add` adder with the value */
@@ -18677,6 +18705,9 @@ static int js_array_reduce_step(JSContext *ctx, struct JSArrayReduce *s, JSValue
 #define SETOP_UNION      0   /* add each key to r (internal append — spec forbids calling r.add) */
 #define SETOP_SYMDIFF    1   /* key in THIS -> delete from r; key in neither -> add to r (insertion order preserved) */
 #define SETOP_SUPERSET   2   /* every key must be in THIS; a miss short-circuits false and CLOSES the iterator */
+#define ITERCONS_SUMPRECISE 7 /* Math.sumPrecise(iterable): no result object at all — `sum` accumulates exactly and the
+                                 finish yields the correctly-rounded double. A non-number element is an
+                                 IfAbruptCloseIterator TypeError like every other sink's bad element. */
 #define ITERCONS_ITERTERM 6  /* Iterator.prototype EAGER terminal (toArray/forEach/reduce/some/every/find): GetIteratorDirect(this)
                                 — `this` IS the iterator (no @@iterator call) — then drive it on the tramp. `setop` holds
                                 the ITERTERM_* rule; `mapfn` the predicate/reducer; `k` the visit counter. */
@@ -18714,7 +18745,12 @@ typedef struct JSIterConsume {
                         generator-backed sources and handed everything else to the C loop. */
     JSValue super_ref;  /* super(iterable) entry: the owned parent-class ref, freed at finish; UNDEFINED
                            for the OP_call_constructor entry which has no such ref */
+    SumPreciseState sum; /* ITERCONS_SUMPRECISE only. POD, so it needs no entry in ITERCONS_OWNED. */
 } JSIterConsume;
+static void sum_precise_init(SumPreciseState *s);
+static void sum_precise_add(SumPreciseState *s, double d);
+static double sum_precise_get_result(SumPreciseState *s);
+static JSValue js_math_sumPrecise(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 #define ITERCONS_OWNED(F) F(r) F(iter) F(next) F(adder) F(mapfn) F(mapfn_this) F(cb_value)
 /* NOTE: JSIteratorHelperData::cb_value is owned too — freed by the finalizer and cleared on every path below. */
 static int js_iter_consume_step(JSContext *ctx, struct JSIterConsume *s, JSValue res);
@@ -18730,7 +18766,7 @@ static JSMapRecord *map_find_record(JSContext *ctx, JSMapState *s, JSValueConst 
 static JSMapRecord *map_add_record(JSContext *ctx, JSMapState *s, JSValue key);
 static void map_delete_record(JSRuntime *rt, JSMapState *s, JSMapRecord *mr);
 static bool iter_consume_gen_backed(JSContext *ctx, JSValueConst items, JSValue *out_getiter);
-static bool tramp_can_call_iter_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, JSValue *out_getiter);
+static bool tramp_can_call_iter_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, JSValue *out_getiter, uint8_t *out_sink);
 static JSValue js_map_constructor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv, int magic);
 static bool tramp_can_call_setmap_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_magic, JSValue *out_getiter);
 static JSValue js_object_fromEntries(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
@@ -19413,6 +19449,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     int smc_magic = 0;                                  /* new Set(gen)/new Map(gen) recognition: 0 = Map, MAGIC_SET = Set (read at OP_call_constructor, consumed by do_setmap_consume_tramp) */
     int ta_classid = 0;                                 /* new TypedArray(gen) recognition: the TA class (read at OP_call_constructor, consumed by do_ta_consume_tramp) */
     uint8_t setop_kind = 0;                             /* s.union/symmetricDifference recognition: SETOP_* (consumed by do_setop_consume_tramp) */
+    uint8_t icons_sink = ITERCONS_FROM;                 /* which builtin do_iter_consume_tramp is serving: ITERCONS_FROM (Array.from) or ITERCONS_SUMPRECISE (Math.sumPrecise) */
     /* APPLY-mode body entry: f.apply(this,arr) / Reflect.apply(f,this,arr) / f(...spread). The args come from the
        ARRAY into the callee's OWN frame (never the caller stack, whose compiled size the array length could
        overflow), so the body-entry labels take them from here instead of from call_argv. Shared by ALL THREE
@@ -20933,8 +20970,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                tramp_first is -2 and tramp_is_tail is already set by the caller; a plain -1 call never routes here
                (it jumps straight to do_generic_callee below, where call_argv[-2] is not a receiver). */
             {
-                if (tramp_can_call_iter_consume(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter))
-                    goto do_iter_consume_tramp;                 /* Array.from(iterable) */
+                if (tramp_can_call_iter_consume(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter, &icons_sink))
+                    goto do_iter_consume_tramp;                 /* Array.from(iterable) / Math.sumPrecise(iterable) */
                 if (tramp_can_call_setop_consume(call_argv[-1], call_argv[-2], vc(call_argv), call_argc, &setop_kind))
                     goto do_setop_consume_tramp;                /* s.union/symmetricDifference(setlike) */
                 if (tramp_can_call_iterterm(ctx, call_argv[-1], call_argv[-2], call_argc, &iterterm_kind))
@@ -21219,9 +21256,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                here on the tramp) or the source is a direct generator/helper (its @@iterator returns itself). */
             {
                 JSValueConst thisv = call_argv[-2];
+                uint8_t sink0 = icons_sink; icons_sink = ITERCONS_FROM;   /* read + reset */
                 JSIterConsume *s;
                 JSValue result;
-                if (JS_IsConstructor(ctx, thisv))
+                if (sink0 == ITERCONS_SUMPRECISE)
+                    result = JS_UNDEFINED;              /* no accumulator OBJECT: the sum lives in s->sum */
+                else if (JS_IsConstructor(ctx, thisv))
                     result = JS_CallConstructor(ctx, thisv, 0, NULL);
                 else
                     result = JS_NewArray(ctx);
@@ -21233,11 +21273,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->next = JS_UNDEFINED;
                 s->cb_value = JS_UNDEFINED;
                 s->adder = JS_UNDEFINED;
-                /* Array.from(items, mapfn, thisArg): dup the mapfn + thisArg (recognition checked mapfn callable). */
-                s->mapfn = (call_argc >= 2) ? js_dup(call_argv[1]) : JS_UNDEFINED;
-                s->mapfn_this = (call_argc >= 3) ? js_dup(call_argv[2]) : JS_UNDEFINED;
+                /* Array.from(items, mapfn, thisArg): dup the mapfn + thisArg (recognition checked mapfn callable).
+                   sumPrecise takes no callback at all. */
+                s->mapfn = (sink0 == ITERCONS_FROM && call_argc >= 2) ? js_dup(call_argv[1]) : JS_UNDEFINED;
+                s->mapfn_this = (sink0 == ITERCONS_FROM && call_argc >= 3) ? js_dup(call_argv[2]) : JS_UNDEFINED;
                 s->k = 0;
-                s->sink = ITERCONS_FROM;
+                s->sink = sink0;
+                if (sink0 == ITERCONS_SUMPRECISE) sum_precise_init(&s->sum);
                 s->super_ref = JS_UNDEFINED;   /* only the super(iterable) entry owns one */
                 s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
                 tramp_consume_iterable = call_argv[0]; tramp_consume_state = s; tramp_consume_kind = CONT_ITER_CONSUME;
@@ -48740,6 +48782,7 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
         done = JS_ToBoolFree(ctx, done_val);
         if (done) {   /* iterator exhausted: s->r is complete */
             JS_FreeValue(ctx, res);
+            if (s->sink == ITERCONS_SUMPRECISE) s->r = js_float64(sum_precise_get_result(&s->sum));
             if (s->sink == ITERCONS_SETOP && s->setop == SETOP_SUPERSET) s->r = js_bool(s->k != 0);
             if (s->sink == ITERCONS_ITERTERM) {
                 if (s->setop == ITERTERM_SOME) s->r = js_bool(false);
@@ -48757,7 +48800,22 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
         value = JS_GetProperty(ctx, res, JS_ATOM_value);
         JS_FreeValue(ctx, res);
         if (JS_IsException(value)) return -1;
-        if (s->sink == ITERCONS_SET) {
+        if (s->sink == ITERCONS_SUMPRECISE) {
+            /* Math.sumPrecise: the element MUST already be a Number — the spec does no coercion, and a non-number
+               is an IfAbruptCloseIterator TypeError (return 2 so the shared close runs before it propagates). */
+            uint32_t vtag = JS_VALUE_GET_TAG(value);
+            double d;
+            if (JS_TAG_IS_FLOAT64(vtag)) {
+                d = JS_VALUE_GET_FLOAT64(value);
+            } else if (vtag == JS_TAG_INT) {
+                d = JS_VALUE_GET_INT(value);
+            } else {
+                JS_FreeValue(ctx, value);
+                JS_ThrowTypeError(ctx, "not a number");
+                s->abrupt = 1; return 2;
+            }
+            sum_precise_add(&s->sum, d);
+        } else if (s->sink == ITERCONS_SET) {
             /* new Set(gen): adder(value). Mirrors js_map_constructor's is_set branch. */
             JSValue ret = JS_Call(ctx, s->adder, s->r, 1, vc(&value));
             JS_FreeValue(ctx, value);
@@ -48960,7 +49018,7 @@ static bool iter_consume_gen_backed(JSContext *ctx, JSValueConst items, JSValue 
     return false;
 }
 
-static bool tramp_can_call_iter_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, JSValue *out_getiter)
+static bool tramp_can_call_iter_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, JSValue *out_getiter, uint8_t *out_sink)
 {
     JSObject *fp;
     *out_getiter = JS_UNDEFINED;
@@ -48969,7 +49027,15 @@ static bool tramp_can_call_iter_consume(JSContext *ctx, JSValueConst func, JSVal
     fp = JS_VALUE_GET_OBJ(func);
     if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
     if (fp->u.cfunc.cproto != JS_CFUNC_generic) return false;
+    /* TWO builtins consume an iterable with this exact shape, so they share the recognizer rather than growing a
+       second one: Array.from collects, Math.sumPrecise accumulates. *out_sink says which. */
+    if (fp->u.cfunc.c_function.generic == js_math_sumPrecise) {
+        *out_sink = ITERCONS_SUMPRECISE;
+        iter_data_at_iterator(ctx, call_argv[0], out_getiter);   /* absent/getter/proxy => the acquire's GetIterator throws */
+        return true;
+    }
     if (fp->u.cfunc.c_function.generic != js_array_from) return false;
+    *out_sink = ITERCONS_FROM;
     /* a mapfn arg, if present and not undefined, MUST be callable — else Array.from throws EARLY (before GetIterator);
        leave that to the normal path rather than routing. thisArg (argv[2]) is free. */
     if (call_argc >= 2 && !JS_IsUndefined(call_argv[1]) && !JS_IsFunction(ctx, call_argv[1])) return false;
@@ -49954,11 +50020,18 @@ static void *js_array_find_init(JSContext *ctx, JSValueConst this_val, int argc,
     JSValue objv;
     int64_t len;
 
-    objv = JS_ToObject(ctx, this_val);
-    if (JS_IsException(objv))
-        return NULL;
-    if (js_get_length64(ctx, &len, objv)) { JS_FreeValue(ctx, objv); return NULL; }
+    if (mode & FIND_TA) {
+        objv = js_dup(this_val);   /* js_typed_array_get_length_unsafe VALIDATES the receiver and yields its length */
+        len = js_typed_array_get_length_unsafe(ctx, objv);
+        if (len < 0) { JS_FreeValue(ctx, objv); return NULL; }
+    } else {
+        objv = JS_ToObject(ctx, this_val);
+        if (JS_IsException(objv))
+            return NULL;
+        if (js_get_length64(ctx, &len, objv)) { JS_FreeValue(ctx, objv); return NULL; }
+    }
     if (argc < 1 || check_function(ctx, argv[0])) { JS_FreeValue(ctx, objv); return NULL; }
+    mode &= ~FIND_TA;   /* only the length differed; every later test is on the plain mode */
     s = js_mallocz(ctx, sizeof(*s));
     if (!s) { JS_FreeValue(ctx, objv); JS_ThrowOutOfMemory(ctx); return NULL; }
     s->obj = objv;
@@ -50017,6 +50090,7 @@ static JSValue js_array_find_fini(JSContext *ctx, void *st, bool take_result)
 
 enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_ARRAY_FIND, STEPDEF_ARRAY_FIND_INDEX, STEPDEF_ARRAY_FIND_LAST, STEPDEF_ARRAY_FIND_LAST_INDEX,
+    STEPDEF_TA_FIND, STEPDEF_TA_FIND_INDEX, STEPDEF_TA_FIND_LAST, STEPDEF_TA_FIND_LAST_INDEX,
     STEPDEF_RE_REPLACE, STEPDEF_STR_REPLACE, STEPDEF_STR_REPLACE_ALL,
     STEPDEF_ARRAY_EVERY, STEPDEF_ARRAY_SOME, STEPDEF_ARRAY_FOREACH, STEPDEF_ARRAY_MAP, STEPDEF_ARRAY_FILTER,
     STEPDEF_TA_EVERY, STEPDEF_TA_SOME, STEPDEF_TA_FOREACH, STEPDEF_TA_MAP, STEPDEF_TA_FILTER,
@@ -50031,6 +50105,10 @@ static const JSTrampStepDef js_array_find_def          = { js_array_find_init, j
 static const JSTrampStepDef js_array_findIndex_def     = { js_array_find_init, js_array_find_step, js_array_find_fini, ArrayFindIndex };
 static const JSTrampStepDef js_array_findLast_def      = { js_array_find_init, js_array_find_step, js_array_find_fini, ArrayFindLast };
 static const JSTrampStepDef js_array_findLastIndex_def = { js_array_find_init, js_array_find_step, js_array_find_fini, ArrayFindLastIndex };
+static const JSTrampStepDef js_ta_find_def             = { js_array_find_init, js_array_find_step, js_array_find_fini, ArrayFind | FIND_TA };
+static const JSTrampStepDef js_ta_findIndex_def        = { js_array_find_init, js_array_find_step, js_array_find_fini, ArrayFindIndex | FIND_TA };
+static const JSTrampStepDef js_ta_findLast_def         = { js_array_find_init, js_array_find_step, js_array_find_fini, ArrayFindLast | FIND_TA };
+static const JSTrampStepDef js_ta_findLastIndex_def    = { js_array_find_init, js_array_find_step, js_array_find_fini, ArrayFindLastIndex | FIND_TA };
 static const JSTrampStepDef js_re_replace_def          = { js_re_rep_init, js_re_rep_vstep, js_re_rep_fini, 0 };
 static const JSTrampStepDef js_str_replace_def         = { js_str_replace_init, js_str_replace_vstep, js_str_replace_fini, 0 };
 static const JSTrampStepDef js_str_replaceAll_def      = { js_str_replace_init, js_str_replace_vstep, js_str_replace_fini, 1 };
@@ -50059,6 +50137,10 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_ARRAY_FIND_INDEX]      = &js_array_findIndex_def,
     [STEPDEF_ARRAY_FIND_LAST]       = &js_array_findLast_def,
     [STEPDEF_ARRAY_FIND_LAST_INDEX] = &js_array_findLastIndex_def,
+    [STEPDEF_TA_FIND]               = &js_ta_find_def,
+    [STEPDEF_TA_FIND_INDEX]         = &js_ta_findIndex_def,
+    [STEPDEF_TA_FIND_LAST]          = &js_ta_findLast_def,
+    [STEPDEF_TA_FIND_LAST_INDEX]    = &js_ta_findLastIndex_def,
     [STEPDEF_RE_REPLACE]            = &js_re_replace_def,
     [STEPDEF_STR_REPLACE]           = &js_str_replace_def,
     [STEPDEF_STR_REPLACE_ALL]       = &js_str_replaceAll_def,
@@ -54548,22 +54630,6 @@ static JSValue js_math_clz32(JSContext *ctx, JSValueConst this_val,
     return js_int32(r);
 }
 
-/* we add one extra limb to avoid having to test for overflows during the sum */
-#define SUM_PRECISE_ACC_LEN 34
-
-typedef enum {
-    SUM_PRECISE_STATE_MINUS_ZERO,
-    SUM_PRECISE_STATE_FINITE,
-    SUM_PRECISE_STATE_INFINITY,
-    SUM_PRECISE_STATE_MINUS_INFINITY, /* must be after SUM_PRECISE_STATE_INFINITY */
-    SUM_PRECISE_STATE_NAN, /* must be after SUM_PRECISE_STATE_MINUS_INFINITY */
-} SumPreciseStateEnum;
-
-typedef struct {
-    uint64_t acc[SUM_PRECISE_ACC_LEN];
-    int n_limbs; /* acc is not necessarily normalized */
-    SumPreciseStateEnum state;
-} SumPreciseState;
 
 static void sum_precise_init(SumPreciseState *s)
 {
@@ -54756,44 +54822,19 @@ static double sum_precise_get_result(SumPreciseState *s)
 static JSValue js_math_sumPrecise(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv)
 {
-    JSValue iter, next, item, ret;
-    uint32_t tag;
-    int done;
-    double d;
-    SumPreciseState s_s, *s = &s_s;
-
+    JSValue iter;
+    /* DELETED: the summation loop. It drove the argument's .next() from C, where a generator body cannot suspend.
+       Math.sumPrecise is now an ITERCONS_SUMPRECISE consume — the exact accumulator, per-element number check and
+       IfAbruptCloseIterator all live in the one consume machine, with the running sum ON the state so it survives a
+       suspension. What is LEFT here is the shape that never iterates: a non-iterable argument (including the
+       0-argument call), whose TypeError GetIterator raises below. */
     iter = JS_GetIterator(ctx, argv[0], /*is_async*/false);
     if (JS_IsException(iter))
         return JS_EXCEPTION;
-    ret = JS_EXCEPTION;
-    next = JS_GetProperty(ctx, iter, JS_ATOM_next);
-    if (JS_IsException(next))
-        goto fail;
-    sum_precise_init(s);
-    for (;;) {
-        item = JS_IteratorNext(ctx, iter, next, 0, NULL, &done);
-        if (JS_IsException(item))
-            goto fail;
-        if (done)
-            break;
-        tag = JS_VALUE_GET_TAG(item);
-        if (JS_TAG_IS_FLOAT64(tag)) {
-            d = JS_VALUE_GET_FLOAT64(item);
-        } else if (tag == JS_TAG_INT) {
-            d = JS_VALUE_GET_INT(item);
-        } else {
-            JS_FreeValue(ctx, item);
-            JS_ThrowTypeError(ctx, "not a number");
-            JS_IteratorClose(ctx, iter, /*is_exception_pending*/true);
-            goto fail;
-        }
-        sum_precise_add(s, d);
-    }
-    ret = js_float64(sum_precise_get_result(s));
-fail:
+    DFAIL("Math.sumPrecise reached its C entry with an ITERABLE source — route that call site onto the consume "
+          "machine; the summation loop here no longer exists");
     JS_FreeValue(ctx, iter);
-    JS_FreeValue(ctx, next);
-    return ret;
+    return JS_EXCEPTION;
 }
 
 /* xorshift* random number generator by Marsaglia */
@@ -67042,66 +67083,6 @@ static JSValue js_typed_array_fill(JSContext *ctx, JSValueConst this_val,
     return js_dup(this_val);
 }
 
-static JSValue js_typed_array_find(JSContext *ctx, JSValueConst this_val,
-                                   int argc, JSValueConst *argv, int mode)
-{
-    JSValueConst func, this_arg, args[3];
-    JSValue val, index_val, res;
-    int len, k, end;
-    int dir;
-
-    val = JS_UNDEFINED;
-    len = js_typed_array_get_length_unsafe(ctx, this_val);
-    if (len < 0)
-        goto exception;
-
-    func = argv[0];
-    if (check_function(ctx, func))
-        goto exception;
-
-    this_arg = JS_UNDEFINED;
-    if (argc > 1)
-        this_arg = argv[1];
-
-    k = 0;
-    dir = 1;
-    end = len;
-    if (mode == ArrayFindLast || mode == ArrayFindLastIndex) {
-        k = len - 1;
-        dir = -1;
-        end = -1;
-    }
-
-    for(; k != end; k += dir) {
-        index_val = js_int32(k);
-        val = JS_GetPropertyValue(ctx, this_val, index_val);
-        if (JS_IsException(val))
-            goto exception;
-        args[0] = val;
-        args[1] = index_val;
-        args[2] = this_val;
-        res = JS_Call(ctx, func, this_arg, 3, args);
-        if (JS_IsException(res))
-            goto exception;
-        if (JS_ToBoolFree(ctx, res)) {
-            if (mode == ArrayFindIndex || mode == ArrayFindLastIndex) {
-                JS_FreeValue(ctx, val);
-                return index_val;
-            } else {
-                return val;
-            }
-        }
-        JS_FreeValue(ctx, val);
-    }
-    if (mode == ArrayFindIndex || mode == ArrayFindLastIndex)
-        return js_int32(-1);
-    else
-        return JS_UNDEFINED;
-
-exception:
-    JS_FreeValue(ctx, val);
-    return JS_EXCEPTION;
-}
 
 #define special_indexOf 0
 #define special_lastIndexOf 1
@@ -68052,10 +68033,10 @@ static const JSCFunctionListEntry js_typed_array_base_proto_funcs[] = {
     JS_CFUNC_STEP_DEF("reduce", 1, STEPDEF_TA_REDUCE ),
     JS_CFUNC_STEP_DEF("reduceRight", 1, STEPDEF_TA_REDUCE_RIGHT ),
     JS_CFUNC_DEF("fill", 1, js_typed_array_fill ),
-    JS_CFUNC_MAGIC_DEF("find", 1, js_typed_array_find, ArrayFind ),
-    JS_CFUNC_MAGIC_DEF("findIndex", 1, js_typed_array_find, ArrayFindIndex ),
-    JS_CFUNC_MAGIC_DEF("findLast", 1, js_typed_array_find, ArrayFindLast ),
-    JS_CFUNC_MAGIC_DEF("findLastIndex", 1, js_typed_array_find, ArrayFindLastIndex ),
+    JS_CFUNC_STEP_DEF("find", 1, STEPDEF_TA_FIND ),
+    JS_CFUNC_STEP_DEF("findIndex", 1, STEPDEF_TA_FIND_INDEX ),
+    JS_CFUNC_STEP_DEF("findLast", 1, STEPDEF_TA_FIND_LAST ),
+    JS_CFUNC_STEP_DEF("findLastIndex", 1, STEPDEF_TA_FIND_LAST_INDEX ),
     JS_CFUNC_DEF("reverse", 0, js_typed_array_reverse ),
     JS_CFUNC_DEF("toReversed", 0, js_typed_array_toReversed ),
     JS_CFUNC_DEF("slice", 2, js_typed_array_slice ),
