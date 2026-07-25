@@ -18040,6 +18040,12 @@ typedef struct JSStepHdr {
     JSValue this_val;    /* the receiver; new_target for a constructor step */
     JSValue func_obj;    /* the callee — a closure step machine reads its func_data record through this */
     JSValue *argv;       /* argc owned values, in the tail of the state's own allocation */
+    /* A prologue's in-flight coercion. `coerce` is the operand it handed to ToPrimitive (owned across the
+       suspension, because the machine's C locals are gone when it resumes); cb_coerce is the one-element request
+       buffer holding a borrowed view of it. Every prologue that coerces needs exactly this pair, so it lives in
+       the header rather than being re-declared in each state. */
+    JSValue coerce;
+    JSValue cb_coerce[1];
 } JSStepHdr;
 /* The argument vector lives after the state in ONE allocation: a machine's arguments are exactly as long-lived as
    the machine, and a second allocation is a second free to forget. */
@@ -18081,12 +18087,41 @@ static inline JSValueConst step_arg(const JSStepHdr *h, int i)
     return i < h->argc ? h->argv[i] : JS_UNDEFINED;
 }
 
+/* LengthOfArrayLike as two steps. Get(obj,"length") stays C — an ACCESSOR there is a separate unbuilt route —
+   but ToLength on an object result runs a user valueOf/toString/@@toPrimitive, and from a C prologue a loop in
+   that method hits "@WHY loop preempted in a NON-coroutine activation": its C entry never became a flow base.
+   Returns 1 = the caller must `return 5`, 0 = *plen is filled, -1 = threw. */
+static int step_length_begin(JSContext *ctx, JSStepHdr *h, JSValueConst obj, int64_t *plen,
+                             JSValue **out_cb, int *out_argc)
+{
+    JSValue v = JS_GetProperty(ctx, obj, JS_ATOM_length);
+    if (JS_IsException(v))
+        return -1;
+    if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT) {
+        h->coerce = v;             /* owned until the primitive comes back */
+        h->cb_coerce[0] = v;       /* borrowed view — the request buffer never owns */
+        *out_cb = h->cb_coerce; *out_argc = HINT_NUMBER;
+        return 1;
+    }
+    return JS_ToLengthFree(ctx, plen, v);
+}
+
+/* the resumption: `prim` is the settled primitive, consumed here. */
+static int step_length_end(JSContext *ctx, JSStepHdr *h, JSValue prim, int64_t *plen)
+{
+    JS_FreeValue(ctx, h->coerce);
+    h->coerce = JS_UNDEFINED;
+    return JS_ToLengthFree(ctx, plen, prim);
+}
+
 static JSValue tramp_step_state_free(JSContext *ctx, void *st, bool take_result)
 {
     JSStepHdr *h = st;
     int i;
     JS_FreeValue(ctx, h->this_val);
     JS_FreeValue(ctx, h->func_obj);
+    JS_FreeValue(ctx, h->coerce);   /* set only while a prologue coercion is in flight */
+    h->coerce = JS_UNDEFINED;
     for (i = 0; i < h->argc; i++)
         JS_FreeValue(ctx, h->argv[i]);
     h->argc = 0;                     /* fini frees the block; nothing may read the captures after this */
@@ -18097,14 +18132,14 @@ static JSValue tramp_step_state_free(JSContext *ctx, void *st, bool take_result)
 enum { ArrayFind, ArrayFindIndex, ArrayFindLast, ArrayFindLastIndex };
 /* ORed into the find family's mode for the TypedArray receivers. The find STEP is already receiver-agnostic (it
    reads elements with JS_GetPropertyValue, which serves both), so the whole difference is how the length is
-   obtained — the same split js_array_every_init makes with special_TA, and the reason a separate
+   obtained — the same split js_array_every_recv makes with special_TA, and the reason a separate
    js_typed_array_find C loop never had to exist. That loop drove its callback with JS_Call, so a callback that
    loops preempted in a C activation with no flow base. */
 #define FIND_TA 8
 typedef struct JSArrayFind {
     JSStepHdr hdr;           /* MUST be first: the generic driver casts the state to JSStepHdr * */
     JSValue obj, func, this_arg, val, result;
-    int64_t k, end;
+    int64_t len, k, end;
     int dir, mode;
     uint8_t cb_pending;
     JSValue cb_args[5];      /* [thisArg, fn, val, index, receiver] */
@@ -18736,8 +18771,6 @@ typedef struct JSArrayEvery {
    CONTINUATION-HOLDING re-entrant. They are a step machine, so that drive runs on the tramp chain: each callback
    is a NORMAL frame carrying the state, so it runs with gen_state == the base and a callback BODY LOOP preempts
    the base flow — never a C-recursive JS_Call that could only drive to completion. */
-static int js_array_every_init(JSContext *ctx, struct JSArrayEvery *s, JSValueConst this_val,
-                               int argc, JSValueConst *argv, int special);
 static int js_array_every_step(JSContext *ctx, struct JSArrayEvery *s, JSValue res, JSValueConst out_args[3]);
 static void js_array_every_end(JSContext *ctx, struct JSArrayEvery *s, bool take_ret);
 /* reduce/reduceRight: the same continuation-holding shape as js_array_every, with the accumulator as the state. */
@@ -18749,8 +18782,6 @@ typedef struct JSArrayReduce {
     JSValueConst func;
     JSValue cb_args[6];          /* [this=undefined, func, acc, val, index, obj]; call_argv = &cb_args[2], argc=4 */
 } JSArrayReduce;
-static int js_array_reduce_init(JSContext *ctx, struct JSArrayReduce *s, JSValueConst this_val,
-                                int argc, JSValueConst *argv, int special);
 static int js_array_reduce_step(JSContext *ctx, struct JSArrayReduce *s, JSValue acc1, JSValueConst out_args[4]);
 /* Array.from(GENERATOR): CONSUME the generator on the tramp chain — each .next() runs the generator body HERE so
    a body loop suspend/resumes at any depth, never the C-recursion drive-to-completion js_array_from's loop uses.
@@ -18972,7 +19003,6 @@ typedef struct JSArraySort {
     uint8_t pending;                /* a cmp(array[l],array[r]) result is awaited */
     JSValue cb_args[4];             /* [this=undefined, method, array[l].val, array[r].val]; call_argv=&cb_args[2], argc=2 */
 } JSArraySort;
-static int js_array_sort_init(JSContext *ctx, struct JSArraySort *s, JSValueConst this_val, JSValueConst method);
 static int js_array_sort_step(JSContext *ctx, struct JSArraySort *s, JSValue res, JSValueConst out_args[2]);
 static JSValue js_array_sort_end(JSContext *ctx, struct JSArraySort *s, bool ok);
 static int js_array_sort_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
@@ -21646,9 +21676,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 {
                     void *touter = tp->outer; uint8_t touter_kind = tp->outer_kind;
                     JS_FreeValue(ctx, tp->obj); js_free_rt(rt, tp);
-                    if (touter) {   /* the machine that asked is abandoned with the coercion */
-                        DCHECK(touter_kind == CONT_STEP, "ToPrimitive outer continuation: unknown machine kind");
-                        tramp_step_state_free(ctx, touter, false);
+                    /* the machine that asked goes with the coercion, and so do the machines waiting on IT —
+                       `[x].map(String)` is an outer waiting on an inner that asked for a primitive. */
+                    DCHECK(!touter || touter_kind == CONT_STEP,
+                           "ToPrimitive outer continuation: unknown machine kind");
+                    while (touter) {
+                        JSStepHdr *oh = touter; touter = oh->outer;
+                        tramp_step_state_free(ctx, oh, false);
                     }
                     goto exception;
                 }
@@ -26338,11 +26372,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             /* the coercion method THREW: 7.1.1 propagates it (there is no next-method fallback on an abrupt
                completion), so drop the sequence state and re-raise in the operator's frame. */
             JSToPrim *tp = xcs;
+            void *touter = tp->outer;
+            uint8_t touter_kind = tp->outer_kind;   /* read BEFORE the free — tp is gone below */
             JSValue *cargv = sp - xcg;
             for (i = xcf; i < xcg; i++) JS_FreeValue(ctx, cargv[i]);
             sp += xcf - xcg;
             JS_FreeValue(ctx, tp->obj);
             js_free_rt(rt, tp);
+            /* A coercion requested BY A MACHINE goes with it — the machine is waiting on a primitive that will
+               never arrive, and nothing else will ever reach its state again. Dropping only the JSToPrim leaked
+               the machine, and with it hdr.argv (the callback closure) and hdr.func_obj, which retain the realm:
+               353 objects for `String({valueOf(){throw}, toString(){throw}})`. The toprim_throw label already
+               did this for a throw raised inside the sequence's own C code; a throw from the USER's method
+               unwinds through HERE instead, and the two paths had drifted. */
+            DCHECK(!touter || touter_kind == CONT_STEP,
+                   "ToPrimitive outer continuation: unknown machine kind");
+            while (touter) {
+                JSStepHdr *oh = touter; touter = oh->outer;
+                tramp_step_state_free(ctx, oh, false);
+            }
             goto exception;
         } else if (xck == CONT_FOROF_NEXT) {
             /* the plain iterator's .next() THREW. js_for_of_next's own abrupt handling: clear the enum_rec's
@@ -50002,29 +50050,33 @@ done:
 
 /* The PROLOGUE (obj/len/func/this_arg + the per-special `ret` seed), run as step 0. Returns 0 = ok,
    -1 = exception (the state is safe to js_array_every_end either way). */
-static int js_array_every_init(JSContext *ctx, JSArrayEvery *s, JSValueConst this_val,
-                               int argc, JSValueConst *argv, int special)
+/* The receiver half of the prologue: a TypedArray validates and yields its length with no user code; a plain
+   array-like needs LengthOfArrayLike, whose ToLength is a step, so the length arrives separately. */
+static int js_array_every_recv(JSContext *ctx, JSArrayEvery *s)
+{
+    s->obj = JS_UNDEFINED; s->ret = JS_UNDEFINED; s->val = JS_UNDEFINED;
+    s->len = 0; s->k = 0; s->n = 0; s->special = s->hdr.arg; s->pending_k = -1;
+    if (s->special & special_TA) {
+        s->obj = js_dup(s->hdr.this_val);
+        s->len = js_typed_array_get_length_unsafe(ctx, s->obj);
+        return s->len < 0 ? -1 : 0;
+    }
+    s->obj = JS_ToObject(ctx, s->hdr.this_val);
+    if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
+    return 0;
+}
+
+/* Everything after the length: the callback check and the per-special `ret` seed. */
+static int js_array_every_seed(JSContext *ctx, JSArrayEvery *s)
 {
     JSValueConst args[2];
 
-    s->obj = JS_UNDEFINED; s->ret = JS_UNDEFINED; s->val = JS_UNDEFINED;
-    s->len = 0; s->k = 0; s->n = 0; s->special = special; s->pending_k = -1;
-    if (special & special_TA) {
-        s->obj = js_dup(this_val);
-        s->len = js_typed_array_get_length_unsafe(ctx, s->obj);
-        if (s->len < 0)
-            return -1;
-    } else {
-        s->obj = JS_ToObject(ctx, this_val);
-        if (js_get_length64(ctx, &s->len, s->obj))
-            return -1;
-    }
-    s->func = (argc > 0) ? argv[0] : JS_UNDEFINED;
-    s->this_arg = (argc > 1) ? argv[1] : JS_UNDEFINED;
+    s->func = step_arg(&s->hdr, 0);
+    s->this_arg = step_arg(&s->hdr, 1);
     if (check_function(ctx, s->func))
         return -1;
 
-    switch (special) {
+    switch (s->special) {
     case special_every:
     case special_every | special_TA:
         s->ret = JS_TRUE;
@@ -50073,12 +50125,25 @@ static int js_array_every_vstep(JSContext *ctx, void *st, JSValue cb_result, JSV
 {
     JSArrayEvery *s = st;
     int r;
-    if (s->hdr.stage == 0) {   /* the prologue: obj/len/func/this_arg + the per-special `ret` seed */
-        s->hdr.stage = 1;
+    if (s->hdr.stage == 0) {
+        s->hdr.stage = 2;
         JS_FreeValue(ctx, cb_result);
         cb_result = JS_UNDEFINED;
-        if (js_array_every_init(ctx, s, s->hdr.this_val, s->hdr.argc,
-                                (JSValueConst *)s->hdr.argv, s->hdr.arg))
+        if (js_array_every_recv(ctx, s))
+            return -1;
+        if (!(s->hdr.arg & special_TA)) {
+            r = step_length_begin(ctx, &s->hdr, s->obj, &s->len, out_cb, out_argc);
+            if (r < 0) return -1;
+            if (r == 1) { s->hdr.stage = 1; return 5; }
+        }
+        if (js_array_every_seed(ctx, s))
+            return -1;
+    } else if (s->hdr.stage == 1) {   /* the length's ToLength settled */
+        s->hdr.stage = 2;
+        if (step_length_end(ctx, &s->hdr, cb_result, &s->len))
+            return -1;
+        cb_result = JS_UNDEFINED;
+        if (js_array_every_seed(ctx, s))
             return -1;
     }
     r = js_array_every_step(ctx, s, cb_result, (JSValueConst *)&s->cb_args[2]);   /* consumes cb_result */
@@ -50105,27 +50170,31 @@ static JSValue js_array_every_vfini(JSContext *ctx, void *st, bool take_result)
 #define special_reduce       0
 #define special_reduceRight  1
 
-/* Seed the accumulator: argv[1] if given, else the first present element (spec: empty + no seed -> TypeError). */
-static int js_array_reduce_init(JSContext *ctx, JSArrayReduce *s, JSValueConst this_val,
-                                int argc, JSValueConst *argv, int special)
+static int js_array_reduce_recv(JSContext *ctx, JSArrayReduce *s)
 {
+    s->obj = JS_UNDEFINED; s->acc = JS_UNDEFINED; s->val = JS_UNDEFINED;
+    s->len = 0; s->k = 0; s->special = s->hdr.arg; s->pending = 0;
+    if (s->special & special_TA) {
+        s->obj = js_dup(s->hdr.this_val);
+        s->len = js_typed_array_get_length_unsafe(ctx, s->obj);
+        return s->len < 0 ? -1 : 0;
+    }
+    s->obj = JS_ToObject(ctx, s->hdr.this_val);
+    if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
+    return 0;
+}
+
+/* Seed the accumulator: argv[1] if given, else the first present element (spec: empty + no seed -> TypeError). */
+static int js_array_reduce_seed(JSContext *ctx, JSArrayReduce *s)
+{
+    int special = s->special;
     int64_t k1;
     int present;
 
-    s->obj = JS_UNDEFINED; s->acc = JS_UNDEFINED; s->val = JS_UNDEFINED;
-    s->len = 0; s->k = 0; s->special = special; s->pending = 0;
-    if (special & special_TA) {
-        s->obj = js_dup(this_val);
-        s->len = js_typed_array_get_length_unsafe(ctx, s->obj);
-        if (s->len < 0) return -1;
-    } else {
-        s->obj = JS_ToObject(ctx, this_val);
-        if (js_get_length64(ctx, &s->len, s->obj)) return -1;
-    }
-    s->func = (argc > 0) ? argv[0] : JS_UNDEFINED;
+    s->func = step_arg(&s->hdr, 0);
     if (check_function(ctx, s->func)) return -1;
-    if (argc > 1) {
-        s->acc = js_dup(argv[1]);
+    if (s->hdr.argc > 1) {
+        s->acc = js_dup(s->hdr.argv[1]);
         return 0;
     }
     for (;;) {
@@ -50134,7 +50203,7 @@ static int js_array_reduce_init(JSContext *ctx, JSArrayReduce *s, JSValueConst t
         s->k++;
         if (special & special_TA) {
             s->acc = JS_GetPropertyInt64(ctx, s->obj, k1);
-            if (JS_IsException(s->acc)) return -1;
+            if (JS_IsException(s->acc)) { s->acc = JS_UNDEFINED; return -1; }
             return 0;
         }
         present = JS_TryGetPropertyInt64(ctx, s->obj, k1, &s->acc);
@@ -50191,19 +50260,32 @@ static void js_array_reduce_end(JSContext *ctx, JSArrayReduce *s, bool take_acc)
     s->acc = JS_UNDEFINED; s->val = JS_UNDEFINED; s->obj = JS_UNDEFINED;
 }
 
-/* reduce/reduceRight (+ TypedArray twins) as a STEP builtin. js_array_reduce_init/step/end already existed and
+/* reduce/reduceRight (+ TypedArray twins) as a STEP builtin. js_array_reduce_recv/seed/step/end and
    the C function was nothing but a JS_Call driver loop over them — the second, non-suspending driver. Deleted, so
    the machine has ONE driver and tramp_can_call_array_reduce has nothing left to choose against. */
 static int js_array_reduce_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSArrayReduce *s = st;
     int r;
-    if (s->hdr.stage == 0) {   /* the prologue: obj/len/func + the accumulator seed */
-        s->hdr.stage = 1;
+    if (s->hdr.stage == 0) {
+        s->hdr.stage = 2;
         JS_FreeValue(ctx, cb_result);
         cb_result = JS_UNDEFINED;
-        if (js_array_reduce_init(ctx, s, s->hdr.this_val, s->hdr.argc,
-                                 (JSValueConst *)s->hdr.argv, s->hdr.arg))
+        if (js_array_reduce_recv(ctx, s))
+            return -1;
+        if (!(s->hdr.arg & special_TA)) {
+            r = step_length_begin(ctx, &s->hdr, s->obj, &s->len, out_cb, out_argc);
+            if (r < 0) return -1;
+            if (r == 1) { s->hdr.stage = 1; return 5; }
+        }
+        if (js_array_reduce_seed(ctx, s))
+            return -1;
+    } else if (s->hdr.stage == 1) {   /* the length's ToLength settled */
+        s->hdr.stage = 2;
+        if (step_length_end(ctx, &s->hdr, cb_result, &s->len))
+            return -1;
+        cb_result = JS_UNDEFINED;
+        if (js_array_reduce_seed(ctx, s))
             return -1;
     }
     r = js_array_reduce_step(ctx, s, cb_result, (JSValueConst *)&s->cb_args[2]);   /* consumes cb_result */
@@ -50420,27 +50502,28 @@ static void js_array_find_end(JSContext *ctx, JSArrayFind *s, bool take_result)
     JS_FreeValue(ctx, s->val);
 }
 
-static int js_array_find_prologue(JSContext *ctx, JSArrayFind *s)
+static int js_array_find_recv(JSContext *ctx, JSArrayFind *s)
 {
-    int mode = s->hdr.arg;
-    int64_t len;
-
-    if (mode & FIND_TA) {
+    if (s->hdr.arg & FIND_TA) {
         s->obj = js_dup(s->hdr.this_val);   /* js_typed_array_get_length_unsafe VALIDATES the receiver + its length */
-        len = js_typed_array_get_length_unsafe(ctx, s->obj);
-        if (len < 0) return -1;
-    } else {
-        s->obj = JS_ToObject(ctx, s->hdr.this_val);
-        if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
-        if (js_get_length64(ctx, &len, s->obj)) return -1;
+        s->len = js_typed_array_get_length_unsafe(ctx, s->obj);
+        return s->len < 0 ? -1 : 0;
     }
+    s->obj = JS_ToObject(ctx, s->hdr.this_val);
+    if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
+    return 0;
+}
+
+static int js_array_find_seed(JSContext *ctx, JSArrayFind *s)
+{
+    int mode = s->hdr.arg & ~FIND_TA;   /* only the length differed; every later test is on the plain mode */
+
     if (s->hdr.argc < 1 || check_function(ctx, s->hdr.argv[0])) return -1;
-    mode &= ~FIND_TA;   /* only the length differed; every later test is on the plain mode */
     s->func = js_dup(s->hdr.argv[0]);
     s->this_arg = js_dup(step_arg(&s->hdr, 1));
     s->mode = mode;
-    if (mode == ArrayFindLast || mode == ArrayFindLastIndex) { s->k = len - 1; s->dir = -1; s->end = -1; }
-    else                                                     { s->k = 0;       s->dir = 1;  s->end = len; }
+    if (mode == ArrayFindLast || mode == ArrayFindLastIndex) { s->k = s->len - 1; s->dir = -1; s->end = -1; }
+    else                                                     { s->k = 0;          s->dir = 1;  s->end = s->len; }
     return 0;
 }
 
@@ -50450,10 +50533,25 @@ static int js_array_find_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
     bool is_index;
 
     if (s->hdr.stage == 0) {
-        s->hdr.stage = 1;
+        int lr;
+        s->hdr.stage = 2;
         JS_FreeValue(ctx, cb_result);
         cb_result = JS_UNDEFINED;
-        if (js_array_find_prologue(ctx, s))
+        if (js_array_find_recv(ctx, s))
+            return -1;
+        if (!(s->hdr.arg & FIND_TA)) {
+            lr = step_length_begin(ctx, &s->hdr, s->obj, &s->len, out_cb, out_argc);
+            if (lr < 0) return -1;
+            if (lr == 1) { s->hdr.stage = 1; return 5; }
+        }
+        if (js_array_find_seed(ctx, s))
+            return -1;
+    } else if (s->hdr.stage == 1) {   /* the length's ToLength settled */
+        s->hdr.stage = 2;
+        if (step_length_end(ctx, &s->hdr, cb_result, &s->len))
+            return -1;
+        cb_result = JS_UNDEFINED;
+        if (js_array_find_seed(ctx, s))
             return -1;
     }
     is_index = (s->mode == ArrayFindIndex || s->mode == ArrayFindLastIndex);
@@ -51340,15 +51438,25 @@ exception:
 
 /* read the present, non-undefined elements into s->array (undefined -> the end, holes -> after that), alloc tmp,
    set up the first merge block. Returns 0 ok / -1 exception (safe to js_array_sort_end). */
-static int js_array_sort_init(JSContext *ctx, JSArraySort *s, JSValueConst this_val, JSValueConst method)
+/* The receiver half. `method` is hdr.argv[0] — owned by the header for the machine's whole life, which is why
+   the state can borrow it. */
+static int js_array_sort_recv(JSContext *ctx, JSArraySort *s)
 {
-    int64_t i, pos = 0; int present;
-    s->obj = JS_UNDEFINED; s->method = method; s->array = NULL; s->tmp = NULL;
+    int64_t i;
+    s->obj = JS_UNDEFINED; s->method = step_arg(&s->hdr, 0); s->array = NULL; s->tmp = NULL;
     s->n = 0; s->len = 0; s->undefined_count = 0; s->pending = 0;
     s->width = 1; s->i = 0; s->lo = s->mid = s->hi = s->l = s->r = s->k = 0;
     for (i = 0; i < 4; i++) s->cb_args[i] = JS_UNDEFINED;
-    s->obj = JS_ToObject(ctx, this_val);
-    if (js_get_length64(ctx, &s->len, s->obj)) return -1;
+    s->obj = JS_ToObject(ctx, s->hdr.this_val);
+    if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
+    return 0;
+}
+
+/* Collect the present, non-undefined elements into the merge array. Runs after the length, so it is its own
+   function rather than the tail of an init. */
+static int js_array_sort_collect(JSContext *ctx, JSArraySort *s)
+{
+    int64_t i, pos = 0; int present;
     if (s->len > 0) {
         s->array = js_malloc(ctx, (size_t)s->len * sizeof(ValueSlot));
         if (!s->array) return -1;
@@ -51487,54 +51595,41 @@ fail2:
    the default-comparison branch in js_array_sort_step there is no case left for a C body to serve. */
 /* sort and toSorted are ONE machine: same comparator drive, same merge, same writeback. The only difference is
    WHAT is sorted — the receiver, or a dense copy of it — so it is the prologue that branches on hdr.arg, not a
-   second machine. (toSorted does not use Array[@@species]; it always yields a base Array.) */
-static int js_array_sort_prologue(JSContext *ctx, JSArraySort *s)
+   second machine. (toSorted does not use Array[@@species]; it always yields a base Array.) The prologue is in
+   three stages because LengthOfArrayLike sits in the middle of it and its ToLength can run user code. */
+static int js_array_sort_copy(JSContext *ctx, JSArraySort *s)
 {
-    JSValueConst method = step_arg(&s->hdr, 0);
-    JSValue arr, obj, *arrp, *pval;
+    JSValue arr, *arrp, *pval;
     JSObject *p;
-    int64_t i, len;
+    int64_t i, len = s->len;
     uint32_t count32;
-    int r;
-
-    if (!JS_IsUndefined(method) && check_function(ctx, method))
-        return -1;   /* spec: a non-callable comparator throws BEFORE anything is read */
-    if (!s->hdr.arg)
-        return js_array_sort_init(ctx, s, s->hdr.this_val, method);
 
     /* toSorted: a.slice().sort(), except that a.slice() leaves holes in a sparse array intact whereas
        a.toSorted() replaces them with undefined — so the copy is built dense here. */
-    obj = JS_ToObject(ctx, s->hdr.this_val);
-    if (JS_IsException(obj))
-        return -1;
-    if (js_get_length64(ctx, &len, obj)) { JS_FreeValue(ctx, obj); return -1; }
-
     arr = js_allocate_fast_array(ctx, len);
-    if (JS_IsException(arr)) { JS_FreeValue(ctx, obj); return -1; }
-
+    if (JS_IsException(arr))
+        return -1;
     if (len > 0) {
         p = JS_VALUE_GET_OBJ(arr);
         i = 0;
         pval = p->u.array.u.values;
-        if (js_get_fast_array(ctx, obj, &arrp, &count32) && count32 == len) {
+        if (js_get_fast_array(ctx, s->obj, &arrp, &count32) && count32 == len) {
             for (; i < len; i++, pval++)
                 *pval = js_dup(arrp[i]);
         } else {
             for (; i < len; i++, pval++) {
-                if (-1 == JS_TryGetPropertyInt64(ctx, obj, i, pval)) {
+                if (-1 == JS_TryGetPropertyInt64(ctx, s->obj, i, pval)) {
                     p->u.array.count = i;   /* only the slots written so far are initialised */
-                    JS_FreeValue(ctx, arr); JS_FreeValue(ctx, obj);
+                    JS_FreeValue(ctx, arr);
                     return -1;
                 }
             }
         }
         p->u.array.count = len;
     }
-    JS_FreeValue(ctx, obj);
-
-    r = js_array_sort_init(ctx, s, arr, method);
-    JS_FreeValue(ctx, arr);   /* js_array_sort_init took its own ref via JS_ToObject */
-    return r;
+    JS_FreeValue(ctx, s->obj);
+    s->obj = arr;   /* the sort, the writeback and the result are all the copy from here on */
+    return 0;
 }
 
 static int js_array_sort_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
@@ -51542,11 +51637,26 @@ static int js_array_sort_vstep(JSContext *ctx, void *st, JSValue cb_result, JSVa
     JSArraySort *s = st;
     int r;
     if (s->hdr.stage == 0) {
-        s->hdr.stage = 1;
+        JSValueConst method = step_arg(&s->hdr, 0);
+        s->hdr.stage = 2;
         JS_FreeValue(ctx, cb_result);
         cb_result = JS_UNDEFINED;
-        if (js_array_sort_prologue(ctx, s))
+        if (!JS_IsUndefined(method) && check_function(ctx, method))
+            return -1;   /* spec: a non-callable comparator throws BEFORE anything is read */
+        if (js_array_sort_recv(ctx, s))
             return -1;
+        r = step_length_begin(ctx, &s->hdr, s->obj, &s->len, out_cb, out_argc);
+        if (r < 0) return -1;
+        if (r == 1) { s->hdr.stage = 1; return 5; }
+        if (s->hdr.arg && js_array_sort_copy(ctx, s)) return -1;
+        if (js_array_sort_collect(ctx, s)) return -1;
+    } else if (s->hdr.stage == 1) {   /* the length's ToLength settled */
+        s->hdr.stage = 2;
+        if (step_length_end(ctx, &s->hdr, cb_result, &s->len))
+            return -1;
+        cb_result = JS_UNDEFINED;
+        if (s->hdr.arg && js_array_sort_copy(ctx, s)) return -1;
+        if (js_array_sort_collect(ctx, s)) return -1;
     }
     r = js_array_sort_step(ctx, s, cb_result, (JSValueConst *)&s->cb_args[2]);   /* consumes cb_result */
     if (r < 0) return -1;
@@ -67968,14 +68078,17 @@ static void js_ta_slice_end(JSContext *ctx, JSTASlice *s, bool take_result)
 }
 
 /* Request ToPrimitive on hdr.argv[i] when it is an object, so a user valueOf on `start` or `end` SUSPENDS.
-   This is what init-as-step-0 buys: the coercions the spec puts in front of the copy are now ordinary steps. */
+   This is what init-as-step-0 buys: the coercions the spec puts in front of the copy are now ordinary steps.
+   The request goes in the header's cb_coerce, NEVER in cb_args: cb_args[0] is the species constructor, which
+   js_ta_slice_end FREES as owned, so parking a borrowed operand there over-freed the caller's object the moment
+   the abrupt path started tearing the state down (it used to leak instead, which hid it). */
 static bool ta_slice_toprim(JSTASlice *s, int i, JSValue **out_cb, int *out_argc)
 {
     JSValueConst v = step_arg(&s->hdr, i);
     if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
         return false;
-    s->cb_args[0] = (JSValue)v;   /* borrowed: the header holds the reference */
-    *out_cb = s->cb_args; *out_argc = HINT_NUMBER;
+    s->hdr.cb_coerce[0] = (JSValue)v;   /* borrowed: hdr.argv holds the reference */
+    *out_cb = s->hdr.cb_coerce; *out_argc = HINT_NUMBER;
     return true;
 }
 
