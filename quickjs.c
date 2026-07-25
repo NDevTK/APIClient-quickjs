@@ -1622,6 +1622,7 @@ static JSValue js_call_c_function_data(JSContext *ctx, JSValueConst func_obj,
                                        JSValueConst this_val,
                                        int argc, JSValueConst *argv, int flags);
 static void js_c_closure_finalizer(JSRuntime *rt, JSValueConst val);
+static void js_c_closure_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func);
 static JSValue js_call_c_closure(JSContext *ctx, JSValueConst func_obj,
                                  JSValueConst this_val,
                                  int argc, JSValueConst *argv, int flags);
@@ -2332,7 +2333,7 @@ static JSClassShortDef const js_std_class_def[] = {
     { JS_ATOM_Function, js_bytecode_function_finalizer, js_bytecode_function_mark }, /* JS_CLASS_BYTECODE_FUNCTION */
     { JS_ATOM_Function, js_bound_function_finalizer, js_bound_function_mark }, /* JS_CLASS_BOUND_FUNCTION */
     { JS_ATOM_Function, js_c_function_data_finalizer, js_c_function_data_mark }, /* JS_CLASS_C_FUNCTION_DATA */
-    { JS_ATOM_Function, js_c_closure_finalizer, NULL},                           /* JS_CLASS_C_CLOSURE */
+    { JS_ATOM_Function, js_c_closure_finalizer, js_c_closure_mark },             /* JS_CLASS_C_CLOSURE */
     { JS_ATOM_GeneratorFunction, js_bytecode_function_finalizer, js_bytecode_function_mark },  /* JS_CLASS_GENERATOR_FUNCTION */
     { JS_ATOM_ForInIterator, js_for_in_iterator_finalizer, js_for_in_iterator_mark },      /* JS_CLASS_FOR_IN_ITERATOR */
     { JS_ATOM_RegExp, js_regexp_finalizer, NULL },                              /* JS_CLASS_REGEXP */
@@ -6768,6 +6769,11 @@ typedef struct JSCFunctionDataRecord {
        resolve/reject) on the tramp so that callback's loop parks. tramp_step_def_of returns it; the closure is then
        dispatched through do_step_tramp exactly like a JS_CFUNC_step C function. NULL for an ordinary closure. */
     const struct JSTrampStepDef *step_def;
+    /* The realm the closure was created in. js_call_c_function switches to the callee's before running a C
+       builtin and these two entries carried an upstream TODO instead — so a Promise reaction, an async-generator
+       resolve function or a module-evaluation callback built its intrinsics out of whatever realm happened to be
+       CALLING it. Same fix, same reason, and it is what lets a closure step machine name its own realm. */
+    JSContext *realm;
     JSValue data[];
 } JSCFunctionDataRecord;
 
@@ -6780,6 +6786,8 @@ static void js_c_function_data_finalizer(JSRuntime *rt, JSValueConst val)
         for(i = 0; i < s->data_len; i++) {
             JS_FreeValueRT(rt, s->data[i]);
         }
+        if (s->realm)
+            JS_FreeContext(s->realm);
         js_free_rt(rt, s);
     }
 }
@@ -6794,6 +6802,8 @@ static void js_c_function_data_mark(JSRuntime *rt, JSValueConst val,
         for(i = 0; i < s->data_len; i++) {
             JS_MarkValue(rt, s->data[i], mark_func);
         }
+        if (s->realm)
+            mark_func(rt, &s->realm->header);
     }
 }
 
@@ -6828,7 +6838,8 @@ static JSValue js_call_c_function_data(JSContext *ctx, JSValueConst func_obj,
     prev_sf = rt->current_stack_frame;
     sf->prev_frame = prev_sf;
     rt->current_stack_frame = sf;
-    // TODO(bnoordhuis) switch realms like js_call_c_function does
+    DCHECK(s->realm != NULL, "a C closure with no realm: every creation path must record one");
+    ctx = s->realm;   /* change the current realm, exactly as js_call_c_function does */
     sf->is_strict_mode = false;
     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
     sf->cur_func = unsafe_unconst(func_obj);
@@ -6862,6 +6873,7 @@ JSValue JS_NewCFunctionData2(JSContext *ctx, JSCFunctionData *func,
     s->data_len = data_len;
     s->magic = magic;
     s->step_def = NULL;   /* ordinary closure; a step-machine reaction sets this after creation */
+    s->realm = JS_DupContext(ctx);
     for(i = 0; i < data_len; i++)
         s->data[i] = js_dup(data[i]);
     JS_SetOpaqueInternal(func_obj, s);
@@ -6912,7 +6924,17 @@ typedef struct JSCClosureRecord {
     uint16_t magic;
     void *opaque;
     void (*opaque_finalize)(void *opaque);
+    JSContext *realm;   /* as for JSCFunctionDataRecord above */
 } JSCClosureRecord;
+
+/* the realm is a GC-visible reference, so the class needs a mark function it did not have while the record held
+   nothing collectable. */
+static void js_c_closure_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func)
+{
+    JSCClosureRecord *s = JS_GetOpaque(val, JS_CLASS_C_CLOSURE);
+    if (s && s->realm)
+        mark_func(rt, &s->realm->header);
+}
 
 static void js_c_closure_finalizer(JSRuntime *rt, JSValueConst val)
 {
@@ -6921,7 +6943,8 @@ static void js_c_closure_finalizer(JSRuntime *rt, JSValueConst val)
     if (s) {
         if (s->opaque_finalize)
            s->opaque_finalize(s->opaque);
-
+        if (s->realm)
+            JS_FreeContext(s->realm);
         js_free_rt(rt, s);
     }
 }
@@ -6955,7 +6978,8 @@ static JSValue js_call_c_closure(JSContext *ctx, JSValueConst func_obj,
     prev_sf = rt->current_stack_frame;
     sf->prev_frame = prev_sf;
     rt->current_stack_frame = sf;
-    // TODO(bnoordhuis) switch realms like js_call_c_function does
+    DCHECK(s->realm != NULL, "a C closure with no realm: every creation path must record one");
+    ctx = s->realm;   /* change the current realm, exactly as js_call_c_function does */
     sf->is_strict_mode = false;
     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
     sf->cur_func = unsafe_unconst(func_obj);
@@ -6988,6 +7012,7 @@ JSValue JS_NewCClosure(JSContext *ctx, JSCClosure *func, const char *name,
     s->magic = magic;
     s->opaque = opaque;
     s->opaque_finalize = opaque_finalize;
+    s->realm = JS_DupContext(ctx);
     JS_SetOpaqueInternal(func_obj, s);
     name_atom = JS_ATOM_empty_string;
     if (name && *name) {
@@ -18188,14 +18213,19 @@ static inline JSValueConst step_arg(const JSStepHdr *h, int i)
    the same builtin — without this `new otherRealm.Function("")` builds its function, and its prototype, out of
    the CALLER's intrinsics. Seven realm tests in built-ins/Function are what noticed; every machine was running
    in the wrong realm, the Function constructor is just the first one for which that is observable. A CLOSURE
-   step machine (a Promise reaction, class JS_CLASS_C_FUNCTION_DATA) carries no realm of its own and runs in the
-   caller's, exactly as its non-machine counterpart did. */
+   step machine (a Promise reaction, class JS_CLASS_C_FUNCTION_DATA) names the realm recorded on its own data
+   record — the same one js_call_c_function_data now switches to. */
 static inline JSContext *step_realm(JSContext *ctx, const JSStepHdr *h)
 {
     if (JS_VALUE_GET_TAG(h->func_obj) == JS_TAG_OBJECT) {
         JSObject *p = JS_VALUE_GET_OBJ(h->func_obj);
         if (p->class_id == JS_CLASS_C_FUNCTION && p->u.cfunc.realm)
             return p->u.cfunc.realm;
+        if (p->class_id == JS_CLASS_C_FUNCTION_DATA) {
+            JSCFunctionDataRecord *cr = p->u.c_function_data_record;
+            if (cr && cr->realm)
+                return cr->realm;
+        }
     }
     return ctx;
 }
