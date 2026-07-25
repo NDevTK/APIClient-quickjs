@@ -17993,7 +17993,8 @@ static void close_lexical_var(JSContext *ctx, JSFunctionBytecode *b,
    builtin IS a step machine, declared with JS_CFUNC_STEP_DEF. This is NOT an allowlist: there is no JS_Call-loop
    implementation left for a missing row to fall back to, so a builtin either has a definition here or has none.
      init -> opaque state (NULL + pending exception on error)
-     step -> 0 = DONE (fini yields the result), 3 = CALL (*out_cb is [this, fn, args...]), -1 = error
+     step -> 0 = DONE (fini yields the result), 3 = CALL (*out_cb is [this, fn, args...]),
+             4 = CONSTRUCT (*out_cb is [ctor, args...]; the object returns as the next step's cb_result), -1 = error
      fini -> tear down; returns the result when take_result. */
 typedef struct JSTrampStepDef {
     /* func_obj is the CALLEE — for a plain C-function step machine it is that function (unused); for a
@@ -21090,6 +21091,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     *sp++ = r;
                     BREAK;
                 }
+                if (st == 4) {
+                    /* CONSTRUCT: *out_cb is [ctor, args...]. A builtin whose spec step is a real Construct —
+                       ArraySpeciesCreate / TypedArrayCreateFromConstructor — used to reach JS_CallConstructor from
+                       C, which drives a bytecode constructor to completion. With JSConstruct's outer continuation
+                       the object comes back to THIS step instead. A C constructor has no body to suspend and is
+                       constructed in place, the same split every callback drive makes. */
+                    if (tramp_can_construct(cb[0])) {
+                        con_func = cb[0]; con_ntgt = cb[0];
+                        con_args = (JSValueConst *)&cb[1]; con_argc = cbn;
+                        con_from_super = 0; con_super_ref = JS_UNDEFINED;
+                        con_outer = stt; con_outer_kind = CONT_STEP;
+                        tramp_first = 0; tramp_is_tail = 0;
+                        goto do_construct_tramp;
+                    }
+                    ret_val = JS_CallConstructor(ctx, cb[0], cbn, (JSValueConst *)&cb[1]);
+                    if (unlikely(JS_IsException(ret_val))) { h->def->fini(ctx, stt, false); goto exception; }
+                    cont_st = stt;
+                    goto do_step_step;
+                }
                 DCHECK(st == 3, "step builtin: unknown step code");
                 call_argv = (JSValueConst *)&cb[2];
                 call_argc = cbn; tramp_first = -2; tramp_is_tail = 0;
@@ -23160,8 +23180,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         sp += cfirst - cargc;
                         JS_FreeValue(ctx, super_ref);
                         cont_st = couter; cont_kind_cur = couter_kind;
-                        DCHECK(couter_kind == CONT_ITER_CONSUME, "construct outer continuation: unknown machine kind");
-                        goto do_iter_consume_step;
+                        if (couter_kind == CONT_ITER_CONSUME) goto do_iter_consume_step;
+                        DCHECK(couter_kind == CONT_STEP, "construct outer continuation: unknown machine kind");
+                        goto do_step_step;
                     }
                     if (from_super) {
                         /* super(): no operands on the caller stack — free the super ctor ref and push the bound
@@ -26173,9 +26194,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             if (cs->outer) {
                 /* the machine that requested this construct is abandoned with it — otherwise its collected array,
                    iterator and callback state leak on every throwing constructor. */
-                DCHECK(cs->outer_kind == CONT_ITER_CONSUME, "construct outer continuation: unknown machine kind");
-                js_iter_consume_end(ctx, (struct JSIterConsume *)cs->outer);
-                js_free_rt(rt, cs->outer);
+                if (cs->outer_kind == CONT_ITER_CONSUME) {
+                    js_iter_consume_end(ctx, (struct JSIterConsume *)cs->outer);
+                    js_free_rt(rt, cs->outer);
+                } else {
+                    DCHECK(cs->outer_kind == CONT_STEP, "construct outer continuation: unknown machine kind");
+                    ((JSStepHdr *)cs->outer)->def->fini(ctx, cs->outer, false);   /* fini OWNS the allocation */
+                }
             }
             js_free_rt(rt, cs);
         } else if (xck == CONT_SETTER) {
@@ -50302,8 +50327,13 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_TA_EVERY, STEPDEF_TA_SOME, STEPDEF_TA_FOREACH, STEPDEF_TA_MAP, STEPDEF_TA_FILTER,
     STEPDEF_ARRAY_REDUCE, STEPDEF_ARRAY_REDUCE_RIGHT, STEPDEF_TA_REDUCE, STEPDEF_TA_REDUCE_RIGHT,
     STEPDEF_ARRAY_SORT, STEPDEF_ARRAY_TOSORTED, STEPDEF_JSON_PARSE,
+    STEPDEF_TA_SLICE,
     STEPDEF_COUNT
 };
+static void *js_ta_slice_init(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv,
+                              int unused, JSValueConst func_obj);
+static int js_ta_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_ta_slice_fini(JSContext *ctx, void *st, bool take_result);
 /* One NAMED definition per builtin, referenced by its JS_CFUNC_STEP_DEF registration through the id above — the same shape as
    JS_CFUNC_MAGIC_DEF naming its C function, so the registration line tells you what runs. An index into a side
    table would be a second list to keep in sync and a magic number that silently repoints when a row is inserted. */
@@ -50330,6 +50360,7 @@ static const JSTrampStepDef js_ta_map_def          = { js_array_every_vinit, js_
 static const JSTrampStepDef js_array_sort_def    = { js_array_sort_vinit, js_array_sort_vstep, js_array_sort_vfini, 0 };
 static const JSTrampStepDef js_array_toSorted_def = { js_array_toSorted_vinit, js_array_sort_vstep, js_array_sort_vfini, 0 };
 static const JSTrampStepDef js_json_parse_def    = { js_json_parse_vinit, js_json_parse_vstep, js_json_parse_vfini, 0 };
+static const JSTrampStepDef js_ta_slice_def     = { js_ta_slice_init, js_ta_slice_step, js_ta_slice_fini, 0 };
 static const JSTrampStepDef js_array_reduce_def  = { js_array_reduce_vinit, js_array_reduce_vstep, js_array_reduce_vfini, special_reduce };
 static const JSTrampStepDef js_array_reduceR_def = { js_array_reduce_vinit, js_array_reduce_vstep, js_array_reduce_vfini, special_reduceRight };
 static const JSTrampStepDef js_ta_reduce_def     = { js_array_reduce_vinit, js_array_reduce_vstep, js_array_reduce_vfini, special_reduce | special_TA };
@@ -50358,6 +50389,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_TA_FILTER]     = &js_ta_filter_def,
     [STEPDEF_ARRAY_SORT]    = &js_array_sort_def,   [STEPDEF_ARRAY_TOSORTED] = &js_array_toSorted_def,
     [STEPDEF_JSON_PARSE]    = &js_json_parse_def,
+    [STEPDEF_TA_SLICE]      = &js_ta_slice_def,
     [STEPDEF_ARRAY_REDUCE]  = &js_array_reduce_def,  [STEPDEF_ARRAY_REDUCE_RIGHT] = &js_array_reduceR_def,
     [STEPDEF_TA_REDUCE]     = &js_ta_reduce_def,     [STEPDEF_TA_REDUCE_RIGHT]    = &js_ta_reduceR_def,
 };
@@ -67661,72 +67693,145 @@ static JSValue js_typed_array_toReversed(JSContext *ctx, JSValueConst this_val,
     return ret;
 }
 
-static JSValue js_typed_array_slice(JSContext *ctx, JSValueConst this_val,
-                                    int argc, JSValueConst *argv)
-{
-    JSValueConst args[2];
-    JSValue arr, val;
-    JSObject *p, *p1;
-    int n, len, start, final, count, shift, space;
+/* %TypedArray%.prototype.slice, 23.2.3.27. Its TypedArraySpeciesCreate is a real Construct of the species
+   constructor, which is USER code — reached through JS_CallConstructor from a C body it drove to completion, so a
+   custom species ctor with a loop (or one that detaches the buffer, which is what the detached-buffer-custom-ctor
+   tests do) had nowhere to suspend. As a step machine the create is a CONSTRUCT step; the copy that follows is
+   pure C over two typed arrays and needs no further suspension. */
+typedef struct JSTASlice {
+    JSStepHdr hdr;          /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    JSValue src;            /* the receiver (owned) */
+    JSValue arr;            /* the created target (owned) */
+    JSValue cb_args[2];     /* [ctor, count] handed to the CONSTRUCT step */
+    int start, count;
+    int len;                /* the receiver's length as read BEFORE the index coercions ran */
+    uint8_t asked;          /* 1 = the CONSTRUCT has been requested; the next entry carries its result */
+    uint8_t created;        /* 1 = `arr` exists; the next step does the copy */
+} JSTASlice;
 
-    arr = JS_UNDEFINED;
+static void js_ta_slice_end(JSContext *ctx, JSTASlice *s, bool take_result)
+{
+    if (!take_result)
+        JS_FreeValue(ctx, s->arr);
+    JS_FreeValue(ctx, s->src);
+    JS_FreeValue(ctx, s->cb_args[0]);
+}
+
+static void *js_ta_slice_init(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv,
+                              int unused, JSValueConst func_obj)
+{
+    JSTASlice *s;
+    JSObject *p;
+    JSValue ctor;
+    int len, start, final;
+
     p = get_typed_array(ctx, this_val);
     if (!p)
-        return JS_EXCEPTION;
-    if (typed_array_is_oob(p))
-        return JS_ThrowTypeErrorArrayBufferOOB(ctx);
+        return NULL;
+    if (typed_array_is_oob(p)) { JS_ThrowTypeErrorArrayBufferOOB(ctx); return NULL; }
     len = p->u.array.count;
-
-    if (JS_ToInt32Clamp(ctx, &start, argv[0], 0, len, len))
-        goto exception;
+    if (JS_ToInt32Clamp(ctx, &start, argc > 0 ? argv[0] : JS_UNDEFINED, 0, len, len))
+        return NULL;
     final = len;
-    if (!JS_IsUndefined(argv[1])) {
+    if (argc > 1 && !JS_IsUndefined(argv[1])) {
         if (JS_ToInt32Clamp(ctx, &final, argv[1], 0, len, len))
-            goto exception;
+            return NULL;
     }
-    count = max_int(final - start, 0);
+    /* SpeciesConstructor reads .constructor and @@species IN THIS ORDER, before the length is computed into the
+       argument — keep it here so the observable reads stay where the spec puts them. */
+    ctor = JS_SpeciesConstructor(ctx, this_val, JS_UNDEFINED);
+    if (JS_IsException(ctor))
+        return NULL;
+    if (JS_IsUndefined(ctor)) {
+        /* no species: the default constructor for this element type, which is C — nothing to suspend, so it is
+           created here and the machine goes straight to the copy. */
+        JSValue cnt = js_int32(max_int(final - start, 0));
+        JSValue arr = js_typed_array_constructor(ctx, JS_UNDEFINED, 1, vc(&cnt), p->class_id);
+        if (JS_IsException(arr)) return NULL;
+        s = js_mallocz(ctx, sizeof(*s));
+        if (!s) { JS_FreeValue(ctx, arr); JS_ThrowOutOfMemory(ctx); return NULL; }
+        s->arr = arr; s->created = 1;
+        s->cb_args[0] = JS_UNDEFINED;
+    } else {
+        s = js_mallocz(ctx, sizeof(*s));
+        if (!s) { JS_FreeValue(ctx, ctor); JS_ThrowOutOfMemory(ctx); return NULL; }
+        s->arr = JS_UNDEFINED;
+        s->cb_args[0] = ctor;   /* owned */
+    }
+    s->src = js_dup(this_val);
+    s->start = start;
+    s->len = len;
+    s->count = max_int(final - start, 0);
+    s->cb_args[1] = js_int32(s->count);
+    return s;
+}
 
-    args[0] = this_val;
-    args[1] = js_int32(count);
-    arr = js_typed_array___speciesCreate(ctx, JS_UNDEFINED, 2, args, true);
-    if (JS_IsException(arr))
-        goto exception;
+static int js_ta_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSTASlice *s = st;
+    JSObject *p, *p1;
+    int n, shift, space, count;
+    JSValue val;
 
+    if (!s->created) {
+        if (!s->asked) {
+            /* The FIRST entry carries JS_UNDEFINED, not UNINITIALIZED — do_step_tramp seeds the driver with
+               UNDEFINED — so "have I asked yet" is state, never a tag test. Reading it off the tag made the first
+               entry look like a settled construct, which validated JS_UNDEFINED as a typed array. */
+            s->asked = 1;
+            JS_FreeValue(ctx, cb_result);
+            *out_cb = s->cb_args; *out_argc = 1;   /* [ctor, count] */
+            return 4;
+        }
+        /* the construct settled: TypedArrayCreateFromConstructor's validation, exactly as js_typed_array_create
+           performs it — ValidateTypedArray, the immutable-buffer check, then the length floor. */
+        s->arr = cb_result;
+        s->created = 1;
+        { int new_len = js_typed_array_get_length_unsafe(ctx, s->arr);
+          if (new_len < 0) return -1;
+          if (typed_array_is_immutable(JS_VALUE_GET_OBJ(s->arr))) { JS_ThrowTypeErrorImmutableArrayBuffer(ctx); return -1; }
+          if (new_len < s->count) { JS_ThrowTypeError(ctx, "TypedArray length is too small"); return -1; } }
+    } else {
+        JS_FreeValue(ctx, cb_result);   /* the no-species path: nothing was requested, this is the seed */
+    }
+    count = s->count;
     if (count > 0) {
-        if (validate_typed_array(ctx, this_val)
-        ||  validate_typed_array(ctx, arr))
-            goto exception;
-
-        if (len != p->u.array.count)
-            goto slow_path;
-
-        p1 = get_typed_array(ctx, arr);
-        if (p1 != NULL && p->class_id == p1->class_id &&
-            typed_array_length(p1) >= count &&
-            typed_array_length(p) >= start + count) {
+        if (validate_typed_array(ctx, s->src) || validate_typed_array(ctx, s->arr))
+            return -1;
+        p = get_typed_array(ctx, s->src);
+        p1 = get_typed_array(ctx, s->arr);
+        /* s->len is the length read BEFORE start/end were coerced and before the species constructor ran. If the
+           receiver's length has MOVED since (a valueOf or a ctor that resizes the backing buffer), `count` is
+           stale and the block copy would read past the end — take the element-wise path, which re-reads the live
+           count. Losing this comparison in the restructure segfaulted resize-count-bytes-to-zero. */
+        if (p && p1 && s->len == p->u.array.count && p->class_id == p1->class_id
+            && typed_array_length(p1) >= count && typed_array_length(p) >= s->start + count) {
             shift = typed_array_size_log2(p->class_id);
             memmove(p1->u.array.u.uint8_ptr,
-                    p->u.array.u.uint8_ptr + (start << shift),
+                    p->u.array.u.uint8_ptr + (s->start << shift),
                     count << shift);
         } else {
-        slow_path:
-            space = max_int(0, p->u.array.count - start);
+            space = p ? max_int(0, p->u.array.count - s->start) : 0;
             count = min_int(count, space);
             for (n = 0; n < count; n++) {
-                val = JS_GetPropertyValue(ctx, this_val, js_int32(start + n));
+                val = JS_GetPropertyValue(ctx, s->src, js_int32(s->start + n));
                 if (JS_IsException(val))
-                    goto exception;
-                if (JS_SetPropertyValue(ctx, arr, js_int32(n), val,
-                                        JS_PROP_THROW) < 0)
-                    goto exception;
+                    return -1;
+                if (JS_SetPropertyValue(ctx, s->arr, js_int32(n), val, JS_PROP_THROW) < 0)
+                    return -1;
             }
         }
     }
-    return arr;
+    return 0;
+}
 
- exception:
-    JS_FreeValue(ctx, arr);
-    return JS_EXCEPTION;
+static JSValue js_ta_slice_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSTASlice *s = st;
+    JSValue r = take_result ? s->arr : JS_UNDEFINED;
+    js_ta_slice_end(ctx, s, take_result);
+    js_free(ctx, s);
+    return r;
 }
 
 static JSValue js_typed_array_subarray(JSContext *ctx, JSValueConst this_val,
@@ -68155,7 +68260,7 @@ static const JSCFunctionListEntry js_typed_array_base_proto_funcs[] = {
     JS_CFUNC_STEP_DEF("findLastIndex", 1, STEPDEF_TA_FIND_LAST_INDEX ),
     JS_CFUNC_DEF("reverse", 0, js_typed_array_reverse ),
     JS_CFUNC_DEF("toReversed", 0, js_typed_array_toReversed ),
-    JS_CFUNC_DEF("slice", 2, js_typed_array_slice ),
+    JS_CFUNC_STEP_DEF("slice", 2, STEPDEF_TA_SLICE ),
     JS_CFUNC_DEF("subarray", 2, js_typed_array_subarray ),
     JS_CFUNC_DEF("sort", 1, js_typed_array_sort ),
     JS_CFUNC_DEF("toSorted", 1, js_typed_array_toSorted ),
