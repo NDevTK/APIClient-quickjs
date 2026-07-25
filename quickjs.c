@@ -1399,6 +1399,25 @@ static void js_disposable_stack_mark(JSRuntime *rt, JSValueConst val,
 
 #define HINT_STRING  0
 #define HINT_NUMBER  1
+
+/* The step-machine ids. They are referenced by the prototype tables AND by two internal function-object
+   creations far above the definitions, so the list lives here, ahead of every use. */
+enum {   /* the STEPDEF_* ids used at the registration sites */
+    STEPDEF_ARRAY_FIND, STEPDEF_ARRAY_FIND_INDEX, STEPDEF_ARRAY_FIND_LAST, STEPDEF_ARRAY_FIND_LAST_INDEX,
+    STEPDEF_TA_FIND, STEPDEF_TA_FIND_INDEX, STEPDEF_TA_FIND_LAST, STEPDEF_TA_FIND_LAST_INDEX,
+    STEPDEF_RE_REPLACE, STEPDEF_STR_REPLACE, STEPDEF_STR_REPLACE_ALL,
+    STEPDEF_ARRAY_EVERY, STEPDEF_ARRAY_SOME, STEPDEF_ARRAY_FOREACH, STEPDEF_ARRAY_MAP, STEPDEF_ARRAY_FILTER,
+    STEPDEF_TA_EVERY, STEPDEF_TA_SOME, STEPDEF_TA_FOREACH, STEPDEF_TA_MAP, STEPDEF_TA_FILTER,
+    STEPDEF_ARRAY_REDUCE, STEPDEF_ARRAY_REDUCE_RIGHT, STEPDEF_TA_REDUCE, STEPDEF_TA_REDUCE_RIGHT,
+    STEPDEF_ARRAY_SORT, STEPDEF_ARRAY_TOSORTED, STEPDEF_JSON_PARSE,
+    STEPDEF_TA_SLICE, STEPDEF_STR_CONCAT, STEPDEF_STR_CTOR, STEPDEF_ARRAY_AT,
+    STEPDEF_ARRAY_INDEXOF, STEPDEF_ARRAY_LASTINDEXOF, STEPDEF_ARRAY_INCLUDES,
+    STEPDEF_STR_TRIM, STEPDEF_STR_TRIMSTART, STEPDEF_STR_TRIMEND, STEPDEF_STR_AT, STEPDEF_STR_CODEPOINTAT,
+    STEPDEF_STR_SUBSTRING, STEPDEF_STR_INDEXOF, STEPDEF_STR_LASTINDEXOF, STEPDEF_STR_NORMALIZE,
+    STEPDEF_TA_AT, STEPDEF_TA_SET, STEPDEF_JSON_RAWJSON,
+    STEPDEF_OBJ_DEFINEPROPERTY, STEPDEF_REFLECT_DEFINEPROPERTY,
+    STEPDEF_COUNT
+};
 #define HINT_NONE    2
 #define HINT_FORCE_ORDINARY (1 << 4) // don't try Symbol.toPrimitive
 static JSValue JS_ToPrimitiveFree(JSContext *ctx, JSValue val, int hint);
@@ -1423,8 +1442,6 @@ static JSValue js_array_constructor(JSContext *ctx, JSValueConst new_target,
                                     int argc, JSValueConst *argv);
 static JSValue js_error_constructor(JSContext *ctx, JSValueConst new_target,
                                     int argc, JSValueConst *argv, int magic);
-static JSValue js_object_defineProperty(JSContext *ctx, JSValueConst this_val,
-                                        int argc, JSValueConst *argv, int magic);
 
 typedef enum JSStrictEqModeEnum {
     JS_EQ_STRICT,
@@ -9141,9 +9158,10 @@ static JSValue js_bytecode_autoinit(JSContext *ctx, JSObject *p, JSAtom atom,
                                      1, JS_CFUNC_constructor_or_func_magic,
                                      JS_TYPE_ERROR),
                 JS_AtomToValue(ctx, JS_ATOM_Symbol_asyncIterator),
-                JS_NewCFunctionMagic(ctx, js_object_defineProperty,
-                                     "Object.defineProperty", 3,
-                                     JS_CFUNC_generic_magic, 0),
+                /* the same builtin the global one is: a step machine, so the helper's call to it routes
+                   through the interpreter's dispatch like any other */
+                JS_NewCFunctionMagic(ctx, NULL, "Object.defineProperty", 3,
+                                     JS_CFUNC_step, STEPDEF_OBJ_DEFINEPROPERTY),
                 JS_AtomToValue(ctx, JS_ATOM_Symbol_iterator),
             };
             return js_bytecode_eval(ctx, qjsc_builtin_array_fromasync,
@@ -18237,6 +18255,35 @@ static int step_tostring_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSVal
     return JS_IsException(*pout) ? -1 : 0;
 }
 
+/* ToPropertyKey (7.1.19): ToPrimitive with hint STRING — the page's code when the key is an object — after
+   which a Symbol is used as-is and anything else is ToString'd. The atom conversion runs nothing. Every C site
+   that takes a property key coerces it exactly this way, which is why this is a shared sub-sequence and not part
+   of one builtin. */
+static int step_topropkey_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValue in, JSAtom *pres,
+                              JSValue **out_cb, int *out_argc)
+{
+    if (h->str_phase == STR_PH_START) {
+        JS_FreeValue(ctx, in);
+        if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT) {
+            DCHECK(JS_VALUE_GET_TAG(h->coerce) != JS_TAG_OBJECT,
+                   "a coercion is already in flight on this machine's header");
+            h->coerce = js_dup(v);
+            h->cb_coerce[0] = h->coerce;
+            *out_cb = h->cb_coerce; *out_argc = HINT_STRING;
+            h->str_phase = STR_PH_PRIM;
+            return 5;
+        }
+        *pres = JS_ValueToAtom(ctx, v);
+        return (*pres == JS_ATOM_NULL) ? -1 : 0;
+    }
+    JS_FreeValue(ctx, h->coerce);
+    h->coerce = JS_UNDEFINED;
+    h->str_phase = STR_PH_START;
+    *pres = JS_ValueToAtom(ctx, in);
+    JS_FreeValue(ctx, in);
+    return (*pres == JS_ATOM_NULL) ? -1 : 0;
+}
+
 /* JS_ToStringCheckObject on the RECEIVER — RequireObjectCoercible, then ToString. Every String.prototype method
    opens with it, which is why even a ZERO-ARGUMENT one could not stay a C body: `"".trim.call(o)` where o's
    toString loops preempted in an activation with no flow base. */
@@ -19368,6 +19415,14 @@ typedef struct JSArraySearch {
     JSValue result;       /* DONE (owned) */
     int64_t len, n;
 } JSArraySearch;
+
+/* Object.defineProperty / Reflect.defineProperty: ToPropertyKey on the key is the page's code. The descriptor
+   READ that follows also runs accessors, which is a separate route and still C. */
+typedef struct JSObjDefProp {
+    JSStepHdr hdr;
+    JSValue result;       /* DONE (owned) */
+    JSAtom atom;          /* the coerced key (owned) */
+} JSObjDefProp;
 
 /* JSON.rawJSON: ToString on its argument is the page's code, and everything after it — the validation, the
    parse, building the frozen wrapper — runs none. */
@@ -47857,34 +47912,46 @@ static JSValue js_object_setPrototypeOf(JSContext *ctx, JSValueConst this_val,
 }
 
 /* magic = 1 if called as Reflect.defineProperty */
-static JSValue js_object_defineProperty(JSContext *ctx, JSValueConst this_val,
-                                        int argc, JSValueConst *argv, int magic)
+static int js_obj_defprop_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    JSValueConst obj, prop, desc;
-    int ret, flags;
-    JSAtom atom;
+    JSObjDefProp *s = st;
+    JSValueConst obj = step_arg(&s->hdr, 0);
+    int ret, flags, r;
 
-    obj = argv[0];
-    prop = argv[1];
-    desc = argv[2];
-
-    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
-        return JS_ThrowTypeErrorNotAnObject(ctx);
-    atom = JS_ValueToAtom(ctx, prop);
-    if (unlikely(atom == JS_ATOM_NULL))
-        return JS_EXCEPTION;
-    flags = JS_PROP_THROW | JS_PROP_DEFINE_PROPERTY;
-    if (magic)
-        flags = JS_PROP_REFLECT_DEFINE_PROPERTY;
-    ret = JS_DefinePropertyDesc(ctx, obj, atom, desc, flags);
-    JS_FreeAtom(ctx, atom);
-    if (ret < 0) {
-        return JS_EXCEPTION;
-    } else if (magic) {
-        return js_bool(ret);
-    } else {
-        return js_dup(obj);
+    if (s->hdr.stage == 0) {
+        if (s->hdr.str_phase == STR_PH_START) {
+            s->result = JS_UNDEFINED;
+            s->atom = JS_ATOM_NULL;
+            if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT) {
+                JS_FreeValue(ctx, cb_result);
+                JS_ThrowTypeErrorNotAnObject(ctx);
+                return -1;
+            }
+        }
+        r = step_topropkey_run(ctx, &s->hdr, step_arg(&s->hdr, 1), cb_result, &s->atom, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 1;
     }
+    JS_FreeValue(ctx, cb_result);
+
+    flags = s->hdr.arg ? JS_PROP_REFLECT_DEFINE_PROPERTY
+                       : (JS_PROP_THROW | JS_PROP_DEFINE_PROPERTY);
+    ret = JS_DefinePropertyDesc(ctx, obj, s->atom, step_arg(&s->hdr, 2), flags);
+    if (ret < 0)
+        return -1;
+    s->result = s->hdr.arg ? js_bool(ret) : js_dup(obj);
+    return 0;
+}
+
+static JSValue js_obj_defprop_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSObjDefProp *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    JS_FreeAtom(ctx, s->atom);
+    js_free(ctx, s);
+    return r;
 }
 
 static JSValue js_object_defineProperties(JSContext *ctx, JSValueConst this_val,
@@ -48771,7 +48838,7 @@ static const JSCFunctionListEntry js_object_funcs[] = {
     JS_CFUNC_DEF("create", 2, js_object_create ),
     JS_CFUNC_MAGIC_DEF("getPrototypeOf", 1, js_object_getPrototypeOf, 0 ),
     JS_CFUNC_DEF("setPrototypeOf", 2, js_object_setPrototypeOf ),
-    JS_CFUNC_MAGIC_DEF("defineProperty", 3, js_object_defineProperty, 0 ),
+    JS_CFUNC_STEP_DEF("defineProperty", 3, STEPDEF_OBJ_DEFINEPROPERTY ),
     JS_CFUNC_DEF("defineProperties", 2, js_object_defineProperties ),
     JS_CFUNC_DEF("getOwnPropertyNames", 1, js_object_getOwnPropertyNames ),
     JS_CFUNC_DEF("getOwnPropertySymbols", 1, js_object_getOwnPropertySymbols ),
@@ -51119,21 +51186,6 @@ static JSValue js_array_find_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
-enum {   /* the STEPDEF_* ids used at the registration sites */
-    STEPDEF_ARRAY_FIND, STEPDEF_ARRAY_FIND_INDEX, STEPDEF_ARRAY_FIND_LAST, STEPDEF_ARRAY_FIND_LAST_INDEX,
-    STEPDEF_TA_FIND, STEPDEF_TA_FIND_INDEX, STEPDEF_TA_FIND_LAST, STEPDEF_TA_FIND_LAST_INDEX,
-    STEPDEF_RE_REPLACE, STEPDEF_STR_REPLACE, STEPDEF_STR_REPLACE_ALL,
-    STEPDEF_ARRAY_EVERY, STEPDEF_ARRAY_SOME, STEPDEF_ARRAY_FOREACH, STEPDEF_ARRAY_MAP, STEPDEF_ARRAY_FILTER,
-    STEPDEF_TA_EVERY, STEPDEF_TA_SOME, STEPDEF_TA_FOREACH, STEPDEF_TA_MAP, STEPDEF_TA_FILTER,
-    STEPDEF_ARRAY_REDUCE, STEPDEF_ARRAY_REDUCE_RIGHT, STEPDEF_TA_REDUCE, STEPDEF_TA_REDUCE_RIGHT,
-    STEPDEF_ARRAY_SORT, STEPDEF_ARRAY_TOSORTED, STEPDEF_JSON_PARSE,
-    STEPDEF_TA_SLICE, STEPDEF_STR_CONCAT, STEPDEF_STR_CTOR, STEPDEF_ARRAY_AT,
-    STEPDEF_ARRAY_INDEXOF, STEPDEF_ARRAY_LASTINDEXOF, STEPDEF_ARRAY_INCLUDES,
-    STEPDEF_STR_TRIM, STEPDEF_STR_TRIMSTART, STEPDEF_STR_TRIMEND, STEPDEF_STR_AT, STEPDEF_STR_CODEPOINTAT,
-    STEPDEF_STR_SUBSTRING, STEPDEF_STR_INDEXOF, STEPDEF_STR_LASTINDEXOF, STEPDEF_STR_NORMALIZE,
-    STEPDEF_TA_AT, STEPDEF_TA_SET, STEPDEF_JSON_RAWJSON,
-    STEPDEF_COUNT
-};
 static int js_str_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_str_ctor_fini(JSContext *ctx, void *st, bool take_result);
 static int js_str_concat_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
@@ -51150,6 +51202,8 @@ static int js_ta_idx_step(JSContext *ctx, void *st, JSValue cb_result, JSValue *
 static JSValue js_ta_idx_fini(JSContext *ctx, void *st, bool take_result);
 static int js_json_raw_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_json_raw_fini(JSContext *ctx, void *st, bool take_result);
+static int js_obj_defprop_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_obj_defprop_fini(JSContext *ctx, void *st, bool take_result);
 /* One NAMED definition per builtin, referenced by its JS_CFUNC_STEP_DEF registration through the id above — the same shape as
    JS_CFUNC_MAGIC_DEF naming its C function, so the registration line tells you what runs. An index into a side
    table would be a second list to keep in sync and a magic number that silently repoints when a row is inserted. */
@@ -51195,6 +51249,8 @@ static const JSTrampStepDef js_str_normalize_def  = { sizeof(JSStrRecv), js_str_
 static const JSTrampStepDef js_ta_at_def          = { sizeof(JSTAIdx), js_ta_idx_step, js_ta_idx_fini, TAIDX_AT };
 static const JSTrampStepDef js_ta_set_def         = { sizeof(JSTAIdx), js_ta_idx_step, js_ta_idx_fini, TAIDX_SET };
 static const JSTrampStepDef js_json_raw_def       = { sizeof(JSJsonRaw), js_json_raw_step, js_json_raw_fini, 0 };
+static const JSTrampStepDef js_obj_defprop_def    = { sizeof(JSObjDefProp), js_obj_defprop_step, js_obj_defprop_fini, 0 };
+static const JSTrampStepDef js_refl_defprop_def   = { sizeof(JSObjDefProp), js_obj_defprop_step, js_obj_defprop_fini, 1 };
 static const JSTrampStepDef js_array_reduce_def  = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduce };
 static const JSTrampStepDef js_array_reduceR_def = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduceRight };
 static const JSTrampStepDef js_ta_reduce_def     = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduce | special_TA };
@@ -51242,6 +51298,8 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_TA_AT]           = &js_ta_at_def,
     [STEPDEF_TA_SET]          = &js_ta_set_def,
     [STEPDEF_JSON_RAWJSON]    = &js_json_raw_def,
+    [STEPDEF_OBJ_DEFINEPROPERTY]     = &js_obj_defprop_def,
+    [STEPDEF_REFLECT_DEFINEPROPERTY] = &js_refl_defprop_def,
     [STEPDEF_ARRAY_REDUCE]  = &js_array_reduce_def,  [STEPDEF_ARRAY_REDUCE_RIGHT] = &js_array_reduceR_def,
     [STEPDEF_TA_REDUCE]     = &js_ta_reduce_def,     [STEPDEF_TA_REDUCE_RIGHT]    = &js_ta_reduceR_def,
 };
@@ -51269,6 +51327,7 @@ STEP_STATE_HDR_FIRST(JSArraySearch);
 STEP_STATE_HDR_FIRST(JSStrRecv);
 STEP_STATE_HDR_FIRST(JSTAIdx);
 STEP_STATE_HDR_FIRST(JSJsonRaw);
+STEP_STATE_HDR_FIRST(JSObjDefProp);
 
 static const JSTrampStepDef *tramp_step_def_of(JSValueConst func)
 {
@@ -59245,7 +59304,7 @@ static JSValue js_reflect_ownKeys(JSContext *ctx, JSValueConst this_val,
 static const JSCFunctionListEntry js_reflect_funcs[] = {
     JS_CFUNC_DEF("apply", 3, js_reflect_apply ),
     JS_CFUNC_DEF("construct", 2, js_reflect_construct ),
-    JS_CFUNC_MAGIC_DEF("defineProperty", 3, js_object_defineProperty, 1 ),
+    JS_CFUNC_STEP_DEF("defineProperty", 3, STEPDEF_REFLECT_DEFINEPROPERTY ),
     JS_CFUNC_DEF("deleteProperty", 2, js_reflect_deleteProperty ),
     JS_CFUNC_DEF("get", 2, js_reflect_get ),
     JS_CFUNC_MAGIC_DEF("getOwnPropertyDescriptor", 2, js_object_getOwnPropertyDescriptor, 1 ),
