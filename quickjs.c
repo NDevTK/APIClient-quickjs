@@ -19053,6 +19053,7 @@ typedef struct JSArrayEvery {
        func/this_arg from the header's captured invocation), so do_return skips its `cargv = sp - cargc`
        arg-free for a callback frame. The ORIGINAL call's operand shape lives in hdr. */
     JSValue cb_args[5];
+    JSValue ta_dest;      /* filter|TA: the species-created typed array, held across its `set` (owned) */
 } JSArrayEvery;
 /* Array iteration builtins (forEach/map/every/some/filter) drive a JS callback from a C loop — the
    CONTINUATION-HOLDING re-entrant. They are a step machine, so that drive runs on the tramp chain: each callback
@@ -19367,6 +19368,16 @@ typedef struct JSArraySearch {
     JSValue result;       /* DONE (owned) */
     int64_t len, n;
 } JSArraySearch;
+
+/* TypedArray.prototype at / set: the receiver validation is C, and then the index (at) or the offset (set) is
+   ToIntegerOrInfinity — the page's code. `at` re-reads the live element count afterwards because that coercion
+   can resize or detach the backing buffer, which is exactly why the C body had a comment saying so. */
+enum { TAIDX_AT = 0, TAIDX_SET };
+typedef struct JSTAIdx {
+    JSStepHdr hdr;
+    JSValue result;       /* DONE (owned) */
+    int64_t len, idx;
+} JSTAIdx;
 
 /* String.prototype trim / trimStart / trimEnd / at / codePointAt: ONE machine. Their whole shared prologue is
    JS_ToStringCheckObject on the receiver, and the two index methods add one ToIntegerOrInfinity — both the
@@ -50546,19 +50557,10 @@ static int js_array_every_step(JSContext *ctx, JSArrayEvery *s, JSValue res, JSV
         }
     }
 done:
-    if (s->special == (special_filter | special_TA)) {
-        JSValue arr, res2;
-        JSValueConst a2[2];
-        a2[0] = s->obj;
-        a2[1] = js_int32(s->n);
-        arr = js_typed_array___speciesCreate(ctx, JS_UNDEFINED, 2, a2, true);
-        if (JS_IsException(arr)) return -1;
-        a2[0] = s->ret;
-        res2 = JS_Invoke(ctx, arr, JS_ATOM_set, 1, a2);
-        if (check_exception_free(ctx, res2)) { JS_FreeValue(ctx, arr); return -1; }
-        JS_FreeValue(ctx, s->ret);
-        s->ret = arr;
-    }
+    /* TypedArray filter's writeback — the species create and the destination's own `set` — is NOT here: both run
+       the page's code (a Construct, a property read that may be an accessor, and a call to a method that is
+       itself a step machine), so they are stages of the driver below. Doing them here meant JS_Invoke from C,
+       which is js_call_c_function's DFAIL now that `set` is a machine. */
     return 0;
 }
 
@@ -50634,7 +50636,8 @@ static void js_array_every_end(JSContext *ctx, JSArrayEvery *s, bool take_ret)
         JS_FreeValue(ctx, s->ret);
     JS_FreeValue(ctx, s->val);
     JS_FreeValue(ctx, s->obj);
-    s->ret = JS_UNDEFINED; s->val = JS_UNDEFINED; s->obj = JS_UNDEFINED;
+    s->ret = JS_UNDEFINED; s->val = JS_UNDEFINED; s->obj = JS_UNDEFINED;    JS_FreeValue(ctx, s->ta_dest);
+    s->ta_dest = JS_UNDEFINED;
 }
 
 /* every/some/forEach/map/filter (and their TypedArray twins) as a STEP builtin. js_array_every was ALREADY split
@@ -50664,11 +50667,47 @@ static int js_array_every_vstep(JSContext *ctx, void *st, JSValue cb_result, JSV
         if (r) return r < 0 ? -1 : r;
         s->hdr.stage = 3;
     }
+    if (s->hdr.stage == 4) {   /* filter|TA: the destination's `set` method arrived */
+        JSValue m = cb_result;
+        s->hdr.stage = 5;
+        if (!JS_IsFunction(ctx, m)) {
+            JS_FreeValue(ctx, m);
+            JS_ThrowTypeError(ctx, "not a function");
+            return -1;
+        }
+        s->cb_args[0] = js_dup(s->ta_dest);
+        s->cb_args[1] = m;                    /* owned */
+        s->cb_args[2] = js_dup(s->ret);       /* the collected plain array */
+        *out_cb = s->cb_args; *out_argc = 1;
+        return 3;
+    }
+    if (s->hdr.stage == 5) {   /* filter|TA: `set` returned; the destination IS the result */
+        JS_FreeValue(ctx, cb_result);
+        JS_FreeValue(ctx, s->cb_args[0]); s->cb_args[0] = JS_UNDEFINED;
+        JS_FreeValue(ctx, s->cb_args[1]); s->cb_args[1] = JS_UNDEFINED;
+        JS_FreeValue(ctx, s->cb_args[2]); s->cb_args[2] = JS_UNDEFINED;
+        JS_FreeValue(ctx, s->ret);
+        s->ret = s->ta_dest;
+        s->ta_dest = JS_UNDEFINED;
+        return 0;
+    }
     r = js_array_every_step(ctx, s, cb_result, (JSValueConst *)&s->cb_args[2]);   /* consumes cb_result */
     if (r < 0)
         return -1;
-    if (r == 0)
-        return 0;
+    if (r == 0) {
+        if (s->special != (special_filter | special_TA))
+            return 0;
+        /* the elements are collected in a plain array; the RESULT is a species-created typed array they are
+           written into with its own `set`. Both the create and that method read run the page's code. */
+        { JSValueConst a2[2];
+          a2[0] = s->obj; a2[1] = js_int32(s->n);
+          s->ta_dest = js_typed_array___speciesCreate(ctx, JS_UNDEFINED, 2, a2, true);
+          if (JS_IsException(s->ta_dest)) { s->ta_dest = JS_UNDEFINED; return -1; } }
+        s->hdr.stage = 4;
+        s->hdr.cb_coerce[0] = s->ta_dest;     /* borrowed: the state holds it */
+        *out_cb = s->hdr.cb_coerce; *out_argc = (int)JS_ATOM_set;
+        return 6;
+    }
     /* cb_args is [this, func, val, idx, obj] — already the method-call shape the driver wants */
     s->cb_args[0] = s->this_arg;
     s->cb_args[1] = s->func;
@@ -51084,6 +51123,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_ARRAY_INDEXOF, STEPDEF_ARRAY_LASTINDEXOF, STEPDEF_ARRAY_INCLUDES,
     STEPDEF_STR_TRIM, STEPDEF_STR_TRIMSTART, STEPDEF_STR_TRIMEND, STEPDEF_STR_AT, STEPDEF_STR_CODEPOINTAT,
     STEPDEF_STR_SUBSTRING, STEPDEF_STR_INDEXOF, STEPDEF_STR_LASTINDEXOF, STEPDEF_STR_NORMALIZE,
+    STEPDEF_TA_AT, STEPDEF_TA_SET,
     STEPDEF_COUNT
 };
 static int js_str_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
@@ -51098,6 +51138,8 @@ static int js_array_search_step(JSContext *ctx, void *st, JSValue cb_result, JSV
 static JSValue js_array_search_fini(JSContext *ctx, void *st, bool take_result);
 static int js_str_recv_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_str_recv_fini(JSContext *ctx, void *st, bool take_result);
+static int js_ta_idx_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_ta_idx_fini(JSContext *ctx, void *st, bool take_result);
 /* One NAMED definition per builtin, referenced by its JS_CFUNC_STEP_DEF registration through the id above — the same shape as
    JS_CFUNC_MAGIC_DEF naming its C function, so the registration line tells you what runs. An index into a side
    table would be a second list to keep in sync and a magic number that silently repoints when a row is inserted. */
@@ -51140,6 +51182,8 @@ static const JSTrampStepDef js_str_substring_def  = { sizeof(JSStrRecv), js_str_
 static const JSTrampStepDef js_str_indexOf_def    = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_INDEXOF };
 static const JSTrampStepDef js_str_lastIndexOf_def= { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_LASTINDEXOF };
 static const JSTrampStepDef js_str_normalize_def  = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_NORMALIZE };
+static const JSTrampStepDef js_ta_at_def          = { sizeof(JSTAIdx), js_ta_idx_step, js_ta_idx_fini, TAIDX_AT };
+static const JSTrampStepDef js_ta_set_def         = { sizeof(JSTAIdx), js_ta_idx_step, js_ta_idx_fini, TAIDX_SET };
 static const JSTrampStepDef js_array_reduce_def  = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduce };
 static const JSTrampStepDef js_array_reduceR_def = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduceRight };
 static const JSTrampStepDef js_ta_reduce_def     = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduce | special_TA };
@@ -51184,6 +51228,8 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_STR_INDEXOF]     = &js_str_indexOf_def,
     [STEPDEF_STR_LASTINDEXOF] = &js_str_lastIndexOf_def,
     [STEPDEF_STR_NORMALIZE]   = &js_str_normalize_def,
+    [STEPDEF_TA_AT]           = &js_ta_at_def,
+    [STEPDEF_TA_SET]          = &js_ta_set_def,
     [STEPDEF_ARRAY_REDUCE]  = &js_array_reduce_def,  [STEPDEF_ARRAY_REDUCE_RIGHT] = &js_array_reduceR_def,
     [STEPDEF_TA_REDUCE]     = &js_ta_reduce_def,     [STEPDEF_TA_REDUCE_RIGHT]    = &js_ta_reduceR_def,
 };
@@ -51209,6 +51255,7 @@ STEP_STATE_HDR_FIRST(JSTASlice);
 STEP_STATE_HDR_FIRST(JSArrayAt);
 STEP_STATE_HDR_FIRST(JSArraySearch);
 STEP_STATE_HDR_FIRST(JSStrRecv);
+STEP_STATE_HDR_FIRST(JSTAIdx);
 
 static const JSTrampStepDef *tramp_step_def_of(JSValueConst func)
 {
@@ -67578,25 +67625,22 @@ static JSValue js_typed_array_get_toStringTag(JSContext *ctx,
     return JS_AtomToString(ctx, ctx->rt->class_array[p->class_id].class_name);
 }
 
+/* `offset` arrives already coerced: ToIntegerOrInfinity on it runs the page's code, so it is a step in the
+   machine below rather than a JS_ToInt64Sat here. The receiver validation and the immutability check precede it
+   and run nothing, so they stay where the spec puts them. */
 static JSValue js_typed_array_set_internal(JSContext *ctx,
                                            JSValueConst dst,
                                            JSValueConst src,
-                                           JSValueConst off)
+                                           int64_t offset)
 {
     JSObject *p;
     JSObject *src_p;
     uint32_t i;
-    int64_t dst_len, src_len, offset;
+    int64_t dst_len, src_len;
     JSValue val, src_obj = JS_UNDEFINED;
 
     p = get_typed_array(ctx, dst);
     if (!p)
-        goto fail;
-    if (typed_array_is_immutable(p)) {
-        JS_ThrowTypeErrorImmutableArrayBuffer(ctx);
-        goto fail;
-    }
-    if (JS_ToInt64Sat(ctx, &offset, off))
         goto fail;
     if (offset < 0)
         goto range_error;
@@ -67668,58 +67712,6 @@ fail:
     return JS_EXCEPTION;
 }
 
-static JSValue js_typed_array_at(JSContext *ctx, JSValueConst this_val,
-                                 int argc, JSValueConst *argv)
-{
-    JSObject *p;
-    int64_t idx, len;
-
-    p = get_typed_array(ctx, this_val);
-    if (!p)
-        return JS_EXCEPTION;
-    if (typed_array_is_oob(p))
-        return JS_ThrowTypeErrorArrayBufferOOB(ctx);
-    len = p->u.array.count;
-
-    // note: can change p->u.array.count
-    if (JS_ToInt64Sat(ctx, &idx, argv[0]))
-        return JS_EXCEPTION;
-
-    if (idx < 0)
-        idx = len + idx;
-
-    if (idx < 0 || idx >= p->u.array.count)
-        return JS_UNDEFINED;
-
-    switch (p->class_id) {
-    case JS_CLASS_INT8_ARRAY:
-        return js_int32(p->u.array.u.int8_ptr[idx]);
-    case JS_CLASS_UINT8C_ARRAY:
-    case JS_CLASS_UINT8_ARRAY:
-        return js_int32(p->u.array.u.uint8_ptr[idx]);
-    case JS_CLASS_INT16_ARRAY:
-        return js_int32(p->u.array.u.int16_ptr[idx]);
-    case JS_CLASS_UINT16_ARRAY:
-        return js_int32(p->u.array.u.uint16_ptr[idx]);
-    case JS_CLASS_INT32_ARRAY:
-        return js_int32(p->u.array.u.int32_ptr[idx]);
-    case JS_CLASS_UINT32_ARRAY:
-        return js_uint32(p->u.array.u.uint32_ptr[idx]);
-    case JS_CLASS_FLOAT16_ARRAY:
-        return js_float64(fromfp16(p->u.array.u.fp16_ptr[idx]));
-    case JS_CLASS_FLOAT32_ARRAY:
-        return js_float64(p->u.array.u.float_ptr[idx]);
-    case JS_CLASS_FLOAT64_ARRAY:
-        return js_float64(p->u.array.u.double_ptr[idx]);
-    case JS_CLASS_BIG_INT64_ARRAY:
-        return JS_NewBigInt64(ctx, p->u.array.u.int64_ptr[idx]);
-    case JS_CLASS_BIG_UINT64_ARRAY:
-        return JS_NewBigUint64(ctx, p->u.array.u.uint64_ptr[idx]);
-    }
-
-    abort(); /* unreachable */
-    return JS_UNDEFINED;
-}
 
 static JSValue js_typed_array_with(JSContext *ctx, JSValueConst this_val,
                                    int argc, JSValueConst *argv)
@@ -67803,16 +67795,6 @@ static JSValue js_typed_array_with(JSContext *ctx, JSValueConst this_val,
     return arr;
 }
 
-static JSValue js_typed_array_set(JSContext *ctx,
-                                  JSValueConst this_val,
-                                  int argc, JSValueConst *argv)
-{
-    JSValueConst offset = JS_UNDEFINED;
-    if (argc > 1) {
-        offset = argv[1];
-    }
-    return js_typed_array_set_internal(ctx, this_val, argv[0], offset);
-}
 
 static JSValue js_create_typed_array_iterator(JSContext *ctx, JSValueConst this_val,
                                               int argc, JSValueConst *argv, int magic)
@@ -68672,6 +68654,81 @@ static JSValue js_ta_slice_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
+static int js_ta_idx_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSTAIdx *s = st;
+    JSObject *p;
+    int64_t idx;
+    int r;
+
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        s->result = JS_UNDEFINED;
+        p = get_typed_array(ctx, s->hdr.this_val);
+        if (!p) return -1;
+        if (s->hdr.arg == TAIDX_AT) {
+            if (typed_array_is_oob(p)) { JS_ThrowTypeErrorArrayBufferOOB(ctx); return -1; }
+            s->len = p->u.array.count;
+        } else if (typed_array_is_immutable(p)) {
+            JS_ThrowTypeErrorImmutableArrayBuffer(ctx);
+            return -1;
+        }
+        s->hdr.stage = 1;
+    }
+    if (s->hdr.stage == 1) {
+        JSValueConst v = (s->hdr.arg == TAIDX_AT) ? step_arg(&s->hdr, 0) : step_arg(&s->hdr, 1);
+        r = step_toint64_run(ctx, &s->hdr, v, cb_result, &s->idx, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 2;
+    }
+    JS_FreeValue(ctx, cb_result);
+
+    if (s->hdr.arg == TAIDX_SET) {
+        s->result = js_typed_array_set_internal(ctx, s->hdr.this_val, step_arg(&s->hdr, 0), s->idx);
+        return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
+    }
+
+    /* the coercion above can RESIZE or detach the backing buffer, so the bound is re-checked against the live
+       count — the length captured before it only decides what a negative index counts back from. */
+    p = get_typed_array(ctx, s->hdr.this_val);
+    if (!p) return -1;
+    idx = s->idx;
+    if (idx < 0)
+        idx = s->len + idx;
+    if (idx < 0 || idx >= p->u.array.count) {
+        s->result = JS_UNDEFINED;
+        return 0;
+    }
+    switch (p->class_id) {
+    case JS_CLASS_INT8_ARRAY:     s->result = js_int32(p->u.array.u.int8_ptr[idx]); break;
+    case JS_CLASS_UINT8C_ARRAY:
+    case JS_CLASS_UINT8_ARRAY:    s->result = js_int32(p->u.array.u.uint8_ptr[idx]); break;
+    case JS_CLASS_INT16_ARRAY:    s->result = js_int32(p->u.array.u.int16_ptr[idx]); break;
+    case JS_CLASS_UINT16_ARRAY:   s->result = js_int32(p->u.array.u.uint16_ptr[idx]); break;
+    case JS_CLASS_INT32_ARRAY:    s->result = js_int32(p->u.array.u.int32_ptr[idx]); break;
+    case JS_CLASS_UINT32_ARRAY:   s->result = js_uint32(p->u.array.u.uint32_ptr[idx]); break;
+    case JS_CLASS_FLOAT16_ARRAY:  s->result = js_float64(fromfp16(p->u.array.u.fp16_ptr[idx])); break;
+    case JS_CLASS_FLOAT32_ARRAY:  s->result = js_float64(p->u.array.u.float_ptr[idx]); break;
+    case JS_CLASS_FLOAT64_ARRAY:  s->result = js_float64(p->u.array.u.double_ptr[idx]); break;
+    case JS_CLASS_BIG_INT64_ARRAY:  s->result = JS_NewBigInt64(ctx, p->u.array.u.int64_ptr[idx]); break;
+    case JS_CLASS_BIG_UINT64_ARRAY: s->result = JS_NewBigUint64(ctx, p->u.array.u.uint64_ptr[idx]); break;
+    default:
+        DFAIL("TypedArray element read reached a class that is not a typed array");
+        return -1;
+    }
+    return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
+}
+
+static JSValue js_ta_idx_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSTAIdx *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    js_free(ctx, s);
+    return r;
+}
+
 static JSValue js_typed_array_subarray(JSContext *ctx, JSValueConst this_val,
                                        int argc, JSValueConst *argv)
 {
@@ -69072,12 +69129,12 @@ static const JSCFunctionListEntry js_typed_array_base_funcs[] = {
 
 static const JSCFunctionListEntry js_typed_array_base_proto_funcs[] = {
     JS_CGETSET_DEF("length", js_typed_array_get_length, NULL ),
-    JS_CFUNC_DEF("at", 1, js_typed_array_at ),
+    JS_CFUNC_STEP_DEF("at", 1, STEPDEF_TA_AT ),
     JS_CFUNC_DEF("with", 2, js_typed_array_with ),
     JS_CGETSET_DEF("buffer", js_typed_array_get_buffer, NULL ),
     JS_CGETSET_DEF("byteLength", js_typed_array_get_byteLength, NULL ),
     JS_CGETSET_DEF("byteOffset", js_typed_array_get_byteOffset, NULL ),
-    JS_CFUNC_DEF("set", 1, js_typed_array_set ),
+    JS_CFUNC_STEP_DEF("set", 1, STEPDEF_TA_SET ),
     JS_CFUNC_MAGIC_DEF("values", 0, js_create_typed_array_iterator, JS_ITERATOR_KIND_VALUE ),
     JS_ALIAS_DEF("[Symbol.iterator]", "values" ),
     JS_CFUNC_MAGIC_DEF("keys", 0, js_create_typed_array_iterator, JS_ITERATOR_KIND_KEY ),
