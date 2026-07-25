@@ -1416,6 +1416,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_STR_SUBSTRING, STEPDEF_STR_INDEXOF, STEPDEF_STR_LASTINDEXOF, STEPDEF_STR_NORMALIZE,
     STEPDEF_TA_AT, STEPDEF_TA_SET, STEPDEF_JSON_RAWJSON,
     STEPDEF_OBJ_DEFINEPROPERTY, STEPDEF_REFLECT_DEFINEPROPERTY,
+    STEPDEF_PARSEINT, STEPDEF_PARSEFLOAT,
     STEPDEF_COUNT
 };
 #define HINT_NONE    2
@@ -18329,6 +18330,31 @@ static int step_toint64_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValu
     return JS_ToInt64SatFree(ctx, pres, in);
 }
 
+/* the same sub-sequence delivering ToInt32's exact result. A saturating int64 cannot stand in for it: ToInt32
+   WRAPS modulo 2**32, so parseInt's radix of 2**32+16 is 16, and any narrowing applied after a saturation has
+   already lost that. Each conversion gets its own tail rather than one being approximated from another. */
+static int step_toint32_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValue in, int *pres,
+                            JSValue **out_cb, int *out_argc)
+{
+    if (h->num_phase == NUM_PH_START) {
+        JS_FreeValue(ctx, in);
+        if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT) {
+            DCHECK(JS_VALUE_GET_TAG(h->coerce) != JS_TAG_OBJECT,
+                   "a coercion is already in flight on this machine's header");
+            h->coerce = js_dup(v);
+            h->cb_coerce[0] = h->coerce;
+            *out_cb = h->cb_coerce; *out_argc = HINT_NUMBER;
+            h->num_phase = NUM_PH_PRIM;
+            return 5;
+        }
+        return JS_ToInt32(ctx, pres, v);
+    }
+    JS_FreeValue(ctx, h->coerce);
+    h->coerce = JS_UNDEFINED;
+    h->num_phase = NUM_PH_START;
+    return JS_ToInt32Free(ctx, pres, in);
+}
+
 /* the same sub-sequence delivering a double: String.prototype.lastIndexOf's position is compared as one
    (NaN means "from the end"), which a saturating int64 cannot express. */
 static int step_tofloat64_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValue in, double *pres,
@@ -19415,6 +19441,15 @@ typedef struct JSArraySearch {
     JSValue result;       /* DONE (owned) */
     int64_t len, n;
 } JSArraySearch;
+
+/* parseInt / parseFloat: ToString on the input, and for parseInt ToInt32 on the radix — the page's code either
+   way. Everything after is the numeric scanner, which runs none. */
+typedef struct JSParseNum {
+    JSStepHdr hdr;
+    JSValue str;          /* the input as a string (owned) */
+    JSValue result;       /* DONE (owned) */
+    int radix;
+} JSParseNum;
 
 /* Object.defineProperty / Reflect.defineProperty: ToPropertyKey on the key is the page's code. The descriptor
    READ that follows also runs accessors, which is a separate route and still C. */
@@ -47912,6 +47947,58 @@ static JSValue js_object_setPrototypeOf(JSContext *ctx, JSValueConst this_val,
 }
 
 /* magic = 1 if called as Reflect.defineProperty */
+/* hdr.arg: 0 = parseFloat, 1 = parseInt (which additionally coerces a radix). */
+static int js_parse_num_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSParseNum *s = st;
+    const char *cs, *q;
+    int radix, flags, r;
+
+    if (s->hdr.stage == 0) {
+        if (s->hdr.str_phase == STR_PH_START) { s->str = JS_UNDEFINED; s->result = JS_UNDEFINED; }
+        r = step_tostring_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->str, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 1;
+    }
+    if (s->hdr.stage == 1) {
+        if (s->hdr.arg) {
+            r = step_toint32_run(ctx, &s->hdr, step_arg(&s->hdr, 1), cb_result, &s->radix, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+        }
+        s->hdr.stage = 2;
+    }
+    JS_FreeValue(ctx, cb_result);
+
+    cs = JS_ToCString(ctx, s->str);   /* the value is already a string: no user code */
+    if (!cs) return -1;
+    q = cs + skip_spaces(cs);
+    if (!s->hdr.arg) {
+        s->result = js_atof(ctx, q, NULL, 10, 0);
+    } else {
+        radix = s->radix;
+        if (radix != 0 && (radix < 2 || radix > 36)) {
+            s->result = JS_NAN;
+        } else {
+            flags = ATOD_INT_ONLY | ATOD_ACCEPT_PREFIX_AFTER_SIGN;
+            s->result = js_atof(ctx, q, NULL, radix, flags);
+        }
+    }
+    JS_FreeCString(ctx, cs);
+    return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
+}
+
+static JSValue js_parse_num_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSParseNum *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    JS_FreeValue(ctx, s->str);
+    js_free(ctx, s);
+    return r;
+}
+
 static int js_obj_defprop_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSObjDefProp *s = st;
@@ -51204,6 +51291,8 @@ static int js_json_raw_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
 static JSValue js_json_raw_fini(JSContext *ctx, void *st, bool take_result);
 static int js_obj_defprop_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_obj_defprop_fini(JSContext *ctx, void *st, bool take_result);
+static int js_parse_num_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_parse_num_fini(JSContext *ctx, void *st, bool take_result);
 /* One NAMED definition per builtin, referenced by its JS_CFUNC_STEP_DEF registration through the id above — the same shape as
    JS_CFUNC_MAGIC_DEF naming its C function, so the registration line tells you what runs. An index into a side
    table would be a second list to keep in sync and a magic number that silently repoints when a row is inserted. */
@@ -51251,6 +51340,8 @@ static const JSTrampStepDef js_ta_set_def         = { sizeof(JSTAIdx), js_ta_idx
 static const JSTrampStepDef js_json_raw_def       = { sizeof(JSJsonRaw), js_json_raw_step, js_json_raw_fini, 0 };
 static const JSTrampStepDef js_obj_defprop_def    = { sizeof(JSObjDefProp), js_obj_defprop_step, js_obj_defprop_fini, 0 };
 static const JSTrampStepDef js_refl_defprop_def   = { sizeof(JSObjDefProp), js_obj_defprop_step, js_obj_defprop_fini, 1 };
+static const JSTrampStepDef js_parseInt_def       = { sizeof(JSParseNum), js_parse_num_step, js_parse_num_fini, 1 };
+static const JSTrampStepDef js_parseFloat_def     = { sizeof(JSParseNum), js_parse_num_step, js_parse_num_fini, 0 };
 static const JSTrampStepDef js_array_reduce_def  = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduce };
 static const JSTrampStepDef js_array_reduceR_def = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduceRight };
 static const JSTrampStepDef js_ta_reduce_def     = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduce | special_TA };
@@ -51300,6 +51391,8 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_JSON_RAWJSON]    = &js_json_raw_def,
     [STEPDEF_OBJ_DEFINEPROPERTY]     = &js_obj_defprop_def,
     [STEPDEF_REFLECT_DEFINEPROPERTY] = &js_refl_defprop_def,
+    [STEPDEF_PARSEINT]        = &js_parseInt_def,
+    [STEPDEF_PARSEFLOAT]      = &js_parseFloat_def,
     [STEPDEF_ARRAY_REDUCE]  = &js_array_reduce_def,  [STEPDEF_ARRAY_REDUCE_RIGHT] = &js_array_reduceR_def,
     [STEPDEF_TA_REDUCE]     = &js_ta_reduce_def,     [STEPDEF_TA_REDUCE_RIGHT]    = &js_ta_reduceR_def,
 };
@@ -51328,6 +51421,7 @@ STEP_STATE_HDR_FIRST(JSStrRecv);
 STEP_STATE_HDR_FIRST(JSTAIdx);
 STEP_STATE_HDR_FIRST(JSJsonRaw);
 STEP_STATE_HDR_FIRST(JSObjDefProp);
+STEP_STATE_HDR_FIRST(JSParseNum);
 
 static const JSTrampStepDef *tramp_step_def_of(JSValueConst func)
 {
@@ -53638,47 +53732,7 @@ static const JSCFunctionListEntry js_number_proto_funcs[] = {
     JS_CFUNC_DEF("valueOf", 0, js_number_valueOf ),
 };
 
-static JSValue js_parseInt(JSContext *ctx, JSValueConst this_val,
-                           int argc, JSValueConst *argv)
-{
-    const char *str, *p;
-    int radix, flags;
-    JSValue ret;
 
-    str = JS_ToCString(ctx, argv[0]);
-    if (!str)
-        return JS_EXCEPTION;
-    if (JS_ToInt32(ctx, &radix, argv[1])) {
-        JS_FreeCString(ctx, str);
-        return JS_EXCEPTION;
-    }
-    if (radix != 0 && (radix < 2 || radix > 36)) {
-        ret = JS_NAN;
-    } else {
-        p = str;
-        p += skip_spaces(p);
-        flags = ATOD_INT_ONLY | ATOD_ACCEPT_PREFIX_AFTER_SIGN;
-        ret = js_atof(ctx, p, NULL, radix, flags);
-    }
-    JS_FreeCString(ctx, str);
-    return ret;
-}
-
-static JSValue js_parseFloat(JSContext *ctx, JSValueConst this_val,
-                             int argc, JSValueConst *argv)
-{
-    const char *str, *p;
-    JSValue ret;
-
-    str = JS_ToCString(ctx, argv[0]);
-    if (!str)
-        return JS_EXCEPTION;
-    p = str;
-    p += skip_spaces(p);
-    ret = js_atof(ctx, p, NULL, 10, 0);
-    JS_FreeCString(ctx, str);
-    return ret;
-}
 
 /* Boolean */
 static JSValue js_boolean_constructor(JSContext *ctx, JSValueConst new_target,
@@ -64991,8 +65045,8 @@ static JSValue js_global_unescape(JSContext *ctx, JSValueConst this_val,
 /* global object */
 
 static const JSCFunctionListEntry js_global_funcs[] = {
-    JS_CFUNC_DEF("parseInt", 2, js_parseInt ),
-    JS_CFUNC_DEF("parseFloat", 1, js_parseFloat ),
+    JS_CFUNC_STEP_DEF("parseInt", 2, STEPDEF_PARSEINT ),
+    JS_CFUNC_STEP_DEF("parseFloat", 1, STEPDEF_PARSEFLOAT ),
     JS_CFUNC_DEF("isNaN", 1, js_global_isNaN ),
     JS_CFUNC_DEF("isFinite", 1, js_global_isFinite ),
     JS_CFUNC_DEF("queueMicrotask", 1, js_global_queueMicrotask ),
