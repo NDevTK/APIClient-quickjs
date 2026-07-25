@@ -18790,9 +18790,16 @@ typedef struct JSAsyncFromSync {
     JSValue sync_iter;           /* the sync generator being driven (owned) */
     int orig_cfirst, orig_cargc; /* the ORIGINAL OP_call_method operand shape (pop at finish) */
     uint8_t orig_is_tail;
-    uint8_t is_close;            /* 1 = driven from OP_iterator_close (.return over a sync gen): the settle DISCARDS
-                                    the result promise and pops the single iterator operand (sp[-1]), no push. */
+    uint8_t deliver;             /* AFS_* — WHERE the settle puts the wrapper's promise. The three entry opcodes
+                                    differ only in that, so the drive and the settle are shared and this selects
+                                    the tail. */
 } JSAsyncFromSync;
+/* CALL: OP_call_method on wrapper.next(v) — pop the call operands, push the promise.
+   CLOSE: OP_iterator_close — the promise is never awaited: discard it and pop the iterator operand (sp[-1]).
+   ITERNEXT: OP_iterator_next (`for await` / yield* delegation) — the promise REPLACES the argument at sp[-1];
+   the enum_rec below it stays. Without this mode for-await over a sync GENERATOR reached
+   js_async_from_sync_iterator_next -> JS_IteratorNext2 -> js_generator_next, off the tramp. */
+enum { AFS_DELIVER_CALL = 0, AFS_DELIVER_CLOSE, AFS_DELIVER_ITERNEXT };
 static JSValue js_promise_resolve(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
 static __exception int perform_promise_then(JSContext *ctx, JSValueConst promise, JSValueConst *resolve_reject, JSValueConst *cap_resolving_funcs);
 static JSValue js_async_from_sync_iterator_unwrap_func_create(JSContext *ctx, bool done);
@@ -19395,7 +19402,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     void *tramp_consume_state = NULL;                   /* the consumer state awaiting the iterator (JSIterConsume / JSPromiseAll) */
     uint8_t tramp_consume_kind = 0;                     /* CONT_* of tramp_consume_state: CONT_ITER_CONSUME / CONT_PROMISE_ALL */
     JSValue tramp_consume_acquired = JS_UNDEFINED;      /* the acquired iterator handed to do_consume_deliver_iterator (JS_EXCEPTION if GetIterator threw) */
-    int tramp_afs_close = 0;                            /* 1 = enter do_async_from_sync_tramp in CLOSE mode: OP_iterator_close of a for-await wrapper over a sync gen — drive syncGen.return() (magic RETURN) on the tramp, wrap per spec, then DISCARD the promise and pop sp[-1]. read+reset in do_async_from_sync_tramp */
+    int tramp_afs_mode = AFS_DELIVER_CALL;              /* which entry opcode is entering do_async_from_sync_tramp (AFS_DELIVER_*): it decides where the wrapper is on the stack and where its promise goes. read+reset there */
     int tramp_gen_cont_consume = 0;                     /* 1 = this do_generator_tramp drive is a CONSUMER (Array.from / Promise.all) driving a generator held in the consumer state; caller_sp stays put; the direct-mode settle re-enters the consumer's step (by cont_kind) instead of pushing the result */
     JSValueConst tramp_gen_cont_iter = JS_UNDEFINED;    /* the generator the consumer step wants driven (set before goto do_generator_tramp) */
     JSValueConst tramp_gen_cont_arg = JS_UNDEFINED;     /* the RESUME arg a consumer drive forwards to gen.next(v) (async-from-sync .next(v)); UNDEFINED for Array.from/Promise.all. read+reset in do_generator_tramp so it never leaks to the next drive */
@@ -21915,11 +21922,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             /* for await (x of syncGen): OP_call_method on the async-from-sync wrapper's .next(). Create the wrapper's
                result promise + drive syncGen.next() on THIS chain; the settle wraps it and yields the promise (which
                OP_await then awaits). call_argv[-2] = the wrapper (its sync_iter is the generator).
-               CLOSE mode (tramp_afs_close): the wrapper is at sp[-1] (OP_iterator_close), drive syncGen.return() and
-               DISCARD the wrapped promise at the settle (its is_close bit), popping sp[-1]. */
+               CLOSE (OP_iterator_close): the wrapper is at sp[-1], drive syncGen.return() and discard the promise.
+               ITERNEXT (OP_iterator_next, i.e. `for await`): the wrapper is at sp[-4] and the resume argument at
+               sp[-1], which the promise then replaces. */
             {
-                int afs_close = tramp_afs_close; tramp_afs_close = 0;   /* read + reset */
-                JSValueConst wrap = afs_close ? sp[-1] : call_argv[-2];
+                int afs_mode = tramp_afs_mode; tramp_afs_mode = AFS_DELIVER_CALL;   /* read + reset */
+                int afs_close = (afs_mode == AFS_DELIVER_CLOSE);
+                JSValueConst wrap = afs_close ? sp[-1] : (afs_mode == AFS_DELIVER_ITERNEXT ? sp[-4] : call_argv[-2]);
                 JSObject *wp = JS_VALUE_GET_OBJ(wrap);
                 JSAsyncFromSyncIteratorData *ws = wp->u.async_from_sync_iterator_data;
                 JSAsyncFromSync *s = js_mallocz(ctx, sizeof(*s));
@@ -21929,11 +21938,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (JS_IsException(prom)) { js_free_rt(rt, s); goto exception; }
                 s->promise = prom;
                 s->sync_iter = js_dup(ws->sync_iter);
-                s->is_close = afs_close;
+                s->deliver = afs_mode;
                 if (afs_close) { s->orig_cfirst = -1; s->orig_cargc = 0; s->orig_is_tail = 0; }
+                else if (afs_mode == AFS_DELIVER_ITERNEXT) { s->orig_cfirst = 0; s->orig_cargc = 0; s->orig_is_tail = 0; }
                 else { s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail; }
                 tramp_cont_state = s; tramp_cont_kind = CONT_ASYNC_FROM_SYNC; tramp_gen_cont_iter = s->sync_iter;
-                tramp_gen_cont_arg = (!afs_close && call_argc >= 1) ? call_argv[0] : JS_UNDEFINED;   /* forward .next(v)'s v to syncGen.next(v); close forwards no arg */
+                tramp_gen_cont_arg = afs_close ? JS_UNDEFINED
+                                   : (afs_mode == AFS_DELIVER_ITERNEXT ? sp[-1]
+                                      : (call_argc >= 1 ? call_argv[0] : JS_UNDEFINED));   /* forward the resume value to syncGen.next(v); close forwards none */
                 tramp_gen_cont_consume = 1; tramp_gen_magic = afs_close ? GEN_MAGIC_RETURN : GEN_MAGIC_NEXT;
                 goto do_generator_tramp;
             }
@@ -21965,13 +21977,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JS_FreeValue(ctx, value_wrapper); JS_FreeValue(ctx, unwrap);
                 {
                     JSValue r = js_dup(s->promise);
-                    int cfirst = s->orig_cfirst, cargc = s->orig_cargc; uint8_t itail = s->orig_is_tail, isclose = s->is_close;
+                    int cfirst = s->orig_cfirst, cargc = s->orig_cargc; uint8_t itail = s->orig_is_tail, deliver = s->deliver;
                     JSValue *cargv;
                     js_async_from_sync_end(ctx, s); js_free_rt(rt, s);
                     cargv = sp - cargc;
                     for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
                     sp += cfirst - cargc;
-                    if (isclose) { JS_FreeValue(ctx, r); BREAK; }   /* OP_iterator_close: discard the wrapped promise (bytecode never awaits it) */
+                    if (deliver == AFS_DELIVER_CLOSE) { JS_FreeValue(ctx, r); BREAK; }   /* the promise is never awaited */
+                    if (deliver == AFS_DELIVER_ITERNEXT) { JS_FreeValue(ctx, sp[-1]); sp[-1] = r; BREAK; }   /* replaces the resume arg; OP_await takes it from there */
                     if (itail) { ret_val = r; goto do_return; }
                     *sp++ = r;
                     BREAK;
@@ -21979,7 +21992,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             async_from_sync_reject:
                 {
                     JSValue err = JS_GetException(ctx), rr2, r;
-                    int cfirst = s->orig_cfirst, cargc = s->orig_cargc; uint8_t itail = s->orig_is_tail, isclose = s->is_close;
+                    int cfirst = s->orig_cfirst, cargc = s->orig_cargc; uint8_t itail = s->orig_is_tail, deliver = s->deliver;
                     JSValue *cargv;
                     rr2 = JS_Call(ctx, s->resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
                     JS_FreeValue(ctx, err); JS_FreeValue(ctx, rr2);
@@ -21988,7 +22001,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     cargv = sp - cargc;
                     for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
                     sp += cfirst - cargc;
-                    if (isclose) { JS_FreeValue(ctx, r); BREAK; }   /* OP_iterator_close: discard the wrapped rejected promise */
+                    if (deliver == AFS_DELIVER_CLOSE) { JS_FreeValue(ctx, r); BREAK; }   /* never awaited */
+                    if (deliver == AFS_DELIVER_ITERNEXT) { JS_FreeValue(ctx, sp[-1]); sp[-1] = r; BREAK; }
                     if (itail) { ret_val = r; goto do_return; }
                     *sp++ = r;
                     BREAK;
@@ -23897,7 +23911,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (JS_VALUE_GET_TAG(si) == JS_TAG_OBJECT) {
                             JSObject *sip = JS_VALUE_GET_OBJ(si);
                             if (sip->class_id == JS_CLASS_GENERATOR && sip->u.generator_data) {
-                                tramp_afs_close = 1; goto do_async_from_sync_tramp;
+                                tramp_afs_mode = AFS_DELIVER_CLOSE; goto do_async_from_sync_tramp;
                             }
                         }
                     }
@@ -24054,6 +24068,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    the C-recursion JS_Call -> js_generator_next drive-to-completion (deleted). */
                 if (tramp_gen_method_magic(sp[-3], sp[-4]) == GEN_MAGIC_NEXT) {
                     tramp_gen_magic = GEN_MAGIC_NEXT; tramp_gen_iternext = 1; goto do_generator_tramp;
+                }
+                /* `for await (x of syncGen)` and `yield* asyncFromSync`: the iterator is the async-from-sync
+                   WRAPPER, whose .next() drives the sync iterator from C
+                   (js_async_from_sync_iterator_next -> JS_IteratorNext2 -> js_generator_next). OP_call_method
+                   already routed the direct `wrapper.next()` spelling; this is the SAME wrapper reached through
+                   the loop opcode, and leaving it out is why the AsyncFromSyncIteratorPrototype tree aborted. */
+                if (JS_VALUE_GET_TAG(sp[-4]) == JS_TAG_OBJECT) {
+                    JSObject *wp2 = JS_VALUE_GET_OBJ(sp[-4]);
+                    if (wp2->class_id == JS_CLASS_ASYNC_FROM_SYNC_ITERATOR && wp2->u.async_from_sync_iterator_data) {
+                        JSValueConst si2 = ((JSAsyncFromSyncIteratorData *)wp2->u.async_from_sync_iterator_data)->sync_iter;
+                        if (JS_VALUE_GET_TAG(si2) == JS_TAG_OBJECT
+                            && JS_VALUE_GET_OBJ(si2)->class_id == JS_CLASS_GENERATOR
+                            && JS_VALUE_GET_OBJ(si2)->u.generator_data) {
+                            tramp_afs_mode = AFS_DELIVER_ITERNEXT; goto do_async_from_sync_tramp;
+                        }
+                    }
                 }
                 ret = JS_Call(ctx, sp[-3], sp[-4], 1, vc(sp - 1));
                 if (JS_IsException(ret))
@@ -48875,12 +48905,16 @@ static bool tramp_can_call_setmap_consume(JSContext *ctx, JSValueConst func, JSV
     if (fp->u.cfunc.cproto != JS_CFUNC_constructor_magic) return false;
     if (fp->u.cfunc.c_function.constructor_magic != js_map_constructor) return false;
     magic = fp->u.cfunc.magic;
-    if (magic & MAGIC_WEAK) return false;   /* WeakSet/WeakMap: out of scope */
-    /* ANY callable @@iterator, primitives included — the same widening Array.from took in cf07b09, where the
-       primitive exclusion turned out to CAUSE the abort it looked like it avoided (acquisition ran from C, the
-       one place a generator @@iterator cannot suspend). */
-    if (!iter_data_at_iterator(ctx, call_argv[0], out_getiter)) return false;
-    if (!JS_IsFunction(ctx, *out_getiter)) { JS_FreeValue(ctx, *out_getiter); *out_getiter = JS_UNDEFINED; return false; }
+    /* WeakSet/WeakMap were excluded as "out of scope". They take the SAME constructor, the same adder selection
+       (MAGIC_SET picks add over set) and the same per-element rule, so the exclusion bought nothing and cost the
+       route: `new WeakMap([[k,v]])` reached the C entry, whose iteration loop is deleted, and aborted.
+       The @@iterator PROBE is likewise no longer a gate. It is side-effect-free, so it declines a getter
+       @@iterator, a Proxy and an absent one — and the acquire performs the REAL GetMethod for exactly those
+       cases, running the getter and raising GetIterator's own TypeError in spec order. Refusing the route on a
+       failed probe handed those back to the deleted loop. What is left is the one shape that does NOT iterate:
+       a nullish iterable, which per 24.1.1.1 step 2 yields the empty collection before the adder is even read. */
+    if (JS_IsUndefined(call_argv[0]) || JS_IsNull(call_argv[0])) return false;
+    iter_data_at_iterator(ctx, call_argv[0], out_getiter);   /* JS_UNDEFINED when absent/uncallable => the acquire decides */
     *out_magic = magic;
     return true;
 }
