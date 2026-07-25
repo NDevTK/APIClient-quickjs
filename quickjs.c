@@ -18014,6 +18014,13 @@ typedef struct JSTrampStepDef {
     int      arg;
 } JSTrampStepDef;
 static const JSTrampStepDef *tramp_step_def_of(JSValueConst func);
+#define CONT_TOPRIM        21  /* cont_state = JSToPrim: ToPrimitive's method call (7.1.1) running ON THE TRAMP.
+                                  JS_ToPrimitiveFree calls @@toPrimitive / valueOf / toString with JS_CallFree, from
+                                  C — so a user coercion method containing a loop preempts in an activation with no
+                                  flow base. The operator site drives the method here instead, writes the primitive
+                                  back into the operand slot, and RE-EXECUTES its opcode: everything before the
+                                  coercion is a tag test, so re-running it is free and the remaining operands are
+                                  coerced in spec order by the same retry. */
 #define CONT_STEP          17  /* cont_state = a step builtin's state; ONE continuation kind for ALL of them. */
 /* EVERY step state begins with this header. The driver keeps NOTHING in a C local: a flow suspends and resumes
    through async_func_resume, which re-enters JS_CallInternal with all locals reset — so the step definition and
@@ -18081,6 +18088,7 @@ static void *tramp_step_state_new(JSContext *ctx, const JSTrampStepDef *sd, JSVa
     h->func_obj = js_dup(func_obj);
     return h;
 }
+
 
 /* argv[i] for i >= argc is UNDEFINED. js_call_c_function pads its arg_buf out to the function's declared arity,
    so a C body may read argv[1] of a zero-argument call; a step machine is handed the CALL's real operands, so
@@ -18235,6 +18243,27 @@ static JSValue tramp_step_state_free(JSContext *ctx, void *st, bool take_result)
     h->this_val = JS_UNDEFINED;
     h->func_obj = JS_UNDEFINED;
     return h->def->fini(ctx, st, take_result);
+}
+
+struct JSToPrim;
+static void js_toprim_abandon(JSContext *ctx, struct JSToPrim *tp);
+/* The chain is not homogeneous: a machine's outer is another machine, EXCEPT that a machine invoked as a
+   coercion method (`{valueOf: [].sort}`) is waited on by a ToPrimitive sequence. The kind on each link says which,
+   so the walk asks rather than assuming — assuming would free a JSToPrim through JSStepHdr's teardown. */
+static void tramp_step_chain_free(JSContext *ctx, void *st)
+{
+    while (st) {
+        JSStepHdr *h = st;
+        void *nxt = h->outer;
+        uint8_t nk = h->outer_kind;
+        tramp_step_state_free(ctx, h, false);
+        if (nxt && nk == CONT_TOPRIM) {
+            js_toprim_abandon(ctx, nxt);   /* which walks whatever waits on IT */
+            return;
+        }
+        DCHECK(!nxt || nk == CONT_STEP, "step outer continuation: unknown sequence kind");
+        st = nxt;
+    }
 }
 enum { ArrayFind, ArrayFindIndex, ArrayFindLast, ArrayFindLastIndex };
 /* ORed into the find family's mode for the TypedArray receivers. The find STEP is already receiver-agnostic (it
@@ -18696,13 +18725,9 @@ typedef struct JSIterFrom { int orig_cfirst, orig_cargc; uint8_t orig_is_tail; }
                                    three acquire shapes (inline C-function call, generator create, bytecode call)
                                    arrive at the consumer identically. */
 typedef struct JSConsumeGetIter { void *consumer; uint8_t consumer_kind; } JSConsumeGetIter;
-#define CONT_TOPRIM        21  /* cont_state = JSToPrim: ToPrimitive's method call (7.1.1) running ON THE TRAMP.
-                                  JS_ToPrimitiveFree calls @@toPrimitive / valueOf / toString with JS_CallFree, from
-                                  C — so a user coercion method containing a loop preempts in an activation with no
-                                  flow base. The operator site drives the method here instead, writes the primitive
-                                  back into the operand slot, and RE-EXECUTES its opcode: everything before the
-                                  coercion is a tag test, so re-running it is free and the remaining operands are
-                                  coerced in spec order by the same retry. */
+/* Abandon a machine AND every machine waiting on it. `arr.map(String)` is an outer waiting on an inner; a
+   coercion requested by that inner adds a third. Six sites had this loop written out and each one was a chance
+   to stop at the first link — which is exactly how the ToPrimitive unwind leaked the realm. */
 typedef struct JSToPrim {
     JSValue obj;              /* the object being coerced (owned) */
     const uint8_t *retry_pc;  /* OPERAND mode: the opcode byte to re-execute once the slot holds a primitive */
@@ -18712,7 +18737,38 @@ typedef struct JSToPrim {
     uint8_t hint;             /* HINT_STRING / HINT_NUMBER (the ordinary-method order) */
     uint8_t hint_none;        /* 1 = the caller's hint was HINT_NONE: @@toPrimitive gets "default" */
     uint8_t stage;            /* 0 = @@toPrimitive, 1 = its result pending, 2/3 = the ordinary methods */
+    JSValue cb[3];            /* [this, method, hint?] — the coercion call's operands, OWNED here. They used to be
+                                 pushed onto the CALLER's stack, guarded by a DCHECK against its compiled
+                                 stack_size — a frame that merely wrote `a + b` has no obligation to have three
+                                 spare slots, so that guard was a crash waiting for a small frame. Owning them
+                                 also makes this sequence's dispatch identical in shape to every other one's,
+                                 which is what lets there be a single dispatch instead of a copy per sequence. */
 } JSToPrim;
+
+static void js_toprim_free_cb(JSContext *ctx, struct JSToPrim *tp)
+{
+    int i;
+    for (i = 0; i < 3; i++) { JS_FreeValue(ctx, tp->cb[i]); tp->cb[i] = JS_UNDEFINED; }
+}
+
+static void js_toprim_free(JSContext *ctx, struct JSToPrim *tp)
+{
+    js_toprim_free_cb(ctx, tp);
+    JS_FreeValue(ctx, tp->obj);
+    js_free_rt(ctx->rt, tp);
+}
+
+/* 7.1.1 propagates an abrupt completion — there is no next-method fallback — so the sequence dies, and with it
+   the machine that asked for the primitive and whoever was waiting on that. */
+static void js_toprim_abandon(JSContext *ctx, struct JSToPrim *tp)
+{
+    void *touter = tp->outer;
+    DCHECK(!touter || tp->outer_kind == CONT_STEP,
+           "ToPrimitive outer continuation: unknown machine kind");
+    js_toprim_free(ctx, tp);
+    tramp_step_chain_free(ctx, touter);
+}
+
 #define CONT_FOROF_NEXT    20  /* cont_state = NULL (the enum_rec offset rides the frame's forof_off): `for (x of it)`
                                   where it.next is a NORMAL bytecode function. Its body runs on THIS chain, so a loop
                                   in a hand-written .next() preempts; js_for_of_next -> JS_IteratorNext -> JS_Call was
@@ -19733,6 +19789,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSAtom gp_atom = JS_ATOM_NULL;                      /* machine the value is delivered to. */
     void *gp_outer = NULL;
     uint8_t gp_outer_kind = CONT_NONE;
+    void *cd_outer = NULL;                              /* do_cont_dispatch: the sequence awaiting the call's result */
+    uint8_t cd_outer_kind = CONT_NONE;
     uint8_t tp_outer_kind = CONT_NONE;
     int tramp_cont_forof = 0;                           /* CONT_FOROF_NEXT: the enum_rec stack offset for the .next() drive about to be pushed. Rides the frame's forof_off (read+reset in do_tramp_call) so no per-iteration heap state is allocated for what is one int. */
     int tramp_gen_forof = 1;                            /* <0 = for-of iterator stack offset (always -3-.. ); 1 = direct .next() (no valid offset is positive) */
@@ -21468,12 +21526,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValue *cb = NULL; int cbn = 0;
                 int st = h->def->step(ctx, stt, ret_val, &cb, &cbn);
                 if (unlikely(st < 0)) {
-                    void *souter = h->outer;
-                    tramp_step_state_free(ctx, stt, false);
-                    while (souter) {   /* the machines waiting on this one go with it */
-                        JSStepHdr *oh = souter; souter = oh->outer;
-                        tramp_step_state_free(ctx, oh, false);
-                    }
+                    tramp_step_chain_free(ctx, stt);   /* and the machines waiting on it */
                     goto exception;
                 }
                 if (st == 0) {
@@ -21484,9 +21537,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JSValue *cargv = sp - cargc;
                     for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
                     sp += cfirst - cargc;
-                    if (souter) {   /* an inner machine: its result is the outer step's callback result */
-                        DCHECK(souter_kind == CONT_STEP, "step outer continuation: unknown machine kind");
+                    if (souter) {   /* something is waiting on this machine's result */
                         ret_val = r; cont_st = souter;
+                        if (souter_kind == CONT_TOPRIM)
+                            goto do_toprim_step;   /* the machine WAS a coercion method */
+                        DCHECK(souter_kind == CONT_STEP, "step outer continuation: unknown sequence kind");
                         goto do_step_step;
                     }
                     if (itail) { ret_val = r; goto do_return; }
@@ -21533,35 +21588,54 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 DCHECK(st == 3, "step builtin: unknown step code");
                 call_argv = (JSValueConst *)&cb[2];
                 call_argc = cbn; tramp_first = -2; tramp_is_tail = 0;
-                if (tramp_can_call(call_argv[-1])) {
-                    tramp_cont_state = stt; tramp_cont_kind = CONT_STEP;
-                    goto do_tramp_call;
-                }
-                if (tramp_step_def_of(call_argv[-1])) {
-                    /* the callback IS a step machine (`arr.map(String)`): drive it through the same entry with an
-                       outer continuation, never in place — in place is js_call_c_function's DFAIL. */
-                    tramp_step_outer = stt; tramp_step_outer_kind = CONT_STEP;
-                    goto do_step_tramp;
-                }
-                /* a C/bound callback has no preemptible body, so running it inline suspends nothing — the step
-                   machine still owns the loop state, so the builtin stays parkable between callbacks. */
-                ret_val = JS_Call(ctx, call_argv[-1], call_argv[-2], call_argc, call_argv);
-                if (unlikely(JS_IsException(ret_val))) goto step_abandon;
-                cont_st = stt;
-                goto do_step_step;
+                cd_outer = stt; cd_outer_kind = CONT_STEP;
+                goto do_cont_dispatch;
 
             step_abandon:
-                /* an INLINE call/construct threw (a C callee, so nothing suspended). The machine that asked can
-                   never be reached again, and neither can the machines waiting on IT — the same chain the st < 0
-                   arm above walks, and the same one CONT_TOPRIM had to learn to walk. */
+                /* an INLINE call/construct threw (a C callee, so nothing suspended): the machine that asked can
+                   never be reached again, and neither can the machines waiting on IT. The machine is `cont_st`,
+                   which is the ONE variable both arms that jump here agree on — reading it from a local that only
+                   the CALL arm set left the CONSTRUCT arm freeing a machine that was already gone. */
+                tramp_step_chain_free(ctx, cont_st);
+                goto exception;
+            }
+
+        do_cont_dispatch:
+            /* THE dispatch for a continuation-holding SEQUENCE's call. Every such sequence — a step machine's
+               callback, the ToPrimitive method walk — holds its operands in its OWN buffer (never the caller's
+               compiler-sized stack) and needs the result delivered back to itself rather than pushed. The three
+               callee shapes are asked about HERE and nowhere else: this used to be two copies, one per sequence,
+               and a third would be how one callee starts answering differently depending on which sequence
+               invoked it. Entered with call_argv/call_argc/tramp_first set and cd_outer/cd_outer_kind naming the
+               sequence. */
+            {
+                if (tramp_can_call(call_argv[-1])) {
+                    tramp_cont_state = cd_outer; tramp_cont_kind = cd_outer_kind;
+                    cd_outer = NULL; cd_outer_kind = CONT_NONE;
+                    goto do_tramp_call;               /* a bytecode body: it runs here and can park */
+                }
+                if (tramp_step_def_of(call_argv[-1])) {
+                    /* the callee IS a step machine (`arr.map(String)`, `{valueOf: [].sort}`): drive it through the
+                       one step entry with this sequence as its outer continuation, never in place — in place is
+                       js_call_c_function's DFAIL. */
+                    tramp_step_outer = cd_outer; tramp_step_outer_kind = cd_outer_kind;
+                    cd_outer = NULL; cd_outer_kind = CONT_NONE;
+                    goto do_step_tramp;
+                }
+                /* a C/bound callee has no preemptible body, so running it inline suspends nothing — the sequence
+                   still owns its state, so it stays parkable between calls. */
                 {
-                    void *souter = h->outer;
-                    tramp_step_state_free(ctx, stt, false);
-                    while (souter) {
-                        JSStepHdr *oh = souter; souter = oh->outer;
-                        tramp_step_state_free(ctx, oh, false);
+                    uint8_t ckind = cd_outer_kind;
+                    cont_st = cd_outer;
+                    cd_outer = NULL; cd_outer_kind = CONT_NONE;
+                    ret_val = JS_Call(ctx, call_argv[-1], call_argv[-2], call_argc, call_argv);
+                    if (ckind == CONT_STEP) {
+                        if (unlikely(JS_IsException(ret_val))) goto step_abandon;
+                        goto do_step_step;
                     }
-                    goto exception;
+                    DCHECK(ckind == CONT_TOPRIM, "do_cont_dispatch: unknown sequence kind");
+                    if (unlikely(JS_IsException(ret_val))) { js_toprim_abandon(ctx, cont_st); goto exception; }
+                    goto do_toprim_step;
                 }
             }
 
@@ -21762,12 +21836,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSToPrim *tp = (JSToPrim *)cont_st;
                 JSValue method;
                 JSAtom mname;
+                js_toprim_free_cb(ctx, tp);   /* the call that produced ret_val is finished with its operands */
                 if (JS_VALUE_GET_TAG(ret_val) != JS_TAG_UNINITIALIZED) {
                     if (tp->stage == 1 && !JS_IsUninitialized(ret_val)) {
                         /* @@toPrimitive's result: 7.1.1 step 2.d — it MUST be primitive, there is no fallback. */
                         if (JS_VALUE_GET_TAG(ret_val) == JS_TAG_OBJECT) {
                             JS_FreeValue(ctx, ret_val);
-                            JS_FreeValue(ctx, tp->obj); js_free_rt(rt, tp);
+                            js_toprim_free(ctx, tp);
                             JS_ThrowTypeError(ctx, "toPrimitive");
                             goto exception;
                         }
@@ -21789,12 +21864,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             JSValue harg = JS_AtomToString(ctx, tp->hint_none ? JS_ATOM_default
                                                            : (tp->hint == HINT_STRING ? JS_ATOM_string : JS_ATOM_number));
                             if (JS_IsException(harg)) { JS_FreeValue(ctx, method); goto toprim_throw; }
-                            DCHECK(sp + 3 <= TRAMP_SP_LIMIT(sf),
-                                   "ToPrimitive drive: operand push exceeds the frame's compiled stack_size");
-                            *sp++ = js_dup(tp->obj);   /* this */
-                            *sp++ = method;            /* the method (owned, transferred) */
-                            *sp++ = harg;              /* the hint string */
-                            call_argv = sp - 1; call_argc = 1; tramp_first = -2; tramp_is_tail = 0;
+                            tp->cb[0] = js_dup(tp->obj);   /* this */
+                            tp->cb[1] = method;            /* the method (owned, transferred) */
+                            tp->cb[2] = harg;              /* the hint string */
+                            call_argv = (JSValueConst *)&tp->cb[2]; call_argc = 1;
+                            tramp_first = -2; tramp_is_tail = 0;
                             goto toprim_dispatch;
                         }
                         JS_FreeValue(ctx, method);
@@ -21812,31 +21886,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     method = JS_GetProperty(ctx, tp->obj, mname);
                     if (JS_IsException(method)) goto toprim_throw;
                     if (!JS_IsFunction(ctx, method)) { JS_FreeValue(ctx, method); continue; }
-                    DCHECK(sp + 2 <= TRAMP_SP_LIMIT(sf),
-                           "ToPrimitive drive: operand push exceeds the frame's compiled stack_size");
-                    *sp++ = js_dup(tp->obj);
-                    *sp++ = method;
-                    call_argv = sp; call_argc = 0; tramp_first = -2; tramp_is_tail = 0;
+                    tp->cb[0] = js_dup(tp->obj);
+                    tp->cb[1] = method;
+                    call_argv = (JSValueConst *)&tp->cb[2]; call_argc = 0;
+                    tramp_first = -2; tramp_is_tail = 0;
                     goto toprim_dispatch;
                 }
             toprim_dispatch:
-                /* a BYTECODE coercion method runs its body here, so a loop in it parks; a C one has no body to
-                   suspend and is called in place. */
-                if (tramp_can_call(call_argv[-1])) {
-                    tramp_cont_state = tp; tramp_cont_kind = CONT_TOPRIM;
-                    goto do_tramp_call;
-                }
-                { JSValue cr = JS_Call(ctx, call_argv[-1], call_argv[-2], call_argc, call_argv);
-                  for (i = -2; i < call_argc; i++) JS_FreeValue(ctx, call_argv[i]);
-                  sp -= 2 + call_argc;
-                  if (JS_IsException(cr)) goto toprim_throw;
-                  ret_val = cr; cont_st = tp; goto do_toprim_step; }
+                cd_outer = tp; cd_outer_kind = CONT_TOPRIM;
+                goto do_cont_dispatch;
             toprim_deliver:
                 {
                     const uint8_t *rpc = tp->retry_pc;
                     int slot = tp->slot;
                     void *touter = tp->outer; uint8_t touter_kind = tp->outer_kind;
-                    JS_FreeValue(ctx, tp->obj); js_free_rt(rt, tp);
+                    js_toprim_free(ctx, tp);
                     if (touter) {
                         /* MACHINE mode: a coercing BUILTIN asked for this primitive; it comes back as that step's
                            result, exactly as a callback's would. */
@@ -21852,16 +21916,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
             toprim_throw:
                 {
-                    void *touter = tp->outer; uint8_t touter_kind = tp->outer_kind;
-                    JS_FreeValue(ctx, tp->obj); js_free_rt(rt, tp);
-                    /* the machine that asked goes with the coercion, and so do the machines waiting on IT —
-                       `[x].map(String)` is an outer waiting on an inner that asked for a primitive. */
-                    DCHECK(!touter || touter_kind == CONT_STEP,
-                           "ToPrimitive outer continuation: unknown machine kind");
-                    while (touter) {
-                        JSStepHdr *oh = touter; touter = oh->outer;
-                        tramp_step_state_free(ctx, oh, false);
-                    }
+                    js_toprim_abandon(ctx, tp);
                     goto exception;
                 }
             }
@@ -21937,10 +21992,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 {
                     void *gouter = gp_outer;
                     gp_outer = NULL; gp_outer_kind = CONT_NONE; gp_atom = JS_ATOM_NULL;
-                    while (gouter) {
-                        JSStepHdr *oh = gouter; gouter = oh->outer;
-                        tramp_step_state_free(ctx, oh, false);
-                    }
+                    tramp_step_chain_free(ctx, gouter);
                     goto exception;
                 }
 
@@ -23588,21 +23640,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         ret_val = js_proxy_get_invariant(ctx, gp->target, gp->atom, ret_val);
                     js_getprop_free(ctx, gp);
                     if (unlikely(JS_IsException(ret_val))) {
-                        while (gouter) {
-                            JSStepHdr *oh = gouter; gouter = oh->outer;
-                            tramp_step_state_free(ctx, oh, false);
-                        }
+                        tramp_step_chain_free(ctx, gouter);
                         goto exception;
                     }
                     cont_st = gouter;
                     goto do_step_step;
                 }
                 if (rck == CONT_TOPRIM) {
-                    /* the coercion method returned: drop its operands and feed the result to the sequence, which
-                       either delivers a primitive or moves on to the next method. */
-                    JSValue *cargv = sp - cargc;
-                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
-                    sp += cfirst - cargc;
+                    /* the coercion method returned: feed the result to the sequence, which either delivers a
+                       primitive or moves on to the next method. Its operands live in the sequence's own buffer,
+                       so nothing on the caller's stack moves — do_toprim_step releases them on re-entry. */
                     cont_st = rcs;
                     goto do_toprim_step;
                 }
@@ -26648,26 +26695,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         } else if (xck == CONT_TOPRIM) {
             /* the coercion method THREW: 7.1.1 propagates it (there is no next-method fallback on an abrupt
                completion), so drop the sequence state and re-raise in the operator's frame. */
-            JSToPrim *tp = xcs;
-            void *touter = tp->outer;
-            uint8_t touter_kind = tp->outer_kind;   /* read BEFORE the free — tp is gone below */
-            JSValue *cargv = sp - xcg;
-            for (i = xcf; i < xcg; i++) JS_FreeValue(ctx, cargv[i]);
-            sp += xcf - xcg;
-            JS_FreeValue(ctx, tp->obj);
-            js_free_rt(rt, tp);
             /* A coercion requested BY A MACHINE goes with it — the machine is waiting on a primitive that will
-               never arrive, and nothing else will ever reach its state again. Dropping only the JSToPrim leaked
-               the machine, and with it hdr.argv (the callback closure) and hdr.func_obj, which retain the realm:
-               353 objects for `String({valueOf(){throw}, toString(){throw}})`. The toprim_throw label already
-               did this for a throw raised inside the sequence's own C code; a throw from the USER's method
-               unwinds through HERE instead, and the two paths had drifted. */
-            DCHECK(!touter || touter_kind == CONT_STEP,
-                   "ToPrimitive outer continuation: unknown machine kind");
-            while (touter) {
-                JSStepHdr *oh = touter; touter = oh->outer;
-                tramp_step_state_free(ctx, oh, false);
-            }
+               never arrive. Dropping only the JSToPrim leaked the machine, and with it hdr.argv (the callback
+               closure) and hdr.func_obj, which retain the realm: 353 objects for
+               `String({valueOf(){throw}, toString(){throw}})`. The sequence's own throw label already did this;
+               a throw from the USER's method unwinds through HERE instead, and the two had drifted, which is why
+               there is now one function and no loop written out at either site. */
+            js_toprim_abandon(ctx, xcs);
             goto exception;
         } else if (xck == CONT_FOROF_NEXT) {
             /* the plain iterator's .next() THREW. js_for_of_next's own abrupt handling: clear the enum_rec's
@@ -26754,10 +26788,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             DCHECK(!gouter || gp->outer_kind == CONT_STEP,
                    "property-get outer continuation: unknown machine kind");
             js_getprop_free(ctx, gp);
-            while (gouter) {
-                JSStepHdr *oh = gouter; gouter = oh->outer;
-                tramp_step_state_free(ctx, oh, false);
-            }
+            tramp_step_chain_free(ctx, gouter);
         } else if (xck == CONT_CONSTRUCT) {
             /* the throwing frame was a constructor body: drop the created `this` and the super ctor ref. For
                new C() the operands on the caller stack are freed by the caller's own catch-search; for super()
