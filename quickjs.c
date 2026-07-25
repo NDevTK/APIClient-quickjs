@@ -18449,6 +18449,12 @@ typedef struct JSIterFrom { int orig_cfirst, orig_cargc; uint8_t orig_is_tail; }
                                    three acquire shapes (inline C-function call, generator create, bytecode call)
                                    arrive at the consumer identically. */
 typedef struct JSConsumeGetIter { void *consumer; uint8_t consumer_kind; } JSConsumeGetIter;
+#define CONT_FOROF_NEXT    20  /* cont_state = NULL (the enum_rec offset rides the frame's forof_off): `for (x of it)`
+                                  where it.next is a NORMAL bytecode function. Its body runs on THIS chain, so a loop
+                                  in a hand-written .next() preempts; js_for_of_next -> JS_IteratorNext -> JS_Call was
+                                  a C recursion that drove it to completion. do_return applies IteratorNext's
+                                  "result must be an object" check and IteratorComplete/IteratorValue, and places
+                                  [value, done] exactly where js_for_of_next's tail does. */
 
 
 static JSValue js_iterator_from(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
@@ -19306,6 +19312,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     uint8_t tramp_cont_kind = CONT_NONE, cont_kind_cur = CONT_NONE;
     int iter_special = 0;
     int tramp_gen_magic = 0;                            /* set before goto do_generator_tramp */
+    int tramp_cont_forof = 0;                           /* CONT_FOROF_NEXT: the enum_rec stack offset for the .next() drive about to be pushed. Rides the frame's forof_off (read+reset in do_tramp_call) so no per-iteration heap state is allocated for what is one int. */
     int tramp_gen_forof = 1;                            /* <0 = for-of iterator stack offset (always -3-.. ); 1 = direct .next() (no valid offset is positive) */
     int tramp_ith_forof = 1;                            /* Iterator Helper for-of drive: <0 = iterator stack offset; 1 = direct. read+reset by do_iter_helper_tramp */
     int tramp_gen_iternext = 0;                         /* 1 = OP_iterator_next drive (yield* / destructuring): iterator at sp[-4], arg at sp[-1], result OBJECT replaces sp[-1] */
@@ -20296,6 +20303,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 ntf->arg_allocated = narg_alloc; ntf->callee_argc = eff_argc;
                 ntf->async_data = NULL; ntf->async_promise = JS_UNDEFINED; ntf->gen_data = NULL;
                 ntf->cont_state = tramp_cont_state; ntf->cont_kind = tramp_cont_kind; tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;   /* NORMAL frame; iter_state set only for an array-iteration callback */
+                ntf->forof_off = tramp_cont_forof; tramp_cont_forof = 0;   /* CONT_FOROF_NEXT's enum_rec offset; 0 (never a valid offset) otherwise */
                 sf = nsf; b = nb; ctx = nb->realm;
                 arg_buf = narg_buf; var_buf = nvar_buf; stack_buf = nstack_buf;
                 var_refs = np->u.func.var_refs;
@@ -22745,6 +22753,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 TrampFrame *rtf = tf_top;
                 int cfirst, cargc; uint8_t itail;
                 void *rcs = rtf->cont_state; uint8_t rck = rtf->cont_kind;
+                int rfof = rtf->forof_off;   /* CONT_FOROF_NEXT: the enum_rec offset, relative to the restored caller sp */
                 if (unlikely(sf->var_ref_count != 0)) close_var_refs(rt, sf);
                 for (pval = local_buf; pval < sp; pval++) JS_FreeValue(ctx, *pval);
                 js_free_rt(rt, local_buf);
@@ -22807,6 +22816,39 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                     cont_st = rcs; cont_kind_cur = CONT_ITER_HELPER;
                     goto do_iter_helper_step;
+                }
+                if (rck == CONT_FOROF_NEXT) {
+                    /* the plain iterator's .next() returned: IteratorNext's object check, then
+                       IteratorComplete/IteratorValue, then js_for_of_next's exact tail — [value, done] pushed above
+                       the enum_rec, and the enum_rec's iterator slot cleared on done so the loop's
+                       OP_iterator_close does not close an exhausted iterator. */
+                    JSValue *cargv = sp - cargc;
+                    JSValue value;
+                    int done;
+                    DCHECK(cargc - cfirst == 2, "for-of next frame has an unexpected operand shape");
+                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
+                    sp += cfirst - cargc;
+                    DCHECK(rfof <= -3, "CONT_FOROF_NEXT frame carries no enum_rec offset");
+                    if (unlikely(!JS_IsObject(ret_val))) {
+                        JS_FreeValue(ctx, ret_val);
+                        JS_ThrowTypeError(ctx, "iterator must return an object");
+                        JS_FreeValue(ctx, sp[rfof]); sp[rfof] = JS_UNDEFINED;
+                        goto exception;
+                    }
+                    value = JS_IteratorGetCompleteValue(ctx, ret_val, &done);   /* reads .done then .value */
+                    JS_FreeValue(ctx, ret_val);
+                    if (unlikely(JS_IsException(value))) {
+                        JS_FreeValue(ctx, sp[rfof]); sp[rfof] = JS_UNDEFINED;
+                        goto exception;
+                    }
+                    if (done) {
+                        JS_FreeValue(ctx, sp[rfof]); sp[rfof] = JS_UNDEFINED;
+                        JS_FreeValue(ctx, value); value = JS_UNDEFINED;
+                    }
+                    sp[0] = value;
+                    sp[1] = js_bool(done);
+                    sp += 2;
+                    BREAK;
                 }
                 if (rck == CONT_CONSUME_GETITER) {
                     /* the bytecode @@iterator returned: GetIterator step 5 (the result must be an Object), then the
@@ -23770,6 +23812,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 if (tramp_can_call_iter_helper(sp[offset + 1], sp[offset])) {   /* for-of over a lazy Iterator Helper -> drive on THIS chain */
                     tramp_ith_forof = offset; goto do_iter_helper_tramp;
+                }
+                if (tramp_can_call(sp[offset + 1])) {
+                    /* A PLAIN iterator whose .next() is a normal bytecode function — the ordinary
+                       `{[Symbol.iterator]() { return { next() {…} } }}` shape. Its body runs on THIS chain so a
+                       loop in it preempts; js_for_of_next reached it through JS_IteratorNext -> JS_Call, a C
+                       recursion whose back-edge preempt has no flow base (the gen_state-NULL DFAIL). */
+                    JSValueConst itv = sp[offset], nextv = sp[offset + 1];
+                    DCHECK(sp + 2 <= TRAMP_SP_LIMIT(sf),
+                           "for-of .next() drive: operand push exceeds the frame's compiled stack_size");
+                    *sp++ = js_dup(itv);      /* this */
+                    *sp++ = js_dup(nextv);    /* the next method */
+                    call_argv = sp; call_argc = 0; tramp_first = -2; tramp_is_tail = 0;
+                    tramp_cont_forof = offset;   /* rides the frame; sp is restored to here before it is used */
+                    tramp_cont_state = NULL; tramp_cont_kind = CONT_FOROF_NEXT;
+                    goto do_tramp_call;
                 }
                 if (js_for_of_next(ctx, sp, offset))
                     goto exception;
@@ -25675,6 +25732,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         TrampFrame *rtf = tf_top;
         void *xcs = rtf->cont_state; uint8_t xck = rtf->cont_kind;
         int xcf = rtf->call_first, xcg = rtf->call_argc;   /* the throwing call's own operand shape on the caller stack */
+        int xfof = rtf->forof_off;   /* CONT_FOROF_NEXT: the enum_rec offset, relative to the restored caller sp */
         if (unlikely(sf->var_ref_count != 0)) close_var_refs(rt, sf);
         for (pval = local_buf; pval < sp; pval++) JS_FreeValue(ctx, *pval);
         js_free_rt(rt, local_buf);
@@ -25698,6 +25756,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             cit->done = 1;
             cit->executing = 0;
             iter_helper_close_source_abrupt(ctx, cit);
+        } else if (xck == CONT_FOROF_NEXT) {
+            /* the plain iterator's .next() THREW. js_for_of_next's own abrupt handling: clear the enum_rec's
+               iterator slot (a failed IteratorNext leaves the iterator [[Done]] — the loop's OP_iterator_close
+               must not close it), then propagate. This cont owns the two operands it pushed, so the enum_rec
+               offset is measured from the sp they are dropped back to. */
+            JSValue *cargv = sp - xcg;
+            DCHECK(xcg - xcf == 2, "for-of next frame has an unexpected operand shape");
+            DCHECK(xfof <= -3, "CONT_FOROF_NEXT frame carries no enum_rec offset");
+            for (i = xcf; i < xcg; i++) JS_FreeValue(ctx, cargv[i]);
+            sp += xcf - xcg;
+            JS_FreeValue(ctx, sp[xfof]); sp[xfof] = JS_UNDEFINED;
+            goto exception;
         } else if (xck == CONT_CONSUME_GETITER) {
             /* the bytecode @@iterator THREW. GetIterator propagates the abrupt completion to its CONSUMER, which
                finishes it by its own rule (Promise.all rejects the aggregate; Array.from / new Set|Map /
