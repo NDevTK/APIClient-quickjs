@@ -18178,8 +18178,21 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
                degraded gracefully, it just moved where the crash surfaced. With it gone, every call site must
                route to do_step_tramp; one that does not crashes HERE, naming itself, instead of silently
                driving a callback to completion. */
-            DFAIL("a step builtin was invoked outside the interpreter's dispatch — route that call site onto "
-                  "do_step_tramp (see the .apply / spread / Reflect.apply gates); there is no second driver");
+            /* Two different causes reach here, and only one of them is a missing route.
+               (1) A CALL SHAPE that was never routed — route it onto do_step_tramp, the way .call / .apply /
+                   spread / Reflect.apply / Reflect.construct / a bound target / super() already are.
+               (2) A COERCION INSIDE A STEP MACHINE'S OWN init. `[].every(f)` reads its length with
+                   js_get_length64, `[].join(sep)` does ToString on the separator, `slice` clamps its indices —
+                   all ToPrimitive, all user code, all in C before the machine exists. An init cannot request a
+                   step, so there is nothing to route it to, and when that user method is ITSELF a step machine
+                   (Array.prototype.toString and .join are) it lands here. The named capability is: INIT BECOMES
+                   STEP 0 — the state is allocated empty and its prologue runs as ordinary steps, so a coercion in
+                   a builtin's prologue suspends like one in its body. Until that exists, converting a coercing
+                   builtin whose value flows back into another builtin's prologue turns this crash into a wider
+                   one rather than removing it. */
+            DFAIL("a step builtin was invoked outside the interpreter's dispatch — either an unrouted call shape "
+                  "(route it onto do_step_tramp) or a coercion inside another step machine's init, which needs "
+                  "init to become step 0 before it can be routed at all");
             ret_val = JS_EXCEPTION;
         }
         break;
