@@ -18041,13 +18041,13 @@ typedef struct JSStepHdr {
     JSValue func_obj;    /* the callee — a closure step machine reads its func_data record through this */
     JSValue *argv;       /* argc owned values, in the tail of the state's own allocation */
     /* A prologue's in-flight sub-sequence (today: LengthOfArrayLike). `coerce` is the value it is holding across
-       a suspension — the machine's C locals are gone when it resumes — and cb_coerce is the request buffer: a
-       borrowed [value] for a TOPRIMITIVE, or [receiver, getter] for a 0-argument method CALL. `len_phase` is the
+       a suspension — the machine's C locals are gone when it resumes — and cb_coerce is the request buffer, a
+       borrowed [value] for a TOPRIMITIVE or [obj] for a GETPROP. `len_phase` is the
        sub-sequence's own cursor, kept here so the machine spends ONE of its stages on the whole read instead of
        one per suspension point. Every coercing prologue needs exactly this, so it lives in the header rather
        than being re-declared (and mis-declared) in each state. */
     JSValue coerce;
-    JSValue cb_coerce[2];
+    JSValue cb_coerce[1];
     uint8_t len_phase;
 } JSStepHdr;
 /* The argument vector lives after the state in ONE allocation: a machine's arguments are exactly as long-lived as
@@ -18090,16 +18090,17 @@ static inline JSValueConst step_arg(const JSStepHdr *h, int i)
     return i < h->argc ? h->argv[i] : JS_UNDEFINED;
 }
 
-/* LengthOfArrayLike as a RESUMABLE sub-sequence. Both halves can run user code: a `get length()` accessor is a
-   function body, and ToLength on an object result runs a valueOf/toString/@@toPrimitive. From a C prologue a
-   loop in either hits "@WHY loop preempted in a NON-coroutine activation" — its C entry never became a flow
-   base. So the getter is a CALL step and the ToLength is a TOPRIMITIVE step.
+
+/* LengthOfArrayLike as a RESUMABLE sub-sequence. Both halves can run user code: the READ can be an accessor or a
+   proxy trap, and ToLength on an object result runs a valueOf/toString/@@toPrimitive. From a C prologue a loop in
+   any of them hits "@WHY loop preempted in a NON-coroutine activation" — its C entry never became a flow base. So
+   the read is a GETPROP step and the ToLength is a TOPRIMITIVE step; WHICH shape the read turns out to be is the
+   driver's business, not this function's.
    The caller spends ONE stage here and re-enters with each step's result until this returns 0:
-     0  = *plen is filled, the sub-sequence is finished and reset
-     3/5 = the caller must return that step code; it will be re-entered at the same stage
-     -1 = threw. */
+     0   = *plen is filled, the sub-sequence is finished and reset
+     5/6 = the caller must return that step code; it will be re-entered at the same stage
+     -1  = threw. */
 enum { LEN_PH_START = 0, LEN_PH_GOT, LEN_PH_PRIM };
-static inline JSObject *tramp_bytecode_getter(JSObject *p, JSAtom atom);
 
 /* the tail shared by both entries into ToLength: `v` is the raw length value, owned and consumed. */
 static int step_length_value(JSContext *ctx, JSStepHdr *h, JSValue v, int64_t *plen,
@@ -18120,25 +18121,13 @@ static int step_length_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSVal
                            JSValue **out_cb, int *out_argc)
 {
     switch (h->len_phase) {
-    case LEN_PH_START: {
-        /* A BYTECODE getter is called on the tramp, so its body suspends like any other. Anything else — a data
-           slot, a C getter, a Proxy trap — is read here; a looping Proxy `get` trap is the next unbuilt route and
-           says so by aborting at the preempt. */
-        JSObject *g = JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT
-                        ? tramp_bytecode_getter(JS_VALUE_GET_OBJ(obj), JS_ATOM_length) : NULL;
+    case LEN_PH_START:
         JS_FreeValue(ctx, in);
-        if (g) {
-            h->cb_coerce[0] = (JSValue)obj;                    /* receiver — borrowed */
-            h->cb_coerce[1] = JS_MKPTR(JS_TAG_OBJECT, g);      /* the getter — borrowed from the slot */
-            *out_cb = h->cb_coerce; *out_argc = 0;
-            h->len_phase = LEN_PH_GOT;
-            return 3;
-        }
-        { JSValue v = JS_GetProperty(ctx, obj, JS_ATOM_length);
-          if (JS_IsException(v)) { h->len_phase = LEN_PH_START; return -1; }
-          return step_length_value(ctx, h, v, plen, out_cb, out_argc); }
-    }
-    case LEN_PH_GOT:                     /* `in` is the getter's return value */
+        h->cb_coerce[0] = (JSValue)obj;   /* borrowed: the machine holds the receiver */
+        *out_cb = h->cb_coerce; *out_argc = (int)JS_ATOM_length;
+        h->len_phase = LEN_PH_GOT;
+        return 6;
+    case LEN_PH_GOT:                      /* `in` is the value the read produced */
         return step_length_value(ctx, h, in, plen, out_cb, out_argc);
     default:                             /* `in` is the settled primitive */
         DCHECK(h->len_phase == LEN_PH_PRIM, "LengthOfArrayLike resumed in an unknown phase");
@@ -18493,6 +18482,32 @@ typedef struct TrampFrame {
                                   continuation and runs at do_return, before the result is placed. */
 typedef struct JSProxyGet { JSValue target; JSAtom atom; } JSProxyGet;
 static JSValue js_proxy_get_invariant(JSContext *ctx, JSValueConst target, JSAtom atom, JSValue ret);
+#define CONT_GETPROP       22  /* cont_state = JSGetProp: a property READ requested by a STEP MACHINE (step code 6).
+                                  The read can run user code two ways — a bytecode accessor, or a Proxy `get` trap —
+                                  and a machine cannot drive either itself: it has no access to the interpreter's
+                                  stack from inside its step, and the trap's [[Get]] INVARIANT runs on the trap's
+                                  RESULT, so it has to ride a continuation. The driver performs the read whichever
+                                  shape it is and delivers the value to the machine's next step, exactly as the
+                                  TOPRIMITIVE sequence delivers a primitive. */
+typedef struct JSGetProp {
+    JSValue target;      /* the proxy's [[Target]], for the invariant (owned); UNDEFINED for an accessor */
+    JSAtom atom;         /* the key (owned) */
+    void *outer; uint8_t outer_kind;
+    uint8_t nargs;
+    JSValue cb[5];       /* [this, fn, args…] — OWNED here, never on the caller's compiler-sized stack. A trap
+                            call needs five slots and the frame that invoked the builtin has no obligation to
+                            have room for them; a step machine's cb_args solve this the same way. */
+} JSGetProp;
+
+static void js_getprop_free(JSContext *ctx, JSGetProp *gp)
+{
+    int i;
+    JS_FreeValue(ctx, gp->target);
+    JS_FreeAtom(ctx, gp->atom);
+    for (i = 0; i < 2 + gp->nargs; i++)
+        JS_FreeValue(ctx, gp->cb[i]);
+    js_free_rt(ctx->rt, gp);
+}
 #define CONT_PROMISE_EXEC  14  /* cont_state = JSPromiseExec: `new Promise(executor)` (27.2.3.1). The executor is a
                                   CONTINUATION-HOLDING C entry — steps 3-8 create the promise and its resolving
                                   functions BEFORE the call, and steps 10-11 (reject-on-abrupt, then return the
@@ -19631,6 +19646,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     const uint8_t *tp_retry_pc = NULL;
     JSValueConst tp_value = JS_UNDEFINED;               /* MACHINE mode: the value to coerce (borrowed) */
     void *tp_outer = NULL;
+    JSValueConst gp_obj = JS_UNDEFINED;                 /* do_getprop_tramp inputs: the receiver, the key, and the */
+    JSAtom gp_atom = JS_ATOM_NULL;                      /* machine the value is delivered to. */
+    void *gp_outer = NULL;
+    uint8_t gp_outer_kind = CONT_NONE;
     uint8_t tp_outer_kind = CONT_NONE;
     int tramp_cont_forof = 0;                           /* CONT_FOROF_NEXT: the enum_rec stack offset for the .next() drive about to be pushed. Rides the frame's forof_off (read+reset in do_tramp_call) so no per-iteration heap state is allocated for what is one int. */
     int tramp_gen_forof = 1;                            /* <0 = for-of iterator stack offset (always -3-.. ); 1 = direct .next() (no valid offset is positive) */
@@ -21372,6 +21391,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     *sp++ = r;
                     BREAK;
                 }
+                if (st == 6) {
+                    /* GETPROP: *out_cb is [obj] and *out_argc is the ATOM — the same shape as TOPRIMITIVE passing
+                       its hint. A prologue reads `length`, `constructor`, `@@species`; every one of those can be
+                       an accessor or a proxy trap, which is user code the machine must not drive itself. */
+                    gp_outer = stt; gp_outer_kind = CONT_STEP;
+                    gp_obj = cb[0]; gp_atom = (JSAtom)cbn;
+                    goto do_getprop_tramp;
+                }
                 if (st == 5) {
                     /* TOPRIMITIVE: *out_cb is [value] and *out_argc is the HINT. A builtin that coerces its
                        arguments (String.prototype.concat, and the whole ToString/ToNumber family) reaches user
@@ -21722,6 +21749,84 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto exception;
                 }
             }
+
+        do_getprop_tramp:
+            /* A property READ requested by a step machine's prologue. Three shapes, ONE entry: a Proxy `get` trap
+               and a bytecode accessor are user code and run ON THIS CHAIN, so a loop in either parks; everything
+               else (a data slot, a C getter, a bound accessor, a revoked-proxy throw) is read right here. Routing
+               a trap WITHOUT its [[Get]] invariant would not be a partial implementation but a wrong one, so the
+               invariant rides the continuation and runs on the trap's result. */
+            {
+                JSGetProp *gp;
+                JSValue method = JS_UNDEFINED, keyval = JS_UNDEFINED, tgt = JS_UNDEFINED, handler = JS_UNDEFINED;
+                JSObject *getter = NULL;
+                if (JS_VALUE_GET_TAG(gp_obj) == JS_TAG_OBJECT) {
+                    JSObject *po = JS_VALUE_GET_OBJ(gp_obj);
+                    if (po->class_id == JS_CLASS_PROXY) {
+                        JSProxyData *pd = get_proxy_method(ctx, &method, gp_obj, JS_ATOM_get);
+                        if (!pd) goto getprop_throw;               /* revoked, or the handler's own get threw */
+                        if (JS_IsUndefined(method) || !tramp_can_call(method)) {
+                            JS_FreeValue(ctx, method);             /* no trap, or a C/bound trap with no body */
+                            method = JS_UNDEFINED;
+                        } else {
+                            keyval = JS_AtomToValue(ctx, gp_atom);
+                            if (JS_IsException(keyval)) { JS_FreeValue(ctx, method); goto getprop_throw; }
+                            tgt = js_dup(pd->target);
+                            handler = js_dup(pd->handler);
+                        }
+                    } else {
+                        getter = tramp_bytecode_getter(po, gp_atom);
+                    }
+                }
+                if (JS_IsUndefined(method) && !getter) {
+                    ret_val = JS_GetProperty(ctx, gp_obj, gp_atom);
+                    if (unlikely(JS_IsException(ret_val))) goto getprop_throw;
+                    cont_st = gp_outer;                            /* nothing suspended: straight to the machine */
+                    DCHECK(gp_outer_kind == CONT_STEP, "property-get outer continuation: unknown machine kind");
+                    gp_outer = NULL; gp_atom = JS_ATOM_NULL;
+                    goto do_step_step;
+                }
+                gp = js_mallocz(ctx, sizeof(*gp));
+                if (unlikely(!gp)) {
+                    JS_FreeValue(ctx, method); JS_FreeValue(ctx, keyval);
+                    JS_FreeValue(ctx, tgt); JS_FreeValue(ctx, handler);
+                    JS_ThrowOutOfMemory(ctx);
+                    goto getprop_throw;
+                }
+                gp->target = tgt;
+                gp->atom = JS_DupAtom(ctx, gp_atom);
+                gp->outer = gp_outer; gp->outer_kind = gp_outer_kind;
+                if (getter) {
+                    gp->cb[0] = js_dup(gp_obj);                              /* this = the receiver */
+                    gp->cb[1] = js_dup(JS_MKPTR(JS_TAG_OBJECT, getter));     /* the accessor */
+                    gp->nargs = 0;
+                } else {
+                    gp->cb[0] = handler;                                     /* this = the handler */
+                    gp->cb[1] = method;                                      /* the trap (owned) */
+                    gp->cb[2] = js_dup(gp->target);
+                    gp->cb[3] = keyval;
+                    gp->cb[4] = js_dup(gp_obj);                              /* receiver IS the proxy */
+                    gp->nargs = 3;
+                }
+                gp_outer = NULL; gp_outer_kind = CONT_NONE; gp_atom = JS_ATOM_NULL;
+                call_argv = (JSValueConst *)&gp->cb[2];
+                call_argc = gp->nargs; tramp_first = -2; tramp_is_tail = 0;
+                tramp_cont_state = gp; tramp_cont_kind = CONT_GETPROP;
+                goto do_tramp_call;
+            }
+
+            getprop_throw:
+                /* the read threw before anything suspended — the machine waiting on the value goes with it, and
+                   so do the machines waiting on IT. */
+                {
+                    void *gouter = gp_outer;
+                    gp_outer = NULL; gp_outer_kind = CONT_NONE; gp_atom = JS_ATOM_NULL;
+                    while (gouter) {
+                        JSStepHdr *oh = gouter; gouter = oh->outer;
+                        tramp_step_state_free(ctx, oh, false);
+                    }
+                    goto exception;
+                }
 
         do_consume_acquire_iterator:
             /* GetIterator for EVERY iterable-consuming builtin (Array.from / new Set|Map / Object.fromEntries /
@@ -23354,6 +23459,27 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                     cont_st = rcs;
                     goto do_iter_helper_step;
+                }
+                if (rck == CONT_GETPROP) {
+                    /* the accessor or the proxy trap returned. Its operands live in the continuation's own buffer
+                       (do_tramp_call dup'd them into the callee frame), so nothing on the caller's stack moves;
+                       enforce the target's [[Get]] invariant when it WAS a trap, then hand the value to the
+                       machine that asked. */
+                    JSGetProp *gp = rcs;
+                    void *gouter = gp->outer;
+                    DCHECK(gp->outer_kind == CONT_STEP, "property-get outer continuation: unknown machine kind");
+                    if (!JS_IsUndefined(gp->target))
+                        ret_val = js_proxy_get_invariant(ctx, gp->target, gp->atom, ret_val);
+                    js_getprop_free(ctx, gp);
+                    if (unlikely(JS_IsException(ret_val))) {
+                        while (gouter) {
+                            JSStepHdr *oh = gouter; gouter = oh->outer;
+                            tramp_step_state_free(ctx, oh, false);
+                        }
+                        goto exception;
+                    }
+                    cont_st = gouter;
+                    goto do_step_step;
                 }
                 if (rck == CONT_TOPRIM) {
                     /* the coercion method returned: drop its operands and feed the result to the sequence, which
@@ -26504,6 +26630,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         } else if (xck == CONT_PROXY_GET) {
             JSProxyGet *pg = xcs;
             JS_FreeValue(ctx, pg->target); JS_FreeAtom(ctx, pg->atom); js_free_rt(rt, pg);
+        } else if (xck == CONT_GETPROP) {
+            /* the accessor / trap THREW: the machine waiting on the value can never be reached again, so it and
+               the machines waiting on it go too. */
+            JSGetProp *gp = xcs;
+            void *gouter = gp->outer;
+            DCHECK(!gouter || gp->outer_kind == CONT_STEP,
+                   "property-get outer continuation: unknown machine kind");
+            js_getprop_free(ctx, gp);
+            while (gouter) {
+                JSStepHdr *oh = gouter; gouter = oh->outer;
+                tramp_step_state_free(ctx, oh, false);
+            }
         } else if (xck == CONT_CONSTRUCT) {
             /* the throwing frame was a constructor body: drop the created `this` and the super ctor ref. For
                new C() the operands on the caller stack are freed by the caller's own catch-search; for super()
