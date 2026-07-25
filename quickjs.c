@@ -18260,6 +18260,29 @@ static int step_getidx_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, int64
     return step_getprop_done(ctx, h, in, pout);
 }
 
+/* HasProperty(O, ! ToString(𝔽(idx))) — the OTHER half of the element access indexOf/lastIndexOf perform, which
+   skip holes and so must ask before they read. A Proxy `has` trap is the page's code exactly as `get` is, and
+   JS_TryGetPropertyInt64 reached it from C. 0 = *pres is filled, 7 = the caller must return that step code. */
+static int step_hasidx_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, int64_t idx, JSValue in,
+                           int *pres, JSValue **out_cb, int *out_argc)
+{
+    if (h->get_phase == GET_PH_START) {
+        JSAtom atom;
+        int r;
+        JS_FreeValue(ctx, in);
+        atom = JS_NewAtomInt64(ctx, idx);
+        if (atom == JS_ATOM_NULL) return -1;
+        r = step_getprop_begin(ctx, h, obj, atom, out_cb, out_argc);
+        return (r == 6) ? 7 : r;   /* the same request, asking the other question */
+    }
+    *pres = JS_ToBool(ctx, in);
+    JS_FreeValue(ctx, in);
+    JS_FreeAtom(ctx, h->get_atom);
+    h->get_atom = JS_ATOM_NULL;
+    h->get_phase = GET_PH_START;
+    return 0;
+}
+
 /* LengthOfArrayLike as a RESUMABLE sub-sequence. Both halves can run user code: the READ can be an accessor or a
    proxy trap, and ToLength on an object result runs a valueOf/toString/@@toPrimitive. From a C prologue a loop in
    any of them hits "@WHY loop preempted in a NON-coroutine activation" — its C entry never became a flow base. So
@@ -18911,7 +18934,9 @@ typedef struct TrampFrame {
                                   continuation and runs at do_return, before the result is placed. */
 typedef struct JSProxyGet { JSValue target; JSAtom atom; } JSProxyGet;
 static JSValue js_proxy_get_invariant(JSContext *ctx, JSValueConst target, JSAtom atom, JSValue ret);
-#define CONT_GETPROP       22  /* cont_state = JSGetProp: a property READ requested by a STEP MACHINE (step code 6).
+static int js_proxy_has_invariant(JSContext *ctx, JSValueConst target, JSAtom atom, int ret);
+#define CONT_GETPROP       22  /* cont_state = JSGetProp: a keyed property OPERATION requested by a STEP MACHINE —
+                                  a READ (step code 6) or a HasProperty (step code 7).
                                   The read can run user code two ways — a bytecode accessor, or a Proxy `get` trap —
                                   and a machine cannot drive either itself: it has no access to the interpreter's
                                   stack from inside its step, and the trap's [[Get]] INVARIANT runs on the trap's
@@ -18922,6 +18947,10 @@ typedef struct JSGetProp {
     JSValue target;      /* the proxy's [[Target]], for the invariant (owned); UNDEFINED for an accessor */
     JSAtom atom;         /* the key (owned) */
     void *outer; uint8_t outer_kind;
+    uint8_t is_has;      /* 1 = [[HasProperty]] (step code 7) rather than [[Get]] (step code 6). The two differ
+                            only in which trap runs, which invariant its result must satisfy and whether the
+                            result is a boolean — everything else about the request, the dispatch, the delivery
+                            and the unwind is identical, which is why they are one continuation and not two. */
     uint8_t nargs;
     JSValue cb[5];       /* [this, fn, args…] — OWNED here, never on the caller's compiler-sized stack. A trap
                             call needs five slots and the frame that invoked the builtin has no obligation to
@@ -19603,8 +19632,10 @@ enum { SEARCH_INDEXOF = 0, SEARCH_LASTINDEXOF, SEARCH_INCLUDES };
 typedef struct JSArraySearch {
     JSStepHdr hdr;
     JSValue obj;          /* ToObject(this) (owned) */
+    JSValue val;          /* the element, held across its read (owned) */
     JSValue result;       /* DONE (owned) */
     int64_t len, n;
+    int present;          /* HasProperty(O, k): indexOf and lastIndexOf skip holes, so they must ask first */
 } JSArraySearch;
 
 /* Array.prototype.join / toLocaleString. EVERY step of this one is the page's code: LengthOfArrayLike, the
@@ -20309,8 +20340,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     const uint8_t *tp_retry_pc = NULL;
     JSValueConst tp_value = JS_UNDEFINED;               /* MACHINE mode: the value to coerce (borrowed) */
     void *tp_outer = NULL;
-    JSValueConst gp_obj = JS_UNDEFINED;                 /* do_getprop_tramp inputs: the receiver, the key, and the */
-    JSAtom gp_atom = JS_ATOM_NULL;                      /* machine the value is delivered to. */
+    JSValueConst gp_obj = JS_UNDEFINED;                 /* do_getprop_tramp inputs: the receiver, the key, whether */
+    JSAtom gp_atom = JS_ATOM_NULL;                      /* it is a [[Get]] or a [[HasProperty]], and the machine */
+    uint8_t gp_is_has = 0;                              /* the result is delivered to. */
     void *gp_outer = NULL;
     uint8_t gp_outer_kind = CONT_NONE;
     void *cd_outer = NULL;                              /* do_cont_dispatch: the sequence awaiting the call's result */
@@ -22072,12 +22104,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     *sp++ = r;
                     BREAK;
                 }
-                if (st == 6) {
-                    /* GETPROP: *out_cb is [obj] and *out_argc is the ATOM — the same shape as TOPRIMITIVE passing
-                       its hint. A prologue reads `length`, `constructor`, `@@species`; every one of those can be
-                       an accessor or a proxy trap, which is user code the machine must not drive itself. */
+                if (st == 6 || st == 7) {
+                    /* GETPROP (6) / HASPROPERTY (7): *out_cb is [obj] and *out_argc is the ATOM — the same shape as
+                       TOPRIMITIVE passing its hint. A prologue reads `length`, `constructor`, `@@species`; a search
+                       loop asks whether index k is present; every one of those can be an accessor or a proxy trap,
+                       which is user code the machine must not drive itself. */
                     gp_outer = stt; gp_outer_kind = CONT_STEP;
-                    gp_obj = cb[0]; gp_atom = (JSAtom)cbn;
+                    gp_obj = cb[0]; gp_atom = (JSAtom)cbn; gp_is_has = (st == 7);
                     goto do_getprop_tramp;
                 }
                 if (st == 5) {
@@ -22457,11 +22490,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
 
         do_getprop_tramp:
-            /* A property READ requested by a step machine's prologue. Three shapes, ONE entry: a Proxy `get` trap
-               and a bytecode accessor are user code and run ON THIS CHAIN, so a loop in either parks; everything
-               else (a data slot, a C getter, a bound accessor, a revoked-proxy throw) is read right here. Routing
-               a trap WITHOUT its [[Get]] invariant would not be a partial implementation but a wrong one, so the
-               invariant rides the continuation and runs on the trap's result. */
+            /* A keyed property OPERATION requested by a step machine — a READ or a HasProperty. Three shapes, ONE
+               entry: a Proxy trap and a bytecode accessor are user code and run ON THIS CHAIN, so a loop in either
+               parks; everything else (a data slot, a C getter, a bound accessor, a revoked-proxy throw) is done
+               right here. Routing a trap WITHOUT its invariant would not be a partial implementation but a wrong
+               one, so the invariant rides the continuation and runs on the trap's result. The two operations
+               differ ONLY in the trap name, the invariant and the result type — everything about the dispatch,
+               the delivery and the unwind is the same, which is why this is one entry and not two. */
             {
                 JSGetProp *gp;
                 JSValue method = JS_UNDEFINED, keyval = JS_UNDEFINED, tgt = JS_UNDEFINED, handler = JS_UNDEFINED;
@@ -22469,7 +22504,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (JS_VALUE_GET_TAG(gp_obj) == JS_TAG_OBJECT) {
                     JSObject *po = JS_VALUE_GET_OBJ(gp_obj);
                     if (po->class_id == JS_CLASS_PROXY) {
-                        JSProxyData *pd = get_proxy_method(ctx, &method, gp_obj, JS_ATOM_get);
+                        JSProxyData *pd = get_proxy_method(ctx, &method, gp_obj,
+                                                          gp_is_has ? JS_ATOM_has : JS_ATOM_get);
                         if (!pd) goto getprop_throw;               /* revoked, or the handler's own get threw */
                         if (JS_IsUndefined(method) || !tramp_can_call(method)) {
                             JS_FreeValue(ctx, method);             /* no trap, or a C/bound trap with no body */
@@ -22480,16 +22516,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             tgt = js_dup(pd->target);
                             handler = js_dup(pd->handler);
                         }
-                    } else {
-                        getter = tramp_bytecode_getter(po, gp_atom);
+                    } else if (!gp_is_has) {
+                        getter = tramp_bytecode_getter(po, gp_atom);   /* a HasProperty never invokes a getter */
                     }
                 }
                 if (JS_IsUndefined(method) && !getter) {
-                    ret_val = JS_GetProperty(ctx, gp_obj, gp_atom);
-                    if (unlikely(JS_IsException(ret_val))) goto getprop_throw;
+                    if (gp_is_has) {
+                        int hres = JS_HasProperty(ctx, gp_obj, gp_atom);
+                        if (unlikely(hres < 0)) goto getprop_throw;
+                        ret_val = js_bool(hres);
+                    } else {
+                        ret_val = JS_GetProperty(ctx, gp_obj, gp_atom);
+                        if (unlikely(JS_IsException(ret_val))) goto getprop_throw;
+                    }
                     cont_st = gp_outer;                            /* nothing suspended: straight to the machine */
                     DCHECK(gp_outer_kind == CONT_STEP, "property-get outer continuation: unknown machine kind");
-                    gp_outer = NULL; gp_atom = JS_ATOM_NULL;
+                    gp_outer = NULL; gp_atom = JS_ATOM_NULL; gp_is_has = 0;
                     goto do_step_step;
                 }
                 gp = js_mallocz(ctx, sizeof(*gp));
@@ -22502,6 +22544,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 gp->target = tgt;
                 gp->atom = JS_DupAtom(ctx, gp_atom);
                 gp->outer = gp_outer; gp->outer_kind = gp_outer_kind;
+                gp->is_has = gp_is_has;
                 if (getter) {
                     gp->cb[0] = js_dup(gp_obj);                              /* this = the receiver */
                     gp->cb[1] = js_dup(JS_MKPTR(JS_TAG_OBJECT, getter));     /* the accessor */
@@ -22511,10 +22554,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     gp->cb[1] = method;                                      /* the trap (owned) */
                     gp->cb[2] = js_dup(gp->target);
                     gp->cb[3] = keyval;
-                    gp->cb[4] = js_dup(gp_obj);                              /* receiver IS the proxy */
-                    gp->nargs = 3;
+                    /* has(target, key) takes two arguments; get(target, key, receiver) takes three. */
+                    if (gp_is_has) {
+                        gp->nargs = 2;
+                    } else {
+                        gp->cb[4] = js_dup(gp_obj);                          /* receiver IS the proxy */
+                        gp->nargs = 3;
+                    }
                 }
-                gp_outer = NULL; gp_outer_kind = CONT_NONE; gp_atom = JS_ATOM_NULL;
+                gp_outer = NULL; gp_outer_kind = CONT_NONE; gp_atom = JS_ATOM_NULL; gp_is_has = 0;
                 call_argv = (JSValueConst *)&gp->cb[2];
                 call_argc = gp->nargs; tramp_first = -2; tramp_is_tail = 0;
                 tramp_cont_state = gp; tramp_cont_kind = CONT_GETPROP;
@@ -22526,7 +22574,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    so do the machines waiting on IT. */
                 {
                     void *gouter = gp_outer;
-                    gp_outer = NULL; gp_outer_kind = CONT_NONE; gp_atom = JS_ATOM_NULL;
+                    gp_outer = NULL; gp_outer_kind = CONT_NONE; gp_atom = JS_ATOM_NULL; gp_is_has = 0;
                     tramp_step_chain_free(ctx, gouter);
                     goto exception;
                 }
@@ -24171,8 +24219,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JSGetProp *gp = rcs;
                     void *gouter = gp->outer;
                     DCHECK(gp->outer_kind == CONT_STEP, "property-get outer continuation: unknown machine kind");
-                    if (!JS_IsUndefined(gp->target))
+                    if (gp->is_has) {
+                        /* the `has` trap's boolean, then the target's [[HasProperty]] invariant on it */
+                        int hres = js_proxy_has_invariant(ctx, gp->target, gp->atom, JS_ToBoolFree(ctx, ret_val));
+                        ret_val = (hres < 0) ? JS_EXCEPTION : js_bool(hres);
+                    } else if (!JS_IsUndefined(gp->target)) {
                         ret_val = js_proxy_get_invariant(ctx, gp->target, gp->atom, ret_val);
+                    }
                     js_getprop_free(ctx, gp);
                     if (unlikely(JS_IsException(ret_val))) {
                         tramp_step_chain_free(ctx, gouter);
@@ -50924,15 +50977,20 @@ static int js_array_at_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
         if (r) return r < 0 ? -1 : r;
         s->hdr.stage = 3;
     }
-    JS_FreeValue(ctx, cb_result);
-    if (s->idx < 0)
-        s->idx = s->len + s->idx;
-    if (s->idx < 0 || s->idx >= s->len) {
-        s->result = JS_UNDEFINED;
-        return 0;
+    if (s->hdr.stage == 3) {
+        if (s->idx < 0)
+            s->idx = s->len + s->idx;
+        if (s->idx < 0 || s->idx >= s->len) {
+            JS_FreeValue(ctx, cb_result);
+            s->result = JS_UNDEFINED;
+            return 0;
+        }
+        s->hdr.stage = 4;
     }
-    s->result = JS_GetPropertyInt64(ctx, s->obj, s->idx);
-    if (JS_IsException(s->result)) { s->result = JS_UNDEFINED; return -1; }
+    /* Get(O, ! ToString(k)) — an index accessor or a Proxy `get` trap is the page's code, and reading it with
+       JS_GetPropertyInt64 from here drove it to completion. */
+    r = step_getidx_run(ctx, &s->hdr, s->obj, s->idx, cb_result, &s->result, out_cb, out_argc);
+    if (r) return r < 0 ? -1 : r;
     return 0;
 }
 
@@ -51542,7 +51600,8 @@ static int js_array_search_step(JSContext *ctx, void *st, JSValue cb_result, JSV
     JSArraySearch *s = st;
     JSValueConst target = step_arg(&s->hdr, 0);
     int mode = s->hdr.arg;
-    JSValue val, *arrp;
+    int back = (mode == SEARCH_LASTINDEXOF);
+    JSValue *arrp;
     uint32_t count;
     int r, eq = (mode == SEARCH_INCLUDES) ? JS_EQ_SAME_VALUE_ZERO : JS_EQ_STRICT;
 
@@ -51577,48 +51636,66 @@ static int js_array_search_step(JSContext *ctx, void *st, JSValue cb_result, JSV
         }
         s->hdr.stage = 3;
     }
-    JS_FreeValue(ctx, cb_result);
-
-    if (s->len > 0) {
-        if (mode == SEARCH_LASTINDEXOF) {
-            if (js_get_fast_array(ctx, s->obj, &arrp, &count) && count == s->len) {
-                for (; s->n >= 0; s->n--)
-                    if (js_strict_eq2(ctx, target, arrp[s->n], eq)) goto found;
-            }
-            for (; s->n >= 0; s->n--) {
-                int present = JS_TryGetPropertyInt64(ctx, s->obj, s->n, &val);
-                if (present < 0) return -1;
-                if (present) {
-                    bool hit = js_strict_eq2(ctx, target, val, eq);   /* BORROWS both: the element is ours to free */
-                    JS_FreeValue(ctx, val);
-                    if (hit) goto found;
-                }
-            }
-        } else {
-            if (js_get_fast_array(ctx, s->obj, &arrp, &count)) {
-                for (; s->n < count; s->n++)
-                    if (js_strict_eq2(ctx, target, arrp[s->n], eq)) goto found;
-            }
-            for (; s->n < s->len; s->n++) {
-                bool hit;
-                if (mode == SEARCH_INCLUDES) {
-                    /* includes visits holes as undefined; indexOf skips them */
-                    val = JS_GetPropertyInt64(ctx, s->obj, s->n);
-                    if (JS_IsException(val)) return -1;
-                } else {
-                    int present = JS_TryGetPropertyInt64(ctx, s->obj, s->n, &val);
-                    if (present < 0) return -1;
-                    if (!present) continue;
-                }
-                hit = js_strict_eq2(ctx, target, val, eq);   /* BORROWS both: the element is ours to free */
-                JS_FreeValue(ctx, val);
-                if (hit) goto found;
+    if (s->hdr.stage == 3) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        s->val = JS_UNDEFINED;
+        /* The DENSE prefix. js_strict_eq2 over a fast array's own slots runs none of the page's code, so this is
+           the same comparison the routed loop below performs, reached without a round trip — not a second
+           implementation of the read, and not a path anything can silently fall back to. It is a stage of its
+           own because the routed loop suspends, and re-entering would otherwise re-scan it. */
+        if (s->len > 0) {
+            if (back) {
+                if (js_get_fast_array(ctx, s->obj, &arrp, &count) && count == s->len)
+                    for (; s->n >= 0; s->n--)
+                        if (js_strict_eq2(ctx, target, arrp[s->n], eq)) goto found;
+            } else {
+                if (js_get_fast_array(ctx, s->obj, &arrp, &count))
+                    for (; s->n < count; s->n++)
+                        if (js_strict_eq2(ctx, target, arrp[s->n], eq)) goto found;
             }
         }
+        s->hdr.stage = 4;
     }
+    /* The routed loop: HasProperty and Get are each the page's code — an index accessor or a Proxy trap — and
+       JS_TryGetPropertyInt64 / JS_GetPropertyInt64 reached both from C, driving them to completion. */
+    for (;;) {
+        if (s->hdr.stage == 4) {
+            if (s->len <= 0 || (back ? s->n < 0 : s->n >= s->len))
+                break;
+            if (mode == SEARCH_INCLUDES) {
+                s->hdr.stage = 6;          /* includes visits holes as undefined; it never asks */
+            } else {
+                r = step_hasidx_run(ctx, &s->hdr, s->obj, s->n, cb_result, &s->present, out_cb, out_argc);
+                cb_result = JS_UNDEFINED;
+                if (r) return r < 0 ? -1 : r;
+                s->hdr.stage = 5;
+            }
+        }
+        if (s->hdr.stage == 5) {
+            if (!s->present) {
+                if (back) s->n--; else s->n++;
+                s->hdr.stage = 4;
+                continue;
+            }
+            s->hdr.stage = 6;
+        }
+        DCHECK(s->hdr.stage == 6, "array search machine: unknown stage");
+        r = step_getidx_run(ctx, &s->hdr, s->obj, s->n, cb_result, &s->val, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        {
+            bool hit = js_strict_eq2(ctx, target, s->val, eq);   /* BORROWS both: the element is ours to free */
+            JS_FreeValue(ctx, s->val); s->val = JS_UNDEFINED;
+            if (hit) goto found;
+        }
+        if (back) s->n--; else s->n++;
+        s->hdr.stage = 4;
+    }
+    JS_FreeValue(ctx, cb_result);
     s->result = (mode == SEARCH_INCLUDES) ? js_bool(false) : js_int64(-1);
     return 0;
 found:
+    JS_FreeValue(ctx, cb_result);
     s->result = (mode == SEARCH_INCLUDES) ? js_bool(true) : js_int64(s->n);
     return 0;
 }
@@ -51628,6 +51705,7 @@ static JSValue js_array_search_fini(JSContext *ctx, void *st, bool take_result)
     JSArraySearch *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (!take_result) JS_FreeValue(ctx, s->result);
+    JS_FreeValue(ctx, s->val);
     JS_FreeValue(ctx, s->obj);
     js_free(ctx, s);
     return r;
@@ -60351,6 +60429,27 @@ static int js_proxy_preventExtensions(JSContext *ctx, JSValueConst obj)
     return res;
 }
 
+/* [[HasProperty]] invariant: a trap that reports ABSENT must be telling the truth about a non-configurable own
+   property of the target, and about a non-extensible target. ONE implementation, shared by the C path and by the
+   trampolined trap's continuation — the check runs on the trap's RESULT, so the tramp path can only honour it
+   from a continuation, exactly as [[Get]]'s does. `ret` is the trap's boolean; returns it, or -1 having thrown. */
+static int js_proxy_has_invariant(JSContext *ctx, JSValueConst target, JSAtom atom, int ret)
+{
+    JSObject *p;
+    int desc_flags, res;
+    if (ret)
+        return 1;
+    p = JS_VALUE_GET_OBJ(target);
+    res = JS_GetOwnPropertyFlagsInternal(ctx, &desc_flags, p, atom);
+    if (res < 0)
+        return -1;
+    if (res && (!(desc_flags & JS_PROP_CONFIGURABLE) || !p->extensible)) {
+        JS_ThrowTypeError(ctx, "proxy: inconsistent has");
+        return -1;
+    }
+    return 0;
+}
+
 static int js_proxy_has(JSContext *ctx, JSValueConst obj, JSAtom atom)
 {
     JSProxyData *s;
@@ -60377,21 +60476,7 @@ static int js_proxy_has(JSContext *ctx, JSValueConst obj, JSAtom atom)
     if (JS_IsException(ret1))
         return -1;
     ret = JS_ToBoolFree(ctx, ret1);
-    if (!ret) {
-        int desc_flags;
-        p = JS_VALUE_GET_OBJ(s->target);
-        res = JS_GetOwnPropertyFlagsInternal(ctx, &desc_flags, p, atom);
-        if (res < 0)
-            return -1;
-        if (res) {
-            res2 = !(desc_flags & JS_PROP_CONFIGURABLE);
-            if (res2 || !p->extensible) {
-                JS_ThrowTypeError(ctx, "proxy: inconsistent has");
-                return -1;
-            }
-        }
-    }
-    return ret;
+    return js_proxy_has_invariant(ctx, s->target, atom, ret);
 }
 
 /* [[Get]] invariant: a trap result for a non-configurable/non-writable own property of the target must be SameValue
