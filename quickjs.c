@@ -18055,7 +18055,7 @@ typedef struct JSStepHdr {
        than being re-declared (and mis-declared) in each state. */
     JSValue coerce;
     JSValue cb_coerce[2];
-    uint8_t len_phase, spc_phase;
+    uint8_t len_phase, spc_phase, num_phase;
 } JSStepHdr;
 /* The argument vector lives after the state in ONE allocation: a machine's arguments are exactly as long-lived as
    the machine, and a second allocation is a second free to forget. */
@@ -18206,6 +18206,36 @@ static int step_species_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSVa
         *pout = in;
         return 0;
     }
+}
+
+/* ToNumber on a value that may run user code, delivered as a saturating int64 (ToIntegerOrInfinity's clamp).
+   The object case is a TOPRIMITIVE step; the primitive that comes back converts without running anything. This
+   is the shape EVERY builtin that takes an index has — `[1,2].at(x)`, indexOf's fromIndex, String's positions —
+   and each of them did it with JS_ToInt64Sat straight out of C, so a valueOf with a loop in it preempted in an
+   activation with no flow base. 0 = *pres is filled, 5 = the caller must return that step code and will be
+   re-entered here, -1 = threw. */
+enum { NUM_PH_START = 0, NUM_PH_PRIM };
+
+static int step_toint64_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValue in, int64_t *pres,
+                            JSValue **out_cb, int *out_argc)
+{
+    if (h->num_phase == NUM_PH_START) {
+        JS_FreeValue(ctx, in);
+        if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT) {
+            DCHECK(JS_VALUE_GET_TAG(h->coerce) != JS_TAG_OBJECT,
+                   "a coercion is already in flight on this machine's header");
+            h->coerce = js_dup(v);
+            h->cb_coerce[0] = h->coerce;     /* borrowed view */
+            *out_cb = h->cb_coerce; *out_argc = HINT_NUMBER;
+            h->num_phase = NUM_PH_PRIM;
+            return 5;
+        }
+        return JS_ToInt64Sat(ctx, pres, v);
+    }
+    JS_FreeValue(ctx, h->coerce);
+    h->coerce = JS_UNDEFINED;
+    h->num_phase = NUM_PH_START;
+    return JS_ToInt64SatFree(ctx, pres, in);
 }
 
 static int step_length_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSValue in, int64_t *plen,
@@ -19247,6 +19277,16 @@ typedef struct JSStrConcat {
     int k;
     uint8_t this_done;    /* 1 = the receiver has been coerced into acc */
 } JSStrConcat;
+
+/* Array.prototype.at: ToObject, LengthOfArrayLike, then ToIntegerOrInfinity on the index — all three the page's
+   code, none of it able to suspend from a C body. No loop and no callback; it is the smallest member of the
+   argument-coercion family and the shape the rest of that family takes. */
+typedef struct JSArrayAt {
+    JSStepHdr hdr;
+    JSValue obj;          /* ToObject(this) (owned) */
+    JSValue result;       /* DONE (owned) */
+    int64_t len, idx;
+} JSArrayAt;
 
 /* TypedArray.prototype.slice: the index coercions and the species Construct are its PROLOGUE,
    staged as steps 0-2 so a user valueOf on either index suspends. */
@@ -50126,32 +50166,50 @@ static int JS_isConcatSpreadable(JSContext *ctx, JSValueConst obj)
     return js_is_array(ctx, obj);
 }
 
-static JSValue js_array_at(JSContext *ctx, JSValueConst this_val,
-                           int argc, JSValueConst *argv)
+static int js_array_at_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    JSValue obj, ret;
-    int64_t len, idx;
+    JSArrayAt *s = st;
+    int r;
 
-    ret = JS_EXCEPTION;
-    obj = JS_ToObject(ctx, this_val);
-    if (js_get_length64(ctx, &len, obj))
-        goto exception;
-
-    if (JS_ToInt64Sat(ctx, &idx, argv[0]))
-        goto exception;
-
-    if (idx < 0)
-        idx = len + idx;
-
-    if (idx < 0 || idx >= len) {
-        ret = JS_UNDEFINED;
-    } else {
-        ret = JS_GetPropertyInt64(ctx, obj, idx);
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        s->obj = JS_ToObject(ctx, s->hdr.this_val);
+        if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
+        s->result = JS_UNDEFINED;
+        s->hdr.stage = 1;
     }
+    if (s->hdr.stage == 1) {
+        r = step_length_run(ctx, &s->hdr, s->obj, cb_result, &s->len, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 2;
+    }
+    if (s->hdr.stage == 2) {
+        r = step_toint64_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->idx, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 3;
+    }
+    JS_FreeValue(ctx, cb_result);
+    if (s->idx < 0)
+        s->idx = s->len + s->idx;
+    if (s->idx < 0 || s->idx >= s->len) {
+        s->result = JS_UNDEFINED;
+        return 0;
+    }
+    s->result = JS_GetPropertyInt64(ctx, s->obj, s->idx);
+    if (JS_IsException(s->result)) { s->result = JS_UNDEFINED; return -1; }
+    return 0;
+}
 
- exception:
-    JS_FreeValue(ctx, obj);
-    return ret;
+static JSValue js_array_at_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSArrayAt *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    JS_FreeValue(ctx, s->obj);
+    js_free(ctx, s);
+    return r;
 }
 
 static JSValue js_array_with(JSContext *ctx, JSValueConst this_val,
@@ -50954,7 +51012,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_TA_EVERY, STEPDEF_TA_SOME, STEPDEF_TA_FOREACH, STEPDEF_TA_MAP, STEPDEF_TA_FILTER,
     STEPDEF_ARRAY_REDUCE, STEPDEF_ARRAY_REDUCE_RIGHT, STEPDEF_TA_REDUCE, STEPDEF_TA_REDUCE_RIGHT,
     STEPDEF_ARRAY_SORT, STEPDEF_ARRAY_TOSORTED, STEPDEF_JSON_PARSE,
-    STEPDEF_TA_SLICE, STEPDEF_STR_CONCAT, STEPDEF_STR_CTOR,
+    STEPDEF_TA_SLICE, STEPDEF_STR_CONCAT, STEPDEF_STR_CTOR, STEPDEF_ARRAY_AT,
     STEPDEF_COUNT
 };
 static int js_str_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
@@ -50963,6 +51021,8 @@ static int js_str_concat_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
 static JSValue js_str_concat_fini(JSContext *ctx, void *st, bool take_result);
 static int js_ta_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_ta_slice_fini(JSContext *ctx, void *st, bool take_result);
+static int js_array_at_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_array_at_fini(JSContext *ctx, void *st, bool take_result);
 /* One NAMED definition per builtin, referenced by its JS_CFUNC_STEP_DEF registration through the id above — the same shape as
    JS_CFUNC_MAGIC_DEF naming its C function, so the registration line tells you what runs. An index into a side
    table would be a second list to keep in sync and a magic number that silently repoints when a row is inserted. */
@@ -50992,6 +51052,7 @@ static const JSTrampStepDef js_json_parse_def    = { sizeof(JSJsonReviver), js_j
 static const JSTrampStepDef js_ta_slice_def     = { sizeof(JSTASlice), js_ta_slice_step, js_ta_slice_fini, 0 };
 static const JSTrampStepDef js_str_concat_def   = { sizeof(JSStrConcat), js_str_concat_step, js_str_concat_fini, 0 };
 static const JSTrampStepDef js_str_ctor_def     = { sizeof(JSStrCtor), js_str_ctor_step, js_str_ctor_fini, 0 };
+static const JSTrampStepDef js_array_at_def     = { sizeof(JSArrayAt), js_array_at_step, js_array_at_fini, 0 };
 static const JSTrampStepDef js_array_reduce_def  = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduce };
 static const JSTrampStepDef js_array_reduceR_def = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduceRight };
 static const JSTrampStepDef js_ta_reduce_def     = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduce | special_TA };
@@ -51023,6 +51084,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_TA_SLICE]      = &js_ta_slice_def,
     [STEPDEF_STR_CONCAT]    = &js_str_concat_def,
     [STEPDEF_STR_CTOR]      = &js_str_ctor_def,
+    [STEPDEF_ARRAY_AT]      = &js_array_at_def,
     [STEPDEF_ARRAY_REDUCE]  = &js_array_reduce_def,  [STEPDEF_ARRAY_REDUCE_RIGHT] = &js_array_reduceR_def,
     [STEPDEF_TA_REDUCE]     = &js_ta_reduce_def,     [STEPDEF_TA_REDUCE_RIGHT]    = &js_ta_reduceR_def,
 };
@@ -51045,6 +51107,7 @@ STEP_STATE_HDR_FIRST(JSJsonReviver);
 STEP_STATE_HDR_FIRST(JSStrCtor);
 STEP_STATE_HDR_FIRST(JSStrConcat);
 STEP_STATE_HDR_FIRST(JSTASlice);
+STEP_STATE_HDR_FIRST(JSArrayAt);
 
 static const JSTrampStepDef *tramp_step_def_of(JSValueConst func)
 {
@@ -53056,7 +53119,7 @@ static const JSCFunctionListEntry js_array_unscopables_funcs[] = {
 };
 
 static const JSCFunctionListEntry js_array_proto_funcs[] = {
-    JS_CFUNC_DEF("at", 1, js_array_at ),
+    JS_CFUNC_STEP_DEF("at", 1, STEPDEF_ARRAY_AT ),
     JS_CFUNC_DEF("with", 2, js_array_with ),
     JS_CFUNC_DEF("concat", 1, js_array_concat ),
     JS_CFUNC_STEP_DEF("every", 1, STEPDEF_ARRAY_EVERY ),
