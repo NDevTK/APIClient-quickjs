@@ -18042,13 +18042,13 @@ typedef struct JSStepHdr {
     JSValue *argv;       /* argc owned values, in the tail of the state's own allocation */
     /* A prologue's in-flight sub-sequence (today: LengthOfArrayLike). `coerce` is the value it is holding across
        a suspension — the machine's C locals are gone when it resumes — and cb_coerce is the request buffer, a
-       borrowed [value] for a TOPRIMITIVE or [obj] for a GETPROP. `len_phase` is the
+       borrowed [value] for a TOPRIMITIVE, [obj] for a GETPROP, or [ctor, arg] for a CONSTRUCT. `len_phase` is the
        sub-sequence's own cursor, kept here so the machine spends ONE of its stages on the whole read instead of
        one per suspension point. Every coercing prologue needs exactly this, so it lives in the header rather
        than being re-declared (and mis-declared) in each state. */
     JSValue coerce;
-    JSValue cb_coerce[1];
-    uint8_t len_phase;
+    JSValue cb_coerce[2];
+    uint8_t len_phase, spc_phase;
 } JSStepHdr;
 /* The argument vector lives after the state in ONE allocation: a machine's arguments are exactly as long-lived as
    the machine, and a second allocation is a second free to forget. */
@@ -18115,6 +18115,89 @@ static int step_length_value(JSContext *ctx, JSStepHdr *h, JSValue v, int64_t *p
     }
     h->len_phase = LEN_PH_START;
     return JS_ToLengthFree(ctx, plen, v);
+}
+
+/* ArraySpeciesCreate (7.3.22) as a RESUMABLE sub-sequence, the same shape as LengthOfArrayLike above. THREE of
+   its steps run user code — Get(O,"constructor"), Get(C,@@species) and the Construct — so all three are steps
+   (6, 6, 4) and the whole thing suspends wherever the page's code does. `h->coerce` carries the constructor
+   across each suspension, because the machine's C locals are gone when it resumes.
+     0   = *pout holds the created array
+     4/6 = the caller must return that step code; it will be re-entered at the same stage
+     -1  = threw. */
+enum { SPC_START = 0, SPC_CTOR, SPC_SPECIES, SPC_CONSTRUCT };
+static JSContext *JS_GetFunctionRealm(JSContext *ctx, JSValueConst func_obj);
+
+/* Steps 7-9, shared by "the constructor was not an object" and "the @@species read settled": undefined means a
+   plain Array of that length, and ANYTHING else is Construct'ed — where a non-constructor throws, which IS step
+   9's TypeError. Consumes `ctor`. */
+static int step_species_finish(JSContext *ctx, JSStepHdr *h, JSValue ctor, JSValueConst len_val,
+                               JSValue *pout, JSValue **out_cb, int *out_argc)
+{
+    if (JS_IsUndefined(ctor)) {
+        h->spc_phase = SPC_START;
+        *pout = js_array_constructor(ctx, JS_UNDEFINED, 1, &len_val);
+        return JS_IsException(*pout) ? -1 : 0;
+    }
+    h->coerce = ctor;                     /* owned across the Construct */
+    h->cb_coerce[0] = ctor;               /* borrowed view */
+    h->cb_coerce[1] = (JSValue)len_val;   /* a number: no ownership to transfer */
+    *out_cb = h->cb_coerce; *out_argc = 1;
+    h->spc_phase = SPC_CONSTRUCT;
+    return 4;
+}
+
+static int step_species_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSValue in,
+                            JSValueConst len_val, JSValue *pout, JSValue **out_cb, int *out_argc)
+{
+    JSValue ctor;
+    switch (h->spc_phase) {
+    case SPC_START: {
+        int res = js_is_array(ctx, obj);
+        JS_FreeValue(ctx, in);
+        if (res < 0) return -1;
+        if (!res) {   /* not an array: a plain Array of that length, no user code at all */
+            *pout = js_array_constructor(ctx, JS_UNDEFINED, 1, &len_val);
+            return JS_IsException(*pout) ? -1 : 0;
+        }
+        h->cb_coerce[0] = (JSValue)obj;   /* borrowed: the machine holds the receiver */
+        *out_cb = h->cb_coerce; *out_argc = (int)JS_ATOM_constructor;
+        h->spc_phase = SPC_CTOR;
+        return 6;
+    }
+    case SPC_CTOR:
+        ctor = in;
+        if (JS_IsConstructor(ctx, ctor)) {
+            /* legacy web compatibility: another realm's %Array% means "no species" */
+            JSContext *realm = JS_GetFunctionRealm(ctx, ctor);
+            if (!realm) { JS_FreeValue(ctx, ctor); return -1; }
+            if (realm != ctx && js_same_value(ctx, ctor, realm->array_ctor)) {
+                JS_FreeValue(ctx, ctor);
+                ctor = JS_UNDEFINED;
+            }
+        }
+        if (JS_IsObject(ctor)) {
+            h->coerce = ctor;                 /* owned across the @@species read */
+            h->cb_coerce[0] = ctor;           /* borrowed view */
+            *out_cb = h->cb_coerce; *out_argc = (int)JS_ATOM_Symbol_species;
+            h->spc_phase = SPC_SPECIES;
+            return 6;
+        }
+        /* NOT an object: step 4's @@species read is skipped, but steps 7-9 still apply — `a.constructor = null`
+           reaches step 9 and throws, it does not quietly get a plain Array. Same tail as the species result. */
+        return step_species_finish(ctx, h, ctor, len_val, pout, out_cb, out_argc);
+    case SPC_SPECIES:
+        JS_FreeValue(ctx, h->coerce);
+        h->coerce = JS_UNDEFINED;
+        ctor = JS_IsNull(in) ? (JS_FreeValue(ctx, in), JS_UNDEFINED) : in;
+        return step_species_finish(ctx, h, ctor, len_val, pout, out_cb, out_argc);
+    default:
+        DCHECK(h->spc_phase == SPC_CONSTRUCT, "ArraySpeciesCreate resumed in an unknown phase");
+        JS_FreeValue(ctx, h->coerce);
+        h->coerce = JS_UNDEFINED;
+        h->spc_phase = SPC_START;
+        *pout = in;
+        return 0;
+    }
 }
 
 static int step_length_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSValue in, int64_t *plen,
@@ -21424,7 +21507,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         goto do_construct_tramp;
                     }
                     ret_val = JS_CallConstructor(ctx, cb[0], cbn, (JSValueConst *)&cb[1]);
-                    if (unlikely(JS_IsException(ret_val))) { tramp_step_state_free(ctx, stt, false); goto exception; }
+                    if (unlikely(JS_IsException(ret_val))) goto step_abandon;
                     cont_st = stt;
                     goto do_step_step;
                 }
@@ -21444,9 +21527,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 /* a C/bound callback has no preemptible body, so running it inline suspends nothing — the step
                    machine still owns the loop state, so the builtin stays parkable between callbacks. */
                 ret_val = JS_Call(ctx, call_argv[-1], call_argv[-2], call_argc, call_argv);
-                if (unlikely(JS_IsException(ret_val))) { tramp_step_state_free(ctx, stt, false); goto exception; }
+                if (unlikely(JS_IsException(ret_val))) goto step_abandon;
                 cont_st = stt;
                 goto do_step_step;
+
+            step_abandon:
+                /* an INLINE call/construct threw (a C callee, so nothing suspended). The machine that asked can
+                   never be reached again, and neither can the machines waiting on IT — the same chain the st < 0
+                   arm above walks, and the same one CONT_TOPRIM had to learn to walk. */
+                {
+                    void *souter = h->outer;
+                    tramp_step_state_free(ctx, stt, false);
+                    while (souter) {
+                        JSStepHdr *oh = souter; souter = oh->outer;
+                        tramp_step_state_free(ctx, oh, false);
+                    }
+                    goto exception;
+                }
             }
 
         do_iter_consume_tramp:
@@ -50239,11 +50336,19 @@ static int js_array_every_recv(JSContext *ctx, JSArrayEvery *s)
     return 0;
 }
 
-/* Everything after the length: the callback check and the per-special `ret` seed. */
-static int js_array_every_seed(JSContext *ctx, JSArrayEvery *s)
+/* The callback check plus the per-special `ret` seed. map and filter seed theirs with ArraySpeciesCreate, which
+   runs user code three times over, so this is a RE-ENTERED stage like the length: it returns a step code the
+   caller must propagate, and is called again with that step's result. */
+static int js_array_every_seed(JSContext *ctx, JSArrayEvery *s, JSValue in,
+                               JSValue **out_cb, int *out_argc)
 {
     JSValueConst args[2];
 
+    if (s->hdr.spc_phase != SPC_START)   /* mid-ArraySpeciesCreate: the checks below already ran */
+        return step_species_run(ctx, &s->hdr, s->obj, in,
+                                s->special == special_map ? js_int64(s->len) : js_int32(0),
+                                &s->ret, out_cb, out_argc);
+    JS_FreeValue(ctx, in);
     s->func = step_arg(&s->hdr, 0);
     s->this_arg = step_arg(&s->hdr, 1);
     if (check_function(ctx, s->func))
@@ -50259,13 +50364,11 @@ static int js_array_every_seed(JSContext *ctx, JSArrayEvery *s)
         s->ret = JS_FALSE;
         break;
     case special_map:
-        s->ret = JS_ArraySpeciesCreate(ctx, s->obj, js_int64(s->len));
-        if (JS_IsException(s->ret)) return -1;
-        break;
+        return step_species_run(ctx, &s->hdr, s->obj, JS_UNDEFINED, js_int64(s->len),
+                                &s->ret, out_cb, out_argc);
     case special_filter:
-        s->ret = JS_ArraySpeciesCreate(ctx, s->obj, js_int32(0));
-        if (JS_IsException(s->ret)) return -1;
-        break;
+        return step_species_run(ctx, &s->hdr, s->obj, JS_UNDEFINED, js_int32(0),
+                                &s->ret, out_cb, out_argc);
     case special_map | special_TA:
         args[0] = s->obj;
         args[1] = js_int32(s->len);
@@ -50311,10 +50414,11 @@ static int js_array_every_vstep(JSContext *ctx, void *st, JSValue cb_result, JSV
         if (r) return r < 0 ? -1 : r;
         s->hdr.stage = 2;
     }
-    if (s->hdr.stage == 2) {
+    if (s->hdr.stage == 2) {   /* the seed, re-entered while ArraySpeciesCreate runs the page's code */
+        r = js_array_every_seed(ctx, s, cb_result, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
         s->hdr.stage = 3;
-        if (js_array_every_seed(ctx, s))
-            return -1;
     }
     r = js_array_every_step(ctx, s, cb_result, (JSValueConst *)&s->cb_args[2]);   /* consumes cb_result */
     if (r < 0)
