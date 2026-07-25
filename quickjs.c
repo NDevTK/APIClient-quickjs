@@ -1414,9 +1414,24 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_ARRAY_INDEXOF, STEPDEF_ARRAY_LASTINDEXOF, STEPDEF_ARRAY_INCLUDES,
     STEPDEF_STR_TRIM, STEPDEF_STR_TRIMSTART, STEPDEF_STR_TRIMEND, STEPDEF_STR_AT, STEPDEF_STR_CODEPOINTAT,
     STEPDEF_STR_SUBSTRING, STEPDEF_STR_INDEXOF, STEPDEF_STR_LASTINDEXOF, STEPDEF_STR_NORMALIZE,
+    STEPDEF_STR_CHARAT, STEPDEF_STR_CHARCODEAT,
     STEPDEF_TA_AT, STEPDEF_TA_SET, STEPDEF_JSON_RAWJSON,
     STEPDEF_OBJ_DEFINEPROPERTY, STEPDEF_REFLECT_DEFINEPROPERTY,
     STEPDEF_PARSEINT, STEPDEF_PARSEFLOAT, STEPDEF_STR_SPLIT,
+    STEPDEF_ARRAY_JOIN, STEPDEF_ARRAY_TOLOCALESTRING, STEPDEF_ARRAY_TOSTRING,
+    STEPDEF_TA_JOIN, STEPDEF_TA_TOLOCALESTRING,
+    STEPDEF_BIGINT_ASUINTN, STEPDEF_BIGINT_ASINTN,
+    STEPDEF_OBJ_GOPD, STEPDEF_REFLECT_GOPD,
+    STEPDEF_REGEXP_EXEC, STEPDEF_REGEXP_TEST,
+    STEPDEF_DV_FIRST,
+#define DV_STEPDEF_LIST(F) F(INT8) F(UINT8) F(INT16) F(UINT16) F(INT32) F(UINT32) \
+                           F(BIG_INT64) F(BIG_UINT64) F(FLOAT16) F(FLOAT32) F(FLOAT64)
+#define DV_STEPDEF_ID(N) STEPDEF_DV_GET_##N, STEPDEF_DV_SET_##N,
+    DV_STEPDEF_LIST(DV_STEPDEF_ID)
+#undef DV_STEPDEF_ID
+    STEPDEF_FUNCTION_CALL, STEPDEF_ISNAN, STEPDEF_ISFINITE,
+    STEPDEF_NUM_TOSTRING, STEPDEF_NUM_TOLOCALESTRING, STEPDEF_NUM_TOFIXED,
+    STEPDEF_NUM_TOEXPONENTIAL, STEPDEF_NUM_TOPRECISION, STEPDEF_NUM_CTOR,
     STEPDEF_COUNT
 };
 #define HINT_NONE    2
@@ -18031,6 +18046,25 @@ typedef struct JSTrampStepDef {
     int     (*step)(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
     JSValue (*fini)(JSContext *ctx, void *st, bool take_result);
     int      arg;
+    /* COERCE-THEN-COMPUTE machines only (js_primargs_step); zero for every other definition. Such a builtin's
+       ONLY user code is ToPrimitive on some of its arguments, and everything after — JS_ToIndex, JS_ToNumber,
+       JS_ToBigInt, JS_ToPropertyKey on a PRIMITIVE — runs none. So the builtin DECLARES which arguments it
+       coerces and this one machine performs those coercions on the tramp, then calls the body with the
+       primitives in place. The body is not a legacy twin: with primitive arguments it has no user code left to
+       reach, which is exactly what the declaration asserts, and it is the only implementation there is. */
+    JSCFunctionType body;
+    uint8_t  body_proto;   /* JS_CFUNC_generic or JS_CFUNC_generic_magic */
+    int      body_magic;
+    /* A VALIDATION the spec performs BEFORE the coercions — DataView's setters reject an immutable buffer
+       before reading either argument, and test262 pins that ordering. It is part of the declaration because
+       "everything before the coercions" is exactly what the machine has to reproduce; a builtin whose leading
+       check this cannot express does not carry the declaration at all. -1 = threw. */
+    int      (*precheck)(JSContext *ctx, JSValueConst this_val, int magic);
+    /* A validation that runs between the FIRST coerced argument and the next one. DataView's setters must throw
+       ToIndex's RangeError for a fractional byteOffset before the value's valueOf runs, and test262 pins that
+       too. Like precheck it is part of the declaration: it names the computation the spec interleaves, and the
+       body re-runs it on the way through. -1 = threw. */
+    int      (*midcheck)(JSContext *ctx, JSValueConst *argp, int magic);
 } JSTrampStepDef;
 static const JSTrampStepDef *tramp_step_def_of(JSValueConst func);
 #define CONT_TOPRIM        21  /* cont_state = JSToPrim: ToPrimitive's method call (7.1.1) running ON THE TRAMP.
@@ -18074,7 +18108,11 @@ typedef struct JSStepHdr {
        than being re-declared (and mis-declared) in each state. */
     JSValue coerce;
     JSValue cb_coerce[2];
-    uint8_t len_phase, spc_phase, num_phase, str_phase;
+    uint8_t len_phase, spc_phase, num_phase, str_phase, get_phase;
+    /* the key a GETPROP sub-sequence is holding across its suspension. It is OWNED here because the driver
+       BORROWS the atom the request carries, and released by the shared teardown so an abandon mid-read cannot
+       leak it. JS_ATOM_NULL is zero, so a js_mallocz'd state already reads as "no read in flight". */
+    JSAtom get_atom;
 } JSStepHdr;
 /* The argument vector lives after the state in ONE allocation: a machine's arguments are exactly as long-lived as
    the machine, and a second allocation is a second free to forget. */
@@ -18117,6 +18155,65 @@ static inline JSValueConst step_arg(const JSStepHdr *h, int i)
     return i < h->argc ? h->argv[i] : JS_UNDEFINED;
 }
 
+
+/* A KEYED property read, Get(O, key), as a RESUMABLE sub-sequence — the primitive every array builtin's loop
+   body opens with. Each of them did it with JS_GetPropertyInt64/JS_GetProperty straight out of C, so an index
+   accessor or a Proxy `get` trap with a loop in it preempted in an activation with no flow base. The read
+   ALWAYS goes to the GETPROP step: WHICH shape it turns out to be — a dense slot, a C getter, a bytecode
+   accessor, a proxy trap — is the driver's decision and is made in exactly one place.
+   The atom the request carries is BORROWED by the driver, which is why an INDEX read (whose atom is created on
+   the spot and, past 2**31, allocated) has to park its atom on the header: the shared teardown releases it, so
+   an abandon mid-read cannot leak it.
+     0 = *pout holds the element, 6 = the caller must return that step code, -1 = threw. */
+enum { GET_PH_START = 0, GET_PH_GOT };
+
+/* the head both entries share: `atom` is OWNED and moves onto the header. */
+static int step_getprop_begin(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAtom atom,
+                              JSValue **out_cb, int *out_argc)
+{
+    DCHECK(h->get_atom == JS_ATOM_NULL, "a keyed read is already in flight on this machine's header");
+    h->get_atom = atom;
+    h->cb_coerce[0] = (JSValue)obj;   /* borrowed: the machine holds the receiver across the read */
+    *out_cb = h->cb_coerce; *out_argc = (int)atom;
+    h->get_phase = GET_PH_GOT;
+    return 6;
+}
+
+/* the tail both entries share: the value arrived, so the key is done. */
+static int step_getprop_done(JSContext *ctx, JSStepHdr *h, JSValue in, JSValue *pout)
+{
+    JS_FreeAtom(ctx, h->get_atom);
+    h->get_atom = JS_ATOM_NULL;
+    h->get_phase = GET_PH_START;
+    *pout = in;
+    return 0;
+}
+
+/* a NAMED key, borrowed from the caller (a permanent atom in every current use). */
+static int step_getprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAtom atom, JSValue in,
+                            JSValue *pout, JSValue **out_cb, int *out_argc)
+{
+    if (h->get_phase == GET_PH_START) {
+        JS_FreeValue(ctx, in);
+        return step_getprop_begin(ctx, h, obj, JS_DupAtom(ctx, atom), out_cb, out_argc);
+    }
+    return step_getprop_done(ctx, h, in, pout);
+}
+
+/* an INDEX key. ! ToString(𝔽(idx)) is what the spec's element access reduces to, and the atom is the engine's
+   representation of exactly that. */
+static int step_getidx_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, int64_t idx, JSValue in,
+                           JSValue *pout, JSValue **out_cb, int *out_argc)
+{
+    if (h->get_phase == GET_PH_START) {
+        JSAtom atom;
+        JS_FreeValue(ctx, in);
+        atom = JS_NewAtomInt64(ctx, idx);
+        if (atom == JS_ATOM_NULL) return -1;
+        return step_getprop_begin(ctx, h, obj, atom, out_cb, out_argc);
+    }
+    return step_getprop_done(ctx, h, in, pout);
+}
 
 /* LengthOfArrayLike as a RESUMABLE sub-sequence. Both halves can run user code: the READ can be an accessor or a
    proxy trap, and ToLength on an object result runs a valueOf/toString/@@toPrimitive. From a C prologue a loop in
@@ -18408,6 +18505,8 @@ static JSValue tramp_step_state_free(JSContext *ctx, void *st, bool take_result)
     JS_FreeValue(ctx, h->func_obj);
     JS_FreeValue(ctx, h->coerce);   /* set only while a prologue coercion is in flight */
     h->coerce = JS_UNDEFINED;
+    JS_FreeAtom(ctx, h->get_atom);  /* set only while a property read is in flight */
+    h->get_atom = JS_ATOM_NULL;
     for (i = 0; i < h->argc; i++)
         JS_FreeValue(ctx, h->argv[i]);
     h->argc = 0;                     /* fini frees the block; nothing may read the captures after this */
@@ -18850,6 +18949,7 @@ static JSValue js_str_replace_fini(JSContext *ctx, void *st, bool take_result);
 typedef struct JSReRep {
     JSStepHdr hdr;           /* MUST be first: the generic step driver casts the state to JSStepHdr * */
     uint8_t functional;      /* 1 = callable replacer (step-code 3); 0 = GetSubstitution inside the same walk */
+    uint8_t is_global, fullUnicode;   /* read from `flags` before ToString(S), used by the collection after it */
     JSValue rx;              /* the regexp (owned) */
     JSValue str;             /* the subject string (owned) */
     JSValue rep;             /* the replacer function (owned) */
@@ -18866,6 +18966,7 @@ typedef struct JSReRep {
     JSValue result;          /* DONE: the finished string (owned) */
 } JSReRep;
 static int js_re_rep_step(JSContext *ctx, struct JSReRep *s, JSValue cb_result);
+static int js_re_rep_collect(JSContext *ctx, struct JSReRep *s);
 static void js_re_rep_end(JSContext *ctx, struct JSReRep *s, bool take_result);
 static int js_re_rep_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_re_rep_fini(JSContext *ctx, void *st, bool take_result);
@@ -19442,6 +19543,96 @@ typedef struct JSArraySearch {
     int64_t len, n;
 } JSArraySearch;
 
+/* Array.prototype.join / toLocaleString. EVERY step of this one is the page's code: LengthOfArrayLike, the
+   separator's ToString, the per-index element READ (an accessor or a proxy `get` trap), the element's own
+   ToString, and — for toLocaleString — Get(el,"toLocaleString") and the CALL of it. It ran from a C body, so
+   `[{toString(){while(x){}}}].join()` preempted with no flow base; the harness's own deepEqual formatter is
+   built on exactly that shape, which is how it aborted a whole test262 directory.
+   The StringBuffer is part of the state and is initialised by the FIRST statement of stage 0: fini frees
+   exactly what the state holds, and a buffer initialised any later is freed through a NULL ctx. */
+/* Four modes: the two Array.prototype entries and the two TypedArray.prototype ones. They differ only in where
+   the length comes from (LengthOfArrayLike vs the typed array's own count, which a coercing separator can
+   RESIZE) and in the trailing separators a resize leaves behind — the loop that runs the page's code is the
+   same one, which is why it is one machine. */
+enum { JOIN_ARRAY = 0, JOIN_ARRAY_LOCALE, JOIN_TA, JOIN_TA_LOCALE };
+typedef struct JSArrayJoin {
+    JSStepHdr hdr;
+    JSValue obj;          /* ToObject(this) (owned) */
+    JSValue sep;          /* the separator STRING (owned), or UNDEFINED for the default comma */
+    JSValue el;           /* the element, held across its coercion (owned) */
+    JSValue result;       /* DONE (owned) */
+    JSValue cb[2];        /* [element, its toLocaleString] */
+    StringBuffer b;
+    int64_t len, i;
+    int64_t oldlen;       /* TypedArray only: the count before a separator coercion could resize the buffer */
+} JSArrayJoin;
+
+/* Number.prototype's five formatting methods: the receiver unwrap runs nothing, but the digits/radix argument
+   is the page's code. ONE machine, five modes — they differ only in WHEN the argument is coerced and how the
+   double is formatted. */
+enum { NUMFMT_TOSTRING = 0, NUMFMT_TOLOCALESTRING, NUMFMT_TOFIXED, NUMFMT_TOEXPONENTIAL, NUMFMT_TOPRECISION };
+typedef struct JSNumberFmt {
+    JSStepHdr hdr;
+    JSValue val;          /* thisNumberValue (owned) */
+    JSValue result;       /* DONE (owned) */
+    double d;
+    int64_t n;
+} JSNumberFmt;
+
+/* The Number constructor. ToNumeric(argv[0]) is the page's code and ran from a C body, so `Number([1])` reaches
+   Array.prototype.toString — a machine — and `Number({valueOf(){while(x){}}})` preempted with no flow base. */
+typedef struct JSNumCtor {
+    JSStepHdr hdr;
+    JSValue result;       /* DONE (owned) */
+    JSValue cb[1];        /* the TOPRIMITIVE request buffer */
+    uint8_t coerced;
+} JSNumCtor;
+
+/* The global isNaN / isFinite. Their ONE step is ToNumber(argv[0]) — the page's code — and the predicate after
+   it runs nothing. They ran from a C body, so `isNaN({valueOf(){while(x){}}})` preempted with no flow base, and
+   `isNaN([1])` reaches Array.prototype.toString, which is a machine a C body cannot drive at all. */
+typedef struct JSCoerce1 {
+    JSStepHdr hdr;
+    JSValue result;       /* DONE (owned) */
+    double d;
+} JSCoerce1;
+
+/* The coerce-then-compute state: the machine keeps nothing but the coerced argument vector it hands to the
+   body, and a cursor saying how far it has got. PRIMARGS packs the declaration — WHICH arguments are coerced,
+   with which hint, and the arity the body reads (js_call_c_function pads to the declared length; a machine is
+   handed the call's real operands, so the padding happens here or the body reads past the end). */
+#define PRIMARGS(mask, hint, nargs) ((mask) | ((hint) == HINT_STRING ? 0x100 : 0) | ((nargs) << 16))
+typedef struct JSPrimArgs {
+    JSStepHdr hdr;
+    JSValue result;       /* DONE (owned) */
+    JSValue *argp;        /* the body's argument vector: the coerced copies, owned */
+    JSValue cb[1];        /* the TOPRIMITIVE request buffer */
+    int nargp;
+    int next;             /* the next argument index to examine */
+} JSPrimArgs;
+
+/* Function.prototype.call. Its whole content is "the receiver is the function, argv[0] is the new receiver and
+   the rest are the arguments" — no continuation of its own — but the CALL it then performs has to reach the one
+   dispatch, and a C body cannot. `Function.prototype.call.bind(Array.prototype.join)` is how the gap shows up:
+   the bound driver invokes .call as a VALUE, not through a call opcode, so its JS_Call of a step builtin lands
+   on js_call_c_function's DFAIL. As a machine there is ONE implementation, reached identically however the call
+   was spelled, and the ultimate target suspends like any other callee. */
+typedef struct JSFuncCall {
+    JSStepHdr hdr;
+    JSValue result;       /* DONE (owned) */
+    JSValue *cb;          /* [newThis, f, args…] — the argument count is the caller's, so this is its own block */
+    int ncb;
+} JSFuncCall;
+
+/* Array.prototype.toString is Get(array,"join") and then a CALL of it — a user `join`, or the built-in one,
+   which is now a machine and so cannot be invoked from a C body at all. */
+typedef struct JSArrayToString {
+    JSStepHdr hdr;
+    JSValue obj;          /* ToObject(this) (owned) */
+    JSValue result;       /* DONE (owned) */
+    JSValue cb[2];        /* [array, its join] */
+} JSArrayToString;
+
 /* String.prototype.split runs the page's code at FOUR points: the @@split GetMethod on the separator, the call
    to that method when it exists, ToString on the receiver, and ToUint32(limit) / ToString(separator). The walk
    that follows is pure string scanning. */
@@ -19500,7 +19691,8 @@ typedef struct JSTAIdx {
    drift apart. */
 enum { STRRECV_TRIM_START = 1, STRRECV_TRIM_END = 2, STRRECV_TRIM_BOTH = 3,
        STRRECV_AT, STRRECV_CODEPOINTAT, STRRECV_SUBSTRING,
-       STRRECV_INDEXOF, STRRECV_LASTINDEXOF, STRRECV_NORMALIZE };
+       STRRECV_INDEXOF, STRRECV_LASTINDEXOF, STRRECV_NORMALIZE,
+       STRRECV_CHARAT, STRRECV_CHARCODEAT };
 typedef struct JSStrRecv {
     JSStepHdr hdr;
     JSValue str;          /* the receiver as a string (owned) */
@@ -19529,10 +19721,6 @@ static JSValue js_json_parse_vfini(JSContext *ctx, void *st, bool take_result);
 static int js_json_reviver_init(JSContext *ctx, struct JSJsonReviver *s, JSValueConst text_arg, JSValueConst reviver);
 static int js_json_reviver_step(JSContext *ctx, struct JSJsonReviver *s, JSValue res, JSValueConst out_args[3]);
 static JSValue js_json_reviver_end(JSContext *ctx, struct JSJsonReviver *s, bool ok);
-/* Function.prototype.call is CALL-SITE-RESOLVED: it holds no continuation, so rather than C-recursing
-   js_function_call (which would run the ultimate target's body off the chain, unable to preempt), the
-   interpreter reslices the operands at the call site and dispatches the target directly (do_forward_call). */
-static JSValue js_function_call(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 /* js_call_function — the builtins' monkey-patch-proof Function.prototype.call (Iterator.zip/zipKeyed use it to invoke
    an input iterator's .next). It holds NO continuation, so like f.call it is RESOLVED at the operator site and the
    ultimate target dispatched on this chain; JS_Call'ing it from C would drive a generator .next off the tramp. */
@@ -19660,12 +19848,19 @@ static inline bool tramp_is_call_function(JSValueConst method) {
         && mp->u.cfunc.cproto == JS_CFUNC_generic
         && mp->u.cfunc.c_function.generic == js_call_function;
 }
+/* Function.prototype.call reached at a CALL OPERATOR, where the operands ALREADY hold [f, .call, thisArg, args]
+   — one reslice away from the method-call shape. Resolving it here is not a second implementation of .call (the
+   C body is gone; the semantics live in the step machine): it is the ON-STACK operand shape's resolution, and it
+   is what keeps a forwarded call asking the same questions a direct one does — the consumer recognizers, the
+   generator-method routing and the proxy [[Call]] resolution all hang off do_forward_dispatch, which the
+   sequence-buffer dispatch (do_cont_dispatch) does not reach. A .call reached as a VALUE — the bound driver's
+   target — has no operands to reslice and runs the machine instead. */
 static inline bool tramp_is_function_call(JSValueConst method) {
     JSObject *mp;
     if (JS_VALUE_GET_TAG(method) != JS_TAG_OBJECT) return false;
     mp = JS_VALUE_GET_OBJ(method);
-    return mp->class_id == JS_CLASS_C_FUNCTION && mp->u.cfunc.cproto == JS_CFUNC_generic
-        && mp->u.cfunc.c_function.generic == js_function_call;
+    return mp->class_id == JS_CLASS_C_FUNCTION && mp->u.cfunc.cproto == JS_CFUNC_step
+        && mp->u.cfunc.magic == STEPDEF_FUNCTION_CALL;
 }
 /* Function.prototype.apply — call-site-resolved like .call, but its args live in an ARRAY (arbitrary length),
    so they cannot be spread onto the fixed-size caller frame; do_apply_tramp reads them with build_arg_list
@@ -20798,7 +20993,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         }
                     }
                 }
-                if (tramp_is_function_call(call_argv[-1])) {   /* f.call(thisArg,...) -> resolve + dispatch f here */
+                if (tramp_is_function_call(call_argv[-1])) {   /* f.call(thisArg,...) -> reslice + dispatch f here */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_forward_call;
                 }
                 if (tramp_is_function_apply(call_argv[-1])) {   /* target kind is NOT a call-site question */
@@ -21364,11 +21559,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
 
         do_forward_call:
-            /* f.call(thisArg, ...args): Function.prototype.call holds NO continuation, so RESOLVE it at the
-               operator site and dispatch the ultimate target f on THIS chain (its body — normal / async /
-               generator / array-iteration — then preempts the base like any other). Reslice the operands from
-               the .call shape [f, call, thisArg, a0..aN-1] to the method-call shape [thisArg, f, a0..aN-1]:
-               one slot narrower, so the target's do_return pops exactly where `f` sat and pushes the result. */
+            /* f.call(thisArg, ...args) at a call OPERATOR: the operands are already [f, call, thisArg, a0..aN-1],
+               so reslice them in place to the method-call shape [thisArg, f, a0..aN-1] — one slot narrower, so the
+               target's do_return pops exactly where `f` sat and pushes the result — and fall into the dispatch
+               every method call uses. The .call object itself is dropped here; what it MEANS lives in one place,
+               the step machine that runs when .call is reached with no operands to reslice. */
             {
                 JSValue fv = (JSValue)call_argv[-2];                               /* the target f */
                 JSValue tv = (call_argc >= 1) ? (JSValue)call_argv[0] : JS_UNDEFINED;  /* the new this */
@@ -25578,6 +25773,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
                 is_computed = (opcode == OP_define_method_computed);
                 if (is_computed) {
+                    if (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT) {
+                        sf->cur_pc = pc; tp_slot = -2; tp_retry_pc = pc - 1; goto key_toprim;
+                    }
                     atom = JS_ValueToAtom(ctx, sp[-2]);
                     if (unlikely(atom == JS_ATOM_NULL))
                         goto exception;
@@ -25639,6 +25837,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
 
+        key_toprim:
+            /* ToPropertyKey (7.1.19) on an OBJECT key runs the page's @@toPrimitive/valueOf/toString, and every
+               interpreter site that needs a key reached it through JS_ValueToAtom — from C, so a loop in that
+               method preempted in an activation with no flow base, and an ARRAY key reaches
+               Array.prototype.toString, a step machine no C body can drive at all. Coerce the key on the tramp
+               with hint STRING and re-execute the opcode: on the retry the key is a primitive, so the atom
+               conversion (and the getter/setter probe that follows it) runs nothing. Entered with tp_slot naming
+               the key operand and tp_retry_pc the opcode's own byte. */
+            tp_hint = HINT_STRING;
+            goto do_toprim_tramp;
+
         CASE(OP_get_array_el):
             {
                 JSValue val;
@@ -25664,9 +25873,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                 }
                 sf->cur_pc = pc;
-                /* non-object key only: ToPropertyKey on an object runs user toPrimitive, and the fallback
-                   JS_GetPropertyValue converts again — probing here would double the side effect. */
-                if (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT && JS_VALUE_GET_TAG(sp[-1]) != JS_TAG_OBJECT) {
+                if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) { tp_slot = -1; tp_retry_pc = pc - 1; goto key_toprim; }
+                if (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT) {
                     JSAtom katom = JS_ValueToAtom(ctx, sp[-1]);   /* ToPropertyKey (may throw) */
                     if (unlikely(katom == JS_ATOM_NULL))
                         goto exception;
@@ -25709,6 +25917,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                 }
                 sf->cur_pc = pc;
+                if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) { tp_slot = -1; tp_retry_pc = pc - 1; goto key_toprim; }
                 val = JS_GetPropertyValue(ctx, sp[-2], sp[-1]);
                 sp[-1] = val;
                 if (unlikely(JS_IsException(val)))
@@ -25742,6 +25951,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValue val;
                 JSAtom atom;
                 sf->cur_pc = pc;
+                if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) { tp_slot = -1; tp_retry_pc = pc - 1; goto key_toprim; }
                 atom = JS_ValueToAtom(ctx, sp[-1]);
                 if (unlikely(atom == JS_ATOM_NULL))
                     goto exception;
@@ -25801,11 +26011,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                 }
                 sf->cur_pc = pc;
-                /* A non-object computed key that resolves to a bytecode setter -> route as a 1-arg method call so
-                   the setter body preempts. Guard on a non-object key: ToPropertyKey on an object runs user
-                   toPrimitive, and the fallback path converts again — only a primitive key is safe to probe here
-                   without a double side effect. */
-                if (JS_VALUE_GET_TAG(sp[-3]) == JS_TAG_OBJECT && JS_VALUE_GET_TAG(sp[-2]) != JS_TAG_OBJECT) {
+                if (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT) { tp_slot = -2; tp_retry_pc = pc - 1; goto key_toprim; }
+                /* A computed key that resolves to a bytecode setter -> route as a 1-arg method call so the
+                   setter body preempts. */
+                if (JS_VALUE_GET_TAG(sp[-3]) == JS_TAG_OBJECT) {
                     JSAtom katom = JS_ValueToAtom(ctx, sp[-2]);
                     if (unlikely(katom == JS_ATOM_NULL))
                         goto exception;
@@ -25865,6 +26074,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JS_ThrowTypeErrorNotAnObject(ctx);
                     goto exception;
                 }
+                if (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT) { tp_slot = -2; tp_retry_pc = pc - 1; goto key_toprim; }
                 atom = JS_ValueToAtom(ctx, sp[-2]);
                 if (unlikely(atom == JS_ATOM_NULL))
                     goto exception;
@@ -26183,6 +26393,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             sp--;
             BREAK;
 
+        unary_arith_toprim:
+            /* The SAME 13.5.4/13.5.6/13.4 problem the binary label routes, for the one-operand operators:
+               ToNumeric on the operand runs the page's valueOf/toString/@@toPrimitive, and js_unary_arith_slow /
+               js_not_slow / js_post_inc_slow all reach it with JS_CallFree from C — where a loop in that method
+               preempts in an activation with no flow base, and an ARRAY operand reaches Array.prototype.toString,
+               which is a step machine no C body can drive at all. Coerce on the tramp and re-execute: the prefix
+               of every one of these opcodes is a pure tag test, so the retry costs nothing. Each is a
+               single-byte opcode, so `pc - 1` is its own byte. */
+            tp_slot = -1; tp_hint = HINT_NUMBER; tp_retry_pc = pc - 1;
+            goto do_toprim_tramp;
+
         CASE(OP_plus):
             {
                 JSValue op1;
@@ -26192,6 +26413,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tag == JS_TAG_INT || JS_TAG_IS_FLOAT64(tag)) {
                 } else {
                     sf->cur_pc = pc;
+                    if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) goto unary_arith_toprim;
                     if (js_unary_arith_slow(ctx, sp, opcode))
                         goto exception;
                 }
@@ -26223,6 +26445,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp[-1] = js_float64(d);
                 } else {
                     sf->cur_pc = pc;
+                    if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) goto unary_arith_toprim;
                     if (js_unary_arith_slow(ctx, sp, opcode))
                         goto exception;
                 }
@@ -26241,6 +26464,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 } else {
                 inc_slow:
                     sf->cur_pc = pc;
+                    if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) goto unary_arith_toprim;
                     if (js_unary_arith_slow(ctx, sp, opcode))
                         goto exception;
                 }
@@ -26259,6 +26483,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 } else {
                 dec_slow:
                     sf->cur_pc = pc;
+                    if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) goto unary_arith_toprim;
                     if (js_unary_arith_slow(ctx, sp, opcode))
                         goto exception;
                 }
@@ -26277,6 +26502,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 } else {
                 post_inc_slow:
                     sf->cur_pc = pc;
+                    if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) goto unary_arith_toprim;
                     if (js_post_inc_slow(ctx, sp, opcode))
                         goto exception;
                 }
@@ -26296,6 +26522,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 } else {
                 post_dec_slow:
                     sf->cur_pc = pc;
+                    if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) goto unary_arith_toprim;
                     if (js_post_inc_slow(ctx, sp, opcode))
                         goto exception;
                 }
@@ -26366,6 +26593,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp[-1] = js_int32(~JS_VALUE_GET_INT(op1));
                 } else {
                     sf->cur_pc = pc;
+                    if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) goto unary_arith_toprim;
                     if (js_not_slow(ctx, sp))
                         goto exception;
                 }
@@ -26589,6 +26817,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             case JS_TAG_STRING:
             case JS_TAG_SYMBOL:
                 break;
+            case JS_TAG_OBJECT:
+                /* ToPropertyKey on an object runs the page's coercion methods; route it, exactly as the
+                   element-access opcodes do, and re-execute with the primitive in the slot. */
+                sf->cur_pc = pc; tp_slot = -1; tp_retry_pc = pc - 1; goto key_toprim;
             default:
                 sf->cur_pc = pc;
                 ret_val = JS_ToPropertyKey(ctx, sp[-1]);
@@ -26611,6 +26843,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             case JS_TAG_STRING:
             case JS_TAG_SYMBOL:
                 break;
+            case JS_TAG_OBJECT:
+                /* ToPropertyKey on an object runs the page's coercion methods; route it, exactly as the
+                   element-access opcodes do, and re-execute with the primitive in the slot. */
+                sf->cur_pc = pc; tp_slot = -1; tp_retry_pc = pc - 1; goto key_toprim;
             default:
                 sf->cur_pc = pc;
                 ret_val = JS_ToPropertyKey(ctx, sp[-1]);
@@ -47245,8 +47481,6 @@ JSValue JS_ReadObject(JSContext *ctx, const uint8_t *buf, size_t buf_len,
 
 static JSValue js_boolean_constructor(JSContext *ctx, JSValueConst this_val,
                                       int argc, JSValueConst *argv);
-static JSValue js_number_constructor(JSContext *ctx, JSValueConst this_val,
-                                     int argc, JSValueConst *argv);
 
 static int check_function(JSContext *ctx, JSValueConst obj)
 {
@@ -47640,25 +47874,23 @@ static JSValue js_global_eval(JSContext *ctx, JSValueConst this_val,
     return JS_EvalObject(ctx, ctx->global_obj, argv[0], JS_EVAL_TYPE_INDIRECT, -1);
 }
 
-static JSValue js_global_isNaN(JSContext *ctx, JSValueConst this_val,
-                               int argc, JSValueConst *argv)
+/* isNaN (arg 0) and isFinite (arg 1): stage 0 is ToNumber(argv[0]); the predicate needs no stage of its own. */
+static int js_coerce1_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    double d;
-
-    if (unlikely(JS_ToFloat64(ctx, &d, argv[0])))
-        return JS_EXCEPTION;
-    return js_bool(isnan(d));
+    JSCoerce1 *s = st;
+    int r = step_tofloat64_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->d, out_cb, out_argc);
+    if (r) return r < 0 ? -1 : r;
+    s->result = js_bool(s->hdr.arg ? isfinite(s->d) : isnan(s->d));
+    return 0;
 }
 
-static JSValue js_global_isFinite(JSContext *ctx, JSValueConst this_val,
-                                  int argc, JSValueConst *argv)
+static JSValue js_coerce1_fini(JSContext *ctx, void *st, bool take_result)
 {
-    bool res;
-    double d;
-    if (unlikely(JS_ToFloat64(ctx, &d, argv[0])))
-        return JS_EXCEPTION;
-    res = isfinite(d);
-    return js_bool(res);
+    JSCoerce1 *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    js_free(ctx, s);
+    return r;
 }
 
 static JSValue js_microtask_job(JSContext *ctx,
@@ -48952,7 +49184,7 @@ static const JSCFunctionListEntry js_object_funcs[] = {
     JS_CFUNC_MAGIC_DEF("entries", 1, js_object_keys, JS_ITERATOR_KIND_KEY_AND_VALUE ),
     JS_CFUNC_MAGIC_DEF("isExtensible", 1, js_object_isExtensible, 0 ),
     JS_CFUNC_MAGIC_DEF("preventExtensions", 1, js_object_preventExtensions, 0 ),
-    JS_CFUNC_MAGIC_DEF("getOwnPropertyDescriptor", 2, js_object_getOwnPropertyDescriptor, 0 ),
+    JS_CFUNC_STEP_DEF("getOwnPropertyDescriptor", 2, STEPDEF_OBJ_GOPD ),
     JS_CFUNC_DEF("getOwnPropertyDescriptors", 1, js_object_getOwnPropertyDescriptors ),
     JS_CFUNC_DEF("is", 2, js_object_is ),
     JS_CFUNC_DEF("assign", 2, js_object_assign ),
@@ -49170,14 +49402,109 @@ static JSValue js_function_apply(JSContext *ctx, JSValueConst this_val,
     return ret;
 }
 
-static JSValue js_function_call(JSContext *ctx, JSValueConst this_val,
-                                int argc, JSValueConst *argv)
+/* THE coerce-then-compute machine. Stage 0 walks the declared argument positions, requesting a TOPRIMITIVE for
+   each OBJECT among them; stage 1 receives one and replaces that argument. When none is left the body runs with
+   an argument vector that holds only primitives, so every JS_ToIndex / JS_ToNumber / JS_ToBigInt /
+   JS_ToPropertyKey inside it is pure arithmetic. */
+static int js_primargs_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    if (argc <= 0) {
-        return JS_Call(ctx, this_val, JS_UNDEFINED, 0, NULL);
+    JSPrimArgs *s = st;
+    unsigned mask = (unsigned)s->hdr.arg & 0xff;
+    int hint = (s->hdr.arg & 0x100) ? HINT_STRING : HINT_NUMBER;
+    int nargs = (s->hdr.arg >> 16) & 0xff;
+    int i;
+
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result);
+        s->result = JS_UNDEFINED;
+        if (s->hdr.def->precheck && s->hdr.def->precheck(ctx, s->hdr.this_val, s->hdr.def->body_magic) < 0)
+            return -1;
+        s->nargp = s->hdr.argc > nargs ? s->hdr.argc : nargs;
+        s->argp = js_malloc(ctx, sizeof(JSValue) * (size_t)(s->nargp > 0 ? s->nargp : 1));
+        if (unlikely(!s->argp)) { s->nargp = 0; return -1; }
+        for (i = 0; i < s->nargp; i++)
+            s->argp[i] = js_dup(step_arg(&s->hdr, i));
+        s->next = 0;
+        s->hdr.stage = 1;
     } else {
-        return JS_Call(ctx, this_val, argv[0], argc - 1, argv + 1);
+        DCHECK(s->next > 0, "coerce-then-compute: a primitive arrived with no coercion in flight");
+        JS_FreeValue(ctx, s->argp[s->next - 1]);
+        s->argp[s->next - 1] = cb_result;   /* the primitive REPLACES the argument the body will read */
+        if (s->next == 1 && s->hdr.def->midcheck
+            && s->hdr.def->midcheck(ctx, (JSValueConst *)s->argp, s->hdr.def->body_magic) < 0)
+            return -1;
     }
+    while (s->next < s->nargp) {
+        i = s->next++;
+        if (i >= 8 || !((mask >> i) & 1)) continue;
+        if (JS_VALUE_GET_TAG(s->argp[i]) == JS_TAG_OBJECT) {
+            s->cb[0] = s->argp[i];   /* borrowed: the vector holds the reference */
+            *out_cb = s->cb; *out_argc = hint;
+            return 5;
+        }
+        /* the argument was already primitive, so its own interleaved validation is due right here */
+        if (i == 0 && s->hdr.def->midcheck && s->hdr.def->midcheck(ctx, (JSValueConst *)s->argp, s->hdr.def->body_magic) < 0)
+            return -1;
+    }
+    DCHECK(s->hdr.def->body.generic != NULL, "a coerce-then-compute definition with no body");
+    if (s->hdr.def->body_proto == JS_CFUNC_generic_magic) {
+        s->result = s->hdr.def->body.generic_magic(ctx, s->hdr.this_val, s->nargp,
+                                                   (JSValueConst *)s->argp, s->hdr.def->body_magic);
+    } else {
+        DCHECK(s->hdr.def->body_proto == JS_CFUNC_generic, "coerce-then-compute: unhandled body prototype");
+        s->result = s->hdr.def->body.generic(ctx, s->hdr.this_val, s->nargp, (JSValueConst *)s->argp);
+    }
+    return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
+}
+
+static JSValue js_primargs_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSPrimArgs *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    int i;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    for (i = 0; i < s->nargp; i++) JS_FreeValue(ctx, s->argp[i]);
+    js_free(ctx, s->argp);
+    js_free(ctx, s);
+    return r;
+}
+
+/* Stages: 0 assemble [newThis, f, args…] and CALL, 1 the result. */
+static int js_function_call_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSFuncCall *s = st;
+    int i, n;
+
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result);
+        s->result = JS_UNDEFINED;
+        n = s->hdr.argc > 0 ? s->hdr.argc - 1 : 0;
+        s->cb = js_malloc(ctx, sizeof(JSValue) * (size_t)(n + 2));
+        if (unlikely(!s->cb)) return -1;
+        s->ncb = n + 2;
+        s->cb[0] = js_dup(step_arg(&s->hdr, 0));   /* thisArg — absent means undefined, which is the spec's */
+        s->cb[1] = js_dup(s->hdr.this_val);        /* the function; a non-callable throws at the dispatch */
+        for (i = 0; i < n; i++)
+            s->cb[2 + i] = js_dup(s->hdr.argv[1 + i]);
+        s->hdr.stage = 1;
+        *out_cb = s->cb; *out_argc = n;
+        return 3;
+    }
+    DCHECK(s->hdr.stage == 1, "Function.prototype.call: unknown stage");
+    s->result = cb_result;
+    return 0;
+}
+
+static JSValue js_function_call_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSFuncCall *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    int i;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    for (i = 0; i < s->ncb; i++) JS_FreeValue(ctx, s->cb[i]);
+    js_free(ctx, s->cb);
+    js_free(ctx, s);
+    return r;
 }
 
 static JSValue js_function_bind(JSContext *ctx, JSValueConst this_val,
@@ -49320,7 +49647,7 @@ static JSValue js_function_hasInstance(JSContext *ctx, JSValueConst this_val,
 }
 
 static const JSCFunctionListEntry js_function_proto_funcs[] = {
-    JS_CFUNC_DEF("call", 1, js_function_call ),
+    JS_CFUNC_STEP_DEF("call", 1, STEPDEF_FUNCTION_CALL ),
     JS_CFUNC_MAGIC_DEF("apply", 2, js_function_apply, 0 ),
     JS_CFUNC_DEF("bind", 1, js_function_bind ),
     JS_CFUNC_DEF("toString", 0, js_function_toString ),
@@ -51312,6 +51639,28 @@ static int js_parse_num_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
 static JSValue js_parse_num_fini(JSContext *ctx, void *st, bool take_result);
 static int js_str_split_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_str_split_fini(JSContext *ctx, void *st, bool take_result);
+static int js_array_join_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_array_join_fini(JSContext *ctx, void *st, bool take_result);
+static JSValue js_bigint_asUintN(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int asIntN);
+static JSValue js_object_getOwnPropertyDescriptor(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
+static JSValue js_regexp_exec(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static JSValue js_regexp_test(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static JSValue js_dataview_getValue(JSContext *ctx, JSValueConst this_obj, int argc, JSValueConst *argv, int class_id);
+static JSValue js_dataview_setValue(JSContext *ctx, JSValueConst this_obj, int argc, JSValueConst *argv, int class_id);
+static int js_dataview_set_precheck(JSContext *ctx, JSValueConst this_val, int magic);
+static int js_dataview_set_midcheck(JSContext *ctx, JSValueConst *argp, int magic);
+static int js_primargs_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_primargs_fini(JSContext *ctx, void *st, bool take_result);
+static int js_num_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_num_ctor_fini(JSContext *ctx, void *st, bool take_result);
+static int js_number_fmt_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_number_fmt_fini(JSContext *ctx, void *st, bool take_result);
+static int js_coerce1_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_coerce1_fini(JSContext *ctx, void *st, bool take_result);
+static int js_function_call_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_function_call_fini(JSContext *ctx, void *st, bool take_result);
+static int js_array_tostring_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_array_tostring_fini(JSContext *ctx, void *st, bool take_result);
 /* One NAMED definition per builtin, referenced by its JS_CFUNC_STEP_DEF registration through the id above — the same shape as
    JS_CFUNC_MAGIC_DEF naming its C function, so the registration line tells you what runs. An index into a side
    table would be a second list to keep in sync and a magic number that silently repoints when a row is inserted. */
@@ -51354,6 +51703,8 @@ static const JSTrampStepDef js_str_substring_def  = { sizeof(JSStrRecv), js_str_
 static const JSTrampStepDef js_str_indexOf_def    = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_INDEXOF };
 static const JSTrampStepDef js_str_lastIndexOf_def= { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_LASTINDEXOF };
 static const JSTrampStepDef js_str_normalize_def  = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_NORMALIZE };
+static const JSTrampStepDef js_str_charAt_def     = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_CHARAT };
+static const JSTrampStepDef js_str_charCodeAt_def = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_CHARCODEAT };
 static const JSTrampStepDef js_ta_at_def          = { sizeof(JSTAIdx), js_ta_idx_step, js_ta_idx_fini, TAIDX_AT };
 static const JSTrampStepDef js_ta_set_def         = { sizeof(JSTAIdx), js_ta_idx_step, js_ta_idx_fini, TAIDX_SET };
 static const JSTrampStepDef js_json_raw_def       = { sizeof(JSJsonRaw), js_json_raw_step, js_json_raw_fini, 0 };
@@ -51362,6 +51713,35 @@ static const JSTrampStepDef js_refl_defprop_def   = { sizeof(JSObjDefProp), js_o
 static const JSTrampStepDef js_parseInt_def       = { sizeof(JSParseNum), js_parse_num_step, js_parse_num_fini, 1 };
 static const JSTrampStepDef js_parseFloat_def     = { sizeof(JSParseNum), js_parse_num_step, js_parse_num_fini, 0 };
 static const JSTrampStepDef js_str_split_def      = { sizeof(JSStrSplit), js_str_split_step, js_str_split_fini, 0 };
+static const JSTrampStepDef js_array_join_def     = { sizeof(JSArrayJoin), js_array_join_step, js_array_join_fini, JOIN_ARRAY };
+static const JSTrampStepDef js_array_tolocale_def = { sizeof(JSArrayJoin), js_array_join_step, js_array_join_fini, JOIN_ARRAY_LOCALE };
+static const JSTrampStepDef js_ta_join_def        = { sizeof(JSArrayJoin), js_array_join_step, js_array_join_fini, JOIN_TA };
+static const JSTrampStepDef js_ta_tolocale_def    = { sizeof(JSArrayJoin), js_array_join_step, js_array_join_fini, JOIN_TA_LOCALE };
+#define PRIMARGS_DEF(spec, proto, fn, magic) \
+    { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, (spec), { .proto = (fn) }, JS_CFUNC_##proto, (magic), NULL, NULL }
+#define PRIMARGS_DEF_PRE(spec, proto, fn, magic, pre, mid) \
+    { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, (spec), { .proto = (fn) }, JS_CFUNC_##proto, (magic), (pre), (mid) }
+static const JSTrampStepDef js_bigint_asUintN_def = PRIMARGS_DEF(PRIMARGS(0x3, HINT_NUMBER, 2), generic_magic, js_bigint_asUintN, 0);
+static const JSTrampStepDef js_bigint_asIntN_def  = PRIMARGS_DEF(PRIMARGS(0x3, HINT_NUMBER, 2), generic_magic, js_bigint_asUintN, 1);
+static const JSTrampStepDef js_obj_gopd_def       = PRIMARGS_DEF(PRIMARGS(0x2, HINT_STRING, 2), generic_magic, js_object_getOwnPropertyDescriptor, 0);
+static const JSTrampStepDef js_reflect_gopd_def   = PRIMARGS_DEF(PRIMARGS(0x2, HINT_STRING, 2), generic_magic, js_object_getOwnPropertyDescriptor, 1);
+static const JSTrampStepDef js_regexp_exec_def    = PRIMARGS_DEF(PRIMARGS(0x1, HINT_STRING, 1), generic, js_regexp_exec, 0);
+static const JSTrampStepDef js_regexp_test_def    = PRIMARGS_DEF(PRIMARGS(0x1, HINT_STRING, 1), generic, js_regexp_test, 0);
+#define DV_STEPDEF_DEF(N) \
+    static const JSTrampStepDef js_dv_get_##N##_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 2), generic_magic, js_dataview_getValue, JS_CLASS_##N##_ARRAY); \
+    static const JSTrampStepDef js_dv_set_##N##_def = PRIMARGS_DEF_PRE(PRIMARGS(0x3, HINT_NUMBER, 3), generic_magic, js_dataview_setValue, JS_CLASS_##N##_ARRAY, js_dataview_set_precheck, js_dataview_set_midcheck);
+DV_STEPDEF_LIST(DV_STEPDEF_DEF)
+#undef DV_STEPDEF_DEF
+static const JSTrampStepDef js_num_ctor_def       = { sizeof(JSNumCtor), js_num_ctor_step, js_num_ctor_fini, 0 };
+static const JSTrampStepDef js_num_tostring_def   = { sizeof(JSNumberFmt), js_number_fmt_step, js_number_fmt_fini, NUMFMT_TOSTRING };
+static const JSTrampStepDef js_num_tolocale_def   = { sizeof(JSNumberFmt), js_number_fmt_step, js_number_fmt_fini, NUMFMT_TOLOCALESTRING };
+static const JSTrampStepDef js_num_tofixed_def    = { sizeof(JSNumberFmt), js_number_fmt_step, js_number_fmt_fini, NUMFMT_TOFIXED };
+static const JSTrampStepDef js_num_toexp_def      = { sizeof(JSNumberFmt), js_number_fmt_step, js_number_fmt_fini, NUMFMT_TOEXPONENTIAL };
+static const JSTrampStepDef js_num_toprec_def     = { sizeof(JSNumberFmt), js_number_fmt_step, js_number_fmt_fini, NUMFMT_TOPRECISION };
+static const JSTrampStepDef js_isNaN_def          = { sizeof(JSCoerce1), js_coerce1_step, js_coerce1_fini, 0 };
+static const JSTrampStepDef js_isFinite_def       = { sizeof(JSCoerce1), js_coerce1_step, js_coerce1_fini, 1 };
+static const JSTrampStepDef js_function_call_def  = { sizeof(JSFuncCall), js_function_call_step, js_function_call_fini, 0 };
+static const JSTrampStepDef js_array_tostring_def = { sizeof(JSArrayToString), js_array_tostring_step, js_array_tostring_fini, 0 };
 static const JSTrampStepDef js_array_reduce_def  = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduce };
 static const JSTrampStepDef js_array_reduceR_def = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduceRight };
 static const JSTrampStepDef js_ta_reduce_def     = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduce | special_TA };
@@ -51406,6 +51786,8 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_STR_INDEXOF]     = &js_str_indexOf_def,
     [STEPDEF_STR_LASTINDEXOF] = &js_str_lastIndexOf_def,
     [STEPDEF_STR_NORMALIZE]   = &js_str_normalize_def,
+    [STEPDEF_STR_CHARAT]      = &js_str_charAt_def,
+    [STEPDEF_STR_CHARCODEAT]  = &js_str_charCodeAt_def,
     [STEPDEF_TA_AT]           = &js_ta_at_def,
     [STEPDEF_TA_SET]          = &js_ta_set_def,
     [STEPDEF_JSON_RAWJSON]    = &js_json_raw_def,
@@ -51414,6 +51796,29 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_PARSEINT]        = &js_parseInt_def,
     [STEPDEF_PARSEFLOAT]      = &js_parseFloat_def,
     [STEPDEF_STR_SPLIT]       = &js_str_split_def,
+    [STEPDEF_ARRAY_JOIN]      = &js_array_join_def,
+    [STEPDEF_ARRAY_TOLOCALESTRING] = &js_array_tolocale_def,
+    [STEPDEF_TA_JOIN]         = &js_ta_join_def,
+    [STEPDEF_TA_TOLOCALESTRING] = &js_ta_tolocale_def,
+    [STEPDEF_ARRAY_TOSTRING]  = &js_array_tostring_def,
+    [STEPDEF_FUNCTION_CALL]   = &js_function_call_def,
+    [STEPDEF_NUM_CTOR]        = &js_num_ctor_def,
+    [STEPDEF_BIGINT_ASUINTN]  = &js_bigint_asUintN_def,
+    [STEPDEF_BIGINT_ASINTN]   = &js_bigint_asIntN_def,
+    [STEPDEF_OBJ_GOPD]        = &js_obj_gopd_def,
+    [STEPDEF_REFLECT_GOPD]    = &js_reflect_gopd_def,
+    [STEPDEF_REGEXP_EXEC]     = &js_regexp_exec_def,
+    [STEPDEF_REGEXP_TEST]     = &js_regexp_test_def,
+#define DV_STEPDEF_ROW(N) [STEPDEF_DV_GET_##N] = &js_dv_get_##N##_def, [STEPDEF_DV_SET_##N] = &js_dv_set_##N##_def,
+    DV_STEPDEF_LIST(DV_STEPDEF_ROW)
+#undef DV_STEPDEF_ROW
+    [STEPDEF_NUM_TOSTRING]    = &js_num_tostring_def,
+    [STEPDEF_NUM_TOLOCALESTRING] = &js_num_tolocale_def,
+    [STEPDEF_NUM_TOFIXED]     = &js_num_tofixed_def,
+    [STEPDEF_NUM_TOEXPONENTIAL] = &js_num_toexp_def,
+    [STEPDEF_NUM_TOPRECISION] = &js_num_toprec_def,
+    [STEPDEF_ISNAN]           = &js_isNaN_def,
+    [STEPDEF_ISFINITE]        = &js_isFinite_def,
     [STEPDEF_ARRAY_REDUCE]  = &js_array_reduce_def,  [STEPDEF_ARRAY_REDUCE_RIGHT] = &js_array_reduceR_def,
     [STEPDEF_TA_REDUCE]     = &js_ta_reduce_def,     [STEPDEF_TA_REDUCE_RIGHT]    = &js_ta_reduceR_def,
 };
@@ -51444,6 +51849,13 @@ STEP_STATE_HDR_FIRST(JSJsonRaw);
 STEP_STATE_HDR_FIRST(JSObjDefProp);
 STEP_STATE_HDR_FIRST(JSParseNum);
 STEP_STATE_HDR_FIRST(JSStrSplit);
+STEP_STATE_HDR_FIRST(JSArrayJoin);
+STEP_STATE_HDR_FIRST(JSArrayToString);
+STEP_STATE_HDR_FIRST(JSFuncCall);
+STEP_STATE_HDR_FIRST(JSCoerce1);
+STEP_STATE_HDR_FIRST(JSNumberFmt);
+STEP_STATE_HDR_FIRST(JSNumCtor);
+STEP_STATE_HDR_FIRST(JSPrimArgs);
 
 static const JSTrampStepDef *tramp_step_def_of(JSValueConst func)
 {
@@ -51464,84 +51876,207 @@ static const JSTrampStepDef *tramp_step_def_of(JSValueConst func)
     return js_tramp_step_defs[fp->u.cfunc.magic];
 }
 
-static JSValue js_array_toString(JSContext *ctx, JSValueConst this_val,
-                                 int argc, JSValueConst *argv)
+/* 23.1.3.36 Array.prototype.toString. Stages: 0 ToObject, 1 Get(array,"join"), 2 its dispatch, 3 the result. */
+static int js_array_tostring_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    JSValue obj, method, ret;
+    JSArrayToString *s = st;
+    int r;
 
-    obj = JS_ToObject(ctx, this_val);
-    if (JS_IsException(obj))
-        return JS_EXCEPTION;
-    method = JS_GetProperty(ctx, obj, JS_ATOM_join);
-    if (JS_IsException(method)) {
-        ret = JS_EXCEPTION;
-    } else
-    if (!JS_IsFunction(ctx, method)) {
-        /* Use intrinsic Object.prototype.toString */
-        JS_FreeValue(ctx, method);
-        ret = js_object_toString(ctx, obj, 0, NULL);
-    } else {
-        ret = JS_CallFree(ctx, method, obj, 0, NULL);
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        s->obj = JS_ToObject(ctx, s->hdr.this_val);
+        s->result = JS_UNDEFINED;
+        if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
+        s->hdr.stage = 1;
     }
-    JS_FreeValue(ctx, obj);
-    return ret;
+    if (s->hdr.stage == 1) {
+        r = step_getprop_run(ctx, &s->hdr, s->obj, JS_ATOM_join, cb_result, &s->cb[1], out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 2;
+    }
+    if (s->hdr.stage == 2) {
+        if (!JS_IsFunction(ctx, s->cb[1])) {
+            /* step 3: a non-callable `join` falls back to the intrinsic Object.prototype.toString, which reads
+               only @@toStringTag — a read the spec performs, and one this machine does not yet route. */
+            s->result = js_object_toString(ctx, s->obj, 0, NULL);
+            return JS_IsException(s->result) ? -1 : 0;
+        }
+        s->cb[0] = js_dup(s->obj);
+        s->hdr.stage = 3;
+        *out_cb = s->cb; *out_argc = 0;
+        return 3;
+    }
+    DCHECK(s->hdr.stage == 3, "Array.prototype.toString: unknown stage");
+    s->result = cb_result;
+    return 0;
 }
 
-static JSValue js_array_join(JSContext *ctx, JSValueConst this_val,
-                             int argc, JSValueConst *argv, int toLocaleString)
+static JSValue js_array_tostring_fini(JSContext *ctx, void *st, bool take_result)
 {
-    JSValue obj, sep = JS_UNDEFINED, el;
-    StringBuffer b_s, *b = &b_s;
-    JSString *p = NULL;
-    int64_t i, n;
-    int c;
+    JSArrayToString *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    int i;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    JS_FreeValue(ctx, s->obj);
+    for (i = 0; i < 2; i++) JS_FreeValue(ctx, s->cb[i]);
+    js_free(ctx, s);
+    return r;
+}
 
-    obj = JS_ToObject(ctx, this_val);
-    if (js_get_length64(ctx, &n, obj))
-        goto exception;
+/* 23.1.3.18 join / 23.1.3.33 toLocaleString. Stages: 0 ToObject, 1 LengthOfArrayLike, 2 ToString(separator),
+   then the loop — 3 its head (the separator), 8 read element i, 4 dispatch on it, 5 the toLocaleString method,
+   6 its call's result, 7 ToString(element) and append. The loop returns to 3 until i reaches len. */
+static int js_array_join_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSArrayJoin *s = st;
+    int mode = s->hdr.arg;
+    int locale = (mode == JOIN_ARRAY_LOCALE || mode == JOIN_TA_LOCALE);
+    int is_ta = (mode == JOIN_TA || mode == JOIN_TA_LOCALE);
+    JSValue str;
+    int r;
 
-    c = ',';    /* default separator */
-    if (!toLocaleString && argc > 0 && !JS_IsUndefined(argv[0])) {
-        sep = JS_ToString(ctx, argv[0]);
-        if (JS_IsException(sep))
-            goto exception;
-        p = JS_VALUE_GET_STRING(sep);
-        if (p->len == 1 && !p->is_wide_char)
-            c = str8(p)[0];
-        else
-            c = -1;
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
+        string_buffer_init(ctx, &s->b, 0);
+        s->sep = JS_UNDEFINED; s->el = JS_UNDEFINED; s->result = JS_UNDEFINED;
+        if (is_ta) {
+            JSObject *p = get_typed_array(ctx, s->hdr.this_val);
+            if (!p) { s->obj = JS_UNDEFINED; return -1; }
+            if (typed_array_is_oob(p)) {
+                s->obj = JS_UNDEFINED;
+                JS_ThrowTypeErrorArrayBufferOOB(ctx);
+                return -1;
+            }
+            s->obj = js_dup(s->hdr.this_val);
+            s->oldlen = s->len = p->u.array.count;
+        } else {
+            s->obj = JS_ToObject(ctx, s->hdr.this_val);
+            if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
+        }
+        s->hdr.stage = 1;
     }
-    string_buffer_init(ctx, b, 0);
+    if (s->hdr.stage == 1) {
+        if (!is_ta) {   /* a typed array's length is its own count, not a property read */
+            r = step_length_run(ctx, &s->hdr, s->obj, cb_result, &s->len, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+        }
+        s->hdr.stage = 2;
+    }
+    if (s->hdr.stage == 2) {
+        /* toLocaleString takes no separator: its comma is not configurable. */
+        if (!locale && s->hdr.argc > 0 && !JS_IsUndefined(s->hdr.argv[0])) {
+            r = step_tostring_run(ctx, &s->hdr, s->hdr.argv[0], cb_result, &s->sep, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            if (is_ta) {
+                /* ToString(separator) can DETACH or shrink the buffer, so the count is re-read after it and the
+                   walk covers only what survived. s->oldlen still holds the count from before, and the tail
+                   below emits the separators the lost elements would have contributed — which is exactly what a
+                   resize is observable as. */
+                int64_t newlen = JS_VALUE_GET_OBJ(s->obj)->u.array.count;
+                if (newlen < s->len) s->len = newlen;
+            }
+        }
+        s->i = 0;
+        s->hdr.stage = 3;
+    }
 
-    for(i = 0; i < n; i++) {
-        if (i > 0) {
-            if (c >= 0) {
-                string_buffer_putc8(b, c);
+    for (;;) {
+        if (s->hdr.stage == 3) {
+            /* the loop HEAD is its own stage precisely because it writes to the buffer: the read below suspends
+               and re-enters this function at its own stage, so a separator emitted in the same block as the read
+               would be emitted again on every resume — which under forced preemption is every element. */
+            if (s->i >= s->len)
+                break;
+            if (s->i > 0) {
+                if (JS_IsUndefined(s->sep)) {
+                    string_buffer_putc8(&s->b, ',');
+                } else {
+                    JSString *p = JS_VALUE_GET_STRING(s->sep);   /* re-derived: a C local would be gone */
+                    string_buffer_concat(&s->b, p, 0, p->len);
+                }
+            }
+            s->hdr.stage = 8;
+        }
+        if (s->hdr.stage == 8) {
+            r = step_getidx_run(ctx, &s->hdr, s->obj, s->i, cb_result, &s->el, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->hdr.stage = 4;
+        }
+        if (s->hdr.stage == 4) {
+            if (JS_IsNull(s->el) || JS_IsUndefined(s->el)) {
+                /* a hole or a nullish element contributes nothing but the separator */
+                JS_FreeValue(ctx, s->el); s->el = JS_UNDEFINED;
+                s->i++;
+                s->hdr.stage = 3;
+                continue;
+            }
+            s->hdr.stage = locale ? 5 : 7;
+        }
+        if (s->hdr.stage == 5) {
+            r = step_getprop_run(ctx, &s->hdr, s->el, JS_ATOM_toLocaleString, cb_result, &s->cb[1],
+                                 out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->cb[0] = s->el;                 /* the receiver: ownership moves into the call buffer */
+            s->el = JS_UNDEFINED;
+            s->hdr.stage = 6;
+            *out_cb = s->cb; *out_argc = 0;
+            return 3;                          /* a non-callable toLocaleString throws HERE, as Invoke does */
+        }
+        if (s->hdr.stage == 6) {
+            s->el = cb_result; cb_result = JS_UNDEFINED;
+            JS_FreeValue(ctx, s->cb[0]); s->cb[0] = JS_UNDEFINED;
+            JS_FreeValue(ctx, s->cb[1]); s->cb[1] = JS_UNDEFINED;
+            s->hdr.stage = 7;
+        }
+        DCHECK(s->hdr.stage == 7, "Array.prototype.join: unknown stage");
+        r = step_tostring_run(ctx, &s->hdr, s->el, cb_result, &str, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        JS_FreeValue(ctx, s->el); s->el = JS_UNDEFINED;
+        if (string_buffer_concat_value_free(&s->b, str))
+            return -1;
+        s->i++;
+        s->hdr.stage = 3;
+    }
+
+    JS_FreeValue(ctx, cb_result);
+    if (is_ta) {
+        /* the separators for the elements a resizing separator-coercion removed */
+        for (s->i = s->len > 1 ? s->len : 1; s->i < s->oldlen; s->i++) {
+            if (JS_IsUndefined(s->sep)) {
+                string_buffer_putc8(&s->b, ',');
             } else {
-                string_buffer_concat(b, p, 0, p->len);
+                JSString *p = JS_VALUE_GET_STRING(s->sep);
+                string_buffer_concat(&s->b, p, 0, p->len);
             }
-        }
-        el = JS_GetPropertyUint32(ctx, obj, i);
-        if (JS_IsException(el))
-            goto fail;
-        if (!JS_IsNull(el) && !JS_IsUndefined(el)) {
-            if (toLocaleString) {
-                el = JS_ToLocaleStringFree(ctx, el);
-            }
-            if (string_buffer_concat_value_free(b, el))
-                goto fail;
         }
     }
-    JS_FreeValue(ctx, sep);
-    JS_FreeValue(ctx, obj);
-    return string_buffer_end(b);
+    /* string_buffer_end NULLs the buffer on every path that consumed it and leaves it intact on the error
+       path, so the teardown's string_buffer_free is right either way. */
+    s->result = string_buffer_end(&s->b);
+    return JS_IsException(s->result) ? -1 : 0;
+}
 
-fail:
-    string_buffer_free(b);
-    JS_FreeValue(ctx, sep);
-exception:
-    JS_FreeValue(ctx, obj);
-    return JS_EXCEPTION;
+static JSValue js_array_join_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSArrayJoin *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    int i;
+    DCHECK(s->b.ctx != NULL, "the join buffer is initialised by stage 0's first statement, before any throw");
+    string_buffer_free(&s->b);
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    JS_FreeValue(ctx, s->obj);
+    JS_FreeValue(ctx, s->sep);
+    JS_FreeValue(ctx, s->el);
+    for (i = 0; i < 2; i++) JS_FreeValue(ctx, s->cb[i]);
+    js_free(ctx, s);
+    return r;
 }
 
 static JSValue js_array_pop(JSContext *ctx, JSValueConst this_val,
@@ -53473,9 +54008,9 @@ static const JSCFunctionListEntry js_array_proto_funcs[] = {
     JS_CFUNC_STEP_DEF("indexOf", 1, STEPDEF_ARRAY_INDEXOF ),
     JS_CFUNC_STEP_DEF("lastIndexOf", 1, STEPDEF_ARRAY_LASTINDEXOF ),
     JS_CFUNC_STEP_DEF("includes", 1, STEPDEF_ARRAY_INCLUDES ),
-    JS_CFUNC_MAGIC_DEF("join", 1, js_array_join, 0 ),
-    JS_CFUNC_DEF("toString", 0, js_array_toString ),
-    JS_CFUNC_MAGIC_DEF("toLocaleString", 0, js_array_join, 1 ),
+    JS_CFUNC_STEP_DEF("join", 1, STEPDEF_ARRAY_JOIN ),
+    JS_CFUNC_STEP_DEF("toString", 0, STEPDEF_ARRAY_TOSTRING ),
+    JS_CFUNC_STEP_DEF("toLocaleString", 0, STEPDEF_ARRAY_TOLOCALESTRING ),
     JS_CFUNC_MAGIC_DEF("pop", 0, js_array_pop, 0 ),
     JS_CFUNC_MAGIC_DEF("push", 1, js_array_push, 0 ),
     JS_CFUNC_MAGIC_DEF("shift", 0, js_array_pop, 1 ),
@@ -53504,59 +54039,88 @@ static const JSCFunctionListEntry js_array_iterator_proto_funcs[] = {
 
 /* Number */
 
-static JSValue js_number_constructor(JSContext *ctx, JSValueConst new_target,
-                                     int argc, JSValueConst *argv)
+/* 21.1.1.1. The receiver slot IS new_target on a constructor step; UNDEFINED means a plain `Number(x)` call.
+   The ToNumeric is a TOPRIMITIVE step, so a valueOf with a loop in it parks like any other callee. */
+static int js_num_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
+    JSNumCtor *s = st;
+    JSValueConst nt = s->hdr.this_val;
+    JSValueConst arg = step_arg(&s->hdr, 0);
     JSValue val, obj;
-    if (argc == 0) {
-        val = js_int32(0);
+
+    if (!s->coerced && s->hdr.argc > 0 && JS_VALUE_GET_TAG(arg) == JS_TAG_OBJECT) {
+        s->coerced = 1;
+        s->cb[0] = (JSValue)arg;   /* borrowed: hdr.argv holds the reference */
+        *out_cb = s->cb; *out_argc = HINT_NUMBER;
+        JS_FreeValue(ctx, cb_result);
+        return 5;
+    }
+    if (s->coerced) {
+        val = JS_ToNumericFree(ctx, cb_result);   /* a primitive now: this runs nothing */
     } else {
-        val = JS_ToNumeric(ctx, argv[0]);
-        if (JS_IsException(val))
-            return val;
-        switch(JS_VALUE_GET_TAG(val)) {
-        case JS_TAG_SHORT_BIG_INT:
-            val = js_int64(JS_VALUE_GET_SHORT_BIG_INT(val));
-            if (JS_IsException(val))
-                return val;
-            break;
-        case JS_TAG_BIG_INT:
-            {
-                JSBigInt *p = JS_VALUE_GET_PTR(val);
-                double d;
-                d = js_bigint_to_float64(ctx, p);
-                JS_FreeValue(ctx, val);
-                val = js_float64(d);
-            }
-            break;
-        default:
-            break;
+        JS_FreeValue(ctx, cb_result);
+        val = (s->hdr.argc == 0) ? js_int32(0) : JS_ToNumeric(ctx, arg);
+    }
+    if (JS_IsException(val)) return -1;
+    switch(JS_VALUE_GET_TAG(val)) {
+    case JS_TAG_SHORT_BIG_INT:
+        val = js_int64(JS_VALUE_GET_SHORT_BIG_INT(val));
+        if (JS_IsException(val)) return -1;
+        break;
+    case JS_TAG_BIG_INT:
+        {
+            JSBigInt *p = JS_VALUE_GET_PTR(val);
+            double d = js_bigint_to_float64(ctx, p);
+            JS_FreeValue(ctx, val);
+            val = js_float64(d);
         }
+        break;
+    default:
+        break;
     }
-    if (!JS_IsUndefined(new_target)) {
-        obj = js_create_from_ctor(ctx, new_target, JS_CLASS_NUMBER);
-        if (!JS_IsException(obj))
-            JS_SetObjectData(ctx, obj, val);
-        return obj;
-    } else {
-        return val;
+    if (JS_IsUndefined(nt)) {
+        s->result = val;
+        return 0;
     }
+    obj = js_create_from_ctor(ctx, nt, JS_CLASS_NUMBER);
+    if (JS_IsException(obj)) { JS_FreeValue(ctx, val); return -1; }
+    JS_SetObjectData(ctx, obj, val);
+    s->result = obj;
+    return 0;
 }
 
+static JSValue js_num_ctor_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSNumCtor *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    js_free(ctx, s);
+    return r;
+}
+
+/* Number.isNaN / Number.isFinite do NOT coerce (21.1.2.2 / 21.1.2.4 step 1 rejects a non-Number outright), so
+   they run none of the page's code and read the number directly rather than borrowing the coercing global's
+   body — which is now a step machine and cannot be called from C at all. */
 static JSValue js_number_isNaN(JSContext *ctx, JSValueConst this_val,
                                int argc, JSValueConst *argv)
 {
+    double d;
     if (!JS_IsNumber(argv[0]))
         return JS_FALSE;
-    return js_global_isNaN(ctx, this_val, argc, argv);
+    if (unlikely(JS_ToFloat64(ctx, &d, argv[0])))   /* a Number: reads the value, runs nothing */
+        return JS_EXCEPTION;
+    return js_bool(isnan(d));
 }
 
 static JSValue js_number_isFinite(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv)
 {
+    double d;
     if (!JS_IsNumber(argv[0]))
         return JS_FALSE;
-    return js_global_isFinite(ctx, this_val, argc, argv);
+    if (unlikely(JS_ToFloat64(ctx, &d, argv[0])))
+        return JS_EXCEPTION;
+    return js_bool(isfinite(d));
 }
 
 static JSValue js_number_isInteger(JSContext *ctx, JSValueConst this_val,
@@ -53634,123 +54198,128 @@ static int js_get_radix(JSContext *ctx, JSValueConst val)
     return radix;
 }
 
-static JSValue js_number_toString(JSContext *ctx, JSValueConst this_val,
-                                  int argc, JSValueConst *argv, int magic)
+/* Number.prototype.toString / toLocaleString / toFixed / toExponential / toPrecision. thisNumberValue runs
+   nothing (it unwraps the receiver or throws), but the DIGITS argument is ToInt32Sat'd — the page's code, from
+   a C body, so `(1).toFixed({valueOf(){while(x){}}})` preempted with no flow base and `(1).toFixed([2])`
+   reaches Array.prototype.toString, which is a machine no C body can drive.
+   Stage 0 unwraps the receiver, 1 coerces the argument where the mode has one, 2 formats. */
+static int js_number_fmt_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    JSValue val;
-    int base, flags;
-    double d;
+    JSNumberFmt *s = st;
+    int mode = s->hdr.arg;
+    JSValueConst arg0 = step_arg(&s->hdr, 0);
+    int f, flags, r;
 
-    val = js_thisNumberValue(ctx, this_val);
-    if (JS_IsException(val))
-        return val;
-    if (magic || JS_IsUndefined(argv[0])) {
-        base = 10;
-    } else {
-        base = js_get_radix(ctx, argv[0]);
-        if (base < 0)
-            goto fail;
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        s->result = JS_UNDEFINED;
+        s->val = js_thisNumberValue(ctx, s->hdr.this_val);
+        if (JS_IsException(s->val)) { s->val = JS_UNDEFINED; return -1; }
+        s->hdr.stage = 1;
     }
-    if (JS_VALUE_GET_TAG(val) == JS_TAG_INT) {
-        char buf1[70];
-        int len;
-        len = i64toa_radix(buf1, JS_VALUE_GET_INT(val), base);
-        return js_new_string8_len(ctx, buf1, len);
+    if (s->hdr.stage == 1) {
+        /* WHICH modes coerce, and when, is observable: toString with no radix and toPrecision with no
+           precision never touch the argument, while toExponential and toFixed coerce even an undefined one. */
+        bool coerces = (mode == NUMFMT_TOFIXED || mode == NUMFMT_TOEXPONENTIAL)
+                    || (mode == NUMFMT_TOSTRING && !JS_IsUndefined(arg0))
+                    || (mode == NUMFMT_TOPRECISION && !JS_IsUndefined(arg0));
+        s->n = 0;
+        if (coerces) {
+            r = step_toint64_run(ctx, &s->hdr, arg0, cb_result, &s->n, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+        }
+        s->hdr.stage = 2;
     }
-    if (JS_ToFloat64Free(ctx, &d, val))
-        return JS_EXCEPTION;
-    flags = JS_DTOA_FORMAT_FREE;
-    if (base != 10)
-        flags |= JS_DTOA_EXP_DISABLED;
-    return js_dtoa2(ctx, d, base, 0, flags);
- fail:
-    JS_FreeValue(ctx, val);
-    return JS_EXCEPTION;
-}
+    JS_FreeValue(ctx, cb_result);
 
-static JSValue js_number_toFixed(JSContext *ctx, JSValueConst this_val,
-                                 int argc, JSValueConst *argv)
-{
-    JSValue val;
-    int f, flags;
-    double d;
+    /* JS_ToInt32Sat's saturation, applied to the int64-saturated result the sub-sequence delivers */
+    f = (int)(s->n < INT32_MIN ? INT32_MIN : s->n > INT32_MAX ? INT32_MAX : s->n);
 
-    val = js_thisNumberValue(ctx, this_val);
-    if (JS_IsException(val))
-        return val;
-    if (JS_ToFloat64Free(ctx, &d, val))
-        return JS_EXCEPTION;
-    if (JS_ToInt32Sat(ctx, &f, argv[0]))
-        return JS_EXCEPTION;
-    if (f < 0 || f > 100)
-        return JS_ThrowRangeError(ctx, "invalid number of digits");
-    if (fabs(d) >= 1e21)
+    if (mode == NUMFMT_TOSTRING || mode == NUMFMT_TOLOCALESTRING) {
+        int base = 10;
+        if (mode == NUMFMT_TOSTRING && !JS_IsUndefined(arg0)) {
+            base = f;
+            if (base < 2 || base > 36) {
+                JS_ThrowRangeError(ctx, "toString() radix argument must be between 2 and 36");
+                return -1;
+            }
+        }
+        if (JS_VALUE_GET_TAG(s->val) == JS_TAG_INT) {
+            char buf1[70];
+            int len = i64toa_radix(buf1, JS_VALUE_GET_INT(s->val), base);
+            s->result = js_new_string8_len(ctx, buf1, len);
+            return JS_IsException(s->result) ? -1 : 0;
+        }
+        if (JS_ToFloat64(ctx, &s->d, s->val))
+            return -1;
         flags = JS_DTOA_FORMAT_FREE;
-    else
-        flags = JS_DTOA_FORMAT_FRAC;
-    return js_dtoa2(ctx, d, 10, f, flags);
+        if (base != 10)
+            flags |= JS_DTOA_EXP_DISABLED;
+        s->result = js_dtoa2(ctx, s->d, base, 0, flags);
+        return JS_IsException(s->result) ? -1 : 0;
+    }
+
+    if (JS_ToFloat64(ctx, &s->d, s->val))
+        return -1;
+
+    if (mode == NUMFMT_TOFIXED) {
+        if (f < 0 || f > 100) {
+            JS_ThrowRangeError(ctx, "invalid number of digits");
+            return -1;
+        }
+        flags = (fabs(s->d) >= 1e21) ? JS_DTOA_FORMAT_FREE : JS_DTOA_FORMAT_FRAC;
+        s->result = js_dtoa2(ctx, s->d, 10, f, flags);
+        return JS_IsException(s->result) ? -1 : 0;
+    }
+    if (mode == NUMFMT_TOEXPONENTIAL) {
+        if (!isfinite(s->d)) {
+            s->result = JS_ToStringFree(ctx, __JS_NewFloat64(s->d));
+            return JS_IsException(s->result) ? -1 : 0;
+        }
+        if (JS_IsUndefined(arg0)) {
+            flags = JS_DTOA_FORMAT_FREE;
+            f = 0;
+        } else {
+            if (f < 0 || f > 100) {
+                JS_ThrowRangeError(ctx, "invalid number of digits");
+                return -1;
+            }
+            f++;
+            flags = JS_DTOA_FORMAT_FIXED;
+        }
+        s->result = js_dtoa2(ctx, s->d, 10, f, flags | JS_DTOA_EXP_ENABLED);
+        return JS_IsException(s->result) ? -1 : 0;
+    }
+    DCHECK(mode == NUMFMT_TOPRECISION, "Number formatting machine: unknown mode");
+    if (JS_IsUndefined(arg0) || !isfinite(s->d)) {
+        s->result = JS_ToStringFree(ctx, __JS_NewFloat64(s->d));
+        return JS_IsException(s->result) ? -1 : 0;
+    }
+    if (f < 1 || f > 100) {
+        JS_ThrowRangeError(ctx, "invalid number of digits");
+        return -1;
+    }
+    s->result = js_dtoa2(ctx, s->d, 10, f, JS_DTOA_FORMAT_FIXED);
+    return JS_IsException(s->result) ? -1 : 0;
 }
 
-static JSValue js_number_toExponential(JSContext *ctx, JSValueConst this_val,
-                                       int argc, JSValueConst *argv)
+static JSValue js_number_fmt_fini(JSContext *ctx, void *st, bool take_result)
 {
-    JSValue val;
-    int f, flags;
-    double d;
-
-    val = js_thisNumberValue(ctx, this_val);
-    if (JS_IsException(val))
-        return val;
-    if (JS_ToFloat64Free(ctx, &d, val))
-        return JS_EXCEPTION;
-    if (JS_ToInt32Sat(ctx, &f, argv[0]))
-        return JS_EXCEPTION;
-    if (!isfinite(d)) {
-        return JS_ToStringFree(ctx,  __JS_NewFloat64(d));
-    }
-    if (JS_IsUndefined(argv[0])) {
-        flags = JS_DTOA_FORMAT_FREE;
-        f = 0;
-    } else {
-        if (f < 0 || f > 100)
-            return JS_ThrowRangeError(ctx, "invalid number of digits");
-        f++;
-        flags = JS_DTOA_FORMAT_FIXED;
-    }
-    return js_dtoa2(ctx, d, 10, f, flags | JS_DTOA_EXP_ENABLED);
-}
-
-static JSValue js_number_toPrecision(JSContext *ctx, JSValueConst this_val,
-                                     int argc, JSValueConst *argv)
-{
-    JSValue val;
-    int p;
-    double d;
-
-    val = js_thisNumberValue(ctx, this_val);
-    if (JS_IsException(val))
-        return val;
-    if (JS_ToFloat64Free(ctx, &d, val))
-        return JS_EXCEPTION;
-    if (JS_IsUndefined(argv[0]))
-        goto to_string;
-    if (JS_ToInt32Sat(ctx, &p, argv[0]))
-        return JS_EXCEPTION;
-    if (!isfinite(d)) {
-    to_string:
-        return JS_ToStringFree(ctx,  __JS_NewFloat64(d));
-    }
-    if (p < 1 || p > 100)
-        return JS_ThrowRangeError(ctx, "invalid number of digits");
-    return js_dtoa2(ctx, d, 10, p, JS_DTOA_FORMAT_FIXED);
+    JSNumberFmt *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    JS_FreeValue(ctx, s->val);
+    js_free(ctx, s);
+    return r;
 }
 
 static const JSCFunctionListEntry js_number_proto_funcs[] = {
-    JS_CFUNC_DEF("toExponential", 1, js_number_toExponential ),
-    JS_CFUNC_DEF("toFixed", 1, js_number_toFixed ),
-    JS_CFUNC_DEF("toPrecision", 1, js_number_toPrecision ),
-    JS_CFUNC_MAGIC_DEF("toString", 1, js_number_toString, 0 ),
-    JS_CFUNC_MAGIC_DEF("toLocaleString", 0, js_number_toString, 1 ),
+    JS_CFUNC_STEP_DEF("toExponential", 1, STEPDEF_NUM_TOEXPONENTIAL ),
+    JS_CFUNC_STEP_DEF("toFixed", 1, STEPDEF_NUM_TOFIXED ),
+    JS_CFUNC_STEP_DEF("toPrecision", 1, STEPDEF_NUM_TOPRECISION ),
+    JS_CFUNC_STEP_DEF("toString", 1, STEPDEF_NUM_TOSTRING ),
+    JS_CFUNC_STEP_DEF("toLocaleString", 0, STEPDEF_NUM_TOLOCALESTRING ),
     JS_CFUNC_DEF("valueOf", 0, js_number_valueOf ),
 };
 
@@ -54146,6 +54715,7 @@ static int js_str_recv_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
     if (s->hdr.stage == 1) {
         switch (mode) {
         case STRRECV_AT: case STRRECV_CODEPOINTAT: case STRRECV_SUBSTRING:
+        case STRRECV_CHARAT: case STRRECV_CHARCODEAT:
             r = step_toint64_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->idx, out_cb, out_argc);
             cb_result = JS_UNDEFINED;
             if (r) return r < 0 ? -1 : r;
@@ -54206,6 +54776,16 @@ static int js_str_recv_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
         if (idx < 0) idx = len + idx;
         if (idx < 0 || idx >= len) { s->result = JS_UNDEFINED; return 0; }
         s->result = js_new_string_char(ctx, string_get(p, idx));
+        return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
+    }
+    if (mode == STRRECV_CHARAT || mode == STRRECV_CHARCODEAT) {
+        /* 22.1.3.1 / 22.1.3.2: an out-of-range position is the empty string / NaN, never a throw. */
+        if (idx < 0 || idx >= len) {
+            s->result = (mode == STRRECV_CHARAT) ? js_empty_string(ctx->rt) : JS_NAN;
+            return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
+        }
+        c = string_get(p, idx);
+        s->result = (mode == STRRECV_CHARAT) ? js_new_string_char(ctx, c) : js_int32(c);
         return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
     }
     if (mode == STRRECV_CODEPOINTAT) {
@@ -54289,56 +54869,6 @@ static JSValue js_str_recv_fini(JSContext *ctx, void *st, bool take_result)
     JS_FreeValue(ctx, s->arg);
     js_free(ctx, s);
     return r;
-}
-
-static JSValue js_string_charCodeAt(JSContext *ctx, JSValueConst this_val,
-                                     int argc, JSValueConst *argv)
-{
-    JSValue val, ret;
-    JSString *p;
-    int idx, c;
-
-    val = JS_ToStringCheckObject(ctx, this_val);
-    if (JS_IsException(val))
-        return val;
-    p = JS_VALUE_GET_STRING(val);
-    if (JS_ToInt32Sat(ctx, &idx, argv[0])) {
-        JS_FreeValue(ctx, val);
-        return JS_EXCEPTION;
-    }
-    if (idx < 0 || idx >= p->len) {
-        ret = JS_NAN;
-    } else {
-        c = string_get(p, idx);
-        ret = js_int32(c);
-    }
-    JS_FreeValue(ctx, val);
-    return ret;
-}
-
-static JSValue js_string_charAt(JSContext *ctx, JSValueConst this_val,
-                                int argc, JSValueConst *argv)
-{
-    JSValue val, ret;
-    JSString *p;
-    int idx, c;
-
-    val = JS_ToStringCheckObject(ctx, this_val);
-    if (JS_IsException(val))
-        return val;
-    p = JS_VALUE_GET_STRING(val);
-    if (JS_ToInt32Sat(ctx, &idx, argv[0])) {
-        JS_FreeValue(ctx, val);
-        return JS_EXCEPTION;
-    }
-    if (idx < 0 || idx >= p->len) {
-        ret = js_empty_string(ctx->rt);
-    } else {
-        c = string_get(p, idx);
-        ret = js_new_string_char(ctx, c);
-    }
-    JS_FreeValue(ctx, val);
-    return ret;
 }
 
 
@@ -54995,32 +55525,50 @@ static int js_str_replace_prologue(JSContext *ctx, JSStrReplace *s)
     /* The plain string-search walk — ONE walk for both replacer kinds. A callable drives step-code 3; anything
        else is ToString'd once and fed to GetSubstitution inside the same loop. There is no separate no-callback
        body: that duplicate walk is deleted. */
-    s->str = JS_ToString(ctx, this_val);
-    if (JS_IsException(s->str)) { s->str = JS_UNDEFINED; return -1; }
-    s->search_str = JS_ToString(ctx, searchValue);
-    if (JS_IsException(s->search_str)) { s->search_str = JS_UNDEFINED; return -1; }
+    /* The three ToStrings run the page's coercion methods, and this prologue is not a step — it cannot suspend.
+       They are stages 10..12 of the machine instead; `mode` staying 4 is what tells the vstep to run them. */
     s->functional = JS_IsFunction(ctx, repArg);
-    if (s->functional) {
+    if (s->functional)
         s->cb_args[1] = js_dup(repArg);
-    } else {
-        s->rep_val = JS_ToString(ctx, repArg);
-        if (JS_IsException(s->rep_val)) { s->rep_val = JS_UNDEFINED; return -1; }
-    }
-    string_buffer_init(ctx, &s->b, 0);
-    s->is_first = 1;
-    s->mode = 0;
+    s->mode = 4;
     return 0;
 }
 
 static int js_str_replace_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSStrReplace *s = st;
+    int rr;
     if (s->hdr.stage == 0) {
-        s->hdr.stage = 1;
         JS_FreeValue(ctx, cb_result);
         cb_result = JS_UNDEFINED;
         if (js_str_replace_prologue(ctx, s))
             return -1;
+        s->hdr.stage = (s->mode == 4) ? 10 : 1;
+    }
+    /* 22.1.3.19 steps 3, 5 and 8: ToString on the receiver, the search value and — when it is not callable —
+       the replacement. Each is the page's code, so each is its own stage. */
+    if (s->hdr.stage == 10) {
+        rr = step_tostring_run(ctx, &s->hdr, s->hdr.this_val, cb_result, &s->str, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (rr) return rr < 0 ? -1 : rr;
+        s->hdr.stage = 11;
+    }
+    if (s->hdr.stage == 11) {
+        rr = step_tostring_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->search_str, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (rr) return rr < 0 ? -1 : rr;
+        s->hdr.stage = 12;
+    }
+    if (s->hdr.stage == 12) {
+        if (!s->functional) {
+            rr = step_tostring_run(ctx, &s->hdr, step_arg(&s->hdr, 1), cb_result, &s->rep_val, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (rr) return rr < 0 ? -1 : rr;
+        }
+        string_buffer_init(ctx, &s->b, 0);
+        s->is_first = 1;
+        s->mode = 0;
+        s->hdr.stage = 1;
     }
     if (s->mode == 3)   /* delegated: the built-in @@replace machine IS the walk */
         return ((JSStepHdr *)s->inner)->def->step(ctx, s->inner, cb_result, out_cb, out_argc);
@@ -55692,8 +56240,8 @@ static const JSCFunctionListEntry js_string_funcs[] = {
 static const JSCFunctionListEntry js_string_proto_funcs[] = {
     JS_PROP_INT32_DEF("length", 0, JS_PROP_CONFIGURABLE ),
     JS_CFUNC_STEP_DEF("at", 1, STEPDEF_STR_AT ),
-    JS_CFUNC_DEF("charCodeAt", 1, js_string_charCodeAt ),
-    JS_CFUNC_DEF("charAt", 1, js_string_charAt ),
+    JS_CFUNC_STEP_DEF("charCodeAt", 1, STEPDEF_STR_CHARCODEAT ),
+    JS_CFUNC_STEP_DEF("charAt", 1, STEPDEF_STR_CHARAT ),
     JS_CFUNC_STEP_DEF("concat", 1, STEPDEF_STR_CONCAT ),
     JS_CFUNC_STEP_DEF("codePointAt", 1, STEPDEF_STR_CODEPOINTAT ),
     JS_CFUNC_DEF("isWellFormed", 0, js_string_isWellFormed ),
@@ -57193,6 +57741,13 @@ static JSValue JS_RegExpExec(JSContext *ctx, JSValueConst r, JSValueConst s)
     method = JS_GetProperty(ctx, r, JS_ATOM_exec);
     if (JS_IsException(method))
         return method;
+    if (tramp_step_def_of(method) == &js_regexp_exec_def) {
+        /* the BUILT-IN exec, unpatched: 22.2.7.1 step 3 calls it, and calling it as a value would mean this C
+           frame driving a step machine. Its own computation is what the step machine's body is, and with a
+           STRING subject there is nothing left in it to coerce, so it runs here directly. */
+        JS_FreeValue(ctx, method);
+        return js_regexp_exec(ctx, r, 1, &s);
+    }
     if (JS_IsFunction(ctx, method)) {
         ret = JS_CallFree(ctx, method, r, 1, &s);
         if (JS_IsException(ret))
@@ -57531,7 +58086,9 @@ static int js_is_standard_regexp(JSContext *ctx, JSValueConst rx)
         if (JS_IsException(val))
             return -1;
         // rx.exec === RE_exec
-        res = JS_IsCFunction(ctx, val, js_regexp_exec, 0);
+        /* the BUILT-IN exec, which is a step machine: its identity is the definition it names, not a
+           c_function pointer the JS_CFUNC_step cproto does not carry. */
+        res = tramp_step_def_of(val) == &js_regexp_exec_def;
         JS_FreeValue(ctx, val);
     }
     return res;
@@ -57708,8 +58265,18 @@ static int js_re_rep_prologue(JSContext *ctx, JSReRep *s)
         if (JS_SetProperty(ctx, this_val, JS_ATOM_lastIndex, js_int32(0)) < 0) { JS_FreeValue(ctx, flags); return -1; }
     }
     JS_FreeValue(ctx, flags);
-    s->str = JS_ToString(ctx, step_arg(&s->hdr, 0));
-    if (JS_IsException(s->str)) { s->str = JS_UNDEFINED; return -1; }
+    s->is_global = is_global2;
+    s->fullUnicode = fullUnicode2;
+    return 0;   /* ToString(S) is the page's code and is stage 10; the collection resumes in _collect below */
+}
+
+/* 22.2.7.11 step 5 onwards: with S in hand, collect every match. Split from the prologue because the ToString
+   between them runs the page's code and so has to be a stage of its own. */
+static int js_re_rep_collect(JSContext *ctx, JSReRep *s)
+{
+    JSValueConst this_val = s->hdr.this_val;
+    JSValueConst repArg = step_arg(&s->hdr, 1);
+    int is_global2 = s->is_global, fullUnicode2 = s->fullUnicode, rcap = s->nresults;
     for (;;) {
         JSValue mres = JS_RegExpExec(ctx, this_val, s->str);
         if (JS_IsException(mres)) return -1;
@@ -57754,10 +58321,18 @@ static int js_re_rep_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue 
     JSReRep *s = st;
     int r;
     if (s->hdr.stage == 0) {
-        s->hdr.stage = 1;
         JS_FreeValue(ctx, cb_result);
         cb_result = JS_UNDEFINED;
         if (js_re_rep_prologue(ctx, s))
+            return -1;
+        s->hdr.stage = 10;
+    }
+    if (s->hdr.stage == 10) {
+        r = step_tostring_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->str, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 1;
+        if (js_re_rep_collect(ctx, s))
             return -1;
     }
     r = js_re_rep_step(ctx, s, cb_result);
@@ -58003,9 +58578,9 @@ static const JSCFunctionListEntry js_regexp_proto_funcs[] = {
     JS_CGETSET_MAGIC_DEF("unicodeSets", js_regexp_get_flag, NULL, LRE_FLAG_UNICODE_SETS ),
     JS_CGETSET_MAGIC_DEF("sticky", js_regexp_get_flag, NULL, LRE_FLAG_STICKY ),
     JS_CGETSET_MAGIC_DEF("hasIndices", js_regexp_get_flag, NULL, LRE_FLAG_INDICES ),
-    JS_CFUNC_DEF("exec", 1, js_regexp_exec ),
+    JS_CFUNC_STEP_DEF("exec", 1, STEPDEF_REGEXP_EXEC ),
     JS_CFUNC_DEF("compile", 2, js_regexp_compile ),
-    JS_CFUNC_DEF("test", 1, js_regexp_test ),
+    JS_CFUNC_STEP_DEF("test", 1, STEPDEF_REGEXP_TEST ),
     JS_CFUNC_DEF("toString", 0, js_regexp_toString ),
     JS_CFUNC_STEP_DEF("[Symbol.replace]", 2, STEPDEF_RE_REPLACE ),
     JS_CFUNC_DEF("[Symbol.match]", 1, js_regexp_Symbol_match ),
@@ -59419,7 +59994,7 @@ static const JSCFunctionListEntry js_reflect_funcs[] = {
     JS_CFUNC_STEP_DEF("defineProperty", 3, STEPDEF_REFLECT_DEFINEPROPERTY ),
     JS_CFUNC_DEF("deleteProperty", 2, js_reflect_deleteProperty ),
     JS_CFUNC_DEF("get", 2, js_reflect_get ),
-    JS_CFUNC_MAGIC_DEF("getOwnPropertyDescriptor", 2, js_object_getOwnPropertyDescriptor, 1 ),
+    JS_CFUNC_STEP_DEF("getOwnPropertyDescriptor", 2, STEPDEF_REFLECT_GOPD ),
     JS_CFUNC_MAGIC_DEF("getPrototypeOf", 1, js_object_getPrototypeOf, 1 ),
     JS_CFUNC_DEF("has", 2, js_reflect_has ),
     JS_CFUNC_MAGIC_DEF("isExtensible", 1, js_object_isExtensible, 1 ),
@@ -65105,8 +65680,8 @@ static JSValue js_global_unescape(JSContext *ctx, JSValueConst this_val,
 static const JSCFunctionListEntry js_global_funcs[] = {
     JS_CFUNC_STEP_DEF("parseInt", 2, STEPDEF_PARSEINT ),
     JS_CFUNC_STEP_DEF("parseFloat", 1, STEPDEF_PARSEFLOAT ),
-    JS_CFUNC_DEF("isNaN", 1, js_global_isNaN ),
-    JS_CFUNC_DEF("isFinite", 1, js_global_isFinite ),
+    JS_CFUNC_STEP_DEF("isNaN", 1, STEPDEF_ISNAN ),
+    JS_CFUNC_STEP_DEF("isFinite", 1, STEPDEF_ISFINITE ),
     JS_CFUNC_DEF("queueMicrotask", 1, js_global_queueMicrotask ),
 
     JS_CFUNC_MAGIC_DEF("decodeURI", 1, js_global_decodeURI, 0 ),
@@ -66507,8 +67082,8 @@ static JSValue js_bigint_asUintN(JSContext *ctx,
 }
 
 static const JSCFunctionListEntry js_bigint_funcs[] = {
-    JS_CFUNC_MAGIC_DEF("asUintN", 2, js_bigint_asUintN, 0 ),
-    JS_CFUNC_MAGIC_DEF("asIntN", 2, js_bigint_asUintN, 1 ),
+    JS_CFUNC_STEP_DEF("asUintN", 2, STEPDEF_BIGINT_ASUINTN ),
+    JS_CFUNC_STEP_DEF("asIntN", 2, STEPDEF_BIGINT_ASINTN ),
 };
 
 static const JSCFunctionListEntry js_bigint_proto_funcs[] = {
@@ -66820,7 +67395,7 @@ int JS_AddIntrinsicBaseObjects(JSContext *ctx)
 
     /* Number */
     obj1 = JS_NewCConstructor(ctx, JS_CLASS_NUMBER, "Number",
-                              js_number_constructor, 1, JS_CFUNC_constructor_or_func, 0,
+                              NULL, 1, JS_CFUNC_step_ctor, STEPDEF_NUM_CTOR,
                               JS_UNDEFINED,
                               js_number_funcs, countof(js_number_funcs),
                               js_number_proto_funcs, countof(js_number_proto_funcs),
@@ -68527,85 +69102,6 @@ exception:
     return JS_EXCEPTION;
 }
 
-static JSValue js_typed_array_join(JSContext *ctx, JSValueConst this_val,
-                                   int argc, JSValueConst *argv, int toLocaleString)
-{
-    JSValue sep = JS_UNDEFINED, el;
-    StringBuffer b_s, *b = &b_s;
-    JSString *s = NULL;
-    JSObject *p;
-    int i, len, oldlen, newlen;
-    int c;
-
-    p = get_typed_array(ctx, this_val);
-    if (!p)
-        return JS_EXCEPTION;
-    if (typed_array_is_oob(p))
-        return JS_ThrowTypeErrorArrayBufferOOB(ctx);
-    len = oldlen = newlen = p->u.array.count;
-
-    c = ',';    /* default separator */
-    if (!toLocaleString && argc > 0 && !JS_IsUndefined(argv[0])) {
-        sep = JS_ToString(ctx, argv[0]);
-        if (JS_IsException(sep))
-            goto exception;
-        s = JS_VALUE_GET_STRING(sep);
-        if (s->len == 1 && !s->is_wide_char)
-            c = str8(s)[0];
-        else
-            c = -1;
-        // ToString(sep) can detach or resize the arraybuffer as a side effect
-        newlen = p->u.array.count;
-        len = min_int(len, newlen);
-    }
-    string_buffer_init(ctx, b, 0);
-
-    /* XXX: optimize with direct access */
-    for(i = 0; i < len; i++) {
-        if (i > 0) {
-            if (c >= 0) {
-                if (string_buffer_putc8(b, c))
-                    goto fail;
-            } else {
-                if (string_buffer_concat(b, s, 0, s->len))
-                    goto fail;
-            }
-        }
-        el = JS_GetPropertyUint32(ctx, this_val, i);
-        /* Can return undefined for example if the typed array is detached */
-        if (!JS_IsNull(el) && !JS_IsUndefined(el)) {
-            if (JS_IsException(el))
-                goto fail;
-            if (toLocaleString) {
-                el = JS_ToLocaleStringFree(ctx, el);
-            }
-            if (string_buffer_concat_value_free(b, el))
-                goto fail;
-        }
-    }
-
-    // add extra separators in case RAB was resized by evil .valueOf method
-    i = max_int(1, newlen);
-    for(/*empty*/; i < oldlen; i++) {
-        if (c >= 0) {
-            if (string_buffer_putc8(b, c))
-                goto fail;
-        } else {
-            if (string_buffer_concat(b, s, 0, s->len))
-                goto fail;
-        }
-    }
-
-    JS_FreeValue(ctx, sep);
-    return string_buffer_end(b);
-
-fail:
-    string_buffer_free(b);
-    JS_FreeValue(ctx, sep);
-exception:
-    return JS_EXCEPTION;
-}
-
 static JSValue js_typed_array_reverse(JSContext *ctx, JSValueConst this_val,
                                       int argc, JSValueConst *argv)
 {
@@ -69410,8 +69906,8 @@ static const JSCFunctionListEntry js_typed_array_base_proto_funcs[] = {
     JS_CFUNC_DEF("subarray", 2, js_typed_array_subarray ),
     JS_CFUNC_DEF("sort", 1, js_typed_array_sort ),
     JS_CFUNC_DEF("toSorted", 1, js_typed_array_toSorted ),
-    JS_CFUNC_MAGIC_DEF("join", 1, js_typed_array_join, 0 ),
-    JS_CFUNC_MAGIC_DEF("toLocaleString", 0, js_typed_array_join, 1 ),
+    JS_CFUNC_STEP_DEF("join", 1, STEPDEF_TA_JOIN ),
+    JS_CFUNC_STEP_DEF("toLocaleString", 0, STEPDEF_TA_TOLOCALESTRING ),
     JS_CFUNC_MAGIC_DEF("indexOf", 1, js_typed_array_indexOf, special_indexOf ),
     JS_CFUNC_MAGIC_DEF("lastIndexOf", 1, js_typed_array_indexOf, special_lastIndexOf ),
     JS_CFUNC_MAGIC_DEF("includes", 1, js_typed_array_indexOf, special_includes ),
@@ -69999,6 +70495,30 @@ static JSValue js_dataview_getValue(JSContext *ctx,
     return JS_EXCEPTION; // pacify compiler
 }
 
+/* 25.3.4.16 step 4: ToIndex(getIndex) — and its RangeError for a fractional or negative offset — completes
+   BEFORE the value is read. The argument is a primitive by the time this runs, so the conversion itself runs
+   none of the page's code; only its rejection is observable. */
+static int js_dataview_set_midcheck(JSContext *ctx, JSValueConst *argp, int magic)
+{
+    uint64_t pos;
+    return JS_ToIndex(ctx, &pos, argp[0]) ? -1 : 0;
+}
+
+/* 25.3.4.16 SetViewValue steps 1-3: the receiver must be a DataView over a MUTABLE buffer, and that is decided
+   BEFORE either argument is read — test262 pins the ordering, so the coerce-then-compute machine runs this
+   first and the body re-checks it on the way through. */
+static int js_dataview_set_precheck(JSContext *ctx, JSValueConst this_val, int magic)
+{
+    JSTypedArray *ta = JS_GetOpaque2(ctx, this_val, JS_CLASS_DATAVIEW);
+    if (!ta)
+        return -1;
+    if (ta->buffer->u.array_buffer->immutable) {
+        JS_ThrowTypeErrorImmutableArrayBuffer(ctx);
+        return -1;
+    }
+    return 0;
+}
+
 static JSValue js_dataview_setValue(JSContext *ctx,
                                     JSValueConst this_obj,
                                     int argc, JSValueConst *argv, int class_id)
@@ -70100,28 +70620,28 @@ static const JSCFunctionListEntry js_dataview_proto_funcs[] = {
     JS_CGETSET_DEF("buffer", js_dataview_get_buffer, NULL ),
     JS_CGETSET_DEF("byteLength", js_dataview_get_byteLength, NULL ),
     JS_CGETSET_DEF("byteOffset", js_dataview_get_byteOffset, NULL ),
-    JS_CFUNC_MAGIC_DEF("getInt8", 1, js_dataview_getValue, JS_CLASS_INT8_ARRAY ),
-    JS_CFUNC_MAGIC_DEF("getUint8", 1, js_dataview_getValue, JS_CLASS_UINT8_ARRAY ),
-    JS_CFUNC_MAGIC_DEF("getInt16", 1, js_dataview_getValue, JS_CLASS_INT16_ARRAY ),
-    JS_CFUNC_MAGIC_DEF("getUint16", 1, js_dataview_getValue, JS_CLASS_UINT16_ARRAY ),
-    JS_CFUNC_MAGIC_DEF("getInt32", 1, js_dataview_getValue, JS_CLASS_INT32_ARRAY ),
-    JS_CFUNC_MAGIC_DEF("getUint32", 1, js_dataview_getValue, JS_CLASS_UINT32_ARRAY ),
-    JS_CFUNC_MAGIC_DEF("getBigInt64", 1, js_dataview_getValue, JS_CLASS_BIG_INT64_ARRAY ),
-    JS_CFUNC_MAGIC_DEF("getBigUint64", 1, js_dataview_getValue, JS_CLASS_BIG_UINT64_ARRAY ),
-    JS_CFUNC_MAGIC_DEF("getFloat16", 1, js_dataview_getValue, JS_CLASS_FLOAT16_ARRAY ),
-    JS_CFUNC_MAGIC_DEF("getFloat32", 1, js_dataview_getValue, JS_CLASS_FLOAT32_ARRAY ),
-    JS_CFUNC_MAGIC_DEF("getFloat64", 1, js_dataview_getValue, JS_CLASS_FLOAT64_ARRAY ),
-    JS_CFUNC_MAGIC_DEF("setInt8", 2, js_dataview_setValue, JS_CLASS_INT8_ARRAY ),
-    JS_CFUNC_MAGIC_DEF("setUint8", 2, js_dataview_setValue, JS_CLASS_UINT8_ARRAY ),
-    JS_CFUNC_MAGIC_DEF("setInt16", 2, js_dataview_setValue, JS_CLASS_INT16_ARRAY ),
-    JS_CFUNC_MAGIC_DEF("setUint16", 2, js_dataview_setValue, JS_CLASS_UINT16_ARRAY ),
-    JS_CFUNC_MAGIC_DEF("setInt32", 2, js_dataview_setValue, JS_CLASS_INT32_ARRAY ),
-    JS_CFUNC_MAGIC_DEF("setUint32", 2, js_dataview_setValue, JS_CLASS_UINT32_ARRAY ),
-    JS_CFUNC_MAGIC_DEF("setBigInt64", 2, js_dataview_setValue, JS_CLASS_BIG_INT64_ARRAY ),
-    JS_CFUNC_MAGIC_DEF("setBigUint64", 2, js_dataview_setValue, JS_CLASS_BIG_UINT64_ARRAY ),
-    JS_CFUNC_MAGIC_DEF("setFloat16", 2, js_dataview_setValue, JS_CLASS_FLOAT16_ARRAY ),
-    JS_CFUNC_MAGIC_DEF("setFloat32", 2, js_dataview_setValue, JS_CLASS_FLOAT32_ARRAY ),
-    JS_CFUNC_MAGIC_DEF("setFloat64", 2, js_dataview_setValue, JS_CLASS_FLOAT64_ARRAY ),
+    JS_CFUNC_STEP_DEF("getInt8", 1, STEPDEF_DV_GET_INT8 ),
+    JS_CFUNC_STEP_DEF("getUint8", 1, STEPDEF_DV_GET_UINT8 ),
+    JS_CFUNC_STEP_DEF("getInt16", 1, STEPDEF_DV_GET_INT16 ),
+    JS_CFUNC_STEP_DEF("getUint16", 1, STEPDEF_DV_GET_UINT16 ),
+    JS_CFUNC_STEP_DEF("getInt32", 1, STEPDEF_DV_GET_INT32 ),
+    JS_CFUNC_STEP_DEF("getUint32", 1, STEPDEF_DV_GET_UINT32 ),
+    JS_CFUNC_STEP_DEF("getBigInt64", 1, STEPDEF_DV_GET_BIG_INT64 ),
+    JS_CFUNC_STEP_DEF("getBigUint64", 1, STEPDEF_DV_GET_BIG_UINT64 ),
+    JS_CFUNC_STEP_DEF("getFloat16", 1, STEPDEF_DV_GET_FLOAT16 ),
+    JS_CFUNC_STEP_DEF("getFloat32", 1, STEPDEF_DV_GET_FLOAT32 ),
+    JS_CFUNC_STEP_DEF("getFloat64", 1, STEPDEF_DV_GET_FLOAT64 ),
+    JS_CFUNC_STEP_DEF("setInt8", 2, STEPDEF_DV_SET_INT8 ),
+    JS_CFUNC_STEP_DEF("setUint8", 2, STEPDEF_DV_SET_UINT8 ),
+    JS_CFUNC_STEP_DEF("setInt16", 2, STEPDEF_DV_SET_INT16 ),
+    JS_CFUNC_STEP_DEF("setUint16", 2, STEPDEF_DV_SET_UINT16 ),
+    JS_CFUNC_STEP_DEF("setInt32", 2, STEPDEF_DV_SET_INT32 ),
+    JS_CFUNC_STEP_DEF("setUint32", 2, STEPDEF_DV_SET_UINT32 ),
+    JS_CFUNC_STEP_DEF("setBigInt64", 2, STEPDEF_DV_SET_BIG_INT64 ),
+    JS_CFUNC_STEP_DEF("setBigUint64", 2, STEPDEF_DV_SET_BIG_UINT64 ),
+    JS_CFUNC_STEP_DEF("setFloat16", 2, STEPDEF_DV_SET_FLOAT16 ),
+    JS_CFUNC_STEP_DEF("setFloat32", 2, STEPDEF_DV_SET_FLOAT32 ),
+    JS_CFUNC_STEP_DEF("setFloat64", 2, STEPDEF_DV_SET_FLOAT64 ),
     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "DataView", JS_PROP_CONFIGURABLE ),
 };
 
