@@ -18531,7 +18531,13 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val, in
    from_super distinguishes the two entry shapes: `new C()` (OP_call_constructor) has its operands on the
    caller stack and cleans them at do_return; super() (OP_init_ctor) takes args from the derived frame's argv,
    owns a `super_ref` to free, and pushes its bound object with no operand cleanup. */
-struct JSConstruct { JSValue created_obj; JSValue super_ref; uint8_t from_super; };
+/* outer/outer_kind: a CONSTRUCT requested BY a state machine rather than by an opcode. Without it the only thing
+   do_construct_tramp could do with the constructed object was push it on the operand stack, so any machine needing
+   a real Construct had to call JS_CallConstructor from C — a drive-to-completion for a bytecode constructor. That
+   is what kept TypedArray.from's receiver gate narrowed to the concrete %TypedArray% constructors: 23.2.2.1's
+   TypedArrayCreateFromConstructor is Construct(C, «len»), and `TA.from.call(customCtor, [])` makes C user code.
+   With an outer continuation set, do_return feeds the constructed object to that machine's step instead. */
+struct JSConstruct { JSValue created_obj; JSValue super_ref; uint8_t from_super; void *outer; uint8_t outer_kind; };
 
 /* Only a NORMAL bytecode function trampolines (the common deep-recursion case). */
 static inline bool tramp_can_call(JSValueConst func) {
@@ -18746,12 +18752,24 @@ typedef struct JSIterConsume {
     JSValue super_ref;  /* super(iterable) entry: the owned parent-class ref, freed at finish; UNDEFINED
                            for the OP_call_constructor entry which has no such ref */
     SumPreciseState sum; /* ITERCONS_SUMPRECISE only. POD, so it needs no entry in ITERCONS_OWNED. */
+    /* TypedArray.from, 23.2.2.1 step 5. The collect (5.a/5.b) is the ordinary FROM sink; what follows is two more
+       phases the C entry used to do in a loop: 5.c CREATE the target by CONSTRUCTING the receiver with the
+       collected length, then 5.d MAP+SET each element. Both run user code, so both are phases of this machine
+       rather than a finish. ta_phase: 0 = collecting, 1 = creating, 2 = mapping. */
+    JSValue ta_target;   /* the constructed target (owned); becomes the result at the finish */
+    int64_t ta_k;        /* 5.d's element index — distinct from k, which holds the collected COUNT */
+    uint8_t ta_phase;
+    uint8_t ta_isfrom;   /* 1 = TypedArray.from (construct the receiver); 0 = new TypedArray(iterable), which
+                            creates from ta_classid and never constructs a user ctor */
 } JSIterConsume;
+static int js_typed_array_get_length_unsafe(JSContext *ctx, JSValueConst obj);
+static bool typed_array_is_immutable(JSObject *p);
+static JSValue JS_ThrowTypeErrorImmutableArrayBuffer(JSContext *ctx);
 static void sum_precise_init(SumPreciseState *s);
 static void sum_precise_add(SumPreciseState *s, double d);
 static double sum_precise_get_result(SumPreciseState *s);
 static JSValue js_math_sumPrecise(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
-#define ITERCONS_OWNED(F) F(r) F(iter) F(next) F(adder) F(mapfn) F(mapfn_this) F(cb_value)
+#define ITERCONS_OWNED(F) F(r) F(iter) F(next) F(adder) F(mapfn) F(mapfn_this) F(cb_value) F(ta_target)
 /* NOTE: JSIteratorHelperData::cb_value is owned too — freed by the finalizer and cleared on every path below. */
 static int js_iter_consume_step(JSContext *ctx, struct JSIterConsume *s, JSValue res);
 static void js_iter_consume_end(JSContext *ctx, struct JSIterConsume *s);
@@ -18848,6 +18866,7 @@ static JSValue js_promise_race(JSContext *ctx, JSValueConst this_val, int argc, 
 static JSValue js_promise_all_resolve_element(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValueConst *func_data);
 static __exception int remainingElementsCount_add(JSContext *ctx, JSValueConst resolve_element_env, int addend);
 static JSValue js_typed_array_from(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static JSValue js_typed_array_of(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 static bool tramp_can_call_ta_from_consume(JSContext *ctx, JSValueConst func, JSValueConst this_val, JSValueConst *call_argv, int call_argc, int *out_classid, JSValue *out_getiter);
 static void js_array_reduce_end(JSContext *ctx, struct JSArrayReduce *s, bool take_acc);
 static JSValue js_array_reduce(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int special);
@@ -19397,6 +19416,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     /* constructor trampoline (do_construct_tramp): con_func/con_ntgt/con_args/con_argc + con_from_super are set
        by OP_call_constructor (new C()) or OP_init_ctor (super()) before the goto. */
     JSValueConst con_func = JS_UNDEFINED, con_ntgt = JS_UNDEFINED;
+    void *con_outer = NULL;                             /* non-NULL = this construct was requested by a state machine; its step receives the object (read+reset in do_construct_tramp) */
+    uint8_t con_outer_kind = CONT_NONE;                 /* CONT_* of con_outer */
     JSValueConst *con_args = NULL; int con_argc = 0;
     uint8_t con_from_super = 0; JSValue con_super_ref = JS_UNDEFINED;
     /* Promise-executor trampoline (do_promise_exec_tramp): the SAME builtin is reached by two entry shapes, so both
@@ -20587,6 +20608,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (unlikely(!cs)) { JS_FreeValue(ctx, cthis); JS_FreeValue(ctx, con_super_ref); JS_ThrowOutOfMemory(ctx); goto exception; }
                 cs->created_obj = cthis;   /* owned here; substituted or freed at do_return / exception unwind */
                 cs->super_ref = con_super_ref; cs->from_super = con_from_super;
+                cs->outer = con_outer; cs->outer_kind = con_outer_kind;
+                con_outer = NULL; con_outer_kind = CONT_NONE;   /* read + reset: never leak onto the body's own constructs */
                 ntf = js_malloc_rt(rt, sizeof(TrampFrame));
                 if (unlikely(!ntf)) { JS_FreeValue(ctx, cthis); JS_FreeValue(ctx, con_super_ref); js_free_rt(rt, cs); JS_ThrowOutOfMemory(ctx); goto exception; }
                 nlb = js_malloc_rt(rt, asize ? asize : sizeof(JSValue));
@@ -20600,7 +20623,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 ntf->caller_argc = argc; ntf->caller_argv = argv;
                 ntf->caller_arg_allocated_size = arg_allocated_size;
                 ntf->caller_sp = sp;
-                ntf->call_first = tramp_first; ntf->call_argc = con_argc; ntf->is_tail = tramp_is_tail;
+                /* The operand shape is NOT the argument count. For `new C()` they coincide (the args ARE the
+                   operands), but a construct requested by a state machine pushes NO operands and takes its
+                   arguments from the machine's own buffer — recording con_argc there made do_return free and pop
+                   a live caller operand, which showed up as a misaligned argument list at the NEXT call. */
+                ntf->call_first = cs->outer ? 0 : tramp_first;
+                ntf->call_argc = cs->outer ? 0 : con_argc;
+                ntf->is_tail = cs->outer ? 0 : tramp_is_tail;
                 ntf->b = nb; ntf->ctx = nb->realm; ntf->local_buf = nlb;
                 nsf = &ntf->sf;
                 nsf->is_strict_mode = nb->is_strict_mode;
@@ -21656,6 +21685,94 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSIterConsume *s;
                 JSValue tmp;
                 ta_from = 0;
+                if (is_from && ta_classid == -1) {
+                    /* 23.2.2.2 %TypedArray%.of: the list IS the argument list, so there is no source and no
+                       @@iterator — it enters the shared create+set phases directly, which is the whole of steps
+                       2-4 once the create is a real Construct on the tramp. */
+                    JSIterConsume *so;
+                    JSValue lst;
+                    if (!JS_IsConstructor(ctx, ntgt)) {
+                        JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED;
+                        JS_ThrowTypeError(ctx, "not a constructor");
+                        goto exception;
+                    }
+                    JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED;
+                    lst = JS_NewArray(ctx);
+                    if (JS_IsException(lst)) goto exception;
+                    for (i = 0; i < call_argc; i++) {
+                        if (JS_DefinePropertyValueInt64(ctx, lst, i, js_dup(call_argv[i]), JS_PROP_C_W_E | JS_PROP_THROW) < 0)
+                            { JS_FreeValue(ctx, lst); goto exception; }
+                    }
+                    so = js_mallocz(ctx, sizeof(*so));
+                    if (unlikely(!so)) { JS_FreeValue(ctx, lst); JS_ThrowOutOfMemory(ctx); goto exception; }
+                    so->r = lst;
+                    so->iter = JS_UNDEFINED; so->next = JS_UNDEFINED;
+                    so->cb_value = JS_UNDEFINED; so->ta_target = JS_UNDEFINED;
+                    so->adder = js_dup(ntgt);
+                    so->mapfn = JS_UNDEFINED; so->mapfn_this = JS_UNDEFINED;
+                    so->super_ref = JS_UNDEFINED;
+                    so->k = call_argc; so->ta_k = 0;
+                    so->sink = ITERCONS_FROM; so->ta_isfrom = 1; so->ta_classid = 0;
+                    so->ta_phase = 1;
+                    so->orig_cfirst = -2; so->orig_cargc = call_argc; so->orig_is_tail = 0;
+                    cont_st = so; cont_kind_cur = CONT_ITER_CONSUME;
+                    ret_val = JS_UNINITIALIZED;
+                    goto do_iter_consume_step;
+                }
+                if (is_from) {
+                    /* 23.2.2.1 step 2, BEFORE @@iterator is read. The recognizer no longer gates on the receiver
+                       being a concrete %TypedArray% constructor, so this check lives where the spec puts it
+                       instead of being a silent decline. */
+                    if (!JS_IsConstructor(ctx, ntgt)) {
+                        JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED;
+                        JS_ThrowTypeError(ctx, "not a constructor");
+                        goto exception;
+                    }
+                    /* Step 4's GetMethod, made exactly once. The probe is side-effect-free and declines an
+                       accessor @@iterator or a Proxy, so when it came back empty the read happens HERE — running
+                       the getter, in spec order — and its answer picks step 5 (iterable) or step 6 (array-like). */
+                    if (!JS_IsFunction(ctx, tramp_iter_getiter)) {
+                        JSValue m = JS_GetProperty(ctx, call_argv[0], JS_ATOM_Symbol_iterator);
+                        JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED;
+                        if (JS_IsException(m)) goto exception;
+                        if (JS_IsUndefined(m) || JS_IsNull(m)) {
+                            /* Step 6, the ARRAY-LIKE source. A different algorithm from step 5 only in where the
+                               values come from: no iterator, the list IS the object and its length. Steps 6.c/6.d
+                               (Construct the receiver, then map+set) are the SAME two phases step 5 ends with, so
+                               it enters the machine directly at the create phase with the source as its list —
+                               which is what lets a custom BYTECODE constructor and a looping mapfn run on the
+                               tramp here too, instead of being called from a C loop. */
+                            JSValue src6; int64_t len6;
+                            JSIterConsume *s6;
+                            JS_FreeValue(ctx, m);
+                            src6 = JS_ToObject(ctx, call_argv[0]);
+                            if (JS_IsException(src6)) goto exception;
+                            if (js_get_length64(ctx, &len6, src6) < 0) { JS_FreeValue(ctx, src6); goto exception; }
+                            s6 = js_mallocz(ctx, sizeof(*s6));
+                            if (unlikely(!s6)) { JS_FreeValue(ctx, src6); JS_ThrowOutOfMemory(ctx); goto exception; }
+                            s6->r = src6;                       /* the source list the map phase indexes */
+                            s6->iter = JS_UNDEFINED; s6->next = JS_UNDEFINED;
+                            s6->cb_value = JS_UNDEFINED; s6->ta_target = JS_UNDEFINED;
+                            s6->adder = js_dup(ntgt);           /* the constructor the create phase Constructs */
+                            s6->mapfn = (call_argc >= 2) ? js_dup(call_argv[1]) : JS_UNDEFINED;
+                            s6->mapfn_this = (call_argc >= 3) ? js_dup(call_argv[2]) : JS_UNDEFINED;
+                            s6->super_ref = JS_UNDEFINED;
+                            s6->k = len6; s6->ta_k = 0;
+                            s6->sink = ITERCONS_FROM; s6->ta_isfrom = 1; s6->ta_classid = 0;
+                            s6->ta_phase = 1;                   /* skip the collect: the list already exists */
+                            s6->orig_cfirst = -2; s6->orig_cargc = call_argc; s6->orig_is_tail = 0;
+                            cont_st = s6; cont_kind_cur = CONT_ITER_CONSUME;
+                            ret_val = JS_UNINITIALIZED;
+                            goto do_iter_consume_step;
+                        }
+                        if (!JS_IsFunction(ctx, m)) {
+                            JS_FreeValue(ctx, m);
+                            JS_ThrowTypeError(ctx, "value is not iterable");
+                            goto exception;
+                        }
+                        tramp_iter_getiter = m;   /* the acquire CALLS this exact method — no second read */
+                    }
+                }
                 s = js_mallocz(ctx, sizeof(*s));
                 if (unlikely(!s)) { JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED; JS_ThrowOutOfMemory(ctx); goto exception; }
                 tmp = JS_NewArray(ctx);
@@ -21669,7 +21786,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    js_typed_array_from on the collected array — spec map-after-create order), NOT during the collect. */
                 s->mapfn = (is_from && call_argc >= 2) ? js_dup(call_argv[1]) : JS_UNDEFINED;
                 s->mapfn_this = (is_from && call_argc >= 3) ? js_dup(call_argv[2]) : JS_UNDEFINED;
-                s->ta_classid = ta_classid;
+                s->ta_classid = is_from ? 0 : ta_classid;   /* the from path CONSTRUCTS the receiver; only new TypedArray(iterable) creates by class id */
+                s->ta_isfrom = is_from;
+                s->ta_target = JS_UNDEFINED;
                 s->k = 0;
                 s->sink = ITERCONS_FROM;
                 s->super_ref = JS_UNDEFINED;   /* only the super(iterable) entry owns one */
@@ -21726,14 +21845,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     DCHECK(sp + 4 <= TRAMP_SP_LIMIT(sf),
                            "iterterm callback: operand push exceeds the frame's compiled stack_size");
                     { bool from_mapfn = (s->cb_pending == 2);
-                      int nargs = (!from_mapfn && s->setop == ITERTERM_REDUCE) ? 3 : 2;
+                      bool ta_mapfn = (s->cb_pending == 3);   /* TypedArray.from step 5.d/6.d: mapfn(kValue, k) with thisArg */
+                      int nargs = (!from_mapfn && !ta_mapfn && s->setop == ITERTERM_REDUCE) ? 3 : 2;
                       DCHECK(sp + 2 + nargs <= TRAMP_SP_LIMIT(sf),
                              "consume callback: operand push exceeds the frame's compiled stack_size");
-                      *sp++ = from_mapfn ? js_dup(s->mapfn_this) : JS_UNDEFINED;   /* Array.from's thisArg */
+                      *sp++ = (from_mapfn || ta_mapfn) ? js_dup(s->mapfn_this) : JS_UNDEFINED;   /* the from thisArg */
                       *sp++ = js_dup(s->mapfn);
                       if (nargs == 3) *sp++ = js_dup(s->r);      /* reduce: accumulator first */
                       *sp++ = js_dup(s->cb_value);
-                      *sp++ = js_int64(from_mapfn ? s->k : s->k - 1);   /* FROM has not incremented k yet */
+                      *sp++ = js_int64(ta_mapfn ? s->ta_k : (from_mapfn ? s->k : s->k - 1));   /* FROM has not incremented k yet */
                       call_argv = sp - nargs; call_argc = nargs; tramp_first = -2; tramp_is_tail = 0; }
                     tramp_cont_state = s; tramp_cont_kind = CONT_ITER_CONSUME;
                     if (tramp_can_call(call_argv[-1])) goto do_tramp_call;
@@ -21745,6 +21865,26 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                       sp -= 4;
                       ret_val = cr;
                       goto do_iter_consume_step; }
+                }
+                if (st == 4) {
+                    /* 23.2.2.1 step 5.c: TypedArrayCreateFromConstructor(C, «len») — a REAL Construct of the
+                       receiver, which is why this is a phase and not a finish. A bytecode constructor runs its body
+                       on THIS chain (the outer continuation feeds the object back to this step); a C constructor has
+                       no body to suspend and is constructed in place. */
+                    JSValue lenv = js_int64(s->k);
+                    s->ta_phase = 2;   /* whichever way it settles, the next entry ADOPTS the object + validates */
+                    if (tramp_can_construct(s->adder)) {
+                        con_func = s->adder; con_ntgt = s->adder;
+                        con_args = vc(&lenv); con_argc = 1;
+                        con_from_super = 0; con_super_ref = JS_UNDEFINED;
+                        con_outer = s; con_outer_kind = CONT_ITER_CONSUME;
+                        tramp_first = 0; tramp_is_tail = 0;   /* no operands pushed: do_return frees nothing */
+                        goto do_construct_tramp;              /* settle -> do_iter_consume_step with the object */
+                    }
+                    ret_val = JS_CallConstructor(ctx, s->adder, 1, vc(&lenv));
+                    JS_FreeValue(ctx, lenv);
+                    if (JS_IsException(ret_val)) { js_iter_consume_end(ctx, s); js_free_rt(rt, s); goto exception; }
+                    goto do_iter_consume_step;
                 }
                 if (st == 2) {
                     /* the sink short-circuited (Set.prototype.isSupersetOf found a miss): spec IteratorClose, then
@@ -21779,6 +21919,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     uint8_t itail = s->orig_is_tail;
                     int64_t n = s->k;
                     uint8_t sink = s->sink;
+                    uint8_t is_tafrom = s->ta_isfrom;
                     int ta_cid = s->ta_classid;
                     JSValue ta_ntgt = s->adder;   /* new TypedArray(gen): the new_target/ctor; else the add/set method or UNDEFINED */
                     JSValue ta_mapfn = s->mapfn, ta_mapfn_this = s->mapfn_this;   /* TypedArray.from(gen, mapfn): applied here */
@@ -21786,25 +21927,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JS_FreeValue(ctx, s->super_ref);   /* super() entry ref: the DONE path frees inline, not through _end */
                     js_free_rt(rt, s);
                     if (ta_cid != 0) {
-                        JSValue ta;
-                        if (JS_VALUE_GET_TAG(ta_mapfn) != JS_TAG_UNDEFINED) {
-                            /* TypedArray.from(iterable, mapfn): the iterable is now COLLECTED on the tramp (the
-                               recognizer is widened past generator-backed sources), but the mapfn is USER CODE that
-                               must run per-element WITHOUT drive-to-completion. Spec 22.2.2.1 is collect -> create the
-                               TA (length = collected count) -> map+set each element with the created TA as target.
-                               That map+set is a SECOND per-element tramp phase over the created TA; the old
-                               js_typed_array_from(r, mapfn) re-call did it in a C loop (drive-to-completion) AND
-                               re-iterated the collected array (its own @@iterator DFAIL). No-mapfn TypedArray.from is
-                               fully routed; only this second phase is unbuilt. */
-                            DFAIL("TypedArray.from(iterable, mapfn): collect is routed but the mapfn map+set is not yet "
-                                  "a tramp phase — create the TA from the collected count, then drive mapfn(v,i) per "
-                                  "element on the tramp (spec 22.2.2.1), never the finish js_typed_array_from re-call");
-                            ta = JS_EXCEPTION;
-                        } else {
-                            /* new TypedArray(gen) / TypedArray.from(gen): create from the collected array via the ctor
-                               object path — spec IterableToList done on the tramp, then buffer create + element copy. */
-                            ta = js_typed_array_constructor_obj(ctx, ta_ntgt, r, ta_cid);
-                        }
+                        /* new TypedArray(iterable) — a DIFFERENT algorithm from TypedArray.from: 23.2.5.1 does
+                           IterableToList then creates by CLASS, never constructing a user ctor. TypedArray.from's
+                           create+map is a phase of the machine above and never reaches here. */
+                        JSValue ta = js_typed_array_constructor_obj(ctx, ta_ntgt, r, ta_cid);
                         JS_FreeValue(ctx, ta_ntgt); JS_FreeValue(ctx, r);
                         JS_FreeValue(ctx, ta_mapfn); JS_FreeValue(ctx, ta_mapfn_this);
                         if (JS_IsException(ta)) goto exception;   /* operands freed by the exception unwind */
@@ -21812,7 +21938,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     } else {
                         JS_FreeValue(ctx, ta_ntgt);   /* the add/set method (UNDEFINED for plain FROM) */
                         JS_FreeValue(ctx, ta_mapfn); JS_FreeValue(ctx, ta_mapfn_this);   /* Array.from's mapfn (applied during collect) */
-                        if (sink == ITERCONS_FROM && JS_SetProperty(ctx, r, JS_ATOM_length, js_uint32((uint32_t)n)) < 0) {
+                        /* Array.from's array result gets its length; TypedArray.from's result is the CONSTRUCTED
+                           typed array, whose length is fixed by the constructor — writing to it is not part of
+                           23.2.2.1 and would throw. */
+                        if (sink == ITERCONS_FROM && !is_tafrom
+                            && JS_SetProperty(ctx, r, JS_ATOM_length, js_uint32((uint32_t)n)) < 0) {
                             JS_FreeValue(ctx, r); goto exception;   /* operands freed by the exception unwind */
                         }
                     }
@@ -23014,12 +23144,24 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JSValue created = cs->created_obj;
                     uint8_t from_super = cs->from_super;
                     JSValue super_ref = cs->super_ref;
+                    void *couter = cs->outer; uint8_t couter_kind = cs->outer_kind;
                     js_free_rt(rt, cs);
                     if (JS_VALUE_GET_TAG(ret_val) == JS_TAG_OBJECT) {
                         JS_FreeValue(ctx, created);
                     } else {
                         JS_FreeValue(ctx, ret_val);
                         ret_val = created;
+                    }
+                    if (couter) {
+                        /* requested by a state machine: drop this construct's operands (it pushed none, so the
+                           shape is 0/0) and hand the object to that machine's step. */
+                        JSValue *cargv2 = sp - cargc;
+                        for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv2[i]);
+                        sp += cfirst - cargc;
+                        JS_FreeValue(ctx, super_ref);
+                        cont_st = couter; cont_kind_cur = couter_kind;
+                        DCHECK(couter_kind == CONT_ITER_CONSUME, "construct outer continuation: unknown machine kind");
+                        goto do_iter_consume_step;
                     }
                     if (from_super) {
                         /* super(): no operands on the caller stack — free the super ctor ref and push the bound
@@ -26028,6 +26170,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             struct JSConstruct *cs = xcs;
             JS_FreeValue(ctx, cs->created_obj);
             JS_FreeValue(ctx, cs->super_ref);
+            if (cs->outer) {
+                /* the machine that requested this construct is abandoned with it — otherwise its collected array,
+                   iterator and callback state leak on every throwing constructor. */
+                DCHECK(cs->outer_kind == CONT_ITER_CONSUME, "construct outer continuation: unknown machine kind");
+                js_iter_consume_end(ctx, (struct JSIterConsume *)cs->outer);
+                js_free_rt(rt, cs->outer);
+            }
             js_free_rt(rt, cs);
         } else if (xck == CONT_SETTER) {
             /* a throwing setter body: no continuation state; its operands (this,setter,value) are on the caller
@@ -48738,6 +48887,12 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
             if (which == 2) { s->abrupt = 1; return 2; }
             return -1;
         }
+        if (which == 3) {   /* TypedArray.from's mapfn (23.2.2.1 step 5.d.iii): the RESULT is Set into the target */
+            JS_FreeValue(ctx, value);
+            if (JS_SetPropertyInt64(ctx, s->ta_target, s->ta_k, fret) < 0) return -1;   /* consumes fret */
+            s->ta_k++;
+            return 1;
+        }
         if (which == 2) {   /* Array.from's mapfn: the RESULT is the element to append */
             JS_FreeValue(ctx, value);
             if (JS_DefinePropertyValueInt64(ctx, s->r, s->k, fret, JS_PROP_C_W_E | JS_PROP_THROW) < 0)
@@ -48769,6 +48924,43 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
             s->r = value; s->closing = 1; return 2;
         }
     }
+    if (s->ta_phase) {
+        /* 23.2.2.1 step 5.c/5.d, AFTER the whole collect. Never entered by any other sink. */
+        if (s->ta_phase == 1) {   /* 5.c: Construct(C, «len») — the arm runs it on the tramp */
+            if (JS_VALUE_GET_TAG(res) != JS_TAG_UNINITIALIZED) JS_FreeValue(ctx, res);
+            return 4;
+        }
+        if (s->ta_phase == 2) {
+            /* the construct settled: `res` IS the new object. TypedArrayCreateFromConstructor finishes with
+               ValidateTypedArray plus, because a length argument was passed, the [[ArrayLength]] >= len check. */
+            int64_t tlen;
+            if (JS_VALUE_GET_TAG(res) == JS_TAG_UNINITIALIZED) { JS_ThrowTypeError(ctx, "constructor returned nothing"); return -1; }
+            s->ta_target = res;
+            tlen = js_typed_array_get_length_unsafe(ctx, s->ta_target);
+            if (tlen < 0) return -1;
+            if (typed_array_is_immutable(JS_VALUE_GET_OBJ(s->ta_target))) { JS_ThrowTypeErrorImmutableArrayBuffer(ctx); return -1; }
+            if (tlen < s->k) { JS_ThrowTypeError(ctx, "TypedArray length is too small"); return -1; }
+            s->ta_phase = 3;
+        } else if (JS_VALUE_GET_TAG(res) != JS_TAG_UNINITIALIZED) {
+            JS_FreeValue(ctx, res);   /* the map callback re-enters with no iterator result */
+        }
+        for (; s->ta_k < s->k; ) {
+            JSValue v = JS_GetPropertyInt64(ctx, s->r, s->ta_k);
+            if (JS_IsException(v)) return -1;
+            if (JS_IsUndefined(s->mapfn)) {
+                if (JS_SetPropertyInt64(ctx, s->ta_target, s->ta_k, v) < 0) return -1;   /* consumes v */
+                s->ta_k++;
+                continue;
+            }
+            /* mapfn(kValue, k) is USER CODE: hand it to the shared callback drive so its body runs on the tramp. */
+            s->cb_value = v;
+            s->cb_pending = 3;
+            return 3;
+        }
+        JS_FreeValue(ctx, s->r);            /* the collected list is spent */
+        s->r = s->ta_target; s->ta_target = JS_UNDEFINED;
+        return 0;
+    }
     if (s->closing) {   /* the short-circuit close has run (result already decided): finish */
         if (JS_VALUE_GET_TAG(res) != JS_TAG_UNINITIALIZED) JS_FreeValue(ctx, res);
         if (s->sink == ITERCONS_SETOP && s->setop == SETOP_SUPERSET) s->r = js_bool(s->k != 0);
@@ -48782,6 +48974,7 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
         done = JS_ToBoolFree(ctx, done_val);
         if (done) {   /* iterator exhausted: s->r is complete */
             JS_FreeValue(ctx, res);
+            if (s->ta_isfrom) { s->ta_phase = 1; s->ta_k = 0; return 4; }   /* collect done -> 5.c create */
             if (s->sink == ITERCONS_SUMPRECISE) s->r = js_float64(sum_precise_get_result(&s->sum));
             if (s->sink == ITERCONS_SETOP && s->setop == SETOP_SUPERSET) s->r = js_bool(s->k != 0);
             if (s->sink == ITERCONS_ITERTERM) {
@@ -48926,7 +49119,11 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
                 return 1;
             }
         } else {   /* ITERCONS_FROM / ITERCONS_SPREAD: append at the running index */
-            if (s->sink == ITERCONS_FROM && s->ta_classid == 0 && JS_VALUE_GET_TAG(s->mapfn) != JS_TAG_UNDEFINED) {
+            /* !ta_isfrom: Array.from applies its mapfn DURING the collect; TypedArray.from applies it AFTER, in
+               its own phase (23.2.2.1 5.d), over the created target. They share the sink and the mapfn field, and
+               the old ta_classid != 0 test happened to separate them only because the from path used to create by
+               class id — running the mapfn twice per element the moment that stopped being true. */
+            if (s->sink == ITERCONS_FROM && !s->ta_isfrom && JS_VALUE_GET_TAG(s->mapfn) != JS_TAG_UNDEFINED) {
                 /* Array.from(items, mapfn): the mapfn must run ON THE TRAMP like every other callback — a loop
                    inside it has to park. Hold the element and hand the call to do_iter_consume_step (cb_pending 2
                    selects mapfn_this as the receiver and the not-yet-incremented index). */
@@ -49166,31 +49363,40 @@ static bool tramp_can_call_ta_consume(JSContext *ctx, JSValueConst func, JSValue
    path (from applies it during element-set, a different finish). */
 static bool tramp_can_call_ta_from_consume(JSContext *ctx, JSValueConst func, JSValueConst this_val, JSValueConst *call_argv, int call_argc, int *out_classid, JSValue *out_getiter)
 {
-    JSObject *fp, *tp;
+    JSObject *fp;
+    (void)this_val;   /* the receiver is no longer a routing question — see below */
     *out_getiter = JS_UNDEFINED;
-    if (call_argc < 1) return false;
+    /* No blanket argc gate: `of()` with no arguments is a perfectly ordinary call that must still route (it
+       Constructs the receiver with length 0). Only `from` needs a source, and it checks for one itself. */
     if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
     fp = JS_VALUE_GET_OBJ(func);
     if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
     if (fp->u.cfunc.cproto != JS_CFUNC_generic) return false;
-    if (fp->u.cfunc.c_function.generic != js_typed_array_from) return false;
-    if (JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT) return false;
-    tp = JS_VALUE_GET_OBJ(this_val);   /* the TypedArray ctor supplies the class + create target */
-    if (tp->class_id != JS_CLASS_C_FUNCTION) return false;
-    if (tp->u.cfunc.cproto != JS_CFUNC_constructor_magic) return false;
-    if (tp->u.cfunc.c_function.constructor_magic != js_typed_array_constructor) return false;
-    if (JS_VALUE_GET_TAG(call_argv[0]) != JS_TAG_OBJECT) return false;
-    /* a mapfn arg, if present and not undefined, MUST be callable — else from throws EARLY; leave that to the
-       normal path. When present it is applied at the finish (via js_typed_array_from), not during the collect. */
-    if (call_argc >= 2 && !JS_IsUndefined(call_argv[1]) && !JS_IsFunction(ctx, call_argv[1])) return false;
-    /* ANY callable @@iterator, not just a generator-backed one: iter_consume_gen_backed was the fallback selector
-       that dropped a plain iterator onto js_typed_array_from's C drive-to-completion. Array-LIKES (no @@iterator,
-       driven by length+indices) are a genuinely different algorithm and correctly stay in the C entry. */
-    if (!iter_data_at_iterator(ctx, call_argv[0], out_getiter)) return false;
-    if (!JS_IsFunction(ctx, *out_getiter)) {
-        JS_FreeValue(ctx, *out_getiter); *out_getiter = JS_UNDEFINED; return false;
+    if (fp->u.cfunc.c_function.generic == js_typed_array_of) {
+        /* %TypedArray%.of(...items) is 23.2.2.2: IsConstructor(C), TypedArrayCreateFromConstructor(C, «len»),
+           then Set each argument. Its create is the SAME Construct(C, «len») as from's, so it shares this
+           recognizer and the same two phases rather than growing its own of everything. */
+        *out_classid = -1;   /* the arm's marker for the `of` shape (no source object at all) */
+        return true;
     }
-    *out_classid = tp->u.cfunc.magic;
+    if (fp->u.cfunc.c_function.generic != js_typed_array_from) return false;
+    /* NO receiver gate. It required a concrete %TypedArray% constructor, which sent `%TypedArray%.from([])` and
+       `TA.from.call(anyOtherCtor, …)` to the C loop — and the reason it could not be dropped was that the finish
+       created the target by CLASS ID instead of Constructing the receiver. Now that the create is a real
+       Construct(C, «len») phase on the tramp, the receiver is just the constructor the spec says it is, and its
+       IsConstructor check (step 2) lives in the arm, in order. *out_classid stays only for the sibling
+       `new TypedArray(iterable)` route, which genuinely creates by class. A primitive SOURCE is fine too — the
+       probe boxes it, exactly as Array.from's does. */
+    if (call_argc >= 2 && !JS_IsUndefined(call_argv[1]) && !JS_IsFunction(ctx, call_argv[1])) return false;   /* step 3: an uncallable mapfn throws BEFORE @@iterator is read */
+    if (call_argc < 1) return false;   /* from() with no source: the C entry's step-2/3 throws reach it first */
+    *out_classid = 0;
+    /* The probe is NOT a gate any more, only a hint. It is side-effect-free, so it declines an accessor
+       @@iterator and a Proxy — and declining the ROUTE for those handed them to a C loop that then read
+       @@iterator for real and iterated it. The arm performs that read itself when the probe came back empty, so
+       there is exactly one observable GetMethod either way, and it is the arm that decides step 5 (iterable, the
+       consume machine) versus step 6 (array-like, a different algorithm). */
+    iter_data_at_iterator(ctx, call_argv[0], out_getiter);
+    *out_classid = 0;   /* the from path constructs the receiver; the class id is the sibling route's business */
     return true;
 }
 
@@ -66821,143 +67027,38 @@ static JSValue js_typed_array___speciesCreate(JSContext *ctx,
 static JSValue js_typed_array_from(JSContext *ctx, JSValueConst this_val,
                                    int argc, JSValueConst *argv)
 {
-    // from(items, mapfn = void 0, this_arg = void 0)
-    JSValueConst items = argv[0], mapfn, this_arg;
-    JSValueConst args[2];
-    JSValue stack[2];
-    JSValue iter, arr, r, v, v2;
-    int64_t k, len;
-    int done, mapping;
+    JSValue iter;
+    JSValueConst items = argv[0];
 
-    mapping = false;
-    mapfn = JS_UNDEFINED;
-    this_arg = JS_UNDEFINED;
-    r = JS_UNDEFINED;
-    arr = JS_UNDEFINED;
-    stack[0] = JS_UNDEFINED;
-    stack[1] = JS_UNDEFINED;
-
-    if (argc > 1) {
-        mapfn = argv[1];
-        if (!JS_IsUndefined(mapfn)) {
-            if (check_function(ctx, mapfn))
-                goto exception;
-            mapping = 1;
-            if (argc > 2)
-                this_arg = argv[2];
-        }
-    }
-    iter = JS_GetProperty(ctx, items, JS_ATOM_Symbol_iterator);
+    /* 23.2.2.1 steps 5 AND 6 are DELETED from here. Both end in the same two phases — Construct the receiver with
+       the length, then map+set each element — and both run USER code (the constructor, the mapfn) that a C loop
+       cannot suspend, so both are phases of the consume machine now. What survives is the prefix that never
+       reaches a source: step 2's IsConstructor and step 3's mapfn check, plus step 4's read, which is what throws
+       for `TA.from()` with no argument at all. */
+    if (!JS_IsConstructor(ctx, this_val))
+        return JS_ThrowTypeError(ctx, "not a constructor");
+    if (argc > 1 && !JS_IsUndefined(argv[1]) && check_function(ctx, argv[1]))
+        return JS_EXCEPTION;
+    iter = JS_GetProperty(ctx, items, JS_ATOM_Symbol_iterator);   /* throws for a nullish source */
     if (JS_IsException(iter))
-        goto exception;
-    if (!JS_IsUndefined(iter) && !JS_IsNull(iter)) {
-        if (!JS_IsFunction(ctx, iter)) {
-            JS_FreeValue(ctx, iter);
-            JS_ThrowTypeError(ctx, "value is not iterable");
-            goto exception;
-        }
-        /* FALLBACK — TypedArray.from over an ITERABLE drives .next and the mapfn from C. Alive because
-           tramp_can_call_ta_from_consume narrows to generator-backed sources. The array-like path below is a
-           different algorithm (length + indices) and is not this. */
-        /* The iteration itself IS routed (tramp_can_call_ta_from_consume takes any callable @@iterator). What
-           still reaches here is the receiver: the recognizer requires `this` to be a CONCRETE %TypedArray%
-           constructor, so `%TypedArray%.from([])`, `TA.from.call(customCtor, …)` and `TA.from.call(nonCtor, …)`
-           decline and land in this loop. Widening that gate needs the SPEC create, which the routed path does not
-           have: 23.2.2.1 step 5.c is TypedArrayCreateFromConstructor(C, «len») — a real Construct(C, [len]) — and
-           the routed finish instead takes the js_typed_array_constructor_obj shortcut, which never calls C. So the
-           three named pieces, in order:
-             1. do_construct_tramp needs an OUTER CONTINUATION (JSConstruct gains outer/outer_kind, and do_return's
-                CONT_CONSTRUCT arm settles into it instead of always pushing). Without it a custom bytecode ctor
-                would be Constructed from C — a new drive-to-completion, which is why the gate was not simply
-                widened.
-             2. With that, the consume DONE requests Construct(C, [len]) and re-enters as a create phase.
-             3. The mapfn map+set becomes a SECOND per-element phase over the created TA, reusing the cb_pending
-                callback drive ITERCONS_FROM already has (spec runs mapfn AFTER the whole collect, not during). */
-        DFAIL("TypedArray.from is iterating from C — the receiver gate (concrete %TypedArray% ctor only) and the "
-              "mapfn map+set are unbuilt; both need do_construct_tramp to accept an outer continuation so "
-              "TypedArrayCreateFromConstructor's Construct(C, [len]) runs on the tramp");
-        arr = JS_NewArray(ctx);
-        if (JS_IsException(arr)) {
-            JS_FreeValue(ctx, iter);
-            goto exception;
-        }
-        stack[0] = JS_GetIterator2(ctx, items, iter);
-        JS_FreeValue(ctx, iter);
-        if (JS_IsException(stack[0]))
-            goto exception;
-        stack[1] = JS_GetProperty(ctx, stack[0], JS_ATOM_next);
-        if (JS_IsException(stack[1]))
-            goto exception_close;
-        for (k = 0;; k++) {
-            v = JS_IteratorNext(ctx, stack[0], stack[1], 0, NULL, &done);
-            if (JS_IsException(v))
-                goto exception_close;
-            if (done)
-                break;
-            if (JS_DefinePropertyValueInt64(ctx, arr, k, v, JS_PROP_C_W_E | JS_PROP_THROW) < 0)
-                goto exception_close;
-        }
-    } else {
-        arr = JS_ToObject(ctx, items);
-        if (JS_IsException(arr))
-            goto exception;
-    }
-    if (js_get_length64(ctx, &len, arr) < 0)
-        goto exception;
-    v = js_int64(len);
-    r = js_typed_array_create(ctx, this_val, 1, vc(&v), true);
-    JS_FreeValue(ctx, v);
-    if (JS_IsException(r))
-        goto exception;
-    for(k = 0; k < len; k++) {
-        v = JS_GetPropertyInt64(ctx, arr, k);
-        if (JS_IsException(v))
-            goto exception;
-        if (mapping) {
-            args[0] = v;
-            args[1] = js_int32(k);
-            v2 = JS_Call(ctx, mapfn, this_arg, 2, args);
-            JS_FreeValue(ctx, v);
-            v = v2;
-            if (JS_IsException(v))
-                goto exception;
-        }
-        if (JS_SetPropertyInt64(ctx, r, k, v) < 0)
-            goto exception;
-    }
-    goto done;
-
- exception_close:
-    if (!JS_IsUndefined(stack[0]))
-        JS_IteratorClose(ctx, stack[0], true);
- exception:
-    JS_FreeValue(ctx, r);
-    r = JS_EXCEPTION;
- done:
-    JS_FreeValue(ctx, arr);
-    JS_FreeValue(ctx, stack[0]);
-    JS_FreeValue(ctx, stack[1]);
-    return r;
+        return JS_EXCEPTION;
+    JS_FreeValue(ctx, iter);
+    DFAIL("TypedArray.from reached its C entry with a real source — 23.2.2.1 steps 5 and 6 are both phases of the "
+          "consume machine; route that call shape onto it");
+    return JS_ThrowTypeError(ctx, "TypedArray.from: unrouted call shape (no off-tramp implementation exists)");
 }
 
 static JSValue js_typed_array_of(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv)
 {
-    JSValue v, obj;
-    int i;
-
-    v = js_int32(argc);
-    obj = js_typed_array_create(ctx, this_val, 1, vc(&v), true);
-    if (JS_IsException(obj))
-        return obj;
-
-    for(i = 0; i < argc; i++) {
-        if (JS_SetPropertyUint32(ctx, obj, i, js_dup(argv[i])) < 0) {
-            JS_FreeValue(ctx, obj);
-            return JS_EXCEPTION;
-        }
-    }
-    return obj;
+    /* 23.2.2.2's body is DELETED: its TypedArrayCreateFromConstructor is a real Construct of the receiver, which a
+       C loop cannot suspend through, and it shares from's create+set phases exactly. What survives is step 1,
+       which never touches a constructor. */
+    if (!JS_IsConstructor(ctx, this_val))
+        return JS_ThrowTypeError(ctx, "not a constructor");
+    DFAIL("TypedArray.of reached its C entry — its create+set are phases of the consume machine; route that "
+          "call shape onto it");
+    return JS_ThrowTypeError(ctx, "TypedArray.of: unrouted call shape (no off-tramp implementation exists)");
 }
 
 static JSValue js_typed_array_copyWithin(JSContext *ctx, JSValueConst this_val,
