@@ -20389,6 +20389,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     void *con_outer = NULL;                             /* non-NULL = this construct was requested by a state machine; its step receives the object (read+reset in do_construct_tramp) */
     uint8_t con_outer_kind = CONT_NONE;                 /* CONT_* of con_outer */
     JSValueConst *con_args = NULL; int con_argc = 0;
+    /* An ARGUMENT-VECTOR construct: con_args is a malloc'd block this label owns rather than a window onto a
+       frame that outlives the callee. A flattened bound chain is the case that needs it — its arguments come
+       from several bound objects and the caller's stack, so they are contiguous nowhere. It also forces the
+       COPY path: the borrow below is sound only for slots someone else frees. */
+    JSValue *con_args_owned = NULL;
+    /* the CALLER's operand count, when it differs from the callee's argument count — which it does exactly when
+       the vector supplies more arguments than the call site pushed. -1 = they are the same, the usual case.
+       do_apply_tramp has always kept these apart (ap_cargc vs the array's length); this label conflated them
+       because until a bound chain was flattened here they could not differ. */
+    int con_cargc = -1;
     uint8_t con_from_super = 0; JSValue con_super_ref = JS_UNDEFINED;
     /* Promise-executor trampoline (do_promise_exec_tramp): the SAME builtin is reached by two entry shapes, so both
        set these before the goto — `new Promise(fn)` (OP_call_constructor: operands on the caller stack, popped at
@@ -21111,9 +21121,26 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     int nb6;
                     JSValueConst tgt6 = tramp_bound_target(call_argv[-2], &bthis6, &nb6);
                     const JSTrampStepDef *sd6 = tramp_step_def_of(tgt6);
+                    JSValueConst ntgt6 = js_same_value(ctx, call_argv[-1], call_argv[-2])
+                                         ? tgt6 : call_argv[-1];
+                    if (tramp_can_construct(tgt6)) {
+                        /* a BYTECODE constructor at the end of the chain: its body runs on this chain like any
+                           other, with the flattened arguments handed over as an owned vector — they come from
+                           several bound objects and the caller's stack, so they are contiguous nowhere and the
+                           borrow the label otherwise does has nothing to borrow from. */
+                        int n6 = nb6 + call_argc, k6;
+                        JSValue *ab6 = js_malloc(ctx, sizeof(JSValue) * (n6 > 0 ? n6 : 1));
+                        if (unlikely(!ab6)) goto exception;
+                        tramp_bound_args(call_argv[-2], (JSValueConst *)ab6, nb6);   /* borrowed: the copy dups */
+                        for (k6 = 0; k6 < call_argc; k6++) ab6[nb6 + k6] = (JSValue)call_argv[k6];
+                        con_func = tgt6; con_ntgt = ntgt6;
+                        con_args = (JSValueConst *)ab6; con_argc = n6; con_args_owned = ab6;
+                        con_cargc = call_argc;   /* the caller pushed only ITS args, not the chain's */
+                        con_from_super = 0; con_super_ref = JS_UNDEFINED;
+                        tramp_first = -2; tramp_is_tail = 0;
+                        goto do_construct_tramp;
+                    }
                     if (sd6) {
-                        JSValueConst ntgt6 = js_same_value(ctx, call_argv[-1], call_argv[-2])
-                                             ? tgt6 : call_argv[-1];
                         int n6 = nb6 + call_argc, k6;
                         JSValue *ab6 = js_malloc(ctx, sizeof(JSValue) * (n6 > 0 ? n6 : 1));
                         void *stt6;
@@ -21674,7 +21701,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    got the clause. `class C extends TA { constructor(...p) { super(...p); } }` as a species
                    constructor leaked the whole graph on every TypedArray.prototype.slice, throwing or not. */
                 int narg_alloc = (eff_argc < nb->arg_count) ? nb->arg_count : 0;
-                if (con_outer && eff_argc > narg_alloc)
+                if ((con_outer || con_args_owned) && eff_argc > narg_alloc)
                     narg_alloc = eff_argc;
                 size_t asize = sizeof(JSValue) * TRAMP_FRAME_SLOTS(narg_alloc, nb)
                              + sizeof(JSVarRef *) * nb->var_ref_count;
@@ -21683,18 +21710,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     cthis = JS_UNDEFINED;   /* bound by super(); body returns the object itself */
                 } else {
                     cthis = js_create_from_ctor(ctx, ntgt, JS_CLASS_OBJECT);
-                    if (unlikely(JS_IsException(cthis))) { JS_FreeValue(ctx, con_super_ref); goto exception; }
+                    if (unlikely(JS_IsException(cthis))) { js_free(ctx, con_args_owned); con_args_owned = NULL; JS_FreeValue(ctx, con_super_ref); goto exception; }
                 }
                 cs = js_malloc_rt(rt, sizeof(*cs));
-                if (unlikely(!cs)) { JS_FreeValue(ctx, cthis); JS_FreeValue(ctx, con_super_ref); JS_ThrowOutOfMemory(ctx); goto exception; }
+                if (unlikely(!cs)) { js_free(ctx, con_args_owned); con_args_owned = NULL; JS_FreeValue(ctx, cthis); JS_FreeValue(ctx, con_super_ref); JS_ThrowOutOfMemory(ctx); goto exception; }
                 cs->created_obj = cthis;   /* owned here; substituted or freed at do_return / exception unwind */
                 cs->super_ref = con_super_ref; cs->from_super = con_from_super;
                 cs->outer = con_outer; cs->outer_kind = con_outer_kind;
                 con_outer = NULL; con_outer_kind = CONT_NONE;   /* read + reset: never leak onto the body's own constructs */
                 ntf = js_malloc_rt(rt, sizeof(TrampFrame));
-                if (unlikely(!ntf)) { JS_FreeValue(ctx, cthis); JS_FreeValue(ctx, con_super_ref); js_free_rt(rt, cs); JS_ThrowOutOfMemory(ctx); goto exception; }
+                if (unlikely(!ntf)) { js_free(ctx, con_args_owned); con_args_owned = NULL; JS_FreeValue(ctx, cthis); JS_FreeValue(ctx, con_super_ref); js_free_rt(rt, cs); JS_ThrowOutOfMemory(ctx); goto exception; }
                 nlb = js_malloc_rt(rt, asize ? asize : sizeof(JSValue));
-                if (unlikely(!nlb)) { JS_FreeValue(ctx, cthis); JS_FreeValue(ctx, con_super_ref); js_free_rt(rt, cs); js_free_rt(rt, ntf); JS_ThrowOutOfMemory(ctx); goto exception; }
+                if (unlikely(!nlb)) { js_free(ctx, con_args_owned); con_args_owned = NULL; JS_FreeValue(ctx, cthis); JS_FreeValue(ctx, con_super_ref); js_free_rt(rt, cs); js_free_rt(rt, ntf); JS_ThrowOutOfMemory(ctx); goto exception; }
                 ntf->up = tf_top;
                 ntf->caller_sf = sf; ntf->caller_b = b; ntf->caller_ctx = ctx;
                 ntf->caller_local_buf = local_buf; ntf->caller_stack_buf = stack_buf;
@@ -21709,7 +21736,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    arguments from the machine's own buffer — recording con_argc there made do_return free and pop
                    a live caller operand, which showed up as a misaligned argument list at the NEXT call. */
                 ntf->call_first = cs->outer ? 0 : tramp_first;
-                ntf->call_argc = cs->outer ? 0 : con_argc;
+                ntf->call_argc = cs->outer ? 0 : (con_cargc >= 0 ? con_cargc : con_argc);
+                con_cargc = -1;   /* read + reset: never leak the shape onto the body's own constructs */
                 ntf->is_tail = cs->outer ? 0 : tramp_is_tail;
                 ntf->b = nb; ntf->ctx = nb->realm; ntf->local_buf = nlb;
                 nsf = &ntf->sf;
@@ -21723,8 +21751,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     for (; k < narg_alloc; k++) narg_buf[k] = JS_UNDEFINED;
                     nsf->arg_count = narg_alloc;
                 } else {
-                    narg_buf = (JSValue *)con_args;
+                    /* zero arguments either way: an OWNED vector has nothing in it to point at, and pointing at
+                       one that is about to be freed is a dangling arg_buf even when nothing reads it. */
+                    narg_buf = con_args_owned ? NULL : (JSValue *)con_args;
                 }
+                if (con_args_owned) { js_free(ctx, con_args_owned); con_args_owned = NULL; con_args = NULL; }
                 nvar_buf = nlb + narg_alloc;
                 for (k = 0; k < nb->var_count; k++) nvar_buf[k] = JS_UNDEFINED;
                 nstack_buf = nvar_buf + nb->var_count;
