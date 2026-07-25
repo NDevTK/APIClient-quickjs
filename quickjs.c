@@ -17994,7 +17994,9 @@ static void close_lexical_var(JSContext *ctx, JSFunctionBytecode *b,
    implementation left for a missing row to fall back to, so a builtin either has a definition here or has none.
      init -> opaque state (NULL + pending exception on error)
      step -> 0 = DONE (fini yields the result), 3 = CALL (*out_cb is [this, fn, args...]),
-             4 = CONSTRUCT (*out_cb is [ctor, args...]; the object returns as the next step's cb_result), -1 = error
+             4 = CONSTRUCT (*out_cb is [ctor, args...]; the object returns as the next step's cb_result),
+             5 = TOPRIMITIVE (*out_cb is [value], *out_argc is the hint; the primitive returns the same way),
+             -1 = error
      fini -> tear down; returns the result when take_result. */
 typedef struct JSTrampStepDef {
     /* func_obj is the CALLEE — for a plain C-function step machine it is that function (unused); for a
@@ -18456,6 +18458,23 @@ typedef struct JSIterFrom { int orig_cfirst, orig_cargc; uint8_t orig_is_tail; }
                                    three acquire shapes (inline C-function call, generator create, bytecode call)
                                    arrive at the consumer identically. */
 typedef struct JSConsumeGetIter { void *consumer; uint8_t consumer_kind; } JSConsumeGetIter;
+#define CONT_TOPRIM        21  /* cont_state = JSToPrim: ToPrimitive's method call (7.1.1) running ON THE TRAMP.
+                                  JS_ToPrimitiveFree calls @@toPrimitive / valueOf / toString with JS_CallFree, from
+                                  C — so a user coercion method containing a loop preempts in an activation with no
+                                  flow base. The operator site drives the method here instead, writes the primitive
+                                  back into the operand slot, and RE-EXECUTES its opcode: everything before the
+                                  coercion is a tag test, so re-running it is free and the remaining operands are
+                                  coerced in spec order by the same retry. */
+typedef struct JSToPrim {
+    JSValue obj;              /* the object being coerced (owned) */
+    const uint8_t *retry_pc;  /* OPERAND mode: the opcode byte to re-execute once the slot holds a primitive */
+    int slot;                 /* OPERAND mode: the operand's offset from sp (negative) */
+    void *outer;              /* MACHINE mode: the step machine awaiting the primitive (NULL = operand mode) */
+    uint8_t outer_kind;       /* CONT_* of outer */
+    uint8_t hint;             /* HINT_STRING / HINT_NUMBER (the ordinary-method order) */
+    uint8_t hint_none;        /* 1 = the caller's hint was HINT_NONE: @@toPrimitive gets "default" */
+    uint8_t stage;            /* 0 = @@toPrimitive, 1 = its result pending, 2/3 = the ordinary methods */
+} JSToPrim;
 #define CONT_FOROF_NEXT    20  /* cont_state = NULL (the enum_rec offset rides the frame's forof_off): `for (x of it)`
                                   where it.next is a NORMAL bytecode function. Its body runs on THIS chain, so a loop
                                   in a hand-written .next() preempts; js_for_of_next -> JS_IteratorNext -> JS_Call was
@@ -19446,6 +19465,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     uint8_t tramp_cont_kind = CONT_NONE, cont_kind_cur = CONT_NONE;
     int iter_special = 0;
     int tramp_gen_magic = 0;                            /* set before goto do_generator_tramp */
+    int tp_slot = 0;                                    /* do_toprim_tramp inputs. OPERAND mode: the operand's offset from sp + the opcode byte to re-execute. MACHINE mode: tp_outer is set and the primitive is delivered to that step instead. */
+    int tp_hint = HINT_NONE;
+    const uint8_t *tp_retry_pc = NULL;
+    JSValueConst tp_value = JS_UNDEFINED;               /* MACHINE mode: the value to coerce (borrowed) */
+    void *tp_outer = NULL;
+    uint8_t tp_outer_kind = CONT_NONE;
     int tramp_cont_forof = 0;                           /* CONT_FOROF_NEXT: the enum_rec stack offset for the .next() drive about to be pushed. Rides the frame's forof_off (read+reset in do_tramp_call) so no per-iteration heap state is allocated for what is one int. */
     int tramp_gen_forof = 1;                            /* <0 = for-of iterator stack offset (always -3-.. ); 1 = direct .next() (no valid offset is positive) */
     int tramp_ith_forof = 1;                            /* Iterator Helper for-of drive: <0 = iterator stack offset; 1 = direct. read+reset by do_iter_helper_tramp */
@@ -21091,6 +21116,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     *sp++ = r;
                     BREAK;
                 }
+                if (st == 5) {
+                    /* TOPRIMITIVE: *out_cb is [value] and *out_argc is the HINT. A builtin that coerces its
+                       arguments (String.prototype.concat, and the whole ToString/ToNumber family) reaches user
+                       valueOf/toString/@@toPrimitive through JS_ToPrimitiveFree's JS_CallFree — from C. The
+                       coercion runs on the tramp instead and its primitive returns as the next step's result. */
+                    tp_outer = stt; tp_outer_kind = CONT_STEP;
+                    tp_value = cb[0]; tp_hint = cbn;
+                    tp_slot = 0; tp_retry_pc = NULL;
+                    goto do_toprim_tramp;
+                }
                 if (st == 4) {
                     /* CONSTRUCT: *out_cb is [ctor, args...]. A builtin whose spec step is a real Construct —
                        ArraySpeciesCreate / TypedArrayCreateFromConstructor — used to reach JS_CallConstructor from
@@ -21464,6 +21499,135 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
                 tramp_consume_iterable = obj; tramp_consume_state = s; tramp_consume_kind = CONT_ITER_FROM;
                 goto do_consume_acquire_iterator;
+            }
+
+        do_toprim_tramp:
+            /* 7.1.1 ToPrimitive, with its METHOD CALL on this chain. Entered with tp_slot / tp_hint /
+               tp_retry_pc; a JSToPrim carries the sequence position across the call so a suspended coercion
+               resumes where it left off. The property READS stay inline (a coercion method is a data property in
+               every real case; an accessor one is the getter-from-C family, not this one). */
+            {
+                JSToPrim *tp = js_mallocz(ctx, sizeof(*tp));
+                if (unlikely(!tp)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                tp->outer = tp_outer; tp->outer_kind = tp_outer_kind;
+                tp->obj = js_dup(tp_outer ? tp_value : sp[tp_slot]);
+                tp->retry_pc = tp_retry_pc;
+                tp->slot = tp_slot;
+                tp->hint = (tp_hint == HINT_STRING) ? HINT_STRING : HINT_NUMBER;   /* NONE uses the NUMBER order */
+                tp->hint_none = (tp_hint == HINT_NONE);
+                tp->stage = 0;
+                tp_outer = NULL; tp_outer_kind = CONT_NONE; tp_value = JS_UNDEFINED;   /* read + reset */
+                cont_st = tp; cont_kind_cur = CONT_TOPRIM;
+                ret_val = JS_UNINITIALIZED;
+                goto do_toprim_step;
+            }
+
+        do_toprim_step:
+            /* ret_val = the previous coercion method's result (UNINITIALIZED on the first entry). Either the
+               sequence is done (a primitive lands in the slot and the opcode re-runs) or the next method is
+               driven. */
+            {
+                JSToPrim *tp = (JSToPrim *)cont_st;
+                JSValue method;
+                JSAtom mname;
+                if (JS_VALUE_GET_TAG(ret_val) != JS_TAG_UNINITIALIZED) {
+                    if (tp->stage == 1 && !JS_IsUninitialized(ret_val)) {
+                        /* @@toPrimitive's result: 7.1.1 step 2.d — it MUST be primitive, there is no fallback. */
+                        if (JS_VALUE_GET_TAG(ret_val) == JS_TAG_OBJECT) {
+                            JS_FreeValue(ctx, ret_val);
+                            JS_FreeValue(ctx, tp->obj); js_free_rt(rt, tp);
+                            JS_ThrowTypeError(ctx, "toPrimitive");
+                            goto exception;
+                        }
+                        goto toprim_deliver;
+                    }
+                    if (JS_VALUE_GET_TAG(ret_val) != JS_TAG_OBJECT)
+                        goto toprim_deliver;   /* OrdinaryToPrimitive: a primitive result wins */
+                    JS_FreeValue(ctx, ret_val);   /* an object result: fall through to the next method */
+                    ret_val = JS_UNINITIALIZED;
+                }
+                for (;;) {
+                    if (tp->stage == 0) {
+                        tp->stage = 1;
+                        method = JS_GetProperty(ctx, tp->obj, JS_ATOM_Symbol_toPrimitive);
+                        if (JS_IsException(method)) goto toprim_throw;
+                        /* test262 uses null as a non-callable converter, which the spec's "not undefined" wording
+                           does not cover — quickjs has always treated both as absent here. */
+                        if (!JS_IsUndefined(method) && !JS_IsNull(method)) {
+                            JSValue harg = JS_AtomToString(ctx, tp->hint_none ? JS_ATOM_default
+                                                           : (tp->hint == HINT_STRING ? JS_ATOM_string : JS_ATOM_number));
+                            if (JS_IsException(harg)) { JS_FreeValue(ctx, method); goto toprim_throw; }
+                            DCHECK(sp + 3 <= TRAMP_SP_LIMIT(sf),
+                                   "ToPrimitive drive: operand push exceeds the frame's compiled stack_size");
+                            *sp++ = js_dup(tp->obj);   /* this */
+                            *sp++ = method;            /* the method (owned, transferred) */
+                            *sp++ = harg;              /* the hint string */
+                            call_argv = sp - 1; call_argc = 1; tramp_first = -2; tramp_is_tail = 0;
+                            goto toprim_dispatch;
+                        }
+                        JS_FreeValue(ctx, method);
+                        tp->stage = 2;   /* no @@toPrimitive: OrdinaryToPrimitive from the first method */
+                        continue;
+                    }
+                    if (tp->stage >= 4) {   /* both ordinary methods returned objects */
+                        JS_ThrowTypeError(ctx, "cannot convert to primitive");
+                        goto toprim_throw;
+                    }
+                    /* stage 2 = the first method for this hint, stage 3 = the second. HINT_STRING tries toString
+                       first, HINT_NUMBER valueOf first — the (i ^ hint) rule, spelled out. */
+                    mname = ((tp->stage - 2) ^ tp->hint) == 0 ? JS_ATOM_toString : JS_ATOM_valueOf;
+                    tp->stage++;
+                    method = JS_GetProperty(ctx, tp->obj, mname);
+                    if (JS_IsException(method)) goto toprim_throw;
+                    if (!JS_IsFunction(ctx, method)) { JS_FreeValue(ctx, method); continue; }
+                    DCHECK(sp + 2 <= TRAMP_SP_LIMIT(sf),
+                           "ToPrimitive drive: operand push exceeds the frame's compiled stack_size");
+                    *sp++ = js_dup(tp->obj);
+                    *sp++ = method;
+                    call_argv = sp; call_argc = 0; tramp_first = -2; tramp_is_tail = 0;
+                    goto toprim_dispatch;
+                }
+            toprim_dispatch:
+                /* a BYTECODE coercion method runs its body here, so a loop in it parks; a C one has no body to
+                   suspend and is called in place. */
+                if (tramp_can_call(call_argv[-1])) {
+                    tramp_cont_state = tp; tramp_cont_kind = CONT_TOPRIM;
+                    goto do_tramp_call;
+                }
+                { JSValue cr = JS_Call(ctx, call_argv[-1], call_argv[-2], call_argc, call_argv);
+                  for (i = -2; i < call_argc; i++) JS_FreeValue(ctx, call_argv[i]);
+                  sp -= 2 + call_argc;
+                  if (JS_IsException(cr)) goto toprim_throw;
+                  ret_val = cr; cont_st = tp; goto do_toprim_step; }
+            toprim_deliver:
+                {
+                    const uint8_t *rpc = tp->retry_pc;
+                    int slot = tp->slot;
+                    void *touter = tp->outer; uint8_t touter_kind = tp->outer_kind;
+                    JS_FreeValue(ctx, tp->obj); js_free_rt(rt, tp);
+                    if (touter) {
+                        /* MACHINE mode: a coercing BUILTIN asked for this primitive; it comes back as that step's
+                           result, exactly as a callback's would. */
+                        cont_st = touter; cont_kind_cur = touter_kind;
+                        DCHECK(touter_kind == CONT_STEP, "ToPrimitive outer continuation: unknown machine kind");
+                        goto do_step_step;
+                    }
+                    JS_FreeValue(ctx, sp[slot]);
+                    sp[slot] = ret_val;       /* the operand is now a primitive */
+                    ret_val = JS_UNDEFINED;
+                    pc = rpc;                 /* re-execute the operator; its prefix is pure tag tests */
+                    BREAK;
+                }
+            toprim_throw:
+                {
+                    void *touter = tp->outer; uint8_t touter_kind = tp->outer_kind;
+                    JS_FreeValue(ctx, tp->obj); js_free_rt(rt, tp);
+                    if (touter) {   /* the machine that asked is abandoned with the coercion */
+                        DCHECK(touter_kind == CONT_STEP, "ToPrimitive outer continuation: unknown machine kind");
+                        ((JSStepHdr *)touter)->def->fini(ctx, touter, false);
+                    }
+                    goto exception;
+                }
             }
 
         do_consume_acquire_iterator:
@@ -23097,6 +23261,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                     cont_st = rcs; cont_kind_cur = CONT_ITER_HELPER;
                     goto do_iter_helper_step;
+                }
+                if (rck == CONT_TOPRIM) {
+                    /* the coercion method returned: drop its operands and feed the result to the sequence, which
+                       either delivers a primitive or moves on to the next method. */
+                    JSValue *cargv = sp - cargc;
+                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
+                    sp += cfirst - cargc;
+                    cont_st = rcs; cont_kind_cur = CONT_TOPRIM;
+                    goto do_toprim_step;
                 }
                 if (rck == CONT_FOROF_NEXT) {
                     /* the plain iterator's .next() returned: IteratorNext's object check, then
@@ -25118,6 +25291,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 } else {
                 add_slow_case:
                     sf->cur_pc = pc;
+                    /* 13.15.3: ToPrimitive(left) then ToPrimitive(right), and BOTH call user code. js_add_slow
+                       does them with JS_CallFree from C, so a `valueOf`/`toString`/@@toPrimitive with a loop in it
+                       preempts in an activation with no flow base. Coerce the LEFT operand first, on the tramp,
+                       then re-execute this opcode — the prefix above is pure tag tests, so the retry costs
+                       nothing and the right operand is coerced by the same path on the next pass, in order. */
+                    if (JS_VALUE_GET_TAG(op1) == JS_TAG_OBJECT || JS_VALUE_GET_TAG(op2) == JS_TAG_OBJECT) {
+                        tp_slot = (JS_VALUE_GET_TAG(op1) == JS_TAG_OBJECT) ? -2 : -1;
+                        tp_hint = HINT_NONE;
+                        tp_retry_pc = pc - 1;
+                        goto do_toprim_tramp;
+                    }
                     if (js_add_slow(ctx, sp))
                         goto exception;
                     sp--;
@@ -26107,6 +26291,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             cit->done = 1;
             cit->executing = 0;
             iter_helper_close_source_abrupt(ctx, cit);
+        } else if (xck == CONT_TOPRIM) {
+            /* the coercion method THREW: 7.1.1 propagates it (there is no next-method fallback on an abrupt
+               completion), so drop the sequence state and re-raise in the operator's frame. */
+            JSToPrim *tp = xcs;
+            JSValue *cargv = sp - xcg;
+            for (i = xcf; i < xcg; i++) JS_FreeValue(ctx, cargv[i]);
+            sp += xcf - xcg;
+            JS_FreeValue(ctx, tp->obj);
+            js_free_rt(rt, tp);
+            goto exception;
         } else if (xck == CONT_FOROF_NEXT) {
             /* the plain iterator's .next() THREW. js_for_of_next's own abrupt handling: clear the enum_rec's
                iterator slot (a failed IteratorNext leaves the iterator [[Done]] — the loop's OP_iterator_close
@@ -50327,9 +50521,13 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_TA_EVERY, STEPDEF_TA_SOME, STEPDEF_TA_FOREACH, STEPDEF_TA_MAP, STEPDEF_TA_FILTER,
     STEPDEF_ARRAY_REDUCE, STEPDEF_ARRAY_REDUCE_RIGHT, STEPDEF_TA_REDUCE, STEPDEF_TA_REDUCE_RIGHT,
     STEPDEF_ARRAY_SORT, STEPDEF_ARRAY_TOSORTED, STEPDEF_JSON_PARSE,
-    STEPDEF_TA_SLICE,
+    STEPDEF_TA_SLICE, STEPDEF_STR_CONCAT,
     STEPDEF_COUNT
 };
+static void *js_str_concat_init(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv,
+                                int unused, JSValueConst func_obj);
+static int js_str_concat_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_str_concat_fini(JSContext *ctx, void *st, bool take_result);
 static void *js_ta_slice_init(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv,
                               int unused, JSValueConst func_obj);
 static int js_ta_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
@@ -50361,6 +50559,7 @@ static const JSTrampStepDef js_array_sort_def    = { js_array_sort_vinit, js_arr
 static const JSTrampStepDef js_array_toSorted_def = { js_array_toSorted_vinit, js_array_sort_vstep, js_array_sort_vfini, 0 };
 static const JSTrampStepDef js_json_parse_def    = { js_json_parse_vinit, js_json_parse_vstep, js_json_parse_vfini, 0 };
 static const JSTrampStepDef js_ta_slice_def     = { js_ta_slice_init, js_ta_slice_step, js_ta_slice_fini, 0 };
+static const JSTrampStepDef js_str_concat_def   = { js_str_concat_init, js_str_concat_step, js_str_concat_fini, 0 };
 static const JSTrampStepDef js_array_reduce_def  = { js_array_reduce_vinit, js_array_reduce_vstep, js_array_reduce_vfini, special_reduce };
 static const JSTrampStepDef js_array_reduceR_def = { js_array_reduce_vinit, js_array_reduce_vstep, js_array_reduce_vfini, special_reduceRight };
 static const JSTrampStepDef js_ta_reduce_def     = { js_array_reduce_vinit, js_array_reduce_vstep, js_array_reduce_vfini, special_reduce | special_TA };
@@ -50390,6 +50589,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_ARRAY_SORT]    = &js_array_sort_def,   [STEPDEF_ARRAY_TOSORTED] = &js_array_toSorted_def,
     [STEPDEF_JSON_PARSE]    = &js_json_parse_def,
     [STEPDEF_TA_SLICE]      = &js_ta_slice_def,
+    [STEPDEF_STR_CONCAT]    = &js_str_concat_def,
     [STEPDEF_ARRAY_REDUCE]  = &js_array_reduce_def,  [STEPDEF_ARRAY_REDUCE_RIGHT] = &js_array_reduceR_def,
     [STEPDEF_TA_REDUCE]     = &js_ta_reduce_def,     [STEPDEF_TA_REDUCE_RIGHT]    = &js_ta_reduceR_def,
 };
@@ -53196,37 +53396,41 @@ static JSValue js_string_codePointAt(JSContext *ctx, JSValueConst this_val,
     return ret;
 }
 
-static JSValue js_string_concat(JSContext *ctx, JSValueConst this_val,
-                                int argc, JSValueConst *argv)
+/* The all-strings fast path, kept because it is the common case: one allocation and memcpys instead of a chain
+   of ToString + ConcatString. Returns 1 with *out set, or 0 when any operand is not a same-width string — in
+   which case a ToPrimitive is due and only the step machine below can run it. */
+static int js_string_concat_fast(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, JSValue *out)
 {
     int i, is_wide_char;
     JSString *p, *q;
     int64_t len;
     uint32_t n;
-    JSValue r;
     char *d;
 
     if (JS_TAG_STRING != JS_VALUE_GET_TAG(this_val))
-        goto slow_path;
+        return 0;
     p = JS_VALUE_GET_STRING(this_val);
     len = p->len;
     is_wide_char = p->is_wide_char;
     for (i = 0; i < argc; i++) {
         if (JS_TAG_STRING != JS_VALUE_GET_TAG(argv[i]))
-            goto slow_path;
+            return 0;
         p = JS_VALUE_GET_STRING(argv[i]);
         if (p->is_wide_char ^ is_wide_char)
-            goto slow_path;
+            return 0;
         len += p->len;
     }
-    if (len > INT_MAX>>is_wide_char)
-        return JS_ThrowOutOfMemory(ctx);
+    if (len > INT_MAX>>is_wide_char) {
+        *out = JS_ThrowOutOfMemory(ctx);
+        return 1;
+    }
     p = JS_VALUE_GET_STRING(this_val);
-    if (p->len == len)
-        return js_dup(this_val);
+    if (p->len == len) {
+        *out = js_dup(this_val);
+        return 1;
+    }
     q = js_alloc_string(ctx, len, is_wide_char);
-    if (!q)
-        return JS_EXCEPTION;
+    if (!q) { *out = JS_EXCEPTION; return 1; }
     d = strv(q);
     n = p->len << is_wide_char;
     memcpy(d, strv(p), n);
@@ -53239,14 +53443,103 @@ static JSValue js_string_concat(JSContext *ctx, JSValueConst this_val,
     }
     if (!is_wide_char)
         *d = '\0';
-    return JS_MKPTR(JS_TAG_STRING, q);
-slow_path:
-    r = JS_ToStringCheckObject(ctx, this_val);
-    for (i = 0; i < argc; i++) {
-        if (JS_IsException(r))
-            break;
-        r = JS_ConcatString(ctx, r, js_dup(argv[i]));
+    *out = JS_MKPTR(JS_TAG_STRING, q);
+    return 1;
+}
+
+/* String.prototype.concat as a step machine. The fast path above (every operand already a string) needs no user
+   code and stays; the moment one does not, each ToString is a TOPRIMITIVE step so a user valueOf/toString parks
+   like any other body. `acc` is the string built so far; `k` is the next argument to coerce. */
+typedef struct JSStrConcat {
+    JSStepHdr hdr;        /* MUST be first */
+    JSValue acc;          /* the accumulated string (owned) */
+    JSValue this_val;     /* the receiver (owned) */
+    JSValue cb[1];        /* the TOPRIMITIVE request's [value] (borrowed from this state) */
+    int argc, k;
+    uint8_t this_done;    /* 1 = the receiver has been coerced into acc */
+    JSValue args[];       /* the arguments (owned), allocated with the state — `concat(...bigArray)` is an
+                             ordinary call, and a fixed buffer here would be a cap on argument count. */
+} JSStrConcat;
+
+static void js_str_concat_end(JSContext *ctx, JSStrConcat *s, bool take_result)
+{
+    int i;
+    if (!take_result)
+        JS_FreeValue(ctx, s->acc);
+    JS_FreeValue(ctx, s->this_val);
+    for (i = 0; i < s->argc; i++) JS_FreeValue(ctx, s->args[i]);
+}
+
+static void *js_str_concat_init(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv,
+                                int unused, JSValueConst func_obj)
+{
+    JSStrConcat *s;
+    int i;
+    if (JS_IsUndefined(this_val) || JS_IsNull(this_val)) {
+        JS_ThrowTypeError(ctx, "cannot convert to object");   /* RequireObjectCoercible, step 1 */
+        return NULL;
     }
+    s = js_mallocz(ctx, sizeof(*s) + (size_t)argc * sizeof(JSValue));
+    if (!s) { JS_ThrowOutOfMemory(ctx); return NULL; }
+    s->acc = JS_UNDEFINED;
+    s->this_val = js_dup(this_val);
+    s->argc = argc;
+    for (i = 0; i < argc; i++) s->args[i] = js_dup(argv[i]);
+    if (js_string_concat_fast(ctx, this_val, argc, argv, &s->acc)) {
+        if (JS_IsException(s->acc)) { s->acc = JS_UNDEFINED; js_str_concat_end(ctx, s, false); js_free(ctx, s); return NULL; }
+        s->this_done = 1; s->k = argc;   /* nothing to coerce: the first step finishes */
+    }
+    return s;
+}
+
+static int js_str_concat_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSStrConcat *s = st;
+    JSValue v;
+
+    if (JS_VALUE_GET_TAG(cb_result) != JS_TAG_UNINITIALIZED && !JS_IsUndefined(cb_result)) {
+        /* a coercion settled: it is a PRIMITIVE, so ToString finishes it without user code. */
+        JSValue str = JS_ToString(ctx, cb_result);
+        JS_FreeValue(ctx, cb_result);
+        if (JS_IsException(str)) return -1;
+        if (!s->this_done) { s->this_done = 1; s->acc = str; }
+        else { s->acc = JS_ConcatString(ctx, s->acc, str); s->k++;
+               if (JS_IsException(s->acc)) { s->acc = JS_UNDEFINED; return -1; } }
+    } else if (JS_VALUE_GET_TAG(cb_result) != JS_TAG_UNINITIALIZED) {
+        JS_FreeValue(ctx, cb_result);
+    }
+    if (!s->this_done) {
+        if (JS_VALUE_GET_TAG(s->this_val) == JS_TAG_OBJECT) {
+            s->cb[0] = s->this_val;   /* borrowed: the state holds the reference */
+            *out_cb = s->cb; *out_argc = HINT_STRING;
+            return 5;
+        }
+        s->acc = JS_ToString(ctx, s->this_val);
+        if (JS_IsException(s->acc)) { s->acc = JS_UNDEFINED; return -1; }
+        s->this_done = 1;
+    }
+    while (s->k < s->argc) {
+        v = s->args[s->k];
+        if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT) {
+            s->cb[0] = v;
+            *out_cb = s->cb; *out_argc = HINT_STRING;
+            return 5;
+        }
+        { JSValue str = JS_ToString(ctx, v);
+          if (JS_IsException(str)) return -1;
+          s->acc = JS_ConcatString(ctx, s->acc, str);
+          if (JS_IsException(s->acc)) { s->acc = JS_UNDEFINED; return -1; }
+          s->k++; }
+    }
+    return 0;
+}
+
+static JSValue js_str_concat_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSStrConcat *s = st;
+    JSValue r = take_result ? s->acc : JS_UNDEFINED;
+    js_str_concat_end(ctx, s, take_result);
+    js_free(ctx, s);
     return r;
 }
 
@@ -54627,7 +54920,7 @@ static const JSCFunctionListEntry js_string_proto_funcs[] = {
     JS_CFUNC_DEF("at", 1, js_string_at ),
     JS_CFUNC_DEF("charCodeAt", 1, js_string_charCodeAt ),
     JS_CFUNC_DEF("charAt", 1, js_string_charAt ),
-    JS_CFUNC_DEF("concat", 1, js_string_concat ),
+    JS_CFUNC_STEP_DEF("concat", 1, STEPDEF_STR_CONCAT ),
     JS_CFUNC_DEF("codePointAt", 1, js_string_codePointAt ),
     JS_CFUNC_DEF("isWellFormed", 0, js_string_isWellFormed ),
     JS_CFUNC_DEF("toWellFormed", 0, js_string_toWellFormed ),
