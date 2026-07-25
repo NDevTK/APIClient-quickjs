@@ -49,10 +49,26 @@
 #include "dtoa.h"
 
 #if defined(EMSCRIPTEN) || defined(_MSC_VER)
+
 #define DIRECT_DISPATCH  0
 #else
 #define DIRECT_DISPATCH  1
 #endif
+
+/* Forced-exec fork-local assert — MIRRORS engine/host/check.h (the quickjs submodule is a separate repo and
+   cannot include the host header, exactly as extension/check.js mirrors the same law on the JS side). Same
+   semantics: DFAIL = a DEV-ONLY should-never-happen (design invariant / not-yet-built capability) — emits
+   @WHY at the origin then aborts; QJS_CHECK_FAIL = ALWAYS fatal (dev AND release) for a "must-not-proceed
+   even in production" invariant. DFAIL compiles out in release (APICLIENT_DEV=0); its condition must be
+   side-effect-free and never recoverable control flow. */
+#if defined(APICLIENT_DEV) && APICLIENT_DEV == 0
+#define DFAIL(msg)         ((void)0)
+#define DCHECK(cond, msg)  ((void)0)
+#else
+#define DFAIL(msg)         do { fprintf(stderr, "@WHY %s (%s:%d)\n", (msg), __FILE__, __LINE__); abort(); } while (0)
+#define DCHECK(cond, msg)  do { if (!(cond)) DFAIL(msg); } while (0)
+#endif
+#define QJS_CHECK_FAIL(msg) do { fprintf(stderr, "@E %s (%s:%d)\n", (msg), __FILE__, __LINE__); abort(); } while (0)
 
 #if defined(__APPLE__)
 #define MALLOC_OVERHEAD  0
@@ -581,6 +597,12 @@ struct JSContext {
     JSValue native_error_proto[JS_NATIVE_ERROR_COUNT];
     JSValue error_ctor;
     JSValue error_back_trace;
+    /* import(specifier) whose specifier is an OBJECT: 13.3.10.1 runs ToString INSIDE the promise, so an abrupt
+       completion REJECTS rather than throws. The capability is created at the opcode and rides the coercion;
+       when the coercion throws, the abandon parks it here and the interpreter's exception label — the only place
+       that can push the promise as the opcode's RESULT — rejects it once the unwind has returned to the frame
+       named in `sf`. NULL whenever no import coercion is in flight. */
+    struct JSImportCap *pending_import_cap;
     JSValue pending_close_gen;   /* a C builtin (IfAbruptCloseIterator) deferred a GENERATOR-source close to its
                                     interpreter caller: the JS_CallInternal exception label routes it onto
                                     do_generator_tramp (close_exc) so the finally runs on the tramp, never a
@@ -2973,6 +2995,7 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
     ctx->error_ctor = JS_NULL;
     ctx->error_back_trace = JS_UNDEFINED;
     ctx->pending_close_gen = JS_UNINITIALIZED;
+    ctx->pending_import_cap = NULL;
     ctx->error_prepare_stack = JS_UNDEFINED;
     ctx->error_stack_trace_limit = js_int32(10);
     init_list_head(&ctx->loaded_modules);
@@ -3178,6 +3201,7 @@ void JS_FreeContext(JSContext *ctx)
         JS_FreeValue(ctx, ctx->native_error_proto[i]);
     }
     JS_FreeValue(ctx, ctx->error_ctor);
+    DCHECK(ctx->pending_import_cap == NULL, "a parked import capability outlived its context");
     JS_FreeValue(ctx, ctx->pending_close_gen);   /* normally UNINITIALIZED (drained at the exception label); free defensively */
     JS_FreeValue(ctx, ctx->error_back_trace);
     JS_FreeValue(ctx, ctx->error_prepare_stack);
@@ -6217,21 +6241,6 @@ static __maybe_unused void JS_DumpShapes(JSRuntime *rt)
     }
     printf("}\n");
 }
-
-/* Forced-exec fork-local assert — MIRRORS engine/host/check.h (the quickjs submodule is a separate repo and
-   cannot include the host header, exactly as extension/check.js mirrors the same law on the JS side). Same
-   semantics: DFAIL = a DEV-ONLY should-never-happen (design invariant / not-yet-built capability) — emits
-   @WHY at the origin then aborts; QJS_CHECK_FAIL = ALWAYS fatal (dev AND release) for a "must-not-proceed
-   even in production" invariant. DFAIL compiles out in release (APICLIENT_DEV=0); its condition must be
-   side-effect-free and never recoverable control flow. */
-#if defined(APICLIENT_DEV) && APICLIENT_DEV == 0
-#define DFAIL(msg)         ((void)0)
-#define DCHECK(cond, msg)  ((void)0)
-#else
-#define DFAIL(msg)         do { fprintf(stderr, "@WHY %s (%s:%d)\n", (msg), __FILE__, __LINE__); abort(); } while (0)
-#define DCHECK(cond, msg)  do { if (!(cond)) DFAIL(msg); } while (0)
-#endif
-#define QJS_CHECK_FAIL(msg) do { fprintf(stderr, "@E %s (%s:%d)\n", (msg), __FILE__, __LINE__); abort(); } while (0)
 
 /* 'props[]' is used to initialized the object properties. The number
    of elements depends on the shape. */
@@ -18082,6 +18091,15 @@ static const JSTrampStepDef *tramp_step_def_of(JSValueConst func);
                                   coercion is a tag test, so re-running it is free and the remaining operands are
                                   coerced in spec order by the same retry. */
 #define CONT_STEP          17  /* cont_state = a step builtin's state; ONE continuation kind for ALL of them. */
+#define CONT_IMPORT        18  /* ToPrimitive outer = JSImportCap: the specifier coercion of `import(obj)`. Its
+                                  abrupt completion is a REJECTION of the capability created before it, not a
+                                  throw — the one continuation whose failure path is a value, not an unwind. */
+typedef struct JSImportCap {
+    JSValue promise;
+    JSValue funcs[2];      /* [resolve, reject] */
+    const uint8_t *next_pc;/* where the opcode continues once the promise is its result */
+    JSStackFrame *sf;      /* the frame that issued OP_import: the unwind acts only when it gets back here */
+} JSImportCap;
 /* EVERY step state begins with this header. The driver keeps NOTHING in a C local: a flow suspends and resumes
    through async_func_resume, which re-enters JS_CallInternal with all locals reset — so the step definition and
    the original operand shape must ride the state, exactly as every other continuation's orig_c* fields do. */
@@ -19061,12 +19079,29 @@ static void js_toprim_free(JSContext *ctx, struct JSToPrim *tp)
 
 /* 7.1.1 propagates an abrupt completion — there is no next-method fallback — so the sequence dies, and with it
    the machine that asked for the primitive and whoever was waiting on that. */
+static void js_import_cap_free(JSContext *ctx, JSImportCap *ic)
+{
+    JS_FreeValue(ctx, ic->promise);
+    JS_FreeValue(ctx, ic->funcs[0]);
+    JS_FreeValue(ctx, ic->funcs[1]);
+    js_free(ctx, ic);
+}
+
 static void js_toprim_abandon(JSContext *ctx, struct JSToPrim *tp)
 {
     void *touter = tp->outer;
-    DCHECK(!touter || tp->outer_kind == CONT_STEP,
-           "ToPrimitive outer continuation: unknown machine kind");
+    uint8_t tk = tp->outer_kind;
     js_toprim_free(ctx, tp);
+    if (touter && tk == CONT_IMPORT) {
+        /* the specifier's coercion threw. There is nothing to unwind INTO: the capability it was created for is
+           the opcode's result, and rejecting it is what the spec does with this abrupt completion. Park it for
+           the exception label, which is where the frame and the operand stack are the opcode's again. */
+        DCHECK(ctx->pending_import_cap == NULL, "pending_import_cap already set — nested import coercion");
+        ctx->pending_import_cap = touter;
+        return;
+    }
+    DCHECK(!touter || tk == CONT_STEP,
+           "ToPrimitive outer continuation: unknown machine kind");
     tramp_step_chain_free(ctx, touter);
 }
 
@@ -22394,6 +22429,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     int slot = tp->slot;
                     void *touter = tp->outer; uint8_t touter_kind = tp->outer_kind;
                     js_toprim_free(ctx, tp);
+                    if (touter && touter_kind == CONT_IMPORT) {
+                        /* the specifier coerced without throwing, so the capability created for the abrupt case
+                           is never observed — drop it and let the re-executed opcode make its own. Creating one
+                           runs none of the page's code (the intrinsic Promise), which is what makes that sound. */
+                        js_import_cap_free(ctx, (JSImportCap *)touter);
+                        touter = NULL;
+                    }
                     if (touter) {
                         /* MACHINE mode: a coercing BUILTIN asked for this primitive; it comes back as that step's
                            result, exactly as a callback's would. */
@@ -24541,6 +24583,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 JSValue val;
                 sf->cur_pc = pc;
+                if (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT) {
+                    /* 13.3.10.1 step 6 ToString(specifier) is the page's code AND is performed inside the
+                       returned promise, so it must both run on the tramp and REJECT rather than throw. Create the
+                       capability first — the intrinsic Promise runs nothing — and hand it to the coercion. */
+                    JSImportCap *ic = js_mallocz(ctx, sizeof(*ic));
+                    if (unlikely(!ic)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                    ic->promise = JS_NewPromiseCapability(ctx, ic->funcs);
+                    if (unlikely(JS_IsException(ic->promise))) { js_free(ctx, ic); goto exception; }
+                    ic->next_pc = pc; ic->sf = sf;
+                    tp_outer = ic; tp_outer_kind = CONT_IMPORT; tp_value = sp[-2];
+                    tp_slot = -2; tp_hint = HINT_STRING; tp_retry_pc = pc - 1;
+                    goto do_toprim_tramp;
+                }
                 val = js_dynamic_import(ctx, sp[-2], sp[-1]);
                 if (JS_IsException(val))
                     goto exception;
@@ -25905,7 +25960,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                 }
                 sf->cur_pc = pc;
-                if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) { tp_slot = -1; tp_retry_pc = pc - 1; goto key_toprim; }
+                /* 6.2.5.5 GetValue step 3.a ToObject(base) precedes step 3.c ToPropertyKey, so a NULLISH base
+                   throws its TypeError before the key is coerced at all. */
+                if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT
+                    && !JS_IsUndefined(sp[-2]) && !JS_IsNull(sp[-2])) { tp_slot = -1; tp_retry_pc = pc - 1; goto key_toprim; }
                 if (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT) {
                     JSAtom katom = JS_ValueToAtom(ctx, sp[-1]);   /* ToPropertyKey (may throw) */
                     if (unlikely(katom == JS_ATOM_NULL))
@@ -25949,7 +26007,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                 }
                 sf->cur_pc = pc;
-                if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) { tp_slot = -1; tp_retry_pc = pc - 1; goto key_toprim; }
+                /* 6.2.5.5 GetValue step 3.a ToObject(base) precedes step 3.c ToPropertyKey, so a NULLISH base
+                   throws its TypeError before the key is coerced at all. */
+                if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT
+                    && !JS_IsUndefined(sp[-2]) && !JS_IsNull(sp[-2])) { tp_slot = -1; tp_retry_pc = pc - 1; goto key_toprim; }
                 val = JS_GetPropertyValue(ctx, sp[-2], sp[-1]);
                 sp[-1] = val;
                 if (unlikely(JS_IsException(val)))
@@ -26043,7 +26104,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                 }
                 sf->cur_pc = pc;
-                if (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT) { tp_slot = -2; tp_retry_pc = pc - 1; goto key_toprim; }
+                /* 6.2.5.5 PutValue step 5.a ToObject(base) precedes step 3.c ToPropertyKey, so a NULLISH base
+                   throws its TypeError before the key is coerced at all. */
+                if (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT
+                    && !JS_IsUndefined(sp[-3]) && !JS_IsNull(sp[-3])) { tp_slot = -2; tp_retry_pc = pc - 1; goto key_toprim; }
                 /* A computed key that resolves to a bytecode setter -> route as a 1-arg method call so the
                    setter body preempts. */
                 if (JS_VALUE_GET_TAG(sp[-3]) == JS_TAG_OBJECT) {
@@ -27048,6 +27112,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         }
     }
  exception:
+    if (unlikely(ctx->pending_import_cap != NULL && ctx->pending_import_cap->sf == sf)) {
+        /* the unwind is back in the frame that issued OP_import, so its operands and its continuation pc are
+           ours again: the throw becomes the capability's rejection and the promise becomes the opcode's result.
+           The `sf` test is what keeps a try/catch INSIDE the coercion method catching first, and a try/catch
+           around the import() itself from catching at all — which is the whole point of the rejection. */
+        JSImportCap *ic = ctx->pending_import_cap;
+        JSValue exc = JS_GetException(ctx), rr;
+        ctx->pending_import_cap = NULL;
+        rr = JS_Call(ctx, ic->funcs[1], JS_UNDEFINED, 1, vc(&exc));
+        JS_FreeValue(ctx, exc);
+        JS_FreeValue(ctx, rr);
+        JS_FreeValue(ctx, sp[-1]);
+        JS_FreeValue(ctx, sp[-2]);
+        sp -= 2;
+        *sp++ = ic->promise; ic->promise = JS_UNDEFINED;
+        pc = ic->next_pc;
+        js_import_cap_free(ctx, ic);
+        goto restart;
+    }
     if (unlikely(!JS_IsUninitialized(ctx->pending_close_gen))) {
         /* A C builtin (IfAbruptCloseIterator) deferred a generator-source close: route it onto do_generator_tramp
            (close_exc) so the finally runs on the tramp; the in-flight exception is saved+restored across the close. */
