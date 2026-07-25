@@ -18424,6 +18424,16 @@ static JSValue js_promise_new(JSContext *ctx, JSValueConst new_target, JSValue *
                                   shared acquire (so a generator-function @@iterator is created ON THE TRAMP) and the
                                   resulting iterator IS the call's result; the deliver just yields it. */
 typedef struct JSIterFrom { int orig_cfirst, orig_cargc; uint8_t orig_is_tail; } JSIterFrom;
+#define CONT_CONSUME_GETITER 19 /* cont_state = JSConsumeGetIter: GetIterator step 4's Call(method, obj) when the
+                                   @@iterator method is a NORMAL bytecode function. Its body runs on THIS chain, so a
+                                   loop in a hand-written `[Symbol.iterator]()` preempts like any other function —
+                                   JS_GetIterator2 used to call it from C, which was ONE drive-to-completion shared by
+                                   every consumer (Array.from / new Set|Map / Object.fromEntries / spread /
+                                   Promise.all / TypedArray.from / Iterator.from). do_return applies GetIterator's
+                                   "the result must be an Object" check and hands it to the shared deliver, so all
+                                   three acquire shapes (inline C-function call, generator create, bytecode call)
+                                   arrive at the consumer identically. */
+typedef struct JSConsumeGetIter { void *consumer; uint8_t consumer_kind; } JSConsumeGetIter;
 
 
 static JSValue js_iterator_from(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
@@ -18964,26 +18974,6 @@ static bool tramp_resolve_proxy_callee(JSContext *ctx, JSValueConst func, JSValu
     *out = js_dup(cur);
     return true;
 }
-/* f.apply(this,arr) / Reflect.apply(f,this,arr) where f is a GENERATOR FUNCTION: build the arg list here (the
-   array can be arbitrarily long, so it never touches the caller stack) and hand it to the create in apply mode.
-   Returns 1 armed, 0 not our shape, -1 pending exception. */
-static int tramp_arm_gen_apply(JSContext *ctx, JSValueConst func, JSValueConst thisArg, JSValueConst arrayArg,
-                               JSValue **out_argv, uint32_t *out_argc)
-{
-    JSValue *atab = NULL;
-    uint32_t alen = 0;
-    (void)thisArg;
-    if (!tramp_can_call_gen_create(func)) return 0;
-    if (JS_VALUE_GET_TAG(arrayArg) != JS_TAG_UNDEFINED && JS_VALUE_GET_TAG(arrayArg) != JS_TAG_NULL) {
-        atab = build_arg_list(ctx, &alen, arrayArg);   /* reads the array (may throw) */
-        if (!atab) return -1;
-    } else {
-        atab = js_malloc(ctx, sizeof(JSValue));        /* never NULL: NULL is the "not armed" sentinel */
-        if (!atab) return -1;
-    }
-    *out_argv = atab; *out_argc = alen;
-    return 1;
-}
 static inline bool tramp_is_call_function(JSValueConst method) {
     JSObject *mp;
     if (JS_VALUE_GET_TAG(method) != JS_TAG_OBJECT) return false;
@@ -19077,6 +19067,33 @@ static inline bool tramp_can_call_agen_create(JSValueConst func) {
     fp = JS_VALUE_GET_OBJ(func);
     return fp->class_id == JS_CLASS_ASYNC_GENERATOR_FUNCTION;
 }
+
+/* THE body-entry question, asked in exactly ONE place. A callee that HAS a bytecode body has exactly four ways in
+   (plain frame / async frame / generator create / async-generator create); which one is a property of the CALLEE,
+   never of the call spelling. It was written out per call shape instead, and the copies drifted: OP_call and
+   OP_call_method asked all four, do_forward_dispatch asked three — so `ag()` created its coroutine on the tramp
+   while `method.call(obj)` on the SAME async generator fell through to js_async_generator_function_call and drove
+   the body to completion (Array.fromAsync's `method.call(items)`, which is why built-ins/Array and the whole
+   language/ tree aborted). That is the per-spelling drift CLAUDE.md bans, and a fifth body kind would have had to
+   be added to N sites correctly. Now a site declares only its OPERAND SHAPE and tail-ness; the list lives here. */
+typedef enum { TBE_NONE = 0, TBE_PLAIN, TBE_ASYNC, TBE_GEN, TBE_AGEN } JSTrampBodyEntry;
+static inline JSTrampBodyEntry tramp_body_entry(JSValueConst func) {
+    if (tramp_can_call(func))             return TBE_PLAIN;
+    if (tramp_can_call_async(func))       return TBE_ASYNC;
+    if (tramp_can_call_gen_create(func))  return TBE_GEN;
+    if (tramp_can_call_agen_create(func)) return TBE_AGEN;
+    return TBE_NONE;   /* no bytecode body: the caller's own shape decides what to try next */
+}
+/* Expanded at each operand shape; `first` is tramp_first (-1 plain [f,args] / -2 method [this,f,args]). Falls
+   THROUGH (no jump) only for TBE_NONE, which is the caller's "this callee has no body" continuation. */
+#define TRAMP_BODY_DISPATCH(first, tail)                                                              \
+    switch (tramp_body_entry(call_argv[-1])) {                                                        \
+    case TBE_NONE:  break;                                                                            \
+    case TBE_PLAIN: tramp_first = (first); tramp_is_tail = (tail); goto do_tramp_call;                 \
+    case TBE_ASYNC: tramp_first = (first); tramp_is_tail = (tail); goto do_async_tramp_call;           \
+    case TBE_GEN:   tramp_first = (first); tramp_is_tail = (tail); goto do_generator_create_tramp;     \
+    case TBE_AGEN:  tramp_first = (first); tramp_is_tail = (tail); goto do_agen_create_tramp;          \
+    }
 struct JSAsyncGeneratorData;
 static void js_async_generator_free(JSRuntime *rt, struct JSAsyncGeneratorData *s);
 /* A generator .next()/.throw()/.return() runs its body on the caller's tramp chain (do_generator_tramp) so a
@@ -19302,13 +19319,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     int smc_magic = 0;                                  /* new Set(gen)/new Map(gen) recognition: 0 = Map, MAGIC_SET = Set (read at OP_call_constructor, consumed by do_setmap_consume_tramp) */
     int ta_classid = 0;                                 /* new TypedArray(gen) recognition: the TA class (read at OP_call_constructor, consumed by do_ta_consume_tramp) */
     uint8_t setop_kind = 0;                             /* s.union/symmetricDifference recognition: SETOP_* (consumed by do_setop_consume_tramp) */
-    /* APPLY-mode generator create: f.apply(this,arr)/Reflect.apply(f,this,arr) where f is a GENERATOR FUNCTION. The
-       args come from the array into the generator's OWN frame (never the caller stack, which the array length could
-       overflow), so do_generator_create_tramp takes them explicitly instead of from call_argv. */
-    JSValueConst gc_apply_func = JS_UNDEFINED;
-    JSValueConst gc_apply_this = JS_UNDEFINED;
-    JSValue *gc_apply_argv = NULL;
-    uint32_t gc_apply_argc = 0;
+    /* APPLY-mode body entry: f.apply(this,arr) / Reflect.apply(f,this,arr) / f(...spread). The args come from the
+       ARRAY into the callee's OWN frame (never the caller stack, whose compiled size the array length could
+       overflow), so the body-entry labels take them from here instead of from call_argv. Shared by ALL THREE
+       coroutine entries (do_async_tramp_call / do_generator_create_tramp / do_agen_create_tramp): it was
+       generator-only (`gc_apply_*`), which is why `agen(...spread)` and `asyncFn.apply(o,a)` had no route and fell
+       to js_call_*_function's drive-to-completion. NULL argv = not in apply mode. */
+    JSValueConst tramp_apply_func = JS_UNDEFINED;
+    JSValueConst tramp_apply_this = JS_UNDEFINED;
+    JSValue *tramp_apply_argv = NULL;
+    uint32_t tramp_apply_argc = 0;
+    /* Drop the vector + LEAVE apply mode. Every body entry calls this the moment async_func_init returns (which
+       dups func/this/args), success or failure — a later release leaks the whole argument list on a throwing
+       create, and a missed reset would silently feed this call's args to the NEXT create. */
+    #define TRAMP_APPLY_RELEASE() do {                                                   \
+        for (uint32_t ar_ = 0; ar_ < tramp_apply_argc; ar_++) JS_FreeValue(ctx, tramp_apply_argv[ar_]); \
+        js_free(ctx, tramp_apply_argv);                                                  \
+        tramp_apply_argv = NULL; tramp_apply_argc = 0;                                   \
+        tramp_apply_func = JS_UNDEFINED; tramp_apply_this = JS_UNDEFINED;                \
+    } while (0)
     uint8_t iterterm_kind = 0;                          /* Iterator.prototype terminal recognition: ITERTERM_* (consumed by do_iterterm_tramp) */
     int ta_from = 0;                                    /* 1 = TypedArray.from(gen) (OP_call_method): new_target is this_val at call_argv[-2], not call_argv[-1] */
     int pa_magic = 0;                                   /* Promise.all/allSettled(gen) recognition: the PROMISE_MAGIC (read at OP_call_method, consumed by do_promise_all_consume_tramp) */
@@ -19865,19 +19894,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             has_call_argc:
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
-                if (tramp_can_call(call_argv[-1])) {   /* NORMAL bytecode fn -> heap frame, no C recursion */
-                    tramp_first = -1; tramp_is_tail = (opcode == OP_tail_call);
-                    goto do_tramp_call;
-                }
-                if (tramp_can_call_async(call_argv[-1])) {   /* ASYNC fn -> body runs on THIS chain (base gen_state) */
-                    tramp_first = -1; tramp_is_tail = (opcode == OP_tail_call); goto do_async_tramp_call;
-                }
-                if (tramp_can_call_gen_create(call_argv[-1])) {   /* generator fn g() -> params-to-initial_yield on THIS chain */
-                    tramp_first = -1; tramp_is_tail = (opcode == OP_tail_call); goto do_generator_create_tramp;
-                }
-                if (tramp_can_call_agen_create(call_argv[-1])) {   /* async generator ag() -> params-to-initial_yield here */
-                    tramp_first = -1; tramp_is_tail = (opcode == OP_tail_call); goto do_agen_create_tramp;
-                }
+                TRAMP_BODY_DISPATCH(-1, opcode == OP_tail_call);   /* f() with a bytecode body -> that body on THIS chain */
                 if (tramp_can_call_bound(call_argv[-1])) {   /* f.bind(...)(...) -> assemble bound+call args, dispatch target */
                     tramp_is_tail = (opcode == OP_tail_call); goto do_bound_tramp;
                 }
@@ -19978,19 +19995,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc += 2;
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
-                if (tramp_can_call(call_argv[-1])) {   /* NORMAL bytecode method -> heap frame (this = call_argv[-2]) */
-                    tramp_first = -2; tramp_is_tail = (opcode == OP_tail_call_method);
-                    goto do_tramp_call;
-                }
-                if (tramp_can_call_async(call_argv[-1])) {   /* ASYNC method -> body runs on THIS chain (this=call_argv[-2]) */
-                    tramp_first = -2; tramp_is_tail = (opcode == OP_tail_call_method); goto do_async_tramp_call;
-                }
-                if (tramp_can_call_gen_create(call_argv[-1])) {   /* generator method -> params-to-initial_yield on THIS chain */
-                    tramp_first = -2; tramp_is_tail = (opcode == OP_tail_call_method); goto do_generator_create_tramp;
-                }
-                if (tramp_can_call_agen_create(call_argv[-1])) {   /* async generator method -> params here */
-                    tramp_first = -2; tramp_is_tail = (opcode == OP_tail_call_method); goto do_agen_create_tramp;
-                }
+                TRAMP_BODY_DISPATCH(-2, opcode == OP_tail_call_method);   /* o.m() with a bytecode body -> that body here */
                 /* the iterable-consuming builtins (Array.from / Object.fromEntries / Iterator.from / it.* / s.union /
                    TypedArray.from / Promise.all|allSettled|any|race) are recognized in ONE place, do_consumer_dispatch,
                    which this opcode's convergence (goto do_generic_callee below) passes through — see that label. */
@@ -20018,24 +20023,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_is_function_call(call_argv[-1])) {   /* f.call(thisArg,...) -> resolve + dispatch f here */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_forward_call;
                 }
-                if (tramp_is_function_apply(call_argv[-1]) && tramp_can_call_gen_create(call_argv[-2])) {
-                    /* g.apply(this, arr) with g a GENERATOR FUNCTION: create on the tramp with the arg list. */
-                    JSValueConst aa2 = (call_argc >= 2) ? call_argv[1] : JS_UNDEFINED;
-                    int atag2 = JS_VALUE_GET_TAG(aa2);
-                    if (atag2 == JS_TAG_UNDEFINED || atag2 == JS_TAG_NULL || atag2 == JS_TAG_OBJECT) {
-                        int ga = tramp_arm_gen_apply(ctx, call_argv[-2],
-                                                     (call_argc >= 1) ? call_argv[0] : JS_UNDEFINED, aa2,
-                                                     &gc_apply_argv, &gc_apply_argc);
-                        if (unlikely(ga < 0)) goto exception;
-                        if (ga > 0) {
-                            gc_apply_func = call_argv[-2];
-                            gc_apply_this = (call_argc >= 1) ? call_argv[0] : JS_UNDEFINED;
-                            tramp_first = -2; tramp_is_tail = (opcode == OP_tail_call_method);
-                            goto do_generator_create_tramp;
-                        }
-                    }
-                }
-                if (tramp_is_function_apply(call_argv[-1])) {   /* target kind is NOT a call-site question */   /* f.apply(this,arr), f NORMAL */
+                if (tramp_is_function_apply(call_argv[-1])) {   /* target kind is NOT a call-site question */
                     /* only when arr is undefined/null (0 args) or an object (array-like); a primitive arr must
                        throw a realm-correct TypeError from the C js_function_apply BEFORE the target runs. */
                     JSValueConst aa = (call_argc >= 2) ? call_argv[1] : JS_UNDEFINED;
@@ -20076,19 +20064,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     ((JSValue *)call_argv)[0] = rtgt2;
                 }
                 if (tramp_is_reflect_apply(call_argv[-1]) && call_argc >= 3
-                    && JS_VALUE_GET_TAG(call_argv[2]) == JS_TAG_OBJECT
-                    && tramp_can_call_gen_create(call_argv[0])) {   /* Reflect.apply(generatorFn, this, argsList) */
-                    int ga = tramp_arm_gen_apply(ctx, call_argv[0], call_argv[1], call_argv[2],
-                                                 &gc_apply_argv, &gc_apply_argc);
-                    if (unlikely(ga < 0)) goto exception;
-                    if (ga > 0) {
-                        gc_apply_func = call_argv[0]; gc_apply_this = call_argv[1];
-                        tramp_first = -2; tramp_is_tail = (opcode == OP_tail_call_method);
-                        goto do_generator_create_tramp;
-                    }
-                }
-                if (tramp_is_reflect_apply(call_argv[-1]) && call_argc >= 3 && (tramp_can_call(call_argv[0]) || tramp_step_def_of(call_argv[0]))
                     && JS_VALUE_GET_TAG(call_argv[2]) == JS_TAG_OBJECT) {   /* Reflect.apply(target, this, argsList) */
+                    /* No target-kind gate: the reshape path handles every kind (four bytecode bodies, a step
+                       builtin, and a plain C/bound/proxy target it calls in place), so asking what the target IS
+                       here is exactly the question CLAUDE.md says disappears once that path is complete. */
                     ap_func = call_argv[0]; ap_this = call_argv[1]; ap_array = call_argv[2];
                     ap_cfirst = -2; ap_cargc = call_argc;   /* operands [Reflect, apply, target, this, argsList] */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_apply_tramp;
@@ -20601,9 +20580,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         call_argc = 3; tramp_first = -2;
                     }
                 }
-                if (tramp_can_call(call_argv[-1])) goto do_tramp_call;
-                if (tramp_can_call_async(call_argv[-1])) goto do_async_tramp_call;
-                if (tramp_can_call_gen_create(call_argv[-1])) goto do_generator_create_tramp;
+                TRAMP_BODY_DISPATCH(-2, tramp_is_tail);   /* the reshape already produced the method shape */
                 /* The forwarded shape is identical to the direct one, so it must ask the SAME questions. The
                    consumer recognizers used to be copied here and fell behind the OP_call_method list by five
                    (promise_all, promise_race, ta_from, ...), which is why replace.call(123,"2",fn) and
@@ -20633,7 +20610,32 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValueConst thisArg = ap_this;
                 JSValueConst arrayArg = ap_array;
                 JSObject *np;
-                if (!tramp_can_call(nfunc) && !tramp_step_def_of(nfunc)) {
+                JSTrampBodyEntry ap_tbe = tramp_body_entry(nfunc);
+                if (ap_tbe != TBE_NONE && ap_tbe != TBE_PLAIN) {
+                    /* A COROUTINE target reached through an apply-shaped call. Asking only `tramp_can_call` here
+                       sent `gen(...spread)`, `agen.apply(o,a)` and `Reflect.apply(asyncFn,…)` to the JS_Call
+                       below, i.e. js_call_generator_function / js_async_generator_function_call /
+                       js_call_async_function — the drive-to-completion. The three coroutine entries all read the
+                       apply-mode vector, so the ONLY thing this shape has to do is fill it and restate its
+                       operands in the method shape those entries clean up ([f, thisArg, array] at
+                       call_argv[-2..0], which is exactly ap_cfirst/-2 + ap_cargc). */
+                    uint32_t alen4 = 0; JSValue *atab4;
+                    if (JS_VALUE_GET_TAG(arrayArg) != JS_TAG_UNDEFINED && JS_VALUE_GET_TAG(arrayArg) != JS_TAG_NULL) {
+                        atab4 = build_arg_list(ctx, &alen4, arrayArg);   /* reads the array (may throw) */
+                        if (unlikely(!atab4)) goto exception;
+                    } else {
+                        atab4 = js_malloc(ctx, sizeof(JSValue));   /* never NULL: NULL is the not-in-apply-mode sentinel */
+                        if (unlikely(!atab4)) goto exception;
+                    }
+                    tramp_apply_argv = atab4; tramp_apply_argc = alen4;
+                    tramp_apply_func = nfunc; tramp_apply_this = thisArg;
+                    call_argv = (JSValueConst *)sp - ap_cargc; call_argc = ap_cargc; tramp_first = ap_cfirst;
+                    if (ap_tbe == TBE_ASYNC) goto do_async_tramp_call;
+                    if (ap_tbe == TBE_GEN)   goto do_generator_create_tramp;
+                    DCHECK(ap_tbe == TBE_AGEN, "apply-mode body entry: unhandled coroutine kind");
+                    goto do_agen_create_tramp;
+                }
+                if (ap_tbe == TBE_NONE && !tramp_step_def_of(nfunc)) {
                     /* a PLAIN C / bound / proxy target. It holds no continuation and has no preemptible body, so
                        invoking it here is complete — and handling it HERE is what lets the three call-site gates
                        drop their `(tramp_can_call(t) || tramp_step_def_of(t))` half. .apply is call-site-resolved
@@ -21320,6 +21322,33 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     tramp_gen_create_cont_it = tramp_consume_state; tramp_gen_create_cont_kind = tramp_consume_kind;
                     goto do_generator_create_tramp;   /* settle -> do_consume_deliver_iterator */
                 }
+                if (tramp_can_call(method)) {
+                    /* A NORMAL bytecode @@iterator (`[Symbol.iterator]() { … }`, an arrow, a class method): GetIterator
+                       step 4's Call runs its BODY on this chain, so a loop in it preempts. The three arms here are not
+                       a fallback selector — they are the three ways a callee's body can be entered, and the C arm below
+                       is the one with no body to suspend. */
+                    JSConsumeGetIter *gi = js_mallocz(ctx, sizeof(*gi));
+                    if (unlikely(!gi)) {
+                        JS_FreeValue(ctx, method);
+                        tramp_consume_acquired = JS_EXCEPTION;
+                        goto do_consume_deliver_iterator;
+                    }
+                    gi->consumer = tramp_consume_state; gi->consumer_kind = tramp_consume_kind;
+                    /* Hand the consumer to the frame's continuation BEFORE the call: the method's own body may
+                       consume an iterable itself (`[Symbol.iterator]() { return Array.from(x)[Symbol.iterator]() }`),
+                       which would otherwise overwrite these interpreter-locals mid-acquire. */
+                    tramp_consume_state = NULL; tramp_consume_kind = CONT_NONE;
+                    tramp_consume_iterable = JS_UNDEFINED;   /* borrowed operand — never outlive the call */
+                    DCHECK(sp + 2 <= TRAMP_SP_LIMIT(sf),
+                           "consume acquire: getiter operand push exceeds the frame's compiled stack_size");
+                    *sp++ = js_dup(iterable);   /* this */
+                    *sp++ = method;             /* the @@iterator method (owned, transferred) */
+                    call_argv = sp; call_argc = 0; tramp_first = -2; tramp_is_tail = 0;
+                    tramp_cont_state = gi; tramp_cont_kind = CONT_CONSUME_GETITER;
+                    goto do_tramp_call;   /* settle -> do_consume_deliver_iterator */
+                }
+                /* A C-function @@iterator (Array.prototype.values, %ArrayIteratorPrototype%, a bound function …):
+                   no bytecode body exists to suspend, so the call is made in place. */
                 tramp_consume_acquired = JS_GetIterator2(ctx, iterable, method);
                 JS_FreeValue(ctx, method);
                 goto do_consume_deliver_iterator;
@@ -22030,7 +22059,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                completion. At OP_await / return / exception (do_async_settle) the body settles its promise, this
                frame pops, and the promise becomes the caller's synchronous result. */
             {
-                JSValueConst afunc = call_argv[-1];
+                bool aapply = (tramp_apply_argv != NULL);
+                JSValueConst afunc = aapply ? tramp_apply_func : call_argv[-1];
                 JSAsyncFunctionData *as;
                 JSValue aprom;
                 TrampFrame *atf;
@@ -22046,9 +22076,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 as->resolving_funcs[1] = JS_UNDEFINED;
                 aprom = JS_NewPromiseCapability(ctx, as->resolving_funcs);
                 if (unlikely(JS_IsException(aprom))) { js_async_function_free(rt, as); goto exception; }
-                if (async_func_init(ctx, &as->func_state, afunc,
-                                    (tramp_first == -2) ? call_argv[-2] : JS_UNDEFINED, call_argc, vc(call_argv))) {
-                    JS_FreeValue(ctx, aprom); js_async_function_free(rt, as); goto exception;
+                {
+                    int ainit = async_func_init(ctx, &as->func_state, afunc,
+                                                aapply ? tramp_apply_this : ((tramp_first == -2) ? call_argv[-2] : JS_UNDEFINED),
+                                                aapply ? (int)tramp_apply_argc : call_argc,
+                                                aapply ? vc(tramp_apply_argv) : vc(call_argv));
+                    if (aapply) TRAMP_APPLY_RELEASE();
+                    if (ainit) { JS_FreeValue(ctx, aprom); js_async_function_free(rt, as); goto exception; }
                 }
                 as->is_active = true;
                 atf = js_malloc_rt(rt, sizeof(TrampFrame));
@@ -22430,16 +22464,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                the base flow), then create the async-generator object at do_agen_create_settle. Mirrors
                js_async_generator_function_call. */
             {
-                JSValueConst afn = call_argv[-1];
+                bool agapply = (tramp_apply_argv != NULL);
+                JSValueConst afn = agapply ? tramp_apply_func : call_argv[-1];
                 struct JSAsyncGeneratorData *s = js_mallocz(ctx, sizeof(JSAsyncGeneratorData));
                 TrampFrame *atf2; JSStackFrame *asf2; JSObject *afp; JSFunctionBytecode *ab2;
                 if (unlikely(!s)) { JS_ThrowOutOfMemory(ctx); goto exception; }
                 ((JSAsyncGeneratorData *)s)->state = JS_ASYNC_GENERATOR_STATE_SUSPENDED_START;
                 init_list_head(&((JSAsyncGeneratorData *)s)->queue);
-                if (async_func_init(ctx, &((JSAsyncGeneratorData *)s)->func_state, afn,
-                                    (tramp_first == -2) ? call_argv[-2] : JS_UNDEFINED, call_argc, vc(call_argv))) {
-                    ((JSAsyncGeneratorData *)s)->state = JS_ASYNC_GENERATOR_STATE_COMPLETED;
-                    js_async_generator_free(rt, s); goto exception;
+                {
+                    int aginit = async_func_init(ctx, &((JSAsyncGeneratorData *)s)->func_state, afn,
+                                                 agapply ? tramp_apply_this : ((tramp_first == -2) ? call_argv[-2] : JS_UNDEFINED),
+                                                 agapply ? (int)tramp_apply_argc : call_argc,
+                                                 agapply ? vc(tramp_apply_argv) : vc(call_argv));
+                    if (agapply) TRAMP_APPLY_RELEASE();
+                    if (aginit) {
+                        ((JSAsyncGeneratorData *)s)->state = JS_ASYNC_GENERATOR_STATE_COMPLETED;
+                        js_async_generator_free(rt, s); goto exception;
+                    }
                 }
                 atf2 = js_malloc_rt(rt, sizeof(TrampFrame));
                 if (unlikely(!atf2)) { js_async_generator_free(rt, s); JS_ThrowOutOfMemory(ctx); goto exception; }
@@ -22515,8 +22556,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 void *gcreate_cont = tramp_gen_create_cont_it; tramp_gen_create_cont_it = NULL;   /* driver create? (settle re-enters its step) */
                 uint8_t gcreate_cont_kind = tramp_gen_create_cont_kind; tramp_gen_create_cont_kind = 0;
-                bool gapply = (gc_apply_argv != NULL);
-                JSValueConst gfunc = gapply ? gc_apply_func : call_argv[-1];
+                bool gapply = (tramp_apply_argv != NULL);
+                JSValueConst gfunc = gapply ? tramp_apply_func : call_argv[-1];
                 JSGeneratorData *s = js_mallocz(ctx, sizeof(*s));
                 TrampFrame *gtf; JSStackFrame *gsf; JSObject *gfp; JSFunctionBytecode *gb;
                 /* A create failure BEFORE the frame is pushed can't reach the gen-frame exception unwind (which frees a
@@ -22529,23 +22570,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         js_promise_all_end(ctx, (JSPromiseAll *)gcreate_cont); js_free_rt(rt, gcreate_cont); } } while (0)
                 if (unlikely(!s)) { GEN_CREATE_FAIL_FREE_CONT(); JS_ThrowOutOfMemory(ctx); goto exception; }
                 s->state = JS_GENERATOR_STATE_SUSPENDED_START;
-                if (async_func_init(ctx, &s->func_state, gfunc,
-                                    gapply ? gc_apply_this : ((tramp_first == -2) ? call_argv[-2] : JS_UNDEFINED),
-                                    gapply ? (int)gc_apply_argc : call_argc,
-                                    gapply ? vc(gc_apply_argv) : vc(call_argv))) {
-                    s->state = JS_GENERATOR_STATE_COMPLETED;
-                    free_generator_stack_rt(rt, s); js_free_rt(rt, s); GEN_CREATE_FAIL_FREE_CONT(); goto exception;
+                {   /* async_func_init DUPS func + this + args, so the apply vector is dead the instant it returns —
+                       release it here, on the failure path too. Releasing it only after the frame alloc succeeded
+                       leaked the whole argument list on every throwing/OOM create. */
+                    int ginit = async_func_init(ctx, &s->func_state, gfunc,
+                                                gapply ? tramp_apply_this : ((tramp_first == -2) ? call_argv[-2] : JS_UNDEFINED),
+                                                gapply ? (int)tramp_apply_argc : call_argc,
+                                                gapply ? vc(tramp_apply_argv) : vc(call_argv));
+                    if (gapply) TRAMP_APPLY_RELEASE();
+                    if (ginit) {
+                        s->state = JS_GENERATOR_STATE_COMPLETED;
+                        free_generator_stack_rt(rt, s); js_free_rt(rt, s); GEN_CREATE_FAIL_FREE_CONT(); goto exception;
+                    }
                 }
                 gtf = js_malloc_rt(rt, sizeof(TrampFrame));
                 if (unlikely(!gtf)) { free_generator_stack_rt(rt, s); js_free_rt(rt, s); GEN_CREATE_FAIL_FREE_CONT(); JS_ThrowOutOfMemory(ctx); goto exception; }
                 #undef GEN_CREATE_FAIL_FREE_CONT
                 gtf->async_promise = js_dup(gfunc);   /* held for js_create_from_ctor at initial_yield */
-                if (gapply) {   /* the arg list was dup'd into the generator frame; drop our copy + leave apply mode */
-                    for (i = 0; i < (int)gc_apply_argc; i++) JS_FreeValue(ctx, gc_apply_argv[i]);
-                    js_free(ctx, gc_apply_argv);
-                    gc_apply_argv = NULL; gc_apply_argc = 0;
-                    gc_apply_func = JS_UNDEFINED; gc_apply_this = JS_UNDEFINED;
-                }
                 for (i = tramp_first; i < call_argc; i++) JS_FreeValue(ctx, call_argv[i]);   /* free func(+this)+args (dup'd into s) */
                 gtf->up = tf_top;
                 gtf->caller_sf = sf; gtf->caller_b = b; gtf->caller_ctx = ctx;
@@ -22719,6 +22760,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                     cont_st = rcs; cont_kind_cur = CONT_ITER_HELPER;
                     goto do_iter_helper_step;
+                }
+                if (rck == CONT_CONSUME_GETITER) {
+                    /* the bytecode @@iterator returned: GetIterator step 5 (the result must be an Object), then the
+                       SAME deliver the inline acquire and the generator-create settle use. */
+                    JSConsumeGetIter *gi = rcs;
+                    JSValue *cargv = sp - cargc;
+                    DCHECK(cargc - cfirst == 2, "consume getiter frame has an unexpected operand shape");
+                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
+                    sp += cfirst - cargc;
+                    if (unlikely(!JS_IsObject(ret_val))) {
+                        JS_FreeValue(ctx, ret_val);
+                        JS_ThrowTypeErrorNotAnObject(ctx);
+                        ret_val = JS_EXCEPTION;
+                    }
+                    tramp_consume_state = gi->consumer; tramp_consume_kind = gi->consumer_kind;
+                    js_free_rt(rt, gi);
+                    tramp_consume_acquired = ret_val;
+                    ret_val = JS_UNDEFINED;
+                    goto do_consume_deliver_iterator;
                 }
                 if (rck == CONT_PROXY_GET) {
                     /* the proxy [[Get]] trap returned: enforce the target's invariants on its result, then let the
@@ -25567,6 +25627,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     if (tf_top) {
         TrampFrame *rtf = tf_top;
         void *xcs = rtf->cont_state; uint8_t xck = rtf->cont_kind;
+        int xcf = rtf->call_first, xcg = rtf->call_argc;   /* the throwing call's own operand shape on the caller stack */
         if (unlikely(sf->var_ref_count != 0)) close_var_refs(rt, sf);
         for (pval = local_buf; pval < sp; pval++) JS_FreeValue(ctx, *pval);
         js_free_rt(rt, local_buf);
@@ -25590,6 +25651,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             cit->done = 1;
             cit->executing = 0;
             iter_helper_close_source_abrupt(ctx, cit);
+        } else if (xck == CONT_CONSUME_GETITER) {
+            /* the bytecode @@iterator THREW. GetIterator propagates the abrupt completion to its CONSUMER, which
+               finishes it by its own rule (Promise.all rejects the aggregate; Array.from / new Set|Map /
+               Object.fromEntries / spread / Iterator.from propagate) — the same deliver arm the inline
+               JS_GetIterator2 throw reaches, so both acquire shapes fail identically. This cont owns the two
+               operands it pushed ([this, method]) on BOTH paths, so the stack it hands back to the deliver is the
+               one the inline acquire would have left. */
+            JSConsumeGetIter *gi = xcs;
+            JSValue *cargv = sp - xcg;
+            DCHECK(xcg - xcf == 2, "consume getiter frame has an unexpected operand shape");
+            for (i = xcf; i < xcg; i++) JS_FreeValue(ctx, cargv[i]);
+            sp += xcf - xcg;
+            tramp_consume_state = gi->consumer; tramp_consume_kind = gi->consumer_kind;
+            js_free_rt(rt, gi);
+            tramp_consume_acquired = JS_EXCEPTION;
+            goto do_consume_deliver_iterator;
         } else if (xck == CONT_PROMISE_EXEC) {
             /* 27.2.3.1 step 10: the executor completed ABRUPTLY — Call(reject, undefined, «completion.[[Value]]»),
                then step 11 still returns the promise. The throw must NOT propagate: `new Promise(function(){throw
