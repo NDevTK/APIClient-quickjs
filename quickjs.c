@@ -18055,7 +18055,7 @@ typedef struct JSStepHdr {
        than being re-declared (and mis-declared) in each state. */
     JSValue coerce;
     JSValue cb_coerce[2];
-    uint8_t len_phase, spc_phase, num_phase;
+    uint8_t len_phase, spc_phase, num_phase, str_phase;
 } JSStepHdr;
 /* The argument vector lives after the state in ONE allocation: a machine's arguments are exactly as long-lived as
    the machine, and a second allocation is a second free to forget. */
@@ -18206,6 +18206,50 @@ static int step_species_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSVa
         *pout = in;
         return 0;
     }
+}
+
+/* ToString on a value that may run user code. The object case is a TOPRIMITIVE step; whatever comes back is a
+   primitive, so the ToString that finishes it runs nothing. 0 = *pout is the string, 5 = the caller must return
+   that step code and will be re-entered here, -1 = threw. */
+enum { STR_PH_START = 0, STR_PH_PRIM };
+
+static int step_tostring_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValue in, JSValue *pout,
+                             JSValue **out_cb, int *out_argc)
+{
+    if (h->str_phase == STR_PH_START) {
+        JS_FreeValue(ctx, in);
+        if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT) {
+            DCHECK(JS_VALUE_GET_TAG(h->coerce) != JS_TAG_OBJECT,
+                   "a coercion is already in flight on this machine's header");
+            h->coerce = js_dup(v);
+            h->cb_coerce[0] = h->coerce;     /* borrowed view */
+            *out_cb = h->cb_coerce; *out_argc = HINT_STRING;
+            h->str_phase = STR_PH_PRIM;
+            return 5;
+        }
+        *pout = JS_ToString(ctx, v);
+        return JS_IsException(*pout) ? -1 : 0;
+    }
+    JS_FreeValue(ctx, h->coerce);
+    h->coerce = JS_UNDEFINED;
+    h->str_phase = STR_PH_START;
+    *pout = JS_ToStringFree(ctx, in);
+    return JS_IsException(*pout) ? -1 : 0;
+}
+
+/* JS_ToStringCheckObject on the RECEIVER — RequireObjectCoercible, then ToString. Every String.prototype method
+   opens with it, which is why even a ZERO-ARGUMENT one could not stay a C body: `"".trim.call(o)` where o's
+   toString loops preempted in an activation with no flow base. */
+static int step_thisstring_run(JSContext *ctx, JSStepHdr *h, JSValue in, JSValue *pout,
+                               JSValue **out_cb, int *out_argc)
+{
+    if (h->str_phase == STR_PH_START
+        && (JS_IsUndefined(h->this_val) || JS_IsNull(h->this_val))) {
+        JS_FreeValue(ctx, in);
+        JS_ThrowTypeError(ctx, "null or undefined are forbidden");
+        return -1;
+    }
+    return step_tostring_run(ctx, h, h->this_val, in, pout, out_cb, out_argc);
 }
 
 /* ToNumber on a value that may run user code, delivered as a saturating int64 (ToIntegerOrInfinity's clamp).
@@ -19299,6 +19343,19 @@ typedef struct JSArraySearch {
     JSValue result;       /* DONE (owned) */
     int64_t len, n;
 } JSArraySearch;
+
+/* String.prototype trim / trimStart / trimEnd / at / codePointAt: ONE machine. Their whole shared prologue is
+   JS_ToStringCheckObject on the receiver, and the two index methods add one ToIntegerOrInfinity — both the
+   page's code. The trim modes keep the magic values the registrations already used, so the two lists cannot
+   drift apart. */
+enum { STRRECV_TRIM_START = 1, STRRECV_TRIM_END = 2, STRRECV_TRIM_BOTH = 3,
+       STRRECV_AT, STRRECV_CODEPOINTAT };
+typedef struct JSStrRecv {
+    JSStepHdr hdr;
+    JSValue str;          /* the receiver as a string (owned) */
+    JSValue result;       /* DONE (owned) */
+    int64_t idx;
+} JSStrRecv;
 
 /* TypedArray.prototype.slice: the index coercions and the species Construct are its PROLOGUE,
    staged as steps 0-2 so a user valueOf on either index suspends. */
@@ -21891,10 +21948,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 js_toprim_free_cb(ctx, tp);   /* the call that produced ret_val is finished with its operands */
                 if (JS_VALUE_GET_TAG(ret_val) != JS_TAG_UNINITIALIZED) {
                     if (tp->stage == 1 && !JS_IsUninitialized(ret_val)) {
-                        /* @@toPrimitive's result: 7.1.1 step 2.d — it MUST be primitive, there is no fallback. */
+                        /* @@toPrimitive's result: 7.1.1 step 2.d — it MUST be primitive, there is no fallback.
+                           This is an ABRUPT exit like the method throwing, so it abandons the machine that asked
+                           for the primitive too; freeing only the sequence leaked the realm through that
+                           machine's captured invocation. The rule has one function precisely so it cannot be
+                           half-applied, and this exit predates it. */
                         if (JS_VALUE_GET_TAG(ret_val) == JS_TAG_OBJECT) {
                             JS_FreeValue(ctx, ret_val);
-                            js_toprim_free(ctx, tp);
+                            js_toprim_abandon(ctx, tp);
                             JS_ThrowTypeError(ctx, "toPrimitive");
                             goto exception;
                         }
@@ -50994,6 +51055,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_ARRAY_SORT, STEPDEF_ARRAY_TOSORTED, STEPDEF_JSON_PARSE,
     STEPDEF_TA_SLICE, STEPDEF_STR_CONCAT, STEPDEF_STR_CTOR, STEPDEF_ARRAY_AT,
     STEPDEF_ARRAY_INDEXOF, STEPDEF_ARRAY_LASTINDEXOF, STEPDEF_ARRAY_INCLUDES,
+    STEPDEF_STR_TRIM, STEPDEF_STR_TRIMSTART, STEPDEF_STR_TRIMEND, STEPDEF_STR_AT, STEPDEF_STR_CODEPOINTAT,
     STEPDEF_COUNT
 };
 static int js_str_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
@@ -51006,6 +51068,8 @@ static int js_array_at_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
 static JSValue js_array_at_fini(JSContext *ctx, void *st, bool take_result);
 static int js_array_search_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_search_fini(JSContext *ctx, void *st, bool take_result);
+static int js_str_recv_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_str_recv_fini(JSContext *ctx, void *st, bool take_result);
 /* One NAMED definition per builtin, referenced by its JS_CFUNC_STEP_DEF registration through the id above — the same shape as
    JS_CFUNC_MAGIC_DEF naming its C function, so the registration line tells you what runs. An index into a side
    table would be a second list to keep in sync and a magic number that silently repoints when a row is inserted. */
@@ -51039,6 +51103,11 @@ static const JSTrampStepDef js_array_at_def     = { sizeof(JSArrayAt), js_array_
 static const JSTrampStepDef js_array_indexOf_def     = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_INDEXOF };
 static const JSTrampStepDef js_array_lastIndexOf_def = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_LASTINDEXOF };
 static const JSTrampStepDef js_array_includes_def    = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_INCLUDES };
+static const JSTrampStepDef js_str_trim_def       = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_TRIM_BOTH };
+static const JSTrampStepDef js_str_trimStart_def  = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_TRIM_START };
+static const JSTrampStepDef js_str_trimEnd_def    = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_TRIM_END };
+static const JSTrampStepDef js_str_at_def         = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_AT };
+static const JSTrampStepDef js_str_codePointAt_def= { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_CODEPOINTAT };
 static const JSTrampStepDef js_array_reduce_def  = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduce };
 static const JSTrampStepDef js_array_reduceR_def = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduceRight };
 static const JSTrampStepDef js_ta_reduce_def     = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduce | special_TA };
@@ -51074,6 +51143,11 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_ARRAY_INDEXOF]     = &js_array_indexOf_def,
     [STEPDEF_ARRAY_LASTINDEXOF] = &js_array_lastIndexOf_def,
     [STEPDEF_ARRAY_INCLUDES]    = &js_array_includes_def,
+    [STEPDEF_STR_TRIM]        = &js_str_trim_def,
+    [STEPDEF_STR_TRIMSTART]   = &js_str_trimStart_def,
+    [STEPDEF_STR_TRIMEND]     = &js_str_trimEnd_def,
+    [STEPDEF_STR_AT]          = &js_str_at_def,
+    [STEPDEF_STR_CODEPOINTAT] = &js_str_codePointAt_def,
     [STEPDEF_ARRAY_REDUCE]  = &js_array_reduce_def,  [STEPDEF_ARRAY_REDUCE_RIGHT] = &js_array_reduceR_def,
     [STEPDEF_TA_REDUCE]     = &js_ta_reduce_def,     [STEPDEF_TA_REDUCE_RIGHT]    = &js_ta_reduceR_def,
 };
@@ -51098,6 +51172,7 @@ STEP_STATE_HDR_FIRST(JSStrConcat);
 STEP_STATE_HDR_FIRST(JSTASlice);
 STEP_STATE_HDR_FIRST(JSArrayAt);
 STEP_STATE_HDR_FIRST(JSArraySearch);
+STEP_STATE_HDR_FIRST(JSStrRecv);
 
 static const JSTrampStepDef *tramp_step_def_of(JSValueConst func)
 {
@@ -53804,31 +53879,64 @@ JSValue js_string_codePointRange(JSContext *ctx, JSValueConst this_val,
     return string_buffer_end(b);
 }
 
-static JSValue js_string_at(JSContext *ctx, JSValueConst this_val,
-                            int argc, JSValueConst *argv)
-{
-    JSValue val, ret;
-    JSString *p;
-    int idx, c;
 
-    val = JS_ToStringCheckObject(ctx, this_val);
-    if (JS_IsException(val))
-        return val;
-    p = JS_VALUE_GET_STRING(val);
-    if (JS_ToInt32Sat(ctx, &idx, argv[0])) {
-        JS_FreeValue(ctx, val);
-        return JS_EXCEPTION;
+static int js_str_recv_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSStrRecv *s = st;
+    JSString *p;
+    int mode = s->hdr.arg;
+    int r, a, b, len, idx, c;
+
+    if (s->hdr.stage == 0) {
+        r = step_thisstring_run(ctx, &s->hdr, cb_result, &s->str, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->result = JS_UNDEFINED;
+        s->hdr.stage = 1;
     }
-    if (idx < 0)
-        idx = p->len + idx;
-    if (idx < 0 || idx >= p->len) {
-        ret = JS_UNDEFINED;
-    } else {
-        c = string_get(p, idx);
-        ret = js_new_string_char(ctx, c);
+    if (s->hdr.stage == 1) {
+        if (mode == STRRECV_AT || mode == STRRECV_CODEPOINTAT) {
+            r = step_toint64_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->idx, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+        }
+        s->hdr.stage = 2;
     }
-    JS_FreeValue(ctx, val);
-    return ret;
+    JS_FreeValue(ctx, cb_result);
+
+    p = JS_VALUE_GET_STRING(s->str);
+    len = p->len;
+    if (mode <= STRRECV_TRIM_BOTH) {
+        a = 0;
+        b = len;
+        if (mode & 1) while (a < len && lre_is_space(string_get(p, a))) a++;
+        if (mode & 2) while (b > a && lre_is_space(string_get(p, b - 1))) b--;
+        s->result = js_sub_string(ctx, p, a, b);
+        return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
+    }
+    /* the saturating int64 narrows to int exactly as JS_ToInt32Sat's clamp did */
+    idx = (s->idx < INT32_MIN) ? INT32_MIN : (s->idx > INT32_MAX) ? INT32_MAX : (int)s->idx;
+    if (mode == STRRECV_AT) {
+        if (idx < 0) idx = len + idx;
+        if (idx < 0 || idx >= len) { s->result = JS_UNDEFINED; return 0; }
+        s->result = js_new_string_char(ctx, string_get(p, idx));
+        return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
+    }
+    DCHECK(mode == STRRECV_CODEPOINTAT, "string receiver machine: unknown mode");
+    if (idx < 0 || idx >= len) { s->result = JS_UNDEFINED; return 0; }
+    c = string_getc(p, &idx);
+    s->result = js_int32(c);
+    return 0;
+}
+
+static JSValue js_str_recv_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSStrRecv *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    JS_FreeValue(ctx, s->str);
+    js_free(ctx, s);
+    return r;
 }
 
 static JSValue js_string_charCodeAt(JSContext *ctx, JSValueConst this_val,
@@ -53881,30 +53989,6 @@ static JSValue js_string_charAt(JSContext *ctx, JSValueConst this_val,
     return ret;
 }
 
-static JSValue js_string_codePointAt(JSContext *ctx, JSValueConst this_val,
-                                     int argc, JSValueConst *argv)
-{
-    JSValue val, ret;
-    JSString *p;
-    int idx, c;
-
-    val = JS_ToStringCheckObject(ctx, this_val);
-    if (JS_IsException(val))
-        return val;
-    p = JS_VALUE_GET_STRING(val);
-    if (JS_ToInt32Sat(ctx, &idx, argv[0])) {
-        JS_FreeValue(ctx, val);
-        return JS_EXCEPTION;
-    }
-    if (idx < 0 || idx >= p->len) {
-        ret = JS_UNDEFINED;
-    } else {
-        c = string_getc(p, &idx);
-        ret = js_int32(c);
-    }
-    JS_FreeValue(ctx, val);
-    return ret;
-}
 
 /* The all-strings fast path, kept because it is the common case: one allocation and memcpys instead of a chain
    of ToString + ConcatString. Returns 1 with *out set, or 0 when any operand is not a same-width string — in
@@ -54993,31 +55077,6 @@ fail:
     return JS_EXCEPTION;
 }
 
-static JSValue js_string_trim(JSContext *ctx, JSValueConst this_val,
-                              int argc, JSValueConst *argv, int magic)
-{
-    JSValue str, ret;
-    int a, b, len;
-    JSString *p;
-
-    str = JS_ToStringCheckObject(ctx, this_val);
-    if (JS_IsException(str))
-        return str;
-    p = JS_VALUE_GET_STRING(str);
-    a = 0;
-    b = len = p->len;
-    if (magic & 1) {
-        while (a < len && lre_is_space(string_get(p, a)))
-            a++;
-    }
-    if (magic & 2) {
-        while (b > a && lre_is_space(string_get(p, b - 1)))
-            b--;
-    }
-    ret = js_sub_string(ctx, p, a, b);
-    JS_FreeValue(ctx, str);
-    return ret;
-}
 
 /* return 0 if before the first char */
 static int string_prevc(JSString *p, int *pidx)
@@ -55399,11 +55458,11 @@ static const JSCFunctionListEntry js_string_funcs[] = {
 
 static const JSCFunctionListEntry js_string_proto_funcs[] = {
     JS_PROP_INT32_DEF("length", 0, JS_PROP_CONFIGURABLE ),
-    JS_CFUNC_DEF("at", 1, js_string_at ),
+    JS_CFUNC_STEP_DEF("at", 1, STEPDEF_STR_AT ),
     JS_CFUNC_DEF("charCodeAt", 1, js_string_charCodeAt ),
     JS_CFUNC_DEF("charAt", 1, js_string_charAt ),
     JS_CFUNC_STEP_DEF("concat", 1, STEPDEF_STR_CONCAT ),
-    JS_CFUNC_DEF("codePointAt", 1, js_string_codePointAt ),
+    JS_CFUNC_STEP_DEF("codePointAt", 1, STEPDEF_STR_CODEPOINTAT ),
     JS_CFUNC_DEF("isWellFormed", 0, js_string_isWellFormed ),
     JS_CFUNC_DEF("toWellFormed", 0, js_string_toWellFormed ),
     JS_CFUNC_MAGIC_DEF("indexOf", 1, js_string_indexOf, 0 ),
@@ -55423,10 +55482,10 @@ static const JSCFunctionListEntry js_string_proto_funcs[] = {
     JS_CFUNC_STEP_DEF("replaceAll", 2, STEPDEF_STR_REPLACE_ALL ),
     JS_CFUNC_MAGIC_DEF("padEnd", 1, js_string_pad, 1 ),
     JS_CFUNC_MAGIC_DEF("padStart", 1, js_string_pad, 0 ),
-    JS_CFUNC_MAGIC_DEF("trim", 0, js_string_trim, 3 ),
-    JS_CFUNC_MAGIC_DEF("trimEnd", 0, js_string_trim, 2 ),
+    JS_CFUNC_STEP_DEF("trim", 0, STEPDEF_STR_TRIM ),
+    JS_CFUNC_STEP_DEF("trimEnd", 0, STEPDEF_STR_TRIMEND ),
     JS_ALIAS_DEF("trimRight", "trimEnd" ),
-    JS_CFUNC_MAGIC_DEF("trimStart", 0, js_string_trim, 1 ),
+    JS_CFUNC_STEP_DEF("trimStart", 0, STEPDEF_STR_TRIMSTART ),
     JS_ALIAS_DEF("trimLeft", "trimStart" ),
     JS_CFUNC_DEF("toString", 0, js_string_toString ),
     JS_CFUNC_DEF("valueOf", 0, js_string_toString ),
