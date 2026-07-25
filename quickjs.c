@@ -19565,6 +19565,9 @@ typedef struct JSArraySort {
     uint8_t pending;                /* a cmp(array[l],array[r]) result is awaited */
     uint8_t cmp_ph;                 /* the DEFAULT ordering coerces two operands; this says which one is due.
                                        The header's str_phase resumes each ToString, this says whose. */
+    int64_t col_i;                  /* the COLLECT cursor: which index is being gathered */
+    int present;                    /* HasProperty(O, k) for that index — sort skips holes */
+    uint8_t elem_ph;                /* 0 = the ask is due, 1 = the read is due */
     JSValue coerced;                /* the string a ToString delivered, until the slot adopts it (owned) */
     JSValue cb_args[4];             /* [this=undefined, method, array[l].val, array[r].val]; call_argv=&cb_args[2], argc=2 */
 } JSArraySort;
@@ -53000,22 +53003,36 @@ static int js_array_sort_recv(JSContext *ctx, JSArraySort *s)
 
 /* Collect the present, non-undefined elements into the merge array. Runs after the length, so it is its own
    function rather than the tail of an init. */
-static int js_array_sort_collect(JSContext *ctx, JSArraySort *s)
+/* Gather the present, non-undefined elements. The ask and the read are each the page's code — an index accessor
+   or a Proxy trap — and JS_TryGetPropertyInt64 reached both from C, so a loop in either preempted with no flow
+   base before a single comparison had happened. s->n IS the write cursor, which is what makes an abandon
+   mid-collect free exactly what was gathered. */
+static int js_array_sort_collect(JSContext *ctx, JSArraySort *s, JSValue in, JSValue **out_cb, int *out_argc)
 {
-    int64_t i, pos = 0; int present;
-    if (s->len > 0) {
-        s->array = js_malloc(ctx, (size_t)s->len * sizeof(ValueSlot));
-        if (!s->array) return -1;
+    int r;
+    while (s->col_i < s->len) {
+        if (s->elem_ph == 0) {
+            r = step_hasidx_run(ctx, &s->hdr, s->obj, s->col_i, in, &s->present, out_cb, out_argc);
+            in = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->elem_ph = 1;
+        }
+        if (!s->present) { s->col_i++; s->elem_ph = 0; continue; }
+        {
+            JSValue v;
+            r = step_getidx_run(ctx, &s->hdr, s->obj, s->col_i, in, &v, out_cb, out_argc);
+            in = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->elem_ph = 0;
+            if (JS_IsUndefined(v)) {
+                s->undefined_count++;
+            } else {
+                s->array[s->n].val = v; s->array[s->n].str = NULL; s->array[s->n].pos = s->col_i; s->n++;
+            }
+            s->col_i++;
+        }
     }
-    for (i = 0; i < s->len; i++) {
-        JSValue v;
-        present = JS_TryGetPropertyInt64(ctx, s->obj, i, &v);
-        if (present < 0) { s->n = pos; return -1; }
-        if (present == 0) continue;
-        if (JS_IsUndefined(v)) { s->undefined_count++; continue; }
-        s->array[pos].val = v; s->array[pos].str = NULL; s->array[pos].pos = i; pos++;
-    }
-    s->n = pos;
+    JS_FreeValue(ctx, in);
     if (s->n > 1) {
         s->tmp = js_malloc(ctx, (size_t)s->n * sizeof(ValueSlot));
         if (!s->tmp) return -1;
@@ -53217,9 +53234,19 @@ static int js_array_sort_vstep(JSContext *ctx, void *st, JSValue cb_result, JSVa
         s->hdr.stage = 2;
     }
     if (s->hdr.stage == 2) {
-        s->hdr.stage = 3;
         if (s->hdr.arg && js_array_sort_copy(ctx, s)) return -1;
-        if (js_array_sort_collect(ctx, s)) return -1;
+        if (s->len > 0) {
+            s->array = js_malloc(ctx, (size_t)s->len * sizeof(ValueSlot));
+            if (!s->array) return -1;
+        }
+        s->col_i = 0; s->n = 0;
+        s->hdr.stage = 6;
+    }
+    if (s->hdr.stage == 6) {   /* the collect, re-entered while an index's ask or read runs the page's code */
+        r = js_array_sort_collect(ctx, s, cb_result, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 3;
     }
     r = js_array_sort_step(ctx, s, cb_result, (JSValueConst *)&s->cb_args[2], out_cb, out_argc);   /* consumes cb_result */
     if (r < 0) return -1;
