@@ -20795,12 +20795,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSPromiseExec *s;
                 JSValue rfuncs[2], pobj;
                 pobj = js_promise_new(ctx, pe_ntgt, rfuncs);   /* steps 3-8 (OrdinaryCreateFromConstructor uses NewTarget) */
-                if (unlikely(JS_IsException(pobj))) { JS_FreeValue(ctx, pe_super_ref); goto exception; }
+                if (unlikely(JS_IsException(pobj))) goto promise_exec_abort;
                 s = js_malloc_rt(rt, sizeof(*s));
                 if (unlikely(!s)) {
                     JS_FreeValue(ctx, pobj); JS_FreeValue(ctx, rfuncs[0]); JS_FreeValue(ctx, rfuncs[1]);
-                    JS_FreeValue(ctx, pe_super_ref);
-                    JS_ThrowOutOfMemory(ctx); goto exception;
+                    JS_ThrowOutOfMemory(ctx); goto promise_exec_abort;
                 }
                 s->promise = pobj;
                 s->resolving_funcs[0] = rfuncs[0];
@@ -20824,6 +20823,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 ret_val = JS_Call(ctx, pe_executor, JS_UNDEFINED, 2, (JSValueConst *)&s->cb_args[2]);
                 pexec_finish_state = s;
                 goto do_promise_exec_finish;
+
+            promise_exec_abort:
+                /* EVERY pe_* input is released in ONE place. Three entry spellings set them — the constructor
+                   operand, super(), and Reflect.construct — and only Reflect.construct's executor is OWNED here
+                   (it comes out of the args list, not off the stack). An exit that named a subset is exactly how
+                   `Reflect.construct(Promise, [fn], badNewTarget)` leaked that executor, and with its closure the
+                   whole realm: 360 objects on the one test whose `prototype` getter throws. */
+                {
+                    JS_FreeValue(ctx, pe_super_ref);    pe_super_ref = JS_UNDEFINED;
+                    JS_FreeValue(ctx, pe_executor_own); pe_executor_own = JS_UNDEFINED;
+                    goto exception;
+                }
             }
 
         do_promise_exec_finish:
@@ -20930,7 +20941,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSFunctionBytecode *nb = np->u.func.function_bytecode;
                 struct JSConstruct *cs; JSValue cthis;
                 int eff_argc = con_argc;
+                /* narg_alloc 0 = BORROW the args in place, which is only sound when the borrowed slots belong to a
+                   frame that outlives this one and frees them: the caller's operand stack for `new C()`, the
+                   derived frame's argv for super(). A construct requested BY A STEP MACHINE borrows the machine's
+                   own cb buffer instead, and that is the same ownership hole the CALL path closed — it just never
+                   got the clause. `class C extends TA { constructor(...p) { super(...p); } }` as a species
+                   constructor leaked the whole graph on every TypedArray.prototype.slice, throwing or not. */
                 int narg_alloc = (eff_argc < nb->arg_count) ? nb->arg_count : 0;
+                if (con_outer && eff_argc > narg_alloc)
+                    narg_alloc = eff_argc;
                 size_t asize = sizeof(JSValue) * TRAMP_FRAME_SLOTS(narg_alloc, nb)
                              + sizeof(JSVarRef *) * nb->var_ref_count;
                 TrampFrame *ntf; JSValue *nlb, *narg_buf, *nvar_buf, *nstack_buf; JSStackFrame *nsf; int k;
