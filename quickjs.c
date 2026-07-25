@@ -18282,6 +18282,30 @@ static int step_toint64_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValu
     return JS_ToInt64SatFree(ctx, pres, in);
 }
 
+/* the same sub-sequence delivering a double: String.prototype.lastIndexOf's position is compared as one
+   (NaN means "from the end"), which a saturating int64 cannot express. */
+static int step_tofloat64_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValue in, double *pres,
+                              JSValue **out_cb, int *out_argc)
+{
+    if (h->num_phase == NUM_PH_START) {
+        JS_FreeValue(ctx, in);
+        if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT) {
+            DCHECK(JS_VALUE_GET_TAG(h->coerce) != JS_TAG_OBJECT,
+                   "a coercion is already in flight on this machine's header");
+            h->coerce = js_dup(v);
+            h->cb_coerce[0] = h->coerce;
+            *out_cb = h->cb_coerce; *out_argc = HINT_NUMBER;
+            h->num_phase = NUM_PH_PRIM;
+            return 5;
+        }
+        return JS_ToFloat64(ctx, pres, v);
+    }
+    JS_FreeValue(ctx, h->coerce);
+    h->coerce = JS_UNDEFINED;
+    h->num_phase = NUM_PH_START;
+    return JS_ToFloat64Free(ctx, pres, in);
+}
+
 static int step_length_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSValue in, int64_t *plen,
                            JSValue **out_cb, int *out_argc)
 {
@@ -19349,12 +19373,15 @@ typedef struct JSArraySearch {
    page's code. The trim modes keep the magic values the registrations already used, so the two lists cannot
    drift apart. */
 enum { STRRECV_TRIM_START = 1, STRRECV_TRIM_END = 2, STRRECV_TRIM_BOTH = 3,
-       STRRECV_AT, STRRECV_CODEPOINTAT };
+       STRRECV_AT, STRRECV_CODEPOINTAT, STRRECV_SUBSTRING,
+       STRRECV_INDEXOF, STRRECV_LASTINDEXOF, STRRECV_NORMALIZE };
 typedef struct JSStrRecv {
     JSStepHdr hdr;
     JSValue str;          /* the receiver as a string (owned) */
+    JSValue arg;          /* a coerced STRING argument (owned): indexOf's search, normalize's form */
     JSValue result;       /* DONE (owned) */
-    int64_t idx;
+    int64_t idx, idx2;
+    double dpos;
 } JSStrRecv;
 
 /* TypedArray.prototype.slice: the index coercions and the species Construct are its PROLOGUE,
@@ -51056,6 +51083,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_TA_SLICE, STEPDEF_STR_CONCAT, STEPDEF_STR_CTOR, STEPDEF_ARRAY_AT,
     STEPDEF_ARRAY_INDEXOF, STEPDEF_ARRAY_LASTINDEXOF, STEPDEF_ARRAY_INCLUDES,
     STEPDEF_STR_TRIM, STEPDEF_STR_TRIMSTART, STEPDEF_STR_TRIMEND, STEPDEF_STR_AT, STEPDEF_STR_CODEPOINTAT,
+    STEPDEF_STR_SUBSTRING, STEPDEF_STR_INDEXOF, STEPDEF_STR_LASTINDEXOF, STEPDEF_STR_NORMALIZE,
     STEPDEF_COUNT
 };
 static int js_str_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
@@ -51108,6 +51136,10 @@ static const JSTrampStepDef js_str_trimStart_def  = { sizeof(JSStrRecv), js_str_
 static const JSTrampStepDef js_str_trimEnd_def    = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_TRIM_END };
 static const JSTrampStepDef js_str_at_def         = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_AT };
 static const JSTrampStepDef js_str_codePointAt_def= { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_CODEPOINTAT };
+static const JSTrampStepDef js_str_substring_def  = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_SUBSTRING };
+static const JSTrampStepDef js_str_indexOf_def    = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_INDEXOF };
+static const JSTrampStepDef js_str_lastIndexOf_def= { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_LASTINDEXOF };
+static const JSTrampStepDef js_str_normalize_def  = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_NORMALIZE };
 static const JSTrampStepDef js_array_reduce_def  = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduce };
 static const JSTrampStepDef js_array_reduceR_def = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduceRight };
 static const JSTrampStepDef js_ta_reduce_def     = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduce | special_TA };
@@ -51148,6 +51180,10 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_STR_TRIMEND]     = &js_str_trimEnd_def,
     [STEPDEF_STR_AT]          = &js_str_at_def,
     [STEPDEF_STR_CODEPOINTAT] = &js_str_codePointAt_def,
+    [STEPDEF_STR_SUBSTRING]   = &js_str_substring_def,
+    [STEPDEF_STR_INDEXOF]     = &js_str_indexOf_def,
+    [STEPDEF_STR_LASTINDEXOF] = &js_str_lastIndexOf_def,
+    [STEPDEF_STR_NORMALIZE]   = &js_str_normalize_def,
     [STEPDEF_ARRAY_REDUCE]  = &js_array_reduce_def,  [STEPDEF_ARRAY_REDUCE_RIGHT] = &js_array_reduceR_def,
     [STEPDEF_TA_REDUCE]     = &js_ta_reduce_def,     [STEPDEF_TA_REDUCE_RIGHT]    = &js_ta_reduceR_def,
 };
@@ -53880,6 +53916,18 @@ JSValue js_string_codePointRange(JSContext *ctx, JSValueConst this_val,
 }
 
 
+static int string_cmp(JSString *p1, JSString *p2, int x1, int x2, int len);
+static int JS_ToUTF32String(JSContext *ctx, uint32_t **pbuf, JSValue val1);
+static JSValue JS_NewUTF32String(JSContext *ctx, const uint32_t *buf, int len);
+
+/* JS_ToInt32Clamp(v, 0, len, 0)'s arithmetic once its ToInt32Sat half is a step. */
+static int str_clamp(int64_t v, int len)
+{
+    if (v < 0) v = 0;
+    else if (v > len) v = len;
+    return (int)v;
+}
+
 static int js_str_recv_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSStrRecv *s = st;
@@ -53888,24 +53936,67 @@ static int js_str_recv_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
     int r, a, b, len, idx, c;
 
     if (s->hdr.stage == 0) {
+        if (s->hdr.str_phase == STR_PH_START) {
+            /* A zeroed state holds the INTEGER 0 in every JSValue field — freeable, which is what makes
+               driver-owned allocation sound, but NOT a sentinel anything may read. normalize() with no form
+               left `arg` at that zero and then read it as a JSString. Every field this machine will read is
+               given its sentinel here, before the first thing that can suspend. */
+            s->str = JS_UNDEFINED; s->arg = JS_UNDEFINED; s->result = JS_UNDEFINED;
+        }
         r = step_thisstring_run(ctx, &s->hdr, cb_result, &s->str, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
-        s->result = JS_UNDEFINED;
         s->hdr.stage = 1;
     }
     if (s->hdr.stage == 1) {
-        if (mode == STRRECV_AT || mode == STRRECV_CODEPOINTAT) {
+        switch (mode) {
+        case STRRECV_AT: case STRRECV_CODEPOINTAT: case STRRECV_SUBSTRING:
             r = step_toint64_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->idx, out_cb, out_argc);
             cb_result = JS_UNDEFINED;
             if (r) return r < 0 ? -1 : r;
+            break;
+        case STRRECV_INDEXOF: case STRRECV_LASTINDEXOF:
+            r = step_tostring_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->arg, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            break;
+        case STRRECV_NORMALIZE:
+            /* an absent or undefined form is NFC and coerces nothing. The UTF-32 conversion the C body did first
+               runs no user code, so reading the form before it is not observable. `arg` staying UNDEFINED IS the
+               answer to "was there a form", so the two places cannot disagree. */
+            if (!JS_IsUndefined(step_arg(&s->hdr, 0))) {
+                r = step_tostring_run(ctx, &s->hdr, s->hdr.argv[0], cb_result, &s->arg, out_cb, out_argc);
+                cb_result = JS_UNDEFINED;
+                if (r) return r < 0 ? -1 : r;
+            }
+            break;
         }
         s->hdr.stage = 2;
     }
-    JS_FreeValue(ctx, cb_result);
-
     p = JS_VALUE_GET_STRING(s->str);
     len = p->len;
+    if (s->hdr.stage == 2) {
+        s->idx2 = len;
+        s->dpos = 0;
+        if (mode == STRRECV_SUBSTRING) {
+            if (!JS_IsUndefined(step_arg(&s->hdr, 1))) {
+                r = step_toint64_run(ctx, &s->hdr, s->hdr.argv[1], cb_result, &s->idx2, out_cb, out_argc);
+                cb_result = JS_UNDEFINED;
+                if (r) return r < 0 ? -1 : r;
+            }
+        } else if ((mode == STRRECV_INDEXOF || mode == STRRECV_LASTINDEXOF) && s->hdr.argc > 1) {
+            if (mode == STRRECV_LASTINDEXOF) {
+                r = step_tofloat64_run(ctx, &s->hdr, s->hdr.argv[1], cb_result, &s->dpos, out_cb, out_argc);
+            } else {
+                r = step_toint64_run(ctx, &s->hdr, s->hdr.argv[1], cb_result, &s->idx2, out_cb, out_argc);
+            }
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+        }
+        s->hdr.stage = 3;
+    }
+    JS_FreeValue(ctx, cb_result);
+
     if (mode <= STRRECV_TRIM_BOTH) {
         a = 0;
         b = len;
@@ -53922,11 +54013,76 @@ static int js_str_recv_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
         s->result = js_new_string_char(ctx, string_get(p, idx));
         return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
     }
-    DCHECK(mode == STRRECV_CODEPOINTAT, "string receiver machine: unknown mode");
-    if (idx < 0 || idx >= len) { s->result = JS_UNDEFINED; return 0; }
-    c = string_getc(p, &idx);
-    s->result = js_int32(c);
-    return 0;
+    if (mode == STRRECV_CODEPOINTAT) {
+        if (idx < 0 || idx >= len) { s->result = JS_UNDEFINED; return 0; }
+        c = string_getc(p, &idx);
+        s->result = js_int32(c);
+        return 0;
+    }
+    if (mode == STRRECV_SUBSTRING) {
+        /* JS_ToInt32Clamp(0, len, 0) on each index, then the pair is ordered */
+        a = str_clamp(s->idx, len);
+        b = JS_IsUndefined(step_arg(&s->hdr, 1)) ? len : str_clamp(s->idx2, len);
+        s->result = js_sub_string(ctx, p, a < b ? a : b, a < b ? b : a);
+        return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
+    }
+    if (mode == STRRECV_INDEXOF || mode == STRRECV_LASTINDEXOF) {
+        JSString *p1 = JS_VALUE_GET_STRING(s->arg);
+        int v_len = p1->len, pos, start, stop, inc, i, ret = -1;
+        if (mode == STRRECV_LASTINDEXOF) {
+            pos = len - v_len;
+            if (s->hdr.argc > 1 && !isnan(s->dpos)) {
+                if (s->dpos <= 0) pos = 0;
+                else if (s->dpos < pos) pos = (int)s->dpos;
+            }
+            start = pos; stop = 0; inc = -1;
+        } else {
+            pos = (s->hdr.argc > 1) ? str_clamp(s->idx2, len) : 0;
+            start = pos; stop = len - v_len; inc = 1;
+        }
+        if (len >= v_len && inc * (stop - start) >= 0) {
+            for (i = start;; i += inc) {
+                if (!string_cmp(p, p1, i, 0, v_len)) { ret = i; break; }
+                if (i == stop) break;
+            }
+        }
+        s->result = js_int32(ret);
+        return 0;
+    }
+    DCHECK(mode == STRRECV_NORMALIZE, "string receiver machine: unknown mode");
+    {
+        UnicodeNormalizationEnum n_type = UNICODE_NFC;
+        uint32_t *buf = NULL, *out_buf;
+        int buf_len, out_len, is_compat;
+        if (!JS_IsUndefined(s->arg)) {
+            JSString *f = JS_VALUE_GET_STRING(s->arg);
+            const char *form = JS_ToCString(ctx, s->arg), *q;
+            size_t form_len = f->len;
+            if (!form) return -1;
+            q = form;
+            is_compat = false;
+            if (q[0] != 'N' || q[1] != 'F') goto bad_form;
+            q += 2;
+            if (*q == 'K') { is_compat = true; q++; }
+            if ((*q != 'C' && *q != 'D') || (size_t)(q + 1 - form) != form_len) {
+            bad_form:
+                JS_FreeCString(ctx, form);
+                JS_ThrowRangeError(ctx, "bad normalization form");
+                return -1;
+            }
+            n_type = UNICODE_NFC + is_compat * 2 + (*q - 'C');
+            JS_FreeCString(ctx, form);
+        }
+        buf_len = JS_ToUTF32String(ctx, &buf, s->str);   /* runs no user code */
+        if (buf_len < 0) return -1;
+        out_len = unicode_normalize(&out_buf, buf, buf_len, n_type,
+                                    ctx->rt, (DynBufReallocFunc *)js_realloc_rt);
+        js_free(ctx, buf);
+        if (out_len < 0) return -1;
+        s->result = JS_NewUTF32String(ctx, out_buf, out_len);
+        js_free(ctx, out_buf);
+        return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
+    }
 }
 
 static JSValue js_str_recv_fini(JSContext *ctx, void *st, bool take_result)
@@ -53935,6 +54091,7 @@ static JSValue js_str_recv_fini(JSContext *ctx, void *st, bool take_result)
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (!take_result) JS_FreeValue(ctx, s->result);
     JS_FreeValue(ctx, s->str);
+    JS_FreeValue(ctx, s->arg);
     js_free(ctx, s);
     return r;
 }
@@ -54246,70 +54403,6 @@ static JSValue js_string_toWellFormed(JSContext *ctx, JSValueConst this_val,
     return ret;
 }
 
-static JSValue js_string_indexOf(JSContext *ctx, JSValueConst this_val,
-                                 int argc, JSValueConst *argv, int lastIndexOf)
-{
-    JSValue str, v;
-    int i, len, v_len, pos, start, stop, ret, inc;
-    JSString *p;
-    JSString *p1;
-
-    str = JS_ToStringCheckObject(ctx, this_val);
-    if (JS_IsException(str))
-        return str;
-    v = JS_ToString(ctx, argv[0]);
-    if (JS_IsException(v))
-        goto fail;
-    p = JS_VALUE_GET_STRING(str);
-    p1 = JS_VALUE_GET_STRING(v);
-    len = p->len;
-    v_len = p1->len;
-    if (lastIndexOf) {
-        pos = len - v_len;
-        if (argc > 1) {
-            double d;
-            if (JS_ToFloat64(ctx, &d, argv[1]))
-                goto fail;
-            if (!isnan(d)) {
-                if (d <= 0)
-                    pos = 0;
-                else if (d < pos)
-                    pos = d;
-            }
-        }
-        start = pos;
-        stop = 0;
-        inc = -1;
-    } else {
-        pos = 0;
-        if (argc > 1) {
-            if (JS_ToInt32Clamp(ctx, &pos, argv[1], 0, len, 0))
-                goto fail;
-        }
-        start = pos;
-        stop = len - v_len;
-        inc = 1;
-    }
-    ret = -1;
-    if (len >= v_len && inc * (stop - start) >= 0) {
-        for (i = start;; i += inc) {
-            if (!string_cmp(p, p1, i, 0, v_len)) {
-                ret = i;
-                break;
-            }
-            if (i == stop)
-                break;
-        }
-    }
-    JS_FreeValue(ctx, str);
-    JS_FreeValue(ctx, v);
-    return js_int32(ret);
-
-fail:
-    JS_FreeValue(ctx, str);
-    JS_FreeValue(ctx, v);
-    return JS_EXCEPTION;
-}
 
 /* return < 0 if exception or true/false */
 static int js_is_regexp(JSContext *ctx, JSValueConst obj);
@@ -54872,39 +54965,6 @@ exception:
     return JS_EXCEPTION;
 }
 
-static JSValue js_string_substring(JSContext *ctx, JSValueConst this_val,
-                                   int argc, JSValueConst *argv)
-{
-    JSValue str, ret;
-    int a, b, start, end;
-    JSString *p;
-
-    str = JS_ToStringCheckObject(ctx, this_val);
-    if (JS_IsException(str))
-        return str;
-    p = JS_VALUE_GET_STRING(str);
-    if (JS_ToInt32Clamp(ctx, &a, argv[0], 0, p->len, 0)) {
-        JS_FreeValue(ctx, str);
-        return JS_EXCEPTION;
-    }
-    b = p->len;
-    if (!JS_IsUndefined(argv[1])) {
-        if (JS_ToInt32Clamp(ctx, &b, argv[1], 0, p->len, 0)) {
-            JS_FreeValue(ctx, str);
-            return JS_EXCEPTION;
-        }
-    }
-    if (a < b) {
-        start = a;
-        end = b;
-    } else {
-        start = b;
-        end = a;
-    }
-    ret = js_sub_string(ctx, p, start, end);
-    JS_FreeValue(ctx, str);
-    return ret;
-}
 
 static JSValue js_string_substr(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv)
@@ -55275,64 +55335,6 @@ static JSValue JS_NewUTF32String(JSContext *ctx, const uint32_t *buf, int len)
     return JS_EXCEPTION;
 }
 
-static JSValue js_string_normalize(JSContext *ctx, JSValueConst this_val,
-                                   int argc, JSValueConst *argv)
-{
-    const char *form, *p;
-    size_t form_len;
-    int is_compat, buf_len, out_len;
-    UnicodeNormalizationEnum n_type;
-    JSValue val;
-    uint32_t *buf, *out_buf;
-
-    val = JS_ToStringCheckObject(ctx, this_val);
-    if (JS_IsException(val))
-        return val;
-    buf = NULL; // appease bogus -Wmaybe-uninitialized warning
-    buf_len = JS_ToUTF32String(ctx, &buf, val);
-    JS_FreeValue(ctx, val);
-    if (buf_len < 0)
-        return JS_EXCEPTION;
-
-    if (argc == 0 || JS_IsUndefined(argv[0])) {
-        n_type = UNICODE_NFC;
-    } else {
-        form = JS_ToCStringLen(ctx, &form_len, argv[0]);
-        if (!form)
-            goto fail1;
-        p = form;
-        if (p[0] != 'N' || p[1] != 'F')
-            goto bad_form;
-        p += 2;
-        is_compat = false;
-        if (*p == 'K') {
-            is_compat = true;
-            p++;
-        }
-        if (*p == 'C' || *p == 'D') {
-            n_type = UNICODE_NFC + is_compat * 2 + (*p - 'C');
-            if ((p + 1 - form) != form_len)
-                goto bad_form;
-        } else {
-        bad_form:
-            JS_FreeCString(ctx, form);
-            JS_ThrowRangeError(ctx, "bad normalization form");
-        fail1:
-            js_free(ctx, buf);
-            return JS_EXCEPTION;
-        }
-        JS_FreeCString(ctx, form);
-    }
-
-    out_len = unicode_normalize(&out_buf, buf, buf_len, n_type,
-                                ctx->rt, (DynBufReallocFunc *)js_realloc_rt);
-    js_free(ctx, buf);
-    if (out_len < 0)
-        return JS_EXCEPTION;
-    val = JS_NewUTF32String(ctx, out_buf, out_len);
-    js_free(ctx, out_buf);
-    return val;
-}
 
 /* also used for String.prototype.valueOf */
 static JSValue js_string_toString(JSContext *ctx, JSValueConst this_val,
@@ -55465,8 +55467,8 @@ static const JSCFunctionListEntry js_string_proto_funcs[] = {
     JS_CFUNC_STEP_DEF("codePointAt", 1, STEPDEF_STR_CODEPOINTAT ),
     JS_CFUNC_DEF("isWellFormed", 0, js_string_isWellFormed ),
     JS_CFUNC_DEF("toWellFormed", 0, js_string_toWellFormed ),
-    JS_CFUNC_MAGIC_DEF("indexOf", 1, js_string_indexOf, 0 ),
-    JS_CFUNC_MAGIC_DEF("lastIndexOf", 1, js_string_indexOf, 1 ),
+    JS_CFUNC_STEP_DEF("indexOf", 1, STEPDEF_STR_INDEXOF ),
+    JS_CFUNC_STEP_DEF("lastIndexOf", 1, STEPDEF_STR_LASTINDEXOF ),
     JS_CFUNC_MAGIC_DEF("includes", 1, js_string_includes, 0 ),
     JS_CFUNC_MAGIC_DEF("endsWith", 1, js_string_includes, 2 ),
     JS_CFUNC_MAGIC_DEF("startsWith", 1, js_string_includes, 1 ),
@@ -55474,7 +55476,7 @@ static const JSCFunctionListEntry js_string_proto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("matchAll", 1, js_string_match, JS_ATOM_Symbol_matchAll ),
     JS_CFUNC_MAGIC_DEF("search", 1, js_string_match, JS_ATOM_Symbol_search ),
     JS_CFUNC_DEF("split", 2, js_string_split ),
-    JS_CFUNC_DEF("substring", 2, js_string_substring ),
+    JS_CFUNC_STEP_DEF("substring", 2, STEPDEF_STR_SUBSTRING ),
     JS_CFUNC_DEF("substr", 2, js_string_substr ),
     JS_CFUNC_DEF("slice", 2, js_string_slice ),
     JS_CFUNC_DEF("repeat", 1, js_string_repeat ),
@@ -55490,7 +55492,7 @@ static const JSCFunctionListEntry js_string_proto_funcs[] = {
     JS_CFUNC_DEF("toString", 0, js_string_toString ),
     JS_CFUNC_DEF("valueOf", 0, js_string_toString ),
     JS_CFUNC_DEF("localeCompare", 1, js_string_localeCompare ),
-    JS_CFUNC_DEF("normalize", 0, js_string_normalize ),
+    JS_CFUNC_STEP_DEF("normalize", 0, STEPDEF_STR_NORMALIZE ),
     JS_CFUNC_MAGIC_DEF("toLowerCase", 0, js_string_toLowerCase, 1 ),
     JS_CFUNC_MAGIC_DEF("toUpperCase", 0, js_string_toLowerCase, 0 ),
     JS_CFUNC_MAGIC_DEF("toLocaleLowerCase", 0, js_string_toLowerCase, 1 ),
