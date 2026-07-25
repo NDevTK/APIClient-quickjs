@@ -66859,8 +66859,23 @@ static JSValue js_typed_array_from(JSContext *ctx, JSValueConst this_val,
         /* FALLBACK — TypedArray.from over an ITERABLE drives .next and the mapfn from C. Alive because
            tramp_can_call_ta_from_consume narrows to generator-backed sources. The array-like path below is a
            different algorithm (length + indices) and is not this. */
-        DFAIL("TypedArray.from is iterating from C — route this call site onto the consume machine (widen "
-              "tramp_can_call_ta_from_consume past generator-backed sources)");
+        /* The iteration itself IS routed (tramp_can_call_ta_from_consume takes any callable @@iterator). What
+           still reaches here is the receiver: the recognizer requires `this` to be a CONCRETE %TypedArray%
+           constructor, so `%TypedArray%.from([])`, `TA.from.call(customCtor, …)` and `TA.from.call(nonCtor, …)`
+           decline and land in this loop. Widening that gate needs the SPEC create, which the routed path does not
+           have: 23.2.2.1 step 5.c is TypedArrayCreateFromConstructor(C, «len») — a real Construct(C, [len]) — and
+           the routed finish instead takes the js_typed_array_constructor_obj shortcut, which never calls C. So the
+           three named pieces, in order:
+             1. do_construct_tramp needs an OUTER CONTINUATION (JSConstruct gains outer/outer_kind, and do_return's
+                CONT_CONSTRUCT arm settles into it instead of always pushing). Without it a custom bytecode ctor
+                would be Constructed from C — a new drive-to-completion, which is why the gate was not simply
+                widened.
+             2. With that, the consume DONE requests Construct(C, [len]) and re-enters as a create phase.
+             3. The mapfn map+set becomes a SECOND per-element phase over the created TA, reusing the cb_pending
+                callback drive ITERCONS_FROM already has (spec runs mapfn AFTER the whole collect, not during). */
+        DFAIL("TypedArray.from is iterating from C — the receiver gate (concrete %TypedArray% ctor only) and the "
+              "mapfn map+set are unbuilt; both need do_construct_tramp to accept an outer continuation so "
+              "TypedArrayCreateFromConstructor's Construct(C, [len]) runs on the tramp");
         arr = JS_NewArray(ctx);
         if (JS_IsException(arr)) {
             JS_FreeValue(ctx, iter);
