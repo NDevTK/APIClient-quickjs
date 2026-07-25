@@ -19369,6 +19369,14 @@ typedef struct JSArraySearch {
     int64_t len, n;
 } JSArraySearch;
 
+/* JSON.rawJSON: ToString on its argument is the page's code, and everything after it — the validation, the
+   parse, building the frozen wrapper — runs none. */
+typedef struct JSJsonRaw {
+    JSStepHdr hdr;
+    JSValue str;          /* the argument as a string (owned; HANDED to the wrapper on success) */
+    JSValue result;       /* DONE (owned) */
+} JSJsonRaw;
+
 /* TypedArray.prototype at / set: the receiver validation is C, and then the index (at) or the offset (set) is
    ToIntegerOrInfinity — the page's code. `at` re-reads the live element count afterwards because that coercion
    can resize or detach the backing buffer, which is exactly why the C body had a comment saying so. */
@@ -51123,7 +51131,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_ARRAY_INDEXOF, STEPDEF_ARRAY_LASTINDEXOF, STEPDEF_ARRAY_INCLUDES,
     STEPDEF_STR_TRIM, STEPDEF_STR_TRIMSTART, STEPDEF_STR_TRIMEND, STEPDEF_STR_AT, STEPDEF_STR_CODEPOINTAT,
     STEPDEF_STR_SUBSTRING, STEPDEF_STR_INDEXOF, STEPDEF_STR_LASTINDEXOF, STEPDEF_STR_NORMALIZE,
-    STEPDEF_TA_AT, STEPDEF_TA_SET,
+    STEPDEF_TA_AT, STEPDEF_TA_SET, STEPDEF_JSON_RAWJSON,
     STEPDEF_COUNT
 };
 static int js_str_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
@@ -51140,6 +51148,8 @@ static int js_str_recv_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
 static JSValue js_str_recv_fini(JSContext *ctx, void *st, bool take_result);
 static int js_ta_idx_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_ta_idx_fini(JSContext *ctx, void *st, bool take_result);
+static int js_json_raw_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_json_raw_fini(JSContext *ctx, void *st, bool take_result);
 /* One NAMED definition per builtin, referenced by its JS_CFUNC_STEP_DEF registration through the id above — the same shape as
    JS_CFUNC_MAGIC_DEF naming its C function, so the registration line tells you what runs. An index into a side
    table would be a second list to keep in sync and a magic number that silently repoints when a row is inserted. */
@@ -51184,6 +51194,7 @@ static const JSTrampStepDef js_str_lastIndexOf_def= { sizeof(JSStrRecv), js_str_
 static const JSTrampStepDef js_str_normalize_def  = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_NORMALIZE };
 static const JSTrampStepDef js_ta_at_def          = { sizeof(JSTAIdx), js_ta_idx_step, js_ta_idx_fini, TAIDX_AT };
 static const JSTrampStepDef js_ta_set_def         = { sizeof(JSTAIdx), js_ta_idx_step, js_ta_idx_fini, TAIDX_SET };
+static const JSTrampStepDef js_json_raw_def       = { sizeof(JSJsonRaw), js_json_raw_step, js_json_raw_fini, 0 };
 static const JSTrampStepDef js_array_reduce_def  = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduce };
 static const JSTrampStepDef js_array_reduceR_def = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduceRight };
 static const JSTrampStepDef js_ta_reduce_def     = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduce | special_TA };
@@ -51230,6 +51241,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_STR_NORMALIZE]   = &js_str_normalize_def,
     [STEPDEF_TA_AT]           = &js_ta_at_def,
     [STEPDEF_TA_SET]          = &js_ta_set_def,
+    [STEPDEF_JSON_RAWJSON]    = &js_json_raw_def,
     [STEPDEF_ARRAY_REDUCE]  = &js_array_reduce_def,  [STEPDEF_ARRAY_REDUCE_RIGHT] = &js_array_reduceR_def,
     [STEPDEF_TA_REDUCE]     = &js_ta_reduce_def,     [STEPDEF_TA_REDUCE_RIGHT]    = &js_ta_reduceR_def,
 };
@@ -51256,6 +51268,7 @@ STEP_STATE_HDR_FIRST(JSArrayAt);
 STEP_STATE_HDR_FIRST(JSArraySearch);
 STEP_STATE_HDR_FIRST(JSStrRecv);
 STEP_STATE_HDR_FIRST(JSTAIdx);
+STEP_STATE_HDR_FIRST(JSJsonRaw);
 
 static const JSTrampStepDef *tramp_step_def_of(JSValueConst func)
 {
@@ -58595,47 +58608,65 @@ static bool is_valid_raw_json_char(int c)
             c == '"');
 }
 
-static JSValue js_json_rawJSON(JSContext *ctx, JSValueConst this_val,
-                               int argc, JSValueConst *argv)
+static int js_json_raw_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    JSValue str, res, obj;
+    JSJsonRaw *s = st;
     JSString *p;
-    str = JS_ToString(ctx, argv[0]);
-    if (JS_IsException(str))
-        return str;
-    p = JS_VALUE_GET_STRING(str);
+    JSValue res, obj;
+    int r;
+
+    if (s->hdr.stage == 0) {
+        if (s->hdr.str_phase == STR_PH_START) { s->str = JS_UNDEFINED; s->result = JS_UNDEFINED; }
+        r = step_tostring_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->str, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 1;
+    }
+    JS_FreeValue(ctx, cb_result);
+
+    p = JS_VALUE_GET_STRING(s->str);
     if (p->len == 0 ||
         !is_valid_raw_json_char(string_get(p, 0)) ||
-        !is_valid_raw_json_char(string_get(p, p->len - 1))) {
+        !is_valid_raw_json_char(string_get(p, p->len - 1)))
         goto syntax_error;
-    }
     /* rawJSON only validates: no reviver, so this is the plain parse — JS_ParseJSON_internal is the one parser,
        reached directly rather than through a builtin entry that no longer exists. */
     {
         const char *cs; size_t cl;
-        cs = JS_ToCStringLen(ctx, &cl, str);
+        cs = JS_ToCStringLen(ctx, &cl, s->str);
         res = cs ? JS_ParseJSON_internal(ctx, cs, cl, "<input>", NULL) : JS_EXCEPTION;
         if (cs) JS_FreeCString(ctx, cs);
     }
     if (JS_IsException(res)) {
     syntax_error:
         JS_ThrowSyntaxError(ctx, "invalid rawJSON string");
-        goto fail;
+        return -1;
     }
     JS_FreeValue(ctx, res);
 
     obj = JS_NewObjectProtoClass(ctx, JS_NULL, JS_CLASS_RAWJSON);
     if (JS_IsException(obj))
-        goto fail;
-    if (JS_DefinePropertyValue(ctx, obj, JS_ATOM_rawJSON, str, JS_PROP_ENUMERABLE) < 0) {
+        return -1;
+    /* the define CONSUMES the string, so the state must stop owning it or fini would free it twice */
+    if (JS_DefinePropertyValue(ctx, obj, JS_ATOM_rawJSON, s->str, JS_PROP_ENUMERABLE) < 0) {
+        s->str = JS_UNDEFINED;
         JS_FreeValue(ctx, obj);
-        return JS_EXCEPTION;
+        return -1;
     }
+    s->str = JS_UNDEFINED;
     JS_PreventExtensions(ctx, obj);
-    return obj;
- fail:
-    JS_FreeValue(ctx, str);
-    return JS_EXCEPTION;
+    s->result = obj;
+    return 0;
+}
+
+static JSValue js_json_raw_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSJsonRaw *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    JS_FreeValue(ctx, s->str);
+    js_free(ctx, s);
+    return r;
 }
 
 typedef struct JSONStringifyContext {
@@ -59041,7 +59072,7 @@ static JSValue js_json_stringify(JSContext *ctx, JSValueConst this_val,
 static const JSCFunctionListEntry js_json_funcs[] = {
     JS_CFUNC_DEF("isRawJSON", 1, js_json_isRawJSON ),
     JS_CFUNC_STEP_DEF("parse", 2, STEPDEF_JSON_PARSE ),
-    JS_CFUNC_DEF("rawJSON", 1, js_json_rawJSON ),
+    JS_CFUNC_STEP_DEF("rawJSON", 1, STEPDEF_JSON_RAWJSON ),
     JS_CFUNC_DEF("stringify", 3, js_json_stringify ),
     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "JSON", JS_PROP_CONFIGURABLE ),
 };
