@@ -1423,6 +1423,9 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_BIGINT_ASUINTN, STEPDEF_BIGINT_ASINTN,
     STEPDEF_OBJ_GOPD, STEPDEF_REFLECT_GOPD,
     STEPDEF_REGEXP_EXEC, STEPDEF_REGEXP_TEST,
+    STEPDEF_ITER_TAKE, STEPDEF_ITER_DROP,
+    STEPDEF_FUNCTION_CTOR, STEPDEF_GENERATOR_FUNCTION_CTOR,
+    STEPDEF_ASYNC_FUNCTION_CTOR, STEPDEF_ASYNC_GENERATOR_FUNCTION_CTOR,
     STEPDEF_DV_FIRST,
 #define DV_STEPDEF_LIST(F) F(INT8) F(UINT8) F(INT16) F(UINT16) F(INT32) F(UINT32) \
                            F(BIG_INT64) F(BIG_UINT64) F(FLOAT16) F(FLOAT32) F(FLOAT64)
@@ -18065,6 +18068,10 @@ typedef struct JSTrampStepDef {
        too. Like precheck it is part of the declaration: it names the computation the spec interleaves, and the
        body re-runs it on the way through. -1 = threw. */
     int      (*midcheck)(JSContext *ctx, JSValueConst *argp, int magic);
+    /* IfAbruptCloseIterator and its kin: what the spec does when an ARGUMENT COERCION throws. The coercion
+       aborts in the driver, which tears the machine down through fini, so this runs from there — and only when
+       a coercion was actually in flight, because a body that threw has already run its own cleanup. */
+    void     (*onerror)(JSContext *ctx, JSValueConst this_val, int magic);
 } JSTrampStepDef;
 static const JSTrampStepDef *tramp_step_def_of(JSValueConst func);
 #define CONT_TOPRIM        21  /* cont_state = JSToPrim: ToPrimitive's method call (7.1.1) running ON THE TRAMP.
@@ -18109,6 +18116,10 @@ typedef struct JSStepHdr {
     JSValue coerce;
     JSValue cb_coerce[2];
     uint8_t len_phase, spc_phase, num_phase, str_phase, get_phase;
+    /* an ARGUMENT COERCION is outstanding, so an abandon here is the spec's abrupt-completion case (take/drop's
+       IfAbruptCloseIterator). It lives on the header because the teardown is what has to act on it, and the
+       teardown releases this_val — the receiver the handler needs — before the machine's own fini can see it. */
+    uint8_t coercing;
     /* the key a GETPROP sub-sequence is holding across its suspension. It is OWNED here because the driver
        BORROWS the atom the request carries, and released by the shared teardown so an abandon mid-read cannot
        leak it. JS_ATOM_NULL is zero, so a js_mallocz'd state already reads as "no read in flight". */
@@ -18153,6 +18164,22 @@ static void *tramp_step_state_new(JSContext *ctx, const JSTrampStepDef *sd, JSVa
 static inline JSValueConst step_arg(const JSStepHdr *h, int i)
 {
     return i < h->argc ? h->argv[i] : JS_UNDEFINED;
+}
+
+/* js_call_c_function switches the CURRENT REALM to the callee's before running a C builtin, and a step machine is
+   the same builtin — without this `new otherRealm.Function("")` builds its function, and its prototype, out of
+   the CALLER's intrinsics. Seven realm tests in built-ins/Function are what noticed; every machine was running
+   in the wrong realm, the Function constructor is just the first one for which that is observable. A CLOSURE
+   step machine (a Promise reaction, class JS_CLASS_C_FUNCTION_DATA) carries no realm of its own and runs in the
+   caller's, exactly as its non-machine counterpart did. */
+static inline JSContext *step_realm(JSContext *ctx, const JSStepHdr *h)
+{
+    if (JS_VALUE_GET_TAG(h->func_obj) == JS_TAG_OBJECT) {
+        JSObject *p = JS_VALUE_GET_OBJ(h->func_obj);
+        if (p->class_id == JS_CLASS_C_FUNCTION && p->u.cfunc.realm)
+            return p->u.cfunc.realm;
+    }
+    return ctx;
 }
 
 
@@ -18501,6 +18528,8 @@ static JSValue tramp_step_state_free(JSContext *ctx, void *st, bool take_result)
 {
     JSStepHdr *h = st;
     int i;
+    if (!take_result && h->coercing && h->def->onerror)
+        h->def->onerror(ctx, h->this_val, h->def->body_magic);   /* BEFORE the receiver is released */
     JS_FreeValue(ctx, h->this_val);
     JS_FreeValue(ctx, h->func_obj);
     JS_FreeValue(ctx, h->coerce);   /* set only while a prologue coercion is in flight */
@@ -19602,6 +19631,9 @@ typedef struct JSCoerce1 {
    with which hint, and the arity the body reads (js_call_c_function pads to the declared length; a machine is
    handed the call's real operands, so the padding happens here or the body reads past the end). */
 #define PRIMARGS(mask, hint, nargs) ((mask) | ((hint) == HINT_STRING ? 0x100 : 0) | ((nargs) << 16))
+/* the Function constructor ToStrings EVERY argument, however many there are — a mask of positions cannot say
+   that, so "all of them" is its own bit rather than a mask wide enough for today's tests. */
+#define PRIMARGS_ALL 0x200
 typedef struct JSPrimArgs {
     JSStepHdr hdr;
     JSValue result;       /* DONE (owned) */
@@ -21981,7 +22013,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 void *stt = cont_st;
                 JSStepHdr *h = stt;
                 JSValue *cb = NULL; int cbn = 0;
-                int st = h->def->step(ctx, stt, ret_val, &cb, &cbn);
+                int st = h->def->step(step_realm(ctx, h), stt, ret_val, &cb, &cbn);
                 if (unlikely(st < 0)) {
                     tramp_step_chain_free(ctx, stt);   /* and the machines waiting on it */
                     goto exception;
@@ -49428,6 +49460,7 @@ static int js_primargs_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
         s->hdr.stage = 1;
     } else {
         DCHECK(s->next > 0, "coerce-then-compute: a primitive arrived with no coercion in flight");
+        s->hdr.coercing = 0;
         JS_FreeValue(ctx, s->argp[s->next - 1]);
         s->argp[s->next - 1] = cb_result;   /* the primitive REPLACES the argument the body will read */
         if (s->next == 1 && s->hdr.def->midcheck
@@ -49436,10 +49469,11 @@ static int js_primargs_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
     }
     while (s->next < s->nargp) {
         i = s->next++;
-        if (i >= 8 || !((mask >> i) & 1)) continue;
+        if (!(s->hdr.arg & PRIMARGS_ALL) && (i >= 8 || !((mask >> i) & 1))) continue;
         if (JS_VALUE_GET_TAG(s->argp[i]) == JS_TAG_OBJECT) {
             s->cb[0] = s->argp[i];   /* borrowed: the vector holds the reference */
             *out_cb = s->cb; *out_argc = hint;
+            s->hdr.coercing = 1;
             return 5;
         }
         /* the argument was already primitive, so its own interleaved validation is due right here */
@@ -51643,6 +51677,9 @@ static int js_array_join_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
 static JSValue js_array_join_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_bigint_asUintN(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int asIntN);
 static JSValue js_object_getOwnPropertyDescriptor(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
+static JSValue js_create_iterator_helper(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
+static int js_iterator_helper_precheck(JSContext *ctx, JSValueConst this_val, int magic);
+static void js_iterator_helper_close(JSContext *ctx, JSValueConst this_val, int magic);
 static JSValue js_regexp_exec(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 static JSValue js_regexp_test(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 static JSValue js_dataview_getValue(JSContext *ctx, JSValueConst this_obj, int argc, JSValueConst *argv, int class_id);
@@ -51717,16 +51754,25 @@ static const JSTrampStepDef js_array_join_def     = { sizeof(JSArrayJoin), js_ar
 static const JSTrampStepDef js_array_tolocale_def = { sizeof(JSArrayJoin), js_array_join_step, js_array_join_fini, JOIN_ARRAY_LOCALE };
 static const JSTrampStepDef js_ta_join_def        = { sizeof(JSArrayJoin), js_array_join_step, js_array_join_fini, JOIN_TA };
 static const JSTrampStepDef js_ta_tolocale_def    = { sizeof(JSArrayJoin), js_array_join_step, js_array_join_fini, JOIN_TA_LOCALE };
-#define PRIMARGS_DEF(spec, proto, fn, magic) \
-    { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, (spec), { .proto = (fn) }, JS_CFUNC_##proto, (magic), NULL, NULL }
-#define PRIMARGS_DEF_PRE(spec, proto, fn, magic, pre, mid) \
-    { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, (spec), { .proto = (fn) }, JS_CFUNC_##proto, (magic), (pre), (mid) }
+#define PRIMARGS_DEF_FULL(spec, proto, fn, magic, pre, mid, err) \
+    { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, (spec), { .proto = (fn) }, JS_CFUNC_##proto, (magic), (pre), (mid), (err) }
+#define PRIMARGS_DEF(spec, proto, fn, magic)                PRIMARGS_DEF_FULL(spec, proto, fn, magic, NULL, NULL, NULL)
+#define PRIMARGS_DEF_PRE(spec, proto, fn, magic, pre, mid)  PRIMARGS_DEF_FULL(spec, proto, fn, magic, pre, mid, NULL)
 static const JSTrampStepDef js_bigint_asUintN_def = PRIMARGS_DEF(PRIMARGS(0x3, HINT_NUMBER, 2), generic_magic, js_bigint_asUintN, 0);
 static const JSTrampStepDef js_bigint_asIntN_def  = PRIMARGS_DEF(PRIMARGS(0x3, HINT_NUMBER, 2), generic_magic, js_bigint_asUintN, 1);
 static const JSTrampStepDef js_obj_gopd_def       = PRIMARGS_DEF(PRIMARGS(0x2, HINT_STRING, 2), generic_magic, js_object_getOwnPropertyDescriptor, 0);
 static const JSTrampStepDef js_reflect_gopd_def   = PRIMARGS_DEF(PRIMARGS(0x2, HINT_STRING, 2), generic_magic, js_object_getOwnPropertyDescriptor, 1);
+static const JSTrampStepDef js_iter_take_def      = PRIMARGS_DEF_FULL(PRIMARGS(0x1, HINT_NUMBER, 1), generic_magic, js_create_iterator_helper, JS_ITERATOR_HELPER_KIND_TAKE, js_iterator_helper_precheck, NULL, js_iterator_helper_close);
+static const JSTrampStepDef js_iter_drop_def      = PRIMARGS_DEF_FULL(PRIMARGS(0x1, HINT_NUMBER, 1), generic_magic, js_create_iterator_helper, JS_ITERATOR_HELPER_KIND_DROP, js_iterator_helper_precheck, NULL, js_iterator_helper_close);
 static const JSTrampStepDef js_regexp_exec_def    = PRIMARGS_DEF(PRIMARGS(0x1, HINT_STRING, 1), generic, js_regexp_exec, 0);
 static const JSTrampStepDef js_regexp_test_def    = PRIMARGS_DEF(PRIMARGS(0x1, HINT_STRING, 1), generic, js_regexp_test, 0);
+/* new Function(a, b, body) / the generator and async variants: 20.2.1.1 CreateDynamicFunction ToStrings every
+   argument in order and everything after is the parser. The receiver slot is new_target on a constructor step,
+   which is exactly what the body reads. */
+static const JSTrampStepDef js_function_ctor_def  = PRIMARGS_DEF(PRIMARGS_ALL | PRIMARGS(0, HINT_STRING, 0), generic_magic, js_function_constructor, JS_FUNC_NORMAL);
+static const JSTrampStepDef js_genfn_ctor_def     = PRIMARGS_DEF(PRIMARGS_ALL | PRIMARGS(0, HINT_STRING, 0), generic_magic, js_function_constructor, JS_FUNC_GENERATOR);
+static const JSTrampStepDef js_asyncfn_ctor_def   = PRIMARGS_DEF(PRIMARGS_ALL | PRIMARGS(0, HINT_STRING, 0), generic_magic, js_function_constructor, JS_FUNC_ASYNC);
+static const JSTrampStepDef js_asyncgenfn_ctor_def= PRIMARGS_DEF(PRIMARGS_ALL | PRIMARGS(0, HINT_STRING, 0), generic_magic, js_function_constructor, JS_FUNC_ASYNC_GENERATOR);
 #define DV_STEPDEF_DEF(N) \
     static const JSTrampStepDef js_dv_get_##N##_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 2), generic_magic, js_dataview_getValue, JS_CLASS_##N##_ARRAY); \
     static const JSTrampStepDef js_dv_set_##N##_def = PRIMARGS_DEF_PRE(PRIMARGS(0x3, HINT_NUMBER, 3), generic_magic, js_dataview_setValue, JS_CLASS_##N##_ARRAY, js_dataview_set_precheck, js_dataview_set_midcheck);
@@ -51807,8 +51853,14 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_BIGINT_ASINTN]   = &js_bigint_asIntN_def,
     [STEPDEF_OBJ_GOPD]        = &js_obj_gopd_def,
     [STEPDEF_REFLECT_GOPD]    = &js_reflect_gopd_def,
+    [STEPDEF_ITER_TAKE]       = &js_iter_take_def,
+    [STEPDEF_ITER_DROP]       = &js_iter_drop_def,
     [STEPDEF_REGEXP_EXEC]     = &js_regexp_exec_def,
     [STEPDEF_REGEXP_TEST]     = &js_regexp_test_def,
+    [STEPDEF_FUNCTION_CTOR]   = &js_function_ctor_def,
+    [STEPDEF_GENERATOR_FUNCTION_CTOR] = &js_genfn_ctor_def,
+    [STEPDEF_ASYNC_FUNCTION_CTOR] = &js_asyncfn_ctor_def,
+    [STEPDEF_ASYNC_GENERATOR_FUNCTION_CTOR] = &js_asyncgenfn_ctor_def,
 #define DV_STEPDEF_ROW(N) [STEPDEF_DV_GET_##N] = &js_dv_get_##N##_def, [STEPDEF_DV_SET_##N] = &js_dv_set_##N##_def,
     DV_STEPDEF_LIST(DV_STEPDEF_ROW)
 #undef DV_STEPDEF_ROW
@@ -53515,6 +53567,32 @@ static JSValue js_iterator_proto_set_toStringTag(JSContext *ctx, JSValueConst th
 
 /* Iterator.prototype.{drop,take,map,filter,flatMap}: create the helper object over `this` (the source iterator).
    No drive-to-completion — pure object creation; the source is iterated lazily by the helper's .next(). */
+/* IfAbruptCloseIterator: close the source. A GENERATOR source's .return() must run its finally on the tramp
+   (js_generator_next is a DFAIL) — DEFER it to the interpreter caller via ctx->pending_close_gen, which its
+   exception label routes onto do_generator_tramp. A non-generator source's .return() is a plain call — close now.
+   Shared by the body's own failures and by the coerce-then-compute machine's abrupt-coercion hook, because the
+   spec makes no distinction between them: step 5 of take/drop closes for BOTH. */
+static void js_iterator_helper_close(JSContext *ctx, JSValueConst this_val, int magic)
+{
+    if (JS_VALUE_GET_TAG(this_val) == JS_TAG_OBJECT) {
+        JSObject *tp = JS_VALUE_GET_OBJ(this_val);
+        if (tp->class_id == JS_CLASS_GENERATOR && tp->u.generator_data
+            && ((JSGeneratorData *)tp->u.generator_data)->state != JS_GENERATOR_STATE_EXECUTING) {
+            DCHECK(JS_IsUninitialized(ctx->pending_close_gen), "pending_close_gen already set — nested IfAbruptCloseIterator");
+            ctx->pending_close_gen = js_dup(this_val);
+            return;
+        }
+    }
+    JS_IteratorClose(ctx, this_val, true);
+}
+
+/* 27.1.4.5/27.1.4.3 steps 1-2: the receiver must be an Object, and that TypeError precedes the limit's
+   coercion AND does not close anything. */
+static int js_iterator_helper_precheck(JSContext *ctx, JSValueConst this_val, int magic)
+{
+    return check_iterator(ctx, this_val);
+}
+
 static JSValue js_create_iterator_helper(JSContext *ctx, JSValueConst this_val,
                                          int argc, JSValueConst *argv, int magic)
 {
@@ -53606,19 +53684,7 @@ static JSValue js_create_iterator_helper(JSContext *ctx, JSValueConst this_val,
 range_error:
     JS_ThrowRangeError(ctx, "must be positive");
 fail:
-    /* IfAbruptCloseIterator: close the source. A GENERATOR source's .return() must run its finally on the tramp
-       (js_generator_next is a DFAIL) — DEFER it to the interpreter caller via ctx->pending_close_gen, which its
-       exception label routes onto do_generator_tramp. A non-generator source's .return() is a plain call — close now. */
-    if (JS_VALUE_GET_TAG(this_val) == JS_TAG_OBJECT) {
-        JSObject *tp = JS_VALUE_GET_OBJ(this_val);
-        if (tp->class_id == JS_CLASS_GENERATOR && tp->u.generator_data
-            && ((JSGeneratorData *)tp->u.generator_data)->state != JS_GENERATOR_STATE_EXECUTING) {
-            DCHECK(JS_IsUninitialized(ctx->pending_close_gen), "pending_close_gen already set — nested IfAbruptCloseIterator");
-            ctx->pending_close_gen = js_dup(this_val);
-            return JS_EXCEPTION;
-        }
-    }
-    JS_IteratorClose(ctx, this_val, true);
+    js_iterator_helper_close(ctx, this_val, magic);
     return JS_EXCEPTION;
 }
 
@@ -53946,8 +54012,8 @@ static JSValue js_iterator_proto_terminal(JSContext *ctx, JSValueConst this_val,
 static const JSCFunctionListEntry js_iterator_proto_funcs[] = {
     /* LAZY helpers create a helper object; its .next() drives the source on the tramp. The EAGER terminals consume
        the iterator to completion — they run as ITERCONS_ITERTERM on the tramp (do_iterterm_tramp), never a C loop. */
-    JS_CFUNC_MAGIC_DEF("drop", 1, js_create_iterator_helper, JS_ITERATOR_HELPER_KIND_DROP ),
-    JS_CFUNC_MAGIC_DEF("take", 1, js_create_iterator_helper, JS_ITERATOR_HELPER_KIND_TAKE ),
+    JS_CFUNC_STEP_DEF("drop", 1, STEPDEF_ITER_DROP ),
+    JS_CFUNC_STEP_DEF("take", 1, STEPDEF_ITER_TAKE ),
     JS_CFUNC_MAGIC_DEF("map", 1, js_create_iterator_helper, JS_ITERATOR_HELPER_KIND_MAP ),
     JS_CFUNC_MAGIC_DEF("filter", 1, js_create_iterator_helper, JS_ITERATOR_HELPER_KIND_FILTER ),
     JS_CFUNC_MAGIC_DEF("flatMap", 1, js_create_iterator_helper, JS_ITERATOR_HELPER_KIND_FLAT_MAP ),
@@ -65337,9 +65403,8 @@ int JS_AddIntrinsicPromise(JSContext *ctx)
     ctx->promise_ctor = obj1;
 
     /* AsyncFunction */
-    ft.generic_magic = js_function_constructor;
     obj1 = JS_NewCConstructor(ctx, JS_CLASS_ASYNC_FUNCTION, "AsyncFunction",
-                              ft.generic, 1, JS_CFUNC_constructor_or_func_magic, JS_FUNC_ASYNC,
+                              NULL, 1, JS_CFUNC_step_ctor, STEPDEF_ASYNC_FUNCTION_CTOR,
                               ctx->function_ctor,
                               NULL, 0,
                               js_async_function_proto_funcs, countof(js_async_function_proto_funcs),
@@ -65373,9 +65438,8 @@ int JS_AddIntrinsicPromise(JSContext *ctx)
         return -1;
 
     /* AsyncGeneratorFunction */
-    ft.generic_magic = js_function_constructor;
     obj1 = JS_NewCConstructor(ctx, JS_CLASS_ASYNC_GENERATOR_FUNCTION, "AsyncGeneratorFunction",
-                              ft.generic, 1, JS_CFUNC_constructor_or_func_magic, JS_FUNC_ASYNC_GENERATOR,
+                              NULL, 1, JS_CFUNC_step_ctor, STEPDEF_ASYNC_GENERATOR_FUNCTION_CTOR,
                               ctx->function_ctor,
                               NULL, 0,
                               js_async_generator_function_proto_funcs, countof(js_async_generator_function_proto_funcs),
@@ -67236,9 +67300,8 @@ int JS_AddIntrinsicBaseObjects(JSContext *ctx)
     JS_FreeValue(ctx, obj1);
 
     /* Function */
-    ft.generic_magic = js_function_constructor;
     obj1 = JS_NewCConstructor(ctx, JS_CLASS_BYTECODE_FUNCTION, "Function",
-                              ft.generic, 1, JS_CFUNC_constructor_or_func_magic, JS_FUNC_NORMAL,
+                              NULL, 1, JS_CFUNC_step_ctor, STEPDEF_FUNCTION_CTOR,
                               JS_UNDEFINED,
                               NULL, 0,
                               js_function_proto_funcs, countof(js_function_proto_funcs),
@@ -67470,9 +67533,8 @@ int JS_AddIntrinsicBaseObjects(JSContext *ctx)
     if (JS_IsException(ctx->class_proto[JS_CLASS_GENERATOR]))
         return -1;
 
-    ft.generic_magic = js_function_constructor;
     obj1 = JS_NewCConstructor(ctx, JS_CLASS_GENERATOR_FUNCTION, "GeneratorFunction",
-                              ft.generic, 1, JS_CFUNC_constructor_or_func_magic, JS_FUNC_GENERATOR,
+                              NULL, 1, JS_CFUNC_step_ctor, STEPDEF_GENERATOR_FUNCTION_CTOR,
                               ctx->function_ctor,
                               NULL, 0,
                               js_generator_function_proto_funcs,
