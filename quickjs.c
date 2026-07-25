@@ -418,6 +418,15 @@ struct JSRuntime {
     void *user_opaque;
     void *libc_opaque;
     JSRuntimeFinalizerState *finalizers;
+    /* THE PUMP'S PARKED SLOT — see JS_ParkFlow. It lives on the RUNTIME because that is what it is: the flow it
+       holds owns an async activation belonging to THIS runtime's heap, and resuming it from anywhere else frees a
+       frame that another runtime is running. It was a process global with the rt parameter accepted and ignored,
+       which made run-test262's worker threads share one slot: thread A parked its flow, thread B's pump resumed
+       it, and the abort surfaced as "async_func_free: freeing a RUNNING async frame" in a random test. That made
+       the ONE gate nondeterministic — a DFAIL that fires 3 runs in 4 names nothing, and a green run proves
+       nothing either. Per-runtime (not merely per-thread) is the honest scope: two runtimes on one thread are
+       just as separate. */
+    struct { JSFlowParkFn *fn; void *opaque; JSContext *ctx; } parked_flow;
 };
 
 struct JSClass {
@@ -18420,6 +18429,12 @@ static int js_str_replace_step(JSContext *ctx, JSStrReplace *s, JSValue cb_resul
 static void js_str_replace_end(JSContext *ctx, JSStrReplace *s, bool take_result);
 static JSValue js_promise_constructor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv);
 static JSValue js_promise_new(JSContext *ctx, JSValueConst new_target, JSValue *resolving_funcs);
+/* WrapForValidIterator's [[Iterated]] record — defined HERE (not at its finalizer) because the interpreter builds
+   one: Iterator.from's wrapper is created by the CONT_ITER_FROM deliver, on the tramp. */
+typedef struct JSIteratorWrapData {
+    JSValue wrapped_iter;
+    JSValue wrapped_next;
+} JSIteratorWrapData;
 #define CONT_ITER_FROM     12  /* cont_state = JSIterFrom: Iterator.from(obj) — GetIterator(obj) is performed by the
                                   shared acquire (so a generator-function @@iterator is created ON THE TRAMP) and the
                                   resulting iterator IS the call's result; the deliver just yields it. */
@@ -18439,23 +18454,21 @@ typedef struct JSConsumeGetIter { void *consumer; uint8_t consumer_kind; } JSCon
 static JSValue js_iterator_from(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 static bool iter_data_at_iterator(JSContext *ctx, JSValueConst items, JSValue *out);
 static bool tramp_can_call_gen_create(JSValueConst func);
-/* Iterator.from(obj) whose @@iterator is a generator function: that call creates a coroutine, so it must run on the
-   tramp. Probe is side-effect-free (descriptor only), so it cannot disturb Iterator.from's own read order. */
+/* Iterator.from — EVERY argument, including a primitive and a non-iterable. There is nothing left to SELECT: the
+   tramp arm performs the whole of 27.1.3.1 (its TypeErrors included) and the C entry DFAILs, so the only thing
+   this does is pass the side-effect-free @@iterator probe along for the acquire to use. Its ABSENCE is the
+   acquire's flattenable "O is its own iterator" case, never a reason to refuse the route. */
 static bool tramp_can_call_iterator_from(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, JSValue *out_getiter)
 {
     JSObject *fp;
     *out_getiter = JS_UNDEFINED;
-    if (call_argc < 1) return false;
     if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
     fp = JS_VALUE_GET_OBJ(func);
     if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
     if (fp->u.cfunc.cproto != JS_CFUNC_generic) return false;
     if (fp->u.cfunc.c_function.generic != js_iterator_from) return false;
-    if (JS_VALUE_GET_TAG(call_argv[0]) != JS_TAG_OBJECT) return false;   /* string/primitive: plain C path */
-    if (!iter_data_at_iterator(ctx, call_argv[0], out_getiter)) return false;
-    if (tramp_can_call_gen_create(*out_getiter)) return true;
-    JS_FreeValue(ctx, *out_getiter); *out_getiter = JS_UNDEFINED;
-    return false;
+    if (call_argc >= 1) iter_data_at_iterator(ctx, call_argv[0], out_getiter);   /* JS_UNDEFINED when absent/uncallable */
+    return true;
 }
 #define CONT_ITER_HELPER   11  /* cont_state = JSIteratorHelperData: a lazy Iterator Helper (drop/take/map/filter/
                                   flatMap) whose .next() drives the SOURCE iterator's .next() on the chain (a generator
@@ -19143,22 +19156,18 @@ static _Thread_local JSAsyncFunctionState *g_flow_base_gen = NULL;
    preempts inside job-driven code parks HERE, and the host pump (JS_ResumeParkedFlow, called before draining a
    job) resumes it. One slot is what a single-flow engine needs today; the solver's ranked frontier replaces the
    slot, not the contract — "resume the top-ranked parked flow before starting new work" holds at both sizes. */
-static JSFlowParkFn *g_parked_fn = NULL;
-static void *g_parked_opaque = NULL;
-static JSContext *g_parked_ctx = NULL;
-
 void JS_ParkFlow(JSContext *ctx, JSFlowParkFn *fn, void *opaque) {
-    assert(g_parked_fn == NULL);   /* one parked flow at a time: it resumes before any other work runs */
-    g_parked_ctx = ctx; g_parked_fn = fn; g_parked_opaque = opaque;
+    JSRuntime *rt = ctx->rt;
+    DCHECK(rt->parked_flow.fn == NULL, "two flows parked at once: the slot resumes before any other work runs");
+    rt->parked_flow.ctx = ctx; rt->parked_flow.fn = fn; rt->parked_flow.opaque = opaque;
 }
-bool JS_HasParkedFlow(JSRuntime *rt) { (void)rt; return g_parked_fn != NULL; }
+bool JS_HasParkedFlow(JSRuntime *rt) { return rt->parked_flow.fn != NULL; }
 bool JS_ResumeParkedFlow(JSRuntime *rt) {
-    JSFlowParkFn *fn = g_parked_fn;
-    JSContext *ctx = g_parked_ctx;
-    void *op = g_parked_opaque;
-    (void)rt;
+    JSFlowParkFn *fn = rt->parked_flow.fn;
+    JSContext *ctx = rt->parked_flow.ctx;
+    void *op = rt->parked_flow.opaque;
     if (!fn) return false;
-    g_parked_fn = NULL; g_parked_opaque = NULL; g_parked_ctx = NULL;
+    rt->parked_flow.fn = NULL; rt->parked_flow.opaque = NULL; rt->parked_flow.ctx = NULL;
     fn(ctx, op);   /* may park again at the next back-edge — the pump loops */
     return true;
 }
@@ -21253,31 +21262,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
 
         do_iterfrom_tramp:
-            /* Iterator.from(obj) whose @@iterator is a generator function: perform Iterator.from's own steps in order
-               (the already-an-Iterator short-circuit, then the real Get), and hand the method to the shared acquire so
-               the coroutine is CREATED on the tramp. The acquired iterator IS the result. */
+            /* 27.1.3.1 Iterator.from(O), the WHOLE of it — the C entry is gone. Step 1 is
+               GetIteratorFlattenable(O, iterate-string-primitives), which is the shared acquire in its FLATTENABLE
+               mode (the one step where it differs from GetIterator: an absent @@iterator makes O itself the
+               iterator instead of a TypeError). Steps 2-6 (GetIteratorDirect's `next`, the %Iterator%
+               hasInstance, and the WrapForValidIterator wrapper) are the deliver arm.
+
+               This also FIXES the order the C body had: it tested `O instanceof Iterator` BEFORE reading
+               @@iterator, so `Iterator.from(gen)` returned gen without ever calling its @@iterator — observable
+               whenever @@iterator is overridden. The spec tests the ACQUIRED iterator, not O. */
             {
-                JSValueConst obj = call_argv[0];
+                JSValueConst obj = (call_argc >= 1) ? call_argv[0] : JS_UNDEFINED;
                 JSIterFrom *s;
-                JSValue method;
-                int isit = JS_OrdinaryIsInstanceOf(ctx, obj, ctx->iterator_ctor);
-                if (isit < 0) { JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED; goto exception; }
-                if (isit) {   /* already an Iterator: Iterator.from returns it unchanged */
-                    JSValue r = js_dup(obj);
+                if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT && !JS_IsString(obj)) {
+                    /* GetIteratorFlattenable step 1: a non-Object that is not a String (iterate-string-primitives
+                       is the only primitive handling Iterator.from allows). */
                     JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED;
-                    { JSValue *cv = sp - call_argc; for (i = -2; i < call_argc; i++) JS_FreeValue(ctx, cv[i]); sp += -2 - call_argc; }
-                    if (tramp_is_tail) { ret_val = r; goto do_return; }
-                    *sp++ = r;
-                    BREAK;
+                    JS_ThrowTypeError(ctx, "Iterator.from called on non-object");
+                    goto exception;
                 }
-                method = JS_GetProperty(ctx, obj, JS_ATOM_Symbol_iterator);   /* the REAL Get, in Iterator.from's order */
-                JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED;
-                if (JS_IsException(method)) goto exception;
-                DCHECK(tramp_can_call_gen_create(method), "Iterator.from: probe said generator-function @@iterator");
                 s = js_mallocz(ctx, sizeof(*s));
-                if (unlikely(!s)) { JS_FreeValue(ctx, method); JS_ThrowOutOfMemory(ctx); goto exception; }
+                if (unlikely(!s)) { JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED;
+                                    JS_ThrowOutOfMemory(ctx); goto exception; }
                 s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
-                tramp_iter_getiter = method;
                 tramp_consume_iterable = obj; tramp_consume_state = s; tramp_consume_kind = CONT_ITER_FROM;
                 goto do_consume_acquire_iterator;
             }
@@ -21305,9 +21312,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         tramp_consume_acquired = JS_EXCEPTION;
                         goto do_consume_deliver_iterator;
                     }
-                    if (!JS_IsFunction(ctx, method)) {   /* undefined/null/non-callable => not iterable */
+                    if (!JS_IsFunction(ctx, method)) {   /* undefined/null/non-callable */
+                        bool flattenable = (tramp_consume_kind == CONT_ITER_FROM);
+                        bool nullish = JS_IsUndefined(method) || JS_IsNull(method);
                         JS_FreeValue(ctx, method);
-                        JS_ThrowTypeError(ctx, "value is not iterable");
+                        /* GetIteratorFlattenable (Iterator.from) vs GetIterator (every other consumer) — the ONE
+                           step where the two abstract operations differ. Flattenable with an ABSENT @@iterator
+                           takes O ITSELF as the iterator (`Iterator.from({next(){…}})` wraps a bare
+                           next-provider); GetIterator throws. A present-but-non-callable @@iterator is GetMethod's
+                           TypeError either way. */
+                        if (flattenable && nullish) {
+                            tramp_consume_acquired = js_dup(iterable);
+                            goto do_consume_deliver_iterator;
+                        }
+                        JS_ThrowTypeError(ctx, nullish ? "value is not iterable"
+                                                       : "value is not a function");
                         tramp_consume_acquired = JS_EXCEPTION;
                         goto do_consume_deliver_iterator;
                     }
@@ -21373,13 +21392,41 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto do_iter_consume_step;
                 }
                 if (ckind == CONT_ITER_FROM) {
+                    /* Iterator.from, steps after GetIteratorFlattenable's Call: step 4 (the iterator must be an
+                       Object), GetIteratorDirect's `next` — read UNCONDITIONALLY, before the hasInstance test,
+                       because the spec finishes the iterator record first — then step 2-3 (%Iterator%
+                       hasInstance) decides between the iterator itself and a WrapForValidIterator around it. */
                     JSIterFrom *fs = (JSIterFrom *)cst;
                     int cf = fs->orig_cfirst, cg = fs->orig_cargc; uint8_t itl = fs->orig_is_tail;
+                    JSValue nextm, r;
+                    JSIteratorWrapData *wd;
+                    int isit;
                     js_free_rt(rt, fs);
                     if (JS_IsException(acq)) goto exception;
+                    if (!JS_IsObject(acq)) {
+                        JS_FreeValue(ctx, acq);
+                        JS_ThrowTypeErrorNotAnObject(ctx);
+                        goto exception;
+                    }
+                    nextm = JS_GetProperty(ctx, acq, JS_ATOM_next);
+                    if (JS_IsException(nextm)) { JS_FreeValue(ctx, acq); goto exception; }
+                    isit = JS_OrdinaryIsInstanceOf(ctx, acq, ctx->iterator_ctor);
+                    if (isit < 0) { JS_FreeValue(ctx, nextm); JS_FreeValue(ctx, acq); goto exception; }
+                    if (isit) {
+                        JS_FreeValue(ctx, nextm);   /* the record is complete; an Iterator instance needs no wrapper */
+                        r = acq;
+                    } else {
+                        r = JS_NewObjectClass(ctx, JS_CLASS_ITERATOR_WRAP);
+                        if (JS_IsException(r)) { JS_FreeValue(ctx, nextm); JS_FreeValue(ctx, acq); goto exception; }
+                        wd = js_malloc(ctx, sizeof(*wd));
+                        if (unlikely(!wd)) { JS_FreeValue(ctx, r); JS_FreeValue(ctx, nextm); JS_FreeValue(ctx, acq); goto exception; }
+                        wd->wrapped_iter = acq;   /* transferred */
+                        wd->wrapped_next = nextm;
+                        JS_SetOpaqueInternal(r, wd);
+                    }
                     { JSValue *cv = sp - cg; for (i = cf; i < cg; i++) JS_FreeValue(ctx, cv[i]); sp += cf - cg; }
-                    if (itl) { ret_val = acq; goto do_return; }
-                    *sp++ = acq;
+                    if (itl) { ret_val = r; goto do_return; }
+                    *sp++ = r;
                     BREAK;
                 }
                 DCHECK(ckind == CONT_PROMISE_ALL, "consume deliver: unknown consumer kind");
@@ -50942,10 +50989,6 @@ static JSValue js_array_iterator_next(JSContext *ctx, JSValueConst this_val,
     }
 }
 
-typedef struct JSIteratorWrapData {
-    JSValue wrapped_iter;
-    JSValue wrapped_next;
-} JSIteratorWrapData;
 
 static void js_iterator_wrap_finalizer(JSRuntime *rt, JSValueConst val)
 {
@@ -51239,57 +51282,14 @@ fail:
 static JSValue js_iterator_from(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv)
 {
-    JSValue method, iter;
-    JSIteratorWrapData *it;
-    int ret;
-
-    JSValueConst obj = argv[0];
-    if (!JS_IsObject(obj) && !JS_IsString(obj))
-        return JS_ThrowTypeError(ctx, "Iterator.from called on non-object");
-    /* FALLBACK — Iterator.from ACQUIRES from C: it reads @@iterator (which may be an accessor, i.e. user JS) and
-       CALLS it, both off the tramp. Alive because tramp_can_call_iterator_from narrows to a generator-function
-       @@iterator. Acquisition belongs in the machine as its first step; until then this crashes rather than
-       quietly running a path that cannot suspend. */
-    DFAIL("Iterator.from is acquiring its iterator from C — route this call site onto the consume machine "
-          "(widen tramp_can_call_iterator_from past a generator-function @@iterator)");
-    if (JS_IsString(obj)) {
-        method = JS_GetProperty(ctx, obj, JS_ATOM_Symbol_iterator);
-        if (JS_IsException(method))
-            return JS_EXCEPTION;
-        return JS_CallFree(ctx, method, obj, 0, NULL);
-    }
-    ret = JS_OrdinaryIsInstanceOf(ctx, obj, ctx->iterator_ctor);
-    if (ret < 0)
-        return JS_EXCEPTION;
-    if (ret)
-        return js_dup(obj);
-    method = JS_GetProperty(ctx, obj, JS_ATOM_Symbol_iterator);
-    if (JS_IsException(method))
-        return JS_EXCEPTION;
-    if (JS_IsNull(method) || JS_IsUndefined(method)) {
-        method = JS_GetProperty(ctx, obj, JS_ATOM_next);
-        if (JS_IsException(method))
-            return JS_EXCEPTION;
-        iter = JS_NewObjectClass(ctx, JS_CLASS_ITERATOR_WRAP);
-        if (JS_IsException(iter))
-            goto fail;
-        it = js_malloc(ctx, sizeof(*it));
-        if (!it)
-            goto fail;
-        it->wrapped_iter = js_dup(obj);
-        it->wrapped_next = method;
-        JS_SetOpaqueInternal(iter, it);
-    } else {
-        iter = JS_GetIterator2(ctx, obj, method);
-        JS_FreeValue(ctx, method);
-        if (JS_IsException(iter))
-            return JS_EXCEPTION;
-    }
-    return iter;
-fail:
-    JS_FreeValue(ctx, method);
-    JS_FreeValue(ctx, iter);
-    return JS_EXCEPTION;
+    /* The C body is DELETED, not narrowed. 27.1.3.1 lives on the tramp (do_iterfrom_tramp + the shared acquire's
+       flattenable mode + the CONT_ITER_FROM deliver), which is the only implementation: it ACQUIRES by calling
+       @@iterator, and calling it from here is off-chain by construction. Reaching this entry means a call SHAPE
+       was never routed (`Iterator.from.apply(...)`, an invocation from inside a C builtin) — name that shape
+       instead of quietly running a second, non-suspending copy of the algorithm. */
+    DFAIL("Iterator.from reached its C entry — route that call shape onto the consume machine "
+          "(do_iterfrom_tramp performs the whole of 27.1.3.1)");
+    return JS_ThrowTypeError(ctx, "Iterator.from: unrouted call shape (no off-tramp implementation exists)");
 }
 
 static int check_iterator(JSContext *ctx, JSValueConst obj)
