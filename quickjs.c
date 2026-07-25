@@ -18799,7 +18799,9 @@ typedef struct JSAsyncFromSync {
    ITERNEXT: OP_iterator_next (`for await` / yield* delegation) — the promise REPLACES the argument at sp[-1];
    the enum_rec below it stays. Without this mode for-await over a sync GENERATOR reached
    js_async_from_sync_iterator_next -> JS_IteratorNext2 -> js_generator_next, off the tramp. */
-enum { AFS_DELIVER_CALL = 0, AFS_DELIVER_CLOSE, AFS_DELIVER_ITERNEXT };
+/* ITERCALL: OP_iterator_call — `for await`/yield* delegating .return(v)/.throw(v) onto the wrapper. Delivers
+   like ITERNEXT and then pushes the opcode's `false` ret_flag (the method WAS present). */
+enum { AFS_DELIVER_CALL = 0, AFS_DELIVER_CLOSE, AFS_DELIVER_ITERNEXT, AFS_DELIVER_ITERCALL };
 static JSValue js_promise_resolve(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
 static __exception int perform_promise_then(JSContext *ctx, JSValueConst promise, JSValueConst *resolve_reject, JSValueConst *cap_resolving_funcs);
 static JSValue js_async_from_sync_iterator_unwrap_func_create(JSContext *ctx, bool done);
@@ -19403,6 +19405,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     uint8_t tramp_consume_kind = 0;                     /* CONT_* of tramp_consume_state: CONT_ITER_CONSUME / CONT_PROMISE_ALL */
     JSValue tramp_consume_acquired = JS_UNDEFINED;      /* the acquired iterator handed to do_consume_deliver_iterator (JS_EXCEPTION if GetIterator threw) */
     int tramp_afs_mode = AFS_DELIVER_CALL;              /* which entry opcode is entering do_async_from_sync_tramp (AFS_DELIVER_*): it decides where the wrapper is on the stack and where its promise goes. read+reset there */
+    int tramp_afs_magic = GEN_MAGIC_NEXT;               /* AFS_DELIVER_ITERCALL: which of the wrapper's methods is running (GEN_MAGIC_RETURN / GEN_MAGIC_THROW). read+reset in do_async_from_sync_tramp */
+    int tramp_afs_noarg = 0;                            /* AFS_DELIVER_ITERCALL: 1 = the NO-ARGUMENT form (OP_iterator_call flags&2, yield*'s return() delegation) — forward nothing to syncGen.return/throw. read+reset there */
     int tramp_gen_cont_consume = 0;                     /* 1 = this do_generator_tramp drive is a CONSUMER (Array.from / Promise.all) driving a generator held in the consumer state; caller_sp stays put; the direct-mode settle re-enters the consumer's step (by cont_kind) instead of pushing the result */
     JSValueConst tramp_gen_cont_iter = JS_UNDEFINED;    /* the generator the consumer step wants driven (set before goto do_generator_tramp) */
     JSValueConst tramp_gen_cont_arg = JS_UNDEFINED;     /* the RESUME arg a consumer drive forwards to gen.next(v) (async-from-sync .next(v)); UNDEFINED for Array.from/Promise.all. read+reset in do_generator_tramp so it never leaks to the next drive */
@@ -21928,7 +21932,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 int afs_mode = tramp_afs_mode; tramp_afs_mode = AFS_DELIVER_CALL;   /* read + reset */
                 int afs_close = (afs_mode == AFS_DELIVER_CLOSE);
-                JSValueConst wrap = afs_close ? sp[-1] : (afs_mode == AFS_DELIVER_ITERNEXT ? sp[-4] : call_argv[-2]);
+                int afs_iter_magic = tramp_afs_magic; tramp_afs_magic = GEN_MAGIC_NEXT;   /* read + reset (ITERCALL only) */
+                int afs_noarg = tramp_afs_noarg; tramp_afs_noarg = 0;
+                JSValueConst wrap = afs_close ? sp[-1]
+                                  : ((afs_mode == AFS_DELIVER_ITERNEXT || afs_mode == AFS_DELIVER_ITERCALL)
+                                     ? sp[-4] : call_argv[-2]);
                 JSObject *wp = JS_VALUE_GET_OBJ(wrap);
                 JSAsyncFromSyncIteratorData *ws = wp->u.async_from_sync_iterator_data;
                 JSAsyncFromSync *s = js_mallocz(ctx, sizeof(*s));
@@ -21940,8 +21948,51 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->sync_iter = js_dup(ws->sync_iter);
                 s->deliver = afs_mode;
                 if (afs_close) { s->orig_cfirst = -1; s->orig_cargc = 0; s->orig_is_tail = 0; }
-                else if (afs_mode == AFS_DELIVER_ITERNEXT) { s->orig_cfirst = 0; s->orig_cargc = 0; s->orig_is_tail = 0; }
+                else if (afs_mode == AFS_DELIVER_ITERNEXT || afs_mode == AFS_DELIVER_ITERCALL) { s->orig_cfirst = 0; s->orig_cargc = 0; s->orig_is_tail = 0; }
                 else { s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail; }
+                if (afs_mode == AFS_DELIVER_ITERCALL) {
+                    /* 27.1.4.4 / .5: .return(v) and .throw(v) do NOT reuse [[NextMethod]] — they GetMethod the SYNC
+                       iterator's own `return`/`throw` first, and an ABSENT one settles without any drive at all
+                       (return resolves {value:v,done:true}; throw closes the sync iterator and rejects with a
+                       TypeError). The whole operation lives here, so the read happens EXACTLY once — probing it at
+                       the opcode to decide whether to route would have run a getter twice. */
+                    JSValue m = JS_GetProperty(ctx, s->sync_iter,
+                                               afs_iter_magic == GEN_MAGIC_RETURN ? JS_ATOM_return : JS_ATOM_throw);
+                    if (JS_IsException(m)) goto do_afs_itercall_reject;
+                    if (JS_IsUndefined(m) || JS_IsNull(m)) {
+                        JS_FreeValue(ctx, m);
+                        if (afs_iter_magic == GEN_MAGIC_RETURN) {
+                            ret_val = js_create_iterator_result(ctx, afs_noarg ? JS_UNDEFINED : js_dup(sp[-1]), true);
+                            if (JS_IsException(ret_val)) goto do_afs_itercall_reject;
+                            cont_st = s; cont_kind_cur = CONT_ASYNC_FROM_SYNC;
+                            goto do_async_from_sync_step;   /* wraps + delivers exactly like a driven result */
+                        }
+                        if (JS_IteratorClose(ctx, s->sync_iter, false) == 0)
+                            JS_ThrowTypeError(ctx, "throw is not a method");
+                        goto do_afs_itercall_reject;   /* the close's own throw wins if it had one */
+                    }
+                    if (tramp_gen_method_magic(m, s->sync_iter) == afs_iter_magic) {
+                        JS_FreeValue(ctx, m);   /* the built-in: drive the generator body on the tramp */
+                        tramp_cont_state = s; tramp_cont_kind = CONT_ASYNC_FROM_SYNC; tramp_gen_cont_iter = s->sync_iter;
+                        tramp_gen_cont_arg = afs_noarg ? JS_UNDEFINED : sp[-1];
+                        tramp_gen_cont_consume = 1; tramp_gen_magic = afs_iter_magic;
+                        goto do_generator_tramp;
+                    }
+                    /* a REPLACED return/throw on a generator object: no coroutine to suspend through it, so it is
+                       called here and its result enters the same settle. */
+                    ret_val = JS_CallFree(ctx, m, s->sync_iter, afs_noarg ? 0 : 1, afs_noarg ? NULL : vc(&sp[-1]));
+                    if (JS_IsException(ret_val)) goto do_afs_itercall_reject;
+                    if (!JS_IsObject(ret_val)) {
+                        JS_FreeValue(ctx, ret_val);
+                        JS_ThrowTypeError(ctx, "iterator result not an object");
+                        goto do_afs_itercall_reject;
+                    }
+                    cont_st = s; cont_kind_cur = CONT_ASYNC_FROM_SYNC;
+                    goto do_async_from_sync_step;
+                do_afs_itercall_reject:
+                    cont_st = s; cont_kind_cur = CONT_ASYNC_FROM_SYNC;
+                    goto do_async_from_sync_abrupt;   /* rejects s->promise and delivers it per s->deliver */
+                }
                 tramp_cont_state = s; tramp_cont_kind = CONT_ASYNC_FROM_SYNC; tramp_gen_cont_iter = s->sync_iter;
                 tramp_gen_cont_arg = afs_close ? JS_UNDEFINED
                                    : (afs_mode == AFS_DELIVER_ITERNEXT ? sp[-1]
@@ -21985,28 +22036,41 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp += cfirst - cargc;
                     if (deliver == AFS_DELIVER_CLOSE) { JS_FreeValue(ctx, r); BREAK; }   /* the promise is never awaited */
                     if (deliver == AFS_DELIVER_ITERNEXT) { JS_FreeValue(ctx, sp[-1]); sp[-1] = r; BREAK; }   /* replaces the resume arg; OP_await takes it from there */
+                    if (deliver == AFS_DELIVER_ITERCALL) { JS_FreeValue(ctx, sp[-1]); sp[-1] = r; *sp++ = js_bool(false); BREAK; }   /* + the opcode's ret_flag */
                     if (itail) { ret_val = r; goto do_return; }
                     *sp++ = r;
                     BREAK;
                 }
             async_from_sync_reject:
-                {
-                    JSValue err = JS_GetException(ctx), rr2, r;
-                    int cfirst = s->orig_cfirst, cargc = s->orig_cargc; uint8_t itail = s->orig_is_tail, deliver = s->deliver;
-                    JSValue *cargv;
-                    rr2 = JS_Call(ctx, s->resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
-                    JS_FreeValue(ctx, err); JS_FreeValue(ctx, rr2);
-                    r = js_dup(s->promise);
-                    js_async_from_sync_end(ctx, s); js_free_rt(rt, s);
-                    cargv = sp - cargc;
-                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
-                    sp += cfirst - cargc;
-                    if (deliver == AFS_DELIVER_CLOSE) { JS_FreeValue(ctx, r); BREAK; }   /* never awaited */
-                    if (deliver == AFS_DELIVER_ITERNEXT) { JS_FreeValue(ctx, sp[-1]); sp[-1] = r; BREAK; }
-                    if (itail) { ret_val = r; goto do_return; }
-                    *sp++ = r;
-                    BREAK;
-                }
+                cont_st = s;
+                goto do_async_from_sync_abrupt;
+            }
+
+        do_async_from_sync_abrupt:
+            /* IfAbruptRejectPromise for EVERY way the operation can complete abruptly: a failure inside the
+               wrap/settle above, a pre-drive GetMethod/Call in the ITERCALL arm, and — the one that has no other
+               home — the DRIVEN sync .next()/.throw()/.return() THROWING, which reaches this cont through the
+               exception unwind. `iter.throw(e)` on `async function*(){ yield* g() }` where g does not catch is
+               exactly that: the sync generator propagates, and the wrapper must REJECT its promise, never let the
+               throw escape. The reject is a built-in resolving function, so it runs no user JS. */
+            {
+                JSAsyncFromSync *s = (JSAsyncFromSync *)cont_st;
+                JSValue err = JS_GetException(ctx), rr2, r;
+                int cfirst = s->orig_cfirst, cargc = s->orig_cargc; uint8_t itail = s->orig_is_tail, deliver = s->deliver;
+                JSValue *cargv;
+                rr2 = JS_Call(ctx, s->resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
+                JS_FreeValue(ctx, err); JS_FreeValue(ctx, rr2);
+                r = js_dup(s->promise);
+                js_async_from_sync_end(ctx, s); js_free_rt(rt, s);
+                cargv = sp - cargc;
+                for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
+                sp += cfirst - cargc;
+                if (deliver == AFS_DELIVER_CLOSE) { JS_FreeValue(ctx, r); BREAK; }   /* never awaited */
+                if (deliver == AFS_DELIVER_ITERNEXT) { JS_FreeValue(ctx, sp[-1]); sp[-1] = r; BREAK; }
+                if (deliver == AFS_DELIVER_ITERCALL) { JS_FreeValue(ctx, sp[-1]); sp[-1] = r; *sp++ = js_bool(false); BREAK; }
+                if (itail) { ret_val = r; goto do_return; }
+                *sp++ = r;
+                BREAK;
             }
 
         do_iter_helper_tramp:
@@ -24101,6 +24165,27 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int flags;
                 flags = *pc++;
                 sf->cur_pc = pc;
+                /* `for await`/yield* delegating .return(v)/.throw(v) onto an async-from-sync WRAPPER over a sync
+                   generator: the wrapper's method reads the sync iterator's own return/throw and drives it, which
+                   from here would be js_async_from_sync_iterator_next -> JS_IteratorNext2 -> js_generator_next, off
+                   the tramp. Route the WHOLE operation (the GetMethod included, so it happens exactly once).
+                   flags&2 is the NO-ARGUMENT form, which yield*'s own return() delegation uses — excluding it was
+                   why `yield* g()` inside an async generator still aborted after the with-argument form was
+                   routed; the two differ only in what reaches syncGen.return/throw. */
+                if (JS_VALUE_GET_TAG(sp[-4]) == JS_TAG_OBJECT) {
+                    JSObject *wp3 = JS_VALUE_GET_OBJ(sp[-4]);
+                    if (wp3->class_id == JS_CLASS_ASYNC_FROM_SYNC_ITERATOR && wp3->u.async_from_sync_iterator_data) {
+                        JSValueConst si3 = ((JSAsyncFromSyncIteratorData *)wp3->u.async_from_sync_iterator_data)->sync_iter;
+                        if (JS_VALUE_GET_TAG(si3) == JS_TAG_OBJECT
+                            && JS_VALUE_GET_OBJ(si3)->class_id == JS_CLASS_GENERATOR
+                            && JS_VALUE_GET_OBJ(si3)->u.generator_data) {
+                            tramp_afs_mode = AFS_DELIVER_ITERCALL;
+                            tramp_afs_magic = (flags & 1) ? GEN_MAGIC_THROW : GEN_MAGIC_RETURN;
+                            tramp_afs_noarg = ((flags & 2) != 0);
+                            goto do_async_from_sync_tramp;
+                        }
+                    }
+                }
                 method = JS_GetProperty(ctx, sp[-4], (flags & 1) ?
                                         JS_ATOM_throw : JS_ATOM_return);
                 if (JS_IsException(method))
@@ -25659,6 +25744,24 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 }
                             }
                         }
+                        /* `for await (x of syncGen)` unwinding: the enum_rec holds the async-from-sync WRAPPER, and
+                           closing it calls its .return(), which drives syncGen.return() from C — the same
+                           off-tramp path OP_iterator_close already routes, reached through the exception unwind
+                           instead. Drive the sync generator's finally on the tramp; the wrapped promise
+                           IteratorClose would have produced is discarded on this path anyway (an exception is
+                           pending, so its result is ignored). */
+                        if (ip->class_id == JS_CLASS_ASYNC_FROM_SYNC_ITERATOR && ip->u.async_from_sync_iterator_data) {
+                            JSValueConst si4 = ((JSAsyncFromSyncIteratorData *)ip->u.async_from_sync_iterator_data)->sync_iter;
+                            if (JS_VALUE_GET_TAG(si4) == JS_TAG_OBJECT) {
+                                JSObject *sp4 = JS_VALUE_GET_OBJ(si4);
+                                if (sp4->class_id == JS_CLASS_GENERATOR && sp4->u.generator_data
+                                    && ((JSGeneratorData *)sp4->u.generator_data)->state != JS_GENERATOR_STATE_EXECUTING) {
+                                    tramp_gen_close_slot_gen = js_dup(si4);
+                                    tramp_gen_magic = GEN_MAGIC_RETURN; tramp_gen_close = 1; tramp_gen_close_exc = 1;
+                                    goto do_generator_tramp;
+                                }
+                            }
+                        }
                     }
                     JS_IteratorClose(ctx, sp[-1], true);
                 } else {
@@ -25734,21 +25837,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
         }
         if (afs_throw) {
-            /* for await (x of syncGen): a throw from the sync generator REJECTS the wrapper's result promise (which
-               OP_await then rejects into the async body), never propagates. Pop the OP_call_method operands + yield it. */
-            JSValue err = JS_GetException(ctx), rr, r;
-            int cfirst = afs_throw->orig_cfirst, cargc = afs_throw->orig_cargc; uint8_t itail = afs_throw->orig_is_tail;
-            JSValue *cargv;
-            rr = JS_Call(ctx, afs_throw->resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
-            JS_FreeValue(ctx, err); JS_FreeValue(ctx, rr);
-            r = js_dup(afs_throw->promise);
-            js_async_from_sync_end(ctx, afs_throw); js_free_rt(rt, afs_throw);
-            cargv = sp - cargc;
-            for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
-            sp += cfirst - cargc;
-            if (itail) { ret_val = r; goto do_return; }
-            *sp++ = r;
-            BREAK;
+            /* A throw from the driven sync generator REJECTS the wrapper's result promise, never propagates. This
+               used to spell the reject out again with the OP_call_method delivery HARDCODED (`*sp++ = r`), which
+               was correct for exactly one of the wrapper's four entry opcodes: reached through OP_iterator_call
+               (`iter.throw(e)` delegating into `yield* syncGen`) it pushed the promise instead of replacing the
+               argument slot, so the promise was never awaited and the test hung with no error. Same abrupt, same
+               settle — one implementation, and s->deliver decides the tail. */
+            cont_st = afs_throw; cont_kind_cur = CONT_ASYNC_FROM_SYNC;
+            goto do_async_from_sync_abrupt;
         }
         goto exception;   /* re-raise the pending exception in the caller */
     }
