@@ -19563,9 +19563,13 @@ typedef struct JSArraySort {
     int64_t len, undefined_count;
     int64_t width, i, lo, mid, hi, l, r, k;   /* bottom-up merge-sort cursors */
     uint8_t pending;                /* a cmp(array[l],array[r]) result is awaited */
+    uint8_t cmp_ph;                 /* the DEFAULT ordering coerces two operands; this says which one is due.
+                                       The header's str_phase resumes each ToString, this says whose. */
+    JSValue coerced;                /* the string a ToString delivered, until the slot adopts it (owned) */
     JSValue cb_args[4];             /* [this=undefined, method, array[l].val, array[r].val]; call_argv=&cb_args[2], argc=2 */
 } JSArraySort;
-static int js_array_sort_step(JSContext *ctx, struct JSArraySort *s, JSValue res, JSValueConst out_args[2]);
+static int js_array_sort_step(JSContext *ctx, struct JSArraySort *s, JSValue res, JSValueConst out_args[2],
+                              JSValue **out_cb, int *out_argc);
 static JSValue js_array_sort_end(JSContext *ctx, struct JSArraySort *s, bool ok);
 static int js_array_sort_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_sort_vfini(JSContext *ctx, void *st, bool take_result);
@@ -53024,17 +53028,23 @@ static int js_array_sort_collect(JSContext *ctx, JSArraySort *s)
 /* Drive the merge until the next comparison is needed (return 1, out_args = the two element values) or the sort
    is complete (return 0). `res` (owned) is the comparator's return value for the pending comparison, or JS_UNDEFINED
    on the first call. Returns -1 on exception. */
-static int js_array_sort_step(JSContext *ctx, JSArraySort *s, JSValue res, JSValueConst out_args[2])
+static int js_array_sort_step(JSContext *ctx, JSArraySort *s, JSValue res, JSValueConst out_args[2],
+                              JSValue **out_cb, int *out_argc)
 {
+    int rc;
     if (s->pending) {
         double v;
         if (JS_ToFloat64Free(ctx, &v, res) < 0) return -1;   /* consumes res */
+        res = JS_UNDEFINED;
         s->pending = 0;
         if (v <= 0) s->tmp[s->k++] = s->array[s->l++];   /* stable: <= keeps the left (earlier) element first */
         else        s->tmp[s->k++] = s->array[s->r++];
-    } else {
+    } else if (s->hdr.str_phase == STR_PH_START) {
         JS_FreeValue(ctx, res);   /* JS_UNDEFINED on the first call, or a stray value */
+        res = JS_UNDEFINED;
     }
+    /* otherwise `res` is the primitive a default-ordering ToString is waiting for; the loop hands it back to
+       the sub-sequence that asked, which is the only thing allowed to consume it. */
     for (;;) {
         if (s->width >= s->n) break;                 /* fully sorted (n<=1 lands here immediately) */
         if (s->i >= s->n) {                          /* this width pass done -> next width */
@@ -53052,22 +53062,34 @@ static int js_array_sort_step(JSContext *ctx, JSArraySort *s, JSValue res, JSVal
         assert(s->k - s->lo == (s->l - s->lo) + (s->r - s->mid));
         if (s->l < s->mid && s->r < s->hi) {
             if (JS_IsUndefined(s->method)) {
-                /* DEFAULT ordering: ToString both and compare — no callback, so no suspension point. It lives HERE
-                   so ONE machine covers both comparator kinds; leaving it in a second C body is the seam every bug
-                   this session came from. ToString is not bypassed for identical values (test262
-                   Array/prototype/sort/bug_596_1.js), and ties fall back to original position for stability. */
+                /* DEFAULT ordering: ToString both and compare. It lives HERE so ONE machine covers both
+                   comparator kinds; leaving it in a second C body is the seam every bug this session came from.
+                   Its two ToStrings ARE suspension points — an element with a user toString/valueOf runs the
+                   page's code, and doing it with JS_ToString from here drove that to completion while the
+                   comparator branch beside it parked correctly. ToString is not bypassed for identical values
+                   (test262 Array/prototype/sort/bug_596_1.js), and ties fall back to original position for
+                   stability. The cursors s->l and s->r do not move across a suspension, so the two slots this
+                   re-derives on re-entry are the same two. */
                 ValueSlot *ap = &s->array[s->l], *bp = &s->array[s->r];
                 int cmp;
-                if (!ap->str) {
-                    JSValue str = JS_ToString(ctx, ap->val);
-                    if (JS_IsException(str)) return -1;
-                    ap->str = JS_VALUE_GET_STRING(str);
+                if (s->cmp_ph == 0) {
+                    if (!ap->str) {
+                        rc = step_tostring_run(ctx, &s->hdr, ap->val, res, &s->coerced, out_cb, out_argc);
+                        res = JS_UNDEFINED;
+                        if (rc) return rc < 0 ? -1 : rc;
+                        ap->str = JS_VALUE_GET_STRING(s->coerced);
+                        s->coerced = JS_UNDEFINED;
+                    }
+                    s->cmp_ph = 1;
                 }
                 if (!bp->str) {
-                    JSValue str = JS_ToString(ctx, bp->val);
-                    if (JS_IsException(str)) return -1;
-                    bp->str = JS_VALUE_GET_STRING(str);
+                    rc = step_tostring_run(ctx, &s->hdr, bp->val, res, &s->coerced, out_cb, out_argc);
+                    res = JS_UNDEFINED;
+                    if (rc) return rc < 0 ? -1 : rc;
+                    bp->str = JS_VALUE_GET_STRING(s->coerced);
+                    s->coerced = JS_UNDEFINED;
                 }
+                s->cmp_ph = 0;
                 cmp = js_string_compare(ap->str, bp->str);
                 if (cmp == 0)
                     cmp = (ap->pos > bp->pos) - (ap->pos < bp->pos);
@@ -53199,8 +53221,9 @@ static int js_array_sort_vstep(JSContext *ctx, void *st, JSValue cb_result, JSVa
         if (s->hdr.arg && js_array_sort_copy(ctx, s)) return -1;
         if (js_array_sort_collect(ctx, s)) return -1;
     }
-    r = js_array_sort_step(ctx, s, cb_result, (JSValueConst *)&s->cb_args[2]);   /* consumes cb_result */
+    r = js_array_sort_step(ctx, s, cb_result, (JSValueConst *)&s->cb_args[2], out_cb, out_argc);   /* consumes cb_result */
     if (r < 0) return -1;
+    if (r == 5) return r;   /* the default ordering's ToString: the driver coerces and re-enters here */
     if (r == 0) return 0;
     s->cb_args[0] = JS_UNDEFINED;            /* the comparator gets this = undefined */
     s->cb_args[1] = s->method;
@@ -53211,7 +53234,10 @@ static int js_array_sort_vstep(JSContext *ctx, void *st, JSValue cb_result, JSVa
 static JSValue js_array_sort_vfini(JSContext *ctx, void *st, bool take_result)
 {
     JSArraySort *s = st;
-    JSValue r = js_array_sort_end(ctx, s, take_result);   /* writes back and yields the array */
+    JSValue r;
+    JS_FreeValue(ctx, s->coerced);   /* a ToString that landed just before an abandon */
+    s->coerced = JS_UNDEFINED;
+    r = js_array_sort_end(ctx, s, take_result);   /* writes back and yields the array */
     js_free(ctx, s);
     if (!take_result) { JS_FreeValue(ctx, r); return JS_UNDEFINED; }
     return r;
