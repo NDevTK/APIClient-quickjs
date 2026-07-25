@@ -19129,6 +19129,73 @@ static inline int tramp_gen_method_magic(JSValueConst method, JSValueConst this_
     return mp->u.cfunc.magic;
 }
 
+static JSValue js_iterator_wrap_next(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv,
+                                     int *pdone, int magic);
+/* WrapForValidIterator's .next FORWARDS VERBATIM — 27.1.4.2.1 is `Return ? Call([[NextMethod]], [[Iterator]])`
+   with nothing after the call. That makes it CALL-SITE-RESOLVED (§C-stack): a driver replaces the
+   (iterator, nextMethod) pair with the WRAPPED one and drives that, so a wrapped plain iterator's bytecode
+   .next() runs on the tramp like any other. Reached through js_iterator_wrap_next instead, it recursed
+   JS_IteratorNext -> JS_Call into a C activation with no flow base — `Iterator.from(x).toArray()` aborted.
+   Narrow on purpose: ONLY the built-in .next (a user-patched wrapper.next is a different function and must
+   run), and ONLY GEN_MAGIC_NEXT (.return is NOT a pure forward — it does GetMethod("return") and synthesizes
+   a result object when absent, so it keeps its own body). The resolved pair is BORROWED from the wrapper,
+   which every caller keeps alive across the call. Nested wrappers unwind in the loop. */
+static bool tramp_unwrap_iter_next(JSValueConst *piter, JSValueConst *pnext) {
+    bool changed = false;
+    for (;;) {
+        JSObject *mp, *tp;
+        JSIteratorWrapData *wd;
+        if (JS_VALUE_GET_TAG(*pnext) != JS_TAG_OBJECT || JS_VALUE_GET_TAG(*piter) != JS_TAG_OBJECT) return changed;
+        mp = JS_VALUE_GET_OBJ(*pnext);
+        if (mp->class_id != JS_CLASS_C_FUNCTION || mp->u.cfunc.cproto != JS_CFUNC_iterator_next
+            || mp->u.cfunc.c_function.iterator_next != js_iterator_wrap_next
+            || mp->u.cfunc.magic != GEN_MAGIC_NEXT) return changed;
+        tp = JS_VALUE_GET_OBJ(*piter);
+        if (tp->class_id != JS_CLASS_ITERATOR_WRAP) return changed;   /* RequireInternalSlot fails: let it throw */
+        wd = tp->u.iterator_wrap_data;
+        if (!wd) return changed;
+        *piter = wd->wrapped_iter; *pnext = wd->wrapped_next;
+        changed = true;
+    }
+}
+
+/* THE iterator-.next drive, asked in ONE place. A consumer holding an (iterator, nextMethod) record and a
+   continuation has exactly these ways to run that .next(): unwrap a WrapForValidIterator to the record it
+   forwards to, hand a lazy Iterator Helper to its own step machine, run a generator body on the tramp, run a
+   bytecode .next() on the tramp — and, when none of those apply, call a C .next() in place (no body, nothing to
+   suspend), which is the FALLTHROUGH each site finishes with because only the site knows how to settle it.
+   Written out per consumer, the copies drifted exactly as the body-entry list did: Promise.all never asked the
+   HELPER question (so Promise.all(iter.map(f)) reached js_iterator_helper_next's DFAIL), the consume arm asked it
+   by looking at the RECEIVER's class instead of the method (so a user-patched helper.next was ignored and the
+   built-in ran anyway), and none of them unwrapped. A site now declares only its record, its state and its cont
+   kind. */
+#define TRAMP_DRIVE_ITER_NEXT(diter, dnext, statep, kindc)                                              \
+    do {                                                                                                 \
+        tramp_unwrap_iter_next(&(diter), &(dnext));                                                      \
+        if (tramp_can_call_iter_helper((dnext), (diter))) {                                              \
+            JSIteratorHelperData *dh_ = JS_VALUE_GET_OBJ(diter)->u.iterator_helper_data;                 \
+            dh_->executing = 1; dh_->resume_pc = ITHP_START;                                             \
+            dh_->drive_mode = ITH_CONSUME; dh_->consumer = (statep); dh_->consumer_kind = (kindc);        \
+            cont_st = dh_; cont_kind_cur = CONT_ITER_HELPER;                                             \
+            ret_val = JS_UNINITIALIZED;                                                                   \
+            goto do_iter_helper_step;                                                                     \
+        }                                                                                                 \
+        if (tramp_gen_method_magic((dnext), (diter)) == GEN_MAGIC_NEXT) {                                \
+            tramp_cont_state = (statep); tramp_cont_kind = (kindc);                                      \
+            tramp_gen_cont_iter = (diter); tramp_gen_cont_consume = 1;                                   \
+            tramp_gen_magic = GEN_MAGIC_NEXT;                                                            \
+            goto do_generator_tramp;                                                                      \
+        }                                                                                                 \
+        DCHECK(sp + 2 <= TRAMP_SP_LIMIT(sf),                                                             \
+               "iterator .next() drive: operand push exceeds the frame's compiled stack_size");           \
+        *sp++ = js_dup(diter);                                                                            \
+        *sp++ = js_dup(dnext);                                                                            \
+        call_argv = sp; call_argc = 0; tramp_first = -2; tramp_is_tail = 0;                              \
+        tramp_cont_state = (statep); tramp_cont_kind = (kindc);                                          \
+        if (tramp_can_call(call_argv[-1])) goto do_tramp_call;                                            \
+        tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;                                            \
+    } while (0)
+
 /* forced-exec FLOW-CONTROL hooks (see JSFlowControlHooks in quickjs.h) — the scheduler's control over
    interpreter execution: .branch (which arm to take when branching on a CONCOLIC value; the hook FORKS the
    sibling by appending a decision vector, NEVER by rewinding OP_if, so a native builtin loop-back calls the SAME
@@ -21703,33 +21770,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     *sp++ = r;
                     BREAK;
                 }
-                /* CALL: drive s->iter.next() on this chain — the same three-way dispatch the helper step uses. A
-                   HELPER drives via the helper tramp (ITH_CONSUME, delivering {value,done} back to THIS step); a
-                   GENERATOR runs its body via do_generator_tramp cont-consume; a PLAIN iterator's .next() is a
-                   non-suspending call made in-loop. Any settle re-enters do_iter_consume_step with the result. */
-                if (JS_VALUE_GET_TAG(s->iter) == JS_TAG_OBJECT
-                    && JS_VALUE_GET_OBJ(s->iter)->class_id == JS_CLASS_ITERATOR_HELPER) {
-                    JSIteratorHelperData *hs = JS_VALUE_GET_OBJ(s->iter)->u.iterator_helper_data;
-                    hs->executing = 1; hs->resume_pc = ITHP_START;
-                    hs->drive_mode = ITH_CONSUME; hs->consumer = s; hs->consumer_kind = CONT_ITER_CONSUME;
-                    cont_st = hs; cont_kind_cur = CONT_ITER_HELPER;
-                    ret_val = JS_UNINITIALIZED;
-                    goto do_iter_helper_step;
-                }
-                if (tramp_gen_method_magic(s->next, s->iter) == GEN_MAGIC_NEXT) {
-                    tramp_cont_state = s; tramp_cont_kind = CONT_ITER_CONSUME; tramp_gen_cont_iter = s->iter;
-                    tramp_gen_cont_consume = 1; tramp_gen_magic = GEN_MAGIC_NEXT;
-                    goto do_generator_tramp;
-                }
-                /* PLAIN iterator: drive its .next() on the tramp as well - [this=iterator, next], no args. */
-                DCHECK(sp + 2 <= TRAMP_SP_LIMIT(sf),
-                       "plain .next() drive: operand push exceeds the frame's compiled stack_size");
-                *sp++ = js_dup(s->iter);
-                *sp++ = js_dup(s->next);
-                call_argv = sp; call_argc = 0; tramp_first = -2; tramp_is_tail = 0;
-                tramp_cont_state = s; tramp_cont_kind = CONT_ITER_CONSUME;
-                if (tramp_can_call(call_argv[-1])) goto do_tramp_call;
-                tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;
+                /* CALL: drive the record's .next() on this chain. Any settle re-enters do_iter_consume_step with
+                   the result; a C .next() has no body to suspend, so it is called in-loop just below. */
+                { JSValueConst di = s->iter, dn = s->next;
+                  TRAMP_DRIVE_ITER_NEXT(di, dn, s, CONT_ITER_CONSUME); }
                 { JSValue nr = JS_Call(ctx, call_argv[-1], call_argv[-2], 0, NULL);
                   JS_FreeValue(ctx, call_argv[-1]); JS_FreeValue(ctx, call_argv[-2]); sp -= 2;
                   if (JS_IsException(nr)) { js_iter_consume_end(ctx, s); js_free_rt(rt, s); goto exception; }
@@ -21859,19 +21903,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    the receiver with no class check: the generator-backed narrowing in the recognizer was the only
                    thing keeping a non-generator out, so widening it segfaulted on Promise.all([]). */
                 s->driving_next = 1;   /* an abrupt during this .next()/its result extraction must NOT close the iter */
-                if (tramp_gen_method_magic(s->next, s->iter) == GEN_MAGIC_NEXT) {
-                    tramp_cont_state = s; tramp_cont_kind = CONT_PROMISE_ALL; tramp_gen_cont_iter = s->iter;
-                    tramp_gen_cont_consume = 1; tramp_gen_magic = GEN_MAGIC_NEXT;
-                    goto do_generator_tramp;
-                }
-                DCHECK(sp + 2 <= TRAMP_SP_LIMIT(sf),
-                       "Promise combinator plain .next() drive: operand push exceeds the frame's compiled stack_size");
-                *sp++ = js_dup(s->iter);
-                *sp++ = js_dup(s->next);
-                call_argv = sp; call_argc = 0; tramp_first = -2; tramp_is_tail = 0;
-                tramp_cont_state = s; tramp_cont_kind = CONT_PROMISE_ALL;
-                if (tramp_can_call(call_argv[-1])) goto do_tramp_call;
-                tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;
+                { JSValueConst di = s->iter, dn = s->next;
+                  TRAMP_DRIVE_ITER_NEXT(di, dn, s, CONT_PROMISE_ALL); }
                 { JSValue nr = JS_Call(ctx, call_argv[-1], call_argv[-2], 0, NULL);
                   JS_FreeValue(ctx, call_argv[-1]); JS_FreeValue(ctx, call_argv[-2]); sp -= 2;
                   if (JS_IsException(nr)) goto promise_all_err;
@@ -22074,32 +22107,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                     JSValueConst drive_obj  = it->drive_inner ? it->inner : it->obj;
                     JSValueConst drive_next = it->drive_inner ? it->inner_next : it->next;
-                    if (tramp_gen_method_magic(drive_next, drive_obj) == GEN_MAGIC_NEXT) {
-                        /* GENERATOR: run its body on the tramp; the settle re-enters do_iter_helper_step. */
-                        tramp_cont_state = it; tramp_cont_kind = CONT_ITER_HELPER; tramp_gen_cont_iter = drive_obj;
-                        tramp_gen_cont_consume = 1; tramp_gen_magic = GEN_MAGIC_NEXT;
-                        goto do_generator_tramp;
-                    }
-                    if (tramp_can_call_iter_helper(drive_next, drive_obj)) {
-                        /* HELPER (chaining map(filter(g)), or a flatMap inner that is itself a helper): drive it as an
-                           ITH_CONSUME whose consumer is this helper; walk down (its DONE re-enters here for `it`). */
-                        JSIteratorHelperData *inner = JS_VALUE_GET_OBJ(drive_obj)->u.iterator_helper_data;
-                        inner->executing = 1; inner->resume_pc = ITHP_START;
-                        inner->drive_mode = ITH_CONSUME; inner->consumer = it; inner->consumer_kind = CONT_ITER_HELPER;
-                        it = inner;
-                        continue;
-                    }
-                    /* PLAIN iterator: its .next is frequently a JS function with a loop of its own, so it runs ON
-                       THE TRAMP too - [this=iterator, next] with no args; do_return re-enters this step with the
-                       iterator result and validates it is an object. */
-                    DCHECK(sp + 2 <= TRAMP_SP_LIMIT(sf),
-                           "plain .next() drive: operand push exceeds the frame's compiled stack_size");
-                    *sp++ = js_dup(drive_obj);
-                    *sp++ = js_dup(drive_next);
-                    call_argv = sp; call_argc = 0; tramp_first = -2; tramp_is_tail = 0;
-                    tramp_cont_state = it; tramp_cont_kind = CONT_ITER_HELPER;
-                    if (tramp_can_call(call_argv[-1])) goto do_tramp_call;
-                    tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;
+                    /* the helper's own chain walk (map(filter(g))) went `it = inner; continue;` — re-entering the
+                       label with cont_st is the same step with the same UNINITIALIZED result, and it lets this site
+                       share the ONE drive. */
+                    TRAMP_DRIVE_ITER_NEXT(drive_obj, drive_next, it, CONT_ITER_HELPER);
                     { JSValue nr = JS_Call(ctx, call_argv[-1], call_argv[-2], 0, NULL);
                       JS_FreeValue(ctx, call_argv[-1]); JS_FreeValue(ctx, call_argv[-2]); sp -= 2;
                       if (JS_IsException(nr)) { it->executing = 0; goto exception; }
@@ -23813,20 +23824,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_iter_helper(sp[offset + 1], sp[offset])) {   /* for-of over a lazy Iterator Helper -> drive on THIS chain */
                     tramp_ith_forof = offset; goto do_iter_helper_tramp;
                 }
-                if (tramp_can_call(sp[offset + 1])) {
+                {
                     /* A PLAIN iterator whose .next() is a normal bytecode function — the ordinary
                        `{[Symbol.iterator]() { return { next() {…} } }}` shape. Its body runs on THIS chain so a
                        loop in it preempts; js_for_of_next reached it through JS_IteratorNext -> JS_Call, a C
-                       recursion whose back-edge preempt has no flow base (the gen_state-NULL DFAIL). */
+                       recursion whose back-edge preempt has no flow base (the gen_state-NULL DFAIL).
+                       The WRAPPER unwrap redirects only the CALL, never the enum_rec: `for (x of
+                       Iterator.from({next(){…}}))` drives the wrapped .next() here, while the slots keep the
+                       wrapper so a `break`'s OP_iterator_close still goes through
+                       WrapForValidIterator.prototype.return (which a page may have patched). The generator and
+                       helper arms above deliberately test the RAW slots — they read the receiver back off the
+                       stack, so an unwrapped receiver would not match what they push. */
                     JSValueConst itv = sp[offset], nextv = sp[offset + 1];
-                    DCHECK(sp + 2 <= TRAMP_SP_LIMIT(sf),
-                           "for-of .next() drive: operand push exceeds the frame's compiled stack_size");
-                    *sp++ = js_dup(itv);      /* this */
-                    *sp++ = js_dup(nextv);    /* the next method */
-                    call_argv = sp; call_argc = 0; tramp_first = -2; tramp_is_tail = 0;
-                    tramp_cont_forof = offset;   /* rides the frame; sp is restored to here before it is used */
-                    tramp_cont_state = NULL; tramp_cont_kind = CONT_FOROF_NEXT;
-                    goto do_tramp_call;
+                    tramp_unwrap_iter_next(&itv, &nextv);
+                    if (tramp_can_call(nextv)) {
+                        DCHECK(sp + 2 <= TRAMP_SP_LIMIT(sf),
+                               "for-of .next() drive: operand push exceeds the frame's compiled stack_size");
+                        *sp++ = js_dup(itv);      /* this */
+                        *sp++ = js_dup(nextv);    /* the next method */
+                        call_argv = sp; call_argc = 0; tramp_first = -2; tramp_is_tail = 0;
+                        tramp_cont_forof = offset;   /* rides the frame; sp is restored to here before it is used */
+                        tramp_cont_state = NULL; tramp_cont_kind = CONT_FOROF_NEXT;
+                        goto do_tramp_call;
+                    }
                 }
                 if (js_for_of_next(ctx, sp, offset))
                     goto exception;
@@ -26307,6 +26327,16 @@ static int flow_settle_await(JSContext *ctx, JSAsyncFunctionState *s) {
 
 int JS_FlowResume(JSContext *ctx, JSValue *flow) {
     JSAsyncFunctionState *s = (JSAsyncFunctionState *)flow;
+    /* NESTED resume: a host API that evaluates a program synchronously while a flow is already running
+       ($262.evalScript, and any embedder JS_Eval from a C builtin) starts a SECOND flow from inside the outer
+       flow's C stack. Without this restore the inner flow's base would stay installed after it finishes, and
+       every later back-edge in the OUTER flow would read a base that is not its own — the "not the flow base"
+       DFAIL, on code that is perfectly fine. Only the nesting case restores: at the top level the pump keeps the
+       base installed across resumes ON PURPOSE, so that a coroutine resumed during the post-eval job phase is
+       still measured against a base and cannot drive to completion unnoticed. */
+    JSAsyncFunctionState *outer_base = g_flow_base_gen;
+    bool nested = (outer_base != NULL && outer_base != s);
+    int result;
     for (;;) {
         g_flow_base_gen = s;   /* this is the flow's BASE activation — a branch here may snapshot-fork; a branch
                                   in a nested async call (different gen_state) forks by replay instead */
@@ -26315,10 +26345,11 @@ int JS_FlowResume(JSContext *ctx, JSValue *flow) {
            with a FUNC_RET_* code): a NORMAL-func_kind program completes via `done:` leaving BOTH cur_sp NULL
            AND the tramp chain empty. A BASE suspend (done_generator) saves cur_sp (non-null); a DEEP suspend
            returns directly with cur_sp NULL but stashes the chain in tramp_top. So suspended iff either is set. */
-        if (s->frame.cur_sp == NULL && s->tramp_top == NULL) { JS_FreeValue(ctx, r); return 0; }   /* completed / threw */
+        if (s->frame.cur_sp == NULL && s->tramp_top == NULL) { JS_FreeValue(ctx, r); result = 0; break; }   /* completed / threw */
         int fr = JS_VALUE_GET_INT(r);
-        if (fr == FUNC_RET_PREEMPT || fr == FUNC_RET_YIELD || fr == FUNC_RET_YIELD_STAR)
-            return 1;   /* suspended — the scheduler (preempt) or generator consumer resumes it */
+        if (fr == FUNC_RET_PREEMPT || fr == FUNC_RET_YIELD || fr == FUNC_RET_YIELD_STAR) {
+            result = 1; break;   /* suspended — the scheduler (preempt) or generator consumer resumes it */
+        }
         if (fr == FUNC_RET_AWAIT) {
             /* OP_await left the awaited operand at cur_sp[-1]. Settle it + continue. A BASE flow is a CLASSIC
                script (no top-level await), so a base-level await is only ever an already-settled promise; a
@@ -26328,8 +26359,10 @@ int JS_FlowResume(JSContext *ctx, JSValue *flow) {
             continue;   /* re-resume: the continuation reads the settled value from cur_sp[-1] */
         }
         JS_FreeValue(ctx, r);
-        return 0;
+        result = 0; break;
     }
+    if (nested) g_flow_base_gen = outer_base;
+    return result;
 }
 void JS_FlowFree(JSContext *ctx, JSValue *flow) {
     JSAsyncFunctionState *s = (JSAsyncFunctionState *)flow;

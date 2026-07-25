@@ -530,6 +530,9 @@ static JSValue js_detachArrayBuffer(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
+static int fork_preempt_enabled(void);
+static JSValue fork_preempt_eval(JSContext *ctx, const char *buf, size_t buf_len, int eval_flags);
+
 static JSValue js_evalScript_262(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
 {
@@ -539,7 +542,17 @@ static JSValue js_evalScript_262(JSContext *ctx, JSValueConst this_val,
     str = JS_ToCStringLen(ctx, &len, argv[0]);
     if (!str)
         return JS_EXCEPTION;
-    ret = JS_Eval(ctx, str, len, "<evalScript>", JS_EVAL_TYPE_GLOBAL);
+    /* THE SAME entry every other evaluation uses. This called plain JS_Eval — the exact fallback eval_buf's own
+       comment calls banned ("a fallback to plain JS_Eval tests something that never runs and hides feature
+       gaps"), sitting two functions away. The program it evaluates is REAL test code (31 annexB/language files
+       run their assertions inside it), so running it off the flow machinery meant its loops preempted in a C
+       activation with no flow base and the whole annexB tree aborted. It is a NESTED flow: the outer flow is
+       suspended in this C frame while the host pumps the inner one to its completion, which is the host
+       boundary a synchronous eval API requires, not a second scheduler inside the engine. No test uses the
+       completion value, and JS_FlowResume does not surface one, so the result is UNDEFINED / EXCEPTION. */
+    ret = fork_preempt_enabled()
+        ? fork_preempt_eval(ctx, str, len, JS_EVAL_TYPE_GLOBAL)
+        : JS_Eval(ctx, str, len, "<evalScript>", JS_EVAL_TYPE_GLOBAL);
     JS_FreeCString(ctx, str);
     return ret;
 }
