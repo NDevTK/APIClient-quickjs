@@ -1416,7 +1416,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_STR_SUBSTRING, STEPDEF_STR_INDEXOF, STEPDEF_STR_LASTINDEXOF, STEPDEF_STR_NORMALIZE,
     STEPDEF_TA_AT, STEPDEF_TA_SET, STEPDEF_JSON_RAWJSON,
     STEPDEF_OBJ_DEFINEPROPERTY, STEPDEF_REFLECT_DEFINEPROPERTY,
-    STEPDEF_PARSEINT, STEPDEF_PARSEFLOAT,
+    STEPDEF_PARSEINT, STEPDEF_PARSEFLOAT, STEPDEF_STR_SPLIT,
     STEPDEF_COUNT
 };
 #define HINT_NONE    2
@@ -19441,6 +19441,18 @@ typedef struct JSArraySearch {
     JSValue result;       /* DONE (owned) */
     int64_t len, n;
 } JSArraySearch;
+
+/* String.prototype.split runs the page's code at FOUR points: the @@split GetMethod on the separator, the call
+   to that method when it exists, ToString on the receiver, and ToUint32(limit) / ToString(separator). The walk
+   that follows is pure string scanning. */
+typedef struct JSStrSplit {
+    JSStepHdr hdr;
+    JSValue str;          /* S (owned) */
+    JSValue sep;          /* R (owned) */
+    JSValue result;       /* DONE (owned) */
+    JSValue cb[4];        /* [separator, splitter, receiver, limit] */
+    int lim32;
+} JSStrSplit;
 
 /* parseInt / parseFloat: ToString on the input, and for parseInt ToInt32 on the radix — the page's code either
    way. Everything after is the numeric scanner, which runs none. */
@@ -51298,6 +51310,8 @@ static int js_obj_defprop_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
 static JSValue js_obj_defprop_fini(JSContext *ctx, void *st, bool take_result);
 static int js_parse_num_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_parse_num_fini(JSContext *ctx, void *st, bool take_result);
+static int js_str_split_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_str_split_fini(JSContext *ctx, void *st, bool take_result);
 /* One NAMED definition per builtin, referenced by its JS_CFUNC_STEP_DEF registration through the id above — the same shape as
    JS_CFUNC_MAGIC_DEF naming its C function, so the registration line tells you what runs. An index into a side
    table would be a second list to keep in sync and a magic number that silently repoints when a row is inserted. */
@@ -51347,6 +51361,7 @@ static const JSTrampStepDef js_obj_defprop_def    = { sizeof(JSObjDefProp), js_o
 static const JSTrampStepDef js_refl_defprop_def   = { sizeof(JSObjDefProp), js_obj_defprop_step, js_obj_defprop_fini, 1 };
 static const JSTrampStepDef js_parseInt_def       = { sizeof(JSParseNum), js_parse_num_step, js_parse_num_fini, 1 };
 static const JSTrampStepDef js_parseFloat_def     = { sizeof(JSParseNum), js_parse_num_step, js_parse_num_fini, 0 };
+static const JSTrampStepDef js_str_split_def      = { sizeof(JSStrSplit), js_str_split_step, js_str_split_fini, 0 };
 static const JSTrampStepDef js_array_reduce_def  = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduce };
 static const JSTrampStepDef js_array_reduceR_def = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduceRight };
 static const JSTrampStepDef js_ta_reduce_def     = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduce | special_TA };
@@ -51398,6 +51413,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_REFLECT_DEFINEPROPERTY] = &js_refl_defprop_def,
     [STEPDEF_PARSEINT]        = &js_parseInt_def,
     [STEPDEF_PARSEFLOAT]      = &js_parseFloat_def,
+    [STEPDEF_STR_SPLIT]       = &js_str_split_def,
     [STEPDEF_ARRAY_REDUCE]  = &js_array_reduce_def,  [STEPDEF_ARRAY_REDUCE_RIGHT] = &js_array_reduceR_def,
     [STEPDEF_TA_REDUCE]     = &js_ta_reduce_def,     [STEPDEF_TA_REDUCE_RIGHT]    = &js_ta_reduceR_def,
 };
@@ -51427,6 +51443,7 @@ STEP_STATE_HDR_FIRST(JSTAIdx);
 STEP_STATE_HDR_FIRST(JSJsonRaw);
 STEP_STATE_HDR_FIRST(JSObjDefProp);
 STEP_STATE_HDR_FIRST(JSParseNum);
+STEP_STATE_HDR_FIRST(JSStrSplit);
 
 static const JSTrampStepDef *tramp_step_def_of(JSValueConst func)
 {
@@ -55053,94 +55070,130 @@ static JSValue js_str_replace_fini(JSContext *ctx, void *st, bool take_result)
 }
 
 
-static JSValue js_string_split(JSContext *ctx, JSValueConst this_val,
-                               int argc, JSValueConst *argv)
+/* Stages: 0 the @@split GetMethod, 1 its dispatch, 2 ToString(receiver), 3 ToUint32(limit),
+   4 ToString(separator), then the walk; 5 the @@split result. */
+static int js_str_split_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    // split(sep, limit)
-    JSValueConst O = this_val, separator = argv[0], limit = argv[1];
-    JSValueConst args[2];
-    JSValue S, A, R, T;
-    uint32_t lim, lengthA;
-    int64_t p, q, s, r, e;
+    JSStrSplit *s = st;
+    JSValueConst O = s->hdr.this_val;
+    JSValueConst separator = step_arg(&s->hdr, 0);
+    JSValue A, T;
     JSString *sp, *rp;
+    uint32_t lengthA;
+    int64_t p, q, slen, rlen, e;
+    int r;
 
-    if (JS_IsUndefined(O) || JS_IsNull(O))
-        return JS_ThrowTypeError(ctx, "cannot convert to object");
-
-    S = JS_UNDEFINED;
-    A = JS_UNDEFINED;
-    R = JS_UNDEFINED;
-
-    if (JS_IsObject(separator)) {
-        JSValue splitter;
-        splitter = JS_GetProperty(ctx, separator, JS_ATOM_Symbol_split);
-        if (JS_IsException(splitter))
-            return JS_EXCEPTION;
-        if (!JS_IsUndefined(splitter) && !JS_IsNull(splitter)) {
-            args[0] = O;
-            args[1] = limit;
-            return JS_CallFree(ctx, splitter, separator, 2, args);
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        s->str = JS_UNDEFINED; s->sep = JS_UNDEFINED; s->result = JS_UNDEFINED;
+        if (JS_IsUndefined(O) || JS_IsNull(O)) {
+            JS_ThrowTypeError(ctx, "cannot convert to object");
+            return -1;
+        }
+        s->hdr.stage = 2;
+        if (JS_IsObject(separator)) {
+            s->hdr.stage = 1;
+            s->hdr.cb_coerce[0] = (JSValue)separator;   /* borrowed: hdr.argv holds it */
+            *out_cb = s->hdr.cb_coerce; *out_argc = (int)JS_ATOM_Symbol_split;
+            return 6;
         }
     }
-    S = JS_ToString(ctx, O);
-    if (JS_IsException(S))
-        goto exception;
-    A = JS_NewArray(ctx);
-    if (JS_IsException(A))
-        goto exception;
-    lengthA = 0;
-    if (JS_IsUndefined(limit)) {
-        lim = 0xffffffff;
-    } else {
-        if (JS_ToUint32(ctx, &lim, limit) < 0)
-            goto exception;
+    if (s->hdr.stage == 1) {                 /* the @@split method arrived */
+        JSValue m = cb_result;
+        cb_result = JS_UNDEFINED;
+        s->hdr.stage = 2;
+        if (!JS_IsUndefined(m) && !JS_IsNull(m)) {
+            s->cb[0] = js_dup(separator);    /* this = the separator */
+            s->cb[1] = m;                    /* owned */
+            s->cb[2] = js_dup(O);
+            s->cb[3] = js_dup(step_arg(&s->hdr, 1));
+            s->hdr.stage = 5;
+            *out_cb = s->cb; *out_argc = 2;
+            return 3;
+        }
+        JS_FreeValue(ctx, m);
     }
-    sp = JS_VALUE_GET_STRING(S);
-    s = sp->len;
-    R = JS_ToString(ctx, separator);
-    if (JS_IsException(R))
-        goto exception;
-    rp = JS_VALUE_GET_STRING(R);
-    r = rp->len;
-    p = 0;
-    if (lim == 0)
-        goto done;
-    if (JS_IsUndefined(separator))
-        goto add_tail;
-    if (s == 0) {
-        if (r != 0)
-            goto add_tail;
-        goto done;
+    if (s->hdr.stage == 5) {                 /* @@split's result IS the answer */
+        s->result = cb_result;
+        return 0;
     }
-    q = p;
-    for (q = p; (q += !r) <= s - r - !r; q = p = e + r) {
-        e = string_indexof(sp, rp, q);
-        if (e < 0)
-            break;
-        T = js_sub_string(ctx, sp, p, e);
-        if (JS_IsException(T))
-            goto exception;
-        if (JS_CreateDataPropertyUint32(ctx, A, lengthA++, T, 0) < 0)
-            goto exception;
-        if (lengthA == lim)
-            goto done;
+    if (s->hdr.stage == 2) {
+        r = step_tostring_run(ctx, &s->hdr, O, cb_result, &s->str, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 3;
     }
-add_tail:
-    T = js_sub_string(ctx, sp, p, s);
-    if (JS_IsException(T))
-        goto exception;
-    if (JS_CreateDataPropertyUint32(ctx, A, lengthA++, T,0 ) < 0)
-        goto exception;
-done:
-    JS_FreeValue(ctx, S);
-    JS_FreeValue(ctx, R);
-    return A;
+    if (s->hdr.stage == 3) {
+        s->lim32 = -1;                       /* the whole 32-bit range, i.e. 0xffffffff read unsigned */
+        if (!JS_IsUndefined(step_arg(&s->hdr, 1))) {
+            /* ToUint32 is ToInt32's wrap read unsigned, so one conversion serves both */
+            r = step_toint32_run(ctx, &s->hdr, s->hdr.argv[1], cb_result, &s->lim32, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+        }
+        s->hdr.stage = 4;
+    }
+    if (s->hdr.stage == 4) {
+        r = step_tostring_run(ctx, &s->hdr, separator, cb_result, &s->sep, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 6;
+    }
+    JS_FreeValue(ctx, cb_result);
 
-exception:
-    JS_FreeValue(ctx, A);
-    JS_FreeValue(ctx, S);
-    JS_FreeValue(ctx, R);
-    return JS_EXCEPTION;
+    {   /* the walk: pure string scanning, no user code */
+        uint32_t lim = (uint32_t)s->lim32;
+        A = JS_NewArray(ctx);
+        if (JS_IsException(A)) return -1;
+        lengthA = 0;
+        sp = JS_VALUE_GET_STRING(s->str);
+        slen = sp->len;
+        rp = JS_VALUE_GET_STRING(s->sep);
+        rlen = rp->len;
+        p = 0;
+        if (lim == 0)
+            goto done;
+        if (JS_IsUndefined(separator))
+            goto add_tail;
+        if (slen == 0) {
+            if (rlen != 0)
+                goto add_tail;
+            goto done;
+        }
+        for (q = p; (q += !rlen) <= slen - rlen - !rlen; q = p = e + rlen) {
+            e = string_indexof(sp, rp, q);
+            if (e < 0)
+                break;
+            T = js_sub_string(ctx, sp, p, e);
+            if (JS_IsException(T)) goto fail;
+            if (JS_CreateDataPropertyUint32(ctx, A, lengthA++, T, 0) < 0) goto fail;
+            if (lengthA == lim)
+                goto done;
+        }
+    add_tail:
+        T = js_sub_string(ctx, sp, p, slen);
+        if (JS_IsException(T)) goto fail;
+        if (JS_CreateDataPropertyUint32(ctx, A, lengthA++, T, 0) < 0) goto fail;
+    done:
+        s->result = A;
+        return 0;
+    fail:
+        JS_FreeValue(ctx, A);
+        return -1;
+    }
+}
+
+static JSValue js_str_split_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSStrSplit *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    int i;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    JS_FreeValue(ctx, s->str);
+    JS_FreeValue(ctx, s->sep);
+    for (i = 0; i < 4; i++) JS_FreeValue(ctx, s->cb[i]);
+    js_free(ctx, s);
+    return r;
 }
 
 
@@ -55653,7 +55706,7 @@ static const JSCFunctionListEntry js_string_proto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("match", 1, js_string_match, JS_ATOM_Symbol_match ),
     JS_CFUNC_MAGIC_DEF("matchAll", 1, js_string_match, JS_ATOM_Symbol_matchAll ),
     JS_CFUNC_MAGIC_DEF("search", 1, js_string_match, JS_ATOM_Symbol_search ),
-    JS_CFUNC_DEF("split", 2, js_string_split ),
+    JS_CFUNC_STEP_DEF("split", 2, STEPDEF_STR_SPLIT ),
     JS_CFUNC_STEP_DEF("substring", 2, STEPDEF_STR_SUBSTRING ),
     JS_CFUNC_DEF("substr", 2, js_string_substr ),
     JS_CFUNC_DEF("slice", 2, js_string_slice ),
