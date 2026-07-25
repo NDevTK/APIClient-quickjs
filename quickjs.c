@@ -18383,12 +18383,15 @@ typedef struct TrampFrame {
        re-enters the builtin's STEP with the result. The callback runs with gen_state unchanged (the base), so a
        callback BODY LOOP preempts the BASE flow at any depth — never drive-to-completion. */
     void *cont_state;
-    uint8_t cont_kind;   /* CONT_NONE / CONT_ARRAY_ITER / CONT_ARRAY_REDUCE */
+    uint8_t cont_kind;   /* CONT_NONE / CONT_STEP / … */
 } TrampFrame;
 
 #define CONT_NONE          0
-#define CONT_ARRAY_ITER    1   /* cont_state = JSArrayEvery  (forEach/map/every/some/filter) */
-#define CONT_ARRAY_REDUCE  2   /* cont_state = JSArrayReduce (reduce/reduceRight) */
+/* 1, 2, 6 and 7 were CONT_ARRAY_ITER / CONT_ARRAY_REDUCE / CONT_SORT / CONT_JSON_REVIVE — one continuation kind
+   per hand-written driver, each with its own DONE arm, operand pop, callback drive and COW-fork clone. Those four
+   builtins are step machines now and CONT_STEP serves all of them, so the kinds went with their drivers. The
+   numbers are left as holes on purpose: a kind is a wire value stamped into a TrampFrame, and renumbering to
+   close a gap would silently repoint any state that outlived the change. */
 #define CONT_AGEN_CREATE   3   /* cont_state = JSAsyncGeneratorData: an async generator's params are binding on
                                   this chain (run-to-initial_yield); settles at OP_initial_yield by creating the
                                   async-generator object. Mirrors the sync gen_magic==0xFF creation frame. */
@@ -18399,13 +18402,6 @@ typedef struct TrampFrame {
 #define CONT_SETTER        5   /* cont_state = NULL: a `set x(v){…}` bytecode-setter body runs on this chain as a
                                   1-arg method call; do_return frees the operands like a normal method call but
                                   DISCARDS the setter's return value (a property write yields nothing). */
-#define CONT_SORT          6   /* cont_state = JSArraySort: arr.sort(cmp) drives a SUSPENDABLE bottom-up merge
-                                  sort whose comparator runs on this chain, so a comparator body loop preempts the
-                                  base flow. do_return re-enters js_array_sort_step with the comparison result. */
-#define CONT_JSON_REVIVE   7   /* cont_state = JSJsonReviver: JSON.parse(str, reviver) walks the parsed tree with
-                                  an EXPLICIT DFS stack (no C recursion) and calls the reviver on this chain at
-                                  each node (post-order), so a reviver body loop preempts. do_return re-enters
-                                  js_json_reviver_step with the reviver's result. */
 #define CONT_ASYNC_FROM_SYNC 10 /* cont_state = JSAsyncFromSync: `for await (x of syncGen)` — the async-from-sync
                                   wrapper's .next() drives syncGen.next() on the chain, then wraps {value,done} in
                                   Promise.resolve(value).then(unwrap) at the settle. No fork-clone yet (DFAIL-guarded). */
@@ -18458,11 +18454,9 @@ typedef struct JSPromiseTry {
     JSValue cb_args[];           /* [this=undefined, fn, arg0..arg(nargs-1)] — owned dups; the tramp reads &cb_args[2] */
 } JSPromiseTry;
 static bool tramp_can_call_promise_try(JSValueConst func, JSValueConst *call_argv, int call_argc);
-#define CONT_STR_REPLACE   15  /* cont_state = JSStrReplace: String.prototype.replace/replaceAll with a FUNCTION
-                                  replacer. The builtin holds a StringBuffer + endOfLastMatch across each callback,
-                                  so the callback dispatch is hooked into the flow machinery (the builtin stays in
-                                  C) — replaceAll's loop is preemptible at every callback boundary, and the
-                                  replacer's own body at every back-edge. */
+/* String.prototype.replace/replaceAll: a step machine. It holds a StringBuffer + endOfLastMatch across each
+   callback, so replaceAll's loop is preemptible at every callback boundary and the replacer's body at every
+   back-edge. (Kind 15 was CONT_STR_REPLACE, back when a hand-written driver ran this walk.) */
 typedef struct JSStrReplace {
     JSStepHdr hdr;           /* MUST be first: the generic step driver casts the state to JSStepHdr * */
     uint8_t mode;            /* 0 = string walk, 1 = call a USER @@replace, 2 = finished, 3 = delegate to the built-in @@replace machine */
@@ -18479,15 +18473,12 @@ typedef struct JSStrReplace {
     uint8_t is_first;
     uint8_t is_replaceAll;
     uint8_t cb_pending;     /* 1 = the value delivered to the next step is the replacer's result */
-    int orig_cfirst, orig_cargc; uint8_t orig_is_tail;   /* the ORIGINAL OP_call_method operand shape */
 } JSStrReplace;
 static int js_str_replace_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_str_replace_fini(JSContext *ctx, void *st, bool take_result);
-#define CONT_RE_REPLACE    16  /* cont_state = JSReRep: str.replace(/re/g, fn) — RegExp.prototype[@@replace] with a
-                                  FUNCTION replacer. Phase 1 (collect every match) runs in C at setup because the
-                                  recognizer demands a STANDARD regexp; phase 2 (substitute each match) holds the
-                                  StringBuffer + nextSourcePosition + result index across each callback, so it is
-                                  driven one match per step on the tramp. */
+/* RegExp.prototype[@@replace] with a function replacer: a step machine. Phase 1 collects every match; phase 2
+   holds the StringBuffer + nextSourcePosition + result index across each callback and substitutes one match per
+   step. (Kind 16 was CONT_RE_REPLACE.) */
 typedef struct JSReRep {
     JSStepHdr hdr;           /* MUST be first: the generic step driver casts the state to JSStepHdr * */
     uint8_t functional;      /* 1 = callable replacer (step-code 3); 0 = GetSubstitution inside the same walk */
@@ -18505,7 +18496,6 @@ typedef struct JSReRep {
     int cb_nargs;
     uint8_t cb_pending;      /* 1 = the value delivered to the next step is the replacer's result */
     JSValue result;          /* DONE: the finished string (owned) */
-    int orig_cfirst, orig_cargc; uint8_t orig_is_tail;
 } JSReRep;
 static int js_re_rep_step(JSContext *ctx, struct JSReRep *s, JSValue cb_result);
 static void js_re_rep_end(JSContext *ctx, struct JSReRep *s, bool take_result);
@@ -18516,7 +18506,6 @@ static int string_indexof_char(JSString *p, int c, int from);
 static int64_t string_advance_index(JSString *p, int64_t idx, bool unicode);
 static JSValue JS_RegExpExec(JSContext *ctx, JSValueConst r, JSValueConst s);
 static int js_str_replace_step(JSContext *ctx, JSStrReplace *s, JSValue cb_result);
-static void js_str_replace_end(JSContext *ctx, JSStrReplace *s, bool take_result);
 static JSValue js_promise_constructor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv);
 static JSValue js_promise_new(JSContext *ctx, JSValueConst new_target, JSValue *resolving_funcs);
 /* WrapForValidIterator's [[Iterated]] record — defined HERE (not at its finalizer) because the interpreter builds
@@ -18734,27 +18723,23 @@ typedef struct JSArrayEvery {
     int64_t len, k, n;
     int special, pending_k;
     JSValueConst func, this_arg;
-    /* Tramp-chain coroutine (do_array_iter_tramp) fields. cb_args is the callback's operand buffer OWNED BY THE
-       STATE — the callback args must NOT go on the caller's stack (its stack_size is compiler-computed for the
-       caller's own needs) and must NOT need a bytecode-less continuation frame (the exception handler rightly
-       assumes every frame has bytecode). Layout mirrors a method call so do_tramp_call reads it directly:
-       [0]=this_arg [1]=func [2..4]=(val,index,obj); call_argv = &cb_args[2], tramp_first=-2, call_argc=3. All
-       entries are BORROWED (val/obj from this state, func/this_arg from the caller's live stack), so do_return
-       must skip its `cargv = sp - cargc` arg-free for an iter_state frame. orig_* are the ORIGINAL OP_call's
-       operand shape, used once when the iteration finishes to pop them and push the builtin's result. */
+    /* cb_args is the callback's operand buffer OWNED BY THE STATE — the callback args must NOT go on the
+       caller's stack (its stack_size is compiler-computed for the caller's own needs) and must NOT need a
+       bytecode-less continuation frame (the exception handler rightly assumes every frame has bytecode). Layout
+       mirrors a method call so the driver reads it directly: [0]=this_arg [1]=func [2..4]=(val,index,obj);
+       call_argv = &cb_args[2], tramp_first=-2, call_argc=3. All entries are BORROWED (val/obj from this state,
+       func/this_arg from the header's captured invocation), so do_return skips its `cargv = sp - cargc`
+       arg-free for a callback frame. The ORIGINAL call's operand shape lives in hdr. */
     JSValue cb_args[5];
-    int orig_cfirst, orig_cargc;
-    uint8_t orig_is_tail;
 } JSArrayEvery;
 /* Array iteration builtins (forEach/map/every/some/filter) drive a JS callback from a C loop — the
-   CONTINUATION-HOLDING re-entrant. do_array_iter_tramp runs that drive on the tramp chain: each callback is a
-   NORMAL frame carrying iter_state (no bytecode-less frame), so the callback runs with gen_state == the base and
-   a callback BODY LOOP preempts the base flow — never a C-recursive JS_Call that could only drive to completion. */
+   CONTINUATION-HOLDING re-entrant. They are a step machine, so that drive runs on the tramp chain: each callback
+   is a NORMAL frame carrying the state, so it runs with gen_state == the base and a callback BODY LOOP preempts
+   the base flow — never a C-recursive JS_Call that could only drive to completion. */
 static int js_array_every_init(JSContext *ctx, struct JSArrayEvery *s, JSValueConst this_val,
                                int argc, JSValueConst *argv, int special);
 static int js_array_every_step(JSContext *ctx, struct JSArrayEvery *s, JSValue res, JSValueConst out_args[3]);
 static void js_array_every_end(JSContext *ctx, struct JSArrayEvery *s, bool take_ret);
-static JSValue js_array_every(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int special);
 /* reduce/reduceRight: the same continuation-holding shape as js_array_every, with the accumulator as the state. */
 typedef struct JSArrayReduce {
     JSStepHdr hdr;           /* MUST be first: the generic step driver casts the state to JSStepHdr * */
@@ -18763,8 +18748,6 @@ typedef struct JSArrayReduce {
     int special, pending;        /* pending = a callback result (the next accumulator) is awaited */
     JSValueConst func;
     JSValue cb_args[6];          /* [this=undefined, func, acc, val, index, obj]; call_argv = &cb_args[2], argc=4 */
-    int orig_cfirst, orig_cargc;
-    uint8_t orig_is_tail;
 } JSArrayReduce;
 static int js_array_reduce_init(JSContext *ctx, struct JSArrayReduce *s, JSValueConst this_val,
                                 int argc, JSValueConst *argv, int special);
@@ -18970,7 +18953,6 @@ static JSValue js_typed_array_from(JSContext *ctx, JSValueConst this_val, int ar
 static JSValue js_typed_array_of(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 static bool tramp_can_call_ta_from_consume(JSContext *ctx, JSValueConst func, JSValueConst this_val, JSValueConst *call_argv, int call_argc, int *out_classid, JSValue *out_getiter);
 static void js_array_reduce_end(JSContext *ctx, struct JSArrayReduce *s, bool take_acc);
-static JSValue js_array_reduce(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int special);
 /* arr.sort(cmpFn) with a NORMAL bytecode comparator: a SUSPENDABLE bottom-up (iterative) stable merge sort whose
    ONLY suspension point is cmp(array[l], array[r]) inside the inner merge. All algorithm state (width, block
    index, merge cursors) lives in the heap struct, so no C-stack recursion — a comparator body loop preempts and
@@ -18989,9 +18971,7 @@ typedef struct JSArraySort {
     int64_t width, i, lo, mid, hi, l, r, k;   /* bottom-up merge-sort cursors */
     uint8_t pending;                /* a cmp(array[l],array[r]) result is awaited */
     JSValue cb_args[4];             /* [this=undefined, method, array[l].val, array[r].val]; call_argv=&cb_args[2], argc=2 */
-    int orig_cfirst, orig_cargc; uint8_t orig_is_tail;
 } JSArraySort;
-static JSValue js_array_sort(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 static int js_array_sort_init(JSContext *ctx, struct JSArraySort *s, JSValueConst this_val, JSValueConst method);
 static int js_array_sort_step(JSContext *ctx, struct JSArraySort *s, JSValue res, JSValueConst out_args[2]);
 static JSValue js_array_sort_end(JSContext *ctx, struct JSArraySort *s, bool ok);
@@ -19025,7 +19005,6 @@ typedef struct JSJsonReviver {
     JRFrame *stack; int sp, cap;
     JSValue result;                 /* final revived value */
     JSValue cb_args[5];             /* [holder(this), reviver, name_val, val, context]; call_argv=&cb_args[2], argc=3 */
-    int orig_cfirst, orig_cargc; uint8_t orig_is_tail;
 } JSJsonReviver;
 /* String(x) / new String(x), 22.1.1.1. Its ToString(argv[0]) runs a user valueOf/toString/@@toPrimitive, which
    from a C body would be JS_CallFree with nowhere to suspend. As a step machine the coercion is a TOPRIMITIVE
@@ -19375,7 +19354,7 @@ static bool tramp_unwrap_iter_next(JSValueConst *piter, JSValueConst *pnext) {
             JSIteratorHelperData *dh_ = JS_VALUE_GET_OBJ(diter)->u.iterator_helper_data;                 \
             dh_->executing = 1; dh_->resume_pc = ITHP_START;                                             \
             dh_->drive_mode = ITH_CONSUME; dh_->consumer = (statep); dh_->consumer_kind = (kindc);        \
-            cont_st = dh_; cont_kind_cur = CONT_ITER_HELPER;                                             \
+            cont_st = dh_;                                             \
             ret_val = JS_UNINITIALIZED;                                                                   \
             goto do_iter_helper_step;                                                                     \
         }                                                                                                 \
@@ -19574,11 +19553,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        ap_cfirst/ap_cargc parameterize do_return's operand cleanup for the two operand shapes. */
     JSValueConst ap_func = JS_UNDEFINED, ap_this = JS_UNDEFINED, ap_array = JS_UNDEFINED;
     int ap_cfirst = -2, ap_cargc = 0;
-    /* array-iteration coroutine (do_array_iter_tramp): tramp_iter_state is handed to the callback frame that
-       do_tramp_call pushes, so its do_return re-enters js_array_every_step instead of returning to bytecode. */
+    /* A continuation-holding builtin's state is handed to the callback frame that do_tramp_call pushes, so its
+       do_return re-enters that builtin's step instead of returning to bytecode. */
     void *tramp_cont_state = NULL, *cont_st = NULL;
-    uint8_t tramp_cont_kind = CONT_NONE, cont_kind_cur = CONT_NONE;
-    int iter_special = 0;
+    uint8_t tramp_cont_kind = CONT_NONE;
     int tramp_gen_magic = 0;                            /* set before goto do_generator_tramp */
     int tramp_step_isctor = 0;                          /* 1 = the step about to be pushed is a CONSTRUCT, so the receiver slot carries new_target (read+reset in do_step_tramp) */
     void *tramp_step_outer = NULL;                      /* non-NULL = the step about to be pushed delivers its result to this machine's step, not to the operand stack (read+reset in do_step_tramp) */
@@ -21161,22 +21139,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 goto restart;
             }
 
-        do_array_reduce_tramp:
-            /* arr.reduce/reduceRight: same shape as do_array_iter_tramp — the callback drive runs HERE so a
-               callback body loop preempts the base flow; operands live in the state's cb_args. */
-            {
-                struct JSArrayReduce *s = js_malloc(ctx, sizeof(*s));
-                if (unlikely(!s)) { JS_ThrowOutOfMemory(ctx); goto exception; }
-                if (js_array_reduce_init(ctx, s, call_argv[-2], call_argc, vc(call_argv), iter_special)) {
-                    js_array_reduce_end(ctx, s, false); js_free_rt(rt, s); goto exception;
-                }
-                for (i = 0; i < 6; i++) s->cb_args[i] = JS_UNDEFINED;
-                s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
-                cont_st = s; cont_kind_cur = CONT_ARRAY_REDUCE;
-                ret_val = JS_UNDEFINED;
-                goto do_array_reduce_step;
-            }
-
         do_consumer_dispatch:
             /* THE single consultation of the iterable-CONSUMING builtins (Array.from / Object.fromEntries /
                Iterator.from / it.toArray|forEach|... / s.union|... / TypedArray.from / Promise.all|allSettled|any|
@@ -21395,179 +21357,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 goto do_step_step;
             }
 
-        do_array_reduce_step:
-            {
-                struct JSArrayReduce *s = (struct JSArrayReduce *)cont_st;
-                int st = js_array_reduce_step(ctx, s, ret_val, (JSValueConst *)&s->cb_args[2]);
-                if (unlikely(st < 0)) { js_array_reduce_end(ctx, s, false); js_free_rt(rt, s); goto exception; }
-                if (st == 0) {   /* DONE: the accumulator is the result */
-                    JSValue r = s->acc;
-                    int cfirst = s->orig_cfirst, cargc = s->orig_cargc;
-                    uint8_t itail = s->orig_is_tail;
-                    JSValue *cargv = sp - cargc;
-                    js_array_reduce_end(ctx, s, true);
-                    js_free_rt(rt, s);
-                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
-                    sp += cfirst - cargc;
-                    if (itail) { ret_val = r; goto do_return; }
-                    *sp++ = r;
-                    BREAK;
-                }
-                s->cb_args[0] = JS_UNDEFINED;   /* reduce's callback gets this = undefined */
-                s->cb_args[1] = s->func;
-                call_argv = (JSValueConst *)&s->cb_args[2];
-                call_argc = 4; tramp_first = -2; tramp_is_tail = 0;
-                if (tramp_can_call(s->cb_args[1])) {
-                    tramp_cont_state = s; tramp_cont_kind = CONT_ARRAY_REDUCE;
-                    goto do_tramp_call;
-                }
-                ret_val = JS_Call(ctx, s->cb_args[1], JS_UNDEFINED, 4, (JSValueConst *)&s->cb_args[2]);
-                if (unlikely(JS_IsException(ret_val))) {
-                    js_array_reduce_end(ctx, s, false); js_free_rt(rt, s); goto exception;
-                }
-                goto do_array_reduce_step;
-            }
-
-        do_sort_tramp:
-            /* arr.sort(cmp): drive a suspendable bottom-up merge sort whose comparator runs HERE on the chain, so
-               a comparator body loop preempts the base. Operands [arr, sortfn, cmp] (call_first=-2). */
-            {
-                JSArraySort *s = js_malloc(ctx, sizeof(*s));
-                if (unlikely(!s)) { JS_ThrowOutOfMemory(ctx); goto exception; }
-                if (js_array_sort_init(ctx, s, call_argv[-2], call_argv[0])) {
-                    js_array_sort_end(ctx, s, false); js_free_rt(rt, s); goto exception;
-                }
-                s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
-                cont_st = s; cont_kind_cur = CONT_SORT;
-                ret_val = JS_UNDEFINED;
-                goto do_sort_step;
-            }
-
-        do_sort_step:
-            {
-                JSArraySort *s = (JSArraySort *)cont_st;
-                int st = js_array_sort_step(ctx, s, ret_val, (JSValueConst *)&s->cb_args[2]);
-                if (unlikely(st < 0)) { js_array_sort_end(ctx, s, false); js_free_rt(rt, s); goto exception; }
-                if (st == 0) {   /* DONE: the sorted array object is the result */
-                    int cfirst = s->orig_cfirst, cargc = s->orig_cargc;
-                    uint8_t itail = s->orig_is_tail;
-                    JSValue r = js_array_sort_end(ctx, s, true);   /* writes back; may throw */
-                    JSValue *cargv = sp - cargc;
-                    js_free_rt(rt, s);
-                    if (unlikely(JS_IsException(r))) goto exception;
-                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
-                    sp += cfirst - cargc;
-                    if (itail) { ret_val = r; goto do_return; }
-                    *sp++ = r;
-                    BREAK;
-                }
-                /* st == 1: compare the two elements — the comparator runs on the chain (borrowed cb_args). */
-                s->cb_args[0] = JS_UNDEFINED;   /* comparator this = undefined */
-                s->cb_args[1] = s->method;
-                call_argv = (JSValueConst *)&s->cb_args[2];
-                call_argc = 2; tramp_first = -2; tramp_is_tail = 0;
-                tramp_cont_state = s; tramp_cont_kind = CONT_SORT;   /* method is a NORMAL bytecode fn (gated at admission) */
-                goto do_tramp_call;
-            }
-
-        do_json_revive_tramp:
-            /* JSON.parse(text, reviver): parse synchronously, then walk the tree with an explicit DFS stack whose
-               reviver call runs HERE on the chain (so a reviver body loop preempts). Operands [JSON, parse, text,
-               reviver] (call_first=-2). */
-            {
-                JSJsonReviver *s = js_malloc(ctx, sizeof(*s));
-                if (unlikely(!s)) { JS_ThrowOutOfMemory(ctx); goto exception; }
-                if (js_json_reviver_init(ctx, s, call_argv[0], call_argv[1])) {
-                    js_json_reviver_end(ctx, s, false); js_free_rt(rt, s); goto exception;
-                }
-                s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
-                cont_st = s; cont_kind_cur = CONT_JSON_REVIVE;
-                ret_val = JS_UNDEFINED;
-                goto do_json_revive_step;
-            }
-
-        do_json_revive_step:
-            {
-                JSJsonReviver *s = (JSJsonReviver *)cont_st;
-                int st = js_json_reviver_step(ctx, s, ret_val, (JSValueConst *)&s->cb_args[2]);
-                if (unlikely(st < 0)) { js_json_reviver_end(ctx, s, false); js_free_rt(rt, s); goto exception; }
-                if (st == 0) {   /* DONE: the revived value */
-                    int cfirst = s->orig_cfirst, cargc = s->orig_cargc;
-                    uint8_t itail = s->orig_is_tail;
-                    JSValue r = js_json_reviver_end(ctx, s, true);
-                    JSValue *cargv = sp - cargc;
-                    js_free_rt(rt, s);
-                    if (unlikely(JS_IsException(r))) goto exception;
-                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
-                    sp += cfirst - cargc;
-                    if (itail) { ret_val = r; goto do_return; }
-                    *sp++ = r;
-                    BREAK;
-                }
-                /* st == 1: call reviver.call(holder, name, val, context) on the chain. cb_args[0]=holder set by
-                   the step; [2..4]=name,val,context; set [1]=reviver here. */
-                s->cb_args[1] = s->reviver;
-                call_argv = (JSValueConst *)&s->cb_args[2];
-                call_argc = 3; tramp_first = -2; tramp_is_tail = 0;
-                tramp_cont_state = s; tramp_cont_kind = CONT_JSON_REVIVE;   /* reviver is a NORMAL bytecode fn (gated) */
-                goto do_tramp_call;
-            }
-
-        do_array_iter_tramp:
-            /* arr.forEach/map/every/some/filter: run the CALLBACK DRIVE here on the chain. The state owns the
-               callback's operand buffer (cb_args), so no bytecode-less frame and no growth of the caller's
-               compiler-sized stack. Each callback is a NORMAL frame carrying iter_state; gen_state is unchanged
-               (the base), so a callback BODY LOOP preempts the BASE flow at any depth. */
-            {
-                struct JSArrayEvery *s = js_malloc(ctx, sizeof(*s));
-                if (unlikely(!s)) { JS_ThrowOutOfMemory(ctx); goto exception; }
-                if (js_array_every_init(ctx, s, call_argv[-2], call_argc, vc(call_argv), iter_special)) {
-                    js_array_every_end(ctx, s, false); js_free_rt(rt, s); goto exception;
-                }
-                for (i = 0; i < 5; i++) s->cb_args[i] = JS_UNDEFINED;
-                s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
-                cont_st = s; cont_kind_cur = CONT_ARRAY_ITER;
-                ret_val = JS_UNDEFINED;   /* first step has no previous callback result */
-                goto do_array_iter_step;
-            }
-
-        do_array_iter_step:
-            /* ret_val = the previous callback's result (JS_UNDEFINED on the first step); iter_st = the state.
-               Feed it to the step, then either drive the next callback or finish the builtin. */
-            {
-                struct JSArrayEvery *s = (struct JSArrayEvery *)cont_st;
-                int st = js_array_every_step(ctx, s, ret_val, (JSValueConst *)&s->cb_args[2]);
-                if (unlikely(st < 0)) { js_array_every_end(ctx, s, false); js_free_rt(rt, s); goto exception; }
-                if (st == 0) {   /* DONE: pop the ORIGINAL OP_call operands, yield the builtin's result */
-                    JSValue r = s->ret;
-                    int cfirst = s->orig_cfirst, cargc = s->orig_cargc;
-                    uint8_t itail = s->orig_is_tail;
-                    JSValue *cargv = sp - cargc;
-                    js_array_every_end(ctx, s, true);   /* takes r */
-                    js_free_rt(rt, s);
-                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
-                    sp += cfirst - cargc;
-                    if (itail) { ret_val = r; goto do_return; }
-                    *sp++ = r;
-                    BREAK;
-                }
-                /* CALL: drive this element's callback. cb_args is [this,func,val,idx,obj] — a method-call shape. */
-                s->cb_args[0] = s->this_arg; s->cb_args[1] = s->func;
-                call_argv = (JSValueConst *)&s->cb_args[2];
-                call_argc = 3; tramp_first = -2; tramp_is_tail = 0;
-                if (tramp_can_call(s->cb_args[1])) {
-                    tramp_cont_state = s; tramp_cont_kind = CONT_ARRAY_ITER;   /* the pushed frame carries the state; its do_return re-enters the step */
-                    goto do_tramp_call;
-                }
-                /* A non-NORMAL callback (C function / bound / proxy) has no preemptible body — call it directly
-                   and step again; nothing to park. */
-                ret_val = JS_Call(ctx, s->cb_args[1], s->cb_args[0], 3, (JSValueConst *)&s->cb_args[2]);
-                if (unlikely(JS_IsException(ret_val))) {
-                    js_array_every_end(ctx, s, false); js_free_rt(rt, s); goto exception;
-                }
-                goto do_array_iter_step;
-            }
-
         do_iter_consume_tramp:
             /* Array.from(iterable): GetIterator(items) via the @@iterator method the recognition read, then consume
                the iterator on THIS chain. call_argv[-2] = Array (from's `this`/ctor), call_argv[0] = items. The
@@ -21646,7 +21435,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->super_ref = JS_UNDEFINED;   /* only the super(iterable) entry owns one */
                 s->setop = iterterm_kind;
                 s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
-                cont_st = s; cont_kind_cur = CONT_ITER_CONSUME;
+                cont_st = s;
                 ret_val = JS_UNINITIALIZED;
                 goto do_iter_consume_step;
             }
@@ -21752,7 +21541,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 tp->hint_none = (tp_hint == HINT_NONE);
                 tp->stage = 0;
                 tp_outer = NULL; tp_outer_kind = CONT_NONE; tp_value = JS_UNDEFINED;   /* read + reset */
-                cont_st = tp; cont_kind_cur = CONT_TOPRIM;
+                cont_st = tp;
                 ret_val = JS_UNINITIALIZED;
                 goto do_toprim_step;
             }
@@ -21843,7 +21632,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (touter) {
                         /* MACHINE mode: a coercing BUILTIN asked for this primitive; it comes back as that step's
                            result, exactly as a callback's would. */
-                        cont_st = touter; cont_kind_cur = touter_kind;
+                        cont_st = touter;
                         DCHECK(touter_kind == CONT_STEP, "ToPrimitive outer continuation: unknown machine kind");
                         goto do_step_step;
                     }
@@ -21963,7 +21752,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     cs->iter = acq;
                     cs->next = JS_GetProperty(ctx, acq, JS_ATOM_next);   /* GetIterator's nextMethod (drives a plain iterator) */
                     if (JS_IsException(cs->next)) { cs->next = JS_UNDEFINED; js_iter_consume_end(ctx, cs); js_free_rt(rt, cs); goto exception; }
-                    cont_st = cs; cont_kind_cur = CONT_ITER_CONSUME;
+                    cont_st = cs;
                     ret_val = JS_UNINITIALIZED;   /* first step: no previous next() result */
                     goto do_iter_consume_step;
                 }
@@ -22014,7 +21803,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     ps->iter = acq;
                     ps->next = JS_GetProperty(ctx, acq, JS_ATOM_next);
                     if (!JS_IsException(ps->next)) {
-                        cont_st = ps; cont_kind_cur = CONT_PROMISE_ALL;
+                        cont_st = ps;
                         ret_val = JS_UNINITIALIZED;
                         goto do_promise_all_step;
                     }
@@ -22134,7 +21923,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     so->sink = ITERCONS_FROM; so->ta_isfrom = 1; so->ta_classid = 0;
                     so->ta_phase = 1;
                     so->orig_cfirst = -2; so->orig_cargc = call_argc; so->orig_is_tail = 0;
-                    cont_st = so; cont_kind_cur = CONT_ITER_CONSUME;
+                    cont_st = so;
                     ret_val = JS_UNINITIALIZED;
                     goto do_iter_consume_step;
                 }
@@ -22180,7 +21969,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             s6->sink = ITERCONS_FROM; s6->ta_isfrom = 1; s6->ta_classid = 0;
                             s6->ta_phase = 1;                   /* skip the collect: the list already exists */
                             s6->orig_cfirst = -2; s6->orig_cargc = call_argc; s6->orig_is_tail = 0;
-                            cont_st = s6; cont_kind_cur = CONT_ITER_CONSUME;
+                            cont_st = s6;
                             ret_val = JS_UNINITIALIZED;
                             goto do_iter_consume_step;
                         }
@@ -22555,7 +22344,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (afs_iter_magic == GEN_MAGIC_RETURN) {
                             ret_val = js_create_iterator_result(ctx, afs_noarg ? JS_UNDEFINED : js_dup(sp[-1]), true);
                             if (JS_IsException(ret_val)) goto do_afs_itercall_reject;
-                            cont_st = s; cont_kind_cur = CONT_ASYNC_FROM_SYNC;
+                            cont_st = s;
                             goto do_async_from_sync_step;   /* wraps + delivers exactly like a driven result */
                         }
                         if (JS_IteratorClose(ctx, s->sync_iter, false) == 0)
@@ -22578,10 +22367,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         JS_ThrowTypeError(ctx, "iterator result not an object");
                         goto do_afs_itercall_reject;
                     }
-                    cont_st = s; cont_kind_cur = CONT_ASYNC_FROM_SYNC;
+                    cont_st = s;
                     goto do_async_from_sync_step;
                 do_afs_itercall_reject:
-                    cont_st = s; cont_kind_cur = CONT_ASYNC_FROM_SYNC;
+                    cont_st = s;
                     goto do_async_from_sync_abrupt;   /* rejects s->promise and delivers it per s->deliver */
                 }
                 tramp_cont_state = s; tramp_cont_kind = CONT_ASYNC_FROM_SYNC; tramp_gen_cont_iter = s->sync_iter;
@@ -22676,7 +22465,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 it->resume_pc = ITHP_START;
                 if (ith_off < 0) { it->drive_mode = ITH_FOROF; it->forof_off = ith_off; }
                 else { it->drive_mode = ITH_DIRECT; it->orig_cargc = call_argc; it->orig_is_tail = tramp_is_tail; }
-                cont_st = it; cont_kind_cur = CONT_ITER_HELPER;
+                cont_st = it;
                 ret_val = JS_UNINITIALIZED;
                 goto do_iter_helper_step;
             }
@@ -22736,7 +22525,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             it->consumer = NULL;
                             ret_val = out;
                             if (ck == CONT_ITER_HELPER) { it = (JSIteratorHelperData *)cons; continue; }
-                            cont_st = cons; cont_kind_cur = ck;
+                            cont_st = cons;
                             if (ck == CONT_ITER_CONSUME) goto do_iter_consume_step;
                             if (ck == CONT_PROMISE_ALL) goto do_promise_all_step;
                             if (ck == CONT_ASYNC_FROM_SYNC) goto do_async_from_sync_step;
@@ -22986,7 +22775,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (do_throw) { JS_FreeValue(ctx, gv); JS_Throw(ctx, thr); goto exception; }
                         giter = js_create_iterator_result(ctx, gv, true);
                         if (JS_IsException(giter)) goto exception;
-                        cont_st = cc_state; cont_kind_cur = cc_kind;
+                        cont_st = cc_state;
                         ret_val = giter;
                         if (cc_kind == CONT_PROMISE_ALL) goto do_promise_all_step;
                         if (cc_kind == CONT_ASYNC_FROM_SYNC) goto do_async_from_sync_step;
@@ -23177,7 +22966,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 giter = (gdone == 2) ? value : js_create_iterator_result(ctx, value, gdone);
                 if (JS_IsException(giter)) goto exception;
                 if (gck == CONT_ITER_CONSUME || gck == CONT_PROMISE_ALL || gck == CONT_ASYNC_FROM_SYNC || gck == CONT_ITER_HELPER) {   /* consumer drive: feed {value,done} back to its step (caller stack untouched: sp == caller_sp) */
-                    cont_st = gcont; cont_kind_cur = gck;
+                    cont_st = gcont;
                     ret_val = giter;
                     if (gck == CONT_PROMISE_ALL) goto do_promise_all_step;
                     if (gck == CONT_ASYNC_FROM_SYNC) goto do_async_from_sync_step;
@@ -23400,7 +23189,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (JS_IsException(cit->inner_next)) { cit->inner_next = JS_UNDEFINED; cit->executing = 0; goto exception; }
                     cit->drive_inner = 1;
                     cit->resume_pc = ITHP_START;
-                    cont_st = cit; cont_kind_cur = CONT_ITER_HELPER;
+                    cont_st = cit;
                     ret_val = JS_UNINITIALIZED;
                     goto do_iter_helper_step;
                 }
@@ -23463,7 +23252,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         JS_ThrowTypeError(ctx, "iterator result not an object");
                         goto exception;
                     }
-                    cont_st = rcs; cont_kind_cur = CONT_ITER_CONSUME;
+                    cont_st = rcs;
                     goto do_iter_consume_step;
                 }
                 if (rck == CONT_PROMISE_ALL) {
@@ -23476,7 +23265,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     DCHECK(cargc - cfirst == 2 || cargc - cfirst == 3, "promise-all cont frame has an unexpected operand shape");
                     for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
                     sp += cfirst - cargc;
-                    cont_st = rcs; cont_kind_cur = CONT_PROMISE_ALL;
+                    cont_st = rcs;
                     goto do_promise_all_step;
                 }
                 if (rck == CONT_ITER_HELPER) {
@@ -23494,7 +23283,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         JS_ThrowTypeError(ctx, "iterator result not an object");
                         goto exception;
                     }
-                    cont_st = rcs; cont_kind_cur = CONT_ITER_HELPER;
+                    cont_st = rcs;
                     goto do_iter_helper_step;
                 }
                 if (rck == CONT_TOPRIM) {
@@ -23503,7 +23292,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JSValue *cargv = sp - cargc;
                     for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
                     sp += cfirst - cargc;
-                    cont_st = rcs; cont_kind_cur = CONT_TOPRIM;
+                    cont_st = rcs;
                     goto do_toprim_step;
                 }
                 if (rck == CONT_FOROF_NEXT) {
@@ -23587,7 +23376,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv2[i]);
                         sp += cfirst - cargc;
                         JS_FreeValue(ctx, super_ref);
-                        cont_st = couter; cont_kind_cur = couter_kind;
+                        cont_st = couter;
                         if (couter_kind == CONT_ITER_CONSUME) goto do_iter_consume_step;
                         DCHECK(couter_kind == CONT_STEP, "construct outer continuation: unknown machine kind");
                         goto do_step_step;
@@ -23618,17 +23407,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 } else if (rck != CONT_NONE) {
                     /* A C-builtin-driven CALLBACK returned: its operands live in the state's own buffer
                        (borrowed), NOT on the caller's stack — so skip the cargv arg-free, and feed the result to
-                       that builtin's STEP instead of pushing it. The step drives the next element or finishes. */
-                    cont_st = rcs; cont_kind_cur = rck;
-                    if (rck == CONT_STEP) goto do_step_step;
-                    if (rck == CONT_ARRAY_REDUCE) goto do_array_reduce_step;
-                    if (rck == CONT_SORT) goto do_sort_step;
-                    if (rck == CONT_JSON_REVIVE) goto do_json_revive_step;
-                    /* CONT_ITER_CONSUME settles via do_generator_settle (its callback IS a generator drive), never
-                       here — a leaked kind (e.g. a stale tramp_cont_kind stamped onto an inner call) would misread
-                       its state as a JSArrayEvery. Assert the fallthrough's sole remaining kind at its origin. */
-                    DCHECK(rck == CONT_ARRAY_ITER, "do_return: C-continuation fallthrough expects CONT_ARRAY_ITER; a stray cont_kind would misdispatch to do_array_iter_step");
-                    goto do_array_iter_step;
+                       that builtin's STEP instead of pushing it. The step drives the next element or finishes.
+                       ONE kind reaches here now. It used to be five: the four hand-written drivers this dispatch
+                       named (array-iteration, reduce, sort, JSON revive) were the JS_Call-loop twins of the step
+                       machines that replaced them, and each kept its own copy of the DONE/operand-pop/callback
+                       drive. CONT_ITER_CONSUME settles via do_generator_settle (its callback IS a generator
+                       drive) and never arrives here, so a stray kind is a bug, not a case to add. */
+                    DCHECK(rck == CONT_STEP, "do_return: a C-continuation fallthrough must be CONT_STEP; a stray "
+                                             "cont_kind would misread its state as a step machine's");
+                    cont_st = rcs;
+                    goto do_step_step;
                 }
                 if (itail) goto do_return;   /* caller was a tail-caller: propagate */
                 {
@@ -26487,7 +26275,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                (`iter.throw(e)` delegating into `yield* syncGen`) it pushed the promise instead of replacing the
                argument slot, so the promise was never awaited and the test hung with no error. Same abrupt, same
                settle — one implementation, and s->deliver decides the tail. */
-            cont_st = afs_throw; cont_kind_cur = CONT_ASYNC_FROM_SYNC;
+            cont_st = afs_throw;
             goto do_async_from_sync_abrupt;
         }
         goto exception;   /* re-raise the pending exception in the caller */
@@ -26712,16 +26500,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 else
                     JS_IteratorClose(ctx, cs2->iter, true);
             }
-            if (xck == CONT_ARRAY_ITER)
-                js_array_every_end(ctx, (struct JSArrayEvery *)xcs, false);
-            else if (xck == CONT_SORT)
-                js_array_sort_end(ctx, (struct JSArraySort *)xcs, false);
-            else if (xck == CONT_JSON_REVIVE)
-                js_json_reviver_end(ctx, (struct JSJsonReviver *)xcs, false);
-            else if (xck == CONT_ITER_CONSUME)
+            if (xck == CONT_ITER_CONSUME)
                 js_iter_consume_end(ctx, (struct JSIterConsume *)xcs);
-            else if (xck == CONT_ARRAY_REDUCE)
-                js_array_reduce_end(ctx, (struct JSArrayReduce *)xcs, false);
             else if (xck == CONT_STEP) {
                 /* fini OWNS the state allocation (every driver path calls it and expects the free), so the
                    trailing js_free_rt below must not run — it was a DOUBLE FREE on the callback-throws path for
@@ -26732,10 +26512,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 while (souter) { JSStepHdr *oh = souter; souter = oh->outer; tramp_step_state_free(ctx, oh, false); }
                 xcs = NULL;
             }
-            else if (xck == CONT_STR_REPLACE)
-                js_str_replace_end(ctx, (JSStrReplace *)xcs, false);
-            else if (xck == CONT_RE_REPLACE)
-                js_re_rep_end(ctx, (JSReRep *)xcs, false);
             /* CONT_PROMISE_ALL is handled by its own arm above (reject-and-yield, never abandon-and-propagate) and
                never reaches this generic teardown — a stray one here would be a bug, so the DFAIL guards it. */
             else
@@ -27419,57 +27195,7 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
             ct->sf.var_ref_count = otf->sf.var_ref_count;   /* share this frame's closed cells + take a ref */
             for (int vi = 0; vi < otf->sf.var_ref_count; vi++) { ct->sf.var_refs[vi] = otf->sf.var_refs[vi]; if (ct->sf.var_refs[vi]) JS_REF_COUNT(ct->sf.var_refs[vi])++; }
             ct->sf.prev_frame = NULL;
-            if (otf->cont_kind == CONT_ARRAY_ITER) {
-                /* C-CONTINUATION callback frame (forEach/map/every/some/filter): clone the builtin's iteration
-                   state so the sibling iterates INDEPENDENTLY from the fork point. obj/ret/val are OWNED (dup);
-                   func/this_arg are BORROWED object values kept alive by the clone's own caller-stack dup (plain
-                   copy — XL would corrupt an object value). The map/filter result array (ret) is SHARED and
-                   COW-isolated per-flow, like any post-fork object mutation.
-                   CRITICAL: the callback's args live in cb_args (an EXTERNAL buffer owned by the state), so the
-                   in-flight callback's sf.arg_buf points at &os->cb_args[2] — NOT the caller's stack. The generic
-                   XL(cob,ccb) above mis-relocated it (a wild pointer); repoint it into the CLONE's cb_args, and
-                   rebuild cb_args as the borrowed [this,func,val,idx,obj] shape referencing ns's owned fields so
-                   the running callback reads the correct element. */
-                struct JSArrayEvery *os = (struct JSArrayEvery *)otf->cont_state;
-                struct JSArrayEvery *ns = js_malloc(ctx, sizeof(*ns));
-                if (!ns) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
-                *ns = *os;
-                ns->obj = js_dup(os->obj);
-                ns->val = js_dup(os->val);
-                /* ret: forEach=undefined / every/some=bool (immutable) OR map/filter's result ARRAY. The array is
-                   SHARED (js_dup) and COW-isolated per-flow like any other shared array — the fast-array-append
-                   capture (add_fast_array_element / push fast path) records each arm's element write, so the two
-                   accumulators diverge and cow_unapply truncates each arm's appends away on context-switch. */
-                ns->ret = js_dup(os->ret);
-                ns->func = os->func; ns->this_arg = os->this_arg;
-                ns->cb_args[0] = ns->this_arg; ns->cb_args[1] = ns->func;
-                ns->cb_args[2] = ns->val; ns->cb_args[3] = os->cb_args[3]; ns->cb_args[4] = ns->obj;
-                ct->cont_state = ns;
-                if (otf->sf.arg_buf == &os->cb_args[2])   /* the callback's args are external cb_args -> repoint */
-                    ct->sf.arg_buf = &ns->cb_args[2];
-            } else if (otf->cont_kind == CONT_ARRAY_REDUCE) {
-                /* reduce/reduceRight callback frame: clone the ACCUMULATOR state so the sibling reduces INDEPENDENTLY
-                   from the fork point (the accumulator sibling of the CONT_ARRAY_ITER case above). acc/val/obj are
-                   OWNED (dup); func is BORROWED (plain copy, kept alive by the clone's own caller-stack dup). `acc` is
-                   the PRE-callback accumulator at the fork (the in-flight reducer's result isn't computed yet); each
-                   arm reassigns its OWN ns->acc going forward, so a primitive accumulator diverges by value and a
-                   shared-object accumulator is COW-isolated per-flow like any post-fork mutation. cb_args mirror the
-                   [this,func,acc,val,idx,obj] shape referencing ns's owned fields so the running reducer reads right. */
-                struct JSArrayReduce *os = (struct JSArrayReduce *)otf->cont_state;
-                struct JSArrayReduce *ns = js_malloc(ctx, sizeof(*ns));
-                if (!ns) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
-                *ns = *os;
-                ns->obj = js_dup(os->obj);
-                ns->acc = js_dup(os->acc);
-                ns->val = js_dup(os->val);
-                ns->func = os->func;
-                ns->cb_args[0] = JS_UNDEFINED; ns->cb_args[1] = ns->func;
-                ns->cb_args[2] = ns->acc; ns->cb_args[3] = ns->val;
-                ns->cb_args[4] = os->cb_args[4]; ns->cb_args[5] = ns->obj;   /* [4]=index number (plain copy) */
-                ct->cont_state = ns;
-                if (otf->sf.arg_buf == &os->cb_args[2])   /* the reducer's args are external cb_args -> repoint */
-                    ct->sf.arg_buf = &ns->cb_args[2];
-            } else if (otf->cont_kind == CONT_PROMISE_EXEC) {
+            if (otf->cont_kind == CONT_PROMISE_EXEC) {
                 /* the Promise EXECUTOR body forked: each arm must settle its own timeline, so the sibling gets its
                    own state. The promise object and its resolving functions are SHARED (created pre-fork, js_dup)
                    and COW-isolated per-flow like any other post-fork object mutation — so arm A resolving with X
@@ -27492,8 +27218,18 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                 if (otf->sf.arg_buf == &os->cb_args[2])
                     ct->sf.arg_buf = &ns->cb_args[2];
             } else {
+                /* The two arms that used to stand here cloned JSArrayEvery and JSArrayReduce for the hand-written
+                   array-iteration and reduce drivers. Those drivers are gone, so the arms were unreachable — and
+                   what replaced them, CONT_STEP, has no arm at all. The named capability is a `clone` in
+                   JSTrampStepDef: only the machine knows which of its fields are OWNED (dup them), which are
+                   BORROWED from the caller's stack (plain copy — XL would corrupt an object value), and how to
+                   rebuild its cb_args as borrowed views of the CLONE, after which the in-flight callback's
+                   sf.arg_buf is repointed from &os->cb_args[k] into the clone's. That is per-machine knowledge
+                   the driver cannot synthesise, which is why it belongs in the def and not here. */
                 DCHECK(otf->cont_kind == CONT_NONE,
-                       "clone_deep_flow: deep-fork of this C-continuation kind (sort/json-revive/construct/agen/str-replace/re-replace) not built");
+                       "clone_deep_flow: deep-fork of a C-continuation callback frame is not built — a step "
+                       "machine needs a `clone` in its JSTrampStepDef (dup the owned fields, rebuild cb_args as "
+                       "borrowed views of the clone, repoint the callback frame's arg_buf into them)");
             }
         }
         ct->up = (i == n - 1) ? NULL : ca[i + 1];
@@ -50264,9 +50000,8 @@ done:
     return 0;
 }
 
-/* Initialize the resumable state (the pre-loop setup: obj/len/func/this_arg + the per-special `ret` seed).
-   Returns 0 = ok, -1 = exception (state is safe to js_array_every_end). Shared by the plain C driver
-   (js_array_every) and the tramp-chain coroutine (do_array_iter_tramp) — ONE source of truth. */
+/* The PROLOGUE (obj/len/func/this_arg + the per-special `ret` seed), run as step 0. Returns 0 = ok,
+   -1 = exception (the state is safe to js_array_every_end either way). */
 static int js_array_every_init(JSContext *ctx, JSArrayEvery *s, JSValueConst this_val,
                                int argc, JSValueConst *argv, int special)
 {
@@ -54240,15 +53975,6 @@ exception:
    with a two-phase structure) and is deliberately NOT recognized — a separate step in its own right. */
 
 
-static void js_str_replace_end(JSContext *ctx, JSStrReplace *s, bool take_result)
-{
-    if (!take_result) {
-        string_buffer_free(&s->b);
-        JS_FreeValue(ctx, s->result);
-    }
-    JS_FreeValue(ctx, s->str);
-    JS_FreeValue(ctx, s->search_str);
-}
 
 /* 0 = DONE (s->result is the answer), 3 = CALL the replacer on the tramp, -1 = error.
    Mirrors the C loop exactly, split at the one point where it re-enters JS. */
