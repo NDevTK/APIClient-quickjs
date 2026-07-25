@@ -18870,8 +18870,10 @@ static bool needs_backtrace(JSValue exc)
    whole JS call stack must be HEAP-resident, not on the C stack. So a NORMAL bytecode call pushes a heap
    TrampFrame and `goto restart`s into the callee IN THE SAME JS_CallInternal loop (no C recursion); OP_return
    pops it. The C stack stays flat, deep recursion never overflows, and (with the generator base + a per-opcode
-   yield, next) the entire chain can be unwound at a yield and rebuilt on resume. Non-NORMAL callees (C funcs,
-   bound/proxy, generators) keep the recursive path for now — the common deep case is NORMAL. */
+   yield, next) the entire chain can be unwound at a yield and rebuilt on resume. Generators, bound functions,
+   proxies and step machines are all trampolined too (do_generator_tramp, do_bound_tramp, js_tramp_proxy_*,
+   do_step_tramp); what is left on the recursive path is a callee with NO preemptible body — a plain C function,
+   which has nothing to suspend. */
 typedef struct TrampFrame {
     JSStackFrame sf;                 /* the callee's own frame (heap-resident) */
     JSFunctionBytecode *b;
@@ -19256,15 +19258,51 @@ static inline bool tramp_can_call(JSValueConst func) {
     if (fp->class_id != JS_CLASS_BYTECODE_FUNCTION) return false;
     return fp->u.func.function_bytecode->func_kind == JS_FUNC_NORMAL;
 }
-/* A BOUND function (f.bind(t, ...a)) whose DIRECT target is a normal bytecode fn: do_bound_tramp assembles the
-   bound args ++ the call args into the target's frame and dispatches it on the chain, so a loop in the bound
-   target preempts. Nested binds (target itself bound) / native targets fall back to js_call_bound_function. */
+/* A bound function's chain, FLATTENED. `f.bind(a, x).bind(b, y)()` calls f with this = the INNERMOST bind's
+   this_val and args = innermost bound args ++ … ++ outermost bound args ++ the call args, so the walk fills the
+   vector BACKWARDS from the outermost level: each level's block sits just before the one it wraps. Nested binds
+   used to fall back to js_call_bound_function — a C round trip that drove the ultimate target to completion,
+   and js_call_c_function's DFAIL once that target was a step machine. There is no depth limit here and none is
+   wanted; the walk is O(depth) with no stack of its own.
+   Returns the ultimate target; *pthis is its receiver and *pnbound the number of bound arguments. */
+static JSValueConst tramp_bound_target(JSValueConst func, JSValueConst *pthis, int *pnbound) {
+    JSValueConst cur = func, recv = JS_UNDEFINED;
+    int n = 0;
+    while (JS_VALUE_GET_TAG(cur) == JS_TAG_OBJECT
+           && JS_VALUE_GET_OBJ(cur)->class_id == JS_CLASS_BOUND_FUNCTION) {
+        JSBoundFunction *bf = JS_VALUE_GET_OBJ(cur)->u.bound_function;
+        n += bf->argc;
+        recv = bf->this_val;   /* the innermost bind wins, and it is the last one this loop sees */
+        cur = bf->func_obj;
+    }
+    if (pthis) *pthis = recv;
+    if (pnbound) *pnbound = n;
+    return cur;
+}
+
+/* fill `vec` with the chain's bound arguments in call order. vec must have room for tramp_bound_target's
+   *pnbound entries; the values are BORROWED — every one is held by a bound-function object that stays live on
+   the caller's operand stack until do_return frees it. */
+static void tramp_bound_args(JSValueConst func, JSValueConst *vec, int nbound) {
+    JSValueConst cur = func;
+    int pos = nbound;
+    while (JS_VALUE_GET_TAG(cur) == JS_TAG_OBJECT
+           && JS_VALUE_GET_OBJ(cur)->class_id == JS_CLASS_BOUND_FUNCTION) {
+        JSBoundFunction *bf = JS_VALUE_GET_OBJ(cur)->u.bound_function;
+        int k;
+        pos -= bf->argc;
+        for (k = 0; k < bf->argc; k++)
+            vec[pos + k] = bf->argv[k];
+        cur = bf->func_obj;
+    }
+}
+
+/* A BOUND function whose ULTIMATE target is a normal bytecode fn: do_bound_tramp assembles the flattened bound
+   args ++ the call args into that target's frame and dispatches it on the chain, so a loop in it preempts. */
 static inline bool tramp_can_call_bound(JSValueConst func) {
-    JSObject *fp;
     if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
-    fp = JS_VALUE_GET_OBJ(func);
-    if (fp->class_id != JS_CLASS_BOUND_FUNCTION) return false;
-    return tramp_can_call(fp->u.bound_function->func_obj);
+    if (JS_VALUE_GET_OBJ(func)->class_id != JS_CLASS_BOUND_FUNCTION) return false;
+    return tramp_can_call(tramp_bound_target(func, NULL, NULL));
 }
 /* A bytecode CONSTRUCTOR (`new C()`) runs its body on the caller's tramp chain (do_construct_tramp) so a loop
    in the constructor body preempts the base flow at any depth — never a C-recursion through
@@ -21063,6 +21101,36 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     tramp_first = -2; tramp_is_tail = 0;
                     goto do_construct_tramp;
                 }
+                if (JS_VALUE_GET_TAG(call_argv[-2]) == JS_TAG_OBJECT
+                    && JS_VALUE_GET_OBJ(call_argv[-2])->class_id == JS_CLASS_BOUND_FUNCTION) {
+                    /* `new (String.bind(null))(x)`: 10.4.1.2 constructs the ULTIMATE target with the flattened
+                       bound args, retargeting new_target when it is the bound function itself. Resolving it here
+                       is what keeps a bound STEP constructor off js_call_bound_function's JS_Call, which is
+                       js_call_c_function's DFAIL. */
+                    JSValueConst bthis6;
+                    int nb6;
+                    JSValueConst tgt6 = tramp_bound_target(call_argv[-2], &bthis6, &nb6);
+                    const JSTrampStepDef *sd6 = tramp_step_def_of(tgt6);
+                    if (sd6) {
+                        JSValueConst ntgt6 = js_same_value(ctx, call_argv[-1], call_argv[-2])
+                                             ? tgt6 : call_argv[-1];
+                        int n6 = nb6 + call_argc, k6;
+                        JSValue *ab6 = js_malloc(ctx, sizeof(JSValue) * (n6 > 0 ? n6 : 1));
+                        void *stt6;
+                        if (unlikely(!ab6)) goto exception;
+                        tramp_bound_args(call_argv[-2], (JSValueConst *)ab6, nb6);   /* borrowed: the state dups */
+                        for (k6 = 0; k6 < call_argc; k6++) ab6[nb6 + k6] = (JSValue)call_argv[k6];
+                        stt6 = tramp_step_state_new(ctx, sd6, ntgt6, n6, (JSValueConst *)ab6, tgt6);
+                        js_free(ctx, ab6);
+                        if (unlikely(!stt6)) goto exception;
+                        ((JSStepHdr *)stt6)->orig_cfirst = -2;
+                        ((JSStepHdr *)stt6)->orig_cargc = call_argc;
+                        ((JSStepHdr *)stt6)->orig_is_tail = 0;
+                        cont_st = stt6;
+                        ret_val = JS_UNDEFINED;
+                        goto do_step_step;
+                    }
+                }
                 if (tramp_can_call_setmap_consume(ctx, call_argv[-2], vc(call_argv), call_argc, &smc_magic, &tramp_iter_getiter)) {   /* new Set/Map(iterable) -> GetIterator + consume on THIS chain */
                     smc_ntgt = call_argv[-1]; smc_items = call_argv[0];
                     smc_cfirst = -2; smc_cargc = call_argc; smc_super_ref = JS_UNDEFINED;
@@ -21923,12 +21991,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                stack until do_return frees it). Operand shape is the plain-call shape [boundfn, callArgs…]:
                boundfn = call_argv[-1], call_first = -1; do_return frees boundfn + callArgs and pushes the result. */
             {
-                JSObject *bp = JS_VALUE_GET_OBJ(call_argv[-1]);
-                JSBoundFunction *bf = bp->u.bound_function;
-                JSValueConst nfunc = bf->func_obj;
+                JSValueConst bthis;
+                int nbound;
+                JSValueConst nfunc = tramp_bound_target(call_argv[-1], &bthis, &nbound);
                 JSObject *np = JS_VALUE_GET_OBJ(nfunc);
                 JSFunctionBytecode *nb = np->u.func.function_bytecode;
-                int nbound = bf->argc;
                 int eff_argc = nbound + call_argc;
                 int narg_alloc = (eff_argc < nb->arg_count) ? nb->arg_count : eff_argc;
                 size_t asize = sizeof(JSValue) * TRAMP_FRAME_SLOTS(narg_alloc, nb)
@@ -21953,8 +22020,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 nsf->is_strict_mode = nb->is_strict_mode;
                 nsf->cur_func = unsafe_unconst(nfunc);
                 narg_buf = nlb;
-                for (k = 0; k < nbound; k++) narg_buf[k] = js_dup(bf->argv[k]);            /* bound args first */
-                for (k = 0; k < call_argc; k++) narg_buf[nbound + k] = js_dup(call_argv[k]);  /* then call args */
+                /* the whole chain's bound args, innermost first, then the call args */
+                tramp_bound_args(call_argv[-1], (JSValueConst *)narg_buf, nbound);
+                for (k = 0; k < nbound; k++) narg_buf[k] = js_dup(narg_buf[k]);
+                for (k = 0; k < call_argc; k++) narg_buf[nbound + k] = js_dup(call_argv[k]);
                 for (k = eff_argc; k < narg_alloc; k++) narg_buf[k] = JS_UNDEFINED;
                 nsf->arg_count = narg_alloc;
                 nvar_buf = nlb + narg_alloc;
@@ -21968,7 +22037,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 nsf->prev_frame = rt->current_stack_frame;
                 rt->current_stack_frame = nsf;
                 tf_top = ntf;
-                this_obj = bf->this_val;   /* borrowed via the bound-function object (live on the stack until do_return) */
+                this_obj = bthis;   /* borrowed via the bound-function object (live on the stack until do_return) */
                 new_target = JS_UNDEFINED;
                 ntf->this_val = this_obj; ntf->new_target = new_target;
                 ntf->arg_allocated = narg_alloc; ntf->callee_argc = eff_argc;
@@ -22028,27 +22097,28 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto do_step_tramp;
                 if (JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT
                     && JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_BOUND_FUNCTION) {
-                    /* `String.bind(t)(x)` — a bound function whose target is a step machine. js_call_bound_function
-                       would JS_Call it, which is js_call_c_function's step DFAIL. Assemble bound ++ call args into
-                       the init (never onto the operand stack, whose compiled size the bound list could overflow)
-                       and drive it. A bound-of-bound target is not resolved here and crashes at that DFAIL naming
-                       itself, rather than being quietly handed back to the C path. */
-                    JSBoundFunction *bf5 = JS_VALUE_GET_OBJ(call_argv[-1])->u.bound_function;
-                    const JSTrampStepDef *sd5 = tramp_step_def_of(bf5->func_obj);
+                    /* `String.bind(t)(x)` — a bound function whose ultimate target is a step machine.
+                       js_call_bound_function would JS_Call it, which is js_call_c_function's step DFAIL. Assemble
+                       the FLATTENED bound args ++ call args into the state (never onto the operand stack, whose
+                       compiled size the bound list could overflow) and drive it. */
+                    JSValueConst bthis5;
+                    int nb5;
+                    JSValueConst tgt5 = tramp_bound_target(call_argv[-1], &bthis5, &nb5);
+                    const JSTrampStepDef *sd5 = tramp_step_def_of(tgt5);
                     if (sd5) {
-                        int nb5 = bf5->argc, n5 = nb5 + call_argc, k5;
+                        int n5 = nb5 + call_argc, k5;
                         JSValue *ab5 = js_malloc(ctx, sizeof(JSValue) * (n5 > 0 ? n5 : 1));
                         void *stt5;
                         if (unlikely(!ab5)) goto exception;
-                        for (k5 = 0; k5 < nb5; k5++) ab5[k5] = (JSValue)bf5->argv[k5];         /* borrowed: init dups */
+                        tramp_bound_args(call_argv[-1], (JSValueConst *)ab5, nb5);   /* borrowed: the state dups */
                         for (k5 = 0; k5 < call_argc; k5++) ab5[nb5 + k5] = (JSValue)call_argv[k5];
                         /* a bound CALL is never a construct, so a constructor step sees new_target UNDEFINED
                            rather than the bound `this` — `String.bind(null)()` must yield "" , not try to build a
                            wrapper from null. */
                         stt5 = tramp_step_state_new(ctx, sd5,
-                                                    JS_VALUE_GET_OBJ(bf5->func_obj)->u.cfunc.cproto == JS_CFUNC_step_ctor
-                                                        ? JS_UNDEFINED : bf5->this_val,
-                                                    n5, (JSValueConst *)ab5, bf5->func_obj);
+                                                    JS_VALUE_GET_OBJ(tgt5)->u.cfunc.cproto == JS_CFUNC_step_ctor
+                                                        ? JS_UNDEFINED : bthis5,
+                                                    n5, (JSValueConst *)ab5, tgt5);
                         js_free(ctx, ab5);
                         if (unlikely(!stt5)) goto exception;
                         ((JSStepHdr *)stt5)->orig_cfirst = tramp_first;
