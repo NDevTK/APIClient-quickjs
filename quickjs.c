@@ -25890,6 +25890,28 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_pow):
         binary_arith_slow:
             sf->cur_pc = pc;
+            /* The same 13.15.3 problem OP_add already routes: ToNumeric on each operand runs the page's
+               valueOf/toString/@@toPrimitive, and js_binary_arith_slow does it with JS_CallFree from C — where a
+               loop in that method preempts in an activation with no flow base. Coerce the LEFT object operand on
+               the tramp and re-execute; the prefix above is pure tag tests, so the retry costs nothing and the
+               right operand is coerced by the same path on the next pass, in spec order. Every opcode reaching
+               this label is one byte, so `pc - 1` is its own byte. */
+            if (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT) {
+                tp_slot = -2; tp_hint = HINT_NUMBER; tp_retry_pc = pc - 1;
+                goto do_toprim_tramp;
+            }
+            if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) {
+                /* These operators are ToNumeric(lhs) THEN ToNumeric(rhs), and ToNumeric is ToPrimitive plus the
+                   numeric conversion — so the LEFT operand's conversion must COMPLETE before the right is touched
+                   at all. Interleaving the two ToPrimitives (which is right for `+`, whose two ToPrimitives do
+                   precede any conversion) let a left `valueOf` returning a Symbol run the right's valueOf before
+                   throwing: order-of-evaluation traced "1234" where the spec says "123". The left is already a
+                   primitive here, so this conversion runs no user code — it only throws. */
+                sp[-2] = JS_ToNumericFree(ctx, sp[-2]);
+                if (unlikely(JS_IsException(sp[-2]))) { sp[-2] = JS_UNDEFINED; goto exception; }
+                tp_slot = -1; tp_hint = HINT_NUMBER; tp_retry_pc = pc - 1;
+                goto do_toprim_tramp;
+            }
             if (js_binary_arith_slow(ctx, sp, opcode))
                 goto exception;
             sp--;
@@ -26193,7 +26215,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
 
-#define OP_CMP(opcode, binary_op, slow_call)              \
+/* `coerce_hint` is the ToPrimitive hint this comparison owes its operands, or -1 when it owes them none. The
+   RELATIONAL four run ToPrimitive(number) on both (7.2.13 step 1), so an object operand is coerced on the tramp
+   and the opcode re-executed, exactly as OP_add does. STRICT equality coerces nothing. Loose ==/!= is the one
+   that is CONDITIONAL — two objects compare by reference with no coercion at all, and null/undefined never
+   coerce — so it keeps its C slow path and says so by aborting at the preempt if a valueOf there loops; a
+   blanket coercion here would be a spec bug, not a routing gap. */
+#define OP_CMP(opcode, binary_op, coerce_hint, slow_call)              \
             CASE(opcode):                                 \
                 {                                         \
                 JSValue op1, op2;                         \
@@ -26204,6 +26232,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp--;                                               \
                 } else {                                                \
                     sf->cur_pc = pc;                                    \
+                    if ((coerce_hint) >= 0                              \
+                        && (JS_VALUE_GET_TAG(op1) == JS_TAG_OBJECT       \
+                            || JS_VALUE_GET_TAG(op2) == JS_TAG_OBJECT)) { \
+                        tp_slot = (JS_VALUE_GET_TAG(op1) == JS_TAG_OBJECT) ? -2 : -1; \
+                        tp_hint = (coerce_hint);                        \
+                        tp_retry_pc = pc - 1;                           \
+                        goto do_toprim_tramp;                           \
+                    }                                                   \
                     if (slow_call)                                      \
                         goto exception;                                 \
                     sp--;                                               \
@@ -26211,14 +26247,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }                                                       \
             BREAK
 
-            OP_CMP(OP_lt, <, js_relational_slow(ctx, sp, opcode));
-            OP_CMP(OP_lte, <=, js_relational_slow(ctx, sp, opcode));
-            OP_CMP(OP_gt, >, js_relational_slow(ctx, sp, opcode));
-            OP_CMP(OP_gte, >=, js_relational_slow(ctx, sp, opcode));
-            OP_CMP(OP_eq, ==, js_eq_slow(ctx, sp, 0));
-            OP_CMP(OP_neq, !=, js_eq_slow(ctx, sp, 1));
-            OP_CMP(OP_strict_eq, ==, js_strict_eq_slow(ctx, sp, 0));
-            OP_CMP(OP_strict_neq, !=, js_strict_eq_slow(ctx, sp, 1));
+            OP_CMP(OP_lt,  <,  HINT_NUMBER, js_relational_slow(ctx, sp, opcode));
+            OP_CMP(OP_lte, <=, HINT_NUMBER, js_relational_slow(ctx, sp, opcode));
+            OP_CMP(OP_gt,  >,  HINT_NUMBER, js_relational_slow(ctx, sp, opcode));
+            OP_CMP(OP_gte, >=, HINT_NUMBER, js_relational_slow(ctx, sp, opcode));
+            OP_CMP(OP_eq,  ==, -1, js_eq_slow(ctx, sp, 0));
+            OP_CMP(OP_neq, !=, -1, js_eq_slow(ctx, sp, 1));
+            OP_CMP(OP_strict_eq,  ==, -1, js_strict_eq_slow(ctx, sp, 0));
+            OP_CMP(OP_strict_neq, !=, -1, js_strict_eq_slow(ctx, sp, 1));
 
         CASE(OP_in):
             sf->cur_pc = pc;
