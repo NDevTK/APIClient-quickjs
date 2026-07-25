@@ -19288,6 +19288,18 @@ typedef struct JSArrayAt {
     int64_t len, idx;
 } JSArrayAt;
 
+/* indexOf / lastIndexOf / includes: ONE machine, three modes. They differ only in the search direction, the
+   fromIndex clamp and the equality (strict vs SameValueZero); the part that had to change is the same in all
+   three — ToObject, LengthOfArrayLike and ToIntegerOrInfinity(fromIndex) are the page's code and ran from a C
+   body, so `[1,2].indexOf(1, {valueOf(){ while(x){} }})` preempted with no flow base. */
+enum { SEARCH_INDEXOF = 0, SEARCH_LASTINDEXOF, SEARCH_INCLUDES };
+typedef struct JSArraySearch {
+    JSStepHdr hdr;
+    JSValue obj;          /* ToObject(this) (owned) */
+    JSValue result;       /* DONE (owned) */
+    int64_t len, n;
+} JSArraySearch;
+
 /* TypedArray.prototype.slice: the index coercions and the species Construct are its PROLOGUE,
    staged as steps 0-2 so a user valueOf on either index suspends. */
 typedef struct JSTASlice {
@@ -50757,150 +50769,118 @@ static JSValue js_array_fill(JSContext *ctx, JSValueConst this_val,
     return JS_EXCEPTION;
 }
 
-static JSValue js_array_includes(JSContext *ctx, JSValueConst this_val,
-                                 int argc, JSValueConst *argv)
+/* SameValueZero membership in an ENGINE-OWNED dense array — JSON's cycle stack and its property list. It shares
+   a NAME with Array.prototype.includes and nothing else: no ToObject, no LengthOfArrayLike, no fromIndex, and
+   therefore no user code and nothing to suspend. It is a different algorithm, not a spare copy of the builtin,
+   so it is not debt to retire — reusing the builtin here was the accident. */
+static bool js_internal_array_includes(JSContext *ctx, JSValueConst arr, JSValueConst val)
 {
-    JSValue obj, val;
-    int64_t len, n;
     JSValue *arrp;
-    uint32_t count;
-    int res;
-
-    obj = JS_ToObject(ctx, this_val);
-    if (js_get_length64(ctx, &len, obj))
-        goto exception;
-
-    res = true;
-    if (len > 0) {
-        n = 0;
-        if (argc > 1) {
-            if (JS_ToInt64Clamp(ctx, &n, argv[1], 0, len, len))
-                goto exception;
-        }
-        if (js_get_fast_array(ctx, obj, &arrp, &count)) {
-            for (; n < count; n++) {
-                if (js_strict_eq2(ctx, argv[0], arrp[n],
-                                  JS_EQ_SAME_VALUE_ZERO)) {
-                    goto done;
-                }
-            }
-        }
-        for (; n < len; n++) {
-            val = JS_GetPropertyInt64(ctx, obj, n);
-            if (JS_IsException(val))
-                goto exception;
-            if (js_strict_eq2(ctx, argv[0], val, JS_EQ_SAME_VALUE_ZERO)) {
-                JS_FreeValue(ctx, val);
-                goto done;
-            }
-            JS_FreeValue(ctx, val);
-        }
+    uint32_t count, i;
+    if (!js_get_fast_array(ctx, arr, &arrp, &count)) {
+        DFAIL("an engine-owned array must be a fast array");
+        return false;
     }
-    res = false;
- done:
-    JS_FreeValue(ctx, obj);
-    return js_bool(res);
-
- exception:
-    JS_FreeValue(ctx, obj);
-    return JS_EXCEPTION;
+    for (i = 0; i < count; i++)
+        if (js_strict_eq2(ctx, val, arrp[i], JS_EQ_SAME_VALUE_ZERO))
+            return true;
+    return false;
 }
 
-static JSValue js_array_indexOf(JSContext *ctx, JSValueConst this_val,
-                                int argc, JSValueConst *argv)
+static int js_array_search_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    JSValue obj, val;
-    int64_t len, n;
-    JSValue *arrp;
+    JSArraySearch *s = st;
+    JSValueConst target = step_arg(&s->hdr, 0);
+    int mode = s->hdr.arg;
+    JSValue val, *arrp;
     uint32_t count;
+    int r, eq = (mode == SEARCH_INCLUDES) ? JS_EQ_SAME_VALUE_ZERO : JS_EQ_STRICT;
 
-    obj = JS_ToObject(ctx, this_val);
-    if (js_get_length64(ctx, &len, obj))
-        goto exception;
-
-    if (len > 0) {
-        n = 0;
-        if (argc > 1) {
-            if (JS_ToInt64Clamp(ctx, &n, argv[1], 0, len, len))
-                goto exception;
-        }
-        if (js_get_fast_array(ctx, obj, &arrp, &count)) {
-            for (; n < count; n++) {
-                if (js_strict_eq2(ctx, argv[0], arrp[n], JS_EQ_STRICT)) {
-                    goto done;
-                }
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        s->obj = JS_ToObject(ctx, s->hdr.this_val);
+        if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
+        s->result = JS_UNDEFINED;
+        s->hdr.stage = 1;
+    }
+    if (s->hdr.stage == 1) {
+        r = step_length_run(ctx, &s->hdr, s->obj, cb_result, &s->len, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 2;
+    }
+    if (s->hdr.stage == 2) {
+        if (s->len > 0) {
+            /* JS_ToInt64Clamp's arithmetic, with its ToInt64Sat half now a step */
+            int64_t lo = (mode == SEARCH_LASTINDEXOF) ? -1 : 0;
+            int64_t hi = (mode == SEARCH_LASTINDEXOF) ? s->len - 1 : s->len;
+            if (s->hdr.argc > 1) {
+                r = step_toint64_run(ctx, &s->hdr, s->hdr.argv[1], cb_result, &s->n, out_cb, out_argc);
+                cb_result = JS_UNDEFINED;
+                if (r) return r < 0 ? -1 : r;
+                if (s->n < 0) s->n += s->len;
+                if (s->n < lo) s->n = lo;
+                else if (s->n > hi) s->n = hi;
+            } else {
+                s->n = (mode == SEARCH_LASTINDEXOF) ? s->len - 1 : 0;
             }
         }
-        for (; n < len; n++) {
-            int present = JS_TryGetPropertyInt64(ctx, obj, n, &val);
-            if (present < 0)
-                goto exception;
-            if (present) {
-                if (js_strict_eq2(ctx, argv[0], val, JS_EQ_STRICT)) {
+        s->hdr.stage = 3;
+    }
+    JS_FreeValue(ctx, cb_result);
+
+    if (s->len > 0) {
+        if (mode == SEARCH_LASTINDEXOF) {
+            if (js_get_fast_array(ctx, s->obj, &arrp, &count) && count == s->len) {
+                for (; s->n >= 0; s->n--)
+                    if (js_strict_eq2(ctx, target, arrp[s->n], eq)) goto found;
+            }
+            for (; s->n >= 0; s->n--) {
+                int present = JS_TryGetPropertyInt64(ctx, s->obj, s->n, &val);
+                if (present < 0) return -1;
+                if (present) {
+                    bool hit = js_strict_eq2(ctx, target, val, eq);   /* BORROWS both: the element is ours to free */
                     JS_FreeValue(ctx, val);
-                    goto done;
+                    if (hit) goto found;
                 }
+            }
+        } else {
+            if (js_get_fast_array(ctx, s->obj, &arrp, &count)) {
+                for (; s->n < count; s->n++)
+                    if (js_strict_eq2(ctx, target, arrp[s->n], eq)) goto found;
+            }
+            for (; s->n < s->len; s->n++) {
+                bool hit;
+                if (mode == SEARCH_INCLUDES) {
+                    /* includes visits holes as undefined; indexOf skips them */
+                    val = JS_GetPropertyInt64(ctx, s->obj, s->n);
+                    if (JS_IsException(val)) return -1;
+                } else {
+                    int present = JS_TryGetPropertyInt64(ctx, s->obj, s->n, &val);
+                    if (present < 0) return -1;
+                    if (!present) continue;
+                }
+                hit = js_strict_eq2(ctx, target, val, eq);   /* BORROWS both: the element is ours to free */
                 JS_FreeValue(ctx, val);
+                if (hit) goto found;
             }
         }
     }
-    n = -1;
- done:
-    JS_FreeValue(ctx, obj);
-    return js_int64(n);
-
- exception:
-    JS_FreeValue(ctx, obj);
-    return JS_EXCEPTION;
+    s->result = (mode == SEARCH_INCLUDES) ? js_bool(false) : js_int64(-1);
+    return 0;
+found:
+    s->result = (mode == SEARCH_INCLUDES) ? js_bool(true) : js_int64(s->n);
+    return 0;
 }
 
-static JSValue js_array_lastIndexOf(JSContext *ctx, JSValueConst this_val,
-                                    int argc, JSValueConst *argv)
+static JSValue js_array_search_fini(JSContext *ctx, void *st, bool take_result)
 {
-    JSValue obj, val;
-    int64_t len, n;
-    JSValue *arrp;
-    uint32_t count;
-
-    obj = JS_ToObject(ctx, this_val);
-    if (js_get_length64(ctx, &len, obj))
-        goto exception;
-
-    if (len > 0) {
-        n = len - 1;
-        if (argc > 1) {
-            if (JS_ToInt64Clamp(ctx, &n, argv[1], -1, len - 1, len))
-                goto exception;
-        }
-        if (js_get_fast_array(ctx, obj, &arrp, &count) && count == len) {
-            for (; n >= 0; n--) {
-                if (js_strict_eq2(ctx, argv[0], arrp[n],
-                                  JS_EQ_STRICT)) {
-                    goto done;
-                }
-            }
-        }
-        for (; n >= 0; n--) {
-            int present = JS_TryGetPropertyInt64(ctx, obj, n, &val);
-            if (present < 0)
-                goto exception;
-            if (present) {
-                if (js_strict_eq2(ctx, argv[0], val, JS_EQ_STRICT)) {
-                    JS_FreeValue(ctx, val);
-                    goto done;
-                }
-                JS_FreeValue(ctx, val);
-            }
-        }
-    }
-    n = -1;
- done:
-    JS_FreeValue(ctx, obj);
-    return js_int64(n);
-
- exception:
-    JS_FreeValue(ctx, obj);
-    return JS_EXCEPTION;
+    JSArraySearch *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    JS_FreeValue(ctx, s->obj);
+    js_free(ctx, s);
+    return r;
 }
 
 /* find/findIndex/findLast/findLastIndex. There is no js_array_find C function: the walk exists ONCE, as a step
@@ -51013,6 +50993,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_ARRAY_REDUCE, STEPDEF_ARRAY_REDUCE_RIGHT, STEPDEF_TA_REDUCE, STEPDEF_TA_REDUCE_RIGHT,
     STEPDEF_ARRAY_SORT, STEPDEF_ARRAY_TOSORTED, STEPDEF_JSON_PARSE,
     STEPDEF_TA_SLICE, STEPDEF_STR_CONCAT, STEPDEF_STR_CTOR, STEPDEF_ARRAY_AT,
+    STEPDEF_ARRAY_INDEXOF, STEPDEF_ARRAY_LASTINDEXOF, STEPDEF_ARRAY_INCLUDES,
     STEPDEF_COUNT
 };
 static int js_str_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
@@ -51023,6 +51004,8 @@ static int js_ta_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
 static JSValue js_ta_slice_fini(JSContext *ctx, void *st, bool take_result);
 static int js_array_at_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_at_fini(JSContext *ctx, void *st, bool take_result);
+static int js_array_search_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_array_search_fini(JSContext *ctx, void *st, bool take_result);
 /* One NAMED definition per builtin, referenced by its JS_CFUNC_STEP_DEF registration through the id above — the same shape as
    JS_CFUNC_MAGIC_DEF naming its C function, so the registration line tells you what runs. An index into a side
    table would be a second list to keep in sync and a magic number that silently repoints when a row is inserted. */
@@ -51053,6 +51036,9 @@ static const JSTrampStepDef js_ta_slice_def     = { sizeof(JSTASlice), js_ta_sli
 static const JSTrampStepDef js_str_concat_def   = { sizeof(JSStrConcat), js_str_concat_step, js_str_concat_fini, 0 };
 static const JSTrampStepDef js_str_ctor_def     = { sizeof(JSStrCtor), js_str_ctor_step, js_str_ctor_fini, 0 };
 static const JSTrampStepDef js_array_at_def     = { sizeof(JSArrayAt), js_array_at_step, js_array_at_fini, 0 };
+static const JSTrampStepDef js_array_indexOf_def     = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_INDEXOF };
+static const JSTrampStepDef js_array_lastIndexOf_def = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_LASTINDEXOF };
+static const JSTrampStepDef js_array_includes_def    = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_INCLUDES };
 static const JSTrampStepDef js_array_reduce_def  = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduce };
 static const JSTrampStepDef js_array_reduceR_def = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduceRight };
 static const JSTrampStepDef js_ta_reduce_def     = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduce | special_TA };
@@ -51085,6 +51071,9 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_STR_CONCAT]    = &js_str_concat_def,
     [STEPDEF_STR_CTOR]      = &js_str_ctor_def,
     [STEPDEF_ARRAY_AT]      = &js_array_at_def,
+    [STEPDEF_ARRAY_INDEXOF]     = &js_array_indexOf_def,
+    [STEPDEF_ARRAY_LASTINDEXOF] = &js_array_lastIndexOf_def,
+    [STEPDEF_ARRAY_INCLUDES]    = &js_array_includes_def,
     [STEPDEF_ARRAY_REDUCE]  = &js_array_reduce_def,  [STEPDEF_ARRAY_REDUCE_RIGHT] = &js_array_reduceR_def,
     [STEPDEF_TA_REDUCE]     = &js_ta_reduce_def,     [STEPDEF_TA_REDUCE_RIGHT]    = &js_ta_reduceR_def,
 };
@@ -51108,6 +51097,7 @@ STEP_STATE_HDR_FIRST(JSStrCtor);
 STEP_STATE_HDR_FIRST(JSStrConcat);
 STEP_STATE_HDR_FIRST(JSTASlice);
 STEP_STATE_HDR_FIRST(JSArrayAt);
+STEP_STATE_HDR_FIRST(JSArraySearch);
 
 static const JSTrampStepDef *tramp_step_def_of(JSValueConst func)
 {
@@ -53134,9 +53124,9 @@ static const JSCFunctionListEntry js_array_proto_funcs[] = {
     JS_CFUNC_STEP_DEF("findIndex", 1, STEPDEF_ARRAY_FIND_INDEX ),
     JS_CFUNC_STEP_DEF("findLast", 1, STEPDEF_ARRAY_FIND_LAST ),
     JS_CFUNC_STEP_DEF("findLastIndex", 1, STEPDEF_ARRAY_FIND_LAST_INDEX ),
-    JS_CFUNC_DEF("indexOf", 1, js_array_indexOf ),
-    JS_CFUNC_DEF("lastIndexOf", 1, js_array_lastIndexOf ),
-    JS_CFUNC_DEF("includes", 1, js_array_includes ),
+    JS_CFUNC_STEP_DEF("indexOf", 1, STEPDEF_ARRAY_INDEXOF ),
+    JS_CFUNC_STEP_DEF("lastIndexOf", 1, STEPDEF_ARRAY_LASTINDEXOF ),
+    JS_CFUNC_STEP_DEF("includes", 1, STEPDEF_ARRAY_INCLUDES ),
     JS_CFUNC_MAGIC_DEF("join", 1, js_array_join, 0 ),
     JS_CFUNC_DEF("toString", 0, js_array_toString ),
     JS_CFUNC_MAGIC_DEF("toLocaleString", 0, js_array_join, 1 ),
@@ -58658,10 +58648,7 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
             val = val1;
             goto concat_value;
         }
-        v = js_array_includes(ctx, jsc->stack, 1, vc(&val));
-        if (JS_IsException(v))
-            goto exception;
-        if (JS_ToBoolFree(ctx, v)) {
+        if (js_internal_array_includes(ctx, jsc->stack, val)) {
             JS_ThrowTypeError(ctx, "circular reference");
             goto exception;
         }
@@ -58867,13 +58854,7 @@ JSValue JS_JSONStringify(JSContext *ctx, JSValueConst obj,
                     JS_FreeValue(ctx, v);
                     continue;
                 }
-                present = js_array_includes(ctx, jsc->property_list,
-                                            1, vc(&v));
-                if (JS_IsException(present)) {
-                    JS_FreeValue(ctx, v);
-                    goto exception;
-                }
-                if (!JS_ToBoolFree(ctx, present)) {
+                if (!js_internal_array_includes(ctx, jsc->property_list, v)) {
                     JS_SetPropertyInt64(ctx, jsc->property_list, j++, v);
                 } else {
                     JS_FreeValue(ctx, v);
