@@ -19311,6 +19311,9 @@ typedef struct JSArrayEvery {
     JSValue obj, ret, val;
     int64_t len, k, n;
     int special, pending_k;
+    int present;             /* HasProperty(O, k): the plain-array forms skip holes, so they must ask first */
+    uint8_t elem_ph;         /* 0 = the ask is due, 1 = the read is due. The header's get_phase resumes each
+                                sub-sequence; this says WHICH of the two the loop is in. */
     JSValueConst func, this_arg;
     /* cb_args is the callback's operand buffer OWNED BY THE STATE — the callback args must NOT go on the
        caller's stack (its stack_size is compiler-computed for the caller's own needs) and must NOT need a
@@ -19326,7 +19329,8 @@ typedef struct JSArrayEvery {
    CONTINUATION-HOLDING re-entrant. They are a step machine, so that drive runs on the tramp chain: each callback
    is a NORMAL frame carrying the state, so it runs with gen_state == the base and a callback BODY LOOP preempts
    the base flow — never a C-recursive JS_Call that could only drive to completion. */
-static int js_array_every_step(JSContext *ctx, struct JSArrayEvery *s, JSValue res, JSValueConst out_args[3]);
+static int js_array_every_step(JSContext *ctx, struct JSArrayEvery *s, JSValue res, JSValueConst out_args[3],
+                               JSValue **out_cb, int *out_argc);
 static void js_array_every_end(JSContext *ctx, struct JSArrayEvery *s, bool take_ret);
 /* reduce/reduceRight: the same continuation-holding shape as js_array_every, with the accumulator as the state. */
 typedef struct JSArrayReduce {
@@ -51179,8 +51183,10 @@ static JSValue js_typed_array___speciesCreate(JSContext *ctx,
 /* One coroutine step: PROCESS the previous callback's `res` (for element pending_k), then ADVANCE to the next
    present element and fill out_args with (value, index, obj). Returns 1 = CALL (invoke func on out_args), 0 = DONE
    (s->ret is the final result), -1 = EXCEPTION. Consumes `res`. Identical semantics to the original C loop. */
-static int js_array_every_step(JSContext *ctx, JSArrayEvery *s, JSValue res, JSValueConst out_args[3])
+static int js_array_every_step(JSContext *ctx, JSArrayEvery *s, JSValue res, JSValueConst out_args[3],
+                               JSValue **out_cb, int *out_argc)
 {
+    int r;
     /* the element cursor never runs past the length; pending_k is either -1 (no callback in flight) or the
        index whose callback result is `res` now — a drift would double-process or skip an element. */
     assert(s->k >= 0 && s->k <= s->len);
@@ -51215,27 +51221,36 @@ static int js_array_every_step(JSContext *ctx, JSArrayEvery *s, JSValue res, JSV
         }
         JS_FreeValue(ctx, s->val);
         s->val = JS_UNDEFINED;
+        res = JS_UNDEFINED;   /* the switch above consumed it on every arm */
     }
+    /* HasProperty and Get are each the page's code — an index accessor or a Proxy trap — and
+       JS_TryGetPropertyInt64 / JS_GetPropertyInt64 reached both from C, driving them to completion. Each is a
+       step now, so `[].map.call(proxyWithLoopingGetTrap, f)` parks like anything else. */
     while (s->k < s->len) {
-        int64_t k = s->k++;
-        int present;
-        JSValue val;
-        if (s->special & special_TA) {
-            val = JS_GetPropertyInt64(ctx, s->obj, k);
-            if (JS_IsException(val)) return -1;
-            present = true;
-        } else {
-            present = JS_TryGetPropertyInt64(ctx, s->obj, k, &val);
-            if (present < 0) return -1;
+        if (s->elem_ph == 0) {
+            if (s->special & special_TA) {
+                s->present = 1;   /* a typed array has no holes to ask about */
+            } else {
+                r = step_hasidx_run(ctx, &s->hdr, s->obj, s->k, res, &s->present, out_cb, out_argc);
+                res = JS_UNDEFINED;
+                if (r) return r < 0 ? -1 : r;
+            }
+            s->elem_ph = 1;
         }
-        if (present) {
-            s->val = val;
-            s->pending_k = k;
-            out_args[0] = val;
-            out_args[1] = js_int64(k);
-            out_args[2] = s->obj;
-            return 1;
+        if (!s->present) {
+            s->k++;
+            s->elem_ph = 0;
+            continue;
         }
+        r = step_getidx_run(ctx, &s->hdr, s->obj, s->k, res, &s->val, out_cb, out_argc);
+        res = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->elem_ph = 0;
+        s->pending_k = s->k++;
+        out_args[0] = s->val;
+        out_args[1] = js_int64(s->pending_k);
+        out_args[2] = s->obj;
+        return 1;
     }
 done:
     /* TypedArray filter's writeback — the species create and the destination's own `set` — is NOT here: both run
@@ -51372,9 +51387,11 @@ static int js_array_every_vstep(JSContext *ctx, void *st, JSValue cb_result, JSV
         s->ta_dest = JS_UNDEFINED;
         return 0;
     }
-    r = js_array_every_step(ctx, s, cb_result, (JSValueConst *)&s->cb_args[2]);   /* consumes cb_result */
+    r = js_array_every_step(ctx, s, cb_result, (JSValueConst *)&s->cb_args[2], out_cb, out_argc);   /* consumes cb_result */
     if (r < 0)
         return -1;
+    if (r == 6 || r == 7)
+        return r;   /* the element's keyed operation: the driver performs it and re-enters here */
     if (r == 0) {
         if (s->special != (special_filter | special_TA))
             return 0;
