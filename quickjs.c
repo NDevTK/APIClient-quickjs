@@ -19338,10 +19338,13 @@ typedef struct JSArrayReduce {
     JSValue obj, acc, val;
     int64_t len, k;
     int special, pending;        /* pending = a callback result (the next accumulator) is awaited */
+    int present;                 /* HasProperty(O, k): the plain-array forms skip holes, so they must ask first */
+    uint8_t elem_ph;             /* 0 = the ask is due, 1 = the read is due (the header's get_phase resumes each) */
     JSValueConst func;
     JSValue cb_args[6];          /* [this=undefined, func, acc, val, index, obj]; call_argv = &cb_args[2], argc=4 */
 } JSArrayReduce;
-static int js_array_reduce_step(JSContext *ctx, struct JSArrayReduce *s, JSValue acc1, JSValueConst out_args[4]);
+static int js_array_reduce_step(JSContext *ctx, struct JSArrayReduce *s, JSValue acc1, JSValueConst out_args[4],
+                               JSValue **out_cb, int *out_argc);
 /* Array.from(GENERATOR): CONSUME the generator on the tramp chain — each .next() runs the generator body HERE so
    a body loop suspend/resumes at any depth, never the C-recursion drive-to-completion js_array_from's loop uses.
    Only the direct-generator, no-mapfn case is routed (the metric drive); every other Array.from shape stays on the
@@ -51440,69 +51443,89 @@ static int js_array_reduce_recv(JSContext *ctx, JSArrayReduce *s)
 }
 
 /* Seed the accumulator: argv[1] if given, else the first present element (spec: empty + no seed -> TypeError). */
-static int js_array_reduce_seed(JSContext *ctx, JSArrayReduce *s)
+/* The SEED scan when no initial value was passed: the first PRESENT element becomes the accumulator. It reads
+   elements exactly as the walk below does — an ask and a read, each the page's code — so it is resumable in the
+   same way. The argc>1 arm never suspends, which is what makes re-entering here land in the loop. */
+static int js_array_reduce_seed(JSContext *ctx, JSArrayReduce *s, JSValue in, JSValue **out_cb, int *out_argc)
 {
     int special = s->special;
     int64_t k1;
-    int present;
+    int r;
 
     s->func = step_arg(&s->hdr, 0);
-    if (check_function(ctx, s->func)) return -1;
+    if (check_function(ctx, s->func)) { JS_FreeValue(ctx, in); return -1; }
     if (s->hdr.argc > 1) {
+        JS_FreeValue(ctx, in);
         s->acc = js_dup(s->hdr.argv[1]);
         return 0;
     }
     for (;;) {
-        if (s->k >= s->len) { JS_ThrowTypeError(ctx, "empty array"); return -1; }
+        if (s->k >= s->len) { JS_FreeValue(ctx, in); JS_ThrowTypeError(ctx, "empty array"); return -1; }
         k1 = (special & special_reduceRight) ? s->len - s->k - 1 : s->k;
-        s->k++;
-        if (special & special_TA) {
-            s->acc = JS_GetPropertyInt64(ctx, s->obj, k1);
-            if (JS_IsException(s->acc)) { s->acc = JS_UNDEFINED; return -1; }
-            return 0;
+        if (s->elem_ph == 0) {
+            if (special & special_TA) {
+                s->present = 1;   /* a typed array has no holes to ask about */
+            } else {
+                r = step_hasidx_run(ctx, &s->hdr, s->obj, k1, in, &s->present, out_cb, out_argc);
+                in = JS_UNDEFINED;
+                if (r) return r < 0 ? -1 : r;
+            }
+            s->elem_ph = 1;
         }
-        present = JS_TryGetPropertyInt64(ctx, s->obj, k1, &s->acc);
-        if (present < 0) return -1;
-        if (present) return 0;
+        if (!s->present) { s->k++; s->elem_ph = 0; continue; }
+        r = step_getidx_run(ctx, &s->hdr, s->obj, k1, in, &s->acc, out_cb, out_argc);
+        in = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->elem_ph = 0;
+        s->k++;
+        return 0;
     }
 }
 
 /* One coroutine step: adopt the previous callback's result as the accumulator, then advance to the next present
    element and fill out_args with (acc, value, index, obj). 1 = CALL, 0 = DONE (s->acc is the result), -1 = EXC. */
-static int js_array_reduce_step(JSContext *ctx, JSArrayReduce *s, JSValue acc1, JSValueConst out_args[4])
+static int js_array_reduce_step(JSContext *ctx, JSArrayReduce *s, JSValue acc1, JSValueConst out_args[4],
+                                JSValue **out_cb, int *out_argc)
 {
+    int r;
     /* the scan cursor stays within the array; pending is 0/1 (at most one callback in flight). */
     assert(s->k >= -1 && s->k <= s->len && (s->pending == 0 || s->pending == 1));
     if (s->pending) {
         s->pending = 0;
         JS_FreeValue(ctx, s->acc);
         s->acc = acc1;                 /* the callback's result IS the next accumulator (owned) */
+        acc1 = JS_UNDEFINED;           /* …so it must not be freed again by the sub-sequences below */
         JS_FreeValue(ctx, s->val);
         s->val = JS_UNDEFINED;
     }
+    /* the ask and the read are each the page's code; JS_TryGetPropertyInt64 / JS_GetPropertyInt64 reached both
+       from C, driving an index accessor or a Proxy trap to completion beside a callback that parked correctly. */
     while (s->k < s->len) {
         int64_t k1 = (s->special & special_reduceRight) ? s->len - s->k - 1 : s->k;
-        int present;
-        JSValue val;
+        if (s->elem_ph == 0) {
+            if (s->special & special_TA) {
+                s->present = 1;
+            } else {
+                r = step_hasidx_run(ctx, &s->hdr, s->obj, k1, acc1, &s->present, out_cb, out_argc);
+                acc1 = JS_UNDEFINED;
+                if (r) return r < 0 ? -1 : r;
+            }
+            s->elem_ph = 1;
+        }
+        if (!s->present) { s->k++; s->elem_ph = 0; continue; }
+        r = step_getidx_run(ctx, &s->hdr, s->obj, k1, acc1, &s->val, out_cb, out_argc);
+        acc1 = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->elem_ph = 0;
         s->k++;
-        if (s->special & special_TA) {
-            val = JS_GetPropertyInt64(ctx, s->obj, k1);
-            if (JS_IsException(val)) return -1;
-            present = true;
-        } else {
-            present = JS_TryGetPropertyInt64(ctx, s->obj, k1, &val);
-            if (present < 0) return -1;
-        }
-        if (present) {
-            s->val = val;
-            s->pending = 1;
-            out_args[0] = s->acc;
-            out_args[1] = val;
-            out_args[2] = js_int64(k1);
-            out_args[3] = s->obj;
-            return 1;
-        }
+        s->pending = 1;
+        out_args[0] = s->acc;
+        out_args[1] = s->val;
+        out_args[2] = js_int64(k1);
+        out_args[3] = s->obj;
+        return 1;
     }
+    JS_FreeValue(ctx, acc1);
     return 0;
 }
 
@@ -51536,12 +51559,14 @@ static int js_array_reduce_vstep(JSContext *ctx, void *st, JSValue cb_result, JS
         s->hdr.stage = 2;
     }
     if (s->hdr.stage == 2) {
+        r = js_array_reduce_seed(ctx, s, cb_result, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
         s->hdr.stage = 3;
-        if (js_array_reduce_seed(ctx, s))
-            return -1;
     }
-    r = js_array_reduce_step(ctx, s, cb_result, (JSValueConst *)&s->cb_args[2]);   /* consumes cb_result */
+    r = js_array_reduce_step(ctx, s, cb_result, (JSValueConst *)&s->cb_args[2], out_cb, out_argc);   /* consumes cb_result */
     if (r < 0) return -1;
+    if (r == 6 || r == 7) return r;   /* the element's keyed operation: the driver performs it and re-enters */
     if (r == 0) return 0;
     s->cb_args[0] = JS_UNDEFINED;            /* reduce's callback gets this = undefined */
     s->cb_args[1] = s->func;
