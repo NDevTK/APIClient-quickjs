@@ -19280,6 +19280,23 @@ static JSValueConst tramp_bound_target(JSValueConst func, JSValueConst *pthis, i
     return cur;
 }
 
+/* 10.4.1.2 step 5, applied at EVERY level: a bound function's [[Construct]] replaces newTarget with its target
+   when newTarget IS that bound function, and the target's own [[Construct]] then applies the same rule to what
+   is left. Doing it once against the outermost link is wrong — `Reflect.construct(A.bind().bind(), [], A.bind())`
+   retargets at the INNER link and new.target must come out as A. SameValue on two objects is identity, so this
+   needs no context. */
+static JSValueConst tramp_bound_newtarget(JSValueConst func, JSValueConst nt) {
+    JSValueConst cur = func;
+    while (JS_VALUE_GET_TAG(cur) == JS_TAG_OBJECT
+           && JS_VALUE_GET_OBJ(cur)->class_id == JS_CLASS_BOUND_FUNCTION) {
+        JSValueConst tgt = JS_VALUE_GET_OBJ(cur)->u.bound_function->func_obj;
+        if (JS_VALUE_GET_TAG(nt) == JS_TAG_OBJECT && JS_VALUE_GET_OBJ(nt) == JS_VALUE_GET_OBJ(cur))
+            nt = tgt;
+        cur = tgt;
+    }
+    return nt;
+}
+
 /* fill `vec` with the chain's bound arguments in call order. vec must have room for tramp_bound_target's
    *pnbound entries; the values are BORROWED — every one is held by a bound-function object that stays live on
    the caller's operand stack until do_return frees it. */
@@ -20391,8 +20408,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSValueConst *con_args = NULL; int con_argc = 0;
     /* An ARGUMENT-VECTOR construct: con_args is a malloc'd block this label owns rather than a window onto a
        frame that outlives the callee. A flattened bound chain is the case that needs it — its arguments come
-       from several bound objects and the caller's stack, so they are contiguous nowhere. It also forces the
-       COPY path: the borrow below is sound only for slots someone else frees. */
+       from several bound objects and the caller's stack, so they are contiguous nowhere, and so does an argument
+       LIST (Reflect.construct), which build_arg_list already produces as a block. It also forces the COPY path:
+       the borrow below is sound only for slots someone else frees. ONE ownership rule — the block AND every
+       element belong to it, released with free_arg_list — because two would be a rule to get wrong at each of
+       the label's five exits. */
     JSValue *con_args_owned = NULL;
     /* the CALLER's operand count, when it differs from the callee's argument count — which it does exactly when
        the vector supplies more arguments than the call site pushed. -1 = they are the same, the usual case.
@@ -21121,8 +21141,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     int nb6;
                     JSValueConst tgt6 = tramp_bound_target(call_argv[-2], &bthis6, &nb6);
                     const JSTrampStepDef *sd6 = tramp_step_def_of(tgt6);
-                    JSValueConst ntgt6 = js_same_value(ctx, call_argv[-1], call_argv[-2])
-                                         ? tgt6 : call_argv[-1];
+                    JSValueConst ntgt6 = tramp_bound_newtarget(call_argv[-2], call_argv[-1]);
                     if (tramp_can_construct(tgt6)) {
                         /* a BYTECODE constructor at the end of the chain: its body runs on this chain like any
                            other, with the flattened arguments handed over as an owned vector — they come from
@@ -21131,8 +21150,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         int n6 = nb6 + call_argc, k6;
                         JSValue *ab6 = js_malloc(ctx, sizeof(JSValue) * (n6 > 0 ? n6 : 1));
                         if (unlikely(!ab6)) goto exception;
-                        tramp_bound_args(call_argv[-2], (JSValueConst *)ab6, nb6);   /* borrowed: the copy dups */
-                        for (k6 = 0; k6 < call_argc; k6++) ab6[nb6 + k6] = (JSValue)call_argv[k6];
+                        tramp_bound_args(call_argv[-2], (JSValueConst *)ab6, nb6);
+                        for (k6 = 0; k6 < nb6; k6++) ab6[k6] = js_dup(ab6[k6]);   /* the vector OWNS its elements */
+                        for (k6 = 0; k6 < call_argc; k6++) ab6[nb6 + k6] = js_dup(call_argv[k6]);
                         con_func = tgt6; con_ntgt = ntgt6;
                         con_args = (JSValueConst *)ab6; con_argc = n6; con_args_owned = ab6;
                         con_cargc = call_argc;   /* the caller pushed only ITS args, not the chain's */
@@ -21275,6 +21295,45 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     cont_st = stt4;
                     ret_val = JS_UNDEFINED;
                     goto do_step_step;
+                }
+                if (tramp_is_reflect_construct(call_argv[-1]) && call_argc >= 2
+                    && tramp_can_construct(tramp_bound_target(call_argv[0], NULL, NULL))) {
+                    /* Reflect.construct(C, argsList[, newTarget]) with a BYTECODE constructor, behind any number
+                       of binds. Its body belongs on this chain exactly as `new C()`'s does; only the step-machine
+                       and Promise targets were resolved here, so a loop directly in a plain constructor's body
+                       preempted with no flow base. The arguments are the chain's bound ones followed by the list,
+                       and build_arg_list already yields a block — which is what the owned-vector entry takes. */
+                    int nbc = 0;
+                    JSValueConst tgtc = tramp_bound_target(call_argv[0], NULL, &nbc);
+                    JSValueConst ntgtc = tramp_bound_newtarget(call_argv[0],
+                                             (call_argc >= 3) ? call_argv[2] : call_argv[0]);
+                    uint32_t alenc = 0; JSValue *atabc; JSValue *abc; int kc;
+                    /* 28.1.2 step 2: an explicit newTarget must itself be a constructor, and that TypeError
+                       precedes CreateListFromArrayLike — which is what the harness's own isConstructor() probe
+                       is, so getting it wrong made every not-a-constructor test in the suite report the
+                       opposite. */
+                    if (call_argc >= 3 && !JS_IsConstructor(ctx, call_argv[2])) {
+                        JS_ThrowTypeError(ctx, "not a constructor");
+                        goto exception;
+                    }
+                    if (JS_VALUE_GET_TAG(call_argv[1]) != JS_TAG_OBJECT) {
+                        JS_ThrowTypeError(ctx, "not an object");
+                        goto exception;
+                    }
+                    atabc = build_arg_list(ctx, &alenc, call_argv[1]);
+                    if (unlikely(!atabc)) goto exception;
+                    abc = js_malloc(ctx, sizeof(JSValue) * (nbc + alenc > 0 ? nbc + alenc : 1));
+                    if (unlikely(!abc)) { free_arg_list(ctx, atabc, alenc); goto exception; }
+                    tramp_bound_args(call_argv[0], (JSValueConst *)abc, nbc);
+                    for (kc = 0; kc < nbc; kc++) abc[kc] = js_dup(abc[kc]);
+                    for (kc = 0; kc < (int)alenc; kc++) abc[nbc + kc] = atabc[kc];   /* ownership moves over */
+                    js_free(ctx, atabc);                                             /* the block only */
+                    con_func = tgtc; con_ntgt = ntgtc;
+                    con_args = (JSValueConst *)abc; con_argc = nbc + (int)alenc; con_args_owned = abc;
+                    con_cargc = call_argc;   /* the caller pushed the Reflect.construct operands, not the list */
+                    con_from_super = 0; con_super_ref = JS_UNDEFINED;
+                    tramp_first = -2; tramp_is_tail = (opcode == OP_tail_call_method);
+                    goto do_construct_tramp;
                 }
                 if (tramp_is_reflect_construct(call_argv[-1]) && call_argc >= 2
                     && tramp_can_call_promise_exec(ctx, call_argv[0], NULL, 0)) {
@@ -21710,18 +21769,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     cthis = JS_UNDEFINED;   /* bound by super(); body returns the object itself */
                 } else {
                     cthis = js_create_from_ctor(ctx, ntgt, JS_CLASS_OBJECT);
-                    if (unlikely(JS_IsException(cthis))) { js_free(ctx, con_args_owned); con_args_owned = NULL; JS_FreeValue(ctx, con_super_ref); goto exception; }
+                    if (unlikely(JS_IsException(cthis))) { free_arg_list(ctx, con_args_owned, con_argc); con_args_owned = NULL; JS_FreeValue(ctx, con_super_ref); goto exception; }
                 }
                 cs = js_malloc_rt(rt, sizeof(*cs));
-                if (unlikely(!cs)) { js_free(ctx, con_args_owned); con_args_owned = NULL; JS_FreeValue(ctx, cthis); JS_FreeValue(ctx, con_super_ref); JS_ThrowOutOfMemory(ctx); goto exception; }
+                if (unlikely(!cs)) { free_arg_list(ctx, con_args_owned, con_argc); con_args_owned = NULL; JS_FreeValue(ctx, cthis); JS_FreeValue(ctx, con_super_ref); JS_ThrowOutOfMemory(ctx); goto exception; }
                 cs->created_obj = cthis;   /* owned here; substituted or freed at do_return / exception unwind */
                 cs->super_ref = con_super_ref; cs->from_super = con_from_super;
                 cs->outer = con_outer; cs->outer_kind = con_outer_kind;
                 con_outer = NULL; con_outer_kind = CONT_NONE;   /* read + reset: never leak onto the body's own constructs */
                 ntf = js_malloc_rt(rt, sizeof(TrampFrame));
-                if (unlikely(!ntf)) { js_free(ctx, con_args_owned); con_args_owned = NULL; JS_FreeValue(ctx, cthis); JS_FreeValue(ctx, con_super_ref); js_free_rt(rt, cs); JS_ThrowOutOfMemory(ctx); goto exception; }
+                if (unlikely(!ntf)) { free_arg_list(ctx, con_args_owned, con_argc); con_args_owned = NULL; JS_FreeValue(ctx, cthis); JS_FreeValue(ctx, con_super_ref); js_free_rt(rt, cs); JS_ThrowOutOfMemory(ctx); goto exception; }
                 nlb = js_malloc_rt(rt, asize ? asize : sizeof(JSValue));
-                if (unlikely(!nlb)) { js_free(ctx, con_args_owned); con_args_owned = NULL; JS_FreeValue(ctx, cthis); JS_FreeValue(ctx, con_super_ref); js_free_rt(rt, cs); js_free_rt(rt, ntf); JS_ThrowOutOfMemory(ctx); goto exception; }
+                if (unlikely(!nlb)) { free_arg_list(ctx, con_args_owned, con_argc); con_args_owned = NULL; JS_FreeValue(ctx, cthis); JS_FreeValue(ctx, con_super_ref); js_free_rt(rt, cs); js_free_rt(rt, ntf); JS_ThrowOutOfMemory(ctx); goto exception; }
                 ntf->up = tf_top;
                 ntf->caller_sf = sf; ntf->caller_b = b; ntf->caller_ctx = ctx;
                 ntf->caller_local_buf = local_buf; ntf->caller_stack_buf = stack_buf;
@@ -21755,7 +21814,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        one that is about to be freed is a dangling arg_buf even when nothing reads it. */
                     narg_buf = con_args_owned ? NULL : (JSValue *)con_args;
                 }
-                if (con_args_owned) { js_free(ctx, con_args_owned); con_args_owned = NULL; con_args = NULL; }
+                if (con_args_owned) { free_arg_list(ctx, con_args_owned, con_argc); con_args_owned = NULL; con_args = NULL; }
                 nvar_buf = nlb + narg_alloc;
                 for (k = 0; k < nb->var_count; k++) nvar_buf[k] = JS_UNDEFINED;
                 nstack_buf = nvar_buf + nb->var_count;
