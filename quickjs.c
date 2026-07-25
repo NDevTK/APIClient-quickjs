@@ -19475,6 +19475,11 @@ typedef struct JSTAIdx {
     JSStepHdr hdr;
     JSValue result;       /* DONE (owned) */
     int64_t len, idx;
+    /* set's array-like source: its length is LengthOfArrayLike and each element is coerced, so the copy is a
+       loop of steps rather than a C for(). */
+    JSValue src;          /* ToObject(source) (owned) */
+    JSValue el;           /* the element held across its coercion (owned) */
+    int64_t src_len, i;
 } JSTAIdx;
 
 /* String.prototype trim / trimStart / trimEnd / at / codePointAt: ONE machine. Their whole shared prologue is
@@ -67769,36 +67774,38 @@ static JSValue js_typed_array_get_toStringTag(JSContext *ctx,
     return JS_AtomToString(ctx, ctx->rt->class_array[p->class_id].class_name);
 }
 
-/* `offset` arrives already coerced: ToIntegerOrInfinity on it runs the page's code, so it is a step in the
-   machine below rather than a JS_ToInt64Sat here. The receiver validation and the immutability check precede it
-   and run nothing, so they stay where the spec puts them. */
-static JSValue js_typed_array_set_internal(JSContext *ctx,
-                                           JSValueConst dst,
-                                           JSValueConst src,
-                                           int64_t offset)
+/* The TYPED-ARRAY-source half of %TypedArray%.prototype.set. Past the validation it runs NO user code — the
+   source's elements are already numbers or bigints — so it stays a C body. The array-like half does not: its
+   length is LengthOfArrayLike and each element is coerced, so it lives in the machine's stages.
+   `offset` arrives already coerced for the same reason. Returns 1 = handled, 0 = the source is not a typed array
+   and the caller must run the element loop, -1 = threw. */
+static int js_typed_array_set_ta(JSContext *ctx,
+                                 JSValueConst dst,
+                                 JSValueConst src_obj,
+                                 int64_t offset,
+                                 int64_t *pdst_len)
 {
-    JSObject *p;
-    JSObject *src_p;
+    JSObject *p, *src_p;
     uint32_t i;
     int64_t dst_len, src_len;
-    JSValue val, src_obj = JS_UNDEFINED;
+    JSValue val;
 
     p = get_typed_array(ctx, dst);
     if (!p)
-        goto fail;
+        return -1;
     if (offset < 0)
         goto range_error;
     if (typed_array_is_oob(p)) {
     detached:
         JS_ThrowTypeErrorArrayBufferOOB(ctx);
-        goto fail;
+        return -1;
     }
     dst_len = p->u.array.count;
-    src_obj = JS_ToObject(ctx, src);
-    if (JS_IsException(src_obj))
-        goto fail;
+    *pdst_len = dst_len;
     src_p = JS_VALUE_GET_OBJ(src_obj);
-    if (is_typed_array(src_p->class_id)) {
+    if (!is_typed_array(src_p->class_id))
+        return 0;                      /* the array-like half: the caller's stages own it */
+    {
         JSTypedArray *dest_ta = p->u.typed_array;
         JSArrayBuffer *dest_abuf = dest_ta->buffer->u.array_buffer;
         JSTypedArray *src_ta = src_p->u.typed_array;
@@ -67807,53 +67814,36 @@ static JSValue js_typed_array_set_internal(JSContext *ctx,
 
         if (typed_array_is_oob(src_p))
             goto detached;
-
         src_len = src_p->u.array.count;
         if (offset > dst_len - src_len)
             goto range_error;
-
-        /* copying between typed objects */
         if (src_p->class_id == p->class_id) {
             /* same type, use memmove */
             memmove(dest_abuf->data + dest_ta->offset + (offset << shift),
                     src_abuf->data + src_ta->offset, src_len << shift);
-            goto done;
+            return 1;
         }
         if (dest_abuf->data == src_abuf->data) {
             /* copying between the same buffer using different types of mappings
                would require a temporary buffer */
         }
         /* otherwise, default behavior is slow but correct */
-    } else {
-        // can change |dst| as a side effect; per spec,
-        // perform the range check against its old length
-        if (js_get_length64(ctx, &src_len, src_obj))
-            goto fail;
-        if (offset > dst_len - src_len) {
-        range_error:
-            JS_ThrowRangeError(ctx, "invalid array length");
-            goto fail;
-        }
     }
-    for(i = 0; i < src_len; i++) {
+    for (i = 0; i < src_len; i++) {
+        /* the source is a typed array, so every element is already a number or a bigint: the store's conversion
+           runs nothing and this loop needs no steps. */
         val = JS_GetPropertyUint32(ctx, src_obj, i);
         if (JS_IsException(val))
-            goto fail;
-        // Per spec: detaching the TA mid-iteration is allowed and should
-        // not throw an exception. Because iteration over the source array is
-        // observable, we cannot bail out early when the TA is first detached.
-        if (typed_array_is_oob(p)) {
+            return -1;
+        if (typed_array_is_oob(p))
             JS_FreeValue(ctx, val);
-        } else if (JS_SetPropertyUint32(ctx, dst, offset + i, val) < 0) {
-            goto fail;
-        }
+        else if (JS_SetPropertyUint32(ctx, dst, offset + i, val) < 0)
+            return -1;
     }
-done:
-    JS_FreeValue(ctx, src_obj);
-    return JS_UNDEFINED;
-fail:
-    JS_FreeValue(ctx, src_obj);
-    return JS_EXCEPTION;
+    return 1;
+range_error:
+    JS_ThrowRangeError(ctx, "invalid array length");
+    return -1;
 }
 
 
@@ -68808,6 +68798,7 @@ static int js_ta_idx_step(JSContext *ctx, void *st, JSValue cb_result, JSValue *
     if (s->hdr.stage == 0) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         s->result = JS_UNDEFINED;
+        s->src = JS_UNDEFINED; s->el = JS_UNDEFINED;
         p = get_typed_array(ctx, s->hdr.this_val);
         if (!p) return -1;
         if (s->hdr.arg == TAIDX_AT) {
@@ -68826,12 +68817,73 @@ static int js_ta_idx_step(JSContext *ctx, void *st, JSValue cb_result, JSValue *
         if (r) return r < 0 ? -1 : r;
         s->hdr.stage = 2;
     }
-    JS_FreeValue(ctx, cb_result);
-
+    /* The two modes DIVERGE here, and `cb_result` is still live: set's stages 3 and 5 consume it. Freeing it
+       once for both before the split handed those stages a value that had already been released — harmless only
+       because the values that reach them happen to be numbers. Each mode owns the result it was resumed with. */
     if (s->hdr.arg == TAIDX_SET) {
-        s->result = js_typed_array_set_internal(ctx, s->hdr.this_val, step_arg(&s->hdr, 0), s->idx);
-        return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
+        int64_t dst_len;
+        if (s->hdr.stage == 2) {
+            int h;
+            s->src = JS_ToObject(ctx, step_arg(&s->hdr, 0));
+            if (JS_IsException(s->src)) { s->src = JS_UNDEFINED; return -1; }
+            h = js_typed_array_set_ta(ctx, s->hdr.this_val, s->src, s->idx, &s->len);
+            if (h < 0) return -1;
+            if (h) { s->result = JS_UNDEFINED; return 0; }   /* a typed-array source needs no steps at all */
+            s->hdr.stage = 3;
+        }
+        if (s->hdr.stage == 3) {   /* LengthOfArrayLike on the source, re-entered until it finishes */
+            int r2 = step_length_run(ctx, &s->hdr, s->src, cb_result, &s->src_len, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r2) return r2 < 0 ? -1 : r2;
+            /* reading the length can change |dst|; per spec the range check is against its OLD length */
+            dst_len = s->len;
+            if (s->idx > dst_len - s->src_len) {
+                JS_ThrowRangeError(ctx, "invalid array length");
+                return -1;
+            }
+            s->hdr.stage = 4;
+        }
+        for (;;) {
+            if (s->hdr.stage == 5) {          /* the element's primitive arrived */
+                s->hdr.stage = 4;
+                JS_FreeValue(ctx, s->el);     /* the OBJECT the primitive came from; cb_coerce only borrowed it */
+                s->el = JS_UNDEFINED;
+                p = get_typed_array(ctx, s->hdr.this_val);
+                if (p && !typed_array_is_oob(p)) {
+                    if (JS_SetPropertyUint32(ctx, s->hdr.this_val, s->idx + s->i, cb_result) < 0) return -1;
+                } else {
+                    JS_FreeValue(ctx, cb_result);
+                }
+                cb_result = JS_UNDEFINED;
+                s->i++;
+            }
+            JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+            if (s->i >= s->src_len) { s->result = JS_UNDEFINED; return 0; }
+            s->el = JS_GetPropertyUint32(ctx, s->src, (uint32_t)s->i);
+            if (JS_IsException(s->el)) { s->el = JS_UNDEFINED; return -1; }
+            /* Per spec, detaching mid-iteration is allowed and must not throw: iterating the SOURCE is
+               observable, so the walk continues and only the stores stop. */
+            if (JS_VALUE_GET_TAG(s->el) == JS_TAG_OBJECT) {
+                s->hdr.stage = 5;
+                s->hdr.cb_coerce[0] = s->el;   /* borrowed: the state holds it */
+                *out_cb = s->hdr.cb_coerce; *out_argc = HINT_NUMBER;
+                return 5;
+            }
+            p = get_typed_array(ctx, s->hdr.this_val);
+            if (p && !typed_array_is_oob(p)) {
+                if (JS_SetPropertyUint32(ctx, s->hdr.this_val, s->idx + s->i, s->el) < 0) {
+                    s->el = JS_UNDEFINED;
+                    return -1;
+                }
+            } else {
+                JS_FreeValue(ctx, s->el);
+            }
+            s->el = JS_UNDEFINED;
+            s->i++;
+        }
     }
+
+    JS_FreeValue(ctx, cb_result);
 
     /* the coercion above can RESIZE or detach the backing buffer, so the bound is re-checked against the live
        count — the length captured before it only decides what a negative index counts back from. */
@@ -68869,6 +68921,8 @@ static JSValue js_ta_idx_fini(JSContext *ctx, void *st, bool take_result)
     JSTAIdx *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (!take_result) JS_FreeValue(ctx, s->result);
+    JS_FreeValue(ctx, s->src);
+    JS_FreeValue(ctx, s->el);
     js_free(ctx, s);
     return r;
 }
