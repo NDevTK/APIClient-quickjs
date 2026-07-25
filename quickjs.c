@@ -6690,7 +6690,8 @@ JSValue JS_NewCFunction3(JSContext *ctx, JSCFunction *func,
     p->is_constructor = (cproto == JS_CFUNC_constructor ||
                          cproto == JS_CFUNC_constructor_magic ||
                          cproto == JS_CFUNC_constructor_or_func ||
-                         cproto == JS_CFUNC_constructor_or_func_magic);
+                         cproto == JS_CFUNC_constructor_or_func_magic ||
+                         cproto == JS_CFUNC_step_ctor);
     name_atom = JS_ATOM_empty_string;
     if (name && *name) {
         name_atom = JS_NewAtom(ctx, name);
@@ -18017,6 +18018,14 @@ typedef struct JSStepHdr {
     const JSTrampStepDef *def;
     int orig_cfirst, orig_cargc;
     uint8_t orig_is_tail;
+    /* A step machine whose CALLBACK is itself a step machine — `arr.map(String)` is the ordinary case. The inner
+       one is driven by the same do_step_tramp, and its result is delivered to the outer step instead of being
+       pushed. Without this the inner reached js_call_c_function's DFAIL: the CALL arm invoked a C callback in
+       place, which is right for a callback with no body and wrong for one that IS a machine. Third place this
+       outer-continuation shape has been needed (construct, ToPrimitive, and here), which is what makes it the
+       primitive rather than three special cases. */
+    void *outer;
+    uint8_t outer_kind;
 } JSStepHdr;
 enum { ArrayFind, ArrayFindIndex, ArrayFindLast, ArrayFindLastIndex };
 /* ORed into the find family's mode for the TypedArray receivers. The find STEP is already receiver-agnostic (it
@@ -18157,6 +18166,7 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
             }
         }
         break;
+    case JS_CFUNC_step_ctor:
     case JS_CFUNC_step:
         {
             /* A step builtin reached OUTSIDE the interpreter's dispatch (a host JS_Call). It runs the SAME step
@@ -19465,6 +19475,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     uint8_t tramp_cont_kind = CONT_NONE, cont_kind_cur = CONT_NONE;
     int iter_special = 0;
     int tramp_gen_magic = 0;                            /* set before goto do_generator_tramp */
+    int tramp_step_isctor = 0;                          /* 1 = the step about to be pushed is a CONSTRUCT, so the receiver slot carries new_target (read+reset in do_step_tramp) */
+    void *tramp_step_outer = NULL;                      /* non-NULL = the step about to be pushed delivers its result to this machine's step, not to the operand stack (read+reset in do_step_tramp) */
+    uint8_t tramp_step_outer_kind = CONT_NONE;
     int tp_slot = 0;                                    /* do_toprim_tramp inputs. OPERAND mode: the operand's offset from sp + the opcode byte to re-execute. MACHINE mode: tp_outer is set and the primitive is delivered to that step instead. */
     int tp_hint = HINT_NONE;
     const uint8_t *tp_retry_pc = NULL;
@@ -20155,6 +20168,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     pe_cfirst = -2; pe_cargc = call_argc; pe_super_ref = JS_UNDEFINED; pe_executor_own = JS_UNDEFINED;
                     tramp_is_tail = 0; goto do_promise_exec_tramp;
                 }
+                if (JS_VALUE_GET_TAG(call_argv[-2]) == JS_TAG_OBJECT
+                    && JS_VALUE_GET_OBJ(call_argv[-2])->class_id == JS_CLASS_C_FUNCTION
+                    && JS_VALUE_GET_OBJ(call_argv[-2])->u.cfunc.cproto == JS_CFUNC_step_ctor) {
+                    /* A constructor_or_func builtin declared as a step machine (String, and every other coercing
+                       constructor as they convert). `new C(args)` lays its operands out as [func, new_target,
+                       args] while a method call is [this, func, args] — the SAME two slots in the other order, and
+                       the constructor_or_func convention already passes new_target where a method passes `this`.
+                       So this is an operand RESHAPE, like .call and .apply: swap the two, and do_step_tramp reads
+                       the callee and the receiver exactly where it always does. No second step kind, no
+                       construct-aware init signature. */
+                    JSValue *A = (JSValue *)call_argv;
+                    JSValue f = A[-2];
+                    A[-2] = A[-1];   /* this = new_target */
+                    A[-1] = f;       /* callee */
+                    tramp_first = -2; tramp_is_tail = 0; tramp_step_isctor = 1;
+                    goto do_step_tramp;
+                }
                 ret_val = JS_CallConstructorInternal(ctx, call_argv[-2],
                                                      call_argv[-1], call_argc,
                                                      vc(call_argv), 0);
@@ -20212,6 +20242,37 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         ap_array = aa; ap_cfirst = -2; ap_cargc = call_argc;
                         tramp_is_tail = (opcode == OP_tail_call_method); goto do_apply_tramp;
                     }
+                }
+                if (tramp_is_reflect_construct(call_argv[-1]) && call_argc >= 2
+                    && JS_VALUE_GET_TAG(call_argv[0]) == JS_TAG_OBJECT
+                    && JS_VALUE_GET_OBJ(call_argv[0])->class_id == JS_CLASS_C_FUNCTION
+                    && JS_VALUE_GET_OBJ(call_argv[0])->u.cfunc.cproto == JS_CFUNC_step_ctor) {
+                    /* Reflect.construct(C, argsList[, newTarget]) with C a step-machine constructor. Like
+                       Reflect.apply, the operator site resolves it: the arguments come from the LIST into the
+                       machine's init (never onto the operand stack, whose compiled size the list could overflow),
+                       and the receiver slot carries newTarget — the same convention OP_call_constructor's reshape
+                       preserves. Reached through js_reflect_construct instead, it was JS_CallConstructor2 into
+                       js_call_c_function's step DFAIL. */
+                    const JSTrampStepDef *sd = tramp_step_def_of(call_argv[0]);
+                    JSValueConst ntgt2 = (call_argc >= 3) ? call_argv[2] : call_argv[0];
+                    uint32_t alen4 = 0; JSValue *atab4 = NULL; void *stt4;
+                    if (JS_VALUE_GET_TAG(call_argv[1]) != JS_TAG_OBJECT) {
+                        JS_ThrowTypeError(ctx, "not an object");
+                        goto exception;
+                    }
+                    atab4 = build_arg_list(ctx, &alen4, call_argv[1]);
+                    if (unlikely(!atab4)) goto exception;
+                    stt4 = sd->init(ctx, ntgt2, (int)alen4, (JSValueConst *)atab4, sd->arg, call_argv[0]);
+                    free_arg_list(ctx, atab4, alen4);
+                    if (unlikely(!stt4)) goto exception;
+                    ((JSStepHdr *)stt4)->def = sd;
+                    ((JSStepHdr *)stt4)->outer = NULL; ((JSStepHdr *)stt4)->outer_kind = CONT_NONE;
+                    ((JSStepHdr *)stt4)->orig_cfirst = -2;      /* the Reflect.construct operands */
+                    ((JSStepHdr *)stt4)->orig_cargc = call_argc;
+                    ((JSStepHdr *)stt4)->orig_is_tail = (opcode == OP_tail_call_method);
+                    cont_st = stt4;
+                    ret_val = JS_UNDEFINED;
+                    goto do_step_step;
                 }
                 if (tramp_is_reflect_construct(call_argv[-1]) && call_argc >= 2
                     && tramp_can_call_promise_exec(ctx, call_argv[0], NULL, 0)) {
@@ -21056,6 +21117,41 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValueConst gthis = (tramp_first == -2) ? call_argv[-2] : JS_UNDEFINED;
                 if (tramp_step_def_of(call_argv[-1]))
                     goto do_step_tramp;
+                if (JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT
+                    && JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_BOUND_FUNCTION) {
+                    /* `String.bind(t)(x)` — a bound function whose target is a step machine. js_call_bound_function
+                       would JS_Call it, which is js_call_c_function's step DFAIL. Assemble bound ++ call args into
+                       the init (never onto the operand stack, whose compiled size the bound list could overflow)
+                       and drive it. A bound-of-bound target is not resolved here and crashes at that DFAIL naming
+                       itself, rather than being quietly handed back to the C path. */
+                    JSBoundFunction *bf5 = JS_VALUE_GET_OBJ(call_argv[-1])->u.bound_function;
+                    const JSTrampStepDef *sd5 = tramp_step_def_of(bf5->func_obj);
+                    if (sd5) {
+                        int nb5 = bf5->argc, n5 = nb5 + call_argc, k5;
+                        JSValue *ab5 = js_malloc(ctx, sizeof(JSValue) * (n5 > 0 ? n5 : 1));
+                        void *stt5;
+                        if (unlikely(!ab5)) goto exception;
+                        for (k5 = 0; k5 < nb5; k5++) ab5[k5] = (JSValue)bf5->argv[k5];         /* borrowed: init dups */
+                        for (k5 = 0; k5 < call_argc; k5++) ab5[nb5 + k5] = (JSValue)call_argv[k5];
+                        /* a bound CALL is never a construct, so a constructor step sees new_target UNDEFINED
+                           rather than the bound `this` — `String.bind(null)()` must yield "" , not try to build a
+                           wrapper from null. */
+                        stt5 = sd5->init(ctx,
+                                         JS_VALUE_GET_OBJ(bf5->func_obj)->u.cfunc.cproto == JS_CFUNC_step_ctor
+                                             ? JS_UNDEFINED : bf5->this_val,
+                                         n5, (JSValueConst *)ab5, sd5->arg, bf5->func_obj);
+                        js_free(ctx, ab5);
+                        if (unlikely(!stt5)) goto exception;
+                        ((JSStepHdr *)stt5)->def = sd5;
+                        ((JSStepHdr *)stt5)->outer = NULL; ((JSStepHdr *)stt5)->outer_kind = CONT_NONE;
+                        ((JSStepHdr *)stt5)->orig_cfirst = tramp_first;
+                        ((JSStepHdr *)stt5)->orig_cargc = call_argc;
+                        ((JSStepHdr *)stt5)->orig_is_tail = tramp_is_tail;
+                        cont_st = stt5;
+                        ret_val = JS_UNDEFINED;
+                        goto do_step_step;
+                    }
+                }
                 ret_val = JS_CallInternal(ctx, call_argv[-1], gthis, JS_UNDEFINED,
                                           call_argc, vc(call_argv), 0);
                 if (unlikely(JS_IsException(ret_val)))
@@ -21081,8 +21177,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 /* tramp_first is -2 for a METHOD shape ([this, f, args]) and -1 for a PLAIN call ([f, args]),
                    where the receiver is undefined — `TypedArray.prototype.forEach()` must reach init with
                    this=undefined so it throws TypeError, not read an operand that is not there. */
-                stt = sd->init(ctx, tramp_first == -2 ? call_argv[-2] : JS_UNDEFINED,
-                               call_argc, vc(call_argv), sd->arg, call_argv[-1]);
+                /* The receiver slot means "new_target" for a CONSTRUCTOR step and "this" for a method step, so a
+                   plain CALL of a constructor step must see UNDEFINED there — `globalThis.String(x)` would
+                   otherwise hand globalThis to the machine as new_target and build a wrapper. Only the construct
+                   entries (OP_call_constructor's reshape, Reflect.construct, super()) set the flag. */
+                { int isctor5 = tramp_step_isctor; tramp_step_isctor = 0;
+                  JSValueConst recv5 = (tramp_first == -2) ? call_argv[-2] : JS_UNDEFINED;
+                  if (!isctor5 && JS_VALUE_GET_OBJ(call_argv[-1])->u.cfunc.cproto == JS_CFUNC_step_ctor)
+                      recv5 = JS_UNDEFINED;
+                  stt = sd->init(ctx, recv5, call_argc, vc(call_argv), sd->arg, call_argv[-1]); }
                 if (unlikely(!stt)) goto exception;
                 ((JSStepHdr *)stt)->def = sd;
                 /* the operand cleanup at DONE frees call_argv[orig_cfirst .. orig_cargc); it MUST match how this
@@ -21090,9 +21193,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    -2 was safe only while every step machine was a prototype method (arr.find, str.replace) — a
                    Promise reaction closure is called as a PLAIN function (onFulfilled(v)), so -2 freed one slot
                    below the callee and corrupted the caller's stack (the next call read a garbage callee). */
-                ((JSStepHdr *)stt)->orig_cfirst = tramp_first;
-                ((JSStepHdr *)stt)->orig_cargc = call_argc;
-                ((JSStepHdr *)stt)->orig_is_tail = tramp_is_tail;
+                ((JSStepHdr *)stt)->outer = tramp_step_outer;
+                ((JSStepHdr *)stt)->outer_kind = tramp_step_outer_kind;
+                /* an inner machine's arguments live in the OUTER state's buffer, never on the stack, so its
+                   operand shape is empty — recording the caller's would free slots it does not own. */
+                ((JSStepHdr *)stt)->orig_cfirst = tramp_step_outer ? 0 : tramp_first;
+                ((JSStepHdr *)stt)->orig_cargc = tramp_step_outer ? 0 : call_argc;
+                ((JSStepHdr *)stt)->orig_is_tail = tramp_step_outer ? 0 : tramp_is_tail;
+                tramp_step_outer = NULL; tramp_step_outer_kind = CONT_NONE;   /* read + reset */
                 cont_st = stt;
                 ret_val = JS_UNDEFINED;
                 goto do_step_step;
@@ -21104,14 +21212,28 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSStepHdr *h = stt;
                 JSValue *cb = NULL; int cbn = 0;
                 int st = h->def->step(ctx, stt, ret_val, &cb, &cbn);
-                if (unlikely(st < 0)) { h->def->fini(ctx, stt, false); goto exception; }
+                if (unlikely(st < 0)) {
+                    void *souter = h->outer;
+                    h->def->fini(ctx, stt, false);
+                    while (souter) {   /* the machines waiting on this one go with it */
+                        JSStepHdr *oh = souter; souter = oh->outer;
+                        oh->def->fini(ctx, oh, false);
+                    }
+                    goto exception;
+                }
                 if (st == 0) {
+                    void *souter = h->outer; uint8_t souter_kind = h->outer_kind;
                     JSValue r = h->def->fini(ctx, stt, true);
                     int cfirst = h->orig_cfirst, cargc = h->orig_cargc;
                     uint8_t itail = h->orig_is_tail;
                     JSValue *cargv = sp - cargc;
                     for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
                     sp += cfirst - cargc;
+                    if (souter) {   /* an inner machine: its result is the outer step's callback result */
+                        DCHECK(souter_kind == CONT_STEP, "step outer continuation: unknown machine kind");
+                        ret_val = r; cont_st = souter;
+                        goto do_step_step;
+                    }
                     if (itail) { ret_val = r; goto do_return; }
                     *sp++ = r;
                     BREAK;
@@ -21151,6 +21273,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call(call_argv[-1])) {
                     tramp_cont_state = stt; tramp_cont_kind = CONT_STEP;
                     goto do_tramp_call;
+                }
+                if (tramp_step_def_of(call_argv[-1])) {
+                    /* the callback IS a step machine (`arr.map(String)`): drive it through the same entry with an
+                       outer continuation, never in place — in place is js_call_c_function's DFAIL. */
+                    tramp_step_outer = stt; tramp_step_outer_kind = CONT_STEP;
+                    goto do_step_tramp;
                 }
                 /* a C/bound callback has no preemptible body, so running it inline suspends nothing — the step
                    machine still owns the loop state, so the builtin stays parkable between callbacks. */
@@ -23471,6 +23599,28 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     smc_cfirst = 0; smc_cargc = 0; smc_super_ref = super;
                     tramp_first = 0; tramp_is_tail = 0;
                     goto do_setmap_consume_tramp;
+                }
+                {
+                    const JSTrampStepDef *sd = tramp_step_def_of(super);
+                    if (sd && JS_VALUE_GET_OBJ(super)->u.cfunc.cproto == JS_CFUNC_step_ctor) {
+                        /* `class X extends String` — super() into a step-machine constructor. Same walk as the
+                           Map/Set and Promise supers above: NewTarget stays the DERIVED class so the result gets
+                           the subclass prototype, the arguments are the derived frame's argv, and nothing sits on
+                           the caller stack to pop, so the machine's DONE pushes its result at the current sp
+                           exactly as JS_CallConstructor2 did. `super` is an owned ref, and the init dups whatever
+                           it keeps, so it is released as soon as the init returns. */
+                        void *stt5 = sd->init(ctx, new_target, argc, argv, sd->arg, super);
+                        JS_FreeValue(ctx, super);
+                        if (unlikely(!stt5)) goto exception;
+                        ((JSStepHdr *)stt5)->def = sd;
+                        ((JSStepHdr *)stt5)->outer = NULL; ((JSStepHdr *)stt5)->outer_kind = CONT_NONE;
+                        ((JSStepHdr *)stt5)->orig_cfirst = 0;
+                        ((JSStepHdr *)stt5)->orig_cargc = 0;
+                        ((JSStepHdr *)stt5)->orig_is_tail = 0;
+                        cont_st = stt5;
+                        ret_val = JS_UNDEFINED;
+                        goto do_step_step;
+                    }
                 }
                 if (tramp_can_call_promise_exec(ctx, super, argv, argc)) {
                     /* super(fn) into the Promise constructor from a subclass: same builtin, same 27.2.3.1 steps —
@@ -26470,8 +26620,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             else if (xck == CONT_STEP) {
                 /* fini OWNS the state allocation (every driver path calls it and expects the free), so the
                    trailing js_free_rt below must not run — it was a DOUBLE FREE on the callback-throws path for
-                   every step builtin. NULL it so the shared free is skipped. */
+                   every step builtin. NULL it so the shared free is skipped. The machines WAITING on this one
+                   (a step whose callback is a step) go with it. */
+                void *souter = ((JSStepHdr *)xcs)->outer;
                 ((JSStepHdr *)xcs)->def->fini(ctx, xcs, false);
+                while (souter) { JSStepHdr *oh = souter; souter = oh->outer; oh->def->fini(ctx, oh, false); }
                 xcs = NULL;
             }
             else if (xck == CONT_STR_REPLACE)
@@ -46579,8 +46732,6 @@ JSValue JS_ReadObject(JSContext *ctx, const uint8_t *buf, size_t buf_len,
 /*******************************************************************/
 /* runtime functions & objects */
 
-static JSValue js_string_constructor(JSContext *ctx, JSValueConst this_val,
-                                     int argc, JSValueConst *argv);
 static JSValue js_boolean_constructor(JSContext *ctx, JSValueConst this_val,
                                       int argc, JSValueConst *argv);
 static JSValue js_number_constructor(JSContext *ctx, JSValueConst this_val,
@@ -50521,9 +50672,13 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_TA_EVERY, STEPDEF_TA_SOME, STEPDEF_TA_FOREACH, STEPDEF_TA_MAP, STEPDEF_TA_FILTER,
     STEPDEF_ARRAY_REDUCE, STEPDEF_ARRAY_REDUCE_RIGHT, STEPDEF_TA_REDUCE, STEPDEF_TA_REDUCE_RIGHT,
     STEPDEF_ARRAY_SORT, STEPDEF_ARRAY_TOSORTED, STEPDEF_JSON_PARSE,
-    STEPDEF_TA_SLICE, STEPDEF_STR_CONCAT,
+    STEPDEF_TA_SLICE, STEPDEF_STR_CONCAT, STEPDEF_STR_CTOR,
     STEPDEF_COUNT
 };
+static void *js_str_ctor_init(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv,
+                              int unused, JSValueConst func_obj);
+static int js_str_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_str_ctor_fini(JSContext *ctx, void *st, bool take_result);
 static void *js_str_concat_init(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv,
                                 int unused, JSValueConst func_obj);
 static int js_str_concat_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
@@ -50560,6 +50715,7 @@ static const JSTrampStepDef js_array_toSorted_def = { js_array_toSorted_vinit, j
 static const JSTrampStepDef js_json_parse_def    = { js_json_parse_vinit, js_json_parse_vstep, js_json_parse_vfini, 0 };
 static const JSTrampStepDef js_ta_slice_def     = { js_ta_slice_init, js_ta_slice_step, js_ta_slice_fini, 0 };
 static const JSTrampStepDef js_str_concat_def   = { js_str_concat_init, js_str_concat_step, js_str_concat_fini, 0 };
+static const JSTrampStepDef js_str_ctor_def     = { js_str_ctor_init, js_str_ctor_step, js_str_ctor_fini, 0 };
 static const JSTrampStepDef js_array_reduce_def  = { js_array_reduce_vinit, js_array_reduce_vstep, js_array_reduce_vfini, special_reduce };
 static const JSTrampStepDef js_array_reduceR_def = { js_array_reduce_vinit, js_array_reduce_vstep, js_array_reduce_vfini, special_reduceRight };
 static const JSTrampStepDef js_ta_reduce_def     = { js_array_reduce_vinit, js_array_reduce_vstep, js_array_reduce_vfini, special_reduce | special_TA };
@@ -50590,6 +50746,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_JSON_PARSE]    = &js_json_parse_def,
     [STEPDEF_TA_SLICE]      = &js_ta_slice_def,
     [STEPDEF_STR_CONCAT]    = &js_str_concat_def,
+    [STEPDEF_STR_CTOR]      = &js_str_ctor_def,
     [STEPDEF_ARRAY_REDUCE]  = &js_array_reduce_def,  [STEPDEF_ARRAY_REDUCE_RIGHT] = &js_array_reduceR_def,
     [STEPDEF_TA_REDUCE]     = &js_ta_reduce_def,     [STEPDEF_TA_REDUCE_RIGHT]    = &js_ta_reduceR_def,
 };
@@ -50623,7 +50780,7 @@ static const JSTrampStepDef *tramp_step_def_of(JSValueConst func)
         return s ? s->step_def : NULL;
     }
     if (fp->class_id != JS_CLASS_C_FUNCTION) return NULL;
-    if (fp->u.cfunc.cproto != JS_CFUNC_step) return NULL;
+    if (fp->u.cfunc.cproto != JS_CFUNC_step && fp->u.cfunc.cproto != JS_CFUNC_step_ctor) return NULL;
     DCHECK((unsigned)fp->u.cfunc.magic < STEPDEF_COUNT, "JS_CFUNC_STEP_DEF id is out of range");
     DCHECK(js_tramp_step_defs[fp->u.cfunc.magic] != NULL, "STEPDEF id has no table row");
     return js_tramp_step_defs[fp->u.cfunc.magic];
@@ -53107,36 +53264,87 @@ static const JSClassExoticMethods js_string_exotic_methods = {
     .delete_property = js_string_delete_property,
 };
 
-static JSValue js_string_constructor(JSContext *ctx, JSValueConst new_target,
-                                     int argc, JSValueConst *argv)
+/* String(x) / new String(x), 22.1.1.1. Its ToString(argv[0]) runs a user valueOf/toString/@@toPrimitive, which
+   from a C body would be JS_CallFree with nowhere to suspend. As a step machine the coercion is a TOPRIMITIVE
+   step; the wrapper creation that follows runs no user code. ONE machine serves both spellings — new_target
+   arrives in the receiver slot, which is the constructor_or_func convention and what OP_call_constructor's
+   reshape preserves. */
+typedef struct JSStrCtor {
+    JSStepHdr hdr;        /* MUST be first */
+    JSValue result;       /* DONE: the string or wrapper (owned) */
+    JSValue new_target;   /* UNDEFINED for a plain call (owned) */
+    JSValue arg;          /* argv[0] (owned); UNINITIALIZED when there was no argument */
+    JSValue cb[1];
+    uint8_t coerced;
+} JSStrCtor;
+
+static void js_str_ctor_end(JSContext *ctx, JSStrCtor *s)
 {
+    JS_FreeValue(ctx, s->new_target);
+    if (!JS_IsUninitialized(s->arg)) JS_FreeValue(ctx, s->arg);
+}
+
+static void *js_str_ctor_init(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv,
+                              int unused, JSValueConst func_obj)
+{
+    JSStrCtor *s = js_mallocz(ctx, sizeof(*s));
+    if (!s) { JS_ThrowOutOfMemory(ctx); return NULL; }
+    s->new_target = js_dup(this_val);   /* the receiver slot IS new_target here; UNDEFINED = a plain call */
+    s->arg = (argc == 0) ? JS_UNINITIALIZED : js_dup(argv[0]);
+    return s;
+}
+
+static int js_str_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSStrCtor *s = st;
     JSValue val, obj;
-    if (argc == 0) {
-        val = js_empty_string(ctx->rt);
+
+    if (!s->coerced && JS_VALUE_GET_TAG(s->arg) == JS_TAG_OBJECT) {
+        s->coerced = 1;
+        s->cb[0] = s->arg;   /* borrowed: the state holds the reference */
+        *out_cb = s->cb; *out_argc = HINT_STRING;
+        if (JS_VALUE_GET_TAG(cb_result) != JS_TAG_UNINITIALIZED) JS_FreeValue(ctx, cb_result);
+        return 5;
+    }
+    if (s->coerced) {
+        /* the coercion settled: a primitive, so ToString finishes without user code. */
+        val = JS_ToString(ctx, cb_result);
+        JS_FreeValue(ctx, cb_result);
     } else {
-        if (JS_IsUndefined(new_target) && JS_IsSymbol(argv[0])) {
-            JSAtomStruct *p = JS_VALUE_GET_PTR(argv[0]);
+        if (JS_VALUE_GET_TAG(cb_result) != JS_TAG_UNINITIALIZED) JS_FreeValue(ctx, cb_result);
+        if (JS_IsUninitialized(s->arg)) {
+            val = js_empty_string(ctx->rt);
+        } else if (JS_IsUndefined(s->new_target) && JS_IsSymbol(s->arg)) {
+            /* 22.1.1.1 step 2.b: String(sym) describes the symbol; new String(sym) throws through ToString. */
+            JSAtomStruct *p = JS_VALUE_GET_PTR(s->arg);
             val = JS_ConcatString3(ctx, "Symbol(", JS_AtomToString(ctx, js_get_atom_index(ctx->rt, p)), ")");
         } else {
-            val = JS_ToString(ctx, argv[0]);
+            val = JS_ToString(ctx, s->arg);
         }
-        if (JS_IsException(val))
-            return val;
     }
-    if (!JS_IsUndefined(new_target)) {
-        JSString *p1 = JS_VALUE_GET_STRING(val);
+    if (JS_IsException(val)) return -1;
+    if (JS_IsUndefined(s->new_target)) {
+        s->result = val;
+        return 0;
+    }
+    { JSString *p1 = JS_VALUE_GET_STRING(val);
+      int len = p1->len;
+      obj = js_create_from_ctor(ctx, s->new_target, JS_CLASS_STRING);
+      if (JS_IsException(obj)) { JS_FreeValue(ctx, val); return -1; }
+      JS_SetObjectData(ctx, obj, val);
+      JS_DefinePropertyValue(ctx, obj, JS_ATOM_length, js_int32(len), 0);
+      s->result = obj; }
+    return 0;
+}
 
-        obj = js_create_from_ctor(ctx, new_target, JS_CLASS_STRING);
-        if (JS_IsException(obj)) {
-            JS_FreeValue(ctx, val);
-        } else {
-            JS_SetObjectData(ctx, obj, val);
-            JS_DefinePropertyValue(ctx, obj, JS_ATOM_length, js_int32(p1->len), 0);
-        }
-        return obj;
-    } else {
-        return val;
-    }
+static JSValue js_str_ctor_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSStrCtor *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    js_str_ctor_end(ctx, s);
+    js_free(ctx, s);
+    return r;
 }
 
 static JSValue js_thisStringValue(JSContext *ctx, JSValueConst this_val)
@@ -59708,8 +59916,11 @@ static JSValue js_symbol_toString(JSContext *ctx, JSValueConst this_val,
     val = js_thisSymbolValue(ctx, this_val);
     if (JS_IsException(val))
         return val;
-    /* XXX: use JS_ToStringInternal() with a flags */
-    ret = js_string_constructor(ctx, JS_UNDEFINED, 1, vc(&val));
+    /* String(sym)'s description branch, inlined: the argument is a SYMBOL, so there is no coercion and nothing
+       to suspend — the String constructor is a step machine now and calling it from here would be an unrouted
+       call shape for no benefit. */
+    { JSAtomStruct *p = JS_VALUE_GET_PTR(val);
+      ret = JS_ConcatString3(ctx, "Symbol(", JS_AtomToString(ctx, js_get_atom_index(ctx->rt, p)), ")"); }
     JS_FreeValue(ctx, val);
     return ret;
 }
@@ -66065,8 +66276,11 @@ int JS_AddIntrinsicBaseObjects(JSContext *ctx)
         return -1;
 
     /* String */
+    /* Registered as a STEP machine: cproto JS_CFUNC_step with the definition id in magic, so both `String(x)` and
+       `new String(x)` reach do_step_tramp (OP_call_constructor reshapes its operands into the method shape). The
+       function pointer is unused on that cproto. */
     obj1 = JS_NewCConstructor(ctx, JS_CLASS_STRING, "String",
-                              js_string_constructor, 1, JS_CFUNC_constructor_or_func, 0,
+                              NULL, 1, JS_CFUNC_step_ctor, STEPDEF_STR_CTOR,
                               JS_UNDEFINED,
                               js_string_funcs, countof(js_string_funcs),
                               js_string_proto_funcs, countof(js_string_proto_funcs),
