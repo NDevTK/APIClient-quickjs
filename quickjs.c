@@ -52271,14 +52271,16 @@ static JSIterAtState iter_data_at_iterator(JSContext *ctx, JSValueConst items, J
     return st;
 }
 
-/* Consumers that drive a generator OR helper (Array.from / spread / Set / Map / Object.fromEntries / TypedArray):
-   accept when the iterator will be a generator/helper — a generator-function @@iterator (created on the tramp) or a
-   direct generator/helper (its @@iterator returns itself). *out_getiter = the method (owned) for the consume tramp. */
-/* GENERATOR-BACKED sources only. Broadening this to every callable @@iterator was tried and REVERTED: routing all
-   iterables through the consume machinery regressed 12 tests (Array.from 2, Set 1, Map 4, Object.fromEntries 5),
-   so the C path still owns semantics this machinery does not reproduce. Consequence, stated rather than hidden: a
-   PLAIN iterator consumed by Array.from/spread/Set/Map still drives its .next from C, so a loop in that .next
-   cannot park - unlike the same iterator consumed by an Iterator.prototype method, which now can. */
+/* The gate for the consumers that do NOT have a recognizer of their own — the array-literal and call SPREAD
+   (OP_append) and new TypedArray(iterable). *out_getiter = the @@iterator method (owned) for the consume tramp.
+   It accepts a generator/helper source, and any callable @@iterator that is not a BUILT-IN C function: a built-in
+   @@iterator yields a built-in iterator whose .next() is C and invokes nothing, so there is no user body to suspend
+   and js_append_enumerate's fast-array copy is a different algorithm rather than a fallback.
+   (This once read "GENERATOR-BACKED sources only", recording that broadening it had regressed 12 tests. That note
+   described the state before the consume machine could acquire on the tramp; Array.from and Object.fromEntries have
+   their own recognizers accepting any callable @@iterator now, and the widening here landed green. What is still
+   refused is the shape the probe cannot READ without invoking something — a getter, a proxy — which is the
+   named-unbuilt tramp acquire, not a semantics gap.) */
 static bool iter_consume_gen_backed(JSContext *ctx, JSValueConst items, JSValue *out_getiter)
 {
     JSValue m;
@@ -52436,10 +52438,10 @@ static bool tramp_can_call_objentries_consume(JSContext *ctx, JSValueConst func,
        iter-arg-is-{null,undefined,poisoned} and Iterator.from fallback tests and leaked: the acquire's abrupt and
        not-a-function paths are shared with a NULLISH and a PRIMITIVE source, which that route does not model.
        Build that first, then this refusal goes. */
-    if (!iter_data_at_iterator(ctx, call_argv[0], out_getiter)) return false;
-    if (JS_IsFunction(ctx, *out_getiter)) return true;
-    JS_FreeValue(ctx, *out_getiter); *out_getiter = JS_UNDEFINED;
-    return false;
+    /* FOUND is the only route: an ABSENT @@iterator is Object.fromEntries's own TypeError (its argument must be
+       iterable, there is no array-like branch here) and DECLINE is the refusal above. Testing the tri-state as a
+       bool would read as "not declined", which is a different question. */
+    return iter_data_at_iterator(ctx, call_argv[0], out_getiter) == ITERAT_FOUND;
 }
 
 /* Route new TypedArray(iterable) — js_typed_array_constructor_obj collects it (js_array_from_iterator) in a C loop,
