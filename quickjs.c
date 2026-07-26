@@ -1445,7 +1445,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_BIGINT_ASUINTN, STEPDEF_BIGINT_ASINTN,
     STEPDEF_OBJ_GOPD, STEPDEF_REFLECT_GOPD,
     STEPDEF_OBJ_VALUES, STEPDEF_OBJ_ENTRIES, STEPDEF_OBJ_ASSIGN, STEPDEF_OBJ_SPREAD,
-    STEPDEF_ARRAY_FLAT, STEPDEF_ARRAY_FLATMAP, STEPDEF_ARRAY_FROMLIKE, STEPDEF_ARRAY_WITH,
+    STEPDEF_ARRAY_FLAT, STEPDEF_ARRAY_FLATMAP, STEPDEF_ARRAY_FROMLIKE, STEPDEF_ARRAY_WITH, STEPDEF_ARRAY_FILL,
     STEPDEF_MATH_ABS, STEPDEF_MATH_FLOOR, STEPDEF_MATH_CEIL, STEPDEF_MATH_ROUND, STEPDEF_MATH_SQRT, STEPDEF_MATH_ACOS, STEPDEF_MATH_ASIN, STEPDEF_MATH_ATAN, STEPDEF_MATH_COS, STEPDEF_MATH_EXP, STEPDEF_MATH_LOG, STEPDEF_MATH_SIN, STEPDEF_MATH_TAN, STEPDEF_MATH_TRUNC, STEPDEF_MATH_SIGN, STEPDEF_MATH_COSH, STEPDEF_MATH_SINH, STEPDEF_MATH_TANH, STEPDEF_MATH_ACOSH, STEPDEF_MATH_ASINH, STEPDEF_MATH_ATANH, STEPDEF_MATH_EXPM1, STEPDEF_MATH_LOG1P, STEPDEF_MATH_LOG2, STEPDEF_MATH_LOG10, STEPDEF_MATH_CBRT, STEPDEF_MATH_F16ROUND, STEPDEF_MATH_FROUND, STEPDEF_MATH_ATAN2, STEPDEF_MATH_POW, STEPDEF_MATH_MIN, STEPDEF_MATH_MAX, STEPDEF_MATH_HYPOT, STEPDEF_MATH_IMUL, STEPDEF_MATH_CLZ32, STEPDEF_STR_FROMCHARCODE, STEPDEF_STR_FROMCODEPOINT, STEPDEF_DATE_UTC,
     STEPDEF_REGEXP_EXEC, STEPDEF_REGEXP_TEST,
     STEPDEF_ITER_TAKE, STEPDEF_ITER_DROP,
@@ -18199,6 +18199,24 @@ static int step_getidx_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, int64
     return step_getprop_done(ctx, h, in, pout);
 }
 
+/* Set(O, ! ToString(𝔽(idx)), v, true) — the write half of an element access. A setter or a Proxy `set` trap is
+   the page's code exactly as `get` is, and every builtin that fills a receiver reached it with
+   JS_SetPropertyInt64 from C. 0 = done, 8 = the caller must return that step code, -1 = threw. */
+static int step_setidx_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, int64_t idx, JSValueConst value,
+                           JSValue in, JSValue **out_cb, int *out_argc)
+{
+    if (h->get_phase == GET_PH_START) {
+        JSAtom atom;
+        int r;
+        atom = JS_NewAtomInt64(ctx, idx);
+        if (atom == JS_ATOM_NULL) { JS_FreeValue(ctx, in); return -1; }
+        r = step_setprop_run(ctx, h, obj, atom, value, in, out_cb, out_argc);
+        JS_FreeAtom(ctx, atom);   /* step_setprop_run took its own reference */
+        return r;
+    }
+    return step_setprop_run(ctx, h, obj, JS_ATOM_NULL, value, in, out_cb, out_argc);
+}
+
 /* HasProperty(O, ! ToString(𝔽(idx))) — the OTHER half of the element access indexOf/lastIndexOf perform, which
    skip holes and so must ask before they read. A Proxy `has` trap is the page's code exactly as `get` is, and
    JS_TryGetPropertyInt64 reached it from C. 0 = *pres is filled, 7 = the caller must return that step code. */
@@ -19879,6 +19897,16 @@ typedef struct JSArrayAt {
     JSValue result;       /* DONE (owned) */
     int64_t len, idx;
 } JSArrayAt;
+
+/* Array.prototype.fill, 23.1.3.7. ToObject, LengthOfArrayLike, then the two index coercions, then Set(O, k, value)
+   for every k in the range — and that Set is the page's code on an accessor or a Proxy receiver. js_array_fill did
+   all of it from a C entry, so `[1,2].fill(0, {valueOf(){ while(x){} }})` and a looping index setter both preempted
+   with no flow base. */
+typedef struct JSArrayFill {
+    JSStepHdr hdr;        /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    JSValue obj;          /* ToObject(this) (owned); also the result */
+    int64_t len, k, end;
+} JSArrayFill;
 
 /* Array.prototype.with, 23.1.3.39. Its prologue is JSArrayAt's — ToObject, LengthOfArrayLike,
    ToIntegerOrInfinity(index) — and then every element is READ, which on an accessor or a Proxy source is the
@@ -53017,6 +53045,76 @@ static JSValue js_array_at_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
+/* JS_ToInt64Clamp's shape at int64 width: a negative index is relative to `len`, then clamped into [0, len]. */
+static int64_t arr_clamp_idx(int64_t v, int64_t len)
+{
+    if (v < 0) v += len;
+    if (v < 0) v = 0;
+    else if (v > len) v = len;
+    return v;
+}
+
+static int js_array_fill_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSArrayFill *s = st;
+    int r;
+
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
+        s->obj = JS_UNDEFINED;
+        s->len = 0; s->k = 0; s->end = 0;
+        s->obj = JS_ToObject(ctx, s->hdr.this_val);
+        if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
+        s->hdr.stage = 1;
+    }
+    if (s->hdr.stage == 1) {
+        r = step_length_run(ctx, &s->hdr, s->obj, cb_result, &s->len, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->k = 0; s->end = s->len;
+        s->hdr.stage = 2;
+    }
+    if (s->hdr.stage == 2) {
+        /* an ABSENT or undefined bound is the default and coerces nothing — the same rule substring's second
+           argument follows, and the reason the defaults are set above rather than here. */
+        if (s->hdr.argc > 1 && !JS_IsUndefined(step_arg(&s->hdr, 1))) {
+            r = step_toint64_run(ctx, &s->hdr, s->hdr.argv[1], cb_result, &s->k, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->k = arr_clamp_idx(s->k, s->len);
+        }
+        s->hdr.stage = 3;
+    }
+    if (s->hdr.stage == 3) {
+        if (s->hdr.argc > 2 && !JS_IsUndefined(step_arg(&s->hdr, 2))) {
+            r = step_toint64_run(ctx, &s->hdr, s->hdr.argv[2], cb_result, &s->end, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->end = arr_clamp_idx(s->end, s->len);
+        }
+        s->hdr.stage = 4;
+    }
+    while (s->k < s->end) {
+        /* Set(O, ! ToString(k), value, true): an index setter or a Proxy `set` trap runs on this chain. */
+        r = step_setidx_run(ctx, &s->hdr, s->obj, s->k, step_arg(&s->hdr, 0), cb_result, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->k++;
+    }
+    JS_FreeValue(ctx, cb_result);
+    return 0;
+}
+
+static JSValue js_array_fill_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSArrayFill *s = st;
+    JSValue r = take_result ? js_dup(s->obj) : JS_UNDEFINED;
+    JS_FreeValue(ctx, s->obj);
+    js_free(ctx, s);
+    return r;
+}
+
 static int js_array_with_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSArrayWith *s = st;
@@ -53623,40 +53721,6 @@ static JSValue js_array_reduce_vfini(JSContext *ctx, void *st, bool take_result)
 }
 
 /* Exact C-function identity + magic, as with js_array_every. */
-static JSValue js_array_fill(JSContext *ctx, JSValueConst this_val,
-                             int argc, JSValueConst *argv)
-{
-    JSValue obj;
-    int64_t len, start, end;
-
-    obj = JS_ToObject(ctx, this_val);
-    if (js_get_length64(ctx, &len, obj))
-        goto exception;
-
-    start = 0;
-    if (argc > 1 && !JS_IsUndefined(argv[1])) {
-        if (JS_ToInt64Clamp(ctx, &start, argv[1], 0, len, len))
-            goto exception;
-    }
-
-    end = len;
-    if (argc > 2 && !JS_IsUndefined(argv[2])) {
-        if (JS_ToInt64Clamp(ctx, &end, argv[2], 0, len, len))
-            goto exception;
-    }
-
-    /* XXX: should special case fast arrays */
-    while (start < end) {
-        if (JS_SetPropertyInt64(ctx, obj, start, js_dup(argv[0])) < 0)
-            goto exception;
-        start++;
-    }
-    return obj;
-
- exception:
-    JS_FreeValue(ctx, obj);
-    return JS_EXCEPTION;
-}
 
 /* SameValueZero membership in an ENGINE-OWNED dense array — JSON's cycle stack and its property list. It shares
    a NAME with Array.prototype.includes and nothing else: no ToObject, no LengthOfArrayLike, no fromIndex, and
@@ -53901,6 +53965,8 @@ static int js_ta_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
 static JSValue js_ta_slice_fini(JSContext *ctx, void *st, bool take_result);
 static int js_array_at_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_array_with_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static int js_array_fill_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_array_fill_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_array_with_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_array_at_fini(JSContext *ctx, void *st, bool take_result);
 static int js_array_search_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
@@ -54016,6 +54082,7 @@ static const JSTrampStepDef js_str_concat_def   = { sizeof(JSStrConcat), js_str_
 static const JSTrampStepDef js_str_ctor_def     = { sizeof(JSStrCtor), js_str_ctor_step, js_str_ctor_fini, 0 };
 static const JSTrampStepDef js_array_at_def     = { sizeof(JSArrayAt), js_array_at_step, js_array_at_fini, 0 };
 static const JSTrampStepDef js_array_with_def   = { sizeof(JSArrayWith), js_array_with_step, js_array_with_fini, 0 };
+static const JSTrampStepDef js_array_fill_def   = { sizeof(JSArrayFill), js_array_fill_step, js_array_fill_fini, 0 };
 static const JSTrampStepDef js_array_indexOf_def     = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_INDEXOF };
 static const JSTrampStepDef js_array_lastIndexOf_def = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_LASTINDEXOF };
 static const JSTrampStepDef js_array_includes_def    = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_INCLUDES };
@@ -54164,6 +54231,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_STR_CTOR]      = &js_str_ctor_def,
     [STEPDEF_ARRAY_AT]      = &js_array_at_def,
     [STEPDEF_ARRAY_WITH]    = &js_array_with_def,
+    [STEPDEF_ARRAY_FILL]    = &js_array_fill_def,
     [STEPDEF_ARRAY_INDEXOF]     = &js_array_indexOf_def,
     [STEPDEF_ARRAY_LASTINDEXOF] = &js_array_lastIndexOf_def,
     [STEPDEF_ARRAY_INCLUDES]    = &js_array_includes_def,
@@ -56683,7 +56751,7 @@ static const JSCFunctionListEntry js_array_proto_funcs[] = {
     JS_CFUNC_STEP_DEF("filter", 1, STEPDEF_ARRAY_FILTER ),
     JS_CFUNC_STEP_DEF("reduce", 1, STEPDEF_ARRAY_REDUCE ),
     JS_CFUNC_STEP_DEF("reduceRight", 1, STEPDEF_ARRAY_REDUCE_RIGHT ),
-    JS_CFUNC_DEF("fill", 1, js_array_fill ),
+    JS_CFUNC_STEP_DEF("fill", 1, STEPDEF_ARRAY_FILL ),
     JS_CFUNC_STEP_DEF("find", 1, STEPDEF_ARRAY_FIND ),
     JS_CFUNC_STEP_DEF("findIndex", 1, STEPDEF_ARRAY_FIND_INDEX ),
     JS_CFUNC_STEP_DEF("findLast", 1, STEPDEF_ARRAY_FIND_LAST ),
