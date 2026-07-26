@@ -19646,6 +19646,15 @@ typedef struct JSIterConsume {
        the key, 3 = define. */
     uint8_t ent_ph;
     uint8_t ent_pending; /* 1 = an entry sequence is in flight, so `res` is its phase result, not a .next() one */
+    /* Array.from's receiver, held ACROSS GetIterator. 23.1.2.1 does step 3's GetMethod BEFORE step 4.a's
+       Construct(C), and constructing first was unobservable only while @@iterator could not be a getter. It can
+       be now, so the result object is created at the deliver arm instead. UNDEFINED for every other sink. */
+    JSValue from_ctor;
+    /* 1 = the deliver arm still owes step 4.a's ArrayCreate/Construct(C). The RECEIVER cannot say so: sink
+       ITERCONS_FROM is shared with TypedArray.from and new TypedArray(iterable), and `Array.from.call(undefined, x)`
+       is a legitimate receiver of UNDEFINED whose result is a plain ArrayCreate — reading "is from_ctor set?" as
+       "is the Construct owed?" would leave that call with no result object at all. */
+    uint8_t from_owes_result;
     JSValue ent_obj;     /* the entry object, held across its two reads (owned) */
     JSValue ent_key;     /* entry[0], then its property key (owned) */
     JSValue ent_val;     /* entry[1] (owned) */
@@ -19658,10 +19667,25 @@ static void sum_precise_add(SumPreciseState *s, double d);
 static double sum_precise_get_result(SumPreciseState *s);
 static JSValue js_math_sumPrecise(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 #define ITERCONS_OWNED(F) F(r) F(iter) F(next) F(adder) F(mapfn) F(mapfn_this) F(cb_value) F(ta_target) \
-                          F(ent_obj) F(ent_key) F(ent_val)
+                          F(ent_obj) F(ent_key) F(ent_val) F(from_ctor) F(super_ref)
 /* NOTE: JSIteratorHelperData::cb_value is owned too — freed by the finalizer and cleared on every path below. */
 static int js_iter_consume_step(JSContext *ctx, struct JSIterConsume *s, JSValue res);
 static void js_iter_consume_end(JSContext *ctx, struct JSIterConsume *s);
+/* THE allocator: nine call sites build a JSIterConsume, each setting the fields ITS consumer uses, and a
+   js_mallocz leaves the rest as all-zero bytes — which is JS_TAG_INT 0, NOT undefined. That value frees and dups as
+   a no-op, so it looks harmless, and every field is therefore read with `JS_IsUndefined` as "this consumer did not
+   set it". A field added to ITERCONS_OWNED thus reads back as SET at the eight sites that never heard of it — the
+   Array.from receiver did exactly that, and `new Int8Array(iterable)` overwrote its own result with a fresh array,
+   leaking the whole graph. The one owned-field list drives free, clone AND init, so a new field cannot skip a
+   site. */
+#define ITERCONS_INIT_ONE(f) s->f = JS_UNDEFINED;
+static JSIterConsume *js_iter_consume_new(JSContext *ctx)
+{
+    JSIterConsume *s = js_mallocz(ctx, sizeof(*s));
+    if (unlikely(!s)) return NULL;
+    ITERCONS_OWNED(ITERCONS_INIT_ONE)
+    return s;
+}
 /* Set-record primitives — ITERCONS_SETOP folds setlike.keys() straight into the result's [[SetData]] (the spec
    forbids calling the observable .add), so the consume step needs them before their definitions. */
 static JSValue map_normalize_key(JSContext *ctx, JSValue key);
@@ -22893,31 +22917,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValueConst thisv = call_argv[-2];
                 uint8_t sink0 = icons_sink; icons_sink = ITERCONS_FROM;   /* read + reset */
                 JSIterConsume *s;
-                JSValue result;
-                if (sink0 == ITERCONS_SUMPRECISE)
-                    result = JS_UNDEFINED;              /* no accumulator OBJECT: the sum lives in s->sum */
-                else if (JS_IsConstructor(ctx, thisv))
-                    result = JS_CallConstructor(ctx, thisv, 0, NULL);
-                else
-                    result = JS_NewArray(ctx);
-                if (JS_IsException(result)) { JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED; goto exception; }
-                s = js_mallocz(ctx, sizeof(*s));
-                if (unlikely(!s)) { JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED; JS_FreeValue(ctx, result); JS_ThrowOutOfMemory(ctx); goto exception; }
-                s->r = result;
-                s->iter = JS_UNDEFINED;
-                s->next = JS_UNDEFINED;
-                s->cb_value = JS_UNDEFINED;
-                s->adder = JS_UNDEFINED;
+                /* the result object is NOT created here: 23.1.2.1 orders step 3's GetMethod before step 4.a's
+                   Construct(C), and GetMethod can now run a getter. It is created at the deliver arm, once the
+                   acquire has decided there IS an iterator — see from_owes_result. */
+                s = js_iter_consume_new(ctx);
+                if (unlikely(!s)) { JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED; JS_ThrowOutOfMemory(ctx); goto exception; }
                 /* Array.from(items, mapfn, thisArg): dup the mapfn + thisArg (recognition checked mapfn callable).
                    sumPrecise takes no callback at all. */
                 s->mapfn = (sink0 == ITERCONS_FROM && call_argc >= 2) ? js_dup(call_argv[1]) : JS_UNDEFINED;
                 s->mapfn_this = (sink0 == ITERCONS_FROM && call_argc >= 3) ? js_dup(call_argv[2]) : JS_UNDEFINED;
                 s->k = 0;
                 s->sink = sink0;
+                s->from_ctor = (sink0 == ITERCONS_FROM) ? js_dup(thisv) : JS_UNDEFINED;
+                s->from_owes_result = (sink0 == ITERCONS_FROM);
                 if (sink0 == ITERCONS_SUMPRECISE) sum_precise_init(&s->sum);
-                s->super_ref = JS_UNDEFINED;   /* only the super(iterable) entry owns one */
                 s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
-                tramp_consume_iterable = call_argv[0]; tramp_consume_state = s; tramp_consume_kind = CONT_ITER_CONSUME;
+                DCHECK(call_argc >= 1, "the consume entry reads call_argv[0]; the recognizer refuses argc 0, whose "
+                                       "whole algorithm is GetMethod(undefined)'s TypeError with no user code in it");
+                tramp_consume_iterable = call_argv[0];
+                tramp_consume_state = s; tramp_consume_kind = CONT_ITER_CONSUME;
                 goto do_consume_acquire_iterator;
             }
 
@@ -22948,18 +22966,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     acc = (call_argc >= 2) ? js_dup(call_argv[1]) : JS_UNINITIALIZED;   /* UNINITIALIZED = seed from the first element */
                 else acc = JS_UNDEFINED;
                 if (JS_IsException(acc)) { JS_FreeValue(ctx, nextm); goto exception; }
-                s = js_mallocz(ctx, sizeof(*s));
+                s = js_iter_consume_new(ctx);
                 if (unlikely(!s)) { JS_FreeValue(ctx, nextm); JS_FreeValue(ctx, acc); JS_ThrowOutOfMemory(ctx); goto exception; }
                 s->r = acc;
                 s->iter = js_dup(iterobj);
                 s->next = nextm;
-                s->cb_value = JS_UNDEFINED;   /* js_mallocz zero is NOT JS_UNDEFINED */
-                s->adder = JS_UNDEFINED;
                 s->mapfn = (call_argc >= 1) ? js_dup(call_argv[0]) : JS_UNDEFINED;
-                s->mapfn_this = JS_UNDEFINED;
                 s->k = 0;
                 s->sink = ITERCONS_ITERTERM;
-                s->super_ref = JS_UNDEFINED;   /* only the super(iterable) entry owns one */
                 s->setop = iterterm_kind;
                 s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
                 cont_st = s;
@@ -23006,17 +23020,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         nr->value = JS_UNDEFINED;
                     }
                 }
-                s = js_mallocz(ctx, sizeof(*s));
+                s = js_iter_consume_new(ctx);
                 if (unlikely(!s)) { JS_FreeValue(ctx, keys); JS_FreeValue(ctx, newset); JS_ThrowOutOfMemory(ctx); goto exception; }
                 s->r = newset;                /* UNDEFINED for isSupersetOf — its boolean result is set at finish */
-                s->iter = JS_UNDEFINED;
-                s->next = JS_UNDEFINED;
-                s->cb_value = JS_UNDEFINED;
                 s->adder = js_dup(thisset);   /* symmetricDifference / isSupersetOf consult THIS per element */
-                s->mapfn = JS_UNDEFINED; s->mapfn_this = JS_UNDEFINED;
                 s->k = 1;                     /* isSupersetOf: found-so-far = true (unused by union/symmetricDifference) */
                 s->sink = ITERCONS_SETOP;
-                s->super_ref = JS_UNDEFINED;   /* only the super(iterable) entry owns one */
                 s->setop = setop_kind;
                 s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
                 tramp_iter_getiter = keys;   /* the acquire CALLS it on setlike (create-on-tramp if it is a generator fn) */
@@ -23372,6 +23381,32 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         bool flattenable = (tramp_consume_kind == CONT_ITER_FROM);
                         bool nullish = JS_IsUndefined(method) || JS_IsNull(method);
                         JS_FreeValue(ctx, method);
+                        /* 23.1.2.1 step 4: Array.from with NO iterator is the array-like algorithm, not an error.
+                           The probe picks that branch when it can see @@iterator is absent; when the read had to
+                           RUN (a getter, a proxy) only this point knows, so the hand-off is here. The iterator
+                           machine is discarded unused — its result object is not built until the method is in
+                           hand, one step below, so nothing observable has happened to undo. */
+                        if (nullish && tramp_consume_kind == CONT_ITER_CONSUME
+                            && ((JSIterConsume *)tramp_consume_state)->from_owes_result) {
+                            JSIterConsume *fs = (JSIterConsume *)tramp_consume_state;
+                            int fcargc = fs->orig_cargc;
+                            uint8_t fitail = fs->orig_is_tail;
+                            JSValueConst *fcargv = (JSValueConst *)(sp - fcargc);
+                            void *fl_stt;
+                            DCHECK(fs->orig_cfirst == -2, "Array.from's operands are a method-call shape");
+                            fl_stt = tramp_step_state_new(ctx, tramp_step_def_by_id(STEPDEF_ARRAY_FROMLIKE),
+                                                          fcargv[-2], fcargc, fcargv, fcargv[-1]);
+                            js_iter_consume_end(ctx, fs); js_free_rt(rt, fs);
+                            tramp_consume_state = NULL; tramp_consume_kind = CONT_NONE;
+                            tramp_consume_iterable = JS_UNDEFINED;
+                            if (unlikely(!fl_stt)) goto exception;
+                            ((JSStepHdr *)fl_stt)->orig_cfirst = -2;
+                            ((JSStepHdr *)fl_stt)->orig_cargc = fcargc;
+                            ((JSStepHdr *)fl_stt)->orig_is_tail = fitail;
+                            cont_st = fl_stt;
+                            ret_val = JS_UNDEFINED;
+                            goto do_step_step;
+                        }
                         /* GetIteratorFlattenable (Iterator.from) vs GetIterator (every other consumer) — the ONE
                            step where the two abstract operations differ. Flattenable with an ABSENT @@iterator
                            takes O ITSELF as the iterator (`Iterator.from({next(){…}})` wraps a bare
@@ -23385,6 +23420,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                                        : "value is not a function");
                         tramp_consume_acquired = JS_EXCEPTION;
                         goto do_consume_deliver_iterator;
+                    }
+                }
+                /* 23.1.2.1 steps 6.a-6.c sit exactly HERE: after GetMethod has produced a callable @@iterator and
+                   before GetIterator's Call. Array.from is the one consumer with something to do at that point —
+                   Construct(C) — and doing it before the acquire instead was unobservable only while @@iterator
+                   could not be a getter. iter-cstm-ctor-err is what pins the order: a throwing C must win over the
+                   TypeError a bad iterator would raise a step later. */
+                if (tramp_consume_kind == CONT_ITER_CONSUME) {
+                    JSIterConsume *fs = (JSIterConsume *)tramp_consume_state;
+                    if (fs->from_owes_result) {
+                        JSValue ctor = fs->from_ctor;
+                        fs->from_ctor = JS_UNDEFINED;
+                        fs->from_owes_result = 0;
+                        DCHECK(JS_IsUndefined(fs->r), "Array.from's result object is built exactly once");
+                        fs->r = JS_IsConstructor(ctx, ctor) ? JS_CallConstructor(ctx, ctor, 0, NULL)
+                                                            : JS_NewArray(ctx);
+                        JS_FreeValue(ctx, ctor);
+                        if (JS_IsException(fs->r)) {
+                            fs->r = JS_UNDEFINED;
+                            JS_FreeValue(ctx, method);
+                            tramp_consume_acquired = JS_EXCEPTION;
+                            goto do_consume_deliver_iterator;
+                        }
                     }
                 }
                 if (tramp_can_call_gen_create(method)) {
@@ -23534,14 +23592,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JS_ThrowTypeError(ctx, "%s is not a function", (magic & MAGIC_SET) ? "add" : "set");
                     goto exception;
                 }
-                s = js_mallocz(ctx, sizeof(*s));
+                s = js_iter_consume_new(ctx);
                 if (unlikely(!s)) { JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED; JS_FreeValue(ctx, adder); JS_FreeValue(ctx, obj); JS_ThrowOutOfMemory(ctx); goto exception; }
                 s->r = obj;
-                s->iter = JS_UNDEFINED;
-                s->next = JS_UNDEFINED;
-                s->cb_value = JS_UNDEFINED;
                 s->adder = adder;
-                s->mapfn = JS_UNDEFINED; s->mapfn_this = JS_UNDEFINED;
                 s->k = 0;
                 s->sink = (magic & MAGIC_SET) ? ITERCONS_SET : ITERCONS_MAP;
                 s->orig_cfirst = smc_cfirst; s->orig_cargc = smc_cargc; s->orig_is_tail = tramp_is_tail;
@@ -23557,16 +23611,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSIterConsume *s;
                 JSValue obj = JS_NewObject(ctx);
                 if (JS_IsException(obj)) { JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED; goto exception; }
-                s = js_mallocz(ctx, sizeof(*s));
+                s = js_iter_consume_new(ctx);
                 if (unlikely(!s)) { JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED; JS_FreeValue(ctx, obj); JS_ThrowOutOfMemory(ctx); goto exception; }
                 s->r = obj;
-                s->iter = JS_UNDEFINED;
-                s->next = JS_UNDEFINED;
-                s->cb_value = JS_UNDEFINED;
-                s->adder = JS_UNDEFINED; s->mapfn = JS_UNDEFINED; s->mapfn_this = JS_UNDEFINED;
                 s->k = 0;
                 s->sink = ITERCONS_OBJENTRIES;
-                s->super_ref = JS_UNDEFINED;   /* only the super(iterable) entry owns one */
                 s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
                 /* argc 0 means the source is UNDEFINED, which the acquire turns into GetIterator's TypeError —
                    reading call_argv[0] there would read the slot ABOVE the operands. */
@@ -23604,14 +23653,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (JS_DefinePropertyValueInt64(ctx, lst, i, js_dup(call_argv[i]), JS_PROP_C_W_E | JS_PROP_THROW) < 0)
                             { JS_FreeValue(ctx, lst); goto exception; }
                     }
-                    so = js_mallocz(ctx, sizeof(*so));
+                    so = js_iter_consume_new(ctx);
                     if (unlikely(!so)) { JS_FreeValue(ctx, lst); JS_ThrowOutOfMemory(ctx); goto exception; }
                     so->r = lst;
-                    so->iter = JS_UNDEFINED; so->next = JS_UNDEFINED;
-                    so->cb_value = JS_UNDEFINED; so->ta_target = JS_UNDEFINED;
                     so->adder = js_dup(ntgt);
-                    so->mapfn = JS_UNDEFINED; so->mapfn_this = JS_UNDEFINED;
-                    so->super_ref = JS_UNDEFINED;
                     so->k = call_argc; so->ta_k = 0;
                     so->sink = ITERCONS_FROM; so->ta_isfrom = 1; so->ta_classid = 0;
                     so->ta_phase = 1;
@@ -23649,15 +23694,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             src6 = JS_ToObject(ctx, call_argv[0]);
                             if (JS_IsException(src6)) goto exception;
                             if (js_get_length64(ctx, &len6, src6) < 0) { JS_FreeValue(ctx, src6); goto exception; }
-                            s6 = js_mallocz(ctx, sizeof(*s6));
+                            s6 = js_iter_consume_new(ctx);
                             if (unlikely(!s6)) { JS_FreeValue(ctx, src6); JS_ThrowOutOfMemory(ctx); goto exception; }
                             s6->r = src6;                       /* the source list the map phase indexes */
-                            s6->iter = JS_UNDEFINED; s6->next = JS_UNDEFINED;
-                            s6->cb_value = JS_UNDEFINED; s6->ta_target = JS_UNDEFINED;
                             s6->adder = js_dup(ntgt);           /* the constructor the create phase Constructs */
                             s6->mapfn = (call_argc >= 2) ? js_dup(call_argv[1]) : JS_UNDEFINED;
                             s6->mapfn_this = (call_argc >= 3) ? js_dup(call_argv[2]) : JS_UNDEFINED;
-                            s6->super_ref = JS_UNDEFINED;
                             s6->k = len6; s6->ta_k = 0;
                             s6->sink = ITERCONS_FROM; s6->ta_isfrom = 1; s6->ta_classid = 0;
                             s6->ta_phase = 1;                   /* skip the collect: the list already exists */
@@ -23674,14 +23716,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         tramp_iter_getiter = m;   /* the acquire CALLS this exact method — no second read */
                     }
                 }
-                s = js_mallocz(ctx, sizeof(*s));
+                s = js_iter_consume_new(ctx);
                 if (unlikely(!s)) { JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED; JS_ThrowOutOfMemory(ctx); goto exception; }
                 tmp = JS_NewArray(ctx);
                 if (JS_IsException(tmp)) { JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED; js_free_rt(rt, s); goto exception; }
                 s->r = tmp;
-                s->iter = JS_UNDEFINED;
-                s->next = JS_UNDEFINED;
-                s->cb_value = JS_UNDEFINED;
                 s->adder = js_dup(ntgt);   /* the new_target/ctor, used at the finish to create the typed array */
                 /* TypedArray.from(gen, mapfn, thisArg): carry the mapfn; it is applied at the finish (via
                    js_typed_array_from on the collected array — spec map-after-create order), NOT during the collect. */
@@ -23689,10 +23728,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->mapfn_this = (is_from && call_argc >= 3) ? js_dup(call_argv[2]) : JS_UNDEFINED;
                 s->ta_classid = is_from ? 0 : ta_classid;   /* the from path CONSTRUCTS the receiver; only new TypedArray(iterable) creates by class id */
                 s->ta_isfrom = is_from;
-                s->ta_target = JS_UNDEFINED;
                 s->k = 0;
                 s->sink = ITERCONS_FROM;
-                s->super_ref = JS_UNDEFINED;   /* only the super(iterable) entry owns one */
                 s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
                 tramp_consume_iterable = call_argv[0]; tramp_consume_state = s; tramp_consume_kind = CONT_ITER_CONSUME;
                 goto do_consume_acquire_iterator;
@@ -23704,17 +23741,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                A generator-function @@iterator is created on the tramp; else GetIterator2 inline. The spread operands
                [array, pos, iterable] at sp[-3..-1] stay put below any transient create push. */
             {
-                JSIterConsume *s = js_mallocz(ctx, sizeof(*s));
+                JSIterConsume *s = js_iter_consume_new(ctx);
                 if (unlikely(!s)) { JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED; JS_ThrowOutOfMemory(ctx); goto exception; }
                 s->r = js_dup(sp[-3]);            /* the array being built — a shared ref; appends land on sp[-3] too */
-                s->iter = JS_UNDEFINED;
-                s->next = JS_UNDEFINED;
-                s->cb_value = JS_UNDEFINED;
-                s->adder = JS_UNDEFINED;
-                s->mapfn = JS_UNDEFINED; s->mapfn_this = JS_UNDEFINED;
                 s->k = JS_VALUE_GET_INT(sp[-2]);  /* the current append position */
                 s->sink = ITERCONS_SPREAD;
-                s->super_ref = JS_UNDEFINED;   /* only the super(iterable) entry owns one */
                 tramp_consume_iterable = sp[-1]; tramp_consume_state = s; tramp_consume_kind = CONT_ITER_CONSUME;
                 goto do_consume_acquire_iterator;
             }
@@ -23846,27 +23877,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            sp[-3] (same object). Match js_append_enumerate + OP_append's tail: write the new position
                            back to sp[-2], drop the iterable at sp[-1], and pop it. r/iter are the state's own refs. */
                         int64_t n = s->k;
-                        JS_FreeValue(ctx, s->r); JS_FreeValue(ctx, s->iter); JS_FreeValue(ctx, s->next);
-                    JS_FreeValue(ctx, s->super_ref);   /* super() entry ref: the DONE path frees inline, not through _end */
-                        js_free_rt(rt, s);
+                        js_iter_consume_end(ctx, s); js_free_rt(rt, s);
                         sp[-2] = js_int32((int32_t)n);
                         JS_FreeValue(ctx, sp[-1]);   /* the spread iterable (generator) */
                         sp--;
                         BREAK;
                     }
                     /* ITERCONS_FROM (set length) / _SET / _MAP: pop the ORIGINAL call/ctor operands, yield the result */
-                    JSValue r = s->r;
+                    /* The four values this path CARRIES OUT are moved off the state (cleared, so the teardown does
+                       not free them); everything else the state owns goes through the ONE owned-field list. Freeing
+                       the rest by hand here was a second list to keep in sync with ITERCONS_OWNED, and a field
+                       missing from it leaks silently on the success path only. */
+                    DCHECK(!s->from_owes_result, "the consume finished without ever building Array.from's result object");
+                    JSValue r = s->r;                          s->r = JS_UNDEFINED;
                     int cfirst = s->orig_cfirst, cargc = s->orig_cargc;
                     uint8_t itail = s->orig_is_tail;
                     int64_t n = s->k;
                     uint8_t sink = s->sink;
                     uint8_t is_tafrom = s->ta_isfrom;
                     int ta_cid = s->ta_classid;
-                    JSValue ta_ntgt = s->adder;   /* new TypedArray(gen): the new_target/ctor; else the add/set method or UNDEFINED */
-                    JSValue ta_mapfn = s->mapfn, ta_mapfn_this = s->mapfn_this;   /* TypedArray.from(gen, mapfn): applied here */
-                    JS_FreeValue(ctx, s->iter); JS_FreeValue(ctx, s->next);
-                    JS_FreeValue(ctx, s->super_ref);   /* super() entry ref: the DONE path frees inline, not through _end */
-                    js_free_rt(rt, s);
+                    JSValue ta_ntgt = s->adder;                s->adder = JS_UNDEFINED;   /* new TypedArray(gen): the new_target/ctor; else the add/set method or UNDEFINED */
+                    JSValue ta_mapfn = s->mapfn;               s->mapfn = JS_UNDEFINED;   /* TypedArray.from(gen, mapfn): applied here */
+                    JSValue ta_mapfn_this = s->mapfn_this;     s->mapfn_this = JS_UNDEFINED;
+                    js_iter_consume_end(ctx, s); js_free_rt(rt, s);
                     if (ta_cid != 0) {
                         /* new TypedArray(iterable) — a DIFFERENT algorithm from TypedArray.from: 23.2.5.1 does
                            IterableToList then creates by CLASS, never constructing a user ctor. TypedArray.from's
@@ -51978,9 +52011,7 @@ static JSValue js_array_from(JSContext *ctx, JSValueConst this_val,
     if (JS_IsException(iter))
         goto exception;
     /* GetMethod(items, @@iterator): a NULLISH result means "no iterator" and takes the array-like branch, a
-       non-callable one is a TypeError, and only a callable one is an iterable. The test used to be `!IsUndefined`,
-       which sent both `@@iterator = null` (array-like per the spec) and `@@iterator = 5` (a TypeError) into the
-       iterable arm — and since that arm is now a DFAIL, both aborted the engine instead of doing their spec thing. */
+       non-callable one is a TypeError, and only a callable one is an iterable. */
     if (!JS_IsUndefined(iter) && !JS_IsNull(iter)) {
         if (check_function(ctx, iter)) {
             JS_FreeValue(ctx, iter);
@@ -51989,12 +52020,10 @@ static JSValue js_array_from(JSContext *ctx, JSValueConst this_val,
         /* DELETED: the ITERABLE branch. Array.from over any callable @@iterator — including one on a primitive —
            is driven by the ONE consume machine (ITERCONS_FROM), which acquires the iterator on the tramp and
            performs IfAbruptCloseIterator itself. This loop drove .next and the mapfn from C, which is exactly
-           where a coroutine cannot suspend. An iterable source reaching here means a call site was not routed —
-           today the only way is an @@iterator this engine cannot read side-effect-free (a getter, a proxy), which
-           is the named-unbuilt tramp acquire.
-           The ARRAY-LIKE branch below is NOT a fallback for this: it is a different algorithm (length + indices,
-           no iterator at all), it is the JSArrayFromLike machine for every routed call, and what remains here is
-           reached only through that same unread-@@iterator path. */
+           where a coroutine cannot suspend. EVERY source routes now — a getter or Proxy @@iterator included, since
+           the acquire reads it on the tramp — so reaching here at all means a CALL SITE was not routed.
+           The ARRAY-LIKE branch below is the JSArrayFromLike machine for every routed call; what remains of it here
+           is reachable only through that same unrouted call site. */
         JS_FreeValue(ctx, iter);
         DFAIL("Array.from reached its C entry with an ITERABLE source — route that call site onto the consume "
               "machine; the iteration loop here no longer exists");
@@ -52362,11 +52391,13 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
     return 1;   /* drive iter.next() */
 }
 
-/* Abandon a half-run consumer (exception / fork-unwind): free the owned result + generator + adder. On the normal
-   DONE finish the caller instead MOVES s->r out and frees s->iter/s->adder inline, so this is the error path only. */
+/* Tear a consumer down: free every field ITERCONS_OWNED names, and nothing else. EVERY path ends here — the
+   exception unwind, the fork-abandon AND the normal DONE finish, which first MOVES the two-to-four values it
+   carries out off the state (clearing each) so this frees the remainder. The DONE path used to free its fields by
+   hand, which is a second owned-field list: a field missing from it leaked on success only, where no error path
+   ever exercises it. */
 static void js_iter_consume_end(JSContext *ctx, JSIterConsume *s)
 {
-    JS_FreeValue(ctx, s->super_ref); s->super_ref = JS_UNDEFINED;   /* super() entry's parent-class ref */
     #define ITERCONS_FREE_ONE(f) JS_FreeValue(ctx, s->f);
     ITERCONS_OWNED(ITERCONS_FREE_ONE)
     #undef ITERCONS_FREE_ONE
@@ -52505,15 +52536,14 @@ static bool tramp_can_call_iter_consume(JSContext *ctx, JSValueConst func, JSVal
        exclusion CAUSED the failure it appeared to avoid: iter_data_at_iterator boxes for the lookup and the
        machine acquires on the chain, so routing the primitive is the fix.
        Array-LIKES (no @@iterator at all) are a DIFFERENT algorithm — length + indices — so they get their own
-       machine rather than a sink on the iterator walk; the sink value is only how this ONE recognizer tells its
-       caller which to drive. What still declines is the shape the probe cannot answer without invoking something (a
-       getter, a proxy) and the shape whose answer is a throw (present but not callable): the first is the
-       named-unbuilt tramp acquire, the second is GetMethod's TypeError, which the C entry raises. */
-    switch (iter_data_at_iterator(ctx, call_argv[0], out_getiter)) {
-    case ITERAT_FOUND:  return true;
-    case ITERAT_ABSENT: *out_sink = ITERCONS_FROMLIKE; return true;
-    default:            return false;
-    }
+       machine rather than a sink on the iterator walk; the probe's ABSENT answer picks it here, and a getter that
+       turns out to yield nothing picks it at the acquire, which is the only place that can know.
+       Nothing DECLINES any more: a source whose @@iterator the probe cannot read side-effect-free (a getter, a
+       Proxy) routes to the iterator machine, whose acquire performs the REAL GetMethod on the tramp and then
+       decides — callable, nullish (hand off to the array-like machine) or a TypeError. */
+    if (iter_data_at_iterator(ctx, call_argv[0], out_getiter) == ITERAT_ABSENT)
+        *out_sink = ITERCONS_FROMLIKE;
+    return true;
 }
 
 /* Route new Set(gen) / new Map(gen) — the js_map_constructor C loop drives the argument generator's .next(). Scoped
