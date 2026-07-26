@@ -22894,7 +22894,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        of it, and each consumer's deliver arm finishes an acquisition failure (Promise rejects,
                        Array.from/Set/Map propagate). */
                     JS_FreeValue(ctx, method);
-                    method = JS_GetProperty(ctx, iterable, JS_ATOM_Symbol_iterator);   /* runs a getter; may throw */
+                    /* NOT ON THE TRAMP YET: a GETTER @@iterator (or a Proxy trap) is user code, so a loop in it has
+                       no flow base. Every consumer's recognizer therefore still refuses a source whose @@iterator
+                       the side-effect-free probe cannot read, and this read only ever sees the absent /
+                       non-callable / nullish / primitive cases. Routing it through the property-get tramp is the
+                       build that removes those refusals; the first attempt broke the Promise
+                       iter-arg-is-{null,undefined,poisoned} and Iterator.from fallback paths, which share this
+                       code with a nullish and a primitive source. */
+                    method = JS_GetProperty(ctx, iterable, JS_ATOM_Symbol_iterator);
                     if (JS_IsException(method)) {
                         tramp_consume_acquired = JS_EXCEPTION;
                         goto do_consume_deliver_iterator;
@@ -23293,6 +23300,27 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                       cr = JS_Call(ctx, call_argv[-1], JS_UNDEFINED, 2, cargs2);
                       for (i = -2; i < 2; i++) JS_FreeValue(ctx, call_argv[i]);
                       sp -= 4;
+                      ret_val = cr;
+                      goto do_iter_consume_step; }
+                }
+                if (st == 7) {
+                    /* the collection's ADDER (Set.prototype.add / Map.prototype.set, or a SUBCLASS's override) is
+                       user code: [this=r, adder, value] for a Set, [this=r, adder, key, value] for a Map.
+                       Calling it with JS_Call drove an overriding bytecode body to completion. */
+                    int nargs = (s->sink == ITERCONS_MAP) ? 2 : 1;
+                    DCHECK(sp + 2 + nargs <= TRAMP_SP_LIMIT(sf),
+                           "consume adder: operand push exceeds the frame's compiled stack_size");
+                    *sp++ = js_dup(s->r);
+                    *sp++ = js_dup(s->adder);
+                    if (nargs == 2) { *sp++ = js_dup(s->ent_key); *sp++ = js_dup(s->ent_val); }
+                    else { *sp++ = js_dup(s->cb_value); }
+                    call_argv = sp - nargs; call_argc = nargs; tramp_first = -2; tramp_is_tail = 0;
+                    tramp_cont_state = s; tramp_cont_kind = CONT_ITER_CONSUME;
+                    if (tramp_can_call(call_argv[-1])) goto do_tramp_call;
+                    tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;
+                    { JSValue cr = JS_Call(ctx, call_argv[-1], call_argv[-2], nargs, (JSValueConst *)call_argv);
+                      for (i = -2; i < nargs; i++) JS_FreeValue(ctx, call_argv[i]);
+                      sp -= 2 + nargs;
                       ret_val = cr;
                       goto do_iter_consume_step; }
                 }
@@ -24515,7 +24543,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        caller_sp ABOVE them) and resume the consume step with the result. */
                     JSValue *cargv = sp - cargc;
                     int nops = cargc - cfirst;
-                    DCHECK(nops == 2 || nops == 4 || nops == 5, "consume cont frame has an unexpected operand shape");
+                    /* 2 = a PLAIN iterator's .next() ([iter, next]) — the only shape whose result must be an
+                       iterator-result object; 3 = a Set's one-argument adder ([this, add, value]); 4 = a 2-arg
+                       callback or a Map's adder ([this, set, key, value]); 5 = reduce's 3-arg callback. */
+                    DCHECK(nops == 2 || nops == 3 || nops == 4 || nops == 5,
+                           "consume cont frame has an unexpected operand shape");
                     for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
                     sp += cfirst - cargc;
                     if (nops == 2 && !JS_IsException(ret_val) && !JS_IsObject(ret_val)) {
@@ -51012,6 +51044,12 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
         if (s->ent_ph == 1) {
             s->ent_val = res;
             JS_FreeValue(ctx, s->ent_obj); s->ent_obj = JS_UNDEFINED;   /* both reads done */
+            if (s->sink == ITERCONS_MAP) {
+                /* a Map key is used as-is — no ToPropertyKey — so the entry sequence ends at the adder */
+                s->ent_pending = 0;
+                s->cb_pending = 4;
+                return 7;
+            }
             s->ent_ph = 2;
             return 5;                       /* ToPrimitive(entry[0], string) — ToPropertyKey's user-code half */
         }
@@ -51037,8 +51075,20 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
            generator's return() off the tramp. */
         if (JS_IsException(fret)) {
             JS_FreeValue(ctx, value);
+            if (which == 4) {   /* the ADDER threw: IfAbruptCloseIterator, so close before propagating */
+                JS_FreeValue(ctx, s->ent_key); s->ent_key = JS_UNDEFINED;
+                JS_FreeValue(ctx, s->ent_val); s->ent_val = JS_UNDEFINED;
+                s->abrupt = 1; return 2;
+            }
             if (which == 2) { s->abrupt = 1; return 2; }
             return -1;
+        }
+        if (which == 4) {   /* the adder RETURNED; Set/Map discard its result */
+            JS_FreeValue(ctx, value);   /* SET's element; UNDEFINED for MAP */
+            JS_FreeValue(ctx, s->ent_key); s->ent_key = JS_UNDEFINED;
+            JS_FreeValue(ctx, s->ent_val); s->ent_val = JS_UNDEFINED;
+            JS_FreeValue(ctx, fret);
+            return 1;
         }
         if (which == 3) {   /* TypedArray.from's mapfn (23.2.2.1 step 5.d.iii): the RESULT is Set into the target */
             JS_FreeValue(ctx, value);
@@ -51162,12 +51212,11 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
             }
             sum_precise_add(&s->sum, d);
         } else if (s->sink == ITERCONS_SET) {
-            /* new Set(gen): adder(value). Mirrors js_map_constructor's is_set branch. */
-            JSValue ret = JS_Call(ctx, s->adder, s->r, 1, vc(&value));
-            JS_FreeValue(ctx, value);
-            /* the adder threw: IfAbruptCloseIterator (Set/set-iterator-close-after-add-failure) */
-            if (JS_IsException(ret)) { s->abrupt = 1; return 2; }
-            JS_FreeValue(ctx, ret);
+            /* new Set(iterable): adder(value). The adder is `this.add` — a SUBCLASS can override it with a
+               bytecode body, so it is user code and runs as a PHASE on the tramp, never a JS_Call from here. */
+            s->cb_value = value;
+            s->cb_pending = 4;
+            return 7;
         } else if (s->sink == ITERCONS_OBJENTRIES) {
             /* Object.fromEntries: the entry must be an object; r[entry[0]] = entry[1]. The two element reads and
                the key's ToPropertyKey are USER CODE, so each is a phase the interpreter runs on the tramp and
@@ -51181,22 +51230,16 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
             s->ent_pending = 1;
             return 6;             /* read ent_obj[0] on the tramp */
         } else if (s->sink == ITERCONS_MAP) {
-            /* new Map(gen): the entry must be an object; adder(entry[0], entry[1]). Mirrors js_map_constructor. */
-            JSValue key, val, ret; JSValueConst args[2];
-            /* every abrupt exit is an IfAbruptCloseIterator site — a non-object entry, a key/value get, or
-               the adder throwing (Map/iterator-item-*-returns-abrupt, iterator-items-are-not-object-close-
-               iterator, iterator-close-after-set-failure) */
+            /* new Map(iterable): the entry must be an object; adder(entry[0], entry[1]). The two element reads and
+               the adder are all user code, so they are PHASES of this machine — the SAME entry sequence
+               fromEntries uses, minus the key coercion (a Map key is not a property key).
+               Every abrupt exit is an IfAbruptCloseIterator site (Map/iterator-item-*-returns-abrupt,
+               iterator-items-are-not-object-close-iterator, iterator-close-after-set-failure). */
             if (!JS_IsObject(value)) { JS_FreeValue(ctx, value); JS_ThrowTypeErrorNotAnObject(ctx); s->abrupt = 1; return 2; }
-            key = JS_GetPropertyUint32(ctx, value, 0);
-            if (JS_IsException(key)) { JS_FreeValue(ctx, value); s->abrupt = 1; return 2; }
-            val = JS_GetPropertyUint32(ctx, value, 1);
-            JS_FreeValue(ctx, value);
-            if (JS_IsException(val)) { JS_FreeValue(ctx, key); s->abrupt = 1; return 2; }
-            args[0] = key; args[1] = val;
-            ret = JS_Call(ctx, s->adder, s->r, 2, args);
-            JS_FreeValue(ctx, key); JS_FreeValue(ctx, val);
-            if (JS_IsException(ret)) { s->abrupt = 1; return 2; }
-            JS_FreeValue(ctx, ret);
+            s->ent_obj = value;   /* ownership moves to the state for the whole entry sequence */
+            s->ent_ph = 0;
+            s->ent_pending = 1;
+            return 6;             /* read ent_obj[0] on the tramp */
         } else if (s->sink == ITERCONS_ITERTERM) {
             /* Iterator.prototype eager terminal. `r` accumulates the answer; `mapfn` is the predicate/reducer, called
                with (value, counter) — or (accumulator, value, counter) for reduce. A deciding element short-circuits
@@ -51499,11 +51542,15 @@ static bool tramp_can_call_objentries_consume(JSContext *ctx, JSValueConst func,
     if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
     if (fp->u.cfunc.cproto != JS_CFUNC_generic) return false;
     if (fp->u.cfunc.c_function.generic != js_object_fromEntries) return false;
-    /* ANY callable @@iterator, not just a generator-backed one, and on a PRIMITIVE source too — iter_data_at_iterator
-       boxes it for the walk, so `Object.fromEntries("ab")` reaches the same consumer as an array does. Each
-       narrowing here is a case silently handed to the live C loop in js_object_fromEntries, which is what has to
-       go before that loop can be deleted. Widened ONE step at a time so a failure names the missing capability
-       instead of producing a mixed count. */
+    /* ANY callable @@iterator, not just a generator-backed one, and on a PRIMITIVE source too — the probe boxes
+       it for the walk, so `Object.fromEntries("ab")` reaches the same consumer as an array does.
+       What is still a refusal is a source whose @@iterator the side-effect-free probe cannot read: a GETTER, or a
+       Proxy. Those reach the C entry, whose iteration loop is gone, so the DFAIL there NAMES the capability to
+       build — the acquire's own @@iterator GetMethod must run ON THE TRAMP, because a getter body is user code
+       with a loop that has to park. Routing it through the property-get tramp regressed the Promise
+       iter-arg-is-{null,undefined,poisoned} and Iterator.from fallback tests and leaked: the acquire's abrupt and
+       not-a-function paths are shared with a NULLISH and a PRIMITIVE source, which that route does not model.
+       Build that first, then this refusal goes. */
     if (!iter_data_at_iterator(ctx, call_argv[0], out_getiter)) return false;
     if (JS_IsFunction(ctx, *out_getiter)) return true;
     JS_FreeValue(ctx, *out_getiter); *out_getiter = JS_UNDEFINED;
