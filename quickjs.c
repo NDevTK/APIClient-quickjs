@@ -21886,42 +21886,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         goto do_step_step;
                     }
                 }
-                if (JS_VALUE_GET_TAG(call_argv[-2]) == JS_TAG_OBJECT
-                    && JS_VALUE_GET_OBJ(call_argv[-2])->class_id == JS_CLASS_PROXY) {
-                    /* proxy [[Construct]]: run the trap on THIS chain. Five operands replace the callee,
-                       new_target and args, and the continuation's only job is the must-return-an-object check. */
-                    JSValue px[5], ptgt;
-                    int px_ret;
-                    DCHECK(sp + 3 <= TRAMP_SP_LIMIT(sf),
-                           "proxy construct trap: operand reshape exceeds the frame's compiled stack_size");
-                    px_ret = js_tramp_proxy_construct(ctx, call_argv[-2], call_argv[-1],
-                                                      call_argc, vc(call_argv), px, &ptgt);
-                    while (px_ret == 2) {   /* no trap: construct the TARGET, which may itself be a proxy */
-                        JSValue *A = (JSValue *)call_argv;
-                        JS_FreeValue(ctx, A[-2]);
-                        A[-2] = ptgt;
-                        px_ret = js_tramp_proxy_construct(ctx, call_argv[-2], call_argv[-1],
-                                                          call_argc, vc(call_argv), px, &ptgt);
-                    }
-                    if (unlikely(px_ret < 0)) goto exception;
-                    if (px_ret > 0) {
-                        JSValue *A = (JSValue *)call_argv;
-                        int k;
-                        for (k = 0; k < call_argc; k++) JS_FreeValue(ctx, A[k]);
-                        JS_FreeValue(ctx, A[-1]);   /* new_target — px[4] holds its own ref */
-                        JS_FreeValue(ctx, A[-2]);   /* the proxy */
-                        A[-2] = px[0]; A[-1] = px[1];
-                        A[0] = px[2]; A[1] = px[3]; A[2] = px[4];
-                        sp = A + 3;
-                        call_argv = A; call_argc = 3; tramp_first = -2; tramp_is_tail = 0;
-                        tramp_cont_state = NULL; tramp_cont_kind = CONT_PROXY_CONSTRUCT;
-                        goto do_tramp_call;
-                    }
-                    /* px_ret == 0: the callee resolved through the no-trap proxies is whatever it is — a
-                       bytecode ctor, a consumer builtin, a plain C one. The dispatch below answers that, so the
-                       resolution does not need its own copy of the question and a consumer behind a trapless
-                       proxy stops falling to a C entry. */
-                }
                 con_func = call_argv[-2]; con_ntgt = call_argv[-1];
                 con_args = vc(call_argv); con_argc = call_argc;
                 con_from_super = 0; con_super_ref = JS_UNDEFINED;
@@ -22508,6 +22472,66 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int con_cargc_in = con_cargc;
                 int con_pop = tramp_first ? (con_cargc_in >= 0 ? con_cargc_in : con_argc) : 0;
                 con_cargc = -1;
+                if (JS_VALUE_GET_TAG(con_func) == JS_TAG_OBJECT
+                    && JS_VALUE_GET_OBJ(con_func)->class_id == JS_CLASS_PROXY) {
+                    /* Proxy [[Construct]]: run the trap on THIS chain. This used to sit at OP_call_constructor,
+                       which is why `new P(...arr)` — the spread shape, which never passes that opcode — fell to
+                       JS_CallConstructorInternal and drove the trap (or the target's body) to completion. It
+                       belongs where the other construct-target questions are asked, and from here it serves
+                       every shape: the operands to drop are whatever con_pop says, and the five the trap call
+                       needs are pushed at sp rather than written over the caller's slots, so the reshape no
+                       longer assumes the arguments are ON that stack. Trapless proxies resolve through to the
+                       ultimate target and fall into the arms below, so a consumer behind one is routed too. */
+                    JSValue px[5], ptgt = JS_UNDEFINED, resolved = JS_UNDEFINED;
+                    int px_ret = js_tramp_proxy_construct(ctx, con_func, con_ntgt, con_argc, con_args, px, &ptgt);
+                    while (px_ret == 2) {   /* no trap: construct the TARGET, which may itself be a proxy */
+                        JS_FreeValue(ctx, resolved);
+                        resolved = ptgt; ptgt = JS_UNDEFINED;
+                        con_func = resolved;
+                        px_ret = js_tramp_proxy_construct(ctx, con_func, con_ntgt, con_argc, con_args, px, &ptgt);
+                    }
+                    if (unlikely(px_ret < 0)) { JS_FreeValue(ctx, resolved); goto exception; }
+                    if (px_ret > 0) {
+                        DCHECK(!con_outer, "a step machine's Construct of a Proxy has no outer delivery on "
+                                           "CONT_PROXY_CONSTRUCT — build it before routing that shape here");
+                        JS_FreeValue(ctx, resolved);
+                        if (tramp_first == -2) {
+                            JSValue *cargv = sp - con_pop;
+                            for (i = -2; i < con_pop; i++) JS_FreeValue(ctx, cargv[i]);
+                            sp -= con_pop + 2;
+                        }
+                        if (con_args_owned) {
+                            free_arg_list(ctx, con_args_owned, con_argc); con_args_owned = NULL; con_args = NULL;
+                        }
+                        JS_FreeValue(ctx, con_super_ref); con_super_ref = JS_UNDEFINED;
+                        DCHECK(sp + 5 <= TRAMP_SP_LIMIT(sf),
+                               "proxy construct trap: operand reshape exceeds the frame's compiled stack_size");
+                        sp[0] = px[0]; sp[1] = px[1]; sp[2] = px[2]; sp[3] = px[3]; sp[4] = px[4];
+                        call_argv = (JSValueConst *)(sp + 2); call_argc = 3; sp += 5;
+                        tramp_first = -2; tramp_is_tail = 0;
+                        tramp_cont_state = NULL; tramp_cont_kind = CONT_PROXY_CONSTRUCT;
+                        goto do_tramp_call;
+                    }
+                    /* px_ret == 0: con_func is now the ultimate target — a bytecode ctor, a consumer builtin, a
+                       step machine, a plain C one. The arms below answer that, so the resolution keeps no copy
+                       of the question. What it does have to answer is WHO OWNS the resolved target: the arms
+                       BORROW con_func, so the reference has to live where a callee's already does. For a stack
+                       shape that is the callee operand — which is exactly why the old copy wrote it there. For a
+                       shapeless one (super(), a machine's Construct) it is con_super_ref, which IS the owned
+                       reference to con_func at those entries. */
+                    if (!JS_IsUndefined(resolved)) {
+                        if (tramp_first == -2) {
+                            JSValue *slot = sp - con_pop - 2;   /* the callee operand, under new_target and args */
+                            JS_FreeValue(ctx, *slot);
+                            *slot = resolved;
+                            con_func = *slot;
+                        } else {
+                            JS_FreeValue(ctx, con_super_ref);
+                            con_super_ref = resolved;
+                            con_func = resolved;
+                        }
+                    }
+                }
                 if (tramp_can_construct(con_func)) {
                     con_cargc = con_cargc_in;                 /* the body entry reads and resets it itself */
                     goto do_construct_tramp;                  /* a bytecode ctor: its body runs on this chain */
