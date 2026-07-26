@@ -1445,7 +1445,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_BIGINT_ASUINTN, STEPDEF_BIGINT_ASINTN,
     STEPDEF_OBJ_GOPD, STEPDEF_REFLECT_GOPD,
     STEPDEF_OBJ_VALUES, STEPDEF_OBJ_ENTRIES, STEPDEF_OBJ_ASSIGN, STEPDEF_OBJ_SPREAD,
-    STEPDEF_ARRAY_FLAT, STEPDEF_ARRAY_FLATMAP, STEPDEF_ARRAY_FROMLIKE, STEPDEF_ARRAY_WITH, STEPDEF_ARRAY_FILL, STEPDEF_ARRAY_COPYWITHIN,
+    STEPDEF_ARRAY_FLAT, STEPDEF_ARRAY_FLATMAP, STEPDEF_ARRAY_FROMLIKE, STEPDEF_ARRAY_WITH, STEPDEF_ARRAY_FILL, STEPDEF_ARRAY_COPYWITHIN, STEPDEF_BIGINT_CTOR,
     STEPDEF_MATH_ABS, STEPDEF_MATH_FLOOR, STEPDEF_MATH_CEIL, STEPDEF_MATH_ROUND, STEPDEF_MATH_SQRT, STEPDEF_MATH_ACOS, STEPDEF_MATH_ASIN, STEPDEF_MATH_ATAN, STEPDEF_MATH_COS, STEPDEF_MATH_EXP, STEPDEF_MATH_LOG, STEPDEF_MATH_SIN, STEPDEF_MATH_TAN, STEPDEF_MATH_TRUNC, STEPDEF_MATH_SIGN, STEPDEF_MATH_COSH, STEPDEF_MATH_SINH, STEPDEF_MATH_TANH, STEPDEF_MATH_ACOSH, STEPDEF_MATH_ASINH, STEPDEF_MATH_ATANH, STEPDEF_MATH_EXPM1, STEPDEF_MATH_LOG1P, STEPDEF_MATH_LOG2, STEPDEF_MATH_LOG10, STEPDEF_MATH_CBRT, STEPDEF_MATH_F16ROUND, STEPDEF_MATH_FROUND, STEPDEF_MATH_ATAN2, STEPDEF_MATH_POW, STEPDEF_MATH_MIN, STEPDEF_MATH_MAX, STEPDEF_MATH_HYPOT, STEPDEF_MATH_IMUL, STEPDEF_MATH_CLZ32, STEPDEF_STR_FROMCHARCODE, STEPDEF_STR_FROMCODEPOINT, STEPDEF_DATE_UTC,
     STEPDEF_REGEXP_EXEC, STEPDEF_REGEXP_TEST,
     STEPDEF_ITER_TAKE, STEPDEF_ITER_DROP,
@@ -17966,7 +17966,7 @@ typedef struct JSTrampStepDef {
        primitives in place. The body is not a legacy twin: with primitive arguments it has no user code left to
        reach, which is exactly what the declaration asserts, and it is the only implementation there is. */
     JSCFunctionType body;
-    uint8_t  body_proto;   /* JS_CFUNC_generic or JS_CFUNC_generic_magic */
+    uint8_t  body_proto;   /* JS_CFUNC_generic, _generic_magic or _constructor_or_func */
     int      body_magic;
     /* A VALIDATION the spec performs BEFORE the coercions — DataView's setters reject an immutable buffer
        before reading either argument, and test262 pins that ordering. It is part of the declaration because
@@ -51511,7 +51511,12 @@ static int js_primargs_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
        count to the body instead made every VARIADIC one see phantom undefined arguments, so `Math.max()` computed
        max(undefined, undefined) = NaN where the spec says -Infinity, `String.fromCharCode()` returned "\0" instead
        of "", and `Date.UTC(1970)` filled in five undefined fields and returned NaN. */
-    if (s->hdr.def->body_proto == JS_CFUNC_generic_magic) {
+    if (s->hdr.def->body_proto == JS_CFUNC_constructor_or_func) {
+        /* A builtin that is BOTH callable and a constructor (BigInt) whose only user code is its argument's
+           ToPrimitive. The step-ctor reshape already passes new_target where a method passes `this`, which is
+           exactly this prototype's first parameter, so the declaration needs nothing construct-aware. */
+        s->result = s->hdr.def->body.generic(ctx, s->hdr.this_val, s->hdr.argc, (JSValueConst *)s->argp);
+    } else if (s->hdr.def->body_proto == JS_CFUNC_generic_magic) {
         s->result = s->hdr.def->body.generic_magic(ctx, s->hdr.this_val, s->hdr.argc,
                                                    (JSValueConst *)s->argp, s->hdr.def->body_magic);
     } else {
@@ -54243,6 +54248,13 @@ static const JSTrampStepDef js_array_at_def     = { sizeof(JSArrayAt), js_array_
 static const JSTrampStepDef js_array_with_def   = { sizeof(JSArrayWith), js_array_with_step, js_array_with_fini, 0 };
 static const JSTrampStepDef js_array_fill_def   = { sizeof(JSArrayFill), js_array_fill_step, js_array_fill_fini, 0 };
 static const JSTrampStepDef js_array_copyWithin_def = { sizeof(JSArrayCopyWithin), js_array_copywithin_step, js_array_copywithin_fini, 0 };
+static JSValue js_bigint_constructor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv);
+/* 21.2.1.1 BigInt(value): its ONLY user code is step 2's ToPrimitive on the argument — everything after runs on a
+   primitive. It is callable AND a constructor (which throws), which is what the constructor_or_func body
+   prototype is for. */
+static const JSTrampStepDef js_bigint_ctor_def =
+    { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, PRIMARGS(0x1, HINT_NUMBER, 1),
+      { .generic = js_bigint_constructor }, JS_CFUNC_constructor_or_func, 0, NULL, NULL, NULL };
 static const JSTrampStepDef js_array_indexOf_def     = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_INDEXOF };
 static const JSTrampStepDef js_array_lastIndexOf_def = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_LASTINDEXOF };
 static const JSTrampStepDef js_array_includes_def    = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_INCLUDES };
@@ -54393,6 +54405,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_ARRAY_WITH]    = &js_array_with_def,
     [STEPDEF_ARRAY_FILL]    = &js_array_fill_def,
     [STEPDEF_ARRAY_COPYWITHIN] = &js_array_copyWithin_def,
+    [STEPDEF_BIGINT_CTOR]   = &js_bigint_ctor_def,
     [STEPDEF_ARRAY_INDEXOF]     = &js_array_indexOf_def,
     [STEPDEF_ARRAY_LASTINDEXOF] = &js_array_lastIndexOf_def,
     [STEPDEF_ARRAY_INCLUDES]    = &js_array_includes_def,
@@ -70045,7 +70058,7 @@ int JS_AddIntrinsicBigInt(JSContext *ctx)
     JSValue obj1;
 
     obj1 = JS_NewCConstructor(ctx, JS_CLASS_BIG_INT, "BigInt",
-                              js_bigint_constructor, 1, JS_CFUNC_constructor_or_func, 0,
+                              js_bigint_constructor, 1, JS_CFUNC_step_ctor, STEPDEF_BIGINT_CTOR,
                               JS_UNDEFINED,
                               js_bigint_funcs, countof(js_bigint_funcs),
                               js_bigint_proto_funcs, countof(js_bigint_proto_funcs),
