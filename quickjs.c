@@ -1435,7 +1435,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_ARRAY_INDEXOF, STEPDEF_ARRAY_LASTINDEXOF, STEPDEF_ARRAY_INCLUDES,
     STEPDEF_STR_TRIM, STEPDEF_STR_TRIMSTART, STEPDEF_STR_TRIMEND, STEPDEF_STR_AT, STEPDEF_STR_CODEPOINTAT,
     STEPDEF_STR_SUBSTRING, STEPDEF_STR_INDEXOF, STEPDEF_STR_LASTINDEXOF, STEPDEF_STR_NORMALIZE,
-    STEPDEF_STR_CHARAT, STEPDEF_STR_CHARCODEAT,
+    STEPDEF_STR_CHARAT, STEPDEF_STR_CHARCODEAT, STEPDEF_STR_SLICE, STEPDEF_STR_SUBSTR, STEPDEF_STR_REPEAT,
     STEPDEF_TA_AT, STEPDEF_TA_SET, STEPDEF_JSON_RAWJSON,
     STEPDEF_OBJ_DEFINEPROPERTY, STEPDEF_REFLECT_DEFINEPROPERTY,
     STEPDEF_PARSEINT, STEPDEF_PARSEFLOAT, STEPDEF_STR_SPLIT,
@@ -20108,7 +20108,8 @@ typedef struct JSTAIdx {
 enum { STRRECV_TRIM_START = 1, STRRECV_TRIM_END = 2, STRRECV_TRIM_BOTH = 3,
        STRRECV_AT, STRRECV_CODEPOINTAT, STRRECV_SUBSTRING,
        STRRECV_INDEXOF, STRRECV_LASTINDEXOF, STRRECV_NORMALIZE,
-       STRRECV_CHARAT, STRRECV_CHARCODEAT };
+       STRRECV_CHARAT, STRRECV_CHARCODEAT,
+       STRRECV_SLICE, STRRECV_SUBSTR, STRRECV_REPEAT };
 typedef struct JSStrRecv {
     JSStepHdr hdr;
     JSValue str;          /* the receiver as a string (owned) */
@@ -53978,6 +53979,9 @@ static const JSTrampStepDef js_str_lastIndexOf_def= { sizeof(JSStrRecv), js_str_
 static const JSTrampStepDef js_str_normalize_def  = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_NORMALIZE };
 static const JSTrampStepDef js_str_charAt_def     = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_CHARAT };
 static const JSTrampStepDef js_str_charCodeAt_def = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_CHARCODEAT };
+static const JSTrampStepDef js_str_slice_def      = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_SLICE };
+static const JSTrampStepDef js_str_substr_def     = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_SUBSTR };
+static const JSTrampStepDef js_str_repeat_def     = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_REPEAT };
 static const JSTrampStepDef js_ta_at_def          = { sizeof(JSTAIdx), js_ta_idx_step, js_ta_idx_fini, TAIDX_AT };
 static const JSTrampStepDef js_ta_set_def         = { sizeof(JSTAIdx), js_ta_idx_step, js_ta_idx_fini, TAIDX_SET };
 static const JSTrampStepDef js_json_raw_def       = { sizeof(JSJsonRaw), js_json_raw_step, js_json_raw_fini, 0 };
@@ -54115,6 +54119,9 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_STR_AT]          = &js_str_at_def,
     [STEPDEF_STR_CODEPOINTAT] = &js_str_codePointAt_def,
     [STEPDEF_STR_SUBSTRING]   = &js_str_substring_def,
+    [STEPDEF_STR_SLICE]       = &js_str_slice_def,
+    [STEPDEF_STR_SUBSTR]      = &js_str_substr_def,
+    [STEPDEF_STR_REPEAT]      = &js_str_repeat_def,
     [STEPDEF_STR_INDEXOF]     = &js_str_indexOf_def,
     [STEPDEF_STR_LASTINDEXOF] = &js_str_lastIndexOf_def,
     [STEPDEF_STR_NORMALIZE]   = &js_str_normalize_def,
@@ -57305,6 +57312,16 @@ static int JS_ToUTF32String(JSContext *ctx, uint32_t **pbuf, JSValue val1);
 static JSValue JS_NewUTF32String(JSContext *ctx, const uint32_t *buf, int len);
 
 /* JS_ToInt32Clamp(v, 0, len, 0)'s arithmetic once its ToInt32Sat half is a step. */
+/* JS_ToInt32Clamp's shape: a negative index is relative to `neg_off` (the string length for slice/substr's start,
+   zero for a plain length), then the result is clamped into [0, hi]. */
+static int str_clamp_off(int64_t v, int hi, int neg_off)
+{
+    if (v < 0) v += neg_off;
+    if (v < 0) v = 0;
+    else if (v > hi) v = hi;
+    return (int)v;
+}
+
 static int str_clamp(int64_t v, int len)
 {
     if (v < 0) v = 0;
@@ -57336,6 +57353,7 @@ static int js_str_recv_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
         switch (mode) {
         case STRRECV_AT: case STRRECV_CODEPOINTAT: case STRRECV_SUBSTRING:
         case STRRECV_CHARAT: case STRRECV_CHARCODEAT:
+        case STRRECV_SLICE: case STRRECV_SUBSTR: case STRRECV_REPEAT:
             r = step_toint64_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->idx, out_cb, out_argc);
             cb_result = JS_UNDEFINED;
             if (r) return r < 0 ? -1 : r;
@@ -57363,7 +57381,7 @@ static int js_str_recv_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
     if (s->hdr.stage == 2) {
         s->idx2 = len;
         s->dpos = 0;
-        if (mode == STRRECV_SUBSTRING) {
+        if (mode == STRRECV_SUBSTRING || mode == STRRECV_SLICE || mode == STRRECV_SUBSTR) {
             if (!JS_IsUndefined(step_arg(&s->hdr, 1))) {
                 r = step_toint64_run(ctx, &s->hdr, s->hdr.argv[1], cb_result, &s->idx2, out_cb, out_argc);
                 cb_result = JS_UNDEFINED;
@@ -57419,6 +57437,42 @@ static int js_str_recv_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
         a = str_clamp(s->idx, len);
         b = JS_IsUndefined(step_arg(&s->hdr, 1)) ? len : str_clamp(s->idx2, len);
         s->result = js_sub_string(ctx, p, a < b ? a : b, a < b ? b : a);
+        return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
+    }
+    if (mode == STRRECV_SLICE || mode == STRRECV_SUBSTR) {
+        /* 22.1.3.22 slice / B.2.2.1 substr: the SAME two coercions as substring in the same order, differing only
+           in how the pair is clamped — slice takes [start, end) with a negative index relative to the end, substr
+           takes [start, start+length). The C bodies did both JS_ToInt32Clamp calls from a C entry, which is where
+           `"abc".slice({valueOf(){ while(x){} }})` preempted with no flow base. */
+        a = str_clamp_off(s->idx, len, len);
+        if (mode == STRRECV_SLICE) {
+            b = JS_IsUndefined(step_arg(&s->hdr, 1)) ? len : str_clamp_off(s->idx2, len, len);
+            if (b < a) b = a;
+        } else {
+            b = a + (JS_IsUndefined(step_arg(&s->hdr, 1)) ? len - a : str_clamp_off(s->idx2, len - a, 0));
+        }
+        s->result = js_sub_string(ctx, p, a, b);
+        return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
+    }
+    if (mode == STRRECV_REPEAT) {
+        /* 22.1.3.16: ToIntegerOrInfinity(count), then the RangeError, then the build. Only the coercion is the
+           page's code; everything after it is arithmetic on a string this machine already holds. */
+        StringBuffer rb_s, *rb = &rb_s;
+        int64_t cnt = s->idx;
+        if (cnt < 0 || cnt > INT32_MAX)
+            return JS_ThrowRangeError(ctx, "invalid repeat count"), -1;
+        if (len == 0 || cnt == 1) { s->result = js_dup(s->str); return 0; }
+        if (cnt * len > JS_STRING_LEN_MAX)
+            return JS_ThrowRangeError(ctx, "invalid string length"), -1;
+        if (string_buffer_init2(ctx, rb, (int)(cnt * len), p->is_wide_char))
+            return -1;
+        if (len == 1) {
+            string_buffer_fill(rb, string_get(p, 0), (int)cnt);
+        } else {
+            int64_t k;
+            for (k = 0; k < cnt; k++) string_buffer_concat(rb, p, 0, len);
+        }
+        s->result = string_buffer_end(rb);
         return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
     }
     if (mode == STRRECV_INDEXOF || mode == STRRECV_LASTINDEXOF) {
@@ -58365,61 +58419,7 @@ static JSValue js_str_split_fini(JSContext *ctx, void *st, bool take_result)
 }
 
 
-static JSValue js_string_substr(JSContext *ctx, JSValueConst this_val,
-                                int argc, JSValueConst *argv)
-{
-    JSValue str, ret;
-    int a, len, n;
-    JSString *p;
 
-    str = JS_ToStringCheckObject(ctx, this_val);
-    if (JS_IsException(str))
-        return str;
-    p = JS_VALUE_GET_STRING(str);
-    len = p->len;
-    if (JS_ToInt32Clamp(ctx, &a, argv[0], 0, len, len)) {
-        JS_FreeValue(ctx, str);
-        return JS_EXCEPTION;
-    }
-    n = len - a;
-    if (!JS_IsUndefined(argv[1])) {
-        if (JS_ToInt32Clamp(ctx, &n, argv[1], 0, len - a, 0)) {
-            JS_FreeValue(ctx, str);
-            return JS_EXCEPTION;
-        }
-    }
-    ret = js_sub_string(ctx, p, a, a + n);
-    JS_FreeValue(ctx, str);
-    return ret;
-}
-
-static JSValue js_string_slice(JSContext *ctx, JSValueConst this_val,
-                               int argc, JSValueConst *argv)
-{
-    JSValue str, ret;
-    int len, start, end;
-    JSString *p;
-
-    str = JS_ToStringCheckObject(ctx, this_val);
-    if (JS_IsException(str))
-        return str;
-    p = JS_VALUE_GET_STRING(str);
-    len = p->len;
-    if (JS_ToInt32Clamp(ctx, &start, argv[0], 0, len, len)) {
-        JS_FreeValue(ctx, str);
-        return JS_EXCEPTION;
-    }
-    end = len;
-    if (!JS_IsUndefined(argv[1])) {
-        if (JS_ToInt32Clamp(ctx, &end, argv[1], 0, len, len)) {
-            JS_FreeValue(ctx, str);
-            return JS_EXCEPTION;
-        }
-    }
-    ret = js_sub_string(ctx, p, start, max_int(end, start));
-    JS_FreeValue(ctx, str);
-    return ret;
-}
 
 static JSValue js_string_pad(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv, int padEnd)
@@ -58492,49 +58492,6 @@ fail1:
     return JS_EXCEPTION;
 }
 
-static JSValue js_string_repeat(JSContext *ctx, JSValueConst this_val,
-                                int argc, JSValueConst *argv)
-{
-    JSValue str;
-    StringBuffer b_s, *b = &b_s;
-    JSString *p;
-    int64_t val;
-    int n, len;
-
-    str = JS_ToStringCheckObject(ctx, this_val);
-    if (JS_IsException(str))
-        goto fail;
-    if (JS_ToInt64Sat(ctx, &val, argv[0]))
-        goto fail;
-    if (val < 0 || val > 2147483647) {
-        JS_ThrowRangeError(ctx, "invalid repeat count");
-        goto fail;
-    }
-    n = val;
-    p = JS_VALUE_GET_STRING(str);
-    len = p->len;
-    if (len == 0 || n == 1)
-        return str;
-    if (val * len > JS_STRING_LEN_MAX) {
-        JS_ThrowRangeError(ctx, "invalid string length");
-        goto fail;
-    }
-    if (string_buffer_init2(ctx, b, n * len, p->is_wide_char))
-        goto fail;
-    if (len == 1) {
-        string_buffer_fill(b, string_get(p, 0), n);
-    } else {
-        while (n-- > 0) {
-            string_buffer_concat(b, p, 0, len);
-        }
-    }
-    JS_FreeValue(ctx, str);
-    return string_buffer_end(b);
-
-fail:
-    JS_FreeValue(ctx, str);
-    return JS_EXCEPTION;
-}
 
 
 /* return 0 if before the first char */
@@ -58876,9 +58833,9 @@ static const JSCFunctionListEntry js_string_proto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("search", 1, js_string_match, JS_ATOM_Symbol_search ),
     JS_CFUNC_STEP_DEF("split", 2, STEPDEF_STR_SPLIT ),
     JS_CFUNC_STEP_DEF("substring", 2, STEPDEF_STR_SUBSTRING ),
-    JS_CFUNC_DEF("substr", 2, js_string_substr ),
-    JS_CFUNC_DEF("slice", 2, js_string_slice ),
-    JS_CFUNC_DEF("repeat", 1, js_string_repeat ),
+    JS_CFUNC_STEP_DEF("substr", 2, STEPDEF_STR_SUBSTR ),
+    JS_CFUNC_STEP_DEF("slice", 2, STEPDEF_STR_SLICE ),
+    JS_CFUNC_STEP_DEF("repeat", 1, STEPDEF_STR_REPEAT ),
     JS_CFUNC_STEP_DEF("replace", 2, STEPDEF_STR_REPLACE ),
     JS_CFUNC_STEP_DEF("replaceAll", 2, STEPDEF_STR_REPLACE_ALL ),
     JS_CFUNC_MAGIC_DEF("padEnd", 1, js_string_pad, 1 ),
