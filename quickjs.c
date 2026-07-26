@@ -17550,90 +17550,6 @@ static bool js_get_fast_array(JSContext *ctx, JSValue obj,
     return false;
 }
 
-static __exception int js_append_enumerate(JSContext *ctx, JSValue *sp)
-{
-    JSValue iterator, enumobj, method, value;
-    int is_array_iterator;
-    JSValue *arrp;
-    uint32_t i, count32, pos;
-
-    if (JS_VALUE_GET_TAG(sp[-2]) != JS_TAG_INT) {
-        JS_ThrowInternalError(ctx, "invalid index for append");
-        return -1;
-    }
-
-    pos = JS_VALUE_GET_INT(sp[-2]);
-
-    /* XXX: further optimisations:
-       - use ctx->array_proto_values?
-       - check if array_iterator_prototype next method is built-in and
-         avoid constructing actual iterator object?
-       - build this into js_for_of_start and use in all `for (x of o)` loops
-     */
-    iterator = JS_GetProperty(ctx, sp[-1], JS_ATOM_Symbol_iterator);
-    if (JS_IsException(iterator))
-        return -1;
-    /* Used to squelch a -Wcast-function-type warning. */
-    JSCFunctionType ft = { .generic_magic = js_create_array_iterator };
-    is_array_iterator = JS_IsCFunction(ctx, iterator,
-                                       ft.generic,
-                                       JS_ITERATOR_KIND_VALUE);
-    JS_FreeValue(ctx, iterator);
-
-    enumobj = JS_GetIterator(ctx, sp[-1], false);
-    if (JS_IsException(enumobj))
-        return -1;
-    method = JS_GetProperty(ctx, enumobj, JS_ATOM_next);
-    if (JS_IsException(method)) {
-        JS_FreeValue(ctx, enumobj);
-        return -1;
-    }
-    /* Used to squelch a -Wcast-function-type warning. */
-    JSCFunctionType ft2 = { .iterator_next = js_array_iterator_next };
-    if (is_array_iterator
-            &&  JS_IsCFunction(ctx, method, ft2.generic, 0)
-            &&  js_get_fast_array(ctx, sp[-1], &arrp, &count32)) {
-        uint32_t len;
-        if (js_get_length32(ctx, &len, sp[-1]))
-            goto exception;
-        /* if len > count32, the elements >= count32 might be read in
-           the prototypes and might have side effects */
-        if (len != count32)
-            goto general_case;
-        /* Handle fast arrays explicitly */
-        for (i = 0; i < count32; i++) {
-            if (JS_DefinePropertyValueUint32(ctx, sp[-3], pos++,
-                                             js_dup(arrp[i]), JS_PROP_C_W_E) < 0)
-                goto exception;
-        }
-    } else {
-    general_case:
-        for (;;) {
-            int done;
-            value = JS_IteratorNext(ctx, enumobj, method, 0, NULL, &done);
-            if (JS_IsException(value))
-                goto exception;
-            if (done) {
-                /* value is JS_UNDEFINED */
-                break;
-            }
-            if (JS_DefinePropertyValueUint32(ctx, sp[-3], pos++, value, JS_PROP_C_W_E) < 0)
-                goto exception;
-        }
-    }
-    /* Note: could raise an error if too many elements */
-    sp[-2] = js_int32(pos);
-    JS_FreeValue(ctx, enumobj);
-    JS_FreeValue(ctx, method);
-    return 0;
-
-exception:
-    JS_IteratorClose(ctx, enumobj, true);
-    JS_FreeValue(ctx, enumobj);
-    JS_FreeValue(ctx, method);
-    return -1;
-}
-
 /* only valid inside C functions */
 static JSValueConst JS_GetActiveFunction(JSContext *ctx)
 {
@@ -19251,6 +19167,59 @@ static JSValue js_iterator_from(JSContext *ctx, JSValueConst this_val, int argc,
 typedef enum { ITERAT_DECLINE = 0, ITERAT_FOUND, ITERAT_ABSENT } JSIterAtState;
 static JSIterAtState iter_data_at_iterator(JSContext *ctx, JSValueConst items, JSValue *out);
 static bool tramp_can_call_gen_create(JSValueConst func);
+/* The same question for ANY key, on an object that is already an object: walk the prototype chain reading only OWN
+   DATA properties. Both users need exactly this and neither may run user code to get it — the @@iterator probe
+   above decides which algorithm a consumer takes, and the spread's fast-array check decides whether the built-in
+   iteration protocol is still in place. */
+static JSIterAtState data_method_at(JSContext *ctx, JSObject *p, JSAtom atom, JSValue *out);
+/* [...src] over a FAST ARRAY still using the built-in iteration protocol. This is a DIFFERENT ALGORITHM from the
+   consume machine, not a fallback for it: the built-in @@iterator and %ArrayIteratorPrototype%.next invoke nothing,
+   so the whole protocol is observationally a slot copy and entering it is work with no semantics in it. Every
+   precondition is decided WITHOUT running user code, and a source failing any of them is simply not this algorithm
+   — it acquires on the tramp like everything else. Returns 1 = appended, 0 = not this algorithm, -1 = exception. */
+static int js_append_fast_array(JSContext *ctx, JSValue *sp);
+static int js_append_fast_array(JSContext *ctx, JSValue *sp)
+{
+    JSCFunctionType at_it = { .generic_magic = js_create_array_iterator };
+    JSCFunctionType it_next = { .iterator_next = js_array_iterator_next };
+    JSValue m, it;
+    JSValue *arrp;
+    uint32_t i, count32, len, pos;
+    bool pristine;
+
+    DCHECK(JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_INT, "OP_append's position operand is an int");
+    if (JS_VALUE_GET_TAG(sp[-1]) != JS_TAG_OBJECT) return 0;
+    if (!js_get_fast_array(ctx, sp[-1], &arrp, &count32)) return 0;
+    if (js_get_length32(ctx, &len, sp[-1])) return -1;   /* an own JS_PROP_LENGTH read: no user code */
+    /* a length past the dense part means the tail elements are read through the PROTOTYPE, which can be an
+       accessor — the protocol is then observable and this is not the algorithm */
+    if (len != count32) return 0;
+    if (data_method_at(ctx, JS_VALUE_GET_OBJ(sp[-1]), JS_ATOM_Symbol_iterator, &m) != ITERAT_FOUND) return 0;
+    pristine = JS_IsCFunction(ctx, m, at_it.generic, JS_ITERATOR_KIND_VALUE);
+    JS_FreeValue(ctx, m);
+    if (!pristine) return 0;
+    /* WHOSE %ArrayIteratorPrototype% is in play is decided by the @@iterator that just proved built-in, not by this
+       realm — a cross-realm Array.prototype[@@iterator] produces an iterator from ITS realm, whose .next may be the
+       patched one. Creating the iterator answers that exactly and runs no user code; a route re-creates it, which is
+       unobservable for the same reason. */
+    it = js_create_array_iterator(ctx, sp[-1], 0, NULL, JS_ITERATOR_KIND_VALUE);
+    if (JS_IsException(it)) return -1;
+    pristine = (data_method_at(ctx, JS_VALUE_GET_OBJ(it), JS_ATOM_next, &m) == ITERAT_FOUND)
+               && JS_IsCFunction(ctx, m, it_next.generic, 0);
+    JS_FreeValue(ctx, m);   /* the walk OWNS what it found on every answer, and && stops short of the found one */
+    JS_FreeValue(ctx, it);
+    if (!pristine) return 0;
+
+    /* re-read the dense storage: the allocation above may have run the GC */
+    if (!js_get_fast_array(ctx, sp[-1], &arrp, &count32)) return 0;
+    pos = JS_VALUE_GET_INT(sp[-2]);
+    for (i = 0; i < count32; i++) {
+        if (JS_DefinePropertyValueUint32(ctx, sp[-3], pos++, js_dup(arrp[i]), JS_PROP_C_W_E) < 0)
+            return -1;
+    }
+    sp[-2] = js_int32(pos);
+    return 1;
+}
 /* Iterator.from — EVERY argument, including a primitive and a non-iterable. There is nothing left to SELECT: the
    tramp arm performs the whole of 27.1.3.1 (its TypeErrors included) and the C entry DFAILs, so the only thing
    this does is pass the side-effect-free @@iterator probe along for the acquire to use. Its ABSENCE is the
@@ -23873,9 +23842,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 if (st == 0) {   /* DONE */
                     if (s->sink == ITERCONS_SPREAD) {
-                        /* [...gen] (OP_append): the elements were appended to s->r == the caller-stack array at
-                           sp[-3] (same object). Match js_append_enumerate + OP_append's tail: write the new position
-                           back to sp[-2], drop the iterable at sp[-1], and pop it. r/iter are the state's own refs. */
+                        /* [...src] (OP_append): the elements were appended to s->r == the caller-stack array at
+                           sp[-3] (same object). Finish as OP_append's own tail does: write the new position back to
+                           sp[-2], drop the iterable at sp[-1], and pop it. */
                         int64_t n = s->k;
                         js_iter_consume_end(ctx, s); js_free_rt(rt, s);
                         sp[-2] = js_int32((int32_t)n);
@@ -27424,15 +27393,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_append):    /* array pos enumobj -- array pos */
             {
                 sf->cur_pc = pc;
-                /* [...iterable]: consume on THIS chain (the .next() body suspend/resumes) rather than the C-recursion
-                   drive-to-completion js_append_enumerate's loop would use — WHEN the iterator will be a generator/
-                   helper (the ONE shared side-effect-free gate). Plain-C iterables (arrays/sets) + array-likes stay on
-                   the C js_append_enumerate path. */
-                if (iter_consume_gen_backed(ctx, sp[-1], &tramp_iter_getiter))
-                    goto do_spread_consume_tramp;
-                if (js_append_enumerate(ctx, sp))
-                    goto exception;
-                JS_FreeValue(ctx, *--sp);
+                /* [...iterable]: ONE C algorithm remains here, and it is not an iteration — a fast array whose
+                   protocol is still entirely built-in is copied slot by slot, invoking nothing. EVERY other source
+                   acquires @@iterator on the tramp and consumes there, so a getter or Proxy @@iterator, a patched
+                   %ArrayIteratorPrototype%.next, a Set/Map/string/arguments iterator and a plain object iterator all
+                   run their bodies on this chain and park at any depth. The old gate asked whether the iterator
+                   would be a GENERATOR and handed everything else to a C .next() loop, which is a drive-to-completion
+                   for exactly the patched-next case it could not see. */
+                {
+                    int fa = js_append_fast_array(ctx, sp);
+                    if (unlikely(fa < 0)) goto exception;
+                    if (fa) { JS_FreeValue(ctx, *--sp); BREAK; }
+                }
+                tramp_iter_getiter = JS_UNDEFINED;   /* the acquire performs the real GetMethod on the tramp */
+                goto do_spread_consume_tramp;
             }
             BREAK;
 
@@ -52446,12 +52420,21 @@ static JSIterAtState iter_data_at_iterator(JSContext *ctx, JSValueConst items, J
         if (JS_IsException(boxed)) return ITERAT_DECLINE;
         p = JS_VALUE_GET_OBJ(boxed);
     }
+    st = data_method_at(ctx, p, JS_ATOM_Symbol_iterator, out);
+    JS_FreeValue(ctx, boxed);
+    return st;
+}
+
+static JSIterAtState data_method_at(JSContext *ctx, JSObject *p, JSAtom atom, JSValue *out)
+{
+    JSIterAtState st = ITERAT_ABSENT;   /* a walk that finds nothing on the whole chain HAS its answer */
+    *out = JS_UNDEFINED;
     for (; p != NULL; p = p->shape->proto) {
         JSPropertyDescriptor desc;
         int ret;
-        if (p->class_id == JS_CLASS_PROXY) { st = ITERAT_DECLINE; break; }   /* an own-property query IS a trap */
-        ret = JS_GetOwnPropertyInternal(ctx, &desc, p, JS_ATOM_Symbol_iterator);
-        if (ret < 0) { st = ITERAT_DECLINE; break; }
+        if (p->class_id == JS_CLASS_PROXY) return ITERAT_DECLINE;   /* an own-property query IS a trap */
+        ret = JS_GetOwnPropertyInternal(ctx, &desc, p, atom);
+        if (ret < 0) return ITERAT_DECLINE;
         if (ret) {
             if (desc.flags & JS_PROP_GETSET) {
                 st = ITERAT_DECLINE;   /* a GETTER is user code: reading it is the acquire's job, not this probe's */
@@ -52465,20 +52448,19 @@ static JSIterAtState iter_data_at_iterator(JSContext *ctx, JSValueConst items, J
             break;
         }
     }
-    JS_FreeValue(ctx, boxed);
     return st;
 }
 
-/* The gate for the consumers that do NOT have a recognizer of their own — the array-literal and call SPREAD
-   (OP_append) and new TypedArray(iterable). *out_getiter = the @@iterator method (owned) for the consume tramp.
-   It accepts a generator/helper source, and any callable @@iterator that is not a BUILT-IN C function: a built-in
-   @@iterator yields a built-in iterator whose .next() is C and invokes nothing, so there is no user body to suspend
-   and js_append_enumerate's fast-array copy is a different algorithm rather than a fallback.
+/* The remaining narrow gate: new Set(iterable) / new Map(iterable), whose C constructor loop still drives the
+   argument's .next(). *out_getiter = the @@iterator method (owned) for the consume tramp. It accepts a
+   generator/helper source and any callable @@iterator that is not a BUILT-IN C function, and REFUSES the shapes the
+   probe cannot read side-effect-free (a getter, a Proxy) plus a built-in @@iterator — whose iterator's .next() may
+   still be patched, which is precisely what this cannot see.
+   That refusal is a FALLBACK to js_map_constructor's loop, not a different algorithm, so it is the next widening:
+   the spread lost its equivalent by routing everything that is not the fast-array slot copy, and the same move
+   applies here once new Set/new Map's collect is a phase of the consume machine rather than a C loop.
    (This once read "GENERATOR-BACKED sources only", recording that broadening it had regressed 12 tests. That note
-   described the state before the consume machine could acquire on the tramp; Array.from and Object.fromEntries have
-   their own recognizers accepting any callable @@iterator now, and the widening here landed green. What is still
-   refused is the shape the probe cannot READ without invoking something — a getter, a proxy — which is the
-   named-unbuilt tramp acquire, not a semantics gap.) */
+   described the state before the consume machine could acquire on the tramp.) */
 static bool iter_consume_gen_backed(JSContext *ctx, JSValueConst items, JSValue *out_getiter)
 {
     JSValue m;
@@ -52494,12 +52476,10 @@ static bool iter_consume_gen_backed(JSContext *ctx, JSValueConst items, JSValue 
         }
     }
     /* A NON-BUILT-IN callable @@iterator: the iterator it returns is user code, so its .next() body must run on the
-       chain. This is the widening that made `[...{[Symbol.iterator](){ return {next(){…loop…}} }}]` work — before it,
-       only a GENERATOR-backed source routed and a plain object iterator drove to completion in C. What stays behind
-       is not a fallback: a BUILT-IN @@iterator (array/string/Set/Map/arguments) yields a built-in iterator whose
-       .next() is C, so there is no user body to suspend, and js_append_enumerate's fast-array case is a different
-       algorithm entirely (copy the slots, invoke nothing). A user who PATCHES a built-in iterator's .next is the one
-       remaining shape this cannot see side-effect-free, and it is reached only through the C entry. */
+       chain. A BUILT-IN @@iterator is refused here because this cannot see whether the iterator's .next is still the
+       built-in one — `%ArrayIteratorPrototype%.next = function(){…}` is invisible to a probe of @@iterator alone.
+       The spread answers that exactly by CREATING the built-in iterator (which runs nothing) and probing ITS .next;
+       doing the same here is part of the same widening. */
     if (JS_IsFunction(ctx, m)
         && !(JS_VALUE_GET_TAG(m) == JS_TAG_OBJECT
              && JS_VALUE_GET_OBJ(m)->class_id == JS_CLASS_C_FUNCTION)) {
