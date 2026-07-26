@@ -1445,7 +1445,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_BIGINT_ASUINTN, STEPDEF_BIGINT_ASINTN,
     STEPDEF_OBJ_GOPD, STEPDEF_REFLECT_GOPD,
     STEPDEF_OBJ_VALUES, STEPDEF_OBJ_ENTRIES, STEPDEF_OBJ_ASSIGN, STEPDEF_OBJ_SPREAD,
-    STEPDEF_ARRAY_FLAT, STEPDEF_ARRAY_FLATMAP, STEPDEF_ARRAY_FROMLIKE,
+    STEPDEF_ARRAY_FLAT, STEPDEF_ARRAY_FLATMAP, STEPDEF_ARRAY_FROMLIKE, STEPDEF_ARRAY_WITH,
     STEPDEF_MATH_ABS, STEPDEF_MATH_FLOOR, STEPDEF_MATH_CEIL, STEPDEF_MATH_ROUND, STEPDEF_MATH_SQRT, STEPDEF_MATH_ACOS, STEPDEF_MATH_ASIN, STEPDEF_MATH_ATAN, STEPDEF_MATH_COS, STEPDEF_MATH_EXP, STEPDEF_MATH_LOG, STEPDEF_MATH_SIN, STEPDEF_MATH_TAN, STEPDEF_MATH_TRUNC, STEPDEF_MATH_SIGN, STEPDEF_MATH_COSH, STEPDEF_MATH_SINH, STEPDEF_MATH_TANH, STEPDEF_MATH_ACOSH, STEPDEF_MATH_ASINH, STEPDEF_MATH_ATANH, STEPDEF_MATH_EXPM1, STEPDEF_MATH_LOG1P, STEPDEF_MATH_LOG2, STEPDEF_MATH_LOG10, STEPDEF_MATH_CBRT, STEPDEF_MATH_F16ROUND, STEPDEF_MATH_FROUND, STEPDEF_MATH_ATAN2, STEPDEF_MATH_POW, STEPDEF_MATH_MIN, STEPDEF_MATH_MAX, STEPDEF_MATH_HYPOT, STEPDEF_MATH_IMUL, STEPDEF_MATH_CLZ32, STEPDEF_STR_FROMCHARCODE, STEPDEF_STR_FROMCODEPOINT, STEPDEF_DATE_UTC,
     STEPDEF_REGEXP_EXEC, STEPDEF_REGEXP_TEST,
     STEPDEF_ITER_TAKE, STEPDEF_ITER_DROP,
@@ -19879,6 +19879,19 @@ typedef struct JSArrayAt {
     JSValue result;       /* DONE (owned) */
     int64_t len, idx;
 } JSArrayAt;
+
+/* Array.prototype.with, 23.1.3.39. Its prologue is JSArrayAt's — ToObject, LengthOfArrayLike,
+   ToIntegerOrInfinity(index) — and then every element is READ, which on an accessor or a Proxy source is the
+   page's code. js_array_with did all of it from a C entry, so `[1,2].with({valueOf(){ while(x){} }}, 0)` and a
+   looping index getter both preempted with no flow base. The FAST-ARRAY case is a different algorithm, not a
+   fallback: dense slots copied straight across, invoking nothing. */
+typedef struct JSArrayWith {
+    JSStepHdr hdr;        /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    JSValue obj;          /* ToObject(this) (owned) */
+    JSValue arr;          /* the result being built (owned) */
+    JSValue el;           /* the element held across its read (owned) */
+    int64_t len, idx, i;
+} JSArrayWith;
 
 /* Object.values / Object.entries: EnumerableOwnProperties (7.3.23) — snapshot the own keys, then READ each one.
    Every read is the page's code (an accessor, a Proxy `get` trap) and JS_GetOwnPropertyNames2 performed it with
@@ -53004,63 +53017,96 @@ static JSValue js_array_at_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
-static JSValue js_array_with(JSContext *ctx, JSValueConst this_val,
-                             int argc, JSValueConst *argv)
+static int js_array_with_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    JSValue arr, obj, ret, *arrp, *pval;
-    JSObject *p;
-    int64_t i, len, idx;
-    uint32_t count32;
+    JSArrayWith *s = st;
+    int r;
 
-    ret = JS_EXCEPTION;
-    arr = JS_UNDEFINED;
-    obj = JS_ToObject(ctx, this_val);
-    if (js_get_length64(ctx, &len, obj))
-        goto exception;
-
-    if (JS_ToInt64Sat(ctx, &idx, argv[0]))
-        goto exception;
-
-    if (idx < 0)
-        idx = len + idx;
-
-    if (idx < 0 || idx >= len) {
-        JS_ThrowRangeError(ctx, "invalid array index: %" PRId64, idx);
-        goto exception;
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
+        s->obj = JS_UNDEFINED; s->arr = JS_UNDEFINED; s->el = JS_UNDEFINED;
+        s->len = 0; s->idx = 0; s->i = 0;
+        s->obj = JS_ToObject(ctx, s->hdr.this_val);
+        if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
+        s->hdr.stage = 1;
     }
-
-    arr = js_allocate_fast_array(ctx, len);
-    if (JS_IsException(arr))
-        goto exception;
-
-    p = JS_VALUE_GET_OBJ(arr);
-    i = 0;
-    pval = p->u.array.u.values;
-    if (js_get_fast_array(ctx, obj, &arrp, &count32) && count32 == len) {
-        for (; i < idx; i++, pval++)
-            *pval = js_dup(arrp[i]);
-        *pval = js_dup(argv[1]);
-        for (i++, pval++; i < len; i++, pval++)
-            *pval = js_dup(arrp[i]);
-    } else {
-        for (; i < idx; i++, pval++)
-            if (-1 == JS_TryGetPropertyInt64(ctx, obj, i, pval))
-                goto exception;
-        *pval = js_dup(argv[1]);
-        for (i++, pval++; i < len; i++, pval++) {
-            if (-1 == JS_TryGetPropertyInt64(ctx, obj, i, pval))
-                goto exception;
+    if (s->hdr.stage == 1) {
+        r = step_length_run(ctx, &s->hdr, s->obj, cb_result, &s->len, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 2;
+    }
+    if (s->hdr.stage == 2) {
+        r = step_toint64_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->idx, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 3;
+    }
+    if (s->hdr.stage == 3) {
+        JSValue *arrp;
+        uint32_t count32;
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        if (s->idx < 0) s->idx = s->len + s->idx;
+        if (s->idx < 0 || s->idx >= s->len)
+            return JS_ThrowRangeError(ctx, "invalid array index: %" PRId64, s->idx), -1;
+        /* 23.1.3.39 step 5's ArrayCreate(len) comes BEFORE any element is read, and it is what makes the length
+           affordable-or-not decision once: it rejects a length past INT32_MAX and otherwise commits the storage,
+           already filled with undefined. Building the result incrementally instead would loop 2^32 times on an
+           array-like that merely CLAIMS a huge length, which is how this first went out of memory. */
+        s->arr = js_allocate_fast_array(ctx, s->len);
+        if (JS_IsException(s->arr)) { s->arr = JS_UNDEFINED; return -1; }
+        /* the DENSE source: slots copied across with the one replacement, invoking nothing. Whether the copy
+           applies is decided without running anything, so asking costs no semantics. */
+        if (js_get_fast_array(ctx, s->obj, &arrp, &count32) && count32 == s->len) {
+            JSValue *pval = JS_VALUE_GET_OBJ(s->arr)->u.array.u.values;
+            int64_t k;
+            for (k = 0; k < s->len; k++, pval++) {
+                JS_FreeValue(ctx, *pval);   /* the allocator's undefined */
+                *pval = (k == s->idx) ? js_dup(step_arg(&s->hdr, 1)) : js_dup(arrp[k]);
+            }
+            return 0;
+        }
+        s->i = 0;
+        s->hdr.stage = 4;
+    }
+    for (;;) {
+        if (s->hdr.stage == 6) break;
+        if (s->hdr.stage == 4) {
+            if (s->i >= s->len) { s->hdr.stage = 6; break; }
+            if (s->i == s->idx) {
+                s->el = js_dup(step_arg(&s->hdr, 1));
+            } else {
+                /* step 6.c's Get(O, Pk): an index accessor or a Proxy trap runs on this chain. */
+                r = step_getidx_run(ctx, &s->hdr, s->obj, s->i, cb_result, &s->el, out_cb, out_argc);
+                cb_result = JS_UNDEFINED;
+                if (r) return r < 0 ? -1 : r;
+            }
+            s->hdr.stage = 5;
+        }
+        if (s->hdr.stage == 5) {
+            JSValue v = s->el;
+            s->el = JS_UNDEFINED;   /* the define consumes it on every path */
+            if (JS_DefinePropertyValueInt64(ctx, s->arr, s->i, v, JS_PROP_C_W_E | JS_PROP_THROW) < 0)
+                return -1;
+            s->i++;
+            s->hdr.stage = 4;
         }
     }
-
-    ret = arr;
-    arr = JS_UNDEFINED;
-
-exception:
-    JS_FreeValue(ctx, arr);
-    JS_FreeValue(ctx, obj);
-    return ret;
+    return 0;
 }
+
+static JSValue js_array_with_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSArrayWith *s = st;
+    JSValue r = take_result ? s->arr : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->arr);
+    JS_FreeValue(ctx, s->el);
+    JS_FreeValue(ctx, s->obj);
+    js_free(ctx, s);
+    return r;
+}
+
 
 static JSValue js_array_concat(JSContext *ctx, JSValueConst this_val,
                                int argc, JSValueConst *argv)
@@ -53854,6 +53900,8 @@ static JSValue js_str_concat_fini(JSContext *ctx, void *st, bool take_result);
 static int js_ta_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_ta_slice_fini(JSContext *ctx, void *st, bool take_result);
 static int js_array_at_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static int js_array_with_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_array_with_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_array_at_fini(JSContext *ctx, void *st, bool take_result);
 static int js_array_search_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_search_fini(JSContext *ctx, void *st, bool take_result);
@@ -53967,6 +54015,7 @@ static const JSTrampStepDef js_ta_slice_def     = { sizeof(JSTASlice), js_ta_sli
 static const JSTrampStepDef js_str_concat_def   = { sizeof(JSStrConcat), js_str_concat_step, js_str_concat_fini, 0 };
 static const JSTrampStepDef js_str_ctor_def     = { sizeof(JSStrCtor), js_str_ctor_step, js_str_ctor_fini, 0 };
 static const JSTrampStepDef js_array_at_def     = { sizeof(JSArrayAt), js_array_at_step, js_array_at_fini, 0 };
+static const JSTrampStepDef js_array_with_def   = { sizeof(JSArrayWith), js_array_with_step, js_array_with_fini, 0 };
 static const JSTrampStepDef js_array_indexOf_def     = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_INDEXOF };
 static const JSTrampStepDef js_array_lastIndexOf_def = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_LASTINDEXOF };
 static const JSTrampStepDef js_array_includes_def    = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_INCLUDES };
@@ -54114,6 +54163,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_STR_CONCAT]    = &js_str_concat_def,
     [STEPDEF_STR_CTOR]      = &js_str_ctor_def,
     [STEPDEF_ARRAY_AT]      = &js_array_at_def,
+    [STEPDEF_ARRAY_WITH]    = &js_array_with_def,
     [STEPDEF_ARRAY_INDEXOF]     = &js_array_indexOf_def,
     [STEPDEF_ARRAY_LASTINDEXOF] = &js_array_lastIndexOf_def,
     [STEPDEF_ARRAY_INCLUDES]    = &js_array_includes_def,
@@ -56624,7 +56674,7 @@ static const JSCFunctionListEntry js_array_unscopables_funcs[] = {
 
 static const JSCFunctionListEntry js_array_proto_funcs[] = {
     JS_CFUNC_STEP_DEF("at", 1, STEPDEF_ARRAY_AT ),
-    JS_CFUNC_DEF("with", 2, js_array_with ),
+    JS_CFUNC_STEP_DEF("with", 2, STEPDEF_ARRAY_WITH ),
     JS_CFUNC_DEF("concat", 1, js_array_concat ),
     JS_CFUNC_STEP_DEF("every", 1, STEPDEF_ARRAY_EVERY ),
     JS_CFUNC_STEP_DEF("some", 1, STEPDEF_ARRAY_SOME ),
