@@ -1445,7 +1445,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_BIGINT_ASUINTN, STEPDEF_BIGINT_ASINTN,
     STEPDEF_OBJ_GOPD, STEPDEF_REFLECT_GOPD,
     STEPDEF_OBJ_VALUES, STEPDEF_OBJ_ENTRIES, STEPDEF_OBJ_ASSIGN, STEPDEF_OBJ_SPREAD,
-    STEPDEF_ARRAY_FLAT, STEPDEF_ARRAY_FLATMAP, STEPDEF_ARRAY_FROMLIKE, STEPDEF_ARRAY_WITH, STEPDEF_ARRAY_FILL,
+    STEPDEF_ARRAY_FLAT, STEPDEF_ARRAY_FLATMAP, STEPDEF_ARRAY_FROMLIKE, STEPDEF_ARRAY_WITH, STEPDEF_ARRAY_FILL, STEPDEF_ARRAY_COPYWITHIN,
     STEPDEF_MATH_ABS, STEPDEF_MATH_FLOOR, STEPDEF_MATH_CEIL, STEPDEF_MATH_ROUND, STEPDEF_MATH_SQRT, STEPDEF_MATH_ACOS, STEPDEF_MATH_ASIN, STEPDEF_MATH_ATAN, STEPDEF_MATH_COS, STEPDEF_MATH_EXP, STEPDEF_MATH_LOG, STEPDEF_MATH_SIN, STEPDEF_MATH_TAN, STEPDEF_MATH_TRUNC, STEPDEF_MATH_SIGN, STEPDEF_MATH_COSH, STEPDEF_MATH_SINH, STEPDEF_MATH_TANH, STEPDEF_MATH_ACOSH, STEPDEF_MATH_ASINH, STEPDEF_MATH_ATANH, STEPDEF_MATH_EXPM1, STEPDEF_MATH_LOG1P, STEPDEF_MATH_LOG2, STEPDEF_MATH_LOG10, STEPDEF_MATH_CBRT, STEPDEF_MATH_F16ROUND, STEPDEF_MATH_FROUND, STEPDEF_MATH_ATAN2, STEPDEF_MATH_POW, STEPDEF_MATH_MIN, STEPDEF_MATH_MAX, STEPDEF_MATH_HYPOT, STEPDEF_MATH_IMUL, STEPDEF_MATH_CLZ32, STEPDEF_STR_FROMCHARCODE, STEPDEF_STR_FROMCODEPOINT, STEPDEF_DATE_UTC,
     STEPDEF_REGEXP_EXEC, STEPDEF_REGEXP_TEST,
     STEPDEF_ITER_TAKE, STEPDEF_ITER_DROP,
@@ -18217,6 +18217,30 @@ static int step_setidx_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, int64
     return step_setprop_run(ctx, h, obj, JS_ATOM_NULL, value, in, out_cb, out_argc);
 }
 
+/* DeletePropertyOrThrow(O, ! ToString(𝔽(idx))): a Proxy `deleteProperty` trap is the page's code, and
+   JS_DeletePropertyInt64 reached it from C. 0 = done, 9 = the caller must return that step code, -1 = threw. */
+static int step_delidx_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, int64_t idx,
+                           JSValue in, JSValue **out_cb, int *out_argc)
+{
+    if (h->get_phase == GET_PH_START) {
+        JSAtom atom;
+        JS_FreeValue(ctx, in);
+        atom = JS_NewAtomInt64(ctx, idx);
+        if (atom == JS_ATOM_NULL) return -1;
+        DCHECK(h->get_atom == JS_ATOM_NULL, "a keyed operation is already in flight on this machine's header");
+        h->get_atom = atom;                 /* the conversion already owns it */
+        h->cb_coerce[0] = (JSValue)obj;     /* borrowed: the machine holds it across the delete */
+        *out_cb = h->cb_coerce; *out_argc = (int)atom;
+        h->get_phase = GET_PH_GOT;
+        return 9;
+    }
+    JS_FreeAtom(ctx, h->get_atom);
+    h->get_atom = JS_ATOM_NULL;
+    h->get_phase = GET_PH_START;
+    JS_FreeValue(ctx, in);                  /* a delete delivers no value */
+    return 0;
+}
+
 /* HasProperty(O, ! ToString(𝔽(idx))) — the OTHER half of the element access indexOf/lastIndexOf perform, which
    skip holes and so must ask before they read. A Proxy `has` trap is the page's code exactly as `get` is, and
    JS_TryGetPropertyInt64 reached it from C. 0 = *pres is filled, 7 = the caller must return that step code. */
@@ -18968,6 +18992,9 @@ typedef struct JSGetProp {
 #define GP_GET 0
 #define GP_HAS 1
 #define GP_SET 2
+#define GP_DELETE 3   /* step code 9. copyWithin removes the target index when the source one is absent, which is
+                         the page's `deleteProperty` trap on a Proxy — the same shape as has/get/set, differing
+                         only in the trap name, the invariant and the absent result. */
 
 static void js_getprop_free(JSContext *ctx, JSGetProp *gp)
 {
@@ -19907,6 +19934,20 @@ typedef struct JSArrayFill {
     JSValue obj;          /* ToObject(this) (owned); also the result */
     int64_t len, k, end;
 } JSArrayFill;
+
+/* Array.prototype.copyWithin, 23.1.3.4. ToObject, LengthOfArrayLike, THREE index coercions, then a walk that
+   for each position either copies the source element or DELETES the target one (step 14.d.ii, when the source is
+   absent) — a Get, a Set and a Delete, every one of them the page's code on an accessor or a Proxy. JS_CopySubArray
+   did the whole walk from C. Its dense fast path is a different algorithm and stays: contiguous slots moved with
+   no protocol at all. */
+typedef struct JSArrayCopyWithin {
+    JSStepHdr hdr;        /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    JSValue obj;          /* ToObject(this) (owned); also the result */
+    JSValue el;           /* the element held between its read and its write (owned) */
+    int64_t len, to, from, final, count, i;
+    int dir;
+    int present;          /* the last HasProperty answer */
+} JSArrayCopyWithin;
 
 /* Array.prototype.with, 23.1.3.39. Its prologue is JSArrayAt's — ToObject, LengthOfArrayLike,
    ToIntegerOrInfinity(index) — and then every element is READ, which on an accessor or a Proxy source is the
@@ -22850,15 +22891,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     *sp++ = r;
                     BREAK;
                 }
-                if (st == 6 || st == 7 || st == 8) {
-                    /* GETPROP (6) / HASPROPERTY (7) / SETPROP (8): *out_cb is [obj] — plus [value] for the write —
+                if (st == 6 || st == 7 || st == 8 || st == 9) {
+                    /* GETPROP (6) / HASPROPERTY (7) / SETPROP (8) / DELETE (9): *out_cb is [obj] — plus [value] for the write —
                        and *out_argc is the ATOM, the same shape as TOPRIMITIVE passing its hint. A prologue reads
                        `length`, `constructor`, `@@species`; a search loop asks whether index k is present; a copy
                        writes each key it read; every one of those can be an accessor or a proxy trap, which is user
                        code the machine must not drive itself. */
                     gp_outer = stt; gp_outer_kind = CONT_STEP;
                     gp_obj = cb[0]; gp_atom = (JSAtom)cbn;
-                    gp_op = (st == 7) ? GP_HAS : (st == 8) ? GP_SET : GP_GET;
+                    gp_op = (st == 7) ? GP_HAS : (st == 8) ? GP_SET : (st == 9) ? GP_DELETE : GP_GET;
                     gp_val = (st == 8) ? cb[1] : JS_UNDEFINED;
                     goto do_getprop_tramp;
                 }
@@ -23273,7 +23314,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (po->class_id == JS_CLASS_PROXY) {
                         JSProxyData *pd = get_proxy_method(ctx, &method, gp_obj,
                                                           gp_op == GP_HAS ? JS_ATOM_has :
-                                                          gp_op == GP_SET ? JS_ATOM_set : JS_ATOM_get);
+                                                          gp_op == GP_SET ? JS_ATOM_set :
+                                                          gp_op == GP_DELETE ? JS_ATOM_deleteProperty : JS_ATOM_get);
                         if (!pd) goto getprop_throw;               /* revoked, or the handler's own get threw */
                         if (JS_IsUndefined(method) || !tramp_can_call(method)) {
                             JS_FreeValue(ctx, method);             /* no trap, or a C/bound trap with no body */
@@ -23296,6 +23338,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         int hres = JS_HasProperty(ctx, gp_obj, gp_atom);
                         if (unlikely(hres < 0)) goto getprop_throw;
                         ret_val = js_bool(hres);
+                    } else if (gp_op == GP_DELETE) {
+                        /* DeletePropertyOrThrow(O, P): like the write, it yields nothing but its throw. */
+                        if (unlikely(JS_DeleteProperty(ctx, gp_obj, gp_atom, JS_PROP_THROW) < 0))
+                            goto getprop_throw;
+                        ret_val = JS_UNDEFINED;
                     } else if (gp_op == GP_SET) {
                         /* Set(O, P, V, true): the write yields nothing to the machine, only its throw. */
                         if (unlikely(JS_SetPropertyInternal2(ctx, gp_obj, gp_atom, js_dup(gp_val), gp_obj,
@@ -23355,8 +23402,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     gp->cb[3] = keyval;
                     /* has(target, key) takes two; get(target, key, receiver) three; set(target, key, value,
                        receiver) four. */
-                    if (gp_op == GP_HAS) {
-                        gp->nargs = 2;
+                    if (gp_op == GP_HAS || gp_op == GP_DELETE) {
+                        gp->nargs = 2;   /* has(target, key) / deleteProperty(target, key) */
                     } else if (gp_op == GP_SET) {
                         gp->cb[4] = js_dup(gp_val);
                         gp->cb[5] = js_dup(gp_obj);                          /* receiver IS the proxy */
@@ -25204,6 +25251,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         /* the `has` trap's boolean, then the target's [[HasProperty]] invariant on it */
                         int hres = js_proxy_has_invariant(ctx, gp->target, gp->atom, JS_ToBoolFree(ctx, ret_val));
                         ret_val = (hres < 0) ? JS_EXCEPTION : js_bool(hres);
+                    } else if (gp->op == GP_DELETE) {
+                        /* the `deleteProperty` trap's boolean owes the target's [[Delete]] invariant and then,
+                           because every consumer performs DeletePropertyOrThrow, a TypeError when it is false.
+                           The machine is handed UNDEFINED — a delete has no value to deliver. */
+                        int dres = js_proxy_delete_invariant(ctx, gp->target, gp->atom, JS_ToBoolFree(ctx, ret_val));
+                        if (dres < 0) ret_val = JS_EXCEPTION;
+                        else if (!dres) { JS_ThrowTypeError(ctx, "proxy: cannot delete property"); ret_val = JS_EXCEPTION; }
+                        else ret_val = JS_UNDEFINED;
                     } else if (gp->op == GP_SET) {
                         /* A SETTER yields nothing at all; a `set` TRAP yields a boolean that owes the target's
                            [[Set]] invariant and then, because every consumer of this request performs
@@ -53054,6 +53109,108 @@ static int64_t arr_clamp_idx(int64_t v, int64_t len)
     return v;
 }
 
+static int js_array_copywithin_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSArrayCopyWithin *s = st;
+    int r;
+
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
+        s->obj = JS_UNDEFINED; s->el = JS_UNDEFINED;
+        s->len = 0; s->to = 0; s->from = 0; s->final = 0; s->count = 0; s->i = 0;
+        s->dir = 1; s->present = 0;
+        s->obj = JS_ToObject(ctx, s->hdr.this_val);
+        if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
+        s->hdr.stage = 1;
+    }
+    if (s->hdr.stage == 1) {
+        r = step_length_run(ctx, &s->hdr, s->obj, cb_result, &s->len, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->final = s->len;
+        s->hdr.stage = 2;
+    }
+    if (s->hdr.stage == 2) {
+        r = step_toint64_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->to, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->to = arr_clamp_idx(s->to, s->len);
+        s->hdr.stage = 3;
+    }
+    if (s->hdr.stage == 3) {
+        r = step_toint64_run(ctx, &s->hdr, step_arg(&s->hdr, 1), cb_result, &s->from, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->from = arr_clamp_idx(s->from, s->len);
+        s->hdr.stage = 4;
+    }
+    if (s->hdr.stage == 4) {
+        /* an ABSENT or undefined end is the default and coerces nothing */
+        if (s->hdr.argc > 2 && !JS_IsUndefined(step_arg(&s->hdr, 2))) {
+            r = step_toint64_run(ctx, &s->hdr, s->hdr.argv[2], cb_result, &s->final, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->final = arr_clamp_idx(s->final, s->len);
+        }
+        s->count = min_int64(s->final - s->from, s->len - s->to);
+        /* step 14: overlapping ranges are walked BACKWARDS so a copy never reads a slot it has already written */
+        s->dir = (s->from < s->to && s->to < s->from + s->count) ? -1 : 1;
+        s->i = 0;
+        s->hdr.stage = 5;
+    }
+    for (;;) {
+        int64_t from, to;
+        if (s->hdr.stage == 8) break;
+        from = (s->dir < 0) ? s->from + s->count - s->i - 1 : s->from + s->i;
+        to   = (s->dir < 0) ? s->to   + s->count - s->i - 1 : s->to   + s->i;
+        if (s->hdr.stage == 5) {
+            if (s->i >= s->count) { s->hdr.stage = 8; break; }
+            /* HasProperty(O, fromKey) — step 14.c. A Proxy `has` trap is the page's code. */
+            r = step_hasidx_run(ctx, &s->hdr, s->obj, from, cb_result, &s->present, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->hdr.stage = 6;
+        }
+        if (s->hdr.stage == 6) {
+            if (s->present) {
+                r = step_getidx_run(ctx, &s->hdr, s->obj, from, cb_result, &s->el, out_cb, out_argc);
+                cb_result = JS_UNDEFINED;
+                if (r) return r < 0 ? -1 : r;
+            }
+            s->hdr.stage = 7;
+        }
+        if (s->hdr.stage == 7) {
+            if (s->present) {
+                /* Set(O, toKey, fromVal, true) — step 14.d.i */
+                r = step_setidx_run(ctx, &s->hdr, s->obj, to, s->el, cb_result, out_cb, out_argc);
+                cb_result = JS_UNDEFINED;
+                if (r) return r < 0 ? -1 : r;
+                JS_FreeValue(ctx, s->el); s->el = JS_UNDEFINED;
+            } else {
+                /* DeletePropertyOrThrow(O, toKey) — step 14.d.ii */
+                r = step_delidx_run(ctx, &s->hdr, s->obj, to, cb_result, out_cb, out_argc);
+                cb_result = JS_UNDEFINED;
+                if (r) return r < 0 ? -1 : r;
+            }
+            s->i++;
+            s->hdr.stage = 5;
+        }
+    }
+    JS_FreeValue(ctx, cb_result);
+    return 0;
+}
+
+static JSValue js_array_copywithin_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSArrayCopyWithin *s = st;
+    JSValue r = take_result ? js_dup(s->obj) : JS_UNDEFINED;
+    JS_FreeValue(ctx, s->el);
+    JS_FreeValue(ctx, s->obj);
+    js_free(ctx, s);
+    return r;
+}
+
 static int js_array_fill_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSArrayFill *s = st;
@@ -53966,6 +54123,8 @@ static JSValue js_ta_slice_fini(JSContext *ctx, void *st, bool take_result);
 static int js_array_at_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_array_with_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_array_fill_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static int js_array_copywithin_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_array_copywithin_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_array_fill_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_array_with_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_array_at_fini(JSContext *ctx, void *st, bool take_result);
@@ -54083,6 +54242,7 @@ static const JSTrampStepDef js_str_ctor_def     = { sizeof(JSStrCtor), js_str_ct
 static const JSTrampStepDef js_array_at_def     = { sizeof(JSArrayAt), js_array_at_step, js_array_at_fini, 0 };
 static const JSTrampStepDef js_array_with_def   = { sizeof(JSArrayWith), js_array_with_step, js_array_with_fini, 0 };
 static const JSTrampStepDef js_array_fill_def   = { sizeof(JSArrayFill), js_array_fill_step, js_array_fill_fini, 0 };
+static const JSTrampStepDef js_array_copyWithin_def = { sizeof(JSArrayCopyWithin), js_array_copywithin_step, js_array_copywithin_fini, 0 };
 static const JSTrampStepDef js_array_indexOf_def     = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_INDEXOF };
 static const JSTrampStepDef js_array_lastIndexOf_def = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_LASTINDEXOF };
 static const JSTrampStepDef js_array_includes_def    = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_INCLUDES };
@@ -54232,6 +54392,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_ARRAY_AT]      = &js_array_at_def,
     [STEPDEF_ARRAY_WITH]    = &js_array_with_def,
     [STEPDEF_ARRAY_FILL]    = &js_array_fill_def,
+    [STEPDEF_ARRAY_COPYWITHIN] = &js_array_copyWithin_def,
     [STEPDEF_ARRAY_INDEXOF]     = &js_array_indexOf_def,
     [STEPDEF_ARRAY_LASTINDEXOF] = &js_array_lastIndexOf_def,
     [STEPDEF_ARRAY_INCLUDES]    = &js_array_includes_def,
@@ -55025,40 +55186,6 @@ exception:
     return ret;
 }
 
-static JSValue js_array_copyWithin(JSContext *ctx, JSValueConst this_val,
-                                   int argc, JSValueConst *argv)
-{
-    JSValue obj;
-    int64_t len, from, to, final, count;
-
-    obj = JS_ToObject(ctx, this_val);
-    if (js_get_length64(ctx, &len, obj))
-        goto exception;
-
-    if (JS_ToInt64Clamp(ctx, &to, argv[0], 0, len, len))
-        goto exception;
-
-    if (JS_ToInt64Clamp(ctx, &from, argv[1], 0, len, len))
-        goto exception;
-
-    final = len;
-    if (argc > 2 && !JS_IsUndefined(argv[2])) {
-        if (JS_ToInt64Clamp(ctx, &final, argv[2], 0, len, len))
-            goto exception;
-    }
-
-    count = min_int64(final - from, len - to);
-
-    if (JS_CopySubArray(ctx, obj, to, from, count,
-                        (from < to && to < from + count) ? -1 : +1))
-        goto exception;
-
-    return obj;
-
- exception:
-    JS_FreeValue(ctx, obj);
-    return JS_EXCEPTION;
-}
 
 /* ---- Array.from over an array-like as a step machine (see JSArrayFromLike) ---- */
 static int js_array_fromlike_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
@@ -56773,7 +56900,7 @@ static const JSCFunctionListEntry js_array_proto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("slice", 2, js_array_slice, 0 ),
     JS_CFUNC_MAGIC_DEF("splice", 2, js_array_slice, 1 ),
     JS_CFUNC_DEF("toSpliced", 2, js_array_toSpliced ),
-    JS_CFUNC_DEF("copyWithin", 2, js_array_copyWithin ),
+    JS_CFUNC_STEP_DEF("copyWithin", 2, STEPDEF_ARRAY_COPYWITHIN ),
     JS_CFUNC_STEP_DEF("flatMap", 1, STEPDEF_ARRAY_FLATMAP ),
     JS_CFUNC_STEP_DEF("flat", 0, STEPDEF_ARRAY_FLAT ),
     JS_CFUNC_MAGIC_DEF("values", 0, js_create_array_iterator, JS_ITERATOR_KIND_VALUE ),
