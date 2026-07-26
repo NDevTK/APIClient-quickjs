@@ -52058,6 +52058,7 @@ static JSValue js_array_from(JSContext *ctx, JSValueConst this_val,
         JS_FreeValue(ctx, iter);
         DFAIL("Array.from reached its C entry with an ITERABLE source — route that call site onto the consume "
               "machine; the iteration loop here no longer exists");
+        JS_ThrowTypeError(ctx, "Array.from: unrouted call shape (no off-tramp implementation exists)");
         goto exception;
     } else {
         JS_FreeValue(ctx, iter);
@@ -59306,7 +59307,7 @@ static JSValue js_math_sumPrecise(JSContext *ctx, JSValueConst this_val,
     DFAIL("Math.sumPrecise reached its C entry with an ITERABLE source — route that call site onto the consume "
           "machine; the summation loop here no longer exists");
     JS_FreeValue(ctx, iter);
-    return JS_EXCEPTION;
+    return JS_ThrowTypeError(ctx, "Math.sumPrecise: unrouted call shape (no off-tramp implementation exists)");
 }
 
 /* xorshift* random number generator by Marsaglia */
@@ -63856,6 +63857,7 @@ static JSValue js_map_constructor(JSContext *ctx, JSValueConst new_target,
             goto fail;
         DFAIL("new Map/Set reached its C entry with an ITERABLE source - route that call site onto the consume "
               "machine; the iteration loop here no longer exists");
+        JS_ThrowTypeError(ctx, "new Map/Set: unrouted construct shape (no off-tramp implementation exists)");
         goto fail;
         JS_FreeValue(ctx, next_method);
         JS_FreeValue(ctx, iter);
@@ -66677,7 +66679,7 @@ static JSValue js_promise_constructor(JSContext *ctx, JSValueConst new_target,
     DFAIL("Promise constructor reached its C entry with a CALLABLE executor — that call site must route to "
           "do_promise_exec_tramp; there is no JS_Call version here any more");
     (void)obj; (void)args; (void)ret;
-    return JS_EXCEPTION;
+    return JS_ThrowTypeError(ctx, "new Promise: unrouted construct shape (no off-tramp implementation exists)");
 }
 
 static JSValue js_promise_executor(JSContext *ctx,
@@ -67829,7 +67831,7 @@ static JSValue js_iter_close_throw_c_entry(JSContext *ctx, JSValueConst this_val
 {
     DFAIL("the async-from-sync closeIterator reaction reached its C entry — it is a step machine, so this call "
           "site must route through do_step_tramp; a JS_Call here would drive a generator `finally` off-tramp");
-    return JS_EXCEPTION;
+    return JS_ThrowTypeError(ctx, "async-from-sync closeIterator: unrouted call shape (no off-tramp implementation exists)");
 }
 
 static JSValue js_iter_close_throw_create(JSContext *ctx, JSValueConst sync_iter)
