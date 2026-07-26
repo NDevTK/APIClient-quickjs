@@ -27666,10 +27666,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp[-2] = js_int32(v1 << v2);
                     sp--;
                 } else {
-                    sf->cur_pc = pc;
-                    if (js_binary_logic_slow(ctx, sp, opcode))
-                        goto exception;
-                    sp--;
+                    goto binary_logic_slow;
                 }
             }
             BREAK;
@@ -27685,10 +27682,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp[-2] = js_uint32((uint32_t)JS_VALUE_GET_INT(op1) >> v2);
                     sp--;
                 } else {
-                    sf->cur_pc = pc;
-                    if (js_shr_slow(ctx, sp))
-                        goto exception;
-                    sp--;
+                    goto binary_logic_slow;
                 }
             }
             BREAK;
@@ -27706,10 +27700,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp[-2] = js_int32((int)JS_VALUE_GET_INT(op1) >> v2);
                     sp--;
                 } else {
-                    sf->cur_pc = pc;
-                    if (js_binary_logic_slow(ctx, sp, opcode))
-                        goto exception;
-                    sp--;
+                    goto binary_logic_slow;
                 }
             }
             BREAK;
@@ -27722,10 +27713,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp[-2] = js_int32(JS_VALUE_GET_INT(op1) & JS_VALUE_GET_INT(op2));
                     sp--;
                 } else {
-                    sf->cur_pc = pc;
-                    if (js_binary_logic_slow(ctx, sp, opcode))
-                        goto exception;
-                    sp--;
+                    goto binary_logic_slow;
                 }
             }
             BREAK;
@@ -27738,10 +27726,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp[-2] = js_int32(JS_VALUE_GET_INT(op1) | JS_VALUE_GET_INT(op2));
                     sp--;
                 } else {
-                    sf->cur_pc = pc;
-                    if (js_binary_logic_slow(ctx, sp, opcode))
-                        goto exception;
-                    sp--;
+                    goto binary_logic_slow;
                 }
             }
             BREAK;
@@ -27754,8 +27739,33 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp[-2] = js_int32(JS_VALUE_GET_INT(op1) ^ JS_VALUE_GET_INT(op2));
                     sp--;
                 } else {
+        binary_logic_slow:
+                    /* ONE slow path for the whole bitwise/shift family, the same shape binary_arith_slow already
+                       has: `&|^<<>>>>>`'s ToNumeric runs the page's valueOf/toString/@@toPrimitive, and
+                       js_binary_logic_slow did it with JS_CallFree from C, where a loop in that method preempts in
+                       an activation with no flow base. Coerce the LEFT object operand on the tramp and re-execute
+                       the opcode; the fast prefix is pure tag tests, so the retry is free and the right operand is
+                       coerced by the same path on the next pass, in spec order. It was five arms each calling the
+                       C slow path, which is why the arithmetic family's routing never reached them.
+                       Every opcode reaching this label is one byte, so `pc - 1` is its own byte. */
                     sf->cur_pc = pc;
-                    if (js_binary_logic_slow(ctx, sp, opcode))
+                    if (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT) {
+                        tp_slot = -2; tp_hint = HINT_NUMBER; tp_retry_pc = pc - 1;
+                        goto do_toprim_tramp;
+                    }
+                    if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) {
+                        /* ToNumeric(lhs) must COMPLETE before the rhs is touched (the same ordering rule the
+                           arithmetic label spells out). The left is already primitive here, so this conversion
+                           runs no user code — it only throws. */
+                        sp[-2] = JS_ToNumericFree(ctx, sp[-2]);
+                        if (unlikely(JS_IsException(sp[-2]))) { sp[-2] = JS_UNDEFINED; goto exception; }
+                        tp_slot = -1; tp_hint = HINT_NUMBER; tp_retry_pc = pc - 1;
+                        goto do_toprim_tramp;
+                    }
+                    /* >>> is the one with its own tail (an unsigned result), so the family's shared label names it
+                       rather than growing a second copy of the coercion above. */
+                    if (opcode == OP_shr ? js_shr_slow(ctx, sp)
+                                         : js_binary_logic_slow(ctx, sp, opcode))
                         goto exception;
                     sp--;
                 }
