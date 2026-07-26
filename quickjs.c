@@ -51843,6 +51843,18 @@ static bool iter_consume_gen_backed(JSContext *ctx, JSValueConst items, JSValue 
             *out_getiter = m; return true;
         }
     }
+    /* A NON-BUILT-IN callable @@iterator: the iterator it returns is user code, so its .next() body must run on the
+       chain. This is the widening that made `[...{[Symbol.iterator](){ return {next(){…loop…}} }}]` work — before it,
+       only a GENERATOR-backed source routed and a plain object iterator drove to completion in C. What stays behind
+       is not a fallback: a BUILT-IN @@iterator (array/string/Set/Map/arguments) yields a built-in iterator whose
+       .next() is C, so there is no user body to suspend, and js_append_enumerate's fast-array case is a different
+       algorithm entirely (copy the slots, invoke nothing). A user who PATCHES a built-in iterator's .next is the one
+       remaining shape this cannot see side-effect-free, and it is reached only through the C entry. */
+    if (JS_IsFunction(ctx, m)
+        && !(JS_VALUE_GET_TAG(m) == JS_TAG_OBJECT
+             && JS_VALUE_GET_OBJ(m)->class_id == JS_CLASS_C_FUNCTION)) {
+        *out_getiter = m; return true;
+    }
     JS_FreeValue(ctx, m);
     return false;
 }
@@ -51975,9 +51987,11 @@ static bool tramp_can_call_objentries_consume(JSContext *ctx, JSValueConst func,
     return false;
 }
 
-/* Route new TypedArray(gen) — js_typed_array_constructor_obj collects the iterable (js_array_from_iterator) in a C
-   loop, driving a generator argument's .next(). Scoped to the direct-generator case; *out_classid = the TA class
-   (the ctor's magic). Fork-safe (the collected array's appends are COW-captured). */
+/* Route new TypedArray(iterable) — js_typed_array_constructor_obj collects it (js_array_from_iterator) in a C loop,
+   driving the argument's .next(). The gate is the shared iter_consume_gen_backed, so this widened with it: a plain
+   object iterator routes now too, and only a BUILT-IN @@iterator (whose .next() is C and invokes nothing) stays on
+   the C collect. *out_classid = the TA class (the ctor's magic). Fork-safe (the collected array's appends are
+   COW-captured). */
 static bool tramp_can_call_ta_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_classid, JSValue *out_getiter)
 {
     JSObject *fp;
