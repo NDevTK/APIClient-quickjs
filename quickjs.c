@@ -1445,7 +1445,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_BIGINT_ASUINTN, STEPDEF_BIGINT_ASINTN,
     STEPDEF_OBJ_GOPD, STEPDEF_REFLECT_GOPD,
     STEPDEF_OBJ_VALUES, STEPDEF_OBJ_ENTRIES, STEPDEF_OBJ_ASSIGN, STEPDEF_OBJ_SPREAD,
-    STEPDEF_ARRAY_FLAT, STEPDEF_ARRAY_FLATMAP, STEPDEF_ARRAY_FROMLIKE, STEPDEF_ARRAY_WITH, STEPDEF_ARRAY_FILL, STEPDEF_ARRAY_COPYWITHIN, STEPDEF_BIGINT_CTOR, STEPDEF_TA_WITH, STEPDEF_TA_FILL, STEPDEF_TA_COPYWITHIN, STEPDEF_TA_INDEXOF, STEPDEF_TA_LASTINDEXOF, STEPDEF_TA_INCLUDES, STEPDEF_TA_SUBARRAY, STEPDEF_DATE_TOJSON, STEPDEF_DATE_TOPRIM, STEPDEF_DATE_CTOR,
+    STEPDEF_ARRAY_FLAT, STEPDEF_ARRAY_FLATMAP, STEPDEF_ARRAY_FROMLIKE, STEPDEF_ARRAY_WITH, STEPDEF_ARRAY_FILL, STEPDEF_ARRAY_COPYWITHIN, STEPDEF_BIGINT_CTOR, STEPDEF_TA_WITH, STEPDEF_TA_FILL, STEPDEF_TA_COPYWITHIN, STEPDEF_TA_INDEXOF, STEPDEF_TA_LASTINDEXOF, STEPDEF_TA_INCLUDES, STEPDEF_TA_SUBARRAY, STEPDEF_AB_SLICE, STEPDEF_AB_SLICE_IMM, STEPDEF_SAB_SLICE, STEPDEF_DATE_TOJSON, STEPDEF_DATE_TOPRIM, STEPDEF_DATE_CTOR,
     STEPDEF_MATH_ABS, STEPDEF_MATH_FLOOR, STEPDEF_MATH_CEIL, STEPDEF_MATH_ROUND, STEPDEF_MATH_SQRT, STEPDEF_MATH_ACOS, STEPDEF_MATH_ASIN, STEPDEF_MATH_ATAN, STEPDEF_MATH_COS, STEPDEF_MATH_EXP, STEPDEF_MATH_LOG, STEPDEF_MATH_SIN, STEPDEF_MATH_TAN, STEPDEF_MATH_TRUNC, STEPDEF_MATH_SIGN, STEPDEF_MATH_COSH, STEPDEF_MATH_SINH, STEPDEF_MATH_TANH, STEPDEF_MATH_ACOSH, STEPDEF_MATH_ASINH, STEPDEF_MATH_ATANH, STEPDEF_MATH_EXPM1, STEPDEF_MATH_LOG1P, STEPDEF_MATH_LOG2, STEPDEF_MATH_LOG10, STEPDEF_MATH_CBRT, STEPDEF_MATH_F16ROUND, STEPDEF_MATH_FROUND, STEPDEF_MATH_ATAN2, STEPDEF_MATH_POW, STEPDEF_MATH_MIN, STEPDEF_MATH_MAX, STEPDEF_MATH_HYPOT, STEPDEF_MATH_IMUL, STEPDEF_MATH_CLZ32, STEPDEF_STR_FROMCHARCODE, STEPDEF_STR_FROMCODEPOINT, STEPDEF_DATE_UTC,
     STEPDEF_REGEXP_EXEC, STEPDEF_REGEXP_TEST,
     STEPDEF_ITER_TAKE, STEPDEF_ITER_DROP,
@@ -19959,6 +19959,24 @@ typedef struct JSArrayFill {
     int64_t len, k, end;
 } JSArrayFill;
 
+/* 25.1.6.7 ArrayBuffer.prototype.slice (and sliceToImmutable, which differs only in skipping the species). Both
+   bounds are the page's code, and so is SpeciesConstructor's pair of reads and the Construct that follows —
+   js_array_buffer_slice ran all of it from C. Same shape as subarray's, so it is the same five stages with a
+   different builder; the intrinsic default and the immutable variant simply never reach the species stages. */
+typedef struct JSABSlice {
+    JSStepHdr hdr;        /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    JSValue result;       /* DONE (owned) */
+    JSValue prim[2];      /* the coerced bounds (owned) */
+    JSValue ctor;         /* `constructor`, then its @@species (owned) */
+    JSValue cargs[2];     /* [ctor, newLength] — the CONSTRUCT request (owned) */
+    int64_t len, start, new_len;
+    int i;
+} JSABSlice;
+static JSValue js_array_buffer_slice_build(JSContext *ctx, JSValueConst this_val, JSValue new_obj,
+                                           int64_t start, int64_t new_len, int magic);
+static JSValue js_array_buffer_constructor2(JSContext *ctx, JSValueConst new_target, uint64_t len,
+                                            uint64_t *pmax_len, JSClassID class_id);
+
 /* 23.2.3.30 %TypedArray%.prototype.subarray. Its two bounds are the page's code, and so is everything after them:
    TypedArraySpeciesCreate reads `constructor`, reads @@species and CONSTRUCTS — three more user-code points that
    js_typed_array___speciesCreate ran from C. That is why subarray is not a mode of the coercion prologue: its tail
@@ -19997,12 +20015,14 @@ typedef struct JSTACoerce {
     JSStepHdr hdr;        /* MUST be first: the generic step driver casts the state to JSStepHdr * */
     JSValue result;       /* DONE (owned) */
     JSValue prim[3];      /* the coerced arguments (owned) */
+    int idx[3];           /* their ToIntegerOrInfinity results, clamped against `len` */
+    uint64_t fill_v64;    /* TAPRO_FILL only: argument 0 already converted to the element's representation */
     int len, i;
 } JSTACoerce;
-static JSValue js_typed_array_fill_build(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv,
-                                         int len);
-static JSValue js_typed_array_copywithin_build(JSContext *ctx, JSValueConst this_val, int argc,
-                                               JSValueConst *argv, int len);
+static int js_typed_array_fill_value(JSContext *ctx, JSObject *p, JSValueConst val, uint64_t *pv64);
+static JSValue js_typed_array_fill_build(JSContext *ctx, JSValueConst this_val, uint64_t v64, int k, int final);
+static JSValue js_typed_array_copywithin_build(JSContext *ctx, JSValueConst this_val, int to, int from,
+                                               int final, int len);
 static JSValue js_typed_array_indexof_build(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv,
                                             int special, int len);
 
@@ -53570,6 +53590,102 @@ static bool ta_coerce_wants(JSTACoerce *s, int i)
     return h->argc > 2 && !JS_IsUndefined(step_arg(h, 2));
 }
 
+static int js_ab_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSABSlice *s = st;
+    JSArrayBuffer *abuf;
+    int magic = s->hdr.arg, class_id = magic >> 1;
+    int r;
+
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
+        s->result = JS_UNDEFINED; s->ctor = JS_UNDEFINED;
+        s->prim[0] = JS_UNDEFINED; s->prim[1] = JS_UNDEFINED;
+        s->cargs[0] = JS_UNDEFINED; s->cargs[1] = JS_UNDEFINED;
+        s->len = 0; s->start = 0; s->new_len = 0; s->i = 0;
+        abuf = JS_GetOpaque2(ctx, s->hdr.this_val, class_id);
+        if (!abuf) return -1;
+        if (abuf->detached) { JS_ThrowTypeErrorDetachedArrayBuffer(ctx); return -1; }
+        if (abuf->immutable) { JS_ThrowTypeErrorImmutableArrayBuffer(ctx); return -1; }
+        s->len = abuf->byte_length;
+        s->hdr.stage = 1;
+    }
+    while (s->hdr.stage == 1) {
+        int64_t v;
+        if (s->i >= 2) break;
+        /* `start` always, `end` only when it is not undefined */
+        if (s->i == 1 && JS_IsUndefined(step_arg(&s->hdr, 1))) { s->i++; continue; }
+        r = step_toprim_run(ctx, &s->hdr, step_arg(&s->hdr, s->i), HINT_NUMBER, cb_result, &s->prim[s->i],
+                            out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        /* the NUMERIC half runs right here, not after both bounds: ToIntegerOrInfinity is where a Symbol's
+           TypeError is ordered, and `slice(Symbol(), {valueOf(){…}})` must throw BEFORE the second argument's
+           valueOf runs. Nothing in it invokes anything — the operand is a primitive already. */
+        if (JS_ToInt64Clamp(ctx, &v, s->prim[s->i], 0, s->len, s->len)) return -1;
+        if (s->i == 0) s->start = v; else s->new_len = v;
+        s->i++;
+    }
+    if (s->hdr.stage == 1) {
+        int64_t end = JS_IsUndefined(step_arg(&s->hdr, 1)) ? s->len : s->new_len;
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        s->new_len = max_int64(end - s->start, 0);
+        /* sliceToImmutable has no SpeciesConstructor step at all */
+        s->hdr.stage = (magic & 1) ? 4 : 2;
+    }
+    if (s->hdr.stage == 2) {
+        r = step_getprop_run(ctx, &s->hdr, s->hdr.this_val, JS_ATOM_constructor, cb_result, &s->ctor,
+                             out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        if (JS_IsUndefined(s->ctor)) s->hdr.stage = 4;
+        else if (!JS_IsObject(s->ctor)) { JS_ThrowTypeErrorNotAnObject(ctx); return -1; }
+        else s->hdr.stage = 3;
+    }
+    if (s->hdr.stage == 3) {
+        JSValue sp = JS_UNDEFINED;
+        r = step_getprop_run(ctx, &s->hdr, s->ctor, JS_ATOM_Symbol_species, cb_result, &sp, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        JS_FreeValue(ctx, s->ctor);
+        s->ctor = JS_IsNull(sp) ? (JS_FreeValue(ctx, sp), JS_UNDEFINED) : sp;
+        if (!JS_IsUndefined(s->ctor) && !JS_IsConstructor(ctx, s->ctor)) {
+            JS_ThrowTypeError(ctx, "not a constructor");
+            return -1;
+        }
+        s->hdr.stage = 4;
+    }
+    if (s->hdr.stage == 4) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        if (JS_IsUndefined(s->ctor)) {
+            JSValue nb = js_array_buffer_constructor2(ctx, JS_UNDEFINED, s->new_len, NULL, class_id);
+            s->result = js_array_buffer_slice_build(ctx, s->hdr.this_val, nb, s->start, s->new_len, magic);
+            return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
+        }
+        s->cargs[0] = js_dup(s->ctor);
+        s->cargs[1] = js_int64(s->new_len);
+        s->hdr.stage = 5;
+        *out_cb = s->cargs; *out_argc = 1;
+        return 4;
+    }
+    DCHECK(s->hdr.stage == 5, "ArrayBuffer.prototype.slice: unknown stage");
+    s->result = js_array_buffer_slice_build(ctx, s->hdr.this_val, cb_result, s->start, s->new_len, magic);
+    return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
+}
+
+static JSValue js_ab_slice_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSABSlice *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    int i;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    for (i = 0; i < 2; i++) { JS_FreeValue(ctx, s->cargs[i]); JS_FreeValue(ctx, s->prim[i]); }
+    JS_FreeValue(ctx, s->ctor);
+    js_free(ctx, s);
+    return r;
+}
+
 static int js_ta_subarray_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSTASubarray *s = st;
@@ -53700,6 +53816,7 @@ static int js_ta_coerce_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
         /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
         s->result = JS_UNDEFINED;
         s->prim[0] = JS_UNDEFINED; s->prim[1] = JS_UNDEFINED; s->prim[2] = JS_UNDEFINED;
+        s->fill_v64 = 0;
         s->len = 0; s->i = 0;
         /* steps 1-2 run before any coercion, and their throws precede them */
         p = get_typed_array(ctx, s->hdr.this_val);
@@ -53710,36 +53827,49 @@ static int js_ta_coerce_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
         }
         if (typed_array_is_oob(p)) { JS_ThrowTypeErrorArrayBufferOOB(ctx); return -1; }
         s->len = p->u.array.count;
+        /* the defaults the spec gives an omitted bound: `start` 0, `end` the length */
+        s->idx[0] = 0; s->idx[1] = 0; s->idx[2] = s->len;
         s->hdr.stage = 1;
     }
     while (s->hdr.stage == 1) {
+        int mode = TAPRO_MODE(s->hdr.arg);
         if (s->i >= 3) break;
         if (!ta_coerce_wants(s, s->i)) { s->i++; continue; }
         r = step_toprim_run(ctx, &s->hdr, step_arg(&s->hdr, s->i), HINT_NUMBER, cb_result, &s->prim[s->i],
                             out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
+        /* The NUMERIC half of this argument's coercion runs HERE, not once every ToPrimitive is done: the spec
+           completes each argument's conversion before starting the next, so a Symbol in slot 0 must throw its
+           TypeError before slot 1's valueOf ever runs. The operand is a primitive already — nothing below
+           invokes user code, so this cannot suspend and needs no stage of its own. */
+        if (mode == TAPRO_FILL && s->i == 0) {
+            JSObject *p = get_typed_array(ctx, s->hdr.this_val);
+            if (!p) return -1;
+            if (js_typed_array_fill_value(ctx, p, s->prim[0], &s->fill_v64)) return -1;
+        } else if (mode != TAPRO_SEARCH) {
+            if (JS_ToInt32Clamp(ctx, &s->idx[s->i], s->prim[s->i], 0, s->len, s->len)) return -1;
+        }
         s->i++;
     }
     JS_FreeValue(ctx, cb_result);
-    {   /* an argument this does not coerce is handed through unchanged; the builder reads it only where the spec
-           does, and a primitive it never touches costs nothing. */
-        JSValueConst pv[3];
-        int k;
-        for (k = 0; k < 3; k++)
-            pv[k] = ta_coerce_wants(s, k) ? s->prim[k] : step_arg(&s->hdr, k);
-        switch (TAPRO_MODE(s->hdr.arg)) {
-        case TAPRO_COPYWITHIN:
-            s->result = js_typed_array_copywithin_build(ctx, s->hdr.this_val, s->hdr.argc, pv, s->len);
-            break;
-        case TAPRO_SEARCH:
-            s->result = js_typed_array_indexof_build(ctx, s->hdr.this_val, s->hdr.argc, pv, s->len,
-                                                     TAPRO_SPECIAL(s->hdr.arg));
-            break;
-        default:
-            s->result = js_typed_array_fill_build(ctx, s->hdr.this_val, s->hdr.argc, pv, s->len);
-            break;
-        }
+    switch (TAPRO_MODE(s->hdr.arg)) {
+    case TAPRO_COPYWITHIN:
+        s->result = js_typed_array_copywithin_build(ctx, s->hdr.this_val, s->idx[0], s->idx[1], s->idx[2],
+                                                    s->len);
+        break;
+    case TAPRO_SEARCH: {
+        /* the sought VALUE is never coerced (it is compared by type), so SEARCH has exactly ONE coercion and no
+           interleaving to get wrong; its fromIndex conversion differs per `special`, so the builder keeps it. */
+        JSValueConst pv[2] = { step_arg(&s->hdr, 0),
+                               ta_coerce_wants(s, 1) ? s->prim[1] : step_arg(&s->hdr, 1) };
+        s->result = js_typed_array_indexof_build(ctx, s->hdr.this_val, s->hdr.argc, pv, s->len,
+                                                 TAPRO_SPECIAL(s->hdr.arg));
+        break;
+    }
+    default:
+        s->result = js_typed_array_fill_build(ctx, s->hdr.this_val, s->fill_v64, s->idx[1], s->idx[2]);
+        break;
     }
     return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
 }
@@ -54716,6 +54846,8 @@ static int js_array_fill_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
 static int js_ta_with_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_ta_coerce_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_ta_subarray_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static int js_ab_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_ab_slice_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_ta_subarray_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_ta_coerce_fini(JSContext *ctx, void *st, bool take_result);
 static int js_date_tojson_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
@@ -54856,6 +54988,9 @@ static const JSTrampStepDef js_ta_indexOf_def     = { sizeof(JSTACoerce), js_ta_
 static const JSTrampStepDef js_ta_lastIndexOf_def = { sizeof(JSTACoerce), js_ta_coerce_step, js_ta_coerce_fini, TAPRO_SEARCH_ARG(special_lastIndexOf) };
 static const JSTrampStepDef js_ta_includes_def    = { sizeof(JSTACoerce), js_ta_coerce_step, js_ta_coerce_fini, TAPRO_SEARCH_ARG(special_includes) };
 static const JSTrampStepDef js_ta_subarray_def    = { sizeof(JSTASubarray), js_ta_subarray_step, js_ta_subarray_fini, 0 };
+static const JSTrampStepDef js_ab_slice_def      = { sizeof(JSABSlice), js_ab_slice_step, js_ab_slice_fini, JS_CLASS_ARRAY_BUFFER*2 + 0 };
+static const JSTrampStepDef js_ab_sliceImm_def   = { sizeof(JSABSlice), js_ab_slice_step, js_ab_slice_fini, JS_CLASS_ARRAY_BUFFER*2 + 1 };
+static const JSTrampStepDef js_sab_slice_def     = { sizeof(JSABSlice), js_ab_slice_step, js_ab_slice_fini, JS_CLASS_SHARED_ARRAY_BUFFER*2 + 0 };
 static const JSTrampStepDef js_date_toJSON_def = { sizeof(JSDateToJSON), js_date_tojson_step, js_date_tojson_fini, 0 };
 static const JSTrampStepDef js_date_toPrim_def = { sizeof(JSDateToPrim), js_date_toprim_step, js_date_toprim_fini, 0 };
 static const JSTrampStepDef js_date_ctor_def = { sizeof(JSDateCtor), js_date_ctor_step, js_date_ctor_fini, 0 };
@@ -55020,6 +55155,9 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_TA_LASTINDEXOF]= &js_ta_lastIndexOf_def,
     [STEPDEF_TA_INCLUDES]   = &js_ta_includes_def,
     [STEPDEF_TA_SUBARRAY]   = &js_ta_subarray_def,
+    [STEPDEF_AB_SLICE]      = &js_ab_slice_def,
+    [STEPDEF_AB_SLICE_IMM]  = &js_ab_sliceImm_def,
+    [STEPDEF_SAB_SLICE]     = &js_sab_slice_def,
     [STEPDEF_DATE_TOJSON]   = &js_date_toJSON_def,
     [STEPDEF_DATE_TOPRIM]   = &js_date_toPrim_def,
     [STEPDEF_DATE_CTOR]     = &js_date_ctor_def,
@@ -71530,55 +71668,18 @@ static JSValue js_array_buffer_resize(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
-static JSValue js_array_buffer_slice(JSContext *ctx,
-                                     JSValueConst this_val,
-                                     int argc, JSValueConst *argv, int magic)
+/* 25.1.6.7 from the species result onwards: the bounds are already primitives, `start`/`new_len` are computed from
+   the length read BEFORE them, and `new_obj` is whatever the species (or the intrinsic) built. Every check below is
+   a re-validation the spec performs after that user code, and none of them runs any more of it. */
+static JSValue js_array_buffer_slice_build(JSContext *ctx, JSValueConst this_val, JSValue new_obj,
+                                           int64_t start, int64_t new_len, int magic)
 {
     JSArrayBuffer *abuf, *new_abuf;
-    int64_t len, start, end, new_len;
-    JSValue ctor, new_obj;
-    bool immutable;
-    int class_id;
+    bool immutable = magic & 1;
+    int class_id = magic >> 1;
 
-    immutable = magic & 1;
-    class_id = magic >> 1;
     abuf = JS_GetOpaque2(ctx, this_val, class_id);
-    if (!abuf)
-        return JS_EXCEPTION;
-    if (abuf->detached)
-        return JS_ThrowTypeErrorDetachedArrayBuffer(ctx);
-    if (abuf->immutable)
-        return JS_ThrowTypeErrorImmutableArrayBuffer(ctx);
-    len = abuf->byte_length;
-
-    if (JS_ToInt64Clamp(ctx, &start, argv[0], 0, len, len))
-        return JS_EXCEPTION;
-
-    end = len;
-    if (!JS_IsUndefined(argv[1])) {
-        if (JS_ToInt64Clamp(ctx, &end, argv[1], 0, len, len))
-            return JS_EXCEPTION;
-    }
-    new_len = max_int64(end - start, 0);
-    // note: difference between slice and sliceToImmutable is that the
-    // latter does not have this step:
-    //        1. Let _ctor_ be ? SpeciesConstructor(_O_, %ArrayBuffer%)
-    ctor = JS_UNDEFINED;
-    if (!immutable) {
-        ctor = JS_SpeciesConstructor(ctx, this_val, JS_UNDEFINED);
-        if (JS_IsException(ctor))
-            return ctor;
-    }
-    if (JS_IsUndefined(ctor)) {
-        new_obj = js_array_buffer_constructor2(ctx, JS_UNDEFINED, new_len,
-                                               NULL, class_id);
-    } else {
-        JSValue args[1];
-        args[0] = js_int64(new_len);
-        new_obj = JS_CallConstructor(ctx, ctor, 1, vc(args));
-        JS_FreeValue(ctx, ctor);
-        JS_FreeValue(ctx, args[0]);
-    }
+    if (!abuf) { JS_FreeValue(ctx, new_obj); return JS_EXCEPTION; }
     if (JS_IsException(new_obj))
         return new_obj;
     new_abuf = JS_GetOpaque2(ctx, new_obj, class_id);
@@ -71627,8 +71728,8 @@ static const JSCFunctionListEntry js_array_buffer_proto_funcs[] = {
     JS_CGETSET_DEF("detached", js_array_buffer_get_detached, NULL ),
     JS_CGETSET_DEF("immutable", js_array_buffer_get_immutable, NULL ),
     JS_CFUNC_MAGIC_DEF("resize", 1, js_array_buffer_resize, JS_CLASS_ARRAY_BUFFER ),
-    JS_CFUNC_MAGIC_DEF("slice", 2, js_array_buffer_slice, JS_CLASS_ARRAY_BUFFER*2 + /*immutable*/0 ),
-    JS_CFUNC_MAGIC_DEF("sliceToImmutable", 2, js_array_buffer_slice, JS_CLASS_ARRAY_BUFFER*2 + /*immutable*/1 ),
+    JS_CFUNC_STEP_DEF("slice", 2, STEPDEF_AB_SLICE ),
+    JS_CFUNC_STEP_DEF("sliceToImmutable", 2, STEPDEF_AB_SLICE_IMM ),
     JS_CFUNC_MAGIC_DEF("transfer", 0, js_array_buffer_transfer, JS_ARRAY_BUFFER_TRANSFER ),
     JS_CFUNC_MAGIC_DEF("transferToImmutable", 0, js_array_buffer_transfer, JS_ARRAY_BUFFER_TRANSFER_TO_IMMUTABLE ),
     JS_CFUNC_MAGIC_DEF("transferToFixedLength", 0, js_array_buffer_transfer, JS_ARRAY_BUFFER_TRANSFER_TO_FIXED_LENGTH ),
@@ -71646,7 +71747,7 @@ static const JSCFunctionListEntry js_shared_array_buffer_proto_funcs[] = {
     JS_CGETSET_MAGIC_DEF("maxByteLength", js_array_buffer_get_maxByteLength, NULL, JS_CLASS_SHARED_ARRAY_BUFFER ),
     JS_CGETSET_MAGIC_DEF("growable", js_array_buffer_get_resizable, NULL, JS_CLASS_SHARED_ARRAY_BUFFER ),
     JS_CFUNC_MAGIC_DEF("grow", 1, js_array_buffer_resize, JS_CLASS_SHARED_ARRAY_BUFFER ),
-    JS_CFUNC_MAGIC_DEF("slice", 2, js_array_buffer_slice, JS_CLASS_SHARED_ARRAY_BUFFER*2 + /*immutable*/0 ),
+    JS_CFUNC_STEP_DEF("slice", 2, STEPDEF_SAB_SLICE ),
     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "SharedArrayBuffer", JS_PROP_CONFIGURABLE ),
 };
 
@@ -72100,27 +72201,18 @@ static JSValue js_typed_array_of(JSContext *ctx, JSValueConst this_val,
 /* 23.2.3.6 steps 4 onwards, with every argument ALREADY a primitive and `len` captured at step 2 — the clamp is
    against the length the spec read BEFORE the coercions, and the re-clamp below is what a valueOf that resized the
    buffer leaves to do. Nothing here runs user code. */
-static JSValue js_typed_array_copywithin_build(JSContext *ctx, JSValueConst this_val, int argc,
-                                               JSValueConst *argv, int len)
+/* 23.2.3.6 from step 8 onwards: every index is ALREADY the ToIntegerOrInfinity result, clamped against the `len`
+   step 3 read. The conversions live in the step machine's coercion loop because the spec interleaves each one
+   with its own argument's ToPrimitive; nothing below invokes user code. */
+static JSValue js_typed_array_copywithin_build(JSContext *ctx, JSValueConst this_val, int to, int from,
+                                               int final, int len)
 {
     JSObject *p;
-    int to, from, final, count, shift, space;
+    int count, shift, space;
 
     p = get_typed_array(ctx, this_val);
     if (!p)
         return JS_EXCEPTION;
-
-    if (JS_ToInt32Clamp(ctx, &to, argv[0], 0, len, len))
-        return JS_EXCEPTION;
-
-    if (JS_ToInt32Clamp(ctx, &from, argv[1], 0, len, len))
-        return JS_EXCEPTION;
-
-    final = len;
-    if (argc > 2 && !JS_IsUndefined(argv[2])) {
-        if (JS_ToInt32Clamp(ctx, &final, argv[2], 0, len, len))
-            return JS_EXCEPTION;
-    }
 
     if (typed_array_is_oob(p))
         return JS_ThrowTypeErrorArrayBufferOOB(ctx);
@@ -72138,38 +72230,31 @@ static JSValue js_typed_array_copywithin_build(JSContext *ctx, JSValueConst this
     return js_dup(this_val);
 }
 
-/* 23.2.3.9 steps 3 onwards, with every argument ALREADY a primitive and `len` captured at step 2 — a resizable
-   buffer shrunk by the page's valueOf must clamp against the length the spec read BEFORE the coercions, which is
-   why the caller holds it. None of the conversions below runs user code on a primitive. */
-static JSValue js_typed_array_fill_build(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv,
-                                         int len)
+/* 23.2.3.9 step 4: the fill VALUE's numeric conversion, split out of the builder because the spec orders it
+   BEFORE `start`'s ToIntegerOrInfinity — `fill(Symbol(), {valueOf(){…}})` must throw its TypeError without ever
+   running the second argument's valueOf. The operand is already a primitive, so nothing here invokes user code. */
+static int js_typed_array_fill_value(JSContext *ctx, JSObject *p, JSValueConst val, uint64_t *pv64)
 {
-    JSObject *p;
-    int k, final, shift;
     uint64_t v64;
-
-    p = get_typed_array(ctx, this_val);
-    if (!p)
-        return JS_EXCEPTION;
 
     if (p->class_id == JS_CLASS_UINT8C_ARRAY) {
         int32_t v;
-        if (JS_ToUint8ClampFree(ctx, &v, js_dup(argv[0])))
-            return JS_EXCEPTION;
+        if (JS_ToUint8ClampFree(ctx, &v, js_dup(val)))
+            return -1;
         v64 = v;
     } else if (p->class_id <= JS_CLASS_UINT32_ARRAY) {
         uint32_t v;
-        if (JS_ToUint32(ctx, &v, argv[0]))
-            return JS_EXCEPTION;
+        if (JS_ToUint32(ctx, &v, val))
+            return -1;
         v64 = v;
     } else
     if (p->class_id <= JS_CLASS_BIG_UINT64_ARRAY) {
-        if (JS_ToBigInt64(ctx, (int64_t *)&v64, argv[0]))
-            return JS_EXCEPTION;
+        if (JS_ToBigInt64(ctx, (int64_t *)&v64, val))
+            return -1;
     } else {
         double d;
-        if (JS_ToFloat64(ctx, &d, argv[0]))
-            return JS_EXCEPTION;
+        if (JS_ToFloat64(ctx, &d, val))
+            return -1;
         if (p->class_id == JS_CLASS_FLOAT16_ARRAY) {
             v64 = tofp16(d);
         } else if (p->class_id == JS_CLASS_FLOAT32_ARRAY) {
@@ -72185,18 +72270,21 @@ static JSValue js_typed_array_fill_build(JSContext *ctx, JSValueConst this_val, 
             v64 = u.u64;
         }
     }
+    *pv64 = v64;
+    return 0;
+}
 
-    k = 0;
-    if (argc > 1) {
-        if (JS_ToInt32Clamp(ctx, &k, argv[1], 0, len, len))
-            return JS_EXCEPTION;
-    }
+/* 23.2.3.9 from step 8 onwards, with the value ALREADY converted and both bounds ALREADY the clamped
+   ToIntegerOrInfinity results — a resizable buffer shrunk by the page's valueOf must clamp against the length the
+   spec read BEFORE the coercions, which is why the caller holds it. Nothing below invokes user code. */
+static JSValue js_typed_array_fill_build(JSContext *ctx, JSValueConst this_val, uint64_t v64, int k, int final)
+{
+    JSObject *p;
+    int shift;
 
-    final = len;
-    if (argc > 2 && !JS_IsUndefined(argv[2])) {
-        if (JS_ToInt32Clamp(ctx, &final, argv[2], 0, len, len))
-            return JS_EXCEPTION;
-    }
+    p = get_typed_array(ctx, this_val);
+    if (!p)
+        return JS_EXCEPTION;
 
     if (typed_array_is_oob(p))
         return JS_ThrowTypeErrorArrayBufferOOB(ctx);
