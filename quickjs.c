@@ -19180,6 +19180,11 @@ static void js_import_cap_free(JSContext *ctx, JSImportCap *ic)
     js_free(ctx, ic);
 }
 
+/* CONT_ITER_CONSUME's value, needed here because js_toprim_abandon runs before the kind list; the DCHECK below
+   keeps the two from drifting. */
+#define TOPRIM_OUTER_ITER_CONSUME 8
+static void js_iter_consume_abandon(JSContext *ctx, void *st);
+
 static void js_toprim_abandon(JSContext *ctx, struct JSToPrim *tp)
 {
     void *touter = tp->outer;
@@ -19191,6 +19196,10 @@ static void js_toprim_abandon(JSContext *ctx, struct JSToPrim *tp)
            the exception label, which is where the frame and the operand stack are the opcode's again. */
         DCHECK(ctx->pending_import_cap == NULL, "pending_import_cap already set — nested import coercion");
         ctx->pending_import_cap = touter;
+        return;
+    }
+    if (touter && tk == TOPRIM_OUTER_ITER_CONSUME) {
+        js_iter_consume_abandon(ctx, touter);   /* IfAbruptCloseIterator, then the machine is gone */
         return;
     }
     DCHECK(!touter || tk == CONT_STEP,
@@ -19262,6 +19271,7 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val, in
                                   chain, per element wrapping Promise.resolve(value).then(resolve_element). Reuses the
                                   generator drive; the settle re-enters do_promise_all_step. No promise-state
                                   fork-clone yet — a fork mid-consume DFAILs at the clone (guarded), never silent. */
+_Static_assert(TOPRIM_OUTER_ITER_CONSUME == 8, "TOPRIM_OUTER_ITER_CONSUME must equal CONT_ITER_CONSUME");
 #define CONT_ITER_CONSUME  8   /* cont_state = JSIterConsume: a builtin that CONSUMES an iterator in a loop
                                   (Array.from) drives the iterator's .next() on this chain — when the iterator is a
                                   GENERATOR its body runs on the chain (suspend/resume at any depth), never the
@@ -19555,6 +19565,15 @@ typedef struct JSIterConsume {
     uint8_t ta_phase;
     uint8_t ta_isfrom;   /* 1 = TypedArray.from (construct the receiver); 0 = new TypedArray(iterable), which
                             creates from ta_classid and never constructs a user ctor */
+    /* ITERCONS_OBJENTRIES: the entry's two element reads and the key's ToPropertyKey are USER CODE (an accessor,
+       a Proxy trap, a toString), so each is a PHASE of this machine rather than a C call inside the sink — a loop
+       in that code has to park like any other. ent_ph says which is due: 0 = entry[0], 1 = entry[1], 2 = coerce
+       the key, 3 = define. */
+    uint8_t ent_ph;
+    uint8_t ent_pending; /* 1 = an entry sequence is in flight, so `res` is its phase result, not a .next() one */
+    JSValue ent_obj;     /* the entry object, held across its two reads (owned) */
+    JSValue ent_key;     /* entry[0], then its property key (owned) */
+    JSValue ent_val;     /* entry[1] (owned) */
 } JSIterConsume;
 static int js_typed_array_get_length_unsafe(JSContext *ctx, JSValueConst obj);
 static bool typed_array_is_immutable(JSObject *p);
@@ -19563,7 +19582,8 @@ static void sum_precise_init(SumPreciseState *s);
 static void sum_precise_add(SumPreciseState *s, double d);
 static double sum_precise_get_result(SumPreciseState *s);
 static JSValue js_math_sumPrecise(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
-#define ITERCONS_OWNED(F) F(r) F(iter) F(next) F(adder) F(mapfn) F(mapfn_this) F(cb_value) F(ta_target)
+#define ITERCONS_OWNED(F) F(r) F(iter) F(next) F(adder) F(mapfn) F(mapfn_this) F(cb_value) F(ta_target) \
+                          F(ent_obj) F(ent_key) F(ent_val)
 /* NOTE: JSIteratorHelperData::cb_value is owned too — freed by the finalizer and cleared on every path below. */
 static int js_iter_consume_step(JSContext *ctx, struct JSIterConsume *s, JSValue res);
 static void js_iter_consume_end(JSContext *ctx, struct JSIterConsume *s);
@@ -22747,6 +22767,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         /* MACHINE mode: a coercing BUILTIN asked for this primitive; it comes back as that step's
                            result, exactly as a callback's would. */
                         cont_st = touter;
+                        if (touter_kind == CONT_ITER_CONSUME) { cont_st = touter; goto do_iter_consume_step; }
                         DCHECK(touter_kind == CONT_STEP, "ToPrimitive outer continuation: unknown machine kind");
                         goto do_step_step;
                     }
@@ -22804,8 +22825,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (unlikely(JS_IsException(ret_val))) goto getprop_throw;
                     }
                     cont_st = gp_outer;                            /* nothing suspended: straight to the machine */
-                    DCHECK(gp_outer_kind == CONT_STEP, "property-get outer continuation: unknown machine kind");
-                    gp_outer = NULL; gp_atom = JS_ATOM_NULL; gp_is_has = 0;
+                    { uint8_t gk = gp_outer_kind;
+                      gp_outer = NULL; gp_outer_kind = CONT_NONE; gp_atom = JS_ATOM_NULL; gp_is_has = 0;
+                      if (gk == CONT_ITER_CONSUME) goto do_iter_consume_step;
+                      DCHECK(gk == CONT_STEP, "property-get outer continuation: unknown machine kind"); }
                     goto do_step_step;
                 }
                 gp = js_mallocz(ctx, sizeof(*gp));
@@ -23272,6 +23295,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                       sp -= 4;
                       ret_val = cr;
                       goto do_iter_consume_step; }
+                }
+                if (st == 6) {
+                    /* Object.fromEntries: read the entry's element ent_ph through the property-get tramp, so an
+                       ACCESSOR entry or a Proxy source runs its body on this chain and a loop in it parks. Reading
+                       it here with JS_GetPropertyUint32 was the "loop preempted in a NON-coroutine activation"
+                       DFAIL: the getter had no flow base. */
+                    gp_outer = s; gp_outer_kind = CONT_ITER_CONSUME;
+                    gp_obj = s->ent_obj;
+                    gp_atom = __JS_AtomFromUInt32(s->ent_ph);
+                    gp_is_has = 0;
+                    goto do_getprop_tramp;
+                }
+                if (st == 5) {
+                    /* ToPropertyKey's user-code half on the entry's key: ToPrimitive with hint STRING, on the
+                       tramp for the same reason. */
+                    tp_outer = s; tp_outer_kind = CONT_ITER_CONSUME;
+                    tp_value = s->ent_key; tp_hint = HINT_STRING;
+                    tp_slot = 0; tp_retry_pc = NULL;
+                    goto do_toprim_tramp;
                 }
                 if (st == 4) {
                     /* 23.2.2.1 step 5.c: TypedArrayCreateFromConstructor(C, «len») — a REAL Construct of the
@@ -24523,7 +24565,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        machine that asked. */
                     JSGetProp *gp = rcs;
                     void *gouter = gp->outer;
-                    DCHECK(gp->outer_kind == CONT_STEP, "property-get outer continuation: unknown machine kind");
+                    uint8_t gouter_kind = gp->outer_kind;
+                    DCHECK(gouter_kind == CONT_STEP || gouter_kind == CONT_ITER_CONSUME,
+                           "property-get outer continuation: unknown machine kind");
                     if (gp->is_has) {
                         /* the `has` trap's boolean, then the target's [[HasProperty]] invariant on it */
                         int hres = js_proxy_has_invariant(ctx, gp->target, gp->atom, JS_ToBoolFree(ctx, ret_val));
@@ -24532,11 +24576,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         ret_val = js_proxy_get_invariant(ctx, gp->target, gp->atom, ret_val);
                     }
                     js_getprop_free(ctx, gp);
+                    cont_st = gouter;
+                    if (gouter_kind == CONT_ITER_CONSUME) {
+                        /* the consume step OWNS the abrupt case: it sets `abrupt` and returns 2 so the shared
+                           IteratorClose runs before the exception propagates (IfAbruptCloseIterator). */
+                        goto do_iter_consume_step;
+                    }
                     if (unlikely(JS_IsException(ret_val))) {
                         tramp_step_chain_free(ctx, gouter);
                         goto exception;
                     }
-                    cont_st = gouter;
                     goto do_step_step;
                 }
                 if (rck == CONT_TOPRIM) {
@@ -27896,10 +27945,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                the machines waiting on it go too. */
             JSGetProp *gp = xcs;
             void *gouter = gp->outer;
-            DCHECK(!gouter || gp->outer_kind == CONT_STEP,
+            uint8_t gk2 = gp->outer_kind;
+            DCHECK(!gouter || gk2 == CONT_STEP || gk2 == CONT_ITER_CONSUME,
                    "property-get outer continuation: unknown machine kind");
             js_getprop_free(ctx, gp);
-            tramp_step_chain_free(ctx, gouter);
+            if (gouter && gk2 == CONT_ITER_CONSUME) {
+                /* the entry's accessor threw: IfAbruptCloseIterator still owes the source a close, and the machine
+                   that asked for the read can never be re-entered — abandon does both. */
+                js_iter_consume_abandon(ctx, gouter);
+            } else {
+                tramp_step_chain_free(ctx, gouter);
+            }
         } else if (xck == CONT_CONSTRUCT) {
             /* the throwing frame was a constructor body: drop the created `this` and the super ctor ref. For
                new C() the operands on the caller stack are freed by the caller's own catch-search; for super()
@@ -50942,6 +50998,34 @@ static JSValue js_array_from(JSContext *ctx, JSValueConst this_val,
 static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
 {
     if (s->abrupt) { JS_FreeValue(ctx, res); return -1; }   /* close done; the original exception propagates */
+    if (s->ent_pending) {
+        /* Object.fromEntries, mid-ENTRY: `res` is what the tramp just produced for phase ent_ph — entry[0],
+           entry[1], or the key's ToPrimitive. Each of those runs user code (an accessor, a Proxy trap, a
+           toString) as its own tramp activation, so a loop inside it PARKS instead of being driven to
+           completion. Every abrupt exit is an IfAbruptCloseIterator site (return 2). */
+        if (JS_IsException(res)) { s->ent_pending = 0; s->abrupt = 1; return 2; }
+        if (s->ent_ph == 0) {
+            s->ent_key = res;
+            s->ent_ph = 1;
+            return 6;                       /* read entry[1] */
+        }
+        if (s->ent_ph == 1) {
+            s->ent_val = res;
+            JS_FreeValue(ctx, s->ent_obj); s->ent_obj = JS_UNDEFINED;   /* both reads done */
+            s->ent_ph = 2;
+            return 5;                       /* ToPrimitive(entry[0], string) — ToPropertyKey's user-code half */
+        }
+        DCHECK(s->ent_ph == 2, "fromEntries entry sequence: unknown phase");
+        s->ent_pending = 0;
+        { JSValue v = s->ent_val;
+          s->ent_val = JS_UNDEFINED;
+          JS_FreeValue(ctx, s->ent_key); s->ent_key = JS_UNDEFINED;
+          /* `res` is a PRIMITIVE now, so the rest of ToPropertyKey inside DefinePropertyValueValue runs no user
+             code at all. */
+          if (JS_DefinePropertyValueValue(ctx, s->r, res, v, JS_PROP_C_W_E | JS_PROP_THROW) < 0)
+              { s->abrupt = 1; return 2; }   /* consumes res + v */ }
+        return 1;                            /* entry done: drive the next .next() */
+    }
     if (s->cb_pending) {
         /* `res` is the ITERTERM callback's RESULT (it ran on the tramp), not an iterator result. */
         JSValue value = s->cb_value, fret = res;
@@ -51085,19 +51169,17 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
             if (JS_IsException(ret)) { s->abrupt = 1; return 2; }
             JS_FreeValue(ctx, ret);
         } else if (s->sink == ITERCONS_OBJENTRIES) {
-            /* Object.fromEntries(gen): the entry must be an object; r[entry[0]] = entry[1]. Mirrors js_object_fromEntries. */
-            JSValue key, val;
-            /* every abrupt exit here is an IfAbruptCloseIterator site: set abrupt and return 2 so the
-               shared close runs before the exception propagates. Returning -1 skipped the close, which is
-               exactly what the iterator-closed-for-* tests observe. */
+            /* Object.fromEntries: the entry must be an object; r[entry[0]] = entry[1]. The two element reads and
+               the key's ToPropertyKey are USER CODE, so each is a phase the interpreter runs on the tramp and
+               delivers back here — not a C call that would drive a getter's loop to completion.
+               Every abrupt exit is an IfAbruptCloseIterator site: set abrupt and return 2 so the shared close
+               runs before the exception propagates. Returning -1 skipped the close, which is exactly what the
+               iterator-closed-for-* tests observe. */
             if (!JS_IsObject(value)) { JS_FreeValue(ctx, value); JS_ThrowTypeErrorNotAnObject(ctx); s->abrupt = 1; return 2; }
-            key = JS_GetPropertyUint32(ctx, value, 0);
-            if (JS_IsException(key)) { JS_FreeValue(ctx, value); s->abrupt = 1; return 2; }
-            val = JS_GetPropertyUint32(ctx, value, 1);
-            JS_FreeValue(ctx, value);
-            if (JS_IsException(val)) { JS_FreeValue(ctx, key); s->abrupt = 1; return 2; }
-            if (JS_DefinePropertyValueValue(ctx, s->r, key, val, JS_PROP_C_W_E | JS_PROP_THROW) < 0)
-                { s->abrupt = 1; return 2; }   /* consumes key + val */
+            s->ent_obj = value;   /* ownership moves to the state for the whole entry sequence */
+            s->ent_ph = 0;
+            s->ent_pending = 1;
+            return 6;             /* read ent_obj[0] on the tramp */
         } else if (s->sink == ITERCONS_MAP) {
             /* new Map(gen): the entry must be an object; adder(entry[0], entry[1]). Mirrors js_map_constructor. */
             JSValue key, val, ret; JSValueConst args[2];
@@ -51217,6 +51299,26 @@ static void js_iter_consume_end(JSContext *ctx, JSIterConsume *s)
     #define ITERCONS_FREE_ONE(f) JS_FreeValue(ctx, s->f);
     ITERCONS_OWNED(ITERCONS_FREE_ONE)
     #undef ITERCONS_FREE_ONE
+}
+
+/* A phase this machine asked the interpreter to run (the entry key's ToPrimitive) THREW where there is no way
+   back into the step: IfAbruptCloseIterator still has to close the source before the exception propagates (the
+   close's own throw is discarded — the original wins), and then the machine is gone. A GENERATOR source's
+   .return() is a coroutine, so it is DEFERRED to the exception label's tramp close rather than driven here. */
+static void js_iter_consume_abandon(JSContext *ctx, void *st)
+{
+    JSIterConsume *s = st;
+    if (!JS_IsUndefined(s->iter)) {
+        if (JS_VALUE_GET_TAG(s->iter) == JS_TAG_OBJECT
+            && JS_VALUE_GET_OBJ(s->iter)->class_id == JS_CLASS_GENERATOR
+            && JS_VALUE_GET_OBJ(s->iter)->u.generator_data
+            && JS_IsUninitialized(ctx->pending_close_gen))
+            ctx->pending_close_gen = js_dup(s->iter);
+        else
+            JS_IteratorClose(ctx, s->iter, true);
+    }
+    js_iter_consume_end(ctx, s);
+    js_free_rt(ctx->rt, s);
 }
 
 /* Route Array.from ONLY for the direct-generator, single-arg (no mapfn) shape — the case whose C loop drives the
