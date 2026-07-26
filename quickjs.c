@@ -19006,6 +19006,9 @@ typedef struct JSProxyGet { JSValue target; JSAtom atom; } JSProxyGet;
                                   issued the delete, not to whichever frame happens to be current when the trap
                                   returns, so it is captured at the operator site rather than read at do_return. */
 typedef struct JSProxyDelete { JSValue target; JSAtom atom; bool throw_on_false; } JSProxyDelete;
+#define CONT_PROXY_CONSTRUCT 23 /* cont_state = NULL: a trampolined proxy [[Construct]] trap. The only thing it owes
+                                  after the call is 9.5.14 step 13 — the trap's result MUST be an object — so the
+                                  continuation carries no state, only the obligation. */
 #define CONT_PROXY_SET     6   /* cont_state = JSProxySet: a trampolined proxy [[Set]] trap. Carries (target, key)
                                   like the others PLUS the written VALUE, because 9.5.9 step 11's invariant is a
                                   SameValue against it, and the write's strictness. The trap's boolean is consumed
@@ -19320,6 +19323,7 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_PROXY_HAS:
     case CONT_PROXY_DELETE:
     case CONT_PROXY_SET:
+    case CONT_PROXY_CONSTRUCT:
     case CONT_PROMISE_EXEC:
     case CONT_PROMISE_TRY:
     case CONT_STEP:
@@ -20197,6 +20201,42 @@ static int js_tramp_proxy_set(JSContext *ctx, JSValueConst obj, JSAtom atom, JSV
     out[3] = keyval;
     out[4] = js_dup(value);
     out[5] = js_dup(obj);          /* receiver IS the proxy */
+    return 1;
+}
+/* PROXY [[Construct]]: `new proxy(...)`. Resolve the `construct` trap at the operator site and dispatch it as
+   trap(target, argArray, newTarget) with `this` = handler, so a loop in the trap body parks. Layout-independent
+   like [[Set]]'s: fills out[0..4] with [handler, trap, target, argArray, newTarget] (owning every one) because the
+   operand count the caller consumes depends on its argc. Returns 1 = routed, 2 = no trap, re-dispatch against
+   *out_target (which may itself be a proxy), 0 = not a proxy / non-bytecode trap, -1 = pending exception. */
+static JSValue JS_ThrowTypeErrorNotAConstructor(JSContext *ctx, JSValueConst val);
+static int js_tramp_proxy_construct(JSContext *ctx, JSValueConst func, JSValueConst new_target,
+                                    int argc, JSValueConst *argv, JSValue *out /* 5 slots */,
+                                    JSValue *out_target)
+{
+    JSProxyData *s;
+    JSValue method, arr;
+    *out_target = JS_UNDEFINED;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT
+        || JS_VALUE_GET_OBJ(func)->class_id != JS_CLASS_PROXY) return 0;
+    s = get_proxy_method(ctx, &method, func, JS_ATOM_construct);
+    if (!s) return -1;
+    if (!JS_IsConstructor(ctx, s->target)) {
+        JS_FreeValue(ctx, method);
+        JS_ThrowTypeErrorNotAConstructor(ctx, s->target);
+        return -1;
+    }
+    if (JS_IsUndefined(method)) {
+        *out_target = js_dup(s->target);   /* 9.5.14 step 6: Construct(target, args, newTarget) */
+        return 2;
+    }
+    if (!tramp_can_call(method)) { JS_FreeValue(ctx, method); return 0; }   /* C/bound trap: no preemptible body */
+    arr = js_create_array(ctx, argc, argv);
+    if (JS_IsException(arr)) { JS_FreeValue(ctx, method); return -1; }
+    out[0] = js_dup(s->handler);   /* this */
+    out[1] = method;               /* the trap (owned) */
+    out[2] = js_dup(s->target);
+    out[3] = arr;
+    out[4] = js_dup(new_target);
     return 1;
 }
 /* PROXY [[Call]]: resolve the `apply` trap at the operator site and dispatch it on THIS chain as
@@ -21453,6 +21493,47 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     A[-1] = f;       /* callee */
                     tramp_first = -2; tramp_is_tail = 0; tramp_step_isctor = 1;
                     goto do_step_tramp;
+                }
+                if (JS_VALUE_GET_TAG(call_argv[-2]) == JS_TAG_OBJECT
+                    && JS_VALUE_GET_OBJ(call_argv[-2])->class_id == JS_CLASS_PROXY) {
+                    /* proxy [[Construct]]: run the trap on THIS chain. Five operands replace the callee,
+                       new_target and args, and the continuation's only job is the must-return-an-object check. */
+                    JSValue px[5], ptgt;
+                    int px_ret;
+                    DCHECK(sp + 3 <= TRAMP_SP_LIMIT(sf),
+                           "proxy construct trap: operand reshape exceeds the frame's compiled stack_size");
+                    px_ret = js_tramp_proxy_construct(ctx, call_argv[-2], call_argv[-1],
+                                                      call_argc, vc(call_argv), px, &ptgt);
+                    while (px_ret == 2) {   /* no trap: construct the TARGET, which may itself be a proxy */
+                        JSValue *A = (JSValue *)call_argv;
+                        JS_FreeValue(ctx, A[-2]);
+                        A[-2] = ptgt;
+                        px_ret = js_tramp_proxy_construct(ctx, call_argv[-2], call_argv[-1],
+                                                          call_argc, vc(call_argv), px, &ptgt);
+                    }
+                    if (unlikely(px_ret < 0)) goto exception;
+                    if (px_ret > 0) {
+                        JSValue *A = (JSValue *)call_argv;
+                        int k;
+                        for (k = 0; k < call_argc; k++) JS_FreeValue(ctx, A[k]);
+                        JS_FreeValue(ctx, A[-1]);   /* new_target — px[4] holds its own ref */
+                        JS_FreeValue(ctx, A[-2]);   /* the proxy */
+                        A[-2] = px[0]; A[-1] = px[1];
+                        A[0] = px[2]; A[1] = px[3]; A[2] = px[4];
+                        sp = A + 3;
+                        call_argv = A; call_argc = 3; tramp_first = -2; tramp_is_tail = 0;
+                        tramp_cont_state = NULL; tramp_cont_kind = CONT_PROXY_CONSTRUCT;
+                        goto do_tramp_call;
+                    }
+                    /* px_ret == 0: the resolved callee (possibly a target reached through no-trap proxies) has no
+                       preemptible trap body — fall through to the C construct below, which re-reads call_argv[-2]. */
+                    if (tramp_can_construct(call_argv[-2])) {
+                        con_func = call_argv[-2]; con_ntgt = call_argv[-1];
+                        con_args = vc(call_argv); con_argc = call_argc;
+                        con_from_super = 0; con_super_ref = JS_UNDEFINED;
+                        tramp_first = -2; tramp_is_tail = 0;
+                        goto do_construct_tramp;   /* a bytecode ctor behind a trapless proxy still runs here */
+                    }
                 }
                 ret_val = JS_CallConstructorInternal(ctx, call_argv[-2],
                                                      call_argv[-1], call_argc,
@@ -24944,6 +25025,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 } else if (rck == CONT_PROMISE_TRY) {
                     ptry_finish_state = rcs;
                     goto do_promise_try_finish;   /* fn returned: resolve the promise with its value */
+                } else if (rck == CONT_PROXY_CONSTRUCT) {
+                    /* 9.5.14 step 13: the `construct` trap's result must be an object. Then the normal placement
+                       below drops the five reshaped operands and pushes it where `new` expects its result. */
+                    if (unlikely(JS_VALUE_GET_TAG(ret_val) != JS_TAG_OBJECT)) {
+                        JS_FreeValue(ctx, ret_val);
+                        JS_ThrowTypeErrorNotAnObject(ctx);
+                        goto exception;
+                    }
                 } else if (rck == CONT_PROXY_SET) {
                     /* the proxy `set` trap returned: ToBoolean, the target's [[Set]] invariant (the SAME
                        js_proxy_set_invariant the C path uses), then the strict-mode throw a rejected write owes.
@@ -28305,9 +28394,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
             }
             js_free_rt(rt, cs);
-        } else if (xck == CONT_SETTER) {
-            /* a throwing setter body: no continuation state; its operands (this,setter,value) are on the caller
-               stack and freed by the caller's own catch-search, exactly like a normal method call. */
+        } else if (xck == CONT_SETTER || xck == CONT_PROXY_CONSTRUCT) {
+            /* a throwing setter body, or a throwing proxy `construct` trap: no continuation state; the operands are
+               on the caller stack and freed by the caller's own catch-search, exactly like a normal method call. */
         } else if (xck == CONT_PROMISE_ALL) {
             /* a Promise combinator callback driven on the tramp threw — a plain iterator's .next(), or the
                aggregate resolve/reject settle for a custom Promise subclass. PerformPromiseAll's abrupt handling
@@ -62332,8 +62421,10 @@ static JSValue js_proxy_call_constructor(JSContext *ctx, JSValueConst func_obj,
     s = get_proxy_method(ctx, &method, func_obj, JS_ATOM_construct);
     if (!s)
         return JS_EXCEPTION;
-    if (!JS_IsConstructor(ctx, s->target))
+    if (!JS_IsConstructor(ctx, s->target)) {
+        JS_FreeValue(ctx, method);   /* the trap was already read: returning without it leaked the handler's function */
         return JS_ThrowTypeErrorNotAConstructor(ctx, s->target);
+    }
     if (JS_IsUndefined(method))
         return JS_CallConstructor2(ctx, s->target, new_target, argc, argv);
     arg_array = js_create_array(ctx, argc, argv);
