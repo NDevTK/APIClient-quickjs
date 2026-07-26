@@ -1445,7 +1445,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_BIGINT_ASUINTN, STEPDEF_BIGINT_ASINTN,
     STEPDEF_OBJ_GOPD, STEPDEF_REFLECT_GOPD,
     STEPDEF_OBJ_VALUES, STEPDEF_OBJ_ENTRIES, STEPDEF_OBJ_ASSIGN, STEPDEF_OBJ_SPREAD,
-    STEPDEF_ARRAY_FLAT, STEPDEF_ARRAY_FLATMAP, STEPDEF_ARRAY_FROMLIKE, STEPDEF_ARRAY_WITH, STEPDEF_ARRAY_FILL, STEPDEF_ARRAY_COPYWITHIN, STEPDEF_BIGINT_CTOR, STEPDEF_TA_WITH, STEPDEF_TA_FILL, STEPDEF_TA_COPYWITHIN, STEPDEF_TA_INDEXOF, STEPDEF_TA_LASTINDEXOF, STEPDEF_TA_INCLUDES, STEPDEF_DATE_TOJSON, STEPDEF_DATE_TOPRIM, STEPDEF_DATE_CTOR,
+    STEPDEF_ARRAY_FLAT, STEPDEF_ARRAY_FLATMAP, STEPDEF_ARRAY_FROMLIKE, STEPDEF_ARRAY_WITH, STEPDEF_ARRAY_FILL, STEPDEF_ARRAY_COPYWITHIN, STEPDEF_BIGINT_CTOR, STEPDEF_TA_WITH, STEPDEF_TA_FILL, STEPDEF_TA_COPYWITHIN, STEPDEF_TA_INDEXOF, STEPDEF_TA_LASTINDEXOF, STEPDEF_TA_INCLUDES, STEPDEF_TA_SUBARRAY, STEPDEF_DATE_TOJSON, STEPDEF_DATE_TOPRIM, STEPDEF_DATE_CTOR,
     STEPDEF_MATH_ABS, STEPDEF_MATH_FLOOR, STEPDEF_MATH_CEIL, STEPDEF_MATH_ROUND, STEPDEF_MATH_SQRT, STEPDEF_MATH_ACOS, STEPDEF_MATH_ASIN, STEPDEF_MATH_ATAN, STEPDEF_MATH_COS, STEPDEF_MATH_EXP, STEPDEF_MATH_LOG, STEPDEF_MATH_SIN, STEPDEF_MATH_TAN, STEPDEF_MATH_TRUNC, STEPDEF_MATH_SIGN, STEPDEF_MATH_COSH, STEPDEF_MATH_SINH, STEPDEF_MATH_TANH, STEPDEF_MATH_ACOSH, STEPDEF_MATH_ASINH, STEPDEF_MATH_ATANH, STEPDEF_MATH_EXPM1, STEPDEF_MATH_LOG1P, STEPDEF_MATH_LOG2, STEPDEF_MATH_LOG10, STEPDEF_MATH_CBRT, STEPDEF_MATH_F16ROUND, STEPDEF_MATH_FROUND, STEPDEF_MATH_ATAN2, STEPDEF_MATH_POW, STEPDEF_MATH_MIN, STEPDEF_MATH_MAX, STEPDEF_MATH_HYPOT, STEPDEF_MATH_IMUL, STEPDEF_MATH_CLZ32, STEPDEF_STR_FROMCHARCODE, STEPDEF_STR_FROMCODEPOINT, STEPDEF_DATE_UTC,
     STEPDEF_REGEXP_EXEC, STEPDEF_REGEXP_TEST,
     STEPDEF_ITER_TAKE, STEPDEF_ITER_DROP,
@@ -19958,6 +19958,24 @@ typedef struct JSArrayFill {
     JSValue obj;          /* ToObject(this) (owned); also the result */
     int64_t len, k, end;
 } JSArrayFill;
+
+/* 23.2.3.30 %TypedArray%.prototype.subarray. Its two bounds are the page's code, and so is everything after them:
+   TypedArraySpeciesCreate reads `constructor`, reads @@species and CONSTRUCTS — three more user-code points that
+   js_typed_array___speciesCreate ran from C. That is why subarray is not a mode of the coercion prologue: its tail
+   is not pure. */
+typedef struct JSTASubarray {
+    JSStepHdr hdr;        /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    JSValue result;       /* DONE (owned) */
+    JSValue prim[2];      /* the coerced bounds (owned) */
+    JSValue buffer;       /* the source's [[ViewedArrayBuffer]] (owned) */
+    JSValue ctor;         /* `constructor`, then its @@species (owned) */
+    JSValue cargs[4];     /* [ctor, buffer, offset, count] — the CONSTRUCT request (owned) */
+    int len, i, nargs, class_id;
+} JSTASubarray;
+static JSValue js_typed_array_get_buffer(JSContext *ctx, JSValueConst this_val);
+static JSValue js_typed_array_constructor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv,
+                                          int classid);
+static JSObject *get_typed_array(JSContext *ctx, JSValueConst this_val);
 
 /* THE %TypedArray% coercion prologue. fill (23.2.3.9) and copyWithin (23.2.3.6) have the identical shape: validate,
    read the length, coerce up to three arguments the page controls, then a tail that runs no user code at all. Both
@@ -53552,6 +53570,125 @@ static bool ta_coerce_wants(JSTACoerce *s, int i)
     return h->argc > 2 && !JS_IsUndefined(step_arg(h, 2));
 }
 
+static int js_ta_subarray_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSTASubarray *s = st;
+    int r, k;
+
+    if (s->hdr.stage == 0) {
+        JSObject *p;
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
+        s->result = JS_UNDEFINED; s->buffer = JS_UNDEFINED; s->ctor = JS_UNDEFINED;
+        s->prim[0] = JS_UNDEFINED; s->prim[1] = JS_UNDEFINED;
+        for (k = 0; k < 4; k++) s->cargs[k] = JS_UNDEFINED;
+        s->len = 0; s->i = 0; s->nargs = 0; s->class_id = 0;
+        p = get_typed_array(ctx, s->hdr.this_val);
+        if (!p) return -1;
+        s->len = p->u.array.count;
+        s->class_id = p->class_id;
+        s->hdr.stage = 1;
+    }
+    while (s->hdr.stage == 1) {
+        if (s->i >= 2) break;
+        /* `begin` always, `end` only when it is not undefined — the same rule the C body applied */
+        if (s->i == 1 && JS_IsUndefined(step_arg(&s->hdr, 1))) { s->i++; continue; }
+        r = step_toprim_run(ctx, &s->hdr, step_arg(&s->hdr, s->i), HINT_NUMBER, cb_result, &s->prim[s->i],
+                            out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->i++;
+    }
+    if (s->hdr.stage == 1) {
+        JSObject *p = get_typed_array(ctx, s->hdr.this_val);
+        JSTypedArray *ta;
+        int start, final, count, shift, offset;
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        if (!p) return -1;
+        /* the clamps are against the length read at step 2, on operands that are primitives now */
+        if (JS_ToInt32Clamp(ctx, &start, s->prim[0], 0, s->len, s->len)) return -1;
+        final = s->len;
+        if (!JS_IsUndefined(step_arg(&s->hdr, 1))
+            && JS_ToInt32Clamp(ctx, &final, s->prim[1], 0, s->len, s->len)) return -1;
+        count = max_int(final - start, 0);
+        ta = p->u.typed_array;
+        /* step 12 reads the [[ByteOffset]] SLOT, not the .byteOffset getter, which reports 0 once the buffer is
+           detached — and `end`'s valueOf is free to detach it. */
+        shift = typed_array_size_log2(p->class_id);
+        offset = ta->offset + (start << shift);
+        s->buffer = js_typed_array_get_buffer(ctx, s->hdr.this_val);
+        if (JS_IsException(s->buffer)) { s->buffer = JS_UNDEFINED; return -1; }
+        s->cargs[1] = js_dup(s->buffer);
+        s->cargs[2] = js_int32(offset);
+        s->cargs[3] = js_int32(count);
+        /* step 16: a LENGTH-TRACKING source with no explicit `end` builds the result length-tracking too, and its
+           argumentsList is « buffer, beginByteOffset » — TWO entries. A third undefined is observable: a custom
+           @@species sees an extra argument and `arguments.length` 3. */
+        s->nargs = (ta->track_rab && JS_IsUndefined(step_arg(&s->hdr, 1))) ? 2 : 3;
+        s->hdr.stage = 2;
+    }
+    if (s->hdr.stage == 2) {
+        /* SpeciesConstructor step 1: Get(O, "constructor") */
+        r = step_getprop_run(ctx, &s->hdr, s->hdr.this_val, JS_ATOM_constructor, cb_result, &s->ctor,
+                             out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        if (JS_IsUndefined(s->ctor)) { s->hdr.stage = 4; }      /* step 2: the intrinsic */
+        else if (!JS_IsObject(s->ctor)) { JS_ThrowTypeErrorNotAnObject(ctx); return -1; }
+        else s->hdr.stage = 3;
+    }
+    if (s->hdr.stage == 3) {
+        /* SpeciesConstructor step 4: Get(C, @@species) */
+        JSValue sp = JS_UNDEFINED;
+        r = step_getprop_run(ctx, &s->hdr, s->ctor, JS_ATOM_Symbol_species, cb_result, &sp, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        JS_FreeValue(ctx, s->ctor);
+        s->ctor = JS_IsNull(sp) ? (JS_FreeValue(ctx, sp), JS_UNDEFINED) : sp;
+        if (!JS_IsUndefined(s->ctor) && !JS_IsConstructor(ctx, s->ctor)) {
+            JS_ThrowTypeError(ctx, "not a constructor");
+            return -1;
+        }
+        s->hdr.stage = 4;
+    }
+    if (s->hdr.stage == 4) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        if (JS_IsUndefined(s->ctor)) {
+            /* no species: create by CLASS, which constructs nothing of the page's */
+            s->result = js_typed_array_constructor(ctx, JS_UNDEFINED, s->nargs,
+                                                   (JSValueConst *)&s->cargs[1], s->class_id);
+            return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
+        }
+        s->cargs[0] = js_dup(s->ctor);
+        s->hdr.stage = 5;
+        *out_cb = s->cargs; *out_argc = s->nargs;
+        return 4;
+    }
+    DCHECK(s->hdr.stage == 5, "TypedArray.prototype.subarray: unknown stage");
+    /* TypedArrayCreateFromConstructor's tail: the result must BE a typed array, and with one argument it must be
+       long enough. Neither check runs user code. */
+    s->result = cb_result;
+    if (js_typed_array_get_length_unsafe(ctx, s->result) < 0) {
+        JS_FreeValue(ctx, s->result); s->result = JS_UNDEFINED;
+        return -1;
+    }
+    return 0;
+}
+
+static JSValue js_ta_subarray_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSTASubarray *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    int i;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    for (i = 0; i < 4; i++) JS_FreeValue(ctx, s->cargs[i]);
+    for (i = 0; i < 2; i++) JS_FreeValue(ctx, s->prim[i]);
+    JS_FreeValue(ctx, s->ctor);
+    JS_FreeValue(ctx, s->buffer);
+    js_free(ctx, s);
+    return r;
+}
+
 static int js_ta_coerce_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSTACoerce *s = st;
@@ -54578,6 +54715,8 @@ static int js_array_with_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
 static int js_array_fill_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_ta_with_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_ta_coerce_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static int js_ta_subarray_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_ta_subarray_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_ta_coerce_fini(JSContext *ctx, void *st, bool take_result);
 static int js_date_tojson_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_date_toprim_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
@@ -54716,6 +54855,7 @@ static const JSTrampStepDef js_ta_copyWithin_def = { sizeof(JSTACoerce), js_ta_c
 static const JSTrampStepDef js_ta_indexOf_def     = { sizeof(JSTACoerce), js_ta_coerce_step, js_ta_coerce_fini, TAPRO_SEARCH_ARG(special_indexOf) };
 static const JSTrampStepDef js_ta_lastIndexOf_def = { sizeof(JSTACoerce), js_ta_coerce_step, js_ta_coerce_fini, TAPRO_SEARCH_ARG(special_lastIndexOf) };
 static const JSTrampStepDef js_ta_includes_def    = { sizeof(JSTACoerce), js_ta_coerce_step, js_ta_coerce_fini, TAPRO_SEARCH_ARG(special_includes) };
+static const JSTrampStepDef js_ta_subarray_def    = { sizeof(JSTASubarray), js_ta_subarray_step, js_ta_subarray_fini, 0 };
 static const JSTrampStepDef js_date_toJSON_def = { sizeof(JSDateToJSON), js_date_tojson_step, js_date_tojson_fini, 0 };
 static const JSTrampStepDef js_date_toPrim_def = { sizeof(JSDateToPrim), js_date_toprim_step, js_date_toprim_fini, 0 };
 static const JSTrampStepDef js_date_ctor_def = { sizeof(JSDateCtor), js_date_ctor_step, js_date_ctor_fini, 0 };
@@ -54879,6 +55019,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_TA_INDEXOF]    = &js_ta_indexOf_def,
     [STEPDEF_TA_LASTINDEXOF]= &js_ta_lastIndexOf_def,
     [STEPDEF_TA_INCLUDES]   = &js_ta_includes_def,
+    [STEPDEF_TA_SUBARRAY]   = &js_ta_subarray_def,
     [STEPDEF_DATE_TOJSON]   = &js_date_toJSON_def,
     [STEPDEF_DATE_TOPRIM]   = &js_date_toPrim_def,
     [STEPDEF_DATE_CTOR]     = &js_date_ctor_def,
@@ -72784,53 +72925,6 @@ static JSValue js_ta_idx_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
-static JSValue js_typed_array_subarray(JSContext *ctx, JSValueConst this_val,
-                                       int argc, JSValueConst *argv)
-{
-    JSArrayBuffer *abuf;
-    JSTypedArray *ta;
-    JSValueConst args[4];
-    JSValue arr, byteOffset, ta_buffer;
-    JSObject *p;
-    int len, start, final, count, shift, offset, nargs;
-
-    p = get_typed_array(ctx, this_val);
-    if (!p)
-        goto exception;
-    len = p->u.array.count;
-    if (JS_ToInt32Clamp(ctx, &start, argv[0], 0, len, len))
-        goto exception;
-    final = len;
-    if (!JS_IsUndefined(argv[1])) {
-        if (JS_ToInt32Clamp(ctx, &final, argv[1], 0, len, len))
-            goto exception;
-    }
-    count = max_int(final - start, 0);
-    ta = p->u.typed_array;
-    /* 23.2.3.30 step 12 reads O.[[ByteOffset]] — the SLOT, not the .byteOffset getter, which reports 0 once the
-       buffer is detached (and `end`'s valueOf is free to detach it). And the algorithm has NO bounds check of its
-       own: it hands buffer/beginByteOffset/newLength to TypedArraySpeciesCreate, and the constructor is what
-       throws on a detached buffer. The RangeError here pre-empted that and fired on a detach the spec lets
-       through. */
-    shift = typed_array_size_log2(p->class_id);
-    offset = ta->offset + (start << shift);
-    ta_buffer = js_typed_array_get_buffer(ctx, this_val);
-    if (JS_IsException(ta_buffer))
-        goto exception;
-    args[0] = this_val;
-    args[1] = safe_const(ta_buffer);
-    args[2] = safe_const(js_int32(offset));
-    args[3] = safe_const(js_int32(count));
-    /* 23.2.3.30 step 16: a LENGTH-TRACKING source with no explicit `end` builds the result length-tracking too,
-       and its argumentsList is « buffer, beginByteOffset » — TWO entries. Passing a third `undefined` is
-       observable: a custom @@species sees an extra argument (and `arguments.length` 3). */
-    nargs = (ta->track_rab && JS_IsUndefined(argv[1])) ? 3 : 4;
-    arr = js_typed_array___speciesCreate(ctx, JS_UNDEFINED, nargs, args, false);
-    JS_FreeValue(ctx, ta_buffer);
-    return arr;
- exception:
-    return JS_EXCEPTION;
-}
 
 /* TypedArray.prototype.sort */
 
@@ -73205,7 +73299,7 @@ static const JSCFunctionListEntry js_typed_array_base_proto_funcs[] = {
     JS_CFUNC_DEF("reverse", 0, js_typed_array_reverse ),
     JS_CFUNC_DEF("toReversed", 0, js_typed_array_toReversed ),
     JS_CFUNC_STEP_DEF("slice", 2, STEPDEF_TA_SLICE ),
-    JS_CFUNC_DEF("subarray", 2, js_typed_array_subarray ),
+    JS_CFUNC_STEP_DEF("subarray", 2, STEPDEF_TA_SUBARRAY ),
     JS_CFUNC_DEF("sort", 1, js_typed_array_sort ),
     JS_CFUNC_DEF("toSorted", 1, js_typed_array_toSorted ),
     JS_CFUNC_STEP_DEF("join", 1, STEPDEF_TA_JOIN ),
