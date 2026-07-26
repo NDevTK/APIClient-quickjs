@@ -1445,7 +1445,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_BIGINT_ASUINTN, STEPDEF_BIGINT_ASINTN,
     STEPDEF_OBJ_GOPD, STEPDEF_REFLECT_GOPD,
     STEPDEF_OBJ_VALUES, STEPDEF_OBJ_ENTRIES, STEPDEF_OBJ_ASSIGN, STEPDEF_OBJ_SPREAD,
-    STEPDEF_ARRAY_FLAT, STEPDEF_ARRAY_FLATMAP, STEPDEF_ARRAY_FROMLIKE, STEPDEF_ARRAY_WITH, STEPDEF_ARRAY_FILL, STEPDEF_ARRAY_COPYWITHIN, STEPDEF_BIGINT_CTOR, STEPDEF_TA_WITH, STEPDEF_TA_FILL, STEPDEF_TA_COPYWITHIN, STEPDEF_TA_INDEXOF, STEPDEF_TA_LASTINDEXOF, STEPDEF_TA_INCLUDES, STEPDEF_TA_SUBARRAY, STEPDEF_AB_SLICE, STEPDEF_AB_SLICE_IMM, STEPDEF_SAB_SLICE, STEPDEF_DATE_TOJSON, STEPDEF_DATE_TOPRIM, STEPDEF_DATE_CTOR,
+    STEPDEF_ARRAY_FLAT, STEPDEF_ARRAY_FLATMAP, STEPDEF_ARRAY_FROMLIKE, STEPDEF_ARRAY_WITH, STEPDEF_ARRAY_FILL, STEPDEF_ARRAY_COPYWITHIN, STEPDEF_BIGINT_CTOR, STEPDEF_TA_WITH, STEPDEF_TA_FILL, STEPDEF_TA_COPYWITHIN, STEPDEF_TA_INDEXOF, STEPDEF_TA_LASTINDEXOF, STEPDEF_TA_INCLUDES, STEPDEF_TA_SUBARRAY, STEPDEF_AB_SLICE, STEPDEF_AB_SLICE_IMM, STEPDEF_SAB_SLICE, STEPDEF_AB_CTOR, STEPDEF_SAB_CTOR, STEPDEF_AB_RESIZE, STEPDEF_SAB_GROW, STEPDEF_AB_TRANSFER, STEPDEF_AB_TRANSFER_IMM, STEPDEF_AB_TRANSFER_FIX, STEPDEF_DATAVIEW_CTOR, STEPDEF_DATE_TOJSON, STEPDEF_DATE_TOPRIM, STEPDEF_DATE_CTOR,
     STEPDEF_MATH_ABS, STEPDEF_MATH_FLOOR, STEPDEF_MATH_CEIL, STEPDEF_MATH_ROUND, STEPDEF_MATH_SQRT, STEPDEF_MATH_ACOS, STEPDEF_MATH_ASIN, STEPDEF_MATH_ATAN, STEPDEF_MATH_COS, STEPDEF_MATH_EXP, STEPDEF_MATH_LOG, STEPDEF_MATH_SIN, STEPDEF_MATH_TAN, STEPDEF_MATH_TRUNC, STEPDEF_MATH_SIGN, STEPDEF_MATH_COSH, STEPDEF_MATH_SINH, STEPDEF_MATH_TANH, STEPDEF_MATH_ACOSH, STEPDEF_MATH_ASINH, STEPDEF_MATH_ATANH, STEPDEF_MATH_EXPM1, STEPDEF_MATH_LOG1P, STEPDEF_MATH_LOG2, STEPDEF_MATH_LOG10, STEPDEF_MATH_CBRT, STEPDEF_MATH_F16ROUND, STEPDEF_MATH_FROUND, STEPDEF_MATH_ATAN2, STEPDEF_MATH_POW, STEPDEF_MATH_MIN, STEPDEF_MATH_MAX, STEPDEF_MATH_HYPOT, STEPDEF_MATH_IMUL, STEPDEF_MATH_CLZ32, STEPDEF_STR_FROMCHARCODE, STEPDEF_STR_FROMCODEPOINT, STEPDEF_DATE_UTC,
     STEPDEF_REGEXP_EXEC, STEPDEF_REGEXP_TEST,
     STEPDEF_ITER_TAKE, STEPDEF_ITER_DROP,
@@ -1521,7 +1521,6 @@ static bool is_valid_weakref_target(JSValueConst val);
 static void insert_weakref_record(JSValueConst target,
                                   struct JSWeakRefRecord *wr);
 static JSValue js_array_buffer_constructor3(JSContext *ctx,
-                                            JSValueConst new_target,
                                             uint64_t len, uint64_t *max_len,
                                             JSClassID class_id,
                                             uint8_t *buf,
@@ -17984,6 +17983,7 @@ typedef struct JSTrampStepDef {
     void     (*onerror)(JSContext *ctx, JSValueConst this_val, int magic);
 } JSTrampStepDef;
 static const JSTrampStepDef *tramp_step_def_of(JSValueConst func);
+static const JSTrampStepDef *tramp_step_ctor_def_of(JSValueConst func);
 /* the def a STEPDEF_* id names. A CALL reaches its def through the callee object; an OPCODE that drives a machine
    has no callee to read, so it names the def by id — the same list, one lookup, no second table. */
 static const JSTrampStepDef *tramp_step_def_by_id(int id);
@@ -18792,8 +18792,21 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
                length, `slice` clamping its indices — user code reached from C before the state existed, with no
                step to route it to. There is no init any more: the driver allocates the state and the prologue is
                step 0, so a coercion in a prologue requests a TOPRIMITIVE step exactly like one in a body. */
-            DFAIL("a step builtin was invoked outside the interpreter's dispatch — route that call site onto "
-                  "do_step_tramp; there is no second driver");
+            {   /* NAME the builtin. Without it the abort says only "a step builtin", and finding WHICH one meant
+                   bisecting the corpus a directory at a time — the assert is supposed to name the exact unbuilt
+                   mechanism, not start a search. The STEPDEF id identifies the def uniquely; the `name` property
+                   is what a reader recognises, and reading it here is safe because the very next statement is
+                   abort(). */
+                char why[192];
+                const char *nm = NULL;
+                JSValue nv = JS_GetProperty(ctx, func_obj, JS_ATOM_name);
+                if (!JS_IsException(nv)) nm = JS_ToCString(ctx, nv);
+                snprintf(why, sizeof(why),
+                         "the step builtin `%s` (STEPDEF id %d) was invoked outside the interpreter's dispatch — "
+                         "route that call site onto do_step_tramp; there is no second driver",
+                         nm ? nm : "?", p->u.cfunc.magic);
+                DFAIL(why);
+            }
             ret_val = JS_EXCEPTION;
         }
         break;
@@ -19924,6 +19937,7 @@ typedef struct JSJsonReviver {
 typedef struct JSStrCtor {
     JSStepHdr hdr;        /* MUST be first — new_target is hdr.this_val, the argument is hdr.argv[0] */
     JSValue result;       /* DONE: the string or wrapper (owned) */
+    JSValue val;          /* the computed string, held across the wrapper's prototype read (owned) */
     JSValue cb[1];
     uint8_t coerced;
 } JSStrCtor;
@@ -19974,8 +19988,35 @@ typedef struct JSABSlice {
 } JSABSlice;
 static JSValue js_array_buffer_slice_build(JSContext *ctx, JSValueConst this_val, JSValue new_obj,
                                            int64_t start, int64_t new_len, int magic);
-static JSValue js_array_buffer_constructor2(JSContext *ctx, JSValueConst new_target, uint64_t len,
+static JSValue js_array_buffer_constructor2(JSContext *ctx, uint64_t len,
                                             uint64_t *pmax_len, JSClassID class_id);
+
+/* 25.1.4.1 / 25.2.3.1 the ArrayBuffer and SharedArrayBuffer constructors. ToIndex(length) is page code, so is the
+   options object's `maxByteLength` [[Get]] and the ToIndex of what it returns, and so is AllocateArrayBuffer's
+   OrdinaryCreateFromConstructor — four user-code points a single C body could not suspend at. The two
+   constructors are one machine differing only by class id. */
+typedef struct JSABCtor {
+    JSStepHdr hdr;        /* MUST be first; new_target is hdr.this_val, the class id is hdr.arg */
+    JSValue result;       /* DONE (owned) */
+    JSValue prim;         /* the value being coerced, or the `maxByteLength` option (owned) */
+    uint64_t len, max_len;
+    uint8_t has_max;
+} JSABCtor;
+
+/* 25.3.2.1 the DataView constructor. ToIndex(byteOffset) and ToIndex(byteLength) both run the page's valueOf, and
+   OrdinaryCreateFromConstructor after them reads new.target's `prototype` — three user-code points a single C
+   body could not suspend at, so `new DataView(buf, {valueOf(){ while(x){} }})` had no flow base. The spec
+   interleaves the checks with the coercions (the detached check and the byteOffset range check sit BETWEEN them),
+   so each stage carries its own, and both post-create re-checks stay because the prototype read can resize or
+   detach the buffer just as the coercions can. */
+typedef struct JSDataViewCtor {
+    JSStepHdr hdr;        /* MUST be first; new_target is hdr.this_val */
+    JSValue result;       /* DONE (owned) */
+    JSValue prim;         /* the bound being coerced (owned) */
+    uint64_t offset;
+    uint32_t len;
+    uint8_t recompute_len, track_rab;
+} JSDataViewCtor;
 
 /* 23.2.3.30 %TypedArray%.prototype.subarray. Its two bounds are the page's code, and so is everything after them:
    TypedArraySpeciesCreate reads `constructor`, reads @@species and CONSTRUCTS — three more user-code points that
@@ -20225,6 +20266,7 @@ typedef struct JSNumberFmt {
 typedef struct JSNumCtor {
     JSStepHdr hdr;
     JSValue result;       /* DONE (owned) */
+    JSValue val;          /* the computed numeric value, held across the wrapper's prototype read (owned) */
     JSValue cb[1];        /* the TOPRIMITIVE request buffer */
     uint8_t coerced;
 } JSNumCtor;
@@ -21049,7 +21091,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     void *tramp_cont_state = NULL, *cont_st = NULL;
     uint8_t tramp_cont_kind = CONT_NONE;
     int tramp_gen_magic = 0;                            /* set before goto do_generator_tramp */
-    int tramp_step_isctor = 0;                          /* 1 = the step about to be pushed is a CONSTRUCT, so the receiver slot carries new_target (read+reset in do_step_tramp) */
     void *tramp_step_outer = NULL;                      /* non-NULL = the step about to be pushed delivers its result to this machine's step, not to the operand stack (read+reset in do_step_tramp) */
     uint8_t tramp_step_outer_kind = CONT_NONE;
     int tp_slot = 0;                                    /* do_toprim_tramp inputs. OPERAND mode: the operand's offset from sp + the opcode byte to re-execute. MACHINE mode: tp_outer is set and the primitive is delivered to that step instead. */
@@ -21816,23 +21857,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                 }
                 if (JS_VALUE_GET_TAG(call_argv[-2]) == JS_TAG_OBJECT
-                    && JS_VALUE_GET_OBJ(call_argv[-2])->class_id == JS_CLASS_C_FUNCTION
-                    && JS_VALUE_GET_OBJ(call_argv[-2])->u.cfunc.cproto == JS_CFUNC_step_ctor) {
-                    /* A constructor_or_func builtin declared as a step machine (String, and every other coercing
-                       constructor as they convert). `new C(args)` lays its operands out as [func, new_target,
-                       args] while a method call is [this, func, args] — the SAME two slots in the other order, and
-                       the constructor_or_func convention already passes new_target where a method passes `this`.
-                       So this is an operand RESHAPE, like .call and .apply: swap the two, and do_step_tramp reads
-                       the callee and the receiver exactly where it always does. No second step kind, no
-                       construct-aware init signature. */
-                    JSValue *A = (JSValue *)call_argv;
-                    JSValue f = A[-2];
-                    A[-2] = A[-1];   /* this = new_target */
-                    A[-1] = f;       /* callee */
-                    tramp_first = -2; tramp_is_tail = 0; tramp_step_isctor = 1;
-                    goto do_step_tramp;
-                }
-                if (JS_VALUE_GET_TAG(call_argv[-2]) == JS_TAG_OBJECT
                     && JS_VALUE_GET_OBJ(call_argv[-2])->class_id == JS_CLASS_PROXY) {
                     /* proxy [[Construct]]: run the trap on THIS chain. Five operands replace the callee,
                        new_target and args, and the continuation's only job is the must-return-an-object check. */
@@ -22168,6 +22192,45 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         tramp_is_tail = 0; goto do_apply_tramp;
                     }
                 }
+                if (magic == 1) {
+                    /* `new C(...arr)` and `super(...args)` — the CONSTRUCT spread, and the one construct shape
+                       with NO routing at all: it fell straight through to js_function_apply, so a bytecode
+                       constructor's body ran by C recursion (a loop in it preempted with no flow base) and a
+                       step-machine constructor reached js_call_c_function's DFAIL. Like .apply and
+                       Reflect.construct it is CALL-SITE-RESOLVED: the arguments come from the ARRAY into a heap
+                       list, never onto the compiled operand stack, so the operand shape is the fixed
+                       [func, new_target, array] triple (cfirst -2, cargc 1) whichever target it turns out to be. */
+                    JSValueConst cf = sp[-3], cnt = sp[-2], carr = sp[-1];
+                    int atag = JS_VALUE_GET_TAG(carr);
+                    const JSTrampStepDef *csd = tramp_step_ctor_def_of(cf);
+                    if ((csd || tramp_can_construct(cf))
+                        && (atag == JS_TAG_UNDEFINED || atag == JS_TAG_NULL || atag == JS_TAG_OBJECT)) {
+                        uint32_t alen7 = 0; JSValue *atab7 = NULL;
+                        if (atag == JS_TAG_OBJECT) {
+                            atab7 = build_arg_list(ctx, &alen7, carr);   /* reads the array (may throw) */
+                            if (unlikely(!atab7)) goto exception;
+                        }
+                        if (csd) {
+                            void *stt7 = tramp_step_state_new(ctx, csd, cnt, (int)alen7,
+                                                              (JSValueConst *)atab7, cf);
+                            free_arg_list(ctx, atab7, alen7);
+                            if (unlikely(!stt7)) goto exception;
+                            ((JSStepHdr *)stt7)->orig_cfirst = -2;
+                            ((JSStepHdr *)stt7)->orig_cargc = 1;
+                            ((JSStepHdr *)stt7)->orig_is_tail = 0;
+                            cont_st = stt7;
+                            ret_val = JS_UNDEFINED;
+                            goto do_step_step;
+                        }
+                        con_func = cf; con_ntgt = cnt;
+                        con_args = (JSValueConst *)atab7; con_argc = (int)alen7; con_args_owned = atab7;
+                        con_cargc = 1;   /* the caller pushed the apply triple, not the list */
+                        con_from_super = 0; con_super_ref = JS_UNDEFINED;
+                        con_outer = NULL; con_outer_kind = CONT_NONE;
+                        tramp_first = -2; tramp_is_tail = 0;
+                        goto do_construct_tramp;
+                    }
+                }
                 ret_val = js_function_apply(ctx, sp[-3], 2, vc(&sp[-2]), magic);
                 if (unlikely(JS_IsException(ret_val)))
                     goto exception;
@@ -22413,18 +22476,49 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int con_cargc = tramp_first ? con_argc : 0;   /* what the arm has to POP, which is nothing for super() */
                 if (tramp_can_construct(con_func))
                     goto do_construct_tramp;                  /* a bytecode ctor: its body runs on this chain */
+                {
+                    /* A CONSTRUCTOR step machine, asked HERE and nowhere else. This was written out three times —
+                       OP_call_constructor reshaped its operands, OP_init_ctor's super() built the state by hand,
+                       and a step machine's own Construct request had no copy at all, so `ab.slice()` reaching
+                       `new ArrayBuffer(n)` fell through to JS_CallConstructor and js_call_c_function's DFAIL. The
+                       state takes callee, new_target and args EXPLICITLY, which is what lets both construct operand
+                       shapes reach it without any reshape: -2 pops [func, new_target, args] off the caller stack,
+                       0 (super(), and a machine's own cb buffer) pops nothing. */
+                    const JSTrampStepDef *csd = tramp_step_ctor_def_of(con_func);
+                    if (csd) {
+                        void *cstt = tramp_step_state_new(ctx, csd, con_ntgt, con_argc, con_args, con_func);
+                        JS_FreeValue(ctx, con_super_ref); con_super_ref = JS_UNDEFINED;
+                        if (unlikely(!cstt)) goto exception;
+                        ((JSStepHdr *)cstt)->outer = con_outer;
+                        ((JSStepHdr *)cstt)->outer_kind = con_outer_kind;
+                        /* a machine's own Construct borrows ITS buffer, so there is nothing on the stack to pop */
+                        ((JSStepHdr *)cstt)->orig_cfirst = con_outer ? 0 : tramp_first;
+                        ((JSStepHdr *)cstt)->orig_cargc = con_outer ? 0 : con_cargc;
+                        ((JSStepHdr *)cstt)->orig_is_tail = 0;
+                        con_outer = NULL; con_outer_kind = CONT_NONE;
+                        cont_st = cstt;
+                        ret_val = JS_UNDEFINED;
+                        goto do_step_step;
+                    }
+                }
                 if (tramp_can_call_setmap_consume(ctx, con_func, con_args, con_argc, &smc_magic, &tramp_iter_getiter)) {
+                    DCHECK(!con_outer, "a step machine's Construct reached the Map/Set consumer arm — build its "
+                                       "outer delivery");
                     smc_ntgt = con_ntgt; smc_items = (con_argc > 0) ? con_args[0] : JS_UNDEFINED;
                     smc_cfirst = tramp_first; smc_cargc = con_cargc;
                     smc_super_ref = con_super_ref; con_super_ref = JS_UNDEFINED;
                     tramp_is_tail = 0; goto do_setmap_consume_tramp;
                 }
                 if (tramp_can_call_ta_consume(ctx, con_func, con_args, con_argc, &ta_classid, &tramp_iter_getiter)) {
+                    DCHECK(!con_outer, "a step machine's Construct reached the TypedArray consumer arm — build its "
+                                       "outer delivery");
                     tac_args = con_args; tac_argc = con_argc; tac_ntgt = con_ntgt; tac_cfirst = tramp_first;
                     tac_super_ref = con_super_ref; con_super_ref = JS_UNDEFINED;
                     tramp_is_tail = 0; goto do_ta_consume_tramp;
                 }
                 if (tramp_can_call_promise_exec(ctx, con_func, con_args, con_argc)) {
+                    DCHECK(!con_outer, "a step machine's Construct reached the Promise executor arm — build its "
+                                       "outer delivery");
                     pe_ntgt = con_ntgt; pe_executor = con_args[0];
                     pe_cfirst = tramp_first; pe_cargc = con_cargc; pe_executor_own = JS_UNDEFINED;
                     pe_super_ref = con_super_ref; con_super_ref = JS_UNDEFINED;
@@ -22433,6 +22527,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 /* No arm matched: a C constructor with no body to suspend. The cleanup is fully determined by the
                    operand shape, which is why these were two blocks. */
                 if (tramp_first == -2) {
+                    DCHECK(!con_outer, "a step machine's Construct never puts operands on the caller stack");
                     ret_val = JS_CallConstructorInternal(ctx, con_func, con_ntgt, con_argc, con_args, 0);
                     if (unlikely(JS_IsException(ret_val))) goto exception;   /* operands freed by the unwind */
                     for (i = -2; i < con_argc; i++) JS_FreeValue(ctx, ((JSValue *)con_args)[i]);
@@ -22441,6 +22536,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     DCHECK(tramp_first == 0, "a construct shape with no stack operands cannot also pop them");
                     ret_val = JS_CallConstructor2(ctx, con_func, con_ntgt, con_argc, con_args);
                     JS_FreeValue(ctx, con_super_ref); con_super_ref = JS_UNDEFINED;
+                    if (con_outer) {
+                        /* the machine that ASKED for this construct takes the object; a C constructor has no body
+                           to suspend, so it ran in place and the machine is still parked and resumable. */
+                        uint8_t ckind = con_outer_kind;
+                        cont_st = con_outer;
+                        con_outer = NULL; con_outer_kind = CONT_NONE;
+                        DCHECK(ckind == CONT_STEP, "do_construct_dispatch: unknown outer sequence kind");
+                        if (unlikely(JS_IsException(ret_val))) goto step_abandon;
+                        goto do_step_step;
+                    }
                     if (unlikely(JS_IsException(ret_val))) goto exception;
                 }
                 *sp++ = ret_val;
@@ -22969,17 +23074,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 /* tramp_first is -2 for a METHOD shape ([this, f, args]) and -1 for a PLAIN call ([f, args]),
                    where the receiver is undefined — `TypedArray.prototype.forEach()` must reach step 0 with
                    this=undefined so it throws TypeError, not read an operand that is not there. */
-                /* The receiver slot means "new_target" for a CONSTRUCTOR step and "this" for a method step, so a
-                   plain CALL of a constructor step must see UNDEFINED there — `globalThis.String(x)` would
-                   otherwise hand globalThis to the machine as new_target and build a wrapper. Only the construct
-                   entries (OP_call_constructor's reshape, Reflect.construct, super()) set the flag. */
-                { int isctor5 = tramp_step_isctor; tramp_step_isctor = 0;
-                  JSObject *fo5 = JS_VALUE_GET_OBJ(call_argv[-1]);
+                /* The receiver slot means "new_target" for a CONSTRUCTOR step and "this" for a method step. This
+                   entry is only ever reached by a CALL — every construct spelling passes new_target explicitly,
+                   through do_construct_dispatch's one step arm or Reflect.construct's list resolution — so a
+                   constructor step arriving here is a plain call and must see UNDEFINED: `globalThis.String(x)`
+                   would otherwise hand globalThis to the machine as new_target and build a wrapper. */
+                { JSObject *fo5 = JS_VALUE_GET_OBJ(call_argv[-1]);
                   JSValueConst recv5 = (tramp_first == -2) ? call_argv[-2] : JS_UNDEFINED;
                   /* cproto lives in the u.cfunc arm of the object union; a CLOSURE step machine (a Promise
                      reaction) uses u.c_function_data_record, so reading cproto unconditionally read whatever
                      that record's first words happen to be. */
-                  if (!isctor5 && fo5->class_id == JS_CLASS_C_FUNCTION &&
+                  if (fo5->class_id == JS_CLASS_C_FUNCTION &&
                       fo5->u.cfunc.cproto == JS_CFUNC_step_ctor)
                       recv5 = JS_UNDEFINED;
                   stt = tramp_step_state_new(ctx, sd, recv5, call_argc, vc(call_argv), call_argv[-1]); }
@@ -23064,18 +23169,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        C, which drives a bytecode constructor to completion. With JSConstruct's outer continuation
                        the object comes back to THIS step instead. A C constructor has no body to suspend and is
                        constructed in place, the same split every callback drive makes. */
-                    if (tramp_can_construct(cb[0])) {
-                        con_func = cb[0]; con_ntgt = cb[0];
-                        con_args = (JSValueConst *)&cb[1]; con_argc = cbn;
-                        con_from_super = 0; con_super_ref = JS_UNDEFINED;
-                        con_outer = stt; con_outer_kind = CONT_STEP;
-                        tramp_first = 0; tramp_is_tail = 0;
-                        goto do_construct_tramp;
-                    }
-                    ret_val = JS_CallConstructor(ctx, cb[0], cbn, (JSValueConst *)&cb[1]);
-                    if (unlikely(JS_IsException(ret_val))) goto step_abandon;
-                    cont_st = stt;
-                    goto do_step_step;
+                    con_func = cb[0]; con_ntgt = cb[0];
+                    con_args = (JSValueConst *)&cb[1]; con_argc = cbn;
+                    con_from_super = 0; con_super_ref = JS_UNDEFINED;
+                    con_outer = stt; con_outer_kind = CONT_STEP;
+                    tramp_first = 0; tramp_is_tail = 0;
+                    cont_st = stt;   /* step_abandon reads it if the construct throws in place */
+                    goto do_construct_dispatch;
                 }
                 DCHECK(st == 3, "step builtin: unknown step code");
                 call_argv = (JSValueConst *)&cb[2];
@@ -25683,26 +25783,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 super = JS_GetPrototype(ctx, sf->cur_func);
                 if (JS_IsException(super))
                     goto exception;
-                {
-                    const JSTrampStepDef *sd = tramp_step_def_of(super);
-                    if (sd && JS_VALUE_GET_OBJ(super)->u.cfunc.cproto == JS_CFUNC_step_ctor) {
-                        /* `class X extends String` — super() into a step-machine constructor. Same walk as the
-                           Map/Set and Promise supers above: NewTarget stays the DERIVED class so the result gets
-                           the subclass prototype, the arguments are the derived frame's argv, and nothing sits on
-                           the caller stack to pop, so the machine's DONE pushes its result at the current sp
-                           exactly as JS_CallConstructor2 did. `super` is an owned ref, and the state captures
-                           whatever it keeps, so it is released as soon as the state exists. */
-                        void *stt5 = tramp_step_state_new(ctx, sd, new_target, argc, argv, super);
-                        JS_FreeValue(ctx, super);
-                        if (unlikely(!stt5)) goto exception;
-                        ((JSStepHdr *)stt5)->orig_cfirst = 0;
-                        ((JSStepHdr *)stt5)->orig_cargc = 0;
-                        ((JSStepHdr *)stt5)->orig_is_tail = 0;
-                        cont_st = stt5;
-                        ret_val = JS_UNDEFINED;
-                        goto do_step_step;
-                    }
-                }
                 /* super(x) is the SECOND construct operand shape: NewTarget stays the DERIVED class so the
                    result gets the subclass prototype, the arguments are the derived frame's argv, and nothing
                    sits on the caller stack to pop. `super` is an owned ref, transferred to whichever arm the
@@ -29300,6 +29380,37 @@ static JSValue js_create_from_ctor(JSContext *ctx, JSValueConst ctor,
     obj = JS_NewObjectProtoClass(ctx, proto, class_id);
     JS_FreeValue(ctx, proto);
     return obj;
+}
+
+/* OrdinaryCreateFromConstructor (10.1.13) for a CONSTRUCTOR STEP MACHINE. Its `prototype` read is an ordinary
+   [[Get]], so a new.target carrying an accessor or a Proxy `get` trap runs page code there — and the C body
+   above has no flow base to run it on, which is why `Reflect.construct(Date, [], proxyNewTarget)` aborted.
+   Every constructor machine ends in this same read, so it is a shared sub-sequence over step_getprop_run rather
+   than a stage each of them re-spells. The realm fallback below inspects the constructor without invoking it.
+     0 = *pout holds the new object, 6 = the caller must return that step code, -1 = threw. */
+static int step_create_from_ctor_run(JSContext *ctx, JSStepHdr *h, JSValueConst ctor, int class_id,
+                                     JSValue in, JSValue *pout, JSValue **out_cb, int *out_argc)
+{
+    JSValue proto;
+    JSContext *realm;
+    int r;
+
+    if (JS_IsUndefined(ctor)) {
+        JS_FreeValue(ctx, in);
+        proto = js_dup(ctx->class_proto[class_id]);
+    } else {
+        r = step_getprop_run(ctx, h, ctor, JS_ATOM_prototype, in, &proto, out_cb, out_argc);
+        if (r) return r;
+        if (!JS_IsObject(proto)) {
+            JS_FreeValue(ctx, proto);
+            realm = JS_GetFunctionRealm(ctx, ctor);
+            if (!realm) return -1;
+            proto = js_dup(realm->class_proto[class_id]);
+        }
+    }
+    *pout = JS_NewObjectProtoClass(ctx, proto, class_id);
+    JS_FreeValue(ctx, proto);
+    return JS_IsException(*pout) ? (*pout = JS_UNDEFINED, -1) : 0;
 }
 
 /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
@@ -49182,7 +49293,7 @@ static JSValue JS_ReadArrayBuffer(BCReaderState *s)
         return JS_EXCEPTION;
     }
     // makes a copy of the input
-    obj = js_array_buffer_constructor3(ctx, JS_UNDEFINED,
+    obj = js_array_buffer_constructor3(ctx,
                                        byte_length, pmax_byte_length,
                                        JS_CLASS_ARRAY_BUFFER,
                                        (uint8_t*)s->ptr,
@@ -49227,7 +49338,7 @@ static JSValue JS_ReadSharedArrayBuffer(BCReaderState *s)
     /* keep the SAB pointer so that the user can clone it or free it */
     s->sab_tab[s->sab_tab_len++] = data_ptr;
     /* the SharedArrayBuffer is cloned */
-    obj = js_array_buffer_constructor3(ctx, JS_UNDEFINED,
+    obj = js_array_buffer_constructor3(ctx,
                                        byte_length, pmax_byte_length,
                                        JS_CLASS_SHARED_ARRAY_BUFFER,
                                        data_ptr,
@@ -53445,15 +53556,19 @@ static int js_date_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
             s->hdr.stage = 3;
         }
     }
-    JS_FreeValue(ctx, cb_result);
-    if (s->n >= 2) {
-        int k;
-        for (k = 0; k < s->n; k++)
-            if (!isfinite(s->fields[k])) break;
-        s->val = (k == s->n) ? set_date_fields(s->fields, 1) : NAN;
+    if (s->hdr.stage != 6) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        if (s->n >= 2) {
+            int k;
+            for (k = 0; k < s->n; k++)
+                if (!isfinite(s->fields[k])) break;
+            s->val = (k == s->n) ? set_date_fields(s->fields, 1) : NAN;
+        }
+        s->hdr.stage = 6;
     }
-    s->result = js_create_from_ctor(ctx, s->hdr.this_val, JS_CLASS_DATE);
-    if (JS_IsException(s->result)) { s->result = JS_UNDEFINED; return -1; }
+    r = step_create_from_ctor_run(ctx, &s->hdr, s->hdr.this_val, JS_CLASS_DATE, cb_result, &s->result,
+                                  out_cb, out_argc);
+    if (r) return r < 0 ? -1 : r;
     JS_SetObjectData(ctx, s->result, js_float64(s->val));
     if (JS_IsUndefined(s->hdr.this_val)) {
         /* invoked as a function: the value is (new Date()).toString() */
@@ -53659,7 +53774,7 @@ static int js_ab_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
     if (s->hdr.stage == 4) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         if (JS_IsUndefined(s->ctor)) {
-            JSValue nb = js_array_buffer_constructor2(ctx, JS_UNDEFINED, s->new_len, NULL, class_id);
+            JSValue nb = js_array_buffer_constructor2(ctx, s->new_len, NULL, class_id);
             s->result = js_array_buffer_slice_build(ctx, s->hdr.this_val, nb, s->start, s->new_len, magic);
             return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
         }
@@ -54847,6 +54962,10 @@ static int js_ta_with_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
 static int js_ta_coerce_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_ta_subarray_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_ab_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static int js_ab_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_ab_ctor_fini(JSContext *ctx, void *st, bool take_result);
+static int js_dataview_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_dataview_ctor_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_ab_slice_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_ta_subarray_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_ta_coerce_fini(JSContext *ctx, void *st, bool take_result);
@@ -54888,6 +55007,17 @@ static JSValue js_bigint_asUintN(JSContext *ctx, JSValueConst this_val, int argc
 static JSValue js_object_getOwnPropertyDescriptor(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
 static JSValue js_create_iterator_helper(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
 static int js_iterator_helper_precheck(JSContext *ctx, JSValueConst this_val, int magic);
+enum {
+    JS_ARRAY_BUFFER_TRANSFER,
+    JS_ARRAY_BUFFER_TRANSFER_TO_IMMUTABLE,
+    JS_ARRAY_BUFFER_TRANSFER_TO_FIXED_LENGTH,
+};
+static int js_array_buffer_resize_precheck(JSContext *ctx, JSValueConst this_val, int class_id);
+static int js_array_buffer_transfer_precheck(JSContext *ctx, JSValueConst this_val, int magic);
+static JSValue js_array_buffer_resize(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv,
+                                      int class_id);
+static JSValue js_array_buffer_transfer(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv,
+                                        int magic);
 static void js_iterator_helper_close(JSContext *ctx, JSValueConst this_val, int magic);
 static JSValue js_regexp_exec(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 static JSValue js_regexp_test(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
@@ -54988,6 +55118,9 @@ static const JSTrampStepDef js_ta_indexOf_def     = { sizeof(JSTACoerce), js_ta_
 static const JSTrampStepDef js_ta_lastIndexOf_def = { sizeof(JSTACoerce), js_ta_coerce_step, js_ta_coerce_fini, TAPRO_SEARCH_ARG(special_lastIndexOf) };
 static const JSTrampStepDef js_ta_includes_def    = { sizeof(JSTACoerce), js_ta_coerce_step, js_ta_coerce_fini, TAPRO_SEARCH_ARG(special_includes) };
 static const JSTrampStepDef js_ta_subarray_def    = { sizeof(JSTASubarray), js_ta_subarray_step, js_ta_subarray_fini, 0 };
+static const JSTrampStepDef js_ab_ctor_def       = { sizeof(JSABCtor), js_ab_ctor_step, js_ab_ctor_fini, JS_CLASS_ARRAY_BUFFER };
+static const JSTrampStepDef js_sab_ctor_def      = { sizeof(JSABCtor), js_ab_ctor_step, js_ab_ctor_fini, JS_CLASS_SHARED_ARRAY_BUFFER };
+static const JSTrampStepDef js_dataview_ctor_def = { sizeof(JSDataViewCtor), js_dataview_ctor_step, js_dataview_ctor_fini, 0 };
 static const JSTrampStepDef js_ab_slice_def      = { sizeof(JSABSlice), js_ab_slice_step, js_ab_slice_fini, JS_CLASS_ARRAY_BUFFER*2 + 0 };
 static const JSTrampStepDef js_ab_sliceImm_def   = { sizeof(JSABSlice), js_ab_slice_step, js_ab_slice_fini, JS_CLASS_ARRAY_BUFFER*2 + 1 };
 static const JSTrampStepDef js_sab_slice_def     = { sizeof(JSABSlice), js_ab_slice_step, js_ab_slice_fini, JS_CLASS_SHARED_ARRAY_BUFFER*2 + 0 };
@@ -55045,6 +55178,13 @@ static const JSTrampStepDef js_obj_gopd_def       = PRIMARGS_DEF(PRIMARGS(0x2, H
 static const JSTrampStepDef js_reflect_gopd_def   = PRIMARGS_DEF(PRIMARGS(0x2, HINT_STRING, 2), generic_magic, js_object_getOwnPropertyDescriptor, 1);
 static const JSTrampStepDef js_iter_take_def      = PRIMARGS_DEF_FULL(PRIMARGS(0x1, HINT_NUMBER, 1), generic_magic, js_create_iterator_helper, JS_ITERATOR_HELPER_KIND_TAKE, js_iterator_helper_precheck, NULL, js_iterator_helper_close);
 static const JSTrampStepDef js_iter_drop_def      = PRIMARGS_DEF_FULL(PRIMARGS(0x1, HINT_NUMBER, 1), generic_magic, js_create_iterator_helper, JS_ITERATOR_HELPER_KIND_DROP, js_iterator_helper_precheck, NULL, js_iterator_helper_close);
+/* resize/grow and the three transfers are the same declared shape: ONE numeric argument, then a tail that runs
+   no user code. The receiver validation the spec orders ahead of the coercion is the precheck. */
+static const JSTrampStepDef js_ab_resize_def     = PRIMARGS_DEF_PRE(PRIMARGS(0x1, HINT_NUMBER, 1), generic_magic, js_array_buffer_resize, JS_CLASS_ARRAY_BUFFER, js_array_buffer_resize_precheck, NULL);
+static const JSTrampStepDef js_sab_grow_def      = PRIMARGS_DEF_PRE(PRIMARGS(0x1, HINT_NUMBER, 1), generic_magic, js_array_buffer_resize, JS_CLASS_SHARED_ARRAY_BUFFER, js_array_buffer_resize_precheck, NULL);
+static const JSTrampStepDef js_ab_transfer_def   = PRIMARGS_DEF_PRE(PRIMARGS(0x1, HINT_NUMBER, 1), generic_magic, js_array_buffer_transfer, JS_ARRAY_BUFFER_TRANSFER, js_array_buffer_transfer_precheck, NULL);
+static const JSTrampStepDef js_ab_transferImm_def = PRIMARGS_DEF_PRE(PRIMARGS(0x1, HINT_NUMBER, 1), generic_magic, js_array_buffer_transfer, JS_ARRAY_BUFFER_TRANSFER_TO_IMMUTABLE, js_array_buffer_transfer_precheck, NULL);
+static const JSTrampStepDef js_ab_transferFix_def = PRIMARGS_DEF_PRE(PRIMARGS(0x1, HINT_NUMBER, 1), generic_magic, js_array_buffer_transfer, JS_ARRAY_BUFFER_TRANSFER_TO_FIXED_LENGTH, js_array_buffer_transfer_precheck, NULL);
 static const JSTrampStepDef js_regexp_exec_def    = PRIMARGS_DEF(PRIMARGS(0x1, HINT_STRING, 1), generic, js_regexp_exec, 0);
 static const JSTrampStepDef js_regexp_test_def    = PRIMARGS_DEF(PRIMARGS(0x1, HINT_STRING, 1), generic, js_regexp_test, 0);
 /* THE WHOLE numeric-coercion surface, declared rather than re-implemented. Every one of these performed its
@@ -55155,6 +55295,14 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_TA_LASTINDEXOF]= &js_ta_lastIndexOf_def,
     [STEPDEF_TA_INCLUDES]   = &js_ta_includes_def,
     [STEPDEF_TA_SUBARRAY]   = &js_ta_subarray_def,
+    [STEPDEF_AB_RESIZE]     = &js_ab_resize_def,
+    [STEPDEF_SAB_GROW]      = &js_sab_grow_def,
+    [STEPDEF_AB_TRANSFER]   = &js_ab_transfer_def,
+    [STEPDEF_AB_TRANSFER_IMM] = &js_ab_transferImm_def,
+    [STEPDEF_AB_TRANSFER_FIX] = &js_ab_transferFix_def,
+    [STEPDEF_AB_CTOR]       = &js_ab_ctor_def,
+    [STEPDEF_SAB_CTOR]      = &js_sab_ctor_def,
+    [STEPDEF_DATAVIEW_CTOR] = &js_dataview_ctor_def,
     [STEPDEF_AB_SLICE]      = &js_ab_slice_def,
     [STEPDEF_AB_SLICE_IMM]  = &js_ab_sliceImm_def,
     [STEPDEF_SAB_SLICE]     = &js_sab_slice_def,
@@ -55324,6 +55472,19 @@ static const JSTrampStepDef *tramp_step_def_of(JSValueConst func)
     DCHECK((unsigned)fp->u.cfunc.magic < STEPDEF_COUNT, "JS_CFUNC_STEP_DEF id is out of range");
     DCHECK(js_tramp_step_defs[fp->u.cfunc.magic] != NULL, "STEPDEF id has no table row");
     return js_tramp_step_defs[fp->u.cfunc.magic];
+}
+
+/* the same question restricted to [[Construct]]: a plain step machine is not a constructor, so `new (arr.map)`
+   must still reach JS_CallConstructorInternal's TypeError rather than being driven as one. This is the construct
+   side's routing predicate — it picks WHICH single implementation runs, and there is nothing left for it to
+   fall back to. */
+static const JSTrampStepDef *tramp_step_ctor_def_of(JSValueConst func)
+{
+    JSObject *fp;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return NULL;
+    fp = JS_VALUE_GET_OBJ(func);
+    if (fp->class_id != JS_CLASS_C_FUNCTION || fp->u.cfunc.cproto != JS_CFUNC_step_ctor) return NULL;
+    return tramp_step_def_of(func);
 }
 
 /* 23.1.3.36 Array.prototype.toString. Stages: 0 ToObject, 1 Get(array,"join"), 2 its dispatch, 3 the result. */
@@ -57693,7 +57854,11 @@ static int js_num_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
     JSValueConst nt = s->hdr.this_val;
     JSValueConst arg = step_arg(&s->hdr, 0);
     JSValue val, obj;
+    int r;
 
+    /* stage 1 = the value is computed and parked on the state; only the wrapper's prototype read is left */
+    if (s->hdr.stage == 1)
+        goto made_value;
     if (!s->coerced && s->hdr.argc > 0 && JS_VALUE_GET_TAG(arg) == JS_TAG_OBJECT) {
         s->coerced = 1;
         s->cb[0] = (JSValue)arg;   /* borrowed: hdr.argv holds the reference */
@@ -57707,6 +57872,7 @@ static int js_num_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
         JS_FreeValue(ctx, cb_result);
         val = (s->hdr.argc == 0) ? js_int32(0) : JS_ToNumeric(ctx, arg);
     }
+    cb_result = JS_UNDEFINED;   /* consumed above; the prototype read below is handed a fresh delivery slot */
     if (JS_IsException(val)) return -1;
     switch(JS_VALUE_GET_TAG(val)) {
     case JS_TAG_SHORT_BIG_INT:
@@ -57728,9 +57894,14 @@ static int js_num_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
         s->result = val;
         return 0;
     }
-    obj = js_create_from_ctor(ctx, nt, JS_CLASS_NUMBER);
-    if (JS_IsException(obj)) { JS_FreeValue(ctx, val); return -1; }
-    JS_SetObjectData(ctx, obj, val);
+    /* the wrapper's prototype read can suspend, so the computed value moves onto the state first */
+    s->val = val;
+    s->hdr.stage = 1;
+made_value:
+    r = step_create_from_ctor_run(ctx, &s->hdr, nt, JS_CLASS_NUMBER, cb_result, &obj, out_cb, out_argc);
+    if (r) return r < 0 ? -1 : r;
+    JS_SetObjectData(ctx, obj, s->val);
+    s->val = JS_UNDEFINED;
     s->result = obj;
     return 0;
 }
@@ -57740,6 +57911,7 @@ static JSValue js_num_ctor_fini(JSContext *ctx, void *st, bool take_result)
     JSNumCtor *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (!take_result) JS_FreeValue(ctx, s->result);
+    JS_FreeValue(ctx, s->val);
     js_free(ctx, s);
     return r;
 }
@@ -58122,7 +58294,11 @@ static int js_str_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
     JSValueConst nt = s->hdr.this_val;   /* the receiver slot IS new_target here; UNDEFINED = a plain call */
     JSValueConst arg = step_arg(&s->hdr, 0);
     JSValue val, obj;
+    int r;
 
+    /* stage 1 = the string is computed and parked on the state; only the wrapper's prototype read is left */
+    if (s->hdr.stage == 1)
+        goto made_value;
     if (!s->coerced && JS_VALUE_GET_TAG(arg) == JS_TAG_OBJECT) {
         s->coerced = 1;
         s->cb[0] = (JSValue)arg;   /* borrowed: the header holds the reference */
@@ -58146,16 +58322,21 @@ static int js_str_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
             val = JS_ToString(ctx, arg);
         }
     }
+    cb_result = JS_UNDEFINED;   /* consumed above; the prototype read below is handed a fresh delivery slot */
     if (JS_IsException(val)) return -1;
     if (JS_IsUndefined(nt)) {
         s->result = val;
         return 0;
     }
-    { JSString *p1 = JS_VALUE_GET_STRING(val);
-      int len = p1->len;
-      obj = js_create_from_ctor(ctx, nt, JS_CLASS_STRING);
-      if (JS_IsException(obj)) { JS_FreeValue(ctx, val); return -1; }
-      JS_SetObjectData(ctx, obj, val);
+    /* the wrapper's prototype read can suspend, so the computed string moves onto the state first */
+    s->val = val;
+    s->hdr.stage = 1;
+made_value:
+    r = step_create_from_ctor_run(ctx, &s->hdr, nt, JS_CLASS_STRING, cb_result, &obj, out_cb, out_argc);
+    if (r) return r < 0 ? -1 : r;
+    { int len = JS_VALUE_GET_STRING(s->val)->len;
+      JS_SetObjectData(ctx, obj, s->val);
+      s->val = JS_UNDEFINED;
       JS_DefinePropertyValue(ctx, obj, JS_ATOM_length, js_int32(len), 0);
       s->result = obj; }
     return 0;
@@ -58166,6 +58347,7 @@ static JSValue js_str_ctor_fini(JSContext *ctx, void *st, bool take_result)
     JSStrCtor *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (!take_result) JS_FreeValue(ctx, s->result);
+    JS_FreeValue(ctx, s->val);
     js_free(ctx, s);
     return r;
 }
@@ -71099,29 +71281,29 @@ static uint8_t const typed_array_size_log2[JS_TYPED_ARRAY_COUNT] = {
     1, 2, 3                 // Float16Array, Float32Array, Float64Array
 };
 
-static JSValue js_array_buffer_constructor3(JSContext *ctx,
-                                            JSValueConst new_target,
-                                            uint64_t len, uint64_t *max_len,
-                                            JSClassID class_id,
-                                            uint8_t *buf,
-                                            JSFreeArrayBufferDataFunc *free_func,
-                                            void *opaque, bool alloc_flag)
+/* AllocateArrayBuffer from step 2 onwards, taking the object OrdinaryCreateFromConstructor already made and
+   OWNING it from here. The split exists because that create is a `prototype` [[Get]] on new.target — page code —
+   and only a step machine can suspend at it; every one of the engine's own allocations below builds on the
+   intrinsic prototype, where the create runs nothing. */
+static JSValue js_array_buffer_init(JSContext *ctx, JSValue obj,
+                                    uint64_t len, uint64_t *max_len,
+                                    JSClassID class_id,
+                                    uint8_t *buf,
+                                    JSFreeArrayBufferDataFunc *free_func,
+                                    void *opaque, bool alloc_flag)
 {
     JSRuntime *rt = ctx->rt;
-    JSValue obj;
     JSArrayBuffer *abuf = NULL;
     uint64_t sab_alloc_len;
 
     if (!alloc_flag && buf && max_len && free_func != js_array_buffer_free) {
         // not observable from JS land, only through C API misuse;
         // JS code cannot create externally managed buffers directly
+        JS_FreeValue(ctx, obj);
         return JS_ThrowInternalError(ctx,
                                      "resizable ArrayBuffers not supported "
                                      "for externally managed buffers");
     }
-    obj = js_create_from_ctor(ctx, new_target, class_id);
-    if (JS_IsException(obj))
-        return obj;
     /* XXX: we are currently limited to 2 GB */
     if (len > INT32_MAX) {
         JS_ThrowRangeError(ctx, "invalid array buffer length");
@@ -71195,21 +71377,34 @@ static void js_array_buffer_free(JSRuntime *rt, void *opaque, void *ptr)
     js_free_rt(rt, ptr);
 }
 
+/* the engine's OWN allocations: an intrinsic-prototype buffer, so there is no new.target and no read to suspend
+   at. `new ArrayBuffer(...)` does not come through here — it is a step machine that owns the create itself. */
+static JSValue js_array_buffer_constructor3(JSContext *ctx,
+                                            uint64_t len, uint64_t *max_len,
+                                            JSClassID class_id,
+                                            uint8_t *buf,
+                                            JSFreeArrayBufferDataFunc *free_func,
+                                            void *opaque, bool alloc_flag)
+{
+    JSValue obj = js_create_from_ctor(ctx, JS_UNDEFINED, class_id);
+    if (JS_IsException(obj))
+        return obj;
+    return js_array_buffer_init(ctx, obj, len, max_len, class_id, buf, free_func, opaque, alloc_flag);
+}
+
 static JSValue js_array_buffer_constructor2(JSContext *ctx,
-                                            JSValueConst new_target,
                                             uint64_t len, uint64_t *max_len,
                                             JSClassID class_id)
 {
-    return js_array_buffer_constructor3(ctx, new_target, len, max_len,
+    return js_array_buffer_constructor3(ctx, len, max_len,
                                         class_id, NULL, js_array_buffer_free,
                                         NULL, true);
 }
 
 static JSValue js_array_buffer_constructor1(JSContext *ctx,
-                                            JSValueConst new_target,
                                             uint64_t len, uint64_t *max_len)
 {
-    return js_array_buffer_constructor2(ctx, new_target, len, max_len,
+    return js_array_buffer_constructor2(ctx, len, max_len,
                                         JS_CLASS_ARRAY_BUFFER);
 }
 
@@ -71219,7 +71414,7 @@ JSValue JS_NewArrayBuffer(JSContext *ctx, uint8_t *buf, size_t len,
 {
     JSClassID class_id =
         is_shared ? JS_CLASS_SHARED_ARRAY_BUFFER : JS_CLASS_ARRAY_BUFFER;
-    return js_array_buffer_constructor3(ctx, JS_UNDEFINED, len, NULL, class_id,
+    return js_array_buffer_constructor3(ctx, len, NULL, class_id,
                                         buf, free_func, opaque, false);
 }
 
@@ -71230,61 +71425,82 @@ bool JS_IsArrayBuffer(JSValueConst obj) {
 /* create a new ArrayBuffer of length 'len' and copy 'buf' to it */
 JSValue JS_NewArrayBufferCopy(JSContext *ctx, const uint8_t *buf, size_t len)
 {
-    return js_array_buffer_constructor3(ctx, JS_UNDEFINED, len, NULL,
+    return js_array_buffer_constructor3(ctx, len, NULL,
                                         JS_CLASS_ARRAY_BUFFER,
                                         (uint8_t *)buf,
                                         js_array_buffer_free, NULL,
                                         true);
 }
 
-static JSValue js_array_buffer_constructor0(JSContext *ctx, JSValueConst new_target,
-                                            int argc, JSValueConst *argv,
-                                            JSClassID class_id)
+static int js_ab_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    uint64_t len, max_len, *pmax_len = NULL;
-    JSValue obj, val;
+    JSABCtor *s = st;
+    JSClassID class_id = s->hdr.arg;
+    JSValue obj;
     int64_t i;
+    int r;
 
-    if (JS_ToIndex(ctx, &len, argv[0]))
-        return JS_EXCEPTION;
-    if (argc < 2)
-        goto next;
-    if (!JS_IsObject(argv[1]))
-        goto next;
-    obj = JS_ToObject(ctx, argv[1]);
-    if (JS_IsException(obj))
-        return JS_EXCEPTION;
-    val = JS_GetProperty(ctx, obj, JS_ATOM_maxByteLength);
-    JS_FreeValue(ctx, obj);
-    if (JS_IsException(val))
-        return JS_EXCEPTION;
-    if (JS_IsUndefined(val))
-        goto next;
-    if (JS_ToInt64Free(ctx, &i, val))
-        return JS_EXCEPTION;
-    // don't have to check i < 0 because len >= 0
-    if (len > i || i > MAX_SAFE_INTEGER)
-        return JS_ThrowRangeError(ctx, "invalid array buffer max length");
-    max_len = i;
-    pmax_len = &max_len;
-next:
-    return js_array_buffer_constructor2(ctx, new_target, len, pmax_len,
-                                        class_id);
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
+        s->result = JS_UNDEFINED; s->prim = JS_UNDEFINED;
+        s->len = 0; s->max_len = 0; s->has_max = 0;
+        /* step 1: a plain call reaches the machine with new_target UNDEFINED */
+        if (JS_IsUndefined(s->hdr.this_val))
+            return JS_ThrowTypeError(ctx, "must be called with new"), -1;
+        s->hdr.stage = 1;
+    }
+    if (s->hdr.stage == 1) {
+        /* step 2's ToIndex(length) */
+        r = step_toprim_run(ctx, &s->hdr, step_arg(&s->hdr, 0), HINT_NUMBER, cb_result, &s->prim,
+                            out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        if (JS_ToIndex(ctx, &s->len, s->prim)) return -1;   /* a primitive: this invokes nothing */
+        /* GetArrayBufferMaxByteLengthOption step 1: a non-object options bag has no read at all */
+        s->hdr.stage = (s->hdr.argc > 1 && JS_IsObject(step_arg(&s->hdr, 1))) ? 2 : 4;
+    }
+    if (s->hdr.stage == 2) {
+        JS_FreeValue(ctx, s->prim); s->prim = JS_UNDEFINED;
+        r = step_getprop_run(ctx, &s->hdr, step_arg(&s->hdr, 1), JS_ATOM_maxByteLength, cb_result, &s->prim,
+                             out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        /* step 3: an absent option leaves the buffer fixed-length */
+        s->hdr.stage = JS_IsUndefined(s->prim) ? 4 : 3;
+    }
+    if (s->hdr.stage == 3) {
+        JSValue v = s->prim;
+        s->prim = JS_UNDEFINED;
+        r = step_toprim_run(ctx, &s->hdr, v, HINT_NUMBER, cb_result, &s->prim, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) { JS_FreeValue(ctx, v); return r < 0 ? -1 : r; }
+        JS_FreeValue(ctx, v);
+        if (JS_ToInt64Free(ctx, &i, s->prim)) { s->prim = JS_UNDEFINED; return -1; }
+        s->prim = JS_UNDEFINED;
+        // don't have to check i < 0 because len >= 0
+        if (s->len > (uint64_t)i || i > MAX_SAFE_INTEGER)
+            return JS_ThrowRangeError(ctx, "invalid array buffer max length"), -1;
+        s->max_len = i;
+        s->has_max = 1;
+        s->hdr.stage = 4;
+    }
+    DCHECK(s->hdr.stage == 4, "the ArrayBuffer constructor reached an unknown stage");
+    r = step_create_from_ctor_run(ctx, &s->hdr, s->hdr.this_val, class_id, cb_result, &obj, out_cb, out_argc);
+    if (r) return r < 0 ? -1 : r;
+    s->result = js_array_buffer_init(ctx, obj, s->len, s->has_max ? &s->max_len : NULL, class_id,
+                                     NULL, js_array_buffer_free, NULL, true);
+    return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
 }
 
-static JSValue js_array_buffer_constructor(JSContext *ctx, JSValueConst new_target,
-                                           int argc, JSValueConst *argv)
+static JSValue js_ab_ctor_fini(JSContext *ctx, void *st, bool take_result)
 {
-    return js_array_buffer_constructor0(ctx, new_target, argc, argv,
-                                        JS_CLASS_ARRAY_BUFFER);
-}
-
-static JSValue js_shared_array_buffer_constructor(JSContext *ctx,
-                                                  JSValueConst new_target,
-                                                  int argc, JSValueConst *argv)
-{
-    return js_array_buffer_constructor0(ctx, new_target, argc, argv,
-                                        JS_CLASS_SHARED_ARRAY_BUFFER);
+    JSABCtor *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    JS_FreeValue(ctx, s->prim);
+    js_free(ctx, s);
+    return r;
 }
 
 /* also used for SharedArrayBuffer */
@@ -71535,11 +71751,6 @@ static void js_array_buffer_update_typed_arrays(JSArrayBuffer *abuf)
     }
 }
 
-enum {
-    JS_ARRAY_BUFFER_TRANSFER,
-    JS_ARRAY_BUFFER_TRANSFER_TO_IMMUTABLE,
-    JS_ARRAY_BUFFER_TRANSFER_TO_FIXED_LENGTH,
-};
 
 // ES #sec-arraybuffer.prototype.transfer
 static JSValue js_array_buffer_transfer(JSContext *ctx, JSValueConst this_val,
@@ -71580,7 +71791,7 @@ static JSValue js_array_buffer_transfer(JSContext *ctx, JSValueConst this_val,
     /* create an empty AB */
     if (new_len == 0) {
         JS_DetachArrayBuffer(ctx, this_val);
-        ret = js_array_buffer_constructor2(ctx, JS_UNDEFINED, 0, pmax_len,
+        ret = js_array_buffer_constructor2(ctx, 0, pmax_len,
                                            JS_CLASS_ARRAY_BUFFER);
         goto fini;
     }
@@ -71600,7 +71811,7 @@ static JSValue js_array_buffer_transfer(JSContext *ctx, JSValueConst this_val,
     abuf->byte_length = 0;
     abuf->detached = true;
     js_array_buffer_update_typed_arrays(abuf);
-    ret = js_array_buffer_constructor3(ctx, JS_UNDEFINED, new_len, pmax_len,
+    ret = js_array_buffer_constructor3(ctx, new_len, pmax_len,
                                        JS_CLASS_ARRAY_BUFFER, bs,
                                        abuf->free_func, NULL,
                                        /*alloc_flag*/false);
@@ -71614,6 +71825,30 @@ fini:
         abuf->immutable = true;
     }
     return ret;
+}
+
+/* resize/grow step 2-3 and transfer's RequireInternalSlot: the receiver checks the spec orders BEFORE
+   ToIndex(newLength), which is why they are a precheck rather than the head of the body — a coerce-then-compute
+   machine coerces first, and `ArrayBuffer.prototype.resize.call({}, {valueOf(){...}})` must throw without
+   running that valueOf. */
+static int js_array_buffer_resize_precheck(JSContext *ctx, JSValueConst this_val, int class_id)
+{
+    JSArrayBuffer *abuf = JS_GetOpaque2(ctx, this_val, class_id);
+    if (!abuf)
+        return -1;
+    if (abuf->immutable)
+        return JS_ThrowTypeErrorImmutableArrayBuffer(ctx), -1;
+    return 0;
+}
+
+static int js_array_buffer_transfer_precheck(JSContext *ctx, JSValueConst this_val, int magic)
+{
+    JSArrayBuffer *abuf = JS_GetOpaque2(ctx, this_val, JS_CLASS_ARRAY_BUFFER);
+    if (!abuf)
+        return -1;
+    if (abuf->shared)
+        return JS_ThrowTypeError(ctx, "cannot transfer a SharedArrayBuffer"), -1;
+    return 0;
 }
 
 static JSValue js_array_buffer_resize(JSContext *ctx, JSValueConst this_val,
@@ -71727,12 +71962,12 @@ static const JSCFunctionListEntry js_array_buffer_proto_funcs[] = {
     JS_CGETSET_MAGIC_DEF("resizable", js_array_buffer_get_resizable, NULL, JS_CLASS_ARRAY_BUFFER ),
     JS_CGETSET_DEF("detached", js_array_buffer_get_detached, NULL ),
     JS_CGETSET_DEF("immutable", js_array_buffer_get_immutable, NULL ),
-    JS_CFUNC_MAGIC_DEF("resize", 1, js_array_buffer_resize, JS_CLASS_ARRAY_BUFFER ),
+    JS_CFUNC_STEP_DEF("resize", 1, STEPDEF_AB_RESIZE ),
     JS_CFUNC_STEP_DEF("slice", 2, STEPDEF_AB_SLICE ),
     JS_CFUNC_STEP_DEF("sliceToImmutable", 2, STEPDEF_AB_SLICE_IMM ),
-    JS_CFUNC_MAGIC_DEF("transfer", 0, js_array_buffer_transfer, JS_ARRAY_BUFFER_TRANSFER ),
-    JS_CFUNC_MAGIC_DEF("transferToImmutable", 0, js_array_buffer_transfer, JS_ARRAY_BUFFER_TRANSFER_TO_IMMUTABLE ),
-    JS_CFUNC_MAGIC_DEF("transferToFixedLength", 0, js_array_buffer_transfer, JS_ARRAY_BUFFER_TRANSFER_TO_FIXED_LENGTH ),
+    JS_CFUNC_STEP_DEF("transfer", 0, STEPDEF_AB_TRANSFER ),
+    JS_CFUNC_STEP_DEF("transferToImmutable", 0, STEPDEF_AB_TRANSFER_IMM ),
+    JS_CFUNC_STEP_DEF("transferToFixedLength", 0, STEPDEF_AB_TRANSFER_FIX ),
     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "ArrayBuffer", JS_PROP_CONFIGURABLE ),
 };
 
@@ -71746,7 +71981,7 @@ static const JSCFunctionListEntry js_shared_array_buffer_proto_funcs[] = {
     JS_CGETSET_MAGIC_DEF("byteLength", js_array_buffer_get_byteLength, NULL, JS_CLASS_SHARED_ARRAY_BUFFER ),
     JS_CGETSET_MAGIC_DEF("maxByteLength", js_array_buffer_get_maxByteLength, NULL, JS_CLASS_SHARED_ARRAY_BUFFER ),
     JS_CGETSET_MAGIC_DEF("growable", js_array_buffer_get_resizable, NULL, JS_CLASS_SHARED_ARRAY_BUFFER ),
-    JS_CFUNC_MAGIC_DEF("grow", 1, js_array_buffer_resize, JS_CLASS_SHARED_ARRAY_BUFFER ),
+    JS_CFUNC_STEP_DEF("grow", 1, STEPDEF_SAB_GROW ),
     JS_CFUNC_STEP_DEF("slice", 2, STEPDEF_SAB_SLICE ),
     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "SharedArrayBuffer", JS_PROP_CONFIGURABLE ),
 };
@@ -72055,7 +72290,7 @@ static JSValue js_typed_array_with_build(JSContext *ctx, JSValueConst this_val, 
         JS_FreeValue(ctx, val);
         return JS_EXCEPTION;
     }
-    buffer = js_array_buffer_constructor1(ctx, JS_UNDEFINED,
+    buffer = js_array_buffer_constructor1(ctx,
                                           (uint64_t)len << size_log2,
                                           NULL);
     if (JS_IsException(buffer)) {
@@ -73488,7 +73723,7 @@ static JSValue js_array_from_iterator(JSContext *ctx, uint32_t *plen,
    filling the array; this is the part that invokes nothing. */
 static int js_typed_array_alloc_len(JSContext *ctx, JSValueConst obj, int classid, int64_t len)
 {
-    JSValue buffer = js_array_buffer_constructor1(ctx, JS_UNDEFINED, len << typed_array_size_log2(classid), NULL);
+    JSValue buffer = js_array_buffer_constructor1(ctx, len << typed_array_size_log2(classid), NULL);
     if (JS_IsException(buffer))
         return -1;
     return typed_array_init(ctx, obj, buffer, 0, len, /*track_rab*/false);
@@ -73525,7 +73760,7 @@ static JSValue js_typed_array_constructor_obj(JSContext *ctx,
         arr = js_dup(obj);
     }
 
-    buffer = js_array_buffer_constructor1(ctx, JS_UNDEFINED,
+    buffer = js_array_buffer_constructor1(ctx,
                                           len << size_log2,
                                           NULL);
     if (JS_IsException(buffer))
@@ -73576,7 +73811,7 @@ static JSValue js_typed_array_constructor_ta(JSContext *ctx,
     src_buffer = ta->buffer;
     src_abuf = src_buffer->u.array_buffer;
     size_log2 = typed_array_size_log2(classid);
-    buffer = js_array_buffer_constructor1(ctx, JS_UNDEFINED,
+    buffer = js_array_buffer_constructor1(ctx,
                                           (uint64_t)len << size_log2,
                                           NULL);
     if (JS_IsException(buffer))
@@ -73624,7 +73859,7 @@ static JSValue js_typed_array_constructor(JSContext *ctx,
     if (JS_VALUE_GET_TAG(argv[0]) != JS_TAG_OBJECT) {
         if (JS_ToIndex(ctx, &len, argv[0]))
             return JS_EXCEPTION;
-        buffer = js_array_buffer_constructor1(ctx, JS_UNDEFINED,
+        buffer = js_array_buffer_constructor1(ctx,
                                               len << size_log2,
                                               NULL);
         if (JS_IsException(buffer))
@@ -73727,79 +73962,105 @@ static void js_typed_array_mark(JSRuntime *rt, JSValueConst val,
     }
 }
 
-static JSValue js_dataview_constructor(JSContext *ctx,
-                                       JSValueConst new_target,
-                                       int argc, JSValueConst *argv)
+static int js_dataview_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    bool recompute_len = false;
-    bool track_rab = false;
+    JSDataViewCtor *s = st;
+    JSValueConst buffer = step_arg(&s->hdr, 0);
     JSArrayBuffer *abuf;
-    uint64_t offset;
-    uint32_t len;
-    JSValueConst buffer;
-    JSValue obj;
     JSTypedArray *ta;
     JSObject *p;
+    int r;
 
-    buffer = argv[0];
-    abuf = js_get_array_buffer(ctx, buffer);
-    if (!abuf)
-        return JS_EXCEPTION;
-    offset = 0;
-    if (argc > 1) {
-        if (JS_ToIndex(ctx, &offset, argv[1]))
-            return JS_EXCEPTION;
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
+        s->result = JS_UNDEFINED; s->prim = JS_UNDEFINED;
+        s->offset = 0; s->len = 0; s->recompute_len = 0; s->track_rab = 0;
+        /* step 1: a plain call reaches the machine with new_target UNDEFINED, and the spec puts the rejection in
+           the algorithm itself — ahead of the ArrayBuffer check and both coercions */
+        if (JS_IsUndefined(s->hdr.this_val))
+            return JS_ThrowTypeError(ctx, "must be called with new"), -1;
+        /* step 2: the receiver must be an ArrayBuffer before any argument is touched */
+        if (!js_get_array_buffer(ctx, buffer)) return -1;
+        s->hdr.stage = (s->hdr.argc > 1) ? 1 : 2;
     }
-    if (abuf->detached)
-        return JS_ThrowTypeErrorDetachedArrayBuffer(ctx);
-    if (offset > abuf->byte_length)
-        return JS_ThrowRangeError(ctx, "invalid byteOffset");
-    len = abuf->byte_length - offset;
-    if (argc > 2 && !JS_IsUndefined(argv[2])) {
+    if (s->hdr.stage == 1) {
+        /* step 3's ToIndex(byteOffset) */
+        r = step_toprim_run(ctx, &s->hdr, step_arg(&s->hdr, 1), HINT_NUMBER, cb_result, &s->prim,
+                            out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        if (JS_ToIndex(ctx, &s->offset, s->prim)) return -1;   /* a primitive: this invokes nothing */
+        s->hdr.stage = 2;
+    }
+    if (s->hdr.stage == 2) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        /* steps 4-6 sit BETWEEN the two coercions, so a detached or too-short buffer is rejected before
+           byteLength's valueOf ever runs */
+        abuf = js_get_array_buffer(ctx, buffer);
+        DCHECK(abuf != NULL, "the DataView constructor's argument stopped being an ArrayBuffer mid-sequence");
+        if (abuf->detached) { JS_ThrowTypeErrorDetachedArrayBuffer(ctx); return -1; }
+        if (s->offset > abuf->byte_length) { JS_ThrowRangeError(ctx, "invalid byteOffset"); return -1; }
+        s->len = abuf->byte_length - s->offset;
+        if (s->hdr.argc > 2 && !JS_IsUndefined(step_arg(&s->hdr, 2))) {
+            s->hdr.stage = 3;
+        } else {
+            s->recompute_len = 1;
+            s->track_rab = array_buffer_is_resizable(abuf);
+            s->hdr.stage = 4;
+        }
+    }
+    if (s->hdr.stage == 3) {
+        /* step 8's ToIndex(byteLength) */
         uint64_t l;
-        if (JS_ToIndex(ctx, &l, argv[2]))
-            return JS_EXCEPTION;
-        if (l > len)
-            return JS_ThrowRangeError(ctx, "invalid byteLength");
-        len = l;
-    } else {
-        recompute_len = true;
-        track_rab = array_buffer_is_resizable(abuf);
+        r = step_toprim_run(ctx, &s->hdr, step_arg(&s->hdr, 2), HINT_NUMBER, cb_result, &s->prim,
+                            out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        if (JS_ToIndex(ctx, &l, s->prim)) return -1;           /* a primitive: this invokes nothing */
+        if (l > s->len) { JS_ThrowRangeError(ctx, "invalid byteLength"); return -1; }
+        s->len = l;
+        s->hdr.stage = 4;
     }
+    DCHECK(s->hdr.stage == 4, "the DataView constructor reached an unknown stage");
+    r = step_create_from_ctor_run(ctx, &s->hdr, s->hdr.this_val, JS_CLASS_DATAVIEW, cb_result, &s->result,
+                                  out_cb, out_argc);
+    if (r) return r < 0 ? -1 : r;
 
-    obj = js_create_from_ctor(ctx, new_target, JS_CLASS_DATAVIEW);
-    if (JS_IsException(obj))
-        return JS_EXCEPTION;
-    if (abuf->detached) {
-        /* could have been detached in js_create_from_ctor() */
-        JS_ThrowTypeErrorDetachedArrayBuffer(ctx);
-        goto fail;
-    }
-    // RAB could have been resized in js_create_from_ctor()
-    if (offset > abuf->byte_length) {
+    /* the `prototype` read is page code like the coercions: it can detach or resize the buffer under us */
+    abuf = js_get_array_buffer(ctx, buffer);
+    DCHECK(abuf != NULL, "the DataView constructor's argument stopped being an ArrayBuffer mid-sequence");
+    if (abuf->detached) { JS_ThrowTypeErrorDetachedArrayBuffer(ctx); return -1; }
+    if (s->offset > abuf->byte_length) {
         goto out_of_bound;
-    } else if (recompute_len) {
-        len = abuf->byte_length - offset;
-    } else if (offset + len > abuf->byte_length) {
+    } else if (s->recompute_len) {
+        s->len = abuf->byte_length - s->offset;
+    } else if (s->offset + s->len > abuf->byte_length) {
     out_of_bound:
         JS_ThrowRangeError(ctx, "invalid byteOffset or byteLength");
-        goto fail;
+        return -1;
     }
     ta = js_malloc(ctx, sizeof(*ta));
-    if (!ta) {
-    fail:
-        JS_FreeValue(ctx, obj);
-        return JS_EXCEPTION;
-    }
-    p = JS_VALUE_GET_OBJ(obj);
+    if (!ta) return -1;
+    p = JS_VALUE_GET_OBJ(s->result);
     ta->obj = p;
     ta->buffer = JS_VALUE_GET_OBJ(js_dup(buffer));
-    ta->offset = offset;
-    ta->length = len;
-    ta->track_rab = track_rab;
+    ta->offset = s->offset;
+    ta->length = s->len;
+    ta->track_rab = s->track_rab;
     list_add_tail(&ta->link, &abuf->array_list);
     p->u.typed_array = ta;
-    return obj;
+    return 0;
+}
+
+static JSValue js_dataview_ctor_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSDataViewCtor *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    JS_FreeValue(ctx, s->prim);
+    js_free(ctx, s);
+    return r;
 }
 
 // is the DataView out of bounds relative to its parent arraybuffer?
@@ -74166,7 +74427,7 @@ JSValue JS_NewUint8Array(JSContext *ctx, uint8_t *buf, size_t len,
 {
     JSClassID class_id =
         is_shared ? JS_CLASS_SHARED_ARRAY_BUFFER : JS_CLASS_ARRAY_BUFFER;
-    JSValue buffer = js_array_buffer_constructor3(ctx, JS_UNDEFINED, len, NULL,
+    JSValue buffer = js_array_buffer_constructor3(ctx, len, NULL,
                                                   class_id, buf, free_func,
                                                   opaque, false);
     return js_new_uint8array(ctx, buffer);
@@ -74174,7 +74435,7 @@ JSValue JS_NewUint8Array(JSContext *ctx, uint8_t *buf, size_t len,
 
 JSValue JS_NewUint8ArrayCopy(JSContext *ctx, const uint8_t *buf, size_t len)
 {
-    JSValue buffer = js_array_buffer_constructor3(ctx, JS_UNDEFINED, len, NULL,
+    JSValue buffer = js_array_buffer_constructor3(ctx, len, NULL,
                                                   JS_CLASS_ARRAY_BUFFER,
                                                   (uint8_t *)buf,
                                                   js_array_buffer_free, NULL,
@@ -74690,7 +74951,7 @@ int JS_AddIntrinsicTypedArrays(JSContext *ctx)
     int i, ret;
 
     obj = JS_NewCConstructor(ctx, JS_CLASS_ARRAY_BUFFER, "ArrayBuffer",
-                             js_array_buffer_constructor, 1, JS_CFUNC_constructor, 0,
+                             NULL, 1, JS_CFUNC_step_ctor, STEPDEF_AB_CTOR,
                              JS_UNDEFINED,
                              js_array_buffer_funcs, countof(js_array_buffer_funcs),
                              js_array_buffer_proto_funcs, countof(js_array_buffer_proto_funcs),
@@ -74700,7 +74961,7 @@ int JS_AddIntrinsicTypedArrays(JSContext *ctx)
     JS_FreeValue(ctx, obj);
 
     obj = JS_NewCConstructor(ctx, JS_CLASS_SHARED_ARRAY_BUFFER, "SharedArrayBuffer",
-                             js_shared_array_buffer_constructor, 1, JS_CFUNC_constructor, 0,
+                             NULL, 1, JS_CFUNC_step_ctor, STEPDEF_SAB_CTOR,
                              JS_UNDEFINED,
                              js_shared_array_buffer_funcs, countof(js_shared_array_buffer_funcs),
                              js_shared_array_buffer_proto_funcs, countof(js_shared_array_buffer_proto_funcs),
@@ -74764,7 +75025,7 @@ int JS_AddIntrinsicTypedArrays(JSContext *ctx)
 
     /* DataView */
     obj = JS_NewCConstructor(ctx, JS_CLASS_DATAVIEW, "DataView",
-                             js_dataview_constructor, 1, JS_CFUNC_constructor, 0,
+                             NULL, 1, JS_CFUNC_step_ctor, STEPDEF_DATAVIEW_CTOR,
                              JS_UNDEFINED,
                              NULL, 0,
                              js_dataview_proto_funcs, countof(js_dataview_proto_funcs),
