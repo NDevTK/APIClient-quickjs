@@ -1444,7 +1444,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_BIGINT_ASUINTN, STEPDEF_BIGINT_ASINTN,
     STEPDEF_OBJ_GOPD, STEPDEF_REFLECT_GOPD,
     STEPDEF_OBJ_VALUES, STEPDEF_OBJ_ENTRIES, STEPDEF_OBJ_ASSIGN, STEPDEF_OBJ_SPREAD,
-    STEPDEF_ARRAY_FLAT, STEPDEF_ARRAY_FLATMAP,
+    STEPDEF_ARRAY_FLAT, STEPDEF_ARRAY_FLATMAP, STEPDEF_ARRAY_FROMLIKE,
     STEPDEF_MATH_ABS, STEPDEF_MATH_FLOOR, STEPDEF_MATH_CEIL, STEPDEF_MATH_ROUND, STEPDEF_MATH_SQRT, STEPDEF_MATH_ACOS, STEPDEF_MATH_ASIN, STEPDEF_MATH_ATAN, STEPDEF_MATH_COS, STEPDEF_MATH_EXP, STEPDEF_MATH_LOG, STEPDEF_MATH_SIN, STEPDEF_MATH_TAN, STEPDEF_MATH_TRUNC, STEPDEF_MATH_SIGN, STEPDEF_MATH_COSH, STEPDEF_MATH_SINH, STEPDEF_MATH_TANH, STEPDEF_MATH_ACOSH, STEPDEF_MATH_ASINH, STEPDEF_MATH_ATANH, STEPDEF_MATH_EXPM1, STEPDEF_MATH_LOG1P, STEPDEF_MATH_LOG2, STEPDEF_MATH_LOG10, STEPDEF_MATH_CBRT, STEPDEF_MATH_F16ROUND, STEPDEF_MATH_FROUND, STEPDEF_MATH_ATAN2, STEPDEF_MATH_POW, STEPDEF_MATH_MIN, STEPDEF_MATH_MAX, STEPDEF_MATH_HYPOT, STEPDEF_MATH_IMUL, STEPDEF_MATH_CLZ32, STEPDEF_STR_FROMCHARCODE, STEPDEF_STR_FROMCODEPOINT, STEPDEF_DATE_UTC,
     STEPDEF_REGEXP_EXEC, STEPDEF_REGEXP_TEST,
     STEPDEF_ITER_TAKE, STEPDEF_ITER_DROP,
@@ -19201,7 +19201,12 @@ static void js_toprim_abandon(JSContext *ctx, struct JSToPrim *tp)
 
 
 static JSValue js_iterator_from(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
-static bool iter_data_at_iterator(JSContext *ctx, JSValueConst items, JSValue *out);
+/* What a source's @@iterator says, read WITHOUT running anything. Three answers, not two: collapsing ABSENT into
+   DECLINE is what kept Array.from's array-like branch in C, because "there is no @@iterator" and "I cannot see the
+   @@iterator without invoking something" are opposite conclusions — the first SELECTS the length+indices algorithm,
+   the second is the named-unbuilt tramp acquire. */
+typedef enum { ITERAT_DECLINE = 0, ITERAT_FOUND, ITERAT_ABSENT } JSIterAtState;
+static JSIterAtState iter_data_at_iterator(JSContext *ctx, JSValueConst items, JSValue *out);
 static bool tramp_can_call_gen_create(JSValueConst func);
 /* Iterator.from — EVERY argument, including a primitive and a non-iterable. There is nothing left to SELECT: the
    tramp arm performs the whole of 27.1.3.1 (its TypeErrors included) and the C entry DFAILs, so the only thing
@@ -19540,6 +19545,10 @@ typedef struct {
 #define ITERCONS_SUMPRECISE 7 /* Math.sumPrecise(iterable): no result object at all — `sum` accumulates exactly and the
                                  finish yields the correctly-rounded double. A non-number element is an
                                  IfAbruptCloseIterator TypeError like every other sink's bad element. */
+#define ITERCONS_FROMLIKE 8 /* Array.from over an ARRAY-LIKE — length + indices, no @@iterator at all. A genuinely
+                              different algorithm from the iterator walk, so it is not a sink on JSIterConsume but a
+                              machine of its own; this value only tells the ONE recognizer's caller which to drive,
+                              which is why the recognizer did not have to be split in two. */
 #define ITERCONS_ITERTERM 6  /* Iterator.prototype EAGER terminal (toArray/forEach/reduce/some/every/find): GetIteratorDirect(this)
                                 — `this` IS the iterator (no @@iterator call) — then drive it on the tramp. `setop` holds
                                 the ITERTERM_* rule; `mapfn` the predicate/reducer; `k` the visit counter. */
@@ -19847,6 +19856,19 @@ typedef struct JSArrayFlat {
     int present;         /* the HasProperty answer, held across its own suspension */
     JSValue cb[5];       /* the mapper CALL request: [thisArg, mapfn, element, index, source] — all BORROWED views */
 } JSArrayFlat;
+/* Array.from(arrayLike, mapfn, thisArg) — 23.1.2.1 steps 5-10, the branch taken when the source has NO @@iterator.
+   Every step is the page's code: the `length` read, each index read (an accessor, a Proxy trap), the MAPPER call, and
+   a subclass Construct. js_array_from did all of it from C, so `Array.from({length: n}, fn)` — the standard way to
+   build a range — aborted on the first back-edge in fn. */
+typedef struct JSArrayFromLike {
+    JSStepHdr hdr;       /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    JSValue items;       /* ToObject(argv[0]) (owned) */
+    JSValue arr;         /* the result: Construct(C, len) or ArrayCreate(len) (owned) */
+    JSValue el;          /* the element held across its read / mapper call (owned) */
+    int64_t len, k;
+    JSValue cb[4];       /* [thisArg, mapfn, element, index] — BORROWED views, or [ctor, len] for the Construct */
+} JSArrayFromLike;
+
 #define ARRAYFLAT_FLAT    0
 #define ARRAYFLAT_FLATMAP 1
 
@@ -22522,8 +22544,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                tramp_first is -2 and tramp_is_tail is already set by the caller; a plain -1 call never routes here
                (it jumps straight to do_generic_callee below, where call_argv[-2] is not a receiver). */
             {
-                if (tramp_can_call_iter_consume(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter, &icons_sink))
+                if (tramp_can_call_iter_consume(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter, &icons_sink)) {
+                    if (icons_sink == ITERCONS_FROMLIKE)
+                        goto do_from_like_tramp;                /* Array.from(arrayLike): length + indices */
                     goto do_iter_consume_tramp;                 /* Array.from(iterable) / Math.sumPrecise(iterable) */
+                }
                 if (tramp_can_call_setop_consume(call_argv[-1], call_argv[-2], vc(call_argv), call_argc, &setop_kind))
                     goto do_setop_consume_tramp;                /* s.union/symmetricDifference(setlike) */
                 if (tramp_can_call_iterterm(ctx, call_argv[-1], call_argv[-2], call_argc, &iterterm_kind))
@@ -22793,6 +22818,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (unlikely(JS_IsException(ret_val))) { js_toprim_abandon(ctx, cont_st); goto exception; }
                     goto do_toprim_step;
                 }
+            }
+
+        do_from_like_tramp:
+            /* Array.from over an ARRAY-LIKE. A CALL site, so the machine's completion pops this call's operands and
+               pushes the result exactly as any step builtin's does; the state captures the invocation, so nothing
+               here has to survive a suspension. */
+            {
+                void *fl_stt = tramp_step_state_new(ctx, tramp_step_def_by_id(STEPDEF_ARRAY_FROMLIKE),
+                                                    call_argv[-2], call_argc, vc(call_argv), call_argv[-1]);
+                if (unlikely(!fl_stt)) goto exception;
+                ((JSStepHdr *)fl_stt)->orig_cfirst = -2;
+                ((JSStepHdr *)fl_stt)->orig_cargc = call_argc;
+                ((JSStepHdr *)fl_stt)->orig_is_tail = tramp_is_tail;
+                cont_st = fl_stt;
+                ret_val = JS_UNDEFINED;
+                goto do_step_step;
             }
 
         do_iter_consume_tramp:
@@ -51769,18 +51810,30 @@ static JSValue js_array_from(JSContext *ctx, JSValueConst this_val,
     iter = JS_GetProperty(ctx, items, JS_ATOM_Symbol_iterator);
     if (JS_IsException(iter))
         goto exception;
-    if (!JS_IsUndefined(iter)) {
+    /* GetMethod(items, @@iterator): a NULLISH result means "no iterator" and takes the array-like branch, a
+       non-callable one is a TypeError, and only a callable one is an iterable. The test used to be `!IsUndefined`,
+       which sent both `@@iterator = null` (array-like per the spec) and `@@iterator = 5` (a TypeError) into the
+       iterable arm — and since that arm is now a DFAIL, both aborted the engine instead of doing their spec thing. */
+    if (!JS_IsUndefined(iter) && !JS_IsNull(iter)) {
+        if (check_function(ctx, iter)) {
+            JS_FreeValue(ctx, iter);
+            goto exception;
+        }
         /* DELETED: the ITERABLE branch. Array.from over any callable @@iterator — including one on a primitive —
            is driven by the ONE consume machine (ITERCONS_FROM), which acquires the iterator on the tramp and
            performs IfAbruptCloseIterator itself. This loop drove .next and the mapfn from C, which is exactly
-           where a coroutine cannot suspend. An iterable source reaching here means a call site was not routed.
+           where a coroutine cannot suspend. An iterable source reaching here means a call site was not routed —
+           today the only way is an @@iterator this engine cannot read side-effect-free (a getter, a proxy), which
+           is the named-unbuilt tramp acquire.
            The ARRAY-LIKE branch below is NOT a fallback for this: it is a different algorithm (length + indices,
-           no iterator at all) and legitimately stays. */
+           no iterator at all), it is the JSArrayFromLike machine for every routed call, and what remains here is
+           reached only through that same unread-@@iterator path. */
         JS_FreeValue(ctx, iter);
         DFAIL("Array.from reached its C entry with an ITERABLE source — route that call site onto the consume "
               "machine; the iteration loop here no longer exists");
         goto exception;
     } else {
+        JS_FreeValue(ctx, iter);
         arrayLike = JS_ToObject(ctx, items);
         if (JS_IsException(arrayLike))
             goto exception;
@@ -52180,35 +52233,42 @@ static void js_iter_consume_abandon(JSContext *ctx, void *st)
    searching items and its INTERNAL prototype chain (a primitive is boxed for the walk). A GETTER @@iterator, a Proxy,
    a non-callable value, or none -> false, *out UNDEFINED — the consumer keeps its own observable order by falling to
    its C path (which runs a getter at the right step). No speculative getter/trap execution in recognition. */
-static bool iter_data_at_iterator(JSContext *ctx, JSValueConst items, JSValue *out)
+static JSIterAtState iter_data_at_iterator(JSContext *ctx, JSValueConst items, JSValue *out)
 {
     JSValue boxed = JS_UNDEFINED;
     JSObject *p;
-    bool found = false;
+    JSIterAtState st = ITERAT_ABSENT;   /* a walk that finds nothing on the whole chain HAS its answer */
     *out = JS_UNDEFINED;
     if (JS_VALUE_GET_TAG(items) == JS_TAG_OBJECT) {
         p = JS_VALUE_GET_OBJ(items);
     } else {
-        if (JS_IsUndefined(items) || JS_IsNull(items)) return false;
+        /* a nullish source is not "absent @@iterator", it is a TypeError from ToObject — never a route */
+        if (JS_IsUndefined(items) || JS_IsNull(items)) return ITERAT_DECLINE;
         boxed = JS_ToObject(ctx, items);   /* primitive wrapper; its @@iterator lives on the prototype (Array.from(5)) */
-        if (JS_IsException(boxed)) return false;
+        if (JS_IsException(boxed)) return ITERAT_DECLINE;
         p = JS_VALUE_GET_OBJ(boxed);
     }
     for (; p != NULL; p = p->shape->proto) {
         JSPropertyDescriptor desc;
         int ret;
-        if (p->class_id == JS_CLASS_PROXY) break;   /* a proxy own-property query is a trap (side effect) — decline */
+        if (p->class_id == JS_CLASS_PROXY) { st = ITERAT_DECLINE; break; }   /* an own-property query IS a trap */
         ret = JS_GetOwnPropertyInternal(ctx, &desc, p, JS_ATOM_Symbol_iterator);
-        if (ret < 0) break;
+        if (ret < 0) { st = ITERAT_DECLINE; break; }
         if (ret) {
-            if (!(desc.flags & JS_PROP_GETSET) && JS_IsFunction(ctx, desc.value)) { *out = js_dup(desc.value); found = true; }
-            if (desc.flags & JS_PROP_GETSET) { JS_FreeValue(ctx, desc.getter); JS_FreeValue(ctx, desc.setter); }
-            else JS_FreeValue(ctx, desc.value);
+            if (desc.flags & JS_PROP_GETSET) {
+                st = ITERAT_DECLINE;   /* a GETTER is user code: reading it is the acquire's job, not this probe's */
+                JS_FreeValue(ctx, desc.getter); JS_FreeValue(ctx, desc.setter);
+            } else {
+                if (JS_IsFunction(ctx, desc.value)) { *out = js_dup(desc.value); st = ITERAT_FOUND; }
+                else if (JS_IsUndefined(desc.value) || JS_IsNull(desc.value)) st = ITERAT_ABSENT;
+                else st = ITERAT_DECLINE;   /* present but not callable: GetMethod throws, which the C entry does */
+                JS_FreeValue(ctx, desc.value);
+            }
             break;
         }
     }
     JS_FreeValue(ctx, boxed);
-    return found;
+    return st;
 }
 
 /* Consumers that drive a generator OR helper (Array.from / spread / Set / Map / Object.fromEntries / TypedArray):
@@ -52223,7 +52283,7 @@ static bool iter_consume_gen_backed(JSContext *ctx, JSValueConst items, JSValue 
 {
     JSValue m;
     *out_getiter = JS_UNDEFINED;
-    if (!iter_data_at_iterator(ctx, items, &m)) return false;
+    if (iter_data_at_iterator(ctx, items, &m) != ITERAT_FOUND) return false;
     if (tramp_can_call_gen_create(m)) { *out_getiter = m; return true; }
     if (JS_VALUE_GET_TAG(items) == JS_TAG_OBJECT) {
         JSObject *ip = JS_VALUE_GET_OBJ(items);
@@ -52274,12 +52334,17 @@ static bool tramp_can_call_iter_consume(JSContext *ctx, JSValueConst func, JSVal
        path, where GetIterator invokes a generator @@iterator through JS_Call -> js_call_generator_function
        -> async_func_resume, off the tramp — the drive-to-completion abort, confirmed by backtrace. The
        exclusion CAUSED the failure it appeared to avoid: iter_data_at_iterator boxes for the lookup and the
-       machine acquires on the chain, so routing the primitive is the fix. Array-LIKES (no @@iterator at all,
-       driven by length + indices) are a different algorithm and stay in the C entry. */
-    if (!iter_data_at_iterator(ctx, call_argv[0], out_getiter)) return false;
-    if (JS_IsFunction(ctx, *out_getiter)) return true;
-    JS_FreeValue(ctx, *out_getiter); *out_getiter = JS_UNDEFINED;
-    return false;
+       machine acquires on the chain, so routing the primitive is the fix.
+       Array-LIKES (no @@iterator at all) are a DIFFERENT algorithm — length + indices — so they get their own
+       machine rather than a sink on the iterator walk; the sink value is only how this ONE recognizer tells its
+       caller which to drive. What still declines is the shape the probe cannot answer without invoking something (a
+       getter, a proxy) and the shape whose answer is a throw (present but not callable): the first is the
+       named-unbuilt tramp acquire, the second is GetMethod's TypeError, which the C entry raises. */
+    switch (iter_data_at_iterator(ctx, call_argv[0], out_getiter)) {
+    case ITERAT_FOUND:  return true;
+    case ITERAT_ABSENT: *out_sink = ITERCONS_FROMLIKE; return true;
+    default:            return false;
+    }
 }
 
 /* Route new Set(gen) / new Map(gen) — the js_map_constructor C loop drives the argument generator's .next(). Scoped
@@ -53471,6 +53536,8 @@ static int js_array_join_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
 static JSValue js_array_join_fini(JSContext *ctx, void *st, bool take_result);
 static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_array_flat_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static int js_array_fromlike_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_array_fromlike_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_array_flat_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_prop_walk_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_bigint_asUintN(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int asIntN);
@@ -53595,6 +53662,7 @@ static const JSTrampStepDef js_obj_assign_def     = { sizeof(JSPropWalk), js_pro
 static const JSTrampStepDef js_obj_spread_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_SPREAD };
 static const JSTrampStepDef js_array_flat_def      = { sizeof(JSArrayFlat), js_array_flat_step, js_array_flat_fini, ARRAYFLAT_FLAT };
 static const JSTrampStepDef js_array_flatMap_def   = { sizeof(JSArrayFlat), js_array_flat_step, js_array_flat_fini, ARRAYFLAT_FLATMAP };
+static const JSTrampStepDef js_array_fromlike_def  = { sizeof(JSArrayFromLike), js_array_fromlike_step, js_array_fromlike_fini, 0 };
 #define PRIMARGS_DEF_FULL(spec, proto, fn, magic, pre, mid, err) \
     { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, (spec), { .proto = (fn) }, JS_CFUNC_##proto, (magic), (pre), (mid), (err) }
 #define PRIMARGS_DEF(spec, proto, fn, magic)                PRIMARGS_DEF_FULL(spec, proto, fn, magic, NULL, NULL, NULL)
@@ -53742,6 +53810,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_OBJ_SPREAD]      = &js_obj_spread_def,
     [STEPDEF_ARRAY_FLAT]      = &js_array_flat_def,
     [STEPDEF_ARRAY_FLATMAP]   = &js_array_flatMap_def,
+    [STEPDEF_ARRAY_FROMLIKE]  = &js_array_fromlike_def,
     [STEPDEF_MATH_ABS] = &js_math_abs_def,
     [STEPDEF_MATH_FLOOR] = &js_math_floor_def,
     [STEPDEF_MATH_CEIL] = &js_math_ceil_def,
@@ -54524,6 +54593,112 @@ static JSValue js_array_copyWithin(JSContext *ctx, JSValueConst this_val,
  exception:
     JS_FreeValue(ctx, obj);
     return JS_EXCEPTION;
+}
+
+/* ---- Array.from over an array-like as a step machine (see JSArrayFromLike) ---- */
+static int js_array_fromlike_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSArrayFromLike *s = st;
+    int mapping;
+    int r;
+
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
+        s->items = JS_UNDEFINED; s->arr = JS_UNDEFINED; s->el = JS_UNDEFINED;
+        s->len = 0; s->k = 0;
+        s->items = JS_ToObject(ctx, step_arg(&s->hdr, 0));
+        if (JS_IsException(s->items)) { s->items = JS_UNDEFINED; return -1; }
+        s->hdr.stage = 1;
+    }
+    mapping = !JS_IsUndefined(step_arg(&s->hdr, 1));
+    if (s->hdr.stage == 1) {
+        r = step_length_run(ctx, &s->hdr, s->items, cb_result, &s->len, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 2;
+    }
+    if (s->hdr.stage == 2) {
+        /* step 7: Construct(C, «len») when the receiver is a constructor — `Array.from.call(Sub, arrayLike)` makes
+           that user code — else ArrayCreate(len), which invokes nothing. */
+        if (JS_IsConstructor(ctx, s->hdr.this_val)) {
+            s->cb[0] = s->hdr.this_val;   /* borrowed: the header owns the receiver */
+            s->cb[1] = js_int64(s->len);
+            *out_cb = s->cb; *out_argc = 1;
+            s->hdr.stage = 3;
+            return 4;
+        }
+        {
+            JSValue len_val = js_int64(s->len);
+            s->arr = js_array_constructor(ctx, JS_UNDEFINED, 1, vc(&len_val));
+            JS_FreeValue(ctx, len_val);
+            if (JS_IsException(s->arr)) { s->arr = JS_UNDEFINED; return -1; }
+        }
+        s->hdr.stage = 4;
+    }
+    if (s->hdr.stage == 3) {
+        s->arr = cb_result;   /* the constructed object */
+        cb_result = JS_UNDEFINED;
+        s->hdr.stage = 4;
+    }
+    for (;;) {
+        if (s->hdr.stage == 4) {
+            if (s->k >= s->len) { s->hdr.stage = 7; break; }
+            s->hdr.stage = 5;
+        }
+        if (s->hdr.stage == 5) {
+            r = step_getidx_run(ctx, &s->hdr, s->items, s->k, cb_result, &s->el, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->hdr.stage = 6;
+        }
+        if (s->hdr.stage == 6) {
+            if (mapping) {
+                /* Call(mapfn, thisArg, «kValue, 𝔽(k)»). Every slot is a BORROWED view of something this state or
+                   its header owns, so the request buffer has nothing to release. */
+                s->cb[0] = (JSValue)step_arg(&s->hdr, 2);   /* thisArg */
+                s->cb[1] = (JSValue)step_arg(&s->hdr, 1);   /* the mapper */
+                s->cb[2] = s->el;
+                s->cb[3] = js_int64(s->k);
+                *out_cb = s->cb; *out_argc = 2;
+                s->hdr.stage = 8;
+                return 3;
+            }
+            s->hdr.stage = 9;
+        }
+        if (s->hdr.stage == 8) {
+            JS_FreeValue(ctx, s->el);
+            s->el = cb_result;   /* the mapped value REPLACES the element */
+            cb_result = JS_UNDEFINED;
+            s->hdr.stage = 9;
+        }
+        if (s->hdr.stage == 9) {
+            JSValue el = s->el;
+            s->el = JS_UNDEFINED;   /* the define consumes it on every path */
+            if (JS_DefinePropertyValueInt64(ctx, s->arr, s->k, el, JS_PROP_C_W_E | JS_PROP_THROW) < 0)
+                return -1;
+            s->k++;
+            s->hdr.stage = 4;
+        }
+    }
+    /* step 10: Set(A, "length", 𝔽(len), true). On a plain Array this is the internal length; on a SUBCLASS with a
+       `length` setter it is user code, and reaching it from here is the keyed-WRITE step primitive this engine does
+       not have yet — it aborts loud there rather than driving the setter to completion. */
+    JS_FreeValue(ctx, cb_result);
+    if (JS_SetProperty(ctx, s->arr, JS_ATOM_length, js_int64(s->len)) < 0)
+        return -1;
+    return 0;
+}
+
+static JSValue js_array_fromlike_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSArrayFromLike *s = st;
+    JSValue r = take_result ? s->arr : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->arr);
+    JS_FreeValue(ctx, s->el);
+    JS_FreeValue(ctx, s->items);
+    js_free(ctx, s);
+    return r;
 }
 
 /* ---- Array.prototype.flat / flatMap as a step machine (see JSArrayFlat) ---- */
