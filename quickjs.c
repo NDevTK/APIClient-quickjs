@@ -23405,6 +23405,27 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             ret_val = JS_UNDEFINED;
                             goto do_step_step;
                         }
+                        /* 23.2.2.1 step 6: TypedArray.from with NO iterator is the ARRAY-LIKE algorithm, and it
+                           is the SAME machine — the source becomes the list and the walk starts at
+                           LengthOfArrayLike instead of a collect. Nothing observable has happened to undo: the
+                           collect array is private and the receiver is not constructed until the create phase. */
+                        if (nullish && tramp_consume_kind == CONT_ITER_CONSUME
+                            && ((JSIterConsume *)tramp_consume_state)->ta_isfrom) {
+                            JSIterConsume *fs = (JSIterConsume *)tramp_consume_state;
+                            JSValue src6 = JS_ToObject(ctx, iterable);
+                            if (JS_IsException(src6)) {
+                                tramp_consume_acquired = JS_EXCEPTION;
+                                goto do_consume_deliver_iterator;
+                            }
+                            JS_FreeValue(ctx, fs->r);   /* the empty collect list */
+                            fs->r = src6;
+                            fs->k = 0; fs->ta_k = 0; fs->ta_phase = 4;
+                            tramp_consume_state = NULL; tramp_consume_kind = CONT_NONE;
+                            tramp_consume_iterable = JS_UNDEFINED;
+                            cont_st = fs;
+                            ret_val = JS_UNINITIALIZED;
+                            goto do_iter_consume_step;
+                        }
                         /* GetIteratorFlattenable (Iterator.from) vs GetIterator (every other consumer) — the ONE
                            step where the two abstract operations differ. Flattenable with an ABSENT @@iterator
                            takes O ITSELF as the iterator (`Iterator.from({next(){…}})` wraps a bare
@@ -23672,46 +23693,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         JS_ThrowTypeError(ctx, "not a constructor");
                         goto exception;
                     }
-                    /* Step 4's GetMethod, made exactly once. The probe is side-effect-free and declines an
-                       accessor @@iterator or a Proxy, so when it came back empty the read happens HERE — running
-                       the getter, in spec order — and its answer picks step 5 (iterable) or step 6 (array-like). */
-                    if (!JS_IsFunction(ctx, tramp_iter_getiter)) {
-                        JSValue m = JS_GetProperty(ctx, call_argv[0], JS_ATOM_Symbol_iterator);
-                        JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED;
-                        if (JS_IsException(m)) goto exception;
-                        if (JS_IsUndefined(m) || JS_IsNull(m)) {
-                            /* Step 6, the ARRAY-LIKE source. A different algorithm from step 5 only in where the
-                               values come from: no iterator, the list IS the object and its length. Steps 6.c/6.d
-                               (Construct the receiver, then map+set) are the SAME two phases step 5 ends with, so
-                               it enters the machine directly at the create phase with the source as its list —
-                               which is what lets a custom BYTECODE constructor and a looping mapfn run on the
-                               tramp here too, instead of being called from a C loop. */
-                            JSValue src6; int64_t len6;
-                            JSIterConsume *s6;
-                            JS_FreeValue(ctx, m);
-                            src6 = JS_ToObject(ctx, call_argv[0]);
-                            if (JS_IsException(src6)) goto exception;
-                            s6 = js_iter_consume_new(ctx);
-                            if (unlikely(!s6)) { JS_FreeValue(ctx, src6); JS_ThrowOutOfMemory(ctx); goto exception; }
-                            s6->r = src6;                       /* the source list the map phase indexes */
-                            s6->adder = js_dup(ntgt);           /* the constructor the create phase Constructs */
-                            s6->mapfn = (call_argc >= 2) ? js_dup(call_argv[1]) : JS_UNDEFINED;
-                            s6->mapfn_this = (call_argc >= 3) ? js_dup(call_argv[2]) : JS_UNDEFINED;
-                            s6->k = 0; s6->ta_k = 0;
-                            s6->sink = ITERCONS_FROM; s6->ta_isfrom = 1; s6->ta_classid = 0;
-                            s6->ta_phase = 4;                   /* no collect; step 6's LengthOfArrayLike first */
-                            s6->orig_cfirst = -2; s6->orig_cargc = call_argc; s6->orig_is_tail = 0;
-                            cont_st = s6;
-                            ret_val = JS_UNINITIALIZED;
-                            goto do_iter_consume_step;
-                        }
-                        if (!JS_IsFunction(ctx, m)) {
-                            JS_FreeValue(ctx, m);
-                            JS_ThrowTypeError(ctx, "value is not iterable");
-                            goto exception;
-                        }
-                        tramp_iter_getiter = m;   /* the acquire CALLS this exact method — no second read */
-                    }
+                    /* Step 4's GetMethod is the ACQUIRE's, not this entry's. Reading it here ran a getter or a
+                       Proxy trap from C, which is the drive-to-completion the whole machine exists to avoid; the
+                       acquire performs it on the tramp and then decides — callable is step 5, nullish is step 6's
+                       array-like walk (the same machine at its length phase), non-callable is GetMethod's
+                       TypeError. */
                 }
                 s = js_iter_consume_new(ctx);
                 if (unlikely(!s)) { JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED; JS_ThrowOutOfMemory(ctx); goto exception; }
