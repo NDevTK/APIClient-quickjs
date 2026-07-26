@@ -19164,6 +19164,33 @@ static JSValue js_iterator_from(JSContext *ctx, JSValueConst this_val, int argc,
    DECLINE is what kept Array.from's array-like branch in C, because "there is no @@iterator" and "I cannot see the
    @@iterator without invoking something" are opposite conclusions — the first SELECTS the length+indices algorithm,
    the second is the named-unbuilt tramp acquire. */
+/* Does writing `val` into `target[key]` coerce val first? Only a TypedArray does, and only through a CANONICAL
+   NUMERIC INDEX — 10.4.5.5 [[Set]] step 1.b routes those to TypedArraySetElement, whose step 1 is ToNumber (or
+   ToBigInt for the two 64-bit classes); every other key on a TypedArray is an ordinary set that reads val as-is.
+   A non-object val coerces without running anything, so only an object needs the tramp. */
+static bool ta_write_needs_toprim(JSContext *ctx, JSValueConst target, JSValueConst key, JSValueConst val)
+{
+    JSObject *p;
+    if (JS_VALUE_GET_TAG(val) != JS_TAG_OBJECT) return false;
+    if (JS_VALUE_GET_TAG(target) != JS_TAG_OBJECT) return false;
+    p = JS_VALUE_GET_OBJ(target);
+    if (!is_typed_array(p->class_id)) return false;
+    switch (JS_VALUE_GET_TAG(key)) {
+    case JS_TAG_INT:
+    case JS_TAG_FLOAT64:
+        return true;
+    case JS_TAG_STRING: {
+        JSAtom a = JS_ValueToAtom(ctx, key);   /* a STRING key: interning it runs nothing */
+        int num;
+        if (a == JS_ATOM_NULL) { JS_FreeValue(ctx, JS_GetException(ctx)); return false; }
+        num = JS_AtomIsNumericIndex(ctx, a);
+        JS_FreeAtom(ctx, a);
+        return num > 0;
+    }
+    default:
+        return false;   /* a symbol, a bool, null/undefined: an ordinary set */
+    }
+}
 typedef enum { ITERAT_DECLINE = 0, ITERAT_FOUND, ITERAT_ABSENT } JSIterAtState;
 static JSIterAtState iter_data_at_iterator(JSContext *ctx, JSValueConst items, JSValue *out);
 static bool tramp_can_call_gen_create(JSValueConst func);
@@ -19629,6 +19656,7 @@ typedef struct JSIterConsume {
     JSValue ent_val;     /* entry[1] (owned) */
 } JSIterConsume;
 static int js_typed_array_get_length_unsafe(JSContext *ctx, JSValueConst obj);
+static int js_typed_array_alloc_len(JSContext *ctx, JSValueConst obj, int classid, int64_t len);
 static bool typed_array_is_immutable(JSObject *p);
 static JSValue JS_ThrowTypeErrorImmutableArrayBuffer(JSContext *ctx);
 static void sum_precise_init(SumPreciseState *s);
@@ -23697,6 +23725,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->mapfn_this = (is_from && call_argc >= 3) ? js_dup(call_argv[2]) : JS_UNDEFINED;
                 s->ta_classid = is_from ? 0 : ta_classid;   /* the from path CONSTRUCTS the receiver; only new TypedArray(iterable) creates by class id */
                 s->ta_isfrom = is_from;
+                if (!is_from) {
+                    /* 23.2.5.1 step 6.a.i: AllocateTypedArray runs BEFORE the source is read at all — a Proxy
+                       new_target sees its `prototype` get before the iterator does anything, and an iteration that
+                       throws leaves an already-allocated object behind. Only the BUFFER waits for the length, so
+                       the create is here and js_typed_array_alloc_len is at the collect's end. */
+                    s->ta_target = js_create_from_ctor(ctx, ntgt, ta_classid);
+                    if (JS_IsException(s->ta_target)) {
+                        s->ta_target = JS_UNDEFINED;
+                        js_iter_consume_end(ctx, s); js_free_rt(rt, s);
+                        JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED;
+                        goto exception;
+                    }
+                }
                 s->k = 0;
                 s->sink = ITERCONS_FROM;
                 s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
@@ -23800,10 +23841,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto do_getprop_tramp;
                 }
                 if (st == 5) {
-                    /* ToPropertyKey's user-code half on the entry's key: ToPrimitive with hint STRING, on the
-                       tramp for the same reason. */
+                    /* THE ToPrimitive arm. Two phases use it and the flag already in flight says which — a
+                       TypedArray element write coerces with hint NUMBER (10.4.5.16 step 1), fromEntries'
+                       ToPropertyKey with hint STRING. Both are the page's @@toPrimitive/valueOf, and both used to
+                       run from C. */
                     tp_outer = s; tp_outer_kind = CONT_ITER_CONSUME;
-                    tp_value = s->ent_key; tp_hint = HINT_STRING;
+                    if (s->cb_pending == 5) {
+                        tp_value = s->cb_value; tp_hint = HINT_NUMBER;
+                    } else {
+                        DCHECK(s->ent_pending && s->ent_ph == 2,
+                               "the consume machine's ToPrimitive arm was entered with no coercion in flight");
+                        tp_value = s->ent_key; tp_hint = HINT_STRING;
+                    }
                     tp_slot = 0; tp_retry_pc = NULL;
                     goto do_toprim_tramp;
                 }
@@ -23869,25 +23918,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JSValue ta_mapfn = s->mapfn;               s->mapfn = JS_UNDEFINED;   /* TypedArray.from(gen, mapfn): applied here */
                     JSValue ta_mapfn_this = s->mapfn_this;     s->mapfn_this = JS_UNDEFINED;
                     js_iter_consume_end(ctx, s); js_free_rt(rt, s);
-                    if (ta_cid != 0) {
-                        /* new TypedArray(iterable) — a DIFFERENT algorithm from TypedArray.from: 23.2.5.1 does
-                           IterableToList then creates by CLASS, never constructing a user ctor. TypedArray.from's
-                           create+map is a phase of the machine above and never reaches here. */
-                        JSValue ta = js_typed_array_constructor_obj(ctx, ta_ntgt, r, ta_cid);
-                        JS_FreeValue(ctx, ta_ntgt); JS_FreeValue(ctx, r);
-                        JS_FreeValue(ctx, ta_mapfn); JS_FreeValue(ctx, ta_mapfn_this);
-                        if (JS_IsException(ta)) goto exception;   /* operands freed by the exception unwind */
-                        r = ta;
-                    } else {
-                        JS_FreeValue(ctx, ta_ntgt);   /* the add/set method (UNDEFINED for plain FROM) */
-                        JS_FreeValue(ctx, ta_mapfn); JS_FreeValue(ctx, ta_mapfn_this);   /* Array.from's mapfn (applied during collect) */
-                        /* Array.from's array result gets its length; TypedArray.from's result is the CONSTRUCTED
-                           typed array, whose length is fixed by the constructor — writing to it is not part of
-                           23.2.2.1 and would throw. */
-                        if (sink == ITERCONS_FROM && !is_tafrom
-                            && JS_SetProperty(ctx, r, JS_ATOM_length, js_uint32((uint32_t)n)) < 0) {
-                            JS_FreeValue(ctx, r); goto exception;   /* operands freed by the exception unwind */
-                        }
+                    JS_FreeValue(ctx, ta_ntgt);   /* the add/set method, or the TypedArray new_target the create phase used */
+                    JS_FreeValue(ctx, ta_mapfn); JS_FreeValue(ctx, ta_mapfn_this);   /* Array.from's mapfn (applied during collect) */
+                    /* Array.from's array result gets its length. BOTH TypedArray shapes arrive here already
+                       BUILT — from's Construct(C, len) and the constructor's create-by-class are phases of the
+                       machine — and their length is fixed by the allocation, so writing to it is not part of
+                       either algorithm and would throw. */
+                    if (sink == ITERCONS_FROM && !is_tafrom && ta_cid == 0
+                        && JS_SetProperty(ctx, r, JS_ATOM_length, js_uint32((uint32_t)n)) < 0) {
+                        JS_FreeValue(ctx, r); goto exception;   /* operands freed by the exception unwind */
                     }
                     JSValue *cargv = sp - cargc;
                     for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
@@ -26952,6 +26991,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
 
+        value_tonum_toprim:
+            /* 10.4.5.5 [[Set]] -> 10.4.5.16 TypedArraySetElement step 1: a write through a TypedArray's canonical
+               numeric index coerces V with ToNumber (ToBigInt for the 64-bit classes) BEFORE the bounds test, and
+               for an OBJECT V that is the page's @@toPrimitive/valueOf. Every C write site reached it through
+               JS_ToNumberFree, so `ta[0] = {valueOf(){ while(x){} }}` preempted in an activation with no flow base
+               — and so did every builtin that fills a TypedArray from user values, since they all end at this same
+               [[Set]]. Coerce on the tramp and re-execute: on the retry V is a primitive and the ToNumber inside
+               [[Set]] runs nothing. Entered with tp_slot naming the VALUE operand. */
+            tp_hint = HINT_NUMBER;
+            goto do_toprim_tramp;
+
         key_toprim:
             /* ToPropertyKey (7.1.19) on an OBJECT key runs the page's @@toPrimitive/valueOf/toString, and every
                interpreter site that needs a key reached it through JS_ValueToAtom — from C, so a loop in that
@@ -27279,6 +27329,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    throws its TypeError before the key is coerced at all. */
                 if (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT
                     && !JS_IsUndefined(sp[-3]) && !JS_IsNull(sp[-3])) { tp_slot = -2; tp_retry_pc = pc - 1; goto key_toprim; }
+                /* ToPropertyKey first (above), then the TypedArray element coercion — spec order, and the key must
+                   be a primitive before it can be tested for a canonical numeric index. */
+                if (ta_write_needs_toprim(ctx, sp[-3], sp[-2], sp[-1])) { tp_slot = -1; tp_retry_pc = pc - 1; goto value_tonum_toprim; }
                 /* A computed key that resolves to a bytecode setter -> route as a 1-arg method call so the
                    setter body preempts. */
                 if (JS_VALUE_GET_TAG(sp[-3]) == JS_TAG_OBJECT) {
@@ -52054,6 +52107,26 @@ static JSValue js_array_from(JSContext *ctx, JSValueConst this_val,
     return r;
 }
 
+/* 23.2.2.1 step 5.d.iv / 5.b: Set(target, k, value, true) into the TypedArray being built. That [[Set]] begins
+   with ToNumber (ToBigInt for the 64-bit classes), which for an OBJECT value is the page's @@toPrimitive/valueOf —
+   so `Int8Array.from([{valueOf(){ while(x){} }}])` drove a user body from C. Park it for the ToPrimitive arm
+   instead; on the way back the value is a primitive and the [[Set]] runs nothing.
+   Returns 1 = parked (propagate step code 5), 0 = written, -1 = threw. Consumes v either way. */
+static int ta_elem_set(JSContext *ctx, JSIterConsume *s, JSValue v)
+{
+    JSValue idx = js_int64(s->ta_k);
+    bool needs = ta_write_needs_toprim(ctx, s->ta_target, idx, v);
+    JS_FreeValue(ctx, idx);
+    if (needs) {
+        DCHECK(!s->cb_pending, "a callback round-trip is already in flight on this state");
+        s->cb_value = v; s->cb_pending = 5;
+        return 1;
+    }
+    if (JS_SetPropertyInt64(ctx, s->ta_target, s->ta_k, v) < 0) return -1;   /* consumes v */
+    s->ta_k++;
+    return 0;
+}
+
 /* Advance Array.from(generator): `res` is the previous .next() iterator-result {value,done}, or UNINITIALIZED on
    the first step. Returns 1 = drive iter.next() again, 0 = DONE (s->r is the finished array), -1 = exception.
    Consumes `res`. The generator's .next() body runs on the tramp chain (the caller re-enters this step at the
@@ -52121,11 +52194,18 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
             JS_FreeValue(ctx, fret);
             return 1;
         }
-        if (which == 3) {   /* TypedArray.from's mapfn (23.2.2.1 step 5.d.iii): the RESULT is Set into the target */
+        if (which == 5 || which == 3) {
+            /* 5 = the element's ToPrimitive settled, so `fret` is the primitive the [[Set]] wanted; 3 = the mapfn
+               returned, so `fret` is the mapped element (which may itself need coercing). Either way the write
+               belongs to the map/set phase, which RESUMES ITSELF — returning 1 here would drive the source's
+               .next() again, and the source is exhausted by then, so every element cost the page's iterator one
+               extra spurious call (Int8Array.from(src, fn) over two elements called next 5 times, not 3). */
+            int w;
             JS_FreeValue(ctx, value);
-            if (JS_SetPropertyInt64(ctx, s->ta_target, s->ta_k, fret) < 0) return -1;   /* consumes fret */
-            s->ta_k++;
-            return 1;
+            w = ta_elem_set(ctx, s, fret);   /* consumes fret */
+            if (w < 0) return -1;
+            if (w == 1) return 5;
+            goto ta_map_loop;
         }
         if (which == 2) {   /* Array.from's mapfn: the RESULT is the element to append */
             JS_FreeValue(ctx, value);
@@ -52178,12 +52258,14 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
         } else if (JS_VALUE_GET_TAG(res) != JS_TAG_UNINITIALIZED) {
             JS_FreeValue(ctx, res);   /* the map callback re-enters with no iterator result */
         }
+    ta_map_loop:
         for (; s->ta_k < s->k; ) {
             JSValue v = JS_GetPropertyInt64(ctx, s->r, s->ta_k);
             if (JS_IsException(v)) return -1;
             if (JS_IsUndefined(s->mapfn)) {
-                if (JS_SetPropertyInt64(ctx, s->ta_target, s->ta_k, v) < 0) return -1;   /* consumes v */
-                s->ta_k++;
+                int w = ta_elem_set(ctx, s, v);   /* consumes v */
+                if (w < 0) return -1;
+                if (w == 1) return 5;             /* the element is an object: coerce it on the tramp first */
                 continue;
             }
             /* mapfn(kValue, k) is USER CODE: hand it to the shared callback drive so its body runs on the tramp. */
@@ -52209,6 +52291,17 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
         if (done) {   /* iterator exhausted: s->r is complete */
             JS_FreeValue(ctx, res);
             if (s->ta_isfrom) { s->ta_phase = 1; s->ta_k = 0; return 4; }   /* collect done -> 5.c create */
+            if (s->ta_classid != 0) {
+                /* 23.2.5.1 step 5.b.ii InitializeTypedArrayFromList: the object was allocated at step 6.a.i, before
+                   @@iterator was read, so only its BUFFER is sized here; then each element is Set — the SAME
+                   phase-3 loop, because that write's ToNumber is the page's code either way. This used to hand the
+                   collected list to js_typed_array_constructor_obj at the finish, which re-entered the ITERATION
+                   protocol on the list it had just been given and then set every element from C. */
+                DCHECK(!JS_IsUndefined(s->ta_target), "the TypedArray was not allocated before its source was read");
+                if (js_typed_array_alloc_len(ctx, s->ta_target, s->ta_classid, s->k) < 0) return -1;
+                s->ta_phase = 3; s->ta_k = 0;
+                goto ta_map_loop;
+            }
             if (s->sink == ITERCONS_SUMPRECISE) s->r = js_float64(sum_precise_get_result(&s->sum));
             if (s->sink == ITERCONS_SETOP && s->setop == SETOP_SUPERSET) s->r = js_bool(s->k != 0);
             if (s->sink == ITERCONS_ITERTERM) {
@@ -72622,6 +72715,18 @@ static JSValue js_array_from_iterator(JSContext *ctx, uint32_t *plen,
     JS_FreeValue(ctx, iter);
     JS_FreeValue(ctx, arr);
     return JS_EXCEPTION;
+}
+
+/* AllocateTypedArrayBuffer(O, len) — 23.2.5.1's second half. The OBJECT is allocated earlier (step 6.a.i, before
+   @@iterator is even read), and only its BUFFER waits for the length, so the two are separate operations here too.
+   The ELEMENT writes that follow are user code (each is a ToNumber), so they belong to whichever machine is
+   filling the array; this is the part that invokes nothing. */
+static int js_typed_array_alloc_len(JSContext *ctx, JSValueConst obj, int classid, int64_t len)
+{
+    JSValue buffer = js_array_buffer_constructor1(ctx, JS_UNDEFINED, len << typed_array_size_log2(classid), NULL);
+    if (JS_IsException(buffer))
+        return -1;
+    return typed_array_init(ctx, obj, buffer, 0, len, /*track_rab*/false);
 }
 
 static JSValue js_typed_array_constructor_obj(JSContext *ctx,
