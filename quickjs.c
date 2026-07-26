@@ -34369,6 +34369,21 @@ static int js_parse_destructuring_element(JSParseState *s, int tok,
                     var_name = js_parse_destructuring_var(s, tok, is_arg);
                     if (var_name == JS_ATOM_NULL)
                         goto prop_error;
+                    if (tok == TOK_VAR && has_with_scope(s->cur_func, s->cur_func->scope_level)) {
+                        /* 14.3.3.3 KeyedBindingInitialization: step 2 ResolveBinding precedes step 3 GetV, and a
+                           `var` target inside a `with` resolves through the object Environment Record — an
+                           OBSERVABLE HasBinding. Materialise the Reference BEFORE the source read, the same way
+                           the shorthand `{p}` form below and an assignment target already do; a plain
+                           OP_scope_put_var after the read would resolve too late. Lexical targets cannot be
+                           intercepted by a `with` (resolve_scope_var finds them locally) and keep their
+                           TDZ-honouring OP_scope_put_var_init. */
+                        emit_op(s, OP_scope_get_var);
+                        emit_atom(s, var_name);
+                        emit_u16(s, s->cur_func->scope_level);
+                        JS_FreeAtom(s->ctx, var_name);   /* get_lvalue re-reads it from the bytecode, owned */
+                        var_name = JS_ATOM_NULL;
+                        goto lvalue;
+                    }
                 } else {
                     if (js_parse_left_hand_side_expr(s))
                         goto prop_error;
@@ -38441,8 +38456,23 @@ static JSResolveResultEnum js_resolve_export1(JSContext *ctx,
                     return ret;
                 } else if (ret == JS_RESOLVE_RES_FOUND) {
                     if (*pme != NULL) {
-                        if (*pmodule != res_m ||
-                            res_me->local_name != (*pme)->local_name) {
+                        /* 16.2.1.6.3 ResolveExport step 10.d.ii compares the ResolvedBinding's [[Module]] and
+                           [[BindingName]]. For an `all` indirect entry (`export * as ns from "m"`, and an
+                           `export { ns }` of a namespace import) the ResolvedBinding is
+                           { Module: the IMPORTED module, BindingName: namespace } — NOT the re-exporting module
+                           and its local name, which is what this compared, making two star-exports of the same
+                           namespace look ambiguous. */
+                        JSModuleDef *a_mod = res_m, *b_mod = *pmodule;
+                        bool a_ns = (res_me->export_type == JS_EXPORT_TYPE_INDIRECT &&
+                                     res_me->local_name == JS_ATOM__star_);
+                        bool b_ns = ((*pme)->export_type == JS_EXPORT_TYPE_INDIRECT &&
+                                     (*pme)->local_name == JS_ATOM__star_);
+                        if (a_ns)
+                            a_mod = res_m->req_module_entries[res_me->u.req_module_idx].module;
+                        if (b_ns)
+                            b_mod = (*pmodule)->req_module_entries[(*pme)->u.req_module_idx].module;
+                        if (a_ns != b_ns || a_mod != b_mod ||
+                            (!a_ns && res_me->local_name != (*pme)->local_name)) {
                             *pmodule = NULL;
                             *pme = NULL;
                             return JS_RESOLVE_RES_AMBIGUOUS;
@@ -38833,6 +38863,34 @@ JSValue JS_GetModuleNamespace(JSContext *ctx, JSModuleDef *m)
 #endif
 
 /* Load all the required modules for module 'm' */
+/* 16.2.1.7.1 ParseModule step 10.a.ii: an `export { x }` whose LOCAL name is an IMPORTED binding is NOT a local
+   export — it is an INDIRECT re-export of the original binding, so ResolveExport reaches the very binding the
+   importer would. For a NAMESPACE import (`import * as ns from "m"; export { ns }`) that is the `all` form,
+   which resolves to { Module: m, BindingName: namespace }: that is why two modules re-exporting the same
+   namespace are ONE binding, not an ambiguity between two module-local variables. */
+static void js_module_reexport_imported_bindings(JSContext *ctx, JSModuleDef *m, JSFunctionDef *fd)
+{
+    int i, j;
+
+    for (i = 0; i < m->export_entries_count; i++) {
+        JSExportEntry *me = &m->export_entries[i];
+        if (me->export_type != JS_EXPORT_TYPE_LOCAL)
+            continue;
+        for (j = 0; j < m->import_entries_count; j++) {
+            JSImportEntry *mi = &m->import_entries[j];
+            DCHECK(mi->var_idx >= 0 && mi->var_idx < fd->closure_var_count,
+                   "a module import entry names a closure var outside the module's own scope");
+            if (fd->closure_var[mi->var_idx].var_name != me->local_name)
+                continue;
+            JS_FreeAtom(ctx, me->local_name);
+            me->local_name = JS_DupAtom(ctx, mi->import_name);   /* `*` for a namespace import */
+            me->export_type = JS_EXPORT_TYPE_INDIRECT;
+            me->u.req_module_idx = mi->req_module_idx;
+            break;
+        }
+    }
+}
+
 static int js_resolve_module(JSContext *ctx, JSModuleDef *m)
 {
     int i;
@@ -45753,8 +45811,10 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
         goto fail1;
     }
 
-    if (m != NULL)
+    if (m != NULL) {
         m->has_tla = fd->has_await;
+        js_module_reexport_imported_bindings(ctx, m, fd);
+    }
 
     /* create the function object and all the enclosed functions */
     fun_obj = js_create_function(ctx, fd);
