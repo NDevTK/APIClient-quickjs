@@ -1444,6 +1444,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_BIGINT_ASUINTN, STEPDEF_BIGINT_ASINTN,
     STEPDEF_OBJ_GOPD, STEPDEF_REFLECT_GOPD,
     STEPDEF_OBJ_VALUES, STEPDEF_OBJ_ENTRIES, STEPDEF_OBJ_ASSIGN, STEPDEF_OBJ_SPREAD,
+    STEPDEF_MATH_ABS, STEPDEF_MATH_FLOOR, STEPDEF_MATH_CEIL, STEPDEF_MATH_ROUND, STEPDEF_MATH_SQRT, STEPDEF_MATH_ACOS, STEPDEF_MATH_ASIN, STEPDEF_MATH_ATAN, STEPDEF_MATH_COS, STEPDEF_MATH_EXP, STEPDEF_MATH_LOG, STEPDEF_MATH_SIN, STEPDEF_MATH_TAN, STEPDEF_MATH_TRUNC, STEPDEF_MATH_SIGN, STEPDEF_MATH_COSH, STEPDEF_MATH_SINH, STEPDEF_MATH_TANH, STEPDEF_MATH_ACOSH, STEPDEF_MATH_ASINH, STEPDEF_MATH_ATANH, STEPDEF_MATH_EXPM1, STEPDEF_MATH_LOG1P, STEPDEF_MATH_LOG2, STEPDEF_MATH_LOG10, STEPDEF_MATH_CBRT, STEPDEF_MATH_F16ROUND, STEPDEF_MATH_FROUND, STEPDEF_MATH_ATAN2, STEPDEF_MATH_POW, STEPDEF_MATH_MIN, STEPDEF_MATH_MAX, STEPDEF_MATH_HYPOT, STEPDEF_MATH_IMUL, STEPDEF_MATH_CLZ32, STEPDEF_STR_FROMCHARCODE, STEPDEF_STR_FROMCODEPOINT, STEPDEF_DATE_UTC,
     STEPDEF_REGEXP_EXEC, STEPDEF_REGEXP_TEST,
     STEPDEF_ITER_TAKE, STEPDEF_ITER_DROP,
     STEPDEF_FUNCTION_CTOR, STEPDEF_GENERATOR_FUNCTION_CTOR,
@@ -51065,12 +51066,32 @@ static int js_primargs_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
             return -1;
     }
     DCHECK(s->hdr.def->body.generic != NULL, "a coerce-then-compute definition with no body");
+    /* The f_f / f_f_f prototypes take a DOUBLE, so js_call_c_function did their ToNumber — which is where the whole
+       Math surface reached a page's valueOf from C. The conversion happens here instead, on operands this machine
+       has already made primitive, so it invokes nothing and only throws (a Symbol, a BigInt). The order is
+       argument order, which is the order the spec's ToNumber steps are in. */
+    if (s->hdr.def->body_proto == JS_CFUNC_f_f || s->hdr.def->body_proto == JS_CFUNC_f_f_f) {
+        double d0 = 0, d1 = 0;
+        if (JS_ToFloat64(ctx, &d0, s->argp[0]))
+            return -1;
+        if (s->hdr.def->body_proto == JS_CFUNC_f_f_f && JS_ToFloat64(ctx, &d1, s->argp[1]))
+            return -1;
+        s->result = js_float64(s->hdr.def->body_proto == JS_CFUNC_f_f
+                                   ? s->hdr.def->body.f_f(d0)
+                                   : s->hdr.def->body.f_f_f(d0, d1));
+        return 0;
+    }
+    /* The BODY's argc is the call's REAL argc, never the padded vector length — exactly what js_call_c_function
+       passes. nargp pads the BUFFER so a fixed-arity body may read argv[1] of a one-argument call; handing that
+       count to the body instead made every VARIADIC one see phantom undefined arguments, so `Math.max()` computed
+       max(undefined, undefined) = NaN where the spec says -Infinity, `String.fromCharCode()` returned "\0" instead
+       of "", and `Date.UTC(1970)` filled in five undefined fields and returned NaN. */
     if (s->hdr.def->body_proto == JS_CFUNC_generic_magic) {
-        s->result = s->hdr.def->body.generic_magic(ctx, s->hdr.this_val, s->nargp,
+        s->result = s->hdr.def->body.generic_magic(ctx, s->hdr.this_val, s->hdr.argc,
                                                    (JSValueConst *)s->argp, s->hdr.def->body_magic);
     } else {
         DCHECK(s->hdr.def->body_proto == JS_CFUNC_generic, "coerce-then-compute: unhandled body prototype");
-        s->result = s->hdr.def->body.generic(ctx, s->hdr.this_val, s->nargp, (JSValueConst *)s->argp);
+        s->result = s->hdr.def->body.generic(ctx, s->hdr.this_val, s->hdr.argc, (JSValueConst *)s->argp);
     }
     return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
 }
@@ -53403,6 +53424,43 @@ static int js_iterator_helper_precheck(JSContext *ctx, JSValueConst this_val, in
 static void js_iterator_helper_close(JSContext *ctx, JSValueConst this_val, int magic);
 static JSValue js_regexp_exec(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 static JSValue js_regexp_test(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static double js_math_fabs(double x);
+static double js_math_floor(double x);
+static double js_math_ceil(double x);
+static double js_math_round(double x);
+static double js_math_sqrt(double x);
+static double js_math_acos(double x);
+static double js_math_asin(double x);
+static double js_math_atan(double x);
+static double js_math_cos(double x);
+static double js_math_exp(double x);
+static double js_math_log(double x);
+static double js_math_sin(double x);
+static double js_math_tan(double x);
+static double js_math_trunc(double x);
+static double js_math_sign(double x);
+static double js_math_cosh(double x);
+static double js_math_sinh(double x);
+static double js_math_tanh(double x);
+static double js_math_acosh(double x);
+static double js_math_asinh(double x);
+static double js_math_atanh(double x);
+static double js_math_expm1(double x);
+static double js_math_log1p(double x);
+static double js_math_log2(double x);
+static double js_math_log10(double x);
+static double js_math_cbrt(double x);
+static double js_math_f16round(double x);
+static double js_math_fround(double x);
+static double js_math_atan2(double x, double y);
+static double js_math_pow(double x, double y);
+static JSValue js_math_min_max(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
+static JSValue js_math_hypot(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static JSValue js_math_imul(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static JSValue js_math_clz32(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static JSValue js_string_fromCharCode(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static JSValue js_string_fromCodePoint(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static JSValue js_Date_UTC(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 static JSValue js_dataview_getValue(JSContext *ctx, JSValueConst this_obj, int argc, JSValueConst *argv, int class_id);
 static JSValue js_dataview_setValue(JSContext *ctx, JSValueConst this_obj, int argc, JSValueConst *argv, int class_id);
 static int js_dataview_set_precheck(JSContext *ctx, JSValueConst this_val, int magic);
@@ -53491,6 +53549,49 @@ static const JSTrampStepDef js_iter_take_def      = PRIMARGS_DEF_FULL(PRIMARGS(0
 static const JSTrampStepDef js_iter_drop_def      = PRIMARGS_DEF_FULL(PRIMARGS(0x1, HINT_NUMBER, 1), generic_magic, js_create_iterator_helper, JS_ITERATOR_HELPER_KIND_DROP, js_iterator_helper_precheck, NULL, js_iterator_helper_close);
 static const JSTrampStepDef js_regexp_exec_def    = PRIMARGS_DEF(PRIMARGS(0x1, HINT_STRING, 1), generic, js_regexp_exec, 0);
 static const JSTrampStepDef js_regexp_test_def    = PRIMARGS_DEF(PRIMARGS(0x1, HINT_STRING, 1), generic, js_regexp_test, 0);
+/* THE WHOLE numeric-coercion surface, declared rather than re-implemented. Every one of these performed its
+   ToNumber from C — js_call_c_function does it for the f_f/f_f_f prototypes, and the generic ones call JS_ToFloat64
+   themselves — so a page's `valueOf` containing a loop aborted in `Math.max(o, 1)` while the identical method
+   suspended in `o + 1`. They are all the same shape: coerce the named arguments left to right, then compute from
+   primitives, which is exactly what PRIMARGS says, so each is ONE line and none of them grows a machine. */
+static const JSTrampStepDef js_math_abs_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_fabs, 0);
+static const JSTrampStepDef js_math_floor_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_floor, 0);
+static const JSTrampStepDef js_math_ceil_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_ceil, 0);
+static const JSTrampStepDef js_math_round_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_round, 0);
+static const JSTrampStepDef js_math_sqrt_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_sqrt, 0);
+static const JSTrampStepDef js_math_acos_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_acos, 0);
+static const JSTrampStepDef js_math_asin_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_asin, 0);
+static const JSTrampStepDef js_math_atan_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_atan, 0);
+static const JSTrampStepDef js_math_cos_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_cos, 0);
+static const JSTrampStepDef js_math_exp_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_exp, 0);
+static const JSTrampStepDef js_math_log_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_log, 0);
+static const JSTrampStepDef js_math_sin_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_sin, 0);
+static const JSTrampStepDef js_math_tan_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_tan, 0);
+static const JSTrampStepDef js_math_trunc_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_trunc, 0);
+static const JSTrampStepDef js_math_sign_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_sign, 0);
+static const JSTrampStepDef js_math_cosh_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_cosh, 0);
+static const JSTrampStepDef js_math_sinh_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_sinh, 0);
+static const JSTrampStepDef js_math_tanh_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_tanh, 0);
+static const JSTrampStepDef js_math_acosh_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_acosh, 0);
+static const JSTrampStepDef js_math_asinh_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_asinh, 0);
+static const JSTrampStepDef js_math_atanh_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_atanh, 0);
+static const JSTrampStepDef js_math_expm1_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_expm1, 0);
+static const JSTrampStepDef js_math_log1p_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_log1p, 0);
+static const JSTrampStepDef js_math_log2_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_log2, 0);
+static const JSTrampStepDef js_math_log10_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_log10, 0);
+static const JSTrampStepDef js_math_cbrt_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_cbrt, 0);
+static const JSTrampStepDef js_math_f16round_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_f16round, 0);
+static const JSTrampStepDef js_math_fround_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_fround, 0);
+static const JSTrampStepDef js_math_atan2_def = PRIMARGS_DEF(PRIMARGS(0x3, HINT_NUMBER, 2), f_f_f, js_math_atan2, 0);
+static const JSTrampStepDef js_math_pow_def = PRIMARGS_DEF(PRIMARGS(0x3, HINT_NUMBER, 2), f_f_f, js_math_pow, 0);
+static const JSTrampStepDef js_math_min_def = PRIMARGS_DEF(PRIMARGS_ALL | PRIMARGS(0, HINT_NUMBER, 2), generic_magic, js_math_min_max, 0);
+static const JSTrampStepDef js_math_max_def = PRIMARGS_DEF(PRIMARGS_ALL | PRIMARGS(0, HINT_NUMBER, 2), generic_magic, js_math_min_max, 1);
+static const JSTrampStepDef js_math_hypot_def = PRIMARGS_DEF(PRIMARGS_ALL | PRIMARGS(0, HINT_NUMBER, 2), generic, js_math_hypot, 0);
+static const JSTrampStepDef js_math_imul_def = PRIMARGS_DEF(PRIMARGS(0x3, HINT_NUMBER, 2), generic, js_math_imul, 0);
+static const JSTrampStepDef js_math_clz32_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), generic, js_math_clz32, 0);
+static const JSTrampStepDef js_str_fromCharCode_def = PRIMARGS_DEF(PRIMARGS_ALL | PRIMARGS(0, HINT_NUMBER, 1), generic, js_string_fromCharCode, 0);
+static const JSTrampStepDef js_str_fromCodePoint_def = PRIMARGS_DEF(PRIMARGS_ALL | PRIMARGS(0, HINT_NUMBER, 1), generic, js_string_fromCodePoint, 0);
+static const JSTrampStepDef js_date_UTC_def = PRIMARGS_DEF(PRIMARGS_ALL | PRIMARGS(0, HINT_NUMBER, 7), generic, js_Date_UTC, 0);
 /* new Function(a, b, body) / the generator and async variants: 20.2.1.1 CreateDynamicFunction ToStrings every
    argument in order and everything after is the parser. The receiver slot is new_target on a constructor step,
    which is exactly what the body reads. */
@@ -53581,6 +53682,44 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_OBJ_ENTRIES]     = &js_obj_entries_def,
     [STEPDEF_OBJ_ASSIGN]      = &js_obj_assign_def,
     [STEPDEF_OBJ_SPREAD]      = &js_obj_spread_def,
+    [STEPDEF_MATH_ABS] = &js_math_abs_def,
+    [STEPDEF_MATH_FLOOR] = &js_math_floor_def,
+    [STEPDEF_MATH_CEIL] = &js_math_ceil_def,
+    [STEPDEF_MATH_ROUND] = &js_math_round_def,
+    [STEPDEF_MATH_SQRT] = &js_math_sqrt_def,
+    [STEPDEF_MATH_ACOS] = &js_math_acos_def,
+    [STEPDEF_MATH_ASIN] = &js_math_asin_def,
+    [STEPDEF_MATH_ATAN] = &js_math_atan_def,
+    [STEPDEF_MATH_COS] = &js_math_cos_def,
+    [STEPDEF_MATH_EXP] = &js_math_exp_def,
+    [STEPDEF_MATH_LOG] = &js_math_log_def,
+    [STEPDEF_MATH_SIN] = &js_math_sin_def,
+    [STEPDEF_MATH_TAN] = &js_math_tan_def,
+    [STEPDEF_MATH_TRUNC] = &js_math_trunc_def,
+    [STEPDEF_MATH_SIGN] = &js_math_sign_def,
+    [STEPDEF_MATH_COSH] = &js_math_cosh_def,
+    [STEPDEF_MATH_SINH] = &js_math_sinh_def,
+    [STEPDEF_MATH_TANH] = &js_math_tanh_def,
+    [STEPDEF_MATH_ACOSH] = &js_math_acosh_def,
+    [STEPDEF_MATH_ASINH] = &js_math_asinh_def,
+    [STEPDEF_MATH_ATANH] = &js_math_atanh_def,
+    [STEPDEF_MATH_EXPM1] = &js_math_expm1_def,
+    [STEPDEF_MATH_LOG1P] = &js_math_log1p_def,
+    [STEPDEF_MATH_LOG2] = &js_math_log2_def,
+    [STEPDEF_MATH_LOG10] = &js_math_log10_def,
+    [STEPDEF_MATH_CBRT] = &js_math_cbrt_def,
+    [STEPDEF_MATH_F16ROUND] = &js_math_f16round_def,
+    [STEPDEF_MATH_FROUND] = &js_math_fround_def,
+    [STEPDEF_MATH_ATAN2] = &js_math_atan2_def,
+    [STEPDEF_MATH_POW] = &js_math_pow_def,
+    [STEPDEF_MATH_MIN] = &js_math_min_def,
+    [STEPDEF_MATH_MAX] = &js_math_max_def,
+    [STEPDEF_MATH_HYPOT] = &js_math_hypot_def,
+    [STEPDEF_MATH_IMUL] = &js_math_imul_def,
+    [STEPDEF_MATH_CLZ32] = &js_math_clz32_def,
+    [STEPDEF_STR_FROMCHARCODE] = &js_str_fromCharCode_def,
+    [STEPDEF_STR_FROMCODEPOINT] = &js_str_fromCodePoint_def,
+    [STEPDEF_DATE_UTC] = &js_date_UTC_def,
     [STEPDEF_REFLECT_GOPD]    = &js_reflect_gopd_def,
     [STEPDEF_ITER_TAKE]       = &js_iter_take_def,
     [STEPDEF_ITER_DROP]       = &js_iter_drop_def,
@@ -58080,8 +58219,8 @@ static JSValue js_string_CreateHTML(JSContext *ctx, JSValueConst this_val,
 }
 
 static const JSCFunctionListEntry js_string_funcs[] = {
-    JS_CFUNC_DEF("fromCharCode", 1, js_string_fromCharCode ),
-    JS_CFUNC_DEF("fromCodePoint", 1, js_string_fromCodePoint ),
+    JS_CFUNC_STEP_DEF("fromCharCode", 1, STEPDEF_STR_FROMCHARCODE ),
+    JS_CFUNC_STEP_DEF("fromCodePoint", 1, STEPDEF_STR_FROMCODEPOINT ),
     JS_CFUNC_DEF("raw", 1, js_string_raw ),
 };
 
@@ -58601,44 +58740,44 @@ static double js_math_log10(double d) { return log10(d); }
 static double js_math_cbrt(double d) { return cbrt(d); }
 
 static const JSCFunctionListEntry js_math_funcs[] = {
-    JS_CFUNC_MAGIC_DEF("min", 2, js_math_min_max, 0 ),
-    JS_CFUNC_MAGIC_DEF("max", 2, js_math_min_max, 1 ),
-    JS_CFUNC_SPECIAL_DEF("abs", 1, f_f, js_math_fabs ),
-    JS_CFUNC_SPECIAL_DEF("floor", 1, f_f, js_math_floor ),
-    JS_CFUNC_SPECIAL_DEF("ceil", 1, f_f, js_math_ceil ),
-    JS_CFUNC_SPECIAL_DEF("round", 1, f_f, js_math_round ),
-    JS_CFUNC_SPECIAL_DEF("sqrt", 1, f_f, js_math_sqrt ),
+    JS_CFUNC_STEP_DEF("min", 2, STEPDEF_MATH_MIN ),
+    JS_CFUNC_STEP_DEF("max", 2, STEPDEF_MATH_MAX ),
+    JS_CFUNC_STEP_DEF("abs", 1, STEPDEF_MATH_ABS ),
+    JS_CFUNC_STEP_DEF("floor", 1, STEPDEF_MATH_FLOOR ),
+    JS_CFUNC_STEP_DEF("ceil", 1, STEPDEF_MATH_CEIL ),
+    JS_CFUNC_STEP_DEF("round", 1, STEPDEF_MATH_ROUND ),
+    JS_CFUNC_STEP_DEF("sqrt", 1, STEPDEF_MATH_SQRT ),
 
-    JS_CFUNC_SPECIAL_DEF("acos", 1, f_f, js_math_acos ),
-    JS_CFUNC_SPECIAL_DEF("asin", 1, f_f, js_math_asin ),
-    JS_CFUNC_SPECIAL_DEF("atan", 1, f_f, js_math_atan ),
-    JS_CFUNC_SPECIAL_DEF("atan2", 2, f_f_f, js_math_atan2 ),
-    JS_CFUNC_SPECIAL_DEF("cos", 1, f_f, js_math_cos ),
-    JS_CFUNC_SPECIAL_DEF("exp", 1, f_f, js_math_exp ),
-    JS_CFUNC_SPECIAL_DEF("log", 1, f_f, js_math_log ),
-    JS_CFUNC_SPECIAL_DEF("pow", 2, f_f_f, js_math_pow ),
-    JS_CFUNC_SPECIAL_DEF("sin", 1, f_f, js_math_sin ),
-    JS_CFUNC_SPECIAL_DEF("tan", 1, f_f, js_math_tan ),
+    JS_CFUNC_STEP_DEF("acos", 1, STEPDEF_MATH_ACOS ),
+    JS_CFUNC_STEP_DEF("asin", 1, STEPDEF_MATH_ASIN ),
+    JS_CFUNC_STEP_DEF("atan", 1, STEPDEF_MATH_ATAN ),
+    JS_CFUNC_STEP_DEF("atan2", 2, STEPDEF_MATH_ATAN2 ),
+    JS_CFUNC_STEP_DEF("cos", 1, STEPDEF_MATH_COS ),
+    JS_CFUNC_STEP_DEF("exp", 1, STEPDEF_MATH_EXP ),
+    JS_CFUNC_STEP_DEF("log", 1, STEPDEF_MATH_LOG ),
+    JS_CFUNC_STEP_DEF("pow", 2, STEPDEF_MATH_POW ),
+    JS_CFUNC_STEP_DEF("sin", 1, STEPDEF_MATH_SIN ),
+    JS_CFUNC_STEP_DEF("tan", 1, STEPDEF_MATH_TAN ),
     /* ES6 */
-    JS_CFUNC_SPECIAL_DEF("trunc", 1, f_f, js_math_trunc ),
-    JS_CFUNC_SPECIAL_DEF("sign", 1, f_f, js_math_sign ),
-    JS_CFUNC_SPECIAL_DEF("cosh", 1, f_f, js_math_cosh ),
-    JS_CFUNC_SPECIAL_DEF("sinh", 1, f_f, js_math_sinh ),
-    JS_CFUNC_SPECIAL_DEF("tanh", 1, f_f, js_math_tanh ),
-    JS_CFUNC_SPECIAL_DEF("acosh", 1, f_f, js_math_acosh ),
-    JS_CFUNC_SPECIAL_DEF("asinh", 1, f_f, js_math_asinh ),
-    JS_CFUNC_SPECIAL_DEF("atanh", 1, f_f, js_math_atanh ),
-    JS_CFUNC_SPECIAL_DEF("expm1", 1, f_f, js_math_expm1 ),
-    JS_CFUNC_SPECIAL_DEF("log1p", 1, f_f, js_math_log1p ),
-    JS_CFUNC_SPECIAL_DEF("log2", 1, f_f, js_math_log2 ),
-    JS_CFUNC_SPECIAL_DEF("log10", 1, f_f, js_math_log10 ),
-    JS_CFUNC_SPECIAL_DEF("cbrt", 1, f_f, js_math_cbrt ),
-    JS_CFUNC_DEF("hypot", 2, js_math_hypot ),
+    JS_CFUNC_STEP_DEF("trunc", 1, STEPDEF_MATH_TRUNC ),
+    JS_CFUNC_STEP_DEF("sign", 1, STEPDEF_MATH_SIGN ),
+    JS_CFUNC_STEP_DEF("cosh", 1, STEPDEF_MATH_COSH ),
+    JS_CFUNC_STEP_DEF("sinh", 1, STEPDEF_MATH_SINH ),
+    JS_CFUNC_STEP_DEF("tanh", 1, STEPDEF_MATH_TANH ),
+    JS_CFUNC_STEP_DEF("acosh", 1, STEPDEF_MATH_ACOSH ),
+    JS_CFUNC_STEP_DEF("asinh", 1, STEPDEF_MATH_ASINH ),
+    JS_CFUNC_STEP_DEF("atanh", 1, STEPDEF_MATH_ATANH ),
+    JS_CFUNC_STEP_DEF("expm1", 1, STEPDEF_MATH_EXPM1 ),
+    JS_CFUNC_STEP_DEF("log1p", 1, STEPDEF_MATH_LOG1P ),
+    JS_CFUNC_STEP_DEF("log2", 1, STEPDEF_MATH_LOG2 ),
+    JS_CFUNC_STEP_DEF("log10", 1, STEPDEF_MATH_LOG10 ),
+    JS_CFUNC_STEP_DEF("cbrt", 1, STEPDEF_MATH_CBRT ),
+    JS_CFUNC_STEP_DEF("hypot", 2, STEPDEF_MATH_HYPOT ),
     JS_CFUNC_DEF("random", 0, js_math_random ),
-    JS_CFUNC_SPECIAL_DEF("f16round", 1, f_f, js_math_f16round ),
-    JS_CFUNC_SPECIAL_DEF("fround", 1, f_f, js_math_fround ),
-    JS_CFUNC_DEF("imul", 2, js_math_imul ),
-    JS_CFUNC_DEF("clz32", 1, js_math_clz32 ),
+    JS_CFUNC_STEP_DEF("f16round", 1, STEPDEF_MATH_F16ROUND ),
+    JS_CFUNC_STEP_DEF("fround", 1, STEPDEF_MATH_FROUND ),
+    JS_CFUNC_STEP_DEF("imul", 2, STEPDEF_MATH_IMUL ),
+    JS_CFUNC_STEP_DEF("clz32", 1, STEPDEF_MATH_CLZ32 ),
     JS_CFUNC_DEF("sumPrecise", 1, js_math_sumPrecise ),
     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "Math", JS_PROP_CONFIGURABLE ),
     JS_PROP_DOUBLE_DEF("E", 2.718281828459045, 0 ),
@@ -68770,7 +68909,7 @@ done:
 static const JSCFunctionListEntry js_date_funcs[] = {
     JS_CFUNC_DEF("now", 0, js_Date_now ),
     JS_CFUNC_DEF("parse", 1, js_Date_parse ),
-    JS_CFUNC_DEF("UTC", 7, js_Date_UTC ),
+    JS_CFUNC_STEP_DEF("UTC", 7, STEPDEF_DATE_UTC ),
 };
 
 static const JSCFunctionListEntry js_date_proto_funcs[] = {
