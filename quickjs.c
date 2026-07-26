@@ -19060,6 +19060,8 @@ typedef struct JSPromiseExec {
                                     Args live in the STATE, not pushed as operands, so sp is untouched and the
                                     ORIGINAL ctor operands stay exactly where the finish pops them (as reduce does). */
     int orig_cfirst, orig_cargc; /* the ORIGINAL OP_call_constructor operand shape (pop at finish) */
+    uint8_t orig_is_tail;        /* `return Reflect.construct(Promise, [fn])` IS a tail construct: the frame must
+                                    RETURN the promise, not push it and run off the end of the tail-call opcode */
 } JSPromiseExec;
 static bool tramp_can_call_promise_exec(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc);
 /* (was 18, which CONT_IMPORT already had: both a frame's cont_kind and a continuation's outer_kind draw from this
@@ -21839,53 +21841,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc += 2;
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
-                if (JS_VALUE_GET_TAG(call_argv[-2]) == JS_TAG_OBJECT
-                    && JS_VALUE_GET_OBJ(call_argv[-2])->class_id == JS_CLASS_BOUND_FUNCTION) {
-                    /* `new (String.bind(null))(x)`: 10.4.1.2 constructs the ULTIMATE target with the flattened
-                       bound args, retargeting new_target when it is the bound function itself. Resolving it here
-                       is what keeps a bound STEP constructor off js_call_bound_function's JS_Call, which is
-                       js_call_c_function's DFAIL. */
-                    JSValueConst bthis6;
-                    int nb6;
-                    JSValueConst tgt6 = tramp_bound_target(call_argv[-2], &bthis6, &nb6);
-                    const JSTrampStepDef *sd6 = tramp_step_def_of(tgt6);
-                    JSValueConst ntgt6 = tramp_bound_newtarget(call_argv[-2], call_argv[-1]);
-                    if (tramp_can_construct(tgt6)) {
-                        /* a BYTECODE constructor at the end of the chain: its body runs on this chain like any
-                           other, with the flattened arguments handed over as an owned vector — they come from
-                           several bound objects and the caller's stack, so they are contiguous nowhere and the
-                           borrow the label otherwise does has nothing to borrow from. */
-                        int n6 = nb6 + call_argc, k6;
-                        JSValue *ab6 = js_malloc(ctx, sizeof(JSValue) * (n6 > 0 ? n6 : 1));
-                        if (unlikely(!ab6)) goto exception;
-                        tramp_bound_args(call_argv[-2], (JSValueConst *)ab6, nb6);
-                        for (k6 = 0; k6 < nb6; k6++) ab6[k6] = js_dup(ab6[k6]);   /* the vector OWNS its elements */
-                        for (k6 = 0; k6 < call_argc; k6++) ab6[nb6 + k6] = js_dup(call_argv[k6]);
-                        con_func = tgt6; con_ntgt = ntgt6;
-                        con_args = (JSValueConst *)ab6; con_argc = n6; con_args_owned = ab6;
-                        con_cargc = call_argc;   /* the caller pushed only ITS args, not the chain's */
-                        con_from_super = 0; con_super_ref = JS_UNDEFINED;
-                        tramp_first = -2; tramp_is_tail = 0;
-                        goto do_construct_tramp;
-                    }
-                    if (sd6) {
-                        int n6 = nb6 + call_argc, k6;
-                        JSValue *ab6 = js_malloc(ctx, sizeof(JSValue) * (n6 > 0 ? n6 : 1));
-                        void *stt6;
-                        if (unlikely(!ab6)) goto exception;
-                        tramp_bound_args(call_argv[-2], (JSValueConst *)ab6, nb6);   /* borrowed: the state dups */
-                        for (k6 = 0; k6 < call_argc; k6++) ab6[nb6 + k6] = (JSValue)call_argv[k6];
-                        stt6 = tramp_step_state_new(ctx, sd6, ntgt6, n6, (JSValueConst *)ab6, tgt6);
-                        js_free(ctx, ab6);
-                        if (unlikely(!stt6)) goto exception;
-                        ((JSStepHdr *)stt6)->orig_cfirst = -2;
-                        ((JSStepHdr *)stt6)->orig_cargc = call_argc;
-                        ((JSStepHdr *)stt6)->orig_is_tail = 0;
-                        cont_st = stt6;
-                        ret_val = JS_UNDEFINED;
-                        goto do_step_step;
-                    }
-                }
                 con_func = call_argv[-2]; con_ntgt = call_argv[-1];
                 con_args = vc(call_argv); con_argc = call_argc;
                 con_from_super = 0; con_super_ref = JS_UNDEFINED;
@@ -21947,90 +21902,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                 }
                 if (tramp_is_reflect_construct(call_argv[-1]) && call_argc >= 2
-                    && JS_VALUE_GET_TAG(call_argv[0]) == JS_TAG_OBJECT
-                    && JS_VALUE_GET_OBJ(call_argv[0])->class_id == JS_CLASS_C_FUNCTION
-                    && JS_VALUE_GET_OBJ(call_argv[0])->u.cfunc.cproto == JS_CFUNC_step_ctor) {
-                    /* Reflect.construct(C, argsList[, newTarget]) with C a step-machine constructor. Like
-                       Reflect.apply, the operator site resolves it: the arguments come from the LIST into the
-                       machine's init (never onto the operand stack, whose compiled size the list could overflow),
-                       and the receiver slot carries newTarget — the same convention OP_call_constructor's reshape
-                       preserves. Reached through js_reflect_construct instead, it was JS_CallConstructor2 into
-                       js_call_c_function's step DFAIL. */
-                    const JSTrampStepDef *sd = tramp_step_def_of(call_argv[0]);
-                    JSValueConst ntgt2 = (call_argc >= 3) ? call_argv[2] : call_argv[0];
-                    uint32_t alen4 = 0; JSValue *atab4 = NULL; void *stt4;
-                    if (JS_VALUE_GET_TAG(call_argv[1]) != JS_TAG_OBJECT) {
-                        JS_ThrowTypeError(ctx, "not an object");
-                        goto exception;
-                    }
-                    atab4 = build_arg_list(ctx, &alen4, call_argv[1]);
-                    if (unlikely(!atab4)) goto exception;
-                    stt4 = tramp_step_state_new(ctx, sd, ntgt2, (int)alen4, (JSValueConst *)atab4, call_argv[0]);
-                    free_arg_list(ctx, atab4, alen4);
-                    if (unlikely(!stt4)) goto exception;
-                    ((JSStepHdr *)stt4)->outer = NULL; ((JSStepHdr *)stt4)->outer_kind = CONT_NONE;
-                    ((JSStepHdr *)stt4)->orig_cfirst = -2;      /* the Reflect.construct operands */
-                    ((JSStepHdr *)stt4)->orig_cargc = call_argc;
-                    ((JSStepHdr *)stt4)->orig_is_tail = (opcode == OP_tail_call_method);
-                    cont_st = stt4;
-                    ret_val = JS_UNDEFINED;
-                    goto do_step_step;
-                }
-                if (tramp_is_reflect_construct(call_argv[-1]) && call_argc >= 2
-                    && tramp_can_construct(tramp_bound_target(call_argv[0], NULL, NULL))) {
-                    /* Reflect.construct(C, argsList[, newTarget]) with a BYTECODE constructor, behind any number
-                       of binds. Its body belongs on this chain exactly as `new C()`'s does; only the step-machine
-                       and Promise targets were resolved here, so a loop directly in a plain constructor's body
-                       preempted with no flow base. The arguments are the chain's bound ones followed by the list,
-                       and build_arg_list already yields a block — which is what the owned-vector entry takes. */
-                    int nbc = 0;
-                    JSValueConst tgtc = tramp_bound_target(call_argv[0], NULL, &nbc);
-                    JSValueConst ntgtc = tramp_bound_newtarget(call_argv[0],
-                                             (call_argc >= 3) ? call_argv[2] : call_argv[0]);
-                    uint32_t alenc = 0; JSValue *atabc; JSValue *abc; int kc;
-                    /* 28.1.2 step 2: an explicit newTarget must itself be a constructor, and that TypeError
-                       precedes CreateListFromArrayLike — which is what the harness's own isConstructor() probe
-                       is, so getting it wrong made every not-a-constructor test in the suite report the
-                       opposite. */
-                    if (call_argc >= 3 && !JS_IsConstructor(ctx, call_argv[2])) {
-                        JS_ThrowTypeError(ctx, "not a constructor");
-                        goto exception;
-                    }
-                    if (JS_VALUE_GET_TAG(call_argv[1]) != JS_TAG_OBJECT) {
-                        JS_ThrowTypeError(ctx, "not an object");
-                        goto exception;
-                    }
-                    atabc = build_arg_list(ctx, &alenc, call_argv[1]);
-                    if (unlikely(!atabc)) goto exception;
-                    abc = js_malloc(ctx, sizeof(JSValue) * (nbc + alenc > 0 ? nbc + alenc : 1));
-                    if (unlikely(!abc)) { free_arg_list(ctx, atabc, alenc); goto exception; }
-                    tramp_bound_args(call_argv[0], (JSValueConst *)abc, nbc);
-                    for (kc = 0; kc < nbc; kc++) abc[kc] = js_dup(abc[kc]);
-                    for (kc = 0; kc < (int)alenc; kc++) abc[nbc + kc] = atabc[kc];   /* ownership moves over */
-                    js_free(ctx, atabc);                                             /* the block only */
-                    con_func = tgtc; con_ntgt = ntgtc;
-                    con_args = (JSValueConst *)abc; con_argc = nbc + (int)alenc; con_args_owned = abc;
-                    con_cargc = call_argc;   /* the caller pushed the Reflect.construct operands, not the list */
+                    && JS_IsConstructor(ctx, call_argv[0])
+                    && (call_argc < 3 || JS_IsConstructor(ctx, call_argv[2]))
+                    && JS_VALUE_GET_TAG(call_argv[1]) == JS_TAG_OBJECT) {
+                    /* Reflect.construct(target, argsList[, newTarget]). CALL-SITE-RESOLVED like Reflect.apply,
+                       and for the same reason: the arguments come from a LIST that must never reach the operand
+                       stack, whose compiled size it could overflow. WHAT the target is is NOT this site's
+                       question — three copies here knew only step ctors, bytecode-behind-binds and Promise, so
+                       Reflect.construct of a Proxy, of Map/Set or of a TypedArray reached its C entry while the
+                       same target through `new` did not. The dispatch answers all of them.
+                       The two IsConstructor checks and the array-like check are 28.1.2 steps 1-3, and they gate
+                       the route because their THROWS belong to the C entry below, which raises them in the
+                       spec's order with the realm-correct error. */
+                    uint32_t alenr = 0;
+                    JSValue *atabr = build_arg_list(ctx, &alenr, call_argv[1]);
+                    if (unlikely(!atabr)) goto exception;
+                    con_func = call_argv[0];
+                    con_ntgt = (call_argc >= 3) ? call_argv[2] : call_argv[0];
+                    con_args = (JSValueConst *)atabr; con_argc = (int)alenr; con_args_owned = atabr;
+                    con_cargc = call_argc;   /* operands [Reflect, construct, target, argsList, newTarget?] */
                     con_from_super = 0; con_super_ref = JS_UNDEFINED;
+                    con_outer = NULL; con_outer_kind = CONT_NONE;
                     tramp_first = -2; tramp_is_tail = (opcode == OP_tail_call_method);
-                    goto do_construct_tramp;
-                }
-                if (tramp_is_reflect_construct(call_argv[-1]) && call_argc >= 2
-                    && tramp_can_call_promise_exec(ctx, call_argv[0], NULL, 0)) {
-                    /* Reflect.construct(Promise, argsList[, newTarget]): resolve it HERE, like Reflect.apply.
-                       The Promise constructor's executor body was deleted, so this spelling has nothing to fall
-                       to — routing it is the replacement. Only the executor and the operand-cleanup shape are
-                       needed; the args never have to reach the stack, because the constructor reads argv[0]. */
-                    JSValue ex = JS_GetPropertyUint32(ctx, call_argv[1], 0);
-                    if (unlikely(JS_IsException(ex))) goto exception;
-                    if (JS_IsFunction(ctx, ex)) {
-                        pe_ntgt = (call_argc >= 3) ? call_argv[2] : call_argv[0];
-                        pe_executor = ex; pe_executor_own = ex;   /* the state owns it: no operand to borrow */
-                        pe_cfirst = -2; pe_cargc = call_argc; pe_super_ref = JS_UNDEFINED;
-                        tramp_is_tail = 0;
-                        goto do_promise_exec_tramp;
-                    }
-                    JS_FreeValue(ctx, ex);   /* non-callable: fall through so step 2 throws in the C entry */
+                    goto do_construct_dispatch;   /* the arms carry the tail shape; forcing it off leaked the frame */
                 }
                 if (tramp_is_reflect_apply(call_argv[-1]) && call_argc >= 3
                     && JS_VALUE_GET_TAG(call_argv[0]) == JS_TAG_OBJECT
@@ -22326,7 +22220,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->resolving_funcs[1] = rfuncs[1];
                 s->super_ref = pe_super_ref; pe_super_ref = JS_UNDEFINED;   /* ownership moves to the continuation */
                 s->executor_own = pe_executor_own; pe_executor_own = JS_UNDEFINED;
-                s->orig_cfirst = pe_cfirst; s->orig_cargc = pe_cargc;
+                s->orig_cfirst = pe_cfirst; s->orig_cargc = pe_cargc; s->orig_is_tail = tramp_is_tail;
                 s->cb_args[0] = JS_UNDEFINED;          /* step 9: thisArgument is undefined */
                 s->cb_args[1] = pe_executor;           /* the executor (borrowed: a ctor operand / the derived argv) */
                 s->cb_args[2] = s->resolving_funcs[0]; /* borrowed views of the owned pair */
@@ -22368,6 +22262,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSPromiseExec *ps = pexec_finish_state;
                 JSValue r = ps->promise;
                 int cfirst = ps->orig_cfirst, cargc = ps->orig_cargc;
+                uint8_t itail = ps->orig_is_tail;
                 JSValue *cargv = sp - cargc;
                 pexec_finish_state = NULL;
                 if (unlikely(JS_IsException(ret_val))) {
@@ -22391,6 +22286,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 js_free_rt(rt, ps);
                 for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
                 sp += cfirst - cargc;
+                if (itail) { ret_val = r; goto do_return; }
                 *sp++ = r;
             }
             BREAK;
@@ -22532,6 +22428,37 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         }
                     }
                 }
+                if (JS_VALUE_GET_TAG(con_func) == JS_TAG_OBJECT
+                    && JS_VALUE_GET_OBJ(con_func)->class_id == JS_CLASS_BOUND_FUNCTION) {
+                    /* 10.4.1.2: a bound function's [[Construct]] constructs the ULTIMATE target with the
+                       flattened bound args, retargeting new_target when it is the bound function itself. Like the
+                       trapless proxy above this is a REWRITE, not an arm: it produces a new (target, arguments,
+                       new_target) and re-enters, so every kind below answers a bound target exactly as it answers
+                       a bare one. Written out at OP_call_constructor it knew only bytecode and step targets, so
+                       `new (Set.bind(null))(iterable)` and `new (RegExp.bind(null,"a"))("g")` reached C entries.
+                       The flattened arguments come from several bound objects and the caller's stack, so they are
+                       contiguous nowhere: they become an OWNED list, which is the shape the dispatch already has. */
+                    int nb8 = 0, k8, n8;
+                    JSValueConst tgt8 = tramp_bound_target(con_func, NULL, &nb8);
+                    JSValueConst ntgt8 = tramp_bound_newtarget(con_func, con_ntgt);
+                    JSValue *ab8;
+                    n8 = nb8 + con_argc;
+                    ab8 = js_malloc(ctx, sizeof(JSValue) * (size_t)(n8 > 0 ? n8 : 1));
+                    if (unlikely(!ab8)) goto exception;
+                    tramp_bound_args(con_func, (JSValueConst *)ab8, nb8);
+                    for (k8 = 0; k8 < nb8; k8++) ab8[k8] = js_dup(ab8[k8]);
+                    for (k8 = 0; k8 < con_argc; k8++) ab8[nb8 + k8] = js_dup(con_args[k8]);
+                    if (con_args_owned) { free_arg_list(ctx, con_args_owned, con_argc); }
+                    /* The target needs NO reference of its own: it is reachable through the bound object, and
+                       whatever already keeps THAT alive keeps it alive too — the callee operand for a stack
+                       shape, con_super_ref for super(), the machine's own buffer for a Construct request. Giving
+                       it one anyway is how the first attempt leaked: the -2 arms free the operands, not
+                       con_super_ref. */
+                    con_func = tgt8; con_ntgt = ntgt8;
+                    con_args = (JSValueConst *)ab8; con_argc = n8; con_args_owned = ab8;
+                    con_cargc = con_pop;   /* the OPERANDS are unchanged; only the arguments were rewritten */
+                    goto do_construct_dispatch;
+                }
                 if (tramp_can_construct(con_func)) {
                     con_cargc = con_cargc_in;                 /* the body entry reads and resets it itself */
                     goto do_construct_tramp;                  /* a bytecode ctor: its body runs on this chain */
@@ -22557,7 +22484,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         /* a machine's own Construct borrows ITS buffer, so there is nothing on the stack to pop */
                         ((JSStepHdr *)cstt)->orig_cfirst = con_outer ? 0 : tramp_first;
                         ((JSStepHdr *)cstt)->orig_cargc = con_outer ? 0 : con_pop;
-                        ((JSStepHdr *)cstt)->orig_is_tail = 0;
+                        ((JSStepHdr *)cstt)->orig_is_tail = con_outer ? 0 : tramp_is_tail;
                         con_outer = NULL; con_outer_kind = CONT_NONE;
                         cont_st = cstt;
                         ret_val = JS_UNDEFINED;
@@ -22574,7 +22501,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     con_args_owned = NULL;
                     smc_cfirst = tramp_first; smc_cargc = con_pop;
                     smc_super_ref = con_super_ref; con_super_ref = JS_UNDEFINED;
-                    tramp_is_tail = 0; goto do_setmap_consume_tramp;
+                    goto do_setmap_consume_tramp;
                 }
                 if (tramp_can_call_ta_consume(ctx, con_func, con_args, con_argc, &ta_classid, &tramp_iter_getiter)) {
                     DCHECK(!con_outer, "a step machine's Construct reached the TypedArray consumer arm — build its "
@@ -22584,7 +22511,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     tac_args_own = con_args_owned; tac_args_own_n = con_args_owned ? con_argc : 0;
                     con_args_owned = NULL;   /* same as Map/Set: the state owns it for the whole consume */
                     tac_super_ref = con_super_ref; con_super_ref = JS_UNDEFINED;
-                    tramp_is_tail = 0; goto do_ta_consume_tramp;
+                    goto do_ta_consume_tramp;
                 }
                 if (tramp_can_call_promise_exec(ctx, con_func, con_args, con_argc)) {
                     DCHECK(!con_outer, "a step machine's Construct reached the Promise executor arm — build its "
@@ -22598,7 +22525,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                     pe_cfirst = tramp_first; pe_cargc = con_pop;
                     pe_super_ref = con_super_ref; con_super_ref = JS_UNDEFINED;
-                    tramp_is_tail = 0; goto do_promise_exec_tramp;
+                    goto do_promise_exec_tramp;
                 }
                 /* No arm matched: a C constructor with no body to suspend. The cleanup is fully determined by the
                    operand shape, which is why these were two blocks. */
@@ -22612,6 +22539,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (unlikely(JS_IsException(ret_val))) goto exception;   /* operands freed by the unwind */
                     for (i = -2; i < con_pop; i++) JS_FreeValue(ctx, cargv[i]);
                     sp -= con_pop + 2;
+                    if (tramp_is_tail) goto do_return;   /* the operands are already popped, as the step DONE does */
                 } else {
                     DCHECK(tramp_first == 0, "a construct shape with no stack operands cannot also pop them");
                     DCHECK(!con_args_owned, "a shapeless construct never owns its argument list");
@@ -23060,7 +22988,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     tac_cargc = TAKE_CALL_POP();
                     tac_args_own = call_args_owned; tac_args_own_n = call_args_owned_n;
                     call_args_owned = NULL; call_args_owned_n = 0;
-                    ta_from = 1; tramp_is_tail = 0; goto do_ta_consume_tramp;   /* TypedArray.from(iterable) — never tail */
+                    /* the arm records the shape it was given; forcing non-tail made `return Int8Array.of(1,2)`
+                       push its result and then run off the end of the tail-call opcode */
+                    ta_from = 1; goto do_ta_consume_tramp;
                 }
                 if (tramp_can_call_promise_all(ctx, call_argv[-1], vc(call_argv), call_argc, &pa_magic, &tramp_iter_getiter))
                     goto do_promise_all_consume_tramp;          /* Promise.all/allSettled/any/race(iterable) */
@@ -24165,7 +24095,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     so->k = ta_argc; so->ta_k = 0;
                     so->sink = ITERCONS_FROM; so->ta_isfrom = 1; so->ta_classid = 0;
                     so->ta_phase = 1;
-                    so->orig_cfirst = tac_cfirst; so->orig_cargc = (tac_cfirst ? ta_argc : 0); so->orig_is_tail = 0;
+                    so->orig_cfirst = tac_cfirst;
+                    so->orig_cargc = tac_cfirst ? (tac_cargc >= 0 ? tac_cargc : ta_argc) : 0;
+                    so->orig_is_tail = tramp_is_tail;
+                    tac_cargc = -1;   /* read + reset */
                     cont_st = so;
                     ret_val = JS_UNINITIALIZED;
                     goto do_iter_consume_step;
@@ -24190,6 +24123,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 tmp = JS_NewArray(ctx);
                 if (JS_IsException(tmp)) { JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED; js_free_rt(rt, s); goto exception; }
                 s->r = tmp;
+                /* the owned argument LIST goes on the state HERE, before anything that can throw: the create
+                   below reads new_target's `prototype` and a getter there is page code. Setting it after that
+                   read leaked the whole graph on custom-proto-access-throws, because the teardown frees exactly
+                   what the state holds and the list was still in a local. */
+                s->args_own = tac_args_own; s->args_own_n = tac_args_own_n;   /* NULL for an operand shape */
+                tac_args_own = NULL; tac_args_own_n = 0;
+                s->super_ref = tac_super_ref; tac_super_ref = JS_UNDEFINED;
                 s->adder = js_dup(ntgt);   /* the new_target/ctor, used at the finish to create the typed array */
                 /* TypedArray.from(gen, mapfn, thisArg): carry the mapfn; it is applied at the finish (via
                    js_typed_array_from on the collected array — spec map-after-create order), NOT during the collect. */
@@ -24212,11 +24152,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 s->k = 0;
                 s->sink = ITERCONS_FROM;
-                s->super_ref = tac_super_ref; tac_super_ref = JS_UNDEFINED;
-                s->args_own = tac_args_own; s->args_own_n = tac_args_own_n;   /* NULL for an operand shape */
-                tac_args_own = NULL; tac_args_own_n = 0;
                 s->orig_cfirst = tac_cfirst;
                 s->orig_cargc = tac_cfirst ? (tac_cargc >= 0 ? tac_cargc : ta_argc) : 0;
+                s->orig_is_tail = tramp_is_tail;
                 tac_cargc = -1;   /* read + reset */
                 DCHECK(ta_argc >= 1, "the TypedArray consume arm reads its source; the recognizers refuse argc 0");
                 tramp_consume_iterable = ta_argv[0];
