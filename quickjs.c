@@ -38278,6 +38278,53 @@ static JSModuleDef *js_find_loaded_module(JSContext *ctx, JSAtom name)
 
 /* return NULL in case of exception (e.g. module could not be loaded) */
 /* `base_cname` and `cname1` may be pure ASCII or UTF-8 encoded */
+/* HostLoadImportedModule keys the module map on the specifier AND the import attributes, so the same file
+   imported as JavaScript and with `type: 'text'` are DIFFERENT Module Records. Keying on the specifier alone
+   handed a self-referential text import the JS record, whose `default` export does not exist. The separator is
+   a control character, which cannot appear in a path or in a type name, so the key is unambiguous. */
+static JSAtom js_module_map_key(JSContext *ctx, const char *cname, JSValueConst attributes)
+{
+    JSValue tv;
+    const char *tstr;
+    char *keyed;
+    JSAtom a;
+    size_t n;
+
+    if (!JS_IsObject(attributes))
+        return JS_NewAtom(ctx, cname);
+    tv = JS_GetPropertyStr(ctx, attributes, "type");
+    if (JS_IsException(tv))
+        return JS_ATOM_NULL;
+    if (!JS_IsString(tv)) {
+        JS_FreeValue(ctx, tv);
+        return JS_NewAtom(ctx, cname);
+    }
+    tstr = JS_ToCString(ctx, tv);
+    JS_FreeValue(ctx, tv);
+    if (!tstr)
+        return JS_ATOM_NULL;
+    n = strlen(cname) + strlen(tstr) + sizeof("\001type=");
+    keyed = js_malloc(ctx, n);
+    if (!keyed) {
+        JS_FreeCString(ctx, tstr);
+        return JS_ATOM_NULL;
+    }
+    snprintf(keyed, n, "%s\001type=%s", cname, tstr);
+    JS_FreeCString(ctx, tstr);
+    a = JS_NewAtom(ctx, keyed);
+    js_free(ctx, keyed);
+    return a;
+}
+
+/* true when `key` is just the specifier — i.e. the attributes contributed nothing to the module map key. */
+static bool keyed_by_attributes(JSContext *ctx, JSAtom key, const char *cname)
+{
+    JSAtom plain = JS_NewAtom(ctx, cname);
+    bool same = (plain == key);
+    JS_FreeAtom(ctx, plain);
+    return same;
+}
+
 static JSModuleDef *js_host_resolve_imported_module(JSContext *ctx,
                                                     const char *base_cname,
                                                     const char *cname1,
@@ -38301,7 +38348,7 @@ static JSModuleDef *js_host_resolve_imported_module(JSContext *ctx,
     if (!cname)
         return NULL;
 
-    module_name = JS_NewAtom(ctx, cname);
+    module_name = js_module_map_key(ctx, cname, attributes);
     if (module_name == JS_ATOM_NULL) {
         js_free(ctx, cname);
         return NULL;
@@ -38315,8 +38362,6 @@ static JSModuleDef *js_host_resolve_imported_module(JSContext *ctx,
         return m;
     }
 
-    JS_FreeAtom(ctx, module_name);
-
     /* load the module */
     if (!rt->u.module_loader_func) {
         /* XXX: use a syntax error ? */
@@ -38324,6 +38369,7 @@ static JSModuleDef *js_host_resolve_imported_module(JSContext *ctx,
         JS_ThrowReferenceError(ctx, "could not load module '%s'",
                                cname);
         js_free(ctx, cname);
+        JS_FreeAtom(ctx, module_name);
         return NULL;
     }
 
@@ -38331,6 +38377,17 @@ static JSModuleDef *js_host_resolve_imported_module(JSContext *ctx,
         m = rt->u.module_loader_func2(ctx, cname, rt->module_loader_opaque, attributes);
     } else {
         m = rt->u.module_loader_func(ctx, cname, rt->module_loader_opaque);
+    }
+    /* The loader registers the record under the raw specifier (it is loading a FILE). When the attributes made
+       the key DIFFER from that specifier, re-key the record so the next import with the same type finds it and
+       one with a different type does not. A plain import's key IS the specifier, and then nothing is touched —
+       the module name is also its resolution base for nested imports, so only a synthetic module (json/text/
+       bytes, which has neither nested imports nor import.meta) is ever renamed. */
+    if (m && !keyed_by_attributes(ctx, module_name, cname)) {
+        JS_FreeAtom(ctx, m->module_name);
+        m->module_name = module_name;   /* ownership transfers */
+    } else {
+        JS_FreeAtom(ctx, module_name);
     }
     js_free(ctx, cname);
     return m;
