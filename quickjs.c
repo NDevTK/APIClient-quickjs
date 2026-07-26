@@ -39746,20 +39746,23 @@ static JSValue js_async_module_execution_rejected(JSContext *ctx, JSValueConst t
     module->eval_exception = js_dup(error);
     module->status = JS_MODULE_STATUS_EVALUATED;
 
-    for(i = 0; i < module->async_parent_modules_count; i++) {
-        JSModuleDef *m = module->async_parent_modules[i];
-        JSValue m_obj = JS_NewModuleValue(ctx, m);
-        js_async_module_execution_rejected(ctx, JS_UNDEFINED, 1, &error, 0,
-                                           vc(&m_obj));
-        JS_FreeValue(ctx, m_obj);
-    }
-
+    /* AsyncModuleExecutionRejected step 9 rejects THIS module's top-level capability, and step 10 recurses into
+       the async parents — in that order, so the promises settle LEAF-TO-ROOT. Recursing first settled them
+       root-to-leaf, which rejection-order measures. */
     if (!JS_IsUndefined(module->promise)) {
         JSValue ret_val;
         assert(module->cycle_root == module);
         ret_val = JS_Call(ctx, module->resolving_funcs[1], JS_UNDEFINED,
                           1, &error);
         JS_FreeValue(ctx, ret_val);
+    }
+
+    for(i = 0; i < module->async_parent_modules_count; i++) {
+        JSModuleDef *m = module->async_parent_modules[i];
+        JSValue m_obj = JS_NewModuleValue(ctx, m);
+        js_async_module_execution_rejected(ctx, JS_UNDEFINED, 1, &error, 0,
+                                           vc(&m_obj));
+        JS_FreeValue(ctx, m_obj);
     }
     return JS_UNDEFINED;
 }
