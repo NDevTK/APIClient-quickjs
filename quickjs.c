@@ -1445,7 +1445,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_BIGINT_ASUINTN, STEPDEF_BIGINT_ASINTN,
     STEPDEF_OBJ_GOPD, STEPDEF_REFLECT_GOPD,
     STEPDEF_OBJ_VALUES, STEPDEF_OBJ_ENTRIES, STEPDEF_OBJ_ASSIGN, STEPDEF_OBJ_SPREAD,
-    STEPDEF_ARRAY_FLAT, STEPDEF_ARRAY_FLATMAP, STEPDEF_ARRAY_FROMLIKE, STEPDEF_ARRAY_WITH, STEPDEF_ARRAY_FILL, STEPDEF_ARRAY_COPYWITHIN, STEPDEF_BIGINT_CTOR, STEPDEF_TA_WITH, STEPDEF_DATE_TOJSON, STEPDEF_DATE_TOPRIM,
+    STEPDEF_ARRAY_FLAT, STEPDEF_ARRAY_FLATMAP, STEPDEF_ARRAY_FROMLIKE, STEPDEF_ARRAY_WITH, STEPDEF_ARRAY_FILL, STEPDEF_ARRAY_COPYWITHIN, STEPDEF_BIGINT_CTOR, STEPDEF_TA_WITH, STEPDEF_DATE_TOJSON, STEPDEF_DATE_TOPRIM, STEPDEF_DATE_CTOR,
     STEPDEF_MATH_ABS, STEPDEF_MATH_FLOOR, STEPDEF_MATH_CEIL, STEPDEF_MATH_ROUND, STEPDEF_MATH_SQRT, STEPDEF_MATH_ACOS, STEPDEF_MATH_ASIN, STEPDEF_MATH_ATAN, STEPDEF_MATH_COS, STEPDEF_MATH_EXP, STEPDEF_MATH_LOG, STEPDEF_MATH_SIN, STEPDEF_MATH_TAN, STEPDEF_MATH_TRUNC, STEPDEF_MATH_SIGN, STEPDEF_MATH_COSH, STEPDEF_MATH_SINH, STEPDEF_MATH_TANH, STEPDEF_MATH_ACOSH, STEPDEF_MATH_ASINH, STEPDEF_MATH_ATANH, STEPDEF_MATH_EXPM1, STEPDEF_MATH_LOG1P, STEPDEF_MATH_LOG2, STEPDEF_MATH_LOG10, STEPDEF_MATH_CBRT, STEPDEF_MATH_F16ROUND, STEPDEF_MATH_FROUND, STEPDEF_MATH_ATAN2, STEPDEF_MATH_POW, STEPDEF_MATH_MIN, STEPDEF_MATH_MAX, STEPDEF_MATH_HYPOT, STEPDEF_MATH_IMUL, STEPDEF_MATH_CLZ32, STEPDEF_STR_FROMCHARCODE, STEPDEF_STR_FROMCODEPOINT, STEPDEF_DATE_UTC,
     STEPDEF_REGEXP_EXEC, STEPDEF_REGEXP_TEST,
     STEPDEF_ITER_TAKE, STEPDEF_ITER_DROP,
@@ -19972,6 +19972,25 @@ typedef struct JSTAWith {
 } JSTAWith;
 static JSValue js_typed_array_with_build(JSContext *ctx, JSValueConst this_val, int64_t idx, JSValue val, uint32_t len);
 static JSObject *get_typed_array(JSContext *ctx, JSValueConst this_val);
+
+/* 21.4.2.1 the Date constructor. Its argument coercions are the page's code and js_date_constructor ran them from
+   its C entry, so `new Date({valueOf(){ while(x){} }})` preempted with no flow base. It is not a
+   coerce-then-compute declaration for two reasons the spec spells out: a Date-OBJECT argument is read from its
+   internal slot with no coercion at all, and the hint depends on the count — DEFAULT for one argument, NUMBER for
+   several. */
+typedef struct JSDateCtor {
+    JSStepHdr hdr;        /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    JSValue result;       /* DONE (owned) */
+    JSValue prim;         /* the one-argument ToPrimitive result (owned) */
+    double fields[7];
+    double val;
+    int n, i;
+} JSDateCtor;
+static int64_t date_now(void);
+static double time_clip(double t);
+static double set_date_fields(double fields[], int is_local);
+static JSValue js_Date_parse(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static JSValue get_date_string(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
 
 /* 21.4.4.45 Date.prototype[@@toPrimitive]. It performs OrdinaryToPrimitive on ITSELF — the 7.1.1 walk with step 2
    skipped — and js_date_Symbol_toPrimitive ran that walk from a C entry, so a page's valueOf or toString with a
@@ -53285,6 +53304,110 @@ static JSValue js_array_copywithin_fini(JSContext *ctx, void *st, bool take_resu
     return r;
 }
 
+static int js_date_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSDateCtor *s = st;
+    int r;
+
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
+        s->result = JS_UNDEFINED; s->prim = JS_UNDEFINED;
+        s->val = 0; s->i = 0;
+        /* `Date(...)` called as a FUNCTION ignores its arguments entirely — it does not coerce them. */
+        s->n = JS_IsUndefined(s->hdr.this_val) ? 0 : s->hdr.argc;
+        if (s->n == 0) { s->val = date_now(); s->hdr.stage = 5; }
+        else if (s->n == 1) {
+            /* a Date OBJECT is read from its slot: step 4.a, no coercion */
+            if (JS_VALUE_GET_TAG(step_arg(&s->hdr, 0)) == JS_TAG_OBJECT) {
+                JSObject *p = JS_VALUE_GET_OBJ(step_arg(&s->hdr, 0));
+                if (p->class_id == JS_CLASS_DATE && JS_IsNumber(p->u.object_data)) {
+                    if (JS_ToFloat64(ctx, &s->val, p->u.object_data)) return -1;
+                    s->val = time_clip(s->val);
+                    s->hdr.stage = 5;
+                }
+            }
+            if (s->hdr.stage != 5) s->hdr.stage = 1;
+        } else {
+            static const double init[7] = { 0, 0, 1, 0, 0, 0, 0 };
+            memcpy(s->fields, init, sizeof(init));
+            if (s->n > 7) s->n = 7;
+            s->hdr.stage = 3;
+        }
+    }
+    if (s->hdr.stage == 1) {
+        /* step 4.b's ToPrimitive with the DEFAULT hint */
+        r = step_toprim_run(ctx, &s->hdr, step_arg(&s->hdr, 0), HINT_NONE, cb_result, &s->prim, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        {   /* a STRING is parsed, anything else is ToNumber — both on a PRIMITIVE, so neither invokes anything */
+            JSValue v = s->prim;
+            s->prim = JS_UNDEFINED;
+            if (JS_IsString(v)) {
+                JSValue dv = js_Date_parse(ctx, JS_UNDEFINED, 1, vc(&v));
+                JS_FreeValue(ctx, v);
+                if (JS_IsException(dv)) return -1;
+                if (JS_ToFloat64Free(ctx, &s->val, dv)) return -1;
+            } else if (JS_ToFloat64Free(ctx, &s->val, v)) {
+                return -1;
+            }
+            s->val = time_clip(s->val);
+        }
+        s->hdr.stage = 5;
+    }
+    while (s->hdr.stage == 3 || s->hdr.stage == 4) {
+        if (s->hdr.stage == 3) {
+            if (s->i >= s->n) { s->hdr.stage = 5; break; }
+            /* step 7's ToNumber per field. EVERY provided argument is coerced, in order, before any of them is
+               examined — a NaN in an earlier one does not skip the later coercions the page can observe. */
+            r = step_toprim_run(ctx, &s->hdr, step_arg(&s->hdr, s->i), HINT_NUMBER, cb_result, &s->prim,
+                                out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->hdr.stage = 4;
+        }
+        if (s->hdr.stage == 4) {
+            JSValue v = s->prim;
+            double a;
+            s->prim = JS_UNDEFINED;
+            if (JS_ToFloat64Free(ctx, &a, v)) return -1;
+            s->fields[s->i] = isfinite(a) ? trunc(a) : NAN;
+            if (s->i == 0 && isfinite(a) && s->fields[0] >= 0 && s->fields[0] < 100)
+                s->fields[0] += 1900;
+            s->i++;
+            s->hdr.stage = 3;
+        }
+    }
+    JS_FreeValue(ctx, cb_result);
+    if (s->n >= 2) {
+        int k;
+        for (k = 0; k < s->n; k++)
+            if (!isfinite(s->fields[k])) break;
+        s->val = (k == s->n) ? set_date_fields(s->fields, 1) : NAN;
+    }
+    s->result = js_create_from_ctor(ctx, s->hdr.this_val, JS_CLASS_DATE);
+    if (JS_IsException(s->result)) { s->result = JS_UNDEFINED; return -1; }
+    JS_SetObjectData(ctx, s->result, js_float64(s->val));
+    if (JS_IsUndefined(s->hdr.this_val)) {
+        /* invoked as a function: the value is (new Date()).toString() */
+        JSValue str = get_date_string(ctx, s->result, 0, NULL, 0x13);
+        JS_FreeValue(ctx, s->result);
+        s->result = JS_IsException(str) ? JS_UNDEFINED : str;
+        if (JS_IsUndefined(s->result)) return -1;
+    }
+    return 0;
+}
+
+static JSValue js_date_ctor_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSDateCtor *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    JS_FreeValue(ctx, s->prim);
+    js_free(ctx, s);
+    return r;
+}
+
 static int js_date_toprim_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSDateToPrim *s = st;
@@ -54344,6 +54467,8 @@ static int js_array_fill_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
 static int js_ta_with_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_date_tojson_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_date_toprim_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static int js_date_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_date_ctor_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_date_toprim_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_date_tojson_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_ta_with_fini(JSContext *ctx, void *st, bool take_result);
@@ -54474,6 +54599,7 @@ static JSValue js_bigint_constructor(JSContext *ctx, JSValueConst new_target, in
 static const JSTrampStepDef js_ta_with_def = { sizeof(JSTAWith), js_ta_with_step, js_ta_with_fini, 0 };
 static const JSTrampStepDef js_date_toJSON_def = { sizeof(JSDateToJSON), js_date_tojson_step, js_date_tojson_fini, 0 };
 static const JSTrampStepDef js_date_toPrim_def = { sizeof(JSDateToPrim), js_date_toprim_step, js_date_toprim_fini, 0 };
+static const JSTrampStepDef js_date_ctor_def = { sizeof(JSDateCtor), js_date_ctor_step, js_date_ctor_fini, 0 };
 static const JSTrampStepDef js_bigint_ctor_def =
     { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, PRIMARGS(0x1, HINT_NUMBER, 1),
       { .generic = js_bigint_constructor }, JS_CFUNC_constructor_or_func, 0, NULL, NULL, NULL };
@@ -54631,6 +54757,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_TA_WITH]       = &js_ta_with_def,
     [STEPDEF_DATE_TOJSON]   = &js_date_toJSON_def,
     [STEPDEF_DATE_TOPRIM]   = &js_date_toPrim_def,
+    [STEPDEF_DATE_CTOR]     = &js_date_ctor_def,
     [STEPDEF_ARRAY_INDEXOF]     = &js_array_indexOf_def,
     [STEPDEF_ARRAY_LASTINDEXOF] = &js_array_lastIndexOf_def,
     [STEPDEF_ARRAY_INCLUDES]    = &js_array_includes_def,
@@ -69268,73 +69395,6 @@ static int64_t date_now(void) {
     return js__gettimeofday_us() / 1000;
 }
 
-static JSValue js_date_constructor(JSContext *ctx, JSValueConst new_target,
-                                   int argc, JSValueConst *argv)
-{
-    // Date(y, mon, d, h, m, s, ms)
-    JSValue rv;
-    int i, n;
-    double a, val;
-
-    if (JS_IsUndefined(new_target)) {
-        /* invoked as function */
-        argc = 0;
-    }
-    n = argc;
-    if (n == 0) {
-        val = date_now();
-    } else if (n == 1) {
-        JSValue v, dv;
-        if (JS_VALUE_GET_TAG(argv[0]) == JS_TAG_OBJECT) {
-            JSObject *p = JS_VALUE_GET_OBJ(argv[0]);
-            if (p->class_id == JS_CLASS_DATE && JS_IsNumber(p->u.object_data)) {
-                if (JS_ToFloat64(ctx, &val, p->u.object_data))
-                    return JS_EXCEPTION;
-                val = time_clip(val);
-                goto has_val;
-            }
-        }
-        v = JS_ToPrimitive(ctx, argv[0], HINT_NONE);
-        if (JS_IsString(v)) {
-            dv = js_Date_parse(ctx, JS_UNDEFINED, 1, vc(&v));
-            JS_FreeValue(ctx, v);
-            if (JS_IsException(dv))
-                return JS_EXCEPTION;
-            if (JS_ToFloat64Free(ctx, &val, dv))
-                return JS_EXCEPTION;
-        } else {
-            if (JS_ToFloat64Free(ctx, &val, v))
-                return JS_EXCEPTION;
-        }
-        val = time_clip(val);
-    } else {
-        double fields[] = { 0, 0, 1, 0, 0, 0, 0 };
-        if (n > 7)
-            n = 7;
-        for(i = 0; i < n; i++) {
-            if (JS_ToFloat64(ctx, &a, argv[i]))
-                return JS_EXCEPTION;
-            if (!isfinite(a))
-                break;
-            fields[i] = trunc(a);
-            if (i == 0 && fields[0] >= 0 && fields[0] < 100)
-                fields[0] += 1900;
-        }
-        val = (i == n) ? set_date_fields(fields, 1) : NAN;
-    }
-has_val:
-    rv = js_create_from_ctor(ctx, new_target, JS_CLASS_DATE);
-    if (!JS_IsException(rv))
-        JS_SetObjectData(ctx, rv, js_float64(val));
-    if (!JS_IsException(rv) && JS_IsUndefined(new_target)) {
-        /* invoked as a function, return (new Date()).toString(); */
-        JSValue s;
-        s = get_date_string(ctx, rv, 0, NULL, 0x13);
-        JS_FreeValue(ctx, rv);
-        rv = s;
-    }
-    return rv;
-}
 
 static JSValue js_Date_UTC(JSContext *ctx, JSValueConst this_val,
                            int argc, JSValueConst *argv)
@@ -69968,7 +70028,7 @@ int JS_AddIntrinsicDate(JSContext *ctx)
     JSValue obj;
 
     obj = JS_NewCConstructor(ctx, JS_CLASS_DATE, "Date",
-                             js_date_constructor, 7, JS_CFUNC_constructor_or_func, 0,
+                             NULL, 7, JS_CFUNC_step_ctor, STEPDEF_DATE_CTOR,
                              JS_UNDEFINED,
                              js_date_funcs, countof(js_date_funcs),
                              js_date_proto_funcs, countof(js_date_proto_funcs),
