@@ -1278,7 +1278,10 @@ JS_EXTERN void JS_SetConcolicHooks(const JSConcolicHooks *hooks);
 JS_EXTERN JSValue *JS_FlowNew(JSContext *ctx, const char *src, size_t len, const char *filename, int eval_flags);
 /* MODULE sources: a graph to link and evaluate, not a program to wrap. Returns the evaluation PROMISE. */
 JS_EXTERN JSValue  JS_FlowEvalModule(JSContext *ctx, const char *src, size_t len, const char *filename, int eval_flags);   /* eval_flags: JS_EVAL_FLAG_STRICT threaded through; opaque flow handle (NULL on error) */
-JS_EXTERN int      JS_FlowResume(JSContext *ctx, JSValue *flow);              /* 1 = suspended (preempted), 0 = completed */
+/* 1 = suspended (preempted), 0 = completed. *pres receives the program's COMPLETION VALUE (or JS_EXCEPTION) on
+   completion, JS_UNDEFINED while suspended — a script's completion value is part of its completion, so it is not
+   optional: pres==NULL is a DCHECK, never a licence to discard the value the program produced. */
+JS_EXTERN int      JS_FlowResume(JSContext *ctx, JSValue *flow, JSValue *pres);
 JS_EXTERN void     JS_FlowFree(JSContext *ctx, JSValue *flow);
 /* Feature-engagement counters (anti-fake-green): requested = back-edge preempt points reached; fired = actually
    parked+rebuilt. requested>fired iff the feature is gated somewhere (nested async/generator activation). */

@@ -1,2 +1,0 @@
-test262/test/built-ins/Proxy/revocable/tco-fn-realm.js:23: strict mode: Test262Error: Expected a TypeError but got a different error constructor with the same name
-test262/test/built-ins/TypedArray/prototype/slice/speciesctor-return-same-buffer-with-offset.js:40: TypeError: ArrayBuffer is immutable (Testing with Float64Array and makeImmutableArrayBuffer.)

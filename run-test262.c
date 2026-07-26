@@ -549,8 +549,7 @@ static JSValue js_evalScript_262(JSContext *ctx, JSValueConst this_val,
        run their assertions inside it), so running it off the flow machinery meant its loops preempted in a C
        activation with no flow base and the whole annexB tree aborted. It is a NESTED flow: the outer flow is
        suspended in this C frame while the host pumps the inner one to its completion, which is the host
-       boundary a synchronous eval API requires, not a second scheduler inside the engine. No test uses the
-       completion value, and JS_FlowResume does not surface one, so the result is UNDEFINED / EXCEPTION. */
+       boundary a synchronous eval API requires, not a second scheduler inside the engine. */
     ret = fork_preempt_enabled()
         ? fork_preempt_eval(ctx, str, len, "<evalScript>", JS_EVAL_TYPE_GLOBAL)
         : JS_Eval(ctx, str, len, "<evalScript>", JS_EVAL_TYPE_GLOBAL);
@@ -1382,11 +1381,12 @@ static JSValue fork_preempt_eval(JSContext *ctx, const char *buf, size_t buf_len
         return JS_FlowEvalModule(ctx, buf, buf_len, filename, eval_flags);
     }
     JSValue *flow = JS_FlowNew(ctx, buf, buf_len, filename, eval_flags);   /* STRICTNESS and the real script NAME */
+    JSValue res = JS_UNDEFINED;
     if (!flow) return JS_EXCEPTION;   /* compile error: exception already pending */
     JS_SetFlowControlHooks(&fork_hooks_ON);
-    while (JS_FlowResume(ctx, flow)) { }   /* park + rebuild the whole frame chain on every back-edge */
+    while (JS_FlowResume(ctx, flow, &res)) { }   /* park + rebuild the whole frame chain on every back-edge */
     JS_FlowFree(ctx, flow);
-    return JS_HasException(ctx) ? JS_EXCEPTION : JS_UNDEFINED;
+    return res;   /* the program's COMPLETION VALUE — what an eval API evaluates to (JS_EXCEPTION on a throw) */
 }
 
 static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,

@@ -821,9 +821,9 @@ typedef enum {
     JS_VAR_PRIVATE_SETTER, /* must come after JS_VAR_PRIVATE_GETTER */
     JS_VAR_PRIVATE_GETTER_SETTER, /* must come after JS_VAR_PRIVATE_SETTER */
     JS_VAR_USING, /* using declaration variable */
-    JS_VAR_USING_METHOD, /* hidden local holding the cached dispose method
-                            for the preceding JS_VAR_USING var (always
-                            allocated immediately after it). */
+    JS_VAR_USING_METHOD, /* hidden local holding the dispose method GetDisposeMethod fetched for one `using`
+                            declaration. The pairing lives in fd->using_decls, so this slot is NOT required to sit
+                            next to the resource — which is what lets a module-level resource be a var_ref. */
 } JSVarKindEnum;
 
 /* XXX: could use a different structure in bytecode functions to save
@@ -25812,24 +25812,28 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
         CASE(OP_using_dispose):
             {
-                int idx;
-                JSValueConst val, method;
+                /* stack: error_state value method -- error_state. The resource and its already-fetched dispose
+                   method are pushed by the OP_dispose_scope expansion with ordinary load opcodes, so this opcode is
+                   addressing-agnostic: a module-level resource lives in a var_ref, a block-local one in a frame
+                   slot, and both arrive here the same way. */
+                JSValue val = sp[-2], method = sp[-1];
                 JSValue ret, error_state;
 
-                idx = get_u16(pc);
-                pc += 2;
-                val = var_buf[idx];
-                method = var_buf[idx + 1];
+                sp -= 2;
                 error_state = sp[-1];
 
                 if (JS_IsNull(val) || JS_IsUndefined(val) ||
                     JS_IsUninitialized(val)) {
                     /* null/undefined (spec-permitted) or uninitialized
                        (declaration threw before assignment). */
+                    JS_FreeValue(ctx, val);
+                    JS_FreeValue(ctx, method);
                     BREAK;
                 }
                 sf->cur_pc = pc;
                 ret = JS_Call(ctx, method, val, 0, NULL);
+                JS_FreeValue(ctx, val);
+                JS_FreeValue(ctx, method);
                 if (JS_IsException(ret)) {
                     JSValue new_error = JS_GetException(ctx);
                     if (!JS_IsUninitialized(error_state)) {
@@ -25854,25 +25858,28 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
         CASE(OP_using_dispose_async):
             {
-                int idx;
-                JSValueConst val, method;
+                /* stack: value method -- promise (see OP_using_dispose for why the operands come off the stack) */
+                JSValue val = sp[-2], method = sp[-1];
                 JSValue ret;
-
-                idx = get_u16(pc);
-                pc += 2;
-                val = var_buf[idx];
-                method = var_buf[idx + 1];
 
                 if (JS_IsNull(val) || JS_IsUndefined(val) ||
                     JS_IsUninitialized(val)) {
+                    sp -= 2;
+                    JS_FreeValue(ctx, val);
+                    JS_FreeValue(ctx, method);
                     sp[0] = JS_UNDEFINED;
                     sp++;
                     BREAK;
                 }
                 sf->cur_pc = pc;
                 ret = JS_Call(ctx, method, val, 0, NULL);
+                /* on a throw the two operands stay on the stack and the unwind to the OP_catch handler frees them
+                   (it releases everything above the recorded catch offset) — freeing here would double-free */
                 if (JS_IsException(ret))
                     goto exception;
+                sp -= 2;
+                JS_FreeValue(ctx, val);
+                JS_FreeValue(ctx, method);
                 sp[0] = ret;
                 sp++;
             }
@@ -28494,8 +28501,9 @@ JSValue JS_FlowEvalModule(JSContext *ctx, const char *src, size_t len, const cha
     return JS_EvalFunction(ctx, bc);   /* create the module function, link the graph, evaluate; consumes bc */
 }
 
-int JS_FlowResume(JSContext *ctx, JSValue *flow) {
+int JS_FlowResume(JSContext *ctx, JSValue *flow, JSValue *pres) {
     JSAsyncFunctionState *s = (JSAsyncFunctionState *)flow;
+    DCHECK(pres != NULL, "JS_FlowResume: the completion value is part of the completion — the caller must take it");
     /* NESTED resume: a host API that evaluates a program synchronously while a flow is already running
        ($262.evalScript, and any embedder JS_Eval from a C builtin) starts a SECOND flow from inside the outer
        flow's C stack. Without this restore the inner flow's base would stay installed after it finishes, and
@@ -28514,10 +28522,13 @@ int JS_FlowResume(JSContext *ctx, JSValue *flow) {
            with a FUNC_RET_* code): a NORMAL-func_kind program completes via `done:` leaving BOTH cur_sp NULL
            AND the tramp chain empty. A BASE suspend (done_generator) saves cur_sp (non-null); a DEEP suspend
            returns directly with cur_sp NULL but stashes the chain in tramp_top. So suspended iff either is set. */
-        if (s->frame.cur_sp == NULL && s->tramp_top == NULL) { JS_FreeValue(ctx, r); result = 0; break; }   /* completed / threw */
+        /* `r` IS the program's completion value here (`done:` returns ret_val — the value the global program's
+           OP_return left on the stack, or JS_EXCEPTION). Freeing it discarded what the script evaluated to, which
+           is exactly the value a synchronous host eval API ($262.createRealm().evalScript) must hand back. */
+        if (s->frame.cur_sp == NULL && s->tramp_top == NULL) { *pres = r; result = 0; break; }   /* completed / threw */
         int fr = JS_VALUE_GET_INT(r);
         if (fr == FUNC_RET_PREEMPT || fr == FUNC_RET_YIELD || fr == FUNC_RET_YIELD_STAR) {
-            result = 1; break;   /* suspended — the scheduler (preempt) or generator consumer resumes it */
+            *pres = JS_UNDEFINED; result = 1; break;   /* suspended — the scheduler (preempt) or generator consumer resumes it */
         }
         if (fr == FUNC_RET_AWAIT) {
             /* OP_await left the awaited operand at cur_sp[-1]. Settle it + continue. A BASE flow is a CLASSIC
@@ -28527,8 +28538,12 @@ int JS_FlowResume(JSContext *ctx, JSValue *flow) {
             if (!flow_settle_await(ctx, s)) DFAIL("JS_FlowResume: base-flow await on a pending promise (impossible for a classic script)");
             continue;   /* re-resume: the continuation reads the settled value from cur_sp[-1] */
         }
+        /* The frame says SUSPENDED (cur_sp or tramp_top set) but the code is none of the four FUNC_RET_* — there is
+           no fifth suspend reason, so this is a should-never-happen. It used to report `completed` and drop `r`,
+           which would silently abandon a live suspended frame; a new suspend code must be ROUTED, not swallowed. */
+        DFAIL("JS_FlowResume: suspended frame with an unknown FUNC_RET code — route the new suspend reason");
         JS_FreeValue(ctx, r);
-        result = 0; break;
+        *pres = JS_UNDEFINED; result = 0; break;
     }
     if (nested) g_flow_base_gen = outer_base;
     return result;
@@ -29861,6 +29876,21 @@ typedef struct BlockEnv {
     int using_scope_level; /* scope level for OP_dispose_scope (-1 if none) */
 } BlockEnv;
 
+/* One `using`/`await using` declaration = one entry on the scope's DisposeCapability
+   ([[DisposableResourceStack]], sec-adddisposableresource). The resource VALUE and its already-fetched
+   [[DisposeMethod]] are each addressed independently, because a declaration at the body scope of a MODULE binds a
+   module-environment binding (a JS_CLOSURE_MODULE_DECL var_ref, which `export { r }` resolves to) while its cached
+   dispose method is a compiler temp that never leaves the module activation, hence always a frame local. The old
+   model required the two to be ADJACENT frame slots so one opcode operand could reach both; that adjacency is
+   exactly what made a module-level `using` unexportable, so the stack is recorded here and the dispose opcodes take
+   both operands off the JS stack. */
+typedef struct JSUsingDecl {
+    int scope_level;        /* the lexical scope whose exit disposes this resource */
+    int value_idx;          /* frame-local index, or the JSGlobalVar index when value_is_global */
+    int method_idx;         /* frame-local index of the cached dispose method */
+    bool value_is_global;   /* the value is a program-level (module) binding, reached via its var_ref */
+} JSUsingDecl;
+
 typedef struct JSGlobalVar {
     int cpool_idx; /* if >= 0, index in the constant pool for hoisted
                       function defintion*/
@@ -29994,6 +30024,12 @@ typedef struct JSFunctionDef {
     int global_var_count;
     int global_var_size;
     JSGlobalVar *global_vars;
+
+    /* the function's `using` declarations in DECLARATION order; OP_dispose_scope walks them BACKWARDS, which is
+       the spec's reverse disposal order (sec-disposeresources iterates [[DisposableResourceStack]] in reverse). */
+    int using_decl_count;
+    int using_decl_size;
+    JSUsingDecl *using_decls;
 
     DynBuf byte_code;
     int last_opcode_pos; /* -1 if no last opcode */
@@ -32210,6 +32246,31 @@ static JSGlobalVar *add_global_var(JSContext *ctx, JSFunctionDef *s,
     return hf;
 }
 
+/* A lexical declaration at the BODY scope of a global program or a module is a PROGRAM-LEVEL binding (a
+   JSGlobalVar: a lexical global for a script, a module-environment var_ref for a module), not a frame local. */
+static bool js_decl_is_program_level(JSFunctionDef *fd)
+{
+    return fd->is_eval &&
+           (fd->eval_type == JS_EVAL_TYPE_GLOBAL || fd->eval_type == JS_EVAL_TYPE_MODULE) &&
+           fd->scope_level == fd->body_scope;
+}
+
+/* Push one `using`/`await using` declaration onto the compile-time image of the scope's DisposeCapability. */
+static int add_using_decl(JSContext *ctx, JSFunctionDef *fd, int value_idx,
+                          bool value_is_global, int method_idx)
+{
+    JSUsingDecl *ud;
+    if (js_resize_array(ctx, (void **)&fd->using_decls, sizeof(fd->using_decls[0]),
+                        &fd->using_decl_size, fd->using_decl_count + 1))
+        return -1;
+    ud = &fd->using_decls[fd->using_decl_count++];
+    ud->scope_level = fd->scope_level;
+    ud->value_idx = value_idx;
+    ud->method_idx = method_idx;
+    ud->value_is_global = value_is_global;
+    return 0;
+}
+
 typedef enum {
     JS_VAR_DEF_WITH,
     JS_VAR_DEF_LET,
@@ -32281,17 +32342,22 @@ static int define_var(JSParseState *s, JSFunctionDef *fd, JSAtom name,
             }
         }
 
-        if (fd->is_eval &&
-                (fd->eval_type == JS_EVAL_TYPE_GLOBAL ||
-                fd->eval_type == JS_EVAL_TYPE_MODULE) &&
-                fd->scope_level == fd->body_scope &&
-                var_def_type != JS_VAR_DEF_USING) {
+        /* A `using` declaration at the BODY scope of a module is a module-environment binding like any other
+           lexical declaration — `export { r }` resolves to it, so it must become a JSGlobalVar (and from there a
+           JS_CLOSURE_MODULE_DECL var_ref), not a frame local. It used to be forced down the local path because the
+           dispose opcodes could only address adjacent frame slots; the DisposeCapability is recorded in
+           fd->using_decls now, so the exclusion is gone. (`using` at the body scope of a SCRIPT or an eval is a
+           SyntaxError — sec-using-declaration — so MODULE is the only reachable program-level case.) */
+        if (js_decl_is_program_level(fd)) {
             JSGlobalVar *hf;
+            DCHECK(var_def_type != JS_VAR_DEF_USING || fd->eval_type == JS_EVAL_TYPE_MODULE,
+                   "a program-level `using` declaration is only reachable in a module");
             hf = add_global_var(s->ctx, fd, name);
             if (!hf)
                 return -1;
             hf->is_lexical = true;
-            hf->is_const = (var_def_type == JS_VAR_DEF_CONST);
+            hf->is_const = (var_def_type == JS_VAR_DEF_CONST ||
+                            var_def_type == JS_VAR_DEF_USING);
             idx = GLOBAL_VAR_OFFSET;
         } else {
             JSVarKindEnum var_kind;
@@ -36545,13 +36611,15 @@ static __exception int js_parse_var(JSParseState *s, int parse_flags, int tok,
             int using_method_idx = -1;
             if (next_token(s))
                 goto var_error;
+            bool using_is_global = (tok == TOK_USING) && js_decl_is_program_level(fd);
             if (js_define_var(s, name, tok))
                 goto var_error;
             if (tok == TOK_USING) {
-                /* Allocate a paired hidden local for the cached dispose
-                   method. Must be allocated immediately after the value
-                   var so OP_using_dispose can locate it at value_idx + 1.
-                */
+                /* The resource VALUE is whatever js_define_var just created: the module binding it appended to
+                   global_vars, or the frame local it appended to vars. The dispose METHOD is always a hidden frame
+                   local — it is a compiler temp holding the already-fetched GetDisposeMethod result, never a
+                   binding, so it needs no module storage even when the value has some. */
+                int using_value_idx = using_is_global ? fd->global_var_count - 1 : fd->var_count - 1;
                 using_method_idx = add_scope_var(ctx, fd,
                                                  JS_ATOM__using_dispose_,
                                                  JS_VAR_USING_METHOD);
@@ -36559,6 +36627,8 @@ static __exception int js_parse_var(JSParseState *s, int parse_flags, int tok,
                     goto var_error;
                 fd->vars[using_method_idx].is_lexical = 1;
                 fd->vars[using_method_idx].is_const = 1;
+                if (add_using_decl(ctx, fd, using_value_idx, using_is_global, using_method_idx) < 0)
+                    goto var_error;
             }
             if (export_flag) {
                 if (!add_export_entry(s, s->cur_func->module, name, name,
@@ -36849,6 +36919,10 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
                 return -1;
             }
             if (tok == TOK_USING) {
+                /* the for-of head opens its own per-iteration scope, so this binding is never program-level */
+                int value_idx = fd->var_count - 1;
+                DCHECK(!js_decl_is_program_level(fd),
+                       "a for-of `using` head must be inside its own iteration scope, never at the program body scope");
                 int mi = add_scope_var(ctx, fd, JS_ATOM__using_dispose_,
                                        JS_VAR_USING_METHOD);
                 if (mi < 0) {
@@ -36857,6 +36931,10 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
                 }
                 fd->vars[mi].is_lexical = 1;
                 fd->vars[mi].is_const = 1;
+                if (add_using_decl(ctx, fd, value_idx, false, mi) < 0) {
+                    JS_FreeAtom(s->ctx, var_name);
+                    return -1;
+                }
                 emit_op(s, OP_using_check);
                 emit_u8(s, is_await_using);
                 emit_op(s, OP_put_loc);
@@ -40849,6 +40927,7 @@ static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd)
         JS_FreeAtom(ctx, fd->global_vars[i].var_name);
     }
     js_free(ctx, fd->global_vars);
+    js_free(ctx, fd->using_decls);   /* plain ints: no owned atoms to release */
 
     for(i = 0; i < fd->closure_var_count; i++) {
         JSClosureVar *cv = &fd->closure_var[i];
@@ -41287,6 +41366,8 @@ static __maybe_unused void js_dump_function_bytecode(JSContext *ctx, JSFunctionB
             JSVarDef *vd = &b->vardefs[b->arg_count + i];
             printf("%5d: %s %s", i,
                    vd->var_kind == JS_VAR_CATCH ? "catch" :
+                   vd->var_kind == JS_VAR_USING ? "using" :
+                   vd->var_kind == JS_VAR_USING_METHOD ? "using-method" :
                    (vd->var_kind == JS_VAR_FUNCTION_DECL ||
                     vd->var_kind == JS_VAR_NEW_FUNCTION_DECL) ? "function" :
                    vd->is_const ? "const" :
@@ -43133,56 +43214,82 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
             break;
 
         case OP_dispose_scope:
+            /* Expand the scope's compile-time DisposeCapability. sec-disposeresources walks
+               [[DisposableResourceStack]] in REVERSE, which is fd->using_decls backwards. Each entry pushes its
+               (value, method) pair with the ordinary load opcode for wherever that half lives — a module-level
+               resource's value is a var_ref, its method a frame local — so the dispose opcodes need no addressing
+               mode of their own and the two halves need not be adjacent slots. */
             {
-                int scope_idx, scope = get_u16(bc_buf + pos + 1);
+                int ud_i, scope = get_u16(bc_buf + pos + 1);
                 bool is_async = s->scopes[scope].is_await_using;
 
-                for(scope_idx = s->scopes[scope].first; scope_idx >= 0;) {
-                    JSVarDef *vd = &s->vars[scope_idx];
-                    if (vd->scope_level == scope) {
-                        if (vd->var_kind == JS_VAR_USING) {
-                            if (is_async) {
-                                int label_catch = new_label_fd(s);
-                                int label_end = new_label_fd(s);
-                                if (label_catch < 0 || label_end < 0) {
-                                    dbuf_set_error(&bc_out);
-                                    break;
-                                }
-
-                                dbuf_putc(&bc_out, OP_catch);
-                                dbuf_put_u32(&bc_out, label_catch);
-                                update_label(s, label_catch, 1);
-                                s->jump_size++;
-
-                                dbuf_putc(&bc_out, OP_using_dispose_async);
-                                dbuf_put_u16(&bc_out, scope_idx);
-
-                                dbuf_putc(&bc_out, OP_await);
-                                dbuf_putc(&bc_out, OP_drop);
-                                dbuf_putc(&bc_out, OP_drop);
-
-                                dbuf_putc(&bc_out, OP_goto);
-                                dbuf_put_u32(&bc_out, label_end);
-                                update_label(s, label_end, 1);
-                                s->jump_size++;
-
-                                dbuf_putc(&bc_out, OP_label);
-                                dbuf_put_u32(&bc_out, label_catch);
-                                s->label_slots[label_catch].pos2 = bc_out.size;
-
-                                dbuf_putc(&bc_out, OP_using_dispose_merge);
-
-                                dbuf_putc(&bc_out, OP_label);
-                                dbuf_put_u32(&bc_out, label_end);
-                                s->label_slots[label_end].pos2 = bc_out.size;
-                            } else {
-                                dbuf_putc(&bc_out, OP_using_dispose);
-                                dbuf_put_u16(&bc_out, scope_idx);
+                for (ud_i = s->using_decl_count - 1; ud_i >= 0; ud_i--) {
+                    JSUsingDecl *ud = &s->using_decls[ud_i];
+                    int value_op = OP_get_loc, value_idx = ud->value_idx;
+                    if (ud->scope_level != scope)
+                        continue;
+                    if (ud->value_is_global) {
+                        /* the module binding add_module_variables made for this global var: its var_idx IS the
+                           global-var index, which is how the export table and every read of the name reach it */
+                        int cv_i;
+                        value_op = OP_get_var_ref;
+                        value_idx = -1;
+                        for (cv_i = 0; cv_i < s->closure_var_count; cv_i++) {
+                            JSClosureVar *cv = &s->closure_var[cv_i];
+                            if (cv->closure_type == JS_CLOSURE_MODULE_DECL && cv->var_idx == ud->value_idx) {
+                                value_idx = cv_i;
+                                break;
                             }
                         }
-                        scope_idx = vd->scope_next;
+                        DCHECK(value_idx >= 0,
+                               "a program-level `using` binding has no module closure var — add_module_variables did not run");
+                    }
+                    if (is_async) {
+                        int label_catch = new_label_fd(s);
+                        int label_end = new_label_fd(s);
+                        if (label_catch < 0 || label_end < 0) {
+                            dbuf_set_error(&bc_out);
+                            break;
+                        }
+
+                        dbuf_putc(&bc_out, OP_catch);
+                        dbuf_put_u32(&bc_out, label_catch);
+                        update_label(s, label_catch, 1);
+                        s->jump_size++;
+
+                        /* the raw (unchecked) loads: a resource whose initializer threw is still UNINITIALIZED
+                           here and must reach the dispose opcode as such, not as a TDZ ReferenceError */
+                        dbuf_putc(&bc_out, value_op);
+                        dbuf_put_u16(&bc_out, value_idx);
+                        dbuf_putc(&bc_out, OP_get_loc);
+                        dbuf_put_u16(&bc_out, ud->method_idx);
+
+                        dbuf_putc(&bc_out, OP_using_dispose_async);
+
+                        dbuf_putc(&bc_out, OP_await);
+                        dbuf_putc(&bc_out, OP_drop);
+                        dbuf_putc(&bc_out, OP_drop);
+
+                        dbuf_putc(&bc_out, OP_goto);
+                        dbuf_put_u32(&bc_out, label_end);
+                        update_label(s, label_end, 1);
+                        s->jump_size++;
+
+                        dbuf_putc(&bc_out, OP_label);
+                        dbuf_put_u32(&bc_out, label_catch);
+                        s->label_slots[label_catch].pos2 = bc_out.size;
+
+                        dbuf_putc(&bc_out, OP_using_dispose_merge);
+
+                        dbuf_putc(&bc_out, OP_label);
+                        dbuf_put_u32(&bc_out, label_end);
+                        s->label_slots[label_end].pos2 = bc_out.size;
                     } else {
-                        break;
+                        dbuf_putc(&bc_out, value_op);
+                        dbuf_put_u16(&bc_out, value_idx);
+                        dbuf_putc(&bc_out, OP_get_loc);
+                        dbuf_put_u16(&bc_out, ud->method_idx);
+                        dbuf_putc(&bc_out, OP_using_dispose);
                     }
                 }
             }
@@ -44882,6 +44989,10 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     }
     js_free(ctx, fd->closure_var);
     fd->closure_var = NULL;
+    /* consumed by the OP_dispose_scope expansion in resolve_variables; nothing in the bytecode refers to it */
+    js_free(ctx, fd->using_decls);
+    fd->using_decls = NULL;
+    fd->using_decl_count = fd->using_decl_size = 0;
 
     b->has_prototype = fd->has_prototype;
     b->has_simple_parameter_list = fd->has_simple_parameter_list;
