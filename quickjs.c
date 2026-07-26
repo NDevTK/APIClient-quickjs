@@ -69854,8 +69854,12 @@ static JSValue js_typed_array_indexOf(JSContext *ctx, JSValueConst this_val,
 
     /* if the array was detached, no need to go further (but no
        exception is raised) */
-    if (typed_array_is_oob(p) || len > p->u.array.count) {
-        /* "includes" scans all the properties, so "undefined" can match */
+    if (typed_array_is_oob(p) ||
+        (len > p->u.array.count && special == special_includes)) {
+        /* includes() reads with Get (step 11.a), so an index past the CURRENT length yields undefined and a
+           searched undefined matches. indexOf/lastIndexOf ask HasProperty instead: those indices are ABSENT, so
+           the scan must CONTINUE below them rather than bail — the surviving elements are still in range,
+           because the index arithmetic above used the ORIGINAL length. */
         if (special == special_includes)
             if (JS_IsUndefined(argv[0]))
                 if (k < typed_array_length(p))
@@ -69863,12 +69867,20 @@ static JSValue js_typed_array_indexOf(JSContext *ctx, JSValueConst this_val,
         goto done;
     }
 
-    // RAB may have been resized by evil .valueOf method
+    /* A SHRINK inside fromIndex's valueOf does not abandon the scan: the spec's loop asks HasProperty per index,
+       so indices past the new length are absent and the scan continues BELOW them. The index arithmetic above
+       still used the ORIGINAL length, which is what makes a negative fromIndex relative to it. */
     len = min_int(len, p->u.array.count);
     if (len == 0)
         goto done;
-    k = min_int(k, len);
-    stop = min_int(stop, len);
+    if (special == special_lastIndexOf) {
+        k = min_int(k, len - 1);   /* k is an INDEX here, so len-1: min(k, len) would read one past the end */
+        if (k < 0)
+            goto done;
+    } else {
+        k = min_int(k, len);
+        stop = min_int(stop, len);
+    }
 
     is_bigint = 0;
     is_int = 0; /* avoid warning */
@@ -70306,9 +70318,21 @@ static int js_ta_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
         if (p && p1 && s->len == p->u.array.count && p->class_id == p1->class_id
             && typed_array_length(p1) >= count && typed_array_length(p) >= s->start + count) {
             shift = typed_array_size_log2(p->class_id);
-            memmove(p1->u.array.u.uint8_ptr,
-                    p->u.array.u.uint8_ptr + (s->start << shift),
-                    count << shift);
+            {
+                uint8_t *dst = p1->u.array.u.uint8_ptr;
+                const uint8_t *src = p->u.array.u.uint8_ptr + (s->start << shift);
+                size_t nbytes = (size_t)count << shift, bi;
+                /* 23.2.3.27 step 14.g.ix copies FORWARD, one unit at a time. When @@species returns a view on
+                   the SAME buffer at a HIGHER offset, that propagates the first element through the overlap —
+                   memmove deliberately does the opposite (it preserves the source), producing [20,30,40,…]
+                   where the spec produces [20,20,20,…]. Overlap the other way, and non-overlap, are identical
+                   either way. */
+                if (dst > src && (size_t)(dst - src) < nbytes)
+                    for (bi = 0; bi < nbytes; bi++)
+                        dst[bi] = src[bi];
+                else
+                    memmove(dst, src, nbytes);
+            }
         } else {
             space = p ? max_int(0, p->u.array.count - s->start) : 0;
             count = min_int(count, space);
@@ -70480,7 +70504,7 @@ static JSValue js_typed_array_subarray(JSContext *ctx, JSValueConst this_val,
     JSValueConst args[4];
     JSValue arr, byteOffset, ta_buffer;
     JSObject *p;
-    int len, start, final, count, shift, offset;
+    int len, start, final, count, shift, offset, nargs;
 
     p = get_typed_array(ctx, this_val);
     if (!p)
@@ -70494,21 +70518,14 @@ static JSValue js_typed_array_subarray(JSContext *ctx, JSValueConst this_val,
             goto exception;
     }
     count = max_int(final - start, 0);
-    byteOffset = js_typed_array_get_byteOffset(ctx, this_val);
-    if (JS_IsException(byteOffset))
-        goto exception;
     ta = p->u.typed_array;
-    abuf = ta->buffer->u.array_buffer;
-    if (ta->offset > abuf->byte_length)
-        goto range_error;
-    if (ta->offset == abuf->byte_length && count > 0) {
-    range_error:
-        JS_ThrowRangeError(ctx, "invalid offset");
-        goto exception;
-    }
+    /* 23.2.3.30 step 12 reads O.[[ByteOffset]] — the SLOT, not the .byteOffset getter, which reports 0 once the
+       buffer is detached (and `end`'s valueOf is free to detach it). And the algorithm has NO bounds check of its
+       own: it hands buffer/beginByteOffset/newLength to TypedArraySpeciesCreate, and the constructor is what
+       throws on a detached buffer. The RangeError here pre-empted that and fired on a detach the spec lets
+       through. */
     shift = typed_array_size_log2(p->class_id);
-    offset = JS_VALUE_GET_INT(byteOffset) + (start << shift);
-    JS_FreeValue(ctx, byteOffset);
+    offset = ta->offset + (start << shift);
     ta_buffer = js_typed_array_get_buffer(ctx, this_val);
     if (JS_IsException(ta_buffer))
         goto exception;
@@ -70516,10 +70533,11 @@ static JSValue js_typed_array_subarray(JSContext *ctx, JSValueConst this_val,
     args[1] = safe_const(ta_buffer);
     args[2] = safe_const(js_int32(offset));
     args[3] = safe_const(js_int32(count));
-    // result is length-tracking if source TA is and no explicit count is given
-    if (ta->track_rab && JS_IsUndefined(argv[1]))
-        args[3] = JS_UNDEFINED;
-    arr = js_typed_array___speciesCreate(ctx, JS_UNDEFINED, 4, args, false);
+    /* 23.2.3.30 step 16: a LENGTH-TRACKING source with no explicit `end` builds the result length-tracking too,
+       and its argumentsList is « buffer, beginByteOffset » — TWO entries. Passing a third `undefined` is
+       observable: a custom @@species sees an extra argument (and `arguments.length` 3). */
+    nargs = (ta->track_rab && JS_IsUndefined(argv[1])) ? 3 : 4;
+    arr = js_typed_array___speciesCreate(ctx, JS_UNDEFINED, nargs, args, false);
     JS_FreeValue(ctx, ta_buffer);
     return arr;
  exception:
