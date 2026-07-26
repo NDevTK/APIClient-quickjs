@@ -1,3 +1,2 @@
 test262/test/built-ins/TypedArray/prototype/slice/speciesctor-return-same-buffer-with-offset.js:40: TypeError: ArrayBuffer is immutable (Testing with Float64Array and makeImmutableArrayBuffer.)
 test262/test/language/module-code/top-level-await/rejection-order.js:20: TypeError: $DONE() not called
-test262/test/language/module-code/top-level-await/async-module-does-not-block-sibling-modules.js:13: TypeError: $DONE() not called

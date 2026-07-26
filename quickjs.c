@@ -29076,7 +29076,7 @@ static bool js_async_function_post(JSContext *ctx, JSAsyncFunctionData *s, JSVal
    resumed AS A FLOW (js_async_function_resume_as_flow): a loop/await PARKS at a back-edge and re-enters via the job
    pump, never self-resumed to completion. There is no drive-to-completion resume to fall back to. */
 
-static JSValue js_async_resume_job(JSContext *ctx, int argc, JSValueConst *argv);
+static void js_async_resume_park(JSContext *ctx, void *opaque);
 
 /* Resume a SUSPENDED async continuation AS A FLOW (the post-await body). Such a continuation is not a nested
    activation of anything — it IS the running flow — so it becomes its own base while it runs; its loops then
@@ -29093,26 +29093,26 @@ static bool js_async_function_resume_as_flow(JSContext *ctx, JSAsyncFunctionData
     func_ret = async_func_resume(ctx, &s->func_state);
     g_flow_base_gen = prev_base;
     if (JS_VALUE_GET_TAG(func_ret) == JS_TAG_INT && JS_VALUE_GET_INT(func_ret) == FUNC_RET_PREEMPT) {
-        jv = JS_MKPTR(JS_TAG_INT, s);   /* not refcounted by the queue: we take an explicit ref below */
-        JS_REF_COUNT(s)++;
-        if (JS_EnqueueJob(ctx, js_async_resume_job, 1, (JSValueConst *)&jv) < 0) {
-            js_async_function_free(ctx->rt, s);
-            return false;
-        }
-        return true;   /* PARKED: the pump resumes it */
+        /* PARK in the parked-flow SLOT, never on the job queue. A forced preempt is not a microtask: the FIFO
+           puts the continuation behind every pending job, which REORDERS observable ordering — the resume razor's
+           exact prohibition. It is observable: a module body that preempts (a destructuring cover-grammar
+           back-jump is enough) then resumed after a sibling's await continuation, so `export const {x} =
+           globalThis` read a value the sibling had already changed. The host pump drains this slot before
+           starting any job, so the resume is transparent. */
+        JS_REF_COUNT(s)++;   /* the slot holds a reference until the resume releases it */
+        JS_ParkFlow(ctx, js_async_resume_park, s);
+        return true;
     }
     return js_async_function_post(ctx, s, func_ret);
 }
 
-static JSValue js_async_resume_job(JSContext *ctx, int argc, JSValueConst *argv)
+static void js_async_resume_park(JSContext *ctx, void *opaque)
 {
-    JSAsyncFunctionData *s = JS_VALUE_GET_PTR(argv[0]);
-    bool ok;
+    JSAsyncFunctionData *s = opaque;
     /* a preempt-resume is a CONTINUATION, never a re-throw: the throw (if any) was consumed on the first resume */
     s->func_state.throw_flag = false;
-    ok = js_async_function_resume_as_flow(ctx, s);
-    js_async_function_free(ctx->rt, s);   /* release the ref taken at enqueue */
-    return ok ? JS_UNDEFINED : JS_EXCEPTION;
+    js_async_function_resume_as_flow(ctx, s);
+    js_async_function_free(ctx->rt, s);   /* release the ref taken at park */
 }
 
 static JSValue js_async_function_resolve_call(JSContext *ctx,
