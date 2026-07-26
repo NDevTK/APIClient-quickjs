@@ -28131,7 +28131,7 @@ static JSValue async_func_resume(JSContext *ctx, JSAsyncFunctionState *s)
 /* APIClient forced-execution FLOW API: a flow is a preemptible activation. Its program runs as an async
    function frame (heap-resident, suspendable), so the scheduler can preempt it mid-execution (at a loop
    back-edge, via the preempt hook) and resume it later — the substrate for value-ordered interleaving. */
-JSValue *JS_FlowNew(JSContext *ctx, const char *src, size_t len, int eval_flags) {
+JSValue *JS_FlowNew(JSContext *ctx, const char *src, size_t len, const char *filename, int eval_flags) {
     /* Compile as a GLOBAL program (NOT an async-function wrapper): boot is a classic script, so top-level
        `var`/function must create GLOBAL bindings (window.d = …, the moat surface) — an async wrapper would
        scope them to the function and break that. The compiled global program runs through the same async-
@@ -28140,7 +28140,12 @@ JSValue *JS_FlowNew(JSContext *ctx, const char *src, size_t len, int eval_flags)
        CALLED at top level, whose bodies are their own frames). eval_flags carries the caller's STRICTNESS
        (JS_EVAL_FLAG_STRICT) so the flow compiles with the same strict mode as a plain JS_Eval would — a
        time-travel harness that dropped it would silently run strict tests non-strict (wrong `this`, etc.). */
-    JSValue bc = JS_Eval(ctx, src, len, "<flow>",
+    /* the REAL script name, not a placeholder. It is the program's ScriptOrModule name, which is what
+       import() resolves a relative specifier against — with "<flow>" there, the name a dynamic import computes
+       for the cache and the name the host loader registers the module under DIVERGE, so the same module is
+       loaded and EVALUATED once per import (test262's reuse-namespace-object / eval-rqstd-once). A placeholder
+       standing in for data the caller has is exactly the shape that hides. */
+    JSValue bc = JS_Eval(ctx, src, len, filename ? filename : "<flow>",
                          JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY | (eval_flags & JS_EVAL_FLAG_STRICT));
     if (JS_IsException(bc)) { JS_FreeValue(ctx, bc); return NULL; }
     /* COMPILE_ONLY yields raw JS_TAG_FUNCTION_BYTECODE — wrap it in a closure with the global scope (var_refs

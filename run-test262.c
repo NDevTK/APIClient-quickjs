@@ -1381,7 +1381,7 @@ static JSValue fork_preempt_eval(JSContext *ctx, const char *buf, size_t buf_len
         JS_SetFlowControlHooks(&fork_hooks_ON);
         return JS_FlowEvalModule(ctx, buf, buf_len, filename, eval_flags);
     }
-    JSValue *flow = JS_FlowNew(ctx, buf, buf_len, eval_flags);   /* thread STRICTNESS so strict tests run strict */
+    JSValue *flow = JS_FlowNew(ctx, buf, buf_len, filename, eval_flags);   /* STRICTNESS and the real script NAME */
     if (!flow) return JS_EXCEPTION;   /* compile error: exception already pending */
     JS_SetFlowControlHooks(&fork_hooks_ON);
     while (JS_FlowResume(ctx, flow)) { }   /* park + rebuild the whole frame chain on every back-edge */

@@ -1275,7 +1275,7 @@ JS_EXTERN void JS_SetConcolicHooks(const JSConcolicHooks *hooks);
 /* Forced-execution FLOW API — the host CALLS these to create / drive / snapshot / free flows. (The preempt
    CALLBACK that parks a running flow lives in JSFlowControlHooks above; these are the host-driven counterpart.)
    A flow runs as a preemptible heap-resident async-function frame, so it interleaves under the WFQ. */
-JS_EXTERN JSValue *JS_FlowNew(JSContext *ctx, const char *src, size_t len, int eval_flags);
+JS_EXTERN JSValue *JS_FlowNew(JSContext *ctx, const char *src, size_t len, const char *filename, int eval_flags);
 /* MODULE sources: a graph to link and evaluate, not a program to wrap. Returns the evaluation PROMISE. */
 JS_EXTERN JSValue  JS_FlowEvalModule(JSContext *ctx, const char *src, size_t len, const char *filename, int eval_flags);   /* eval_flags: JS_EVAL_FLAG_STRICT threaded through; opaque flow handle (NULL on error) */
 JS_EXTERN int      JS_FlowResume(JSContext *ctx, JSValue *flow);              /* 1 = suspended (preempted), 0 = completed */
