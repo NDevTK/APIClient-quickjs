@@ -20859,7 +20859,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSValueConst tramp_gen_cont_iter = JS_UNDEFINED;    /* the generator the consumer step wants driven (set before goto do_generator_tramp) */
     JSValueConst tramp_gen_cont_arg = JS_UNDEFINED;     /* the RESUME arg a consumer drive forwards to gen.next(v) (async-from-sync .next(v)); UNDEFINED for Array.from/Promise.all. read+reset in do_generator_tramp so it never leaks to the next drive */
     int smc_magic = 0;                                  /* new Set(gen)/new Map(gen) recognition: 0 = Map, MAGIC_SET = Set (read at OP_call_constructor, consumed by do_setmap_consume_tramp) */
-    int ta_classid = 0;                                 /* new TypedArray(gen) recognition: the TA class (read at OP_call_constructor, consumed by do_ta_consume_tramp) */
+    int ta_classid = 0;                                 /* new TypedArray(gen) recognition: the TA class (read at the construct dispatch, consumed by do_ta_consume_tramp) */
+    /* do_ta_consume_tramp's OPERAND SHAPE, set by whichever site jumps to it — the arm never reads the stack, so
+       one arm serves `new TA(x)` (operands on the caller stack), `TA.from(x)` (a method call) and `super(x)` from
+       a subclass (the derived frame's argv, nothing on the stack to pop). Written out per site, the arm would drift
+       the way OP_init_ctor's partial copy of this chain already had: it knew Map/Set and String but not
+       TypedArray, so `class S extends Int8Array {}` reached the C entry. */
+    JSValueConst *tac_args = NULL; int tac_argc = 0, tac_cfirst = -2;
+    JSValueConst tac_ntgt = JS_UNDEFINED;
     uint8_t setop_kind = 0;                             /* s.union/symmetricDifference recognition: SETOP_* (consumed by do_setop_consume_tramp) */
     uint8_t icons_sink = ITERCONS_FROM;                 /* which builtin do_iter_consume_tramp is serving: ITERCONS_FROM (Array.from) or ITERCONS_SUMPRECISE (Math.sumPrecise) */
     /* APPLY-mode body entry: f.apply(this,arr) / Reflect.apply(f,this,arr) / f(...spread). The args come from the
@@ -21590,6 +21597,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     tramp_is_tail = 0; goto do_setmap_consume_tramp;
                 }
                 if (tramp_can_call_ta_consume(ctx, call_argv[-2], vc(call_argv), call_argc, &ta_classid, &tramp_iter_getiter)) {   /* new TypedArray(iterable) -> collect on THIS chain */
+                    tac_args = vc(call_argv); tac_argc = call_argc; tac_ntgt = call_argv[-1]; tac_cfirst = -2;
                     tramp_is_tail = 0; goto do_ta_consume_tramp;
                 }
                 if (tramp_can_call_promise_exec(ctx, call_argv[-2], vc(call_argv), call_argc)) {   /* new Promise(fn) -> executor body on THIS chain */
@@ -22625,6 +22633,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call_objentries_consume(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter))
                     goto do_objentries_consume_tramp;           /* Object.fromEntries(iterable) */
                 if (tramp_can_call_ta_from_consume(ctx, call_argv[-1], call_argv[-2], vc(call_argv), call_argc, &ta_classid, &tramp_iter_getiter)) {
+                    tac_args = vc(call_argv); tac_argc = call_argc; tac_ntgt = call_argv[-2]; tac_cfirst = -2;
                     ta_from = 1; tramp_is_tail = 0; goto do_ta_consume_tramp;   /* TypedArray.from(iterable) — never tail */
                 }
                 if (tramp_can_call_promise_all(ctx, call_argv[-1], vc(call_argv), call_argc, &pa_magic, &tramp_iter_getiter))
@@ -23652,7 +23661,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 /* new TypedArray(gen): new_target at call_argv[-1]. TypedArray.from(gen): the ctor IS this_val at
                    call_argv[-2] (ta_from). Either way it is the create target passed to the TA finish. */
                 int is_from = ta_from;
-                JSValueConst ntgt = is_from ? call_argv[-2] : call_argv[-1];
+                JSValueConst ntgt = tac_ntgt;
+                JSValueConst *ta_argv = tac_args;
+                int ta_argc = tac_argc;
                 JSIterConsume *s;
                 JSValue tmp;
                 ta_from = 0;
@@ -23670,18 +23681,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED;
                     lst = JS_NewArray(ctx);
                     if (JS_IsException(lst)) goto exception;
-                    for (i = 0; i < call_argc; i++) {
-                        if (JS_DefinePropertyValueInt64(ctx, lst, i, js_dup(call_argv[i]), JS_PROP_C_W_E | JS_PROP_THROW) < 0)
+                    for (i = 0; i < ta_argc; i++) {
+                        if (JS_DefinePropertyValueInt64(ctx, lst, i, js_dup(ta_argv[i]), JS_PROP_C_W_E | JS_PROP_THROW) < 0)
                             { JS_FreeValue(ctx, lst); goto exception; }
                     }
                     so = js_iter_consume_new(ctx);
                     if (unlikely(!so)) { JS_FreeValue(ctx, lst); JS_ThrowOutOfMemory(ctx); goto exception; }
                     so->r = lst;
                     so->adder = js_dup(ntgt);
-                    so->k = call_argc; so->ta_k = 0;
+                    so->k = ta_argc; so->ta_k = 0;
                     so->sink = ITERCONS_FROM; so->ta_isfrom = 1; so->ta_classid = 0;
                     so->ta_phase = 1;
-                    so->orig_cfirst = -2; so->orig_cargc = call_argc; so->orig_is_tail = 0;
+                    so->orig_cfirst = tac_cfirst; so->orig_cargc = (tac_cfirst ? ta_argc : 0); so->orig_is_tail = 0;
                     cont_st = so;
                     ret_val = JS_UNINITIALIZED;
                     goto do_iter_consume_step;
@@ -23709,8 +23720,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->adder = js_dup(ntgt);   /* the new_target/ctor, used at the finish to create the typed array */
                 /* TypedArray.from(gen, mapfn, thisArg): carry the mapfn; it is applied at the finish (via
                    js_typed_array_from on the collected array — spec map-after-create order), NOT during the collect. */
-                s->mapfn = (is_from && call_argc >= 2) ? js_dup(call_argv[1]) : JS_UNDEFINED;
-                s->mapfn_this = (is_from && call_argc >= 3) ? js_dup(call_argv[2]) : JS_UNDEFINED;
+                s->mapfn = (is_from && ta_argc >= 2) ? js_dup(ta_argv[1]) : JS_UNDEFINED;
+                s->mapfn_this = (is_from && ta_argc >= 3) ? js_dup(ta_argv[2]) : JS_UNDEFINED;
                 s->ta_classid = is_from ? 0 : ta_classid;   /* the from path CONSTRUCTS the receiver; only new TypedArray(iterable) creates by class id */
                 s->ta_isfrom = is_from;
                 if (!is_from) {
@@ -23728,8 +23739,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 s->k = 0;
                 s->sink = ITERCONS_FROM;
-                s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
-                tramp_consume_iterable = call_argv[0]; tramp_consume_state = s; tramp_consume_kind = CONT_ITER_CONSUME;
+                s->orig_cfirst = tac_cfirst; s->orig_cargc = (tac_cfirst ? ta_argc : 0); s->orig_is_tail = tramp_is_tail;
+                DCHECK(ta_argc >= 1, "the TypedArray consume arm reads its source; the recognizers refuse argc 0");
+                tramp_consume_iterable = ta_argv[0]; tramp_consume_state = s; tramp_consume_kind = CONT_ITER_CONSUME;
                 goto do_consume_acquire_iterator;
             }
 
