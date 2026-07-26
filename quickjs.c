@@ -1444,6 +1444,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_BIGINT_ASUINTN, STEPDEF_BIGINT_ASINTN,
     STEPDEF_OBJ_GOPD, STEPDEF_REFLECT_GOPD,
     STEPDEF_OBJ_VALUES, STEPDEF_OBJ_ENTRIES, STEPDEF_OBJ_ASSIGN, STEPDEF_OBJ_SPREAD,
+    STEPDEF_ARRAY_FLAT, STEPDEF_ARRAY_FLATMAP,
     STEPDEF_MATH_ABS, STEPDEF_MATH_FLOOR, STEPDEF_MATH_CEIL, STEPDEF_MATH_ROUND, STEPDEF_MATH_SQRT, STEPDEF_MATH_ACOS, STEPDEF_MATH_ASIN, STEPDEF_MATH_ATAN, STEPDEF_MATH_COS, STEPDEF_MATH_EXP, STEPDEF_MATH_LOG, STEPDEF_MATH_SIN, STEPDEF_MATH_TAN, STEPDEF_MATH_TRUNC, STEPDEF_MATH_SIGN, STEPDEF_MATH_COSH, STEPDEF_MATH_SINH, STEPDEF_MATH_TANH, STEPDEF_MATH_ACOSH, STEPDEF_MATH_ASINH, STEPDEF_MATH_ATANH, STEPDEF_MATH_EXPM1, STEPDEF_MATH_LOG1P, STEPDEF_MATH_LOG2, STEPDEF_MATH_LOG10, STEPDEF_MATH_CBRT, STEPDEF_MATH_F16ROUND, STEPDEF_MATH_FROUND, STEPDEF_MATH_ATAN2, STEPDEF_MATH_POW, STEPDEF_MATH_MIN, STEPDEF_MATH_MAX, STEPDEF_MATH_HYPOT, STEPDEF_MATH_IMUL, STEPDEF_MATH_CLZ32, STEPDEF_STR_FROMCHARCODE, STEPDEF_STR_FROMCODEPOINT, STEPDEF_DATE_UTC,
     STEPDEF_REGEXP_EXEC, STEPDEF_REGEXP_TEST,
     STEPDEF_ITER_TAKE, STEPDEF_ITER_DROP,
@@ -18517,6 +18518,31 @@ static int step_toint32_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValu
 
 /* the same sub-sequence delivering a double: String.prototype.lastIndexOf's position is compared as one
    (NaN means "from the end"), which a saturating int64 cannot express. */
+/* ToIntegerOrInfinity CLAMPED to int (Array.prototype.flat's depth): the same shape as step_toint32_run, differing
+   only in the conversion applied once the operand is primitive — ToInt32 WRAPS where this SATURATES, and a depth of
+   2**32 must flatten everything rather than nothing. */
+static int step_toint32sat_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValue in, int *pres,
+                               JSValue **out_cb, int *out_argc)
+{
+    if (h->num_phase == NUM_PH_START) {
+        JS_FreeValue(ctx, in);
+        if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT) {
+            DCHECK(JS_VALUE_GET_TAG(h->coerce) != JS_TAG_OBJECT,
+                   "a coercion is already in flight on this machine's header");
+            h->coerce = js_dup(v);
+            h->cb_coerce[0] = h->coerce;
+            *out_cb = h->cb_coerce; *out_argc = HINT_NUMBER;
+            h->num_phase = NUM_PH_PRIM;
+            return 5;
+        }
+        return JS_ToInt32Sat(ctx, pres, v);
+    }
+    JS_FreeValue(ctx, h->coerce);
+    h->coerce = JS_UNDEFINED;
+    h->num_phase = NUM_PH_START;
+    { int r = JS_ToInt32Sat(ctx, pres, in); JS_FreeValue(ctx, in); return r; }
+}
+
 static int step_tofloat64_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValue in, double *pres,
                               JSValue **out_cb, int *out_argc)
 {
@@ -19796,6 +19822,34 @@ typedef struct JSPropWalk {
 #define PROPWALK_VALUES  0
 #define PROPWALK_ENTRIES 1
 #define PROPWALK_ASSIGN  2   /* Object.assign(target, ...sources): the same read per key, written to the target */
+/* Array.prototype.flat / flatMap — 23.1.3.13's FlattenIntoArray, which is a RECURSIVE C walker whose every step is
+   the page's code: HasProperty and Get on each index (an accessor, a Proxy trap), the mapper CALL, and the nested
+   source's `length`. All of it ran from C, so `[1,2].flatMap(fn)` with a loop in fn aborted. The recursion becomes
+   an explicit frame stack, which is what makes each of those a suspension point.
+   Only the OUTERMOST source is mapped (the recursive call passes no mapper), and that is why a frame does not carry
+   one: `sp == 1` IS "this is the root". */
+typedef struct JSFlatFrame {
+    JSValue source;      /* the array being flattened at this level (owned) */
+    int64_t len, i;
+    int depth;           /* how much deeper this level may flatten */
+} JSFlatFrame;
+
+typedef struct JSArrayFlat {
+    JSStepHdr hdr;       /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    JSValue obj;         /* ToObject(this) (owned) */
+    JSValue arr;         /* ArraySpeciesCreate's target — the RESULT (owned) */
+    JSValue el;          /* the element held across its read / mapper call (owned) */
+    JSFlatFrame *fr;
+    int sp, cap;
+    int64_t target_index;
+    int64_t len0;        /* the root source's length */
+    int depth0;
+    int present;         /* the HasProperty answer, held across its own suspension */
+    JSValue cb[5];       /* the mapper CALL request: [thisArg, mapfn, element, index, source] — all BORROWED views */
+} JSArrayFlat;
+#define ARRAYFLAT_FLAT    0
+#define ARRAYFLAT_FLATMAP 1
+
 #define PROPWALK_SPREAD  3   /* `{...src}` / `{a, ...rest}` (OP_copy_data_properties): argv is [target, source,
                                 excludeList]. The target is a FRESH object the opcode just built, so the write is a
                                 DefineOwnProperty with no user code in it — only the READ can suspend. */
@@ -53416,6 +53470,8 @@ static JSValue js_str_split_fini(JSContext *ctx, void *st, bool take_result);
 static int js_array_join_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_join_fini(JSContext *ctx, void *st, bool take_result);
 static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static int js_array_flat_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_array_flat_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_prop_walk_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_bigint_asUintN(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int asIntN);
 static JSValue js_object_getOwnPropertyDescriptor(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
@@ -53537,6 +53593,8 @@ static const JSTrampStepDef js_obj_values_def     = { sizeof(JSPropWalk), js_pro
 static const JSTrampStepDef js_obj_entries_def    = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_ENTRIES };
 static const JSTrampStepDef js_obj_assign_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_ASSIGN };
 static const JSTrampStepDef js_obj_spread_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_SPREAD };
+static const JSTrampStepDef js_array_flat_def      = { sizeof(JSArrayFlat), js_array_flat_step, js_array_flat_fini, ARRAYFLAT_FLAT };
+static const JSTrampStepDef js_array_flatMap_def   = { sizeof(JSArrayFlat), js_array_flat_step, js_array_flat_fini, ARRAYFLAT_FLATMAP };
 #define PRIMARGS_DEF_FULL(spec, proto, fn, magic, pre, mid, err) \
     { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, (spec), { .proto = (fn) }, JS_CFUNC_##proto, (magic), (pre), (mid), (err) }
 #define PRIMARGS_DEF(spec, proto, fn, magic)                PRIMARGS_DEF_FULL(spec, proto, fn, magic, NULL, NULL, NULL)
@@ -53682,6 +53740,8 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_OBJ_ENTRIES]     = &js_obj_entries_def,
     [STEPDEF_OBJ_ASSIGN]      = &js_obj_assign_def,
     [STEPDEF_OBJ_SPREAD]      = &js_obj_spread_def,
+    [STEPDEF_ARRAY_FLAT]      = &js_array_flat_def,
+    [STEPDEF_ARRAY_FLATMAP]   = &js_array_flatMap_def,
     [STEPDEF_MATH_ABS] = &js_math_abs_def,
     [STEPDEF_MATH_FLOOR] = &js_math_floor_def,
     [STEPDEF_MATH_CEIL] = &js_math_ceil_def,
@@ -54466,114 +54526,171 @@ static JSValue js_array_copyWithin(JSContext *ctx, JSValueConst this_val,
     return JS_EXCEPTION;
 }
 
-static int64_t JS_FlattenIntoArray(JSContext *ctx, JSValueConst target,
-                                   JSValueConst source, int64_t sourceLen,
-                                   int64_t targetIndex, int depth,
-                                   JSValueConst mapperFunction,
-                                   JSValueConst thisArg)
+/* ---- Array.prototype.flat / flatMap as a step machine (see JSArrayFlat) ---- */
+static int js_flat_push(JSContext *ctx, JSArrayFlat *s, JSValue source, int64_t len, int depth)
 {
-    JSValue element;
-    int64_t sourceIndex, elementLen;
-    int present, is_array;
-
-    if (js_check_stack_overflow(ctx->rt, 0)) {
-        JS_ThrowStackOverflow(ctx);
-        return -1;
+    JSFlatFrame *f;
+    if (s->sp >= s->cap) {
+        int nc = s->cap ? s->cap * 2 : 8;
+        JSFlatFrame *ns = js_realloc(ctx, s->fr, (size_t)nc * sizeof(JSFlatFrame));
+        if (!ns) { JS_FreeValue(ctx, source); return -1; }
+        s->fr = ns; s->cap = nc;
     }
+    f = &s->fr[s->sp++];
+    f->source = source;   /* owned, transferred */
+    f->len = len; f->i = 0; f->depth = depth;
+    return 0;
+}
 
-    for (sourceIndex = 0; sourceIndex < sourceLen; sourceIndex++) {
-        present = JS_TryGetPropertyInt64(ctx, source, sourceIndex, &element);
-        if (present < 0)
-            return -1;
-        if (!present)
-            continue;
-        if (!JS_IsUndefined(mapperFunction)) {
-            JSValue index = js_int64(sourceIndex);
-            JSValueConst args[3] = { element, index, source };
-            JSValue ret = JS_Call(ctx, mapperFunction, thisArg, 3, args);
-            JS_FreeValue(ctx, element);
-            JS_FreeValue(ctx, index);
-            if (JS_IsException(ret))
-                return -1;
-            element = ret;
+static int js_array_flat_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSArrayFlat *s = st;
+    int is_map = (s->hdr.arg == ARRAYFLAT_FLATMAP);
+    JSFlatFrame *f;
+    int r;
+
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
+        s->obj = JS_UNDEFINED; s->arr = JS_UNDEFINED; s->el = JS_UNDEFINED;
+        s->fr = NULL; s->sp = 0; s->cap = 0;
+        s->target_index = 0; s->len0 = 0; s->depth0 = 1; s->present = 0;
+        s->obj = JS_ToObject(ctx, s->hdr.this_val);
+        if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
+        s->hdr.stage = 1;
+    }
+    if (s->hdr.stage == 1) {
+        r = step_length_run(ctx, &s->hdr, s->obj, cb_result, &s->len0, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 2;
+    }
+    if (s->hdr.stage == 2) {
+        /* flatMap validates its mapper BEFORE anything else observable; flat coerces its depth, which is where a
+           `valueOf` gets to run. */
+        if (is_map) {
+            if (check_function(ctx, step_arg(&s->hdr, 0))) { JS_FreeValue(ctx, cb_result); return -1; }
+        } else if (s->hdr.argc > 0 && !JS_IsUndefined(step_arg(&s->hdr, 0))) {
+            r = step_toint32sat_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->depth0,
+                                    out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
         }
-        if (depth > 0) {
-            is_array = js_is_array(ctx, element);
-            if (is_array < 0)
-                goto fail;
-            if (is_array) {
-                if (js_get_length64(ctx, &elementLen, element) < 0)
-                    goto fail;
-                targetIndex = JS_FlattenIntoArray(ctx, target, element,
-                                                  elementLen, targetIndex,
-                                                  depth - 1,
-                                                  JS_UNDEFINED, JS_UNDEFINED);
-                if (targetIndex < 0)
-                    goto fail;
-                JS_FreeValue(ctx, element);
-                continue;
+        s->hdr.stage = 3;
+    }
+    if (s->hdr.stage == 3) {
+        /* ArraySpeciesCreate(O, 0): a @@species getter and a subclass constructor are both user code, which
+           step_species_run drives. */
+        r = step_species_run(ctx, &s->hdr, s->obj, cb_result, js_int32(0), &s->arr, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        if (js_flat_push(ctx, s, js_dup(s->obj), s->len0, s->depth0) < 0) return -1;
+        s->hdr.stage = 4;
+    }
+    for (;;) {
+        if (s->hdr.stage == 4) {   /* frame head */
+            if (s->sp == 0) { JS_FreeValue(ctx, cb_result); return 0; }   /* DONE: fini hands back s->arr */
+            f = &s->fr[s->sp - 1];
+            if (f->i >= f->len) {
+                JS_FreeValue(ctx, f->source);
+                s->sp--;
+                continue;   /* the parent's cursor was advanced BEFORE it descended, so it just re-heads */
             }
+            s->hdr.stage = 5;
         }
-        if (targetIndex >= MAX_SAFE_INTEGER) {
-            JS_ThrowTypeError(ctx, "Array too long");
-            goto fail;
+        f = &s->fr[s->sp - 1];
+        if (s->hdr.stage == 5) {
+            r = step_hasidx_run(ctx, &s->hdr, f->source, f->i, cb_result, &s->present, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->hdr.stage = 6;
         }
-        if (JS_DefinePropertyValueInt64(ctx, target, targetIndex, element,
-                                        JS_PROP_C_W_E | JS_PROP_THROW) < 0)
-            return -1;
-        targetIndex++;
+        if (s->hdr.stage == 6) {
+            if (!s->present) { f->i++; s->hdr.stage = 4; continue; }   /* a HOLE is skipped, not flattened */
+            s->hdr.stage = 7;
+        }
+        if (s->hdr.stage == 7) {
+            r = step_getidx_run(ctx, &s->hdr, f->source, f->i, cb_result, &s->el, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->hdr.stage = 8;
+        }
+        if (s->hdr.stage == 8) {
+            if (is_map && s->sp == 1) {
+                /* Call(mapperFunction, thisArg, «element, 𝔽(sourceIndex), source»). Every slot is a BORROWED view
+                   of something this state owns, so the request buffer has nothing to release. */
+                s->cb[0] = (JSValue)step_arg(&s->hdr, 1);   /* thisArg */
+                s->cb[1] = (JSValue)step_arg(&s->hdr, 0);   /* the mapper */
+                s->cb[2] = s->el;
+                s->cb[3] = js_int64(f->i);
+                s->cb[4] = f->source;
+                *out_cb = s->cb; *out_argc = 3;
+                s->hdr.stage = 9;
+                return 3;
+            }
+            s->hdr.stage = 10;
+        }
+        if (s->hdr.stage == 9) {
+            JS_FreeValue(ctx, s->el);
+            s->el = cb_result;   /* the mapped value REPLACES the element */
+            cb_result = JS_UNDEFINED;
+            s->hdr.stage = 10;
+        }
+        if (s->hdr.stage == 10) {
+            if (f->depth > 0) {
+                int ia = js_is_array(ctx, s->el);
+                if (ia < 0) { JS_FreeValue(ctx, cb_result); return -1; }
+                if (ia) { s->hdr.stage = 11; goto descend; }
+            }
+            if (s->target_index >= MAX_SAFE_INTEGER) {
+                JS_FreeValue(ctx, cb_result);
+                JS_ThrowTypeError(ctx, "Array too long");
+                return -1;
+            }
+            {
+                JSValue el = s->el;
+                s->el = JS_UNDEFINED;   /* the define consumes it on every path */
+                if (JS_DefinePropertyValueInt64(ctx, s->arr, s->target_index, el,
+                                                JS_PROP_C_W_E | JS_PROP_THROW) < 0)
+                    return -1;
+            }
+            s->target_index++;
+            f->i++;
+            s->hdr.stage = 4;
+            continue;
+        }
+    descend:
+        if (s->hdr.stage == 11) {
+            int64_t sublen;
+            r = step_length_run(ctx, &s->hdr, s->el, cb_result, &sublen, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            /* advance the PARENT before descending: when the child frame pops, the parent re-heads at the next
+               index, which is what the C version's `continue` past the recursive call did. */
+            f->i++;
+            {
+                JSValue sub = s->el;
+                s->el = JS_UNDEFINED;
+                if (js_flat_push(ctx, s, sub, sublen, f->depth - 1) < 0) return -1;
+            }
+            s->hdr.stage = 4;
+        }
     }
-    return targetIndex;
-
-fail:
-    JS_FreeValue(ctx, element);
-    return -1;
 }
 
-static JSValue js_array_flatten(JSContext *ctx, JSValueConst this_val,
-                                int argc, JSValueConst *argv, int map)
+static JSValue js_array_flat_fini(JSContext *ctx, void *st, bool take_result)
 {
-    JSValue obj, arr;
-    JSValueConst mapperFunction, thisArg;
-    int64_t sourceLen;
-    int depthNum;
-
-    arr = JS_UNDEFINED;
-    obj = JS_ToObject(ctx, this_val);
-    if (js_get_length64(ctx, &sourceLen, obj))
-        goto exception;
-
-    depthNum = 1;
-    mapperFunction = JS_UNDEFINED;
-    thisArg = JS_UNDEFINED;
-    if (map) {
-        mapperFunction = argv[0];
-        if (argc > 1) {
-            thisArg = argv[1];
-        }
-        if (check_function(ctx, mapperFunction))
-            goto exception;
-    } else {
-        if (argc > 0 && !JS_IsUndefined(argv[0])) {
-            if (JS_ToInt32Sat(ctx, &depthNum, argv[0]) < 0)
-                goto exception;
-        }
-    }
-    arr = JS_ArraySpeciesCreate(ctx, obj, js_int32(0));
-    if (JS_IsException(arr))
-        goto exception;
-    if (JS_FlattenIntoArray(ctx, arr, obj, sourceLen, 0, depthNum,
-                            mapperFunction, thisArg) < 0)
-        goto exception;
-    JS_FreeValue(ctx, obj);
-    return arr;
-
-exception:
-    JS_FreeValue(ctx, obj);
-    JS_FreeValue(ctx, arr);
-    return JS_EXCEPTION;
+    JSArrayFlat *s = st;
+    JSValue r = take_result ? s->arr : JS_UNDEFINED;
+    int i;
+    if (!take_result) JS_FreeValue(ctx, s->arr);
+    JS_FreeValue(ctx, s->el);
+    JS_FreeValue(ctx, s->obj);
+    for (i = 0; i < s->sp; i++) JS_FreeValue(ctx, s->fr[i].source);
+    js_free(ctx, s->fr);
+    js_free(ctx, s);
+    return r;
 }
-
 /* Array sort */
 
 typedef struct ValueSlot {
@@ -56010,8 +56127,8 @@ static const JSCFunctionListEntry js_array_proto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("splice", 2, js_array_slice, 1 ),
     JS_CFUNC_DEF("toSpliced", 2, js_array_toSpliced ),
     JS_CFUNC_DEF("copyWithin", 2, js_array_copyWithin ),
-    JS_CFUNC_MAGIC_DEF("flatMap", 1, js_array_flatten, 1 ),
-    JS_CFUNC_MAGIC_DEF("flat", 0, js_array_flatten, 0 ),
+    JS_CFUNC_STEP_DEF("flatMap", 1, STEPDEF_ARRAY_FLATMAP ),
+    JS_CFUNC_STEP_DEF("flat", 0, STEPDEF_ARRAY_FLAT ),
     JS_CFUNC_MAGIC_DEF("values", 0, js_create_array_iterator, JS_ITERATOR_KIND_VALUE ),
     JS_ALIAS_DEF("[Symbol.iterator]", "values" ),
     JS_CFUNC_MAGIC_DEF("keys", 0, js_create_array_iterator, JS_ITERATOR_KIND_KEY ),
