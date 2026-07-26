@@ -17365,18 +17365,33 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
     return 0;
 }
 
-static JSValue JS_IteratorGetCompleteValue(JSContext *ctx, JSValue obj,
-                                           int *pdone)
+/* 7.4.4 IteratorComplete: ToBoolean(? Get(iterResult, "done")). -1 on an abrupt completion. */
+static int JS_IteratorComplete(JSContext *ctx, JSValueConst obj)
 {
-    JSValue done_val, value;
-    int done;
-    done_val = JS_GetProperty(ctx, obj, JS_ATOM_done);
+    JSValue done_val = JS_GetProperty(ctx, obj, JS_ATOM_done);
     if (JS_IsException(done_val))
+        return -1;
+    return JS_ToBoolFree(ctx, done_val);
+}
+
+/* 7.4.6 IteratorStep, minus the .next() call the caller already made: IteratorComplete, then IteratorValue
+   ONLY when it said not-done. Reading `value` on a done result is OBSERVABLE (a `value` getter runs) and no
+   for-of consumer has anywhere to put it — ForIn/OfBodyEvaluation step 3.h returns before step 3.i, both in
+   the sync form (OP_for_of_next) and the async one (OP_iterator_get_value_done). This is the shape
+   JS_IteratorNext already had; the two had drifted.
+   NOT for AsyncFromSyncIteratorContinuation, whose step 3 reads `value` unconditionally — see js_async_from_sync_iterator_next. */
+static JSValue JS_IteratorStepValue(JSContext *ctx, JSValueConst obj, int *pdone)
+{
+    JSValue value;
+    int done = JS_IteratorComplete(ctx, obj);
+    if (done < 0)
         goto fail;
-    done = JS_ToBoolFree(ctx, done_val);
-    value = JS_GetProperty(ctx, obj, JS_ATOM_value);
-    if (JS_IsException(value))
-        goto fail;
+    value = JS_UNDEFINED;
+    if (!done) {
+        value = JS_GetProperty(ctx, obj, JS_ATOM_value);
+        if (JS_IsException(value))
+            goto fail;
+    }
     *pdone = done;
     return value;
  fail:
@@ -17450,7 +17465,7 @@ static __exception int js_iterator_get_value_done(JSContext *ctx, JSValue *sp)
         JS_ThrowTypeError(ctx, "iterator must return an object");
         return -1;
     }
-    value = JS_IteratorGetCompleteValue(ctx, obj, &done);
+    value = JS_IteratorStepValue(ctx, obj, &done);
     if (JS_IsException(value))
         return -1;
     JS_FreeValue(ctx, obj);
@@ -24088,7 +24103,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     /* OP_for_of_next protocol: value at sp[0], done at sp[1], then sp += 2. A yield* (gdone==2)
                        delivered an iterator-result object; unpack it into (value, done). */
                     if (gdone == 2) {
-                        int d; JSValue v = JS_IteratorGetCompleteValue(ctx, value, &d);
+                        int d; JSValue v = JS_IteratorStepValue(ctx, value, &d);
                         JS_FreeValue(ctx, value);
                         if (JS_IsException(v)) goto exception;
                         sp[0] = v; sp[1] = js_bool(d);
@@ -24475,7 +24490,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         JS_FreeValue(ctx, sp[rfof]); sp[rfof] = JS_UNDEFINED;
                         goto exception;
                     }
-                    value = JS_IteratorGetCompleteValue(ctx, ret_val, &done);   /* reads .done then .value */
+                    value = JS_IteratorStepValue(ctx, ret_val, &done);   /* reads .done then .value */
                     JS_FreeValue(ctx, ret_val);
                     if (unlikely(JS_IsException(value))) {
                         JS_FreeValue(ctx, sp[rfof]); sp[rfof] = JS_UNDEFINED;
@@ -32344,6 +32359,11 @@ static int __exception js_parse_property_name(JSParseState *s,
             goto fail;
         if (js_parse_expect(s, ']'))
             goto fail;
+        /* 13.2.5.4 ComputedPropertyName : [ AssignmentExpression ] — step 3 is ToPropertyKey, so the
+           coercion is part of evaluating the NAME, not of the operation that later consumes it. Leaving it
+           to the consumer runs it after the value expression (`{[key]: value}` must coerce key FIRST) and
+           after a class field's whole definition. */
+        emit_op(s, OP_to_propkey);
         name = JS_ATOM_NULL;
     } else if (s->token.val == TOK_PRIVATE_NAME && allow_private) {
         name = JS_DupAtom(s->ctx, s->token.u.ident.atom);
@@ -33679,12 +33699,11 @@ static __exception int get_lvalue(JSParseState *s, int *popcode, int *pscope,
                 opcode = OP_get_ref_value;
             }
             break;
-        case OP_get_array_el:
-            emit_op(s, OP_to_propkey2);
-            break;
-        case OP_get_super_value:
-            emit_op(s, OP_to_propkey);
-            break;
+        /* A WRITE-ONLY member reference carries its key UNCOERCED: 6.2.5.6 PutValue does ToObject(base) at
+           step 3.a and ToPropertyKey at step 3.c, both AFTER the RHS is evaluated. OP_put_array_el /
+           OP_put_super_value perform both, in that order, so there is nothing to emit here. (The keep==true
+           arm above still coerces, because it reads through GetValue first — 6.2.5.5 step 3.c — and PutValue
+           then sees a key it does not re-coerce.) */
         }
     }
 
@@ -34062,8 +34081,8 @@ static int js_parse_destructuring_element(JSParseState *s, int tok,
                     if (prop_name == JS_ATOM_NULL) {
                         /* computed property name on stack */
                         if (has_ellipsis) {
-                            /* define the property in excludeList */
-                            emit_op(s, OP_to_propkey); /* avoid calling ToString twice */
+                            /* define the property in excludeList (the key is already a property key —
+                               ComputedPropertyName evaluation coerced it) */
                             emit_op(s, OP_perm3); /* TOS: src excludeList prop */
                             emit_op(s, OP_null); /* TOS: src excludeList prop null */
                             emit_op(s, OP_define_array_el); /* TOS: src excludeList prop */
@@ -34095,7 +34114,7 @@ static int js_parse_destructuring_element(JSParseState *s, int tok,
                     continue;
                 }
                 if (prop_name == JS_ATOM_NULL) {
-                    emit_op(s, OP_to_propkey2);
+                    /* the key is already a property key — ComputedPropertyName evaluation coerced it */
                     if (has_ellipsis) {
                         /* define the property in excludeList */
                         emit_op(s, OP_perm3);
@@ -35780,38 +35799,14 @@ static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags)
         if (get_lvalue(s, &opcode, &scope, &name, &label, NULL, (op != '='), op) < 0)
             return -1;
 
-        // comply with rather obtuse evaluation order of computed properties:
-        // obj[key]=val evaluates val->obj->key when obj is null/undefined
-        // but key->obj->val when an object
-        // FIXME(bnoordhuis) less stack shuffling; don't to_propkey twice in
-        // happy path; replace `dup is_undefined_or_null if_true` with new
-        // opcode if_undefined_or_null? replace `swap dup` with over?
-        if (op == '=' && opcode == OP_get_array_el) {
-            int label_next = -1;
-            JSFunctionDef *fd = s->cur_func;
-            assert(OP_to_propkey2 == fd->byte_code.buf[fd->last_opcode_pos]);
-            fd->byte_code.size = fd->last_opcode_pos;
-            fd->last_opcode_pos = -1;
-            emit_op(s, OP_swap); // obj key -> key obj
-            emit_op(s, OP_dup);
-            emit_op(s, OP_is_undefined_or_null);
-            label_next = emit_goto(s, OP_if_true, -1);
-            emit_op(s, OP_swap);
-            emit_op(s, OP_to_propkey);
-            emit_op(s, OP_swap);
-            emit_label(s, label_next);
-            emit_op(s, OP_swap);
-        }
-
+        /* No key coercion is emitted around the RHS: a write-only member reference holds its key raw and
+           OP_put_array_el runs ToObject(base) then ToPropertyKey(key) at PutValue time, which is the whole
+           of the "obtuse" order. The former workaround here re-emitted a nullish-base test so the key could
+           be coerced EARLY on the object-base path — the pre-ES2022 order, before a Reference Record was
+           allowed to hold an un-coerced [[ReferencedName]]. */
         if (js_parse_assign_expr2(s, parse_flags)) {
             JS_FreeAtom(s->ctx, name);
             return -1;
-        }
-
-        if (op == '=' && opcode == OP_get_array_el) {
-            emit_op(s, OP_swap); // obj key val -> obj val key
-            emit_op(s, OP_to_propkey);
-            emit_op(s, OP_swap);
         }
 
         if (op == '=') {
@@ -65765,8 +65760,17 @@ static JSValue js_async_from_sync_iterator_next(JSContext *ctx, JSValueConst thi
     if (JS_IsException(value))
         goto reject;
     if (done == 2) {
+        /* 27.1.4.4 AsyncFromSyncIteratorContinuation steps 1-4: IteratorComplete, then IteratorValue
+           UNCONDITIONALLY — not IteratorStep. A done result's `value` is the sync iterator's RETURN value,
+           which the wrapper must still await and deliver, and which `yield*` over a sync iterator inside an
+           async generator reads as the delegation's result. */
         JSValue obj = value;
-        value = JS_IteratorGetCompleteValue(ctx, obj, &done);
+        done = JS_IteratorComplete(ctx, obj);
+        if (done < 0) {
+            JS_FreeValue(ctx, obj);
+            goto reject;
+        }
+        value = JS_GetProperty(ctx, obj, JS_ATOM_value);
         JS_FreeValue(ctx, obj);
         if (JS_IsException(value))
             goto reject;
