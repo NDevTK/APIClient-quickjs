@@ -52451,14 +52451,16 @@ static JSIterAtState data_method_at(JSContext *ctx, JSObject *p, JSAtom atom, JS
     return st;
 }
 
-/* The remaining narrow gate: new Set(iterable) / new Map(iterable), whose C constructor loop still drives the
-   argument's .next(). *out_getiter = the @@iterator method (owned) for the consume tramp. It accepts a
-   generator/helper source and any callable @@iterator that is not a BUILT-IN C function, and REFUSES the shapes the
-   probe cannot read side-effect-free (a getter, a Proxy) plus a built-in @@iterator — whose iterator's .next() may
-   still be patched, which is precisely what this cannot see.
-   That refusal is a FALLBACK to js_map_constructor's loop, not a different algorithm, so it is the next widening:
-   the spread lost its equivalent by routing everything that is not the fast-array slot copy, and the same move
-   applies here once new Set/new Map's collect is a phase of the consume machine rather than a C loop.
+/* ONE caller is left: new TypedArray(iterable), whose js_array_from_iterator collect still drives the argument's
+   .next() from C. *out_getiter = the @@iterator method (owned) for the consume tramp. It accepts a generator/helper
+   source and any callable @@iterator that is not a BUILT-IN C function, and REFUSES the shapes the probe cannot read
+   side-effect-free (a getter, a Proxy) plus a built-in @@iterator — whose ITERATOR's .next may still be patched,
+   which is exactly what a probe of @@iterator alone cannot see.
+   Every refusal is a FALLBACK to that C loop, not a different algorithm, so this is the next widening. The spread
+   lost its equivalent by routing everything that is not the fast-array slot copy, and it answers the patched-.next
+   question by CREATING the built-in iterator (which runs nothing) and probing ITS .next. The move needs one thing
+   built first: 23.2.5.1 step 5.c makes a nullish @@iterator the ARRAY-LIKE algorithm, and the acquire's nullish arm
+   has no TypedArray destination to hand off to yet — Array.from's equivalent is JSArrayFromLike.
    (This once read "GENERATOR-BACKED sources only", recording that broadening it had regressed 12 tests. That note
    described the state before the consume machine could acquire on the tramp.) */
 static bool iter_consume_gen_backed(JSContext *ctx, JSValueConst items, JSValue *out_getiter)
