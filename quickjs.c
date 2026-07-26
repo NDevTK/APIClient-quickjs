@@ -23568,7 +23568,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->sink = ITERCONS_OBJENTRIES;
                 s->super_ref = JS_UNDEFINED;   /* only the super(iterable) entry owns one */
                 s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
-                tramp_consume_iterable = call_argv[0]; tramp_consume_state = s; tramp_consume_kind = CONT_ITER_CONSUME;
+                /* argc 0 means the source is UNDEFINED, which the acquire turns into GetIterator's TypeError —
+                   reading call_argv[0] there would read the slot ABOVE the operands. */
+                tramp_consume_iterable = (call_argc >= 1) ? call_argv[0] : JS_UNDEFINED;
+                tramp_consume_state = s; tramp_consume_kind = CONT_ITER_CONSUME;
                 goto do_consume_acquire_iterator;
             }
 
@@ -50862,19 +50865,11 @@ int JS_FreezeObject(JSContext *ctx, JSValueConst obj)
 static JSValue js_object_fromEntries(JSContext *ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv)
 {
-    /* The iteration loop is DELETED. Object.fromEntries over any callable @@iterator is driven by the ONE consume
-       machine (ITERCONS_OBJENTRIES), which performs IfAbruptCloseIterator itself since 4fa2d2f. What remains here
-       is the case with no iteration at all: a source with no callable @@iterator, where GetIterator throws. A
-       source that DOES iterate reaching this entry means a call site was not routed — that is a bug to fix at the
-       call site, not a loop to keep for it. */
-    JSValue iter;
-
-    iter = JS_GetIterator(ctx, argv[0], false);   /* throws for a non-iterable, which is the whole job left here */
-    if (JS_IsException(iter))
-        return JS_EXCEPTION;
-    JS_FreeValue(ctx, iter);
-    DFAIL("Object.fromEntries reached its C entry with an ITERABLE source — route that call site onto the consume "
-          "machine; the iteration loop here no longer exists");
+    /* NOTHING is left here. The recognizer accepts every source now that the acquire performs the whole of
+       GetIterator on the tramp — including the not-iterable TypeError, which was the last thing this entry did.
+       Reaching it means a CALL SITE was not routed, which is a bug to fix there and not a body to keep for it. */
+    DFAIL("Object.fromEntries reached its C entry — every source routes to the consume machine; route that call "
+          "site");
     return JS_ThrowTypeError(ctx, "Object.fromEntries not on the consume machine");
 }
 
@@ -52595,25 +52590,22 @@ static bool tramp_can_call_objentries_consume(JSContext *ctx, JSValueConst func,
 {
     JSObject *fp;
     *out_getiter = JS_UNDEFINED;
-    if (call_argc < 1) return false;
     if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
     fp = JS_VALUE_GET_OBJ(func);
     if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
     if (fp->u.cfunc.cproto != JS_CFUNC_generic) return false;
     if (fp->u.cfunc.c_function.generic != js_object_fromEntries) return false;
-    /* ANY callable @@iterator, not just a generator-backed one, and on a PRIMITIVE source too — the probe boxes
-       it for the walk, so `Object.fromEntries("ab")` reaches the same consumer as an array does.
-       What is still a refusal is a source whose @@iterator the side-effect-free probe cannot read: a GETTER, or a
-       Proxy. Those reach the C entry, whose iteration loop is gone, so the DFAIL there NAMES the capability to
-       build — the acquire's own @@iterator GetMethod must run ON THE TRAMP, because a getter body is user code
-       with a loop that has to park. Routing it through the property-get tramp regressed the Promise
-       iter-arg-is-{null,undefined,poisoned} and Iterator.from fallback tests and leaked: the acquire's abrupt and
-       not-a-function paths are shared with a NULLISH and a PRIMITIVE source, which that route does not model.
-       Build that first, then this refusal goes. */
-    /* FOUND is the only route: an ABSENT @@iterator is Object.fromEntries's own TypeError (its argument must be
-       iterable, there is no array-like branch here) and DECLINE is the refusal above. Testing the tri-state as a
-       bool would read as "not declined", which is a different question. */
-    return iter_data_at_iterator(ctx, call_argv[0], out_getiter) == ITERAT_FOUND;
+    /* EVERY source. There is nothing left to SELECT: the acquire performs the whole of GetIterator — the @@iterator
+       READ on the tramp (a getter, a Proxy trap), the nullish and non-callable TypeErrors, the Call — and the
+       machine performs the whole of the walk including IfAbruptCloseIterator. The probe is passed along only as an
+       optimisation: when it already read a callable @@iterator side-effect-free, the acquire skips re-reading it.
+       (This used to refuse a source whose @@iterator the probe could not read, and said so at length, because the
+       acquire's read ran from C. That capability is built; the refusal goes with it, which is what the note asked
+       for.) */
+    /* argc 0 is not a reason to refuse either: `Object.fromEntries()` is GetIterator(undefined)'s TypeError, which
+       the acquire raises like any other. Refusing it sent it to a C entry that no longer has a body. */
+    if (call_argc >= 1) iter_data_at_iterator(ctx, call_argv[0], out_getiter);
+    return true;
 }
 
 /* Route new TypedArray(iterable) — js_typed_array_constructor_obj collects it (js_array_from_iterator) in a C loop,
