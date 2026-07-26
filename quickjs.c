@@ -23405,12 +23405,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             ret_val = JS_UNDEFINED;
                             goto do_step_step;
                         }
-                        /* 23.2.2.1 step 6: TypedArray.from with NO iterator is the ARRAY-LIKE algorithm, and it
-                           is the SAME machine — the source becomes the list and the walk starts at
-                           LengthOfArrayLike instead of a collect. Nothing observable has happened to undo: the
-                           collect array is private and the receiver is not constructed until the create phase. */
+                        /* 23.2.2.1 step 6 / 23.2.5.1 step 5.c: a TypedArray consumer with NO iterator takes the
+                           ARRAY-LIKE algorithm, and it is the SAME machine — the source becomes the list and the
+                           walk starts at LengthOfArrayLike instead of a collect. Nothing observable has happened
+                           to undo: the collect array is private, and neither the receiver's Construct nor the
+                           buffer allocation has run. */
                         if (nullish && tramp_consume_kind == CONT_ITER_CONSUME
-                            && ((JSIterConsume *)tramp_consume_state)->ta_isfrom) {
+                            && (((JSIterConsume *)tramp_consume_state)->ta_isfrom
+                                || ((JSIterConsume *)tramp_consume_state)->ta_classid != 0)) {
                             JSIterConsume *fs = (JSIterConsume *)tramp_consume_state;
                             JSValue src6 = JS_ToObject(ctx, iterable);
                             if (JS_IsException(src6)) {
@@ -52201,8 +52203,15 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
                 return 5;
             }
             if (JS_ToLengthFree(ctx, &len, fret) < 0) return -1;
-            s->k = len; s->ta_k = 0; s->ta_phase = 1;
-            return 4;                       /* -> step 7's TypedArrayCreateFromConstructor */
+            s->k = len; s->ta_k = 0;
+            if (s->ta_isfrom) { s->ta_phase = 1; return 4; }   /* -> step 7's TypedArrayCreateFromConstructor */
+            /* new TypedArray(arrayLike), 23.2.5.1 step 5.c.ii InitializeTypedArrayFromArrayLike: the object was
+               allocated at step 6.a.i, so only its buffer is sized — no user constructor is involved. */
+            DCHECK(s->ta_classid != 0 && !JS_IsUndefined(s->ta_target),
+                   "the TypedArray was not allocated before its source was read");
+            if (js_typed_array_alloc_len(ctx, s->ta_target, s->ta_classid, s->k) < 0) return -1;
+            s->ta_phase = 3;
+            goto ta_map_loop;
         }
         if (which == 6) {   /* the source element just read: hand it to the map/set phase */
             DCHECK(JS_IsUndefined(value), "the indexed read parks nothing on cb_value before it runs");
@@ -52764,8 +52773,20 @@ static bool tramp_can_call_ta_consume(JSContext *ctx, JSValueConst func, JSValue
     if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
     if (fp->u.cfunc.cproto != JS_CFUNC_constructor_magic) return false;
     if (fp->u.cfunc.c_function.constructor_magic != js_typed_array_constructor) return false;
+    /* 23.2.5.1 step 6.a: only an OBJECT first argument reaches the iterable/array-like branch — a number is a
+       length and takes a different algorithm entirely, as do a TypedArray source (an element-wise copy that
+       invokes nothing) and an ArrayBuffer (a view over existing bytes, whose byteOffset/length ToIndex coercions
+       are a separate unbuilt piece). */
     if (JS_VALUE_GET_TAG(call_argv[0]) != JS_TAG_OBJECT) return false;
-    if (!iter_consume_gen_backed(ctx, call_argv[0], out_getiter)) return false;
+    {
+        JSObject *sp0 = JS_VALUE_GET_OBJ(call_argv[0]);
+        if (is_typed_array(sp0->class_id)) return false;
+        if (sp0->class_id == JS_CLASS_ARRAY_BUFFER || sp0->class_id == JS_CLASS_SHARED_ARRAY_BUFFER) return false;
+    }
+    /* Nothing else declines. The probe is a side-effect-free HINT the acquire may reuse; when it cannot answer —
+       a getter, a Proxy, a built-in @@iterator whose iterator's .next may be patched — the acquire performs the
+       real GetMethod on the tramp and picks step 5 or step 6 from its answer. */
+    iter_data_at_iterator(ctx, call_argv[0], out_getiter);
     *out_classid = fp->u.cfunc.magic;   /* JS_CLASS_UINT8C_ARRAY .. (nonzero) */
     return true;
 }
