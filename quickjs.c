@@ -1445,7 +1445,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_BIGINT_ASUINTN, STEPDEF_BIGINT_ASINTN,
     STEPDEF_OBJ_GOPD, STEPDEF_REFLECT_GOPD,
     STEPDEF_OBJ_VALUES, STEPDEF_OBJ_ENTRIES, STEPDEF_OBJ_ASSIGN, STEPDEF_OBJ_SPREAD,
-    STEPDEF_ARRAY_FLAT, STEPDEF_ARRAY_FLATMAP, STEPDEF_ARRAY_FROMLIKE, STEPDEF_ARRAY_WITH, STEPDEF_ARRAY_FILL, STEPDEF_ARRAY_COPYWITHIN, STEPDEF_BIGINT_CTOR, STEPDEF_TA_WITH, STEPDEF_TA_FILL, STEPDEF_TA_COPYWITHIN, STEPDEF_DATE_TOJSON, STEPDEF_DATE_TOPRIM, STEPDEF_DATE_CTOR,
+    STEPDEF_ARRAY_FLAT, STEPDEF_ARRAY_FLATMAP, STEPDEF_ARRAY_FROMLIKE, STEPDEF_ARRAY_WITH, STEPDEF_ARRAY_FILL, STEPDEF_ARRAY_COPYWITHIN, STEPDEF_BIGINT_CTOR, STEPDEF_TA_WITH, STEPDEF_TA_FILL, STEPDEF_TA_COPYWITHIN, STEPDEF_TA_INDEXOF, STEPDEF_TA_LASTINDEXOF, STEPDEF_TA_INCLUDES, STEPDEF_DATE_TOJSON, STEPDEF_DATE_TOPRIM, STEPDEF_DATE_CTOR,
     STEPDEF_MATH_ABS, STEPDEF_MATH_FLOOR, STEPDEF_MATH_CEIL, STEPDEF_MATH_ROUND, STEPDEF_MATH_SQRT, STEPDEF_MATH_ACOS, STEPDEF_MATH_ASIN, STEPDEF_MATH_ATAN, STEPDEF_MATH_COS, STEPDEF_MATH_EXP, STEPDEF_MATH_LOG, STEPDEF_MATH_SIN, STEPDEF_MATH_TAN, STEPDEF_MATH_TRUNC, STEPDEF_MATH_SIGN, STEPDEF_MATH_COSH, STEPDEF_MATH_SINH, STEPDEF_MATH_TANH, STEPDEF_MATH_ACOSH, STEPDEF_MATH_ASINH, STEPDEF_MATH_ATANH, STEPDEF_MATH_EXPM1, STEPDEF_MATH_LOG1P, STEPDEF_MATH_LOG2, STEPDEF_MATH_LOG10, STEPDEF_MATH_CBRT, STEPDEF_MATH_F16ROUND, STEPDEF_MATH_FROUND, STEPDEF_MATH_ATAN2, STEPDEF_MATH_POW, STEPDEF_MATH_MIN, STEPDEF_MATH_MAX, STEPDEF_MATH_HYPOT, STEPDEF_MATH_IMUL, STEPDEF_MATH_CLZ32, STEPDEF_STR_FROMCHARCODE, STEPDEF_STR_FROMCODEPOINT, STEPDEF_DATE_UTC,
     STEPDEF_REGEXP_EXEC, STEPDEF_REGEXP_TEST,
     STEPDEF_ITER_TAKE, STEPDEF_ITER_DROP,
@@ -19965,7 +19965,16 @@ typedef struct JSArrayFill {
    `ta.copyWithin({valueOf(){ while(x){} }}, 1)` preempted with no flow base. Like `with`, the length is captured
    BEFORE any coercion, because the clamp is against the length the spec read first and the tail re-clamps to
    whatever a valueOf left behind. They are two modes of one machine, not two machines. */
-enum { TAPRO_FILL = 0, TAPRO_COPYWITHIN };
+/* the search `special` values, needed here by the mode declarations and by the builtin further down */
+#define special_indexOf 0
+#define special_lastIndexOf 1
+#define special_includes -1
+enum { TAPRO_FILL = 0, TAPRO_COPYWITHIN, TAPRO_SEARCH };
+/* the SEARCH modes also need indexOf's `special`, which rides the same declaration rather than growing a second
+   field: the mode is the low byte, the special the next one (biased, because includes is -1). */
+#define TAPRO_SEARCH_ARG(special) (TAPRO_SEARCH | (((special) + 1) << 8))
+#define TAPRO_MODE(arg)    ((arg) & 0xff)
+#define TAPRO_SPECIAL(arg) ((((arg) >> 8) & 0xff) - 1)
 typedef struct JSTACoerce {
     JSStepHdr hdr;        /* MUST be first: the generic step driver casts the state to JSStepHdr * */
     JSValue result;       /* DONE (owned) */
@@ -19976,6 +19985,8 @@ static JSValue js_typed_array_fill_build(JSContext *ctx, JSValueConst this_val, 
                                          int len);
 static JSValue js_typed_array_copywithin_build(JSContext *ctx, JSValueConst this_val, int argc,
                                                JSValueConst *argv, int len);
+static JSValue js_typed_array_indexof_build(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv,
+                                            int special, int len);
 
 /* 23.2.3.36 %TypedArray%.prototype.with. Its index and its value are BOTH the page's code, and js_typed_array_with
    coerced them with JS_ToInt64Sat / JS_ToPrimitive from a C entry. The length is captured at step 2, BEFORE either
@@ -53527,10 +53538,17 @@ static JSValue js_date_tojson_fini(JSContext *ctx, void *st, bool take_result)
 /* Which arguments each mode coerces, straight from the spec: fill takes the value always and `start` whenever it
    was PASSED (an explicit undefined is ToIntegerOrInfinity'd to 0, not skipped); copyWithin takes both target and
    start unconditionally. Both take `end` only when it was passed and is not undefined. */
-static bool ta_coerce_wants(JSStepHdr *h, int i)
+static bool ta_coerce_wants(JSTACoerce *s, int i)
 {
+    JSStepHdr *h = &s->hdr;
+    int mode = TAPRO_MODE(h->arg);
+    if (mode == TAPRO_SEARCH) {
+        /* only the fromIndex — the sought VALUE is compared by type, never coerced — and 23.2.3.16 step 3 returns
+           for an EMPTY array before reaching it, so a throwing fromIndex valueOf must not run at all. */
+        return i == 1 && h->argc > 1 && s->len > 0;
+    }
     if (i == 0) return true;
-    if (i == 1) return (h->arg == TAPRO_COPYWITHIN) || h->argc > 1;
+    if (i == 1) return (mode == TAPRO_COPYWITHIN) || h->argc > 1;
     return h->argc > 2 && !JS_IsUndefined(step_arg(h, 2));
 }
 
@@ -53549,14 +53567,17 @@ static int js_ta_coerce_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
         /* steps 1-2 run before any coercion, and their throws precede them */
         p = get_typed_array(ctx, s->hdr.this_val);
         if (!p) return -1;
-        if (typed_array_is_immutable(p)) { JS_ThrowTypeErrorImmutableArrayBuffer(ctx); return -1; }
+        /* the SEARCH modes read but never write, so the immutable check is not theirs */
+        if (TAPRO_MODE(s->hdr.arg) != TAPRO_SEARCH && typed_array_is_immutable(p)) {
+            JS_ThrowTypeErrorImmutableArrayBuffer(ctx); return -1;
+        }
         if (typed_array_is_oob(p)) { JS_ThrowTypeErrorArrayBufferOOB(ctx); return -1; }
         s->len = p->u.array.count;
         s->hdr.stage = 1;
     }
     while (s->hdr.stage == 1) {
         if (s->i >= 3) break;
-        if (!ta_coerce_wants(&s->hdr, s->i)) { s->i++; continue; }
+        if (!ta_coerce_wants(s, s->i)) { s->i++; continue; }
         r = step_toprim_run(ctx, &s->hdr, step_arg(&s->hdr, s->i), HINT_NUMBER, cb_result, &s->prim[s->i],
                             out_cb, out_argc);
         cb_result = JS_UNDEFINED;
@@ -53569,10 +53590,19 @@ static int js_ta_coerce_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
         JSValueConst pv[3];
         int k;
         for (k = 0; k < 3; k++)
-            pv[k] = ta_coerce_wants(&s->hdr, k) ? s->prim[k] : step_arg(&s->hdr, k);
-        s->result = (s->hdr.arg == TAPRO_COPYWITHIN)
-            ? js_typed_array_copywithin_build(ctx, s->hdr.this_val, s->hdr.argc, pv, s->len)
-            : js_typed_array_fill_build(ctx, s->hdr.this_val, s->hdr.argc, pv, s->len);
+            pv[k] = ta_coerce_wants(s, k) ? s->prim[k] : step_arg(&s->hdr, k);
+        switch (TAPRO_MODE(s->hdr.arg)) {
+        case TAPRO_COPYWITHIN:
+            s->result = js_typed_array_copywithin_build(ctx, s->hdr.this_val, s->hdr.argc, pv, s->len);
+            break;
+        case TAPRO_SEARCH:
+            s->result = js_typed_array_indexof_build(ctx, s->hdr.this_val, s->hdr.argc, pv, s->len,
+                                                     TAPRO_SPECIAL(s->hdr.arg));
+            break;
+        default:
+            s->result = js_typed_array_fill_build(ctx, s->hdr.this_val, s->hdr.argc, pv, s->len);
+            break;
+        }
     }
     return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
 }
@@ -54683,6 +54713,9 @@ static JSValue js_bigint_constructor(JSContext *ctx, JSValueConst new_target, in
 static const JSTrampStepDef js_ta_with_def = { sizeof(JSTAWith), js_ta_with_step, js_ta_with_fini, 0 };
 static const JSTrampStepDef js_ta_fill_def = { sizeof(JSTACoerce), js_ta_coerce_step, js_ta_coerce_fini, TAPRO_FILL };
 static const JSTrampStepDef js_ta_copyWithin_def = { sizeof(JSTACoerce), js_ta_coerce_step, js_ta_coerce_fini, TAPRO_COPYWITHIN };
+static const JSTrampStepDef js_ta_indexOf_def     = { sizeof(JSTACoerce), js_ta_coerce_step, js_ta_coerce_fini, TAPRO_SEARCH_ARG(special_indexOf) };
+static const JSTrampStepDef js_ta_lastIndexOf_def = { sizeof(JSTACoerce), js_ta_coerce_step, js_ta_coerce_fini, TAPRO_SEARCH_ARG(special_lastIndexOf) };
+static const JSTrampStepDef js_ta_includes_def    = { sizeof(JSTACoerce), js_ta_coerce_step, js_ta_coerce_fini, TAPRO_SEARCH_ARG(special_includes) };
 static const JSTrampStepDef js_date_toJSON_def = { sizeof(JSDateToJSON), js_date_tojson_step, js_date_tojson_fini, 0 };
 static const JSTrampStepDef js_date_toPrim_def = { sizeof(JSDateToPrim), js_date_toprim_step, js_date_toprim_fini, 0 };
 static const JSTrampStepDef js_date_ctor_def = { sizeof(JSDateCtor), js_date_ctor_step, js_date_ctor_fini, 0 };
@@ -54843,6 +54876,9 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_TA_WITH]       = &js_ta_with_def,
     [STEPDEF_TA_FILL]       = &js_ta_fill_def,
     [STEPDEF_TA_COPYWITHIN] = &js_ta_copyWithin_def,
+    [STEPDEF_TA_INDEXOF]    = &js_ta_indexOf_def,
+    [STEPDEF_TA_LASTINDEXOF]= &js_ta_lastIndexOf_def,
+    [STEPDEF_TA_INCLUDES]   = &js_ta_includes_def,
     [STEPDEF_DATE_TOJSON]   = &js_date_toJSON_def,
     [STEPDEF_DATE_TOPRIM]   = &js_date_toPrim_def,
     [STEPDEF_DATE_CTOR]     = &js_date_ctor_def,
@@ -72055,15 +72091,14 @@ static JSValue js_typed_array_fill_build(JSContext *ctx, JSValueConst this_val, 
 }
 
 
-#define special_indexOf 0
-#define special_lastIndexOf 1
-#define special_includes -1
 
-static JSValue js_typed_array_indexOf(JSContext *ctx, JSValueConst this_val,
-                                      int argc, JSValueConst *argv, int special)
+/* 23.2.3.16/.20/.14 from step 3 onwards, with the fromIndex ALREADY a primitive and `len` captured at step 2.
+   The sought VALUE is never coerced — it is compared by type — and the scan below invokes nothing. */
+static JSValue js_typed_array_indexof_build(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv,
+                                            int len, int special)
 {
     JSObject *p;
-    int len, tag, is_int, is_bigint, k, stop, inc, res = -1;
+    int tag, is_int, is_bigint, k, stop, inc, res = -1;
     int64_t v64;
     double d;
     float f;
@@ -72072,9 +72107,6 @@ static JSValue js_typed_array_indexOf(JSContext *ctx, JSValueConst this_val,
     p = get_typed_array(ctx, this_val);
     if (!p)
         return JS_EXCEPTION;
-    if (typed_array_is_oob(p))
-        return JS_ThrowTypeErrorArrayBufferOOB(ctx);
-    len = p->u.array.count;
 
     if (len == 0)
         goto done;
@@ -73178,9 +73210,9 @@ static const JSCFunctionListEntry js_typed_array_base_proto_funcs[] = {
     JS_CFUNC_DEF("toSorted", 1, js_typed_array_toSorted ),
     JS_CFUNC_STEP_DEF("join", 1, STEPDEF_TA_JOIN ),
     JS_CFUNC_STEP_DEF("toLocaleString", 0, STEPDEF_TA_TOLOCALESTRING ),
-    JS_CFUNC_MAGIC_DEF("indexOf", 1, js_typed_array_indexOf, special_indexOf ),
-    JS_CFUNC_MAGIC_DEF("lastIndexOf", 1, js_typed_array_indexOf, special_lastIndexOf ),
-    JS_CFUNC_MAGIC_DEF("includes", 1, js_typed_array_indexOf, special_includes ),
+    JS_CFUNC_STEP_DEF("indexOf", 1, STEPDEF_TA_INDEXOF ),
+    JS_CFUNC_STEP_DEF("lastIndexOf", 1, STEPDEF_TA_LASTINDEXOF ),
+    JS_CFUNC_STEP_DEF("includes", 1, STEPDEF_TA_INCLUDES ),
     //JS_ALIAS_BASE_DEF("toString", "toString", 2 /* Array.prototype. */), @@@
 };
 
