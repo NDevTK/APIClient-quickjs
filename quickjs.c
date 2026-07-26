@@ -33891,14 +33891,20 @@ static __exception int get_lvalue(JSParseState *s, int *popcode, int *pscope,
         }
         if (name == JS_ATOM_this || name == JS_ATOM_new_target)
             goto invalid_lvalue;
-        /* A name that may resolve into a `with` object materialises a Reference (OP_scope_make_ref ->
-           OP_get_ref_value/OP_put_ref_value) even for a write-only lvalue, because HasBinding must run when
-           the reference is RESOLVED — before the RHS — and OP_scope_put_var would run it after. */
-        if (has_with_scope(fd, scope)) {
-            depth = 2;  /* will generate OP_get_ref_value */
-        } else {
-            depth = 0;
-        }
+        /* An unqualified identifier lvalue ALWAYS materialises a Reference (OP_scope_make_ref ->
+           OP_get_ref_value / OP_put_ref_value). 13.15.2 evaluates the LeftHandSideExpression to a Reference
+           FIRST, then the RHS, then PutValue — so the binding the write lands in is the one resolution found
+           BEFORE the RHS ran, even if the RHS added a nearer one. Resolving at the PUT instead was a deliberate
+           deviation for speed (shared with V8/SpiderMonkey/JSC, and the reason these tests were EXCLUDED rather
+           than recorded), and it is observable three ways: `x = (eval("var x;"), 1)` wrote the eval-created
+           binding instead of the captured one; the compound forms did the same; and in strict mode
+           `undeclared = (this.undeclared = 5)` has an UNRESOLVABLE reference that must throw a ReferenceError
+           even though the RHS created the global.
+           The speed is not lost: resolve_scope_var's optimize_scope_make_ref rewrites the reference back into a
+           direct get/put whenever the name resolves to a static local or closure slot, where re-resolution
+           cannot differ. It survives only where it is load-bearing — a `with` object, a var object reachable by
+           a direct eval, and an unresolvable global. */
+        depth = 2;  /* will generate OP_get_ref_value */
         break;
     case OP_get_field:
         name = get_u32(fd->byte_code.buf + fd->last_opcode_pos + 1);
@@ -42031,7 +42037,14 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
 
     switch (op) {
     case OP_scope_make_ref:
-        if (label_done == -1 && can_opt_put_global_ref_value(bc_buf, ls->pos)) {
+        /* Rewriting a GLOBAL reference back into OP_get_var/OP_put_var re-resolves the name at the PUT, and a
+           global's resolvability — unlike a static local slot's — can CHANGE while the RHS runs. In STRICT code
+           that is observable: `undeclared = (this.undeclared = 5)` captures an UNRESOLVABLE reference, so
+           PutValue must throw a ReferenceError even though the RHS created the global. Sloppy code cannot tell
+           the difference (an unresolvable PutValue there just creates the global, exactly as OP_put_var does),
+           so the fast path survives where it is sound. */
+        if (label_done == -1 && !s->is_strict_mode
+            && can_opt_put_global_ref_value(bc_buf, ls->pos)) {
             pos_next = optimize_scope_make_global_ref(ctx, s, bc, bc_buf, ls,
                                                       pos_next, var_name);
         } else {
