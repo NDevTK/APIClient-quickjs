@@ -1436,6 +1436,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_STR_TRIM, STEPDEF_STR_TRIMSTART, STEPDEF_STR_TRIMEND, STEPDEF_STR_AT, STEPDEF_STR_CODEPOINTAT,
     STEPDEF_STR_SUBSTRING, STEPDEF_STR_INDEXOF, STEPDEF_STR_LASTINDEXOF, STEPDEF_STR_NORMALIZE,
     STEPDEF_STR_CHARAT, STEPDEF_STR_CHARCODEAT, STEPDEF_STR_SLICE, STEPDEF_STR_SUBSTR, STEPDEF_STR_REPEAT,
+    STEPDEF_STR_PADSTART, STEPDEF_STR_PADEND,
     STEPDEF_TA_AT, STEPDEF_TA_SET, STEPDEF_JSON_RAWJSON,
     STEPDEF_OBJ_DEFINEPROPERTY, STEPDEF_REFLECT_DEFINEPROPERTY,
     STEPDEF_PARSEINT, STEPDEF_PARSEFLOAT, STEPDEF_STR_SPLIT,
@@ -20109,7 +20110,8 @@ enum { STRRECV_TRIM_START = 1, STRRECV_TRIM_END = 2, STRRECV_TRIM_BOTH = 3,
        STRRECV_AT, STRRECV_CODEPOINTAT, STRRECV_SUBSTRING,
        STRRECV_INDEXOF, STRRECV_LASTINDEXOF, STRRECV_NORMALIZE,
        STRRECV_CHARAT, STRRECV_CHARCODEAT,
-       STRRECV_SLICE, STRRECV_SUBSTR, STRRECV_REPEAT };
+       STRRECV_SLICE, STRRECV_SUBSTR, STRRECV_REPEAT,
+       STRRECV_PADSTART, STRRECV_PADEND };
 typedef struct JSStrRecv {
     JSStepHdr hdr;
     JSValue str;          /* the receiver as a string (owned) */
@@ -53982,6 +53984,8 @@ static const JSTrampStepDef js_str_charCodeAt_def = { sizeof(JSStrRecv), js_str_
 static const JSTrampStepDef js_str_slice_def      = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_SLICE };
 static const JSTrampStepDef js_str_substr_def     = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_SUBSTR };
 static const JSTrampStepDef js_str_repeat_def     = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_REPEAT };
+static const JSTrampStepDef js_str_padStart_def   = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_PADSTART };
+static const JSTrampStepDef js_str_padEnd_def     = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_PADEND };
 static const JSTrampStepDef js_ta_at_def          = { sizeof(JSTAIdx), js_ta_idx_step, js_ta_idx_fini, TAIDX_AT };
 static const JSTrampStepDef js_ta_set_def         = { sizeof(JSTAIdx), js_ta_idx_step, js_ta_idx_fini, TAIDX_SET };
 static const JSTrampStepDef js_json_raw_def       = { sizeof(JSJsonRaw), js_json_raw_step, js_json_raw_fini, 0 };
@@ -54122,6 +54126,8 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_STR_SLICE]       = &js_str_slice_def,
     [STEPDEF_STR_SUBSTR]      = &js_str_substr_def,
     [STEPDEF_STR_REPEAT]      = &js_str_repeat_def,
+    [STEPDEF_STR_PADSTART]    = &js_str_padStart_def,
+    [STEPDEF_STR_PADEND]      = &js_str_padEnd_def,
     [STEPDEF_STR_INDEXOF]     = &js_str_indexOf_def,
     [STEPDEF_STR_LASTINDEXOF] = &js_str_lastIndexOf_def,
     [STEPDEF_STR_NORMALIZE]   = &js_str_normalize_def,
@@ -57354,6 +57360,7 @@ static int js_str_recv_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
         case STRRECV_AT: case STRRECV_CODEPOINTAT: case STRRECV_SUBSTRING:
         case STRRECV_CHARAT: case STRRECV_CHARCODEAT:
         case STRRECV_SLICE: case STRRECV_SUBSTR: case STRRECV_REPEAT:
+        case STRRECV_PADSTART: case STRRECV_PADEND:
             r = step_toint64_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->idx, out_cb, out_argc);
             cb_result = JS_UNDEFINED;
             if (r) return r < 0 ? -1 : r;
@@ -57384,6 +57391,15 @@ static int js_str_recv_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
         if (mode == STRRECV_SUBSTRING || mode == STRRECV_SLICE || mode == STRRECV_SUBSTR) {
             if (!JS_IsUndefined(step_arg(&s->hdr, 1))) {
                 r = step_toint64_run(ctx, &s->hdr, s->hdr.argv[1], cb_result, &s->idx2, out_cb, out_argc);
+                cb_result = JS_UNDEFINED;
+                if (r) return r < 0 ? -1 : r;
+            }
+        } else if (mode == STRRECV_PADSTART || mode == STRRECV_PADEND) {
+            /* 22.1.3.17 StringPad step 4: an intMaxLength that does not exceed the receiver returns EARLY, before
+               the filler is coerced at all — so the filler's ToString sits INSIDE that test. Getting it out of
+               order would run a page's toString the spec never runs. */
+            if (s->idx > len && s->hdr.argc > 1 && !JS_IsUndefined(step_arg(&s->hdr, 1))) {
+                r = step_tostring_run(ctx, &s->hdr, s->hdr.argv[1], cb_result, &s->arg, out_cb, out_argc);
                 cb_result = JS_UNDEFINED;
                 if (r) return r < 0 ? -1 : r;
             }
@@ -57474,6 +57490,39 @@ static int js_str_recv_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
         }
         s->result = string_buffer_end(rb);
         return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
+    }
+    if (mode == STRRECV_PADSTART || mode == STRRECV_PADEND) {
+        /* 22.1.3.17/22.1.3.18: both coercions ran on the tramp above, in spec order and under spec conditions, so
+           everything here is arithmetic on strings this machine already holds. */
+        StringBuffer pb_s, *pb = &pb_s;
+        JSString *p1 = NULL;
+        int n = (s->idx < INT32_MIN) ? INT32_MIN : (s->idx > INT32_MAX) ? INT32_MAX : (int)s->idx;
+        c = ' ';
+        if (len >= n) { s->result = js_dup(s->str); return 0; }
+        if (!JS_IsUndefined(s->arg)) {
+            p1 = JS_VALUE_GET_STRING(s->arg);
+            if (p1->len == 0) { s->result = js_dup(s->str); return 0; }
+            if (p1->len == 1) { c = string_get(p1, 0); p1 = NULL; }
+        }
+        if (n > JS_STRING_LEN_MAX) { JS_ThrowRangeError(ctx, "invalid string length"); return -1; }
+        if (string_buffer_init(ctx, pb, n)) return -1;
+        n -= len;
+        if (mode == STRRECV_PADEND && string_buffer_concat(pb, p, 0, len)) goto pad_fail;
+        if (p1) {
+            while (n > 0) {
+                int chunk = min_int(n, p1->len);
+                if (string_buffer_concat(pb, p1, 0, chunk)) goto pad_fail;
+                n -= chunk;
+            }
+        } else if (string_buffer_fill(pb, c, n)) {
+            goto pad_fail;
+        }
+        if (mode == STRRECV_PADSTART && string_buffer_concat(pb, p, 0, len)) goto pad_fail;
+        s->result = string_buffer_end(pb);
+        return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
+    pad_fail:
+        string_buffer_free(pb);
+        return -1;
     }
     if (mode == STRRECV_INDEXOF || mode == STRRECV_LASTINDEXOF) {
         JSString *p1 = JS_VALUE_GET_STRING(s->arg);
@@ -58421,76 +58470,6 @@ static JSValue js_str_split_fini(JSContext *ctx, void *st, bool take_result)
 
 
 
-static JSValue js_string_pad(JSContext *ctx, JSValueConst this_val,
-                             int argc, JSValueConst *argv, int padEnd)
-{
-    JSValue str, v = JS_UNDEFINED;
-    StringBuffer b_s, *b = &b_s;
-    JSString *p, *p1 = NULL;
-    int n, len, c = ' ';
-
-    str = JS_ToStringCheckObject(ctx, this_val);
-    if (JS_IsException(str))
-        goto fail1;
-    if (JS_ToInt32Sat(ctx, &n, argv[0]))
-        goto fail2;
-    p = JS_VALUE_GET_STRING(str);
-    len = p->len;
-    if (len >= n)
-        return str;
-    if (argc > 1 && !JS_IsUndefined(argv[1])) {
-        v = JS_ToString(ctx, argv[1]);
-        if (JS_IsException(v))
-            goto fail2;
-        p1 = JS_VALUE_GET_STRING(v);
-        if (p1->len == 0) {
-            JS_FreeValue(ctx, v);
-            return str;
-        }
-        if (p1->len == 1) {
-            c = string_get(p1, 0);
-            p1 = NULL;
-        }
-    }
-    if (n > JS_STRING_LEN_MAX) {
-        JS_ThrowRangeError(ctx, "invalid string length");
-        goto fail3;
-    }
-    if (string_buffer_init(ctx, b, n))
-        goto fail3;
-    n -= len;
-    if (padEnd) {
-        if (string_buffer_concat(b, p, 0, len))
-            goto fail;
-    }
-    if (p1) {
-        while (n > 0) {
-            int chunk = min_int(n, p1->len);
-            if (string_buffer_concat(b, p1, 0, chunk))
-                goto fail;
-            n -= chunk;
-        }
-    } else {
-        if (string_buffer_fill(b, c, n))
-            goto fail;
-    }
-    if (!padEnd) {
-        if (string_buffer_concat(b, p, 0, len))
-            goto fail;
-    }
-    JS_FreeValue(ctx, v);
-    JS_FreeValue(ctx, str);
-    return string_buffer_end(b);
-
-fail:
-    string_buffer_free(b);
-fail3:
-    JS_FreeValue(ctx, v);
-fail2:
-    JS_FreeValue(ctx, str);
-fail1:
-    return JS_EXCEPTION;
-}
 
 
 
@@ -58838,8 +58817,8 @@ static const JSCFunctionListEntry js_string_proto_funcs[] = {
     JS_CFUNC_STEP_DEF("repeat", 1, STEPDEF_STR_REPEAT ),
     JS_CFUNC_STEP_DEF("replace", 2, STEPDEF_STR_REPLACE ),
     JS_CFUNC_STEP_DEF("replaceAll", 2, STEPDEF_STR_REPLACE_ALL ),
-    JS_CFUNC_MAGIC_DEF("padEnd", 1, js_string_pad, 1 ),
-    JS_CFUNC_MAGIC_DEF("padStart", 1, js_string_pad, 0 ),
+    JS_CFUNC_STEP_DEF("padEnd", 1, STEPDEF_STR_PADEND ),
+    JS_CFUNC_STEP_DEF("padStart", 1, STEPDEF_STR_PADSTART ),
     JS_CFUNC_STEP_DEF("trim", 0, STEPDEF_STR_TRIM ),
     JS_CFUNC_STEP_DEF("trimEnd", 0, STEPDEF_STR_TRIMEND ),
     JS_ALIAS_DEF("trimRight", "trimEnd" ),
