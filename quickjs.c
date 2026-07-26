@@ -1443,7 +1443,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_TA_JOIN, STEPDEF_TA_TOLOCALESTRING,
     STEPDEF_BIGINT_ASUINTN, STEPDEF_BIGINT_ASINTN,
     STEPDEF_OBJ_GOPD, STEPDEF_REFLECT_GOPD,
-    STEPDEF_OBJ_VALUES, STEPDEF_OBJ_ENTRIES, STEPDEF_OBJ_ASSIGN,
+    STEPDEF_OBJ_VALUES, STEPDEF_OBJ_ENTRIES, STEPDEF_OBJ_ASSIGN, STEPDEF_OBJ_SPREAD,
     STEPDEF_REGEXP_EXEC, STEPDEF_REGEXP_TEST,
     STEPDEF_ITER_TAKE, STEPDEF_ITER_DROP,
     STEPDEF_FUNCTION_CTOR, STEPDEF_GENERATOR_FUNCTION_CTOR,
@@ -17632,80 +17632,6 @@ exception:
     return -1;
 }
 
-static __exception int JS_CopyDataProperties(JSContext *ctx,
-                                             JSValue target,
-                                             JSValue source,
-                                             JSValue excluded,
-                                             bool setprop)
-{
-    JSPropertyEnum *tab_atom;
-    JSValue val;
-    uint32_t i, tab_atom_count;
-    JSObject *p;
-    JSObject *pexcl = NULL;
-    int ret, gpn_flags;
-    int desc_flags;
-    bool is_enumerable;
-
-    if (JS_VALUE_GET_TAG(source) != JS_TAG_OBJECT)
-        return 0;
-
-    if (JS_VALUE_GET_TAG(excluded) == JS_TAG_OBJECT)
-        pexcl = JS_VALUE_GET_OBJ(excluded);
-
-    p = JS_VALUE_GET_OBJ(source);
-
-    gpn_flags = JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK | JS_GPN_ENUM_ONLY;
-    if (p->is_exotic) {
-        const JSClassExoticMethods *em = ctx->rt->class_array[p->class_id].exotic;
-        /* cannot use JS_GPN_ENUM_ONLY with e.g. proxies because it
-           introduces a visible change */
-        if (em && em->get_own_property_names) {
-            gpn_flags &= ~JS_GPN_ENUM_ONLY;
-        }
-    }
-    if (JS_GetOwnPropertyNamesInternal(ctx, &tab_atom, &tab_atom_count, p,
-                                       gpn_flags))
-        return -1;
-
-    for (i = 0; i < tab_atom_count; i++) {
-        if (pexcl) {
-            ret = JS_GetOwnPropertyInternal(ctx, NULL, pexcl, tab_atom[i].atom);
-            if (ret) {
-                if (ret < 0)
-                    goto exception;
-                continue;
-            }
-        }
-        if (!(gpn_flags & JS_GPN_ENUM_ONLY)) {
-            /* test if the property is enumerable */
-            ret = JS_GetOwnPropertyFlagsInternal(ctx, &desc_flags, p, tab_atom[i].atom);
-            if (ret < 0)
-                goto exception;
-            if (!ret)
-                continue;
-            is_enumerable = (desc_flags & JS_PROP_ENUMERABLE) != 0;
-            if (!is_enumerable)
-                continue;
-        }
-        val = JS_GetProperty(ctx, source, tab_atom[i].atom);
-        if (JS_IsException(val))
-            goto exception;
-        if (setprop)
-            ret = JS_SetProperty(ctx, target, tab_atom[i].atom, val);
-        else
-            ret = JS_DefinePropertyValue(ctx, target, tab_atom[i].atom, val,
-                                         JS_PROP_C_W_E);
-        if (ret < 0)
-            goto exception;
-    }
-    js_free_prop_enum(ctx, tab_atom, tab_atom_count);
-    return 0;
- exception:
-    js_free_prop_enum(ctx, tab_atom, tab_atom_count);
-    return -1;
-}
-
 /* only valid inside C functions */
 static JSValueConst JS_GetActiveFunction(JSContext *ctx)
 {
@@ -18139,6 +18065,9 @@ typedef struct JSTrampStepDef {
     void     (*onerror)(JSContext *ctx, JSValueConst this_val, int magic);
 } JSTrampStepDef;
 static const JSTrampStepDef *tramp_step_def_of(JSValueConst func);
+/* the def a STEPDEF_* id names. A CALL reaches its def through the callee object; an OPCODE that drives a machine
+   has no callee to read, so it names the def by id — the same list, one lookup, no second table. */
+static const JSTrampStepDef *tramp_step_def_by_id(int id);
 #define CONT_TOPRIM        21  /* cont_state = JSToPrim: ToPrimitive's method call (7.1.1) running ON THE TRAMP.
                                   JS_ToPrimitiveFree calls @@toPrimitive / valueOf / toString with JS_CallFree, from
                                   C — so a user coercion method containing a loop preempts in an activation with no
@@ -18194,6 +18123,10 @@ typedef struct JSStepHdr {
        IfAbruptCloseIterator). It lives on the header because the teardown is what has to act on it, and the
        teardown releases this_val — the receiver the handler needs — before the machine's own fini can see it. */
     uint8_t coercing;
+    /* An OPCODE-driven machine whose operation yields NOTHING — an object spread mutates its target in place, the
+       way a property write does. The DONE path otherwise always leaves exactly one value on the operand stack, and
+       an opcode's COMPILED stack has no slot for it (unlike a call site, whose callee slot is the result slot). */
+    uint8_t discard_result;
     /* the key a GETPROP sub-sequence is holding across its suspension. It is OWNED here because the driver
        BORROWS the atom the request carries, and released by the shared teardown so an abandon mid-read cannot
        leak it. JS_ATOM_NULL is zero, so a js_mallocz'd state already reads as "no read in flight". */
@@ -19862,6 +19795,9 @@ typedef struct JSPropWalk {
 #define PROPWALK_VALUES  0
 #define PROPWALK_ENTRIES 1
 #define PROPWALK_ASSIGN  2   /* Object.assign(target, ...sources): the same read per key, written to the target */
+#define PROPWALK_SPREAD  3   /* `{...src}` / `{a, ...rest}` (OP_copy_data_properties): argv is [target, source,
+                                excludeList]. The target is a FRESH object the opcode just built, so the write is a
+                                DefineOwnProperty with no user code in it — only the READ can suspend. */
 
 /* indexOf / lastIndexOf / includes: ONE machine, three modes. They differ only in the search direction, the
    fromIndex clamp and the equality (strict vs SameValueZero); the part that had to change is the same in all
@@ -22679,11 +22615,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        cleanup below ran off whatever the freed block then held. */
                     void *souter = h->outer; uint8_t souter_kind = h->outer_kind;
                     int cfirst = h->orig_cfirst, cargc = h->orig_cargc;
-                    uint8_t itail = h->orig_is_tail;
+                    uint8_t itail = h->orig_is_tail, idiscard = h->discard_result;
                     JSValue r = tramp_step_state_free(ctx, stt, true);
                     JSValue *cargv = sp - cargc;
                     for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
                     sp += cfirst - cargc;
+                    if (idiscard) { JS_FreeValue(ctx, r); BREAK; }   /* an opcode whose operation yields nothing */
                     if (souter) {   /* something is waiting on this machine's result */
                         ret_val = r; cont_st = souter;
                         if (souter_kind == CONT_TOPRIM)
@@ -27224,12 +27161,31 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    2 bits for exclusionList */
                 int mask;
 
+                JSValueConst pw_args[3];
+                void *pw_stt;
                 mask = *pc++;
                 sf->cur_pc = pc;
-                if (JS_CopyDataProperties(ctx, sp[-1 - (mask & 3)],
-                                          sp[-1 - ((mask >> 2) & 7)],
-                                          sp[-1 - ((mask >> 5) & 7)], 0))
-                    goto exception;
+                /* `{...src}` / `{a, ...rest}`: the copy READS every own key of the source, and each read is the
+                   page's code — an accessor body, a Proxy `get` trap. JS_CopyDataProperties did those reads with
+                   JS_GetProperty from C, so a getter with a loop in it drove to completion; the whole walk is the
+                   property-walk step machine now (its SPREAD sink), and that C function is deleted.
+                   The machine is driven straight from here: an opcode has no callee slot to reach a def through, so
+                   it names the def by id, and it yields NOTHING (the target is mutated in place), which is what
+                   discard_result says. The three operands stay on the stack and are BORROWED — the state dups
+                   them, and the compiled stack is unchanged by the machine. */
+                pw_args[0] = sp[-1 - (mask & 3)];
+                pw_args[1] = sp[-1 - ((mask >> 2) & 7)];
+                pw_args[2] = sp[-1 - ((mask >> 5) & 7)];
+                pw_stt = tramp_step_state_new(ctx, tramp_step_def_by_id(STEPDEF_OBJ_SPREAD),
+                                              JS_UNDEFINED, 3, pw_args, JS_UNDEFINED);
+                if (unlikely(!pw_stt)) goto exception;
+                ((JSStepHdr *)pw_stt)->orig_cfirst = 0;
+                ((JSStepHdr *)pw_stt)->orig_cargc = 0;
+                ((JSStepHdr *)pw_stt)->orig_is_tail = 0;
+                ((JSStepHdr *)pw_stt)->discard_result = 1;
+                cont_st = pw_stt;
+                ret_val = JS_UNDEFINED;
+                goto do_step_step;
             }
             BREAK;
 
@@ -50093,10 +50049,12 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
            handed over late is a leak and a buffer initialised late is freed with a NULL context. */
         s->obj = JS_UNDEFINED; s->result = JS_UNDEFINED; s->el = JS_UNDEFINED;
         s->atoms = NULL; s->len = 0; s->i = 0; s->j = 0;
-        s->src_i = assign ? 1 : 0;
-        /* 20.1.2.1 step 1 / 7.3.23 step 1: ToObject the target (assign) or the sole source, and it is what the
-           machine RETURNS in the assign case, so it goes in `result`. */
-        s->result = assign ? JS_ToObject(ctx, step_arg(&s->hdr, 0)) : JS_NewArray(ctx);
+        s->src_i = (mode == PROPWALK_VALUES || mode == PROPWALK_ENTRIES) ? 0 : 1;
+        /* 20.1.2.1 step 1 / 7.3.23 step 1: ToObject the target (assign) or build the output array. A SPREAD's
+           target is the object the opcode just created — already an object, and it belongs to the opcode's stack,
+           so it is only BORROWED here. `result` is what the machine hands back, which a spread discards. */
+        s->result = assign ? JS_ToObject(ctx, step_arg(&s->hdr, 0))
+                  : (mode == PROPWALK_SPREAD ? js_dup(step_arg(&s->hdr, 0)) : JS_NewArray(ctx));
         if (JS_IsException(s->result)) { s->result = JS_UNDEFINED; return -1; }
         s->hdr.stage = 1;
     }
@@ -50105,16 +50063,28 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
             /* open the next SOURCE. assign has argc-1 of them and skips the nullish ones (step 3.a); the others
                have exactly one, argv[0]. */
             JSValueConst src;
-            if (assign && s->src_i >= s->hdr.argc) { JS_FreeValue(ctx, cb_result); return 0; }
+            /* How many sources this sink has: assign takes every argument after the target, a spread takes the one
+               the opcode handed it, values/entries take argv[0] — and for those two an EXTRA argument is not a
+               second source, so the bound is a mode fact, not argc. */
+            int src_end = assign ? s->hdr.argc : (mode == PROPWALK_SPREAD ? 2 : 1);
+            if (s->src_i >= src_end) { JS_FreeValue(ctx, cb_result); return 0; }
             src = step_arg(&s->hdr, s->src_i);
-            if (assign && (JS_IsNull(src) || JS_IsUndefined(src))) { s->src_i++; continue; }
+            /* a nullish source contributes nothing to assign (step 3.a) or to a spread (`{...null}` is empty), but
+               values/entries THROW on it — their step 1 is ToObject of the argument itself. A non-object source is
+               BOXED, which is how `{..."ab"}` yields {0:"a",1:"b"}. */
+            if ((assign || mode == PROPWALK_SPREAD) && (JS_IsNull(src) || JS_IsUndefined(src))) {
+                s->src_i++;
+                continue;
+            }
             s->obj = JS_ToObject(ctx, src);
             if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; JS_FreeValue(ctx, cb_result); return -1; }
             /* the snapshot is taken WITHOUT JS_GPN_ENUM_ONLY and each key's enumerability re-checked below,
                because the reads run between the snapshot and the check and one of them can redefine a later key.
                assign copies SYMBOL keys too — its key list is [[OwnPropertyKeys]], not just the string ones. */
             if (JS_GetOwnPropertyNamesInternal(ctx, &s->atoms, &s->len, JS_VALUE_GET_OBJ(s->obj),
-                                               JS_GPN_STRING_MASK | (assign ? JS_GPN_SYMBOL_MASK : 0))) {
+                                               JS_GPN_STRING_MASK
+                                               | (mode == PROPWALK_VALUES || mode == PROPWALK_ENTRIES
+                                                      ? 0 : JS_GPN_SYMBOL_MASK))) {
                 s->atoms = NULL; s->len = 0;
                 JS_FreeValue(ctx, cb_result);
                 return -1;
@@ -50125,6 +50095,16 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
         if (s->hdr.stage == 2) {
             int desc_flags, res;
             if (s->i >= s->len) { s->hdr.stage = 4; goto source_done; }
+            if (mode == PROPWALK_SPREAD) {
+                /* `{a, ...rest}`: the keys already bound by the pattern are excluded. The list is an object the
+                   compiler built, so this lookup invokes nothing. */
+                JSValueConst excl = step_arg(&s->hdr, 2);
+                if (JS_VALUE_GET_TAG(excl) == JS_TAG_OBJECT) {
+                    res = JS_GetOwnPropertyInternal(ctx, NULL, JS_VALUE_GET_OBJ(excl), s->atoms[s->i].atom);
+                    if (res < 0) { JS_FreeValue(ctx, cb_result); return -1; }
+                    if (res) { s->i++; continue; }
+                }
+            }
             res = JS_GetOwnPropertyFlagsInternal(ctx, &desc_flags, JS_VALUE_GET_OBJ(s->obj),
                                                  s->atoms[s->i].atom);
             if (res < 0) { JS_FreeValue(ctx, cb_result); return -1; }
@@ -50149,6 +50129,11 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
                 int sret = JS_SetPropertyInternal2(ctx, s->result, s->atoms[s->i].atom, item,
                                                   s->result, JS_PROP_THROW);
                 if (sret < 0) return -1;
+            } else if (mode == PROPWALK_SPREAD) {
+                /* CreateDataPropertyOrThrow on a FRESH object: no setter, no trap, nothing that can suspend. */
+                if (JS_DefinePropertyValue(ctx, s->result, JS_DupAtom(ctx, s->atoms[s->i].atom), item,
+                                           JS_PROP_C_W_E | JS_PROP_THROW) < 0)
+                    return -1;
             } else if (mode == PROPWALK_ENTRIES) {
                 JSValue pair = JS_NewArray(ctx), key;
                 if (JS_IsException(pair)) { JS_FreeValue(ctx, item); return -1; }
@@ -50176,7 +50161,6 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
             js_free_prop_enum(ctx, s->atoms, s->len);
             s->atoms = NULL; s->len = 0;
             JS_FreeValue(ctx, s->obj); s->obj = JS_UNDEFINED;
-            if (!assign) { JS_FreeValue(ctx, cb_result); return 0; }
             s->src_i++;
             s->hdr.stage = 1;
         }
@@ -53484,6 +53468,7 @@ static const JSTrampStepDef js_ta_tolocale_def    = { sizeof(JSArrayJoin), js_ar
 static const JSTrampStepDef js_obj_values_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_VALUES };
 static const JSTrampStepDef js_obj_entries_def    = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_ENTRIES };
 static const JSTrampStepDef js_obj_assign_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_ASSIGN };
+static const JSTrampStepDef js_obj_spread_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_SPREAD };
 #define PRIMARGS_DEF_FULL(spec, proto, fn, magic, pre, mid, err) \
     { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, (spec), { .proto = (fn) }, JS_CFUNC_##proto, (magic), (pre), (mid), (err) }
 #define PRIMARGS_DEF(spec, proto, fn, magic)                PRIMARGS_DEF_FULL(spec, proto, fn, magic, NULL, NULL, NULL)
@@ -53585,6 +53570,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_OBJ_VALUES]      = &js_obj_values_def,
     [STEPDEF_OBJ_ENTRIES]     = &js_obj_entries_def,
     [STEPDEF_OBJ_ASSIGN]      = &js_obj_assign_def,
+    [STEPDEF_OBJ_SPREAD]      = &js_obj_spread_def,
     [STEPDEF_REFLECT_GOPD]    = &js_reflect_gopd_def,
     [STEPDEF_ITER_TAKE]       = &js_iter_take_def,
     [STEPDEF_ITER_DROP]       = &js_iter_drop_def,
@@ -53607,6 +53593,13 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_ARRAY_REDUCE]  = &js_array_reduce_def,  [STEPDEF_ARRAY_REDUCE_RIGHT] = &js_array_reduceR_def,
     [STEPDEF_TA_REDUCE]     = &js_ta_reduce_def,     [STEPDEF_TA_REDUCE_RIGHT]    = &js_ta_reduceR_def,
 };
+
+static const JSTrampStepDef *tramp_step_def_by_id(int id)
+{
+    DCHECK(id >= 0 && id < STEPDEF_COUNT, "step def id out of range");
+    DCHECK(js_tramp_step_defs[id] != NULL, "a STEPDEF id with no definition — the table row is missing");
+    return js_tramp_step_defs[id];
+}
 
 /* Every step state MUST begin with JSStepHdr — the driver casts the opaque state to JSStepHdr * and writes
    def/orig_c* through it, so a state that forgets gets its first field overwritten by the step-def pointer.
