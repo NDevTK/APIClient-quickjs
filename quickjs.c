@@ -1445,7 +1445,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_BIGINT_ASUINTN, STEPDEF_BIGINT_ASINTN,
     STEPDEF_OBJ_GOPD, STEPDEF_REFLECT_GOPD,
     STEPDEF_OBJ_VALUES, STEPDEF_OBJ_ENTRIES, STEPDEF_OBJ_ASSIGN, STEPDEF_OBJ_SPREAD,
-    STEPDEF_ARRAY_FLAT, STEPDEF_ARRAY_FLATMAP, STEPDEF_ARRAY_FROMLIKE, STEPDEF_ARRAY_WITH, STEPDEF_ARRAY_FILL, STEPDEF_ARRAY_COPYWITHIN, STEPDEF_BIGINT_CTOR, STEPDEF_TA_WITH,
+    STEPDEF_ARRAY_FLAT, STEPDEF_ARRAY_FLATMAP, STEPDEF_ARRAY_FROMLIKE, STEPDEF_ARRAY_WITH, STEPDEF_ARRAY_FILL, STEPDEF_ARRAY_COPYWITHIN, STEPDEF_BIGINT_CTOR, STEPDEF_TA_WITH, STEPDEF_DATE_TOJSON,
     STEPDEF_MATH_ABS, STEPDEF_MATH_FLOOR, STEPDEF_MATH_CEIL, STEPDEF_MATH_ROUND, STEPDEF_MATH_SQRT, STEPDEF_MATH_ACOS, STEPDEF_MATH_ASIN, STEPDEF_MATH_ATAN, STEPDEF_MATH_COS, STEPDEF_MATH_EXP, STEPDEF_MATH_LOG, STEPDEF_MATH_SIN, STEPDEF_MATH_TAN, STEPDEF_MATH_TRUNC, STEPDEF_MATH_SIGN, STEPDEF_MATH_COSH, STEPDEF_MATH_SINH, STEPDEF_MATH_TANH, STEPDEF_MATH_ACOSH, STEPDEF_MATH_ASINH, STEPDEF_MATH_ATANH, STEPDEF_MATH_EXPM1, STEPDEF_MATH_LOG1P, STEPDEF_MATH_LOG2, STEPDEF_MATH_LOG10, STEPDEF_MATH_CBRT, STEPDEF_MATH_F16ROUND, STEPDEF_MATH_FROUND, STEPDEF_MATH_ATAN2, STEPDEF_MATH_POW, STEPDEF_MATH_MIN, STEPDEF_MATH_MAX, STEPDEF_MATH_HYPOT, STEPDEF_MATH_IMUL, STEPDEF_MATH_CLZ32, STEPDEF_STR_FROMCHARCODE, STEPDEF_STR_FROMCODEPOINT, STEPDEF_DATE_UTC,
     STEPDEF_REGEXP_EXEC, STEPDEF_REGEXP_TEST,
     STEPDEF_ITER_TAKE, STEPDEF_ITER_DROP,
@@ -19972,6 +19972,18 @@ typedef struct JSTAWith {
 } JSTAWith;
 static JSValue js_typed_array_with_build(JSContext *ctx, JSValueConst this_val, int64_t idx, JSValue val, uint32_t len);
 static JSObject *get_typed_array(JSContext *ctx, JSValueConst this_val);
+
+/* 21.4.4.37 Date.prototype.toJSON. Three of its steps are the page's code — ToPrimitive on the receiver, the
+   `toISOString` read, and the call — and js_date_toJSON ran all three from a C entry, so
+   `Date.prototype.toJSON.call({valueOf(){ while(x){} }})` preempted with no flow base. It is also the C site that
+   reaches the intrinsic Object.prototype.toString through OrdinaryToPrimitive. */
+typedef struct JSDateToJSON {
+    JSStepHdr hdr;        /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    JSValue obj;          /* ToObject(this) (owned) */
+    JSValue tv;           /* the ToPrimitive result (owned) */
+    JSValue result;       /* DONE (owned) */
+    JSValue cb[2];        /* [obj, its toISOString] — the CALL request */
+} JSDateToJSON;
 
 /* Array.prototype.copyWithin, 23.1.3.4. ToObject, LengthOfArrayLike, THREE index coercions, then a walk that
    for each position either copies the source element or DELETES the target one (step 14.d.ii, when the source is
@@ -47348,6 +47360,12 @@ typedef enum BCTagEnum {
    regenerated the blobs. */
 _Static_assert(OP_COUNT == 255,
                "the opcode set changed: bump BC_VERSION and run `make codegen` to regenerate builtin-*.h");
+/* The SAME trap through the other table. A blob names a built-in atom by its INDEX, so inserting one anywhere
+   before the symbols shifts every later name and the blob silently resolves the wrong one — Iterator.zip started
+   reading `done` off the atom next to it, five tests deep in a directory that has nothing to do with the atom that
+   was added. Adding `toISOString` for Date.prototype.toJSON is what found it. Same gate, same fix. */
+_Static_assert(JS_ATOM_END == 243,
+               "the atom table changed: run `make codegen` to regenerate builtin-*.h, then update this count");
 
 typedef struct BCWriterState {
     JSContext *ctx;
@@ -53254,6 +53272,63 @@ static JSValue js_array_copywithin_fini(JSContext *ctx, void *st, bool take_resu
     return r;
 }
 
+static int js_date_tojson_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSDateToJSON *s = st;
+    int r;
+
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
+        s->obj = JS_UNDEFINED; s->tv = JS_UNDEFINED; s->result = JS_UNDEFINED;
+        s->cb[0] = JS_UNDEFINED; s->cb[1] = JS_UNDEFINED;
+        s->obj = JS_ToObject(ctx, s->hdr.this_val);
+        if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
+        s->hdr.stage = 1;
+    }
+    if (s->hdr.stage == 1) {
+        r = step_toprim_run(ctx, &s->hdr, s->obj, HINT_NUMBER, cb_result, &s->tv, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        /* step 3: a NON-FINITE number is null, and the method is never even read */
+        if (JS_IsNumber(s->tv)) {
+            double d;
+            if (JS_ToFloat64(ctx, &d, s->tv) < 0) return -1;
+            if (!isfinite(d)) { s->result = JS_NULL; return 0; }
+        }
+        s->hdr.stage = 2;
+    }
+    if (s->hdr.stage == 2) {
+        r = step_getprop_run(ctx, &s->hdr, s->obj, JS_ATOM_toISOString, cb_result, &s->cb[1], out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        if (!JS_IsFunction(ctx, s->cb[1])) {
+            JS_ThrowTypeError(ctx, "object needs toISOString method");
+            return -1;
+        }
+        s->cb[0] = js_dup(s->obj);
+        s->hdr.stage = 3;
+        *out_cb = s->cb; *out_argc = 0;
+        return 3;
+    }
+    DCHECK(s->hdr.stage == 3, "Date.prototype.toJSON: unknown stage");
+    s->result = cb_result;
+    return 0;
+}
+
+static JSValue js_date_tojson_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSDateToJSON *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    int i;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    for (i = 0; i < 2; i++) JS_FreeValue(ctx, s->cb[i]);
+    JS_FreeValue(ctx, s->tv);
+    JS_FreeValue(ctx, s->obj);
+    js_free(ctx, s);
+    return r;
+}
+
 static int js_ta_with_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSTAWith *s = st;
@@ -54213,6 +54288,8 @@ static int js_array_at_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
 static int js_array_with_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_array_fill_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_ta_with_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static int js_date_tojson_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_date_tojson_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_ta_with_fini(JSContext *ctx, void *st, bool take_result);
 static int js_array_copywithin_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_copywithin_fini(JSContext *ctx, void *st, bool take_result);
@@ -54339,6 +54416,7 @@ static JSValue js_bigint_constructor(JSContext *ctx, JSValueConst new_target, in
    primitive. It is callable AND a constructor (which throws), which is what the constructor_or_func body
    prototype is for. */
 static const JSTrampStepDef js_ta_with_def = { sizeof(JSTAWith), js_ta_with_step, js_ta_with_fini, 0 };
+static const JSTrampStepDef js_date_toJSON_def = { sizeof(JSDateToJSON), js_date_tojson_step, js_date_tojson_fini, 0 };
 static const JSTrampStepDef js_bigint_ctor_def =
     { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, PRIMARGS(0x1, HINT_NUMBER, 1),
       { .generic = js_bigint_constructor }, JS_CFUNC_constructor_or_func, 0, NULL, NULL, NULL };
@@ -54494,6 +54572,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_ARRAY_COPYWITHIN] = &js_array_copyWithin_def,
     [STEPDEF_BIGINT_CTOR]   = &js_bigint_ctor_def,
     [STEPDEF_TA_WITH]       = &js_ta_with_def,
+    [STEPDEF_DATE_TOJSON]   = &js_date_toJSON_def,
     [STEPDEF_ARRAY_INDEXOF]     = &js_array_indexOf_def,
     [STEPDEF_ARRAY_LASTINDEXOF] = &js_array_lastIndexOf_def,
     [STEPDEF_ARRAY_INCLUDES]    = &js_array_includes_def,
@@ -69784,43 +69863,6 @@ static JSValue js_date_setYear(JSContext *ctx, JSValueConst this_val,
     return ret;
 }
 
-static JSValue js_date_toJSON(JSContext *ctx, JSValueConst this_val,
-                              int argc, JSValueConst *argv)
-{
-    // toJSON(key)
-    JSValue obj, tv, method, rv;
-    double d;
-
-    rv = JS_EXCEPTION;
-    tv = JS_UNDEFINED;
-
-    obj = JS_ToObject(ctx, this_val);
-    tv = JS_ToPrimitive(ctx, obj, HINT_NUMBER);
-    if (JS_IsException(tv))
-        goto exception;
-    if (JS_IsNumber(tv)) {
-        if (JS_ToFloat64(ctx, &d, tv) < 0)
-            goto exception;
-        if (!isfinite(d)) {
-            rv = JS_NULL;
-            goto done;
-        }
-    }
-    method = JS_GetPropertyStr(ctx, obj, "toISOString");
-    if (JS_IsException(method))
-        goto exception;
-    if (!JS_IsFunction(ctx, method)) {
-        JS_ThrowTypeError(ctx, "object needs toISOString method");
-        JS_FreeValue(ctx, method);
-        goto exception;
-    }
-    rv = JS_CallFree(ctx, method, obj, 0, NULL);
-exception:
-done:
-    JS_FreeValue(ctx, obj);
-    JS_FreeValue(ctx, tv);
-    return rv;
-}
 
 static const JSCFunctionListEntry js_date_funcs[] = {
     JS_CFUNC_DEF("now", 0, js_Date_now ),
@@ -69875,7 +69917,7 @@ static const JSCFunctionListEntry js_date_proto_funcs[] = {
     JS_CFUNC_DEF("setYear", 1, js_date_setYear ),
     JS_CFUNC_MAGIC_DEF("setFullYear", 3, set_date_field, 0x031 ),
     JS_CFUNC_MAGIC_DEF("setUTCFullYear", 3, set_date_field, 0x030 ),
-    JS_CFUNC_DEF("toJSON", 1, js_date_toJSON ),
+    JS_CFUNC_STEP_DEF("toJSON", 1, STEPDEF_DATE_TOJSON ),
 };
 
 JSValue JS_NewDate(JSContext *ctx, double epoch_ms)
