@@ -19144,6 +19144,17 @@ typedef struct JSIteratorWrapData {
                                   shared acquire (so a generator-function @@iterator is created ON THE TRAMP) and the
                                   resulting iterator IS the call's result; the deliver just yields it. */
 typedef struct JSIterFrom { int orig_cfirst, orig_cargc; uint8_t orig_is_tail; } JSIterFrom;
+#define CONT_ACQUIRE_GET  25   /* cont_state = JSAcquireGet: GetIterator step 3's READ of @@iterator, when reading it
+                                  is itself the page's code (a getter, a Proxy trap). The consumer waiting on the
+                                  acquire cannot be the read's outer continuation directly — a consumer's delivery
+                                  finishes an ACQUISITION, not a property read — so this carries it across the read
+                                  and re-enters the acquire with the method in hand. */
+typedef struct JSAcquireGet {
+    JSValueConst iterable;   /* BORROWED: it is the consumer's own call operand, which lives on the caller's stack
+                                for the consumer's whole lifetime — the same borrow the acquire already makes. */
+    void *consumer;
+    uint8_t consumer_kind;
+} JSAcquireGet;
 #define CONT_CONSUME_GETITER 19 /* cont_state = JSConsumeGetIter: GetIterator step 4's Call(method, obj) when the
                                    @@iterator method is a NORMAL bytecode function. Its body runs on THIS chain, so a
                                    loop in a hand-written `[Symbol.iterator]()` preempts like any other function —
@@ -19331,6 +19342,7 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_STEP:
     case CONT_IMPORT:
     case CONT_CONSUME_GETITER:
+    case CONT_ACQUIRE_GET:
     case CONT_FOROF_NEXT:
     case CONT_TOPRIM:
     case CONT_GETPROP:
@@ -23218,8 +23230,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                     cont_st = gp_outer;                            /* nothing suspended: straight to the machine */
                     { uint8_t gk = gp_outer_kind;
+                      void *gouter0 = gp_outer;
                       gp_outer = NULL; gp_outer_kind = CONT_NONE; gp_atom = JS_ATOM_NULL;
                       gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                      if (gk == CONT_ACQUIRE_GET) {
+                          /* the read invoked nothing (a data @@iterator, a primitive source, a nullish one whose
+                             TypeError went to getprop_throw): re-enter the acquire with the method in hand, the
+                             SAME arm the suspended read resumes into. */
+                          JSAcquireGet *ag = gouter0;
+                          tramp_consume_state = ag->consumer;
+                          tramp_consume_kind = ag->consumer_kind;
+                          tramp_consume_iterable = ag->iterable;
+                          js_free_rt(rt, ag);
+                          tramp_iter_getiter = ret_val;
+                          goto do_consume_acquire_have_method;
+                      }
                       if (gk == CONT_ITER_CONSUME) goto do_iter_consume_step;
                       DCHECK(gk == CONT_STEP, "property-get outer continuation: unknown machine kind"); }
                     goto do_step_step;
@@ -23276,8 +23301,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    so do the machines waiting on IT. */
                 {
                     void *gouter = gp_outer;
+                    uint8_t gk3 = gp_outer_kind;
                     gp_outer = NULL; gp_outer_kind = CONT_NONE; gp_atom = JS_ATOM_NULL;
                     gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                    if (gk3 == CONT_ACQUIRE_GET) {
+                        /* the @@iterator read threw with nothing suspended (a nullish source's TypeError, a
+                           primitive's patched getter): that is an ACQUISITION failure, and each consumer's deliver
+                           arm knows what its own builtin owes for one — Promise rejects, the rest propagate. */
+                        JSAcquireGet *ag = gouter;
+                        tramp_consume_state = ag->consumer;
+                        tramp_consume_kind = ag->consumer_kind;
+                        tramp_consume_iterable = ag->iterable;
+                        js_free_rt(rt, ag);
+                        tramp_consume_acquired = JS_EXCEPTION;
+                        goto do_consume_deliver_iterator;
+                    }
                     tramp_step_chain_free(ctx, gouter);
                     goto exception;
                 }
@@ -23289,30 +23327,48 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                throwing/looping param prologue suspends); any other callable is invoked inline (it returns an iterator
                without running a coroutine). One acquire for all consumers — never re-implemented per builtin. */
             {
-                JSValue method = tramp_iter_getiter; tramp_iter_getiter = JS_UNDEFINED;
-                JSValueConst iterable = tramp_consume_iterable;
-                if (!JS_IsFunction(ctx, method)) {
-                    /* The probe is side-effect-free, so it DECLINES a getter @@iterator (and a non-function/absent
-                       value) — method is UNDEFINED here. Perform the REAL GetMethod now: read @@iterator, RUNNING a
-                       getter, which may THROW (a poisoned @@iterator must reject the aggregate with ITS error, not a
-                       synthesized "not iterable" — iter-arg-is-poisoned). Then apply GetIterator's checks. NOT-
-                       ITERABLE is part of GetIterator, not a reason to refuse the route; the acquire owns the whole
-                       of it, and each consumer's deliver arm finishes an acquisition failure (Promise rejects,
-                       Array.from/Set/Map propagate). */
-                    JS_FreeValue(ctx, method);
-                    /* NOT ON THE TRAMP YET: a GETTER @@iterator (or a Proxy trap) is user code, so a loop in it has
-                       no flow base. Every consumer's recognizer therefore still refuses a source whose @@iterator
-                       the side-effect-free probe cannot read, and this read only ever sees the absent /
-                       non-callable / nullish / primitive cases. Routing it through the property-get tramp is the
-                       build that removes those refusals; the first attempt broke the Promise
-                       iter-arg-is-{null,undefined,poisoned} and Iterator.from fallback paths, which share this
-                       code with a nullish and a primitive source. */
-                    method = JS_GetProperty(ctx, iterable, JS_ATOM_Symbol_iterator);
-                    if (JS_IsException(method)) {
+                JSValue probed = tramp_iter_getiter; tramp_iter_getiter = JS_UNDEFINED;
+                if (JS_IsFunction(ctx, probed)) {
+                    tramp_iter_getiter = probed;         /* the probe already read it, side-effect-free */
+                    goto do_consume_acquire_have_method;
+                }
+                JS_FreeValue(ctx, probed);
+                /* The probe DECLINED (a getter, a Proxy) or the value is absent / nullish / non-callable, so this is
+                   the REAL GetMethod: it must run through the ONE property-operation entry, because reading
+                   @@iterator can be user code with a loop in it. Everything that decides what the read MEANS —
+                   nullish, non-callable, the flattenable case — lives after it, at do_consume_acquire_have_method,
+                   so the abrupt and not-a-function paths are the same code whether the read suspended or not. That
+                   sharing is what the first attempt at this got wrong. */
+                {
+                    JSAcquireGet *ag = js_mallocz(ctx, sizeof(*ag));
+                    if (unlikely(!ag)) {
+                        JS_ThrowOutOfMemory(ctx);
                         tramp_consume_acquired = JS_EXCEPTION;
                         goto do_consume_deliver_iterator;
                     }
-                    if (!JS_IsFunction(ctx, method)) {   /* undefined/null/non-callable */
+                    ag->iterable = tramp_consume_iterable;
+                    ag->consumer = tramp_consume_state;
+                    ag->consumer_kind = tramp_consume_kind;
+                    tramp_consume_state = NULL; tramp_consume_kind = CONT_NONE;
+                    gp_outer = ag; gp_outer_kind = CONT_ACQUIRE_GET;
+                    gp_obj = ag->iterable; gp_atom = JS_ATOM_Symbol_iterator;
+                    gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                    goto do_getprop_tramp;
+                }
+            }
+
+        do_consume_acquire_have_method:
+            /* GetIterator with @@iterator IN HAND (tramp_iter_getiter), however it was obtained. */
+            {
+                JSValue method = tramp_iter_getiter; tramp_iter_getiter = JS_UNDEFINED;
+                JSValueConst iterable = tramp_consume_iterable;
+                if (!JS_IsFunction(ctx, method)) {
+                    /* undefined / null / non-callable — GetMethod's own outcomes, applied here so they read the
+                       same whether the read above suspended in a getter or not. A poisoned @@iterator never gets
+                       here: its throw is delivered to the consumer as an acquisition failure, which is what makes
+                       `Promise.all({get [Symbol.iterator](){throw e}})` reject with ITS error rather than with a
+                       synthesized "not iterable". */
+                    {
                         bool flattenable = (tramp_consume_kind == CONT_ITER_FROM);
                         bool nullish = JS_IsUndefined(method) || JS_IsNull(method);
                         JS_FreeValue(ctx, method);
@@ -23330,7 +23386,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         tramp_consume_acquired = JS_EXCEPTION;
                         goto do_consume_deliver_iterator;
                     }
-                    /* method is the real callable @@iterator — fall through to the generator-check + call below */
                 }
                 if (tramp_can_call_gen_create(method)) {
                     DCHECK(sp + 2 <= TRAMP_SP_LIMIT(sf),
@@ -25004,8 +25059,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JSGetProp *gp = rcs;
                     void *gouter = gp->outer;
                     uint8_t gouter_kind = gp->outer_kind;
-                    DCHECK(gouter_kind == CONT_STEP || gouter_kind == CONT_ITER_CONSUME,
+                    DCHECK(gouter_kind == CONT_STEP || gouter_kind == CONT_ITER_CONSUME
+                           || gouter_kind == CONT_ACQUIRE_GET,
                            "property-get outer continuation: unknown machine kind");
+                    if (gouter_kind == CONT_ACQUIRE_GET) {
+                        /* @@iterator has been read (the getter or trap ran on this chain). Restore the acquire's
+                           locals from the continuation — they cannot live in interpreter locals across a
+                           suspension, which is the other thing the first attempt at this got wrong — and re-enter
+                           with the method in hand. An abrupt read is an ACQUISITION failure, so it goes to the
+                           consumer's deliver arm, not to a property-get unwind. */
+                        JSAcquireGet *ag = gouter;
+                        if (!JS_IsUndefined(gp->target)) ret_val = js_proxy_get_invariant(ctx, gp->target, gp->atom, ret_val);
+                        js_getprop_free(ctx, gp);
+                        tramp_consume_state = ag->consumer;
+                        tramp_consume_kind = ag->consumer_kind;
+                        tramp_consume_iterable = ag->iterable;
+                        js_free_rt(rt, ag);
+                        if (unlikely(JS_IsException(ret_val))) {
+                            tramp_consume_acquired = JS_EXCEPTION;
+                            goto do_consume_deliver_iterator;
+                        }
+                        tramp_iter_getiter = ret_val;
+                        goto do_consume_acquire_have_method;
+                    }
                     if (gp->op == GP_HAS) {
                         /* the `has` trap's boolean, then the target's [[HasProperty]] invariant on it */
                         int hres = js_proxy_has_invariant(ctx, gp->target, gp->atom, JS_ToBoolFree(ctx, ret_val));
@@ -28669,9 +28745,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JSGetProp *gp = xcs;
             void *gouter = gp->outer;
             uint8_t gk2 = gp->outer_kind;
-            DCHECK(!gouter || gk2 == CONT_STEP || gk2 == CONT_ITER_CONSUME,
+            DCHECK(!gouter || gk2 == CONT_STEP || gk2 == CONT_ITER_CONSUME || gk2 == CONT_ACQUIRE_GET,
                    "property-get outer continuation: unknown machine kind");
             js_getprop_free(ctx, gp);
+            if (gouter && gk2 == CONT_ACQUIRE_GET) {
+                /* a POISONED @@iterator getter: the consumer is waiting on an ACQUISITION, so the throw is
+                   delivered as one rather than unwound here — that is what makes the aggregate reject with the
+                   getter's own error. The exception is left pending and picked up by the deliver arm. */
+                JSAcquireGet *ag = gouter;
+                tramp_consume_state = ag->consumer;
+                tramp_consume_kind = ag->consumer_kind;
+                tramp_consume_iterable = ag->iterable;
+                js_free_rt(rt, ag);
+                tramp_consume_acquired = JS_EXCEPTION;
+                goto do_consume_deliver_iterator;
+            }
             if (gouter && gk2 == CONT_ITER_CONSUME) {
                 /* the entry's accessor threw: IfAbruptCloseIterator still owes the source a close, and the machine
                    that asked for the read can never be re-entered — abandon does both. */
