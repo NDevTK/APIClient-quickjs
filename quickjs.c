@@ -51397,11 +51397,11 @@ static bool tramp_can_call_objentries_consume(JSContext *ctx, JSValueConst func,
     if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
     if (fp->u.cfunc.cproto != JS_CFUNC_generic) return false;
     if (fp->u.cfunc.c_function.generic != js_object_fromEntries) return false;
-    if (JS_VALUE_GET_TAG(call_argv[0]) != JS_TAG_OBJECT) return false;
-    /* ANY callable @@iterator, not just a generator-backed one. The gen-backed narrowing is what hands every
-       other iterable to the live C loop in js_object_fromEntries — i.e. it is the fallback selector, and it has
-       to go before that loop can be deleted. Broadened here FIRST, alone, so whatever semantics the consume
-       machinery does not yet reproduce shows up as this consumer's failures rather than twelve mixed ones. */
+    /* ANY callable @@iterator, not just a generator-backed one, and on a PRIMITIVE source too — iter_data_at_iterator
+       boxes it for the walk, so `Object.fromEntries("ab")` reaches the same consumer as an array does. Each
+       narrowing here is a case silently handed to the live C loop in js_object_fromEntries, which is what has to
+       go before that loop can be deleted. Widened ONE step at a time so a failure names the missing capability
+       instead of producing a mixed count. */
     if (!iter_data_at_iterator(ctx, call_argv[0], out_getiter)) return false;
     if (JS_IsFunction(ctx, *out_getiter)) return true;
     JS_FreeValue(ctx, *out_getiter); *out_getiter = JS_UNDEFINED;
