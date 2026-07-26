@@ -1443,7 +1443,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_TA_JOIN, STEPDEF_TA_TOLOCALESTRING,
     STEPDEF_BIGINT_ASUINTN, STEPDEF_BIGINT_ASINTN,
     STEPDEF_OBJ_GOPD, STEPDEF_REFLECT_GOPD,
-    STEPDEF_OBJ_VALUES, STEPDEF_OBJ_ENTRIES,
+    STEPDEF_OBJ_VALUES, STEPDEF_OBJ_ENTRIES, STEPDEF_OBJ_ASSIGN,
     STEPDEF_REGEXP_EXEC, STEPDEF_REGEXP_TEST,
     STEPDEF_ITER_TAKE, STEPDEF_ITER_DROP,
     STEPDEF_FUNCTION_CTOR, STEPDEF_GENERATOR_FUNCTION_CTOR,
@@ -19851,15 +19851,17 @@ typedef struct JSArrayAt {
    fallback this could absorb — the same split as an array-like versus an iterable. */
 typedef struct JSPropWalk {
     JSStepHdr hdr;          /* MUST be first: the generic step driver casts the state to JSStepHdr * */
-    JSValue obj;            /* ToObject(argv[0]) (owned) */
-    JSValue result;         /* the array being built (owned) */
+    JSValue obj;            /* ToObject of the source currently being walked (owned) */
+    JSValue result;         /* the array being built, or ASSIGN's target (owned) */
     JSValue el;             /* the value a read produced, held across its suspension (owned) */
-    JSPropertyEnum *atoms;  /* the own-key snapshot (owned) */
+    JSPropertyEnum *atoms;  /* the own-key snapshot of THIS source (owned) */
     uint32_t len;           /* how many keys the snapshot holds */
     uint32_t i, j;          /* the key cursor and the output cursor — they diverge, keys can be skipped */
+    int src_i;              /* ASSIGN walks every argument after the target; the others have one source */
 } JSPropWalk;
 #define PROPWALK_VALUES  0
 #define PROPWALK_ENTRIES 1
+#define PROPWALK_ASSIGN  2   /* Object.assign(target, ...sources): the same read per key, written to the target */
 
 /* indexOf / lastIndexOf / includes: ONE machine, three modes. They differ only in the search direction, the
    fromIndex clamp and the equality (strict vs SameValueZero); the part that had to change is the same in all
@@ -50081,7 +50083,8 @@ done:
 static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSPropWalk *s = st;
-    int entries = (s->hdr.arg == PROPWALK_ENTRIES);
+    int mode = s->hdr.arg;
+    int assign = (mode == PROPWALK_ASSIGN);
     int r;
 
     if (s->hdr.stage == 0) {
@@ -50090,43 +50093,63 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
            handed over late is a leak and a buffer initialised late is freed with a NULL context. */
         s->obj = JS_UNDEFINED; s->result = JS_UNDEFINED; s->el = JS_UNDEFINED;
         s->atoms = NULL; s->len = 0; s->i = 0; s->j = 0;
-        s->obj = JS_ToObject(ctx, step_arg(&s->hdr, 0));
-        if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
-        /* the snapshot is taken WITHOUT JS_GPN_ENUM_ONLY and each key's enumerability re-checked below, because
-           the reads run between the snapshot and the check and one of them can redefine a later key. */
-        if (JS_GetOwnPropertyNamesInternal(ctx, &s->atoms, &s->len, JS_VALUE_GET_OBJ(s->obj),
-                                           JS_GPN_STRING_MASK)) {
-            s->atoms = NULL; s->len = 0;
-            return -1;
-        }
-        s->result = JS_NewArray(ctx);
+        s->src_i = assign ? 1 : 0;
+        /* 20.1.2.1 step 1 / 7.3.23 step 1: ToObject the target (assign) or the sole source, and it is what the
+           machine RETURNS in the assign case, so it goes in `result`. */
+        s->result = assign ? JS_ToObject(ctx, step_arg(&s->hdr, 0)) : JS_NewArray(ctx);
         if (JS_IsException(s->result)) { s->result = JS_UNDEFINED; return -1; }
         s->hdr.stage = 1;
     }
     for (;;) {
         if (s->hdr.stage == 1) {
-            int desc_flags, res;
-            if (s->i >= s->len) {
+            /* open the next SOURCE. assign has argc-1 of them and skips the nullish ones (step 3.a); the others
+               have exactly one, argv[0]. */
+            JSValueConst src;
+            if (assign && s->src_i >= s->hdr.argc) { JS_FreeValue(ctx, cb_result); return 0; }
+            src = step_arg(&s->hdr, s->src_i);
+            if (assign && (JS_IsNull(src) || JS_IsUndefined(src))) { s->src_i++; continue; }
+            s->obj = JS_ToObject(ctx, src);
+            if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; JS_FreeValue(ctx, cb_result); return -1; }
+            /* the snapshot is taken WITHOUT JS_GPN_ENUM_ONLY and each key's enumerability re-checked below,
+               because the reads run between the snapshot and the check and one of them can redefine a later key.
+               assign copies SYMBOL keys too — its key list is [[OwnPropertyKeys]], not just the string ones. */
+            if (JS_GetOwnPropertyNamesInternal(ctx, &s->atoms, &s->len, JS_VALUE_GET_OBJ(s->obj),
+                                               JS_GPN_STRING_MASK | (assign ? JS_GPN_SYMBOL_MASK : 0))) {
+                s->atoms = NULL; s->len = 0;
                 JS_FreeValue(ctx, cb_result);
-                return 0;   /* DONE: fini hands back s->result */
+                return -1;
             }
+            s->i = 0;
+            s->hdr.stage = 2;
+        }
+        if (s->hdr.stage == 2) {
+            int desc_flags, res;
+            if (s->i >= s->len) { s->hdr.stage = 4; goto source_done; }
             res = JS_GetOwnPropertyFlagsInternal(ctx, &desc_flags, JS_VALUE_GET_OBJ(s->obj),
                                                  s->atoms[s->i].atom);
             if (res < 0) { JS_FreeValue(ctx, cb_result); return -1; }
             if (!res || !(desc_flags & JS_PROP_ENUMERABLE)) { s->i++; continue; }
-            s->hdr.stage = 2;
+            s->hdr.stage = 3;
         }
-        if (s->hdr.stage == 2) {
+        if (s->hdr.stage == 3) {
             r = step_getprop_run(ctx, &s->hdr, s->obj, s->atoms[s->i].atom, cb_result,
                                  &s->el, out_cb, out_argc);
             cb_result = JS_UNDEFINED;
             if (r) return r < 0 ? -1 : r;
-            s->hdr.stage = 3;
+            s->hdr.stage = 5;
         }
-        if (s->hdr.stage == 3) {
+        if (s->hdr.stage == 5) {
             JSValue item = s->el;
             s->el = JS_UNDEFINED;   /* the state no longer owns it: every path below consumes it */
-            if (entries) {
+            if (assign) {
+                /* 20.1.2.1 step 3.a.iii.2: Set(to, nextKey, propValue, true). A SETTER or a Proxy `set` trap on
+                   the TARGET is user code and this reaches it from C — the one edge of this walk that is still a
+                   drive-to-completion, and it aborts loud there rather than being papered over. It wants the
+                   keyed-WRITE step primitive that GETPROP is the read half of. */
+                int sret = JS_SetPropertyInternal2(ctx, s->result, s->atoms[s->i].atom, item,
+                                                  s->result, JS_PROP_THROW);
+                if (sret < 0) return -1;
+            } else if (mode == PROPWALK_ENTRIES) {
                 JSValue pair = JS_NewArray(ctx), key;
                 if (JS_IsException(pair)) { JS_FreeValue(ctx, item); return -1; }
                 key = JS_AtomToValue(ctx, s->atoms[s->i].atom);
@@ -50137,11 +50160,24 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
                 if (JS_CreateDataPropertyUint32(ctx, pair, 1, item, JS_PROP_THROW) < 0) {
                     JS_FreeValue(ctx, pair); return -1;   /* item was consumed by the failing call */
                 }
-                item = pair;
+                if (JS_CreateDataPropertyUint32(ctx, s->result, s->j++, pair, 0) < 0)
+                    return -1;
+            } else {
+                if (JS_CreateDataPropertyUint32(ctx, s->result, s->j++, item, 0) < 0)
+                    return -1;
             }
-            if (JS_CreateDataPropertyUint32(ctx, s->result, s->j++, item, 0) < 0)
-                return -1;
             s->i++;
+            s->hdr.stage = 2;
+        }
+        if (s->hdr.stage == 4) {
+        source_done:
+            /* this source is exhausted: release its snapshot before the next one replaces it (the teardown frees
+               only what the state currently holds, so overwriting either field without freeing it leaks). */
+            js_free_prop_enum(ctx, s->atoms, s->len);
+            s->atoms = NULL; s->len = 0;
+            JS_FreeValue(ctx, s->obj); s->obj = JS_UNDEFINED;
+            if (!assign) { JS_FreeValue(ctx, cb_result); return 0; }
+            s->src_i++;
             s->hdr.stage = 1;
         }
     }
@@ -50434,34 +50470,6 @@ static JSValue js_object_toLocaleString(JSContext *ctx, JSValueConst this_val,
                                         int argc, JSValueConst *argv)
 {
     return JS_Invoke(ctx, this_val, JS_ATOM_toString, 0, NULL);
-}
-
-static JSValue js_object_assign(JSContext *ctx, JSValueConst this_val,
-                                int argc, JSValueConst *argv)
-{
-    // Object.assign(obj, source1)
-    JSValue obj, s;
-    int i;
-
-    s = JS_UNDEFINED;
-    obj = JS_ToObject(ctx, argv[0]);
-    if (JS_IsException(obj))
-        goto exception;
-    for (i = 1; i < argc; i++) {
-        if (!JS_IsNull(argv[i]) && !JS_IsUndefined(argv[i])) {
-            s = JS_ToObject(ctx, argv[i]);
-            if (JS_IsException(s))
-                goto exception;
-            if (JS_CopyDataProperties(ctx, obj, s, JS_UNDEFINED, true))
-                goto exception;
-            JS_FreeValue(ctx, s);
-        }
-    }
-    return obj;
-exception:
-    JS_FreeValue(ctx, obj);
-    JS_FreeValue(ctx, s);
-    return JS_EXCEPTION;
 }
 
 static JSValue js_object_seal(JSContext *ctx, JSValueConst this_val,
@@ -50801,7 +50809,7 @@ static const JSCFunctionListEntry js_object_funcs[] = {
     JS_CFUNC_STEP_DEF("getOwnPropertyDescriptor", 2, STEPDEF_OBJ_GOPD ),
     JS_CFUNC_DEF("getOwnPropertyDescriptors", 1, js_object_getOwnPropertyDescriptors ),
     JS_CFUNC_DEF("is", 2, js_object_is ),
-    JS_CFUNC_DEF("assign", 2, js_object_assign ),
+    JS_CFUNC_STEP_DEF("assign", 2, STEPDEF_OBJ_ASSIGN ),
     JS_CFUNC_MAGIC_DEF("seal", 1, js_object_seal, 0 ),
     JS_CFUNC_MAGIC_DEF("freeze", 1, js_object_seal, 1 ),
     JS_CFUNC_MAGIC_DEF("isSealed", 1, js_object_isSealed, 0 ),
@@ -53475,6 +53483,7 @@ static const JSTrampStepDef js_ta_join_def        = { sizeof(JSArrayJoin), js_ar
 static const JSTrampStepDef js_ta_tolocale_def    = { sizeof(JSArrayJoin), js_array_join_step, js_array_join_fini, JOIN_TA_LOCALE };
 static const JSTrampStepDef js_obj_values_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_VALUES };
 static const JSTrampStepDef js_obj_entries_def    = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_ENTRIES };
+static const JSTrampStepDef js_obj_assign_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_ASSIGN };
 #define PRIMARGS_DEF_FULL(spec, proto, fn, magic, pre, mid, err) \
     { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, (spec), { .proto = (fn) }, JS_CFUNC_##proto, (magic), (pre), (mid), (err) }
 #define PRIMARGS_DEF(spec, proto, fn, magic)                PRIMARGS_DEF_FULL(spec, proto, fn, magic, NULL, NULL, NULL)
@@ -53575,6 +53584,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_OBJ_GOPD]        = &js_obj_gopd_def,
     [STEPDEF_OBJ_VALUES]      = &js_obj_values_def,
     [STEPDEF_OBJ_ENTRIES]     = &js_obj_entries_def,
+    [STEPDEF_OBJ_ASSIGN]      = &js_obj_assign_def,
     [STEPDEF_REFLECT_GOPD]    = &js_reflect_gopd_def,
     [STEPDEF_ITER_TAKE]       = &js_iter_take_def,
     [STEPDEF_ITER_DROP]       = &js_iter_drop_def,
