@@ -20867,6 +20867,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        TypedArray, so `class S extends Int8Array {}` reached the C entry. */
     JSValueConst *tac_args = NULL; int tac_argc = 0, tac_cfirst = -2;
     JSValueConst tac_ntgt = JS_UNDEFINED;
+    JSValue tac_super_ref = JS_UNDEFINED;   /* the super() entry's owned parent-class ref; the state frees it */
     uint8_t setop_kind = 0;                             /* s.union/symmetricDifference recognition: SETOP_* (consumed by do_setop_consume_tramp) */
     uint8_t icons_sink = ITERCONS_FROM;                 /* which builtin do_iter_consume_tramp is serving: ITERCONS_FROM (Array.from) or ITERCONS_SUMPRECISE (Math.sumPrecise) */
     /* APPLY-mode body entry: f.apply(this,arr) / Reflect.apply(f,this,arr) / f(...spread). The args come from the
@@ -21537,13 +21538,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc += 2;
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
-                if (tramp_can_construct(call_argv[-2])) {   /* bytecode ctor -> body on THIS chain (loop preempts base) */
-                    con_func = call_argv[-2]; con_ntgt = call_argv[-1];
-                    con_args = vc(call_argv); con_argc = call_argc;
-                    con_from_super = 0; con_super_ref = JS_UNDEFINED;
-                    tramp_first = -2; tramp_is_tail = 0;
-                    goto do_construct_tramp;
-                }
                 if (JS_VALUE_GET_TAG(call_argv[-2]) == JS_TAG_OBJECT
                     && JS_VALUE_GET_OBJ(call_argv[-2])->class_id == JS_CLASS_BOUND_FUNCTION) {
                     /* `new (String.bind(null))(x)`: 10.4.1.2 constructs the ULTIMATE target with the flattened
@@ -21590,20 +21584,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         ret_val = JS_UNDEFINED;
                         goto do_step_step;
                     }
-                }
-                if (tramp_can_call_setmap_consume(ctx, call_argv[-2], vc(call_argv), call_argc, &smc_magic, &tramp_iter_getiter)) {   /* new Set/Map(iterable) -> GetIterator + consume on THIS chain */
-                    smc_ntgt = call_argv[-1]; smc_items = call_argv[0];
-                    smc_cfirst = -2; smc_cargc = call_argc; smc_super_ref = JS_UNDEFINED;
-                    tramp_is_tail = 0; goto do_setmap_consume_tramp;
-                }
-                if (tramp_can_call_ta_consume(ctx, call_argv[-2], vc(call_argv), call_argc, &ta_classid, &tramp_iter_getiter)) {   /* new TypedArray(iterable) -> collect on THIS chain */
-                    tac_args = vc(call_argv); tac_argc = call_argc; tac_ntgt = call_argv[-1]; tac_cfirst = -2;
-                    tramp_is_tail = 0; goto do_ta_consume_tramp;
-                }
-                if (tramp_can_call_promise_exec(ctx, call_argv[-2], vc(call_argv), call_argc)) {   /* new Promise(fn) -> executor body on THIS chain */
-                    pe_ntgt = call_argv[-1]; pe_executor = call_argv[0];
-                    pe_cfirst = -2; pe_cargc = call_argc; pe_super_ref = JS_UNDEFINED; pe_executor_own = JS_UNDEFINED;
-                    tramp_is_tail = 0; goto do_promise_exec_tramp;
                 }
                 if (JS_VALUE_GET_TAG(call_argv[-2]) == JS_TAG_OBJECT
                     && JS_VALUE_GET_OBJ(call_argv[-2])->class_id == JS_CLASS_C_FUNCTION
@@ -21653,27 +21633,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         tramp_cont_state = NULL; tramp_cont_kind = CONT_PROXY_CONSTRUCT;
                         goto do_tramp_call;
                     }
-                    /* px_ret == 0: the resolved callee (possibly a target reached through no-trap proxies) has no
-                       preemptible trap body — fall through to the C construct below, which re-reads call_argv[-2]. */
-                    if (tramp_can_construct(call_argv[-2])) {
-                        con_func = call_argv[-2]; con_ntgt = call_argv[-1];
-                        con_args = vc(call_argv); con_argc = call_argc;
-                        con_from_super = 0; con_super_ref = JS_UNDEFINED;
-                        tramp_first = -2; tramp_is_tail = 0;
-                        goto do_construct_tramp;   /* a bytecode ctor behind a trapless proxy still runs here */
-                    }
+                    /* px_ret == 0: the callee resolved through the no-trap proxies is whatever it is — a
+                       bytecode ctor, a consumer builtin, a plain C one. The dispatch below answers that, so the
+                       resolution does not need its own copy of the question and a consumer behind a trapless
+                       proxy stops falling to a C entry. */
                 }
-                ret_val = JS_CallConstructorInternal(ctx, call_argv[-2],
-                                                     call_argv[-1], call_argc,
-                                                     vc(call_argv), 0);
-                if (unlikely(JS_IsException(ret_val)))
-                    goto exception;
-                for(i = -2; i < call_argc; i++)
-                    JS_FreeValue(ctx, call_argv[i]);
-                sp -= call_argc + 2;
-                *sp++ = ret_val;
+                con_func = call_argv[-2]; con_ntgt = call_argv[-1];
+                con_args = vc(call_argv); con_argc = call_argc;
+                con_from_super = 0; con_super_ref = JS_UNDEFINED;
+                tramp_first = -2; tramp_is_tail = 0;
+                goto do_construct_dispatch;
             }
-            BREAK;
         CASE(OP_call_method):
         CASE(OP_tail_call_method):
             {
@@ -22196,6 +22166,54 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 sp += cfirst - cargc;
                 if (itail) { ret_val = r; goto do_return; }
                 *sp++ = r;
+            }
+            BREAK;
+
+        do_construct_dispatch:
+            /* THE construct-side consumer chain, asked in ONE place. Two operand SHAPES reach it, exactly as the
+               call side has two: `new C(x)` with [func, new_target, args] on the caller stack (tramp_first == -2)
+               and super(x) with the derived frame's argv and nothing to pop (tramp_first == 0). The arms take that
+               shape rather than reading the stack, which is what lets one chain serve both.
+               Written out per site it had already drifted: OP_init_ctor's copy knew Map/Set and Promise but not
+               TypedArray, so `class S extends Int8Array {}` reached a C entry the routed spelling never touches —
+               one builtin answering differently depending on how the construct was spelled.
+               Inputs: con_func, con_ntgt, con_args/con_argc, con_super_ref (owned; transferred to whichever arm
+               matches), con_from_super, tramp_first, tramp_is_tail. */
+            {
+                int con_cargc = tramp_first ? con_argc : 0;   /* what the arm has to POP, which is nothing for super() */
+                if (tramp_can_construct(con_func))
+                    goto do_construct_tramp;                  /* a bytecode ctor: its body runs on this chain */
+                if (tramp_can_call_setmap_consume(ctx, con_func, con_args, con_argc, &smc_magic, &tramp_iter_getiter)) {
+                    smc_ntgt = con_ntgt; smc_items = (con_argc > 0) ? con_args[0] : JS_UNDEFINED;
+                    smc_cfirst = tramp_first; smc_cargc = con_cargc;
+                    smc_super_ref = con_super_ref; con_super_ref = JS_UNDEFINED;
+                    tramp_is_tail = 0; goto do_setmap_consume_tramp;
+                }
+                if (tramp_can_call_ta_consume(ctx, con_func, con_args, con_argc, &ta_classid, &tramp_iter_getiter)) {
+                    tac_args = con_args; tac_argc = con_argc; tac_ntgt = con_ntgt; tac_cfirst = tramp_first;
+                    tac_super_ref = con_super_ref; con_super_ref = JS_UNDEFINED;
+                    tramp_is_tail = 0; goto do_ta_consume_tramp;
+                }
+                if (tramp_can_call_promise_exec(ctx, con_func, con_args, con_argc)) {
+                    pe_ntgt = con_ntgt; pe_executor = con_args[0];
+                    pe_cfirst = tramp_first; pe_cargc = con_cargc; pe_executor_own = JS_UNDEFINED;
+                    pe_super_ref = con_super_ref; con_super_ref = JS_UNDEFINED;
+                    tramp_is_tail = 0; goto do_promise_exec_tramp;
+                }
+                /* No arm matched: a C constructor with no body to suspend. The cleanup is fully determined by the
+                   operand shape, which is why these were two blocks. */
+                if (tramp_first == -2) {
+                    ret_val = JS_CallConstructorInternal(ctx, con_func, con_ntgt, con_argc, con_args, 0);
+                    if (unlikely(JS_IsException(ret_val))) goto exception;   /* operands freed by the unwind */
+                    for (i = -2; i < con_argc; i++) JS_FreeValue(ctx, ((JSValue *)con_args)[i]);
+                    sp -= con_argc + 2;
+                } else {
+                    DCHECK(tramp_first == 0, "a construct shape with no stack operands cannot also pop them");
+                    ret_val = JS_CallConstructor2(ctx, con_func, con_ntgt, con_argc, con_args);
+                    JS_FreeValue(ctx, con_super_ref); con_super_ref = JS_UNDEFINED;
+                    if (unlikely(JS_IsException(ret_val))) goto exception;
+                }
+                *sp++ = ret_val;
             }
             BREAK;
 
@@ -23739,6 +23757,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 s->k = 0;
                 s->sink = ITERCONS_FROM;
+                s->super_ref = tac_super_ref; tac_super_ref = JS_UNDEFINED;
                 s->orig_cfirst = tac_cfirst; s->orig_cargc = (tac_cfirst ? ta_argc : 0); s->orig_is_tail = tramp_is_tail;
                 DCHECK(ta_argc >= 1, "the TypedArray consume arm reads its source; the recognizers refuse argc 0");
                 tramp_consume_iterable = ta_argv[0]; tramp_consume_state = s; tramp_consume_kind = CONT_ITER_CONSUME;
@@ -25416,24 +25435,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 super = JS_GetPrototype(ctx, sf->cur_func);
                 if (JS_IsException(super))
                     goto exception;
-                if (tramp_can_construct(super)) {   /* bytecode super -> body on THIS chain (loop preempts base) */
-                    con_func = super; con_ntgt = new_target;
-                    con_args = argv; con_argc = argc;
-                    con_from_super = 1; con_super_ref = super;   /* owned; freed in the CONT_CONSTRUCT return/unwind */
-                    tramp_first = 0; tramp_is_tail = 0;   /* caller_sp = current sp: super() pushes its object there */
-                    goto do_construct_tramp;
-                }
-                if (tramp_can_call_setmap_consume(ctx, super, argv, argc, &smc_magic, &tramp_iter_getiter)) {
-                    /* super(iterable) into the Map/Set constructor from a subclass: same builtin, same walk.
-                       NewTarget stays the DERIVED class so the result gets the subclass prototype; the args
-                       are the derived frame's argv (nothing on the caller stack to pop); `super` is an owned
-                       ref the continuation frees. Without this the spelling reached the C entry, whose loop
-                       is deleted — the DFAIL that left Set/prototype/difference/subclass* red. */
-                    smc_ntgt = new_target; smc_items = (argc > 0) ? argv[0] : JS_UNDEFINED;
-                    smc_cfirst = 0; smc_cargc = 0; smc_super_ref = super;
-                    tramp_first = 0; tramp_is_tail = 0;
-                    goto do_setmap_consume_tramp;
-                }
                 {
                     const JSTrampStepDef *sd = tramp_step_def_of(super);
                     if (sd && JS_VALUE_GET_OBJ(super)->u.cfunc.cproto == JS_CFUNC_step_ctor) {
@@ -25454,24 +25455,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         goto do_step_step;
                     }
                 }
-                if (tramp_can_call_promise_exec(ctx, super, argv, argc)) {
-                    /* super(fn) into the Promise constructor from a subclass: same builtin, same 27.2.3.1 steps —
-                       run the executor on THIS chain too. NewTarget stays the DERIVED class (so the promise gets the
-                       subclass prototype), the args are the derived frame's argv (nothing on the caller stack to
-                       pop), and `super` is an owned ref the continuation frees at finish. The promise super()
-                       yields is pushed at the current sp, exactly as the JS_CallConstructor2 path below does. */
-                    pe_ntgt = new_target; pe_executor = argv[0];
-                    pe_cfirst = 0; pe_cargc = 0; pe_super_ref = super; pe_executor_own = JS_UNDEFINED;
-                    tramp_first = 0; tramp_is_tail = 0;
-                    goto do_promise_exec_tramp;
-                }
-                ret = JS_CallConstructor2(ctx, super, new_target, argc, argv);
-                JS_FreeValue(ctx, super);
-                if (JS_IsException(ret))
-                    goto exception;
-                *sp++ = ret;
+                /* super(x) is the SECOND construct operand shape: NewTarget stays the DERIVED class so the
+                   result gets the subclass prototype, the arguments are the derived frame's argv, and nothing
+                   sits on the caller stack to pop. `super` is an owned ref, transferred to whichever arm the
+                   shared chain picks. */
+                con_func = super; con_ntgt = new_target;
+                con_args = argv; con_argc = argc;
+                con_from_super = 1; con_super_ref = super;
+                tramp_first = 0; tramp_is_tail = 0;
+                goto do_construct_dispatch;
             }
-            BREAK;
         CASE(OP_check_brand):
             {
                 int ret = JS_CheckBrand(ctx, sp[-2], sp[-1]);
