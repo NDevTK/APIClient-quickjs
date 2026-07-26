@@ -4065,12 +4065,14 @@ static JSValue JS_AtomIsNumericIndex1(JSContext *ctx, JSAtom atom)
             if (c == '0' && len == 2)
                 goto minus_zero;
         }
-        /* XXX: should test NaN, but the tests do not check it */
         if (!is_num(c)) {
             /* XXX: String should be normalized, therefore 8-bit only */
             const uint16_t nfinity16[7] = { 'n', 'f', 'i', 'n', 'i', 't', 'y' };
+            const uint16_t aN16[2] = { 'a', 'N' };
             if (!(c =='I' && (r_end - r) == 8 &&
-                  !memcmp(r + 1, nfinity16, sizeof(nfinity16))))
+                  !memcmp(r + 1, nfinity16, sizeof(nfinity16))) &&
+                !(c =='N' && (r_end - r) == 3 &&
+                  !memcmp(r + 1, aN16, sizeof(aN16))))
                 return JS_UNDEFINED;
         }
     } else {
@@ -4091,10 +4093,16 @@ static JSValue JS_AtomIsNumericIndex1(JSContext *ctx, JSAtom atom)
         }
         if (!is_num(c)) {
             if (!(c =='I' && (r_end - r) == 8 &&
-                  !memcmp(r + 1, "nfinity", 7)))
+                  !memcmp(r + 1, "nfinity", 7)) &&
+                !(c =='N' && (r_end - r) == 3 &&
+                  !memcmp(r + 1, "aN", 2)))
                 return JS_UNDEFINED;
         }
     }
+    /* This prefix test only FILTERS; the round-trip below decides. CanonicalNumericIndexString accepts exactly
+       the spellings ToString(ToNumber(P)) reproduces, so besides digits and a leading '-' the non-finite
+       spellings "Infinity" and "NaN" both qualify — a typed array therefore treats obj["NaN"] as an
+       (always invalid) integer index, not as a normal named property. */
     /* this is ECMA CanonicalNumericIndexString primitive */
     num = JS_ToNumber(ctx, JS_MKPTR(JS_TAG_STRING, p));
     if (JS_IsException(num))
@@ -10831,6 +10839,15 @@ retry:
                         if (ret < 0)
                             goto fail;
                     typed_array_oob:
+                        /* 10.4.5.5 [[Set]](P, V, Receiver) with a canonical numeric index that is NOT a valid
+                           index. Step 1 (O and Receiver are the SAME object) runs TypedArraySetElement, which
+                           coerces V and then discards it. Step 2 (a DIFFERENT receiver) returns true outright
+                           — V is never read, so coercing it here fabricated an observable side effect and, for
+                           a plain receiver, a property the spec never creates. */
+                        if (p != p1) {
+                            JS_FreeValue(ctx, val);
+                            return true;
+                        }
                         // per spec: evaluate value for side effects
                         if (p1->class_id == JS_CLASS_BIG_INT64_ARRAY ||
                             p1->class_id == JS_CLASS_BIG_UINT64_ARRAY) {
@@ -19624,6 +19641,11 @@ typedef struct JSAsyncFromSync {
     uint8_t deliver;             /* AFS_* — WHERE the settle puts the wrapper's promise. The three entry opcodes
                                     differ only in that, so the drive and the settle are shared and this selects
                                     the tail. */
+    uint8_t close_on_rejection;  /* 27.1.4.4's closeOnRejection argument: true for .next/.throw, false for
+                                    .return (which has already closed the sync iterator). */
+    JSValue pending_error;       /* set (owned) only while step 6's IteratorClose is running on the chain: the
+                                    abrupt step-5 completion that step 4 makes the result no matter what the
+                                    close does. UNINITIALIZED otherwise. */
 } JSAsyncFromSync;
 /* CALL: OP_call_method on wrapper.next(v) — pop the call operands, push the promise.
    CLOSE: OP_iterator_close — the promise is never awaited: discard it and pop the iterator operand (sp[-1]).
@@ -19636,6 +19658,8 @@ enum { AFS_DELIVER_CALL = 0, AFS_DELIVER_CLOSE, AFS_DELIVER_ITERNEXT, AFS_DELIVE
 static JSValue js_promise_resolve(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
 static __exception int perform_promise_then(JSContext *ctx, JSValueConst promise, JSValueConst *resolve_reject, JSValueConst *cap_resolving_funcs);
 static JSValue js_async_from_sync_iterator_unwrap_func_create(JSContext *ctx, bool done);
+static int js_async_from_sync_continuation(JSContext *ctx, JSValueConst sync_iter, JSValue value, int done,
+                                           bool close_on_rejection, JSValueConst *resolving_funcs);
 static void js_async_from_sync_end(JSContext *ctx, struct JSAsyncFromSync *s);
 static JSValue js_async_from_sync_iterator_next(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
 static JSValue js_promise_all(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
@@ -22410,6 +22434,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     cd_outer = NULL; cd_outer_kind = CONT_NONE;
                     goto do_step_tramp;
                 }
+                {
+                    int gmag = tramp_gen_method_magic(call_argv[-1], call_argv[-2]);
+                    if (gmag >= 0) {
+                        /* the callee is a GENERATOR's own .next/.return/.throw: the body is a coroutine that must
+                           run on THIS chain so a loop or a `finally` in it suspends. Calling it in place is
+                           js_generator_next's DFAIL. cont_consume mode is the exact fit — it leaves the caller
+                           stack untouched and takes the generator from the state, which is where a sequence's
+                           operands already live. */
+                        tramp_cont_state = cd_outer; tramp_cont_kind = cd_outer_kind;
+                        tramp_gen_cont_iter = call_argv[-2];
+                        tramp_gen_cont_arg = (call_argc >= 1) ? call_argv[0] : JS_UNDEFINED;
+                        tramp_gen_cont_consume = 1; tramp_gen_magic = gmag;
+                        cd_outer = NULL; cd_outer_kind = CONT_NONE;
+                        goto do_generator_tramp;
+                    }
+                }
                 /* a C/bound callee has no preemptible body, so running it inline suspends nothing — the sequence
                    still owns its state, so it stays parkable between calls. */
                 {
@@ -23482,7 +23522,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (JS_IsException(prom)) { js_free_rt(rt, s); goto exception; }
                 s->promise = prom;
                 s->sync_iter = js_dup(ws->sync_iter);
+                s->pending_error = JS_UNINITIALIZED;
                 s->deliver = afs_mode;
+                /* .return() passes closeOnRejection=false (27.1.4.2.3 step 11): it has already asked the sync
+                   iterator to close, so neither step 6 nor step 14 may close it again. .next()/.throw() pass
+                   true. AFS_DELIVER_CLOSE is OP_iterator_close driving the wrapper's own .return(). */
+                s->close_on_rejection = !(afs_close ||
+                                          (afs_mode == AFS_DELIVER_ITERCALL &&
+                                           afs_iter_magic == GEN_MAGIC_RETURN));
                 if (afs_close) { s->orig_cfirst = -1; s->orig_cargc = 0; s->orig_is_tail = 0; }
                 else if (afs_mode == AFS_DELIVER_ITERNEXT || afs_mode == AFS_DELIVER_ITERCALL) { s->orig_cfirst = 0; s->orig_cargc = 0; s->orig_is_tail = 0; }
                 else { s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail; }
@@ -23544,24 +23591,46 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 JSAsyncFromSync *s = (JSAsyncFromSync *)cont_st;
                 JSValue giter = ret_val;
-                JSValue value, done_val, value_wrapper, unwrap;
-                int done;
-                done_val = JS_GetProperty(ctx, giter, JS_ATOM_done);
-                if (JS_IsException(done_val)) { JS_FreeValue(ctx, giter); goto async_from_sync_reject; }
-                done = JS_ToBoolFree(ctx, done_val);
-                value = JS_GetProperty(ctx, giter, JS_ATOM_value);
+                JSValue value;
+                int done, rcont;
+                if (!JS_IsUninitialized(s->pending_error)) {
+                    /* the step-6 close ran on this chain (below) and has now settled; step 4 says the ORIGINAL
+                       abrupt completion is the result, so whatever the close produced is discarded. */
+                    JS_FreeValue(ctx, giter);
+                    JS_Throw(ctx, s->pending_error);
+                    s->pending_error = JS_UNINITIALIZED;
+                    goto async_from_sync_reject;
+                }
+                done = JS_IteratorComplete(ctx, giter);                     /* steps 1-2 */
+                if (done < 0) { JS_FreeValue(ctx, giter); goto async_from_sync_reject; }
+                value = JS_GetProperty(ctx, giter, JS_ATOM_value);          /* steps 3-4, unconditional */
                 JS_FreeValue(ctx, giter);
                 if (JS_IsException(value)) goto async_from_sync_reject;
-                value_wrapper = js_promise_resolve(ctx, ctx->promise_ctor, 1, vc(&value), 0);
-                JS_FreeValue(ctx, value);
-                if (JS_IsException(value_wrapper)) goto async_from_sync_reject;
-                unwrap = js_async_from_sync_iterator_unwrap_func_create(ctx, done);
-                if (JS_IsException(unwrap)) { JS_FreeValue(ctx, value_wrapper); goto async_from_sync_reject; }
-                {
-                    JSValueConst rr[2]; rr[0] = unwrap; rr[1] = JS_UNDEFINED;
-                    perform_promise_then(ctx, value_wrapper, rr, vc(s->resolving_funcs));
+                rcont = js_async_from_sync_continuation(ctx, s->sync_iter, value, done,   /* steps 5-15 */
+                                                       s->close_on_rejection, vc(s->resolving_funcs));
+                if (rcont > 0) {
+                    /* step 6: IteratorClose(syncIteratorRecord, the abrupt step-5 completion). The sync iterator's
+                       `return` can be a generator body, so it runs on THIS chain and re-enters this settle, which
+                       the saved error above turns into the reject. */
+                    JSValue perr = JS_GetException(ctx);
+                    JSValue rm = JS_GetProperty(ctx, s->sync_iter, JS_ATOM_return);
+                    if (!JS_IsException(rm) && tramp_gen_method_magic(rm, s->sync_iter) == GEN_MAGIC_RETURN) {
+                        JS_FreeValue(ctx, rm);
+                        s->pending_error = perr;
+                        tramp_cont_state = s; tramp_cont_kind = CONT_ASYNC_FROM_SYNC;
+                        tramp_gen_cont_iter = s->sync_iter;
+                        tramp_gen_cont_consume = 1; tramp_gen_magic = GEN_MAGIC_RETURN;
+                        goto do_generator_tramp;
+                    }
+                    /* a plain (or absent, or replaced) `return`: no coroutine to suspend, so IteratorClose runs
+                       here as the spec's synchronous operation. */
+                    JS_FreeValue(ctx, rm);
+                    JS_Throw(ctx, perr);
+                    JS_IteratorClose(ctx, s->sync_iter, /*is_exception_pending*/true);
+                    goto async_from_sync_reject;
                 }
-                JS_FreeValue(ctx, value_wrapper); JS_FreeValue(ctx, unwrap);
+                if (rcont)
+                    goto async_from_sync_reject;
                 {
                     JSValue r = js_dup(s->promise);
                     int cfirst = s->orig_cfirst, cargc = s->orig_cargc; uint8_t itail = s->orig_is_tail, deliver = s->deliver;
@@ -23936,6 +24005,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (cc_kind == CONT_PROMISE_ALL) goto do_promise_all_step;
                         if (cc_kind == CONT_ASYNC_FROM_SYNC) goto do_async_from_sync_step;
                         if (cc_kind == CONT_ITER_HELPER) goto do_iter_helper_step;
+                        if (cc_kind == CONT_STEP) goto do_step_step;
                         goto do_iter_consume_step;
                     }
                     if (forof) {
@@ -24121,12 +24191,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 giter = (gdone == 2) ? value : js_create_iterator_result(ctx, value, gdone);
                 if (JS_IsException(giter)) goto exception;
-                if (gck == CONT_ITER_CONSUME || gck == CONT_PROMISE_ALL || gck == CONT_ASYNC_FROM_SYNC || gck == CONT_ITER_HELPER) {   /* consumer drive: feed {value,done} back to its step (caller stack untouched: sp == caller_sp) */
+                if (gck == CONT_ITER_CONSUME || gck == CONT_PROMISE_ALL || gck == CONT_ASYNC_FROM_SYNC || gck == CONT_ITER_HELPER || gck == CONT_STEP) {   /* consumer drive: feed {value,done} back to its step (caller stack untouched: sp == caller_sp) */
                     cont_st = gcont;
                     ret_val = giter;
                     if (gck == CONT_PROMISE_ALL) goto do_promise_all_step;
                     if (gck == CONT_ASYNC_FROM_SYNC) goto do_async_from_sync_step;
                     if (gck == CONT_ITER_HELPER) goto do_iter_helper_step;
+                    if (gck == CONT_STEP) goto do_step_step;   /* a step machine drove the generator (IteratorClose) */
                     goto do_iter_consume_step;
                 }
                 if (gtail) {   /* `return g.next()`: OP_tail_call_method had NO following OP_return — the {value,done}
@@ -24739,6 +24810,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #define JS_THROW_VAR_UNINITIALIZED  2
 #define JS_THROW_ERROR_DELETE_SUPER   3
 #define JS_THROW_ERROR_ITERATOR_THROW 4
+#define JS_THROW_ERROR_INVALID_ASSIGN_TARGET 5
             {
                 JSAtom atom;
                 int type;
@@ -24759,6 +24831,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 else
                 if (type == JS_THROW_ERROR_ITERATOR_THROW)
                     JS_ThrowTypeError(ctx, "iterator does not have a throw method");
+                else
+                if (type == JS_THROW_ERROR_INVALID_ASSIGN_TARGET)
+                    /* AnnexB ~web-compat~ AssignmentTargetType: a sloppy-mode CallExpression used as an
+                       assignment target. The call has already run; nothing after this does. */
+                    JS_ThrowReferenceError(ctx, "invalid assignment left-hand side");
                 else
                     JS_ThrowInternalError(ctx, "invalid throw var type %d", type);
             }
@@ -25274,9 +25351,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         CASE(OP_goto):
-            pc += (int32_t)get_u32(pc);
-            if (unlikely(js_poll_interrupts(ctx)))
-                goto exception;
+            {
+                int32_t gdiff = (int32_t)get_u32(pc);
+                pc += gdiff;
+                if (unlikely(js_poll_interrupts(ctx)))
+                    goto exception;
+                /* BACK-EDGE ONLY. A forward goto is not a loop iteration, and preempting one is not free: a park
+                   re-enters through the job pump, which INSERTS a microtask tick — observable ordering (the
+                   for-await-of ticks-with-* tests count them). "Preempt every loop back-edge" is the contract;
+                   firing on every jump was a strictly larger set that bought no coverage and reordered jobs,
+                   which the resume razor forbids. */
+                if (gdiff >= 0)
+                    BREAK;
+            }
             /* forced-exec PREEMPTION at a loop back-edge. A preempt SUSPENDS this flow and YIELDS to the ONE
                scheduler (JS_FlowResume), which resumes it when it is top-ranked again — suspend/resume at any
                depth, NEVER drive-to-completion. The BASE activation (gen_state == g_flow_base_gen) yields
@@ -25297,9 +25384,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
         CASE(OP_goto16):
-            pc += (int16_t)get_u16(pc);
-            if (unlikely(js_poll_interrupts(ctx)))
-                goto exception;
+            {
+                int16_t gdiff16 = (int16_t)get_u16(pc);
+                pc += gdiff16;
+                if (unlikely(js_poll_interrupts(ctx)))
+                    goto exception;
+                if (gdiff16 >= 0)
+                    BREAK;   /* back-edge only — see OP_goto */
+            }
             if (unlikely(g_flow_control.preempt != NULL) && g_flow_control.preempt()) {
                 FLOW_PREEMPT_COUNT(g_flow_preempt_requested);
                 if (gen_state == g_flow_base_gen) { FLOW_PREEMPT_COUNT(g_flow_preempt_fired); goto do_preempt; }
@@ -25313,9 +25405,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
         CASE(OP_goto8):
-            pc += (int8_t)pc[0];
-            if (unlikely(js_poll_interrupts(ctx)))
-                goto exception;
+            {
+                int8_t gdiff8 = (int8_t)pc[0];
+                pc += gdiff8;
+                if (unlikely(js_poll_interrupts(ctx)))
+                    goto exception;
+                if (gdiff8 >= 0)
+                    BREAK;   /* back-edge only — see OP_goto */
+            }
             if (unlikely(g_flow_control.preempt != NULL) && g_flow_control.preempt()) {
                 FLOW_PREEMPT_COUNT(g_flow_preempt_requested);
                 if (gen_state == g_flow_base_gen) { FLOW_PREEMPT_COUNT(g_flow_preempt_fired); goto do_preempt; }
@@ -26305,17 +26402,44 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_get_ref_value):
             {
                 JSValue val;
+                JSAtom atom;
+                int ret;
                 sf->cur_pc = pc;
+                atom = JS_ValueToAtom(ctx, sp[-1]);   /* already a property key: the ref carries an atom value */
+                if (unlikely(atom == JS_ATOM_NULL))
+                    goto exception;
                 if (unlikely(JS_IsUndefined(sp[-2]))) {
-                    JSAtom atom = JS_ValueToAtom(ctx, sp[-1]);
-                    if (atom != JS_ATOM_NULL) {
-                        JS_ThrowReferenceErrorNotDefined(ctx, atom);
-                        JS_FreeAtom(ctx, atom);
-                    }
+                    JS_ThrowReferenceErrorNotDefined(ctx, atom);
+                    JS_FreeAtom(ctx, atom);
                     goto exception;
                 }
-                val = JS_GetPropertyValue(ctx, sp[-2],
-                                          js_dup(sp[-1]));
+                /* 9.1.1.2.6 GetBindingValue step 2: the object Environment Record performs its OWN
+                   HasProperty, separate from the HasBinding that resolved this reference. Observable — the
+                   @@unscopables Get in between runs page code that can delete the binding, and a Proxy counts
+                   every trap. */
+                ret = JS_HasProperty(ctx, sp[-2], atom);
+                if (unlikely(ret < 0)) {
+                    JS_FreeAtom(ctx, atom);
+                    goto exception;
+                }
+                if (unlikely(!ret)) {
+                    /* step 3. A DECLARATIVE record's base (global_var_obj, or the null-proto dummy
+                       OP_make_var_ref_ref builds) always holds the binding, so only an object record can
+                       reach here. */
+                    DCHECK(!js_same_value(ctx, sp[-2], ctx->global_var_obj),
+                           "a declarative record's binding cannot vanish between HasBinding and GetBindingValue");
+                    if (is_strict_mode(ctx)) {
+                        JS_ThrowReferenceErrorNotDefined(ctx, atom);
+                        JS_FreeAtom(ctx, atom);
+                        goto exception;
+                    }
+                    JS_FreeAtom(ctx, atom);
+                    sp[0] = JS_UNDEFINED;
+                    sp++;
+                    BREAK;
+                }
+                val = JS_GetProperty(ctx, sp[-2], atom);   /* step 4 */
+                JS_FreeAtom(ctx, atom);
                 if (unlikely(JS_IsException(val)))
                     goto exception;
                 sp[0] = val;
@@ -26419,26 +26543,46 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
         CASE(OP_put_ref_value):
             {
-                int ret, flags;
+                int ret;
+                JSAtom atom;
                 sf->cur_pc = pc;
-                flags = JS_PROP_THROW_STRICT;
+                atom = JS_ValueToAtom(ctx, sp[-2]);   /* already a property key */
+                if (unlikely(atom == JS_ATOM_NULL))
+                    goto exception;
                 if (unlikely(JS_IsUndefined(sp[-3]))) {
+                    /* 6.2.5.6 PutValue step 2: an UNRESOLVABLE reference. Strict code throws; sloppy code
+                       creates the property on the global object. */
                     if (is_strict_mode(ctx)) {
-                        JSAtom atom = JS_ValueToAtom(ctx, sp[-2]);
-                        if (atom != JS_ATOM_NULL) {
-                            JS_ThrowReferenceErrorNotDefined(ctx, atom);
-                            JS_FreeAtom(ctx, atom);
-                        }
+                        JS_ThrowReferenceErrorNotDefined(ctx, atom);
+                        JS_FreeAtom(ctx, atom);
                         goto exception;
-                    } else {
-                        sp[-3] = js_dup(ctx->global_obj);
                     }
+                    sp[-3] = js_dup(ctx->global_obj);
                 } else {
-                    if (is_strict_mode(ctx))
-                        flags |= JS_PROP_NO_ADD;
+                    /* 9.1.1.2.5 SetMutableBinding step 2: `stillExists`, the object Environment Record's OWN
+                       HasProperty. It replaces the JS_PROP_NO_ADD approximation that used to stand in for
+                       step 3 — that flag silently declined to add instead of throwing, and never ran the
+                       lookup a Proxy observes. */
+                    ret = JS_HasProperty(ctx, sp[-3], atom);
+                    if (unlikely(ret < 0)) {
+                        JS_FreeAtom(ctx, atom);
+                        goto exception;
+                    }
+                    if (unlikely(!ret)) {
+                        DCHECK(!js_same_value(ctx, sp[-3], ctx->global_var_obj),
+                               "a declarative record's binding cannot vanish between HasBinding and SetMutableBinding");
+                        if (is_strict_mode(ctx)) {
+                            JS_ThrowReferenceErrorNotDefined(ctx, atom);   /* step 3 */
+                            JS_FreeAtom(ctx, atom);
+                            goto exception;
+                        }
+                    }
                 }
-                ret = JS_SetPropertyValue(ctx, sp[-3], sp[-2], sp[-1], flags);
+                ret = JS_SetPropertyInternal(ctx, sp[-3], atom, sp[-1],   /* step 4 */
+                                             JS_PROP_THROW_STRICT);
+                JS_FreeAtom(ctx, atom);
                 JS_FreeValue(ctx, sp[-3]);
+                JS_FreeValue(ctx, sp[-2]);
                 sp -= 3;
                 if (unlikely(ret < 0))
                     goto exception;
@@ -27255,6 +27399,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 sf->cur_pc = pc;
 
                 obj = sp[-1];
+                /* 9.1.1.2.1 HasBinding step 2 */
                 ret = JS_HasProperty(ctx, obj, atom);
                 if (unlikely(ret < 0))
                     goto exception;
@@ -27266,16 +27411,52 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (ret)
                             goto no_with;
                     }
+                    /* HasBinding said yes, but it is a SEPARATE abstract operation from the one that follows:
+                       GetBindingValue (9.1.1.2.6 step 2) and SetMutableBinding (9.1.1.2.5 step 2) each perform
+                       their OWN HasProperty. That second lookup is observable — HasBinding's @@unscopables Get
+                       runs page code that can delete the binding, and a Proxy counts every trap. DeleteBinding
+                       (9.1.1.2.4) is the one that does not re-check: it is a bare [[Delete]]. */
                     switch (opcode) {
                     case OP_with_get_var:
-                        val = JS_GetProperty(ctx, obj, atom);
-                        if (unlikely(JS_IsException(val)))
+                    case OP_with_get_ref:
+                    case OP_with_get_ref_undef:
+                        ret = JS_HasProperty(ctx, obj, atom);   /* GetBindingValue step 2 */
+                        if (unlikely(ret < 0))
                             goto exception;
-                        set_value(ctx, &sp[-1], val);
+                        if (!ret) {
+                            /* step 3: the binding is gone. Strict code throws; sloppy code reads undefined.
+                               Never a fall-through to the enclosing scope — the binding was RESOLVED here. */
+                            if (sf->is_strict_mode) {
+                                JS_ThrowReferenceErrorNotDefined(ctx, atom);
+                                goto exception;
+                            }
+                            val = JS_UNDEFINED;
+                        } else {
+                            val = JS_GetProperty(ctx, obj, atom);   /* step 4 */
+                            if (unlikely(JS_IsException(val)))
+                                goto exception;
+                        }
+                        if (opcode == OP_with_get_var) {
+                            set_value(ctx, &sp[-1], val);
+                        } else {
+                            if (opcode == OP_with_get_ref_undef) {
+                                /* produce a pair undefined/function on the stack */
+                                JS_FreeValue(ctx, sp[-1]);
+                                sp[-1] = JS_UNDEFINED;
+                            }
+                            /* OP_with_get_ref: produce a pair object/method on the stack */
+                            *sp++ = val;
+                        }
                         break;
                     case OP_with_put_var:
-                        /* XXX: check if strict mode */
-                        ret = JS_SetPropertyInternal(ctx, obj, atom, sp[-2],
+                        ret = JS_HasProperty(ctx, obj, atom);   /* SetMutableBinding step 2, stillExists */
+                        if (unlikely(ret < 0))
+                            goto exception;
+                        if (!ret && sf->is_strict_mode) {
+                            JS_ThrowReferenceErrorNotDefined(ctx, atom);   /* step 3 */
+                            goto exception;
+                        }
+                        ret = JS_SetPropertyInternal(ctx, obj, atom, sp[-2],   /* step 4 */
                                                      JS_PROP_THROW_STRICT);
                         JS_FreeValue(ctx, sp[-1]);
                         sp -= 2;
@@ -27292,22 +27473,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     case OP_with_make_ref:
                         /* produce a pair object/propname on the stack */
                         *sp++ = JS_AtomToValue(ctx, atom);
-                        break;
-                    case OP_with_get_ref:
-                        /* produce a pair object/method on the stack */
-                        val = JS_GetProperty(ctx, obj, atom);
-                        if (unlikely(JS_IsException(val)))
-                            goto exception;
-                        *sp++ = val;
-                        break;
-                    case OP_with_get_ref_undef:
-                        /* produce a pair undefined/function on the stack */
-                        val = JS_GetProperty(ctx, obj, atom);
-                        if (unlikely(JS_IsException(val)))
-                            goto exception;
-                        JS_FreeValue(ctx, sp[-1]);
-                        sp[-1] = JS_UNDEFINED;
-                        *sp++ = val;
                         break;
                     }
                     pc += diff - 5;
@@ -27527,6 +27692,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         if (gtf->cont_kind == CONT_ITER_CONSUME) {   /* Array.from consumer: the generator body threw -> abandon the half-built array (its own ref to the generator is dropped here; the drive ref is dropped below) */
             js_iter_consume_end(ctx, (struct JSIterConsume *)gtf->cont_state);
             js_free_rt(rt, gtf->cont_state);
+        }
+        if (gtf->cont_kind == CONT_STEP) {
+            /* a STEP MACHINE drove this generator (IteratorClose running a `finally`) and the body threw: the
+               machine can never be re-entered, so tear it down — and its fini decides which completion wins
+               (IteratorClose's does: the original throw replaces the body's). */
+            tramp_step_chain_free(ctx, gtf->cont_state);
         }
         /* CONT_PROMISE_ALL: handled AFTER the frame pop — the throw REJECTS the aggregate promise (not propagates). */
         sf->cur_sp = sp;   /* the body frame is "running" (cur_sp NULL); restore it so async_func_free can tear down */
@@ -28464,6 +28635,9 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                 ns->promise = JS_NewPromiseCapability(ctx, ns->resolving_funcs);   /* fresh (overwrites the copied funcs): sibling delivers ITS own promise */
                 if (JS_IsException(ns->promise)) { js_free(ctx, ns); js_free(ctx, oa); js_free(ctx, ca); return NULL; }
                 ns->sync_iter = js_dup(os->sync_iter);
+                /* a fork mid step-6-close: each arm owns its own copy of the completion it will reject with */
+                if (!JS_IsUninitialized(os->pending_error))
+                    ns->pending_error = js_dup(os->pending_error);
                 ct->cont_state = ns;
             } else if (otf->cont_kind == CONT_PROMISE_ALL) {
                 /* Promise.all(gen) forked mid-consume. The sibling gets a FRESH aggregate (own result_promise +
@@ -29723,6 +29897,10 @@ typedef struct JSFunctionDef {
 
     DynBuf byte_code;
     int last_opcode_pos; /* -1 if no last opcode */
+    /* the last emitted opcode is a call that came from `CallExpression TemplateLiteral`, whose
+       AssignmentTargetType stays ~invalid~ while the two Arguments productions are ~web-compat~. It shares
+       an opcode with them, so the distinction lives here, beside last_opcode_pos and read at the same point. */
+    bool last_opcode_is_template_call;
 
     LabelSlot *label_slots;
     int label_size; /* allocated size for label_slots[] */
@@ -31424,6 +31602,7 @@ static void emit_op(JSParseState *s, uint8_t val)
     DynBuf *bc = &fd->byte_code;
 
     fd->last_opcode_pos = bc->size;
+    fd->last_opcode_is_template_call = false;
     dbuf_putc(bc, val);
 }
 
@@ -32269,6 +32448,16 @@ static bool token_is_ident(int tok)
              tok <= TOK_LAST_KEYWORD));
 }
 
+/* Can this token begin a PropertyName / ClassElementName?  `get` and `set` are only accessor prefixes when the
+   NEXT token can, so this decides whether `get` is a prefix or a name in its own right — the discriminator the
+   grammar uses, and the one ASI needs (`class A { get \n *a(){} }` is a FIELD named "get" followed by a
+   generator method, because `get *a(){}` is not a MethodDefinition). */
+static bool token_starts_property_name(int tok)
+{
+    return token_is_ident(tok) || tok == TOK_STRING || tok == TOK_NUMBER ||
+           tok == '[' || tok == TOK_PRIVATE_NAME;
+}
+
 /* if the property is an expression, name = JS_ATOM_NULL */
 static int __exception js_parse_property_name(JSParseState *s,
                                               JSAtom *pname,
@@ -32288,9 +32477,8 @@ static int __exception js_parse_property_name(JSParseState *s,
             name = JS_DupAtom(s->ctx, s->token.u.ident.atom);
             if (next_token(s))
                 goto fail1;
-            if (s->token.val == ':' || s->token.val == ',' ||
-                s->token.val == '}' || s->token.val == '(' ||
-                s->token.val == '=' || s->token.val == ';') {
+            if (!token_starts_property_name(s->token.val)) {
+                /* `get`/`set` is the NAME here, not an accessor prefix */
                 is_non_reserved_ident = true;
                 goto ident_found;
             }
@@ -33603,6 +33791,9 @@ static __exception int get_lvalue(JSParseState *s, int *popcode, int *pscope,
         }
         if (name == JS_ATOM_this || name == JS_ATOM_new_target)
             goto invalid_lvalue;
+        /* A name that may resolve into a `with` object materialises a Reference (OP_scope_make_ref ->
+           OP_get_ref_value/OP_put_ref_value) even for a write-only lvalue, because HasBinding must run when
+           the reference is RESOLVED — before the RHS — and OP_scope_put_var would run it after. */
         if (has_with_scope(fd, scope)) {
             depth = 2;  /* will generate OP_get_ref_value */
         } else {
@@ -33624,6 +33815,43 @@ static __exception int get_lvalue(JSParseState *s, int *popcode, int *pscope,
     case OP_get_super_value:
         depth = 3;
         break;
+    case OP_call:
+    case OP_call_method:
+    case OP_eval:
+    case OP_apply_eval:
+    case OP_apply:
+        /* AnnexB "Runtime Errors for Function Call Assignment Targets": in SLOPPY code the
+           AssignmentTargetType of `CallExpression Arguments` and of CoverCallExpressionAndAsyncArrowHead is
+           ~web-compat~, so `f() = v`, `f() += v`, `f()++` and `for (f() of x)` PARSE and throw a
+           ReferenceError at runtime — the call itself runs, nothing after it does. Strict code, `new f()`
+           (OP_call_constructor) and the TemplateLiteral production keep AssignmentTargetType ~invalid~ and
+           stay early SyntaxErrors. */
+        if (fd->is_strict_mode || fd->last_opcode_is_template_call)
+            goto invalid_lvalue;
+        /* ~web-compat~ is NOT `simple`, so only the productions whose early error was relaxed to test for
+           ~invalid~ accept it: plain and compound assignment, the update operators, and a for-in/of head.
+           Logical assignment (&&= ||= ??=) and a DestructuringAssignmentTarget still require `simple` and
+           stay early SyntaxErrors. */
+        if (!(tok == '=' || (tok >= TOK_MUL_ASSIGN && tok <= TOK_POW_ASSIGN) ||
+              tok == TOK_INC || tok == TOK_DEC || tok == TOK_FOR))
+            goto invalid_lvalue;
+        if (opcode == OP_apply &&
+            get_u16(fd->byte_code.buf + fd->last_opcode_pos + 1) != 0)
+            goto invalid_lvalue;   /* `new f(...args)` — a NewExpression, never web-compat */
+        /* the call STAYS; the throw goes right after it, before the RHS is even parsed */
+        emit_op(s, OP_throw_error);
+        emit_atom(s, JS_ATOM_NULL);
+        emit_u8(s, JS_THROW_ERROR_INVALID_ASSIGN_TARGET);
+        /* Hand back a well-formed 2-slot member reference (the call result plus a key) so the unreachable
+           tail the parser still emits stays stack-balanced. */
+        emit_op(s, OP_undefined);
+        opcode = OP_get_array_el;
+        depth = 2;
+        if (keep) {
+            emit_op(s, OP_dup2);
+            emit_op(s, OP_get_array_el);
+        }
+        goto lvalue_done;
     default:
     invalid_lvalue:
         if (tok == TOK_FOR) {
@@ -33707,6 +33935,7 @@ static __exception int get_lvalue(JSParseState *s, int *popcode, int *pscope,
         }
     }
 
+ lvalue_done:
     *popcode = opcode;
     *pscope = scope;
     /* name has refcount for OP_get_field and OP_get_ref_value,
@@ -34632,20 +34861,14 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
         break;
     case '{':
     case '[':
-        {
-            int skip_bits;
-            if (js_parse_skip_parens_token(s, &skip_bits, false) == '=') {
-                if (js_parse_destructuring_element(s, 0, false, false, skip_bits & SKIP_HAS_ELLIPSIS, true, false) < 0)
-                    return -1;
-            } else {
-                if (s->token.val == '{') {
-                    if (js_parse_object_literal(s))
-                        return -1;
-                } else {
-                    if (js_parse_array_literal(s))
-                        return -1;
-                }
-            }
+        /* Always a LITERAL here. The AssignmentPattern reparse belongs to the AssignmentExpression
+           production and lives in js_parse_assign_expr2. */
+        if (s->token.val == '{') {
+            if (js_parse_object_literal(s))
+                return -1;
+        } else {
+            if (js_parse_array_literal(s))
+                return -1;
         }
         break;
     case TOK_NEW:
@@ -35031,6 +35254,7 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
                     break;
                 }
             }
+            fd->last_opcode_is_template_call = (call_type == FUNC_CALL_TEMPLATE);
             call_type = FUNC_CALL_NORMAL;
         } else if (s->token.val == '.') {
             if (next_token(s))
@@ -35784,6 +36008,21 @@ static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags)
                                       s->token.col_num);
     }
  next:
+    if (s->token.val == '[' || s->token.val == '{') {
+        int skip_bits;
+        if (js_parse_skip_parens_token(s, &skip_bits, false) == '=') {
+            /* 13.15 AssignmentExpression : ObjectLiteral|ArrayLiteral = AssignmentExpression — the literal is
+               REPARSED through the AssignmentPattern cover grammar. That production exists only at
+               AssignmentExpression level, so the test belongs HERE. Doing it in the primary-expression parser
+               accepted the `=` at any operand position, e.g. `#f in {} = 0`, where the grammar allows only a
+               ShiftExpression. */
+            /* it returns has_initializer (1) on success, not 0 */
+            if (js_parse_destructuring_element(s, 0, false, false,
+                                               skip_bits & SKIP_HAS_ELLIPSIS, true, false) < 0)
+                return -1;
+            return 0;
+        }
+    }
     if (s->token.val == TOK_IDENT) {
         /* name0 is used to check for OP_set_name pattern, not duplicated */
         name0 = s->token.u.ident.atom;
@@ -36675,16 +36914,37 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
     emit_label(s, label_cont);
     if (is_for_of) {
         if (is_async) {
+            /* 14.7.5.7 ForIn/OfBodyEvaluation steps 3.a-3.d are `?`, NOT a try region: an abrupt completion from
+               the HEAD — a rejected next(), a non-object result, a throwing done/value getter — returns without
+               AsyncIteratorClose, because the iterator is already finished. The enum_rec's catch offset 0 on the
+               stack would close it anyway (returnCount 2 where the spec says 1), so the head runs under its own
+               catch offset whose handler DROPS the enum_rec before rethrowing. The sync path reaches the same
+               result in C, by clearing the enum_rec's iterator slot. */
+            int label_head_abrupt = new_label(s);
+            int label_head_ok;
             /* call the next method */
             /* stack: iter_obj next catch_offset */
             emit_op(s, OP_dup3);
             emit_op(s, OP_drop);
             emit_op(s, OP_call_method);
             emit_u16(s, 0);
+            emit_goto(s, OP_catch, label_head_abrupt);
+            emit_op(s, OP_swap);        /* stack: … catch_offset(head) promise */
             /* get the result of the promise */
             emit_op(s, OP_await);
+            emit_op(s, OP_swap);
+            emit_op(s, OP_drop);        /* the head settled: its catch offset is done with */
             /* unwrap the value and done values */
             emit_op(s, OP_iterator_get_value_done);
+            label_head_ok = emit_goto(s, OP_goto, -1);
+            emit_label(s, label_head_abrupt);
+            /* stack: iter_obj next catch_offset(loop) exception — drop the whole enum_rec so the unwind finds no
+               catch offset 0 for this loop, then rethrow into whatever encloses it. */
+            emit_op(s, OP_nip);
+            emit_op(s, OP_nip);
+            emit_op(s, OP_nip);
+            emit_op(s, OP_throw);
+            emit_label(s, label_head_ok);
         } else {
             emit_op(s, OP_for_of_next);
             emit_u8(s, 0);
@@ -65195,6 +65455,8 @@ static void js_async_from_sync_end(JSContext *ctx, JSAsyncFromSync *s)
     JS_FreeValue(ctx, s->resolving_funcs[0]);
     JS_FreeValue(ctx, s->resolving_funcs[1]);
     JS_FreeValue(ctx, s->sync_iter);
+    if (!JS_IsUninitialized(s->pending_error))
+        JS_FreeValue(ctx, s->pending_error);   /* only set while step 6's close is in flight */
 }
 
 /* Free a Promise.all(gen) state's owned fields (result_promise moved out by the caller before this on the happy path). */
@@ -65655,6 +65917,134 @@ static JSValue js_async_from_sync_iterator_unwrap_func_create(JSContext *ctx,
                                1, 0, 1, func_data);
 }
 
+/* 27.1.4.4 step 11 `closeIterator`: IteratorClose(syncIteratorRecord, ThrowCompletion(error)), as a STEP
+   MACHINE. It has to be one: the sync iterator's `return` is often a GENERATOR body — `try { yield p } finally
+   { … }` — and a coroutine body must suspend on the tramp, which a JS_Call out of a C reaction body cannot do.
+   Stages: 0 capture, 1 GetMethod(iterator,"return") then call it, 2 finish. This machine NEVER completes
+   normally: 7.4.11 step 4 says a throw completion is the result whatever the close did, so every exit is the
+   stored error, re-thrown by fini over anything the close itself raised. */
+typedef struct JSIterCloseThrow {
+    JSStepHdr hdr;       /* MUST be first: the driver casts state -> JSStepHdr * */
+    JSValue error;       /* the rejection reason — the completion that wins (owned) */
+    JSValue cb_args[2];  /* [this=iterator, return_fn] — owned; borrowed by the callback frame */
+} JSIterCloseThrow;
+_Static_assert(offsetof(JSIterCloseThrow, hdr) == 0, "JSStepHdr must be first in JSIterCloseThrow");
+
+static int js_iter_close_throw_step(JSContext *ctx, void *st, JSValue cb_result,
+                                   JSValue **out_cb, int *out_argc)
+{
+    JSIterCloseThrow *s = st;
+    int r;
+
+    if (s->hdr.stage == 0) {
+        JSCFunctionDataRecord *rec = JS_VALUE_GET_OBJ(s->hdr.func_obj)->u.c_function_data_record;
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        /* every owned field is placed BEFORE anything that can throw: the teardown frees exactly what the
+           state holds and nothing else. */
+        s->error = s->hdr.argc > 0 ? js_dup(s->hdr.argv[0]) : JS_UNDEFINED;
+        s->cb_args[0] = js_dup(rec->data[0]);   /* the sync iterator */
+        s->cb_args[1] = JS_UNDEFINED;
+        s->hdr.stage = 1;
+    }
+    if (s->hdr.stage == 1) {
+        r = step_getprop_run(ctx, &s->hdr, s->cb_args[0], JS_ATOM_return, cb_result,
+                             &s->cb_args[1], out_cb, out_argc);   /* 7.4.11 step 2 GetMethod */
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 2;
+        if (JS_IsUndefined(s->cb_args[1]) || JS_IsNull(s->cb_args[1]))
+            return -1;                          /* step 3.b: nothing to call, the completion is all there is */
+        *out_cb = s->cb_args; *out_argc = 0;     /* step 3.c Call(return, iterator) */
+        return 3;
+    }
+    DCHECK(s->hdr.stage == 2, "IteratorClose-throw: unknown stage");
+    /* steps 5 and 6 are unreachable under a throw completion — step 4 returns before them, so neither the
+       inner result's abruptness nor its not-an-Object-ness is observable. */
+    JS_FreeValue(ctx, cb_result);
+    return -1;
+}
+
+static JSValue js_iter_close_throw_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSIterCloseThrow *s = st;
+    DCHECK(!take_result, "IteratorClose-throw never completes normally");
+    JS_FreeValue(ctx, s->cb_args[0]);
+    JS_FreeValue(ctx, s->cb_args[1]);
+    /* step 4: the stored completion is the result, REPLACING whatever the `return` call or the GetMethod
+       raised. */
+    JS_Throw(ctx, s->error);
+    js_free_rt(ctx->rt, s);
+    return JS_EXCEPTION;
+}
+
+static const JSTrampStepDef js_iter_close_throw_def = {
+    sizeof(JSIterCloseThrow), js_iter_close_throw_step, js_iter_close_throw_fini, 0
+};
+
+/* The closure has no C body: its only dispatch is as a Promise reaction, and promise_reaction_job routes a
+   step-machine closure onto the tramp as a call-root flow. A C entry would mean an unrouted call site. */
+static JSValue js_iter_close_throw_c_entry(JSContext *ctx, JSValueConst this_val,
+                                          int argc, JSValueConst *argv,
+                                          int magic, JSValueConst *func_data)
+{
+    DFAIL("the async-from-sync closeIterator reaction reached its C entry — it is a step machine, so this call "
+          "site must route through do_step_tramp; a JS_Call here would drive a generator `finally` off-tramp");
+    return JS_EXCEPTION;
+}
+
+static JSValue js_iter_close_throw_create(JSContext *ctx, JSValueConst sync_iter)
+{
+    JSValue f = JS_NewCFunctionData(ctx, js_iter_close_throw_c_entry, 1, 0, 1, &sync_iter);
+    if (JS_IsException(f))
+        return f;
+    promise_closure_set_step(f, &js_iter_close_throw_def);
+    return f;
+}
+
+/* 27.1.4.4 AsyncFromSyncIteratorContinuation steps 5-15, shared by the trampolined settle and the direct
+   %AsyncFromSyncIteratorPrototype% methods. Consumes `value`.
+   Returns 0 on success; -1 with an exception pending for the caller's IfAbruptRejectPromise; or 1 meaning
+   "step 5 completed abruptly and step 6 requires IteratorClose first" — the caller owns that close because for
+   a GENERATOR sync iterator it runs a coroutine body that must suspend on the tramp. */
+static int js_async_from_sync_continuation(JSContext *ctx, JSValueConst sync_iter,
+                                          JSValue value, int done,
+                                          bool close_on_rejection,
+                                          JSValueConst *resolving_funcs)
+{
+    JSValue value_wrapper, unwrap, on_rejected = JS_UNDEFINED;
+    JSValueConst rr[2];
+    int res;
+
+    value_wrapper = js_promise_resolve(ctx, ctx->promise_ctor, 1, vc(&value), 0);   /* step 5 */
+    JS_FreeValue(ctx, value);
+    if (JS_IsException(value_wrapper)) {
+        /* PromiseResolve itself completed abruptly — a poisoned `constructor` getter on the value. */
+        return (!done && close_on_rejection) ? 1 : -1;   /* step 6 needs the close; step 7 rejects either way */
+    }
+    unwrap = js_async_from_sync_iterator_unwrap_func_create(ctx, done);   /* steps 8-9 */
+    if (JS_IsException(unwrap)) {
+        JS_FreeValue(ctx, value_wrapper);
+        return -1;
+    }
+    /* steps 11-14: onRejected exists only while the sync iterator is still open and this method closes on
+       rejection (.next/.throw do, .return does not — it has already closed it). */
+    if (!done && close_on_rejection) {
+        on_rejected = js_iter_close_throw_create(ctx, sync_iter);
+        if (JS_IsException(on_rejected)) {
+            JS_FreeValue(ctx, value_wrapper);
+            JS_FreeValue(ctx, unwrap);
+            return -1;
+        }
+    }
+    rr[0] = unwrap;
+    rr[1] = on_rejected;
+    res = perform_promise_then(ctx, value_wrapper, rr, resolving_funcs);   /* step 15 */
+    JS_FreeValue(ctx, value_wrapper);
+    JS_FreeValue(ctx, unwrap);
+    JS_FreeValue(ctx, on_rejected);
+    return res;
+}
+
 /* AsyncIteratorPrototype */
 
 static const JSCFunctionListEntry js_async_iterator_proto_funcs[] = {
@@ -65721,6 +66111,7 @@ static JSValue js_async_from_sync_iterator_next(JSContext *ctx, JSValueConst thi
     JSAsyncFromSyncIteratorData *s;
     int done;
     int is_reject;
+    int res_cont;
 
     promise = JS_NewPromiseCapability(ctx, resolving_funcs);
     if (JS_IsException(promise))
@@ -65790,45 +66181,23 @@ static JSValue js_async_from_sync_iterator_next(JSContext *ctx, JSValueConst thi
         JS_FreeValue(ctx, resolving_funcs[1]);
         return promise;
     }
-    {
-        JSValue value_wrapper_promise, resolve_reject[2];
-        int res;
-
-        value_wrapper_promise = js_promise_resolve(ctx, ctx->promise_ctor,
-                                                   1, vc(&value), 0);
-        if (JS_IsException(value_wrapper_promise)) {
-            JS_FreeValue(ctx, value);
+    /* steps 5-15. closeOnRejection is false only for .return(), which has already closed the sync iterator. */
+    res_cont = js_async_from_sync_continuation(ctx, s->sync_iter, value, done,
+                                              magic != GEN_MAGIC_RETURN,
+                                              vc(resolving_funcs));
+    if (res_cont > 0)   /* step 6 */
+        JS_IteratorClose(ctx, s->sync_iter, /*is_exception_pending*/true);
+    if (res_cont) {
+        if (JS_HasException(ctx))
             goto reject;
-        }
-
-        resolve_reject[0] =
-            js_async_from_sync_iterator_unwrap_func_create(ctx, done);
-        if (JS_IsException(resolve_reject[0])) {
-            JS_FreeValue(ctx, value_wrapper_promise);
-            goto fail;
-        }
-        JS_FreeValue(ctx, value);
-        resolve_reject[1] = JS_UNDEFINED;
-
-        res = perform_promise_then(ctx, value_wrapper_promise,
-                                   vc(resolve_reject),
-                                   vc(resolving_funcs));
-        JS_FreeValue(ctx, resolve_reject[0]);
-        JS_FreeValue(ctx, value_wrapper_promise);
         JS_FreeValue(ctx, resolving_funcs[0]);
         JS_FreeValue(ctx, resolving_funcs[1]);
-        if (res) {
-            JS_FreeValue(ctx, promise);
-            return JS_EXCEPTION;
-        }
+        JS_FreeValue(ctx, promise);
+        return JS_EXCEPTION;
     }
-    return promise;
- fail:
-    JS_FreeValue(ctx, value);
     JS_FreeValue(ctx, resolving_funcs[0]);
     JS_FreeValue(ctx, resolving_funcs[1]);
-    JS_FreeValue(ctx, promise);
-    return JS_EXCEPTION;
+    return promise;
 }
 
 static const JSCFunctionListEntry js_async_from_sync_iterator_proto_funcs[] = {
