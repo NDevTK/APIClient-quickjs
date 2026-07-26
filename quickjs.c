@@ -19142,7 +19142,10 @@ typedef struct JSIteratorWrapData {
 #define CONT_ITER_FROM     12  /* cont_state = JSIterFrom: Iterator.from(obj) — GetIterator(obj) is performed by the
                                   shared acquire (so a generator-function @@iterator is created ON THE TRAMP) and the
                                   resulting iterator IS the call's result; the deliver just yields it. */
-typedef struct JSIterFrom { int orig_cfirst, orig_cargc; uint8_t orig_is_tail; } JSIterFrom;
+/* args_own mirrors JSIterConsume's: an .apply / spread CALL's arguments live in a heap list, and this state
+   borrows the source out of it until the acquire delivers an iterator. */
+typedef struct JSIterFrom { int orig_cfirst, orig_cargc; uint8_t orig_is_tail;
+                            JSValue *args_own; int args_own_n; } JSIterFrom;
 #define CONT_ACQUIRE_GET  25   /* cont_state = JSAcquireGet: GetIterator step 3's READ of @@iterator, when reading it
                                   is itself the page's code (a getter, a Proxy trap). The consumer waiting on the
                                   acquire cannot be the read's outer continuation directly — a consumer's delivery
@@ -19710,11 +19713,14 @@ typedef struct JSIterConsume {
     JSValue super_ref;  /* super(iterable) entry: the owned parent-class ref, freed at finish; UNDEFINED
                            for the OP_call_constructor entry which has no such ref */
     SumPreciseState sum; /* ITERCONS_SUMPRECISE only. POD, so it needs no entry in ITERCONS_OWNED. */
-    /* The SOURCE, owned, for the one shape where it is not a live operand: `new Map(...arr)` /
-       `new Int8Array(...arr)` take their arguments from a heap list that is freed as soon as the arm has read
-       it, so the iterable would dangle for the whole consume. UNDEFINED = the ordinary case, where the source
-       is a caller operand the frame keeps alive. */
-    JSValue src_own;
+    /* The ARGUMENT LIST, owned, for the shapes whose arguments are not caller operands: the spread and .apply
+       build one on the heap (`new Map(...arr)`, `Array.from(...[src])`), and this state borrows from it for the
+       WHOLE consume — the source is the `this` of the @@iterator call and of every .next(), and a mapfn/thisArg
+       is read at the finish. Owning the list is one rule for every arm; dup-what-you-keep would be a different
+       rule per arm, and the arm that got it wrong would dangle. NULL = the ordinary case, where the arguments
+       are caller operands the frame keeps alive. */
+    JSValue *args_own;
+    int args_own_n;
     /* TypedArray.from, 23.2.2.1 step 5. The collect (5.a/5.b) is the ordinary FROM sink; what follows is two more
        phases the C entry used to do in a loop: 5.c CREATE the target by CONSTRUCTING the receiver with the
        collected length, then 5.d MAP+SET each element. Both run user code, so both are phases of this machine
@@ -19753,7 +19759,7 @@ static void sum_precise_add(SumPreciseState *s, double d);
 static double sum_precise_get_result(SumPreciseState *s);
 static JSValue js_math_sumPrecise(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 #define ITERCONS_OWNED(F) F(r) F(iter) F(next) F(adder) F(mapfn) F(mapfn_this) F(cb_value) F(ta_target) \
-                          F(ent_obj) F(ent_key) F(ent_val) F(from_ctor) F(super_ref) F(src_own)
+                          F(ent_obj) F(ent_key) F(ent_val) F(from_ctor) F(super_ref)
 /* NOTE: JSIteratorHelperData::cb_value is owned too — freed by the finalizer and cleared on every path below. */
 static int js_iter_consume_step(JSContext *ctx, struct JSIterConsume *s, JSValue res);
 static void js_iter_consume_end(JSContext *ctx, struct JSIterConsume *s);
@@ -19826,6 +19832,9 @@ typedef struct JSPromiseAll {
     JSValue fin_arg;             /* the finalize argument (values dup / AggregateError), owned only in the brief
                                     window before it is transferred onto the tramp operand stack */
     int orig_cfirst, orig_cargc; uint8_t orig_is_tail;   /* the ORIGINAL OP_call_method operand shape */
+    /* mirrors JSIterConsume's: an .apply / spread CALL's arguments live in a heap list, and the iterable is
+       borrowed out of it until the acquire has an iterator. */
+    JSValue *args_own; int args_own_n;
 } JSPromiseAll;
 static int js_promise_all_step(JSContext *ctx, struct JSPromiseAll *s, JSValue res);
 static int js_promise_all_attach(JSContext *ctx, struct JSPromiseAll *s, int index, JSValue next_promise);
@@ -21083,8 +21092,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                                                         entry shapes, ctor and super() */
     int smc_cfirst = -2, smc_cargc = 0; JSValue smc_super_ref = JS_UNDEFINED;
     JSValue pe_executor_own = JS_UNDEFINED;   /* owned executor for the Reflect.construct spelling */
-    JSValue smc_src_own = JS_UNDEFINED;       /* owned iterable when `new Map(...arr)` took its args from a list */
-    JSValue tac_src_own = JS_UNDEFINED;       /* the same for `new Int8Array(...arr)` */
+    /* The heap argument LIST a spread / .apply shape built, handed to whichever consumer arm runs so the state
+       can own it for the whole consume. NULL = the arguments are caller operands. */
+    JSValue *smc_args_own = NULL; int smc_args_own_n = 0;
+    JSValue *tac_args_own = NULL; int tac_args_own_n = 0;
     JSPromiseExec *pexec_finish_state = NULL;   /* set by whichever dispatch shape reaches do_promise_exec_finish */
     JSPromiseTry *ptry_finish_state = NULL;     /* set by the CONT_PROMISE_TRY return that reaches do_promise_try_finish */
     uint8_t rerep_direct = 0;                           /* 1 = re[@@replace](str,fn) shape, 0 = str.replace(re,fn) */
@@ -21144,6 +21155,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        the way OP_init_ctor's partial copy of this chain already had: it knew Map/Set and String but not
        TypedArray, so `class S extends Int8Array {}` reached the C entry. */
     JSValueConst *tac_args = NULL; int tac_argc = 0, tac_cfirst = -2, tac_cargc = -1;
+    /* The CALL shape's operand-pop count and heap argument list, the mirror of con_cargc / con_args_owned on the
+       construct side. An .apply / spread CALL pushes the fixed [f, thisArg, array] triple and takes its arguments
+       from the array, so the count it pops is NOT call_argc. -1 / NULL = the arguments ARE the operands. Both are
+       CONSUMED by whichever arm runs: leaving either set makes the next call on this frame pop the wrong count. */
+    int call_cargc = -1;
+/* READ-AND-CONSUME, at the point of use. A derived-once variable carried across the arms goes stale the moment
+   one arm forwards to another that does not record a shape (a bound bytecode target), and the next call on this
+   frame then pops the previous one's count — the construct side's con_cargc lost a day to exactly that. Written
+   as a macro so "resolve it" and "consume it" cannot be separated. */
+    int call_pop = 0;   /* scratch for TAKE_CALL_POP */
+#define TAKE_CALL_POP() (call_pop = (call_cargc >= 0) ? call_cargc : call_argc, call_cargc = -1, call_pop)
+    JSValue *call_args_owned = NULL; int call_args_owned_n = 0;
     JSValueConst tac_ntgt = JS_UNDEFINED;
     JSValue tac_super_ref = JS_UNDEFINED;   /* the super() entry's owned parent-class ref; the state frees it */
     uint8_t setop_kind = 0;                             /* s.union/symmetricDifference recognition: SETOP_* (consumed by do_setop_consume_tramp) */
@@ -22425,10 +22448,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (JS_IsException(rp)) { js_free_rt(rt, s); goto exception; }
                 s->promise = rp;
                 s->nargs = nargs;
-                s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
+                s->orig_cfirst = -2; s->orig_cargc = TAKE_CALL_POP(); s->orig_is_tail = tramp_is_tail;
                 s->cb_args[0] = JS_UNDEFINED;          /* thisArgument for fn is undefined */
                 s->cb_args[1] = js_dup(fn);
                 for (i = 0; i < nargs; i++) s->cb_args[2 + i] = js_dup(call_argv[1 + i]);
+                /* everything this state keeps is dup'd above, so an .apply/spread list is done with here */
+                if (call_args_owned) {
+                    free_arg_list(ctx, call_args_owned, call_args_owned_n);
+                    call_args_owned = NULL; call_args_owned_n = 0;
+                }
                 call_argv = (JSValueConst *)&s->cb_args[2]; call_argc = nargs; tramp_first = -2; tramp_is_tail = 0;
                 tramp_cont_state = s; tramp_cont_kind = CONT_PROMISE_TRY;
                 goto do_tramp_call;   /* bytecode fn: its body runs on THIS chain and can park */
@@ -22516,13 +22544,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     DCHECK(!con_outer, "a step machine's Construct reached the Map/Set consumer arm — build its "
                                        "outer delivery");
                     smc_ntgt = con_ntgt; smc_items = (con_argc > 0) ? con_args[0] : JS_UNDEFINED;
-                    if (con_args_owned) {
-                        /* the source outlives this arm — it is the `this` of the @@iterator call and then of
-                           every .next() — so it moves onto the consumer state before the list goes */
-                        smc_src_own = js_dup(smc_items);
-                        free_arg_list(ctx, con_args_owned, con_argc); con_args_owned = NULL; con_args = NULL;
-                        smc_items = smc_src_own;
-                    }
+                    /* the source outlives this arm — it is the `this` of the @@iterator call and then of every
+                       .next() — so the LIST it lives in moves onto the consumer state */
+                    smc_args_own = con_args_owned; smc_args_own_n = con_args_owned ? con_argc : 0;
+                    con_args_owned = NULL;
                     smc_cfirst = tramp_first; smc_cargc = con_pop;
                     smc_super_ref = con_super_ref; con_super_ref = JS_UNDEFINED;
                     tramp_is_tail = 0; goto do_setmap_consume_tramp;
@@ -22532,13 +22557,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                        "outer delivery");
                     tac_args = con_args; tac_argc = con_argc; tac_ntgt = con_ntgt; tac_cfirst = tramp_first;
                     tac_cargc = con_pop;
-                    if (con_args_owned) {
-                        /* same as Map/Set: only argument 0 (the source) is read on the construct path — mapfn
-                           and thisArg belong to TypedArray.from, which is a CALL and never arrives here. */
-                        tac_src_own = js_dup(con_args[0]);
-                        free_arg_list(ctx, con_args_owned, con_argc); con_args_owned = NULL;
-                        con_args = NULL; tac_args = NULL;
-                    }
+                    tac_args_own = con_args_owned; tac_args_own_n = con_args_owned ? con_argc : 0;
+                    con_args_owned = NULL;   /* same as Map/Set: the state owns it for the whole consume */
                     tac_super_ref = con_super_ref; con_super_ref = JS_UNDEFINED;
                     tramp_is_tail = 0; goto do_ta_consume_tramp;
                 }
@@ -22819,50 +22839,33 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     DCHECK(ap_tbe == TBE_AGEN, "apply-mode body entry: unhandled coroutine kind");
                     goto do_agen_create_tramp;
                 }
-                if (ap_tbe == TBE_NONE && !tramp_step_def_of(nfunc)) {
-                    /* a PLAIN C / bound / proxy target. It holds no continuation and has no preemptible body, so
-                       invoking it here is complete — and handling it HERE is what lets the three call-site gates
-                       drop their `(tramp_can_call(t) || tramp_step_def_of(t))` half. .apply is call-site-resolved
-                       (§C-stack): the operator site always reshapes, and what the TARGET happens to be is not a
-                       question the call site should be asking. */
-                    uint32_t alen3 = 0; JSValue *atab3 = NULL;
-                    int cf3 = ap_cfirst, ca3 = ap_cargc; uint8_t it3 = tramp_is_tail;
-                    JSValue *cargv3;
+                if (ap_tbe == TBE_NONE) {
+                    /* A target with NO bytecode body: a consumer builtin, a step machine, a bound function, a
+                       proxy, a plain C function. WHICH it is is not this site's question — asking it here is how
+                       `Array.from(...[src])` and `Int8Array.from(...[src])` ended up at their C entries while
+                       `Array.from(src)` did not, one builtin answering differently by how the call was written.
+                       So this shape converges like every other -2 call: on do_consumer_dispatch, and through it
+                       do_generic_callee. The arguments come from the ARRAY, so they go in a heap list with TWO
+                       LEADING SLOTS holding `this` and the callee — that is exactly the [this, f, args] layout
+                       those chains read, and it means neither of them needs to know the list exists. What the
+                       chain does need to know is that the OPERANDS are still the apply triple on the stack:
+                       call_cargc says so, and each arm reads-and-consumes it through TAKE_CALL_POP. */
+                    uint32_t alen3 = 0; JSValue *atab3 = NULL, *pre3;
+                    uint32_t k3;
                     if (JS_VALUE_GET_TAG(arrayArg) != JS_TAG_UNDEFINED && JS_VALUE_GET_TAG(arrayArg) != JS_TAG_NULL) {
                         atab3 = build_arg_list(ctx, &alen3, arrayArg);
                         if (unlikely(!atab3)) goto exception;
                     }
-                    ret_val = JS_Call(ctx, nfunc, thisArg, (int)alen3, (JSValueConst *)atab3);
-                    free_arg_list(ctx, atab3, alen3);
-                    if (unlikely(JS_IsException(ret_val))) goto exception;
-                    cargv3 = sp - ca3;
-                    for (i = cf3; i < ca3; i++) JS_FreeValue(ctx, cargv3[i]);
-                    sp += cf3 - ca3;
-                    if (it3) goto do_return;
-                    *sp++ = ret_val;
-                    BREAK;
-                }
-                {   /* the target may be a STEP builtin (f.apply / Reflect.apply / the spread). It has no bytecode
-                       body, so the code below does not apply — route it onto the one step driver here. There is no
-                       fallback to fall through TO: js_call_c_function now DFAILs on a step builtin, so a call
-                       shape that is not routed crashes loud instead of quietly losing suspension. */
-                    const JSTrampStepDef *sd = tramp_step_def_of(nfunc);
-                    if (sd) {
-                        uint32_t alen2 = 0; JSValue *atab2 = NULL; void *stt;
-                        if (JS_VALUE_GET_TAG(arrayArg) != JS_TAG_UNDEFINED && JS_VALUE_GET_TAG(arrayArg) != JS_TAG_NULL) {
-                            atab2 = build_arg_list(ctx, &alen2, arrayArg);
-                            if (unlikely(!atab2)) goto exception;
-                        }
-                        stt = tramp_step_state_new(ctx, sd, thisArg, (int)alen2, (JSValueConst *)atab2, nfunc);
-                        free_arg_list(ctx, atab2, alen2);
-                        if (unlikely(!stt)) goto exception;
-                        ((JSStepHdr *)stt)->orig_cfirst = ap_cfirst;   /* the APPLY operand shape, not a method call's */
-                        ((JSStepHdr *)stt)->orig_cargc = ap_cargc;
-                        ((JSStepHdr *)stt)->orig_is_tail = tramp_is_tail;
-                        cont_st = stt;
-                        ret_val = JS_UNDEFINED;
-                        goto do_step_step;
-                    }
+                    pre3 = js_malloc(ctx, sizeof(JSValue) * (size_t)(alen3 + 2));
+                    if (unlikely(!pre3)) { free_arg_list(ctx, atab3, alen3); goto exception; }
+                    pre3[0] = js_dup(thisArg);
+                    pre3[1] = js_dup(nfunc);
+                    for (k3 = 0; k3 < alen3; k3++) pre3[2 + k3] = atab3[k3];   /* values MOVE; only the array goes */
+                    js_free(ctx, atab3);
+                    call_args_owned = pre3; call_args_owned_n = (int)alen3 + 2;
+                    call_argv = (JSValueConst *)&pre3[2]; call_argc = (int)alen3;
+                    tramp_first = -2; call_cargc = ap_cargc;   /* [f, thisArg, array] stays on the stack */
+                    goto do_consumer_dispatch;
                 }
                 np = JS_VALUE_GET_OBJ(nfunc);
                 JSFunctionBytecode *nb = np->u.func.function_bytecode;
@@ -22959,7 +22962,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 ntf->caller_arg_allocated_size = arg_allocated_size;
                 ntf->caller_sp = sp;
                 DCHECK(tramp_first == -1 || tramp_first == -2, "bound-call reshape: unknown caller operand shape");
-                ntf->call_first = tramp_first; ntf->call_argc = call_argc; ntf->is_tail = tramp_is_tail;
+                ntf->call_first = tramp_first; ntf->call_argc = TAKE_CALL_POP(); ntf->is_tail = tramp_is_tail;
+                if (call_args_owned) {   /* the arguments are copied into the callee's own arg_buf below */
+                    free_arg_list(ctx, call_args_owned, call_args_owned_n);
+                    call_args_owned = NULL; call_args_owned_n = 0;
+                }
                 ntf->b = nb; ntf->ctx = nb->realm; ntf->local_buf = nlb;
                 nsf = &ntf->sf;
                 nsf->is_strict_mode = nb->is_strict_mode;
@@ -23024,6 +23031,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto do_objentries_consume_tramp;           /* Object.fromEntries(iterable) */
                 if (tramp_can_call_ta_from_consume(ctx, call_argv[-1], call_argv[-2], vc(call_argv), call_argc, &ta_classid, &tramp_iter_getiter)) {
                     tac_args = vc(call_argv); tac_argc = call_argc; tac_ntgt = call_argv[-2]; tac_cfirst = -2;
+                    /* this arm records its shape LATER, in do_ta_consume_tramp, so it is the one that has to carry
+                       the resolved pop count and the list rather than recording them here */
+                    tac_cargc = TAKE_CALL_POP();
+                    tac_args_own = call_args_owned; tac_args_own_n = call_args_owned_n;
+                    call_args_owned = NULL; call_args_owned_n = 0;
                     ta_from = 1; tramp_is_tail = 0; goto do_ta_consume_tramp;   /* TypedArray.from(iterable) — never tail */
                 }
                 if (tramp_can_call_promise_all(ctx, call_argv[-1], vc(call_argv), call_argc, &pa_magic, &tramp_iter_getiter))
@@ -23071,8 +23083,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         js_free(ctx, ab5);
                         if (unlikely(!stt5)) goto exception;
                         ((JSStepHdr *)stt5)->orig_cfirst = tramp_first;
-                        ((JSStepHdr *)stt5)->orig_cargc = call_argc;
+                        ((JSStepHdr *)stt5)->orig_cargc = TAKE_CALL_POP();
                         ((JSStepHdr *)stt5)->orig_is_tail = tramp_is_tail;
+                        if (call_args_owned) {   /* the state captured the invocation */
+                            free_arg_list(ctx, call_args_owned, call_args_owned_n);
+                            call_args_owned = NULL; call_args_owned_n = 0;
+                        }
                         cont_st = stt5;
                         ret_val = JS_UNDEFINED;
                         goto do_step_step;
@@ -23087,15 +23103,32 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 ret_val = JS_CallInternal(ctx, call_argv[-1], gthis, JS_UNDEFINED,
                                           call_argc, vc(call_argv), 0);
+                /* the arguments were read; an apply shape's list is done with HERE, before either exit — the tail
+                   exit below never reaches the cleanup block, which is where it leaked. */
+                if (call_args_owned) {
+                    free_arg_list(ctx, call_args_owned, call_args_owned_n);
+                    call_args_owned = NULL; call_args_owned_n = 0;
+                }
                 if (unlikely(JS_IsException(ret_val)))
                     goto exception;
-                if (tramp_is_tail)
+                if (tramp_is_tail) {
+                    (void)TAKE_CALL_POP();   /* the frame unwind pops; the shape must not outlive this call */
                     goto do_return;   /* NOT `done`: a trampolined caller must UNWIND its tramp chain (do_return
                                          pops it, or falls to `done` at the base) — `goto done` would abandon
                                          tf_top, leaking the trampoline frames' held values. */
-                for (i = tramp_first; i < call_argc; i++)
-                    JS_FreeValue(ctx, call_argv[i]);
-                sp += tramp_first - call_argc;
+                }
+                {
+                    JSValue *cargv;
+                    int pop = TAKE_CALL_POP();
+                    cargv = sp - pop;   /* the OPERANDS, which are not call_argv for an apply shape */
+                    if (call_args_owned) {
+                        free_arg_list(ctx, call_args_owned, call_args_owned_n);
+                        call_args_owned = NULL; call_args_owned_n = 0;
+                    }
+                    for (i = tramp_first; i < pop; i++)
+                        JS_FreeValue(ctx, cargv[i]);
+                    sp += tramp_first - pop;
+                }
                 *sp++ = ret_val;
             }
             BREAK;
@@ -23137,8 +23170,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 /* an inner machine's arguments live in the OUTER state's buffer, never on the stack, so its
                    operand shape is empty — recording the caller's would free slots it does not own. */
                 h->orig_cfirst = tramp_step_outer ? 0 : tramp_first;
-                h->orig_cargc = tramp_step_outer ? 0 : call_argc;
+                h->orig_cargc = tramp_step_outer ? 0 : TAKE_CALL_POP();
                 h->orig_is_tail = tramp_step_outer ? 0 : tramp_is_tail;
+                if (call_args_owned) {   /* the state captured the invocation */
+                    free_arg_list(ctx, call_args_owned, call_args_owned_n);
+                    call_args_owned = NULL; call_args_owned_n = 0;
+                }
                 tramp_step_outer = NULL; tramp_step_outer_kind = CONT_NONE;   /* read + reset */
                 cont_st = stt;
                 ret_val = JS_UNDEFINED;
@@ -23293,7 +23330,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                                     call_argv[-2], call_argc, vc(call_argv), call_argv[-1]);
                 if (unlikely(!fl_stt)) goto exception;
                 ((JSStepHdr *)fl_stt)->orig_cfirst = -2;
-                ((JSStepHdr *)fl_stt)->orig_cargc = call_argc;
+                ((JSStepHdr *)fl_stt)->orig_cargc = TAKE_CALL_POP();
+                if (call_args_owned) {   /* the state captured the invocation */
+                    free_arg_list(ctx, call_args_owned, call_args_owned_n);
+                    call_args_owned = NULL; call_args_owned_n = 0;
+                }
                 ((JSStepHdr *)fl_stt)->orig_is_tail = tramp_is_tail;
                 cont_st = fl_stt;
                 ret_val = JS_UNDEFINED;
@@ -23323,7 +23364,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->from_ctor = (sink0 == ITERCONS_FROM) ? js_dup(thisv) : JS_UNDEFINED;
                 s->from_owes_result = (sink0 == ITERCONS_FROM);
                 if (sink0 == ITERCONS_SUMPRECISE) sum_precise_init(&s->sum);
-                s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
+                s->orig_cfirst = -2; s->orig_cargc = TAKE_CALL_POP(); s->orig_is_tail = tramp_is_tail;
+                s->args_own = call_args_owned; s->args_own_n = call_args_owned_n;
+                call_args_owned = NULL; call_args_owned_n = 0;
                 DCHECK(call_argc >= 1, "the consume entry reads call_argv[0]; the recognizer refuses argc 0, whose "
                                        "whole algorithm is GetMethod(undefined)'s TypeError with no user code in it");
                 tramp_consume_iterable = call_argv[0];
@@ -23367,7 +23410,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->k = 0;
                 s->sink = ITERCONS_ITERTERM;
                 s->setop = iterterm_kind;
-                s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
+                s->orig_cfirst = -2; s->orig_cargc = TAKE_CALL_POP(); s->orig_is_tail = tramp_is_tail;
+                s->args_own = call_args_owned; s->args_own_n = call_args_owned_n;
+                call_args_owned = NULL; call_args_owned_n = 0;
                 cont_st = s;
                 ret_val = JS_UNINITIALIZED;
                 goto do_iter_consume_step;
@@ -23419,7 +23464,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->k = 1;                     /* isSupersetOf: found-so-far = true (unused by union/symmetricDifference) */
                 s->sink = ITERCONS_SETOP;
                 s->setop = setop_kind;
-                s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
+                s->orig_cfirst = -2; s->orig_cargc = TAKE_CALL_POP(); s->orig_is_tail = tramp_is_tail;
+                s->args_own = call_args_owned; s->args_own_n = call_args_owned_n;
+                call_args_owned = NULL; call_args_owned_n = 0;
                 tramp_iter_getiter = keys;   /* the acquire CALLS it on setlike (create-on-tramp if it is a generator fn) */
                 tramp_consume_iterable = setlike; tramp_consume_state = s; tramp_consume_kind = CONT_ITER_CONSUME;
                 goto do_consume_acquire_iterator;
@@ -23448,7 +23495,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s = js_mallocz(ctx, sizeof(*s));
                 if (unlikely(!s)) { JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED;
                                     JS_ThrowOutOfMemory(ctx); goto exception; }
-                s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
+                s->orig_cfirst = -2; s->orig_cargc = TAKE_CALL_POP(); s->orig_is_tail = tramp_is_tail;
+                s->args_own = call_args_owned; s->args_own_n = call_args_owned_n;
+                call_args_owned = NULL; call_args_owned_n = 0;
                 tramp_consume_iterable = obj; tramp_consume_state = s; tramp_consume_kind = CONT_ITER_FROM;
                 goto do_consume_acquire_iterator;
             }
@@ -23939,6 +23988,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JSValue nextm, r;
                     JSIteratorWrapData *wd;
                     int isit;
+                    if (fs->args_own) free_arg_list(ctx, fs->args_own, fs->args_own_n);
                     js_free_rt(rt, fs);
                     if (JS_IsException(acq)) goto exception;
                     if (!JS_IsObject(acq)) {
@@ -24025,7 +24075,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->sink = (magic & MAGIC_SET) ? ITERCONS_SET : ITERCONS_MAP;
                 s->orig_cfirst = smc_cfirst; s->orig_cargc = smc_cargc; s->orig_is_tail = tramp_is_tail;
                 s->super_ref = smc_super_ref; smc_super_ref = JS_UNDEFINED;   /* super() entry owns it */
-                s->src_own = smc_src_own; smc_src_own = JS_UNDEFINED;   /* the spread's list is already gone */
+                s->args_own = smc_args_own; s->args_own_n = smc_args_own_n;   /* NULL for an operand shape */
+                smc_args_own = NULL; smc_args_own_n = 0;
                 tramp_consume_iterable = smc_items; tramp_consume_state = s; tramp_consume_kind = CONT_ITER_CONSUME;
                 goto do_consume_acquire_iterator;
             }
@@ -24042,7 +24093,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->r = obj;
                 s->k = 0;
                 s->sink = ITERCONS_OBJENTRIES;
-                s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
+                s->orig_cfirst = -2; s->orig_cargc = TAKE_CALL_POP(); s->orig_is_tail = tramp_is_tail;
+                s->args_own = call_args_owned; s->args_own_n = call_args_owned_n;
+                call_args_owned = NULL; call_args_owned_n = 0;
                 /* argc 0 means the source is UNDEFINED, which the acquire turns into GetIterator's TypeError —
                    reading call_argv[0] there would read the slot ABOVE the operands. */
                 tramp_consume_iterable = (call_argc >= 1) ? call_argv[0] : JS_UNDEFINED;
@@ -24116,8 +24169,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->adder = js_dup(ntgt);   /* the new_target/ctor, used at the finish to create the typed array */
                 /* TypedArray.from(gen, mapfn, thisArg): carry the mapfn; it is applied at the finish (via
                    js_typed_array_from on the collected array — spec map-after-create order), NOT during the collect. */
-                DCHECK(!is_from || ta_argv != NULL,
-                       "TypedArray.from is a CALL: its operands are the caller's, never a construct spread's list");
                 s->mapfn = (is_from && ta_argc >= 2) ? js_dup(ta_argv[1]) : JS_UNDEFINED;
                 s->mapfn_this = (is_from && ta_argc >= 3) ? js_dup(ta_argv[2]) : JS_UNDEFINED;
                 s->ta_classid = is_from ? 0 : ta_classid;   /* the from path CONSTRUCTS the receiver; only new TypedArray(iterable) creates by class id */
@@ -24138,12 +24189,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->k = 0;
                 s->sink = ITERCONS_FROM;
                 s->super_ref = tac_super_ref; tac_super_ref = JS_UNDEFINED;
-                s->src_own = tac_src_own; tac_src_own = JS_UNDEFINED;   /* the spread's list is already gone */
+                s->args_own = tac_args_own; s->args_own_n = tac_args_own_n;   /* NULL for an operand shape */
+                tac_args_own = NULL; tac_args_own_n = 0;
                 s->orig_cfirst = tac_cfirst;
                 s->orig_cargc = tac_cfirst ? (tac_cargc >= 0 ? tac_cargc : ta_argc) : 0;
                 tac_cargc = -1;   /* read + reset */
                 DCHECK(ta_argc >= 1, "the TypedArray consume arm reads its source; the recognizers refuse argc 0");
-                tramp_consume_iterable = JS_IsUndefined(s->src_own) ? ta_argv[0] : (JSValueConst)s->src_own;
+                tramp_consume_iterable = ta_argv[0];
                 tramp_consume_state = s; tramp_consume_kind = CONT_ITER_CONSUME;
                 goto do_consume_acquire_iterator;
             }
@@ -24383,7 +24435,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->elem_promises = JS_NewArray(ctx);
                 s->index = 0;
                 s->magic = pa_magic;
-                s->orig_cfirst = -2; s->orig_cargc = call_argc; s->orig_is_tail = tramp_is_tail;
+                s->orig_cfirst = -2; s->orig_cargc = TAKE_CALL_POP(); s->orig_is_tail = tramp_is_tail;
+                s->args_own = call_args_owned; s->args_own_n = call_args_owned_n;
+                call_args_owned = NULL; call_args_owned_n = 0;
                 if (JS_IsException(s->promise_resolve) || !JS_IsFunction(ctx, s->promise_resolve)
                     || JS_IsException(s->values) || JS_IsException(s->resolve_element_env)
                     || JS_IsException(s->elem_promises)
@@ -28842,6 +28896,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         }
     }
  exception:
+    /* An arm that threw BEFORE adopting the call shape must not leave it behind: the list would leak and the
+       resolved pop count would be read by the next call this frame makes (a catch resumes in this same frame).
+       The same rule as the construct side's con_cargc, applied where every abrupt path converges. */
+    if (call_args_owned) { free_arg_list(ctx, call_args_owned, call_args_owned_n); call_args_owned = NULL; call_args_owned_n = 0; }
+    call_cargc = -1;
     if (unlikely(ctx->pending_import_cap != NULL && ctx->pending_import_cap->sf == sf)) {
         /* the unwind is back in the frame that issued OP_import, so its operands and its continuation pc are
            ours again: the throw becomes the capability's rejection and the promise becomes the opcode's result.
@@ -52933,6 +52992,7 @@ static void js_iter_consume_end(JSContext *ctx, JSIterConsume *s)
     #define ITERCONS_FREE_ONE(f) JS_FreeValue(ctx, s->f);
     ITERCONS_OWNED(ITERCONS_FREE_ONE)
     #undef ITERCONS_FREE_ONE
+    if (s->args_own) { free_arg_list(ctx, s->args_own, s->args_own_n); s->args_own = NULL; s->args_own_n = 0; }
 }
 
 /* A phase this machine asked the interpreter to run (the entry key's ToPrimitive) THREW where there is no way
@@ -68489,6 +68549,7 @@ static void js_promise_all_end(JSContext *ctx, JSPromiseAll *s)
     JS_FreeValue(ctx, s->values);
     JS_FreeValue(ctx, s->resolve_element_env);
     JS_FreeValue(ctx, s->elem_promises);
+    if (s->args_own) { free_arg_list(ctx, s->args_own, s->args_own_n); s->args_own = NULL; s->args_own_n = 0; }
 }
 
 /* Route Promise.all / allSettled / any over a GENERATOR-BACKED iterable (its .next() must run on the tramp); `race`
