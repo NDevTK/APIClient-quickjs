@@ -1443,6 +1443,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_TA_JOIN, STEPDEF_TA_TOLOCALESTRING,
     STEPDEF_BIGINT_ASUINTN, STEPDEF_BIGINT_ASINTN,
     STEPDEF_OBJ_GOPD, STEPDEF_REFLECT_GOPD,
+    STEPDEF_OBJ_VALUES, STEPDEF_OBJ_ENTRIES,
     STEPDEF_REGEXP_EXEC, STEPDEF_REGEXP_TEST,
     STEPDEF_ITER_TAKE, STEPDEF_ITER_DROP,
     STEPDEF_FUNCTION_CTOR, STEPDEF_GENERATOR_FUNCTION_CTOR,
@@ -1588,8 +1589,7 @@ static int JS_GetOwnPropertyInternal(JSContext *ctx, JSPropertyDescriptor *desc,
                                      JSObject *p, JSAtom prop);
 static int JS_GetOwnPropertyFlagsInternal(JSContext *ctx, int *pflags,
                                           JSObject *p, JSAtom prop);
-static JSValue JS_GetOwnPropertyNames2(JSContext *ctx, JSValueConst obj1,
-                                       int flags, int kind);
+static JSValue JS_GetOwnPropertyNames2(JSContext *ctx, JSValueConst obj1, int flags);
 static void js_free_desc(JSContext *ctx, JSPropertyDescriptor *desc);
 static void async_func_mark(JSRuntime *rt, JSAsyncFunctionState *s,
                             JS_MarkFunc *mark_func);
@@ -9153,7 +9153,7 @@ static JSValue js_getOwnPropertyKeys(JSContext *ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv)
 {
     int flags = JS_GPN_STRING_MASK|JS_GPN_SYMBOL_MASK;
-    return JS_GetOwnPropertyNames2(ctx, argv[0], flags, JS_ITERATOR_KIND_KEY);
+    return JS_GetOwnPropertyNames2(ctx, argv[0], flags);
 }
 
 static JSValue js_hasOwnEnumProperty(JSContext *ctx, JSValueConst this_val,
@@ -19843,6 +19843,23 @@ typedef struct JSArrayAt {
     JSValue result;       /* DONE (owned) */
     int64_t len, idx;
 } JSArrayAt;
+
+/* Object.values / Object.entries: EnumerableOwnProperties (7.3.23) — snapshot the own keys, then READ each one.
+   Every read is the page's code (an accessor, a Proxy `get` trap) and JS_GetOwnPropertyNames2 performed it with
+   JS_GetProperty from C, so a getter containing a loop drove to completion. Object.keys is NOT part of this
+   machine: KIND_KEY never reads a value, so it is a different algorithm with no user code in it at all, not a
+   fallback this could absorb — the same split as an array-like versus an iterable. */
+typedef struct JSPropWalk {
+    JSStepHdr hdr;          /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    JSValue obj;            /* ToObject(argv[0]) (owned) */
+    JSValue result;         /* the array being built (owned) */
+    JSValue el;             /* the value a read produced, held across its suspension (owned) */
+    JSPropertyEnum *atoms;  /* the own-key snapshot (owned) */
+    uint32_t len;           /* how many keys the snapshot holds */
+    uint32_t i, j;          /* the key cursor and the output cursor — they diverge, keys can be skipped */
+} JSPropWalk;
+#define PROPWALK_VALUES  0
+#define PROPWALK_ENTRIES 1
 
 /* indexOf / lastIndexOf / includes: ONE machine, three modes. They differ only in the search direction, the
    fromIndex clamp and the equality (strict vs SameValueZero); the part that had to change is the same in all
@@ -50003,10 +50020,14 @@ exception:
     return JS_EXCEPTION;
 }
 
-static JSValue JS_GetOwnPropertyNames2(JSContext *ctx, JSValueConst obj1,
-                                       int flags, int kind)
+/* The KEY list of an object's own properties, as an Array: Object.keys / getOwnPropertyNames /
+   getOwnPropertySymbols / Reflect.ownKeys. It used to take a `kind` and additionally READ each value for
+   Object.values / Object.entries — reads that are the page's code and ran from here, off the tramp. Those two are
+   the JSPropWalk step machine now, and every remaining caller wants keys, so the parameter and both value branches
+   are gone rather than left as an unreachable second algorithm. */
+static JSValue JS_GetOwnPropertyNames2(JSContext *ctx, JSValueConst obj1, int flags)
 {
-    JSValue obj, r, val, key, value;
+    JSValue obj, r, val;
     JSObject *p;
     JSPropertyEnum *atoms;
     uint32_t len, i, j;
@@ -50036,41 +50057,14 @@ static JSValue JS_GetOwnPropertyNames2(JSContext *ctx, JSValueConst obj1,
             if (!(desc_flags & JS_PROP_ENUMERABLE))
                 continue;
         }
-        switch(kind) {
-        default:
-        case JS_ITERATOR_KIND_KEY:
-            val = JS_AtomToValue(ctx, atom);
-            if (JS_IsException(val))
-                goto exception;
-            break;
-        case JS_ITERATOR_KIND_VALUE:
-            val = JS_GetProperty(ctx, obj, atom);
-            if (JS_IsException(val))
-                goto exception;
-            break;
-        case JS_ITERATOR_KIND_KEY_AND_VALUE:
-            val = JS_NewArray(ctx);
-            if (JS_IsException(val))
-                goto exception;
-            key = JS_AtomToValue(ctx, atom);
-            if (JS_IsException(key))
-                goto exception1;
-            if (JS_CreateDataPropertyUint32(ctx, val, 0, key, JS_PROP_THROW) < 0)
-                goto exception1;
-            value = JS_GetProperty(ctx, obj, atom);
-            if (JS_IsException(value))
-                goto exception1;
-            if (JS_CreateDataPropertyUint32(ctx, val, 1, value, JS_PROP_THROW) < 0)
-                goto exception1;
-            break;
-        }
+        val = JS_AtomToValue(ctx, atom);
+        if (JS_IsException(val))
+            goto exception;
         if (JS_CreateDataPropertyUint32(ctx, r, j++, val, 0) < 0)
             goto exception;
     }
     goto done;
 
-exception1:
-    JS_FreeValue(ctx, val);
 exception:
     JS_FreeValue(ctx, r);
     r = JS_EXCEPTION;
@@ -50080,18 +50074,101 @@ done:
     return r;
 }
 
+/* Object.values / Object.entries — 7.3.23 EnumerableOwnProperties as a STEP MACHINE (see JSPropWalk). One read is
+   requested per key through step_getprop_run, which is the shared entry that routes an accessor body and a Proxy
+   `get` trap onto the tramp chain (and does a data slot inline), so a getter with a loop in it parks like any other
+   call instead of driving to completion inside JS_GetOwnPropertyNames2. */
+static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSPropWalk *s = st;
+    int entries = (s->hdr.arg == PROPWALK_ENTRIES);
+    int r;
+
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        /* FIRST, before anything that can throw: the teardown frees exactly what the state holds, so a field
+           handed over late is a leak and a buffer initialised late is freed with a NULL context. */
+        s->obj = JS_UNDEFINED; s->result = JS_UNDEFINED; s->el = JS_UNDEFINED;
+        s->atoms = NULL; s->len = 0; s->i = 0; s->j = 0;
+        s->obj = JS_ToObject(ctx, step_arg(&s->hdr, 0));
+        if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
+        /* the snapshot is taken WITHOUT JS_GPN_ENUM_ONLY and each key's enumerability re-checked below, because
+           the reads run between the snapshot and the check and one of them can redefine a later key. */
+        if (JS_GetOwnPropertyNamesInternal(ctx, &s->atoms, &s->len, JS_VALUE_GET_OBJ(s->obj),
+                                           JS_GPN_STRING_MASK)) {
+            s->atoms = NULL; s->len = 0;
+            return -1;
+        }
+        s->result = JS_NewArray(ctx);
+        if (JS_IsException(s->result)) { s->result = JS_UNDEFINED; return -1; }
+        s->hdr.stage = 1;
+    }
+    for (;;) {
+        if (s->hdr.stage == 1) {
+            int desc_flags, res;
+            if (s->i >= s->len) {
+                JS_FreeValue(ctx, cb_result);
+                return 0;   /* DONE: fini hands back s->result */
+            }
+            res = JS_GetOwnPropertyFlagsInternal(ctx, &desc_flags, JS_VALUE_GET_OBJ(s->obj),
+                                                 s->atoms[s->i].atom);
+            if (res < 0) { JS_FreeValue(ctx, cb_result); return -1; }
+            if (!res || !(desc_flags & JS_PROP_ENUMERABLE)) { s->i++; continue; }
+            s->hdr.stage = 2;
+        }
+        if (s->hdr.stage == 2) {
+            r = step_getprop_run(ctx, &s->hdr, s->obj, s->atoms[s->i].atom, cb_result,
+                                 &s->el, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->hdr.stage = 3;
+        }
+        if (s->hdr.stage == 3) {
+            JSValue item = s->el;
+            s->el = JS_UNDEFINED;   /* the state no longer owns it: every path below consumes it */
+            if (entries) {
+                JSValue pair = JS_NewArray(ctx), key;
+                if (JS_IsException(pair)) { JS_FreeValue(ctx, item); return -1; }
+                key = JS_AtomToValue(ctx, s->atoms[s->i].atom);
+                if (JS_IsException(key)) { JS_FreeValue(ctx, pair); JS_FreeValue(ctx, item); return -1; }
+                if (JS_CreateDataPropertyUint32(ctx, pair, 0, key, JS_PROP_THROW) < 0) {
+                    JS_FreeValue(ctx, pair); JS_FreeValue(ctx, item); return -1;
+                }
+                if (JS_CreateDataPropertyUint32(ctx, pair, 1, item, JS_PROP_THROW) < 0) {
+                    JS_FreeValue(ctx, pair); return -1;   /* item was consumed by the failing call */
+                }
+                item = pair;
+            }
+            if (JS_CreateDataPropertyUint32(ctx, s->result, s->j++, item, 0) < 0)
+                return -1;
+            s->i++;
+            s->hdr.stage = 1;
+        }
+    }
+}
+
+static JSValue js_prop_walk_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSPropWalk *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    JS_FreeValue(ctx, s->el);
+    JS_FreeValue(ctx, s->obj);
+    if (s->atoms) js_free_prop_enum(ctx, s->atoms, s->len);
+    js_free(ctx, s);
+    return r;
+}
+
 static JSValue js_object_getOwnPropertyNames(JSContext *ctx, JSValueConst this_val,
                                              int argc, JSValueConst *argv)
 {
-    return JS_GetOwnPropertyNames2(ctx, argv[0],
-                                   JS_GPN_STRING_MASK, JS_ITERATOR_KIND_KEY);
+    return JS_GetOwnPropertyNames2(ctx, argv[0], JS_GPN_STRING_MASK);
 }
 
 static JSValue js_object_getOwnPropertySymbols(JSContext *ctx, JSValueConst this_val,
                                              int argc, JSValueConst *argv)
 {
-    return JS_GetOwnPropertyNames2(ctx, argv[0],
-                                   JS_GPN_SYMBOL_MASK, JS_ITERATOR_KIND_KEY);
+    return JS_GetOwnPropertyNames2(ctx, argv[0], JS_GPN_SYMBOL_MASK);
 }
 
 static JSValue js_object_groupBy(JSContext *ctx, JSValueConst this_val,
@@ -50185,10 +50262,9 @@ exception:
 }
 
 static JSValue js_object_keys(JSContext *ctx, JSValueConst this_val,
-                              int argc, JSValueConst *argv, int kind)
+                              int argc, JSValueConst *argv)
 {
-    return JS_GetOwnPropertyNames2(ctx, argv[0],
-                                   JS_GPN_ENUM_ONLY | JS_GPN_STRING_MASK, kind);
+    return JS_GetOwnPropertyNames2(ctx, argv[0], JS_GPN_ENUM_ONLY | JS_GPN_STRING_MASK);
 }
 
 static JSValue js_object_isExtensible(JSContext *ctx, JSValueConst this_val,
@@ -50717,9 +50793,9 @@ static const JSCFunctionListEntry js_object_funcs[] = {
     JS_CFUNC_DEF("getOwnPropertyNames", 1, js_object_getOwnPropertyNames ),
     JS_CFUNC_DEF("getOwnPropertySymbols", 1, js_object_getOwnPropertySymbols ),
     JS_CFUNC_DEF("groupBy", 2, js_object_groupBy ),
-    JS_CFUNC_MAGIC_DEF("keys", 1, js_object_keys, JS_ITERATOR_KIND_KEY ),
-    JS_CFUNC_MAGIC_DEF("values", 1, js_object_keys, JS_ITERATOR_KIND_VALUE ),
-    JS_CFUNC_MAGIC_DEF("entries", 1, js_object_keys, JS_ITERATOR_KIND_KEY_AND_VALUE ),
+    JS_CFUNC_DEF("keys", 1, js_object_keys ),
+    JS_CFUNC_STEP_DEF("values", 1, STEPDEF_OBJ_VALUES ),
+    JS_CFUNC_STEP_DEF("entries", 1, STEPDEF_OBJ_ENTRIES ),
     JS_CFUNC_MAGIC_DEF("isExtensible", 1, js_object_isExtensible, 0 ),
     JS_CFUNC_MAGIC_DEF("preventExtensions", 1, js_object_preventExtensions, 0 ),
     JS_CFUNC_STEP_DEF("getOwnPropertyDescriptor", 2, STEPDEF_OBJ_GOPD ),
@@ -53316,6 +53392,8 @@ static int js_str_split_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
 static JSValue js_str_split_fini(JSContext *ctx, void *st, bool take_result);
 static int js_array_join_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_join_fini(JSContext *ctx, void *st, bool take_result);
+static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_prop_walk_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_bigint_asUintN(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int asIntN);
 static JSValue js_object_getOwnPropertyDescriptor(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
 static JSValue js_create_iterator_helper(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
@@ -53395,6 +53473,8 @@ static const JSTrampStepDef js_array_join_def     = { sizeof(JSArrayJoin), js_ar
 static const JSTrampStepDef js_array_tolocale_def = { sizeof(JSArrayJoin), js_array_join_step, js_array_join_fini, JOIN_ARRAY_LOCALE };
 static const JSTrampStepDef js_ta_join_def        = { sizeof(JSArrayJoin), js_array_join_step, js_array_join_fini, JOIN_TA };
 static const JSTrampStepDef js_ta_tolocale_def    = { sizeof(JSArrayJoin), js_array_join_step, js_array_join_fini, JOIN_TA_LOCALE };
+static const JSTrampStepDef js_obj_values_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_VALUES };
+static const JSTrampStepDef js_obj_entries_def    = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_ENTRIES };
 #define PRIMARGS_DEF_FULL(spec, proto, fn, magic, pre, mid, err) \
     { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, (spec), { .proto = (fn) }, JS_CFUNC_##proto, (magic), (pre), (mid), (err) }
 #define PRIMARGS_DEF(spec, proto, fn, magic)                PRIMARGS_DEF_FULL(spec, proto, fn, magic, NULL, NULL, NULL)
@@ -53493,6 +53573,8 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_BIGINT_ASUINTN]  = &js_bigint_asUintN_def,
     [STEPDEF_BIGINT_ASINTN]   = &js_bigint_asIntN_def,
     [STEPDEF_OBJ_GOPD]        = &js_obj_gopd_def,
+    [STEPDEF_OBJ_VALUES]      = &js_obj_values_def,
+    [STEPDEF_OBJ_ENTRIES]     = &js_obj_entries_def,
     [STEPDEF_REFLECT_GOPD]    = &js_reflect_gopd_def,
     [STEPDEF_ITER_TAKE]       = &js_iter_take_def,
     [STEPDEF_ITER_DROP]       = &js_iter_drop_def,
@@ -61344,8 +61426,7 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
             if (!JS_IsUndefined(jsc->property_list))
                 tab = js_dup(jsc->property_list);
             else
-                tab = js_object_keys(ctx, JS_UNDEFINED, 1, vc(&val),
-                                     JS_ITERATOR_KIND_KEY);
+                tab = js_object_keys(ctx, JS_UNDEFINED, 1, vc(&val));
             if (JS_IsException(tab))
                 goto exception;
             if (js_get_length64(ctx, &len, tab))
@@ -61737,8 +61818,7 @@ static JSValue js_reflect_ownKeys(JSContext *ctx, JSValueConst this_val,
     if (JS_VALUE_GET_TAG(argv[0]) != JS_TAG_OBJECT)
         return JS_ThrowTypeErrorNotAnObject(ctx);
     return JS_GetOwnPropertyNames2(ctx, argv[0],
-                                   JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK,
-                                   JS_ITERATOR_KIND_KEY);
+                                   JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK);
 }
 
 static const JSCFunctionListEntry js_reflect_funcs[] = {
