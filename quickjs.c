@@ -19636,6 +19636,7 @@ typedef struct JSIterConsume {
     uint8_t ta_phase;
     uint8_t ta_isfrom;   /* 1 = TypedArray.from (construct the receiver); 0 = new TypedArray(iterable), which
                             creates from ta_classid and never constructs a user ctor */
+    uint8_t ta_have_el;  /* 1 = cb_value holds the source element the map/set phase just read back */
     /* ITERCONS_OBJENTRIES: the entry's two element reads and the key's ToPropertyKey are USER CODE (an accessor,
        a Proxy trap, a toString), so each is a PHASE of this machine rather than a C call inside the sink — a loop
        in that code has to park like any other. ent_ph says which is due: 0 = entry[0], 1 = entry[1], 2 = coerce
@@ -23690,16 +23691,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             JS_FreeValue(ctx, m);
                             src6 = JS_ToObject(ctx, call_argv[0]);
                             if (JS_IsException(src6)) goto exception;
-                            if (js_get_length64(ctx, &len6, src6) < 0) { JS_FreeValue(ctx, src6); goto exception; }
                             s6 = js_iter_consume_new(ctx);
                             if (unlikely(!s6)) { JS_FreeValue(ctx, src6); JS_ThrowOutOfMemory(ctx); goto exception; }
                             s6->r = src6;                       /* the source list the map phase indexes */
                             s6->adder = js_dup(ntgt);           /* the constructor the create phase Constructs */
                             s6->mapfn = (call_argc >= 2) ? js_dup(call_argv[1]) : JS_UNDEFINED;
                             s6->mapfn_this = (call_argc >= 3) ? js_dup(call_argv[2]) : JS_UNDEFINED;
-                            s6->k = len6; s6->ta_k = 0;
+                            s6->k = 0; s6->ta_k = 0;
                             s6->sink = ITERCONS_FROM; s6->ta_isfrom = 1; s6->ta_classid = 0;
-                            s6->ta_phase = 1;                   /* skip the collect: the list already exists */
+                            s6->ta_phase = 4;                   /* no collect; step 6's LengthOfArrayLike first */
                             s6->orig_cfirst = -2; s6->orig_cargc = call_argc; s6->orig_is_tail = 0;
                             cont_st = s6;
                             ret_val = JS_UNINITIALIZED;
@@ -23830,13 +23830,24 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                       goto do_iter_consume_step; }
                 }
                 if (st == 6) {
-                    /* Object.fromEntries: read the entry's element ent_ph through the property-get tramp, so an
-                       ACCESSOR entry or a Proxy source runs its body on this chain and a loop in it parks. Reading
-                       it here with JS_GetPropertyUint32 was the "loop preempted in a NON-coroutine activation"
-                       DFAIL: the getter had no flow base. */
+                    /* THE indexed-read arm. An ACCESSOR element or a Proxy source runs its body on this chain, so a
+                       loop in it parks; reading with JS_GetPropertyUint32 instead was the "loop preempted in a
+                       NON-coroutine activation" DFAIL, the getter having no flow base. Two phases use it and the
+                       flag in flight says which — fromEntries reads the entry's element ent_ph, and the
+                       TypedArray map/set phase reads source element ta_k. */
                     gp_outer = s; gp_outer_kind = CONT_ITER_CONSUME;
-                    gp_obj = s->ent_obj;
-                    gp_atom = __JS_AtomFromUInt32(s->ent_ph);
+                    if (s->cb_pending == 7) {
+                        gp_obj = s->r; gp_atom = JS_ATOM_length;   /* LengthOfArrayLike's Get half */
+                    } else if (s->cb_pending == 6) {
+                        DCHECK(s->ta_k <= JS_ATOM_MAX_INT,
+                               "a TypedArray source longer than an int atom can name — build the heap-atom read");
+                        gp_obj = s->r;
+                        gp_atom = __JS_AtomFromUInt32((uint32_t)s->ta_k);
+                    } else {
+                        DCHECK(s->ent_pending, "the consume machine's indexed-read arm was entered with no read in flight");
+                        gp_obj = s->ent_obj;
+                        gp_atom = __JS_AtomFromUInt32(s->ent_ph);
+                    }
                     gp_op = GP_GET; gp_val = JS_UNDEFINED;
                     goto do_getprop_tramp;
                 }
@@ -23846,7 +23857,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        ToPropertyKey with hint STRING. Both are the page's @@toPrimitive/valueOf, and both used to
                        run from C. */
                     tp_outer = s; tp_outer_kind = CONT_ITER_CONSUME;
-                    if (s->cb_pending == 5) {
+                    if (s->cb_pending == 5 || s->cb_pending == 8) {
                         tp_value = s->cb_value; tp_hint = HINT_NUMBER;
                     } else {
                         DCHECK(s->ent_pending && s->ent_ph == 2,
@@ -52194,6 +52205,25 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
             JS_FreeValue(ctx, fret);
             return 1;
         }
+        if (which == 7 || which == 8) {
+            /* 7 = Get(source, "length") returned; 8 = the ToPrimitive of that result settled. ToLength on a
+               PRIMITIVE runs nothing, so the rest of LengthOfArrayLike finishes here and the create phase follows. */
+            int64_t len;
+            JS_FreeValue(ctx, value);
+            if (which == 7 && JS_VALUE_GET_TAG(fret) == JS_TAG_OBJECT) {
+                s->cb_value = fret; s->cb_pending = 8;
+                return 5;
+            }
+            if (JS_ToLengthFree(ctx, &len, fret) < 0) return -1;
+            s->k = len; s->ta_k = 0; s->ta_phase = 1;
+            return 4;                       /* -> step 7's TypedArrayCreateFromConstructor */
+        }
+        if (which == 6) {   /* the source element just read: hand it to the map/set phase */
+            DCHECK(JS_IsUndefined(value), "the indexed read parks nothing on cb_value before it runs");
+            JS_FreeValue(ctx, value);
+            s->cb_value = fret; s->ta_have_el = 1;
+            goto ta_map_loop;
+        }
         if (which == 5 || which == 3) {
             /* 5 = the element's ToPrimitive settled, so `fret` is the primitive the [[Set]] wanted; 3 = the mapfn
                returned, so `fret` is the mapped element (which may itself need coercing). Either way the write
@@ -52240,6 +52270,16 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
     }
     if (s->ta_phase) {
         /* 23.2.2.1 step 5.c/5.d, AFTER the whole collect. Never entered by any other sink. */
+        if (s->ta_phase == 4) {
+            /* step 6 LengthOfArrayLike, for the ARRAY-LIKE source that skips the collect entirely. Get(src,
+               "length") is the page's code for an accessor or a Proxy, and ToLength on its result can be another
+               @@toPrimitive — so both halves run on the tramp, and js_get_length64 at the entry (which did them
+               from C) is gone. */
+            if (JS_VALUE_GET_TAG(res) != JS_TAG_UNINITIALIZED) JS_FreeValue(ctx, res);
+            DCHECK(!s->cb_pending, "a round-trip is already in flight on this state");
+            s->cb_pending = 7;
+            return 6;
+        }
         if (s->ta_phase == 1) {   /* 5.c: Construct(C, «len») — the arm runs it on the tramp */
             if (JS_VALUE_GET_TAG(res) != JS_TAG_UNINITIALIZED) JS_FreeValue(ctx, res);
             return 4;
@@ -52260,8 +52300,18 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
         }
     ta_map_loop:
         for (; s->ta_k < s->k; ) {
-            JSValue v = JS_GetPropertyInt64(ctx, s->r, s->ta_k);
-            if (JS_IsException(v)) return -1;
+            JSValue v;
+            /* 23.2.2.1 step 5.d.i Get(arrayLike, k). For TypedArray.from over an ARRAY-LIKE the source is the
+               page's own object, so this read is an accessor or a Proxy trap — it goes through the indexed-read
+               arm and comes back parked on cb_value. For a collected list it resolves inline with nothing to
+               suspend, so the one path serves both. */
+            if (!s->ta_have_el) {
+                DCHECK(!s->cb_pending, "a round-trip is already in flight on this state");
+                s->cb_pending = 6;
+                return 6;
+            }
+            s->ta_have_el = 0;
+            v = s->cb_value; s->cb_value = JS_UNDEFINED;
             if (JS_IsUndefined(s->mapfn)) {
                 int w = ta_elem_set(ctx, s, v);   /* consumes v */
                 if (w < 0) return -1;
