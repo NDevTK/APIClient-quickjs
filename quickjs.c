@@ -22341,10 +22341,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto exception;
                 }
                 if (st == 0) {
+                    /* EVERY field must be read BEFORE the free: fini owns the allocation, and `h` IS `stt`, so
+                       reading orig_cfirst/orig_cargc/orig_is_tail afterwards was a use-after-free — the operand
+                       cleanup below ran off whatever the freed block then held. */
                     void *souter = h->outer; uint8_t souter_kind = h->outer_kind;
-                    JSValue r = tramp_step_state_free(ctx, stt, true);
                     int cfirst = h->orig_cfirst, cargc = h->orig_cargc;
                     uint8_t itail = h->orig_is_tail;
+                    JSValue r = tramp_step_state_free(ctx, stt, true);
                     JSValue *cargv = sp - cargc;
                     for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
                     sp += cfirst - cargc;
@@ -39739,7 +39742,15 @@ static JSValue js_async_module_execution_fulfilled(JSContext *ctx, JSValueConst 
         JSModuleDef *m = exec_list->tab[i];
         if (m->status == JS_MODULE_STATUS_EVALUATED) {
             assert(m->eval_has_exception);
-        } else if (m->has_tla) {
+        } else if (m->has_tla || !m->init_func) {
+            /* EVERY bytecode body is async-evaluated, top-level await or not, because a loop/await back-edge can
+               PARK it — the same rule js_inner_module_evaluation applies, and the reason only a C init_func
+               module is synchronous here. Splitting on has_tla alone drove a parking body through
+               js_execute_sync_module and then marked it EVALUATED, settling its top-level capability while the
+               body was still suspended; the body's later completion re-entered this function on an
+               already-evaluated module and read its freed flow state. ASan found the use-after-free; the assert
+               that would have caught it is compiled out of the NDEBUG build the harness uses, which is why the
+               failure looked like an ENABLE_DUMPS-dependent hang. */
             js_execute_async_module(ctx, m);
         } else {
             JSValue error;
@@ -39804,10 +39815,12 @@ static int js_execute_sync_module(JSContext *ctx, JSModuleDef *m,
             JS_FreeValue(ctx, promise);
             return -1;
         } else {
-            /* PENDING: the module body PARKED as a flow (a loop/await preempt yielded to the scheduler). It becomes
-               async-evaluating — attach the async completion handlers so the module graph resumes when the flow
-               finishes, and mark it async so the caller records EVALUATING_ASYNC. Mirrors js_execute_async_module;
-               this is what makes module evaluation suspend/resume on the tramp instead of driving to completion. */
+            /* PENDING here is a should-never-happen: both callers route a body that can park through
+               js_execute_async_module, so this path only ever runs a C init_func module (which cannot park) —
+               and marking a parked module EVALUATED afterwards is exactly the use-after-free this replaced. */
+            DFAIL("a module body PARKED on the synchronous execution path — route that caller through "
+                  "js_execute_async_module; settling its capability while the body is suspended frees the flow "
+                  "state its completion still reads");
             JSValue m_obj, resolve_funcs[2], ret_val;
             m->async_evaluation = true;
             m->async_evaluation_timestamp = ctx->rt->module_async_evaluation_next_timestamp++;

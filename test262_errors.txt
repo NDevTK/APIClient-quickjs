@@ -7,4 +7,3 @@ test262/test/language/expressions/dynamic-import/import-attributes/2nd-param-wit
 test262/test/language/import/import-attributes/text-self.js:10: SyntaxError: Could not find export 'default' in module 'test262/test/language/import/import-attributes/text-self.js'
 test262/test/language/module-code/top-level-await/rejection-order.js:20: TypeError: $DONE() not called
 test262/test/language/module-code/top-level-await/async-module-does-not-block-sibling-modules.js:13: TypeError: $DONE() not called
-test262/test/language/module-code/top-level-await/module-graphs-does-not-hang.js:10: TypeError: $DONE() not called
