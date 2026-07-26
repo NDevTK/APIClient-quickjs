@@ -18996,8 +18996,24 @@ typedef struct TrampFrame {
                                   still satisfy the target's non-configurable invariants, so the check rides a
                                   continuation and runs at do_return, before the result is placed. */
 typedef struct JSProxyGet { JSValue target; JSAtom atom; } JSProxyGet;
+#define CONT_PROXY_HAS     7   /* cont_state = JSProxyGet: a trampolined proxy [[HasProperty]] trap. It needs exactly
+                                  what [[Get]]'s continuation needs — (target, key) carried across the call, because
+                                  9.5.7 step 9's invariant runs on the trap's RESULT — so it shares the state and
+                                  differs only in the post-check and in placing a BOOLEAN (ToBoolean of the result). */
+#define CONT_PROXY_DELETE 15   /* cont_state = JSProxyDelete: a trampolined proxy [[Delete]] trap. Same (target, key)
+                                  post-check shape as [[HasProperty]], plus the STRICTNESS of the deleting code — a
+                                  `false` result throws in strict mode, and the strictness belongs to the frame that
+                                  issued the delete, not to whichever frame happens to be current when the trap
+                                  returns, so it is captured at the operator site rather than read at do_return. */
+typedef struct JSProxyDelete { JSValue target; JSAtom atom; bool throw_on_false; } JSProxyDelete;
+#define CONT_PROXY_SET     6   /* cont_state = JSProxySet: a trampolined proxy [[Set]] trap. Carries (target, key)
+                                  like the others PLUS the written VALUE, because 9.5.9 step 11's invariant is a
+                                  SameValue against it, and the write's strictness. The trap's boolean is consumed
+                                  here and NOTHING is placed — a property write yields no value, like CONT_SETTER. */
+typedef struct JSProxySet { JSValue target; JSValue value; JSAtom atom; bool throw_on_false; } JSProxySet;
 static JSValue js_proxy_get_invariant(JSContext *ctx, JSValueConst target, JSAtom atom, JSValue ret);
 static int js_proxy_has_invariant(JSContext *ctx, JSValueConst target, JSAtom atom, int ret);
+static int js_proxy_delete_invariant(JSContext *ctx, JSValueConst target, JSAtom atom, int ret);
 #define CONT_GETPROP       22  /* cont_state = JSGetProp: a keyed property OPERATION requested by a STEP MACHINE —
                                   a READ (step code 6) or a HasProperty (step code 7).
                                   The read can run user code two ways — a bytecode accessor, or a Proxy `get` trap —
@@ -19301,6 +19317,9 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_ITER_HELPER:
     case CONT_ITER_FROM:
     case CONT_PROXY_GET:
+    case CONT_PROXY_HAS:
+    case CONT_PROXY_DELETE:
+    case CONT_PROXY_SET:
     case CONT_PROMISE_EXEC:
     case CONT_PROMISE_TRY:
     case CONT_STEP:
@@ -20062,6 +20081,122 @@ static int js_tramp_proxy_get(JSContext *ctx, JSValue *sp_obj_slot, JSAtom atom,
     out_extra[1] = js_dup(s->target);        /* [0]  target */
     out_extra[2] = keyval;                   /* [1]  key */
     out_extra[3] = recv;                     /* [2]  receiver */
+    return 1;
+}
+/* PROXY [[HasProperty]]: `key in proxy`. Same shape as [[Get]] — reshape the operator's two operands into the
+   method-call shape [handler, trap, target, key] so the trap's body runs on THIS chain and its one result lands in
+   the slot the `in` result belongs in. `sp` points just past the operands: sp[-2] = key, sp[-1] = the proxy; on
+   success sp[-2..1] are the reshaped operands (the caller advances sp by 2). Returns 1 when it routed, 0 to fall
+   through to the C path (no trap, or a C/bound trap with no preemptible body), -1 on a pending exception. */
+static int js_tramp_proxy_has(JSContext *ctx, JSValue *sp, void **out_cont)
+{
+    JSProxyData *s;
+    JSValue method, keyval, target, handler;
+    JSAtom atom;
+    JSProxyGet *pg;
+    if (JS_VALUE_GET_TAG(sp[-1]) != JS_TAG_OBJECT
+        || JS_VALUE_GET_OBJ(sp[-1])->class_id != JS_CLASS_PROXY) return 0;
+    s = get_proxy_method(ctx, &method, sp[-1], JS_ATOM_has);
+    if (!s) return -1;                       /* revoked / handler get threw */
+    if (JS_IsUndefined(method) || !tramp_can_call(method)) {
+        JS_FreeValue(ctx, method);
+        return 0;
+    }
+    /* ToPropertyKey the operand FIRST: it can run user code (@@toPrimitive) and throw, and it is the value the
+       trap must be handed — the raw operand would pass `1` where the spec passes "1". */
+    atom = JS_ValueToAtom(ctx, sp[-2]);
+    if (unlikely(atom == JS_ATOM_NULL)) { JS_FreeValue(ctx, method); return -1; }
+    keyval = JS_AtomToValue(ctx, atom);
+    if (JS_IsException(keyval)) { JS_FreeAtom(ctx, atom); JS_FreeValue(ctx, method); return -1; }
+    pg = js_malloc(ctx, sizeof(*pg));
+    if (!pg) { JS_FreeAtom(ctx, atom); JS_FreeValue(ctx, keyval); JS_FreeValue(ctx, method); return -1; }
+    /* own refs BEFORE the proxy operand is released: s points into the proxy's own data */
+    target = js_dup(s->target);
+    handler = js_dup(s->handler);
+    pg->target = js_dup(target);
+    pg->atom = atom;                         /* owned, transferred */
+    *out_cont = pg;
+    JS_FreeValue(ctx, sp[-2]);               /* the raw key operand: replaced by the canonical key value */
+    JS_FreeValue(ctx, sp[-1]);               /* the proxy itself is not an argument to `has` */
+    sp[-2] = handler;                        /* [-2] this = handler */
+    sp[-1] = method;                         /* [-1] the trap (owned) */
+    sp[0]  = target;                         /* [0]  target */
+    sp[1]  = keyval;                         /* [1]  key */
+    return 1;
+}
+/* PROXY [[Delete]]: `delete proxy[key]`. Identical reshape to [[HasProperty]] — [handler, trap, target, key] — but
+   the operand ORDER at the operator is reversed (`delete` has the object at sp[-2] and the key at sp[-1], `in` the
+   other way round), and the result slot is still sp[-2], so the handler goes there either way. */
+static int js_tramp_proxy_delete(JSContext *ctx, JSValue *sp, bool throw_on_false, void **out_cont)
+{
+    JSProxyData *s;
+    JSValue method, keyval, target, handler;
+    JSAtom atom;
+    JSProxyDelete *pd;
+    if (JS_VALUE_GET_TAG(sp[-2]) != JS_TAG_OBJECT
+        || JS_VALUE_GET_OBJ(sp[-2])->class_id != JS_CLASS_PROXY) return 0;
+    s = get_proxy_method(ctx, &method, sp[-2], JS_ATOM_deleteProperty);
+    if (!s) return -1;
+    if (JS_IsUndefined(method) || !tramp_can_call(method)) {
+        JS_FreeValue(ctx, method);
+        return 0;
+    }
+    atom = JS_ValueToAtom(ctx, sp[-1]);      /* ToPropertyKey can run user code and throw */
+    if (unlikely(atom == JS_ATOM_NULL)) { JS_FreeValue(ctx, method); return -1; }
+    keyval = JS_AtomToValue(ctx, atom);
+    if (JS_IsException(keyval)) { JS_FreeAtom(ctx, atom); JS_FreeValue(ctx, method); return -1; }
+    pd = js_malloc(ctx, sizeof(*pd));
+    if (!pd) { JS_FreeAtom(ctx, atom); JS_FreeValue(ctx, keyval); JS_FreeValue(ctx, method); return -1; }
+    target = js_dup(s->target);              /* own refs BEFORE the proxy operand is released */
+    handler = js_dup(s->handler);
+    pd->target = js_dup(target);
+    pd->atom = atom;                         /* owned, transferred */
+    pd->throw_on_false = throw_on_false;
+    *out_cont = pd;
+    JS_FreeValue(ctx, sp[-1]);               /* the raw key operand */
+    JS_FreeValue(ctx, sp[-2]);               /* the proxy is not an argument to `deleteProperty` */
+    sp[-2] = handler;
+    sp[-1] = method;
+    sp[0]  = target;
+    sp[1]  = keyval;
+    return 1;
+}
+/* PROXY [[Set]]: `proxy[key] = value`. The trap takes FOUR arguments, so unlike the other traps the reshape is not
+   a fixed rewrite of the operator's slots — the two write opcodes consume a different number of operands (obj+value
+   vs obj+key+value) and both must leave NOTHING behind. So this helper is layout-independent: it fills `out[0..5]`
+   with [handler, trap, target, key, value, receiver] (owning every one) and the call site places them wherever its
+   own operand cleanup will land. `value` is BORROWED. Returns 1 = routed, 0 = fall through to the C path,
+   -1 = pending exception. */
+static int js_proxy_set_invariant(JSContext *ctx, JSValueConst target, JSAtom atom, JSValueConst value, int ret);
+static int js_tramp_proxy_set(JSContext *ctx, JSValueConst obj, JSAtom atom, JSValueConst value,
+                              bool throw_on_false, JSValue *out /* 6 slots */, void **out_cont)
+{
+    JSProxyData *s;
+    JSValue method, keyval;
+    JSProxySet *ps;
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT
+        || JS_VALUE_GET_OBJ(obj)->class_id != JS_CLASS_PROXY) return 0;
+    s = get_proxy_method(ctx, &method, obj, JS_ATOM_set);
+    if (!s) return -1;
+    if (JS_IsUndefined(method) || !tramp_can_call(method)) {
+        JS_FreeValue(ctx, method);
+        return 0;
+    }
+    keyval = JS_AtomToValue(ctx, atom);
+    if (JS_IsException(keyval)) { JS_FreeValue(ctx, method); return -1; }
+    ps = js_malloc(ctx, sizeof(*ps));
+    if (!ps) { JS_FreeValue(ctx, keyval); JS_FreeValue(ctx, method); return -1; }
+    ps->target = js_dup(s->target);
+    ps->value = js_dup(value);
+    ps->atom = JS_DupAtom(ctx, atom);
+    ps->throw_on_false = throw_on_false;
+    *out_cont = ps;
+    out[0] = js_dup(s->handler);   /* this */
+    out[1] = method;               /* the trap (owned) */
+    out[2] = js_dup(s->target);
+    out[3] = keyval;
+    out[4] = js_dup(value);
+    out[5] = js_dup(obj);          /* receiver IS the proxy */
     return 1;
 }
 /* PROXY [[Call]]: resolve the `apply` trap at the operator site and dispatch it on THIS chain as
@@ -24743,6 +24878,30 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     ret_val = js_proxy_get_invariant(ctx, pg->target, pg->atom, ret_val);
                     JS_FreeValue(ctx, pg->target); JS_FreeAtom(ctx, pg->atom); js_free_rt(rt, pg);
                     if (unlikely(JS_IsException(ret_val))) goto exception;
+                } else if (rck == CONT_PROXY_HAS) {
+                    /* the proxy `has` trap returned: ToBoolean it, then the target's [[HasProperty]] invariant —
+                       the SAME js_proxy_has_invariant the C path uses — and place the boolean. */
+                    JSProxyGet *pg = rcs;
+                    int hres = js_proxy_has_invariant(ctx, pg->target, pg->atom,
+                                                      JS_ToBoolFree(ctx, ret_val));
+                    JS_FreeValue(ctx, pg->target); JS_FreeAtom(ctx, pg->atom); js_free_rt(rt, pg);
+                    if (unlikely(hres < 0)) goto exception;
+                    ret_val = js_bool(hres);
+                } else if (rck == CONT_PROXY_DELETE) {
+                    /* the proxy `deleteProperty` trap returned: ToBoolean, the target's [[Delete]] invariant (the
+                       SAME js_proxy_delete_invariant the C path uses), then the strict-mode throw a `false` delete
+                       owes — the strictness was captured where the `delete` was written. */
+                    JSProxyDelete *pd = rcs;
+                    bool pd_throw = pd->throw_on_false;
+                    int dres = js_proxy_delete_invariant(ctx, pd->target, pd->atom,
+                                                         JS_ToBoolFree(ctx, ret_val));
+                    JS_FreeValue(ctx, pd->target); JS_FreeAtom(ctx, pd->atom); js_free_rt(rt, pd);
+                    if (unlikely(dres < 0)) goto exception;
+                    if (!dres && pd_throw) {
+                        JS_ThrowTypeError(ctx, "could not delete property");
+                        goto exception;
+                    }
+                    ret_val = js_bool(dres);
                 } else if (rck == CONT_CONSTRUCT) {
                     /* constructor body returned: apply the constructor rule — use the body result if it is an
                        object, else the created `this`. */
@@ -24785,6 +24944,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 } else if (rck == CONT_PROMISE_TRY) {
                     ptry_finish_state = rcs;
                     goto do_promise_try_finish;   /* fn returned: resolve the promise with its value */
+                } else if (rck == CONT_PROXY_SET) {
+                    /* the proxy `set` trap returned: ToBoolean, the target's [[Set]] invariant (the SAME
+                       js_proxy_set_invariant the C path uses), then the strict-mode throw a rejected write owes.
+                       Free the operands and push NOTHING — a property write yields no value. */
+                    JSProxySet *ps = rcs;
+                    bool ps_throw = ps->throw_on_false;
+                    int sres = js_proxy_set_invariant(ctx, ps->target, ps->atom, ps->value,
+                                                      JS_ToBoolFree(ctx, ret_val));
+                    JSValue *cargv = sp - cargc;
+                    JS_FreeValue(ctx, ps->target); JS_FreeValue(ctx, ps->value);
+                    JS_FreeAtom(ctx, ps->atom); js_free_rt(rt, ps);
+                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
+                    sp += cfirst - cargc;
+                    if (unlikely(sres < 0)) goto exception;
+                    if (!sres && ps_throw) {
+                        JS_ThrowTypeError(ctx, "proxy: cannot set property");
+                        goto exception;
+                    }
+                    BREAK;
                 } else if (rck == CONT_SETTER) {
                     /* setter returned: free the operands (this,setter,value) on the caller stack exactly like a
                        method call, but DISCARD the return value — a property write pushes nothing. */
@@ -26192,6 +26370,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc += 4;
 
                 obj = sp[-2];
+                if (unlikely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT
+                             && JS_VALUE_GET_OBJ(obj)->class_id == JS_CLASS_PROXY)) {
+                    /* proxy [[Set]]: run the `set` trap on THIS chain so a loop inside it preempts. Six operands
+                       replace the two, and the continuation's own cleanup lands sp back where a write leaves it. */
+                    JSValue px[6];
+                    void *ps_cont = NULL;
+                    int ps_ret;
+                    sf->cur_pc = pc;
+                    DCHECK(sp + 4 <= TRAMP_SP_LIMIT(sf),
+                           "proxy set trap: operand reshape exceeds the frame's compiled stack_size");
+                    ps_ret = js_tramp_proxy_set(ctx, obj, atom, sp[-1], sf->is_strict_mode, px, &ps_cont);
+                    if (unlikely(ps_ret < 0)) goto exception;
+                    if (ps_ret > 0) {
+                        JS_FreeValue(ctx, sp[-2]);   /* the proxy — px owns its own handler/target/receiver refs */
+                        JS_FreeValue(ctx, sp[-1]);   /* the written value — dup'd into px[4] and the continuation */
+                        sp[-2] = px[0]; sp[-1] = px[1];
+                        sp[0] = px[2]; sp[1] = px[3]; sp[2] = px[4]; sp[3] = px[5];
+                        sp += 4;
+                        call_argv = sp - 4; call_argc = 4; tramp_first = -2; tramp_is_tail = 0;
+                        tramp_cont_state = ps_cont; tramp_cont_kind = CONT_PROXY_SET;
+                        goto do_tramp_call;
+                    }
+                }
                 if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
                     p = JS_VALUE_GET_OBJ(obj);
                     prs = find_own_property(&pr, p, atom);
@@ -26586,6 +26787,34 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSObject *p;
 
                 val = sp[-1];
+                if (unlikely(JS_VALUE_GET_TAG(sp[-3]) == JS_TAG_OBJECT
+                             && JS_VALUE_GET_OBJ(sp[-3])->class_id == JS_CLASS_PROXY)) {
+                    /* proxy [[Set]] with a computed key — the same six operands as OP_put_field, based one slot
+                       lower because this opcode consumes three, so its cleanup lands sp in the same place. */
+                    JSValue px[6];
+                    void *ps_cont = NULL;
+                    int ps_ret;
+                    JSAtom katom;
+                    sf->cur_pc = pc;
+                    DCHECK(sp + 3 <= TRAMP_SP_LIMIT(sf),
+                           "proxy set trap: operand reshape exceeds the frame's compiled stack_size");
+                    katom = JS_ValueToAtom(ctx, sp[-2]);   /* ToPropertyKey can run user code and throw */
+                    if (unlikely(katom == JS_ATOM_NULL)) goto exception;
+                    ps_ret = js_tramp_proxy_set(ctx, sp[-3], katom, val, sf->is_strict_mode, px, &ps_cont);
+                    JS_FreeAtom(ctx, katom);
+                    if (unlikely(ps_ret < 0)) goto exception;
+                    if (ps_ret > 0) {
+                        JS_FreeValue(ctx, sp[-3]);
+                        JS_FreeValue(ctx, sp[-2]);
+                        JS_FreeValue(ctx, sp[-1]);
+                        sp[-3] = px[0]; sp[-2] = px[1]; sp[-1] = px[2];
+                        sp[0] = px[3]; sp[1] = px[4]; sp[2] = px[5];
+                        sp += 3;
+                        call_argv = sp - 4; call_argc = 4; tramp_first = -2; tramp_is_tail = 0;
+                        tramp_cont_state = ps_cont; tramp_cont_kind = CONT_PROXY_SET;
+                        goto do_tramp_call;
+                    }
+                }
                 if (likely(JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_INT)) {
                     idx = JS_VALUE_GET_INT(sp[-2]);
                     if (likely(JS_VALUE_GET_TAG(sp[-3]) == JS_TAG_OBJECT)) {
@@ -27386,6 +27615,24 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
         CASE(OP_in):
             sf->cur_pc = pc;
+            /* PROXY [[HasProperty]]: run the `has` trap on THIS chain so a loop inside it preempts. The reshape
+               leaves [handler, trap, target, key] whose caller_sp IS the slot the `in` result belongs in, so
+               do_return drops the operands and lands the boolean there. */
+            if (unlikely(JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT
+                         && JS_VALUE_GET_OBJ(sp[-1])->class_id == JS_CLASS_PROXY)) {
+                void *ph_cont = NULL;
+                int ph_ret;
+                DCHECK(sp + 2 <= TRAMP_SP_LIMIT(sf),
+                       "proxy has trap: operand reshape exceeds the frame's compiled stack_size");
+                ph_ret = js_tramp_proxy_has(ctx, sp, &ph_cont);
+                if (unlikely(ph_ret < 0)) goto exception;
+                if (ph_ret > 0) {
+                    sp += 2;
+                    call_argv = sp - 2; call_argc = 2; tramp_first = -2; tramp_is_tail = 0;
+                    tramp_cont_state = ph_cont; tramp_cont_kind = CONT_PROXY_HAS;
+                    goto do_tramp_call;
+                }
+            }
             if (js_operator_in(ctx, sp))
                 goto exception;
             sp--;
@@ -27414,6 +27661,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
         CASE(OP_delete):
             sf->cur_pc = pc;
+            /* PROXY [[Delete]]: run the `deleteProperty` trap on THIS chain so a loop inside it preempts. */
+            if (unlikely(JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT
+                         && JS_VALUE_GET_OBJ(sp[-2])->class_id == JS_CLASS_PROXY)) {
+                void *pd_cont = NULL;
+                int pd_ret;
+                DCHECK(sp + 2 <= TRAMP_SP_LIMIT(sf),
+                       "proxy deleteProperty trap: operand reshape exceeds the frame's compiled stack_size");
+                pd_ret = js_tramp_proxy_delete(ctx, sp, sf->is_strict_mode, &pd_cont);
+                if (unlikely(pd_ret < 0)) goto exception;
+                if (pd_ret > 0) {
+                    sp += 2;
+                    call_argv = sp - 2; call_argc = 2; tramp_first = -2; tramp_is_tail = 0;
+                    tramp_cont_state = pd_cont; tramp_cont_kind = CONT_PROXY_DELETE;
+                    goto do_tramp_call;
+                }
+            }
             if (js_operator_delete(ctx, sp))
                 goto exception;
             sp--;
@@ -27995,9 +28258,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             if (itail) { ret_val = r; goto do_return; }
             *sp++ = r;
             BREAK;
-        } else if (xck == CONT_PROXY_GET) {
+        } else if (xck == CONT_PROXY_GET || xck == CONT_PROXY_HAS) {
+            /* the trap body THREW: the invariant it owed is moot, and its operands are on the caller stack where
+               the caller's own catch-search frees them, exactly like a normal method call. */
             JSProxyGet *pg = xcs;
             JS_FreeValue(ctx, pg->target); JS_FreeAtom(ctx, pg->atom); js_free_rt(rt, pg);
+        } else if (xck == CONT_PROXY_DELETE) {
+            JSProxyDelete *pd = xcs;
+            JS_FreeValue(ctx, pd->target); JS_FreeAtom(ctx, pd->atom); js_free_rt(rt, pd);
+        } else if (xck == CONT_PROXY_SET) {
+            JSProxySet *ps = xcs;
+            JS_FreeValue(ctx, ps->target); JS_FreeValue(ctx, ps->value);
+            JS_FreeAtom(ctx, ps->atom); js_free_rt(rt, ps);
         } else if (xck == CONT_GETPROP) {
             /* the accessor / trap THREW: the machine waiting on the value can never be reached again, so it and
                the machines waiting on it go too. */
@@ -61539,13 +61811,45 @@ static JSValue js_proxy_get(JSContext *ctx, JSValueConst obj, JSAtom atom,
     return js_proxy_get_invariant(ctx, s->target, atom, ret);
 }
 
+/* [[Set]] invariant: a trap that reports SUCCESS must be telling the truth — a non-configurable, non-writable data
+   property of the target must have been written its own value (SameValue), and a non-configurable accessor with no
+   setter cannot have been written at all. ONE implementation, shared by the C path and by the trampolined trap's
+   continuation — the check runs on the trap's RESULT, so the tramp path can only honour it from a continuation, and
+   that is why the continuation has to carry the written VALUE as well as (target, key). `ret` is the trap's boolean;
+   returns it, or -1 having thrown. The strict-mode throw a `false` result owes stays with the caller, which is the
+   only place that knows the write's flags. */
+static int js_proxy_set_invariant(JSContext *ctx, JSValueConst target, JSAtom atom,
+                                  JSValueConst value, int ret)
+{
+    JSPropertyDescriptor desc;
+    int res;
+    if (!ret)
+        return 0;
+    res = JS_GetOwnPropertyInternal(ctx, &desc, JS_VALUE_GET_OBJ(target), atom);
+    if (res < 0)
+        return -1;
+    if (res) {
+        if ((desc.flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)) == 0) {
+            if (!js_same_value(ctx, desc.value, value))
+                goto fail;
+        } else if ((desc.flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE)) == JS_PROP_GETSET
+                   && JS_IsUndefined(desc.setter)) {
+        fail:
+            js_free_desc(ctx, &desc);
+            JS_ThrowTypeError(ctx, "proxy: inconsistent set");
+            return -1;
+        }
+        js_free_desc(ctx, &desc);
+    }
+    return 1;
+}
+
 static int js_proxy_set(JSContext *ctx, JSValueConst obj, JSAtom atom,
                         JSValueConst value, JSValueConst receiver, int flags)
 {
     JSProxyData *s;
     JSValue method, ret1, atom_val;
-    bool ret;
-    int res;
+    int ret;
     JSValueConst args[4];
 
     s = get_proxy_method(ctx, &method, obj, JS_ATOM_set);
@@ -61568,31 +61872,13 @@ static int js_proxy_set(JSContext *ctx, JSValueConst obj, JSAtom atom,
     JS_FreeValue(ctx, atom_val);
     if (JS_IsException(ret1))
         return -1;
-    ret = JS_ToBoolFree(ctx, ret1);
-    if (ret) {
-        JSPropertyDescriptor desc;
-        res = JS_GetOwnPropertyInternal(ctx, &desc, JS_VALUE_GET_OBJ(s->target), atom);
-        if (res < 0)
-            return -1;
-        if (res) {
-            if ((desc.flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)) == 0) {
-                if (!js_same_value(ctx, desc.value, value)) {
-                    goto fail;
-                }
-            } else if ((desc.flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE)) == JS_PROP_GETSET && JS_IsUndefined(desc.setter)) {
-                fail:
-                    js_free_desc(ctx, &desc);
-                    JS_ThrowTypeError(ctx, "proxy: inconsistent set");
-                    return -1;
-            }
-            js_free_desc(ctx, &desc);
-        }
-    } else {
-        if ((flags & JS_PROP_THROW) ||
-            ((flags & JS_PROP_THROW_STRICT) && is_strict_mode(ctx))) {
-            JS_ThrowTypeError(ctx, "proxy: cannot set property");
-            return -1;
-        }
+    ret = js_proxy_set_invariant(ctx, s->target, atom, value, JS_ToBoolFree(ctx, ret1));
+    if (ret < 0)
+        return -1;
+    if (!ret && ((flags & JS_PROP_THROW) ||
+                 ((flags & JS_PROP_THROW_STRICT) && is_strict_mode(ctx)))) {
+        JS_ThrowTypeError(ctx, "proxy: cannot set property");
+        return -1;
     }
     return ret;
 }
@@ -61832,12 +62118,41 @@ static int js_proxy_define_own_property(JSContext *ctx, JSValueConst obj,
     return 1;
 }
 
+/* [[Delete]] invariant: a trap that reports SUCCESS must be telling the truth about a non-configurable own property
+   of the target, and about a non-extensible target. ONE implementation, shared by the C path and by the trampolined
+   trap's continuation — the check runs on the trap's RESULT, so the tramp path can only honour it from a
+   continuation, exactly as [[Get]]'s and [[HasProperty]]'s do. `ret` is the trap's boolean; returns it, or -1
+   having thrown. */
+static int js_proxy_delete_invariant(JSContext *ctx, JSValueConst target, JSAtom atom, int ret)
+{
+    int desc_flags, res2, is_extensible;
+    if (!ret)
+        return 0;
+    res2 = JS_GetOwnPropertyFlagsInternal(ctx, &desc_flags, JS_VALUE_GET_OBJ(target), atom);
+    if (res2 < 0)
+        return -1;
+    if (res2) {
+        if (!(desc_flags & JS_PROP_CONFIGURABLE)) {
+            JS_ThrowTypeError(ctx, "proxy: inconsistent deleteProperty");
+            return -1;
+        }
+        is_extensible = JS_IsExtensible(ctx, target);
+        if (is_extensible < 0)
+            return -1;
+        if (!is_extensible) {
+            /* proxy-missing-checks */
+            JS_ThrowTypeError(ctx, "proxy: inconsistent deleteProperty");
+            return -1;
+        }
+    }
+    return 1;
+}
+
 static int js_proxy_delete_property(JSContext *ctx, JSValueConst obj,
                                     JSAtom atom)
 {
     JSProxyData *s;
     JSValue method, ret, atom_val;
-    int res2, is_extensible;
     bool res;
     JSValueConst args[2];
 
@@ -61859,27 +62174,7 @@ static int js_proxy_delete_property(JSContext *ctx, JSValueConst obj,
     if (JS_IsException(ret))
         return -1;
     res = JS_ToBoolFree(ctx, ret);
-    if (res) {
-        int desc_flags;
-        res2 = JS_GetOwnPropertyFlagsInternal(ctx, &desc_flags, JS_VALUE_GET_OBJ(s->target), atom);
-        if (res2 < 0)
-            return -1;
-        if (res2) {
-            if (!(desc_flags & JS_PROP_CONFIGURABLE)) {
-                JS_ThrowTypeError(ctx, "proxy: inconsistent deleteProperty");
-                return -1;
-            }
-            is_extensible = JS_IsExtensible(ctx, s->target);
-            if (is_extensible < 0)
-                return -1;
-            if (!is_extensible) {
-                /* proxy-missing-checks */
-                JS_ThrowTypeError(ctx, "proxy: inconsistent deleteProperty");
-                return -1;
-            }
-        }
-    }
-    return res;
+    return js_proxy_delete_invariant(ctx, s->target, atom, res);
 }
 
 /* return the index of the property or -1 if not found */
