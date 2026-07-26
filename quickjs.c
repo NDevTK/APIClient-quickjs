@@ -802,7 +802,6 @@ typedef struct JSVarScope {
     int parent;  /* index into fd->scopes of the enclosing scope */
     int first;   /* index into fd->vars of the last variable in this scope */
     uint8_t has_using : 1; /* scope has using declarations */
-    uint8_t is_await_using : 1; /* scope has await using declarations */
     int using_label_catch; /* label for catch handler (-1 if none) */
     int using_label_end;   /* label for end of disposal block (-1 if none) */
 } JSVarScope;
@@ -19049,7 +19048,10 @@ typedef struct JSPromiseExec {
     int orig_cfirst, orig_cargc; /* the ORIGINAL OP_call_constructor operand shape (pop at finish) */
 } JSPromiseExec;
 static bool tramp_can_call_promise_exec(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc);
-#define CONT_PROMISE_TRY   18  /* cont_state = JSPromiseTry: Promise.try(fn, ...args). Creates the capability, drives
+/* (was 18, which CONT_IMPORT already had: both a frame's cont_kind and a continuation's outer_kind draw from this
+   ONE namespace, so two kinds sharing a number is a live misread waiting for the first ToPrimitive whose outer is a
+   Promise.try. cont_kinds_are_distinct() below turns that into a compile error.) */
+#define CONT_PROMISE_TRY   16  /* cont_state = JSPromiseTry: Promise.try(fn, ...args). Creates the capability, drives
                                   fn(...args) on THIS chain (so a loop in fn parks), then resolves with fn's return;
                                   the exception arm rejects with an abrupt fn and yields the promise (Promise.try
                                   returns a rejected promise, never raises) — the same shape as the executor. */
@@ -19278,6 +19280,38 @@ _Static_assert(TOPRIM_OUTER_ITER_CONSUME == 8, "TOPRIM_OUTER_ITER_CONSUME must e
                                   C-recursion drive-to-completion JS_IteratorNext would use. The generator drive
                                   frame carries this cont; its direct-mode settle re-enters js_iter_consume_step
                                   with the {value,done} result. */
+
+/* THE CONT_* NAMESPACE IS ONE NAMESPACE. A TrampFrame's cont_kind and a continuation's outer_kind both hold values
+   from it (a JSToPrim's outer is CONT_STEP / CONT_IMPORT / CONT_ITER_CONSUME; a JSGetProp's is CONT_STEP or
+   CONT_ITER_CONSUME), so two kinds sharing a number silently routes one continuation's state through the other
+   one's reader — a use-after-free or worse, and only for the first program that pairs them. The kinds are declared
+   next to the state structs they describe, hundreds of lines apart, which is exactly how CONT_IMPORT and
+   CONT_PROMISE_TRY both ended up at 18. A switch is the one construct C has that makes a duplicate constant a
+   COMPILE ERROR ("duplicate case value"), so this function exists only to be compiled. Every new kind goes here. */
+static inline void cont_kinds_are_distinct(int k)
+{
+    switch (k) {
+    case CONT_NONE:
+    case CONT_AGEN_CREATE:
+    case CONT_CONSTRUCT:
+    case CONT_SETTER:
+    case CONT_ITER_CONSUME:
+    case CONT_PROMISE_ALL:
+    case CONT_ASYNC_FROM_SYNC:
+    case CONT_ITER_HELPER:
+    case CONT_ITER_FROM:
+    case CONT_PROXY_GET:
+    case CONT_PROMISE_EXEC:
+    case CONT_PROMISE_TRY:
+    case CONT_STEP:
+    case CONT_IMPORT:
+    case CONT_CONSUME_GETITER:
+    case CONT_FOROF_NEXT:
+    case CONT_TOPRIM:
+    case CONT_GETPROP:
+        break;
+    }
+}
 
 /* A bytecode constructor's body run on the trampoline chain; holds the created `this` across the body so
    do_return can apply the constructor return-value rule (use `this` when the body returns a non-object).
@@ -20586,10 +20620,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #define DEF(id, size, n_pop, n_push, f) && case_OP_ ## id,
 #define def(id, size, n_pop, n_push, f)
 #include "quickjs-opcode.h"
-        /* OP_COUNT == 256: the DEFs fill every byte-opcode slot 0..255, so no default-fill range remains
-           (a `[OP_COUNT ... 255]` catch-all would be an empty, ill-formed designator here). */
+        /* The DEFs fill slots 0..OP_COUNT-1; every remaining byte an indirect jump could read must still land
+           somewhere, so the tail goes to the default label. A NULL slot here is a jump to address 0 on the first
+           corrupt or hostile bytecode byte. */
+        [OP_COUNT ... 255] = &&case_default,
     };
-    _Static_assert(OP_COUNT == 256, "dispatch_table must be fully populated by the opcode DEFs");
+    /* The range designator above is EMPTY (and ill-formed) at exactly 256 opcodes, which is where the set stood
+       until OP_using_dispose_async was deleted. Adding a 256th opcode back must delete the designator in the same
+       diff — this assert is what makes that a build failure instead of a silent [256 ... 255]. */
+    _Static_assert(OP_COUNT < 256, "the dispatch tail fill [OP_COUNT ... 255] needs at least one unused opcode byte");
 #define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) __extension__ ({ goto *dispatch_table[opcode = *pc++]; });
 #define CASE(op)        case_ ## op
 #define DEFAULT         case_default
@@ -21121,9 +21160,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
                 TRAMP_BODY_DISPATCH(-1, opcode == OP_tail_call);   /* f() with a bytecode body -> that body on THIS chain */
-                if (tramp_can_call_bound(call_argv[-1])) {   /* f.bind(...)(...) -> assemble bound+call args, dispatch target */
-                    tramp_is_tail = (opcode == OP_tail_call); goto do_bound_tramp;
-                }
+                /* the BOUND-function reshape is asked at do_generic_callee, which this opcode converges on: a bound
+                   function has no bytecode body of its own, so every call shape reaches that one point. Asking it
+                   here instead is what left `o.m()` (a bound method) driving its target to completion while
+                   `m()` parked — the OP_call_method chain never grew the copy. */
                 if (tramp_is_call_function(call_argv[-1]) && call_argc >= 2) {   /* builtins' call(thisArg,f,...) -> dispatch f here */
                     tramp_is_tail = (opcode == OP_tail_call); goto do_forward_callfn;
                 }
@@ -21295,6 +21335,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 call_argc = get_u16(pc);
                 pc += 2;
+            has_method_call_argc:
+                /* Entry for an opcode that IS a method call but spells its operands differently (OP_using_dispose's
+                   [value][method] is [this][f] with zero args). It must jump HERE and not re-derive the chain: the
+                   chain below is bound functions, proxy [[Call]], the async-from-sync .next, the generator methods,
+                   the iterable consumers and finally do_generic_callee, and a second site that reimplements part of
+                   it is one builtin answering differently depending on which opcode called it — a bound dispose
+                   method drove its target to completion for exactly that reason. */
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
                 TRAMP_BODY_DISPATCH(-2, opcode == OP_tail_call_method);   /* o.m() with a bytecode body -> that body here */
@@ -22150,7 +22197,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                Mirrors do_apply_tramp: assemble boundArgs ++ callArgs into the target's OWN arg_buf (the total is
                arbitrary), this = bf->this_val (borrowed — the bound-function object stays live on the caller
                stack until do_return frees it). Operand shape is the plain-call shape [boundfn, callArgs…]:
-               boundfn = call_argv[-1], call_first = -1; do_return frees boundfn + callArgs and pushes the result. */
+               boundfn = call_argv[-1]; call_first is the CALLER's operand shape (-1 plain [boundfn, callArgs…],
+               -2 method [receiver, boundfn, callArgs…] — the receiver is ignored, the bound `this` wins, but it is
+               still an operand do_return must free), and do_return pushes the result. */
             {
                 JSValueConst bthis;
                 int nbound;
@@ -22175,7 +22224,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 ntf->caller_argc = argc; ntf->caller_argv = argv;
                 ntf->caller_arg_allocated_size = arg_allocated_size;
                 ntf->caller_sp = sp;
-                ntf->call_first = -1; ntf->call_argc = call_argc; ntf->is_tail = tramp_is_tail;
+                DCHECK(tramp_first == -1 || tramp_first == -2, "bound-call reshape: unknown caller operand shape");
+                ntf->call_first = tramp_first; ntf->call_argc = call_argc; ntf->is_tail = tramp_is_tail;
                 ntf->b = nb; ntf->ctx = nb->realm; ntf->local_buf = nlb;
                 nsf = &ntf->sf;
                 nsf->is_strict_mode = nb->is_strict_mode;
@@ -22289,6 +22339,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         ret_val = JS_UNDEFINED;
                         goto do_step_step;
                     }
+                    /* the ultimate target is a plain BYTECODE body: assemble the flattened bound args and run it
+                       here, so a loop in it parks. js_call_bound_function would JS_Call it — a drive-to-completion.
+                       tramp_first travels with the reshape, which is what lets the same code serve the plain
+                       `bf()` and method `o.bf()` spellings; hardcoding -1 here meant the method spelling's
+                       receiver operand was never freed, so it could not be routed at all. */
+                    if (tramp_can_call_bound(call_argv[-1]))
+                        goto do_bound_tramp;
                 }
                 ret_val = JS_CallInternal(ctx, call_argv[-1], gthis, JS_UNDEFINED,
                                           call_argc, vc(call_argv), 0);
@@ -25811,79 +25868,32 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         CASE(OP_using_dispose):
+            /* sec-disposeresources step 3.a: Call(resource.[[DisposeMethod]], resource.[[ResourceValue]]).
+               stack: value method -- result.
+               [value][method] IS the method-call operand shape ([this, f] with zero args), so this opcode does not
+               call: it hands its operands to the ONE method-call dispatch chain (has_method_call_argc). It used to
+               reach the dispose method through JS_Call from C, which is a drive-to-completion — a dispose body
+               containing a loop preempted in an activation with no flow base and aborted.
+               Nothing here handles the abrupt completion: the OP_dispose_scope expansion wraps this call in an
+               OP_catch whose handler is OP_using_dispose_merge, so a throwing dispose is folded into the
+               accumulated error_state by bytecode rather than by a continuation of its own. */
             {
-                /* stack: error_state value method -- error_state. The resource and its already-fetched dispose
-                   method are pushed by the OP_dispose_scope expansion with ordinary load opcodes, so this opcode is
-                   addressing-agnostic: a module-level resource lives in a var_ref, a block-local one in a frame
-                   slot, and both arrive here the same way. */
                 JSValue val = sp[-2], method = sp[-1];
-                JSValue ret, error_state;
-
-                sp -= 2;
-                error_state = sp[-1];
 
                 if (JS_IsNull(val) || JS_IsUndefined(val) ||
                     JS_IsUninitialized(val)) {
-                    /* null/undefined (spec-permitted) or uninitialized
-                       (declaration threw before assignment). */
-                    JS_FreeValue(ctx, val);
-                    JS_FreeValue(ctx, method);
-                    BREAK;
-                }
-                sf->cur_pc = pc;
-                ret = JS_Call(ctx, method, val, 0, NULL);
-                JS_FreeValue(ctx, val);
-                JS_FreeValue(ctx, method);
-                if (JS_IsException(ret)) {
-                    JSValue new_error = JS_GetException(ctx);
-                    if (!JS_IsUninitialized(error_state)) {
-                        JSValue se;
-                        se = js_new_suppressed_error(ctx, new_error,
-                                                     error_state);
-                        JS_FreeValue(ctx, new_error);
-                        JS_FreeValue(ctx, error_state);
-                        if (JS_IsException(se)) {
-                            sp[-1] = JS_GetException(ctx);
-                        } else {
-                            sp[-1] = se;
-                        }
-                    } else {
-                        sp[-1] = new_error;
-                    }
-                } else {
-                    JS_FreeValue(ctx, ret);
-                }
-            }
-            BREAK;
-
-        CASE(OP_using_dispose_async):
-            {
-                /* stack: value method -- promise (see OP_using_dispose for why the operands come off the stack) */
-                JSValue val = sp[-2], method = sp[-1];
-                JSValue ret;
-
-                if (JS_IsNull(val) || JS_IsUndefined(val) ||
-                    JS_IsUninitialized(val)) {
+                    /* null/undefined (spec-permitted: AddDisposableResource records no method) or uninitialized
+                       (the declaration threw before its initializer completed). */
                     sp -= 2;
                     JS_FreeValue(ctx, val);
                     JS_FreeValue(ctx, method);
-                    sp[0] = JS_UNDEFINED;
-                    sp++;
+                    *sp++ = JS_UNDEFINED;
                     BREAK;
                 }
-                sf->cur_pc = pc;
-                ret = JS_Call(ctx, method, val, 0, NULL);
-                /* on a throw the two operands stay on the stack and the unwind to the OP_catch handler frees them
-                   (it releases everything above the recorded catch offset) — freeing here would double-free */
-                if (JS_IsException(ret))
-                    goto exception;
-                sp -= 2;
-                JS_FreeValue(ctx, val);
-                JS_FreeValue(ctx, method);
-                sp[0] = ret;
-                sp++;
+                call_argc = 0;
+                opcode = OP_call_method;   /* never a tail call: the result is dropped by the expansion */
+                goto has_method_call_argc;
             }
-            BREAK;
 
         CASE(OP_using_dispose_merge):
             {
@@ -29889,6 +29899,9 @@ typedef struct JSUsingDecl {
     int value_idx;          /* frame-local index, or the JSGlobalVar index when value_is_global */
     int method_idx;         /* frame-local index of the cached dispose method */
     bool value_is_global;   /* the value is a program-level (module) binding, reached via its var_ref */
+    bool is_await;          /* [[Hint]]: async-dispose (`await using`) awaits the dispose result, sync-dispose does
+                               not — per RESOURCE (Dispose step 3), not per scope. A scope-wide flag awaited a plain
+                               `using`'s result too whenever any sibling was an `await using`. */
 } JSUsingDecl;
 
 typedef struct JSGlobalVar {
@@ -32078,7 +32091,6 @@ static int push_scope(JSParseState *s) {
         fd->scopes[scope].parent = fd->scope_level;
         fd->scopes[scope].first = fd->scope_first;
         fd->scopes[scope].has_using = 0;
-        fd->scopes[scope].is_await_using = 0;
         fd->scopes[scope].using_label_catch = -1;
         fd->scopes[scope].using_label_end = -1;
         emit_op(s, OP_enter_scope);
@@ -32257,7 +32269,7 @@ static bool js_decl_is_program_level(JSFunctionDef *fd)
 
 /* Push one `using`/`await using` declaration onto the compile-time image of the scope's DisposeCapability. */
 static int add_using_decl(JSContext *ctx, JSFunctionDef *fd, int value_idx,
-                          bool value_is_global, int method_idx)
+                          bool value_is_global, int method_idx, bool is_await)
 {
     JSUsingDecl *ud;
     if (js_resize_array(ctx, (void **)&fd->using_decls, sizeof(fd->using_decls[0]),
@@ -32268,6 +32280,7 @@ static int add_using_decl(JSContext *ctx, JSFunctionDef *fd, int value_idx,
     ud->value_idx = value_idx;
     ud->method_idx = method_idx;
     ud->value_is_global = value_is_global;
+    ud->is_await = is_await;
     return 0;
 }
 
@@ -36627,7 +36640,8 @@ static __exception int js_parse_var(JSParseState *s, int parse_flags, int tok,
                     goto var_error;
                 fd->vars[using_method_idx].is_lexical = 1;
                 fd->vars[using_method_idx].is_const = 1;
-                if (add_using_decl(ctx, fd, using_value_idx, using_is_global, using_method_idx) < 0)
+                if (add_using_decl(ctx, fd, using_value_idx, using_is_global, using_method_idx,
+                                   (parse_flags & PF_AWAIT_USING) != 0) < 0)
                     goto var_error;
             }
             if (export_flag) {
@@ -36660,8 +36674,6 @@ static __exception int js_parse_var(JSParseState *s, int parse_flags, int tok,
                     bool init;
 
                     if (tok == TOK_USING) {
-                        bool is_await = (parse_flags & PF_AWAIT_USING) != 0;
-
                         if (!fd->scopes[fd->scope_level].has_using) {
                             /* First 'using' in this scope: set up labels
                                for the catch handler and end of disposal */
@@ -36678,8 +36690,6 @@ static __exception int js_parse_var(JSParseState *s, int parse_flags, int tok,
                             emit_goto(s, OP_catch,
                                 fd->scopes[fd->scope_level].using_label_catch);
                         }
-                        if (is_await)
-                            fd->scopes[fd->scope_level].is_await_using = 1;
                     }
 
                     if (js_parse_assign_expr2(s, parse_flags))
@@ -36931,7 +36941,7 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
                 }
                 fd->vars[mi].is_lexical = 1;
                 fd->vars[mi].is_const = 1;
-                if (add_using_decl(ctx, fd, value_idx, false, mi) < 0) {
+                if (add_using_decl(ctx, fd, value_idx, false, mi, is_await_using) < 0) {
                     JS_FreeAtom(s->ctx, var_name);
                     return -1;
                 }
@@ -36950,8 +36960,6 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
                     fd->scopes[fd->scope_level].using_label_catch = new_label(s);
                     fd->scopes[fd->scope_level].using_label_end = new_label(s);
                 }
-                if (is_await_using)
-                    fd->scopes[fd->scope_level].is_await_using = 1;
             }
         }
     } else if (!is_async && token_is_pseudo_keyword(s, JS_ATOM_async) && peek_token(s, false) == TOK_OF) {
@@ -40830,7 +40838,6 @@ static JSFunctionDef *js_new_function_def(JSContext *ctx,
     fd->scopes[0].first = -1;
     fd->scopes[0].parent = -1;
     fd->scopes[0].has_using = 0;
-    fd->scopes[0].is_await_using = 0;
     fd->scopes[0].using_label_catch = -1;
     fd->scopes[0].using_label_end = -1;
     fd->scope_level = 0;  /* 0: var/arg scope */
@@ -43221,7 +43228,6 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
                mode of their own and the two halves need not be adjacent slots. */
             {
                 int ud_i, scope = get_u16(bc_buf + pos + 1);
-                bool is_async = s->scopes[scope].is_await_using;
 
                 for (ud_i = s->using_decl_count - 1; ud_i >= 0; ud_i--) {
                     JSUsingDecl *ud = &s->using_decls[ud_i];
@@ -43244,53 +43250,51 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
                         DCHECK(value_idx >= 0,
                                "a program-level `using` binding has no module closure var — add_module_variables did not run");
                     }
-                    if (is_async) {
-                        int label_catch = new_label_fd(s);
-                        int label_end = new_label_fd(s);
-                        if (label_catch < 0 || label_end < 0) {
-                            dbuf_set_error(&bc_out);
-                            break;
-                        }
-
-                        dbuf_putc(&bc_out, OP_catch);
-                        dbuf_put_u32(&bc_out, label_catch);
-                        update_label(s, label_catch, 1);
-                        s->jump_size++;
-
-                        /* the raw (unchecked) loads: a resource whose initializer threw is still UNINITIALIZED
-                           here and must reach the dispose opcode as such, not as a TDZ ReferenceError */
-                        dbuf_putc(&bc_out, value_op);
-                        dbuf_put_u16(&bc_out, value_idx);
-                        dbuf_putc(&bc_out, OP_get_loc);
-                        dbuf_put_u16(&bc_out, ud->method_idx);
-
-                        dbuf_putc(&bc_out, OP_using_dispose_async);
-
-                        dbuf_putc(&bc_out, OP_await);
-                        dbuf_putc(&bc_out, OP_drop);
-                        dbuf_putc(&bc_out, OP_drop);
-
-                        dbuf_putc(&bc_out, OP_goto);
-                        dbuf_put_u32(&bc_out, label_end);
-                        update_label(s, label_end, 1);
-                        s->jump_size++;
-
-                        dbuf_putc(&bc_out, OP_label);
-                        dbuf_put_u32(&bc_out, label_catch);
-                        s->label_slots[label_catch].pos2 = bc_out.size;
-
-                        dbuf_putc(&bc_out, OP_using_dispose_merge);
-
-                        dbuf_putc(&bc_out, OP_label);
-                        dbuf_put_u32(&bc_out, label_end);
-                        s->label_slots[label_end].pos2 = bc_out.size;
-                    } else {
-                        dbuf_putc(&bc_out, value_op);
-                        dbuf_put_u16(&bc_out, value_idx);
-                        dbuf_putc(&bc_out, OP_get_loc);
-                        dbuf_put_u16(&bc_out, ud->method_idx);
-                        dbuf_putc(&bc_out, OP_using_dispose);
+                    /* ONE shape for sync and `await using`; the await is the only difference. The sync form used to
+                       have its own: OP_using_dispose caught the dispose method's throw INSIDE the opcode and merged
+                       it there, which is why that call could not be an ordinary trampolined call (a call site cannot
+                       catch). Wrapping it in the same OP_catch the async form already used makes the abrupt path
+                       bytecode for both, so the dispose call is just a call. */
+                    int label_catch = new_label_fd(s);
+                    int label_end = new_label_fd(s);
+                    if (label_catch < 0 || label_end < 0) {
+                        dbuf_set_error(&bc_out);
+                        break;
                     }
+
+                    dbuf_putc(&bc_out, OP_catch);
+                    dbuf_put_u32(&bc_out, label_catch);
+                    update_label(s, label_catch, 1);
+                    s->jump_size++;
+
+                    /* the raw (unchecked) loads: a resource whose initializer threw is still UNINITIALIZED here
+                       and must reach the dispose opcode as such, not as a TDZ ReferenceError */
+                    dbuf_putc(&bc_out, value_op);
+                    dbuf_put_u16(&bc_out, value_idx);
+                    dbuf_putc(&bc_out, OP_get_loc);
+                    dbuf_put_u16(&bc_out, ud->method_idx);
+
+                    dbuf_putc(&bc_out, OP_using_dispose);
+
+                    if (ud->is_await)
+                        dbuf_putc(&bc_out, OP_await);   /* Dispose step 3: this RESOURCE's [[Hint]] is async-dispose */
+                    dbuf_putc(&bc_out, OP_drop);        /* the dispose call's result is discarded */
+                    dbuf_putc(&bc_out, OP_drop);        /* the catch_offset */
+
+                    dbuf_putc(&bc_out, OP_goto);
+                    dbuf_put_u32(&bc_out, label_end);
+                    update_label(s, label_end, 1);
+                    s->jump_size++;
+
+                    dbuf_putc(&bc_out, OP_label);
+                    dbuf_put_u32(&bc_out, label_catch);
+                    s->label_slots[label_catch].pos2 = bc_out.size;
+
+                    dbuf_putc(&bc_out, OP_using_dispose_merge);
+
+                    dbuf_putc(&bc_out, OP_label);
+                    dbuf_put_u32(&bc_out, label_end);
+                    s->label_slots[label_end].pos2 = bc_out.size;
                 }
             }
             break;
@@ -46377,7 +46381,16 @@ typedef enum BCTagEnum {
     BC_TAG_SYMBOL,
 } BCTagEnum;
 
-#define BC_VERSION 27
+#define BC_VERSION 28
+/* The serialized form embeds RAW OPCODE BYTES, so the opcode set is part of the wire format — and this binary
+   deserializes blobs written by a PREVIOUS build of itself: the builtin-*.h bytecode compiled into it
+   (Array.fromAsync, Iterator.zip). Deleting one opcode shifted every later opcode's value, and the stale
+   Array.fromAsync blob then read an operand as an atom index — surfacing as "invalid atom index" from an unrelated
+   property access, several thousand tests away from the cause, because the version byte still matched. This assert
+   is the gate: change the opcode set and the BUILD fails until BC_VERSION is bumped and `make codegen` has
+   regenerated the blobs. */
+_Static_assert(OP_COUNT == 255,
+               "the opcode set changed: bump BC_VERSION and run `make codegen` to regenerate builtin-*.h");
 
 typedef struct BCWriterState {
     JSContext *ctx;
