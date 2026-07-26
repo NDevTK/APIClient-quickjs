@@ -18241,6 +18241,32 @@ static int step_getprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAt
     return step_getprop_done(ctx, h, in, pout);
 }
 
+/* A keyed WRITE, Set(O, key, value, true) — the mirror of the read above and the half that was missing. Every
+   builtin that copies properties (Object.assign's target, Array.from's final `length`) performed it with
+   JS_SetProperty straight out of C, so a SETTER or a Proxy `set` trap with a loop in it had no flow base. WHICH
+   shape it turns out to be — a data slot, a bytecode setter, a trap — is the driver's decision, made in the one
+   place the read's already is. The value is BORROWED: the continuation dups what it needs for the invariant.
+     0 = done, 8 = the caller must return that step code, -1 = threw. */
+static int step_setprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAtom atom, JSValueConst value,
+                            JSValue in, JSValue **out_cb, int *out_argc)
+{
+    if (h->get_phase == GET_PH_START) {
+        JS_FreeValue(ctx, in);
+        DCHECK(h->get_atom == JS_ATOM_NULL, "a keyed operation is already in flight on this machine's header");
+        h->get_atom = JS_DupAtom(ctx, atom);
+        h->cb_coerce[0] = (JSValue)obj;     /* borrowed: the machine holds both across the write */
+        h->cb_coerce[1] = (JSValue)value;
+        *out_cb = h->cb_coerce; *out_argc = (int)atom;
+        h->get_phase = GET_PH_GOT;
+        return 8;
+    }
+    JS_FreeAtom(ctx, h->get_atom);
+    h->get_atom = JS_ATOM_NULL;
+    h->get_phase = GET_PH_START;
+    JS_FreeValue(ctx, in);                  /* a write delivers no value */
+    return 0;
+}
+
 /* an INDEX key. ! ToString(𝔽(idx)) is what the spec's element access reduces to, and the atom is the engine's
    representation of exactly that. */
 static int step_getidx_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, int64_t idx, JSValue in,
@@ -18992,21 +19018,27 @@ static int js_proxy_delete_invariant(JSContext *ctx, JSValueConst target, JSAtom
 typedef struct JSGetProp {
     JSValue target;      /* the proxy's [[Target]], for the invariant (owned); UNDEFINED for an accessor */
     JSAtom atom;         /* the key (owned) */
+    JSValue value;       /* GP_SET only: the value written, which 9.5.9 step 11's invariant is a SameValue against
+                            (owned). UNDEFINED for the two reads. */
     void *outer; uint8_t outer_kind;
-    uint8_t is_has;      /* 1 = [[HasProperty]] (step code 7) rather than [[Get]] (step code 6). The two differ
-                            only in which trap runs, which invariant its result must satisfy and whether the
-                            result is a boolean — everything else about the request, the dispatch, the delivery
-                            and the unwind is identical, which is why they are one continuation and not two. */
+    uint8_t op;          /* GP_GET / GP_HAS / GP_SET — step codes 6, 7 and 8. They differ only in which trap runs,
+                            which invariant its result must satisfy and what the machine is handed back; everything
+                            else about the request, the dispatch, the delivery and the unwind is identical, which is
+                            why they are one continuation and not three. */
     uint8_t nargs;
-    JSValue cb[5];       /* [this, fn, args…] — OWNED here, never on the caller's compiler-sized stack. A trap
-                            call needs five slots and the frame that invoked the builtin has no obligation to
+    JSValue cb[6];       /* [this, fn, args…] — OWNED here, never on the caller's compiler-sized stack. The `set`
+                            trap call needs six slots and the frame that invoked the builtin has no obligation to
                             have room for them; a step machine's cb_args solve this the same way. */
 } JSGetProp;
+#define GP_GET 0
+#define GP_HAS 1
+#define GP_SET 2
 
 static void js_getprop_free(JSContext *ctx, JSGetProp *gp)
 {
     int i;
     JS_FreeValue(ctx, gp->target);
+    JS_FreeValue(ctx, gp->value);
     JS_FreeAtom(ctx, gp->atom);
     for (i = 0; i < 2 + gp->nargs; i++)
         JS_FreeValue(ctx, gp->cb[i]);
@@ -20761,9 +20793,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     const uint8_t *tp_retry_pc = NULL;
     JSValueConst tp_value = JS_UNDEFINED;               /* MACHINE mode: the value to coerce (borrowed) */
     void *tp_outer = NULL;
-    JSValueConst gp_obj = JS_UNDEFINED;                 /* do_getprop_tramp inputs: the receiver, the key, whether */
-    JSAtom gp_atom = JS_ATOM_NULL;                      /* it is a [[Get]] or a [[HasProperty]], and the machine */
-    uint8_t gp_is_has = 0;                              /* the result is delivered to. */
+    JSValueConst gp_obj = JS_UNDEFINED;                 /* do_getprop_tramp inputs: the receiver, the key, WHICH */
+    JSAtom gp_atom = JS_ATOM_NULL;                      /* keyed operation ([[Get]]/[[HasProperty]]/[[Set]]), and */
+    uint8_t gp_op = GP_GET;                             /* the result is delivered to. */
+    JSValueConst gp_val = JS_UNDEFINED;                 /* GP_SET: the value to write (borrowed from the machine) */
     void *gp_outer = NULL;
     uint8_t gp_outer_kind = CONT_NONE;
     void *cd_outer = NULL;                              /* do_cont_dispatch: the sequence awaiting the call's result */
@@ -22712,13 +22745,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     *sp++ = r;
                     BREAK;
                 }
-                if (st == 6 || st == 7) {
-                    /* GETPROP (6) / HASPROPERTY (7): *out_cb is [obj] and *out_argc is the ATOM — the same shape as
-                       TOPRIMITIVE passing its hint. A prologue reads `length`, `constructor`, `@@species`; a search
-                       loop asks whether index k is present; every one of those can be an accessor or a proxy trap,
-                       which is user code the machine must not drive itself. */
+                if (st == 6 || st == 7 || st == 8) {
+                    /* GETPROP (6) / HASPROPERTY (7) / SETPROP (8): *out_cb is [obj] — plus [value] for the write —
+                       and *out_argc is the ATOM, the same shape as TOPRIMITIVE passing its hint. A prologue reads
+                       `length`, `constructor`, `@@species`; a search loop asks whether index k is present; a copy
+                       writes each key it read; every one of those can be an accessor or a proxy trap, which is user
+                       code the machine must not drive itself. */
                     gp_outer = stt; gp_outer_kind = CONT_STEP;
-                    gp_obj = cb[0]; gp_atom = (JSAtom)cbn; gp_is_has = (st == 7);
+                    gp_obj = cb[0]; gp_atom = (JSAtom)cbn;
+                    gp_op = (st == 7) ? GP_HAS : (st == 8) ? GP_SET : GP_GET;
+                    gp_val = (st == 8) ? cb[1] : JS_UNDEFINED;
                     goto do_getprop_tramp;
                 }
                 if (st == 5) {
@@ -23141,12 +23177,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 JSGetProp *gp;
                 JSValue method = JS_UNDEFINED, keyval = JS_UNDEFINED, tgt = JS_UNDEFINED, handler = JS_UNDEFINED;
-                JSObject *getter = NULL;
+                JSObject *accessor = NULL;
                 if (JS_VALUE_GET_TAG(gp_obj) == JS_TAG_OBJECT) {
                     JSObject *po = JS_VALUE_GET_OBJ(gp_obj);
                     if (po->class_id == JS_CLASS_PROXY) {
                         JSProxyData *pd = get_proxy_method(ctx, &method, gp_obj,
-                                                          gp_is_has ? JS_ATOM_has : JS_ATOM_get);
+                                                          gp_op == GP_HAS ? JS_ATOM_has :
+                                                          gp_op == GP_SET ? JS_ATOM_set : JS_ATOM_get);
                         if (!pd) goto getprop_throw;               /* revoked, or the handler's own get threw */
                         if (JS_IsUndefined(method) || !tramp_can_call(method)) {
                             JS_FreeValue(ctx, method);             /* no trap, or a C/bound trap with no body */
@@ -23157,22 +23194,32 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             tgt = js_dup(pd->target);
                             handler = js_dup(pd->handler);
                         }
-                    } else if (!gp_is_has) {
-                        getter = tramp_bytecode_getter(po, gp_atom);   /* a HasProperty never invokes a getter */
+                    } else if (gp_op == GP_GET) {
+                        accessor = tramp_bytecode_getter(po, gp_atom);   /* a HasProperty never invokes a getter */
+                    } else if (gp_op == GP_SET) {
+                        accessor = tramp_bytecode_setter(po, gp_atom);
                     }
                 }
-                if (JS_IsUndefined(method) && !getter) {
-                    if (gp_is_has) {
+                if (JS_IsUndefined(method) && !accessor) {
+                    /* nothing user-written is involved: do it right here and hand the machine its answer. */
+                    if (gp_op == GP_HAS) {
                         int hres = JS_HasProperty(ctx, gp_obj, gp_atom);
                         if (unlikely(hres < 0)) goto getprop_throw;
                         ret_val = js_bool(hres);
+                    } else if (gp_op == GP_SET) {
+                        /* Set(O, P, V, true): the write yields nothing to the machine, only its throw. */
+                        if (unlikely(JS_SetPropertyInternal2(ctx, gp_obj, gp_atom, js_dup(gp_val), gp_obj,
+                                                             JS_PROP_THROW) < 0))
+                            goto getprop_throw;
+                        ret_val = JS_UNDEFINED;
                     } else {
                         ret_val = JS_GetProperty(ctx, gp_obj, gp_atom);
                         if (unlikely(JS_IsException(ret_val))) goto getprop_throw;
                     }
                     cont_st = gp_outer;                            /* nothing suspended: straight to the machine */
                     { uint8_t gk = gp_outer_kind;
-                      gp_outer = NULL; gp_outer_kind = CONT_NONE; gp_atom = JS_ATOM_NULL; gp_is_has = 0;
+                      gp_outer = NULL; gp_outer_kind = CONT_NONE; gp_atom = JS_ATOM_NULL;
+                      gp_op = GP_GET; gp_val = JS_UNDEFINED;
                       if (gk == CONT_ITER_CONSUME) goto do_iter_consume_step;
                       DCHECK(gk == CONT_STEP, "property-get outer continuation: unknown machine kind"); }
                     goto do_step_step;
@@ -23185,27 +23232,39 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto getprop_throw;
                 }
                 gp->target = tgt;
+                gp->value = (gp_op == GP_SET) ? js_dup(gp_val) : JS_UNDEFINED;
                 gp->atom = JS_DupAtom(ctx, gp_atom);
                 gp->outer = gp_outer; gp->outer_kind = gp_outer_kind;
-                gp->is_has = gp_is_has;
-                if (getter) {
+                gp->op = gp_op;
+                if (accessor) {
                     gp->cb[0] = js_dup(gp_obj);                              /* this = the receiver */
-                    gp->cb[1] = js_dup(JS_MKPTR(JS_TAG_OBJECT, getter));     /* the accessor */
-                    gp->nargs = 0;
+                    gp->cb[1] = js_dup(JS_MKPTR(JS_TAG_OBJECT, accessor));   /* the accessor */
+                    if (gp_op == GP_SET) {
+                        gp->cb[2] = js_dup(gp_val);                          /* set x(v): one argument */
+                        gp->nargs = 1;
+                    } else {
+                        gp->nargs = 0;
+                    }
                 } else {
                     gp->cb[0] = handler;                                     /* this = the handler */
                     gp->cb[1] = method;                                      /* the trap (owned) */
                     gp->cb[2] = js_dup(gp->target);
                     gp->cb[3] = keyval;
-                    /* has(target, key) takes two arguments; get(target, key, receiver) takes three. */
-                    if (gp_is_has) {
+                    /* has(target, key) takes two; get(target, key, receiver) three; set(target, key, value,
+                       receiver) four. */
+                    if (gp_op == GP_HAS) {
                         gp->nargs = 2;
+                    } else if (gp_op == GP_SET) {
+                        gp->cb[4] = js_dup(gp_val);
+                        gp->cb[5] = js_dup(gp_obj);                          /* receiver IS the proxy */
+                        gp->nargs = 4;
                     } else {
                         gp->cb[4] = js_dup(gp_obj);                          /* receiver IS the proxy */
                         gp->nargs = 3;
                     }
                 }
-                gp_outer = NULL; gp_outer_kind = CONT_NONE; gp_atom = JS_ATOM_NULL; gp_is_has = 0;
+                gp_outer = NULL; gp_outer_kind = CONT_NONE; gp_atom = JS_ATOM_NULL;
+                gp_op = GP_GET; gp_val = JS_UNDEFINED;
                 call_argv = (JSValueConst *)&gp->cb[2];
                 call_argc = gp->nargs; tramp_first = -2; tramp_is_tail = 0;
                 tramp_cont_state = gp; tramp_cont_kind = CONT_GETPROP;
@@ -23217,7 +23276,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    so do the machines waiting on IT. */
                 {
                     void *gouter = gp_outer;
-                    gp_outer = NULL; gp_outer_kind = CONT_NONE; gp_atom = JS_ATOM_NULL; gp_is_has = 0;
+                    gp_outer = NULL; gp_outer_kind = CONT_NONE; gp_atom = JS_ATOM_NULL;
+                    gp_op = GP_GET; gp_val = JS_UNDEFINED;
                     tramp_step_chain_free(ctx, gouter);
                     goto exception;
                 }
@@ -23678,7 +23738,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     gp_outer = s; gp_outer_kind = CONT_ITER_CONSUME;
                     gp_obj = s->ent_obj;
                     gp_atom = __JS_AtomFromUInt32(s->ent_ph);
-                    gp_is_has = 0;
+                    gp_op = GP_GET; gp_val = JS_UNDEFINED;
                     goto do_getprop_tramp;
                 }
                 if (st == 5) {
@@ -24946,10 +25006,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     uint8_t gouter_kind = gp->outer_kind;
                     DCHECK(gouter_kind == CONT_STEP || gouter_kind == CONT_ITER_CONSUME,
                            "property-get outer continuation: unknown machine kind");
-                    if (gp->is_has) {
+                    if (gp->op == GP_HAS) {
                         /* the `has` trap's boolean, then the target's [[HasProperty]] invariant on it */
                         int hres = js_proxy_has_invariant(ctx, gp->target, gp->atom, JS_ToBoolFree(ctx, ret_val));
                         ret_val = (hres < 0) ? JS_EXCEPTION : js_bool(hres);
+                    } else if (gp->op == GP_SET) {
+                        /* A SETTER yields nothing at all; a `set` TRAP yields a boolean that owes the target's
+                           [[Set]] invariant and then, because every consumer of this request performs
+                           Set(O, P, V, true), a TypeError when it is false. Either way the machine is handed
+                           UNDEFINED — a write has no value to deliver. */
+                        if (!JS_IsUndefined(gp->target)) {
+                            int sres = js_proxy_set_invariant(ctx, gp->target, gp->atom, gp->value,
+                                                              JS_ToBoolFree(ctx, ret_val));
+                            if (sres < 0) ret_val = JS_EXCEPTION;
+                            else if (!sres) { JS_ThrowTypeError(ctx, "proxy: cannot set property"); ret_val = JS_EXCEPTION; }
+                            else ret_val = JS_UNDEFINED;
+                        } else {
+                            JS_FreeValue(ctx, ret_val);
+                            ret_val = JS_UNDEFINED;
+                        }
                     } else if (!JS_IsUndefined(gp->target)) {
                         ret_val = js_proxy_get_invariant(ctx, gp->target, gp->atom, ret_val);
                     }
@@ -50228,13 +50303,11 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
             JSValue item = s->el;
             s->el = JS_UNDEFINED;   /* the state no longer owns it: every path below consumes it */
             if (assign) {
-                /* 20.1.2.1 step 3.a.iii.2: Set(to, nextKey, propValue, true). A SETTER or a Proxy `set` trap on
-                   the TARGET is user code and this reaches it from C — the one edge of this walk that is still a
-                   drive-to-completion, and it aborts loud there rather than being papered over. It wants the
-                   keyed-WRITE step primitive that GETPROP is the read half of. */
-                int sret = JS_SetPropertyInternal2(ctx, s->result, s->atoms[s->i].atom, item,
-                                                  s->result, JS_PROP_THROW);
-                if (sret < 0) return -1;
+                /* 20.1.2.1 step 3.a.iii.2: Set(to, nextKey, propValue, true) — through the keyed-WRITE step, so a
+                   SETTER or a Proxy `set` trap on the TARGET runs on the chain. The element is parked back on the
+                   state because the write suspends and this function's locals do not survive that. */
+                s->el = item;
+                s->hdr.stage = 6;
             } else if (mode == PROPWALK_SPREAD) {
                 /* CreateDataPropertyOrThrow on a FRESH object: no setter, no trap, nothing that can suspend. */
                 if (JS_DefinePropertyValue(ctx, s->result, JS_DupAtom(ctx, s->atoms[s->i].atom), item,
@@ -50257,6 +50330,17 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
                 if (JS_CreateDataPropertyUint32(ctx, s->result, s->j++, item, 0) < 0)
                     return -1;
             }
+            if (s->hdr.stage != 6) {
+                s->i++;
+                s->hdr.stage = 2;
+            }
+        }
+        if (s->hdr.stage == 6) {
+            r = step_setprop_run(ctx, &s->hdr, s->result, s->atoms[s->i].atom, s->el, cb_result,
+                                 out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            JS_FreeValue(ctx, s->el); s->el = JS_UNDEFINED;
             s->i++;
             s->hdr.stage = 2;
         }
@@ -54644,6 +54728,9 @@ static int js_array_fromlike_step(JSContext *ctx, void *st, JSValue cb_result, J
         s->hdr.stage = 4;
     }
     for (;;) {
+        /* the loop is left at stage 7 (the trailing length write), and that write SUSPENDS — so a re-entry lands
+           here with a stage no arm below matches. Without this the loop spun forever on the resume. */
+        if (s->hdr.stage == 7) break;
         if (s->hdr.stage == 4) {
             if (s->k >= s->len) { s->hdr.stage = 7; break; }
             s->hdr.stage = 5;
@@ -54684,11 +54771,15 @@ static int js_array_fromlike_step(JSContext *ctx, void *st, JSValue cb_result, J
         }
     }
     /* step 10: Set(A, "length", 𝔽(len), true). On a plain Array this is the internal length; on a SUBCLASS with a
-       `length` setter it is user code, and reaching it from here is the keyed-WRITE step primitive this engine does
-       not have yet — it aborts loud there rather than driving the setter to completion. */
-    JS_FreeValue(ctx, cb_result);
-    if (JS_SetProperty(ctx, s->arr, JS_ATOM_length, js_int64(s->len)) < 0)
-        return -1;
+       `length` setter it is user code, which is why it goes through the keyed-WRITE step like every other write. */
+    DCHECK(s->hdr.stage == 7, "the array-like walk left its loop in an unexpected stage");
+    /* the length value is parked on the state, not a C local: the write can suspend and this function's locals do
+       not survive that — the request BORROWS what it is handed. */
+    if (JS_IsUndefined(s->el)) s->el = js_int64(s->len);
+    r = step_setprop_run(ctx, &s->hdr, s->arr, JS_ATOM_length, s->el, cb_result, out_cb, out_argc);
+    cb_result = JS_UNDEFINED;
+    if (r) return r < 0 ? -1 : r;
+    JS_FreeValue(ctx, s->el); s->el = JS_UNDEFINED;
     return 0;
 }
 
