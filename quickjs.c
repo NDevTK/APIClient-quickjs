@@ -24957,9 +24957,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                     ret_val = js_dup(obj);   /* non-string direct eval yields its argument unchanged */
                 } else {
-                    ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
-                                              JS_UNDEFINED, call_argc,
-                                              vc(call_argv), 0);
+                    /* The identifier `eval` resolved to something ELSE (`eval = f`, a local `var eval`, a `with`
+                       object's property). 13.3.6.1 step 6 only special-cases the value %eval%; anything else is an
+                       ORDINARY call, so it belongs on the tramp like every other call shape. C-recursing into
+                       JS_CallInternal here gave the callee its own activation off the chain: a loop in it had no
+                       flow base to park into, and 100000 tail calls through such an identifier exhausted the C
+                       stack (the tco-non-eval-* tests). The operands are already the PLAIN shape
+                       [callee, args…] with `this` undefined, which is tramp_first = -1 — the only thing this
+                       opcode declares; do_generic_callee asks every other question about the callee. */
+                    tramp_first = -1; tramp_is_tail = 0;
+                    tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;
+                    if (tramp_can_call(call_argv[-1])) goto do_tramp_call;
+                    goto do_generic_callee;
                 }
                 if (unlikely(JS_IsException(ret_val)))
                     goto exception;
