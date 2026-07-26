@@ -1445,7 +1445,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_BIGINT_ASUINTN, STEPDEF_BIGINT_ASINTN,
     STEPDEF_OBJ_GOPD, STEPDEF_REFLECT_GOPD,
     STEPDEF_OBJ_VALUES, STEPDEF_OBJ_ENTRIES, STEPDEF_OBJ_ASSIGN, STEPDEF_OBJ_SPREAD,
-    STEPDEF_ARRAY_FLAT, STEPDEF_ARRAY_FLATMAP, STEPDEF_ARRAY_FROMLIKE, STEPDEF_ARRAY_WITH, STEPDEF_ARRAY_FILL, STEPDEF_ARRAY_COPYWITHIN, STEPDEF_BIGINT_CTOR,
+    STEPDEF_ARRAY_FLAT, STEPDEF_ARRAY_FLATMAP, STEPDEF_ARRAY_FROMLIKE, STEPDEF_ARRAY_WITH, STEPDEF_ARRAY_FILL, STEPDEF_ARRAY_COPYWITHIN, STEPDEF_BIGINT_CTOR, STEPDEF_TA_WITH,
     STEPDEF_MATH_ABS, STEPDEF_MATH_FLOOR, STEPDEF_MATH_CEIL, STEPDEF_MATH_ROUND, STEPDEF_MATH_SQRT, STEPDEF_MATH_ACOS, STEPDEF_MATH_ASIN, STEPDEF_MATH_ATAN, STEPDEF_MATH_COS, STEPDEF_MATH_EXP, STEPDEF_MATH_LOG, STEPDEF_MATH_SIN, STEPDEF_MATH_TAN, STEPDEF_MATH_TRUNC, STEPDEF_MATH_SIGN, STEPDEF_MATH_COSH, STEPDEF_MATH_SINH, STEPDEF_MATH_TANH, STEPDEF_MATH_ACOSH, STEPDEF_MATH_ASINH, STEPDEF_MATH_ATANH, STEPDEF_MATH_EXPM1, STEPDEF_MATH_LOG1P, STEPDEF_MATH_LOG2, STEPDEF_MATH_LOG10, STEPDEF_MATH_CBRT, STEPDEF_MATH_F16ROUND, STEPDEF_MATH_FROUND, STEPDEF_MATH_ATAN2, STEPDEF_MATH_POW, STEPDEF_MATH_MIN, STEPDEF_MATH_MAX, STEPDEF_MATH_HYPOT, STEPDEF_MATH_IMUL, STEPDEF_MATH_CLZ32, STEPDEF_STR_FROMCHARCODE, STEPDEF_STR_FROMCODEPOINT, STEPDEF_DATE_UTC,
     STEPDEF_REGEXP_EXEC, STEPDEF_REGEXP_TEST,
     STEPDEF_ITER_TAKE, STEPDEF_ITER_DROP,
@@ -18454,6 +18454,30 @@ static int step_thisstring_run(JSContext *ctx, JSStepHdr *h, JSValue in, JSValue
    re-entered here, -1 = threw. */
 enum { NUM_PH_START = 0, NUM_PH_PRIM };
 
+/* ToPrimitive(v, hint) delivering the PRIMITIVE ITSELF. The existing helpers each finish with a conversion —
+   ToString, ToLength, ToNumber — but some spec steps ARE the coercion and inspect what came back (which type it
+   is, whether it is finite). 0 = *pout is filled, 5 = the caller must return that step code, -1 = threw. */
+static int step_toprim_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, int hint, JSValue in, JSValue *pout,
+                           JSValue **out_cb, int *out_argc)
+{
+    if (h->num_phase == NUM_PH_START) {
+        JS_FreeValue(ctx, in);
+        if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT) { *pout = js_dup(v); return 0; }
+        DCHECK(JS_VALUE_GET_TAG(h->coerce) != JS_TAG_OBJECT,
+               "a coercion is already in flight on this machine's header");
+        h->coerce = js_dup(v);
+        h->cb_coerce[0] = h->coerce;
+        *out_cb = h->cb_coerce; *out_argc = hint;
+        h->num_phase = NUM_PH_PRIM;
+        return 5;
+    }
+    JS_FreeValue(ctx, h->coerce);
+    h->coerce = JS_UNDEFINED;
+    h->num_phase = NUM_PH_START;
+    *pout = in;
+    return 0;
+}
+
 static int step_toint64_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValue in, int64_t *pres,
                             JSValue **out_cb, int *out_argc)
 {
@@ -19934,6 +19958,20 @@ typedef struct JSArrayFill {
     JSValue obj;          /* ToObject(this) (owned); also the result */
     int64_t len, k, end;
 } JSArrayFill;
+
+/* 23.2.3.36 %TypedArray%.prototype.with. Its index and its value are BOTH the page's code, and js_typed_array_with
+   coerced them with JS_ToInt64Sat / JS_ToPrimitive from a C entry. The length is captured at step 2, BEFORE either
+   coercion, because a resizable buffer shrunk by a valueOf must still yield a result of the ORIGINAL length —
+   which is why this cannot be a coerce-then-compute declaration. */
+typedef struct JSTAWith {
+    JSStepHdr hdr;        /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    JSValue val;          /* the coerced value (owned) */
+    JSValue result;       /* DONE (owned) */
+    int64_t idx;
+    uint32_t len;
+} JSTAWith;
+static JSValue js_typed_array_with_build(JSContext *ctx, JSValueConst this_val, int64_t idx, JSValue val, uint32_t len);
+static JSObject *get_typed_array(JSContext *ctx, JSValueConst this_val);
 
 /* Array.prototype.copyWithin, 23.1.3.4. ToObject, LengthOfArrayLike, THREE index coercions, then a walk that
    for each position either copies the source element or DELETES the target one (step 14.d.ii, when the source is
@@ -53216,6 +53254,52 @@ static JSValue js_array_copywithin_fini(JSContext *ctx, void *st, bool take_resu
     return r;
 }
 
+static int js_ta_with_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSTAWith *s = st;
+    int r;
+
+    if (s->hdr.stage == 0) {
+        JSObject *p;
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
+        s->val = JS_UNDEFINED; s->result = JS_UNDEFINED;
+        s->idx = 0; s->len = 0;
+        p = get_typed_array(ctx, s->hdr.this_val);
+        if (!p) return -1;
+        s->len = p->u.array.count;   /* step 2, before either coercion */
+        s->hdr.stage = 1;
+    }
+    if (s->hdr.stage == 1) {
+        r = step_toint64_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->idx, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        if (s->idx < 0) s->idx += s->len;   /* resolved against the ORIGINAL length, per steps 5-6 */
+        s->hdr.stage = 2;
+    }
+    if (s->hdr.stage == 2) {
+        r = step_toprim_run(ctx, &s->hdr, step_arg(&s->hdr, 1), HINT_NUMBER, cb_result, &s->val,
+                            out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 3;
+    }
+    JS_FreeValue(ctx, cb_result);
+    { JSValue v = s->val; s->val = JS_UNDEFINED;
+      s->result = js_typed_array_with_build(ctx, s->hdr.this_val, s->idx, v, s->len); }
+    return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
+}
+
+static JSValue js_ta_with_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSTAWith *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    JS_FreeValue(ctx, s->val);
+    js_free(ctx, s);
+    return r;
+}
+
 static int js_array_fill_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSArrayFill *s = st;
@@ -54128,6 +54212,8 @@ static JSValue js_ta_slice_fini(JSContext *ctx, void *st, bool take_result);
 static int js_array_at_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_array_with_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_array_fill_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static int js_ta_with_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_ta_with_fini(JSContext *ctx, void *st, bool take_result);
 static int js_array_copywithin_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_copywithin_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_array_fill_fini(JSContext *ctx, void *st, bool take_result);
@@ -54252,6 +54338,7 @@ static JSValue js_bigint_constructor(JSContext *ctx, JSValueConst new_target, in
 /* 21.2.1.1 BigInt(value): its ONLY user code is step 2's ToPrimitive on the argument — everything after runs on a
    primitive. It is callable AND a constructor (which throws), which is what the constructor_or_func body
    prototype is for. */
+static const JSTrampStepDef js_ta_with_def = { sizeof(JSTAWith), js_ta_with_step, js_ta_with_fini, 0 };
 static const JSTrampStepDef js_bigint_ctor_def =
     { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, PRIMARGS(0x1, HINT_NUMBER, 1),
       { .generic = js_bigint_constructor }, JS_CFUNC_constructor_or_func, 0, NULL, NULL, NULL };
@@ -54406,6 +54493,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_ARRAY_FILL]    = &js_array_fill_def,
     [STEPDEF_ARRAY_COPYWITHIN] = &js_array_copyWithin_def,
     [STEPDEF_BIGINT_CTOR]   = &js_bigint_ctor_def,
+    [STEPDEF_TA_WITH]       = &js_ta_with_def,
     [STEPDEF_ARRAY_INDEXOF]     = &js_array_indexOf_def,
     [STEPDEF_ARRAY_LASTINDEXOF] = &js_array_lastIndexOf_def,
     [STEPDEF_ARRAY_INCLUDES]    = &js_array_includes_def,
@@ -71434,32 +71522,24 @@ range_error:
 }
 
 
-static JSValue js_typed_array_with(JSContext *ctx, JSValueConst this_val,
-                                   int argc, JSValueConst *argv)
+/* 23.2.3.36 steps 7 onwards, with the index and the value ALREADY coerced and `len` captured at step 2 — a
+   resizable buffer shrunk by the page's valueOf must still yield a result of the original length, which is why
+   the caller holds it. Nothing below runs user code. */
+static JSValue js_typed_array_with_build(JSContext *ctx, JSValueConst this_val, int64_t idx, JSValue val,
+                                         uint32_t len)
 {
-    JSValue arr, val, buffer;
+    JSValue arr, buffer;
     JSObject *p;
     JSTypedArray *ta;
     JSArrayBuffer *src_abuf, *abuf;
-    int64_t idx;
-    uint32_t len, newlen, copy_len;
+    uint32_t newlen, copy_len;
     int size_log2;
 
     p = get_typed_array(ctx, this_val);
-    if (!p)
+    if (!p) {
+        JS_FreeValue(ctx, val);
         return JS_EXCEPTION;
-
-    len = p->u.array.count;
-    if (JS_ToInt64Sat(ctx, &idx, argv[0]))
-        return JS_EXCEPTION;
-    /* resolve negative index using original length (spec step 5-6) */
-    if (idx < 0)
-        idx = len + idx;
-
-    val = JS_ToPrimitive(ctx, argv[1], HINT_NUMBER);
-    if (JS_IsException(val))
-        return JS_EXCEPTION;
-
+    }
     /* re-validate after user code (spec step 9: IsValidIntegerIndex) */
     if (typed_array_is_oob(p)) {
         JS_FreeValue(ctx, val);
@@ -72854,7 +72934,7 @@ static const JSCFunctionListEntry js_typed_array_base_funcs[] = {
 static const JSCFunctionListEntry js_typed_array_base_proto_funcs[] = {
     JS_CGETSET_DEF("length", js_typed_array_get_length, NULL ),
     JS_CFUNC_STEP_DEF("at", 1, STEPDEF_TA_AT ),
-    JS_CFUNC_DEF("with", 2, js_typed_array_with ),
+    JS_CFUNC_STEP_DEF("with", 2, STEPDEF_TA_WITH ),
     JS_CGETSET_DEF("buffer", js_typed_array_get_buffer, NULL ),
     JS_CGETSET_DEF("byteLength", js_typed_array_get_byteLength, NULL ),
     JS_CGETSET_DEF("byteOffset", js_typed_array_get_byteOffset, NULL ),
