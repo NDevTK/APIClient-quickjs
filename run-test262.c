@@ -531,7 +531,8 @@ static JSValue js_detachArrayBuffer(JSContext *ctx, JSValueConst this_val,
 }
 
 static int fork_preempt_enabled(void);
-static JSValue fork_preempt_eval(JSContext *ctx, const char *buf, size_t buf_len, int eval_flags);
+static JSValue fork_preempt_eval(JSContext *ctx, const char *buf, size_t buf_len,
+                                 const char *filename, int eval_flags);
 
 static JSValue js_evalScript_262(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
@@ -551,7 +552,7 @@ static JSValue js_evalScript_262(JSContext *ctx, JSValueConst this_val,
        boundary a synchronous eval API requires, not a second scheduler inside the engine. No test uses the
        completion value, and JS_FlowResume does not surface one, so the result is UNDEFINED / EXCEPTION. */
     ret = fork_preempt_enabled()
-        ? fork_preempt_eval(ctx, str, len, JS_EVAL_TYPE_GLOBAL)
+        ? fork_preempt_eval(ctx, str, len, "<evalScript>", JS_EVAL_TYPE_GLOBAL)
         : JS_Eval(ctx, str, len, "<evalScript>", JS_EVAL_TYPE_GLOBAL);
     JS_FreeCString(ctx, str);
     return ret;
@@ -1370,7 +1371,16 @@ static void fork_preempt_hooks_off(void) {
         JS_SetFlowControlHooks(&fork_hooks_OFF);
 }
 
-static JSValue fork_preempt_eval(JSContext *ctx, const char *buf, size_t buf_len, int eval_flags) {
+static JSValue fork_preempt_eval(JSContext *ctx, const char *buf, size_t buf_len,
+                                 const char *filename, int eval_flags) {
+    if ((eval_flags & JS_EVAL_TYPE_MASK) == JS_EVAL_TYPE_MODULE) {
+        /* A MODULE is a graph, not a program to wrap: link it and evaluate it, and its bodies — which are async
+           functions on the same seam a flow's base runs on — park and resume through the pump below. The hooks
+           arm BEFORE the call rather than after, because here the evaluation IS the run; arming afterwards would
+           execute every module body with the feature off and the engagement metric could not see it. */
+        JS_SetFlowControlHooks(&fork_hooks_ON);
+        return JS_FlowEvalModule(ctx, buf, buf_len, filename, eval_flags);
+    }
     JSValue *flow = JS_FlowNew(ctx, buf, buf_len, eval_flags);   /* thread STRICTNESS so strict tests run strict */
     if (!flow) return JS_EXCEPTION;   /* compile error: exception already pending */
     JS_SetFlowControlHooks(&fork_hooks_ON);
@@ -1408,7 +1418,7 @@ static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,
            something that never runs and hides feature gaps. A construct the feature does not yet support (module
            top-level, async interleaving) must FAIL LOUD here (an honest gap to build at the root: module support
            in JS_FlowNew), never be papered over by JS_Eval. */
-        res_val = fork_preempt_eval(ctx, buf, buf_len, eval_flags);
+        res_val = fork_preempt_eval(ctx, buf, buf_len, filename, eval_flags);
     else
         res_val = JS_Eval(ctx, buf, buf_len, filename, eval_flags);   /* only when the feature is OFF entirely */
 

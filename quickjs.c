@@ -28173,6 +28173,24 @@ static int flow_settle_await(JSContext *ctx, JSAsyncFunctionState *s) {
     return 1;
 }
 
+/* MODULE evaluation under the flow feature. A module is not a program JS_FlowNew can wrap: it is a GRAPH that
+   must be linked and then evaluated in dependency order. But every bytecode module BODY is already an async
+   function driven through async_func_resume — the same seam a flow's base runs on, which is why
+   js_inner_module_evaluation treats them all as async-evaluated — so each body parks at a back-edge and the
+   host pump (JS_ResumeParkedFlow) resumes it, exactly like any other flow. What was missing was only the ENTRY:
+   JS_FlowNew compiled with JS_EVAL_TYPE_GLOBAL and threw the caller's MODULE flag away, so a module source was
+   parsed as a classic script and every import/export came back as "unsupported keyword" — a parser error for a
+   parser that is fine. Returns the module's evaluation PROMISE, which is what evaluating a module yields; the
+   caller settles it through the same job pump it uses for an async script. */
+JSValue JS_FlowEvalModule(JSContext *ctx, const char *src, size_t len, const char *filename, int eval_flags) {
+    JSValue bc = JS_Eval(ctx, src, len, filename,
+                         JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY |
+                         (eval_flags & JS_EVAL_FLAG_STRICT));
+    if (JS_IsException(bc)) return bc;
+    DCHECK(JS_VALUE_GET_TAG(bc) == JS_TAG_MODULE, "a MODULE compile must yield a module");
+    return JS_EvalFunction(ctx, bc);   /* create the module function, link the graph, evaluate; consumes bc */
+}
+
 int JS_FlowResume(JSContext *ctx, JSValue *flow) {
     JSAsyncFunctionState *s = (JSAsyncFunctionState *)flow;
     /* NESTED resume: a host API that evaluates a program synchronously while a flow is already running
