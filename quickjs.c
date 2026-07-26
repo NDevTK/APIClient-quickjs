@@ -1445,7 +1445,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_BIGINT_ASUINTN, STEPDEF_BIGINT_ASINTN,
     STEPDEF_OBJ_GOPD, STEPDEF_REFLECT_GOPD,
     STEPDEF_OBJ_VALUES, STEPDEF_OBJ_ENTRIES, STEPDEF_OBJ_ASSIGN, STEPDEF_OBJ_SPREAD,
-    STEPDEF_ARRAY_FLAT, STEPDEF_ARRAY_FLATMAP, STEPDEF_ARRAY_FROMLIKE, STEPDEF_ARRAY_WITH, STEPDEF_ARRAY_FILL, STEPDEF_ARRAY_COPYWITHIN, STEPDEF_BIGINT_CTOR, STEPDEF_TA_WITH, STEPDEF_DATE_TOJSON,
+    STEPDEF_ARRAY_FLAT, STEPDEF_ARRAY_FLATMAP, STEPDEF_ARRAY_FROMLIKE, STEPDEF_ARRAY_WITH, STEPDEF_ARRAY_FILL, STEPDEF_ARRAY_COPYWITHIN, STEPDEF_BIGINT_CTOR, STEPDEF_TA_WITH, STEPDEF_DATE_TOJSON, STEPDEF_DATE_TOPRIM,
     STEPDEF_MATH_ABS, STEPDEF_MATH_FLOOR, STEPDEF_MATH_CEIL, STEPDEF_MATH_ROUND, STEPDEF_MATH_SQRT, STEPDEF_MATH_ACOS, STEPDEF_MATH_ASIN, STEPDEF_MATH_ATAN, STEPDEF_MATH_COS, STEPDEF_MATH_EXP, STEPDEF_MATH_LOG, STEPDEF_MATH_SIN, STEPDEF_MATH_TAN, STEPDEF_MATH_TRUNC, STEPDEF_MATH_SIGN, STEPDEF_MATH_COSH, STEPDEF_MATH_SINH, STEPDEF_MATH_TANH, STEPDEF_MATH_ACOSH, STEPDEF_MATH_ASINH, STEPDEF_MATH_ATANH, STEPDEF_MATH_EXPM1, STEPDEF_MATH_LOG1P, STEPDEF_MATH_LOG2, STEPDEF_MATH_LOG10, STEPDEF_MATH_CBRT, STEPDEF_MATH_F16ROUND, STEPDEF_MATH_FROUND, STEPDEF_MATH_ATAN2, STEPDEF_MATH_POW, STEPDEF_MATH_MIN, STEPDEF_MATH_MAX, STEPDEF_MATH_HYPOT, STEPDEF_MATH_IMUL, STEPDEF_MATH_CLZ32, STEPDEF_STR_FROMCHARCODE, STEPDEF_STR_FROMCODEPOINT, STEPDEF_DATE_UTC,
     STEPDEF_REGEXP_EXEC, STEPDEF_REGEXP_TEST,
     STEPDEF_ITER_TAKE, STEPDEF_ITER_DROP,
@@ -19973,6 +19973,15 @@ typedef struct JSTAWith {
 static JSValue js_typed_array_with_build(JSContext *ctx, JSValueConst this_val, int64_t idx, JSValue val, uint32_t len);
 static JSObject *get_typed_array(JSContext *ctx, JSValueConst this_val);
 
+/* 21.4.4.45 Date.prototype[@@toPrimitive]. It performs OrdinaryToPrimitive on ITSELF — the 7.1.1 walk with step 2
+   skipped — and js_date_Symbol_toPrimitive ran that walk from a C entry, so a page's valueOf or toString with a
+   loop in it preempted with no flow base. Everything before the walk (the hint's validation) invokes nothing. */
+typedef struct JSDateToPrim {
+    JSStepHdr hdr;        /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    JSValue result;       /* DONE (owned) */
+    int hint;             /* the validated hint, with HINT_FORCE_ORDINARY set */
+} JSDateToPrim;
+
 /* 21.4.4.37 Date.prototype.toJSON. Three of its steps are the page's code — ToPrimitive on the receiver, the
    `toISOString` read, and the call — and js_date_toJSON ran all three from a C entry, so
    `Date.prototype.toJSON.call({valueOf(){ while(x){} }})` preempted with no flow base. It is also the C site that
@@ -23233,9 +23242,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 tp->obj = js_dup(tp_outer ? tp_value : sp[tp_slot]);
                 tp->retry_pc = tp_retry_pc;
                 tp->slot = tp_slot;
-                tp->hint = (tp_hint == HINT_STRING) ? HINT_STRING : HINT_NUMBER;   /* NONE uses the NUMBER order */
-                tp->hint_none = (tp_hint == HINT_NONE);
-                tp->stage = 0;
+                { int th = tp_hint & ~HINT_FORCE_ORDINARY;
+                  tp->hint = (th == HINT_STRING) ? HINT_STRING : HINT_NUMBER;   /* NONE uses the NUMBER order */
+                  tp->hint_none = (th == HINT_NONE);
+                  /* 7.1.1.1 OrdinaryToPrimitive is the SAME walk with step 2 skipped, which is what
+                     Date.prototype[@@toPrimitive] performs on itself — entering at stage 2 is the whole
+                     difference, so the two are one sequence rather than a second implementation. */
+                  tp->stage = (tp_hint & HINT_FORCE_ORDINARY) ? 2 : 0; }
                 tp_outer = NULL; tp_outer_kind = CONT_NONE; tp_value = JS_UNDEFINED;   /* read + reset */
                 cont_st = tp;
                 ret_val = JS_UNINITIALIZED;
@@ -53272,6 +53285,47 @@ static JSValue js_array_copywithin_fini(JSContext *ctx, void *st, bool take_resu
     return r;
 }
 
+static int js_date_toprim_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSDateToPrim *s = st;
+    int r;
+
+    if (s->hdr.stage == 0) {
+        JSAtom hint = JS_ATOM_NULL;
+        int hint_num;
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        s->result = JS_UNDEFINED;
+        if (!JS_IsObject(s->hdr.this_val)) { JS_ThrowTypeErrorNotAnObject(ctx); return -1; }
+        if (JS_IsString(step_arg(&s->hdr, 0))) {
+            hint = JS_ValueToAtom(ctx, step_arg(&s->hdr, 0));   /* a STRING key: interning it runs nothing */
+            if (hint == JS_ATOM_NULL) return -1;
+            JS_FreeAtom(ctx, hint);
+        }
+        switch (hint) {
+        case JS_ATOM_number:
+        case JS_ATOM_integer:  hint_num = HINT_NUMBER; break;
+        case JS_ATOM_string:
+        case JS_ATOM_default:  hint_num = HINT_STRING; break;
+        default: JS_ThrowTypeError(ctx, "invalid hint"); return -1;
+        }
+        s->hint = hint_num | HINT_FORCE_ORDINARY;
+        s->hdr.stage = 1;
+    }
+    r = step_toprim_run(ctx, &s->hdr, s->hdr.this_val, s->hint, cb_result, &s->result,
+                        out_cb, out_argc);
+    if (r) return r < 0 ? -1 : r;
+    return 0;
+}
+
+static JSValue js_date_toprim_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSDateToPrim *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    js_free(ctx, s);
+    return r;
+}
+
 static int js_date_tojson_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSDateToJSON *s = st;
@@ -54289,6 +54343,8 @@ static int js_array_with_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
 static int js_array_fill_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_ta_with_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_date_tojson_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static int js_date_toprim_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_date_toprim_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_date_tojson_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_ta_with_fini(JSContext *ctx, void *st, bool take_result);
 static int js_array_copywithin_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
@@ -54417,6 +54473,7 @@ static JSValue js_bigint_constructor(JSContext *ctx, JSValueConst new_target, in
    prototype is for. */
 static const JSTrampStepDef js_ta_with_def = { sizeof(JSTAWith), js_ta_with_step, js_ta_with_fini, 0 };
 static const JSTrampStepDef js_date_toJSON_def = { sizeof(JSDateToJSON), js_date_tojson_step, js_date_tojson_fini, 0 };
+static const JSTrampStepDef js_date_toPrim_def = { sizeof(JSDateToPrim), js_date_toprim_step, js_date_toprim_fini, 0 };
 static const JSTrampStepDef js_bigint_ctor_def =
     { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, PRIMARGS(0x1, HINT_NUMBER, 1),
       { .generic = js_bigint_constructor }, JS_CFUNC_constructor_or_func, 0, NULL, NULL, NULL };
@@ -54573,6 +54630,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_BIGINT_CTOR]   = &js_bigint_ctor_def,
     [STEPDEF_TA_WITH]       = &js_ta_with_def,
     [STEPDEF_DATE_TOJSON]   = &js_date_toJSON_def,
+    [STEPDEF_DATE_TOPRIM]   = &js_date_toPrim_def,
     [STEPDEF_ARRAY_INDEXOF]     = &js_array_indexOf_def,
     [STEPDEF_ARRAY_LASTINDEXOF] = &js_array_lastIndexOf_def,
     [STEPDEF_ARRAY_INCLUDES]    = &js_array_includes_def,
@@ -69771,37 +69829,6 @@ static JSValue js_Date_now(JSContext *ctx, JSValueConst this_val,
     return js_int64(date_now());
 }
 
-static JSValue js_date_Symbol_toPrimitive(JSContext *ctx, JSValueConst this_val,
-                                          int argc, JSValueConst *argv)
-{
-    // Symbol_toPrimitive(hint)
-    JSValueConst obj = this_val;
-    JSAtom hint = JS_ATOM_NULL;
-    int hint_num;
-
-    if (!JS_IsObject(obj))
-        return JS_ThrowTypeErrorNotAnObject(ctx);
-
-    if (JS_IsString(argv[0])) {
-        hint = JS_ValueToAtom(ctx, argv[0]);
-        if (hint == JS_ATOM_NULL)
-            return JS_EXCEPTION;
-        JS_FreeAtom(ctx, hint);
-    }
-    switch (hint) {
-    case JS_ATOM_number:
-    case JS_ATOM_integer:
-        hint_num = HINT_NUMBER;
-        break;
-    case JS_ATOM_string:
-    case JS_ATOM_default:
-        hint_num = HINT_STRING;
-        break;
-    default:
-        return JS_ThrowTypeError(ctx, "invalid hint");
-    }
-    return JS_ToPrimitive(ctx, obj, hint_num | HINT_FORCE_ORDINARY);
-}
 
 static JSValue js_date_getTimezoneOffset(JSContext *ctx, JSValueConst this_val,
                                          int argc, JSValueConst *argv)
@@ -69873,7 +69900,7 @@ static const JSCFunctionListEntry js_date_funcs[] = {
 static const JSCFunctionListEntry js_date_proto_funcs[] = {
     JS_CFUNC_DEF("valueOf", 0, js_date_getTime ),
     JS_CFUNC_MAGIC_DEF("toString", 0, get_date_string, 0x13 ),
-    JS_CFUNC_DEF("[Symbol.toPrimitive]", 1, js_date_Symbol_toPrimitive ),
+    JS_CFUNC_STEP_DEF("[Symbol.toPrimitive]", 1, STEPDEF_DATE_TOPRIM ),
     JS_CFUNC_MAGIC_DEF("toUTCString", 0, get_date_string, 0x03 ),
     JS_ALIAS_DEF("toGMTString", "toUTCString" ),
     JS_CFUNC_MAGIC_DEF("toISOString", 0, get_date_string, 0x23 ),
