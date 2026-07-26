@@ -21103,15 +21103,27 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    (0,evalFromOtherRealm)(src) must keep the C path — its program belongs to THAT realm's global. */
                 if (tramp_is_global_eval(call_argv[-1]) && call_argc >= 1 && JS_IsString(call_argv[0])
                     && js_same_value(ctx, call_argv[-1], ctx->eval_obj)) {
-                    /* INDIRECT eval: compile to a closure and run its body on THIS chain so its loops park. */
+                    /* INDIRECT eval: compile to a closure and run its body on THIS chain so its loops park.
+                       Its receiver is the GLOBAL OBJECT — indirect eval is global scope whatever the code's
+                       strictness, which the C path gets by passing ctx->global_obj to JS_CallFree. Dispatching
+                       it in the PLAIN shape gave this = undefined, and a `"use strict"` prologue then kept it
+                       undefined instead of resolving to the global (10.4.3-1-20-s / -20gs). The operands are
+                       reshaped UP by one into the METHOD shape — the eval function's own slot becomes the
+                       receiver and the first argument's slot the callee, both of which this call site owns, and
+                       do_return then drops exactly those two and lands the result where the callee sat. */
                     JSValue eclo = JS_EvalObject(ctx, ctx->global_obj, call_argv[0],
                                                  JS_EVAL_TYPE_INDIRECT | JS_EVAL_FLAG_TRAMP_CLOSURE, -1);
+                    JSValue *A;
                     if (unlikely(JS_IsException(eclo))) goto exception;
                     DCHECK(tramp_can_call(eclo), "indirect eval closure is not a trampolinable bytecode function");
-                    for (i = -1; i < call_argc; i++) JS_FreeValue(ctx, call_argv[i]);
-                    sp = (JSValue *)call_argv;
-                    ((JSValue *)call_argv)[-1] = eclo;
-                    call_argc = 0; tramp_first = -1; tramp_is_tail = (opcode == OP_tail_call);
+                    A = (JSValue *)call_argv;
+                    for (i = 0; i < call_argc; i++) JS_FreeValue(ctx, A[i]);
+                    JS_FreeValue(ctx, A[-1]);
+                    A[-1] = js_dup(ctx->global_obj);
+                    A[0]  = eclo;
+                    sp = A + 1;
+                    call_argv = (JSValueConst *)(A + 1);
+                    call_argc = 0; tramp_first = -2; tramp_is_tail = (opcode == OP_tail_call);
                     goto do_tramp_call;
                 }
                 tramp_first = -1; tramp_is_tail = (opcode == OP_tail_call);
