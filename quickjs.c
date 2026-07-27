@@ -59563,6 +59563,15 @@ static void js_iterator_wrap_mark(JSRuntime *rt, JSValueConst val,
     }
 }
 
+/* 27.1.4.2.1 steps 1-2, and NOTHING ELSE. The FORWARD is call-site-resolved: do_generic_callee rewrites the
+   (receiver, callee) pair to the wrapped record and re-enters, and the drives that hold a record resolve it
+   through tramp_unwrap_iter_next — so every spelling of `w.next()` runs the wrapped .next() on the tramp, with
+   the arguments dropped exactly as step 4 requires. What is gone is the JS_IteratorNext -> JS_Call this used to
+   run: a C activation with no flow base that drove a looping .next() to completion, re-wrapped the forwarded
+   result and required it to be an Object, none of which step 4 does.
+   Both resolutions decline on a receiver that is not a wrapper, which is precisely the case RequireInternalSlot
+   rejects — `%WrapForValidIteratorPrototype%.next.call({})` is a TypeError, and raising it runs no user code and
+   has nothing to suspend. So a VALID wrapper arriving here is an unrouted call site, and the DCHECK names it. */
 static JSValue js_iterator_wrap_next(JSContext *ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv,
                                      int *pdone, int magic)
@@ -59570,9 +59579,10 @@ static JSValue js_iterator_wrap_next(JSContext *ctx, JSValueConst this_val,
     JSIteratorWrapData *it;
     DCHECK(magic == GEN_MAGIC_NEXT, "js_iterator_wrap_next reached with a magic that is not the verbatim forward");
     it = JS_GetOpaque2(ctx, this_val, JS_CLASS_ITERATOR_WRAP);
-    if (!it)
-        return JS_EXCEPTION;
-    return JS_IteratorNext(ctx, it->wrapped_iter, it->wrapped_next, argc, argv, pdone);
+    DCHECK(it == NULL, "a VALID WrapForValidIterator reached the .next C entry — the forward is call-site-resolved, "
+                       "so route that call site through do_generic_callee's unwrap rewrite");
+    *pdone = false;
+    return JS_EXCEPTION;   /* JS_GetOpaque2 already threw RequireInternalSlot's TypeError */
 }
 
 /* 27.1.4.2.2, as a step machine so both of its user-code sites suspend. Two fidelity bugs went with the old body:
