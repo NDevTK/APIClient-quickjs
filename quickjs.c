@@ -19809,6 +19809,9 @@ typedef struct JSArrayEvery {
        arg-free for a callback frame. The ORIGINAL call's operand shape lives in hdr. */
     JSValue cb_args[5];
     JSValue ta_dest;      /* filter|TA: the species-created typed array, held across its `set` (owned) */
+    JSValue def_val;      /* the element being WRITTEN into the result, held across the write (owned) */
+    int64_t def_k;        /* its index — captured, because filter's n advances once and the write can suspend */
+    uint8_t def_ph;       /* 1 = a write into the result is in flight */
 } JSArrayEvery;
 /* Array iteration builtins (forEach/map/every/some/filter) drive a JS callback from a C loop — the
    CONTINUATION-HOLDING re-entrant. They are a step machine, so that drive runs on the tramp chain: each callback
@@ -55205,6 +55208,8 @@ static int js_array_every_step(JSContext *ctx, JSArrayEvery *s, JSValue res, JSV
        index whose callback result is `res` now — a drift would double-process or skip an element. */
     assert(s->k >= 0 && s->k <= s->len);
     assert(s->pending_k == -1 || (s->pending_k >= 0 && s->pending_k < s->len));
+    if (s->def_ph)               /* re-entered mid-write: the driver has performed it */
+        goto do_result_write;
     if (s->pending_k >= 0) {
         int64_t k = s->pending_k;
         s->pending_k = -1;
@@ -55218,16 +55223,22 @@ static int js_array_every_step(JSContext *ctx, JSArrayEvery *s, JSValue res, JSV
             if (JS_ToBoolFree(ctx, res)) { s->ret = JS_TRUE; goto done; }
             break;
         case special_map:
-            if (JS_DefinePropertyValueInt64(ctx, s->ret, k, res, JS_PROP_C_W_E | JS_PROP_THROW) < 0) return -1;
-            break;
+            /* 23.1.3.21 step 6.c.iii CreateDataPropertyOrThrow(A, Pk, mappedValue): on a @@species result that is
+               a Proxy or a subclass this is the page's `defineProperty` trap, and it ran from C. */
+            s->def_k = k; s->def_val = res; s->def_ph = 1;
+            res = JS_UNDEFINED;
+            goto do_result_write;
         case special_map | special_TA:
             if (JS_SetPropertyValue(ctx, s->ret, js_int32(k), res, JS_PROP_THROW) < 0) return -1;
             break;
         case special_filter:
         case special_filter | special_TA:
             if (JS_ToBoolFree(ctx, res)) {
-                if (JS_DefinePropertyValueInt64Const(ctx, s->ret, s->n++, s->val, JS_PROP_C_W_E | JS_PROP_THROW) < 0) return -1;
+                res = JS_UNDEFINED;
+                s->def_k = s->n++; s->def_val = js_dup(s->val); s->def_ph = 1;
+                goto do_result_write;
             }
+            res = JS_UNDEFINED;
             break;
         default:
             JS_FreeValue(ctx, res);
@@ -55237,6 +55248,20 @@ static int js_array_every_step(JSContext *ctx, JSArrayEvery *s, JSValue res, JSV
         s->val = JS_UNDEFINED;
         res = JS_UNDEFINED;   /* the switch above consumed it on every arm */
     }
+    goto advance;
+
+ do_result_write:
+    /* the write into the RESULT, whichever of the two sinks asked for it. It is a keyed operation like the
+       element read below, so the driver performs it and re-enters here — which is why the index is captured:
+       filter's `n` advances once, at the decision, not at every resume. */
+    r = step_defidx_run(ctx, &s->hdr, s->ret, s->def_k, s->def_val, res, out_cb, out_argc);
+    res = JS_UNDEFINED;
+    if (r) return r < 0 ? -1 : r;
+    s->def_ph = 0;
+    JS_FreeValue(ctx, s->def_val); s->def_val = JS_UNDEFINED;
+    JS_FreeValue(ctx, s->val); s->val = JS_UNDEFINED;
+
+ advance:
     /* HasProperty and Get are each the page's code — an index accessor or a Proxy trap — and
        JS_TryGetPropertyInt64 / JS_GetPropertyInt64 reached both from C, driving them to completion. Each is a
        step now, so `[].map.call(proxyWithLoopingGetTrap, f)` parks like anything else. */
@@ -55280,8 +55305,8 @@ done:
    array-like needs LengthOfArrayLike, whose ToLength is a step, so the length arrives separately. */
 static int js_array_every_recv(JSContext *ctx, JSArrayEvery *s)
 {
-    s->obj = JS_UNDEFINED; s->ret = JS_UNDEFINED; s->val = JS_UNDEFINED;
-    s->len = 0; s->k = 0; s->n = 0; s->special = s->hdr.arg; s->pending_k = -1;
+    s->obj = JS_UNDEFINED; s->ret = JS_UNDEFINED; s->val = JS_UNDEFINED; s->def_val = JS_UNDEFINED;
+    s->len = 0; s->k = 0; s->n = 0; s->def_k = 0; s->def_ph = 0; s->special = s->hdr.arg; s->pending_k = -1;
     if (s->special & special_TA) {
         s->obj = js_dup(s->hdr.this_val);
         s->len = js_typed_array_get_length_unsafe(ctx, s->obj);
@@ -55348,6 +55373,7 @@ static void js_array_every_end(JSContext *ctx, JSArrayEvery *s, bool take_ret)
     if (!take_ret)
         JS_FreeValue(ctx, s->ret);
     JS_FreeValue(ctx, s->val);
+    JS_FreeValue(ctx, s->def_val); s->def_val = JS_UNDEFINED;
     JS_FreeValue(ctx, s->obj);
     s->ret = JS_UNDEFINED; s->val = JS_UNDEFINED; s->obj = JS_UNDEFINED;    JS_FreeValue(ctx, s->ta_dest);
     s->ta_dest = JS_UNDEFINED;
@@ -55419,8 +55445,8 @@ static int js_array_every_vstep(JSContext *ctx, void *st, JSValue cb_result, JSV
     r = js_array_every_step(ctx, s, cb_result, (JSValueConst *)&s->cb_args[2], out_cb, out_argc);   /* consumes cb_result */
     if (r < 0)
         return -1;
-    if (r == 6 || r == 7)
-        return r;   /* the element's keyed operation: the driver performs it and re-enters here */
+    if (r == 6 || r == 7 || r == 10)
+        return r;   /* the element's keyed operation, or the result write: the driver performs it and re-enters */
     if (r == 0) {
         if (s->special != (special_filter | special_TA))
             return 0;
