@@ -20035,6 +20035,13 @@ typedef struct {
 #define ITERCONS_SUMPRECISE 7 /* Math.sumPrecise(iterable): no result object at all — `sum` accumulates exactly and the
                                  finish yields the correctly-rounded double. A non-number element is an
                                  IfAbruptCloseIterator TypeError like every other sink's bad element. */
+/* Iterator.prototype's EAGER terminals. One walk with a parameter: the tag is the base plus the ITERTERM_*
+   kind, exactly as a STEPDEF id names one machine among many. It is a builtin declaring itself and its own
+   argument — nothing selects it. */
+/* Set.prototype's set-operations that FOLD a setlike's keys() in. Same shape as the terminals: the tag is a
+   base plus the SETOP_* kind. */
+#define ITERCONS_SETOP_BASE 24
+#define ITERCONS_ITERTERM_BASE 16
 #define ITERCONS_TA_FROM 10 /* %TypedArray%.from(source, mapfn?, thisArg?) — do_ta_consume_tramp's `from` shape */
 #define ITERCONS_TA_OF   11 /* %TypedArray%.of(...items) — the same create+set phases with the argument LIST as
                                the source, which is why it shares that walk rather than growing its own */
@@ -20153,20 +20160,14 @@ static JSIterConsume *js_iter_consume_new(JSContext *ctx)
    forbids calling the observable .add), so the consume step needs them before their definitions. */
 static JSValue map_normalize_key(JSContext *ctx, JSValue key);
 static int js_setlike_get_props(JSContext *ctx, JSValueConst setlike, uint64_t *psize, JSValue *phas, JSValue *pkeys);
-static JSValue js_set_union(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
-static JSValue js_set_symmetricDifference(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
-static JSValue js_set_isSupersetOf(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 static JSMapRecord *map_find_record(JSContext *ctx, JSMapState *s, JSValueConst key);
 static JSMapRecord *map_add_record(JSContext *ctx, JSMapState *s, JSValue key);
 static void map_delete_record(JSRuntime *rt, JSMapState *s, JSMapRecord *mr);
 static bool iter_consume_gen_backed(JSContext *ctx, JSValueConst items, JSValue *out_getiter);
 static JSValue js_map_constructor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv, int magic);
 static bool tramp_can_call_setmap_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_magic, JSValue *out_getiter);
-static bool tramp_can_call_setop_consume(JSValueConst func, JSValueConst this_val, JSValueConst *call_argv, int call_argc, uint8_t *out_setop);
 static int check_function(JSContext *ctx, JSValueConst obj);
 static void iter_helper_close_source_abrupt(JSContext *ctx, JSIteratorHelperData *it);
-static bool tramp_can_call_iterterm(JSContext *ctx, JSValueConst func, JSValueConst this_val, int call_argc, uint8_t *out_term);
-static JSValue js_iterator_proto_terminal(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
 static JSValue js_typed_array_constructor_obj(JSContext *ctx, JSValueConst new_target, JSValueConst obj, int classid);
 static bool tramp_can_call_ta_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_classid, JSValue *out_getiter);
 /* Promise.all(gen): drive the generator's .next() on the tramp chain, wrapping each yielded value in
@@ -23328,20 +23329,51 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                `Array.from(gen)` did not. */
             {
                 crecv = (tramp_first == -2) ? call_argv[-2] : JS_UNDEFINED;
-                if (tramp_can_call_setop_consume(call_argv[-1], crecv, vc(call_argv), call_argc, &setop_kind))
-                    goto do_setop_consume_tramp;                /* s.union/symmetricDifference(setlike) */
-                if (tramp_can_call_iterterm(ctx, call_argv[-1], crecv, call_argc, &iterterm_kind))
-                    goto do_iterterm_tramp;                     /* it.toArray/forEach/reduce/some/every/find */
                 {   /* THE declared-capability arm. A builtin that consumes an iterator says so at its own
                        definition (JS_CFUNC_CONSUME_DEF) and carries its sink, so this asks ONE question for all
                        of them instead of one identity test per builtin. The recognizers below are the ones whose
                        legacy body still exists to be chosen against; each conversion moves one up here. */
                     int csink = tramp_consume_sink_of(call_argv[-1]);
                     if (csink >= 0) {
+                        /* The @@iterator PROBE belongs only to the walks that acquire one. A set-operation takes
+                           its iterator from setlike.keys() and a terminal from GetIteratorDirect(this), so both
+                           would strand the probe's value — setop overwrote tramp_iter_getiter with `keys` and
+                           leaked what was in it. Those two answer first, before anything is read. */
+                        if (csink >= ITERCONS_SETOP_BASE) {
+                            /* 24.2.4.x step 2: RequireInternalSlot(O, [[SetData]]), then GetSetRecord(other)
+                               step 1's "other must be an Object". Both are validation with no user code in them.
+                               The recognizer declined them AND declined call_argc != 1 — but arity is not a spec
+                               condition at all: `s.union(a, b)` ignores b, and that decline sent an ordinary call
+                               to a C body whose loop is a DFAIL, so it ABORTED. */
+                            if (JS_VALUE_GET_TAG(crecv) != JS_TAG_OBJECT ||
+                                JS_VALUE_GET_OBJ(crecv)->class_id != JS_CLASS_SET) {
+                                JS_ThrowTypeErrorInvalidClass(ctx, JS_CLASS_SET);
+                                goto exception;
+                            }
+                            if (call_argc < 1 || JS_VALUE_GET_TAG(call_argv[0]) != JS_TAG_OBJECT) {
+                                JS_ThrowTypeErrorNotAnObject(ctx);
+                                goto exception;
+                            }
+                            setop_kind = (uint8_t)(csink - ITERCONS_SETOP_BASE);
+                            goto do_setop_consume_tramp;
+                        }
+                        if (csink >= ITERCONS_ITERTERM_BASE) {
+                            /* GetIteratorDirect(this) requires an Object — 27.1.4.x step 1, validation with no
+                               user code in it. The recognizer used to DECLINE a non-Object and let the C entry
+                               throw, which is one silent fallback per narrowing condition. The CALLBACK check
+                               stays in the arm below, because an invalid callback still owes the iterator an
+                               IfAbruptCloseIterator close and only that arm can route a generator's. */
+                            if (!JS_IsObject(crecv)) {
+                                JS_ThrowTypeErrorNotAnObject(ctx);
+                                goto exception;
+                            }
+                            iterterm_kind = (uint8_t)(csink - ITERCONS_ITERTERM_BASE);
+                            goto do_iterterm_tramp;
+                        }
                         /* the probe is an OPTIMISATION, not a gate: when @@iterator is already readable
                            side-effect-free the acquire skips re-reading it, and otherwise the acquire performs
-                           the whole of GetIterator on the tramp. It runs nothing, so doing it before the
-                           machine's own validation cannot be observed. */
+                           the whole of GetIterator on the tramp. It runs nothing, so doing it before a walk's
+                           own validation cannot be observed. */
                         tramp_iter_getiter = JS_UNDEFINED;
                         if (call_argc >= 1 &&
                             iter_data_at_iterator(ctx, call_argv[0], &tramp_iter_getiter) == ITERAT_ABSENT &&
@@ -54163,39 +54195,15 @@ static bool tramp_can_call_setmap_consume(JSContext *ctx, JSValueConst func, JSV
    iterator may be a GENERATOR (a `*keys()` method), which the C loop would drive to completion. Recognition reads NO
    property of setlike: the spec order is size, then has, then keys, and do_setop_consume_tramp performs that read in
    order before handing `keys` to the shared acquire. *out_setop selects the per-element rule. */
-static bool tramp_can_call_setop_consume(JSValueConst func, JSValueConst this_val, JSValueConst *call_argv, int call_argc, uint8_t *out_setop)
-{
-    JSObject *fp;
-    if (call_argc != 1) return false;
-    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
-    fp = JS_VALUE_GET_OBJ(func);
-    if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
-    if (fp->u.cfunc.cproto != JS_CFUNC_generic) return false;
-    if (fp->u.cfunc.c_function.generic == js_set_union) *out_setop = SETOP_UNION;
-    else if (fp->u.cfunc.c_function.generic == js_set_symmetricDifference) *out_setop = SETOP_SYMDIFF;
-    else if (fp->u.cfunc.c_function.generic == js_set_isSupersetOf) *out_setop = SETOP_SUPERSET;
-    else return false;
-    if (JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT) return false;
-    if (JS_VALUE_GET_OBJ(this_val)->class_id != JS_CLASS_SET) return false;
-    return JS_VALUE_GET_TAG(call_argv[0]) == JS_TAG_OBJECT;
-}
+/* DELETED: tramp_can_call_setop_consume. union / symmetricDifference / isSupersetOf declare their walk-plus-kind
+   at their definitions. Its declines were the receiver's [[SetData]] check, `other` not being an Object, and an
+   ARITY gate that is not a spec condition at all — the last one made `s.union(a, b)` abort, because the decline
+   handed an ordinary call to a C body whose loop no longer exists. */
 
 /* it.toArray()/forEach/reduce/some/every/find: run the terminal as a consume on the tramp. Recognition reads nothing —
    do_iterterm_tramp performs the spec's argument validation and GetIteratorDirect(this) itself. */
-static bool tramp_can_call_iterterm(JSContext *ctx, JSValueConst func, JSValueConst this_val, int call_argc, uint8_t *out_term)
-{
-    JSObject *fp;
-    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
-    fp = JS_VALUE_GET_OBJ(func);
-    if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
-    if (fp->u.cfunc.cproto != JS_CFUNC_generic_magic) return false;
-    if (fp->u.cfunc.c_function.generic_magic != js_iterator_proto_terminal) return false;
-    if (!JS_IsObject(this_val)) return false;   /* the C entry throws TypeError — leave it there */
-    /* A MISSING callback is accepted too: the spec still closes the underlying iterator on that TypeError, and only
-       do_iterterm_tramp can route a generator's close onto the tramp. */
-    *out_term = (uint8_t)fp->u.cfunc.magic;
-    return true;
-}
+/* DELETED: tramp_can_call_iterterm. Each terminal declares its own walk-plus-kind at its definition. Its one
+   decline was a non-Object receiver — validation, now in the dispatch, in the same place in the order. */
 
 /* DELETED: tramp_can_call_objentries_consume. Object.fromEntries declares its sink at its own definition now
    (JS_CFUNC_CONSUME_DEF), so there is no identity test to make: its C body was already a DFAIL, which is exactly
@@ -59302,16 +59310,9 @@ static const JSCFunctionListEntry js_iterator_funcs[] = {
    resumes like any other flow. This function exists to give each terminal an ADDRESS the recognition matches, and to
    perform the argument validation the spec does before GetIteratorDirect. Reaching the drive below means an
    un-routed off-tramp call: a should-never-happen to route at its root, never a C loop. */
-static JSValue js_iterator_proto_terminal(JSContext *ctx, JSValueConst this_val,
-                                          int argc, JSValueConst *argv, int magic)
-{
-    if (!JS_IsObject(this_val))
-        return JS_ThrowTypeErrorNotAnObject(ctx);
-    if (magic != ITERTERM_TOARRAY && check_function(ctx, argv[0]))
-        return JS_EXCEPTION;
-    DFAIL("Iterator.prototype eager terminal driven off the tramp chain — route the caller onto do_iterterm_tramp");
-    return JS_ThrowTypeError(ctx, "Iterator terminal not on the tramp");
-}
+/* DELETED: js_iterator_proto_terminal. Its body was the receiver check, the callback check and a DFAIL; the
+   first is the dispatch's, the second the arm's — where it can still close the iterator — and with the walk
+   declared at each definition no pointer names it. */
 
 static const JSCFunctionListEntry js_iterator_proto_funcs[] = {
     /* LAZY helpers create a helper object; its .next() drives the source on the tramp. The EAGER terminals consume
@@ -59321,12 +59322,12 @@ static const JSCFunctionListEntry js_iterator_proto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("map", 1, js_create_iterator_helper, JS_ITERATOR_HELPER_KIND_MAP ),
     JS_CFUNC_MAGIC_DEF("filter", 1, js_create_iterator_helper, JS_ITERATOR_HELPER_KIND_FILTER ),
     JS_CFUNC_MAGIC_DEF("flatMap", 1, js_create_iterator_helper, JS_ITERATOR_HELPER_KIND_FLAT_MAP ),
-    JS_CFUNC_MAGIC_DEF("toArray", 0, js_iterator_proto_terminal, ITERTERM_TOARRAY ),
-    JS_CFUNC_MAGIC_DEF("forEach", 1, js_iterator_proto_terminal, ITERTERM_FOREACH ),
-    JS_CFUNC_MAGIC_DEF("reduce", 1, js_iterator_proto_terminal, ITERTERM_REDUCE ),
-    JS_CFUNC_MAGIC_DEF("some", 1, js_iterator_proto_terminal, ITERTERM_SOME ),
-    JS_CFUNC_MAGIC_DEF("every", 1, js_iterator_proto_terminal, ITERTERM_EVERY ),
-    JS_CFUNC_MAGIC_DEF("find", 1, js_iterator_proto_terminal, ITERTERM_FIND ),
+    JS_CFUNC_CONSUME_DEF("toArray", 0, ITERCONS_ITERTERM_BASE + ITERTERM_TOARRAY ),
+    JS_CFUNC_CONSUME_DEF("forEach", 1, ITERCONS_ITERTERM_BASE + ITERTERM_FOREACH ),
+    JS_CFUNC_CONSUME_DEF("reduce", 1, ITERCONS_ITERTERM_BASE + ITERTERM_REDUCE ),
+    JS_CFUNC_CONSUME_DEF("some", 1, ITERCONS_ITERTERM_BASE + ITERTERM_SOME ),
+    JS_CFUNC_CONSUME_DEF("every", 1, ITERCONS_ITERTERM_BASE + ITERTERM_EVERY ),
+    JS_CFUNC_CONSUME_DEF("find", 1, ITERCONS_ITERTERM_BASE + ITERTERM_FIND ),
     JS_CFUNC_DEF("[Symbol.dispose]", 0, js_iterator_proto_dispose ),
     JS_CFUNC_DEF("[Symbol.iterator]", 0, js_iterator_proto_iterator ),
     JS_CGETSET_DEF("[Symbol.toStringTag]", js_iterator_proto_get_toStringTag, js_iterator_proto_set_toStringTag),
@@ -68110,59 +68111,11 @@ exception:
     return rval;
 }
 
-static JSValue js_set_isSupersetOf(JSContext *ctx, JSValueConst this_val,
-                                   int argc, JSValueConst *argv)
-{
-    JSValue has, item, iter, keys, next, rval;
-    JSValueConst setlike;
-    int done;
-    bool found;
-    JSMapState *s;
-    uint64_t size;
-
-    s = JS_GetOpaque2(ctx, this_val, JS_CLASS_SET);
-    if (!s)
-        return JS_EXCEPTION;
-    setlike = argv[0];
-    if (js_setlike_get_props(ctx, setlike, &size, &has, &keys) < 0)
-        return JS_EXCEPTION;
-    iter = JS_UNDEFINED;
-    next = JS_UNDEFINED;
-    rval = JS_EXCEPTION;
-    found = false;
-    if (s->record_count < size)
-        goto fini;
-    iter = JS_Call(ctx, keys, setlike, 0, NULL);
-    if (JS_IsException(iter))
-        goto exception;
-    next = JS_GetProperty(ctx, iter, JS_ATOM_next);
-    if (JS_IsException(next))
-        goto exception;
-    found = true;
-    for (;;) {
-        item = JS_IteratorNext(ctx, iter, next, 0, NULL, &done);
-        if (JS_IsException(item))
-            goto exception;
-        if (done) // item is JS_UNDEFINED
-            break;
-        item = map_normalize_key(ctx, item);
-        found = (NULL != map_find_record(ctx, s, item));
-        JS_FreeValue(ctx, item);
-        if (found)
-            continue;
-        if (JS_IteratorClose(ctx, iter, /*is_exception_pending*/false) < 0)
-            goto exception;
-        break;
-    }
-fini:
-    rval = found ? JS_TRUE : JS_FALSE;
-exception:
-    JS_FreeValue(ctx, has);
-    JS_FreeValue(ctx, keys);
-    JS_FreeValue(ctx, iter);
-    JS_FreeValue(ctx, next);
-    return rval;
-}
+/* DELETED: js_set_isSupersetOf. The whole operation is do_setop_consume_tramp — the setlike's props read in spec
+   order, THIS's records copied straight into the result (the spec forbids calling .add), and keys() folded in by
+   the shared acquire so a generator `*keys()` runs on the tramp. This body still had a LIVE JS_IteratorNext loop,
+   reachable only through the recognizer's declines; with the walk declared at the definition no pointer names
+   it, and js_call_c_function's JS_CFUNC_consume arm is the backstop for a call site that was never routed. */
 
 static JSValue js_set_intersection(JSContext *ctx, JSValueConst this_val,
                                    int argc, JSValueConst *argv)
@@ -68364,157 +68317,17 @@ fini:
     return newset;
 }
 
-static JSValue js_set_symmetricDifference(JSContext *ctx, JSValueConst this_val,
-                                          int argc, JSValueConst *argv)
-{
-    JSValue has, item, iter, keys, newset, next;
-    JSValueConst setlike;
-    struct list_head *el;
-    JSMapState *s, *t;
-    JSMapRecord *mr;
-    uint64_t size;
-    int done;
-    bool present;
+/* DELETED: js_set_symmetricDifference. The whole operation is do_setop_consume_tramp — the setlike's props read in spec
+   order, THIS's records copied straight into the result (the spec forbids calling .add), and keys() folded in by
+   the shared acquire so a generator `*keys()` runs on the tramp. This body still had a LIVE JS_IteratorNext loop,
+   reachable only through the recognizer's declines; with the walk declared at the definition no pointer names
+   it, and js_call_c_function's JS_CFUNC_consume arm is the backstop for a call site that was never routed. */
 
-    s = JS_GetOpaque2(ctx, this_val, JS_CLASS_SET);
-    if (!s)
-        return JS_EXCEPTION;
-    setlike = argv[0];
-    if (js_setlike_get_props(ctx, setlike, &size, &has, &keys) < 0)
-        return JS_EXCEPTION;
-    JS_FreeValue(ctx, has);
-    iter = JS_UNDEFINED;
-    next = JS_UNDEFINED;
-    newset = js_map_constructor(ctx, JS_UNDEFINED, 0, NULL, MAGIC_SET);
-    if (JS_IsException(newset))
-        goto exception;
-    t = JS_GetOpaque(newset, JS_CLASS_SET);
-    // can't clone this_val using js_map_constructor(),
-    // test262 mandates we don't call the .add method
-    list_for_each(el, &s->records) {
-        mr = list_entry(el, JSMapRecord, link);
-        if (mr->empty)
-            continue;
-        mr = map_add_record(ctx, t, mr->key);
-        if (!mr)
-            goto exception;
-        mr->value = JS_UNDEFINED;
-    }
-    iter = JS_Call(ctx, keys, setlike, 0, NULL);
-    if (JS_IsException(iter))
-        goto exception;
-    next = JS_GetProperty(ctx, iter, JS_ATOM_next);
-    if (JS_IsException(next))
-        goto exception;
-    for (;;) {
-        item = JS_IteratorNext(ctx, iter, next, 0, NULL, &done);
-        if (JS_IsException(item))
-            goto exception;
-        if (done) // item is JS_UNDEFINED
-            break;
-        // note the subtlety here: due to mutating iterators, it's
-        // possible for keys to disappear during iteration; test262
-        // still expects us to maintain insertion order though, so
-        // we first check |this|, then |new|; |new| is a copy of |this|
-        // - if item exists in |this|, delete (if it exists) from |new|
-        // - if item misses in |this| and |new|, add to |new|
-        // - if item exists in |new| but misses in |this|, *don't* add it,
-        //   mutating iterator erased it
-        item = map_normalize_key(ctx, item);
-        present = (NULL != map_find_record(ctx, s, item));
-        mr = map_find_record(ctx, t, item);
-        if (present) {
-            if (mr)
-                map_delete_record(ctx->rt, t, mr);
-            JS_FreeValue(ctx, item);
-        } else if (mr) {
-            JS_FreeValue(ctx, item);
-        } else {
-            mr = map_add_record(ctx, t, item);
-            JS_FreeValue(ctx, item);
-            if (!mr)
-                goto exception;
-            mr->value = JS_UNDEFINED;
-        }
-    }
-    goto fini;
-exception:
-    JS_FreeValue(ctx, newset);
-    newset = JS_EXCEPTION;
-fini:
-    JS_FreeValue(ctx, keys);
-    JS_FreeValue(ctx, next);
-    JS_FreeValue(ctx, iter);
-    return newset;
-}
-
-static JSValue js_set_union(JSContext *ctx, JSValueConst this_val,
-                            int argc, JSValueConst *argv)
-{
-    JSValue has, item, iter, keys, newset, next, rv;
-    JSValueConst setlike;
-    struct list_head *el;
-    JSMapState *s, *t;
-    JSMapRecord *mr;
-    uint64_t size;
-    int done;
-
-    iter = JS_UNDEFINED;
-    s = JS_GetOpaque2(ctx, this_val, JS_CLASS_SET);
-    if (!s)
-        return JS_EXCEPTION;
-    setlike = argv[0];
-    if (js_setlike_get_props(ctx, setlike, &size, &has, &keys) < 0)
-        return JS_EXCEPTION;
-    JS_FreeValue(ctx, has);
-    iter = JS_UNDEFINED;
-    next = JS_UNDEFINED;
-    newset = js_map_constructor(ctx, JS_UNDEFINED, 0, NULL, MAGIC_SET);
-    if (JS_IsException(newset))
-        goto exception;
-    t = JS_GetOpaque(newset, JS_CLASS_SET);
-    list_for_each(el, &s->records) {
-        mr = list_entry(el, JSMapRecord, link);
-        if (mr->empty)
-            continue;
-        mr = map_add_record(ctx, t, mr->key);
-        if (!mr)
-            goto exception;
-        mr->value = JS_UNDEFINED;
-    }
-    /* FALLBACK — the Set set-operations (union/intersection/difference/…) call the setlike's keys() and drive
-       .next from C, where a coroutine cannot suspend. Alive because tramp_can_call_setop_consume narrows to
-       generator-backed sources. Widen it, build what the failures name, delete this loop. */
-    DFAIL("a Set set-operation is iterating its setlike from C — route this call site onto the consume machine "
-          "(widen tramp_can_call_setop_consume past generator-backed sources)");
-    iter = JS_Call(ctx, keys, setlike, 0, NULL);
-    if (JS_IsException(iter))
-        goto exception;
-    next = JS_GetProperty(ctx, iter, JS_ATOM_next);
-    if (JS_IsException(next))
-        goto exception;
-    for (;;) {
-        item = JS_IteratorNext(ctx, iter, next, 0, NULL, &done);
-        if (JS_IsException(item))
-            goto exception;
-        if (done) // item is JS_UNDEFINED
-            break;
-        rv = js_map_set(ctx, newset, 1, vc(&item), MAGIC_SET);
-        JS_FreeValue(ctx, item);
-        if (JS_IsException(rv))
-            goto exception;
-        JS_FreeValue(ctx, rv);
-    }
-    goto fini;
-exception:
-    JS_FreeValue(ctx, newset);
-    newset = JS_EXCEPTION;
-fini:
-    JS_FreeValue(ctx, keys);
-    JS_FreeValue(ctx, next);
-    JS_FreeValue(ctx, iter);
-    return newset;
-}
+/* DELETED: js_set_union. The whole operation is do_setop_consume_tramp — the setlike's props read in spec
+   order, THIS's records copied straight into the result (the spec forbids calling .add), and keys() folded in by
+   the shared acquire so a generator `*keys()` runs on the tramp. This body still had a LIVE JS_IteratorNext loop,
+   reachable only through the recognizer's declines; with the walk declared at the definition no pointer names
+   it, and js_call_c_function's JS_CFUNC_consume arm is the backstop for a call site that was never routed. */
 
 static const JSCFunctionListEntry js_map_funcs[] = {
     JS_CFUNC_DEF("groupBy", 2, js_map_groupBy ),
@@ -68558,11 +68371,11 @@ static const JSCFunctionListEntry js_set_proto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("forEach", 1, js_map_forEach, MAGIC_SET ),
     JS_CFUNC_DEF("isDisjointFrom", 1, js_set_isDisjointFrom ),
     JS_CFUNC_DEF("isSubsetOf", 1, js_set_isSubsetOf ),
-    JS_CFUNC_DEF("isSupersetOf", 1, js_set_isSupersetOf ),
+    JS_CFUNC_CONSUME_DEF("isSupersetOf", 1, ITERCONS_SETOP_BASE + SETOP_SUPERSET ),
     JS_CFUNC_DEF("intersection", 1, js_set_intersection ),
     JS_CFUNC_DEF("difference", 1, js_set_difference ),
-    JS_CFUNC_DEF("symmetricDifference", 1, js_set_symmetricDifference ),
-    JS_CFUNC_DEF("union", 1, js_set_union ),
+    JS_CFUNC_CONSUME_DEF("symmetricDifference", 1, ITERCONS_SETOP_BASE + SETOP_SYMDIFF ),
+    JS_CFUNC_CONSUME_DEF("union", 1, ITERCONS_SETOP_BASE + SETOP_UNION ),
     JS_CFUNC_MAGIC_DEF("values", 0, js_create_map_iterator, (JS_ITERATOR_KIND_KEY << 2) | MAGIC_SET ),
     JS_ALIAS_DEF("keys", "values" ),
     JS_ALIAS_DEF("[Symbol.iterator]", "values" ),
