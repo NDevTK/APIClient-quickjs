@@ -1461,7 +1461,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_NUM_TOSTRING, STEPDEF_NUM_TOLOCALESTRING, STEPDEF_NUM_TOFIXED,
     STEPDEF_NUM_TOEXPONENTIAL, STEPDEF_NUM_TOPRECISION, STEPDEF_NUM_CTOR,
     STEPDEF_ITERATOR_CTOR, STEPDEF_ARRAY_OF, STEPDEF_ARRAY_CONCAT,
-    STEPDEF_WEAKREF_CTOR, STEPDEF_FINREC_CTOR,
+    STEPDEF_WEAKREF_CTOR, STEPDEF_FINREC_CTOR, STEPDEF_ARRAY_SLICE, STEPDEF_ARRAY_SPLICE,
     STEPDEF_COUNT
 };
 #define HINT_NONE    2
@@ -20227,6 +20227,16 @@ typedef struct JSFlatFrame {
     int depth;           /* how much deeper this level may flatten */
 } JSFlatFrame;
 
+typedef struct JSArraySlice {
+    JSStepHdr hdr;       /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    JSValue obj;         /* ToObject(this) (owned) */
+    JSValue arr;         /* ArraySpeciesCreate's target — the RESULT (owned) */
+    JSValue el;          /* the element held across its read (owned) */
+    int64_t len, start, count, del_count, final, k, n, new_len, di;
+    uint32_t item_count, ii;
+    int present;         /* the HasProperty answer, held across its own suspension */
+} JSArraySlice;
+
 typedef struct JSArrayFlat {
     JSStepHdr hdr;       /* MUST be first: the generic step driver casts the state to JSStepHdr * */
     JSValue obj;         /* ToObject(this) (owned) */
@@ -23643,6 +23653,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSGetProp *gp;
                 JSValue method = JS_UNDEFINED, keyval = JS_UNDEFINED, tgt = JS_UNDEFINED, handler = JS_UNDEFINED;
                 JSObject *accessor = NULL;
+                /* a TRAPLESS proxy forwards to its target, and this label does that forward ITSELF: re-entering
+                   the proxy's own [[Get]]/[[Set]]/[[Has]]/[[Delete]] would look the trap up a SECOND time, which
+                   a page can observe — the handler in splice/property-traps-order-with-species is itself a Proxy
+                   and counted the extra `set`. JS_UNINITIALIZED = not a trapless proxy (JS_UNDEFINED is a real
+                   target). */
+                JSValueConst gp_fwd = JS_UNINITIALIZED;
                 if (JS_VALUE_GET_TAG(gp_obj) == JS_TAG_OBJECT) {
                     JSObject *po = JS_VALUE_GET_OBJ(gp_obj);
                     if (po->class_id == JS_CLASS_PROXY) {
@@ -23651,8 +23667,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                                           gp_op == GP_SET ? JS_ATOM_set :
                                                           gp_op == GP_DELETE ? JS_ATOM_deleteProperty : JS_ATOM_get);
                         if (!pd) goto getprop_throw;               /* revoked, or the handler's own get threw */
-                        if (JS_IsUndefined(method) || !tramp_can_call(method)) {
-                            JS_FreeValue(ctx, method);             /* no trap, or a C/bound trap with no body */
+                        if (JS_IsUndefined(method)) {
+                            gp_fwd = pd->target;                   /* no trap: forward, exactly once */
+                        } else if (!tramp_can_call(method)) {
+                            JS_FreeValue(ctx, method);             /* a C/bound trap with no body: the generic
+                                                                      path below invokes it */
                             method = JS_UNDEFINED;
                         } else {
                             keyval = JS_AtomToValue(ctx, gp_atom);
@@ -23667,22 +23686,38 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                 }
                 if (JS_IsUndefined(method) && !accessor) {
-                    /* nothing user-written is involved: do it right here and hand the machine its answer. */
+                    /* nothing user-written is involved: do it right here and hand the machine its answer. A
+                       trapless proxy's forward is spelled out — the RECEIVER stays the proxy, exactly as
+                       js_proxy_get / _set / _has / _delete_property spell it — so the trap is looked up once. */
+                    bool fwd = !JS_IsUninitialized(gp_fwd);
                     if (gp_op == GP_HAS) {
-                        int hres = JS_HasProperty(ctx, gp_obj, gp_atom);
+                        int hres = JS_HasProperty(ctx, fwd ? gp_fwd : gp_obj, gp_atom);
                         if (unlikely(hres < 0)) goto getprop_throw;
                         ret_val = js_bool(hres);
                     } else if (gp_op == GP_DELETE) {
-                        /* DeletePropertyOrThrow(O, P): like the write, it yields nothing but its throw. */
-                        if (unlikely(JS_DeleteProperty(ctx, gp_obj, gp_atom, JS_PROP_THROW) < 0))
+                        /* DeletePropertyOrThrow(O, P): like the write, it yields nothing but its throw. A
+                           trapless proxy's own delete passes NO throw flag and reports false, which its caller
+                           turns into the TypeError — so the forward keeps that split. */
+                        if (fwd) {
+                            int dres = JS_DeleteProperty(ctx, gp_fwd, gp_atom, 0);
+                            if (unlikely(dres < 0)) goto getprop_throw;
+                            if (!dres) {
+                                JS_ThrowTypeErrorAtom(ctx, "could not delete property '%s'", gp_atom);
+                                goto getprop_throw;
+                            }
+                        } else if (unlikely(JS_DeleteProperty(ctx, gp_obj, gp_atom, JS_PROP_THROW) < 0)) {
                             goto getprop_throw;
+                        }
                         ret_val = JS_UNDEFINED;
                     } else if (gp_op == GP_SET) {
                         /* Set(O, P, V, true): the write yields nothing to the machine, only its throw. */
-                        if (unlikely(JS_SetPropertyInternal2(ctx, gp_obj, gp_atom, js_dup(gp_val), gp_obj,
-                                                             JS_PROP_THROW) < 0))
+                        if (unlikely(JS_SetPropertyInternal2(ctx, fwd ? gp_fwd : gp_obj, gp_atom, js_dup(gp_val),
+                                                             gp_obj, JS_PROP_THROW) < 0))
                             goto getprop_throw;
                         ret_val = JS_UNDEFINED;
+                    } else if (fwd) {
+                        ret_val = JS_GetPropertyInternal(ctx, gp_fwd, gp_atom, gp_obj, false);
+                        if (unlikely(JS_IsException(ret_val))) goto getprop_throw;
                     } else {
                         ret_val = JS_GetProperty(ctx, gp_obj, gp_atom);
                         if (unlikely(JS_IsException(ret_val))) goto getprop_throw;
@@ -55636,6 +55671,12 @@ static int js_array_of_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
 static JSValue js_array_of_fini(JSContext *ctx, void *st, bool take_result);
 static const JSTrampStepDef js_array_of_def = { sizeof(JSArrayOf), js_array_of_step, js_array_of_fini, 0 };
 static int js_array_concat_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static int js_array_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_array_slice_fini(JSContext *ctx, void *st, bool take_result);
+static const JSTrampStepDef js_array_slice_def  =
+    { sizeof(JSArraySlice), js_array_slice_step, js_array_slice_fini, 0 };
+static const JSTrampStepDef js_array_splice_def =
+    { sizeof(JSArraySlice), js_array_slice_step, js_array_slice_fini, 1 };
 static JSValue js_array_concat_fini(JSContext *ctx, void *st, bool take_result);
 static const JSTrampStepDef js_array_concat_def =
     { sizeof(JSArrayConcat), js_array_concat_step, js_array_concat_fini, 0 };
@@ -55836,6 +55877,8 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_ITERATOR_CTOR] = &js_iterator_ctor_def,
     [STEPDEF_ARRAY_OF]      = &js_array_of_def,
     [STEPDEF_ARRAY_CONCAT]  = &js_array_concat_def,
+    [STEPDEF_ARRAY_SLICE]   = &js_array_slice_def,
+    [STEPDEF_ARRAY_SPLICE]  = &js_array_splice_def,
     [STEPDEF_WEAKREF_CTOR]  = &js_weakref_ctor_def,
     [STEPDEF_FINREC_CTOR]   = &js_finrec_ctor_def,
     [STEPDEF_ARRAY_INDEXOF]     = &js_array_indexOf_def,
@@ -56460,110 +56503,181 @@ exception:
     return ret;
 }
 
-static JSValue js_array_slice(JSContext *ctx, JSValueConst this_val,
-                              int argc, JSValueConst *argv, int splice)
+/* 23.1.3.28 slice / 23.1.3.31 splice — ONE machine, `splice` in hdr.arg, exactly as the C function was one body
+   with a magic. Everything observable is the page's code: LengthOfArrayLike, both index coercions (a `valueOf`
+   runs there), ArraySpeciesCreate's Get(constructor) / Get(@@species) / Construct, every HasProperty and Get of
+   the copied range, Set(A,"length",n), and splice's own deletes, writes and final Set(O,"length"). js_array_slice
+   performed all of it from C, so a loop in any of them had no flow base and aborted at its back-edge.
+   The FAST-ARRAY paths stay: js_get_fast_array / js_is_fast_array is precisely the statement that no accessor, no
+   Proxy trap and no prototype lookup is reachable, so they are the same computation with no observable step — not
+   a second implementation of one.
+   Stages: 0 ToObject, 1 length, 2 start, 3 the second index, 4 ArraySpeciesCreate, 5 copy head, 6 HasProperty,
+   7 Get, 8 Set(A,"length",n), 9 splice's shift + delete head, 10 delete, 11 the inserted items,
+   12 Set(O,"length",newLen). */
+
+static int js_array_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    JSValue obj, arr, val, len_val;
-    int64_t len, start, k, final, n, count, del_count, new_len;
-    int kPresent;
+    JSArraySlice *s = st;
+    int splice = (s->hdr.arg != 0);
     JSValue *arrp;
-    uint32_t count32, i, item_count;
+    uint32_t count32;
+    int r;
 
-    arr = JS_UNDEFINED;
-    obj = JS_ToObject(ctx, this_val);
-    if (js_get_length64(ctx, &len, obj))
-        goto exception;
-
-    if (JS_ToInt64Clamp(ctx, &start, argv[0], 0, len, len))
-        goto exception;
-
-    if (splice) {
-        if (argc == 0) {
-            item_count = 0;
-            del_count = 0;
-        } else if (argc == 1) {
-            item_count = 0;
-            del_count = len - start;
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
+        s->obj = JS_UNDEFINED; s->arr = JS_UNDEFINED; s->el = JS_UNDEFINED;
+        s->len = 0; s->start = 0; s->count = 0; s->del_count = 0; s->final = 0;
+        s->k = 0; s->n = 0; s->new_len = 0; s->di = 0;
+        s->item_count = 0; s->ii = 0; s->present = 0;
+        s->obj = JS_ToObject(ctx, s->hdr.this_val);
+        if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
+        s->hdr.stage = 1;
+    }
+    if (s->hdr.stage == 1) {
+        r = step_length_run(ctx, &s->hdr, s->obj, cb_result, &s->len, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 2;
+    }
+    if (s->hdr.stage == 2) {
+        r = step_toint64_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->start, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->start = arr_clamp_idx(s->start, s->len);
+        s->hdr.stage = 3;
+    }
+    if (s->hdr.stage == 3) {
+        if (splice) {
+            if (s->hdr.argc == 0) {
+                s->item_count = 0; s->del_count = 0;
+            } else if (s->hdr.argc == 1) {
+                s->item_count = 0; s->del_count = s->len - s->start;
+            } else {
+                s->item_count = s->hdr.argc - 2;
+                r = step_toint64_run(ctx, &s->hdr, step_arg(&s->hdr, 1), cb_result, &s->del_count,
+                                     out_cb, out_argc);
+                cb_result = JS_UNDEFINED;
+                if (r) return r < 0 ? -1 : r;
+                /* JS_ToInt64Clamp(…, 0, len - start, 0): no negative-relative offset here */
+                if (s->del_count < 0) s->del_count = 0;
+                else if (s->del_count > s->len - s->start) s->del_count = s->len - s->start;
+            }
+            if (s->len + s->item_count - s->del_count > MAX_SAFE_INTEGER) {
+                JS_ThrowTypeError(ctx, "Array loo long");
+                return -1;
+            }
+            s->count = s->del_count;
         } else {
-            item_count = argc - 2;
-            if (JS_ToInt64Clamp(ctx, &del_count, argv[1], 0, len - start, 0))
-                goto exception;
+            s->final = s->len;
+            if (!JS_IsUndefined(step_arg(&s->hdr, 1))) {
+                r = step_toint64_run(ctx, &s->hdr, step_arg(&s->hdr, 1), cb_result, &s->final,
+                                     out_cb, out_argc);
+                cb_result = JS_UNDEFINED;
+                if (r) return r < 0 ? -1 : r;
+                s->final = arr_clamp_idx(s->final, s->len);
+            }
+            s->count = max_int64(s->final - s->start, 0);
         }
-        if (len + item_count - del_count > MAX_SAFE_INTEGER) {
-            JS_ThrowTypeError(ctx, "Array loo long");
-            goto exception;
-        }
-        count = del_count;
-    } else {
-        item_count = 0; /* avoid warning */
-        final = len;
-        if (!JS_IsUndefined(argv[1])) {
-            if (JS_ToInt64Clamp(ctx, &final, argv[1], 0, len, len))
-                goto exception;
-        }
-        count = max_int64(final - start, 0);
+        s->hdr.stage = 4;
     }
-    len_val = js_int64(count);
-    arr = JS_ArraySpeciesCreate(ctx, obj, len_val);
-    JS_FreeValue(ctx, len_val);
-    if (JS_IsException(arr))
-        goto exception;
-
-    k = start;
-    final = start + count;
-    n = 0;
-    /* The fast array test on arr ensures that
-       JS_CreateDataPropertyUint32() won't modify obj in case arr is
-       an exotic object */
-    /* Special case fast arrays */
-    if (js_get_fast_array(ctx, obj, &arrp, &count32) &&
-        js_is_fast_array(ctx, arr)) {
-        /* XXX: should share code with fast array constructor */
-        for (; k < final && k < count32; k++, n++) {
-            if (JS_CreateDataPropertyUint32Const(ctx, arr, n, arrp[k], JS_PROP_THROW) < 0)
-                goto exception;
-        }
+    if (s->hdr.stage == 4) {
+        r = step_species_run(ctx, &s->hdr, s->obj, cb_result, js_int64(s->count), &s->arr, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->k = s->start;
+        s->final = s->start + s->count;
+        s->n = 0;
+        s->hdr.stage = 5;
     }
-    /* Copy the remaining elements if any (handle case of inherited properties) */
-    for (; k < final; k++, n++) {
-        kPresent = JS_TryGetPropertyInt64(ctx, obj, k, &val);
-        if (kPresent < 0)
-            goto exception;
-        if (kPresent) {
-            if (JS_CreateDataPropertyUint32(ctx, arr, n, val, JS_PROP_THROW) < 0)
-                goto exception;
-        }
-    }
-    if (JS_SetProperty(ctx, arr, JS_ATOM_length, js_int64(n)) < 0)
-        goto exception;
-
-    if (splice) {
-        new_len = len + item_count - del_count;
-        if (item_count != del_count) {
-            if (JS_CopySubArray(ctx, obj, start + item_count,
-                                start + del_count, len - (start + del_count),
-                                item_count <= del_count ? +1 : -1) < 0)
-                goto exception;
-
-            for (k = len; k-- > new_len; ) {
-                if (JS_DeletePropertyInt64(ctx, obj, k, JS_PROP_THROW) < 0)
-                    goto exception;
+    if (s->hdr.stage == 5) {
+        /* The fast-array test on `arr` is what makes JS_CreateDataPropertyUint32Const unable to touch `obj`:
+           neither side can run a trap, so this whole span has no observable step in it. */
+        if (js_get_fast_array(ctx, s->obj, &arrp, &count32) && js_is_fast_array(ctx, s->arr)) {
+            for (; s->k < s->final && s->k < count32; s->k++, s->n++) {
+                if (JS_CreateDataPropertyUint32Const(ctx, s->arr, s->n, arrp[s->k], JS_PROP_THROW) < 0)
+                    return -1;
             }
         }
-        for (i = 0; i < item_count; i++) {
-            if (JS_SetPropertyInt64(ctx, obj, start + i, js_dup(argv[i + 2])) < 0)
-                goto exception;
-        }
-        if (JS_SetProperty(ctx, obj, JS_ATOM_length, js_int64(new_len)) < 0)
-            goto exception;
+        s->hdr.stage = 6;
     }
-    JS_FreeValue(ctx, obj);
-    return arr;
+    /* GUARDED on the two stages this walk owns: a resume lands at the top of the machine, and an unguarded loop
+       here would run the element Get for a flow that had suspended in the splice tail. */
+    while (s->hdr.stage == 6 || s->hdr.stage == 7) {
+        if (s->hdr.stage == 6) {
+            if (s->k >= s->final) { JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED; s->hdr.stage = 8; break; }
+            r = step_hasidx_run(ctx, &s->hdr, s->obj, s->k, cb_result, &s->present, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            if (!s->present) { s->k++; s->n++; continue; }   /* a HOLE stays a hole in the result */
+            s->hdr.stage = 7;
+        }
+        r = step_getidx_run(ctx, &s->hdr, s->obj, s->k, cb_result, &s->el, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        {
+            JSValue el = s->el;
+            s->el = JS_UNDEFINED;   /* the create CONSUMES it, so the state must let go first */
+            if (JS_CreateDataPropertyUint32(ctx, s->arr, s->n, el, JS_PROP_THROW) < 0)
+                return -1;
+        }
+        s->k++; s->n++;
+        s->hdr.stage = 6;
+    }
+    if (s->hdr.stage == 8) {
+        r = step_setprop_run(ctx, &s->hdr, s->arr, JS_ATOM_length, js_int64(s->n), cb_result, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        if (!splice) return 0;
+        s->hdr.stage = 9;
+    }
+    if (s->hdr.stage == 9) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        s->new_len = s->len + s->item_count - s->del_count;
+        if (s->item_count != s->del_count) {
+            /* The SHIFT is still JS_CopySubArray. Its fast-array path runs no user code at all; its slow path
+               reads and writes `obj` from C and is the one remaining unconverted walk in this builtin — a loop in
+               an accessor there aborts exactly as it did before, which is the honest state of that site. */
+            if (JS_CopySubArray(ctx, s->obj, s->start + s->item_count,
+                                s->start + s->del_count, s->len - (s->start + s->del_count),
+                                s->item_count <= s->del_count ? +1 : -1) < 0)
+                return -1;
+            s->di = s->len;
+        } else {
+            s->di = s->new_len;   /* nothing to trim */
+        }
+        s->hdr.stage = 10;
+    }
+    while (s->hdr.stage == 10) {
+        if (s->di <= s->new_len) { JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED; s->ii = 0; s->hdr.stage = 11; break; }
+        r = step_delidx_run(ctx, &s->hdr, s->obj, s->di - 1, cb_result, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->di--;
+    }
+    while (s->hdr.stage == 11) {
+        if (s->ii >= s->item_count) { JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED; s->hdr.stage = 12; break; }
+        r = step_setidx_run(ctx, &s->hdr, s->obj, s->start + s->ii, step_arg(&s->hdr, s->ii + 2),
+                            cb_result, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->ii++;
+    }
+    r = step_setprop_run(ctx, &s->hdr, s->obj, JS_ATOM_length, js_int64(s->new_len), cb_result,
+                         out_cb, out_argc);
+    if (r) return r < 0 ? -1 : r;
+    return 0;
+}
 
- exception:
-    JS_FreeValue(ctx, obj);
-    JS_FreeValue(ctx, arr);
-    return JS_EXCEPTION;
+static JSValue js_array_slice_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSArraySlice *s = st;
+    JSValue r = take_result ? s->arr : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->arr);
+    JS_FreeValue(ctx, s->obj);
+    JS_FreeValue(ctx, s->el);
+    js_free(ctx, s);
+    return r;
 }
 
 static JSValue js_array_toSpliced(JSContext *ctx, JSValueConst this_val,
@@ -58364,8 +58478,8 @@ static const JSCFunctionListEntry js_array_proto_funcs[] = {
     JS_CFUNC_DEF("toReversed", 0, js_array_toReversed ),
     JS_CFUNC_STEP_DEF("sort", 1, STEPDEF_ARRAY_SORT ),
     JS_CFUNC_STEP_DEF("toSorted", 1, STEPDEF_ARRAY_TOSORTED ),
-    JS_CFUNC_MAGIC_DEF("slice", 2, js_array_slice, 0 ),
-    JS_CFUNC_MAGIC_DEF("splice", 2, js_array_slice, 1 ),
+    JS_CFUNC_STEP_DEF("slice", 2, STEPDEF_ARRAY_SLICE ),
+    JS_CFUNC_STEP_DEF("splice", 2, STEPDEF_ARRAY_SPLICE ),
     JS_CFUNC_DEF("toSpliced", 2, js_array_toSpliced ),
     JS_CFUNC_STEP_DEF("copyWithin", 2, STEPDEF_ARRAY_COPYWITHIN ),
     JS_CFUNC_STEP_DEF("flatMap", 1, STEPDEF_ARRAY_FLATMAP ),
