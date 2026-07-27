@@ -1462,7 +1462,8 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_NUM_TOEXPONENTIAL, STEPDEF_NUM_TOPRECISION, STEPDEF_NUM_CTOR,
     STEPDEF_ITERATOR_CTOR, STEPDEF_ARRAY_OF, STEPDEF_ARRAY_CONCAT,
     STEPDEF_WEAKREF_CTOR, STEPDEF_FINREC_CTOR, STEPDEF_ARRAY_SLICE, STEPDEF_ARRAY_SPLICE,
-    STEPDEF_ARRAY_CTOR,
+    STEPDEF_ARRAY_CTOR, STEPDEF_ARRAY_POP, STEPDEF_ARRAY_SHIFT,
+    STEPDEF_ARRAY_PUSH, STEPDEF_ARRAY_UNSHIFT,
     STEPDEF_DOMEXCEPTION_CTOR,
     STEPDEF_COUNT
 };
@@ -18403,6 +18404,8 @@ static int step_species_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSVa
      4/6 = the caller must return that step code; it will be re-entered at the same stage
      -1  = threw. */
 static int js_typed_array_get_length_unsafe(JSContext *ctx, JSValueConst obj);
+static int js_array_private_push(JSContext *ctx, JSValueConst arr, JSValueConst v);
+static int js_array_private_pop(JSContext *ctx, JSValueConst arr);
 
 static int step_ta_species_finish(JSContext *ctx, JSStepHdr *h, JSValue ctor, JSValueConst len_val,
                                   int class_id, JSValue *pout, JSValue **out_cb, int *out_argc)
@@ -20357,6 +20360,21 @@ typedef struct JSFlatFrame {
     int64_t len, i;
     int depth;           /* how much deeper this level may flatten */
 } JSFlatFrame;
+
+typedef struct JSArrayPop {
+    JSStepHdr hdr;       /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    JSValue obj;         /* ToObject(this) (owned) */
+    JSValue res;         /* the removed element — the RESULT (owned) */
+    int64_t len, newLen, cs_i;
+    int present;
+} JSArrayPop;
+
+typedef struct JSArrayPush {
+    JSStepHdr hdr;       /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    JSValue obj;         /* ToObject(this) (owned) */
+    int64_t len, newLen, from, cs_i;
+    int i, present;
+} JSArrayPush;
 
 typedef struct JSArraySlice {
     JSStepHdr hdr;       /* MUST be first: the generic step driver casts the state to JSStepHdr * */
@@ -51530,7 +51548,7 @@ static JSValue js_object_groupBy(JSContext *ctx, JSValueConst this_val,
             }
         }
 
-        res = js_array_push(ctx, prop, 1, vc(&v), /*unshift*/0);
+        res = js_int32(js_array_private_push(ctx, prop, v));
         if (JS_IsException(res))
             goto exception;
         // res is an int64
@@ -52931,85 +52949,16 @@ static JSValue js_aggregate_error_constructor(JSContext *ctx,
 
 /* Array */
 
-static int JS_CopySubArray(JSContext *ctx,
-                           JSValue obj, int64_t to_pos,
-                           int64_t from_pos, int64_t count, int dir)
-{
-    JSObject *p;
-    int64_t i, from, to, len;
-    JSValue val;
-    int fromPresent;
 
-    p = NULL;
-    if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
-        p = JS_VALUE_GET_OBJ(obj);
-        if (p->class_id != JS_CLASS_ARRAY || !p->fast_array) {
-            p = NULL;
-        }
-    }
-
-    for (i = 0; i < count; ) {
-        if (dir < 0) {
-            from = from_pos + count - i - 1;
-            to = to_pos + count - i - 1;
-        } else {
-            from = from_pos + i;
-            to = to_pos + i;
-        }
-        if (p && p->fast_array &&
-            from >= 0 && from < (len = p->u.array.count)  &&
-            to >= 0 && to < len) {
-            int64_t l, j;
-            /* Fast path for fast arrays. Since we don't look at the
-               prototype chain, we can optimize only the cases where
-               all the elements are present in the array. */
-            l = count - i;
-            if (dir < 0) {
-                l = min_int64(l, from + 1);
-                l = min_int64(l, to + 1);
-                for(j = 0; j < l; j++) {
-                    set_value(ctx, &p->u.array.u.values[to - j],
-                              js_dup(p->u.array.u.values[from - j]));
-                }
-            } else {
-                l = min_int64(l, len - from);
-                l = min_int64(l, len - to);
-                for(j = 0; j < l; j++) {
-                    set_value(ctx, &p->u.array.u.values[to + j],
-                              js_dup(p->u.array.u.values[from + j]));
-                }
-            }
-            i += l;
-        } else {
-            fromPresent = JS_TryGetPropertyInt64(ctx, obj, from, &val);
-            if (fromPresent < 0)
-                goto exception;
-
-            if (fromPresent) {
-                if (JS_SetPropertyInt64(ctx, obj, to, val) < 0)
-                    goto exception;
-            } else {
-                if (JS_DeletePropertyInt64(ctx, obj, to, JS_PROP_THROW) < 0)
-                    goto exception;
-            }
-            i++;
-        }
-    }
-    return 0;
-
- exception:
-    return -1;
-}
-
-/* JS_CopySubArray's element walk as a RESUMABLE sub-sequence. Its fast-array span moves slots directly and has
-   no observable step in it; its SLOW path is a HasProperty, then a Get and a Set, or a Delete — every one of them
-   the page's code, and splice performed the whole walk from C, so an accessor or a Proxy trap with a loop in it
-   had no flow base. DIRECTION matters (an overlapping shift copies backwards), which is why the cursor is an
-   index into `count` rather than a from/to pair: from and to are derived from it on every re-entry, so a resume
-   lands on the same element the suspension left.
-     0 = done, 6/7/8/9 = the caller must return that step code, -1 = threw.
-   JS_CopySubArray itself stays for `shift` and `unshift`, which are not machines yet — each is its own
-   conversion, and this walk is what they will use when they are. */
+/* THE element-shift walk, the one Array has: splice's tail, shift's move-down and unshift's move-up. Its
+   fast-array span moves slots directly and has no observable step in it; its SLOW path is a HasProperty, then a
+   Get and a Set, or a Delete — every one of them the page's code, and JS_CopySubArray performed the whole walk
+   from C for all three, so an accessor or a Proxy trap with a loop in it had no flow base. That C twin is
+   deleted; this is the only implementation.
+   DIRECTION matters (an overlapping shift copies backwards), which is why the cursor is an index into `count`
+   rather than a from/to pair: from and to are derived from it on every re-entry, so a resume lands on the same
+   element the suspension left.
+     0 = done, 6/7/8/9 = the caller must return that step code, -1 = threw. */
 enum { CS_HEAD = 0, CS_HAS, CS_GET, CS_WRITE };
 static int step_copysub_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj,
                             int64_t to_pos, int64_t from_pos, int64_t count, int dir,
@@ -55947,6 +55896,14 @@ static int js_array_concat_step(JSContext *ctx, void *st, JSValue cb_result, JSV
 static int js_array_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_slice_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_array_ctor_body(JSContext *ctx, JSValueConst obj_, int argc, JSValueConst *argv);
+static int js_array_pop_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_array_pop_fini(JSContext *ctx, void *st, bool take_result);
+static int js_array_push_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_array_push_fini(JSContext *ctx, void *st, bool take_result);
+static const JSTrampStepDef js_array_pop_def     = { sizeof(JSArrayPop),  js_array_pop_step,  js_array_pop_fini,  0 };
+static const JSTrampStepDef js_array_shift_def   = { sizeof(JSArrayPop),  js_array_pop_step,  js_array_pop_fini,  1 };
+static const JSTrampStepDef js_array_push_def    = { sizeof(JSArrayPush), js_array_push_step, js_array_push_fini, 0 };
+static const JSTrampStepDef js_array_unshift_def = { sizeof(JSArrayPush), js_array_push_step, js_array_push_fini, 1 };
 static const JSTrampStepDef js_array_ctor_def =
     CREATECTOR_DEF(JS_CLASS_ARRAY, 0, generic, js_array_ctor_body, 0);
 static const JSTrampStepDef js_array_slice_def  =
@@ -56161,6 +56118,10 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_ARRAY_OF]      = &js_array_of_def,
     [STEPDEF_ARRAY_CONCAT]  = &js_array_concat_def,
     [STEPDEF_ARRAY_CTOR]    = &js_array_ctor_def,
+    [STEPDEF_ARRAY_POP]     = &js_array_pop_def,
+    [STEPDEF_ARRAY_SHIFT]   = &js_array_shift_def,
+    [STEPDEF_ARRAY_PUSH]    = &js_array_push_def,
+    [STEPDEF_ARRAY_UNSHIFT] = &js_array_unshift_def,
     [STEPDEF_ARRAY_SLICE]   = &js_array_slice_def,
     [STEPDEF_ARRAY_SPLICE]  = &js_array_splice_def,
     [STEPDEF_WEAKREF_CTOR]  = &js_weakref_ctor_def,
@@ -56547,128 +56508,208 @@ static JSValue js_array_join_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
-static JSValue js_array_pop(JSContext *ctx, JSValueConst this_val,
-                            int argc, JSValueConst *argv, int shift)
+/* Append to / pop from an ENGINE-PRIVATE array — JSON.stringify's cycle stack, the property-walk accumulators.
+   The receiver is one this engine made and the page has never seen, so there is no accessor, no trap and no
+   prototype lookup to reach: this is the same computation the builtins' fast-array span performs, with none of
+   the observable steps that made them machines. It is NOT a fallback for those — nothing routes here. */
+static int js_array_private_push(JSContext *ctx, JSValueConst arr, JSValueConst v)
 {
-    JSValue obj, res = JS_UNDEFINED;
-    int64_t len, newLen;
-    JSValue *arrp;
-    uint32_t count32;
-
-    obj = JS_ToObject(ctx, this_val);
-    if (js_get_length64(ctx, &len, obj))
-        goto exception;
-    newLen = 0;
-    if (len > 0) {
-        newLen = len - 1;
-        /* Special case fast arrays */
-        if (js_get_fast_array(ctx, obj, &arrp, &count32) && count32 == len) {
-            JSObject *p = JS_VALUE_GET_OBJ(obj);
-            if (shift) {
-                res = arrp[0];
-                memmove(arrp, arrp + 1, (count32 - 1) * sizeof(*arrp));
-                p->u.array.count--;
-            } else {
-                res = arrp[count32 - 1];
-                p->u.array.count--;
-            }
-        } else {
-            if (shift) {
-                res = JS_GetPropertyInt64(ctx, obj, 0);
-                if (JS_IsException(res))
-                    goto exception;
-                if (JS_CopySubArray(ctx, obj, 0, 1, len - 1, +1))
-                    goto exception;
-            } else {
-                res = JS_GetPropertyInt64(ctx, obj, newLen);
-                if (JS_IsException(res))
-                    goto exception;
-            }
-            if (JS_DeletePropertyInt64(ctx, obj, newLen, JS_PROP_THROW) < 0)
-                goto exception;
-        }
-    }
-    if (JS_SetProperty(ctx, obj, JS_ATOM_length, js_int64(newLen)) < 0)
-        goto exception;
-
-    JS_FreeValue(ctx, obj);
-    return res;
-
- exception:
-    JS_FreeValue(ctx, res);
-    JS_FreeValue(ctx, obj);
-    return JS_EXCEPTION;
+    int64_t len;
+    if (js_get_length64(ctx, &len, arr))
+        return -1;
+    return JS_SetPropertyInt64(ctx, arr, len, js_dup(v)) < 0 ? -1 : 0;
 }
 
-static JSValue js_array_push(JSContext *ctx, JSValueConst this_val,
-                             int argc, JSValueConst *argv, int unshift)
+static int js_array_private_pop(JSContext *ctx, JSValueConst arr)
 {
-    JSValue obj;
-    int i;
-    int64_t len, from, newLen;
+    int64_t len;
+    if (js_get_length64(ctx, &len, arr))
+        return -1;
+    if (len <= 0)
+        return 0;
+    /* TRUNCATE, never DeletePropertyOrThrow: a delete takes a dense array out of its fast representation, and the
+       next js_internal_array_includes on the same engine-owned array then hits its "must be a fast array" DFAIL.
+       The builtin's own fast path decrements the element count for the same reason. */
+    return JS_SetProperty(ctx, arr, JS_ATOM_length, js_int64(len - 1)) < 0 ? -1 : 0;
+}
 
-    /* fast path for push on fast arrays */
-    if (likely(JS_VALUE_GET_TAG(this_val) == JS_TAG_OBJECT && !unshift)) {
-        JSObject *p = JS_VALUE_GET_OBJ(this_val);
-        if (likely(p->class_id == JS_CLASS_ARRAY &&
-                   p->fast_array &&
-                   p->extensible &&
-                   p->shape->proto == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]) &&
-                   ctx->std_array_prototype)) {
-            uint32_t array_len, new_len;
-            if (likely(JS_VALUE_GET_TAG(p->prop[0].u.value) == JS_TAG_INT &&
-                       (get_shape_prop(p->shape)->flags & JS_PROP_WRITABLE))) {
-                array_len = JS_VALUE_GET_INT(p->prop[0].u.value);
-                new_len = array_len + argc;
-                if (likely(array_len == p->u.array.count &&
-                           new_len >= array_len && new_len <= (uint32_t)INT32_MAX)) { /* no overflow and within fast-array bounds */
-                    if (unlikely(new_len > p->u.array.u1.size)) {
-                        if (expand_fast_array(ctx, p, new_len))
-                            return JS_EXCEPTION;
+/* 23.1.3.22 pop / 23.1.3.26 shift — one machine, the shift flag in the declaration, exactly as the C body was
+   one function with a magic. LengthOfArrayLike, the element Get, shift's element SHIFT, the Delete and the final
+   Set(length) are all the page's code on an exotic receiver, and js_array_pop ran every one of them from C.
+   The fast-array span stays: js_get_fast_array with count32 == len is the statement that the receiver is a plain
+   dense array, so that branch has no observable step in it at all.
+   Stages: 0 ToObject, 1 length, 2 the element Get, 3 the shift, 4 the Delete, 5 Set(O,"length",newLen). */
+
+static int js_array_pop_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSArrayPop *s = st;
+    int shift = (s->hdr.arg != 0);
+    JSValue *arrp;
+    uint32_t count32;
+    int r;
+
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
+        s->obj = JS_UNDEFINED; s->res = JS_UNDEFINED;
+        s->len = 0; s->newLen = 0; s->cs_i = 0; s->present = 0;
+        s->obj = JS_ToObject(ctx, s->hdr.this_val);
+        if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
+        s->hdr.stage = 1;
+    }
+    if (s->hdr.stage == 1) {
+        r = step_length_run(ctx, &s->hdr, s->obj, cb_result, &s->len, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->newLen = 0;
+        s->hdr.stage = 5;
+        if (s->len > 0) {
+            s->newLen = s->len - 1;
+            if (js_get_fast_array(ctx, s->obj, &arrp, &count32) && count32 == s->len) {
+                JSObject *p = JS_VALUE_GET_OBJ(s->obj);
+                if (shift) {
+                    s->res = arrp[0];
+                    memmove(arrp, arrp + 1, (count32 - 1) * sizeof(*arrp));
+                } else {
+                    s->res = arrp[count32 - 1];
+                }
+                p->u.array.count--;
+            } else {
+                s->hdr.stage = 2;
+            }
+        }
+    }
+    if (s->hdr.stage == 2) {
+        r = step_getidx_run(ctx, &s->hdr, s->obj, shift ? 0 : s->newLen, cb_result, &s->res, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->cs_i = 0;
+        s->hdr.stage = shift ? 3 : 4;
+    }
+    if (s->hdr.stage == 3) {   /* shift: everything above index 0 moves down one */
+        r = step_copysub_run(ctx, &s->hdr, s->obj, 0, 1, s->len - 1, +1,
+                             &s->cs_i, &s->present, cb_result, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 4;
+    }
+    if (s->hdr.stage == 4) {
+        r = step_delidx_run(ctx, &s->hdr, s->obj, s->newLen, cb_result, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 5;
+    }
+    r = step_setprop_run(ctx, &s->hdr, s->obj, JS_ATOM_length, js_int64(s->newLen), cb_result, out_cb, out_argc);
+    if (r) return r < 0 ? -1 : r;
+    return 0;
+}
+
+static JSValue js_array_pop_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSArrayPop *s = st;
+    JSValue r = take_result ? s->res : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->res);
+    JS_FreeValue(ctx, s->obj);
+    js_free(ctx, s);
+    return r;
+}
+
+/* 23.1.3.23 push / 23.1.3.34 unshift — one machine, the unshift flag in the declaration. LengthOfArrayLike,
+   unshift's element SHIFT, each inserted write and the final Set(length) are the page's code, and js_array_push
+   ran them from C. The dense-array push fast path stays, guarded by everything that makes it unobservable
+   (a plain fast Array with the standard prototype, a writable int `length` that matches the element count).
+   Stages: 0 the fast path / ToObject, 1 length, 2 unshift's shift, 3 the inserted writes,
+   4 Set(O,"length",newLen). */
+
+static int js_array_push_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSArrayPush *s = st;
+    int unshift = (s->hdr.arg != 0);
+    int i, r;
+
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        s->obj = JS_UNDEFINED;
+        s->len = 0; s->newLen = 0; s->from = 0; s->cs_i = 0; s->i = 0; s->present = 0;
+        /* the dense-array append: no accessor, no trap, no prototype lookup is reachable under these guards */
+        if (likely(JS_VALUE_GET_TAG(s->hdr.this_val) == JS_TAG_OBJECT && !unshift)) {
+            JSObject *p = JS_VALUE_GET_OBJ(s->hdr.this_val);
+            if (likely(p->class_id == JS_CLASS_ARRAY &&
+                       p->fast_array &&
+                       p->extensible &&
+                       p->shape->proto == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]) &&
+                       ctx->std_array_prototype)) {
+                uint32_t array_len, new_len;
+                if (likely(JS_VALUE_GET_TAG(p->prop[0].u.value) == JS_TAG_INT &&
+                           (get_shape_prop(p->shape)->flags & JS_PROP_WRITABLE))) {
+                    array_len = JS_VALUE_GET_INT(p->prop[0].u.value);
+                    new_len = array_len + s->hdr.argc;
+                    if (likely(array_len == p->u.array.count &&
+                               new_len >= array_len && new_len <= (uint32_t)INT32_MAX)) {
+                        if (unlikely(new_len > p->u.array.u1.size)) {
+                            if (expand_fast_array(ctx, p, new_len))
+                                return -1;
+                        }
+                        /* Forced-exec COW: this path writes values[] directly (bypassing
+                           add_fast_array_element's capture), so record each created element slot so a shared
+                           array's per-flow push is isolated (cow_unapply truncates it away). */
+                        for (i = 0; i < s->hdr.argc; i++)
+                            cow_capture_append(ctx, s->hdr.this_val, __JS_AtomFromUInt32(array_len + i));
+                        for (i = 0; i < s->hdr.argc; i++)
+                            p->u.array.u.values[array_len + i] = js_dup(s->hdr.argv[i]);
+                        p->u.array.count = new_len;
+                        p->prop[0].u.value = js_uint32(new_len);
+                        s->newLen = new_len;
+                        return 0;
                     }
-                    /* Forced-exec COW: this fast path writes values[] directly (bypassing add_fast_array_element's
-                       capture), so record each created element slot so a shared array's per-flow push is isolated
-                       (cow_unapply truncates it away). O(1) append capture; cheap-skips a flow_local array. */
-                    for(i = 0; i < argc; i++)
-                        cow_capture_append(ctx, this_val, __JS_AtomFromUInt32(array_len + i));
-                    for(i = 0; i < argc; i++) {
-                        p->u.array.u.values[array_len + i] = js_dup(argv[i]);
-                    }
-                    p->u.array.count = new_len;
-                    p->prop[0].u.value = js_uint32(new_len);
-                    return js_int32(new_len);
                 }
             }
         }
+        s->obj = JS_ToObject(ctx, s->hdr.this_val);
+        if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
+        s->hdr.stage = 1;
     }
+    if (s->hdr.stage == 1) {
+        r = step_length_run(ctx, &s->hdr, s->obj, cb_result, &s->len, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->newLen = s->len + s->hdr.argc;
+        if (s->newLen > MAX_SAFE_INTEGER) {
+            JS_ThrowTypeError(ctx, "Array loo long");
+            return -1;
+        }
+        s->from = s->len;
+        s->cs_i = 0; s->i = 0;
+        s->hdr.stage = (unshift && s->hdr.argc > 0) ? 2 : 3;
+    }
+    if (s->hdr.stage == 2) {   /* unshift: everything moves up by argc, backwards so the copy does not overlap */
+        r = step_copysub_run(ctx, &s->hdr, s->obj, s->hdr.argc, 0, s->len, -1,
+                             &s->cs_i, &s->present, cb_result, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->from = 0;
+        s->hdr.stage = 3;
+    }
+    while (s->hdr.stage == 3) {
+        if (s->i >= s->hdr.argc) { JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED; s->hdr.stage = 4; break; }
+        r = step_setidx_run(ctx, &s->hdr, s->obj, s->from + s->i, step_arg(&s->hdr, s->i),
+                            cb_result, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->i++;
+    }
+    r = step_setprop_run(ctx, &s->hdr, s->obj, JS_ATOM_length, js_int64(s->newLen), cb_result, out_cb, out_argc);
+    if (r) return r < 0 ? -1 : r;
+    return 0;
+}
 
-    obj = JS_ToObject(ctx, this_val);
-    if (js_get_length64(ctx, &len, obj))
-        goto exception;
-    newLen = len + argc;
-    if (newLen > MAX_SAFE_INTEGER) {
-        JS_ThrowTypeError(ctx, "Array loo long");
-        goto exception;
-    }
-    from = len;
-    if (unshift && argc > 0) {
-        if (JS_CopySubArray(ctx, obj, argc, 0, len, -1))
-            goto exception;
-        from = 0;
-    }
-    for(i = 0; i < argc; i++) {
-        if (JS_SetPropertyInt64(ctx, obj, from + i, js_dup(argv[i])) < 0)
-            goto exception;
-    }
-    if (JS_SetProperty(ctx, obj, JS_ATOM_length, js_int64(newLen)) < 0)
-        goto exception;
-
-    JS_FreeValue(ctx, obj);
-    return js_int64(newLen);
-
- exception:
-    JS_FreeValue(ctx, obj);
-    return JS_EXCEPTION;
+static JSValue js_array_push_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSArrayPush *s = st;
+    JSValue r = take_result ? js_int64(s->newLen) : JS_UNDEFINED;
+    JS_FreeValue(ctx, s->obj);
+    js_free(ctx, s);
+    return r;
 }
 
 static JSValue js_array_reverse(JSContext *ctx, JSValueConst this_val,
@@ -58757,10 +58798,10 @@ static const JSCFunctionListEntry js_array_proto_funcs[] = {
     JS_CFUNC_STEP_DEF("join", 1, STEPDEF_ARRAY_JOIN ),
     JS_CFUNC_STEP_DEF("toString", 0, STEPDEF_ARRAY_TOSTRING ),
     JS_CFUNC_STEP_DEF("toLocaleString", 0, STEPDEF_ARRAY_TOLOCALESTRING ),
-    JS_CFUNC_MAGIC_DEF("pop", 0, js_array_pop, 0 ),
-    JS_CFUNC_MAGIC_DEF("push", 1, js_array_push, 0 ),
-    JS_CFUNC_MAGIC_DEF("shift", 0, js_array_pop, 1 ),
-    JS_CFUNC_MAGIC_DEF("unshift", 1, js_array_push, 1 ),
+    JS_CFUNC_STEP_DEF("pop", 0, STEPDEF_ARRAY_POP ),
+    JS_CFUNC_STEP_DEF("push", 1, STEPDEF_ARRAY_PUSH ),
+    JS_CFUNC_STEP_DEF("shift", 0, STEPDEF_ARRAY_SHIFT ),
+    JS_CFUNC_STEP_DEF("unshift", 1, STEPDEF_ARRAY_UNSHIFT ),
     JS_CFUNC_DEF("reverse", 0, js_array_reverse ),
     JS_CFUNC_DEF("toReversed", 0, js_array_toReversed ),
     JS_CFUNC_STEP_DEF("sort", 1, STEPDEF_ARRAY_SORT ),
@@ -64241,7 +64282,7 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
             sep = js_dup(jsc->empty);
             sep1 = js_dup(jsc->empty);
         }
-        v = js_array_push(ctx, jsc->stack, 1, vc(&val), 0);
+        v = js_int32(js_array_private_push(ctx, jsc->stack, val));
         if (check_exception_free(ctx, v))
             goto exception;
         ret = js_is_array(ctx, val);
@@ -64322,7 +64363,7 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
             }
             string_buffer_putc8(jsc->b, '}');
         }
-        if (check_exception_free(ctx, js_array_pop(ctx, jsc->stack, 0, NULL, 0)))
+        if (js_array_private_pop(ctx, jsc->stack) < 0)
             goto exception;
         JS_FreeValue(ctx, val);
         JS_FreeValue(ctx, tab);
@@ -66462,7 +66503,7 @@ static JSValue js_map_groupBy(JSContext *ctx, JSValueConst this_val,
             JS_FreeValue(ctx, res);
         }
 
-        res = js_array_push(ctx, prop, 1, vc(&v), /*unshift*/0);
+        res = js_int32(js_array_private_push(ctx, prop, v));
         if (JS_IsException(res))
             goto exception;
         // res is an int64
