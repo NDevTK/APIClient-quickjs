@@ -22437,10 +22437,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 /* the iterable-consuming builtins (Array.from / Object.fromEntries / Iterator.from / it.* / s.union /
                    TypedArray.from / Promise.all|allSettled|any|race) are recognized in ONE place, do_consumer_dispatch,
                    which this opcode's convergence (goto do_generic_callee below) passes through — see that label. */
-                /* for await (x of syncGen): the async-from-sync wrapper's .next() (no arg) over a sync GENERATOR — its
-                   .next() would drive syncGen.next() to completion. Route syncGen.next() onto the tramp; the settle
-                   wraps {value,done} in a promise (do_async_from_sync_step). call_argv[-2]=wrapper, [-1]=its .next. */
-                if (JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT) {   /* async-from-sync .next() or .next(v) over a sync GENERATOR */
+                /* for await (x of syncIter): the async-from-sync wrapper's .next() drives the WRAPPED iterator's
+                   .next() and wraps its {value,done} in a promise. js_async_from_sync_iterator_next did that
+                   drive with JS_IteratorNext2 -> JS_Call from C. It used to be routed only when the sync source
+                   was a live GENERATOR — every other one fell to that C entry, so a hand-written `for await`
+                   source with a loop in its .next() aborted at its back-edge. What the wrapper is, is a fact
+                   about the CALLEE; what the source is, is not, and the drive answers it.
+                   call_argv[-2] = the wrapper, [-1] = its .next. */
+                if (JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT) {
                     JSObject *mp = JS_VALUE_GET_OBJ(call_argv[-1]);
                     if (mp->class_id == JS_CLASS_C_FUNCTION && mp->u.cfunc.cproto == JS_CFUNC_generic_magic
                         && mp->u.cfunc.c_function.generic_magic == js_async_from_sync_iterator_next
@@ -22448,13 +22452,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         && JS_VALUE_GET_TAG(call_argv[-2]) == JS_TAG_OBJECT) {
                         JSObject *wp = JS_VALUE_GET_OBJ(call_argv[-2]);
                         if (wp->class_id == JS_CLASS_ASYNC_FROM_SYNC_ITERATOR && wp->u.async_from_sync_iterator_data) {
-                            JSValueConst si = ((JSAsyncFromSyncIteratorData *)wp->u.async_from_sync_iterator_data)->sync_iter;
-                            if (JS_VALUE_GET_TAG(si) == JS_TAG_OBJECT) {
-                                JSObject *sip = JS_VALUE_GET_OBJ(si);
-                                if (sip->class_id == JS_CLASS_GENERATOR && sip->u.generator_data) {
-                                    tramp_is_tail = (opcode == OP_tail_call_method); goto do_async_from_sync_tramp;
-                                }
-                            }
+                            tramp_is_tail = (opcode == OP_tail_call_method); goto do_async_from_sync_tramp;
                         }
                     }
                 }
@@ -23763,6 +23761,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         TAKE_CALL_SHAPE();
                         cont_st = dcs;
                         goto do_promise_all_deliver;
+                    }
+                    if (dck == CONT_ASYNC_FROM_SYNC) {
+                        TAKE_CALL_SHAPE();
+                        cont_st = dcs;
+                        goto do_afs_deliver;
                     }
                     if (dck == CONT_STEP || dck == CONT_TOPRIM) {
                         /* a SEQUENCE's call — a step machine's callback, the ToPrimitive method walk. Its operands
@@ -25528,6 +25531,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                      ? sp[-4] : call_argv[-2]);
                 JSObject *wp = JS_VALUE_GET_OBJ(wrap);
                 JSAsyncFromSyncIteratorData *ws = wp->u.async_from_sync_iterator_data;
+                JSValueConst afs_next = ws->next_method;   /* the record's nextMethod, borrowed via the wrapper */
                 JSAsyncFromSync *s = js_mallocz(ctx, sizeof(*s));
                 JSValue prom;
                 if (unlikely(!s)) { JS_ThrowOutOfMemory(ctx); goto exception; }
@@ -25589,14 +25593,43 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     cont_st = s;
                     goto do_async_from_sync_abrupt;   /* rejects s->promise and delivers it per s->deliver */
                 }
-                tramp_cont_state = s; tramp_cont_kind = CONT_ASYNC_FROM_SYNC; tramp_gen_cont_iter = s->sync_iter;
-                tramp_gen_cont_arg = afs_close ? JS_UNDEFINED
-                                   : (afs_mode == AFS_DELIVER_ITERNEXT ? sp[-1]
-                                      : (call_argc >= 1 ? call_argv[0] : JS_UNDEFINED));   /* forward the resume value to syncGen.next(v); close forwards none */
-                tramp_gen_cont_consume = 1; tramp_gen_magic = afs_close ? GEN_MAGIC_RETURN : GEN_MAGIC_NEXT;
-                goto do_generator_tramp;
+                if (afs_close || tramp_gen_method_magic(afs_next, s->sync_iter) == GEN_MAGIC_NEXT) {
+                    /* a GENERATOR source (and every close, which OP_iterator_close only routes for one): its body
+                       runs on this chain and the settle re-enters the step. */
+                    tramp_cont_state = s; tramp_cont_kind = CONT_ASYNC_FROM_SYNC; tramp_gen_cont_iter = s->sync_iter;
+                    tramp_gen_cont_arg = afs_close ? JS_UNDEFINED
+                                       : (afs_mode == AFS_DELIVER_ITERNEXT ? sp[-1]
+                                          : (call_argc >= 1 ? call_argv[0] : JS_UNDEFINED));   /* forward the resume value to syncGen.next(v); close forwards none */
+                    tramp_gen_cont_consume = 1; tramp_gen_magic = afs_close ? GEN_MAGIC_RETURN : GEN_MAGIC_NEXT;
+                    goto do_generator_tramp;
+                }
+                /* every other sync source: the ONE .next() drive, which unwraps, hands a helper to its own step,
+                   and sends every remaining callee kind to the convergence point. 27.1.4.4 forwards no resume
+                   value to a plain .next() — only the generator arm above does, because only a generator has a
+                   suspended body to resume with one. */
+                DCHECK(sp + 2 <= TRAMP_SP_LIMIT(sf),
+                       "async-from-sync drive: operand push exceeds the frame's compiled stack_size");
+                { JSValueConst di = s->sync_iter, dn = afs_next;
+                  TRAMP_DRIVE_ITER_NEXT(di, dn, s, CONT_ASYNC_FROM_SYNC, NULL); }
             }
 
+        do_afs_deliver:
+            /* THE delivery of a driven sync .next(). Its operands are dropped and IteratorNext's step 3 applied —
+               the result must be an Object — before the wrap. A failure REJECTS the wrapper's promise rather than
+               throwing: the caller is awaiting, so an escaping throw would be the wrong completion entirely. */
+            {
+                JSValue *cargv = sp - call_pop;
+                DCHECK(call_pop >= call_first_r, "async-from-sync drive records operands ending below where they start");
+                for (i = call_first_r; i < call_pop; i++) JS_FreeValue(ctx, cargv[i]);
+                sp += call_first_r - call_pop;
+                if (unlikely(JS_IsException(ret_val))) goto do_async_from_sync_abrupt;
+                if (unlikely(!JS_IsObject(ret_val))) {
+                    JS_FreeValue(ctx, ret_val);
+                    JS_ThrowTypeError(ctx, "iterator result not an object");
+                    goto do_async_from_sync_abrupt;
+                }
+            }
+            /* fall through */
         do_async_from_sync_step:
             /* ret_val = the {value,done} from syncGen.next() (direct-mode settle). Wrap it as the async-from-sync
                .next() would — value_wrapper = Promise.resolve(value); result settles via then(unwrap) — then pop the
@@ -25674,6 +25707,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 JSAsyncFromSync *s = (JSAsyncFromSync *)cont_st;
                 JSValue err = JS_GetException(ctx), rr2, r;
+                (void)0;
                 int cfirst = s->orig_cfirst, cargc = s->orig_cargc; uint8_t itail = s->orig_is_tail, deliver = s->deliver;
                 JSValue *cargv;
                 rr2 = JS_Call(ctx, s->resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
@@ -26659,6 +26693,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     call_first_r = cfirst; call_pop = cargc;
                     cont_st = rcs;
                     goto do_promise_all_deliver;
+                }
+                if (rck == CONT_ASYNC_FROM_SYNC) {
+                    call_first_r = cfirst; call_pop = cargc;
+                    cont_st = rcs;
+                    goto do_afs_deliver;
                 }
                 if (rck == CONT_ITER_HELPER) {
                     /* the map/filter callback returned: resume the helper step with its result. do_tramp_call DUPS
@@ -30635,6 +30674,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         } else if (xck == CONT_SETTER || xck == CONT_PROXY_CONSTRUCT || xck == CONT_INSTANCEOF) {
             /* a throwing setter body, or a throwing proxy `construct` trap: no continuation state; the operands are
                on the caller stack and freed by the caller's own catch-search, exactly like a normal method call. */
+        } else if (xck == CONT_ASYNC_FROM_SYNC) {
+            /* a driven sync .next() THREW while `for await` was awaiting the wrapper's promise. Like the Promise
+               combinators, the wrapper must REJECT that promise and yield it — an escaping throw would be the
+               wrong completion for an awaiting caller. The abrupt arm owns the reject and the operand pop; all
+               this owes is the DRIVE's own operands, which sit above the original call's. */
+            JSValue *cargv = sp - xcg;
+            DCHECK(xcg >= xcf, "async-from-sync drive records operands ending below where they start");
+            for (i = xcf; i < xcg; i++) JS_FreeValue(ctx, cargv[i]);
+            sp += xcf - xcg;
+            cont_st = xcs;
+            goto do_async_from_sync_abrupt;
         } else if (xck == CONT_PROMISE_ALL) {
             /* a Promise combinator callback driven on the tramp threw — a plain iterator's .next(), or the
                aggregate resolve/reject settle for a custom Promise subclass. PerformPromiseAll's abrupt handling
