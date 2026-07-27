@@ -24024,6 +24024,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         tramp_consume_acquired = JS_EXCEPTION;
                         goto do_consume_deliver_iterator;
                     }
+                    if (gk3 == CONT_ITER_CONSUME) {
+                        /* A CONSUME machine is NOT a step machine — JSIterConsume has no JSStepHdr — so tearing it
+                           down through the step chain read its first JSValue field as a JSTrampStepDef * and
+                           called through it. `Object.fromEntries([revokedProxy])` segfaulted on that: the entry's
+                           read throws IN PLACE (get_proxy_method on a revoked handler), which is exactly the case
+                           this label exists for. Hand the throw to the machine instead, the same way the SUSPENDED
+                           read's delivery does — the consume step owns IfAbruptCloseIterator and closes the source
+                           before the exception propagates. */
+                        cont_st = gouter;
+                        ret_val = JS_EXCEPTION;
+                        goto do_iter_consume_step;
+                    }
+                    DCHECK(gk3 == CONT_STEP, "property-get outer continuation: unknown machine kind");
                     tramp_step_chain_free(ctx, gouter);
                     goto exception;
                 }
