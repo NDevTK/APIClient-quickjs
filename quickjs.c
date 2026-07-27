@@ -1462,6 +1462,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_NUM_TOEXPONENTIAL, STEPDEF_NUM_TOPRECISION, STEPDEF_NUM_CTOR,
     STEPDEF_ITERATOR_CTOR, STEPDEF_ARRAY_OF, STEPDEF_ARRAY_CONCAT,
     STEPDEF_WEAKREF_CTOR, STEPDEF_FINREC_CTOR, STEPDEF_ARRAY_SLICE, STEPDEF_ARRAY_SPLICE,
+    STEPDEF_ARRAY_CTOR,
     STEPDEF_DOMEXCEPTION_CTOR,
     STEPDEF_COUNT
 };
@@ -9227,7 +9228,9 @@ static JSValue js_bytecode_autoinit(JSContext *ctx, JSObject *p, JSAtom atom,
     case JS_BUILTIN_ARRAY_FROMASYNC:
         {
             JSValue argv[] = {
-                JS_NewCFunction(ctx, js_array_constructor, "Array", 0),
+                /* the same builtin the global one is: a step ctor, so the helper's `new C(n)` performs
+                   new.target's `prototype` read on the tramp like any other construct */
+                JS_NewCFunctionMagic(ctx, NULL, "Array", 1, JS_CFUNC_step_ctor, STEPDEF_ARRAY_CTOR),
                 JS_NewCFunctionMagic(ctx, js_error_constructor, "TypeError",
                                      1, JS_CFUNC_constructor_or_func_magic,
                                      JS_TYPE_ERROR),
@@ -18385,6 +18388,100 @@ static int step_species_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSVa
         h->spc_phase = SPC_START;
         *pout = in;
         return 0;
+    }
+}
+
+/* TypedArraySpeciesCreate (23.2.4.1) as a RESUMABLE sub-sequence — the same shape and the same phases as
+   ArraySpeciesCreate above. Three of its steps run the page's code: Get(O,"constructor"), Get(C,@@species) and
+   the Construct. js_typed_array___speciesCreate performed all three from C, so `%TypedArray%[@@species]` set to
+   a constructor with a loop in it had no flow base — and once a builtin constructor is a STEP MACHINE that C
+   path cannot run it at all, which is what `ta.map(fn)` with the species set to Array proved.
+   What differs from the array form is only the two ends: the default is the exemplar's OWN intrinsic
+   constructor, and the constructed value is validated as a typed array long enough for the request
+   (TypedArrayCreateFromConstructor). The middle is identical, which is why the phases are shared.
+     0   = *pout holds the created typed array
+     4/6 = the caller must return that step code; it will be re-entered at the same stage
+     -1  = threw. */
+static int js_typed_array_get_length_unsafe(JSContext *ctx, JSValueConst obj);
+
+static int step_ta_species_finish(JSContext *ctx, JSStepHdr *h, JSValue ctor, JSValueConst len_val,
+                                  int class_id, JSValue *pout, JSValue **out_cb, int *out_argc)
+{
+    if (JS_IsUndefined(ctor)) {
+        h->spc_phase = SPC_START;
+        *pout = js_typed_array_constructor(ctx, JS_UNDEFINED, 1, &len_val, class_id);
+        return JS_IsException(*pout) ? -1 : 0;
+    }
+    if (!JS_IsConstructor(ctx, ctor)) {   /* SpeciesConstructor step 7 */
+        JS_FreeValue(ctx, ctor);
+        h->spc_phase = SPC_START;
+        JS_ThrowTypeError(ctx, "not a constructor");
+        return -1;
+    }
+    h->coerce = ctor;                     /* owned across the Construct */
+    h->cb_coerce[0] = ctor;               /* borrowed view */
+    h->cb_coerce[1] = (JSValue)len_val;   /* a number: no ownership to transfer */
+    *out_cb = h->cb_coerce; *out_argc = 1;
+    h->spc_phase = SPC_CONSTRUCT;
+    return 4;
+}
+
+static int step_ta_species_run(JSContext *ctx, JSStepHdr *h, JSValueConst exemplar, JSValue in,
+                               JSValueConst len_val, int class_id, bool require_mutable,
+                               JSValue *pout, JSValue **out_cb, int *out_argc)
+{
+    JSValue ctor;
+    switch (h->spc_phase) {
+    case SPC_START:
+        JS_FreeValue(ctx, in);
+        h->cb_coerce[0] = (JSValue)exemplar;   /* borrowed: the machine holds the receiver */
+        *out_cb = h->cb_coerce; *out_argc = (int)JS_ATOM_constructor;
+        h->spc_phase = SPC_CTOR;
+        return 6;
+    case SPC_CTOR:
+        ctor = in;
+        if (JS_IsUndefined(ctor))   /* SpeciesConstructor step 2 */
+            return step_ta_species_finish(ctx, h, JS_UNDEFINED, len_val, class_id, pout, out_cb, out_argc);
+        if (!JS_IsObject(ctor)) {   /* step 3 */
+            JS_FreeValue(ctx, ctor);
+            h->spc_phase = SPC_START;
+            JS_ThrowTypeError(ctx, "not an object");
+            return -1;
+        }
+        h->coerce = ctor;                 /* owned across the @@species read */
+        h->cb_coerce[0] = ctor;           /* borrowed view */
+        *out_cb = h->cb_coerce; *out_argc = (int)JS_ATOM_Symbol_species;
+        h->spc_phase = SPC_SPECIES;
+        return 6;
+    case SPC_SPECIES:
+        JS_FreeValue(ctx, h->coerce);
+        h->coerce = JS_UNDEFINED;
+        ctor = (JS_IsNull(in) || JS_IsUndefined(in)) ? (JS_FreeValue(ctx, in), JS_UNDEFINED) : in;
+        return step_ta_species_finish(ctx, h, ctor, len_val, class_id, pout, out_cb, out_argc);
+    default: {
+        int new_len;
+        int64_t want;
+        DCHECK(h->spc_phase == SPC_CONSTRUCT, "TypedArraySpeciesCreate resumed in an unknown phase");
+        JS_FreeValue(ctx, h->coerce);
+        h->coerce = JS_UNDEFINED;
+        h->spc_phase = SPC_START;
+        /* TypedArrayCreateFromConstructor's validation, on the object the page's constructor returned. */
+        new_len = js_typed_array_get_length_unsafe(ctx, in);
+        if (new_len < 0) goto fail;
+        if (require_mutable && typed_array_is_immutable(JS_VALUE_GET_OBJ(in))) {
+            JS_ThrowTypeErrorImmutableArrayBuffer(ctx);
+            goto fail;
+        }
+        if (JS_ToLengthFree(ctx, &want, js_dup(len_val))) goto fail;
+        if (new_len < want) {
+            JS_ThrowTypeError(ctx, "TypedArray length is too small");
+        fail:
+            JS_FreeValue(ctx, in);
+            return -1;
+        }
+        *pout = in;
+        return 0;
+    }
     }
 }
 
@@ -52930,18 +53027,22 @@ fail:
     return JS_EXCEPTION;
 }
 
-/* 23.1.1.1 in full. Its `prototype` read is still performed HERE, from C, and exactly ONE C CONSTRUCT site is
-   left to explain why: TypedArraySpeciesCreate. `%TypedArray%[@@species]` is the page's, so `ta.map(fn)` with the
-   species set to Array constructs THIS from js_typed_array___speciesCreate, which the two TypedArray map/filter
-   machines call from C — and a step-machine constructor cannot be run from there at all. Four sites came before
-   it and are gone: js_array_of's Construct, JS_ArraySpeciesCreate's concat and slice/splice (deleted with it),
-   and Array.from's iterable-branch Construct. Converting the constructor before the fifth turns `ta.map` into an
-   abort, which is the order this file keeps. */
+/* The INTERNAL array creations — JS_NewArrayFrom's length form, a RegExp split result, an iterator helper's
+   buffer — pass NO new.target, so OrdinaryCreateFromConstructor degenerates to the intrinsic prototype and runs
+   nothing. That is a genuinely different computation from the constructor's, not a fallback for it: a REAL
+   new.target has a `prototype` read to perform, and that read is the page's code, so it reaches the
+   STEPDEF_ARRAY_CTOR machine. Five C CONSTRUCT sites had to become machines before this could say so, each one
+   found by converting the constructor and watching the corpus name the next: js_array_of's Construct,
+   JS_ArraySpeciesCreate's concat and slice/splice (deleted with it), Array.from's iterable-branch Construct, and
+   TypedArraySpeciesCreate (deleted with its C twin). */
 static JSValue js_array_constructor(JSContext *ctx, JSValueConst new_target,
                                     int argc, JSValueConst *argv)
 {
     JSValue obj;
-    obj = js_create_from_ctor(ctx, new_target, JS_CLASS_ARRAY);
+    DCHECK(JS_IsUndefined(new_target),
+           "the Array constructor reached its C entry with a real new.target — its `prototype` read is the page's "
+           "code and belongs on the tramp; route that call site onto the STEPDEF_ARRAY_CTOR machine");
+    obj = js_create_from_ctor(ctx, JS_UNDEFINED, JS_CLASS_ARRAY);
     if (JS_IsException(obj))
         return obj;
     return js_array_ctor_body(ctx, obj, argc, argv);
@@ -54919,10 +55020,6 @@ static int js_typed_array_get_length_unsafe(JSContext *ctx, JSValueConst obj)
     return p->u.array.count;
 }
 
-static JSValue js_typed_array___speciesCreate(JSContext *ctx,
-                                              JSValueConst this_val,
-                                              int argc, JSValueConst *argv,
-                                              bool require_mutable);
 
 
 /* One coroutine step: PROCESS the previous callback's `res` (for element pending_k), then ADVANCE to the next
@@ -55031,10 +55128,15 @@ static int js_array_every_seed(JSContext *ctx, JSArrayEvery *s, JSValue in,
 {
     JSValueConst args[2];
 
-    if (s->hdr.spc_phase != SPC_START)   /* mid-ArraySpeciesCreate: the checks below already ran */
+    if (s->hdr.spc_phase != SPC_START) {   /* mid-SpeciesCreate: the checks below already ran */
+        if (s->special == (special_map | special_TA))
+            return step_ta_species_run(ctx, &s->hdr, s->obj, in, js_int64(s->len),
+                                       JS_VALUE_GET_OBJ(s->obj)->class_id, true,
+                                       &s->ret, out_cb, out_argc);
         return step_species_run(ctx, &s->hdr, s->obj, in,
                                 s->special == special_map ? js_int64(s->len) : js_int32(0),
                                 &s->ret, out_cb, out_argc);
+    }
     JS_FreeValue(ctx, in);
     s->func = step_arg(&s->hdr, 0);
     s->this_arg = step_arg(&s->hdr, 1);
@@ -55057,11 +55159,9 @@ static int js_array_every_seed(JSContext *ctx, JSArrayEvery *s, JSValue in,
         return step_species_run(ctx, &s->hdr, s->obj, JS_UNDEFINED, js_int32(0),
                                 &s->ret, out_cb, out_argc);
     case special_map | special_TA:
-        args[0] = s->obj;
-        args[1] = js_int32(s->len);
-        s->ret = js_typed_array___speciesCreate(ctx, JS_UNDEFINED, 2, args, true);
-        if (JS_IsException(s->ret)) return -1;
-        break;
+        return step_ta_species_run(ctx, &s->hdr, s->obj, JS_UNDEFINED, js_int64(s->len),
+                                   JS_VALUE_GET_OBJ(s->obj)->class_id, true,
+                                   &s->ret, out_cb, out_argc);
     case special_filter | special_TA:
         s->ret = JS_NewArray(ctx);
         if (JS_IsException(s->ret)) return -1;
@@ -55108,6 +55208,18 @@ static int js_array_every_vstep(JSContext *ctx, void *st, JSValue cb_result, JSV
         if (r) return r < 0 ? -1 : r;
         s->hdr.stage = 3;
     }
+    if (s->hdr.stage == 6) {   /* filter|TA: species-create the destination, then read its `set` */
+    ta_filter_dest:
+        r = step_ta_species_run(ctx, &s->hdr, s->obj, cb_result, js_int64(s->n),
+                                JS_VALUE_GET_OBJ(s->obj)->class_id, true,
+                                &s->ta_dest, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 4;
+        s->hdr.cb_coerce[0] = s->ta_dest;     /* borrowed: the state holds it */
+        *out_cb = s->hdr.cb_coerce; *out_argc = (int)JS_ATOM_set;
+        return 6;
+    }
     if (s->hdr.stage == 4) {   /* filter|TA: the destination's `set` method arrived */
         JSValue m = cb_result;
         s->hdr.stage = 5;
@@ -55141,15 +55253,11 @@ static int js_array_every_vstep(JSContext *ctx, void *st, JSValue cb_result, JSV
         if (s->special != (special_filter | special_TA))
             return 0;
         /* the elements are collected in a plain array; the RESULT is a species-created typed array they are
-           written into with its own `set`. Both the create and that method read run the page's code. */
-        { JSValueConst a2[2];
-          a2[0] = s->obj; a2[1] = js_int32(s->n);
-          s->ta_dest = js_typed_array___speciesCreate(ctx, JS_UNDEFINED, 2, a2, true);
-          if (JS_IsException(s->ta_dest)) { s->ta_dest = JS_UNDEFINED; return -1; } }
-        s->hdr.stage = 4;
-        s->hdr.cb_coerce[0] = s->ta_dest;     /* borrowed: the state holds it */
-        *out_cb = s->hdr.cb_coerce; *out_argc = (int)JS_ATOM_set;
-        return 6;
+           written into with its own `set`. Both the create and that method read run the page's code, so both
+           are stages — the create's three steps included. */
+        s->hdr.stage = 6;
+        cb_result = JS_UNDEFINED;   /* consumed by the walk above */
+        goto ta_filter_dest;
     }
     /* cb_args is [this, func, val, idx, obj] — already the method-call shape the driver wants */
     s->cb_args[0] = s->this_arg;
@@ -55756,6 +55864,9 @@ static const JSTrampStepDef js_array_of_def = { sizeof(JSArrayOf), js_array_of_s
 static int js_array_concat_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_array_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_slice_fini(JSContext *ctx, void *st, bool take_result);
+static JSValue js_array_ctor_body(JSContext *ctx, JSValueConst obj_, int argc, JSValueConst *argv);
+static const JSTrampStepDef js_array_ctor_def =
+    CREATECTOR_DEF(JS_CLASS_ARRAY, 0, generic, js_array_ctor_body, 0);
 static const JSTrampStepDef js_array_slice_def  =
     { sizeof(JSArraySlice), js_array_slice_step, js_array_slice_fini, 0 };
 static const JSTrampStepDef js_array_splice_def =
@@ -55967,6 +56078,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_ITERATOR_CTOR] = &js_iterator_ctor_def,
     [STEPDEF_ARRAY_OF]      = &js_array_of_def,
     [STEPDEF_ARRAY_CONCAT]  = &js_array_concat_def,
+    [STEPDEF_ARRAY_CTOR]    = &js_array_ctor_def,
     [STEPDEF_ARRAY_SLICE]   = &js_array_slice_def,
     [STEPDEF_ARRAY_SPLICE]  = &js_array_splice_def,
     [STEPDEF_WEAKREF_CTOR]  = &js_weakref_ctor_def,
@@ -71866,7 +71978,7 @@ int JS_AddIntrinsicBaseObjects(JSContext *ctx)
 
     /* Array */
     obj1 = JS_NewCConstructor(ctx, JS_CLASS_ARRAY, "Array",
-                              js_array_constructor, 1, JS_CFUNC_constructor_or_func, 0,
+                              NULL, 1, JS_CFUNC_step_ctor, STEPDEF_ARRAY_CTOR,
                               JS_UNDEFINED,
                               js_array_funcs, countof(js_array_funcs),
                               js_array_proto_funcs, countof(js_array_proto_funcs),
@@ -73115,33 +73227,6 @@ static JSValue js_typed_array_create(JSContext *ctx, JSValueConst ctor,
     return ret;
 }
 
-static JSValue js_typed_array___speciesCreate(JSContext *ctx,
-                                              JSValueConst this_val,
-                                              int argc, JSValueConst *argv,
-                                              bool require_mutable)
-{
-    JSValueConst obj;
-    JSObject *p;
-    JSValue ctor, ret;
-    int argc1;
-
-    obj = argv[0];
-    p = get_typed_array(ctx, obj);
-    if (!p)
-        return JS_EXCEPTION;
-    ctor = JS_SpeciesConstructor(ctx, obj, JS_UNDEFINED);
-    if (JS_IsException(ctor))
-        return ctor;
-    argc1 = max_int(argc - 1, 0);
-    if (JS_IsUndefined(ctor)) {
-        ret = js_typed_array_constructor(ctx, JS_UNDEFINED, argc1, argv + 1,
-                                         p->class_id);
-    } else {
-        ret = js_typed_array_create(ctx, ctor, argc1, argv + 1, require_mutable);
-        JS_FreeValue(ctx, ctor);
-    }
-    return ret;
-}
 
 static JSValue js_typed_array_from(JSContext *ctx, JSValueConst this_val,
                                    int argc, JSValueConst *argv)
