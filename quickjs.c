@@ -18033,6 +18033,19 @@ typedef struct JSTrampStepDef {
        a coercion was actually in flight, because a body that threw has already run its own cleanup. */
     void     (*onerror)(JSContext *ctx, JSValueConst this_val, int magic);
 } JSTrampStepDef;
+/* The SINK a consuming builtin declares at its definition, or -1. The same shape as tramp_step_def_of: the
+   callee carries the capability, so the interpreter asks one question rather than testing it against a list of
+   function pointers. Every such recognizer could only exist while a legacy JS_Call-loop body survived for it to
+   choose against; where that body is already a DFAIL, the identity test is pure residue. */
+static inline int tramp_consume_sink_of(JSValueConst func)
+{
+    JSObject *fp;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return -1;
+    fp = JS_VALUE_GET_OBJ(func);
+    if (fp->class_id != JS_CLASS_C_FUNCTION) return -1;
+    if (fp->u.cfunc.cproto != JS_CFUNC_consume) return -1;
+    return fp->u.cfunc.magic;
+}
 static const JSTrampStepDef *tramp_step_def_of(JSValueConst func);
 static const JSTrampStepDef *tramp_step_ctor_def_of(JSValueConst func);
 /* the def a STEPDEF_* id names. A CALL reaches its def through the callee object; an OPCODE that drives a machine
@@ -18965,6 +18978,13 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
         }
         break;
     case JS_CFUNC_step_ctor:
+    case JS_CFUNC_consume:
+        /* A consuming builtin reached OUTSIDE the interpreter's dispatch. There is no body to run — the walk IS
+           the consume machine, which needs a tramp chain — so this names the unrouted call site rather than
+           driving the source's .next() to completion from here. */
+        DFAIL("a declared consume builtin was invoked outside the interpreter's dispatch — route that call site "
+              "onto do_consumer_dispatch; there is no second driver");
+        return JS_ThrowTypeError(ctx, "consume builtin not on the trampoline");
     case JS_CFUNC_step:
         {
             /* A step builtin reached OUTSIDE the interpreter's dispatch (a host JS_Call). It runs the SAME step
@@ -20149,8 +20169,6 @@ static bool iter_consume_gen_backed(JSContext *ctx, JSValueConst items, JSValue 
 static bool tramp_can_call_iter_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, JSValue *out_getiter, uint8_t *out_sink);
 static JSValue js_map_constructor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv, int magic);
 static bool tramp_can_call_setmap_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_magic, JSValue *out_getiter);
-static JSValue js_object_fromEntries(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
-static bool tramp_can_call_objentries_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, JSValue *out_getiter);
 static bool tramp_can_call_setop_consume(JSValueConst func, JSValueConst this_val, JSValueConst *call_argv, int call_argc, uint8_t *out_setop);
 static int check_function(JSContext *ctx, JSValueConst obj);
 static void iter_helper_close_source_abrupt(JSContext *ctx, JSIteratorHelperData *it);
@@ -23331,8 +23349,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto do_iterterm_tramp;                     /* it.toArray/forEach/reduce/some/every/find */
                 if (tramp_can_call_iterator_from(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter))
                     goto do_iterfrom_tramp;                     /* Iterator.from(obj) */
-                if (tramp_can_call_objentries_consume(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter))
-                    goto do_objentries_consume_tramp;           /* Object.fromEntries(iterable) */
+                {   /* THE declared-capability arm. A builtin that consumes an iterator says so at its own
+                       definition (JS_CFUNC_CONSUME_DEF) and carries its sink, so this asks ONE question for all
+                       of them instead of one identity test per builtin. The recognizers below are the ones whose
+                       legacy body still exists to be chosen against; each conversion moves one up here. */
+                    int csink = tramp_consume_sink_of(call_argv[-1]);
+                    if (csink >= 0) {
+                        DCHECK(csink == ITERCONS_OBJENTRIES,
+                               "a builtin declared a consume sink the dispatch does not route yet");
+                        /* the probe is an OPTIMISATION, not a gate: when @@iterator is already readable
+                           side-effect-free the acquire skips re-reading it, and otherwise the acquire performs
+                           the whole of GetIterator on the tramp. */
+                        tramp_iter_getiter = JS_UNDEFINED;
+                        if (call_argc >= 1) iter_data_at_iterator(ctx, call_argv[0], &tramp_iter_getiter);
+                        goto do_objentries_consume_tramp;       /* Object.fromEntries(iterable) */
+                    }
+                }
                 if (tramp_can_call_ta_from_consume(ctx, call_argv[-1], crecv, vc(call_argv), call_argc, &ta_classid, &tramp_iter_getiter)) {
                     tac_args = vc(call_argv); tac_argc = call_argc; tac_ntgt = crecv;
                     /* this arm records its shape LATER, in do_ta_consume_tramp, so it is the one that has to carry
@@ -52323,16 +52355,9 @@ int JS_FreezeObject(JSContext *ctx, JSValueConst obj)
     return result;
 }
 
-static JSValue js_object_fromEntries(JSContext *ctx, JSValueConst this_val,
-                                     int argc, JSValueConst *argv)
-{
-    /* NOTHING is left here. The recognizer accepts every source now that the acquire performs the whole of
-       GetIterator on the tramp — including the not-iterable TypeError, which was the last thing this entry did.
-       Reaching it means a CALL SITE was not routed, which is a bug to fix there and not a body to keep for it. */
-    DFAIL("Object.fromEntries reached its C entry — every source routes to the consume machine; route that call "
-          "site");
-    return JS_ThrowTypeError(ctx, "Object.fromEntries not on the consume machine");
-}
+/* DELETED: js_object_fromEntries. Its body was already only a DFAIL; with the capability declared at the
+   definition there is no function pointer left to name it, and js_call_c_function's JS_CFUNC_consume arm is the
+   one backstop for a call site that was never routed. */
 
 static JSValue js_object_is(JSContext *ctx, JSValueConst this_val,
                             int argc, JSValueConst *argv)
@@ -52532,7 +52557,7 @@ static const JSCFunctionListEntry js_object_funcs[] = {
     JS_CFUNC_MAGIC_DEF("freeze", 1, js_object_seal, 1 ),
     JS_CFUNC_MAGIC_DEF("isSealed", 1, js_object_isSealed, 0 ),
     JS_CFUNC_MAGIC_DEF("isFrozen", 1, js_object_isSealed, 1 ),
-    JS_CFUNC_DEF("fromEntries", 1, js_object_fromEntries ),
+    JS_CFUNC_CONSUME_DEF("fromEntries", 1, ITERCONS_OBJENTRIES ),
     JS_CFUNC_DEF("hasOwn", 2, js_object_hasOwn ),
 };
 
@@ -54290,27 +54315,9 @@ static bool tramp_can_call_iterterm(JSContext *ctx, JSValueConst func, JSValueCo
     return true;
 }
 
-static bool tramp_can_call_objentries_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, JSValue *out_getiter)
-{
-    JSObject *fp;
-    *out_getiter = JS_UNDEFINED;
-    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
-    fp = JS_VALUE_GET_OBJ(func);
-    if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
-    if (fp->u.cfunc.cproto != JS_CFUNC_generic) return false;
-    if (fp->u.cfunc.c_function.generic != js_object_fromEntries) return false;
-    /* EVERY source. There is nothing left to SELECT: the acquire performs the whole of GetIterator — the @@iterator
-       READ on the tramp (a getter, a Proxy trap), the nullish and non-callable TypeErrors, the Call — and the
-       machine performs the whole of the walk including IfAbruptCloseIterator. The probe is passed along only as an
-       optimisation: when it already read a callable @@iterator side-effect-free, the acquire skips re-reading it.
-       (This used to refuse a source whose @@iterator the probe could not read, and said so at length, because the
-       acquire's read ran from C. That capability is built; the refusal goes with it, which is what the note asked
-       for.) */
-    /* argc 0 is not a reason to refuse either: `Object.fromEntries()` is GetIterator(undefined)'s TypeError, which
-       the acquire raises like any other. Refusing it sent it to a C entry that no longer has a body. */
-    if (call_argc >= 1) iter_data_at_iterator(ctx, call_argv[0], out_getiter);
-    return true;
-}
+/* DELETED: tramp_can_call_objentries_consume. Object.fromEntries declares its sink at its own definition now
+   (JS_CFUNC_CONSUME_DEF), so there is no identity test to make: its C body was already a DFAIL, which is exactly
+   the state in which a recognizer is pure residue — it was choosing against something that no longer exists. */
 
 /* Route new TypedArray(iterable) — js_typed_array_constructor_obj collects it (js_array_from_iterator) in a C loop,
    driving the argument's .next(). The gate is the shared iter_consume_gen_backed, so this widened with it: a plain

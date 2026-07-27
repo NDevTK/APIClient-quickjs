@@ -1440,6 +1440,10 @@ typedef enum JSCFunctionEnum {  /* XXX: should rename for namespace isolation */
        cannot be parked. So the builtin IS a step machine — there is no JS_Call loop version of it to fall back
        to — and `magic` indexes its row in the step table. */
     JS_CFUNC_step,
+    JS_CFUNC_consume,     /* a builtin that CONSUMES an iterator in a loop. The sink (ITERCONS_*) is in magic, so
+                             the callee CARRIES which walk it wants and the interpreter asks ONE question instead
+                             of a per-builtin identity test. Same shape as JS_CFUNC_step: the function pointer is
+                             unused, because there is no C body left to call. */
     JS_CFUNC_step_ctor,   /* a step machine that is ALSO a constructor (String): `new C(x)` and `C(x)` are two
                              spellings of one builtin, and which one ran is already carried by the receiver slot
                              (new_target for a construct, undefined for a call). Separate from JS_CFUNC_step only
@@ -1555,6 +1559,7 @@ typedef struct JSCFunctionListEntry {
    incapable of silently repointing an existing one. The step def is NOT stored in JSCFunctionType: that union
    holds function pointers, and putting a data pointer in it is a strict-aliasing violation that survives -O0 and
    segfaults at -O1 (measured: -fno-strict-aliasing passed, plain -O1 crashed). */
+#define JS_CFUNC_CONSUME_DEF(name, length, sink) { name, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE, JS_DEF_CFUNC, sink, { .func = { length, JS_CFUNC_consume, { .generic = NULL } } } }
 #define JS_CFUNC_STEP_DEF(name, length, stepid) { name, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE, JS_DEF_CFUNC, stepid, { .func = { length, JS_CFUNC_step, { .generic = NULL } } } }
 #define JS_CFUNC_STEP_CTOR_DEF(name, length, stepid) { name, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE, JS_DEF_CFUNC, stepid, { .func = { length, JS_CFUNC_step_ctor, { .generic = NULL } } } }
 #define JS_CFUNC_MAGIC_DEF(name, length, func1, magic) { name, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE, JS_DEF_CFUNC, magic, { .func = { length, JS_CFUNC_generic_magic, { .generic_magic = func1 } } } }
