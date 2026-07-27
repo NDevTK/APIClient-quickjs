@@ -18929,6 +18929,15 @@ typedef struct TrampFrame {
     int forof_off;   /* for a FOR-OF generator drive (is_tail, async_promise UNDEFINED): the iterator's caller-stack
                         offset (caller_sp[forof_off] is the generator object). Lets a concolic fork inside a for-of
                         body recover the shared generator to record its per-flow gen_data swap. Unused otherwise. */
+    uint8_t agen_fin;    /* CONT_AGEN_DRIVE: what the OPERAND SHAPE that started this drive wants done with the
+                            settlement promise — AGEN_FIN_PUSH / _PUSH_FALSE / _DISCARD. The shape is the only
+                            thing that differs between `ag.next()`, yield*'s OP_iterator_next / OP_iterator_call
+                            delegation and a for-await `break`'s OP_iterator_close, so it is the only thing they
+                            declare; everything after the enqueue is the same drive. */
+    JSValue agen_hold;   /* CONT_AGEN_DRIVE: the async-generator OBJECT, held across the body run — the receiver
+                            operand was its only reference and this frame freed it, exactly as the sync generator
+                            drive holds its receiver in async_promise. (async_promise carries the SETTLEMENT
+                            promise here, the drive's synchronous result, as it does for an async-function frame.) */
     JSValue close_saved_exc;   /* CLOSE-DURING-EXCEPTION-UNWIND (is_tail==4): the in-flight exception, saved+cleared
                                   before the generator's .return()/finally runs, restored after so the finally's own
                                   outcome never overwrites the propagating exception (spec IteratorClose completion). */
@@ -18951,6 +18960,22 @@ typedef struct TrampFrame {
 #define CONT_AGEN_CREATE   3   /* cont_state = JSAsyncGeneratorData: an async generator's params are binding on
                                   this chain (run-to-initial_yield); settles at OP_initial_yield by creating the
                                   async-generator object. Mirrors the sync gen_magic==0xFF creation frame. */
+/* The OPERAND SHAPES that can start an async-generator drive, and what each wants back. A shape declares only
+   where its receiver/argument sit and what the protocol expects on the stack afterwards — never how the body is
+   driven, which is the same for all of them. */
+#define AGEN_SHAPE_CALL      0   /* ag.next(v): [this, f, args] at call_argv, tail-able; result is the call's value */
+#define AGEN_SHAPE_ITERNEXT  1   /* OP_iterator_next (yield* delegation): iterator sp[-4], arg sp[-1] -> promise at sp[-1] */
+#define AGEN_SHAPE_ITERCALL  2   /* OP_iterator_call (yield* .return/.throw): same, plus the `false` ret_flag above it */
+#define AGEN_SHAPE_CLOSE     3   /* OP_iterator_close (break out of for-await): iterator sp[-1], promise DISCARDED */
+#define AGEN_FIN_PUSH        0
+#define AGEN_FIN_PUSH_FALSE  1
+#define AGEN_FIN_DISCARD     2
+#define CONT_AGEN_DRIVE   26   /* cont_state = JSAsyncGeneratorData: an async generator's BODY is running on this
+                                  chain, driving one queued .next()/.throw()/.return() request. At await / yield /
+                                  yield* / return / exception it settles through the ONE state machine
+                                  (js_async_generator_post) and either drives the next queued request or hands the
+                                  settlement promise back to the caller. Mirrors CONT_AGEN_CREATE, which binds the
+                                  same body's PARAMS on the chain. */
 #define CONT_CONSTRUCT     4   /* cont_state = JSConstruct: a `new C()` bytecode-constructor body runs on this
                                   chain (so a loop in the constructor body preempts the base). The created `this`
                                   rides the continuation and is substituted for a non-object body result at
@@ -19408,6 +19433,7 @@ static inline void cont_kinds_are_distinct(int k)
     switch (k) {
     case CONT_NONE:
     case CONT_AGEN_CREATE:
+    case CONT_AGEN_DRIVE:
     case CONT_CONSTRUCT:
     case CONT_SETTER:
     case CONT_ITER_CONSUME:
@@ -20836,6 +20862,29 @@ static inline int tramp_gen_method_magic(JSValueConst method, JSValueConst this_
     return mp->u.cfunc.magic;
 }
 
+static JSValue js_async_generator_next(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv,
+                                       int magic);
+static JSValue js_async_generator_enqueue(JSContext *ctx, struct JSAsyncGeneratorData *s, int magic,
+                                          JSValueConst arg);
+static int js_async_generator_pre(JSContext *ctx, struct JSAsyncGeneratorData *s);
+static int js_async_generator_post(JSContext *ctx, struct JSAsyncGeneratorData *s, JSValue func_ret);
+/* An ASYNC generator .next()/.throw()/.return() — the same question as tramp_gen_method_magic, for the async
+   class. Asked in exactly ONE place (do_generic_callee), which every call shape converges on, so a bound /
+   proxied / applied / spread `ag.next()` cannot answer differently from a plain one. Off the tramp the drive
+   declares ITSELF a flow base (js_async_generator_resume_next), which is right only when the resume IS the
+   running flow — a promise reaction. Called synchronously from a running flow it is a NESTED activation, and its
+   first back-edge then parks a flow the caller's scheduler never asked for. */
+static inline int tramp_agen_method_magic(JSValueConst method, JSValueConst this_val) {
+    JSObject *mp, *tp;
+    if (JS_VALUE_GET_TAG(method) != JS_TAG_OBJECT || JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT) return -1;
+    mp = JS_VALUE_GET_OBJ(method);
+    if (mp->class_id != JS_CLASS_C_FUNCTION || mp->u.cfunc.cproto != JS_CFUNC_generic_magic
+        || mp->u.cfunc.c_function.generic_magic != js_async_generator_next) return -1;
+    tp = JS_VALUE_GET_OBJ(this_val);
+    if (tp->class_id != JS_CLASS_ASYNC_GENERATOR || !tp->u.async_generator_data) return -1;
+    return mp->u.cfunc.magic;
+}
+
 static JSValue js_iterator_wrap_next(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv,
                                      int *pdone, int magic);
 /* WrapForValidIterator's .next FORWARDS VERBATIM — 27.1.4.2.1 is `Return ? Call([[NextMethod]], [[Iterator]])`
@@ -21104,6 +21153,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     void *tramp_cont_state = NULL, *cont_st = NULL;
     uint8_t tramp_cont_kind = CONT_NONE;
     int tramp_gen_magic = 0;                            /* set before goto do_generator_tramp */
+    /* ASYNC-GENERATOR DRIVE (do_agen_drive_tramp/_enter/_finish). tramp_agen_magic is the request kind, set before
+       the goto. The other four carry the drive ACROSS the pre/enter/settle loop, and are live only between one of
+       those labels and the frame push that follows it — the frame is what holds the drive while the body runs, so
+       a nested `ag.next()` inside the body cannot observe them. */
+    int tramp_agen_magic = 0;
+    uint8_t tramp_agen_shape = AGEN_SHAPE_CALL;         /* read+reset by do_agen_drive_tramp */
+    uint8_t tramp_agen_noarg = 0;                       /* ITERCALL: the no-argument delegation form (flags & 2) */
+    uint8_t agen_fin = AGEN_FIN_PUSH;
+    JSAsyncGeneratorData *agen_s = NULL;                /* the machine being driven */
+    JSValue agen_prom = JS_UNDEFINED;                   /* its settlement promise: the drive's synchronous result */
+    JSValue agen_hold = JS_UNDEFINED;                   /* the generator object, held across the body run */
+    JSValue *agen_caller_sp = NULL;                     /* the caller's sp with the drive's operands already freed */
+    uint8_t agen_tail = 0;                              /* `return ag.next()`: the promise IS the caller's return */
     void *tramp_step_outer = NULL;                      /* non-NULL = the step about to be pushed delivers its result to this machine's step, not to the operand stack (read+reset in do_step_tramp) */
     uint8_t tramp_step_outer_kind = CONT_NONE;
     int tp_slot = 0;                                    /* do_toprim_tramp inputs. OPERAND mode: the operand's offset from sp + the opcode byte to re-execute. MACHINE mode: tp_outer is set and the primitive is delivered to that step instead. */
@@ -21298,7 +21360,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    omitting it here made a preempted param-binding resume from a garbage frame. */
                 JSAsyncFunctionState *dfs = dtf->async_data ? &dtf->async_data->func_state
                                           : dtf->gen_data ? &dtf->gen_data->func_state
-                                          : dtf->cont_kind == CONT_AGEN_CREATE
+                                          : (dtf->cont_kind == CONT_AGEN_CREATE || dtf->cont_kind == CONT_AGEN_DRIVE)
                                               ? &((JSAsyncGeneratorData *)dtf->cont_state)->func_state
                                           : NULL;
                 JSStackFrame *dsf = dfs ? &dfs->frame : &dtf->sf;
@@ -22954,6 +23016,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 if (tramp_step_def_of(call_argv[-1]))
                     goto do_step_tramp;
+                {   /* ag.next()/.throw()/.return(): the body runs on THIS chain, so a loop in it preempts the base
+                       flow. Asked here and nowhere else — a bound or proxied `ag.next` re-enters this label after
+                       its rewrite, so every spelling reaches the same driver. */
+                    int agmag = tramp_agen_method_magic(call_argv[-1], gthis);
+                    if (agmag >= 0) { tramp_agen_magic = agmag; goto do_agen_drive_tramp; }
+                }
                 if (JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT
                     && JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_BOUND_FUNCTION) {
                     /* 10.4.1.1: a bound function's [[Call]] calls its ULTIMATE target with the flattened bound
@@ -25271,6 +25339,149 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 BREAK;
             }
 
+        do_agen_drive_tramp:
+            /* ag.next() / .throw() / .return() called from bytecode. The request is enqueued and then the BODY RUNS
+               HERE, on the caller's chain, so a loop anywhere in it preempts the caller's flow at any depth.
+               Driven from C instead (js_async_generator_resume_next) the body declares ITSELF a flow base, which is
+               right only when the resume IS the running flow — a promise reaction. Reached synchronously from a
+               running flow it is a NESTED activation, and its first back-edge parks a flow the caller's scheduler
+               never asked for: the park slot then holds the generator, its frame, its bytecode and that bytecode's
+               realm until something drains the pump, which for a script that never awaits is never. */
+            {
+                uint8_t agshape = tramp_agen_shape; tramp_agen_shape = AGEN_SHAPE_CALL;
+                bool agnoarg = (tramp_agen_noarg != 0); tramp_agen_noarg = 0;
+                JSValueConst agthis = (agshape == AGEN_SHAPE_CALL)  ? call_argv[-2]
+                                    : (agshape == AGEN_SHAPE_CLOSE) ? sp[-1] : sp[-4];
+                JSValueConst agarg = (agshape == AGEN_SHAPE_CALL) ? ((call_argc >= 1) ? call_argv[0] : JS_UNDEFINED)
+                                   : (agshape == AGEN_SHAPE_CLOSE || agnoarg) ? JS_UNDEFINED : sp[-1];
+                int agpop, agfirst;
+                JSValue *agargv;
+                DCHECK(JS_VALUE_GET_TAG(agthis) == JS_TAG_OBJECT
+                       && JS_VALUE_GET_OBJ(agthis)->class_id == JS_CLASS_ASYNC_GENERATOR
+                       && JS_VALUE_GET_OBJ(agthis)->u.async_generator_data != NULL,
+                       "do_agen_drive_tramp entered with a receiver that is not a live async generator — the route "
+                       "that set tramp_agen_magic must dispatch a non-async-generator .next() through its C entry");
+                agen_s = JS_VALUE_GET_OBJ(agthis)->u.async_generator_data;
+                agen_hold = js_dup(agthis);   /* the receiver operand is its only ref and this block frees it */
+                agen_prom = js_async_generator_enqueue(ctx, agen_s, tramp_agen_magic, agarg);
+                agen_fin = (agshape == AGEN_SHAPE_ITERCALL) ? AGEN_FIN_PUSH_FALSE
+                         : (agshape == AGEN_SHAPE_CLOSE)    ? AGEN_FIN_DISCARD : AGEN_FIN_PUSH;
+                if (agshape == AGEN_SHAPE_CALL) {
+                    /* the operands go now, in whatever shape the call was written in — the promise is this call's
+                       result no matter what the body does, so nothing below needs them. */
+                    TAKE_CALL_SHAPE(); agpop = call_pop; agfirst = call_first_r;
+                    agargv = sp - agpop;
+                    if (call_args_owned) {
+                        free_arg_list(ctx, call_args_owned, call_args_owned_n);
+                        call_args_owned = NULL; call_args_owned_n = 0;
+                    }
+                    for (i = agfirst; i < agpop; i++) JS_FreeValue(ctx, agargv[i]);
+                    sp += agfirst - agpop;
+                    agen_tail = tramp_is_tail;
+                } else {
+                    /* the iterator-protocol shapes all consume exactly one slot: the resume argument
+                       (ITERNEXT/ITERCALL) or the iterator itself (CLOSE). What replaces it is agen_fin's job. */
+                    JS_FreeValue(ctx, sp[-1]);
+                    sp--;
+                    agen_tail = 0;
+                }
+                agen_caller_sp = sp;
+                if (unlikely(JS_IsException(agen_prom))) { JS_FreeValue(ctx, agen_hold); goto exception; }
+                /* AsyncGeneratorEnqueue on a RUNNING body only queues: the body is already on some chain (this one,
+                   below us) and a second entry would run one frame twice. */
+                if (agen_s->state == JS_ASYNC_GENERATOR_STATE_EXECUTING) goto do_agen_drive_finish;
+            }
+            /* fall through */
+        do_agen_drive_enter:
+            /* Ask the machine what the head of the queue needs. It settles everything that needs no body run
+               (a completed generator, an awaiting return), and returns 1 having delivered the resume input. */
+            if (!js_async_generator_pre(ctx, agen_s))
+                goto do_agen_drive_finish;
+            {
+                TrampFrame *dtf3 = js_malloc_rt(rt, sizeof(TrampFrame));
+                JSStackFrame *dsf3; JSObject *dfp3; JSFunctionBytecode *db3;
+                if (unlikely(!dtf3)) { JS_FreeValue(ctx, agen_hold); JS_FreeValue(ctx, agen_prom); JS_ThrowOutOfMemory(ctx); goto exception; }
+                dtf3->up = tf_top;
+                dtf3->caller_sf = sf; dtf3->caller_b = b; dtf3->caller_ctx = ctx;
+                dtf3->caller_local_buf = local_buf; dtf3->caller_stack_buf = stack_buf;
+                dtf3->caller_var_buf = var_buf; dtf3->caller_arg_buf = arg_buf;
+                dtf3->caller_this = this_obj; dtf3->caller_new_target = new_target;
+                dtf3->caller_var_refs = var_refs;
+                dtf3->caller_argc = argc; dtf3->caller_argv = argv;
+                dtf3->caller_arg_allocated_size = arg_allocated_size;
+                dtf3->caller_sp = agen_caller_sp;
+                dtf3->call_first = -1; dtf3->call_argc = 0; dtf3->is_tail = agen_tail;
+                dtf3->async_data = NULL; dtf3->gen_data = NULL; dtf3->gen_magic = 0; dtf3->gen_tailcall = 0;
+                dtf3->forof_off = 0;
+                dtf3->async_promise = agen_prom; dtf3->agen_hold = agen_hold; dtf3->agen_fin = agen_fin;
+                dtf3->close_saved_exc = JS_UNINITIALIZED;
+                dtf3->cont_state = agen_s; dtf3->cont_kind = CONT_AGEN_DRIVE;
+                dtf3->b = NULL; dtf3->local_buf = NULL;   /* the body frame owns its buffers via agen_s->func_state */
+                dsf3 = &agen_s->func_state.frame;
+                dfp3 = JS_VALUE_GET_OBJ(dsf3->cur_func);
+                db3 = dfp3->u.func.function_bytecode;
+                dtf3->ctx = db3->realm;
+                dsf3->prev_frame = rt->current_stack_frame;
+                rt->current_stack_frame = dsf3;
+                tf_top = dtf3;
+                sf = dsf3; b = db3; ctx = db3->realm;
+                var_refs = dfp3->u.func.var_refs;
+                local_buf = arg_buf = dsf3->arg_buf;
+                var_buf = dsf3->var_buf;
+                stack_buf = dsf3->var_buf + db3->var_count;
+                this_obj = agen_s->func_state.this_val; new_target = JS_UNDEFINED;
+                argc = agen_s->func_state.argc; argv = (JSValueConst *)dsf3->arg_buf;
+                arg_allocated_size = dsf3->arg_count;
+                sp = dsf3->cur_sp; pc = dsf3->cur_pc;
+                dsf3->cur_sp = NULL;   /* running */
+                if (agen_s->func_state.throw_flag) { agen_s->func_state.throw_flag = false; goto exception; }  /* .throw() -> body catch */
+                goto restart;
+            }
+
+        do_agen_drive_finish:
+            /* nothing left to drive: the settlement promise is this call's value (it is already pending or already
+               settled — either is correct, the caller only ever sees the promise). */
+            sp = agen_caller_sp;
+            JS_FreeValue(ctx, agen_hold); agen_hold = JS_UNDEFINED;
+            if (agen_fin == AGEN_FIN_DISCARD) {   /* OP_iterator_close: the promise is never awaited */
+                JS_FreeValue(ctx, agen_prom); agen_prom = JS_UNDEFINED;
+                BREAK;
+            }
+            if (agen_tail) { ret_val = agen_prom; agen_prom = JS_UNDEFINED; goto do_return; }
+            *sp++ = agen_prom; agen_prom = JS_UNDEFINED;
+            if (agen_fin == AGEN_FIN_PUSH_FALSE) *sp++ = JS_FALSE;   /* OP_iterator_call's ret_flag: a method ran */
+            BREAK;
+
+        do_agen_drive_settle:
+            /* the body reached await / yield / yield* / return / an uncaught throw (ret_val says which). Pop back
+               to the .next() caller FIRST — the outcome may COMPLETE the generator, which tears its frame down —
+               then hand the outcome to the one state machine and either drive the next queued request or finish. */
+            {
+                TrampFrame *dtf3 = tf_top;
+                JSValue agret = ret_val;
+                agen_s = (JSAsyncGeneratorData *)dtf3->cont_state;
+                agen_prom = dtf3->async_promise;
+                agen_hold = dtf3->agen_hold;
+                agen_fin = dtf3->agen_fin;
+                agen_tail = dtf3->is_tail;
+                agen_caller_sp = dtf3->caller_sp;
+                sf->cur_pc = pc; sf->cur_sp = sp;   /* the body-frame state js_async_generator_post reads */
+                rt->current_stack_frame = dtf3->caller_sf;
+                tf_top = dtf3->up;
+                sf = dtf3->caller_sf; b = dtf3->caller_b; ctx = dtf3->caller_ctx;
+                local_buf = dtf3->caller_local_buf; stack_buf = dtf3->caller_stack_buf;
+                var_buf = dtf3->caller_var_buf; arg_buf = dtf3->caller_arg_buf;
+                this_obj = dtf3->caller_this; new_target = dtf3->caller_new_target;
+                var_refs = dtf3->caller_var_refs;
+                argc = dtf3->caller_argc; argv = dtf3->caller_argv;
+                arg_allocated_size = dtf3->caller_arg_allocated_size;
+                pc = sf->cur_pc; sp = dtf3->caller_sp;
+                js_free_rt(rt, dtf3);
+                if (js_async_generator_post(ctx, agen_s, agret))
+                    goto do_agen_drive_enter;
+                goto do_agen_drive_finish;
+            }
+
         do_generator_create_tramp:
             /* A generator FUNCTION call g() runs its params up to OP_initial_yield HERE on the tramp chain (so a
                PARAM-DEFAULT loop preempts the base flow), then at initial_yield (do_generator_create_settle)
@@ -26718,6 +26929,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (ip->class_id == JS_CLASS_GENERATOR && ip->u.generator_data) {
                         tramp_gen_magic = GEN_MAGIC_RETURN; tramp_gen_close = 1; goto do_generator_tramp;
                     }
+                    if (ip->class_id == JS_CLASS_ASYNC_GENERATOR && ip->u.async_generator_data) {
+                        /* the ASYNC generator's .return(): its `finally` runs on THIS chain. The promise the
+                           request settles with is never awaited on this path, so the drive discards it. */
+                        tramp_agen_magic = GEN_MAGIC_RETURN; tramp_agen_shape = AGEN_SHAPE_CLOSE;
+                        goto do_agen_drive_tramp;
+                    }
                     /* `for await (x of syncGen)` early-close: the wrapper's .return() would drive the sync generator
                        off-tramp (js_async_from_sync_iterator_next -> JS_IteratorNext2 -> js_generator_next). Route it
                        through the async-from-sync tramp in CLOSE mode: syncGen.return() runs its finally on the tramp,
@@ -26845,6 +27062,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_gen_method_magic(sp[-3], sp[-4]) == GEN_MAGIC_NEXT) {
                     tramp_gen_magic = GEN_MAGIC_NEXT; tramp_gen_iternext = 1; goto do_generator_tramp;
                 }
+                {   /* the same delegation over an ASYNC generator (`yield* ag()`): its body runs on THIS chain and
+                       the .next() promise takes the resume-argument slot, which the following OP_await consumes. */
+                    int agmag = tramp_agen_method_magic(sp[-3], sp[-4]);
+                    if (agmag >= 0) {
+                        tramp_agen_magic = agmag; tramp_agen_shape = AGEN_SHAPE_ITERNEXT;
+                        goto do_agen_drive_tramp;
+                    }
+                }
                 /* `for await (x of syncGen)` and `yield* asyncFromSync`: the iterator is the async-from-sync
                    WRAPPER, whose .next() drives the sync iterator from C
                    (js_async_from_sync_iterator_next -> JS_IteratorNext2 -> js_generator_next). OP_call_method
@@ -26905,6 +27130,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (JS_IsUndefined(method) || JS_IsNull(method)) {
                     ret_flag = true;
                 } else {
+                    {   /* delegating .return()/.throw() onto an ASYNC generator: drive its body (its `finally`, or
+                           the catch its .throw() lands in) on THIS chain. The method is resolved by lookup here, so
+                           the question is asked on the RESOLVED method — a page that patched it gets its own. */
+                        int agmag = tramp_agen_method_magic(method, sp[-4]);
+                        if (agmag >= 0) {
+                            JS_FreeValue(ctx, method);
+                            tramp_agen_magic = agmag; tramp_agen_shape = AGEN_SHAPE_ITERCALL;
+                            tramp_agen_noarg = ((flags & 2) != 0);
+                            goto do_agen_drive_tramp;
+                        }
+                    }
                     if (flags & 2) {
                         /* no argument */
                         ret = JS_CallFree(ctx, method, sp[-4],
@@ -28747,21 +28983,28 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
         CASE(OP_await):
             ret_val = js_int32(FUNC_RET_AWAIT);
-            if (tf_top && tf_top->async_data) goto do_async_settle;   /* async body on the tramp chain */
-            goto done_generator;
+            goto do_body_suspend;
         CASE(OP_yield):
             ret_val = js_int32(FUNC_RET_YIELD);
-            if (tf_top && tf_top->gen_data) goto do_generator_settle;   /* generator body on the tramp chain */
-            goto done_generator;
+            goto do_body_suspend;
         CASE(OP_yield_star):
         CASE(OP_async_yield_star):
             ret_val = js_int32(FUNC_RET_YIELD_STAR);
-            if (tf_top && tf_top->gen_data) goto do_generator_settle;   /* generator body on the tramp chain */
-            goto done_generator;
+            goto do_body_suspend;
         CASE(OP_return_async):
-            if (tf_top && tf_top->async_data) { ret_val = JS_UNDEFINED; goto do_async_settle; }   /* async body on the tramp chain */
-            if (tf_top && tf_top->gen_data) { ret_val = JS_UNDEFINED; goto do_generator_settle; }  /* generator completion */
             ret_val = JS_UNDEFINED;
+        do_body_suspend:
+            /* THE SUSPEND SEAM. The opcode says WHY the body suspended; WHO is driving it is a property of the
+               FRAME, so that question is asked once here rather than re-asked at each of these opcodes — where a
+               new body kind would have had to be added to four sites, correctly, and an omission would silently
+               fall through to done_generator and unwind the wrong activation. The three kinds are mutually
+               exclusive by construction (a frame is an async body, a sync generator body, or an async generator
+               drive), and no frame means the body IS the base activation that async_func_resume entered. */
+            if (tf_top) {
+                if (tf_top->async_data) goto do_async_settle;                            /* async function body */
+                if (tf_top->gen_data)   goto do_generator_settle;                        /* sync generator body */
+                if (tf_top->cont_kind == CONT_AGEN_DRIVE) goto do_agen_drive_settle;     /* async generator body */
+            }
             goto done_generator;
         CASE(OP_initial_yield):
             if (tf_top && tf_top->gen_data && tf_top->gen_magic == 0xFF) goto do_generator_create_settle;   /* g() creation on the chain */
@@ -28937,6 +29180,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     if (tf_top && tf_top->async_data) {
         ret_val = JS_EXCEPTION;
         goto do_async_settle;
+    }
+    /* uncaught in an ASYNC GENERATOR body on the tramp chain: like the async case, the .next() call does not throw
+       — the request's promise is REJECTED and the machine moves to the next queued request. */
+    if (tf_top && tf_top->cont_kind == CONT_AGEN_DRIVE) {
+        ret_val = JS_EXCEPTION;
+        goto do_agen_drive_settle;
     }
     /* uncaught in a GENERATOR body on the tramp chain: free the generator, pop to the .next() caller, and re-raise
        there (a generator throw propagates to whoever called .next(), exactly as js_generator_next returns it). */
@@ -29870,6 +30119,11 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
         if (!ct) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }   /* OOM: partial leak on the abort path */
         ca[i] = ct;
         *ct = *otf;   /* scalars + BORROWED values (cur_func/this_val/new_target stay borrowed); fix pointers below */
+        DCHECK(otf->cont_kind != CONT_AGEN_DRIVE,
+               "clone_deep_flow: a concolic fork inside an ASYNC GENERATOR body on the tramp — the sibling needs "
+               "its OWN JSAsyncGeneratorData (cloned body frame, fresh queue and settlement capability), like the "
+               "async_data and gen_data arms below; the struct copy would share the parent's machine and settle "
+               "both arms' requests off one queue");
 
         if (otf->async_data) {
             /* ASYNC body on the chain: clone a FRESH async_data with its OWN return-promise capability. The fork
@@ -30737,28 +30991,36 @@ static void js_async_gen_park_resume(JSContext *ctx, void *opaque)
     JS_FreeValue(ctx, gobj);   /* release the ref taken at park */
 }
 
-static void js_async_generator_resume_next(JSContext *ctx,
-                                           JSAsyncGeneratorData *s)
+/* THE ASYNC-GENERATOR STATE MACHINE, split at the ONE seam that has two entries: the BODY RUN.
+   `pre` decides what the head of the queue needs and delivers the resume input, settling every case that needs
+   no body run; `post` consumes one body run's outcome and says whether the queue has more to drive. Between them
+   the body is entered, and THAT is the only thing the two drivers do differently: on the caller's TRAMP CHAIN
+   when `ag.next()` is called from bytecode (do_agen_drive_tramp — the body's loops then preempt the caller's
+   flow, at any depth), or as its OWN flow base when a promise reaction resumes an awaiting body
+   (js_async_generator_resume_next below, which parks). That is exactly the split an async FUNCTION already has
+   between its tramp entry and js_async_function_resume_as_flow; the machine itself has one implementation. */
+static int js_async_generator_pre(JSContext *ctx, JSAsyncGeneratorData *s)
 {
     JSAsyncGeneratorRequest *next;
-    JSValue func_ret, value;
+    JSValue value;
 
     for(;;) {
         if (list_empty(&s->queue))
-            break;
+            return 0;
         next = list_entry(s->queue.next, JSAsyncGeneratorRequest, link);
         switch(s->state) {
         case JS_ASYNC_GENERATOR_STATE_EXECUTING:
-            /* only happens when restarting execution after await() */
-            goto resume_exec;
+            /* restarting after an await: the settled value is already in place at cur_sp[-1] (or thrown) */
+            return 1;
         case JS_ASYNC_GENERATOR_STATE_AWAITING_RETURN:
-            goto done;
+            return 0;
         case JS_ASYNC_GENERATOR_STATE_SUSPENDED_START:
             if (next->completion_type == GEN_MAGIC_NEXT) {
-                goto exec_no_arg;
-            } else {
-                js_async_generator_complete(ctx, s);
+                s->func_state.throw_flag = false;
+                s->state = JS_ASYNC_GENERATOR_STATE_EXECUTING;
+                return 1;
             }
+            js_async_generator_complete(ctx, s);
             break;
         case JS_ASYNC_GENERATOR_STATE_COMPLETED:
             if (next->completion_type == GEN_MAGIC_NEXT) {
@@ -30769,7 +31031,7 @@ static void js_async_generator_resume_next(JSContext *ctx,
             } else {
                 js_async_generator_reject(ctx, s, next->result);
             }
-            goto done;
+            return 0;
         case JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD:
         case JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD_STAR:
             value = js_dup(next->result);
@@ -30781,76 +31043,98 @@ static void js_async_generator_resume_next(JSContext *ctx,
                 /* 'yield' returns a value. 'yield *' also returns a value
                    in case the 'throw' method is called */
                 s->func_state.frame.cur_sp[-1] = value;
-                s->func_state.frame.cur_sp[0] =
-                    js_int32(next->completion_type);
+                s->func_state.frame.cur_sp[0] = js_int32(next->completion_type);
                 s->func_state.frame.cur_sp++;
-            exec_no_arg:
                 s->func_state.throw_flag = false;
             }
             s->state = JS_ASYNC_GENERATOR_STATE_EXECUTING;
-        resume_exec:
-            {
-                /* the async-generator BODY is a flow: its own base, so a back-edge PARKS it */
-                JSAsyncFunctionState *prev_base = g_flow_base_gen;
-                g_flow_base_gen = &s->func_state;
-                func_ret = async_func_resume(ctx, &s->func_state);
-                g_flow_base_gen = prev_base;
-            }
-            if (JS_VALUE_GET_TAG(func_ret) == JS_TAG_INT && JS_VALUE_GET_INT(func_ret) == FUNC_RET_PREEMPT &&
-                (s->func_state.frame.cur_sp != NULL || s->func_state.tramp_top != NULL)) {
-                /* PARKED mid-body: park into THE PUMP, never the job FIFO (that reorders microtasks). The state
-                   stays EXECUTING, so the pump's resume re-enters here at the saved point. */
-                js_dup(JS_MKPTR(JS_TAG_OBJECT, s->generator));   /* the park keeps the suspended body alive */
-                JS_ParkFlow(ctx, js_async_gen_park_resume, s->generator);
-                return;
-            }
-            if (JS_IsException(func_ret)) {
-                value = JS_GetException(ctx);
-                js_async_generator_complete(ctx, s);
-                js_async_generator_reject(ctx, s, value);
-                JS_FreeValue(ctx, value);
-            } else if (JS_VALUE_GET_TAG(func_ret) == JS_TAG_INT) {
-                int func_ret_code, ret;
-                value = s->func_state.frame.cur_sp[-1];
-                s->func_state.frame.cur_sp[-1] = JS_UNDEFINED;
-                func_ret_code = JS_VALUE_GET_INT(func_ret);
-                switch(func_ret_code) {
-                case FUNC_RET_YIELD:
-                case FUNC_RET_YIELD_STAR:
-                    if (func_ret_code == FUNC_RET_YIELD_STAR)
-                        s->state = JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD_STAR;
-                    else
-                        s->state = JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD;
-                    js_async_generator_resolve(ctx, s, value, false);
-                    JS_FreeValue(ctx, value);
-                    break;
-                case FUNC_RET_AWAIT:
-                    ret = js_async_generator_await(ctx, s, value);
-                    JS_FreeValue(ctx, value);
-                    if (ret < 0) {
-                        /* exception: throw it */
-                        s->func_state.throw_flag = true;
-                        goto resume_exec;
-                    }
-                    goto done;
-                default:
-                    abort();
-                }
-            } else {
-                assert(JS_IsUndefined(func_ret));
-                /* end of function */
-                value = s->func_state.frame.cur_sp[-1];
-                s->func_state.frame.cur_sp[-1] = JS_UNDEFINED;
-                js_async_generator_complete(ctx, s);
-                js_async_generator_resolve(ctx, s, value, true);
-                JS_FreeValue(ctx, value);
-            }
-            break;
+            return 1;
         default:
-            abort();
+            DFAIL("async generator resumed in an unknown state");
+            return 0;
         }
     }
- done: ;
+}
+
+/* One body run's outcome. Returns 1 when the machine has more to do (drive `pre` again), 0 when it is parked on
+   an await or has nothing queued. The body frame must be non-running (cur_sp set) on entry: an outcome that
+   COMPLETES the generator tears that frame down. */
+static int js_async_generator_post(JSContext *ctx, JSAsyncGeneratorData *s, JSValue func_ret)
+{
+    JSValue value;
+    int ret;
+
+    if (JS_IsException(func_ret)) {
+        value = JS_GetException(ctx);
+        js_async_generator_complete(ctx, s);
+        js_async_generator_reject(ctx, s, value);
+        JS_FreeValue(ctx, value);
+        return 1;
+    }
+    if (JS_VALUE_GET_TAG(func_ret) == JS_TAG_INT) {
+        value = s->func_state.frame.cur_sp[-1];
+        s->func_state.frame.cur_sp[-1] = JS_UNDEFINED;
+        switch(JS_VALUE_GET_INT(func_ret)) {
+        case FUNC_RET_YIELD:
+        case FUNC_RET_YIELD_STAR:
+            s->state = (JS_VALUE_GET_INT(func_ret) == FUNC_RET_YIELD_STAR)
+                     ? JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD_STAR
+                     : JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD;
+            js_async_generator_resolve(ctx, s, value, false);
+            JS_FreeValue(ctx, value);
+            return 1;
+        case FUNC_RET_AWAIT:
+            ret = js_async_generator_await(ctx, s, value);
+            JS_FreeValue(ctx, value);
+            if (ret < 0) {
+                /* the await plumbing itself threw: re-enter the body with that throw (pre sees EXECUTING) */
+                s->func_state.throw_flag = true;
+                return 1;
+            }
+            return 0;
+        default:
+            DFAIL("async generator body suspended with an unknown FUNC_RET code — route the new suspend reason");
+            return 0;
+        }
+    }
+    DCHECK(JS_IsUndefined(func_ret), "async generator body completed with a value that is not the frame result");
+    value = s->func_state.frame.cur_sp[-1];
+    s->func_state.frame.cur_sp[-1] = JS_UNDEFINED;
+    js_async_generator_complete(ctx, s);
+    js_async_generator_resolve(ctx, s, value, true);
+    JS_FreeValue(ctx, value);
+    return 1;
+}
+
+/* The JOB-DRIVEN driver: a promise reaction (an await settling, or the pump resuming a parked body) continues an
+   async generator that IS the running flow, so its body becomes its own flow base and a back-edge PARKS it. A
+   `ag.next()` written in script does NOT come here — that is a nested activation of the caller's flow and runs on
+   the caller's chain (do_agen_drive_tramp), which is why this driver never sees a synchronous drive. */
+static void js_async_generator_resume_next(JSContext *ctx,
+                                           JSAsyncGeneratorData *s)
+{
+    JSValue func_ret;
+    JSAsyncFunctionState *prev_base;
+
+    for(;;) {
+        if (!js_async_generator_pre(ctx, s))
+            return;
+        /* the async-generator BODY is a flow: its own base, so a back-edge PARKS it */
+        prev_base = g_flow_base_gen;
+        g_flow_base_gen = &s->func_state;
+        func_ret = async_func_resume(ctx, &s->func_state);
+        g_flow_base_gen = prev_base;
+        if (JS_VALUE_GET_TAG(func_ret) == JS_TAG_INT && JS_VALUE_GET_INT(func_ret) == FUNC_RET_PREEMPT &&
+            (s->func_state.frame.cur_sp != NULL || s->func_state.tramp_top != NULL)) {
+            /* PARKED mid-body: park into THE PUMP, never the job FIFO (that reorders microtasks). The state
+               stays EXECUTING, so the pump's resume re-enters here at the saved point. */
+            js_dup(JS_MKPTR(JS_TAG_OBJECT, s->generator));   /* the park keeps the suspended body alive */
+            JS_ParkFlow(ctx, js_async_gen_park_resume, s->generator);
+            return;
+        }
+        if (!js_async_generator_post(ctx, s, func_ret))
+            return;
+    }
 }
 
 static JSValue js_async_generator_resolve_function(JSContext *ctx,
@@ -30888,12 +31172,11 @@ static JSValue js_async_generator_resolve_function(JSContext *ctx,
     return JS_UNDEFINED;
 }
 
-/* magic = GEN_MAGIC_x */
-static JSValue js_async_generator_next(JSContext *ctx, JSValueConst this_val,
-                                       int argc, JSValueConst *argv,
-                                       int magic)
+/* AsyncGeneratorEnqueue (27.7.3.4): one .next()/.throw()/.return() request joins the queue and gets the promise
+   the call evaluates to. `s == NULL` is the receiver-is-not-an-async-generator case, whose promise is REJECTED
+   rather than thrown — a genuinely different outcome, not a fallback for the drive. */
+static JSValue js_async_generator_enqueue(JSContext *ctx, JSAsyncGeneratorData *s, int magic, JSValueConst arg)
 {
-    JSAsyncGeneratorData *s = JS_GetOpaque(this_val, JS_CLASS_ASYNC_GENERATOR);
     JSValue promise, resolving_funcs[2];
     JSAsyncGeneratorRequest *req;
 
@@ -30913,23 +31196,38 @@ static JSValue js_async_generator_next(JSContext *ctx, JSValueConst this_val,
         return promise;
     }
     req = js_mallocz(ctx, sizeof(*req));
-    if (!req)
-        goto fail;
+    if (!req) {
+        JS_FreeValue(ctx, resolving_funcs[0]);
+        JS_FreeValue(ctx, resolving_funcs[1]);
+        JS_FreeValue(ctx, promise);
+        return JS_EXCEPTION;
+    }
     req->completion_type = magic;
-    req->result = js_dup(argv[0]);
+    req->result = js_dup(arg);
     req->promise = js_dup(promise);
     req->resolving_funcs[0] = resolving_funcs[0];
     req->resolving_funcs[1] = resolving_funcs[1];
     list_add_tail(&req->link, &s->queue);
-    if (s->state != JS_ASYNC_GENERATOR_STATE_EXECUTING) {
-        js_async_generator_resume_next(ctx, s);
-    }
     return promise;
- fail:
-    JS_FreeValue(ctx, resolving_funcs[0]);
-    JS_FreeValue(ctx, resolving_funcs[1]);
-    JS_FreeValue(ctx, promise);
-    return JS_EXCEPTION;
+}
+
+/* magic = GEN_MAGIC_x */
+static JSValue js_async_generator_next(JSContext *ctx, JSValueConst this_val,
+                                       int argc, JSValueConst *argv,
+                                       int magic)
+{
+    JSAsyncGeneratorData *s = JS_GetOpaque(this_val, JS_CLASS_ASYNC_GENERATOR);
+
+    if (s) {
+        /* A LIVE async generator reaching this C entry means a call site drove its body OFF the tramp chain: the
+           body would then run as a nested activation with no flow base, so its first loop back-edge cannot park.
+           There is no second driver to fall back to — route that call site onto do_agen_drive_tramp. Release keeps
+           a throw because the capability is not supportable off the chain, never because a drive is acceptable. */
+        DFAIL("AsyncGenerator .next()/.throw()/.return() reached its C entry with a live async generator — "
+              "route that call site onto do_agen_drive_tramp; there is no second driver");
+        return JS_ThrowTypeError(ctx, "async generator driven off the tramp chain");
+    }
+    return js_async_generator_enqueue(ctx, s, magic, argv[0]);
 }
 
 static JSValue js_async_generator_function_call(JSContext *ctx,
