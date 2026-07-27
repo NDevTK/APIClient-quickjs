@@ -1454,6 +1454,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_MATH_ABS, STEPDEF_MATH_FLOOR, STEPDEF_MATH_CEIL, STEPDEF_MATH_ROUND, STEPDEF_MATH_SQRT, STEPDEF_MATH_ACOS, STEPDEF_MATH_ASIN, STEPDEF_MATH_ATAN, STEPDEF_MATH_COS, STEPDEF_MATH_EXP, STEPDEF_MATH_LOG, STEPDEF_MATH_SIN, STEPDEF_MATH_TAN, STEPDEF_MATH_TRUNC, STEPDEF_MATH_SIGN, STEPDEF_MATH_COSH, STEPDEF_MATH_SINH, STEPDEF_MATH_TANH, STEPDEF_MATH_ACOSH, STEPDEF_MATH_ASINH, STEPDEF_MATH_ATANH, STEPDEF_MATH_EXPM1, STEPDEF_MATH_LOG1P, STEPDEF_MATH_LOG2, STEPDEF_MATH_LOG10, STEPDEF_MATH_CBRT, STEPDEF_MATH_F16ROUND, STEPDEF_MATH_FROUND, STEPDEF_MATH_ATAN2, STEPDEF_MATH_POW, STEPDEF_MATH_MIN, STEPDEF_MATH_MAX, STEPDEF_MATH_HYPOT, STEPDEF_MATH_IMUL, STEPDEF_MATH_CLZ32, STEPDEF_STR_FROMCHARCODE, STEPDEF_STR_FROMCODEPOINT, STEPDEF_DATE_UTC,
     STEPDEF_REGEXP_EXEC, STEPDEF_REGEXP_TEST,
     STEPDEF_ITER_TAKE, STEPDEF_ITER_DROP, STEPDEF_ITER_WRAP_RETURN,
+    STEPDEF_ITER_CONCAT_NEXT, STEPDEF_ITER_CONCAT_RETURN,
     STEPDEF_FUNCTION_CTOR, STEPDEF_GENERATOR_FUNCTION_CTOR,
     STEPDEF_ASYNC_FUNCTION_CTOR, STEPDEF_ASYNC_GENERATOR_FUNCTION_CTOR,
     STEPDEF_DV_FIRST,
@@ -18086,6 +18087,11 @@ typedef struct JSStepHdr {
        primitive rather than three special cases. */
     void *outer;
     uint8_t outer_kind;
+    /* CONT_FOROF_NEXT carries no STATE — its enum_rec offset is the whole of what the continuation needs — so a
+       machine reached as a for-of .next() (Iterator.concat's) has an outer_kind with a NULL outer, and this is
+       what its delivery reads. Without it the DONE arm saw no outer at all and pushed the result as a bare
+       operand, which the loop then read as its enum_rec. */
+    int outer_forof;
     /* THE INVOCATION. Captured (owned) by the driver before the first step, because a prologue that suspends
        resumes into a step whose C locals are gone and whose operand stack the machine must not depend on. It is
        also what let every machine drop its private copy of the receiver and the argument vector: those were the
@@ -20604,6 +20610,32 @@ typedef struct JSDateToPrim {
    `toISOString` read, and the call — and js_date_toJSON ran all three from a C entry, so
    `Date.prototype.toJSON.call({valueOf(){ while(x){} }})` preempted with no flow base. It is also the C site that
    reaches the intrinsic Object.prototype.toString through OrdinaryToPrimitive. */
+/* Iterator.concat's lazy iterator. Its .next() walks a LIST of (iterable, @@iterator) pairs, and every step of
+   that walk is the page's code: the @@iterator CALL, the `next` read, the .next() CALL, and the `done`/`value`
+   reads off the result. js_iterator_concat_next ran all of them from a C entry with JS_GetIterator2,
+   JS_GetProperty and JS_IteratorNext2 -> JS_Call, so a loop anywhere in a concatenated source aborted at its
+   back-edge. Its .return() is the same story with one pair of user-code sites, so it is a machine of its own
+   rather than an arm of this one — they share nothing but the receiver. */
+typedef struct JSIterConcatNext {
+    JSStepHdr hdr;    /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    JSValue self;     /* OUR OWN reference to the receiver (owned). The header's is released by the shared
+                         teardown BEFORE fini runs, and fini is where the `running` guard has to be lowered — on
+                         every exit, because a machine that suspends mid-walk and then throws never reaches its
+                         own stages again and a guard left raised bricks the iterator for good. */
+    JSValue item;     /* the iterator result, held across its `done` and `value` reads (owned) */
+    JSValue cb[2];    /* [receiver, method] — the CALL request */
+    JSValue result;   /* DONE (owned) */
+    uint8_t held;     /* 1 = this machine raised `running` and owes it back */
+} JSIterConcatNext;
+
+typedef struct JSIterConcatReturn {
+    JSStepHdr hdr;    /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    JSValue self;     /* owned, for the same reason */
+    JSValue cb[2];    /* [iterator, its `return`] — the CALL request */
+    JSValue result;   /* DONE (owned) */
+    uint8_t held;
+} JSIterConcatReturn;
+
 /* 27.1.4.2.2 %WrapForValidIteratorPrototype%.return: RequireInternalSlot, then `? GetMethod(iterator, "return")`
    and `? Call(returnMethod, iterator)` — BOTH the page's code on an accessor, a Proxy, or a plain method with a
    loop in it. js_iterator_wrap_next ran them with JS_GetProperty and JS_IteratorNext2 -> JS_Call from a C entry,
@@ -23881,6 +23913,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     h->outer = inner5 ? tramp_step_outer
                                       : (tramp_cont_kind != CONT_NONE ? tramp_cont_state : NULL);
                     h->outer_kind = inner5 ? tramp_step_outer_kind : tramp_cont_kind;
+                    h->outer_forof = inner5 ? 0 : tramp_cont_forof;
                     TAKE_CALL_SHAPE();
                     h->orig_cfirst = inner5 ? 0 : call_first_r;
                     h->orig_cargc = inner5 ? 0 : call_pop;
@@ -23905,6 +23938,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int st = h->def->step(step_realm(ctx, h), stt, ret_val, &cb, &cbn);
                 if (unlikely(st < 0)) {
                     void *souter0 = h->outer; uint8_t sk0 = h->outer_kind;
+                    if (sk0 == CONT_FOROF_NEXT) {
+                        /* a for-of .next() that threw: the iterator is [[Done]], so the enum_rec's slot is
+                           cleared and the loop's OP_iterator_close must not close it — the same abrupt handling
+                           the unwind arm gives a .next() driven on a heap frame. */
+                        int cfirst1 = h->orig_cfirst, cargc1 = h->orig_cargc, foff1 = h->outer_forof;
+                        JSValue *fcargv;
+                        DCHECK(foff1 <= -3, "a for-of .next() step machine carries no enum_rec offset");
+                        tramp_step_state_free(ctx, stt, false);
+                        fcargv = sp - cargc1;
+                        for (i = cfirst1; i < cargc1; i++) JS_FreeValue(ctx, fcargv[i]);
+                        sp += cfirst1 - cargc1;
+                        JS_FreeValue(ctx, sp[foff1]); sp[foff1] = JS_UNDEFINED;
+                        goto exception;
+                    }
                     if (souter0 && (sk0 == CONT_ITER_CONSUME || sk0 == CONT_ITER_HELPER
                                     || sk0 == CONT_ITER_CLOSE_CALL)) {
                         /* the machine WAS a call made by one of these sequences, so its throw is that call's
@@ -23928,10 +23975,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        reading orig_cfirst/orig_cargc/orig_is_tail afterwards was a use-after-free — the operand
                        cleanup below ran off whatever the freed block then held. */
                     void *souter = h->outer; uint8_t souter_kind = h->outer_kind;
-                    int cfirst = h->orig_cfirst, cargc = h->orig_cargc;
+                    int cfirst = h->orig_cfirst, cargc = h->orig_cargc, foff = h->outer_forof;
                     uint8_t itail = h->orig_is_tail, idiscard = h->discard_result;
                     JSValue r = tramp_step_state_free(ctx, stt, true);
                     JSValue *cargv;
+                    if (souter_kind == CONT_FOROF_NEXT) {
+                        /* the machine WAS a for-of .next(). Its operands are dropped and its result enters the
+                           loop's protocol exactly where a returned heap frame's does. */
+                        JSValue *fcargv = sp - cargc;
+                        DCHECK(souter == NULL, "a for-of .next() continuation carries no state");
+                        DCHECK(foff <= -3, "a for-of .next() step machine carries no enum_rec offset");
+                        for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, fcargv[i]);
+                        sp += cfirst - cargc;
+                        if (js_forof_deliver(ctx, sp, foff, r)) goto exception;
+                        sp += 2;
+                        BREAK;
+                    }
                     if (souter && (souter_kind == CONT_ITER_CONSUME || souter_kind == CONT_ITER_HELPER
                                    || souter_kind == CONT_ITER_CLOSE_CALL)) {
                         /* the machine WAS a call one of these sequences made — a consumer's CALLBACK
@@ -56956,6 +57015,14 @@ static const JSTrampStepDef js_dataview_ctor_def = { sizeof(JSDataViewCtor), js_
 static const JSTrampStepDef js_ab_slice_def      = { sizeof(JSABSlice), js_ab_slice_step, js_ab_slice_fini, JS_CLASS_ARRAY_BUFFER*2 + 0 };
 static const JSTrampStepDef js_ab_sliceImm_def   = { sizeof(JSABSlice), js_ab_slice_step, js_ab_slice_fini, JS_CLASS_ARRAY_BUFFER*2 + 1 };
 static const JSTrampStepDef js_sab_slice_def     = { sizeof(JSABSlice), js_ab_slice_step, js_ab_slice_fini, JS_CLASS_SHARED_ARRAY_BUFFER*2 + 0 };
+static int js_iter_concat_next_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_iter_concat_next_fini(JSContext *ctx, void *st, bool take_result);
+static const JSTrampStepDef js_iter_concat_next_def =
+    { sizeof(JSIterConcatNext), js_iter_concat_next_step, js_iter_concat_next_fini, 0 };
+static int js_iter_concat_return_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_iter_concat_return_fini(JSContext *ctx, void *st, bool take_result);
+static const JSTrampStepDef js_iter_concat_return_def =
+    { sizeof(JSIterConcatReturn), js_iter_concat_return_step, js_iter_concat_return_fini, 0 };
 static int js_iter_wrap_return_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_iter_wrap_return_fini(JSContext *ctx, void *st, bool take_result);
 static const JSTrampStepDef js_iter_wrap_return_def =
@@ -57324,6 +57391,8 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_ITER_TAKE]       = &js_iter_take_def,
     [STEPDEF_ITER_DROP]       = &js_iter_drop_def,
     [STEPDEF_ITER_WRAP_RETURN] = &js_iter_wrap_return_def,
+    [STEPDEF_ITER_CONCAT_NEXT] = &js_iter_concat_next_def,
+    [STEPDEF_ITER_CONCAT_RETURN] = &js_iter_concat_return_def,
     [STEPDEF_REGEXP_EXEC]     = &js_regexp_exec_def,
     [STEPDEF_REGEXP_TEST]     = &js_re_test_def,
     [STEPDEF_FUNCTION_CTOR]   = &js_function_ctor_def,
@@ -59339,116 +59408,230 @@ static void js_iterator_concat_mark(JSRuntime *rt, JSValueConst val,
     }
 }
 
-static JSValue js_iterator_concat_next(JSContext *ctx, JSValueConst this_val,
-                                       int argc, JSValueConst *argv,
-                                       int *pdone, int magic)
-{
-    JSValue iter, item, next, val, *obj, *meth;
-    JSIteratorConcatData *it;
-    int done;
 
-    it = JS_GetOpaque2(ctx, this_val, JS_CLASS_ITERATOR_CONCAT);
-    if (!it)
-        return JS_EXCEPTION;
-    if (it->running)
-        return JS_ThrowTypeError(ctx, "already running");
-    it->running = true;
-next:
-    if (it->index >= it->count) {
-        *pdone = true;
-        val = JS_UNDEFINED;
-        goto done;
-    }
-    obj = &it->values[it->index + 0];
-    meth = &it->values[it->index + 1];
-    iter = it->iter;
-    if (JS_IsUndefined(iter)) {
-        iter = JS_GetIterator2(ctx, *obj, *meth);
-        if (JS_IsException(iter))
-            goto fail;
-        it->iter = iter;
-    }
-    next = it->next;
-    if (JS_IsUndefined(next)) {
-        next = JS_GetProperty(ctx, iter, JS_ATOM_next);
-        if (JS_IsException(next))
-            goto fail;
-        it->next = next;
-    }
-    item = JS_IteratorNext2(ctx, iter, next, 0, NULL, &done);
-    if (JS_IsException(item))
-        goto fail;
-    if (!done) {
-        *pdone = false;
-        val = item;
-        goto done;
-    }
-    // done==1 means really done, done==2 means "unknown, inspect object"
-    if (done == 2) {
-        val = JS_GetProperty(ctx, item, JS_ATOM_done);
-        if (JS_IsException(val)) {
-            JS_FreeValue(ctx, item);
-            goto fail;
-        }
-        done = JS_ToBoolFree(ctx, val);
-    }
-    if (done) {
-        JS_FreeValue(ctx, item);
-        JS_FreeValue(ctx, iter);
-        JS_FreeValue(ctx, next);
-        it->iter = JS_UNDEFINED;
-        it->next = JS_UNDEFINED;
-        JS_FreeValue(ctx, *meth);
-        JS_FreeValue(ctx, *obj);
-        it->index += 2;
-        goto next;
-    }
-    val = JS_GetProperty(ctx, item, JS_ATOM_value);
-    JS_FreeValue(ctx, item);
-    *pdone = false;
-done:
-    it->running = false;
-    return val;
-fail:
-    val = JS_EXCEPTION;
-    goto done;
+
+/* The list walk, as phases. `hdr.this_val` is the JS_CLASS_ITERATOR_CONCAT receiver, so its data is re-read at
+   every resume rather than cached across a suspension. `running` is the spec's re-entrancy guard; the teardown
+   clears it, which is what makes an abrupt exit leave the iterator usable exactly as the C body's `done:` label
+   did. */
+enum { CONCAT_PH_HEAD = 0, CONCAT_PH_ITER, CONCAT_PH_NEXTM, CONCAT_PH_CALL,
+       CONCAT_PH_DONE, CONCAT_PH_VALUE };
+
+static JSIteratorConcatData *js_iter_concat_data(JSContext *ctx, JSValueConst this_val)
+{
+    return JS_GetOpaque2(ctx, this_val, JS_CLASS_ITERATOR_CONCAT);
 }
 
-static JSValue js_iterator_concat_return(JSContext *ctx, JSValueConst this_val,
-                                         int argc, JSValueConst *argv)
+/* the current pair is done: drop it and its live iterator, and move on to the next one */
+static void js_iter_concat_advance(JSContext *ctx, JSIteratorConcatData *it)
 {
-    JSIteratorConcatData *it;
-    JSValue ret, *pval;
+    JS_FreeValue(ctx, it->iter);  it->iter = JS_UNDEFINED;
+    JS_FreeValue(ctx, it->next);  it->next = JS_UNDEFINED;
+    JS_FreeValue(ctx, it->values[it->index + 1]);
+    JS_FreeValue(ctx, it->values[it->index + 0]);
+    it->index += 2;
+}
 
-    it = JS_GetOpaque2(ctx, this_val, JS_CLASS_ITERATOR_CONCAT);
-    if (!it)
-        return JS_EXCEPTION;
-    if (it->running)
-        return JS_ThrowTypeError(ctx, "already running");
-    ret = JS_UNDEFINED;
-    if (!JS_IsUndefined(it->iter)) {
-        ret = JS_GetProperty(ctx, it->iter, JS_ATOM_return);
-        if (JS_IsException(ret))
-            return JS_EXCEPTION;
+static int js_iter_concat_next_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSIterConcatNext *s = st;
+    JSIteratorConcatData *it;
+    int r;
+
+    if (!s->held) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
+        s->self = JS_UNDEFINED; s->item = JS_UNDEFINED; s->result = JS_UNDEFINED;
+        s->cb[0] = JS_UNDEFINED; s->cb[1] = JS_UNDEFINED;
+        it = js_iter_concat_data(ctx, s->hdr.this_val);
+        if (!it) return -1;
+        if (it->running) { JS_ThrowTypeError(ctx, "already running"); return -1; }
         it->running = true;
-        ret = JS_CallFree(ctx, ret, it->iter, 0, NULL);
+        s->self = js_dup(s->hdr.this_val);
+        s->held = 1;   /* `running` is ours now: fini owes it back */
+    }
+    it = js_iter_concat_data(ctx, s->self);
+    DCHECK(it != NULL, "Iterator.concat: the receiver lost its data mid-walk");
+
+    for (;;) {
+        if (s->hdr.stage == CONCAT_PH_HEAD) {
+            if (it->index >= it->count) {
+                s->result = js_create_iterator_result(ctx, JS_UNDEFINED, true);
+                return JS_IsException(s->result) ? -1 : 0;
+            }
+            if (JS_IsUndefined(it->iter)) {
+                /* GetIterator(obj, method): Call(method, obj) — the page's @@iterator */
+                s->cb[0] = js_dup(it->values[it->index + 0]);
+                s->cb[1] = js_dup(it->values[it->index + 1]);
+                s->hdr.stage = CONCAT_PH_ITER;
+                *out_cb = s->cb; *out_argc = 0;
+                return 3;
+            }
+            s->hdr.stage = CONCAT_PH_NEXTM;
+        }
+        if (s->hdr.stage == CONCAT_PH_ITER) {
+            if (!JS_IsObject(cb_result)) {   /* GetIterator step 5 */
+                JS_FreeValue(ctx, cb_result);
+                JS_ThrowTypeErrorNotAnObject(ctx);
+                return -1;
+            }
+            JS_FreeValue(ctx, s->cb[0]); s->cb[0] = JS_UNDEFINED;
+            JS_FreeValue(ctx, s->cb[1]); s->cb[1] = JS_UNDEFINED;
+            it->iter = cb_result; cb_result = JS_UNDEFINED;
+            s->hdr.stage = CONCAT_PH_NEXTM;
+        }
+        if (s->hdr.stage == CONCAT_PH_NEXTM) {
+            if (JS_IsUndefined(it->next)) {
+                JSValue nm = JS_UNDEFINED;
+                r = step_getprop_run(ctx, &s->hdr, it->iter, JS_ATOM_next, cb_result, &nm, out_cb, out_argc);
+                cb_result = JS_UNDEFINED;
+                if (r) return r < 0 ? -1 : r;
+                it = js_iter_concat_data(ctx, s->self);   /* the read may have run page code */
+                DCHECK(it != NULL, "Iterator.concat: the receiver lost its data across its `next` read");
+                JS_FreeValue(ctx, it->next);
+                it->next = nm;
+            }
+            s->cb[0] = js_dup(it->iter);
+            s->cb[1] = js_dup(it->next);
+            s->hdr.stage = CONCAT_PH_CALL;
+            *out_cb = s->cb; *out_argc = 0;
+            return 3;
+        }
+        if (s->hdr.stage == CONCAT_PH_CALL) {
+            JS_FreeValue(ctx, s->cb[0]); s->cb[0] = JS_UNDEFINED;
+            JS_FreeValue(ctx, s->cb[1]); s->cb[1] = JS_UNDEFINED;
+            if (!JS_IsObject(cb_result)) {   /* IteratorNext step 3 */
+                JS_FreeValue(ctx, cb_result);
+                JS_ThrowTypeError(ctx, "iterator result not an object");
+                return -1;
+            }
+            s->item = cb_result; cb_result = JS_UNDEFINED;
+            s->hdr.stage = CONCAT_PH_DONE;
+        }
+        if (s->hdr.stage == CONCAT_PH_DONE) {
+            JSValue dv = JS_UNDEFINED;
+            r = step_getprop_run(ctx, &s->hdr, s->item, JS_ATOM_done, cb_result, &dv, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            if (!JS_ToBoolFree(ctx, dv)) {
+                s->hdr.stage = CONCAT_PH_VALUE;
+            } else {
+                JS_FreeValue(ctx, s->item); s->item = JS_UNDEFINED;
+                it = js_iter_concat_data(ctx, s->self);   /* the read may have run page code */
+                DCHECK(it != NULL, "Iterator.concat: the receiver lost its data across its `done` read");
+                js_iter_concat_advance(ctx, it);
+                s->hdr.stage = CONCAT_PH_HEAD;
+                continue;
+            }
+        }
+        DCHECK(s->hdr.stage == CONCAT_PH_VALUE, "Iterator.concat .next(): unknown stage");
+        {
+            JSValue vv = JS_UNDEFINED;
+            r = step_getprop_run(ctx, &s->hdr, s->item, JS_ATOM_value, cb_result, &vv, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            JS_FreeValue(ctx, s->item); s->item = JS_UNDEFINED;
+            s->result = js_create_iterator_result(ctx, vv, false);
+            return JS_IsException(s->result) ? -1 : 0;
+        }
+    }
+}
+
+static JSValue js_iter_concat_next_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSIterConcatNext *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    int i;
+    if (s->held) {   /* the re-entrancy guard is lowered however the walk ended */
+        JSIteratorConcatData *it = JS_GetOpaque(s->self, JS_CLASS_ITERATOR_CONCAT);
+        DCHECK(it != NULL, "Iterator.concat: the receiver lost its data before its guard was lowered");
         it->running = false;
     }
-    while (it->index < it->count) {
-        pval = &it->values[it->index++];
-        JS_FreeValue(ctx, *pval);
-        *pval = JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    for (i = 0; i < 2; i++) JS_FreeValue(ctx, s->cb[i]);
+    JS_FreeValue(ctx, s->item);
+    JS_FreeValue(ctx, s->self);
+    js_free(ctx, s);
+    return r;
+}
+
+static int js_iter_concat_return_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSIterConcatReturn *s = st;
+    JSIteratorConcatData *it;
+    int r;
+
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        s->self = JS_UNDEFINED; s->result = JS_UNDEFINED; s->cb[0] = JS_UNDEFINED; s->cb[1] = JS_UNDEFINED;
+        it = js_iter_concat_data(ctx, s->hdr.this_val);
+        if (!it) return -1;
+        if (it->running) { JS_ThrowTypeError(ctx, "already running"); return -1; }
+        s->self = js_dup(s->hdr.this_val);
+        s->hdr.stage = JS_IsUndefined(it->iter) ? 3 : 1;   /* nothing live to close */
     }
-    JS_FreeValue(ctx, it->iter);
-    JS_FreeValue(ctx, it->next);
-    it->iter = JS_UNDEFINED;
-    it->next = JS_UNDEFINED;
-    return ret;
+    if (s->hdr.stage == 1) {
+        JSValue rm = JS_UNDEFINED;
+        it = js_iter_concat_data(ctx, s->self);
+        DCHECK(it != NULL, "Iterator.concat .return(): the receiver lost its data");
+        r = step_getprop_run(ctx, &s->hdr, it->iter, JS_ATOM_return, cb_result, &rm, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        it = js_iter_concat_data(ctx, s->self);
+        DCHECK(it != NULL, "Iterator.concat .return(): the receiver lost its data across its `return` read");
+        /* the C body called whatever the read produced and let JS_CallFree raise on a non-callable, so a nullish
+           `return` was a TypeError rather than a no-op. That is what it did, and it is kept: this is not
+           GetMethod — 27.1.4.1.2's concat iterator calls the property it read. */
+        s->cb[0] = js_dup(it->iter);
+        s->cb[1] = rm;
+        it->running = true;
+        s->held = 1;
+        s->hdr.stage = 2;
+        *out_cb = s->cb; *out_argc = 0;
+        return 3;
+    }
+    if (s->hdr.stage == 2) {
+        it = js_iter_concat_data(ctx, s->self);
+        DCHECK(it != NULL, "Iterator.concat .return(): the receiver lost its data across its `return` call");
+        it->running = false;
+        s->held = 0;
+        s->result = cb_result;
+        s->hdr.stage = 3;
+        if (JS_IsException(s->result)) { s->result = JS_UNDEFINED; return -1; }
+    }
+    DCHECK(s->hdr.stage == 3, "Iterator.concat .return(): unknown stage");
+    it = js_iter_concat_data(ctx, s->self);
+    DCHECK(it != NULL, "Iterator.concat .return(): the receiver lost its data before its release");
+    while (it->index < it->count) {
+        JSValue *pv = &it->values[it->index++];
+        JS_FreeValue(ctx, *pv);
+        *pv = JS_UNDEFINED;
+    }
+    JS_FreeValue(ctx, it->iter);  it->iter = JS_UNDEFINED;
+    JS_FreeValue(ctx, it->next);  it->next = JS_UNDEFINED;
+    return 0;
+}
+
+static JSValue js_iter_concat_return_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSIterConcatReturn *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    int i;
+    if (s->held) {
+        JSIteratorConcatData *it = JS_GetOpaque(s->self, JS_CLASS_ITERATOR_CONCAT);
+        DCHECK(it != NULL, "Iterator.concat: the receiver lost its data before its guard was lowered");
+        it->running = false;
+    }
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    for (i = 0; i < 2; i++) JS_FreeValue(ctx, s->cb[i]);
+    JS_FreeValue(ctx, s->self);
+    js_free(ctx, s);
+    return r;
 }
 
 static const JSCFunctionListEntry js_iterator_concat_proto_funcs[] = {
-    JS_ITERATOR_NEXT_DEF("next", 1, js_iterator_concat_next, 0 ),
-    JS_CFUNC_DEF("return", 1, js_iterator_concat_return ),
+    JS_CFUNC_STEP_DEF("next", 1, STEPDEF_ITER_CONCAT_NEXT ),
+    JS_CFUNC_STEP_DEF("return", 1, STEPDEF_ITER_CONCAT_RETURN ),
     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "Iterator Concat", JS_PROP_CONFIGURABLE ),
 };
 
