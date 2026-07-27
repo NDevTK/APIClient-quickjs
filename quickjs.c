@@ -18635,6 +18635,9 @@ static void js_toprim_abandon(JSContext *ctx, struct JSToPrim *tp);
 /* The chain is not homogeneous: a machine's outer is another machine, EXCEPT that a machine invoked as a
    coercion method (`{valueOf: [].sort}`) is waited on by a ToPrimitive sequence. The kind on each link says which,
    so the walk asks rather than assuming — assuming would free a JSToPrim through JSStepHdr's teardown. */
+#define CONT_FROM_CTOR    27   /* declared with its record, JSFromCtor, further down; the step-chain abandon here
+                                  is one of the three places that has to know the kind. */
+static void js_from_ctor_abandon(JSContext *ctx, void *st);
 static void tramp_step_chain_free(JSContext *ctx, void *st)
 {
     while (st) {
@@ -18644,6 +18647,10 @@ static void tramp_step_chain_free(JSContext *ctx, void *st)
         tramp_step_state_free(ctx, h, false);
         if (nxt && nk == CONT_TOPRIM) {
             js_toprim_abandon(ctx, nxt);   /* which walks whatever waits on IT */
+            return;
+        }
+        if (nxt && nk == CONT_FROM_CTOR) {
+            js_from_ctor_abandon(ctx, nxt);
             return;
         }
         DCHECK(!nxt || nk == CONT_STEP, "step outer continuation: unknown sequence kind");
@@ -19193,6 +19200,31 @@ typedef struct JSIterFrom { int orig_cfirst, orig_cargc; uint8_t orig_is_tail;
                                   acquire cannot be the read's outer continuation directly — a consumer's delivery
                                   finishes an ACQUISITION, not a property read — so this carries it across the read
                                   and re-enters the acquire with the method in hand. */
+/* CONT_FROM_CTOR (declared above tramp_step_chain_free, which needs the value):
+   cont_state = JSFromCtor: 23.1.2.1 step 6.b's Construct(C) — Array.from's result
+                                  object, built between GetMethod(@@iterator) and GetIterator's Call. C is
+                                  whatever the page put on `this`, so the Construct is USER CODE; it went through
+                                  JS_CallConstructor, which drives a bytecode constructor to completion and cannot
+                                  run a step-machine one at all. The record holds the @@iterator METHOD across it,
+                                  because the acquire is only half done when the Construct starts. */
+typedef struct JSFromCtor {
+    JSValueConst iterable;   /* BORROWED, exactly as JSAcquireGet's is: the consumer's own call operand */
+    void *consumer;          /* the JSIterConsume waiting for its result object */
+    uint8_t consumer_kind;
+    JSValue ctor;            /* C, OWNED across the Construct — con_func only borrows it */
+    JSValue method;          /* the @@iterator method, OWNED; the acquire resumes with it in hand */
+} JSFromCtor;
+struct JSIterConsume;
+static void js_iter_consume_end(JSContext *ctx, struct JSIterConsume *s);
+static void js_from_ctor_abandon(JSContext *ctx, void *st)
+{
+    JSFromCtor *fc = st;
+    JS_FreeValue(ctx, fc->ctor);
+    JS_FreeValue(ctx, fc->method);
+    js_iter_consume_end(ctx, (struct JSIterConsume *)fc->consumer);
+    js_free_rt(ctx->rt, fc->consumer);
+    js_free_rt(ctx->rt, fc);
+}
 typedef struct JSAcquireGet {
     JSValueConst iterable;   /* BORROWED: it is the consumer's own call operand, which lives on the caller's stack
                                 for the consumer's whole lifetime — the same borrow the acquire already makes. */
@@ -19468,6 +19500,7 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_IMPORT:
     case CONT_CONSUME_GETITER:
     case CONT_ACQUIRE_GET:
+    case CONT_FROM_CTOR:
     case CONT_FOROF_NEXT:
     case CONT_TOPRIM:
     case CONT_GETPROP:
@@ -22617,6 +22650,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         uint8_t ckind = con_outer_kind;
                         cont_st = con_outer;
                         con_outer = NULL; con_outer_kind = CONT_NONE;
+                        if (ckind == CONT_FROM_CTOR) {
+                            if (unlikely(JS_IsException(ret_val))) {
+                                js_from_ctor_abandon(ctx, cont_st);
+                                cont_st = NULL;
+                                goto exception;
+                            }
+                            goto do_from_ctor_deliver;
+                        }
                         DCHECK(ckind == CONT_STEP, "do_construct_dispatch: unknown outer sequence kind");
                         if (unlikely(JS_IsException(ret_val))) goto step_abandon;
                         goto do_step_step;
@@ -23217,6 +23258,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         ret_val = r; cont_st = souter;
                         if (souter_kind == CONT_TOPRIM)
                             goto do_toprim_step;   /* the machine WAS a coercion method */
+                        if (souter_kind == CONT_FROM_CTOR)
+                            goto do_from_ctor_deliver;   /* the machine WAS a step constructor */
                         DCHECK(souter_kind == CONT_STEP, "step outer continuation: unknown sequence kind");
                         goto do_step_step;
                     }
@@ -23852,6 +23895,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
             }
 
+        do_from_ctor_deliver:
+            /* Array.from's result object exists (ret_val): put it on the consumer and resume the acquire exactly
+               where it left off, with the @@iterator method back in hand. */
+            {
+                JSFromCtor *fc = cont_st;
+                JSIterConsume *fs2 = (JSIterConsume *)fc->consumer;
+                DCHECK(fc->consumer_kind == CONT_ITER_CONSUME,
+                       "Array.from's Construct is waited on by an iterator-consume machine and nothing else");
+                DCHECK(JS_IsUndefined(fs2->r), "Array.from's result object is built exactly once");
+                fs2->r = ret_val;
+                tramp_consume_state = fc->consumer;
+                tramp_consume_kind = fc->consumer_kind;
+                tramp_consume_iterable = fc->iterable;
+                tramp_iter_getiter = fc->method;
+                JS_FreeValue(ctx, fc->ctor);
+                js_free_rt(rt, fc);
+                cont_st = NULL;
+            }
+            /* fall through */
         do_consume_acquire_have_method:
             /* GetIterator with @@iterator IN HAND (tramp_iter_getiter), however it was obtained. */
             {
@@ -23943,14 +24005,42 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         fs->from_ctor = JS_UNDEFINED;
                         fs->from_owes_result = 0;
                         DCHECK(JS_IsUndefined(fs->r), "Array.from's result object is built exactly once");
-                        fs->r = JS_IsConstructor(ctx, ctor) ? JS_CallConstructor(ctx, ctor, 0, NULL)
-                                                            : JS_NewArray(ctx);
-                        JS_FreeValue(ctx, ctor);
-                        if (JS_IsException(fs->r)) {
-                            fs->r = JS_UNDEFINED;
-                            JS_FreeValue(ctx, method);
-                            tramp_consume_acquired = JS_EXCEPTION;
-                            goto do_consume_deliver_iterator;
+                        if (!JS_IsConstructor(ctx, ctor)) {
+                            JS_FreeValue(ctx, ctor);
+                            fs->r = JS_NewArray(ctx);   /* ArrayCreate(0): no user code at all */
+                            if (JS_IsException(fs->r)) {
+                                fs->r = JS_UNDEFINED;
+                                JS_FreeValue(ctx, method);
+                                tramp_consume_acquired = JS_EXCEPTION;
+                                goto do_consume_deliver_iterator;
+                            }
+                        } else {
+                            /* Construct(C) on THIS chain: the acquire is only half done, so the @@iterator method
+                               and the consumer ride a JSFromCtor until the object comes back. Re-entering
+                               do_consume_acquire_have_method then re-runs only its GetMethod outcomes, which are
+                               side-effect-free with a callable method in hand, and skips this block because
+                               from_owes_result is already cleared. */
+                            JSFromCtor *fc = js_mallocz(ctx, sizeof(*fc));
+                            if (unlikely(!fc)) {
+                                JS_FreeValue(ctx, ctor); JS_FreeValue(ctx, method);
+                                JS_ThrowOutOfMemory(ctx);
+                                tramp_consume_acquired = JS_EXCEPTION;
+                                goto do_consume_deliver_iterator;
+                            }
+                            fc->iterable = iterable;
+                            fc->consumer = tramp_consume_state;
+                            fc->consumer_kind = tramp_consume_kind;
+                            fc->ctor = ctor;
+                            fc->method = method;
+                            tramp_consume_state = NULL; tramp_consume_kind = CONT_NONE;
+                            tramp_consume_iterable = JS_UNDEFINED;
+                            con_func = fc->ctor; con_ntgt = fc->ctor;
+                            con_args = NULL; con_argc = 0;
+                            con_from_super = 0; con_super_ref = JS_UNDEFINED;
+                            con_outer = fc; con_outer_kind = CONT_FROM_CTOR;
+                            tramp_first = 0; tramp_is_tail = 0;
+                            cont_st = fc;   /* the abandon paths read it */
+                            goto do_construct_dispatch;
                         }
                     }
                 }
@@ -25937,6 +26027,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         JS_FreeValue(ctx, super_ref);
                         cont_st = couter;
                         if (couter_kind == CONT_ITER_CONSUME) goto do_iter_consume_step;
+                        if (couter_kind == CONT_FROM_CTOR) goto do_from_ctor_deliver;
                         DCHECK(couter_kind == CONT_STEP, "construct outer continuation: unknown machine kind");
                         goto do_step_step;
                     }
@@ -29499,7 +29590,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             if (cs->outer) {
                 /* the machine that requested this construct is abandoned with it — otherwise its collected array,
                    iterator and callback state leak on every throwing constructor. */
-                if (cs->outer_kind == CONT_ITER_CONSUME) {
+                if (cs->outer_kind == CONT_FROM_CTOR) {
+                    js_from_ctor_abandon(ctx, cs->outer);
+                } else if (cs->outer_kind == CONT_ITER_CONSUME) {
                     js_iter_consume_end(ctx, (struct JSIterConsume *)cs->outer);
                     js_free_rt(rt, cs->outer);
                 } else {
@@ -52837,11 +52930,12 @@ fail:
     return JS_EXCEPTION;
 }
 
-/* 23.1.1.1 in full. Its `prototype` read is still performed HERE, from C, and exactly ONE site is why: the
-   ITERABLE branch of Array.from, whose Construct(C) sits inside do_consume_acquire_iterator (23.1.2.1 steps
-   6.a-6.c) and still goes through JS_CallConstructor. js_array_of and JS_ArraySpeciesCreate's two callers — the
-   other three — are machines now and JS_ArraySpeciesCreate is deleted. Routing that Construct back into the
-   acquire is the constructor's last subproblem; converting the constructor before it turns that call into an
+/* 23.1.1.1 in full. Its `prototype` read is still performed HERE, from C, and exactly ONE C CONSTRUCT site is
+   left to explain why: TypedArraySpeciesCreate. `%TypedArray%[@@species]` is the page's, so `ta.map(fn)` with the
+   species set to Array constructs THIS from js_typed_array___speciesCreate, which the two TypedArray map/filter
+   machines call from C — and a step-machine constructor cannot be run from there at all. Four sites came before
+   it and are gone: js_array_of's Construct, JS_ArraySpeciesCreate's concat and slice/splice (deleted with it),
+   and Array.from's iterable-branch Construct. Converting the constructor before the fifth turns `ta.map` into an
    abort, which is the order this file keeps. */
 static JSValue js_array_constructor(JSContext *ctx, JSValueConst new_target,
                                     int argc, JSValueConst *argv)
