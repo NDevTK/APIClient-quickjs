@@ -19763,6 +19763,11 @@ typedef struct JSIteratorHelperData {
     JSValue inner_next;      /* flatMap: the inner iterator's .next method (its source runs on the tramp too) */
     uint8_t drive_inner;     /* flatMap: 1 = the next DRIVE targets it->inner (not it->obj) */
     uint8_t drive_close;     /* take: 1 = the next DRIVE calls the source's .return() (close-on-limit) instead of .next() */
+    uint8_t drive_pending;   /* 1 = the call now in flight is a .next()/.return() DRIVE, not the map/filter callback.
+                                WHICH it is cannot be read off the operand shape: do_generic_callee's proxy arm
+                                replaces the pushed [iter, next] with the trap's five and its bound arm with a
+                                flattened list, so a proxied .next() counted as a callback and aborted. The machine
+                                asked for the call, so the machine is what says which one it asked for. */
     JSValue cb_value;        /* map/filter: the source value held across a callback that runs on the tramp (owned) */
 } JSIteratorHelperData;
 enum { ITH_DIRECT = 0, ITH_FOROF, ITH_ITERNEXT, ITH_CONSUME };
@@ -20142,6 +20147,9 @@ typedef struct JSIterConsume {
                             done path is re-entered after it) */
     uint8_t closing; /* 1 = the sink short-circuited: close the iterator on the tramp, then finish */
     uint8_t cb_pending; /* ITERTERM: 1 = `res` on the next step entry is the CALLBACK's result, not an iterator result */
+    uint8_t drive_pending; /* 1 = the call now in flight is the record's .next() DRIVE, not a callback or an adder.
+                              The operand shape cannot answer this — a PROXIED .next() is reshaped to the trap's
+                              five operands — so the machine that asked records what it asked for. */
     JSValue cb_value;   /* ITERTERM: the element held across a callback that runs on the tramp (owned) */
     uint8_t abrupt;  /* 1 = the sink completed ABRUPTLY with an exception pending. It returns 2 so the shared
                         close-then-finish runs IteratorClose (spec IfAbruptCloseIterator), and the close must
@@ -21409,14 +21417,16 @@ static bool tramp_unwrap_iter_next(JSValueConst *piter, JSValueConst *pnext) {
 /* THE iterator-.next drive, asked in ONE place. A consumer holding an (iterator, nextMethod) record and a
    continuation has exactly these ways to run that .next(): unwrap a WrapForValidIterator to the record it
    forwards to, hand a lazy Iterator Helper to its own step machine, run a generator body on the tramp, run a
-   bytecode .next() on the tramp — and, when none of those apply, call a C .next() in place (no body, nothing to
-   suspend), which is the FALLTHROUGH each site finishes with because only the site knows how to settle it.
+   bytecode .next() on the tramp — and, for every other callee kind, the ONE convergence point, which delivers
+   the continuation the site declared. Each site used to finish with its own JS_Call instead, on the theory that
+   a non-bytecode .next() has no body to suspend — false for a BOUND or a PROXIED one, and false for the built-in
+   ARRAY iterator, whose length and element reads are the page's code on an accessor or a Proxy.
    Written out per consumer, the copies drifted exactly as the body-entry list did: Promise.all never asked the
    HELPER question (so Promise.all(iter.map(f)) reached js_iterator_helper_next's DFAIL), the consume arm asked it
    by looking at the RECEIVER's class instead of the method (so a user-patched helper.next was ignored and the
    built-in ran anyway), and none of them unwrapped. A site now declares only its record, its state and its cont
    kind. */
-#define TRAMP_DRIVE_ITER_NEXT(diter, dnext, statep, kindc)                                              \
+#define TRAMP_DRIVE_ITER_NEXT(diter, dnext, statep, kindc, pdrive)                                      \
     do {                                                                                                 \
         tramp_unwrap_iter_next(&(diter), &(dnext));                                                      \
         if (tramp_can_call_iter_helper((dnext), (diter))) {                                              \
@@ -21439,8 +21449,12 @@ static bool tramp_unwrap_iter_next(JSValueConst *piter, JSValueConst *pnext) {
         *sp++ = js_dup(dnext);                                                                            \
         call_argv = sp; call_argc = 0; tramp_first = -2; tramp_is_tail = 0;                              \
         tramp_cont_state = (statep); tramp_cont_kind = (kindc);                                          \
+        /* set HERE, not at the site: the three arms above never reach a delivery (a helper re-enters its own    \
+           step, a generator settles through do_generator_settle), so a flag raised before them would still be   \
+           standing when the machine's NEXT call — a callback — was delivered. */                                \
+        if (pdrive) *(uint8_t *)(pdrive) = 1;                                                             \
         if (tramp_can_call(call_argv[-1])) goto do_tramp_call;                                            \
-        tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;                                            \
+        goto do_generic_callee;                                                                           \
     } while (0)
 
 /* forced-exec FLOW-CONTROL hooks (see JSFlowControlHooks in quickjs.h) — the scheduler's control over
@@ -23700,6 +23714,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         cont_st = dcs;
                         goto do_helper_deliver;
                     }
+                    if (dck == CONT_PROMISE_ALL) {
+                        TAKE_CALL_SHAPE();
+                        cont_st = dcs;
+                        goto do_promise_all_deliver;
+                    }
                     if (dck == CONT_STEP || dck == CONT_TOPRIM) {
                         /* a SEQUENCE's call — a step machine's callback, the ToPrimitive method walk. Its operands
                            live in the sequence's own buffer, never on the caller's stack, so there is nothing to
@@ -25027,15 +25046,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                source), so it is delivered rather than intercepted here. */
             {
                 JSValue *cargv = sp - call_pop;
-                int nops = call_pop - call_first_r;
-                /* 2 = a PLAIN iterator's .next() ([iter, next]) — the only shape whose result must be an
-                   iterator-result object; 3 = a Set's one-argument adder ([this, add, value]); 4 = a 2-arg
-                   callback or a Map's adder ([this, set, key, value]); 5 = reduce's 3-arg callback. */
-                DCHECK(nops == 2 || nops == 3 || nops == 4 || nops == 5,
-                       "consume callback has an unexpected operand shape");
+                int drive = ((JSIterConsume *)cont_st)->drive_pending;
+                ((JSIterConsume *)cont_st)->drive_pending = 0;
+                DCHECK(call_pop >= call_first_r, "consume call records operands ending below where they start");
                 for (i = call_first_r; i < call_pop; i++) JS_FreeValue(ctx, cargv[i]);
                 sp += call_first_r - call_pop;
-                if (nops == 2 && !JS_IsException(ret_val) && !JS_IsObject(ret_val)) {
+                /* IteratorNext's step 3: only a .next() DRIVE owes "the result must be an Object". A callback or
+                   an adder owes nothing. */
+                if (drive && !JS_IsException(ret_val) && !JS_IsObject(ret_val)) {
                     JS_FreeValue(ctx, ret_val); ret_val = JS_UNINITIALIZED;
                     js_iter_consume_end(ctx, (JSIterConsume *)cont_st); js_free_rt(rt, cont_st);
                     JS_ThrowTypeError(ctx, "iterator result not an object");
@@ -25245,13 +25263,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 /* CALL: drive the record's .next() on this chain. Any settle re-enters do_iter_consume_step with
                    the result; a C .next() has no body to suspend, so it is called in-loop just below. */
                 { JSValueConst di = s->iter, dn = s->next;
-                  TRAMP_DRIVE_ITER_NEXT(di, dn, s, CONT_ITER_CONSUME); }
-                { JSValue nr = JS_Call(ctx, call_argv[-1], call_argv[-2], 0, NULL);
-                  JS_FreeValue(ctx, call_argv[-1]); JS_FreeValue(ctx, call_argv[-2]); sp -= 2;
-                  if (JS_IsException(nr)) { js_iter_consume_end(ctx, s); js_free_rt(rt, s); goto exception; }
-                  if (!JS_IsObject(nr)) { JS_FreeValue(ctx, nr); js_iter_consume_end(ctx, s); js_free_rt(rt, s);
-                                          JS_ThrowTypeError(ctx, "iterator result not an object"); goto exception; }
-                  ret_val = nr; goto do_iter_consume_step; }
+                  TRAMP_DRIVE_ITER_NEXT(di, dn, s, CONT_ITER_CONSUME, &s->drive_pending); }
             }
 
         do_promise_all_consume_tramp:
@@ -25303,6 +25315,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 goto do_consume_acquire_iterator;   /* GetIterator + its throw-rejects-the-aggregate live in the shared deliver */
             }
 
+        do_promise_all_deliver:
+            /* THE ONE delivery of a Promise combinator's call: either the PLAIN-iterator .next() ([iter, next],
+               nops 2) or the aggregate FINALIZE settle ([this, fn, arg], nops 3), from any frame kind. For .next
+               the step consumes the {value,done} in ret_val; for finalize the step's `finalizing` flag makes it
+               return DONE, ignoring ret_val. The non-object case is enforced by js_promise_all_step, not here. A
+               generator .next settles via do_generator_settle instead. */
+            {
+                JSValue *cargv = sp - call_pop;
+                DCHECK(call_pop >= call_first_r, "promise-all call records operands ending below where they start");
+                for (i = call_first_r; i < call_pop; i++) JS_FreeValue(ctx, cargv[i]);
+                sp += call_first_r - call_pop;
+            }
+            /* fall through */
         do_promise_all_step:
             /* ret_val = the previous .next() result {value,done} (UNINITIALIZED on the first step). Feed it in, then
                either wrap the next value into Promise.resolve(v).then(resolve_element) and drive the next .next(), or
@@ -25378,11 +25403,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    thing keeping a non-generator out, so widening it segfaulted on Promise.all([]). */
                 s->driving_next = 1;   /* an abrupt during this .next()/its result extraction must NOT close the iter */
                 { JSValueConst di = s->iter, dn = s->next;
-                  TRAMP_DRIVE_ITER_NEXT(di, dn, s, CONT_PROMISE_ALL); }
-                { JSValue nr = JS_Call(ctx, call_argv[-1], call_argv[-2], 0, NULL);
-                  JS_FreeValue(ctx, call_argv[-1]); JS_FreeValue(ctx, call_argv[-2]); sp -= 2;
-                  if (JS_IsException(nr)) goto promise_all_err;
-                  ret_val = nr; goto do_promise_all_step; }   /* the non-object case is enforced by js_promise_all_step */
+                  TRAMP_DRIVE_ITER_NEXT(di, dn, s, CONT_PROMISE_ALL, NULL); }
             }
 
         do_async_from_sync_tramp:
@@ -25589,13 +25610,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                path owns it, so it is delivered rather than intercepted. */
             {
                 JSValue *cargv = sp - call_pop;
-                int nops = call_pop - call_first_r;
-                DCHECK(nops == 2 || nops == 4, "helper callback has an unexpected operand shape");
+                int drive = ((JSIteratorHelperData *)cont_st)->drive_pending;
+                ((JSIteratorHelperData *)cont_st)->drive_pending = 0;
+                DCHECK(call_pop >= call_first_r, "helper call records operands ending below where they start");
                 for (i = call_first_r; i < call_pop; i++) JS_FreeValue(ctx, cargv[i]);
                 sp += call_first_r - call_pop;   /* drop [this, next] or [this, func, value, index] */
-                if (nops == 2 && !JS_IsException(ret_val) && !JS_IsObject(ret_val)) {
+                if (drive && !JS_IsException(ret_val) && !JS_IsObject(ret_val)) {
                     JS_FreeValue(ctx, ret_val); ret_val = JS_UNINITIALIZED;
                     ((JSIteratorHelperData *)cont_st)->executing = 0;
+                    /* the helper is abrupt, so its consumer can never be re-entered — the same obligation the
+                       step's own <0 and the callback frame's unwind carry. */
+                    js_iter_helper_drop_consumer(ctx, (JSIteratorHelperData *)cont_st);
                     JS_ThrowTypeError(ctx, "iterator result not an object");
                     goto exception;
                 }
@@ -25698,12 +25723,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     /* the helper's own chain walk (map(filter(g))) went `it = inner; continue;` — re-entering the
                        label with cont_st is the same step with the same UNINITIALIZED result, and it lets this site
                        share the ONE drive. */
-                    TRAMP_DRIVE_ITER_NEXT(drive_obj, drive_next, it, CONT_ITER_HELPER);
-                    { JSValue nr = JS_Call(ctx, call_argv[-1], call_argv[-2], 0, NULL);
-                      JS_FreeValue(ctx, call_argv[-1]); JS_FreeValue(ctx, call_argv[-2]); sp -= 2;
-                      if (JS_IsException(nr)) { it->executing = 0; goto exception; }
-                      if (!JS_IsObject(nr)) { JS_FreeValue(ctx, nr); it->executing = 0; JS_ThrowTypeError(ctx, "iterator result not an object"); goto exception; }
-                      ret_val = nr; continue; }
+                    TRAMP_DRIVE_ITER_NEXT(drive_obj, drive_next, it, CONT_ITER_HELPER, &it->drive_pending);
                 }
             }
 
@@ -26531,17 +26551,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto do_consume_deliver;
                 }
                 if (rck == CONT_PROMISE_ALL) {
-                    /* a Promise combinator's bytecode callback driven on the tramp returned: either the PLAIN-iterator
-                       .next() ([iter, next], nops 2) or the aggregate FINALIZE settle ([this, fn, arg], nops 3). Drop
-                       its operands and resume the step. For .next the step consumes the {value,done} in ret_val; for
-                       finalize the step's `finalizing` flag makes it return DONE, ignoring ret_val. A generator .next
-                       settles via do_generator_settle instead; this arm is only the non-generator tramp drives. */
-                    JSValue *cargv = sp - cargc;
-                    DCHECK(cargc - cfirst == 2 || cargc - cfirst == 3, "promise-all cont frame has an unexpected operand shape");
-                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
-                    sp += cfirst - cargc;
+                    call_first_r = cfirst; call_pop = cargc;
                     cont_st = rcs;
-                    goto do_promise_all_step;
+                    goto do_promise_all_deliver;
                 }
                 if (rck == CONT_ITER_HELPER) {
                     /* the map/filter callback returned: resume the helper step with its result. do_tramp_call DUPS
