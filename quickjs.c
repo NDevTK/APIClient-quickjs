@@ -54957,8 +54957,10 @@ static JSValue js_array_with_fini(JSContext *ctx, void *st, bool take_result)
    source's `length`, each HasProperty and each Get, and the final Set(A,"length",n). js_array_concat performed
    all of them from C, so a @@species constructor, a @@isConcatSpreadable getter or a Proxy `get` trap with a
    loop in it had no flow base and aborted at its back-edge.
-   Stages: 0 ToObject, 1 ArraySpeciesCreate, 2 element head + IsConcatSpreadable, 3 that source's length,
-   4 HasProperty(k), 5 Get(k), 6 Set(A,"length",n). */
+   Stages: 0 ToObject, 1 ArraySpeciesCreate, 2 element head + IsConcatSpreadable, 7 the whole-element define,
+   3 that source's length, 4 HasProperty(k), 5 Get(k), 8 the element define, 6 Set(A,"length",n). (7 and 8 are
+   out of order because they were added after the rest; a stage is a wire value in a suspended state, and
+   renumbering to tidy the list would silently repoint anything parked at the old one.) */
 typedef struct JSArrayConcat {
     JSStepHdr hdr;       /* MUST be first: the generic step driver casts the state to JSStepHdr * */
     JSValue obj;         /* ToObject(this) (owned) */
@@ -55020,14 +55022,19 @@ static int js_array_concat_step(JSContext *ctx, void *st, JSValue cb_result, JSV
                     JS_ThrowTypeError(ctx, "Array loo long");
                     return -1;
                 }
-                if (JS_DefinePropertyValueInt64Const(ctx, s->arr, s->n, e,
-                                                     JS_PROP_C_W_E | JS_PROP_THROW) < 0)
-                    return -1;
-                s->n++;
-                s->i++;
-                continue;   /* stays at stage 2: the next element */
+                s->hdr.stage = 7;
+            } else {
+                s->hdr.stage = 3;
             }
-            s->hdr.stage = 3;
+        }
+        if (s->hdr.stage == 7) {   /* the whole element appended: CreateDataPropertyOrThrow is the page's */
+            r = step_defidx_run(ctx, &s->hdr, s->arr, s->n, e, cb_result, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->n++;
+            s->i++;
+            s->hdr.stage = 2;
+            continue;
         }
         if (s->hdr.stage == 3) {
             r = step_length_run(ctx, &s->hdr, e, cb_result, &s->len, out_cb, out_argc);
@@ -55040,7 +55047,9 @@ static int js_array_concat_step(JSContext *ctx, void *st, JSValue cb_result, JSV
             s->k = 0;
             s->hdr.stage = 4;
         }
-        for (;;) {
+        /* GUARDED on the three stages this walk owns: a resume lands at the top of the machine, and an
+           unguarded loop here would run the element Get for a flow that had suspended elsewhere. */
+        while (s->hdr.stage == 4 || s->hdr.stage == 5 || s->hdr.stage == 8) {
             if (s->hdr.stage == 4) {
                 if (s->k >= s->len) { JS_FreeValue(ctx, cb_result); s->i++; s->hdr.stage = 2; break; }
                 r = step_hasidx_run(ctx, &s->hdr, e, s->k, cb_result, &s->present, out_cb, out_argc);
@@ -55049,15 +55058,16 @@ static int js_array_concat_step(JSContext *ctx, void *st, JSValue cb_result, JSV
                 if (!s->present) { s->k++; s->n++; continue; }   /* a HOLE: the result keeps it a hole */
                 s->hdr.stage = 5;
             }
-            r = step_getidx_run(ctx, &s->hdr, e, s->k, cb_result, &s->el, out_cb, out_argc);
+            if (s->hdr.stage == 5) {
+                r = step_getidx_run(ctx, &s->hdr, e, s->k, cb_result, &s->el, out_cb, out_argc);
+                cb_result = JS_UNDEFINED;
+                if (r) return r < 0 ? -1 : r;
+                s->hdr.stage = 8;
+            }
+            r = step_defidx_run(ctx, &s->hdr, s->arr, s->n, s->el, cb_result, out_cb, out_argc);
             cb_result = JS_UNDEFINED;
             if (r) return r < 0 ? -1 : r;
-            {
-                JSValue el = s->el;
-                s->el = JS_UNDEFINED;   /* the define CONSUMES it, so the state must let go first */
-                if (JS_DefinePropertyValueInt64(ctx, s->arr, s->n, el, JS_PROP_C_W_E | JS_PROP_THROW) < 0)
-                    return -1;
-            }
+            JS_FreeValue(ctx, s->el); s->el = JS_UNDEFINED;   /* the define BORROWS it */
             s->k++; s->n++;
             s->hdr.stage = 4;
         }
@@ -56908,9 +56918,10 @@ exception:
    Proxy trap and no prototype lookup is reachable, so they are the same computation with no observable step — not
    a second implementation of one.
    Stages: 0 ToObject, 1 length, 2 start, 3 the second index, 4 ArraySpeciesCreate, 5 copy head, 6 HasProperty,
-   7 Get, 8 Set(A,"length",n), 9 splice's tail head, 13 the element shift, 10 delete, 11 the inserted items,
-   12 Set(O,"length",newLen). (13 is out of order because it was added after the rest; a stage is a wire value in
-   a suspended state, and renumbering to tidy the list would silently repoint anything parked at the old one.) */
+   7 Get, 14 the element define, 8 Set(A,"length",n), 9 splice's tail head, 13 the element shift, 10 delete,
+   11 the inserted items, 12 Set(O,"length",newLen). (13 and 14 are out of order because they were added after
+   the rest; a stage is a wire value in a suspended state, and renumbering to tidy the list would silently
+   repoint anything parked at the old one.) */
 
 static int js_array_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
@@ -57000,7 +57011,7 @@ static int js_array_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
     }
     /* GUARDED on the two stages this walk owns: a resume lands at the top of the machine, and an unguarded loop
        here would run the element Get for a flow that had suspended in the splice tail. */
-    while (s->hdr.stage == 6 || s->hdr.stage == 7) {
+    while (s->hdr.stage == 6 || s->hdr.stage == 7 || s->hdr.stage == 14) {
         if (s->hdr.stage == 6) {
             if (s->k >= s->final) { JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED; s->hdr.stage = 8; break; }
             r = step_hasidx_run(ctx, &s->hdr, s->obj, s->k, cb_result, &s->present, out_cb, out_argc);
@@ -57009,15 +57020,16 @@ static int js_array_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
             if (!s->present) { s->k++; s->n++; continue; }   /* a HOLE stays a hole in the result */
             s->hdr.stage = 7;
         }
-        r = step_getidx_run(ctx, &s->hdr, s->obj, s->k, cb_result, &s->el, out_cb, out_argc);
+        if (s->hdr.stage == 7) {
+            r = step_getidx_run(ctx, &s->hdr, s->obj, s->k, cb_result, &s->el, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->hdr.stage = 14;
+        }
+        r = step_defidx_run(ctx, &s->hdr, s->arr, s->n, s->el, cb_result, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
-        {
-            JSValue el = s->el;
-            s->el = JS_UNDEFINED;   /* the create CONSUMES it, so the state must let go first */
-            if (JS_CreateDataPropertyUint32(ctx, s->arr, s->n, el, JS_PROP_THROW) < 0)
-                return -1;
-        }
+        JS_FreeValue(ctx, s->el); s->el = JS_UNDEFINED;   /* the define BORROWS it */
         s->k++; s->n++;
         s->hdr.stage = 6;
     }
