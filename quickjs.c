@@ -52809,10 +52809,12 @@ fail:
     return JS_EXCEPTION;
 }
 
-/* 23.1.1.1 in full. Its `prototype` read is still performed HERE, from C, because the Array constructor is
-   reached by C CONSTRUCT sites that are not machines yet — js_array_of and JS_ArraySpeciesCreate (concat, slice,
-   splice). Those are its subproblem: each has to become a step machine before this can declare itself one, and
-   converting the constructor first turns their JS_CallConstructor into an abort. */
+/* 23.1.1.1 in full. Its `prototype` read is still performed HERE, from C, and exactly ONE site is why: the
+   ITERABLE branch of Array.from, whose Construct(C) sits inside do_consume_acquire_iterator (23.1.2.1 steps
+   6.a-6.c) and still goes through JS_CallConstructor. js_array_of and JS_ArraySpeciesCreate's two callers — the
+   other three — are machines now and JS_ArraySpeciesCreate is deleted. Routing that Construct back into the
+   acquire is the constructor's last subproblem; converting the constructor before it turns that call into an
+   abort, which is the order this file keeps. */
 static JSValue js_array_constructor(JSContext *ctx, JSValueConst new_target,
                                     int argc, JSValueConst *argv)
 {
@@ -53726,51 +53728,6 @@ static JSValue js_get_this(JSContext *ctx, JSValueConst this_val)
     return js_dup(this_val);
 }
 
-static JSValue JS_ArraySpeciesCreate(JSContext *ctx, JSValueConst obj,
-                                     JSValueConst len_val)
-{
-    JSValue ctor, ret, species;
-    int res;
-    JSContext *realm;
-
-    res = js_is_array(ctx, obj);
-    if (res < 0)
-        return JS_EXCEPTION;
-    if (!res)
-        return js_array_constructor(ctx, JS_UNDEFINED, 1, &len_val);
-    ctor = JS_GetProperty(ctx, obj, JS_ATOM_constructor);
-    if (JS_IsException(ctor))
-        return ctor;
-    if (JS_IsConstructor(ctx, ctor)) {
-        /* legacy web compatibility */
-        realm = JS_GetFunctionRealm(ctx, ctor);
-        if (!realm) {
-            JS_FreeValue(ctx, ctor);
-            return JS_EXCEPTION;
-        }
-        if (realm != ctx &&
-            js_same_value(ctx, ctor, realm->array_ctor)) {
-            JS_FreeValue(ctx, ctor);
-            ctor = JS_UNDEFINED;
-        }
-    }
-    if (JS_IsObject(ctor)) {
-        species = JS_GetProperty(ctx, ctor, JS_ATOM_Symbol_species);
-        JS_FreeValue(ctx, ctor);
-        if (JS_IsException(species))
-            return species;
-        ctor = species;
-        if (JS_IsNull(ctor))
-            ctor = JS_UNDEFINED;
-    }
-    if (JS_IsUndefined(ctor)) {
-        return js_array_constructor(ctx, JS_UNDEFINED, 1, &len_val);
-    } else {
-        ret = JS_CallConstructor(ctx, ctor, 1, &len_val);
-        JS_FreeValue(ctx, ctor);
-        return ret;
-    }
-}
 
 static const JSCFunctionListEntry js_array_funcs[] = {
     JS_CFUNC_DEF("isArray", 1, js_array_isArray ),
