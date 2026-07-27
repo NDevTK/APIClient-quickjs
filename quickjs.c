@@ -20115,6 +20115,14 @@ typedef struct {
                                 other.has(element). There is no keys() iterator here — THIS's own [[SetData]] is
                                 walked, which invokes nothing — so the only user code is the per-element `has`
                                 CALL, and that is the capability the other three set-operations were waiting on. */
+/* 7.3.35 GroupBy(items, callback, keyCoercion) — the walk behind Object.groupBy and Map.groupBy. Its magic is
+   the base plus the COERCION kind, the same way the terminals and the set-operations name themselves. The two
+   differ only in how the key is canonicalised (ToPropertyKey vs SameValueZero) and what holds the groups; the
+   walk, the callback and the abrupt handling are one. */
+#define ITERCONS_GROUPBY_BASE 12
+#define GROUPBY_PROPERTY   0   /* Object.groupBy: a null-prototype object keyed by ToPropertyKey(key) */
+#define GROUPBY_COLLECTION 1   /* Map.groupBy: a Map keyed by CanonicalizeKeyedCollectionKey(key) */
+#define ITERCONS_GROUPBY   ITERCONS_GROUPBY_BASE
 #define ITERCONS_SUMPRECISE 7 /* Math.sumPrecise(iterable): no result object at all — `sum` accumulates exactly and the
                                  finish yields the correctly-rounded double. A non-number element is an
                                  IfAbruptCloseIterator TypeError like every other sink's bad element. */
@@ -21766,6 +21774,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSValueConst tac_ntgt = JS_UNDEFINED;
     JSValue tac_super_ref = JS_UNDEFINED;   /* the super() entry's owned parent-class ref; the state frees it */
     uint8_t setop_kind = 0;                             /* s.union/symmetricDifference recognition: SETOP_* (consumed by do_setop_consume_tramp) */
+    uint8_t groupby_kind = 0;                           /* Object.groupBy / Map.groupBy: GROUPBY_* (consumed by do_groupby_consume_tramp) */
     uint8_t icons_sink = ITERCONS_FROM;                 /* which builtin do_iter_consume_tramp is serving: ITERCONS_FROM (Array.from) or ITERCONS_SUMPRECISE (Math.sumPrecise) */
     /* APPLY-mode body entry: f.apply(this,arr) / Reflect.apply(f,this,arr) / f(...spread). The args come from the
        ARRAY into the callee's OWN frame (never the caller stack, whose compiled size the array length could
@@ -23476,6 +23485,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             setop_kind = (uint8_t)(csink - ITERCONS_SETOP_BASE);
                             goto do_setop_consume_tramp;
                         }
+                        if (csink == ITERCONS_GROUPBY_BASE + GROUPBY_PROPERTY
+                            || csink == ITERCONS_GROUPBY_BASE + GROUPBY_COLLECTION) {
+                            /* 7.3.35 step 2's IsCallable is observed BEFORE `items` is touched, so it answers up
+                               here with the other pre-probe validations rather than below the probe — which also
+                               means a throw here cannot strand the probed @@iterator. The acquire then performs
+                               the whole of GetIterator, which is what the probe was only ever an optimisation
+                               for. */
+                            if (check_function(ctx, (call_argc >= 2) ? call_argv[1] : JS_UNDEFINED))
+                                goto exception;
+                            groupby_kind = (uint8_t)(csink - ITERCONS_GROUPBY_BASE);
+                            goto do_groupby_consume_tramp;
+                        }
                         if (csink >= ITERCONS_ITERTERM_BASE) {
                             /* GetIteratorDirect(this) requires an Object — 27.1.4.x step 1, validation with no
                                user code in it. The recognizer used to DECLINE a non-Object and let the C entry
@@ -24916,6 +24937,37 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 goto do_consume_acquire_iterator;
             }
 
+        do_groupby_consume_tramp:
+            /* Object.groupBy(items, cb) / Map.groupBy(items, cb): create the container and consume `items` on
+               this chain, calling cb per element. Its C body drove the iterator with JS_IteratorNext and the
+               callback with JS_Call, and got three things wrong besides: it passed globalThis as the callback's
+               receiver where the spec passes UNDEFINED (which a STRICT callback can see), it never closed the
+               iterator when the callback threw (step 5.e is an IfAbruptCloseIterator site), and Object.groupBy
+               coerced the key TWICE — once for the read and once for the write — so a key object's toString ran
+               twice per element. */
+            {
+                JSIterConsume *s;
+                JSValue box = (groupby_kind == GROUPBY_PROPERTY)
+                              ? JS_NewObjectProto(ctx, JS_NULL)
+                              : js_map_constructor(ctx, JS_UNDEFINED, 0, NULL, 0);
+                DCHECK(JS_IsUndefined(tramp_iter_getiter),
+                       "GroupBy answers above the @@iterator probe, so there is none to hand to its acquire");
+                if (JS_IsException(box)) goto exception;
+                s = js_iter_consume_new(ctx);
+                if (unlikely(!s)) { JS_FreeValue(ctx, box); JS_ThrowOutOfMemory(ctx); goto exception; }
+                s->r = box;
+                s->mapfn = (call_argc >= 2) ? js_dup(call_argv[1]) : JS_UNDEFINED;
+                s->k = 0;
+                s->sink = ITERCONS_GROUPBY;
+                s->setop = groupby_kind;
+                TAKE_CALL_SHAPE(); s->orig_cfirst = call_first_r; s->orig_cargc = call_pop; s->orig_is_tail = tramp_is_tail;
+                s->args_own = call_args_owned; s->args_own_n = call_args_owned_n;
+                call_args_owned = NULL; call_args_owned_n = 0;
+                tramp_consume_iterable = (call_argc >= 1) ? call_argv[0] : JS_UNDEFINED;
+                tramp_consume_state = s; tramp_consume_kind = CONT_ITER_CONSUME;
+                goto do_consume_acquire_iterator;
+            }
+
         do_objentries_consume_tramp:
             /* Object.fromEntries(gen): create the empty result object and consume the generator, defining
                r[entry[0]] = entry[1] per element on THIS chain. call_argv[0] = the generator. */
@@ -25205,6 +25257,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (s->setrec_pending) {
                         DCHECK(s->setrec_ph == 1, "GetSetRecord's ToPrimitive arm entered outside the size phase");
                         tp_value = s->cb_value; tp_hint = HINT_NUMBER;   /* ToNumber(rawSize) */
+                    } else if (s->cb_pending == 13) {
+                        tp_value = s->ent_key; tp_hint = HINT_STRING;    /* GroupBy's ToPropertyKey(key) */
                     } else if (s->cb_pending == 5 || s->cb_pending == 8) {
                         tp_value = s->cb_value; tp_hint = HINT_NUMBER;
                     } else {
@@ -52386,95 +52440,6 @@ static JSValue js_object_getOwnPropertySymbols(JSContext *ctx, JSValueConst this
     return JS_GetOwnPropertyNames2(ctx, argv[0], JS_GPN_SYMBOL_MASK);
 }
 
-static JSValue js_object_groupBy(JSContext *ctx, JSValueConst this_val,
-                                 int argc, JSValueConst *argv)
-{
-    JSValue res, iter, next, groups, k, v, prop;
-    JSValueConst cb, args[2];
-    int64_t idx;
-    int done;
-
-    // "is function?" check must be observed before argv[0] is accessed
-    cb = argv[1];
-    if (check_function(ctx, cb))
-        return JS_EXCEPTION;
-
-    // TODO(bnoordhuis) add fast path for arrays but as groupBy() is
-    // defined in terms of iterators, the fast path must check that
-    // this[Symbol.iterator] is the built-in array iterator
-    iter = JS_GetIterator(ctx, argv[0], /*is_async*/false);
-    if (JS_IsException(iter))
-        return JS_EXCEPTION;
-
-    k = JS_UNDEFINED;
-    v = JS_UNDEFINED;
-    prop = JS_UNDEFINED;
-    groups = JS_UNDEFINED;
-
-    next = JS_GetProperty(ctx, iter, JS_ATOM_next);
-    if (JS_IsException(next))
-        goto exception;
-
-    groups = JS_NewObjectProto(ctx, JS_NULL);
-    if (JS_IsException(groups))
-        goto exception;
-
-    for (idx = 0; ; idx++) {
-        v = JS_IteratorNext(ctx, iter, next, 0, NULL, &done);
-        if (JS_IsException(v))
-            goto exception;
-        if (done)
-            break; // v is JS_UNDEFINED
-
-        args[0] = v;
-        args[1] = js_int64(idx);
-        k = JS_Call(ctx, cb, ctx->global_obj, 2, args);
-        if (JS_IsException(k))
-            goto exception;
-
-        k = js_dup(k);
-        prop = JS_GetPropertyValue(ctx, groups, k);
-        if (JS_IsException(prop))
-            goto exception;
-
-        if (JS_IsUndefined(prop)) {
-            prop = JS_NewArray(ctx);
-            if (JS_IsException(prop))
-                goto exception;
-            k = js_dup(k);
-            prop = js_dup(prop);
-            if (JS_SetPropertyValue(ctx, groups, k, prop,
-                                    JS_PROP_C_W_E|JS_PROP_THROW) < 0) {
-                goto exception;
-            }
-        }
-
-        res = js_int32(js_array_private_push(ctx, prop, v));
-        if (JS_IsException(res))
-            goto exception;
-        // res is an int64
-
-        JS_FreeValue(ctx, prop);
-        JS_FreeValue(ctx, k);
-        JS_FreeValue(ctx, v);
-        prop = JS_UNDEFINED;
-        k = JS_UNDEFINED;
-        v = JS_UNDEFINED;
-    }
-
-    JS_FreeValue(ctx, iter);
-    JS_FreeValue(ctx, next);
-    return groups;
-
-exception:
-    JS_FreeValue(ctx, prop);
-    JS_FreeValue(ctx, k);
-    JS_FreeValue(ctx, v);
-    JS_FreeValue(ctx, groups);
-    JS_FreeValue(ctx, iter);
-    JS_FreeValue(ctx, next);
-    return JS_EXCEPTION;
-}
 
 static JSValue js_object_keys(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv)
@@ -52964,7 +52929,7 @@ static const JSCFunctionListEntry js_object_funcs[] = {
     JS_CFUNC_DEF("defineProperties", 2, js_object_defineProperties ),
     JS_CFUNC_DEF("getOwnPropertyNames", 1, js_object_getOwnPropertyNames ),
     JS_CFUNC_DEF("getOwnPropertySymbols", 1, js_object_getOwnPropertySymbols ),
-    JS_CFUNC_DEF("groupBy", 2, js_object_groupBy ),
+    JS_CFUNC_CONSUME_DEF("groupBy", 2, ITERCONS_GROUPBY_BASE + GROUPBY_PROPERTY ),
     JS_CFUNC_DEF("keys", 1, js_object_keys ),
     JS_CFUNC_STEP_DEF("values", 1, STEPDEF_OBJ_VALUES ),
     JS_CFUNC_STEP_DEF("entries", 1, STEPDEF_OBJ_ENTRIES ),
@@ -54207,6 +54172,69 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
               { s->abrupt = 1; return 2; }   /* consumes res + v */ }
         return 1;                            /* entry done: drive the next .next() */
     }
+    if (s->cb_pending == 12 || s->cb_pending == 13) {
+        /* GroupBy: 12 = the callback's KEY just arrived; 13 = the PROPERTY variant's ToPropertyKey settled to a
+           primitive. Either way the element is waiting and the group it belongs to is now known. */
+        uint8_t gwhich = s->cb_pending;
+        JSValue gkey = res, gel;
+        s->cb_pending = 0;
+        if (gwhich == 12) {
+            gel = s->cb_value; s->cb_value = JS_UNDEFINED;
+            if (JS_IsException(gkey)) { JS_FreeValue(ctx, gel); s->abrupt = 1; return 2; }
+            if (s->setop == GROUPBY_PROPERTY && JS_VALUE_GET_TAG(gkey) == JS_TAG_OBJECT) {
+                /* ToPropertyKey's user-code half: the key's @@toPrimitive / toString / valueOf. Coercing it ONCE
+                   is the point — the C body ran it for the read and again for the write. */
+                s->ent_key = gkey; s->ent_val = gel;
+                s->cb_pending = 13;
+                return 5;
+            }
+        } else {
+            gel = s->ent_val; s->ent_val = JS_UNDEFINED;
+            JS_FreeValue(ctx, s->ent_key); s->ent_key = JS_UNDEFINED;
+            if (JS_IsException(gkey)) { JS_FreeValue(ctx, gel); s->abrupt = 1; return 2; }
+        }
+        /* AddValueToKeyedGroup. The container is FRESH — a null-prototype object or a Map whose [[MapData]] the
+           spec appends to directly — so neither the lookup nor the insert can reach the page. */
+        if (s->setop == GROUPBY_PROPERTY) {
+            JSAtom gat = JS_ValueToAtom(ctx, gkey);   /* `gkey` is a primitive here: no user code left */
+            JSValue garr;
+            JS_FreeValue(ctx, gkey);
+            if (gat == JS_ATOM_NULL) { JS_FreeValue(ctx, gel); s->abrupt = 1; return 2; }
+            garr = JS_GetProperty(ctx, s->r, gat);
+            if (JS_IsException(garr)) { JS_FreeAtom(ctx, gat); JS_FreeValue(ctx, gel); s->abrupt = 1; return 2; }
+            if (JS_IsUndefined(garr)) {
+                garr = JS_NewArray(ctx);
+                if (JS_IsException(garr)) { JS_FreeAtom(ctx, gat); JS_FreeValue(ctx, gel); return -1; }
+                if (JS_DefinePropertyValue(ctx, s->r, gat, js_dup(garr), JS_PROP_C_W_E | JS_PROP_THROW) < 0) {
+                    JS_FreeAtom(ctx, gat); JS_FreeValue(ctx, garr); JS_FreeValue(ctx, gel); return -1;
+                }
+            }
+            JS_FreeAtom(ctx, gat);
+            if (js_array_private_push(ctx, garr, gel) < 0) { JS_FreeValue(ctx, garr); JS_FreeValue(ctx, gel); return -1; }
+            JS_FreeValue(ctx, garr);
+            JS_FreeValue(ctx, gel);
+            return 1;
+        }
+        {
+            JSMapState *gms = JS_GetOpaque(s->r, JS_CLASS_MAP);
+            JSMapRecord *gmr;
+            DCHECK(gms != NULL, "Map.groupBy: r must be the result Map");
+            gkey = map_normalize_key(ctx, gkey);
+            gmr = map_find_record(ctx, gms, gkey);
+            if (!gmr) {
+                JSValue garr = JS_NewArray(ctx);
+                if (JS_IsException(garr)) { JS_FreeValue(ctx, gkey); JS_FreeValue(ctx, gel); return -1; }
+                gmr = map_add_record(ctx, gms, gkey);   /* dups the key */
+                if (!gmr) { JS_FreeValue(ctx, gkey); JS_FreeValue(ctx, garr); JS_FreeValue(ctx, gel);
+                            JS_ThrowOutOfMemory(ctx); return -1; }
+                gmr->value = garr;
+            }
+            JS_FreeValue(ctx, gkey);
+            if (js_array_private_push(ctx, gmr->value, gel) < 0) { JS_FreeValue(ctx, gel); return -1; }
+            JS_FreeValue(ctx, gel);
+            return 1;
+        }
+    }
     if (s->cb_pending) {
         /* `res` is the ITERTERM callback's RESULT (it ran on the tramp), not an iterator result. */
         JSValue value = s->cb_value, fret = res;
@@ -54451,6 +54479,14 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
             s->cb_value = value;
             s->cb_pending = 4;
             return 7;
+        } else if (s->sink == ITERCONS_GROUPBY) {
+            /* step 5.e: Call(callback, undefined, «value, k») — the page's code, so it runs on the tramp and the
+               element waits in cb_value for its key. */
+            DCHECK(JS_IsUndefined(s->cb_value), "the consume machine already holds an element");
+            s->k++;
+            s->cb_value = value;
+            s->cb_pending = 12;
+            return 3;
         } else if (s->sink == ITERCONS_OBJENTRIES) {
             /* Object.fromEntries: the entry must be an object; r[entry[0]] = entry[1]. The two element reads and
                the key's ToPropertyKey are USER CODE, so each is a phase the interpreter runs on the tramp and
@@ -68171,91 +68207,6 @@ static JSValue js_map_forEach(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
-static JSValue js_map_groupBy(JSContext *ctx, JSValueConst this_val,
-                              int argc, JSValueConst *argv)
-{
-    JSValue res, iter, next, groups, k, v, prop;
-    JSValueConst cb, args[2];
-    int64_t idx;
-    int done;
-
-    // "is function?" check must be observed before argv[0] is accessed
-    cb = argv[1];
-    if (check_function(ctx, cb))
-        return JS_EXCEPTION;
-
-    iter = JS_GetIterator(ctx, argv[0], /*is_async*/false);
-    if (JS_IsException(iter))
-        return JS_EXCEPTION;
-
-    k = JS_UNDEFINED;
-    v = JS_UNDEFINED;
-    prop = JS_UNDEFINED;
-    groups = JS_UNDEFINED;
-
-    next = JS_GetProperty(ctx, iter, JS_ATOM_next);
-    if (JS_IsException(next))
-        goto exception;
-
-    groups = js_map_constructor(ctx, JS_UNDEFINED, 0, NULL, 0);
-    if (JS_IsException(groups))
-        goto exception;
-
-    for (idx = 0; ; idx++) {
-        v = JS_IteratorNext(ctx, iter, next, 0, NULL, &done);
-        if (JS_IsException(v))
-            goto exception;
-        if (done)
-            break; // v is JS_UNDEFINED
-
-        args[0] = v;
-        args[1] = js_int64(idx);
-        k = JS_Call(ctx, cb, ctx->global_obj, 2, args);
-        if (JS_IsException(k))
-            goto exception;
-
-        prop = js_map_get(ctx, groups, 1, vc(&k), 0);
-        if (JS_IsException(prop))
-            goto exception;
-
-        if (JS_IsUndefined(prop)) {
-            prop = JS_NewArray(ctx);
-            if (JS_IsException(prop))
-                goto exception;
-            args[0] = k;
-            args[1] = prop;
-            res = js_map_set(ctx, groups, 2, args, 0);
-            if (JS_IsException(res))
-                goto exception;
-            JS_FreeValue(ctx, res);
-        }
-
-        res = js_int32(js_array_private_push(ctx, prop, v));
-        if (JS_IsException(res))
-            goto exception;
-        // res is an int64
-
-        JS_FreeValue(ctx, prop);
-        JS_FreeValue(ctx, k);
-        JS_FreeValue(ctx, v);
-        prop = JS_UNDEFINED;
-        k = JS_UNDEFINED;
-        v = JS_UNDEFINED;
-    }
-
-    JS_FreeValue(ctx, iter);
-    JS_FreeValue(ctx, next);
-    return groups;
-
-exception:
-    JS_FreeValue(ctx, prop);
-    JS_FreeValue(ctx, k);
-    JS_FreeValue(ctx, v);
-    JS_FreeValue(ctx, groups);
-    JS_FreeValue(ctx, iter);
-    JS_FreeValue(ctx, next);
-    return JS_EXCEPTION;
-}
 
 static void js_map_finalizer(JSRuntime *rt, JSValueConst val)
 {
@@ -68544,7 +68495,7 @@ static int JS_WriteSet(BCWriterState *s, struct JSMapState *map_state)
    it, and js_call_c_function's JS_CFUNC_consume arm is the backstop for a call site that was never routed. */
 
 static const JSCFunctionListEntry js_map_funcs[] = {
-    JS_CFUNC_DEF("groupBy", 2, js_map_groupBy ),
+    JS_CFUNC_CONSUME_DEF("groupBy", 2, ITERCONS_GROUPBY_BASE + GROUPBY_COLLECTION ),
     JS_CGETSET_DEF("[Symbol.species]", js_get_this, NULL ),
 };
 
