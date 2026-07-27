@@ -20119,7 +20119,7 @@ typedef struct JSArraySort {
     JSStepHdr hdr;                  /* MUST be first: the generic step driver casts the state to JSStepHdr * and
                                        writes def/orig_c* through it. Without this the driver overwrote `obj`
                                        with the step-def pointer, and the corruption only surfaced far away in
-                                       js_array_sort_end's teardown. */
+                                       the teardown. */
     JSValue obj;                    /* the array object (owned) */
     JSValueConst method;            /* the comparator (borrowed from the caller's live stack) */
     struct ValueSlot *array, *tmp;  /* present-non-undefined elements + merge scratch */
@@ -20130,6 +20130,8 @@ typedef struct JSArraySort {
     uint8_t cmp_ph;                 /* the DEFAULT ordering coerces two operands; this says which one is due.
                                        The header's str_phase resumes each ToString, this says whose. */
     int64_t col_i;                  /* the COLLECT cursor: which index is being gathered */
+    int64_t wb;                     /* the WRITEBACK cursor: which index is being put back. It is also what
+                                       tells the teardown which slots the writeback has not consumed yet. */
     int present;                    /* HasProperty(O, k) for that index — sort skips holes */
     uint8_t elem_ph;                /* 0 = the ask is due, 1 = the read is due */
     JSValue coerced;                /* the string a ToString delivered, until the slot adopts it (owned) */
@@ -20137,7 +20139,6 @@ typedef struct JSArraySort {
 } JSArraySort;
 static int js_array_sort_step(JSContext *ctx, struct JSArraySort *s, JSValue res, JSValueConst out_args[2],
                               JSValue **out_cb, int *out_argc);
-static JSValue js_array_sort_end(JSContext *ctx, struct JSArraySort *s, bool ok);
 static int js_array_sort_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_sort_vfini(JSContext *ctx, void *st, bool take_result);
 
@@ -57788,7 +57789,7 @@ exception:
 }
 
 /* read the present, non-undefined elements into s->array (undefined -> the end, holes -> after that), alloc tmp,
-   set up the first merge block. Returns 0 ok / -1 exception (safe to js_array_sort_end). */
+   set up the first merge block. Returns 0 ok / -1 exception (safe to tear down). */
 /* The receiver half. `method` is hdr.argv[0] — owned by the header for the machine's whole life, which is why
    the state can borrow it. */
 static int js_array_sort_recv(JSContext *ctx, JSArraySort *s)
@@ -57796,7 +57797,7 @@ static int js_array_sort_recv(JSContext *ctx, JSArraySort *s)
     int64_t i;
     s->obj = JS_UNDEFINED; s->method = step_arg(&s->hdr, 0); s->array = NULL; s->tmp = NULL;
     s->n = 0; s->len = 0; s->undefined_count = 0; s->pending = 0;
-    s->width = 1; s->i = 0; s->lo = s->mid = s->hi = s->l = s->r = s->k = 0;
+    s->width = 1; s->i = 0; s->lo = s->mid = s->hi = s->l = s->r = s->k = 0; s->wb = 0;
     for (i = 0; i < 4; i++) s->cb_args[i] = JS_UNDEFINED;
     s->obj = JS_ToObject(ctx, s->hdr.this_val);
     if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
@@ -57931,43 +57932,27 @@ static int js_array_sort_step(JSContext *ctx, JSArraySort *s, JSValue res, JSVal
             s->l = s->lo; s->r = s->mid; s->k = s->lo;
         }
     }
-    return 0;   /* caller writes the sorted array back in js_array_sort_end */
+    return 0;   /* the merge is done: js_array_sort_vstep writes the sorted list back */
 }
 
-/* On ok: write the sorted elements back to obj, then the undefineds, then delete the holes; return obj (owned,
-   transferred to caller). On failure: free everything, return JS_EXCEPTION. Either way the state is released. */
-static JSValue js_array_sort_end(JSContext *ctx, JSArraySort *s, bool ok)
+/* Release one gathered slot: the element and the ToString the default ordering cached on it. The writeback
+   calls this as each slot lands, and the teardown calls it for every slot the writeback did not reach — which
+   is why s->wb is the single boundary between the two. */
+static void sort_slot_release(JSContext *ctx, ValueSlot *v)
 {
-    int64_t i, w = 0;
-    if (!ok) goto fail;
-    while (w < s->n) {                               /* sorted present elements back in place */
-        /* the default-ordering path caches each element's ToString in .str; release it here, exactly as the
-           rqsort writeback did. Nothing populated .str while only comparator sorts reached this machine, which
-           is why its absence was invisible until the default path was folded in. */
-        if (s->array[w].str) { JS_FreeValue(ctx, JS_MKPTR(JS_TAG_STRING, s->array[w].str)); s->array[w].str = NULL; }
-        if (s->array[w].pos == w) { JS_FreeValue(ctx, s->array[w].val); }
-        else if (JS_SetPropertyInt64(ctx, s->obj, w, s->array[w].val) < 0) { w++; goto fail; }
-        w++;
-    }
-    js_free(ctx, s->array); s->array = NULL;
-    js_free(ctx, s->tmp); s->tmp = NULL;
-    for (i = w; s->undefined_count-- > 0; i++)
-        if (JS_SetPropertyInt64(ctx, s->obj, i, JS_UNDEFINED) < 0) goto fail2;
-    for (; i < s->len; i++)
-        if (JS_DeletePropertyInt64(ctx, s->obj, i, JS_PROP_THROW) < 0) goto fail2;
-    return s->obj;
-fail:
-    for (; w < s->n; w++) {
-        if (s->array[w].str) JS_FreeValue(ctx, JS_MKPTR(JS_TAG_STRING, s->array[w].str));
-        JS_FreeValue(ctx, s->array[w].val);
-    }
-    js_free(ctx, s->array); s->array = NULL;
-    js_free(ctx, s->tmp); s->tmp = NULL;
-fail2:
-    JS_FreeValue(ctx, s->obj); s->obj = JS_UNDEFINED;
-    return JS_EXCEPTION;
+    if (v->str) { JS_FreeValue(ctx, JS_MKPTR(JS_TAG_STRING, v->str)); v->str = NULL; }
+    JS_FreeValue(ctx, v->val); v->val = JS_UNDEFINED;
 }
 
+/* DELETED: js_array_sort_end. It performed 23.1.3.30 steps 8-9 — the Set of every sorted element back onto the
+   receiver and the DeletePropertyOrThrow of the trailing holes — from fini, a TEARDOWN path. A teardown cannot
+   suspend, so a `set` or `deleteProperty` trap with a loop in it had no flow base there; and it could not raise
+   the exception a rejecting trap produces either, because fini's result is the machine's value, not a status.
+   Those steps are stages 7-9 of js_array_sort_vstep now, and fini only releases.
+   It also skipped the Set for any element whose sorted position equalled its original one (`pos == w`). Step 8
+   has no such case: `[1,2,3]` behind a Proxy fired NO `set` trap at all where the spec fires three, and a sort
+   that permutes nothing on a FROZEN array succeeded silently where the spec throws. `pos` survives only as the
+   stable-sort tiebreak it also is. */
 /* The sort recognizer is DELETED. Its comment used to say a default sort or a native comparator "stays on rqsort"
    — that sentence WAS the dual system: it named the second implementation the recognizer existed to select. With
    rqsort's body gone and the default ordering folded into js_array_sort_step, there is nothing to select. */
@@ -58050,25 +58035,71 @@ static int js_array_sort_vstep(JSContext *ctx, void *st, JSValue cb_result, JSVa
         if (r) return r < 0 ? -1 : r;
         s->hdr.stage = 3;
     }
-    r = js_array_sort_step(ctx, s, cb_result, (JSValueConst *)&s->cb_args[2], out_cb, out_argc);   /* consumes cb_result */
-    if (r < 0) return -1;
-    if (r == 5) return r;   /* the default ordering's ToString: the driver coerces and re-enters here */
-    if (r == 0) return 0;
-    s->cb_args[0] = JS_UNDEFINED;            /* the comparator gets this = undefined */
-    s->cb_args[1] = s->method;
-    *out_cb = s->cb_args; *out_argc = 2;
-    return 3;
+    if (s->hdr.stage == 3) {
+        r = js_array_sort_step(ctx, s, cb_result, (JSValueConst *)&s->cb_args[2], out_cb, out_argc);   /* consumes cb_result */
+        cb_result = JS_UNDEFINED;
+        if (r < 0) return -1;
+        if (r == 5) return r;   /* the default ordering's ToString: the driver coerces and re-enters here */
+        if (r != 0) {
+            s->cb_args[0] = JS_UNDEFINED;            /* the comparator gets this = undefined */
+            s->cb_args[1] = s->method;
+            *out_cb = s->cb_args; *out_argc = 2;
+            return 3;
+        }
+        s->wb = 0;
+        s->hdr.stage = 7;
+    }
+    /* 23.1.3.30 steps 8-9: SortIndexedProperties has produced the sorted list, and putting it back is the
+       page's code — a Set on an accessor or a `set` trap, a DeletePropertyOrThrow on a `deleteProperty` trap.
+       The element is BORROWED across its write and released once it lands, so s->wb is exactly how far the
+       teardown must not free. (toSorted's receiver is its own dense copy, so the same walk reaches no page code
+       there and its delete loop is empty — one writeback, not two.) */
+    while (s->hdr.stage == 7) {
+        if (s->wb >= s->n) { s->hdr.stage = 8; break; }
+        r = step_setidx_run(ctx, &s->hdr, s->obj, s->wb, s->array[s->wb].val, cb_result, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        sort_slot_release(ctx, &s->array[s->wb]);
+        s->wb++;
+    }
+    /* the undefineds the collect held back, in the one place the sort order puts them */
+    while (s->hdr.stage == 8) {
+        if (s->wb >= s->n + s->undefined_count) { s->hdr.stage = 9; break; }
+        r = step_setidx_run(ctx, &s->hdr, s->obj, s->wb, JS_UNDEFINED, cb_result, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->wb++;
+    }
+    /* step 9: the holes the collect skipped are deleted off the end */
+    for (;;) {
+        if (s->wb >= s->len) {
+            JS_FreeValue(ctx, cb_result);
+            DCHECK(s->n + s->undefined_count <= s->len, "the sort gathered more elements than the receiver had");
+            return 0;
+        }
+        r = step_delidx_run(ctx, &s->hdr, s->obj, s->wb, cb_result, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->wb++;
+    }
 }
 
 static JSValue js_array_sort_vfini(JSContext *ctx, void *st, bool take_result)
 {
     JSArraySort *s = st;
     JSValue r;
+    int64_t w;
     JS_FreeValue(ctx, s->coerced);   /* a ToString that landed just before an abandon */
     s->coerced = JS_UNDEFINED;
-    r = js_array_sort_end(ctx, s, take_result);   /* writes back and yields the array */
+    /* every slot the writeback has not consumed: all of them when the machine is abandoned before stage 7, the
+       tail of them when a `set` trap threw part-way through it. */
+    for (w = s->wb; w < s->n; w++)
+        sort_slot_release(ctx, &s->array[w]);
+    js_free(ctx, s->array); s->array = NULL;
+    js_free(ctx, s->tmp);   s->tmp = NULL;
+    r = take_result ? s->obj : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->obj);
     js_free(ctx, s);
-    if (!take_result) { JS_FreeValue(ctx, r); return JS_UNDEFINED; }
     return r;
 }
 
