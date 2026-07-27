@@ -24025,6 +24025,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_can_call(call_argv[-1])) {
                     tramp_cont_state = cd_outer; tramp_cont_kind = cd_outer_kind;
                     cd_outer = NULL; cd_outer_kind = CONT_NONE;
+                    /* the sequence's arguments are its OWN buffer, so the shape this call declares is EMPTY: the
+                       caller's stack is untouched. The arm below declared it and this one did not, so a bytecode
+                       callback's frame recorded the OUTER machine's operands instead — harmless only while the
+                       return dropped nothing. */
+                    call_cfirst = 0; call_cargc = 0;
                     goto do_tramp_call;               /* a bytecode body: it runs here and can park */
                 }
                 if (tramp_step_def_of(call_argv[-1])) {
@@ -24059,6 +24064,24 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    A sequence holds its operands in its OWN buffer, so the shape it declares is EMPTY — the same
                    convention an inner step machine uses, and what makes every arm over there leave the caller's
                    stack alone. */
+                /* A sequence's operands are its own request buffer, BORROWED from its state — and the arms over
+                   there REWRITE the callee in place: a trapless proxy resolves to its target, a bound function to
+                   its own. Writing through a borrowed slot frees a reference the buffer never owned, which is a
+                   premature free of the callee (`[1,2].filter(new Proxy(fn, {}))`). Hand them an OWNED copy, the
+                   same [this, f, args...] list the bound arm builds; the caller's stack stays untouched, which is
+                   what the empty shape states. */
+                {
+                    int n7 = call_argc, k7;
+                    JSValue *bl7 = js_malloc(ctx, sizeof(JSValue) * (size_t)(n7 + 2));
+                    if (unlikely(!bl7)) goto exception;
+                    bl7[0] = js_dup(call_argv[-2]);
+                    bl7[1] = js_dup(call_argv[-1]);
+                    for (k7 = 0; k7 < n7; k7++) bl7[2 + k7] = js_dup(call_argv[k7]);
+                    if (call_args_owned) free_arg_list(ctx, call_args_owned, call_args_owned_n);
+                    call_args_owned = bl7; call_args_owned_n = n7 + 2;
+                    call_argv = (JSValueConst *)&bl7[2];
+                    tramp_first = -2;
+                }
                 tramp_cont_state = cd_outer; tramp_cont_kind = cd_outer_kind;
                 cd_outer = NULL; cd_outer_kind = CONT_NONE;
                 call_cfirst = 0; call_cargc = 0;
@@ -26813,12 +26836,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                     goto do_step_step;
                 }
-                if (rck == CONT_TOPRIM) {
-                    /* the coercion method returned: feed the result to the sequence, which either delivers a
-                       primitive or moves on to the next method. Its operands live in the sequence's own buffer,
-                       so nothing on the caller's stack moves — do_toprim_step releases them on re-entry. */
+                if (rck == CONT_TOPRIM || rck == CONT_STEP) {
+                    /* a SEQUENCE's call returned — a coercion method, or a step machine's callback. Its arguments
+                       live in the sequence's own buffer, so the shape it declared is EMPTY and this drop is a
+                       no-op... UNLESS do_generic_callee reshaped the call: its PROXY arm replaces the operands
+                       with the trap's FIVE, on the caller's stack, and records THAT shape on the frame. Assuming
+                       the empty one leaked all five and left them under the caller's next operand, which then
+                       read a garbage callee — `[1,2,3].map(new Proxy(fn, {apply}))` is the whole reproduction.
+                       Whatever the frame RECORDED is what is dropped, the rule every other arm here follows. */
+                    JSValue *scargv = sp - cargc;
+                    DCHECK(cargc >= cfirst, "a sequence call records operands ending below where they start");
+                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, scargv[i]);
+                    sp += cfirst - cargc;
                     cont_st = rcs;
-                    goto do_toprim_step;
+                    if (rck == CONT_TOPRIM) goto do_toprim_step;
+                    goto do_step_step;
                 }
                 if (rck == CONT_ITER_CLOSE_CALL) {
                     /* 7.4.9 steps 5-6: the `return` method returned. */
@@ -26979,18 +27011,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JS_FreeValue(ctx, ret_val);
                     BREAK;
                 } else if (rck != CONT_NONE) {
-                    /* A C-builtin-driven CALLBACK returned: its operands live in the state's own buffer
-                       (borrowed), NOT on the caller's stack — so skip the cargv arg-free, and feed the result to
-                       that builtin's STEP instead of pushing it. The step drives the next element or finishes.
-                       ONE kind reaches here now. It used to be five: the four hand-written drivers this dispatch
-                       named (array-iteration, reduce, sort, JSON revive) were the JS_Call-loop twins of the step
-                       machines that replaced them, and each kept its own copy of the DONE/operand-pop/callback
-                       drive. CONT_ITER_CONSUME settles via do_generator_settle (its callback IS a generator
-                       drive) and never arrives here, so a stray kind is a bug, not a case to add. */
-                    DCHECK(rck == CONT_STEP, "do_return: a C-continuation fallthrough must be CONT_STEP; a stray "
-                                             "cont_kind would misread its state as a step machine's");
-                    cont_st = rcs;
-                    goto do_step_step;
+                    /* Every continuation kind is routed by an arm above; this is the backstop. It used to be
+                       CONT_STEP's own arm, which skipped the operand drop on the theory that a sequence's
+                       arguments are never on the caller's stack — true of the call it makes, false once
+                       do_generic_callee reshapes one, so that arm moved up beside CONT_TOPRIM and this became
+                       what it always should have been: a name for the kind nobody routed. */
+                    DFAIL("do_return: an unrouted continuation kind reached the fallthrough; a stray cont_kind "
+                          "would misread its state as a step machine's");
+                    goto exception;
                 }
                 if (itail) goto do_return;   /* caller was a tail-caller: propagate */
                 {
