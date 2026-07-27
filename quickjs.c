@@ -1462,6 +1462,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_NUM_TOEXPONENTIAL, STEPDEF_NUM_TOPRECISION, STEPDEF_NUM_CTOR,
     STEPDEF_ITERATOR_CTOR, STEPDEF_ARRAY_OF, STEPDEF_ARRAY_CONCAT,
     STEPDEF_WEAKREF_CTOR, STEPDEF_FINREC_CTOR, STEPDEF_ARRAY_SLICE, STEPDEF_ARRAY_SPLICE,
+    STEPDEF_DOMEXCEPTION_CTOR,
     STEPDEF_COUNT
 };
 #define HINT_NONE    2
@@ -52190,9 +52191,15 @@ static JSValue js_primargs_fini(JSContext *ctx, void *st, bool take_result)
    result), which is what a constructor that only creates looks like.
    The body OWNS obj: a constructor body already ends in `return obj` and frees it on every failure path, so
    taking it is the shape those bodies are written in. */
+/* the CLASS and the body's DECLARED ARGUMENT COUNT, packed into the declaration's `arg`. */
+#define CREATECTOR_ARG(class_id, nargs) ((class_id) | ((nargs) << 16))
+#define CREATECTOR_CLASS(a) ((a) & 0xffff)
+#define CREATECTOR_NARGS(a) (((a) >> 16) & 0xff)
 typedef struct JSCreateCtor {
     JSStepHdr hdr;
     JSValue result;
+    JSValue *argp;   /* a PADDED argument vector, only when the body reads further than the call supplied */
+    int nargp;
 } JSCreateCtor;
 
 static int js_creatector_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
@@ -52211,7 +52218,8 @@ static int js_creatector_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
     }
     /* new.target UNDEFINED is the call form of a constructor_or_func builtin (`Array(3)`): the spec's
        OrdinaryCreateFromConstructor degenerates to the intrinsic prototype, which reads nothing. */
-    r = step_create_from_ctor_run(ctx, &s->hdr, s->hdr.this_val, s->hdr.arg, cb_result, &obj, out_cb, out_argc);
+    r = step_create_from_ctor_run(ctx, &s->hdr, s->hdr.this_val, CREATECTOR_CLASS(s->hdr.arg), cb_result, &obj,
+                                  out_cb, out_argc);
     if (r) return r < 0 ? -1 : r;
     if (!s->hdr.def->body.generic) {
         s->result = obj;
@@ -52219,10 +52227,27 @@ static int js_creatector_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
     }
     DCHECK(s->hdr.def->body_proto == JS_CFUNC_generic || s->hdr.def->body_proto == JS_CFUNC_generic_magic,
            "OrdinaryCreateFromConstructor: unhandled body prototype");
-    s->result = (s->hdr.def->body_proto == JS_CFUNC_generic_magic)
-              ? s->hdr.def->body.generic_magic(ctx, obj, s->hdr.argc, (JSValueConst *)s->hdr.argv,
-                                               s->hdr.def->body_magic)
-              : s->hdr.def->body.generic(ctx, obj, s->hdr.argc, (JSValueConst *)s->hdr.argv);
+    {
+        /* js_call_c_function PADS a C body's argument vector to its declared length, so a body may read argv[1]
+           of a zero-argument call; a machine is handed the CALL's real operands, so the padding has to happen
+           here or `new DOMException()` reads one slot past the captured vector. The count rides the declaration
+           beside the class id, the same way the coerce-then-compute spec carries its own. */
+        int nargs = CREATECTOR_NARGS(s->hdr.arg);
+        JSValueConst *bargv = (JSValueConst *)s->hdr.argv;
+        if (s->hdr.argc < nargs) {
+            int i;
+            DCHECK(s->argp == NULL, "the padded argument vector is built exactly once");
+            s->argp = js_malloc(ctx, sizeof(JSValue) * (size_t)nargs);
+            if (unlikely(!s->argp)) { JS_FreeValue(ctx, obj); return -1; }
+            s->nargp = nargs;
+            for (i = 0; i < nargs; i++)
+                s->argp[i] = (i < s->hdr.argc) ? js_dup(s->hdr.argv[i]) : JS_UNDEFINED;
+            bargv = (JSValueConst *)s->argp;
+        }
+        s->result = (s->hdr.def->body_proto == JS_CFUNC_generic_magic)
+                  ? s->hdr.def->body.generic_magic(ctx, obj, s->hdr.argc, bargv, s->hdr.def->body_magic)
+                  : s->hdr.def->body.generic(ctx, obj, s->hdr.argc, bargv);
+    }
     return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
 }
 
@@ -52230,7 +52255,10 @@ static JSValue js_creatector_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSCreateCtor *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
+    int i;
     if (!take_result) JS_FreeValue(ctx, s->result);
+    for (i = 0; i < s->nargp; i++) JS_FreeValue(ctx, s->argp[i]);
+    js_free(ctx, s->argp);
     js_free(ctx, s);
     return r;
 }
@@ -55618,12 +55646,16 @@ static const JSTrampStepDef js_sab_slice_def     = { sizeof(JSABSlice), js_ab_sl
 static const JSTrampStepDef js_date_toJSON_def = { sizeof(JSDateToJSON), js_date_tojson_step, js_date_tojson_fini, 0 };
 static const JSTrampStepDef js_date_toPrim_def = { sizeof(JSDateToPrim), js_date_toprim_step, js_date_toprim_fini, 0 };
 static const JSTrampStepDef js_date_ctor_def = { sizeof(JSDateCtor), js_date_ctor_step, js_date_ctor_fini, 0 };
-/* An OrdinaryCreateFromConstructor declaration: the CLASS in `arg`, the post-create body (NULL = the object is
-   the result), and the same precheck hook the coerce-then-compute machines use for a leading validation. */
-#define CREATECTOR_DEF_FULL(class_id, proto, fn, magic, pre) \
-    { sizeof(JSCreateCtor), js_creatector_step, js_creatector_fini, (class_id), { .proto = (fn) }, \
-      JS_CFUNC_##proto, (magic), (pre), NULL, NULL }
-#define CREATECTOR_DEF(class_id, proto, fn, magic) CREATECTOR_DEF_FULL(class_id, proto, fn, magic, NULL)
+/* An OrdinaryCreateFromConstructor declaration: the CLASS and the body's DECLARED ARGUMENT COUNT in `arg`, the
+   post-create body (NULL = the object is the result), and the same precheck hook the coerce-then-compute machines
+   use for a leading validation. The count is part of the declaration for the same reason PRIMARGS carries its
+   own: js_call_c_function pads a C body's vector to its declared length and a machine gets the call's real
+   operands, so a body that reads argv[1] of a zero-argument call needs the padding built here. */
+#define CREATECTOR_DEF_FULL(class_id, nargs, proto, fn, magic, pre) \
+    { sizeof(JSCreateCtor), js_creatector_step, js_creatector_fini, CREATECTOR_ARG(class_id, nargs), \
+      { .proto = (fn) }, JS_CFUNC_##proto, (magic), (pre), NULL, NULL }
+#define CREATECTOR_DEF(class_id, nargs, proto, fn, magic) \
+    CREATECTOR_DEF_FULL(class_id, nargs, proto, fn, magic, NULL)
 static int js_array_of_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_of_fini(JSContext *ctx, void *st, bool take_result);
 static const JSTrampStepDef js_array_of_def = { sizeof(JSArrayOf), js_array_of_step, js_array_of_fini, 0 };
@@ -55640,15 +55672,22 @@ static const JSTrampStepDef js_array_concat_def =
 static int js_iterator_ctor_precheck(JSContext *ctx, const JSStepHdr *h);
 static int js_weakref_ctor_precheck(JSContext *ctx, const JSStepHdr *h);
 static JSValue js_weakref_ctor_body(JSContext *ctx, JSValueConst obj_, int argc, JSValueConst *argv);
+static int js_domexception_ctor_precheck(JSContext *ctx, const JSStepHdr *h);
+static JSValue js_domexception_ctor_body(JSContext *ctx, JSValueConst obj_, int argc, JSValueConst *argv,
+                                         int backtrace_flags);
+static const JSTrampStepDef js_domexception_ctor_def =
+    CREATECTOR_DEF_FULL(JS_CLASS_DOM_EXCEPTION, 2, generic_magic, js_domexception_ctor_body,
+                        JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL, js_domexception_ctor_precheck);
 static int js_finrec_ctor_precheck(JSContext *ctx, const JSStepHdr *h);
 static JSValue js_finrec_ctor_body(JSContext *ctx, JSValueConst obj_, int argc, JSValueConst *argv);
 static const JSTrampStepDef js_weakref_ctor_def =
-    CREATECTOR_DEF_FULL(JS_CLASS_WEAK_REF, generic, js_weakref_ctor_body, 0, js_weakref_ctor_precheck);
+    CREATECTOR_DEF_FULL(JS_CLASS_WEAK_REF, 1, generic, js_weakref_ctor_body, 0, js_weakref_ctor_precheck);
 static const JSTrampStepDef js_finrec_ctor_def =
-    CREATECTOR_DEF_FULL(JS_CLASS_FINALIZATION_REGISTRY, generic, js_finrec_ctor_body, 0, js_finrec_ctor_precheck);
+    CREATECTOR_DEF_FULL(JS_CLASS_FINALIZATION_REGISTRY, 1, generic, js_finrec_ctor_body, 0,
+                        js_finrec_ctor_precheck);
 /* 27.1.3.1 Iterator: steps 1-2 are the abstract-class validation, step 3 is the whole constructor. */
 static const JSTrampStepDef js_iterator_ctor_def =
-    CREATECTOR_DEF_FULL(JS_CLASS_ITERATOR, generic, NULL, 0, js_iterator_ctor_precheck);
+    CREATECTOR_DEF_FULL(JS_CLASS_ITERATOR, 0, generic, NULL, 0, js_iterator_ctor_precheck);
 static const JSTrampStepDef js_bigint_ctor_def =
     { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, PRIMARGS(0x1, HINT_NUMBER, 1),
       { .generic = js_bigint_constructor }, JS_CFUNC_constructor_or_func, 0, NULL, NULL, NULL };
@@ -55838,6 +55877,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_ARRAY_SPLICE]  = &js_array_splice_def,
     [STEPDEF_WEAKREF_CTOR]  = &js_weakref_ctor_def,
     [STEPDEF_FINREC_CTOR]   = &js_finrec_ctor_def,
+    [STEPDEF_DOMEXCEPTION_CTOR] = &js_domexception_ctor_def,
     [STEPDEF_ARRAY_INDEXOF]     = &js_array_indexOf_def,
     [STEPDEF_ARRAY_LASTINDEXOF] = &js_array_lastIndexOf_def,
     [STEPDEF_ARRAY_INCLUDES]    = &js_array_includes_def,
@@ -76370,16 +76410,15 @@ static void js_domexception_mark(JSRuntime *rt, JSValueConst val,
     }
 }
 
-static JSValue js_domexception_constructor0(JSContext *ctx, JSValueConst new_target,
-                                            int argc, JSValueConst *argv,
-                                            int backtrace_flags)
+/* Everything the DOMException constructor does ON the object OrdinaryCreateFromConstructor made. It OWNS obj —
+   the shape the constructor was already written in. */
+static JSValue js_domexception_ctor_body(JSContext *ctx, JSValueConst obj_,
+                                         int argc, JSValueConst *argv,
+                                         int backtrace_flags)
 {
     JSDOMExceptionData *s;
-    JSValue obj, message, name;
+    JSValue obj = (JSValue)obj_, message, name;
 
-    obj = js_create_from_ctor(ctx, new_target, JS_CLASS_DOM_EXCEPTION);
-    if (JS_IsException(obj))
-        return JS_EXCEPTION;
     if (!JS_IsUndefined(argv[0]))
         message = JS_ToString(ctx, argv[0]);
     else
@@ -76410,13 +76449,30 @@ fail1:
     return JS_EXCEPTION;
 }
 
-static JSValue js_domexception_constructor(JSContext *ctx, JSValueConst new_target,
-                                           int argc, JSValueConst *argv)
+/* WebIDL's `[Exposed] constructor` requires new; that check precedes the `prototype` read. */
+static int js_domexception_ctor_precheck(JSContext *ctx, const JSStepHdr *h)
 {
-    if (JS_IsUndefined(new_target))
-        return JS_ThrowTypeError(ctx, "constructor requires 'new'");
-    return js_domexception_constructor0(ctx, new_target, argc, argv,
-                                        JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL);
+    if (JS_IsUndefined(h->this_val)) {
+        JS_ThrowTypeError(ctx, "constructor requires 'new'");
+        return -1;
+    }
+    return 0;
+}
+
+/* The INTERNAL DOMException creations (js_new_dom_exception) pass no new.target, so the create runs nothing;
+   a REAL new.target reaches the machine. */
+static JSValue js_domexception_constructor0(JSContext *ctx, JSValueConst new_target,
+                                            int argc, JSValueConst *argv,
+                                            int backtrace_flags)
+{
+    JSValue obj;
+    DCHECK(JS_IsUndefined(new_target),
+           "the DOMException constructor reached its C entry with a real new.target — route that call site onto "
+           "the STEPDEF_DOMEXCEPTION_CTOR machine");
+    obj = js_create_from_ctor(ctx, JS_UNDEFINED, JS_CLASS_DOM_EXCEPTION);
+    if (JS_IsException(obj))
+        return JS_EXCEPTION;
+    return js_domexception_ctor_body(ctx, obj, argc, argv, backtrace_flags);
 }
 
 static JSValue js_domexception_getfield(JSContext *ctx, JSValueConst this_val,
@@ -76517,8 +76573,8 @@ int JS_AddIntrinsicDOMException(JSContext *ctx)
     JS_SetPropertyFunctionList(ctx, proto,
                                js_domexception_proto_funcs,
                                countof(js_domexception_proto_funcs));
-    ctor = JS_NewCFunction2(ctx, js_domexception_constructor, "DOMException", 2,
-                            JS_CFUNC_constructor_or_func, 0);
+    ctor = JS_NewCFunction2(ctx, NULL, "DOMException", 2,
+                            JS_CFUNC_step_ctor, STEPDEF_DOMEXCEPTION_CTOR);
     JS_SetConstructor(ctx, ctor, proto);
     for (i = 0; i < countof(js_dom_exception_names_table); i++) {
         name = JS_NewAtom(ctx, js_dom_exception_names_table[i].code_name);
