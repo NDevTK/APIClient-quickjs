@@ -19627,12 +19627,17 @@ static void js_toprim_abandon(JSContext *ctx, struct JSToPrim *tp)
    sp[-1]; an unwind has no operand to borrow, and it must carry the in-flight exception across a close that can
    SUSPEND, so neither can live in an interpreter local. This state is that difference and nothing else, which is
    why the two modes share the CONT_* kinds and the whole sequence: the state's PRESENCE is the mode. */
-typedef struct JSIterCloseExc {
+typedef struct JSIterClose {
     JSValue iter;        /* owned: the iterator being closed */
-    JSValue saved_exc;   /* owned: the exception the close must not overwrite (7.4.9's abrupt completion wins) */
-} JSIterCloseExc;
+    JSValue saved_exc;   /* owned when the completion is ABRUPT — the exception the close must not overwrite
+                            (7.4.9's abrupt completion wins). UNINITIALIZED = a NORMAL completion, whose own
+                            throw propagates and whose result must be an Object. */
+    void *outer;         /* the machine WAITING for the close to finish (a short-circuiting consumer), or NULL
+                            when the close is the unwind's own and there is nothing to resume into. */
+    uint8_t outer_kind;  /* CONT_* of `outer` */
+} JSIterClose;
 #define CONT_ITER_CLOSE    28  /* cont_state = NULL for OP_iterator_close (its iterator stays at sp[-1] for the
-                                  whole sequence), a JSIterCloseExc for an unwind close: 7.4.9 step 2's
+                                  whole sequence), a JSIterClose otherwise: 7.4.9 step 2's
                                   `? GetMethod(iterator, "return")`. */
 #define CONT_ITER_CLOSE_CALL 29 /* same split: step 3.c's Call(return, iterator). Its result is discarded; under a
                                   NORMAL completion it owes step 6's "must be an Object", and under an unwind the
@@ -24552,7 +24557,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         /* a poisoned `return` accessor. For the OPCODE's close nothing is waiting on the read and
                            the iterator it left on the stack is freed by the ordinary unwind; for an UNWIND close
                            the read's throw is discarded and the original exception wins. */
-                        if (gouter) { cont_st = gouter; goto do_iter_close_exc_done; }
+                        if (gouter) { cont_st = gouter; goto do_iter_close_finish; }
                         goto exception;
                     }
                     DCHECK(gk3 == CONT_STEP, "property-get outer continuation: unknown machine kind");
@@ -25228,17 +25233,35 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto do_iter_consume_step;
                 }
                 if (st == 2) {
-                    /* the sink short-circuited (Set.prototype.isSupersetOf found a miss): spec IteratorClose, then
-                       finish. A GENERATOR iterator's .return() (its finally) runs ON THE TRAMP and re-enters this
-                       step, which then finishes; a plain iterator closes inline. */
+                    /* the sink short-circuited (Set.prototype.isSupersetOf found a miss, an entry was not an
+                       object, a callback threw): spec IteratorClose, then finish. A GENERATOR iterator's .return()
+                       runs its finally ON THE TRAMP and re-enters this step. Everything else runs 7.4.9 itself —
+                       `? GetMethod(iterator, "return")` and the call are the page's code, and JS_IteratorClose ran
+                       both from C, so a loop in either aborted at its back-edge.
+                       Unlike the unwind's close this one has somewhere to RETURN TO, and unlike the opcode's it is
+                       not always abrupt: `s->abrupt` picks the completion, and the state names the machine to
+                       resume. Those are the two fields that make one sequence serve all three. */
                     ret_val = JS_UNINITIALIZED;
                     if (tramp_gen_method_magic(s->next, s->iter) == GEN_MAGIC_NEXT) {
                         tramp_cont_state = s; tramp_cont_kind = CONT_ITER_CONSUME; tramp_gen_cont_iter = s->iter;
                         tramp_gen_cont_consume = 1; tramp_gen_magic = GEN_MAGIC_RETURN;
                         goto do_generator_tramp;
                     }
-                    if (JS_IteratorClose(ctx, s->iter, s->abrupt) < 0) { js_iter_consume_end(ctx, s); js_free_rt(rt, s); goto exception; }
-                    goto do_iter_consume_step;
+                    {
+                        JSIterClose *ce = js_malloc(ctx, sizeof(*ce));
+                        if (unlikely(!ce)) { js_iter_consume_end(ctx, s); js_free_rt(rt, s); goto exception; }
+                        ce->iter = js_dup(s->iter);
+                        ce->outer = s; ce->outer_kind = CONT_ITER_CONSUME;
+                        if (s->abrupt) {
+                            ce->saved_exc = rt->current_exception;
+                            rt->current_exception = JS_UNINITIALIZED;
+                        } else {
+                            ce->saved_exc = JS_UNINITIALIZED;
+                        }
+                        gp_obj = ce->iter; gp_atom = JS_ATOM_return; gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                        gp_outer = ce; gp_outer_kind = CONT_ITER_CLOSE;
+                        goto do_getprop_tramp;
+                    }
                 }
                 if (st == 12) goto do_setop_consume_acquire;   /* GetSetRecord done, result seeded */
                 if (st == 0) {   /* DONE */
@@ -26609,7 +26632,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (unlikely(JS_IsException(ret_val))) {
                             /* a poisoned `return` accessor. Under an UNWIND close 7.4.9 discards its throw and the
                                original exception wins; under the opcode's close it propagates. */
-                            if (cont_st) goto do_iter_close_exc_done;
+                            if (cont_st) goto do_iter_close_finish;
                             goto exception;
                         }
                         goto do_iter_close_method;
@@ -27878,26 +27901,27 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
         do_iter_close_method:
             /* 7.4.9 steps 2-3, with ret_val holding the `return` method. cont_st is NULL for the OPCODE's close
-               (its iterator is the operand at sp[-1]) and a JSIterCloseExc for an UNWIND close (whose iterator and
+               (its iterator is the operand at sp[-1]) and a JSIterClose for an UNWIND close (whose iterator and
                saved exception are in the state). GetMethod's contract: undefined or null means there is nothing to
                close, and anything else non-callable is its TypeError. */
             {
-                JSIterCloseExc *ce = (JSIterCloseExc *)cont_st;
+                JSIterClose *ce = (JSIterClose *)cont_st;
                 JSValue clm = ret_val;
                 JSValueConst cli = ce ? ce->iter : sp[-1];
                 if (JS_IsUndefined(clm) || JS_IsNull(clm)) {
                     JS_FreeValue(ctx, clm);
-                    if (ce) goto do_iter_close_exc_done;
+                    if (ce) goto do_iter_close_finish;
                     JS_FreeValue(ctx, sp[-1]);
                     sp--;
                     BREAK;
                 }
                 if (!JS_IsFunction(ctx, clm)) {
                     JS_FreeValue(ctx, clm);
-                    /* under an abrupt completion 7.4.9 discards its OWN throw, so this TypeError is never raised
-                       there — the original exception is what propagates. */
-                    if (ce) goto do_iter_close_exc_done;
+                    /* GetMethod's TypeError is the CLOSE's own throw: under an abrupt completion the finish
+                       discards it, under a normal one it propagates. Raising it either way is what lets both
+                       modes share this exit. */
                     JS_ThrowTypeError(ctx, "not a function");
+                    if (ce) goto do_iter_close_finish;
                     goto exception;
                 }
                 if (ce) {
@@ -27906,7 +27930,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        compiled stack_size has no headroom to promise. call_cfirst/call_cargc state that the
                        caller's own operands are untouched. */
                     JSValue *cl2 = js_malloc(ctx, sizeof(JSValue) * 2);
-                    if (unlikely(!cl2)) { JS_FreeValue(ctx, clm); goto do_iter_close_exc_done; }
+                    if (unlikely(!cl2)) { JS_FreeValue(ctx, clm); goto do_iter_close_finish; }
                     cl2[0] = js_dup(cli);   /* this */
                     cl2[1] = clm;           /* the `return` method — the list adopts it */
                     TAKE_CALL_SHAPE();
@@ -27932,44 +27956,69 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             /* THE ONE completion of 7.4.9 steps 5-6 — reached from every frame kind the `return` method can have
                (a returned heap frame, a bodiless callee run in place) and from its THROW. cont_st says which mode:
                a NULL state is the opcode's close, where the method's own throw propagates and its result must be
-               an Object; a JSIterCloseExc is an unwind close, where the result AND any throw are discarded so the
+               an Object; a JSIterClose is an unwind close, where the result AND any throw are discarded so the
                original abrupt completion wins. The operand shape is in call_first_r/call_pop. */
             {
-                JSIterCloseExc *ce = (JSIterCloseExc *)cont_st;
+                JSIterClose *ce = (JSIterClose *)cont_st;
                 JSValue *cargv = sp - call_pop;
                 DCHECK(call_pop >= call_first_r, "iterator close records operands ending below where they start");
                 for (i = call_first_r; i < call_pop; i++) JS_FreeValue(ctx, cargv[i]);
                 sp += call_first_r - call_pop;
-                if (ce) {
-                    JS_FreeValue(ctx, ret_val);   /* the result, or JS_EXCEPTION — either way discarded */
-                    goto do_iter_close_exc_done;
+                /* Step 6's "the result must be an Object" belongs to a NORMAL completion, whatever mode the
+                   close is in — and under an abrupt one the result, the check and any throw are all discarded.
+                   Which is why the state's saved_exc, not its presence, decides this. */
+                if (ce && !JS_IsUninitialized(ce->saved_exc)) {
+                    JS_FreeValue(ctx, ret_val);
+                    goto do_iter_close_finish;
                 }
-                if (unlikely(JS_IsException(ret_val))) goto exception;
+                if (unlikely(JS_IsException(ret_val))) {
+                    if (ce) goto do_iter_close_finish;
+                    goto exception;
+                }
                 if (unlikely(!JS_IsObject(ret_val))) {
                     JS_FreeValue(ctx, ret_val);
                     JS_ThrowTypeErrorNotAnObject(ctx);
+                    if (ce) goto do_iter_close_finish;
                     goto exception;
                 }
                 JS_FreeValue(ctx, ret_val);
+                if (ce) goto do_iter_close_finish;
                 JS_FreeValue(ctx, sp[-1]);
                 sp--;
                 BREAK;
             }
 
-        do_iter_close_exc_done:
-            /* the unwind close is over, however it ended: drop the state, re-raise the exception it was holding
-               and carry on unwinding. `cont_st` is the JSIterCloseExc; anything the close itself threw is dropped
-               here, which is 7.4.9's "the abrupt completion wins". */
+        do_iter_close_finish:
+            /* THE end of a state-carrying close, however it ended. An exception may be pending — the `return`
+               threw, its read threw, or step 6 rejected the result. Under an ABRUPT completion 7.4.9 discards all
+               of that and re-raises the one the close interrupted; under a NORMAL one it propagates. Then the
+               machine that asked for the close is resumed, or torn down if the close failed. */
             {
-                JSIterCloseExc *ce = (JSIterCloseExc *)cont_st;
-                JSValue saved;
-                DCHECK(ce != NULL, "do_iter_close_exc_done reached with no unwind-close state");
-                saved = ce->saved_exc;
+                JSIterClose *ce = (JSIterClose *)cont_st;
+                void *co;
+                uint8_t ck;
+                bool failed;
+                DCHECK(ce != NULL, "do_iter_close_finish reached with no close state");
+                co = ce->outer; ck = ce->outer_kind;
                 JS_FreeValue(ctx, ce->iter);
+                if (!JS_IsUninitialized(ce->saved_exc)) {
+                    JS_FreeValue(ctx, rt->current_exception);
+                    rt->current_exception = ce->saved_exc;
+                }
                 js_free(ctx, ce);
                 cont_st = NULL;
-                JS_FreeValue(ctx, rt->current_exception);
-                rt->current_exception = saved;
+                failed = !JS_IsUninitialized(rt->current_exception);
+                if (co) {
+                    DCHECK(ck == CONT_ITER_CONSUME, "iterator close: unknown waiting-machine kind");
+                    if (failed) {
+                        js_iter_consume_end(ctx, (JSIterConsume *)co); js_free_rt(rt, co);
+                        goto exception;
+                    }
+                    cont_st = co;
+                    ret_val = JS_UNINITIALIZED;
+                    goto do_iter_consume_step;
+                }
+                DCHECK(failed, "a close with no waiting machine must end with the completion it interrupted");
                 goto exception;
             }
         CASE(OP_nip_catch):
@@ -30131,11 +30180,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
            operand to borrow for the iterator and the in-flight exception has to survive a suspension, so this
            mode carries a state; its presence in the continuation IS the mode. */
         {
-            JSIterCloseExc *ce = js_malloc(ctx, sizeof(*ce));
+            JSIterClose *ce = js_malloc(ctx, sizeof(*ce));
             if (unlikely(!ce)) { JS_FreeValue(ctx, ci); goto exception; }
             ce->iter = ci;
-            ce->saved_exc = rt->current_exception;
+            ce->saved_exc = rt->current_exception;   /* non-UNINITIALIZED: this close is the ABRUPT kind */
             rt->current_exception = JS_UNINITIALIZED;
+            ce->outer = NULL; ce->outer_kind = CONT_NONE;   /* the unwind's own: nothing to resume into */
             gp_obj = ci; gp_atom = JS_ATOM_return; gp_op = GP_GET; gp_val = JS_UNDEFINED;
             gp_outer = ce; gp_outer_kind = CONT_ITER_CLOSE;
             goto do_getprop_tramp;
@@ -30379,7 +30429,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             DCHECK(xcg >= xcf, "iterator-close frame records operands ending below where they start");
             for (i = xcf; i < xcg; i++) JS_FreeValue(ctx, cargv[i]);
             sp += xcf - xcg;
-            if (xcs) { cont_st = xcs; goto do_iter_close_exc_done; }
+            if (xcs) { cont_st = xcs; goto do_iter_close_finish; }
             goto exception;
         } else if (xck == CONT_FOROF_NEXT) {
             /* the plain iterator's .next() THREW. Its abrupt handling: clear the enum_rec's iterator slot (a
@@ -30500,7 +30550,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    here rather than at the in-place site). 7.4.9 discards the close's own throw: the exception the
                    state is holding is the one that propagates. */
                 cont_st = gouter;
-                goto do_iter_close_exc_done;
+                goto do_iter_close_finish;
             } else {
                 tramp_step_chain_free(ctx, gouter);
             }
