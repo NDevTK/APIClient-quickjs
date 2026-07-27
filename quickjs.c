@@ -57337,10 +57337,13 @@ static int js_array_fromlike_step(JSContext *ctx, void *st, JSValue cb_result, J
             s->hdr.stage = 9;
         }
         if (s->hdr.stage == 9) {
-            JSValue el = s->el;
-            s->el = JS_UNDEFINED;   /* the define consumes it on every path */
-            if (JS_DefinePropertyValueInt64(ctx, s->arr, s->k, el, JS_PROP_C_W_E | JS_PROP_THROW) < 0)
-                return -1;
+            /* 23.1.2.1 step 8.f CreateDataPropertyOrThrow(A, Pk, mappedValue): A is Construct(C, len) when `this`
+               is a constructor, so on a Proxy or subclass this is the page's `defineProperty` trap. The element is
+               BORROWED across the write and freed once it lands. */
+            r = step_defidx_run(ctx, &s->hdr, s->arr, s->k, s->el, cb_result, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            JS_FreeValue(ctx, s->el); s->el = JS_UNDEFINED;
             s->k++;
             s->hdr.stage = 4;
         }
@@ -57490,13 +57493,15 @@ static int js_array_flat_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
                 JS_ThrowTypeError(ctx, "Array too long");
                 return -1;
             }
-            {
-                JSValue el = s->el;
-                s->el = JS_UNDEFINED;   /* the define consumes it on every path */
-                if (JS_DefinePropertyValueInt64(ctx, s->arr, s->target_index, el,
-                                                JS_PROP_C_W_E | JS_PROP_THROW) < 0)
-                    return -1;
-            }
+            s->hdr.stage = 12;
+        }
+        if (s->hdr.stage == 12) {
+            /* 23.1.3.13.1 step 2.d.iii.4 CreateDataPropertyOrThrow(target, targetIndex, element): the target is
+               ArraySpeciesCreate's, so on a Proxy or subclass this is the page's `defineProperty` trap. */
+            r = step_defidx_run(ctx, &s->hdr, s->arr, s->target_index, s->el, cb_result, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            JS_FreeValue(ctx, s->el); s->el = JS_UNDEFINED;
             s->target_index++;
             f->i++;
             s->hdr.stage = 4;
