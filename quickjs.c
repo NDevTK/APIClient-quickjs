@@ -1454,7 +1454,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_MATH_ABS, STEPDEF_MATH_FLOOR, STEPDEF_MATH_CEIL, STEPDEF_MATH_ROUND, STEPDEF_MATH_SQRT, STEPDEF_MATH_ACOS, STEPDEF_MATH_ASIN, STEPDEF_MATH_ATAN, STEPDEF_MATH_COS, STEPDEF_MATH_EXP, STEPDEF_MATH_LOG, STEPDEF_MATH_SIN, STEPDEF_MATH_TAN, STEPDEF_MATH_TRUNC, STEPDEF_MATH_SIGN, STEPDEF_MATH_COSH, STEPDEF_MATH_SINH, STEPDEF_MATH_TANH, STEPDEF_MATH_ACOSH, STEPDEF_MATH_ASINH, STEPDEF_MATH_ATANH, STEPDEF_MATH_EXPM1, STEPDEF_MATH_LOG1P, STEPDEF_MATH_LOG2, STEPDEF_MATH_LOG10, STEPDEF_MATH_CBRT, STEPDEF_MATH_F16ROUND, STEPDEF_MATH_FROUND, STEPDEF_MATH_ATAN2, STEPDEF_MATH_POW, STEPDEF_MATH_MIN, STEPDEF_MATH_MAX, STEPDEF_MATH_HYPOT, STEPDEF_MATH_IMUL, STEPDEF_MATH_CLZ32, STEPDEF_STR_FROMCHARCODE, STEPDEF_STR_FROMCODEPOINT, STEPDEF_DATE_UTC,
     STEPDEF_REGEXP_EXEC, STEPDEF_REGEXP_TEST,
     STEPDEF_ITER_TAKE, STEPDEF_ITER_DROP, STEPDEF_ITER_WRAP_RETURN,
-    STEPDEF_ITER_CONCAT_NEXT, STEPDEF_ITER_CONCAT_RETURN,
+    STEPDEF_ITER_CONCAT_NEXT, STEPDEF_ITER_CONCAT_RETURN, STEPDEF_ARRAY_ITER_NEXT,
     /* one per error KIND: a step constructor's magic IS its definition id, so the kind cannot also ride there.
        The block is contiguous and indexed by JSErrorEnum, with JS_PLAIN_ERROR last. */
     STEPDEF_ERROR_CTOR_BASE,
@@ -17429,6 +17429,18 @@ static int js_forof_deliver(JSContext *ctx, JSValue *sp, int rfof, JSValue ret_v
     return 0;
 }
 
+/* The OP_iterator_next protocol TAIL: IteratorNext(record, value) yields whatever the .next() returned, and the
+   opcode's own contract is that the result REPLACES the resume argument at sp[-1]. No object check here — the
+   consumers of this opcode (yield* delegation, destructuring) each perform their own, at the point the spec puts
+   it. `sp` is the caller's stack with the call's operands already dropped. Four return paths reach it (a popped
+   heap frame, a callee that never got one, a finished step machine, a drained iterator helper), so there is one
+   implementation of it rather than a copy per path. */
+static void js_iternext_deliver(JSContext *ctx, JSValue *sp, JSValue ret_val)
+{
+    JS_FreeValue(ctx, sp[-1]);
+    sp[-1] = ret_val;
+}
+
 /* DELETED: js_for_of_next. It was OP_for_of_next's C fallback — reached whenever the iterator's .next() was
    not a plain bytecode function — and it drove that .next() through JS_IteratorNext -> JS_Call, a C activation
    whose back-edge preempt has no flow base. The opcode routes EVERY .next() now: a bytecode body to
@@ -17568,10 +17580,6 @@ static JSValue js_create_iterator_result(JSContext *ctx,
     }
     return obj;
 }
-
-static JSValue js_array_iterator_next(JSContext *ctx, JSValueConst this_val,
-                                      int argc, JSValueConst *argv,
-                                      int *pdone, int magic);
 
 static JSValue js_create_array_iterator(JSContext *ctx, JSValueConst this_val,
                                         int argc, JSValueConst *argv, int magic);
@@ -19675,6 +19683,13 @@ typedef struct JSIterClose {
                                   a C recursion that drove it to completion. do_return applies IteratorNext's
                                   "result must be an object" check and IteratorComplete/IteratorValue, and places
                                   [value, done] exactly where js_for_of_next's tail does. */
+#define CONT_ITER_NEXT_OP  30  /* cont_state = NULL: OP_iterator_next's .next(value) — yield* delegation and
+                                  destructuring — where the callee is neither a generator (do_generator_tramp's
+                                  iternext mode) nor a lazy helper (ITH_ITERNEXT). Its body runs on THIS chain,
+                                  and do_return replaces the resume argument at sp[-1] with the result. The
+                                  opcode used to finish with JS_Call, so a BOUND, PROXIED, or step-machine
+                                  .next() drove to completion from C — the built-in ARRAY iterator's, once it
+                                  became a step machine, aborted outright. */
 
 
 /* What a source's @@iterator says, read WITHOUT running anything. Three answers, not two: collapsing ABSENT into
@@ -19725,7 +19740,6 @@ static int js_append_fast_array(JSContext *ctx, JSValue *sp);
 static int js_append_fast_array(JSContext *ctx, JSValue *sp)
 {
     JSCFunctionType at_it = { .generic_magic = js_create_array_iterator };
-    JSCFunctionType it_next = { .iterator_next = js_array_iterator_next };
     JSValue m, it;
     JSValue *arrp;
     uint32_t i, count32, len, pos;
@@ -19748,8 +19762,13 @@ static int js_append_fast_array(JSContext *ctx, JSValue *sp)
        unobservable for the same reason. */
     it = js_create_array_iterator(ctx, sp[-1], 0, NULL, JS_ITERATOR_KIND_VALUE);
     if (JS_IsException(it)) return -1;
+    /* %ArrayIteratorPrototype%.next is a step machine, so it is identified by its DEFINITION id rather than by a
+       function pointer — a step def carries no `generic`. */
     pristine = (data_method_at(ctx, JS_VALUE_GET_OBJ(it), JS_ATOM_next, &m) == ITERAT_FOUND)
-               && JS_IsCFunction(ctx, m, it_next.generic, 0);
+               && JS_VALUE_GET_TAG(m) == JS_TAG_OBJECT
+               && JS_VALUE_GET_OBJ(m)->class_id == JS_CLASS_C_FUNCTION
+               && JS_VALUE_GET_OBJ(m)->u.cfunc.cproto == JS_CFUNC_step
+               && JS_VALUE_GET_OBJ(m)->u.cfunc.magic == STEPDEF_ARRAY_ITER_NEXT;
     JS_FreeValue(ctx, m);   /* the walk OWNS what it found on every answer, and && stops short of the found one */
     JS_FreeValue(ctx, it);
     if (!pristine) return 0;
@@ -19897,6 +19916,9 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_FOROF_NEXT:
     case CONT_TOPRIM:
     case CONT_GETPROP:
+    case CONT_ITER_CLOSE:
+    case CONT_ITER_CLOSE_CALL:
+    case CONT_ITER_NEXT_OP:
         break;
     }
 }
@@ -20365,6 +20387,8 @@ typedef struct JSAsyncFromSync {
                                     the tail. */
     uint8_t close_on_rejection;  /* 27.1.4.4's closeOnRejection argument: true for .next/.throw, false for
                                     .return (which has already closed the sync iterator). */
+    JSValue drive_next;          /* the sync record's nextMethod (owned, taken at construction): the wrapper it was
+                                    read from can be released before the drive returns. */
     JSValue pending_error;       /* set (owned) only while step 6's IteratorClose is running on the chain: the
                                     abrupt step-5 completion that step 4 makes the result no matter what the
                                     close does. UNINITIALIZED otherwise. */
@@ -20653,6 +20677,23 @@ typedef struct JSErrorCtor {
     int64_t k;        /* the collect index */
     int present;      /* the HasProperty answer */
 } JSErrorCtor;
+
+/* 23.1.5.1 %ArrayIteratorPrototype%.next — the built-in iterator behind every `for (x of arr)`, `[...arr]`,
+   `Array.from(arr)` and keys()/values()/entries(). TWO of its steps are the page's code: LengthOfArrayLike, read
+   EVERY iteration (an accessor `length`, a Proxy `get` trap), and the element read. js_array_iterator_next did
+   both with js_get_length32 and JS_GetPropertyUint32 from a C entry, so spreading a Proxy or an accessor-backed
+   array-like drove the trap to completion.
+   A TYPED ARRAY takes neither step: its length is its own count and its elements are slots, so there is no user
+   code on either side. That is a DIFFERENT ALGORITHM, not a fallback — the same split js_append_fast_array
+   makes, and it is decided without running any user code. */
+typedef struct JSArrayIterNext {
+    JSStepHdr hdr;    /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    JSValue obj;      /* the source, held across both reads (owned) */
+    JSValue el;       /* the element, held across its read (owned) */
+    JSValue result;   /* DONE (owned) */
+    int64_t len, idx;
+    int kind;
+} JSArrayIterNext;
 
 /* Iterator.concat's lazy iterator. Its .next() walks a LIST of (iterable, @@iterator) pairs, and every step of
    that walk is the page's code: the @@iterator CALL, the `next` read, the .next() CALL, and the `done`/`value`
@@ -21534,28 +21575,33 @@ static bool tramp_unwrap_iter_next(JSValueConst *piter, JSValueConst *pnext) {
    by looking at the RECEIVER's class instead of the method (so a user-patched helper.next was ignored and the
    built-in ran anyway), and none of them unwrapped. A site now declares only its record, its state and its cont
    kind. */
-#define TRAMP_DRIVE_ITER_NEXT(diter, dnext, statep, kindc, pdrive)                                      \
+#define TRAMP_DRIVE_ITER_NEXT(diter, dnext, statep, kindc, pdrive, darg)                                \
     do {                                                                                                 \
-        tramp_unwrap_iter_next(&(diter), &(dnext));                                                      \
+        /* IteratorNext(record, value) FORWARDS its value, and WrapForValidIterator's .next does NOT      \
+           (27.1.4.2.1 step 4 calls with no arguments) — so a drive CARRYING one must not unwrap, or the  \
+           wrapped iterator would see an argument the wrapper would have swallowed. */                    \
+        if (JS_IsUninitialized(darg)) tramp_unwrap_iter_next(&(diter), &(dnext));                        \
         if (tramp_can_call_iter_helper((dnext), (diter))) {                                              \
             JSIteratorHelperData *dh_ = JS_VALUE_GET_OBJ(diter)->u.iterator_helper_data;                 \
             dh_->executing = 1; dh_->resume_pc = ITHP_START;                                             \
             dh_->drive_mode = ITH_CONSUME; dh_->consumer = (statep); dh_->consumer_kind = (kindc);        \
-            cont_st = dh_;                                             \
+            cont_st = dh_;                                                                                \
             ret_val = JS_UNINITIALIZED;                                                                   \
             goto do_iter_helper_step;                                                                     \
         }                                                                                                 \
         if (tramp_gen_method_magic((dnext), (diter)) == GEN_MAGIC_NEXT) {                                \
             tramp_cont_state = (statep); tramp_cont_kind = (kindc);                                      \
             tramp_gen_cont_iter = (diter); tramp_gen_cont_consume = 1;                                   \
+            tramp_gen_cont_arg = JS_IsUninitialized(darg) ? JS_UNDEFINED : (darg);                       \
             tramp_gen_magic = GEN_MAGIC_NEXT;                                                            \
             goto do_generator_tramp;                                                                      \
         }                                                                                                 \
-        DCHECK(sp + 2 <= TRAMP_SP_LIMIT(sf),                                                             \
+        DCHECK(sp + 3 <= TRAMP_SP_LIMIT(sf),                                                             \
                "iterator .next() drive: operand push exceeds the frame's compiled stack_size");           \
         *sp++ = js_dup(diter);                                                                            \
         *sp++ = js_dup(dnext);                                                                            \
         call_argv = sp; call_argc = 0; tramp_first = -2; tramp_is_tail = 0;                              \
+        if (!JS_IsUninitialized(darg)) { *sp++ = js_dup(darg); call_argc = 1; }                          \
         tramp_cont_state = (statep); tramp_cont_kind = (kindc);                                          \
         /* set HERE, not at the site: the three arms above never reach a delivery (a helper re-enters its own    \
            step, a generator settles through do_generator_settle), so a flag raised before them would still be   \
@@ -21797,7 +21843,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     uint8_t tp_outer_kind = CONT_NONE;
     int tramp_cont_forof = 0;                           /* CONT_FOROF_NEXT: the enum_rec stack offset for the .next() drive about to be pushed. Rides the frame's forof_off (read+reset in do_tramp_call) so no per-iteration heap state is allocated for what is one int. */
     int tramp_gen_forof = 1;                            /* <0 = for-of iterator stack offset (always -3-.. ); 1 = direct .next() (no valid offset is positive) */
-    int tramp_ith_forof = 1;                            /* Iterator Helper for-of drive: <0 = iterator stack offset; 1 = direct. read+reset by do_iter_helper_tramp */
+    uint8_t tramp_ith_mode = ITH_DIRECT;                /* Iterator Helper drive: which DELIVERY the .next() owes (ITH_DIRECT / ITH_FOROF / ITH_ITERNEXT). read+reset by do_iter_helper_tramp */
+    int tramp_ith_forof = 0;                            /* ITH_FOROF only: the enum_rec's caller-stack offset */
     int tramp_gen_iternext = 0;                         /* 1 = OP_iterator_next drive (yield* / destructuring): iterator at sp[-4], arg at sp[-1], result OBJECT replaces sp[-1] */
     int tramp_gen_close = 0;                            /* 1 = OP_iterator_close drive (.return() on an unconsumed generator iterator at sp[-1]): body runs finally on the tramp, result DISCARDED */
     int tramp_gen_close_exc = 0;                        /* 1 = the close is happening DURING exception unwind (JS_IteratorClose(iter,true)): after the finally runs, restore the in-flight exception and continue unwinding (goto exception), never overwrite it */
@@ -22513,25 +22560,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 /* the iterable-consuming builtins (Array.from / Object.fromEntries / Iterator.from / it.* / s.union /
                    TypedArray.from / Promise.all|allSettled|any|race) are recognized in ONE place, do_consumer_dispatch,
                    which this opcode's convergence (goto do_generic_callee below) passes through — see that label. */
-                /* for await (x of syncIter): the async-from-sync wrapper's .next() drives the WRAPPED iterator's
-                   .next() and wraps its {value,done} in a promise. js_async_from_sync_iterator_next did that
-                   drive with JS_IteratorNext2 -> JS_Call from C. It used to be routed only when the sync source
-                   was a live GENERATOR — every other one fell to that C entry, so a hand-written `for await`
-                   source with a loop in its .next() aborted at its back-edge. What the wrapper is, is a fact
-                   about the CALLEE; what the source is, is not, and the drive answers it.
-                   call_argv[-2] = the wrapper, [-1] = its .next. */
-                if (JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT) {
-                    JSObject *mp = JS_VALUE_GET_OBJ(call_argv[-1]);
-                    if (mp->class_id == JS_CLASS_C_FUNCTION && mp->u.cfunc.cproto == JS_CFUNC_generic_magic
-                        && mp->u.cfunc.c_function.generic_magic == js_async_from_sync_iterator_next
-                        && mp->u.cfunc.magic == GEN_MAGIC_NEXT
-                        && JS_VALUE_GET_TAG(call_argv[-2]) == JS_TAG_OBJECT) {
-                        JSObject *wp = JS_VALUE_GET_OBJ(call_argv[-2]);
-                        if (wp->class_id == JS_CLASS_ASYNC_FROM_SYNC_ITERATOR && wp->u.async_from_sync_iterator_data) {
-                            tramp_is_tail = (opcode == OP_tail_call_method); goto do_async_from_sync_tramp;
-                        }
-                    }
-                }
                 if (tramp_is_function_call(call_argv[-1])) {   /* f.call(thisArg,...) -> reslice + dispatch f here */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_forward_call;
                 }
@@ -23717,6 +23745,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     int agmag = tramp_agen_method_magic(call_argv[-1], gthis);
                     if (agmag >= 0) { tramp_agen_magic = agmag; goto do_agen_drive_tramp; }
                 }
+                if (tramp_first == -2 && JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT
+                    && JS_VALUE_GET_TAG(gthis) == JS_TAG_OBJECT) {
+                    /* the async-from-sync wrapper's .next(): it drives the WRAPPED iterator's .next() and wraps
+                       the {value,done} in a promise, and js_async_from_sync_iterator_next does that drive with
+                       JS_IteratorNext2 -> JS_Call from C. The question is about the CALLEE, so it is asked HERE
+                       and nowhere else: at OP_call_method it answered only that spelling, and every other one —
+                       .call, .apply, spread, bound, a `yield*` delegation's own invoke — reached the C entry. */
+                    JSObject *mp = JS_VALUE_GET_OBJ(call_argv[-1]);
+                    JSObject *wp = JS_VALUE_GET_OBJ(gthis);
+                    if (mp->class_id == JS_CLASS_C_FUNCTION && mp->u.cfunc.cproto == JS_CFUNC_generic_magic
+                        && mp->u.cfunc.c_function.generic_magic == js_async_from_sync_iterator_next
+                        && mp->u.cfunc.magic == GEN_MAGIC_NEXT
+                        && wp->class_id == JS_CLASS_ASYNC_FROM_SYNC_ITERATOR && wp->u.async_from_sync_iterator_data)
+                        goto do_async_from_sync_tramp;
+                }
                 if (tramp_first == -2) {
                     /* WrapForValidIterator's .next FORWARDS VERBATIM — 27.1.4.2.1 is
                        `Return ? Call([[NextMethod]], [[Iterator]])`, with no arguments passed and nothing after
@@ -23881,6 +23924,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         sp += 2;
                         BREAK;
                     }
+                    if (dck == CONT_ITER_NEXT_OP) {
+                        JSValue *cargv;
+                        int pop, first;
+                        TAKE_CALL_SHAPE(); pop = call_pop; first = call_first_r;
+                        cargv = sp - pop;
+                        for (i = first; i < pop; i++) JS_FreeValue(ctx, cargv[i]);
+                        sp += first - pop;
+                        if (unlikely(JS_IsException(ret_val))) goto exception;
+                        js_iternext_deliver(ctx, sp, ret_val);
+                        BREAK;
+                    }
                     DCHECK(dck == CONT_NONE,
                            "a callee with no heap frame was handed a continuation this arm cannot deliver");
                 }
@@ -23996,8 +24050,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         JS_FreeValue(ctx, sp[foff1]); sp[foff1] = JS_UNDEFINED;
                         goto exception;
                     }
+                    if (sk0 == CONT_ITER_NEXT_OP) {
+                        /* a step-machine .next() that threw (the built-in ARRAY iterator's, on an accessor or a
+                           proxied length): drop its operands and propagate. Unlike for-of there is no enum_rec
+                           slot to clear — the delegating frame's own unwind owns the iterator. */
+                        int cfirst1 = h->orig_cfirst, cargc1 = h->orig_cargc;
+                        JSValue *ncargv;
+                        DCHECK(souter0 == NULL, "an OP_iterator_next continuation carries no state");
+                        tramp_step_state_free(ctx, stt, false);
+                        ncargv = sp - cargc1;
+                        for (i = cfirst1; i < cargc1; i++) JS_FreeValue(ctx, ncargv[i]);
+                        sp += cfirst1 - cargc1;
+                        goto exception;
+                    }
                     if (souter0 && (sk0 == CONT_ITER_CONSUME || sk0 == CONT_ITER_HELPER
-                                    || sk0 == CONT_ITER_CLOSE_CALL)) {
+                                    || sk0 == CONT_ITER_CLOSE_CALL || sk0 == CONT_ASYNC_FROM_SYNC
+                                    || sk0 == CONT_PROMISE_ALL)) {
                         /* the machine WAS a call made by one of these sequences, so its throw is that call's
                            abrupt result and the sequence owns it — IfAbruptCloseIterator for a consumer, and
                            7.4.9's "the abrupt completion wins" for a close. Delivered exactly as a returned heap
@@ -24009,6 +24077,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         call_first_r = cfirst0; call_pop = cargc0;
                         if (sk0 == CONT_ITER_CONSUME) goto do_consume_deliver;
                         if (sk0 == CONT_ITER_HELPER)  goto do_helper_deliver;
+                        if (sk0 == CONT_ASYNC_FROM_SYNC) goto do_afs_deliver;
+                        if (sk0 == CONT_PROMISE_ALL) goto do_promise_all_deliver;
                         goto do_iter_close_deliver;
                     }
                     tramp_step_chain_free(ctx, stt);   /* and the machines waiting on it */
@@ -24035,16 +24105,31 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         sp += 2;
                         BREAK;
                     }
+                    if (souter_kind == CONT_ITER_NEXT_OP) {
+                        /* the machine WAS an OP_iterator_next .next(). Its operands are dropped and its result
+                           replaces the resume argument, exactly where a returned heap frame's does. */
+                        JSValue *ncargv = sp - cargc;
+                        DCHECK(souter == NULL, "an OP_iterator_next continuation carries no state");
+                        for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, ncargv[i]);
+                        sp += cfirst - cargc;
+                        js_iternext_deliver(ctx, sp, r);
+                        BREAK;
+                    }
                     if (souter && (souter_kind == CONT_ITER_CONSUME || souter_kind == CONT_ITER_HELPER
-                                   || souter_kind == CONT_ITER_CLOSE_CALL)) {
+                                   || souter_kind == CONT_ITER_CLOSE_CALL
+                                   || souter_kind == CONT_ASYNC_FROM_SYNC
+                                   || souter_kind == CONT_PROMISE_ALL)) {
                         /* the machine WAS a call one of these sequences made — a consumer's CALLBACK
-                           (`Array.from(g, String)`, `.map(Math.abs)`) or an iterator's `return`. Its result and
-                           the caller's operands are handed to that sequence's one delivery, exactly as a heap
-                           frame's are; the operand drop lives there, so it is not repeated here. */
+                           (`Array.from(g, String)`, `.map(Math.abs)`), an iterator's `return`, or the sync
+                           .next() an async-from-sync wrapper drives. Its result and the caller's operands are
+                           handed to that sequence's one delivery, exactly as a heap frame's are; the operand
+                           drop lives there, so it is not repeated here. */
                         ret_val = r; cont_st = souter;
                         call_first_r = cfirst; call_pop = cargc;
                         if (souter_kind == CONT_ITER_HELPER) goto do_helper_deliver;
                         if (souter_kind == CONT_ITER_CLOSE_CALL) goto do_iter_close_deliver;
+                        if (souter_kind == CONT_ASYNC_FROM_SYNC) goto do_afs_deliver;
+                        if (souter_kind == CONT_PROMISE_ALL) goto do_promise_all_deliver;
                         goto do_consume_deliver;
                     }
                     cargv = sp - cargc;
@@ -25516,7 +25601,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 /* CALL: drive the record's .next() on this chain. Any settle re-enters do_iter_consume_step with
                    the result; a C .next() has no body to suspend, so it is called in-loop just below. */
                 { JSValueConst di = s->iter, dn = s->next;
-                  TRAMP_DRIVE_ITER_NEXT(di, dn, s, CONT_ITER_CONSUME, &s->drive_pending); }
+                  TRAMP_DRIVE_ITER_NEXT(di, dn, s, CONT_ITER_CONSUME, &s->drive_pending, JS_UNINITIALIZED); }
             }
 
         do_promise_all_consume_tramp:
@@ -25656,7 +25741,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    thing keeping a non-generator out, so widening it segfaulted on Promise.all([]). */
                 s->driving_next = 1;   /* an abrupt during this .next()/its result extraction must NOT close the iter */
                 { JSValueConst di = s->iter, dn = s->next;
-                  TRAMP_DRIVE_ITER_NEXT(di, dn, s, CONT_PROMISE_ALL, NULL); }
+                  TRAMP_DRIVE_ITER_NEXT(di, dn, s, CONT_PROMISE_ALL, NULL, JS_UNINITIALIZED); }
             }
 
         do_async_from_sync_tramp:
@@ -25676,7 +25761,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                      ? sp[-4] : call_argv[-2]);
                 JSObject *wp = JS_VALUE_GET_OBJ(wrap);
                 JSAsyncFromSyncIteratorData *ws = wp->u.async_from_sync_iterator_data;
-                JSValueConst afs_next = ws->next_method;   /* the record's nextMethod, borrowed via the wrapper */
                 JSAsyncFromSync *s = js_mallocz(ctx, sizeof(*s));
                 JSValue prom;
                 if (unlikely(!s)) { JS_ThrowOutOfMemory(ctx); goto exception; }
@@ -25684,6 +25768,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (JS_IsException(prom)) { js_free_rt(rt, s); goto exception; }
                 s->promise = prom;
                 s->sync_iter = js_dup(ws->sync_iter);
+                /* The record's nextMethod, held by the STATE from here on. The wrapper that holds it can be
+                   released before the drive returns (its only stack reference is an operand this entry pops), so
+                   borrowing it was a use-after-free waiting to happen; and taking the ref into a LOCAL leaked it
+                   on every path that never reaches the drive — .return()/.throw() and OP_iterator_close all
+                   settle through their own arms, and a leaked ref to a C function pins its realm, which is the
+                   whole 370-object graph of `yield* syncGen` + `.return()`. One owner, freed by
+                   js_async_from_sync_end on every exit. */
+                s->drive_next = js_dup(ws->next_method);
+                /* every dup the wrapper owes is taken, so an OWNED invocation list (a bound or spread spelling
+                   reaching this from do_generic_callee) can go — the caller's own operands, which orig_cfirst /
+                   orig_cargc name below, are what the settle pops. */
+                if (call_args_owned) {
+                    free_arg_list(ctx, call_args_owned, call_args_owned_n);
+                    call_args_owned = NULL; call_args_owned_n = 0;
+                }
                 s->pending_error = JS_UNINITIALIZED;
                 s->deliver = afs_mode;
                 /* .return() passes closeOnRejection=false (27.1.4.2.3 step 11): it has already asked the sync
@@ -25738,14 +25837,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     cont_st = s;
                     goto do_async_from_sync_abrupt;   /* rejects s->promise and delivers it per s->deliver */
                 }
-                if (afs_close || tramp_gen_method_magic(afs_next, s->sync_iter) == GEN_MAGIC_NEXT) {
-                    /* a GENERATOR source (and every close, which OP_iterator_close only routes for one): its body
-                       runs on this chain and the settle re-enters the step. */
+                if (afs_close) {
+                    /* OP_iterator_close on the wrapper drives the sync GENERATOR's .return() — the only kind the
+                       close opcode routes here — with no resume value (7.4.9 passes none). A generator .next() is
+                       answered by the one drive below, like every other source. */
                     tramp_cont_state = s; tramp_cont_kind = CONT_ASYNC_FROM_SYNC; tramp_gen_cont_iter = s->sync_iter;
-                    tramp_gen_cont_arg = afs_close ? JS_UNDEFINED
-                                       : (afs_mode == AFS_DELIVER_ITERNEXT ? sp[-1]
-                                          : (call_argc >= 1 ? call_argv[0] : JS_UNDEFINED));   /* forward the resume value to syncGen.next(v); close forwards none */
-                    tramp_gen_cont_consume = 1; tramp_gen_magic = afs_close ? GEN_MAGIC_RETURN : GEN_MAGIC_NEXT;
+                    tramp_gen_cont_arg = JS_UNDEFINED;
+                    tramp_gen_cont_consume = 1; tramp_gen_magic = GEN_MAGIC_RETURN;
                     goto do_generator_tramp;
                 }
                 /* every other sync source: the ONE .next() drive, which unwraps, hands a helper to its own step,
@@ -25754,8 +25852,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    suspended body to resume with one. */
                 DCHECK(sp + 2 <= TRAMP_SP_LIMIT(sf),
                        "async-from-sync drive: operand push exceeds the frame's compiled stack_size");
-                { JSValueConst di = s->sync_iter, dn = afs_next;
-                  TRAMP_DRIVE_ITER_NEXT(di, dn, s, CONT_ASYNC_FROM_SYNC, NULL); }
+                { JSValueConst di = s->sync_iter, dn = s->drive_next;
+                  /* 27.1.4.2.1 steps 5-6: the resume value is forwarded when the wrapper was given one. */
+                  JSValueConst darg = (afs_mode == AFS_DELIVER_ITERNEXT ? sp[-1]
+                                       : (call_argc >= 1 ? call_argv[0] : JS_UNINITIALIZED));
+                  TRAMP_DRIVE_ITER_NEXT(di, dn, s, CONT_ASYNC_FROM_SYNC, NULL, darg); }
             }
 
         do_afs_deliver:
@@ -25872,16 +25973,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
         do_iter_helper_tramp:
             /* A lazy Iterator Helper's .next(): drive the source's .next() on THIS chain via do_iter_helper_step.
-               DIRECT: helper at call_argv[-2]. FOR-OF: helper at sp[tramp_ith_forof] (stays on the caller stack). */
+               DIRECT: helper at call_argv[-2]. FOR-OF: helper at sp[tramp_ith_forof]. ITERNEXT (yield* it.map(f)):
+               helper at sp[-4]. The last two stay on the caller stack; only the delivery differs. */
             {
-                int ith_off = tramp_ith_forof; tramp_ith_forof = 1;   /* read + reset */
-                JSValueConst hval = (ith_off < 0) ? sp[ith_off] : call_argv[-2];
+                uint8_t ith_mode = tramp_ith_mode; int ith_off = tramp_ith_forof;   /* read + reset */
+                tramp_ith_mode = ITH_DIRECT; tramp_ith_forof = 0;
+                JSValueConst hval = (ith_mode == ITH_FOROF)    ? sp[ith_off]
+                                  : (ith_mode == ITH_ITERNEXT) ? sp[-4]
+                                                               : call_argv[-2];
                 JSObject *hp = JS_VALUE_GET_OBJ(hval);
                 JSIteratorHelperData *it = hp->u.iterator_helper_data;
                 it->executing = 1;
                 it->resume_pc = ITHP_START;
-                if (ith_off < 0) { it->drive_mode = ITH_FOROF; it->forof_off = ith_off; }
-                else { it->drive_mode = ITH_DIRECT; it->orig_cargc = call_argc; it->orig_is_tail = tramp_is_tail; }
+                it->drive_mode = ith_mode;
+                if (ith_mode == ITH_FOROF) it->forof_off = ith_off;
+                else if (ith_mode == ITH_DIRECT) { it->orig_cargc = call_argc; it->orig_is_tail = tramp_is_tail; }
                 cont_st = it;
                 ret_val = JS_UNINITIALIZED;
                 goto do_iter_helper_step;
@@ -25990,8 +26096,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             sp[0] = v; sp[1] = js_bool(JS_ToBoolFree(ctx, dv)); sp += 2;
                             BREAK;
                         }
-                        DFAIL("do_iter_helper_step: iternext delivery not built yet");
-                        JS_FreeValue(ctx, out); goto exception;
+                        /* OP_iterator_next protocol: the {value,done} object REPLACES the resume argument at
+                           sp[-1] (the helper itself stays at sp[-4]); sp unchanged. */
+                        DCHECK(it->drive_mode == ITH_ITERNEXT, "an iterator helper finished in no drive mode");
+                        js_iternext_deliver(ctx, sp, out);
+                        BREAK;
                     }
                     /* st == 1: DRIVE the current target's .next() — the SOURCE (it->obj/it->next), or for flatMap
                        iterating an inner iterable, the INNER (it->inner/it->inner_next). Either can be a generator
@@ -26008,7 +26117,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     /* the helper's own chain walk (map(filter(g))) went `it = inner; continue;` — re-entering the
                        label with cont_st is the same step with the same UNINITIALIZED result, and it lets this site
                        share the ONE drive. */
-                    TRAMP_DRIVE_ITER_NEXT(drive_obj, drive_next, it, CONT_ITER_HELPER, &it->drive_pending);
+                    TRAMP_DRIVE_ITER_NEXT(drive_obj, drive_next, it, CONT_ITER_HELPER, &it->drive_pending, JS_UNINITIALIZED);
                 }
             }
 
@@ -26993,6 +27102,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (js_forof_deliver(ctx, sp, rfof, ret_val))
                         goto exception;
                     sp += 2;
+                    BREAK;
+                }
+                if (rck == CONT_ITER_NEXT_OP) {
+                    /* the .next() returned: drop whatever operand shape the frame RECORDED (do_generic_callee's
+                       proxy and bound arms replace the three the opcode pushed), then the opcode's tail — the
+                       result replaces the resume argument. */
+                    JSValue *cargv = sp - cargc;
+                    DCHECK(cargc >= cfirst, "iterator-next frame records operands ending below where they start");
+                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
+                    sp += cfirst - cargc;
+                    js_iternext_deliver(ctx, sp, ret_val);
                     BREAK;
                 }
                 if (rck == CONT_CONSUME_GETITER) {
@@ -28042,7 +28162,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     tramp_gen_magic = GEN_MAGIC_NEXT; tramp_gen_forof = offset; goto do_generator_tramp;
                 }
                 if (tramp_can_call_iter_helper(sp[offset + 1], sp[offset])) {   /* for-of over a lazy Iterator Helper -> drive on THIS chain */
-                    tramp_ith_forof = offset; goto do_iter_helper_tramp;
+                    tramp_ith_mode = ITH_FOROF; tramp_ith_forof = offset; goto do_iter_helper_tramp;
                 }
                 {
                     /* A PLAIN iterator whose .next() is a normal bytecode function — the ordinary
@@ -28367,7 +28487,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_iterator_next):
             /* stack: iter_obj next catch_offset val */
             {
-                JSValue ret;
                 sf->cur_pc = pc;
                 /* a GENERATOR iterator's .next() (yield* delegation, destructuring) runs its body on THIS chain
                    (do_generator_tramp iternext mode) so a body loop/branch preempts + forks the base flow — never
@@ -28390,20 +28509,35 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    the loop opcode, and leaving it out is why the AsyncFromSyncIteratorPrototype tree aborted. */
                 if (JS_VALUE_GET_TAG(sp[-4]) == JS_TAG_OBJECT) {
                     JSObject *wp2 = JS_VALUE_GET_OBJ(sp[-4]);
+                    /* what the WRAPPER is, is a fact about the callee; what its sync source turns out to be is
+                       not, and the ONE .next() drive answers that. The source condition that used to be here sent
+                       every non-generator to js_async_from_sync_iterator_next's C entry. */
                     if (wp2->class_id == JS_CLASS_ASYNC_FROM_SYNC_ITERATOR && wp2->u.async_from_sync_iterator_data) {
-                        JSValueConst si2 = ((JSAsyncFromSyncIteratorData *)wp2->u.async_from_sync_iterator_data)->sync_iter;
-                        if (JS_VALUE_GET_TAG(si2) == JS_TAG_OBJECT
-                            && JS_VALUE_GET_OBJ(si2)->class_id == JS_CLASS_GENERATOR
-                            && JS_VALUE_GET_OBJ(si2)->u.generator_data) {
-                            tramp_afs_mode = AFS_DELIVER_ITERNEXT; goto do_async_from_sync_tramp;
-                        }
+                        tramp_afs_mode = AFS_DELIVER_ITERNEXT; goto do_async_from_sync_tramp;
                     }
                 }
-                ret = JS_Call(ctx, sp[-3], sp[-4], 1, vc(sp - 1));
-                if (JS_IsException(ret))
-                    goto exception;
-                JS_FreeValue(ctx, sp[-1]);
-                sp[-1] = ret;
+                /* a lazy Iterator Helper delegated to (`yield* it.map(f)`): its step machine drives the source
+                   on THIS chain. Reaching js_iterator_helper_next from the JS_Call below was its DFAIL, which is
+                   what the ITH_ITERNEXT drive mode was declared for and never built. */
+                if (tramp_can_call_iter_helper(sp[-3], sp[-4])) {
+                    tramp_ith_mode = ITH_ITERNEXT; goto do_iter_helper_tramp;
+                }
+                /* EVERY other callee. IteratorNext(record, value) FORWARDS its value, so there is no wrapper
+                   unwrap here — WrapForValidIterator.next takes no arguments (27.1.4.2.1 step 4), and unwrapping
+                   would hand the wrapped iterator an argument the wrapper swallows. The split below is the
+                   callee's FRAME KIND, never whether to suspend. */
+                {
+                    JSValueConst itv = sp[-4], nextv = sp[-3], argv0 = sp[-1];
+                    DCHECK(sp + 3 <= TRAMP_SP_LIMIT(sf),
+                           "iterator .next() drive: operand push exceeds the frame's compiled stack_size");
+                    *sp++ = js_dup(itv);      /* this */
+                    *sp++ = js_dup(nextv);    /* the next method */
+                    call_argv = sp; call_argc = 1; tramp_first = -2; tramp_is_tail = 0;
+                    *sp++ = js_dup(argv0);    /* the resume argument IteratorNext forwards */
+                    tramp_cont_state = NULL; tramp_cont_kind = CONT_ITER_NEXT_OP;
+                    if (tramp_can_call(nextv)) goto do_tramp_call;
+                    goto do_generic_callee;
+                }
             }
             BREAK;
 
@@ -30822,9 +30956,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
             }
             js_free_rt(rt, cs);
-        } else if (xck == CONT_SETTER || xck == CONT_PROXY_CONSTRUCT || xck == CONT_INSTANCEOF) {
-            /* a throwing setter body, or a throwing proxy `construct` trap: no continuation state; the operands are
-               on the caller stack and freed by the caller's own catch-search, exactly like a normal method call. */
+        } else if (xck == CONT_SETTER || xck == CONT_PROXY_CONSTRUCT || xck == CONT_INSTANCEOF
+                   || xck == CONT_ITER_NEXT_OP) {
+            /* a throwing setter body, a throwing proxy `construct` trap, or an OP_iterator_next .next() that threw:
+               no continuation state; the operands are on the caller stack and freed by the caller's own
+               catch-search, exactly like a normal method call. */
         } else if (xck == CONT_ASYNC_FROM_SYNC) {
             /* a driven sync .next() THREW while `for await` was awaiting the wrapper's promise. Like the Promise
                combinators, the wrapper must REJECT that promise and yield it — an escaping throw would be the
@@ -57156,6 +57292,10 @@ static const JSTrampStepDef js_error_ctor_defs[JS_PLAIN_ERROR + 1] = {
 };
 #undef ERRCTOR_DEF
 _Static_assert(JS_PLAIN_ERROR == 9, "the error-constructor definition block is written out per kind");
+static int js_array_iter_next_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_array_iter_next_fini(JSContext *ctx, void *st, bool take_result);
+static const JSTrampStepDef js_array_iter_next_def =
+    { sizeof(JSArrayIterNext), js_array_iter_next_step, js_array_iter_next_fini, 0 };
 static int js_iter_concat_next_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_iter_concat_next_fini(JSContext *ctx, void *st, bool take_result);
 static const JSTrampStepDef js_iter_concat_next_def =
@@ -57534,6 +57674,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_ITER_WRAP_RETURN] = &js_iter_wrap_return_def,
     [STEPDEF_ITER_CONCAT_NEXT] = &js_iter_concat_next_def,
     [STEPDEF_ITER_CONCAT_RETURN] = &js_iter_concat_return_def,
+    [STEPDEF_ARRAY_ITER_NEXT] = &js_array_iter_next_def,
 #define ERRCTOR_ROW(k) [STEPDEF_ERROR_CTOR_BASE + (k)] = &js_error_ctor_defs[k],
     ERRCTOR_ROW(0) ERRCTOR_ROW(1) ERRCTOR_ROW(2) ERRCTOR_ROW(3) ERRCTOR_ROW(4)
     ERRCTOR_ROW(5) ERRCTOR_ROW(6) ERRCTOR_ROW(7) ERRCTOR_ROW(8) ERRCTOR_ROW(JS_PLAIN_ERROR)
@@ -59224,7 +59365,7 @@ static JSValue js_array_sort_vfini(JSContext *ctx, void *st, bool take_result)
 typedef struct JSArrayIteratorData {
     JSValue obj;
     JSIteratorKindEnum kind;
-    uint32_t idx;
+    int64_t idx;   /* LengthOfArrayLike is ToLength, so a source can be longer than a uint32 cursor can count */
 } JSArrayIteratorData;
 
 static void js_array_iterator_finalizer(JSRuntime *rt, JSValueConst val)
@@ -59308,64 +59449,89 @@ static JSValue js_create_array_iterator(JSContext *ctx, JSValueConst this_val,
     return JS_EXCEPTION;
 }
 
-static JSValue js_array_iterator_next(JSContext *ctx, JSValueConst this_val,
-                                      int argc, JSValueConst *argv,
-                                      int *pdone, int magic)
+static int js_array_iter_next_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
+    JSArrayIterNext *s = st;
     JSArrayIteratorData *it;
-    uint32_t len, idx;
-    JSValue val, obj;
-    JSObject *p;
+    int r;
 
-    it = JS_GetOpaque2(ctx, this_val, JS_CLASS_ARRAY_ITERATOR);
-    if (!it)
-        goto fail1;
-    if (JS_IsUndefined(it->obj))
-        goto done;
-    p = JS_VALUE_GET_OBJ(it->obj);
-    if (is_typed_array(p->class_id)) {
-        if (typed_array_is_oob(p)) {
-            JS_ThrowTypeErrorArrayBufferOOB(ctx);
-            goto fail1;
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
+        s->obj = JS_UNDEFINED; s->el = JS_UNDEFINED; s->result = JS_UNDEFINED;
+        s->len = 0; s->idx = 0; s->kind = JS_ITERATOR_KIND_VALUE;
+        it = JS_GetOpaque2(ctx, s->hdr.this_val, JS_CLASS_ARRAY_ITERATOR);
+        if (!it) return -1;
+        if (JS_IsUndefined(it->obj)) {   /* already exhausted: the closure has returned */
+            s->result = js_create_iterator_result(ctx, JS_UNDEFINED, true);
+            return JS_IsException(s->result) ? -1 : 0;
         }
-        len = p->u.array.count;
+        s->obj = js_dup(it->obj);
+        s->kind = it->kind;
+        {
+            JSObject *p = JS_VALUE_GET_OBJ(s->obj);
+            if (is_typed_array(p->class_id)) {
+                if (typed_array_is_oob(p)) { JS_ThrowTypeErrorArrayBufferOOB(ctx); return -1; }
+                s->len = p->u.array.count;
+                s->hdr.stage = 2;
+            } else {
+                s->hdr.stage = 1;
+            }
+        }
+    }
+    if (s->hdr.stage == 1) {
+        /* LengthOfArrayLike: `? ToLength(? Get(O, "length"))`. js_get_length32 used ToUint32 instead, so a
+           `length` of -1 read as 4294967295 rather than clamping to 0. */
+        r = step_getlen_run(ctx, &s->hdr, s->obj, JS_ATOM_length, cb_result, &s->len, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 2;
+    }
+    if (s->hdr.stage == 2) {
+        it = JS_GetOpaque(s->hdr.this_val, JS_CLASS_ARRAY_ITERATOR);
+        DCHECK(it != NULL, "the array iterator lost its data across its own length read");
+        s->idx = it->idx;
+        if (s->idx >= s->len) {
+            JS_FreeValue(ctx, it->obj);
+            it->obj = JS_UNDEFINED;
+            s->result = js_create_iterator_result(ctx, JS_UNDEFINED, true);
+            return JS_IsException(s->result) ? -1 : 0;
+        }
+        it->idx = s->idx + 1;
+        if (s->kind == JS_ITERATOR_KIND_KEY) {   /* the key kind reads no element at all */
+            s->result = js_create_iterator_result(ctx, js_int64(s->idx), false);
+            return JS_IsException(s->result) ? -1 : 0;
+        }
+        s->hdr.stage = 3;
+    }
+    DCHECK(s->hdr.stage == 3, "%ArrayIteratorPrototype%.next: unknown stage");
+    r = step_getidx_run(ctx, &s->hdr, s->obj, s->idx, cb_result, &s->el, out_cb, out_argc);
+    if (r) return r < 0 ? -1 : r;
+    if (s->kind == JS_ITERATOR_KIND_VALUE) {
+        s->result = js_create_iterator_result(ctx, s->el, false);
+        s->el = JS_UNDEFINED;
     } else {
-        if (js_get_length32(ctx, &len, it->obj)) {
-        fail1:
-            *pdone = false;
-            return JS_EXCEPTION;
-        }
+        JSValueConst args[2];
+        JSValue num = js_int64(s->idx), pair;
+        args[0] = num; args[1] = s->el;
+        pair = js_create_array(ctx, 2, args);
+        JS_FreeValue(ctx, num);
+        JS_FreeValue(ctx, s->el); s->el = JS_UNDEFINED;
+        if (JS_IsException(pair)) return -1;
+        s->result = js_create_iterator_result(ctx, pair, false);
     }
-    idx = it->idx;
-    if (idx >= len) {
-        JS_FreeValue(ctx, it->obj);
-        it->obj = JS_UNDEFINED;
-    done:
-        *pdone = true;
-        return JS_UNDEFINED;
-    }
-    it->idx = idx + 1;
-    *pdone = false;
-    if (it->kind == JS_ITERATOR_KIND_KEY) {
-        return js_uint32(idx);
-    } else {
-        val = JS_GetPropertyUint32(ctx, it->obj, idx);
-        if (JS_IsException(val))
-            return JS_EXCEPTION;
-        if (it->kind == JS_ITERATOR_KIND_VALUE) {
-            return val;
-        } else {
-            JSValueConst args[2];
-            JSValue num;
-            num = js_uint32(idx);
-            args[0] = num;
-            args[1] = val;
-            obj = js_create_array(ctx, 2, args);
-            JS_FreeValue(ctx, val);
-            JS_FreeValue(ctx, num);
-            return obj;
-        }
-    }
+    return JS_IsException(s->result) ? -1 : 0;
+}
+
+static JSValue js_array_iter_next_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSArrayIterNext *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    JS_FreeValue(ctx, s->el);
+    JS_FreeValue(ctx, s->obj);
+    js_free(ctx, s);
+    return r;
 }
 
 
@@ -60442,7 +60608,7 @@ static const JSCFunctionListEntry js_array_proto_funcs[] = {
 };
 
 static const JSCFunctionListEntry js_array_iterator_proto_funcs[] = {
-    JS_ITERATOR_NEXT_DEF("next", 0, js_array_iterator_next, 0 ),
+    JS_CFUNC_STEP_DEF("next", 0, STEPDEF_ARRAY_ITER_NEXT ),
     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "Array Iterator", JS_PROP_CONFIGURABLE ),
 };
 
@@ -70934,6 +71100,7 @@ static void js_async_from_sync_end(JSContext *ctx, JSAsyncFromSync *s)
     JS_FreeValue(ctx, s->resolving_funcs[0]);
     JS_FreeValue(ctx, s->resolving_funcs[1]);
     JS_FreeValue(ctx, s->sync_iter);
+    JS_FreeValue(ctx, s->drive_next);
     if (!JS_IsUninitialized(s->pending_error))
         JS_FreeValue(ctx, s->pending_error);   /* only set while step 6's close is in flight */
 }
