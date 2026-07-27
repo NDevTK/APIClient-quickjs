@@ -23936,7 +23936,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             /* s.union(setlike) / s.symmetricDifference(setlike): read setlike's props in SPEC ORDER (size, has, keys),
                seed the result Set with THIS set's records (a direct [[SetData]] copy — the spec forbids calling .add),
                then hand `keys` to the shared acquire so a generator `*keys()` runs on the tramp.
-               call_argv[-2] = the THIS set, call_argv[0] = setlike. */
+               call_argv[-2] = the THIS set, call_argv[0] = setlike.
+
+               STILL FROM C, and it aborts by name: js_setlike_get_props performs GetSetRecord's three property
+               reads — `size`, `has`, `keys` — plus ToNumber on the size, with JS_GetProperty. An ACCESSOR or a
+               Proxy there is the page's code, so
+                   new Set([1,2]).union({ get size() { while (…) {} return 2 }, has, keys })
+               preempts in an activation with no flow base. Routing the ITERATION (this arm) did not route the
+               RECORD. The machinery for it is already here: st == 6 drives a routed property read through
+               gp_obj/gp_atom and delivers back to js_iter_consume_step, and st == 5 does the ToPrimitive — so
+               these are four more phases of this machine, not a new mechanism.
+               The same read is what blocks Set.prototype.isSubsetOf / isDisjointFrom / intersection /
+               difference, which no recognizer ever covered and which still hold LIVE JS_IteratorNext and
+               JS_Call loops. Their shared shape is NOT a keys() consume: it is "walk THIS's own records, call
+               other.has per element", with intersection/difference taking the keys() branch only when `other` is
+               the smaller side. So one missing capability — the per-element `has` call on the tramp — gives all
+               four their first branch, and this arm already covers the second. */
             {
                 JSValueConst thisset = crecv;
                 JSValueConst setlike = call_argv[0];
@@ -54189,19 +54204,11 @@ static bool tramp_can_call_setmap_consume(JSContext *ctx, JSValueConst func, JSV
     return true;
 }
 
-/* Route Object.fromEntries(gen) — its C loop drives the argument generator's .next(). Scoped to the direct-generator
-   case; every other shape stays on the normal cfunc path. Fork-safe (the result object's writes are COW-captured). */
-/* s.union(setlike) / s.symmetricDifference(setlike): both seed a new Set from THIS, then fold in setlike.keys() — whose
-   iterator may be a GENERATOR (a `*keys()` method), which the C loop would drive to completion. Recognition reads NO
-   property of setlike: the spec order is size, then has, then keys, and do_setop_consume_tramp performs that read in
-   order before handing `keys` to the shared acquire. *out_setop selects the per-element rule. */
 /* DELETED: tramp_can_call_setop_consume. union / symmetricDifference / isSupersetOf declare their walk-plus-kind
    at their definitions. Its declines were the receiver's [[SetData]] check, `other` not being an Object, and an
    ARITY gate that is not a spec condition at all — the last one made `s.union(a, b)` abort, because the decline
    handed an ordinary call to a C body whose loop no longer exists. */
 
-/* it.toArray()/forEach/reduce/some/every/find: run the terminal as a consume on the tramp. Recognition reads nothing —
-   do_iterterm_tramp performs the spec's argument validation and GetIteratorDirect(this) itself. */
 /* DELETED: tramp_can_call_iterterm. Each terminal declares its own walk-plus-kind at its definition. Its one
    decline was a non-Object receiver — validation, now in the dispatch, in the same place in the order. */
 
