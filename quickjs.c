@@ -1453,7 +1453,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_ARRAY_FLAT, STEPDEF_ARRAY_FLATMAP, STEPDEF_ARRAY_FROMLIKE, STEPDEF_ARRAY_WITH, STEPDEF_ARRAY_FILL, STEPDEF_ARRAY_COPYWITHIN, STEPDEF_BIGINT_CTOR, STEPDEF_TA_WITH, STEPDEF_TA_FILL, STEPDEF_TA_COPYWITHIN, STEPDEF_TA_INDEXOF, STEPDEF_TA_LASTINDEXOF, STEPDEF_TA_INCLUDES, STEPDEF_TA_SUBARRAY, STEPDEF_AB_SLICE, STEPDEF_AB_SLICE_IMM, STEPDEF_SAB_SLICE, STEPDEF_AB_CTOR, STEPDEF_SAB_CTOR, STEPDEF_AB_RESIZE, STEPDEF_SAB_GROW, STEPDEF_AB_TRANSFER, STEPDEF_AB_TRANSFER_IMM, STEPDEF_AB_TRANSFER_FIX, STEPDEF_DATAVIEW_CTOR, STEPDEF_DATE_TOJSON, STEPDEF_DATE_TOPRIM, STEPDEF_DATE_CTOR,
     STEPDEF_MATH_ABS, STEPDEF_MATH_FLOOR, STEPDEF_MATH_CEIL, STEPDEF_MATH_ROUND, STEPDEF_MATH_SQRT, STEPDEF_MATH_ACOS, STEPDEF_MATH_ASIN, STEPDEF_MATH_ATAN, STEPDEF_MATH_COS, STEPDEF_MATH_EXP, STEPDEF_MATH_LOG, STEPDEF_MATH_SIN, STEPDEF_MATH_TAN, STEPDEF_MATH_TRUNC, STEPDEF_MATH_SIGN, STEPDEF_MATH_COSH, STEPDEF_MATH_SINH, STEPDEF_MATH_TANH, STEPDEF_MATH_ACOSH, STEPDEF_MATH_ASINH, STEPDEF_MATH_ATANH, STEPDEF_MATH_EXPM1, STEPDEF_MATH_LOG1P, STEPDEF_MATH_LOG2, STEPDEF_MATH_LOG10, STEPDEF_MATH_CBRT, STEPDEF_MATH_F16ROUND, STEPDEF_MATH_FROUND, STEPDEF_MATH_ATAN2, STEPDEF_MATH_POW, STEPDEF_MATH_MIN, STEPDEF_MATH_MAX, STEPDEF_MATH_HYPOT, STEPDEF_MATH_IMUL, STEPDEF_MATH_CLZ32, STEPDEF_STR_FROMCHARCODE, STEPDEF_STR_FROMCODEPOINT, STEPDEF_DATE_UTC,
     STEPDEF_REGEXP_EXEC, STEPDEF_REGEXP_TEST,
-    STEPDEF_ITER_TAKE, STEPDEF_ITER_DROP,
+    STEPDEF_ITER_TAKE, STEPDEF_ITER_DROP, STEPDEF_ITER_WRAP_RETURN,
     STEPDEF_FUNCTION_CTOR, STEPDEF_GENERATOR_FUNCTION_CTOR,
     STEPDEF_ASYNC_FUNCTION_CTOR, STEPDEF_ASYNC_GENERATOR_FUNCTION_CTOR,
     STEPDEF_DV_FIRST,
@@ -20564,6 +20564,19 @@ typedef struct JSDateToPrim {
    `toISOString` read, and the call — and js_date_toJSON ran all three from a C entry, so
    `Date.prototype.toJSON.call({valueOf(){ while(x){} }})` preempted with no flow base. It is also the C site that
    reaches the intrinsic Object.prototype.toString through OrdinaryToPrimitive. */
+/* 27.1.4.2.2 %WrapForValidIteratorPrototype%.return: RequireInternalSlot, then `? GetMethod(iterator, "return")`
+   and `? Call(returnMethod, iterator)` — BOTH the page's code on an accessor, a Proxy, or a plain method with a
+   loop in it. js_iterator_wrap_next ran them with JS_GetProperty and JS_IteratorNext2 -> JS_Call from a C entry,
+   so closing an `Iterator.from(plainObject)` wrapper aborted at the wrapped `return`'s back-edge.
+   `.next` is NOT part of this: 27.1.4.2.1 forwards VERBATIM, which makes it CALL-SITE-RESOLVED
+   (tramp_unwrap_iter_next replaces the record) rather than a machine — a different mechanism, not a fallback. */
+typedef struct JSIterWrapReturn {
+    JSStepHdr hdr;    /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    JSValue iter;     /* the WRAPPED iterator (owned) */
+    JSValue result;   /* DONE (owned) */
+    JSValue cb[2];    /* [iterator, its `return`] — the CALL request */
+} JSIterWrapReturn;
+
 typedef struct JSDateToJSON {
     JSStepHdr hdr;        /* MUST be first: the generic step driver casts the state to JSStepHdr * */
     JSValue obj;          /* ToObject(this) (owned) */
@@ -23565,6 +23578,34 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     int agmag = tramp_agen_method_magic(call_argv[-1], gthis);
                     if (agmag >= 0) { tramp_agen_magic = agmag; goto do_agen_drive_tramp; }
                 }
+                if (tramp_first == -2) {
+                    /* WrapForValidIterator's .next FORWARDS VERBATIM — 27.1.4.2.1 is
+                       `Return ? Call([[NextMethod]], [[Iterator]])`, with no arguments passed and nothing after
+                       the call. That makes it a REWRITE like the bound arm below, not an arm of its own: produce
+                       the wrapped (receiver, callee) and re-enter, so every kind below answers the wrapped .next
+                       exactly as it answers a bare one and a bytecode .next() with a loop in it gets a heap frame.
+                       The drives that hold an (iterator, nextMethod) record already resolve this themselves; this
+                       is the same question for a plain CALL, asked at the one convergence point so `w.next()`,
+                       `w.next.call(w)`, `Reflect.apply(w.next, w, [])` and a spread cannot answer differently.
+                       Reached through js_iterator_wrap_next instead, it recursed JS_IteratorNext -> JS_Call into a
+                       C activation with no flow base, AND re-wrapped the forwarded result into a fresh
+                       iterator-result object after requiring it to be one — neither of which step 4 does. */
+                    JSValueConst uiter = gthis, unext = call_argv[-1];
+                    if (tramp_unwrap_iter_next(&uiter, &unext)) {
+                        JSValue *wl = js_malloc(ctx, sizeof(JSValue) * 2);
+                        if (unlikely(!wl)) goto exception;
+                        wl[0] = js_dup(uiter);
+                        wl[1] = js_dup(unext);
+                        TAKE_CALL_SHAPE();
+                        call_cfirst = call_first_r; call_cargc = call_pop;   /* the caller's operands are unchanged */
+                        if (call_args_owned) free_arg_list(ctx, call_args_owned, call_args_owned_n);
+                        call_args_owned = wl; call_args_owned_n = 2;
+                        call_argv = (JSValueConst *)&wl[2]; call_argc = 0;
+                        tramp_first = -2;
+                        TRAMP_BODY_DISPATCH(-2, tramp_is_tail);
+                        goto do_consumer_dispatch;
+                    }
+                }
                 if (JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT
                     && JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_BOUND_FUNCTION) {
                     /* 10.4.1.1: a bound function's [[Call]] calls its ULTIMATE target with the flattened bound
@@ -23658,6 +23699,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         TAKE_CALL_SHAPE();
                         cont_st = dcs;
                         goto do_helper_deliver;
+                    }
+                    if (dck == CONT_STEP || dck == CONT_TOPRIM) {
+                        /* a SEQUENCE's call — a step machine's callback, the ToPrimitive method walk. Its operands
+                           live in the sequence's own buffer, never on the caller's stack, so there is nothing to
+                           drop here; the frame-pop path delivers these two the same way. */
+                        TAKE_CALL_SHAPE();   /* consume the shape so it cannot leak onto this frame's next call */
+                        DCHECK(call_pop == 0 && call_first_r == 0,
+                               "a sequence's call declared caller-stack operands it does not own");
+                        cont_st = dcs;
+                        if (dck == CONT_TOPRIM) {
+                            if (unlikely(JS_IsException(ret_val))) { js_toprim_abandon(ctx, cont_st); goto exception; }
+                            goto do_toprim_step;
+                        }
+                        if (unlikely(JS_IsException(ret_val))) goto step_abandon;
+                        goto do_step_step;
                     }
                     if (dck == CONT_ITER_CLOSE_CALL) {
                         TAKE_CALL_SHAPE();
@@ -23775,6 +23831,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValue *cb = NULL; int cbn = 0;
                 int st = h->def->step(step_realm(ctx, h), stt, ret_val, &cb, &cbn);
                 if (unlikely(st < 0)) {
+                    void *souter0 = h->outer; uint8_t sk0 = h->outer_kind;
+                    if (souter0 && (sk0 == CONT_ITER_CONSUME || sk0 == CONT_ITER_HELPER
+                                    || sk0 == CONT_ITER_CLOSE_CALL)) {
+                        /* the machine WAS a call made by one of these sequences, so its throw is that call's
+                           abrupt result and the sequence owns it — IfAbruptCloseIterator for a consumer, and
+                           7.4.9's "the abrupt completion wins" for a close. Delivered exactly as a returned heap
+                           frame's throw is; unwinding here instead would tear the sequence down behind its back. */
+                        int cfirst0 = h->orig_cfirst, cargc0 = h->orig_cargc;
+                        h->outer = NULL; h->outer_kind = CONT_NONE;
+                        tramp_step_state_free(ctx, stt, false);
+                        ret_val = JS_EXCEPTION; cont_st = souter0;
+                        call_first_r = cfirst0; call_pop = cargc0;
+                        if (sk0 == CONT_ITER_CONSUME) goto do_consume_deliver;
+                        if (sk0 == CONT_ITER_HELPER)  goto do_helper_deliver;
+                        goto do_iter_close_deliver;
+                    }
                     tramp_step_chain_free(ctx, stt);   /* and the machines waiting on it */
                     goto exception;
                 }
@@ -23787,13 +23859,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     uint8_t itail = h->orig_is_tail, idiscard = h->discard_result;
                     JSValue r = tramp_step_state_free(ctx, stt, true);
                     JSValue *cargv;
-                    if (souter && (souter_kind == CONT_ITER_CONSUME || souter_kind == CONT_ITER_HELPER)) {
-                        /* the machine WAS a consumer's CALLBACK (`Array.from(g, String)`, `.map(Math.abs)`). Its
-                           result and the caller's operands are handed to that consumer's one delivery, exactly as
-                           a heap frame's are — the operand drop lives there, so it is not repeated here. */
+                    if (souter && (souter_kind == CONT_ITER_CONSUME || souter_kind == CONT_ITER_HELPER
+                                   || souter_kind == CONT_ITER_CLOSE_CALL)) {
+                        /* the machine WAS a call one of these sequences made — a consumer's CALLBACK
+                           (`Array.from(g, String)`, `.map(Math.abs)`) or an iterator's `return`. Its result and
+                           the caller's operands are handed to that sequence's one delivery, exactly as a heap
+                           frame's are; the operand drop lives there, so it is not repeated here. */
                         ret_val = r; cont_st = souter;
                         call_first_r = cfirst; call_pop = cargc;
                         if (souter_kind == CONT_ITER_HELPER) goto do_helper_deliver;
+                        if (souter_kind == CONT_ITER_CLOSE_CALL) goto do_iter_close_deliver;
                         goto do_consume_deliver;
                     }
                     cargv = sp - cargc;
@@ -23903,21 +23978,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         goto do_generator_tramp;
                     }
                 }
-                /* a C/bound callee has no preemptible body, so running it inline suspends nothing — the sequence
-                   still owns its state, so it stays parkable between calls. */
-                {
-                    uint8_t ckind = cd_outer_kind;
-                    cont_st = cd_outer;
-                    cd_outer = NULL; cd_outer_kind = CONT_NONE;
-                    ret_val = JS_Call(ctx, call_argv[-1], call_argv[-2], call_argc, call_argv);
-                    if (ckind == CONT_STEP) {
-                        if (unlikely(JS_IsException(ret_val))) goto step_abandon;
-                        goto do_step_step;
-                    }
-                    DCHECK(ckind == CONT_TOPRIM, "do_cont_dispatch: unknown sequence kind");
-                    if (unlikely(JS_IsException(ret_val))) { js_toprim_abandon(ctx, cont_st); goto exception; }
-                    goto do_toprim_step;
-                }
+                /* Everything else is the SAME question do_generic_callee answers for a stack-shaped call — a
+                   Proxy, a bound function, an async-generator method, a plain C function — so it is asked there,
+                   once. Calling it with JS_Call here was the fallback: a BOUND or PROXIED callback of a sequence
+                   drove from C (`Iterator.from(x)` closing through a bound `return` aborted at its back-edge)
+                   while the same callback reached from an opcode parked.
+                   A sequence holds its operands in its OWN buffer, so the shape it declares is EMPTY — the same
+                   convention an inner step machine uses, and what makes every arm over there leave the caller's
+                   stack alone. */
+                tramp_cont_state = cd_outer; tramp_cont_kind = cd_outer_kind;
+                cd_outer = NULL; cd_outer_kind = CONT_NONE;
+                call_cfirst = 0; call_cargc = 0;
+                goto do_generic_callee;
             }
 
         do_from_like_tramp:
@@ -56562,6 +56634,10 @@ static const JSTrampStepDef js_dataview_ctor_def = { sizeof(JSDataViewCtor), js_
 static const JSTrampStepDef js_ab_slice_def      = { sizeof(JSABSlice), js_ab_slice_step, js_ab_slice_fini, JS_CLASS_ARRAY_BUFFER*2 + 0 };
 static const JSTrampStepDef js_ab_sliceImm_def   = { sizeof(JSABSlice), js_ab_slice_step, js_ab_slice_fini, JS_CLASS_ARRAY_BUFFER*2 + 1 };
 static const JSTrampStepDef js_sab_slice_def     = { sizeof(JSABSlice), js_ab_slice_step, js_ab_slice_fini, JS_CLASS_SHARED_ARRAY_BUFFER*2 + 0 };
+static int js_iter_wrap_return_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_iter_wrap_return_fini(JSContext *ctx, void *st, bool take_result);
+static const JSTrampStepDef js_iter_wrap_return_def =
+    { sizeof(JSIterWrapReturn), js_iter_wrap_return_step, js_iter_wrap_return_fini, 0 };
 static const JSTrampStepDef js_date_toJSON_def = { sizeof(JSDateToJSON), js_date_tojson_step, js_date_tojson_fini, 0 };
 static const JSTrampStepDef js_date_toPrim_def = { sizeof(JSDateToPrim), js_date_toprim_step, js_date_toprim_fini, 0 };
 static const JSTrampStepDef js_date_ctor_def = { sizeof(JSDateCtor), js_date_ctor_step, js_date_ctor_fini, 0 };
@@ -56925,6 +57001,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_REFLECT_GOPD]    = &js_reflect_gopd_def,
     [STEPDEF_ITER_TAKE]       = &js_iter_take_def,
     [STEPDEF_ITER_DROP]       = &js_iter_drop_def,
+    [STEPDEF_ITER_WRAP_RETURN] = &js_iter_wrap_return_def,
     [STEPDEF_REGEXP_EXEC]     = &js_regexp_exec_def,
     [STEPDEF_REGEXP_TEST]     = &js_re_test_def,
     [STEPDEF_FUNCTION_CTOR]   = &js_function_ctor_def,
@@ -58783,27 +58860,70 @@ static JSValue js_iterator_wrap_next(JSContext *ctx, JSValueConst this_val,
                                      int *pdone, int magic)
 {
     JSIteratorWrapData *it;
-    JSValue method, ret;
+    DCHECK(magic == GEN_MAGIC_NEXT, "js_iterator_wrap_next reached with a magic that is not the verbatim forward");
     it = JS_GetOpaque2(ctx, this_val, JS_CLASS_ITERATOR_WRAP);
     if (!it)
         return JS_EXCEPTION;
-    if (magic == GEN_MAGIC_NEXT)
-        return JS_IteratorNext(ctx, it->wrapped_iter, it->wrapped_next, argc, argv, pdone);
-    method = JS_GetProperty(ctx, it->wrapped_iter, JS_ATOM_return);
-    if (JS_IsException(method))
-        return JS_EXCEPTION;
-    if (JS_IsNull(method) || JS_IsUndefined(method)) {
-        *pdone = true;
-        return JS_UNDEFINED;
+    return JS_IteratorNext(ctx, it->wrapped_iter, it->wrapped_next, argc, argv, pdone);
+}
+
+/* 27.1.4.2.2, as a step machine so both of its user-code sites suspend. Two fidelity bugs went with the old body:
+   it forwarded its own ARGUMENTS to `return` (the spec calls it with none) and it required the result to be an
+   Object (step 7 returns the call's result verbatim — only .next's IteratorNext imposes that check). */
+static int js_iter_wrap_return_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSIterWrapReturn *s = st;
+    int r;
+
+    if (s->hdr.stage == 0) {
+        JSIteratorWrapData *it;
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
+        s->iter = JS_UNDEFINED; s->result = JS_UNDEFINED;
+        s->cb[0] = JS_UNDEFINED; s->cb[1] = JS_UNDEFINED;
+        it = JS_GetOpaque2(ctx, s->hdr.this_val, JS_CLASS_ITERATOR_WRAP);
+        if (!it) return -1;
+        s->iter = js_dup(it->wrapped_iter);
+        s->hdr.stage = 1;
     }
-    ret = JS_IteratorNext2(ctx, it->wrapped_iter, method, argc, argv, pdone);
-    JS_FreeValue(ctx, method);
-    return ret;
+    if (s->hdr.stage == 1) {
+        r = step_getprop_run(ctx, &s->hdr, s->iter, JS_ATOM_return, cb_result, &s->cb[1], out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        /* GetMethod: undefined or null means there is nothing to forward to (step 6). */
+        if (JS_IsUndefined(s->cb[1]) || JS_IsNull(s->cb[1])) {
+            s->result = js_create_iterator_result(ctx, JS_UNDEFINED, true);
+            return JS_IsException(s->result) ? -1 : 0;
+        }
+        if (!JS_IsFunction(ctx, s->cb[1])) {
+            JS_ThrowTypeError(ctx, "not a function");
+            return -1;
+        }
+        s->cb[0] = js_dup(s->iter);
+        s->hdr.stage = 2;
+        *out_cb = s->cb; *out_argc = 0;
+        return 3;
+    }
+    DCHECK(s->hdr.stage == 2, "WrapForValidIterator.return: unknown stage");
+    s->result = cb_result;
+    return 0;
+}
+
+static JSValue js_iter_wrap_return_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSIterWrapReturn *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    int i;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    for (i = 0; i < 2; i++) JS_FreeValue(ctx, s->cb[i]);
+    JS_FreeValue(ctx, s->iter);
+    js_free(ctx, s);
+    return r;
 }
 
 static const JSCFunctionListEntry js_iterator_wrap_proto_funcs[] = {
     JS_ITERATOR_NEXT_DEF("next", 0, js_iterator_wrap_next, GEN_MAGIC_NEXT ),
-    JS_ITERATOR_NEXT_DEF("return", 0, js_iterator_wrap_next, GEN_MAGIC_RETURN ),
+    JS_CFUNC_STEP_DEF("return", 0, STEPDEF_ITER_WRAP_RETURN ),
 };
 
 static int check_iterator(JSContext *ctx, JSValueConst obj);
