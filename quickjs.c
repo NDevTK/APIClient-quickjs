@@ -2607,7 +2607,13 @@ void JS_SetSharedArrayBufferFunctions(JSRuntime *rt,
 }
 
 /* return 0 if OK, < 0 if exception */
-static JSJobEnqueueHook g_job_enqueue_hook = NULL;
+/* THREAD-LOCAL, for the SAME reason g_flow_base_gen is (see below): the real engine is single-threaded — one WASM
+   instance per document — but run-test262 drives many tests on parallel OS threads, each installing and releasing
+   its own hooks around its own test. A process-global here is a data race with a real crash in it: one thread's
+   `hooks OFF` at the end of its test lands between another thread's `preempt != NULL` check and its CALL through
+   that same pointer, so the interpreter jumps to address 0 at a loop back-edge. Single-threaded these are just
+   globals. */
+static _Thread_local JSJobEnqueueHook g_job_enqueue_hook = NULL;
 void JS_SetJobEnqueueHook(JSJobEnqueueHook h) { g_job_enqueue_hook = h; }
 
 int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
@@ -6291,10 +6297,10 @@ uint32_t JS_ObjFlowGen(JSValueConst obj) {
    shared heap state (see JSTimeTravelHooks in quickjs.h). g_time_travel.prop_write covers a property write (and,
    via the host's absent-slot recording, a creation); .cell_write covers a closure-cell (JSVarRef) write, which
    bypasses the property path. Installed once by JS_SetTimeTravelHooks. */
-static JSTimeTravelHooks g_time_travel = { NULL, NULL, NULL };
+static _Thread_local JSTimeTravelHooks g_time_travel = { NULL, NULL, NULL };
 /* forced-exec CONCOLIC-VALUE hooks (see JSConcolicHooks in quickjs.h): .add propagates a concolic value through
    `+` (js_add_slow), .cmp through == / === . One struct, installed by JS_SetConcolicHooks. */
-static JSConcolicHooks g_concolic = { NULL, NULL };
+static _Thread_local JSConcolicHooks g_concolic = { NULL, NULL };
 /* Ask the host to record an object's pre-write state (for per-flow revert). Whether a FLOW_LOCAL object is
    skipped is decided by the HOST hook, NOT here: a snapshot fork SHARES the parent frame's flow_local objects
    with the sibling, so once a flow has forked those objects are shared and their mutations MUST be captured. The
@@ -21616,7 +21622,7 @@ static bool tramp_unwrap_iter_next(JSValueConst *piter, JSValueConst *pnext) {
    sibling by appending a decision vector, NEVER by rewinding OP_if, so a native builtin loop-back calls the SAME
    hook — frame-agnostic by construction), .fork (build the hot sibling from a frame CLONE), .preempt (park the
    running flow at a yield point). One struct, installed by JS_SetFlowControlHooks. */
-static JSFlowControlHooks g_flow_control = { NULL, NULL, NULL };
+static _Thread_local JSFlowControlHooks g_flow_control = { NULL, NULL, NULL };
 /* The flow's BASE async activation, set by JS_FlowResume around the base run. A concolic branch may frame-
    snapshot-fork ONLY when the running activation IS this base and flat (tf_top==NULL); a branch in a NESTED
    async function call (its own gen_state) or a deep trampolined frame forks by decision-vector replay instead.
