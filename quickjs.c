@@ -1462,7 +1462,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_NUM_TOEXPONENTIAL, STEPDEF_NUM_TOPRECISION, STEPDEF_NUM_CTOR,
     STEPDEF_ITERATOR_CTOR, STEPDEF_ARRAY_OF, STEPDEF_ARRAY_CONCAT,
     STEPDEF_WEAKREF_CTOR, STEPDEF_FINREC_CTOR, STEPDEF_ARRAY_SLICE, STEPDEF_ARRAY_SPLICE,
-    STEPDEF_ARRAY_CTOR, STEPDEF_ARRAY_POP, STEPDEF_ARRAY_SHIFT,
+    STEPDEF_ARRAY_CTOR, STEPDEF_ARRAY_POP, STEPDEF_ARRAY_SHIFT, STEPDEF_ARRAY_REVERSE,
     STEPDEF_ARRAY_PUSH, STEPDEF_ARRAY_UNSHIFT,
     STEPDEF_DOMEXCEPTION_CTOR,
     STEPDEF_COUNT
@@ -20416,6 +20416,14 @@ typedef struct JSArrayPush {
     int64_t len, newLen, from, cs_i;
     int i, present;
 } JSArrayPush;
+
+typedef struct JSArrayReverse {
+    JSStepHdr hdr;       /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    JSValue obj;         /* ToObject(this) — also the RESULT (owned) */
+    JSValue lval, hval;  /* the two elements, held across the asks and the writes (owned) */
+    int64_t len, l, h;
+    int l_present, h_present;
+} JSArrayReverse;
 
 typedef struct JSArraySlice {
     JSStepHdr hdr;       /* MUST be first: the generic step driver casts the state to JSStepHdr * */
@@ -56063,6 +56071,10 @@ static int js_array_concat_step(JSContext *ctx, void *st, JSValue cb_result, JSV
 static int js_array_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_slice_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_array_ctor_body(JSContext *ctx, JSValueConst obj_, int argc, JSValueConst *argv);
+static int js_array_reverse_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_array_reverse_fini(JSContext *ctx, void *st, bool take_result);
+static const JSTrampStepDef js_array_reverse_def =
+    { sizeof(JSArrayReverse), js_array_reverse_step, js_array_reverse_fini, 0 };
 static int js_array_pop_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_pop_fini(JSContext *ctx, void *st, bool take_result);
 static int js_array_push_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
@@ -56285,6 +56297,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_ARRAY_OF]      = &js_array_of_def,
     [STEPDEF_ARRAY_CONCAT]  = &js_array_concat_def,
     [STEPDEF_ARRAY_CTOR]    = &js_array_ctor_def,
+    [STEPDEF_ARRAY_REVERSE] = &js_array_reverse_def,
     [STEPDEF_ARRAY_POP]     = &js_array_pop_def,
     [STEPDEF_ARRAY_SHIFT]   = &js_array_shift_def,
     [STEPDEF_ARRAY_PUSH]    = &js_array_push_def,
@@ -56879,73 +56892,114 @@ static JSValue js_array_push_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
-static JSValue js_array_reverse(JSContext *ctx, JSValueConst this_val,
-                                int argc, JSValueConst *argv)
+/* 23.1.3.25 Array.prototype.reverse. Every step of the swap is the page's code on an exotic receiver — the
+   length read, both HasProperty asks, both Gets, and then two writes that are a Set or a
+   DeletePropertyOrThrow depending on which side existed. js_array_reverse performed all of them from C.
+   The DENSE span stays: js_get_fast_array with count32 == len is the statement that no accessor, no Proxy trap
+   and no prototype lookup is reachable, so those slots swap with no observable step at all.
+   Stages: 0 ToObject, 1 length + the dense span, 2 pair head, 3 Has(l), 4 Get(l), 5 Has(h), 6 Get(h),
+   7 the first write, 8 the second. */
+
+static int js_array_reverse_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    JSValue obj, lval, hval;
+    JSArrayReverse *s = st;
     JSValue *arrp;
-    int64_t len, l, h;
-    int l_present, h_present;
     uint32_t count32;
+    int r;
 
-    lval = JS_UNDEFINED;
-    obj = JS_ToObject(ctx, this_val);
-    if (js_get_length64(ctx, &len, obj))
-        goto exception;
-
-    /* Special case fast arrays */
-    if (js_get_fast_array(ctx, obj, &arrp, &count32) && count32 == len) {
-        uint32_t ll, hh;
-
-        if (count32 > 1) {
-            for (ll = 0, hh = count32 - 1; ll < hh; ll++, hh--) {
-                lval = arrp[ll];
-                arrp[ll] = arrp[hh];
-                arrp[hh] = lval;
-            }
-        }
-        return obj;
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
+        s->obj = JS_UNDEFINED; s->lval = JS_UNDEFINED; s->hval = JS_UNDEFINED;
+        s->len = 0; s->l = 0; s->h = 0; s->l_present = 0; s->h_present = 0;
+        s->obj = JS_ToObject(ctx, s->hdr.this_val);
+        if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
+        s->hdr.stage = 1;
     }
-
-    for (l = 0, h = len - 1; l < h; l++, h--) {
-        l_present = JS_TryGetPropertyInt64(ctx, obj, l, &lval);
-        if (l_present < 0)
-            goto exception;
-        h_present = JS_TryGetPropertyInt64(ctx, obj, h, &hval);
-        if (h_present < 0)
-            goto exception;
-        if (h_present) {
-            if (JS_SetPropertyInt64(ctx, obj, l, hval) < 0)
-                goto exception;
-
-            if (l_present) {
-                if (JS_SetPropertyInt64(ctx, obj, h, lval) < 0) {
-                    lval = JS_UNDEFINED;
-                    goto exception;
+    if (s->hdr.stage == 1) {
+        r = step_length_run(ctx, &s->hdr, s->obj, cb_result, &s->len, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        if (js_get_fast_array(ctx, s->obj, &arrp, &count32) && count32 == s->len) {
+            uint32_t ll, hh;
+            if (count32 > 1) {
+                for (ll = 0, hh = count32 - 1; ll < hh; ll++, hh--) {
+                    JSValue t = arrp[ll];
+                    arrp[ll] = arrp[hh];
+                    arrp[hh] = t;
                 }
-                lval = JS_UNDEFINED;
-            } else {
-                if (JS_DeletePropertyInt64(ctx, obj, h, JS_PROP_THROW) < 0)
-                    goto exception;
             }
-        } else {
-            if (l_present) {
-                if (JS_DeletePropertyInt64(ctx, obj, l, JS_PROP_THROW) < 0)
-                    goto exception;
-                if (JS_SetPropertyInt64(ctx, obj, h, lval) < 0) {
-                    lval = JS_UNDEFINED;
-                    goto exception;
-                }
-                lval = JS_UNDEFINED;
-            }
+            return 0;
         }
+        s->l = 0; s->h = s->len - 1;
+        s->hdr.stage = 2;
     }
-    return obj;
+    for (;;) {
+        if (s->hdr.stage == 2) {
+            if (s->l >= s->h) { JS_FreeValue(ctx, cb_result); return 0; }
+            s->hdr.stage = 3;
+        }
+        if (s->hdr.stage == 3) {
+            r = step_hasidx_run(ctx, &s->hdr, s->obj, s->l, cb_result, &s->l_present, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->hdr.stage = s->l_present ? 4 : 5;
+        }
+        if (s->hdr.stage == 4) {
+            r = step_getidx_run(ctx, &s->hdr, s->obj, s->l, cb_result, &s->lval, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->hdr.stage = 5;
+        }
+        if (s->hdr.stage == 5) {
+            r = step_hasidx_run(ctx, &s->hdr, s->obj, s->h, cb_result, &s->h_present, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->hdr.stage = s->h_present ? 6 : 7;
+        }
+        if (s->hdr.stage == 6) {
+            r = step_getidx_run(ctx, &s->hdr, s->obj, s->h, cb_result, &s->hval, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->hdr.stage = 7;
+        }
+        /* THE two writes. Which pair they are is decided by which side existed, and a HOLE on one side is a
+           DeletePropertyOrThrow on the other — the spec's own three cases, in the spec's order. */
+        if (s->hdr.stage == 7) {
+            if (s->h_present)
+                r = step_setidx_run(ctx, &s->hdr, s->obj, s->l, s->hval, cb_result, out_cb, out_argc);
+            else if (s->l_present)
+                r = step_delidx_run(ctx, &s->hdr, s->obj, s->l, cb_result, out_cb, out_argc);
+            else
+                { JS_FreeValue(ctx, cb_result); r = 0; }
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->hdr.stage = 8;
+        }
+        if (s->h_present && !s->l_present)
+            r = step_delidx_run(ctx, &s->hdr, s->obj, s->h, cb_result, out_cb, out_argc);
+        else if (s->l_present)
+            r = step_setidx_run(ctx, &s->hdr, s->obj, s->h, s->lval, cb_result, out_cb, out_argc);
+        else
+            { JS_FreeValue(ctx, cb_result); r = 0; }
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        JS_FreeValue(ctx, s->lval); s->lval = JS_UNDEFINED;
+        JS_FreeValue(ctx, s->hval); s->hval = JS_UNDEFINED;
+        s->l++; s->h--;
+        s->hdr.stage = 2;
+    }
+}
 
- exception:
-    JS_FreeValue(ctx, lval);
-    JS_FreeValue(ctx, obj);
-    return JS_EXCEPTION;
+static JSValue js_array_reverse_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSArrayReverse *s = st;
+    JSValue r = take_result ? s->obj : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->obj);
+    JS_FreeValue(ctx, s->lval);
+    JS_FreeValue(ctx, s->hval);
+    js_free(ctx, s);
+    return r;
 }
 
 // Note: a.toReversed() is a.slice().reverse() with the twist that a.slice()
@@ -58976,7 +59030,7 @@ static const JSCFunctionListEntry js_array_proto_funcs[] = {
     JS_CFUNC_STEP_DEF("push", 1, STEPDEF_ARRAY_PUSH ),
     JS_CFUNC_STEP_DEF("shift", 0, STEPDEF_ARRAY_SHIFT ),
     JS_CFUNC_STEP_DEF("unshift", 1, STEPDEF_ARRAY_UNSHIFT ),
-    JS_CFUNC_DEF("reverse", 0, js_array_reverse ),
+    JS_CFUNC_STEP_DEF("reverse", 0, STEPDEF_ARRAY_REVERSE ),
     JS_CFUNC_DEF("toReversed", 0, js_array_toReversed ),
     JS_CFUNC_STEP_DEF("sort", 1, STEPDEF_ARRAY_SORT ),
     JS_CFUNC_STEP_DEF("toSorted", 1, STEPDEF_ARRAY_TOSORTED ),
