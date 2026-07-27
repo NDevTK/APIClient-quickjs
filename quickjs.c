@@ -20102,6 +20102,11 @@ typedef struct {
 #define SETOP_UNION      0   /* add each key to r (internal append — spec forbids calling r.add) */
 #define SETOP_SYMDIFF    1   /* key in THIS -> delete from r; key in neither -> add to r (insertion order preserved) */
 #define SETOP_SUPERSET   2   /* every key must be in THIS; a miss short-circuits false and CLOSES the iterator */
+#define SETOP_INTERSECT  5   /* 24.2.4.9: the elements in BOTH. Same two walks as isDisjointFrom, chosen the same
+                                way, but building a Set instead of a boolean — the result starts EMPTY and a hit
+                                appends. */
+#define SETOP_DIFF       6   /* 24.2.4.4: the elements in THIS and not in other. The result starts as a copy of
+                                THIS (the seeding union/symmetricDifference already do) and a hit REMOVES. */
 #define SETOP_DISJOINT   4   /* 24.2.4.5: no element in common. The ONLY set-operation whose WALK is chosen at
                                 run time — THIS's records against other.has when THIS is the smaller side, else
                                 other's keys() against THIS's [[SetData]] — which is why the machine picks it once
@@ -20208,7 +20213,7 @@ typedef struct JSIterConsume {
     uint8_t from_owes_result;
     JSValue ent_obj;     /* the entry object, held across its two reads (owned) */
     JSValue ent_key;     /* entry[0], then its property key (owned) */
-    /* GetSetRecord (24.2.1.2) for a set-operation, performed as PHASES rather than by js_setlike_get_props from
+    /* GetSetRecord (24.2.1.2) for a set-operation, performed as PHASES rather than by three JS_GetProperty calls from
        C: `size` and its ToNumber, then `has`, then `keys` — each of them the page's code on an accessor or a
        Proxy. setrec_ph: 0 size read, 1 its ToPrimitive, 2 has read, 3 keys read, 4 complete. */
     JSValue setlike;     /* the `other` argument (owned) — the record is read off it, then the acquire uses it */
@@ -20255,7 +20260,6 @@ static JSIterConsume *js_iter_consume_new(JSContext *ctx)
 /* Set-record primitives — ITERCONS_SETOP folds setlike.keys() straight into the result's [[SetData]] (the spec
    forbids calling the observable .add), so the consume step needs them before their definitions. */
 static JSValue map_normalize_key(JSContext *ctx, JSValue key);
-static int js_setlike_get_props(JSContext *ctx, JSValueConst setlike, uint64_t *psize, JSValue *phas, JSValue *pkeys);
 static JSMapRecord *map_find_record(JSContext *ctx, JSMapState *s, JSValueConst key);
 static JSMapRecord *map_add_record(JSContext *ctx, JSMapState *s, JSValue key);
 static void map_delete_record(JSRuntime *rt, JSMapState *s, JSMapRecord *mr);
@@ -24140,19 +24144,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                then hand `keys` to the shared acquire so a generator `*keys()` runs on the tramp.
                call_argv[-2] = the THIS set, call_argv[0] = setlike.
 
-               GetSetRecord is PHASES of the machine (setrec_ph), not js_setlike_get_props from C: `size` and its
-               ToNumber, then `has`, then `keys` are each the page's code on an accessor or a Proxy, and reading
-               them with JS_GetProperty meant
+               GetSetRecord is PHASES of the machine (setrec_ph), not three JS_GetProperty calls from C: `size` and
+               its ToNumber, then `has`, then `keys` are each the page's code on an accessor or a Proxy, and
+               reading them from C meant
                    new Set([1,2]).union({ get size() { while (…) {} return 2 }, has, keys })
                preempted in an activation with no flow base. Routing the ITERATION alone did not route the
                RECORD. It needed no new mechanism — st == 6 is a routed property read delivering back to
                js_iter_consume_step and st == 5 is the ToPrimitive, so it is four more phases.
-               js_setlike_get_props survives for Set.prototype.isSubsetOf / isDisjointFrom / intersection /
-               difference, which no recognizer ever covered and which still hold LIVE JS_IteratorNext and
-               JS_Call loops. Their shared shape is NOT a keys() consume: it is "walk THIS's own records, call
-               other.has per element", with intersection/difference taking the keys() branch only when `other` is
-               the smaller side. One missing capability — the per-element `has` call on the tramp — gives all
-               four their first branch, and this arm already covers the second. */
+               ALL SEVEN set-operations arrive here now. Four of them (isSubsetOf, isDisjointFrom, intersection,
+               difference) are not purely a keys() consume: their first branch is "walk THIS's own records,
+               calling other.has per element", taken when THIS is the smaller side. That walk is the machine's
+               has-walk and its per-element `has` is a one-argument callback step; this arm covers the second
+               branch for all of them. */
             {
                 JSValueConst thisset = crecv;
                 JSValueConst setlike = call_argv[0];
@@ -54039,8 +54042,9 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
                            JS_ThrowTypeError(ctx, ".has is not a function"); return -1; }
                 /* union/symmetricDifference/isSupersetOf consult THIS and never call it — it only has to EXIST.
                    The has-WALK calls it per element, so it keeps it. */
-                if (s->setop == SETOP_SUBSET || s->setop == SETOP_DISJOINT) s->setrec_has = res;
-                else                                                         JS_FreeValue(ctx, res);
+                if (s->setop == SETOP_SUBSET || s->setop == SETOP_DISJOINT
+                    || s->setop == SETOP_INTERSECT || s->setop == SETOP_DIFF) s->setrec_has = res;
+                else                                                          JS_FreeValue(ctx, res);
                 s->setrec_ph = 3;
             } else {
                 DCHECK(s->setrec_ph == 3, "GetSetRecord: unknown phase");
@@ -54090,12 +54094,23 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
             s->r = js_map_constructor(ctx, JS_UNDEFINED, 0, NULL, MAGIC_SET);
             if (JS_IsException(s->r)) { s->r = JS_UNDEFINED; return -1; }
             ts = JS_GetOpaque(s->r, JS_CLASS_SET);
-            list_for_each(el, &ss->records) {
-                JSMapRecord *mr = list_entry(el, JSMapRecord, link), *nr;
-                if (mr->empty) continue;
-                nr = map_add_record(ctx, ts, mr->key);
-                if (!nr) { JS_ThrowOutOfMemory(ctx); return -1; }
-                nr->value = JS_UNDEFINED;
+            /* intersection is the one result-building operation that starts EMPTY: its elements are the ones both
+               sides have, so there is nothing to seed. The other three start from THIS's records. */
+            if (s->setop != SETOP_INTERSECT) {
+                list_for_each(el, &ss->records) {
+                    JSMapRecord *mr = list_entry(el, JSMapRecord, link), *nr;
+                    if (mr->empty) continue;
+                    nr = map_add_record(ctx, ts, mr->key);
+                    if (!nr) { JS_ThrowOutOfMemory(ctx); return -1; }
+                    nr->value = JS_UNDEFINED;
+                }
+            }
+            if ((s->setop == SETOP_INTERSECT || s->setop == SETOP_DIFF)
+                && ss->record_count <= s->setrec_size) {
+                /* the smaller side is walked, exactly as isDisjointFrom decides it */
+                s->iter = js_create_map_iterator(ctx, s->adder, 0, NULL, MAGIC_SET);
+                if (JS_IsException(s->iter)) { s->iter = JS_UNDEFINED; return -1; }
+                goto setop_has_walk;
             }
             return 12;
         }
@@ -54105,14 +54120,38 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
         /* the per-element `has` CALL returned. `res` may be an exception (the page's has threw), which the
            machine propagates: THIS's own record walk is not an iterator, so there is nothing to close. */
         int ok;
+        JSValue hel = s->cb_value;
+        s->cb_value = JS_UNDEFINED;
         s->cb_pending = 0;
-        JS_FreeValue(ctx, s->cb_value); s->cb_value = JS_UNDEFINED;
-        if (JS_IsException(res)) return -1;
+        if (JS_IsException(res)) { JS_FreeValue(ctx, hel); return -1; }
         ok = JS_ToBoolFree(ctx, res);
-        DCHECK(s->setop == SETOP_SUBSET || s->setop == SETOP_DISJOINT,
-               "a `has` call came back to a set-operation that never makes one");
-        /* isSubsetOf is decided by a MISS, isDisjointFrom by a HIT — the same walk, opposite polarity. */
-        if (ok == (s->setop == SETOP_DISJOINT)) { s->r = js_bool(false); return 0; }
+        if (s->setop == SETOP_SUBSET || s->setop == SETOP_DISJOINT) {
+            /* isSubsetOf is decided by a MISS, isDisjointFrom by a HIT — the same walk, opposite polarity. */
+            JS_FreeValue(ctx, hel);
+            if (ok == (s->setop == SETOP_DISJOINT)) { s->r = js_bool(false); return 0; }
+        } else {
+            /* intersection APPENDS on a hit (into a result that started empty), difference REMOVES on one (from a
+               result that started as a copy of THIS). The spec mutates [[SetData]] directly — an observable
+               r.add must not be called — and the `has` may have re-added an element, so a hit consults the
+               result before appending. */
+            JSMapState *hrs = JS_GetOpaque(s->r, JS_CLASS_SET);
+            JSMapRecord *hmr;
+            DCHECK(s->setop == SETOP_INTERSECT || s->setop == SETOP_DIFF,
+                   "a `has` call came back to a set-operation that never makes one");
+            DCHECK(hrs != NULL, "setop has-walk: r must be the result Set");
+            hel = map_normalize_key(ctx, hel);
+            if (ok) {
+                hmr = map_find_record(ctx, hrs, hel);
+                if (s->setop == SETOP_DIFF) {
+                    if (hmr) map_delete_record(ctx->rt, hrs, hmr);
+                } else if (!hmr) {
+                    hmr = map_add_record(ctx, hrs, hel);
+                    if (!hmr) { JS_FreeValue(ctx, hel); JS_ThrowOutOfMemory(ctx); return -1; }
+                    hmr->value = JS_UNDEFINED;
+                }
+            }
+            JS_FreeValue(ctx, hel);
+        }
     setop_has_walk:
         for (;;) {
             JSValue item;
@@ -54121,7 +54160,13 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
                record, not a fallback for one — so it steps here rather than as a routed .next(). */
             item = js_map_iterator_next(ctx, s->iter, 0, NULL, &done, MAGIC_SET);
             if (JS_IsException(item)) return -1;
-            if (done) { JS_FreeValue(ctx, item); s->r = js_bool(true); return 0; }
+            if (done) {
+                JS_FreeValue(ctx, item);
+                /* the BOOLEAN operations answer with their verdict; the result-BUILDING ones already hold theirs
+                   in `r` and must not have it overwritten. */
+                if (s->setop == SETOP_SUBSET || s->setop == SETOP_DISJOINT) s->r = js_bool(true);
+                return 0;
+            }
             DCHECK(JS_IsUndefined(s->cb_value), "the consume machine already holds an element");
             s->cb_value = item;
             s->cb_pending = 11;
@@ -54477,6 +54522,23 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
                 s->k = 0;            /* the deciding element */
                 s->closing = 1;      /* spec: IteratorClose before returning */
                 return 2;            /* close the iterator (on the tramp if it is a generator), then finish */
+            }
+            if (s->setop == SETOP_INTERSECT || s->setop == SETOP_DIFF) {
+                /* the other side of the same two rules: a key THIS also has is appended (intersection) or removed
+                   (difference); one it does not have changes nothing either way. */
+                bool present = (NULL != map_find_record(ctx, ts, value));
+                if (present) {
+                    mr = map_find_record(ctx, rs, value);
+                    if (s->setop == SETOP_DIFF) {
+                        if (mr) map_delete_record(ctx->rt, rs, mr);
+                    } else if (!mr) {
+                        mr = map_add_record(ctx, rs, value);
+                        if (!mr) { JS_FreeValue(ctx, value); return -1; }
+                        mr->value = JS_UNDEFINED;
+                    }
+                }
+                JS_FreeValue(ctx, value);
+                return 1;
             }
             if (s->setop == SETOP_UNION) {
                 if (!map_find_record(ctx, rs, value)) {
@@ -68458,66 +68520,6 @@ static int JS_WriteSet(BCWriterState *s, struct JSMapState *map_state)
     return js_map_write(s, map_state, MAGIC_SET);
 }
 
-static int js_setlike_get_props(JSContext *ctx, JSValueConst setlike,
-                                uint64_t *psize, JSValue *phas, JSValue *pkeys)
-{
-    JSValue has, keys, v;
-    JSMapState *s;
-    uint64_t size;
-    double d;
-
-    keys = JS_UNDEFINED;
-    has = JS_UNDEFINED;
-    s = JS_GetOpaque(setlike, JS_CLASS_SET);
-    if (s) {
-        size = s->record_count;
-    } else {
-        v = JS_GetProperty(ctx, setlike, JS_ATOM_size);
-        if (JS_IsException(v))
-            return -1;
-        if (JS_IsUndefined(v)) {
-            JS_ThrowTypeError(ctx, ".size is undefined");
-            return -1;
-        }
-        if (JS_ToFloat64Free(ctx, &d, v) < 0)
-            return -1;
-        if (d < 0) {
-            JS_ThrowRangeError(ctx, ".size is not a legal size");
-            return -1;
-        }
-        if (isnan(d)) {
-            JS_ThrowTypeError(ctx, ".size is not a legal size");
-            return -1;
-        }
-        if (isinf(d) || d > (double)MAX_SAFE_INTEGER) {
-            size = UINT64_MAX;
-        } else {
-            size = (uint64_t)d; // cast for expository reasons
-        }
-    }
-    has = JS_GetProperty(ctx, setlike, JS_ATOM_has);
-    if (JS_IsException(has))
-        return -1;
-    if (!JS_IsFunction(ctx, has)) {
-        JS_ThrowTypeError(ctx, ".has is not a function");
-        goto fail;
-    }
-    keys = JS_GetProperty(ctx, setlike, JS_ATOM_keys);
-    if (JS_IsException(keys))
-        goto fail;
-    if (!JS_IsFunction(ctx, keys)) {
-        JS_ThrowTypeError(ctx, ".keys is not a function");
-        goto fail;
-    }
-    *psize = size;
-    *phas = has;
-    *pkeys = keys;
-    return 0;
-fail:
-    JS_FreeValue(ctx, has);
-    JS_FreeValue(ctx, keys);
-    return -1;
-}
 
 
 
@@ -68527,205 +68529,7 @@ fail:
    reachable only through the recognizer's declines; with the walk declared at the definition no pointer names
    it, and js_call_c_function's JS_CFUNC_consume arm is the backstop for a call site that was never routed. */
 
-static JSValue js_set_intersection(JSContext *ctx, JSValueConst this_val,
-                                   int argc, JSValueConst *argv)
-{
-    JSValue has, item, iter, keys, newset, next, rv;
-    JSValueConst setlike;
-    JSMapState *s, *t;
-    JSMapRecord *mr;
-    uint64_t size;
-    int done, ok;
 
-    s = JS_GetOpaque2(ctx, this_val, JS_CLASS_SET);
-    if (!s)
-        return JS_EXCEPTION;
-    setlike = argv[0];
-    if (js_setlike_get_props(ctx, setlike, &size, &has, &keys) < 0)
-        return JS_EXCEPTION;
-    iter = JS_UNDEFINED;
-    next = JS_UNDEFINED;
-    newset = JS_UNDEFINED;
-    if (s->record_count > size) {
-        iter = JS_Call(ctx, keys, setlike, 0, NULL);
-        if (JS_IsException(iter))
-            goto exception;
-        next = JS_GetProperty(ctx, iter, JS_ATOM_next);
-        if (JS_IsException(next))
-            goto exception;
-        newset = js_map_constructor(ctx, JS_UNDEFINED, 0, NULL, MAGIC_SET);
-        if (JS_IsException(newset))
-            goto exception;
-        t = JS_GetOpaque(newset, JS_CLASS_SET);
-        for (;;) {
-            item = JS_IteratorNext(ctx, iter, next, 0, NULL, &done);
-            if (JS_IsException(item))
-                goto exception;
-            if (done) // item is JS_UNDEFINED
-                break;
-            item = map_normalize_key(ctx, item);
-            if (!map_find_record(ctx, s, item)) {
-                JS_FreeValue(ctx, item);
-            } else if (map_find_record(ctx, t, item)) {
-                JS_FreeValue(ctx, item); // no duplicates
-            } else if ((mr = map_add_record(ctx, t, item))) {
-                JS_FreeValue(ctx, item);
-                mr->value = JS_UNDEFINED;
-            } else {
-                JS_FreeValue(ctx, item);
-                goto exception;
-            }
-        }
-    } else {
-        iter = js_create_map_iterator(ctx, this_val, 0, NULL, MAGIC_SET);
-        if (JS_IsException(iter))
-            goto exception;
-        newset = js_map_constructor(ctx, JS_UNDEFINED, 0, NULL, MAGIC_SET);
-        if (JS_IsException(newset))
-            goto exception;
-        t = JS_GetOpaque(newset, JS_CLASS_SET);
-        for (;;) {
-            item = js_map_iterator_next(ctx, iter, 0, NULL, &done, MAGIC_SET);
-            if (JS_IsException(item))
-                goto exception;
-            if (done) // item is JS_UNDEFINED
-                break;
-            rv = JS_Call(ctx, has, setlike, 1, vc(&item));
-            ok = JS_ToBoolFree(ctx, rv); // returns -1 if rv is JS_EXCEPTION
-            if (ok > 0) {
-                item = map_normalize_key(ctx, item);
-                if (map_find_record(ctx, t, item)) {
-                    JS_FreeValue(ctx, item); // no duplicates
-                } else if ((mr = map_add_record(ctx, t, item))) {
-                    JS_FreeValue(ctx, item);
-                    mr->value = JS_UNDEFINED;
-                } else {
-                    JS_FreeValue(ctx, item);
-                    goto exception;
-                }
-            } else {
-                JS_FreeValue(ctx, item);
-                if (ok < 0)
-                    goto exception;
-            }
-        }
-    }
-    goto fini;
-exception:
-    JS_FreeValue(ctx, newset);
-    newset = JS_EXCEPTION;
-fini:
-    JS_FreeValue(ctx, has);
-    JS_FreeValue(ctx, keys);
-    JS_FreeValue(ctx, iter);
-    JS_FreeValue(ctx, next);
-    return newset;
-}
-
-static JSValue js_set_difference(JSContext *ctx, JSValueConst this_val,
-                                 int argc, JSValueConst *argv)
-{
-    JSValue has, item, iter, keys, newset, next, rv;
-    JSValueConst setlike;
-    JSMapState *s, *t;
-    JSMapRecord *mr;
-    uint64_t size;
-    int done;
-    int ok;
-
-    s = JS_GetOpaque2(ctx, this_val, JS_CLASS_SET);
-    if (!s)
-        return JS_EXCEPTION;
-    setlike = argv[0];
-    if (js_setlike_get_props(ctx, setlike, &size, &has, &keys) < 0)
-        return JS_EXCEPTION;
-    iter = JS_UNDEFINED;
-    next = JS_UNDEFINED;
-    newset = JS_UNDEFINED;
-    if (s->record_count > size) {
-        iter = JS_Call(ctx, keys, setlike, 0, NULL);
-        if (JS_IsException(iter))
-            goto exception;
-        next = JS_GetProperty(ctx, iter, JS_ATOM_next);
-        if (JS_IsException(next))
-            goto exception;
-        /* Copy this_val's records DIRECTLY rather than constructing from it as an iterable. The iterable form
-           re-entered js_map_constructor from C, which is the one path that cannot suspend — and it was the only
-           internal caller doing so, found by backtrace once the constructor's loop was deleted. A Set copying a
-           Set needs no JS iteration at all: the records are C data. Same shape as the tramp path already uses. */
-        {
-            struct list_head *el2;
-            newset = js_map_constructor(ctx, JS_UNDEFINED, 0, NULL, MAGIC_SET);
-            if (JS_IsException(newset))
-                goto exception;
-            t = JS_GetOpaque(newset, JS_CLASS_SET);
-            list_for_each(el2, &s->records) {
-                JSMapRecord *mr = list_entry(el2, JSMapRecord, link), *nr;
-                if (mr->empty)
-                    continue;
-                nr = map_add_record(ctx, t, mr->key);
-                if (!nr)
-                    goto exception;
-                nr->value = JS_UNDEFINED;
-            }
-        }
-        for (;;) {
-            item = JS_IteratorNext(ctx, iter, next, 0, NULL, &done);
-            if (JS_IsException(item))
-                goto exception;
-            if (done) // item is JS_UNDEFINED
-                break;
-            item = map_normalize_key(ctx, item);
-            mr = map_find_record(ctx, t, item);
-            if (mr)
-                map_delete_record(ctx->rt, t, mr);
-            JS_FreeValue(ctx, item);
-        }
-    } else {
-        iter = js_create_map_iterator(ctx, this_val, 0, NULL, MAGIC_SET);
-        if (JS_IsException(iter))
-            goto exception;
-        newset = js_map_constructor(ctx, JS_UNDEFINED, 0, NULL, MAGIC_SET);
-        if (JS_IsException(newset))
-            goto exception;
-        t = JS_GetOpaque(newset, JS_CLASS_SET);
-        for (;;) {
-            item = js_map_iterator_next(ctx, iter, 0, NULL, &done, MAGIC_SET);
-            if (JS_IsException(item))
-                goto exception;
-            if (done) // item is JS_UNDEFINED
-                break;
-            rv = JS_Call(ctx, has, setlike, 1, vc(&item));
-            ok = JS_ToBoolFree(ctx, rv); // returns -1 if rv is JS_EXCEPTION
-            if (ok == 0) {
-                item = map_normalize_key(ctx, item);
-                if (map_find_record(ctx, t, item)) {
-                    JS_FreeValue(ctx, item); // no duplicates
-                } else if ((mr = map_add_record(ctx, t, item))) {
-                    JS_FreeValue(ctx, item);
-                    mr->value = JS_UNDEFINED;
-                } else {
-                    JS_FreeValue(ctx, item);
-                    goto exception;
-                }
-            } else {
-                JS_FreeValue(ctx, item);
-                if (ok < 0)
-                    goto exception;
-            }
-        }
-    }
-    goto fini;
-exception:
-    JS_FreeValue(ctx, newset);
-    newset = JS_EXCEPTION;
-fini:
-    JS_FreeValue(ctx, has);
-    JS_FreeValue(ctx, keys);
-    JS_FreeValue(ctx, iter);
-    JS_FreeValue(ctx, next);
-    return newset;
-}
 
 /* DELETED: js_set_symmetricDifference. The whole operation is do_setop_consume_tramp — the setlike's props read in spec
    order, THIS's records copied straight into the result (the spec forbids calling .add), and keys() folded in by
@@ -68782,8 +68586,8 @@ static const JSCFunctionListEntry js_set_proto_funcs[] = {
     JS_CFUNC_CONSUME_DEF("isDisjointFrom", 1, ITERCONS_SETOP_BASE + SETOP_DISJOINT ),
     JS_CFUNC_CONSUME_DEF("isSubsetOf", 1, ITERCONS_SETOP_BASE + SETOP_SUBSET ),
     JS_CFUNC_CONSUME_DEF("isSupersetOf", 1, ITERCONS_SETOP_BASE + SETOP_SUPERSET ),
-    JS_CFUNC_DEF("intersection", 1, js_set_intersection ),
-    JS_CFUNC_DEF("difference", 1, js_set_difference ),
+    JS_CFUNC_CONSUME_DEF("intersection", 1, ITERCONS_SETOP_BASE + SETOP_INTERSECT ),
+    JS_CFUNC_CONSUME_DEF("difference", 1, ITERCONS_SETOP_BASE + SETOP_DIFF ),
     JS_CFUNC_CONSUME_DEF("symmetricDifference", 1, ITERCONS_SETOP_BASE + SETOP_SYMDIFF ),
     JS_CFUNC_CONSUME_DEF("union", 1, ITERCONS_SETOP_BASE + SETOP_UNION ),
     JS_CFUNC_MAGIC_DEF("values", 0, js_create_map_iterator, (JS_ITERATOR_KIND_KEY << 2) | MAGIC_SET ),
