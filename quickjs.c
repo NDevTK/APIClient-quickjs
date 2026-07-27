@@ -1460,7 +1460,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_FUNCTION_CALL, STEPDEF_ISNAN, STEPDEF_ISFINITE,
     STEPDEF_NUM_TOSTRING, STEPDEF_NUM_TOLOCALESTRING, STEPDEF_NUM_TOFIXED,
     STEPDEF_NUM_TOEXPONENTIAL, STEPDEF_NUM_TOPRECISION, STEPDEF_NUM_CTOR,
-    STEPDEF_ITERATOR_CTOR, STEPDEF_ARRAY_OF,
+    STEPDEF_ITERATOR_CTOR, STEPDEF_ARRAY_OF, STEPDEF_ARRAY_CONCAT,
     STEPDEF_COUNT
 };
 #define HINT_NONE    2
@@ -54632,70 +54632,131 @@ static JSValue js_array_with_fini(JSContext *ctx, void *st, bool take_result)
 }
 
 
-static JSValue js_array_concat(JSContext *ctx, JSValueConst this_val,
-                               int argc, JSValueConst *argv)
+/* 23.1.3.1 Array.prototype.concat. EVERY observable step is the page's code: ArraySpeciesCreate's
+   Get(constructor) / Get(@@species) / Construct, each element's Get(@@isConcatSpreadable), each spreadable
+   source's `length`, each HasProperty and each Get, and the final Set(A,"length",n). js_array_concat performed
+   all of them from C, so a @@species constructor, a @@isConcatSpreadable getter or a Proxy `get` trap with a
+   loop in it had no flow base and aborted at its back-edge.
+   Stages: 0 ToObject, 1 ArraySpeciesCreate, 2 element head + IsConcatSpreadable, 3 that source's length,
+   4 HasProperty(k), 5 Get(k), 6 Set(A,"length",n). */
+typedef struct JSArrayConcat {
+    JSStepHdr hdr;       /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    JSValue obj;         /* ToObject(this) (owned) */
+    JSValue arr;         /* ArraySpeciesCreate's target — the RESULT (owned) */
+    JSValue el;          /* the element held across its read (owned) */
+    int64_t n, k, len;
+    int i;               /* -1 = the receiver, then 0..argc-1 */
+    int present;         /* the HasProperty answer, held across its own suspension */
+    int spreadable;
+} JSArrayConcat;
+
+static int js_array_concat_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    JSValue obj, arr, val;
+    JSArrayConcat *s = st;
     JSValueConst e;
-    int64_t len, k, n;
-    int i, res;
+    int r;
 
-    arr = JS_UNDEFINED;
-    obj = JS_ToObject(ctx, this_val);
-    if (JS_IsException(obj))
-        goto exception;
-
-    arr = JS_ArraySpeciesCreate(ctx, obj, js_int32(0));
-    if (JS_IsException(arr))
-        goto exception;
-    n = 0;
-    for (i = -1; i < argc; i++) {
-        if (i < 0)
-            e = obj;
-        else
-            e = argv[i];
-
-        res = JS_isConcatSpreadable(ctx, e);
-        if (res < 0)
-            goto exception;
-        if (res) {
-            if (js_get_length64(ctx, &len, e))
-                goto exception;
-            if (n + len > MAX_SAFE_INTEGER) {
-                JS_ThrowTypeError(ctx, "Array loo long");
-                goto exception;
-            }
-            for (k = 0; k < len; k++, n++) {
-                res = JS_TryGetPropertyInt64(ctx, e, k, &val);
-                if (res < 0)
-                    goto exception;
-                if (res) {
-                    if (JS_DefinePropertyValueInt64(ctx, arr, n, val,
-                                                    JS_PROP_C_W_E | JS_PROP_THROW) < 0)
-                        goto exception;
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
+        s->obj = JS_UNDEFINED; s->arr = JS_UNDEFINED; s->el = JS_UNDEFINED;
+        s->n = 0; s->k = 0; s->len = 0; s->i = -1; s->present = 0; s->spreadable = 0;
+        s->obj = JS_ToObject(ctx, s->hdr.this_val);
+        if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
+        s->hdr.stage = 1;
+    }
+    if (s->hdr.stage == 1) {
+        r = step_species_run(ctx, &s->hdr, s->obj, cb_result, js_int32(0), &s->arr, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 2;
+    }
+    while (s->hdr.stage != 6) {
+        e = (s->i < 0) ? (JSValueConst)s->obj : step_arg(&s->hdr, s->i);
+        if (s->hdr.stage == 2) {
+            if (s->i >= s->hdr.argc) { JS_FreeValue(ctx, cb_result); s->hdr.stage = 6; break; }
+            /* IsConcatSpreadable(e) — 23.1.3.1.1: a non-object is never spread; otherwise the page's
+               @@isConcatSpreadable decides, and only its absence falls back to IsArray. */
+            if (!JS_IsObject(e)) {
+                JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+                s->spreadable = 0;
+            } else {
+                JSValue sv;
+                r = step_getprop_run(ctx, &s->hdr, e, JS_ATOM_Symbol_isConcatSpreadable, cb_result, &sv,
+                                     out_cb, out_argc);
+                cb_result = JS_UNDEFINED;
+                if (r) return r < 0 ? -1 : r;
+                if (!JS_IsUndefined(sv)) {
+                    s->spreadable = JS_ToBoolFree(ctx, sv);
+                } else {
+                    JS_FreeValue(ctx, sv);
+                    r = js_is_array(ctx, e);
+                    if (r < 0) return -1;
+                    s->spreadable = r;
                 }
             }
-        } else {
-            if (n >= MAX_SAFE_INTEGER) {
-                JS_ThrowTypeError(ctx, "Array loo long");
-                goto exception;
+            if (!s->spreadable) {
+                if (s->n >= MAX_SAFE_INTEGER) {
+                    JS_ThrowTypeError(ctx, "Array loo long");
+                    return -1;
+                }
+                if (JS_DefinePropertyValueInt64Const(ctx, s->arr, s->n, e,
+                                                     JS_PROP_C_W_E | JS_PROP_THROW) < 0)
+                    return -1;
+                s->n++;
+                s->i++;
+                continue;   /* stays at stage 2: the next element */
             }
-            if (JS_DefinePropertyValueInt64Const(ctx, arr, n, e,
-                                                 JS_PROP_C_W_E | JS_PROP_THROW) < 0)
-                goto exception;
-            n++;
+            s->hdr.stage = 3;
+        }
+        if (s->hdr.stage == 3) {
+            r = step_length_run(ctx, &s->hdr, e, cb_result, &s->len, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            if (s->n + s->len > MAX_SAFE_INTEGER) {
+                JS_ThrowTypeError(ctx, "Array loo long");
+                return -1;
+            }
+            s->k = 0;
+            s->hdr.stage = 4;
+        }
+        for (;;) {
+            if (s->hdr.stage == 4) {
+                if (s->k >= s->len) { JS_FreeValue(ctx, cb_result); s->i++; s->hdr.stage = 2; break; }
+                r = step_hasidx_run(ctx, &s->hdr, e, s->k, cb_result, &s->present, out_cb, out_argc);
+                cb_result = JS_UNDEFINED;
+                if (r) return r < 0 ? -1 : r;
+                if (!s->present) { s->k++; s->n++; continue; }   /* a HOLE: the result keeps it a hole */
+                s->hdr.stage = 5;
+            }
+            r = step_getidx_run(ctx, &s->hdr, e, s->k, cb_result, &s->el, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            {
+                JSValue el = s->el;
+                s->el = JS_UNDEFINED;   /* the define CONSUMES it, so the state must let go first */
+                if (JS_DefinePropertyValueInt64(ctx, s->arr, s->n, el, JS_PROP_C_W_E | JS_PROP_THROW) < 0)
+                    return -1;
+            }
+            s->k++; s->n++;
+            s->hdr.stage = 4;
         }
     }
-    if (JS_SetProperty(ctx, arr, JS_ATOM_length, js_int64(n)) < 0)
-        goto exception;
+    /* Set(A, "length", n): a subclass or Proxy `length` setter is the page's code too. */
+    r = step_setprop_run(ctx, &s->hdr, s->arr, JS_ATOM_length, js_int64(s->n), cb_result, out_cb, out_argc);
+    if (r) return r < 0 ? -1 : r;
+    return 0;
+}
 
-    JS_FreeValue(ctx, obj);
-    return arr;
-
-exception:
-    JS_FreeValue(ctx, arr);
-    JS_FreeValue(ctx, obj);
-    return JS_EXCEPTION;
+static JSValue js_array_concat_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSArrayConcat *s = st;
+    JSValue r = take_result ? s->arr : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->arr);
+    JS_FreeValue(ctx, s->obj);
+    JS_FreeValue(ctx, s->el);
+    js_free(ctx, s);
+    return r;
 }
 
 #define special_every    0
@@ -55570,6 +55631,10 @@ static const JSTrampStepDef js_date_ctor_def = { sizeof(JSDateCtor), js_date_cto
 static int js_array_of_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_of_fini(JSContext *ctx, void *st, bool take_result);
 static const JSTrampStepDef js_array_of_def = { sizeof(JSArrayOf), js_array_of_step, js_array_of_fini, 0 };
+static int js_array_concat_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_array_concat_fini(JSContext *ctx, void *st, bool take_result);
+static const JSTrampStepDef js_array_concat_def =
+    { sizeof(JSArrayConcat), js_array_concat_step, js_array_concat_fini, 0 };
 static int js_iterator_ctor_precheck(JSContext *ctx, JSValueConst new_target, int magic);
 /* 27.1.3.1 Iterator: steps 1-2 are the abstract-class validation, step 3 is the whole constructor. */
 static const JSTrampStepDef js_iterator_ctor_def =
@@ -55758,6 +55823,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_DATE_CTOR]     = &js_date_ctor_def,
     [STEPDEF_ITERATOR_CTOR] = &js_iterator_ctor_def,
     [STEPDEF_ARRAY_OF]      = &js_array_of_def,
+    [STEPDEF_ARRAY_CONCAT]  = &js_array_concat_def,
     [STEPDEF_ARRAY_INDEXOF]     = &js_array_indexOf_def,
     [STEPDEF_ARRAY_LASTINDEXOF] = &js_array_lastIndexOf_def,
     [STEPDEF_ARRAY_INCLUDES]    = &js_array_includes_def,
@@ -58255,7 +58321,7 @@ static const JSCFunctionListEntry js_array_unscopables_funcs[] = {
 static const JSCFunctionListEntry js_array_proto_funcs[] = {
     JS_CFUNC_STEP_DEF("at", 1, STEPDEF_ARRAY_AT ),
     JS_CFUNC_STEP_DEF("with", 2, STEPDEF_ARRAY_WITH ),
-    JS_CFUNC_DEF("concat", 1, js_array_concat ),
+    JS_CFUNC_STEP_DEF("concat", 1, STEPDEF_ARRAY_CONCAT ),
     JS_CFUNC_STEP_DEF("every", 1, STEPDEF_ARRAY_EVERY ),
     JS_CFUNC_STEP_DEF("some", 1, STEPDEF_ARRAY_SOME ),
     JS_CFUNC_STEP_DEF("forEach", 1, STEPDEF_ARRAY_FOREACH ),
