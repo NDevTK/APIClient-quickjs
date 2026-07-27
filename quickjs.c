@@ -19588,6 +19588,12 @@ static void js_toprim_abandon(JSContext *ctx, struct JSToPrim *tp)
     tramp_step_chain_free(ctx, touter);
 }
 
+#define CONT_ITER_CLOSE    28  /* cont_state = NULL: 7.4.9 IteratorClose step 2's `? GetMethod(iterator,
+                                  "return")` requested by OP_iterator_close. Stateless — the iterator it closes is
+                                  the opcode's own operand and stays at sp[-1] for the whole sequence, so there is
+                                  nothing to carry across the read. */
+#define CONT_ITER_CLOSE_CALL 29 /* cont_state = NULL: step 3.c's Call(return, iterator). Its result is discarded;
+                                  all it owes is step 6's "must be an Object". */
 #define CONT_FOROF_NEXT    20  /* cont_state = NULL (the enum_rec offset rides the frame's forof_off): `for (x of it)`
                                   where it.next is a NORMAL bytecode function. Its body runs on THIS chain, so a loop
                                   in a hand-written .next() preempts; js_for_of_next -> JS_IteratorNext -> JS_Call was
@@ -23503,6 +23509,24 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         free_arg_list(ctx, call_args_owned, call_args_owned_n);
                         call_args_owned = NULL; call_args_owned_n = 0;
                     }
+                    if (dck == CONT_ITER_CLOSE_CALL) {
+                        JSValue *cargv;
+                        int pop, first;
+                        TAKE_CALL_SHAPE(); pop = call_pop; first = call_first_r;
+                        cargv = sp - pop;
+                        for (i = first; i < pop; i++) JS_FreeValue(ctx, cargv[i]);
+                        sp += first - pop;
+                        if (unlikely(JS_IsException(ret_val))) goto exception;
+                        if (unlikely(!JS_IsObject(ret_val))) {
+                            JS_FreeValue(ctx, ret_val);
+                            JS_ThrowTypeErrorNotAnObject(ctx);
+                            goto exception;
+                        }
+                        JS_FreeValue(ctx, ret_val);
+                        JS_FreeValue(ctx, sp[-1]);
+                        sp--;
+                        BREAK;
+                    }
                     if (dck == CONT_FOROF_NEXT) {
                         JSValue *cargv;
                         int pop, first;
@@ -24154,6 +24178,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                           goto do_consume_acquire_have_method;
                       }
                       if (gk == CONT_ITER_CONSUME) goto do_iter_consume_step;
+                      if (gk == CONT_ITER_CLOSE) goto do_iter_close_method;
                       DCHECK(gk == CONT_STEP, "property-get outer continuation: unknown machine kind"); }
                     goto do_step_step;
                 }
@@ -24245,6 +24270,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         cont_st = gouter;
                         ret_val = JS_EXCEPTION;
                         goto do_iter_consume_step;
+                    }
+                    if (gk3 == CONT_ITER_CLOSE) {
+                        /* a poisoned `return` accessor: nothing is waiting on the read, and the iterator the
+                           opcode left on the stack is freed by the ordinary unwind. */
+                        DCHECK(gouter == NULL, "an iterator-close property read carries no state");
+                        goto exception;
                     }
                     DCHECK(gk3 == CONT_STEP, "property-get outer continuation: unknown machine kind");
                     tramp_step_chain_free(ctx, gouter);
@@ -26258,8 +26289,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     void *gouter = gp->outer;
                     uint8_t gouter_kind = gp->outer_kind;
                     DCHECK(gouter_kind == CONT_STEP || gouter_kind == CONT_ITER_CONSUME
-                           || gouter_kind == CONT_ACQUIRE_GET,
+                           || gouter_kind == CONT_ACQUIRE_GET || gouter_kind == CONT_ITER_CLOSE,
                            "property-get outer continuation: unknown machine kind");
+                    if (gouter_kind == CONT_ITER_CLOSE) {
+                        /* the `return` accessor or trap ran on this chain. The iterator is still the opcode's
+                           operand at the restored sp[-1], so the sequence just carries on with the method. */
+                        if (!JS_IsUndefined(gp->target))
+                            ret_val = js_proxy_get_invariant(ctx, gp->target, gp->atom, ret_val);
+                        js_getprop_free(ctx, gp);
+                        if (unlikely(JS_IsException(ret_val))) goto exception;
+                        goto do_iter_close_method;
+                    }
                     if (gouter_kind == CONT_ACQUIRE_GET) {
                         /* @@iterator has been read (the getter or trap ran on this chain). Restore the acquire's
                            locals from the continuation — they cannot live in interpreter locals across a
@@ -26340,6 +26380,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        so nothing on the caller's stack moves — do_toprim_step releases them on re-entry. */
                     cont_st = rcs;
                     goto do_toprim_step;
+                }
+                if (rck == CONT_ITER_CLOSE_CALL) {
+                    /* 7.4.9 steps 5-6: the `return` method returned. Under a NORMAL completion its own throw
+                       propagates and its result must be an Object; the value itself is discarded. */
+                    JSValue *cargv = sp - cargc;
+                    DCHECK(cargc >= cfirst, "iterator-close frame records operands ending below where they start");
+                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
+                    sp += cfirst - cargc;
+                    if (unlikely(!JS_IsObject(ret_val))) {
+                        JS_FreeValue(ctx, ret_val);
+                        JS_ThrowTypeErrorNotAnObject(ctx);
+                        goto exception;
+                    }
+                    JS_FreeValue(ctx, ret_val);
+                    JS_FreeValue(ctx, sp[-1]);
+                    sp--;
+                    BREAK;
                 }
                 if (rck == CONT_FOROF_NEXT) {
                     /* the plain iterator's .next() returned: IteratorNext's object check, then
@@ -27506,12 +27563,45 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         }
                     }
                 }
-                if (JS_IteratorClose(ctx, sp[-1], false))
-                    goto exception;
-                JS_FreeValue(ctx, sp[-1]);
+                /* 7.4.9 step 2: `? GetMethod(iterator, "return")`. Reading it is the page's code on an
+                   accessor or a Proxy, and JS_IteratorClose did it with JS_GetProperty from C — so was the call
+                   that follows. The iterator stays at sp[-1] across both, which is why neither needs state. */
+                gp_obj = sp[-1]; gp_atom = JS_ATOM_return; gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                gp_outer = NULL; gp_outer_kind = CONT_ITER_CLOSE;
+                goto do_getprop_tramp;
             }
             sp--;
             BREAK;
+
+        do_iter_close_method:
+            /* 7.4.9 steps 2-3, with ret_val holding the `return` method and the iterator still at sp[-1].
+               GetMethod's contract: undefined or null means there is nothing to close, and anything else
+               non-callable is its TypeError. */
+            {
+                JSValue clm = ret_val;
+                JSValueConst cli;
+                if (JS_IsUndefined(clm) || JS_IsNull(clm)) {
+                    JS_FreeValue(ctx, clm);
+                    JS_FreeValue(ctx, sp[-1]);
+                    sp--;
+                    BREAK;
+                }
+                if (!JS_IsFunction(ctx, clm)) {
+                    JS_FreeValue(ctx, clm);
+                    JS_ThrowTypeError(ctx, "not a function");
+                    goto exception;
+                }
+                DCHECK(sp + 2 <= TRAMP_SP_LIMIT(sf),
+                       "iterator close: operand push exceeds the frame's compiled stack_size");
+                cli = sp[-1];
+                sp[0] = js_dup(cli);   /* this */
+                sp[1] = clm;           /* the `return` method — the stack adopts it */
+                sp += 2;
+                call_argv = sp; call_argc = 0; tramp_first = -2; tramp_is_tail = 0;
+                tramp_cont_state = NULL; tramp_cont_kind = CONT_ITER_CLOSE_CALL;
+                if (tramp_can_call(sp[-1])) goto do_tramp_call;
+                goto do_generic_callee;
+            }
         CASE(OP_nip_catch):
             {
                 JSValue ret_val;
@@ -29882,13 +29972,24 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                there is now one function and no loop written out at either site. */
             js_toprim_abandon(ctx, xcs);
             goto exception;
-        } else if (xck == CONT_FOROF_NEXT) {
-            /* the plain iterator's .next() THREW. js_for_of_next's own abrupt handling: clear the enum_rec's
-               iterator slot (a failed IteratorNext leaves the iterator [[Done]] — the loop's OP_iterator_close
-               must not close it), then propagate. This cont owns the two operands it pushed, so the enum_rec
-               offset is measured from the sp they are dropped back to. */
+        } else if (xck == CONT_ITER_CLOSE_CALL) {
+            /* the iterator's `return` THREW. Under 7.4.9 with a normal completion that throw propagates, so all
+               this owes is the operands it pushed; the iterator itself is the opcode's own stack slot and the
+               ordinary unwind frees it. */
             JSValue *cargv = sp - xcg;
-            DCHECK(xcg - xcf == 2, "for-of next frame has an unexpected operand shape");
+            DCHECK(xcg >= xcf, "iterator-close frame records operands ending below where they start");
+            for (i = xcf; i < xcg; i++) JS_FreeValue(ctx, cargv[i]);
+            sp += xcf - xcg;
+            goto exception;
+        } else if (xck == CONT_FOROF_NEXT) {
+            /* the plain iterator's .next() THREW. Its abrupt handling: clear the enum_rec's iterator slot (a
+               failed IteratorNext leaves the iterator [[Done]] — the loop's OP_iterator_close must not close
+               it), then propagate. This cont owns the operands it pushed, so the enum_rec offset is measured
+               from the sp they are dropped back to. Their SHAPE is whatever the frame recorded, not the
+               [iter, next] the opcode pushed: do_generic_callee's proxy and bound arms replace them, exactly as
+               on the normal-return path. */
+            JSValue *cargv = sp - xcg;
+            DCHECK(xcg >= xcf, "for-of next frame records operands ending below where they start");
             DCHECK(xfof <= -3, "CONT_FOROF_NEXT frame carries no enum_rec offset");
             for (i = xcf; i < xcg; i++) JS_FreeValue(ctx, cargv[i]);
             sp += xcf - xcg;
@@ -29974,7 +30075,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JSGetProp *gp = xcs;
             void *gouter = gp->outer;
             uint8_t gk2 = gp->outer_kind;
-            DCHECK(!gouter || gk2 == CONT_STEP || gk2 == CONT_ITER_CONSUME || gk2 == CONT_ACQUIRE_GET,
+            DCHECK(!gouter || gk2 == CONT_STEP || gk2 == CONT_ITER_CONSUME || gk2 == CONT_ACQUIRE_GET
+                   || gk2 == CONT_ITER_CLOSE,
                    "property-get outer continuation: unknown machine kind");
             js_getprop_free(ctx, gp);
             if (gouter && gk2 == CONT_ACQUIRE_GET) {
