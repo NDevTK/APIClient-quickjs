@@ -20127,6 +20127,13 @@ typedef struct JSIterConsume {
     uint8_t from_owes_result;
     JSValue ent_obj;     /* the entry object, held across its two reads (owned) */
     JSValue ent_key;     /* entry[0], then its property key (owned) */
+    /* GetSetRecord (24.2.1.2) for a set-operation, performed as PHASES rather than by js_setlike_get_props from
+       C: `size` and its ToNumber, then `has`, then `keys` — each of them the page's code on an accessor or a
+       Proxy. setrec_ph: 0 size read, 1 its ToPrimitive, 2 has read, 3 keys read, 4 complete. */
+    JSValue setlike;     /* the `other` argument (owned) — the record is read off it, then the acquire uses it */
+    JSValue setrec_keys; /* the validated keys method (owned), handed to the acquire */
+    uint64_t setrec_size;
+    uint8_t setrec_ph, setrec_pending;
     JSValue ent_val;     /* entry[1] (owned) */
 } JSIterConsume;
 static int js_typed_array_get_length_unsafe(JSContext *ctx, JSValueConst obj);
@@ -20137,7 +20144,8 @@ static void sum_precise_init(SumPreciseState *s);
 static void sum_precise_add(SumPreciseState *s, double d);
 static double sum_precise_get_result(SumPreciseState *s);
 #define ITERCONS_OWNED(F) F(r) F(iter) F(next) F(adder) F(mapfn) F(mapfn_this) F(cb_value) F(ta_target) \
-                          F(ent_obj) F(ent_key) F(ent_val) F(from_ctor) F(super_ref)
+                          F(ent_obj) F(ent_key) F(ent_val) F(from_ctor) F(super_ref) \
+                          F(setlike) F(setrec_keys)
 /* NOTE: JSIteratorHelperData::cb_value is owned too — freed by the finalizer and cleared on every path below. */
 static int js_iter_consume_step(JSContext *ctx, struct JSIterConsume *s, JSValue res);
 static void js_iter_consume_end(JSContext *ctx, struct JSIterConsume *s);
@@ -23938,66 +23946,56 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                then hand `keys` to the shared acquire so a generator `*keys()` runs on the tramp.
                call_argv[-2] = the THIS set, call_argv[0] = setlike.
 
-               STILL FROM C, and it aborts by name: js_setlike_get_props performs GetSetRecord's three property
-               reads — `size`, `has`, `keys` — plus ToNumber on the size, with JS_GetProperty. An ACCESSOR or a
-               Proxy there is the page's code, so
+               GetSetRecord is PHASES of the machine (setrec_ph), not js_setlike_get_props from C: `size` and its
+               ToNumber, then `has`, then `keys` are each the page's code on an accessor or a Proxy, and reading
+               them with JS_GetProperty meant
                    new Set([1,2]).union({ get size() { while (…) {} return 2 }, has, keys })
-               preempts in an activation with no flow base. Routing the ITERATION (this arm) did not route the
-               RECORD. The machinery for it is already here: st == 6 drives a routed property read through
-               gp_obj/gp_atom and delivers back to js_iter_consume_step, and st == 5 does the ToPrimitive — so
-               these are four more phases of this machine, not a new mechanism.
-               The same read is what blocks Set.prototype.isSubsetOf / isDisjointFrom / intersection /
+               preempted in an activation with no flow base. Routing the ITERATION alone did not route the
+               RECORD. It needed no new mechanism — st == 6 is a routed property read delivering back to
+               js_iter_consume_step and st == 5 is the ToPrimitive, so it is four more phases.
+               js_setlike_get_props survives for Set.prototype.isSubsetOf / isDisjointFrom / intersection /
                difference, which no recognizer ever covered and which still hold LIVE JS_IteratorNext and
                JS_Call loops. Their shared shape is NOT a keys() consume: it is "walk THIS's own records, call
                other.has per element", with intersection/difference taking the keys() branch only when `other` is
-               the smaller side. So one missing capability — the per-element `has` call on the tramp — gives all
+               the smaller side. One missing capability — the per-element `has` call on the tramp — gives all
                four their first branch, and this arm already covers the second. */
             {
                 JSValueConst thisset = crecv;
                 JSValueConst setlike = call_argv[0];
-                JSMapState *ss = JS_GetOpaque(thisset, JS_CLASS_SET), *ts;
-                JSValue has, keys, newset;
-                uint64_t size;
-                struct list_head *el;
+                JSMapState *ls = JS_GetOpaque(setlike, JS_CLASS_SET);
                 JSIterConsume *s;
-                DCHECK(ss != NULL, "setop consume: `this` must be a Set (recognition guaranteed)");
-                if (js_setlike_get_props(ctx, setlike, &size, &has, &keys) < 0) goto exception;
-                JS_FreeValue(ctx, has);   /* these three consult THIS, never setlike.has */
-                newset = JS_UNDEFINED;
-                if (setop_kind == SETOP_SUPERSET) {
-                    /* isSupersetOf: no result Set — THIS must contain every key. A smaller THIS cannot be a superset,
-                       and the spec decides that BEFORE touching keys(). */
-                    if (ss->record_count < size) {
-                        JS_FreeValue(ctx, keys);
-                        { JSValue *cv = sp - call_argc; for (i = -2; i < call_argc; i++) JS_FreeValue(ctx, cv[i]); sp += -2 - call_argc; }
-                        if (tramp_is_tail) { ret_val = js_bool(false); goto do_return; }
-                        *sp++ = js_bool(false);
-                        BREAK;
-                    }
-                } else {
-                    newset = js_map_constructor(ctx, JS_UNDEFINED, 0, NULL, MAGIC_SET);
-                    if (JS_IsException(newset)) { JS_FreeValue(ctx, keys); goto exception; }
-                    ts = JS_GetOpaque(newset, JS_CLASS_SET);
-                    list_for_each(el, &ss->records) {
-                        JSMapRecord *mr = list_entry(el, JSMapRecord, link), *nr;
-                        if (mr->empty) continue;
-                        nr = map_add_record(ctx, ts, mr->key);
-                        if (!nr) { JS_FreeValue(ctx, keys); JS_FreeValue(ctx, newset); goto exception; }
-                        nr->value = JS_UNDEFINED;
-                    }
-                }
+                DCHECK(JS_GetOpaque(thisset, JS_CLASS_SET) != NULL,
+                       "setop consume: `this` must be a Set (the dispatch checked it)");
                 s = js_iter_consume_new(ctx);
-                if (unlikely(!s)) { JS_FreeValue(ctx, keys); JS_FreeValue(ctx, newset); JS_ThrowOutOfMemory(ctx); goto exception; }
-                s->r = newset;                /* UNDEFINED for isSupersetOf — its boolean result is set at finish */
+                if (unlikely(!s)) { JS_ThrowOutOfMemory(ctx); goto exception; }
                 s->adder = js_dup(thisset);   /* symmetricDifference / isSupersetOf consult THIS per element */
-                s->k = 1;                     /* isSupersetOf: found-so-far = true (unused by union/symmetricDifference) */
+                s->setlike = js_dup(setlike);
+                s->k = 1;                     /* isSupersetOf: found-so-far = true (unused by the other two) */
                 s->sink = ITERCONS_SETOP;
                 s->setop = setop_kind;
                 TAKE_CALL_SHAPE(); s->orig_cfirst = call_first_r; s->orig_cargc = call_pop; s->orig_is_tail = tramp_is_tail;
                 s->args_own = call_args_owned; s->args_own_n = call_args_owned_n;
                 call_args_owned = NULL; call_args_owned_n = 0;
-                tramp_iter_getiter = keys;   /* the acquire CALLS it on setlike (create-on-tramp if it is a generator fn) */
-                tramp_consume_iterable = setlike; tramp_consume_state = s; tramp_consume_kind = CONT_ITER_CONSUME;
+                /* A real Set answers `size` from its own record count with no read at all — the spec's own
+                   short-circuit, not an optimisation — so that phase is skipped; `has` and `keys` are still read
+                   off it, because a subclass may override them. */
+                s->setrec_pending = 1;
+                if (ls) { s->setrec_size = ls->record_count; s->setrec_ph = 2; }
+                else     { s->setrec_ph = 0; }
+                cont_st = s;
+                ret_val = JS_UNINITIALIZED;   /* nothing delivered yet: the machine issues the first read */
+                goto do_iter_consume_step;
+            }
+
+        do_setop_consume_acquire:
+            /* The record is in hand and the result is seeded (both inside the machine — neither runs user code).
+               All that is left here is handing `keys` to the shared acquire, which CALLS it on setlike and puts a
+               generator `*keys()` on the tramp. */
+            {
+                JSIterConsume *s = (JSIterConsume *)cont_st;
+                tramp_iter_getiter = s->setrec_keys;
+                s->setrec_keys = JS_UNDEFINED;
+                tramp_consume_iterable = s->setlike; tramp_consume_state = s; tramp_consume_kind = CONT_ITER_CONSUME;
                 goto do_consume_acquire_iterator;
             }
 
@@ -24938,7 +24936,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        flag in flight says which — fromEntries reads the entry's element ent_ph, and the
                        TypedArray map/set phase reads source element ta_k. */
                     gp_outer = s; gp_outer_kind = CONT_ITER_CONSUME;
-                    if (s->cb_pending == 7) {
+                    if (s->setrec_pending) {
+                        gp_obj = s->setlike;
+                        gp_atom = (s->setrec_ph == 0) ? JS_ATOM_size
+                                : (s->setrec_ph == 2) ? JS_ATOM_has : JS_ATOM_keys;
+                    } else if (s->cb_pending == 7) {
                         gp_obj = s->r; gp_atom = JS_ATOM_length;   /* LengthOfArrayLike's Get half */
                     } else if (s->cb_pending == 6) {
                         DCHECK(s->ta_k <= JS_ATOM_MAX_INT,
@@ -24978,7 +24980,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        ToPropertyKey with hint STRING. Both are the page's @@toPrimitive/valueOf, and both used to
                        run from C. */
                     tp_outer = s; tp_outer_kind = CONT_ITER_CONSUME;
-                    if (s->cb_pending == 5 || s->cb_pending == 8) {
+                    if (s->setrec_pending) {
+                        DCHECK(s->setrec_ph == 1, "GetSetRecord's ToPrimitive arm entered outside the size phase");
+                        tp_value = s->cb_value; tp_hint = HINT_NUMBER;   /* ToNumber(rawSize) */
+                    } else if (s->cb_pending == 5 || s->cb_pending == 8) {
                         tp_value = s->cb_value; tp_hint = HINT_NUMBER;
                     } else {
                         DCHECK(s->ent_pending && s->ent_ph == 2,
@@ -25021,6 +25026,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (JS_IteratorClose(ctx, s->iter, s->abrupt) < 0) { js_iter_consume_end(ctx, s); js_free_rt(rt, s); goto exception; }
                     goto do_iter_consume_step;
                 }
+                if (st == 12) goto do_setop_consume_acquire;   /* GetSetRecord done, result seeded */
                 if (st == 0) {   /* DONE */
                     if (s->sink == ITERCONS_SPREAD) {
                         /* [...src] (OP_append): the elements were appended to s->r == the caller-stack array at
@@ -53643,6 +53649,83 @@ static int ta_elem_set(JSContext *ctx, JSIterConsume *s, JSValue v)
 static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
 {
     if (s->abrupt) { JS_FreeValue(ctx, res); return -1; }   /* close done; the original exception propagates */
+    if (s->setrec_pending) {
+        /* 24.2.1.2 GetSetRecord, one property at a time. `res` is what the tramp produced for the phase in
+           flight, or UNINITIALIZED on the first entry when nothing has been read yet. There is no iterator to
+           close on an abrupt exit — the record is read BEFORE keys() is ever called — so these return -1 rather
+           than the IfAbruptCloseIterator 2. */
+        if (!JS_IsUninitialized(res)) {
+            if (JS_IsException(res)) { s->setrec_pending = 0; return -1; }
+            if (s->setrec_ph == 0 || s->setrec_ph == 1) {
+                double d;
+                if (s->setrec_ph == 0) {
+                    if (JS_IsUndefined(res)) {
+                        JS_FreeValue(ctx, res);
+                        s->setrec_pending = 0;
+                        JS_ThrowTypeError(ctx, ".size is undefined");
+                        return -1;
+                    }
+                    if (JS_VALUE_GET_TAG(res) == JS_TAG_OBJECT) {
+                        /* ToNumber(rawSize) on an object is @@toPrimitive/valueOf — the page's code */
+                        DCHECK(JS_IsUndefined(s->cb_value), "the consume machine already holds a value");
+                        s->cb_value = res;
+                        s->setrec_ph = 1;
+                        return 5;
+                    }
+                }
+                if (JS_ToFloat64Free(ctx, &d, res) < 0) { s->setrec_pending = 0; return -1; }
+                if (s->setrec_ph == 1) { JS_FreeValue(ctx, s->cb_value); s->cb_value = JS_UNDEFINED; }
+                if (isnan(d)) { s->setrec_pending = 0; JS_ThrowTypeError(ctx, ".size is not a legal size"); return -1; }
+                if (d < 0) { s->setrec_pending = 0; JS_ThrowRangeError(ctx, ".size is not a legal size"); return -1; }
+                s->setrec_size = (isinf(d) || d > (double)MAX_SAFE_INTEGER) ? UINT64_MAX : (uint64_t)d;
+                s->setrec_ph = 2;
+            } else if (s->setrec_ph == 2) {
+                int ok = JS_IsFunction(ctx, res);
+                JS_FreeValue(ctx, res);   /* the set-operations consult THIS, never setlike.has — but it must EXIST */
+                if (!ok) { s->setrec_pending = 0; JS_ThrowTypeError(ctx, ".has is not a function"); return -1; }
+                s->setrec_ph = 3;
+            } else {
+                DCHECK(s->setrec_ph == 3, "GetSetRecord: unknown phase");
+                if (!JS_IsFunction(ctx, res)) {
+                    JS_FreeValue(ctx, res);
+                    s->setrec_pending = 0;
+                    JS_ThrowTypeError(ctx, ".keys is not a function");
+                    return -1;
+                }
+                s->setrec_keys = res;
+                s->setrec_ph = 4;
+            }
+        }
+        if (s->setrec_ph == 1) return 5;    /* the size coercion */
+        if (s->setrec_ph == 4) {
+            /* The record is complete. Seeding the result is a direct [[SetData]] copy — the spec forbids calling
+               r.add — and the superset size test is arithmetic, so both are plain C and belong here rather than
+               in the interpreter arm: nothing in them can suspend. */
+            JSMapState *ss = JS_GetOpaque(s->adder, JS_CLASS_SET), *ts;
+            struct list_head *el;
+            s->setrec_pending = 0;
+            DCHECK(ss != NULL, "setop: the receiver stopped being a Set across the record read");
+            if (s->setop == SETOP_SUPERSET) {
+                /* isSupersetOf: no result Set — THIS must contain every key, and a smaller THIS cannot, which
+                   the spec decides BEFORE touching keys(). Answering through the machine's own DONE path means
+                   the operand pop has one implementation. */
+                if (ss->record_count < s->setrec_size) { s->k = 0; s->r = js_bool(false); return 0; }
+                return 12;
+            }
+            s->r = js_map_constructor(ctx, JS_UNDEFINED, 0, NULL, MAGIC_SET);
+            if (JS_IsException(s->r)) { s->r = JS_UNDEFINED; return -1; }
+            ts = JS_GetOpaque(s->r, JS_CLASS_SET);
+            list_for_each(el, &ss->records) {
+                JSMapRecord *mr = list_entry(el, JSMapRecord, link), *nr;
+                if (mr->empty) continue;
+                nr = map_add_record(ctx, ts, mr->key);
+                if (!nr) { JS_ThrowOutOfMemory(ctx); return -1; }
+                nr->value = JS_UNDEFINED;
+            }
+            return 12;
+        }
+        return 6;                            /* the next property read */
+    }
     if (s->ent_pending) {
         /* Object.fromEntries, mid-ENTRY: `res` is what the tramp just produced for phase ent_ph — entry[0],
            entry[1], or the key's ToPrimitive. Each of those runs user code (an accessor, a Proxy trap, a
