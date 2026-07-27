@@ -2759,6 +2759,15 @@ void JS_FreeRuntime(JSRuntime *rt)
     int i;
 
     rt->in_free = true;
+    /* A PARKED FLOW AT TEARDOWN IS A DROPPED FLOW. The slot is not a GC root: it holds a raw callback plus a
+       reference the park took (the suspended async activation, or the async generator whose body is mid-run), and
+       tearing the runtime down without resuming it leaks that whole graph silently — the runtime's own object walk
+       reports the leaked objects but names nothing that explains them. The scheduler contract is that no work item
+       is ever dropped, so this is the host's invariant to keep: drain with JS_ResumeParkedFlow before the last
+       reference goes. */
+    DCHECK(rt->parked_flow.fn == NULL,
+           "JS_FreeRuntime with a flow still parked — the host tore down without draining the park slot "
+           "(JS_ResumeParkedFlow); that flow and everything it holds is dropped, not finished");
     JS_FreeValueRT(rt, rt->current_exception);
 
     list_for_each_safe(el, el1, &rt->job_list) {
