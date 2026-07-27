@@ -1463,7 +1463,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_ITERATOR_CTOR, STEPDEF_ARRAY_OF, STEPDEF_ARRAY_CONCAT,
     STEPDEF_WEAKREF_CTOR, STEPDEF_FINREC_CTOR, STEPDEF_ARRAY_SLICE, STEPDEF_ARRAY_SPLICE,
     STEPDEF_ARRAY_CTOR, STEPDEF_ARRAY_POP, STEPDEF_ARRAY_SHIFT, STEPDEF_ARRAY_REVERSE,
-    STEPDEF_ARRAY_PUSH, STEPDEF_ARRAY_UNSHIFT,
+    STEPDEF_ARRAY_PUSH, STEPDEF_ARRAY_UNSHIFT, STEPDEF_ARRAY_TOREVERSED, STEPDEF_ARRAY_TOSPLICED,
     STEPDEF_DOMEXCEPTION_CTOR,
     STEPDEF_COUNT
 };
@@ -10757,6 +10757,22 @@ static JSValue js_allocate_fast_array(JSContext *ctx, int64_t len)
         set_value(ctx, &p->prop[0].u.value, js_int32(len));
     }
     return arr;
+}
+
+/* `!` CreateDataPropertyOrThrow(A, ! ToString(𝔽(i)), v) where A is the dense base Array a change-array-by-copy
+   method allocated for its result. A is engine-private and never consulted Array[@@species], so this reaches no
+   accessor, no Proxy trap and no prototype lookup, and cannot fail — which is exactly what the spec's `!`
+   asserts. It is the same computation as the keyed-write step with no observable step, not a way around one.
+   Consumes v. */
+static void arr_dense_put(JSContext *ctx, JSValueConst arr, int64_t i, JSValue v)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(arr);
+    DCHECK(JS_VALUE_GET_TAG(arr) == JS_TAG_OBJECT && p->class_id == JS_CLASS_ARRAY && p->fast_array,
+           "the private result of a change-array-by-copy method left its dense shape");
+    DCHECK(i >= 0 && i < p->u.array.count,
+           "a change-array-by-copy store landed outside the result it allocated");
+    JS_FreeValue(ctx, p->u.array.u.values[i]);
+    p->u.array.u.values[i] = v;
 }
 
 static void js_free_desc(JSContext *ctx, JSPropertyDescriptor *desc)
@@ -20424,6 +20440,23 @@ typedef struct JSArrayReverse {
     int64_t len, l, h;
     int l_present, h_present;
 } JSArrayReverse;
+
+typedef struct JSArrayToReversed {
+    JSStepHdr hdr;       /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    JSValue obj;         /* ToObject(this) (owned) */
+    JSValue arr;         /* the fresh dense base Array — the RESULT (owned) */
+    JSValue el;          /* the element held across its read (owned) */
+    int64_t len, k;
+} JSArrayToReversed;
+
+typedef struct JSArrayToSpliced {
+    JSStepHdr hdr;       /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    JSValue obj;         /* ToObject(this) (owned) */
+    JSValue arr;         /* the fresh dense base Array — the RESULT (owned) */
+    JSValue el;          /* the element held across its read (owned) */
+    int64_t len, start, del, newlen, i, from;
+    int64_t add;         /* insertCount: the ...items of the call */
+} JSArrayToSpliced;
 
 typedef struct JSArraySlice {
     JSStepHdr hdr;       /* MUST be first: the generic step driver casts the state to JSStepHdr * */
@@ -56075,6 +56108,14 @@ static int js_array_reverse_step(JSContext *ctx, void *st, JSValue cb_result, JS
 static JSValue js_array_reverse_fini(JSContext *ctx, void *st, bool take_result);
 static const JSTrampStepDef js_array_reverse_def =
     { sizeof(JSArrayReverse), js_array_reverse_step, js_array_reverse_fini, 0 };
+static int js_array_toreversed_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_array_toreversed_fini(JSContext *ctx, void *st, bool take_result);
+static const JSTrampStepDef js_array_toReversed_def =
+    { sizeof(JSArrayToReversed), js_array_toreversed_step, js_array_toreversed_fini, 0 };
+static int js_array_tospliced_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_array_tospliced_fini(JSContext *ctx, void *st, bool take_result);
+static const JSTrampStepDef js_array_toSpliced_def =
+    { sizeof(JSArrayToSpliced), js_array_tospliced_step, js_array_tospliced_fini, 0 };
 static int js_array_pop_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_pop_fini(JSContext *ctx, void *st, bool take_result);
 static int js_array_push_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
@@ -56298,6 +56339,8 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_ARRAY_CONCAT]  = &js_array_concat_def,
     [STEPDEF_ARRAY_CTOR]    = &js_array_ctor_def,
     [STEPDEF_ARRAY_REVERSE] = &js_array_reverse_def,
+    [STEPDEF_ARRAY_TOREVERSED] = &js_array_toReversed_def,
+    [STEPDEF_ARRAY_TOSPLICED]  = &js_array_toSpliced_def,
     [STEPDEF_ARRAY_POP]     = &js_array_pop_def,
     [STEPDEF_ARRAY_SHIFT]   = &js_array_shift_def,
     [STEPDEF_ARRAY_PUSH]    = &js_array_push_def,
@@ -57002,52 +57045,76 @@ static JSValue js_array_reverse_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
-// Note: a.toReversed() is a.slice().reverse() with the twist that a.slice()
-// leaves holes in sparse arrays intact whereas a.toReversed() replaces them
-// with undefined, thus in effect creating a dense array.
-// Does not use Array[@@species], always returns a base Array.
-static JSValue js_array_toReversed(JSContext *ctx, JSValueConst this_val,
-                                   int argc, JSValueConst *argv)
+/* 23.1.3.33 Array.prototype.toReversed — a.slice().reverse() with the twist that a.slice() leaves the holes of a
+   sparse array intact whereas a.toReversed() replaces them with undefined, so the result is dense. It does not
+   consult Array[@@species]; the result is always a base Array, which is why the writes into it are `!`
+   CreateDataPropertyOrThrow on an engine-private object and reach no page code at all — only the READS do.
+   Those reads are the page's: LengthOfArrayLike is a `length` getter or a Proxy `get` trap, and each element is
+   step 5.c's `? Get(O, from)` on an accessor or a trap. js_array_toReversed performed all of them from C, so a
+   loop in any of them had no flow base and aborted at its back-edge.
+   It also asked HasProperty before every read (JS_TryGetPropertyInt64), which step 5.c does NOT: on
+   `new Proxy([1,2],{has:()=>false, get:()=>'V'})` that fired two `has` traps and produced [undefined,undefined]
+   where the spec yields ["V","V"]. The step sub-sequence is the plain Get the spec names.
+   The FAST-ARRAY span stays: js_get_fast_array is precisely the statement that no accessor, no Proxy trap and no
+   prototype lookup is reachable, so it is the same computation with no observable step.
+   Stages: 0 ToObject, 1 length + allocate + the dense span, 2 the element read. */
+
+static int js_array_toreversed_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    JSValue arr, obj, ret, *arrp, *pval;
-    JSObject *p;
-    int64_t i, len;
+    JSArrayToReversed *s = st;
+    JSValue *arrp;
     uint32_t count32;
+    int r;
 
-    ret = JS_EXCEPTION;
-    arr = JS_UNDEFINED;
-    obj = JS_ToObject(ctx, this_val);
-    if (js_get_length64(ctx, &len, obj))
-        goto exception;
-
-    arr = js_allocate_fast_array(ctx, len);
-    if (JS_IsException(arr))
-        goto exception;
-
-    if (len > 0) {
-        p = JS_VALUE_GET_OBJ(arr);
-
-        i = len - 1;
-        pval = p->u.array.u.values;
-        if (js_get_fast_array(ctx, obj, &arrp, &count32) && count32 == len) {
-            for (; i >= 0; i--, pval++)
-                *pval = js_dup(arrp[i]);
-        } else {
-            // Query order is observable; test262 expects descending order.
-            for (; i >= 0; i--, pval++) {
-                if (-1 == JS_TryGetPropertyInt64(ctx, obj, i, pval))
-                    goto exception;
-            }
-        }
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
+        s->obj = JS_UNDEFINED; s->arr = JS_UNDEFINED; s->el = JS_UNDEFINED;
+        s->len = 0; s->k = 0;
+        s->obj = JS_ToObject(ctx, s->hdr.this_val);
+        if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
+        s->hdr.stage = 1;
     }
+    if (s->hdr.stage == 1) {
+        r = step_length_run(ctx, &s->hdr, s->obj, cb_result, &s->len, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        /* ArrayCreate(len) fills the storage with undefined, so a suspension part-way through the walk leaves a
+           GC-walkable array — the slots the page has not reached yet are already holes-as-undefined. */
+        s->arr = js_allocate_fast_array(ctx, s->len);
+        if (JS_IsException(s->arr)) { s->arr = JS_UNDEFINED; return -1; }
+        if (s->len <= 0) return 0;
+        if (js_get_fast_array(ctx, s->obj, &arrp, &count32) && count32 == s->len) {
+            JSValue *pval = JS_VALUE_GET_OBJ(s->arr)->u.array.u.values;
+            int64_t i;
+            for (i = s->len - 1; i >= 0; i--, pval++)
+                *pval = js_dup(arrp[i]);
+            return 0;
+        }
+        s->hdr.stage = 2;
+    }
+    for (;;) {
+        if (s->k >= s->len) { JS_FreeValue(ctx, cb_result); return 0; }
+        /* step 5.c: `? Get(O, ! ToString(𝔽(len - k - 1)))` — descending, and the order is observable. */
+        r = step_getidx_run(ctx, &s->hdr, s->obj, s->len - 1 - s->k, cb_result, &s->el, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        /* step 5.d: `!` CreateDataPropertyOrThrow(A, Pk, fromValue). */
+        arr_dense_put(ctx, s->arr, s->k, s->el);
+        s->el = JS_UNDEFINED;
+        s->k++;
+    }
+}
 
-    ret = arr;
-    arr = JS_UNDEFINED;
-
-exception:
-    JS_FreeValue(ctx, arr);
-    JS_FreeValue(ctx, obj);
-    return ret;
+static JSValue js_array_toreversed_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSArrayToReversed *s = st;
+    JSValue r = take_result ? s->arr : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->arr);
+    JS_FreeValue(ctx, s->obj);
+    JS_FreeValue(ctx, s->el);
+    js_free(ctx, s);
+    return r;
 }
 
 /* 23.1.3.28 slice / 23.1.3.31 splice — ONE machine, `splice` in hdr.arg, exactly as the C function was one body
@@ -57231,82 +57298,133 @@ static JSValue js_array_slice_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
-static JSValue js_array_toSpliced(JSContext *ctx, JSValueConst this_val,
-                                  int argc, JSValueConst *argv)
+/* 23.1.3.35 Array.prototype.toSpliced — splice without mutating the receiver. It does not consult
+   Array[@@species]; the result is always a dense base Array, so every write into it is a `!`
+   CreateDataPropertyOrThrow on an engine-private object and reaches no page code. The READS are the page's:
+   LengthOfArrayLike, ToIntegerOrInfinity of `start` and of `skipCount` (a `valueOf` runs there), and steps 14.b
+   and 16.c's `? Get(O, Pi)` for every copied element. js_array_toSpliced ran all of them from C, so a loop in
+   any of them had no flow base and aborted at its back-edge.
+   It also asked HasProperty before every read (JS_TryGetPropertyInt64), which 14.b and 16.c do NOT: on a Proxy
+   whose `has` says false and whose `get` returns a value, that produced undefined where the spec yields the
+   value. The step sub-sequence is the plain Get the spec names.
+   The FAST-ARRAY span stays: js_get_fast_array is precisely the statement that no accessor, no Proxy trap and no
+   prototype lookup is reachable, so it is the same computation with no observable step.
+   Stages: 0 ToObject, 1 length, 2 start, 3 skipCount + allocate + the dense span, 4 the head reads,
+   5 the inserted items, 6 the tail reads. */
+
+static int js_array_tospliced_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    JSValue arr, obj, ret, *arrp, *pval, *last;
-    JSObject *p;
-    int64_t i, j, len, newlen, start, add, del;
+    JSArrayToSpliced *s = st;
+    JSValue *arrp;
     uint32_t count32;
+    int r;
 
-    ret = JS_EXCEPTION;
-    arr = JS_UNDEFINED;
-
-    obj = JS_ToObject(ctx, this_val);
-    if (js_get_length64(ctx, &len, obj))
-        goto exception;
-
-    start = 0;
-    if (argc > 0)
-        if (JS_ToInt64Clamp(ctx, &start, argv[0], 0, len, len))
-            goto exception;
-
-    del = 0;
-    if (argc > 0)
-        del = len - start;
-    if (argc > 1)
-        if (JS_ToInt64Clamp(ctx, &del, argv[1], 0, del, 0))
-            goto exception;
-
-    add = 0;
-    if (argc > 2)
-        add = argc - 2;
-
-    newlen = len + add - del;
-    if (newlen > MAX_SAFE_INTEGER) {
-        JS_ThrowTypeError(ctx, "invalid array length");
-        goto exception;
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
+        s->obj = JS_UNDEFINED; s->arr = JS_UNDEFINED; s->el = JS_UNDEFINED;
+        s->len = 0; s->start = 0; s->del = 0; s->newlen = 0; s->i = 0; s->from = 0; s->add = 0;
+        s->obj = JS_ToObject(ctx, s->hdr.this_val);
+        if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
+        s->hdr.stage = 1;
     }
-
-    arr = js_allocate_fast_array(ctx, newlen);
-    if (JS_IsException(arr))
-        goto exception;
-
-    if (newlen <= 0)
-        goto done;
-
-    p = JS_VALUE_GET_OBJ(arr);
-    pval = &p->u.array.u.values[0];
-    last = &p->u.array.u.values[newlen];
-
-    if (js_get_fast_array(ctx, obj, &arrp, &count32) && count32 == len) {
-        for (i = 0; i < start; i++, pval++)
-            *pval = js_dup(arrp[i]);
-        for (j = 0; j < add; j++, pval++)
-            *pval = js_dup(argv[2 + j]);
-        for (i += del; i < len; i++, pval++)
-            *pval = js_dup(arrp[i]);
-    } else {
-        for (i = 0; i < start; i++, pval++)
-            if (-1 == JS_TryGetPropertyInt64(ctx, obj, i, pval))
-                goto exception;
-        for (j = 0; j < add; j++, pval++)
-            *pval = js_dup(argv[2 + j]);
-        for (i += del; i < len; i++, pval++)
-            if (-1 == JS_TryGetPropertyInt64(ctx, obj, i, pval))
-                goto exception;
+    if (s->hdr.stage == 1) {
+        r = step_length_run(ctx, &s->hdr, s->obj, cb_result, &s->len, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 2;
     }
+    if (s->hdr.stage == 2) {
+        /* steps 3-4: ToIntegerOrInfinity(start), then the negative-relative clamp into [0, len]. */
+        r = step_toint64_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->start, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->start = arr_clamp_idx(s->start, s->len);
+        s->hdr.stage = 3;
+    }
+    if (s->hdr.stage == 3) {
+        /* steps 6-8: `start` absent skips nothing, `skipCount` absent skips the whole tail, and only the
+           present-and-given case coerces — which is why this reads argc and not the padded operand. */
+        if (s->hdr.argc == 0) {
+            s->del = 0;
+        } else if (s->hdr.argc == 1) {
+            s->del = s->len - s->start;
+        } else {
+            r = step_toint64_run(ctx, &s->hdr, step_arg(&s->hdr, 1), cb_result, &s->del, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            if (s->del < 0) s->del = 0;
+            else if (s->del > s->len - s->start) s->del = s->len - s->start;
+        }
+        s->add = s->hdr.argc > 2 ? s->hdr.argc - 2 : 0;
+        s->newlen = s->len + s->add - s->del;
+        if (s->newlen > MAX_SAFE_INTEGER) {
+            JS_ThrowTypeError(ctx, "invalid array length");
+            return -1;
+        }
+        s->arr = js_allocate_fast_array(ctx, s->newlen);
+        if (JS_IsException(s->arr)) { s->arr = JS_UNDEFINED; return -1; }
+        if (s->newlen <= 0) return 0;
+        /* the coercions above are page code and may have reshaped the receiver, so the fast-array test is made
+           here and not before them. */
+        if (js_get_fast_array(ctx, s->obj, &arrp, &count32) && count32 == s->len) {
+            int64_t i, j, w = 0;
+            for (i = 0; i < s->start; i++)
+                arr_dense_put(ctx, s->arr, w++, js_dup(arrp[i]));
+            for (j = 0; j < s->add; j++)
+                arr_dense_put(ctx, s->arr, w++, js_dup(step_arg(&s->hdr, (int)(2 + j))));
+            for (i += s->del; i < s->len; i++)
+                arr_dense_put(ctx, s->arr, w++, js_dup(arrp[i]));
+            DCHECK(w == s->newlen, "the dense toSpliced copy did not fill its allocated result exactly");
+            return 0;
+        }
+        s->i = 0;
+        s->from = s->start + s->del;
+        s->hdr.stage = 4;
+    }
+    /* step 14: the head, `? Get(O, Pi)` for i < actualStart. */
+    while (s->hdr.stage == 4) {
+        if (s->i >= s->start) { s->hdr.stage = 5; break; }
+        r = step_getidx_run(ctx, &s->hdr, s->obj, s->i, cb_result, &s->el, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        arr_dense_put(ctx, s->arr, s->i, s->el);
+        s->el = JS_UNDEFINED;
+        s->i++;
+    }
+    if (s->hdr.stage == 5) {
+        /* step 15: the inserted items, which are already values — nothing observable happens here. */
+        int64_t j;
+        for (j = 0; j < s->add; j++, s->i++)
+            arr_dense_put(ctx, s->arr, s->i, js_dup(step_arg(&s->hdr, (int)(2 + j))));
+        s->hdr.stage = 6;
+    }
+    /* step 16: the tail, `? Get(O, from)` written at Pi — two cursors, because the copy is a shift. */
+    for (;;) {
+        if (s->i >= s->newlen) {
+            JS_FreeValue(ctx, cb_result);
+            DCHECK(s->from == s->len, "the toSpliced tail walk did not consume the receiver exactly");
+            return 0;
+        }
+        r = step_getidx_run(ctx, &s->hdr, s->obj, s->from, cb_result, &s->el, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        arr_dense_put(ctx, s->arr, s->i, s->el);
+        s->el = JS_UNDEFINED;
+        s->i++;
+        s->from++;
+    }
+}
 
-    assert(pval == last);
-
-done:
-    ret = arr;
-    arr = JS_UNDEFINED;
-
-exception:
-    JS_FreeValue(ctx, arr);
-    JS_FreeValue(ctx, obj);
-    return ret;
+static JSValue js_array_tospliced_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSArrayToSpliced *s = st;
+    JSValue r = take_result ? s->arr : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->arr);
+    JS_FreeValue(ctx, s->obj);
+    JS_FreeValue(ctx, s->el);
+    js_free(ctx, s);
+    return r;
 }
 
 
@@ -59031,12 +59149,12 @@ static const JSCFunctionListEntry js_array_proto_funcs[] = {
     JS_CFUNC_STEP_DEF("shift", 0, STEPDEF_ARRAY_SHIFT ),
     JS_CFUNC_STEP_DEF("unshift", 1, STEPDEF_ARRAY_UNSHIFT ),
     JS_CFUNC_STEP_DEF("reverse", 0, STEPDEF_ARRAY_REVERSE ),
-    JS_CFUNC_DEF("toReversed", 0, js_array_toReversed ),
+    JS_CFUNC_STEP_DEF("toReversed", 0, STEPDEF_ARRAY_TOREVERSED ),
     JS_CFUNC_STEP_DEF("sort", 1, STEPDEF_ARRAY_SORT ),
     JS_CFUNC_STEP_DEF("toSorted", 1, STEPDEF_ARRAY_TOSORTED ),
     JS_CFUNC_STEP_DEF("slice", 2, STEPDEF_ARRAY_SLICE ),
     JS_CFUNC_STEP_DEF("splice", 2, STEPDEF_ARRAY_SPLICE ),
-    JS_CFUNC_DEF("toSpliced", 2, js_array_toSpliced ),
+    JS_CFUNC_STEP_DEF("toSpliced", 2, STEPDEF_ARRAY_TOSPLICED ),
     JS_CFUNC_STEP_DEF("copyWithin", 2, STEPDEF_ARRAY_COPYWITHIN ),
     JS_CFUNC_STEP_DEF("flatMap", 1, STEPDEF_ARRAY_FLATMAP ),
     JS_CFUNC_STEP_DEF("flat", 0, STEPDEF_ARRAY_FLAT ),
