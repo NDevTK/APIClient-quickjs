@@ -18819,6 +18819,13 @@ static void js_toprim_abandon(JSContext *ctx, struct JSToPrim *tp);
 #define CONT_FROM_CTOR    27   /* declared with its record, JSFromCtor, further down; the step-chain abandon here
                                   is one of the three places that has to know the kind. */
 static void js_from_ctor_abandon(JSContext *ctx, void *st);
+/* CONT_ITER_CONSUME's value, needed by BOTH abandon walks below (this one and js_toprim_abandon), which run
+   before the kind list is declared. The _Static_assert at the list keeps the two from drifting. */
+#define CONT_ITER_CONSUME_FWD 8
+static void js_iter_consume_abandon(JSContext *ctx, void *st);
+/* CONT_ITER_HELPER's value, forward for the same reason. */
+#define CONT_ITER_HELPER_FWD  11
+static void js_iter_helper_abandon(JSContext *ctx, void *st);
 static void tramp_step_chain_free(JSContext *ctx, void *st)
 {
     while (st) {
@@ -18832,6 +18839,15 @@ static void tramp_step_chain_free(JSContext *ctx, void *st)
         }
         if (nxt && nk == CONT_FROM_CTOR) {
             js_from_ctor_abandon(ctx, nxt);
+            return;
+        }
+        if (nxt && nk == CONT_ITER_CONSUME_FWD) {
+            /* the machine was a consume machine's CALLBACK and threw: the source owes IfAbruptCloseIterator. */
+            js_iter_consume_abandon(ctx, nxt);
+            return;
+        }
+        if (nxt && nk == CONT_ITER_HELPER_FWD) {
+            js_iter_helper_abandon(ctx, nxt);
             return;
         }
         DCHECK(!nxt || nk == CONT_STEP, "step outer continuation: unknown sequence kind");
@@ -19581,11 +19597,6 @@ static void js_import_cap_free(JSContext *ctx, JSImportCap *ic)
     js_free(ctx, ic);
 }
 
-/* CONT_ITER_CONSUME's value, needed here because js_toprim_abandon runs before the kind list; the DCHECK below
-   keeps the two from drifting. */
-#define TOPRIM_OUTER_ITER_CONSUME 8
-static void js_iter_consume_abandon(JSContext *ctx, void *st);
-
 static void js_toprim_abandon(JSContext *ctx, struct JSToPrim *tp)
 {
     void *touter = tp->outer;
@@ -19599,7 +19610,7 @@ static void js_toprim_abandon(JSContext *ctx, struct JSToPrim *tp)
         ctx->pending_import_cap = touter;
         return;
     }
-    if (touter && tk == TOPRIM_OUTER_ITER_CONSUME) {
+    if (touter && tk == CONT_ITER_CONSUME_FWD) {
         js_iter_consume_abandon(ctx, touter);   /* IfAbruptCloseIterator, then the machine is gone */
         return;
     }
@@ -19746,19 +19757,27 @@ enum { ITH_DIRECT = 0, ITH_FOROF, ITH_ITERNEXT, ITH_CONSUME };
 enum { ITHP_START = 0, ITHP_DROP_SKIP, ITHP_EMIT, ITHP_FLATMAP_SRC, ITHP_FLATMAP_INNER, ITHP_TAKE_CLOSE,
        ITHP_CB_DONE, ITHP_FLATMAP_CB };   /* ITHP_FLATMAP_CB: `res` is the flatMap mapper's result */   /* ITHP_CB_DONE: the map/filter callback ran ON THE TRAMP; `res` is its result */
 static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue res, JSValue *out);
+/* A lazy helper's CALLBACK threw. The helper object is GC-owned (it IS the JS-visible iterator), so there is
+   nothing to free — only the re-entrancy flag its step raised, exactly as the helper's own abrupt arm clears it.
+   Its source is closed by the helper's own return/throw, not here. */
+static void js_iter_helper_abandon(JSContext *ctx, void *st)
+{
+    ((JSIteratorHelperData *)st)->executing = 0;
+}
 static bool tramp_can_call_iter_helper(JSValueConst func, JSValueConst this_val);
 static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int *pdone, int magic);
 #define CONT_PROMISE_ALL   9   /* cont_state = JSPromiseAll: Promise.all(gen) drives the generator's .next() on the
                                   chain, per element wrapping Promise.resolve(value).then(resolve_element). Reuses the
                                   generator drive; the settle re-enters do_promise_all_step. No promise-state
                                   fork-clone yet — a fork mid-consume DFAILs at the clone (guarded), never silent. */
-_Static_assert(TOPRIM_OUTER_ITER_CONSUME == 8, "TOPRIM_OUTER_ITER_CONSUME must equal CONT_ITER_CONSUME");
 #define CONT_ITER_CONSUME  8   /* cont_state = JSIterConsume: a builtin that CONSUMES an iterator in a loop
                                   (Array.from) drives the iterator's .next() on this chain — when the iterator is a
                                   GENERATOR its body runs on the chain (suspend/resume at any depth), never the
                                   C-recursion drive-to-completion JS_IteratorNext would use. The generator drive
                                   frame carries this cont; its direct-mode settle re-enters js_iter_consume_step
                                   with the {value,done} result. */
+_Static_assert(CONT_ITER_CONSUME_FWD == CONT_ITER_CONSUME, "the forward alias used by the abandon walks must equal CONT_ITER_CONSUME");
+_Static_assert(CONT_ITER_HELPER_FWD == CONT_ITER_HELPER, "the forward alias used by the abandon walk must equal CONT_ITER_HELPER");
 
 /* THE CONT_* NAMESPACE IS ONE NAMESPACE. A TrampFrame's cont_kind and a continuation's outer_kind both hold values
    from it (a JSToPrim's outer is CONT_STEP / CONT_IMPORT / CONT_ITER_CONSUME; a JSGetProp's is CONT_STEP or
@@ -23574,6 +23593,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        rather than parked. */
                     uint8_t dck = tramp_cont_kind;
                     int dfof = tramp_cont_forof;
+                    void *dcs = tramp_cont_state;
                     tramp_cont_kind = CONT_NONE; tramp_cont_state = NULL; tramp_cont_forof = 0;
                     ret_val = JS_CallInternal(ctx, call_argv[-1], gthis, JS_UNDEFINED,
                                               call_argc, vc(call_argv), 0);
@@ -23582,6 +23602,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (call_args_owned) {
                         free_arg_list(ctx, call_args_owned, call_args_owned_n);
                         call_args_owned = NULL; call_args_owned_n = 0;
+                    }
+                    if (dck == CONT_ITER_CONSUME) {
+                        /* a consume machine's CALLBACK — an iterterm predicate, a collection's adder — whose
+                           callee has no bytecode body. It used to be called with JS_Call from the machine's own
+                           arm, which is the fallback shape: a BOUND or PROXIED or step-machine callback drove
+                           from C there while a plain one parked. */
+                        TAKE_CALL_SHAPE();
+                        cont_st = dcs;
+                        goto do_consume_deliver;
+                    }
+                    if (dck == CONT_ITER_HELPER) {
+                        /* a lazy helper's map/filter callback with no bytecode body — same story. */
+                        TAKE_CALL_SHAPE();
+                        cont_st = dcs;
+                        goto do_helper_deliver;
                     }
                     if (dck == CONT_ITER_CLOSE_CALL) {
                         JSValue *cargv;
@@ -23673,14 +23708,28 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    -2 was safe only while every step machine was a prototype method (arr.find, str.replace) — a
                    Promise reaction closure is called as a PLAIN function (onFulfilled(v)), so -2 freed one slot
                    below the callee and corrupted the caller's stack (the next call read a garbage callee). */
-                h->outer = tramp_step_outer;
-                h->outer_kind = tramp_step_outer_kind;
-                /* an inner machine's arguments live in the OUTER state's buffer, never on the stack, so its
-                   operand shape is empty — recording the caller's would free slots it does not own. */
-                TAKE_CALL_SHAPE();
-                h->orig_cfirst = tramp_step_outer ? 0 : call_first_r;
-                h->orig_cargc = tramp_step_outer ? 0 : call_pop;
-                h->orig_is_tail = tramp_step_outer ? 0 : tramp_is_tail;
+                /* WHO RECEIVES THIS MACHINE'S RESULT is ONE question with ONE field. It used to be asked from two
+                   registers: tramp_step_outer (a SEQUENCE waiting — another step, a ToPrimitive, a CreateFromCtor)
+                   and tramp_cont_* (a CALL SITE waiting), and this entry read only the first. So a step machine
+                   reached as a consume machine's callback — `Array.from(g(), String)`, `[...].map(Math.abs)` —
+                   dropped its continuation, pushed its result as a bare operand and freed the caller's operands
+                   at a pc that was not an opcode boundary; the next call then read a garbage callee ("not a
+                   function"). Both registers name a CONT_* kind, so they are the same field: adopt whichever is
+                   set. An INNER machine differs only in where its arguments live (the outer state's buffer, never
+                   the stack), so the empty operand shape keys on that, not on "has an outer". */
+                {
+                    int inner5 = (tramp_step_outer != NULL);
+                    DCHECK(!inner5 || tramp_cont_kind == CONT_NONE,
+                           "a step machine was handed both a sequence outer and a call continuation");
+                    h->outer = inner5 ? tramp_step_outer
+                                      : (tramp_cont_kind != CONT_NONE ? tramp_cont_state : NULL);
+                    h->outer_kind = inner5 ? tramp_step_outer_kind : tramp_cont_kind;
+                    TAKE_CALL_SHAPE();
+                    h->orig_cfirst = inner5 ? 0 : call_first_r;
+                    h->orig_cargc = inner5 ? 0 : call_pop;
+                    h->orig_is_tail = inner5 ? 0 : tramp_is_tail;
+                    tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE; tramp_cont_forof = 0;
+                }
                 if (call_args_owned) {   /* the state captured the invocation */
                     free_arg_list(ctx, call_args_owned, call_args_owned_n);
                     call_args_owned = NULL; call_args_owned_n = 0;
@@ -23709,7 +23758,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     int cfirst = h->orig_cfirst, cargc = h->orig_cargc;
                     uint8_t itail = h->orig_is_tail, idiscard = h->discard_result;
                     JSValue r = tramp_step_state_free(ctx, stt, true);
-                    JSValue *cargv = sp - cargc;
+                    JSValue *cargv;
+                    if (souter && (souter_kind == CONT_ITER_CONSUME || souter_kind == CONT_ITER_HELPER)) {
+                        /* the machine WAS a consumer's CALLBACK (`Array.from(g, String)`, `.map(Math.abs)`). Its
+                           result and the caller's operands are handed to that consumer's one delivery, exactly as
+                           a heap frame's are — the operand drop lives there, so it is not repeated here. */
+                        ret_val = r; cont_st = souter;
+                        call_first_r = cfirst; call_pop = cargc;
+                        if (souter_kind == CONT_ITER_HELPER) goto do_helper_deliver;
+                        goto do_consume_deliver;
+                    }
+                    cargv = sp - cargc;
                     for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
                     sp += cfirst - cargc;
                     if (idiscard) { JS_FreeValue(ctx, r); BREAK; }   /* an opcode whose operation yields nothing */
@@ -24860,6 +24919,33 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 goto do_consume_acquire_iterator;
             }
 
+        do_consume_deliver:
+            /* THE ONE delivery of a consume machine's callback result. Every FRAME KIND the callee can have
+               converges here: a bytecode body whose heap frame returned, a callee with no body called in place at
+               do_generic_callee, and a STEP MACHINE that finished at do_step_step. Each arrives having set only
+               the OPERAND SHAPE (call_first_r/call_pop) and cont_st/ret_val — the drop and the iterator-result
+               check are identical for all three, which is why they were copies (and why the step-machine kind,
+               having no copy, silently dropped its continuation and corrupted the caller's stack).
+               ret_val may be an EXCEPTION: the step's own abrupt path owns it (IfAbruptCloseIterator closes the
+               source), so it is delivered rather than intercepted here. */
+            {
+                JSValue *cargv = sp - call_pop;
+                int nops = call_pop - call_first_r;
+                /* 2 = a PLAIN iterator's .next() ([iter, next]) — the only shape whose result must be an
+                   iterator-result object; 3 = a Set's one-argument adder ([this, add, value]); 4 = a 2-arg
+                   callback or a Map's adder ([this, set, key, value]); 5 = reduce's 3-arg callback. */
+                DCHECK(nops == 2 || nops == 3 || nops == 4 || nops == 5,
+                       "consume callback has an unexpected operand shape");
+                for (i = call_first_r; i < call_pop; i++) JS_FreeValue(ctx, cargv[i]);
+                sp += call_first_r - call_pop;
+                if (nops == 2 && !JS_IsException(ret_val) && !JS_IsObject(ret_val)) {
+                    JS_FreeValue(ctx, ret_val); ret_val = JS_UNINITIALIZED;
+                    js_iter_consume_end(ctx, (JSIterConsume *)cont_st); js_free_rt(rt, cont_st);
+                    JS_ThrowTypeError(ctx, "iterator result not an object");
+                    goto exception;
+                }
+            }
+            /* fall through */
         do_iter_consume_step:
             /* ret_val = the previous .next() result object (UNINITIALIZED on the first step). Feed it to the step,
                then either drive the next .next() (generator body on this chain) or finish the array. */
@@ -24898,15 +24984,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                       *sp++ = js_int64(ta_mapfn ? s->ta_k : (from_mapfn ? s->k : s->k - 1));   /* FROM has not incremented k yet */
                       call_argv = sp - nargs; call_argc = nargs; tramp_first = -2; tramp_is_tail = 0; }
                     tramp_cont_state = s; tramp_cont_kind = CONT_ITER_CONSUME;
+                    /* the split is the FRAME KIND, not whether to suspend — a bytecode body gets a heap frame
+                       and everything else goes to the one convergence point, which delivers this continuation. */
                     if (tramp_can_call(call_argv[-1])) goto do_tramp_call;
-                    tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;
-                    { JSValueConst cargs2[2]; JSValue cr;
-                      cargs2[0] = call_argv[0]; cargs2[1] = call_argv[1];
-                      cr = JS_Call(ctx, call_argv[-1], JS_UNDEFINED, 2, cargs2);
-                      for (i = -2; i < 2; i++) JS_FreeValue(ctx, call_argv[i]);
-                      sp -= 4;
-                      ret_val = cr;
-                      goto do_iter_consume_step; }
+                    goto do_generic_callee;
                 }
                 if (st == 7) {
                     /* the collection's ADDER (Set.prototype.add / Map.prototype.set, or a SUBCLASS's override) is
@@ -24921,13 +25002,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     else { *sp++ = js_dup(s->cb_value); }
                     call_argv = sp - nargs; call_argc = nargs; tramp_first = -2; tramp_is_tail = 0;
                     tramp_cont_state = s; tramp_cont_kind = CONT_ITER_CONSUME;
+                    /* a SUBCLASS may override add/set with a bound or proxied function; the split is the frame
+                       kind, and do_generic_callee answers every other shape. */
                     if (tramp_can_call(call_argv[-1])) goto do_tramp_call;
-                    tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;
-                    { JSValue cr = JS_Call(ctx, call_argv[-1], call_argv[-2], nargs, (JSValueConst *)call_argv);
-                      for (i = -2; i < nargs; i++) JS_FreeValue(ctx, call_argv[i]);
-                      sp -= 2 + nargs;
-                      ret_val = cr;
-                      goto do_iter_consume_step; }
+                    goto do_generic_callee;
                 }
                 if (st == 6) {
                     /* THE indexed-read arm. An ACCESSOR element or a Proxy source runs its body on this chain, so a
@@ -25411,6 +25489,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 goto do_iter_helper_step;
             }
 
+        do_helper_deliver:
+            /* THE ONE delivery of an iterator helper's callback result — the same three frame kinds the consume
+               delivery above serves (a returned heap frame, a bodiless callee run in place, a finished step
+               machine), and the same reason it is one label. ret_val may be an EXCEPTION: the step's own abrupt
+               path owns it, so it is delivered rather than intercepted. */
+            {
+                JSValue *cargv = sp - call_pop;
+                int nops = call_pop - call_first_r;
+                DCHECK(nops == 2 || nops == 4, "helper callback has an unexpected operand shape");
+                for (i = call_first_r; i < call_pop; i++) JS_FreeValue(ctx, cargv[i]);
+                sp += call_first_r - call_pop;   /* drop [this, next] or [this, func, value, index] */
+                if (nops == 2 && !JS_IsException(ret_val) && !JS_IsObject(ret_val)) {
+                    JS_FreeValue(ctx, ret_val); ret_val = JS_UNINITIALIZED;
+                    ((JSIteratorHelperData *)cont_st)->executing = 0;
+                    JS_ThrowTypeError(ctx, "iterator result not an object");
+                    goto exception;
+                }
+            }
+            /* fall through */
         do_iter_helper_step:
             /* ret_val = the source .next() {value,done} from the previous drive (UNINITIALIZED on the first step).
                ONE drive mechanism: the step decides skip/emit; a GENERATOR source .next() runs on the tramp (its body
@@ -25434,16 +25531,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         *sp++ = js_int64(it->count++);        /* arg1: index */
                         call_argv = sp - 2; call_argc = 2; tramp_first = -2; tramp_is_tail = 0;
                         tramp_cont_state = it; tramp_cont_kind = CONT_ITER_HELPER;
+                        /* the split is the FRAME KIND, not whether to suspend — a bytecode body gets a heap frame
+                           and every other kind goes to the one convergence point, which delivers this
+                           continuation. `.map(Math.abs)` is a STEP MACHINE and reached its C entry here. */
                         if (tramp_can_call(call_argv[-1])) goto do_tramp_call;
-                        /* a C/bound callback has no preemptible body: call it here and feed the result back */
-                        tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;
-                        { JSValueConst cargs[2]; JSValue cr;
-                          cargs[0] = call_argv[0]; cargs[1] = call_argv[1];
-                          cr = JS_Call(ctx, call_argv[-1], JS_UNDEFINED, 2, cargs);
-                          for (i = -2; i < 2; i++) JS_FreeValue(ctx, call_argv[i]);
-                          sp -= 4;
-                          ret_val = cr;   /* may be an exception; ITHP_CB_DONE handles it */
-                          continue; }
+                        goto do_generic_callee;
                     }
                     if (st == 2) {   /* CREATE_INNER (flatMap): the inner's [Symbol.iterator] is a generator function.
                                         Push [this, gfunc] as the create's call operands — the SAME stack shape an
@@ -26327,23 +26419,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (rck == CONT_ITER_CONSUME) {
                     /* the ITERTERM callback returned: drop its operands (do_tramp_call dup'd the args and recorded
                        caller_sp ABOVE them) and resume the consume step with the result. */
-                    JSValue *cargv = sp - cargc;
-                    int nops = cargc - cfirst;
-                    /* 2 = a PLAIN iterator's .next() ([iter, next]) — the only shape whose result must be an
-                       iterator-result object; 3 = a Set's one-argument adder ([this, add, value]); 4 = a 2-arg
-                       callback or a Map's adder ([this, set, key, value]); 5 = reduce's 3-arg callback. */
-                    DCHECK(nops == 2 || nops == 3 || nops == 4 || nops == 5,
-                           "consume cont frame has an unexpected operand shape");
-                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
-                    sp += cfirst - cargc;
-                    if (nops == 2 && !JS_IsException(ret_val) && !JS_IsObject(ret_val)) {
-                        JS_FreeValue(ctx, ret_val); ret_val = JS_UNINITIALIZED;
-                        js_iter_consume_end(ctx, (JSIterConsume *)rcs); js_free_rt(rt, rcs);
-                        JS_ThrowTypeError(ctx, "iterator result not an object");
-                        goto exception;
-                    }
+                    call_first_r = cfirst; call_pop = cargc;
                     cont_st = rcs;
-                    goto do_iter_consume_step;
+                    goto do_consume_deliver;
                 }
                 if (rck == CONT_PROMISE_ALL) {
                     /* a Promise combinator's bytecode callback driven on the tramp returned: either the PLAIN-iterator
@@ -26360,21 +26438,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 if (rck == CONT_ITER_HELPER) {
                     /* the map/filter callback returned: resume the helper step with its result. do_tramp_call DUPS
-                       the args, so the caller-stack operands are still owned here — free them BEFORE re-entering,
-                       since jumping past the shared cleanup below would leak all four and corrupt refcounts. */
-                    JSValue *cargv = sp - cargc;   /* do_tramp_call recorded caller_sp = sp ABOVE the operands */
-                    int nops = cargc - cfirst;
-                    DCHECK(nops == 2 || nops == 4, "helper cont frame has an unexpected operand shape");
-                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
-                    sp += cfirst - cargc;          /* drop [this, next] or [this, func, value, index] */
-                    if (nops == 2 && !JS_IsException(ret_val) && !JS_IsObject(ret_val)) {
-                        JS_FreeValue(ctx, ret_val); ret_val = JS_UNINITIALIZED;
-                        ((JSIteratorHelperData *)rcs)->executing = 0;
-                        JS_ThrowTypeError(ctx, "iterator result not an object");
-                        goto exception;
-                    }
+                       the args, so the caller-stack operands are still owned here — the shared delivery frees them
+                       BEFORE re-entering, since jumping past it would leak all four and corrupt refcounts. */
+                    call_first_r = cfirst; call_pop = cargc;
                     cont_st = rcs;
-                    goto do_iter_helper_step;
+                    goto do_helper_deliver;
                 }
                 if (rck == CONT_GETPROP) {
                     /* the accessor or the proxy trap returned. Its operands live in the continuation's own buffer
