@@ -17390,32 +17390,46 @@ static __exception int js_for_of_start(JSContext *ctx, JSValue *sp,
    objs. If 'done' is true or in case of exception, 'enum_rec' is set
    to undefined. If 'done' is true, 'value' is always set to
    undefined. */
-static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
+static JSValue JS_IteratorStepValue(JSContext *ctx, JSValueConst obj, int *pdone);
+/* The for-of protocol TAIL: IteratorNext's object check, then IteratorComplete/IteratorValue, then [value,
+   done] pushed above the enum_rec — whose iterator slot is cleared on done so the loop's OP_iterator_close does
+   not close an exhausted iterator. `sp` is the caller's stack with the call's operands already dropped; the
+   caller adds 2 afterwards.
+   There are two ways a .next() returns — a popped heap frame, and a callee that never got one — and this is the
+   protocol both deliver through, so there is one implementation of it rather than a copy per return path. */
+static int js_forof_deliver(JSContext *ctx, JSValue *sp, int rfof, JSValue ret_val)
 {
-    JSValue value = JS_UNDEFINED;
-    int done = 1;
-
-    if (likely(!JS_IsUndefined(sp[offset]))) {
-        value = JS_IteratorNext(ctx, sp[offset], sp[offset + 1], 0, NULL, &done);
-        if (JS_IsException(value))
-            done = -1;
-        if (done) {
-            /* value is JS_UNDEFINED or JS_EXCEPTION */
-            /* replace the iteration object with undefined */
-            JS_FreeValue(ctx, sp[offset]);
-            sp[offset] = JS_UNDEFINED;
-            if (done < 0) {
-                return -1;
-            } else {
-                JS_FreeValue(ctx, value);
-                value = JS_UNDEFINED;
-            }
-        }
+    JSValue value;
+    int done;
+    DCHECK(rfof <= -3, "the for-of protocol tail was given no enum_rec offset");
+    if (unlikely(!JS_IsObject(ret_val))) {
+        JS_FreeValue(ctx, ret_val);
+        JS_ThrowTypeError(ctx, "iterator must return an object");
+        JS_FreeValue(ctx, sp[rfof]); sp[rfof] = JS_UNDEFINED;
+        return -1;
+    }
+    value = JS_IteratorStepValue(ctx, ret_val, &done);   /* reads .done then .value */
+    JS_FreeValue(ctx, ret_val);
+    if (unlikely(JS_IsException(value))) {
+        JS_FreeValue(ctx, sp[rfof]); sp[rfof] = JS_UNDEFINED;
+        return -1;
+    }
+    if (done) {
+        JS_FreeValue(ctx, sp[rfof]); sp[rfof] = JS_UNDEFINED;
+        JS_FreeValue(ctx, value); value = JS_UNDEFINED;
     }
     sp[0] = value;
     sp[1] = js_bool(done);
     return 0;
 }
+
+/* DELETED: js_for_of_next. It was OP_for_of_next's C fallback — reached whenever the iterator's .next() was
+   not a plain bytecode function — and it drove that .next() through JS_IteratorNext -> JS_Call, a C activation
+   whose back-edge preempt has no flow base. The opcode routes EVERY .next() now: a bytecode body to
+   do_tramp_call, everything else to do_generic_callee, which is the split between FRAME KINDS and not a choice
+   about whether to suspend. Its tail became js_forof_deliver, which both return paths share.
+   What made the fallback removable was giving do_generic_callee's direct-call arm a continuation: until then a
+   callee with no heap frame could only push its result, so the opcode had to keep a second way to finish. */
 
 /* 7.4.4 IteratorComplete: ToBoolean(? Get(iterResult, "done")). -1 on an abrupt completion. */
 static int JS_IteratorComplete(JSContext *ctx, JSValueConst obj)
@@ -23472,13 +23486,37 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     TRAMP_BODY_DISPATCH(-2, tramp_is_tail);
                     goto do_consumer_dispatch;
                 }
-                ret_val = JS_CallInternal(ctx, call_argv[-1], gthis, JS_UNDEFINED,
-                                          call_argc, vc(call_argv), 0);
-                /* the arguments were read; an apply shape's list is done with HERE, before either exit — the tail
-                   exit below never reaches the cleanup block, which is where it leaked. */
-                if (call_args_owned) {
-                    free_arg_list(ctx, call_args_owned, call_args_owned_n);
-                    call_args_owned = NULL; call_args_owned_n = 0;
+                {   /* A callee that gets NO heap frame returns HERE, so this is where its continuation has to
+                       be delivered — the frame-pop path above never runs for it. Without this the result was
+                       pushed as a bare operand and the pending continuation was silently dropped, which is why
+                       only a bytecode callee could carry one. The call is synchronous by construction (a body
+                       that could suspend went to do_tramp_call or do_step_tramp), so the delivery is immediate
+                       rather than parked. */
+                    uint8_t dck = tramp_cont_kind;
+                    int dfof = tramp_cont_forof;
+                    tramp_cont_kind = CONT_NONE; tramp_cont_state = NULL; tramp_cont_forof = 0;
+                    ret_val = JS_CallInternal(ctx, call_argv[-1], gthis, JS_UNDEFINED,
+                                              call_argc, vc(call_argv), 0);
+                    /* the arguments were read; an apply shape's list is done with HERE, before either exit — the
+                       tail exit below never reaches the cleanup block, which is where it leaked. */
+                    if (call_args_owned) {
+                        free_arg_list(ctx, call_args_owned, call_args_owned_n);
+                        call_args_owned = NULL; call_args_owned_n = 0;
+                    }
+                    if (dck == CONT_FOROF_NEXT) {
+                        JSValue *cargv;
+                        int pop, first;
+                        TAKE_CALL_SHAPE(); pop = call_pop; first = call_first_r;
+                        cargv = sp - pop;
+                        for (i = first; i < pop; i++) JS_FreeValue(ctx, cargv[i]);
+                        sp += first - pop;
+                        if (unlikely(JS_IsException(ret_val))) goto exception;
+                        if (js_forof_deliver(ctx, sp, dfof, ret_val)) goto exception;
+                        sp += 2;
+                        BREAK;
+                    }
+                    DCHECK(dck == CONT_NONE,
+                           "a callee with no heap frame was handed a continuation this arm cannot deliver");
                 }
                 if (unlikely(JS_IsException(ret_val)))
                     goto exception;
@@ -26309,30 +26347,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        the enum_rec, and the enum_rec's iterator slot cleared on done so the loop's
                        OP_iterator_close does not close an exhausted iterator. */
                     JSValue *cargv = sp - cargc;
-                    JSValue value;
-                    int done;
-                    DCHECK(cargc - cfirst == 2, "for-of next frame has an unexpected operand shape");
+                    /* The operand shape is whatever the frame RECORDED, which is not always the [iter, next]
+                       the opcode pushed: do_generic_callee's proxy arm replaces those two with the trap's five,
+                       and its bound arm with the flattened argument list. Asserting 2 here was true only while a
+                       bytecode .next() was the sole way in — a proxied one aborted the moment the opcode stopped
+                       gating on that. What must hold is that the enum_rec sits BELOW the operands, which
+                       js_forof_deliver asserts on the restored sp. */
+                    DCHECK(cargc >= cfirst, "for-of next frame records operands ending below where they start");
                     for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
                     sp += cfirst - cargc;
-                    DCHECK(rfof <= -3, "CONT_FOROF_NEXT frame carries no enum_rec offset");
-                    if (unlikely(!JS_IsObject(ret_val))) {
-                        JS_FreeValue(ctx, ret_val);
-                        JS_ThrowTypeError(ctx, "iterator must return an object");
-                        JS_FreeValue(ctx, sp[rfof]); sp[rfof] = JS_UNDEFINED;
+                    if (js_forof_deliver(ctx, sp, rfof, ret_val))
                         goto exception;
-                    }
-                    value = JS_IteratorStepValue(ctx, ret_val, &done);   /* reads .done then .value */
-                    JS_FreeValue(ctx, ret_val);
-                    if (unlikely(JS_IsException(value))) {
-                        JS_FreeValue(ctx, sp[rfof]); sp[rfof] = JS_UNDEFINED;
-                        goto exception;
-                    }
-                    if (done) {
-                        JS_FreeValue(ctx, sp[rfof]); sp[rfof] = JS_UNDEFINED;
-                        JS_FreeValue(ctx, value); value = JS_UNDEFINED;
-                    }
-                    sp[0] = value;
-                    sp[1] = js_bool(done);
                     sp += 2;
                     BREAK;
                 }
@@ -27400,22 +27425,30 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        WrapForValidIterator.prototype.return (which a page may have patched). The generator and
                        helper arms above deliberately test the RAW slots — they read the receiver back off the
                        stack, so an unwrapped receiver would not match what they push. */
-                    JSValueConst itv = sp[offset], nextv = sp[offset + 1];
-                    tramp_unwrap_iter_next(&itv, &nextv);
-                    if (tramp_can_call(nextv)) {
-                        DCHECK(sp + 2 <= TRAMP_SP_LIMIT(sf),
-                               "for-of .next() drive: operand push exceeds the frame's compiled stack_size");
-                        *sp++ = js_dup(itv);      /* this */
-                        *sp++ = js_dup(nextv);    /* the next method */
-                        call_argv = sp; call_argc = 0; tramp_first = -2; tramp_is_tail = 0;
-                        tramp_cont_forof = offset;   /* rides the frame; sp is restored to here before it is used */
-                        tramp_cont_state = NULL; tramp_cont_kind = CONT_FOROF_NEXT;
-                        goto do_tramp_call;
+                    JSValueConst itv, nextv;
+                    if (JS_IsUndefined(sp[offset])) {
+                        /* the loop already finished — its enum_rec slot was cleared — so there is no .next() to
+                           call, and the protocol's [value, done] goes on directly. */
+                        sp[0] = JS_UNDEFINED;
+                        sp[1] = js_bool(true);
+                        sp += 2;
+                        BREAK;
                     }
+                    itv = sp[offset]; nextv = sp[offset + 1];
+                    tramp_unwrap_iter_next(&itv, &nextv);
+                    DCHECK(sp + 2 <= TRAMP_SP_LIMIT(sf),
+                           "for-of .next() drive: operand push exceeds the frame's compiled stack_size");
+                    *sp++ = js_dup(itv);      /* this */
+                    *sp++ = js_dup(nextv);    /* the next method */
+                    call_argv = sp; call_argc = 0; tramp_first = -2; tramp_is_tail = 0;
+                    tramp_cont_forof = offset;   /* rides the frame; sp is restored to here before it is used */
+                    tramp_cont_state = NULL; tramp_cont_kind = CONT_FOROF_NEXT;
+                    /* the split is the FRAME KIND, not whether to suspend: a bytecode body gets a heap frame,
+                       and everything else — a C builtin's next, a bound one, a proxy, a step machine — goes to
+                       the one convergence point that answers every other question about a callee. */
+                    if (tramp_can_call(nextv)) goto do_tramp_call;
+                    goto do_generic_callee;
                 }
-                if (js_for_of_next(ctx, sp, offset))
-                    goto exception;
-                sp += 2;
             }
             BREAK;
         CASE(OP_for_await_of_start):
