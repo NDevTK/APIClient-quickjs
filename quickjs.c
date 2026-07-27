@@ -18260,6 +18260,32 @@ static int step_delidx_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, int64
     return 0;
 }
 
+/* CreateDataPropertyOrThrow(O, ! ToString(𝔽(idx)), v) — how every builtin FILLS a result object. On a Proxy it
+   is the `defineProperty` trap, which is the page's code, and JS_DefinePropertyValueInt64 reached it from C.
+   0 = done, 10 = the caller must return that step code, -1 = threw. */
+static int step_defidx_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, int64_t idx, JSValueConst value,
+                           JSValue in, JSValue **out_cb, int *out_argc)
+{
+    if (h->get_phase == GET_PH_START) {
+        JSAtom atom;
+        JS_FreeValue(ctx, in);
+        atom = JS_NewAtomInt64(ctx, idx);
+        if (atom == JS_ATOM_NULL) return -1;
+        DCHECK(h->get_atom == JS_ATOM_NULL, "a keyed operation is already in flight on this machine's header");
+        h->get_atom = atom;                 /* the conversion already owns it */
+        h->cb_coerce[0] = (JSValue)obj;     /* borrowed: the machine holds both across the define */
+        h->cb_coerce[1] = (JSValue)value;
+        *out_cb = h->cb_coerce; *out_argc = (int)atom;
+        h->get_phase = GET_PH_GOT;
+        return 10;
+    }
+    JS_FreeAtom(ctx, h->get_atom);
+    h->get_atom = JS_ATOM_NULL;
+    h->get_phase = GET_PH_START;
+    JS_FreeValue(ctx, in);                  /* a define delivers no value */
+    return 0;
+}
+
 /* HasProperty(O, ! ToString(𝔽(idx))) — the OTHER half of the element access indexOf/lastIndexOf perform, which
    skip holes and so must ask before they read. A Proxy `has` trap is the page's code exactly as `get` is, and
    JS_TryGetPropertyInt64 reached it from C. 0 = *pres is filled, 7 = the caller must return that step code. */
@@ -19150,6 +19176,10 @@ typedef struct JSProxySet { JSValue target; JSValue value; JSAtom atom; bool thr
 static JSValue js_proxy_get_invariant(JSContext *ctx, JSValueConst target, JSAtom atom, JSValue ret);
 static int js_proxy_has_invariant(JSContext *ctx, JSValueConst target, JSAtom atom, int ret);
 static int js_proxy_delete_invariant(JSContext *ctx, JSValueConst target, JSAtom atom, int ret);
+static int js_proxy_define_invariant(JSContext *ctx, JSValueConst target, JSAtom prop, JSValueConst val,
+                                     JSValueConst getter, JSValueConst setter, int flags, bool ret);
+static JSValue js_create_desc(JSContext *ctx, JSValueConst val, JSValueConst getter, JSValueConst setter,
+                              int flags);
 #define CONT_GETPROP       22  /* cont_state = JSGetProp: a keyed property OPERATION requested by a STEP MACHINE —
                                   a READ (step code 6) or a HasProperty (step code 7).
                                   The read can run user code two ways — a bytecode accessor, or a Proxy `get` trap —
@@ -19176,6 +19206,12 @@ typedef struct JSGetProp {
 #define GP_GET 0
 #define GP_HAS 1
 #define GP_SET 2
+#define GP_DEFINE 4   /* step code 10. CreateDataPropertyOrThrow(O, P, V) — a DefineOwnProperty, which on a Proxy
+                         is the `defineProperty` trap and therefore the page's code. Every builtin that FILLS a
+                         result object performs it (Array.of, Array.from, concat, slice, Object.fromEntries), and
+                         each did it from C. Only the CreateDataProperty shape is expressed: a data descriptor
+                         with all three attributes true, which is what every one of those sites needs; a machine
+                         wanting another shape has to say so rather than have this guess. */
 #define GP_DELETE 3   /* step code 9. copyWithin removes the target index when the source one is absent, which is
                          the page's `deleteProperty` trap on a Proxy — the same shape as has/get/set, differing
                          only in the trap name, the invariant and the absent result. */
@@ -23382,7 +23418,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     *sp++ = r;
                     BREAK;
                 }
-                if (st == 6 || st == 7 || st == 8 || st == 9) {
+                if (st == 6 || st == 7 || st == 8 || st == 9 || st == 10) {
                     /* GETPROP (6) / HASPROPERTY (7) / SETPROP (8) / DELETE (9): *out_cb is [obj] — plus [value] for the write —
                        and *out_argc is the ATOM, the same shape as TOPRIMITIVE passing its hint. A prologue reads
                        `length`, `constructor`, `@@species`; a search loop asks whether index k is present; a copy
@@ -23390,8 +23426,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        code the machine must not drive itself. */
                     gp_outer = stt; gp_outer_kind = CONT_STEP;
                     gp_obj = cb[0]; gp_atom = (JSAtom)cbn;
-                    gp_op = (st == 7) ? GP_HAS : (st == 8) ? GP_SET : (st == 9) ? GP_DELETE : GP_GET;
-                    gp_val = (st == 8) ? cb[1] : JS_UNDEFINED;
+                    gp_op = (st == 7) ? GP_HAS : (st == 8) ? GP_SET : (st == 9) ? GP_DELETE
+                          : (st == 10) ? GP_DEFINE : GP_GET;
+                    gp_val = (st == 8 || st == 10) ? cb[1] : JS_UNDEFINED;
                     goto do_getprop_tramp;
                 }
                 if (st == 5) {
@@ -23824,7 +23861,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         JSProxyData *pd = get_proxy_method(ctx, &method, gp_obj,
                                                           gp_op == GP_HAS ? JS_ATOM_has :
                                                           gp_op == GP_SET ? JS_ATOM_set :
-                                                          gp_op == GP_DELETE ? JS_ATOM_deleteProperty : JS_ATOM_get);
+                                                          gp_op == GP_DELETE ? JS_ATOM_deleteProperty :
+                                                          gp_op == GP_DEFINE ? JS_ATOM_defineProperty : JS_ATOM_get);
                         if (!pd) goto getprop_throw;               /* revoked, or the handler's own get threw */
                         if (JS_IsUndefined(method)) {
                             gp_fwd = pd->target;                   /* no trap: forward, exactly once */
@@ -23872,6 +23910,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         /* Set(O, P, V, true): the write yields nothing to the machine, only its throw. */
                         if (unlikely(JS_SetPropertyInternal2(ctx, fwd ? gp_fwd : gp_obj, gp_atom, js_dup(gp_val),
                                                              gp_obj, JS_PROP_THROW) < 0))
+                            goto getprop_throw;
+                        ret_val = JS_UNDEFINED;
+                    } else if (gp_op == GP_DEFINE) {
+                        /* CreateDataPropertyOrThrow(O, P, V): yields nothing but its throw either. A trapless
+                           proxy's own define forwards to the TARGET, with no receiver in the operation at all. */
+                        if (unlikely(JS_DefinePropertyValue(ctx, fwd ? gp_fwd : gp_obj, gp_atom, js_dup(gp_val),
+                                                            JS_PROP_C_W_E | JS_PROP_THROW) < 0))
                             goto getprop_throw;
                         ret_val = JS_UNDEFINED;
                     } else if (fwd) {
@@ -23932,6 +23977,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        receiver) four. */
                     if (gp_op == GP_HAS || gp_op == GP_DELETE) {
                         gp->nargs = 2;   /* has(target, key) / deleteProperty(target, key) */
+                    } else if (gp_op == GP_DEFINE) {
+                        /* defineProperty(target, key, descriptor). FromPropertyDescriptor builds the descriptor
+                           OBJECT the trap sees, and this request only ever expresses CreateDataProperty's shape. */
+                        JSValue d5 = js_create_desc(ctx, gp_val, JS_UNDEFINED, JS_UNDEFINED,
+                                                    JS_PROP_HAS_VALUE | JS_PROP_HAS_WRITABLE |
+                                                    JS_PROP_HAS_ENUMERABLE | JS_PROP_HAS_CONFIGURABLE |
+                                                    JS_PROP_C_W_E);
+                        if (unlikely(JS_IsException(d5))) { js_getprop_free(ctx, gp); goto getprop_throw; }
+                        gp->cb[4] = d5;
+                        gp->nargs = 3;
                     } else if (gp_op == GP_SET) {
                         gp->cb[4] = js_dup(gp_val);
                         gp->cb[5] = js_dup(gp_obj);                          /* receiver IS the proxy */
@@ -25997,6 +26052,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (dres < 0) ret_val = JS_EXCEPTION;
                         else if (!dres) { JS_ThrowTypeError(ctx, "proxy: cannot delete property"); ret_val = JS_EXCEPTION; }
                         else ret_val = JS_UNDEFINED;
+                    } else if (gp->op == GP_DEFINE) {
+                        /* the `defineProperty` trap's boolean owes the target's [[DefineOwnProperty]] invariant,
+                           and then — because every consumer performs CreateDataPropertyOrThrow — a TypeError when
+                           it is false. The invariant's own THROW flag covers that, so it is passed. */
+                        int fres = js_proxy_define_invariant(ctx, gp->target, gp->atom, gp->value,
+                                                             JS_UNDEFINED, JS_UNDEFINED,
+                                                             JS_PROP_HAS_VALUE | JS_PROP_HAS_WRITABLE |
+                                                             JS_PROP_HAS_ENUMERABLE | JS_PROP_HAS_CONFIGURABLE |
+                                                             JS_PROP_C_W_E | JS_PROP_THROW,
+                                                             JS_ToBoolFree(ctx, ret_val));
+                        ret_val = (fres < 0) ? JS_EXCEPTION : JS_UNDEFINED;
                     } else if (gp->op == GP_SET) {
                         /* A SETTER yields nothing at all; a `set` TRAP yields a boolean that owes the target's
                            [[Set]] invariant and then, because every consumer of this request performs
@@ -53917,18 +53983,19 @@ static bool tramp_can_call_ta_from_consume(JSContext *ctx, JSValueConst func, JS
    Stages: 0 request the Construct (or make the plain array and fall straight through), 1 fill the result. */
 typedef struct JSArrayOf {
     JSStepHdr hdr;
-    JSValue result;
+    JSValue result;   /* the object being filled — also the RESULT (owned) */
+    int i;
 } JSArrayOf;
 
 static int js_array_of_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSArrayOf *s = st;
-    JSValue obj;
-    int i;
+    int r;
 
     if (s->hdr.stage == 0) {
-        JS_FreeValue(ctx, cb_result);
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         s->result = JS_UNDEFINED;
+        s->i = 0;
         s->hdr.stage = 1;
         if (JS_IsConstructor(ctx, s->hdr.this_val)) {
             s->hdr.cb_coerce[0] = s->hdr.this_val;        /* borrowed: the header owns the receiver */
@@ -53936,24 +54003,27 @@ static int js_array_of_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
             *out_cb = s->hdr.cb_coerce; *out_argc = 1;
             return 4;
         }
-        obj = JS_NewArray(ctx);
-        if (JS_IsException(obj))
-            return -1;
-    } else {
-        obj = cb_result;   /* the constructed object, owned */
+        s->result = JS_NewArray(ctx);   /* ArrayCreate(0): no user code at all */
+        if (JS_IsException(s->result)) { s->result = JS_UNDEFINED; return -1; }
+        s->hdr.stage = 2;
     }
-    for(i = 0; i < s->hdr.argc; i++) {
-        if (JS_CreateDataPropertyUint32Const(ctx, obj, i, step_arg(&s->hdr, i),
-                                             JS_PROP_THROW) < 0) {
-            goto fail;
-        }
+    if (s->hdr.stage == 1) {
+        s->result = cb_result;   /* the constructed object, owned */
+        cb_result = JS_UNDEFINED;
+        s->hdr.stage = 2;
     }
-    if (JS_SetProperty(ctx, obj, JS_ATOM_length, js_uint32(s->hdr.argc)) < 0) {
-    fail:
-        JS_FreeValue(ctx, obj);
-        return -1;
+    /* steps 5 and 6 are the PAGE's on a Proxy or a subclass: CreateDataPropertyOrThrow is a defineProperty trap
+       and Set(A,"length") a setter, and both ran from C inside this body. */
+    while (s->hdr.stage == 2) {
+        if (s->i >= s->hdr.argc) { JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED; s->hdr.stage = 3; break; }
+        r = step_defidx_run(ctx, &s->hdr, s->result, s->i, step_arg(&s->hdr, s->i), cb_result, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->i++;
     }
-    s->result = obj;
+    r = step_setprop_run(ctx, &s->hdr, s->result, JS_ATOM_length, js_uint32(s->hdr.argc), cb_result,
+                         out_cb, out_argc);
+    if (r) return r < 0 ? -1 : r;
     return 0;
 }
 
@@ -65284,6 +65354,22 @@ static int js_proxy_define_own_property(JSContext *ctx, JSValueConst obj,
     if (JS_IsException(ret1))
         return -1;
     ret = JS_ToBoolFree(ctx, ret1);
+    return js_proxy_define_invariant(ctx, s->target, prop, val, getter, setter, flags, ret);
+}
+
+/* [[DefineOwnProperty]] invariant (10.5.6 steps 13-16): a trap that reports SUCCESS must be consistent with the
+   target's own property and with its extensibility. ONE implementation, shared by the C path above and by the
+   trampolined trap's continuation — it runs on the trap's RESULT, so the tramp path can only honour it from a
+   continuation, exactly as [[Get]]'s, [[HasProperty]]'s and [[Delete]]'s do. `ret` is the trap's boolean;
+   returns 1, 0 (rejected with no THROW flag), or -1 having thrown. */
+static int js_proxy_define_invariant(JSContext *ctx, JSValueConst target, JSAtom prop, JSValueConst val,
+                                     JSValueConst getter, JSValueConst setter, int flags, bool ret)
+{
+    JSObject *p;
+    JSPropertyDescriptor desc;
+    int res;
+    bool setting_not_configurable;
+
     if (!ret) {
         if (flags & JS_PROP_THROW) {
             JS_ThrowTypeError(ctx, "proxy: defineProperty exception");
@@ -65292,7 +65378,7 @@ static int js_proxy_define_own_property(JSContext *ctx, JSValueConst obj,
             return 0;
         }
     }
-    p = JS_VALUE_GET_OBJ(s->target);
+    p = JS_VALUE_GET_OBJ(target);
     res = JS_GetOwnPropertyInternal(ctx, &desc, p, prop);
     if (res < 0)
         return -1;
