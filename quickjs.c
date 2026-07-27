@@ -22745,6 +22745,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        one that is about to be freed is a dangling arg_buf even when nothing reads it. */
                     narg_buf = call_args_owned ? NULL : (JSValue *)call_argv;   /* else: the caller stack (borrowed) */
                 }
+                /* the RECEIVER is read out of the operands BEFORE the list is released. For an OWNED invocation
+                   call_argv points INTO that list (the bound arm's [this, f, args...]), so reading call_argv[-2]
+                   after the free is a use-after-free — the same borrow `nfunc` takes, and `nfunc` was already
+                   read into a local up here for exactly that reason. The frame BORROWS this receiver
+                   (ntf->this_val is JSValueConst and nothing frees it); what keeps it alive is what keeps the
+                   callee alive — the caller's own operand, which this call never touches. */
+                this_obj = (tramp_first == -2) ? call_argv[-2] : JS_UNDEFINED;
                 if (call_args_owned) {   /* copied into the callee's own arg_buf above */
                     free_arg_list(ctx, call_args_owned, call_args_owned_n);
                     call_args_owned = NULL; call_args_owned_n = 0;
@@ -22760,7 +22767,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 nsf->prev_frame = rt->current_stack_frame;
                 rt->current_stack_frame = nsf;
                 tf_top = ntf;
-                this_obj = (tramp_first == -2) ? call_argv[-2] : JS_UNDEFINED;
                 new_target = JS_UNDEFINED;
                 ntf->this_val = this_obj; ntf->new_target = new_target;
                 ntf->arg_allocated = narg_alloc; ntf->callee_argc = eff_argc;
