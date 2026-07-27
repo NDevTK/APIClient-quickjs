@@ -20097,6 +20097,10 @@ typedef struct {
 #define SETOP_UNION      0   /* add each key to r (internal append — spec forbids calling r.add) */
 #define SETOP_SYMDIFF    1   /* key in THIS -> delete from r; key in neither -> add to r (insertion order preserved) */
 #define SETOP_SUPERSET   2   /* every key must be in THIS; a miss short-circuits false and CLOSES the iterator */
+#define SETOP_DISJOINT   4   /* 24.2.4.5: no element in common. The ONLY set-operation whose WALK is chosen at
+                                run time — THIS's records against other.has when THIS is the smaller side, else
+                                other's keys() against THIS's [[SetData]] — which is why the machine picks it once
+                                the record is complete rather than the dispatch picking it up front. */
 #define SETOP_SUBSET     3   /* the OTHER direction, and the other WALK: every record of THIS must satisfy
                                 other.has(element). There is no keys() iterator here — THIS's own [[SetData]] is
                                 walked, which invokes nothing — so the only user code is the per-element `has`
@@ -53985,8 +53989,8 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
                            JS_ThrowTypeError(ctx, ".has is not a function"); return -1; }
                 /* union/symmetricDifference/isSupersetOf consult THIS and never call it — it only has to EXIST.
                    The has-WALK calls it per element, so it keeps it. */
-                if (s->setop == SETOP_SUBSET) s->setrec_has = res;
-                else                          JS_FreeValue(ctx, res);
+                if (s->setop == SETOP_SUBSET || s->setop == SETOP_DISJOINT) s->setrec_has = res;
+                else                                                         JS_FreeValue(ctx, res);
                 s->setrec_ph = 3;
             } else {
                 DCHECK(s->setrec_ph == 3, "GetSetRecord: unknown phase");
@@ -54014,6 +54018,14 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
                    touched. Otherwise walk THIS's own records — no iterator protocol, nothing to close — calling
                    other.has per element on the tramp. */
                 if (ss->record_count > s->setrec_size) { s->r = js_bool(false); return 0; }
+                s->iter = js_create_map_iterator(ctx, s->adder, 0, NULL, MAGIC_SET);
+                if (JS_IsException(s->iter)) { s->iter = JS_UNDEFINED; return -1; }
+                goto setop_has_walk;
+            }
+            if (s->setop == SETOP_DISJOINT) {
+                /* 24.2.4.5 step 5 vs 6: the size decides WHICH side is walked, and both walks already exist. */
+                s->k = 1;   /* the keys branch's running answer: disjoint so far */
+                if (ss->record_count > s->setrec_size) return 12;   /* walk other.keys() against THIS */
                 s->iter = js_create_map_iterator(ctx, s->adder, 0, NULL, MAGIC_SET);
                 if (JS_IsException(s->iter)) { s->iter = JS_UNDEFINED; return -1; }
                 goto setop_has_walk;
@@ -54047,8 +54059,10 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
         JS_FreeValue(ctx, s->cb_value); s->cb_value = JS_UNDEFINED;
         if (JS_IsException(res)) return -1;
         ok = JS_ToBoolFree(ctx, res);
-        DCHECK(s->setop == SETOP_SUBSET, "a `has` call came back to a set-operation that never makes one");
-        if (!ok) { s->r = js_bool(false); return 0; }   /* isSubsetOf: one miss decides it */
+        DCHECK(s->setop == SETOP_SUBSET || s->setop == SETOP_DISJOINT,
+               "a `has` call came back to a set-operation that never makes one");
+        /* isSubsetOf is decided by a MISS, isDisjointFrom by a HIT — the same walk, opposite polarity. */
+        if (ok == (s->setop == SETOP_DISJOINT)) { s->r = js_bool(false); return 0; }
     setop_has_walk:
         for (;;) {
             JSValue item;
@@ -54268,7 +54282,8 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
     }
     if (s->closing) {   /* the short-circuit close has run (result already decided): finish */
         if (JS_VALUE_GET_TAG(res) != JS_TAG_UNINITIALIZED) JS_FreeValue(ctx, res);
-        if (s->sink == ITERCONS_SETOP && s->setop == SETOP_SUPERSET) s->r = js_bool(s->k != 0);
+        if (s->sink == ITERCONS_SETOP && (s->setop == SETOP_SUPERSET || s->setop == SETOP_DISJOINT))
+            s->r = js_bool(s->k != 0);
         return 0;
     }
     if (JS_VALUE_GET_TAG(res) != JS_TAG_UNINITIALIZED) {
@@ -54292,7 +54307,8 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
                 goto ta_map_loop;
             }
             if (s->sink == ITERCONS_SUMPRECISE) s->r = js_float64(sum_precise_get_result(&s->sum));
-            if (s->sink == ITERCONS_SETOP && s->setop == SETOP_SUPERSET) s->r = js_bool(s->k != 0);
+            if (s->sink == ITERCONS_SETOP && (s->setop == SETOP_SUPERSET || s->setop == SETOP_DISJOINT))
+            s->r = js_bool(s->k != 0);
             if (s->sink == ITERCONS_ITERTERM) {
                 if (s->setop == ITERTERM_SOME) s->r = js_bool(false);
                 else if (s->setop == ITERTERM_EVERY) s->r = js_bool(true);
@@ -54395,17 +54411,20 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
         } else if (s->sink == ITERCONS_SETOP) {
             /* Set.prototype.union / symmetricDifference: fold setlike.keys() into r (already seeded with THIS set's
                records). The spec mutates r's [[SetData]] directly — an observable r.add must NOT be called. */
-            JSMapState *rs = (s->setop == SETOP_SUPERSET) ? NULL : JS_GetOpaque(s->r, JS_CLASS_SET);
+            JSMapState *rs = (s->setop == SETOP_SUPERSET || s->setop == SETOP_DISJOINT)
+                             ? NULL : JS_GetOpaque(s->r, JS_CLASS_SET);
             JSMapState *ts = JS_GetOpaque(s->adder, JS_CLASS_SET);   /* THIS set */
             JSMapRecord *mr;
             DCHECK(ts != NULL, "SETOP consume: adder must hold the THIS Set");
-            DCHECK(rs != NULL || s->setop == SETOP_SUPERSET, "SETOP consume: r must be the result Set");
+            DCHECK(rs != NULL || s->setop == SETOP_SUPERSET || s->setop == SETOP_DISJOINT,
+                   "SETOP consume: r must be the result Set");
             value = map_normalize_key(ctx, value);
-            if (s->setop == SETOP_SUPERSET) {
+            if (s->setop == SETOP_SUPERSET || s->setop == SETOP_DISJOINT) {
+                /* isSupersetOf is decided by a MISS, isDisjointFrom by a HIT — one walk, opposite polarity. */
                 bool found = (NULL != map_find_record(ctx, ts, value));
                 JS_FreeValue(ctx, value);
-                if (found) return 1;
-                s->k = 0;            /* a miss decides false */
+                if (found != (s->setop == SETOP_DISJOINT)) return 1;
+                s->k = 0;            /* the deciding element */
                 s->closing = 1;      /* spec: IteratorClose before returning */
                 return 2;            /* close the iterator (on the tramp if it is a generator), then finish */
             }
@@ -68450,76 +68469,6 @@ fail:
     return -1;
 }
 
-static JSValue js_set_isDisjointFrom(JSContext *ctx, JSValueConst this_val,
-                                     int argc, JSValueConst *argv)
-{
-    JSValue has, item, iter, keys, next, rv, rval;
-    JSValueConst setlike;
-    int done;
-    bool found;
-    JSMapState *s;
-    uint64_t size;
-    int ok;
-
-    s = JS_GetOpaque2(ctx, this_val, JS_CLASS_SET);
-    if (!s)
-        return JS_EXCEPTION;
-    setlike = argv[0];
-    if (js_setlike_get_props(ctx, setlike, &size, &has, &keys) < 0)
-        return JS_EXCEPTION;
-    iter = JS_UNDEFINED;
-    next = JS_UNDEFINED;
-    rval = JS_EXCEPTION;
-    if (s->record_count > size) {
-        iter = JS_Call(ctx, keys, setlike, 0, NULL);
-        if (JS_IsException(iter))
-            goto exception;
-        next = JS_GetProperty(ctx, iter, JS_ATOM_next);
-        if (JS_IsException(next))
-            goto exception;
-        found = false;
-        for (;;) {
-            item = JS_IteratorNext(ctx, iter, next, 0, NULL, &done);
-            if (JS_IsException(item))
-                goto exception;
-            if (done) // item is JS_UNDEFINED
-                break;
-            item = map_normalize_key(ctx, item);
-            found = (NULL != map_find_record(ctx, s, item));
-            JS_FreeValue(ctx, item);
-            if (!found)
-                continue;
-            if (JS_IteratorClose(ctx, iter, /*is_exception_pending*/false) < 0)
-                goto exception;
-            break;
-        }
-    } else {
-        iter = js_create_map_iterator(ctx, this_val, 0, NULL, MAGIC_SET);
-        if (JS_IsException(iter))
-            goto exception;
-        found = false;
-        do {
-            item = js_map_iterator_next(ctx, iter, 0, NULL, &done, MAGIC_SET);
-            if (JS_IsException(item))
-                goto exception;
-            if (done) // item is JS_UNDEFINED
-                break;
-            rv = JS_Call(ctx, has, setlike, 1, vc(&item));
-            JS_FreeValue(ctx, item);
-            ok = JS_ToBoolFree(ctx, rv); // returns -1 if rv is JS_EXCEPTION
-            if (ok < 0)
-                goto exception;
-            found = (ok > 0);
-        } while (!found);
-    }
-    rval = !found ? JS_TRUE : JS_FALSE;
-exception:
-    JS_FreeValue(ctx, has);
-    JS_FreeValue(ctx, keys);
-    JS_FreeValue(ctx, iter);
-    JS_FreeValue(ctx, next);
-    return rval;
-}
 
 
 /* DELETED: js_set_isSupersetOf. The whole operation is do_setop_consume_tramp — the setlike's props read in spec
@@ -68780,7 +68729,7 @@ static const JSCFunctionListEntry js_set_proto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("clear", 0, js_map_clear, MAGIC_SET ),
     JS_CGETSET_MAGIC_DEF("size", js_map_get_size, NULL, MAGIC_SET ),
     JS_CFUNC_MAGIC_DEF("forEach", 1, js_map_forEach, MAGIC_SET ),
-    JS_CFUNC_DEF("isDisjointFrom", 1, js_set_isDisjointFrom ),
+    JS_CFUNC_CONSUME_DEF("isDisjointFrom", 1, ITERCONS_SETOP_BASE + SETOP_DISJOINT ),
     JS_CFUNC_CONSUME_DEF("isSubsetOf", 1, ITERCONS_SETOP_BASE + SETOP_SUBSET ),
     JS_CFUNC_CONSUME_DEF("isSupersetOf", 1, ITERCONS_SETOP_BASE + SETOP_SUPERSET ),
     JS_CFUNC_DEF("intersection", 1, js_set_intersection ),
