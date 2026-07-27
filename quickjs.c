@@ -1455,6 +1455,10 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_REGEXP_EXEC, STEPDEF_REGEXP_TEST,
     STEPDEF_ITER_TAKE, STEPDEF_ITER_DROP, STEPDEF_ITER_WRAP_RETURN,
     STEPDEF_ITER_CONCAT_NEXT, STEPDEF_ITER_CONCAT_RETURN,
+    /* one per error KIND: a step constructor's magic IS its definition id, so the kind cannot also ride there.
+       The block is contiguous and indexed by JSErrorEnum, with JS_PLAIN_ERROR last. */
+    STEPDEF_ERROR_CTOR_BASE,
+    STEPDEF_ERROR_CTOR_LAST = STEPDEF_ERROR_CTOR_BASE + JS_PLAIN_ERROR,
     STEPDEF_FUNCTION_CTOR, STEPDEF_GENERATOR_FUNCTION_CTOR,
     STEPDEF_ASYNC_FUNCTION_CTOR, STEPDEF_ASYNC_GENERATOR_FUNCTION_CTOR,
     STEPDEF_DV_FIRST,
@@ -1495,8 +1499,6 @@ static JSValue js_array_push(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv, int unshift);
 static JSValue js_array_constructor(JSContext *ctx, JSValueConst new_target,
                                     int argc, JSValueConst *argv);
-static JSValue js_error_constructor(JSContext *ctx, JSValueConst new_target,
-                                    int argc, JSValueConst *argv, int magic);
 
 typedef enum JSStrictEqModeEnum {
     JS_EQ_STRICT,
@@ -9238,9 +9240,9 @@ static JSValue js_bytecode_autoinit(JSContext *ctx, JSObject *p, JSAtom atom,
                 /* the same builtin the global one is: a step ctor, so the helper's `new C(n)` performs
                    new.target's `prototype` read on the tramp like any other construct */
                 JS_NewCFunctionMagic(ctx, NULL, "Array", 1, JS_CFUNC_step_ctor, STEPDEF_ARRAY_CTOR),
-                JS_NewCFunctionMagic(ctx, js_error_constructor, "TypeError",
-                                     1, JS_CFUNC_constructor_or_func_magic,
-                                     JS_TYPE_ERROR),
+                JS_NewCFunctionMagic(ctx, NULL, "TypeError",
+                                     1, JS_CFUNC_step_ctor,
+                                      STEPDEF_ERROR_CTOR_BASE + JS_TYPE_ERROR),
                 JS_AtomToValue(ctx, JS_ATOM_Symbol_asyncIterator),
                 /* the same builtin the global one is: a step machine, so the helper's call to it routes
                    through the interpreter's dispatch like any other */
@@ -9256,12 +9258,12 @@ static JSValue js_bytecode_autoinit(JSContext *ctx, JSObject *p, JSAtom atom,
         {
             JSValue argv[] = {
                 js_dup(ctx->class_proto[JS_CLASS_ITERATOR_HELPER]),
-                JS_NewCFunctionMagic(ctx, js_error_constructor, "InternalError",
-                                     1, JS_CFUNC_constructor_or_func_magic,
-                                     JS_INTERNAL_ERROR),
-                JS_NewCFunctionMagic(ctx, js_error_constructor, "TypeError",
-                                     1, JS_CFUNC_constructor_or_func_magic,
-                                     JS_TYPE_ERROR),
+                JS_NewCFunctionMagic(ctx, NULL, "InternalError",
+                                     1, JS_CFUNC_step_ctor,
+                                      STEPDEF_ERROR_CTOR_BASE + JS_INTERNAL_ERROR),
+                JS_NewCFunctionMagic(ctx, NULL, "TypeError",
+                                     1, JS_CFUNC_step_ctor,
+                                      STEPDEF_ERROR_CTOR_BASE + JS_TYPE_ERROR),
                 JS_NewCFunction(ctx, js_call_function, "call", 2),
                 JS_AtomToValue(ctx, JS_ATOM_Symbol_iterator),
             };
@@ -9275,12 +9277,12 @@ static JSValue js_bytecode_autoinit(JSContext *ctx, JSObject *p, JSAtom atom,
         {
             JSValue argv[] = {
                 js_dup(ctx->class_proto[JS_CLASS_ITERATOR_HELPER]),
-                JS_NewCFunctionMagic(ctx, js_error_constructor, "InternalError",
-                                     1, JS_CFUNC_constructor_or_func_magic,
-                                     JS_INTERNAL_ERROR),
-                JS_NewCFunctionMagic(ctx, js_error_constructor, "TypeError",
-                                     1, JS_CFUNC_constructor_or_func_magic,
-                                     JS_TYPE_ERROR),
+                JS_NewCFunctionMagic(ctx, NULL, "InternalError",
+                                     1, JS_CFUNC_step_ctor,
+                                      STEPDEF_ERROR_CTOR_BASE + JS_INTERNAL_ERROR),
+                JS_NewCFunctionMagic(ctx, NULL, "TypeError",
+                                     1, JS_CFUNC_step_ctor,
+                                      STEPDEF_ERROR_CTOR_BASE + JS_TYPE_ERROR),
                 JS_NewCFunction(ctx, js_call_function, "call", 2),
                 JS_NewCFunction(ctx, js_hasOwnEnumProperty,
                                 "hasOwnEnumProperty", 2),
@@ -18340,6 +18342,25 @@ static int step_defidx_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, int64
     return 0;
 }
 
+/* HasProperty(O, key) for a NAMED key, borrowed from the caller — InstallErrorCause asks it of `options`, which
+   can be a Proxy whose `has` trap is the page's code. Same request as the read, asking the other question. */
+static int step_hasprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAtom atom, JSValue in,
+                            int *pres, JSValue **out_cb, int *out_argc)
+{
+    if (h->get_phase == GET_PH_START) {
+        int r;
+        JS_FreeValue(ctx, in);
+        r = step_getprop_begin(ctx, h, obj, JS_DupAtom(ctx, atom), out_cb, out_argc);
+        return (r == 6) ? 7 : r;
+    }
+    *pres = JS_ToBool(ctx, in);
+    JS_FreeValue(ctx, in);
+    JS_FreeAtom(ctx, h->get_atom);
+    h->get_atom = JS_ATOM_NULL;
+    h->get_phase = GET_PH_START;
+    return 0;
+}
+
 /* HasProperty(O, ! ToString(𝔽(idx))) — the OTHER half of the element access indexOf/lastIndexOf perform, which
    skip holes and so must ask before they read. A Proxy `has` trap is the page's code exactly as `get` is, and
    JS_TryGetPropertyInt64 reached it from C. 0 = *pres is filled, 7 = the caller must return that step code. */
@@ -19816,6 +19837,10 @@ static void js_iter_helper_drop_consumer(JSContext *ctx, JSIteratorHelperData *i
     }
     if (!cons)
         return;
+    if (ck == CONT_STEP) {   /* a step machine was holding this helper: it can never be re-entered either */
+        tramp_step_chain_free(ctx, cons);
+        return;
+    }
     DCHECK(ck == CONT_ITER_CONSUME_FWD,
            "an abrupt helper source has a consumer kind whose teardown is not built");
     js_iter_consume_end(ctx, (struct JSIterConsume *)cons);
@@ -20610,6 +20635,25 @@ typedef struct JSDateToPrim {
    `toISOString` read, and the call — and js_date_toJSON ran all three from a C entry, so
    `Date.prototype.toJSON.call({valueOf(){ while(x){} }})` preempted with no flow base. It is also the C site that
    reaches the intrinsic Object.prototype.toString through OrdinaryToPrimitive. */
+/* 20.5.1.1 Error / 20.5.6.1.1 NativeError / 20.5.7.1.1 AggregateError / SuppressedError — ONE algorithm with a
+   KIND parameter, and every step of it is the page's code. OrdinaryCreateFromConstructor reads `prototype` off
+   the new target (a subclass accessor, a Proxy trap); ToString(message) runs the page's toString/@@toPrimitive;
+   InstallErrorCause asks `options` a HasProperty and then a Get; and AggregateError ITERATES its errors
+   argument — GetIterator, the `next` read, and a .next()/done/value loop. js_error_constructor ran all of it
+   from a C entry, so `new Error({toString(){while(x){}}})` aborted at its back-edge and
+   `new AggregateError(gen)` drove the generator to completion through iterator_to_array. */
+typedef struct JSErrorCtor {
+    JSStepHdr hdr;    /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    JSValue obj;      /* the error being built (owned) — and the result */
+    JSValue held;     /* whatever is held across one suspension: the message, the cause, an element (owned) */
+    JSValue iter;     /* AggregateError: the errors iterator (owned) */
+    JSValue next;     /* its .next method (owned) */
+    JSValue arr;      /* AggregateError: the collected list (owned) */
+    JSValue cb[2];    /* [receiver, method] — the CALL request */
+    int64_t k;        /* the collect index */
+    int present;      /* the HasProperty answer */
+} JSErrorCtor;
+
 /* Iterator.concat's lazy iterator. Its .next() walks a LIST of (iterable, @@iterator) pairs, and every step of
    that walk is the page's code: the @@iterator CALL, the `next` read, the .next() CALL, and the `done`/`value`
    reads off the result. js_iterator_concat_next ran all of them from a C entry with JS_GetIterator2,
@@ -24099,6 +24143,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     cd_outer = NULL; cd_outer_kind = CONT_NONE;
                     goto do_step_tramp;
                 }
+                if (tramp_can_call_iter_helper(call_argv[-1], call_argv[-2])) {
+                    /* the callee is a lazy Iterator HELPER's own .next(): it IS a machine of a different kind,
+                       driven by do_iter_helper_step, and calling it in place is js_iterator_helper_next's DFAIL.
+                       The same question the ONE .next() drive asks — a sequence asks it too, because a sequence
+                       can hold an iterator (AggregateError's errors walk) exactly as a consumer can. */
+                    JSIteratorHelperData *dh = JS_VALUE_GET_OBJ(call_argv[-2])->u.iterator_helper_data;
+                    dh->executing = 1; dh->resume_pc = ITHP_START;
+                    dh->drive_mode = ITH_CONSUME; dh->consumer = cd_outer; dh->consumer_kind = cd_outer_kind;
+                    cd_outer = NULL; cd_outer_kind = CONT_NONE;
+                    cont_st = dh;
+                    ret_val = JS_UNINITIALIZED;
+                    goto do_iter_helper_step;
+                }
                 {
                     int gmag = tramp_gen_method_magic(call_argv[-1], call_argv[-2]);
                     if (gmag >= 0) {
@@ -25911,6 +25968,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             if (ck == CONT_ITER_CONSUME) goto do_iter_consume_step;
                             if (ck == CONT_PROMISE_ALL) goto do_promise_all_step;
                             if (ck == CONT_ASYNC_FROM_SYNC) goto do_async_from_sync_step;
+                            if (ck == CONT_STEP) goto do_step_step;   /* a step machine holding the iterator */
                             DFAIL("do_iter_helper_step: ITH_CONSUME consumer_kind not routed");
                             goto exception;
                         }
@@ -53663,135 +53721,208 @@ static const JSCFunctionListEntry js_function_proto_funcs[] = {
                          offsetof(JSFunctionBytecode, col_num)),
 };
 
-/* Error class */
 
-static JSValue iterator_to_array(JSContext *ctx, JSValueConst items)
+enum { ERRC_PH_CREATE = 0, ERRC_PH_MSG, ERRC_PH_HASCAUSE, ERRC_PH_GETCAUSE,
+       ERRC_PH_ITERM, ERRC_PH_ITEROBJ, ERRC_PH_NEXTM, ERRC_PH_CALLNEXT,
+       ERRC_PH_DONE, ERRC_PH_VALUE, ERRC_PH_FINISH };
+
+/* which argument carries `message`, and where `options` starts, per kind — the whole of the spec's per-kind
+   branching before the tail. */
+static int js_error_ctor_opts(int kind)
 {
-    JSValue iter, next_method = JS_UNDEFINED;
-    JSValue v, r = JS_UNDEFINED;
-    int64_t k;
-    int done;
-
-    iter = JS_GetIterator(ctx, items, false);
-    if (JS_IsException(iter))
-        goto exception;
-    next_method = JS_GetProperty(ctx, iter, JS_ATOM_next);
-    if (JS_IsException(next_method))
-        goto exception;
-    r = JS_NewArray(ctx);
-    if (JS_IsException(r))
-        goto exception;
-    for (k = 0;; k++) {
-        v = JS_IteratorNext(ctx, iter, next_method, 0, NULL, &done);
-        if (JS_IsException(v))
-            goto exception_close;
-        if (done)
-            break;
-        if (JS_DefinePropertyValueInt64(ctx, r, k, v,
-                                        JS_PROP_C_W_E | JS_PROP_THROW) < 0)
-            goto exception_close;
-    }
- done:
-    JS_FreeValue(ctx, next_method);
-    JS_FreeValue(ctx, iter);
-    return r;
- exception_close:
-    JS_IteratorClose(ctx, iter, true);
- exception:
-    JS_FreeValue(ctx, r);
-    r = JS_EXCEPTION;
-    goto done;
+    if (kind == JS_AGGREGATE_ERROR) return 2;
+    if (kind == JS_SUPPRESSED_ERROR) return 3;
+    return 1;
 }
 
-static JSValue js_error_constructor(JSContext *ctx, JSValueConst new_target,
-                                    int argc, JSValueConst *argv, int magic)
+static int js_error_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    JSValue obj, msg, proto, cause;
-    JSValueConst message;
-    int present, opts;
+    JSErrorCtor *s = st;
+    int kind = s->hdr.arg, opts = js_error_ctor_opts(kind);
+    int r;
 
-    if (JS_IsUndefined(new_target))
-        new_target = JS_GetActiveFunction(ctx);
-    proto = JS_GetProperty(ctx, new_target, JS_ATOM_prototype);
-    if (JS_IsException(proto))
-        return proto;
-    if (!JS_IsObject(proto)) {
-        JSContext *realm;
-        JSValue proto1;
-
+    if (s->hdr.stage == ERRC_PH_CREATE) {
+        JSValue proto;
+        JSValueConst nt;
+        if (s->hdr.get_phase == GET_PH_START) {
+            /* the ONE-TIME init, guarded by the sub-sequence's own cursor rather than by the stage: the
+               `prototype` read below suspends WITHOUT advancing the stage, so a stage-only guard would skip the
+               resume entirely — and re-running the init would clobber everything the state holds.
+               FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
+            s->obj = JS_UNDEFINED; s->held = JS_UNDEFINED; s->iter = JS_UNDEFINED;
+            s->next = JS_UNDEFINED; s->arr = JS_UNDEFINED;
+            s->cb[0] = JS_UNDEFINED; s->cb[1] = JS_UNDEFINED;
+            s->k = 0; s->present = 0;
+        }
+        /* step 1: called as a FUNCTION, the new target is the active function — which for a step machine is the
+           callee it captured, not whatever frame happens to be running. */
+        nt = JS_IsUndefined(s->hdr.this_val) ? s->hdr.func_obj : s->hdr.this_val;
+        r = step_getprop_run(ctx, &s->hdr, nt, JS_ATOM_prototype, cb_result, &proto, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        if (!JS_IsObject(proto)) {
+            /* OrdinaryCreateFromConstructor's fallback: the intrinsic prototype of the NEW TARGET's realm. */
+            JSContext *realm;
+            JS_FreeValue(ctx, proto);
+            realm = JS_GetFunctionRealm(ctx, nt);
+            if (!realm) return -1;
+            proto = js_dup(kind == JS_PLAIN_ERROR ? realm->class_proto[JS_CLASS_ERROR]
+                                                  : realm->native_error_proto[kind]);
+        }
+        s->obj = JS_NewObjectProtoClass(ctx, proto, JS_CLASS_ERROR);
         JS_FreeValue(ctx, proto);
-        realm = JS_GetFunctionRealm(ctx, new_target);
-        if (!realm)
-            return JS_EXCEPTION;
-        if (magic < 0) {
-            proto1 = realm->class_proto[JS_CLASS_ERROR];
-        } else {
-            proto1 = realm->native_error_proto[magic];
-        }
-        proto = js_dup(proto1);
+        if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
+        s->hdr.stage = ERRC_PH_MSG;
     }
-    obj = JS_NewObjectProtoClass(ctx, proto, JS_CLASS_ERROR);
-    JS_FreeValue(ctx, proto);
-    if (JS_IsException(obj))
-        return obj;
-    switch (magic) {
-    case JS_AGGREGATE_ERROR:
-        message = argv[1];
-        opts = 2;
-        break;
-    case JS_SUPPRESSED_ERROR:
-        message = argv[2];
-        opts = 3;
-        break;
-    default:
-        message = argv[0];
-        opts = 1;
-    }
-
-    if (!JS_IsUndefined(message)) {
-        msg = JS_ToString(ctx, message);
-        if (unlikely(JS_IsException(msg)))
-            goto exception;
-        JS_DefinePropertyValue(ctx, obj, JS_ATOM_message, msg,
-                               JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
-    }
-
-    if (argc > opts && JS_VALUE_GET_TAG(argv[opts]) == JS_TAG_OBJECT) {
-        present = JS_HasProperty(ctx, argv[opts], JS_ATOM_cause);
-        if (unlikely(present < 0))
-            goto exception;
-        if (present) {
-            cause = JS_GetProperty(ctx, argv[opts], JS_ATOM_cause);
-            if (unlikely(JS_IsException(cause)))
-                goto exception;
-            JS_DefinePropertyValue(ctx, obj, JS_ATOM_cause, cause,
+    if (s->hdr.stage == ERRC_PH_MSG) {
+        JSValueConst message = step_arg(&s->hdr, opts - 1);
+        if (!JS_IsUndefined(message)) {
+            r = step_tostring_run(ctx, &s->hdr, message, cb_result, &s->held, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            JS_DefinePropertyValue(ctx, s->obj, JS_ATOM_message, s->held,
                                    JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+            s->held = JS_UNDEFINED;   /* the define consumed it */
+        }
+        s->hdr.stage = ERRC_PH_HASCAUSE;
+    }
+    if (s->hdr.stage == ERRC_PH_HASCAUSE) {
+        /* InstallErrorCause: only when `options` is an Object, and then a HasProperty before the Get. */
+        if (s->hdr.argc > opts && JS_VALUE_GET_TAG(s->hdr.argv[opts]) == JS_TAG_OBJECT) {
+            r = step_hasprop_run(ctx, &s->hdr, s->hdr.argv[opts], JS_ATOM_cause, cb_result,
+                                 &s->present, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+        } else {
+            s->present = 0;
+        }
+        s->hdr.stage = ERRC_PH_GETCAUSE;
+    }
+    if (s->hdr.stage == ERRC_PH_GETCAUSE) {
+        if (s->present) {
+            r = step_getprop_run(ctx, &s->hdr, s->hdr.argv[opts], JS_ATOM_cause, cb_result,
+                                 &s->held, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            JS_DefinePropertyValue(ctx, s->obj, JS_ATOM_cause, s->held,
+                                   JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+            s->held = JS_UNDEFINED;
+        }
+        s->hdr.stage = (kind == JS_AGGREGATE_ERROR) ? ERRC_PH_ITERM : ERRC_PH_FINISH;
+    }
+    /* ---- AggregateError's IteratorToList(GetIterator(errors, sync)) ---- */
+    if (s->hdr.stage == ERRC_PH_ITERM) {
+        JSValue m = JS_UNDEFINED;
+        r = step_getprop_run(ctx, &s->hdr, step_arg(&s->hdr, 0), JS_ATOM_Symbol_iterator, cb_result,
+                             &m, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        if (JS_IsUndefined(m) || JS_IsNull(m) || !JS_IsFunction(ctx, m)) {
+            JS_FreeValue(ctx, m);
+            JS_ThrowTypeError(ctx, "value is not iterable");
+            return -1;
+        }
+        s->arr = JS_NewArray(ctx);
+        if (JS_IsException(s->arr)) { s->arr = JS_UNDEFINED; JS_FreeValue(ctx, m); return -1; }
+        s->cb[0] = js_dup(step_arg(&s->hdr, 0));
+        s->cb[1] = m;
+        s->hdr.stage = ERRC_PH_ITEROBJ;
+        *out_cb = s->cb; *out_argc = 0;
+        return 3;
+    }
+    if (s->hdr.stage == ERRC_PH_ITEROBJ) {
+        JS_FreeValue(ctx, s->cb[0]); s->cb[0] = JS_UNDEFINED;
+        JS_FreeValue(ctx, s->cb[1]); s->cb[1] = JS_UNDEFINED;
+        if (!JS_IsObject(cb_result)) {   /* GetIterator step 5 */
+            JS_FreeValue(ctx, cb_result);
+            JS_ThrowTypeErrorNotAnObject(ctx);
+            return -1;
+        }
+        s->iter = cb_result; cb_result = JS_UNDEFINED;
+        s->hdr.stage = ERRC_PH_NEXTM;
+    }
+    if (s->hdr.stage == ERRC_PH_NEXTM) {
+        r = step_getprop_run(ctx, &s->hdr, s->iter, JS_ATOM_next, cb_result, &s->next, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = ERRC_PH_CALLNEXT;
+    }
+    /* the collect loop — entered only by AggregateError; every other kind reached FINISH above */
+    while (s->hdr.stage != ERRC_PH_FINISH) {
+        if (s->hdr.stage == ERRC_PH_CALLNEXT) {
+            s->cb[0] = js_dup(s->iter);
+            s->cb[1] = js_dup(s->next);
+            s->hdr.stage = ERRC_PH_DONE;
+            *out_cb = s->cb; *out_argc = 0;
+            return 3;
+        }
+        if (s->hdr.stage == ERRC_PH_DONE) {
+            if (JS_IsUndefined(s->held)) {   /* the .next() call just returned */
+                JS_FreeValue(ctx, s->cb[0]); s->cb[0] = JS_UNDEFINED;
+                JS_FreeValue(ctx, s->cb[1]); s->cb[1] = JS_UNDEFINED;
+                if (!JS_IsObject(cb_result)) {   /* IteratorNext step 3 */
+                    JS_FreeValue(ctx, cb_result);
+                    JS_ThrowTypeError(ctx, "iterator result not an object");
+                    return -1;
+                }
+                s->held = cb_result; cb_result = JS_UNDEFINED;
+            }
+            {
+                JSValue dv = JS_UNDEFINED;
+                r = step_getprop_run(ctx, &s->hdr, s->held, JS_ATOM_done, cb_result, &dv, out_cb, out_argc);
+                cb_result = JS_UNDEFINED;
+                if (r) return r < 0 ? -1 : r;
+                if (JS_ToBoolFree(ctx, dv)) {
+                    JS_FreeValue(ctx, s->held); s->held = JS_UNDEFINED;
+                    s->hdr.stage = ERRC_PH_FINISH;
+                    break;
+                }
+            }
+            s->hdr.stage = ERRC_PH_VALUE;
+        }
+        DCHECK(s->hdr.stage == ERRC_PH_VALUE, "the Error constructor's errors walk is in an unknown stage");
+        {
+            JSValue vv = JS_UNDEFINED;
+            r = step_getprop_run(ctx, &s->hdr, s->held, JS_ATOM_value, cb_result, &vv, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            JS_FreeValue(ctx, s->held); s->held = JS_UNDEFINED;
+            if (JS_DefinePropertyValueInt64(ctx, s->arr, s->k, vv, JS_PROP_C_W_E | JS_PROP_THROW) < 0)
+                return -1;
+            s->k++;
+            s->hdr.stage = ERRC_PH_CALLNEXT;
         }
     }
-
-    if (magic == JS_AGGREGATE_ERROR) {
-        JSValue error_list = iterator_to_array(ctx, argv[0]);
-        if (JS_IsException(error_list))
-            goto exception;
-        JS_DefinePropertyValue(ctx, obj, JS_ATOM_errors, error_list,
+    DCHECK(s->hdr.stage == ERRC_PH_FINISH, "the Error constructor finished in an unknown stage");
+    if (kind == JS_AGGREGATE_ERROR) {
+        JS_DefinePropertyValue(ctx, s->obj, JS_ATOM_errors, s->arr,
+                               JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+        s->arr = JS_UNDEFINED;
+    }
+    if (kind == JS_SUPPRESSED_ERROR) {
+        JS_DefinePropertyValue(ctx, s->obj, JS_ATOM_error, js_dup(step_arg(&s->hdr, 0)),
+                               JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+        JS_DefinePropertyValue(ctx, s->obj, JS_ATOM_suppressed, js_dup(step_arg(&s->hdr, 1)),
                                JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
     }
+    /* the Error() function itself is skipped in the backtrace, as it was from the C entry */
+    build_backtrace(ctx, s->obj, JS_UNDEFINED, NULL, 0, 0, JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL);
+    return 0;
+}
 
-    if (magic == JS_SUPPRESSED_ERROR) {
-        JS_DefinePropertyValue(ctx, obj, JS_ATOM_error,
-                               js_dup(argv[0]),
-                               JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
-        JS_DefinePropertyValue(ctx, obj, JS_ATOM_suppressed,
-                               js_dup(argv[1]),
-                               JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
-    }
-
-    /* skip the Error() function in the backtrace */
-    build_backtrace(ctx, obj, JS_UNDEFINED, NULL, 0, 0, JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL);
-    return obj;
- exception:
-    JS_FreeValue(ctx, obj);
-    return JS_EXCEPTION;
+static JSValue js_error_ctor_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSErrorCtor *s = st;
+    JSValue r = take_result ? s->obj : JS_UNDEFINED;
+    int i;
+    if (!take_result) JS_FreeValue(ctx, s->obj);
+    for (i = 0; i < 2; i++) JS_FreeValue(ctx, s->cb[i]);
+    JS_FreeValue(ctx, s->arr);
+    JS_FreeValue(ctx, s->next);
+    JS_FreeValue(ctx, s->iter);
+    JS_FreeValue(ctx, s->held);
+    js_free(ctx, s);
+    return r;
 }
 
 static JSValue js_error_toString(JSContext *ctx, JSValueConst this_val,
@@ -57015,6 +57146,16 @@ static const JSTrampStepDef js_dataview_ctor_def = { sizeof(JSDataViewCtor), js_
 static const JSTrampStepDef js_ab_slice_def      = { sizeof(JSABSlice), js_ab_slice_step, js_ab_slice_fini, JS_CLASS_ARRAY_BUFFER*2 + 0 };
 static const JSTrampStepDef js_ab_sliceImm_def   = { sizeof(JSABSlice), js_ab_slice_step, js_ab_slice_fini, JS_CLASS_ARRAY_BUFFER*2 + 1 };
 static const JSTrampStepDef js_sab_slice_def     = { sizeof(JSABSlice), js_ab_slice_step, js_ab_slice_fini, JS_CLASS_SHARED_ARRAY_BUFFER*2 + 0 };
+static int js_error_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_error_ctor_fini(JSContext *ctx, void *st, bool take_result);
+/* `arg` carries the KIND, which is the only thing that differs between the ten definitions. */
+#define ERRCTOR_DEF(k) { sizeof(JSErrorCtor), js_error_ctor_step, js_error_ctor_fini, (k) },
+static const JSTrampStepDef js_error_ctor_defs[JS_PLAIN_ERROR + 1] = {
+    ERRCTOR_DEF(0) ERRCTOR_DEF(1) ERRCTOR_DEF(2) ERRCTOR_DEF(3) ERRCTOR_DEF(4)
+    ERRCTOR_DEF(5) ERRCTOR_DEF(6) ERRCTOR_DEF(7) ERRCTOR_DEF(8) ERRCTOR_DEF(JS_PLAIN_ERROR)
+};
+#undef ERRCTOR_DEF
+_Static_assert(JS_PLAIN_ERROR == 9, "the error-constructor definition block is written out per kind");
 static int js_iter_concat_next_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_iter_concat_next_fini(JSContext *ctx, void *st, bool take_result);
 static const JSTrampStepDef js_iter_concat_next_def =
@@ -57393,6 +57534,10 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_ITER_WRAP_RETURN] = &js_iter_wrap_return_def,
     [STEPDEF_ITER_CONCAT_NEXT] = &js_iter_concat_next_def,
     [STEPDEF_ITER_CONCAT_RETURN] = &js_iter_concat_return_def,
+#define ERRCTOR_ROW(k) [STEPDEF_ERROR_CTOR_BASE + (k)] = &js_error_ctor_defs[k],
+    ERRCTOR_ROW(0) ERRCTOR_ROW(1) ERRCTOR_ROW(2) ERRCTOR_ROW(3) ERRCTOR_ROW(4)
+    ERRCTOR_ROW(5) ERRCTOR_ROW(6) ERRCTOR_ROW(7) ERRCTOR_ROW(8) ERRCTOR_ROW(JS_PLAIN_ERROR)
+#undef ERRCTOR_ROW
     [STEPDEF_REGEXP_EXEC]     = &js_regexp_exec_def,
     [STEPDEF_REGEXP_TEST]     = &js_re_test_def,
     [STEPDEF_FUNCTION_CTOR]   = &js_function_ctor_def,
@@ -73372,9 +73517,8 @@ int JS_AddIntrinsicBaseObjects(JSContext *ctx)
     ctx->function_ctor = obj1;
 
     /* Error */
-    ft.generic_magic = js_error_constructor;
-    ctx->error_ctor = JS_NewCFunctionMagic(ctx, js_error_constructor,
-                                           "Error", 1, JS_CFUNC_constructor_or_func_magic, -1);
+    ctx->error_ctor = JS_NewCFunctionMagic(ctx, NULL, "Error", 1, JS_CFUNC_step_ctor,
+                                           STEPDEF_ERROR_CTOR_BASE + JS_PLAIN_ERROR);
     if (JS_IsException(ctx->error_ctor))
         return -1;
     JS_NewGlobalCConstructor2(ctx, js_dup(ctx->error_ctor),
@@ -73395,9 +73539,9 @@ int JS_AddIntrinsicBaseObjects(JSContext *ctx)
         default:
             n_args = 1;
         }
-        func_obj = JS_NewCFunction3(ctx, ft.generic,
+        func_obj = JS_NewCFunction3(ctx, NULL,
                                     native_error_name[i], n_args,
-                                    JS_CFUNC_constructor_or_func_magic, i,
+                                    JS_CFUNC_step_ctor, STEPDEF_ERROR_CTOR_BASE + i,
                                     ctx->error_ctor, 0);
         if (JS_IsException(func_obj))
             return -1;
