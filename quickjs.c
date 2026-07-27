@@ -1461,6 +1461,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_NUM_TOSTRING, STEPDEF_NUM_TOLOCALESTRING, STEPDEF_NUM_TOFIXED,
     STEPDEF_NUM_TOEXPONENTIAL, STEPDEF_NUM_TOPRECISION, STEPDEF_NUM_CTOR,
     STEPDEF_ITERATOR_CTOR, STEPDEF_ARRAY_OF, STEPDEF_ARRAY_CONCAT,
+    STEPDEF_WEAKREF_CTOR, STEPDEF_FINREC_CTOR,
     STEPDEF_COUNT
 };
 #define HINT_NONE    2
@@ -17980,8 +17981,11 @@ typedef struct JSTrampStepDef {
     /* A VALIDATION the spec performs BEFORE the coercions — DataView's setters reject an immutable buffer
        before reading either argument, and test262 pins that ordering. It is part of the declaration because
        "everything before the coercions" is exactly what the machine has to reproduce; a builtin whose leading
-       check this cannot express does not carry the declaration at all. -1 = threw. */
-    int      (*precheck)(JSContext *ctx, JSValueConst this_val, int magic);
+       check this cannot express does not carry the declaration at all. -1 = threw.
+       It is handed THE INVOCATION, not a receiver and a magic: a leading check is as likely to be about an
+       ARGUMENT (FinalizationRegistry rejects a non-callable, WeakRef an unholdable target, both before the
+       `prototype` read) as about the receiver, and the header is what carries all of it. */
+    int      (*precheck)(JSContext *ctx, const struct JSStepHdr *h);
     /* A validation that runs between the FIRST coerced argument and the next one. DataView's setters must throw
        ToIndex's RangeError for a fractional byteOffset before the value's valueOf runs, and test262 pins that
        too. Like precheck it is part of the declaration: it names the computation the spec interleaves, and the
@@ -52061,7 +52065,7 @@ static int js_primargs_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
     if (s->hdr.stage == 0) {
         JS_FreeValue(ctx, cb_result);
         s->result = JS_UNDEFINED;
-        if (s->hdr.def->precheck && s->hdr.def->precheck(ctx, s->hdr.this_val, s->hdr.def->body_magic) < 0)
+        if (s->hdr.def->precheck && s->hdr.def->precheck(ctx, &s->hdr) < 0)
             return -1;
         s->nargp = s->hdr.argc > nargs ? s->hdr.argc : nargs;
         s->argp = js_malloc(ctx, sizeof(JSValue) * (size_t)(s->nargp > 0 ? s->nargp : 1));
@@ -52166,7 +52170,7 @@ static int js_creatector_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
         JS_FreeValue(ctx, cb_result);
         cb_result = JS_UNDEFINED;
         s->result = JS_UNDEFINED;
-        if (s->hdr.def->precheck && s->hdr.def->precheck(ctx, s->hdr.this_val, s->hdr.def->body_magic) < 0)
+        if (s->hdr.def->precheck && s->hdr.def->precheck(ctx, &s->hdr) < 0)
             return -1;
         s->hdr.stage = 1;
     }
@@ -55501,14 +55505,14 @@ static JSValue js_prop_walk_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_bigint_asUintN(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int asIntN);
 static JSValue js_object_getOwnPropertyDescriptor(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
 static JSValue js_create_iterator_helper(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
-static int js_iterator_helper_precheck(JSContext *ctx, JSValueConst this_val, int magic);
+static int js_iterator_helper_precheck(JSContext *ctx, const JSStepHdr *h);
 enum {
     JS_ARRAY_BUFFER_TRANSFER,
     JS_ARRAY_BUFFER_TRANSFER_TO_IMMUTABLE,
     JS_ARRAY_BUFFER_TRANSFER_TO_FIXED_LENGTH,
 };
-static int js_array_buffer_resize_precheck(JSContext *ctx, JSValueConst this_val, int class_id);
-static int js_array_buffer_transfer_precheck(JSContext *ctx, JSValueConst this_val, int magic);
+static int js_array_buffer_resize_precheck(JSContext *ctx, const JSStepHdr *h);
+static int js_array_buffer_transfer_precheck(JSContext *ctx, const JSStepHdr *h);
 static JSValue js_array_buffer_resize(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv,
                                       int class_id);
 static JSValue js_array_buffer_transfer(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv,
@@ -55555,7 +55559,7 @@ static JSValue js_string_fromCodePoint(JSContext *ctx, JSValueConst this_val, in
 static JSValue js_Date_UTC(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 static JSValue js_dataview_getValue(JSContext *ctx, JSValueConst this_obj, int argc, JSValueConst *argv, int class_id);
 static JSValue js_dataview_setValue(JSContext *ctx, JSValueConst this_obj, int argc, JSValueConst *argv, int class_id);
-static int js_dataview_set_precheck(JSContext *ctx, JSValueConst this_val, int magic);
+static int js_dataview_set_precheck(JSContext *ctx, const JSStepHdr *h);
 static int js_dataview_set_midcheck(JSContext *ctx, JSValueConst *argp, int magic);
 static int js_primargs_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_primargs_fini(JSContext *ctx, void *st, bool take_result);
@@ -55635,7 +55639,15 @@ static int js_array_concat_step(JSContext *ctx, void *st, JSValue cb_result, JSV
 static JSValue js_array_concat_fini(JSContext *ctx, void *st, bool take_result);
 static const JSTrampStepDef js_array_concat_def =
     { sizeof(JSArrayConcat), js_array_concat_step, js_array_concat_fini, 0 };
-static int js_iterator_ctor_precheck(JSContext *ctx, JSValueConst new_target, int magic);
+static int js_iterator_ctor_precheck(JSContext *ctx, const JSStepHdr *h);
+static int js_weakref_ctor_precheck(JSContext *ctx, const JSStepHdr *h);
+static JSValue js_weakref_ctor_body(JSContext *ctx, JSValueConst obj_, int argc, JSValueConst *argv);
+static int js_finrec_ctor_precheck(JSContext *ctx, const JSStepHdr *h);
+static JSValue js_finrec_ctor_body(JSContext *ctx, JSValueConst obj_, int argc, JSValueConst *argv);
+static const JSTrampStepDef js_weakref_ctor_def =
+    CREATECTOR_DEF_FULL(JS_CLASS_WEAK_REF, generic, js_weakref_ctor_body, 0, js_weakref_ctor_precheck);
+static const JSTrampStepDef js_finrec_ctor_def =
+    CREATECTOR_DEF_FULL(JS_CLASS_FINALIZATION_REGISTRY, generic, js_finrec_ctor_body, 0, js_finrec_ctor_precheck);
 /* 27.1.3.1 Iterator: steps 1-2 are the abstract-class validation, step 3 is the whole constructor. */
 static const JSTrampStepDef js_iterator_ctor_def =
     CREATECTOR_DEF_FULL(JS_CLASS_ITERATOR, generic, NULL, 0, js_iterator_ctor_precheck);
@@ -55824,6 +55836,8 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_ITERATOR_CTOR] = &js_iterator_ctor_def,
     [STEPDEF_ARRAY_OF]      = &js_array_of_def,
     [STEPDEF_ARRAY_CONCAT]  = &js_array_concat_def,
+    [STEPDEF_WEAKREF_CTOR]  = &js_weakref_ctor_def,
+    [STEPDEF_FINREC_CTOR]   = &js_finrec_ctor_def,
     [STEPDEF_ARRAY_INDEXOF]     = &js_array_indexOf_def,
     [STEPDEF_ARRAY_LASTINDEXOF] = &js_array_lastIndexOf_def,
     [STEPDEF_ARRAY_INCLUDES]    = &js_array_includes_def,
@@ -57507,8 +57521,9 @@ static JSValue js_iterator_constructor_getset(JSContext *ctx,
    does: step 3 IS the create, so the declaration carries no body and the machine is the whole constructor.
    The abstract-class test compares against the DECLARATION rather than a C function pointer, because there is no
    C function left to compare against — which is the point. */
-static int js_iterator_ctor_precheck(JSContext *ctx, JSValueConst new_target, int magic)
+static int js_iterator_ctor_precheck(JSContext *ctx, const JSStepHdr *h)
 {
+    JSValueConst new_target = h->this_val;
     JSObject *p;
 
     if (JS_TAG_OBJECT != JS_VALUE_GET_TAG(new_target)) {
@@ -57851,8 +57866,9 @@ static void js_iterator_helper_close(JSContext *ctx, JSValueConst this_val, int 
 
 /* 27.1.4.5/27.1.4.3 steps 1-2: the receiver must be an Object, and that TypeError precedes the limit's
    coercion AND does not close anything. */
-static int js_iterator_helper_precheck(JSContext *ctx, JSValueConst this_val, int magic)
+static int js_iterator_helper_precheck(JSContext *ctx, const JSStepHdr *h)
 {
+    JSValueConst this_val = h->this_val;
     return check_iterator(ctx, this_val);
 }
 
@@ -72354,8 +72370,10 @@ fini:
    ToIndex(newLength), which is why they are a precheck rather than the head of the body — a coerce-then-compute
    machine coerces first, and `ArrayBuffer.prototype.resize.call({}, {valueOf(){...}})` must throw without
    running that valueOf. */
-static int js_array_buffer_resize_precheck(JSContext *ctx, JSValueConst this_val, int class_id)
+static int js_array_buffer_resize_precheck(JSContext *ctx, const JSStepHdr *h)
 {
+    JSValueConst this_val = h->this_val;
+    int class_id = h->def->body_magic;
     JSArrayBuffer *abuf = JS_GetOpaque2(ctx, this_val, class_id);
     if (!abuf)
         return -1;
@@ -72364,8 +72382,9 @@ static int js_array_buffer_resize_precheck(JSContext *ctx, JSValueConst this_val
     return 0;
 }
 
-static int js_array_buffer_transfer_precheck(JSContext *ctx, JSValueConst this_val, int magic)
+static int js_array_buffer_transfer_precheck(JSContext *ctx, const JSStepHdr *h)
 {
+    JSValueConst this_val = h->this_val;
     JSArrayBuffer *abuf = JS_GetOpaque2(ctx, this_val, JS_CLASS_ARRAY_BUFFER);
     if (!abuf)
         return -1;
@@ -74787,8 +74806,9 @@ static int js_dataview_set_midcheck(JSContext *ctx, JSValueConst *argp, int magi
 /* 25.3.4.16 SetViewValue steps 1-3: the receiver must be a DataView over a MUTABLE buffer, and that is decided
    BEFORE either argument is read — test262 pins the ordering, so the coerce-then-compute machine runs this
    first and the body re-checks it on the way through. */
-static int js_dataview_set_precheck(JSContext *ctx, JSValueConst this_val, int magic)
+static int js_dataview_set_precheck(JSContext *ctx, const JSStepHdr *h)
 {
+    JSValueConst this_val = h->this_val;
     JSTypedArray *ta = JS_GetOpaque2(ctx, this_val, JS_CLASS_DATAVIEW);
     if (!ta)
         return -1;
@@ -75652,18 +75672,28 @@ static void js_weakref_finalizer(JSRuntime *rt, JSValueConst val)
     js_free_rt(rt, wr);
 }
 
-static JSValue js_weakref_constructor(JSContext *ctx, JSValueConst new_target,
-                                      int argc, JSValueConst *argv)
+/* 26.1.1.1 steps 1-2: NewTarget and CanBeHeldWeakly, both BEFORE OrdinaryCreateFromConstructor's `prototype`
+   read — which is why the declaration's precheck has to see the ARGUMENTS, not just the receiver. */
+static int js_weakref_ctor_precheck(JSContext *ctx, const JSStepHdr *h)
 {
-    if (JS_IsUndefined(new_target))
-        return JS_ThrowTypeError(ctx, "constructor requires 'new'");
+    if (JS_IsUndefined(h->this_val)) {
+        JS_ThrowTypeError(ctx, "constructor requires 'new'");
+        return -1;
+    }
+    if (!is_valid_weakref_target(step_arg(h, 0))) {
+        JS_ThrowTypeError(ctx, "invalid target");
+        return -1;
+    }
+    return 0;
+}
+
+/* 26.1.1.1 steps 3+ — everything done ON the object the create made. It OWNS obj. */
+static JSValue js_weakref_ctor_body(JSContext *ctx, JSValueConst obj_,
+                                    int argc, JSValueConst *argv)
+{
     JSValueConst arg = argv[0];
-    if (!is_valid_weakref_target(arg))
-        return JS_ThrowTypeError(ctx, "invalid target");
     // TODO(saghul): short-circuit if the refcount is 1?
-    JSValue obj = js_create_from_ctor(ctx, new_target, JS_CLASS_WEAK_REF);
-    if (JS_IsException(obj))
-        return JS_EXCEPTION;
+    JSValue obj = (JSValue)obj_;
     JSWeakRefData *wrd = js_malloc(ctx, sizeof(*wrd));
     if (!wrd) {
         JS_FreeValue(ctx, obj);
@@ -75783,17 +75813,22 @@ static void js_finrec_mark(JSRuntime *rt, JSValueConst val,
     }
 }
 
-static JSValue js_finrec_constructor(JSContext *ctx, JSValueConst new_target,
-                                     int argc, JSValueConst *argv)
+/* 26.2.1.1 steps 1-2: NewTarget and IsCallable(cleanupCallback), both before the `prototype` read. */
+static int js_finrec_ctor_precheck(JSContext *ctx, const JSStepHdr *h)
 {
-    if (JS_IsUndefined(new_target))
-        return JS_ThrowTypeError(ctx, "constructor requires 'new'");
+    if (JS_IsUndefined(h->this_val)) {
+        JS_ThrowTypeError(ctx, "constructor requires 'new'");
+        return -1;
+    }
+    return check_function(ctx, step_arg(h, 0)) ? -1 : 0;
+}
+
+/* 26.2.1.1 steps 3+ — everything done ON the object the create made. It OWNS obj. */
+static JSValue js_finrec_ctor_body(JSContext *ctx, JSValueConst obj_,
+                                   int argc, JSValueConst *argv)
+{
     JSValueConst cb = argv[0];
-    if (check_function(ctx, cb))
-        return JS_EXCEPTION;
-    JSValue obj = js_create_from_ctor(ctx, new_target, JS_CLASS_FINALIZATION_REGISTRY);
-    if (JS_IsException(obj))
-        return JS_EXCEPTION;
+    JSValue obj = (JSValue)obj_;
     JSFinalizationRegistryData *frd = js_malloc(ctx, sizeof(*frd));
     if (!frd) {
         JS_FreeValue(ctx, obj);
@@ -75900,7 +75935,7 @@ int JS_AddIntrinsicWeakRef(JSContext *ctx)
             return -1;
     }
     obj = JS_NewCConstructor(ctx, JS_CLASS_WEAK_REF, "WeakRef",
-                             js_weakref_constructor, 1, JS_CFUNC_constructor_or_func, 0,
+                             NULL, 1, JS_CFUNC_step_ctor, STEPDEF_WEAKREF_CTOR,
                              JS_UNDEFINED,
                              NULL, 0,
                              js_weakref_proto_funcs, countof(js_weakref_proto_funcs),
@@ -75916,7 +75951,7 @@ int JS_AddIntrinsicWeakRef(JSContext *ctx)
             return -1;
     }
     obj = JS_NewCConstructor(ctx, JS_CLASS_FINALIZATION_REGISTRY, "FinalizationRegistry",
-                             js_finrec_constructor, 1, JS_CFUNC_constructor_or_func, 0,
+                             NULL, 1, JS_CFUNC_step_ctor, STEPDEF_FINREC_CTOR,
                              JS_UNDEFINED,
                              NULL, 0,
                              js_finrec_proto_funcs, countof(js_finrec_proto_funcs),
