@@ -18055,7 +18055,7 @@ typedef struct JSStepHdr {
        than being re-declared (and mis-declared) in each state. */
     JSValue coerce;
     JSValue cb_coerce[2];
-    uint8_t len_phase, spc_phase, num_phase, str_phase, get_phase;
+    uint8_t len_phase, spc_phase, num_phase, str_phase, get_phase, cs_phase;
     /* an ARGUMENT COERCION is outstanding, so an abandon here is the spec's abrupt-completion case (take/drop's
        IfAbruptCloseIterator). It lives on the header because the teardown is what has to act on it, and the
        teardown releases this_val — the receiver the handler needs — before the machine's own fini can see it. */
@@ -20363,7 +20363,7 @@ typedef struct JSArraySlice {
     JSValue obj;         /* ToObject(this) (owned) */
     JSValue arr;         /* ArraySpeciesCreate's target — the RESULT (owned) */
     JSValue el;          /* the element held across its read (owned) */
-    int64_t len, start, count, del_count, final, k, n, new_len, di;
+    int64_t len, start, count, del_count, final, k, n, new_len, di, cs_i;
     uint32_t item_count, ii;
     int present;         /* the HasProperty answer, held across its own suspension */
 } JSArraySlice;
@@ -53001,6 +53001,88 @@ static int JS_CopySubArray(JSContext *ctx,
     return -1;
 }
 
+/* JS_CopySubArray's element walk as a RESUMABLE sub-sequence. Its fast-array span moves slots directly and has
+   no observable step in it; its SLOW path is a HasProperty, then a Get and a Set, or a Delete — every one of them
+   the page's code, and splice performed the whole walk from C, so an accessor or a Proxy trap with a loop in it
+   had no flow base. DIRECTION matters (an overlapping shift copies backwards), which is why the cursor is an
+   index into `count` rather than a from/to pair: from and to are derived from it on every re-entry, so a resume
+   lands on the same element the suspension left.
+     0 = done, 6/7/8/9 = the caller must return that step code, -1 = threw.
+   JS_CopySubArray itself stays for `shift` and `unshift`, which are not machines yet — each is its own
+   conversion, and this walk is what they will use when they are. */
+enum { CS_HEAD = 0, CS_HAS, CS_GET, CS_WRITE };
+static int step_copysub_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj,
+                            int64_t to_pos, int64_t from_pos, int64_t count, int dir,
+                            int64_t *pi, int *ppresent, JSValue in, JSValue **out_cb, int *out_argc)
+{
+    JSObject *p;
+    int64_t from, to, len, l, j;
+    int r;
+
+    for (;;) {
+        /* re-derived every iteration: the page's code can have grown or shrunk the array, and the fast path is
+           only usable while both indices are still inside it. */
+        p = NULL;
+        if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
+            p = JS_VALUE_GET_OBJ(obj);
+            if (p->class_id != JS_CLASS_ARRAY || !p->fast_array)
+                p = NULL;
+        }
+        from = (dir < 0) ? from_pos + count - *pi - 1 : from_pos + *pi;
+        to   = (dir < 0) ? to_pos   + count - *pi - 1 : to_pos   + *pi;
+        if (h->cs_phase == CS_HEAD) {
+            if (*pi >= count) { JS_FreeValue(ctx, in); return 0; }
+            if (p && from >= 0 && from < (len = p->u.array.count) && to >= 0 && to < len) {
+                /* the whole run of present elements at once — no accessor, no trap, nothing to suspend on */
+                l = count - *pi;
+                if (dir < 0) {
+                    l = min_int64(l, from + 1);
+                    l = min_int64(l, to + 1);
+                    for (j = 0; j < l; j++)
+                        set_value(ctx, &p->u.array.u.values[to - j], js_dup(p->u.array.u.values[from - j]));
+                } else {
+                    l = min_int64(l, len - from);
+                    l = min_int64(l, len - to);
+                    for (j = 0; j < l; j++)
+                        set_value(ctx, &p->u.array.u.values[to + j], js_dup(p->u.array.u.values[from + j]));
+                }
+                *pi += l;
+                continue;
+            }
+            h->cs_phase = CS_HAS;
+        }
+        if (h->cs_phase == CS_HAS) {
+            r = step_hasidx_run(ctx, h, obj, from, in, ppresent, out_cb, out_argc);
+            in = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            h->cs_phase = *ppresent ? CS_GET : CS_WRITE;
+        }
+        if (h->cs_phase == CS_GET) {
+            JSValue el;
+            r = step_getidx_run(ctx, h, obj, from, in, &el, out_cb, out_argc);
+            in = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            DCHECK(JS_IsUndefined(h->coerce) || JS_VALUE_GET_TAG(h->coerce) != JS_TAG_OBJECT,
+                   "the element slot is already holding something across this walk");
+            h->coerce = el;   /* owned across the write */
+            h->cs_phase = CS_WRITE;
+        }
+        DCHECK(h->cs_phase == CS_WRITE, "the sub-array copy resumed in an unknown phase");
+        if (*ppresent) {
+            r = step_setidx_run(ctx, h, obj, to, h->coerce, in, out_cb, out_argc);
+            in = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            JS_FreeValue(ctx, h->coerce); h->coerce = JS_UNDEFINED;
+        } else {
+            r = step_delidx_run(ctx, h, obj, to, in, out_cb, out_argc);
+            in = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+        }
+        (*pi)++;
+        h->cs_phase = CS_HEAD;
+    }
+}
+
 /* 23.1.1.1 steps 3+ — everything the Array constructor does ON the array OrdinaryCreateFromConstructor made.
    It OWNS obj, which is the shape the constructor was already written in (`return obj`, free on every failure). */
 static JSValue js_array_ctor_body(JSContext *ctx, JSValueConst obj_,
@@ -56715,8 +56797,9 @@ exception:
    Proxy trap and no prototype lookup is reachable, so they are the same computation with no observable step — not
    a second implementation of one.
    Stages: 0 ToObject, 1 length, 2 start, 3 the second index, 4 ArraySpeciesCreate, 5 copy head, 6 HasProperty,
-   7 Get, 8 Set(A,"length",n), 9 splice's shift + delete head, 10 delete, 11 the inserted items,
-   12 Set(O,"length",newLen). */
+   7 Get, 8 Set(A,"length",n), 9 splice's tail head, 13 the element shift, 10 delete, 11 the inserted items,
+   12 Set(O,"length",newLen). (13 is out of order because it was added after the rest; a stage is a wire value in
+   a suspended state, and renumbering to tidy the list would silently repoint anything parked at the old one.) */
 
 static int js_array_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
@@ -56731,7 +56814,7 @@ static int js_array_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
         /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
         s->obj = JS_UNDEFINED; s->arr = JS_UNDEFINED; s->el = JS_UNDEFINED;
         s->len = 0; s->start = 0; s->count = 0; s->del_count = 0; s->final = 0;
-        s->k = 0; s->n = 0; s->new_len = 0; s->di = 0;
+        s->k = 0; s->n = 0; s->new_len = 0; s->di = 0; s->cs_i = 0;
         s->item_count = 0; s->ii = 0; s->present = 0;
         s->obj = JS_ToObject(ctx, s->hdr.this_val);
         if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
@@ -56837,18 +56920,19 @@ static int js_array_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
     if (s->hdr.stage == 9) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         s->new_len = s->len + s->item_count - s->del_count;
-        if (s->item_count != s->del_count) {
-            /* The SHIFT is still JS_CopySubArray. Its fast-array path runs no user code at all; its slow path
-               reads and writes `obj` from C and is the one remaining unconverted walk in this builtin — a loop in
-               an accessor there aborts exactly as it did before, which is the honest state of that site. */
-            if (JS_CopySubArray(ctx, s->obj, s->start + s->item_count,
-                                s->start + s->del_count, s->len - (s->start + s->del_count),
-                                s->item_count <= s->del_count ? +1 : -1) < 0)
-                return -1;
-            s->di = s->len;
-        } else {
-            s->di = s->new_len;   /* nothing to trim */
-        }
+        s->cs_i = 0;
+        s->hdr.stage = (s->item_count != s->del_count) ? 13 : 10;
+        if (s->hdr.stage == 10)
+            s->di = s->new_len;   /* nothing to shift and nothing to trim */
+    }
+    if (s->hdr.stage == 13) {   /* the element SHIFT: every read and write in it is the page's */
+        r = step_copysub_run(ctx, &s->hdr, s->obj, s->start + s->item_count,
+                             s->start + s->del_count, s->len - (s->start + s->del_count),
+                             s->item_count <= s->del_count ? +1 : -1,
+                             &s->cs_i, &s->present, cb_result, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->di = s->len;
         s->hdr.stage = 10;
     }
     while (s->hdr.stage == 10) {
