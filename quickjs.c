@@ -1426,7 +1426,8 @@ static void js_disposable_stack_mark(JSRuntime *rt, JSValueConst val,
 enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_ARRAY_FIND, STEPDEF_ARRAY_FIND_INDEX, STEPDEF_ARRAY_FIND_LAST, STEPDEF_ARRAY_FIND_LAST_INDEX,
     STEPDEF_TA_FIND, STEPDEF_TA_FIND_INDEX, STEPDEF_TA_FIND_LAST, STEPDEF_TA_FIND_LAST_INDEX,
-    STEPDEF_RE_REPLACE, STEPDEF_STR_REPLACE, STEPDEF_STR_REPLACE_ALL,
+    STEPDEF_RE_REPLACE, STEPDEF_RE_MATCH, STEPDEF_STR_MATCH, STEPDEF_STR_MATCHALL, STEPDEF_STR_SEARCH,
+    STEPDEF_STR_REPLACE, STEPDEF_STR_REPLACE_ALL,
     STEPDEF_ARRAY_EVERY, STEPDEF_ARRAY_SOME, STEPDEF_ARRAY_FOREACH, STEPDEF_ARRAY_MAP, STEPDEF_ARRAY_FILTER,
     STEPDEF_TA_EVERY, STEPDEF_TA_SOME, STEPDEF_TA_FOREACH, STEPDEF_TA_MAP, STEPDEF_TA_FILTER,
     STEPDEF_ARRAY_REDUCE, STEPDEF_ARRAY_REDUCE_RIGHT, STEPDEF_TA_REDUCE, STEPDEF_TA_REDUCE_RIGHT,
@@ -18072,7 +18073,7 @@ typedef struct JSStepHdr {
        than being re-declared (and mis-declared) in each state. */
     JSValue coerce;
     JSValue cb_coerce[2];
-    uint8_t len_phase, spc_phase, num_phase, str_phase, get_phase, cs_phase;
+    uint8_t len_phase, spc_phase, num_phase, str_phase, get_phase, cs_phase, exec_phase;
     /* an ARGUMENT COERCION is outstanding, so an abandon here is the spec's abrupt-completion case (take/drop's
        IfAbruptCloseIterator). It lives on the header because the teardown is what has to act on it, and the
        teardown releases this_val — the receiver the handler needs — before the machine's own fini can see it. */
@@ -18731,25 +18732,35 @@ static int step_tofloat64_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSVa
     return JS_ToFloat64Free(ctx, pres, in);
 }
 
-static int step_length_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSValue in, int64_t *plen,
+/* `? ToLength(? Get(obj, key))` — the pair LengthOfArrayLike is, and the pair 22.2.7.8 step 4 performs on
+   `lastIndex`. Both halves are the page's code: the read is an accessor or a trap, and the ToLength coerces
+   whatever it produced. ONE implementation, the key as a parameter, so the two spec operations cannot drift.
+   0 = *plen is filled, 5/6 = the caller must return that step code, -1 = threw. */
+static int step_getlen_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAtom key, JSValue in, int64_t *plen,
                            JSValue **out_cb, int *out_argc)
 {
     switch (h->len_phase) {
     case LEN_PH_START:
         JS_FreeValue(ctx, in);
         h->cb_coerce[0] = (JSValue)obj;   /* borrowed: the machine holds the receiver */
-        *out_cb = h->cb_coerce; *out_argc = (int)JS_ATOM_length;
+        *out_cb = h->cb_coerce; *out_argc = (int)key;
         h->len_phase = LEN_PH_GOT;
         return 6;
     case LEN_PH_GOT:                      /* `in` is the value the read produced */
         return step_length_value(ctx, h, in, plen, out_cb, out_argc);
     default:                             /* `in` is the settled primitive */
-        DCHECK(h->len_phase == LEN_PH_PRIM, "LengthOfArrayLike resumed in an unknown phase");
+        DCHECK(h->len_phase == LEN_PH_PRIM, "a keyed ToLength resumed in an unknown phase");
         JS_FreeValue(ctx, h->coerce);
         h->coerce = JS_UNDEFINED;
         h->len_phase = LEN_PH_START;
         return JS_ToLengthFree(ctx, plen, in);
     }
+}
+
+static int step_length_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSValue in, int64_t *plen,
+                           JSValue **out_cb, int *out_argc)
+{
+    return step_getlen_run(ctx, h, obj, JS_ATOM_length, in, plen, out_cb, out_argc);
 }
 
 static JSValue tramp_step_state_free(JSContext *ctx, void *st, bool take_result)
@@ -19307,11 +19318,21 @@ typedef struct JSReRep {
     JSStepHdr hdr;           /* MUST be first: the generic step driver casts the state to JSStepHdr * */
     uint8_t functional;      /* 1 = callable replacer (step-code 3); 0 = GetSubstitution inside the same walk */
     uint8_t is_global, fullUnicode;   /* read from `flags` before ToString(S), used by the collection after it */
+    JSValue flags;           /* Get(rx,"flags") and its ToString, held across each (owned) */
+    JSValue mres;            /* the match RegExpExec produced, until results[] adopts it (owned) */
+    JSValue m0;              /* that match's [0], held across its read (owned) */
+    int64_t thisIndex;       /* the lastIndex an empty match re-reads */
+    JSValue cbx[3];          /* [this, exec, S] — RegExpExec's call request */
+    int64_t nCaptures;       /* max(LengthOfArrayLike(result) - 1, 0) for the match being substituted */
+    int64_t n;               /* the capture cursor */
+    JSValue cap;             /* a capture held across its read and its ToString (owned) */
+    JSValue named;           /* Get(result,"groups") (owned) */
+    JSValue repres;          /* the replacer's return, held across its ToString (owned) */
     JSValue rx;              /* the regexp (owned) */
     JSValue str;             /* the subject string (owned) */
     JSValue rep;             /* the replacer function (owned) */
     JSValue *results;        /* phase-1 match results: an owned array of owned values */
-    int nresults;
+    int nresults, rcap;
     int j;                   /* index of the match being substituted */
     StringBuffer b;          /* the accumulator */
     int nextSourcePosition;
@@ -19319,11 +19340,41 @@ typedef struct JSReRep {
     JSValue matched;         /* the current matched string (owned), held across the callback */
     JSValue *cb_buf;         /* [this, fn, matched, caps..., position, str, groups?] — args live HERE, sp untouched */
     int cb_nargs;
-    uint8_t cb_pending;      /* 1 = the value delivered to the next step is the replacer's result */
     JSValue result;          /* DONE: the finished string (owned) */
 } JSReRep;
-static int js_re_rep_step(JSContext *ctx, struct JSReRep *s, JSValue cb_result);
-static int js_re_rep_collect(JSContext *ctx, struct JSReRep *s);
+/* 21.1.3.11 String.prototype.match / .search / .matchAll — ONE body, the @@-method's atom as the magic, exactly
+   as the C function was. Every step is the page's code: GetMethod(regexp, @@match) and the Call it makes,
+   matchAll's IsRegExp + `flags` read, ToString(this), the RegExp construction, and the final Invoke. */
+typedef struct JSStrMatch {
+    JSStepHdr hdr;           /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    JSValue matcher;         /* GetMethod(regexp, @@x), or the constructed regexp's method (owned) */
+    JSValue str;             /* ToString(this) (owned) */
+    JSValue rx;              /* Construct(RegExp, ...) (owned) */
+    JSValue flags;           /* matchAll's `flags` read, held across its ToString (owned) */
+    JSValue result;          /* DONE (owned) */
+    JSValue cb[4];           /* [this, fn, arg, arg2] — a call or a construct request */
+    uint8_t isRegExp;
+} JSStrMatch;
+
+/* 22.2.6.8 RegExp.prototype[@@match]. Every step of it is the page's code: ToString(string), Get(rx,"flags")
+   and its ToString, Set(rx,"lastIndex",0), and then an UNBOUNDED loop of RegExpExec — whose `exec` the page can
+   patch — each turn reading `[0]` off whatever came back, ToString'ing it, and on an empty match re-reading and
+   re-writing `lastIndex`. The result array is engine-private, so filling it reaches nothing. */
+typedef struct JSReMatch {
+    JSStepHdr hdr;           /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    JSValue rx;              /* the regexp (owned) */
+    JSValue str;             /* the subject string (owned) */
+    JSValue flags;           /* Get(rx,"flags") and its ToString, held across each (owned) */
+    JSValue arr;             /* the result array, or the single non-global result — the RESULT (owned) */
+    JSValue mres;            /* the match RegExpExec produced (owned) */
+    JSValue m0;              /* that match's [0], held across its read (owned) */
+    int64_t n, thisIndex;
+    uint8_t is_global, fullUnicode;
+    JSValue cbx[3];          /* [this, exec, S] — RegExpExec's call request */
+} JSReMatch;
+
+static int js_re_rep_step(JSContext *ctx, struct JSReRep *s, JSValue cb_result,
+                          JSValue **out_cb, int *out_argc);
 static void js_re_rep_end(JSContext *ctx, struct JSReRep *s, bool take_result);
 static int js_re_rep_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_re_rep_fini(JSContext *ctx, void *st, bool take_result);
@@ -56061,6 +56112,17 @@ static const JSTrampStepDef js_ta_findIndex_def        = { sizeof(JSArrayFind), 
 static const JSTrampStepDef js_ta_findLast_def         = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFindLast | FIND_TA };
 static const JSTrampStepDef js_ta_findLastIndex_def    = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFindLastIndex | FIND_TA };
 static const JSTrampStepDef js_re_replace_def          = { sizeof(JSReRep), js_re_rep_vstep, js_re_rep_fini, 0 };
+static int js_re_match_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_re_match_fini(JSContext *ctx, void *st, bool take_result);
+static const JSTrampStepDef js_re_match_def           = { sizeof(JSReMatch), js_re_match_step, js_re_match_fini, 0 };
+static int js_str_match_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_str_match_fini(JSContext *ctx, void *st, bool take_result);
+static const JSTrampStepDef js_str_match_def =
+    { sizeof(JSStrMatch), js_str_match_step, js_str_match_fini, JS_ATOM_Symbol_match };
+static const JSTrampStepDef js_str_matchAll_def =
+    { sizeof(JSStrMatch), js_str_match_step, js_str_match_fini, JS_ATOM_Symbol_matchAll };
+static const JSTrampStepDef js_str_search_def =
+    { sizeof(JSStrMatch), js_str_match_step, js_str_match_fini, JS_ATOM_Symbol_search };
 static const JSTrampStepDef js_str_replace_def         = { sizeof(JSStrReplace), js_str_replace_vstep, js_str_replace_fini, 0 };
 static const JSTrampStepDef js_str_replaceAll_def      = { sizeof(JSStrReplace), js_str_replace_vstep, js_str_replace_fini, 1 };
 static const JSTrampStepDef js_array_every_def     = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_every };
@@ -56314,6 +56376,10 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_TA_FIND_LAST]          = &js_ta_findLast_def,
     [STEPDEF_TA_FIND_LAST_INDEX]    = &js_ta_findLastIndex_def,
     [STEPDEF_RE_REPLACE]            = &js_re_replace_def,
+    [STEPDEF_RE_MATCH]              = &js_re_match_def,
+    [STEPDEF_STR_MATCH]             = &js_str_match_def,
+    [STEPDEF_STR_MATCHALL]          = &js_str_matchAll_def,
+    [STEPDEF_STR_SEARCH]            = &js_str_search_def,
     [STEPDEF_STR_REPLACE]           = &js_str_replace_def,
     [STEPDEF_STR_REPLACE_ALL]       = &js_str_replaceAll_def,
     [STEPDEF_ARRAY_EVERY]   = &js_array_every_def,   [STEPDEF_ARRAY_SOME]    = &js_array_some_def,
@@ -56496,6 +56562,8 @@ STEP_STATE_HDR_FIRST(JSArrayReduce);
 STEP_STATE_HDR_FIRST(JSArraySort);
 STEP_STATE_HDR_FIRST(JSStrReplace);
 STEP_STATE_HDR_FIRST(JSReRep);
+STEP_STATE_HDR_FIRST(JSReMatch);
+STEP_STATE_HDR_FIRST(JSStrMatch);
 STEP_STATE_HDR_FIRST(JSJsonReviver);
 STEP_STATE_HDR_FIRST(JSStrCtor);
 STEP_STATE_HDR_FIRST(JSStrConcat);
@@ -60585,54 +60653,147 @@ static int check_regexp_g_flag(JSContext *ctx, JSValueConst regexp)
     return 0;
 }
 
-static JSValue js_string_match(JSContext *ctx, JSValueConst this_val,
-                               int argc, JSValueConst *argv, int atom)
+/* 21.1.3.11 String.prototype.match, 21.1.3.12 .matchAll and 21.1.3.16 .search — ONE machine, the @@-method's
+   atom in hdr.arg, exactly as js_string_match was one body with a magic. It called the @@-method with
+   JS_CallFree straight out of C, and that method is itself a step machine, so the call reached the DFAIL that
+   says a step builtin was invoked outside the interpreter's dispatch. Every other step is the page's code too:
+   GetMethod's read, matchAll's IsRegExp + `flags` + ToString, ToString(this), Construct(RegExp, ...) and the
+   final Get + Call.
+   Stages: 0 the receiver check, 1 IsRegExp's read, 2 the `flags` read, 3 its ToString, 4 GetMethod, 5 the Call,
+   6 ToString(this), 7 the construct, 8 the constructed regexp's method, 9 the Invoke. */
+static int js_str_match_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    // match(rx), search(rx), matchAll(rx)
-    // atom is JS_ATOM_Symbol_match, JS_ATOM_Symbol_search, or JS_ATOM_Symbol_matchAll
-    JSValueConst O = this_val, regexp = argv[0], args[2];
-    JSValue matcher, S, rx, result, str;
-    int args_len;
+    JSStrMatch *s = st;
+    JSAtom atom = (JSAtom)s->hdr.arg;
+    JSValueConst regexp = step_arg(&s->hdr, 0);
+    JSValue str;
+    int r;
 
-    if (JS_IsUndefined(O) || JS_IsNull(O))
-        return JS_ThrowTypeError(ctx, "cannot convert to object");
-
-    if (JS_IsObject(regexp)) {
-        matcher = JS_GetProperty(ctx, regexp, atom);
-        if (JS_IsException(matcher))
-            return JS_EXCEPTION;
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
+        s->matcher = JS_UNDEFINED; s->str = JS_UNDEFINED; s->rx = JS_UNDEFINED;
+        s->flags = JS_UNDEFINED; s->result = JS_UNDEFINED; s->isRegExp = 0;
+        /* step 1: RequireObjectCoercible(this) */
+        if (JS_IsUndefined(s->hdr.this_val) || JS_IsNull(s->hdr.this_val))
+            return JS_ThrowTypeError(ctx, "cannot convert to object"), -1;
+        /* step 2 gates on `regexp` being an OBJECT: a primitive's prototype is never consulted, which
+           cstm-matcher-on-string-primitive.js checks by making String.prototype[@@match] a throwing getter. */
+        if (!JS_IsObject(regexp)) s->hdr.stage = 6;
+        else s->hdr.stage = (atom == JS_ATOM_Symbol_matchAll) ? 1 : 4;
+    }
+    if (s->hdr.stage == 1) {
+        /* matchAll step 2.a, IsRegExp: `? Get(argument, @@match)` decides it unless it is undefined, in which
+           case the [[RegExpMatcher]] slot does. */
+        JSValue m;
+        r = step_getprop_run(ctx, &s->hdr, regexp, JS_ATOM_Symbol_match, cb_result, &m, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        if (JS_IsUndefined(m))
+            s->isRegExp = (JS_VALUE_GET_OBJ(regexp)->class_id == JS_CLASS_REGEXP);
+        else
+            s->isRegExp = JS_ToBool(ctx, m);
+        JS_FreeValue(ctx, m);
+        s->hdr.stage = s->isRegExp ? 2 : 4;
+    }
+    if (s->hdr.stage == 2) {
+        r = step_getprop_run(ctx, &s->hdr, regexp, JS_ATOM_flags, cb_result, &s->flags, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        /* step 2.b.ii: RequireObjectCoercible(flags) */
+        if (JS_IsUndefined(s->flags) || JS_IsNull(s->flags))
+            return JS_ThrowTypeError(ctx, "cannot convert to object"), -1;
+        s->hdr.stage = 3;
+    }
+    if (s->hdr.stage == 3) {
+        r = step_tostring_run(ctx, &s->hdr, s->flags, cb_result, &str, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        JS_FreeValue(ctx, s->flags);
+        s->flags = str;
+        if (string_indexof_char(JS_VALUE_GET_STRING(s->flags), 'g', 0) < 0)
+            return JS_ThrowTypeError(ctx, "regexp must have the 'g' flag"), -1;
+        JS_FreeValue(ctx, s->flags); s->flags = JS_UNDEFINED;
+        s->hdr.stage = 4;
+    }
+    if (s->hdr.stage == 4) {
+        /* step 2.c: GetMethod(regexp, @@x) — the read is the page's; an uncallable non-nullish result throws */
+        r = step_getprop_run(ctx, &s->hdr, regexp, atom, cb_result, &s->matcher, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        if (JS_IsUndefined(s->matcher) || JS_IsNull(s->matcher)) {
+            JS_FreeValue(ctx, s->matcher); s->matcher = JS_UNDEFINED;
+            s->hdr.stage = 6;
+        } else {
+            if (check_function(ctx, s->matcher)) return -1;
+            s->cb[0] = (JSValue)regexp;      /* this */
+            s->cb[1] = s->matcher;           /* a borrowed view of what the state owns */
+            s->cb[2] = s->hdr.this_val;
+            *out_cb = s->cb; *out_argc = 1;
+            s->hdr.stage = 5;
+            return 3;
+        }
+    }
+    if (s->hdr.stage == 5) {
+        s->result = cb_result;
+        return 0;
+    }
+    if (s->hdr.stage == 6) {
+        r = step_tostring_run(ctx, &s->hdr, s->hdr.this_val, cb_result, &s->str, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        /* step 4: RegExpCreate(regexp, undefined) — or "g" for matchAll. It is a real Construct of whatever
+           %RegExp% currently is, so a subclassed or patched constructor is the page's code. */
+        s->cb[0] = ctx->regexp_ctor;
+        s->cb[1] = (JSValue)regexp;
         if (atom == JS_ATOM_Symbol_matchAll) {
-            if (check_regexp_g_flag(ctx, regexp) < 0) {
-                JS_FreeValue(ctx, matcher);
-                return JS_EXCEPTION;
-            }
+            /* the "g" rides the STATE, not the request buffer: the request's slots are borrowed views, so an
+               abandon between this construct and its result would otherwise leak the string. */
+            s->flags = js_new_string8(ctx, "g");
+            if (JS_IsException(s->flags)) { s->flags = JS_UNDEFINED; return -1; }
+            s->cb[2] = s->flags;
+            *out_argc = 2;
+        } else {
+            *out_argc = 1;
         }
-        if (!JS_IsUndefined(matcher) && !JS_IsNull(matcher)) {
-            return JS_CallFree(ctx, matcher, regexp, 1, &O);
-        }
+        *out_cb = s->cb;
+        s->hdr.stage = 7;
+        return 4;
     }
-    S = JS_ToString(ctx, O);
-    if (JS_IsException(S))
-        return JS_EXCEPTION;
-    args_len = 1;
-    args[0] = regexp;
-    str = JS_UNDEFINED;
-    if (atom == JS_ATOM_Symbol_matchAll) {
-        str = js_new_string8(ctx, "g");
-        if (JS_IsException(str))
-            goto fail;
-        args[args_len++] = str;
+    if (s->hdr.stage == 7) {
+        JS_FreeValue(ctx, s->flags); s->flags = JS_UNDEFINED;
+        s->rx = cb_result; cb_result = JS_UNDEFINED;
+        s->hdr.stage = 8;
     }
-    rx = JS_CallConstructor(ctx, ctx->regexp_ctor, args_len, args);
-    JS_FreeValue(ctx, str);
-    if (JS_IsException(rx)) {
-    fail:
-        JS_FreeValue(ctx, S);
-        return JS_EXCEPTION;
+    if (s->hdr.stage == 8) {
+        /* step 5: Invoke(rx, @@x, «S») — the read and the call are two separate observable steps */
+        r = step_getprop_run(ctx, &s->hdr, s->rx, atom, cb_result, &s->matcher, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        if (check_function(ctx, s->matcher)) return -1;
+        s->cb[0] = s->rx;
+        s->cb[1] = s->matcher;
+        s->cb[2] = s->str;
+        *out_cb = s->cb; *out_argc = 1;
+        s->hdr.stage = 9;
+        return 3;
     }
-    result = JS_InvokeFree(ctx, rx, atom, 1, vc(&S));
-    JS_FreeValue(ctx, S);
-    return result;
+    DCHECK(s->hdr.stage == 9, "String.prototype.match resumed in an unknown stage");
+    s->result = cb_result;
+    return 0;
+}
+
+static JSValue js_str_match_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSStrMatch *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    JS_FreeValue(ctx, s->matcher);
+    JS_FreeValue(ctx, s->str);
+    JS_FreeValue(ctx, s->rx);
+    JS_FreeValue(ctx, s->flags);
+    js_free(ctx, s);
+    return r;
 }
 
 static JSValue js_string___GetSubstitution(JSContext *ctx, JSValueConst this_val,
@@ -61444,9 +61605,9 @@ static const JSCFunctionListEntry js_string_proto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("includes", 1, js_string_includes, 0 ),
     JS_CFUNC_MAGIC_DEF("endsWith", 1, js_string_includes, 2 ),
     JS_CFUNC_MAGIC_DEF("startsWith", 1, js_string_includes, 1 ),
-    JS_CFUNC_MAGIC_DEF("match", 1, js_string_match, JS_ATOM_Symbol_match ),
-    JS_CFUNC_MAGIC_DEF("matchAll", 1, js_string_match, JS_ATOM_Symbol_matchAll ),
-    JS_CFUNC_MAGIC_DEF("search", 1, js_string_match, JS_ATOM_Symbol_search ),
+    JS_CFUNC_STEP_DEF("match", 1, STEPDEF_STR_MATCH ),
+    JS_CFUNC_STEP_DEF("matchAll", 1, STEPDEF_STR_MATCHALL ),
+    JS_CFUNC_STEP_DEF("search", 1, STEPDEF_STR_SEARCH ),
     JS_CFUNC_STEP_DEF("split", 2, STEPDEF_STR_SPLIT ),
     JS_CFUNC_STEP_DEF("substring", 2, STEPDEF_STR_SUBSTRING ),
     JS_CFUNC_STEP_DEF("substr", 2, STEPDEF_STR_SUBSTR ),
@@ -62927,6 +63088,51 @@ fail:
     return JS_EXCEPTION;
 }
 
+enum { EX_PH_START = 0, EX_PH_CALL };
+
+/* 22.2.7.1 RegExpExec(R, S) as a sub-sequence. Two of its steps are the page's code — step 3's
+   `? Get(R, "exec")` and step 5's `? Call(exec, R, «S»)` when that is callable — and JS_RegExpExec reached both
+   from C, so a patched `exec` with a loop in it had no flow base and every consumer of RegExpExec drove it to
+   completion. The caller lends a 3-slot buffer because a CALL request is [this, fn, arg] and the header's own
+   request buffer is two wide; the method itself rides h->coerce, which is what owns it across the call.
+   0 = *pout is filled, 3/6 = the caller must return that step code, -1 = threw. */
+static int step_reexec_run(JSContext *ctx, JSStepHdr *h, JSValueConst r, JSValueConst str, JSValue *buf,
+                           JSValue in, JSValue *pout, JSValue **out_cb, int *out_argc)
+{
+    if (h->exec_phase == EX_PH_START) {
+        int rc = step_getprop_run(ctx, h, r, JS_ATOM_exec, in, &h->coerce, out_cb, out_argc);
+        if (rc) return rc < 0 ? -1 : rc;
+        /* the BUILT-IN exec, unpatched: 22.2.7.1 step 3 calls it, and calling it as a value would mean this
+           frame driving a step machine. Its own computation is what that machine's body is, and with a STRING
+           subject there is nothing left in it to coerce, so it runs here directly — the same computation with
+           no observable step, not a second implementation of one. */
+        if (tramp_step_def_of(h->coerce) != &js_regexp_exec_def && JS_IsFunction(ctx, h->coerce)) {
+            buf[0] = (JSValue)r;        /* this */
+            buf[1] = h->coerce;         /* a borrowed view of what the header owns */
+            buf[2] = (JSValue)str;
+            *out_cb = buf; *out_argc = 1;
+            h->exec_phase = EX_PH_CALL;
+            return 3;
+        }
+        JS_FreeValue(ctx, h->coerce);
+        h->coerce = JS_UNDEFINED;
+        *pout = js_regexp_exec(ctx, r, 1, &str);
+        return JS_IsException(*pout) ? -1 : 0;
+    }
+    DCHECK(h->exec_phase == EX_PH_CALL, "RegExpExec resumed in an unknown phase");
+    JS_FreeValue(ctx, h->coerce);
+    h->coerce = JS_UNDEFINED;
+    h->exec_phase = EX_PH_START;
+    /* step 5.c: the result must be an Object or Null, checked before anyone reads a capture off it */
+    if (!JS_IsObject(in) && !JS_IsNull(in)) {
+        JS_FreeValue(ctx, in);
+        JS_ThrowTypeError(ctx, "RegExp exec method must return an object or null");
+        return -1;
+    }
+    *pout = in;
+    return 0;
+}
+
 static JSValue JS_RegExpExec(JSContext *ctx, JSValueConst r, JSValueConst s)
 {
     JSValue method, ret;
@@ -62969,88 +63175,135 @@ static JSValue js_regexp_test(JSContext *ctx, JSValueConst this_val,
     return js_bool(ret);
 }
 
-static JSValue js_regexp_Symbol_match(JSContext *ctx, JSValueConst this_val,
-                                      int argc, JSValueConst *argv)
+/* 22.2.6.8 RegExp.prototype [ @@match ] ( string ) — a step machine. js_regexp_Symbol_match ran the whole of it
+   from C, including an UNBOUNDED RegExpExec loop that calls a patched `exec`, so a loop anywhere in it had no
+   flow base and aborted at its back-edge.
+   Stages: 0 the receiver check, 1 ToString(string), 2 Get "flags", 3 its ToString + the global branch,
+   4 the non-global single exec, 5 the lastIndex reset + ArrayCreate, 6 the exec, 7 Get "0", 8 its ToString +
+   the result write, 9 the empty-match lastIndex read, 10 its write. */
+static int js_re_match_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    // [Symbol.match](str)
-    JSValueConst rx = this_val;
-    JSValue A, S, flags, result, matchStr;
-    int global, n, fullUnicode, isEmpty;
-    JSString *p;
+    JSReMatch *s = st;
+    JSValue str;
+    int r;
 
-    if (!JS_IsObject(rx))
-        return JS_ThrowTypeErrorNotAnObject(ctx);
-
-    A = JS_UNDEFINED;
-    flags = JS_UNDEFINED;
-    result = JS_UNDEFINED;
-    matchStr = JS_UNDEFINED;
-    S = JS_ToString(ctx, argv[0]);
-    if (JS_IsException(S))
-        goto exception;
-
-    flags = JS_GetProperty(ctx, rx, JS_ATOM_flags);
-    if (JS_IsException(flags))
-        goto exception;
-    flags = JS_ToStringFree(ctx, flags);
-    if (JS_IsException(flags))
-        goto exception;
-    p = JS_VALUE_GET_STRING(flags);
-
-    global = (-1 != string_indexof_char(p, 'g', 0));
-    if (!global) {
-        A = JS_RegExpExec(ctx, rx, S);
-    } else {
-        // 'v' flag implies full Unicode, like 'u'
-        fullUnicode = (string_indexof_char(p, 'u', 0) >= 0 ||
-                       string_indexof_char(p, 'v', 0) >= 0);
-
-        if (JS_SetProperty(ctx, rx, JS_ATOM_lastIndex, js_int32(0)) < 0)
-            goto exception;
-        A = JS_NewArray(ctx);
-        if (JS_IsException(A))
-            goto exception;
-        n = 0;
-        for(;;) {
-            JS_FreeValue(ctx, result);
-            result = JS_RegExpExec(ctx, rx, S);
-            if (JS_IsException(result))
-                goto exception;
-            if (JS_IsNull(result))
-                break;
-            matchStr = JS_ToStringFree(ctx, JS_GetPropertyInt64(ctx, result, 0));
-            if (JS_IsException(matchStr))
-                goto exception;
-            isEmpty = JS_IsEmptyString(matchStr);
-            if (JS_SetPropertyInt64(ctx, A, n++, matchStr) < 0)
-                goto exception;
-            if (isEmpty) {
-                int64_t thisIndex, nextIndex;
-                if (JS_ToLengthFree(ctx, &thisIndex,
-                                    JS_GetProperty(ctx, rx, JS_ATOM_lastIndex)) < 0)
-                    goto exception;
-                p = JS_VALUE_GET_STRING(S);
-                nextIndex = string_advance_index(p, thisIndex, fullUnicode);
-                if (JS_SetProperty(ctx, rx, JS_ATOM_lastIndex, js_int64(nextIndex)) < 0)
-                    goto exception;
-            }
-        }
-        if (n == 0) {
-            JS_FreeValue(ctx, A);
-            A = JS_NULL;
-        }
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
+        s->rx = JS_UNDEFINED; s->str = JS_UNDEFINED; s->flags = JS_UNDEFINED;
+        s->arr = JS_UNDEFINED; s->mres = JS_UNDEFINED; s->m0 = JS_UNDEFINED;
+        s->n = 0; s->thisIndex = 0; s->is_global = 0; s->fullUnicode = 0;
+        if (!JS_IsObject(s->hdr.this_val)) { JS_ThrowTypeErrorNotAnObject(ctx); return -1; }
+        s->rx = js_dup(s->hdr.this_val);
+        s->hdr.stage = 1;
     }
-    JS_FreeValue(ctx, result);
-    JS_FreeValue(ctx, flags);
-    JS_FreeValue(ctx, S);
-    return A;
+    if (s->hdr.stage == 1) {
+        r = step_tostring_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->str, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 2;
+    }
+    if (s->hdr.stage == 2) {
+        r = step_getprop_run(ctx, &s->hdr, s->rx, JS_ATOM_flags, cb_result, &s->flags, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 3;
+    }
+    if (s->hdr.stage == 3) {
+        JSString *fp;
+        r = step_tostring_run(ctx, &s->hdr, s->flags, cb_result, &str, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        JS_FreeValue(ctx, s->flags);
+        s->flags = str;
+        fp = JS_VALUE_GET_STRING(s->flags);
+        s->is_global = (-1 != string_indexof_char(fp, 'g', 0));
+        /* the 'v' flag implies full Unicode, like 'u' */
+        s->fullUnicode = s->is_global && (string_indexof_char(fp, 'u', 0) >= 0 ||
+                                          string_indexof_char(fp, 'v', 0) >= 0);
+        JS_FreeValue(ctx, s->flags); s->flags = JS_UNDEFINED;
+        s->hdr.stage = s->is_global ? 5 : 4;
+    }
+    if (s->hdr.stage == 4) {
+        /* step 5: not global — ONE RegExpExec, and its result IS the answer */
+        r = step_reexec_run(ctx, &s->hdr, s->rx, s->str, s->cbx, cb_result, &s->arr, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        return 0;
+    }
+    if (s->hdr.stage == 5) {
+        /* step 6.b: `? Set(rx, "lastIndex", +0, true)` */
+        r = step_setprop_run(ctx, &s->hdr, s->rx, JS_ATOM_lastIndex, js_int32(0), cb_result, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->arr = JS_NewArray(ctx);   /* step 6.c: ArrayCreate(0) — engine-private, so filling it runs nothing */
+        if (JS_IsException(s->arr)) { s->arr = JS_UNDEFINED; return -1; }
+        s->hdr.stage = 6;
+    }
+    for (;;) {
+        if (s->hdr.stage == 6) {
+            r = step_reexec_run(ctx, &s->hdr, s->rx, s->str, s->cbx, cb_result, &s->mres, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            if (JS_IsNull(s->mres)) {
+                /* step 6.e.ii: no matches at all is null, not an empty array */
+                JS_FreeValue(ctx, s->mres); s->mres = JS_UNDEFINED;
+                if (s->n == 0) { JS_FreeValue(ctx, s->arr); s->arr = JS_NULL; }
+                return 0;
+            }
+            s->hdr.stage = 7;
+        }
+        if (s->hdr.stage == 7) {
+            r = step_getidx_run(ctx, &s->hdr, s->mres, 0, cb_result, &s->m0, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->hdr.stage = 8;
+        }
+        if (s->hdr.stage == 8) {
+            int empty;
+            r = step_tostring_run(ctx, &s->hdr, s->m0, cb_result, &str, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            JS_FreeValue(ctx, s->m0); s->m0 = JS_UNDEFINED;
+            JS_FreeValue(ctx, s->mres); s->mres = JS_UNDEFINED;
+            empty = JS_IsEmptyString(str);
+            /* step 6.e.iv: `!` CreateDataPropertyOrThrow(A, ToString(n), matchStr) — A is engine-private */
+            if (JS_DefinePropertyValueInt64(ctx, s->arr, s->n, str, JS_PROP_C_W_E | JS_PROP_THROW) < 0)
+                return -1;
+            s->n++;
+            if (!empty) { s->hdr.stage = 6; continue; }
+            s->hdr.stage = 9;
+        }
+        if (s->hdr.stage == 9) {
+            /* an EMPTY match must always advance at least one char, or the loop never terminates */
+            r = step_getlen_run(ctx, &s->hdr, s->rx, JS_ATOM_lastIndex, cb_result, &s->thisIndex,
+                                out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->hdr.stage = 10;
+        }
+        r = step_setprop_run(ctx, &s->hdr, s->rx, JS_ATOM_lastIndex,
+                             js_int64(string_advance_index(JS_VALUE_GET_STRING(s->str), s->thisIndex,
+                                                           s->fullUnicode)),
+                             cb_result, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 6;
+    }
+}
 
-exception:
-    JS_FreeValue(ctx, A);
-    JS_FreeValue(ctx, result);
-    JS_FreeValue(ctx, flags);
-    JS_FreeValue(ctx, S);
-    return JS_EXCEPTION;
+static JSValue js_re_match_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSReMatch *s = st;
+    JSValue r = take_result ? s->arr : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->arr);
+    JS_FreeValue(ctx, s->rx);
+    JS_FreeValue(ctx, s->str);
+    JS_FreeValue(ctx, s->flags);
+    JS_FreeValue(ctx, s->mres);
+    JS_FreeValue(ctx, s->m0);
+    js_free(ctx, s);
+    return r;
 }
 
 typedef struct JSRegExpStringIteratorData {
@@ -63293,120 +63546,161 @@ static int js_is_standard_regexp(JSContext *ctx, JSValueConst rx)
    gets the same hook as the string path. Phase 1 runs entirely in C at SETUP because the recognizer requires a
    STANDARD regexp — JS_RegExpExec then uses the built-in exec and no user code runs before the first callback.
    A patched `exec` or a subclassed regexp is therefore NOT recognized and still takes the ordinary C path. */
+/* 22.2.6.11 step 14 — phase 2, one match per entry. EVERY read here is off an object the page produced (a
+   patched `exec` returns whatever it likes), so LengthOfArrayLike, `? Get(result,"0")` and its ToString,
+   `? Get(result,"index")`, each `? Get(result, n)` and its ToString, `? Get(result,"groups")` and the ToString
+   of the replacer's own return are all its code. They ran from C.
+   The C also read "groups" BEFORE the captures. Step 14.i runs the capture loop and step 14.j reads "groups"
+   after it, which a getter on either observes; the stages below are in the spec's order.
+   Stages: 30 the per-match head + length, 31 Get "0", 32 its ToString, 33 Get "index", 34/35 the capture loop,
+   36 Get "groups", 37 the dispatch, 38/39 the replacer's return. */
 static void js_re_rep_free_cb(JSContext *ctx, struct JSReRep *s);
-static int js_re_rep_step(JSContext *ctx, struct JSReRep *s, JSValue cb_result)
+static int js_re_rep_splice(JSContext *ctx, JSReRep *s, JSValue rep_str)
 {
     JSString *sp = JS_VALUE_GET_STRING(s->str);
-
-    if (s->cb_pending) {
-        /* the replacer returned: ToString it and splice at the recorded position */
-        JSValue rep_str = JS_ToString(ctx, cb_result);
-        JS_FreeValue(ctx, cb_result);
-        js_re_rep_free_cb(ctx, s);
-        s->cb_pending = 0;
-        if (JS_IsException(rep_str))
-            return -1;
-        /* a custom regexp can hand back a BACKWARD index; the substitution is then ignored (never rewinds) */
-        if (s->position >= s->nextSourcePosition) {
-            string_buffer_concat(&s->b, sp, s->nextSourcePosition, s->position);
-            string_buffer_concat_value(&s->b, rep_str);
-            s->nextSourcePosition = s->position + JS_VALUE_GET_STRING(s->matched)->len;
-        }
-        JS_FreeValue(ctx, rep_str);
-        s->j++;
+    /* a custom regexp can hand back a BACKWARD index; the substitution is then ignored (never rewinds) */
+    if (s->position >= s->nextSourcePosition) {
+        string_buffer_concat(&s->b, sp, s->nextSourcePosition, s->position);
+        string_buffer_concat_value(&s->b, rep_str);
+        s->nextSourcePosition = s->position + JS_VALUE_GET_STRING(s->matched)->len;
     }
-    for (; s->j < s->nresults; s->j++) {
-        JSValueConst result = s->results[s->j];
-        JSValue namedCaptures;
-        uint32_t nCaptures;
-        int n, k;
-        if (js_get_length32(ctx, &nCaptures, result) < 0)
-            return -1;
-        JS_FreeValue(ctx, s->matched);
-        s->matched = JS_ToStringFree(ctx, JS_GetPropertyInt64(ctx, result, 0));
-        if (JS_IsException(s->matched))
-            return -1;
-        if (JS_ToLengthFree(ctx, &s->position, JS_GetProperty(ctx, result, JS_ATOM_index)))
-            return -1;
-        if (s->position > sp->len)
-            s->position = sp->len;
-        else if (s->position < 0)
-            s->position = 0;
-        namedCaptures = JS_GetProperty(ctx, result, JS_ATOM_groups);
-        if (JS_IsException(namedCaptures))
-            return -1;
-        /* Call(replaceValue, undefined, «matched, ...captures, position, string, groups?»). The spec builds a
-           LIST, not an array — the JS array the C path materializes is never observable, so the args go straight
-           into the call buffer. Layout is [this, fn, args...] so do_tramp_call reads fn at call_argv[-1]. */
-        if (!s->functional) {
-            /* A NON-callable replacement is the same walk with a different substitution SOURCE — GetSubstitution
-               instead of a callback — so it runs HERE, in the one machine, and continues to the next match. It is
-               not a separate no-callback body: that duplicate walk is deleted. */
+    JS_FreeValue(ctx, rep_str);
+    s->j++;
+    s->hdr.stage = 30;
+    return 0;
+}
+
+static int js_re_rep_step(JSContext *ctx, struct JSReRep *s, JSValue cb_result,
+                          JSValue **out_cb, int *out_argc)
+{
+    JSString *sp = JS_VALUE_GET_STRING(s->str);
+    JSValueConst result;
+    JSValue str;
+    int r;
+
+    if (s->hdr.stage == 38) {
+        s->repres = cb_result; cb_result = JS_UNDEFINED;
+        js_re_rep_free_cb(ctx, s);
+        s->hdr.stage = 39;
+    }
+    if (s->hdr.stage == 39) {
+        r = step_tostring_run(ctx, &s->hdr, s->repres, cb_result, &str, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        JS_FreeValue(ctx, s->repres); s->repres = JS_UNDEFINED;
+        js_re_rep_splice(ctx, s, str);
+    }
+    for (;;) {
+        if (s->hdr.stage == 30) {
+            int64_t rlen;
+            if (s->j >= s->nresults) { JS_FreeValue(ctx, cb_result); break; }
+            r = step_length_run(ctx, &s->hdr, s->results[s->j], cb_result, &rlen, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->nCaptures = rlen > 1 ? rlen - 1 : 0;
+            s->hdr.stage = 31;
+        }
+        result = s->results[s->j];
+        if (s->hdr.stage == 31) {
+            r = step_getidx_run(ctx, &s->hdr, result, 0, cb_result, &s->m0, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->hdr.stage = 32;
+        }
+        if (s->hdr.stage == 32) {
+            r = step_tostring_run(ctx, &s->hdr, s->m0, cb_result, &str, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            JS_FreeValue(ctx, s->m0); s->m0 = JS_UNDEFINED;
+            JS_FreeValue(ctx, s->matched);
+            s->matched = str;
+            s->hdr.stage = 33;
+        }
+        if (s->hdr.stage == 33) {
+            r = step_getlen_run(ctx, &s->hdr, result, JS_ATOM_index, cb_result, &s->position, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            if (s->position > sp->len) s->position = sp->len;
+            else if (s->position < 0) s->position = 0;
+            /* the call buffer IS the spec's captures List: [this, fn, matched, caps..., position, string,
+               groups?]. It is allocated once nCaptures is known and filled as each capture lands, so an abandon
+               mid-loop releases exactly what has been gathered (js_re_rep_free_cb reads cb_nargs). */
+            js_re_rep_free_cb(ctx, s);
+            s->cb_buf = js_malloc(ctx, sizeof(JSValue) * (size_t)(2 + s->nCaptures + 4));
+            if (!s->cb_buf) return -1;
+            s->cb_buf[0] = JS_UNDEFINED;               /* thisArgument */
+            s->cb_buf[1] = js_dup(s->rep);
+            s->cb_buf[2] = js_dup(s->matched);
+            s->cb_nargs = 1;
+            s->n = 1;
+            s->hdr.stage = 34;
+        }
+        while (s->hdr.stage == 34 || s->hdr.stage == 35) {
+            if (s->hdr.stage == 34) {
+                if (s->n > s->nCaptures) { s->hdr.stage = 36; break; }
+                r = step_getidx_run(ctx, &s->hdr, result, s->n, cb_result, &s->cap, out_cb, out_argc);
+                cb_result = JS_UNDEFINED;
+                if (r) return r < 0 ? -1 : r;
+                s->hdr.stage = 35;
+            }
+            if (!JS_IsUndefined(s->cap)) {
+                r = step_tostring_run(ctx, &s->hdr, s->cap, cb_result, &str, out_cb, out_argc);
+                cb_result = JS_UNDEFINED;
+                if (r) return r < 0 ? -1 : r;
+                JS_FreeValue(ctx, s->cap);
+                s->cap = str;
+            }
+            s->cb_buf[2 + s->cb_nargs++] = s->cap;     /* the buffer adopts it */
+            s->cap = JS_UNDEFINED;
+            s->n++;
+            s->hdr.stage = 34;
+        }
+        if (s->hdr.stage == 36) {
+            r = step_getprop_run(ctx, &s->hdr, result, JS_ATOM_groups, cb_result, &s->named, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->hdr.stage = 37;
+        }
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        s->cb_buf[2 + s->cb_nargs++] = js_int32(s->position);
+        s->cb_buf[2 + s->cb_nargs++] = js_dup(s->str);
+        if (s->functional) {
+            /* step 14.k: Call(replaceValue, undefined, «matched, ...captures, position, string, groups?»). The
+               spec builds a LIST, not an array — the JS array a C path materializes is never observable, so the
+               args go straight into the call buffer. */
+            if (!JS_IsUndefined(s->named)) {
+                s->cb_buf[2 + s->cb_nargs++] = s->named;   /* ownership moves into the buffer */
+                s->named = JS_UNDEFINED;
+            }
+            s->hdr.stage = 38;
+            *out_cb = s->cb_buf; *out_argc = s->cb_nargs;
+            return 3;
+        }
+        {   /* step 14.l: a NON-callable replacement is the same walk with a different substitution SOURCE —
+               GetSubstitution instead of a callback — so it runs HERE, in the one machine, and continues to the
+               next match. It is not a separate no-callback body: that duplicate walk is deleted. */
             JSValueConst gargs[6];
             JSValue tab, ncap1, rep_str;
-            int gn;
+            int64_t gn;
             tab = JS_NewArray(ctx);
-            if (JS_IsException(tab)) { JS_FreeValue(ctx, namedCaptures); return -1; }
-            if (JS_DefinePropertyValueInt64Const(ctx, tab, 0, js_dup(s->matched), JS_PROP_C_W_E | JS_PROP_THROW) < 0) {
-                JS_FreeValue(ctx, tab); JS_FreeValue(ctx, namedCaptures); return -1;
-            }
-            for (gn = 1; gn < nCaptures; gn++) {
-                JSValue capN = JS_GetPropertyInt64(ctx, result, gn);
-                if (JS_IsException(capN)) { JS_FreeValue(ctx, tab); JS_FreeValue(ctx, namedCaptures); return -1; }
-                if (!JS_IsUndefined(capN)) {
-                    capN = JS_ToStringFree(ctx, capN);
-                    if (JS_IsException(capN)) { JS_FreeValue(ctx, tab); JS_FreeValue(ctx, namedCaptures); return -1; }
-                }
-                if (JS_DefinePropertyValueInt64(ctx, tab, gn, capN, JS_PROP_C_W_E | JS_PROP_THROW) < 0) {
-                    JS_FreeValue(ctx, tab); JS_FreeValue(ctx, namedCaptures); return -1;
+            if (JS_IsException(tab)) return -1;
+            for (gn = 0; gn <= s->nCaptures; gn++) {
+                if (JS_DefinePropertyValueInt64(ctx, tab, gn, js_dup(s->cb_buf[2 + gn]),
+                                                JS_PROP_C_W_E | JS_PROP_THROW) < 0) {
+                    JS_FreeValue(ctx, tab);
+                    return -1;
                 }
             }
-            if (!JS_IsUndefined(namedCaptures)) {
-                ncap1 = JS_ToObject(ctx, namedCaptures);
-                if (JS_IsException(ncap1)) { JS_FreeValue(ctx, tab); JS_FreeValue(ctx, namedCaptures); return -1; }
-            } else {
-                ncap1 = JS_UNDEFINED;
-            }
+            ncap1 = JS_IsUndefined(s->named) ? JS_UNDEFINED : JS_ToObject(ctx, s->named);
+            if (JS_IsException(ncap1)) { JS_FreeValue(ctx, tab); return -1; }
+            JS_FreeValue(ctx, s->named); s->named = JS_UNDEFINED;
             gargs[0] = s->matched; gargs[1] = s->str; gargs[2] = js_int32(s->position);
             gargs[3] = tab;        gargs[4] = ncap1;  gargs[5] = s->rep;
             rep_str = js_string___GetSubstitution(ctx, JS_UNDEFINED, 6, gargs);
-            JS_FreeValue(ctx, tab); JS_FreeValue(ctx, ncap1); JS_FreeValue(ctx, namedCaptures);
+            JS_FreeValue(ctx, tab); JS_FreeValue(ctx, ncap1);
             if (JS_IsException(rep_str)) return -1;
-            if (s->position >= s->nextSourcePosition) {
-                string_buffer_concat(&s->b, sp, s->nextSourcePosition, s->position);
-                string_buffer_concat_value(&s->b, rep_str);
-                s->nextSourcePosition = s->position + JS_VALUE_GET_STRING(s->matched)->len;
-            }
-            JS_FreeValue(ctx, rep_str);
-            continue;
+            js_re_rep_splice(ctx, s, rep_str);
         }
-        s->cb_nargs = 0;
-        s->cb_buf = js_malloc(ctx, sizeof(JSValue) * (2 + nCaptures + 3));
-        if (!s->cb_buf) { JS_FreeValue(ctx, namedCaptures); return -1; }
-        s->cb_buf[0] = JS_UNDEFINED;          /* thisArgument */
-        s->cb_buf[1] = js_dup(s->rep);
-        k = 2;
-        s->cb_buf[k++] = js_dup(s->matched);
-        s->cb_nargs = 1;
-        for (n = 1; n < nCaptures; n++) {
-            JSValue capN = JS_GetPropertyInt64(ctx, result, n);
-            if (JS_IsException(capN)) { JS_FreeValue(ctx, namedCaptures); s->cb_nargs = k - 2; return -1; }
-            if (!JS_IsUndefined(capN)) {
-                capN = JS_ToStringFree(ctx, capN);
-                if (JS_IsException(capN)) { JS_FreeValue(ctx, namedCaptures); s->cb_nargs = k - 2; return -1; }
-            }
-            s->cb_buf[k++] = capN;
-            s->cb_nargs++;
-        }
-        s->cb_buf[k++] = js_int32(s->position);   s->cb_nargs++;
-        s->cb_buf[k++] = js_dup(s->str);          s->cb_nargs++;
-        if (!JS_IsUndefined(namedCaptures)) {
-            s->cb_buf[k++] = namedCaptures;       s->cb_nargs++;   /* ownership moves into the buffer */
-        } else {
-            JS_FreeValue(ctx, namedCaptures);
-        }
-        s->cb_pending = 1;
-        return 3;
     }
     string_buffer_concat(&s->b, sp, s->nextSourcePosition, sp->len);
     s->result = string_buffer_end(&s->b);
@@ -63428,109 +63722,144 @@ static void js_re_rep_free_cb(JSContext *ctx, struct JSReRep *s)
 }
 
 /* RegExp.prototype[@@replace] IS this step machine — JS_CFUNC_STEP_DEF, no recognizer, no C entry to choose
-   against. init runs 22.2.6.11 phase 1 (lastIndex reset + collect EVERY match); step runs phase 2, one match per
-   step. A NON-functional replacer has no JS re-entry at all, so it is computed here in C and the machine reports
-   DONE immediately — that is the no-callback case, not a second copy of the callback walk. */
-/* Phase 1 of RegExp.prototype[@@replace]: collect every match. The old init did this BEFORE allocating the
-   state, which is why it needed a `fail:` label duplicating js_re_rep_end's teardown — and why handing the
-   collected array over late leaked all 361 of its objects. The state now exists first, so every owned value goes
-   onto it the moment it is produced and the ONE teardown covers every exit. */
-static int js_re_rep_prologue(JSContext *ctx, JSReRep *s)
-{
-    JSValueConst this_val = s->hdr.this_val;
-    JSValueConst repArg = step_arg(&s->hdr, 1);
-    JSValue flags;
-    JSString *fp2;
-    int is_global2, fullUnicode2 = 0, rcap = 0;
-
-    if (!JS_IsObject(this_val)) { JS_ThrowTypeErrorNotAnObject(ctx); return -1; }
-    s->rx = js_dup(this_val);
-    string_buffer_init(ctx, &s->b, 0);
-
-    flags = JS_GetProperty(ctx, this_val, JS_ATOM_flags);
-    if (JS_IsException(flags)) return -1;
-    flags = JS_ToStringFree(ctx, flags);
-    if (JS_IsException(flags)) return -1;
-    fp2 = JS_VALUE_GET_STRING(flags);
-    is_global2 = (-1 != string_indexof_char(fp2, 'g', 0));
-    if (is_global2) {
-        fullUnicode2 = (string_indexof_char(fp2, 'u', 0) >= 0 || string_indexof_char(fp2, 'v', 0) >= 0);
-        if (JS_SetProperty(ctx, this_val, JS_ATOM_lastIndex, js_int32(0)) < 0) { JS_FreeValue(ctx, flags); return -1; }
-    }
-    JS_FreeValue(ctx, flags);
-    s->is_global = is_global2;
-    s->fullUnicode = fullUnicode2;
-    return 0;   /* ToString(S) is the page's code and is stage 10; the collection resumes in _collect below */
-}
-
-/* 22.2.7.11 step 5 onwards: with S in hand, collect every match. Split from the prologue because the ToString
-   between them runs the page's code and so has to be a stage of its own. */
-static int js_re_rep_collect(JSContext *ctx, JSReRep *s)
-{
-    JSValueConst this_val = s->hdr.this_val;
-    JSValueConst repArg = step_arg(&s->hdr, 1);
-    int is_global2 = s->is_global, fullUnicode2 = s->fullUnicode, rcap = s->nresults;
-    for (;;) {
-        JSValue mres = JS_RegExpExec(ctx, this_val, s->str);
-        if (JS_IsException(mres)) return -1;
-        if (JS_IsNull(mres)) { JS_FreeValue(ctx, mres); break; }
-        if (s->nresults == rcap) {
-            JSValue *nr;
-            rcap = rcap ? rcap * 2 : 8;
-            nr = js_realloc(ctx, s->results, sizeof(JSValue) * rcap);
-            if (!nr) { JS_FreeValue(ctx, mres); JS_ThrowOutOfMemory(ctx); return -1; }
-            s->results = nr;
-        }
-        s->results[s->nresults++] = mres;
-        if (!is_global2) break;
-        {   /* an EMPTY match must always advance at least one char, or the collect never terminates */
-            JSValue m0 = JS_ToStringFree(ctx, JS_GetPropertyInt64(ctx, mres, 0));
-            if (JS_IsException(m0)) return -1;
-            if (JS_IsEmptyString(m0)) {
-                int64_t thisIndex, nextIndex;
-                JS_FreeValue(ctx, m0);
-                if (JS_ToLengthFree(ctx, &thisIndex, JS_GetProperty(ctx, this_val, JS_ATOM_lastIndex)) < 0) return -1;
-                nextIndex = string_advance_index(JS_VALUE_GET_STRING(s->str), thisIndex, fullUnicode2);
-                if (JS_SetProperty(ctx, this_val, JS_ATOM_lastIndex, js_int64(nextIndex)) < 0) return -1;
-            } else {
-                JS_FreeValue(ctx, m0);
-            }
-        }
-    }
-    /* ONE machine, both replacer kinds: a callable drives step-code 3, anything else is ToString'd once and fed
-       to GetSubstitution inside the same walk. */
-    s->functional = JS_IsFunction(ctx, repArg);
-    if (s->functional) {
-        s->rep = js_dup(repArg);
-    } else {
-        s->rep = JS_ToString(ctx, repArg);
-        if (JS_IsException(s->rep)) { s->rep = JS_UNDEFINED; return -1; }
-    }
-    return 0;
-}
+   against. Stages 0, 10, 20 and 2-4 are 22.2.6.11 steps 2-8 IN THE SPEC'S ORDER — ToString(string), then the
+   replacer's ToString, then `flags`, then the lastIndex reset. The C read `flags` FIRST, which
+   `{ get flags(){...} }` with a throwing subject observes. 11-15 collect every match; 30 onwards is phase 2.
+   DELETED: js_re_rep_prologue and js_re_rep_collect. They ran the whole of phase 1 from C — `? Get(rx,"flags")`
+   and its ToString, `? Set(rx,"lastIndex",0)`, then an UNBOUNDED JS_RegExpExec loop whose every turn could call
+   a patched `exec`, read `[0]` off whatever that returned, ToString it, and re-read and re-write `lastIndex`.
+   A comment here used to justify that by saying a recognizer required a STANDARD regexp, so no user code ran
+   before the first callback. The recognizer is gone, so the justification was stale and the loop was a
+   drive-to-completion inside a converted machine: `re.exec = function(){ while(...){} }` aborted at its
+   back-edge with "its C entry never became a flow base". */
 
 static int js_re_rep_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSReRep *s = st;
+    JSValueConst repArg = step_arg(&s->hdr, 1);
     int r;
+
     if (s->hdr.stage == 0) {
-        JS_FreeValue(ctx, cb_result);
-        cb_result = JS_UNDEFINED;
-        if (js_re_rep_prologue(ctx, s))
-            return -1;
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        if (!JS_IsObject(s->hdr.this_val)) { JS_ThrowTypeErrorNotAnObject(ctx); return -1; }
+        /* FIRST, before anything that can throw: the teardown frees exactly what the state holds, and a buffer
+           initialised late is freed with a NULL ctx. */
+        string_buffer_init(ctx, &s->b, 0);
+        s->flags = JS_UNDEFINED; s->mres = JS_UNDEFINED; s->m0 = JS_UNDEFINED;
+        s->cap = JS_UNDEFINED; s->named = JS_UNDEFINED; s->repres = JS_UNDEFINED;
+        s->rx = js_dup(s->hdr.this_val);
         s->hdr.stage = 10;
     }
     if (s->hdr.stage == 10) {
+        /* step 3: `? ToString(string)` — BEFORE the replacer's coercion and before `flags` */
         r = step_tostring_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->str, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
-        s->hdr.stage = 1;
-        if (js_re_rep_collect(ctx, s))
-            return -1;
+        s->hdr.stage = 20;
     }
-    r = js_re_rep_step(ctx, s, cb_result);
-    if (r == 3) { *out_cb = s->cb_buf; *out_argc = s->cb_nargs; }
-    return r;
+    if (s->hdr.stage == 20) {
+        /* steps 5-6: ONE machine, both replacer kinds — a callable drives step-code 3, anything else is
+           ToString'd HERE, which is where the spec coerces it: before `flags` is read, not after the matches
+           are collected. */
+        s->functional = JS_IsFunction(ctx, repArg);
+        if (s->functional) {
+            s->rep = js_dup(repArg);
+            JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        } else {
+            r = step_tostring_run(ctx, &s->hdr, repArg, cb_result, &s->rep, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) { if (r < 0) s->rep = JS_UNDEFINED; return r < 0 ? -1 : r; }
+        }
+        s->hdr.stage = 2;
+    }
+    if (s->hdr.stage == 2) {
+        /* step 3: `? Get(rx, "flags")`. RegExp.prototype.flags is an accessor that reads six more, so on a
+           subclass this is the page's code several times over. */
+        r = step_getprop_run(ctx, &s->hdr, s->rx, JS_ATOM_flags, cb_result, &s->flags, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 3;
+    }
+    if (s->hdr.stage == 3) {
+        JSValue fstr;
+        JSString *fp;
+        r = step_tostring_run(ctx, &s->hdr, s->flags, cb_result, &fstr, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        JS_FreeValue(ctx, s->flags);
+        s->flags = fstr;
+        fp = JS_VALUE_GET_STRING(s->flags);
+        s->is_global = (-1 != string_indexof_char(fp, 'g', 0));
+        /* the 'v' flag implies full Unicode, like 'u' */
+        s->fullUnicode = s->is_global && (string_indexof_char(fp, 'u', 0) >= 0 ||
+                                          string_indexof_char(fp, 'v', 0) >= 0);
+        JS_FreeValue(ctx, s->flags); s->flags = JS_UNDEFINED;
+        s->hdr.stage = s->is_global ? 4 : 11;
+    }
+    if (s->hdr.stage == 4) {
+        /* step 4.b: `? Set(rx, "lastIndex", 0, true)` */
+        r = step_setprop_run(ctx, &s->hdr, s->rx, JS_ATOM_lastIndex, js_int32(0), cb_result, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 11;
+    }
+    /* step 5 onwards: collect EVERY match. Unbounded by construction — a patched `exec` decides when it ends —
+       so each turn is stages, never a C loop. */
+    while (s->hdr.stage >= 11 && s->hdr.stage <= 15) {
+        if (s->hdr.stage == 11) {
+            r = step_reexec_run(ctx, &s->hdr, s->rx, s->str, s->cbx, cb_result, &s->mres, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            if (JS_IsNull(s->mres)) { JS_FreeValue(ctx, s->mres); s->mres = JS_UNDEFINED; s->hdr.stage = 30; break; }
+            if (s->nresults == s->rcap) {
+                JSValue *nr;
+                int ncap = s->rcap ? s->rcap * 2 : 8;
+                nr = js_realloc(ctx, s->results, sizeof(JSValue) * ncap);
+                if (!nr) { JS_ThrowOutOfMemory(ctx); return -1; }
+                s->results = nr; s->rcap = ncap;
+            }
+            s->results[s->nresults++] = s->mres;   /* the array adopts it */
+            s->mres = JS_UNDEFINED;
+            if (!s->is_global) { s->hdr.stage = 30; break; }
+            s->hdr.stage = 12;
+        }
+        if (s->hdr.stage == 12) {
+            r = step_getidx_run(ctx, &s->hdr, s->results[s->nresults - 1], 0, cb_result, &s->m0,
+                                out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->hdr.stage = 13;
+        }
+        if (s->hdr.stage == 13) {
+            JSValue mstr;
+            int empty;
+            r = step_tostring_run(ctx, &s->hdr, s->m0, cb_result, &mstr, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            JS_FreeValue(ctx, s->m0); s->m0 = JS_UNDEFINED;
+            /* an EMPTY match must always advance at least one char, or the collection never terminates */
+            empty = JS_IsEmptyString(mstr);
+            JS_FreeValue(ctx, mstr);
+            s->hdr.stage = empty ? 14 : 11;
+            continue;
+        }
+        if (s->hdr.stage == 14) {
+            r = step_getlen_run(ctx, &s->hdr, s->rx, JS_ATOM_lastIndex, cb_result, &s->thisIndex,
+                                out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->hdr.stage = 15;
+        }
+        r = step_setprop_run(ctx, &s->hdr, s->rx, JS_ATOM_lastIndex,
+                             js_int64(string_advance_index(JS_VALUE_GET_STRING(s->str), s->thisIndex,
+                                                           s->fullUnicode)),
+                             cb_result, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 11;
+    }
+    DCHECK(s->hdr.stage >= 30, "the @@replace machine entered phase 2 from an unexpected stage");
+    return js_re_rep_step(ctx, s, cb_result, out_cb, out_argc);
 }
 
 static JSValue js_re_rep_fini(JSContext *ctx, void *st, bool take_result)
@@ -63557,6 +63886,12 @@ static void js_re_rep_end(JSContext *ctx, struct JSReRep *s, bool take_result)
     JS_FreeValue(ctx, s->str);
     JS_FreeValue(ctx, s->rep);
     JS_FreeValue(ctx, s->matched);
+    JS_FreeValue(ctx, s->flags);
+    JS_FreeValue(ctx, s->mres);
+    JS_FreeValue(ctx, s->m0);
+    JS_FreeValue(ctx, s->cap);
+    JS_FreeValue(ctx, s->named);
+    JS_FreeValue(ctx, s->repres);
 }
 
 
@@ -63776,7 +64111,7 @@ static const JSCFunctionListEntry js_regexp_proto_funcs[] = {
     JS_CFUNC_STEP_DEF("test", 1, STEPDEF_REGEXP_TEST ),
     JS_CFUNC_DEF("toString", 0, js_regexp_toString ),
     JS_CFUNC_STEP_DEF("[Symbol.replace]", 2, STEPDEF_RE_REPLACE ),
-    JS_CFUNC_DEF("[Symbol.match]", 1, js_regexp_Symbol_match ),
+    JS_CFUNC_STEP_DEF("[Symbol.match]", 1, STEPDEF_RE_MATCH ),
     JS_CFUNC_DEF("[Symbol.matchAll]", 1, js_regexp_Symbol_matchAll ),
     JS_CFUNC_DEF("[Symbol.search]", 1, js_regexp_Symbol_search ),
     JS_CFUNC_DEF("[Symbol.split]", 2, js_regexp_Symbol_split ),
