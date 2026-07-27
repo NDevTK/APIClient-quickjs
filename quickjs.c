@@ -19622,7 +19622,6 @@ static void js_toprim_abandon(JSContext *ctx, struct JSToPrim *tp)
                                   [value, done] exactly where js_for_of_next's tail does. */
 
 
-static JSValue js_iterator_from(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 /* What a source's @@iterator says, read WITHOUT running anything. Three answers, not two: collapsing ABSENT into
    DECLINE is what kept Array.from's array-like branch in C, because "there is no @@iterator" and "I cannot see the
    @@iterator without invoking something" are opposite conclusions — the first SELECTS the length+indices algorithm,
@@ -19714,18 +19713,8 @@ static int js_append_fast_array(JSContext *ctx, JSValue *sp)
    tramp arm performs the whole of 27.1.3.1 (its TypeErrors included) and the C entry DFAILs, so the only thing
    this does is pass the side-effect-free @@iterator probe along for the acquire to use. Its ABSENCE is the
    acquire's flattenable "O is its own iterator" case, never a reason to refuse the route. */
-static bool tramp_can_call_iterator_from(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, JSValue *out_getiter)
-{
-    JSObject *fp;
-    *out_getiter = JS_UNDEFINED;
-    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
-    fp = JS_VALUE_GET_OBJ(func);
-    if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
-    if (fp->u.cfunc.cproto != JS_CFUNC_generic) return false;
-    if (fp->u.cfunc.c_function.generic != js_iterator_from) return false;
-    if (call_argc >= 1) iter_data_at_iterator(ctx, call_argv[0], out_getiter);   /* JS_UNDEFINED when absent/uncallable */
-    return true;
-}
+/* DELETED: tramp_can_call_iterator_from. Iterator.from declares its walk at its own definition; it declined
+   nothing, so the identity test was the whole of it. */
 #define CONT_ITER_HELPER   11  /* cont_state = JSIteratorHelperData: a lazy Iterator Helper (drop/take/map/filter/
                                   flatMap) whose .next() drives the SOURCE iterator's .next() on the chain (a generator
                                   source runs on the tramp), applies the per-kind transform, and delivers per call
@@ -20046,6 +20035,12 @@ typedef struct {
 #define ITERCONS_SUMPRECISE 7 /* Math.sumPrecise(iterable): no result object at all — `sum` accumulates exactly and the
                                  finish yields the correctly-rounded double. A non-number element is an
                                  IfAbruptCloseIterator TypeError like every other sink's bad element. */
+#define ITERCONS_TA_FROM 10 /* %TypedArray%.from(source, mapfn?, thisArg?) — do_ta_consume_tramp's `from` shape */
+#define ITERCONS_TA_OF   11 /* %TypedArray%.of(...items) — the same create+set phases with the argument LIST as
+                               the source, which is why it shares that walk rather than growing its own */
+#define ITERCONS_ITERFROM 9 /* Iterator.from(O): NOT a sink on the consume walk — a walk of its own
+                              (do_iterfrom_tramp). The magic a builtin declares names WHICH WALK it wants, and
+                              these values are that namespace; most of them happen to be consume sinks. */
 #define ITERCONS_FROMLIKE 8 /* Array.from over an ARRAY-LIKE — length + indices, no @@iterator at all. A genuinely
                               different algorithm from the iterator walk, so it is not a sink on JSIterConsume but a
                               machine of its own; this value only tells the ONE recognizer's caller which to drive,
@@ -20253,9 +20248,6 @@ static JSValue js_promise_all(JSContext *ctx, JSValueConst this_val, int argc, J
 static JSValue js_promise_race(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 static JSValue js_promise_all_resolve_element(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValueConst *func_data);
 static __exception int remainingElementsCount_add(JSContext *ctx, JSValueConst resolve_element_env, int addend);
-static JSValue js_typed_array_from(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
-static JSValue js_typed_array_of(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
-static bool tramp_can_call_ta_from_consume(JSContext *ctx, JSValueConst func, JSValueConst this_val, JSValueConst *call_argv, int call_argc, int *out_classid, JSValue *out_getiter);
 static void js_array_reduce_end(JSContext *ctx, struct JSArrayReduce *s, bool take_acc);
 /* arr.sort(cmpFn) with a NORMAL bytecode comparator: a SUSPENDABLE bottom-up (iterative) stable merge sort whose
    ONLY suspension point is cmp(array[l], array[r]) inside the inner merge. All algorithm state (width, block
@@ -23340,8 +23332,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto do_setop_consume_tramp;                /* s.union/symmetricDifference(setlike) */
                 if (tramp_can_call_iterterm(ctx, call_argv[-1], crecv, call_argc, &iterterm_kind))
                     goto do_iterterm_tramp;                     /* it.toArray/forEach/reduce/some/every/find */
-                if (tramp_can_call_iterator_from(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter))
-                    goto do_iterfrom_tramp;                     /* Iterator.from(obj) */
                 {   /* THE declared-capability arm. A builtin that consumes an iterator says so at its own
                        definition (JS_CFUNC_CONSUME_DEF) and carries its sink, so this asks ONE question for all
                        of them instead of one identity test per builtin. The recognizers below are the ones whose
@@ -23358,23 +23348,35 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             csink == ITERCONS_FROM)
                             csink = ITERCONS_FROMLIKE;   /* no @@iterator at all: length + indices, a different walk */
                         if (csink == ITERCONS_OBJENTRIES) goto do_objentries_consume_tramp;
+                        if (csink == ITERCONS_ITERFROM)   goto do_iterfrom_tramp;
                         if (csink == ITERCONS_FROMLIKE)   { icons_sink = csink; goto do_from_like_tramp; }
+                        if (csink == ITERCONS_TA_FROM || csink == ITERCONS_TA_OF) {
+                            /* 23.2.2.1 step 3: an uncallable mapfn throws BEFORE @@iterator is read — the same
+                               validation Array.from's prologue owns, in the same place in the order. `of` takes
+                               no mapfn at all, so it never asks. */
+                            if (csink == ITERCONS_TA_FROM && call_argc >= 2 &&
+                                !JS_IsUndefined(call_argv[1]) && check_function(ctx, call_argv[1])) {
+                                JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED;
+                                goto exception;
+                            }
+                            ta_classid = (csink == ITERCONS_TA_OF) ? -1 : 0;
+                            tac_args = vc(call_argv); tac_argc = call_argc; tac_ntgt = crecv;
+                            /* this arm records its shape LATER, in do_ta_consume_tramp, so it is the one that has
+                               to carry the resolved PAIR and the list rather than recording them here */
+                            TAKE_CALL_SHAPE(); tac_cfirst = call_first_r; tac_cargc = call_pop;
+                            tac_args_own = call_args_owned; tac_args_own_n = call_args_owned_n;
+                            call_args_owned = NULL; call_args_owned_n = 0;
+                            /* the arm records the shape it was given; forcing non-tail made
+                               `return Int8Array.of(1,2)` push its result and then run off the end of the
+                               tail-call opcode */
+                            ta_from = 1;
+                            goto do_ta_consume_tramp;
+                        }
                         DCHECK(csink == ITERCONS_FROM || csink == ITERCONS_SUMPRECISE,
                                "a builtin declared a consume sink the dispatch does not route yet");
                         icons_sink = csink;
                         goto do_iter_consume_tramp;
                     }
-                }
-                if (tramp_can_call_ta_from_consume(ctx, call_argv[-1], crecv, vc(call_argv), call_argc, &ta_classid, &tramp_iter_getiter)) {
-                    tac_args = vc(call_argv); tac_argc = call_argc; tac_ntgt = crecv;
-                    /* this arm records its shape LATER, in do_ta_consume_tramp, so it is the one that has to carry
-                       the resolved PAIR and the list rather than recording them here */
-                    TAKE_CALL_SHAPE(); tac_cfirst = call_first_r; tac_cargc = call_pop;
-                    tac_args_own = call_args_owned; tac_args_own_n = call_args_owned_n;
-                    call_args_owned = NULL; call_args_owned_n = 0;
-                    /* the arm records the shape it was given; forcing non-tail made `return Int8Array.of(1,2)`
-                       push its result and then run off the end of the tail-call opcode */
-                    ta_from = 1; goto do_ta_consume_tramp;
                 }
                 if (tramp_can_call_promise_all(ctx, call_argv[-1], vc(call_argv), call_argc, &pa_magic, &tramp_iter_getiter))
                     goto do_promise_all_consume_tramp;          /* Promise.all/allSettled/any/race(iterable) */
@@ -54235,44 +54237,10 @@ static bool tramp_can_call_ta_consume(JSContext *ctx, JSValueConst func, JSValue
 /* Route TypedArray.from(gen) (no mapfn) — js_typed_array_from's IterableToList drives the generator. this_val is the
    TypedArray ctor (the class + create target); *out_classid = its magic. A mapfn (call_argc>1) is left to the normal
    path (from applies it during element-set, a different finish). */
-static bool tramp_can_call_ta_from_consume(JSContext *ctx, JSValueConst func, JSValueConst this_val, JSValueConst *call_argv, int call_argc, int *out_classid, JSValue *out_getiter)
-{
-    JSObject *fp;
-    (void)this_val;   /* the receiver is no longer a routing question — see below */
-    *out_getiter = JS_UNDEFINED;
-    /* No blanket argc gate: `of()` with no arguments is a perfectly ordinary call that must still route (it
-       Constructs the receiver with length 0). Only `from` needs a source, and it checks for one itself. */
-    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
-    fp = JS_VALUE_GET_OBJ(func);
-    if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
-    if (fp->u.cfunc.cproto != JS_CFUNC_generic) return false;
-    if (fp->u.cfunc.c_function.generic == js_typed_array_of) {
-        /* %TypedArray%.of(...items) is 23.2.2.2: IsConstructor(C), TypedArrayCreateFromConstructor(C, «len»),
-           then Set each argument. Its create is the SAME Construct(C, «len») as from's, so it shares this
-           recognizer and the same two phases rather than growing its own of everything. */
-        *out_classid = -1;   /* the arm's marker for the `of` shape (no source object at all) */
-        return true;
-    }
-    if (fp->u.cfunc.c_function.generic != js_typed_array_from) return false;
-    /* NO receiver gate. It required a concrete %TypedArray% constructor, which sent `%TypedArray%.from([])` and
-       `TA.from.call(anyOtherCtor, …)` to the C loop — and the reason it could not be dropped was that the finish
-       created the target by CLASS ID instead of Constructing the receiver. Now that the create is a real
-       Construct(C, «len») phase on the tramp, the receiver is just the constructor the spec says it is, and its
-       IsConstructor check (step 2) lives in the arm, in order. *out_classid stays only for the sibling
-       `new TypedArray(iterable)` route, which genuinely creates by class. A primitive SOURCE is fine too — the
-       probe boxes it, exactly as Array.from's does. */
-    if (call_argc >= 2 && !JS_IsUndefined(call_argv[1]) && !JS_IsFunction(ctx, call_argv[1])) return false;   /* step 3: an uncallable mapfn throws BEFORE @@iterator is read */
-    if (call_argc < 1) return false;   /* from() with no source: the C entry's step-2/3 throws reach it first */
-    *out_classid = 0;
-    /* The probe is NOT a gate any more, only a hint. It is side-effect-free, so it declines an accessor
-       @@iterator and a Proxy — and declining the ROUTE for those handed them to a C loop that then read
-       @@iterator for real and iterated it. The arm performs that read itself when the probe came back empty, so
-       there is exactly one observable GetMethod either way, and it is the arm that decides step 5 (iterable, the
-       consume machine) versus step 6 (array-like, a different algorithm). */
-    iter_data_at_iterator(ctx, call_argv[0], out_getiter);
-    *out_classid = 0;   /* the from path constructs the receiver; the class id is the sibling route's business */
-    return true;
-}
+/* DELETED: tramp_can_call_ta_from_consume. %TypedArray%.from and .of declare their walks at their own
+   definitions. Its two remaining declines were the same pair Array.from's had — an uncallable mapfn and a
+   missing source — and neither is an algorithm: the mapfn check is step 3, raised in the dispatch before
+   @@iterator is read, and a missing source is the acquire's TypeError. */
 
 /* 23.1.2.3 Array.of. Step 4 is `Construct(C, [len])` when `this` is a constructor — a real Construct of whatever
    the page put there, reached from C by JS_CallConstructor. That drives a bytecode constructor to completion, and
@@ -58796,18 +58764,8 @@ fail:
     return JS_EXCEPTION;
 }
 
-static JSValue js_iterator_from(JSContext *ctx, JSValueConst this_val,
-                                int argc, JSValueConst *argv)
-{
-    /* The C body is DELETED, not narrowed. 27.1.3.1 lives on the tramp (do_iterfrom_tramp + the shared acquire's
-       flattenable mode + the CONT_ITER_FROM deliver), which is the only implementation: it ACQUIRES by calling
-       @@iterator, and calling it from here is off-chain by construction. Reaching this entry means a call SHAPE
-       was never routed (`Iterator.from.apply(...)`, an invocation from inside a C builtin) — name that shape
-       instead of quietly running a second, non-suspending copy of the algorithm. */
-    DFAIL("Iterator.from reached its C entry — route that call shape onto the consume machine "
-          "(do_iterfrom_tramp performs the whole of 27.1.3.1)");
-    return JS_ThrowTypeError(ctx, "Iterator.from: unrouted call shape (no off-tramp implementation exists)");
-}
+/* DELETED: js_iterator_from. Its body was already only a DFAIL — the whole of 27.1.3.1 is do_iterfrom_tramp —
+   and with the walk declared at the definition no pointer names it. */
 
 static int check_iterator(JSContext *ctx, JSValueConst obj)
 {
@@ -59336,7 +59294,7 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
 
 static const JSCFunctionListEntry js_iterator_funcs[] = {
     JS_CFUNC_DEF("concat", 0, js_iterator_concat ),
-    JS_CFUNC_DEF("from", 1, js_iterator_from ),
+    JS_CFUNC_CONSUME_DEF("from", 1, ITERCONS_ITERFROM ),
 };
 
 /* Iterator.prototype eager terminals. Every real call is intercepted at the call site and run as an
@@ -74531,42 +74489,13 @@ static JSValue js_typed_array_create(JSContext *ctx, JSValueConst ctor,
 }
 
 
-static JSValue js_typed_array_from(JSContext *ctx, JSValueConst this_val,
-                                   int argc, JSValueConst *argv)
-{
-    JSValue iter;
-    JSValueConst items = argv[0];
+/* DELETED: js_typed_array_from. Every part of it is a phase of the consume walk it now declares at its own
+   definition — the create is a real Construct(C, «len») on the tramp and the sets follow it — so the body was
+   already only a DFAIL and no pointer names it. */
 
-    /* 23.2.2.1 steps 5 AND 6 are DELETED from here. Both end in the same two phases — Construct the receiver with
-       the length, then map+set each element — and both run USER code (the constructor, the mapfn) that a C loop
-       cannot suspend, so both are phases of the consume machine now. What survives is the prefix that never
-       reaches a source: step 2's IsConstructor and step 3's mapfn check, plus step 4's read, which is what throws
-       for `TA.from()` with no argument at all. */
-    if (!JS_IsConstructor(ctx, this_val))
-        return JS_ThrowTypeError(ctx, "not a constructor");
-    if (argc > 1 && !JS_IsUndefined(argv[1]) && check_function(ctx, argv[1]))
-        return JS_EXCEPTION;
-    iter = JS_GetProperty(ctx, items, JS_ATOM_Symbol_iterator);   /* throws for a nullish source */
-    if (JS_IsException(iter))
-        return JS_EXCEPTION;
-    JS_FreeValue(ctx, iter);
-    DFAIL("TypedArray.from reached its C entry with a real source — 23.2.2.1 steps 5 and 6 are both phases of the "
-          "consume machine; route that call shape onto it");
-    return JS_ThrowTypeError(ctx, "TypedArray.from: unrouted call shape (no off-tramp implementation exists)");
-}
-
-static JSValue js_typed_array_of(JSContext *ctx, JSValueConst this_val,
-                                 int argc, JSValueConst *argv)
-{
-    /* 23.2.2.2's body is DELETED: its TypedArrayCreateFromConstructor is a real Construct of the receiver, which a
-       C loop cannot suspend through, and it shares from's create+set phases exactly. What survives is step 1,
-       which never touches a constructor. */
-    if (!JS_IsConstructor(ctx, this_val))
-        return JS_ThrowTypeError(ctx, "not a constructor");
-    DFAIL("TypedArray.of reached its C entry — its create+set are phases of the consume machine; route that "
-          "call shape onto it");
-    return JS_ThrowTypeError(ctx, "TypedArray.of: unrouted call shape (no off-tramp implementation exists)");
-}
+/* DELETED: js_typed_array_of. Every part of it is a phase of the consume walk it now declares at its own
+   definition — the create is a real Construct(C, «len») on the tramp and the sets follow it — so the body was
+   already only a DFAIL and no pointer names it. */
 
 /* 23.2.3.6 steps 4 onwards, with every argument ALREADY a primitive and `len` captured at step 2 — the clamp is
    against the length the spec read BEFORE the coercions, and the re-clamp below is what a valueOf that resized the
@@ -75723,8 +75652,8 @@ static JSValue js_typed_array_toSorted(JSContext *ctx, JSValueConst this_val,
 }
 
 static const JSCFunctionListEntry js_typed_array_base_funcs[] = {
-    JS_CFUNC_DEF("from", 1, js_typed_array_from ),
-    JS_CFUNC_DEF("of", 0, js_typed_array_of ),
+    JS_CFUNC_CONSUME_DEF("from", 1, ITERCONS_TA_FROM ),
+    JS_CFUNC_CONSUME_DEF("of", 0, ITERCONS_TA_OF ),
     JS_CGETSET_DEF("[Symbol.species]", js_get_this, NULL ),
 };
 
