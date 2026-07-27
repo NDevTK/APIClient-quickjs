@@ -19906,6 +19906,8 @@ typedef struct JSIterConsume {
     /* ITERCONS_OWNED lists EVERY owned JSValue field exactly once: clone_deep_flow dups each and js_iter_consume_end
        frees each, so the two can never drift. A field added to the struct but not to this list is shared by a fork
        and refcount-underflows on the second teardown. */
+    uint8_t len_written; /* ITERCONS_FROM: the closing Set(A,"length") has been performed (it is a phase, and the
+                            done path is re-entered after it) */
     uint8_t closing; /* 1 = the sink short-circuited: close the iterator on the tramp, then finish */
     uint8_t cb_pending; /* ITERTERM: 1 = `res` on the next step entry is the CALLBACK's result, not an iterator result */
     JSValue cb_value;   /* ITERTERM: the element held across a callback that runs on the tramp (owned) */
@@ -24622,6 +24624,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     gp_op = GP_GET; gp_val = JS_UNDEFINED;
                     goto do_getprop_tramp;
                 }
+                if (st == 10) {
+                    /* THE element-WRITE arm. CreateDataPropertyOrThrow into the result, which for Array.from with
+                       a page constructor on `this` is a Proxy or a subclass — so the `defineProperty` trap is the
+                       page's code and a loop in it must park. It shares everything with the read arm above except
+                       the operation; the driver decides what shape the write turns out to be. */
+                    gp_outer = s; gp_outer_kind = CONT_ITER_CONSUME;
+                    gp_obj = s->r;
+                    gp_val = s->cb_value;
+                    if (s->cb_pending == 10) {
+                        gp_atom = JS_ATOM_length; gp_op = GP_SET;   /* the closing Set(A,"length",len) */
+                    } else {
+                        DCHECK(s->cb_pending == 9,
+                               "the consume machine's element-write arm was entered with no write in flight");
+                        DCHECK(s->k <= JS_ATOM_MAX_INT,
+                               "a consumed source longer than an int atom can name — build the heap-atom write");
+                        gp_atom = __JS_AtomFromUInt32((uint32_t)s->k); gp_op = GP_DEFINE;
+                    }
+                    goto do_getprop_tramp;
+                }
                 if (st == 5) {
                     /* THE ToPrimitive arm. Two phases use it and the flag already in flight says which — a
                        TypedArray element write coerces with hint NUMBER (10.4.5.16 step 1), fromEntries'
@@ -24702,14 +24723,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     js_iter_consume_end(ctx, s); js_free_rt(rt, s);
                     JS_FreeValue(ctx, ta_ntgt);   /* the add/set method, or the TypedArray new_target the create phase used */
                     JS_FreeValue(ctx, ta_mapfn); JS_FreeValue(ctx, ta_mapfn_this);   /* Array.from's mapfn (applied during collect) */
-                    /* Array.from's array result gets its length. BOTH TypedArray shapes arrive here already
-                       BUILT — from's Construct(C, len) and the constructor's create-by-class are phases of the
-                       machine — and their length is fixed by the allocation, so writing to it is not part of
-                       either algorithm and would throw. */
-                    if (sink == ITERCONS_FROM && !is_tafrom && ta_cid == 0
-                        && JS_SetProperty(ctx, r, JS_ATOM_length, js_uint32((uint32_t)n)) < 0) {
-                        JS_FreeValue(ctx, r); goto exception;   /* operands freed by the exception unwind */
-                    }
+                    /* Array.from's Set(A,"length") is a PHASE of the machine now — it is the page's setter on a
+                       subclass or Proxy result, and it cannot run here with the machine already torn down. BOTH
+                       TypedArray shapes arrive already BUILT (from's Construct(C, len) and the constructor's
+                       create-by-class are phases too) and their length is fixed by the allocation, so the write is
+                       not part of either algorithm and the machine skips it for them. */
+                    (void)n;
                     JSValue *cargv = sp - cargc;
                     for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
                     sp += cfirst - cargc;
@@ -53338,8 +53357,19 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
                 JS_FreeValue(ctx, s->ent_val); s->ent_val = JS_UNDEFINED;
                 s->abrupt = 1; return 2;
             }
-            if (which == 2) { s->abrupt = 1; return 2; }
+            if (which == 2 || which == 9) { s->abrupt = 1; return 2; }
             return -1;
+        }
+        if (which == 9) {   /* the element write into the RESULT landed */
+            JS_FreeValue(ctx, value);   /* the define BORROWED it */
+            JS_FreeValue(ctx, fret);
+            s->k++;
+            return 1;                   /* drive the next .next() */
+        }
+        if (which == 10) {   /* Set(A,"length") landed: the walk is over */
+            JS_FreeValue(ctx, value);
+            JS_FreeValue(ctx, fret);
+            return 0;
         }
         if (which == 4) {   /* the adder RETURNED; Set/Map discard its result */
             JS_FreeValue(ctx, value);   /* SET's element; UNDEFINED for MAP */
@@ -53389,10 +53419,12 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
         }
         if (which == 2) {   /* Array.from's mapfn: the RESULT is the element to append */
             JS_FreeValue(ctx, value);
-            if (JS_DefinePropertyValueInt64(ctx, s->r, s->k, fret, JS_PROP_C_W_E | JS_PROP_THROW) < 0)
-                { s->abrupt = 1; return 2; }   /* consumed fret; close before propagating */
-            s->k++;
-            return 1;
+            /* the same CreateDataPropertyOrThrow the un-mapped element takes — a `defineProperty` trap on a Proxy
+               or subclass result, so it is the page's code and a phase, not a C write. */
+            DCHECK(JS_IsUndefined(s->cb_value), "the consume machine already holds an element");
+            s->cb_value = fret;
+            s->cb_pending = 9;
+            return 10;
         }
         switch (s->setop) {
         case ITERTERM_FOREACH:
@@ -53514,6 +53546,16 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
                     return -1;
                 }
                 else if (s->setop == ITERTERM_FOREACH) s->r = JS_UNDEFINED;
+            }
+            /* 23.1.2.1 step 6.e.viii Set(A,"length",len) — the page's SETTER on a subclass or Proxy result, and
+               the finish performed it from C with the machine already torn down, which is why it has to happen
+               HERE while there is still a machine to suspend. */
+            if (s->sink == ITERCONS_FROM && !s->ta_isfrom && s->ta_classid == 0 && !s->len_written) {
+                s->len_written = 1;
+                DCHECK(JS_IsUndefined(s->cb_value), "the consume machine already holds a value");
+                s->cb_value = js_uint32((uint32_t)s->k);
+                s->cb_pending = 10;
+                return 10;
             }
             return 0;
         }
@@ -53650,8 +53692,14 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
                 s->cb_pending = 2;
                 return 3;
             }
-            if (JS_DefinePropertyValueInt64(ctx, s->r, s->k, value, JS_PROP_C_W_E | JS_PROP_THROW) < 0)
-                { s->abrupt = 1; return 2; }   /* consumed `value`; IfAbruptCloseIterator (Array/from/iter-set-elem-prop-err) */
+            /* CreateDataPropertyOrThrow(A, k, value): on a Proxy or subclass RESULT that is the page's
+               `defineProperty` trap, and JS_DefinePropertyValueInt64 reached it from C. The element is held
+               across the write and the index advances when it lands (which == 9 above); a throw there is
+               IfAbruptCloseIterator, exactly as the mapfn's is. */
+            DCHECK(JS_IsUndefined(s->cb_value), "the consume machine already holds an element");
+            s->cb_value = value;
+            s->cb_pending = 9;
+            return 10;
         }
         s->k++;
     }
