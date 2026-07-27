@@ -20097,6 +20097,10 @@ typedef struct {
 #define SETOP_UNION      0   /* add each key to r (internal append — spec forbids calling r.add) */
 #define SETOP_SYMDIFF    1   /* key in THIS -> delete from r; key in neither -> add to r (insertion order preserved) */
 #define SETOP_SUPERSET   2   /* every key must be in THIS; a miss short-circuits false and CLOSES the iterator */
+#define SETOP_SUBSET     3   /* the OTHER direction, and the other WALK: every record of THIS must satisfy
+                                other.has(element). There is no keys() iterator here — THIS's own [[SetData]] is
+                                walked, which invokes nothing — so the only user code is the per-element `has`
+                                CALL, and that is the capability the other three set-operations were waiting on. */
 #define ITERCONS_SUMPRECISE 7 /* Math.sumPrecise(iterable): no result object at all — `sum` accumulates exactly and the
                                  finish yields the correctly-rounded double. A non-number element is an
                                  IfAbruptCloseIterator TypeError like every other sink's bad element. */
@@ -20200,6 +20204,7 @@ typedef struct JSIterConsume {
        Proxy. setrec_ph: 0 size read, 1 its ToPrimitive, 2 has read, 3 keys read, 4 complete. */
     JSValue setlike;     /* the `other` argument (owned) — the record is read off it, then the acquire uses it */
     JSValue setrec_keys; /* the validated keys method (owned), handed to the acquire */
+    JSValue setrec_has;  /* the validated has method (owned) — kept only by the walk that CALLS it */
     uint64_t setrec_size;
     uint8_t setrec_ph, setrec_pending;
     JSValue ent_val;     /* entry[1] (owned) */
@@ -20213,10 +20218,16 @@ static void sum_precise_add(SumPreciseState *s, double d);
 static double sum_precise_get_result(SumPreciseState *s);
 #define ITERCONS_OWNED(F) F(r) F(iter) F(next) F(adder) F(mapfn) F(mapfn_this) F(cb_value) F(ta_target) \
                           F(ent_obj) F(ent_key) F(ent_val) F(from_ctor) F(super_ref) \
-                          F(setlike) F(setrec_keys)
+                          F(setlike) F(setrec_keys) F(setrec_has)
 /* NOTE: JSIteratorHelperData::cb_value is owned too — freed by the finalizer and cleared on every path below. */
 static int js_iter_consume_step(JSContext *ctx, struct JSIterConsume *s, JSValue res);
 static void js_iter_consume_end(JSContext *ctx, struct JSIterConsume *s);
+/* THIS-side [[SetData]] walk for the set-operations: creating and stepping a Set's own record iterator invokes
+   nothing, so the has-walk drives it in place rather than as a routed .next(). */
+static JSValue js_create_map_iterator(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv, int magic);
+static JSValue js_map_iterator_next(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv, int *pdone, int magic);
 /* THE allocator: nine call sites build a JSIterConsume, each setting the fields ITS consumer uses, and a
    js_mallocz leaves the rest as all-zero bytes — which is JS_TAG_INT 0, NOT undefined. That value frees and dups as
    a no-op, so it looks harmless, and every field is therefore read with `JS_IsUndefined` as "this consumer did not
@@ -25083,6 +25094,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        re-enters this step (CONT_ITER_CONSUME) with the callback's result. */
                     DCHECK(sp + 4 <= TRAMP_SP_LIMIT(sf),
                            "iterterm callback: operand push exceeds the frame's compiled stack_size");
+                    if (s->cb_pending == 11) {
+                        /* the set-operations' per-element `has`: Call(other.has, other, «element») — one
+                           argument, the receiver is `other`, and there is no index. */
+                        DCHECK(sp + 3 <= TRAMP_SP_LIMIT(sf),
+                               "setop has call: operand push exceeds the frame's compiled stack_size");
+                        *sp++ = js_dup(s->setlike);
+                        *sp++ = js_dup(s->setrec_has);
+                        *sp++ = js_dup(s->cb_value);
+                        call_argv = sp - 1; call_argc = 1; tramp_first = -2; tramp_is_tail = 0;
+                    } else
                     { bool from_mapfn = (s->cb_pending == 2);
                       bool ta_mapfn = (s->cb_pending == 3);   /* TypedArray.from step 5.d/6.d: mapfn(kValue, k) with thisArg */
                       int nargs = (!from_mapfn && !ta_mapfn && s->setop == ITERTERM_REDUCE) ? 3 : 2;
@@ -53960,8 +53981,12 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
                 s->setrec_ph = 2;
             } else if (s->setrec_ph == 2) {
                 int ok = JS_IsFunction(ctx, res);
-                JS_FreeValue(ctx, res);   /* the set-operations consult THIS, never setlike.has — but it must EXIST */
-                if (!ok) { s->setrec_pending = 0; JS_ThrowTypeError(ctx, ".has is not a function"); return -1; }
+                if (!ok) { JS_FreeValue(ctx, res); s->setrec_pending = 0;
+                           JS_ThrowTypeError(ctx, ".has is not a function"); return -1; }
+                /* union/symmetricDifference/isSupersetOf consult THIS and never call it — it only has to EXIST.
+                   The has-WALK calls it per element, so it keeps it. */
+                if (s->setop == SETOP_SUBSET) s->setrec_has = res;
+                else                          JS_FreeValue(ctx, res);
                 s->setrec_ph = 3;
             } else {
                 DCHECK(s->setrec_ph == 3, "GetSetRecord: unknown phase");
@@ -53984,6 +54009,15 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
             struct list_head *el;
             s->setrec_pending = 0;
             DCHECK(ss != NULL, "setop: the receiver stopped being a Set across the record read");
+            if (s->setop == SETOP_SUBSET) {
+                /* 24.2.4.7 step 5: a THIS bigger than `other` cannot be a subset, decided before any element is
+                   touched. Otherwise walk THIS's own records — no iterator protocol, nothing to close — calling
+                   other.has per element on the tramp. */
+                if (ss->record_count > s->setrec_size) { s->r = js_bool(false); return 0; }
+                s->iter = js_create_map_iterator(ctx, s->adder, 0, NULL, MAGIC_SET);
+                if (JS_IsException(s->iter)) { s->iter = JS_UNDEFINED; return -1; }
+                goto setop_has_walk;
+            }
             if (s->setop == SETOP_SUPERSET) {
                 /* isSupersetOf: no result Set — THIS must contain every key, and a smaller THIS cannot, which
                    the spec decides BEFORE touching keys(). Answering through the machine's own DONE path means
@@ -54004,6 +54038,31 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
             return 12;
         }
         return 6;                            /* the next property read */
+    }
+    if (s->cb_pending == 11) {
+        /* the per-element `has` CALL returned. `res` may be an exception (the page's has threw), which the
+           machine propagates: THIS's own record walk is not an iterator, so there is nothing to close. */
+        int ok;
+        s->cb_pending = 0;
+        JS_FreeValue(ctx, s->cb_value); s->cb_value = JS_UNDEFINED;
+        if (JS_IsException(res)) return -1;
+        ok = JS_ToBoolFree(ctx, res);
+        DCHECK(s->setop == SETOP_SUBSET, "a `has` call came back to a set-operation that never makes one");
+        if (!ok) { s->r = js_bool(false); return 0; }   /* isSubsetOf: one miss decides it */
+    setop_has_walk:
+        for (;;) {
+            JSValue item;
+            int done;
+            /* THIS's own [[SetData]] walk invokes nothing — a genuinely different algorithm from an iterator
+               record, not a fallback for one — so it steps here rather than as a routed .next(). */
+            item = js_map_iterator_next(ctx, s->iter, 0, NULL, &done, MAGIC_SET);
+            if (JS_IsException(item)) return -1;
+            if (done) { JS_FreeValue(ctx, item); s->r = js_bool(true); return 0; }
+            DCHECK(JS_IsUndefined(s->cb_value), "the consume machine already holds an element");
+            s->cb_value = item;
+            s->cb_pending = 11;
+            return 3;
+        }
     }
     if (s->ent_pending) {
         /* Object.fromEntries, mid-ENTRY: `res` is what the tramp just produced for phase ent_ph — entry[0],
@@ -68462,54 +68521,6 @@ exception:
     return rval;
 }
 
-static JSValue js_set_isSubsetOf(JSContext *ctx, JSValueConst this_val,
-                                 int argc, JSValueConst *argv)
-{
-    JSValue has, item, iter, keys, next, rv, rval;
-    JSValueConst setlike;
-    bool found;
-    JSMapState *s;
-    uint64_t size;
-    int done, ok;
-
-    s = JS_GetOpaque2(ctx, this_val, JS_CLASS_SET);
-    if (!s)
-        return JS_EXCEPTION;
-    setlike = argv[0];
-    if (js_setlike_get_props(ctx, setlike, &size, &has, &keys) < 0)
-        return JS_EXCEPTION;
-    iter = JS_UNDEFINED;
-    next = JS_UNDEFINED;
-    rval = JS_EXCEPTION;
-    found = false;
-    if (s->record_count > size)
-        goto fini;
-    iter = js_create_map_iterator(ctx, this_val, 0, NULL, MAGIC_SET);
-    if (JS_IsException(iter))
-        goto exception;
-    found = true;
-    do {
-        item = js_map_iterator_next(ctx, iter, 0, NULL, &done, MAGIC_SET);
-        if (JS_IsException(item))
-            goto exception;
-        if (done) // item is JS_UNDEFINED
-            break;
-        rv = JS_Call(ctx, has, setlike, 1, vc(&item));
-        JS_FreeValue(ctx, item);
-        ok = JS_ToBoolFree(ctx, rv); // returns -1 if rv is JS_EXCEPTION
-        if (ok < 0)
-            goto exception;
-        found = (ok > 0);
-    } while (found);
-fini:
-    rval = found ? JS_TRUE : JS_FALSE;
-exception:
-    JS_FreeValue(ctx, has);
-    JS_FreeValue(ctx, keys);
-    JS_FreeValue(ctx, iter);
-    JS_FreeValue(ctx, next);
-    return rval;
-}
 
 /* DELETED: js_set_isSupersetOf. The whole operation is do_setop_consume_tramp — the setlike's props read in spec
    order, THIS's records copied straight into the result (the spec forbids calling .add), and keys() folded in by
@@ -68770,7 +68781,7 @@ static const JSCFunctionListEntry js_set_proto_funcs[] = {
     JS_CGETSET_MAGIC_DEF("size", js_map_get_size, NULL, MAGIC_SET ),
     JS_CFUNC_MAGIC_DEF("forEach", 1, js_map_forEach, MAGIC_SET ),
     JS_CFUNC_DEF("isDisjointFrom", 1, js_set_isDisjointFrom ),
-    JS_CFUNC_DEF("isSubsetOf", 1, js_set_isSubsetOf ),
+    JS_CFUNC_CONSUME_DEF("isSubsetOf", 1, ITERCONS_SETOP_BASE + SETOP_SUBSET ),
     JS_CFUNC_CONSUME_DEF("isSupersetOf", 1, ITERCONS_SETOP_BASE + SETOP_SUPERSET ),
     JS_CFUNC_DEF("intersection", 1, js_set_intersection ),
     JS_CFUNC_DEF("difference", 1, js_set_difference ),
