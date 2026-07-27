@@ -1431,7 +1431,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_TA_EVERY, STEPDEF_TA_SOME, STEPDEF_TA_FOREACH, STEPDEF_TA_MAP, STEPDEF_TA_FILTER,
     STEPDEF_ARRAY_REDUCE, STEPDEF_ARRAY_REDUCE_RIGHT, STEPDEF_TA_REDUCE, STEPDEF_TA_REDUCE_RIGHT,
     STEPDEF_ARRAY_SORT, STEPDEF_ARRAY_TOSORTED, STEPDEF_JSON_PARSE,
-    STEPDEF_TA_SLICE, STEPDEF_STR_CONCAT, STEPDEF_STR_CTOR, STEPDEF_ARRAY_AT,
+    STEPDEF_TA_SLICE, STEPDEF_STR_CONCAT, STEPDEF_STR_CTOR, STEPDEF_STR_RAW, STEPDEF_ARRAY_AT,
     STEPDEF_ARRAY_INDEXOF, STEPDEF_ARRAY_LASTINDEXOF, STEPDEF_ARRAY_INCLUDES,
     STEPDEF_STR_TRIM, STEPDEF_STR_TRIMSTART, STEPDEF_STR_TRIMEND, STEPDEF_STR_AT, STEPDEF_STR_CODEPOINTAT,
     STEPDEF_STR_SUBSTRING, STEPDEF_STR_INDEXOF, STEPDEF_STR_LASTINDEXOF, STEPDEF_STR_NORMALIZE,
@@ -20135,6 +20135,8 @@ typedef struct JSArraySort {
     int present;                    /* HasProperty(O, k) for that index — sort skips holes */
     uint8_t elem_ph;                /* 0 = the ask is due, 1 = the read is due */
     JSValue coerced;                /* the string a ToString delivered, until the slot adopts it (owned) */
+    JSValue copy;                   /* toSorted's ArrayCreate(len), until it becomes the thing being sorted (owned) */
+    JSValue el;                     /* an element held across its read while that copy is being built (owned) */
     JSValue cb_args[4];             /* [this=undefined, method, array[l].val, array[r].val]; call_argv=&cb_args[2], argc=2 */
 } JSArraySort;
 static int js_array_sort_step(JSContext *ctx, struct JSArraySort *s, JSValue res, JSValueConst out_args[2],
@@ -20680,6 +20682,18 @@ typedef struct JSStrRecv {
     int64_t idx, idx2;
     double dpos;
 } JSStrRecv;
+
+/* 22.1.2.4 String.raw: a tagged template's `raw` object is an ORDINARY object the page hands over, so its
+   `raw` read, its length, every literal read and every ToString of a literal or a substitution is the page's
+   code. */
+typedef struct JSStringRaw {
+    JSStepHdr hdr;        /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    JSValue cooked;       /* ToObject(template) (owned), until its `raw` has been read */
+    JSValue literals;     /* ToObject(Get(cooked, "raw")) (owned) */
+    JSValue el;           /* a literal held between its read and its coercion (owned) */
+    StringBuffer b;       /* the accumulated result */
+    int64_t len, i;
+} JSStringRaw;
 
 /* TypedArray.prototype.slice: the index coercions and the species Construct are its PROLOGUE,
    staged as steps 0-2 so a user valueOf on either index suspends. */
@@ -56159,6 +56173,10 @@ static const JSTrampStepDef js_bigint_ctor_def =
 static const JSTrampStepDef js_array_indexOf_def     = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_INDEXOF };
 static const JSTrampStepDef js_array_lastIndexOf_def = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_LASTINDEXOF };
 static const JSTrampStepDef js_array_includes_def    = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_INCLUDES };
+static int js_string_raw_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_string_raw_fini(JSContext *ctx, void *st, bool take_result);
+static const JSTrampStepDef js_string_raw_def =
+    { sizeof(JSStringRaw), js_string_raw_step, js_string_raw_fini, 0 };
 static const JSTrampStepDef js_str_trim_def       = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_TRIM_BOTH };
 static const JSTrampStepDef js_str_trimStart_def  = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_TRIM_START };
 static const JSTrampStepDef js_str_trimEnd_def    = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_TRIM_END };
@@ -56342,6 +56360,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_ARRAY_REVERSE] = &js_array_reverse_def,
     [STEPDEF_ARRAY_TOREVERSED] = &js_array_toReversed_def,
     [STEPDEF_ARRAY_TOSPLICED]  = &js_array_toSpliced_def,
+    [STEPDEF_STR_RAW]          = &js_string_raw_def,
     [STEPDEF_ARRAY_POP]     = &js_array_pop_def,
     [STEPDEF_ARRAY_SHIFT]   = &js_array_shift_def,
     [STEPDEF_ARRAY_PUSH]    = &js_array_push_def,
@@ -57798,6 +57817,7 @@ static int js_array_sort_recv(JSContext *ctx, JSArraySort *s)
     s->obj = JS_UNDEFINED; s->method = step_arg(&s->hdr, 0); s->array = NULL; s->tmp = NULL;
     s->n = 0; s->len = 0; s->undefined_count = 0; s->pending = 0;
     s->width = 1; s->i = 0; s->lo = s->mid = s->hi = s->l = s->r = s->k = 0; s->wb = 0;
+    s->coerced = JS_UNDEFINED; s->copy = JS_UNDEFINED; s->el = JS_UNDEFINED;
     for (i = 0; i < 4; i++) s->cb_args[i] = JS_UNDEFINED;
     s->obj = JS_ToObject(ctx, s->hdr.this_val);
     if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
@@ -57965,40 +57985,12 @@ static void sort_slot_release(JSContext *ctx, ValueSlot *v)
    WHAT is sorted — the receiver, or a dense copy of it — so it is the prologue that branches on hdr.arg, not a
    second machine. (toSorted does not use Array[@@species]; it always yields a base Array.) The prologue is in
    three stages because LengthOfArrayLike sits in the middle of it and its ToLength can run user code. */
-static int js_array_sort_copy(JSContext *ctx, JSArraySort *s)
-{
-    JSValue arr, *arrp, *pval;
-    JSObject *p;
-    int64_t i, len = s->len;
-    uint32_t count32;
-
-    /* toSorted: a.slice().sort(), except that a.slice() leaves holes in a sparse array intact whereas
-       a.toSorted() replaces them with undefined — so the copy is built dense here. */
-    arr = js_allocate_fast_array(ctx, len);
-    if (JS_IsException(arr))
-        return -1;
-    if (len > 0) {
-        p = JS_VALUE_GET_OBJ(arr);
-        i = 0;
-        pval = p->u.array.u.values;
-        if (js_get_fast_array(ctx, s->obj, &arrp, &count32) && count32 == len) {
-            for (; i < len; i++, pval++)
-                *pval = js_dup(arrp[i]);
-        } else {
-            for (; i < len; i++, pval++) {
-                if (-1 == JS_TryGetPropertyInt64(ctx, s->obj, i, pval)) {
-                    p->u.array.count = i;   /* only the slots written so far are initialised */
-                    JS_FreeValue(ctx, arr);
-                    return -1;
-                }
-            }
-        }
-        p->u.array.count = len;
-    }
-    JS_FreeValue(ctx, s->obj);
-    s->obj = arr;   /* the sort, the writeback and the result are all the copy from here on */
-    return 0;
-}
+/* DELETED: js_array_sort_copy. It built toSorted's copy with a C JS_TryGetPropertyInt64 loop, so an element
+   accessor with a loop in it had no flow base; and the HasProperty half of that helper is not in the algorithm
+   at all — 23.1.3.34 step 6 passes read-through-holes to SortIndexedProperties, whose step 3.b then asserts the
+   read is unconditional and 3.c makes it a plain `? Get(obj, Pk)`. On
+   `new Proxy([3,1,2], {has: () => false})` that produced [undefined,undefined,undefined] where the spec sorts
+   the real elements. The walk is stage 10 of js_array_sort_vstep now. */
 
 static int js_array_sort_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
@@ -58021,7 +58013,42 @@ static int js_array_sort_vstep(JSContext *ctx, void *st, JSValue cb_result, JSVa
         s->hdr.stage = 2;
     }
     if (s->hdr.stage == 2) {
-        if (s->hdr.arg && js_array_sort_copy(ctx, s)) return -1;
+        if (s->hdr.arg) {
+            /* 23.1.3.34 step 4: ArrayCreate(len). toSorted sorts a COPY, so the receiver is never written, and
+               the copy is DENSE because read-through-holes gathers every index — what was a hole becomes an
+               undefined the sort orders like any other. */
+            JSValue *arrp;
+            uint32_t count32;
+            s->copy = js_allocate_fast_array(ctx, s->len);
+            if (JS_IsException(s->copy)) { s->copy = JS_UNDEFINED; return -1; }
+            if (js_get_fast_array(ctx, s->obj, &arrp, &count32) && count32 == s->len) {
+                int64_t i;
+                for (i = 0; i < s->len; i++)
+                    arr_dense_put(ctx, s->copy, i, js_dup(arrp[i]));
+            } else {
+                s->col_i = 0;
+                s->hdr.stage = 10;
+            }
+        }
+        if (s->hdr.stage == 2) s->hdr.stage = 11;
+    }
+    /* step 6 with read-through-holes: SortIndexedProperties step 3.b asserts the read is unconditional, so this
+       is a plain `? Get(O, Pk)` at every index — no HasProperty, unlike the skip-holes collect below. */
+    while (s->hdr.stage == 10) {
+        if (s->col_i >= s->len) { s->hdr.stage = 11; break; }
+        r = step_getidx_run(ctx, &s->hdr, s->obj, s->col_i, cb_result, &s->el, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        arr_dense_put(ctx, s->copy, s->col_i, s->el);
+        s->el = JS_UNDEFINED;
+        s->col_i++;
+    }
+    if (s->hdr.stage == 11) {
+        if (s->hdr.arg) {
+            JS_FreeValue(ctx, s->obj);
+            s->obj = s->copy;   /* the sort, the writeback and the result are the copy from here on */
+            s->copy = JS_UNDEFINED;
+        }
         if (s->len > 0) {
             s->array = js_malloc(ctx, (size_t)s->len * sizeof(ValueSlot));
             if (!s->array) return -1;
@@ -58091,6 +58118,8 @@ static JSValue js_array_sort_vfini(JSContext *ctx, void *st, bool take_result)
     int64_t w;
     JS_FreeValue(ctx, s->coerced);   /* a ToString that landed just before an abandon */
     s->coerced = JS_UNDEFINED;
+    JS_FreeValue(ctx, s->copy);      /* toSorted's result, if the copy walk was abandoned part-way through */
+    JS_FreeValue(ctx, s->el);
     /* every slot the writeback has not consumed: all of them when the machine is abandoned before stage 7, the
        tail of them when a `set` trap threw part-way through it. */
     for (w = s->wb; w < s->n; w++)
@@ -59797,44 +59826,100 @@ static JSValue js_string_fromCodePoint(JSContext *ctx, JSValueConst this_val,
     return JS_EXCEPTION;
 }
 
-static JSValue js_string_raw(JSContext *ctx, JSValueConst this_val,
-                             int argc, JSValueConst *argv)
+/* 22.1.2.4 String.raw ( template, ...substitutions ) — the ONLY thing the engine contributes is the
+   concatenation. `template` and its `raw` are ordinary objects the page hands over: step 2's ToObject, step 3's
+   `? Get(cooked, "raw")`, step 4's LengthOfArrayLike, step 7.a's `? Get(literals, Pk)` and the ToString of every
+   literal (7.b) and every substitution (7.e.ii) are all its code, on accessors or Proxy traps. js_string_raw
+   ran the whole loop from C, so a loop in any of them had no flow base and aborted at its back-edge.
+   Stages: 0 ToObject(template), 1 Get "raw" + ToObject, 2 length, 3 the loop head, 4 the literal read,
+   5 its ToString, 6 the substitution's ToString. */
+
+static int js_string_raw_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    // raw(temp,...a)
-    JSValue cooked, val, raw;
-    StringBuffer b_s, *b = &b_s;
-    int64_t i, n;
+    JSStringRaw *s = st;
+    JSValue str;
+    int r;
 
-    string_buffer_init(ctx, b, 0);
-    raw = JS_UNDEFINED;
-    cooked = JS_ToObject(ctx, argv[0]);
-    if (JS_IsException(cooked))
-        goto exception;
-    raw = JS_ToObjectFree(ctx, JS_GetProperty(ctx, cooked, JS_ATOM_raw));
-    if (JS_IsException(raw))
-        goto exception;
-    if (js_get_length64(ctx, &n, raw) < 0)
-        goto exception;
-
-    for (i = 0; i < n; i++) {
-        val = JS_ToStringFree(ctx, JS_GetPropertyInt64(ctx, raw, i));
-        if (JS_IsException(val))
-            goto exception;
-        string_buffer_concat_value_free(b, val);
-        if (i < n - 1 && i + 1 < argc) {
-            if (string_buffer_concat_value(b, argv[i + 1]))
-                goto exception;
-        }
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        /* FIRST, before anything that can throw: the teardown frees exactly what the state holds, and it ends
+           the buffer — one initialised late is freed with a NULL ctx. */
+        string_buffer_init(ctx, &s->b, 0);
+        s->cooked = JS_UNDEFINED; s->literals = JS_UNDEFINED; s->el = JS_UNDEFINED;
+        s->len = 0; s->i = 0;
+        s->cooked = JS_ToObject(ctx, step_arg(&s->hdr, 0));
+        if (JS_IsException(s->cooked)) { s->cooked = JS_UNDEFINED; return -1; }
+        s->hdr.stage = 1;
     }
-    JS_FreeValue(ctx, cooked);
-    JS_FreeValue(ctx, raw);
-    return string_buffer_end(b);
+    if (s->hdr.stage == 1) {
+        r = step_getprop_run(ctx, &s->hdr, s->cooked, JS_ATOM_raw, cb_result, &s->el, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        JS_FreeValue(ctx, s->cooked); s->cooked = JS_UNDEFINED;
+        s->literals = JS_ToObject(ctx, s->el);
+        JS_FreeValue(ctx, s->el); s->el = JS_UNDEFINED;
+        if (JS_IsException(s->literals)) { s->literals = JS_UNDEFINED; return -1; }
+        s->hdr.stage = 2;
+    }
+    if (s->hdr.stage == 2) {
+        r = step_length_run(ctx, &s->hdr, s->literals, cb_result, &s->len, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 3;
+    }
+    for (;;) {
+        if (s->hdr.stage == 3) {
+            /* step 5 folds in here: literalCount <= 0 leaves the buffer empty, which IS the empty String. */
+            if (s->i >= s->len) { JS_FreeValue(ctx, cb_result); break; }
+            s->hdr.stage = 4;
+        }
+        if (s->hdr.stage == 4) {
+            r = step_getidx_run(ctx, &s->hdr, s->literals, s->i, cb_result, &s->el, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->hdr.stage = 5;
+        }
+        if (s->hdr.stage == 5) {
+            r = step_tostring_run(ctx, &s->hdr, s->el, cb_result, &str, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            JS_FreeValue(ctx, s->el); s->el = JS_UNDEFINED;
+            if (string_buffer_concat_value_free(&s->b, str)) return -1;
+            /* step 7.d: the LAST literal ends the string — the trailing substitution is never appended. */
+            if (s->i + 1 >= s->len) break;
+            s->hdr.stage = 6;
+        }
+        /* step 7.e: the substitution, present only while there are any left */
+        if (s->i + 1 < s->hdr.argc) {
+            r = step_tostring_run(ctx, &s->hdr, step_arg(&s->hdr, (int)(s->i + 1)), cb_result, &str,
+                                  out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            if (string_buffer_concat_value_free(&s->b, str)) return -1;
+        } else {
+            JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        }
+        s->i++;
+        s->hdr.stage = 3;
+    }
+    return 0;
+}
 
-exception:
-    JS_FreeValue(ctx, cooked);
-    JS_FreeValue(ctx, raw);
-    string_buffer_free(b);
-    return JS_EXCEPTION;
+static JSValue js_string_raw_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSStringRaw *s = st;
+    JSValue r;
+    JS_FreeValue(ctx, s->cooked);
+    JS_FreeValue(ctx, s->literals);
+    JS_FreeValue(ctx, s->el);
+    if (take_result) {
+        r = string_buffer_end(&s->b);
+    } else {
+        string_buffer_free(&s->b);
+        r = JS_UNDEFINED;
+    }
+    js_free(ctx, s);
+    return r;
 }
 
 /* only used in test262 */
@@ -61342,7 +61427,7 @@ static JSValue js_string_CreateHTML(JSContext *ctx, JSValueConst this_val,
 static const JSCFunctionListEntry js_string_funcs[] = {
     JS_CFUNC_STEP_DEF("fromCharCode", 1, STEPDEF_STR_FROMCHARCODE ),
     JS_CFUNC_STEP_DEF("fromCodePoint", 1, STEPDEF_STR_FROMCODEPOINT ),
-    JS_CFUNC_DEF("raw", 1, js_string_raw ),
+    JS_CFUNC_STEP_DEF("raw", 1, STEPDEF_STR_RAW ),
 };
 
 static const JSCFunctionListEntry js_string_proto_funcs[] = {
