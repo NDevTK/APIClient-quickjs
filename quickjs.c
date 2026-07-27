@@ -1460,6 +1460,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_FUNCTION_CALL, STEPDEF_ISNAN, STEPDEF_ISFINITE,
     STEPDEF_NUM_TOSTRING, STEPDEF_NUM_TOLOCALESTRING, STEPDEF_NUM_TOFIXED,
     STEPDEF_NUM_TOEXPONENTIAL, STEPDEF_NUM_TOPRECISION, STEPDEF_NUM_CTOR,
+    STEPDEF_ITERATOR_CTOR, STEPDEF_ARRAY_OF,
     STEPDEF_COUNT
 };
 #define HINT_NONE    2
@@ -52139,6 +52140,62 @@ static JSValue js_primargs_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
+/* THE OrdinaryCreateFromConstructor MACHINE (10.1.13). A C constructor's first spec step reads new.target's
+   `prototype` — a [[Get]] the page can define as a getter, so it is USER CODE, and every C constructor performed
+   it inside js_create_from_ctor from a frame with no flow base: a loop in that getter aborts at its back-edge
+   with "gen_state NULL". The declaration says only WHICH class the object is (def->arg) and what to run once it
+   exists; stage 0 requests the read on the tramp, and the body is then called with the CREATED OBJECT where a
+   plain C constructor receives new_target. That body is not a legacy twin — with the object already made it has
+   no OrdinaryCreateFromConstructor left to perform, which is exactly what the declaration asserts, and it is the
+   only implementation there is. A NULL body means the machine IS the whole constructor (the created object is the
+   result), which is what a constructor that only creates looks like.
+   The body OWNS obj: a constructor body already ends in `return obj` and frees it on every failure path, so
+   taking it is the shape those bodies are written in. */
+typedef struct JSCreateCtor {
+    JSStepHdr hdr;
+    JSValue result;
+} JSCreateCtor;
+
+static int js_creatector_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSCreateCtor *s = st;
+    JSValue obj;
+    int r;
+
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result);
+        cb_result = JS_UNDEFINED;
+        s->result = JS_UNDEFINED;
+        if (s->hdr.def->precheck && s->hdr.def->precheck(ctx, s->hdr.this_val, s->hdr.def->body_magic) < 0)
+            return -1;
+        s->hdr.stage = 1;
+    }
+    /* new.target UNDEFINED is the call form of a constructor_or_func builtin (`Array(3)`): the spec's
+       OrdinaryCreateFromConstructor degenerates to the intrinsic prototype, which reads nothing. */
+    r = step_create_from_ctor_run(ctx, &s->hdr, s->hdr.this_val, s->hdr.arg, cb_result, &obj, out_cb, out_argc);
+    if (r) return r < 0 ? -1 : r;
+    if (!s->hdr.def->body.generic) {
+        s->result = obj;
+        return 0;
+    }
+    DCHECK(s->hdr.def->body_proto == JS_CFUNC_generic || s->hdr.def->body_proto == JS_CFUNC_generic_magic,
+           "OrdinaryCreateFromConstructor: unhandled body prototype");
+    s->result = (s->hdr.def->body_proto == JS_CFUNC_generic_magic)
+              ? s->hdr.def->body.generic_magic(ctx, obj, s->hdr.argc, (JSValueConst *)s->hdr.argv,
+                                               s->hdr.def->body_magic)
+              : s->hdr.def->body.generic(ctx, obj, s->hdr.argc, (JSValueConst *)s->hdr.argv);
+    return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
+}
+
+static JSValue js_creatector_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSCreateCtor *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    js_free(ctx, s);
+    return r;
+}
+
 /* Stages: 0 assemble [newThis, f, args…] and CALL, 1 the result. */
 static int js_function_call_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
@@ -52687,15 +52744,14 @@ static int JS_CopySubArray(JSContext *ctx,
     return -1;
 }
 
-static JSValue js_array_constructor(JSContext *ctx, JSValueConst new_target,
-                                    int argc, JSValueConst *argv)
+/* 23.1.1.1 steps 3+ — everything the Array constructor does ON the array OrdinaryCreateFromConstructor made.
+   It OWNS obj, which is the shape the constructor was already written in (`return obj`, free on every failure). */
+static JSValue js_array_ctor_body(JSContext *ctx, JSValueConst obj_,
+                                  int argc, JSValueConst *argv)
 {
-    JSValue obj;
+    JSValue obj = (JSValue)obj_;
     int i;
 
-    obj = js_create_from_ctor(ctx, new_target, JS_CLASS_ARRAY);
-    if (JS_IsException(obj))
-        return obj;
     if (argc == 1 && JS_IsNumber(argv[0])) {
         uint32_t len;
         if (JS_ToArrayLengthFree(ctx, &len, js_dup(argv[0]), true))
@@ -52712,6 +52768,20 @@ static JSValue js_array_constructor(JSContext *ctx, JSValueConst new_target,
 fail:
     JS_FreeValue(ctx, obj);
     return JS_EXCEPTION;
+}
+
+/* 23.1.1.1 in full. Its `prototype` read is still performed HERE, from C, because the Array constructor is
+   reached by C CONSTRUCT sites that are not machines yet — js_array_of and JS_ArraySpeciesCreate (concat, slice,
+   splice). Those are its subproblem: each has to become a step machine before this can declare itself one, and
+   converting the constructor first turns their JS_CallConstructor into an abort. */
+static JSValue js_array_constructor(JSContext *ctx, JSValueConst new_target,
+                                    int argc, JSValueConst *argv)
+{
+    JSValue obj;
+    obj = js_create_from_ctor(ctx, new_target, JS_CLASS_ARRAY);
+    if (JS_IsException(obj))
+        return obj;
+    return js_array_ctor_body(ctx, obj, argc, argv);
 }
 
 static JSValue js_array_from(JSContext *ctx, JSValueConst this_val,
@@ -53545,32 +53615,60 @@ static bool tramp_can_call_ta_from_consume(JSContext *ctx, JSValueConst func, JS
     return true;
 }
 
-static JSValue js_array_of(JSContext *ctx, JSValueConst this_val,
-                           int argc, JSValueConst *argv)
+/* 23.1.2.3 Array.of. Step 4 is `Construct(C, [len])` when `this` is a constructor — a real Construct of whatever
+   the page put there, reached from C by JS_CallConstructor. That drives a bytecode constructor to completion, and
+   since the Array constructor itself is becoming a step machine it cannot run one at all. The Construct is a step
+   (4) instead, so the object comes back to stage 1 and a loop anywhere in that constructor parks.
+   Stages: 0 request the Construct (or make the plain array and fall straight through), 1 fill the result. */
+typedef struct JSArrayOf {
+    JSStepHdr hdr;
+    JSValue result;
+} JSArrayOf;
+
+static int js_array_of_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    JSValue n, obj;
+    JSArrayOf *s = st;
+    JSValue obj;
     int i;
 
-    if (JS_IsConstructor(ctx, this_val)) {
-        n = js_int32(argc);
-        obj = JS_CallConstructor(ctx, this_val, 1, vc(&n));
-    } else {
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result);
+        s->result = JS_UNDEFINED;
+        s->hdr.stage = 1;
+        if (JS_IsConstructor(ctx, s->hdr.this_val)) {
+            s->hdr.cb_coerce[0] = s->hdr.this_val;        /* borrowed: the header owns the receiver */
+            s->hdr.cb_coerce[1] = js_int32(s->hdr.argc);  /* a number: nothing to own */
+            *out_cb = s->hdr.cb_coerce; *out_argc = 1;
+            return 4;
+        }
         obj = JS_NewArray(ctx);
+        if (JS_IsException(obj))
+            return -1;
+    } else {
+        obj = cb_result;   /* the constructed object, owned */
     }
-    if (JS_IsException(obj))
-        return JS_EXCEPTION;
-    for(i = 0; i < argc; i++) {
-        if (JS_CreateDataPropertyUint32Const(ctx, obj, i, argv[i],
+    for(i = 0; i < s->hdr.argc; i++) {
+        if (JS_CreateDataPropertyUint32Const(ctx, obj, i, step_arg(&s->hdr, i),
                                              JS_PROP_THROW) < 0) {
             goto fail;
         }
     }
-    if (JS_SetProperty(ctx, obj, JS_ATOM_length, js_uint32(argc)) < 0) {
+    if (JS_SetProperty(ctx, obj, JS_ATOM_length, js_uint32(s->hdr.argc)) < 0) {
     fail:
         JS_FreeValue(ctx, obj);
-        return JS_EXCEPTION;
+        return -1;
     }
-    return obj;
+    s->result = obj;
+    return 0;
+}
+
+static JSValue js_array_of_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSArrayOf *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    js_free(ctx, s);
+    return r;
 }
 
 static JSValue js_array_isArray(JSContext *ctx, JSValueConst this_val,
@@ -53638,7 +53736,7 @@ static JSValue JS_ArraySpeciesCreate(JSContext *ctx, JSValueConst obj,
 static const JSCFunctionListEntry js_array_funcs[] = {
     JS_CFUNC_DEF("isArray", 1, js_array_isArray ),
     JS_CFUNC_DEF("from", 1, js_array_from ),
-    JS_CFUNC_DEF("of", 0, js_array_of ),
+    JS_CFUNC_STEP_DEF("of", 0, STEPDEF_ARRAY_OF ),
     JS_CGETSET_DEF("[Symbol.species]", js_get_this, NULL ),
 };
 
@@ -55463,6 +55561,19 @@ static const JSTrampStepDef js_sab_slice_def     = { sizeof(JSABSlice), js_ab_sl
 static const JSTrampStepDef js_date_toJSON_def = { sizeof(JSDateToJSON), js_date_tojson_step, js_date_tojson_fini, 0 };
 static const JSTrampStepDef js_date_toPrim_def = { sizeof(JSDateToPrim), js_date_toprim_step, js_date_toprim_fini, 0 };
 static const JSTrampStepDef js_date_ctor_def = { sizeof(JSDateCtor), js_date_ctor_step, js_date_ctor_fini, 0 };
+/* An OrdinaryCreateFromConstructor declaration: the CLASS in `arg`, the post-create body (NULL = the object is
+   the result), and the same precheck hook the coerce-then-compute machines use for a leading validation. */
+#define CREATECTOR_DEF_FULL(class_id, proto, fn, magic, pre) \
+    { sizeof(JSCreateCtor), js_creatector_step, js_creatector_fini, (class_id), { .proto = (fn) }, \
+      JS_CFUNC_##proto, (magic), (pre), NULL, NULL }
+#define CREATECTOR_DEF(class_id, proto, fn, magic) CREATECTOR_DEF_FULL(class_id, proto, fn, magic, NULL)
+static int js_array_of_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_array_of_fini(JSContext *ctx, void *st, bool take_result);
+static const JSTrampStepDef js_array_of_def = { sizeof(JSArrayOf), js_array_of_step, js_array_of_fini, 0 };
+static int js_iterator_ctor_precheck(JSContext *ctx, JSValueConst new_target, int magic);
+/* 27.1.3.1 Iterator: steps 1-2 are the abstract-class validation, step 3 is the whole constructor. */
+static const JSTrampStepDef js_iterator_ctor_def =
+    CREATECTOR_DEF_FULL(JS_CLASS_ITERATOR, generic, NULL, 0, js_iterator_ctor_precheck);
 static const JSTrampStepDef js_bigint_ctor_def =
     { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, PRIMARGS(0x1, HINT_NUMBER, 1),
       { .generic = js_bigint_constructor }, JS_CFUNC_constructor_or_func, 0, NULL, NULL, NULL };
@@ -55645,6 +55756,8 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_DATE_TOJSON]   = &js_date_toJSON_def,
     [STEPDEF_DATE_TOPRIM]   = &js_date_toPrim_def,
     [STEPDEF_DATE_CTOR]     = &js_date_ctor_def,
+    [STEPDEF_ITERATOR_CTOR] = &js_iterator_ctor_def,
+    [STEPDEF_ARRAY_OF]      = &js_array_of_def,
     [STEPDEF_ARRAY_INDEXOF]     = &js_array_indexOf_def,
     [STEPDEF_ARRAY_LASTINDEXOF] = &js_array_lastIndexOf_def,
     [STEPDEF_ARRAY_INCLUDES]    = &js_array_includes_def,
@@ -57324,18 +57437,25 @@ static JSValue js_iterator_constructor_getset(JSContext *ctx,
     return js_dup(func_data[0]);
 }
 
-static JSValue js_iterator_constructor(JSContext *ctx, JSValueConst new_target,
-                                       int argc, JSValueConst *argv)
+/* 27.1.3.1 steps 1-2. Everything the Iterator constructor does before OrdinaryCreateFromConstructor, and all it
+   does: step 3 IS the create, so the declaration carries no body and the machine is the whole constructor.
+   The abstract-class test compares against the DECLARATION rather than a C function pointer, because there is no
+   C function left to compare against — which is the point. */
+static int js_iterator_ctor_precheck(JSContext *ctx, JSValueConst new_target, int magic)
 {
     JSObject *p;
 
-    if (JS_TAG_OBJECT != JS_VALUE_GET_TAG(new_target))
-        return JS_ThrowTypeError(ctx, "constructor requires 'new'");
+    if (JS_TAG_OBJECT != JS_VALUE_GET_TAG(new_target)) {
+        JS_ThrowTypeError(ctx, "constructor requires 'new'");
+        return -1;
+    }
     p = JS_VALUE_GET_OBJ(new_target);
-    if (p->class_id == JS_CLASS_C_FUNCTION)
-        if (p->u.cfunc.c_function.generic == js_iterator_constructor)
-            return JS_ThrowTypeError(ctx, "abstract class not constructable");
-    return js_create_from_ctor(ctx, new_target, JS_CLASS_ITERATOR);
+    if (p->class_id == JS_CLASS_C_FUNCTION && p->u.cfunc.cproto == JS_CFUNC_step_ctor
+        && p->u.cfunc.magic == STEPDEF_ITERATOR_CTOR) {
+        JS_ThrowTypeError(ctx, "abstract class not constructable");
+        return -1;
+    }
+    return 0;
 }
 
 typedef struct JSIteratorConcatData {
@@ -71386,7 +71506,7 @@ int JS_AddIntrinsicBaseObjects(JSContext *ctx)
 
     /* Iterator */
     obj2 = JS_NewCConstructor(ctx, JS_CLASS_ITERATOR, "Iterator",
-                              js_iterator_constructor, 0, JS_CFUNC_constructor_or_func, 0,
+                              NULL, 0, JS_CFUNC_step_ctor, STEPDEF_ITERATOR_CTOR,
                               JS_UNDEFINED,
                               js_iterator_funcs, countof(js_iterator_funcs),
                               js_iterator_proto_funcs, countof(js_iterator_proto_funcs),
