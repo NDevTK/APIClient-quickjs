@@ -603,10 +603,13 @@ struct JSContext {
        that can push the promise as the opcode's RESULT — rejects it once the unwind has returned to the frame
        named in `sf`. NULL whenever no import coercion is in flight. */
     struct JSImportCap *pending_import_cap;
-    JSValue pending_close_gen;   /* a C builtin (IfAbruptCloseIterator) deferred a GENERATOR-source close to its
-                                    interpreter caller: the JS_CallInternal exception label routes it onto
-                                    do_generator_tramp (close_exc) so the finally runs on the tramp, never a
-                                    JS_IteratorClose->js_generator_next drive-to-completion. UNINITIALIZED when idle. */
+    JSValue pending_close_iter;  /* IfAbruptCloseIterator deferred an iterator close to its interpreter caller:
+                                    the JS_CallInternal exception label runs 7.4.9 on the tramp, saving and
+                                    restoring the in-flight exception across it, so the page's `return` (a
+                                    generator's finally, an accessor, a proxy trap, a plain method containing a
+                                    loop) never runs in a C activation with no flow base. The label picks the route
+                                    by ITERATOR KIND, the same split OP_iterator_close makes — which is why no
+                                    site that parks one asks what kind it is. UNINITIALIZED when idle. */
     JSValue error_prepare_stack;
     JSValue error_stack_trace_limit;
     JSValue iterator_ctor;
@@ -3012,7 +3015,7 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
     ctx->promise_ctor = JS_NULL;
     ctx->error_ctor = JS_NULL;
     ctx->error_back_trace = JS_UNDEFINED;
-    ctx->pending_close_gen = JS_UNINITIALIZED;
+    ctx->pending_close_iter = JS_UNINITIALIZED;
     ctx->pending_import_cap = NULL;
     ctx->error_prepare_stack = JS_UNDEFINED;
     ctx->error_stack_trace_limit = js_int32(10);
@@ -3220,7 +3223,7 @@ void JS_FreeContext(JSContext *ctx)
     }
     JS_FreeValue(ctx, ctx->error_ctor);
     DCHECK(ctx->pending_import_cap == NULL, "a parked import capability outlived its context");
-    JS_FreeValue(ctx, ctx->pending_close_gen);   /* normally UNINITIALIZED (drained at the exception label); free defensively */
+    JS_FreeValue(ctx, ctx->pending_close_iter);   /* normally UNINITIALIZED (drained at the exception label); free defensively */
     JS_FreeValue(ctx, ctx->error_back_trace);
     JS_FreeValue(ctx, ctx->error_prepare_stack);
     JS_FreeValue(ctx, ctx->error_stack_trace_limit);
@@ -19619,12 +19622,21 @@ static void js_toprim_abandon(JSContext *ctx, struct JSToPrim *tp)
     tramp_step_chain_free(ctx, touter);
 }
 
-#define CONT_ITER_CLOSE    28  /* cont_state = NULL: 7.4.9 IteratorClose step 2's `? GetMethod(iterator,
-                                  "return")` requested by OP_iterator_close. Stateless — the iterator it closes is
-                                  the opcode's own operand and stays at sp[-1] for the whole sequence, so there is
-                                  nothing to carry across the read. */
-#define CONT_ITER_CLOSE_CALL 29 /* cont_state = NULL: step 3.c's Call(return, iterator). Its result is discarded;
-                                  all it owes is step 6's "must be an Object". */
+/* 7.4.9 IteratorClose requested DURING an exception unwind — IfAbruptCloseIterator, deferred to the interpreter
+   through ctx->pending_close_iter. The OPCODE's close is stateless because its iterator is its own operand at
+   sp[-1]; an unwind has no operand to borrow, and it must carry the in-flight exception across a close that can
+   SUSPEND, so neither can live in an interpreter local. This state is that difference and nothing else, which is
+   why the two modes share the CONT_* kinds and the whole sequence: the state's PRESENCE is the mode. */
+typedef struct JSIterCloseExc {
+    JSValue iter;        /* owned: the iterator being closed */
+    JSValue saved_exc;   /* owned: the exception the close must not overwrite (7.4.9's abrupt completion wins) */
+} JSIterCloseExc;
+#define CONT_ITER_CLOSE    28  /* cont_state = NULL for OP_iterator_close (its iterator stays at sp[-1] for the
+                                  whole sequence), a JSIterCloseExc for an unwind close: 7.4.9 step 2's
+                                  `? GetMethod(iterator, "return")`. */
+#define CONT_ITER_CLOSE_CALL 29 /* same split: step 3.c's Call(return, iterator). Its result is discarded; under a
+                                  NORMAL completion it owes step 6's "must be an Object", and under an unwind the
+                                  result AND any throw of its own are discarded and the saved exception re-raised. */
 #define CONT_FOROF_NEXT    20  /* cont_state = NULL (the enum_rec offset rides the frame's forof_off): `for (x of it)`
                                   where it.next is a NORMAL bytecode function. Its body runs on THIS chain, so a loop
                                   in a hand-written .next() preempts; js_for_of_next -> JS_IteratorNext -> JS_Call was
@@ -19763,6 +19775,35 @@ static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue
 static void js_iter_helper_abandon(JSContext *ctx, void *st)
 {
     ((JSIteratorHelperData *)st)->executing = 0;
+}
+/* This helper is a SOURCE being CONSUMED and it has just gone abrupt (its callback threw, or its own step did).
+   The consumer step can never be re-entered, and nothing else owns it: while a helper source runs inline on the
+   interpreter chain the consume machine is not any frame's continuation, so leaving it behind leaked the machine,
+   its accumulator, and everything the realm hangs off them — 724 objects for `it.map(throws).toArray()`. No close
+   is owed to the helper itself: IteratorStepValue marks an iterator [[Done]] when its next throws and returns the
+   abrupt WITHOUT closing. The two abrupt sites (the step's own <0 return and the callback frame's unwind) are the
+   same obligation, which is why this is one function rather than a copy at each. */
+static void js_iter_helper_drop_consumer(JSContext *ctx, JSIteratorHelperData *it)
+{
+    void *cons = it->consumer;
+    uint8_t ck = it->consumer_kind;
+    if (it->drive_mode != ITH_CONSUME || !cons)
+        return;
+    it->consumer = NULL;
+    while (cons && ck == CONT_ITER_HELPER) {   /* a CHAIN: map(filter(src)) */
+        JSIteratorHelperData *ch = cons;
+        ch->executing = 0;
+        ch->done = 1;
+        cons = ch->consumer;
+        ck = ch->consumer_kind;
+        ch->consumer = NULL;   /* the helper object is GC-owned; only the link is dropped */
+    }
+    if (!cons)
+        return;
+    DCHECK(ck == CONT_ITER_CONSUME_FWD,
+           "an abrupt helper source has a consumer kind whose teardown is not built");
+    js_iter_consume_end(ctx, (struct JSIterConsume *)cons);
+    js_free_rt(ctx->rt, cons);
 }
 static bool tramp_can_call_iter_helper(JSValueConst func, JSValueConst this_val);
 static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int *pdone, int magic);
@@ -21625,7 +21666,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     int tramp_gen_iternext = 0;                         /* 1 = OP_iterator_next drive (yield* / destructuring): iterator at sp[-4], arg at sp[-1], result OBJECT replaces sp[-1] */
     int tramp_gen_close = 0;                            /* 1 = OP_iterator_close drive (.return() on an unconsumed generator iterator at sp[-1]): body runs finally on the tramp, result DISCARDED */
     int tramp_gen_close_exc = 0;                        /* 1 = the close is happening DURING exception unwind (JS_IteratorClose(iter,true)): after the finally runs, restore the in-flight exception and continue unwinding (goto exception), never overwrite it */
-    JSValueConst tramp_gen_close_slot_gen = JS_UNINITIALIZED; /* close mode: the generator to close comes from ctx->pending_close_gen (an IfAbruptCloseIterator deferral), NOT sp[-1]; caller_sp stays put (nothing on the stack). read+reset in do_generator_tramp */
+    JSValueConst tramp_gen_close_slot_gen = JS_UNINITIALIZED; /* close mode: the generator to close comes from ctx->pending_close_iter (an IfAbruptCloseIterator deferral), NOT sp[-1]; caller_sp stays put (nothing on the stack). read+reset in do_generator_tramp */
     JSValue tramp_gen_close_deliver = JS_UNINITIALIZED;  /* close-then-deliver (helper .return()): after the source generator closes, PUSH this pre-built {value,done:true} as the helper.return() result instead of discarding. read+reset in do_generator_tramp */
     int tramp_gen_create_forof = 0;                     /* 1 = this do_generator_create_tramp is a for-of iterator-getter (OP_for_of_start): at settle, finish the enum_rec ([iterator, next, catch_offset]) instead of pushing the bare object */
     void *tramp_gen_create_cont_it = NULL;              /* non-NULL = this do_generator_create_tramp creates an iterator from a generator-function @@iterator called by a driver (flatMap inner or a C consumer): the settle stores the created iterator on that driver and re-enters its step, never pushes it. read+reset in do_generator_create_tramp */
@@ -23619,22 +23660,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         goto do_helper_deliver;
                     }
                     if (dck == CONT_ITER_CLOSE_CALL) {
-                        JSValue *cargv;
-                        int pop, first;
-                        TAKE_CALL_SHAPE(); pop = call_pop; first = call_first_r;
-                        cargv = sp - pop;
-                        for (i = first; i < pop; i++) JS_FreeValue(ctx, cargv[i]);
-                        sp += first - pop;
-                        if (unlikely(JS_IsException(ret_val))) goto exception;
-                        if (unlikely(!JS_IsObject(ret_val))) {
-                            JS_FreeValue(ctx, ret_val);
-                            JS_ThrowTypeErrorNotAnObject(ctx);
-                            goto exception;
-                        }
-                        JS_FreeValue(ctx, ret_val);
-                        JS_FreeValue(ctx, sp[-1]);
-                        sp--;
-                        BREAK;
+                        TAKE_CALL_SHAPE();
+                        cont_st = dcs;
+                        goto do_iter_close_deliver;
                     }
                     if (dck == CONT_FOROF_NEXT) {
                         JSValue *cargv;
@@ -23964,15 +23992,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValue nextm, acc;
                 if (iterterm_kind != ITERTERM_TOARRAY
                     && check_function(ctx, (call_argc >= 1) ? call_argv[0] : JS_UNDEFINED)) {
-                    /* IfAbruptCloseIterator: an invalid callback still closes the underlying iterator. A GENERATOR's
-                       .return() must run on the tramp, so defer it to the exception label. */
-                    if (JS_VALUE_GET_TAG(iterobj) == JS_TAG_OBJECT
-                        && JS_VALUE_GET_OBJ(iterobj)->class_id == JS_CLASS_GENERATOR
-                        && JS_VALUE_GET_OBJ(iterobj)->u.generator_data
-                        && JS_IsUninitialized(ctx->pending_close_gen))
-                        ctx->pending_close_gen = js_dup(iterobj);
-                    else
-                        JS_IteratorClose(ctx, iterobj, true);
+                    /* IfAbruptCloseIterator: an invalid callback still closes the underlying iterator, and the
+                       page's `return` runs on the tramp — park it for the exception label, which owns the routing. */
+                    DCHECK(JS_IsUninitialized(ctx->pending_close_iter),
+                           "pending_close_iter already set — a nested IfAbruptCloseIterator needs a queue");
+                    ctx->pending_close_iter = js_dup(iterobj);
                     goto exception;
                 }
                 nextm = JS_GetProperty(ctx, iterobj, JS_ATOM_next);   /* GetIteratorDirect's nextMethod */
@@ -24325,7 +24349,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                           goto do_consume_acquire_have_method;
                       }
                       if (gk == CONT_ITER_CONSUME) goto do_iter_consume_step;
-                      if (gk == CONT_ITER_CLOSE) goto do_iter_close_method;
+                      if (gk == CONT_ITER_CLOSE) { cont_st = gouter0; goto do_iter_close_method; }
                       DCHECK(gk == CONT_STEP, "property-get outer continuation: unknown machine kind"); }
                     goto do_step_step;
                 }
@@ -24419,9 +24443,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         goto do_iter_consume_step;
                     }
                     if (gk3 == CONT_ITER_CLOSE) {
-                        /* a poisoned `return` accessor: nothing is waiting on the read, and the iterator the
-                           opcode left on the stack is freed by the ordinary unwind. */
-                        DCHECK(gouter == NULL, "an iterator-close property read carries no state");
+                        /* a poisoned `return` accessor. For the OPCODE's close nothing is waiting on the read and
+                           the iterator it left on the stack is freed by the ordinary unwind; for an UNWIND close
+                           the read's throw is discarded and the original exception wins. */
+                        if (gouter) { cont_st = gouter; goto do_iter_close_exc_done; }
                         goto exception;
                     }
                     DCHECK(gk3 == CONT_STEP, "property-get outer continuation: unknown machine kind");
@@ -24957,13 +24982,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        (the close's own throw is discarded — the original wins). A generator closes on the tramp via
                        the exception label's deferral. */
                     if (s->sink == ITERCONS_ITERTERM && !JS_IsUndefined(s->iter)) {
-                        if (JS_VALUE_GET_TAG(s->iter) == JS_TAG_OBJECT
-                            && JS_VALUE_GET_OBJ(s->iter)->class_id == JS_CLASS_GENERATOR
-                            && JS_VALUE_GET_OBJ(s->iter)->u.generator_data
-                            && JS_IsUninitialized(ctx->pending_close_gen))
-                            ctx->pending_close_gen = js_dup(s->iter);
-                        else
-                            JS_IteratorClose(ctx, s->iter, true);
+                        DCHECK(JS_IsUninitialized(ctx->pending_close_iter),
+                               "pending_close_iter already set — a nested IfAbruptCloseIterator needs a queue");
+                        ctx->pending_close_iter = js_dup(s->iter);
                     }
                     js_iter_consume_end(ctx, s); js_free_rt(rt, s); goto exception;
                 }
@@ -25519,7 +25540,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JSValue out;
                     int st = js_iter_helper_step(ctx, it, ret_val, &out);
                     ret_val = JS_UNINITIALIZED;
-                    if (unlikely(st < 0)) { it->executing = 0; goto exception; }
+                    if (unlikely(st < 0)) {
+                        it->executing = 0;
+                        js_iter_helper_drop_consumer(ctx, it);
+                        goto exception;
+                    }
                     if (st == 3) {
                         /* run the map/filter callback ON THE TRAMP: [this=undefined, func, value, index]. do_return
                            re-enters this step (CONT_ITER_HELPER) with the callback's result. */
@@ -25763,6 +25788,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 TrampFrame *gtf; JSObject *gfp; JSFunctionBytecode *gb;
                 bool run_body = true, do_throw = false;
                 if (gs->state == JS_GENERATOR_STATE_EXECUTING) {
+                    if (close_exc) {
+                        /* an IfAbruptCloseIterator on a generator that is STILL RUNNING (its own body threw the
+                           exception being unwound). 7.4.9 discards the close's own throw under an abrupt
+                           completion, so this TypeError never surfaces — the original wins. The six sites that
+                           park a close used to carve this state out and hand it to JS_IteratorClose instead,
+                           which reaches js_generator_next's DFAIL for exactly the same reason. */
+                        if (close_from_slot) JS_FreeValue(ctx, (JSValue)close_slot);
+                        rt->current_exception = close_exc_e;
+                        goto exception;
+                    }
                     JS_ThrowTypeError(ctx, "cannot invoke a running generator");
                     goto exception;
                 }
@@ -26461,7 +26496,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (!JS_IsUndefined(gp->target))
                             ret_val = js_proxy_get_invariant(ctx, gp->target, gp->atom, ret_val);
                         js_getprop_free(ctx, gp);
-                        if (unlikely(JS_IsException(ret_val))) goto exception;
+                        cont_st = gouter;
+                        if (unlikely(JS_IsException(ret_val))) {
+                            /* a poisoned `return` accessor. Under an UNWIND close 7.4.9 discards its throw and the
+                               original exception wins; under the opcode's close it propagates. */
+                            if (cont_st) goto do_iter_close_exc_done;
+                            goto exception;
+                        }
                         goto do_iter_close_method;
                     }
                     if (gouter_kind == CONT_ACQUIRE_GET) {
@@ -26546,21 +26587,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto do_toprim_step;
                 }
                 if (rck == CONT_ITER_CLOSE_CALL) {
-                    /* 7.4.9 steps 5-6: the `return` method returned. Under a NORMAL completion its own throw
-                       propagates and its result must be an Object; the value itself is discarded. */
-                    JSValue *cargv = sp - cargc;
-                    DCHECK(cargc >= cfirst, "iterator-close frame records operands ending below where they start");
-                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
-                    sp += cfirst - cargc;
-                    if (unlikely(!JS_IsObject(ret_val))) {
-                        JS_FreeValue(ctx, ret_val);
-                        JS_ThrowTypeErrorNotAnObject(ctx);
-                        goto exception;
-                    }
-                    JS_FreeValue(ctx, ret_val);
-                    JS_FreeValue(ctx, sp[-1]);
-                    sp--;
-                    BREAK;
+                    /* 7.4.9 steps 5-6: the `return` method returned. */
+                    call_first_r = cfirst; call_pop = cargc;
+                    cont_st = rcs;
+                    goto do_iter_close_deliver;
                 }
                 if (rck == CONT_FOROF_NEXT) {
                     /* the plain iterator's .next() returned: IteratorNext's object check, then
@@ -27738,33 +27768,100 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         do_iter_close_method:
-            /* 7.4.9 steps 2-3, with ret_val holding the `return` method and the iterator still at sp[-1].
-               GetMethod's contract: undefined or null means there is nothing to close, and anything else
-               non-callable is its TypeError. */
+            /* 7.4.9 steps 2-3, with ret_val holding the `return` method. cont_st is NULL for the OPCODE's close
+               (its iterator is the operand at sp[-1]) and a JSIterCloseExc for an UNWIND close (whose iterator and
+               saved exception are in the state). GetMethod's contract: undefined or null means there is nothing to
+               close, and anything else non-callable is its TypeError. */
             {
+                JSIterCloseExc *ce = (JSIterCloseExc *)cont_st;
                 JSValue clm = ret_val;
-                JSValueConst cli;
+                JSValueConst cli = ce ? ce->iter : sp[-1];
                 if (JS_IsUndefined(clm) || JS_IsNull(clm)) {
                     JS_FreeValue(ctx, clm);
+                    if (ce) goto do_iter_close_exc_done;
                     JS_FreeValue(ctx, sp[-1]);
                     sp--;
                     BREAK;
                 }
                 if (!JS_IsFunction(ctx, clm)) {
                     JS_FreeValue(ctx, clm);
+                    /* under an abrupt completion 7.4.9 discards its OWN throw, so this TypeError is never raised
+                       there — the original exception is what propagates. */
+                    if (ce) goto do_iter_close_exc_done;
                     JS_ThrowTypeError(ctx, "not a function");
                     goto exception;
                 }
-                DCHECK(sp + 2 <= TRAMP_SP_LIMIT(sf),
-                       "iterator close: operand push exceeds the frame's compiled stack_size");
-                cli = sp[-1];
-                sp[0] = js_dup(cli);   /* this */
-                sp[1] = clm;           /* the `return` method — the stack adopts it */
-                sp += 2;
-                call_argv = sp; call_argc = 0; tramp_first = -2; tramp_is_tail = 0;
-                tramp_cont_state = NULL; tramp_cont_kind = CONT_ITER_CLOSE_CALL;
-                if (tramp_can_call(sp[-1])) goto do_tramp_call;
+                if (ce) {
+                    /* the unwind's call operands go in an OWNED list, not on the caller's stack: this label is
+                       reached from the exception path, where sp sits wherever the throw happened and the frame's
+                       compiled stack_size has no headroom to promise. call_cfirst/call_cargc state that the
+                       caller's own operands are untouched. */
+                    JSValue *cl2 = js_malloc(ctx, sizeof(JSValue) * 2);
+                    if (unlikely(!cl2)) { JS_FreeValue(ctx, clm); goto do_iter_close_exc_done; }
+                    cl2[0] = js_dup(cli);   /* this */
+                    cl2[1] = clm;           /* the `return` method — the list adopts it */
+                    TAKE_CALL_SHAPE();
+                    call_cfirst = 0; call_cargc = 0;
+                    if (call_args_owned) free_arg_list(ctx, call_args_owned, call_args_owned_n);
+                    call_args_owned = cl2; call_args_owned_n = 2;
+                    call_argv = (JSValueConst *)&cl2[2]; call_argc = 0;
+                } else {
+                    DCHECK(sp + 2 <= TRAMP_SP_LIMIT(sf),
+                           "iterator close: operand push exceeds the frame's compiled stack_size");
+                    sp[0] = js_dup(cli);   /* this */
+                    sp[1] = clm;           /* the `return` method — the stack adopts it */
+                    sp += 2;
+                    call_argv = sp; call_argc = 0;
+                }
+                tramp_first = -2; tramp_is_tail = 0;
+                tramp_cont_state = ce; tramp_cont_kind = CONT_ITER_CLOSE_CALL;
+                if (tramp_can_call(call_argv[-1])) goto do_tramp_call;
                 goto do_generic_callee;
+            }
+
+        do_iter_close_deliver:
+            /* THE ONE completion of 7.4.9 steps 5-6 — reached from every frame kind the `return` method can have
+               (a returned heap frame, a bodiless callee run in place) and from its THROW. cont_st says which mode:
+               a NULL state is the opcode's close, where the method's own throw propagates and its result must be
+               an Object; a JSIterCloseExc is an unwind close, where the result AND any throw are discarded so the
+               original abrupt completion wins. The operand shape is in call_first_r/call_pop. */
+            {
+                JSIterCloseExc *ce = (JSIterCloseExc *)cont_st;
+                JSValue *cargv = sp - call_pop;
+                DCHECK(call_pop >= call_first_r, "iterator close records operands ending below where they start");
+                for (i = call_first_r; i < call_pop; i++) JS_FreeValue(ctx, cargv[i]);
+                sp += call_first_r - call_pop;
+                if (ce) {
+                    JS_FreeValue(ctx, ret_val);   /* the result, or JS_EXCEPTION — either way discarded */
+                    goto do_iter_close_exc_done;
+                }
+                if (unlikely(JS_IsException(ret_val))) goto exception;
+                if (unlikely(!JS_IsObject(ret_val))) {
+                    JS_FreeValue(ctx, ret_val);
+                    JS_ThrowTypeErrorNotAnObject(ctx);
+                    goto exception;
+                }
+                JS_FreeValue(ctx, ret_val);
+                JS_FreeValue(ctx, sp[-1]);
+                sp--;
+                BREAK;
+            }
+
+        do_iter_close_exc_done:
+            /* the unwind close is over, however it ended: drop the state, re-raise the exception it was holding
+               and carry on unwinding. `cont_st` is the JSIterCloseExc; anything the close itself threw is dropped
+               here, which is 7.4.9's "the abrupt completion wins". */
+            {
+                JSIterCloseExc *ce = (JSIterCloseExc *)cont_st;
+                JSValue saved;
+                DCHECK(ce != NULL, "do_iter_close_exc_done reached with no unwind-close state");
+                saved = ce->saved_exc;
+                JS_FreeValue(ctx, ce->iter);
+                js_free(ctx, ce);
+                cont_st = NULL;
+                JS_FreeValue(ctx, rt->current_exception);
+                rt->current_exception = saved;
+                goto exception;
             }
         CASE(OP_nip_catch):
             {
@@ -29899,13 +29996,41 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         js_import_cap_free(ctx, ic);
         goto restart;
     }
-    if (unlikely(!JS_IsUninitialized(ctx->pending_close_gen))) {
-        /* A C builtin (IfAbruptCloseIterator) deferred a generator-source close: route it onto do_generator_tramp
-           (close_exc) so the finally runs on the tramp; the in-flight exception is saved+restored across the close. */
-        tramp_gen_close_slot_gen = ctx->pending_close_gen;
-        ctx->pending_close_gen = JS_UNINITIALIZED;
-        tramp_gen_magic = GEN_MAGIC_RETURN; tramp_gen_close = 1; tramp_gen_close_exc = 1;
-        goto do_generator_tramp;
+    if (unlikely(!JS_IsUninitialized(ctx->pending_close_iter))) {
+        /* THE ONE ROUTER for a deferred IfAbruptCloseIterator. The kind test lived at each of the six sites that
+           park one, and each of those sites had the same non-generator FALLBACK beside it: JS_IteratorClose from
+           C, which invokes the page's `return` with JS_CallFree in an activation with no flow base — so a `return`
+           containing a loop aborted at its back-edge. That fallback is gone; every kind is routed here, by the
+           same split OP_iterator_close makes, and a kind with no route CRASHES rather than driving from C. */
+        JSValue ci = ctx->pending_close_iter;
+        ctx->pending_close_iter = JS_UNINITIALIZED;
+        if (JS_VALUE_GET_TAG(ci) == JS_TAG_OBJECT) {
+            JSObject *ip = JS_VALUE_GET_OBJ(ci);
+            if (ip->class_id == JS_CLASS_GENERATOR && ip->u.generator_data) {
+                /* the finally runs on the tramp; close_exc saves+restores the in-flight exception across it. An
+                   EXECUTING generator lands here too — its "cannot invoke a running generator" TypeError is the
+                   CLOSE's own throw, which 7.4.9 discards under an abrupt completion. */
+                tramp_gen_close_slot_gen = ci;
+                tramp_gen_magic = GEN_MAGIC_RETURN; tramp_gen_close = 1; tramp_gen_close_exc = 1;
+                goto do_generator_tramp;
+            }
+        }
+        /* everything else is 7.4.9 itself: `? GetMethod(iterator, "return")` — the page's code on an accessor or
+           a Proxy — then the call. Both run on the tramp; an ASYNC generator's `return` is reached this way too,
+           since do_generic_callee's agen arm answers it and the promise it settles with is discarded exactly as
+           7.4.9 discards any close result under an abrupt completion. Unlike the opcode's close there is no
+           operand to borrow for the iterator and the in-flight exception has to survive a suspension, so this
+           mode carries a state; its presence in the continuation IS the mode. */
+        {
+            JSIterCloseExc *ce = js_malloc(ctx, sizeof(*ce));
+            if (unlikely(!ce)) { JS_FreeValue(ctx, ci); goto exception; }
+            ce->iter = ci;
+            ce->saved_exc = rt->current_exception;
+            rt->current_exception = JS_UNINITIALIZED;
+            gp_obj = ci; gp_atom = JS_ATOM_return; gp_op = GP_GET; gp_val = JS_UNDEFINED;
+            gp_outer = ce; gp_outer_kind = CONT_ITER_CLOSE;
+            goto do_getprop_tramp;
+        }
     }
     if (needs_backtrace(rt->current_exception)
     || JS_IsUndefined(ctx->error_back_trace)) {
@@ -30125,6 +30250,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             cit->done = 1;
             cit->executing = 0;
             iter_helper_close_source_abrupt(ctx, cit);
+            js_iter_helper_drop_consumer(ctx, cit);
         } else if (xck == CONT_TOPRIM) {
             /* the coercion method THREW: 7.1.1 propagates it (there is no next-method fallback on an abrupt
                completion), so drop the sequence state and re-raise in the operator's frame. */
@@ -30137,13 +30263,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             js_toprim_abandon(ctx, xcs);
             goto exception;
         } else if (xck == CONT_ITER_CLOSE_CALL) {
-            /* the iterator's `return` THREW. Under 7.4.9 with a normal completion that throw propagates, so all
-               this owes is the operands it pushed; the iterator itself is the opcode's own stack slot and the
-               ordinary unwind frees it. */
+            /* the iterator's `return` THREW. Under a NORMAL completion that throw propagates, so all this owes is
+               the operands it pushed (the iterator is the opcode's own stack slot, freed by the ordinary unwind);
+               under an UNWIND close the throw is discarded and the saved exception is re-raised. */
             JSValue *cargv = sp - xcg;
             DCHECK(xcg >= xcf, "iterator-close frame records operands ending below where they start");
             for (i = xcf; i < xcg; i++) JS_FreeValue(ctx, cargv[i]);
             sp += xcf - xcg;
+            if (xcs) { cont_st = xcs; goto do_iter_close_exc_done; }
             goto exception;
         } else if (xck == CONT_FOROF_NEXT) {
             /* the plain iterator's .next() THREW. Its abrupt handling: clear the enum_rec's iterator slot (a
@@ -30259,6 +30386,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 /* the entry's accessor threw: IfAbruptCloseIterator still owes the source a close, and the machine
                    that asked for the read can never be re-entered — abandon does both. */
                 js_iter_consume_abandon(ctx, gouter);
+            } else if (gouter && gk2 == CONT_ITER_CLOSE) {
+                /* the `return` ACCESSOR threw during an UNWIND close (its frame suspended, so the throw arrives
+                   here rather than at the in-place site). 7.4.9 discards the close's own throw: the exception the
+                   state is holding is the one that propagates. */
+                cont_st = gouter;
+                goto do_iter_close_exc_done;
             } else {
                 tramp_step_chain_free(ctx, gouter);
             }
@@ -30325,23 +30458,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                sources, which close through their own machinery — i.e. the restriction was part of the same
                fallback the narrowing enforced. */
             if (xck == CONT_ITER_CONSUME
-                && !JS_IsUndefined(((struct JSIterConsume *)xcs)->iter)
-                && (((struct JSIterConsume *)xcs)->sink == ITERCONS_ITERTERM
-                    || !(JS_VALUE_GET_TAG(((struct JSIterConsume *)xcs)->iter) == JS_TAG_OBJECT
-                         && JS_VALUE_GET_OBJ(((struct JSIterConsume *)xcs)->iter)->class_id == JS_CLASS_GENERATOR))) {
-                /* A GENERATOR source in a non-terminal sink already closes through its own machinery, and forcing
-                   IteratorClose on it here resumes its body OFF the tramp (the drive-to-completion DFAIL). Only a
-                   PLAIN iterator was being missed — which is the case Array/from/iter-map-fn-err observes. */
-                /* an Iterator.prototype terminal's callback THREW: same IfAbruptCloseIterator obligation. A generator
-                   source closes on the tramp via the exception label's deferral; anything else closes inline. */
+                && !JS_IsUndefined(((struct JSIterConsume *)xcs)->iter)) {
+                /* The SOURCE KIND used to be asked here: a GENERATOR in a non-terminal sink was excluded because
+                   "it already closes through its own machinery", and because forcing the close ran JS_IteratorClose
+                   inline, which resumes a generator body OFF the tramp. The second reason is gone — the close is
+                   parked and the exception label runs it on the tramp — and the first was never true:
+                   `Array.from(gen, mapfnThatThrows)` left the generator's `finally` UNRUN. Every consumer whose
+                   callback threw is an IfAbruptCloseIterator site, whatever its source. */
                 struct JSIterConsume *cs2 = (struct JSIterConsume *)xcs;
-                if (JS_VALUE_GET_TAG(cs2->iter) == JS_TAG_OBJECT
-                    && JS_VALUE_GET_OBJ(cs2->iter)->class_id == JS_CLASS_GENERATOR
-                    && JS_VALUE_GET_OBJ(cs2->iter)->u.generator_data
-                    && JS_IsUninitialized(ctx->pending_close_gen))
-                    ctx->pending_close_gen = js_dup(cs2->iter);
-                else
-                    JS_IteratorClose(ctx, cs2->iter, true);
+                DCHECK(JS_IsUninitialized(ctx->pending_close_iter),
+                       "pending_close_iter already set — a nested IfAbruptCloseIterator needs a queue");
+                ctx->pending_close_iter = js_dup(cs2->iter);
             }
             if (xck == CONT_ITER_CONSUME)
                 js_iter_consume_end(ctx, (struct JSIterConsume *)xcs);
@@ -54214,13 +54341,9 @@ static void js_iter_consume_abandon(JSContext *ctx, void *st)
 {
     JSIterConsume *s = st;
     if (!JS_IsUndefined(s->iter)) {
-        if (JS_VALUE_GET_TAG(s->iter) == JS_TAG_OBJECT
-            && JS_VALUE_GET_OBJ(s->iter)->class_id == JS_CLASS_GENERATOR
-            && JS_VALUE_GET_OBJ(s->iter)->u.generator_data
-            && JS_IsUninitialized(ctx->pending_close_gen))
-            ctx->pending_close_gen = js_dup(s->iter);
-        else
-            JS_IteratorClose(ctx, s->iter, true);
+        DCHECK(JS_IsUninitialized(ctx->pending_close_iter),
+               "pending_close_iter already set — a nested IfAbruptCloseIterator needs a queue");
+        ctx->pending_close_iter = js_dup(s->iter);
     }
     js_iter_consume_end(ctx, s);
     js_free_rt(ctx->rt, s);
@@ -59036,23 +59159,17 @@ static JSValue js_iterator_proto_set_toStringTag(JSContext *ctx, JSValueConst th
 
 /* Iterator.prototype.{drop,take,map,filter,flatMap}: create the helper object over `this` (the source iterator).
    No drive-to-completion — pure object creation; the source is iterated lazily by the helper's .next(). */
-/* IfAbruptCloseIterator: close the source. A GENERATOR source's .return() must run its finally on the tramp
-   (js_generator_next is a DFAIL) — DEFER it to the interpreter caller via ctx->pending_close_gen, which its
-   exception label routes onto do_generator_tramp. A non-generator source's .return() is a plain call — close now.
-   Shared by the body's own failures and by the coerce-then-compute machine's abrupt-coercion hook, because the
-   spec makes no distinction between them: step 5 of take/drop closes for BOTH. */
+/* IfAbruptCloseIterator: close the source. The `return` is the PAGE's code whatever the source is — a generator's
+   finally, an accessor, a proxy trap, a plain method with a loop in it — so it runs on the tramp: DEFER it to the
+   interpreter caller via ctx->pending_close_iter, whose exception label owns the routing. Asking here what kind of
+   iterator this is (and closing a non-generator inline with JS_IteratorClose) was the fallback that drove the
+   page's `return` from C. Shared by the body's own failures and by the coerce-then-compute machine's
+   abrupt-coercion hook, because the spec makes no distinction: step 5 of take/drop closes for BOTH. */
 static void js_iterator_helper_close(JSContext *ctx, JSValueConst this_val, int magic)
 {
-    if (JS_VALUE_GET_TAG(this_val) == JS_TAG_OBJECT) {
-        JSObject *tp = JS_VALUE_GET_OBJ(this_val);
-        if (tp->class_id == JS_CLASS_GENERATOR && tp->u.generator_data
-            && ((JSGeneratorData *)tp->u.generator_data)->state != JS_GENERATOR_STATE_EXECUTING) {
-            DCHECK(JS_IsUninitialized(ctx->pending_close_gen), "pending_close_gen already set — nested IfAbruptCloseIterator");
-            ctx->pending_close_gen = js_dup(this_val);
-            return;
-        }
-    }
-    JS_IteratorClose(ctx, this_val, true);
+    DCHECK(JS_IsUninitialized(ctx->pending_close_iter),
+           "pending_close_iter already set — a nested IfAbruptCloseIterator needs a queue");
+    ctx->pending_close_iter = js_dup(this_val);
 }
 
 /* 27.1.4.5/27.1.4.3 steps 1-2: the receiver must be an Object, and that TypeError precedes the limit's
@@ -59163,21 +59280,14 @@ fail:
    the {value,done} to deliver. Returns 0 = DONE, 1 = DRIVE the source .next() again. DROP built (skip `count`, then
    pass values through); other kinds still use the plain-iterator js_iterator_helper_next path. */
 /* IfAbruptCloseIterator: close a helper's SOURCE on an abrupt completion (mapper/predicate throw), PRESERVING the
-   pending exception. A GENERATOR source closes on the tramp (the exception label drains pending_close_gen in
-   close_exc mode, saving+restoring the exception); a plain source closes inline as a throw completion (its own
-   return() error is ignored, spec-correct). Call with the pending exception set, then return -1. */
+   pending exception. Every source closes on the tramp — the exception label saves and restores the exception
+   across the close and discards the close's own throw, spec-correct. Call with the pending exception set, then
+   return -1. */
 static void iter_helper_close_source_abrupt(JSContext *ctx, JSIteratorHelperData *it)
 {
-    if (JS_VALUE_GET_TAG(it->obj) == JS_TAG_OBJECT) {
-        JSObject *srcp = JS_VALUE_GET_OBJ(it->obj);
-        if (srcp->class_id == JS_CLASS_GENERATOR && srcp->u.generator_data
-            && ((JSGeneratorData *)srcp->u.generator_data)->state != JS_GENERATOR_STATE_EXECUTING
-            && JS_IsUninitialized(ctx->pending_close_gen)) {
-            ctx->pending_close_gen = js_dup(it->obj);
-            return;
-        }
-    }
-    JS_IteratorClose(ctx, it->obj, true);
+    DCHECK(JS_IsUninitialized(ctx->pending_close_iter),
+           "pending_close_iter already set — a nested IfAbruptCloseIterator needs a queue");
+    ctx->pending_close_iter = js_dup(it->obj);
 }
 
 static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue res, JSValue *out)
