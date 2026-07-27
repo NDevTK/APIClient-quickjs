@@ -21167,6 +21167,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
    frame then pops the previous one's count — the construct side's con_cargc lost a day to exactly that. Written
    as a macro so "resolve it" and "consume it" cannot be separated. */
     int call_pop = 0;   /* scratch for TAKE_CALL_POP */
+    /* the RECEIVER for the consumer chain, resolved from the operand shape once: a plain -1 call has no receiver
+       operand, and reading call_argv[-2] there is reading past the arguments. */
+    JSValueConst crecv = JS_UNDEFINED;
 #define TAKE_CALL_POP() (call_pop = (call_cargc >= 0) ? call_cargc : call_argc, call_cargc = -1, call_pop)
     JSValue *call_args_owned = NULL; int call_args_owned_n = 0;
     JSValueConst tac_ntgt = JS_UNDEFINED;
@@ -21773,37 +21776,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_is_call_function(call_argv[-1]) && call_argc >= 2) {   /* builtins' call(thisArg,f,...) -> dispatch f here */
                     tramp_is_tail = (opcode == OP_tail_call); goto do_forward_callfn;
                 }
-                {   /* PROXY [[Call]]: run the apply trap (or the bare target) on THIS chain */
-                    JSValue px[5], ptgt; int px_ret;
-                    DCHECK(sp + 4 <= TRAMP_SP_LIMIT(sf),
-                           "proxy apply trap: operand reshape exceeds the frame's compiled stack_size");
-                    px_ret = js_tramp_proxy_apply(ctx, call_argv[-1], JS_UNDEFINED,
-                                                  call_argc, vc(call_argv), px, &ptgt);
-                    while (px_ret == 2) {   /* no trap: forward to the resolved callee; it may itself be a proxy
-                                               whose trap must run, so re-resolve in THIS operand shape rather than
-                                               cross-jumping into the [this,f,args] dispatcher. */
-                        JSValue *A = (JSValue *)call_argv;
-                        JS_FreeValue(ctx, A[-1]);
-                        A[-1] = ptgt;
-                        px_ret = js_tramp_proxy_apply(ctx, call_argv[-1], JS_UNDEFINED,
-                                                      call_argc, vc(call_argv), px, &ptgt);
-                    }
-                    if (unlikely(px_ret < 0)) goto exception;
-                    if (px_ret == 1) {                      /* trap(target, thisArg, argArray), this = handler */
-                        JSValue *A = (JSValue *)call_argv;
-                        for (i = 0; i < call_argc; i++) JS_FreeValue(ctx, A[i]);
-                        JS_FreeValue(ctx, A[-1]);           /* the proxy itself */
-                        A[-1] = px[0];                      /* [-2] of the new shape: this = handler */
-                        A[0]  = px[1];                      /* [-1]: the trap */
-                        A[1]  = px[2];                      /* args: target */
-                        A[2]  = px[3];                      /*       thisArg */
-                        A[3]  = px[4];                      /*       argArray */
-                        sp = A + 4;
-                        call_argv = A + 1; call_argc = 3; tramp_first = -2;
-                        tramp_is_tail = (opcode == OP_tail_call);
-                        goto do_tramp_call;
-                    }
-                }
                 /* Same-realm only: js_call_c_function would switch to the eval function's realm, so a cross-realm
                    (0,evalFromOtherRealm)(src) must keep the C path — its program belongs to THAT realm's global. */
                 if (tramp_is_global_eval(call_argv[-1]) && call_argc >= 1 && JS_IsString(call_argv[0])
@@ -21832,7 +21804,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto do_tramp_call;
                 }
                 tramp_first = -1; tramp_is_tail = (opcode == OP_tail_call);
-                goto do_generic_callee;
+                goto do_consumer_dispatch;
             }
             BREAK;
         CASE(OP_call_constructor):
@@ -22139,7 +22111,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    (forEach/map/sort/reduce/find, and not getters, proxy traps, .call or .apply, which borrow from
                    the stack). A callback frame therefore OWNS its arguments. */
                 int narg_alloc = (eff_argc < nb->arg_count) ? nb->arg_count : 0;
-                if (tramp_cont_kind != CONT_NONE && eff_argc > narg_alloc)
+                if ((tramp_cont_kind != CONT_NONE || call_args_owned) && eff_argc > narg_alloc)
                     narg_alloc = eff_argc;
                 size_t asize = sizeof(JSValue) * TRAMP_FRAME_SLOTS(narg_alloc, nb)
                              + sizeof(JSVarRef *) * nb->var_ref_count;
@@ -22157,7 +22129,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 ntf->caller_argc = argc; ntf->caller_argv = argv;
                 ntf->caller_arg_allocated_size = arg_allocated_size;
                 ntf->caller_sp = sp;
-                ntf->call_first = tramp_first; ntf->call_argc = call_argc; ntf->is_tail = tramp_is_tail;
+                ntf->call_first = tramp_first; ntf->call_argc = TAKE_CALL_POP(); ntf->is_tail = tramp_is_tail;
                 ntf->b = nb; ntf->ctx = nb->realm; ntf->local_buf = nlb;
                 nsf = &ntf->sf;
                 nsf->is_strict_mode = nb->is_strict_mode;
@@ -22170,7 +22142,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     for (; k < narg_alloc; k++) narg_buf[k] = JS_UNDEFINED;
                     nsf->arg_count = narg_alloc;
                 } else {
-                    narg_buf = (JSValue *)call_argv;   /* args live on the caller stack (borrowed) */
+                    /* zero arguments either way: an OWNED vector has nothing in it to point at, and pointing at
+                       one that is about to be freed is a dangling arg_buf even when nothing reads it. */
+                    narg_buf = call_args_owned ? NULL : (JSValue *)call_argv;   /* else: the caller stack (borrowed) */
+                }
+                if (call_args_owned) {   /* copied into the callee's own arg_buf above */
+                    free_arg_list(ctx, call_args_owned, call_args_owned_n);
+                    call_args_owned = NULL; call_args_owned_n = 0;
                 }
                 nvar_buf = nlb + narg_alloc;
                 for (k = 0; k < nb->var_count; k++) nvar_buf[k] = JS_UNDEFINED;
@@ -22297,7 +22275,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                the state (like the executor's cb_args) so the ORIGINAL Promise.try operands stay put for the finish
                to pop. do_return -> do_promise_try_finish resolves with fn's return; the exception arm rejects. */
             {
-                JSValueConst thisv = call_argv[-2];
+                JSValueConst thisv = crecv;
                 JSValueConst fn = call_argv[0];
                 int nargs = call_argc - 1;
                 JSPromiseTry *s;
@@ -22308,7 +22286,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (JS_IsException(rp)) { js_free_rt(rt, s); goto exception; }
                 s->promise = rp;
                 s->nargs = nargs;
-                s->orig_cfirst = -2; s->orig_cargc = TAKE_CALL_POP(); s->orig_is_tail = tramp_is_tail;
+                s->orig_cfirst = tramp_first; s->orig_cargc = TAKE_CALL_POP(); s->orig_is_tail = tramp_is_tail;
                 s->cb_args[0] = JS_UNDEFINED;          /* thisArgument for fn is undefined */
                 s->cb_args[1] = js_dup(fn);
                 for (i = 0; i < nargs; i++) s->cb_args[2 + i] = js_dup(call_argv[1 + i]);
@@ -22706,36 +22684,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         do_forward_dispatch:
             /* operands are now the method-call shape [this, f, a0..]: dispatch f on THIS chain. */
             {
-                if (unlikely(JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT
-                             && JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_PROXY)) {
-                    /* PROXY [[Call]] reached through .call/.apply/Reflect.apply/js_call_function: resolve it HERE so
-                       every forwarded shape behaves like a direct call — no-trap proxies collapse to the ultimate
-                       callee, a trap becomes trap(target, thisArg, argArray) on this chain. */
-                    JSValue px[5], ptgt; int px_ret;
-                    DCHECK(sp + 3 <= TRAMP_SP_LIMIT(sf),
-                           "proxy forward dispatch: operand reshape exceeds the frame's compiled stack_size");
-                    px_ret = js_tramp_proxy_apply(ctx, call_argv[-1], call_argv[-2],
-                                                  call_argc, vc(call_argv), px, &ptgt);
-                    while (px_ret == 2) {                   /* no trap: same shape, resolved callee (may be a
-                                                               trap-bearing proxy -> resolve again) */
-                        JS_FreeValue(ctx, (JSValue)call_argv[-1]);
-                        ((JSValue *)call_argv)[-1] = ptgt;
-                        px_ret = js_tramp_proxy_apply(ctx, call_argv[-1], call_argv[-2],
-                                                      call_argc, vc(call_argv), px, &ptgt);
-                    }
-                    if (unlikely(px_ret < 0)) goto exception;
-                    if (px_ret == 1) {
-                        JSValue *A = (JSValue *)call_argv;
-                        for (i = 0; i < call_argc; i++) JS_FreeValue(ctx, A[i]);
-                        JS_FreeValue(ctx, A[-2]);           /* old this */
-                        JS_FreeValue(ctx, A[-1]);           /* the proxy */
-                        A[-2] = px[0];                      /* this = handler */
-                        A[-1] = px[1];                      /* the trap */
-                        A[0]  = px[2]; A[1] = px[3]; A[2] = px[4];   /* target, thisArg, argArray */
-                        sp = A + 3;
-                        call_argc = 3; tramp_first = -2;
-                    }
-                }
                 TRAMP_BODY_DISPATCH(-2, tramp_is_tail);   /* the reshape already produced the method shape */
                 /* The forwarded shape is identical to the direct one, so it must ask the SAME questions. The
                    consumer recognizers used to be copied here and fell behind the OP_call_method list by five
@@ -22965,24 +22913,28 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                at OP_call_method AND at do_forward_dispatch, and the forwarded (.call/.apply) copy fell behind by
                five recognizers, so `Promise.any.call(P, iter)` reached the C body while `Promise.any(iter)` did
                not — one builtin answering differently by how it was spelled. Both -2 sites now converge here.
-               tramp_first is -2 and tramp_is_tail is already set by the caller; a plain -1 call never routes here
-               (it jumps straight to do_generic_callee below, where call_argv[-2] is not a receiver). */
+               BOTH operand shapes route here. A plain -1 call has NO receiver operand, so it sees UNDEFINED —
+               which is what the recognizers should see, since `var u = Set.prototype.union; u(x)` has `this`
+               undefined and must throw rather than consume. Sending -1 to do_generic_callee directly instead was
+               the last spelling gap on this side: `var f = Array.from; f(gen)` reached the C entry while
+               `Array.from(gen)` did not. */
             {
+                crecv = (tramp_first == -2) ? call_argv[-2] : JS_UNDEFINED;
                 if (tramp_can_call_iter_consume(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter, &icons_sink)) {
                     if (icons_sink == ITERCONS_FROMLIKE)
                         goto do_from_like_tramp;                /* Array.from(arrayLike): length + indices */
                     goto do_iter_consume_tramp;                 /* Array.from(iterable) / Math.sumPrecise(iterable) */
                 }
-                if (tramp_can_call_setop_consume(call_argv[-1], call_argv[-2], vc(call_argv), call_argc, &setop_kind))
+                if (tramp_can_call_setop_consume(call_argv[-1], crecv, vc(call_argv), call_argc, &setop_kind))
                     goto do_setop_consume_tramp;                /* s.union/symmetricDifference(setlike) */
-                if (tramp_can_call_iterterm(ctx, call_argv[-1], call_argv[-2], call_argc, &iterterm_kind))
+                if (tramp_can_call_iterterm(ctx, call_argv[-1], crecv, call_argc, &iterterm_kind))
                     goto do_iterterm_tramp;                     /* it.toArray/forEach/reduce/some/every/find */
                 if (tramp_can_call_iterator_from(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter))
                     goto do_iterfrom_tramp;                     /* Iterator.from(obj) */
                 if (tramp_can_call_objentries_consume(ctx, call_argv[-1], vc(call_argv), call_argc, &tramp_iter_getiter))
                     goto do_objentries_consume_tramp;           /* Object.fromEntries(iterable) */
-                if (tramp_can_call_ta_from_consume(ctx, call_argv[-1], call_argv[-2], vc(call_argv), call_argc, &ta_classid, &tramp_iter_getiter)) {
-                    tac_args = vc(call_argv); tac_argc = call_argc; tac_ntgt = call_argv[-2]; tac_cfirst = -2;
+                if (tramp_can_call_ta_from_consume(ctx, call_argv[-1], crecv, vc(call_argv), call_argc, &ta_classid, &tramp_iter_getiter)) {
+                    tac_args = vc(call_argv); tac_argc = call_argc; tac_ntgt = crecv; tac_cfirst = tramp_first;
                     /* this arm records its shape LATER, in do_ta_consume_tramp, so it is the one that has to carry
                        the resolved pop count and the list rather than recording them here */
                     tac_cargc = TAKE_CALL_POP();
@@ -23008,6 +22960,67 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                that gap, and each copy then needed its own tramp_first). */
             {
                 JSValueConst gthis = (tramp_first == -2) ? call_argv[-2] : JS_UNDEFINED;
+                if (JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT
+                    && JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_PROXY) {
+                    /* Proxy [[Call]], asked HERE and nowhere else. do_forward_dispatch had the only copy, and the
+                       .apply / spread route does not pass it — so a trap with a loop in it ran to completion under
+                       `p(...arr)` while `p(x)` parked, and a trapless proxy over a consumer fell to that
+                       consumer's C entry. A trap becomes trap(target, thisArg, argArray) on this chain; a trapless
+                       one resolves to the ultimate callee and the arms below answer it.
+                       The five reshaped operands go in an OWNED list rather than over the caller's slots, because
+                       an apply shape's operands are not where the arguments are — the same reason the construct
+                       side pushes its reshape instead of writing it. */
+                    JSValue px[5], ptgt = JS_UNDEFINED;
+                    int resolved9 = 0;   /* did the walk actually REPLACE the callee? */
+                    int px_ret = js_tramp_proxy_apply(ctx, call_argv[-1], gthis, call_argc, vc(call_argv), px, &ptgt);
+                    while (px_ret == 2) {   /* no trap: same shape, resolved callee (may be another proxy) */
+                        resolved9 = 1;
+                        if (call_args_owned) {
+                            JS_FreeValue(ctx, call_args_owned[1]);
+                            call_args_owned[1] = ptgt;
+                        } else {
+                            JS_FreeValue(ctx, (JSValue)call_argv[-1]);
+                            ((JSValue *)call_argv)[-1] = ptgt;
+                        }
+                        ptgt = JS_UNDEFINED;
+                        px_ret = js_tramp_proxy_apply(ctx, call_argv[-1], gthis, call_argc, vc(call_argv),
+                                                      px, &ptgt);
+                    }
+                    if (unlikely(px_ret < 0)) goto exception;
+                    if (px_ret == 1) {
+                        /* The five reshaped operands REPLACE the caller's, on the stack — the trap call is an
+                           ordinary method call and the frame machinery reads its shape from tramp_first, so a
+                           heap list would have to carry a second `first` alongside its count. The construct side
+                           pushes for the same reason. px[] already holds its own references, so dropping the
+                           originals (including the proxy) first is safe. */
+                        int pop9 = TAKE_CALL_POP();
+                        JSValue *cargv9 = sp - pop9;
+                        if (call_args_owned) {
+                            free_arg_list(ctx, call_args_owned, call_args_owned_n);
+                            call_args_owned = NULL; call_args_owned_n = 0;
+                        }
+                        for (i = tramp_first; i < pop9; i++) JS_FreeValue(ctx, cargv9[i]);
+                        sp += tramp_first - pop9;
+                        DCHECK(sp + 5 <= TRAMP_SP_LIMIT(sf),
+                               "proxy apply trap: operand reshape exceeds the frame's compiled stack_size");
+                        sp[0] = px[0];   /* this = handler */
+                        sp[1] = px[1];   /* the trap */
+                        sp[2] = px[2]; sp[3] = px[3]; sp[4] = px[4];   /* target, thisArg, argArray */
+                        call_argv = (JSValueConst *)(sp + 2); call_argc = 3; sp += 5;
+                        tramp_first = -2;
+                        goto do_tramp_call;   /* the trap is a bytecode body: it runs here and can park */
+                    }
+                    /* px_ret == 0 with a REPLACED callee: none of the questions above this label have been
+                       asked of it — not the body entry, not the consumer recognizers — so re-enter the chain
+                       from the top, exactly as the construct side re-enters after rewriting a trapless proxy.
+                       px_ret == 0 with the callee UNCHANGED is a proxy whose trap is a C or bound function (or
+                       is not callable at all): it has no preemptible body, the arms below reach it in place, and
+                       re-entering there would match this arm again forever. */
+                    if (resolved9) {
+                        TRAMP_BODY_DISPATCH(tramp_first, tramp_is_tail);
+                        goto do_consumer_dispatch;
+                    }
+                }
                 if (tramp_step_def_of(call_argv[-1]))
                     goto do_step_tramp;
                 if (JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT
@@ -23281,9 +23294,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                here has to survive a suspension. */
             {
                 void *fl_stt = tramp_step_state_new(ctx, tramp_step_def_by_id(STEPDEF_ARRAY_FROMLIKE),
-                                                    call_argv[-2], call_argc, vc(call_argv), call_argv[-1]);
+                                                    crecv, call_argc, vc(call_argv), call_argv[-1]);
                 if (unlikely(!fl_stt)) goto exception;
-                ((JSStepHdr *)fl_stt)->orig_cfirst = -2;
+                ((JSStepHdr *)fl_stt)->orig_cfirst = tramp_first;
                 ((JSStepHdr *)fl_stt)->orig_cargc = TAKE_CALL_POP();
                 if (call_args_owned) {   /* the state captured the invocation */
                     free_arg_list(ctx, call_args_owned, call_args_owned_n);
@@ -23301,7 +23314,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                recognition accepted only when the iterator will be a GENERATOR (generator-function @@iterator, created
                here on the tramp) or the source is a direct generator/helper (its @@iterator returns itself). */
             {
-                JSValueConst thisv = call_argv[-2];
+                JSValueConst thisv = crecv;
                 uint8_t sink0 = icons_sink; icons_sink = ITERCONS_FROM;   /* read + reset */
                 JSIterConsume *s;
                 /* the result object is NOT created here: 23.1.2.1 orders step 3's GetMethod before step 4.a's
@@ -23318,7 +23331,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->from_ctor = (sink0 == ITERCONS_FROM) ? js_dup(thisv) : JS_UNDEFINED;
                 s->from_owes_result = (sink0 == ITERCONS_FROM);
                 if (sink0 == ITERCONS_SUMPRECISE) sum_precise_init(&s->sum);
-                s->orig_cfirst = -2; s->orig_cargc = TAKE_CALL_POP(); s->orig_is_tail = tramp_is_tail;
+                s->orig_cfirst = tramp_first; s->orig_cargc = TAKE_CALL_POP(); s->orig_is_tail = tramp_is_tail;
                 s->args_own = call_args_owned; s->args_own_n = call_args_owned_n;
                 call_args_owned = NULL; call_args_owned_n = 0;
                 DCHECK(call_argc >= 1, "the consume entry reads call_argv[0]; the recognizer refuses argc 0, whose "
@@ -23332,7 +23345,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             /* Iterator.prototype eager terminal: validate the callback, GetIteratorDirect(this) — `this` IS the
                iterator, so NO @@iterator call — and consume it on this chain. call_argv[-2] = the iterator. */
             {
-                JSValueConst iterobj = call_argv[-2];
+                JSValueConst iterobj = crecv;
                 JSIterConsume *s;
                 JSValue nextm, acc;
                 if (iterterm_kind != ITERTERM_TOARRAY
@@ -23364,7 +23377,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->k = 0;
                 s->sink = ITERCONS_ITERTERM;
                 s->setop = iterterm_kind;
-                s->orig_cfirst = -2; s->orig_cargc = TAKE_CALL_POP(); s->orig_is_tail = tramp_is_tail;
+                s->orig_cfirst = tramp_first; s->orig_cargc = TAKE_CALL_POP(); s->orig_is_tail = tramp_is_tail;
                 s->args_own = call_args_owned; s->args_own_n = call_args_owned_n;
                 call_args_owned = NULL; call_args_owned_n = 0;
                 cont_st = s;
@@ -23378,7 +23391,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                then hand `keys` to the shared acquire so a generator `*keys()` runs on the tramp.
                call_argv[-2] = the THIS set, call_argv[0] = setlike. */
             {
-                JSValueConst thisset = call_argv[-2];
+                JSValueConst thisset = crecv;
                 JSValueConst setlike = call_argv[0];
                 JSMapState *ss = JS_GetOpaque(thisset, JS_CLASS_SET), *ts;
                 JSValue has, keys, newset;
@@ -23418,7 +23431,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->k = 1;                     /* isSupersetOf: found-so-far = true (unused by union/symmetricDifference) */
                 s->sink = ITERCONS_SETOP;
                 s->setop = setop_kind;
-                s->orig_cfirst = -2; s->orig_cargc = TAKE_CALL_POP(); s->orig_is_tail = tramp_is_tail;
+                s->orig_cfirst = tramp_first; s->orig_cargc = TAKE_CALL_POP(); s->orig_is_tail = tramp_is_tail;
                 s->args_own = call_args_owned; s->args_own_n = call_args_owned_n;
                 call_args_owned = NULL; call_args_owned_n = 0;
                 tramp_iter_getiter = keys;   /* the acquire CALLS it on setlike (create-on-tramp if it is a generator fn) */
@@ -23449,7 +23462,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s = js_mallocz(ctx, sizeof(*s));
                 if (unlikely(!s)) { JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED;
                                     JS_ThrowOutOfMemory(ctx); goto exception; }
-                s->orig_cfirst = -2; s->orig_cargc = TAKE_CALL_POP(); s->orig_is_tail = tramp_is_tail;
+                s->orig_cfirst = tramp_first; s->orig_cargc = TAKE_CALL_POP(); s->orig_is_tail = tramp_is_tail;
                 s->args_own = call_args_owned; s->args_own_n = call_args_owned_n;
                 call_args_owned = NULL; call_args_owned_n = 0;
                 tramp_consume_iterable = obj; tramp_consume_state = s; tramp_consume_kind = CONT_ITER_FROM;
@@ -24047,7 +24060,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->r = obj;
                 s->k = 0;
                 s->sink = ITERCONS_OBJENTRIES;
-                s->orig_cfirst = -2; s->orig_cargc = TAKE_CALL_POP(); s->orig_is_tail = tramp_is_tail;
+                s->orig_cfirst = tramp_first; s->orig_cargc = TAKE_CALL_POP(); s->orig_is_tail = tramp_is_tail;
                 s->args_own = call_args_owned; s->args_own_n = call_args_owned_n;
                 call_args_owned = NULL; call_args_owned_n = 0;
                 /* argc 0 means the source is UNDEFINED, which the acquire turns into GetIterator's TypeError —
@@ -24380,7 +24393,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                tramp (a generator-function @@iterator is created on the tramp via the create-cont, else GetIterator2
                inline), then drive the iterator's .next() on THIS chain. call_argv[-2] = the Promise ctor, [0] = items. */
             {
-                JSValueConst thisv = call_argv[-2];
+                JSValueConst thisv = crecv;
                 JSPromiseAll *s;
                 JSValue rp;
                 s = js_mallocz(ctx, sizeof(*s));
@@ -24397,7 +24410,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->elem_promises = JS_NewArray(ctx);
                 s->index = 0;
                 s->magic = pa_magic;
-                s->orig_cfirst = -2; s->orig_cargc = TAKE_CALL_POP(); s->orig_is_tail = tramp_is_tail;
+                s->orig_cfirst = tramp_first; s->orig_cargc = TAKE_CALL_POP(); s->orig_is_tail = tramp_is_tail;
                 s->args_own = call_args_owned; s->args_own_n = call_args_owned_n;
                 call_args_owned = NULL; call_args_owned_n = 0;
                 if (JS_IsException(s->promise_resolve) || !JS_IsFunction(ctx, s->promise_resolve)
