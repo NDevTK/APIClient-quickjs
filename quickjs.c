@@ -24656,8 +24656,24 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         method = gp_trapst->method;
                         gp_trapst->method = JS_UNDEFINED;
                         if (JS_IsNull(method)) { JS_FreeValue(ctx, method); method = JS_UNDEFINED; }
+                        if (JS_IsUndefined(method)
+                            && JS_VALUE_GET_TAG(pd->target) == JS_TAG_OBJECT
+                            && JS_VALUE_GET_OBJ(pd->target)->class_id == JS_CLASS_PROXY) {
+                            /* NO TRAP, and the target is ITSELF a Proxy. 10.5.x step 6 forwards to
+                               target.[[Get]](P, Receiver) — which IS this entry — so it loops here rather than
+                               being handed to JS_GetPropertyInternal, which re-entered js_proxy_get from C and
+                               cost one C activation per hop: a chain of trapless proxies hit the stack floor and
+                               was caught into a soft RangeError, a bound wearing an error's clothes. Every
+                               operand of the request stands except the object; the RECEIVER in particular does
+                               NOT change across a forward, which is the whole reason it is an operand. */
+                            gp_obj = pd->target;
+                            gp_recv = gp_recv_r;
+                            gp_no_throw = gp_nothrow_r;
+                            if (gp_trapst) { js_trapget_free(ctx, gp_trapst); gp_trapst = NULL; }
+                            goto do_getprop_tramp;
+                        }
                         if (JS_IsUndefined(method)) {
-                            gp_fwd = pd->target;                   /* no trap: forward, exactly once */
+                            gp_fwd = pd->target;                   /* no trap: forward to a non-proxy target */
                         } else {
                             /* ANY callable trap is invoked HERE, once. The bytecode test that used to sit in this
                                arm dropped a C, bound or proxied trap back to the generic path below, which
