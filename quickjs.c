@@ -19109,6 +19109,11 @@ typedef struct TrampFrame {
     JSFunctionBytecode *b;
     JSContext *ctx;
     JSValue *local_buf;
+    /* The SEQUENCE that requested this call, when one did. The generator create can keep it in cont_state, but
+       an ASYNC-GENERATOR create already stores its JSAsyncGeneratorData there — so the requester needs a field of
+       its own rather than a second meaning for that one. NULL = an ordinary call, whose result is pushed. */
+    void *seq_req;
+    uint8_t seq_req_kind;
     /* resume-the-caller record: */
     struct TrampFrame *up;           /* caller TrampFrame, or NULL if the caller is the C-stack base */
     JSStackFrame *caller_sf;
@@ -24341,6 +24346,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     call_argv = (JSValueConst *)&bl7[2];
                     tramp_first = -2;
                 }
+                if (tramp_body_entry(call_argv[-1]) == TBE_AGEN) {
+                    /* an ASYNC-GENERATOR function, the same story as the generator one below: it fell past the
+                       body dispatch and had its coroutine created by an ordinary call. */
+                    tramp_cont_state = cd_outer; tramp_cont_kind = cd_outer_kind;
+                    cd_outer = NULL; cd_outer_kind = CONT_NONE;
+                    call_cfirst = 0; call_cargc = 0;
+                    tramp_is_tail = 0;
+                    goto do_agen_create_tramp;
+                }
                 if (tramp_body_entry(call_argv[-1]) == TBE_GEN) {
                     tramp_gen_create_cont_it = cd_outer; tramp_gen_create_cont_kind = cd_outer_kind;
                     cd_outer = NULL; cd_outer_kind = CONT_NONE;
@@ -26964,7 +26978,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 atf2 = js_malloc_rt(rt, sizeof(TrampFrame));
                 if (unlikely(!atf2)) { js_async_generator_free(rt, s); JS_ThrowOutOfMemory(ctx); goto exception; }
                 atf2->async_promise = js_dup(afn);   /* held for js_create_from_ctor at initial_yield */
+                /* Ownership is read BEFORE the operands are released, because the release is what destroys the
+                   answer: a sequence's operands are an OWNED heap block, and `call_args_owned` is the only thing
+                   that says so. The two rules that follow from it are the generator create's, verbatim — the
+                   caller's sp must not be re-derived from a heap call_argv, and the DECLARED EMPTY SHAPE is
+                   resolved per call, so it is consumed here rather than left for this frame's next call. */
+                bool agowned = (call_args_owned != NULL);
+                call_cfirst = 0; call_cargc = -1;   /* read + reset, as TAKE_CALL_SHAPE does for every other call */
                 for (i = tramp_first; i < call_argc; i++) JS_FreeValue(ctx, call_argv[i]);
+                if (call_args_owned) { js_free(ctx, call_args_owned); call_args_owned = NULL; call_args_owned_n = 0; }
                 atf2->up = tf_top;
                 atf2->caller_sf = sf; atf2->caller_b = b; atf2->caller_ctx = ctx;
                 atf2->caller_local_buf = local_buf; atf2->caller_stack_buf = stack_buf;
@@ -26973,7 +26995,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 atf2->caller_var_refs = var_refs;
                 atf2->caller_argc = argc; atf2->caller_argv = argv;
                 atf2->caller_arg_allocated_size = arg_allocated_size;
-                atf2->caller_sp = call_argv + tramp_first;
+                atf2->seq_req = (tramp_cont_kind == CONT_STEP) ? tramp_cont_state : NULL;
+                atf2->seq_req_kind = atf2->seq_req ? CONT_STEP : CONT_NONE;
+                if (atf2->seq_req) { tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE; }
+                atf2->caller_sp = agowned ? sp : (call_argv + tramp_first);
                 atf2->call_first = -1; atf2->call_argc = 0; atf2->is_tail = tramp_is_tail;
                 atf2->async_data = NULL; atf2->gen_data = NULL; atf2->gen_magic = 0;
                 atf2->cont_state = s; atf2->cont_kind = CONT_AGEN_CREATE;
@@ -27005,6 +27030,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSAsyncGeneratorData *s = (JSAsyncGeneratorData *)atf2->cont_state;
                 JSValue afn = atf2->async_promise;
                 uint8_t aitail = atf2->is_tail;
+                void *aseq = atf2->seq_req; uint8_t aseq_kind = atf2->seq_req_kind;
                 JSValue obj;
                 sf->cur_pc = pc; sf->cur_sp = sp;   /* SUSPENDED_START */
                 obj = js_create_from_ctor(ctx, afn, JS_CLASS_ASYNC_GENERATOR);
@@ -27023,6 +27049,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (unlikely(JS_IsException(obj))) { js_async_generator_free(rt, s); goto exception; }
                 s->generator = JS_VALUE_GET_OBJ(obj);
                 JS_SetOpaqueInternal(obj, s);
+                if (aseq) {
+                    /* requested BY a sequence: the async generator IS that callback's result. */
+                    DCHECK(aseq_kind == CONT_STEP, "async-generator create requester: unknown machine kind");
+                    cont_st = aseq;
+                    ret_val = obj;
+                    goto do_step_step;
+                }
                 if (aitail) { ret_val = obj; goto do_return; }
                 *sp++ = obj;
                 BREAK;
