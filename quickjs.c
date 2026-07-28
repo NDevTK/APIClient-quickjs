@@ -1455,6 +1455,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_REGEXP_EXEC, STEPDEF_REGEXP_TEST,
     STEPDEF_ITER_TAKE, STEPDEF_ITER_DROP, STEPDEF_ITER_WRAP_RETURN,
     STEPDEF_ITER_CONCAT_NEXT, STEPDEF_ITER_CONCAT_RETURN, STEPDEF_ARRAY_ITER_NEXT,
+    STEPDEF_OWNKEYS_NAMES, STEPDEF_OWNKEYS_SYMBOLS, STEPDEF_REFLECT_OWNKEYS,
     /* one per error KIND: a step constructor's magic IS its definition id, so the kind cannot also ride there.
        The block is contiguous and indexed by JSErrorEnum, with JS_PLAIN_ERROR last. */
     STEPDEF_ERROR_CTOR_BASE,
@@ -19267,9 +19268,21 @@ typedef struct JSGetProp {
                          each did it from C. Only the CreateDataProperty shape is expressed: a data descriptor
                          with all three attributes true, which is what every one of those sites needs; a machine
                          wanting another shape has to say so rather than have this guess. */
+#define GP_OWNKEYS 5  /* step code 11. [[OwnPropertyKeys]] — on a Proxy the `ownKeys` trap, and 10.5.11's
+                         invariant runs on ITS result (no duplicates, strings/symbols only, every
+                         non-configurable target key present, and an exact match when the target is not
+                         extensible). Unlike the keyed operations it carries no atom: the whole key list is the
+                         answer, delivered as the ARRAY the spec's CreateArrayFromList would build. Every C caller
+                         of JS_GetOwnPropertyNamesInternal ran that trap through JS_CallFree, so an `ownKeys` with
+                         a loop in it had no flow base — Object.keys, for-in, spread, Object.assign,
+                         Object.freeze, JSON.stringify and Reflect.ownKeys all aborted at its back-edge. */
 #define GP_DELETE 3   /* step code 9. copyWithin removes the target index when the source one is absent, which is
                          the page's `deleteProperty` trap on a Proxy — the same shape as has/get/set, differing
                          only in the trap name, the invariant and the absent result. */
+
+/* 10.5.11 steps 8-22 applied to the trap's result, then CreateArrayFromList over the validated keys — the
+   answer GP_OWNKEYS delivers. CONSUMES prop_array. */
+static JSValue js_proxy_ownkeys_result(JSContext *ctx, JSValueConst proxy, JSValue prop_array);
 
 static void js_getprop_free(JSContext *ctx, JSGetProp *gp)
 {
@@ -23873,6 +23886,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         cont_st = dcs;
                         goto do_iter_close_deliver;
                     }
+                    if (dck == CONT_GETPROP) {
+                        /* a proxy trap with no bytecode body — a C one, a bound one, a proxied one, or a builtin
+                           that is itself a step machine. Its arguments are the continuation's own buffer, so the
+                           shape it declared is empty and the delivery is the same one a returned heap frame gets. */
+                        TAKE_CALL_SHAPE();
+                        cont_st = dcs;
+                        goto do_getprop_deliver;
+                    }
                     if (dck == CONT_FOROF_NEXT) {
                         JSValue *cargv;
                         int pop, first;
@@ -24042,6 +24063,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (sk0 == CONT_PROMISE_ALL) goto do_promise_all_deliver;
                         goto do_iter_close_deliver;
                     }
+                    if (sk0 == CONT_GETPROP) {
+                        /* the machine WAS a proxy trap and it threw: the request's teardown owns what happens
+                           next (a consumer still owes IfAbruptCloseIterator, an acquire delivers the throw as an
+                           acquisition failure), and it must not be walked as a step chain — gp is not one. */
+                        h->outer = NULL; h->outer_kind = CONT_NONE;
+                        tramp_step_state_free(ctx, stt, false);
+                        cont_st = souter0;
+                        goto do_getprop_abandon;
+                    }
                     tramp_step_chain_free(ctx, stt);   /* and the machines waiting on it */
                     goto exception;
                 }
@@ -24103,12 +24133,26 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             goto do_toprim_step;   /* the machine WAS a coercion method */
                         if (souter_kind == CONT_FROM_CTOR)
                             goto do_from_ctor_deliver;   /* the machine WAS a step constructor */
+                        if (souter_kind == CONT_GETPROP) {
+                            call_first_r = 0; call_pop = 0;   /* this arm already dropped them */
+                            goto do_getprop_deliver;          /* the machine WAS a proxy trap */
+                        }
                         DCHECK(souter_kind == CONT_STEP, "step outer continuation: unknown sequence kind");
                         goto do_step_step;
                     }
                     if (itail) { ret_val = r; goto do_return; }
                     *sp++ = r;
                     BREAK;
+                }
+                if (st == 11) {
+                    /* OWNKEYS: *out_cb is [obj] and there is no key at all — the whole list is the answer, so
+                       *out_argc is 0 rather than an atom. The one keyed-operation entry answers it because the
+                       shapes it has to tell apart are the same ones (an ordinary object, a trapless proxy, a
+                       C/bound trap, a bytecode trap) and the invariant rides the same continuation. */
+                    gp_outer = stt; gp_outer_kind = CONT_STEP;
+                    gp_obj = cb[0]; gp_atom = JS_ATOM_NULL;
+                    gp_op = GP_OWNKEYS; gp_val = JS_UNDEFINED;
+                    goto do_getprop_tramp;
                 }
                 if (st == 6 || st == 7 || st == 8 || st == 9 || st == 10) {
                     /* GETPROP (6) / HASPROPERTY (7) / SETPROP (8) / DELETE (9): *out_cb is [obj] — plus [value] for the write —
@@ -24596,17 +24640,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                                           gp_op == GP_HAS ? JS_ATOM_has :
                                                           gp_op == GP_SET ? JS_ATOM_set :
                                                           gp_op == GP_DELETE ? JS_ATOM_deleteProperty :
-                                                          gp_op == GP_DEFINE ? JS_ATOM_defineProperty : JS_ATOM_get);
+                                                          gp_op == GP_DEFINE ? JS_ATOM_defineProperty :
+                                                          gp_op == GP_OWNKEYS ? JS_ATOM_ownKeys : JS_ATOM_get);
                         if (!pd) goto getprop_throw;               /* revoked, or the handler's own get threw */
                         if (JS_IsUndefined(method)) {
                             gp_fwd = pd->target;                   /* no trap: forward, exactly once */
-                        } else if (!tramp_can_call(method)) {
-                            JS_FreeValue(ctx, method);             /* a C/bound trap with no body: the generic
-                                                                      path below invokes it */
-                            method = JS_UNDEFINED;
                         } else {
-                            keyval = JS_AtomToValue(ctx, gp_atom);
-                            if (JS_IsException(keyval)) { JS_FreeValue(ctx, method); goto getprop_throw; }
+                            /* ANY callable trap is invoked HERE, once. The bytecode test that used to sit in this
+                               arm dropped a C, bound or proxied trap back to the generic path below, which
+                               re-entered the proxy's own [[Get]]/[[Has]]/… and looked the handler up a SECOND
+                               time — an observable extra read — and, once a builtin could BE a step machine,
+                               drove one from C: `new Proxy(t, {ownKeys: Object.getOwnPropertyNames})` reached
+                               js_call_c_function's DFAIL. Which KIND of callee it is, is the convergence point's
+                               question, not this one's. */
+                            if (gp_op != GP_OWNKEYS) {   /* [[OwnPropertyKeys]] takes no key: the list IS the answer */
+                                keyval = JS_AtomToValue(ctx, gp_atom);
+                                if (JS_IsException(keyval)) { JS_FreeValue(ctx, method); goto getprop_throw; }
+                            }
                             tgt = js_dup(pd->target);
                             handler = js_dup(pd->handler);
                         }
@@ -24653,6 +24703,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                                             JS_PROP_C_W_E | JS_PROP_THROW) < 0))
                             goto getprop_throw;
                         ret_val = JS_UNDEFINED;
+                    } else if (gp_op == GP_OWNKEYS) {
+                        /* [[OwnPropertyKeys]] with nothing user-written in it: an ordinary object (a slot walk),
+                           a trapless proxy (which forwards, and JS_GetOwnPropertyNamesInternal spells that
+                           forward itself), or a C/bound trap with no body to suspend. The result is the ARRAY the
+                           spec's CreateArrayFromList builds, which is what every consumer of this request wants. */
+                        JSPropertyEnum *ktab = NULL; uint32_t klen = 0, ki;
+                        if (unlikely(JS_GetOwnPropertyNamesInternal(ctx, &ktab, &klen, JS_VALUE_GET_OBJ(gp_obj),
+                                                                    JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK)))
+                            goto getprop_throw;
+                        ret_val = JS_NewArray(ctx);
+                        for (ki = 0; ki < klen && !JS_IsException(ret_val); ki++) {
+                            JSValue kv = JS_AtomToValue(ctx, ktab[ki].atom);
+                            if (JS_IsException(kv) || JS_CreateDataPropertyUint32(ctx, ret_val, ki, kv, 0) < 0) {
+                                if (!JS_IsException(kv)) JS_FreeValue(ctx, JS_UNDEFINED);
+                                JS_FreeValue(ctx, ret_val); ret_val = JS_EXCEPTION;
+                            }
+                        }
+                        js_free_prop_enum(ctx, ktab, klen);
+                        if (unlikely(JS_IsException(ret_val))) goto getprop_throw;
                     } else if (fwd) {
                         ret_val = JS_GetPropertyInternal(ctx, gp_fwd, gp_atom, gp_obj, false);
                         if (unlikely(JS_IsException(ret_val))) goto getprop_throw;
@@ -24690,7 +24759,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto getprop_throw;
                 }
                 gp->target = tgt;
-                gp->value = (gp_op == GP_SET) ? js_dup(gp_val) : JS_UNDEFINED;
+                /* GP_OWNKEYS's invariant is stated over the PROXY, not just its target: 10.5.11 re-reads
+                   [[IsRevoked]] between the trap and the check, so the check needs the proxy object. The `value`
+                   slot is the write's operand and is otherwise unused, so it carries it. */
+                gp->value = (gp_op == GP_SET) ? js_dup(gp_val)
+                          : (gp_op == GP_OWNKEYS) ? js_dup(gp_obj) : JS_UNDEFINED;
                 gp->atom = JS_DupAtom(ctx, gp_atom);
                 gp->outer = gp_outer; gp->outer_kind = gp_outer_kind;
                 gp->op = gp_op;
@@ -24710,7 +24783,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     gp->cb[3] = keyval;
                     /* has(target, key) takes two; get(target, key, receiver) three; set(target, key, value,
                        receiver) four. */
-                    if (gp_op == GP_HAS || gp_op == GP_DELETE) {
+                    if (gp_op == GP_OWNKEYS) {
+                        gp->nargs = 1;   /* ownKeys(target) — no key at all */
+                    } else if (gp_op == GP_HAS || gp_op == GP_DELETE) {
                         gp->nargs = 2;   /* has(target, key) / deleteProperty(target, key) */
                     } else if (gp_op == GP_DEFINE) {
                         /* defineProperty(target, key, descriptor). FromPropertyDescriptor builds the descriptor
@@ -24736,7 +24811,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 call_argv = (JSValueConst *)&gp->cb[2];
                 call_argc = gp->nargs; tramp_first = -2; tramp_is_tail = 0;
                 tramp_cont_state = gp; tramp_cont_kind = CONT_GETPROP;
-                goto do_tramp_call;
+                /* the arguments are the continuation's OWN buffer, never the caller's stack, so the shape both
+                   dispatches record is EMPTY — and it has to be stated, because the frame otherwise records
+                   [-2, nargs] and the delivery would drop that many of the CALLER's operands. */
+                call_cfirst = 0; call_cargc = 0;
+                if (tramp_can_call(gp->cb[1])) goto do_tramp_call;
+                /* a step machine, a bound function, a proxied trap, a plain C one: the convergence point answers
+                   all of them, and the request buffer is the continuation's OWN — which is what the empty shape
+                   states, and what lets its arms rewrite the callee in place without touching the caller. */
+                goto do_generic_callee;
             }
 
             getprop_throw:
@@ -27033,11 +27116,27 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto do_helper_deliver;
                 }
                 if (rck == CONT_GETPROP) {
-                    /* the accessor or the proxy trap returned. Its operands live in the continuation's own buffer
-                       (do_tramp_call dup'd them into the callee frame), so nothing on the caller's stack moves;
-                       enforce the target's [[Get]] invariant when it WAS a trap, then hand the value to the
-                       machine that asked. */
-                    JSGetProp *gp = rcs;
+                    call_first_r = cfirst; call_pop = cargc;
+                    cont_st = rcs;
+                    goto do_getprop_deliver;
+                }
+                if (0) {
+                do_getprop_deliver:
+                    /* THE ONE completion of a keyed property OPERATION — reached from every frame kind the trap or
+                       accessor can have: a returned heap frame, and a callee with no frame at all (a C, bound,
+                       proxied or step-machine trap, all of which the convergence point runs). Its operands live in
+                       the continuation's own buffer, so nothing on the caller's stack moves; enforce the target's
+                       invariant when it WAS a trap, then hand the value to the machine that asked.
+                       The operand shape is whatever the frame RECORDED, which is not always the empty one the
+                       request declared: do_generic_callee's proxy arm replaces the operands with the trap's five,
+                       on the caller's stack. Assuming empty leaked all five and left sp above the caller's next
+                       operand, which then read a garbage callee. */
+                    JSGetProp *gp = cont_st;
+                    JSValue *gcargv = sp - call_pop;
+                    DCHECK(call_pop >= call_first_r, "a property-operation request records operands ending below where they start");
+                    for (i = call_first_r; i < call_pop; i++) JS_FreeValue(ctx, gcargv[i]);
+                    sp += call_first_r - call_pop;
+                    call_first_r = 0; call_pop = 0;
                     void *gouter = gp->outer;
                     uint8_t gouter_kind = gp->outer_kind;
                     DCHECK(gouter_kind == CONT_STEP || gouter_kind == CONT_ITER_CONSUME
@@ -27078,7 +27177,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         tramp_iter_getiter = ret_val;
                         goto do_consume_acquire_have_method;
                     }
-                    if (gp->op == GP_HAS) {
+                    if (gp->op == GP_OWNKEYS) {
+                        /* the `ownKeys` trap returned its List. 10.5.11 steps 8-22 run on it — the same check the
+                           C hook performs, shared so the two cannot drift — and what the machine is handed is the
+                           ARRAY CreateArrayFromList builds from the validated keys. */
+                        ret_val = js_proxy_ownkeys_result(ctx, gp->value, ret_val);
+                    } else if (gp->op == GP_HAS) {
                         /* the `has` trap's boolean, then the target's [[HasProperty]] invariant on it */
                         int hres = js_proxy_has_invariant(ctx, gp->target, gp->atom, JS_ToBoolFree(ctx, ret_val));
                         ret_val = (hres < 0) ? JS_EXCEPTION : js_bool(hres);
@@ -30944,9 +31048,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JS_FreeValue(ctx, ps->target); JS_FreeValue(ctx, ps->value);
             JS_FreeAtom(ctx, ps->atom); js_free_rt(rt, ps);
         } else if (xck == CONT_GETPROP) {
-            /* the accessor / trap THREW: the machine waiting on the value can never be reached again, so it and
-               the machines waiting on it go too. */
-            JSGetProp *gp = xcs;
+            cont_st = xcs;
+            goto do_getprop_abandon;
+        } else if (0) {
+        do_getprop_abandon:
+            /* THE ONE teardown of a keyed property OPERATION that THREW, reached from every frame kind the trap or
+               accessor can have. The machine waiting on the value can never be reached again, so it and the
+               machines waiting on it go too — but by ITS OWN rule: a consumer still owes IfAbruptCloseIterator and
+               an acquire turns the throw into an acquisition failure, and neither is a step chain to walk. */
+            JSGetProp *gp = cont_st;
             void *gouter = gp->outer;
             uint8_t gk2 = gp->outer_kind;
             DCHECK(!gouter || gk2 == CONT_STEP || gk2 == CONT_ITER_CONSUME || gk2 == CONT_ACQUIRE_GET
@@ -52871,16 +52981,78 @@ static JSValue js_prop_walk_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
-static JSValue js_object_getOwnPropertyNames(JSContext *ctx, JSValueConst this_val,
-                                             int argc, JSValueConst *argv)
+/* Object.getOwnPropertyNames / getOwnPropertySymbols and Reflect.ownKeys are one operation with a filter:
+   ToObject (or Reflect's flat Object requirement), then [[OwnPropertyKeys]], then keep the keys of the requested
+   kind. Only the middle step can run the page's code — the `ownKeys` trap — and JS_GetOwnPropertyNames2 reached
+   it through JS_GetOwnPropertyNamesInternal, i.e. JS_CallFree from C with no flow base, so a trap containing a
+   loop aborted at its back-edge. The request is GP_OWNKEYS, answered by the one keyed-operation entry that
+   already answers get/has/set/delete/define, and the 10.5.11 invariant rides its continuation.
+   def->arg: the JS_GPN_* mask to keep, or 0 for Reflect.ownKeys, whose receiver rule differs (a primitive is a
+   TypeError, not a wrapper) and which keeps everything. */
+#define OWNKEYS_REFLECT 0
+typedef struct JSOwnKeys {
+    JSStepHdr hdr;
+    JSValue obj;      /* ToObject(argv[0]) — held across the trap (owned) */
+    JSValue keys;     /* the validated key ARRAY the request delivers (owned) */
+} JSOwnKeys;
+
+static int js_ownkeys_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    return JS_GetOwnPropertyNames2(ctx, argv[0], JS_GPN_STRING_MASK);
+    JSOwnKeys *s = st;
+    JSValueConst arg0 = step_arg(&s->hdr, 0);
+
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
+        s->obj = JS_UNDEFINED; s->keys = JS_UNDEFINED;
+        if (s->hdr.arg == OWNKEYS_REFLECT) {
+            /* 28.1.11 step 1: Reflect.ownKeys takes an Object, it does not coerce one. */
+            if (JS_VALUE_GET_TAG(arg0) != JS_TAG_OBJECT) { JS_ThrowTypeErrorNotAnObject(ctx); return -1; }
+            s->obj = js_dup(arg0);
+        } else {
+            s->obj = JS_ToObject(ctx, arg0);   /* a primitive wrapper; runs no user code */
+            if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
+        }
+        s->hdr.stage = 1;
+        s->hdr.cb_coerce[0] = s->obj;   /* borrowed: the machine holds it across the request */
+        *out_cb = s->hdr.cb_coerce; *out_argc = 0;
+        return 11;
+    }
+    DCHECK(s->hdr.stage == 1, "Object.getOwnPropertyNames: unknown stage");
+    s->keys = cb_result;
+    if (JS_IsException(s->keys)) { s->keys = JS_UNDEFINED; return -1; }
+    if (s->hdr.arg == OWNKEYS_REFLECT)
+        return 0;   /* CreateArrayFromList over every key, which is what the request already delivered */
+    {
+        /* the same filter JS_GetOwnPropertyNames2 applies, over the delivered array. Reading it invokes nothing:
+           it is a fresh dense array this engine built. */
+        JSValue r = JS_NewArray(ctx);
+        uint32_t len = 0, i, j = 0;
+        if (JS_IsException(r)) return -1;
+        if (js_get_length32(ctx, &len, s->keys)) { JS_FreeValue(ctx, r); return -1; }
+        for (i = 0; i < len; i++) {
+            JSValue kv = JS_GetPropertyUint32(ctx, s->keys, i);
+            bool keep;
+            if (JS_IsException(kv)) { JS_FreeValue(ctx, r); return -1; }
+            keep = JS_IsSymbol(kv) ? ((s->hdr.arg & JS_GPN_SYMBOL_MASK) != 0)
+                                   : ((s->hdr.arg & JS_GPN_STRING_MASK) != 0);
+            if (!keep) { JS_FreeValue(ctx, kv); continue; }
+            if (JS_CreateDataPropertyUint32(ctx, r, j++, kv, 0) < 0) { JS_FreeValue(ctx, r); return -1; }
+        }
+        JS_FreeValue(ctx, s->keys);
+        s->keys = r;
+    }
+    return 0;
 }
 
-static JSValue js_object_getOwnPropertySymbols(JSContext *ctx, JSValueConst this_val,
-                                             int argc, JSValueConst *argv)
+static JSValue js_ownkeys_fini(JSContext *ctx, void *st, bool take_result)
 {
-    return JS_GetOwnPropertyNames2(ctx, argv[0], JS_GPN_SYMBOL_MASK);
+    JSOwnKeys *s = st;
+    JSValue r = take_result ? s->keys : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->keys);
+    JS_FreeValue(ctx, s->obj);
+    js_free(ctx, s);
+    return r;
 }
 
 
@@ -53370,8 +53542,8 @@ static const JSCFunctionListEntry js_object_funcs[] = {
     JS_CFUNC_DEF("setPrototypeOf", 2, js_object_setPrototypeOf ),
     JS_CFUNC_STEP_DEF("defineProperty", 3, STEPDEF_OBJ_DEFINEPROPERTY ),
     JS_CFUNC_DEF("defineProperties", 2, js_object_defineProperties ),
-    JS_CFUNC_DEF("getOwnPropertyNames", 1, js_object_getOwnPropertyNames ),
-    JS_CFUNC_DEF("getOwnPropertySymbols", 1, js_object_getOwnPropertySymbols ),
+    JS_CFUNC_STEP_DEF("getOwnPropertyNames", 1, STEPDEF_OWNKEYS_NAMES ),
+    JS_CFUNC_STEP_DEF("getOwnPropertySymbols", 1, STEPDEF_OWNKEYS_SYMBOLS ),
     JS_CFUNC_CONSUME_DEF("groupBy", 2, ITERCONS_GROUPBY_BASE + GROUPBY_PROPERTY ),
     JS_CFUNC_DEF("keys", 1, js_object_keys ),
     JS_CFUNC_STEP_DEF("values", 1, STEPDEF_OBJ_VALUES ),
@@ -57520,6 +57692,11 @@ static const JSTrampStepDef js_ta_set_def         = { sizeof(JSTAIdx), js_ta_idx
 static const JSTrampStepDef js_json_raw_def       = { sizeof(JSJsonRaw), js_json_raw_step, js_json_raw_fini, 0 };
 static const JSTrampStepDef js_obj_defprop_def    = { sizeof(JSObjDefProp), js_obj_defprop_step, js_obj_defprop_fini, 0 };
 static const JSTrampStepDef js_refl_defprop_def   = { sizeof(JSObjDefProp), js_obj_defprop_step, js_obj_defprop_fini, 1 };
+static int js_ownkeys_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_ownkeys_fini(JSContext *ctx, void *st, bool take_result);
+static const JSTrampStepDef js_ownkeys_names_def  = { sizeof(JSOwnKeys), js_ownkeys_step, js_ownkeys_fini, JS_GPN_STRING_MASK };
+static const JSTrampStepDef js_ownkeys_syms_def   = { sizeof(JSOwnKeys), js_ownkeys_step, js_ownkeys_fini, JS_GPN_SYMBOL_MASK };
+static const JSTrampStepDef js_reflect_ownkeys_def = { sizeof(JSOwnKeys), js_ownkeys_step, js_ownkeys_fini, OWNKEYS_REFLECT };
 static const JSTrampStepDef js_parseInt_def       = { sizeof(JSParseNum), js_parse_num_step, js_parse_num_fini, 1 };
 static const JSTrampStepDef js_parseFloat_def     = { sizeof(JSParseNum), js_parse_num_step, js_parse_num_fini, 0 };
 static const JSTrampStepDef js_str_split_def      = { sizeof(JSStrSplit), js_str_split_step, js_str_split_fini, 0 };
@@ -57723,6 +57900,9 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_JSON_RAWJSON]    = &js_json_raw_def,
     [STEPDEF_OBJ_DEFINEPROPERTY]     = &js_obj_defprop_def,
     [STEPDEF_REFLECT_DEFINEPROPERTY] = &js_refl_defprop_def,
+    [STEPDEF_OWNKEYS_NAMES] = &js_ownkeys_names_def,
+    [STEPDEF_OWNKEYS_SYMBOLS] = &js_ownkeys_syms_def,
+    [STEPDEF_REFLECT_OWNKEYS] = &js_reflect_ownkeys_def,
     [STEPDEF_PARSEINT]        = &js_parseInt_def,
     [STEPDEF_PARSEFLOAT]      = &js_parseFloat_def,
     [STEPDEF_STR_SPLIT]       = &js_str_split_def,
@@ -67156,14 +67336,6 @@ static JSValue js_reflect_setPrototypeOf(JSContext *ctx, JSValueConst this_val,
         return js_bool(ret);
 }
 
-static JSValue js_reflect_ownKeys(JSContext *ctx, JSValueConst this_val,
-                                  int argc, JSValueConst *argv)
-{
-    if (JS_VALUE_GET_TAG(argv[0]) != JS_TAG_OBJECT)
-        return JS_ThrowTypeErrorNotAnObject(ctx);
-    return JS_GetOwnPropertyNames2(ctx, argv[0],
-                                   JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK);
-}
 
 static const JSCFunctionListEntry js_reflect_funcs[] = {
     JS_CFUNC_DEF("apply", 3, js_reflect_apply ),
@@ -67175,7 +67347,7 @@ static const JSCFunctionListEntry js_reflect_funcs[] = {
     JS_CFUNC_MAGIC_DEF("getPrototypeOf", 1, js_object_getPrototypeOf, 1 ),
     JS_CFUNC_DEF("has", 2, js_reflect_has ),
     JS_CFUNC_MAGIC_DEF("isExtensible", 1, js_object_isExtensible, 1 ),
-    JS_CFUNC_DEF("ownKeys", 1, js_reflect_ownKeys ),
+    JS_CFUNC_STEP_DEF("ownKeys", 1, STEPDEF_REFLECT_OWNKEYS ),
     JS_CFUNC_MAGIC_DEF("preventExtensions", 1, js_object_preventExtensions, 1 ),
     JS_CFUNC_DEF("set", 3, js_reflect_set ),
     JS_CFUNC_DEF("setPrototypeOf", 2, js_reflect_setPrototypeOf ),
@@ -67879,29 +68051,22 @@ static int find_prop_key(const JSPropertyEnum *tab, int n, JSAtom atom)
     return -1;
 }
 
-static int js_proxy_get_own_property_names(JSContext *ctx,
-                                           JSPropertyEnum **ptab,
-                                           uint32_t *plen,
-                                           JSValueConst obj)
+/* 10.5.11 steps 8-22, the half of [[OwnPropertyKeys]] that runs on the trap's RESULT: it must be a List of
+   Strings and Symbols with no duplicates, it must contain every non-configurable key the target has, and when the
+   target is not extensible it must match the target's keys exactly. The trap CALL is the page's code and the
+   check is not, which is exactly the split every proxy operation makes — so the check lives here, called both by
+   the C hook below (whose trap call is still a JS_CallFree) and by the tramp continuation, which has already run
+   the trap on the interpreter's chain. CONSUMES prop_array either way. */
+static int js_proxy_ownkeys_check(JSContext *ctx, JSValueConst obj, JSValue prop_array,
+                                  JSPropertyEnum **ptab, uint32_t *plen)
 {
-    JSProxyData *s;
-    JSValue method, prop_array, val;
+    JSProxyData *s = JS_VALUE_GET_OBJ(obj)->u.opaque;
+    JSValue val;
     uint32_t len, i, len2;
     JSPropertyEnum *tab, *tab2;
     JSAtom atom;
     int res, is_extensible, idx;
 
-    s = get_proxy_method(ctx, &method, obj, JS_ATOM_ownKeys);
-    if (!s)
-        return -1;
-    if (JS_IsUndefined(method)) {
-        return JS_GetOwnPropertyNamesInternal(ctx, ptab, plen,
-                                      JS_VALUE_GET_OBJ(s->target),
-                                      JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK);
-    }
-    prop_array = JS_CallFree(ctx, method, s->handler, 1, vc(&s->target));
-    if (JS_IsException(prop_array))
-        return -1;
     tab = NULL;
     len = 0;
     tab2 = NULL;
@@ -67995,7 +68160,53 @@ static int js_proxy_get_own_property_names(JSContext *ctx,
     js_free_prop_enum(ctx, tab2, len2);
     js_free_prop_enum(ctx, tab, len);
     JS_FreeValue(ctx, prop_array);
+    *ptab = NULL;
+    *plen = 0;
     return -1;
+}
+
+static JSValue js_proxy_ownkeys_result(JSContext *ctx, JSValueConst proxy, JSValue prop_array)
+{
+    JSPropertyEnum *tab = NULL;
+    uint32_t len = 0, i;
+    JSValue r;
+    if (JS_IsException(prop_array)) return prop_array;   /* the trap threw: nothing to check */
+    if (js_proxy_ownkeys_check(ctx, proxy, prop_array, &tab, &len) < 0)
+        return JS_EXCEPTION;
+    r = JS_NewArray(ctx);
+    for (i = 0; i < len && !JS_IsException(r); i++) {
+        JSValue kv = JS_AtomToValue(ctx, tab[i].atom);
+        if (JS_IsException(kv) || JS_CreateDataPropertyUint32(ctx, r, i, kv, 0) < 0) {
+            JS_FreeValue(ctx, r); r = JS_EXCEPTION;
+        }
+    }
+    js_free_prop_enum(ctx, tab, len);
+    return r;
+}
+
+static int js_proxy_get_own_property_names(JSContext *ctx,
+                                           JSPropertyEnum **ptab,
+                                           uint32_t *plen,
+                                           JSValueConst obj)
+{
+    JSProxyData *s;
+    JSValue method, prop_array;
+
+    s = get_proxy_method(ctx, &method, obj, JS_ATOM_ownKeys);
+    if (!s)
+        return -1;
+    if (JS_IsUndefined(method)) {
+        return JS_GetOwnPropertyNamesInternal(ctx, ptab, plen,
+                                      JS_VALUE_GET_OBJ(s->target),
+                                      JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK);
+    }
+    /* THE LAST C-driven `ownKeys` trap. Every consumer routed onto GP_OWNKEYS runs it on the interpreter's chain
+       instead; the ones still calling JS_GetOwnPropertyNamesInternal from C reach it here, and a trap with a loop
+       in it aborts at its back-edge by name. Converting a consumer is what removes one more of those. */
+    prop_array = JS_CallFree(ctx, method, s->handler, 1, vc(&s->target));
+    if (JS_IsException(prop_array))
+        return -1;
+    return js_proxy_ownkeys_check(ctx, obj, prop_array, ptab, plen);
 }
 
 static JSValue js_proxy_call_constructor(JSContext *ctx, JSValueConst func_obj,
