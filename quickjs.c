@@ -19234,6 +19234,13 @@ static int js_proxy_has_invariant(JSContext *ctx, JSValueConst target, JSAtom at
 static int js_proxy_delete_invariant(JSContext *ctx, JSValueConst target, JSAtom atom, int ret);
 static int js_proxy_define_invariant(JSContext *ctx, JSValueConst target, JSAtom prop, JSValueConst val,
                                      JSValueConst getter, JSValueConst setter, int flags, bool ret);
+/* 6.2.6.4 FromPropertyDescriptor over a filled JSPropertyDescriptor. CONSUMES the descriptor. It builds no
+   accessors and reads nothing of the page's, so it is the same operation wherever [[GetOwnProperty]] was
+   performed — the C path, the in-place request, and the trap's continuation all end here. */
+static JSValue js_desc_to_object(JSContext *ctx, JSPropertyDescriptor *desc);
+static int js_proxy_gopd_check(JSContext *ctx, JSValueConst obj, JSAtom prop,
+                               JSValue trap_result_obj, JSPropertyDescriptor *pdesc);
+
 static JSValue js_create_desc(JSContext *ctx, JSValueConst val, JSValueConst getter, JSValueConst setter,
                               int flags);
 #define CONT_GETPROP       22  /* cont_state = JSGetProp: a keyed property OPERATION requested by a STEP MACHINE —
@@ -19268,6 +19275,12 @@ typedef struct JSGetProp {
                          each did it from C. Only the CreateDataProperty shape is expressed: a data descriptor
                          with all three attributes true, which is what every one of those sites needs; a machine
                          wanting another shape has to say so rather than have this guess. */
+#define GP_GETOWNPROP 6 /* step code 12. [[GetOwnProperty]] — on a Proxy the `getOwnPropertyDescriptor` trap, and
+                         10.5.5's invariant runs on ITS result. What the machine is handed is the descriptor
+                         OBJECT FromPropertyDescriptor builds, or undefined when the property is absent, which is
+                         exactly what Object/Reflect.getOwnPropertyDescriptor return and what an enumerability
+                         test reads. Every C caller of JS_GetOwnPropertyInternal ran that trap through
+                         JS_CallFree. */
 #define GP_OWNKEYS 5  /* step code 11. [[OwnPropertyKeys]] — on a Proxy the `ownKeys` trap, and 10.5.11's
                          invariant runs on ITS result (no duplicates, strings/symbols only, every
                          non-configurable target key present, and an exact match when the target is not
@@ -24144,6 +24157,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     *sp++ = r;
                     BREAK;
                 }
+                if (st == 12) {
+                    /* GETOWNPROP: *out_cb is [obj] and *out_argc is the ATOM, like the keyed reads. */
+                    gp_outer = stt; gp_outer_kind = CONT_STEP;
+                    gp_obj = cb[0]; gp_atom = (JSAtom)cbn;
+                    gp_op = GP_GETOWNPROP; gp_val = JS_UNDEFINED;
+                    goto do_getprop_tramp;
+                }
                 if (st == 11) {
                     /* OWNKEYS: *out_cb is [obj] and there is no key at all — the whole list is the answer, so
                        *out_argc is 0 rather than an atom. The one keyed-operation entry answers it because the
@@ -24641,7 +24661,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                                           gp_op == GP_SET ? JS_ATOM_set :
                                                           gp_op == GP_DELETE ? JS_ATOM_deleteProperty :
                                                           gp_op == GP_DEFINE ? JS_ATOM_defineProperty :
-                                                          gp_op == GP_OWNKEYS ? JS_ATOM_ownKeys : JS_ATOM_get);
+                                                          gp_op == GP_OWNKEYS ? JS_ATOM_ownKeys :
+                                                          gp_op == GP_GETOWNPROP ? JS_ATOM_getOwnPropertyDescriptor
+                                                                                 : JS_ATOM_get);
                         if (!pd) goto getprop_throw;               /* revoked, or the handler's own get threw */
                         if (JS_IsUndefined(method)) {
                             gp_fwd = pd->target;                   /* no trap: forward, exactly once */
@@ -24703,6 +24725,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                                             JS_PROP_C_W_E | JS_PROP_THROW) < 0))
                             goto getprop_throw;
                         ret_val = JS_UNDEFINED;
+                    } else if (gp_op == GP_GETOWNPROP) {
+                        /* [[GetOwnProperty]] with nothing user-written in it: an ordinary object, a trapless
+                           proxy (JS_GetOwnPropertyInternal spells that forward itself), or a C/bound trap. */
+                        JSPropertyDescriptor gd;
+                        int gres = JS_GetOwnPropertyInternal(ctx, &gd, JS_VALUE_GET_OBJ(gp_obj), gp_atom);
+                        if (unlikely(gres < 0)) goto getprop_throw;
+                        ret_val = gres ? js_desc_to_object(ctx, &gd) : JS_UNDEFINED;
+                        if (unlikely(JS_IsException(ret_val))) goto getprop_throw;
                     } else if (gp_op == GP_OWNKEYS) {
                         /* [[OwnPropertyKeys]] with nothing user-written in it: an ordinary object (a slot walk),
                            a trapless proxy (which forwards, and JS_GetOwnPropertyNamesInternal spells that
@@ -24763,7 +24793,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    [[IsRevoked]] between the trap and the check, so the check needs the proxy object. The `value`
                    slot is the write's operand and is otherwise unused, so it carries it. */
                 gp->value = (gp_op == GP_SET) ? js_dup(gp_val)
-                          : (gp_op == GP_OWNKEYS) ? js_dup(gp_obj) : JS_UNDEFINED;
+                          : (gp_op == GP_OWNKEYS || gp_op == GP_GETOWNPROP) ? js_dup(gp_obj) : JS_UNDEFINED;
                 gp->atom = JS_DupAtom(ctx, gp_atom);
                 gp->outer = gp_outer; gp->outer_kind = gp_outer_kind;
                 gp->op = gp_op;
@@ -24785,8 +24815,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        receiver) four. */
                     if (gp_op == GP_OWNKEYS) {
                         gp->nargs = 1;   /* ownKeys(target) — no key at all */
-                    } else if (gp_op == GP_HAS || gp_op == GP_DELETE) {
-                        gp->nargs = 2;   /* has(target, key) / deleteProperty(target, key) */
+                    } else if (gp_op == GP_HAS || gp_op == GP_DELETE || gp_op == GP_GETOWNPROP) {
+                        gp->nargs = 2;   /* has / deleteProperty / getOwnPropertyDescriptor (target, key) */
                     } else if (gp_op == GP_DEFINE) {
                         /* defineProperty(target, key, descriptor). FromPropertyDescriptor builds the descriptor
                            OBJECT the trap sees, and this request only ever expresses CreateDataProperty's shape. */
@@ -27177,7 +27207,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         tramp_iter_getiter = ret_val;
                         goto do_consume_acquire_have_method;
                     }
-                    if (gp->op == GP_OWNKEYS) {
+                    if (gp->op == GP_GETOWNPROP) {
+                        /* the `getOwnPropertyDescriptor` trap returned. 10.5.5 steps 9-17 run on it — the same
+                           check the C hook performs — and the machine is handed the descriptor OBJECT, or
+                           undefined when the property is absent. */
+                        JSPropertyDescriptor gd;
+                        int gres = JS_IsException(ret_val) ? -1
+                                 : js_proxy_gopd_check(ctx, gp->value, gp->atom, ret_val, &gd);
+                        ret_val = (gres < 0) ? JS_EXCEPTION : gres ? js_desc_to_object(ctx, &gd) : JS_UNDEFINED;
+                    } else if (gp->op == GP_OWNKEYS) {
                         /* the `ownKeys` trap returned its List. 10.5.11 steps 8-22 run on it — the same check the
                            C hook performs, shared so the two cannot drift — and what the machine is handed is the
                            ARRAY CreateArrayFromList builds from the validated keys. */
@@ -52653,71 +52691,61 @@ static JSValue js_object___defineGetter__(JSContext *ctx, JSValueConst this_val,
     }
 }
 
-static JSValue js_object_getOwnPropertyDescriptor(JSContext *ctx, JSValueConst this_val,
-                                                  int argc, JSValueConst *argv, int magic)
+/* Object.getOwnPropertyDescriptor and Reflect.getOwnPropertyDescriptor are one operation with one difference:
+   Reflect requires an Object where Object coerces one. Both of their user-code steps are requests — ToPropertyKey
+   on the key, then [[GetOwnProperty]], which on a Proxy is the `getOwnPropertyDescriptor` trap — and the body
+   that used to sit here performed the second with JS_GetOwnPropertyInternal from C, so a trap containing a loop
+   had no flow base. def->arg: 1 = Reflect's receiver rule. */
+typedef struct JSGopd {
+    JSStepHdr hdr;
+    JSValue obj;      /* the receiver, held across both requests (owned) */
+    JSValue result;   /* the descriptor object, or undefined when absent (owned) */
+    JSAtom atom;      /* the coerced key (owned) */
+} JSGopd;
+
+static int js_gopd_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    JSValueConst prop;
-    JSAtom atom;
-    JSValue ret, obj;
-    JSPropertyDescriptor desc;
-    int res, flags;
+    JSGopd *s = st;
+    int r;
 
-    if (magic) {
-        /* Reflect.getOwnPropertyDescriptor case */
-        if (JS_VALUE_GET_TAG(argv[0]) != JS_TAG_OBJECT)
-            return JS_ThrowTypeErrorNotAnObject(ctx);
-        obj = js_dup(argv[0]);
-    } else {
-        obj = JS_ToObject(ctx, argv[0]);
-        if (JS_IsException(obj))
-            return obj;
-    }
-    prop = argv[1];
-    atom = JS_ValueToAtom(ctx, prop);
-    if (unlikely(atom == JS_ATOM_NULL))
-        goto exception;
-    ret = JS_UNDEFINED;
-    if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
-        res = JS_GetOwnPropertyInternal(ctx, &desc, JS_VALUE_GET_OBJ(obj), atom);
-        if (res < 0)
-            goto exception;
-        if (res) {
-            ret = JS_NewObject(ctx);
-            if (JS_IsException(ret))
-                goto exception1;
-            flags = JS_PROP_C_W_E | JS_PROP_THROW;
-            if (desc.flags & JS_PROP_GETSET) {
-                if (JS_DefinePropertyValueConst(ctx, ret, JS_ATOM_get, desc.getter, flags) < 0
-                ||  JS_DefinePropertyValueConst(ctx, ret, JS_ATOM_set, desc.setter, flags) < 0)
-                    goto exception1;
-            } else {
-                if (JS_DefinePropertyValueConst(ctx, ret, JS_ATOM_value, desc.value, flags) < 0
-                ||  JS_DefinePropertyValue(ctx, ret, JS_ATOM_writable,
-                                           js_bool(desc.flags & JS_PROP_WRITABLE),
-                                           flags) < 0)
-                    goto exception1;
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
+        s->obj = JS_UNDEFINED; s->result = JS_UNDEFINED; s->atom = JS_ATOM_NULL;
+        if (s->hdr.arg) {
+            if (JS_VALUE_GET_TAG(step_arg(&s->hdr, 0)) != JS_TAG_OBJECT) {
+                JS_ThrowTypeErrorNotAnObject(ctx); return -1;
             }
-            if (JS_DefinePropertyValue(ctx, ret, JS_ATOM_enumerable,
-                                       js_bool(desc.flags & JS_PROP_ENUMERABLE),
-                                       flags) < 0
-            ||  JS_DefinePropertyValue(ctx, ret, JS_ATOM_configurable,
-                                       js_bool(desc.flags & JS_PROP_CONFIGURABLE),
-                                       flags) < 0)
-                goto exception1;
-            js_free_desc(ctx, &desc);
+            s->obj = js_dup(step_arg(&s->hdr, 0));
+        } else {
+            s->obj = JS_ToObject(ctx, step_arg(&s->hdr, 0));   /* a primitive wrapper; runs no user code */
+            if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
         }
+        s->hdr.stage = 1;
     }
-    JS_FreeAtom(ctx, atom);
-    JS_FreeValue(ctx, obj);
-    return ret;
+    if (s->hdr.stage == 1) {
+        r = step_topropkey_run(ctx, &s->hdr, step_arg(&s->hdr, 1), cb_result, &s->atom, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 2;
+        s->hdr.cb_coerce[0] = s->obj;   /* borrowed: the machine holds it across the request */
+        *out_cb = s->hdr.cb_coerce; *out_argc = (int)s->atom;
+        return 12;
+    }
+    DCHECK(s->hdr.stage == 2, "getOwnPropertyDescriptor: unknown stage");
+    s->result = cb_result;
+    return JS_IsException(s->result) ? -1 : 0;
+}
 
-exception1:
-    js_free_desc(ctx, &desc);
-    JS_FreeValue(ctx, ret);
-exception:
-    JS_FreeAtom(ctx, atom);
-    JS_FreeValue(ctx, obj);
-    return JS_EXCEPTION;
+static JSValue js_gopd_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSGopd *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    JS_FreeValue(ctx, s->obj);
+    JS_FreeAtom(ctx, s->atom);
+    js_free(ctx, s);
+    return r;
 }
 
 static JSValue js_object_getOwnPropertyDescriptors(JSContext *ctx, JSValueConst this_val,
@@ -52748,9 +52776,14 @@ static JSValue js_object_getOwnPropertyDescriptors(JSContext *ctx, JSValueConst 
         atomValue = JS_AtomToValue(ctx, props[i].atom);
         if (JS_IsException(atomValue))
             goto exception;
-        args[0] = obj;
-        args[1] = atomValue;
-        desc = js_object_getOwnPropertyDescriptor(ctx, JS_UNDEFINED, 2, args, 0);
+        /* the singular form is a step machine now, so this walk performs the two primitives itself: the key is
+           already an atom (no ToPropertyKey to run) and [[GetOwnProperty]] is the C hook — which is where a
+           `getOwnPropertyDescriptor` trap with a loop in it aborts by name, this being an unconverted consumer. */
+        {
+            JSPropertyDescriptor pd;
+            int pres = JS_GetOwnPropertyInternal(ctx, &pd, JS_VALUE_GET_OBJ(obj), props[i].atom);
+            desc = (pres < 0) ? JS_EXCEPTION : pres ? js_desc_to_object(ctx, &pd) : JS_UNDEFINED;
+        }
         JS_FreeValue(ctx, atomValue);
         if (JS_IsException(desc))
             goto exception;
@@ -57717,8 +57750,10 @@ static const JSTrampStepDef js_array_fromlike_def  = { sizeof(JSArrayFromLike), 
 #define PRIMARGS_DEF_PRE(spec, proto, fn, magic, pre, mid)  PRIMARGS_DEF_FULL(spec, proto, fn, magic, pre, mid, NULL)
 static const JSTrampStepDef js_bigint_asUintN_def = PRIMARGS_DEF(PRIMARGS(0x3, HINT_NUMBER, 2), generic_magic, js_bigint_asUintN, 0);
 static const JSTrampStepDef js_bigint_asIntN_def  = PRIMARGS_DEF(PRIMARGS(0x3, HINT_NUMBER, 2), generic_magic, js_bigint_asUintN, 1);
-static const JSTrampStepDef js_obj_gopd_def       = PRIMARGS_DEF(PRIMARGS(0x2, HINT_STRING, 2), generic_magic, js_object_getOwnPropertyDescriptor, 0);
-static const JSTrampStepDef js_reflect_gopd_def   = PRIMARGS_DEF(PRIMARGS(0x2, HINT_STRING, 2), generic_magic, js_object_getOwnPropertyDescriptor, 1);
+static int js_gopd_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_gopd_fini(JSContext *ctx, void *st, bool take_result);
+static const JSTrampStepDef js_obj_gopd_def       = { sizeof(JSGopd), js_gopd_step, js_gopd_fini, 0 };
+static const JSTrampStepDef js_reflect_gopd_def   = { sizeof(JSGopd), js_gopd_step, js_gopd_fini, 1 };
 static const JSTrampStepDef js_iter_take_def      = PRIMARGS_DEF_FULL(PRIMARGS(0x1, HINT_NUMBER, 1), generic_magic, js_create_iterator_helper, JS_ITERATOR_HELPER_KIND_TAKE, js_iterator_helper_precheck, NULL, js_iterator_helper_close);
 static const JSTrampStepDef js_iter_drop_def      = PRIMARGS_DEF_FULL(PRIMARGS(0x1, HINT_NUMBER, 1), generic_magic, js_create_iterator_helper, JS_ITERATOR_HELPER_KIND_DROP, js_iterator_helper_precheck, NULL, js_iterator_helper_close);
 /* resize/grow and the three transfers are the same declared shape: ONE numeric argument, then a tail that runs
@@ -67730,6 +67765,39 @@ static int js_proxy_set(JSContext *ctx, JSValueConst obj, JSAtom atom,
     return ret;
 }
 
+static JSValue js_desc_to_object(JSContext *ctx, JSPropertyDescriptor *desc)
+{
+    int flags = JS_PROP_C_W_E | JS_PROP_THROW;
+    JSValue ret;
+    /* the ONE representation of an accessor in a descriptor RECORD. A record built from a descriptor OBJECT
+       carries JS_PROP_HAS_GET/_SET as well, and reporting only those would build a data descriptor here. */
+    DCHECK(!(desc->flags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET)) || (desc->flags & JS_PROP_GETSET),
+           "a [[GetOwnProperty]] record reports an accessor without JS_PROP_GETSET");
+    ret = JS_NewObject(ctx);
+    if (JS_IsException(ret)) { js_free_desc(ctx, desc); return ret; }
+    if (desc->flags & JS_PROP_GETSET) {
+        if (JS_DefinePropertyValueConst(ctx, ret, JS_ATOM_get, desc->getter, flags) < 0
+        ||  JS_DefinePropertyValueConst(ctx, ret, JS_ATOM_set, desc->setter, flags) < 0)
+            goto fail;
+    } else {
+        if (JS_DefinePropertyValueConst(ctx, ret, JS_ATOM_value, desc->value, flags) < 0
+        ||  JS_DefinePropertyValue(ctx, ret, JS_ATOM_writable,
+                                   js_bool(desc->flags & JS_PROP_WRITABLE), flags) < 0)
+            goto fail;
+    }
+    if (JS_DefinePropertyValue(ctx, ret, JS_ATOM_enumerable,
+                               js_bool(desc->flags & JS_PROP_ENUMERABLE), flags) < 0
+    ||  JS_DefinePropertyValue(ctx, ret, JS_ATOM_configurable,
+                               js_bool(desc->flags & JS_PROP_CONFIGURABLE), flags) < 0)
+        goto fail;
+    js_free_desc(ctx, desc);
+    return ret;
+ fail:
+    js_free_desc(ctx, desc);
+    JS_FreeValue(ctx, ret);
+    return JS_EXCEPTION;
+}
+
 static JSValue js_create_desc(JSContext *ctx, JSValueConst val,
                               JSValueConst getter, JSValueConst setter,
                               int flags)
@@ -67768,34 +67836,21 @@ static JSValue js_create_desc(JSContext *ctx, JSValueConst val,
     return ret;
 }
 
-static int js_proxy_get_own_property(JSContext *ctx, JSPropertyDescriptor *pdesc,
-                                     JSValueConst obj, JSAtom prop)
+/* 10.5.5 steps 9-17, the half of [[GetOwnProperty]] that runs on the trap's RESULT: it must be an Object or
+   undefined, and it must be consistent with the target's own descriptor (a non-configurable target property
+   cannot be reported absent or redefined incompatibly, a non-extensible target cannot gain one, and a
+   non-configurable report has to be true of the target). The trap CALL is the page's code and the check is not,
+   the same split every proxy operation makes — so the check lives here, called both by the C hook below and by
+   the tramp continuation, which has already run the trap on the interpreter's chain.
+   CONSUMES trap_result_obj. Returns 1 with *pdesc filled, 0 for absent, -1 having thrown. */
+static int js_proxy_gopd_check(JSContext *ctx, JSValueConst obj, JSAtom prop,
+                               JSValue trap_result_obj, JSPropertyDescriptor *pdesc)
 {
-    JSProxyData *s;
-    JSValue method, trap_result_obj, prop_val;
-    int res, target_desc_ret, ret;
-    JSObject *p;
-    JSValueConst args[2];
+    JSProxyData *s = JS_VALUE_GET_OBJ(obj)->u.opaque;
+    JSObject *p = JS_VALUE_GET_OBJ(s->target);
     JSPropertyDescriptor result_desc, target_desc;
+    int res, target_desc_ret, ret;
 
-    s = get_proxy_method(ctx, &method, obj, JS_ATOM_getOwnPropertyDescriptor);
-    if (!s)
-        return -1;
-    p = JS_VALUE_GET_OBJ(s->target);
-    if (JS_IsUndefined(method)) {
-        return JS_GetOwnPropertyInternal(ctx, pdesc, p, prop);
-    }
-    prop_val = JS_AtomToValue(ctx, prop);
-    if (JS_IsException(prop_val)) {
-        JS_FreeValue(ctx, method);
-        return -1;
-    }
-    args[0] = s->target;
-    args[1] = prop_val;
-    trap_result_obj = JS_CallFree(ctx, method, s->handler, 2, args);
-    JS_FreeValue(ctx, prop_val);
-    if (JS_IsException(trap_result_obj))
-        return -1;
     if (!JS_IsObject(trap_result_obj) && !JS_IsUndefined(trap_result_obj)) {
         JS_FreeValue(ctx, trap_result_obj);
         goto fail;
@@ -67824,6 +67879,14 @@ static int js_proxy_get_own_property(JSContext *ctx, JSPropertyDescriptor *pdesc
         JS_FreeValue(ctx, trap_result_obj);
         if (res < 0)
             return -1;
+        /* js_obj_to_desc reads a descriptor OBJECT and reports which fields were PRESENT (JS_PROP_HAS_*); a
+           [[GetOwnProperty]] result is a descriptor RECORD, whose accessor-ness is JS_PROP_GETSET. Every other
+           object kind fills the record form, so a proxy has to as well — otherwise the same accessor property
+           reads back as an accessor descriptor directly and as a DATA one through a trap that merely forwards it,
+           which is what `Object.getOwnPropertyDescriptor(new Proxy(acc, {getOwnPropertyDescriptor: Reflect
+           .getOwnPropertyDescriptor}), "g")` returned: {value, writable} for a getter. */
+        if (result_desc.flags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET))
+            result_desc.flags |= JS_PROP_GETSET;
 
         if (target_desc_ret) {
             /* convert result_desc.flags to defineProperty flags */
@@ -67863,6 +67926,35 @@ static int js_proxy_get_own_property(JSContext *ctx, JSPropertyDescriptor *pdesc
         }
     }
     return ret;
+}
+
+static int js_proxy_get_own_property(JSContext *ctx, JSPropertyDescriptor *pdesc,
+                                     JSValueConst obj, JSAtom prop)
+{
+    JSProxyData *s;
+    JSValue method, trap_result_obj, prop_val;
+    JSValueConst args[2];
+
+    s = get_proxy_method(ctx, &method, obj, JS_ATOM_getOwnPropertyDescriptor);
+    if (!s)
+        return -1;
+    if (JS_IsUndefined(method))
+        return JS_GetOwnPropertyInternal(ctx, pdesc, JS_VALUE_GET_OBJ(s->target), prop);
+    prop_val = JS_AtomToValue(ctx, prop);
+    if (JS_IsException(prop_val)) {
+        JS_FreeValue(ctx, method);
+        return -1;
+    }
+    args[0] = s->target;
+    args[1] = prop_val;
+    /* THE LAST C-driven `getOwnPropertyDescriptor` trap. Every consumer routed onto GP_GETOWNPROP runs it on the
+       interpreter's chain instead; the ones still calling JS_GetOwnPropertyInternal from C reach it here, and a
+       trap with a loop in it aborts at its back-edge by name. */
+    trap_result_obj = JS_CallFree(ctx, method, s->handler, 2, args);
+    JS_FreeValue(ctx, prop_val);
+    if (JS_IsException(trap_result_obj))
+        return -1;
+    return js_proxy_gopd_check(ctx, obj, prop, trap_result_obj, pdesc);
 }
 
 static int js_proxy_define_own_property(JSContext *ctx, JSValueConst obj,
