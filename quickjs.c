@@ -19308,6 +19308,40 @@ typedef struct JSGetProp {
    answer GP_OWNKEYS delivers. CONSUMES prop_array. */
 static JSValue js_proxy_ownkeys_result(JSContext *ctx, JSValueConst proxy, JSValue prop_array);
 
+#define CONT_TRAP_GET      31  /* cont_state = JSTrapGet: the READ of a Proxy handler's own trap property.
+                                  GetMethod(handler, "get"/"set"/"ownKeys"/…) is an ordinary [[Get]] on an
+                                  ordinary object, so it is the page's code twice over — the handler may define
+                                  the trap as an ACCESSOR, and the handler may itself be a Proxy whose own `get`
+                                  trap runs to produce it. Every proxy operation reached it through
+                                  get_proxy_method's JS_GetProperty, a C activation with no flow base, so a loop
+                                  in either aborted at its back-edge — one gap shared by every operation, not a
+                                  property of any of them.
+                                  It is the SAME request as the operation it precedes — a GP_GET on the handler —
+                                  which is why it re-enters the one keyed-operation entry instead of getting a
+                                  reader of its own, and why a handler that is a Proxy simply recurses through it
+                                  with no C stack at all. This continuation is the operation WAITING for it. */
+typedef struct JSTrapGet {
+    JSValue obj;         /* the proxy the operation is on (owned) */
+    JSValue val;         /* GP_SET / GP_DEFINE's operand (owned) */
+    JSValue recv;        /* the operation's receiver (owned) */
+    JSValue method;      /* the trap, once the read has produced it (owned); UNDEFINED until then */
+    JSAtom atom;         /* the operation's key (owned); JS_ATOM_NULL for GP_OWNKEYS, which has none */
+    void *outer;         /* what is waiting on the OPERATION, not on this read */
+    uint8_t outer_kind;
+    uint8_t op;
+    uint8_t no_throw;
+} JSTrapGet;
+
+static void js_trapget_free(JSContext *ctx, JSTrapGet *tg)
+{
+    JS_FreeValue(ctx, tg->obj);
+    JS_FreeValue(ctx, tg->val);
+    JS_FreeValue(ctx, tg->recv);
+    JS_FreeValue(ctx, tg->method);
+    JS_FreeAtom(ctx, tg->atom);
+    js_free_rt(ctx->rt, tg);
+}
+
 static void js_getprop_free(JSContext *ctx, JSGetProp *gp)
 {
     if (!JS_IsUninitialized(gp->recv)) JS_FreeValue(ctx, gp->recv);
@@ -19896,6 +19930,7 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_ITER_CLOSE:
     case CONT_ITER_CLOSE_CALL:
     case CONT_ITER_NEXT_OP:
+    case CONT_TRAP_GET:
         break;
     }
 }
@@ -21851,6 +21886,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSValueConst gp_recv = JS_UNINITIALIZED;            /* [[Get]]/[[Set]] receiver; UNINITIALIZED = the object itself. read+reset at do_getprop_tramp */
     int gp_no_throw = 0;                                /* 1 = a [[Set]]/[[Delete]] yields its boolean instead of throwing on false. read+reset there */
     JSValueConst gp_val = JS_UNDEFINED;                 /* GP_SET: the value to write (borrowed from the machine) */
+    JSTrapGet *gp_trapst = NULL;                        /* set ONLY between a trap read's delivery and the operation's next exit: the
+                                                           operation it belongs to, holding the method and re-supplying the request's
+                                                           operands. It never spans a suspension — the exits free it — which is why the
+                                                           operands can be borrowed from it. */
     void *gp_outer = NULL;
     uint8_t gp_outer_kind = CONT_NONE;
     void *cd_outer = NULL;                              /* do_cont_dispatch: the sequence awaiting the call's result */
@@ -24698,6 +24737,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValueConst gp_recv_r = JS_IsUninitialized(gp_recv) ? gp_obj : gp_recv;
                 int gp_nothrow_r = gp_no_throw;
                 gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
+                DCHECK(!gp_trapst || (JS_VALUE_GET_TAG(gp_obj) == JS_TAG_OBJECT
+                                      && JS_VALUE_GET_OBJ(gp_obj)->class_id == JS_CLASS_PROXY),
+                       "a trap read was delivered to an operation whose object is not a Proxy");
                 /* a TRAPLESS proxy forwards to its target, and this label does that forward ITSELF: re-entering
                    the proxy's own [[Get]]/[[Set]]/[[Has]]/[[Delete]] would look the trap up a SECOND time, which
                    a page can observe — the handler in splice/property-traps-order-with-species is itself a Proxy
@@ -24707,15 +24749,47 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (JS_VALUE_GET_TAG(gp_obj) == JS_TAG_OBJECT) {
                     JSObject *po = JS_VALUE_GET_OBJ(gp_obj);
                     if (po->class_id == JS_CLASS_PROXY) {
-                        JSProxyData *pd = get_proxy_method(ctx, &method, gp_obj,
-                                                          gp_op == GP_HAS ? JS_ATOM_has :
-                                                          gp_op == GP_SET ? JS_ATOM_set :
-                                                          gp_op == GP_DELETE ? JS_ATOM_deleteProperty :
-                                                          gp_op == GP_DEFINE ? JS_ATOM_defineProperty :
-                                                          gp_op == GP_OWNKEYS ? JS_ATOM_ownKeys :
-                                                          gp_op == GP_GETOWNPROP ? JS_ATOM_getOwnPropertyDescriptor
-                                                                                 : JS_ATOM_get);
-                        if (!pd) goto getprop_throw;               /* revoked, or the handler's own get threw */
+                        JSProxyData *pd = JS_GetOpaque(gp_obj, JS_CLASS_PROXY);
+                        if (!gp_trapst) {
+                            /* GetMethod(handler, trap) has not run yet, and it is the PAGE'S CODE — the handler
+                               may define the trap as an accessor, or be a Proxy itself. It is an ordinary [[Get]]
+                               on the handler, so it is REQUESTED through this very entry rather than performed
+                               from C by get_proxy_method; a handler that is a Proxy therefore recurses through
+                               here with no C stack, and there is no depth check to be a bound in disguise.
+                               10.5.x reads [[Handler]] and [[Target]] BEFORE the read and never re-validates
+                               after, which is why the revoked test is here and not on the delivery path: a
+                               handler getter that revokes its own proxy still gets its trap called, against the
+                               target step 4 captured (revoke leaves both values intact for exactly this). */
+                            JSAtom trap = gp_op == GP_HAS ? JS_ATOM_has :
+                                          gp_op == GP_SET ? JS_ATOM_set :
+                                          gp_op == GP_DELETE ? JS_ATOM_deleteProperty :
+                                          gp_op == GP_DEFINE ? JS_ATOM_defineProperty :
+                                          gp_op == GP_OWNKEYS ? JS_ATOM_ownKeys :
+                                          gp_op == GP_GETOWNPROP ? JS_ATOM_getOwnPropertyDescriptor
+                                                                 : JS_ATOM_get;
+                            JSTrapGet *tg;
+                            if (pd->is_revoked) { JS_ThrowTypeErrorRevokedProxy(ctx); goto getprop_throw; }
+                            tg = js_mallocz(ctx, sizeof(*tg));
+                            if (unlikely(!tg)) { JS_ThrowOutOfMemory(ctx); goto getprop_throw; }
+                            tg->obj = js_dup(gp_obj);
+                            tg->val = js_dup(gp_val);
+                            tg->recv = js_dup(gp_recv_r);
+                            tg->method = JS_UNDEFINED;
+                            tg->atom = JS_DupAtom(ctx, gp_atom);
+                            tg->outer = gp_outer; tg->outer_kind = gp_outer_kind;
+                            tg->op = gp_op; tg->no_throw = (uint8_t)gp_nothrow_r;
+                            gp_obj = pd->handler;   /* borrowed: the proxy tg holds is what keeps it alive */
+                            gp_atom = trap;
+                            gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                            gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
+                            gp_outer = tg; gp_outer_kind = CONT_TRAP_GET;
+                            goto do_getprop_tramp;
+                        }
+                        /* the read produced it. GetMethod maps null onto undefined; a non-callable trap is the
+                           convergence point's TypeError, since nothing observable happens in between. */
+                        method = gp_trapst->method;
+                        gp_trapst->method = JS_UNDEFINED;
+                        if (JS_IsNull(method)) { JS_FreeValue(ctx, method); method = JS_UNDEFINED; }
                         if (JS_IsUndefined(method)) {
                             gp_fwd = pd->target;                   /* no trap: forward, exactly once */
                         } else {
@@ -24828,6 +24902,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                       void *gouter0 = gp_outer;
                       gp_outer = NULL; gp_outer_kind = CONT_NONE; gp_atom = JS_ATOM_NULL;
                       gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                      /* the operation just completed owns its trap read no longer; its operands were borrowed
+                         from it and are done being read. */
+                      if (gp_trapst) { js_trapget_free(ctx, gp_trapst); gp_trapst = NULL; }
+                      if (gk == CONT_TRAP_GET) {
+                          /* a handler TRAP READ that invoked nothing — a data property on the handler, which is
+                             every ordinary proxy. Restore the operation waiting on it and re-enter with the
+                             method in hand, the SAME arm the suspended read resumes into. */
+                          JSTrapGet *tg = gouter0;
+                          tg->method = ret_val;
+                          gp_obj = tg->obj; gp_atom = tg->atom; gp_op = tg->op; gp_val = tg->val;
+                          gp_recv = tg->recv; gp_no_throw = tg->no_throw;
+                          gp_outer = tg->outer; gp_outer_kind = tg->outer_kind;
+                          gp_trapst = tg;
+                          goto do_getprop_tramp;
+                      }
                       if (gk == CONT_ACQUIRE_GET) {
                           /* the read invoked nothing (a data @@iterator, a primitive source, a nullish one whose
                              TypeError went to getprop_throw): re-enter the acquire with the method in hand, the
@@ -24906,6 +24995,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 gp_outer = NULL; gp_outer_kind = CONT_NONE; gp_atom = JS_ATOM_NULL;
                 gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                /* everything the request needs is now in gp, so the trap read's state is released HERE — which
+                   is what lets its operands be borrowed: it never spans the suspension that follows. */
+                if (gp_trapst) { js_trapget_free(ctx, gp_trapst); gp_trapst = NULL; }
                 call_argv = (JSValueConst *)&gp->cb[2];
                 call_argc = gp->nargs; tramp_first = -2; tramp_is_tail = 0;
                 tramp_cont_state = gp; tramp_cont_kind = CONT_GETPROP;
@@ -24928,6 +25020,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     uint8_t gk3 = gp_outer_kind;
                     gp_outer = NULL; gp_outer_kind = CONT_NONE; gp_atom = JS_ATOM_NULL;
                     gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                    if (gp_trapst) { js_trapget_free(ctx, gp_trapst); gp_trapst = NULL; }
+                    if (gk3 == CONT_TRAP_GET) {
+                        /* the handler's trap READ threw in place (a revoked handler, a poisoned accessor that
+                           invoked nothing). The operation waiting on it can never run, so the throw unwinds one
+                           level and this very label handles it for whatever was waiting on the OPERATION. */
+                        JSTrapGet *tg = gouter;
+                        gp_outer = tg->outer; gp_outer_kind = tg->outer_kind;
+                        js_trapget_free(ctx, tg);
+                        goto getprop_throw;
+                    }
                     if (gk3 == CONT_ACQUIRE_GET) {
                         /* the @@iterator read threw with nothing suspended (a nullish source's TypeError, a
                            primitive's patched getter): that is an ACQUISITION failure, and each consumer's deliver
@@ -27238,8 +27340,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     void *gouter = gp->outer;
                     uint8_t gouter_kind = gp->outer_kind;
                     DCHECK(gouter_kind == CONT_STEP || gouter_kind == CONT_ITER_CONSUME
-                           || gouter_kind == CONT_ACQUIRE_GET || gouter_kind == CONT_ITER_CLOSE,
+                           || gouter_kind == CONT_ACQUIRE_GET || gouter_kind == CONT_ITER_CLOSE
+                           || gouter_kind == CONT_TRAP_GET,
                            "property-get outer continuation: unknown machine kind");
+                    if (gouter_kind == CONT_TRAP_GET) {
+                        /* a handler's trap property was produced by USER CODE — an accessor on the handler, or a
+                           handler that is itself a Proxy whose `get` trap ran on this chain. The operation
+                           waiting for it re-enters the one entry with the method in hand. */
+                        JSTrapGet *tg = gouter;
+                        if (!JS_IsUndefined(gp->target))
+                            ret_val = js_proxy_get_invariant(ctx, gp->target, gp->atom, ret_val);
+                        js_getprop_free(ctx, gp);
+                        if (unlikely(JS_IsException(ret_val))) {
+                            gp_outer = tg->outer; gp_outer_kind = tg->outer_kind;
+                            js_trapget_free(ctx, tg);
+                            goto getprop_throw;
+                        }
+                        tg->method = ret_val;
+                        gp_obj = tg->obj; gp_atom = tg->atom; gp_op = tg->op; gp_val = tg->val;
+                        gp_recv = tg->recv; gp_no_throw = tg->no_throw;
+                        gp_outer = tg->outer; gp_outer_kind = tg->outer_kind;
+                        gp_trapst = tg;
+                        goto do_getprop_tramp;
+                    }
                     if (gouter_kind == CONT_ITER_CLOSE) {
                         /* the `return` accessor or trap ran on this chain. The iterator is still the opcode's
                            operand at the restored sp[-1], so the sequence just carries on with the method. */
@@ -31169,9 +31292,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             void *gouter = gp->outer;
             uint8_t gk2 = gp->outer_kind;
             DCHECK(!gouter || gk2 == CONT_STEP || gk2 == CONT_ITER_CONSUME || gk2 == CONT_ACQUIRE_GET
-                   || gk2 == CONT_ITER_CLOSE,
+                   || gk2 == CONT_ITER_CLOSE || gk2 == CONT_TRAP_GET,
                    "property-get outer continuation: unknown machine kind");
             js_getprop_free(ctx, gp);
+            if (gouter && gk2 == CONT_TRAP_GET) {
+                /* a handler's trap ACCESSOR (or a handler-Proxy's own `get` trap) threw after suspending. The
+                   operation waiting for the trap can never run; the throw unwinds one level and the in-place
+                   label finishes it for whatever was waiting on the OPERATION. */
+                JSTrapGet *tg = gouter;
+                gp_outer = tg->outer; gp_outer_kind = tg->outer_kind;
+                js_trapget_free(ctx, tg);
+                goto getprop_throw;
+            }
             if (gouter && gk2 == CONT_ACQUIRE_GET) {
                 /* a POISONED @@iterator getter: the consumer is waiting on an ACQUISITION, so the throw is
                    delivered as one rather than unwound here — that is what makes the aggregate reject with the
