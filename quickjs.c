@@ -22455,7 +22455,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 if (tramp_is_function_apply(call_argv[-1])) {   /* target kind is NOT a call-site question */
                     /* only when arr is undefined/null (0 args) or an object (array-like); a primitive arr must
-                       throw a realm-correct TypeError from the C js_function_apply BEFORE the target runs. */
+                       throw a realm-correct TypeError from the C js_function_apply BEFORE the target runs.
+                       NAMED, and the reason this route still stands: it collects with build_arg_list from C, so
+                       an array-like whose `length` or element getter LOOPS preempts here while the same source
+                       through a bound `.apply` collects on the tramp in the machine. Deleting the route is the
+                       fix — the machine builds its own argument block, which is the only thing the route existed
+                       for — but doing so sends a CONSUMER target (Reflect.apply(Array.from, …)) into
+                       do_consumer_dispatch from a SEQUENCE's call, which assumes caller-stack operands and says
+                       so by name. That capability is what has to be built before this goes. */
                     JSValueConst aa = (call_argc >= 2) ? call_argv[1] : JS_UNDEFINED;
                     int atag = JS_VALUE_GET_TAG(aa);
                     if (atag == JS_TAG_UNDEFINED || atag == JS_TAG_NULL || atag == JS_TAG_OBJECT) {
@@ -22503,9 +22510,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 if (tramp_is_reflect_apply(call_argv[-1]) && call_argc >= 3
                     && JS_VALUE_GET_TAG(call_argv[2]) == JS_TAG_OBJECT) {   /* Reflect.apply(target, this, argsList) */
-                    /* No target-kind gate: the reshape path handles every kind (four bytecode bodies, a step
-                       builtin, and a plain C/bound/proxy target it calls in place), so asking what the target IS
-                       here is exactly the question CLAUDE.md says disappears once that path is complete. */
+                    /* Same standing gap as `.apply` above, and the same one fix: these two were one C body taking
+                       a magic and are one machine now, so this route is the machine's twin — kept only until a
+                       consumer target can be reached from a sequence's call. */
                     ap_func = call_argv[0]; ap_this = call_argv[1]; ap_array = call_argv[2];
                     ap_cfirst = -2; ap_cargc = call_argc;   /* operands [Reflect, apply, target, this, argsList] */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_apply_tramp;
@@ -54107,57 +54114,107 @@ static JSValue js_function_call_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
-/* Function.prototype.apply — `call`'s twin, and it had no machine. `.call` is a step builtin, so reached as a
-   VALUE (a bind target, a callback, a Proxy `apply` trap) the convergence point answers it and its target runs on
-   the tramp; `.apply` was a plain C body, so the same spellings ran their target from C and a loop in it preempted
-   in an activation with no flow base. The operator-site reshape (do_apply_tramp) covers only the SYNTACTIC
-   `f.apply(t, arr)`, exactly as do_forward_call covers syntactic `.call` — what a builtin MEANS when it is reached
-   with no operands to reslice is the machine's job, and this one was missing.
-   Stages: 0 CreateListFromArrayLike then assemble [thisArg, f, args…] and CALL, 1 the result. */
+/* Function.prototype.apply and Reflect.apply — `call`'s twin, and neither had a machine. `.call` is a step
+   builtin, so reached as a VALUE (a bind target, a callback, a Proxy `apply` trap) the convergence point answers
+   it; these were plain C bodies, so the same spellings ran their target from C.
+   CreateListFromArrayLike is the page's code TWICE — `length` and every element are a getter or a Proxy trap —
+   and build_arg_list performs both from C, so an array-like whose getter loops preempted in an activation with no
+   flow base. It is the existing sub-sequences here: step_length_run for `? ToLength(? Get(src,"length"))` and
+   step_getidx_run per element, the same two the array walks already share.
+   Stages: 0 validate, 1 the length, 2 the elements, 3 the CALL, 4 its result. */
+typedef struct JSFuncApply {
+    JSStepHdr hdr;
+    JSValue result;       /* DONE (owned) */
+    JSValue *cb;          /* [thisArg, f, args…] — its own block, the arg count being the SOURCE's */
+    int ncb;
+    int64_t len;          /* LengthOfArrayLike(src) */
+    int64_t i;            /* the collect cursor: an element read can suspend, so it cannot be a C local */
+} JSFuncApply;
+
 static int js_function_apply_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    JSFuncCall *s = st;
-    uint32_t alen = 0, i;
-    JSValue *atab = NULL;
-    JSValueConst arr, fn, thisArg;
+    JSFuncApply *s = st;
     /* 0 = Function.prototype.apply, whose function is the RECEIVER; 1 = Reflect.apply, which passes it as an
        argument. Everything after that is the same algorithm, which is why it is one machine and not two — the
        C bodies were already one function taking a magic. */
     int refl = (int)(intptr_t)s->hdr.arg;
+    JSValueConst fn      = refl ? step_arg(&s->hdr, 0) : s->hdr.this_val;
+    JSValueConst thisArg = step_arg(&s->hdr, refl ? 1 : 0);
+    JSValueConst arr     = step_arg(&s->hdr, refl ? 2 : 1);
+    JSValue in = cb_result;
+    int r;
 
     if (s->hdr.stage == 0) {
-        JS_FreeValue(ctx, cb_result);
+        JS_FreeValue(ctx, in);
+        in = JS_UNDEFINED;
         s->result = JS_UNDEFINED;
-        fn      = refl ? step_arg(&s->hdr, 0) : s->hdr.this_val;
-        thisArg = step_arg(&s->hdr, refl ? 1 : 0);
-        arr     = step_arg(&s->hdr, refl ? 2 : 1);
         if (check_function(ctx, fn))
             return -1;
         /* 20.2.3.1 step 2: a nullish argArray is an empty list. 28.1.1 step 2 has no such case — its
            CreateListFromArrayLike throws on anything that is not an object. */
-        if (refl || (!JS_IsUndefined(arr) && !JS_IsNull(arr))) {
-            atab = build_arg_list(ctx, &alen, arr);
-            if (unlikely(!atab)) return -1;
+        if (!refl && (JS_IsUndefined(arr) || JS_IsNull(arr))) {
+            s->len = 0;
+            s->hdr.stage = 2;
+        } else {
+            if (JS_VALUE_GET_TAG(arr) != JS_TAG_OBJECT) {
+                JS_ThrowTypeError(ctx, "not a object");
+                return -1;
+            }
+            s->hdr.stage = 1;
         }
-        s->cb = js_malloc(ctx, sizeof(JSValue) * (size_t)(alen + 2));
-        if (unlikely(!s->cb)) {
-            if (atab) free_arg_list(ctx, atab, alen);
+    }
+    if (s->hdr.stage == 1) {
+        r = step_length_run(ctx, &s->hdr, arr, in, &s->len, out_cb, out_argc);
+        in = JS_UNDEFINED;
+        if (r) return r;
+        if (s->len > JS_MAX_LOCAL_VARS) {
+            JS_ThrowRangeError(ctx, "too many arguments in function call (only %d allowed)", JS_MAX_LOCAL_VARS);
             return -1;
         }
-        /* the state owns every slot BEFORE anything else can run: a teardown frees exactly ncb of them */
-        s->ncb = (int)alen + 2;
-        for (i = 0; i < alen + 2; i++) s->cb[i] = JS_UNDEFINED;
-        s->cb[0] = js_dup(thisArg);   /* absent means undefined, which is the spec's */
-        s->cb[1] = js_dup(fn);
-        for (i = 0; i < alen; i++) s->cb[2 + i] = atab[i];   /* ownership transferred element by element */
-        js_free(ctx, atab);
-        s->hdr.stage = 1;
-        *out_cb = s->cb; *out_argc = (int)alen;
+        s->hdr.stage = 2;
+    }
+    if (s->hdr.stage == 2) {
+        if (!s->cb) {
+            int64_t k;
+            /* the state owns every slot BEFORE the first element read, which can throw or suspend: a teardown
+               frees exactly ncb of them, so a slot handed over late would leak and one handed over early to a
+               buffer that does not exist yet is a free of garbage. */
+            s->cb = js_malloc(ctx, sizeof(JSValue) * (size_t)(s->len + 2));
+            if (unlikely(!s->cb)) return -1;
+            s->ncb = (int)s->len + 2;
+            for (k = 0; k < s->len + 2; k++) s->cb[k] = JS_UNDEFINED;
+            s->cb[0] = js_dup(thisArg);   /* absent means undefined, which is the spec's */
+            s->cb[1] = js_dup(fn);
+            s->i = 0;
+        }
+        while (s->i < s->len) {
+            JSValue el = JS_UNDEFINED;
+            r = step_getidx_run(ctx, &s->hdr, arr, s->i, in, &el, out_cb, out_argc);
+            in = JS_UNDEFINED;
+            if (r) return r;
+            JS_FreeValue(ctx, s->cb[2 + s->i]);
+            s->cb[2 + s->i] = el;
+            s->i++;
+        }
+        s->hdr.stage = 3;
+        *out_cb = s->cb; *out_argc = (int)s->len;
         return 3;
     }
-    DCHECK(s->hdr.stage == 1, "apply: unknown stage");
-    s->result = cb_result;
+    DCHECK(s->hdr.stage == 3, "apply: unknown stage");
+    s->result = in;
     return 0;
+}
+
+static JSValue js_function_apply_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSFuncApply *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    int i;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    for (i = 0; i < s->ncb; i++) JS_FreeValue(ctx, s->cb[i]);
+    js_free(ctx, s->cb);
+    js_free(ctx, s);
+    return r;
 }
 
 static JSValue js_function_bind(JSContext *ctx, JSValueConst this_val,
@@ -57981,8 +58038,8 @@ static const JSTrampStepDef js_num_toprec_def     = { sizeof(JSNumberFmt), js_nu
 static const JSTrampStepDef js_isNaN_def          = { sizeof(JSCoerce1), js_coerce1_step, js_coerce1_fini, 0 };
 static const JSTrampStepDef js_isFinite_def       = { sizeof(JSCoerce1), js_coerce1_step, js_coerce1_fini, 1 };
 static const JSTrampStepDef js_function_call_def  = { sizeof(JSFuncCall), js_function_call_step, js_function_call_fini, 0 };
-static const JSTrampStepDef js_function_apply_def = { sizeof(JSFuncCall), js_function_apply_step, js_function_call_fini, 0 };
-static const JSTrampStepDef js_reflect_apply_def  = { sizeof(JSFuncCall), js_function_apply_step, js_function_call_fini, 1 };
+static const JSTrampStepDef js_function_apply_def = { sizeof(JSFuncApply), js_function_apply_step, js_function_apply_fini, 0 };
+static const JSTrampStepDef js_reflect_apply_def  = { sizeof(JSFuncApply), js_function_apply_step, js_function_apply_fini, 1 };
 static const JSTrampStepDef js_array_tostring_def = { sizeof(JSArrayToString), js_array_tostring_step, js_array_tostring_fini, 0 };
 static const JSTrampStepDef js_array_reduce_def  = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduce };
 static const JSTrampStepDef js_array_reduceR_def = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduceRight };
