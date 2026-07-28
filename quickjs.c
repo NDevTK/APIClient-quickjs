@@ -19475,6 +19475,8 @@ typedef struct JSAsyncPost {
     JSValue await_promise;    /* AWAIT only (owned); UNDEFINED otherwise */
     JSAsyncFunctionData *st;  /* AWAIT only: a reference the finish releases */
 } JSAsyncPost;
+#define CONT_ITER_HELPER_GET 44  /* gp_outer = JSIteratorHelperData: the helper's IteratorComplete / IteratorValue
+                                    on its source's result. Same page code as the other two unpacks. */
 #define CONT_AFS_GET       43  /* gp_outer = JSAsyncFromSync: the wrapper's IteratorComplete / IteratorValue on
                                   the sync .next()'s result. Both are page code on a hand-written iterator, and
                                   the deliver read them from C. */
@@ -20043,10 +20045,17 @@ typedef struct JSIteratorHelperData {
                                 flattened list, so a proxied .next() counted as a callback and aborted. The machine
                                 asked for the call, so the machine is what says which one it asked for. */
     JSValue cb_value;        /* map/filter: the source value held across a callback that runs on the tramp (owned) */
+    /* IteratorComplete / IteratorValue on the source's .next() RESULT. Both read the result object, which a
+       hand-written source can make an accessor or a Proxy — page code the step read with JS_GetProperty from C.
+       They are requests now, and the result parks here across them because a request suspends the flow. */
+    JSValue res_obj;         /* the source result being unpacked (owned) */
 } JSIteratorHelperData;
 enum { ITH_DIRECT = 0, ITH_FOROF, ITH_ITERNEXT, ITH_CONSUME };
 enum { ITHP_START = 0, ITHP_DROP_SKIP, ITHP_EMIT, ITHP_FLATMAP_SRC, ITHP_FLATMAP_INNER, ITHP_TAKE_CLOSE,
-       ITHP_CB_DONE, ITHP_FLATMAP_CB };   /* ITHP_FLATMAP_CB: `res` is the flatMap mapper's result */   /* ITHP_CB_DONE: the map/filter callback ran ON THE TRAMP; `res` is its result */
+       ITHP_CB_DONE, ITHP_FLATMAP_CB,
+       /* the two halves of an unpack: each is a resume point because each read can suspend. SKIP_DONE answers
+          drop's `done`; EMIT_DONE and EMIT_VALUE answer the emit's two. */
+       ITHP_SKIP_DONE, ITHP_EMIT_DONE, ITHP_EMIT_VALUE };   /* ITHP_FLATMAP_CB: `res` is the flatMap mapper's result */   /* ITHP_CB_DONE: the map/filter callback ran ON THE TRAMP; `res` is its result */
 static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue res, JSValue *out);
 /* A lazy helper's CALLBACK threw. The helper object is GC-owned (it IS the JS-visible iterator), so there is
    nothing to free — only the re-entrancy flag its step raised, exactly as the helper's own abrupt arm clears it.
@@ -20127,6 +20136,7 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_PROXY_CONSTRUCT:
     case CONT_INSTANCEOF:
     case CONT_PROMISE_EXEC:
+    case CONT_ITER_HELPER_GET:
     case CONT_AFS_GET:
     case CONT_PROMISE_ALL_THEN:
     case CONT_AGEN_SETTLE:
@@ -25874,6 +25884,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                       if (gk == CONT_ITER_CLOSE) { cont_st = gouter0; goto do_iter_close_method; }
                       if (gk == CONT_PROMISE_ALL_THEN) { cont_st = gouter0; goto do_promise_all_attach_call; }
                       if (gk == CONT_AFS_GET) { cont_st = gouter0; goto do_async_from_sync_step; }
+                      if (gk == CONT_ITER_HELPER_GET) { cont_st = gouter0; goto do_iter_helper_step; }
                       DCHECK(gk == CONT_STEP, "property-get outer continuation: unknown machine kind"); }
                     goto do_step_step;
                 }
@@ -27470,6 +27481,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            continuation. `.map(Math.abs)` is a STEP MACHINE and reached its C entry here. */
                         goto do_generic_callee;
                     }
+                    if (st == 6) {
+                        /* IteratorComplete / IteratorValue on the source's result: page code on a hand-written
+                           source, so it is a request like every other keyed read. The resume point says which
+                           of the two this is. */
+                        gp_outer = it; gp_outer_kind = CONT_ITER_HELPER_GET;
+                        gp_obj = it->res_obj;
+                        gp_atom = (it->resume_pc == ITHP_EMIT_VALUE) ? JS_ATOM_value : JS_ATOM_done;
+                        gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                        goto do_getprop_tramp;
+                    }
                     if (st == 2) {   /* CREATE_INNER (flatMap): the inner's [Symbol.iterator] is a generator function.
                                         Push [this, gfunc] as the create's call operands — the SAME stack shape an
                                         OP-level g() create uses — and route onto do_generator_create_tramp; the settle
@@ -28709,12 +28730,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            || gouter_kind == CONT_TRAP_GET || gouter_kind == CONT_OP_KEYED
                            || gouter_kind == CONT_FOROF_GET || gouter_kind == CONT_FORAWAIT_GET
                            || gouter_kind == CONT_FORAWAIT_SYNC_GET
-                           || gouter_kind == CONT_PROMISE_ALL_THEN || gouter_kind == CONT_AFS_GET,
+                           || gouter_kind == CONT_PROMISE_ALL_THEN || gouter_kind == CONT_AFS_GET
+                           || gouter_kind == CONT_ITER_HELPER_GET,
                            "property-get outer continuation: unknown machine kind");
                     if (gouter_kind == CONT_PROMISE_ALL_THEN) {
                         js_getprop_free(ctx, gp);
                         cont_st = gouter;
                         goto do_promise_all_attach_call;
+                    }
+                    if (gouter_kind == CONT_ITER_HELPER_GET) {
+                        js_getprop_free(ctx, gp);
+                        cont_st = gouter;
+                        goto do_iter_helper_step;   /* the resume point says which read this answers */
                     }
                     if (gouter_kind == CONT_AFS_GET) {
                         js_getprop_free(ctx, gp);
@@ -32780,9 +32807,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             uint8_t gk2 = gp->outer_kind;
             DCHECK(!gouter || gk2 == CONT_STEP || gk2 == CONT_ITER_CONSUME || gk2 == CONT_ACQUIRE_GET
                    || gk2 == CONT_ITER_CLOSE || gk2 == CONT_TRAP_GET || gk2 == CONT_OP_KEYED
-                   || gk2 == CONT_PROMISE_ALL_THEN || gk2 == CONT_AFS_GET,
+                   || gk2 == CONT_PROMISE_ALL_THEN || gk2 == CONT_AFS_GET
+                   || gk2 == CONT_ITER_HELPER_GET,
                    "property-get outer continuation: unknown machine kind");
             js_getprop_free(ctx, gp);
+            if (gouter && gk2 == CONT_ITER_HELPER_GET) {
+                /* the helper's `done`/`value` read threw: the source is [[Done]] for this helper and the throw
+                   propagates, which is what the step's own -1 does — release the unpack and take that path. */
+                JSIteratorHelperData *hit = gouter;
+                JS_FreeValue(ctx, hit->res_obj); hit->res_obj = JS_UNDEFINED;
+                hit->executing = 0;
+                js_iter_helper_drop_consumer(ctx, hit);
+                goto exception;
+            }
             if (gouter && gk2 == CONT_AFS_GET) {
                 /* the wrapper's `done`/`value` read threw: 27.1.4.4 is inside the IfAbruptRejectPromise, so the
                    throw REJECTS the wrapper's promise rather than propagating — the same arm the deliver's own
@@ -62918,6 +62955,7 @@ static JSValue js_create_iterator_helper(JSContext *ctx, JSValueConst this_val,
     it->inner = JS_UNDEFINED;
     it->inner_next = JS_UNDEFINED;
     it->cb_value = JS_UNDEFINED;
+    it->res_obj = JS_UNDEFINED;   /* the memset zeroes it, and a zero JSValue is not UNDEFINED */
     it->count = count;
     it->executing = 0;
     it->done = 0;
@@ -62987,14 +63025,30 @@ static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue
             DFAIL("js_iter_helper_step: kind not built on the tramp");
             return -1;
         }
-    case ITHP_DROP_SKIP: {
-        JSValue dv = JS_GetProperty(ctx, res, JS_ATOM_done);
-        int d;
-        if (JS_IsException(dv)) { JS_FreeValue(ctx, res); return -1; }
-        d = JS_ToBoolFree(ctx, dv);
-        JS_FreeValue(ctx, res);
+    case ITHP_DROP_SKIP:
+        /* IteratorComplete on the source result: `Get(res, "done")` is the page's code on a hand-written source,
+           so it is a REQUEST and the result parks on the helper across it. */
+        if (!JS_IsObject(res)) {   /* 7.4.2 step 3, stated rather than left to fall out of the read */
+            JS_FreeValue(ctx, res);
+            JS_ThrowTypeError(ctx, "iterator result not an object");
+            return -1;
+        }
+        DCHECK(JS_IsUndefined(it->res_obj), "the helper is already unpacking a result");
+        it->res_obj = res;
+        it->resume_pc = ITHP_SKIP_DONE;
+        return 6;
+    case ITHP_SKIP_DONE: {
+        int d = JS_ToBoolFree(ctx, res);
+        JS_FreeValue(ctx, it->res_obj); it->res_obj = JS_UNDEFINED;
         if (d) { it->done = 1; it->resume_pc = ITHP_START; *out = js_create_iterator_result(ctx, JS_UNDEFINED, true); return JS_IsException(*out) ? -1 : 0; }
-        if (it->count > 0) { it->count--; return 1; }
+        if (it->count > 0) {
+            /* another element to drop: the NEXT drive re-enters the unpack, not this half of it. The resume point
+               has to be set back explicitly now that the read is a suspension — leaving it at SKIP_DONE fed the
+               next result OBJECT to ToBoolean, which is truthy, and drop() reported done. */
+            it->count--;
+            it->resume_pc = ITHP_DROP_SKIP;
+            return 1;
+        }
         it->resume_pc = ITHP_EMIT;
         return 1;
     }
@@ -63003,18 +63057,33 @@ static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue
         it->resume_pc = ITHP_START;
         *out = js_create_iterator_result(ctx, JS_UNDEFINED, true);
         return JS_IsException(*out) ? -1 : 0;
-    case ITHP_EMIT: {
-        JSValue dv = JS_GetProperty(ctx, res, JS_ATOM_done);
-        int d;
-        if (JS_IsException(dv)) { JS_FreeValue(ctx, res); return -1; }
-        d = JS_ToBoolFree(ctx, dv);
-        if (d) { it->done = 1; it->resume_pc = ITHP_START; JS_FreeValue(ctx, res); *out = js_create_iterator_result(ctx, JS_UNDEFINED, true); return JS_IsException(*out) ? -1 : 0; }
-        if (it->kind == JS_ITERATOR_HELPER_KIND_DROP || it->kind == JS_ITERATOR_HELPER_KIND_TAKE) {
-            /* spec: value = IteratorValue(result) — READ .value (fires a value getter, may throw), then yield a fresh
-               {value, done:false}; never pass the source result object through unread. */
-            JSValue v = JS_GetProperty(ctx, res, JS_ATOM_value);
+    case ITHP_EMIT:
+        if (!JS_IsObject(res)) {   /* 7.4.2 step 3 */
             JS_FreeValue(ctx, res);
-            if (JS_IsException(v)) return -1;
+            JS_ThrowTypeError(ctx, "iterator result not an object");
+            return -1;
+        }
+        DCHECK(JS_IsUndefined(it->res_obj), "the helper is already unpacking a result");
+        it->res_obj = res;
+        it->resume_pc = ITHP_EMIT_DONE;
+        return 6;   /* IteratorComplete */
+    case ITHP_EMIT_DONE: {
+        int d = JS_ToBoolFree(ctx, res);
+        if (d) {
+            it->done = 1; it->resume_pc = ITHP_START;
+            JS_FreeValue(ctx, it->res_obj); it->res_obj = JS_UNDEFINED;
+            *out = js_create_iterator_result(ctx, JS_UNDEFINED, true);
+            return JS_IsException(*out) ? -1 : 0;
+        }
+        /* spec: value = IteratorValue(result) — the READ fires a value getter, so it is a request too; a fresh
+           {value, done:false} is yielded afterwards and the source result never passes through unread. */
+        it->resume_pc = ITHP_EMIT_VALUE;
+        return 6;
+    }
+    case ITHP_EMIT_VALUE: {
+        JSValue v = res;
+        JS_FreeValue(ctx, it->res_obj); it->res_obj = JS_UNDEFINED;
+        if (it->kind == JS_ITERATOR_HELPER_KIND_DROP || it->kind == JS_ITERATOR_HELPER_KIND_TAKE) {
             it->resume_pc = ITHP_START;
             *out = js_create_iterator_result(ctx, v, false);   /* consumes v */
             return JS_IsException(*out) ? -1 : 0;
@@ -63022,15 +63091,10 @@ static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue
         /* MAP / FILTER: the callback must run ON THE TRAMP so a loop inside it parks like any other flow. Hold the
            source value on the helper and hand the call back to do_iter_helper_step (st==3); it re-enters here at
            ITHP_CB_DONE with the callback's result in `res`. */
-        {
-            JSValue v = JS_GetProperty(ctx, res, JS_ATOM_value);
-            JS_FreeValue(ctx, res);
-            if (JS_IsException(v)) { it->done = 1; return -1; }   /* IteratorStepValue threw: iterator is done, propagate */
-            DCHECK(JS_IsUndefined(it->cb_value), "helper callback value already held — a step overlapped its callback");
-            it->cb_value = v;
-            it->resume_pc = ITHP_CB_DONE;
-            return 3;   /* CALL it->func(v, count++) on the tramp */
-        }
+        DCHECK(JS_IsUndefined(it->cb_value), "helper callback value already held — a step overlapped its callback");
+        it->cb_value = v;
+        it->resume_pc = ITHP_CB_DONE;
+        return 3;   /* CALL it->func(v, count++) on the tramp */
     }
     case ITHP_CB_DONE: {
         /* `res` is the map/filter callback's RESULT (it ran on the tramp). */
@@ -63169,6 +63233,7 @@ static void js_iterator_helper_finalizer(JSRuntime *rt, JSValueConst val)
         JS_FreeValueRT(rt, it->inner);
         JS_FreeValueRT(rt, it->inner_next);
         JS_FreeValueRT(rt, it->cb_value);
+        JS_FreeValueRT(rt, it->res_obj);
         js_free_rt(rt, it);
     }
 }
@@ -63185,6 +63250,7 @@ static void js_iterator_helper_mark(JSRuntime *rt, JSValueConst val,
         JS_MarkValue(rt, it->inner, mark_func);
         JS_MarkValue(rt, it->inner_next, mark_func);
         JS_MarkValue(rt, it->cb_value, mark_func);
+        JS_MarkValue(rt, it->res_obj, mark_func);
     }
 }
 
