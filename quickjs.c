@@ -22511,6 +22511,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        Reflect.construct through them — a throwing `prototype` getter on the new target leaks one
                        GC object through exactly one of them. Those exits need the teardown js_iter_consume_end
                        just got, and then this goes.
+                       NAMED, and why this route still stands. The machine makes it redundant — it builds its
+                       own argument block, which is the only thing this reshape ever existed for — and every
+                       consumer arm a request can reach now DELIVERS to the machine that asked (Map/Set,
+                       TypedArray, the Promise executor, and a Proxy `construct` trap). What is left is OWNERSHIP
+                       of the requester on the ABRUPT paths: each arm moves con_outer into its own register and
+                       then onto the state it builds, and the code in between reads new_target's `prototype` —
+                       page code, so it throws — leaving the machine referenced by nothing. Routing every
+                       Reflect.construct through those exits leaks (360 objects on Promise's
+                       throwing-prototype test alone).
+                       Releasing them at the shared `exception` label is NOT the fix, and was tried: the arms that
+                       construct in place never clear con_outer on success, so a live machine gets freed and the
+                       suite dies without printing a line. con_outer needs ONE explicit owner across the dispatch,
+                       cleared by whoever adopts it and released by whoever abandons it. Then this goes.
                        Reflect.construct(target, argsList[, newTarget]). CALL-SITE-RESOLVED like Reflect.apply,
                        and for the same reason: the arguments come from a LIST that must never reach the operand
                        stack, whose compiled size it could overflow. WHAT the target is is NOT this site's
@@ -25554,6 +25567,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    what the state holds and the list was still in a local. */
                 s->args_own = tac_args_own; s->args_own_n = tac_args_own_n;   /* NULL for an operand shape */
                 tac_args_own = NULL; tac_args_own_n = 0;
+                /* the REQUESTER goes on the state here for the same reason and by the same rule: the create
+                   below reads new_target's `prototype`, and handing the machine over after that read leaked the
+                   whole machine on a throwing getter — the teardown frees exactly what the state HOLDS. */
+                s->outer = tac_outer; s->outer_kind = tac_outer_kind;
                 s->super_ref = tac_super_ref; tac_super_ref = JS_UNDEFINED;
                 s->adder = js_dup(ntgt);   /* the new_target/ctor, used at the finish to create the typed array */
                 /* TypedArray.from(gen, mapfn, thisArg): carry the mapfn; it is applied at the finish (via
@@ -25577,7 +25594,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 s->k = 0;
                 s->sink = ITERCONS_FROM;
-                s->outer = tac_outer; s->outer_kind = tac_outer_kind;
                 s->orig_cfirst = tac_outer ? 0 : tac_cfirst;
                 s->orig_cargc = tac_outer ? 0 : (tac_cfirst ? (tac_cargc >= 0 ? tac_cargc : ta_argc) : 0);
                 s->orig_is_tail = tac_outer ? 0 : tramp_is_tail;
@@ -30936,6 +30952,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        The same rule as the construct side's con_cargc, applied where every abrupt path converges. */
     if (call_args_owned) { free_arg_list(ctx, call_args_owned, call_args_owned_n); call_args_owned = NULL; call_args_owned_n = 0; }
     call_cargc = -1;
+
     if (unlikely(ctx->pending_import_cap != NULL && ctx->pending_import_cap->sf == sf)) {
         /* the unwind is back in the frame that issued OP_import, so its operands and its continuation pc are
            ours again: the throw becomes the capability's rejection and the promise becomes the opcode's result.
