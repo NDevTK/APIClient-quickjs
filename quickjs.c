@@ -20343,6 +20343,18 @@ static inline JSObject *tramp_accessor_setter(JSContext *ctx, JSObject *p, JSAto
         if (!p) return NULL;
     }
 }
+/* Does reading `atom` off `v` reach PAGE CODE — an accessor, or a Proxy anywhere on its chain? THE one question
+   a C-side property read has to ask before performing itself, because a C activation has no flow base to run
+   that code on. It is the same walk the read opcodes use, so the answer is exact: a read that reaches no user
+   code is a different algorithm rather than a fallback to one, and a read that does is an unbuilt capability the
+   caller must hand out and place on a flow. */
+static bool js_read_is_page_code(JSContext *ctx, JSValueConst v, JSAtom atom)
+{
+    JSObject *p;
+    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT) return false;
+    p = JS_VALUE_GET_OBJ(v);
+    return tramp_proto_proxy(ctx, p, atom) != NULL || tramp_accessor_getter(ctx, p, atom) != NULL;
+}
 /* An ASYNC function runs its body on the CALLER's tramp chain (do_async_tramp_call) so its sync-prefix loop
    preempts the base flow at any depth — never a nested C-recursion that would drive to completion. */
 static inline bool tramp_can_call_async(JSValueConst func) {
@@ -33949,8 +33961,13 @@ static int js_async_function_post_prepare(JSContext *ctx, JSAsyncFunctionData *s
             JS_FreeValue(ctx, func_ret); /* not used */
             if (JS_GetOpaque(value, JS_CLASS_PROMISE)) {
                 /* PromiseResolve's short-circuit: an already-native promise IS the result, and no call happens
-                   at all. The `constructor` READ it performs is still a C read — a promise with an accessor
-                   `constructor` is the one page-code step left in this function. */
+                   at all. */
+                /* PromiseResolve's `constructor` READ, and it is PAGE CODE whenever the promise carries an accessor or a proxy
+                for it (return-suspendedStart-broken-promise.js defines exactly that). It is NOT converted anywhere yet, and
+                it is named rather than guarded at every one of its three sites for the same reason: routing it needs a READ
+                phase ahead of the call phase these prepares have, so the short-circuit's decision itself becomes suspendable.
+                The `then` read next to it IS converted, and its C entry crashes — that asymmetry is deliberate, not a
+                narrowing. */
                 JSValue c2 = JS_GetProperty(ctx, value, JS_ATOM_constructor);
                 bool is_same;
                 if (JS_IsException(c2)) { JS_FreeValue(ctx, value); goto fail; }
@@ -34246,7 +34263,7 @@ static int js_async_generator_await_prepare(JSContext *ctx, JSAsyncGeneratorData
     out->await_promise = JS_UNDEFINED; out->st = NULL;
     if (JS_GetOpaque(value, JS_CLASS_PROMISE)) {
         /* PromiseResolve's short-circuit: an already-native promise IS the result and no call happens. Its
-           `constructor` READ is still a C read — the same one the async function's prepare has. */
+           `constructor` READ is the same unbuilt page-code step named at the other two sites. */
         JSValue c2 = JS_GetProperty(ctx, value, JS_ATOM_constructor);
         bool is_same;
         if (JS_IsException(c2)) return -1;
@@ -73059,13 +73076,11 @@ static JSValue js_promise_resolve_function_call(JSContext *ctx,
         return JS_UNDEFINED;
     is_reject = p->class_id - JS_CLASS_PROMISE_RESOLVE_FUNCTION;
     resolution = argc > 0 ? argv[0] : JS_UNDEFINED;
-    if (!is_reject && JS_IsObject(resolution) && !js_same_value(ctx, resolution, s->promise)) {
-        JSObject *rp = JS_VALUE_GET_OBJ(resolution);
-        if (tramp_proto_proxy(ctx, rp, JS_ATOM_then) || tramp_accessor_getter(ctx, rp, JS_ATOM_then)) {
-            DFAIL("a promise resolving function reached its C entry with a thenable whose `then` READ is page "
-                  "code — hand that caller's call out and place it on a flow, as every settle and Await now do");
-            return JS_EXCEPTION;
-        }
+    if (!is_reject && !js_same_value(ctx, resolution, s->promise)
+        && js_read_is_page_code(ctx, resolution, JS_ATOM_then)) {
+        DFAIL("a promise resolving function reached its C entry with a thenable whose `then` READ is page "
+              "code — hand that caller's call out and place it on a flow, as every settle and Await now do");
+        return JS_EXCEPTION;
     }
     s->presolved->already_resolved = true;
     if (is_reject || !JS_IsObject(resolution)) {
@@ -73272,6 +73287,13 @@ static JSValue js_promise_resolve_native(JSContext *ctx, JSValueConst ctor,
            "PromiseResolve with a non-native constructor reached the C route — perform it as the Promise.resolve "
            "step machine (a DELEGATE request) instead of driving its Construct from here");
     if (!is_reject && JS_GetOpaque(argv[0], JS_CLASS_PROMISE)) {
+        /* PromiseResolve's `constructor` READ, and it is PAGE CODE whenever the promise carries an accessor or
+           a proxy for it (return-suspendedStart-broken-promise.js defines exactly that). The two Awaits that
+           could be converted spell this read out themselves and CRASH on that case; this route cannot yet,
+           because its callers cannot suspend where they call from. The one that reaches the case is
+           js_async_generator_completed_return, through js_async_generator_pre — converting it means `pre` itself
+           becomes suspendable, which is a change to the drive loop's shape rather than another placement of the
+           split, and is why it is named here instead of guarded. */
         JSValue c2 = JS_GetProperty(ctx, argv[0], JS_ATOM_constructor);
         bool is_same;
         if (JS_IsException(c2)) return c2;
