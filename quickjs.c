@@ -17443,24 +17443,6 @@ static __exception int js_op_using_check(JSContext *ctx, JSValueConst val,
     return 0;
 }
 
-static __exception int js_iterator_get_value_done(JSContext *ctx, JSValue *sp)
-{
-    JSValue obj, value;
-    int done;
-    obj = sp[-1];
-    if (!JS_IsObject(obj)) {
-        JS_ThrowTypeError(ctx, "iterator must return an object");
-        return -1;
-    }
-    value = JS_IteratorStepValue(ctx, obj, &done);
-    if (JS_IsException(value))
-        return -1;
-    JS_FreeValue(ctx, obj);
-    sp[-1] = value;
-    sp[0] = js_bool(done);
-    return 0;
-}
-
 static JSValue js_create_iterator_result(JSContext *ctx,
                                          JSValue val,
                                          bool done)
@@ -19456,9 +19438,13 @@ typedef struct JSAsyncPost {
                                   them from C — the most common unpack there is. */
 typedef struct JSForOfUnpack {
     JSValue res;   /* the iterator result being unpacked (owned) */
-    int rfof;      /* the enum_rec's offset from sp, which the done path clears */
+    int rfof;      /* FOU_FOROF: the enum_rec's offset from sp, which the done path clears */
     uint8_t ph;    /* 1 = the `done` read is in flight, 2 = the `value` read is */
+    uint8_t mode;  /* FOU_*: WHERE the pair lands and whether an enum_rec is dropped with it. The reads and their
+                      order are identical; only the placement differs, which is why one label serves both. */
 } JSForOfUnpack;
+enum { FOU_FOROF = 0,      /* OP_for_of_next: value at sp[0], done at sp[1]; a done result closes the enum_rec */
+       FOU_VALUE_DONE };   /* OP_iterator_get_value_done: value REPLACES sp[-1], done at sp[0]; nothing closes */
 #define CONT_PROMISE_ALL_GET 45  /* gp_outer = JSPromiseAll: the combinator's IteratorComplete / IteratorValue on
                                     its iterable's .next() result. */
 #define CONT_ITER_HELPER_GET 44  /* gp_outer = JSIteratorHelperData: the helper's IteratorComplete / IteratorValue
@@ -22171,7 +22157,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     uint8_t gp_op = GP_GET;                             /* the result is delivered to. */
     JSValueConst gp_recv = JS_UNINITIALIZED;            /* [[Get]]/[[Set]] receiver; UNINITIALIZED = the object itself. read+reset at do_getprop_tramp */
     int gp_no_throw = 0;                                /* 1 = a [[Set]]/[[Delete]] yields its boolean instead of throwing on false. read+reset there */
-    int forof_unpack_off = 0;                           /* do_forof_unpack's input: the enum_rec's offset from sp */
+    int forof_unpack_off = 0;                           /* do_forof_unpack's inputs: the enum_rec's offset from sp, */
+    uint8_t forof_unpack_mode = FOU_FOROF;              /* and which placement the pair takes */
     JSValueConst gp_val = JS_UNDEFINED;                 /* GP_SET / GP_DEFINE: the value to write (borrowed from the machine) */
     /* GP_DEFINE's remaining descriptor fields. The request expressed only CreateDataProperty's shape — a data
        descriptor with all three attributes true — hardcoded at THREE sites (the in-place define, the trap's
@@ -25568,11 +25555,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                the enum_rec offset stays valid over a suspension. */
             {
                 JSForOfUnpack *fu;
-                DCHECK(forof_unpack_off <= -3, "the for-of protocol tail was given no enum_rec offset");
+                uint8_t fmode = forof_unpack_mode;
+                forof_unpack_mode = FOU_FOROF;   /* read+reset, like every other request input */
+                DCHECK(fmode != FOU_FOROF || forof_unpack_off <= -3,
+                       "the for-of protocol tail was given no enum_rec offset");
                 if (unlikely(!JS_IsObject(ret_val))) {
                     JS_FreeValue(ctx, ret_val);
                     JS_ThrowTypeError(ctx, "iterator must return an object");
-                    JS_FreeValue(ctx, sp[forof_unpack_off]); sp[forof_unpack_off] = JS_UNDEFINED;
+                    if (fmode == FOU_FOROF) { JS_FreeValue(ctx, sp[forof_unpack_off]); sp[forof_unpack_off] = JS_UNDEFINED; }
                     goto exception;
                 }
                 fu = js_malloc_rt(rt, sizeof(*fu));
@@ -25580,6 +25570,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 fu->res = ret_val; ret_val = JS_UNDEFINED;
                 fu->rfof = forof_unpack_off;
                 fu->ph = 1;
+                fu->mode = fmode;
                 cont_st = fu;
             }
             /* fall through */
@@ -25596,19 +25587,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             /* ret_val = whichever read just answered; the phase says which. */
             {
                 JSForOfUnpack *fu = (JSForOfUnpack *)cont_st;
+                JSValue *slot = (fu->mode == FOU_FOROF) ? sp : sp - 1;
                 if (fu->ph == 1) {
                     if (!JS_ToBoolFree(ctx, ret_val)) { fu->ph = 2; goto do_forof_unpack_read; }
-                    JS_FreeValue(ctx, sp[fu->rfof]); sp[fu->rfof] = JS_UNDEFINED;
-                    sp[0] = JS_UNDEFINED; sp[1] = JS_TRUE;
+                    if (fu->mode == FOU_FOROF) { JS_FreeValue(ctx, sp[fu->rfof]); sp[fu->rfof] = JS_UNDEFINED; }
+                    slot[0] = JS_UNDEFINED; slot[1] = JS_TRUE;
                 } else {
-                    sp[0] = ret_val;    /* owned, transferred */
-                    sp[1] = JS_FALSE;
+                    slot[0] = ret_val;    /* owned, transferred */
+                    slot[1] = JS_FALSE;
                 }
                 ret_val = JS_UNDEFINED;
                 cont_st = NULL;
                 JS_FreeValue(ctx, fu->res);
+                sp += (fu->mode == FOU_FOROF) ? 2 : 1;
                 js_free_rt(rt, fu);
-                sp += 2;
             }
             BREAK;
 
@@ -30151,11 +30143,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             tramp_forawait_wrap = 1;
             goto do_forof_acquire_call;
         CASE(OP_iterator_get_value_done):
+            /* the ASYNC form of the same tail: the awaited result is at sp[-1] and its (value, done) replace it.
+               Same two reads, same order, so it is the same label with a different placement. */
             sf->cur_pc = pc;
-            if (js_iterator_get_value_done(ctx, sp))
-                goto exception;
-            sp += 1;
-            BREAK;
+            ret_val = sp[-1]; sp[-1] = JS_UNDEFINED;   /* the state OWNS the result now: the slot it will be
+                                                          replaced in must not free it a second time */
+            forof_unpack_mode = FOU_VALUE_DONE;
+            goto do_forof_unpack;
         CASE(OP_check_object):
             if (unlikely(!JS_IsObject(sp[-1]))) {
                 JS_ThrowTypeErrorNotAnObject(ctx);
@@ -32883,7 +32877,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 /* the protocol tail's read threw: the loop's enum_rec must not be closed (the iterator has
                    already stepped), which is what clearing the slot says, and the throw propagates. */
                 JSForOfUnpack *fu = gouter;
-                JS_FreeValue(ctx, sp[fu->rfof]); sp[fu->rfof] = JS_UNDEFINED;
+                if (fu->mode == FOU_FOROF) { JS_FreeValue(ctx, sp[fu->rfof]); sp[fu->rfof] = JS_UNDEFINED; }
                 JS_FreeValue(ctx, fu->res);
                 js_free_rt(rt, fu);
                 goto exception;
