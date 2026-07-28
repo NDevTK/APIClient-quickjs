@@ -25482,15 +25482,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         }
                     }
                 }
-                if (tramp_can_call_gen_create(method)) {
-                    DCHECK(sp + 2 <= TRAMP_SP_LIMIT(sf),
-                           "consume acquire: create operand push exceeds the frame's compiled stack_size");
-                    *sp++ = js_dup(iterable);   /* this */
-                    *sp++ = method;             /* gfunc (owned, transferred) */
-                    call_argv = sp; call_argc = 0; tramp_first = -2; tramp_is_tail = 0;
-                    tramp_gen_create_cont_it = tramp_consume_state; tramp_gen_create_cont_kind = tramp_consume_kind;
-                    goto do_generator_create_tramp;   /* settle -> do_consume_deliver_iterator */
-                }
+                /* A GENERATOR-FUNCTION @@iterator used to have its own arm here, handing itself to the
+                   create through the ACQUIRE register so the settle would deliver the generator as the acquired
+                   iterator. It does not need one: the create takes a CALL requester of any kind and records the
+                   caller's operand shape, so the ordinary path below produces the identical result through
+                   CONT_CONSUME_GETITER's delivery — which is also the path that runs GetIterator step 5's object
+                   check, and the arm skipped it. Two routes to one outcome is where they drift. */
                 {
                     /* GetIterator step 4's Call, for ANY callable @@iterator. This asked whether the method had a
                        NORMAL bytecode body and handed everything else to JS_GetIterator2, which calls it from C:
