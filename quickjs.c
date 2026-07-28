@@ -20478,6 +20478,11 @@ typedef struct JSPromiseAll {
                                     subclass's resolve/reject is USER bytecode whose loop must park, so it cannot be
                                     a JS_Call to completion from inside js_promise_all_step. */
     uint8_t fin_is_reject;       /* which resolving_funcs[] the finalize drives */
+    uint8_t resolving_elem;      /* 1 while the PER-ELEMENT `C.resolve(value)` is being driven on the tramp. It is
+                                    user code — Promise.resolve is a page-visible builtin and C may be a subclass
+                                    that overrides it — and a JS_Call to completion from inside this step was the
+                                    last C drive in the combinator. Mirrors `finalizing` exactly. */
+    JSValue elem_value;          /* that call's argument, owned only until it moves onto the operand stack */
     uint8_t driving_next;        /* 1 while a .next() is being driven / its result extracted: the iterator has NOT
                                     yet successfully stepped, so an error here is an IteratorNext abrupt and must
                                     NOT close it (spec fail_reject, not fail_reject1). Cleared once value is in hand. */
@@ -26307,6 +26312,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->elem_promises = JS_NewArray(ctx);
                 s->index = 0;
                 s->magic = pa_magic;
+                /* the two BRIEF-WINDOW values, stated rather than left to js_mallocz: the teardown frees them now
+                   (a state torn down mid-request still holds one), and "a zeroed JSValue happens to be an int" is
+                   not a contract this file should depend on. */
+                s->fin_arg = JS_UNDEFINED; s->elem_value = JS_UNDEFINED;
                 TAKE_CALL_SHAPE(); s->orig_cfirst = call_first_r; s->orig_cargc = call_pop; s->orig_is_tail = tramp_is_tail;
                 s->args_own = call_args_owned; s->args_own_n = call_args_owned_n;
                 call_args_owned = NULL; call_args_owned_n = 0;
@@ -26383,6 +26392,26 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     s->fin_arg = err; s->fin_is_reject = 1; s->finalizing = 1;
                     st = 2;   /* fall through to the FINALIZE drive below, then DONE */
                 }
+                if (st == 4) {
+                    /* RESOLVE-ELEMENT: `C.resolve(value)` per element. C is the receiver Promise.all was called
+                       on, so `resolve` is a page-visible builtin a subclass may override AND is itself a step
+                       machine — a JS_Call to completion from inside js_promise_all_step was the last C drive in
+                       the combinator. Same shape as the FINALIZE below; the step re-enters with the element's
+                       promise in hand. */
+                    DCHECK(sp + 3 <= TRAMP_SP_LIMIT(sf),
+                           "Promise combinator element resolve: operand push exceeds the frame's compiled stack_size");
+                    *sp++ = js_dup(s->this_val);          /* this = C */
+                    *sp++ = js_dup(s->promise_resolve);   /* C.resolve */
+                    *sp++ = s->elem_value; s->elem_value = JS_UNDEFINED;   /* the value (owned, transferred) */
+                    call_argv = sp - 1; call_argc = 1; tramp_first = -2; tramp_is_tail = 0;
+                    /* the operands ARE the three just pushed, which is what an UNSET shape states — and it has to
+                       be stated, because a shape LEFT OVER from an earlier call on this frame is read instead.
+                       A stale empty one popped nothing, so sp drifted by three per element and the enclosing
+                       for-of read its enum_rec out of the drift. */
+                    call_cfirst = 0; call_cargc = -1;
+                    tramp_cont_state = s; tramp_cont_kind = CONT_PROMISE_ALL;
+                    goto do_generic_callee;
+                }
                 if (st == 2) {
                     /* FINALIZE: call resolving_funcs[fin_is_reject](fin_arg) — the aggregate settle. A user
                        Promise subclass's resolve/reject is user code of ANY kind, so it goes to the convergence
@@ -26397,6 +26426,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     *sp++ = js_dup(fn);                   /* the settle function */
                     *sp++ = s->fin_arg; s->fin_arg = JS_UNDEFINED;   /* the arg (owned, transferred) */
                     call_argv = sp - 1; call_argc = 1; tramp_first = -2; tramp_is_tail = 0;
+                    call_cfirst = 0; call_cargc = -1;   /* see the element resolve above */
                     tramp_cont_state = s; tramp_cont_kind = CONT_PROMISE_ALL;
                     goto do_generic_callee;
                 }
@@ -31984,11 +32014,24 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                tramp, js_promise_all_step caught this inline (return -1 -> promise_all_err), so routing the callback
                onto the tramp made this the site that must reproduce that catch. */
             JSPromiseAll *ps = xcs;
-            JSValue err = JS_GetException(ctx), rr;
+            JSValue err, rr;
             JSValue r = js_dup(ps->result_promise);
             int cfirst = ps->orig_cfirst, cargc = ps->orig_cargc;
             uint8_t itail = ps->orig_is_tail;
             JSValue *cargv;
+            /* THE DRIVE'S OWN OPERANDS, which sit ABOVE the original call's — the same thing the async-from-sync
+               arm owes. This arm assumed there were none, which held while every drive this machine made read its
+               operands out of the machine's own buffer; the per-element `C.resolve(value)` and the finalize settle
+               push three onto the CALLER's stack, so a throw from either left sp three high and the ENCLOSING
+               for-of then read its enum_rec out of the drift. The pop is shape-driven, so a drive with no
+               caller-stack operands still pops nothing. */
+            {
+                JSValue *dcargv = sp - xcg;
+                DCHECK(xcg >= xcf, "a Promise combinator drive records operands ending below where they start");
+                for (i = xcf; i < xcg; i++) JS_FreeValue(ctx, dcargv[i]);
+                sp += xcf - xcg;
+            }
+            err = JS_GetException(ctx);
             /* Close ONLY for a post-retrieval throw (fail_reject1). A .next() drive that threw (driving_next) or a
                finalize-stage settle that threw (iter_done) leaves the iterator [[Done]] — no close (fail_reject). */
             if (!JS_IsUndefined(ps->iter) && !ps->driving_next && !ps->iter_done)
@@ -32796,6 +32839,7 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                 ns->next = js_dup(os->next);
                 ns->this_val = js_dup(os->this_val);
                 ns->promise_resolve = js_dup(os->promise_resolve);
+                ns->elem_value = js_dup(os->elem_value);   /* in flight when a fork lands mid-resolve */
                 ns->result_promise = js_new_promise_capability(ctx, ns->resolving_funcs, os->this_val);   /* fresh aggregate + [resolve,reject] */
                 ns->values = JS_NewArray(ctx);
                 ns->resolve_element_env = JS_NewArray(ctx);
@@ -72348,6 +72392,21 @@ static int js_promise_all_step(JSContext *ctx, JSPromiseAll *s, JSValue res)
         JS_FreeValue(ctx, res);
         return 0;   /* the combinator is DONE */
     }
+    if (s->resolving_elem) {
+        /* `res` is C.resolve(value)'s promise, driven on the tramp. Everything the old JS_Call's tail did lives
+           here now — the point of the split is only WHERE the call happens, not what follows it. */
+        s->resolving_elem = 0;
+        next_promise = res;
+        /* Retain the resolved element wrapper so a mid-consume FORK can re-attach a sibling resolve_element to it
+           (the sibling's gen fork is already past elements [0..index) and cannot re-pull them). O(n), same order
+           as `values`. */
+        if (JS_DefinePropertyValueInt64(ctx, s->elem_promises, s->index, js_dup(next_promise), JS_PROP_C_W_E) < 0) {
+            JS_FreeValue(ctx, next_promise); return -1;
+        }
+        if (js_promise_all_attach(ctx, s, s->index, next_promise) < 0) return -1;   /* consumes next_promise */
+        s->index++;
+        return 1;   /* drive the next .next() */
+    }
     if (JS_VALUE_GET_TAG(res) == JS_TAG_UNINITIALIZED)
         return 1;   /* first step: nothing to process, drive .next() */
     if (!JS_IsObject(res)) {
@@ -72392,17 +72451,9 @@ static int js_promise_all_step(JSContext *ctx, JSPromiseAll *s, JSValue res)
     JS_FreeValue(ctx, res);
     if (JS_IsException(value)) return -1;   /* value access threw: still an IteratorNext abrupt — no close */
     s->driving_next = 0;   /* the iterator has fully stepped; from here an error closes it (fail_reject1) */
-    next_promise = JS_Call(ctx, s->promise_resolve, s->this_val, 1, vc(&value));
-    JS_FreeValue(ctx, value);
-    if (JS_IsException(next_promise)) return -1;
-    /* Retain the resolved element wrapper so a mid-consume FORK can re-attach a sibling resolve_element to it (the
-       sibling's gen fork is already past elements [0..index) and cannot re-pull them). O(n), same order as `values`. */
-    if (JS_DefinePropertyValueInt64(ctx, s->elem_promises, s->index, js_dup(next_promise), JS_PROP_C_W_E) < 0) {
-        JS_FreeValue(ctx, next_promise); return -1;
-    }
-    if (js_promise_all_attach(ctx, s, s->index, next_promise) < 0) return -1;   /* consumes next_promise */
-    s->index++;
-    return 1;   /* drive the next .next() */
+    s->elem_value = value;
+    s->resolving_elem = 1;
+    return 4;   /* RESOLVE-ELEMENT: drive C.resolve(value) on the tramp, then re-enter with its promise */
 }
 
 /* Free a for-await async-from-sync state's owned fields (promise dup'd out by the caller before this). */
@@ -72431,6 +72482,8 @@ static void js_promise_all_end(JSContext *ctx, JSPromiseAll *s)
     JS_FreeValue(ctx, s->values);
     JS_FreeValue(ctx, s->resolve_element_env);
     JS_FreeValue(ctx, s->elem_promises);
+    JS_FreeValue(ctx, s->fin_arg);     /* held only between the step that builds it and the drive that takes it */
+    JS_FreeValue(ctx, s->elem_value);  /* likewise, for the per-element resolve */
     if (s->args_own) { free_arg_list(ctx, s->args_own, s->args_own_n); s->args_own = NULL; s->args_own_n = 0; }
 }
 
