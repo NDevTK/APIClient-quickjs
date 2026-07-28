@@ -1443,7 +1443,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_STR_CHARAT, STEPDEF_STR_CHARCODEAT, STEPDEF_STR_SLICE, STEPDEF_STR_SUBSTR, STEPDEF_STR_REPEAT,
     STEPDEF_STR_PADSTART, STEPDEF_STR_PADEND,
     STEPDEF_TA_AT, STEPDEF_TA_SET, STEPDEF_JSON_RAWJSON,
-    STEPDEF_OBJ_DEFINEPROPERTY, STEPDEF_REFLECT_DEFINEPROPERTY,
+    STEPDEF_OBJ_DEFINEPROPERTY, STEPDEF_REFLECT_DEFINEPROPERTY, STEPDEF_OBJ_DEFINEPROPERTIES,
     STEPDEF_PARSEINT, STEPDEF_PARSEFLOAT, STEPDEF_STR_SPLIT,
     STEPDEF_ARRAY_JOIN, STEPDEF_ARRAY_TOLOCALESTRING, STEPDEF_ARRAY_TOSTRING,
     STEPDEF_TA_JOIN, STEPDEF_TA_TOLOCALESTRING,
@@ -21053,6 +21053,33 @@ typedef struct JSReflectProp {
     JSAtom atom;      /* the coerced key (owned) */
 } JSReflectProp;
 
+enum { DESC_PH_ASK = 0, DESC_PH_HAS, DESC_PH_GET };
+typedef struct JSDescCursor {
+    JSValue cb[1];        /* [the descriptor object] — the operand of every request, dup'd once */
+    JSValue value, getter, setter;   /* owned */
+    int flags;
+    uint8_t field;        /* 0..6, an index into js_desc_fields */
+    uint8_t phase;        /* DESC_PH_* */
+} JSDescCursor;
+
+static void js_desc_cursor_init(JSDescCursor *c)
+{
+    c->cb[0] = JS_UNDEFINED;
+    c->value = c->getter = c->setter = JS_UNDEFINED;
+    c->flags = 0; c->field = 0; c->phase = DESC_PH_ASK;
+}
+
+static void js_desc_cursor_free(JSContext *ctx, JSDescCursor *c)
+{
+    JS_FreeValue(ctx, c->cb[0]);
+    JS_FreeValue(ctx, c->value);
+    JS_FreeValue(ctx, c->getter);
+    JS_FreeValue(ctx, c->setter);
+}
+
+static int js_desc_cursor_run(JSContext *ctx, JSDescCursor *c, JSValueConst desc, JSValue in,
+                              JSValue **out_cb, int *out_argc);
+
 typedef struct JSPropWalk {
     JSStepHdr hdr;          /* MUST be first: the generic step driver casts the state to JSStepHdr * */
     JSValue obj;            /* ToObject of the source currently being walked (owned) */
@@ -21062,6 +21089,15 @@ typedef struct JSPropWalk {
     uint32_t len;           /* how many keys the snapshot holds */
     uint32_t i, j;          /* the key cursor and the output cursor — they diverge, keys can be skipped */
     int src_i;              /* ASSIGN walks every argument after the target; the others have one source */
+    /* DEFINEPROPS only. 20.1.2.3.1 is explicitly TWO loops — every descriptor is read and validated before the
+       first one is defined — which the C body did not do and said so in an XXX comment. Collecting them is what
+       makes that ordering real, and it is also what a resumable walk needs: the reads and the defines are
+       separate phases with suspensions inside both. */
+    JSDescCursor dcur;         /* the ToPropertyDescriptor of the key currently being read */
+    JSPropertyDescriptor *dl;  /* the collected descriptors (owned) */
+    JSAtom *dk;                /* their keys (owned) */
+    uint32_t nd, di;           /* how many were collected, and the define cursor */
+    JSValue cb[2];             /* [target, value] for the DEFINE request (owned) */
 } JSPropWalk;
 #define PROPWALK_VALUES  0
 #define PROPWALK_ENTRIES 1
@@ -21166,6 +21202,10 @@ typedef struct JSArrayFromLike {
                                 stops one step earlier: it never performs the per-key Get. Its own C body reached
                                 [[OwnPropertyKeys]] and [[GetOwnProperty]] through JS_GetOwnPropertyNames2, which
                                 ran both proxy traps from C. */
+#define PROPWALK_DEFPROPS 6  /* Object.defineProperties(O, Properties) — 20.1.2.3.1. The same walk over the
+                                source's own keys, but each enumerable one's VALUE is a descriptor OBJECT that
+                                ToPropertyDescriptor reads (twelve more keyed operations), and the define at the
+                                end is itself a request because the TARGET can be a Proxy. */
 #define PROPWALK_SPREAD  3   /* `{...src}` / `{a, ...rest}` (OP_copy_data_properties): argv is [target, source,
                                 excludeList]. The target is a FRESH object the opcode just built, so the write is a
                                 DefineOwnProperty with no user code in it — only the READ can suspend. */
@@ -21301,33 +21341,6 @@ typedef struct JSParseNum {
 
 /* Object.defineProperty / Reflect.defineProperty: ToPropertyKey on the key is the page's code. The descriptor
    READ that follows also runs accessors, which is a separate route and still C. */
-enum { DESC_PH_ASK = 0, DESC_PH_HAS, DESC_PH_GET };
-typedef struct JSDescCursor {
-    JSValue cb[1];        /* [the descriptor object] — the operand of every request, dup'd once */
-    JSValue value, getter, setter;   /* owned */
-    int flags;
-    uint8_t field;        /* 0..6, an index into js_desc_fields */
-    uint8_t phase;        /* DESC_PH_* */
-} JSDescCursor;
-
-static void js_desc_cursor_init(JSDescCursor *c)
-{
-    c->cb[0] = JS_UNDEFINED;
-    c->value = c->getter = c->setter = JS_UNDEFINED;
-    c->flags = 0; c->field = 0; c->phase = DESC_PH_ASK;
-}
-
-static void js_desc_cursor_free(JSContext *ctx, JSDescCursor *c)
-{
-    JS_FreeValue(ctx, c->cb[0]);
-    JS_FreeValue(ctx, c->value);
-    JS_FreeValue(ctx, c->getter);
-    JS_FreeValue(ctx, c->setter);
-}
-
-static int js_desc_cursor_run(JSContext *ctx, JSDescCursor *c, JSValueConst desc, JSValue in,
-                              JSValue **out_cb, int *out_argc);
-
 typedef struct JSObjDefProp {
     JSStepHdr hdr;
     JSValue result;       /* DONE (owned) */
@@ -54007,16 +54020,6 @@ static JSValue js_obj_defprop_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
-static JSValue js_object_defineProperties(JSContext *ctx, JSValueConst this_val,
-                                          int argc, JSValueConst *argv)
-{
-    // defineProperties(obj, properties)
-    JSValueConst obj = argv[0];
-    if (JS_ObjectDefineProperties(ctx, obj, argv[1]))
-        return JS_EXCEPTION;
-    return js_dup(obj);
-}
-
 /* magic = 1 if called as __defineSetter__ */
 static JSValue js_object___defineGetter__(JSContext *ctx, JSValueConst this_val,
                                           int argc, JSValueConst *argv, int magic)
@@ -54193,11 +54196,19 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
            handed over late is a leak and a buffer initialised late is freed with a NULL context. */
         s->obj = JS_UNDEFINED; s->result = JS_UNDEFINED; s->el = JS_UNDEFINED;
         s->atoms = NULL; s->len = 0; s->i = 0; s->j = 0;
-        s->src_i = (mode == PROPWALK_ASSIGN) ? 1 : 0;
+        s->dl = NULL; s->dk = NULL; s->nd = 0; s->di = 0;
+        s->cb[0] = JS_UNDEFINED; s->cb[1] = JS_UNDEFINED;
+        js_desc_cursor_init(&s->dcur);
+        s->src_i = (mode == PROPWALK_ASSIGN || mode == PROPWALK_DEFPROPS) ? 1 : 0;
+        if (mode == PROPWALK_DEFPROPS && JS_VALUE_GET_TAG(step_arg(&s->hdr, 0)) != JS_TAG_OBJECT) {
+            /* 20.1.2.3 step 1, before Properties is even coerced. */
+            JS_ThrowTypeError(ctx, "Object.defineProperties called on non-object");
+            return -1;
+        }
         /* 20.1.2.1 step 1 / 7.3.23 step 1: ToObject the target (assign) or build the output array. A SPREAD's
            target is the object the opcode just created — already an object, and it belongs to the opcode's stack,
            so it is only BORROWED here. `result` is what the machine hands back, which a spread discards. */
-        s->result = assign ? JS_ToObject(ctx, step_arg(&s->hdr, 0))
+        s->result = (assign || mode == PROPWALK_DEFPROPS) ? JS_ToObject(ctx, step_arg(&s->hdr, 0))
                   : (mode == PROPWALK_SPREAD ? js_dup(step_arg(&s->hdr, 0))
                      : mode == PROPWALK_DESCS ? JS_NewObject(ctx) : JS_NewArray(ctx));
         if (JS_IsException(s->result)) { s->result = JS_UNDEFINED; return -1; }
@@ -54211,8 +54222,11 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
             /* How many sources this sink has: assign takes every argument after the target, a spread takes the one
                the opcode handed it, values/entries take argv[0] — and for those two an EXTRA argument is not a
                second source, so the bound is a mode fact, not argc. */
-            int src_end = assign ? s->hdr.argc : (mode == PROPWALK_SPREAD ? 2 : 1);
-            if (s->src_i >= src_end) { JS_FreeValue(ctx, cb_result); return 0; }
+            int src_end = assign ? s->hdr.argc : (mode == PROPWALK_SPREAD || mode == PROPWALK_DEFPROPS) ? 2 : 1;
+            if (s->src_i >= src_end) {
+                if (mode == PROPWALK_DEFPROPS) { s->hdr.stage = 9; goto defprops_apply; }
+                JS_FreeValue(ctx, cb_result); return 0;
+            }
             src = step_arg(&s->hdr, s->src_i);
             /* a nullish source contributes nothing to assign (step 3.a) or to a spread (`{...null}` is empty), but
                values/entries THROW on it — their step 1 is ToObject of the argument itself. A non-object source is
@@ -54249,7 +54263,7 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
                 JSAtom at;
                 if (JS_IsException(kv)) { JS_FreeValue(ctx, keys); s->len = kept; return -1; }
                 if (JS_IsSymbol(kv) && mode != PROPWALK_ASSIGN && mode != PROPWALK_SPREAD
-                    && mode != PROPWALK_DESCS) {
+                    && mode != PROPWALK_DESCS && mode != PROPWALK_DEFPROPS) {
                     JS_FreeValue(ctx, kv);
                     continue;
                 }
@@ -54323,6 +54337,35 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
             if (r) return r < 0 ? -1 : r;
             s->hdr.stage = 5;
         }
+        if (s->hdr.stage == 5 && mode == PROPWALK_DEFPROPS) {
+            /* 20.1.2.3.1 step 4.a.ii: the value IS a descriptor object, and ToPropertyDescriptor reads twelve
+               more keyed operations off it. The cursor is resumable, so this stage is re-entered until it says
+               the descriptor is complete. */
+            r = js_desc_cursor_run(ctx, &s->dcur, s->el, cb_result, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            JS_FreeValue(ctx, s->el); s->el = JS_UNDEFINED;
+            if (!s->dl) {
+                /* at most one descriptor per snapshot key; allocated once the first one is complete so a walk
+                   that keeps none allocates nothing. */
+                s->dl = js_mallocz(ctx, sizeof(*s->dl) * (size_t)(s->len ? s->len : 1));
+                if (!s->dl) { JS_ThrowOutOfMemory(ctx); return -1; }
+                s->dk = js_mallocz(ctx, sizeof(*s->dk) * (size_t)(s->len ? s->len : 1));
+                if (!s->dk) { JS_ThrowOutOfMemory(ctx); return -1; }
+            }
+            DCHECK(s->nd < (s->len ? s->len : 1), "defineProperties collected more descriptors than keys");
+            s->dl[s->nd].flags = s->dcur.flags;
+            s->dl[s->nd].value = s->dcur.value;    /* the cursor's ownership MOVES into the list */
+            s->dl[s->nd].getter = s->dcur.getter;
+            s->dl[s->nd].setter = s->dcur.setter;
+            s->dk[s->nd] = JS_DupAtom(ctx, s->atoms[s->i].atom);
+            s->nd++;
+            JS_FreeValue(ctx, s->dcur.cb[0]);
+            js_desc_cursor_init(&s->dcur);         /* the next key starts a fresh one */
+            s->i++;
+            s->hdr.stage = 2;
+            continue;
+        }
         if (s->hdr.stage == 5) {
             JSValue item = s->el;
             s->el = JS_UNDEFINED;   /* the state no longer owns it: every path below consumes it */
@@ -54368,6 +54411,33 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
             s->i++;
             s->hdr.stage = 2;
         }
+        if (s->hdr.stage == 9) {
+        defprops_apply:
+            /* 20.1.2.3.1 step 5, the SECOND loop. It is separate because the spec says so — every descriptor is
+               validated before any is defined — and because each define is a REQUEST: the target can be a Proxy,
+               whose `defineProperty` trap is the page's code. */
+            JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+            if (s->di >= s->nd) return 0;
+            {
+                JSPropertyDescriptor *d = &s->dl[s->di];
+                JS_FreeValue(ctx, s->cb[0]); JS_FreeValue(ctx, s->cb[1]);
+                s->cb[0] = js_dup(s->result);
+                s->cb[1] = js_dup(d->value);
+                s->hdr.desc_get = d->getter;   /* borrowed: the list holds them across the request */
+                s->hdr.desc_set = d->setter;
+                s->hdr.desc_flags = d->flags | JS_PROP_THROW | JS_PROP_DEFINE_PROPERTY;
+                s->hdr.stage = 10;
+                *out_cb = s->cb; *out_argc = (int)s->dk[s->di];
+                return 10;   /* DEFINE */
+            }
+        }
+        if (s->hdr.stage == 10) {
+            if (JS_IsException(cb_result)) return -1;
+            JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+            s->di++;
+            s->hdr.stage = 9;
+            continue;
+        }
         if (s->hdr.stage == 4) {
         source_done:
             /* this source is exhausted: release its snapshot before the next one replaces it (the teardown frees
@@ -54389,6 +54459,19 @@ static JSValue js_prop_walk_fini(JSContext *ctx, void *st, bool take_result)
     JS_FreeValue(ctx, s->el);
     JS_FreeValue(ctx, s->obj);
     if (s->atoms) js_free_prop_enum(ctx, s->atoms, s->len);
+    js_desc_cursor_free(ctx, &s->dcur);
+    JS_FreeValue(ctx, s->cb[0]); JS_FreeValue(ctx, s->cb[1]);
+    if (s->dl) {
+        uint32_t k;
+        for (k = 0; k < s->nd; k++) {
+            JS_FreeValue(ctx, s->dl[k].value);
+            JS_FreeValue(ctx, s->dl[k].getter);
+            JS_FreeValue(ctx, s->dl[k].setter);
+            JS_FreeAtom(ctx, s->dk[k]);
+        }
+        js_free(ctx, s->dl);
+        js_free(ctx, s->dk);
+    }
     js_free(ctx, s);
     return r;
 }
@@ -54948,7 +55031,7 @@ static const JSCFunctionListEntry js_object_funcs[] = {
     JS_CFUNC_MAGIC_DEF("getPrototypeOf", 1, js_object_getPrototypeOf, 0 ),
     JS_CFUNC_DEF("setPrototypeOf", 2, js_object_setPrototypeOf ),
     JS_CFUNC_STEP_DEF("defineProperty", 3, STEPDEF_OBJ_DEFINEPROPERTY ),
-    JS_CFUNC_DEF("defineProperties", 2, js_object_defineProperties ),
+    JS_CFUNC_STEP_DEF("defineProperties", 2, STEPDEF_OBJ_DEFINEPROPERTIES ),
     JS_CFUNC_STEP_DEF("getOwnPropertyNames", 1, STEPDEF_OWNKEYS_NAMES ),
     JS_CFUNC_STEP_DEF("getOwnPropertySymbols", 1, STEPDEF_OWNKEYS_SYMBOLS ),
     JS_CFUNC_CONSUME_DEF("groupBy", 2, ITERCONS_GROUPBY_BASE + GROUPBY_PROPERTY ),
@@ -59310,6 +59393,7 @@ static const JSTrampStepDef js_reflect_has_def    = { sizeof(JSReflectProp), js_
 static const JSTrampStepDef js_reflect_del_def    = { sizeof(JSReflectProp), js_reflect_prop_step, js_reflect_prop_fini, GP_DELETE };
 static const JSTrampStepDef js_obj_entries_def    = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_ENTRIES };
 static const JSTrampStepDef js_obj_assign_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_ASSIGN };
+static const JSTrampStepDef js_obj_defprops_def   = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_DEFPROPS };
 static const JSTrampStepDef js_obj_spread_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_SPREAD };
 static const JSTrampStepDef js_array_flat_def      = { sizeof(JSArrayFlat), js_array_flat_step, js_array_flat_fini, ARRAYFLAT_FLAT };
 static const JSTrampStepDef js_array_flatMap_def   = { sizeof(JSArrayFlat), js_array_flat_step, js_array_flat_fini, ARRAYFLAT_FLATMAP };
@@ -59670,6 +59754,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_OBJ_VALUES]      = &js_obj_values_def,
     [STEPDEF_OBJ_ENTRIES]     = &js_obj_entries_def,
     [STEPDEF_OBJ_ASSIGN]      = &js_obj_assign_def,
+    [STEPDEF_OBJ_DEFINEPROPERTIES] = &js_obj_defprops_def,
     [STEPDEF_OBJ_SPREAD]      = &js_obj_spread_def,
     [STEPDEF_ARRAY_FLAT]      = &js_array_flat_def,
     [STEPDEF_ARRAY_FLATMAP]   = &js_array_flatMap_def,
