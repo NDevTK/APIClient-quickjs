@@ -19220,9 +19220,14 @@ typedef struct TrampFrame {
                                   OPERATOR. 13.10.2 step 3.b is ToBoolean(result) and nothing else, so the
                                   continuation is that coercion — the operator cannot do it, having already returned
                                   to the interpreter loop when the method's body runs. */
-#define CONT_PROXY_CONSTRUCT 23 /* cont_state = NULL: a trampolined proxy [[Construct]] trap. The only thing it owes
-                                  after the call is 9.5.14 step 13 — the trap's result MUST be an object — so the
-                                  continuation carries no state, only the obligation. */
+#define CONT_PROXY_CONSTRUCT 23 /* cont_state = NULL, or a JSProxyCtor: a trampolined proxy [[Construct]] trap.
+                                  What it owes after the call is 9.5.14 step 13 — the trap's result MUST be an
+                                  object — which needs no state, and that is why it had none. A construct
+                                  requested BY a machine (`Reflect.construct(proxyWithTrap, args)` from the
+                                  Reflect.construct machine) owes one thing more: the object goes to that machine
+                                  instead of onto a caller stack it does not own. NULL means the ordinary case,
+                                  where the operands ARE the caller's. */
+typedef struct JSProxyCtor { void *outer; uint8_t outer_kind; } JSProxyCtor;
 static JSValue js_proxy_get_invariant(JSContext *ctx, JSValueConst target, JSAtom atom, JSValue ret);
 static int js_proxy_has_invariant(JSContext *ctx, JSValueConst target, JSAtom atom, int ret);
 static int js_proxy_delete_invariant(JSContext *ctx, JSValueConst target, JSAtom atom, int ret);
@@ -22497,12 +22502,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     && JS_IsConstructor(ctx, call_argv[0])
                     && (call_argc < 3 || JS_IsConstructor(ctx, call_argv[2]))
                     && JS_VALUE_GET_TAG(call_argv[1]) == JS_TAG_OBJECT) {
-                    /* NAMED, and why this route still stands: the machine makes it redundant — it builds its
-                       own argument block, which is the only thing the reshape ever existed for — and deleting it
-                       sends every consumer target into an arm that had no outer delivery. Three of the four are
-                       built now (Map/Set, TypedArray, the Promise executor); the fourth is a Proxy `construct`
-                       trap, whose CONT_PROXY_CONSTRUCT carries no state to hold an outer. That state is what
-                       has to exist before this goes.
+                    /* NAMED, and why this route still stands. The machine makes it redundant — it builds its own
+                       argument block, which is the only thing this reshape ever existed for — and all four
+                       consumer arms a request can reach now deliver to the machine that asked (Map/Set,
+                       TypedArray, the Promise executor, and a Proxy `construct` trap, which grew a state to hold
+                       the outer). What is left is the ERROR side: the construct dispatch has exception exits that
+                       drop con_outer without tearing the machine down, and deleting this route sends every
+                       Reflect.construct through them — a throwing `prototype` getter on the new target leaks one
+                       GC object through exactly one of them. Those exits need the teardown js_iter_consume_end
+                       just got, and then this goes.
                        Reflect.construct(target, argsList[, newTarget]). CALL-SITE-RESOLVED like Reflect.apply,
                        and for the same reason: the arguments come from a LIST that must never reach the operand
                        stack, whose compiled size it could overflow. WHAT the target is is NOT this site's
@@ -23008,8 +23016,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                     if (unlikely(px_ret < 0)) { JS_FreeValue(ctx, resolved); goto exception; }
                     if (px_ret > 0) {
-                        DCHECK(!con_outer, "a step machine's Construct of a Proxy has no outer delivery on "
-                                           "CONT_PROXY_CONSTRUCT — build it before routing that shape here");
+                        JSProxyCtor *pcs = NULL;
+                        if (con_outer) {
+                            pcs = js_mallocz(ctx, sizeof(*pcs));
+                            if (unlikely(!pcs)) { JS_FreeValue(ctx, resolved); JS_ThrowOutOfMemory(ctx); goto exception; }
+                            pcs->outer = con_outer; pcs->outer_kind = con_outer_kind;
+                            con_outer = NULL; con_outer_kind = CONT_NONE;
+                        }
                         JS_FreeValue(ctx, resolved);
                         if (tramp_first == -2) {
                             JSValue *cargv = sp - con_pop;
@@ -23025,7 +23038,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         sp[0] = px[0]; sp[1] = px[1]; sp[2] = px[2]; sp[3] = px[3]; sp[4] = px[4];
                         call_argv = (JSValueConst *)(sp + 2); call_argc = 3; sp += 5;
                         tramp_first = -2; tramp_is_tail = 0;
-                        tramp_cont_state = NULL; tramp_cont_kind = CONT_PROXY_CONSTRUCT;
+                        tramp_cont_state = pcs; tramp_cont_kind = CONT_PROXY_CONSTRUCT;
                         /* ANY callable trap, exactly as on the [[Call]] side: asking whether it had a BYTECODE
                            body and declining otherwise left the PROXY as the target, so js_proxy_call_constructor
                            drove a C, bound or proxied trap from C. The continuation (10.5.13's must-return-object
@@ -23909,11 +23922,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         cargv = sp - pop;
                         for (i = first; i < pop; i++) JS_FreeValue(ctx, cargv[i]);
                         sp += first - pop;
-                        if (unlikely(JS_IsException(ret_val))) goto exception;
-                        if (unlikely(JS_VALUE_GET_TAG(ret_val) != JS_TAG_OBJECT)) {
-                            JS_FreeValue(ctx, ret_val);
-                            JS_ThrowTypeErrorNotAnObject(ctx);
+                        JSProxyCtor *pcs = dcs;
+                        if (unlikely(JS_IsException(ret_val))
+                            || unlikely(JS_VALUE_GET_TAG(ret_val) != JS_TAG_OBJECT)) {
+                            if (!JS_IsException(ret_val)) {
+                                JS_FreeValue(ctx, ret_val);
+                                JS_ThrowTypeErrorNotAnObject(ctx);
+                            }
+                            if (pcs) { tramp_step_chain_free(ctx, pcs->outer); js_free_rt(rt, pcs); }
                             goto exception;
+                        }
+                        if (pcs) {
+                            void *pouter = pcs->outer;
+                            DCHECK(pcs->outer_kind == CONT_STEP,
+                                   "proxy-construct outer continuation: unknown machine kind");
+                            js_free_rt(rt, pcs);
+                            cont_st = pouter;
+                            goto do_step_step;
                         }
                         *sp++ = ret_val;
                         BREAK;
@@ -25819,6 +25844,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     int cfirst = s->orig_cfirst, cargc = s->orig_cargc;
                     uint8_t itail = s->orig_is_tail;
                     void *fin_outer = s->outer; uint8_t fin_outer_kind = s->outer_kind;
+                    s->outer = NULL;   /* being RESUMED, not abandoned: the teardown below must not free it */
                     int64_t n = s->k;
                     uint8_t sink = s->sink;
                     uint8_t is_tafrom = s->ta_isfrom;
@@ -27612,11 +27638,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     ret_val = js_bool(JS_ToBoolFree(ctx, ret_val));
                 } else if (rck == CONT_PROXY_CONSTRUCT) {
                     /* 9.5.14 step 13: the `construct` trap's result must be an object. Then the normal placement
-                       below drops the five reshaped operands and pushes it where `new` expects its result. */
+                       below drops the five reshaped operands and pushes it where `new` expects its result —
+                       unless a MACHINE asked for this construct, in which case the object is delivered to it and
+                       there is no `new` waiting for a push. */
+                    JSProxyCtor *pcs = rcs;
                     if (unlikely(JS_VALUE_GET_TAG(ret_val) != JS_TAG_OBJECT)) {
                         JS_FreeValue(ctx, ret_val);
                         JS_ThrowTypeErrorNotAnObject(ctx);
+                        if (pcs) { tramp_step_chain_free(ctx, pcs->outer); js_free_rt(rt, pcs); }
                         goto exception;
+                    }
+                    if (pcs) {
+                        void *pouter = pcs->outer; uint8_t pkind = pcs->outer_kind;
+                        JSValue *cargv2 = sp - cargc;
+                        DCHECK(pkind == CONT_STEP, "proxy-construct outer continuation: unknown machine kind");
+                        js_free_rt(rt, pcs);
+                        for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv2[i]);
+                        sp += cfirst - cargc;
+                        cont_st = pouter;
+                        goto do_step_step;
                     }
                 } else if (rck == CONT_SETTER) {
                     /* setter returned: free the operands (this,setter,value) on the caller stack exactly like a
@@ -31309,7 +31349,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
             }
             js_free_rt(rt, cs);
-        } else if (xck == CONT_SETTER || xck == CONT_PROXY_CONSTRUCT || xck == CONT_INSTANCEOF
+        } else if (xck == CONT_PROXY_CONSTRUCT) {
+            /* the trap body THREW. Its operands are on the caller stack and the caller's own catch-search frees
+               them, as for any method call; what is ours is the requester, which can never be re-entered. */
+            JSProxyCtor *pcs = xcs;
+            if (pcs) { tramp_step_chain_free(ctx, pcs->outer); js_free_rt(rt, pcs); }
+        } else if (xck == CONT_SETTER || xck == CONT_INSTANCEOF
                    || xck == CONT_ITER_NEXT_OP) {
             /* a throwing setter body, a throwing proxy `construct` trap, or an OP_iterator_next .next() that threw:
                no continuation state; the operands are on the caller stack and freed by the caller's own
@@ -55709,6 +55754,16 @@ static void js_iter_consume_end(JSContext *ctx, JSIterConsume *s)
     ITERCONS_OWNED(ITERCONS_FREE_ONE)
     #undef ITERCONS_FREE_ONE
     if (s->args_own) { free_arg_list(ctx, s->args_own, s->args_own_n); s->args_own = NULL; s->args_own_n = 0; }
+    if (s->outer) {
+        /* the machine that ASKED for this consume goes with it. This lives HERE, in the one teardown every
+           abrupt path already calls, rather than in a list of the eight sites that tear a consume down — a list
+           is what the next site added forgets, and `Reflect.construct(Int8Array, [{}], throwingProto)` leaked a
+           whole machine through exactly one of them. The FINISH clears s->outer before calling this, because
+           there the requester is being RESUMED, not abandoned. */
+        DCHECK(s->outer_kind == CONT_STEP, "consume outer continuation: unknown machine kind");
+        tramp_step_chain_free(ctx, s->outer);
+        s->outer = NULL; s->outer_kind = CONT_NONE;
+    }
 }
 
 /* A phase this machine asked the interpreter to run (the entry key's ToPrimitive) THREW where there is no way
