@@ -20064,15 +20064,25 @@ static inline bool tramp_can_construct(JSValueConst func) {
    the first own `atom` slot is a GETSET whose getter is a NORMAL bytecode function, else NULL (data prop / C
    getter / exotic / absent → the plain slow path). */
 static JSShapeProperty *find_own_property(JSProperty **ppr, JSObject *p, JSAtom atom);
-static inline JSObject *tramp_bytecode_getter(JSObject *p, JSAtom atom) {
+/* The GETTER of the first own `atom` slot on the proto chain, when there is one — ANY callable getter, which is
+   the whole point. This asked for a NORMAL bytecode body and returned NULL otherwise, and NULL meant the read
+   fell to JS_GetPropertyInternal, which invokes the getter with JS_CallFree from C. Every narrowing condition was
+   therefore a silent fallback: a GENERATOR or async-generator getter had its coroutine created off the chain
+   (drive-to-completion on `o.a` and on every other spelling), and a bound, proxied, or step-machine getter ran
+   its body in a C activation with no flow base. Widened, the callee kind is the convergence point's question —
+   the same question the same callee gets when it is called by name. An own NON-GETSET slot shadows inherited
+   accessors, so the walk stops at the first own slot exactly as the property-read lookup does, and an exotic
+   object's read is not a plain shape walk at all. */
+static inline JSObject *tramp_accessor_getter(JSRuntime *rt, JSObject *p, JSAtom atom) {
     for (;;) {
         JSProperty *pr; JSShapeProperty *prs = find_own_property(&pr, p, atom);
         if (prs) {
             if ((prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
                 JSObject *g = pr->u.getset.getter;
-                if (g && g->class_id == JS_CLASS_BYTECODE_FUNCTION &&
-                    g->u.func.function_bytecode->func_kind == JS_FUNC_NORMAL)
-                    return g;
+                if (g && (g->class_id == JS_CLASS_BYTECODE_FUNCTION
+                          || (g->class_id == JS_CLASS_PROXY ? g->u.proxy_data->is_func
+                                                            : rt->class_array[g->class_id].call != NULL)))
+                    return g;   /* CALLABLE — JS_IsFunction's test, spelled without a JSContext */
             }
             return NULL;
         }
@@ -20081,7 +20091,7 @@ static inline JSObject *tramp_bytecode_getter(JSObject *p, JSAtom atom) {
         if (!p) return NULL;
     }
 }
-/* The setter twin of tramp_bytecode_getter: a property WRITE whose slot is a `set x(v){…}` invokes the setter
+/* The setter twin of tramp_accessor_getter: a property WRITE whose slot is a `set x(v){…}` invokes the setter
    (C-recursively inside JS_SetPropertyInternal2 today), so a loop in the setter body drives to completion.
    Return the setter JSObject when the first own `atom` slot on the proto chain is a GETSET with a NORMAL
    bytecode setter, else NULL. Symmetric caveat: an own NON-GETSET writable data slot shadows inherited setters,
@@ -21443,6 +21453,30 @@ static inline JSTrampBodyEntry tramp_body_entry(JSValueConst func) {
     case TBE_GEN:   tramp_first = (first); tramp_is_tail = (tail); goto do_generator_create_tramp;     \
     case TBE_AGEN:  tramp_first = (first); tramp_is_tail = (tail); goto do_agen_create_tramp;          \
     }
+/* A COROUTINE CREATE releases the call's operands EAGERLY (async_func_init has dup'd everything into the
+   coroutine's own frame), where do_tramp_call leaves them standing for do_return to drop. That is the only
+   difference between the two, so the OWNERSHIP rule has to be do_tramp_call's, exactly:
+     - an OWNED reshaped list (a bound unwrap, a proxy resolve, a sequence's copy) belongs to this call — free it;
+     - an UNSET shape says the operands ARE the caller's stack, which this call consumes — free them, and the
+       caller resumes below them;
+     - a DECLARED shape with no owned list says the operands are a CONTINUATION'S OWN request buffer (gp->cb,
+       where a Proxy trap's and an accessor's arguments live). Those belong to the continuation, which frees them
+       at its own teardown; freeing them here is a double free, and it is what made a second
+       `Reflect.get(objWithGeneratorGetter, "a")` crash inside build_backtrace with the first one's state gone.
+   Either way the DECLARED shape separately names the caller-stack slots the original call left behind, which
+   this call still owes — the same [first, argc) do_return drops. */
+#define CREATE_RELEASE_OPERANDS(decl_, dcf_) do {                                            \
+    if (call_args_owned) {                                                                   \
+        for (i = tramp_first; i < call_argc; i++) JS_FreeValue(ctx, call_argv[i]);           \
+        js_free(ctx, call_args_owned); call_args_owned = NULL; call_args_owned_n = 0;        \
+    } else if ((decl_) < 0) {                                                                \
+        for (i = tramp_first; i < call_argc; i++) JS_FreeValue(ctx, call_argv[i]);           \
+    }                                                                                        \
+    if ((decl_) >= 0) { for (i = (dcf_); i < (decl_); i++) JS_FreeValue(ctx, sp[i - (decl_)]); } \
+} while (0)
+#define CREATE_CALLER_SP(decl_, dcf_) \
+    (((decl_) >= 0) ? (sp - (decl_) + (dcf_)) : (JSValue *)(call_argv + tramp_first))
+
 struct JSAsyncGeneratorData;
 static void js_async_generator_free(JSRuntime *rt, struct JSAsyncGeneratorData *s);
 /* A generator .next()/.throw()/.return() runs its body on the caller's tramp chain (do_generator_tramp) so a
@@ -21763,6 +21797,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     /* the operands do_cont_deliver reads: WHO asked for a call result, in WHAT shape, and whether the requester
        was itself in tail position. A returning bytecode frame fills them from its TrampFrame; a coroutine create
        requested by a call fills them from the requester it took at its own label. */
+    /* the coroutine-create requester a gen/agen unwind took off its frame, discharged AFTER the pop because a
+       keyed property operation's teardown is a label that unwinds through the restored caller stack. */
+    void *gen_unwind_seq_req = NULL; uint8_t gen_unwind_seq_kind = CONT_NONE;
     void *dlv_cs = NULL; uint8_t dlv_ck = CONT_NONE;
     int dlv_cfirst = 0, dlv_cargc = 0, dlv_forof = 0; uint8_t dlv_itail = 0;
     uint8_t tramp_cont_kind = CONT_NONE;
@@ -22168,12 +22205,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 get_length_slow_path:
                     sf->cur_pc = pc;
                     if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) {
-                        JSObject *g = tramp_bytecode_getter(JS_VALUE_GET_OBJ(sp[-1]), atom);
+                        JSObject *g = tramp_accessor_getter(rt, JS_VALUE_GET_OBJ(sp[-1]), atom);
                         if (g) {   /* a bytecode `get length()` -> 0-arg method call on THIS chain */
                             *sp++ = js_dup(JS_MKPTR(JS_TAG_OBJECT, g));   /* stack: [receiver][getter] */
                             call_argv = sp; call_argc = 0;
                             tramp_first = -2; tramp_is_tail = 0;
-                            goto do_tramp_call;
+                            goto do_generic_callee;
                         }
                     }
                     val = JS_GetPropertyInternal(ctx, obj, atom, sp[-1], false);
@@ -24305,16 +24342,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                invoked it. Entered with call_argv/call_argc/tramp_first set and cd_outer/cd_outer_kind naming the
                sequence. */
             {
-                if (tramp_can_call(call_argv[-1])) {
-                    tramp_cont_state = cd_outer; tramp_cont_kind = cd_outer_kind;
-                    cd_outer = NULL; cd_outer_kind = CONT_NONE;
-                    /* the sequence's arguments are its OWN buffer, so the shape this call declares is EMPTY: the
-                       caller's stack is untouched. The arm below declared it and this one did not, so a bytecode
-                       callback's frame recorded the OUTER machine's operands instead — harmless only while the
-                       return dropped nothing. */
-                    call_cfirst = 0; call_cargc = 0;
-                    goto do_tramp_call;               /* a bytecode body: it runs here and can park */
-                }
                 if (tramp_step_def_of(call_argv[-1])) {
                     /* the callee IS a step machine (`arr.map(String)`, `{valueOf: [].sort}`): drive it through the
                        one step entry with this sequence as its outer continuation, never in place — in place is
@@ -24821,14 +24848,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (JS_IsNull(method)) { JS_FreeValue(ctx, method); method = JS_UNDEFINED; }
                         if (JS_IsUndefined(method)
                             && JS_VALUE_GET_TAG(pd->target) == JS_TAG_OBJECT
-                            && JS_VALUE_GET_OBJ(pd->target)->class_id == JS_CLASS_PROXY) {
-                            /* NO TRAP, and the target is ITSELF a Proxy. 10.5.x step 6 forwards to
-                               target.[[Get]](P, Receiver) — which IS this entry — so it loops here rather than
-                               being handed to JS_GetPropertyInternal, which re-entered js_proxy_get from C and
-                               cost one C activation per hop: a chain of trapless proxies hit the stack floor and
-                               was caught into a soft RangeError, a bound wearing an error's clothes. Every
-                               operand of the request stands except the object; the RECEIVER in particular does
-                               NOT change across a forward, which is the whole reason it is an operand. */
+                            && (JS_VALUE_GET_OBJ(pd->target)->class_id == JS_CLASS_PROXY
+                                || gp_op == GP_GET)) {
+                            /* NO TRAP. 10.5.x step 6 forwards to target.[[Get]](P, Receiver) — which IS this
+                               entry — so it loops here rather than being handed to JS_GetPropertyInternal, which
+                               re-entered js_proxy_get from C and cost one C activation per hop: a chain of
+                               trapless proxies hit the stack floor and was caught into a soft RangeError, a bound
+                               wearing an error's clothes. Every operand of the request stands except the object;
+                               the RECEIVER in particular does NOT change across a forward, which is the whole
+                               reason it is an operand.
+                               For a [[Get]] the loop takes an ORDINARY target too, because the forward is the
+                               same operation either way and the C call is what hid the target's ACCESSOR: a
+                               generator getter read through a trapless proxy had its coroutine created inside
+                               JS_GetPropertyInternal, off the chain. The other operations still spell their
+                               forward out below — their C entries do more than re-dispatch (a trapless
+                               [[Delete]] reports false where the direct one throws), so each is its own
+                               conversion, not a case of this one. */
                             gp_obj = pd->target;
                             gp_recv = gp_recv_r;
                             gp_no_throw = gp_nothrow_r;
@@ -24853,7 +24888,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             handler = js_dup(pd->handler);
                         }
                     } else if (gp_op == GP_GET) {
-                        accessor = tramp_bytecode_getter(po, gp_atom);   /* a HasProperty never invokes a getter */
+                        accessor = tramp_accessor_getter(rt, po, gp_atom);   /* a HasProperty never invokes a getter */
                     } else if (gp_op == GP_SET) {
                         accessor = tramp_bytecode_setter(po, gp_atom);
                     }
@@ -25055,10 +25090,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    dispatches record is EMPTY — and it has to be stated, because the frame otherwise records
                    [-2, nargs] and the delivery would drop that many of the CALLER's operands. */
                 call_cfirst = 0; call_cargc = 0;
-                if (tramp_can_call(gp->cb[1])) goto do_tramp_call;
-                /* a step machine, a bound function, a proxied trap, a plain C one: the convergence point answers
-                   all of them, and the request buffer is the continuation's OWN — which is what the empty shape
-                   states, and what lets its arms rewrite the callee in place without touching the caller. */
+                /* a bytecode body, a coroutine function, a step machine, a bound function, a proxied trap, a
+                   plain C one: the convergence point answers all of them, and the request buffer is the
+                   continuation's OWN — which is what the empty shape states, and what lets its arms rewrite the
+                   callee in place without touching the caller. */
                 goto do_generic_callee;
             }
 
@@ -27018,10 +27053,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    that says so. The two rules that follow from it are the generator create's, verbatim — the
                    caller's sp must not be re-derived from a heap call_argv, and the DECLARED EMPTY SHAPE is
                    resolved per call, so it is consumed here rather than left for this frame's next call. */
-                bool agowned = (call_args_owned != NULL);
+                int adecl = call_cargc; int adcf = call_cfirst;   /* the declared shape — see the generator create */
                 call_cfirst = 0; call_cargc = -1;   /* read + reset, as TAKE_CALL_SHAPE does for every other call */
-                for (i = tramp_first; i < call_argc; i++) JS_FreeValue(ctx, call_argv[i]);
-                if (call_args_owned) { js_free(ctx, call_args_owned); call_args_owned = NULL; call_args_owned_n = 0; }
+                CREATE_RELEASE_OPERANDS(adecl, adcf);
                 atf2->up = tf_top;
                 atf2->caller_sf = sf; atf2->caller_b = b; atf2->caller_ctx = ctx;
                 atf2->caller_local_buf = local_buf; atf2->caller_stack_buf = stack_buf;
@@ -27031,7 +27065,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 atf2->caller_argc = argc; atf2->caller_argv = argv;
                 atf2->caller_arg_allocated_size = arg_allocated_size;
                 atf2->seq_req = acreate_cont; atf2->seq_req_kind = acreate_cont_kind;
-                atf2->caller_sp = agowned ? sp : (call_argv + tramp_first);
+                atf2->caller_sp = CREATE_CALLER_SP(adecl, adcf);
                 atf2->call_first = -1; atf2->call_argc = 0; atf2->is_tail = tramp_is_tail;
                 atf2->async_data = NULL; atf2->gen_data = NULL; atf2->gen_magic = 0;
                 atf2->cont_state = s; atf2->cont_kind = CONT_AGEN_CREATE;
@@ -27294,10 +27328,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    declares it, an opcode's does not — and the shape must be CONSUMED here, not left standing: it
                    is resolved per call, so a shape that outlives this one is read by whatever this frame calls
                    next. Leaving it set made `[1].find(genFn)` corrupt the following `sort`. */
-                bool gowned = (call_args_owned != NULL);
+                /* WHERE the caller's sp goes back to, and WHAT of the caller's stack this call owns — the same
+                   two facts do_tramp_call reads out of the declared shape, expressed the same way. `call_argv +
+                   tramp_first` is right only for an UNSET shape, which is the statement that the operands ARE the
+                   caller's stack. A DECLARED shape says they are somewhere else — an owned heap list, or a
+                   continuation's OWN request buffer (`gp->cb`, where a Proxy trap's and an accessor's arguments
+                   live) — and names, separately, the caller-stack slots the original call left behind. Testing
+                   call_args_owned covered only the owned-list half, so an accessor getter that was a generator
+                   function resumed its caller with an sp pointing into the machine's own state. */
+                int gdecl = call_cargc; int gdcf = call_cfirst;
                 call_cfirst = 0; call_cargc = -1;   /* read + reset, as TAKE_CALL_SHAPE does for every other call */
-                for (i = tramp_first; i < call_argc; i++) JS_FreeValue(ctx, call_argv[i]);   /* free func(+this)+args (dup'd into s) */
-                if (call_args_owned) { js_free(ctx, call_args_owned); call_args_owned = NULL; call_args_owned_n = 0; }
+                CREATE_RELEASE_OPERANDS(gdecl, gdcf);
                 gtf->up = tf_top;
                 gtf->caller_sf = sf; gtf->caller_b = b; gtf->caller_ctx = ctx;
                 gtf->caller_local_buf = local_buf; gtf->caller_stack_buf = stack_buf;
@@ -27306,7 +27347,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 gtf->caller_var_refs = var_refs;
                 gtf->caller_argc = argc; gtf->caller_argv = argv;
                 gtf->caller_arg_allocated_size = arg_allocated_size;
-                gtf->caller_sp = gowned ? sp : (call_argv + tramp_first);   /* below func(+this)+args; the generator object goes here (or the cont re-enters the step, popping to here) */
+                gtf->caller_sp = CREATE_CALLER_SP(gdecl, gdcf);   /* the generator object goes here (or the cont re-enters the step, popping to here) */
                 gtf->call_first = -1; gtf->call_argc = 0; gtf->is_tail = gcreate_cont ? 0 : tramp_is_tail;
                 gtf->async_data = NULL;
                 /* 0xFF = CREATING (run-to-initial_yield), not a GEN_MAGIC. cont (flatMap inner): the settle stores the
@@ -28740,10 +28781,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     call_argv = sp; call_argc = 0; tramp_first = -2; tramp_is_tail = 0;
                     tramp_cont_forof = offset;   /* rides the frame; sp is restored to here before it is used */
                     tramp_cont_state = NULL; tramp_cont_kind = CONT_FOROF_NEXT;
-                    /* the split is the FRAME KIND, not whether to suspend: a bytecode body gets a heap frame,
-                       and everything else — a C builtin's next, a bound one, a proxy, a step machine — goes to
-                       the one convergence point that answers every other question about a callee. */
-                    if (tramp_can_call(nextv)) goto do_tramp_call;
+                    /* the FRAME KIND is the convergence point's question — a bytecode body, a generator
+                       function used as `next`, a C builtin's next, a bound one, a proxy, a step machine — and it
+                       is asked there, once. */
                     goto do_generic_callee;
                 }
             }
@@ -29091,7 +29131,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     call_argv = sp; call_argc = 1; tramp_first = -2; tramp_is_tail = 0;
                     *sp++ = js_dup(argv0);    /* the resume argument IteratorNext forwards */
                     tramp_cont_state = NULL; tramp_cont_kind = CONT_ITER_NEXT_OP;
-                    if (tramp_can_call(nextv)) goto do_tramp_call;
                     goto do_generic_callee;
                 }
             }
@@ -29234,12 +29273,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 get_field_slow_path:
                     sf->cur_pc = pc;
                     if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) {
-                        JSObject *g = tramp_bytecode_getter(JS_VALUE_GET_OBJ(sp[-1]), atom);
+                        JSObject *g = tramp_accessor_getter(rt, JS_VALUE_GET_OBJ(sp[-1]), atom);
                         if (g) {
                             *sp++ = js_dup(JS_MKPTR(JS_TAG_OBJECT, g));
                             call_argv = sp; call_argc = 0;
                             tramp_first = -2; tramp_is_tail = 0;
-                            goto do_tramp_call;
+                            goto do_generic_callee;
                         }
                     }
                     val = JS_GetPropertyInternal(ctx, obj, atom, sp[-1], false);
@@ -29310,13 +29349,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 get_field2_slow_path:
                     sf->cur_pc = pc;
                     if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) {
-                        JSObject *g = tramp_bytecode_getter(JS_VALUE_GET_OBJ(sp[-1]), atom);
+                        JSObject *g = tramp_accessor_getter(rt, JS_VALUE_GET_OBJ(sp[-1]), atom);
                         if (g) {   /* bytecode getter -> 0-arg method call; obj STAYS on the stack (get_field2) */
                             *sp++ = js_dup(sp[-1]);   /* `this` copy on top of the retained receiver */
                             *sp++ = js_dup(JS_MKPTR(JS_TAG_OBJECT, g));   /* stack: [receiver][this][getter] */
                             call_argv = sp; call_argc = 0;
                             tramp_first = -2; tramp_is_tail = 0;
-                            goto do_tramp_call;   /* do_return pops this+getter, pushes value -> [receiver][value] */
+                            goto do_generic_callee;   /* do_return pops this+getter, pushes value -> [receiver][value] */
                         }
                     }
                     val = JS_GetPropertyInternal(ctx, obj, atom, sp[-1], false);
@@ -29651,14 +29690,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             goto do_getprop_tramp;
                         }
                     } else {
-                        JSObject *g = tramp_bytecode_getter(JS_VALUE_GET_OBJ(sp[-2]), katom);
+                        JSObject *g = tramp_accessor_getter(rt, JS_VALUE_GET_OBJ(sp[-2]), katom);
                         JS_FreeAtom(ctx, katom);
                         if (g) {   /* obj[key] resolves to a bytecode getter -> 0-arg method call on THIS chain */
                             JS_FreeValue(ctx, sp[-1]);   /* the key is consumed */
                             sp[-1] = js_dup(JS_MKPTR(JS_TAG_OBJECT, g));   /* stack: [receiver][getter] */
                             call_argv = sp; call_argc = 0;
                             tramp_first = -2; tramp_is_tail = 0;
-                            goto do_tramp_call;   /* do_return pops receiver+getter, pushes value -> [value] */
+                            goto do_generic_callee;   /* do_return pops receiver+getter, pushes value -> [value] */
                         }
                     }
                 }
@@ -29719,7 +29758,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             goto do_getprop_tramp;
                         }
                     } else {
-                        JSObject *g = tramp_bytecode_getter(JS_VALUE_GET_OBJ(sp[-2]), katom);
+                        JSObject *g = tramp_accessor_getter(rt, JS_VALUE_GET_OBJ(sp[-2]), katom);
                         JS_FreeAtom(ctx, katom);
                         if (g) {
                             DCHECK(sp + 1 <= TRAMP_SP_LIMIT(sf),
@@ -29730,7 +29769,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             sp++;
                             call_argv = sp; call_argc = 0;
                             tramp_first = -2; tramp_is_tail = 0;
-                            goto do_tramp_call;   /* do_return drops receiver+getter, lands the value at sp[-1] */
+                            goto do_generic_callee;   /* do_return drops receiver+getter, lands the value at sp[-1] */
                         }
                     }
                 }
@@ -29819,7 +29858,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             goto do_getprop_tramp;
                         }
                     } else {
-                        JSObject *g = tramp_bytecode_getter(JS_VALUE_GET_OBJ(sp[-2]), atom);
+                        JSObject *g = tramp_accessor_getter(rt, JS_VALUE_GET_OBJ(sp[-2]), atom);
                         if (g) {
                             JS_FreeAtom(ctx, atom);
                             JS_FreeValue(ctx, sp[-1]);
@@ -29828,7 +29867,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             sp--;
                             call_argv = sp; call_argc = 0;
                             tramp_first = -2; tramp_is_tail = 0;
-                            goto do_tramp_call;   /* drops this+getter, lands the value at sp[-3] of the original */
+                            goto do_generic_callee;   /* drops this+getter, lands the value at sp[-3] of the original */
                         }
                     }
                 }
@@ -31213,9 +31252,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             tramp_step_chain_free(ctx, gtf->cont_state);
         }
         /* and the machine that REQUESTED this generator by calling its function, if the throw came from the params
-           and the generator never existed. Same obligation, same teardown; every gen frame defines the field, so
-           this is read unconditionally rather than guarded by which kind of gen frame it is. */
-        js_create_requester_abandon(ctx, gtf->seq_req, gtf->seq_req_kind);
+           and the generator never existed. Same obligation; every gen frame defines the field, so it is read
+           unconditionally rather than guarded by which kind of gen frame it is. It is DISCHARGED after the pop,
+           because a keyed property operation's teardown is a label that unwinds through the caller's stack. */
+        { void *gseq = gtf->seq_req; uint8_t gseq_kind = gtf->seq_req_kind;
+          gtf->seq_req = NULL; gtf->seq_req_kind = CONT_NONE;
+          gen_unwind_seq_req = gseq; gen_unwind_seq_kind = gseq_kind; }
         /* CONT_PROMISE_ALL: handled AFTER the frame pop — the throw REJECTS the aggregate promise (not propagates). */
         sf->cur_sp = sp;   /* the body frame is "running" (cur_sp NULL); restore it so async_func_free can tear down */
         free_generator_stack_rt(rt, gtf->gen_data);
@@ -31261,6 +31303,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             cont_st = afs_throw;
             goto do_async_from_sync_abrupt;
         }
+        if (gen_unwind_seq_req) {
+            void *gsq = gen_unwind_seq_req; uint8_t gsk = gen_unwind_seq_kind;
+            gen_unwind_seq_req = NULL; gen_unwind_seq_kind = CONT_NONE;
+            if (gsk == CONT_GETPROP) { cont_st = gsq; goto do_getprop_abandon; }   /* its own teardown, one of it */
+            js_create_requester_abandon(ctx, gsq, gsk);
+        }
         goto exception;   /* re-raise the pending exception in the caller */
     }
     /* uncaught while BINDING an async generator's params (the object does not exist yet). This frame's buffers
@@ -31272,11 +31320,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         TrampFrame *ctf2 = tf_top;
         JSValue afn2 = ctf2->async_promise;
         sf->cur_sp = sp;                                  /* the body frame was RUNNING (cur_sp NULL) */
-        /* a SEQUENCE asked for this async generator and the params threw before it existed: the machine can never
-           be re-entered, so it is abandoned here — the same obligation the generator unwind discharges for its own
-           cont, through the same teardown, and the reason the requester is a FIELD rather than a value the pop
-           would forget. */
-        js_create_requester_abandon(ctx, ctf2->seq_req, ctf2->seq_req_kind);
+        /* a machine asked for this async generator and the params threw before it existed: it can never be
+           re-entered, so it is abandoned — the same obligation the generator unwind discharges, after the pop for
+           the same reason, and the reason the requester is a FIELD rather than a value the pop would forget. */
+        gen_unwind_seq_req = ctf2->seq_req; gen_unwind_seq_kind = ctf2->seq_req_kind;
+        ctf2->seq_req = NULL; ctf2->seq_req_kind = CONT_NONE;
         js_async_generator_free(rt, (JSAsyncGeneratorData *)ctf2->cont_state);
         JS_FreeValue(ctx, afn2);                          /* the held function ref */
         rt->current_stack_frame = ctf2->caller_sf;
@@ -31290,6 +31338,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         arg_allocated_size = ctf2->caller_arg_allocated_size;
         pc = sf->cur_pc; sp = ctf2->caller_sp;
         js_free_rt(rt, ctf2);
+        if (gen_unwind_seq_req) {
+            void *asq = gen_unwind_seq_req; uint8_t ask = gen_unwind_seq_kind;
+            gen_unwind_seq_req = NULL; gen_unwind_seq_kind = CONT_NONE;
+            if (ask == CONT_GETPROP) { cont_st = asq; goto do_getprop_abandon; }
+            js_create_requester_abandon(ctx, asq, ask);
+        }
         goto exception;
     }
     /* uncaught in THIS frame: if trampolined, pop to the caller + re-raise there (its stack still holds the
