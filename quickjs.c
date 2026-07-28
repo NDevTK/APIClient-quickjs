@@ -25314,9 +25314,52 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        js_proxy_get / _set / _has / _delete_property spell it — so the trap is looked up once. */
                     bool fwd = !JS_IsUninitialized(gp_fwd);
                     if (gp_op == GP_HAS) {
-                        int hres = JS_HasProperty(ctx, fwd ? gp_fwd : gp_obj, gp_atom);
+                        /* 10.1.7 OrdinaryHasProperty, ONE PROTO LEVEL AT A TIME. The object here is not a Proxy —
+                           that branch is above — so its [[GetOwnProperty]] and [[GetPrototypeOf]] invoke nothing,
+                           whatever exotic class it is. The PARENT can be a Proxy though, and step 4's
+                           `parent.[[HasProperty]](P)` is then its `has` trap: JS_HasProperty walked the whole
+                           chain from C and reached that trap there, so `"k" in Object.create(proxy)` ran a
+                           looping trap with no flow base. Re-entering this very entry with the parent makes the
+                           trap the operand of a request, exactly as it is when the proxy is the object itself. */
+                        JSValueConst hobj = fwd ? gp_fwd : gp_obj;
+                        JSPropertyDescriptor hd;
+                        JSObject *hp = JS_VALUE_GET_OBJ(hobj);
+                        const JSClassExoticMethods *hem = hp->is_exotic ? rt->class_array[hp->class_id].exotic : NULL;
+                        int hres;
+                        DCHECK(hp->class_id != JS_CLASS_PROXY,
+                               "a Proxy reaches the trap branch above, never the ordinary walk");
+                        if (hem && hem->has_property) {
+                            /* the class defines its OWN [[HasProperty]] — a module namespace answers from
+                               [[Exports]] (10.4.6.4) and must not read the binding, which is what makes an
+                               uninitialized export report `true` instead of throwing its TDZ ReferenceError.
+                               Its own algorithm, so it stops here rather than walking. */
+                            hres = hem->has_property(ctx, hobj, gp_atom);
+                            if (unlikely(hres < 0)) goto getprop_throw;
+                            ret_val = js_bool(hres);
+                            goto do_has_answered;
+                        }
+                        hres = JS_GetOwnPropertyInternal(ctx, &hd, hp, gp_atom);
                         if (unlikely(hres < 0)) goto getprop_throw;
-                        ret_val = js_bool(hres);
+                        if (hres) {
+                            js_free_desc(ctx, &hd);
+                            ret_val = JS_TRUE;
+                        } else if (is_typed_array(hp->class_id)
+                                   && (hres = JS_AtomIsNumericIndex(ctx, gp_atom)) != 0) {
+                            /* 10.4.5.2: an INTEGER-INDEXED exotic object's [[HasProperty]] is NOT
+                               OrdinaryHasProperty — for a canonical numeric index the answer IS
+                               IsValidIntegerIndex and the prototype chain is never consulted. A different
+                               algorithm, so it stops here rather than walking. */
+                            if (unlikely(hres < 0)) goto getprop_throw;
+                            ret_val = JS_FALSE;
+                        } else if (hp->shape->proto) {
+                            gp_obj = JS_MKPTR(JS_TAG_OBJECT, hp->shape->proto);
+                            gp_recv = gp_recv_r; gp_no_throw = gp_nothrow_r;
+                            if (gp_trapst) { js_trapget_free(ctx, gp_trapst); gp_trapst = NULL; }
+                            goto do_getprop_tramp;
+                        } else {
+                            ret_val = JS_FALSE;
+                        }
+                    do_has_answered: ;
                     } else if (gp_op == GP_DELETE && gp_nothrow_r) {
                         /* the bare [[Delete]]: its boolean IS the answer. */
                         int dres = JS_DeleteProperty(ctx, fwd ? gp_fwd : gp_obj, gp_atom, 0);
@@ -31292,8 +31335,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                no proxy algorithm of its own. It used to: js_tramp_proxy_has read the trap from C and routed only
                a BYTECODE trap, dropping a C, bound, proxied or step-machine one back to js_proxy_has's JS_Call
                loop — one operator answering differently depending on what the trap happened to be. */
-            if (unlikely(JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT
-                         && JS_VALUE_GET_OBJ(sp[-1])->class_id == JS_CLASS_PROXY)) {
+            if (unlikely(JS_VALUE_GET_TAG(sp[-1]) != JS_TAG_OBJECT)) {
+                JS_ThrowTypeError(ctx, "invalid 'in' operand");
+                goto exception;
+            }
+            {
+                /* EVERY object, not just a Proxy. Narrowing to one was a recognizer selecting a C fallback:
+                   js_operator_in walks the whole prototype chain with JS_HasProperty, so a trap anywhere ABOVE an
+                   ordinary object ran there — `"k" in Object.create(proxy)` is the shape, and it is the ordinary
+                   way to put a proxy in a chain. The entry answers a non-proxy object one proto level at a time
+                   and re-enters itself for the parent, so the trap is reached as the OBJECT of a request. */
                 JSOpKeyed *ok;
                 JSAtom katom = JS_ValueToAtom(ctx, sp[-2]);   /* ToPropertyKey, before the trap sees the key */
                 if (unlikely(katom == JS_ATOM_NULL)) goto exception;
@@ -31305,10 +31356,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 gp_outer = ok; gp_outer_kind = CONT_OP_KEYED;
                 goto do_getprop_tramp;
             }
-            if (js_operator_in(ctx, sp))
-                goto exception;
-            sp--;
-            BREAK;
         CASE(OP_private_in):
             if (js_operator_private_in(ctx, sp))
                 goto exception;
