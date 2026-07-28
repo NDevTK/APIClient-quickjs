@@ -23702,6 +23702,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 ntf->arg_allocated = narg_alloc; ntf->callee_argc = eff_argc;
                 ntf->async_data = NULL; ntf->async_promise = JS_UNDEFINED; ntf->gen_data = NULL;
                 ntf->cont_state = cs; ntf->cont_kind = CONT_CONSTRUCT;
+                ntf->forof_off = 0;   /* a CONSTRUCT is never a for-of drive; do_return reads this field for every
+                                         frame, so leaving it unset was an uninitialized read, not a don't-care */
                 sf = nsf; b = nb; ctx = nb->realm;
                 arg_buf = narg_buf; var_buf = nvar_buf; stack_buf = nstack_buf;
                 var_refs = np->u.func.var_refs;
@@ -23883,7 +23885,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 ntf->this_val = this_obj; ntf->new_target = new_target;
                 ntf->arg_allocated = narg_alloc; ntf->callee_argc = eff_argc;
                 ntf->async_data = NULL; ntf->async_promise = JS_UNDEFINED; ntf->gen_data = NULL;
-                ntf->cont_state = NULL; ntf->cont_kind = CONT_NONE;
+                /* ADOPT the requester here too. This frame is an ordinary bytecode frame, so do_return's delivery
+                   already knows what to do with one; hardcoding NULL only meant that if a machine ever asked for
+                   a call the APPLY entry resolved, its continuation would be dropped exactly as the async frame's
+                   was — silently, and with the result pushed onto a stack expecting nothing. Adopting costs
+                   nothing and removes the question. */
+                ntf->cont_state = tramp_cont_state; ntf->cont_kind = tramp_cont_kind;
+                tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;
+                ntf->forof_off = tramp_cont_forof; tramp_cont_forof = 0;
                 sf = nsf; b = nb; ctx = nb->realm;
                 arg_buf = narg_buf; var_buf = nvar_buf; stack_buf = nstack_buf;
                 var_refs = np->u.func.var_refs;
