@@ -20538,6 +20538,12 @@ typedef struct JSIterConsume {
                               The operand shape cannot answer this — a PROXIED .next() is reshaped to the trap's
                               five operands — so the machine that asked records what it asked for. */
     JSValue cb_value;   /* ITERTERM: the element held across a callback that runs on the tramp (owned) */
+    /* IteratorComplete + IteratorValue (7.4.4 / 7.4.5): `Get(res, "done")` and `Get(res, "value")` on the
+       RESULT OBJECT, which a page's own iterator can make an accessor or a Proxy — so both are page code and the
+       step read them with JS_GetProperty from C. They are requests now, one phase each, with the result object
+       parked here because a request suspends the flow. */
+    JSValue iter_res;   /* the iterator result being unpacked (owned) */
+    uint8_t iterres_ph; /* 0 = none, 1 = the `done` read is in flight, 2 = the `value` read is */
     uint8_t abrupt;  /* 1 = the sink completed ABRUPTLY with an exception pending. It returns 2 so the shared
                         close-then-finish runs IteratorClose (spec IfAbruptCloseIterator), and the close must
                         PRESERVE the pending exception rather than replace it; the next step then propagates.
@@ -20600,6 +20606,7 @@ static void sum_precise_init(SumPreciseState *s);
 static void sum_precise_add(SumPreciseState *s, double d);
 static double sum_precise_get_result(SumPreciseState *s);
 #define ITERCONS_OWNED(F) F(r) F(iter) F(next) F(adder) F(mapfn) F(mapfn_this) F(cb_value) F(ta_target) \
+                          F(iter_res) \
                           F(ent_obj) F(ent_key) F(ent_val) F(from_ctor) F(super_ref) \
                           F(setlike) F(setrec_keys) F(setrec_has)
 /* NOTE: JSIteratorHelperData::cb_value is owned too — freed by the finalizer and cleared on every path below. */
@@ -26642,6 +26649,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                "a TypedArray source longer than an int atom can name — build the heap-atom read");
                         gp_obj = s->r;
                         gp_atom = __JS_AtomFromUInt32((uint32_t)s->ta_k);
+                    } else if (s->iterres_ph) {
+                        /* IteratorComplete / IteratorValue on the result object. */
+                        gp_obj = s->iter_res;
+                        gp_atom = (s->iterres_ph == 1) ? JS_ATOM_done : JS_ATOM_value;
                     } else {
                         DCHECK(s->ent_pending, "the consume machine's indexed-read arm was entered with no read in flight");
                         gp_obj = s->ent_obj;
@@ -57213,12 +57224,52 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
             s->r = js_bool(s->k != 0);
         return 0;
     }
-    if (JS_VALUE_GET_TAG(res) != JS_TAG_UNINITIALIZED) {
-        JSValue done_val = JS_GetProperty(ctx, res, JS_ATOM_done);
+    if (JS_VALUE_GET_TAG(res) != JS_TAG_UNINITIALIZED || s->iterres_ph) {
         int done;
         JSValue value;
-        if (JS_IsException(done_val)) { JS_FreeValue(ctx, res); return -1; }
-        done = JS_ToBoolFree(ctx, done_val);
+        if (s->iterres_ph == 0) {
+            /* 7.4.2 step 3: IteratorNext throws if the result is not an Object — enforced HERE, explicitly. It
+               used to happen by accident: `Get(res, "done")` on a primitive threw "cannot read property of
+               undefined", which is the right ERROR from the wrong step, and ten
+               `this-non-callable-next` / `iterator-not-closed-for-uncallable-next` tests were passing on it. Once
+               the read became a request that accident was gone — a request on a primitive answers undefined
+               rather than throwing — so the step the spec actually states has to be written down. It is a
+               non-object result, not an abrupt one, so it returns -1 (no IteratorClose), which is what those
+               `not_closed` tests pin. */
+            if (JS_IsException(res)) return -1;
+            if (!JS_IsObject(res)) {
+                JS_FreeValue(ctx, res);
+                JS_ThrowTypeError(ctx, "iterator result not an object");
+                return -1;
+            }
+            /* IteratorComplete's `Get(res, "done")` is the page's code on a hand-written iterator, so it is a
+               request. The result object parks here for it and for the value read after. */
+            DCHECK(JS_IsUndefined(s->iter_res), "the consume machine is already unpacking a result");
+            s->iter_res = res;
+            s->iterres_ph = 1;
+            return 6;
+        }
+        if (s->iterres_ph == 1) {
+            /* `res` is the `done` property. 7.4.4 is ToBoolean of it. */
+            done = JS_ToBoolFree(ctx, res);
+            if (!done) {
+                s->iterres_ph = 2;   /* IteratorValue's `Get(res, "value")`, likewise */
+                return 6;
+            }
+            res = s->iter_res; s->iter_res = JS_UNDEFINED;
+            s->iterres_ph = 0;
+            goto iterres_done;
+        }
+        /* iterres_ph == 2: `res` is the `value` property. */
+        value = res;
+        JS_FreeValue(ctx, s->iter_res); s->iter_res = JS_UNDEFINED;
+        s->iterres_ph = 0;
+        res = JS_UNDEFINED;
+        done = 0;
+        goto iterres_have_value;
+    iterres_done:
+        done = 1;
+        value = JS_UNDEFINED;
         if (done) {   /* iterator exhausted: s->r is complete */
             JS_FreeValue(ctx, res);
             /* The record is [[Done]] from here on, so IfAbruptCloseIterator no longer applies to ANYTHING that
@@ -57266,9 +57317,9 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
             }
             return 0;
         }
-        value = JS_GetProperty(ctx, res, JS_ATOM_value);
+    iterres_have_value:
         JS_FreeValue(ctx, res);
-        if (JS_IsException(value)) return -1;
+        res = JS_UNDEFINED;
         if (s->sink == ITERCONS_SUMPRECISE) {
             /* Math.sumPrecise: the element MUST already be a Number — the spec does no coercion, and a non-number
                is an IfAbruptCloseIterator TypeError (return 2 so the shared close runs before it propagates). */
