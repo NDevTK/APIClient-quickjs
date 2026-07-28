@@ -17265,80 +17265,13 @@ static JSValue JS_GetIterator(JSContext *ctx, JSValueConst obj, bool is_async)
 }
 
 /* return *pdone = 2 if the iterator object is not parsed */
-static JSValue JS_IteratorNext2(JSContext *ctx, JSValueConst enum_obj,
-                                JSValueConst method,
-                                int argc, JSValueConst *argv, int *pdone)
-{
-    JSValue obj;
 
-    /* fast path for the built-in iterators (avoid creating the
-       intermediate result object) */
-    if (JS_IsObject(method)) {
-        JSObject *p = JS_VALUE_GET_OBJ(method);
-        if (p->class_id == JS_CLASS_C_FUNCTION &&
-            p->u.cfunc.cproto == JS_CFUNC_iterator_next) {
-            JSCFunctionType func;
-            JSValueConst args[1];
-
-            /* in case the function expects one argument */
-            if (argc == 0) {
-                args[0] = JS_UNDEFINED;
-                argv = args;
-            }
-            func = p->u.cfunc.c_function;
-            return func.iterator_next(ctx, enum_obj, argc, argv,
-                                      pdone, p->u.cfunc.magic);
-        }
-    }
-    obj = JS_Call(ctx, method, enum_obj, argc, argv);
-    if (JS_IsException(obj))
-        goto fail;
-    if (!JS_IsObject(obj)) {
-        JS_FreeValue(ctx, obj);
-        JS_ThrowTypeError(ctx, "iterator must return an object");
-        goto fail;
-    }
-    *pdone = 2;
-    return obj;
- fail:
-    *pdone = false;
-    return JS_EXCEPTION;
-}
-
-static JSValue JS_IteratorNext(JSContext *ctx, JSValueConst enum_obj,
-                               JSValueConst method,
-                               int argc, JSValueConst *argv, int *pdone)
-{
-    JSValue obj, value, done_val;
-    int done;
-
-    obj = JS_IteratorNext2(ctx, enum_obj, method, argc, argv, &done);
-    if (JS_IsException(obj))
-        goto fail;
-    if (likely(done == 0)) {
-        *pdone = false;
-        return obj;
-    } else if (done != 2) {
-        JS_FreeValue(ctx, obj);
-        *pdone = true;
-        return JS_UNDEFINED;
-    } else {
-        done_val = JS_GetProperty(ctx, obj, JS_ATOM_done);
-        if (JS_IsException(done_val))
-            goto fail;
-        *pdone = JS_ToBoolFree(ctx, done_val);
-        value = JS_UNDEFINED;
-        if (!*pdone) {
-            value = JS_GetProperty(ctx, obj, JS_ATOM_value);
-        }
-        JS_FreeValue(ctx, obj);
-        return value;
-    }
- fail:
-    JS_FreeValue(ctx, obj);
-    *pdone = false;
-    return JS_EXCEPTION;
-}
+/* DELETED: JS_IteratorNext. It was the C-side IteratorNext — Call(nextMethod, iterator) plus
+   IteratorComplete/IteratorValue — and its callers were the .next() loops that have all been replaced by
+   flows on the tramp: the Promise combinators, js_array_from_iterator, the async-from-sync wrapper, the
+   iterator-helper walk, js_for_of_next. JS_IteratorNext2, the raw Call underneath it, went with its last caller
+   (js_async_from_sync_iterator_next). Nothing performs IteratorNext from C any more: every .next() in the engine
+   is a call the interpreter makes, on the tramp, where a body with a loop in it can park. */
 
 /* return < 0 in case of exception */
 static int JS_IteratorClose(JSContext *ctx, JSValueConst enum_obj,
@@ -25535,16 +25468,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        receiver, which is why this is a phase and not a finish. A bytecode constructor runs its body
                        on THIS chain (the outer continuation feeds the object back to this step); a C constructor has
                        no body to suspend and is constructed in place. */
-                    JSValue lenv = js_int64(s->k);
+                    JSValue lenv;
                     s->ta_phase = 2;   /* whichever way it settles, the next entry ADOPTS the object + validates */
                     if (tramp_can_construct(s->adder)) {
+                        /* the argument goes in an OWNED one-element list, not a block-local: the `goto` leaves
+                           this scope while con_args still points at it, and the constructor's frame setup reads
+                           it afterwards — a stack-use-after-scope that ASan sees and -O1 happens to survive. */
+                        JSValue *lenl = js_malloc(ctx, sizeof(JSValue));
+                        if (unlikely(!lenl)) { js_iter_consume_end(ctx, s); js_free_rt(rt, s); goto exception; }
+                        lenl[0] = js_int64(s->k);
                         con_func = s->adder; con_ntgt = s->adder;
-                        con_args = vc(&lenv); con_argc = 1;
+                        con_args = (JSValueConst *)lenl; con_argc = 1; con_args_owned = lenl;
                         con_from_super = 0; con_super_ref = JS_UNDEFINED;
                         con_outer = s; con_outer_kind = CONT_ITER_CONSUME;
                         tramp_first = 0; tramp_is_tail = 0;   /* no operands pushed: do_return frees nothing */
                         goto do_construct_tramp;              /* settle -> do_iter_consume_step with the object */
                     }
+                    lenv = js_int64(s->k);
                     ret_val = JS_CallConstructor(ctx, s->adder, 1, vc(&lenv));
                     JS_FreeValue(ctx, lenv);
                     if (JS_IsException(ret_val)) { js_iter_consume_end(ctx, s); js_free_rt(rt, s); goto exception; }
@@ -54993,6 +54933,13 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
         done = JS_ToBoolFree(ctx, done_val);
         if (done) {   /* iterator exhausted: s->r is complete */
             JS_FreeValue(ctx, res);
+            /* The record is [[Done]] from here on, so IfAbruptCloseIterator no longer applies to ANYTHING that
+               follows — the finish, and the element-set phase 23.2.5.1 step 5.e runs AFTER IterableToList has
+               already exhausted the source. Holding the iterator past this point made a throwing element
+               coercion call the source's `return`, which the spec never does. Dropping it here is the fact
+               itself: the abrupt arms key on s->iter being present. */
+            JS_FreeValue(ctx, s->iter);  s->iter = JS_UNDEFINED;
+            JS_FreeValue(ctx, s->next);  s->next = JS_UNDEFINED;
             if (s->ta_isfrom) { s->ta_phase = 1; s->ta_k = 0; return 4; }   /* collect done -> 5.c create */
             if (s->ta_classid != 0) {
                 /* 23.2.5.1 step 5.b.ii InitializeTypedArrayFromList: the object was allocated at step 6.a.i, before
@@ -76205,44 +76152,6 @@ static int typed_array_init(JSContext *ctx, JSValue obj, JSValue buffer,
 }
 
 
-static JSValue js_array_from_iterator(JSContext *ctx, uint32_t *plen,
-                                      JSValueConst obj, JSValueConst method)
-{
-    JSValue arr, iter, next_method = JS_UNDEFINED, val;
-    int done;
-    uint32_t k;
-
-    *plen = 0;
-    arr = JS_NewArray(ctx);
-    if (JS_IsException(arr))
-        return arr;
-    iter = JS_GetIterator2(ctx, obj, method);
-    if (JS_IsException(iter))
-        goto fail;
-    next_method = JS_GetProperty(ctx, iter, JS_ATOM_next);
-    if (JS_IsException(next_method))
-        goto fail;
-    k = 0;
-    for(;;) {
-        val = JS_IteratorNext(ctx, iter, next_method, 0, NULL, &done);
-        if (JS_IsException(val))
-            goto fail;
-        if (done)
-            break;
-        if (JS_CreateDataPropertyUint32(ctx, arr, k, val, JS_PROP_THROW) < 0)
-            goto fail;
-        k++;
-    }
-    JS_FreeValue(ctx, next_method);
-    JS_FreeValue(ctx, iter);
-    *plen = k;
-    return arr;
- fail:
-    JS_FreeValue(ctx, next_method);
-    JS_FreeValue(ctx, iter);
-    JS_FreeValue(ctx, arr);
-    return JS_EXCEPTION;
-}
 
 /* AllocateTypedArrayBuffer(O, len) — 23.2.5.1's second half. The OBJECT is allocated earlier (step 6.a.i, before
    @@iterator is even read), and only its BUFFER waits for the length, so the two are separate operations here too.
@@ -76256,57 +76165,21 @@ static int js_typed_array_alloc_len(JSContext *ctx, JSValueConst obj, int classi
     return typed_array_init(ctx, obj, buffer, 0, len, /*track_rab*/false);
 }
 
+/* 23.2.5.1 steps 5-6, `new TypedArray(object)`, has NO body left here. Both of its algorithms — the iterable
+   one (step 5: GetIterator, collect, then element-set) and the array-like one (step 6: LengthOfArrayLike, then
+   element-set) — run on the consume machine, chosen by the acquire from the real GetMethod rather than by a
+   probe, and every construct spelling reaches it: `new TA(x)`, a subclass's super(), Reflect.construct with a
+   new.target, a bound ctor, a proxied one, and a spread.
+   What is gone with it is js_array_from_iterator: a `for(;;) JS_IteratorNext` collect in a C activation with no
+   flow base, so an argument whose .next() contains a loop aborted at its back-edge. It was the last of those
+   loops. Reaching this entry means a construct site was not routed; there is no second driver. */
 static JSValue js_typed_array_constructor_obj(JSContext *ctx,
                                               JSValueConst new_target,
                                               JSValueConst obj,
                                               int classid)
 {
-    JSValue iter, ret, arr = JS_UNDEFINED, val, buffer;
-    uint32_t i;
-    int size_log2;
-    int64_t len;
-
-    size_log2 = typed_array_size_log2(classid);
-    ret = js_create_from_ctor(ctx, new_target, classid);
-    if (JS_IsException(ret))
-        return JS_EXCEPTION;
-
-    iter = JS_GetProperty(ctx, obj, JS_ATOM_Symbol_iterator);
-    if (JS_IsException(iter))
-        goto fail;
-    if (!JS_IsUndefined(iter) && !JS_IsNull(iter)) {
-        uint32_t len1;
-        arr = js_array_from_iterator(ctx, &len1, obj, iter);
-        JS_FreeValue(ctx, iter);
-        if (JS_IsException(arr))
-            goto fail;
-        len = len1;
-    } else {
-        if (js_get_length64(ctx, &len, obj))
-            goto fail;
-        arr = js_dup(obj);
-    }
-
-    buffer = js_array_buffer_constructor1(ctx,
-                                          len << size_log2,
-                                          NULL);
-    if (JS_IsException(buffer))
-        goto fail;
-    if (typed_array_init(ctx, ret, buffer, 0, len, /*track_rab*/false))
-        goto fail;
-
-    for(i = 0; i < len; i++) {
-        val = JS_GetPropertyUint32(ctx, arr, i);
-        if (JS_IsException(val))
-            goto fail;
-        if (JS_SetPropertyUint32(ctx, ret, i, val) < 0)
-            goto fail;
-    }
-    JS_FreeValue(ctx, arr);
-    return ret;
- fail:
-    JS_FreeValue(ctx, arr);
-    JS_FreeValue(ctx, ret);
+    DFAIL("new TypedArray(object) reached its C entry — route that construct site onto the consume machine "
+          "(do_consumer_dispatch / do_construct_dispatch); there is no second driver");
     return JS_EXCEPTION;
 }
 
