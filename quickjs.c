@@ -1457,6 +1457,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_ITER_CONCAT_NEXT, STEPDEF_ITER_CONCAT_RETURN, STEPDEF_ARRAY_ITER_NEXT,
     STEPDEF_OWNKEYS_NAMES, STEPDEF_OWNKEYS_SYMBOLS, STEPDEF_REFLECT_OWNKEYS,
     STEPDEF_OBJ_KEYS, STEPDEF_OBJ_DESCS,
+    STEPDEF_REFLECT_GET, STEPDEF_REFLECT_SET, STEPDEF_REFLECT_HAS, STEPDEF_REFLECT_DELETE,
     /* one per error KIND: a step constructor's magic IS its definition id, so the kind cannot also ride there.
        The block is contiguous and indexed by JSErrorEnum, with JS_PLAIN_ERROR last. */
     STEPDEF_ERROR_CTOR_BASE,
@@ -18060,7 +18061,9 @@ typedef struct JSStepHdr {
        one per suspension point. Every coercing prologue needs exactly this, so it lives in the header rather
        than being re-declared (and mis-declared) in each state. */
     JSValue coerce;
-    JSValue cb_coerce[2];
+    JSValue cb_coerce[3];   /* three, because the BARE [[Set]] request carries [obj, receiver, value] — the
+                               receiver is a separate operand in the spec and a builtin's Set(O,P,V,true) is the
+                               one form that can leave it implicit. */
     uint8_t len_phase, spc_phase, num_phase, str_phase, get_phase, cs_phase, exec_phase;
     /* an ARGUMENT COERCION is outstanding, so an abandon here is the spec's abrupt-completion case (take/drop's
        IfAbruptCloseIterator). It lives on the header because the teardown is what has to act on it, and the
@@ -19262,6 +19265,13 @@ typedef struct JSGetProp {
                             which invariant its result must satisfy and what the machine is handed back; everything
                             else about the request, the dispatch, the delivery and the unwind is identical, which is
                             why they are one continuation and not three. */
+    JSValue recv;        /* the RECEIVER of a [[Get]]/[[Set]] (owned), UNINITIALIZED when it is the object itself.
+                            It is a separate operand in the spec — `Reflect.get(t, k, r)` reads t's accessor with
+                            r as `this` and hands r to the trap — and hardcoding it to the object is why the two
+                            Reflect forms could not be expressed as requests at all. */
+    uint8_t no_throw;    /* 1 = yield the BOOLEAN a [[Set]]/[[Delete]] reports instead of throwing on false. The
+                            spec has both forms — Set(O,P,V,true)/DeletePropertyOrThrow for a builtin that must
+                            succeed, and the bare internal method for Reflect — and the request expresses which. */
     uint8_t nargs;
     JSValue cb[6];       /* [this, fn, args…] — OWNED here, never on the caller's compiler-sized stack. The `set`
                             trap call needs six slots and the frame that invoked the builtin has no obligation to
@@ -19300,6 +19310,7 @@ static JSValue js_proxy_ownkeys_result(JSContext *ctx, JSValueConst proxy, JSVal
 
 static void js_getprop_free(JSContext *ctx, JSGetProp *gp)
 {
+    if (!JS_IsUninitialized(gp->recv)) JS_FreeValue(ctx, gp->recv);
     int i;
     JS_FreeValue(ctx, gp->target);
     JS_FreeValue(ctx, gp->value);
@@ -20759,6 +20770,14 @@ typedef struct JSArrayWith {
    JS_GetProperty from C, so a getter containing a loop drove to completion. Object.keys is NOT part of this
    machine: KIND_KEY never reads a value, so it is a different algorithm with no user code in it at all, not a
    fallback this could absorb — the same split as an array-like versus an iterable. */
+/* Reflect.get / set / has / deleteProperty — the four BARE internal methods, one machine, def->arg = the GP_* op. */
+typedef struct JSReflectProp {
+    JSStepHdr hdr;
+    JSValue obj;      /* argv[0], held across both requests (owned) */
+    JSValue result;   /* what the operation yields (owned) */
+    JSAtom atom;      /* the coerced key (owned) */
+} JSReflectProp;
+
 typedef struct JSPropWalk {
     JSStepHdr hdr;          /* MUST be first: the generic step driver casts the state to JSStepHdr * */
     JSValue obj;            /* ToObject of the source currently being walked (owned) */
@@ -21829,6 +21848,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSValueConst gp_obj = JS_UNDEFINED;                 /* do_getprop_tramp inputs: the receiver, the key, WHICH */
     JSAtom gp_atom = JS_ATOM_NULL;                      /* keyed operation ([[Get]]/[[HasProperty]]/[[Set]]), and */
     uint8_t gp_op = GP_GET;                             /* the result is delivered to. */
+    JSValueConst gp_recv = JS_UNINITIALIZED;            /* [[Get]]/[[Set]] receiver; UNINITIALIZED = the object itself. read+reset at do_getprop_tramp */
+    int gp_no_throw = 0;                                /* 1 = a [[Set]]/[[Delete]] yields its boolean instead of throwing on false. read+reset there */
     JSValueConst gp_val = JS_UNDEFINED;                 /* GP_SET: the value to write (borrowed from the machine) */
     void *gp_outer = NULL;
     uint8_t gp_outer_kind = CONT_NONE;
@@ -24167,6 +24188,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     *sp++ = r;
                     BREAK;
                 }
+                if (st == 13 || st == 14 || st == 15) {
+                    /* the BARE internal methods — [[Get]] (13), [[Set]] (14), [[Delete]] (15) — as opposed to the
+                       Get/Set(O,P,V,true)/DeletePropertyOrThrow the codes above express. Two things differ and
+                       both are spec operands, not conveniences: the RECEIVER is given rather than implied, and a
+                       [[Set]]/[[Delete]] YIELDS its boolean rather than throwing on false. Only Reflect needs
+                       them, which is exactly why they could not be requests before. */
+                    gp_outer = stt; gp_outer_kind = CONT_STEP;
+                    gp_obj = cb[0]; gp_atom = (JSAtom)cbn;
+                    gp_op = (st == 13) ? GP_GET : (st == 14) ? GP_SET : GP_DELETE;
+                    gp_recv = (st == 15) ? JS_UNINITIALIZED : cb[1];
+                    gp_val = (st == 14) ? cb[2] : JS_UNDEFINED;
+                    gp_no_throw = 1;
+                    goto do_getprop_tramp;
+                }
                 if (st == 12) {
                     /* GETOWNPROP: *out_cb is [obj] and *out_argc is the ATOM, like the keyed reads. */
                     gp_outer = stt; gp_outer_kind = CONT_STEP;
@@ -24657,6 +24692,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSGetProp *gp;
                 JSValue method = JS_UNDEFINED, keyval = JS_UNDEFINED, tgt = JS_UNDEFINED, handler = JS_UNDEFINED;
                 JSObject *accessor = NULL;
+                /* read + reset, like every other input: a receiver or a no-throw left standing would apply to
+                   whatever this frame requests next. UNINITIALIZED receiver means "the object itself", which is
+                   what every builtin's Get/Set performs and what the spec's default receiver is. */
+                JSValueConst gp_recv_r = JS_IsUninitialized(gp_recv) ? gp_obj : gp_recv;
+                int gp_nothrow_r = gp_no_throw;
+                gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
                 /* a TRAPLESS proxy forwards to its target, and this label does that forward ITSELF: re-entering
                    the proxy's own [[Get]]/[[Set]]/[[Has]]/[[Delete]] would look the trap up a SECOND time, which
                    a page can observe — the handler in splice/property-traps-order-with-species is itself a Proxy
@@ -24707,6 +24748,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         int hres = JS_HasProperty(ctx, fwd ? gp_fwd : gp_obj, gp_atom);
                         if (unlikely(hres < 0)) goto getprop_throw;
                         ret_val = js_bool(hres);
+                    } else if (gp_op == GP_DELETE && gp_nothrow_r) {
+                        /* the bare [[Delete]]: its boolean IS the answer. */
+                        int dres = JS_DeleteProperty(ctx, fwd ? gp_fwd : gp_obj, gp_atom, 0);
+                        if (unlikely(dres < 0)) goto getprop_throw;
+                        ret_val = js_bool(dres);
+                    } else if (gp_op == GP_SET && gp_nothrow_r) {
+                        /* the bare [[Set]]: likewise, and with the receiver the operation was given. */
+                        int sres = JS_SetPropertyInternal2(ctx, fwd ? gp_fwd : gp_obj, gp_atom, js_dup(gp_val),
+                                                           gp_recv_r, 0);
+                        if (unlikely(sres < 0)) goto getprop_throw;
+                        ret_val = js_bool(sres);
                     } else if (gp_op == GP_DELETE) {
                         /* DeletePropertyOrThrow(O, P): like the write, it yields nothing but its throw. A
                            trapless proxy's own delete passes NO throw flag and reports false, which its caller
@@ -24725,7 +24777,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     } else if (gp_op == GP_SET) {
                         /* Set(O, P, V, true): the write yields nothing to the machine, only its throw. */
                         if (unlikely(JS_SetPropertyInternal2(ctx, fwd ? gp_fwd : gp_obj, gp_atom, js_dup(gp_val),
-                                                             gp_obj, JS_PROP_THROW) < 0))
+                                                             gp_recv_r, JS_PROP_THROW) < 0))
                             goto getprop_throw;
                         ret_val = JS_UNDEFINED;
                     } else if (gp_op == GP_DEFINE) {
@@ -24767,11 +24819,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         }
                         js_free_prop_enum(ctx, ktab, klen);
                         if (unlikely(JS_IsException(ret_val))) goto getprop_throw;
-                    } else if (fwd) {
-                        ret_val = JS_GetPropertyInternal(ctx, gp_fwd, gp_atom, gp_obj, false);
-                        if (unlikely(JS_IsException(ret_val))) goto getprop_throw;
                     } else {
-                        ret_val = JS_GetProperty(ctx, gp_obj, gp_atom);
+                        ret_val = JS_GetPropertyInternal(ctx, fwd ? gp_fwd : gp_obj, gp_atom, gp_recv_r, false);
                         if (unlikely(JS_IsException(ret_val))) goto getprop_throw;
                     }
                     cont_st = gp_outer;                            /* nothing suspended: straight to the machine */
@@ -24812,8 +24861,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 gp->atom = JS_DupAtom(ctx, gp_atom);
                 gp->outer = gp_outer; gp->outer_kind = gp_outer_kind;
                 gp->op = gp_op;
+                gp->no_throw = (uint8_t)gp_nothrow_r;
+                gp->recv = (JS_VALUE_GET_OBJ(gp_recv_r) == JS_VALUE_GET_OBJ(gp_obj)
+                            && JS_VALUE_GET_TAG(gp_recv_r) == JS_VALUE_GET_TAG(gp_obj))
+                           ? JS_UNINITIALIZED : js_dup(gp_recv_r);
                 if (accessor) {
-                    gp->cb[0] = js_dup(gp_obj);                              /* this = the receiver */
+                    gp->cb[0] = js_dup(gp_recv_r);                           /* this = the receiver */
                     gp->cb[1] = js_dup(JS_MKPTR(JS_TAG_OBJECT, accessor));   /* the accessor */
                     if (gp_op == GP_SET) {
                         gp->cb[2] = js_dup(gp_val);                          /* set x(v): one argument */
@@ -24844,10 +24897,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         gp->nargs = 3;
                     } else if (gp_op == GP_SET) {
                         gp->cb[4] = js_dup(gp_val);
-                        gp->cb[5] = js_dup(gp_obj);                          /* receiver IS the proxy */
+                        gp->cb[5] = js_dup(gp_recv_r);                       /* 10.5.9 step 9: the RECEIVER */
                         gp->nargs = 4;
                     } else {
-                        gp->cb[4] = js_dup(gp_obj);                          /* receiver IS the proxy */
+                        gp->cb[4] = js_dup(gp_recv_r);                       /* 10.5.8 step 9: the RECEIVER */
                         gp->nargs = 3;
                     }
                 }
@@ -27245,6 +27298,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            The machine is handed UNDEFINED — a delete has no value to deliver. */
                         int dres = js_proxy_delete_invariant(ctx, gp->target, gp->atom, JS_ToBoolFree(ctx, ret_val));
                         if (dres < 0) ret_val = JS_EXCEPTION;
+                        else if (gp->no_throw) ret_val = js_bool(dres);
                         else if (!dres) { JS_ThrowTypeError(ctx, "proxy: cannot delete property"); ret_val = JS_EXCEPTION; }
                         else ret_val = JS_UNDEFINED;
                     } else if (gp->op == GP_DEFINE) {
@@ -27267,11 +27321,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             int sres = js_proxy_set_invariant(ctx, gp->target, gp->atom, gp->value,
                                                               JS_ToBoolFree(ctx, ret_val));
                             if (sres < 0) ret_val = JS_EXCEPTION;
+                            else if (gp->no_throw) ret_val = js_bool(sres);
                             else if (!sres) { JS_ThrowTypeError(ctx, "proxy: cannot set property"); ret_val = JS_EXCEPTION; }
                             else ret_val = JS_UNDEFINED;
                         } else {
+                            /* a SETTER body: it yields nothing. A bare [[Set]] through one still succeeded. */
                             JS_FreeValue(ctx, ret_val);
-                            ret_val = JS_UNDEFINED;
+                            ret_val = gp->no_throw ? JS_TRUE : JS_UNDEFINED;
                         }
                     } else if (!JS_IsUndefined(gp->target)) {
                         ret_val = js_proxy_get_invariant(ctx, gp->target, gp->atom, ret_val);
@@ -57756,6 +57812,12 @@ static const JSTrampStepDef js_ta_tolocale_def    = { sizeof(JSArrayJoin), js_ar
 static const JSTrampStepDef js_obj_values_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_VALUES };
 static const JSTrampStepDef js_obj_keys_def       = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_KEYS };
 static const JSTrampStepDef js_obj_descs_def      = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_DESCS };
+static int js_reflect_prop_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_reflect_prop_fini(JSContext *ctx, void *st, bool take_result);
+static const JSTrampStepDef js_reflect_get_def    = { sizeof(JSReflectProp), js_reflect_prop_step, js_reflect_prop_fini, GP_GET };
+static const JSTrampStepDef js_reflect_set_def    = { sizeof(JSReflectProp), js_reflect_prop_step, js_reflect_prop_fini, GP_SET };
+static const JSTrampStepDef js_reflect_has_def    = { sizeof(JSReflectProp), js_reflect_prop_step, js_reflect_prop_fini, GP_HAS };
+static const JSTrampStepDef js_reflect_del_def    = { sizeof(JSReflectProp), js_reflect_prop_step, js_reflect_prop_fini, GP_DELETE };
 static const JSTrampStepDef js_obj_entries_def    = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_ENTRIES };
 static const JSTrampStepDef js_obj_assign_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_ASSIGN };
 static const JSTrampStepDef js_obj_spread_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_SPREAD };
@@ -57955,6 +58017,10 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_REFLECT_DEFINEPROPERTY] = &js_refl_defprop_def,
     [STEPDEF_OBJ_KEYS] = &js_obj_keys_def,
     [STEPDEF_OBJ_DESCS] = &js_obj_descs_def,
+    [STEPDEF_REFLECT_GET] = &js_reflect_get_def,
+    [STEPDEF_REFLECT_SET] = &js_reflect_set_def,
+    [STEPDEF_REFLECT_HAS] = &js_reflect_has_def,
+    [STEPDEF_REFLECT_DELETE] = &js_reflect_del_def,
     [STEPDEF_OWNKEYS_NAMES] = &js_ownkeys_names_def,
     [STEPDEF_OWNKEYS_SYMBOLS] = &js_ownkeys_syms_def,
     [STEPDEF_REFLECT_OWNKEYS] = &js_reflect_ownkeys_def,
@@ -67290,97 +67356,60 @@ static JSValue js_reflect_construct(JSContext *ctx, JSValueConst this_val,
     return ret;
 }
 
-static JSValue js_reflect_deleteProperty(JSContext *ctx, JSValueConst this_val,
-                                         int argc, JSValueConst *argv)
-{
-    JSValueConst obj;
-    JSAtom atom;
-    int ret;
 
-    obj = argv[0];
-    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
-        return JS_ThrowTypeErrorNotAnObject(ctx);
-    atom = JS_ValueToAtom(ctx, argv[1]);
-    if (unlikely(atom == JS_ATOM_NULL))
-        return JS_EXCEPTION;
-    ret = JS_DeleteProperty(ctx, obj, atom, 0);
-    JS_FreeAtom(ctx, atom);
-    if (ret < 0)
-        return JS_EXCEPTION;
-    else
-        return js_bool(ret);
+
+
+
+/* Reflect.get / set / has / deleteProperty are the four BARE internal methods, and each of their two user-code
+   steps is a request: ToPropertyKey on the key, then the method itself — which on a Proxy is a trap and on an
+   ordinary object can be an accessor. Their C bodies performed the second with JS_GetPropertyInternal /
+   JS_SetPropertyInternal2 / JS_HasProperty / JS_DeleteProperty, so a looping getter, setter or trap had no flow
+   base. def->arg is the GP_* op. */
+static int js_reflect_prop_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSReflectProp *s = st;
+    int op = s->hdr.arg, r;
+
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
+        s->obj = JS_UNDEFINED; s->result = JS_UNDEFINED; s->atom = JS_ATOM_NULL;
+        if (JS_VALUE_GET_TAG(step_arg(&s->hdr, 0)) != JS_TAG_OBJECT) {
+            JS_ThrowTypeErrorNotAnObject(ctx); return -1;
+        }
+        s->obj = js_dup(step_arg(&s->hdr, 0));
+        s->hdr.stage = 1;
+    }
+    if (s->hdr.stage == 1) {
+        r = step_topropkey_run(ctx, &s->hdr, step_arg(&s->hdr, 1), cb_result, &s->atom, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 2;
+        /* the receiver defaults to the object; `set` takes it one argument later than `get` does. */
+        s->hdr.cb_coerce[0] = s->obj;
+        if (op == GP_GET) {
+            s->hdr.cb_coerce[1] = (s->hdr.argc > 2) ? s->hdr.argv[2] : s->obj;
+        } else if (op == GP_SET) {
+            s->hdr.cb_coerce[1] = (s->hdr.argc > 3) ? s->hdr.argv[3] : s->obj;
+            s->hdr.cb_coerce[2] = (s->hdr.argc > 2) ? s->hdr.argv[2] : JS_UNDEFINED;
+        }
+        *out_cb = s->hdr.cb_coerce; *out_argc = (int)s->atom;
+        return (op == GP_GET) ? 13 : (op == GP_SET) ? 14 : (op == GP_DELETE) ? 15 : 7;
+    }
+    DCHECK(s->hdr.stage == 2, "Reflect property operation: unknown stage");
+    s->result = cb_result;
+    return JS_IsException(s->result) ? -1 : 0;
 }
 
-static JSValue js_reflect_get(JSContext *ctx, JSValueConst this_val,
-                              int argc, JSValueConst *argv)
+static JSValue js_reflect_prop_fini(JSContext *ctx, void *st, bool take_result)
 {
-    JSValueConst obj, prop, receiver;
-    JSAtom atom;
-    JSValue ret;
-
-    obj = argv[0];
-    prop = argv[1];
-    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
-        return JS_ThrowTypeErrorNotAnObject(ctx);
-    if (argc > 2)
-        receiver = argv[2];
-    else
-        receiver = obj;
-    atom = JS_ValueToAtom(ctx, prop);
-    if (unlikely(atom == JS_ATOM_NULL))
-        return JS_EXCEPTION;
-    ret = JS_GetPropertyInternal(ctx, obj, atom, receiver, false);
-    JS_FreeAtom(ctx, atom);
-    return ret;
-}
-
-static JSValue js_reflect_has(JSContext *ctx, JSValueConst this_val,
-                              int argc, JSValueConst *argv)
-{
-    JSValueConst obj, prop;
-    JSAtom atom;
-    int ret;
-
-    obj = argv[0];
-    prop = argv[1];
-    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
-        return JS_ThrowTypeErrorNotAnObject(ctx);
-    atom = JS_ValueToAtom(ctx, prop);
-    if (unlikely(atom == JS_ATOM_NULL))
-        return JS_EXCEPTION;
-    ret = JS_HasProperty(ctx, obj, atom);
-    JS_FreeAtom(ctx, atom);
-    if (ret < 0)
-        return JS_EXCEPTION;
-    else
-        return js_bool(ret);
-}
-
-static JSValue js_reflect_set(JSContext *ctx, JSValueConst this_val,
-                              int argc, JSValueConst *argv)
-{
-    JSValueConst obj, prop, val, receiver;
-    int ret;
-    JSAtom atom;
-
-    obj = argv[0];
-    prop = argv[1];
-    val = argv[2];
-    if (argc > 3)
-        receiver = argv[3];
-    else
-        receiver = obj;
-    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
-        return JS_ThrowTypeErrorNotAnObject(ctx);
-    atom = JS_ValueToAtom(ctx, prop);
-    if (unlikely(atom == JS_ATOM_NULL))
-        return JS_EXCEPTION;
-    ret = JS_SetPropertyInternal2(ctx, obj, atom, js_dup(val), receiver, 0);
-    JS_FreeAtom(ctx, atom);
-    if (ret < 0)
-        return JS_EXCEPTION;
-    else
-        return js_bool(ret);
+    JSReflectProp *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    JS_FreeValue(ctx, s->obj);
+    JS_FreeAtom(ctx, s->atom);
+    js_free(ctx, s);
+    return r;
 }
 
 static JSValue js_reflect_setPrototypeOf(JSContext *ctx, JSValueConst this_val,
@@ -67399,15 +67428,15 @@ static const JSCFunctionListEntry js_reflect_funcs[] = {
     JS_CFUNC_DEF("apply", 3, js_reflect_apply ),
     JS_CFUNC_DEF("construct", 2, js_reflect_construct ),
     JS_CFUNC_STEP_DEF("defineProperty", 3, STEPDEF_REFLECT_DEFINEPROPERTY ),
-    JS_CFUNC_DEF("deleteProperty", 2, js_reflect_deleteProperty ),
-    JS_CFUNC_DEF("get", 2, js_reflect_get ),
+    JS_CFUNC_STEP_DEF("deleteProperty", 2, STEPDEF_REFLECT_DELETE ),
+    JS_CFUNC_STEP_DEF("get", 2, STEPDEF_REFLECT_GET ),
     JS_CFUNC_STEP_DEF("getOwnPropertyDescriptor", 2, STEPDEF_REFLECT_GOPD ),
     JS_CFUNC_MAGIC_DEF("getPrototypeOf", 1, js_object_getPrototypeOf, 1 ),
-    JS_CFUNC_DEF("has", 2, js_reflect_has ),
+    JS_CFUNC_STEP_DEF("has", 2, STEPDEF_REFLECT_HAS ),
     JS_CFUNC_MAGIC_DEF("isExtensible", 1, js_object_isExtensible, 1 ),
     JS_CFUNC_STEP_DEF("ownKeys", 1, STEPDEF_REFLECT_OWNKEYS ),
     JS_CFUNC_MAGIC_DEF("preventExtensions", 1, js_object_preventExtensions, 1 ),
-    JS_CFUNC_DEF("set", 3, js_reflect_set ),
+    JS_CFUNC_STEP_DEF("set", 3, STEPDEF_REFLECT_SET ),
     JS_CFUNC_DEF("setPrototypeOf", 2, js_reflect_setPrototypeOf ),
     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "Reflect", JS_PROP_CONFIGURABLE ),
 };
