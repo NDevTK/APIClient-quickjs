@@ -1444,6 +1444,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_STR_PADSTART, STEPDEF_STR_PADEND,
     STEPDEF_TA_AT, STEPDEF_TA_SET, STEPDEF_JSON_RAWJSON,
     STEPDEF_OBJ_DEFINEPROPERTY, STEPDEF_REFLECT_DEFINEPROPERTY, STEPDEF_OBJ_DEFINEPROPERTIES,
+    STEPDEF_OBJ_CREATE,
     STEPDEF_PARSEINT, STEPDEF_PARSEFLOAT, STEPDEF_STR_SPLIT,
     STEPDEF_ARRAY_JOIN, STEPDEF_ARRAY_TOLOCALESTRING, STEPDEF_ARRAY_TOSTRING,
     STEPDEF_TA_JOIN, STEPDEF_TA_TOLOCALESTRING,
@@ -21202,6 +21203,10 @@ typedef struct JSArrayFromLike {
                                 stops one step earlier: it never performs the per-key Get. Its own C body reached
                                 [[OwnPropertyKeys]] and [[GetOwnProperty]] through JS_GetOwnPropertyNames2, which
                                 ran both proxy traps from C. */
+#define PROPWALK_OBJCREATE 7 /* Object.create(proto, Properties) — 20.1.2.2, which IS ObjectDefineProperties over
+                                a freshly created object. The only difference from the mode below is where the
+                                target comes from and that Properties may be absent; making it a second sink of
+                                the same walk is what let JS_ObjectDefineProperties go. */
 #define PROPWALK_DEFPROPS 6  /* Object.defineProperties(O, Properties) — 20.1.2.3.1. The same walk over the
                                 source's own keys, but each enumerable one's VALUE is a descriptor OBJECT that
                                 ToPropertyDescriptor reads (twelve more keyed operations), and the define at the
@@ -53595,9 +53600,11 @@ static JSValue JS_ToObjectFree(JSContext *ctx, JSValue val)
    (`Object.defineProperty(o, "a", new Proxy(d, {get(){ for(;;){} }}))`).
    Driven from here they are ordinary requests. The cursor keeps everything the walk accumulates, because a
    request suspends the flow and no interpreter local survives that.
-   js_obj_to_desc still exists for the consumers not yet converted — JS_ObjectDefineProperties (which needs a
-   resumable key cursor of its own before it can adopt this) and the Proxy getOwnPropertyDescriptor trap-result
-   read. Each is its own conversion; this one is Object.defineProperty and Reflect.defineProperty. */
+   Its consumers are Object.defineProperty, Reflect.defineProperty, Object.defineProperties and Object.create,
+   which is all of them bar one: js_obj_to_desc survives only for the Proxy getOwnPropertyDescriptor
+   TRAP-RESULT read, where the descriptor object was built by the trap and the read is the invariant check
+   rather than a spec step of its own. JS_DefinePropertyDesc and JS_ObjectDefineProperties are gone with the
+   last caller. */
 static const struct { uint32_t atom; int has_flag, bool_flag; } js_desc_fields[6] = {
     { JS_ATOM_enumerable,   JS_PROP_HAS_ENUMERABLE,   JS_PROP_ENUMERABLE   },
     { JS_ATOM_configurable, JS_PROP_HAS_CONFIGURABLE, JS_PROP_CONFIGURABLE },
@@ -53769,64 +53776,6 @@ static int js_obj_to_desc(JSContext *ctx, JSPropertyDescriptor *d,
     return -1;
 }
 
-static __exception int JS_DefinePropertyDesc(JSContext *ctx, JSValueConst obj,
-                                             JSAtom prop, JSValueConst desc,
-                                             int flags)
-{
-    JSPropertyDescriptor d;
-    int ret;
-
-    if (js_obj_to_desc(ctx, &d, desc) < 0)
-        return -1;
-
-    ret = JS_DefineProperty(ctx, obj, prop,
-                            d.value, d.getter, d.setter, d.flags | flags);
-    js_free_desc(ctx, &d);
-    return ret;
-}
-
-static __exception int JS_ObjectDefineProperties(JSContext *ctx,
-                                                 JSValueConst obj,
-                                                 JSValueConst properties)
-{
-    JSValue props, desc;
-    JSObject *p;
-    JSPropertyEnum *atoms;
-    uint32_t len, i;
-    int ret = -1;
-
-    if (!JS_IsObject(obj)) {
-        JS_ThrowTypeError(ctx, "Object.defineProperties called on non-object");
-        return -1;
-    }
-    desc = JS_UNDEFINED;
-    props = JS_ToObject(ctx, properties);
-    if (JS_IsException(props))
-        return -1;
-    p = JS_VALUE_GET_OBJ(props);
-    if (JS_GetOwnPropertyNamesInternal(ctx, &atoms, &len, p, JS_GPN_ENUM_ONLY | JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK) < 0)
-        goto exception;
-    // XXX: ECMA specifies that all descriptions should be validated before
-    //      modifying the object. This would require allocating an array
-    //      JSPropertyDescriptor and use 2 separate loops.
-    for(i = 0; i < len; i++) {
-        JS_FreeValue(ctx, desc);
-        desc = JS_GetProperty(ctx, props, atoms[i].atom);
-        if (JS_IsException(desc))
-            goto exception;
-        if (JS_DefinePropertyDesc(ctx, obj, atoms[i].atom, desc,
-                                  JS_PROP_THROW | JS_PROP_DEFINE_PROPERTY) < 0)
-            goto exception;
-    }
-    ret = 0;
-
-exception:
-    js_free_prop_enum(ctx, atoms, len);
-    JS_FreeValue(ctx, props);
-    JS_FreeValue(ctx, desc);
-    return ret;
-}
-
 static JSValue js_object_constructor(JSContext *ctx, JSValueConst new_target,
                                      int argc, JSValueConst *argv)
 {
@@ -53848,28 +53797,6 @@ static JSValue js_object_constructor(JSContext *ctx, JSValueConst new_target,
         }
     }
     return ret;
-}
-
-static JSValue js_object_create(JSContext *ctx, JSValueConst this_val,
-                                int argc, JSValueConst *argv)
-{
-    JSValueConst proto, props;
-    JSValue obj;
-
-    proto = argv[0];
-    if (!JS_IsObject(proto) && !JS_IsNull(proto))
-        return JS_ThrowTypeError(ctx, "object prototype may only be an Object or null");
-    obj = JS_NewObjectProto(ctx, proto);
-    if (JS_IsException(obj))
-        return JS_EXCEPTION;
-    props = argv[1];
-    if (!JS_IsUndefined(props)) {
-        if (JS_ObjectDefineProperties(ctx, obj, props)) {
-            JS_FreeValue(ctx, obj);
-            return JS_EXCEPTION;
-        }
-    }
-    return obj;
 }
 
 static JSValue js_object_getPrototypeOf(JSContext *ctx, JSValueConst this_val,
@@ -54188,6 +54115,8 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
     JSPropWalk *s = st;
     int mode = s->hdr.arg;
     int assign = (mode == PROPWALK_ASSIGN);
+    /* both descriptor sinks: the walk is identical, only the target differs. */
+    int defprops = (mode == PROPWALK_DEFPROPS || mode == PROPWALK_OBJCREATE);
     int r;
 
     if (s->hdr.stage == 0) {
@@ -54199,16 +54128,22 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
         s->dl = NULL; s->dk = NULL; s->nd = 0; s->di = 0;
         s->cb[0] = JS_UNDEFINED; s->cb[1] = JS_UNDEFINED;
         js_desc_cursor_init(&s->dcur);
-        s->src_i = (mode == PROPWALK_ASSIGN || mode == PROPWALK_DEFPROPS) ? 1 : 0;
+        s->src_i = (mode == PROPWALK_ASSIGN || defprops) ? 1 : 0;
         if (mode == PROPWALK_DEFPROPS && JS_VALUE_GET_TAG(step_arg(&s->hdr, 0)) != JS_TAG_OBJECT) {
             /* 20.1.2.3 step 1, before Properties is even coerced. */
             JS_ThrowTypeError(ctx, "Object.defineProperties called on non-object");
             return -1;
         }
+        if (mode == PROPWALK_OBJCREATE && !JS_IsObject(step_arg(&s->hdr, 0))
+            && !JS_IsNull(step_arg(&s->hdr, 0))) {
+            JS_ThrowTypeError(ctx, "object prototype may only be an Object or null");
+            return -1;
+        }
         /* 20.1.2.1 step 1 / 7.3.23 step 1: ToObject the target (assign) or build the output array. A SPREAD's
            target is the object the opcode just created — already an object, and it belongs to the opcode's stack,
            so it is only BORROWED here. `result` is what the machine hands back, which a spread discards. */
-        s->result = (assign || mode == PROPWALK_DEFPROPS) ? JS_ToObject(ctx, step_arg(&s->hdr, 0))
+        s->result = mode == PROPWALK_OBJCREATE ? JS_NewObjectProto(ctx, step_arg(&s->hdr, 0))
+                  : (assign || mode == PROPWALK_DEFPROPS) ? JS_ToObject(ctx, step_arg(&s->hdr, 0))
                   : (mode == PROPWALK_SPREAD ? js_dup(step_arg(&s->hdr, 0))
                      : mode == PROPWALK_DESCS ? JS_NewObject(ctx) : JS_NewArray(ctx));
         if (JS_IsException(s->result)) { s->result = JS_UNDEFINED; return -1; }
@@ -54222,9 +54157,14 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
             /* How many sources this sink has: assign takes every argument after the target, a spread takes the one
                the opcode handed it, values/entries take argv[0] — and for those two an EXTRA argument is not a
                second source, so the bound is a mode fact, not argc. */
-            int src_end = assign ? s->hdr.argc : (mode == PROPWALK_SPREAD || mode == PROPWALK_DEFPROPS) ? 2 : 1;
+            int src_end = assign ? s->hdr.argc : (mode == PROPWALK_SPREAD || defprops) ? 2 : 1;
             if (s->src_i >= src_end) {
-                if (mode == PROPWALK_DEFPROPS) { s->hdr.stage = 9; goto defprops_apply; }
+                if (defprops) { s->hdr.stage = 9; goto defprops_apply; }
+                JS_FreeValue(ctx, cb_result); return 0;
+            }
+            /* 20.1.2.2 step 3: `Object.create(p)` with no Properties defines nothing at all — an ABSENT
+               argument, not an empty one, so it never reaches ToObject's TypeError on undefined. */
+            if (mode == PROPWALK_OBJCREATE && JS_IsUndefined(step_arg(&s->hdr, 1))) {
                 JS_FreeValue(ctx, cb_result); return 0;
             }
             src = step_arg(&s->hdr, s->src_i);
@@ -54263,7 +54203,7 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
                 JSAtom at;
                 if (JS_IsException(kv)) { JS_FreeValue(ctx, keys); s->len = kept; return -1; }
                 if (JS_IsSymbol(kv) && mode != PROPWALK_ASSIGN && mode != PROPWALK_SPREAD
-                    && mode != PROPWALK_DESCS && mode != PROPWALK_DEFPROPS) {
+                    && mode != PROPWALK_DESCS && !defprops) {
                     JS_FreeValue(ctx, kv);
                     continue;
                 }
@@ -54337,7 +54277,7 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
             if (r) return r < 0 ? -1 : r;
             s->hdr.stage = 5;
         }
-        if (s->hdr.stage == 5 && mode == PROPWALK_DEFPROPS) {
+        if (s->hdr.stage == 5 && defprops) {
             /* 20.1.2.3.1 step 4.a.ii: the value IS a descriptor object, and ToPropertyDescriptor reads twelve
                more keyed operations off it. The cursor is resumable, so this stage is re-entered until it says
                the descriptor is complete. */
@@ -55027,7 +54967,7 @@ exception:
 }
 
 static const JSCFunctionListEntry js_object_funcs[] = {
-    JS_CFUNC_DEF("create", 2, js_object_create ),
+    JS_CFUNC_STEP_DEF("create", 2, STEPDEF_OBJ_CREATE ),
     JS_CFUNC_MAGIC_DEF("getPrototypeOf", 1, js_object_getPrototypeOf, 0 ),
     JS_CFUNC_DEF("setPrototypeOf", 2, js_object_setPrototypeOf ),
     JS_CFUNC_STEP_DEF("defineProperty", 3, STEPDEF_OBJ_DEFINEPROPERTY ),
@@ -59394,6 +59334,7 @@ static const JSTrampStepDef js_reflect_del_def    = { sizeof(JSReflectProp), js_
 static const JSTrampStepDef js_obj_entries_def    = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_ENTRIES };
 static const JSTrampStepDef js_obj_assign_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_ASSIGN };
 static const JSTrampStepDef js_obj_defprops_def   = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_DEFPROPS };
+static const JSTrampStepDef js_obj_create_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_OBJCREATE };
 static const JSTrampStepDef js_obj_spread_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_SPREAD };
 static const JSTrampStepDef js_array_flat_def      = { sizeof(JSArrayFlat), js_array_flat_step, js_array_flat_fini, ARRAYFLAT_FLAT };
 static const JSTrampStepDef js_array_flatMap_def   = { sizeof(JSArrayFlat), js_array_flat_step, js_array_flat_fini, ARRAYFLAT_FLATMAP };
@@ -59755,6 +59696,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_OBJ_ENTRIES]     = &js_obj_entries_def,
     [STEPDEF_OBJ_ASSIGN]      = &js_obj_assign_def,
     [STEPDEF_OBJ_DEFINEPROPERTIES] = &js_obj_defprops_def,
+    [STEPDEF_OBJ_CREATE]      = &js_obj_create_def,
     [STEPDEF_OBJ_SPREAD]      = &js_obj_spread_def,
     [STEPDEF_ARRAY_FLAT]      = &js_array_flat_def,
     [STEPDEF_ARRAY_FLATMAP]   = &js_array_flatMap_def,
