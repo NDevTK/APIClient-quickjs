@@ -17318,23 +17318,6 @@ static int JS_IteratorClose(JSContext *ctx, JSValueConst enum_obj,
 }
 
 /* obj -> enum_rec (3 slots) */
-static __exception int js_for_of_start(JSContext *ctx, JSValue *sp,
-                                       bool is_async)
-{
-    JSValue op1, obj, method;
-    op1 = sp[-1];
-    obj = JS_GetIterator(ctx, op1, is_async);
-    if (JS_IsException(obj))
-        return -1;
-    JS_FreeValue(ctx, op1);
-    sp[-1] = obj;
-    method = JS_GetProperty(ctx, obj, JS_ATOM_next);
-    if (JS_IsException(method))
-        return -1;
-    sp[0] = method;
-    return 0;
-}
-
 /* enum_rec [objs] -> enum_rec [objs] value done. There are 'offset'
    objs. If 'done' is true or in case of exception, 'enum_rec' is set
    to undefined. If 'done' is true, 'value' is always set to
@@ -19725,6 +19708,14 @@ typedef struct JSIterClose {
 #define CONT_ITER_CLOSE_CALL 29 /* same split: step 3.c's Call(return, iterator). Its result is discarded; under a
                                   NORMAL completion it owes step 6's "must be an Object", and under an unwind the
                                   result AND any throw of its own are discarded and the saved exception re-raised. */
+#define CONT_FORAWAIT_GET  35  /* cont_state = NULL: `for await`'s GetMethod(obj, @@asyncIterator). If the method
+                                  is nullish, 27.1.4.3 falls to the SYNC @@iterator and wraps — which is two more
+                                  points in the same walk, so each is its own kind rather than a phase byte
+                                  nothing else would read. */
+#define CONT_FORAWAIT_SYNC_GET 36  /* cont_state = NULL: the @@iterator read reached after a nullish
+                                      @@asyncIterator. Its acquire's result gets the wrap. */
+#define CONT_FORAWAIT_WRAP 37  /* cont_state = NULL: the sync-branch acquire's Call. Its result is a SYNC
+                                  iterator, so CreateAsyncFromSyncIterator wraps it before the enum_rec. */
 #define CONT_FOROF_GET     34  /* cont_state = NULL: OP_for_of_start's GetMethod(obj, @@iterator) — step 3's
                                   READ, which is user code whenever @@iterator is an ACCESSOR. It was a plain
                                   JS_GetProperty from C, so such a getter ran with no flow base; it is the one
@@ -19970,6 +19961,9 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_CONSUME_GETITER:
     case CONT_ACQUIRE_GET:
     case CONT_FROM_CTOR:
+    case CONT_FORAWAIT_GET:
+    case CONT_FORAWAIT_SYNC_GET:
+    case CONT_FORAWAIT_WRAP:
     case CONT_FOROF_GET:
     case CONT_FOROF_ACQUIRE:
     case CONT_FOROF_NEXT:
@@ -21852,6 +21846,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     void *cd_outer = NULL;                              /* do_cont_dispatch: the sequence awaiting the call's result */
     uint8_t cd_outer_kind = CONT_NONE;
     uint8_t tp_outer_kind = CONT_NONE;
+    uint8_t tramp_forawait_wrap = 0;                    /* the acquire about to run is `for await`'s SYNC branch: its iterator gets CreateAsyncFromSyncIterator before the enum_rec */
     int tramp_cont_forof = 0;                           /* CONT_FOROF_NEXT: the enum_rec stack offset for the .next() drive about to be pushed. Rides the frame's forof_off (read+reset in do_tramp_call) so no per-iteration heap state is allocated for what is one int. */
     int tramp_gen_forof = 1;                            /* <0 = for-of iterator stack offset (always -3-.. ); 1 = direct .next() (no valid offset is positive) */
     uint8_t tramp_ith_mode = ITH_DIRECT;                /* Iterator Helper drive: which DELIVERY the .next() owes (ITH_DIRECT / ITH_FOROF / ITH_ITERNEXT). read+reset by do_iter_helper_tramp */
@@ -24021,9 +24016,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         pexec_finish_state = dcs;
                         goto do_promise_exec_finish;
                     }
-                    if (dck == CONT_FOROF_ACQUIRE) {
+                    if (dck == CONT_FOROF_ACQUIRE || dck == CONT_FORAWAIT_WRAP) {
                         /* an @@iterator with no bytecode body — a C one (Array.prototype.values, the common
                            case), a bound one, a proxied one, a step machine. */
+                        bool want_wrap = (dck == CONT_FORAWAIT_WRAP);
                         JSValue *cargv;
                         int pop, first;
                         TAKE_CALL_SHAPE(); pop = call_pop; first = call_first_r;
@@ -24032,13 +24028,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         for (i = first; i < pop; i++) JS_FreeValue(ctx, cargv[i]);
                         sp += first - pop;
                         if (unlikely(JS_IsException(ret_val))) goto exception;
-                    /* GetIterator step 5: the result must be an Object. Then the enum_rec OP_for_of_start
+                    /* GetIterator step 5: the result must be an Object. `for await`'s SYNC branch then wraps it
+                       per 27.1.4.3 step 1.b.iii (CreateAsyncFromSyncIterator). Then the enum_rec the start opcode
                        leaves behind: [iterator, next, catch_offset]. */
                     JSValue nextm;
                     if (unlikely(!JS_IsObject(ret_val))) {
                         JS_FreeValue(ctx, ret_val);
                         JS_ThrowTypeErrorNotAnObject(ctx);
                         goto exception;
+                    }
+                    if (want_wrap) {
+                        JSValue wrapped = JS_CreateAsyncFromSyncIterator(ctx, ret_val);
+                        JS_FreeValue(ctx, ret_val);
+                        ret_val = wrapped;
+                        if (unlikely(JS_IsException(ret_val))) goto exception;
                     }
                     DCHECK(sp + 3 <= TRAMP_SP_LIMIT(sf),
                            "for-of acquire: enum_rec push exceeds the frame's compiled stack_size");
@@ -25142,6 +25145,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                           goto do_consume_acquire_have_method;
                       }
                       if (gk == CONT_FOROF_GET) goto do_forof_have_method;   /* the read invoked nothing */
+                      if (gk == CONT_FORAWAIT_GET) goto do_forawait_have_async_method;
+                      if (gk == CONT_FORAWAIT_SYNC_GET) goto do_forawait_have_sync_method;
                       if (gk == CONT_ITER_CONSUME) goto do_iter_consume_step;
                       if (gk == CONT_ITER_CLOSE) { cont_st = gouter0; goto do_iter_close_method; }
                       DCHECK(gk == CONT_STEP, "property-get outer continuation: unknown machine kind"); }
@@ -25243,7 +25248,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         js_trapget_free(ctx, tg);
                         goto getprop_throw;
                     }
-                    if (gk3 == CONT_FOROF_GET) {
+                    if (gk3 == CONT_FOROF_GET || gk3 == CONT_FORAWAIT_GET || gk3 == CONT_FORAWAIT_SYNC_GET) {
                         /* the for-of's @@iterator read threw: its operand (the iterable) is on the stack and
                            belongs to the frame's catch-search, exactly as for any other throwing operator. */
                         goto exception;
@@ -27684,12 +27689,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     DCHECK(gouter_kind == CONT_STEP || gouter_kind == CONT_ITER_CONSUME
                            || gouter_kind == CONT_ACQUIRE_GET || gouter_kind == CONT_ITER_CLOSE
                            || gouter_kind == CONT_TRAP_GET || gouter_kind == CONT_OP_KEYED
-                           || gouter_kind == CONT_FOROF_GET,
+                           || gouter_kind == CONT_FOROF_GET || gouter_kind == CONT_FORAWAIT_GET
+                           || gouter_kind == CONT_FORAWAIT_SYNC_GET,
                            "property-get outer continuation: unknown machine kind");
-                    if (gouter_kind == CONT_FOROF_GET) {
-                        /* the for-of's @@iterator read invoked user code (an accessor, a Proxy `get` trap) and
-                           suspended. The iterable is still at sp[-1]; go on to step 4's Call. */
+                    if (gouter_kind == CONT_FOROF_GET || gouter_kind == CONT_FORAWAIT_GET
+                        || gouter_kind == CONT_FORAWAIT_SYNC_GET) {
+                        /* a for-of / for-await @@iterator read invoked user code (an accessor, a Proxy `get`
+                           trap) and suspended. The iterable is still at sp[-1]; go on to the next step. */
+                        uint8_t gk9 = gouter_kind;
                         js_getprop_free(ctx, gp);
+                        if (gk9 == CONT_FORAWAIT_GET) goto do_forawait_have_async_method;
+                        if (gk9 == CONT_FORAWAIT_SYNC_GET) goto do_forawait_have_sync_method;
                         goto do_forof_have_method;
                     }
                     if (gouter_kind == CONT_TRAP_GET) {
@@ -27878,19 +27888,27 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     js_iternext_deliver(ctx, sp, ret_val);
                     BREAK;
                 }
-                if (dlv_ck == CONT_FOROF_ACQUIRE) {
+                if (dlv_ck == CONT_FOROF_ACQUIRE || dlv_ck == CONT_FORAWAIT_WRAP) {
+                    bool want_wrap = (dlv_ck == CONT_FORAWAIT_WRAP);
                     JSValue *cargv = sp - dlv_cargc;
                     DCHECK(dlv_cargc >= dlv_cfirst, "for-of acquire frame records operands ending below where they start");
                     for (i = dlv_cfirst; i < dlv_cargc; i++) JS_FreeValue(ctx, cargv[i]);
                     sp += dlv_cfirst - dlv_cargc;
                     if (unlikely(JS_IsException(ret_val))) goto exception;
-                    /* GetIterator step 5: the result must be an Object. Then the enum_rec OP_for_of_start
+                    /* GetIterator step 5: the result must be an Object. `for await`'s SYNC branch then wraps it
+                       per 27.1.4.3 step 1.b.iii (CreateAsyncFromSyncIterator). Then the enum_rec the start opcode
                        leaves behind: [iterator, next, catch_offset]. */
                     JSValue nextm;
                     if (unlikely(!JS_IsObject(ret_val))) {
                         JS_FreeValue(ctx, ret_val);
                         JS_ThrowTypeErrorNotAnObject(ctx);
                         goto exception;
+                    }
+                    if (want_wrap) {
+                        JSValue wrapped = JS_CreateAsyncFromSyncIterator(ctx, ret_val);
+                        JS_FreeValue(ctx, ret_val);
+                        ret_val = wrapped;
+                        if (unlikely(JS_IsException(ret_val))) goto exception;
                     }
                     DCHECK(sp + 3 <= TRAMP_SP_LIMIT(sf),
                            "for-of acquire: enum_rec push exceeds the frame's compiled stack_size");
@@ -28872,10 +28890,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_for_of_start):
             sf->cur_pc = pc;
             {
-                /* GetIterator(obj, sync) done at the OPCODE (not the C js_for_of_start) so a GENERATOR-FUNCTION
-                   @@iterator getter creates its iterator on THIS tramp chain — its params-to-initial_yield preempt
-                   the base flow, never the C-recursion drive-to-completion js_call_generator_function would use.
-                   The @@iterator getter is fetched ONCE (a spec GetMethod), so an accessor @@iterator is not re-run. */
+                /* GetIterator(obj, sync) as two REQUESTS on this chain — step 3's GetMethod read, then step 4's
+                   Call — so an accessor @@iterator, a Proxy trap, and the method itself all run where a loop in
+                   them can preempt. The method is fetched ONCE, which is what GetMethod says. */
                 gp_obj = sp[-1]; gp_atom = JS_ATOM_Symbol_iterator; gp_op = GP_GET; gp_val = JS_UNDEFINED;
                 gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
                 gp_outer = NULL; gp_outer_kind = CONT_FOROF_GET;
@@ -28884,8 +28901,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         do_forof_have_method:
-            /* GetIterator steps 3b-4 with the @@iterator method in hand (ret_val), reached from the read whether
-               it invoked user code or not. The iterable is at sp[-1], untouched by the read. */
+            tramp_forawait_wrap = 0;
+            /* fall through */
+        do_forof_acquire_call:
+            /* GetIterator steps 3b-4 with the method in hand (ret_val), reached from the read whether it invoked
+               user code or not, and shared by `for of` and both of `for await`'s branches — they differ only in
+               whether the acquired iterator gets the async-from-sync WRAP. The iterable is at sp[-1], untouched
+               by the read. */
             {
                 JSValue m = ret_val;
                 ret_val = JS_UNDEFINED;
@@ -28894,15 +28916,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JS_ThrowTypeError(ctx, "value is not iterable");
                     goto exception;
                 }
-                /* GetIterator step 4's Call, for ANY callable @@iterator. Only a GENERATOR FUNCTION used to run
-                   here; everything else — including the ordinary `[Symbol.iterator]() {…}` — went to
-                   JS_GetIterator2, which calls it from C, so a loop in it preempted with no flow base. */
+                /* GetIterator step 4's Call, for ANY callable method. Only a GENERATOR FUNCTION used to run here;
+                   everything else — including the ordinary `[Symbol.iterator]() {…}` — went to JS_GetIterator2,
+                   which calls it from C, so a loop in it preempted with no flow base. */
                 DCHECK(sp + 1 <= TRAMP_SP_LIMIT(sf),
                        "for-of acquire: operand push exceeds the frame's compiled stack_size");
-                *sp++ = m;                     /* sp[-1]=the @@iterator method, sp[-2]=iterable(this) */
+                *sp++ = m;                     /* sp[-1]=the method, sp[-2]=iterable(this) */
                 call_argc = 0; call_argv = sp;
                 tramp_first = -2; tramp_is_tail = 0;
-                tramp_cont_state = NULL; tramp_cont_kind = CONT_FOROF_ACQUIRE;
+                tramp_cont_state = NULL;
+                tramp_cont_kind = tramp_forawait_wrap ? CONT_FORAWAIT_WRAP : CONT_FOROF_ACQUIRE;
+                tramp_forawait_wrap = 0;
                 goto do_generic_callee;
             }
         CASE(OP_for_of_next):
@@ -28955,12 +28979,31 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
         CASE(OP_for_await_of_start):
+            /* 27.1.4.3 GetIterator(obj, async): read @@asyncIterator; if it is nullish, read the SYNC @@iterator
+               and wrap the iterator it produces. Every one of those steps is user code — an accessor, a Proxy
+               trap, the method itself — and the C acquire ran all of them from C, so `for await` over the
+               ordinary `[Symbol.iterator]() { … }` had no flow base, exactly as `for of` did. */
             sf->cur_pc = pc;
-            if (js_for_of_start(ctx, sp, true))
-                goto exception;
-            sp += 1;
-            *sp++ = JS_NewCatchOffset(ctx, 0);
-            BREAK;
+            gp_obj = sp[-1]; gp_atom = JS_ATOM_Symbol_asyncIterator; gp_op = GP_GET; gp_val = JS_UNDEFINED;
+            gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
+            gp_outer = NULL; gp_outer_kind = CONT_FORAWAIT_GET;
+            goto do_getprop_tramp;
+
+        do_forawait_have_async_method:
+            /* the @@asyncIterator read completed. A nullish method is 27.1.4.3's fall to the SYNC branch. */
+            if (JS_IsUndefined(ret_val) || JS_IsNull(ret_val)) {
+                JS_FreeValue(ctx, ret_val); ret_val = JS_UNDEFINED;
+                gp_obj = sp[-1]; gp_atom = JS_ATOM_Symbol_iterator; gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
+                gp_outer = NULL; gp_outer_kind = CONT_FORAWAIT_SYNC_GET;
+                goto do_getprop_tramp;
+            }
+            tramp_forawait_wrap = 0;
+            goto do_forof_acquire_call;
+
+        do_forawait_have_sync_method:
+            tramp_forawait_wrap = 1;
+            goto do_forof_acquire_call;
         CASE(OP_iterator_get_value_done):
             sf->cur_pc = pc;
             if (js_iterator_get_value_done(ctx, sp))
@@ -31730,7 +31773,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JSProxyCtor *pcs = xcs;
             if (pcs) { tramp_step_chain_free(ctx, pcs->outer); js_free_rt(rt, pcs); }
         } else if (xck == CONT_SETTER || xck == CONT_INSTANCEOF
-                   || xck == CONT_ITER_NEXT_OP || xck == CONT_FOROF_ACQUIRE) {
+                   || xck == CONT_ITER_NEXT_OP || xck == CONT_FOROF_ACQUIRE
+                   || xck == CONT_FORAWAIT_WRAP) {
             /* a throwing setter body, a throwing proxy `construct` trap, an OP_iterator_next .next() that threw,
                or a for-of's @@iterator that threw: no continuation state; the operands are on the caller stack and
                freed by the caller's own catch-search, exactly like a normal method call. */
