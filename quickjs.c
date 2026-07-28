@@ -22150,16 +22150,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 call_argv = sp - 1; call_argc = 1; tramp_first = -2; tramp_is_tail = 1;
                 goto do_step_tramp;
             }
-            p = JS_VALUE_GET_OBJ(sf->cur_func);
-            b = p->u.func.function_bytecode;
-            ctx = b->realm;
-            var_refs = p->u.func.var_refs;
-            local_buf = arg_buf = sf->arg_buf;
-            var_buf = sf->var_buf;
-            stack_buf = sf->var_buf + b->var_count;
+            /* RELINK the base frame first, and read what the base IS only on the path that runs it. The two
+               steps were fused, so a resume dereferenced `sf->cur_func`'s function_bytecode unconditionally —
+               and a STEP_ROOT base's cur_func is a step CLOSURE (JS_CLASS_C_FUNCTION_DATA), whose union member
+               is a JSCFunctionDataRecord: `b->realm` then read past that allocation (ASan: heap-buffer-overflow
+               8 bytes after a 72-byte region) and `ctx` carried whatever it found until the deep-resume block
+               below overwrote it. The comment on the STEP_ROOT arm above already says the parked case comes
+               back through tramp_top; this is what makes that true of the code rather than only of the prose. */
             sp = sf->cur_sp;
             sf->cur_sp = NULL; /* cur_sp is NULL if the function is running */
-            pc = sf->cur_pc;
             sf->prev_frame = rt->current_stack_frame;
             rt->current_stack_frame = sf;
             if (s->tramp_top) {
@@ -22196,6 +22195,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 dsf->cur_sp = NULL;   /* running */
                 goto restart;
             }
+            /* not parked in a called frame: the base's OWN bytecode resumes, so it must have some. */
+            p = JS_VALUE_GET_OBJ(sf->cur_func);
+            DCHECK(js_class_has_bytecode(p->class_id),
+                   "a coroutine base resumed into its own body with a non-bytecode cur_func — a step-root base "
+                   "reaches its body through do_step_tramp (fresh) or tramp_top (parked), never here");
+            b = p->u.func.function_bytecode;
+            ctx = b->realm;
+            var_refs = p->u.func.var_refs;
+            local_buf = arg_buf = sf->arg_buf;
+            var_buf = sf->var_buf;
+            stack_buf = sf->var_buf + b->var_count;
+            pc = sf->cur_pc;
             if (s->throw_flag)
                 goto exception;
             else
