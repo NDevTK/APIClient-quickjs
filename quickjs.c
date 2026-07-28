@@ -19725,6 +19725,19 @@ typedef struct JSIterClose {
 #define CONT_ITER_CLOSE_CALL 29 /* same split: step 3.c's Call(return, iterator). Its result is discarded; under a
                                   NORMAL completion it owes step 6's "must be an Object", and under an unwind the
                                   result AND any throw of its own are discarded and the saved exception re-raised. */
+#define CONT_FOROF_GET     34  /* cont_state = NULL: OP_for_of_start's GetMethod(obj, @@iterator) — step 3's
+                                  READ, which is user code whenever @@iterator is an ACCESSOR. It was a plain
+                                  JS_GetProperty from C, so such a getter ran with no flow base; it is the one
+                                  keyed-operation entry's GP_GET now, and its delivery performs the step-4 Call.
+                                  The iterable stays at sp[-1] across the read, which is where the operand
+                                  already was. */
+#define CONT_FOROF_ACQUIRE 33  /* cont_state = NULL: OP_for_of_start's GetIterator step 4 Call. The @@iterator
+                                  method is user code of ANY kind, so the acquire is a CALL like every other and
+                                  its delivery finishes the enum_rec ([iterator, next, catch_offset]). It replaces
+                                  a create-only special case (tramp_gen_create_forof) that finished the enum_rec
+                                  for a GENERATOR-FUNCTION @@iterator and left every other kind on
+                                  JS_GetIterator2's C call — where a plain bytecode `[Symbol.iterator]() {…}` with
+                                  a loop in it had no flow base at all. */
 #define CONT_FOROF_NEXT    20  /* cont_state = NULL (the enum_rec offset rides the frame's forof_off): `for (x of it)`
                                   where it.next is a NORMAL bytecode function. Its body runs on THIS chain, so a loop
                                   in a hand-written .next() preempts; js_for_of_next -> JS_IteratorNext -> JS_Call was
@@ -19957,6 +19970,8 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_CONSUME_GETITER:
     case CONT_ACQUIRE_GET:
     case CONT_FROM_CTOR:
+    case CONT_FOROF_GET:
+    case CONT_FOROF_ACQUIRE:
     case CONT_FOROF_NEXT:
     case CONT_TOPRIM:
     case CONT_GETPROP:
@@ -21846,7 +21861,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     int tramp_gen_close_exc = 0;                        /* 1 = the close is happening DURING exception unwind (JS_IteratorClose(iter,true)): after the finally runs, restore the in-flight exception and continue unwinding (goto exception), never overwrite it */
     JSValueConst tramp_gen_close_slot_gen = JS_UNINITIALIZED; /* close mode: the generator to close comes from ctx->pending_close_iter (an IfAbruptCloseIterator deferral), NOT sp[-1]; caller_sp stays put (nothing on the stack). read+reset in do_generator_tramp */
     JSValue tramp_gen_close_deliver = JS_UNINITIALIZED;  /* close-then-deliver (helper .return()): after the source generator closes, PUSH this pre-built {value,done:true} as the helper.return() result instead of discarding. read+reset in do_generator_tramp */
-    int tramp_gen_create_forof = 0;                     /* 1 = this do_generator_create_tramp is a for-of iterator-getter (OP_for_of_start): at settle, finish the enum_rec ([iterator, next, catch_offset]) instead of pushing the bare object */
     void *tramp_gen_create_cont_it = NULL;              /* non-NULL = this do_generator_create_tramp creates an iterator from a generator-function @@iterator called by a driver (flatMap inner or a C consumer): the settle stores the created iterator on that driver and re-enters its step, never pushes it. read+reset in do_generator_create_tramp */
     uint8_t tramp_gen_create_cont_kind = 0;             /* CONT_* of tramp_gen_create_cont_it: CONT_ITER_HELPER (flatMap inner) / CONT_ITER_CONSUME (Array.from etc.) */
     JSValue tramp_iter_getiter = JS_UNDEFINED;          /* the @@iterator method the recognition probed (owned, callable); do_consume_acquire_iterator CALLS it to get the iterator */
@@ -24007,6 +24021,34 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         pexec_finish_state = dcs;
                         goto do_promise_exec_finish;
                     }
+                    if (dck == CONT_FOROF_ACQUIRE) {
+                        /* an @@iterator with no bytecode body — a C one (Array.prototype.values, the common
+                           case), a bound one, a proxied one, a step machine. */
+                        JSValue *cargv;
+                        int pop, first;
+                        TAKE_CALL_SHAPE(); pop = call_pop; first = call_first_r;
+                        DCHECK(pop >= first, "for-of acquire records operands ending below where they start");
+                        cargv = sp - pop;
+                        for (i = first; i < pop; i++) JS_FreeValue(ctx, cargv[i]);
+                        sp += first - pop;
+                        if (unlikely(JS_IsException(ret_val))) goto exception;
+                    /* GetIterator step 5: the result must be an Object. Then the enum_rec OP_for_of_start
+                       leaves behind: [iterator, next, catch_offset]. */
+                    JSValue nextm;
+                    if (unlikely(!JS_IsObject(ret_val))) {
+                        JS_FreeValue(ctx, ret_val);
+                        JS_ThrowTypeErrorNotAnObject(ctx);
+                        goto exception;
+                    }
+                    DCHECK(sp + 3 <= TRAMP_SP_LIMIT(sf),
+                           "for-of acquire: enum_rec push exceeds the frame's compiled stack_size");
+                    *sp++ = ret_val;                     /* sp[-1] = iterator */
+                    nextm = JS_GetProperty(ctx, ret_val, JS_ATOM_next);
+                    if (JS_IsException(nextm)) goto exception;   /* the iterator is on the stack; the unwind frees it */
+                    *sp++ = nextm;                       /* sp[-1]=next, sp[-2]=iterator */
+                    *sp++ = JS_NewCatchOffset(ctx, 0);   /* sp[-1]=catch, sp[-2]=next, sp[-3]=iterator */
+                    BREAK;
+                    }
                     if (dck == CONT_CONSUME_GETITER) {
                         /* an @@iterator with no bytecode body — Array.prototype.values, a bound one, a proxied
                            one, a builtin that is itself a step machine. GetIterator step 5 (the result must be an
@@ -25099,6 +25141,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                           tramp_iter_getiter = ret_val;
                           goto do_consume_acquire_have_method;
                       }
+                      if (gk == CONT_FOROF_GET) goto do_forof_have_method;   /* the read invoked nothing */
                       if (gk == CONT_ITER_CONSUME) goto do_iter_consume_step;
                       if (gk == CONT_ITER_CLOSE) { cont_st = gouter0; goto do_iter_close_method; }
                       DCHECK(gk == CONT_STEP, "property-get outer continuation: unknown machine kind"); }
@@ -25199,6 +25242,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         gp_outer = tg->outer; gp_outer_kind = tg->outer_kind;
                         js_trapget_free(ctx, tg);
                         goto getprop_throw;
+                    }
+                    if (gk3 == CONT_FOROF_GET) {
+                        /* the for-of's @@iterator read threw: its operand (the iterable) is on the stack and
+                           belongs to the frame's catch-search, exactly as for any other throwing operator. */
+                        goto exception;
                     }
                     if (gk3 == CONT_OP_KEYED) {
                         /* the operator's own throw: its operands are still on the stack and belong to the frame's
@@ -27441,8 +27489,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 gtf->gen_data = s; gtf->gen_magic = 0xFF;
                 gtf->cont_state = gcreate_cont; gtf->cont_kind = gcreate_cont ? gcreate_cont_kind : CONT_NONE;
                 gtf->seq_req = gcall_cont; gtf->seq_req_kind = gcall_cont_kind;
-                gtf->forof_off = tramp_gen_create_forof;   /* 1 = OP_for_of_start iterator-getter: finish the enum_rec at settle; 0 = ordinary g() create */
-                tramp_gen_create_forof = 0;
+                gtf->forof_off = 0;   /* a CREATE never carries a for-of offset: OP_for_of_start's acquire is an
+                                          ordinary CALL with a CONT_FOROF_ACQUIRE continuation, so its enum_rec is
+                                          finished by that delivery and not by a second copy in this settle. */
                 gtf->b = NULL; gtf->local_buf = NULL;
                 gsf = &s->func_state.frame;
                 gfp = JS_VALUE_GET_OBJ(gsf->cur_func);
@@ -27472,7 +27521,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSGeneratorData *s = gtf->gen_data;
                 JSValue gfunc = gtf->async_promise;
                 uint8_t gitail = gtf->is_tail;
-                bool gforof_create = gtf->forof_off;   /* 1 = OP_for_of_start iterator-getter: finish the enum_rec */
                 uint8_t gcreate_cont_kind = gtf->cont_kind;   /* ACQUIRE requester: CONT_ITER_HELPER / CONT_ITER_CONSUME / CONT_PROMISE_ALL / CONT_ITER_FROM / CONT_NONE */
                 void *gcreate_cont = (gcreate_cont_kind == CONT_ITER_HELPER || gcreate_cont_kind == CONT_ITER_CONSUME
                                       || gcreate_cont_kind == CONT_PROMISE_ALL
@@ -27533,17 +27581,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     tramp_consume_state = gcreate_cont; tramp_consume_kind = gcreate_cont_kind;
                     tramp_consume_acquired = obj;
                     goto do_consume_deliver_iterator;
-                }
-                if (gforof_create) {
-                    /* OP_for_of_start: the @@iterator getter (a generator function) produced this iterator generator
-                       on the chain; finish the enum_rec exactly as OP_for_of_start's tail — [iterator, next, catch]. */
-                    JSValue nextm;
-                    *sp++ = obj;   /* sp[-1] = iterator (the generator) */
-                    nextm = JS_GetProperty(ctx, obj, JS_ATOM_next);
-                    if (JS_IsException(nextm)) goto exception;   /* obj on the stack; the unwind frees it */
-                    *sp++ = nextm;                       /* sp[-1]=next, sp[-2]=iterator */
-                    *sp++ = JS_NewCatchOffset(ctx, 0);   /* sp[-1]=catch, sp[-2]=next, sp[-3]=iterator */
-                    BREAK;
                 }
                 if (gitail) { ret_val = obj; goto do_return; }
                 *sp++ = obj;
@@ -27646,8 +27683,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                     DCHECK(gouter_kind == CONT_STEP || gouter_kind == CONT_ITER_CONSUME
                            || gouter_kind == CONT_ACQUIRE_GET || gouter_kind == CONT_ITER_CLOSE
-                           || gouter_kind == CONT_TRAP_GET || gouter_kind == CONT_OP_KEYED,
+                           || gouter_kind == CONT_TRAP_GET || gouter_kind == CONT_OP_KEYED
+                           || gouter_kind == CONT_FOROF_GET,
                            "property-get outer continuation: unknown machine kind");
+                    if (gouter_kind == CONT_FOROF_GET) {
+                        /* the for-of's @@iterator read invoked user code (an accessor, a Proxy `get` trap) and
+                           suspended. The iterable is still at sp[-1]; go on to step 4's Call. */
+                        js_getprop_free(ctx, gp);
+                        goto do_forof_have_method;
+                    }
                     if (gouter_kind == CONT_TRAP_GET) {
                         /* a handler's trap property was produced by USER CODE — an accessor on the handler, or a
                            handler that is itself a Proxy whose `get` trap ran on this chain. The operation
@@ -27832,6 +27876,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     for (i = dlv_cfirst; i < dlv_cargc; i++) JS_FreeValue(ctx, cargv[i]);
                     sp += dlv_cfirst - dlv_cargc;
                     js_iternext_deliver(ctx, sp, ret_val);
+                    BREAK;
+                }
+                if (dlv_ck == CONT_FOROF_ACQUIRE) {
+                    JSValue *cargv = sp - dlv_cargc;
+                    DCHECK(dlv_cargc >= dlv_cfirst, "for-of acquire frame records operands ending below where they start");
+                    for (i = dlv_cfirst; i < dlv_cargc; i++) JS_FreeValue(ctx, cargv[i]);
+                    sp += dlv_cfirst - dlv_cargc;
+                    if (unlikely(JS_IsException(ret_val))) goto exception;
+                    /* GetIterator step 5: the result must be an Object. Then the enum_rec OP_for_of_start
+                       leaves behind: [iterator, next, catch_offset]. */
+                    JSValue nextm;
+                    if (unlikely(!JS_IsObject(ret_val))) {
+                        JS_FreeValue(ctx, ret_val);
+                        JS_ThrowTypeErrorNotAnObject(ctx);
+                        goto exception;
+                    }
+                    DCHECK(sp + 3 <= TRAMP_SP_LIMIT(sf),
+                           "for-of acquire: enum_rec push exceeds the frame's compiled stack_size");
+                    *sp++ = ret_val;                     /* sp[-1] = iterator */
+                    nextm = JS_GetProperty(ctx, ret_val, JS_ATOM_next);
+                    if (JS_IsException(nextm)) goto exception;   /* the iterator is on the stack; the unwind frees it */
+                    *sp++ = nextm;                       /* sp[-1]=next, sp[-2]=iterator */
+                    *sp++ = JS_NewCatchOffset(ctx, 0);   /* sp[-1]=catch, sp[-2]=next, sp[-3]=iterator */
                     BREAK;
                 }
                 if (dlv_ck == CONT_CONSUME_GETITER) {
@@ -28809,35 +28876,35 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    @@iterator getter creates its iterator on THIS tramp chain — its params-to-initial_yield preempt
                    the base flow, never the C-recursion drive-to-completion js_call_generator_function would use.
                    The @@iterator getter is fetched ONCE (a spec GetMethod), so an accessor @@iterator is not re-run. */
-                JSValue itbl = sp[-1];
-                JSValue m = JS_GetProperty(ctx, itbl, JS_ATOM_Symbol_iterator);
-                if (JS_IsException(m)) goto exception;
-                if (tramp_can_call_gen_create(m)) {
-                    *sp++ = m;                     /* sp[-1]=gen fn, sp[-2]=iterable(this) */
-                    call_argc = 0; call_argv = sp;
-                    tramp_first = -2; tramp_is_tail = 0;
-                    tramp_gen_create_forof = 1;
-                    goto do_generator_create_tramp;   /* settle finishes the enum_rec */
-                }
+                gp_obj = sp[-1]; gp_atom = JS_ATOM_Symbol_iterator; gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
+                gp_outer = NULL; gp_outer_kind = CONT_FOROF_GET;
+                goto do_getprop_tramp;
+            }
+            BREAK;
+
+        do_forof_have_method:
+            /* GetIterator steps 3b-4 with the @@iterator method in hand (ret_val), reached from the read whether
+               it invoked user code or not. The iterable is at sp[-1], untouched by the read. */
+            {
+                JSValue m = ret_val;
+                ret_val = JS_UNDEFINED;
                 if (!JS_IsFunction(ctx, m)) {
                     JS_FreeValue(ctx, m);
                     JS_ThrowTypeError(ctx, "value is not iterable");
                     goto exception;
                 }
-                {
-                    JSValue iter = JS_GetIterator2(ctx, itbl, m);
-                    JSValue nextm;
-                    JS_FreeValue(ctx, m);
-                    if (JS_IsException(iter)) goto exception;
-                    JS_FreeValue(ctx, itbl);
-                    sp[-1] = iter;
-                    nextm = JS_GetProperty(ctx, iter, JS_ATOM_next);
-                    if (JS_IsException(nextm)) goto exception;
-                    *sp++ = nextm;                       /* sp[-1]=next, sp[-2]=iterator */
-                    *sp++ = JS_NewCatchOffset(ctx, 0);   /* sp[-1]=catch, sp[-2]=next, sp[-3]=iterator */
-                }
+                /* GetIterator step 4's Call, for ANY callable @@iterator. Only a GENERATOR FUNCTION used to run
+                   here; everything else — including the ordinary `[Symbol.iterator]() {…}` — went to
+                   JS_GetIterator2, which calls it from C, so a loop in it preempted with no flow base. */
+                DCHECK(sp + 1 <= TRAMP_SP_LIMIT(sf),
+                       "for-of acquire: operand push exceeds the frame's compiled stack_size");
+                *sp++ = m;                     /* sp[-1]=the @@iterator method, sp[-2]=iterable(this) */
+                call_argc = 0; call_argv = sp;
+                tramp_first = -2; tramp_is_tail = 0;
+                tramp_cont_state = NULL; tramp_cont_kind = CONT_FOROF_ACQUIRE;
+                goto do_generic_callee;
             }
-            BREAK;
         CASE(OP_for_of_next):
             {
                 int offset = -3 - pc[0];
@@ -31663,10 +31730,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JSProxyCtor *pcs = xcs;
             if (pcs) { tramp_step_chain_free(ctx, pcs->outer); js_free_rt(rt, pcs); }
         } else if (xck == CONT_SETTER || xck == CONT_INSTANCEOF
-                   || xck == CONT_ITER_NEXT_OP) {
-            /* a throwing setter body, a throwing proxy `construct` trap, or an OP_iterator_next .next() that threw:
-               no continuation state; the operands are on the caller stack and freed by the caller's own
-               catch-search, exactly like a normal method call. */
+                   || xck == CONT_ITER_NEXT_OP || xck == CONT_FOROF_ACQUIRE) {
+            /* a throwing setter body, a throwing proxy `construct` trap, an OP_iterator_next .next() that threw,
+               or a for-of's @@iterator that threw: no continuation state; the operands are on the caller stack and
+               freed by the caller's own catch-search, exactly like a normal method call. */
         } else if (xck == CONT_ASYNC_FROM_SYNC) {
             /* a driven sync .next() THREW while `for await` was awaiting the wrapper's promise. Like the Promise
                combinators, the wrapper must REJECT that promise and yield it — an escaping throw would be the
