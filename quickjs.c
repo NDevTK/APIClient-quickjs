@@ -33038,6 +33038,11 @@ typedef struct BlockEnv {
     int label_finally; /* -1 if none */
     int scope_level;
     uint8_t has_iterator : 1;
+    uint8_t is_async_iterator : 1; /* the iterator is an ASYNC one (`for await`), so closing it is 7.4.11
+                                      AsyncIteratorClose — Call(return) and then AWAIT the result — not 7.4.9.
+                                      It is a property of the LOOP, not of the enclosing function: an async
+                                      function's `for await` needs the await and an async generator's plain
+                                      for-of does not, and keying on the function kind got both backwards. */
     uint8_t is_regular_stmt : 1; // i.e. not a loop statement
     uint8_t has_using : 1; /* scope has using declarations needing disposal */
     int using_scope_level; /* scope level for OP_dispose_scope (-1 if none) */
@@ -39523,6 +39528,7 @@ static void push_break_entry(JSFunctionDef *fd, BlockEnv *be,
     be->label_finally = -1;
     be->scope_level = fd->scope_level;
     be->has_iterator = false;
+    be->is_async_iterator = false;
     be->is_regular_stmt = false;
     be->has_using = false;
     be->using_scope_level = -1;
@@ -39533,6 +39539,39 @@ static void pop_break_entry(JSFunctionDef *fd)
     BlockEnv *be;
     be = fd->top_break;
     fd->top_break = be->prev;
+}
+
+/* 7.4.11 AsyncIteratorClose over a `for await` loop's enum_rec [iterator, next, catch_offset], consuming the
+   same three slots OP_iterator_close (7.4.9) consumes. The difference is step 3.d: the call's result is AWAITED,
+   which is what makes a `return` that rejects reject the async function. Emitting the sync close for a `for await`
+   dropped the wrapper's promise on the floor, so a throwing sync `return` vanished on `break`.
+   An EXHAUSTED loop leaves the enum_rec's iterator slot undefined and closes nothing — the same guard
+   OP_iterator_close applies — and GetMethod's undefined/null means there is nothing to call. */
+static void emit_async_iterator_close(JSParseState *s)
+{
+    int label_no_method, label_skip, label_done;
+    emit_op(s, OP_drop);   /* the catch offset */
+    emit_op(s, OP_drop);   /* the `next` method */
+    /* stack: iterator */
+    emit_op(s, OP_dup);
+    emit_op(s, OP_is_undefined_or_null);
+    label_skip = emit_goto(s, OP_if_true, -1);
+    emit_op(s, OP_get_field2);
+    emit_atom(s, JS_ATOM_return);
+    /* stack: iterator return_func */
+    emit_op(s, OP_dup);
+    emit_op(s, OP_is_undefined_or_null);
+    label_no_method = emit_goto(s, OP_if_true, -1);
+    emit_op(s, OP_call_method);
+    emit_u16(s, 0);
+    emit_op(s, OP_check_object);   /* step 6: the result must be an Object (the completion here is never a throw) */
+    emit_op(s, OP_await);
+    label_done = emit_goto(s, OP_goto, -1);
+    emit_label(s, label_no_method);
+    emit_op(s, OP_drop);           /* the absent method, leaving the iterator */
+    emit_label(s, label_skip);
+    emit_label(s, label_done);
+    emit_op(s, OP_drop);           /* the iterator, or the awaited result */
 }
 
 static __exception int emit_break(JSParseState *s, JSAtom name, int is_cont)
@@ -39561,7 +39600,10 @@ static __exception int emit_break(JSParseState *s, JSAtom name, int is_cont)
         }
         i = 0;
         if (top->has_iterator) {
-            emit_op(s, OP_iterator_close);
+            if (top->is_async_iterator)
+                emit_async_iterator_close(s);
+            else
+                emit_op(s, OP_iterator_close);
             i += 3;
         }
         for(; i < top->drop_count; i++)
@@ -39622,7 +39664,9 @@ static void emit_return(JSParseState *s, bool hasval)
             emit_op(s, OP_nip_catch);
             /* stack: iter_obj next ret_val */
             if (top->has_iterator) {
-                if (s->cur_func->func_kind == JS_FUNC_ASYNC_GENERATOR) {
+                /* the LOOP decides, not the function: an async function's `for await` owes the await and an
+                   async generator's plain for-of does not. Keying on JS_FUNC_ASYNC_GENERATOR got both wrong. */
+                if (top->is_async_iterator) {
                     int label_next, label_next2;
                     emit_op(s, OP_nip); /* next */
                     emit_op(s, OP_swap);
@@ -39998,6 +40042,7 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
     bool has_initializer, is_for_of, has_destructuring;
     int tok, tok1, opcode, scope, block_scope_level;
     int label_next, label_expr, label_cont, label_body, label_break;
+    int label_done_noclose = -1;   /* a `for await` that ends EXHAUSTED performs no close (14.7.5.7 step 3.e.i) */
     int pos_next, pos_expr;
     BlockEnv break_entry;
 
@@ -40196,6 +40241,7 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
            that a yield in the expression does not try to close a
            not-yet-created iterator */
         break_entry.has_iterator = true;
+        break_entry.is_async_iterator = is_async;
         break_entry.drop_count += 2;
         if (is_async)
             emit_op(s, OP_for_await_of_start);
@@ -40320,15 +40366,32 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
     emit_goto(s, OP_if_false, label_next);
     /* drop the undefined value from for_xx_next */
     emit_op(s, OP_drop);
+    if (is_for_of && is_async) {
+        /* EXHAUSTED: 14.7.5.7 step 3.e.i returns without any close — the iterator is already finished. The sync
+           path reaches that by clearing the enum_rec's iterator slot inside OP_for_of_next, which is what makes
+           OP_iterator_close a no-op below; the async head has no such step, so the loop leaves here directly.
+           Falling through to the close instead ran AsyncIteratorClose on an exhausted iterator: one extra
+           PromiseResolve for the wrapper's synthesised result and one more for the Await, which is exactly the
+           tick and constructor-lookup count ticks-with-sync-iter-resolved-promise-and-constructor-lookup pins. */
+        emit_op(s, OP_drop);   /* the catch offset */
+        emit_op(s, OP_drop);   /* the `next` method */
+        emit_op(s, OP_drop);   /* the iterator */
+        label_done_noclose = emit_goto(s, OP_goto, -1);
+    }
 
     emit_label(s, label_break);
     if (is_for_of) {
         /* close and drop enum_rec */
         emit_source_loc_at(s, source_line_num, source_col_num);
-        emit_op(s, OP_iterator_close);
+        if (is_async)
+            emit_async_iterator_close(s);
+        else
+            emit_op(s, OP_iterator_close);
     } else {
         emit_op(s, OP_drop);
     }
+    if (label_done_noclose != -1)
+        emit_label(s, label_done_noclose);
     pop_break_entry(s->cur_func);
     pop_scope(s);
     return 0;
