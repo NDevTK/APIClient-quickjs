@@ -21219,7 +21219,6 @@ static int js_tramp_proxy_apply(JSContext *ctx, JSValueConst func_obj, JSValueCo
         DCHECK(!JS_IsUndefined(*out_target), "no-trap proxy walk must reach a callee");
         return 2;
     }
-    if (!tramp_can_call(method)) { JS_FreeValue(ctx, method); return 0; }   /* C/bound trap: no preemptible body */
     arr = js_create_array(ctx, argc, argv);
     if (JS_IsException(arr)) { JS_FreeValue(ctx, method); return -1; }
     out_slots[0] = js_dup(s->handler);   /* this */
@@ -23602,15 +23601,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         sp[1] = px[1];   /* the trap */
                         sp[2] = px[2]; sp[3] = px[3]; sp[4] = px[4];   /* target, thisArg, argArray */
                         call_argv = (JSValueConst *)(sp + 2); call_argc = 3; sp += 5;
+                        /* ANY callable trap is dispatched here, once. Asking whether it had a BYTECODE body and
+                           declining otherwise left the PROXY as the callee, so the arms below reached
+                           js_proxy_call and drove a C, bound, proxied or step-machine trap from C — the
+                           recognizer shape, and `new Proxy(f, {apply: Reflect.apply})` reached the backstop
+                           DFAIL. Which KIND of callee the trap is, is the question the rest of THIS label
+                           already answers, so the reshape RE-ENTERS it: the operands now name the trap and its
+                           own `this` (the handler), which is why this is a jump to the top rather than a fall
+                           through — gthis is computed there, and every arm above this one (the bound unwrap
+                           among them) has to see the trap too. */
+                        TRAMP_BODY_DISPATCH(-2, tramp_is_tail);   /* a bytecode trap runs here and can park */
                         tramp_first = -2;
-                        goto do_tramp_call;   /* the trap is a bytecode body: it runs here and can park */
+                        goto do_generic_callee;                   /* every other kind is answered at the top */
                     }
                     /* px_ret == 0 with a REPLACED callee: none of the questions above this label have been
                        asked of it — not the body entry, not the consumer recognizers — so re-enter the chain
                        from the top, exactly as the construct side re-enters after rewriting a trapless proxy.
-                       px_ret == 0 with the callee UNCHANGED is a proxy whose trap is a C or bound function (or
-                       is not callable at all): it has no preemptible body, the arms below reach it in place, and
-                       re-entering there would match this arm again forever. */
+                       px_ret == 0 with the callee UNCHANGED means it was never a proxy at all. */
                     if (resolved9) {
                         TRAMP_BODY_DISPATCH(tramp_first, tramp_is_tail);
                         goto do_consumer_dispatch;
