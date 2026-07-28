@@ -20422,6 +20422,25 @@ static int js_promise_all_step(JSContext *ctx, struct JSPromiseAll *s, JSValue r
 static int js_promise_all_attach(JSContext *ctx, struct JSPromiseAll *s, int index, JSValue next_promise);
 static void js_promise_all_end(JSContext *ctx, struct JSPromiseAll *s);
 static bool tramp_can_call_promise_all(JSContext *ctx, JSValueConst func, JSValueConst recv, JSValueConst *call_argv, int call_argc, int *out_magic, JSValue *out_getiter);
+
+/* A COROUTINE CREATE (generator or async generator) that fails BEFORE its frame exists must abandon the machine
+   that asked for the coroutine: that machine can never be re-entered, and nothing else holds it — the create took
+   it out of tramp_cont_state / tramp_gen_create_cont_it precisely so a stale requester could not be read by this
+   frame's next call. It is the create's counterpart to js_construct_requester_abandon and covers the create's own
+   kind set; a kind with no teardown here CRASHES rather than leaking silently. CONT_ITER_HELPER is listed and does
+   nothing on purpose — the helper is a GC object, so dropping the link is the whole teardown. */
+static void js_create_requester_abandon(JSContext *ctx, void *cont, uint8_t kind)
+{
+    if (!cont)
+        return;
+    if (kind == CONT_ITER_HELPER) return;
+    if (kind == CONT_STEP) { tramp_step_chain_free(ctx, cont); return; }
+    if (kind == CONT_PROMISE_ALL) {
+        js_promise_all_end(ctx, (struct JSPromiseAll *)cont); js_free_rt(ctx->rt, cont); return;
+    }
+    DCHECK(kind == CONT_ITER_CONSUME, "coroutine-create requester: unknown machine kind");
+    js_iter_consume_end(ctx, (struct JSIterConsume *)cont); js_free_rt(ctx->rt, cont);
+}
 typedef struct JSAsyncFromSyncIteratorData {   /* JS_CLASS_ASYNC_FROM_SYNC_ITERATOR opaque (hoisted for the for-await consumer) */
     JSValue sync_iter;
     JSValue next_method;
@@ -26957,11 +26976,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                the base flow), then create the async-generator object at do_agen_create_settle. Mirrors
                js_async_generator_function_call. */
             {
-                bool agapply = (tramp_apply_argv != NULL);
-                JSValueConst afn = agapply ? tramp_apply_func : call_argv[-1];
-                struct JSAsyncGeneratorData *s = js_mallocz(ctx, sizeof(JSAsyncGeneratorData));
+                /* The requester is taken HERE, at the top, for the reason the generator create takes its own here:
+                   between this point and the frame there are failures that `goto exception`, and a requester left
+                   standing in tramp_cont_state would be read by this frame's NEXT call — a stale machine, worse
+                   than the leak. Taken into a local, every failure below discharges it explicitly. */
+                void *acreate_cont = (tramp_cont_kind == CONT_STEP) ? tramp_cont_state : NULL;
+                uint8_t acreate_cont_kind = acreate_cont ? CONT_STEP : CONT_NONE;
+                bool agapply;
+                JSValueConst afn;
+                struct JSAsyncGeneratorData *s;
                 TrampFrame *atf2; JSStackFrame *asf2; JSObject *afp; JSFunctionBytecode *ab2;
-                if (unlikely(!s)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                if (acreate_cont) { tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE; }
+                agapply = (tramp_apply_argv != NULL);
+                afn = agapply ? tramp_apply_func : call_argv[-1];
+                s = js_mallocz(ctx, sizeof(JSAsyncGeneratorData));
+                if (unlikely(!s)) { js_create_requester_abandon(ctx, acreate_cont, acreate_cont_kind); JS_ThrowOutOfMemory(ctx); goto exception; }
                 ((JSAsyncGeneratorData *)s)->state = JS_ASYNC_GENERATOR_STATE_SUSPENDED_START;
                 init_list_head(&((JSAsyncGeneratorData *)s)->queue);
                 {
@@ -26972,11 +27001,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (agapply) TRAMP_APPLY_RELEASE();
                     if (aginit) {
                         ((JSAsyncGeneratorData *)s)->state = JS_ASYNC_GENERATOR_STATE_COMPLETED;
-                        js_async_generator_free(rt, s); goto exception;
+                        js_async_generator_free(rt, s);
+                        js_create_requester_abandon(ctx, acreate_cont, acreate_cont_kind);
+                        goto exception;
                     }
                 }
                 atf2 = js_malloc_rt(rt, sizeof(TrampFrame));
-                if (unlikely(!atf2)) { js_async_generator_free(rt, s); JS_ThrowOutOfMemory(ctx); goto exception; }
+                if (unlikely(!atf2)) { js_async_generator_free(rt, s);
+                                       js_create_requester_abandon(ctx, acreate_cont, acreate_cont_kind);
+                                       JS_ThrowOutOfMemory(ctx); goto exception; }
                 atf2->async_promise = js_dup(afn);   /* held for js_create_from_ctor at initial_yield */
                 /* Ownership is read BEFORE the operands are released, because the release is what destroys the
                    answer: a sequence's operands are an OWNED heap block, and `call_args_owned` is the only thing
@@ -26995,9 +27028,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 atf2->caller_var_refs = var_refs;
                 atf2->caller_argc = argc; atf2->caller_argv = argv;
                 atf2->caller_arg_allocated_size = arg_allocated_size;
-                atf2->seq_req = (tramp_cont_kind == CONT_STEP) ? tramp_cont_state : NULL;
-                atf2->seq_req_kind = atf2->seq_req ? CONT_STEP : CONT_NONE;
-                if (atf2->seq_req) { tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE; }
+                atf2->seq_req = acreate_cont; atf2->seq_req_kind = acreate_cont_kind;
                 atf2->caller_sp = agowned ? sp : (call_argv + tramp_first);
                 atf2->call_first = -1; atf2->call_argc = 0; atf2->is_tail = tramp_is_tail;
                 atf2->async_data = NULL; atf2->gen_data = NULL; atf2->gen_magic = 0;
@@ -27226,14 +27257,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValueConst gfunc = gapply ? tramp_apply_func : call_argv[-1];
                 JSGeneratorData *s = js_mallocz(ctx, sizeof(*s));
                 TrampFrame *gtf; JSStackFrame *gsf; JSObject *gfp; JSFunctionBytecode *gb;
-                /* A create failure BEFORE the frame is pushed can't reach the gen-frame exception unwind (which frees a
-                   CONT_ITER_CONSUME/CONT_PROMISE_ALL cont); free that driver state here. A CONT_ITER_HELPER cont is a
-                   GC object. */
-                #define GEN_CREATE_FAIL_FREE_CONT() do { \
-                    if (gcreate_cont && gcreate_cont_kind == CONT_ITER_CONSUME) { \
-                        js_iter_consume_end(ctx, (JSIterConsume *)gcreate_cont); js_free_rt(rt, gcreate_cont); } \
-                    else if (gcreate_cont && gcreate_cont_kind == CONT_PROMISE_ALL) { \
-                        js_promise_all_end(ctx, (JSPromiseAll *)gcreate_cont); js_free_rt(rt, gcreate_cont); } } while (0)
+                /* A create failure BEFORE the frame is pushed can't reach the gen-frame exception unwind, so the
+                   requester is abandoned here — through the create's ONE teardown, which knows every kind that
+                   can reach this label. The hand-rolled list this replaced knew two of them and silently leaked a
+                   CONT_STEP requester, which is exactly the failure the shared function makes impossible. */
+                #define GEN_CREATE_FAIL_FREE_CONT() \
+                    js_create_requester_abandon(ctx, gcreate_cont, gcreate_cont_kind)
                 if (unlikely(!s)) { GEN_CREATE_FAIL_FREE_CONT(); JS_ThrowOutOfMemory(ctx); goto exception; }
                 s->state = JS_GENERATOR_STATE_SUSPENDED_START;
                 {   /* async_func_init DUPS func + this + args, so the apply vector is dead the instant it returns —
@@ -31216,6 +31245,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         TrampFrame *ctf2 = tf_top;
         JSValue afn2 = ctf2->async_promise;
         sf->cur_sp = sp;                                  /* the body frame was RUNNING (cur_sp NULL) */
+        /* a SEQUENCE asked for this async generator and the params threw before it existed: the machine can never
+           be re-entered, so it is abandoned here — the same obligation the generator unwind discharges for its own
+           cont, through the same teardown, and the reason the requester is a FIELD rather than a value the pop
+           would forget. */
+        js_create_requester_abandon(ctx, ctf2->seq_req, ctf2->seq_req_kind);
         js_async_generator_free(rt, (JSAsyncGeneratorData *)ctf2->cont_state);
         JS_FreeValue(ctx, afn2);                          /* the held function ref */
         rt->current_stack_frame = ctf2->caller_sf;
