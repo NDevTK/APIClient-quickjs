@@ -19370,6 +19370,9 @@ static void js_getprop_free(JSContext *ctx, JSGetProp *gp)
                                   activation that was not the flow base. */
 typedef struct JSPromiseExec {
     JSValue promise;             /* step 3-7: the promise under construction (owned) */
+    void *outer;                 /* non-NULL = requested BY a machine (Reflect.construct(Promise, [fn])): the
+                                    promise is DELIVERED to it, not pushed on a stack this state does not own */
+    uint8_t outer_kind;
     JSValue executor_own;        /* Reflect.construct spelling: the executor came from an argsList element,
                                     not a caller-stack operand, so the state owns it (JS_UNDEFINED otherwise) */
     JSValue resolving_funcs[2];  /* step 8: [resolve, reject] (owned) */
@@ -20234,6 +20237,12 @@ typedef struct JSIterConsume {
     int64_t k;       /* next index to define (SPREAD: the running append position; unused for SET/MAP) */
     int orig_cfirst, orig_cargc;   /* FROM/SET/MAP: the ORIGINAL call/ctor operand shape (pop at finish) */
     uint8_t orig_is_tail;
+    /* Non-NULL = this consume was requested BY a state machine — `Reflect.construct(Map, entries)` from the
+       Reflect.construct machine — so its result is DELIVERED to that machine instead of being popped-and-pushed
+       on a caller stack it does not own. The step-CONSTRUCTOR arm one branch away already had exactly this; the
+       consumer arm asserted it away, which is what made a consumer target unreachable from a request. */
+    void *outer;
+    uint8_t outer_kind;
     uint8_t sink;    /* ITERCONS_FROM / _SPREAD / _SET / _MAP / _OBJENTRIES / _SETOP — the drive is identical; only the per-element sink + setup + finish differ */
     uint8_t setop;   /* SETOP_* — which Set.prototype set-operation rule ITERCONS_SETOP applies per element */
     /* ITERCONS_OWNED lists EVERY owned JSValue field exactly once: clone_deep_flow dups each and js_iter_consume_end
@@ -21693,9 +21702,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        driving its executor to completion — the same builtin suspending on one path and not the other. */
     JSValueConst pe_ntgt = JS_UNDEFINED, pe_executor = JS_UNDEFINED;
     int pe_cfirst = 0, pe_cargc = 0; JSValue pe_super_ref = JS_UNDEFINED;
+    void *pe_outer = NULL; uint8_t pe_outer_kind = CONT_NONE;   /* the machine that requested this Construct, if any */
     JSValueConst smc_ntgt = JS_UNDEFINED, smc_items = JS_UNDEFINED;   /* new Map/Set(iterable): the two
                                                                         entry shapes, ctor and super() */
     int smc_cfirst = -2, smc_cargc = 0; JSValue smc_super_ref = JS_UNDEFINED;
+    void *smc_outer = NULL; uint8_t smc_outer_kind = CONT_NONE;   /* the machine that requested this Construct, if any */
     JSValue pe_executor_own = JS_UNDEFINED;   /* owned executor for the Reflect.construct spelling */
     /* The heap argument LIST a spread / .apply shape built, handed to whichever consumer arm runs so the state
        can own it for the whole consume. NULL = the arguments are caller operands. */
@@ -21780,6 +21791,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        the way OP_init_ctor's partial copy of this chain already had: it knew Map/Set and String but not
        TypedArray, so `class S extends Int8Array {}` reached the C entry. */
     JSValueConst *tac_args = NULL; int tac_argc = 0, tac_cfirst = -2, tac_cargc = -1;
+    void *tac_outer = NULL; uint8_t tac_outer_kind = CONT_NONE;   /* the machine that requested this Construct, if any */
     /* The CALL shape's operand-pop count and heap argument list, the mirror of con_cargc / con_args_owned on the
        construct side. An .apply / spread CALL pushes the fixed [f, thisArg, array] triple and takes its arguments
        from the array, so the count it pops is NOT call_argc. -1 / NULL = the arguments ARE the operands. Both are
@@ -22485,7 +22497,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     && JS_IsConstructor(ctx, call_argv[0])
                     && (call_argc < 3 || JS_IsConstructor(ctx, call_argv[2]))
                     && JS_VALUE_GET_TAG(call_argv[1]) == JS_TAG_OBJECT) {
-                    /* Reflect.construct(target, argsList[, newTarget]). CALL-SITE-RESOLVED like Reflect.apply,
+                    /* NAMED, and why this route still stands: the machine makes it redundant — it builds its
+                       own argument block, which is the only thing the reshape ever existed for — and deleting it
+                       sends every consumer target into an arm that had no outer delivery. Three of the four are
+                       built now (Map/Set, TypedArray, the Promise executor); the fourth is a Proxy `construct`
+                       trap, whose CONT_PROXY_CONSTRUCT carries no state to hold an outer. That state is what
+                       has to exist before this goes.
+                       Reflect.construct(target, argsList[, newTarget]). CALL-SITE-RESOLVED like Reflect.apply,
                        and for the same reason: the arguments come from a LIST that must never reach the operand
                        stack, whose compiled size it could overflow. WHAT the target is is NOT this site's
                        question — three copies here knew only step ctors, bytecode-behind-binds and Promise, so
@@ -22809,7 +22827,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->resolving_funcs[1] = rfuncs[1];
                 s->super_ref = pe_super_ref; pe_super_ref = JS_UNDEFINED;   /* ownership moves to the continuation */
                 s->executor_own = pe_executor_own; pe_executor_own = JS_UNDEFINED;
-                s->orig_cfirst = pe_cfirst; s->orig_cargc = pe_cargc; s->orig_is_tail = tramp_is_tail;
+                s->outer = pe_outer; s->outer_kind = pe_outer_kind;
+                /* a machine's own Construct borrows ITS buffer: nothing on the stack to pop */
+                s->orig_cfirst = pe_outer ? 0 : pe_cfirst;
+                s->orig_cargc  = pe_outer ? 0 : pe_cargc;
+                s->orig_is_tail = pe_outer ? 0 : tramp_is_tail;
+                pe_outer = NULL; pe_outer_kind = CONT_NONE;
                 s->cb_args[0] = JS_UNDEFINED;          /* step 9: thisArgument is undefined */
                 s->cb_args[1] = pe_executor;           /* the executor (borrowed: a ctor operand / the derived argv) */
                 s->cb_args[2] = s->resolving_funcs[0]; /* borrowed views of the owned pair */
@@ -22852,6 +22875,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValue r = ps->promise;
                 int cfirst = ps->orig_cfirst, cargc = ps->orig_cargc;
                 uint8_t itail = ps->orig_is_tail;
+                void *pe_fin_outer = ps->outer; uint8_t pe_fin_outer_kind = ps->outer_kind;
                 JSValue *cargv = sp - cargc;
                 pexec_finish_state = NULL;
                 if (unlikely(JS_IsException(ret_val))) {
@@ -22873,6 +22897,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JS_FreeValue(ctx, ps->super_ref);   /* super() entry: the parent-class ref */
                 JS_FreeValue(ctx, ps->executor_own);   /* Reflect.construct entry: the argsList element */
                 js_free_rt(rt, ps);
+                if (pe_fin_outer) {
+                    DCHECK(pe_fin_outer_kind == CONT_STEP,
+                           "promise-executor outer continuation: unknown machine kind");
+                    cont_st = pe_fin_outer;
+                    ret_val = r;
+                    goto do_step_step;
+                }
                 for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
                 sp += cfirst - cargc;
                 if (itail) { ret_val = r; goto do_return; }
@@ -23088,8 +23119,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                 }
                 if (tramp_can_call_setmap_consume(ctx, con_func, con_args, con_argc, &smc_magic, &tramp_iter_getiter)) {
-                    DCHECK(!con_outer, "a step machine's Construct reached the Map/Set consumer arm — build its "
-                                       "outer delivery");
+                    smc_outer = con_outer; smc_outer_kind = con_outer_kind;
+                    con_outer = NULL; con_outer_kind = CONT_NONE;
                     smc_ntgt = con_ntgt; smc_items = (con_argc > 0) ? con_args[0] : JS_UNDEFINED;
                     /* the source outlives this arm — it is the `this` of the @@iterator call and then of every
                        .next() — so the LIST it lives in moves onto the consumer state */
@@ -23100,8 +23131,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto do_setmap_consume_tramp;
                 }
                 if (tramp_can_call_ta_consume(ctx, con_func, con_args, con_argc, &ta_classid, &tramp_iter_getiter)) {
-                    DCHECK(!con_outer, "a step machine's Construct reached the TypedArray consumer arm — build its "
-                                       "outer delivery");
+                    tac_outer = con_outer; tac_outer_kind = con_outer_kind;
+                    con_outer = NULL; con_outer_kind = CONT_NONE;
                     tac_args = con_args; tac_argc = con_argc; tac_ntgt = con_ntgt; tac_cfirst = tramp_first;
                     tac_cargc = con_pop;
                     tac_args_own = con_args_owned; tac_args_own_n = con_args_owned ? con_argc : 0;
@@ -23110,8 +23141,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto do_ta_consume_tramp;
                 }
                 if (tramp_can_call_promise_exec(ctx, con_func, con_args, con_argc)) {
-                    DCHECK(!con_outer, "a step machine's Construct reached the Promise executor arm — build its "
-                                       "outer delivery");
+                    pe_outer = con_outer; pe_outer_kind = con_outer_kind;
+                    con_outer = NULL; con_outer_kind = CONT_NONE;
                     pe_ntgt = con_ntgt; pe_executor = con_args[0];
                     pe_executor_own = JS_UNDEFINED;
                     if (con_args_owned) {
@@ -25357,7 +25388,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->adder = adder;
                 s->k = 0;
                 s->sink = (magic & MAGIC_SET) ? ITERCONS_SET : ITERCONS_MAP;
-                s->orig_cfirst = smc_cfirst; s->orig_cargc = smc_cargc; s->orig_is_tail = tramp_is_tail;
+                s->outer = smc_outer; s->outer_kind = smc_outer_kind;
+                /* a machine's own Construct borrows ITS buffer, so there is nothing on the stack to pop — the
+                   same rule the step-constructor arm states one branch away. */
+                s->orig_cfirst = smc_outer ? 0 : smc_cfirst;
+                s->orig_cargc  = smc_outer ? 0 : smc_cargc;
+                s->orig_is_tail = smc_outer ? 0 : tramp_is_tail;
+                smc_outer = NULL; smc_outer_kind = CONT_NONE;
                 s->super_ref = smc_super_ref; smc_super_ref = JS_UNDEFINED;   /* super() entry owns it */
                 s->args_own = smc_args_own; s->args_own_n = smc_args_own_n;   /* NULL for an operand shape */
                 smc_args_own = NULL; smc_args_own_n = 0;
@@ -25456,9 +25493,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     so->k = ta_argc; so->ta_k = 0;
                     so->sink = ITERCONS_FROM; so->ta_isfrom = 1; so->ta_classid = 0;
                     so->ta_phase = 1;
-                    so->orig_cfirst = tac_cfirst;
-                    so->orig_cargc = tac_cfirst ? (tac_cargc >= 0 ? tac_cargc : ta_argc) : 0;
-                    so->orig_is_tail = tramp_is_tail;
+                    so->outer = tac_outer; so->outer_kind = tac_outer_kind;
+                    so->orig_cfirst = tac_outer ? 0 : tac_cfirst;
+                    so->orig_cargc = tac_outer ? 0 : (tac_cfirst ? (tac_cargc >= 0 ? tac_cargc : ta_argc) : 0);
+                    so->orig_is_tail = tac_outer ? 0 : tramp_is_tail;
+                    tac_outer = NULL; tac_outer_kind = CONT_NONE;
                     tac_cargc = -1;   /* read + reset */
                     cont_st = so;
                     ret_val = JS_UNINITIALIZED;
@@ -25513,9 +25552,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 s->k = 0;
                 s->sink = ITERCONS_FROM;
-                s->orig_cfirst = tac_cfirst;
-                s->orig_cargc = tac_cfirst ? (tac_cargc >= 0 ? tac_cargc : ta_argc) : 0;
-                s->orig_is_tail = tramp_is_tail;
+                s->outer = tac_outer; s->outer_kind = tac_outer_kind;
+                s->orig_cfirst = tac_outer ? 0 : tac_cfirst;
+                s->orig_cargc = tac_outer ? 0 : (tac_cfirst ? (tac_cargc >= 0 ? tac_cargc : ta_argc) : 0);
+                s->orig_is_tail = tac_outer ? 0 : tramp_is_tail;
+                tac_outer = NULL; tac_outer_kind = CONT_NONE;
                 tac_cargc = -1;   /* read + reset */
                 DCHECK(ta_argc >= 1, "the TypedArray consume arm reads its source; the recognizers refuse argc 0");
                 tramp_consume_iterable = ta_argv[0];
@@ -25777,6 +25818,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JSValue r = s->r;                          s->r = JS_UNDEFINED;
                     int cfirst = s->orig_cfirst, cargc = s->orig_cargc;
                     uint8_t itail = s->orig_is_tail;
+                    void *fin_outer = s->outer; uint8_t fin_outer_kind = s->outer_kind;
                     int64_t n = s->k;
                     uint8_t sink = s->sink;
                     uint8_t is_tafrom = s->ta_isfrom;
@@ -25793,6 +25835,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        create-by-class are phases too) and their length is fixed by the allocation, so the write is
                        not part of either algorithm and the machine skips it for them. */
                     (void)n;
+                    if (fin_outer) {
+                        /* requested BY a machine: hand it the result, exactly as a step-constructor's does.
+                           Nothing was pushed and nothing is popped — the shape recorded at the creation says so. */
+                        DCHECK(fin_outer_kind == CONT_STEP, "consume outer continuation: unknown machine kind");
+                        cont_st = fin_outer;
+                        ret_val = r;
+                        goto do_step_step;
+                    }
                     JSValue *cargv = sp - cargc;
                     for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
                     sp += cfirst - cargc;
