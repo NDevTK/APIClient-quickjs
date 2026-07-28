@@ -19383,7 +19383,7 @@ typedef struct JSPromiseTry {
     int nargs;                   /* number of args passed to fn */
     JSValue cb_args[];           /* [this=undefined, fn, arg0..arg(nargs-1)] — owned dups; the tramp reads &cb_args[2] */
 } JSPromiseTry;
-static bool tramp_can_call_promise_try(JSValueConst func, JSValueConst *call_argv, int call_argc);
+static bool tramp_can_call_promise_try(JSValueConst func, JSValueConst recv, JSValueConst *call_argv, int call_argc);
 /* String.prototype.replace/replaceAll: a step machine. It holds a StringBuffer + endOfLastMatch across each
    callback, so replaceAll's loop is preemptible at every callback boundary and the replacer's body at every
    back-edge. (Kind 15 was CONT_STR_REPLACE, back when a hand-written driver ran this walk.) */
@@ -20375,7 +20375,7 @@ typedef struct JSPromiseAll {
 static int js_promise_all_step(JSContext *ctx, struct JSPromiseAll *s, JSValue res);
 static int js_promise_all_attach(JSContext *ctx, struct JSPromiseAll *s, int index, JSValue next_promise);
 static void js_promise_all_end(JSContext *ctx, struct JSPromiseAll *s);
-static bool tramp_can_call_promise_all(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_magic, JSValue *out_getiter);
+static bool tramp_can_call_promise_all(JSContext *ctx, JSValueConst func, JSValueConst recv, JSValueConst *call_argv, int call_argc, int *out_magic, JSValue *out_getiter);
 typedef struct JSAsyncFromSyncIteratorData {   /* JS_CLASS_ASYNC_FROM_SYNC_ITERATOR opaque (hoisted for the for-await consumer) */
     JSValue sync_iter;
     JSValue next_method;
@@ -23672,9 +23672,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         goto do_iter_consume_tramp;
                     }
                 }
-                if (tramp_can_call_promise_all(ctx, call_argv[-1], vc(call_argv), call_argc, &pa_magic, &tramp_iter_getiter))
+                if (tramp_can_call_promise_all(ctx, call_argv[-1], crecv, vc(call_argv), call_argc, &pa_magic, &tramp_iter_getiter))
                     goto do_promise_all_consume_tramp;          /* Promise.all/allSettled/any/race(iterable) */
-                if (tramp_can_call_promise_try(call_argv[-1], vc(call_argv), call_argc))
+                if (tramp_can_call_promise_try(call_argv[-1], crecv, vc(call_argv), call_argc))
                     goto do_promise_try_tramp;                  /* Promise.try(fn, ...args) */
                 /* no consumer matched: fall into the step/generic convergence below */
             }
@@ -25677,7 +25677,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                       JSValue *cv = sp - cg; for (i = cf; i < cg; i++) JS_FreeValue(ctx, cv[i]); sp += cf - cg;
                       if (it) { ret_val = r; goto do_return; } *sp++ = r; BREAK; }
                 }
-                tramp_consume_iterable = call_argv[0]; tramp_consume_state = s; tramp_consume_kind = CONT_PROMISE_ALL;
+                tramp_consume_iterable = (call_argc >= 1) ? call_argv[0] : JS_UNDEFINED;
+                tramp_consume_state = s; tramp_consume_kind = CONT_PROMISE_ALL;
                 goto do_consume_acquire_iterator;   /* GetIterator + its throw-rejects-the-aggregate live in the shared deliver */
             }
 
@@ -70857,6 +70858,10 @@ static int promise_resolve_elem_prep(JSContext *ctx, int magic, JSValueConst *fu
     JSValueConst resolve_element_env = func_data[4];
     JSValue obj;
     int is_zero, index;
+    /* A resolving function takes ONE parameter, and a page can call it with none — `f()` on a resolve-element
+       closure it got hold of, which is exactly what the reject-element tests do. Reading argv[0] unconditionally
+       ran off the end of the invocation list. */
+    JSValueConst settled = (argc >= 1) ? argv[0] : JS_UNDEFINED;
 
     *out_resolve = JS_UNDEFINED; *out_arg = JS_UNDEFINED; *out_fire = 0;
     if (JS_ToInt32(ctx, &index, func_data[1]))
@@ -70873,9 +70878,9 @@ static int promise_resolve_elem_prep(JSContext *ctx, int magic, JSValueConst *fu
         if (JS_IsException(str)) { JS_FreeValue(ctx, obj); return -1; }
         if (JS_DefinePropertyValue(ctx, obj, JS_ATOM_status, str, JS_PROP_C_W_E) < 0) { JS_FreeValue(ctx, obj); return -1; }
         if (JS_DefinePropertyValue(ctx, obj, is_reject ? JS_ATOM_reason : JS_ATOM_value,
-                                   js_dup(argv[0]), JS_PROP_C_W_E) < 0) { JS_FreeValue(ctx, obj); return -1; }
+                                   js_dup(settled), JS_PROP_C_W_E) < 0) { JS_FreeValue(ctx, obj); return -1; }
     } else {
-        obj = js_dup(argv[0]);
+        obj = js_dup(settled);
     }
     if (JS_DefinePropertyValueUint32(ctx, values, index, obj, JS_PROP_C_W_E) < 0)
         return -1;
@@ -70988,156 +70993,22 @@ static JSValue js_promise_all_resolve_element(JSContext *ctx,
 }
 
 /* magic = 0: Promise.all 1: Promise.allSettled */
+/* 27.2.4.1/.2/.3 Promise.all / allSettled / any, and 27.2.4.5 race below, have NO iteration left here. Every
+   call with an object receiver is routed onto the consume machine at do_consumer_dispatch — one question, asked
+   once, so `.call`/`.apply`/a spread/a bound spelling and any argument count all reach it — and that machine
+   drives the source's @@iterator and .next() on the tramp. What is gone is the `for(;;) JS_IteratorNext` this ran
+   from C, where a .next() with a loop in it had no flow base and aborted at its back-edge.
+   The receiver check is what remains: NewPromiseCapability(C) requires an Object and 27.2.4.1 step 2 throws that
+   TypeError BEFORE any iteration, so it is decided here and the route declines on it. Anything else reaching this
+   entry is an unrouted call site — there is no second driver. */
 static JSValue js_promise_all(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv, int magic)
 {
-    JSValue result_promise, resolving_funcs[2], item, next_promise, ret;
-    JSValue next_method = JS_UNDEFINED, values = JS_UNDEFINED;
-    JSValue resolve_element_env = JS_UNDEFINED, resolve_element, reject_element;
-    JSValue promise_resolve = JS_UNDEFINED, iter = JS_UNDEFINED;
-    JSValueConst then_args[2], resolve_element_data[5];
-    int done, index, is_zero, is_promise_any = (magic == PROMISE_MAGIC_any);
-
     if (!JS_IsObject(this_val))
         return JS_ThrowTypeErrorNotAnObject(ctx);
-    result_promise = js_new_promise_capability(ctx, resolving_funcs, this_val);
-    if (JS_IsException(result_promise))
-        return result_promise;
-    promise_resolve = JS_GetProperty(ctx, this_val, JS_ATOM_resolve);
-    if (JS_IsException(promise_resolve) ||
-        check_function(ctx, promise_resolve))
-        goto fail_reject;
-    iter = JS_GetIterator(ctx, argv[0], false);
-    /* FALLBACK — Promise.all/allSettled/any/race drives .next from C, where a coroutine cannot suspend. Alive
-       because tramp_can_call_promise_all / _race narrow to generator-backed sources; every other iterable lands
-       here. Reaching this with a real iterator is the unbuilt case: widen the selector, build what the failures
-       name, delete the loop. The crash IS the tracking — a comment here is invisible to a green run. */
-    if (!JS_IsException(iter))
-        DFAIL("Promise combinator is iterating from C — route this call site onto the consume machine (widen "
-              "tramp_can_call_promise_all / tramp_can_call_promise_race past generator-backed sources)");
-    if (JS_IsException(iter)) {
-        JSValue error;
-    fail_reject:
-        error = JS_GetException(ctx);
-        ret = JS_Call(ctx, resolving_funcs[1], JS_UNDEFINED, 1, vc(&error));
-        JS_FreeValue(ctx, error);
-        if (JS_IsException(ret))
-            goto fail;
-        JS_FreeValue(ctx, ret);
-    } else {
-        next_method = JS_GetProperty(ctx, iter, JS_ATOM_next);
-        if (JS_IsException(next_method))
-            goto fail_reject;
-        values = JS_NewArray(ctx);
-        if (JS_IsException(values))
-            goto fail_reject;
-        resolve_element_env = JS_NewArray(ctx);
-        if (JS_IsException(resolve_element_env))
-            goto fail_reject;
-        /* remainingElementsCount field */
-        if (JS_DefinePropertyValueUint32(ctx, resolve_element_env, 0,
-                                         js_int32(1),
-                                         JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE | JS_PROP_WRITABLE) < 0)
-            goto fail_reject;
-
-        index = 0;
-        for(;;) {
-            /* XXX: conformance: should close the iterator if error on 'done'
-               access, but not on 'value' access */
-            item = JS_IteratorNext(ctx, iter, next_method, 0, NULL, &done);
-            if (JS_IsException(item))
-                goto fail_reject;
-            if (done)
-                break;
-            next_promise = JS_Call(ctx, promise_resolve,
-                                   this_val, 1, vc(&item));
-            JS_FreeValue(ctx, item);
-            if (JS_IsException(next_promise)) {
-            fail_reject1:
-                JS_IteratorClose(ctx, iter, true);
-                goto fail_reject;
-            }
-            resolve_element_data[0] = JS_FALSE;
-            resolve_element_data[1] = js_int32(index);
-            resolve_element_data[2] = values;
-            resolve_element_data[3] = resolving_funcs[is_promise_any];
-            resolve_element_data[4] = resolve_element_env;
-            resolve_element =
-                JS_NewCFunctionData(ctx, js_promise_all_resolve_element, 1,
-                                    magic, 5, resolve_element_data);
-            if (JS_IsException(resolve_element)) {
-                JS_FreeValue(ctx, next_promise);
-                goto fail_reject1;
-            }
-            promise_reaction_set_step(resolve_element);
-
-            if (magic == PROMISE_MAGIC_allSettled) {
-                reject_element =
-                    JS_NewCFunctionData(ctx, js_promise_all_resolve_element, 1,
-                                        magic | 4, 5, resolve_element_data);
-                if (JS_IsException(reject_element)) {
-                    JS_FreeValue(ctx, next_promise);
-                    goto fail_reject1;
-                }
-                promise_reaction_set_step(reject_element);
-            } else if (magic == PROMISE_MAGIC_any) {
-                if (JS_DefinePropertyValueUint32(ctx, values, index,
-                                                 JS_UNDEFINED, JS_PROP_C_W_E) < 0)
-                    goto fail_reject1;
-                reject_element = resolve_element;
-                resolve_element = js_dup(resolving_funcs[0]);
-            } else {
-                reject_element = js_dup(resolving_funcs[1]);
-            }
-
-            if (remainingElementsCount_add(ctx, resolve_element_env, 1) < 0) {
-                JS_FreeValue(ctx, next_promise);
-                JS_FreeValue(ctx, resolve_element);
-                JS_FreeValue(ctx, reject_element);
-                goto fail_reject1;
-            }
-
-            then_args[0] = resolve_element;
-            then_args[1] = reject_element;
-            ret = JS_InvokeFree(ctx, next_promise, JS_ATOM_then, 2, then_args);
-            JS_FreeValue(ctx, resolve_element);
-            JS_FreeValue(ctx, reject_element);
-            if (check_exception_free(ctx, ret))
-                goto fail_reject1;
-            index++;
-        }
-
-        is_zero = remainingElementsCount_add(ctx, resolve_element_env, -1);
-        if (is_zero < 0)
-            goto fail_reject;
-        if (is_zero) {
-            if (magic == PROMISE_MAGIC_any) {
-                JSValue error;
-                error = js_aggregate_error_constructor(ctx, values);
-                if (JS_IsException(error))
-                    goto fail_reject;
-                JS_FreeValue(ctx, values);
-                values = error;
-            }
-            ret = JS_Call(ctx, resolving_funcs[is_promise_any], JS_UNDEFINED,
-                          1, vc(&values));
-            if (check_exception_free(ctx, ret))
-                goto fail_reject;
-        }
-    }
- done:
-    JS_FreeValue(ctx, promise_resolve);
-    JS_FreeValue(ctx, resolve_element_env);
-    JS_FreeValue(ctx, values);
-    JS_FreeValue(ctx, next_method);
-    JS_FreeValue(ctx, iter);
-    JS_FreeValue(ctx, resolving_funcs[0]);
-    JS_FreeValue(ctx, resolving_funcs[1]);
-    return result_promise;
- fail:
-    JS_FreeValue(ctx, result_promise);
-    result_promise = JS_EXCEPTION;
-    goto done;
+    DFAIL("Promise.all/allSettled/any reached its C entry with an object receiver — route that call site onto "
+          "the consume machine (do_consumer_dispatch); there is no second driver");
+    return JS_EXCEPTION;
 }
 
 /* Advance Promise.all(gen): `res` = the previous .next() result {value,done} (UNINITIALIZED on the first step).
@@ -71299,12 +71170,11 @@ static void js_promise_all_end(JSContext *ctx, JSPromiseAll *s)
 
 /* Route Promise.all / allSettled / any over a GENERATOR-BACKED iterable (its .next() must run on the tramp); `race`
    and every other shape stay on the normal C path, which drives them correctly. */
-static bool tramp_can_call_promise_all(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_magic, JSValue *out_getiter)
+static bool tramp_can_call_promise_all(JSContext *ctx, JSValueConst func, JSValueConst recv, JSValueConst *call_argv, int call_argc, int *out_magic, JSValue *out_getiter)
 {
     JSObject *fp;
     int magic;
     *out_getiter = JS_UNDEFINED;
-    if (call_argc != 1) return false;
     if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
     fp = JS_VALUE_GET_OBJ(func);
     if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
@@ -71324,8 +71194,10 @@ static bool tramp_can_call_promise_all(JSContext *ctx, JSValueConst func, JSValu
     }
     /* the receiver (the constructor `this`) must be an Object — NewPromiseCapability(C) requires it. A non-object
        (Promise.all.call(5, x)) is rejected here so the C entry throws TypeErrorNotAnObject in spec order, BEFORE
-       any iteration; a side-effect-free tag check, so probing it changes nothing. */
-    if (JS_VALUE_GET_TAG(call_argv[-2]) != JS_TAG_OBJECT) return false;
+       any iteration; a side-effect-free tag check, so probing it changes nothing. The RESOLVED receiver is
+       passed in: a plain -1 call (`var f = Promise.all; f(x)`) has no receiver operand at all, so reading
+       call_argv[-2] read whatever sat below the callee. */
+    if (JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT) return false;
     /* ANY argument, including a non-object and a non-iterable. The tag check was the last iterability gate: it
        handed Promise.all(1) / Promise.all(undefined) to the C body, whose whole remaining job there was to reject
        the aggregate with a TypeError — which do_consume_acquire_iterator now does itself, on the tramp.
@@ -71333,7 +71205,10 @@ static bool tramp_can_call_promise_all(JSContext *ctx, JSValueConst func, JSValu
        BEFORE @@iterator, so probing here is unobservable — the observable @@iterator CALL happens later in
        do_consume_acquire_iterator. There is nothing left to SELECT: the probe's result is passed along for the
        acquire to use, and its ABSENCE is the acquire's TypeError, not a reason to refuse the route. */
-    iter_data_at_iterator(ctx, call_argv[0], out_getiter);   /* JS_UNDEFINED when absent/uncallable => acquire throws */
+    /* ANY ARGUMENT COUNT. These take exactly one parameter, so extra arguments are ignored and a missing one is
+       undefined — neither is a fact about the CALLEE, and requiring exactly 1 sent `Promise.all(iter, "extra")`
+       and `Promise.all()` to the C body, whose .next() loop cannot suspend. */
+    iter_data_at_iterator(ctx, (call_argc >= 1) ? call_argv[0] : JS_UNDEFINED, out_getiter);   /* JS_UNDEFINED when absent/uncallable => acquire throws */
     *out_magic = magic;
     return true;
 }
@@ -71359,7 +71234,7 @@ static bool tramp_can_call_promise_exec(JSContext *ctx, JSValueConst func, JSVal
 /* Promise.try(fn, ...args): fn is called SYNCHRONOUSLY, so a loop in it must park. Route only a BYTECODE fn (can
    loop) with an object receiver; a C/bound fn (no preemptible body), a non-callable fn, or a non-object receiver
    fall through to js_promise_try, which handles them in spec order (reject / throw). */
-static bool tramp_can_call_promise_try(JSValueConst func, JSValueConst *call_argv, int call_argc)
+static bool tramp_can_call_promise_try(JSValueConst func, JSValueConst recv, JSValueConst *call_argv, int call_argc)
 {
     JSObject *fp;
     if (call_argc < 1) return false;
@@ -71368,83 +71243,18 @@ static bool tramp_can_call_promise_try(JSValueConst func, JSValueConst *call_arg
     if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
     if (fp->u.cfunc.cproto != JS_CFUNC_generic) return false;
     if (fp->u.cfunc.c_function.generic != js_promise_try) return false;
-    if (JS_VALUE_GET_TAG(call_argv[-2]) != JS_TAG_OBJECT) return false;   /* receiver must be a constructor */
+    if (JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT) return false;   /* receiver must be a constructor (resolved: a plain -1 call has no receiver operand) */
     return tramp_can_call(call_argv[0]);   /* bytecode fn only */
 }
 
 static JSValue js_promise_race(JSContext *ctx, JSValueConst this_val,
                                int argc, JSValueConst *argv)
 {
-    JSValue result_promise, resolving_funcs[2], item, next_promise, ret;
-    JSValue next_method = JS_UNDEFINED, iter = JS_UNDEFINED;
-    JSValue promise_resolve = JS_UNDEFINED;
-    int done;
-
     if (!JS_IsObject(this_val))
         return JS_ThrowTypeErrorNotAnObject(ctx);
-    result_promise = js_new_promise_capability(ctx, resolving_funcs, this_val);
-    if (JS_IsException(result_promise))
-        return result_promise;
-    promise_resolve = JS_GetProperty(ctx, this_val, JS_ATOM_resolve);
-    if (JS_IsException(promise_resolve) ||
-        check_function(ctx, promise_resolve))
-        goto fail_reject;
-    iter = JS_GetIterator(ctx, argv[0], false);
-    /* FALLBACK — Promise.all/allSettled/any/race drives .next from C, where a coroutine cannot suspend. Alive
-       because tramp_can_call_promise_all / _race narrow to generator-backed sources; every other iterable lands
-       here. Reaching this with a real iterator is the unbuilt case: widen the selector, build what the failures
-       name, delete the loop. The crash IS the tracking — a comment here is invisible to a green run. */
-    if (!JS_IsException(iter))
-        DFAIL("Promise combinator is iterating from C — route this call site onto the consume machine (widen "
-              "tramp_can_call_promise_all / tramp_can_call_promise_race past generator-backed sources)");
-    if (JS_IsException(iter)) {
-        JSValue error;
-    fail_reject:
-        error = JS_GetException(ctx);
-        ret = JS_Call(ctx, resolving_funcs[1], JS_UNDEFINED, 1, vc(&error));
-        JS_FreeValue(ctx, error);
-        if (JS_IsException(ret))
-            goto fail;
-        JS_FreeValue(ctx, ret);
-    } else {
-        next_method = JS_GetProperty(ctx, iter, JS_ATOM_next);
-        if (JS_IsException(next_method))
-            goto fail_reject;
-
-        for(;;) {
-            /* XXX: conformance: should close the iterator if error on 'done'
-               access, but not on 'value' access */
-            item = JS_IteratorNext(ctx, iter, next_method, 0, NULL, &done);
-            if (JS_IsException(item))
-                goto fail_reject;
-            if (done)
-                break;
-            next_promise = JS_Call(ctx, promise_resolve,
-                                   this_val, 1, vc(&item));
-            JS_FreeValue(ctx, item);
-            if (JS_IsException(next_promise)) {
-            fail_reject1:
-                JS_IteratorClose(ctx, iter, true);
-                goto fail_reject;
-            }
-            ret = JS_InvokeFree(ctx, next_promise, JS_ATOM_then, 2,
-                                vc(resolving_funcs));
-            if (check_exception_free(ctx, ret))
-                goto fail_reject1;
-        }
-    }
- done:
-    JS_FreeValue(ctx, promise_resolve);
-    JS_FreeValue(ctx, next_method);
-    JS_FreeValue(ctx, iter);
-    JS_FreeValue(ctx, resolving_funcs[0]);
-    JS_FreeValue(ctx, resolving_funcs[1]);
-    return result_promise;
- fail:
-    //JS_FreeValue(ctx, next_method); // why not???
-    JS_FreeValue(ctx, result_promise);
-    result_promise = JS_EXCEPTION;
-    goto done;
+    DFAIL("Promise.race reached its C entry with an object receiver — route that call site onto the consume "
+          "machine (do_consumer_dispatch); there is no second driver");
+    return JS_EXCEPTION;
 }
 
 static __exception int perform_promise_then(JSContext *ctx,
