@@ -19475,6 +19475,10 @@ typedef struct JSAsyncPost {
     JSValue await_promise;    /* AWAIT only (owned); UNDEFINED otherwise */
     JSAsyncFunctionData *st;  /* AWAIT only: a reference the finish releases */
 } JSAsyncPost;
+#define CONT_PROMISE_ALL_THEN 42  /* gp_outer = JSPromiseAll: the per-element attach's `Get(next_promise, "then")`.
+                                     Both halves of that Invoke are page code for a subclass or a thenable, and
+                                     js_promise_all_attach did them with JS_InvokeFree from C — the last live one
+                                     of the eight C-side `then` invokes. */
 #define CONT_AGEN_SETTLE   41  /* cont_state = JSAgenSettle: an async GENERATOR body that reached AWAIT on the
                                   tramp chain. Await's resolve call is the same page code the async function's is
                                   (the native resolving function's `then` read on a thenable), and it is placed
@@ -20120,6 +20124,7 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_PROXY_CONSTRUCT:
     case CONT_INSTANCEOF:
     case CONT_PROMISE_EXEC:
+    case CONT_PROMISE_ALL_THEN:
     case CONT_AGEN_SETTLE:
     case CONT_ASYNC_SETTLE:
     case CONT_PROMISE_TRY_SETTLE:
@@ -20676,13 +20681,23 @@ typedef struct JSPromiseAll {
                                     NOT close it either. Only a post-retrieval error (resolve/attach) closes. */
     JSValue fin_arg;             /* the finalize argument (values dup / AggregateError), owned only in the brief
                                     window before it is transferred onto the tramp operand stack */
+    /* The per-element ATTACH — `Invoke(next_promise, "then", [resolve_element, reject_element])`. BOTH halves are
+       page code for a subclass or a thenable (the `then` READ and the CALL), and js_promise_all_attach did them
+       with JS_InvokeFree from C. Only the PROMISE and the index ride the state across the read: the two element
+       closures are built when the method is in hand, so a fork landing mid-attach gives the sibling its OWN
+       closures bound to ITS aggregate, which is what dup'ing them could not have done. */
+    JSValue att_promise;         /* the resolved element wrapper the attach is on (owned) */
+    int att_index;               /* which element it is */
+    uint8_t attaching;           /* 1 while that attach is being driven on the tramp */
+    int reattach_i;              /* the fork re-attach cursor, one element per drive */
     int orig_cfirst, orig_cargc; uint8_t orig_is_tail;   /* the ORIGINAL OP_call_method operand shape */
     /* mirrors JSIterConsume's: an .apply / spread CALL's arguments live in a heap list, and the iterable is
        borrowed out of it until the acquire has an iterator. */
     JSValue *args_own; int args_own_n;
 } JSPromiseAll;
 static int js_promise_all_step(JSContext *ctx, struct JSPromiseAll *s, JSValue res);
-static int js_promise_all_attach(JSContext *ctx, struct JSPromiseAll *s, int index, JSValue next_promise);
+static int js_promise_all_attach_args(JSContext *ctx, struct JSPromiseAll *s, int index,
+                                      JSValue *out_re, JSValue *out_rj);
 static void js_promise_all_end(JSContext *ctx, struct JSPromiseAll *s);
 static bool tramp_can_call_promise_all(JSContext *ctx, JSValueConst func, JSValueConst recv, JSValueConst *call_argv, int call_argc, int *out_magic, JSValue *out_getiter);
 
@@ -25839,6 +25854,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                       if (gk == CONT_FORAWAIT_SYNC_GET) goto do_forawait_have_sync_method;
                       if (gk == CONT_ITER_CONSUME) goto do_iter_consume_step;
                       if (gk == CONT_ITER_CLOSE) { cont_st = gouter0; goto do_iter_close_method; }
+                      if (gk == CONT_PROMISE_ALL_THEN) { cont_st = gouter0; goto do_promise_all_attach_call; }
                       DCHECK(gk == CONT_STEP, "property-get outer continuation: unknown machine kind"); }
                     goto do_step_step;
                 }
@@ -26816,6 +26832,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    state torn down mid-request still holds one), and "a zeroed JSValue happens to be an int" is not
                    a contract this file should depend on. */
                 s->fin_arg = JS_UNDEFINED; s->elem_value = JS_UNDEFINED;
+                s->att_promise = JS_UNDEFINED;   /* js_mallocz zeroes it, and a zero JSValue is not UNDEFINED */
                 s->acq_method = tramp_iter_getiter; tramp_iter_getiter = JS_UNDEFINED;
                 s->acq_iterable = js_dup((call_argc >= 1) ? call_argv[0] : JS_UNDEFINED);
                 TAKE_CALL_SHAPE(); s->orig_cfirst = call_first_r; s->orig_cargc = call_pop; s->orig_is_tail = tramp_is_tail;
@@ -26869,6 +26886,33 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 goto do_consume_acquire_iterator;   /* GetIterator + its throw-rejects-the-aggregate live in the shared deliver */
             }
 
+        do_promise_all_attach_call:
+            /* ATTACH, second half: the `then` method is in ret_val, so build THIS element's closures and call it.
+               They are built here rather than carried across the read, so a fork landing mid-attach gives the
+               sibling closures bound to its OWN aggregate. Reached from both answers the read can have — a plain
+               data `then` answered in place, and one an accessor or a Proxy trap produced. */
+            {
+                JSPromiseAll *pa = (JSPromiseAll *)cont_st;
+                JSValue pre, prj;
+                cont_st = NULL;
+                if (unlikely(js_promise_all_attach_args(ctx, pa, pa->att_index, &pre, &prj) < 0)) {
+                    JS_FreeValue(ctx, ret_val);
+                    ret_val = JS_UNINITIALIZED;
+                    cont_st = pa;
+                    goto do_promise_all_err_entry;
+                }
+                DCHECK(sp + 4 <= TRAMP_SP_LIMIT(sf),
+                       "Promise combinator attach: operand push exceeds the frame's compiled stack_size");
+                *sp++ = pa->att_promise; pa->att_promise = JS_UNDEFINED;   /* this (owned, transferred) */
+                *sp++ = ret_val; ret_val = JS_UNDEFINED;                   /* the `then` method (owned) */
+                *sp++ = pre;
+                *sp++ = prj;
+                call_argv = sp - 2; call_argc = 2; tramp_first = -2; tramp_is_tail = 0;
+                call_cfirst = 0; call_cargc = -1;   /* the operands ARE the four just pushed */
+                tramp_cont_state = pa; tramp_cont_kind = CONT_PROMISE_ALL;
+                goto do_generic_callee;
+            }
+
         do_promise_all_deliver:
             /* THE ONE delivery of a Promise combinator's call: either the PLAIN-iterator .next() ([iter, next],
                nops 2) or the aggregate FINALIZE settle ([this, fn, arg], nops 3), from any frame kind. For .next
@@ -26889,19 +26933,37 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 JSPromiseAll *s = (JSPromiseAll *)cont_st;
                 int st;
-                if (unlikely(s->reattach_pending > 0)) {
-                    /* freshly-forked sibling: re-attach the retained pre-fork element wrappers [0..reattach_pending) to
-                       THIS aggregate now (deferred out of clone_deep_flow so the .then re-entry runs in the sibling's
-                       own context). Each attach does remainingElementsCount_add(+1), matching the parent's count. */
-                    int rp = s->reattach_pending, rfail = 0;
-                    s->reattach_pending = 0;
-                    for (int ei = 0; ei < rp; ei++) {
-                        JSValue ep = JS_GetPropertyInt64(ctx, s->elem_promises, ei);
-                        if (JS_IsException(ep) || js_promise_all_attach(ctx, s, ei, ep) < 0) { rfail = 1; break; }  /* consumes ep */
+                if (unlikely(s->reattach_pending > 0 && !s->attaching)) {
+                    /* freshly-forked sibling: re-attach the retained pre-fork element wrappers [0..reattach_pending)
+                       to THIS aggregate (deferred out of clone_deep_flow so the .then re-entry runs in the
+                       sibling's own context). Each attach does remainingElementsCount_add(+1), matching the
+                       parent's count — and each is now a REQUEST, so the loop is a CURSOR: one element per drive,
+                       because the `then` read and call between them can suspend. */
+                    JSValue ep;
+                    if (s->reattach_i >= s->reattach_pending) {
+                        s->reattach_pending = 0; s->reattach_i = 0;
+                    } else {
+                        ep = JS_GetPropertyInt64(ctx, s->elem_promises, s->reattach_i);
+                        if (JS_IsException(ep)) { st = -1; goto promise_all_err; }
+                        DCHECK(JS_IsUndefined(s->att_promise), "an attach is already in flight on this aggregate");
+                        s->att_promise = ep;
+                        s->att_index = s->reattach_i;
+                        s->attaching = 1;
+                        s->reattach_i++;
+                        if (s->reattach_i >= s->reattach_pending) { s->reattach_pending = 0; s->reattach_i = 0; }
+                        st = 5;
+                        goto promise_all_dispatch;
                     }
-                    if (rfail) { st = -1; goto promise_all_err; }
                 }
                 st = js_promise_all_step(ctx, s, ret_val);
+            promise_all_dispatch:;
+                if (0) {
+                do_promise_all_err_entry:
+                    /* a stage OUTSIDE the step threw (the attach's `then` read, or building its closures): take
+                       the step's own error path, which knows whether the iterator still owes a close. */
+                    s = (JSPromiseAll *)cont_st;
+                    st = -1;
+                }
                 if (unlikely(st < 0)) {   /* an error: reject the aggregate, yield it (do not throw out of Promise.all) */
                 promise_all_err:;
                     JSValue err = JS_GetException(ctx);
@@ -26916,6 +26978,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        a harmless second call (no re-loop). */
                     s->fin_arg = err; s->fin_is_reject = 1; s->finalizing = 1;
                     st = 2;   /* fall through to the FINALIZE drive below, then DONE */
+                }
+                if (st == 5) {
+                    /* ATTACH, first half: `Get(next_promise, "then")`. On a subclass or a thenable that read is an
+                       accessor or a Proxy trap — page code — and JS_InvokeFree did it from C. */
+                    gp_outer = s; gp_outer_kind = CONT_PROMISE_ALL_THEN;
+                    gp_obj = s->att_promise; gp_atom = JS_ATOM_then;
+                    gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                    goto do_getprop_tramp;
+                }
+                if (st == 6) {
+                    /* the re-attach cursor has another element: re-enter with nothing to consume. */
+                    ret_val = JS_UNINITIALIZED;
+                    goto do_promise_all_step;
                 }
                 if (st == 4) {
                     /* RESOLVE-ELEMENT: `C.resolve(value)` per element. C is the receiver Promise.all was called
@@ -28575,8 +28650,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            || gouter_kind == CONT_ACQUIRE_GET || gouter_kind == CONT_ITER_CLOSE
                            || gouter_kind == CONT_TRAP_GET || gouter_kind == CONT_OP_KEYED
                            || gouter_kind == CONT_FOROF_GET || gouter_kind == CONT_FORAWAIT_GET
-                           || gouter_kind == CONT_FORAWAIT_SYNC_GET,
+                           || gouter_kind == CONT_FORAWAIT_SYNC_GET
+                           || gouter_kind == CONT_PROMISE_ALL_THEN,
                            "property-get outer continuation: unknown machine kind");
+                    if (gouter_kind == CONT_PROMISE_ALL_THEN) {
+                        js_getprop_free(ctx, gp);
+                        cont_st = gouter;
+                        goto do_promise_all_attach_call;
+                    }
                     if (gouter_kind == CONT_FOROF_GET || gouter_kind == CONT_FORAWAIT_GET
                         || gouter_kind == CONT_FORAWAIT_SYNC_GET) {
                         /* a for-of / for-await @@iterator read invoked user code (an accessor, a Proxy `get`
@@ -32632,9 +32713,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             void *gouter = gp->outer;
             uint8_t gk2 = gp->outer_kind;
             DCHECK(!gouter || gk2 == CONT_STEP || gk2 == CONT_ITER_CONSUME || gk2 == CONT_ACQUIRE_GET
-                   || gk2 == CONT_ITER_CLOSE || gk2 == CONT_TRAP_GET || gk2 == CONT_OP_KEYED,
+                   || gk2 == CONT_ITER_CLOSE || gk2 == CONT_TRAP_GET || gk2 == CONT_OP_KEYED
+                   || gk2 == CONT_PROMISE_ALL_THEN,
                    "property-get outer continuation: unknown machine kind");
             js_getprop_free(ctx, gp);
+            if (gouter && gk2 == CONT_PROMISE_ALL_THEN) {
+                /* the attach's `then` READ threw. It is a post-retrieval stage, so it rejects the aggregate and
+                   closes the iterator — spec fail_reject1 — which is exactly what the step's own error path
+                   does. */
+                cont_st = gouter;
+                ret_val = JS_UNINITIALIZED;
+                goto do_promise_all_err_entry;
+            }
             if (gouter && gk2 == CONT_OP_KEYED) {
                 /* a bytecode OPERATOR's trap threw: nothing is waiting on the answer, and the operator's operands
                    belong to its own frame's catch-search — only the key this state owns is ours to release. */
@@ -33572,6 +33662,8 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                 ns->this_val = js_dup(os->this_val);
                 ns->promise_resolve = js_dup(os->promise_resolve);
                 ns->elem_value = js_dup(os->elem_value);   /* in flight when a fork lands mid-resolve */
+                ns->att_promise = js_dup(os->att_promise); /* likewise, mid-attach: the sibling redoes the attach,
+                                                              building its OWN element closures from ns */
                 ns->acq_method = js_dup(os->acq_method);       /* both in flight when a fork lands mid-capability */
                 ns->acq_iterable = js_dup(os->acq_iterable);
                 ns->result_promise = js_new_promise_capability(ctx, ns->resolving_funcs, os->this_val);   /* fresh aggregate + [resolve,reject] */
@@ -73553,18 +73645,19 @@ static JSValue js_promise_all(JSContext *ctx, JSValueConst this_val,
 /* Attach the per-element then() for element `index` of aggregate `s` onto its resolved wrapper `next_promise`
    (CONSUMED). This is the attach half of the per-element loop, factored out so the fork-clone can re-bind the
    retained pre-fork element wrappers onto a sibling aggregate. Returns 0 / -1 (frees next_promise on the error path). */
-static int js_promise_all_attach(JSContext *ctx, JSPromiseAll *s, int index, JSValue next_promise)
+/* The two ELEMENT CLOSURES the attach passes to `then`, built once the method is in hand. Everything here is C:
+   the closures are engine-made and the arrays they capture are the aggregate's own. `race` passes the aggregate's
+   resolve/reject directly — the FIRST element to settle wins, so there is no per-element closure at all. */
+static int js_promise_all_attach_args(JSContext *ctx, JSPromiseAll *s, int index,
+                                      JSValue *out_re, JSValue *out_rj)
 {
-    JSValue resolve_element, rr;
-    JSValueConst resolve_element_data[5], then_args[2];
+    JSValue resolve_element, reject_element;
+    JSValueConst resolve_element_data[5];
+
+    *out_re = JS_UNDEFINED; *out_rj = JS_UNDEFINED;
     if (s->magic == PROMISE_MAGIC_race) {
-        /* race: attach the aggregate's own resolve/reject directly — the FIRST element to settle wins; no per-element
-           closure, no values/remainingElementsCount. */
-        then_args[0] = s->resolving_funcs[0];
-        then_args[1] = s->resolving_funcs[1];
-        rr = JS_InvokeFree(ctx, next_promise, JS_ATOM_then, 2, then_args);
-        if (JS_IsException(rr)) return -1;
-        JS_FreeValue(ctx, rr);
+        *out_re = js_dup(s->resolving_funcs[0]);
+        *out_rj = js_dup(s->resolving_funcs[1]);
         return 0;
     }
     resolve_element_data[0] = JS_FALSE;
@@ -73574,37 +73667,29 @@ static int js_promise_all_attach(JSContext *ctx, JSPromiseAll *s, int index, JSV
     resolve_element_data[4] = s->resolve_element_env;
     resolve_element = JS_NewCFunctionData(ctx, js_promise_all_resolve_element, 1,
                                           s->magic, 5, resolve_element_data);
-    if (JS_IsException(resolve_element)) { JS_FreeValue(ctx, next_promise); return -1; }
+    if (JS_IsException(resolve_element)) return -1;
     promise_reaction_set_step(resolve_element);
-    {
-        JSValue reject_element;
-        if (s->magic == PROMISE_MAGIC_allSettled) {
-            /* allSettled: a rejection is ALSO recorded (as {status:'rejected', reason}) — a second element closure. */
-            reject_element = JS_NewCFunctionData(ctx, js_promise_all_resolve_element, 1,
-                                                 s->magic | 4, 5, resolve_element_data);
-            if (JS_IsException(reject_element)) { JS_FreeValue(ctx, next_promise); JS_FreeValue(ctx, resolve_element); return -1; }
-            promise_reaction_set_step(reject_element);
-        } else if (s->magic == PROMISE_MAGIC_any) {
-            /* any: the element CLOSURE is the REJECT handler (records the error at index); a FULFILLMENT resolves the
-               aggregate directly. Pre-fill values[index] so a later rejection has a slot. */
-            if (JS_DefinePropertyValueUint32(ctx, s->values, index, JS_UNDEFINED, JS_PROP_C_W_E) < 0) {
-                JS_FreeValue(ctx, next_promise); JS_FreeValue(ctx, resolve_element); return -1;
-            }
-            reject_element = resolve_element;
-            resolve_element = js_dup(s->resolving_funcs[0]);
-        } else {
-            reject_element = js_dup(s->resolving_funcs[1]);   /* `all`: reject the aggregate on first rejection */
+    if (s->magic == PROMISE_MAGIC_allSettled) {
+        /* allSettled: a rejection is ALSO recorded (as {status:'rejected', reason}) — a second element closure. */
+        reject_element = JS_NewCFunctionData(ctx, js_promise_all_resolve_element, 1,
+                                             s->magic | 4, 5, resolve_element_data);
+        if (JS_IsException(reject_element)) { JS_FreeValue(ctx, resolve_element); return -1; }
+        promise_reaction_set_step(reject_element);
+    } else if (s->magic == PROMISE_MAGIC_any) {
+        /* any: the element CLOSURE is the REJECT handler (records the error at index); a FULFILLMENT resolves the
+           aggregate directly. Pre-fill values[index] so a later rejection has a slot. */
+        if (JS_DefinePropertyValueUint32(ctx, s->values, index, JS_UNDEFINED, JS_PROP_C_W_E) < 0) {
+            JS_FreeValue(ctx, resolve_element); return -1;
         }
-        if (remainingElementsCount_add(ctx, s->resolve_element_env, 1) < 0) {
-            JS_FreeValue(ctx, next_promise); JS_FreeValue(ctx, resolve_element); JS_FreeValue(ctx, reject_element); return -1;
-        }
-        then_args[0] = resolve_element;
-        then_args[1] = reject_element;
-        rr = JS_InvokeFree(ctx, next_promise, JS_ATOM_then, 2, then_args);
-        JS_FreeValue(ctx, resolve_element); JS_FreeValue(ctx, reject_element);
-        if (JS_IsException(rr)) return -1;
-        JS_FreeValue(ctx, rr);
+        reject_element = resolve_element;
+        resolve_element = js_dup(s->resolving_funcs[0]);
+    } else {
+        reject_element = js_dup(s->resolving_funcs[1]);   /* `all`: reject the aggregate on first rejection */
     }
+    if (remainingElementsCount_add(ctx, s->resolve_element_env, 1) < 0) {
+        JS_FreeValue(ctx, resolve_element); JS_FreeValue(ctx, reject_element); return -1;
+    }
+    *out_re = resolve_element; *out_rj = reject_element;
     return 0;
 }
 
@@ -73629,7 +73714,19 @@ static int js_promise_all_step(JSContext *ctx, JSPromiseAll *s, JSValue res)
         if (JS_DefinePropertyValueInt64(ctx, s->elem_promises, s->index, js_dup(next_promise), JS_PROP_C_W_E) < 0) {
             JS_FreeValue(ctx, next_promise); return -1;
         }
-        if (js_promise_all_attach(ctx, s, s->index, next_promise) < 0) return -1;   /* consumes next_promise */
+        /* the ATTACH is two pieces of page code — the `then` READ and the CALL — so it is REQUESTED, not
+           performed: the state holds the wrapper and the index while the read runs on the tramp. */
+        DCHECK(JS_IsUndefined(s->att_promise), "an attach is already in flight on this aggregate");
+        s->att_promise = next_promise;   /* ownership moves */
+        s->att_index = s->index;
+        s->attaching = 1;
+        return 5;   /* ATTACH: read `then`, then invoke it */
+    }
+    if (s->attaching) {
+        /* the attach's `then` returned (its result is discarded): that element is done. */
+        JS_FreeValue(ctx, res);
+        s->attaching = 0;
+        if (s->reattach_i > 0) return 6;   /* the fork re-attach cursor has more elements */
         s->index++;
         return 1;   /* drive the next .next() */
     }
@@ -73709,6 +73806,7 @@ static void js_promise_all_end(JSContext *ctx, JSPromiseAll *s)
     JS_FreeValue(ctx, s->resolve_element_env);
     JS_FreeValue(ctx, s->elem_promises);
     JS_FreeValue(ctx, s->fin_arg);     /* held only between the step that builds it and the drive that takes it */
+    JS_FreeValue(ctx, s->att_promise); /* held across the attach's `then` read */
     JS_FreeValue(ctx, s->elem_value);  /* likewise, for the per-element resolve */
     JS_FreeValue(ctx, s->acq_method);    /* both held across the capability request */
     JS_FreeValue(ctx, s->acq_iterable);
