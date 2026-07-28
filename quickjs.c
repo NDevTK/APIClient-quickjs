@@ -21556,7 +21556,6 @@ static bool tramp_unwrap_iter_next(JSValueConst *piter, JSValueConst *pnext) {
            step, a generator settles through do_generator_settle), so a flag raised before them would still be   \
            standing when the machine's NEXT call — a callback — was delivered. */                                \
         if (pdrive) *(uint8_t *)(pdrive) = 1;                                                             \
-        if (tramp_can_call(call_argv[-1])) goto do_tramp_call;                                            \
         goto do_generic_callee;                                                                           \
     } while (0)
 
@@ -21761,6 +21760,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     /* A continuation-holding builtin's state is handed to the callback frame that do_tramp_call pushes, so its
        do_return re-enters that builtin's step instead of returning to bytecode. */
     void *tramp_cont_state = NULL, *cont_st = NULL;
+    /* the operands do_cont_deliver reads: WHO asked for a call result, in WHAT shape, and whether the requester
+       was itself in tail position. A returning bytecode frame fills them from its TrampFrame; a coroutine create
+       requested by a call fills them from the requester it took at its own label. */
+    void *dlv_cs = NULL; uint8_t dlv_ck = CONT_NONE;
+    int dlv_cfirst = 0, dlv_cargc = 0, dlv_forof = 0; uint8_t dlv_itail = 0;
     uint8_t tramp_cont_kind = CONT_NONE;
     int tramp_gen_magic = 0;                            /* set before goto do_generator_tramp */
     /* ASYNC-GENERATOR DRIVE (do_agen_drive_tramp/_enter/_finish). tramp_agen_magic is the request kind, set before
@@ -23636,12 +23640,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
 
         do_generic_callee:
-            /* THE convergence point for a callee with no bytecode body. Every call shape arrives having declared
-               only its OPERAND SHAPE (tramp_first: -1 plain [f,args], -2 method [this,f,args]) — the cleanup below
-               is fully determined by it, which is why these were duplicate blocks. The step-machine question is
-               asked HERE, ONCE: a per-call-site predicate is the recognizer allowlist in its final costume, since
-               it must be re-added per call opcode and each omission is a silent gap (routing plain f() was exactly
-               that gap, and each copy then needed its own tramp_first). */
+            /* THE convergence point for a call whose CALLEE KIND is not yet resolved. Every call shape arrives
+               having declared only its OPERAND SHAPE (tramp_first: -1 plain [f,args], -2 method [this,f,args]) —
+               the cleanup below is fully determined by it, which is why these were duplicate blocks. The
+               step-machine question is asked HERE, ONCE: a per-call-site predicate is the recognizer allowlist in
+               its final costume, since it must be re-added per call opcode and each omission is a silent gap
+               (routing plain f() was exactly that gap, and each copy then needed its own tramp_first).
+               THE BODY-ENTRY QUESTION IS ASKED HERE FOR THE SAME REASON. It used to be the ENTRANT's job, and the
+               entrants that were not call opcodes asked a degraded TWO-way version of it —
+               `if (tramp_can_call(callee)) goto do_tramp_call;` — which is true only for a PLAIN body, so a
+               generator or async generator in a step machine's callback slot, a consumer's mapfn, an adder, or a
+               Promise.all resolve-element fell straight past it to the arms below and had its coroutine created by
+               an ordinary C call that then resumed off the chain: the drive-to-completion DFAIL, at seven sites,
+               each of which would have needed a fifth body kind added correctly. A site now declares its shape and
+               jumps; it cannot answer this differently from any other site because it does not answer it. */
+            TRAMP_BODY_DISPATCH(tramp_first, tramp_is_tail);
             {
                 JSValueConst gthis = (tramp_first == -2) ? call_argv[-2] : JS_UNDEFINED;
                 if (JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT
@@ -24365,25 +24378,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     call_argv = (JSValueConst *)&bl7[2];
                     tramp_first = -2;
                 }
-                if (tramp_body_entry(call_argv[-1]) == TBE_AGEN) {
-                    /* an ASYNC-GENERATOR function, the same story as the generator one below: it fell past the
-                       body dispatch and had its coroutine created by an ordinary call. */
-                    tramp_cont_state = cd_outer; tramp_cont_kind = cd_outer_kind;
-                    cd_outer = NULL; cd_outer_kind = CONT_NONE;
-                    call_cfirst = 0; call_cargc = 0;
-                    tramp_is_tail = 0;
-                    goto do_agen_create_tramp;
-                }
-                if (tramp_body_entry(call_argv[-1]) == TBE_GEN) {
-                    tramp_gen_create_cont_it = cd_outer; tramp_gen_create_cont_kind = cd_outer_kind;
-                    cd_outer = NULL; cd_outer_kind = CONT_NONE;
-                    call_cfirst = 0; call_cargc = 0;
-                    tramp_is_tail = 0;
-                    goto do_generator_create_tramp;
-                }
+                /* The two arms that used to sit here — one for a generator function in the callback slot, one
+                   for an async generator — are gone, and their deletion is the point. They named the coroutine
+                   kinds because the create only accepted a CONT_STEP requester, so a sequence had to hand itself
+                   over specially; now the create takes a CALL requester of any kind out of tramp_cont_state,
+                   which is where this fall-through already puts it. A sequence's coroutine callback is not a case,
+                   it is the ordinary path. */
                 tramp_cont_state = cd_outer; tramp_cont_kind = cd_outer_kind;
                 cd_outer = NULL; cd_outer_kind = CONT_NONE;
                 call_cfirst = 0; call_cargc = 0;
+                tramp_is_tail = 0;
                 /* through the CONSUMER recognizers, not past them. An opcode's call reaches them because
                    OP_call/OP_call_method converge on do_consumer_dispatch, and this label jumped straight to
                    do_generic_callee — so a sequence's call was the one spelling that never asked, and
@@ -25726,9 +25730,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                       *sp++ = js_int64(ta_mapfn ? s->ta_k : (from_mapfn ? s->k : s->k - 1));   /* FROM has not incremented k yet */
                       call_argv = sp - nargs; call_argc = nargs; tramp_first = -2; tramp_is_tail = 0; }
                     tramp_cont_state = s; tramp_cont_kind = CONT_ITER_CONSUME;
-                    /* the split is the FRAME KIND, not whether to suspend — a bytecode body gets a heap frame
-                       and everything else goes to the one convergence point, which delivers this continuation. */
-                    if (tramp_can_call(call_argv[-1])) goto do_tramp_call;
+                    /* the FRAME KIND is the convergence point's question, not this site's: it asked only
+                       whether the callee had a PLAIN body, so `Array.from(src, genFn)` created its coroutine by an
+                       ordinary call and resumed it off the chain. */
                     goto do_generic_callee;
                 }
                 if (st == 7) {
@@ -25744,9 +25748,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     else { *sp++ = js_dup(s->cb_value); }
                     call_argv = sp - nargs; call_argc = nargs; tramp_first = -2; tramp_is_tail = 0;
                     tramp_cont_state = s; tramp_cont_kind = CONT_ITER_CONSUME;
-                    /* a SUBCLASS may override add/set with a bound or proxied function; the split is the frame
-                       kind, and do_generic_callee answers every other shape. */
-                    if (tramp_can_call(call_argv[-1])) goto do_tramp_call;
+                    /* a SUBCLASS may override add/set with a bound or proxied function — or a generator
+                       function, which is why the frame kind is asked at the convergence point and not here. */
                     goto do_generic_callee;
                 }
                 if (st == 6) {
@@ -26197,7 +26200,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         call_argv = sp; call_argc = 0; tramp_first = -2; tramp_is_tail = 0;
                         if (!JS_IsUninitialized(s->drive_arg)) { *sp++ = js_dup(s->drive_arg); call_argc = 1; }
                         tramp_cont_state = s; tramp_cont_kind = CONT_ASYNC_FROM_SYNC;
-                        if (tramp_can_call(call_argv[-1])) goto do_tramp_call;
                         goto do_generic_callee;
                     }
                 do_afs_itercall_reject:
@@ -26433,7 +26435,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         /* the split is the FRAME KIND, not whether to suspend — a bytecode body gets a heap frame
                            and every other kind goes to the one convergence point, which delivers this
                            continuation. `.map(Math.abs)` is a STEP MACHINE and reached its C entry here. */
-                        if (tramp_can_call(call_argv[-1])) goto do_tramp_call;
                         goto do_generic_callee;
                     }
                     if (st == 2) {   /* CREATE_INNER (flatMap): the inner's [Symbol.iterator] is a generator function.
@@ -26777,6 +26778,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 gs->state = JS_GENERATOR_STATE_EXECUTING;
                 gtf = js_malloc_rt(rt, sizeof(TrampFrame));
                 if (unlikely(!gtf)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                gtf->seq_req = NULL; gtf->seq_req_kind = CONT_NONE;   /* a DRIVE was not requested BY a call */
                 if (close) {
                     /* OP_iterator_close (.return()): HOLD the generator across its finally run (like the direct
                        drive), then the settle discards the result. A concolic fork in the finally recovers the
@@ -26980,8 +26982,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    between this point and the frame there are failures that `goto exception`, and a requester left
                    standing in tramp_cont_state would be read by this frame's NEXT call — a stale machine, worse
                    than the leak. Taken into a local, every failure below discharges it explicitly. */
-                void *acreate_cont = (tramp_cont_kind == CONT_STEP) ? tramp_cont_state : NULL;
-                uint8_t acreate_cont_kind = acreate_cont ? CONT_STEP : CONT_NONE;
+                void *acreate_cont = tramp_cont_state;
+                uint8_t acreate_cont_kind = tramp_cont_kind;
                 bool agapply;
                 JSValueConst afn;
                 struct JSAsyncGeneratorData *s;
@@ -27081,11 +27083,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->generator = JS_VALUE_GET_OBJ(obj);
                 JS_SetOpaqueInternal(obj, s);
                 if (aseq) {
-                    /* requested BY a sequence: the async generator IS that callback's result. */
-                    DCHECK(aseq_kind == CONT_STEP, "async-generator create requester: unknown machine kind");
-                    cont_st = aseq;
+                    /* requested BY A CALL: the async generator is that call's RESULT, so it goes to the ONE
+                       delivery a returning bytecode callback uses — empty operand shape, because the create
+                       already dropped the call's operands and restored the caller's sp. */
+                    dlv_cs = aseq; dlv_ck = aseq_kind;
+                    dlv_cfirst = 0; dlv_cargc = 0; dlv_itail = 0; dlv_forof = 0;
                     ret_val = obj;
-                    goto do_step_step;
+                    goto do_cont_deliver;
                 }
                 if (aitail) { ret_val = obj; goto do_return; }
                 *sp++ = obj;
@@ -27154,6 +27158,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 TrampFrame *dtf3 = js_malloc_rt(rt, sizeof(TrampFrame));
                 JSStackFrame *dsf3; JSObject *dfp3; JSFunctionBytecode *db3;
                 if (unlikely(!dtf3)) { JS_FreeValue(ctx, agen_hold); JS_FreeValue(ctx, agen_prom); JS_ThrowOutOfMemory(ctx); goto exception; }
+                dtf3->seq_req = NULL; dtf3->seq_req_kind = CONT_NONE;   /* a DRIVE was not requested BY a call */
                 dtf3->up = tf_top;
                 dtf3->caller_sf = sf; dtf3->caller_b = b; dtf3->caller_ctx = ctx;
                 dtf3->caller_local_buf = local_buf; dtf3->caller_stack_buf = stack_buf;
@@ -27240,19 +27245,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                PARAM-DEFAULT loop preempts the base flow), then at initial_yield (do_generator_create_settle)
                creates the generator object and returns it. Mirrors js_call_generator_function. */
             {
-                void *gcreate_cont = tramp_gen_create_cont_it; tramp_gen_create_cont_it = NULL;   /* driver create? (settle re-enters its step) */
+                /* TWO DIFFERENT OBLIGATIONS, and conflating them is what made the generator a wrong ANSWER rather
+                   than a missing one. An ACQUIRE requester (tramp_gen_create_cont_it) called this generator
+                   function as its @@iterator, so the created generator IS its iterator. A CALL requester
+                   (tramp_cont_state, where every ordinary call leaves it) called it as a CALLBACK — a sequence's,
+                   a consumer's mapfn, a collection's adder — so the created generator is that call's RESULT and
+                   goes to the same delivery a plain bytecode callback's return uses. Read off the kind alone they
+                   are indistinguishable: CONT_ITER_CONSUME means both. */
+                void *gcreate_cont = tramp_gen_create_cont_it; tramp_gen_create_cont_it = NULL;   /* ACQUIRE: the settle hands over the iterator */
                 uint8_t gcreate_cont_kind = tramp_gen_create_cont_kind; tramp_gen_create_cont_kind = 0;
-                if (!gcreate_cont && tramp_cont_kind == CONT_STEP) {
-                    /* A SEQUENCE reached this create through a REWRITE — a bound generator function unwrapped at
-                       do_generic_callee, a proxied one resolved to its target — so it never passed the arm that
-                       sets tramp_gen_create_cont_it, and the create ran with no driver at all: the generator was
-                       PUSHED onto the caller's stack while the machine sat waiting for its callback's result.
-                       The requester is where every other call path leaves it, in tramp_cont_state; the dedicated
-                       register exists for the consumers, and a sequence is found here so that EVERY spelling that
-                       reaches this label is driven, not just the one that came straight down. */
-                    gcreate_cont = tramp_cont_state; gcreate_cont_kind = CONT_STEP;
-                    tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;
-                }
+                /* A CALL requester of ANY kind, not just CONT_STEP. Narrowed to sequences, every other machine
+                   that puts a coroutine function in a callback slot — Array.from's mapfn, a Set subclass's adder,
+                   an iterator helper's callback — had its generator PUSHED onto a stack it was not using while it
+                   sat waiting for a result that never came. */
+                void *gcall_cont = tramp_cont_state; uint8_t gcall_cont_kind = tramp_cont_kind;
+                if (gcall_cont) { tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE; }
                 bool gapply = (tramp_apply_argv != NULL);
                 JSValueConst gfunc = gapply ? tramp_apply_func : call_argv[-1];
                 JSGeneratorData *s = js_mallocz(ctx, sizeof(*s));
@@ -27261,8 +27268,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    requester is abandoned here — through the create's ONE teardown, which knows every kind that
                    can reach this label. The hand-rolled list this replaced knew two of them and silently leaked a
                    CONT_STEP requester, which is exactly the failure the shared function makes impossible. */
-                #define GEN_CREATE_FAIL_FREE_CONT() \
-                    js_create_requester_abandon(ctx, gcreate_cont, gcreate_cont_kind)
+                #define GEN_CREATE_FAIL_FREE_CONT() do {                             \
+                    js_create_requester_abandon(ctx, gcreate_cont, gcreate_cont_kind);   \
+                    js_create_requester_abandon(ctx, gcall_cont, gcall_cont_kind); } while (0)
                 if (unlikely(!s)) { GEN_CREATE_FAIL_FREE_CONT(); JS_ThrowOutOfMemory(ctx); goto exception; }
                 s->state = JS_GENERATOR_STATE_SUSPENDED_START;
                 {   /* async_func_init DUPS func + this + args, so the apply vector is dead the instant it returns —
@@ -27305,6 +27313,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    created generator as the helper's inner and re-enters do_iter_helper_step instead of pushing it. */
                 gtf->gen_data = s; gtf->gen_magic = 0xFF;
                 gtf->cont_state = gcreate_cont; gtf->cont_kind = gcreate_cont ? gcreate_cont_kind : CONT_NONE;
+                gtf->seq_req = gcall_cont; gtf->seq_req_kind = gcall_cont ? gcall_cont_kind : CONT_NONE;
                 gtf->forof_off = tramp_gen_create_forof;   /* 1 = OP_for_of_start iterator-getter: finish the enum_rec at settle; 0 = ordinary g() create */
                 tramp_gen_create_forof = 0;
                 gtf->b = NULL; gtf->local_buf = NULL;
@@ -27337,10 +27346,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValue gfunc = gtf->async_promise;
                 uint8_t gitail = gtf->is_tail;
                 bool gforof_create = gtf->forof_off;   /* 1 = OP_for_of_start iterator-getter: finish the enum_rec */
-                uint8_t gcreate_cont_kind = gtf->cont_kind;   /* CONT_ITER_HELPER / CONT_ITER_CONSUME / CONT_PROMISE_ALL / CONT_NONE */
+                uint8_t gcreate_cont_kind = gtf->cont_kind;   /* ACQUIRE requester: CONT_ITER_HELPER / CONT_ITER_CONSUME / CONT_PROMISE_ALL / CONT_ITER_FROM / CONT_NONE */
                 void *gcreate_cont = (gcreate_cont_kind == CONT_ITER_HELPER || gcreate_cont_kind == CONT_ITER_CONSUME
-                                      || gcreate_cont_kind == CONT_PROMISE_ALL || gcreate_cont_kind == CONT_STEP
+                                      || gcreate_cont_kind == CONT_PROMISE_ALL
                                       || gcreate_cont_kind == CONT_ITER_FROM) ? gtf->cont_state : NULL;
+                void *gcall_cont = gtf->seq_req; uint8_t gcall_cont_kind = gtf->seq_req_kind;   /* CALL requester */
                 JSValue obj;
                 sf->cur_pc = pc; sf->cur_sp = sp;   /* suspend at initial_yield (state stays SUSPENDED_START) */
                 obj = js_create_from_ctor(ctx, gfunc, JS_CLASS_GENERATOR);   /* uses the ctor's realm */
@@ -27358,10 +27368,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JS_FreeValue(ctx, gfunc);
                 if (unlikely(JS_IsException(obj))) { free_generator_stack_rt(rt, s); js_free_rt(rt, s); goto exception; }
                 JS_SetOpaqueInternal(obj, s);   /* the object now owns the suspended generator state */
-                if (gcreate_cont && gcreate_cont_kind == CONT_STEP) {
-                    cont_st = gcreate_cont;
+                if (gcall_cont) {
+                    /* requested BY A CALL: the generator is that call's RESULT, so it goes to the ONE delivery a
+                       returning bytecode callback uses. The operand shape is EMPTY because the create already
+                       dropped the call's operands and restored the caller's sp — the delivery must not drop them
+                       twice — and the requester is a machine, never a tail-caller. */
+                    dlv_cs = gcall_cont; dlv_ck = gcall_cont_kind;
+                    dlv_cfirst = 0; dlv_cargc = 0; dlv_itail = 0; dlv_forof = 0;
                     ret_val = obj;
-                    goto do_step_step;
+                    goto do_cont_deliver;
                 }
                 if (gcreate_cont && gcreate_cont_kind == CONT_ITER_HELPER) {
                     /* flatMap inner: the mapped iterable's [Symbol.iterator] generator was created on the tramp.
@@ -27421,34 +27436,44 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc = sf->cur_pc; sp = rtf->caller_sp;
                 cfirst = rtf->call_first; cargc = rtf->call_argc; itail = rtf->is_tail;
                 js_free_rt(rt, rtf);
-                if (rck == CONT_ITER_CONSUME) {
+                dlv_cs = rcs; dlv_ck = rck; dlv_cfirst = cfirst; dlv_cargc = cargc; dlv_itail = itail;
+                dlv_forof = rfof;
+                /* THE call-result delivery. Given (requester, kind, operand shape, tail-ness) it hands ret_val
+                   to whoever asked for the call — the ONE place that knows every continuation kind, ending in the
+                   DFAIL for a kind nobody routed. It is a label because a bytecode frame's return is not the only
+                   thing that produces a call result: a COROUTINE CREATE requested by a call produces one too, and
+                   its settle used to carry a hand-copied subset of these arms, so a requester kind the subset did
+                   not name was silently PUSHED onto a stack the requester was not using. Reaching the same
+                   dispatch, an unrouted kind crashes here by name instead. */
+        do_cont_deliver:
+                if (dlv_ck == CONT_ITER_CONSUME) {
                     /* the ITERTERM callback returned: drop its operands (do_tramp_call dup'd the args and recorded
                        caller_sp ABOVE them) and resume the consume step with the result. */
-                    call_first_r = cfirst; call_pop = cargc;
-                    cont_st = rcs;
+                    call_first_r = dlv_cfirst; call_pop = dlv_cargc;
+                    cont_st = dlv_cs;
                     goto do_consume_deliver;
                 }
-                if (rck == CONT_PROMISE_ALL) {
-                    call_first_r = cfirst; call_pop = cargc;
-                    cont_st = rcs;
+                if (dlv_ck == CONT_PROMISE_ALL) {
+                    call_first_r = dlv_cfirst; call_pop = dlv_cargc;
+                    cont_st = dlv_cs;
                     goto do_promise_all_deliver;
                 }
-                if (rck == CONT_ASYNC_FROM_SYNC) {
-                    call_first_r = cfirst; call_pop = cargc;
-                    cont_st = rcs;
+                if (dlv_ck == CONT_ASYNC_FROM_SYNC) {
+                    call_first_r = dlv_cfirst; call_pop = dlv_cargc;
+                    cont_st = dlv_cs;
                     goto do_afs_deliver;
                 }
-                if (rck == CONT_ITER_HELPER) {
+                if (dlv_ck == CONT_ITER_HELPER) {
                     /* the map/filter callback returned: resume the helper step with its result. do_tramp_call DUPS
                        the args, so the caller-stack operands are still owned here — the shared delivery frees them
                        BEFORE re-entering, since jumping past it would leak all four and corrupt refcounts. */
-                    call_first_r = cfirst; call_pop = cargc;
-                    cont_st = rcs;
+                    call_first_r = dlv_cfirst; call_pop = dlv_cargc;
+                    cont_st = dlv_cs;
                     goto do_helper_deliver;
                 }
-                if (rck == CONT_GETPROP) {
-                    call_first_r = cfirst; call_pop = cargc;
-                    cont_st = rcs;
+                if (dlv_ck == CONT_GETPROP) {
+                    call_first_r = dlv_cfirst; call_pop = dlv_cargc;
+                    cont_st = dlv_cs;
                     goto do_getprop_deliver;
                 }
                 if (0) {
@@ -27621,7 +27646,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                     goto do_step_step;
                 }
-                if (rck == CONT_TOPRIM || rck == CONT_STEP) {
+                if (dlv_ck == CONT_TOPRIM || dlv_ck == CONT_STEP) {
                     /* a SEQUENCE's call returned — a coercion method, or a step machine's callback. Its arguments
                        live in the sequence's own buffer, so the shape it declared is EMPTY and this drop is a
                        no-op... UNLESS do_generic_callee reshaped the call: its PROXY arm replaces the operands
@@ -27629,59 +27654,59 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        the empty one leaked all five and left them under the caller's next operand, which then
                        read a garbage callee — `[1,2,3].map(new Proxy(fn, {apply}))` is the whole reproduction.
                        Whatever the frame RECORDED is what is dropped, the rule every other arm here follows. */
-                    JSValue *scargv = sp - cargc;
-                    DCHECK(cargc >= cfirst, "a sequence call records operands ending below where they start");
-                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, scargv[i]);
-                    sp += cfirst - cargc;
-                    cont_st = rcs;
-                    if (rck == CONT_TOPRIM) goto do_toprim_step;
+                    JSValue *scargv = sp - dlv_cargc;
+                    DCHECK(dlv_cargc >= dlv_cfirst, "a sequence call records operands ending below where they start");
+                    for (i = dlv_cfirst; i < dlv_cargc; i++) JS_FreeValue(ctx, scargv[i]);
+                    sp += dlv_cfirst - dlv_cargc;
+                    cont_st = dlv_cs;
+                    if (dlv_ck == CONT_TOPRIM) goto do_toprim_step;
                     goto do_step_step;
                 }
-                if (rck == CONT_ITER_CLOSE_CALL) {
+                if (dlv_ck == CONT_ITER_CLOSE_CALL) {
                     /* 7.4.9 steps 5-6: the `return` method returned. */
-                    call_first_r = cfirst; call_pop = cargc;
-                    cont_st = rcs;
+                    call_first_r = dlv_cfirst; call_pop = dlv_cargc;
+                    cont_st = dlv_cs;
                     goto do_iter_close_deliver;
                 }
-                if (rck == CONT_FOROF_NEXT) {
+                if (dlv_ck == CONT_FOROF_NEXT) {
                     /* the plain iterator's .next() returned: IteratorNext's object check, then
                        IteratorComplete/IteratorValue, then js_for_of_next's exact tail — [value, done] pushed above
                        the enum_rec, and the enum_rec's iterator slot cleared on done so the loop's
                        OP_iterator_close does not close an exhausted iterator. */
-                    JSValue *cargv = sp - cargc;
+                    JSValue *cargv = sp - dlv_cargc;
                     /* The operand shape is whatever the frame RECORDED, which is not always the [iter, next]
                        the opcode pushed: do_generic_callee's proxy arm replaces those two with the trap's five,
                        and its bound arm with the flattened argument list. Asserting 2 here was true only while a
                        bytecode .next() was the sole way in — a proxied one aborted the moment the opcode stopped
                        gating on that. What must hold is that the enum_rec sits BELOW the operands, which
                        js_forof_deliver asserts on the restored sp. */
-                    DCHECK(cargc >= cfirst, "for-of next frame records operands ending below where they start");
-                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
-                    sp += cfirst - cargc;
-                    if (js_forof_deliver(ctx, sp, rfof, ret_val))
+                    DCHECK(dlv_cargc >= dlv_cfirst, "for-of next frame records operands ending below where they start");
+                    for (i = dlv_cfirst; i < dlv_cargc; i++) JS_FreeValue(ctx, cargv[i]);
+                    sp += dlv_cfirst - dlv_cargc;
+                    if (js_forof_deliver(ctx, sp, dlv_forof, ret_val))
                         goto exception;
                     sp += 2;
                     BREAK;
                 }
-                if (rck == CONT_ITER_NEXT_OP) {
+                if (dlv_ck == CONT_ITER_NEXT_OP) {
                     /* the .next() returned: drop whatever operand shape the frame RECORDED (do_generic_callee's
                        proxy and bound arms replace the three the opcode pushed), then the opcode's tail — the
                        result replaces the resume argument. */
-                    JSValue *cargv = sp - cargc;
-                    DCHECK(cargc >= cfirst, "iterator-next frame records operands ending below where they start");
-                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
-                    sp += cfirst - cargc;
+                    JSValue *cargv = sp - dlv_cargc;
+                    DCHECK(dlv_cargc >= dlv_cfirst, "iterator-next frame records operands ending below where they start");
+                    for (i = dlv_cfirst; i < dlv_cargc; i++) JS_FreeValue(ctx, cargv[i]);
+                    sp += dlv_cfirst - dlv_cargc;
                     js_iternext_deliver(ctx, sp, ret_val);
                     BREAK;
                 }
-                if (rck == CONT_CONSUME_GETITER) {
+                if (dlv_ck == CONT_CONSUME_GETITER) {
                     /* the bytecode @@iterator returned: GetIterator step 5 (the result must be an Object), then the
                        SAME deliver the inline acquire and the generator-create settle use. */
-                    JSConsumeGetIter *gi = rcs;
-                    JSValue *cargv = sp - cargc;
-                    DCHECK(cargc - cfirst == 2, "consume getiter frame has an unexpected operand shape");
-                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
-                    sp += cfirst - cargc;
+                    JSConsumeGetIter *gi = dlv_cs;
+                    JSValue *cargv = sp - dlv_cargc;
+                    DCHECK(dlv_cargc - dlv_cfirst == 2, "consume getiter frame has an unexpected operand shape");
+                    for (i = dlv_cfirst; i < dlv_cargc; i++) JS_FreeValue(ctx, cargv[i]);
+                    sp += dlv_cfirst - dlv_cargc;
                     if (unlikely(!JS_IsObject(ret_val))) {
                         JS_FreeValue(ctx, ret_val);
                         JS_ThrowTypeErrorNotAnObject(ctx);
@@ -27693,10 +27718,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     ret_val = JS_UNDEFINED;
                     goto do_consume_deliver_iterator;
                 }
-                if (rck == CONT_CONSTRUCT) {
+                if (dlv_ck == CONT_CONSTRUCT) {
                     /* constructor body returned: apply the constructor rule — use the body result if it is an
                        object, else the created `this`. */
-                    struct JSConstruct *cs = rcs;
+                    struct JSConstruct *cs = dlv_cs;
                     JSValue created = cs->created_obj;
                     uint8_t from_super = cs->from_super;
                     JSValue super_ref = cs->super_ref;
@@ -27711,9 +27736,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (couter) {
                         /* requested by a state machine: drop this construct's operands (it pushed none, so the
                            shape is 0/0) and hand the object to that machine's step. */
-                        JSValue *cargv2 = sp - cargc;
-                        for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv2[i]);
-                        sp += cfirst - cargc;
+                        JSValue *cargv2 = sp - dlv_cargc;
+                        for (i = dlv_cfirst; i < dlv_cargc; i++) JS_FreeValue(ctx, cargv2[i]);
+                        sp += dlv_cfirst - dlv_cargc;
                         JS_FreeValue(ctx, super_ref);
                         cont_st = couter;
                         if (couter_kind == CONT_ITER_CONSUME) goto do_iter_consume_step;
@@ -27730,22 +27755,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                     /* new C(): operands (func,new_target,args) live on the caller stack — fall through to the
                        normal cargv cleanup + push. */
-                } else if (rck == CONT_PROMISE_EXEC) {
-                    pexec_finish_state = rcs;
+                } else if (dlv_ck == CONT_PROMISE_EXEC) {
+                    pexec_finish_state = dlv_cs;
                     goto do_promise_exec_finish;   /* ONE completion, shared with the inline-executor path */
-                } else if (rck == CONT_PROMISE_TRY) {
-                    ptry_finish_state = rcs;
+                } else if (dlv_ck == CONT_PROMISE_TRY) {
+                    ptry_finish_state = dlv_cs;
                     goto do_promise_try_finish;   /* fn returned: resolve the promise with its value */
-                } else if (rck == CONT_INSTANCEOF) {
+                } else if (dlv_ck == CONT_INSTANCEOF) {
                     /* 13.10.2 step 3.b: ToBoolean the @@hasInstance result, then the normal placement below drops
                        the three reshaped operands and pushes the boolean where `instanceof` expects it. */
                     ret_val = js_bool(JS_ToBoolFree(ctx, ret_val));
-                } else if (rck == CONT_PROXY_CONSTRUCT) {
+                } else if (dlv_ck == CONT_PROXY_CONSTRUCT) {
                     /* 9.5.14 step 13: the `construct` trap's result must be an object. Then the normal placement
                        below drops the five reshaped operands and pushes it where `new` expects its result —
                        unless a MACHINE asked for this construct, in which case the object is delivered to it and
                        there is no `new` waiting for a push. */
-                    JSProxyCtor *pcs = rcs;
+                    JSProxyCtor *pcs = dlv_cs;
                     if (unlikely(JS_VALUE_GET_TAG(ret_val) != JS_TAG_OBJECT)) {
                         JS_FreeValue(ctx, ret_val);
                         JS_ThrowTypeErrorNotAnObject(ctx);
@@ -27754,23 +27779,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                     if (pcs) {
                         void *pouter = pcs->outer; uint8_t pkind = pcs->outer_kind;
-                        JSValue *cargv2 = sp - cargc;
+                        JSValue *cargv2 = sp - dlv_cargc;
                         DCHECK(pkind == CONT_STEP, "proxy-construct outer continuation: unknown machine kind");
                         js_free_rt(rt, pcs);
-                        for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv2[i]);
-                        sp += cfirst - cargc;
+                        for (i = dlv_cfirst; i < dlv_cargc; i++) JS_FreeValue(ctx, cargv2[i]);
+                        sp += dlv_cfirst - dlv_cargc;
                         cont_st = pouter;
                         goto do_step_step;
                     }
-                } else if (rck == CONT_SETTER) {
+                } else if (dlv_ck == CONT_SETTER) {
                     /* setter returned: free the operands (this,setter,value) on the caller stack exactly like a
                        method call, but DISCARD the return value — a property write pushes nothing. */
-                    JSValue *cargv = sp - cargc;
-                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
-                    sp += cfirst - cargc;
+                    JSValue *cargv = sp - dlv_cargc;
+                    for (i = dlv_cfirst; i < dlv_cargc; i++) JS_FreeValue(ctx, cargv[i]);
+                    sp += dlv_cfirst - dlv_cargc;
                     JS_FreeValue(ctx, ret_val);
                     BREAK;
-                } else if (rck != CONT_NONE) {
+                } else if (dlv_ck != CONT_NONE) {
                     /* Every continuation kind is routed by an arm above; this is the backstop. It used to be
                        CONT_STEP's own arm, which skipped the operand drop on the theory that a sequence's
                        arguments are never on the caller's stack — true of the call it makes, false once
@@ -27780,11 +27805,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                           "would misread its state as a step machine's");
                     goto exception;
                 }
-                if (itail) goto do_return;   /* caller was a tail-caller: propagate */
+                if (dlv_itail) goto do_return;   /* caller was a tail-caller: propagate */
                 {
-                    JSValue *cargv = sp - cargc;
-                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
-                    sp += cfirst - cargc;
+                    JSValue *cargv = sp - dlv_cargc;
+                    for (i = dlv_cfirst; i < dlv_cargc; i++) JS_FreeValue(ctx, cargv[i]);
+                    sp += dlv_cfirst - dlv_cargc;
                     *sp++ = ret_val;
                 }
                 BREAK;
@@ -27951,7 +27976,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        opcode declares; do_generic_callee asks every other question about the callee. */
                     tramp_first = -1; tramp_is_tail = 0;
                     tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;
-                    if (tramp_can_call(call_argv[-1])) goto do_tramp_call;
                     goto do_generic_callee;
                 }
                 if (unlikely(JS_IsException(ret_val)))
@@ -28837,7 +28861,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 tramp_first = -2; tramp_is_tail = 0;
                 tramp_cont_state = ce; tramp_cont_kind = CONT_ITER_CLOSE_CALL;
-                if (tramp_can_call(call_argv[-1])) goto do_tramp_call;
                 goto do_generic_callee;
             }
 
@@ -31189,6 +31212,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                (IteratorClose's does: the original throw replaces the body's). */
             tramp_step_chain_free(ctx, gtf->cont_state);
         }
+        /* and the machine that REQUESTED this generator by calling its function, if the throw came from the params
+           and the generator never existed. Same obligation, same teardown; every gen frame defines the field, so
+           this is read unconditionally rather than guarded by which kind of gen frame it is. */
+        js_create_requester_abandon(ctx, gtf->seq_req, gtf->seq_req_kind);
         /* CONT_PROMISE_ALL: handled AFTER the frame pop — the throw REJECTS the aggregate promise (not propagates). */
         sf->cur_sp = sp;   /* the body frame is "running" (cur_sp NULL); restore it so async_func_free can tear down */
         free_generator_stack_rt(rt, gtf->gen_data);
