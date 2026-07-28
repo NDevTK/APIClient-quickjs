@@ -21279,10 +21279,38 @@ typedef struct JSParseNum {
 
 /* Object.defineProperty / Reflect.defineProperty: ToPropertyKey on the key is the page's code. The descriptor
    READ that follows also runs accessors, which is a separate route and still C. */
+enum { DESC_PH_ASK = 0, DESC_PH_HAS, DESC_PH_GET };
+typedef struct JSDescCursor {
+    JSValue cb[1];        /* [the descriptor object] — the operand of every request, dup'd once */
+    JSValue value, getter, setter;   /* owned */
+    int flags;
+    uint8_t field;        /* 0..6, an index into js_desc_fields */
+    uint8_t phase;        /* DESC_PH_* */
+} JSDescCursor;
+
+static void js_desc_cursor_init(JSDescCursor *c)
+{
+    c->cb[0] = JS_UNDEFINED;
+    c->value = c->getter = c->setter = JS_UNDEFINED;
+    c->flags = 0; c->field = 0; c->phase = DESC_PH_ASK;
+}
+
+static void js_desc_cursor_free(JSContext *ctx, JSDescCursor *c)
+{
+    JS_FreeValue(ctx, c->cb[0]);
+    JS_FreeValue(ctx, c->value);
+    JS_FreeValue(ctx, c->getter);
+    JS_FreeValue(ctx, c->setter);
+}
+
+static int js_desc_cursor_run(JSContext *ctx, JSDescCursor *c, JSValueConst desc, JSValue in,
+                              JSValue **out_cb, int *out_argc);
+
 typedef struct JSObjDefProp {
     JSStepHdr hdr;
     JSValue result;       /* DONE (owned) */
     JSAtom atom;          /* the coerced key (owned) */
+    JSDescCursor cur;     /* ToPropertyDescriptor's twelve keyed operations, resumable */
 } JSObjDefProp;
 
 /* JSON.rawJSON: ToString on its argument is the page's code, and everything after it — the validation, the
@@ -53495,6 +53523,89 @@ static JSValue JS_ToObjectFree(JSContext *ctx, JSValue val)
     return obj;
 }
 
+/* 6.2.6.5 ToPropertyDescriptor as a RESUMABLE cursor. Its six fields are read in spec order, each as a
+   HasProperty and then — only if present — a Get: TWELVE keyed operations, every one of which can be a Proxy
+   trap or an accessor. js_obj_to_desc performs them with JS_HasProperty / JS_GetProperty from C, so a looping
+   `has` or `get` on the descriptor object ran with no flow base and aborted the back-edge preempt
+   (`Object.defineProperty(o, "a", new Proxy(d, {get(){ for(;;){} }}))`).
+   Driven from here they are ordinary requests. The cursor keeps everything the walk accumulates, because a
+   request suspends the flow and no interpreter local survives that.
+   js_obj_to_desc still exists for the consumers not yet converted — JS_ObjectDefineProperties (which needs a
+   resumable key cursor of its own before it can adopt this) and the Proxy getOwnPropertyDescriptor trap-result
+   read. Each is its own conversion; this one is Object.defineProperty and Reflect.defineProperty. */
+static const struct { uint32_t atom; int has_flag, bool_flag; } js_desc_fields[6] = {
+    { JS_ATOM_enumerable,   JS_PROP_HAS_ENUMERABLE,   JS_PROP_ENUMERABLE   },
+    { JS_ATOM_configurable, JS_PROP_HAS_CONFIGURABLE, JS_PROP_CONFIGURABLE },
+    { JS_ATOM_value,        JS_PROP_HAS_VALUE,        0                    },
+    { JS_ATOM_writable,     JS_PROP_HAS_WRITABLE,     JS_PROP_WRITABLE     },
+    { JS_ATOM_get,          JS_PROP_HAS_GET,          0                    },
+    { JS_ATOM_set,          JS_PROP_HAS_SET,          0                    },
+};
+/* 0 = the descriptor is complete, -1 = threw, else a REQUEST CODE (7 HasProperty / 6 Get) whose result comes
+   back as `in` on the next call. */
+static int js_desc_cursor_run(JSContext *ctx, JSDescCursor *c, JSValueConst desc, JSValue in,
+                              JSValue **out_cb, int *out_argc)
+{
+    for (;;) {
+        if (c->phase == DESC_PH_ASK) {
+            JS_FreeValue(ctx, in);
+            in = JS_UNDEFINED;
+            if (JS_IsUndefined(c->cb[0])) {
+                /* step 1, and it runs BEFORE the first HasProperty — after ToPropertyKey, which is why it is
+                   here and not in the machine's prologue. */
+                if (!JS_IsObject(desc)) {
+                    JS_ThrowTypeError(ctx, "Property description must be an object");
+                    return -1;
+                }
+                c->cb[0] = js_dup(desc);
+            }
+            if (c->field >= countof(js_desc_fields)) break;
+            c->phase = DESC_PH_HAS;
+            *out_cb = c->cb; *out_argc = (int)js_desc_fields[c->field].atom;
+            return 7;   /* HASPROPERTY */
+        }
+        if (c->phase == DESC_PH_HAS) {
+            bool present = JS_ToBool(ctx, in);
+            JS_FreeValue(ctx, in);
+            in = JS_UNDEFINED;
+            if (!present) { c->field++; c->phase = DESC_PH_ASK; continue; }
+            c->flags |= js_desc_fields[c->field].has_flag;
+            c->phase = DESC_PH_GET;
+            *out_cb = c->cb; *out_argc = (int)js_desc_fields[c->field].atom;
+            return 6;   /* GETPROP */
+        }
+        /* DESC_PH_GET: `in` is the field's value, owned. */
+        switch (c->field) {
+        case 2: c->value = in; break;
+        case 4:
+        case 5: {
+            /* steps 7.b / 8.b: an accessor field must be callable or undefined, checked as it is read — before
+               the NEXT field is even asked for, which a page observes through its `has` trap. */
+            bool ok = JS_IsUndefined(in) || JS_IsFunction(ctx, in);
+            if (c->field == 4) c->getter = in; else c->setter = in;
+            if (!ok) {
+                JS_ThrowTypeError(ctx, c->field == 4 ? "Getter must be a function"
+                                                     : "Setter must be a function");
+                return -1;
+            }
+            break;
+        }
+        default:
+            if (JS_ToBoolFree(ctx, in)) c->flags |= js_desc_fields[c->field].bool_flag;
+            break;
+        }
+        in = JS_UNDEFINED;
+        c->field++; c->phase = DESC_PH_ASK;
+    }
+    /* step 9: an accessor descriptor cannot also carry value or writable. */
+    if ((c->flags & (JS_PROP_HAS_SET | JS_PROP_HAS_GET)) &&
+        (c->flags & (JS_PROP_HAS_VALUE | JS_PROP_HAS_WRITABLE))) {
+        JS_ThrowTypeError(ctx, "Invalid property descriptor. Cannot both specify accessors and a value or writable attribute");
+        return -1;
+    }
+    return 0;
+}
+
 static int js_obj_to_desc(JSContext *ctx, JSPropertyDescriptor *d,
                           JSValueConst desc)
 {
@@ -53782,6 +53893,7 @@ static int js_obj_defprop_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
         if (s->hdr.str_phase == STR_PH_START) {
             s->result = JS_UNDEFINED;
             s->atom = JS_ATOM_NULL;
+            js_desc_cursor_init(&s->cur);
             if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT) {
                 JS_FreeValue(ctx, cb_result);
                 JS_ThrowTypeErrorNotAnObject(ctx);
@@ -53793,11 +53905,20 @@ static int js_obj_defprop_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
         if (r) return r < 0 ? -1 : r;
         s->hdr.stage = 1;
     }
+    if (s->hdr.stage == 1) {
+        /* ToPropertyDescriptor, one keyed operation at a time. It used to be a JS_DefinePropertyDesc call from
+           here, which read all twelve of them from C. */
+        r = js_desc_cursor_run(ctx, &s->cur, step_arg(&s->hdr, 2), cb_result, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 2;
+    }
     JS_FreeValue(ctx, cb_result);
 
     flags = s->hdr.arg ? JS_PROP_REFLECT_DEFINE_PROPERTY
                        : (JS_PROP_THROW | JS_PROP_DEFINE_PROPERTY);
-    ret = JS_DefinePropertyDesc(ctx, obj, s->atom, step_arg(&s->hdr, 2), flags);
+    ret = JS_DefineProperty(ctx, obj, s->atom, s->cur.value, s->cur.getter, s->cur.setter,
+                            s->cur.flags | flags);
     if (ret < 0)
         return -1;
     s->result = s->hdr.arg ? js_bool(ret) : js_dup(obj);
@@ -53810,6 +53931,7 @@ static JSValue js_obj_defprop_fini(JSContext *ctx, void *st, bool take_result)
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (!take_result) JS_FreeValue(ctx, s->result);
     JS_FreeAtom(ctx, s->atom);
+    js_desc_cursor_free(ctx, &s->cur);
     js_free(ctx, s);
     return r;
 }
