@@ -1470,7 +1470,8 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
 #define DV_STEPDEF_ID(N) STEPDEF_DV_GET_##N, STEPDEF_DV_SET_##N,
     DV_STEPDEF_LIST(DV_STEPDEF_ID)
 #undef DV_STEPDEF_ID
-    STEPDEF_FUNCTION_CALL, STEPDEF_FUNCTION_APPLY, STEPDEF_REFLECT_APPLY, STEPDEF_ISNAN, STEPDEF_ISFINITE,
+    STEPDEF_FUNCTION_CALL, STEPDEF_FUNCTION_APPLY, STEPDEF_REFLECT_APPLY, STEPDEF_REFLECT_CONSTRUCT,
+    STEPDEF_ISNAN, STEPDEF_ISFINITE,
     STEPDEF_NUM_TOSTRING, STEPDEF_NUM_TOLOCALESTRING, STEPDEF_NUM_TOFIXED,
     STEPDEF_NUM_TOEXPONENTIAL, STEPDEF_NUM_TOPRECISION, STEPDEF_NUM_CTOR,
     STEPDEF_ITERATOR_CTOR, STEPDEF_ARRAY_OF, STEPDEF_ARRAY_CONCAT,
@@ -18039,6 +18040,11 @@ typedef struct JSStepHdr {
        primitive rather than three special cases. */
     void *outer;
     uint8_t outer_kind;
+    /* A CONSTRUCT request's NEW TARGET (owned), UNINITIALIZED when it is the constructor itself — which is what
+       every builtin's Construct performs and what the request meant before Reflect.construct needed to say
+       otherwise. It lives here rather than in an interpreter register because a machine cannot reach one, and
+       the request can suspend between the step that sets it and the dispatch that reads it. */
+    JSValue ctor_ntgt;
     /* CONT_FOROF_NEXT carries no STATE — its enum_rec offset is the whole of what the continuation needs — so a
        machine reached as a for-of .next() (Iterator.concat's) has an outer_kind with a NULL outer, and this is
        what its delivery reads. Without it the DONE arm saw no outer at all and pushed the result as a bare
@@ -18101,6 +18107,7 @@ static void *tramp_step_state_new(JSContext *ctx, const JSTrampStepDef *sd, JSVa
     h->def = sd;
     h->arg = sd->arg;
     h->stage = 0;
+    h->ctor_ntgt = JS_UNINITIALIZED;   /* a CONSTRUCT request's new target: absent means the constructor itself */
     h->argc = argc;
     h->argv = (JSValue *)((uint8_t *)h + STEP_ARGV_OFFSET(sd->size));
     for (i = 0; i < argc; i++)
@@ -18783,6 +18790,8 @@ static JSValue tramp_step_state_free(JSContext *ctx, void *st, bool take_result)
     JS_FreeValue(ctx, h->func_obj);
     JS_FreeValue(ctx, h->coerce);   /* set only while a prologue coercion is in flight */
     h->coerce = JS_UNDEFINED;
+    if (!JS_IsUninitialized(h->ctor_ntgt)) JS_FreeValue(ctx, h->ctor_ntgt);
+    h->ctor_ntgt = JS_UNINITIALIZED;
     JS_FreeAtom(ctx, h->get_atom);  /* set only while a property read is in flight */
     h->get_atom = JS_ATOM_NULL;
     for (i = 0; i < h->argc; i++)
@@ -21306,8 +21315,8 @@ static inline bool tramp_is_reflect_construct(JSValueConst method) {
     JSObject *mp;
     if (JS_VALUE_GET_TAG(method) != JS_TAG_OBJECT) return false;
     mp = JS_VALUE_GET_OBJ(method);
-    return mp->class_id == JS_CLASS_C_FUNCTION && mp->u.cfunc.cproto == JS_CFUNC_generic
-        && mp->u.cfunc.c_function.generic == js_reflect_construct;
+    return mp->class_id == JS_CLASS_C_FUNCTION && mp->u.cfunc.cproto == JS_CFUNC_step
+        && mp->u.cfunc.magic == STEPDEF_REFLECT_CONSTRUCT;
 }
 
 static inline bool tramp_is_reflect_apply(JSValueConst method) {
@@ -24165,7 +24174,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        C, which drives a bytecode constructor to completion. With JSConstruct's outer continuation
                        the object comes back to THIS step instead. A C constructor has no body to suspend and is
                        constructed in place, the same split every callback drive makes. */
-                    con_func = cb[0]; con_ntgt = cb[0];
+                    con_func = cb[0];
+                    /* the NEW TARGET is an OPERAND of the request. Every builtin's Construct passes the
+                       constructor itself, which is what UNINITIALIZED means; Reflect.construct passes a distinct
+                       one, and hardcoding it to cb[0] is why that form could not be expressed as a request at
+                       all — the same thing the receiver was to [[Get]]. It rides the header, which owns it. */
+                    con_ntgt = JS_IsUninitialized(((JSStepHdr *)stt)->ctor_ntgt) ? cb[0]
+                                                                                 : ((JSStepHdr *)stt)->ctor_ntgt;
                     con_args = (JSValueConst *)&cb[1]; con_argc = cbn;
                     con_from_super = 0; con_super_ref = JS_UNDEFINED;
                     con_outer = stt; con_outer_kind = CONT_STEP;
@@ -54205,6 +54220,80 @@ static int js_function_apply_step(JSContext *ctx, void *st, JSValue cb_result, J
     return 0;
 }
 
+/* Reflect.construct(target, argumentsList[, newTarget]) — apply's construct twin, and it had no machine either,
+   so reached as a VALUE it built its argument list and drove the constructor from C. 28.1.2 is the same shape as
+   28.1.1: validate, CreateListFromArrayLike, then the internal method — so it is the same collect, on the same
+   sub-sequences, ending in a CONSTRUCT request instead of a CALL.
+   Stages: 0 validate, 1 the length, 2 the elements, 3 the CONSTRUCT, 4 its result. */
+static int js_reflect_construct_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSFuncApply *s = st;
+    JSValueConst ctor = step_arg(&s->hdr, 0);
+    JSValueConst arr  = step_arg(&s->hdr, 1);
+    JSValueConst ntgt = (s->hdr.argc >= 3) ? step_arg(&s->hdr, 2) : ctor;
+    JSValue in = cb_result;
+    int r;
+
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, in);
+        in = JS_UNDEFINED;
+        s->result = JS_UNDEFINED;
+        /* 28.1.2 steps 1-3, in the spec's order: both constructor checks precede the list */
+        if (!JS_IsConstructor(ctx, ctor)) {
+            JS_ThrowTypeError(ctx, "not a constructor");
+            return -1;
+        }
+        if (!JS_IsConstructor(ctx, ntgt)) {
+            JS_ThrowTypeError(ctx, "not a constructor");
+            return -1;
+        }
+        if (JS_VALUE_GET_TAG(arr) != JS_TAG_OBJECT) {
+            JS_ThrowTypeError(ctx, "not a object");
+            return -1;
+        }
+        s->hdr.stage = 1;
+    }
+    if (s->hdr.stage == 1) {
+        r = step_length_run(ctx, &s->hdr, arr, in, &s->len, out_cb, out_argc);
+        in = JS_UNDEFINED;
+        if (r) return r;
+        if (s->len > JS_MAX_LOCAL_VARS) {
+            JS_ThrowRangeError(ctx, "too many arguments in function call (only %d allowed)", JS_MAX_LOCAL_VARS);
+            return -1;
+        }
+        s->hdr.stage = 2;
+    }
+    if (s->hdr.stage == 2) {
+        if (!s->cb) {
+            int64_t k;
+            /* [ctor, args…] — the shape step code 4 reads. Every slot is the state's BEFORE the first element
+               read, which can throw or suspend. */
+            s->cb = js_malloc(ctx, sizeof(JSValue) * (size_t)(s->len + 1));
+            if (unlikely(!s->cb)) return -1;
+            s->ncb = (int)s->len + 1;
+            for (k = 0; k < s->len + 1; k++) s->cb[k] = JS_UNDEFINED;
+            s->cb[0] = js_dup(ctor);
+            s->i = 0;
+        }
+        while (s->i < s->len) {
+            JSValue el = JS_UNDEFINED;
+            r = step_getidx_run(ctx, &s->hdr, arr, s->i, in, &el, out_cb, out_argc);
+            in = JS_UNDEFINED;
+            if (r) return r;
+            JS_FreeValue(ctx, s->cb[1 + s->i]);
+            s->cb[1 + s->i] = el;
+            s->i++;
+        }
+        s->hdr.stage = 3;
+        s->hdr.ctor_ntgt = js_dup(ntgt);   /* the request's NEW TARGET operand */
+        *out_cb = s->cb; *out_argc = (int)s->len;
+        return 4;
+    }
+    DCHECK(s->hdr.stage == 3, "Reflect.construct: unknown stage");
+    s->result = in;
+    return 0;
+}
+
 static JSValue js_function_apply_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSFuncApply *s = st;
@@ -58040,6 +58129,7 @@ static const JSTrampStepDef js_isFinite_def       = { sizeof(JSCoerce1), js_coer
 static const JSTrampStepDef js_function_call_def  = { sizeof(JSFuncCall), js_function_call_step, js_function_call_fini, 0 };
 static const JSTrampStepDef js_function_apply_def = { sizeof(JSFuncApply), js_function_apply_step, js_function_apply_fini, 0 };
 static const JSTrampStepDef js_reflect_apply_def  = { sizeof(JSFuncApply), js_function_apply_step, js_function_apply_fini, 1 };
+static const JSTrampStepDef js_reflect_construct_def = { sizeof(JSFuncApply), js_reflect_construct_step, js_function_apply_fini, 0 };
 static const JSTrampStepDef js_array_tostring_def = { sizeof(JSArrayToString), js_array_tostring_step, js_array_tostring_fini, 0 };
 static const JSTrampStepDef js_array_reduce_def  = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduce };
 static const JSTrampStepDef js_array_reduceR_def = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduceRight };
@@ -58167,6 +58257,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_FUNCTION_CALL]   = &js_function_call_def,
     [STEPDEF_FUNCTION_APPLY]  = &js_function_apply_def,
     [STEPDEF_REFLECT_APPLY]   = &js_reflect_apply_def,
+    [STEPDEF_REFLECT_CONSTRUCT] = &js_reflect_construct_def,
     [STEPDEF_NUM_CTOR]        = &js_num_ctor_def,
     [STEPDEF_BIGINT_ASUINTN]  = &js_bigint_asUintN_def,
     [STEPDEF_BIGINT_ASINTN]   = &js_bigint_asIntN_def,
@@ -67560,7 +67651,7 @@ static JSValue js_reflect_setPrototypeOf(JSContext *ctx, JSValueConst this_val,
 
 static const JSCFunctionListEntry js_reflect_funcs[] = {
     JS_CFUNC_STEP_DEF("apply", 3, STEPDEF_REFLECT_APPLY ),
-    JS_CFUNC_DEF("construct", 2, js_reflect_construct ),
+    JS_CFUNC_STEP_DEF("construct", 2, STEPDEF_REFLECT_CONSTRUCT ),
     JS_CFUNC_STEP_DEF("defineProperty", 3, STEPDEF_REFLECT_DEFINEPROPERTY ),
     JS_CFUNC_STEP_DEF("deleteProperty", 2, STEPDEF_REFLECT_DELETE ),
     JS_CFUNC_STEP_DEF("get", 2, STEPDEF_REFLECT_GET ),
