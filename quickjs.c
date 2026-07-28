@@ -62654,6 +62654,12 @@ static JSValue js_async_iterator_proto_dispose(JSContext *ctx,
         return JS_EXCEPTION;
     }
     then_args[0] = undef_fn;
+    /* AsyncFromSyncIteratorContinuation's `Await` chain: the `then` READ this Invoke performs is PAGE CODE for a subclass or a thenable, and a C
+       activation has no flow base to run it on. Not built here — every settle and Await that could be
+       converted was, and this one has no request to hand its call out to yet, so it CRASHES naming
+       itself rather than running an accessor or a Proxy trap off the chain. */
+    if (js_read_is_page_code(ctx, promise, JS_ATOM_then))
+        DFAIL("async-from-sync's await wrapper reads `then` from C — hand its Invoke out and place it on a flow");
     result = JS_Invoke(ctx, promise, JS_ATOM_then, 1, vc(then_args));
     JS_FreeValue(ctx, undef_fn);
     JS_FreeValue(ctx, promise);
@@ -72330,6 +72336,12 @@ static JSValue js_async_dispose_step(JSContext *ctx, JSValueConst this_val,
                                         1, &prev_err);
         then_args[0] = resolve_fn;
         then_args[1] = reject_fn;
+        /* the async-dispose rethrow chain: the `then` READ this Invoke performs is PAGE CODE for a subclass or a thenable, and a C
+           activation has no flow base to run it on. Not built here — every settle and Await that could be
+           converted was, and this one has no request to hand its call out to yet, so it CRASHES naming
+           itself rather than running an accessor or a Proxy trap off the chain. */
+        if (js_read_is_page_code(ctx, ret_promise, JS_ATOM_then))
+            DFAIL("AsyncDisposableStack's rethrow chain reads `then` from C — hand its Invoke out and place it on a flow");
         result = JS_Invoke(ctx, ret_promise, JS_ATOM_then, 2, vc(then_args));
         JS_FreeValue(ctx, resolve_fn);
         JS_FreeValue(ctx, reject_fn);
@@ -72453,6 +72465,12 @@ static JSValue js_disposable_stack_dispose(JSContext *ctx,
             }
             then_args[0] = resolve_fn;
             then_args[1] = reject_fn;
+            /* the async-dispose per-resource chain: the `then` READ this Invoke performs is PAGE CODE for a subclass or a thenable, and a C
+               activation has no flow base to run it on. Not built here — every settle and Await that could be
+               converted was, and this one has no request to hand its call out to yet, so it CRASHES naming
+               itself rather than running an accessor or a Proxy trap off the chain. */
+            if (js_read_is_page_code(ctx, chain, JS_ATOM_then))
+                DFAIL("AsyncDisposableStack's per-resource chain reads `then` from C — hand its Invoke out and place it on a flow");
             new_chain = JS_Invoke(ctx, chain, JS_ATOM_then, 2, vc(then_args));
             JS_FreeValue(ctx, resolve_fn);
             JS_FreeValue(ctx, reject_fn);
@@ -72474,6 +72492,12 @@ static JSValue js_disposable_stack_dispose(JSContext *ctx,
                 return JS_EXCEPTION;
             }
             then_args[0] = undef_fn;
+            /* the async-dispose tail chain: the `then` READ this Invoke performs is PAGE CODE for a subclass or a thenable, and a C
+               activation has no flow base to run it on. Not built here — every settle and Await that could be
+               converted was, and this one has no request to hand its call out to yet, so it CRASHES naming
+               itself rather than running an accessor or a Proxy trap off the chain. */
+            if (js_read_is_page_code(ctx, chain, JS_ATOM_then))
+                DFAIL("AsyncDisposableStack's tail chain reads `then` from C — hand its Invoke out and place it on a flow");
             new_chain = JS_Invoke(ctx, chain, JS_ATOM_then, 1, vc(then_args));
             JS_FreeValue(ctx, undef_fn);
             JS_FreeValue(ctx, chain);
@@ -74116,6 +74140,12 @@ static JSValue js_promise_then_finally_func(JSContext *ctx, JSValueConst this_va
     then_func = JS_NewCFunctionData(ctx, magic == 0 ? js_promise_finally_value_thunk : js_promise_finally_thrower,
                                     0, 0, 1, argv);
     if (JS_IsException(then_func)) { JS_FreeValue(ctx, promise); return then_func; }
+    /* 27.2.5.3 step 6's Invoke(promise, "then", ...): the `then` READ this Invoke performs is PAGE CODE for a subclass or a thenable, and a C
+       activation has no flow base to run it on. Not built here — every settle and Await that could be
+       converted was, and this one has no request to hand its call out to yet, so it CRASHES naming
+       itself rather than running an accessor or a Proxy trap off the chain. */
+    if (js_read_is_page_code(ctx, promise, JS_ATOM_then))
+        DFAIL("Promise.prototype.finally's inner then reads `then` from C — hand its Invoke out and place it on a flow");
     ret = JS_InvokeFree(ctx, promise, JS_ATOM_then, 1, vc(&then_func));
     JS_FreeValue(ctx, then_func);
     return ret;
