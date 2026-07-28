@@ -18035,6 +18035,14 @@ typedef struct JSStepHdr {
        Three values rather than one because that is what the record is; packing them into the step's single
        result would make every consumer unpack a tuple the engine had just built. */
     JSValue cap_promise, cap_funcs[2];
+    /* A DEFINE request's descriptor SHAPE, for a machine that needs one other than CreateDataProperty's. The
+       request expressed only that one shape, hardcoded at three sites, and Object.defineProperty needs an
+       arbitrary descriptor — so the shape became operands. They ride the HEADER rather than the cb array for the
+       same reason get_atom does: a request's operands that have no stack slot live here, and every existing
+       DEFINE keeps working by leaving them alone. desc_flags == 0 means CreateDataProperty's shape.
+       READ AND RESET by the driver like every other request input, so a shape cannot leak into the next one. */
+    JSValueConst desc_get, desc_set;   /* BORROWED: the machine holds them across the request */
+    int desc_flags;
     /* A DELEGATE request's inner machine, owned until the driver adopts it. Delegation is how a step builtin
        performs an ABSTRACT OPERATION that is itself a machine — .finally's PromiseResolve(C, v), which 27.2.5.3
        step 4 states as the operation and not as C.resolve, so it cannot be reached as an ordinary call.
@@ -18109,6 +18117,7 @@ static void *tramp_step_state_new(JSContext *ctx, const JSTrampStepDef *sd, JSVa
     h->ctor_ntgt = JS_UNINITIALIZED;   /* a CONSTRUCT request's new target: absent means the constructor itself */
     h->cap_promise = JS_UNDEFINED;     /* a CAPABILITY request's [promise, resolve, reject], filled by its delivery */
     h->cap_funcs[0] = JS_UNDEFINED; h->cap_funcs[1] = JS_UNDEFINED;
+    h->desc_get = JS_UNDEFINED; h->desc_set = JS_UNDEFINED; h->desc_flags = 0;
     h->delegate = NULL;
     h->argc = argc;
     h->argv = (JSValue *)((uint8_t *)h + STEP_ARGV_OFFSET(sd->size));
@@ -19283,8 +19292,11 @@ static JSValue js_create_desc(JSContext *ctx, JSValueConst val, JSValueConst get
 typedef struct JSGetProp {
     JSValue target;      /* the proxy's [[Target]], for the invariant (owned); UNDEFINED for an accessor */
     JSAtom atom;         /* the key (owned) */
-    JSValue value;       /* GP_SET only: the value written, which 9.5.9 step 11's invariant is a SameValue against
-                            (owned). UNDEFINED for the two reads. */
+    JSValue value;       /* GP_SET: the value written, which 9.5.9 step 11's invariant is a SameValue against
+                            (owned). GP_DEFINE: the descriptor's [[Value]]. UNDEFINED for the reads. */
+    JSValue getter, setter;  /* GP_DEFINE's remaining descriptor fields (owned), so the invariant that runs on the
+                                trap's result sees the SAME descriptor the trap was given. */
+    int dflags;              /* GP_DEFINE's JS_PROP_HAS_* / attribute bits, likewise. */
     void *outer; uint8_t outer_kind;
     uint8_t op;          /* GP_GET / GP_HAS / GP_SET — step codes 6, 7 and 8. They differ only in which trap runs,
                             which invariant its result must satisfy and what the machine is handed back; everything
@@ -19370,6 +19382,12 @@ typedef struct JSTrapGet {
     JSValue method;      /* the trap, once the read has produced it (owned); UNDEFINED until then */
     JSAtom atom;         /* the operation's key (owned); JS_ATOM_NULL for GP_OWNKEYS, which has none */
     void *outer;         /* what is waiting on the OPERATION, not on this read */
+    JSValue getter, setter;  /* GP_DEFINE's remaining descriptor fields (owned) */
+    int dflags;              /* and its attribute bits. The trap READ parks the whole operation, so EVERY operand
+                                of it has to ride here — the shape did not, so a `defineProperty` reaching a proxy
+                                resumed with the CreateDataProperty default and silently made every attribute
+                                true. An operand added to the request is an obligation at each place the request
+                                is parked. */
     uint8_t outer_kind;
     uint8_t op;
     uint8_t no_throw;
@@ -19377,6 +19395,8 @@ typedef struct JSTrapGet {
 
 static void js_trapget_free(JSContext *ctx, JSTrapGet *tg)
 {
+    JS_FreeValue(ctx, tg->getter);
+    JS_FreeValue(ctx, tg->setter);
     JS_FreeValue(ctx, tg->obj);
     JS_FreeValue(ctx, tg->val);
     JS_FreeValue(ctx, tg->recv);
@@ -19391,6 +19411,8 @@ static void js_getprop_free(JSContext *ctx, JSGetProp *gp)
     int i;
     JS_FreeValue(ctx, gp->target);
     JS_FreeValue(ctx, gp->value);
+    JS_FreeValue(ctx, gp->getter);
+    JS_FreeValue(ctx, gp->setter);
     JS_FreeAtom(ctx, gp->atom);
     for (i = 0; i < 2 + gp->nargs; i++)
         JS_FreeValue(ctx, gp->cb[i]);
@@ -21311,6 +21333,7 @@ typedef struct JSObjDefProp {
     JSValue result;       /* DONE (owned) */
     JSAtom atom;          /* the coerced key (owned) */
     JSDescCursor cur;     /* ToPropertyDescriptor's twelve keyed operations, resumable */
+    JSValue cb[2];        /* [target, value] for the DEFINE request (owned) */
 } JSObjDefProp;
 
 /* JSON.rawJSON: ToString on its argument is the page's code, and everything after it — the validation, the
@@ -21996,7 +22019,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     uint8_t gp_op = GP_GET;                             /* the result is delivered to. */
     JSValueConst gp_recv = JS_UNINITIALIZED;            /* [[Get]]/[[Set]] receiver; UNINITIALIZED = the object itself. read+reset at do_getprop_tramp */
     int gp_no_throw = 0;                                /* 1 = a [[Set]]/[[Delete]] yields its boolean instead of throwing on false. read+reset there */
-    JSValueConst gp_val = JS_UNDEFINED;                 /* GP_SET: the value to write (borrowed from the machine) */
+    JSValueConst gp_val = JS_UNDEFINED;                 /* GP_SET / GP_DEFINE: the value to write (borrowed from the machine) */
+    /* GP_DEFINE's remaining descriptor fields. The request expressed only CreateDataProperty's shape — a data
+       descriptor with all three attributes true — hardcoded at THREE sites (the in-place define, the trap's
+       descriptor object, and the invariant that runs on the trap's result). Object.defineProperty needs an
+       arbitrary one, so the shape became operands: a machine that wants CreateDataProperty says so by leaving
+       these at their defaults, which is what step code 10 does. read+reset at do_getprop_tramp. */
+    JSValueConst gp_getter = JS_UNDEFINED, gp_setter = JS_UNDEFINED;
+    int gp_dflags = JS_PROP_HAS_VALUE | JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE
+                  | JS_PROP_HAS_CONFIGURABLE | JS_PROP_C_W_E;
     JSTrapGet *gp_trapst = NULL;                        /* set ONLY between a trap read's delivery and the operation's next exit: the
                                                            operation it belongs to, holding the method and re-supplying the request's
                                                            operands. It never spans a suspension — the exits free it — which is why the
@@ -24793,6 +24824,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     gp_op = (st == 7) ? GP_HAS : (st == 8) ? GP_SET : (st == 9) ? GP_DELETE
                           : (st == 10) ? GP_DEFINE : GP_GET;
                     gp_val = (st == 8 || st == 10) ? cb[1] : JS_UNDEFINED;
+                    if (st == 10 && h->desc_flags) {
+                        /* the machine asked for a descriptor other than CreateDataProperty's. Read and CLEARED
+                           here like every other request input, so a shape applies to this request and no other.
+                           The two values are BORROWED — the machine holds them across the request, exactly as it
+                           holds cb[0] — and the request dups whatever it keeps. */
+                        gp_getter = h->desc_get; gp_setter = h->desc_set;
+                        gp_dflags = h->desc_flags;
+                        gp_no_throw = !(h->desc_flags & JS_PROP_THROW);
+                        h->desc_get = JS_UNDEFINED; h->desc_set = JS_UNDEFINED; h->desc_flags = 0;
+                    }
                     goto do_getprop_tramp;
                 }
                 if (st == 5) {
@@ -25320,7 +25361,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    what every builtin's Get/Set performs and what the spec's default receiver is. */
                 JSValueConst gp_recv_r = JS_IsUninitialized(gp_recv) ? gp_obj : gp_recv;
                 int gp_nothrow_r = gp_no_throw;
+                JSValueConst gp_getter_r = gp_getter, gp_setter_r = gp_setter;
+                int gp_dflags_r = gp_dflags;
                 gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
+                gp_getter = gp_setter = JS_UNDEFINED;
+                gp_dflags = JS_PROP_HAS_VALUE | JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE
+                          | JS_PROP_HAS_CONFIGURABLE | JS_PROP_C_W_E;
                 DCHECK(!gp_trapst || (JS_VALUE_GET_TAG(gp_obj) == JS_TAG_OBJECT
                                       && JS_VALUE_GET_OBJ(gp_obj)->class_id == JS_CLASS_PROXY),
                        "a trap read was delivered to an operation whose object is not a Proxy");
@@ -25359,6 +25405,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             tg->val = js_dup(gp_val);
                             tg->recv = js_dup(gp_recv_r);
                             tg->method = JS_UNDEFINED;
+                            tg->getter = js_dup(gp_getter_r); tg->setter = js_dup(gp_setter_r);
+                            tg->dflags = gp_dflags_r;
                             tg->atom = JS_DupAtom(ctx, gp_atom);
                             tg->outer = gp_outer; tg->outer_kind = gp_outer_kind;
                             tg->op = gp_op; tg->no_throw = (uint8_t)gp_nothrow_r;
@@ -25397,6 +25445,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             gp_obj = pd->target;
                             gp_recv = gp_recv_r;
                             gp_no_throw = gp_nothrow_r;
+                            gp_getter = gp_getter_r; gp_setter = gp_setter_r; gp_dflags = gp_dflags_r;
                             if (gp_trapst) { js_trapget_free(ctx, gp_trapst); gp_trapst = NULL; }
                             goto do_getprop_tramp;
                         }
@@ -25523,12 +25572,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             goto getprop_throw;
                         ret_val = JS_UNDEFINED;
                     } else if (gp_op == GP_DEFINE) {
-                        /* CreateDataPropertyOrThrow(O, P, V): yields nothing but its throw either. A trapless
-                           proxy's own define forwards to the TARGET, with no receiver in the operation at all. */
-                        if (unlikely(JS_DefinePropertyValue(ctx, fwd ? gp_fwd : gp_obj, gp_atom, js_dup(gp_val),
-                                                            JS_PROP_C_W_E | JS_PROP_THROW) < 0))
-                            goto getprop_throw;
-                        ret_val = JS_UNDEFINED;
+                        /* [[DefineOwnProperty]] with the descriptor the request carries. A trapless proxy's own
+                           define forwards to the TARGET, with no receiver in the operation at all. no_throw makes
+                           it the BARE internal method (Reflect.defineProperty's boolean); otherwise it is
+                           DefinePropertyOrThrow and yields nothing but its throw. */
+                        int dfres = JS_DefineProperty(ctx, fwd ? gp_fwd : gp_obj, gp_atom, gp_val,
+                                                      gp_getter_r, gp_setter_r,
+                                                      gp_dflags_r | (gp_nothrow_r ? 0 : JS_PROP_THROW));
+                        if (unlikely(dfres < 0)) goto getprop_throw;
+                        ret_val = gp_nothrow_r ? js_bool(dfres) : JS_UNDEFINED;
                     } else if (gp_op == GP_GETOWNPROP) {
                         /* [[GetOwnProperty]] with nothing user-written in it: an ordinary object, a trapless
                            proxy (JS_GetOwnPropertyInternal spells that forward itself), or a C/bound trap. */
@@ -25581,6 +25633,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                           tg->method = ret_val;
                           gp_obj = tg->obj; gp_atom = tg->atom; gp_op = tg->op; gp_val = tg->val;
                           gp_recv = tg->recv; gp_no_throw = tg->no_throw;
+                          gp_getter = tg->getter; gp_setter = tg->setter; gp_dflags = tg->dflags;
                           gp_outer = tg->outer; gp_outer_kind = tg->outer_kind;
                           gp_trapst = tg;
                           goto do_getprop_tramp;
@@ -25621,8 +25674,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 /* GP_OWNKEYS's invariant is stated over the PROXY, not just its target: 10.5.11 re-reads
                    [[IsRevoked]] between the trap and the check, so the check needs the proxy object. The `value`
                    slot is the write's operand and is otherwise unused, so it carries it. */
-                gp->value = (gp_op == GP_SET) ? js_dup(gp_val)
+                gp->value = (gp_op == GP_SET || gp_op == GP_DEFINE) ? js_dup(gp_val)
                           : (gp_op == GP_OWNKEYS || gp_op == GP_GETOWNPROP) ? js_dup(gp_obj) : JS_UNDEFINED;
+                gp->getter = (gp_op == GP_DEFINE) ? js_dup(gp_getter_r) : JS_UNDEFINED;
+                gp->setter = (gp_op == GP_DEFINE) ? js_dup(gp_setter_r) : JS_UNDEFINED;
+                gp->dflags = gp_dflags_r;
                 gp->atom = JS_DupAtom(ctx, gp_atom);
                 gp->outer = gp_outer; gp->outer_kind = gp_outer_kind;
                 gp->op = gp_op;
@@ -25652,11 +25708,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         gp->nargs = 2;   /* has / deleteProperty / getOwnPropertyDescriptor (target, key) */
                     } else if (gp_op == GP_DEFINE) {
                         /* defineProperty(target, key, descriptor). FromPropertyDescriptor builds the descriptor
-                           OBJECT the trap sees, and this request only ever expresses CreateDataProperty's shape. */
-                        JSValue d5 = js_create_desc(ctx, gp_val, JS_UNDEFINED, JS_UNDEFINED,
-                                                    JS_PROP_HAS_VALUE | JS_PROP_HAS_WRITABLE |
-                                                    JS_PROP_HAS_ENUMERABLE | JS_PROP_HAS_CONFIGURABLE |
-                                                    JS_PROP_C_W_E);
+                           OBJECT the trap sees, out of the shape the request carries. */
+                        JSValue d5 = js_create_desc(ctx, gp_val, gp_getter_r, gp_setter_r, gp_dflags_r);
                         if (unlikely(JS_IsException(d5))) { js_getprop_free(ctx, gp); goto getprop_throw; }
                         gp->cb[4] = d5;
                         gp->nargs = 3;
@@ -28262,6 +28315,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         tg->method = ret_val;
                         gp_obj = tg->obj; gp_atom = tg->atom; gp_op = tg->op; gp_val = tg->val;
                         gp_recv = tg->recv; gp_no_throw = tg->no_throw;
+                        gp_getter = tg->getter; gp_setter = tg->setter; gp_dflags = tg->dflags;
                         gp_outer = tg->outer; gp_outer_kind = tg->outer_kind;
                         gp_trapst = tg;
                         goto do_getprop_tramp;
@@ -28331,12 +28385,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            and then — because every consumer performs CreateDataPropertyOrThrow — a TypeError when
                            it is false. The invariant's own THROW flag covers that, so it is passed. */
                         int fres = js_proxy_define_invariant(ctx, gp->target, gp->atom, gp->value,
-                                                             JS_UNDEFINED, JS_UNDEFINED,
-                                                             JS_PROP_HAS_VALUE | JS_PROP_HAS_WRITABLE |
-                                                             JS_PROP_HAS_ENUMERABLE | JS_PROP_HAS_CONFIGURABLE |
-                                                             JS_PROP_C_W_E | JS_PROP_THROW,
+                                                             gp->getter, gp->setter,
+                                                             gp->dflags | (gp->no_throw ? 0 : JS_PROP_THROW),
                                                              JS_ToBoolFree(ctx, ret_val));
-                        ret_val = (fres < 0) ? JS_EXCEPTION : JS_UNDEFINED;
+                        ret_val = (fres < 0) ? JS_EXCEPTION : gp->no_throw ? js_bool(fres) : JS_UNDEFINED;
                     } else if (gp->op == GP_SET) {
                         /* A SETTER yields nothing at all; a `set` TRAP yields a boolean that owes the target's
                            [[Set]] invariant and then, because every consumer of this request performs
@@ -53893,6 +53945,7 @@ static int js_obj_defprop_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
         if (s->hdr.str_phase == STR_PH_START) {
             s->result = JS_UNDEFINED;
             s->atom = JS_ATOM_NULL;
+            s->cb[0] = JS_UNDEFINED; s->cb[1] = JS_UNDEFINED;
             js_desc_cursor_init(&s->cur);
             if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT) {
                 JS_FreeValue(ctx, cb_result);
@@ -53913,14 +53966,31 @@ static int js_obj_defprop_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
         if (r) return r < 0 ? -1 : r;
         s->hdr.stage = 2;
     }
+    if (s->hdr.stage == 2) {
+        /* the DEFINE itself. On a Proxy target this is the `defineProperty` trap and 10.5.6's invariant on its
+           result — the page's code, which JS_DefineProperty ran from C. It is a request now, carrying the whole
+           descriptor rather than CreateDataProperty's fixed shape, and its THROW flag says which of the two
+           forms the caller wants: Object.defineProperty performs DefinePropertyOrThrow, Reflect.defineProperty
+           the bare [[DefineOwnProperty]] whose boolean IS its answer. */
+        JS_FreeValue(ctx, cb_result);
+        s->hdr.stage = 3;
+        s->cb[0] = js_dup(obj);
+        s->cb[1] = js_dup(s->cur.value);
+        s->hdr.desc_get = s->cur.getter;   /* borrowed: the cursor holds them across the request */
+        s->hdr.desc_set = s->cur.setter;
+        /* JS_PROP_DEFINE_PROPERTY says this is a real [[DefineOwnProperty]] and not CreateDataProperty's
+           shorthand — it is what makes an ABSENT attribute default to false instead of true — and its REFLECT
+           variant is the same operation reporting `false` where the other throws. It doubles as the "not the
+           default shape" marker the request tests for, so an empty descriptor still routes. */
+        s->hdr.desc_flags = s->cur.flags | (s->hdr.arg ? JS_PROP_REFLECT_DEFINE_PROPERTY
+                                                       : (JS_PROP_THROW | JS_PROP_DEFINE_PROPERTY));
+        *out_cb = s->cb; *out_argc = (int)s->atom;
+        return 10;   /* DEFINE */
+    }
+    /* stage 3: undefined for the throwing form, the boolean for the bare one. */
+    if (JS_IsException(cb_result)) return -1;
+    ret = s->hdr.arg ? JS_ToBool(ctx, cb_result) : 0;
     JS_FreeValue(ctx, cb_result);
-
-    flags = s->hdr.arg ? JS_PROP_REFLECT_DEFINE_PROPERTY
-                       : (JS_PROP_THROW | JS_PROP_DEFINE_PROPERTY);
-    ret = JS_DefineProperty(ctx, obj, s->atom, s->cur.value, s->cur.getter, s->cur.setter,
-                            s->cur.flags | flags);
-    if (ret < 0)
-        return -1;
     s->result = s->hdr.arg ? js_bool(ret) : js_dup(obj);
     return 0;
 }
@@ -53932,6 +54002,7 @@ static JSValue js_obj_defprop_fini(JSContext *ctx, void *st, bool take_result)
     if (!take_result) JS_FreeValue(ctx, s->result);
     JS_FreeAtom(ctx, s->atom);
     js_desc_cursor_free(ctx, &s->cur);
+    JS_FreeValue(ctx, s->cb[0]); JS_FreeValue(ctx, s->cb[1]);
     js_free(ctx, s);
     return r;
 }
