@@ -21461,29 +21461,19 @@ static inline JSTrampBodyEntry tramp_body_entry(JSValueConst func) {
     case TBE_GEN:   tramp_first = (first); tramp_is_tail = (tail); goto do_generator_create_tramp;     \
     case TBE_AGEN:  tramp_first = (first); tramp_is_tail = (tail); goto do_agen_create_tramp;          \
     }
-/* A COROUTINE CREATE releases the call's operands EAGERLY (async_func_init has dup'd everything into the
-   coroutine's own frame), where do_tramp_call leaves them standing for do_return to drop. That is the only
-   difference between the two, so the OWNERSHIP rule has to be do_tramp_call's, exactly:
-     - an OWNED reshaped list (a bound unwrap, a proxy resolve, a sequence's copy) belongs to this call — free it;
-     - an UNSET shape says the operands ARE the caller's stack, which this call consumes — free them, and the
-       caller resumes below them;
-     - a DECLARED shape with no owned list says the operands are a CONTINUATION'S OWN request buffer (gp->cb,
-       where a Proxy trap's and an accessor's arguments live). Those belong to the continuation, which frees them
-       at its own teardown; freeing them here is a double free, and it is what made a second
-       `Reflect.get(objWithGeneratorGetter, "a")` crash inside build_backtrace with the first one's state gone.
-   Either way the DECLARED shape separately names the caller-stack slots the original call left behind, which
-   this call still owes — the same [first, argc) do_return drops. */
-#define CREATE_RELEASE_OPERANDS(decl_, dcf_) do {                                            \
+/* A COROUTINE CREATE keeps do_tramp_call's operand model, because it IS a call: the caller's sp does not move,
+   the declared shape is RECORDED on the frame, and the settle drops [first, argc) exactly where a returning
+   bytecode frame does. It used to drop them eagerly and set caller_sp below them, and that divergence produced
+   three separate bugs in a row — an sp derived from a heap call_argv, a double free of a continuation's own
+   request buffer, and a delivery arm that could not be reached because the shape had already been spent. The
+   only thing the create still owes here is the OWNED reshaped list (a bound unwrap, a proxy resolve, a
+   sequence's copy), which do_tramp_call also frees itself once async_func_init has dup'd out of it. */
+#define CREATE_RELEASE_OPERANDS() do {                                                       \
     if (call_args_owned) {                                                                   \
-        for (i = tramp_first; i < call_argc; i++) JS_FreeValue(ctx, call_argv[i]);           \
-        js_free(ctx, call_args_owned); call_args_owned = NULL; call_args_owned_n = 0;        \
-    } else if ((decl_) < 0) {                                                                \
-        for (i = tramp_first; i < call_argc; i++) JS_FreeValue(ctx, call_argv[i]);           \
+        free_arg_list(ctx, call_args_owned, call_args_owned_n);                              \
+        call_args_owned = NULL; call_args_owned_n = 0;                                       \
     }                                                                                        \
-    if ((decl_) >= 0) { for (i = (dcf_); i < (decl_); i++) JS_FreeValue(ctx, sp[i - (decl_)]); } \
 } while (0)
-#define CREATE_CALLER_SP(decl_, dcf_) \
-    (((decl_) >= 0) ? (sp - (decl_) + (dcf_)) : (JSValue *)(call_argv + tramp_first))
 
 struct JSAsyncGeneratorData;
 static void js_async_generator_free(JSRuntime *rt, struct JSAsyncGeneratorData *s);
@@ -22920,16 +22910,30 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->cb_args[3] = s->resolving_funcs[1];
                 call_argv = (JSValueConst *)&s->cb_args[2];
                 call_argc = 2; tramp_first = -2; tramp_is_tail = 0;
-                if (tramp_can_call(pe_executor)) {
-                    tramp_cont_state = s; tramp_cont_kind = CONT_PROMISE_EXEC;
-                    goto do_tramp_call;   /* bytecode executor: its body runs on THIS chain and can park */
+                /* 27.2.3.1 step 9's Call, for ANY executor. This asked whether it had a bytecode body and ran
+                   everything else with JS_Call right here — and "a C/bound executor has no preemptible body" was
+                   false for the bound and proxied cases, whose ULTIMATE target is a bytecode body: `new
+                   Promise(ex.bind(null))` ran its loop in an activation with no flow base. Which kind of callee it
+                   is, is the convergence point's question; a C one is called in place there and delivered through
+                   this same continuation. */
+                {   /* The convergence point REWRITES the callee in place for a trapless proxy, and cb_args is
+                       the continuation's own buffer whose entries it does not own — writing through it frees a
+                       reference that was only borrowed. Hand an OWNED [this, f, args...] copy, the same list the
+                       bound arm builds and the same thing a sequence's call does for the same reason. */
+                    JSValue *el = js_malloc(ctx, sizeof(JSValue) * 4);
+                    if (unlikely(!el)) { JS_ThrowOutOfMemory(ctx); goto promise_exec_abort; }
+                    el[0] = JS_UNDEFINED;                      /* step 9: thisArgument is undefined */
+                    el[1] = js_dup(s->cb_args[1]);             /* the executor */
+                    el[2] = js_dup(s->cb_args[2]);
+                    el[3] = js_dup(s->cb_args[3]);
+                    if (call_args_owned) free_arg_list(ctx, call_args_owned, call_args_owned_n);
+                    call_args_owned = el; call_args_owned_n = 4;
+                    call_argv = (JSValueConst *)&el[2]; call_argc = 2;
                 }
-                /* a C/bound executor has no preemptible body, so running it here suspends nothing — and handling
-                   it HERE is what lets js_promise_constructor's JS_Call version be deleted rather than kept as the
-                   not-recognized path. Both shapes converge on the one completion below. */
-                ret_val = JS_Call(ctx, pe_executor, JS_UNDEFINED, 2, (JSValueConst *)&s->cb_args[2]);
-                pexec_finish_state = s;
-                goto do_promise_exec_finish;
+                tramp_cont_state = s; tramp_cont_kind = CONT_PROMISE_EXEC;
+                tramp_first = -2; tramp_is_tail = 0;
+                call_cfirst = 0; call_cargc = 0;   /* the arguments are an owned list: the caller's stack is untouched */
+                goto do_generic_callee;
 
             promise_exec_abort:
                 /* EVERY pe_* input is released in ONE place. Three entry spellings set them — the constructor
@@ -23992,6 +23996,40 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (unlikely(JS_IsException(ret_val))) goto exception;
                         js_iternext_deliver(ctx, sp, ret_val);
                         BREAK;
+                    }
+                    if (dck == CONT_PROMISE_EXEC) {
+                        /* a C, bound or proxied executor called in place: steps 10-11 are the ONE completion the
+                           frame-return path also reaches — the result is discarded and the promise is yielded,
+                           or the abrupt value rejects it. */
+                        TAKE_CALL_SHAPE();
+                        DCHECK(call_pop == 0 && call_first_r == 0,
+                               "the promise executor's arguments are its continuation's own buffer");
+                        pexec_finish_state = dcs;
+                        goto do_promise_exec_finish;
+                    }
+                    if (dck == CONT_CONSUME_GETITER) {
+                        /* an @@iterator with no bytecode body — Array.prototype.values, a bound one, a proxied
+                           one, a builtin that is itself a step machine. GetIterator step 5 (the result must be an
+                           Object) and the SAME deliver the frame-return path uses; an exception rides through as
+                           the acquisition failure each consumer already knows how to answer. */
+                        JSConsumeGetIter *gi = dcs;
+                        JSValue *cargv;
+                        int pop, first;
+                        TAKE_CALL_SHAPE(); pop = call_pop; first = call_first_r;
+                        DCHECK(pop >= first, "consume getiter call records operands ending below where they start");
+                        cargv = sp - pop;
+                        for (i = first; i < pop; i++) JS_FreeValue(ctx, cargv[i]);
+                        sp += first - pop;
+                        if (unlikely(!JS_IsException(ret_val) && !JS_IsObject(ret_val))) {
+                            JS_FreeValue(ctx, ret_val);
+                            JS_ThrowTypeErrorNotAnObject(ctx);
+                            ret_val = JS_EXCEPTION;
+                        }
+                        tramp_consume_state = gi->consumer; tramp_consume_kind = gi->consumer_kind;
+                        js_free_rt(rt, gi);
+                        tramp_consume_acquired = ret_val;
+                        ret_val = JS_UNDEFINED;
+                        goto do_consume_deliver_iterator;
                     }
                     if (dck == CONT_INSTANCEOF) {
                         /* a callable @@hasInstance with no bytecode body — a C one, a bound one, a proxied one.
@@ -25400,11 +25438,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     tramp_gen_create_cont_it = tramp_consume_state; tramp_gen_create_cont_kind = tramp_consume_kind;
                     goto do_generator_create_tramp;   /* settle -> do_consume_deliver_iterator */
                 }
-                if (tramp_can_call(method)) {
-                    /* A NORMAL bytecode @@iterator (`[Symbol.iterator]() { … }`, an arrow, a class method): GetIterator
-                       step 4's Call runs its BODY on this chain, so a loop in it preempts. The three arms here are not
-                       a fallback selector — they are the three ways a callee's body can be entered, and the C arm below
-                       is the one with no body to suspend. */
+                {
+                    /* GetIterator step 4's Call, for ANY callable @@iterator. This asked whether the method had a
+                       NORMAL bytecode body and handed everything else to JS_GetIterator2, which calls it from C:
+                       a BOUND or PROXIED `[Symbol.iterator]` — `o[Symbol.iterator] = it.bind(null)` — ran its body
+                       in an activation with no flow base. Which KIND of callee it is, is the convergence point's
+                       question, and a C one is called in place there and delivered through the same continuation. */
                     JSConsumeGetIter *gi = js_mallocz(ctx, sizeof(*gi));
                     if (unlikely(!gi)) {
                         JS_FreeValue(ctx, method);
@@ -25423,13 +25462,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     *sp++ = method;             /* the @@iterator method (owned, transferred) */
                     call_argv = sp; call_argc = 0; tramp_first = -2; tramp_is_tail = 0;
                     tramp_cont_state = gi; tramp_cont_kind = CONT_CONSUME_GETITER;
-                    goto do_tramp_call;   /* settle -> do_consume_deliver_iterator */
+                    goto do_generic_callee;   /* settle -> do_consume_deliver_iterator */
                 }
-                /* A C-function @@iterator (Array.prototype.values, %ArrayIteratorPrototype%, a bound function …):
-                   no bytecode body exists to suspend, so the call is made in place. */
-                tramp_consume_acquired = JS_GetIterator2(ctx, iterable, method);
-                JS_FreeValue(ctx, method);
-                goto do_consume_deliver_iterator;
             }
 
         do_consume_deliver_iterator:
@@ -27100,9 +27134,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    that says so. The two rules that follow from it are the generator create's, verbatim — the
                    caller's sp must not be re-derived from a heap call_argv, and the DECLARED EMPTY SHAPE is
                    resolved per call, so it is consumed here rather than left for this frame's next call. */
-                int adecl = call_cargc; int adcf = call_cfirst;   /* the declared shape — see the generator create */
-                call_cfirst = 0; call_cargc = -1;   /* read + reset, as TAKE_CALL_SHAPE does for every other call */
-                CREATE_RELEASE_OPERANDS(adecl, adcf);
+                TAKE_CALL_SHAPE();   /* the same read + reset every other call does */
+                CREATE_RELEASE_OPERANDS();
                 atf2->up = tf_top;
                 atf2->caller_sf = sf; atf2->caller_b = b; atf2->caller_ctx = ctx;
                 atf2->caller_local_buf = local_buf; atf2->caller_stack_buf = stack_buf;
@@ -27112,8 +27145,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 atf2->caller_argc = argc; atf2->caller_argv = argv;
                 atf2->caller_arg_allocated_size = arg_allocated_size;
                 atf2->seq_req = acreate_cont; atf2->seq_req_kind = acreate_cont_kind;
-                atf2->caller_sp = CREATE_CALLER_SP(adecl, adcf);
-                atf2->call_first = -1; atf2->call_argc = 0; atf2->is_tail = tramp_is_tail;
+                atf2->caller_sp = sp;   /* the operands STAND: the settle drops them through the recorded shape */
+                atf2->call_first = call_first_r; atf2->call_argc = call_pop; atf2->is_tail = tramp_is_tail;
                 atf2->async_data = NULL; atf2->gen_data = NULL; atf2->gen_magic = 0;
                 atf2->cont_state = s; atf2->cont_kind = CONT_AGEN_CREATE;
                 atf2->b = NULL; atf2->local_buf = NULL;
@@ -27145,6 +27178,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValue afn = atf2->async_promise;
                 uint8_t aitail = atf2->is_tail;
                 void *aseq = atf2->seq_req; uint8_t aseq_kind = atf2->seq_req_kind;
+                int acf = atf2->call_first, acp = atf2->call_argc;   /* the shape this call left on the caller's stack */
                 JSValue obj;
                 sf->cur_pc = pc; sf->cur_sp = sp;   /* SUSPENDED_START */
                 obj = js_create_from_ctor(ctx, afn, JS_CLASS_ASYNC_GENERATOR);
@@ -27168,10 +27202,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        delivery a returning bytecode callback uses — empty operand shape, because the create
                        already dropped the call's operands and restored the caller's sp. */
                     dlv_cs = aseq; dlv_ck = aseq_kind;
-                    dlv_cfirst = 0; dlv_cargc = 0; dlv_itail = 0; dlv_forof = 0;
+                    dlv_cfirst = acf; dlv_cargc = acp; dlv_itail = 0; dlv_forof = 0;
                     ret_val = obj;
                     goto do_cont_deliver;
                 }
+                { JSValue *cargv0 = sp - acp;   /* see the generator settle */
+                  for (i = acf; i < acp; i++) JS_FreeValue(ctx, cargv0[i]);
+                  sp += acf - acp; }
                 if (aitail) { ret_val = obj; goto do_return; }
                 *sp++ = obj;
                 BREAK;
@@ -27383,9 +27420,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    live) — and names, separately, the caller-stack slots the original call left behind. Testing
                    call_args_owned covered only the owned-list half, so an accessor getter that was a generator
                    function resumed its caller with an sp pointing into the machine's own state. */
-                int gdecl = call_cargc; int gdcf = call_cfirst;
-                call_cfirst = 0; call_cargc = -1;   /* read + reset, as TAKE_CALL_SHAPE does for every other call */
-                CREATE_RELEASE_OPERANDS(gdecl, gdcf);
+                TAKE_CALL_SHAPE();   /* the same read + reset every other call does */
+                CREATE_RELEASE_OPERANDS();
                 gtf->up = tf_top;
                 gtf->caller_sf = sf; gtf->caller_b = b; gtf->caller_ctx = ctx;
                 gtf->caller_local_buf = local_buf; gtf->caller_stack_buf = stack_buf;
@@ -27394,8 +27430,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 gtf->caller_var_refs = var_refs;
                 gtf->caller_argc = argc; gtf->caller_argv = argv;
                 gtf->caller_arg_allocated_size = arg_allocated_size;
-                gtf->caller_sp = CREATE_CALLER_SP(gdecl, gdcf);   /* the generator object goes here (or the cont re-enters the step, popping to here) */
-                gtf->call_first = -1; gtf->call_argc = 0; gtf->is_tail = gcreate_cont ? 0 : tramp_is_tail;
+                gtf->caller_sp = sp;   /* the operands STAND: the settle drops them through the recorded shape */
+                /* the SHAPE this call left on the caller's stack, recorded exactly as do_tramp_call records it
+                   so the settle's drop is the same one do_return performs. */
+                gtf->call_first = call_first_r; gtf->call_argc = call_pop;
+                gtf->is_tail = gcreate_cont ? 0 : tramp_is_tail;
                 gtf->async_data = NULL;
                 /* 0xFF = CREATING (run-to-initial_yield), not a GEN_MAGIC. cont (flatMap inner): the settle stores the
                    created generator as the helper's inner and re-enters do_iter_helper_step instead of pushing it. */
@@ -27439,6 +27478,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                       || gcreate_cont_kind == CONT_PROMISE_ALL
                                       || gcreate_cont_kind == CONT_ITER_FROM) ? gtf->cont_state : NULL;
                 void *gcall_cont = gtf->seq_req; uint8_t gcall_cont_kind = gtf->seq_req_kind;   /* CALL requester */
+                int gcf = gtf->call_first, gcp = gtf->call_argc;   /* the shape this call left on the caller's stack */
                 JSValue obj;
                 sf->cur_pc = pc; sf->cur_sp = sp;   /* suspend at initial_yield (state stays SUSPENDED_START) */
                 obj = js_create_from_ctor(ctx, gfunc, JS_CLASS_GENERATOR);   /* uses the ctor's realm */
@@ -27462,10 +27502,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        dropped the call's operands and restored the caller's sp — the delivery must not drop them
                        twice — and the requester is a machine, never a tail-caller. */
                     dlv_cs = gcall_cont; dlv_ck = gcall_cont_kind;
-                    dlv_cfirst = 0; dlv_cargc = 0; dlv_itail = 0; dlv_forof = 0;
+                    dlv_cfirst = gcf; dlv_cargc = gcp; dlv_itail = 0; dlv_forof = 0;
                     ret_val = obj;
                     goto do_cont_deliver;
                 }
+                /* every arm below wants a clean caller stack, so the operands this call left there are dropped
+                   here — the delivery above does its own dropping, through the shape, which is the only reason
+                   an arm that ASSERTS a particular shape (a consumer's @@iterator, which owes exactly two) can
+                   be reached from a create at all. */
+                { JSValue *cargv0 = sp - gcp;
+                  for (i = gcf; i < gcp; i++) JS_FreeValue(ctx, cargv0[i]);
+                  sp += gcf - gcp; }
                 if (gcreate_cont && gcreate_cont_kind == CONT_ITER_HELPER) {
                     /* flatMap inner: the mapped iterable's [Symbol.iterator] generator was created on the tramp.
                        Store it as the helper's inner and re-enter do_iter_helper_step; ITHP_START drives the inner. */
@@ -27792,7 +27839,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        SAME deliver the inline acquire and the generator-create settle use. */
                     JSConsumeGetIter *gi = dlv_cs;
                     JSValue *cargv = sp - dlv_cargc;
-                    DCHECK(dlv_cargc - dlv_cfirst == 2, "consume getiter frame has an unexpected operand shape");
+                    /* NOT "exactly two": a Proxy `apply` trap reshapes the call into the trap's own five
+                       operands before it ever reaches a frame, and the drop below is written from the shape
+                       precisely so it does not care. Asserting the pre-reshape count made a proxied @@iterator
+                       fire an invariant that was never true of it — it only looked true while such a method was
+                       handed to JS_GetIterator2 and never got here at all. */
+                    DCHECK(dlv_cargc >= dlv_cfirst, "consume getiter frame records operands ending below where they start");
                     for (i = dlv_cfirst; i < dlv_cargc; i++) JS_FreeValue(ctx, cargv[i]);
                     sp += dlv_cfirst - dlv_cargc;
                     if (unlikely(!JS_IsObject(ret_val))) {
