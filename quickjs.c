@@ -21181,7 +21181,6 @@ static int js_tramp_proxy_construct(JSContext *ctx, JSValueConst func, JSValueCo
         *out_target = js_dup(s->target);   /* 9.5.14 step 6: Construct(target, args, newTarget) */
         return 2;
     }
-    if (!tramp_can_call(method)) { JS_FreeValue(ctx, method); return 0; }   /* C/bound trap: no preemptible body */
     arr = js_create_array(ctx, argc, argv);
     if (JS_IsException(arr)) { JS_FreeValue(ctx, method); return -1; }
     out[0] = js_dup(s->handler);   /* this */
@@ -22978,7 +22977,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         call_argv = (JSValueConst *)(sp + 2); call_argc = 3; sp += 5;
                         tramp_first = -2; tramp_is_tail = 0;
                         tramp_cont_state = NULL; tramp_cont_kind = CONT_PROXY_CONSTRUCT;
-                        goto do_tramp_call;
+                        /* ANY callable trap, exactly as on the [[Call]] side: asking whether it had a BYTECODE
+                           body and declining otherwise left the PROXY as the target, so js_proxy_call_constructor
+                           drove a C, bound or proxied trap from C. The continuation (10.5.13's must-return-object
+                           check) rides tramp_cont_kind either way, so the reshape can take the body dispatch or
+                           re-enter the convergence point with the trap as the callee. */
+                        TRAMP_BODY_DISPATCH(-2, 0);
+                        tramp_first = -2;
+                        goto do_generic_callee;
                     }
                     /* px_ret == 0: con_func is now the ultimate target — a bytecode ctor, a consumer builtin, a
                        step machine, a plain C one. The arms below answer that, so the resolution keeps no copy
@@ -23841,6 +23847,26 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         sp += first - pop;
                         if (unlikely(JS_IsException(ret_val))) goto exception;
                         js_iternext_deliver(ctx, sp, ret_val);
+                        BREAK;
+                    }
+                    if (dck == CONT_PROXY_CONSTRUCT) {
+                        /* 10.5.13 step 9: the `construct` trap MUST return an Object. The check is the same one
+                           the frame-return path runs; it only needed an arm here once a C, bound or proxied trap
+                           could be the callee — before that the trap was always a bytecode body, which is exactly
+                           the narrowing this diff removed. */
+                        JSValue *cargv;
+                        int pop, first;
+                        TAKE_CALL_SHAPE(); pop = call_pop; first = call_first_r;
+                        cargv = sp - pop;
+                        for (i = first; i < pop; i++) JS_FreeValue(ctx, cargv[i]);
+                        sp += first - pop;
+                        if (unlikely(JS_IsException(ret_val))) goto exception;
+                        if (unlikely(JS_VALUE_GET_TAG(ret_val) != JS_TAG_OBJECT)) {
+                            JS_FreeValue(ctx, ret_val);
+                            JS_ThrowTypeErrorNotAnObject(ctx);
+                            goto exception;
+                        }
+                        *sp++ = ret_val;
                         BREAK;
                     }
                     DCHECK(dck == CONT_NONE,
