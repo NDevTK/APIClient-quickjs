@@ -19475,6 +19475,19 @@ typedef struct JSAsyncPost {
     JSValue await_promise;    /* AWAIT only (owned); UNDEFINED otherwise */
     JSAsyncFunctionData *st;  /* AWAIT only: a reference the finish releases */
 } JSAsyncPost;
+#define CONT_AGEN_SETTLE   41  /* cont_state = JSAgenSettle: an async GENERATOR body that reached AWAIT on the
+                                  tramp chain. Await's resolve call is the same page code the async function's is
+                                  (the native resolving function's `then` read on a thenable), and it is placed
+                                  here for the same reason — with everything the drive still owes riding the
+                                  state, because a parked flow keeps no interpreter locals. */
+typedef struct JSAgenSettle {
+    JSAsyncPost post;              /* the capability the finish registers on */
+    struct JSAsyncGeneratorData *s;/* borrowed: the generator object on the caller stack keeps it alive */
+    JSValue prom, hold;            /* the drive's own outcome, deferred across the call (owned) */
+    int caller_depth;              /* where the drive's finish restores sp to, as a DEPTH: a park rebuilds the
+                                      frame, so a raw pointer would be stale on resume */
+    uint8_t fin, is_tail;
+} JSAgenSettle;
 typedef struct JSAsyncSettle {
     JSValue promise;      /* the async function's own promise (owned): the CALL's result is discarded, this is not */
     JSAsyncPost post;     /* AWAIT only: the capability the finish registers on, once the resolve call has run */
@@ -20107,6 +20120,7 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_PROXY_CONSTRUCT:
     case CONT_INSTANCEOF:
     case CONT_PROMISE_EXEC:
+    case CONT_AGEN_SETTLE:
     case CONT_ASYNC_SETTLE:
     case CONT_PROMISE_TRY_SETTLE:
     case CONT_PROMISE_CAP:
@@ -21775,7 +21789,10 @@ static JSValue js_async_generator_next(JSContext *ctx, JSValueConst this_val, in
 static JSValue js_async_generator_enqueue(JSContext *ctx, struct JSAsyncGeneratorData *s, int magic,
                                           JSValueConst arg);
 static int js_async_generator_pre(JSContext *ctx, struct JSAsyncGeneratorData *s);
-static int js_async_generator_post(JSContext *ctx, struct JSAsyncGeneratorData *s, JSValue func_ret);
+#define AGEN_AWAIT_CALL 2   /* js_async_generator_post: the caller must place Await's resolve call, then finish it */
+static int js_async_generator_post(JSContext *ctx, struct JSAsyncGeneratorData *s, JSValue func_ret,
+                                   JSAsyncPost *out);
+static int js_async_generator_await_finish(JSContext *ctx, JSAsyncPost *p, struct JSAsyncGeneratorData *s);
 /* An ASYNC generator .next()/.throw()/.return() — the same question as tramp_gen_method_magic, for the async
    class. Asked in exactly ONE place (do_generic_callee), which every call shape converges on, so a bound /
    proxied / applied / spread `ag.next()` cannot answer differently from a plain one. Off the tramp the drive
@@ -24478,6 +24495,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         js_iternext_deliver(ctx, sp, ret_val);
                         BREAK;
                     }
+                    if (dck == CONT_AGEN_SETTLE) {
+                        JSValue *cargv; int pop, first;
+                        TAKE_CALL_SHAPE(); pop = call_pop; first = call_first_r;
+                        cargv = sp - pop;
+                        for (i = first; i < pop; i++) JS_FreeValue(ctx, cargv[i]);
+                        sp += first - pop;
+                        if (unlikely(JS_IsException(ret_val))) {
+                            JSAgenSettle *ags = dcs;
+                            JS_FreeValue(ctx, ags->post.await_promise);
+                            JS_FreeValue(ctx, ags->prom); JS_FreeValue(ctx, ags->hold);
+                            js_free_rt(rt, ags);
+                            goto exception;
+                        }
+                        cont_st = dcs;
+                        goto do_agen_settled;
+                    }
                     if (dck == CONT_ASYNC_SETTLE) {
                         /* the resolving function had no heap frame — the native one is a step machine, but a C
                            or bound resolve lands here. Drop its operands and place the promise. */
@@ -24887,6 +24920,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             call_first_r = 0; call_pop = 0;
                             ptry_finish_state = souter;
                             goto do_promise_try_finish;
+                        }
+                        if (souter_kind == CONT_AGEN_SETTLE) {
+                            ret_val = r;
+                            cont_st = souter;
+                            goto do_agen_settled;
                         }
                         if (souter_kind == CONT_ASYNC_SETTLE) {
                             /* the resolving function WAS a step machine — the native one is. This arm already
@@ -28192,10 +28230,59 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 arg_allocated_size = dtf3->caller_arg_allocated_size;
                 pc = sf->cur_pc; sp = dtf3->caller_sp;
                 js_free_rt(rt, dtf3);
-                if (js_async_generator_post(ctx, agen_s, agret))
-                    goto do_agen_drive_enter;
+                {
+                    JSAsyncPost apost;
+                    int pr = js_async_generator_post(ctx, agen_s, agret, &apost);
+                    if (pr == AGEN_AWAIT_CALL) {
+                        /* Await's resolve call goes on THIS chain, and the drive's own outcome is deferred across
+                           it — the same shape do_async_settle uses for the async function's settle. */
+                        JSAgenSettle *ags = js_malloc_rt(rt, sizeof(*ags));
+                        if (unlikely(!ags)) {
+                            JS_FreeValue(ctx, apost.func); JS_FreeValue(ctx, apost.value);
+                            JS_FreeValue(ctx, apost.await_promise);
+                            JS_ThrowOutOfMemory(ctx);
+                            goto exception;
+                        }
+                        ags->post = apost; ags->s = agen_s;
+                        ags->prom = agen_prom; agen_prom = JS_UNDEFINED;
+                        ags->hold = agen_hold; agen_hold = JS_UNDEFINED;
+                        ags->fin = agen_fin; ags->is_tail = agen_tail;
+                        ags->caller_depth = (int)(agen_caller_sp - stack_buf);
+                        DCHECK(sp + 3 <= TRAMP_SP_LIMIT(sf),
+                               "async generator await: operand push exceeds the frame's compiled stack_size");
+                        *sp++ = JS_UNDEFINED;
+                        *sp++ = apost.func;    /* the resolving function (owned, transferred) */
+                        *sp++ = apost.value;   /* the awaited value (owned, transferred) */
+                        call_argv = sp - 1; call_argc = 1; tramp_first = -2; tramp_is_tail = 0;
+                        tramp_cont_state = ags; tramp_cont_kind = CONT_AGEN_SETTLE;
+                        goto do_generic_callee;
+                    }
+                    if (pr)
+                        goto do_agen_drive_enter;
+                }
                 goto do_agen_drive_finish;
             }
+
+        do_agen_settled:
+            /* Await's resolve call returned: register the continuation, restore the drive's outcome and finish
+               it. `sp` is already back where the body frame left it. */
+            {
+                JSAgenSettle *ags = cont_st;
+                int fr;
+                cont_st = NULL;
+                JS_FreeValue(ctx, ret_val);
+                fr = js_async_generator_await_finish(ctx, &ags->post, ags->s);
+                agen_prom = ags->prom; agen_hold = ags->hold;
+                agen_fin = ags->fin; agen_tail = ags->is_tail;
+                agen_caller_sp = stack_buf + ags->caller_depth;
+                js_free_rt(rt, ags);
+                if (unlikely(fr < 0)) {
+                    JS_FreeValue(ctx, agen_prom); agen_prom = JS_UNDEFINED;
+                    JS_FreeValue(ctx, agen_hold); agen_hold = JS_UNDEFINED;
+                    goto exception;
+                }
+            }
+            goto do_agen_drive_finish;
 
         do_generator_create_tramp:
             /* A generator FUNCTION call g() runs its params up to OP_initial_yield HERE on the tramp chain (so a
@@ -28769,6 +28856,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 } else if (dlv_ck == CONT_PROMISE_EXEC) {
                     pexec_finish_state = dlv_cs;
                     goto do_promise_exec_finish;   /* ONE completion, shared with the inline-executor path */
+                } else if (dlv_ck == CONT_AGEN_SETTLE) {
+                    JSValue *scargv = sp - dlv_cargc;
+                    for (i = dlv_cfirst; i < dlv_cargc; i++) JS_FreeValue(ctx, scargv[i]);
+                    sp += dlv_cfirst - dlv_cargc;
+                    cont_st = dlv_cs;
+                    goto do_agen_settled;
                 } else if (dlv_ck == CONT_ASYNC_SETTLE) {
                     /* a BYTECODE resolving function (a subclass's) returned. */
                     JSValue *scargv = sp - dlv_cargc;
@@ -32476,6 +32569,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JS_FreeValue(ctx, rr);
             *sp++ = r;
             BREAK;
+        } else if (xck == CONT_AGEN_SETTLE) {
+            /* the resolving function THREW: the await can never be registered and the drive's outcome can never
+               be placed, so both are released and the throw propagates. */
+            JSAgenSettle *ags = xcs;
+            JS_FreeValue(ctx, ags->post.await_promise);
+            JS_FreeValue(ctx, ags->prom); JS_FreeValue(ctx, ags->hold);
+            js_free_rt(rt, ags);
+            xcs = NULL;
+            goto exception;
         } else if (xck == CONT_ASYNC_SETTLE) {
             /* the resolving function THREW. Nothing settles the promise then and nothing is waiting on it that
                can still be reached, so the requester is abandoned and the throw propagates — the same shape the
@@ -34128,39 +34230,64 @@ static int js_async_generator_resolve_function_create(JSContext *ctx,
     return 0;
 }
 
-static int js_async_generator_await(JSContext *ctx,
-                                    JSAsyncGeneratorData *s,
-                                    JSValue value)
+/* Await inside an async GENERATOR, split exactly as the async function's is: PromiseResolve(%Promise%, value)
+   resolves a fresh capability, and that CALL is page code — the native resolving function's
+   `Get(resolution, "then")` when the awaited value is a thenable — so it is handed to the caller to place on a
+   flow instead of being a JS_Call from here. AGEN_AWAIT_CALL means "call out->func(out->value), then finish";
+   0 means the short-circuit applied and the await is already registered. */
+static int js_async_generator_await_finish(JSContext *ctx, JSAsyncPost *p, JSAsyncGeneratorData *s);
+
+static int js_async_generator_await_prepare(JSContext *ctx, JSAsyncGeneratorData *s, JSValueConst value,
+                                            JSAsyncPost *out)
 {
-    JSValue promise, resolving_funcs[2], resolving_funcs1[2];
+    JSValue promise, resolving_funcs[2];
+
+    out->func = JS_UNDEFINED; out->value = JS_UNDEFINED;
+    out->await_promise = JS_UNDEFINED; out->st = NULL;
+    if (JS_GetOpaque(value, JS_CLASS_PROMISE)) {
+        /* PromiseResolve's short-circuit: an already-native promise IS the result and no call happens. Its
+           `constructor` READ is still a C read — the same one the async function's prepare has. */
+        JSValue c2 = JS_GetProperty(ctx, value, JS_ATOM_constructor);
+        bool is_same;
+        if (JS_IsException(c2)) return -1;
+        is_same = js_same_value(ctx, c2, ctx->promise_ctor);
+        JS_FreeValue(ctx, c2);
+        if (is_same) {
+            out->await_promise = js_dup(value);
+            return js_async_generator_await_finish(ctx, out, s) < 0 ? -1 : 0;
+        }
+    }
+    promise = js_new_promise_capability(ctx, resolving_funcs, ctx->promise_ctor);
+    if (JS_IsException(promise)) return -1;
+    JS_FreeValue(ctx, resolving_funcs[1]);
+    out->func = resolving_funcs[0];
+    out->value = js_dup(value);
+    out->await_promise = promise;
+    return AGEN_AWAIT_CALL;
+}
+
+/* Await's remaining steps once its resolve call has run: the generator's own resolving functions and
+   PerformPromiseThen on the capability. Consumes out->await_promise. */
+static int js_async_generator_await_finish(JSContext *ctx, JSAsyncPost *p, JSAsyncGeneratorData *s)
+{
+    JSValue promise = p->await_promise;
+    JSValue resolving_funcs[2], resolving_funcs1[2];
     int i, res;
 
-    promise = js_promise_resolve_native(ctx, ctx->promise_ctor,
-                                 1, vc(&value), 0);
-    if (JS_IsException(promise))
-        goto fail;
-
+    p->await_promise = JS_UNDEFINED;
     if (js_async_generator_resolve_function_create(ctx, JS_MKPTR(JS_TAG_OBJECT, s->generator),
                                                    resolving_funcs, false)) {
         JS_FreeValue(ctx, promise);
-        goto fail;
+        return -1;
     }
-
-    /* Note: no need to create 'thrownawayCapability' as in
-       the spec */
+    /* Note: no need to create 'thrownawayCapability' as in the spec */
     for(i = 0; i < 2; i++)
         resolving_funcs1[i] = JS_UNDEFINED;
-    res = perform_promise_then(ctx, promise,
-                               vc(resolving_funcs),
-                               vc(resolving_funcs1));
+    res = perform_promise_then(ctx, promise, vc(resolving_funcs), vc(resolving_funcs1));
     JS_FreeValue(ctx, promise);
     for(i = 0; i < 2; i++)
         JS_FreeValue(ctx, resolving_funcs[i]);
-    if (res)
-        goto fail;
-    return 0;
- fail:
-    return -1;
+    return res ? -1 : 0;
 }
 
 static void js_async_generator_resolve_or_reject(JSContext *ctx,
@@ -34330,8 +34457,11 @@ static int js_async_generator_pre(JSContext *ctx, JSAsyncGeneratorData *s)
 /* One body run's outcome. Returns 1 when the machine has more to do (drive `pre` again), 0 when it is parked on
    an await or has nothing queued. The body frame must be non-running (cur_sp set) on entry: an outcome that
    COMPLETES the generator tears that frame down. */
-static int js_async_generator_post(JSContext *ctx, JSAsyncGeneratorData *s, JSValue func_ret)
+static int js_async_generator_post(JSContext *ctx, JSAsyncGeneratorData *s, JSValue func_ret,
+                                   JSAsyncPost *out)
 {
+    out->func = JS_UNDEFINED; out->value = JS_UNDEFINED;
+    out->await_promise = JS_UNDEFINED; out->st = NULL;
     JSValue value;
     int ret;
 
@@ -34355,14 +34485,14 @@ static int js_async_generator_post(JSContext *ctx, JSAsyncGeneratorData *s, JSVa
             JS_FreeValue(ctx, value);
             return 1;
         case FUNC_RET_AWAIT:
-            ret = js_async_generator_await(ctx, s, value);
+            ret = js_async_generator_await_prepare(ctx, s, value, out);
             JS_FreeValue(ctx, value);
             if (ret < 0) {
                 /* the await plumbing itself threw: re-enter the body with that throw (pre sees EXECUTING) */
                 s->func_state.throw_flag = true;
                 return 1;
             }
-            return 0;
+            return ret;   /* 0 = registered, AGEN_AWAIT_CALL = the caller places the resolve call */
         default:
             DFAIL("async generator body suspended with an unknown FUNC_RET code — route the new suspend reason");
             return 0;
@@ -34403,8 +34533,26 @@ static void js_async_generator_resume_next(JSContext *ctx,
             JS_ParkFlow(ctx, js_async_gen_park_resume, s->generator);
             return;
         }
-        if (!js_async_generator_post(ctx, s, func_ret))
-            return;
+        {
+            JSAsyncPost apost;
+            int pr = js_async_generator_post(ctx, s, func_ret, &apost);
+            if (pr == AGEN_AWAIT_CALL) {
+                /* Await's resolve call as a CALL-ROOT FLOW: this context has no tramp chain to route it onto. */
+                int cr = js_settle_as_flow(ctx, apost.func, apost.value);
+                JS_FreeValue(ctx, apost.func);
+                JS_FreeValue(ctx, apost.value);
+                if (cr == 0) cr = js_async_generator_await_finish(ctx, &apost, s);
+                if (cr < 0) {
+                    JS_FreeValue(ctx, apost.await_promise);
+                    /* the plumbing threw: re-enter the body with it, exactly as a failed prepare does */
+                    s->func_state.throw_flag = true;
+                    continue;
+                }
+                return;
+            }
+            if (!pr)
+                return;
+        }
     }
 }
 
@@ -72902,17 +73050,23 @@ static JSValue js_promise_resolve_function_call(JSContext *ctx,
 
     /* Reached only by a JS_Call from C — every call that goes through the interpreter's convergence point is the
        step machine above, and every settle that used to JS_Call from here was converted to reach one: the
-       promise-reaction settle, the async function's, and an async FUNCTION's Await. ONE caller is left and it is
-       the async GENERATOR's Await — js_async_generator_await, through js_promise_resolve_native — which needs the
-       identical split js_async_function_post_prepare just got: hand the resolve call out, finish Await's
-       PerformPromiseThen after it has run, and route it as CONT_ASYNC_SETTLE does from the tramp chain. Until
-       then `for await` and `yield await thenable` in an async generator read `then` from here, with no flow
-       base. */
+       promise-reaction settle, the async function's, an async FUNCTION's Await and an async GENERATOR's. What is
+       left here is the part of 27.2.1.3.2 that runs no page code at all; the `then` READ is the one step that
+       can, and a C activation has no flow base for it — so a caller that still needs it CRASHES here naming
+       itself, instead of running page code off the chain. */
     s = p->u.promise_function_data;
     if (!s || s->presolved->already_resolved)
         return JS_UNDEFINED;
     is_reject = p->class_id - JS_CLASS_PROMISE_RESOLVE_FUNCTION;
     resolution = argc > 0 ? argv[0] : JS_UNDEFINED;
+    if (!is_reject && JS_IsObject(resolution) && !js_same_value(ctx, resolution, s->promise)) {
+        JSObject *rp = JS_VALUE_GET_OBJ(resolution);
+        if (tramp_proto_proxy(ctx, rp, JS_ATOM_then) || tramp_accessor_getter(ctx, rp, JS_ATOM_then)) {
+            DFAIL("a promise resolving function reached its C entry with a thenable whose `then` READ is page "
+                  "code — hand that caller's call out and place it on a flow, as every settle and Await now do");
+            return JS_EXCEPTION;
+        }
+    }
     s->presolved->already_resolved = true;
     if (is_reject || !JS_IsObject(resolution)) {
         fulfill_or_reject_promise(ctx, s->promise, resolution, is_reject);
