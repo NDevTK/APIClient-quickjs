@@ -27178,6 +27178,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 void *gcreate_cont = tramp_gen_create_cont_it; tramp_gen_create_cont_it = NULL;   /* driver create? (settle re-enters its step) */
                 uint8_t gcreate_cont_kind = tramp_gen_create_cont_kind; tramp_gen_create_cont_kind = 0;
+                if (!gcreate_cont && tramp_cont_kind == CONT_STEP) {
+                    /* A SEQUENCE reached this create through a REWRITE — a bound generator function unwrapped at
+                       do_generic_callee, a proxied one resolved to its target — so it never passed the arm that
+                       sets tramp_gen_create_cont_it, and the create ran with no driver at all: the generator was
+                       PUSHED onto the caller's stack while the machine sat waiting for its callback's result.
+                       The requester is where every other call path leaves it, in tramp_cont_state; the dedicated
+                       register exists for the consumers, and a sequence is found here so that EVERY spelling that
+                       reaches this label is driven, not just the one that came straight down. */
+                    gcreate_cont = tramp_cont_state; gcreate_cont_kind = CONT_STEP;
+                    tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;
+                }
                 bool gapply = (tramp_apply_argv != NULL);
                 JSValueConst gfunc = gapply ? tramp_apply_func : call_argv[-1];
                 JSGeneratorData *s = js_mallocz(ctx, sizeof(*s));
@@ -27213,7 +27224,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    declares it, an opcode's does not — and the shape must be CONSUMED here, not left standing: it
                    is resolved per call, so a shape that outlives this one is read by whatever this frame calls
                    next. Leaving it set made `[1].find(genFn)` corrupt the following `sort`. */
-                bool gowned = (call_args_owned != NULL && call_cfirst == 0 && call_cargc == 0);
+                bool gowned = (call_args_owned != NULL);
                 call_cfirst = 0; call_cargc = -1;   /* read + reset, as TAKE_CALL_SHAPE does for every other call */
                 for (i = tramp_first; i < call_argc; i++) JS_FreeValue(ctx, call_argv[i]);   /* free func(+this)+args (dup'd into s) */
                 if (call_args_owned) { js_free(ctx, call_args_owned); call_args_owned = NULL; call_args_owned_n = 0; }
