@@ -19603,6 +19603,22 @@ static void js_from_ctor_abandon(JSContext *ctx, void *st)
     js_free_rt(ctx->rt, fc->consumer);
     js_free_rt(ctx->rt, fc);
 }
+
+/* THE ONE teardown of a construct's REQUESTER — the machine waiting for the object. It is reached from every
+   abrupt exit of the dispatch, and it has to ASK WHAT KIND the requester is: con_outer_kind is CONT_STEP for a
+   step machine, but CONT_FROM_CTOR and CONT_ITER_CONSUME are also requesters, and neither of those states begins
+   with a JSStepHdr. Freeing them through the step chain reads their first JSValue field as a JSTrampStepDef * and
+   calls through it — the same crash the consume-abandon comment records, and what a blanket
+   tramp_step_chain_free here produced: the suite died without printing a line. */
+static void js_construct_requester_abandon(JSContext *ctx, void *outer, uint8_t kind)
+{
+    if (!outer)
+        return;
+    if (kind == CONT_FROM_CTOR) { js_from_ctor_abandon(ctx, outer); return; }
+    if (kind == CONT_ITER_CONSUME_FWD) { js_iter_consume_abandon(ctx, outer); return; }   /* declared later; the alias is asserted equal */
+    DCHECK(kind == CONT_STEP, "construct requester: unknown machine kind");
+    tramp_step_chain_free(ctx, outer);
+}
 typedef struct JSAcquireGet {
     JSValueConst iterable;   /* BORROWED: it is the consumer's own call operand, which lives on the caller's stack
                                 for the consumer's whole lifetime — the same borrow the acquire already makes. */
@@ -21325,13 +21341,6 @@ static JSValue js_reflect_apply(JSContext *ctx, JSValueConst this_val, int argc,
    because that body was the second implementation. Routing the spelling is the replacement; leaving the body
    there for it would be the fallback. */
 static JSValue js_reflect_construct(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
-static inline bool tramp_is_reflect_construct(JSValueConst method) {
-    JSObject *mp;
-    if (JS_VALUE_GET_TAG(method) != JS_TAG_OBJECT) return false;
-    mp = JS_VALUE_GET_OBJ(method);
-    return mp->class_id == JS_CLASS_C_FUNCTION && mp->u.cfunc.cproto == JS_CFUNC_step
-        && mp->u.cfunc.magic == STEPDEF_REFLECT_CONSTRUCT;
-}
 
 static inline bool tramp_is_reflect_apply(JSValueConst method) {
     JSObject *mp;
@@ -22488,7 +22497,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        fix — the machine builds its own argument block, which is the only thing the route existed
                        for — but doing so sends a CONSUMER target (Reflect.apply(Array.from, …)) into
                        do_consumer_dispatch from a SEQUENCE's call, which assumes caller-stack operands and says
-                       so by name. That capability is what has to be built before this goes. */
+                       so by name. That capability is what has to be built before this goes.
+                       The CONSTRUCT side of exactly this is now BUILT and its route is gone: a consume state
+                       carries outer/outer_kind, records the empty operand shape when it has one, and delivers to
+                       the machine that asked; con_outer has one owner, released where every abrupt path
+                       converges. The call side needs the same at do_consumer_dispatch's creation sites, reading
+                       cd_outer where the construct arms read con_outer. Then this route and Reflect.apply's go
+                       together, and build_arg_list stops running page code from C. */
                     JSValueConst aa = (call_argc >= 2) ? call_argv[1] : JS_UNDEFINED;
                     int atag = JS_VALUE_GET_TAG(aa);
                     if (atag == JS_TAG_UNDEFINED || atag == JS_TAG_NULL || atag == JS_TAG_OBJECT) {
@@ -22498,53 +22513,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         tramp_is_tail = (opcode == OP_tail_call_method); goto do_apply_tramp;
                     }
                 }
-                if (tramp_is_reflect_construct(call_argv[-1]) && call_argc >= 2
-                    && JS_IsConstructor(ctx, call_argv[0])
-                    && (call_argc < 3 || JS_IsConstructor(ctx, call_argv[2]))
-                    && JS_VALUE_GET_TAG(call_argv[1]) == JS_TAG_OBJECT) {
-                    /* NAMED, and why this route still stands. The machine makes it redundant — it builds its own
-                       argument block, which is the only thing this reshape ever existed for — and all four
-                       consumer arms a request can reach now deliver to the machine that asked (Map/Set,
-                       TypedArray, the Promise executor, and a Proxy `construct` trap, which grew a state to hold
-                       the outer). What is left is the ERROR side: the construct dispatch has exception exits that
-                       drop con_outer without tearing the machine down, and deleting this route sends every
-                       Reflect.construct through them — a throwing `prototype` getter on the new target leaks one
-                       GC object through exactly one of them. Those exits need the teardown js_iter_consume_end
-                       just got, and then this goes.
-                       NAMED, and why this route still stands. The machine makes it redundant — it builds its
-                       own argument block, which is the only thing this reshape ever existed for — and every
-                       consumer arm a request can reach now DELIVERS to the machine that asked (Map/Set,
-                       TypedArray, the Promise executor, and a Proxy `construct` trap). What is left is OWNERSHIP
-                       of the requester on the ABRUPT paths: each arm moves con_outer into its own register and
-                       then onto the state it builds, and the code in between reads new_target's `prototype` —
-                       page code, so it throws — leaving the machine referenced by nothing. Routing every
-                       Reflect.construct through those exits leaks (360 objects on Promise's
-                       throwing-prototype test alone).
-                       Releasing them at the shared `exception` label is NOT the fix, and was tried: the arms that
-                       construct in place never clear con_outer on success, so a live machine gets freed and the
-                       suite dies without printing a line. con_outer needs ONE explicit owner across the dispatch,
-                       cleared by whoever adopts it and released by whoever abandons it. Then this goes.
-                       Reflect.construct(target, argsList[, newTarget]). CALL-SITE-RESOLVED like Reflect.apply,
-                       and for the same reason: the arguments come from a LIST that must never reach the operand
-                       stack, whose compiled size it could overflow. WHAT the target is is NOT this site's
-                       question — three copies here knew only step ctors, bytecode-behind-binds and Promise, so
-                       Reflect.construct of a Proxy, of Map/Set or of a TypedArray reached its C entry while the
-                       same target through `new` did not. The dispatch answers all of them.
-                       The two IsConstructor checks and the array-like check are 28.1.2 steps 1-3, and they gate
-                       the route because their THROWS belong to the C entry below, which raises them in the
-                       spec's order with the realm-correct error. */
-                    uint32_t alenr = 0;
-                    JSValue *atabr = build_arg_list(ctx, &alenr, call_argv[1]);
-                    if (unlikely(!atabr)) goto exception;
-                    con_func = call_argv[0];
-                    con_ntgt = (call_argc >= 3) ? call_argv[2] : call_argv[0];
-                    con_args = (JSValueConst *)atabr; con_argc = (int)alenr; con_args_owned = atabr;
-                    con_cargc = call_argc;   /* operands [Reflect, construct, target, argsList, newTarget?] */
-                    con_from_super = 0; con_super_ref = JS_UNDEFINED;
-                    con_outer = NULL; con_outer_kind = CONT_NONE;
-                    tramp_first = -2; tramp_is_tail = (opcode == OP_tail_call_method);
-                    goto do_construct_dispatch;   /* the arms carry the tail shape; forcing it off leaked the frame */
-                }
+                /* `Reflect.construct(f, src[, nt])` has NO route here. The reshape existed only because the
+                   arguments come from a LIST that must never touch the operand stack, and the machine builds its
+                   own block for exactly that reason — it was the redundant twin. Keeping it meant the syntactic
+                   spelling collected with build_arg_list from C, running the source's `length` and element
+                   getters in an activation with no flow base, while the same source through a bound
+                   Reflect.construct collected on the tramp: one builtin answering differently by how it was
+                   written. */
                 if (tramp_is_reflect_apply(call_argv[-1]) && call_argc >= 3
                     && JS_VALUE_GET_TAG(call_argv[0]) == JS_TAG_OBJECT
                     && JS_VALUE_GET_OBJ(call_argv[0])->class_id == JS_CLASS_PROXY) {
@@ -25569,8 +25544,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 tac_args_own = NULL; tac_args_own_n = 0;
                 /* the REQUESTER goes on the state here for the same reason and by the same rule: the create
                    below reads new_target's `prototype`, and handing the machine over after that read leaked the
-                   whole machine on a throwing getter — the teardown frees exactly what the state HOLDS. */
+                   whole machine on a throwing getter — the teardown frees exactly what the state HOLDS. The
+                   register is cleared in the SAME breath, because ownership is what is being transferred:
+                   leaving both pointing at it made the create's throw free it twice, once through the state's
+                   teardown and once through the dispatch's. s->outer is the flag from here on. */
                 s->outer = tac_outer; s->outer_kind = tac_outer_kind;
+                tac_outer = NULL; tac_outer_kind = CONT_NONE;
                 s->super_ref = tac_super_ref; tac_super_ref = JS_UNDEFINED;
                 s->adder = js_dup(ntgt);   /* the new_target/ctor, used at the finish to create the typed array */
                 /* TypedArray.from(gen, mapfn, thisArg): carry the mapfn; it is applied at the finish (via
@@ -25594,10 +25573,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 s->k = 0;
                 s->sink = ITERCONS_FROM;
-                s->orig_cfirst = tac_outer ? 0 : tac_cfirst;
-                s->orig_cargc = tac_outer ? 0 : (tac_cfirst ? (tac_cargc >= 0 ? tac_cargc : ta_argc) : 0);
-                s->orig_is_tail = tac_outer ? 0 : tramp_is_tail;
-                tac_outer = NULL; tac_outer_kind = CONT_NONE;
+                s->orig_cfirst = s->outer ? 0 : tac_cfirst;
+                s->orig_cargc = s->outer ? 0 : (tac_cfirst ? (tac_cargc >= 0 ? tac_cargc : ta_argc) : 0);
+                s->orig_is_tail = s->outer ? 0 : tramp_is_tail;
                 tac_cargc = -1;   /* read + reset */
                 DCHECK(ta_argc >= 1, "the TypedArray consume arm reads its source; the recognizers refuse argc 0");
                 tramp_consume_iterable = ta_argv[0];
@@ -30952,6 +30930,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        The same rule as the construct side's con_cargc, applied where every abrupt path converges. */
     if (call_args_owned) { free_arg_list(ctx, call_args_owned, call_args_owned_n); call_args_owned = NULL; call_args_owned_n = 0; }
     call_cargc = -1;
+    /* The same rule for the construct's REQUESTER. Every arm that adopts con_outer clears it, so a non-NULL one
+       here means the dispatch threw BETWEEN taking it and handing it to a state — and the code in between reads
+       new_target's `prototype`, which is page code, so that is a live path: `Reflect.construct(Promise, [fn],
+       badNewTarget)` leaked 360 objects through it. Releasing at each arm's own exits is the list that forgets
+       (two of them already had), so it happens where every abrupt path converges, exactly as the call shape
+       above does. The per-arm registers hold the same requester between the arm and its state, so they answer
+       here too. */
+    js_construct_requester_abandon(ctx, con_outer, con_outer_kind);  con_outer = NULL; con_outer_kind = CONT_NONE;
+    js_construct_requester_abandon(ctx, pe_outer,  pe_outer_kind);   pe_outer  = NULL; pe_outer_kind  = CONT_NONE;
+    js_construct_requester_abandon(ctx, tac_outer, tac_outer_kind);  tac_outer = NULL; tac_outer_kind = CONT_NONE;
+    js_construct_requester_abandon(ctx, smc_outer, smc_outer_kind);  smc_outer = NULL; smc_outer_kind = CONT_NONE;
 
     if (unlikely(ctx->pending_import_cap != NULL && ctx->pending_import_cap->sf == sf)) {
         /* the unwind is back in the frame that issued OP_import, so its operands and its continuation pc are
