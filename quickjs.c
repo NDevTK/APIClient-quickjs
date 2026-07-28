@@ -17331,32 +17331,6 @@ static JSValue JS_IteratorStepValue(JSContext *ctx, JSValueConst obj, int *pdone
    caller adds 2 afterwards.
    There are two ways a .next() returns — a popped heap frame, and a callee that never got one — and this is the
    protocol both deliver through, so there is one implementation of it rather than a copy per return path. */
-static int js_forof_deliver(JSContext *ctx, JSValue *sp, int rfof, JSValue ret_val)
-{
-    JSValue value;
-    int done;
-    DCHECK(rfof <= -3, "the for-of protocol tail was given no enum_rec offset");
-    if (unlikely(!JS_IsObject(ret_val))) {
-        JS_FreeValue(ctx, ret_val);
-        JS_ThrowTypeError(ctx, "iterator must return an object");
-        JS_FreeValue(ctx, sp[rfof]); sp[rfof] = JS_UNDEFINED;
-        return -1;
-    }
-    value = JS_IteratorStepValue(ctx, ret_val, &done);   /* reads .done then .value */
-    JS_FreeValue(ctx, ret_val);
-    if (unlikely(JS_IsException(value))) {
-        JS_FreeValue(ctx, sp[rfof]); sp[rfof] = JS_UNDEFINED;
-        return -1;
-    }
-    if (done) {
-        JS_FreeValue(ctx, sp[rfof]); sp[rfof] = JS_UNDEFINED;
-        JS_FreeValue(ctx, value); value = JS_UNDEFINED;
-    }
-    sp[0] = value;
-    sp[1] = js_bool(done);
-    return 0;
-}
-
 /* The OP_iterator_next protocol TAIL: IteratorNext(record, value) yields whatever the .next() returned, and the
    opcode's own contract is that the result REPLACES the resume argument at sp[-1]. No object check here — the
    consumers of this opcode (yield* delegation, destructuring) each perform their own, at the point the spec puts
@@ -17373,7 +17347,8 @@ static void js_iternext_deliver(JSContext *ctx, JSValue *sp, JSValue ret_val)
    not a plain bytecode function — and it drove that .next() through JS_IteratorNext -> JS_Call, a C activation
    whose back-edge preempt has no flow base. The opcode routes EVERY .next() now: a bytecode body to
    do_tramp_call, everything else to do_generic_callee, which is the split between FRAME KINDS and not a choice
-   about whether to suspend. Its tail became js_forof_deliver, which both return paths share.
+   about whether to suspend. Its tail is do_forof_unpack, which every return path shares — a LABEL rather than a
+   C helper, because the two reads it performs are the page's code and have to be requests.
    What made the fallback removable was giving do_generic_callee's direct-call arm a continuation: until then a
    callee with no heap frame could only push its result, so the opcode had to keep a second way to finish. */
 
@@ -19475,6 +19450,15 @@ typedef struct JSAsyncPost {
     JSValue await_promise;    /* AWAIT only (owned); UNDEFINED otherwise */
     JSAsyncFunctionData *st;  /* AWAIT only: a reference the finish releases */
 } JSAsyncPost;
+#define CONT_FOROF_UNPACK  46  /* gp_outer = JSForOfUnpack: the for-of / iterator-next protocol TAIL's
+                                  IteratorComplete and IteratorValue. Both read the RESULT object, which a
+                                  hand-written iterator can make an accessor or a Proxy, and js_forof_deliver ran
+                                  them from C — the most common unpack there is. */
+typedef struct JSForOfUnpack {
+    JSValue res;   /* the iterator result being unpacked (owned) */
+    int rfof;      /* the enum_rec's offset from sp, which the done path clears */
+    uint8_t ph;    /* 1 = the `done` read is in flight, 2 = the `value` read is */
+} JSForOfUnpack;
 #define CONT_PROMISE_ALL_GET 45  /* gp_outer = JSPromiseAll: the combinator's IteratorComplete / IteratorValue on
                                     its iterable's .next() result. */
 #define CONT_ITER_HELPER_GET 44  /* gp_outer = JSIteratorHelperData: the helper's IteratorComplete / IteratorValue
@@ -20139,6 +20123,7 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_PROXY_CONSTRUCT:
     case CONT_INSTANCEOF:
     case CONT_PROMISE_EXEC:
+    case CONT_FOROF_UNPACK:
     case CONT_PROMISE_ALL_GET:
     case CONT_ITER_HELPER_GET:
     case CONT_AFS_GET:
@@ -22186,6 +22171,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     uint8_t gp_op = GP_GET;                             /* the result is delivered to. */
     JSValueConst gp_recv = JS_UNINITIALIZED;            /* [[Get]]/[[Set]] receiver; UNINITIALIZED = the object itself. read+reset at do_getprop_tramp */
     int gp_no_throw = 0;                                /* 1 = a [[Set]]/[[Delete]] yields its boolean instead of throwing on false. read+reset there */
+    int forof_unpack_off = 0;                           /* do_forof_unpack's input: the enum_rec's offset from sp */
     JSValueConst gp_val = JS_UNDEFINED;                 /* GP_SET / GP_DEFINE: the value to write (borrowed from the machine) */
     /* GP_DEFINE's remaining descriptor fields. The request expressed only CreateDataProperty's shape — a data
        descriptor with all three attributes true — hardcoded at THREE sites (the in-place define, the trap's
@@ -24543,9 +24529,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         for (i = first; i < pop; i++) JS_FreeValue(ctx, cargv[i]);
                         sp += first - pop;
                         if (unlikely(JS_IsException(ret_val))) goto exception;
-                        if (js_forof_deliver(ctx, sp, dfof, ret_val)) goto exception;
-                        sp += 2;
-                        BREAK;
+                        forof_unpack_off = dfof;
+                        goto do_forof_unpack;
                     }
                     if (dck == CONT_ITER_NEXT_OP) {
                         JSValue *cargv;
@@ -24932,9 +24917,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         DCHECK(foff <= -3, "a for-of .next() step machine carries no enum_rec offset");
                         for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, fcargv[i]);
                         sp += cfirst - cargc;
-                        if (js_forof_deliver(ctx, sp, foff, r)) goto exception;
-                        sp += 2;
-                        BREAK;
+                        forof_unpack_off = foff;
+                        ret_val = r;
+                        goto do_forof_unpack;
                     }
                     if (souter_kind == CONT_ITER_NEXT_OP) {
                         /* the machine WAS an OP_iterator_next .next(). Its operands are dropped and its result
@@ -25574,6 +25559,59 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
         }
 
+        do_forof_unpack:
+            /* THE for-of / iterator-next protocol tail. 7.4.6 IteratorStep: IteratorComplete, then IteratorValue
+               ONLY when it said not-done — reading `value` on a done result is observable and no consumer has
+               anywhere to put it. Both reads are the RESULT object's, which a hand-written iterator can make an
+               accessor or a Proxy, and js_forof_deliver performed them from C, so such a getter ran with no flow
+               base. `sp` does not move across either request (the operands are the continuation's own buffer), so
+               the enum_rec offset stays valid over a suspension. */
+            {
+                JSForOfUnpack *fu;
+                DCHECK(forof_unpack_off <= -3, "the for-of protocol tail was given no enum_rec offset");
+                if (unlikely(!JS_IsObject(ret_val))) {
+                    JS_FreeValue(ctx, ret_val);
+                    JS_ThrowTypeError(ctx, "iterator must return an object");
+                    JS_FreeValue(ctx, sp[forof_unpack_off]); sp[forof_unpack_off] = JS_UNDEFINED;
+                    goto exception;
+                }
+                fu = js_malloc_rt(rt, sizeof(*fu));
+                if (unlikely(!fu)) { JS_FreeValue(ctx, ret_val); JS_ThrowOutOfMemory(ctx); goto exception; }
+                fu->res = ret_val; ret_val = JS_UNDEFINED;
+                fu->rfof = forof_unpack_off;
+                fu->ph = 1;
+                cont_st = fu;
+            }
+            /* fall through */
+        do_forof_unpack_read:
+            {
+                JSForOfUnpack *fu = (JSForOfUnpack *)cont_st;
+                gp_outer = fu; gp_outer_kind = CONT_FOROF_UNPACK;
+                gp_obj = fu->res; gp_atom = (fu->ph == 1) ? JS_ATOM_done : JS_ATOM_value;
+                gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                goto do_getprop_tramp;
+            }
+
+        do_forof_unpack_step:
+            /* ret_val = whichever read just answered; the phase says which. */
+            {
+                JSForOfUnpack *fu = (JSForOfUnpack *)cont_st;
+                if (fu->ph == 1) {
+                    if (!JS_ToBoolFree(ctx, ret_val)) { fu->ph = 2; goto do_forof_unpack_read; }
+                    JS_FreeValue(ctx, sp[fu->rfof]); sp[fu->rfof] = JS_UNDEFINED;
+                    sp[0] = JS_UNDEFINED; sp[1] = JS_TRUE;
+                } else {
+                    sp[0] = ret_val;    /* owned, transferred */
+                    sp[1] = JS_FALSE;
+                }
+                ret_val = JS_UNDEFINED;
+                cont_st = NULL;
+                JS_FreeValue(ctx, fu->res);
+                js_free_rt(rt, fu);
+                sp += 2;
+            }
+            BREAK;
+
         do_getprop_tramp:
             /* A keyed property OPERATION requested by a step machine — a READ or a HasProperty. Three shapes, ONE
                entry: a Proxy trap and a bytecode accessor are user code and run ON THIS CHAIN, so a loop in either
@@ -25894,6 +25932,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                       if (gk == CONT_AFS_GET) { cont_st = gouter0; goto do_async_from_sync_step; }
                       if (gk == CONT_ITER_HELPER_GET) { cont_st = gouter0; goto do_iter_helper_step; }
                       if (gk == CONT_PROMISE_ALL_GET) { cont_st = gouter0; goto do_promise_all_step; }
+                      if (gk == CONT_FOROF_UNPACK) { cont_st = gouter0; goto do_forof_unpack_step; }
                       DCHECK(gk == CONT_STEP, "property-get outer continuation: unknown machine kind"); }
                     goto do_step_step;
                 }
@@ -28750,12 +28789,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            || gouter_kind == CONT_FOROF_GET || gouter_kind == CONT_FORAWAIT_GET
                            || gouter_kind == CONT_FORAWAIT_SYNC_GET
                            || gouter_kind == CONT_PROMISE_ALL_THEN || gouter_kind == CONT_AFS_GET
-                           || gouter_kind == CONT_ITER_HELPER_GET || gouter_kind == CONT_PROMISE_ALL_GET,
+                           || gouter_kind == CONT_ITER_HELPER_GET || gouter_kind == CONT_PROMISE_ALL_GET
+                           || gouter_kind == CONT_FOROF_UNPACK,
                            "property-get outer continuation: unknown machine kind");
                     if (gouter_kind == CONT_PROMISE_ALL_THEN) {
                         js_getprop_free(ctx, gp);
                         cont_st = gouter;
                         goto do_promise_all_attach_call;
+                    }
+                    if (gouter_kind == CONT_FOROF_UNPACK) {
+                        js_getprop_free(ctx, gp);
+                        cont_st = gouter;
+                        goto do_forof_unpack_step;
                     }
                     if (gouter_kind == CONT_PROMISE_ALL_GET) {
                         js_getprop_free(ctx, gp);
@@ -28954,10 +28999,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     DCHECK(dlv_cargc >= dlv_cfirst, "for-of next frame records operands ending below where they start");
                     for (i = dlv_cfirst; i < dlv_cargc; i++) JS_FreeValue(ctx, cargv[i]);
                     sp += dlv_cfirst - dlv_cargc;
-                    if (js_forof_deliver(ctx, sp, dlv_forof, ret_val))
-                        goto exception;
-                    sp += 2;
-                    BREAK;
+                    forof_unpack_off = dlv_forof;
+                    goto do_forof_unpack;
                 }
                 if (dlv_ck == CONT_ITER_NEXT_OP) {
                     /* the .next() returned: drop whatever operand shape the frame RECORDED (do_generic_callee's
@@ -32832,9 +32875,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             DCHECK(!gouter || gk2 == CONT_STEP || gk2 == CONT_ITER_CONSUME || gk2 == CONT_ACQUIRE_GET
                    || gk2 == CONT_ITER_CLOSE || gk2 == CONT_TRAP_GET || gk2 == CONT_OP_KEYED
                    || gk2 == CONT_PROMISE_ALL_THEN || gk2 == CONT_AFS_GET
-                   || gk2 == CONT_ITER_HELPER_GET || gk2 == CONT_PROMISE_ALL_GET,
+                   || gk2 == CONT_ITER_HELPER_GET || gk2 == CONT_PROMISE_ALL_GET
+                   || gk2 == CONT_FOROF_UNPACK,
                    "property-get outer continuation: unknown machine kind");
             js_getprop_free(ctx, gp);
+            if (gouter && gk2 == CONT_FOROF_UNPACK) {
+                /* the protocol tail's read threw: the loop's enum_rec must not be closed (the iterator has
+                   already stepped), which is what clearing the slot says, and the throw propagates. */
+                JSForOfUnpack *fu = gouter;
+                JS_FreeValue(ctx, sp[fu->rfof]); sp[fu->rfof] = JS_UNDEFINED;
+                JS_FreeValue(ctx, fu->res);
+                js_free_rt(rt, fu);
+                goto exception;
+            }
             if (gouter && gk2 == CONT_PROMISE_ALL_GET) {
                 /* the unpack's read threw: it is an IteratorNext abrupt, so the aggregate rejects WITHOUT closing
                    the iterator — which is exactly what the step's error path does while driving_next is set. */
