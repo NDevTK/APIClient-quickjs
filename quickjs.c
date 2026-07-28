@@ -20201,6 +20201,25 @@ static inline JSObject *tramp_accessor_getter(JSRuntime *rt, JSObject *p, JSAtom
         if (!p) return NULL;
     }
 }
+/* The first PROXY at or above `p`, reached before any own slot for `atom` — the object whose [[Get]]/[[Set]] the
+   ordinary walk hands the operation to. 10.1.8 step 3 and 10.1.9 step 2.b forward to `parent.[[X]](P, …,
+   Receiver)` with the RECEIVER UNCHANGED, so routing there with the original receiver IS that step. The operators
+   asked only whether the OBJECT ITSELF was a proxy and let JS_GetPropertyInternal / JS_SetPropertyInternal2 walk
+   the rest from C — where a trap on the chain ran with no flow base, and `Object.create(proxy)` is the ordinary
+   way to put one there.
+   NULL means the walk reaches no user code and the C read performs it, which is a different algorithm rather than
+   a fallback: an own slot answers before the parent, and an EXOTIC object's [[Get]] is its own (an integer index
+   is not a chain walk at all). That is the same stopping rule tramp_accessor_getter uses, and the same narrowing:
+   a proxy ABOVE an exotic object is still reached from C. */
+static inline JSObject *tramp_proto_proxy(JSObject *p, JSAtom atom) {
+    for (;;) {
+        if (p->class_id == JS_CLASS_PROXY) return p;   /* before is_exotic: a proxy IS exotic */
+        if (find_own_property1(p, atom)) return NULL;
+        if (p->is_exotic) return NULL;
+        p = p->shape->proto;
+        if (!p) return NULL;
+    }
+}
 /* The setter twin of tramp_accessor_getter, and ANY callable setter for the same reason: a property WRITE whose
    slot is a `set x(v){…}` invokes the setter, and asking for a NORMAL bytecode body dropped every other kind into
    JS_SetPropertyInternal2, which calls it from C. A GENERATOR setter created its coroutine off the chain and a
@@ -21962,6 +21981,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     /* NewPromiseCapability in flight: the ctor to construct, the machine waiting, and the [promise, resolve,
        reject] the delivery hands it. Registers rather than a state field because the request is issued and
        consumed at one point each, exactly like the consume-acquire's. */
+    JSObject *tramp_px = NULL;   /* tramp_proto_proxy's answer, consumed by the request it is found for */
     JSValueConst tramp_cap_ctor = JS_UNDEFINED;
     void *tramp_cap_outer = NULL; uint8_t tramp_cap_kind = CONT_NONE;
     JSValue tramp_cap_promise = JS_UNDEFINED;
@@ -25302,10 +25322,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             tgt = js_dup(pd->target);
                             handler = js_dup(pd->handler);
                         }
-                    } else if (gp_op == GP_GET) {
-                        accessor = tramp_accessor_getter(rt, po, gp_atom);   /* a HasProperty never invokes a getter */
-                    } else if (gp_op == GP_SET) {
-                        accessor = tramp_accessor_setter(rt, po, gp_atom);
+                    } else if (gp_op == GP_GET || gp_op == GP_SET) {
+                        /* the object is ordinary, but a PROXY can stand above it: 10.1.8 step 3 / 10.1.9 step 2.b
+                           hand the operation to `parent.[[Get]]/[[Set]](P, …, Receiver)` with the receiver
+                           unchanged, which is this very entry with a different object. The read opcodes already
+                           route that (tramp_proto_proxy), but a request ARRIVING here — Reflect.get(o,"r") on an
+                           `Object.create(proxy)`, and every step machine's GP_GET/GP_SET — fell to
+                           JS_GetPropertyInternal / JS_SetPropertyInternal2 below and reached the trap from C with
+                           no flow base. The two answers are mutually exclusive by construction: the proxy is
+                           exotic and carries no own slot, so a walk that reaches it found no accessor first. */
+                        tramp_px = tramp_proto_proxy(po, gp_atom);
+                        if (tramp_px) {
+                            gp_obj = JS_MKPTR(JS_TAG_OBJECT, tramp_px);
+                            gp_recv = gp_recv_r; gp_no_throw = gp_nothrow_r;
+                            if (gp_trapst) { js_trapget_free(ctx, gp_trapst); gp_trapst = NULL; }
+                            goto do_getprop_tramp;
+                        }
+                        /* a HasProperty never invokes a getter, which is why GP_HAS is not in this arm */
+                        accessor = gp_op == GP_GET ? tramp_accessor_getter(rt, po, gp_atom)
+                                                   : tramp_accessor_setter(rt, po, gp_atom);
                     }
                 }
                 if (JS_IsUndefined(method) && !accessor) {
@@ -29814,7 +29849,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
                 obj = sp[-1];
                 if (unlikely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT
-                             && JS_VALUE_GET_OBJ(obj)->class_id == JS_CLASS_PROXY)) {
+                             && (tramp_px = tramp_proto_proxy(JS_VALUE_GET_OBJ(obj), atom)) != NULL)) {
                     sf->cur_pc = pc;
                     {   /* [[Get]] on a Proxy is the `get` trap, and the READ of that trap off the handler is
                            user code too: both are the one keyed-operation entry's GP_GET, the same request
@@ -29824,8 +29859,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         JSOpKeyed *ok = js_mallocz(ctx, sizeof(*ok));
                         if (unlikely(!ok)) {  JS_ThrowOutOfMemory(ctx); goto exception; }
                         ok->atom = JS_DupAtom(ctx, atom); ok->pop = 1; ok->push = 1;
-                        gp_obj = obj; gp_atom = ok->atom; gp_op = GP_GET; gp_val = JS_UNDEFINED;
-                        gp_recv = obj; gp_no_throw = 0;
+                        gp_obj = JS_MKPTR(JS_TAG_OBJECT, tramp_px); gp_atom = ok->atom; gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                        gp_recv = obj; gp_no_throw = 0;   /* the RECEIVER stays the original object */
                         gp_outer = ok; gp_outer_kind = CONT_OP_KEYED;
                         goto do_getprop_tramp;
                     }
@@ -29888,7 +29923,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
                 obj = sp[-1];
                 if (unlikely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT
-                             && JS_VALUE_GET_OBJ(obj)->class_id == JS_CLASS_PROXY)) {
+                             && (tramp_px = tramp_proto_proxy(JS_VALUE_GET_OBJ(obj), atom)) != NULL)) {
                     /* `proxy.m()` reads the method through the get trap: the receiver STAYS on the stack, so
                        the value is PUSHED rather than replacing an operand — pop 0. */
                     sf->cur_pc = pc;
@@ -29900,8 +29935,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         JSOpKeyed *ok = js_mallocz(ctx, sizeof(*ok));
                         if (unlikely(!ok)) {  JS_ThrowOutOfMemory(ctx); goto exception; }
                         ok->atom = JS_DupAtom(ctx, atom); ok->pop = 0; ok->push = 1;
-                        gp_obj = obj; gp_atom = ok->atom; gp_op = GP_GET; gp_val = JS_UNDEFINED;
-                        gp_recv = obj; gp_no_throw = 0;
+                        gp_obj = JS_MKPTR(JS_TAG_OBJECT, tramp_px); gp_atom = ok->atom; gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                        gp_recv = obj; gp_no_throw = 0;   /* the RECEIVER stays the original object */
                         gp_outer = ok; gp_outer_kind = CONT_OP_KEYED;
                         goto do_getprop_tramp;
                     }
@@ -29965,7 +30000,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
                 obj = sp[-2];
                 if (unlikely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT
-                             && JS_VALUE_GET_OBJ(obj)->class_id == JS_CLASS_PROXY)) {
+                             && (tramp_px = tramp_proto_proxy(JS_VALUE_GET_OBJ(obj), atom)) != NULL)) {
                     /* [[Set]] on a Proxy is the `set` trap plus the READ of that trap off the handler: the one
                        keyed-operation entry's GP_SET, the same request Reflect.set issues. no_throw is the
                        WRITER's strictness — 6.2.5.6 PutValue step 6 turns a refused write into a TypeError only
@@ -29977,8 +30012,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     ok = js_mallocz(ctx, sizeof(*ok));
                     if (unlikely(!ok)) { JS_ThrowOutOfMemory(ctx); goto exception; }
                     ok->atom = JS_DupAtom(ctx, atom); ok->pop = 2; ok->push = 0;
-                    gp_obj = obj; gp_atom = ok->atom; gp_op = GP_SET; gp_val = sp[-1];
-                    gp_recv = obj; gp_no_throw = !sf->is_strict_mode;
+                    gp_obj = JS_MKPTR(JS_TAG_OBJECT, tramp_px); gp_atom = ok->atom; gp_op = GP_SET; gp_val = sp[-1];
+                    gp_recv = obj; gp_no_throw = !sf->is_strict_mode;   /* the RECEIVER stays the original object */
                     gp_outer = ok; gp_outer_kind = CONT_OP_KEYED;
                     goto do_getprop_tramp;
                 }
@@ -30260,7 +30295,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JSAtom katom = JS_ValueToAtom(ctx, sp[-1]);   /* ToPropertyKey (may throw) */
                     if (unlikely(katom == JS_ATOM_NULL))
                         goto exception;
-                    if (JS_VALUE_GET_OBJ(sp[-2])->class_id == JS_CLASS_PROXY) {
+                    if ((tramp_px = tramp_proto_proxy(JS_VALUE_GET_OBJ(sp[-2]), katom)) != NULL) {
                         {   /* [[Get]] on a Proxy is the `get` trap, and the READ of that trap off the handler is
                                user code too: both are the one keyed-operation entry's GP_GET, the same request
                                Reflect.get issues. The operator's own copy read the trap from C and then asked
@@ -30269,8 +30304,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             JSOpKeyed *ok = js_mallocz(ctx, sizeof(*ok));
                             if (unlikely(!ok)) { JS_FreeAtom(ctx, katom); JS_ThrowOutOfMemory(ctx); goto exception; }
                             ok->atom = katom; ok->pop = 2; ok->push = 1;
-                            gp_obj = sp[-2]; gp_atom = ok->atom; gp_op = GP_GET; gp_val = JS_UNDEFINED;
-                            gp_recv = sp[-2]; gp_no_throw = 0;
+                            gp_obj = JS_MKPTR(JS_TAG_OBJECT, tramp_px); gp_atom = ok->atom; gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                            gp_recv = sp[-2]; gp_no_throw = 0;   /* the RECEIVER stays the original object */
                             gp_outer = ok; gp_outer_kind = CONT_OP_KEYED;
                             goto do_getprop_tramp;
                         }
@@ -30327,7 +30362,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JSAtom katom = JS_ValueToAtom(ctx, sp[-1]);   /* ToPropertyKey (may throw) */
                     if (unlikely(katom == JS_ATOM_NULL))
                         goto exception;
-                    if (JS_VALUE_GET_OBJ(sp[-2])->class_id == JS_CLASS_PROXY) {
+                    if ((tramp_px = tramp_proto_proxy(JS_VALUE_GET_OBJ(sp[-2]), katom)) != NULL) {
                         /* `o[k]++` keeps the object for the write-back, so only the KEY is replaced — pop 1. */
                         {   /* [[Get]] on a Proxy is the `get` trap, and the READ of that trap off the handler is
                                user code too: both are the one keyed-operation entry's GP_GET, the same request
@@ -30337,8 +30372,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             JSOpKeyed *ok = js_mallocz(ctx, sizeof(*ok));
                             if (unlikely(!ok)) { JS_FreeAtom(ctx, katom); JS_ThrowOutOfMemory(ctx); goto exception; }
                             ok->atom = katom; ok->pop = 1; ok->push = 1;
-                            gp_obj = sp[-2]; gp_atom = ok->atom; gp_op = GP_GET; gp_val = JS_UNDEFINED;
-                            gp_recv = sp[-2]; gp_no_throw = 0;
+                            gp_obj = JS_MKPTR(JS_TAG_OBJECT, tramp_px); gp_atom = ok->atom; gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                            gp_recv = sp[-2]; gp_no_throw = 0;   /* the RECEIVER stays the original object */
                             gp_outer = ok; gp_outer_kind = CONT_OP_KEYED;
                             goto do_getprop_tramp;
                         }
@@ -30426,7 +30461,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    sp[-3] — which is why the proxy helper takes the receiver as a parameter instead of assuming the
                    proxy. A bytecode GETTER on the prototype chain is routed here too, with the same receiver. */
                 if (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT) {
-                    if (JS_VALUE_GET_OBJ(sp[-2])->class_id == JS_CLASS_PROXY) {
+                    if ((tramp_px = tramp_proto_proxy(JS_VALUE_GET_OBJ(sp[-2]), atom)) != NULL) {
                         /* `super[k]`: the home object at sp[-2] is looked up but the RECEIVER is `this` at
                            sp[-3], which is exactly the operand the request already carries. */
                         {   /* [[Get]] on a Proxy is the `get` trap, and the READ of that trap off the handler is
@@ -30437,8 +30472,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             JSOpKeyed *ok = js_mallocz(ctx, sizeof(*ok));
                             if (unlikely(!ok)) { JS_FreeAtom(ctx, atom); JS_ThrowOutOfMemory(ctx); goto exception; }
                             ok->atom = atom; ok->pop = 3; ok->push = 1;
-                            gp_obj = sp[-2]; gp_atom = ok->atom; gp_op = GP_GET; gp_val = JS_UNDEFINED;
-                            gp_recv = sp[-3]; gp_no_throw = 0;
+                            gp_obj = JS_MKPTR(JS_TAG_OBJECT, tramp_px); gp_atom = ok->atom; gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                            gp_recv = sp[-3]; gp_no_throw = 0;   /* super's RECEIVER is unchanged either way */
                             gp_outer = ok; gp_outer_kind = CONT_OP_KEYED;
                             goto do_getprop_tramp;
                         }
@@ -30525,15 +30560,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JSAtom katom = JS_ValueToAtom(ctx, sp[-2]);
                     if (unlikely(katom == JS_ATOM_NULL))
                         goto exception;
-                    if (JS_VALUE_GET_OBJ(sp[-3])->class_id == JS_CLASS_PROXY) {
+                    if ((tramp_px = tramp_proto_proxy(JS_VALUE_GET_OBJ(sp[-3]), katom)) != NULL) {
                         /* the same GP_SET request as `o.x = v`, three operands instead of two. It sits HERE, not
                            at the top of the opcode where the old reshape did: the key must go through
                            key_toprim first, so the coercion runs on the tramp instead of inside JS_ValueToAtom. */
                         JSOpKeyed *ok = js_mallocz(ctx, sizeof(*ok));
                         if (unlikely(!ok)) { JS_FreeAtom(ctx, katom); JS_ThrowOutOfMemory(ctx); goto exception; }
                         ok->atom = katom; ok->pop = 3; ok->push = 0;
-                        gp_obj = sp[-3]; gp_atom = katom; gp_op = GP_SET; gp_val = sp[-1];
-                        gp_recv = sp[-3]; gp_no_throw = !sf->is_strict_mode;
+                        gp_obj = JS_MKPTR(JS_TAG_OBJECT, tramp_px); gp_atom = katom; gp_op = GP_SET; gp_val = sp[-1];
+                        gp_recv = sp[-3]; gp_no_throw = !sf->is_strict_mode;   /* the RECEIVER stays the original object */
                         gp_outer = ok; gp_outer_kind = CONT_OP_KEYED;
                         goto do_getprop_tramp;
                     }
