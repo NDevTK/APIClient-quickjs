@@ -20443,9 +20443,15 @@ static bool tramp_can_call_promise_all(JSContext *ctx, JSValueConst func, JSValu
    nothing on purpose — the helper is a GC object, so dropping the link is the whole teardown. */
 static void js_create_requester_abandon(JSContext *ctx, void *cont, uint8_t kind)
 {
-    if (!cont)
+    /* keyed on the KIND, never on the pointer: a continuation whose whole state IS its kind carries a NULL one
+       (CONT_INSTANCEOF, CONT_SETTER, CONT_FOROF_NEXT, CONT_ITER_NEXT_OP), and testing the pointer silently
+       treated those as "no requester at all" — which is how a generator @@hasInstance came back as the generator
+       object instead of ToBoolean of it. */
+    if (kind == CONT_NONE)
         return;
-    if (kind == CONT_ITER_HELPER) return;
+    if (kind == CONT_ITER_HELPER || kind == CONT_INSTANCEOF || kind == CONT_SETTER
+        || kind == CONT_FOROF_NEXT || kind == CONT_ITER_NEXT_OP)
+        return;   /* no owned state: the kind IS the continuation (or the helper is a GC object) */
     if (kind == CONT_STEP) { tramp_step_chain_free(ctx, cont); return; }
     if (kind == CONT_PROMISE_ALL) {
         js_promise_all_end(ctx, (struct JSPromiseAll *)cont); js_free_rt(ctx->rt, cont); return;
@@ -23987,6 +23993,26 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         js_iternext_deliver(ctx, sp, ret_val);
                         BREAK;
                     }
+                    if (dck == CONT_INSTANCEOF) {
+                        /* a callable @@hasInstance with no bytecode body — a C one, a bound one, a proxied one.
+                           13.10.2 step 3.b's ToBoolean, then the operands drop and the boolean is pushed where
+                           `instanceof` expects it; the frame-return arm does exactly this. */
+                        JSValue *cargv;
+                        int pop, first;
+                        TAKE_CALL_SHAPE(); pop = call_pop; first = call_first_r;
+                        if (unlikely(JS_IsException(ret_val))) {
+                            cargv = sp - pop;
+                            for (i = first; i < pop; i++) JS_FreeValue(ctx, cargv[i]);
+                            sp += first - pop;
+                            goto exception;
+                        }
+                        ret_val = js_bool(JS_ToBoolFree(ctx, ret_val));
+                        cargv = sp - pop;
+                        for (i = first; i < pop; i++) JS_FreeValue(ctx, cargv[i]);
+                        sp += first - pop;
+                        *sp++ = ret_val;
+                        BREAK;
+                    }
                     if (dck == CONT_SETTER) {
                         /* a property WRITE whose setter has no bytecode body — a C one (`__proto__`, whose setter
                            IS a C function and is reached by `Object.prototype.__proto__ = {}`), a bound one, a
@@ -27044,7 +27070,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValueConst afn;
                 struct JSAsyncGeneratorData *s;
                 TrampFrame *atf2; JSStackFrame *asf2; JSObject *afp; JSFunctionBytecode *ab2;
-                if (acreate_cont) { tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE; }
+                if (acreate_cont_kind != CONT_NONE) { tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE; }
                 agapply = (tramp_apply_argv != NULL);
                 afn = agapply ? tramp_apply_func : call_argv[-1];
                 s = js_mallocz(ctx, sizeof(JSAsyncGeneratorData));
@@ -27137,7 +27163,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (unlikely(JS_IsException(obj))) { js_async_generator_free(rt, s); goto exception; }
                 s->generator = JS_VALUE_GET_OBJ(obj);
                 JS_SetOpaqueInternal(obj, s);
-                if (aseq) {
+                if (aseq_kind != CONT_NONE) {
                     /* requested BY A CALL: the async generator is that call's RESULT, so it goes to the ONE
                        delivery a returning bytecode callback uses — empty operand shape, because the create
                        already dropped the call's operands and restored the caller's sp. */
@@ -27314,7 +27340,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    an iterator helper's callback — had its generator PUSHED onto a stack it was not using while it
                    sat waiting for a result that never came. */
                 void *gcall_cont = tramp_cont_state; uint8_t gcall_cont_kind = tramp_cont_kind;
-                if (gcall_cont) { tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE; }
+                if (gcall_cont_kind != CONT_NONE) { tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE; }
                 bool gapply = (tramp_apply_argv != NULL);
                 JSValueConst gfunc = gapply ? tramp_apply_func : call_argv[-1];
                 JSGeneratorData *s = js_mallocz(ctx, sizeof(*s));
@@ -27375,7 +27401,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    created generator as the helper's inner and re-enters do_iter_helper_step instead of pushing it. */
                 gtf->gen_data = s; gtf->gen_magic = 0xFF;
                 gtf->cont_state = gcreate_cont; gtf->cont_kind = gcreate_cont ? gcreate_cont_kind : CONT_NONE;
-                gtf->seq_req = gcall_cont; gtf->seq_req_kind = gcall_cont ? gcall_cont_kind : CONT_NONE;
+                gtf->seq_req = gcall_cont; gtf->seq_req_kind = gcall_cont_kind;
                 gtf->forof_off = tramp_gen_create_forof;   /* 1 = OP_for_of_start iterator-getter: finish the enum_rec at settle; 0 = ordinary g() create */
                 tramp_gen_create_forof = 0;
                 gtf->b = NULL; gtf->local_buf = NULL;
@@ -27430,7 +27456,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JS_FreeValue(ctx, gfunc);
                 if (unlikely(JS_IsException(obj))) { free_generator_stack_rt(rt, s); js_free_rt(rt, s); goto exception; }
                 JS_SetOpaqueInternal(obj, s);   /* the object now owns the suspended generator state */
-                if (gcall_cont) {
+                if (gcall_cont_kind != CONT_NONE) {
                     /* requested BY A CALL: the generator is that call's RESULT, so it goes to the ONE delivery a
                        returning bytecode callback uses. The operand shape is EMPTY because the create already
                        dropped the call's operands and restored the caller's sp — the delivery must not drop them
@@ -30802,7 +30828,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             if (JS_IsObject(sp[-1])) {
                 JSValue hi = JS_GetProperty(ctx, sp[-1], JS_ATOM_Symbol_hasInstance);
                 if (unlikely(JS_IsException(hi))) goto exception;
-                if (tramp_can_call(hi)) {
+                if (JS_IsFunction(ctx, hi)) {
+                    /* ANY callable @@hasInstance, which is what 13.10.2 step 2 says: "If instOfHandler is not
+                       undefined, return ToBoolean(? Call(instOfHandler, target, «V»))". Asking whether it had a
+                       BYTECODE body left a bound or proxied one on the C path, where `C[Symbol.hasInstance] =
+                       f.bind(null)` ran its body in an activation with no flow base. Which KIND of callee it is
+                       is the convergence point's question. */
                     JSValue v = sp[-2], o = sp[-1];
                     DCHECK(sp + 1 <= TRAMP_SP_LIMIT(sf),
                            "@@hasInstance drive: operand reshape exceeds the frame's compiled stack_size");
@@ -30812,9 +30843,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp++;
                     call_argv = sp - 1; call_argc = 1; tramp_first = -2; tramp_is_tail = 0;
                     tramp_cont_state = NULL; tramp_cont_kind = CONT_INSTANCEOF;
-                    goto do_tramp_call;
+                    goto do_generic_callee;
                 }
-                JS_FreeValue(ctx, hi);   /* absent, nullish, or a C/bound method: no preemptible body */
+                /* absent, nullish, or NOT CALLABLE: 13.10.2 step 3 is OrdinaryHasInstance, a DIFFERENT algorithm
+                   (a prototype-chain walk with nothing scriptable in it), not a fallback for the call above. */
+                JS_FreeValue(ctx, hi);
             }
             if (js_operator_instanceof(ctx, sp))
                 goto exception;
@@ -31324,7 +31357,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             cont_st = afs_throw;
             goto do_async_from_sync_abrupt;
         }
-        if (gen_unwind_seq_req) {
+        if (gen_unwind_seq_kind != CONT_NONE) {
             void *gsq = gen_unwind_seq_req; uint8_t gsk = gen_unwind_seq_kind;
             gen_unwind_seq_req = NULL; gen_unwind_seq_kind = CONT_NONE;
             if (gsk == CONT_GETPROP) { cont_st = gsq; goto do_getprop_abandon; }   /* its own teardown, one of it */
@@ -31359,7 +31392,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         arg_allocated_size = ctf2->caller_arg_allocated_size;
         pc = sf->cur_pc; sp = ctf2->caller_sp;
         js_free_rt(rt, ctf2);
-        if (gen_unwind_seq_req) {
+        if (gen_unwind_seq_kind != CONT_NONE) {
             void *asq = gen_unwind_seq_req; uint8_t ask = gen_unwind_seq_kind;
             gen_unwind_seq_req = NULL; gen_unwind_seq_kind = CONT_NONE;
             if (ask == CONT_GETPROP) { cont_st = asq; goto do_getprop_abandon; }
