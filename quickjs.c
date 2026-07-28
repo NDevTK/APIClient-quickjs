@@ -1458,6 +1458,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_OWNKEYS_NAMES, STEPDEF_OWNKEYS_SYMBOLS, STEPDEF_REFLECT_OWNKEYS,
     STEPDEF_OBJ_KEYS, STEPDEF_OBJ_DESCS,
     STEPDEF_REFLECT_GET, STEPDEF_REFLECT_SET, STEPDEF_REFLECT_HAS, STEPDEF_REFLECT_DELETE,
+    STEPDEF_PROMISE_RESOLVE, STEPDEF_PROMISE_REJECT,
     /* one per error KIND: a step constructor's magic IS its definition id, so the kind cannot also ride there.
        The block is contiguous and indexed by JSErrorEnum, with JS_PLAIN_ERROR last. */
     STEPDEF_ERROR_CTOR_BASE,
@@ -1591,8 +1592,8 @@ static __exception int perform_promise_then(JSContext *ctx,
                                             JSValueConst promise,
                                             JSValueConst *resolve_reject,
                                             JSValueConst *cap_resolving_funcs);
-static JSValue js_promise_resolve(JSContext *ctx, JSValueConst this_val,
-                                  int argc, JSValueConst *argv, int magic);
+static JSValue js_promise_resolve_native(JSContext *ctx, JSValueConst ctor,
+                                         int argc, JSValueConst *argv, int magic);
 static JSValue js_promise_then(JSContext *ctx, JSValueConst this_val,
                                int argc, JSValueConst *argv);
 static JSValue js_promise_resolve_thenable_job(JSContext *ctx,
@@ -18028,6 +18029,21 @@ typedef struct JSStepHdr {
        otherwise. It lives here rather than in an interpreter register because a machine cannot reach one, and
        the request can suspend between the step that sets it and the dispatch that reads it. */
     JSValue ctor_ntgt;
+    /* A CAPABILITY request's result: NewPromiseCapability's [promise, resolve, reject], OWNED. It lives here for
+       the reason ctor_ntgt does — a machine cannot reach an interpreter register, and the request SUSPENDS
+       between the step that asks and the delivery that answers, because the subclass constructor is user code.
+       Three values rather than one because that is what the record is; packing them into the step's single
+       result would make every consumer unpack a tuple the engine had just built. */
+    JSValue cap_promise, cap_funcs[2];
+    /* A DELEGATE request's inner machine, owned until the driver adopts it. Delegation is how a step builtin
+       performs an ABSTRACT OPERATION that is itself a machine — .finally's PromiseResolve(C, v), which 27.2.5.3
+       step 4 states as the operation and not as C.resolve, so it cannot be reached as an ordinary call.
+       FORWARDING the inner's step from the outer's (what str.replace's @@replace delegation does) works only
+       while the inner's requests carry everything in cb_result: a CAPABILITY or CONSTRUCT records the state the
+       DRIVER is stepping, which under forwarding is the OUTER, so the answer lands on the wrong header. Handing
+       the inner to the driver instead makes it a real machine on the chain, and the CONT_STEP outer it already
+       carries is what delivers its result back. */
+    void *delegate;
     /* CONT_FOROF_NEXT carries no STATE — its enum_rec offset is the whole of what the continuation needs — so a
        machine reached as a for-of .next() (Iterator.concat's) has an outer_kind with a NULL outer, and this is
        what its delivery reads. Without it the DONE arm saw no outer at all and pushed the result as a bare
@@ -18091,6 +18107,9 @@ static void *tramp_step_state_new(JSContext *ctx, const JSTrampStepDef *sd, JSVa
     h->arg = sd->arg;
     h->stage = 0;
     h->ctor_ntgt = JS_UNINITIALIZED;   /* a CONSTRUCT request's new target: absent means the constructor itself */
+    h->cap_promise = JS_UNDEFINED;     /* a CAPABILITY request's [promise, resolve, reject], filled by its delivery */
+    h->cap_funcs[0] = JS_UNDEFINED; h->cap_funcs[1] = JS_UNDEFINED;
+    h->delegate = NULL;
     h->argc = argc;
     h->argv = (JSValue *)((uint8_t *)h + STEP_ARGV_OFFSET(sd->size));
     for (i = 0; i < argc; i++)
@@ -18775,6 +18794,13 @@ static JSValue tramp_step_state_free(JSContext *ctx, void *st, bool take_result)
     h->coerce = JS_UNDEFINED;
     if (!JS_IsUninitialized(h->ctor_ntgt)) JS_FreeValue(ctx, h->ctor_ntgt);
     h->ctor_ntgt = JS_UNINITIALIZED;
+    /* the CAPABILITY record the header owns. A machine that took it out of the header before finishing leaves
+       UNDEFINEDs here; one torn down mid-request still holds all three, and each is a real reference. */
+    JS_FreeValue(ctx, h->cap_promise);   h->cap_promise = JS_UNDEFINED;
+    JS_FreeValue(ctx, h->cap_funcs[0]);  h->cap_funcs[0] = JS_UNDEFINED;
+    JS_FreeValue(ctx, h->cap_funcs[1]);  h->cap_funcs[1] = JS_UNDEFINED;
+    /* an inner machine built but never handed over (the outer threw between the two) is this state's to free. */
+    if (h->delegate) { tramp_step_state_free(ctx, h->delegate, false); h->delegate = NULL; }
     JS_FreeAtom(ctx, h->get_atom);  /* set only while a property read is in flight */
     h->get_atom = JS_ATOM_NULL;
     for (i = 0; i < h->argc; i++)
@@ -18800,8 +18826,13 @@ static void js_iter_consume_abandon(JSContext *ctx, void *st);
 /* CONT_ITER_HELPER's value, forward for the same reason. */
 #define CONT_ITER_HELPER_FWD  11
 static void js_iter_helper_abandon(JSContext *ctx, void *st);
-static void tramp_step_chain_free(JSContext *ctx, void *st)
+/* Free a machine and everything WAITING on it that this walk owns, and report the first requester it does NOT —
+   one whose abrupt handling belongs to the interpreter (a combinator rejects its aggregate; a consumer owes
+   IfAbruptCloseIterator and then yields). Reporting rather than freeing is the whole point: a JSPromiseAll freed
+   through JSStepHdr's teardown reads its `def` out of the middle of the struct. */
+static void *tramp_step_chain_free_upto(JSContext *ctx, void *st, uint8_t *out_kind)
 {
+    *out_kind = 0;   /* CONT_NONE, declared below with the rest of the namespace */
     while (st) {
         JSStepHdr *h = st;
         void *nxt = h->outer;
@@ -18809,24 +18840,35 @@ static void tramp_step_chain_free(JSContext *ctx, void *st)
         tramp_step_state_free(ctx, h, false);
         if (nxt && nk == CONT_TOPRIM) {
             js_toprim_abandon(ctx, nxt);   /* which walks whatever waits on IT */
-            return;
+            return NULL;
         }
         if (nxt && nk == CONT_FROM_CTOR) {
             js_from_ctor_abandon(ctx, nxt);
-            return;
+            return NULL;
         }
         if (nxt && nk == CONT_ITER_CONSUME_FWD) {
             /* the machine was a consume machine's CALLBACK and threw: the source owes IfAbruptCloseIterator. */
             js_iter_consume_abandon(ctx, nxt);
-            return;
+            return NULL;
         }
         if (nxt && nk == CONT_ITER_HELPER_FWD) {
             js_iter_helper_abandon(ctx, nxt);
-            return;
+            return NULL;
         }
-        DCHECK(!nxt || nk == CONT_STEP, "step outer continuation: unknown sequence kind");
+        if (nxt && nk != CONT_STEP) { *out_kind = nk; return nxt; }
         st = nxt;
     }
+    return NULL;
+}
+/* The common case: nothing is left for the interpreter to answer for. A requester this walk does not own reaching
+   here would be one whose abrupt handling was silently skipped, so it CRASHES rather than leaking the answer. */
+static void tramp_step_chain_free(JSContext *ctx, void *st)
+{
+    uint8_t left = 0;
+    void *rest = tramp_step_chain_free_upto(ctx, st, &left);
+    DCHECK(!rest, "a step chain ended in a requester whose abrupt handling only the interpreter can perform — "
+                  "use tramp_step_chain_free_upto and hand it to that kind's unwind arm");
+    (void)rest; (void)left;
 }
 enum { ArrayFind, ArrayFindIndex, ArrayFindLast, ArrayFindLastIndex };
 /* ORed into the find family's mode for the TypedArray receivers. The find STEP is already receiver-agnostic (it
@@ -19417,6 +19459,7 @@ static void js_promise_cap_requester_abandon(JSContext *ctx, void *st)
     void *req = pc->outer; uint8_t rk = pc->outer_kind;
     js_promise_cap_abandon(ctx, pc);
     if (req) {
+        if (rk == CONT_STEP) { tramp_step_chain_free(ctx, req); return; }
         DCHECK(rk == CONT_PROMISE_TRY, "promise-capability requester: unknown machine kind");
         js_promise_try_abandon(ctx, req);
     }
@@ -20574,7 +20617,7 @@ typedef struct JSAsyncFromSync {
 /* ITERCALL: OP_iterator_call — `for await`/yield* delegating .return(v)/.throw(v) onto the wrapper. Delivers
    like ITERNEXT and then pushes the opcode's `false` ret_flag (the method WAS present). */
 enum { AFS_DELIVER_CALL = 0, AFS_DELIVER_CLOSE, AFS_DELIVER_ITERNEXT, AFS_DELIVER_ITERCALL };
-static JSValue js_promise_resolve(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
+static JSValue js_promise_resolve_native(JSContext *ctx, JSValueConst ctor, int argc, JSValueConst *argv, int magic);
 static __exception int perform_promise_then(JSContext *ctx, JSValueConst promise, JSValueConst *resolve_reject, JSValueConst *cap_resolving_funcs);
 static JSValue js_async_from_sync_iterator_unwrap_func_create(JSContext *ctx, bool done);
 static int js_async_from_sync_continuation(JSContext *ctx, JSValueConst sync_iter, JSValue value, int done,
@@ -23122,6 +23165,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         do_promise_cap_deliver:
             /* the capability exists: tramp_cap_promise + tramp_cap_funcs, and tramp_cap_outer/_kind say who asked.
                Reached identically whether the Construct ran user code or there was none to run. */
+            if (tramp_cap_kind == CONT_STEP) {
+                /* a step machine asked: the record goes on its header (which owns it) and the machine is
+                   re-entered with UNDEFINED as its step result — the capability is not a value it returns. */
+                JSStepHdr *ch = tramp_cap_outer;
+                cont_st = tramp_cap_outer;
+                tramp_cap_outer = NULL; tramp_cap_kind = CONT_NONE;
+                ch->cap_promise = tramp_cap_promise; tramp_cap_promise = JS_UNDEFINED;
+                ch->cap_funcs[0] = tramp_cap_funcs[0]; tramp_cap_funcs[0] = JS_UNDEFINED;
+                ch->cap_funcs[1] = tramp_cap_funcs[1]; tramp_cap_funcs[1] = JS_UNDEFINED;
+                ret_val = JS_UNDEFINED;
+                goto do_step_step;
+            }
             DCHECK(tramp_cap_kind == CONT_PROMISE_TRY,
                    "promise-capability requester: unknown machine kind");
             goto do_promise_try_have_cap;
@@ -23134,6 +23189,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 tramp_cap_outer = NULL; tramp_cap_kind = CONT_NONE;
                 tramp_cap_ctor = JS_UNDEFINED;
                 if (cq) {
+                    if (ck9 == CONT_STEP) { cont_st = cq; goto step_abandon; }
                     DCHECK(ck9 == CONT_PROMISE_TRY, "promise-capability requester: unknown machine kind");
                     js_promise_try_abandon(ctx, cq);
                 }
@@ -24632,6 +24688,27 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     tramp_first = 0; tramp_is_tail = 0;
                     cont_st = stt;   /* step_abandon reads it if the construct throws in place */
                     goto do_construct_dispatch;
+                }
+                if (st == 16) {
+                    /* CAPABILITY: *out_cb is [C] and the machine is re-entered with NewPromiseCapability(C) in its
+                       header. One request, one implementation: the operation's native-ctor shortcut, executor,
+                       Construct and callable checks all live at do_promise_cap_tramp and a machine borrows them
+                       rather than restating them as its own GETPROP/CONSTRUCT sequence. */
+                    tramp_cap_ctor = cb[0];
+                    tramp_cap_outer = stt; tramp_cap_kind = CONT_STEP;
+                    goto do_promise_cap_tramp;
+                }
+                if (st == 17) {
+                    /* DELEGATE: the machine hands the driver an inner machine (h->delegate) and stops being the
+                       one being stepped. The CONT_STEP outer is set HERE rather than by the builtin, so a
+                       delegation cannot be built that forgets to say who is waiting for it. */
+                    JSStepHdr *ih = h->delegate;
+                    h->delegate = NULL;
+                    DCHECK(ih != NULL, "a DELEGATE step produced no inner machine");
+                    ih->outer = stt; ih->outer_kind = CONT_STEP;
+                    cont_st = ih;
+                    ret_val = JS_UNDEFINED;
+                    goto do_step_step;
                 }
                 DCHECK(st == 3, "step builtin: unknown step code");
                 call_argv = (JSValueConst *)&cb[2];
@@ -31796,6 +31873,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         arg_allocated_size = rtf->caller_arg_allocated_size;
         pc = sf->cur_pc; sp = rtf->caller_sp;
         js_free_rt(rt, rtf);
+    step_unwind_redispatch:
+        /* THE requester dispatch, entered a second time when a step machine's own chain ended in a requester only
+           one of these arms can answer for. The frame is already popped; every arm below reads only xcs/xck and
+           the shape locals, which is what makes re-entry sound. */
         if (xck == CONT_ITER_HELPER) {
             /* the map/filter/flatMap callback THREW. Control never reaches the step's resume, so IfAbruptCloseIterator
                must happen HERE - the spec closes the underlying iterator when the callback throws, and skipping it is
@@ -32075,10 +32156,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 /* fini OWNS the state allocation (every driver path calls it and expects the free), so the
                    trailing js_free_rt below must not run — it was a DOUBLE FREE on the callback-throws path for
                    every step builtin. NULL it so the shared free is skipped. The machines WAITING on this one
-                   (a step whose callback is a step) go with it. */
-                void *souter = ((JSStepHdr *)xcs)->outer;
-                tramp_step_state_free(ctx, xcs, false);
-                while (souter) { JSStepHdr *oh = souter; souter = oh->outer; tramp_step_state_free(ctx, oh, false); }
+                   (a step whose callback is a step) go with it — through the SHARED walk, which reads each
+                   requester's KIND. This was a hand-rolled loop that freed every outer AS a step state, which
+                   held only while a machine's requester could not be anything else; a machine invoked as a
+                   consume machine's callback has a CONT_PROMISE_ALL / CONT_ITER_CONSUME requester, and freeing a
+                   JSPromiseAll through JSStepHdr's teardown read its `def` out of the middle of the struct.
+                   The same hand-copied-list failure the construct-abandon had, in the same shape. */
+                uint8_t left = CONT_NONE;
+                void *rest = tramp_step_chain_free_upto(ctx, xcs, &left);
+                if (rest) {
+                    /* the machine was invoked BY one of the interpreter's own sequences — a combinator's
+                       per-element C.resolve, a consumer's callback — whose abrupt handling is an arm of this very
+                       dispatch (reject the aggregate, IfAbruptCloseIterator). Re-enter with it. */
+                    xcs = rest; xck = left;
+                    goto step_unwind_redispatch;
+                }
                 xcs = NULL;
             }
             /* CONT_PROMISE_ALL is handled by its own arm above (reject-and-yield, never abandon-and-propagate) and
@@ -33219,7 +33311,7 @@ static bool js_async_function_post(JSContext *ctx, JSAsyncFunctionData *s, JSVal
                    "resumed async body suspended with non-AWAIT code (preempt-in-resumed-async not built as a flow)");
             /* await */
             JS_FreeValue(ctx, func_ret); /* not used */
-            promise = js_promise_resolve(ctx, ctx->promise_ctor,
+            promise = js_promise_resolve_native(ctx, ctx->promise_ctor,
                                          1, vc(&value), 0);
             JS_FreeValue(ctx, value);
             if (JS_IsException(promise))
@@ -33461,7 +33553,7 @@ static int js_async_generator_await(JSContext *ctx,
     JSValue promise, resolving_funcs[2], resolving_funcs1[2];
     int i, res;
 
-    promise = js_promise_resolve(ctx, ctx->promise_ctor,
+    promise = js_promise_resolve_native(ctx, ctx->promise_ctor,
                                  1, vc(&value), 0);
     if (JS_IsException(promise))
         goto fail;
@@ -33545,13 +33637,13 @@ static int js_async_generator_completed_return(JSContext *ctx,
     int res;
 
     // Can fail looking up JS_ATOM_constructor when is_reject==0.
-    promise = js_promise_resolve(ctx, ctx->promise_ctor, 1, vc(&value),
+    promise = js_promise_resolve_native(ctx, ctx->promise_ctor, 1, vc(&value),
                                  /*is_reject*/0);
     // A poisoned .constructor property is observable and the resulting
     // exception should be delivered to the catch handler.
     if (JS_IsException(promise)) {
         JSValue err = JS_GetException(ctx);
-        promise = js_promise_resolve(ctx, ctx->promise_ctor, 1, vc(&err),
+        promise = js_promise_resolve_native(ctx, ctx->promise_ctor, 1, vc(&err),
                                      /*is_reject*/1);
         JS_FreeValue(ctx, err);
         if (JS_IsException(promise))
@@ -58893,7 +58985,87 @@ static const JSTrampStepDef js_ta_filter_def       = { sizeof(JSArrayEvery), js_
 
 /* Designated initializers, so each row states WHICH id it serves. Inserting a builtin cannot silently repoint an
    existing registration the way a positional table would. */
+/* Promise.resolve / Promise.reject (27.2.4.7 / 27.2.4.6) as a STEP MACHINE. All three of its spec steps are the
+   page's code once C is a subclass: the `constructor` read on an already-promise argument, NewPromiseCapability's
+   Construct, and the capability's resolve/reject. The C body ran all three with JS_GetProperty /
+   JS_CallConstructor / JS_Call, so `Sub.resolve(x)` drove each of them to completion. */
+typedef struct JSPromiseResolveM {
+    JSStepHdr hdr;         /* MUST be first */
+    JSValue result;        /* owned: the promise this returns */
+    JSValue cb_args[3];    /* [this=undefined, resolve|reject, value] */
+} JSPromiseResolveM;
+_Static_assert(offsetof(JSPromiseResolveM, hdr) == 0, "JSStepHdr must be first in JSPromiseResolveM");
+
+static int js_promise_resolve_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSPromiseResolveM *s = st;
+    bool is_reject = (s->hdr.arg != 0);
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result);          /* UNDEFINED on the first step */
+        if (!JS_IsObject(s->hdr.this_val)) { JS_ThrowTypeErrorNotAnObject(ctx); return -1; }
+        if (!is_reject && JS_GetOpaque(step_arg(&s->hdr, 0), JS_CLASS_PROMISE)) {
+            /* 27.2.4.7 step 2: `Get(x, "constructor")`, which a Proxy or an accessor makes user code. */
+            s->hdr.stage = 1;
+            s->cb_args[0] = js_dup(step_arg(&s->hdr, 0));
+            *out_cb = s->cb_args; *out_argc = (int)JS_ATOM_constructor;
+            return 6;   /* GETPROP */
+        }
+        s->hdr.stage = 2;
+        s->cb_args[0] = js_dup(s->hdr.this_val);
+        *out_cb = s->cb_args; *out_argc = 0;
+        return 16;   /* CAPABILITY */
+    }
+    if (s->hdr.stage == 1) {
+        /* cb_result = x.constructor. Step 2.b: if it IS this C, x already is the promise to return. */
+        bool same = js_same_value(ctx, cb_result, s->hdr.this_val);
+        JS_FreeValue(ctx, cb_result);
+        JS_FreeValue(ctx, s->cb_args[0]); s->cb_args[0] = JS_UNDEFINED;
+        if (same) { s->result = js_dup(step_arg(&s->hdr, 0)); return 0; }
+        s->hdr.stage = 2;
+        s->cb_args[0] = js_dup(s->hdr.this_val);
+        *out_cb = s->cb_args; *out_argc = 0;
+        return 16;   /* CAPABILITY */
+    }
+    if (s->hdr.stage == 2) {
+        /* the capability is on the header. Call its resolve/reject with the value — user code for a subclass that
+           wraps them, which is why it is a request and not a JS_Call from here. */
+        JS_FreeValue(ctx, cb_result);
+        JS_FreeValue(ctx, s->cb_args[0]);
+        s->hdr.stage = 3;
+        s->result = s->hdr.cap_promise; s->hdr.cap_promise = JS_UNDEFINED;
+        s->cb_args[0] = JS_UNDEFINED;                                   /* this */
+        s->cb_args[1] = s->hdr.cap_funcs[is_reject]; s->hdr.cap_funcs[is_reject] = JS_UNDEFINED;
+        JS_FreeValue(ctx, s->hdr.cap_funcs[!is_reject]); s->hdr.cap_funcs[!is_reject] = JS_UNDEFINED;
+        s->cb_args[2] = js_dup(step_arg(&s->hdr, 0));
+        *out_cb = s->cb_args; *out_argc = 1;
+        return 3;   /* CALL */
+    }
+    /* stage 3: resolve/reject returned; its result is discarded and the promise is the answer. */
+    JS_FreeValue(ctx, cb_result);
+    return 0;
+}
+
+static JSValue js_promise_resolve_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSPromiseResolveM *s = st;
+    JSValue r = take_result ? s->result : (JS_FreeValue(ctx, s->result), JS_UNDEFINED);
+    JS_FreeValue(ctx, s->cb_args[0]);
+    JS_FreeValue(ctx, s->cb_args[1]);
+    JS_FreeValue(ctx, s->cb_args[2]);
+    js_free_rt(ctx->rt, s);
+    return r;
+}
+
+static const JSTrampStepDef js_promise_resolve_def = {
+    sizeof(JSPromiseResolveM), js_promise_resolve_step, js_promise_resolve_fini, 0
+};
+static const JSTrampStepDef js_promise_reject_def = {
+    sizeof(JSPromiseResolveM), js_promise_resolve_step, js_promise_resolve_fini, 1
+};
+
 static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
+    [STEPDEF_PROMISE_RESOLVE]       = &js_promise_resolve_def,
+    [STEPDEF_PROMISE_REJECT]        = &js_promise_reject_def,
     [STEPDEF_ARRAY_FIND]            = &js_array_find_def,
     [STEPDEF_ARRAY_FIND_INDEX]      = &js_array_findIndex_def,
     [STEPDEF_ARRAY_FIND_LAST]       = &js_array_findLast_def,
@@ -61431,23 +61603,23 @@ static JSValue js_async_iterator_proto_dispose(JSContext *ctx,
     method = JS_GetProperty(ctx, this_val, JS_ATOM_return);
     if (JS_IsException(method)) {
         JSValue exc = JS_GetException(ctx);
-        JSValue p = js_promise_resolve(ctx, ctx->promise_ctor, 1, vc(&exc), 1);
+        JSValue p = js_promise_resolve_native(ctx, ctx->promise_ctor, 1, vc(&exc), 1);
         JS_FreeValue(ctx, exc);
         return p;
     }
     if (JS_IsUndefined(method)) {
-        return js_promise_resolve(ctx, ctx->promise_ctor, 1, vc(&undef), 0);
+        return js_promise_resolve_native(ctx, ctx->promise_ctor, 1, vc(&undef), 0);
     }
     ret = JS_Call(ctx, method, this_val, 0, NULL);
     JS_FreeValue(ctx, method);
     if (JS_IsException(ret)) {
         JSValue exc = JS_GetException(ctx);
-        JSValue p = js_promise_resolve(ctx, ctx->promise_ctor, 1, vc(&exc), 1);
+        JSValue p = js_promise_resolve_native(ctx, ctx->promise_ctor, 1, vc(&exc), 1);
         JS_FreeValue(ctx, exc);
         return p;
     }
     /* Wrap in Promise.resolve(ret).then(() => undefined) */
-    promise = js_promise_resolve(ctx, ctx->promise_ctor, 1, vc(&ret), 0);
+    promise = js_promise_resolve_native(ctx, ctx->promise_ctor, 1, vc(&ret), 0);
     JS_FreeValue(ctx, ret);
     if (JS_IsException(promise))
         return promise;
@@ -71124,7 +71296,7 @@ static JSValue js_async_dispose_step(JSContext *ctx, JSValueConst this_val,
     {
         JSValueConst prev_err = argv[0];
         JSValue ret_promise, resolve_fn, reject_fn, then_args[2], result;
-        ret_promise = js_promise_resolve(ctx, ctx->promise_ctor, 1, vc(&ret), 0);
+        ret_promise = js_promise_resolve_native(ctx, ctx->promise_ctor, 1, vc(&ret), 0);
         JS_FreeValue(ctx, ret);
         if (JS_IsException(ret_promise))
             return JS_EXCEPTION;
@@ -71154,7 +71326,7 @@ static JSValue js_disposable_stack_dispose(JSContext *ctx,
     if (!s) {
         if (class_id == JS_CLASS_ASYNC_DISPOSABLE_STACK) {
             JSValue exc = JS_GetException(ctx);
-            JSValue p = js_promise_resolve(ctx, ctx->promise_ctor, 1, vc(&exc),
+            JSValue p = js_promise_resolve_native(ctx, ctx->promise_ctor, 1, vc(&exc),
                                            /*is_reject*/1);
             JS_FreeValue(ctx, exc);
             return p;
@@ -71164,7 +71336,7 @@ static JSValue js_disposable_stack_dispose(JSContext *ctx,
     if (s->disposed) {
         if (class_id == JS_CLASS_ASYNC_DISPOSABLE_STACK) {
             JSValue undef = JS_UNDEFINED;
-            return js_promise_resolve(ctx, ctx->promise_ctor, 1, vc(&undef),
+            return js_promise_resolve_native(ctx, ctx->promise_ctor, 1, vc(&undef),
                                       /*is_reject*/0);
         }
         return JS_UNDEFINED;
@@ -71184,7 +71356,7 @@ static JSValue js_disposable_stack_dispose(JSContext *ctx,
         undef = JS_UNDEFINED;
         i = count - 1;
         if (i < 0) {
-            chain = js_promise_resolve(ctx, ctx->promise_ctor, 1, vc(&undef),
+            chain = js_promise_resolve_native(ctx, ctx->promise_ctor, 1, vc(&undef),
                                        /*is_reject*/0);
             if (JS_IsException(chain))
                 goto async_dispose_fail;
@@ -71192,7 +71364,7 @@ static JSValue js_disposable_stack_dispose(JSContext *ctx,
             JSDisposableResource *res = &s->resources[i];
             if (JS_IsUndefined(res->method)) {
                 /* null/undefined resource: Await(undefined) */
-                chain = js_promise_resolve(ctx, ctx->promise_ctor, 1,
+                chain = js_promise_resolve_native(ctx, ctx->promise_ctor, 1,
                                            vc(&undef), /*is_reject*/0);
             } else {
                 switch (res->hint) {
@@ -71209,11 +71381,11 @@ static JSValue js_disposable_stack_dispose(JSContext *ctx,
                 }
                 if (JS_IsException(ret)) {
                     JSValue err = JS_GetException(ctx);
-                    chain = js_promise_resolve(ctx, ctx->promise_ctor, 1,
+                    chain = js_promise_resolve_native(ctx, ctx->promise_ctor, 1,
                                                vc(&err), /*is_reject*/1);
                     JS_FreeValue(ctx, err);
                 } else {
-                    chain = js_promise_resolve(ctx, ctx->promise_ctor, 1,
+                    chain = js_promise_resolve_native(ctx, ctx->promise_ctor, 1,
                                                vc(&ret), /*is_reject*/0);
                     JS_FreeValue(ctx, ret);
                 }
@@ -71441,7 +71613,7 @@ bool JS_IsPromise(JSValueConst val)
 
 JSValue JS_NewSettledPromise(JSContext *ctx, bool is_reject, JSValueConst value)
 {
-    return js_promise_resolve(ctx, ctx->promise_ctor, 1, &value, is_reject);
+    return js_promise_resolve_native(ctx, ctx->promise_ctor, 1, &value, is_reject);
 }
 
 static int js_create_resolving_functions(JSContext *ctx, JSValue *args,
@@ -72032,35 +72204,33 @@ JSValue JS_NewPromiseCapability(JSContext *ctx, JSValue *resolving_funcs)
     return js_new_promise_capability(ctx, resolving_funcs, JS_UNDEFINED);
 }
 
-static JSValue js_promise_resolve(JSContext *ctx, JSValueConst this_val,
-                                  int argc, JSValueConst *argv, int magic)
+/* PromiseResolve(C, x) with the NATIVE constructor, which is what every C-INTERNAL caller passes (a job's
+   settlement, an await, module evaluation). With C = %Promise% the whole of 27.2.4.7 is unobservable — the
+   capability is built without a Construct and the resolving function is the engine's own — so this is a
+   DIFFERENT ALGORITHM with no user code in it, not a fallback for the machine. The DCHECK is what keeps it that:
+   a species constructor reaching here would be the C drive the machine exists to remove. */
+static JSValue js_promise_resolve_native(JSContext *ctx, JSValueConst ctor,
+                                         int argc, JSValueConst *argv, int magic)
 {
     JSValue result_promise, resolving_funcs[2], ret;
     bool is_reject = magic;
-
-    if (!JS_IsObject(this_val))
-        return JS_ThrowTypeErrorNotAnObject(ctx);
+    DCHECK(js_same_value(ctx, ctor, ctx->promise_ctor),
+           "PromiseResolve with a non-native constructor reached the C route — perform it as the Promise.resolve "
+           "step machine (a DELEGATE request) instead of driving its Construct from here");
     if (!is_reject && JS_GetOpaque(argv[0], JS_CLASS_PROMISE)) {
-        JSValue ctor;
+        JSValue c2 = JS_GetProperty(ctx, argv[0], JS_ATOM_constructor);
         bool is_same;
-        ctor = JS_GetProperty(ctx, argv[0], JS_ATOM_constructor);
-        if (JS_IsException(ctor))
-            return ctor;
-        is_same = js_same_value(ctx, ctor, this_val);
-        JS_FreeValue(ctx, ctor);
-        if (is_same)
-            return js_dup(argv[0]);
+        if (JS_IsException(c2)) return c2;
+        is_same = js_same_value(ctx, c2, ctor);
+        JS_FreeValue(ctx, c2);
+        if (is_same) return js_dup(argv[0]);
     }
-    result_promise = js_new_promise_capability(ctx, resolving_funcs, this_val);
-    if (JS_IsException(result_promise))
-        return result_promise;
+    result_promise = js_new_promise_capability(ctx, resolving_funcs, ctor);
+    if (JS_IsException(result_promise)) return result_promise;
     ret = JS_Call(ctx, resolving_funcs[is_reject], JS_UNDEFINED, 1, argv);
     JS_FreeValue(ctx, resolving_funcs[0]);
     JS_FreeValue(ctx, resolving_funcs[1]);
-    if (JS_IsException(ret)) {
-        JS_FreeValue(ctx, result_promise);
-        return ret;
-    }
+    if (JS_IsException(ret)) { JS_FreeValue(ctx, result_promise); return ret; }
     JS_FreeValue(ctx, ret);
     return result_promise;
 }
@@ -72725,15 +72895,26 @@ static int js_promise_then_finally_step(JSContext *ctx, void *st, JSValue cb_res
         return 3;
     }
     if (s->hdr.stage == 1) {
-        /* cb_result = onFinally's return. Build promise = Promise.resolve(ctor, res) and the value-thunk/thrower,
-           then drive promise.then(then_func) as the SECOND callback (its .then can be a user thenable that loops). */
-        JSValue promise, then_func, then_method;
-        s->hdr.stage = 2;
+        /* cb_result = onFinally's return. 27.2.5.3 step 4 is PromiseResolve(C, result) — the ABSTRACT OPERATION,
+           not `C.resolve`, so it cannot be reached as an ordinary call — and that operation IS the
+           Promise.resolve step machine. DELEGATE to it: driving it from C is what made `.finally` on a SUBCLASS
+           run that subclass's constructor and resolving function to completion. */
+        void *inner;
+        JSValueConst iarg = cb_result;
+        s->hdr.stage = 4;
         JS_FreeValue(ctx, s->cb_args[1]);      /* onFinally no longer needed (phase 0 consumed it) */
         s->cb_args[1] = JS_UNDEFINED;
-        promise = js_promise_resolve(ctx, s->ctor, 1, vc(&cb_result), 0);
+        inner = tramp_step_state_new(ctx, &js_promise_resolve_def, s->ctor, 1, &iarg, JS_UNDEFINED);
         JS_FreeValue(ctx, cb_result);
-        if (JS_IsException(promise)) return -1;
+        if (!inner) return -1;
+        s->hdr.delegate = inner;
+        return 17;   /* DELEGATE */
+    }
+    if (s->hdr.stage == 4) {
+        /* cb_result = PromiseResolve's promise. Build the value-thunk/thrower and drive promise.then(then_func)
+           as the SECOND callback (its .then can be a user thenable that loops). */
+        JSValue promise = cb_result, then_func, then_method;
+        s->hdr.stage = 2;
         then_func = JS_NewCFunctionData(ctx, s->magic == 0 ? js_promise_finally_value_thunk : js_promise_finally_thrower,
                                         0, 0, 1, vc(&s->value));
         if (JS_IsException(then_func)) { JS_FreeValue(ctx, promise); return -1; }
@@ -72778,7 +72959,7 @@ static JSValue js_promise_then_finally_func(JSContext *ctx, JSValueConst this_va
     res = JS_Call(ctx, onFinally, JS_UNDEFINED, 0, NULL);
     if (JS_IsException(res))
         return res;
-    promise = js_promise_resolve(ctx, ctor, 1, vc(&res), 0);
+    promise = js_promise_resolve_native(ctx, ctor, 1, vc(&res), 0);
     JS_FreeValue(ctx, res);
     if (JS_IsException(promise))
         return promise;
@@ -72827,8 +73008,8 @@ static JSValue js_promise_finally(JSContext *ctx, JSValueConst this_val,
 }
 
 static const JSCFunctionListEntry js_promise_funcs[] = {
-    JS_CFUNC_MAGIC_DEF("resolve", 1, js_promise_resolve, 0 ),
-    JS_CFUNC_MAGIC_DEF("reject", 1, js_promise_resolve, 1 ),
+    JS_CFUNC_STEP_DEF("resolve", 1, STEPDEF_PROMISE_RESOLVE ),
+    JS_CFUNC_STEP_DEF("reject", 1, STEPDEF_PROMISE_REJECT ),
     JS_CFUNC_MAGIC_DEF("all", 1, js_promise_all, PROMISE_MAGIC_all ),
     JS_CFUNC_MAGIC_DEF("allSettled", 1, js_promise_all, PROMISE_MAGIC_allSettled ),
     JS_CFUNC_MAGIC_DEF("any", 1, js_promise_all, PROMISE_MAGIC_any ),
@@ -72967,7 +73148,7 @@ static int js_async_from_sync_continuation(JSContext *ctx, JSValueConst sync_ite
     JSValueConst rr[2];
     int res;
 
-    value_wrapper = js_promise_resolve(ctx, ctx->promise_ctor, 1, vc(&value), 0);   /* step 5 */
+    value_wrapper = js_promise_resolve_native(ctx, ctx->promise_ctor, 1, vc(&value), 0);   /* step 5 */
     JS_FreeValue(ctx, value);
     if (JS_IsException(value_wrapper)) {
         /* PromiseResolve itself completed abruptly — a poisoned `constructor` getter on the value. */
