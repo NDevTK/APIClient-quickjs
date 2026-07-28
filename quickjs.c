@@ -19385,6 +19385,42 @@ static bool tramp_can_call_promise_exec(JSContext *ctx, JSValueConst func, JSVal
                                   fn(...args) on THIS chain (so a loop in fn parks), then resolves with fn's return;
                                   the exception arm rejects with an abrupt fn and yields the promise (Promise.try
                                   returns a rejected promise, never raises) — the same shape as the executor. */
+#define CONT_PROMISE_TRY_SETTLE 39  /* cont_state = JSPromiseTry: the capability's resolve(value), which a
+                                       subclass may have wrapped in its own bytecode. */
+#define CONT_PROMISE_CAP   38  /* cont_state = JSPromiseCap: NewPromiseCapability's Construct(C, «executor»). The
+                                  SUBCLASS CONSTRUCTOR is user code and js_new_promise_capability ran it with
+                                  JS_CallConstructor from C, so `Promise.try.call(Sub, fn)` had that constructor's
+                                  loop run with no flow base — and so does every other capability consumer, which
+                                  is why the request exists rather than a second copy per builtin. */
+/* The capability's Construct, ridden on the tramp. Mirrors JSFromCtor: the state holds what the operation needs
+   after the object comes back, and names the machine waiting for it. */
+typedef struct JSPromiseCap {
+    JSValue executor;        /* the C executor whose data[] the constructor fills in (OWNED) */
+    JSValue ctor;            /* C, OWNED across the Construct — con_func only borrows it */
+    void *outer;             /* the machine that asked for the capability */
+    uint8_t outer_kind;
+} JSPromiseCap;
+static JSValue js_promise_executor_new(JSContext *ctx);
+static void js_promise_cap_abandon(JSContext *ctx, JSPromiseCap *pc)
+{
+    JS_FreeValue(ctx, pc->executor);
+    JS_FreeValue(ctx, pc->ctor);
+    js_free_rt(ctx->rt, pc);
+}
+static void js_promise_try_abandon(JSContext *ctx, void *st);
+/* The capability's Construct threw or was unwound: the state goes, and so does the machine that will never
+   receive the capability. ONE implementation, because the two construct-abandon sites are two frame kinds of the
+   same event and a hand-copied second list is what goes stale — this arm was added because one already had. */
+static void js_promise_cap_requester_abandon(JSContext *ctx, void *st)
+{
+    JSPromiseCap *pc = st;
+    void *req = pc->outer; uint8_t rk = pc->outer_kind;
+    js_promise_cap_abandon(ctx, pc);
+    if (req) {
+        DCHECK(rk == CONT_PROMISE_TRY, "promise-capability requester: unknown machine kind");
+        js_promise_try_abandon(ctx, req);
+    }
+}
 typedef struct JSPromiseTry {
     JSValue promise;             /* the result promise (owned) */
     JSValue resolving_funcs[2];  /* [resolve, reject] (owned) */
@@ -19392,6 +19428,16 @@ typedef struct JSPromiseTry {
     int nargs;                   /* number of args passed to fn */
     JSValue cb_args[];           /* [this=undefined, fn, arg0..arg(nargs-1)] — owned dups; the tramp reads &cb_args[2] */
 } JSPromiseTry;
+static void js_promise_try_abandon(JSContext *ctx, void *st)
+{
+    JSPromiseTry *s = st;
+    int k;
+    JS_FreeValue(ctx, s->promise);
+    JS_FreeValue(ctx, s->resolving_funcs[0]);
+    JS_FreeValue(ctx, s->resolving_funcs[1]);
+    for (k = 0; k < s->nargs + 2; k++) JS_FreeValue(ctx, s->cb_args[k]);
+    js_free_rt(ctx->rt, s);
+}
 static bool tramp_can_call_promise_try(JSValueConst func, JSValueConst recv, JSValueConst *call_argv, int call_argc);
 /* String.prototype.replace/replaceAll: a step machine. It holds a StringBuffer + endOfLastMatch across each
    callback, so replaceAll's loop is preemptible at every callback boundary and the replacer's body at every
@@ -19598,10 +19644,13 @@ static void js_from_ctor_abandon(JSContext *ctx, void *st)
    with a JSStepHdr. Freeing them through the step chain reads their first JSValue field as a JSTrampStepDef * and
    calls through it — the same crash the consume-abandon comment records, and what a blanket
    tramp_step_chain_free here produced: the suite died without printing a line. */
+struct JSPromiseCap;
+static void js_promise_cap_requester_abandon(JSContext *ctx, void *st);   /* declared with its record */
 static void js_construct_requester_abandon(JSContext *ctx, void *outer, uint8_t kind)
 {
     if (!outer)
         return;
+    if (kind == CONT_PROMISE_CAP) { js_promise_cap_requester_abandon(ctx, outer); return; }
     if (kind == CONT_FROM_CTOR) { js_from_ctor_abandon(ctx, outer); return; }
     if (kind == CONT_ITER_CONSUME_FWD) { js_iter_consume_abandon(ctx, outer); return; }   /* declared later; the alias is asserted equal */
     DCHECK(kind == CONT_STEP, "construct requester: unknown machine kind");
@@ -19955,6 +20004,8 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_PROXY_CONSTRUCT:
     case CONT_INSTANCEOF:
     case CONT_PROMISE_EXEC:
+    case CONT_PROMISE_TRY_SETTLE:
+    case CONT_PROMISE_CAP:
     case CONT_PROMISE_TRY:
     case CONT_STEP:
     case CONT_IMPORT:
@@ -21846,6 +21897,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     void *cd_outer = NULL;                              /* do_cont_dispatch: the sequence awaiting the call's result */
     uint8_t cd_outer_kind = CONT_NONE;
     uint8_t tp_outer_kind = CONT_NONE;
+    /* NewPromiseCapability in flight: the ctor to construct, the machine waiting, and the [promise, resolve,
+       reject] the delivery hands it. Registers rather than a state field because the request is issued and
+       consumed at one point each, exactly like the consume-acquire's. */
+    JSValueConst tramp_cap_ctor = JS_UNDEFINED;
+    void *tramp_cap_outer = NULL; uint8_t tramp_cap_kind = CONT_NONE;
+    JSValue tramp_cap_promise = JS_UNDEFINED;
+    JSValue tramp_cap_funcs[2] = { JS_UNDEFINED, JS_UNDEFINED };
     uint8_t tramp_forawait_wrap = 0;                    /* the acquire about to run is `for await`'s SYNC branch: its iterator gets CreateAsyncFromSyncIterator before the enum_rec */
     int tramp_cont_forof = 0;                           /* CONT_FOROF_NEXT: the enum_rec stack offset for the .next() drive about to be pushed. Rides the frame's forof_off (read+reset in do_tramp_call) so no per-iteration heap state is allocated for what is one int. */
     int tramp_gen_forof = 1;                            /* <0 = for-of iterator stack offset (always -3-.. ); 1 = direct .next() (no valid offset is positive) */
@@ -23005,22 +23063,93 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
 
+        do_promise_cap_tramp:
+            /* NewPromiseCapability(C). For the native Promise there is no user code in it at all — a different
+               algorithm, not a fallback — so it completes in place. For a SUBCLASS the Construct is the page's
+               constructor, which js_new_promise_capability ran with JS_CallConstructor from C: the ONE thing that
+               made every capability consumer unsuspendable. Inputs: tramp_cap_ctor (borrowed), tramp_cap_outer /
+               _kind naming the machine that will receive [promise, resolve, reject]. */
+            {
+                JSValueConst capc = tramp_cap_ctor;
+                JSPromiseCap *pc;
+                if (JS_IsUndefined(capc) || js_same_value(ctx, capc, ctx->promise_ctor)) {
+                    tramp_cap_promise = js_promise_new(ctx, JS_UNDEFINED, tramp_cap_funcs);
+                    if (unlikely(JS_IsException(tramp_cap_promise))) goto do_promise_cap_abrupt;
+                    goto do_promise_cap_deliver;
+                }
+                pc = js_malloc_rt(rt, sizeof(*pc));
+                if (unlikely(!pc)) { JS_ThrowOutOfMemory(ctx); goto do_promise_cap_abrupt; }
+                pc->executor = js_promise_executor_new(ctx);
+                if (unlikely(JS_IsException(pc->executor))) { js_free_rt(rt, pc); goto do_promise_cap_abrupt; }
+                pc->ctor = js_dup(capc);
+                pc->outer = tramp_cap_outer; pc->outer_kind = tramp_cap_kind;
+                tramp_cap_ctor = JS_UNDEFINED; tramp_cap_outer = NULL; tramp_cap_kind = CONT_NONE;
+                con_func = pc->ctor; con_ntgt = pc->ctor;
+                con_args = (JSValueConst *)&pc->executor; con_argc = 1; con_cargc = 0;   /* the caller's stack is untouched */
+                con_from_super = 0; con_super_ref = JS_UNDEFINED;
+                con_outer = pc; con_outer_kind = CONT_PROMISE_CAP;
+                tramp_first = 0; tramp_is_tail = 0;
+                cont_st = pc;   /* the abandon paths read it */
+                goto do_construct_dispatch;
+            }
+
+        do_promise_cap_ctor_deliver:
+            /* the subclass constructor returned (ret_val). 27.2.1.5 steps 4-5: both resolving functions the
+               executor captured must be callable. */
+            {
+                JSPromiseCap *pc = cont_st;
+                JSCFunctionDataRecord *cd = JS_GetOpaque(pc->executor, JS_CLASS_C_FUNCTION_DATA);
+                tramp_cap_outer = pc->outer; tramp_cap_kind = pc->outer_kind;
+                if (unlikely(check_function(ctx, cd->data[0]) || check_function(ctx, cd->data[1]))) {
+                    JS_FreeValue(ctx, ret_val);
+                    js_promise_cap_abandon(ctx, pc);
+                    cont_st = NULL;
+                    goto do_promise_cap_abrupt;
+                }
+                tramp_cap_funcs[0] = js_dup(cd->data[0]);
+                tramp_cap_funcs[1] = js_dup(cd->data[1]);
+                tramp_cap_promise = ret_val;
+                ret_val = JS_UNDEFINED;
+                js_promise_cap_abandon(ctx, pc);
+                cont_st = NULL;
+            }
+            /* fall through */
+        do_promise_cap_deliver:
+            /* the capability exists: tramp_cap_promise + tramp_cap_funcs, and tramp_cap_outer/_kind say who asked.
+               Reached identically whether the Construct ran user code or there was none to run. */
+            DCHECK(tramp_cap_kind == CONT_PROMISE_TRY,
+                   "promise-capability requester: unknown machine kind");
+            goto do_promise_try_have_cap;
+
+        do_promise_cap_abrupt:
+            /* the capability could not be built (the constructor threw, a resolving function is not callable, OOM).
+               The machine that asked can never run, so it goes with the throw — through its own teardown. */
+            {
+                void *cq = tramp_cap_outer; uint8_t ck9 = tramp_cap_kind;
+                tramp_cap_outer = NULL; tramp_cap_kind = CONT_NONE;
+                tramp_cap_ctor = JS_UNDEFINED;
+                if (cq) {
+                    DCHECK(ck9 == CONT_PROMISE_TRY, "promise-capability requester: unknown machine kind");
+                    js_promise_try_abandon(ctx, cq);
+                }
+                goto exception;
+            }
+
         do_promise_try_tramp:
-            /* Promise.try(fn, ...args): create the capability, then drive fn(...args) on THIS chain so a loop in fn
-               parks. call_argv[-2] = the constructor C, [0] = fn, [1..] = args. The fn-call operands are dup'd into
-               the state (like the executor's cb_args) so the ORIGINAL Promise.try operands stay put for the finish
-               to pop. do_return -> do_promise_try_finish resolves with fn's return; the exception arm rejects. */
+            /* Promise.try(fn, ...args): ask for the capability, then drive fn(...args) on THIS chain so a loop in
+               fn parks. call_argv[-2] = the constructor C, [0] = fn, [1..] = args. The fn-call operands are dup'd
+               into the state (like the executor's cb_args) so the ORIGINAL Promise.try operands stay put for the
+               finish to pop. The state is built FIRST and the capability request names it, because the Construct
+               can suspend — nothing that must survive it may sit in an interpreter local. */
             {
                 JSValueConst thisv = crecv;
                 JSValueConst fn = call_argv[0];
                 int nargs = call_argc - 1;
                 JSPromiseTry *s;
-                JSValue rp;
                 s = js_malloc_rt(rt, sizeof(*s) + (size_t)(nargs + 2) * sizeof(JSValue));
                 if (unlikely(!s)) { JS_ThrowOutOfMemory(ctx); goto exception; }
-                rp = js_new_promise_capability(ctx, s->resolving_funcs, thisv);
-                if (JS_IsException(rp)) { js_free_rt(rt, s); goto exception; }
-                s->promise = rp;
+                s->promise = JS_UNDEFINED;
+                s->resolving_funcs[0] = JS_UNDEFINED; s->resolving_funcs[1] = JS_UNDEFINED;
                 s->nargs = nargs;
                 TAKE_CALL_SHAPE(); s->orig_cfirst = call_first_r; s->orig_cargc = call_pop; s->orig_is_tail = tramp_is_tail;
                 s->cb_args[0] = JS_UNDEFINED;          /* thisArgument for fn is undefined */
@@ -23031,28 +23160,57 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     free_arg_list(ctx, call_args_owned, call_args_owned_n);
                     call_args_owned = NULL; call_args_owned_n = 0;
                 }
-                call_argv = (JSValueConst *)&s->cb_args[2]; call_argc = nargs; tramp_first = -2; tramp_is_tail = 0;
+                tramp_cap_ctor = thisv; tramp_cap_outer = s; tramp_cap_kind = CONT_PROMISE_TRY;
+                goto do_promise_cap_tramp;
+            }
+
+        do_promise_try_have_cap:
+            {
+                JSPromiseTry *s = tramp_cap_outer;
+                tramp_cap_outer = NULL; tramp_cap_kind = CONT_NONE;
+                s->promise = tramp_cap_promise; tramp_cap_promise = JS_UNDEFINED;
+                s->resolving_funcs[0] = tramp_cap_funcs[0]; tramp_cap_funcs[0] = JS_UNDEFINED;
+                s->resolving_funcs[1] = tramp_cap_funcs[1]; tramp_cap_funcs[1] = JS_UNDEFINED;
+                call_argv = (JSValueConst *)&s->cb_args[2]; call_argc = s->nargs;
+                tramp_first = -2; tramp_is_tail = 0;
+                call_cfirst = 0; call_cargc = 0;   /* the arguments are the state's own buffer */
                 tramp_cont_state = s; tramp_cont_kind = CONT_PROMISE_TRY;
-                goto do_tramp_call;   /* bytecode fn: its body runs on THIS chain and can park */
+                goto do_generic_callee;   /* fn of ANY kind: which one is the convergence point's question */
             }
 
         do_promise_try_finish:
-            /* fn returned (or, via the exception arm, threw). ret_val is fn's completion: resolve the promise with a
-               normal value, or the exception arm rejects with an abrupt one; either way yield the promise (pop the
-               ORIGINAL Promise.try operands). A throwing resolve/reject DOES propagate (Call is a ? step). */
+            /* fn returned. ret_val is its completion, and resolve(value) is the CAPABILITY's resolve — a subclass
+               that wraps its resolving functions makes that the page's code, so it goes to the convergence point
+               like every other call rather than a JS_Call from here. The call's operands go ABOVE the original
+               Promise.try operands, which the settle's delivery pops afterwards. A throwing resolve DOES
+               propagate (Call is a ? step), which is what the frame unwind's CONT_PROMISE_TRY_SETTLE arm owes. */
             {
                 JSPromiseTry *ps = ptry_finish_state;
-                JSValue r = ps->promise, rr;
+                ptry_finish_state = NULL;
+                DCHECK(sp + 3 <= TRAMP_SP_LIMIT(sf),
+                       "Promise.try settle: operand push exceeds the frame's compiled stack_size");
+                *sp++ = JS_UNDEFINED;                       /* this */
+                *sp++ = js_dup(ps->resolving_funcs[0]);     /* resolve */
+                *sp++ = ret_val; ret_val = JS_UNDEFINED;    /* the value (owned, transferred) */
+                call_argv = sp - 1; call_argc = 1; tramp_first = -2; tramp_is_tail = 0;
+                tramp_cont_state = ps; tramp_cont_kind = CONT_PROMISE_TRY_SETTLE;
+                goto do_generic_callee;
+            }
+
+        do_promise_try_settled:
+            /* resolve returned (its result is discarded): release the state and yield the promise, popping the
+               ORIGINAL Promise.try operands. ret_val is resolve's result and `sp` is already back to those
+               operands — the settle call's own were dropped by whichever delivery got here. */
+            {
+                JSPromiseTry *ps = cont_st;
+                JSValue r = ps->promise;
                 int cfirst = ps->orig_cfirst, cargc = ps->orig_cargc; uint8_t itail = ps->orig_is_tail;
                 JSValue *cargv = sp - cargc;
-                ptry_finish_state = NULL;
-                rr = JS_Call(ctx, ps->resolving_funcs[0], JS_UNDEFINED, 1, vc(&ret_val));
+                cont_st = NULL;
                 JS_FreeValue(ctx, ret_val);
                 for (i = 0; i < ps->nargs + 2; i++) JS_FreeValue(ctx, ps->cb_args[i]);
                 JS_FreeValue(ctx, ps->resolving_funcs[0]); JS_FreeValue(ctx, ps->resolving_funcs[1]);
                 js_free_rt(rt, ps);
-                if (unlikely(JS_IsException(rr))) { JS_FreeValue(ctx, r); goto exception; }
-                JS_FreeValue(ctx, rr);
                 for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
                 sp += cfirst - cargc;
                 if (itail) { ret_val = r; goto do_return; }
@@ -23277,6 +23435,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         uint8_t ckind = con_outer_kind;
                         cont_st = con_outer;
                         con_outer = NULL; con_outer_kind = CONT_NONE;
+                        if (ckind == CONT_PROMISE_CAP) {
+                            /* a C constructor (or a subclass whose body had nothing to suspend) ran in place. */
+                            if (unlikely(JS_IsException(ret_val))) {
+                                JSPromiseCap *pc9 = cont_st;
+                                tramp_cap_outer = pc9->outer; tramp_cap_kind = pc9->outer_kind;
+                                JS_FreeValue(ctx, pc9->executor); JS_FreeValue(ctx, pc9->ctor);
+                                js_free_rt(rt, pc9);
+                                cont_st = NULL;
+                                goto do_promise_cap_abrupt;
+                            }
+                            goto do_promise_cap_ctor_deliver;
+                        }
                         if (ckind == CONT_FROM_CTOR) {
                             if (unlikely(JS_IsException(ret_val))) {
                                 js_from_ctor_abandon(ctx, cont_st);
@@ -24005,6 +24175,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (unlikely(JS_IsException(ret_val))) goto exception;
                         js_iternext_deliver(ctx, sp, ret_val);
                         BREAK;
+                    }
+                    if (dck == CONT_PROMISE_TRY_SETTLE) {
+                        /* a C resolve (the native capability's) called in place. */
+                        JSValue *cargv;
+                        int pop, first;
+                        TAKE_CALL_SHAPE(); pop = call_pop; first = call_first_r;
+                        cargv = sp - pop;
+                        for (i = first; i < pop; i++) JS_FreeValue(ctx, cargv[i]);
+                        sp += first - pop;
+                        if (unlikely(JS_IsException(ret_val))) { js_promise_try_abandon(ctx, dcs); goto exception; }
+                        cont_st = dcs;
+                        goto do_promise_try_settled;
                     }
                     if (dck == CONT_PROMISE_EXEC) {
                         /* a C, bound or proxied executor called in place: steps 10-11 are the ONE completion the
@@ -27961,6 +28143,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         JS_FreeValue(ctx, super_ref);
                         cont_st = couter;
                         if (couter_kind == CONT_ITER_CONSUME) goto do_iter_consume_step;
+                        if (couter_kind == CONT_PROMISE_CAP) goto do_promise_cap_ctor_deliver;
                         if (couter_kind == CONT_FROM_CTOR) goto do_from_ctor_deliver;
                         DCHECK(couter_kind == CONT_STEP, "construct outer continuation: unknown machine kind");
                         goto do_step_step;
@@ -27977,6 +28160,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 } else if (dlv_ck == CONT_PROMISE_EXEC) {
                     pexec_finish_state = dlv_cs;
                     goto do_promise_exec_finish;   /* ONE completion, shared with the inline-executor path */
+                } else if (dlv_ck == CONT_PROMISE_TRY_SETTLE) {
+                    JSValue *scargv = sp - dlv_cargc;
+                    for (i = dlv_cfirst; i < dlv_cargc; i++) JS_FreeValue(ctx, scargv[i]);
+                    sp += dlv_cfirst - dlv_cargc;
+                    cont_st = dlv_cs;
+                    goto do_promise_try_settled;
                 } else if (dlv_ck == CONT_PROMISE_TRY) {
                     ptry_finish_state = dlv_cs;
                     goto do_promise_try_finish;   /* fn returned: resolve the promise with its value */
@@ -31662,28 +31851,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JS_FreeValue(ctx, rr);
             *sp++ = r;
             BREAK;
+        } else if (xck == CONT_PROMISE_TRY_SETTLE) {
+            /* the capability's resolve THREW. 27.2.6's Call is a `?` step, so the throw propagates rather than
+               settling anything; the state can never be reached again. Its operands are on the caller stack and
+               the caller's own catch-search frees them, like any method call. */
+            js_promise_try_abandon(ctx, xcs);
+            xcs = NULL;
+            goto exception;
         } else if (xck == CONT_PROMISE_TRY) {
             /* Promise.try's fn threw: reject the promise with the abrupt value and yield it (Promise.try returns a
-               rejected promise, never raises) — the same shape as the executor. */
+               rejected promise, never raises). reject is the CAPABILITY's, which a subclass may have wrapped in
+               its own bytecode, so it takes the SAME settle route the resolve does — one call site for both, with
+               the completion selecting which resolving function. The frame is already popped and sp is back at the
+               original operands; the settle call's own go above them. */
             JSPromiseTry *ps = xcs;
-            JSValue err = JS_GetException(ctx), rr;
-            JSValue r = ps->promise;
-            int cfirst = ps->orig_cfirst, cargc = ps->orig_cargc; uint8_t itail = ps->orig_is_tail;
-            JSValue *cargv;
-            rr = JS_Call(ctx, ps->resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
-            JS_FreeValue(ctx, err);
-            for (i = 0; i < ps->nargs + 2; i++) JS_FreeValue(ctx, ps->cb_args[i]);
-            JS_FreeValue(ctx, ps->resolving_funcs[0]);
-            JS_FreeValue(ctx, ps->resolving_funcs[1]);
-            js_free_rt(rt, ps);
-            cargv = sp - cargc;
-            for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
-            sp += cfirst - cargc;
-            if (unlikely(JS_IsException(rr))) { JS_FreeValue(ctx, r); JS_FreeValue(ctx, rr); goto exception; }
-            JS_FreeValue(ctx, rr);
-            if (itail) { ret_val = r; goto do_return; }
-            *sp++ = r;
-            BREAK;
+            JSValue err = JS_GetException(ctx);
+            DCHECK(sp + 3 <= TRAMP_SP_LIMIT(sf),
+                   "Promise.try reject: operand push exceeds the frame's compiled stack_size");
+            *sp++ = JS_UNDEFINED;                       /* this */
+            *sp++ = js_dup(ps->resolving_funcs[1]);     /* reject */
+            *sp++ = err;                                /* the abrupt value (owned, transferred) */
+            call_argv = sp - 1; call_argc = 1; tramp_first = -2; tramp_is_tail = 0;
+            tramp_cont_state = ps; tramp_cont_kind = CONT_PROMISE_TRY_SETTLE;
+            goto do_generic_callee;
         } else if (xck == CONT_GETPROP) {
             cont_st = xcs;
             goto do_getprop_abandon;
@@ -31750,7 +31940,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             if (cs->outer) {
                 /* the machine that requested this construct is abandoned with it — otherwise its collected array,
                    iterator and callback state leak on every throwing constructor. */
-                if (cs->outer_kind == CONT_FROM_CTOR) {
+                if (cs->outer_kind == CONT_PROMISE_CAP) {
+                    js_promise_cap_requester_abandon(ctx, cs->outer);
+                } else if (cs->outer_kind == CONT_FROM_CTOR) {
                     js_from_ctor_abandon(ctx, cs->outer);
                 } else if (cs->outer_kind == CONT_ITER_CONSUME) {
                     js_iter_consume_end(ctx, (struct JSIterConsume *)cs->outer);
