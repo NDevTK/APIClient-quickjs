@@ -21855,6 +21855,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         tramp_apply_argv = NULL; tramp_apply_argc = 0;                                   \
         tramp_apply_func = JS_UNDEFINED; tramp_apply_this = JS_UNDEFINED;                \
     } while (0)
+
+/* A consume machine's operand shape AND its requester, in one place, because they are one decision. A CALL that
+   came from a SEQUENCE (a step machine's request) carries its operands in the sequence's OWN buffer and names the
+   sequence in tramp_cont_state — so the consume owes its result to that machine, not to a caller stack it does
+   not own, and the shape it records is empty. This is the CALL side of what the construct arms do with con_outer;
+   without it `Reflect.apply(Array.from, null, [gen])` had the sequence consumed by the machine's first .next()
+   drive and pushed its array onto a stack belonging to someone else. */
+#define CONSUME_ADOPT_SHAPE(st_) do {                                                   \
+    void *cq_ = (tramp_cont_kind == CONT_STEP) ? tramp_cont_state : NULL;               \
+    TAKE_CALL_SHAPE();                                                                  \
+    (st_)->outer = cq_; (st_)->outer_kind = cq_ ? CONT_STEP : CONT_NONE;                \
+    (st_)->orig_cfirst  = cq_ ? 0 : call_first_r;                                       \
+    (st_)->orig_cargc   = cq_ ? 0 : call_pop;                                           \
+    (st_)->orig_is_tail = cq_ ? 0 : tramp_is_tail;                                      \
+    if (cq_) { tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE; }                  \
+} while (0)
     uint8_t iterterm_kind = 0;                          /* Iterator.prototype terminal recognition: ITERTERM_* (consumed by do_iterterm_tramp) */
     int ta_from = 0;                                    /* 1 = TypedArray.from(gen) (OP_call_method): new_target is this_val at call_argv[-2], not call_argv[-1] */
     int pa_magic = 0;                                   /* Promise.all/allSettled(gen) recognition: the PROMISE_MAGIC (read at OP_call_method, consumed by do_promise_all_consume_tramp) */
@@ -22497,13 +22513,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        fix — the machine builds its own argument block, which is the only thing the route existed
                        for — but doing so sends a CONSUMER target (Reflect.apply(Array.from, …)) into
                        do_consumer_dispatch from a SEQUENCE's call, which assumes caller-stack operands and says
-                       so by name. That capability is what has to be built before this goes.
-                       The CONSTRUCT side of exactly this is now BUILT and its route is gone: a consume state
-                       carries outer/outer_kind, records the empty operand shape when it has one, and delivers to
-                       the machine that asked; con_outer has one owner, released where every abrupt path
-                       converges. The call side needs the same at do_consumer_dispatch's creation sites, reading
-                       cd_outer where the construct arms read con_outer. Then this route and Reflect.apply's go
-                       together, and build_arg_list stops running page code from C. */
+                       so by name.
+                       That capability is now MOSTLY built. A consume state adopts the requester through
+                       CONSUME_ADOPT_SHAPE, and a sequence's call reaches the consumer recognizers at all —
+                       do_cont_dispatch jumped PAST them to do_generic_callee, so a sequence was the one spelling
+                       that never asked, and `Set.prototype.isSubsetOf.apply(s, [t])` hit the consume builtin's
+                       own DFAIL. Deleting this route and Reflect.apply's takes ten aborting fixtures to two, and
+                       both are the same remaining case: `.apply` whose TARGET is a generator or async-generator
+                       method (`g.next.apply(g, [])`), which returns through the bodyless-callee delivery carrying
+                       a caller-stack shape it does not own. That drive needs the cont-consume shape the
+                       operator's own generator-via-apply reshape hands it, and then both routes go. */
                     JSValueConst aa = (call_argc >= 2) ? call_argv[1] : JS_UNDEFINED;
                     int atag = JS_VALUE_GET_TAG(aa);
                     if (atag == JS_TAG_UNDEFINED || atag == JS_TAG_NULL || atag == JS_TAG_OBJECT) {
@@ -22513,13 +22532,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         tramp_is_tail = (opcode == OP_tail_call_method); goto do_apply_tramp;
                     }
                 }
-                /* `Reflect.construct(f, src[, nt])` has NO route here. The reshape existed only because the
-                   arguments come from a LIST that must never touch the operand stack, and the machine builds its
-                   own block for exactly that reason — it was the redundant twin. Keeping it meant the syntactic
-                   spelling collected with build_arg_list from C, running the source's `length` and element
-                   getters in an activation with no flow base, while the same source through a bound
-                   Reflect.construct collected on the tramp: one builtin answering differently by how it was
-                   written. */
                 if (tramp_is_reflect_apply(call_argv[-1]) && call_argc >= 3
                     && JS_VALUE_GET_TAG(call_argv[0]) == JS_TAG_OBJECT
                     && JS_VALUE_GET_OBJ(call_argv[0])->class_id == JS_CLASS_PROXY) {
@@ -24332,7 +24344,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 tramp_cont_state = cd_outer; tramp_cont_kind = cd_outer_kind;
                 cd_outer = NULL; cd_outer_kind = CONT_NONE;
                 call_cfirst = 0; call_cargc = 0;
-                goto do_generic_callee;
+                /* through the CONSUMER recognizers, not past them. An opcode's call reaches them because
+                   OP_call/OP_call_method converge on do_consumer_dispatch, and this label jumped straight to
+                   do_generic_callee — so a sequence's call was the one spelling that never asked, and
+                   `Set.prototype.isSubsetOf.apply(s, [t])` reached the consume builtin's own DFAIL. */
+                goto do_consumer_dispatch;
             }
 
         do_from_like_tramp:
@@ -24388,7 +24404,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->from_ctor = (sink0 == ITERCONS_FROM) ? js_dup(thisv) : JS_UNDEFINED;
                 s->from_owes_result = (sink0 == ITERCONS_FROM);
                 if (sink0 == ITERCONS_SUMPRECISE) sum_precise_init(&s->sum);
-                TAKE_CALL_SHAPE(); s->orig_cfirst = call_first_r; s->orig_cargc = call_pop; s->orig_is_tail = tramp_is_tail;
+                CONSUME_ADOPT_SHAPE(s);
                 s->args_own = call_args_owned; s->args_own_n = call_args_owned_n;
                 call_args_owned = NULL; call_args_owned_n = 0;
                 /* argc 0 is not a refusal either: `Array.from()` is GetMethod(undefined)'s TypeError, which the
@@ -24430,7 +24446,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->k = 0;
                 s->sink = ITERCONS_ITERTERM;
                 s->setop = iterterm_kind;
-                TAKE_CALL_SHAPE(); s->orig_cfirst = call_first_r; s->orig_cargc = call_pop; s->orig_is_tail = tramp_is_tail;
+                CONSUME_ADOPT_SHAPE(s);
                 s->args_own = call_args_owned; s->args_own_n = call_args_owned_n;
                 call_args_owned = NULL; call_args_owned_n = 0;
                 cont_st = s;
@@ -24470,7 +24486,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->k = 1;                     /* isSupersetOf: found-so-far = true (unused by the other two) */
                 s->sink = ITERCONS_SETOP;
                 s->setop = setop_kind;
-                TAKE_CALL_SHAPE(); s->orig_cfirst = call_first_r; s->orig_cargc = call_pop; s->orig_is_tail = tramp_is_tail;
+                CONSUME_ADOPT_SHAPE(s);
                 s->args_own = call_args_owned; s->args_own_n = call_args_owned_n;
                 call_args_owned = NULL; call_args_owned_n = 0;
                 /* A real Set answers `size` from its own record count with no read at all — the spec's own
@@ -24519,6 +24535,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s = js_mallocz(ctx, sizeof(*s));
                 if (unlikely(!s)) { JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED;
                                     JS_ThrowOutOfMemory(ctx); goto exception; }
+                /* Iterator.from's state is a JSIterFrom, not a consume — it has its own finish, so it does not
+                   take the shared adoption yet. A sequence's Iterator.from is the next one to convert. */
                 TAKE_CALL_SHAPE(); s->orig_cfirst = call_first_r; s->orig_cargc = call_pop; s->orig_is_tail = tramp_is_tail;
                 s->args_own = call_args_owned; s->args_own_n = call_args_owned_n;
                 call_args_owned = NULL; call_args_owned_n = 0;
@@ -25438,7 +25456,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->k = 0;
                 s->sink = ITERCONS_GROUPBY;
                 s->setop = groupby_kind;
-                TAKE_CALL_SHAPE(); s->orig_cfirst = call_first_r; s->orig_cargc = call_pop; s->orig_is_tail = tramp_is_tail;
+                CONSUME_ADOPT_SHAPE(s);
                 s->args_own = call_args_owned; s->args_own_n = call_args_owned_n;
                 call_args_owned = NULL; call_args_owned_n = 0;
                 tramp_consume_iterable = (call_argc >= 1) ? call_argv[0] : JS_UNDEFINED;
@@ -25458,7 +25476,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->r = obj;
                 s->k = 0;
                 s->sink = ITERCONS_OBJENTRIES;
-                TAKE_CALL_SHAPE(); s->orig_cfirst = call_first_r; s->orig_cargc = call_pop; s->orig_is_tail = tramp_is_tail;
+                CONSUME_ADOPT_SHAPE(s);
                 s->args_own = call_args_owned; s->args_own_n = call_args_owned_n;
                 call_args_owned = NULL; call_args_owned_n = 0;
                 /* argc 0 means the source is UNDEFINED, which the acquire turns into GetIterator's TypeError —
