@@ -19211,10 +19211,6 @@ typedef struct TrampFrame {
                                   still satisfy the target's non-configurable invariants, so the check rides a
                                   continuation and runs at do_return, before the result is placed. */
 typedef struct JSProxyGet { JSValue target; JSAtom atom; } JSProxyGet;
-#define CONT_PROXY_HAS     7   /* cont_state = JSProxyGet: a trampolined proxy [[HasProperty]] trap. It needs exactly
-                                  what [[Get]]'s continuation needs — (target, key) carried across the call, because
-                                  9.5.7 step 9's invariant runs on the trap's RESULT — so it shares the state and
-                                  differs only in the post-check and in placing a BOOLEAN (ToBoolean of the result). */
 #define CONT_PROXY_DELETE 15   /* cont_state = JSProxyDelete: a trampolined proxy [[Delete]] trap. Same (target, key)
                                   post-check shape as [[HasProperty]], plus the STRICTNESS of the deleting code — a
                                   `false` result throws in strict mode, and the strictness belongs to the frame that
@@ -19307,6 +19303,19 @@ typedef struct JSGetProp {
 /* 10.5.11 steps 8-22 applied to the trap's result, then CreateArrayFromList over the validated keys — the
    answer GP_OWNKEYS delivers. CONSUMES prop_array. */
 static JSValue js_proxy_ownkeys_result(JSContext *ctx, JSValueConst proxy, JSValue prop_array);
+
+#define CONT_OP_KEYED      32  /* cont_state = JSOpKeyed: a keyed operation requested by a BYTECODE OPERATOR rather
+                                  than by a step machine — `k in obj`. The operator is the one consumer whose answer
+                                  goes on the OPERAND STACK instead of into a machine, so all this carries is the
+                                  key it owns and how many operands the answer replaces. Everything else — which
+                                  trap, whether the handler is a Proxy, which kind of callee the trap is, the
+                                  invariant on its result — is the one entry's, which is the point: the operator had
+                                  its OWN copy of the proxy algorithm (js_tramp_proxy_has) that read the trap from C
+                                  and dropped every C, bound or proxied trap back to a C drive. */
+typedef struct JSOpKeyed {
+    JSAtom atom;      /* the ToPropertyKey'd key (owned) */
+    uint8_t pop;      /* operands the answer replaces */
+} JSOpKeyed;
 
 #define CONT_TRAP_GET      31  /* cont_state = JSTrapGet: the READ of a Proxy handler's own trap property.
                                   GetMethod(handler, "get"/"set"/"ownKeys"/…) is an ordinary [[Get]] on an
@@ -19912,7 +19921,6 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_ITER_HELPER:
     case CONT_ITER_FROM:
     case CONT_PROXY_GET:
-    case CONT_PROXY_HAS:
     case CONT_PROXY_DELETE:
     case CONT_PROXY_SET:
     case CONT_PROXY_CONSTRUCT:
@@ -19931,6 +19939,7 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_ITER_CLOSE_CALL:
     case CONT_ITER_NEXT_OP:
     case CONT_TRAP_GET:
+    case CONT_OP_KEYED:
         break;
     }
 }
@@ -21195,47 +21204,6 @@ static int js_tramp_proxy_get(JSContext *ctx, JSValueConst obj, JSAtom atom, JSV
     out[2] = js_dup(s->target);
     out[3] = keyval;
     out[4] = js_dup(receiver);
-    return 1;
-}
-/* PROXY [[HasProperty]]: `key in proxy`. Same shape as [[Get]] — reshape the operator's two operands into the
-   method-call shape [handler, trap, target, key] so the trap's body runs on THIS chain and its one result lands in
-   the slot the `in` result belongs in. `sp` points just past the operands: sp[-2] = key, sp[-1] = the proxy; on
-   success sp[-2..1] are the reshaped operands (the caller advances sp by 2). Returns 1 when it routed, 0 to fall
-   through to the C path (no trap, or a C/bound trap with no preemptible body), -1 on a pending exception. */
-static int js_tramp_proxy_has(JSContext *ctx, JSValue *sp, void **out_cont)
-{
-    JSProxyData *s;
-    JSValue method, keyval, target, handler;
-    JSAtom atom;
-    JSProxyGet *pg;
-    if (JS_VALUE_GET_TAG(sp[-1]) != JS_TAG_OBJECT
-        || JS_VALUE_GET_OBJ(sp[-1])->class_id != JS_CLASS_PROXY) return 0;
-    s = get_proxy_method(ctx, &method, sp[-1], JS_ATOM_has);
-    if (!s) return -1;                       /* revoked / handler get threw */
-    if (JS_IsUndefined(method) || !tramp_can_call(method)) {
-        JS_FreeValue(ctx, method);
-        return 0;
-    }
-    /* ToPropertyKey the operand FIRST: it can run user code (@@toPrimitive) and throw, and it is the value the
-       trap must be handed — the raw operand would pass `1` where the spec passes "1". */
-    atom = JS_ValueToAtom(ctx, sp[-2]);
-    if (unlikely(atom == JS_ATOM_NULL)) { JS_FreeValue(ctx, method); return -1; }
-    keyval = JS_AtomToValue(ctx, atom);
-    if (JS_IsException(keyval)) { JS_FreeAtom(ctx, atom); JS_FreeValue(ctx, method); return -1; }
-    pg = js_malloc(ctx, sizeof(*pg));
-    if (!pg) { JS_FreeAtom(ctx, atom); JS_FreeValue(ctx, keyval); JS_FreeValue(ctx, method); return -1; }
-    /* own refs BEFORE the proxy operand is released: s points into the proxy's own data */
-    target = js_dup(s->target);
-    handler = js_dup(s->handler);
-    pg->target = js_dup(target);
-    pg->atom = atom;                         /* owned, transferred */
-    *out_cont = pg;
-    JS_FreeValue(ctx, sp[-2]);               /* the raw key operand: replaced by the canonical key value */
-    JS_FreeValue(ctx, sp[-1]);               /* the proxy itself is not an argument to `has` */
-    sp[-2] = handler;                        /* [-2] this = handler */
-    sp[-1] = method;                         /* [-1] the trap (owned) */
-    sp[0]  = target;                         /* [0]  target */
-    sp[1]  = keyval;                         /* [1]  key */
     return 1;
 }
 /* PROXY [[Delete]]: `delete proxy[key]`. Identical reshape to [[HasProperty]] — [handler, trap, target, key] — but
@@ -24917,6 +24885,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                           gp_trapst = tg;
                           goto do_getprop_tramp;
                       }
+                      if (gk == CONT_OP_KEYED) {
+                          /* a bytecode OPERATOR's keyed operation, answered with nothing suspended. Its operands
+                             are still where the operator left them (the request's own arguments never touch the
+                             caller's stack), so the answer simply replaces them. */
+                          JSOpKeyed *ok = gouter0;
+                          int npop = ok->pop;
+                          JS_FreeAtom(ctx, ok->atom); js_free_rt(rt, ok);
+                          while (npop-- > 0) JS_FreeValue(ctx, *--sp);
+                          *sp++ = ret_val;
+                          BREAK;
+                      }
                       if (gk == CONT_ACQUIRE_GET) {
                           /* the read invoked nothing (a data @@iterator, a primitive source, a nullish one whose
                              TypeError went to getprop_throw): re-enter the acquire with the method in hand, the
@@ -25029,6 +25008,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         gp_outer = tg->outer; gp_outer_kind = tg->outer_kind;
                         js_trapget_free(ctx, tg);
                         goto getprop_throw;
+                    }
+                    if (gk3 == CONT_OP_KEYED) {
+                        /* the operator's own throw: its operands are still on the stack and belong to the frame's
+                           catch-search, exactly as for any other throwing operator. */
+                        JSOpKeyed *ok = gouter;
+                        JS_FreeAtom(ctx, ok->atom); js_free_rt(rt, ok);
+                        goto exception;
                     }
                     if (gk3 == CONT_ACQUIRE_GET) {
                         /* the @@iterator read threw with nothing suspended (a nullish source's TypeError, a
@@ -27339,9 +27325,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     call_first_r = 0; call_pop = 0;
                     void *gouter = gp->outer;
                     uint8_t gouter_kind = gp->outer_kind;
+                    if (unlikely(JS_IsException(ret_val))) {
+                        /* THE TRAP OR ACCESSOR COMPLETED ABRUPTLY. Every post-check the spec states is
+                           `?`-prefixed on the Call's result, so not one of them runs — and the value must never
+                           reach one: JS_ToBoolFree(JS_EXCEPTION) is TRUE, so `Reflect.has(new Proxy({},
+                           {has: 42}), "a")` reported true and the TypeError vanished. This arrives here rather
+                           than at the abandon only when the callee had no FRAME to unwind (a C trap, a
+                           non-callable one), which is precisely the case each arm below was written without.
+                           One test for all of them, and the throw takes the same per-consumer route an in-place
+                           one does — a consumer still owes IfAbruptCloseIterator, an acquire turns it into an
+                           acquisition failure — which is what that label already knows. */
+                        js_getprop_free(ctx, gp);
+                        gp_outer = gouter; gp_outer_kind = gouter_kind;
+                        goto getprop_throw;
+                    }
                     DCHECK(gouter_kind == CONT_STEP || gouter_kind == CONT_ITER_CONSUME
                            || gouter_kind == CONT_ACQUIRE_GET || gouter_kind == CONT_ITER_CLOSE
-                           || gouter_kind == CONT_TRAP_GET,
+                           || gouter_kind == CONT_TRAP_GET || gouter_kind == CONT_OP_KEYED,
                            "property-get outer continuation: unknown machine kind");
                     if (gouter_kind == CONT_TRAP_GET) {
                         /* a handler's trap property was produced by USER CODE — an accessor on the handler, or a
@@ -27352,6 +27352,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             ret_val = js_proxy_get_invariant(ctx, gp->target, gp->atom, ret_val);
                         js_getprop_free(ctx, gp);
                         if (unlikely(JS_IsException(ret_val))) {
+                            /* the INVARIANT threw (a handler-Proxy's `get` trap lied about a frozen trap slot);
+                               the read itself can no longer be abrupt here. */
                             gp_outer = tg->outer; gp_outer_kind = tg->outer_kind;
                             js_trapget_free(ctx, tg);
                             goto getprop_throw;
@@ -27403,8 +27405,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            check the C hook performs — and the machine is handed the descriptor OBJECT, or
                            undefined when the property is absent. */
                         JSPropertyDescriptor gd;
-                        int gres = JS_IsException(ret_val) ? -1
-                                 : js_proxy_gopd_check(ctx, gp->value, gp->atom, ret_val, &gd);
+                        int gres = js_proxy_gopd_check(ctx, gp->value, gp->atom, ret_val, &gd);
                         ret_val = (gres < 0) ? JS_EXCEPTION : gres ? js_desc_to_object(ctx, &gd) : JS_UNDEFINED;
                     } else if (gp->op == GP_OWNKEYS) {
                         /* the `ownKeys` trap returned its List. 10.5.11 steps 8-22 run on it — the same check the
@@ -27456,6 +27457,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         ret_val = js_proxy_get_invariant(ctx, gp->target, gp->atom, ret_val);
                     }
                     js_getprop_free(ctx, gp);
+                    if (gouter_kind == CONT_OP_KEYED) {
+                        /* a bytecode OPERATOR's keyed operation whose trap suspended. The frame's own operand drop
+                           above has restored sp to exactly where the operator left its operands, so the answer
+                           replaces them — the same placement the in-place arm performs. */
+                        JSOpKeyed *ok = gouter;
+                        int npop = ok->pop;
+                        JS_FreeAtom(ctx, ok->atom); js_free_rt(rt, ok);
+                        if (unlikely(JS_IsException(ret_val))) goto exception;
+                        while (npop-- > 0) JS_FreeValue(ctx, *--sp);
+                        *sp++ = ret_val;
+                        BREAK;
+                    }
                     cont_st = gouter;
                     if (gouter_kind == CONT_ITER_CONSUME) {
                         /* the consume step OWNS the abrupt case: it sets `abrupt` and returns 2 so the shared
@@ -27547,15 +27560,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     ret_val = js_proxy_get_invariant(ctx, pg->target, pg->atom, ret_val);
                     JS_FreeValue(ctx, pg->target); JS_FreeAtom(ctx, pg->atom); js_free_rt(rt, pg);
                     if (unlikely(JS_IsException(ret_val))) goto exception;
-                } else if (rck == CONT_PROXY_HAS) {
-                    /* the proxy `has` trap returned: ToBoolean it, then the target's [[HasProperty]] invariant —
-                       the SAME js_proxy_has_invariant the C path uses — and place the boolean. */
-                    JSProxyGet *pg = rcs;
-                    int hres = js_proxy_has_invariant(ctx, pg->target, pg->atom,
-                                                      JS_ToBoolFree(ctx, ret_val));
-                    JS_FreeValue(ctx, pg->target); JS_FreeAtom(ctx, pg->atom); js_free_rt(rt, pg);
-                    if (unlikely(hres < 0)) goto exception;
-                    ret_val = js_bool(hres);
                 } else if (rck == CONT_PROXY_DELETE) {
                     /* the proxy `deleteProperty` trap returned: ToBoolean, the target's [[Delete]] invariant (the
                        SAME js_proxy_delete_invariant the C path uses), then the strict-mode throw a `false` delete
@@ -30579,23 +30583,28 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
         CASE(OP_in):
             sf->cur_pc = pc;
-            /* PROXY [[HasProperty]]: run the `has` trap on THIS chain so a loop inside it preempts. The reshape
-               leaves [handler, trap, target, key] whose caller_sp IS the slot the `in` result belongs in, so
-               do_return drops the operands and lands the boolean there. */
+            /* ToPropertyKey on the LEFT operand is the page's @@toPrimitive/valueOf/toString, and `in` was the one
+               keyed operator that never joined key_toprim — both js_operator_in and the old proxy reshape reached
+               it through JS_ValueToAtom from C. */
+            if (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT) { tp_slot = -2; tp_retry_pc = pc - 1; goto key_toprim; }
+            /* `k in obj` IS [[HasProperty]], which on a Proxy is the `has` trap and therefore the page's code —
+               and so is the READ of that trap off the handler. Both are the ONE keyed-operation entry's GP_HAS,
+               the same request Reflect.has issues, so every trap kind runs on this chain and the operator holds
+               no proxy algorithm of its own. It used to: js_tramp_proxy_has read the trap from C and routed only
+               a BYTECODE trap, dropping a C, bound, proxied or step-machine one back to js_proxy_has's JS_Call
+               loop — one operator answering differently depending on what the trap happened to be. */
             if (unlikely(JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT
                          && JS_VALUE_GET_OBJ(sp[-1])->class_id == JS_CLASS_PROXY)) {
-                void *ph_cont = NULL;
-                int ph_ret;
-                DCHECK(sp + 2 <= TRAMP_SP_LIMIT(sf),
-                       "proxy has trap: operand reshape exceeds the frame's compiled stack_size");
-                ph_ret = js_tramp_proxy_has(ctx, sp, &ph_cont);
-                if (unlikely(ph_ret < 0)) goto exception;
-                if (ph_ret > 0) {
-                    sp += 2;
-                    call_argv = sp - 2; call_argc = 2; tramp_first = -2; tramp_is_tail = 0;
-                    tramp_cont_state = ph_cont; tramp_cont_kind = CONT_PROXY_HAS;
-                    goto do_tramp_call;
-                }
+                JSOpKeyed *ok;
+                JSAtom katom = JS_ValueToAtom(ctx, sp[-2]);   /* ToPropertyKey, before the trap sees the key */
+                if (unlikely(katom == JS_ATOM_NULL)) goto exception;
+                ok = js_mallocz(ctx, sizeof(*ok));
+                if (unlikely(!ok)) { JS_FreeAtom(ctx, katom); JS_ThrowOutOfMemory(ctx); goto exception; }
+                ok->atom = katom; ok->pop = 2;
+                gp_obj = sp[-1]; gp_atom = katom; gp_op = GP_HAS; gp_val = JS_UNDEFINED;
+                gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
+                gp_outer = ok; gp_outer_kind = CONT_OP_KEYED;
+                goto do_getprop_tramp;
             }
             if (js_operator_in(ctx, sp))
                 goto exception;
@@ -31267,7 +31276,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             if (itail) { ret_val = r; goto do_return; }
             *sp++ = r;
             BREAK;
-        } else if (xck == CONT_PROXY_GET || xck == CONT_PROXY_HAS) {
+        } else if (xck == CONT_PROXY_GET) {
             /* the trap body THREW: the invariant it owed is moot, and its operands are on the caller stack where
                the caller's own catch-search frees them, exactly like a normal method call. */
             JSProxyGet *pg = xcs;
@@ -31292,10 +31301,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             void *gouter = gp->outer;
             uint8_t gk2 = gp->outer_kind;
             DCHECK(!gouter || gk2 == CONT_STEP || gk2 == CONT_ITER_CONSUME || gk2 == CONT_ACQUIRE_GET
-                   || gk2 == CONT_ITER_CLOSE || gk2 == CONT_TRAP_GET,
+                   || gk2 == CONT_ITER_CLOSE || gk2 == CONT_TRAP_GET || gk2 == CONT_OP_KEYED,
                    "property-get outer continuation: unknown machine kind");
             js_getprop_free(ctx, gp);
-            if (gouter && gk2 == CONT_TRAP_GET) {
+            if (gouter && gk2 == CONT_OP_KEYED) {
+                /* a bytecode OPERATOR's trap threw: nothing is waiting on the answer, and the operator's operands
+                   belong to its own frame's catch-search — only the key this state owns is ours to release. */
+                JSOpKeyed *ok = gouter;
+                JS_FreeAtom(ctx, ok->atom); js_free_rt(rt, ok);
+                gouter = NULL;
+            } else if (gouter && gk2 == CONT_TRAP_GET) {
                 /* a handler's trap ACCESSOR (or a handler-Proxy's own `get` trap) threw after suspending. The
                    operation waiting for the trap can never run; the throw unwinds one level and the in-place
                    label finishes it for whatever was waiting on the OPERATION. */
