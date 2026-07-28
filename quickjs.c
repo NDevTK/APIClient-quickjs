@@ -19214,11 +19214,6 @@ typedef struct TrampFrame {
 #define CONT_PROXY_CONSTRUCT 23 /* cont_state = NULL: a trampolined proxy [[Construct]] trap. The only thing it owes
                                   after the call is 9.5.14 step 13 — the trap's result MUST be an object — so the
                                   continuation carries no state, only the obligation. */
-#define CONT_PROXY_SET     6   /* cont_state = JSProxySet: a trampolined proxy [[Set]] trap. Carries (target, key)
-                                  like the others PLUS the written VALUE, because 9.5.9 step 11's invariant is a
-                                  SameValue against it, and the write's strictness. The trap's boolean is consumed
-                                  here and NOTHING is placed — a property write yields no value, like CONT_SETTER. */
-typedef struct JSProxySet { JSValue target; JSValue value; JSAtom atom; bool throw_on_false; } JSProxySet;
 static JSValue js_proxy_get_invariant(JSContext *ctx, JSValueConst target, JSAtom atom, JSValue ret);
 static int js_proxy_has_invariant(JSContext *ctx, JSValueConst target, JSAtom atom, int ret);
 static int js_proxy_delete_invariant(JSContext *ctx, JSValueConst target, JSAtom atom, int ret);
@@ -19305,6 +19300,7 @@ static JSValue js_proxy_ownkeys_result(JSContext *ctx, JSValueConst proxy, JSVal
 typedef struct JSOpKeyed {
     JSAtom atom;          /* the ToPropertyKey'd key (owned) */
     uint8_t pop;          /* operands the answer replaces */
+    uint8_t push;         /* 1 = the answer IS the operator's value; 0 = a WRITE, which yields none */
     uint8_t throw_on_false; /* `delete` in STRICT code: 13.5.1.2 step 6 turns a false [[Delete]] into a TypeError.
                                The request performs the BARE internal method (step 5) and the operator owns step 6,
                                which is why the strictness rides here — it belongs to the frame the `delete` was
@@ -19914,7 +19910,6 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_ASYNC_FROM_SYNC:
     case CONT_ITER_HELPER:
     case CONT_ITER_FROM:
-    case CONT_PROXY_SET:
     case CONT_PROXY_CONSTRUCT:
     case CONT_INSTANCEOF:
     case CONT_PROMISE_EXEC:
@@ -21159,44 +21154,7 @@ static inline bool tramp_is_global_eval(JSValueConst method) {
 }
 static JSProxyData *get_proxy_method(JSContext *ctx, JSValue *pmethod, JSValueConst obj, JSAtom name);
 static inline bool tramp_can_call(JSValueConst func);
-/* PROXY [[Set]]: `proxy[key] = value`. The trap takes FOUR arguments, so unlike the other traps the reshape is not
-   a fixed rewrite of the operator's slots — the two write opcodes consume a different number of operands (obj+value
-   vs obj+key+value) and both must leave NOTHING behind. So this helper is layout-independent: it fills `out[0..5]`
-   with [handler, trap, target, key, value, receiver] (owning every one) and the call site places them wherever its
-   own operand cleanup will land. `value` is BORROWED. Returns 1 = routed, 0 = fall through to the C path,
-   -1 = pending exception. */
 static int js_proxy_set_invariant(JSContext *ctx, JSValueConst target, JSAtom atom, JSValueConst value, int ret);
-static int js_tramp_proxy_set(JSContext *ctx, JSValueConst obj, JSAtom atom, JSValueConst value,
-                              bool throw_on_false, JSValue *out /* 6 slots */, void **out_cont)
-{
-    JSProxyData *s;
-    JSValue method, keyval;
-    JSProxySet *ps;
-    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT
-        || JS_VALUE_GET_OBJ(obj)->class_id != JS_CLASS_PROXY) return 0;
-    s = get_proxy_method(ctx, &method, obj, JS_ATOM_set);
-    if (!s) return -1;
-    if (JS_IsUndefined(method) || !tramp_can_call(method)) {
-        JS_FreeValue(ctx, method);
-        return 0;
-    }
-    keyval = JS_AtomToValue(ctx, atom);
-    if (JS_IsException(keyval)) { JS_FreeValue(ctx, method); return -1; }
-    ps = js_malloc(ctx, sizeof(*ps));
-    if (!ps) { JS_FreeValue(ctx, keyval); JS_FreeValue(ctx, method); return -1; }
-    ps->target = js_dup(s->target);
-    ps->value = js_dup(value);
-    ps->atom = JS_DupAtom(ctx, atom);
-    ps->throw_on_false = throw_on_false;
-    *out_cont = ps;
-    out[0] = js_dup(s->handler);   /* this */
-    out[1] = method;               /* the trap (owned) */
-    out[2] = js_dup(s->target);
-    out[3] = keyval;
-    out[4] = js_dup(value);
-    out[5] = js_dup(obj);          /* receiver IS the proxy */
-    return 1;
-}
 /* PROXY [[Construct]]: `new proxy(...)`. Resolve the `construct` trap at the operator site and dispatch it as
    trap(target, argArray, newTarget) with `this` = handler, so a loop in the trap body parks. Layout-independent
    like [[Set]]'s: fills out[0..4] with [handler, trap, target, argArray, newTarget] (owning every one) because the
@@ -24603,7 +24561,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                13.5.1.2 step 6's TypeError, which is the operator's step, not the object's. */
             {
                 JSOpKeyed *ok = cont_st;
-                int npop = ok->pop;
+                int npop = ok->pop, npush = ok->push;
                 /* The INVARIANT can throw after the trap returned normally — 10.5.10 step 12 on a
                    `deleteProperty` that claimed to remove a non-configurable property — and that arrives here as
                    an EXCEPTION in ret_val. Placing it would push JS_EXCEPTION as the operator's value and lose
@@ -24618,7 +24576,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto exception;
                 }
                 while (npop-- > 0) JS_FreeValue(ctx, *--sp);
-                *sp++ = ret_val;
+                if (npush) *sp++ = ret_val;
+                else JS_FreeValue(ctx, ret_val);   /* a write yields no value */
                 BREAK;
             }
         }
@@ -27533,25 +27492,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         JS_ThrowTypeErrorNotAnObject(ctx);
                         goto exception;
                     }
-                } else if (rck == CONT_PROXY_SET) {
-                    /* the proxy `set` trap returned: ToBoolean, the target's [[Set]] invariant (the SAME
-                       js_proxy_set_invariant the C path uses), then the strict-mode throw a rejected write owes.
-                       Free the operands and push NOTHING — a property write yields no value. */
-                    JSProxySet *ps = rcs;
-                    bool ps_throw = ps->throw_on_false;
-                    int sres = js_proxy_set_invariant(ctx, ps->target, ps->atom, ps->value,
-                                                      JS_ToBoolFree(ctx, ret_val));
-                    JSValue *cargv = sp - cargc;
-                    JS_FreeValue(ctx, ps->target); JS_FreeValue(ctx, ps->value);
-                    JS_FreeAtom(ctx, ps->atom); js_free_rt(rt, ps);
-                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
-                    sp += cfirst - cargc;
-                    if (unlikely(sres < 0)) goto exception;
-                    if (!sres && ps_throw) {
-                        JS_ThrowTypeError(ctx, "proxy: cannot set property");
-                        goto exception;
-                    }
-                    BREAK;
                 } else if (rck == CONT_SETTER) {
                     /* setter returned: free the operands (this,setter,value) on the caller stack exactly like a
                        method call, but DISCARD the return value — a property write pushes nothing. */
@@ -28966,7 +28906,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            JS_Call loop. */
                         JSOpKeyed *ok = js_mallocz(ctx, sizeof(*ok));
                         if (unlikely(!ok)) {  JS_ThrowOutOfMemory(ctx); goto exception; }
-                        ok->atom = JS_DupAtom(ctx, atom); ok->pop = 1;
+                        ok->atom = JS_DupAtom(ctx, atom); ok->pop = 1; ok->push = 1;
                         gp_obj = obj; gp_atom = ok->atom; gp_op = GP_GET; gp_val = JS_UNDEFINED;
                         gp_recv = obj; gp_no_throw = 0;
                         gp_outer = ok; gp_outer_kind = CONT_OP_KEYED;
@@ -29042,7 +28982,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            JS_Call loop. */
                         JSOpKeyed *ok = js_mallocz(ctx, sizeof(*ok));
                         if (unlikely(!ok)) {  JS_ThrowOutOfMemory(ctx); goto exception; }
-                        ok->atom = JS_DupAtom(ctx, atom); ok->pop = 0;
+                        ok->atom = JS_DupAtom(ctx, atom); ok->pop = 0; ok->push = 1;
                         gp_obj = obj; gp_atom = ok->atom; gp_op = GP_GET; gp_val = JS_UNDEFINED;
                         gp_recv = obj; gp_no_throw = 0;
                         gp_outer = ok; gp_outer_kind = CONT_OP_KEYED;
@@ -29109,26 +29049,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 obj = sp[-2];
                 if (unlikely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT
                              && JS_VALUE_GET_OBJ(obj)->class_id == JS_CLASS_PROXY)) {
-                    /* proxy [[Set]]: run the `set` trap on THIS chain so a loop inside it preempts. Six operands
-                       replace the two, and the continuation's own cleanup lands sp back where a write leaves it. */
-                    JSValue px[6];
-                    void *ps_cont = NULL;
-                    int ps_ret;
+                    /* [[Set]] on a Proxy is the `set` trap plus the READ of that trap off the handler: the one
+                       keyed-operation entry's GP_SET, the same request Reflect.set issues. no_throw is the
+                       WRITER's strictness — 6.2.5.6 PutValue step 6 turns a refused write into a TypeError only
+                       in strict code — so the two spellings share one implementation instead of one wrapping the
+                       other. The operator's own copy read the trap from C and then asked whether it had a
+                       BYTECODE body, dropping every other kind back to js_proxy_set's JS_Call loop. */
+                    JSOpKeyed *ok;
                     sf->cur_pc = pc;
-                    DCHECK(sp + 4 <= TRAMP_SP_LIMIT(sf),
-                           "proxy set trap: operand reshape exceeds the frame's compiled stack_size");
-                    ps_ret = js_tramp_proxy_set(ctx, obj, atom, sp[-1], sf->is_strict_mode, px, &ps_cont);
-                    if (unlikely(ps_ret < 0)) goto exception;
-                    if (ps_ret > 0) {
-                        JS_FreeValue(ctx, sp[-2]);   /* the proxy — px owns its own handler/target/receiver refs */
-                        JS_FreeValue(ctx, sp[-1]);   /* the written value — dup'd into px[4] and the continuation */
-                        sp[-2] = px[0]; sp[-1] = px[1];
-                        sp[0] = px[2]; sp[1] = px[3]; sp[2] = px[4]; sp[3] = px[5];
-                        sp += 4;
-                        call_argv = sp - 4; call_argc = 4; tramp_first = -2; tramp_is_tail = 0;
-                        tramp_cont_state = ps_cont; tramp_cont_kind = CONT_PROXY_SET;
-                        goto do_tramp_call;
-                    }
+                    ok = js_mallocz(ctx, sizeof(*ok));
+                    if (unlikely(!ok)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                    ok->atom = JS_DupAtom(ctx, atom); ok->pop = 2; ok->push = 0;
+                    gp_obj = obj; gp_atom = ok->atom; gp_op = GP_SET; gp_val = sp[-1];
+                    gp_recv = obj; gp_no_throw = !sf->is_strict_mode;
+                    gp_outer = ok; gp_outer_kind = CONT_OP_KEYED;
+                    goto do_getprop_tramp;
                 }
                 if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
                     p = JS_VALUE_GET_OBJ(obj);
@@ -29416,7 +29351,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                JS_Call loop. */
                             JSOpKeyed *ok = js_mallocz(ctx, sizeof(*ok));
                             if (unlikely(!ok)) { JS_FreeAtom(ctx, katom); JS_ThrowOutOfMemory(ctx); goto exception; }
-                            ok->atom = katom; ok->pop = 2;
+                            ok->atom = katom; ok->pop = 2; ok->push = 1;
                             gp_obj = sp[-2]; gp_atom = ok->atom; gp_op = GP_GET; gp_val = JS_UNDEFINED;
                             gp_recv = sp[-2]; gp_no_throw = 0;
                             gp_outer = ok; gp_outer_kind = CONT_OP_KEYED;
@@ -29484,7 +29419,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                JS_Call loop. */
                             JSOpKeyed *ok = js_mallocz(ctx, sizeof(*ok));
                             if (unlikely(!ok)) { JS_FreeAtom(ctx, katom); JS_ThrowOutOfMemory(ctx); goto exception; }
-                            ok->atom = katom; ok->pop = 1;
+                            ok->atom = katom; ok->pop = 1; ok->push = 1;
                             gp_obj = sp[-2]; gp_atom = ok->atom; gp_op = GP_GET; gp_val = JS_UNDEFINED;
                             gp_recv = sp[-2]; gp_no_throw = 0;
                             gp_outer = ok; gp_outer_kind = CONT_OP_KEYED;
@@ -29584,7 +29519,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                JS_Call loop. */
                             JSOpKeyed *ok = js_mallocz(ctx, sizeof(*ok));
                             if (unlikely(!ok)) { JS_FreeAtom(ctx, atom); JS_ThrowOutOfMemory(ctx); goto exception; }
-                            ok->atom = atom; ok->pop = 3;
+                            ok->atom = atom; ok->pop = 3; ok->push = 1;
                             gp_obj = sp[-2]; gp_atom = ok->atom; gp_op = GP_GET; gp_val = JS_UNDEFINED;
                             gp_recv = sp[-3]; gp_no_throw = 0;
                             gp_outer = ok; gp_outer_kind = CONT_OP_KEYED;
@@ -29624,34 +29559,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSObject *p;
 
                 val = sp[-1];
-                if (unlikely(JS_VALUE_GET_TAG(sp[-3]) == JS_TAG_OBJECT
-                             && JS_VALUE_GET_OBJ(sp[-3])->class_id == JS_CLASS_PROXY)) {
-                    /* proxy [[Set]] with a computed key — the same six operands as OP_put_field, based one slot
-                       lower because this opcode consumes three, so its cleanup lands sp in the same place. */
-                    JSValue px[6];
-                    void *ps_cont = NULL;
-                    int ps_ret;
-                    JSAtom katom;
-                    sf->cur_pc = pc;
-                    DCHECK(sp + 3 <= TRAMP_SP_LIMIT(sf),
-                           "proxy set trap: operand reshape exceeds the frame's compiled stack_size");
-                    katom = JS_ValueToAtom(ctx, sp[-2]);   /* ToPropertyKey can run user code and throw */
-                    if (unlikely(katom == JS_ATOM_NULL)) goto exception;
-                    ps_ret = js_tramp_proxy_set(ctx, sp[-3], katom, val, sf->is_strict_mode, px, &ps_cont);
-                    JS_FreeAtom(ctx, katom);
-                    if (unlikely(ps_ret < 0)) goto exception;
-                    if (ps_ret > 0) {
-                        JS_FreeValue(ctx, sp[-3]);
-                        JS_FreeValue(ctx, sp[-2]);
-                        JS_FreeValue(ctx, sp[-1]);
-                        sp[-3] = px[0]; sp[-2] = px[1]; sp[-1] = px[2];
-                        sp[0] = px[3]; sp[1] = px[4]; sp[2] = px[5];
-                        sp += 3;
-                        call_argv = sp - 4; call_argc = 4; tramp_first = -2; tramp_is_tail = 0;
-                        tramp_cont_state = ps_cont; tramp_cont_kind = CONT_PROXY_SET;
-                        goto do_tramp_call;
-                    }
-                }
                 if (likely(JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_INT)) {
                     idx = JS_VALUE_GET_INT(sp[-2]);
                     if (likely(JS_VALUE_GET_TAG(sp[-3]) == JS_TAG_OBJECT)) {
@@ -29701,6 +29608,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JSAtom katom = JS_ValueToAtom(ctx, sp[-2]);
                     if (unlikely(katom == JS_ATOM_NULL))
                         goto exception;
+                    if (JS_VALUE_GET_OBJ(sp[-3])->class_id == JS_CLASS_PROXY) {
+                        /* the same GP_SET request as `o.x = v`, three operands instead of two. It sits HERE, not
+                           at the top of the opcode where the old reshape did: the key must go through
+                           key_toprim first, so the coercion runs on the tramp instead of inside JS_ValueToAtom. */
+                        JSOpKeyed *ok = js_mallocz(ctx, sizeof(*ok));
+                        if (unlikely(!ok)) { JS_FreeAtom(ctx, katom); JS_ThrowOutOfMemory(ctx); goto exception; }
+                        ok->atom = katom; ok->pop = 3; ok->push = 0;
+                        gp_obj = sp[-3]; gp_atom = katom; gp_op = GP_SET; gp_val = sp[-1];
+                        gp_recv = sp[-3]; gp_no_throw = !sf->is_strict_mode;
+                        gp_outer = ok; gp_outer_kind = CONT_OP_KEYED;
+                        goto do_getprop_tramp;
+                    }
                     JSObject *st = tramp_bytecode_setter(JS_VALUE_GET_OBJ(sp[-3]), katom);
                     JS_FreeAtom(ctx, katom);
                     if (st) {
@@ -30506,7 +30425,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (unlikely(katom == JS_ATOM_NULL)) goto exception;
                 ok = js_mallocz(ctx, sizeof(*ok));
                 if (unlikely(!ok)) { JS_FreeAtom(ctx, katom); JS_ThrowOutOfMemory(ctx); goto exception; }
-                ok->atom = katom; ok->pop = 2;
+                ok->atom = katom; ok->pop = 2; ok->push = 1;
                 gp_obj = sp[-1]; gp_atom = katom; gp_op = GP_HAS; gp_val = JS_UNDEFINED;
                 gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
                 gp_outer = ok; gp_outer_kind = CONT_OP_KEYED;
@@ -30576,7 +30495,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (unlikely(katom == JS_ATOM_NULL)) goto exception;
                 ok = js_mallocz(ctx, sizeof(*ok));
                 if (unlikely(!ok)) { JS_FreeAtom(ctx, katom); JS_ThrowOutOfMemory(ctx); goto exception; }
-                ok->atom = katom; ok->pop = 2; ok->throw_on_false = sf->is_strict_mode;
+                ok->atom = katom; ok->pop = 2; ok->push = 1; ok->throw_on_false = sf->is_strict_mode;
                 gp_obj = sp[-2]; gp_atom = katom; gp_op = GP_DELETE; gp_val = JS_UNDEFINED;
                 gp_recv = JS_UNINITIALIZED; gp_no_throw = 1;
                 gp_outer = ok; gp_outer_kind = CONT_OP_KEYED;
@@ -31187,10 +31106,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             if (itail) { ret_val = r; goto do_return; }
             *sp++ = r;
             BREAK;
-        } else if (xck == CONT_PROXY_SET) {
-            JSProxySet *ps = xcs;
-            JS_FreeValue(ctx, ps->target); JS_FreeValue(ctx, ps->value);
-            JS_FreeAtom(ctx, ps->atom); js_free_rt(rt, ps);
         } else if (xck == CONT_GETPROP) {
             cont_st = xcs;
             goto do_getprop_abandon;
