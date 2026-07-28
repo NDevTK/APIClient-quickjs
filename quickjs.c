@@ -1470,7 +1470,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
 #define DV_STEPDEF_ID(N) STEPDEF_DV_GET_##N, STEPDEF_DV_SET_##N,
     DV_STEPDEF_LIST(DV_STEPDEF_ID)
 #undef DV_STEPDEF_ID
-    STEPDEF_FUNCTION_CALL, STEPDEF_FUNCTION_APPLY, STEPDEF_ISNAN, STEPDEF_ISFINITE,
+    STEPDEF_FUNCTION_CALL, STEPDEF_FUNCTION_APPLY, STEPDEF_REFLECT_APPLY, STEPDEF_ISNAN, STEPDEF_ISFINITE,
     STEPDEF_NUM_TOSTRING, STEPDEF_NUM_TOLOCALESTRING, STEPDEF_NUM_TOFIXED,
     STEPDEF_NUM_TOEXPONENTIAL, STEPDEF_NUM_TOPRECISION, STEPDEF_NUM_CTOR,
     STEPDEF_ITERATOR_CTOR, STEPDEF_ARRAY_OF, STEPDEF_ARRAY_CONCAT,
@@ -21314,8 +21314,8 @@ static inline bool tramp_is_reflect_apply(JSValueConst method) {
     JSObject *mp;
     if (JS_VALUE_GET_TAG(method) != JS_TAG_OBJECT) return false;
     mp = JS_VALUE_GET_OBJ(method);
-    return mp->class_id == JS_CLASS_C_FUNCTION && mp->u.cfunc.cproto == JS_CFUNC_generic
-        && mp->u.cfunc.c_function.generic == js_reflect_apply;
+    return mp->class_id == JS_CLASS_C_FUNCTION && mp->u.cfunc.cproto == JS_CFUNC_step
+        && mp->u.cfunc.magic == STEPDEF_REFLECT_APPLY;
 }
 
 /* Helpers defined later — needed by the heap-resident async call path inside JS_CallInternal. */
@@ -54119,16 +54119,23 @@ static int js_function_apply_step(JSContext *ctx, void *st, JSValue cb_result, J
     JSFuncCall *s = st;
     uint32_t alen = 0, i;
     JSValue *atab = NULL;
-    JSValueConst arr;
+    JSValueConst arr, fn, thisArg;
+    /* 0 = Function.prototype.apply, whose function is the RECEIVER; 1 = Reflect.apply, which passes it as an
+       argument. Everything after that is the same algorithm, which is why it is one machine and not two — the
+       C bodies were already one function taking a magic. */
+    int refl = (int)(intptr_t)s->hdr.arg;
 
     if (s->hdr.stage == 0) {
         JS_FreeValue(ctx, cb_result);
         s->result = JS_UNDEFINED;
-        if (check_function(ctx, s->hdr.this_val))
+        fn      = refl ? step_arg(&s->hdr, 0) : s->hdr.this_val;
+        thisArg = step_arg(&s->hdr, refl ? 1 : 0);
+        arr     = step_arg(&s->hdr, refl ? 2 : 1);
+        if (check_function(ctx, fn))
             return -1;
-        arr = step_arg(&s->hdr, 1);
-        /* 20.2.3.1 step 2: a nullish argArray is an empty list, not a coercion */
-        if (!JS_IsUndefined(arr) && !JS_IsNull(arr)) {
+        /* 20.2.3.1 step 2: a nullish argArray is an empty list. 28.1.1 step 2 has no such case — its
+           CreateListFromArrayLike throws on anything that is not an object. */
+        if (refl || (!JS_IsUndefined(arr) && !JS_IsNull(arr))) {
             atab = build_arg_list(ctx, &alen, arr);
             if (unlikely(!atab)) return -1;
         }
@@ -54140,15 +54147,15 @@ static int js_function_apply_step(JSContext *ctx, void *st, JSValue cb_result, J
         /* the state owns every slot BEFORE anything else can run: a teardown frees exactly ncb of them */
         s->ncb = (int)alen + 2;
         for (i = 0; i < alen + 2; i++) s->cb[i] = JS_UNDEFINED;
-        s->cb[0] = js_dup(step_arg(&s->hdr, 0));   /* thisArg — absent means undefined, which is the spec's */
-        s->cb[1] = js_dup(s->hdr.this_val);        /* the function */
+        s->cb[0] = js_dup(thisArg);   /* absent means undefined, which is the spec's */
+        s->cb[1] = js_dup(fn);
         for (i = 0; i < alen; i++) s->cb[2 + i] = atab[i];   /* ownership transferred element by element */
         js_free(ctx, atab);
         s->hdr.stage = 1;
         *out_cb = s->cb; *out_argc = (int)alen;
         return 3;
     }
-    DCHECK(s->hdr.stage == 1, "Function.prototype.apply: unknown stage");
+    DCHECK(s->hdr.stage == 1, "apply: unknown stage");
     s->result = cb_result;
     return 0;
 }
@@ -57975,6 +57982,7 @@ static const JSTrampStepDef js_isNaN_def          = { sizeof(JSCoerce1), js_coer
 static const JSTrampStepDef js_isFinite_def       = { sizeof(JSCoerce1), js_coerce1_step, js_coerce1_fini, 1 };
 static const JSTrampStepDef js_function_call_def  = { sizeof(JSFuncCall), js_function_call_step, js_function_call_fini, 0 };
 static const JSTrampStepDef js_function_apply_def = { sizeof(JSFuncCall), js_function_apply_step, js_function_call_fini, 0 };
+static const JSTrampStepDef js_reflect_apply_def  = { sizeof(JSFuncCall), js_function_apply_step, js_function_call_fini, 1 };
 static const JSTrampStepDef js_array_tostring_def = { sizeof(JSArrayToString), js_array_tostring_step, js_array_tostring_fini, 0 };
 static const JSTrampStepDef js_array_reduce_def  = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduce };
 static const JSTrampStepDef js_array_reduceR_def = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduceRight };
@@ -58101,6 +58109,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_ARRAY_TOSTRING]  = &js_array_tostring_def,
     [STEPDEF_FUNCTION_CALL]   = &js_function_call_def,
     [STEPDEF_FUNCTION_APPLY]  = &js_function_apply_def,
+    [STEPDEF_REFLECT_APPLY]   = &js_reflect_apply_def,
     [STEPDEF_NUM_CTOR]        = &js_num_ctor_def,
     [STEPDEF_BIGINT_ASUINTN]  = &js_bigint_asUintN_def,
     [STEPDEF_BIGINT_ASINTN]   = &js_bigint_asIntN_def,
@@ -67493,7 +67502,7 @@ static JSValue js_reflect_setPrototypeOf(JSContext *ctx, JSValueConst this_val,
 
 
 static const JSCFunctionListEntry js_reflect_funcs[] = {
-    JS_CFUNC_DEF("apply", 3, js_reflect_apply ),
+    JS_CFUNC_STEP_DEF("apply", 3, STEPDEF_REFLECT_APPLY ),
     JS_CFUNC_DEF("construct", 2, js_reflect_construct ),
     JS_CFUNC_STEP_DEF("defineProperty", 3, STEPDEF_REFLECT_DEFINEPROPERTY ),
     JS_CFUNC_STEP_DEF("deleteProperty", 2, STEPDEF_REFLECT_DELETE ),
