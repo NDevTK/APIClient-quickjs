@@ -19207,10 +19207,6 @@ typedef struct TrampFrame {
 #define TRAMP_FRAME_SLOTS(nargs, bc) ((nargs) + (bc)->var_count + (bc)->stack_size + TRAMP_SCRATCH_SLOTS)
 #define TRAMP_VAR_REFS(sbuf, bc) ((JSVarRef **)((sbuf) + (bc)->stack_size + TRAMP_SCRATCH_SLOTS))
 #define TRAMP_SP_LIMIT(sf) ((JSValue *)(sf)->var_refs)
-#define CONT_PROXY_GET     13  /* cont_state = JSProxyGet: a trampolined proxy [[Get]] trap. The trap's RESULT must
-                                  still satisfy the target's non-configurable invariants, so the check rides a
-                                  continuation and runs at do_return, before the result is placed. */
-typedef struct JSProxyGet { JSValue target; JSAtom atom; } JSProxyGet;
 #define CONT_INSTANCEOF   24   /* cont_state = NULL: a user `static [Symbol.hasInstance](v)` driven by the instanceof
                                   OPERATOR. 13.10.2 step 3.b is ToBoolean(result) and nothing else, so the
                                   continuation is that coercion — the operator cannot do it, having already returned
@@ -19918,7 +19914,6 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_ASYNC_FROM_SYNC:
     case CONT_ITER_HELPER:
     case CONT_ITER_FROM:
-    case CONT_PROXY_GET:
     case CONT_PROXY_SET:
     case CONT_PROXY_CONSTRUCT:
     case CONT_INSTANCEOF:
@@ -21162,47 +21157,8 @@ static inline bool tramp_is_global_eval(JSValueConst method) {
         && mp->u.cfunc.cproto == JS_CFUNC_generic
         && mp->u.cfunc.c_function.generic == js_global_eval;
 }
-/* PROXY traps are call-site-resolved: a trap holds no surviving continuation, so the interpreter re-dispatches the
-   trap's normal handler on THIS chain and lets do_return place its one result. js_tramp_proxy_get reshapes the
-   operator's operands into the method-call shape [handler, trap, target, key, receiver] whose caller_sp is exactly
-   the slot the operator's result belongs in — the "stack-shape descriptor" is that reshape. Returns 1 when it routed
-   (caller must goto do_tramp_call), 0 to fall through to the C path, -1 on a pending exception. */
 static JSProxyData *get_proxy_method(JSContext *ctx, JSValue *pmethod, JSValueConst obj, JSAtom name);
 static inline bool tramp_can_call(JSValueConst func);
-/* Layout-independent like [[Set]]'s and [[Construct]]'s: fills out[0..4] with [handler, trap, target, key, receiver]
-   (owning every one) so that EVERY read opcode can place them at its own base. It used to rewrite the operand slot
-   in place, which only OP_get_field could use — so `p[k]`, `p.m()`, `p.x++` and `super.x` through a proxy each kept
-   reaching the trap from C and drove its body to completion. `receiver` is a parameter, not the proxy, because
-   `super.x` reads with `this` as the receiver. */
-static int js_tramp_proxy_get(JSContext *ctx, JSValueConst obj, JSAtom atom, JSValueConst receiver,
-                              JSValue *out /* 5 slots written on success */, void **out_cont)
-{
-    JSProxyData *s;
-    JSValue method, keyval;
-    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT
-        || JS_VALUE_GET_OBJ(obj)->class_id != JS_CLASS_PROXY) return 0;
-    s = get_proxy_method(ctx, &method, obj, JS_ATOM_get);
-    if (!s) return -1;                       /* revoked / handler get threw */
-    if (JS_IsUndefined(method) || !tramp_can_call(method)) {
-        JS_FreeValue(ctx, method);           /* no trap, or a C/bound trap with no preemptible body */
-        return 0;
-    }
-    keyval = JS_AtomToValue(ctx, atom);
-    if (JS_IsException(keyval)) { JS_FreeValue(ctx, method); return -1; }
-    {   /* the invariant check needs (target, key) AFTER the trap returns -> carry them on a continuation */
-        JSProxyGet *pg = js_malloc(ctx, sizeof(*pg));
-        if (!pg) { JS_FreeValue(ctx, method); JS_FreeValue(ctx, keyval); return -1; }
-        pg->target = js_dup(s->target);
-        pg->atom = JS_DupAtom(ctx, atom);
-        *out_cont = pg;
-    }
-    out[0] = js_dup(s->handler);   /* this = handler */
-    out[1] = method;               /* the trap (owned) */
-    out[2] = js_dup(s->target);
-    out[3] = keyval;
-    out[4] = js_dup(receiver);
-    return 1;
-}
 /* PROXY [[Set]]: `proxy[key] = value`. The trap takes FOUR arguments, so unlike the other traps the reshape is not
    a fixed rewrite of the operator's slots — the two write opcodes consume a different number of operands (obj+value
    vs obj+key+value) and both must leave NOTHING behind. So this helper is layout-independent: it fills `out[0..5]`
@@ -21897,15 +21853,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     /* Place a resolved proxy [[Get]] trap's five operands at `base` and dispatch. Every read opcode has a different
        base — its own RESULT slot, since do_return lands the trap's one value where `this` sat — and a different set
        of operands to release first, but the placement is identical, so it lives here once. */
-    #define TRAMP_PROXY_GET_PLACE(base, px, cont) do {                                    \
-        JSValue *pgb_ = (base);                                                           \
-        pgb_[0] = (px)[0]; pgb_[1] = (px)[1]; pgb_[2] = (px)[2];                           \
-        pgb_[3] = (px)[3]; pgb_[4] = (px)[4];                                              \
-        sp = pgb_ + 5;                                                                     \
-        call_argv = sp - 3; call_argc = 3; tramp_first = -2; tramp_is_tail = 0;             \
-        tramp_cont_state = (cont); tramp_cont_kind = CONT_PROXY_GET;                        \
-        goto do_tramp_call;                                                                \
-    } while (0)
     #define TRAMP_APPLY_RELEASE() do {                                                   \
         for (uint32_t ar_ = 0; ar_ < tramp_apply_argc; ar_++) JS_FreeValue(ctx, tramp_apply_argv[ar_]); \
         js_free(ctx, tramp_apply_argv);                                                  \
@@ -27531,14 +27478,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     ret_val = JS_UNDEFINED;
                     goto do_consume_deliver_iterator;
                 }
-                if (rck == CONT_PROXY_GET) {
-                    /* the proxy [[Get]] trap returned: enforce the target's invariants on its result, then let the
-                       normal placement below drop the operands and push it. */
-                    JSProxyGet *pg = rcs;
-                    ret_val = js_proxy_get_invariant(ctx, pg->target, pg->atom, ret_val);
-                    JS_FreeValue(ctx, pg->target); JS_FreeAtom(ctx, pg->atom); js_free_rt(rt, pg);
-                    if (unlikely(JS_IsException(ret_val))) goto exception;
-                } else if (rck == CONT_CONSTRUCT) {
+                if (rck == CONT_CONSTRUCT) {
                     /* constructor body returned: apply the constructor rule — use the body result if it is an
                        object, else the created `this`. */
                     struct JSConstruct *cs = rcs;
@@ -29018,22 +28958,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 obj = sp[-1];
                 if (unlikely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT
                              && JS_VALUE_GET_OBJ(obj)->class_id == JS_CLASS_PROXY)) {
-                    /* proxy [[Get]]: run the trap on THIS chain so a loop inside it preempts. The reshape leaves
-                       [handler, trap, target, key, receiver] whose caller_sp IS this operand slot, so do_return
-                       drops the operands and lands the trap's one result exactly where the field value belongs. */
-                    JSValue px[5];
-                    void *pg_cont = NULL;
-                    int pr_ret;
                     sf->cur_pc = pc;
-                    DCHECK(sp + 4 <= TRAMP_SP_LIMIT(sf),
-                           "proxy get trap: operand reshape exceeds the frame's compiled stack_size");
-                    pr_ret = js_tramp_proxy_get(ctx, obj, atom, obj, px, &pg_cont);
-                    if (unlikely(pr_ret < 0)) goto exception;
-                    if (pr_ret > 0) {
-                        JS_FreeValue(ctx, sp[-1]);   /* the proxy — px owns handler/target/receiver refs */
-                        TRAMP_PROXY_GET_PLACE(sp - 1, px, pg_cont);
+                    {   /* [[Get]] on a Proxy is the `get` trap, and the READ of that trap off the handler is
+                           user code too: both are the one keyed-operation entry's GP_GET, the same request
+                           Reflect.get issues. The operator's own copy read the trap from C and then asked
+                           whether it had a BYTECODE body, dropping every other kind back to js_proxy_get's
+                           JS_Call loop. */
+                        JSOpKeyed *ok = js_mallocz(ctx, sizeof(*ok));
+                        if (unlikely(!ok)) {  JS_ThrowOutOfMemory(ctx); goto exception; }
+                        ok->atom = JS_DupAtom(ctx, atom); ok->pop = 1;
+                        gp_obj = obj; gp_atom = ok->atom; gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                        gp_recv = obj; gp_no_throw = 0;
+                        gp_outer = ok; gp_outer_kind = CONT_OP_KEYED;
+                        goto do_getprop_tramp;
                     }
-                    obj = sp[-1];   /* untouched: no trap, or a C/bound trap -> the normal path below */
                 }
                 if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
                     p = JS_VALUE_GET_OBJ(obj);
@@ -29094,18 +29032,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 obj = sp[-1];
                 if (unlikely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT
                              && JS_VALUE_GET_OBJ(obj)->class_id == JS_CLASS_PROXY)) {
-                    /* `proxy.m()` reads the method through the get trap: the receiver STAYS on the stack, so the
-                       reshape is based one slot HIGHER — at the value slot this opcode pushes. */
-                    JSValue px[5];
-                    void *pg_cont = NULL;
-                    int pr_ret;
+                    /* `proxy.m()` reads the method through the get trap: the receiver STAYS on the stack, so
+                       the value is PUSHED rather than replacing an operand — pop 0. */
                     sf->cur_pc = pc;
-                    DCHECK(sp + 5 <= TRAMP_SP_LIMIT(sf),
-                           "proxy get trap: operand reshape exceeds the frame's compiled stack_size");
-                    pr_ret = js_tramp_proxy_get(ctx, obj, atom, obj, px, &pg_cont);
-                    if (unlikely(pr_ret < 0)) goto exception;
-                    if (pr_ret > 0)
-                        TRAMP_PROXY_GET_PLACE(sp, px, pg_cont);   /* the receiver at sp[-1] is untouched */
+                    {   /* [[Get]] on a Proxy is the `get` trap, and the READ of that trap off the handler is
+                           user code too: both are the one keyed-operation entry's GP_GET, the same request
+                           Reflect.get issues. The operator's own copy read the trap from C and then asked
+                           whether it had a BYTECODE body, dropping every other kind back to js_proxy_get's
+                           JS_Call loop. */
+                        JSOpKeyed *ok = js_mallocz(ctx, sizeof(*ok));
+                        if (unlikely(!ok)) {  JS_ThrowOutOfMemory(ctx); goto exception; }
+                        ok->atom = JS_DupAtom(ctx, atom); ok->pop = 0;
+                        gp_obj = obj; gp_atom = ok->atom; gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                        gp_recv = obj; gp_no_throw = 0;
+                        gp_outer = ok; gp_outer_kind = CONT_OP_KEYED;
+                        goto do_getprop_tramp;
+                    }
                 }
                 if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
                     p = JS_VALUE_GET_OBJ(obj);
@@ -29467,18 +29409,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (unlikely(katom == JS_ATOM_NULL))
                         goto exception;
                     if (JS_VALUE_GET_OBJ(sp[-2])->class_id == JS_CLASS_PROXY) {
-                        JSValue px[5];
-                        void *pg_cont = NULL;
-                        int pr_ret;
-                        DCHECK(sp + 3 <= TRAMP_SP_LIMIT(sf),
-                               "proxy get trap: operand reshape exceeds the frame's compiled stack_size");
-                        pr_ret = js_tramp_proxy_get(ctx, sp[-2], katom, sp[-2], px, &pg_cont);
-                        JS_FreeAtom(ctx, katom);
-                        if (unlikely(pr_ret < 0)) goto exception;
-                        if (pr_ret > 0) {
-                            JS_FreeValue(ctx, sp[-1]);   /* the key operand */
-                            JS_FreeValue(ctx, sp[-2]);   /* the proxy */
-                            TRAMP_PROXY_GET_PLACE(sp - 2, px, pg_cont);
+                        {   /* [[Get]] on a Proxy is the `get` trap, and the READ of that trap off the handler is
+                               user code too: both are the one keyed-operation entry's GP_GET, the same request
+                               Reflect.get issues. The operator's own copy read the trap from C and then asked
+                               whether it had a BYTECODE body, dropping every other kind back to js_proxy_get's
+                               JS_Call loop. */
+                            JSOpKeyed *ok = js_mallocz(ctx, sizeof(*ok));
+                            if (unlikely(!ok)) { JS_FreeAtom(ctx, katom); JS_ThrowOutOfMemory(ctx); goto exception; }
+                            ok->atom = katom; ok->pop = 2;
+                            gp_obj = sp[-2]; gp_atom = ok->atom; gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                            gp_recv = sp[-2]; gp_no_throw = 0;
+                            gp_outer = ok; gp_outer_kind = CONT_OP_KEYED;
+                            goto do_getprop_tramp;
                         }
                     } else {
                         JSObject *g = tramp_bytecode_getter(JS_VALUE_GET_OBJ(sp[-2]), katom);
@@ -29534,17 +29476,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (unlikely(katom == JS_ATOM_NULL))
                         goto exception;
                     if (JS_VALUE_GET_OBJ(sp[-2])->class_id == JS_CLASS_PROXY) {
-                        JSValue px[5];
-                        void *pg_cont = NULL;
-                        int pr_ret;
-                        DCHECK(sp + 4 <= TRAMP_SP_LIMIT(sf),
-                               "proxy get trap: operand reshape exceeds the frame's compiled stack_size");
-                        pr_ret = js_tramp_proxy_get(ctx, sp[-2], katom, sp[-2], px, &pg_cont);
-                        JS_FreeAtom(ctx, katom);
-                        if (unlikely(pr_ret < 0)) goto exception;
-                        if (pr_ret > 0) {
-                            JS_FreeValue(ctx, sp[-1]);   /* the key operand; the object stays at sp[-2] */
-                            TRAMP_PROXY_GET_PLACE(sp - 1, px, pg_cont);
+                        /* `o[k]++` keeps the object for the write-back, so only the KEY is replaced — pop 1. */
+                        {   /* [[Get]] on a Proxy is the `get` trap, and the READ of that trap off the handler is
+                               user code too: both are the one keyed-operation entry's GP_GET, the same request
+                               Reflect.get issues. The operator's own copy read the trap from C and then asked
+                               whether it had a BYTECODE body, dropping every other kind back to js_proxy_get's
+                               JS_Call loop. */
+                            JSOpKeyed *ok = js_mallocz(ctx, sizeof(*ok));
+                            if (unlikely(!ok)) { JS_FreeAtom(ctx, katom); JS_ThrowOutOfMemory(ctx); goto exception; }
+                            ok->atom = katom; ok->pop = 1;
+                            gp_obj = sp[-2]; gp_atom = ok->atom; gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                            gp_recv = sp[-2]; gp_no_throw = 0;
+                            gp_outer = ok; gp_outer_kind = CONT_OP_KEYED;
+                            goto do_getprop_tramp;
                         }
                     } else {
                         JSObject *g = tramp_bytecode_getter(JS_VALUE_GET_OBJ(sp[-2]), katom);
@@ -29631,22 +29575,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    proxy. A bytecode GETTER on the prototype chain is routed here too, with the same receiver. */
                 if (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT) {
                     if (JS_VALUE_GET_OBJ(sp[-2])->class_id == JS_CLASS_PROXY) {
-                        JSValue px[5];
-                        void *pg_cont = NULL;
-                        int pr_ret;
-                        DCHECK(sp + 2 <= TRAMP_SP_LIMIT(sf),
-                               "proxy get trap: operand reshape exceeds the frame's compiled stack_size");
-                        pr_ret = js_tramp_proxy_get(ctx, sp[-2], atom, sp[-3], px, &pg_cont);
-                        JS_FreeAtom(ctx, atom);
-                        if (unlikely(pr_ret < 0)) goto exception;
-                        if (pr_ret > 0) {
-                            JS_FreeValue(ctx, sp[-1]);
-                            JS_FreeValue(ctx, sp[-2]);
-                            JS_FreeValue(ctx, sp[-3]);
-                            TRAMP_PROXY_GET_PLACE(sp - 3, px, pg_cont);
+                        /* `super[k]`: the home object at sp[-2] is looked up but the RECEIVER is `this` at
+                           sp[-3], which is exactly the operand the request already carries. */
+                        {   /* [[Get]] on a Proxy is the `get` trap, and the READ of that trap off the handler is
+                               user code too: both are the one keyed-operation entry's GP_GET, the same request
+                               Reflect.get issues. The operator's own copy read the trap from C and then asked
+                               whether it had a BYTECODE body, dropping every other kind back to js_proxy_get's
+                               JS_Call loop. */
+                            JSOpKeyed *ok = js_mallocz(ctx, sizeof(*ok));
+                            if (unlikely(!ok)) { JS_FreeAtom(ctx, atom); JS_ThrowOutOfMemory(ctx); goto exception; }
+                            ok->atom = atom; ok->pop = 3;
+                            gp_obj = sp[-2]; gp_atom = ok->atom; gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                            gp_recv = sp[-3]; gp_no_throw = 0;
+                            gp_outer = ok; gp_outer_kind = CONT_OP_KEYED;
+                            goto do_getprop_tramp;
                         }
-                        atom = JS_ValueToAtom(ctx, sp[-1]);   /* re-resolve: the branch above consumed it */
-                        if (unlikely(atom == JS_ATOM_NULL)) goto exception;
                     } else {
                         JSObject *g = tramp_bytecode_getter(JS_VALUE_GET_OBJ(sp[-2]), atom);
                         if (g) {
@@ -31244,11 +31187,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             if (itail) { ret_val = r; goto do_return; }
             *sp++ = r;
             BREAK;
-        } else if (xck == CONT_PROXY_GET) {
-            /* the trap body THREW: the invariant it owed is moot, and its operands are on the caller stack where
-               the caller's own catch-search frees them, exactly like a normal method call. */
-            JSProxyGet *pg = xcs;
-            JS_FreeValue(ctx, pg->target); JS_FreeAtom(ctx, pg->atom); js_free_rt(rt, pg);
         } else if (xck == CONT_PROXY_SET) {
             JSProxySet *ps = xcs;
             JS_FreeValue(ctx, ps->target); JS_FreeValue(ctx, ps->value);
@@ -67803,7 +67741,7 @@ static int js_proxy_has(JSContext *ctx, JSValueConst obj, JSAtom atom)
 /* [[Get]] invariant: a trap result for a non-configurable/non-writable own property of the target must be SameValue
    as the target's value, and must be undefined for a non-configurable accessor with no getter. ONE implementation,
    shared by the C path and by the trampolined trap's continuation — the check runs on the trap's RESULT, so the
-   tramp path can only honour it from a continuation, which is what CONT_PROXY_GET carries. Consumes `ret`. */
+   tramp path can only honour it from a continuation, which is what CONT_GETPROP carries. Consumes `ret`. */
 static JSValue js_proxy_get_invariant(JSContext *ctx, JSValueConst target, JSAtom atom, JSValue ret)
 {
     JSPropertyDescriptor desc;
