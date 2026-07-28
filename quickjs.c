@@ -67482,13 +67482,42 @@ static JSProxyData *get_proxy_method(JSContext *ctx, JSValue *pmethod,
     return s;
 }
 
+/* Resolve the TRAPLESS PREFIX of a proxy chain for one operation. Every 10.5.x method forwards a trapless
+   operation to the SAME operation on its target, and each hook spelled that forward as a call back into the
+   generic entry — which re-enters this very hook when the target is itself a Proxy. That cost one C activation
+   per hop, so a chain of trapless proxies hit the stack floor and was reported as a soft RangeError: a bound
+   wearing an error's clothes, and one that every C caller of JS_GetProperty/JS_SetProperty inherited (reading
+   `newTarget.prototype` through such a chain is why `new` died long after the interpreter's own entry had
+   stopped recursing). Walking it here makes every hook's forward FLAT, and it is not a shortcut past anything
+   observable: each hop still reads its own handler's trap, in order, exactly as the recursion did.
+   Returns the node whose TRAP must run (*pmethod holds it), or the last proxy of the chain with *pmethod
+   undefined — whose non-proxy target the caller forwards to as before. NULL with an exception pending on a
+   revoked proxy or a throwing handler read. The chain needs no cycle guard: a proxy's [[ProxyTarget]] is fixed
+   at construction and the target must already exist to be passed, so every hop moves to a strictly older
+   object. */
+static JSProxyData *proxy_resolve_trapless(JSContext *ctx, JSValue *pmethod,
+                                           JSValueConst obj, JSAtom name)
+{
+    for (;;) {
+        JSProxyData *s = get_proxy_method(ctx, pmethod, obj, name);
+        if (!s)
+            return NULL;
+        if (!JS_IsUndefined(*pmethod))
+            return s;
+        if (JS_VALUE_GET_TAG(s->target) != JS_TAG_OBJECT
+            || JS_VALUE_GET_OBJ(s->target)->class_id != JS_CLASS_PROXY)
+            return s;
+        obj = s->target;   /* borrowed: the head the caller holds owns the whole chain */
+    }
+}
+
 static JSValue js_proxy_getPrototypeOf(JSContext *ctx, JSValueConst obj)
 {
     JSProxyData *s;
     JSValue method, ret, proto1;
     int res;
 
-    s = get_proxy_method(ctx, &method, obj, JS_ATOM_getPrototypeOf);
+    s = proxy_resolve_trapless(ctx, &method, obj, JS_ATOM_getPrototypeOf);
     if (!s)
         return JS_EXCEPTION;
     if (JS_IsUndefined(method))
@@ -67532,7 +67561,7 @@ static int js_proxy_setPrototypeOf(JSContext *ctx, JSValueConst obj,
     bool res;
     int res2;
 
-    s = get_proxy_method(ctx, &method, obj, JS_ATOM_setPrototypeOf);
+    s = proxy_resolve_trapless(ctx, &method, obj, JS_ATOM_setPrototypeOf);
     if (!s)
         return -1;
     if (JS_IsUndefined(method))
@@ -67575,7 +67604,7 @@ static int js_proxy_isExtensible(JSContext *ctx, JSValueConst obj)
     bool res;
     int res2;
 
-    s = get_proxy_method(ctx, &method, obj, JS_ATOM_isExtensible);
+    s = proxy_resolve_trapless(ctx, &method, obj, JS_ATOM_isExtensible);
     if (!s)
         return -1;
     if (JS_IsUndefined(method))
@@ -67601,7 +67630,7 @@ static int js_proxy_preventExtensions(JSContext *ctx, JSValueConst obj)
     bool res;
     int res2;
 
-    s = get_proxy_method(ctx, &method, obj, JS_ATOM_preventExtensions);
+    s = proxy_resolve_trapless(ctx, &method, obj, JS_ATOM_preventExtensions);
     if (!s)
         return -1;
     if (JS_IsUndefined(method))
@@ -67652,7 +67681,7 @@ static int js_proxy_has(JSContext *ctx, JSValueConst obj, JSAtom atom)
     JSValueConst args[2];
     bool ret, res2;
 
-    s = get_proxy_method(ctx, &method, obj, JS_ATOM_has);
+    s = proxy_resolve_trapless(ctx, &method, obj, JS_ATOM_has);
     if (!s)
         return -1;
     if (JS_IsUndefined(method))
@@ -67708,10 +67737,10 @@ static JSValue js_proxy_get(JSContext *ctx, JSValueConst obj, JSAtom atom,
     JSValue method, ret, atom_val;
     JSValueConst args[3];
 
-    s = get_proxy_method(ctx, &method, obj, JS_ATOM_get);
+    s = proxy_resolve_trapless(ctx, &method, obj, JS_ATOM_get);
     if (!s)
         return JS_EXCEPTION;
-    /* Note: recursion is possible thru the prototype of s->target */
+    /* the RECEIVER never changes across a forward, so the last hop's target answers for the whole chain */
     if (JS_IsUndefined(method))
         return JS_GetPropertyInternal(ctx, s->target, atom, receiver, false);
     atom_val = JS_AtomToValue(ctx, atom);
@@ -67770,7 +67799,7 @@ static int js_proxy_set(JSContext *ctx, JSValueConst obj, JSAtom atom,
     int ret;
     JSValueConst args[4];
 
-    s = get_proxy_method(ctx, &method, obj, JS_ATOM_set);
+    s = proxy_resolve_trapless(ctx, &method, obj, JS_ATOM_set);
     if (!s)
         return -1;
     if (JS_IsUndefined(method)) {
@@ -67971,7 +68000,7 @@ static int js_proxy_get_own_property(JSContext *ctx, JSPropertyDescriptor *pdesc
     JSValue method, trap_result_obj, prop_val;
     JSValueConst args[2];
 
-    s = get_proxy_method(ctx, &method, obj, JS_ATOM_getOwnPropertyDescriptor);
+    s = proxy_resolve_trapless(ctx, &method, obj, JS_ATOM_getOwnPropertyDescriptor);
     if (!s)
         return -1;
     if (JS_IsUndefined(method))
@@ -68006,7 +68035,7 @@ static int js_proxy_define_own_property(JSContext *ctx, JSValueConst obj,
     JSPropertyDescriptor desc;
     bool ret, setting_not_configurable;
 
-    s = get_proxy_method(ctx, &method, obj, JS_ATOM_defineProperty);
+    s = proxy_resolve_trapless(ctx, &method, obj, JS_ATOM_defineProperty);
     if (!s)
         return -1;
     if (JS_IsUndefined(method)) {
@@ -68147,7 +68176,7 @@ static int js_proxy_delete_property(JSContext *ctx, JSValueConst obj,
     bool res;
     JSValueConst args[2];
 
-    s = get_proxy_method(ctx, &method, obj, JS_ATOM_deleteProperty);
+    s = proxy_resolve_trapless(ctx, &method, obj, JS_ATOM_deleteProperty);
     if (!s)
         return -1;
     if (JS_IsUndefined(method)) {
@@ -68320,7 +68349,7 @@ static int js_proxy_get_own_property_names(JSContext *ctx,
     JSProxyData *s;
     JSValue method, prop_array;
 
-    s = get_proxy_method(ctx, &method, obj, JS_ATOM_ownKeys);
+    s = proxy_resolve_trapless(ctx, &method, obj, JS_ATOM_ownKeys);
     if (!s)
         return -1;
     if (JS_IsUndefined(method)) {
@@ -68345,7 +68374,7 @@ static JSValue js_proxy_call_constructor(JSContext *ctx, JSValueConst func_obj,
     JSValue method, arg_array, ret;
     JSValueConst args[3];
 
-    s = get_proxy_method(ctx, &method, func_obj, JS_ATOM_construct);
+    s = proxy_resolve_trapless(ctx, &method, func_obj, JS_ATOM_construct);
     if (!s)
         return JS_EXCEPTION;
     if (!JS_IsConstructor(ctx, s->target)) {
@@ -68384,7 +68413,7 @@ static JSValue js_proxy_call(JSContext *ctx, JSValueConst func_obj,
     if (flags & JS_CALL_FLAG_CONSTRUCTOR)
         return js_proxy_call_constructor(ctx, func_obj, this_obj, argc, argv);
 
-    s = get_proxy_method(ctx, &method, func_obj, JS_ATOM_apply);
+    s = proxy_resolve_trapless(ctx, &method, func_obj, JS_ATOM_apply);
     if (!s)
         return JS_EXCEPTION;
     if (!s->is_func) {
