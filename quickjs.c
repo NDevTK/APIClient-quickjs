@@ -19487,7 +19487,7 @@ static void js_promise_try_abandon(JSContext *ctx, void *st)
     for (k = 0; k < s->nargs + 2; k++) JS_FreeValue(ctx, s->cb_args[k]);
     js_free_rt(ctx->rt, s);
 }
-static bool tramp_can_call_promise_try(JSValueConst func, JSValueConst recv, JSValueConst *call_argv, int call_argc);
+static bool tramp_can_call_promise_try(JSValueConst func);
 /* String.prototype.replace/replaceAll: a step machine. It holds a StringBuffer + endOfLastMatch across each
    callback, so replaceAll's loop is preemptible at every callback boundary and the replacer's body at every
    back-edge. (Kind 15 was CONT_STR_REPLACE, back when a hand-written driver ran this walk.) */
@@ -23256,9 +23256,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                can suspend — nothing that must survive it may sit in an interpreter local. */
             {
                 JSValueConst thisv = crecv;
-                JSValueConst fn = call_argv[0];
-                int nargs = call_argc - 1;
+                /* 27.2.4.6 step 2 (`If C is not an Object, throw`) is VALIDATION — no user code in it — so it
+                   belongs in the prologue, ahead of the capability. It used to be a condition of the recognizer,
+                   which meant `var t = Promise.try; t(fn)` was DECLINED and the whole algorithm ran again in C. */
+                JSValueConst fn;
+                int nargs;
                 JSPromiseTry *s;
+                if (JS_VALUE_GET_TAG(thisv) != JS_TAG_OBJECT) {
+                    JS_ThrowTypeErrorNotAnObject(ctx);
+                    goto exception;
+                }
+                /* `Promise.try()` passes no callback at all: step 4's Call(undefined, …) throws, and that throw is
+                   CAUGHT by step 5 and rejects the capability — it is not a raise, so it cannot be a decline
+                   either. undefined reaches the convergence point like any other callee and the CONT_PROMISE_TRY
+                   unwind arm turns its TypeError into the rejection. */
+                fn = call_argc >= 1 ? call_argv[0] : JS_UNDEFINED;
+                nargs = call_argc >= 1 ? call_argc - 1 : 0;
                 s = js_malloc_rt(rt, sizeof(*s) + (size_t)(nargs + 2) * sizeof(JSValue));
                 if (unlikely(!s)) { JS_ThrowOutOfMemory(ctx); goto exception; }
                 s->promise = JS_UNDEFINED;
@@ -23292,18 +23305,34 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
 
         do_promise_try_finish:
-            /* fn returned. ret_val is its completion, and resolve(value) is the CAPABILITY's resolve — a subclass
-               that wraps its resolving functions makes that the page's code, so it goes to the convergence point
-               like every other call rather than a JS_Call from here. The call's operands go ABOVE the original
-               Promise.try operands, which the settle's delivery pops afterwards. A throwing resolve DOES
+            /* fn's completion is in, and 27.2.4.6 steps 5-6 settle the capability with it — resolve(value) or
+               reject(error). THE COMPLETION SELECTS WHICH RESOLVING FUNCTION, which is why this is ONE site
+               reached from all three ways fn can finish (a bytecode frame returning, a frame THROWING, and a
+               callee with no frame at all): three copies of the push would be three chances to disagree about
+               which operands are on the stack. ret_val == JS_EXCEPTION means the throw is still live in the
+               context and this takes it.
+               The settle is a CALL, not a C settle: a subclass that wraps its resolving functions makes it the
+               page's code, so it goes to the convergence point like every other call. Its operands go ABOVE the
+               original Promise.try operands, which the settle's delivery pops afterwards. A throwing resolve DOES
                propagate (Call is a ? step), which is what the frame unwind's CONT_PROMISE_TRY_SETTLE arm owes. */
             {
                 JSPromiseTry *ps = ptry_finish_state;
+                int is_reject = JS_IsException(ret_val);
+                /* THE fn CALL'S OPERANDS DROP HERE, from the shape its caller resolved into call_first_r/call_pop.
+                   Each entry used to be responsible for its own drop and none of them did it, which was invisible
+                   while the shape was always the state's own cb_args (0/0, a no-op): the PROXY apply reshape puts
+                   five real operands on the caller stack, so `Promise.try(new Proxy(fn, {apply}))` left sp five
+                   high, and the next Promise.try in the frame then popped its own operands out from under it. One
+                   site, because a drop split across three arms is three chances to skip it. */
+                JSValue *fcargv = sp - call_pop;
                 ptry_finish_state = NULL;
+                for (i = call_first_r; i < call_pop; i++) JS_FreeValue(ctx, fcargv[i]);
+                sp += call_first_r - call_pop;
                 DCHECK(sp + 3 <= TRAMP_SP_LIMIT(sf),
                        "Promise.try settle: operand push exceeds the frame's compiled stack_size");
                 *sp++ = JS_UNDEFINED;                       /* this */
-                *sp++ = js_dup(ps->resolving_funcs[0]);     /* resolve */
+                *sp++ = js_dup(ps->resolving_funcs[is_reject]);
+                if (is_reject) ret_val = JS_GetException(ctx);
                 *sp++ = ret_val; ret_val = JS_UNDEFINED;    /* the value (owned, transferred) */
                 call_argv = sp - 1; call_argc = 1; tramp_first = -2; tramp_is_tail = 0;
                 tramp_cont_state = ps; tramp_cont_kind = CONT_PROMISE_TRY_SETTLE;
@@ -23975,7 +24004,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 if (tramp_can_call_promise_all(ctx, call_argv[-1], crecv, vc(call_argv), call_argc, &pa_magic, &tramp_iter_getiter))
                     goto do_promise_all_consume_tramp;          /* Promise.all/allSettled/any/race(iterable) */
-                if (tramp_can_call_promise_try(call_argv[-1], crecv, vc(call_argv), call_argc))
+                if (tramp_can_call_promise_try(call_argv[-1]))
                     goto do_promise_try_tramp;                  /* Promise.try(fn, ...args) */
                 /* no consumer matched: fall into the step/generic convergence below */
             }
@@ -24440,6 +24469,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         *sp++ = ret_val;
                         BREAK;
                     }
+                    if (dck == CONT_PROMISE_TRY) {
+                        /* Promise.try's fn with no bytecode body — a C one (`Promise.try(Math.max)`), a bound one,
+                           a proxied one, a step machine, and the ABSENT one that `Promise.try()` leaves behind
+                           (undefined is not callable, and step 4's TypeError rejects rather than raises). It
+                           needed an arm the moment the recognizer stopped declining those kinds. Its operands are
+                           the state's own cb_args, so the declared shape pops nothing and sp already stands at the
+                           original Promise.try operands — exactly where the settle expects it. */
+                        TAKE_CALL_SHAPE();   /* the finish drops them */
+                        ptry_finish_state = dcs;
+                        goto do_promise_try_finish;
+                    }
                     DCHECK(dck == CONT_NONE,
                            "a callee with no heap frame was handed a continuation this arm cannot deliver");
                 }
@@ -24659,6 +24699,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (souter_kind == CONT_GETPROP) {
                             call_first_r = 0; call_pop = 0;   /* this arm already dropped them */
                             goto do_getprop_deliver;          /* the machine WAS a proxy trap */
+                        }
+                        if (souter_kind == CONT_PROMISE_TRY) {
+                            /* the machine WAS Promise.try's fn — `Promise.try([].sort.bind(a))`. This arm has
+                               already dropped the operands, so the finish has none left to drop. */
+                            call_first_r = 0; call_pop = 0;
+                            ptry_finish_state = souter;
+                            goto do_promise_try_finish;
                         }
                         DCHECK(souter_kind == CONT_STEP, "step outer continuation: unknown sequence kind");
                         goto do_step_step;
@@ -27136,13 +27183,39 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 atf->caller_argc = argc; atf->caller_argv = argv;
                 atf->caller_arg_allocated_size = arg_allocated_size;
                 /* async_func_init dup'd func + args into as->func_state; free the caller-stack copies + callee ref,
-                   then the caller resumes with the PROMISE where the callee + args were. Use tramp_first, NOT a
-                   hardcoded -1: a METHOD call (obj.asyncM(), tramp_first == -2) also has `this` at call_argv[-2],
-                   so hardcoding leaked it AND left sp one slot high — corrupting the caller's stack. */
-                for (i = tramp_first; i < call_argc; i++) JS_FreeValue(ctx, call_argv[i]);
-                atf->caller_sp = call_argv + tramp_first;
-                atf->call_first = -1; atf->call_argc = 0; atf->is_tail = tramp_is_tail;
-                atf->async_data = as; atf->async_promise = aprom; atf->gen_data = NULL; atf->cont_state = NULL; atf->cont_kind = CONT_NONE;
+                   then the caller resumes with the PROMISE where the callee + args were. THE OPERANDS ARE THE
+                   DECLARED SHAPE, never `call_argv + tramp_first`: that spelling reads the operand model off the
+                   ARGUMENT POINTER, which is only the caller's stack when the call came from a stack-shaped
+                   opcode. A continuation whose arguments live in its OWN buffer (Promise.try's cb_args, a step
+                   machine's) declares the EMPTY shape (0,0), and this then freed that buffer's values — leaving
+                   the state holding freed JSValues to free again — and set caller_sp to a HEAP address, so the
+                   caller's stack unwound into the middle of nowhere. tramp_first is still what an undeclared
+                   call means (and -2 for a method call, which is why hardcoding -1 leaked `this`), but it is
+                   TAKE_CALL_SHAPE that says so, in the one place every other call path asks. An OWNED argument
+                   list is released for the same reason: async_func_init has dup'd out of it. */
+                {
+                    JSValue *acargv;
+                    TAKE_CALL_SHAPE();
+                    CREATE_RELEASE_OPERANDS();
+                    acargv = sp - call_pop;
+                    for (i = call_first_r; i < call_pop; i++) JS_FreeValue(ctx, acargv[i]);
+                    atf->caller_sp = acargv + call_first_r;
+                }
+                /* the operands are gone and caller_sp stands below them, so the shape this frame owes its caller
+                   is EMPTY — the -1 that stood here said "pop one more", which nothing read while the promise was
+                   only ever pushed, and became a live lie the moment the settle could route through the shared
+                   delivery. */
+                atf->call_first = 0; atf->call_argc = 0; atf->is_tail = tramp_is_tail;
+                /* ADOPT the requester, exactly as do_tramp_call and both coroutine creates do. Dropping it meant
+                   an async callee invoked BY A MACHINE — `[1,2].map(async x => x)`, `arr.sort(async cmp)`,
+                   Promise.try(asyncFn) — silently lost the continuation waiting on it: the machine's state was
+                   never resumed and never freed, and the promise was PUSHED onto a caller stack that was not
+                   expecting a value, which walked sp off the frame (segfault). An async function is a callee like
+                   any other; its result just happens to be a promise. */
+                atf->async_data = as; atf->async_promise = aprom; atf->gen_data = NULL;
+                atf->cont_state = tramp_cont_state; atf->cont_kind = tramp_cont_kind;
+                tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;
+                atf->forof_off = tramp_cont_forof; tramp_cont_forof = 0;
                 atf->b = NULL; atf->local_buf = NULL;   /* async frame owns its buffers via as->func_state */
                 /* enter the async body frame (mirror the generator-resume entry; gen_state stays the base) */
                 asf = &as->func_state.frame;
@@ -27174,6 +27247,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSAsyncFunctionData *as = atf->async_data;
                 JSValue aprom = atf->async_promise;
                 uint8_t aitail = atf->is_tail;
+                void *acs = atf->cont_state; uint8_t ack = atf->cont_kind;
+                int acf = atf->call_first, acp = atf->call_argc, afof = atf->forof_off;
                 bool ok;
                 sf->cur_pc = pc; sf->cur_sp = sp;   /* the async frame state js_async_function_post reads */
                 ok = js_async_function_post(ctx, as, ret_val);
@@ -27192,7 +27267,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 arg_allocated_size = atf->caller_arg_allocated_size;
                 pc = sf->cur_pc; sp = atf->caller_sp;
                 js_free_rt(rt, atf);
-                if (unlikely(!ok)) { JS_FreeValue(ctx, aprom); goto exception; }   /* uncatchable error propagates */
+                if (unlikely(!ok)) {
+                    /* uncatchable error: the requester can never be reached again, so it goes the way every
+                       abandoned requester goes rather than leaking with the promise. */
+                    JS_FreeValue(ctx, aprom);
+                    if (ack != CONT_NONE) js_create_requester_abandon(ctx, acs, ack);
+                    goto exception;
+                }
+                if (ack != CONT_NONE) {
+                    /* requested BY A MACHINE: the promise is that call's RESULT, so it goes to the ONE delivery a
+                       returning bytecode callback uses — empty operand shape, because this settle already dropped
+                       the call's operands and restored the caller's sp. */
+                    dlv_cs = acs; dlv_ck = ack;
+                    dlv_cfirst = acf; dlv_cargc = acp; dlv_itail = 0; dlv_forof = afof;
+                    ret_val = aprom;
+                    goto do_cont_deliver;
+                }
                 if (aitail) { ret_val = aprom; goto do_return; }   /* `return asyncFn()` — the promise IS the caller's return */
                 *sp++ = aprom;
                 BREAK;
@@ -28406,6 +28496,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     cont_st = dlv_cs;
                     goto do_promise_try_settled;
                 } else if (dlv_ck == CONT_PROMISE_TRY) {
+                    call_first_r = dlv_cfirst; call_pop = dlv_cargc;   /* the finish drops them */
                     ptry_finish_state = dlv_cs;
                     goto do_promise_try_finish;   /* fn returned: resolve the promise with its value */
                 } else if (dlv_ck == CONT_INSTANCEOF) {
@@ -32108,19 +32199,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         } else if (xck == CONT_PROMISE_TRY) {
             /* Promise.try's fn threw: reject the promise with the abrupt value and yield it (Promise.try returns a
                rejected promise, never raises). reject is the CAPABILITY's, which a subclass may have wrapped in
-               its own bytecode, so it takes the SAME settle route the resolve does — one call site for both, with
-               the completion selecting which resolving function. The frame is already popped and sp is back at the
+               its own bytecode, so it takes the SAME settle route the resolve does — the ONE site, with the
+               completion selecting which resolving function. The frame is already popped and sp is back at the
                original operands; the settle call's own go above them. */
-            JSPromiseTry *ps = xcs;
-            JSValue err = JS_GetException(ctx);
-            DCHECK(sp + 3 <= TRAMP_SP_LIMIT(sf),
-                   "Promise.try reject: operand push exceeds the frame's compiled stack_size");
-            *sp++ = JS_UNDEFINED;                       /* this */
-            *sp++ = js_dup(ps->resolving_funcs[1]);     /* reject */
-            *sp++ = err;                                /* the abrupt value (owned, transferred) */
-            call_argv = sp - 1; call_argc = 1; tramp_first = -2; tramp_is_tail = 0;
-            tramp_cont_state = ps; tramp_cont_kind = CONT_PROMISE_TRY_SETTLE;
-            goto do_generic_callee;
+            ptry_finish_state = xcs;
+            call_first_r = 0; call_pop = 0;   /* the frame unwind already popped; nothing left for the finish */
+            ret_val = JS_EXCEPTION;   /* the throw is live in the context; the settle takes it */
+            goto do_promise_try_finish;
         } else if (xck == CONT_GETPROP) {
             cont_st = xcs;
             goto do_getprop_abandon;
@@ -72465,29 +72550,9 @@ exception:
 static JSValue js_promise_try(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv)
 {
-    JSValue result_promise, resolving_funcs[2], ret, ret2;
-    bool is_reject = 0;
-
-    if (!JS_IsObject(this_val))
-        return JS_ThrowTypeErrorNotAnObject(ctx);
-    result_promise = js_new_promise_capability(ctx, resolving_funcs, this_val);
-    if (JS_IsException(result_promise))
-        return result_promise;
-    ret = JS_Call(ctx, argv[0], JS_UNDEFINED, argc - 1, argv + 1);
-    if (JS_IsException(ret)) {
-        is_reject = 1;
-        ret = JS_GetException(ctx);
-    }
-    ret2 = JS_Call(ctx, resolving_funcs[is_reject], JS_UNDEFINED, 1, vc(&ret));
-    JS_FreeValue(ctx, resolving_funcs[0]);
-    JS_FreeValue(ctx, resolving_funcs[1]);
-    JS_FreeValue(ctx, ret);
-    if (JS_IsException(ret2)) {
-        JS_FreeValue(ctx, result_promise);
-        return ret2;
-    }
-    JS_FreeValue(ctx, ret2);
-    return result_promise;
+    DFAIL("Promise.try reached its C entry — route that call site onto the capability machine "
+          "(do_promise_try_tramp); there is no second driver");
+    return JS_EXCEPTION;
 }
 
 static __exception int remainingElementsCount_add(JSContext *ctx,
@@ -72914,20 +72979,21 @@ static bool tramp_can_call_promise_exec(JSContext *ctx, JSValueConst func, JSVal
                                                   js_promise_constructor throws the step-2 TypeError */
 }
 
-/* Promise.try(fn, ...args): fn is called SYNCHRONOUSLY, so a loop in it must park. Route only a BYTECODE fn (can
-   loop) with an object receiver; a C/bound fn (no preemptible body), a non-callable fn, or a non-object receiver
-   fall through to js_promise_try, which handles them in spec order (reject / throw). */
-static bool tramp_can_call_promise_try(JSValueConst func, JSValueConst recv, JSValueConst *call_argv, int call_argc)
+/* Promise.try(fn, ...args): fn is called SYNCHRONOUSLY, so a loop in it must park. This asks ONE question — is
+   the callee Promise.try — and everything it used to ALSO ask was a silent fallback to a C body that is now
+   deleted. The claim that stood here, that a C or bound fn has "no preemptible body" so the C path was correct
+   for it, was false three ways: a BOUND function's target is bytecode and loops, a PROXY's apply trap is a
+   function and loops, and a GENERATOR fn creates a coroutine that then resumed off the chain. All three aborted
+   (two @WHY preempt-in-a-non-coroutine, one drive-to-completion). The receiver and arity conditions were pure
+   VALIDATION, which moved into the machine's prologue where the spec puts them. */
+static bool tramp_can_call_promise_try(JSValueConst func)
 {
     JSObject *fp;
-    if (call_argc < 1) return false;
     if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
     fp = JS_VALUE_GET_OBJ(func);
     if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
     if (fp->u.cfunc.cproto != JS_CFUNC_generic) return false;
-    if (fp->u.cfunc.c_function.generic != js_promise_try) return false;
-    if (JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT) return false;   /* receiver must be a constructor (resolved: a plain -1 call has no receiver operand) */
-    return tramp_can_call(call_argv[0]);   /* bytecode fn only */
+    return fp->u.cfunc.c_function.generic == js_promise_try;
 }
 
 static JSValue js_promise_race(JSContext *ctx, JSValueConst this_val,
