@@ -17974,6 +17974,12 @@ typedef struct JSTrampStepDef {
        aborts in the driver, which tears the machine down through fini, so this runs from there — and only when
        a coercion was actually in flight, because a body that threw has already run its own cleanup. */
     void     (*onerror)(JSContext *ctx, JSValueConst this_val, int magic);
+    /* This machine's algorithm CATCHES an abrupt request result instead of propagating it — 27.2.1.3.2 step 9
+       rejects the promise when `Get(resolution, "then")` throws, so the throw is a VALUE to it, the way
+       CONT_IMPORT's is to the interpreter. Declaring it is what lets the teardown hand the exception back to
+       step() (as JS_EXCEPTION, with the throw still live in the context) rather than free the chain. Zero for
+       every other definition, which is the default a positional initializer leaves. */
+    uint8_t  catches_abrupt;
 } JSTrampStepDef;
 /* The SINK a consuming builtin declares at its definition, or -1. The same shape as tramp_step_def_of: the
    callee carries the capability, so the interpreter asks one question rather than testing it against a list of
@@ -22255,7 +22261,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 rt->current_stack_frame = sf;
                 gen_state = s;
                 call_argv = sp - 1; call_argc = 1; tramp_first = -2; tramp_is_tail = 1;
-                goto do_step_tramp;
+                /* the CONVERGENCE POINT, not do_step_tramp: a call root's callee is whatever the capability
+                   holds — a step-machine closure (a Promise reaction), a native resolving function, a subclass's
+                   BYTECODE resolve, a bound or proxied one. Asking the kind here is the same question every
+                   other call shape asks, and assuming one kind is how a call root would acquire a silent
+                   fallback. */
+                goto do_generic_callee;
             }
             /* RELINK the base frame first, and read what the base IS only on the path that runs it. The two
                steps were fused, so a resume dereferenced `sf->cur_func`'s function_bytecode unconditionally —
@@ -24822,6 +24833,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             call_first_r = 0; call_pop = 0;
                             ptry_finish_state = souter;
                             goto do_promise_try_finish;
+                        }
+                        if (souter_kind == CONT_PROMISE_TRY_SETTLE) {
+                            /* the machine WAS the capability's resolve or reject. A NATIVE promise's resolving
+                               function became one the moment its `then` read had to be a request, so this arm is
+                               reached by every plain `Promise.try(fn)` — it is not a subclass-only path. The
+                               settle's operands are already dropped, which is what the settled label expects. */
+                            ret_val = r;
+                            cont_st = souter;
+                            goto do_promise_try_settled;
                         }
                         DCHECK(souter_kind == CONT_STEP, "step outer continuation: unknown sequence kind");
                         goto do_step_step;
@@ -32390,6 +32410,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 /* the entry's accessor threw: IfAbruptCloseIterator still owes the source a close, and the machine
                    that asked for the read can never be re-entered — abandon does both. */
                 js_iter_consume_abandon(ctx, gouter);
+            } else if (gouter && gk2 == CONT_STEP && ((JSStepHdr *)gouter)->def->catches_abrupt) {
+                /* the read threw and the machine's own algorithm catches it: hand the exception back to step()
+                   with the throw still live, exactly as a normal result is handed back. */
+                cont_st = gouter;
+                ret_val = JS_EXCEPTION;
+                goto do_step_step;
             } else if (gouter && gk2 == CONT_ITER_CLOSE) {
                 /* the `return` ACCESSOR threw during an UNWIND close (its frame suspended, so the throw arrives
                    here rather than at the in-place site). 7.4.9 discards the close's own throw: the exception the
@@ -59594,6 +59620,8 @@ static const JSTrampStepDef js_promise_catch_def = {
 /* .finally's machine is defined with the rest of the Promise code, below this table, because it builds the
    reaction closures that live there. The table only needs its ADDRESS. */
 static const JSTrampStepDef js_promise_finally_def;
+/* likewise: the resolving-function machine is defined with the Promise code it settles. */
+static const JSTrampStepDef js_promise_resolvefn_def;
 
 static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_PROMISE_RESOLVE]       = &js_promise_resolve_def,
@@ -59858,6 +59886,13 @@ static const JSTrampStepDef *tramp_step_def_of(JSValueConst func)
            an internal JS_Call to a user resolve/reject runs on the tramp and parks. */
         JSCFunctionDataRecord *s = fp->u.c_function_data_record;
         return s ? s->step_def : NULL;
+    }
+    if (fp->class_id == JS_CLASS_PROMISE_RESOLVE_FUNCTION
+        || fp->class_id == JS_CLASS_PROMISE_REJECT_FUNCTION) {
+        /* a resolving function IS a step machine — there is exactly one algorithm (27.2.1.3.2), and which of the
+           two it performs is the CLASS, not a def. Its `Get(resolution, "then")` is the page's code, and the
+           class `call` hook read it with JS_GetProperty from C. */
+        return &js_promise_resolvefn_def;
     }
     if (fp->class_id != JS_CLASS_C_FUNCTION) return NULL;
     if (fp->u.cfunc.cproto != JS_CFUNC_step && fp->u.cfunc.cproto != JS_CFUNC_step_ctor) return NULL;
@@ -72181,6 +72216,11 @@ static void promise_reaction_data_free(JSRuntime *rt,
 typedef struct JSReactionFlow {
     JSAsyncFunctionState fs;
     JSValue resolve, reject;   /* the derived promise's capability (owned; may be undefined) */
+    /* The SETTLE is a second phase of the same flow, not a JS_Call from C. A capability's resolve is page code
+       twice over — a subclass may wrap it, and the NATIVE one is a step machine whose `then` read on a thenable
+       result is itself a request — so settling from C ran that read with no flow base. Phase 1 re-uses the very
+       same call-root base the handler ran on. */
+    uint8_t phase;             /* 0 = the handler is running, 1 = the settle is */
 } JSReactionFlow;
 
 static JSValue js_reaction_resume_job(JSContext *ctx, int argc, JSValueConst *argv);
@@ -72219,29 +72259,38 @@ static int reaction_step_flow_init(JSContext *ctx, JSAsyncFunctionState *fs, JSV
     return 0;
 }
 
-/* Settle the derived promise with the handler's completion `res` (consumed), free the flow state. */
-static JSValue reaction_flow_settle(JSContext *ctx, JSReactionFlow *rf, JSValue res)
+static void reaction_flow_free(JSContext *ctx, JSReactionFlow *rf)
 {
-    JSValue func, res2;
+    JS_FreeValue(ctx, rf->resolve); JS_FreeValue(ctx, rf->reject);
+    js_free_rt(ctx->rt, rf);
+}
+
+/* Hand the handler's completion `res` (consumed) to the derived promise's capability. The call becomes PHASE 1 of
+   the same flow — re-initialising the call root with the resolving function as its callee — so a subclass's
+   bytecode resolve, or the native one's `then` read on a thenable, runs on the chain and can park. -1 = the
+   settle needs no call at all (no capability, or the state is already gone). */
+static int reaction_flow_settle_start(JSContext *ctx, JSReactionFlow *rf, JSValue res)
+{
+    JSValueConst func;
     bool is_reject = JS_IsException(res);
 
     if (is_reject) {
         if (unlikely(JS_IsUncatchableError(ctx->rt->current_exception))) {
-            JS_FreeValue(ctx, rf->resolve); JS_FreeValue(ctx, rf->reject);
-            js_free_rt(ctx->rt, rf);
-            return JS_EXCEPTION;
+            JS_FreeValue(ctx, res);
+            return -1;
         }
         res = JS_GetException(ctx);
     }
     func = is_reject ? rf->reject : rf->resolve;
-    res2 = JS_IsUndefined(func) ? JS_UNDEFINED : JS_Call(ctx, func, JS_UNDEFINED, 1, vc(&res));
+    if (JS_IsUndefined(func)) { JS_FreeValue(ctx, res); return -1; }
+    rf->phase = 1;
+    if (reaction_step_flow_init(ctx, &rf->fs, func, res) < 0) { JS_FreeValue(ctx, res); return -1; }
     JS_FreeValue(ctx, res);
-    JS_FreeValue(ctx, rf->resolve); JS_FreeValue(ctx, rf->reject);
-    js_free_rt(ctx->rt, rf);
-    return res2;
+    return 0;
 }
 
 /* One slice of the handler flow: resume it as its own base; a preempt parks it back into the job pump. */
+static JSValue reaction_flow_step(JSContext *ctx, JSReactionFlow *rf);
 static JSValue reaction_flow_step(JSContext *ctx, JSReactionFlow *rf)
 {
     JSAsyncFunctionState *prev_base = g_flow_base_gen;
@@ -72264,7 +72313,17 @@ static JSValue reaction_flow_step(JSContext *ctx, JSReactionFlow *rf)
     js_free_rt(ctx->rt, rf->fs.frame.arg_buf);
     JS_FreeValue(ctx, rf->fs.frame.cur_func);
     JS_FreeValue(ctx, rf->fs.this_val);
-    return reaction_flow_settle(ctx, rf, res);
+    if (rf->phase == 0) {
+        int st = reaction_flow_settle_start(ctx, rf, res);
+        if (st == 0) return reaction_flow_step(ctx, rf);   /* PHASE 1 on the same flow */
+        reaction_flow_free(ctx, rf);
+        return st < 0 && JS_IsException(ctx->rt->current_exception) ? JS_EXCEPTION : JS_UNDEFINED;
+    }
+    /* phase 1: the resolving function's own result is discarded; only its throw matters. */
+    reaction_flow_free(ctx, rf);
+    if (JS_IsException(res)) return JS_EXCEPTION;
+    JS_FreeValue(ctx, res);
+    return JS_UNDEFINED;
 }
 
 static JSValue js_reaction_resume_job(JSContext *ctx, int argc, JSValueConst *argv)
@@ -72525,6 +72584,101 @@ static void js_promise_resolve_function_mark(JSRuntime *rt, JSValueConst val,
     }
 }
 
+/* 27.2.1.3.2 PromiseResolveFunction as a STEP MACHINE. Every step of it is C except one: `Get(resolution,
+   "then")`, which on a thenable with an accessor or a Proxy is the page's code — and `res(thenable)` inside an
+   executor is the ordinary way to reach it. The class `call` hook read it with JS_GetProperty, so a looping
+   `then` getter had no flow base.
+   The read's ABRUPT completion is a VALUE here, not an unwind: step 9 catches it and rejects. That needs no new
+   mechanism — a request's exception is delivered to the machine as its cb_result, the same way a consumer's
+   acquisition failure is.
+   Which of the two functions this is comes from the CLASS, not from a def argument: one algorithm, two entry
+   points, exactly as the C entry had it. */
+typedef struct JSPromiseResolveFn {
+    JSStepHdr hdr;      /* MUST be first */
+    JSValue cb[1];      /* [resolution] — the operand of the `then` read */
+} JSPromiseResolveFn;
+_Static_assert(offsetof(JSPromiseResolveFn, hdr) == 0, "JSStepHdr must be first in JSPromiseResolveFn");
+
+/* the settle every terminal step performs; a resolving function returns undefined whatever it did. */
+static int js_promise_resolvefn_settle(JSContext *ctx, JSPromiseFunctionData *s, JSValueConst v, bool is_reject)
+{
+    fulfill_or_reject_promise(ctx, s->promise, v, is_reject);
+    return 0;
+}
+
+static int js_promise_resolvefn_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSPromiseResolveFn *m = st;
+    JSObject *p = JS_VALUE_GET_OBJ(m->hdr.func_obj);
+    JSPromiseFunctionData *s = p->u.promise_function_data;
+    bool is_reject = (p->class_id - JS_CLASS_PROMISE_RESOLVE_FUNCTION) != 0;
+
+    if (m->hdr.stage == 0) {
+        JSValueConst resolution = step_arg(&m->hdr, 0);
+        JS_FreeValue(ctx, cb_result);
+        m->cb[0] = JS_UNDEFINED;   /* before anything that can throw: the teardown frees what the state holds */
+        /* step 1-3: the pair fires ONCE, and [[AlreadyResolved]] is shared with its twin. */
+        if (!s || s->presolved->already_resolved) return 0;
+        s->presolved->already_resolved = true;
+        if (is_reject || !JS_IsObject(resolution))
+            return js_promise_resolvefn_settle(ctx, s, resolution, is_reject);   /* step 7 / RejectPromise */
+        if (js_same_value(ctx, resolution, s->promise)) {
+            /* step 6: resolving a promise with itself is a TypeError that REJECTS it, not a raise. */
+            JSValue err;
+            JS_ThrowTypeError(ctx, "promise self resolution");
+            err = JS_GetException(ctx);
+            js_promise_resolvefn_settle(ctx, s, err, true);
+            JS_FreeValue(ctx, err);
+            return 0;
+        }
+        m->hdr.stage = 1;
+        m->cb[0] = js_dup(resolution);
+        *out_cb = m->cb; *out_argc = (int)JS_ATOM_then;
+        return 6;   /* GETPROP: step 8's Get(resolution, "then") */
+    }
+    DCHECK(m->hdr.stage == 1, "a promise resolving function has only the `then` read to wait on");
+    {
+        JSValueConst resolution = m->cb[0];
+        JSValue then = cb_result;
+        if (JS_IsException(then)) {
+            /* step 9: the read threw, and that abrupt completion REJECTS rather than propagating. */
+            JSValue err = JS_GetException(ctx);
+            js_promise_resolvefn_settle(ctx, s, err, true);
+            JS_FreeValue(ctx, err);
+            return 0;
+        }
+        if (!JS_IsFunction(ctx, then)) {
+            /* step 11: a non-callable `then` means this is not a thenable — fulfil with it. */
+            JS_FreeValue(ctx, then);
+            return js_promise_resolvefn_settle(ctx, s, resolution, false);
+        }
+        {
+            /* step 12: the CALL is deferred to a job, so nothing user-written runs here. */
+            JSValueConst args[3];
+            args[0] = s->promise;
+            args[1] = resolution;
+            args[2] = then;
+            JS_EnqueueJob(ctx, js_promise_resolve_thenable_job, 3, args);
+            JS_FreeValue(ctx, then);
+        }
+        return 0;
+    }
+}
+
+static JSValue js_promise_resolvefn_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSPromiseResolveFn *m = st;
+    JS_FreeValue(ctx, m->cb[0]);
+    js_free_rt(ctx->rt, m);
+    return JS_UNDEFINED;   /* a resolving function has no result of its own */
+}
+
+static const JSTrampStepDef js_promise_resolvefn_def = {
+    sizeof(JSPromiseResolveFn), js_promise_resolvefn_step, js_promise_resolvefn_fini, 0,
+    /* body, body_proto, body_magic, precheck, midcheck, onerror */ {NULL}, 0, 0, NULL, NULL, NULL,
+    .catches_abrupt = 1   /* step 9: a throwing `then` read REJECTS, it does not propagate */
+};
+
 static JSValue js_promise_resolve_function_call(JSContext *ctx,
                                                 JSValueConst func_obj,
                                                 JSValueConst this_val,
@@ -72533,50 +72687,49 @@ static JSValue js_promise_resolve_function_call(JSContext *ctx,
 {
     JSObject *p = JS_VALUE_GET_OBJ(func_obj);
     JSPromiseFunctionData *s;
-    JSValueConst args[3];
     JSValueConst resolution;
-    JSValue then;
     bool is_reject;
 
+    /* Reached only by a JS_Call from C — every call that goes through the interpreter's convergence point is the
+       step machine above, and the promise-reaction settle was converted to reach it. TWO C callers remain and
+       both perform the `then` READ from here, which is the one step of 27.2.1.3.2 that can be page code:
+       js_async_function_post (through js_promise_resolve_native, when an async function RETURNS a thenable) and
+       the module-evaluation capability. Each needs its own settle to become part of a flow, exactly as
+       reaction_flow_settle_start did; until then a thenable with an accessor or Proxy `then` reaching one of
+       them runs that read with no flow base. */
     s = p->u.promise_function_data;
     if (!s || s->presolved->already_resolved)
         return JS_UNDEFINED;
-    s->presolved->already_resolved = true;
     is_reject = p->class_id - JS_CLASS_PROMISE_RESOLVE_FUNCTION;
-    if (argc > 0)
-        resolution = argv[0];
-    else
-        resolution = JS_UNDEFINED;
-#ifdef ENABLE_DUMPS // JS_DUMP_PROMISE
-    if (check_dump_flag(ctx->rt, JS_DUMP_PROMISE)) {
-        printf("js_promise_resolving_function_call: is_reject=%d resolution=", is_reject);
-        JS_DumpValue(ctx->rt, resolution);
-        printf("\n");
-    }
-#endif
+    resolution = argc > 0 ? argv[0] : JS_UNDEFINED;
+    s->presolved->already_resolved = true;
     if (is_reject || !JS_IsObject(resolution)) {
-        goto done;
+        fulfill_or_reject_promise(ctx, s->promise, resolution, is_reject);
     } else if (js_same_value(ctx, resolution, s->promise)) {
-        JS_ThrowTypeError(ctx, "promise self resolution");
-        goto fail_reject;
-    }
-    then = JS_GetProperty(ctx, resolution, JS_ATOM_then);
-    if (JS_IsException(then)) {
         JSValue error;
-    fail_reject:
+        JS_ThrowTypeError(ctx, "promise self resolution");
         error = JS_GetException(ctx);
         fulfill_or_reject_promise(ctx, s->promise, error, true);
         JS_FreeValue(ctx, error);
-    } else if (!JS_IsFunction(ctx, then)) {
-        JS_FreeValue(ctx, then);
-    done:
-        fulfill_or_reject_promise(ctx, s->promise, resolution, is_reject);
     } else {
-        args[0] = s->promise;
-        args[1] = resolution;
-        args[2] = then;
-        JS_EnqueueJob(ctx, js_promise_resolve_thenable_job, 3, args);
-        JS_FreeValue(ctx, then);
+        /* the read reaches no user code (the walk above proved it), so it is a plain C read here — a different
+           algorithm from the request, not a fallback to one. */
+        JSValue then = JS_GetProperty(ctx, resolution, JS_ATOM_then);
+        if (JS_IsException(then)) {
+            JSValue error = JS_GetException(ctx);
+            fulfill_or_reject_promise(ctx, s->promise, error, true);
+            JS_FreeValue(ctx, error);
+        } else if (!JS_IsFunction(ctx, then)) {
+            JS_FreeValue(ctx, then);
+            fulfill_or_reject_promise(ctx, s->promise, resolution, false);
+        } else {
+            JSValueConst args[3];
+            args[0] = s->promise;
+            args[1] = resolution;
+            args[2] = then;
+            JS_EnqueueJob(ctx, js_promise_resolve_thenable_job, 3, args);
+            JS_FreeValue(ctx, then);
+        }
     }
     return JS_UNDEFINED;
 }
