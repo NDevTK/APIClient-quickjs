@@ -19443,6 +19443,11 @@ typedef struct JSPromiseCap {
     uint8_t outer_kind;
 } JSPromiseCap;
 static JSValue js_promise_executor_new(JSContext *ctx);
+struct JSPromiseAll;
+static void js_promise_all_end(JSContext *ctx, struct JSPromiseAll *s);
+/* CONT_PROMISE_ALL's value, forward for the same reason CONT_ITER_CONSUME_FWD is: the abandon walks run above the
+   kind's own declaration, and the static assert beside that declaration is what keeps the two in step. */
+#define CONT_PROMISE_ALL_FWD 9
 static void js_promise_cap_abandon(JSContext *ctx, JSPromiseCap *pc)
 {
     JS_FreeValue(ctx, pc->executor);
@@ -19459,6 +19464,7 @@ static void js_promise_cap_requester_abandon(JSContext *ctx, void *st)
     void *req = pc->outer; uint8_t rk = pc->outer_kind;
     js_promise_cap_abandon(ctx, pc);
     if (req) {
+        if (rk == CONT_PROMISE_ALL_FWD) { js_promise_all_end(ctx, req); js_free_rt(ctx->rt, req); return; }
         if (rk == CONT_STEP) { tramp_step_chain_free(ctx, req); return; }
         DCHECK(rk == CONT_PROMISE_TRY, "promise-capability requester: unknown machine kind");
         js_promise_try_abandon(ctx, req);
@@ -20022,6 +20028,7 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val, in
                                   frame carries this cont; its direct-mode settle re-enters js_iter_consume_step
                                   with the {value,done} result. */
 _Static_assert(CONT_ITER_CONSUME_FWD == CONT_ITER_CONSUME, "the forward alias used by the abandon walks must equal CONT_ITER_CONSUME");
+_Static_assert(CONT_PROMISE_ALL_FWD == CONT_PROMISE_ALL, "the forward alias used by the capability abandon must equal CONT_PROMISE_ALL");
 _Static_assert(CONT_ITER_HELPER_FWD == CONT_ITER_HELPER, "the forward alias used by the abandon walk must equal CONT_ITER_HELPER");
 
 /* THE CONT_* NAMESPACE IS ONE NAMESPACE. A TrampFrame's cont_kind and a continuation's outer_kind both hold values
@@ -20526,6 +20533,13 @@ typedef struct JSPromiseAll {
                                     that overrides it — and a JS_Call to completion from inside this step was the
                                     last C drive in the combinator. Mirrors `finalizing` exactly. */
     JSValue elem_value;          /* that call's argument, owned only until it moves onto the operand stack */
+    JSValue acq_method;          /* the @@iterator method the acquire already has in hand, held ACROSS the
+                                    aggregate capability's Construct — which is user code for a subclass and can
+                                    suspend, and an interpreter register does not survive that. */
+    JSValue acq_iterable;        /* the same, for the ITERABLE. It was borrowed from the caller's stack, which the
+                                    acquire is allowed to do because the operand outlives it; recovering that slot
+                                    across a suspension means recomputing an operand address, so the state holds
+                                    an owned one and the borrow points at that instead. */
     uint8_t driving_next;        /* 1 while a .next() is being driven / its result extracted: the iterator has NOT
                                     yet successfully stepped, so an error here is an IteratorNext abrupt and must
                                     NOT close it (spec fail_reject, not fail_reject1). Cleared once value is in hand. */
@@ -23165,6 +23179,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         do_promise_cap_deliver:
             /* the capability exists: tramp_cap_promise + tramp_cap_funcs, and tramp_cap_outer/_kind say who asked.
                Reached identically whether the Construct ran user code or there was none to run. */
+            if (tramp_cap_kind == CONT_PROMISE_ALL) goto do_promise_all_have_cap;
             if (tramp_cap_kind == CONT_STEP) {
                 /* a step machine asked: the record goes on its header (which owns it) and the machine is
                    re-entered with UNDEFINED as its step result — the capability is not a value it returns. */
@@ -23189,6 +23204,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 tramp_cap_outer = NULL; tramp_cap_kind = CONT_NONE;
                 tramp_cap_ctor = JS_UNDEFINED;
                 if (cq) {
+                    if (ck9 == CONT_PROMISE_ALL) {
+                        /* the AGGREGATE's own capability could not be built, so there is no promise to reject with
+                           — IfAbruptRejectPromise has nothing to act on and the throw propagates. */
+                        js_promise_all_end(ctx, (JSPromiseAll *)cq); js_free_rt(rt, cq);
+                        goto exception;
+                    }
                     if (ck9 == CONT_STEP) { cont_st = cq; goto step_abandon; }
                     DCHECK(ck9 == CONT_PROMISE_TRY, "promise-capability requester: unknown machine kind");
                     js_promise_try_abandon(ctx, cq);
@@ -26377,25 +26398,47 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValue rp;
                 s = js_mallocz(ctx, sizeof(*s));
                 if (unlikely(!s)) { JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED; JS_ThrowOutOfMemory(ctx); goto exception; }
-                rp = js_new_promise_capability(ctx, s->resolving_funcs, thisv);   /* result_promise + [resolve,reject] */
-                if (JS_IsException(rp)) { JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED; js_free_rt(rt, s); goto exception; }
-                s->result_promise = rp;
+                s->result_promise = JS_UNDEFINED;
+                s->resolving_funcs[0] = JS_UNDEFINED; s->resolving_funcs[1] = JS_UNDEFINED;
                 s->this_val = js_dup(thisv);
-                s->promise_resolve = JS_GetProperty(ctx, thisv, JS_ATOM_resolve);
+                s->promise_resolve = JS_UNDEFINED;   /* read after the capability, which can suspend */
                 s->iter = JS_UNDEFINED;   /* set below (inline) or by the create-cont settle */
                 s->next = JS_UNDEFINED;
-                s->values = JS_NewArray(ctx);
-                s->resolve_element_env = JS_NewArray(ctx);
-                s->elem_promises = JS_NewArray(ctx);
+                s->values = JS_UNDEFINED; s->resolve_element_env = JS_UNDEFINED; s->elem_promises = JS_UNDEFINED;
                 s->index = 0;
                 s->magic = pa_magic;
-                /* the two BRIEF-WINDOW values, stated rather than left to js_mallocz: the teardown frees them now
-                   (a state torn down mid-request still holds one), and "a zeroed JSValue happens to be an int" is
-                   not a contract this file should depend on. */
+                /* the BRIEF-WINDOW values, stated rather than left to js_mallocz: the teardown frees them now (a
+                   state torn down mid-request still holds one), and "a zeroed JSValue happens to be an int" is not
+                   a contract this file should depend on. */
                 s->fin_arg = JS_UNDEFINED; s->elem_value = JS_UNDEFINED;
+                s->acq_method = tramp_iter_getiter; tramp_iter_getiter = JS_UNDEFINED;
+                s->acq_iterable = js_dup((call_argc >= 1) ? call_argv[0] : JS_UNDEFINED);
                 TAKE_CALL_SHAPE(); s->orig_cfirst = call_first_r; s->orig_cargc = call_pop; s->orig_is_tail = tramp_is_tail;
                 s->args_own = call_args_owned; s->args_own_n = call_args_owned_n;
                 call_args_owned = NULL; call_args_owned_n = 0;
+                /* NewPromiseCapability(C) for the AGGREGATE. For a subclass that Construct is the page's code, and
+                   js_new_promise_capability ran it from C right here — so `Promise.all.call(Sub, …)` drove that
+                   constructor to completion. The state is built FIRST because the request can suspend: nothing
+                   that must survive it may sit in an interpreter local, which is why the acquire's method moved
+                   onto the state. */
+                tramp_cap_ctor = thisv; tramp_cap_outer = s; tramp_cap_kind = CONT_PROMISE_ALL;
+                goto do_promise_cap_tramp;
+            }
+
+        do_promise_all_have_cap:
+            {
+                JSPromiseAll *s = tramp_cap_outer;
+                JSValueConst thisv;
+                tramp_cap_outer = NULL; tramp_cap_kind = CONT_NONE;
+                s->result_promise = tramp_cap_promise; tramp_cap_promise = JS_UNDEFINED;
+                s->resolving_funcs[0] = tramp_cap_funcs[0]; tramp_cap_funcs[0] = JS_UNDEFINED;
+                s->resolving_funcs[1] = tramp_cap_funcs[1]; tramp_cap_funcs[1] = JS_UNDEFINED;
+                tramp_iter_getiter = s->acq_method; s->acq_method = JS_UNDEFINED;
+                thisv = s->this_val;
+                s->promise_resolve = JS_GetProperty(ctx, thisv, JS_ATOM_resolve);
+                s->values = JS_NewArray(ctx);
+                s->resolve_element_env = JS_NewArray(ctx);
+                s->elem_promises = JS_NewArray(ctx);
                 if (JS_IsException(s->promise_resolve) || !JS_IsFunction(ctx, s->promise_resolve)
                     || JS_IsException(s->values) || JS_IsException(s->resolve_element_env)
                     || JS_IsException(s->elem_promises)
@@ -26416,7 +26459,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                       JSValue *cv = sp - cg; for (i = cf; i < cg; i++) JS_FreeValue(ctx, cv[i]); sp += cf - cg;
                       if (it) { ret_val = r; goto do_return; } *sp++ = r; BREAK; }
                 }
-                tramp_consume_iterable = (call_argc >= 1) ? call_argv[0] : JS_UNDEFINED;
+                tramp_consume_iterable = s->acq_iterable;   /* borrowed from the STATE, which outlives the acquire */
                 tramp_consume_state = s; tramp_consume_kind = CONT_PROMISE_ALL;
                 goto do_consume_acquire_iterator;   /* GetIterator + its throw-rejects-the-aggregate live in the shared deliver */
             }
@@ -32932,6 +32975,8 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                 ns->this_val = js_dup(os->this_val);
                 ns->promise_resolve = js_dup(os->promise_resolve);
                 ns->elem_value = js_dup(os->elem_value);   /* in flight when a fork lands mid-resolve */
+                ns->acq_method = js_dup(os->acq_method);       /* both in flight when a fork lands mid-capability */
+                ns->acq_iterable = js_dup(os->acq_iterable);
                 ns->result_promise = js_new_promise_capability(ctx, ns->resolving_funcs, os->this_val);   /* fresh aggregate + [resolve,reject] */
                 ns->values = JS_NewArray(ctx);
                 ns->resolve_element_env = JS_NewArray(ctx);
@@ -72654,6 +72699,8 @@ static void js_promise_all_end(JSContext *ctx, JSPromiseAll *s)
     JS_FreeValue(ctx, s->elem_promises);
     JS_FreeValue(ctx, s->fin_arg);     /* held only between the step that builds it and the drive that takes it */
     JS_FreeValue(ctx, s->elem_value);  /* likewise, for the per-element resolve */
+    JS_FreeValue(ctx, s->acq_method);    /* both held across the capability request */
+    JS_FreeValue(ctx, s->acq_iterable);
     if (s->args_own) { free_arg_list(ctx, s->args_own, s->args_own_n); s->args_own = NULL; s->args_own_n = 0; }
 }
 
