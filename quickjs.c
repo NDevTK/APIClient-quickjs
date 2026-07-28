@@ -19466,8 +19466,18 @@ static bool tramp_can_call_promise_exec(JSContext *ctx, JSValueConst func, JSVal
                                   async frame has already popped when the call is issued, so everything the
                                   placement still owes (the promise, who asked for it, in what operand shape)
                                   rides this state rather than an interpreter local a suspension would lose. */
+enum { ASYNC_POST_FAIL = -1, ASYNC_POST_NONE = 0, ASYNC_POST_CALL = 1, ASYNC_POST_AWAIT = 2 };
+/* What an async body's completion still owes, once everything that runs no page code has been done. `func(value)`
+   is the call the CALLER places; for ASYNC_POST_AWAIT it is Await's PromiseResolve step and `await_promise` is
+   the capability the finish then registers the continuation on, which is why the two are handed out together. */
+typedef struct JSAsyncPost {
+    JSValue func, value;      /* owned */
+    JSValue await_promise;    /* AWAIT only (owned); UNDEFINED otherwise */
+    JSAsyncFunctionData *st;  /* AWAIT only: a reference the finish releases */
+} JSAsyncPost;
 typedef struct JSAsyncSettle {
     JSValue promise;      /* the async function's own promise (owned): the CALL's result is discarded, this is not */
+    JSAsyncPost post;     /* AWAIT only: the capability the finish registers on, once the resolve call has run */
     void *cont; uint8_t cont_kind;   /* the machine that asked for the async call, if one did */
     int cfirst, cargc, forof;        /* its operand shape and for-of offset */
     uint8_t is_tail;
@@ -21657,9 +21667,11 @@ static inline bool tramp_is_reflect_apply(JSValueConst method) {
 static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s, JSValueConst func_obj,
                                        JSValueConst this_obj, int argc, JSValueConst *argv);
 static void js_async_function_free(JSRuntime *rt, JSAsyncFunctionData *s);
-enum { ASYNC_POST_FAIL = -1, ASYNC_POST_NONE = 0, ASYNC_POST_CALL = 1 };
 static int js_async_function_post_prepare(JSContext *ctx, JSAsyncFunctionData *s, JSValue func_ret,
-                                          JSValue *out_func, JSValue *out_value);
+                                          JSAsyncPost *out);
+/* Await's remaining steps once its resolve call has run: create the continuation's resolving functions and
+   PerformPromiseThen on the capability. Consumes `p->await_promise` and the reference `p->st` holds. */
+static int js_async_function_await_finish(JSContext *ctx, JSAsyncPost *p);
 /* Run `func(value)` as a CALL-ROOT FLOW whose whole body is that one call — the same base a promise reaction
    runs on — so a loop or an await inside a capability's resolve parks into the job pump instead of running to
    completion in a C activation. 0 = done, -1 = it threw (the exception is live). */
@@ -24478,6 +24490,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (unlikely(JS_IsException(ret_val))) {
                             JSAsyncSettle *ass = dcs;
                             JS_FreeValue(ctx, ass->promise);
+                            JS_FreeValue(ctx, ass->post.await_promise);
+                            if (ass->post.st) js_async_function_free(rt, ass->post.st);
                             if (ass->cont_kind != CONT_NONE) js_create_requester_abandon(ctx, ass->cont, ass->cont_kind);
                             js_free_rt(rt, ass);
                             goto exception;
@@ -27454,10 +27468,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 uint8_t aitail = atf->is_tail;
                 void *acs = atf->cont_state; uint8_t ack = atf->cont_kind;
                 int acf = atf->call_first, acp = atf->call_argc, afof = atf->forof_off;
-                JSValue asf_func, asf_val;
+                JSAsyncPost asf;
                 int post;
                 sf->cur_pc = pc; sf->cur_sp = sp;   /* the async frame state the settle's prepare reads */
-                post = js_async_function_post_prepare(ctx, as, ret_val, &asf_func, &asf_val);
+                post = js_async_function_post_prepare(ctx, as, ret_val, &asf);
                 js_async_function_free(rt, as);     /* drop the creation ref; a suspended continuation keeps its own */
                 /* pop: the async frame's buffers belong to `as` (freed by post/terminate on completion) — so read the
                    caller frame from atf (NOT sf->prev_frame, which would be a use-after-free of the freed async frame;
@@ -27480,26 +27494,30 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (ack != CONT_NONE) js_create_requester_abandon(ctx, acs, ack);
                     goto exception;
                 }
-                if (post == ASYNC_POST_CALL) {
+                if (post == ASYNC_POST_CALL || post == ASYNC_POST_AWAIT) {
                     /* the SETTLE is a call on THIS chain. The async frame is already popped, so its operands go
                        on the caller's stack above whatever is there; the placement below is deferred until the
                        call returns, which is what the state carries. */
                     JSAsyncSettle *ass = js_malloc_rt(rt, sizeof(*ass));
                     if (unlikely(!ass)) {
-                        JS_FreeValue(ctx, asf_func); JS_FreeValue(ctx, asf_val); JS_FreeValue(ctx, aprom);
+                        JS_FreeValue(ctx, asf.func); JS_FreeValue(ctx, asf.value);
+                        JS_FreeValue(ctx, asf.await_promise);
+                        if (asf.st) js_async_function_free(rt, asf.st);
+                        JS_FreeValue(ctx, aprom);
                         if (ack != CONT_NONE) js_create_requester_abandon(ctx, acs, ack);
                         JS_ThrowOutOfMemory(ctx);
                         goto exception;
                     }
                     ass->promise = aprom;
+                    ass->post = asf;         /* the await's capability + reference, for the finish after the call */
                     ass->cont = acs; ass->cont_kind = ack;
                     ass->cfirst = acf; ass->cargc = acp; ass->forof = afof;
                     ass->is_tail = aitail;
                     DCHECK(sp + 3 <= TRAMP_SP_LIMIT(sf),
                            "async settle: operand push exceeds the frame's compiled stack_size");
                     *sp++ = JS_UNDEFINED;    /* this */
-                    *sp++ = asf_func;        /* the resolving function (owned, transferred) */
-                    *sp++ = asf_val;         /* the value (owned, transferred) */
+                    *sp++ = asf.func;        /* the resolving function (owned, transferred) */
+                    *sp++ = asf.value;       /* the value (owned, transferred) */
                     call_argv = sp - 1; call_argc = 1; tramp_first = -2; tramp_is_tail = 0;
                     tramp_cont_state = ass; tramp_cont_kind = CONT_ASYNC_SETTLE;
                     goto do_generic_callee;
@@ -27528,9 +27546,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 void *acs = ass->cont; uint8_t ack = ass->cont_kind;
                 int acf = ass->cfirst, acp = ass->cargc, afof = ass->forof;
                 uint8_t aitail = ass->is_tail;
+                JSAsyncPost post = ass->post;
                 cont_st = NULL;
                 js_free_rt(rt, ass);
                 JS_FreeValue(ctx, ret_val);
+                if (!JS_IsUndefined(post.await_promise)
+                    && js_async_function_await_finish(ctx, &post) < 0) {
+                    /* Await's PerformPromiseThen could not be registered (allocation): the continuation can never
+                       run, so the promise and whatever asked for it go the way every abandoned requester does. */
+                    JS_FreeValue(ctx, aprom);
+                    if (ack != CONT_NONE) js_create_requester_abandon(ctx, acs, ack);
+                    goto exception;
+                }
                 if (ack != CONT_NONE) {
                     dlv_cs = acs; dlv_ck = ack;
                     dlv_cfirst = acf; dlv_cargc = acp; dlv_itail = 0; dlv_forof = afof;
@@ -32455,6 +32482,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                Promise.try settle's throw has. */
             JSAsyncSettle *ass = xcs;
             JS_FreeValue(ctx, ass->promise);
+            JS_FreeValue(ctx, ass->post.await_promise);
+            if (ass->post.st) js_async_function_free(rt, ass->post.st);
             if (ass->cont_kind != CONT_NONE) js_create_requester_abandon(ctx, ass->cont, ass->cont_kind);
             js_free_rt(rt, ass);
             xcs = NULL;
@@ -33772,10 +33801,13 @@ static int js_async_function_resolve_create(JSContext *ctx,
    flow. ASYNC_POST_CALL hands out an OWNED (func, value) pair; NONE means the await path registered a
    continuation and there is nothing to call; FAIL is an uncatchable error. */
 static int js_async_function_post_prepare(JSContext *ctx, JSAsyncFunctionData *s, JSValue func_ret,
-                                          JSValue *out_func, JSValue *out_value)
+                                          JSAsyncPost *out)
 {
+    JSValue *out_func = &out->func, *out_value = &out->value;
     *out_func = JS_UNDEFINED;
     *out_value = JS_UNDEFINED;
+    out->await_promise = JS_UNDEFINED;
+    out->st = NULL;
     if (JS_IsException(func_ret)) {
     fail:
         if (unlikely(JS_IsUncatchableError(ctx->rt->current_exception))) {
@@ -33808,33 +33840,67 @@ static int js_async_function_post_prepare(JSContext *ctx, JSAsyncFunctionData *s
                built "async resume is a scheduler flow" case; fail LOUD at the origin instead of corrupting. */
             DCHECK(JS_VALUE_GET_TAG(func_ret) == JS_TAG_INT && JS_VALUE_GET_INT(func_ret) == FUNC_RET_AWAIT,
                    "resumed async body suspended with non-AWAIT code (preempt-in-resumed-async not built as a flow)");
-            /* await */
+            /* await: 27.7.5.3 step 1 is PromiseResolve(%Promise%, value), and its RESOLVE CALL is page code —
+               the native resolving function's `Get(resolution, "then")` when the awaited value is a thenable, so
+               `await thenable` ran that read from C. The call is handed out like the settle and the rest of Await
+               finishes once it has run. */
             JS_FreeValue(ctx, func_ret); /* not used */
-            promise = js_promise_resolve_native(ctx, ctx->promise_ctor,
-                                         1, vc(&value), 0);
-            JS_FreeValue(ctx, value);
-            if (JS_IsException(promise))
-                goto fail;
-            if (js_async_function_resolve_create(ctx, s, resolving_funcs)) {
-                JS_FreeValue(ctx, promise);
-                goto fail;
+            if (JS_GetOpaque(value, JS_CLASS_PROMISE)) {
+                /* PromiseResolve's short-circuit: an already-native promise IS the result, and no call happens
+                   at all. The `constructor` READ it performs is still a C read — a promise with an accessor
+                   `constructor` is the one page-code step left in this function. */
+                JSValue c2 = JS_GetProperty(ctx, value, JS_ATOM_constructor);
+                bool is_same;
+                if (JS_IsException(c2)) { JS_FreeValue(ctx, value); goto fail; }
+                is_same = js_same_value(ctx, c2, ctx->promise_ctor);
+                JS_FreeValue(ctx, c2);
+                if (is_same) {
+                    out->await_promise = value;   /* ownership moves */
+                    out->st = s;
+                    JS_REF_COUNT(s)++;
+                    if (js_async_function_await_finish(ctx, out) < 0)
+                        goto fail;
+                    return ASYNC_POST_NONE;
+                }
             }
-
-            /* Note: no need to create 'thrownawayCapability' as in
-               the spec */
-            for(i = 0; i < 2; i++)
-                resolving_funcs1[i] = JS_UNDEFINED;
-            res = perform_promise_then(ctx, promise,
-                                       vc(resolving_funcs),
-                                       vc(resolving_funcs1));
-            JS_FreeValue(ctx, promise);
-            for(i = 0; i < 2; i++)
-                JS_FreeValue(ctx, resolving_funcs[i]);
-            if (res)
-                goto fail;
+            promise = js_new_promise_capability(ctx, resolving_funcs, ctx->promise_ctor);
+            if (JS_IsException(promise)) { JS_FreeValue(ctx, value); goto fail; }
+            JS_FreeValue(ctx, resolving_funcs[1]);
+            out->func = resolving_funcs[0];   /* ownership moves */
+            out->value = value;
+            out->await_promise = promise;
+            out->st = s;
+            JS_REF_COUNT(s)++;   /* the finish runs after the call; the state must outlive the caller's release */
+            (void)i; (void)res; (void)resolving_funcs1;
+            return ASYNC_POST_AWAIT;
         }
     }
     return ASYNC_POST_NONE;
+}
+
+static int js_async_function_await_finish(JSContext *ctx, JSAsyncPost *p)
+{
+    JSAsyncFunctionData *s = p->st;
+    JSValue promise = p->await_promise;
+    JSValue resolving_funcs[2], resolving_funcs1[2];
+    int i, res;
+
+    p->await_promise = JS_UNDEFINED;
+    p->st = NULL;
+    if (js_async_function_resolve_create(ctx, s, resolving_funcs)) {
+        JS_FreeValue(ctx, promise);
+        js_async_function_free(ctx->rt, s);
+        return -1;
+    }
+    /* Note: no need to create 'thrownawayCapability' as in the spec */
+    for(i = 0; i < 2; i++)
+        resolving_funcs1[i] = JS_UNDEFINED;
+    res = perform_promise_then(ctx, promise, vc(resolving_funcs), vc(resolving_funcs1));
+    JS_FreeValue(ctx, promise);
+    for(i = 0; i < 2; i++)
+        JS_FreeValue(ctx, resolving_funcs[i]);
+    js_async_function_free(ctx->rt, s);
+    return res ? -1 : 0;
 }
 
 /* Resume an async body one step, then post-process (settle the promise / register the await continuation). The
@@ -33877,13 +33943,19 @@ static bool js_async_function_resume_as_flow(JSContext *ctx, JSAsyncFunctionData
     {
         /* the SETTLE is its own call-root flow: the resolving function is page code (a subclass's, or the native
            one's `then` read on a thenable), and this context has no tramp chain to route it onto. */
-        JSValue f, v;
-        int st = js_async_function_post_prepare(ctx, s, func_ret, &f, &v);
-        if (st != ASYNC_POST_CALL)
+        JSAsyncPost post;
+        int st = js_async_function_post_prepare(ctx, s, func_ret, &post);
+        if (st != ASYNC_POST_CALL && st != ASYNC_POST_AWAIT)
             return st != ASYNC_POST_FAIL;
-        st = js_settle_as_flow(ctx, f, v);
-        JS_FreeValue(ctx, f);
-        JS_FreeValue(ctx, v);
+        st = js_settle_as_flow(ctx, post.func, post.value);
+        JS_FreeValue(ctx, post.func);
+        JS_FreeValue(ctx, post.value);
+        if (st == 0 && !JS_IsUndefined(post.await_promise))
+            st = js_async_function_await_finish(ctx, &post);
+        if (st != 0 && post.st) {   /* the call threw before the finish could consume them */
+            JS_FreeValue(ctx, post.await_promise);
+            js_async_function_free(ctx->rt, post.st);
+        }
         return st == 0;
     }
 }
@@ -72829,12 +72901,13 @@ static JSValue js_promise_resolve_function_call(JSContext *ctx,
     bool is_reject;
 
     /* Reached only by a JS_Call from C — every call that goes through the interpreter's convergence point is the
-       step machine above, and the promise-reaction settle was converted to reach it. TWO C callers remain and
-       both perform the `then` READ from here, which is the one step of 27.2.1.3.2 that can be page code:
-       js_async_function_post (through js_promise_resolve_native, when an async function RETURNS a thenable) and
-       the module-evaluation capability. Each needs its own settle to become part of a flow, exactly as
-       reaction_flow_settle_start did; until then a thenable with an accessor or Proxy `then` reaching one of
-       them runs that read with no flow base. */
+       step machine above, and every settle that used to JS_Call from here was converted to reach one: the
+       promise-reaction settle, the async function's, and an async FUNCTION's Await. ONE caller is left and it is
+       the async GENERATOR's Await — js_async_generator_await, through js_promise_resolve_native — which needs the
+       identical split js_async_function_post_prepare just got: hand the resolve call out, finish Await's
+       PerformPromiseThen after it has run, and route it as CONT_ASYNC_SETTLE does from the tramp chain. Until
+       then `for await` and `yield await thenable` in an async generator read `then` from here, with no flow
+       base. */
     s = p->u.promise_function_data;
     if (!s || s->presolved->already_resolved)
         return JS_UNDEFINED;
