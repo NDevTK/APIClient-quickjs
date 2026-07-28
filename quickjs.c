@@ -17324,7 +17324,6 @@ static int JS_IteratorClose(JSContext *ctx, JSValueConst enum_obj,
    objs. If 'done' is true or in case of exception, 'enum_rec' is set
    to undefined. If 'done' is true, 'value' is always set to
    undefined. */
-static JSValue JS_IteratorStepValue(JSContext *ctx, JSValueConst obj, int *pdone);
 /* The for-of protocol TAIL: IteratorNext's object check, then IteratorComplete/IteratorValue, then [value,
    done] pushed above the enum_rec — whose iterator slot is cleared on done so the loop's OP_iterator_close does
    not close an exhausted iterator. `sp` is the caller's stack with the call's operands already dropped; the
@@ -17351,40 +17350,6 @@ static void js_iternext_deliver(JSContext *ctx, JSValue *sp, JSValue ret_val)
    C helper, because the two reads it performs are the page's code and have to be requests.
    What made the fallback removable was giving do_generic_callee's direct-call arm a continuation: until then a
    callee with no heap frame could only push its result, so the opcode had to keep a second way to finish. */
-
-/* 7.4.4 IteratorComplete: ToBoolean(? Get(iterResult, "done")). -1 on an abrupt completion. */
-static int JS_IteratorComplete(JSContext *ctx, JSValueConst obj)
-{
-    JSValue done_val = JS_GetProperty(ctx, obj, JS_ATOM_done);
-    if (JS_IsException(done_val))
-        return -1;
-    return JS_ToBoolFree(ctx, done_val);
-}
-
-/* 7.4.6 IteratorStep, minus the .next() call the caller already made: IteratorComplete, then IteratorValue
-   ONLY when it said not-done. Reading `value` on a done result is OBSERVABLE (a `value` getter runs) and no
-   for-of consumer has anywhere to put it — ForIn/OfBodyEvaluation step 3.h returns before step 3.i, both in
-   the sync form (OP_for_of_next) and the async one (OP_iterator_get_value_done). This is the shape
-   JS_IteratorNext already had; the two had drifted.
-   NOT for AsyncFromSyncIteratorContinuation, whose step 3 reads `value` unconditionally — see js_async_from_sync_iterator_next. */
-static JSValue JS_IteratorStepValue(JSContext *ctx, JSValueConst obj, int *pdone)
-{
-    JSValue value;
-    int done = JS_IteratorComplete(ctx, obj);
-    if (done < 0)
-        goto fail;
-    value = JS_UNDEFINED;
-    if (!done) {
-        value = JS_GetProperty(ctx, obj, JS_ATOM_value);
-        if (JS_IsException(value))
-            goto fail;
-    }
-    *pdone = done;
-    return value;
- fail:
-    *pdone = false;
-    return JS_EXCEPTION;
-}
 
 static JSValue js_sync_dispose_wrapper(JSContext *ctx, JSValueConst this_val,
                                        int argc, JSValueConst *argv,
@@ -19444,7 +19409,10 @@ typedef struct JSForOfUnpack {
                       order are identical; only the placement differs, which is why one label serves both. */
 } JSForOfUnpack;
 enum { FOU_FOROF = 0,      /* OP_for_of_next: value at sp[0], done at sp[1]; a done result closes the enum_rec */
-       FOU_VALUE_DONE };   /* OP_iterator_get_value_done: value REPLACES sp[-1], done at sp[0]; nothing closes */
+       FOU_VALUE_DONE,     /* OP_iterator_get_value_done: value REPLACES sp[-1], done at sp[0]; nothing closes */
+       FOU_YIELD_STAR };   /* a yield*-delivered result in a for-of drive: placed like FOROF, but the GENERATOR's
+                              own completion is what ends the loop, so this path never closed the enum_rec and
+                              must keep not closing it. */
 #define CONT_PROMISE_ALL_GET 45  /* gp_outer = JSPromiseAll: the combinator's IteratorComplete / IteratorValue on
                                     its iterable's .next() result. */
 #define CONT_ITER_HELPER_GET 44  /* gp_outer = JSIteratorHelperData: the helper's IteratorComplete / IteratorValue
@@ -20746,7 +20714,7 @@ typedef struct JSAsyncFromSync {
                                     read from can be released before the drive returns. */
     /* 27.1.4.4 steps 1-4: IteratorComplete then IteratorValue on the sync .next()'s RESULT. Both read the result
        object, which a hand-written sync iterator can make an accessor or a Proxy — page code, and the deliver
-       read them with JS_IteratorComplete / JS_GetProperty from C. They are requests now, one phase each, and the
+       read them with JS_GetProperty from C. They are requests now, one phase each, and the
        result parks here across them. */
     JSValue res_obj;             /* the sync iterator result being unpacked (owned) */
     uint8_t res_ph;              /* 0 = none, 1 = the `done` read is in flight, 2 = the `value` read is */
@@ -25587,7 +25555,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             /* ret_val = whichever read just answered; the phase says which. */
             {
                 JSForOfUnpack *fu = (JSForOfUnpack *)cont_st;
-                JSValue *slot = (fu->mode == FOU_FOROF) ? sp : sp - 1;
+                JSValue *slot = (fu->mode == FOU_VALUE_DONE) ? sp - 1 : sp;
                 if (fu->ph == 1) {
                     if (!JS_ToBoolFree(ctx, ret_val)) { fu->ph = 2; goto do_forof_unpack_read; }
                     if (fu->mode == FOU_FOROF) { JS_FreeValue(ctx, sp[fu->rfof]); sp[fu->rfof] = JS_UNDEFINED; }
@@ -25599,7 +25567,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 ret_val = JS_UNDEFINED;
                 cont_st = NULL;
                 JS_FreeValue(ctx, fu->res);
-                sp += (fu->mode == FOU_FOROF) ? 2 : 1;
+                sp += (fu->mode == FOU_VALUE_DONE) ? 1 : 2;
                 js_free_rt(rt, fu);
             }
             BREAK;
@@ -28138,13 +28106,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     /* OP_for_of_next protocol: value at sp[0], done at sp[1], then sp += 2. A yield* (gdone==2)
                        delivered an iterator-result object; unpack it into (value, done). */
                     if (gdone == 2) {
-                        int d; JSValue v = JS_IteratorStepValue(ctx, value, &d);
-                        JS_FreeValue(ctx, value);
-                        if (JS_IsException(v)) goto exception;
-                        sp[0] = v; sp[1] = js_bool(d);
-                    } else {
-                        sp[0] = value; sp[1] = js_bool(gdone);
+                        /* a yield* delivered an iterator-result OBJECT: the same 7.4.6 unpack every other
+                           for-of delivery does, so it takes the same label. */
+                        ret_val = value;
+                        forof_unpack_mode = FOU_YIELD_STAR;
+                        goto do_forof_unpack;
                     }
+                    sp[0] = value; sp[1] = js_bool(gdone);
                     sp += 2;
                     BREAK;
                 }
