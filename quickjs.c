@@ -21237,13 +21237,16 @@ static int js_tramp_proxy_apply(JSContext *ctx, JSValueConst func_obj, JSValueCo
 static bool tramp_resolve_proxy_callee(JSContext *ctx, JSValueConst func, JSValue *out)
 {
     JSValueConst cur = func;
-    int guard = 0;
     *out = JS_UNDEFINED;
+    /* The walk terminates STRUCTURALLY, so there is nothing here to bound: a proxy's [[ProxyTarget]] is fixed at
+       construction and the target must already exist to be passed, so every hop moves to a strictly OLDER object
+       and the chain cannot cycle. A `< 10000` counter used to stand here; a magic number asserting something the
+       construction rule already guarantees is a cap wearing an assert's clothes, and it would have fired on a
+       legitimately deep chain. */
     while (JS_VALUE_GET_TAG(cur) == JS_TAG_OBJECT
            && JS_VALUE_GET_OBJ(cur)->class_id == JS_CLASS_PROXY) {
         JSProxyData *s;
         JSValue method;
-        DCHECK(++guard < 10000, "proxy callee resolution did not terminate");
         s = get_proxy_method(ctx, &method, cur, JS_ATOM_apply);
         if (!s) return false;                       /* revoked / handler get threw */
         if (!JS_IsUndefined(method)) { JS_FreeValue(ctx, method); break; }   /* trap here: stop AT this proxy */
