@@ -1456,7 +1456,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_ITER_TAKE, STEPDEF_ITER_DROP, STEPDEF_ITER_WRAP_RETURN,
     STEPDEF_ITER_CONCAT_NEXT, STEPDEF_ITER_CONCAT_RETURN, STEPDEF_ARRAY_ITER_NEXT,
     STEPDEF_OWNKEYS_NAMES, STEPDEF_OWNKEYS_SYMBOLS, STEPDEF_REFLECT_OWNKEYS,
-    STEPDEF_OBJ_KEYS,
+    STEPDEF_OBJ_KEYS, STEPDEF_OBJ_DESCS,
     /* one per error KIND: a step constructor's magic IS its definition id, so the kind cannot also ride there.
        The block is contiguous and indexed by JSErrorEnum, with JS_PLAIN_ERROR last. */
     STEPDEF_ERROR_CTOR_BASE,
@@ -20863,6 +20863,11 @@ typedef struct JSArrayFromLike {
 #define ARRAYFLAT_FLAT    0
 #define ARRAYFLAT_FLATMAP 1
 
+#define PROPWALK_DESCS   5   /* Object.getOwnPropertyDescriptors — the same walk over [[OwnPropertyKeys]], but it
+                                keeps SYMBOL keys, applies no enumerability filter, and the element it collects is
+                                the descriptor the per-key [[GetOwnProperty]] already produced, so it performs no
+                                Get at all. Its own body called Object.getOwnPropertyDescriptor from C in a loop,
+                                which reached both proxy traps from C. */
 #define PROPWALK_KEYS    4   /* Object.keys — the SAME EnumerableOwnProperties walk with `key` as the kind, so it
                                 stops one step earlier: it never performs the per-key Get. Its own C body reached
                                 [[OwnPropertyKeys]] and [[GetOwnProperty]] through JS_GetOwnPropertyNames2, which
@@ -52758,61 +52763,6 @@ static JSValue js_gopd_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
-static JSValue js_object_getOwnPropertyDescriptors(JSContext *ctx, JSValueConst this_val,
-                                                   int argc, JSValueConst *argv)
-{
-    //getOwnPropertyDescriptors(obj)
-    JSValue obj, r;
-    JSObject *p;
-    JSPropertyEnum *props;
-    uint32_t len, i;
-
-    r = JS_UNDEFINED;
-    obj = JS_ToObject(ctx, argv[0]);
-    if (JS_IsException(obj))
-        return JS_EXCEPTION;
-
-    p = JS_VALUE_GET_OBJ(obj);
-    if (JS_GetOwnPropertyNamesInternal(ctx, &props, &len, p,
-                               JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK))
-        goto exception;
-    r = JS_NewObject(ctx);
-    if (JS_IsException(r))
-        goto exception;
-    for(i = 0; i < len; i++) {
-        JSValue atomValue, desc;
-        JSValueConst args[2];
-
-        atomValue = JS_AtomToValue(ctx, props[i].atom);
-        if (JS_IsException(atomValue))
-            goto exception;
-        /* the singular form is a step machine now, so this walk performs the two primitives itself: the key is
-           already an atom (no ToPropertyKey to run) and [[GetOwnProperty]] is the C hook — which is where a
-           `getOwnPropertyDescriptor` trap with a loop in it aborts by name, this being an unconverted consumer. */
-        {
-            JSPropertyDescriptor pd;
-            int pres = JS_GetOwnPropertyInternal(ctx, &pd, JS_VALUE_GET_OBJ(obj), props[i].atom);
-            desc = (pres < 0) ? JS_EXCEPTION : pres ? js_desc_to_object(ctx, &pd) : JS_UNDEFINED;
-        }
-        JS_FreeValue(ctx, atomValue);
-        if (JS_IsException(desc))
-            goto exception;
-        if (!JS_IsUndefined(desc)) {
-            if (JS_DefinePropertyValue(ctx, r, props[i].atom, desc,
-                                       JS_PROP_C_W_E | JS_PROP_THROW) < 0)
-                goto exception;
-        }
-    }
-    js_free_prop_enum(ctx, props, len);
-    JS_FreeValue(ctx, obj);
-    return r;
-
-exception:
-    js_free_prop_enum(ctx, props, len);
-    JS_FreeValue(ctx, obj);
-    JS_FreeValue(ctx, r);
-    return JS_EXCEPTION;
-}
 
 /* The KEY list of an object's own properties, as an Array: Object.keys / getOwnPropertyNames /
    getOwnPropertySymbols / Reflect.ownKeys. It used to take a `kind` and additionally READ each value for
@@ -52890,7 +52840,8 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
            target is the object the opcode just created — already an object, and it belongs to the opcode's stack,
            so it is only BORROWED here. `result` is what the machine hands back, which a spread discards. */
         s->result = assign ? JS_ToObject(ctx, step_arg(&s->hdr, 0))
-                  : (mode == PROPWALK_SPREAD ? js_dup(step_arg(&s->hdr, 0)) : JS_NewArray(ctx));
+                  : (mode == PROPWALK_SPREAD ? js_dup(step_arg(&s->hdr, 0))
+                     : mode == PROPWALK_DESCS ? JS_NewObject(ctx) : JS_NewArray(ctx));
         if (JS_IsException(s->result)) { s->result = JS_UNDEFINED; return -1; }
         s->hdr.stage = 1;
     }
@@ -52939,7 +52890,8 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
                 JSValue kv = JS_GetPropertyUint32(ctx, keys, ki);
                 JSAtom at;
                 if (JS_IsException(kv)) { JS_FreeValue(ctx, keys); s->len = kept; return -1; }
-                if (JS_IsSymbol(kv) && mode != PROPWALK_ASSIGN && mode != PROPWALK_SPREAD) {
+                if (JS_IsSymbol(kv) && mode != PROPWALK_ASSIGN && mode != PROPWALK_SPREAD
+                    && mode != PROPWALK_DESCS) {
                     JS_FreeValue(ctx, kv);
                     continue;
                 }
@@ -52983,6 +52935,15 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
             cb_result = JS_UNDEFINED;
             if (JS_IsException(desc)) return -1;
             if (JS_IsUndefined(desc)) { s->i++; s->hdr.stage = 2; continue; }
+            if (mode == PROPWALK_DESCS) {
+                /* 20.1.2.9 step 4.b-c: the descriptor IS the element, kept for every key regardless of
+                   enumerability, and defined on the result. */
+                if (JS_DefinePropertyValue(ctx, s->result, JS_DupAtom(ctx, s->atoms[s->i].atom), desc,
+                                           JS_PROP_C_W_E | JS_PROP_THROW) < 0)
+                    return -1;
+                s->i++; s->hdr.stage = 2;
+                continue;
+            }
             en = JS_GetProperty(ctx, desc, JS_ATOM_enumerable);
             JS_FreeValue(ctx, desc);
             if (JS_IsException(en)) return -1;
@@ -53639,7 +53600,7 @@ static const JSCFunctionListEntry js_object_funcs[] = {
     JS_CFUNC_MAGIC_DEF("isExtensible", 1, js_object_isExtensible, 0 ),
     JS_CFUNC_MAGIC_DEF("preventExtensions", 1, js_object_preventExtensions, 0 ),
     JS_CFUNC_STEP_DEF("getOwnPropertyDescriptor", 2, STEPDEF_OBJ_GOPD ),
-    JS_CFUNC_DEF("getOwnPropertyDescriptors", 1, js_object_getOwnPropertyDescriptors ),
+    JS_CFUNC_STEP_DEF("getOwnPropertyDescriptors", 1, STEPDEF_OBJ_DESCS ),
     JS_CFUNC_DEF("is", 2, js_object_is ),
     JS_CFUNC_STEP_DEF("assign", 2, STEPDEF_OBJ_ASSIGN ),
     JS_CFUNC_MAGIC_DEF("seal", 1, js_object_seal, 0 ),
@@ -57794,6 +57755,7 @@ static const JSTrampStepDef js_ta_join_def        = { sizeof(JSArrayJoin), js_ar
 static const JSTrampStepDef js_ta_tolocale_def    = { sizeof(JSArrayJoin), js_array_join_step, js_array_join_fini, JOIN_TA_LOCALE };
 static const JSTrampStepDef js_obj_values_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_VALUES };
 static const JSTrampStepDef js_obj_keys_def       = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_KEYS };
+static const JSTrampStepDef js_obj_descs_def      = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_DESCS };
 static const JSTrampStepDef js_obj_entries_def    = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_ENTRIES };
 static const JSTrampStepDef js_obj_assign_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_ASSIGN };
 static const JSTrampStepDef js_obj_spread_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_SPREAD };
@@ -57992,6 +57954,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_OBJ_DEFINEPROPERTY]     = &js_obj_defprop_def,
     [STEPDEF_REFLECT_DEFINEPROPERTY] = &js_refl_defprop_def,
     [STEPDEF_OBJ_KEYS] = &js_obj_keys_def,
+    [STEPDEF_OBJ_DESCS] = &js_obj_descs_def,
     [STEPDEF_OWNKEYS_NAMES] = &js_ownkeys_names_def,
     [STEPDEF_OWNKEYS_SYMBOLS] = &js_ownkeys_syms_def,
     [STEPDEF_REFLECT_OWNKEYS] = &js_reflect_ownkeys_def,
