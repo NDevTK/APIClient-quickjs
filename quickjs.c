@@ -1458,7 +1458,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_OWNKEYS_NAMES, STEPDEF_OWNKEYS_SYMBOLS, STEPDEF_REFLECT_OWNKEYS,
     STEPDEF_OBJ_KEYS, STEPDEF_OBJ_DESCS,
     STEPDEF_REFLECT_GET, STEPDEF_REFLECT_SET, STEPDEF_REFLECT_HAS, STEPDEF_REFLECT_DELETE,
-    STEPDEF_PROMISE_RESOLVE, STEPDEF_PROMISE_REJECT,
+    STEPDEF_PROMISE_RESOLVE, STEPDEF_PROMISE_REJECT, STEPDEF_PROMISE_CATCH, STEPDEF_PROMISE_FINALLY,
     /* one per error KIND: a step constructor's magic IS its definition id, so the kind cannot also ride there.
        The block is contiguous and indexed by JSErrorEnum, with JS_PLAIN_ERROR last. */
     STEPDEF_ERROR_CTOR_BASE,
@@ -59108,8 +59108,62 @@ static const JSTrampStepDef js_promise_reject_def = {
     sizeof(JSPromiseResolveM), js_promise_resolve_step, js_promise_resolve_fini, 1
 };
 
+/* Promise.prototype.catch (27.2.5.1) as a STEP MACHINE. It is `Invoke(promise, "then", «undefined, onRejected»)`
+   and BOTH halves of that Invoke are the page's code: the `then` READ (an accessor, a Proxy trap) and the CALL
+   (a thenable's own then, a subclass's override, the built-in — which is itself a machine). JS_Invoke performed
+   both from C, so `p.catch(f)` drove a looping `then` to completion. */
+typedef struct JSPromiseCatch {
+    JSStepHdr hdr;         /* MUST be first */
+    JSValue result;        /* owned: then's return, which IS catch's */
+    JSValue cb_args[4];    /* [this=promise, then, undefined, onRejected] */
+} JSPromiseCatch;
+_Static_assert(offsetof(JSPromiseCatch, hdr) == 0, "JSStepHdr must be first in JSPromiseCatch");
+
+static int js_promise_catch_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSPromiseCatch *s = st;
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result);          /* UNDEFINED on the first step */
+        s->hdr.stage = 1;
+        s->cb_args[0] = js_dup(s->hdr.this_val);
+        *out_cb = s->cb_args; *out_argc = (int)JS_ATOM_then;
+        return 6;   /* GETPROP: Invoke's GetV(promise, "then") */
+    }
+    if (s->hdr.stage == 1) {
+        /* cb_result = the `then` method. Invoke's Call is next; a non-callable one is that Call's TypeError. */
+        s->hdr.stage = 2;
+        s->cb_args[1] = cb_result;                       /* the method (owned) */
+        s->cb_args[2] = JS_UNDEFINED;                    /* onFulfilled */
+        s->cb_args[3] = js_dup(step_arg(&s->hdr, 0));    /* onRejected */
+        *out_cb = s->cb_args; *out_argc = 2;
+        return 3;   /* CALL */
+    }
+    s->result = cb_result;
+    return 0;
+}
+
+static JSValue js_promise_catch_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSPromiseCatch *s = st;
+    JSValue r = take_result ? s->result : (JS_FreeValue(ctx, s->result), JS_UNDEFINED);
+    int k;
+    for (k = 0; k < 4; k++) JS_FreeValue(ctx, s->cb_args[k]);
+    js_free_rt(ctx->rt, s);
+    return r;
+}
+
+static const JSTrampStepDef js_promise_catch_def = {
+    sizeof(JSPromiseCatch), js_promise_catch_step, js_promise_catch_fini, 0
+};
+
+/* .finally's machine is defined with the rest of the Promise code, below this table, because it builds the
+   reaction closures that live there. The table only needs its ADDRESS. */
+static const JSTrampStepDef js_promise_finally_def;
+
 static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_PROMISE_RESOLVE]       = &js_promise_resolve_def,
+    [STEPDEF_PROMISE_CATCH]         = &js_promise_catch_def,
+    [STEPDEF_PROMISE_FINALLY]       = &js_promise_finally_def,
     [STEPDEF_PROMISE_REJECT]        = &js_promise_reject_def,
     [STEPDEF_ARRAY_FIND]            = &js_array_find_def,
     [STEPDEF_ARRAY_FIND_INDEX]      = &js_array_findIndex_def,
@@ -72882,14 +72936,7 @@ static JSValue js_promise_then(JSContext *ctx, JSValueConst this_val,
     return result_promise;
 }
 
-static JSValue js_promise_catch(JSContext *ctx, JSValueConst this_val,
-                                int argc, JSValueConst *argv)
-{
-    JSValueConst args[2];
-    args[0] = JS_UNDEFINED;
-    args[1] = argv[0];
-    return JS_Invoke(ctx, this_val, JS_ATOM_then, 2, args);
-}
+
 
 static JSValue js_promise_finally_value_thunk(JSContext *ctx, JSValueConst this_val,
                                               int argc, JSValueConst *argv,
@@ -73018,41 +73065,96 @@ static JSValue js_promise_then_finally_func(JSContext *ctx, JSValueConst this_va
     return ret;
 }
 
-static JSValue js_promise_finally(JSContext *ctx, JSValueConst this_val,
-                                  int argc, JSValueConst *argv)
-{
-    JSValueConst onFinally = argv[0];
-    JSValue ctor, ret;
-    JSValue then_funcs[2];
-    JSValueConst func_data[2];
-    int i;
+/* Promise.prototype.finally (27.2.5.3) as a STEP MACHINE. Three of its steps are the page's code:
+   SpeciesConstructor's `constructor` and @@species reads, and Invoke(promise, "then", …) — whose own READ and
+   CALL are both user code. JS_SpeciesConstructor and JS_Invoke performed all four from C. */
+typedef struct JSPromiseFinally {
+    JSStepHdr hdr;         /* MUST be first */
+    JSValue ctor;          /* owned: the species constructor, captured into the two closures */
+    JSValue result;        /* owned: then's return, which IS finally's */
+    JSValue cb_args[4];    /* [this=promise, then, onFinally-wrapper, onFinally-wrapper] */
+} JSPromiseFinally;
+_Static_assert(offsetof(JSPromiseFinally, hdr) == 0, "JSStepHdr must be first in JSPromiseFinally");
 
-    ctor = JS_SpeciesConstructor(ctx, this_val, JS_UNDEFINED);
-    if (JS_IsException(ctor))
-        return ctor;
-    if (!JS_IsFunction(ctx, onFinally)) {
-        then_funcs[0] = js_dup(onFinally);
-        then_funcs[1] = js_dup(onFinally);
-    } else {
-        func_data[0] = ctor;
-        func_data[1] = onFinally;
-        for(i = 0; i < 2; i++) {
-            then_funcs[i] = JS_NewCFunctionData(ctx, js_promise_then_finally_func, 1, i, 2, func_data);
-            if (JS_IsException(then_funcs[i])) {
-                if (i == 1)
-                    JS_FreeValue(ctx, then_funcs[0]);
-                JS_FreeValue(ctx, ctor);
-                return JS_EXCEPTION;
-            }
-            promise_closure_set_step(then_funcs[i], &js_promise_then_finally_def);   /* onFinally parks on the tramp */
-        }
+static int js_promise_finally_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSPromiseFinally *s = st;
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result);          /* UNDEFINED on the first step */
+        if (!JS_IsObject(s->hdr.this_val)) { JS_ThrowTypeErrorNotAnObject(ctx); return -1; }
+        s->hdr.stage = 1;
+        s->cb_args[0] = js_dup(s->hdr.this_val);
+        *out_cb = s->cb_args; *out_argc = (int)JS_ATOM_constructor;
+        return 6;   /* GETPROP: SpeciesConstructor step 2 */
     }
-    JS_FreeValue(ctx, ctor);
-    ret = JS_Invoke(ctx, this_val, JS_ATOM_then, 2, vc(then_funcs));
-    JS_FreeValue(ctx, then_funcs[0]);
-    JS_FreeValue(ctx, then_funcs[1]);
-    return ret;
+    if (s->hdr.stage == 1) {
+        /* cb_result = O.constructor. Steps 3-4: undefined is the default; a non-object is a TypeError. */
+        JS_FreeValue(ctx, s->cb_args[0]); s->cb_args[0] = JS_UNDEFINED;
+        if (JS_IsUndefined(cb_result)) { s->ctor = JS_UNDEFINED; s->hdr.stage = 3; return js_promise_finally_step(ctx, st, JS_UNDEFINED, out_cb, out_argc); }
+        if (!JS_IsObject(cb_result)) { JS_FreeValue(ctx, cb_result); JS_ThrowTypeErrorNotAnObject(ctx); return -1; }
+        s->hdr.stage = 2;
+        s->cb_args[0] = cb_result;   /* the constructor, held for the @@species read (owned) */
+        *out_cb = s->cb_args; *out_argc = (int)JS_ATOM_Symbol_species;
+        return 6;   /* GETPROP: SpeciesConstructor step 5 */
+    }
+    if (s->hdr.stage == 2) {
+        /* cb_result = C[@@species]. Steps 6-8: nullish is the default; a non-constructor is a TypeError. */
+        JS_FreeValue(ctx, s->cb_args[0]); s->cb_args[0] = JS_UNDEFINED;
+        if (JS_IsUndefined(cb_result) || JS_IsNull(cb_result)) { JS_FreeValue(ctx, cb_result); s->ctor = JS_UNDEFINED; }
+        else if (!JS_IsConstructor(ctx, cb_result)) {
+            JS_ThrowTypeErrorNotAConstructor(ctx, cb_result);
+            JS_FreeValue(ctx, cb_result);
+            return -1;
+        } else s->ctor = cb_result;
+        s->hdr.stage = 3;
+        return js_promise_finally_step(ctx, st, JS_UNDEFINED, out_cb, out_argc);
+    }
+    if (s->hdr.stage == 3) {
+        /* the species constructor is in hand: build the two reaction closures, then read `then`. */
+        JSValueConst onFinally = step_arg(&s->hdr, 0);
+        s->hdr.stage = 4;
+        if (!JS_IsFunction(ctx, onFinally)) {
+            s->cb_args[2] = js_dup(onFinally);
+            s->cb_args[3] = js_dup(onFinally);
+        } else {
+            JSValueConst func_data[2];
+            int i;
+            func_data[0] = s->ctor;
+            func_data[1] = onFinally;
+            for (i = 0; i < 2; i++) {
+                s->cb_args[2 + i] = JS_NewCFunctionData(ctx, js_promise_then_finally_func, 1, i, 2, func_data);
+                if (JS_IsException(s->cb_args[2 + i])) { s->cb_args[2 + i] = JS_UNDEFINED; return -1; }
+                promise_closure_set_step(s->cb_args[2 + i], &js_promise_then_finally_def);   /* onFinally parks on the tramp */
+            }
+        }
+        s->cb_args[0] = js_dup(s->hdr.this_val);
+        *out_cb = s->cb_args; *out_argc = (int)JS_ATOM_then;
+        return 6;   /* GETPROP: Invoke's GetV(promise, "then") */
+    }
+    if (s->hdr.stage == 4) {
+        s->hdr.stage = 5;
+        s->cb_args[1] = cb_result;             /* the method (owned); the closures are already at [2],[3] */
+        *out_cb = s->cb_args; *out_argc = 2;
+        return 3;   /* CALL */
+    }
+    s->result = cb_result;
+    return 0;
 }
+
+static JSValue js_promise_finally_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSPromiseFinally *s = st;
+    JSValue r = take_result ? s->result : (JS_FreeValue(ctx, s->result), JS_UNDEFINED);
+    int k;
+    for (k = 0; k < 4; k++) JS_FreeValue(ctx, s->cb_args[k]);
+    JS_FreeValue(ctx, s->ctor);
+    js_free_rt(ctx->rt, s);
+    return r;
+}
+
+static const JSTrampStepDef js_promise_finally_def = {
+    sizeof(JSPromiseFinally), js_promise_finally_step, js_promise_finally_fini, 0
+};
 
 static const JSCFunctionListEntry js_promise_funcs[] = {
     JS_CFUNC_STEP_DEF("resolve", 1, STEPDEF_PROMISE_RESOLVE ),
@@ -73068,8 +73170,8 @@ static const JSCFunctionListEntry js_promise_funcs[] = {
 
 static const JSCFunctionListEntry js_promise_proto_funcs[] = {
     JS_CFUNC_DEF("then", 2, js_promise_then ),
-    JS_CFUNC_DEF("catch", 1, js_promise_catch ),
-    JS_CFUNC_DEF("finally", 1, js_promise_finally ),
+    JS_CFUNC_STEP_DEF("catch", 1, STEPDEF_PROMISE_CATCH ),
+    JS_CFUNC_STEP_DEF("finally", 1, STEPDEF_PROMISE_FINALLY ),
     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "Promise", JS_PROP_CONFIGURABLE ),
 };
 
