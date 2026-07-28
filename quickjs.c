@@ -20091,20 +20091,22 @@ static inline JSObject *tramp_accessor_getter(JSRuntime *rt, JSObject *p, JSAtom
         if (!p) return NULL;
     }
 }
-/* The setter twin of tramp_accessor_getter: a property WRITE whose slot is a `set x(v){…}` invokes the setter
-   (C-recursively inside JS_SetPropertyInternal2 today), so a loop in the setter body drives to completion.
-   Return the setter JSObject when the first own `atom` slot on the proto chain is a GETSET with a NORMAL
-   bytecode setter, else NULL. Symmetric caveat: an own NON-GETSET writable data slot shadows inherited setters,
+/* The setter twin of tramp_accessor_getter, and ANY callable setter for the same reason: a property WRITE whose
+   slot is a `set x(v){…}` invokes the setter, and asking for a NORMAL bytecode body dropped every other kind into
+   JS_SetPropertyInternal2, which calls it from C. A GENERATOR setter created its coroutine off the chain and a
+   BOUND one ran its body in a C activation with no flow base — the two symptoms of the same missing route, and
+   both reproduce on `o.a = 5`. Symmetric caveat: an own NON-GETSET writable data slot shadows inherited setters,
    so stop (return NULL) at the first own slot exactly as the property-write lookup would. */
-static inline JSObject *tramp_bytecode_setter(JSObject *p, JSAtom atom) {
+static inline JSObject *tramp_accessor_setter(JSRuntime *rt, JSObject *p, JSAtom atom) {
     for (;;) {
         JSProperty *pr; JSShapeProperty *prs = find_own_property(&pr, p, atom);
         if (prs) {
             if ((prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
                 JSObject *s = pr->u.getset.setter;
-                if (s && s->class_id == JS_CLASS_BYTECODE_FUNCTION &&
-                    s->u.func.function_bytecode->func_kind == JS_FUNC_NORMAL)
-                    return s;
+                if (s && (s->class_id == JS_CLASS_BYTECODE_FUNCTION
+                          || (s->class_id == JS_CLASS_PROXY ? s->u.proxy_data->is_func
+                                                            : rt->class_array[s->class_id].call != NULL)))
+                    return s;   /* CALLABLE — JS_IsFunction's test, spelled without a JSContext */
                 return NULL;   /* getset but C/absent setter -> slow path */
             }
             return NULL;   /* own data slot shadows inherited setters -> slow path */
@@ -23985,6 +23987,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         js_iternext_deliver(ctx, sp, ret_val);
                         BREAK;
                     }
+                    if (dck == CONT_SETTER) {
+                        /* a property WRITE whose setter has no bytecode body — a C one (`__proto__`, whose setter
+                           IS a C function and is reached by `Object.prototype.__proto__ = {}`), a bound one, a
+                           proxied one, a builtin that is itself a step machine. It needed an arm here the moment
+                           the accessor lookup stopped narrowing to bytecode bodies. Its operands are the caller's
+                           [receiver, setter, value], dropped like any method call's, and the RESULT IS
+                           DISCARDED — a write pushes nothing, which is what the frame-return arm does too. */
+                        JSValue *cargv;
+                        int pop, first;
+                        TAKE_CALL_SHAPE(); pop = call_pop; first = call_first_r;
+                        cargv = sp - pop;
+                        for (i = first; i < pop; i++) JS_FreeValue(ctx, cargv[i]);
+                        sp += first - pop;
+                        if (unlikely(JS_IsException(ret_val))) goto exception;
+                        JS_FreeValue(ctx, ret_val);
+                        BREAK;
+                    }
                     if (dck == CONT_PROXY_CONSTRUCT) {
                         /* 10.5.13 step 9: the `construct` trap MUST return an Object. The check is the same one
                            the frame-return path runs; it only needed an arm here once a C, bound or proxied trap
@@ -24849,7 +24868,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (JS_IsUndefined(method)
                             && JS_VALUE_GET_TAG(pd->target) == JS_TAG_OBJECT
                             && (JS_VALUE_GET_OBJ(pd->target)->class_id == JS_CLASS_PROXY
-                                || gp_op == GP_GET)) {
+                                || gp_op == GP_GET || gp_op == GP_SET)) {
                             /* NO TRAP. 10.5.x step 6 forwards to target.[[Get]](P, Receiver) — which IS this
                                entry — so it loops here rather than being handed to JS_GetPropertyInternal, which
                                re-entered js_proxy_get from C and cost one C activation per hop: a chain of
@@ -24857,13 +24876,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                wearing an error's clothes. Every operand of the request stands except the object;
                                the RECEIVER in particular does NOT change across a forward, which is the whole
                                reason it is an operand.
-                               For a [[Get]] the loop takes an ORDINARY target too, because the forward is the
-                               same operation either way and the C call is what hid the target's ACCESSOR: a
-                               generator getter read through a trapless proxy had its coroutine created inside
-                               JS_GetPropertyInternal, off the chain. The other operations still spell their
-                               forward out below — their C entries do more than re-dispatch (a trapless
-                               [[Delete]] reports false where the direct one throws), so each is its own
-                               conversion, not a case of this one. */
+                               For a [[Get]] or a [[Set]] the loop takes an ORDINARY target too, because the
+                               forward is the same operation either way — 10.5.5 step 6 and 10.5.9 step 6 are
+                               both `Return ? target.[[X]](…, Receiver)`, with the receiver unchanged — and the C
+                               call is what hid the target's ACCESSOR: a generator getter or setter reached
+                               through a trapless proxy had its coroutine created inside JS_GetPropertyInternal /
+                               JS_SetPropertyInternal2, off the chain, and a bound one ran with no flow base.
+                               The other operations still spell their forward out below — their C entries do more
+                               than re-dispatch (a trapless [[Delete]] reports false where the direct one throws),
+                               so each is its own conversion, not a case of this one. */
                             gp_obj = pd->target;
                             gp_recv = gp_recv_r;
                             gp_no_throw = gp_nothrow_r;
@@ -24890,7 +24911,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     } else if (gp_op == GP_GET) {
                         accessor = tramp_accessor_getter(rt, po, gp_atom);   /* a HasProperty never invokes a getter */
                     } else if (gp_op == GP_SET) {
-                        accessor = tramp_bytecode_setter(po, gp_atom);
+                        accessor = tramp_accessor_setter(rt, po, gp_atom);
                     }
                 }
                 if (JS_IsUndefined(method) && !accessor) {
@@ -29418,7 +29439,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 put_field_slow_path:
                     sf->cur_pc = pc;
                     if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
-                        JSObject *st = tramp_bytecode_setter(JS_VALUE_GET_OBJ(obj), atom);
+                        JSObject *st = tramp_accessor_setter(rt, JS_VALUE_GET_OBJ(obj), atom);
                         if (st) {   /* bytecode setter -> 1-arg method call [receiver, setter, value] on THIS chain */
                             JSValue v = sp[-1];                      /* the value being written */
                             sp[-1] = js_dup(JS_MKPTR(JS_TAG_OBJECT, st));   /* stack: [receiver][setter] */
@@ -29426,7 +29447,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             call_argc = 1; call_argv = sp - call_argc;   /* call_argv[0]=value, [-1]=setter, [-2]=receiver */
                             tramp_first = -2; tramp_is_tail = 0;
                             tramp_cont_state = NULL; tramp_cont_kind = CONT_SETTER;   /* do_return discards the result */
-                            goto do_tramp_call;
+                            goto do_generic_callee;   /* which KIND of callee the setter is, is asked there */
                         }
                     }
                     ret = JS_SetPropertyInternal2(ctx, obj, atom, sp[-1], obj,
@@ -29952,7 +29973,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         gp_outer = ok; gp_outer_kind = CONT_OP_KEYED;
                         goto do_getprop_tramp;
                     }
-                    JSObject *st = tramp_bytecode_setter(JS_VALUE_GET_OBJ(sp[-3]), katom);
+                    JSObject *st = tramp_accessor_setter(rt, JS_VALUE_GET_OBJ(sp[-3]), katom);
                     JS_FreeAtom(ctx, katom);
                     if (st) {
                         JS_FreeValue(ctx, sp[-2]);                       /* the key is consumed */
@@ -29960,7 +29981,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         call_argc = 1; call_argv = sp - call_argc;
                         tramp_first = -2; tramp_is_tail = 0;
                         tramp_cont_state = NULL; tramp_cont_kind = CONT_SETTER;
-                        goto do_tramp_call;
+                        goto do_generic_callee;
                     }
                 }
                 ret = JS_SetPropertyValue(ctx, sp[-3], sp[-2], sp[-1], JS_PROP_THROW_STRICT);
