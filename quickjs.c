@@ -19458,6 +19458,20 @@ static bool tramp_can_call_promise_exec(JSContext *ctx, JSValueConst func, JSVal
                                   returns a rejected promise, never raises) — the same shape as the executor. */
 #define CONT_PROMISE_TRY_SETTLE 39  /* cont_state = JSPromiseTry: the capability's resolve(value), which a
                                        subclass may have wrapped in its own bytecode. */
+#define CONT_ASYNC_SETTLE  40  /* cont_state = JSAsyncSettle: an async body that completed ON THE TRAMP CHAIN
+                                  settling its promise. The resolving function is page code — a subclass's, or
+                                  the native one whose `Get(resolution,"then")` on a thenable RESULT is a request
+                                  — and js_async_function_post performed it with a JS_Call from C, so
+                                  `async function f(){ return thenable; }` ran that read with no flow base. The
+                                  async frame has already popped when the call is issued, so everything the
+                                  placement still owes (the promise, who asked for it, in what operand shape)
+                                  rides this state rather than an interpreter local a suspension would lose. */
+typedef struct JSAsyncSettle {
+    JSValue promise;      /* the async function's own promise (owned): the CALL's result is discarded, this is not */
+    void *cont; uint8_t cont_kind;   /* the machine that asked for the async call, if one did */
+    int cfirst, cargc, forof;        /* its operand shape and for-of offset */
+    uint8_t is_tail;
+} JSAsyncSettle;
 #define CONT_PROMISE_CAP   38  /* cont_state = JSPromiseCap: NewPromiseCapability's Construct(C, «executor»). The
                                   SUBCLASS CONSTRUCTOR is user code and js_new_promise_capability ran it with
                                   JS_CallConstructor from C, so `Promise.try.call(Sub, fn)` had that constructor's
@@ -20083,6 +20097,7 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_PROXY_CONSTRUCT:
     case CONT_INSTANCEOF:
     case CONT_PROMISE_EXEC:
+    case CONT_ASYNC_SETTLE:
     case CONT_PROMISE_TRY_SETTLE:
     case CONT_PROMISE_CAP:
     case CONT_PROMISE_TRY:
@@ -21642,7 +21657,13 @@ static inline bool tramp_is_reflect_apply(JSValueConst method) {
 static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s, JSValueConst func_obj,
                                        JSValueConst this_obj, int argc, JSValueConst *argv);
 static void js_async_function_free(JSRuntime *rt, JSAsyncFunctionData *s);
-static bool js_async_function_post(JSContext *ctx, JSAsyncFunctionData *s, JSValue func_ret);
+enum { ASYNC_POST_FAIL = -1, ASYNC_POST_NONE = 0, ASYNC_POST_CALL = 1 };
+static int js_async_function_post_prepare(JSContext *ctx, JSAsyncFunctionData *s, JSValue func_ret,
+                                          JSValue *out_func, JSValue *out_value);
+/* Run `func(value)` as a CALL-ROOT FLOW whose whole body is that one call — the same base a promise reaction
+   runs on — so a loop or an await inside a capability's resolve parks into the job pump instead of running to
+   completion in a C activation. 0 = done, -1 = it threw (the exception is live). */
+static int js_settle_as_flow(JSContext *ctx, JSValueConst func, JSValueConst value);
 JSValue JS_NewPromiseCapability(JSContext *ctx, JSValue *resolving_funcs);
 static JSValue js_generator_next(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv,
                                  int *pdone, int magic);
@@ -24445,6 +24466,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         js_iternext_deliver(ctx, sp, ret_val);
                         BREAK;
                     }
+                    if (dck == CONT_ASYNC_SETTLE) {
+                        /* the resolving function had no heap frame — the native one is a step machine, but a C
+                           or bound resolve lands here. Drop its operands and place the promise. */
+                        JSValue *cargv;
+                        int pop, first;
+                        TAKE_CALL_SHAPE(); pop = call_pop; first = call_first_r;
+                        cargv = sp - pop;
+                        for (i = first; i < pop; i++) JS_FreeValue(ctx, cargv[i]);
+                        sp += first - pop;
+                        if (unlikely(JS_IsException(ret_val))) {
+                            JSAsyncSettle *ass = dcs;
+                            JS_FreeValue(ctx, ass->promise);
+                            if (ass->cont_kind != CONT_NONE) js_create_requester_abandon(ctx, ass->cont, ass->cont_kind);
+                            js_free_rt(rt, ass);
+                            goto exception;
+                        }
+                        cont_st = dcs;
+                        goto do_async_settled;
+                    }
                     if (dck == CONT_PROMISE_TRY_SETTLE) {
                         /* a C resolve (the native capability's) called in place. */
                         JSValue *cargv;
@@ -24833,6 +24873,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             call_first_r = 0; call_pop = 0;
                             ptry_finish_state = souter;
                             goto do_promise_try_finish;
+                        }
+                        if (souter_kind == CONT_ASYNC_SETTLE) {
+                            /* the resolving function WAS a step machine — the native one is. This arm already
+                               dropped the settle's operands, which is what the placement expects. */
+                            ret_val = r;
+                            cont_st = souter;
+                            goto do_async_settled;
                         }
                         if (souter_kind == CONT_PROMISE_TRY_SETTLE) {
                             /* the machine WAS the capability's resolve or reject. A NATIVE promise's resolving
@@ -27407,9 +27454,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 uint8_t aitail = atf->is_tail;
                 void *acs = atf->cont_state; uint8_t ack = atf->cont_kind;
                 int acf = atf->call_first, acp = atf->call_argc, afof = atf->forof_off;
-                bool ok;
-                sf->cur_pc = pc; sf->cur_sp = sp;   /* the async frame state js_async_function_post reads */
-                ok = js_async_function_post(ctx, as, ret_val);
+                JSValue asf_func, asf_val;
+                int post;
+                sf->cur_pc = pc; sf->cur_sp = sp;   /* the async frame state the settle's prepare reads */
+                post = js_async_function_post_prepare(ctx, as, ret_val, &asf_func, &asf_val);
                 js_async_function_free(rt, as);     /* drop the creation ref; a suspended continuation keeps its own */
                 /* pop: the async frame's buffers belong to `as` (freed by post/terminate on completion) — so read the
                    caller frame from atf (NOT sf->prev_frame, which would be a use-after-free of the freed async frame;
@@ -27425,12 +27473,36 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 arg_allocated_size = atf->caller_arg_allocated_size;
                 pc = sf->cur_pc; sp = atf->caller_sp;
                 js_free_rt(rt, atf);
-                if (unlikely(!ok)) {
+                if (unlikely(post == ASYNC_POST_FAIL)) {
                     /* uncatchable error: the requester can never be reached again, so it goes the way every
                        abandoned requester goes rather than leaking with the promise. */
                     JS_FreeValue(ctx, aprom);
                     if (ack != CONT_NONE) js_create_requester_abandon(ctx, acs, ack);
                     goto exception;
+                }
+                if (post == ASYNC_POST_CALL) {
+                    /* the SETTLE is a call on THIS chain. The async frame is already popped, so its operands go
+                       on the caller's stack above whatever is there; the placement below is deferred until the
+                       call returns, which is what the state carries. */
+                    JSAsyncSettle *ass = js_malloc_rt(rt, sizeof(*ass));
+                    if (unlikely(!ass)) {
+                        JS_FreeValue(ctx, asf_func); JS_FreeValue(ctx, asf_val); JS_FreeValue(ctx, aprom);
+                        if (ack != CONT_NONE) js_create_requester_abandon(ctx, acs, ack);
+                        JS_ThrowOutOfMemory(ctx);
+                        goto exception;
+                    }
+                    ass->promise = aprom;
+                    ass->cont = acs; ass->cont_kind = ack;
+                    ass->cfirst = acf; ass->cargc = acp; ass->forof = afof;
+                    ass->is_tail = aitail;
+                    DCHECK(sp + 3 <= TRAMP_SP_LIMIT(sf),
+                           "async settle: operand push exceeds the frame's compiled stack_size");
+                    *sp++ = JS_UNDEFINED;    /* this */
+                    *sp++ = asf_func;        /* the resolving function (owned, transferred) */
+                    *sp++ = asf_val;         /* the value (owned, transferred) */
+                    call_argv = sp - 1; call_argc = 1; tramp_first = -2; tramp_is_tail = 0;
+                    tramp_cont_state = ass; tramp_cont_kind = CONT_ASYNC_SETTLE;
+                    goto do_generic_callee;
                 }
                 if (ack != CONT_NONE) {
                     /* requested BY A MACHINE: the promise is that call's RESULT, so it goes to the ONE delivery a
@@ -27445,6 +27517,30 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 *sp++ = aprom;
                 BREAK;
             }
+
+        do_async_settled:
+            /* the resolving function returned (its result is discarded): release the state and place the PROMISE
+               exactly as the settle-free path above does. `sp` is already back where the async frame left it —
+               the settle call's own operands were dropped by whichever delivery got here. */
+            {
+                JSAsyncSettle *ass = cont_st;
+                JSValue aprom = ass->promise;
+                void *acs = ass->cont; uint8_t ack = ass->cont_kind;
+                int acf = ass->cfirst, acp = ass->cargc, afof = ass->forof;
+                uint8_t aitail = ass->is_tail;
+                cont_st = NULL;
+                js_free_rt(rt, ass);
+                JS_FreeValue(ctx, ret_val);
+                if (ack != CONT_NONE) {
+                    dlv_cs = acs; dlv_ck = ack;
+                    dlv_cfirst = acf; dlv_cargc = acp; dlv_itail = 0; dlv_forof = afof;
+                    ret_val = aprom;
+                    goto do_cont_deliver;
+                }
+                if (aitail) { ret_val = aprom; goto do_return; }
+                *sp++ = aprom;
+            }
+            BREAK;
 
         do_generator_tramp:
             /* A generator .next()/.throw()/.return() runs its body HERE on the tramp chain so a body loop preempts
@@ -28646,6 +28742,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 } else if (dlv_ck == CONT_PROMISE_EXEC) {
                     pexec_finish_state = dlv_cs;
                     goto do_promise_exec_finish;   /* ONE completion, shared with the inline-executor path */
+                } else if (dlv_ck == CONT_ASYNC_SETTLE) {
+                    /* a BYTECODE resolving function (a subclass's) returned. */
+                    JSValue *scargv = sp - dlv_cargc;
+                    for (i = dlv_cfirst; i < dlv_cargc; i++) JS_FreeValue(ctx, scargv[i]);
+                    sp += dlv_cfirst - dlv_cargc;
+                    cont_st = dlv_cs;
+                    goto do_async_settled;
                 } else if (dlv_ck == CONT_PROMISE_TRY_SETTLE) {
                     JSValue *scargv = sp - dlv_cargc;
                     for (i = dlv_cfirst; i < dlv_cargc; i++) JS_FreeValue(ctx, scargv[i]);
@@ -32346,6 +32449,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JS_FreeValue(ctx, rr);
             *sp++ = r;
             BREAK;
+        } else if (xck == CONT_ASYNC_SETTLE) {
+            /* the resolving function THREW. Nothing settles the promise then and nothing is waiting on it that
+               can still be reached, so the requester is abandoned and the throw propagates — the same shape the
+               Promise.try settle's throw has. */
+            JSAsyncSettle *ass = xcs;
+            JS_FreeValue(ctx, ass->promise);
+            if (ass->cont_kind != CONT_NONE) js_create_requester_abandon(ctx, ass->cont, ass->cont_kind);
+            js_free_rt(rt, ass);
+            xcs = NULL;
+            goto exception;
         } else if (xck == CONT_PROMISE_TRY_SETTLE) {
             /* the capability's resolve THREW. 27.2.6's Call is a `?` step, so the throw propagates rather than
                settling anything; the state can never be reached again. Its operands are on the caller stack and
@@ -33650,41 +33763,41 @@ static int js_async_function_resolve_create(JSContext *ctx,
 /* Post-process an async body run: `func_ret` is what running the body produced — an EXCEPTION (reject the
    promise), JS_UNDEFINED (the body returned -> resolve the promise), or FUNC_RET_AWAIT (suspended at await ->
    register the resume continuation). Consumes nothing it does not own. */
-static bool js_async_function_post(JSContext *ctx, JSAsyncFunctionData *s, JSValue func_ret)
+/* Everything of the async settle that runs NO page code: which resolving function to call and with what value,
+   the await continuation's registration, and the body's termination. THE CALL ITSELF IS THE CALLER'S, because a
+   capability's resolve IS page code — a subclass wraps it, and the NATIVE one is a step machine whose
+   `Get(resolution, "then")` on a thenable result is a request — so a JS_Call from here ran it with no flow base.
+   The two callers place it differently because they are in different contexts, not because there are two settles:
+   a body that completed ON THE TRAMP CHAIN routes it there, and one the job pump resumed runs it as a call-root
+   flow. ASYNC_POST_CALL hands out an OWNED (func, value) pair; NONE means the await path registered a
+   continuation and there is nothing to call; FAIL is an uncatchable error. */
+static int js_async_function_post_prepare(JSContext *ctx, JSAsyncFunctionData *s, JSValue func_ret,
+                                          JSValue *out_func, JSValue *out_value)
 {
-    bool is_success = true;
-    JSValue ret2;
-
+    *out_func = JS_UNDEFINED;
+    *out_value = JS_UNDEFINED;
     if (JS_IsException(func_ret)) {
     fail:
         if (unlikely(JS_IsUncatchableError(ctx->rt->current_exception))) {
-            is_success = false;
-        } else {
-            JSValue error = JS_GetException(ctx);
-            ret2 = JS_Call(ctx, s->resolving_funcs[1], JS_UNDEFINED,
-                           1, vc(&error));
-            JS_FreeValue(ctx, error);
-        resolved:
-            if (unlikely(JS_IsException(ret2))) {
-                if (JS_IsUncatchableError(ctx->rt->current_exception)) {
-                    is_success = false;
-                } else {
-                    abort(); /* BUG */
-                }
-            }
-            JS_FreeValue(ctx, ret2);
+            js_async_function_terminate(ctx->rt, s);
+            return ASYNC_POST_FAIL;
         }
+        /* the resolving function is dup'd OUT before the body is torn down: the state that holds it is released
+           by the caller as soon as this returns, and the call happens after that. */
+        *out_func = js_dup(s->resolving_funcs[1]);
+        *out_value = JS_GetException(ctx);
         js_async_function_terminate(ctx->rt, s);
+        return ASYNC_POST_CALL;
     } else {
         JSValue value;
         value = s->func_state.frame.cur_sp[-1];
         s->func_state.frame.cur_sp[-1] = JS_UNDEFINED;
         if (JS_IsUndefined(func_ret)) {
             /* function returned */
-            ret2 = JS_Call(ctx, s->resolving_funcs[0], JS_UNDEFINED,
-                           1, vc(&value));
-            JS_FreeValue(ctx, value);
-            goto resolved;
+            *out_func = js_dup(s->resolving_funcs[0]);
+            *out_value = value;
+            js_async_function_terminate(ctx->rt, s);
+            return ASYNC_POST_CALL;
         } else {
             JSValue promise, resolving_funcs[2], resolving_funcs1[2];
             int i, res;
@@ -33721,7 +33834,7 @@ static bool js_async_function_post(JSContext *ctx, JSAsyncFunctionData *s, JSVal
                 goto fail;
         }
     }
-    return is_success;
+    return ASYNC_POST_NONE;
 }
 
 /* Resume an async body one step, then post-process (settle the promise / register the await continuation). The
@@ -33761,7 +33874,18 @@ static bool js_async_function_resume_as_flow(JSContext *ctx, JSAsyncFunctionData
         JS_ParkFlow(ctx, js_async_resume_park, s);
         return true;
     }
-    return js_async_function_post(ctx, s, func_ret);
+    {
+        /* the SETTLE is its own call-root flow: the resolving function is page code (a subclass's, or the native
+           one's `then` read on a thenable), and this context has no tramp chain to route it onto. */
+        JSValue f, v;
+        int st = js_async_function_post_prepare(ctx, s, func_ret, &f, &v);
+        if (st != ASYNC_POST_CALL)
+            return st != ASYNC_POST_FAIL;
+        st = js_settle_as_flow(ctx, f, v);
+        JS_FreeValue(ctx, f);
+        JS_FreeValue(ctx, v);
+        return st == 0;
+    }
 }
 
 static void js_async_resume_park(JSContext *ctx, void *opaque)
@@ -72329,6 +72453,20 @@ static JSValue reaction_flow_step(JSContext *ctx, JSReactionFlow *rf)
 static JSValue js_reaction_resume_job(JSContext *ctx, int argc, JSValueConst *argv)
 {
     return reaction_flow_step(ctx, (JSReactionFlow *)JS_VALUE_GET_PTR(argv[0]));
+}
+
+/* `func(value)` as a call-root FLOW. JSReactionFlow is exactly the vehicle — a flow plus the capability it
+   settles — and phase 1 IS the settle, so the whole of it is the one call. Used where a settle has no tramp
+   chain to be routed onto: the job pump's async resume. */
+static int js_settle_as_flow(JSContext *ctx, JSValueConst func, JSValueConst value)
+{
+    JSReactionFlow *rf = js_mallocz(ctx, sizeof(*rf));
+    if (unlikely(!rf)) { JS_ThrowOutOfMemory(ctx); return -1; }
+    rf->resolve = js_dup(func);
+    rf->reject = JS_UNDEFINED;
+    rf->phase = 1;   /* there is no handler phase: the settle is the entire flow */
+    if (reaction_step_flow_init(ctx, &rf->fs, func, value) < 0) { reaction_flow_free(ctx, rf); return -1; }
+    return JS_IsException(reaction_flow_step(ctx, rf)) ? -1 : 0;
 }
 
 static JSValue promise_reaction_job(JSContext *ctx, int argc,
