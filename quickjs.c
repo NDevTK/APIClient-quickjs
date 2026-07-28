@@ -19475,6 +19475,9 @@ typedef struct JSAsyncPost {
     JSValue await_promise;    /* AWAIT only (owned); UNDEFINED otherwise */
     JSAsyncFunctionData *st;  /* AWAIT only: a reference the finish releases */
 } JSAsyncPost;
+#define CONT_AFS_GET       43  /* gp_outer = JSAsyncFromSync: the wrapper's IteratorComplete / IteratorValue on
+                                  the sync .next()'s result. Both are page code on a hand-written iterator, and
+                                  the deliver read them from C. */
 #define CONT_PROMISE_ALL_THEN 42  /* gp_outer = JSPromiseAll: the per-element attach's `Get(next_promise, "then")`.
                                      Both halves of that Invoke are page code for a subclass or a thenable, and
                                      js_promise_all_attach did them with JS_InvokeFree from C — the last live one
@@ -20124,6 +20127,7 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_PROXY_CONSTRUCT:
     case CONT_INSTANCEOF:
     case CONT_PROMISE_EXEC:
+    case CONT_AFS_GET:
     case CONT_PROMISE_ALL_THEN:
     case CONT_AGEN_SETTLE:
     case CONT_ASYNC_SETTLE:
@@ -20751,6 +20755,13 @@ typedef struct JSAsyncFromSync {
                                     .return (which has already closed the sync iterator). */
     JSValue drive_next;          /* the sync record's nextMethod (owned, taken at construction): the wrapper it was
                                     read from can be released before the drive returns. */
+    /* 27.1.4.4 steps 1-4: IteratorComplete then IteratorValue on the sync .next()'s RESULT. Both read the result
+       object, which a hand-written sync iterator can make an accessor or a Proxy — page code, and the deliver
+       read them with JS_IteratorComplete / JS_GetProperty from C. They are requests now, one phase each, and the
+       result parks here across them. */
+    JSValue res_obj;             /* the sync iterator result being unpacked (owned) */
+    uint8_t res_ph;              /* 0 = none, 1 = the `done` read is in flight, 2 = the `value` read is */
+    uint8_t res_done;            /* what the `done` read produced, held across the `value` read */
     void *call_outer;            /* AFS_DELIVER_CALL: the machine or sequence WAITING for this call's result — the
                                     wrapper's method is an ordinary callee at do_generic_callee, so whoever made
                                     that call may have declared a continuation, and 7.4.9's generic close does
@@ -25862,6 +25873,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                       if (gk == CONT_ITER_CONSUME) goto do_iter_consume_step;
                       if (gk == CONT_ITER_CLOSE) { cont_st = gouter0; goto do_iter_close_method; }
                       if (gk == CONT_PROMISE_ALL_THEN) { cont_st = gouter0; goto do_promise_all_attach_call; }
+                      if (gk == CONT_AFS_GET) { cont_st = gouter0; goto do_async_from_sync_step; }
                       DCHECK(gk == CONT_STEP, "property-get outer continuation: unknown machine kind"); }
                     goto do_step_step;
                 }
@@ -27111,6 +27123,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    whole 370-object graph of `yield* syncGen` + `.return()`. One owner, freed by
                    js_async_from_sync_end on every exit. */
                 s->drive_next = js_dup(ws->next_method);
+                s->res_obj = JS_UNDEFINED;   /* js_mallocz zeroes it, and a zero JSValue is not UNDEFINED */
                 s->drive_arg = js_dup(afs_arg);   /* owned BEFORE the invocation list below is released */
                 /* the CALL shape is the only one reached through do_generic_callee, so it is the only one whose
                    caller can have declared a continuation; the opcode shapes own their own delivery. */
@@ -27237,11 +27250,35 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     s->pending_error = JS_UNINITIALIZED;
                     goto async_from_sync_reject;
                 }
-                done = JS_IteratorComplete(ctx, giter);                     /* steps 1-2 */
-                if (done < 0) { JS_FreeValue(ctx, giter); goto async_from_sync_reject; }
-                value = JS_GetProperty(ctx, giter, JS_ATOM_value);          /* steps 3-4, unconditional */
-                JS_FreeValue(ctx, giter);
-                if (JS_IsException(value)) goto async_from_sync_reject;
+                if (s->res_ph == 0) {
+                    /* 7.4.2 step 3: the sync .next() result must be an Object. Stated here rather than left to
+                       fail out of the `done` read, which a request answers with undefined instead of throwing. */
+                    if (!JS_IsObject(giter)) {
+                        JS_FreeValue(ctx, giter);
+                        JS_ThrowTypeError(ctx, "iterator result not an object");
+                        goto async_from_sync_reject;
+                    }
+                    DCHECK(JS_IsUndefined(s->res_obj), "the wrapper is already unpacking a result");
+                    s->res_obj = giter;                                     /* steps 1-2: IteratorComplete */
+                    s->res_ph = 1;
+                    gp_outer = s; gp_outer_kind = CONT_AFS_GET;
+                    gp_obj = s->res_obj; gp_atom = JS_ATOM_done;
+                    gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                    goto do_getprop_tramp;
+                }
+                if (s->res_ph == 1) {
+                    s->res_done = JS_ToBoolFree(ctx, giter) ? 1 : 0;
+                    s->res_ph = 2;
+                    gp_outer = s; gp_outer_kind = CONT_AFS_GET;             /* steps 3-4: IteratorValue */
+                    gp_obj = s->res_obj; gp_atom = JS_ATOM_value;
+                    gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                    goto do_getprop_tramp;
+                }
+                /* res_ph == 2: giter is the `value`. */
+                done = s->res_done;
+                value = giter;
+                s->res_ph = 0; s->res_done = 0;
+                JS_FreeValue(ctx, s->res_obj); s->res_obj = JS_UNDEFINED;
                 rcont = js_async_from_sync_continuation(ctx, s->sync_iter, value, done,   /* steps 5-15 */
                                                        s->close_on_rejection, vc(s->resolving_funcs));
                 if (rcont > 0) {
@@ -27282,6 +27319,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
             async_from_sync_reject:
                 cont_st = s;
+                goto do_async_from_sync_abrupt;
+            }
+
+        do_afs_read_throw:
+            /* one of the wrapper's two result reads threw. Release what the unpack was holding, then take the
+               same rejection path the deliver's own abrupt does. */
+            {
+                JSAsyncFromSync *s = (JSAsyncFromSync *)cont_st;
+                JS_FreeValue(ctx, s->res_obj); s->res_obj = JS_UNDEFINED;
+                s->res_ph = 0; s->res_done = 0;
                 goto do_async_from_sync_abrupt;
             }
 
@@ -28662,12 +28709,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            || gouter_kind == CONT_TRAP_GET || gouter_kind == CONT_OP_KEYED
                            || gouter_kind == CONT_FOROF_GET || gouter_kind == CONT_FORAWAIT_GET
                            || gouter_kind == CONT_FORAWAIT_SYNC_GET
-                           || gouter_kind == CONT_PROMISE_ALL_THEN,
+                           || gouter_kind == CONT_PROMISE_ALL_THEN || gouter_kind == CONT_AFS_GET,
                            "property-get outer continuation: unknown machine kind");
                     if (gouter_kind == CONT_PROMISE_ALL_THEN) {
                         js_getprop_free(ctx, gp);
                         cont_st = gouter;
                         goto do_promise_all_attach_call;
+                    }
+                    if (gouter_kind == CONT_AFS_GET) {
+                        js_getprop_free(ctx, gp);
+                        cont_st = gouter;
+                        /* the UNPACK, not the deliver: the deliver's own head drops the DRIVE's operands and this
+                           request is not that call. Re-entering it would drop them a second time, with a stale
+                           shape — the sp drift ASan caught. The phase on the state says which read this answers. */
+                        goto do_async_from_sync_step;
                     }
                     if (gouter_kind == CONT_FOROF_GET || gouter_kind == CONT_FORAWAIT_GET
                         || gouter_kind == CONT_FORAWAIT_SYNC_GET) {
@@ -32725,9 +32780,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             uint8_t gk2 = gp->outer_kind;
             DCHECK(!gouter || gk2 == CONT_STEP || gk2 == CONT_ITER_CONSUME || gk2 == CONT_ACQUIRE_GET
                    || gk2 == CONT_ITER_CLOSE || gk2 == CONT_TRAP_GET || gk2 == CONT_OP_KEYED
-                   || gk2 == CONT_PROMISE_ALL_THEN,
+                   || gk2 == CONT_PROMISE_ALL_THEN || gk2 == CONT_AFS_GET,
                    "property-get outer continuation: unknown machine kind");
             js_getprop_free(ctx, gp);
+            if (gouter && gk2 == CONT_AFS_GET) {
+                /* the wrapper's `done`/`value` read threw: 27.1.4.4 is inside the IfAbruptRejectPromise, so the
+                   throw REJECTS the wrapper's promise rather than propagating — the same arm the deliver's own
+                   abrupt takes. `giter` is UNINITIALIZED there, which that arm allows. */
+                cont_st = gouter;
+                ret_val = JS_UNINITIALIZED;
+                goto do_afs_read_throw;
+            }
             if (gouter && gk2 == CONT_PROMISE_ALL_THEN) {
                 /* the attach's `then` READ threw. It is a post-retrieval stage, so it rejects the aggregate and
                    closes the iterator — spec fail_reject1 — which is exactly what the step's own error path
@@ -73862,6 +73925,7 @@ static void js_async_from_sync_end(JSContext *ctx, JSAsyncFromSync *s)
     JS_FreeValue(ctx, s->resolving_funcs[1]);
     JS_FreeValue(ctx, s->sync_iter);
     JS_FreeValue(ctx, s->drive_next);
+    JS_FreeValue(ctx, s->res_obj);             /* set only while the result unpack is in flight */
     JS_FreeValue(ctx, s->drive_arg);           /* UNINITIALIZED (a no-op free) for the no-argument forms */
     if (!JS_IsUninitialized(s->pending_error))
         JS_FreeValue(ctx, s->pending_error);   /* only set while step 6's close is in flight */
