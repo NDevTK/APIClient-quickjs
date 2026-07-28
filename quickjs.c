@@ -24341,6 +24341,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     call_argv = (JSValueConst *)&bl7[2];
                     tramp_first = -2;
                 }
+                if (tramp_body_entry(call_argv[-1]) == TBE_GEN) {
+                    tramp_gen_create_cont_it = cd_outer; tramp_gen_create_cont_kind = cd_outer_kind;
+                    cd_outer = NULL; cd_outer_kind = CONT_NONE;
+                    call_cfirst = 0; call_cargc = 0;
+                    tramp_is_tail = 0;
+                    goto do_generator_create_tramp;
+                }
                 tramp_cont_state = cd_outer; tramp_cont_kind = cd_outer_kind;
                 cd_outer = NULL; cd_outer_kind = CONT_NONE;
                 call_cfirst = 0; call_cargc = 0;
@@ -27202,7 +27209,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (unlikely(!gtf)) { free_generator_stack_rt(rt, s); js_free_rt(rt, s); GEN_CREATE_FAIL_FREE_CONT(); JS_ThrowOutOfMemory(ctx); goto exception; }
                 #undef GEN_CREATE_FAIL_FREE_CONT
                 gtf->async_promise = js_dup(gfunc);   /* held for js_create_from_ctor at initial_yield */
+                /* "the caller's stack is untouched" is what the DECLARED EMPTY SHAPE states — a sequence's call
+                   declares it, an opcode's does not — and the shape must be CONSUMED here, not left standing: it
+                   is resolved per call, so a shape that outlives this one is read by whatever this frame calls
+                   next. Leaving it set made `[1].find(genFn)` corrupt the following `sort`. */
+                bool gowned = (call_args_owned != NULL && call_cfirst == 0 && call_cargc == 0);
+                call_cfirst = 0; call_cargc = -1;   /* read + reset, as TAKE_CALL_SHAPE does for every other call */
                 for (i = tramp_first; i < call_argc; i++) JS_FreeValue(ctx, call_argv[i]);   /* free func(+this)+args (dup'd into s) */
+                if (call_args_owned) { js_free(ctx, call_args_owned); call_args_owned = NULL; call_args_owned_n = 0; }
                 gtf->up = tf_top;
                 gtf->caller_sf = sf; gtf->caller_b = b; gtf->caller_ctx = ctx;
                 gtf->caller_local_buf = local_buf; gtf->caller_stack_buf = stack_buf;
@@ -27211,7 +27225,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 gtf->caller_var_refs = var_refs;
                 gtf->caller_argc = argc; gtf->caller_argv = argv;
                 gtf->caller_arg_allocated_size = arg_allocated_size;
-                gtf->caller_sp = call_argv + tramp_first;   /* below func(+this)+args; the generator object goes here (or the cont re-enters the step, popping to here) */
+                gtf->caller_sp = gowned ? sp : (call_argv + tramp_first);   /* below func(+this)+args; the generator object goes here (or the cont re-enters the step, popping to here) */
                 gtf->call_first = -1; gtf->call_argc = 0; gtf->is_tail = gcreate_cont ? 0 : tramp_is_tail;
                 gtf->async_data = NULL;
                 /* 0xFF = CREATING (run-to-initial_yield), not a GEN_MAGIC. cont (flatMap inner): the settle stores the
@@ -27252,7 +27266,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 bool gforof_create = gtf->forof_off;   /* 1 = OP_for_of_start iterator-getter: finish the enum_rec */
                 uint8_t gcreate_cont_kind = gtf->cont_kind;   /* CONT_ITER_HELPER / CONT_ITER_CONSUME / CONT_PROMISE_ALL / CONT_NONE */
                 void *gcreate_cont = (gcreate_cont_kind == CONT_ITER_HELPER || gcreate_cont_kind == CONT_ITER_CONSUME
-                                      || gcreate_cont_kind == CONT_PROMISE_ALL
+                                      || gcreate_cont_kind == CONT_PROMISE_ALL || gcreate_cont_kind == CONT_STEP
                                       || gcreate_cont_kind == CONT_ITER_FROM) ? gtf->cont_state : NULL;
                 JSValue obj;
                 sf->cur_pc = pc; sf->cur_sp = sp;   /* suspend at initial_yield (state stays SUSPENDED_START) */
@@ -27271,6 +27285,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JS_FreeValue(ctx, gfunc);
                 if (unlikely(JS_IsException(obj))) { free_generator_stack_rt(rt, s); js_free_rt(rt, s); goto exception; }
                 JS_SetOpaqueInternal(obj, s);   /* the object now owns the suspended generator state */
+                if (gcreate_cont && gcreate_cont_kind == CONT_STEP) {
+                    cont_st = gcreate_cont;
+                    ret_val = obj;
+                    goto do_step_step;
+                }
                 if (gcreate_cont && gcreate_cont_kind == CONT_ITER_HELPER) {
                     /* flatMap inner: the mapped iterable's [Symbol.iterator] generator was created on the tramp.
                        Store it as the helper's inner and re-enter do_iter_helper_step; ITHP_START drives the inner. */
