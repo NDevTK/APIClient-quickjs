@@ -17070,14 +17070,30 @@ static JSValue build_for_in_iterator(JSContext *ctx, JSValue obj)
     if (tag == JS_TAG_NULL || tag == JS_TAG_UNDEFINED)
         return enum_obj;
 
-    /* fast path: assume no enumerable properties in the prototype chain */
+    /* FAST PATH: is there anything enumerable in the prototype chain at all? It is a pure optimisation — the
+       slow path below computes the same enumeration — so it must be UNOBSERVABLE, and on an ordinary object it
+       is: a shape walk with no user code in it.
+       An object whose class overrides [[OwnPropertyKeys]] or [[GetOwnProperty]] — a Proxy, a module namespace —
+       breaks that. Probing one calls its `ownKeys` trap and then its `getOwnPropertyDescriptor` trap per key,
+       and when the probe then falls through, the slow path calls both AGAIN: `for (k in Object.create(new
+       Proxy(…)))` fired each trap TWICE where 14.7.5.10 fires it once. Nothing chooses between two
+       implementations here; the probe simply must not run where running it is visible. */
     obj1 = js_dup(obj);
     for(;;) {
+        JSObject *pp;
         obj1 = JS_GetPrototypeFree(ctx, obj1);
         if (JS_IsNull(obj1))
             break;
         if (JS_IsException(obj1))
             goto fail;
+        pp = JS_VALUE_GET_OBJ(obj1);
+        if (pp->is_exotic) {
+            const JSClassExoticMethods *em = ctx->rt->class_array[pp->class_id].exotic;
+            if (em && (em->get_own_property_names || em->get_own_property)) {
+                JS_FreeValue(ctx, obj1);
+                goto slow_path;
+            }
+        }
         if (JS_GetOwnPropertyNamesInternal(ctx, &tab_atom, &tab_atom_count,
                                            JS_VALUE_GET_OBJ(obj1),
                                            JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY)) {
