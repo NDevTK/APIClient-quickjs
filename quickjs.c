@@ -17326,37 +17326,34 @@ static JSValue js_closure(JSContext *ctx, JSValue bfunc,
 
 #define JS_DEFINE_CLASS_HAS_HERITAGE     (1 << 0)
 
+/* 15.7.14 ClassDefinitionEvaluation step 8.d.i: `Let protoParent be ? Get(superclass, "prototype")`. That is a
+   [[Get]] on the heritage value, so an accessor or a Proxy `get` trap is the page's code — and the opcode ran it
+   with JS_GetProperty from C, where `class C extends new Proxy(f, {get(){for(;;){}}}) {}` had no flow base. The
+   READ is the opcode's now (do_define_class_tramp) and this takes its answer, which is also what makes the
+   validation of it a step the caller can perform in the order the spec states. */
 static int js_op_define_class(JSContext *ctx, JSValue *sp,
                               JSAtom class_name, int class_flags,
                               JSVarRef **cur_var_refs,
-                              JSStackFrame *sf, bool is_computed_name)
+                              JSStackFrame *sf, bool is_computed_name,
+                              JSValue parent_proto_in)
 {
     JSValue bfunc, parent_class, proto = JS_UNDEFINED;
-    JSValue ctor = JS_UNDEFINED, parent_proto = JS_UNDEFINED;
+    JSValue ctor = JS_UNDEFINED, parent_proto = parent_proto_in;
     JSFunctionBytecode *b;
 
     parent_class = sp[-2];
     bfunc = sp[-1];
 
     if (class_flags & JS_DEFINE_CLASS_HAS_HERITAGE) {
+        DCHECK(JS_IsNull(parent_class) || !JS_IsUninitialized(parent_proto),
+               "a class with a heritage reached the builder without its protoParent");
         if (JS_IsNull(parent_class)) {
             parent_proto = JS_NULL;
             parent_class = js_dup(ctx->function_proto);
-        } else {
-            if (!JS_IsConstructor(ctx, parent_class)) {
-                JS_ThrowTypeError(ctx, "parent class must be constructor");
-                goto fail;
-            }
-            parent_proto = JS_GetProperty(ctx, parent_class, JS_ATOM_prototype);
-            if (JS_IsException(parent_proto))
-                goto fail;
-            if (!JS_IsNull(parent_proto) && !JS_IsObject(parent_proto)) {
-                JS_ThrowTypeError(ctx, "parent prototype must be an object or null");
-                goto fail;
-            }
         }
     } else {
         /* parent_class is JS_UNDEFINED in this case */
+        DCHECK(JS_IsUninitialized(parent_proto), "a class with no heritage was handed a protoParent");
         parent_proto = js_dup(ctx->class_proto[JS_CLASS_OBJECT]);
         parent_class = js_dup(ctx->function_proto);
     }
@@ -19050,6 +19047,18 @@ typedef struct JSOpKeyed {
                                   to is parked across them, exactly as a handler's trap READ parks it. It is the
                                   same nesting CONT_TRAP_GET already is: a keyed request whose outer is not a
                                   machine but another keyed OPERATION, carrying what waits on that one. */
+#define CONT_DEFINE_CLASS  63  /* gp_outer = JSOpClass: 15.7.14 ClassDefinitionEvaluation step 8.d.i's
+                                  `Get(superclass, "prototype")`. js_op_define_class read it with JS_GetProperty
+                                  from C, so `class C extends new Proxy(f, {get(){for(;;){}}}) {}` had no flow
+                                  base — and an ACCESSOR `prototype` on an ordinary parent is the same gap. The
+                                  operator's operands stay where they are; only the class NAME and the two flag
+                                  bits have to ride, because the opcode's own locals are gone on resume. */
+typedef struct JSOpClass {
+    JSAtom name;         /* BORROWED from the bytecode's atom table, which outlives the frame */
+    uint8_t flags;       /* JS_DEFINE_CLASS_* */
+    uint8_t computed;    /* 1 = OP_define_class_computed */
+} JSOpClass;
+
 #define CONT_TOPRIM_GET    62  /* gp_outer = JSToPrim: 7.1.1 step 2.a's GetMethod(input, @@toPrimitive) and
                                   7.1.1.1 step 2's Get(O, "toString"/"valueOf"). All three are [[Get]]s on the
                                   object being coerced, so an accessor or a Proxy `get` trap is the page's code —
@@ -20011,6 +20020,7 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_GOPD_DESC:
     case CONT_SET_RECV:
     case CONT_TOPRIM_GET:
+    case CONT_DEFINE_CLASS:
     case CONT_OP_KEYED:
     case CONT_FOR_IN_HAS:
     case CONT_OWNKEYS_CHK:
@@ -27305,6 +27315,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                           cont_st = gouter0;
                           goto do_toprim_have_method;
                       }
+                      if (gk == CONT_DEFINE_CLASS) {
+                          /* the heritage's `prototype` was a plain data property, which is every ordinary
+                             `class C extends D`. */
+                          cont_st = gouter0;
+                          goto do_define_class_deliver;
+                      }
                       if (gk == CONT_TRAP_GET) {
                           /* a handler TRAP READ that invoked nothing — a data property on the handler, which is
                              every ordinary proxy. Restore the operation waiting on it and re-enter with the
@@ -27512,6 +27528,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         gp_outer = gd->outer; gp_outer_kind = gd->outer_kind;
                         js_gopd_desc_free(ctx, gd);
                         goto getprop_throw;
+                    }
+                    if (gk3 == CONT_DEFINE_CLASS) {
+                        /* the heritage read threw in place: the class can never be built, and its operands are
+                           left for the frame's own catch-search like any throwing operator's. */
+                        js_free_rt(rt, gouter);
+                        goto exception;
                     }
                     if (gk3 == CONT_TOPRIM_GET) {
                         /* a coercion method read threw in place (a revoked proxy, a poisoned C accessor). The
@@ -30495,7 +30517,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            || gouter_kind == CONT_FOROF_UNPACK || gouter_kind == CONT_FOR_IN_HAS
                            || gouter_kind == CONT_OWNKEYS_CHK || gouter_kind == CONT_PROXY_INV
                            || gouter_kind == CONT_KEYED_INV || gouter_kind == CONT_WITH_HAS
-                           || gouter_kind == CONT_SET_RECV || gouter_kind == CONT_TOPRIM_GET,
+                           || gouter_kind == CONT_SET_RECV || gouter_kind == CONT_TOPRIM_GET
+                           || gouter_kind == CONT_DEFINE_CLASS,
                            "property-get outer continuation: unknown machine kind");
                     if (gouter_kind == CONT_PROMISE_ALL_THEN) {
                         js_getprop_free(ctx, gp);
@@ -30904,6 +30927,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             goto getprop_throw;
                         }
                         goto do_ownkeys_chk_step;
+                    }
+                    if (gouter_kind == CONT_DEFINE_CLASS) {
+                        /* the heritage's `prototype` ACCESSOR (or a Proxy `get` trap) ran on this chain and
+                           suspended. The frame's own operand drop has restored sp to where the opcode left the
+                           parent class and the closure, which the delivery reads. */
+                        cont_st = gouter;
+                        if (unlikely(JS_IsException(ret_val))) {
+                            js_free_rt(rt, gouter);
+                            goto exception;
+                        }
+                        goto do_define_class_deliver;
                     }
                     if (gouter_kind == CONT_TOPRIM_GET) {
                         /* a coercion method's ACCESSOR (or a Proxy `get` trap) ran on this chain and suspended.
@@ -33148,10 +33182,52 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 atom = get_u32(pc);
                 class_flags = pc[4];
                 pc += 5;
+                if ((class_flags & JS_DEFINE_CLASS_HAS_HERITAGE) && !JS_IsNull(sp[-2])) {
+                    /* 15.7.14 step 8.d: the constructor test, then `Get(superclass, "prototype")` — the page's
+                       code for an accessor or a Proxy. The whole class definition parks across it. */
+                    JSOpClass *oc;
+                    sf->cur_pc = pc;
+                    if (!JS_IsConstructor(ctx, sp[-2])) {
+                        JS_ThrowTypeError(ctx, "parent class must be constructor");
+                        goto exception;
+                    }
+                    oc = js_mallocz(ctx, sizeof(*oc));
+                    if (unlikely(!oc)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                    oc->name = atom;             /* borrowed from the bytecode's atom table */
+                    oc->flags = (uint8_t)class_flags;
+                    oc->computed = (opcode == OP_define_class_computed);
+                    gp_obj = sp[-2]; gp_atom = JS_ATOM_prototype;
+                    gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                    gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
+                    gp_outer = oc; gp_outer_kind = CONT_DEFINE_CLASS;
+                    goto do_getprop_tramp;
+                }
                 if (js_op_define_class(ctx, sp, atom, class_flags,
                                        var_refs, sf,
-                                       (opcode == OP_define_class_computed)) < 0)
+                                       (opcode == OP_define_class_computed),
+                                       JS_UNINITIALIZED) < 0)
                     goto exception;
+            }
+            BREAK;
+
+        do_define_class_deliver:
+            /* the heritage's `prototype` has been read (ret_val). Step 8.d.ii validates it, and the rest of
+               ClassDefinitionEvaluation invokes nothing. */
+            {
+                JSOpClass *oc = cont_st;
+                JSAtom cname = oc->name;
+                int cflags = oc->flags;
+                bool ccomp = oc->computed;
+                cont_st = NULL;
+                js_free_rt(rt, oc);
+                if (!JS_IsNull(ret_val) && !JS_IsObject(ret_val)) {
+                    JS_FreeValue(ctx, ret_val);
+                    JS_ThrowTypeError(ctx, "parent prototype must be an object or null");
+                    goto exception;
+                }
+                if (js_op_define_class(ctx, sp, cname, cflags, var_refs, sf, ccomp, ret_val) < 0)
+                    goto exception;
+                ret_val = JS_UNDEFINED;
             }
             BREAK;
 
@@ -35256,6 +35332,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    || gk2 == CONT_ITER_CLOSE || gk2 == CONT_TRAP_GET || gk2 == CONT_GOPD_DESC
                    || gk2 == CONT_OWNKEYS_CHK || gk2 == CONT_PROXY_INV || gk2 == CONT_KEYED_INV
                    || gk2 == CONT_WITH_HAS || gk2 == CONT_SET_RECV || gk2 == CONT_TOPRIM_GET
+                   || gk2 == CONT_DEFINE_CLASS
                    || gk2 == CONT_OP_KEYED
                    || gk2 == CONT_PROMISE_ALL_THEN || gk2 == CONT_AFS_GET
                    || gk2 == CONT_ITER_HELPER_GET || gk2 == CONT_PROMISE_ALL_GET
@@ -35330,6 +35407,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 goto getprop_throw;
             } else if (gouter && gk2 == CONT_WITH_HAS) {
                 js_with_has_free(ctx, gouter);
+                goto exception;
+            } else if (gouter && gk2 == CONT_DEFINE_CLASS) {
+                /* the heritage's `prototype` accessor threw after suspending: same as the in-place arm. */
+                js_free_rt(rt, gouter);
+                gouter = NULL;
                 goto exception;
             } else if (gouter && gk2 == CONT_TOPRIM_GET) {
                 /* the same for a coercion method read whose accessor threw after suspending. `gp` is already
