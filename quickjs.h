@@ -942,6 +942,8 @@ JS_EXTERN JSValue JS_NewObjectFromStr(JSContext *ctx, int count,
                                       const char **props,
                                       const JSValue *values);
 JS_EXTERN JSValue JS_ToObject(JSContext *ctx, JSValueConst val);
+/* The HOST printer's tag for a value: 20.1.3.6 without its @@toStringTag Get. Not the spec algorithm — that is
+   Object.prototype.toString, which script reaches and which runs the page's code. */
 JS_EXTERN JSValue JS_ToObjectString(JSContext *ctx, JSValueConst val);
 
 JS_EXTERN bool JS_IsFunction(JSContext* ctx, JSValueConst val);

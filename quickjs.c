@@ -1511,9 +1511,17 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_FUNC_BIND, STEPDEF_ITER_SET_CTOR, STEPDEF_ITER_SET_TAG,
     STEPDEF_ITER_HELPER_RETURN,
     STEPDEF_OBJ_SEAL, STEPDEF_OBJ_FREEZE, STEPDEF_OBJ_ISSEALED, STEPDEF_OBJ_ISFROZEN,
+    STEPDEF_OBJ_TOSTRING, STEPDEF_OBJ_TOLOCALESTRING,
+    STEPDEF_DECODE_URI, STEPDEF_DECODE_URI_COMPONENT,
+    STEPDEF_ENCODE_URI, STEPDEF_ENCODE_URI_COMPONENT,
+    STEPDEF_GLOBAL_ESCAPE, STEPDEF_GLOBAL_UNESCAPE,
     STEPDEF_COUNT
 };
 #define HINT_NONE    2
+/* Not a hint: the marker OP_CMP reads for LOOSE equality, whose ToPrimitive is conditional on the operand
+   SHAPES (7.2.14 steps 10-11) rather than unconditional like a relational operator's. Negative so the
+   `coerce_hint >= 0` arm ignores it; strict equality passes -1 and coerces nothing at all. */
+#define HINT_LOOSE_EQ (-2)
 #define HINT_FORCE_ORDINARY (1 << 4) // don't try Symbol.toPrimitive
 static JSValue JS_ToPrimitiveFree(JSContext *ctx, JSValue val, int hint);
 static JSValue JS_ToStringFree(JSContext *ctx, JSValue val);
@@ -33946,6 +33954,27 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         tp_retry_pc = pc - 1;                           \
                         goto do_toprim_tramp;                           \
                     }                                                   \
+                    /* 7.2.14 steps 10-11: LOOSE equality coerces exactly one shape — an Object on one side and \
+                       a Number, BigInt, String, Symbol or Boolean on the other. It cannot use the hint>=0 arm \
+                       above, which coerces whenever EITHER side is an object: `obj == obj` is step 1's \
+                       reference comparison and `obj == null` is step 12, and neither performs ToPrimitive. So \
+                       the operator states its own condition and js_eq_slow's copy of it stops being reachable \
+                       with an object — it ran that ToPrimitive with JS_CallFree from C, where a `valueOf` \
+                       containing a loop had no flow base. A Boolean counts because steps 6-7 convert it with no \
+                       user code and step 11 then coerces the object anyway. */ \
+                    if ((coerce_hint) == HINT_LOOSE_EQ) {               \
+                        int lt1 = JS_VALUE_GET_TAG(op1), lt2 = JS_VALUE_GET_TAG(op2); \
+                        bool lo1 = (lt1 == JS_TAG_OBJECT), lo2 = (lt2 == JS_TAG_OBJECT); \
+                        int lother = lo1 ? lt2 : lt1;                   \
+                        if (lo1 != lo2                                  \
+                            && (tag_is_number(lother) || tag_is_string(lother) \
+                                || lother == JS_TAG_SYMBOL || lother == JS_TAG_BOOL)) { \
+                            tp_slot = lo1 ? -2 : -1;                    \
+                            tp_hint = HINT_NONE;                        \
+                            tp_retry_pc = pc - 1;                       \
+                            goto do_toprim_tramp;                       \
+                        }                                               \
+                    }                                                   \
                     if (slow_call)                                      \
                         goto exception;                                 \
                     sp--;                                               \
@@ -33957,8 +33986,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             OP_CMP(OP_lte, <=, HINT_NUMBER, js_relational_slow(ctx, sp, opcode));
             OP_CMP(OP_gt,  >,  HINT_NUMBER, js_relational_slow(ctx, sp, opcode));
             OP_CMP(OP_gte, >=, HINT_NUMBER, js_relational_slow(ctx, sp, opcode));
-            OP_CMP(OP_eq,  ==, -1, js_eq_slow(ctx, sp, 0));
-            OP_CMP(OP_neq, !=, -1, js_eq_slow(ctx, sp, 1));
+            OP_CMP(OP_eq,  ==, HINT_LOOSE_EQ, js_eq_slow(ctx, sp, 0));
+            OP_CMP(OP_neq, !=, HINT_LOOSE_EQ, js_eq_slow(ctx, sp, 1));
             OP_CMP(OP_strict_eq,  ==, -1, js_strict_eq_slow(ctx, sp, 0));
             OP_CMP(OP_strict_neq, !=, -1, js_strict_eq_slow(ctx, sp, 1));
 
@@ -57600,34 +57629,51 @@ static JSValue js_object_valueOf(JSContext *ctx, JSValueConst this_val,
     return JS_ToObject(ctx, this_val);
 }
 
-static JSValue js_object_toString(JSContext *ctx, JSValueConst this_val,
-                                  int argc, JSValueConst *argv)
-{
-    JSValue obj, tag;
-    int is_array;
-    JSAtom atom;
-    JSObject *p;
+/* 20.1.3.6 Object.prototype.toString. Everything before step 15 runs no page code — ToObject wraps a
+   primitive, IsArray walks a Proxy's targets without a trap, and the builtin tag is a class id — but step 15's
+   `Get(O, @@toStringTag)` is the page's, on an accessor or a Proxy. The C body read it with JS_GetProperty, so
+   `Object.prototype.toString.call(new Proxy(o, {get(){for(;;){}}}))` had no flow base — and type detection by
+   this call is in every bundle. */
+typedef struct JSObjToString {
+    JSStepHdr hdr;     /* MUST be first */
+    JSValue result;    /* DONE (owned) */
+    JSValue obj;       /* ToObject's result, HELD across the request that borrows it (owned) */
+    JSAtom builtin;    /* the step 5-14 tag, used when step 16 rejects what the Get produced */
+} JSObjToString;
 
-    if (JS_IsNull(this_val)) {
-        tag = js_new_string8(ctx, "Null");
-    } else if (JS_IsUndefined(this_val)) {
-        tag = js_new_string8(ctx, "Undefined");
-    } else {
-        obj = JS_ToObject(ctx, this_val);
-        if (JS_IsException(obj))
-            return obj;
-        is_array = js_is_array(ctx, obj);
-        if (is_array < 0) {
-            JS_FreeValue(ctx, obj);
-            return JS_EXCEPTION;
+static int js_object_tostring_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSObjToString *s = st;
+    JSValue tag;
+
+    if (s->hdr.stage == 0) {
+        JSValueConst this_val = s->hdr.this_val;
+        JSValue obj;
+        int is_array;
+        JSObject *p;
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        s->result = JS_UNDEFINED; s->obj = JS_UNDEFINED; s->builtin = JS_ATOM_NULL;
+        if (JS_IsNull(this_val)) {                       /* steps 1-2 */
+            s->result = js_new_string8(ctx, "[object Null]");
+            return JS_IsException(s->result) ? -1 : 0;
         }
+        if (JS_IsUndefined(this_val)) {
+            s->result = js_new_string8(ctx, "[object Undefined]");
+            return JS_IsException(s->result) ? -1 : 0;
+        }
+        obj = JS_ToObject(ctx, this_val);                /* step 3 */
+        if (JS_IsException(obj))
+            return -1;
+        s->obj = obj;   /* the STATE owns it from here: cb_coerce is BORROWED and the request outlives this call */
+        is_array = js_is_array(ctx, obj);                /* step 4: 7.2.6, no trap on a Proxy */
+        if (is_array < 0) return -1;
         if (is_array) {
-            atom = JS_ATOM_Array;
+            s->builtin = JS_ATOM_Array;
         } else if (JS_IsFunction(ctx, obj)) {
-            atom = JS_ATOM_Function;
+            s->builtin = JS_ATOM_Function;
         } else {
             p = JS_VALUE_GET_OBJ(obj);
-            switch(p->class_id) {
+            switch (p->class_id) {                       /* steps 5-14 */
             case JS_CLASS_STRING:
             case JS_CLASS_ARGUMENTS:
             case JS_CLASS_MAPPED_ARGUMENTS:
@@ -57636,34 +57682,146 @@ static JSValue js_object_toString(JSContext *ctx, JSValueConst this_val,
             case JS_CLASS_NUMBER:
             case JS_CLASS_DATE:
             case JS_CLASS_REGEXP:
-                atom = ctx->rt->class_array[p->class_id].class_name;
+                s->builtin = ctx->rt->class_array[p->class_id].class_name;
                 break;
             default:
-                atom = JS_ATOM_Object;
+                s->builtin = JS_ATOM_Object;
                 break;
             }
         }
-        tag = JS_GetProperty(ctx, obj, JS_ATOM_Symbol_toStringTag);
-        JS_FreeValue(ctx, obj);
+        s->builtin = JS_DupAtom(ctx, s->builtin);
+        s->hdr.stage = 1;                                /* step 15: Get(O, @@toStringTag) */
+        s->hdr.cb_coerce[0] = s->obj;                    /* borrowed: the state holds it across the request */
+        *out_cb = s->hdr.cb_coerce; *out_argc = (int)JS_ATOM_Symbol_toStringTag;
+        return 6;
+    }
+    DCHECK(s->hdr.stage == 1, "Object.prototype.toString's machine resumed in no stage");
+    if (JS_IsException(cb_result))
+        return -1;
+    tag = cb_result;
+    if (!JS_IsString(tag)) {                             /* step 16 */
+        JS_FreeValue(ctx, tag);
+        tag = JS_AtomToString(ctx, s->builtin);
         if (JS_IsException(tag))
-            return JS_EXCEPTION;
-        if (!JS_IsString(tag)) {
-            JS_FreeValue(ctx, tag);
-            tag = JS_AtomToString(ctx, atom);
+            return -1;
+    }
+    s->result = JS_ConcatString3(ctx, "[object ", tag, "]");   /* step 17 */
+    return JS_IsException(s->result) ? -1 : 0;
+}
+
+static JSValue js_object_tostring_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSObjToString *s = st;
+    JSValue r;
+    JS_FreeValue(ctx, s->obj);
+    JS_FreeAtom(ctx, s->builtin);
+    r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    js_free(ctx, s);
+    return r;
+}
+
+/* The HOST printer's tag for a value — 20.1.3.6 steps 1-14 and NOT step 15. Both callers (the shell's `print`
+   and the harness's) reach it only after JS_ToCString on the value THREW, so it is the last resort for showing
+   something about an object whose own toString failed; running the page's @@toStringTag getter there would be
+   more page code on a path that exists because page code just raised. The spec algorithm, step 15 included, is
+   the STEPDEF_OBJ_TOSTRING machine, which is the only thing script can reach. */
+JSValue JS_ToObjectString(JSContext *ctx, JSValueConst val)
+{
+    JSAtom atom = JS_ATOM_Object;
+    JSValue obj, tag;
+    int is_array;
+
+    if (JS_IsNull(val))
+        return js_new_string8(ctx, "[object Null]");
+    if (JS_IsUndefined(val))
+        return js_new_string8(ctx, "[object Undefined]");
+    obj = JS_ToObject(ctx, val);
+    if (JS_IsException(obj))
+        return obj;
+    is_array = js_is_array(ctx, obj);
+    if (is_array < 0) { JS_FreeValue(ctx, obj); return JS_EXCEPTION; }
+    if (is_array) {
+        atom = JS_ATOM_Array;
+    } else if (JS_IsFunction(ctx, obj)) {
+        atom = JS_ATOM_Function;
+    } else {
+        JSObject *p = JS_VALUE_GET_OBJ(obj);
+        switch (p->class_id) {
+        case JS_CLASS_STRING:
+        case JS_CLASS_ARGUMENTS:
+        case JS_CLASS_MAPPED_ARGUMENTS:
+        case JS_CLASS_ERROR:
+        case JS_CLASS_BOOLEAN:
+        case JS_CLASS_NUMBER:
+        case JS_CLASS_DATE:
+        case JS_CLASS_REGEXP:
+            atom = ctx->rt->class_array[p->class_id].class_name;
+            break;
+        default:
+            break;
         }
     }
+    JS_FreeValue(ctx, obj);
+    tag = JS_AtomToString(ctx, atom);
+    if (JS_IsException(tag))
+        return tag;
     return JS_ConcatString3(ctx, "[object ", tag, "]");
 }
 
-JSValue JS_ToObjectString(JSContext *ctx, JSValueConst val)
+/* 20.1.3.5 Object.prototype.toLocaleString is `? Invoke(O, "toString")` — a Get and then a CALL, both the
+   page's: the method is whatever `toString` resolves to on the receiver, commonly an override. JS_Invoke ran
+   both from C, so `({toString(){for(;;){}}}).toLocaleString()` drove to completion — and once the intrinsic
+   Object.prototype.toString became a machine, the default receiver reached its backstop too, which is how the
+   corpus named this site. */
+typedef struct JSObjToLocale {
+    JSStepHdr hdr;      /* MUST be first */
+    JSValue result;     /* DONE (owned) */
+    JSValue method;     /* `toString`, held across the call (owned) */
+} JSObjToLocale;
+
+static int js_object_tolocale_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    return js_object_toString(ctx, val, 0, NULL);
+    JSObjToLocale *s = st;
+
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        s->result = JS_UNDEFINED; s->method = JS_UNDEFINED;
+        s->hdr.stage = 1;                            /* Invoke's Get */
+        s->hdr.cb_coerce[0] = s->hdr.this_val;       /* borrowed: the machine holds the receiver */
+        *out_cb = s->hdr.cb_coerce; *out_argc = (int)JS_ATOM_toString;
+        return 6;
+    }
+    if (s->hdr.stage == 1) {
+        if (JS_IsException(cb_result)) return -1;
+        s->method = cb_result;
+        cb_result = JS_UNDEFINED;
+        if (!JS_IsFunction(ctx, s->method)) {
+            /* Invoke's Call raises this for anything not callable, including undefined. */
+            JS_ThrowTypeError(ctx, "not a function");
+            return -1;
+        }
+        s->hdr.stage = 2;                            /* Invoke's Call, with no arguments */
+        s->hdr.cb_coerce[0] = s->hdr.this_val;
+        s->hdr.cb_coerce[1] = s->method;
+        *out_cb = s->hdr.cb_coerce; *out_argc = 0;
+        return 3;
+    }
+    DCHECK(s->hdr.stage == 2, "Object.prototype.toLocaleString's machine resumed in no stage");
+    if (JS_IsException(cb_result)) return -1;
+    s->result = cb_result;
+    return 0;
 }
 
-static JSValue js_object_toLocaleString(JSContext *ctx, JSValueConst this_val,
-                                        int argc, JSValueConst *argv)
+static JSValue js_object_tolocale_fini(JSContext *ctx, void *st, bool take_result)
 {
-    return JS_Invoke(ctx, this_val, JS_ATOM_toString, 0, NULL);
+    JSObjToLocale *s = st;
+    JSValue r;
+    JS_FreeValue(ctx, s->method);
+    r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    js_free(ctx, s);
+    return r;
 }
 
 
@@ -58122,8 +58280,8 @@ static const JSCFunctionListEntry js_object_funcs[] = {
 };
 
 static const JSCFunctionListEntry js_object_proto_funcs[] = {
-    JS_CFUNC_DEF("toString", 0, js_object_toString ),
-    JS_CFUNC_DEF("toLocaleString", 0, js_object_toLocaleString ),
+    JS_CFUNC_STEP_DEF("toString", 0, STEPDEF_OBJ_TOSTRING ),
+    JS_CFUNC_STEP_DEF("toLocaleString", 0, STEPDEF_OBJ_TOLOCALESTRING ),
     JS_CFUNC_DEF("valueOf", 0, js_object_valueOf ),
     JS_CFUNC_STEP_DEF("hasOwnProperty", 1, STEPDEF_OBJ_HASOWNPROP ),
     JS_CFUNC_DEF("isPrototypeOf", 1, js_object_isPrototypeOf ),
@@ -62547,6 +62705,8 @@ static const JSTrampStepDef js_lookupsetter_def = { sizeof(JSLookupAcc), js_look
 static const JSTrampStepDef js_func_bind_def   = { sizeof(JSFuncBind), js_func_bind_step, js_func_bind_fini, 0 };
 static const JSTrampStepDef js_iter_set_ctor_def = { sizeof(JSIterSetter), js_iter_setter_step, js_iter_setter_fini, JS_ATOM_constructor };
 static const JSTrampStepDef js_iter_set_tag_def  = { sizeof(JSIterSetter), js_iter_setter_step, js_iter_setter_fini, JS_ATOM_Symbol_toStringTag };
+static const JSTrampStepDef js_obj_tolocale_def = { sizeof(JSObjToLocale), js_object_tolocale_step, js_object_tolocale_fini, 0 };
+static const JSTrampStepDef js_obj_tostring_def = { sizeof(JSObjToString), js_object_tostring_step, js_object_tostring_fini, 0 };
 static const JSTrampStepDef js_obj_seal_def     = { sizeof(JSIntegrity), js_integrity_step, js_integrity_fini, 0 };
 static const JSTrampStepDef js_obj_freeze_def   = { sizeof(JSIntegrity), js_integrity_step, js_integrity_fini, INTEG_FREEZE };
 static const JSTrampStepDef js_obj_issealed_def = { sizeof(JSIntegrity), js_integrity_step, js_integrity_fini, INTEG_TEST };
@@ -62740,6 +62900,21 @@ static const JSTrampStepDef js_array_fromlike_def  = { sizeof(JSArrayFromLike), 
     { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, (spec), { .proto = (fn) }, JS_CFUNC_##proto, (magic), (pre), (mid), (err) }
 #define PRIMARGS_DEF(spec, proto, fn, magic)                PRIMARGS_DEF_FULL(spec, proto, fn, magic, NULL, NULL, NULL)
 #define PRIMARGS_DEF_PRE(spec, proto, fn, magic, pre, mid)  PRIMARGS_DEF_FULL(spec, proto, fn, magic, pre, mid, NULL)
+static JSValue js_global_decodeURI(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int isComponent);
+static JSValue js_global_encodeURI(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int isComponent);
+static JSValue js_global_escape(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static JSValue js_global_unescape(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+/* 19.2.6 decodeURI(Component) / encodeURI(Component) and B.2.1 escape / unescape. Each is `ToString(arg)` and
+   then a pure byte walk with no user code in it, which is exactly what the coerce-then-compute declaration
+   models — and each ran that ToString from C, so `decodeURIComponent({toString(){for(;;){}}})` drove to
+   completion. Once Object.prototype.toString became a machine the DEFAULT receiver reached its backstop too,
+   which is how the corpus named this family. */
+static const JSTrampStepDef js_decodeURI_def      = PRIMARGS_DEF(PRIMARGS(0x1, HINT_STRING, 1), generic_magic, js_global_decodeURI, 0);
+static const JSTrampStepDef js_decodeURIComp_def  = PRIMARGS_DEF(PRIMARGS(0x1, HINT_STRING, 1), generic_magic, js_global_decodeURI, 1);
+static const JSTrampStepDef js_encodeURI_def      = PRIMARGS_DEF(PRIMARGS(0x1, HINT_STRING, 1), generic_magic, js_global_encodeURI, 0);
+static const JSTrampStepDef js_encodeURIComp_def  = PRIMARGS_DEF(PRIMARGS(0x1, HINT_STRING, 1), generic_magic, js_global_encodeURI, 1);
+static const JSTrampStepDef js_global_escape_def  = PRIMARGS_DEF(PRIMARGS(0x1, HINT_STRING, 1), generic, js_global_escape, 0);
+static const JSTrampStepDef js_global_unescape_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_STRING, 1), generic, js_global_unescape, 0);
 static const JSTrampStepDef js_bigint_asUintN_def = PRIMARGS_DEF(PRIMARGS(0x3, HINT_NUMBER, 2), generic_magic, js_bigint_asUintN, 0);
 static const JSTrampStepDef js_bigint_asIntN_def  = PRIMARGS_DEF(PRIMARGS(0x3, HINT_NUMBER, 2), generic_magic, js_bigint_asUintN, 1);
 static int js_gopd_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
@@ -63031,6 +63206,8 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_ITER_SET_CTOR]  = &js_iter_set_ctor_def,
     [STEPDEF_ITER_SET_TAG]   = &js_iter_set_tag_def,
     [STEPDEF_ITER_HELPER_RETURN] = &js_iter_helper_return_def,
+    [STEPDEF_OBJ_TOSTRING]   = &js_obj_tostring_def,
+    [STEPDEF_OBJ_TOLOCALESTRING] = &js_obj_tolocale_def,
     [STEPDEF_OBJ_SEAL]       = &js_obj_seal_def,
     [STEPDEF_OBJ_FREEZE]     = &js_obj_freeze_def,
     [STEPDEF_OBJ_ISSEALED]   = &js_obj_issealed_def,
@@ -63214,6 +63391,12 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_NUM_TOFIXED]     = &js_num_tofixed_def,
     [STEPDEF_NUM_TOEXPONENTIAL] = &js_num_toexp_def,
     [STEPDEF_NUM_TOPRECISION] = &js_num_toprec_def,
+    [STEPDEF_DECODE_URI]      = &js_decodeURI_def,
+    [STEPDEF_DECODE_URI_COMPONENT] = &js_decodeURIComp_def,
+    [STEPDEF_ENCODE_URI]      = &js_encodeURI_def,
+    [STEPDEF_ENCODE_URI_COMPONENT] = &js_encodeURIComp_def,
+    [STEPDEF_GLOBAL_ESCAPE]   = &js_global_escape_def,
+    [STEPDEF_GLOBAL_UNESCAPE] = &js_global_unescape_def,
     [STEPDEF_ISNAN]           = &js_isNaN_def,
     [STEPDEF_ISFINITE]        = &js_isFinite_def,
     [STEPDEF_ARRAY_REDUCE]  = &js_array_reduce_def,  [STEPDEF_ARRAY_REDUCE_RIGHT] = &js_array_reduceR_def,
@@ -63256,6 +63439,8 @@ STEP_STATE_HDR_FIRST(JSFuncBind);
 STEP_STATE_HDR_FIRST(JSIterSetter);
 STEP_STATE_HDR_FIRST(JSIterHelperReturn);
 STEP_STATE_HDR_FIRST(JSIntegrity);
+STEP_STATE_HDR_FIRST(JSObjToString);
+STEP_STATE_HDR_FIRST(JSObjToLocale);
 STEP_STATE_HDR_FIRST(JSImportOpts);
 STEP_STATE_HDR_FIRST(JSStrCtor);
 STEP_STATE_HDR_FIRST(JSStrConcat);
@@ -63336,15 +63521,25 @@ static int js_array_tostring_step(JSContext *ctx, void *st, JSValue cb_result, J
     }
     if (s->hdr.stage == 2) {
         if (!JS_IsFunction(ctx, s->cb[1])) {
-            /* step 3: a non-callable `join` falls back to the intrinsic Object.prototype.toString, which reads
-               only @@toStringTag — a read the spec performs, and one this machine does not yet route. */
-            s->result = js_object_toString(ctx, s->obj, 0, NULL);
-            return JS_IsException(s->result) ? -1 : 0;
+            /* step 3: a non-callable `join` falls back to the intrinsic Object.prototype.toString, whose
+               @@toStringTag read is the page's. This ran it from C and said so — "a read this machine does not
+               yet route" — which it now does: that intrinsic IS a machine, so this DELEGATES to it rather than
+               keeping a second way to perform the same abstract operation. */
+            void *inner = tramp_step_state_new(ctx, &js_obj_tostring_def, s->obj, 0, NULL, JS_UNDEFINED);
+            if (!inner) return -1;
+            s->hdr.stage = 9;
+            s->hdr.delegate = inner;
+            return 17;   /* DELEGATE */
         }
         s->cb[0] = js_dup(s->obj);
         s->hdr.stage = 3;
         *out_cb = s->cb; *out_argc = 0;
         return 3;
+    }
+    if (s->hdr.stage == 9) {   /* the delegated Object.prototype.toString finished; its answer is ours */
+        if (JS_IsException(cb_result)) return -1;
+        s->result = cb_result;
+        return 0;
     }
     DCHECK(s->hdr.stage == 3, "Array.prototype.toString: unknown stage");
     s->result = cb_result;
@@ -78269,12 +78464,12 @@ static const JSCFunctionListEntry js_global_funcs[] = {
     JS_CFUNC_STEP_DEF("isFinite", 1, STEPDEF_ISFINITE ),
     JS_CFUNC_DEF("queueMicrotask", 1, js_global_queueMicrotask ),
 
-    JS_CFUNC_MAGIC_DEF("decodeURI", 1, js_global_decodeURI, 0 ),
-    JS_CFUNC_MAGIC_DEF("decodeURIComponent", 1, js_global_decodeURI, 1 ),
-    JS_CFUNC_MAGIC_DEF("encodeURI", 1, js_global_encodeURI, 0 ),
-    JS_CFUNC_MAGIC_DEF("encodeURIComponent", 1, js_global_encodeURI, 1 ),
-    JS_CFUNC_DEF("escape", 1, js_global_escape ),
-    JS_CFUNC_DEF("unescape", 1, js_global_unescape ),
+    JS_CFUNC_STEP_DEF("decodeURI", 1, STEPDEF_DECODE_URI ),
+    JS_CFUNC_STEP_DEF("decodeURIComponent", 1, STEPDEF_DECODE_URI_COMPONENT ),
+    JS_CFUNC_STEP_DEF("encodeURI", 1, STEPDEF_ENCODE_URI ),
+    JS_CFUNC_STEP_DEF("encodeURIComponent", 1, STEPDEF_ENCODE_URI_COMPONENT ),
+    JS_CFUNC_STEP_DEF("escape", 1, STEPDEF_GLOBAL_ESCAPE ),
+    JS_CFUNC_STEP_DEF("unescape", 1, STEPDEF_GLOBAL_UNESCAPE ),
     // workarounds for msvc & djgpp where NAN and INFINITY
     // are not compile-time expressions
     JS_PROP_U2D_DEF("Infinity", 0x7FF0ull<<48, 0 ),
