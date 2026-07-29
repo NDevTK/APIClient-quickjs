@@ -12109,64 +12109,6 @@ static int JS_GetGlobalVarRef(JSContext *ctx, JSAtom prop, JSValue *sp)
     return 0;
 }
 
-/* flag = 0: normal variable write
-   flag = 1: initialize lexical variable
-*/
-static inline int JS_SetGlobalVar(JSContext *ctx, JSAtom prop, JSValue val,
-                                  int flag)
-{
-    JSObject *p;
-    JSShapeProperty *prs;
-    JSProperty *pr;
-    int ret;
-
-    /* no exotic behavior is possible in global_var_obj */
-    p = JS_VALUE_GET_OBJ(ctx->global_var_obj);
-    prs = find_own_property(&pr, p, prop);
-    if (prs) {
-        /* XXX: should handle JS_PROP_AUTOINIT properties? */
-        if (flag != 1) {
-            if (unlikely(JS_IsUninitialized(pr->u.value))) {
-                JS_FreeValue(ctx, val);
-                JS_ThrowReferenceErrorUninitialized(ctx, prs->atom);
-                return -1;
-            }
-            if (unlikely(!(prs->flags & JS_PROP_WRITABLE))) {
-                JS_FreeValue(ctx, val);
-                return JS_ThrowTypeErrorReadOnly(ctx, JS_PROP_THROW, prop);
-            }
-        }
-        cow_capture(ctx, ctx->global_var_obj, prop);   /* a global var/let/const IS shared baseline state */
-        set_value(ctx, &pr->u.value, val);
-        return 0;
-    }
-
-    p = JS_VALUE_GET_OBJ(ctx->global_obj);
-    prs = find_own_property(&pr, p, prop);
-    if (prs) {
-        if (likely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
-                                  JS_PROP_LENGTH)) == JS_PROP_WRITABLE)) {
-            /* fast path — capture: a write to an existing global-object property is shared-state too. */
-            cow_capture(ctx, ctx->global_obj, prop);
-            set_value(ctx, &pr->u.value, val);
-            return 0;
-        }
-    }
-    /* slow path */
-    ret = JS_HasProperty(ctx, ctx->global_obj, prop);
-    if (ret < 0) {
-        JS_FreeValue(ctx, val);
-        return -1;
-    }
-    if (ret == 0 && is_strict_mode(ctx)) {
-        JS_FreeValue(ctx, val);
-        JS_ThrowReferenceErrorNotDefined(ctx, prop);
-        return -1;
-    }
-    return JS_SetPropertyInternal(ctx, ctx->global_obj, prop, val,
-                                  JS_PROP_THROW_STRICT);
-}
-
 /* return -1, false or true */
 static int JS_DeleteGlobalVar(JSContext *ctx, JSAtom prop)
 {
@@ -19965,6 +19907,7 @@ typedef struct JSWithHas {
     uint8_t owns_atom;   /* the OP_with_* atoms are the bytecode's; a REFERENCE's is made by ToPropertyKey */
     uint8_t jumps;       /* the OP_with_* forms branch into the with-body once the access is placed */
     int8_t base;         /* the base object's DEPTH in the operand stack, or 0 = the GLOBAL object */
+    int8_t vdepth;       /* the depth of the value a WRITE stores, or 0 = this opcode only reads */
     JSValue arr;         /* @@unscopables' value, held across the read of its key (owned) */
 } JSWithHas;
 /* An object Environment Record's operations, in the order 9.1.1.2.x states them. FIVE of the page's operations
@@ -31220,16 +31163,65 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_put_var):
         CASE(OP_put_var_init):
             {
-                int ret;
+                JSObject *gobj;
+                JSShapeProperty *prs;
+                JSProperty *pr;
                 JSAtom atom;
+                JSWithHas *wh;
                 atom = get_u32(pc);
                 pc += 4;
                 sf->cur_pc = pc;
 
-                ret = JS_SetGlobalVar(ctx, atom, sp[-1], opcode - OP_put_var);
-                sp--;
-                if (unlikely(ret < 0))
-                    goto exception;
+                /* 9.1.1.4.1 HasBinding then 9.1.1.4.5 SetMutableBinding, on the GLOBAL Environment Record. The
+                   DeclarativeRecord half first: a plain slot on an engine object no page can make exotic. */
+                gobj = JS_VALUE_GET_OBJ(ctx->global_var_obj);
+                prs = find_own_property(&pr, gobj, atom);
+                if (prs) {
+                    /* an INITIALISER is 9.1.1.1.4 InitializeBinding, which writes over the uninitialised
+                       marker a `let`/`const`/`class` binding starts as and is not bound by [[Writable]]. */
+                    if (opcode != OP_put_var_init) {
+                        if (unlikely(JS_IsUninitialized(pr->u.value))) {
+                            JS_ThrowReferenceErrorUninitialized(ctx, prs->atom);
+                            goto exception;
+                        }
+                        if (unlikely(!(prs->flags & JS_PROP_WRITABLE))) {
+                            JS_ThrowTypeErrorReadOnly(ctx, JS_PROP_THROW, atom);
+                            goto exception;
+                        }
+                    }
+                    cow_capture(ctx, ctx->global_var_obj, atom);   /* a global var/let/const IS shared baseline state */
+                    set_value(ctx, &pr->u.value, sp[-1]);
+                    sp--;
+                    BREAK;
+                }
+                /* The ObjectRecord half. An OWN, plain, WRITABLE data property is written here for the same
+                   reason the read answers from one: the record's three operations all resolve to it and none
+                   of them reaches page code. Anything else is the page's — a setter, an inherited setter, a
+                   Proxy anywhere on the chain — and JS_SetGlobalVar ran it from C. */
+                gobj = JS_VALUE_GET_OBJ(ctx->global_obj);
+                DCHECK(gobj->class_id != JS_CLASS_PROXY,
+                       "the global object became a Proxy: the own-property answer below would skip its traps");
+                prs = find_own_property(&pr, gobj, atom);
+                if (prs && (prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
+                                          JS_PROP_LENGTH)) == JS_PROP_WRITABLE) {
+                    cow_capture(ctx, ctx->global_obj, atom);
+                    set_value(ctx, &pr->u.value, sp[-1]);
+                    sp--;
+                    BREAK;
+                }
+                wh = js_mallocz(ctx, sizeof(*wh));
+                if (unlikely(!wh)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                /* PAST the DeclarativeRecord the two opcodes are ONE operation, so the record carries one.
+                   InitializeBinding is what tells them apart and it applies only to a LEXICAL binding; a
+                   var-scoped one lives on the global OBJECT, which is how AnnexB B.3.2's labelled function
+                   declaration — `l: function g(){}` in sloppy code — reaches here as OP_put_var_init with a
+                   binding that was never in global_var_obj at all. */
+                wh->atom = atom; wh->op = OP_put_var; wh->phase = WH_HAS; wh->arr = JS_UNDEFINED;
+                wh->vdepth = 1;
+                gp_obj = ctx->global_obj; gp_atom = atom; gp_op = GP_HAS; gp_val = JS_UNDEFINED;
+                gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
+                gp_outer = wh; gp_outer_kind = CONT_WITH_HAS;
+                goto do_getprop_tramp;
             }
             BREAK;
 
@@ -33140,7 +33132,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     wh = js_mallocz(ctx, sizeof(*wh));
                     if (unlikely(!wh)) { JS_FreeAtom(ctx, atom); JS_ThrowOutOfMemory(ctx); goto exception; }
                     wh->atom = atom; wh->owns_atom = 1; wh->op = (uint8_t)opcode; wh->base = 3;
-                    wh->phase = WH_ACCESS; wh->arr = JS_UNDEFINED;
+                    wh->phase = WH_ACCESS; wh->arr = JS_UNDEFINED; wh->vdepth = 1;
                     gp_obj = sp[-3]; gp_atom = atom; gp_op = GP_SET; gp_val = sp[-1];
                     gp_recv = JS_UNINITIALIZED; gp_no_throw = is_strict_mode(ctx) ? 0 : 1;
                     gp_outer = wh; gp_outer_kind = CONT_WITH_HAS;
@@ -33151,7 +33143,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 wh = js_mallocz(ctx, sizeof(*wh));
                 if (unlikely(!wh)) { JS_FreeAtom(ctx, atom); JS_ThrowOutOfMemory(ctx); goto exception; }
                 wh->atom = atom; wh->owns_atom = 1; wh->op = (uint8_t)opcode; wh->base = 3;
-                wh->phase = WH_HAS2; wh->arr = JS_UNDEFINED;
+                wh->phase = WH_HAS2; wh->arr = JS_UNDEFINED; wh->vdepth = 1;
                 gp_obj = sp[-3]; gp_atom = atom; gp_op = GP_HAS; gp_val = JS_UNDEFINED;
                 gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
                 gp_outer = wh; gp_outer_kind = CONT_WITH_HAS;
@@ -34086,6 +34078,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (unlikely(!wh)) { JS_ThrowOutOfMemory(ctx); goto exception; }
                 wh->atom = atom; wh->diff = diff; wh->op = (uint8_t)opcode; wh->is_with = (uint8_t)is_with;
                 wh->phase = WH_HAS; wh->arr = JS_UNDEFINED; wh->base = 1; wh->jumps = 1;
+                wh->vdepth = (opcode == OP_with_put_var) ? 2 : 0;
                 gp_obj = sp[-1]; gp_atom = atom; gp_op = GP_HAS; gp_val = JS_UNDEFINED;
                 gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
                 gp_outer = wh; gp_outer_kind = CONT_WITH_HAS;
@@ -34140,59 +34133,36 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (ret) goto with_absent;   /* step 3.d: blocked, so the reference falls through */
                     goto with_resolved;
                 case WH_HAS2:
-                    if (wop == OP_get_ref_value || wop == OP_put_ref_value) {
-                        /* a REFERENCE that HasBinding already resolved. Step 3's absent case is the same
-                           question for both, and a DECLARATIVE record's base always holds its binding, so only
-                           an object record can reach it. */
-                        ret = JS_ToBoolFree(ctx, ret_val); ret_val = JS_UNDEFINED;
-                        if (!ret) {
-                            DCHECK(!js_same_value(ctx, obj, ctx->global_var_obj),
-                                   "a declarative record's binding cannot vanish between HasBinding and its access");
-                            if (is_strict_mode(ctx)) {
-                                JS_ThrowReferenceErrorNotDefined(ctx, atom);
-                                goto with_throw;
-                            }
-                            if (wop == OP_get_ref_value) { val = JS_UNDEFINED; goto with_place; }
-                            /* a sloppy write to a vanished binding still performs the Set. */
-                        }
-                        wh->phase = WH_ACCESS;
-                        gp_obj = obj; gp_atom = atom;
-                        if (wop == OP_get_ref_value) {
-                            gp_op = GP_GET;
-                        } else {
-                            gp_op = GP_SET; gp_val = sp[-1];
-                            gp_no_throw = is_strict_mode(ctx) ? 0 : 1;
-                        }
-                        goto with_request;
-                    }
                     /* GetBindingValue 9.1.1.2.6 step 2 / SetMutableBinding 9.1.1.2.5 step 2 answered. It is a
                        SEPARATE operation from HasBinding's, and observably so: @@unscopables' Get ran in between
-                       and can have deleted the binding, and a Proxy counts every trap. */
+                       and can have deleted the binding, and a Proxy counts every trap. A REFERENCE opcode asks
+                       the very same question about a binding HasBinding resolved earlier — it was answered by a
+                       second copy of this, keyed on a list of opcodes, which is why every opcode added since had
+                       to be written into that list to be answered at all. */
                     ret = JS_ToBoolFree(ctx, ret_val); ret_val = JS_UNDEFINED;
-                    if (wop == OP_with_put_var) {
-                        if (!ret && sf->is_strict_mode) {
-                            JS_ThrowReferenceErrorNotDefined(ctx, atom);   /* SetMutableBinding step 3 */
-                            goto with_throw;
-                        }
-                        /* step 5's Set(bindingObject, N, V, S): S is the STRICT flag, so a sloppy write that
-                           the object refuses yields false rather than throwing. */
-                        wh->phase = WH_ACCESS;
-                        gp_obj = obj; gp_atom = atom; gp_op = GP_SET; gp_val = sp[-2];
-                        gp_no_throw = sf->is_strict_mode ? 0 : 1;
-                        goto with_request;
-                    }
                     if (!ret) {
-                        /* GetBindingValue step 3: the binding is gone. Strict code throws; sloppy code reads
-                           undefined. Never a fall-through — the reference was RESOLVED here. */
+                        /* GetBindingValue step 3 / SetMutableBinding step 3: the binding is gone. Strict code
+                           throws; sloppy code reads undefined and writes anyway. Never a fall-through — the
+                           reference was RESOLVED here. A DECLARATIVE record's base always holds its binding,
+                           so only an object record can reach this at all. */
+                        DCHECK(!js_same_value(ctx, obj, ctx->global_var_obj),
+                               "a declarative record's binding cannot vanish between HasBinding and its access");
                         if (sf->is_strict_mode) {
                             JS_ThrowReferenceErrorNotDefined(ctx, atom);
                             goto with_throw;
                         }
-                        val = JS_UNDEFINED;
-                        goto with_place;
+                        if (!wh->vdepth) { val = JS_UNDEFINED; goto with_place; }
                     }
-                    wh->phase = WH_ACCESS;                            /* step 4's Get */
-                    gp_obj = obj; gp_atom = atom; gp_op = GP_GET;
+                    wh->phase = WH_ACCESS;
+                    gp_obj = obj; gp_atom = atom;
+                    if (wh->vdepth) {
+                        /* step 5's Set(bindingObject, N, V, S): S is the STRICT flag, so a sloppy write the
+                           object refuses yields false rather than throwing. */
+                        gp_op = GP_SET; gp_val = sp[-wh->vdepth];
+                        gp_no_throw = sf->is_strict_mode ? 0 : 1;
+                    } else {
+                        gp_op = GP_GET;                               /* step 4 */
+                    }
                     goto with_request;
                 default:
                     DCHECK(wh->phase == WH_ACCESS, "a `with` reference resumed in no phase");
@@ -34205,6 +34175,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 switch (wop) {
                 case OP_get_var:
                 case OP_get_var_undef:
+                case OP_put_var:
                 case OP_with_get_var:
                 case OP_with_get_ref:
                 case OP_with_get_ref_undef:
@@ -34257,6 +34228,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 case OP_get_var_undef:
                     *sp++ = val;                       /* the global record's binding value */
                     break;
+                case OP_put_var:
+                    JS_FreeValue(ctx, val);            /* a sloppy Set's boolean is not the operator's value */
+                    JS_FreeValue(ctx, sp[-1]);
+                    sp--;
+                    break;
                 case OP_get_ref_value:
                     *sp++ = val;                       /* the reference's value, above its two operands */
                     break;
@@ -34283,19 +34259,26 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             with_absent:
                 if (!wh->base) {
                     /* the GLOBAL record is the last link of the scope chain, so HasBinding's no is final: an
-                       unresolvable Reference, which `typeof` reads as undefined and every other read throws
-                       (6.2.5.5 GetValue step 3). There is no enclosing scope to drop a base object for. */
-                    int is_typeof;
-                    DCHECK(wop == OP_get_var || wop == OP_get_var_undef,
+                       unresolvable Reference. There is no enclosing scope to drop a base object for. */
+                    DCHECK(wop == OP_get_var || wop == OP_get_var_undef || wop == OP_put_var,
                            "a non-global opcode recorded no operand depth for its base object");
-                    is_typeof = (wop == OP_get_var_undef);
-                    if (!is_typeof)
-                        JS_ThrowReferenceErrorNotDefined(ctx, atom);
-                    js_with_has_free(ctx, wh);
-                    if (!is_typeof)
+                    if (wop == OP_get_var_undef) {
+                        js_with_has_free(ctx, wh);      /* `typeof x` reads an absent binding as undefined */
+                        *sp++ = JS_UNDEFINED;
+                        BREAK;
+                    }
+                    if (!wh->vdepth || sf->is_strict_mode) {
+                        JS_ThrowReferenceErrorNotDefined(ctx, atom);   /* 6.2.5.5 step 3 / 6.2.5.6 step 2.a */
+                        js_with_has_free(ctx, wh);
                         goto exception;
-                    *sp++ = JS_UNDEFINED;
-                    BREAK;
+                    }
+                    /* 6.2.5.6 PutValue step 2.c: a SLOPPY write to an unresolvable reference performs
+                       Set(globalObj, N, W, false) — the same request the resolved path issues, so it is the
+                       same request and not a second write path. */
+                    wh->phase = WH_ACCESS;
+                    gp_obj = ctx->global_obj; gp_atom = atom; gp_op = GP_SET;
+                    gp_val = sp[-wh->vdepth]; gp_no_throw = 1;
+                    goto with_request;
                 }
                 /* the reference is not this record's: drop the base object and fall through to the enclosing
                    scope, which is where the bytecode continues. */
