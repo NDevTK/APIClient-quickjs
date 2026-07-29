@@ -31538,6 +31538,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     *sp++ = nm;
                     BREAK;
                 }
+                /* An OWN property on the global object settles HasBinding without walking anything, which is
+                   the same answer the record's other three opcodes take from their own-property checks. It is
+                   the hot case now: EVERY unqualified-identifier lvalue materialises a Reference, because
+                   re-resolving the name at the write is observably wrong (see resolve_scope_var). */
+                gobj = JS_VALUE_GET_OBJ(ctx->global_obj);
+                DCHECK(gobj->class_id != JS_CLASS_PROXY,
+                       "the global object became a Proxy: the own-property answer below would skip its traps");
+                if (find_own_property(&pr, gobj, atom)) {
+                    nm = JS_AtomToValue(ctx, atom);
+                    if (unlikely(JS_IsException(nm)))
+                        goto exception;
+                    *sp++ = js_dup(ctx->global_obj);
+                    *sp++ = nm;
+                    BREAK;
+                }
                 wh = js_mallocz(ctx, sizeof(*wh));
                 if (unlikely(!wh)) { JS_ThrowOutOfMemory(ctx); goto exception; }
                 wh->atom = atom; wh->op = (uint8_t)opcode; wh->phase = WH_HAS; wh->arr = JS_UNDEFINED;
@@ -48869,16 +48884,6 @@ static bool can_opt_put_ref_value(const uint8_t *bc_buf, int pos)
              opcode == OP_rot3l));
 }
 
-static bool can_opt_put_global_ref_value(const uint8_t *bc_buf, int pos)
-{
-    int opcode = bc_buf[pos];
-    return (bc_buf[pos + 1] == OP_put_ref_value &&
-            (opcode == OP_insert3 ||
-             opcode == OP_perm4 ||
-             opcode == OP_nop ||
-             opcode == OP_rot3l));
-}
-
 static int optimize_scope_make_ref(JSContext *ctx, JSFunctionDef *s,
                                    DynBuf *bc, uint8_t *bc_buf,
                                    LabelSlot *ls, int pos_next,
@@ -48917,41 +48922,6 @@ static int optimize_scope_make_ref(JSContext *ctx, JSFunctionDef *s,
     bc_buf[pos] = get_op + 1;
     put_u16(bc_buf + pos + 1, var_idx);
     pos += 3;
-    /* pad with OP_nop */
-    while (pos < end_pos)
-        bc_buf[pos++] = OP_nop;
-    return pos_next;
-}
-
-static int optimize_scope_make_global_ref(JSContext *ctx, JSFunctionDef *s,
-                                          DynBuf *bc, uint8_t *bc_buf,
-                                          LabelSlot *ls, int pos_next,
-                                          JSAtom var_name)
-{
-    int label_pos, end_pos, pos, op;
-
-    /* replace the reference get/put with normal variable
-       accesses */
-    /* XXX: need 2 extra OP_true if destructuring an array */
-    if (bc_buf[pos_next] == OP_get_ref_value) {
-        dbuf_putc(bc, OP_get_var);
-        dbuf_put_u32(bc, JS_DupAtom(ctx, var_name));
-        pos_next++;
-    }
-    /* remove the OP_label to make room for replacement */
-    /* label should have a refcount of 0 anyway */
-    /* XXX: should have emitted several OP_nop to avoid this kludge */
-    label_pos = ls->pos;
-    pos = label_pos - 5;
-    assert(bc_buf[pos] == OP_label);
-    end_pos = label_pos + 2;
-    op = bc_buf[label_pos];
-    if (op == OP_insert3)
-        bc_buf[pos++] = OP_dup;
-    bc_buf[pos] = OP_put_var;
-    /* XXX: need 2 extra OP_drop if destructuring an array */
-    put_u32(bc_buf + pos + 1, JS_DupAtom(ctx, var_name));
-    pos += 5;
     /* pad with OP_nop */
     while (pos < end_pos)
         bc_buf[pos++] = OP_nop;
@@ -49460,19 +49430,16 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
     switch (op) {
     case OP_scope_make_ref:
         /* Rewriting a GLOBAL reference back into OP_get_var/OP_put_var re-resolves the name at the PUT, and a
-           global's resolvability — unlike a static local slot's — can CHANGE while the RHS runs. In STRICT code
-           that is observable: `undeclared = (this.undeclared = 5)` captures an UNRESOLVABLE reference, so
-           PutValue must throw a ReferenceError even though the RHS created the global. Sloppy code cannot tell
-           the difference (an unresolvable PutValue there just creates the global, exactly as OP_put_var does),
-           so the fast path survives where it is sound. */
-        if (label_done == -1 && !s->is_strict_mode
-            && can_opt_put_global_ref_value(bc_buf, ls->pos)) {
-            pos_next = optimize_scope_make_global_ref(ctx, s, bc, bc_buf, ls,
-                                                      pos_next, var_name);
-        } else {
-            dbuf_putc(bc, OP_make_var_ref);
-            dbuf_put_u32(bc, JS_DupAtom(ctx, var_name));
-        }
+           global's resolvability — unlike a static local slot's — can CHANGE while the RHS runs. That was kept
+           for sloppy code on the claim that sloppy code cannot tell the difference, because an unresolvable
+           PutValue there just creates the global exactly as OP_put_var does. The claim is FALSE, in two ways a
+           page reaches with nothing exotic: `gz = (installProxyProto(), 5)` captured an unresolvable Reference
+           whose PutValue must Set the global object directly, and re-resolving asked the newly-installed
+           prototype's `has` trap TWICE first; and `gq += 1` took the Reference twice over, so 13.15.2's three
+           HasBindings became four. The optimisation is deleted rather than narrowed — every narrowing
+           condition it carried was a case handed back to the wrong answer. */
+        dbuf_putc(bc, OP_make_var_ref);
+        dbuf_put_u32(bc, JS_DupAtom(ctx, var_name));
         break;
     case OP_scope_get_ref:
         /* XXX: should create a dummy object with a named slot that is
