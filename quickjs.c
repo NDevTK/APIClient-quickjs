@@ -71901,11 +71901,23 @@ static int js_proxy_gopd_pre(JSContext *ctx, JSValueConst obj, JSValueConst trap
     *ptd_ret = target_desc_ret;
     *ptd_flags = target_desc_ret ? target_desc.flags : 0;
     if (JS_IsUndefined(trap_result_obj)) {
-        if (target_desc_ret && (!(target_desc.flags & JS_PROP_CONFIGURABLE) || !p->extensible))
+        int ext;
+        if (!target_desc_ret)
+            return 0;                                        /* step 11.a: the target has not got it either */
+        if (!(target_desc.flags & JS_PROP_CONFIGURABLE))     /* step 11.b */
             goto fail;
+        /* step 11.c is `IsExtensible(target)` — the INTERNAL METHOD, which on a Proxy target is its
+           `isExtensible` trap. This read `p->extensible`, the target JSObject's own flag, which for a Proxy is
+           the proxy's storage bit and not its answer: with a non-extensible object behind a trapless proxy,
+           step 11.d's TypeError never fired. */
+        ext = JS_IsExtensible(ctx, s->target);
+        if (ext < 0)
+            return -1;
+        if (!ext)
+            goto fail;                                       /* step 11.d */
         return 0;
     }
-    *pextensible = JS_IsExtensible(ctx, s->target);
+    *pextensible = JS_IsExtensible(ctx, s->target);           /* step 12 */
     if (*pextensible < 0)
         return -1;
     return 1;
