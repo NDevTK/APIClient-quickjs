@@ -1014,8 +1014,10 @@ JS_EXTERN int JS_FreezeObject(JSContext *ctx, JSValueConst obj);
 JS_EXTERN int JS_GetOwnPropertyNames(JSContext *ctx, JSPropertyEnum **ptab,
                                      uint32_t *plen, JSValueConst obj,
                                      int flags);
-JS_EXTERN int JS_GetOwnProperty(JSContext *ctx, JSPropertyDescriptor *desc,
-                                JSValueConst obj, JSAtom prop);
+/* The COW delta's own-property read: the SLOT's stored value. NOT [[GetOwnProperty]] — it asserts that neither a
+   Proxy nor an accessor is reachable, because a delta is swapped by the scheduler and either would run the page's
+   code mid-context-switch. 1 = own property (*pval owned), 0 = absent, -1 = threw. */
+JS_EXTERN int JS_GetOwnSlot(JSContext *ctx, JSValue *pval, JSValueConst obj, JSAtom prop);
 JS_EXTERN void JS_FreePropertyEnum(JSContext *ctx, JSPropertyEnum *tab,
                                    uint32_t len);
 

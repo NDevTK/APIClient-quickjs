@@ -10088,14 +10088,37 @@ static int JS_GetOwnPropertyFlagsInternal(JSContext *ctx, int *pflags,
     return JS_GetOwnPropertyInternal2(ctx, NULL, p, prop, pflags);
 }
 
-int JS_GetOwnProperty(JSContext *ctx, JSPropertyDescriptor *desc,
-                      JSValueConst obj, JSAtom prop)
+/* The COW delta's own-property read: a SLOT's stored value, never an operation.
+   A delta is captured and swapped by the SCHEDULER — cow_capture runs inside a write hook, and unapply/apply run
+   between two flows — so anything here that could reach the page's code would run it with no flow base and in
+   the middle of a context switch. Two shapes could: a Proxy, whose every own-property query is a trap, and an
+   ACCESSOR slot, whose baseline is a getter rather than a value and whose restore would invoke a setter. Neither
+   is reachable, and this ASSERTS that rather than saying it — which is also what guards the restore, because
+   every entry is read here before it is written back.
+   1 = own property (*pval owned), 0 = absent, -1 = threw. */
+int JS_GetOwnSlot(JSContext *ctx, JSValue *pval, JSValueConst obj, JSAtom prop)
 {
+    JSPropertyDescriptor pd;
+    JSObject *p;
+    int has;
+
+    *pval = JS_UNDEFINED;
     if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT) {
         JS_ThrowTypeErrorNotAnObject(ctx);
         return -1;
     }
-    return JS_GetOwnPropertyInternal(ctx, desc, JS_VALUE_GET_OBJ(obj), prop);
+    p = JS_VALUE_GET_OBJ(obj);
+    DCHECK(p->class_id != JS_CLASS_PROXY,
+           "a COW delta holds a Proxy: capturing or swapping it would run the page's traps mid-context-switch");
+    has = JS_GetOwnPropertyInternal(ctx, &pd, p, prop);
+    if (has <= 0)
+        return has;
+    DCHECK(!(pd.flags & JS_PROP_GETSET),
+           "a COW delta holds an ACCESSOR slot: its baseline is a getter and its restore would run a setter");
+    *pval = pd.value;
+    JS_FreeValue(ctx, pd.getter);
+    JS_FreeValue(ctx, pd.setter);
+    return 1;
 }
 
 void JS_FreePropertyEnum(JSContext *ctx, JSPropertyEnum *tab,
