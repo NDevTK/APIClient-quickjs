@@ -1483,7 +1483,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_REGEXP_EXEC, STEPDEF_REGEXP_TEST,
     STEPDEF_ITER_TAKE, STEPDEF_ITER_DROP, STEPDEF_ITER_WRAP_RETURN,
     STEPDEF_ITER_CONCAT_NEXT, STEPDEF_ITER_CONCAT_RETURN, STEPDEF_ARRAY_ITER_NEXT,
-    STEPDEF_OWNKEYS_NAMES, STEPDEF_OWNKEYS_SYMBOLS, STEPDEF_REFLECT_OWNKEYS,
+    STEPDEF_OWNKEYS_NAMES, STEPDEF_OWNKEYS_SYMBOLS, STEPDEF_REFLECT_OWNKEYS, STEPDEF_HAS_OWN_ENUM,
     STEPDEF_OBJ_KEYS, STEPDEF_OBJ_DESCS,
     STEPDEF_REFLECT_GET, STEPDEF_REFLECT_SET, STEPDEF_REFLECT_HAS, STEPDEF_REFLECT_DELETE,
     STEPDEF_PROMISE_RESOLVE, STEPDEF_PROMISE_REJECT, STEPDEF_PROMISE_CATCH, STEPDEF_PROMISE_FINALLY,
@@ -1518,7 +1518,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_JSON_STRINGIFY, STEPDEF_FOR_IN, STEPDEF_IMPORT_OPTS,
     STEPDEF_OBJ_HASOWN, STEPDEF_OBJ_HASOWNPROP,
     STEPDEF_OBJ_LOOKUPGETTER, STEPDEF_OBJ_LOOKUPSETTER,
-    STEPDEF_FUNC_BIND, STEPDEF_ITER_SET_CTOR, STEPDEF_ITER_SET_TAG,
+    STEPDEF_FUNC_BIND, STEPDEF_ITER_SET_CTOR, STEPDEF_ITER_SET_TAG, STEPDEF_ERROR_SET_STACK,
     STEPDEF_ITER_HELPER_RETURN,
     STEPDEF_OBJ_SEAL, STEPDEF_OBJ_FREEZE, STEPDEF_OBJ_ISSEALED, STEPDEF_OBJ_ISFROZEN,
     STEPDEF_OBJ_TOSTRING, STEPDEF_OBJ_TOLOCALESTRING,
@@ -9158,35 +9158,12 @@ static JSValue js_call_function(JSContext *ctx, JSValueConst this_val,
     return JS_Call(ctx, argv[1], argv[0], argc-2, argv+2);
 }
 
-// returns enumerable and non-enumerable strings *and* symbols
-static JSValue js_getOwnPropertyKeys(JSContext *ctx, JSValueConst this_val,
-                                     int argc, JSValueConst *argv)
-{
-    int flags = JS_GPN_STRING_MASK|JS_GPN_SYMBOL_MASK;
-    return JS_GetOwnPropertyNames2(ctx, argv[0], flags);
-}
+/* DELETED: js_getOwnPropertyKeys. 27.1.3.4 Iterator.zipKeyed step 4.a is
+   `? iterables.[[OwnPropertyKeys]]()` and the self-hosted body reached it through this helper's
+   JS_GetOwnPropertyNames2 — the `ownKeys` trap, plus 10.5.11's invariant, from C. It asked for strings AND
+   symbols, which is Reflect.ownKeys exactly, and that is already a step machine; the helper is now that machine
+   rather than a second spelling of it. */
 
-static JSValue js_hasOwnEnumProperty(JSContext *ctx, JSValueConst this_val,
-                                     int argc, JSValueConst *argv)
-{
-    JSObject *p;
-    JSAtom key;
-    int flags, res;
-
-    if (JS_TAG_OBJECT != JS_VALUE_GET_TAG(argv[0]))
-        return JS_ThrowTypeErrorNotAnObject(ctx);
-    p = JS_VALUE_GET_OBJ(argv[0]);
-    key = JS_ValueToAtomInternal(ctx, argv[1], JS_TO_STRING_NO_SIDE_EFFECTS);
-    if (key == JS_ATOM_NULL)
-        return JS_EXCEPTION;
-    res = JS_GetOwnPropertyFlagsInternal(ctx, &flags, p, key);
-    JS_FreeAtom(ctx, key);
-    if (res < 0)
-        return JS_EXCEPTION;
-    if (res > 0 && (flags & JS_PROP_ENUMERABLE))
-        return JS_TRUE;
-    return JS_FALSE;
-}
 
 // note: takes ownership of |argv|
 static JSValue js_bytecode_eval(JSContext *ctx, const uint8_t *bytecode,
@@ -9270,10 +9247,10 @@ static JSValue js_bytecode_autoinit(JSContext *ctx, JSObject *p, JSAtom atom,
                                      1, JS_CFUNC_step_ctor,
                                       STEPDEF_ERROR_CTOR_BASE + JS_TYPE_ERROR),
                 JS_NewCFunction(ctx, js_call_function, "call", 2),
-                JS_NewCFunction(ctx, js_hasOwnEnumProperty,
-                                "hasOwnEnumProperty", 2),
-                JS_NewCFunction(ctx, js_getOwnPropertyKeys,
-                                "getOwnPropertyKeys", 1),
+                JS_NewCFunctionMagic(ctx, NULL, "hasOwnEnumProperty", 2,
+                                     JS_CFUNC_step, STEPDEF_HAS_OWN_ENUM),
+                JS_NewCFunctionMagic(ctx, NULL, "getOwnPropertyKeys", 1,
+                                     JS_CFUNC_step, STEPDEF_REFLECT_OWNKEYS),
                 JS_AtomToValue(ctx, JS_ATOM_Symbol_iterator),
             };
             JSValue result = js_bytecode_eval(ctx, qjsc_builtin_iterator_zip_keyed,
@@ -10304,42 +10281,11 @@ JSValue JS_GetPropertyUint32(JSContext *ctx, JSValueConst this_obj,
     return JS_GetPropertyInt64(ctx, this_obj, idx);
 }
 
-/* Check if an object has a generalized numeric property. Return value:
-   -1 for exception, *pval set to JS_EXCEPTION
-   true if property exists, stored into *pval,
-   false if property does not exist. *pval set to JS_UNDEFINED.
- */
-static int JS_TryGetPropertyInt64(JSContext *ctx, JSValueConst obj, int64_t idx, JSValue *pval)
-{
-    JSValue val;
-    JSAtom prop;
-    int present;
-
-    if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT &&
-               (uint64_t)idx <= INT32_MAX)) {
-        /* fast path for array and typed array access */
-        JSObject *p = JS_VALUE_GET_OBJ(obj);
-        if (js_get_fast_array_element(ctx, p, idx, pval))
-            return true;
-    }
-    val = JS_EXCEPTION;
-    present = -1;
-    prop = JS_NewAtomInt64(ctx, idx);
-    if (likely(prop != JS_ATOM_NULL)) {
-        present = JS_HasProperty(ctx, obj, prop);
-        if (present > 0) {
-            val = JS_GetProperty(ctx, obj, prop);
-            if (unlikely(JS_IsException(val)))
-                present = -1;
-        } else if (present == false) {
-            val = JS_UNDEFINED;
-        }
-        JS_FreeAtom(ctx, prop);
-    }
-    *pval = val;
-    return present;
-}
-
+/* DELETED: JS_TryGetPropertyInt64. It was the has-then-get pair every array builtin used to walk a sparse
+   source, and its last caller went when those builtins became step machines over step_hasidx_run and
+   step_getidx_run — but the body kept compiling, so it kept being a C entry that runs a Proxy's `has` and `get`
+   traps with no flow base, and the [[HasProperty]] ratchet kept counting it as a consumer still to convert. A
+   superseded body that still compiles is the fallback this project forbids, whether or not anything reaches it. */
 JSValue JS_GetPropertyInt64(JSContext *ctx, JSValueConst obj, int64_t idx)
 {
     JSAtom prop;
@@ -17545,6 +17491,12 @@ typedef struct JSTrampStepDef {
        step() (as JS_EXCEPTION, with the throw still live in the context) rather than free the chain. Zero for
        every other definition, which is the default a positional initializer leaves. */
     uint8_t  catches_abrupt;
+    /* SetterThatIgnoresPrototypeProperties' `home` operand, as a class_proto id: the object the setter refuses to
+       write to because the accessor LIVES there. `arg` carries the AO's `p` for the same reason — both are
+       operands of the algorithm, so both are declared rather than hard-coded, which is what lets one machine
+       serve %Iterator.prototype%'s two accessors and Error.prototype.stack. 0 (JS_CLASS_OBJECT) for every other
+       definition; those machines never read it. */
+    int      home_class;
 } JSTrampStepDef;
 /* The SINK a consuming builtin declares at its definition, or -1. The same shape as tramp_step_def_of: the
    callee carries the capability, so the interpreter asks one question rather than testing it against a list of
@@ -57640,6 +57592,56 @@ static JSValue js_obj_defprop_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
+/* 27.1.3.4 step 4.c: `desc = ? iterables.[[GetOwnProperty]](key)`, then whether it exists and is enumerable.
+   JS_GetOwnPropertyFlagsInternal ran the `getOwnPropertyDescriptor` trap and its invariant from C. The RECORD
+   answer shape is what this wants — the two attribute bits, not a descriptor object to read fields back off. */
+typedef struct JSHasOwnEnum {
+    JSStepHdr hdr;
+    JSValue result;      /* DONE (owned) */
+    JSAtom key;          /* the key being asked about (owned) */
+    JSDescFacts facts;   /* the descriptor, as the bits the step tests (owned) */
+} JSHasOwnEnum;
+static int js_has_own_enum_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSHasOwnEnum *s = st;
+
+    if (s->hdr.stage == 0) {
+        JSValueConst obj = step_arg(&s->hdr, 0);
+        JS_FreeValue(ctx, cb_result);
+        s->result = JS_UNDEFINED;
+        s->key = JS_ATOM_NULL;
+        js_desc_facts_init(&s->facts);
+        if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT) {
+            JS_ThrowTypeErrorNotAnObject(ctx);
+            return -1;
+        }
+        /* the key comes from the [[OwnPropertyKeys]] list the invariant walk already validated as Strings and
+           Symbols, so this is a lookup and not a coercion. */
+        s->key = JS_ValueToAtomInternal(ctx, step_arg(&s->hdr, 1), JS_TO_STRING_NO_SIDE_EFFECTS);
+        if (s->key == JS_ATOM_NULL) return -1;
+        s->hdr.stage = 1;
+        s->hdr.desc_facts = &s->facts;
+        s->hdr.cb_coerce[0] = obj;   /* borrowed: the caller's argument outlives the request */
+        *out_cb = s->hdr.cb_coerce; *out_argc = (int)s->key;
+        return 12;
+    }
+    DCHECK(s->hdr.stage == 1, "the own-enumerable probe resumed in no stage");
+    if (JS_IsException(cb_result)) return -1;
+    JS_FreeValue(ctx, cb_result);
+    s->result = js_bool(s->facts.flags >= 0 && (s->facts.flags & JS_PROP_ENUMERABLE));
+    return 0;
+}
+static JSValue js_has_own_enum_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSHasOwnEnum *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    js_desc_facts_free(ctx, &s->facts);
+    JS_FreeAtom(ctx, s->key);
+    js_free(ctx, s);
+    return r;
+}
+
 /* B.2.2.2 / B.2.2.3 Object.prototype.__defineGetter__ / __defineSetter__. Step 5 is
    `? DefinePropertyOrThrow(O, key, desc)` — on a Proxy the `defineProperty` trap plus 10.5.6's invariant, the
    page's code — and step 4's ToPropertyKey is the page's code too. JS_DefineProperty ran the first from C, which
@@ -60464,38 +60466,26 @@ static JSValue js_error_get_stack(JSContext *ctx, JSValueConst this_val)
     return js_dup(p->u.object_data);
 }
 
-static JSValue js_error_set_stack(JSContext *ctx, JSValueConst this_val,
-                                  JSValueConst value)
+/* DELETED: js_error_set_stack's C body. The error-stack accessor's setter IS
+   SetterThatIgnoresPrototypeProperties(E, %Error.prototype%, "stack", v), which %Iterator.prototype%'s two
+   accessors already have a machine for — and the C body ran all THREE of its page-visible operations from C:
+   `E.[[GetOwnProperty]]("stack")` (JS_GetOwnPropertyFlagsInternal, which is a `getOwnPropertyDescriptor` trap on a
+   Proxy receiver — what test262's setter tests reached), CreateDataPropertyOrThrow and Set(E,"stack",v,true).
+   Only its step 3 is not in the AO, so only step 3 is declared, as the definition's precheck. */
+static int js_error_stack_precheck(JSContext *ctx, const struct JSStepHdr *h)
 {
-    int ret, flags;
-
-    if (JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT)
-        return JS_ThrowTypeErrorNotAnObject(ctx);
-    if (!JS_IsString(value))
-        return JS_ThrowTypeError(ctx, "Error.prototype.stack setter expects a string");
-    if (js_same_value(ctx, this_val, ctx->class_proto[JS_CLASS_ERROR]))
-        return JS_ThrowTypeError(ctx, "Error.prototype.stack setter called on the home object");
-    ret = JS_GetOwnPropertyFlagsInternal(ctx, &flags, JS_VALUE_GET_OBJ(this_val),
-                                         JS_ATOM_stack);
-    if (ret < 0)
-        return JS_EXCEPTION;
-    if (ret == 0) {
-        if (JS_DefinePropertyValue(ctx, this_val, JS_ATOM_stack, js_dup(value),
-                                   JS_PROP_C_W_E | JS_PROP_THROW) < 0)
-            return JS_EXCEPTION;
-    } else {
-        if (JS_SetPropertyInternal2(ctx, this_val, JS_ATOM_stack, js_dup(value),
-                                    this_val, JS_PROP_THROW, NULL) < 0)   /* this_val IS the receiver */
-            return JS_EXCEPTION;
+    if (!JS_IsString(step_arg(h, 0))) {   /* step 3: v must ALREADY be a String; nothing is coerced */
+        JS_ThrowTypeError(ctx, "Error.prototype.stack setter expects a string");
+        return -1;
     }
-    return JS_UNDEFINED;
+    return 0;
 }
 
 static const JSCFunctionListEntry js_error_proto_funcs[] = {
     JS_CFUNC_STEP_DEF("toString", 0, STEPDEF_ERROR_TOSTRING ),
     JS_PROP_STRING_DEF("name", "Error", JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE ),
     JS_PROP_STRING_DEF("message", "", JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE ),
-    JS_CGETSET_DEF("stack", js_error_get_stack, js_error_set_stack ),
+    JS_CGETSET_STEP_DEF("stack", js_error_get_stack, STEPDEF_ERROR_SET_STACK ),
 };
 
 static JSValue js_error_isError(JSContext *ctx, JSValueConst this_val,
@@ -63772,6 +63762,7 @@ enum { ITS_OWN = 1, ITS_OWN_GOT, ITS_SET, ITS_DEFINE };
 static int js_iter_setter_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSIterSetter *s = st;
+    const JSTrampStepDef *sdef = s->hdr.def;
     JSAtom key = (JSAtom)s->hdr.arg;
     int r;
 
@@ -63781,7 +63772,11 @@ static int js_iter_setter_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
         s->result = JS_UNDEFINED;
         if (check_iterator(ctx, s->hdr.this_val) < 0)                          /* step 1 */
             return -1;
-        if (js_same_value(ctx, s->hdr.this_val, ctx->class_proto[JS_CLASS_ITERATOR])) {
+        /* an accessor that interposes an extra leading validation declares it: the error-stack accessor's step 3
+           rejects a non-String value, between the not-an-Object test and the home test. */
+        if (sdef->precheck && sdef->precheck(ctx, &s->hdr) < 0)
+            return -1;
+        if (js_same_value(ctx, s->hdr.this_val, ctx->class_proto[sdef->home_class])) {
             JS_ThrowTypeError(ctx, "Cannot assign to read only property");     /* step 2 */
             return -1;
         }
@@ -63810,7 +63805,8 @@ static int js_iter_setter_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
                              step_arg(&s->hdr, 0), cb_result, out_cb, out_argc);
         return r != 0 ? r : 0;
     }
-    DCHECK(s->hdr.stage == ITS_DEFINE, "the %Iterator.prototype% setter's machine resumed in no stage");
+    DCHECK(s->hdr.stage == ITS_DEFINE,
+           "the SetterThatIgnoresPrototypeProperties machine resumed in no stage");
     r = step_defprop_run(ctx, &s->hdr, s->hdr.this_val, key,                   /* step 4 */
                          step_arg(&s->hdr, 0), true, cb_result, out_cb, out_argc);
     return r != 0 ? r : 0;
@@ -63830,8 +63826,12 @@ static const JSTrampStepDef js_hasownprop_def  = { sizeof(JSHasOwn), js_hasown_s
 static const JSTrampStepDef js_lookupgetter_def = { sizeof(JSLookupAcc), js_lookup_acc_step, js_lookup_acc_fini, 0 };
 static const JSTrampStepDef js_lookupsetter_def = { sizeof(JSLookupAcc), js_lookup_acc_step, js_lookup_acc_fini, 1 };
 static const JSTrampStepDef js_func_bind_def   = { sizeof(JSFuncBind), js_func_bind_step, js_func_bind_fini, 0 };
-static const JSTrampStepDef js_iter_set_ctor_def = { sizeof(JSIterSetter), js_iter_setter_step, js_iter_setter_fini, JS_ATOM_constructor };
-static const JSTrampStepDef js_iter_set_tag_def  = { sizeof(JSIterSetter), js_iter_setter_step, js_iter_setter_fini, JS_ATOM_Symbol_toStringTag };
+static const JSTrampStepDef js_iter_set_ctor_def = { sizeof(JSIterSetter), js_iter_setter_step, js_iter_setter_fini, JS_ATOM_constructor,
+                                                    .home_class = JS_CLASS_ITERATOR };
+static const JSTrampStepDef js_iter_set_tag_def  = { sizeof(JSIterSetter), js_iter_setter_step, js_iter_setter_fini, JS_ATOM_Symbol_toStringTag,
+                                                    .home_class = JS_CLASS_ITERATOR };
+static const JSTrampStepDef js_error_set_stack_def = { sizeof(JSIterSetter), js_iter_setter_step, js_iter_setter_fini, JS_ATOM_stack,
+                                                      .home_class = JS_CLASS_ERROR, .precheck = js_error_stack_precheck };
 static const JSTrampStepDef js_instanceof_def  = { sizeof(JSInstanceOf), js_instanceof_step, js_instanceof_fini, INSTOF_OPERATOR };
 static const JSTrampStepDef js_ordinary_hasinst_def = { sizeof(JSInstanceOf), js_instanceof_step, js_instanceof_fini, INSTOF_ORDINARY };
 static const JSTrampStepDef js_obj_tolocale_def = { sizeof(JSObjToLocale), js_object_tolocale_step, js_object_tolocale_fini, 0 };
@@ -64034,6 +64034,7 @@ static const JSTrampStepDef js_str_localeCmp_def  = { sizeof(JSStrRecv), js_str_
 static const JSTrampStepDef js_ta_at_def          = { sizeof(JSTAIdx), js_ta_idx_step, js_ta_idx_fini, TAIDX_AT };
 static const JSTrampStepDef js_ta_set_def         = { sizeof(JSTAIdx), js_ta_idx_step, js_ta_idx_fini, TAIDX_SET };
 static const JSTrampStepDef js_json_raw_def       = { sizeof(JSJsonRaw), js_json_raw_step, js_json_raw_fini, 0 };
+static const JSTrampStepDef js_has_own_enum_def   = { sizeof(JSHasOwnEnum), js_has_own_enum_step, js_has_own_enum_fini, 0 };
 static const JSTrampStepDef js_obj_defprop_def    = { sizeof(JSObjDefProp), js_obj_defprop_step, js_obj_defprop_fini, 0 };
 static const JSTrampStepDef js_obj_defgetter_def  = { sizeof(JSObjDefAccessor), js_obj_defaccessor_step, js_obj_defaccessor_fini, 0 };
 static const JSTrampStepDef js_obj_defsetter_def  = { sizeof(JSObjDefAccessor), js_obj_defaccessor_step, js_obj_defaccessor_fini, 1 };
@@ -64493,6 +64494,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_OBJ_LOOKUPSETTER] = &js_lookupsetter_def,
     [STEPDEF_FUNC_BIND]      = &js_func_bind_def,
     [STEPDEF_ITER_SET_CTOR]  = &js_iter_set_ctor_def,
+    [STEPDEF_ERROR_SET_STACK] = &js_error_set_stack_def,
     [STEPDEF_ITER_SET_TAG]   = &js_iter_set_tag_def,
     [STEPDEF_ITER_HELPER_RETURN] = &js_iter_helper_return_def,
     [STEPDEF_INSTANCEOF]     = &js_instanceof_def,
@@ -64601,6 +64603,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_OWNKEYS_NAMES] = &js_ownkeys_names_def,
     [STEPDEF_OWNKEYS_SYMBOLS] = &js_ownkeys_syms_def,
     [STEPDEF_REFLECT_OWNKEYS] = &js_reflect_ownkeys_def,
+    [STEPDEF_HAS_OWN_ENUM] = &js_has_own_enum_def,
     [STEPDEF_PARSEINT]        = &js_parseInt_def,
     [STEPDEF_PARSEFLOAT]      = &js_parseFloat_def,
     [STEPDEF_STR_SPLIT]       = &js_str_split_def,
@@ -64761,6 +64764,8 @@ STEP_STATE_HDR_FIRST(JSStrRecv);
 STEP_STATE_HDR_FIRST(JSTAIdx);
 STEP_STATE_HDR_FIRST(JSJsonRaw);
 STEP_STATE_HDR_FIRST(JSObjDefProp);
+STEP_STATE_HDR_FIRST(JSObjDefAccessor);
+STEP_STATE_HDR_FIRST(JSHasOwnEnum);
 STEP_STATE_HDR_FIRST(JSParseNum);
 STEP_STATE_HDR_FIRST(JSStrSplit);
 STEP_STATE_HDR_FIRST(JSArrayJoin);
@@ -83476,6 +83481,16 @@ static int js_ta_idx_step(JSContext *ctx, void *st, JSValue cb_result, JSValue *
             s->hdr.stage = 4;
         }
         for (;;) {
+            if (s->hdr.stage == 6) {
+                /* 23.2.3.26.1 step 6.b's `? Get(src, Pk)`, re-entered until it finishes. The source is an
+                   ARRAY-LIKE, so the read is an accessor or a Proxy `get` trap — the page's code, which
+                   JS_GetPropertyUint32 ran from C with no flow base. */
+                int r3 = step_getidx_run(ctx, &s->hdr, s->src, s->i, cb_result, &s->el, out_cb, out_argc);
+                cb_result = JS_UNDEFINED;
+                if (r3) return r3 < 0 ? -1 : r3;
+                s->hdr.stage = 4;
+                goto ta_have_element;
+            }
             if (s->hdr.stage == 5) {          /* the element's primitive arrived */
                 s->hdr.stage = 4;
                 JS_FreeValue(ctx, s->el);     /* the OBJECT the primitive came from; cb_coerce only borrowed it */
@@ -83491,8 +83506,14 @@ static int js_ta_idx_step(JSContext *ctx, void *st, JSValue cb_result, JSValue *
             }
             JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
             if (s->i >= s->src_len) { s->result = JS_UNDEFINED; return 0; }
-            s->el = JS_GetPropertyUint32(ctx, s->src, (uint32_t)s->i);
-            if (JS_IsException(s->el)) { s->el = JS_UNDEFINED; return -1; }
+            {
+                int r3;
+                s->hdr.stage = 6;
+                r3 = step_getidx_run(ctx, &s->hdr, s->src, s->i, JS_UNDEFINED, &s->el, out_cb, out_argc);
+                if (r3) return r3 < 0 ? -1 : r3;
+                s->hdr.stage = 4;
+            }
+        ta_have_element:
             /* Per spec, detaching mid-iteration is allowed and must not throw: iterating the SOURCE is
                observable, so the walk continues and only the stores stop. */
             if (JS_VALUE_GET_TAG(s->el) == JS_TAG_OBJECT) {
