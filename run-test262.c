@@ -1109,6 +1109,22 @@ void load_config(const char *filename, const char *ignore)
         p = str_strip(buf);
         if (*p == '#' || *p == ';' || *p == '\0')
             continue;  /* line comment */
+        {
+            /* A TRAILING comment is a comment too. Only a line STARTING with '#' was one, so
+               `Atomics=!tcc # atomics are broken in recent versions of tcc` set the value to
+               "!tcc # atomics are broken in recent versions of tcc", which matches neither "yes" nor "!tcc" —
+               so the feature was SKIPPED for every compiler and 384 Atomics tests silently never ran. A comment
+               must never change a setting's value; that is the whole difference between a config file and a
+               trap. Whitespace-then-'#' is the delimiter, so a '#' inside a path is still a path. */
+            char *c = p;
+            while ((c = strchr(c, '#')) != NULL) {
+                if (c > p && (c[-1] == ' ' || c[-1] == '\t')) { *c = '\0'; break; }
+                c++;
+            }
+            p = str_strip(p);
+            if (*p == '\0')
+                continue;
+        }
 
         if (*p == "[]"[0]) {
             /* new section */

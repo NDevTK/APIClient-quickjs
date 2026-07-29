@@ -1528,6 +1528,9 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     DATE_SET_LIST(DATE_SET_ID)
 #undef DATE_SET_ID
     STEPDEF_DATE_SETTIME, STEPDEF_DATE_SETYEAR,
+    STEPDEF_ATOMICS_ADD, STEPDEF_ATOMICS_AND, STEPDEF_ATOMICS_OR, STEPDEF_ATOMICS_SUB,
+    STEPDEF_ATOMICS_XOR, STEPDEF_ATOMICS_EXCHANGE, STEPDEF_ATOMICS_CMPXCHG, STEPDEF_ATOMICS_LOAD,
+    STEPDEF_ATOMICS_STORE, STEPDEF_ATOMICS_ISLOCKFREE, STEPDEF_ATOMICS_WAIT, STEPDEF_ATOMICS_NOTIFY,
     STEPDEF_COUNT
 };
 #define HINT_NONE    2
@@ -58708,6 +58711,22 @@ static JSValue js_function_apply(JSContext *ctx, JSValueConst this_val,
    each OBJECT among them; stage 1 receives one and replaces that argument. When none is left the body runs with
    an argument vector that holds only primitives, so every JS_ToIndex / JS_ToNumber / JS_ToBigInt /
    JS_ToPropertyKey inside it is pure arithmetic. */
+/* Every conversion a coerce-then-compute declaration can name — ToNumber for HINT_NUMBER, ToString for
+   HINT_STRING — throws an UNCONDITIONAL TypeError on a Symbol, and the spec performs argument i's conversion
+   BEFORE it touches argument i+1. Splitting ToPrimitive from the narrowing put every later argument's valueOf
+   in between, so `Math.atan2(Symbol(), {valueOf(){throw x}})` ran that valueOf and reported ITS throw where the
+   spec reports the Symbol's TypeError — and the same for Math.pow, Math.max, BigInt.asIntN and Atomics.wait.
+   Doing it here is the narrowing's one outcome that does not depend on what the body converts to. */
+static int prim_arg_check(JSContext *ctx, JSValueConst v, int hint)
+{
+    if (unlikely(JS_VALUE_GET_TAG(v) == JS_TAG_SYMBOL)) {
+        JS_ThrowTypeError(ctx, hint == HINT_STRING ? "cannot convert symbol to string"
+                                                   : "cannot convert symbol to number");
+        return -1;
+    }
+    return 0;
+}
+
 static int js_primargs_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSPrimArgs *s = st;
@@ -58733,6 +58752,8 @@ static int js_primargs_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
         s->hdr.coercing = 0;
         JS_FreeValue(ctx, s->argp[s->next - 1]);
         s->argp[s->next - 1] = cb_result;   /* the primitive REPLACES the argument the body will read */
+        if (prim_arg_check(ctx, s->argp[s->next - 1], hint) < 0)
+            return -1;
         if (s->next == 1 && s->hdr.def->midcheck
             && s->hdr.def->midcheck(ctx, (JSValueConst *)s->argp, s->hdr.def->body_magic) < 0)
             return -1;
@@ -58746,7 +58767,9 @@ static int js_primargs_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
             s->hdr.coercing = 1;
             return 5;
         }
-        /* the argument was already primitive, so its own interleaved validation is due right here */
+        /* the argument was already primitive, so its own conversion and interleaved validation are due here */
+        if (prim_arg_check(ctx, s->argp[i], hint) < 0)
+            return -1;
         if (i == 0 && s->hdr.def->midcheck && s->hdr.def->midcheck(ctx, (JSValueConst *)s->argp, s->hdr.def->body_magic) < 0)
             return -1;
     }
@@ -63161,6 +63184,18 @@ static const JSTrampStepDef js_iter_wrap_return_def =
     { sizeof(JSIterWrapReturn), js_iter_wrap_return_step, js_iter_wrap_return_fini, 0 };
 static const JSTrampStepDef js_date_toJSON_def = { sizeof(JSDateToJSON), js_date_tojson_step, js_date_tojson_fini, 0 };
 static const JSTrampStepDef js_date_toPrim_def = { sizeof(JSDateToPrim), js_date_toprim_step, js_date_toprim_fini, 0 };
+/* the captured half of an Atomics operation: the length ValidateAtomicAccess reads at step 1, held across the
+   index's own coercion, plus the argument vector the body will read. */
+typedef struct JSAtomics {
+    JSStepHdr hdr;        /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    JSValue result;       /* DONE (owned) */
+    JSValue *argp;        /* the arguments, each coerced one replaced in place (owned) */
+    int nargp;
+    uint32_t length;      /* TypedArrayLength, read BEFORE the index was coerced */
+    int i;                /* the coercion cursor */
+    JSValue cb[1];        /* the TOPRIMITIVE request buffer */
+} JSAtomics;
+
 /* the captured half of a Date setter: everything read at step 2, held across the argument coercions. */
 typedef struct JSDateSet {
     JSStepHdr hdr;        /* MUST be first: the generic step driver casts the state to JSStepHdr * */
@@ -63343,6 +63378,68 @@ static const JSTrampStepDef js_date_setYear_def = DATE_SET_DEF(0x011 | DATE_SET_
 /* 21.4.4.27 setTime is the one that reads NOTHING from the stored value — step 2 validates the slot and step 3's
    ToNumber is the whole input — so it IS a coerce-then-compute declaration, with the RequireInternalSlot as the
    leading validation the `pre` hook exists for. */
+#ifdef CONFIG_ATOMICS
+typedef enum AtomicsOpEnum {
+    ATOMICS_OP_ADD,
+    ATOMICS_OP_AND,
+    ATOMICS_OP_OR,
+    ATOMICS_OP_SUB,
+    ATOMICS_OP_XOR,
+    ATOMICS_OP_EXCHANGE,
+    ATOMICS_OP_COMPARE_EXCHANGE,
+    ATOMICS_OP_LOAD,
+} AtomicsOpEnum;
+
+static JSValue js_atomics_op(JSContext *ctx, JSValueConst this_obj, int argc, JSValueConst *argv, int op);
+static JSValue js_atomics_store(JSContext *ctx, JSValueConst this_obj, int argc, JSValueConst *argv);
+static JSValue js_atomics_isLockFree(JSContext *ctx, JSValueConst this_obj, int argc, JSValueConst *argv);
+static JSValue js_atomics_wait(JSContext *ctx, JSValueConst this_obj, int argc, JSValueConst *argv);
+static JSValue js_atomics_notify(JSContext *ctx, JSValueConst this_obj, int argc, JSValueConst *argv);
+static int js_atomics_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_atomics_fini(JSContext *ctx, void *st, bool take_result);
+
+/* 25.4.4-.15. Every Atomics operation is ValidateIntegerTypedArray, then ValidateAtomicAccess — which reads the
+   LENGTH, then ToIndex(index), then tests one against the other — and then ToNumber/ToBigInt on the value(s).
+   Three of those are the page's code and js_atomics_op ran all of them from its C entry (JS_ToIndex inside
+   js_atomics_get_buf, then JS_ToBigInt64 / JS_ToUint32), so `Atomics.store(ta, 0, {valueOf(){for(;;){}}})`
+   preempted with no flow base.
+
+   It is NOT a coerce-then-compute declaration, for the reason the Date setters are not: 25.4.3.2 step 1 reads
+   the length BEFORE step 2's ToIndex, so a growable SharedArrayBuffer grown inside the index's valueOf must
+   still be measured at its ORIGINAL length — which test262's retrieve-length-before-index-coercion checks and a
+   re-read after the coercion gets wrong. The captured length has to live on a state.
+
+   `arg` packs what the twelve entry points differ in: the coercion MASK (argument 0 is the typed array and is
+   never coerced), the padded argument count, `waitable` for ValidateIntegerTypedArray, and whether the access
+   mode is ~write~ — which 25.4.3.1 step 2 -> ValidateTypedArray step 4 rejects on an IMMUTABLE buffer. */
+#define ATOMICS_ARG(mask, nargs, waitable, write) \
+    ((mask) | ((waitable) << 8) | ((write) << 10) | ((nargs) << 16))
+#define ATOMICS_MASK(a)     ((a) & 0xff)
+#define ATOMICS_WAITABLE(a) (((a) >> 8) & 3)
+#define ATOMICS_ISWRITE(a)  (((a) >> 10) & 1)
+#define ATOMICS_NARGS(a)    (((a) >> 16) & 0xff)
+#define ATOMICS_DEF(mask, nargs, waitable, write, proto, fn, magic) \
+    { sizeof(JSAtomics), js_atomics_step, js_atomics_fini, ATOMICS_ARG(mask, nargs, waitable, write), \
+      { .proto = (fn) }, JS_CFUNC_##proto, (magic) }
+/* the read-modify-write eight: index and value(s), access mode ~write~ */
+static const JSTrampStepDef js_atomics_add_def   = ATOMICS_DEF(0x6, 3, 0, 1, generic_magic, js_atomics_op, ATOMICS_OP_ADD);
+static const JSTrampStepDef js_atomics_and_def   = ATOMICS_DEF(0x6, 3, 0, 1, generic_magic, js_atomics_op, ATOMICS_OP_AND);
+static const JSTrampStepDef js_atomics_or_def    = ATOMICS_DEF(0x6, 3, 0, 1, generic_magic, js_atomics_op, ATOMICS_OP_OR);
+static const JSTrampStepDef js_atomics_sub_def   = ATOMICS_DEF(0x6, 3, 0, 1, generic_magic, js_atomics_op, ATOMICS_OP_SUB);
+static const JSTrampStepDef js_atomics_xor_def   = ATOMICS_DEF(0x6, 3, 0, 1, generic_magic, js_atomics_op, ATOMICS_OP_XOR);
+static const JSTrampStepDef js_atomics_xchg_def  = ATOMICS_DEF(0x6, 3, 0, 1, generic_magic, js_atomics_op, ATOMICS_OP_EXCHANGE);
+static const JSTrampStepDef js_atomics_cmpxchg_def = ATOMICS_DEF(0xE, 4, 0, 1, generic_magic, js_atomics_op, ATOMICS_OP_COMPARE_EXCHANGE);
+static const JSTrampStepDef js_atomics_store_def = ATOMICS_DEF(0x6, 3, 0, 1, generic, js_atomics_store, 0);
+/* 25.4.8 load has no value argument at all, and its access mode is ~read~ */
+static const JSTrampStepDef js_atomics_load_def  = ATOMICS_DEF(0x2, 2, 0, 0, generic_magic, js_atomics_op, ATOMICS_OP_LOAD);
+/* wait and notify are the WAITABLE forms — Int32Array or BigInt64Array only, and wait additionally requires a
+   SharedArrayBuffer. Both read rather than write. */
+static const JSTrampStepDef js_atomics_wait_def  = ATOMICS_DEF(0xE, 4, 2, 0, generic, js_atomics_wait, 0);
+static const JSTrampStepDef js_atomics_notify_def = ATOMICS_DEF(0x6, 3, 1, 0, generic, js_atomics_notify, 0);
+/* 25.4.9 isLockFree takes a plain number and no typed array, so it is the ordinary one-argument declaration. */
+static const JSTrampStepDef js_atomics_islockfree_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), generic,
+                                                                    js_atomics_isLockFree, 0);
+#endif /* CONFIG_ATOMICS */
 static const JSTrampStepDef js_date_setTime_def = PRIMARGS_DEF_PRE(PRIMARGS(0x1, HINT_NUMBER, 1), generic,
                                                                   js_date_setTime, 0, js_date_this_precheck, NULL);
 static const JSTrampStepDef js_bigint_asUintN_def = PRIMARGS_DEF(PRIMARGS(0x3, HINT_NUMBER, 2), generic_magic, js_bigint_asUintN, 0);
@@ -63715,6 +63812,14 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
 #undef DATE_SET_ENTRY
     [STEPDEF_DATE_SETTIME]  = &js_date_setTime_def,
     [STEPDEF_DATE_SETYEAR]  = &js_date_setYear_def,
+#ifdef CONFIG_ATOMICS
+    [STEPDEF_ATOMICS_ADD]   = &js_atomics_add_def,   [STEPDEF_ATOMICS_AND]    = &js_atomics_and_def,
+    [STEPDEF_ATOMICS_OR]    = &js_atomics_or_def,    [STEPDEF_ATOMICS_SUB]    = &js_atomics_sub_def,
+    [STEPDEF_ATOMICS_XOR]   = &js_atomics_xor_def,   [STEPDEF_ATOMICS_EXCHANGE] = &js_atomics_xchg_def,
+    [STEPDEF_ATOMICS_CMPXCHG] = &js_atomics_cmpxchg_def, [STEPDEF_ATOMICS_LOAD] = &js_atomics_load_def,
+    [STEPDEF_ATOMICS_STORE] = &js_atomics_store_def, [STEPDEF_ATOMICS_ISLOCKFREE] = &js_atomics_islockfree_def,
+    [STEPDEF_ATOMICS_WAIT]  = &js_atomics_wait_def,  [STEPDEF_ATOMICS_NOTIFY] = &js_atomics_notify_def,
+#endif
     [STEPDEF_STR_CHARAT]      = &js_str_charAt_def,
     [STEPDEF_STR_CHARCODEAT]  = &js_str_charCodeAt_def,
     [STEPDEF_TA_AT]           = &js_ta_at_def,
@@ -83676,17 +83781,8 @@ int JS_GetTypedArrayType(JSValueConst obj)
 /* Atomics */
 #ifdef CONFIG_ATOMICS
 
-typedef enum AtomicsOpEnum {
-    ATOMICS_OP_ADD,
-    ATOMICS_OP_AND,
-    ATOMICS_OP_OR,
-    ATOMICS_OP_SUB,
-    ATOMICS_OP_XOR,
-    ATOMICS_OP_EXCHANGE,
-    ATOMICS_OP_COMPARE_EXCHANGE,
-    ATOMICS_OP_LOAD,
-} AtomicsOpEnum;
-
+/* AtomicsOpEnum now lives beside the step definitions: a definition carries the body's magic, so the enum has
+   to be visible where the definitions are written. */
 static JSObject *js_atomics_get_buf(JSContext *ctx,
                                     JSValueConst obj, JSValueConst idx_val,
                                     JSArrayBuffer **pabuf,
@@ -83736,6 +83832,139 @@ static JSObject *js_atomics_get_buf(JSContext *ctx,
         *pabuf = abuf;
     *pindex = idx;
     return p;
+}
+
+/* 25.4.3.1 ValidateIntegerTypedArray and 25.4.3.2 step 1, which the spec performs BEFORE ToIndex(index). It
+   reads only internal slots, so it invokes nothing — and the LENGTH it returns is the one the range test must
+   use, because a growable buffer grown inside the index's own valueOf must not widen the window it was measured
+   against. */
+static JSObject *js_atomics_validate(JSContext *ctx, JSValueConst obj, int is_waitable, int is_write)
+{
+    JSObject *p;
+    JSTypedArray *ta;
+    JSArrayBuffer *abuf;
+    bool err;
+
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
+        goto fail;
+    p = JS_VALUE_GET_OBJ(obj);
+    if (is_waitable)
+        err = (p->class_id != JS_CLASS_INT32_ARRAY && p->class_id != JS_CLASS_BIG_INT64_ARRAY);
+    else
+        err = !(p->class_id >= JS_CLASS_INT8_ARRAY && p->class_id <= JS_CLASS_BIG_UINT64_ARRAY);
+    if (err) {
+    fail:
+        JS_ThrowTypeError(ctx, "integer TypedArray expected");
+        return NULL;
+    }
+    /* ValidateTypedArray step 4: a ~write~ access mode rejects an IMMUTABLE buffer. The eight
+       read-modify-write operations and store are writes; load, wait and notify are not. */
+    if (is_write && typed_array_is_immutable(p)) {
+        JS_ThrowTypeErrorImmutableArrayBuffer(ctx);
+        return NULL;
+    }
+    ta = p->u.typed_array;
+    abuf = ta->buffer->u.array_buffer;
+    if (!abuf->shared) {
+        if (is_waitable == 2) {
+            JS_ThrowTypeError(ctx, "not a SharedArrayBuffer TypedArray");
+            return NULL;
+        }
+        if (abuf->detached) {
+            JS_ThrowTypeErrorDetachedArrayBuffer(ctx);
+            return NULL;
+        }
+    }
+    return p;
+}
+
+/* 25.4.3.2 steps 2-4: ToIndex(requestIndex) against the length captured at step 1. The spec performs both
+   BEFORE the value is coerced, so an out-of-range index must throw without the value's valueOf running at all —
+   and against the CAPTURED length, so growing the buffer inside the index's own valueOf does not rescue it. The
+   index is already primitive here, so its ToIndex invokes nothing. */
+static int js_atomics_access(JSContext *ctx, JSAtomics *s)
+{
+    uint64_t idx;
+    if (JS_ToIndex(ctx, &idx, s->argp[1]))
+        return -1;
+    if (idx >= s->length) {
+        JS_ThrowRangeError(ctx, "out-of-bound access");
+        return -1;
+    }
+    return 0;
+}
+
+static int js_atomics_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSAtomics *s = st;
+    int arg = s->hdr.arg;
+    unsigned mask = ATOMICS_MASK(arg);
+    int nargs = ATOMICS_NARGS(arg);
+    int i;
+
+    if (s->hdr.stage == 0) {
+        JSObject *p;
+        JS_FreeValue(ctx, cb_result);
+        s->result = JS_UNDEFINED;
+        /* steps 25.4.3.1 and 25.4.3.2 step 1, both BEFORE the first coercion */
+        p = js_atomics_validate(ctx, step_arg(&s->hdr, 0), ATOMICS_WAITABLE(arg), ATOMICS_ISWRITE(arg));
+        if (!p)
+            return -1;
+        s->length = p->u.array.count;
+        s->nargp = s->hdr.argc > nargs ? s->hdr.argc : nargs;
+        s->argp = js_malloc(ctx, sizeof(JSValue) * (size_t)(s->nargp > 0 ? s->nargp : 1));
+        if (unlikely(!s->argp)) { s->nargp = 0; return -1; }
+        for (i = 0; i < s->nargp; i++)
+            s->argp[i] = js_dup(step_arg(&s->hdr, i));
+        s->i = 0;
+        s->hdr.stage = 1;
+    } else {
+        DCHECK(s->i > 0, "an Atomics operation received a primitive with no coercion in flight");
+        s->hdr.coercing = 0;
+        JS_FreeValue(ctx, s->argp[s->i - 1]);
+        s->argp[s->i - 1] = cb_result;   /* the primitive REPLACES the argument the body will read */
+        if (prim_arg_check(ctx, s->argp[s->i - 1], HINT_NUMBER) < 0)
+            return -1;
+        if (s->i == 2 && js_atomics_access(ctx, s) < 0)
+            return -1;
+    }
+    while (s->i < s->nargp) {
+        i = s->i++;
+        if (i >= 8 || !((mask >> i) & 1)) continue;
+        if (JS_VALUE_GET_TAG(s->argp[i]) == JS_TAG_OBJECT) {
+            s->cb[0] = s->argp[i];   /* borrowed: the vector holds the reference */
+            *out_cb = s->cb; *out_argc = HINT_NUMBER;
+            s->hdr.coercing = 1;
+            return 5;
+        }
+        /* the argument was already primitive, so its conversion — and for the index 25.4.3.2 steps 2-4 — is
+           due right here. A BigInt is legitimate on a BigInt64Array, so only the Symbol is rejected. */
+        if (prim_arg_check(ctx, s->argp[i], HINT_NUMBER) < 0)
+            return -1;
+        if (i == 1 && js_atomics_access(ctx, s) < 0)
+            return -1;
+    }
+    DCHECK(s->hdr.def->body.generic != NULL, "an Atomics definition with no body");
+    if (s->hdr.def->body_proto == JS_CFUNC_generic_magic) {
+        s->result = s->hdr.def->body.generic_magic(ctx, s->hdr.this_val, s->hdr.argc,
+                                                   (JSValueConst *)s->argp, s->hdr.def->body_magic);
+    } else {
+        DCHECK(s->hdr.def->body_proto == JS_CFUNC_generic, "an Atomics definition with an unhandled prototype");
+        s->result = s->hdr.def->body.generic(ctx, s->hdr.this_val, s->hdr.argc, (JSValueConst *)s->argp);
+    }
+    return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
+}
+
+static JSValue js_atomics_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSAtomics *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    int i;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    for (i = 0; i < s->nargp; i++) JS_FreeValue(ctx, s->argp[i]);
+    js_free(ctx, s->argp);
+    js_free(ctx, s);
+    return r;
 }
 
 static JSValue js_atomics_op(JSContext *ctx,
@@ -84086,11 +84315,16 @@ static JSValue js_atomics_notify(JSContext *ctx,
     JSArrayBuffer *abuf;
     JSAtomicsWaiter *waiter;
 
-    p = js_atomics_get_buf(ctx, argv[0], argv[1], &abuf, &idx, 1);
-    if (!p)
-        return JS_EXCEPTION;
+    /* 25.4.15 steps 1-2 are the MACHINE's — validation and ValidateAtomicAccess, both against the length read
+       before the index was coerced. Re-running them here re-measured a buffer the index's own valueOf may have
+       detached or resized, which 25.4.15 never does: it has no revalidation step at all. */
+    p = JS_VALUE_GET_OBJ(argv[0]);
+    abuf = p->u.typed_array->buffer->u.array_buffer;
     size_log2 = typed_array_size_log2(p->class_id);
+    if (JS_ToIndex(ctx, &idx, argv[1]))   /* already primitive: invokes nothing */
+        return JS_EXCEPTION;
 
+    /* step 3: the count, whose coercion the machine has already made primitive */
     if (JS_IsUndefined(argv[2])) {
         count = INT32_MAX;
     } else {
@@ -84098,9 +84332,10 @@ static JSValue js_atomics_notify(JSContext *ctx,
             return JS_EXCEPTION;
     }
 
-    /* check if an evil .valueOf has resized or detached the array */
-    if (idx >= p->u.array.count)
-        return JS_ThrowRangeError(ctx, "out-of-bound access");
+    /* step 5: a NON-SHARED buffer notifies nobody and returns +0 — before anything looks at the memory, which
+       is what makes it right for a buffer the index's valueOf detached or resized to zero. */
+    if (!abuf->shared)
+        return js_int32(0);
 
     n = 0;
     if (abuf->shared && count > 0) {
@@ -84129,19 +84364,19 @@ static JSValue js_atomics_notify(JSContext *ctx,
 }
 
 static const JSCFunctionListEntry js_atomics_funcs[] = {
-    JS_CFUNC_MAGIC_DEF("add", 3, js_atomics_op, ATOMICS_OP_ADD ),
-    JS_CFUNC_MAGIC_DEF("and", 3, js_atomics_op, ATOMICS_OP_AND ),
-    JS_CFUNC_MAGIC_DEF("or", 3, js_atomics_op, ATOMICS_OP_OR ),
-    JS_CFUNC_MAGIC_DEF("sub", 3, js_atomics_op, ATOMICS_OP_SUB ),
-    JS_CFUNC_MAGIC_DEF("xor", 3, js_atomics_op, ATOMICS_OP_XOR ),
-    JS_CFUNC_MAGIC_DEF("exchange", 3, js_atomics_op, ATOMICS_OP_EXCHANGE ),
-    JS_CFUNC_MAGIC_DEF("compareExchange", 4, js_atomics_op, ATOMICS_OP_COMPARE_EXCHANGE ),
-    JS_CFUNC_MAGIC_DEF("load", 2, js_atomics_op, ATOMICS_OP_LOAD ),
-    JS_CFUNC_DEF("store", 3, js_atomics_store ),
-    JS_CFUNC_DEF("isLockFree", 1, js_atomics_isLockFree ),
+    JS_CFUNC_STEP_DEF("add", 3, STEPDEF_ATOMICS_ADD ),
+    JS_CFUNC_STEP_DEF("and", 3, STEPDEF_ATOMICS_AND ),
+    JS_CFUNC_STEP_DEF("or", 3, STEPDEF_ATOMICS_OR ),
+    JS_CFUNC_STEP_DEF("sub", 3, STEPDEF_ATOMICS_SUB ),
+    JS_CFUNC_STEP_DEF("xor", 3, STEPDEF_ATOMICS_XOR ),
+    JS_CFUNC_STEP_DEF("exchange", 3, STEPDEF_ATOMICS_EXCHANGE ),
+    JS_CFUNC_STEP_DEF("compareExchange", 4, STEPDEF_ATOMICS_CMPXCHG ),
+    JS_CFUNC_STEP_DEF("load", 2, STEPDEF_ATOMICS_LOAD ),
+    JS_CFUNC_STEP_DEF("store", 3, STEPDEF_ATOMICS_STORE ),
+    JS_CFUNC_STEP_DEF("isLockFree", 1, STEPDEF_ATOMICS_ISLOCKFREE ),
     JS_CFUNC_DEF("pause", 0, js_atomics_pause ),
-    JS_CFUNC_DEF("wait", 4, js_atomics_wait ),
-    JS_CFUNC_DEF("notify", 3, js_atomics_notify ),
+    JS_CFUNC_STEP_DEF("wait", 4, STEPDEF_ATOMICS_WAIT ),
+    JS_CFUNC_STEP_DEF("notify", 3, STEPDEF_ATOMICS_NOTIFY ),
     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "Atomics", JS_PROP_CONFIGURABLE ),
 };
 
