@@ -1470,6 +1470,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_STR_PADSTART, STEPDEF_STR_PADEND,
     STEPDEF_TA_AT, STEPDEF_TA_SET, STEPDEF_JSON_RAWJSON,
     STEPDEF_OBJ_DEFINEPROPERTY, STEPDEF_REFLECT_DEFINEPROPERTY, STEPDEF_OBJ_DEFINEPROPERTIES,
+    STEPDEF_OBJ_DEFGETTER, STEPDEF_OBJ_DEFSETTER,
     STEPDEF_OBJ_CREATE,
     STEPDEF_PARSEINT, STEPDEF_PARSEFLOAT, STEPDEF_STR_SPLIT,
     STEPDEF_ARRAY_JOIN, STEPDEF_ARRAY_TOLOCALESTRING, STEPDEF_ARRAY_TOSTRING,
@@ -33465,18 +33466,24 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
         CASE(OP_define_field):
             {
-                int ret;
-                JSAtom atom;
-                atom = get_u32(pc);
+                /* 15.7.10 DefineField step 8's `? CreateDataPropertyOrThrow(receiver, fieldName, initValue)`. The
+                   receiver is `this` inside a field initialiser, which a DERIVED class's base can return as a
+                   Proxy — so this is the `defineProperty` trap, the page's code, and JS_DefinePropertyValue ran it
+                   from C (test262's class-field-is-observable-by-proxy). The one keyed-operation entry issues it,
+                   the same GP_DEFINE Object.defineProperty's machine does; the operator drops only the VALUE and
+                   leaves the receiver where it was. */
+                JSOpKeyed *ok;
+                JSAtom atom = get_u32(pc);
                 pc += 4;
-
-                ret = JS_DefinePropertyValue(ctx, sp[-2], atom, sp[-1],
-                                             JS_PROP_C_W_E | JS_PROP_THROW);
-                sp--;
-                if (unlikely(ret < 0))
-                    goto exception;
+                sf->cur_pc = pc;
+                ok = js_mallocz(ctx, sizeof(*ok));
+                if (unlikely(!ok)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                ok->atom = JS_DupAtom(ctx, atom); ok->pop = 1; ok->push = 0;
+                gp_obj = sp[-2]; gp_atom = ok->atom; gp_op = GP_DEFINE; gp_val = sp[-1];
+                gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;   /* CreateDataPropertyOrThrow */
+                gp_outer = ok; gp_outer_kind = CONT_OP_KEYED;
+                goto do_getprop_tramp;
             }
-            BREAK;
 
         CASE(OP_set_name):
             {
@@ -57633,51 +57640,74 @@ static JSValue js_obj_defprop_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
-/* magic = 1 if called as __defineSetter__ */
-static JSValue js_object___defineGetter__(JSContext *ctx, JSValueConst this_val,
-                                          int argc, JSValueConst *argv, int magic)
+/* B.2.2.2 / B.2.2.3 Object.prototype.__defineGetter__ / __defineSetter__. Step 5 is
+   `? DefinePropertyOrThrow(O, key, desc)` — on a Proxy the `defineProperty` trap plus 10.5.6's invariant, the
+   page's code — and step 4's ToPropertyKey is the page's code too. JS_DefineProperty ran the first from C, which
+   is what `Object.prototype.__defineGetter__.call(new Proxy({}, {defineProperty(){for(;;){}}}), "x", f)` aborted
+   on. It is the SAME GP_DEFINE request Object.defineProperty's machine issues, with the descriptor built here
+   instead of read off an object; magic selects [[Get]] or [[Set]], which is the only difference between the two
+   builtins and so is the only thing that branches. */
+typedef struct JSObjDefAccessor {
+    JSStepHdr hdr;
+    JSValue result;       /* DONE (owned) */
+    JSValue obj;          /* ToObject(this) (owned) — held across the key coercion and the define */
+    JSAtom atom;          /* the coerced key (owned) */
+    JSValue cb[2];        /* [target, value] for the DEFINE request (owned) */
+} JSObjDefAccessor;
+static int js_obj_defaccessor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    JSValue obj;
-    JSValueConst prop, value, get, set;
-    int ret, flags;
-    JSAtom atom;
+    JSObjDefAccessor *s = st;
+    int r;
 
-    prop = argv[0];
-    value = argv[1];
+    if (s->hdr.stage == 0) {
+        if (s->hdr.str_phase == STR_PH_START) {
+            s->result = JS_UNDEFINED;
+            s->obj = JS_UNDEFINED;
+            s->atom = JS_ATOM_NULL;
+            s->cb[0] = JS_UNDEFINED; s->cb[1] = JS_UNDEFINED;
+            /* step 1's ToObject and step 2's IsCallable both precede step 4's ToPropertyKey, and neither runs the
+               page's code. Their ORDER is observable — a non-callable getter throws before the key is coerced. */
+            s->obj = JS_ToObject(ctx, s->hdr.this_val);
+            if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; JS_FreeValue(ctx, cb_result); return -1; }
+            if (check_function(ctx, step_arg(&s->hdr, 1))) { JS_FreeValue(ctx, cb_result); return -1; }
+        }
+        r = step_topropkey_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->atom, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 1;
+    }
+    if (s->hdr.stage == 1) {
+        JSValueConst value = step_arg(&s->hdr, 1);
+        JS_FreeValue(ctx, cb_result);
+        s->hdr.stage = 2;
+        s->cb[0] = js_dup(s->obj);
+        s->cb[1] = JS_UNDEFINED;                       /* an accessor descriptor has no [[Value]] */
+        s->hdr.desc_get = s->hdr.arg ? JS_UNDEFINED : value;   /* borrowed: the caller's argument outlives this */
+        s->hdr.desc_set = s->hdr.arg ? value : JS_UNDEFINED;
+        s->hdr.desc_flags = JS_PROP_THROW | JS_PROP_DEFINE_PROPERTY
+                          | JS_PROP_HAS_ENUMERABLE | JS_PROP_ENUMERABLE
+                          | JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE
+                          | (s->hdr.arg ? JS_PROP_HAS_SET : JS_PROP_HAS_GET);
+        *out_cb = s->cb; *out_argc = (int)s->atom;
+        return 10;   /* DEFINE */
+    }
+    /* step 6: undefined, whatever the define answered — the THROW flag has already turned a refusal into one. */
+    if (JS_IsException(cb_result)) return -1;
+    JS_FreeValue(ctx, cb_result);
+    s->result = JS_UNDEFINED;
+    return 0;
+}
 
-    obj = JS_ToObject(ctx, this_val);
-    if (JS_IsException(obj))
-        return JS_EXCEPTION;
-
-    if (check_function(ctx, value)) {
-        JS_FreeValue(ctx, obj);
-        return JS_EXCEPTION;
-    }
-    atom = JS_ValueToAtom(ctx, prop);
-    if (unlikely(atom == JS_ATOM_NULL)) {
-        JS_FreeValue(ctx, obj);
-        return JS_EXCEPTION;
-    }
-    flags = JS_PROP_THROW |
-        JS_PROP_HAS_ENUMERABLE | JS_PROP_ENUMERABLE |
-        JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE;
-    if (magic) {
-        get = JS_UNDEFINED;
-        set = value;
-        flags |= JS_PROP_HAS_SET;
-    } else {
-        get = value;
-        set = JS_UNDEFINED;
-        flags |= JS_PROP_HAS_GET;
-    }
-    ret = JS_DefineProperty(ctx, obj, atom, JS_UNDEFINED, get, set, flags);
-    JS_FreeValue(ctx, obj);
-    JS_FreeAtom(ctx, atom);
-    if (ret < 0) {
-        return JS_EXCEPTION;
-    } else {
-        return JS_UNDEFINED;
-    }
+static JSValue js_obj_defaccessor_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSObjDefAccessor *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    JS_FreeAtom(ctx, s->atom);
+    JS_FreeValue(ctx, s->obj);
+    JS_FreeValue(ctx, s->cb[0]); JS_FreeValue(ctx, s->cb[1]);
+    js_free(ctx, s);
+    return r;
 }
 
 /* Object.getOwnPropertyDescriptor and Reflect.getOwnPropertyDescriptor are one operation with one difference:
@@ -59129,8 +59159,8 @@ static const JSCFunctionListEntry js_object_proto_funcs[] = {
     JS_CFUNC_DEF("isPrototypeOf", 1, js_object_isPrototypeOf ),
     JS_CFUNC_DEF("propertyIsEnumerable", 1, js_object_propertyIsEnumerable ),
     JS_CGETSET_DEF("__proto__", js_object_get___proto__, js_object_set___proto__ ),
-    JS_CFUNC_MAGIC_DEF("__defineGetter__", 2, js_object___defineGetter__, 0 ),
-    JS_CFUNC_MAGIC_DEF("__defineSetter__", 2, js_object___defineGetter__, 1 ),
+    JS_CFUNC_STEP_DEF("__defineGetter__", 2, STEPDEF_OBJ_DEFGETTER ),
+    JS_CFUNC_STEP_DEF("__defineSetter__", 2, STEPDEF_OBJ_DEFSETTER ),
     JS_CFUNC_STEP_DEF("__lookupGetter__", 1, STEPDEF_OBJ_LOOKUPGETTER ),
     JS_CFUNC_STEP_DEF("__lookupSetter__", 1, STEPDEF_OBJ_LOOKUPSETTER ),
 };
@@ -64005,6 +64035,8 @@ static const JSTrampStepDef js_ta_at_def          = { sizeof(JSTAIdx), js_ta_idx
 static const JSTrampStepDef js_ta_set_def         = { sizeof(JSTAIdx), js_ta_idx_step, js_ta_idx_fini, TAIDX_SET };
 static const JSTrampStepDef js_json_raw_def       = { sizeof(JSJsonRaw), js_json_raw_step, js_json_raw_fini, 0 };
 static const JSTrampStepDef js_obj_defprop_def    = { sizeof(JSObjDefProp), js_obj_defprop_step, js_obj_defprop_fini, 0 };
+static const JSTrampStepDef js_obj_defgetter_def  = { sizeof(JSObjDefAccessor), js_obj_defaccessor_step, js_obj_defaccessor_fini, 0 };
+static const JSTrampStepDef js_obj_defsetter_def  = { sizeof(JSObjDefAccessor), js_obj_defaccessor_step, js_obj_defaccessor_fini, 1 };
 static const JSTrampStepDef js_refl_defprop_def   = { sizeof(JSObjDefProp), js_obj_defprop_step, js_obj_defprop_fini, 1 };
 static int js_ownkeys_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_ownkeys_fini(JSContext *ctx, void *st, bool take_result);
@@ -64557,6 +64589,8 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_TA_SET]          = &js_ta_set_def,
     [STEPDEF_JSON_RAWJSON]    = &js_json_raw_def,
     [STEPDEF_OBJ_DEFINEPROPERTY]     = &js_obj_defprop_def,
+    [STEPDEF_OBJ_DEFGETTER]          = &js_obj_defgetter_def,
+    [STEPDEF_OBJ_DEFSETTER]          = &js_obj_defsetter_def,
     [STEPDEF_REFLECT_DEFINEPROPERTY] = &js_refl_defprop_def,
     [STEPDEF_OBJ_KEYS] = &js_obj_keys_def,
     [STEPDEF_OBJ_DESCS] = &js_obj_descs_def,
