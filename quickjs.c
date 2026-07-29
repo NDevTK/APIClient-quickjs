@@ -17221,20 +17221,11 @@ static __exception int js_for_in_next(JSContext *ctx, JSValue *sp)
     return 0;
 }
 
-static JSValue JS_GetIterator2(JSContext *ctx, JSValueConst obj,
-                               JSValueConst method)
-{
-    JSValue enum_obj;
-
-    enum_obj = JS_Call(ctx, method, obj, 0, NULL);
-    if (JS_IsException(enum_obj))
-        return enum_obj;
-    if (!JS_IsObject(enum_obj)) {
-        JS_FreeValue(ctx, enum_obj);
-        return JS_ThrowTypeErrorNotAnObject(ctx);
-    }
-    return enum_obj;
-}
+/* DELETED: JS_GetIterator2. It was GetIteratorFromMethod's step 1 Call performed from C — the @@iterator method
+   invoked with JS_Call, so an ordinary `[Symbol.iterator]() {…}` with a loop in it ran with no flow base. Its
+   last caller was flatMap's inner acquire, which recognized a GENERATOR-FUNCTION method to route that one kind
+   onto the create and handed every other callable one here. That acquire is a call at the one call entry now,
+   where the frame-kind question is asked for every callee. */
 
 /* DELETED: JS_GetIterator. It was the whole of GetIterator performed from C — the @@asyncIterator and
    @@iterator READS, the method Call through JS_GetIterator2, and the async-from-sync wrap — every step of it
@@ -19997,6 +19988,14 @@ typedef struct JSIteratorHelperData {
     void *consumer;          /* ITH_CONSUME: the consumer step awaiting this helper's {value,done} — a JSIteratorHelperData
                                 (helper-drives-helper), a JSIterConsume (Array.from/spread/Set/Map), etc. per consumer_kind */
     uint8_t consumer_kind;   /* CONT_* of `consumer`: CONT_ITER_HELPER / CONT_ITER_CONSUME / ... — how to re-enter it */
+    uint8_t read_closes_source;  /* 1 = this read is inside 27.1.4.5's IfAbruptCloseIterator — the flatMap
+                                    acquire's @@iterator and nextMethod reads — so an abrupt one closes the
+                                    SOURCE before propagating. The source's own result reads are not: there the
+                                    source is what went wrong, and 7.4.x propagates without closing it. */
+    JSAtom read_atom;        /* the property a `return 6` asks for. It used to be derived from resume_pc, which
+                                worked only while every read was `done` or `value`; the flatMap acquire reads
+                                @@iterator and `next` too, off objects that are not res_obj's usual one. Always a
+                                permanent well-known atom, so it is stored without a dup. */
     JSValue inner_next;      /* flatMap: the inner iterator's .next method (its source runs on the tramp too) */
     uint8_t drive_inner;     /* flatMap: 1 = the next DRIVE targets it->inner (not it->obj) */
     uint8_t drive_close;     /* take: 1 = the next DRIVE calls the source's .return() (close-on-limit) instead of .next() */
@@ -20017,7 +20016,13 @@ enum { ITHP_START = 0, ITHP_DROP_SKIP, ITHP_EMIT, ITHP_FLATMAP_SRC, ITHP_FLATMAP
        /* the two halves of an unpack: each is a resume point because each read can suspend. SKIP_DONE answers
           drop's `done`; EMIT_DONE and EMIT_VALUE answer the emit's two. */
        ITHP_SKIP_DONE, ITHP_EMIT_DONE, ITHP_EMIT_VALUE, ITHP_FLATMAP_DONE, ITHP_FLATMAP_VALUE,
-       ITHP_INNER_DONE, ITHP_INNER_VALUE };   /* ITHP_FLATMAP_CB: `res` is the flatMap mapper's result */   /* ITHP_CB_DONE: the map/filter callback ran ON THE TRAMP; `res` is its result */
+       ITHP_INNER_DONE, ITHP_INNER_VALUE,
+       /* GetIteratorFlattenable on the mapper's result: the @@iterator READ, the method CALL, and the
+          nextMethod READ. All three are the page's code and all three ran from C — the read with
+          JS_GetProperty, the call with JS_GetIterator2 (bypassed only for a generator function, which is the
+          recognizer that made every other callable @@iterator drive to completion). */
+       ITHP_FLATMAP_ITER_READ, ITHP_FLATMAP_ITER_CALL, ITHP_FLATMAP_NEXT_READ };
+   /* ITHP_FLATMAP_CB: `res` is the flatMap mapper's result */   /* ITHP_CB_DONE: the map/filter callback ran ON THE TRAMP; `res` is its result */
 static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue res, JSValue *out);
 /* A lazy helper's CALLBACK threw. The helper object is GC-owned (it IS the JS-visible iterator), so there is
    nothing to free — only the re-entrancy flag its step raised, exactly as the helper's own abrupt arm clears it.
@@ -27601,23 +27606,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         /* IteratorComplete / IteratorValue on the source's result: page code on a hand-written
                            source, so it is a request like every other keyed read. The resume point says which
                            of the two this is. */
+                        DCHECK(it->read_atom == JS_ATOM_done || it->read_atom == JS_ATOM_value
+                               || it->read_atom == JS_ATOM_next || it->read_atom == JS_ATOM_Symbol_iterator,
+                               "an iterator-helper read request named no property");
                         gp_outer = it; gp_outer_kind = CONT_ITER_HELPER_GET;
                         gp_obj = it->res_obj;
-                        gp_atom = (it->resume_pc == ITHP_EMIT_VALUE || it->resume_pc == ITHP_FLATMAP_VALUE
-                                   || it->resume_pc == ITHP_INNER_VALUE) ? JS_ATOM_value : JS_ATOM_done;
+                        gp_atom = it->read_atom;
                         gp_op = GP_GET; gp_val = JS_UNDEFINED;
                         goto do_getprop_tramp;
                     }
-                    if (st == 2) {   /* CREATE_INNER (flatMap): the inner's [Symbol.iterator] is a generator function.
-                                        Push [this, gfunc] as the create's call operands — the SAME stack shape an
-                                        OP-level g() create uses — and route onto do_generator_create_tramp; the settle
-                                        stores the created generator as the inner and re-enters here. */
-                        *sp++ = it->inner;        /* sp[-2] = this (mapped) */
-                        *sp++ = it->inner_next;   /* sp[-1] = gfunc (the generator function) */
+                    if (st == 7) {   /* CALL a METHOD held on the state: flatMap's GetIteratorFlattenable step 5.b,
+                                        `? Call(method, obj)`. [this, method] is the ordinary method-call shape, and
+                                        the ONE call entry decides the callee's frame kind — a generator function's
+                                        create included, which a call-site recognizer used to answer here for that
+                                        one kind and hand every other callable @@iterator to JS_GetIterator2's
+                                        drive-to-completion. do_return re-enters this step with the result. */
+                        DCHECK(sp + 2 <= TRAMP_SP_LIMIT(sf),
+                               "helper acquire: operand push exceeds the frame's compiled stack_size");
+                        *sp++ = it->inner;        /* sp[-2] = this (the mapped object) */
+                        *sp++ = it->inner_next;   /* sp[-1] = the @@iterator method */
                         it->inner = JS_UNDEFINED; it->inner_next = JS_UNDEFINED;
                         call_argv = sp; call_argc = 0; tramp_first = -2; tramp_is_tail = 0;
-                        tramp_gen_create_cont_it = it; tramp_gen_create_cont_kind = CONT_ITER_HELPER;   /* settle re-enters do_iter_helper_step */
-                        goto do_generator_create_tramp;
+                        tramp_cont_state = it; tramp_cont_kind = CONT_ITER_HELPER;
+                        goto do_generic_callee;
                     }
                     if (st == 0) {   /* DONE: deliver `out` per drive_mode */
                         it->executing = 0;
@@ -33072,10 +33083,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             if (gouter && gk2 == CONT_ITER_HELPER_GET) {
                 /* the helper's `done`/`value` read threw: the source is [[Done]] for this helper and the throw
-                   propagates, which is what the step's own -1 does — release the unpack and take that path. */
+                   propagates, which is what the step's own -1 does — release the unpack and take that path.
+                   The flatMap ACQUIRE's reads are the exception: they sit inside 27.1.4.5's
+                   IfAbruptCloseIterator, so the SOURCE is closed first. The read itself says which it is, because
+                   only the step that issued it knows. */
                 JSIteratorHelperData *hit = gouter;
+                bool closes = (hit->read_closes_source != 0);
+                hit->read_closes_source = 0;
                 JS_FreeValue(ctx, hit->res_obj); hit->res_obj = JS_UNDEFINED;
                 hit->executing = 0;
+                if (closes) {
+                    hit->done = 1;
+                    iter_helper_close_source_abrupt(ctx, hit);
+                }
                 js_iter_helper_drop_consumer(ctx, hit);
                 goto exception;
             }
@@ -63309,7 +63329,7 @@ static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue
         }
         DCHECK(JS_IsUndefined(it->res_obj), "the helper is already unpacking a result");
         it->res_obj = res;
-        it->resume_pc = ITHP_SKIP_DONE;
+        it->resume_pc = ITHP_SKIP_DONE; it->read_atom = JS_ATOM_done;
         return 6;
     case ITHP_SKIP_DONE: {
         int d = JS_ToBoolFree(ctx, res);
@@ -63339,7 +63359,7 @@ static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue
         }
         DCHECK(JS_IsUndefined(it->res_obj), "the helper is already unpacking a result");
         it->res_obj = res;
-        it->resume_pc = ITHP_EMIT_DONE;
+        it->resume_pc = ITHP_EMIT_DONE; it->read_atom = JS_ATOM_done;
         return 6;   /* IteratorComplete */
     case ITHP_EMIT_DONE: {
         int d = JS_ToBoolFree(ctx, res);
@@ -63351,7 +63371,7 @@ static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue
         }
         /* spec: value = IteratorValue(result) — the READ fires a value getter, so it is a request too; a fresh
            {value, done:false} is yielded afterwards and the source result never passes through unread. */
-        it->resume_pc = ITHP_EMIT_VALUE;
+        it->resume_pc = ITHP_EMIT_VALUE; it->read_atom = JS_ATOM_value;
         return 6;
     }
     case ITHP_EMIT_VALUE: {
@@ -63408,7 +63428,7 @@ static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue
         }
         DCHECK(JS_IsUndefined(it->res_obj), "the helper is already unpacking a result");
         it->res_obj = res;
-        it->resume_pc = ITHP_FLATMAP_DONE;
+        it->resume_pc = ITHP_FLATMAP_DONE; it->read_atom = JS_ATOM_done;
         return 6;   /* IteratorComplete */
     case ITHP_FLATMAP_DONE: {
         int d = JS_ToBoolFree(ctx, res);
@@ -63418,7 +63438,7 @@ static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue
             *out = js_create_iterator_result(ctx, JS_UNDEFINED, true);
             return JS_IsException(*out) ? -1 : 0;
         }
-        it->resume_pc = ITHP_FLATMAP_VALUE;
+        it->resume_pc = ITHP_FLATMAP_VALUE; it->read_atom = JS_ATOM_value;
         return 6;   /* IteratorValue */
     }
     case ITHP_FLATMAP_VALUE: {
@@ -63440,30 +63460,65 @@ static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue
                throwing @@iterator: each closes the SOURCE preserving the exception. */
             if (JS_IsException(mapped)) { it->done = 1; iter_helper_close_source_abrupt(ctx, it); return -1; }
             if (!JS_IsObject(mapped)) { JS_FreeValue(ctx, mapped); JS_ThrowTypeError(ctx, "flatMap mapper did not return an object"); it->done = 1; iter_helper_close_source_abrupt(ctx, it); return -1; }
-            method = JS_GetProperty(ctx, mapped, JS_ATOM_Symbol_iterator);
-            if (JS_IsException(method)) { JS_FreeValue(ctx, mapped); it->done = 1; iter_helper_close_source_abrupt(ctx, it); return -1; }
-            if (JS_IsNull(method) || JS_IsUndefined(method)) {
-                JS_FreeValue(ctx, method);
-                iter = mapped;   /* no [Symbol.iterator]: the mapped object IS the iterator */
-            } else if (tramp_can_call_gen_create(method)) {
-                /* the [Symbol.iterator] is a GENERATOR FUNCTION: creating the iterator runs its params-to-initial_yield,
-                   which must be on the tramp (js_call_generator_function -> async_func_resume is off-tramp from here).
-                   Stash (this=mapped, gfunc=method); do_iter_helper_step routes them onto do_generator_create_tramp. */
-                it->inner = mapped;        /* the `this` for the create call (owned; transferred to the stack by the caller) */
-                it->inner_next = method;   /* the generator function to call (owned) */
-                return 2;                  /* CREATE_INNER */
-            } else {
-                iter = JS_GetIterator2(ctx, mapped, method);
-                JS_FreeValue(ctx, method); JS_FreeValue(ctx, mapped);
-                if (JS_IsException(iter)) return -1;
-            }
-            it->inner = iter;
-            it->inner_next = JS_GetProperty(ctx, iter, JS_ATOM_next);
-            if (JS_IsException(it->inner_next)) { JS_FreeValue(ctx, it->inner); it->inner = JS_UNDEFINED; it->inner_next = JS_UNDEFINED; return -1; }
-            it->drive_inner = 1;
-            it->resume_pc = ITHP_FLATMAP_INNER;
-            return 1;   /* drive the inner iterator */
+            /* GetIteratorFlattenable step 4: `? GetMethod(obj, @@iterator)`. A read on the page's object, so a
+               request; the object parks in res_obj across it like every other read this machine makes. */
+            DCHECK(JS_IsUndefined(it->res_obj), "the helper is already holding a read target");
+            it->res_obj = mapped;
+            it->resume_pc = ITHP_FLATMAP_ITER_READ; it->read_atom = JS_ATOM_Symbol_iterator;
+            it->read_closes_source = 1;
+            return 6;
         }
+    }
+    case ITHP_FLATMAP_ITER_READ: {
+        it->read_closes_source = 0;
+        JSValue mapped = it->res_obj; it->res_obj = JS_UNDEFINED;
+        if (JS_IsException(res)) { JS_FreeValue(ctx, mapped); it->done = 1; iter_helper_close_source_abrupt(ctx, it); return -1; }
+        if (JS_IsNull(res) || JS_IsUndefined(res)) {
+            /* no @@iterator: the mapped object IS the iterator (GetIteratorFlattenable's step 5.a). */
+            JS_FreeValue(ctx, res);
+            it->inner = mapped;
+            it->resume_pc = ITHP_FLATMAP_NEXT_READ; it->read_atom = JS_ATOM_next;
+            it->read_closes_source = 1;
+            DCHECK(JS_IsUndefined(it->res_obj), "the helper is already holding a read target");
+            it->res_obj = js_dup(it->inner);
+            return 6;
+        }
+        /* the method CALL. It used to be JS_GetIterator2 from C for everything except a generator function,
+           which one call site recognized so it could route the create — so an ordinary `[Symbol.iterator]() {…}`
+           with a loop in it drove to completion. It is an ordinary call at the one call entry now, which is where
+           the create question is already asked for every callee kind. */
+        it->inner = mapped;   /* `this` (owned; transferred to the stack by the caller) */
+        it->inner_next = res; /* the method (owned) */
+        it->resume_pc = ITHP_FLATMAP_ITER_CALL;
+        return 7;
+    }
+    case ITHP_FLATMAP_ITER_CALL: {
+        if (JS_IsException(res)) { it->done = 1; iter_helper_close_source_abrupt(ctx, it); return -1; }
+        if (!JS_IsObject(res)) {   /* GetIteratorFromMethod step 3 */
+            JS_FreeValue(ctx, res);
+            JS_ThrowTypeErrorNotAnObject(ctx);
+            it->done = 1; iter_helper_close_source_abrupt(ctx, it);
+            return -1;
+        }
+        it->inner = res;
+        it->resume_pc = ITHP_FLATMAP_NEXT_READ; it->read_atom = JS_ATOM_next;
+        it->read_closes_source = 1;
+        DCHECK(JS_IsUndefined(it->res_obj), "the helper is already holding a read target");
+        it->res_obj = js_dup(it->inner);
+        return 6;
+    }
+    case ITHP_FLATMAP_NEXT_READ: {
+        it->read_closes_source = 0;
+        JS_FreeValue(ctx, it->res_obj); it->res_obj = JS_UNDEFINED;
+        if (JS_IsException(res)) {
+            JS_FreeValue(ctx, it->inner); it->inner = JS_UNDEFINED;
+            it->done = 1; iter_helper_close_source_abrupt(ctx, it);
+            return -1;
+        }
+        it->inner_next = res;
+        it->drive_inner = 1;
+        it->resume_pc = ITHP_FLATMAP_INNER;
+        return 1;   /* drive the inner iterator */
     }
     case ITHP_FLATMAP_INNER:
         /* res = INNER {value,done}: 27.1.4.5's inner loop does IteratorStepValue — IteratorComplete then
@@ -63477,7 +63532,7 @@ static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue
         }
         DCHECK(JS_IsUndefined(it->res_obj), "the helper is already unpacking a result");
         it->res_obj = res;
-        it->resume_pc = ITHP_INNER_DONE;
+        it->resume_pc = ITHP_INNER_DONE; it->read_atom = JS_ATOM_done;
         return 6;
     case ITHP_INNER_DONE: {
         int d = JS_ToBoolFree(ctx, res);
@@ -63489,7 +63544,7 @@ static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue
             it->resume_pc = ITHP_FLATMAP_SRC;
             return 1;   /* drive the source for the next inner iterable */
         }
-        it->resume_pc = ITHP_INNER_VALUE;
+        it->resume_pc = ITHP_INNER_VALUE; it->read_atom = JS_ATOM_value;
         return 6;   /* IteratorValue on the inner's result — a request like every other keyed read */
     }
     case ITHP_INNER_VALUE: {
