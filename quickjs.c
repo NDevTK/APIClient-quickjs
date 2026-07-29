@@ -12072,66 +12072,6 @@ static int JS_DefineGlobalFunction(JSContext *ctx, JSAtom prop,
     return 0;
 }
 
-/* construct a reference to a global variable */
-static int JS_GetGlobalVarRef(JSContext *ctx, JSAtom prop, JSValue *sp)
-{
-    JSObject *p;
-    JSShapeProperty *prs;
-    JSProperty *pr;
-
-    /* no exotic behavior is possible in global_var_obj */
-    p = JS_VALUE_GET_OBJ(ctx->global_var_obj);
-    prs = find_own_property(&pr, p, prop);
-    if (prs) {
-        /* XXX: should handle JS_PROP_AUTOINIT properties? */
-        /* XXX: conformance: do these tests in
-           OP_put_var_ref/OP_get_var_ref ? */
-        if (unlikely(JS_IsUninitialized(pr->u.value))) {
-            JS_ThrowReferenceErrorUninitialized(ctx, prs->atom);
-            return -1;
-        }
-        if (unlikely(!(prs->flags & JS_PROP_WRITABLE))) {
-            return JS_ThrowTypeErrorReadOnly(ctx, JS_PROP_THROW, prop);
-        }
-        sp[0] = js_dup(ctx->global_var_obj);
-    } else {
-        int ret;
-        ret = JS_HasProperty(ctx, ctx->global_obj, prop);
-        if (ret < 0)
-            return -1;
-        if (ret) {
-            sp[0] = js_dup(ctx->global_obj);
-        } else {
-            sp[0] = JS_UNDEFINED;
-        }
-    }
-    sp[1] = JS_AtomToValue(ctx, prop);
-    return 0;
-}
-
-/* return -1, false or true */
-static int JS_DeleteGlobalVar(JSContext *ctx, JSAtom prop)
-{
-    JSObject *p;
-    JSShapeProperty *prs;
-    JSProperty *pr;
-    int ret;
-
-    /* 9.1.1.4.7 DeleteBinding ( N ) */
-    p = JS_VALUE_GET_OBJ(ctx->global_var_obj);
-    prs = find_own_property(&pr, p, prop);
-    if (prs)
-        return false; /* lexical variables cannot be deleted */
-    ret = JS_HasProperty(ctx, ctx->global_obj, prop);
-    if (ret < 0)
-        return -1;
-    if (ret) {
-        return JS_DeleteProperty(ctx, ctx->global_obj, prop, 0);
-    } else {
-        return true;
-    }
-}
-
 /* return -1, false or true. return false if not configurable or
    invalid object. return -1 in case of exception.
    flags can be 0, JS_PROP_THROW or JS_PROP_THROW_STRICT */
@@ -31566,13 +31506,45 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
         CASE(OP_make_var_ref):
             {
+                JSObject *gobj;
+                JSShapeProperty *prs;
+                JSProperty *pr;
                 JSAtom atom;
+                JSValue nm;
+                JSWithHas *wh;
                 atom = get_u32(pc);
                 pc += 4;
+                sf->cur_pc = pc;
 
-                if (JS_GetGlobalVarRef(ctx, atom, sp))
-                    goto exception;
-                sp += 2;
+                /* GetIdentifierReference on the GLOBAL Environment Record: 9.1.1.4.1 HasBinding decides which
+                   base the Reference names, and JS_GetGlobalVarRef asked it from C — so `Object
+                   .setPrototypeOf(globalThis, proxy)` put the page's `has` trap on a walk with no flow base.
+                   The DeclarativeRecord half answers first, out of a plain engine object. */
+                gobj = JS_VALUE_GET_OBJ(ctx->global_var_obj);
+                prs = find_own_property(&pr, gobj, atom);
+                if (prs) {
+                    if (unlikely(JS_IsUninitialized(pr->u.value))) {
+                        JS_ThrowReferenceErrorUninitialized(ctx, prs->atom);
+                        goto exception;
+                    }
+                    if (unlikely(!(prs->flags & JS_PROP_WRITABLE))) {
+                        JS_ThrowTypeErrorReadOnly(ctx, JS_PROP_THROW, atom);
+                        goto exception;
+                    }
+                    nm = JS_AtomToValue(ctx, atom);
+                    if (unlikely(JS_IsException(nm)))
+                        goto exception;
+                    *sp++ = js_dup(ctx->global_var_obj);
+                    *sp++ = nm;
+                    BREAK;
+                }
+                wh = js_mallocz(ctx, sizeof(*wh));
+                if (unlikely(!wh)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                wh->atom = atom; wh->op = (uint8_t)opcode; wh->phase = WH_HAS; wh->arr = JS_UNDEFINED;
+                gp_obj = ctx->global_obj; gp_atom = atom; gp_op = GP_HAS; gp_val = JS_UNDEFINED;
+                gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
+                gp_outer = wh; gp_outer_kind = CONT_WITH_HAS;
+                goto do_getprop_tramp;
             }
             BREAK;
 
@@ -33982,17 +33954,33 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
         CASE(OP_delete_var):
             {
+                JSObject *gobj;
+                JSProperty *pr;
                 JSAtom atom;
-                int ret;
-
+                JSWithHas *wh;
                 atom = get_u32(pc);
                 pc += 4;
-
                 sf->cur_pc = pc;
-                ret = JS_DeleteGlobalVar(ctx, atom);
-                if (unlikely(ret < 0))
-                    goto exception;
-                *sp++ = js_bool(ret);
+
+                /* 9.1.1.4.7 DeleteBinding. Its DeclarativeRecord step is 9.1.1.1.7, which reports false for
+                   every binding it holds — a lexical one cannot be deleted — out of a plain engine object. */
+                gobj = JS_VALUE_GET_OBJ(ctx->global_var_obj);
+                if (find_own_property(&pr, gobj, atom)) {
+                    *sp++ = js_bool(false);
+                    BREAK;
+                }
+                /* The reference has to RESOLVE before `delete` can ask the record to drop it, and that
+                   HasBinding walks the global object's prototype chain — the page's `has` trap the moment
+                   anything on it is a Proxy, which JS_DeleteGlobalVar ran from C. */
+                DCHECK(JS_VALUE_GET_OBJ(ctx->global_obj)->class_id != JS_CLASS_PROXY,
+                       "the global object became a Proxy: DeleteBinding's own-property step would skip its traps");
+                wh = js_mallocz(ctx, sizeof(*wh));
+                if (unlikely(!wh)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                wh->atom = atom; wh->op = (uint8_t)opcode; wh->phase = WH_HAS; wh->arr = JS_UNDEFINED;
+                gp_obj = ctx->global_obj; gp_atom = atom; gp_op = GP_HAS; gp_val = JS_UNDEFINED;
+                gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
+                gp_outer = wh; gp_outer_kind = CONT_WITH_HAS;
+                goto do_getprop_tramp;
             }
             BREAK;
 
@@ -34183,14 +34171,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     wh->phase = WH_HAS2;
                     gp_obj = obj; gp_atom = atom; gp_op = GP_HAS;
                     goto with_request;
+                case OP_delete_var:
                 case OP_with_delete_var:
                     /* 9.1.1.2.4 DeleteBinding is the one that does NOT re-check: a bare [[Delete]], whose
-                       boolean is the operator's value. */
+                       boolean is the operator's value. 9.1.1.4.7 puts a HasOwnProperty on the global object in
+                       front of it, and on an ORDINARY receiver the two are the same answer — an absent own
+                       property deletes vacuously — so the record asks for the [[Delete]] and nothing else. */
                     wh->phase = WH_ACCESS;
                     gp_obj = obj; gp_atom = atom; gp_op = GP_DELETE; gp_no_throw = 1;
                     goto with_request;
                 default:
-                    DCHECK(wop == OP_with_make_ref, "an unknown OP_with_* reached the record's dispatch");
+                    DCHECK(wop == OP_with_make_ref || wop == OP_make_var_ref,
+                           "an unknown opcode reached the record's dispatch");
                     val = JS_AtomToValue(ctx, atom);   /* produce a pair object/propname; nothing to run */
                     if (unlikely(JS_IsException(val))) goto with_throw;
                     goto with_place;
@@ -34233,6 +34225,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JS_FreeValue(ctx, sp[-1]);
                     sp--;
                     break;
+                case OP_delete_var:
+                    *sp++ = js_bool(JS_ToBool(ctx, val));
+                    JS_FreeValue(ctx, val);
+                    break;
+                case OP_make_var_ref:
+                    *sp++ = js_dup(ctx->global_obj);   /* the Reference's base, which HasBinding just found */
+                    *sp++ = val;
+                    break;
                 case OP_get_ref_value:
                     *sp++ = val;                       /* the reference's value, above its two operands */
                     break;
@@ -34260,17 +34260,26 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (!wh->base) {
                     /* the GLOBAL record is the last link of the scope chain, so HasBinding's no is final: an
                        unresolvable Reference. There is no enclosing scope to drop a base object for. */
-                    DCHECK(wop == OP_get_var || wop == OP_get_var_undef || wop == OP_put_var,
-                           "a non-global opcode recorded no operand depth for its base object");
-                    if (wop == OP_get_var_undef) {
-                        js_with_has_free(ctx, wh);      /* `typeof x` reads an absent binding as undefined */
+                    if (wop == OP_get_var_undef || wop == OP_delete_var) {
+                        /* 13.5.3 typeof and 13.5.1.2 step 3 delete are DEFINED on an unresolvable Reference,
+                           and neither throws for one. */
+                        js_with_has_free(ctx, wh);
+                        *sp++ = (wop == OP_delete_var) ? js_bool(true) : JS_UNDEFINED;
+                        BREAK;
+                    }
+                    if (wop == OP_make_var_ref) {
+                        val = JS_AtomToValue(ctx, atom);   /* a Reference whose base is unresolvable */
+                        if (unlikely(JS_IsException(val))) goto with_throw;
+                        js_with_has_free(ctx, wh);
                         *sp++ = JS_UNDEFINED;
+                        *sp++ = val;
                         BREAK;
                     }
                     if (!wh->vdepth || sf->is_strict_mode) {
+                        DCHECK(wop == OP_get_var || wop == OP_put_var,
+                               "a non-global opcode recorded no operand depth for its base object");
                         JS_ThrowReferenceErrorNotDefined(ctx, atom);   /* 6.2.5.5 step 3 / 6.2.5.6 step 2.a */
-                        js_with_has_free(ctx, wh);
-                        goto exception;
+                        goto with_throw;
                     }
                     /* 6.2.5.6 PutValue step 2.c: a SLOPPY write to an unresolvable reference performs
                        Set(globalObj, N, W, false) — the same request the resolved path issues, so it is the
