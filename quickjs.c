@@ -55207,6 +55207,13 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
                 s->i++; s->hdr.stage = 2;
                 continue;
             }
+            /* the comment above is a CLAIM about where `desc` came from, so it is asserted rather than trusted:
+               every GP_GETOWNPROP delivery rebuilds the record through js_desc_to_object, including a proxy's,
+               whose trap result is parsed first. If that ever stopped being true this read would be the page's
+               code running from C, which is exactly what the rest of this walk exists to avoid. */
+            DCHECK(!js_read_is_page_code(ctx, desc, JS_ATOM_enumerable),
+                   "a property-walk descriptor came from somewhere other than FromPropertyDescriptor — its "
+                   "`enumerable` read is page code and must become a request");
             en = JS_GetProperty(ctx, desc, JS_ATOM_enumerable);
             JS_FreeValue(ctx, desc);
             if (JS_IsException(en)) return -1;
