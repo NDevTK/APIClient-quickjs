@@ -1497,6 +1497,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_OBJ_SETPROTO, STEPDEF_REFLECT_SETPROTO,
     STEPDEF_JSON_STRINGIFY, STEPDEF_FOR_IN, STEPDEF_IMPORT_OPTS,
     STEPDEF_OBJ_HASOWN, STEPDEF_OBJ_HASOWNPROP,
+    STEPDEF_OBJ_LOOKUPGETTER, STEPDEF_OBJ_LOOKUPSETTER,
     STEPDEF_COUNT
 };
 #define HINT_NONE    2
@@ -17814,6 +17815,12 @@ typedef struct JSStepHdr {
        READ AND RESET by the driver like every other request input, so a shape cannot leak into the next one. */
     JSValueConst desc_get, desc_set;   /* BORROWED: the machine holds them across the request */
     int desc_flags;
+    /* A GETOWNPROP request's ANSWER SHAPE, for a machine that wants the descriptor RECORD instead of the
+       descriptor OBJECT — the invariants' JSDescFacts, reached from a step machine rather than from a
+       continuation. It rides the header for the same reason the shape above does: a request's operand with no
+       stack slot lives here, and the driver READS AND RESETS it like every other request input, so an answer
+       shape cannot leak into the next request. NULL = the object, which is what every other consumer takes. */
+    struct JSDescFacts *desc_facts;
     /* A DELEGATE request's inner machine, owned until the driver adopts it. Delegation is how a step builtin
        performs an ABSTRACT OPERATION that is itself a machine — .finally's PromiseResolve(C, v), which 27.2.5.3
        step 4 states as the operation and not as C.resolve, so it cannot be reached as an ordinary call.
@@ -19059,8 +19066,8 @@ static JSValue js_create_desc(JSContext *ctx, JSValueConst val, JSValueConst get
                                   RESULT, so it has to ride a continuation. The driver performs the read whichever
                                   shape it is and delivers the value to the machine's next step, exactly as the
                                   TOPRIMITIVE sequence delivers a primitive. */
-/* The ANSWER of a [[GetOwnProperty]] request made by a proxy INVARIANT: what the target's own descriptor is, in
-   the form the check actually uses. `flags` is -1 when the property is absent. The three values are OWNED by
+/* The ANSWER of a [[GetOwnProperty]] request that wants the record: what the object's own descriptor is, in
+   the form the consumer actually uses. `flags` is -1 when the property is absent. The three values are OWNED by
    whoever declared the record, and its teardown releases them — which is why every machine that names one frees
    it on both its normal and its abrupt path. */
 typedef struct JSDescFacts {
@@ -22246,6 +22253,8 @@ static JSValue js_json_str_fini(JSContext *ctx, void *st, bool take_result);
 static int js_for_in_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_hasown_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_hasown_fini(JSContext *ctx, void *st, bool take_result);
+static int js_lookup_acc_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_lookup_acc_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_for_in_fini(JSContext *ctx, void *st, bool take_result);
 static int js_json_parse_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_json_parse_vfini(JSContext *ctx, void *st, bool take_result);
@@ -25722,10 +25731,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto do_getprop_tramp;
                 }
                 if (st == 12) {
-                    /* GETOWNPROP: *out_cb is [obj] and *out_argc is the ATOM, like the keyed reads. */
+                    /* GETOWNPROP: *out_cb is [obj] and *out_argc is the ATOM, like the keyed reads. A machine
+                       that wants the RECORD says so on its header, and that is read and reset here. */
                     gp_outer = stt; gp_outer_kind = CONT_STEP;
                     gp_obj = cb[0]; gp_atom = (JSAtom)cbn;
                     gp_op = GP_GETOWNPROP; gp_val = JS_UNDEFINED;
+                    gp_desc_out = h->desc_facts; h->desc_facts = NULL;
                     goto do_getprop_tramp;
                 }
                 if (st == 21) {
@@ -56980,10 +56991,14 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
             int res;
             if (s->i >= s->len) { s->hdr.stage = 4; goto source_done; }
             if (mode == PROPWALK_SPREAD) {
-                /* `{a, ...rest}`: the keys already bound by the pattern are excluded. The list is an object the
-                   compiler built, so this lookup invokes nothing. */
+                /* `{a, ...rest}`: the keys already bound by the pattern are excluded. The list is an object
+                   the COMPILER built for this destructuring, which no page can reach — so this lookup invokes
+                   nothing. ASSERTED rather than claimed: for_in_is_ordinary is exactly the question, and if the
+                   exclusion list ever stopped being ordinary this would be the page's code running from C. */
                 JSValueConst excl = step_arg(&s->hdr, 2);
                 if (JS_VALUE_GET_TAG(excl) == JS_TAG_OBJECT) {
+                    DCHECK(for_in_is_ordinary(ctx, JS_VALUE_GET_OBJ(excl)),
+                           "the spread's exclusion list must be the compiler-built object, never the page's");
                     res = JS_GetOwnPropertyInternal(ctx, NULL, JS_VALUE_GET_OBJ(excl), s->atoms[s->i].atom);
                     if (res < 0) { JS_FreeValue(ctx, cb_result); return -1; }
                     if (res) { s->i++; continue; }
@@ -57709,49 +57724,98 @@ exception:
     return res;
 }
 
-static JSValue js_object___lookupGetter__(JSContext *ctx, JSValueConst this_val,
-                                          int argc, JSValueConst *argv, int setter)
+/* B.2.2.2 __lookupGetter__ / B.2.2.3 __lookupSetter__: ToObject, ToPropertyKey, then walk the prototype chain
+   asking each link for its own descriptor until one answers. THREE of the page's operations, and the C body ran
+   all three — ToPropertyKey as a bare JS_ValueToAtom, and both [[GetOwnProperty]] and [[GetPrototypeOf]] per
+   link, which on a Proxy are its traps with no flow base. The walk is the shape for-in's slow path takes, and
+   the descriptor it needs is the RECORD, because the answer IS desc.[[Get]] or desc.[[Set]].
+   ONE machine: the two forms differ in which accessor they return, which is the arg. */
+typedef struct JSLookupAcc {
+    JSStepHdr hdr;      /* MUST be first. arg: 0 = __lookupGetter__, 1 = __lookupSetter__ */
+    JSValue cur;        /* the chain link being examined (owned) */
+    JSAtom key;         /* ToPropertyKey's result (owned) */
+    JSValue result;     /* DONE (owned) */
+    JSDescFacts facts;  /* this link's own descriptor (owned) */
+} JSLookupAcc;
+enum { LA_KEY = 0, LA_DESC, LA_DESC_GOT, LA_PROTO, LA_PROTO_GOT };
+
+static int js_lookup_acc_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    JSValue obj, res = JS_EXCEPTION;
-    JSAtom prop = JS_ATOM_NULL;
-    JSPropertyDescriptor desc;
-    int has_prop;
+    JSLookupAcc *s = st;
+    int r;
 
-    obj = JS_ToObject(ctx, this_val);
-    if (JS_IsException(obj))
-        goto exception;
-    prop = JS_ValueToAtom(ctx, argv[0]);
-    if (unlikely(prop == JS_ATOM_NULL))
-        goto exception;
-
-    for (;;) {
-        has_prop = JS_GetOwnPropertyInternal(ctx, &desc, JS_VALUE_GET_OBJ(obj), prop);
-        if (has_prop < 0)
-            goto exception;
-        if (has_prop) {
-            if (desc.flags & JS_PROP_GETSET)
-                res = js_dup(setter ? desc.setter : desc.getter);
-            else
-                res = JS_UNDEFINED;
-            js_free_desc(ctx, &desc);
-            break;
-        }
-        obj = JS_GetPrototypeFree(ctx, obj);
-        if (JS_IsException(obj))
-            goto exception;
-        if (JS_IsNull(obj)) {
-            res = JS_UNDEFINED;
-            break;
-        }
-        /* avoid infinite loop (possible with proxies) */
-        if (js_poll_interrupts(ctx))
-            goto exception;
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result);
+        cb_result = JS_UNDEFINED;
+        s->cur = JS_UNDEFINED; s->key = JS_ATOM_NULL; s->result = JS_UNDEFINED;
+        js_desc_facts_init(&s->facts);
+        s->hdr.stage = 1;
+        s->cur = JS_ToObject(ctx, s->hdr.this_val);   /* step 1, before the key: it throws for nullish */
+        if (JS_IsException(s->cur)) { s->cur = JS_UNDEFINED; return -1; }
     }
+    for (;;) {
+        switch (s->hdr.stage) {
+        case 1:   /* LA_KEY: step 2's ToPropertyKey, which runs a key object's toString */
+            r = step_topropkey_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->key, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r != 0) return r;
+            s->hdr.stage = 2;
+            continue;
+        case 2:   /* step 3.a: O.[[GetOwnProperty]](key), answered as a RECORD */
+            JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+            js_desc_facts_free(ctx, &s->facts);   /* the previous link's, before this link answers */
+            s->hdr.stage = 3;
+            s->hdr.desc_facts = &s->facts;
+            s->hdr.cb_coerce[0] = s->cur;   /* borrowed: the machine holds the link across the request */
+            *out_cb = s->hdr.cb_coerce; *out_argc = (int)s->key;
+            return 12;
+        case 3:
+            if (JS_IsException(cb_result)) return -1;
+            JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+            if (s->facts.flags >= 0) {
+                /* step 3.b: found. An ACCESSOR yields the half this form asks for; anything else yields
+                   undefined, and either way the walk stops here. */
+                if (s->facts.flags & JS_PROP_GETSET)
+                    s->result = js_dup(s->hdr.arg ? s->facts.setter : s->facts.getter);
+                else
+                    s->result = JS_UNDEFINED;
+                return 0;
+            }
+            s->hdr.stage = 4;
+            continue;
+        case 4:   /* step 3.c: O.[[GetPrototypeOf]](), which on a Proxy is its trap */
+            JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+            s->hdr.stage = 5;
+            s->hdr.cb_coerce[0] = s->cur;
+            *out_cb = s->hdr.cb_coerce; *out_argc = 0;
+            return 18;
+        default:
+            DCHECK(s->hdr.stage == 5, "__lookupGetter__'s walk resumed in no stage");
+            if (JS_IsException(cb_result)) return -1;
+            JS_FreeValue(ctx, s->cur);
+            s->cur = cb_result;
+            cb_result = JS_UNDEFINED;
+            if (JS_IsNull(s->cur)) {   /* step 3.d: the chain ended */
+                s->result = JS_UNDEFINED;
+                return 0;
+            }
+            s->hdr.stage = 2;
+            continue;
+        }
+    }
+}
 
-exception:
-    JS_FreeAtom(ctx, prop);
-    JS_FreeValue(ctx, obj);
-    return res;
+static JSValue js_lookup_acc_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSLookupAcc *s = st;
+    JSValue r;
+    js_desc_facts_free(ctx, &s->facts);
+    JS_FreeValue(ctx, s->cur);
+    JS_FreeAtom(ctx, s->key);
+    r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    js_free(ctx, s);
+    return r;
 }
 
 static const JSCFunctionListEntry js_object_funcs[] = {
@@ -57790,8 +57854,8 @@ static const JSCFunctionListEntry js_object_proto_funcs[] = {
     JS_CGETSET_DEF("__proto__", js_object_get___proto__, js_object_set___proto__ ),
     JS_CFUNC_MAGIC_DEF("__defineGetter__", 2, js_object___defineGetter__, 0 ),
     JS_CFUNC_MAGIC_DEF("__defineSetter__", 2, js_object___defineGetter__, 1 ),
-    JS_CFUNC_MAGIC_DEF("__lookupGetter__", 1, js_object___lookupGetter__, 0 ),
-    JS_CFUNC_MAGIC_DEF("__lookupSetter__", 1, js_object___lookupGetter__, 1 ),
+    JS_CFUNC_STEP_DEF("__lookupGetter__", 1, STEPDEF_OBJ_LOOKUPGETTER ),
+    JS_CFUNC_STEP_DEF("__lookupSetter__", 1, STEPDEF_OBJ_LOOKUPSETTER ),
 };
 
 /* Function class */
@@ -61993,6 +62057,8 @@ static const JSTrampStepDef js_json_parse_def    = { sizeof(JSJsonReviver), js_j
 static const JSTrampStepDef js_for_in_def       = { sizeof(JSForIn), js_for_in_step, js_for_in_fini, 0 };
 static const JSTrampStepDef js_hasown_def      = { sizeof(JSHasOwn), js_hasown_step, js_hasown_fini, HASOWN_STATIC };
 static const JSTrampStepDef js_hasownprop_def  = { sizeof(JSHasOwn), js_hasown_step, js_hasown_fini, 0 };
+static const JSTrampStepDef js_lookupgetter_def = { sizeof(JSLookupAcc), js_lookup_acc_step, js_lookup_acc_fini, 0 };
+static const JSTrampStepDef js_lookupsetter_def = { sizeof(JSLookupAcc), js_lookup_acc_step, js_lookup_acc_fini, 1 };
 static const JSTrampStepDef js_import_opts_def  = {
     sizeof(JSImportOpts), js_import_opts_step, js_import_opts_fini, 0,
     /* body, body_proto, body_magic, precheck, midcheck, onerror */ {NULL}, 0, 0, NULL, NULL, NULL,
@@ -62466,6 +62532,8 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_FOR_IN]         = &js_for_in_def,
     [STEPDEF_OBJ_HASOWN]     = &js_hasown_def,
     [STEPDEF_OBJ_HASOWNPROP] = &js_hasownprop_def,
+    [STEPDEF_OBJ_LOOKUPGETTER] = &js_lookupgetter_def,
+    [STEPDEF_OBJ_LOOKUPSETTER] = &js_lookupsetter_def,
     [STEPDEF_IMPORT_OPTS]    = &js_import_opts_def,
     [STEPDEF_TA_SLICE]      = &js_ta_slice_def,
     [STEPDEF_STR_CONCAT]    = &js_str_concat_def,
@@ -62682,6 +62750,7 @@ STEP_STATE_HDR_FIRST(JSJsonReviver);
 STEP_STATE_HDR_FIRST(JSJsonStr);
 STEP_STATE_HDR_FIRST(JSForIn);
 STEP_STATE_HDR_FIRST(JSHasOwn);
+STEP_STATE_HDR_FIRST(JSLookupAcc);
 STEP_STATE_HDR_FIRST(JSImportOpts);
 STEP_STATE_HDR_FIRST(JSStrCtor);
 STEP_STATE_HDR_FIRST(JSStrConcat);
