@@ -17594,6 +17594,17 @@ static inline int tramp_consume_sink_of(JSValueConst func)
     if (fp->u.cfunc.cproto != JS_CFUNC_consume) return -1;
     return fp->u.cfunc.magic;
 }
+/* Does this callee DECLARE itself a lazy Iterator Helper's drive? The same question tramp_consume_sink_of asks,
+   about the other cproto that has no body. It replaced a comparison against js_iterator_helper_next's address —
+   a per-builtin identity test, which is what the recognizer ban is about. */
+static JSValue js_iter_helper_declined(JSContext *ctx, JSValueConst this_obj);
+static inline bool tramp_is_iter_drive(JSValueConst func)
+{
+    JSObject *fp;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
+    fp = JS_VALUE_GET_OBJ(func);
+    return fp->class_id == JS_CLASS_C_FUNCTION && fp->u.cfunc.cproto == JS_CFUNC_iterdrive;
+}
 static const JSTrampStepDef *tramp_step_def_of(JSValueConst func);
 static const JSTrampStepDef *tramp_step_ctor_def_of(JSValueConst func);
 /* the def a STEPDEF_* id names. A CALL reaches its def through the callee object; an OPCODE that drives a machine
@@ -18654,6 +18665,15 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
             }
         }
         break;
+    case JS_CFUNC_iterdrive:
+        {
+            /* A lazy Iterator Helper's .next() reached OUTSIDE the drive. There is no body — the drive IS the
+               implementation — so the only ways here are the two the routing predicate declines, and both are
+               spec ANSWERS rather than a fallback: a receiver with no [[UnderlyingIterator]], and a helper that
+               is already driving (GeneratorValidate). Anything else is an unrouted call site, and the DCHECK
+               says so instead of letting it look like a TypeError the page asked for. */
+            return js_iter_helper_declined(ctx, this_obj);
+        }
     case JS_CFUNC_step_ctor:
     case JS_CFUNC_consume:
         /* A consuming builtin reached OUTSIDE the interpreter's dispatch. There is no body to run — the walk IS
@@ -19865,8 +19885,7 @@ static void js_iter_helper_drop_consumer(JSContext *ctx, JSIteratorHelperData *i
     js_iter_consume_end(ctx, (struct JSIterConsume *)cons);
     js_free_rt(ctx->rt, cons);
 }
-static bool tramp_can_call_iter_helper(JSValueConst func, JSValueConst this_val);
-static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int *pdone, int magic);
+static bool iter_helper_drive_ready(JSValueConst func, JSValueConst this_val);
 #define CONT_PROMISE_ALL   9   /* cont_state = JSPromiseAll: Promise.all(gen) drives the generator's .next() on the
                                   chain, per element wrapping Promise.resolve(value).then(resolve_element). Reuses the
                                   generator drive; the settle re-enters do_promise_all_step. No promise-state
@@ -22504,7 +22523,7 @@ static bool tramp_unwrap_iter_next(JSValueConst *piter, JSValueConst *pnext) {
            (27.1.4.2.1 step 4 calls with no arguments) — so a drive CARRYING one must not unwrap, or the  \
            wrapped iterator would see an argument the wrapper would have swallowed. */                    \
         if (JS_IsUninitialized(darg)) tramp_unwrap_iter_next(&(diter), &(dnext));                        \
-        if (tramp_can_call_iter_helper((dnext), (diter))) {                                              \
+        if (iter_helper_drive_ready((dnext), (diter))) {                                              \
             JSIteratorHelperData *dh_ = JS_VALUE_GET_OBJ(diter)->u.iterator_helper_data;                 \
             dh_->executing = 1; dh_->resume_pc = ITHP_START;                                             \
             dh_->drive_mode = ITH_CONSUME; dh_->consumer = (statep); dh_->consumer_kind = (kindc);        \
@@ -24894,7 +24913,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        has no receiver slot, and reading one is a read BEFORE the operand block — the
                        heap-buffer-overflow ASan caught the moment this question moved off OP_call_method, whose
                        shape is always the method one. */
-                    if (tramp_can_call_iter_helper(call_argv[-1], gthis))
+                    if (iter_helper_drive_ready(call_argv[-1], gthis))
                         goto do_iter_helper_tramp;
                 }
                 {   /* ag.next()/.throw()/.return(): the body runs on THIS chain, so a loop in it preempts the base
@@ -25717,7 +25736,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     cd_outer = NULL; cd_outer_kind = CONT_NONE;
                     goto do_step_tramp;
                 }
-                if (tramp_can_call_iter_helper(call_argv[-1], call_argv[-2])) {
+                if (iter_helper_drive_ready(call_argv[-1], call_argv[-2])) {
                     /* the callee is a lazy Iterator HELPER's own .next(): it IS a machine of a different kind,
                        driven by do_iter_helper_step, and calling it in place is js_iterator_helper_next's DFAIL.
                        The same question the ONE .next() drive asks — a sequence asks it too, because a sequence
@@ -65978,22 +65997,39 @@ static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue
 /* Route a lazy Iterator Helper .next() whose SOURCE is a generator (the drive-to-completion case) and whose kind's
    tramp drive is built (DROP) onto do_iter_helper_tramp. Plain-iterator sources / other kinds stay on the C
    js_iterator_helper_next (a plain .next() call does not suspend). */
-static bool tramp_can_call_iter_helper(JSValueConst func, JSValueConst this_val)
+/* Can a drive BEGIN on this receiver? Not which builtin the callee is — that is the declaration's answer now
+   (tramp_is_iter_drive), and comparing against js_iterator_helper_next's address was the identity test the
+   recognizer ban is about. What is left is about the RECEIVER: `.next` is reachable off %IteratorHelperPrototype%
+   with any `this`, and 27.1.4 requires the internal slot; and a helper that is already driving cannot be
+   re-entered, which is GeneratorValidate's TypeError. Both answers belong to js_call_c_function's iterdrive arm,
+   which is where a decline lands — the drive itself cannot give the second one, because entry is what raises the
+   flag it tests. */
+/* The two answers a DECLINED drive owes, which is everything js_iterator_helper_next had left. Both are spec
+   answers and neither is an algorithm: 27.1.4 requires the internal slot, and a helper already driving is
+   GeneratorValidate's TypeError. Reaching here for any OTHER reason is an unrouted call site, and the DCHECK
+   says so rather than letting it read as a TypeError the page asked for. */
+static JSValue js_iter_helper_declined(JSContext *ctx, JSValueConst this_obj)
 {
-    JSObject *mp, *tp;
+    JSObject *hp = JS_VALUE_GET_TAG(this_obj) == JS_TAG_OBJECT ? JS_VALUE_GET_OBJ(this_obj) : NULL;
+    JSIteratorHelperData *hit = (hp && hp->class_id == JS_CLASS_ITERATOR_HELPER)
+                                ? hp->u.iterator_helper_data : NULL;
+    DCHECK(hit == NULL || hit->executing,
+           "a drivable Iterator Helper .next() was invoked outside the interpreter's dispatch — route that call "
+           "site onto do_iter_helper_tramp; there is no second driver");
+    if (!hit)
+        return JS_ThrowTypeError(ctx, "not an Iterator Helper");
+    return JS_ThrowTypeError(ctx, "Iterator Helper is already running");
+}
+
+static bool iter_helper_drive_ready(JSValueConst func, JSValueConst this_val)
+{
+    JSObject *tp;
     JSIteratorHelperData *it;
-    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT || JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT) return false;
-    mp = JS_VALUE_GET_OBJ(func);
-    if (mp->class_id != JS_CLASS_C_FUNCTION || mp->u.cfunc.cproto != JS_CFUNC_iterator_next
-        || mp->u.cfunc.c_function.iterator_next != js_iterator_helper_next
-        || mp->u.cfunc.magic != GEN_MAGIC_NEXT) return false;
+    if (!tramp_is_iter_drive(func)) return false;
+    if (JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT) return false;
     tp = JS_VALUE_GET_OBJ(this_val);
     if (tp->class_id != JS_CLASS_ITERATOR_HELPER) return false;
     it = tp->u.iterator_helper_data;
-    /* `it->done` is NOT a decline any more — the drive answers an exhausted helper itself. What is left is the
-       one state in which a drive cannot BEGIN: one is already running on this helper, which is 27.1.4's
-       GeneratorValidate TypeError, raised by the C entry below. Every KIND is driven, so there is no kind list
-       either; one that were not would reach that entry's DFAIL, which is the point. */
     if (!it || it->executing) return false;
     return true;
 }
@@ -66033,29 +66069,6 @@ static void js_iterator_helper_mark(JSRuntime *rt, JSValueConst val,
 /* Plain-iterator (non-generator source) path for a lazy Iterator Helper .next(): a plain .next() call does not
    suspend, so a C loop here is NOT drive-to-completion. A GENERATOR source is routed onto the tramp before reaching
    here; one that slips through hits the js_generator_next DFAIL. Keeps the recognition identity. */
-static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
-                                      int argc, JSValueConst *argv,
-                                      int *pdone, int magic)
-{
-    /* The DRIVE runs on the tramp (do_iter_helper_tramp), and everything that used to be answered here instead
-       has moved into it: `.return()` is a step machine (STEPDEF_ITER_HELPER_RETURN), an exhausted helper is
-       answered at the drive's start, and every kind is driven. What is left is the ONE state in which a drive
-       cannot begin — one is already running on this helper — which is 27.1.4's GeneratorValidate TypeError and
-       not an algorithm. Any OTHER reason to be here is a source/kind whose drive is not built: DFAIL, never a
-       legacy C-loop fallback. */
-    JSIteratorHelperData *it = JS_GetOpaque2(ctx, this_val, JS_CLASS_ITERATOR_HELPER);
-    *pdone = false;
-    if (!it) return JS_EXCEPTION;
-    if (it->executing) {   /* GeneratorValidate: resuming a helper whose drive is already running (a source .next()
-                              re-entered this helper) is a TypeError for every magic — a trivial guard, no drive. */
-        return JS_ThrowTypeError(ctx, "Iterator Helper is already running");
-    }
-    DFAIL("js_iterator_helper_next: helper source/kind not yet driven on the tramp — build do_iter_helper_step for it, never a legacy C-loop fallback");
-    return JS_ThrowTypeError(ctx, "Iterator Helper .next() not on the tramp");
-}
-
-
-
 static const JSCFunctionListEntry js_iterator_funcs[] = {
     JS_CFUNC_DEF("concat", 0, js_iterator_concat ),
     JS_CFUNC_CONSUME_DEF("from", 1, ITERCONS_ITERFROM ),
@@ -66092,7 +66105,7 @@ static const JSCFunctionListEntry js_iterator_proto_funcs[] = {
 static const JSCFunctionListEntry js_iterator_helper_proto_funcs[] = {
     /* .next() is recognized at the call site and routed onto do_iter_helper_tramp for a generator source; the C
        js_iterator_helper_next handles plain-iterator sources (which do not suspend). */
-    JS_ITERATOR_NEXT_DEF("next", 0, js_iterator_helper_next, GEN_MAGIC_NEXT ),
+    JS_CFUNC_ITERDRIVE_DEF("next", 0 ),
     JS_CFUNC_STEP_DEF("return", 0, STEPDEF_ITER_HELPER_RETURN ),
     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "Iterator Helper", JS_PROP_CONFIGURABLE ),
 };

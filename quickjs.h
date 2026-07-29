@@ -1447,6 +1447,12 @@ typedef enum JSCFunctionEnum {  /* XXX: should rename for namespace isolation */
                              the callee CARRIES which walk it wants and the interpreter asks ONE question instead
                              of a per-builtin identity test. Same shape as JS_CFUNC_step: the function pointer is
                              unused, because there is no C body left to call. */
+    JS_CFUNC_iterdrive,   /* a lazy Iterator Helper's own .next(): the DRIVE is a coroutine on the tramp
+                             (do_iter_helper_step), and there is no C body left to call. It needs a cproto of its
+                             own rather than JS_CFUNC_step because its DELIVERY has modes — the same drive
+                             finishes into a direct call, a for-of, an OP_iterator_next, or a consuming machine —
+                             which a step machine's push-the-result cannot express. The function pointer is
+                             unused, as for consume and step. */
     JS_CFUNC_step_ctor,   /* a step machine that is ALSO a constructor (String): `new C(x)` and `C(x)` are two
                              spellings of one builtin, and which one ran is already carried by the receiver slot
                              (new_target for a construct, undefined for a call). Separate from JS_CFUNC_step only
@@ -1564,6 +1570,7 @@ typedef struct JSCFunctionListEntry {
    holds function pointers, and putting a data pointer in it is a strict-aliasing violation that survives -O0 and
    segfaults at -O1 (measured: -fno-strict-aliasing passed, plain -O1 crashed). */
 #define JS_CFUNC_CONSUME_DEF(name, length, sink) { name, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE, JS_DEF_CFUNC, sink, { .func = { length, JS_CFUNC_consume, { .generic = NULL } } } }
+#define JS_CFUNC_ITERDRIVE_DEF(name, length) { name, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE, JS_DEF_CFUNC, 0, { .func = { length, JS_CFUNC_iterdrive, { .generic = NULL } } } }
 #define JS_CFUNC_STEP_DEF(name, length, stepid) { name, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE, JS_DEF_CFUNC, stepid, { .func = { length, JS_CFUNC_step, { .generic = NULL } } } }
 #define JS_CFUNC_STEP_CTOR_DEF(name, length, stepid) { name, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE, JS_DEF_CFUNC, stepid, { .func = { length, JS_CFUNC_step_ctor, { .generic = NULL } } } }
 #define JS_CFUNC_MAGIC_DEF(name, length, func1, magic) { name, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE, JS_DEF_CFUNC, magic, { .func = { length, JS_CFUNC_generic_magic, { .generic_magic = func1 } } } }
