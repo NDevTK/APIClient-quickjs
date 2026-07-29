@@ -1531,6 +1531,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_ATOMICS_ADD, STEPDEF_ATOMICS_AND, STEPDEF_ATOMICS_OR, STEPDEF_ATOMICS_SUB,
     STEPDEF_ATOMICS_XOR, STEPDEF_ATOMICS_EXCHANGE, STEPDEF_ATOMICS_CMPXCHG, STEPDEF_ATOMICS_LOAD,
     STEPDEF_ATOMICS_STORE, STEPDEF_ATOMICS_ISLOCKFREE, STEPDEF_ATOMICS_WAIT, STEPDEF_ATOMICS_NOTIFY,
+    STEPDEF_PROMISE_THEN,
     STEPDEF_COUNT
 };
 #define HINT_NONE    2
@@ -1648,8 +1649,7 @@ static __exception int perform_promise_then(JSContext *ctx,
                                             JSValueConst *cap_resolving_funcs);
 static JSValue js_promise_resolve_native(JSContext *ctx, JSValueConst ctor,
                                          int argc, JSValueConst *argv, int magic);
-static JSValue js_promise_then(JSContext *ctx, JSValueConst this_val,
-                               int argc, JSValueConst *argv);
+static JSValue js_promise_then_native(JSContext *ctx, JSValueConst promise, JSValueConst *resolve_reject);
 static JSValue js_promise_resolve_thenable_job(JSContext *ctx,
                                                int argc, JSValueConst *argv);
 static bool js_string_eq(JSString *p1, JSString *p2);
@@ -19212,6 +19212,13 @@ typedef struct JSPromiseCap {
     JSValue ctor;            /* C, OWNED across the Construct — con_func only borrows it */
     void *outer;             /* the machine that asked for the capability */
     uint8_t outer_kind;
+    /* The PromiseHook's parent link. js_promise_then bracketed js_new_promise_capability with a JSValueLink on
+       the C STACK, which cannot survive a suspending Construct — and the Construct is precisely what had to
+       start suspending. The node lives here instead, so it lasts exactly as long as the request and a capability
+       requested from inside a subclass constructor nests through its own state, as the C recursion did. */
+    JSValue parent;          /* OWNED, UNDEFINED when there is no parent or no hook */
+    JSValueLink link;
+    uint8_t linked;
 } JSPromiseCap;
 static JSValue js_promise_executor_new(JSContext *ctx);
 struct JSPromiseAll;
@@ -19221,6 +19228,14 @@ static void js_promise_all_end(JSContext *ctx, struct JSPromiseAll *s);
 #define CONT_PROMISE_ALL_FWD 9
 static void js_promise_cap_abandon(JSContext *ctx, JSPromiseCap *pc)
 {
+    if (pc->linked) {
+        /* the hook's parent link is unwound with the request that installed it, on every exit */
+        DCHECK(ctx->rt->parent_promise == &pc->link,
+               "a capability's parent link was not the innermost one when its request ended");
+        ctx->rt->parent_promise = pc->link.next;
+        pc->linked = 0;
+    }
+    JS_FreeValue(ctx, pc->parent);
     JS_FreeValue(ctx, pc->executor);
     JS_FreeValue(ctx, pc->ctor);
     js_free_rt(ctx->rt, pc);
@@ -22880,6 +22895,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSValueConst tramp_cap_ctor = JS_UNDEFINED;
     void *tramp_cap_outer = NULL; uint8_t tramp_cap_kind = CONT_NONE;
     JSValue tramp_cap_promise = JS_UNDEFINED;
+    /* the PromiseHook's parent for the capability being requested (OWNED), UNDEFINED when there is none */
+    JSValue tramp_cap_parent = JS_UNDEFINED;
     JSValue tramp_cap_funcs[2] = { JS_UNDEFINED, JS_UNDEFINED };
     uint8_t tramp_forawait_wrap = 0;                    /* the acquire about to run is `for await`'s SYNC branch: its iterator gets CreateAsyncFromSyncIterator before the enum_rec */
     int tramp_cont_forof = 0;                           /* CONT_FOROF_NEXT: the enum_rec stack offset for the .next() drive about to be pushed. Rides the frame's forof_off (read+reset in do_tramp_call) so no per-iteration heap state is allocated for what is one int. */
@@ -24019,18 +24036,35 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                _kind naming the machine that will receive [promise, resolve, reject]. */
             {
                 JSValueConst capc = tramp_cap_ctor;
+                JSValue capparent = tramp_cap_parent;
                 JSPromiseCap *pc;
+                tramp_cap_parent = JS_UNDEFINED;
                 if (JS_IsUndefined(capc) || js_same_value(ctx, capc, ctx->promise_ctor)) {
+                    /* the NATIVE promise: creation is immediate, so the hook's parent link is a bracket around
+                       exactly one call, which is what it was on the C stack. */
+                    JSValueLink nlink;
+                    bool nlinked = rt->promise_hook && !JS_IsUndefined(capparent);
+                    if (nlinked) { nlink = (JSValueLink){rt->parent_promise, capparent}; rt->parent_promise = &nlink; }
                     tramp_cap_promise = js_promise_new(ctx, JS_UNDEFINED, tramp_cap_funcs);
+                    if (nlinked) rt->parent_promise = nlink.next;
+                    JS_FreeValue(ctx, capparent);
                     if (unlikely(JS_IsException(tramp_cap_promise))) goto do_promise_cap_abrupt;
                     goto do_promise_cap_deliver;
                 }
                 pc = js_malloc_rt(rt, sizeof(*pc));
-                if (unlikely(!pc)) { JS_ThrowOutOfMemory(ctx); goto do_promise_cap_abrupt; }
+                if (unlikely(!pc)) { JS_FreeValue(ctx, capparent); JS_ThrowOutOfMemory(ctx); goto do_promise_cap_abrupt; }
                 pc->executor = js_promise_executor_new(ctx);
-                if (unlikely(JS_IsException(pc->executor))) { js_free_rt(rt, pc); goto do_promise_cap_abrupt; }
+                if (unlikely(JS_IsException(pc->executor))) { JS_FreeValue(ctx, capparent); js_free_rt(rt, pc); goto do_promise_cap_abrupt; }
                 pc->ctor = js_dup(capc);
                 pc->outer = tramp_cap_outer; pc->outer_kind = tramp_cap_kind;
+                pc->parent = capparent;
+                pc->linked = 0;
+                if (rt->promise_hook && !JS_IsUndefined(pc->parent)) {
+                    /* the SUBCLASS constructor is page code that suspends, so the link is held by the request */
+                    pc->link = (JSValueLink){rt->parent_promise, pc->parent};
+                    rt->parent_promise = &pc->link;
+                    pc->linked = 1;
+                }
                 tramp_cap_ctor = JS_UNDEFINED; tramp_cap_outer = NULL; tramp_cap_kind = CONT_NONE;
                 con_func = pc->ctor; con_ntgt = pc->ctor;
                 con_args = (JSValueConst *)&pc->executor; con_argc = 1; con_cargc = 0;   /* the caller's stack is untouched */
@@ -24089,6 +24123,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 void *cq = tramp_cap_outer; uint8_t ck9 = tramp_cap_kind;
                 tramp_cap_outer = NULL; tramp_cap_kind = CONT_NONE;
                 tramp_cap_ctor = JS_UNDEFINED;
+                JS_FreeValue(ctx, tramp_cap_parent); tramp_cap_parent = JS_UNDEFINED;
                 if (cq) {
                     if (ck9 == CONT_PROMISE_ALL) {
                         /* the AGGREGATE's own capability could not be built, so there is no promise to reject with
@@ -47321,8 +47356,7 @@ static void JS_LoadModuleInternal(JSContext *ctx, const char *basename,
     evaluate_resolving_funcs[0] = JS_NewCFunctionData(ctx, js_load_module_fulfilled, 0, 0, 3, func_data);
     evaluate_resolving_funcs[1] = JS_NewCFunctionData(ctx, js_load_module_rejected, 0, 0, 3, func_data);
     JS_FreeValue(ctx, func_obj);
-    ret = js_promise_then(ctx, evaluate_promise, 2, vc(evaluate_resolving_funcs));
-    JS_FreeValue(ctx, ret);
+    JS_FreeValue(ctx, js_promise_then_native(ctx, evaluate_promise, vc(evaluate_resolving_funcs)));
     JS_FreeValue(ctx, evaluate_resolving_funcs[0]);
     JS_FreeValue(ctx, evaluate_resolving_funcs[1]);
     JS_FreeValue(ctx, evaluate_promise);
@@ -47734,8 +47768,7 @@ static int js_execute_async_module(JSContext *ctx, JSModuleDef *m)
     m_obj = JS_NewModuleValue(ctx, m);
     resolve_funcs[0] = JS_NewCFunctionData(ctx, js_async_module_execution_fulfilled, 0, 0, 1, vc(&m_obj));
     resolve_funcs[1] = JS_NewCFunctionData(ctx, js_async_module_execution_rejected, 0, 0, 1, vc(&m_obj));
-    ret_val = js_promise_then(ctx, promise, 2, vc(resolve_funcs));
-    JS_FreeValue(ctx, ret_val);
+    JS_FreeValue(ctx, js_promise_then_native(ctx, promise, vc(resolve_funcs)));
     JS_FreeValue(ctx, m_obj);
     JS_FreeValue(ctx, resolve_funcs[0]);
     JS_FreeValue(ctx, resolve_funcs[1]);
@@ -47781,8 +47814,7 @@ static int js_execute_sync_module(JSContext *ctx, JSModuleDef *m,
             m_obj = JS_NewModuleValue(ctx, m);
             resolve_funcs[0] = JS_NewCFunctionData(ctx, js_async_module_execution_fulfilled, 0, 0, 1, vc(&m_obj));
             resolve_funcs[1] = JS_NewCFunctionData(ctx, js_async_module_execution_rejected, 0, 0, 1, vc(&m_obj));
-            ret_val = js_promise_then(ctx, promise, 2, vc(resolve_funcs));
-            JS_FreeValue(ctx, ret_val);
+            JS_FreeValue(ctx, js_promise_then_native(ctx, promise, vc(resolve_funcs)));
             JS_FreeValue(ctx, m_obj);
             JS_FreeValue(ctx, resolve_funcs[0]);
             JS_FreeValue(ctx, resolve_funcs[1]);
@@ -63688,6 +63720,8 @@ static const JSTrampStepDef js_promise_catch_def = {
 /* .finally's machine is defined with the rest of the Promise code, below this table, because it builds the
    reaction closures that live there. The table only needs its ADDRESS. */
 static const JSTrampStepDef js_promise_finally_def;
+/* likewise .then, whose PerformPromiseThen lives there. */
+static const JSTrampStepDef js_promise_then_def;
 /* likewise: the resolving-function machine is defined with the Promise code it settles. */
 static const JSTrampStepDef js_promise_resolvefn_def;
 
@@ -63695,6 +63729,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_PROMISE_RESOLVE]       = &js_promise_resolve_def,
     [STEPDEF_PROMISE_CATCH]         = &js_promise_catch_def,
     [STEPDEF_PROMISE_FINALLY]       = &js_promise_finally_def,
+    [STEPDEF_PROMISE_THEN]          = &js_promise_then_def,
     [STEPDEF_PROMISE_REJECT]        = &js_promise_reject_def,
     [STEPDEF_ARRAY_FIND]            = &js_array_find_def,
     [STEPDEF_ARRAY_FIND_INDEX]      = &js_array_findIndex_def,
@@ -66304,7 +66339,7 @@ static JSValue js_async_iterator_proto_dispose(JSContext *ctx,
                                                JSValueConst this_val,
                                                int argc, JSValueConst *argv)
 {
-    JSValue method, ret, promise, undef_fn, then_args[1], result;
+    JSValue method, ret, promise, undef_fn, then_args[2], result;
     JSValue undef = JS_UNDEFINED;
 
     method = JS_GetProperty(ctx, this_val, JS_ATOM_return);
@@ -66337,13 +66372,11 @@ static JSValue js_async_iterator_proto_dispose(JSContext *ctx,
         return JS_EXCEPTION;
     }
     then_args[0] = undef_fn;
-    /* AsyncFromSyncIteratorContinuation's `Await` chain: the `then` READ this Invoke performs is PAGE CODE for a subclass or a thenable, and a C
-       activation has no flow base to run it on. Not built here — every settle and Await that could be
-       converted was, and this one has no request to hand its call out to yet, so it CRASHES naming
-       itself rather than running an accessor or a Proxy trap off the chain. */
-    if (js_read_is_page_code(ctx, promise, JS_ATOM_then))
-        DFAIL("async-from-sync's await wrapper reads `then` from C — hand its Invoke out and place it on a flow");
-    result = JS_Invoke(ctx, promise, JS_ATOM_then, 1, vc(then_args));
+    /* this is an AWAIT — PerformPromiseThen on a capability — not Promise.prototype.then, and `promise` is the
+       engine's own PromiseResolve(%Promise%, ret). Spelling it as an Invoke made it read a property and CALL the
+       method, which since `then` became a step machine is a builtin driven from C. */
+    then_args[1] = JS_UNDEFINED;
+    result = js_promise_then_native(ctx, promise, vc(then_args));
     JS_FreeValue(ctx, undef_fn);
     JS_FreeValue(ctx, promise);
     return result;
@@ -76425,13 +76458,8 @@ static JSValue js_async_dispose_step(JSContext *ctx, JSValueConst this_val,
                                         1, &prev_err);
         then_args[0] = resolve_fn;
         then_args[1] = reject_fn;
-        /* the async-dispose rethrow chain: the `then` READ this Invoke performs is PAGE CODE for a subclass or a thenable, and a C
-           activation has no flow base to run it on. Not built here — every settle and Await that could be
-           converted was, and this one has no request to hand its call out to yet, so it CRASHES naming
-           itself rather than running an accessor or a Proxy trap off the chain. */
-        if (js_read_is_page_code(ctx, ret_promise, JS_ATOM_then))
-            DFAIL("AsyncDisposableStack's rethrow chain reads `then` from C — hand its Invoke out and place it on a flow");
-        result = JS_Invoke(ctx, ret_promise, JS_ATOM_then, 2, vc(then_args));
+        /* the same Await, on the engine's own PromiseResolve(%Promise%, ret) */
+        result = js_promise_then_native(ctx, ret_promise, vc(then_args));
         JS_FreeValue(ctx, resolve_fn);
         JS_FreeValue(ctx, reject_fn);
         JS_FreeValue(ctx, ret_promise);
@@ -76554,13 +76582,13 @@ static JSValue js_disposable_stack_dispose(JSContext *ctx,
             }
             then_args[0] = resolve_fn;
             then_args[1] = reject_fn;
-            /* the async-dispose per-resource chain: the `then` READ this Invoke performs is PAGE CODE for a subclass or a thenable, and a C
-               activation has no flow base to run it on. Not built here — every settle and Await that could be
-               converted was, and this one has no request to hand its call out to yet, so it CRASHES naming
-               itself rather than running an accessor or a Proxy trap off the chain. */
-            if (js_read_is_page_code(ctx, chain, JS_ATOM_then))
-                DFAIL("AsyncDisposableStack's per-resource chain reads `then` from C — hand its Invoke out and place it on a flow");
-            new_chain = JS_Invoke(ctx, chain, JS_ATOM_then, 2, vc(then_args));
+            /* DisposeResources' async chain is a sequence of AWAITs, and Await is PerformPromiseThen on a
+               capability — never Promise.prototype.then. Spelling it as an Invoke of `then` made it READ a
+               property (page code for a subclass or a thenable) and then CALL the method, which since `then`
+               became a step machine is a builtin driven from C. `chain` is an engine-built native promise at
+               every link, so the abstract operation is what this always was; the DFAIL that stood here recording
+               "hand its Invoke out" is discharged by there being no Invoke to hand out. */
+            new_chain = js_promise_then_native(ctx, chain, vc(then_args));
             JS_FreeValue(ctx, resolve_fn);
             JS_FreeValue(ctx, reject_fn);
             JS_FreeValue(ctx, chain);
@@ -76573,7 +76601,7 @@ static JSValue js_disposable_stack_dispose(JSContext *ctx,
         s->resource_count = 0;
 
         if (count > 0) {
-            JSValue undef_fn, then_args[1], new_chain;
+            JSValue undef_fn, then_args[2], new_chain;
             undef_fn = JS_NewCFunctionData(ctx, js_async_dispose_to_undef,
                                            0, 0, 0, NULL);
             if (JS_IsException(undef_fn)) {
@@ -76581,13 +76609,10 @@ static JSValue js_disposable_stack_dispose(JSContext *ctx,
                 return JS_EXCEPTION;
             }
             then_args[0] = undef_fn;
-            /* the async-dispose tail chain: the `then` READ this Invoke performs is PAGE CODE for a subclass or a thenable, and a C
-               activation has no flow base to run it on. Not built here — every settle and Await that could be
-               converted was, and this one has no request to hand its call out to yet, so it CRASHES naming
-               itself rather than running an accessor or a Proxy trap off the chain. */
-            if (js_read_is_page_code(ctx, chain, JS_ATOM_then))
-                DFAIL("AsyncDisposableStack's tail chain reads `then` from C — hand its Invoke out and place it on a flow");
-            new_chain = JS_Invoke(ctx, chain, JS_ATOM_then, 1, vc(then_args));
+            /* the same Await with only an onFulfilled: PerformPromiseThen takes both handlers, and an absent
+               onRejected IS undefined. */
+            then_args[1] = JS_UNDEFINED;
+            new_chain = js_promise_then_native(ctx, chain, vc(then_args));
             JS_FreeValue(ctx, undef_fn);
             JS_FreeValue(ctx, chain);
             return new_chain;
@@ -78059,45 +78084,121 @@ static __exception int perform_promise_then(JSContext *ctx,
     return 0;
 }
 
-static JSValue js_promise_then(JSContext *ctx, JSValueConst this_val,
-                               int argc, JSValueConst *argv)
+/* PerformPromiseThen with a fresh NATIVE capability. The HOST operations that attach reactions to an
+   engine-created promise perform exactly this — 16.2.1.5.3's module evaluation and 16.2.1.8's
+   ContinueDynamicImport state PerformPromiseThen directly, never Promise.prototype.then — so no `constructor`
+   and no @@species is read and there is no subclass constructor to construct. It is the operation the spec
+   names for those callers, not a fallback for the method: they went through js_promise_then only because that
+   was the one C function that existed. */
+static JSValue js_promise_then_native(JSContext *ctx, JSValueConst promise, JSValueConst *resolve_reject)
 {
-    JSValue ctor, result_promise, resolving_funcs[2];
-    bool have_promise_hook;
-    JSValueLink link;
-    JSPromiseData *s;
-    JSRuntime *rt;
-    int i, ret;
-
-    s = JS_GetOpaque2(ctx, this_val, JS_CLASS_PROMISE);
-    if (!s)
+    JSValue funcs[2], result;
+    int ret;
+    result = js_new_promise_capability(ctx, funcs, JS_UNDEFINED);
+    if (JS_IsException(result))
         return JS_EXCEPTION;
-
-    ctor = JS_SpeciesConstructor(ctx, this_val, JS_UNDEFINED);
-    if (JS_IsException(ctor))
-        return ctor;
-    rt = ctx->rt;
-    // always restore, even if js_new_promise_capability callee removes hook
-    have_promise_hook = (rt->promise_hook != NULL);
-    if (have_promise_hook) {
-        link = (JSValueLink){rt->parent_promise, this_val};
-        rt->parent_promise = &link;
-    }
-    result_promise = js_new_promise_capability(ctx, resolving_funcs, ctor);
-    if (have_promise_hook)
-        rt->parent_promise = link.next;
-    JS_FreeValue(ctx, ctor);
-    if (JS_IsException(result_promise))
-        return result_promise;
-    ret = perform_promise_then(ctx, this_val, argv, vc(resolving_funcs));
-    for(i = 0; i < 2; i++)
-        JS_FreeValue(ctx, resolving_funcs[i]);
+    ret = perform_promise_then(ctx, promise, resolve_reject, vc(funcs));
+    JS_FreeValue(ctx, funcs[0]);
+    JS_FreeValue(ctx, funcs[1]);
     if (ret) {
-        JS_FreeValue(ctx, result_promise);
+        JS_FreeValue(ctx, result);
         return JS_EXCEPTION;
     }
-    return result_promise;
+    return result;
 }
+
+/* 27.2.5.4 Promise.prototype.then. Two of its four steps are the page's code: SpeciesConstructor reads
+   `constructor` and then `@@species` (either an accessor or a Proxy trap), and NewPromiseCapability CONSTRUCTS
+   whatever that produced. js_promise_then ran the reads with JS_SpeciesConstructor and the Construct with
+   js_new_promise_capability, both from its C entry — so a subclass constructor with a loop in it aborted with no
+   flow base, and `.catch` and `.finally` reached it too, since both are spelled as an Invoke of `then`. */
+typedef struct JSPromiseThen {
+    JSStepHdr hdr;         /* MUST be first */
+    JSValue ctor;          /* the species constructor (owned); UNDEFINED means %Promise% */
+    JSValue result;        /* the result promise (owned) */
+    JSValue cb_args[1];    /* the GETPROP request's object */
+} JSPromiseThen;
+_Static_assert(offsetof(JSPromiseThen, hdr) == 0, "JSStepHdr must be first in JSPromiseThen");
+
+static int js_promise_then_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSPromiseThen *s = st;
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result);          /* UNDEFINED on the first step */
+        s->ctor = JS_UNDEFINED; s->result = JS_UNDEFINED; s->cb_args[0] = JS_UNDEFINED;
+        /* steps 2-3: RequireInternalSlot([[PromiseState]]), before anything is read */
+        if (!JS_GetOpaque2(ctx, s->hdr.this_val, JS_CLASS_PROMISE))
+            return -1;
+        s->hdr.stage = 1;
+        s->cb_args[0] = js_dup(s->hdr.this_val);
+        *out_cb = s->cb_args; *out_argc = (int)JS_ATOM_constructor;
+        return 6;   /* GETPROP: SpeciesConstructor step 2 */
+    }
+    if (s->hdr.stage == 1) {
+        /* cb_result = O.constructor. Steps 3-4: undefined is the default; a non-object is a TypeError. */
+        JS_FreeValue(ctx, s->cb_args[0]); s->cb_args[0] = JS_UNDEFINED;
+        if (JS_IsUndefined(cb_result)) { s->hdr.stage = 3; return js_promise_then_step(ctx, st, JS_UNDEFINED, out_cb, out_argc); }
+        if (!JS_IsObject(cb_result)) { JS_FreeValue(ctx, cb_result); JS_ThrowTypeErrorNotAnObject(ctx); return -1; }
+        s->hdr.stage = 2;
+        s->cb_args[0] = cb_result;   /* the constructor, held for the @@species read (owned) */
+        *out_cb = s->cb_args; *out_argc = (int)JS_ATOM_Symbol_species;
+        return 6;   /* GETPROP: SpeciesConstructor step 5 */
+    }
+    if (s->hdr.stage == 2) {
+        /* cb_result = C[@@species]. Steps 6-8: nullish is the default; a non-constructor is a TypeError. */
+        JS_FreeValue(ctx, s->cb_args[0]); s->cb_args[0] = JS_UNDEFINED;
+        if (JS_IsUndefined(cb_result) || JS_IsNull(cb_result)) { JS_FreeValue(ctx, cb_result); }
+        else if (!JS_IsConstructor(ctx, cb_result)) {
+            JS_ThrowTypeErrorNotAConstructor(ctx, cb_result);
+            JS_FreeValue(ctx, cb_result);
+            return -1;
+        } else s->ctor = cb_result;
+        s->hdr.stage = 3;
+        return js_promise_then_step(ctx, st, JS_UNDEFINED, out_cb, out_argc);
+    }
+    if (s->hdr.stage == 3) {
+        /* step 5: NewPromiseCapability(C). The PromiseHook's parent is this promise, and it rides the request
+           because the Construct suspends. */
+        JS_FreeValue(ctx, cb_result);
+        s->hdr.stage = 4;
+        s->cb_args[0] = js_dup(s->ctor);
+        *out_cb = s->cb_args; *out_argc = 0;
+        return 16;   /* CAPABILITY */
+    }
+    /* stage 4: the capability is on the header. Step 6 PerformPromiseThen invokes nothing. */
+    JS_FreeValue(ctx, cb_result);
+    JS_FreeValue(ctx, s->cb_args[0]); s->cb_args[0] = JS_UNDEFINED;
+    {
+        JSValueConst rf[2], handlers[2];
+        int ret;
+        rf[0] = s->hdr.cap_funcs[0];
+        rf[1] = s->hdr.cap_funcs[1];
+        /* js_call_c_function padded a C body's vector to the declared length; a machine is handed the call's
+           REAL operands, so `p.then()` and `p.then(f)` left argv shorter than the two handlers this reads. */
+        handlers[0] = step_arg(&s->hdr, 0);
+        handlers[1] = step_arg(&s->hdr, 1);
+        ret = perform_promise_then(ctx, s->hdr.this_val, handlers, rf);
+        JS_FreeValue(ctx, s->hdr.cap_funcs[0]); s->hdr.cap_funcs[0] = JS_UNDEFINED;
+        JS_FreeValue(ctx, s->hdr.cap_funcs[1]); s->hdr.cap_funcs[1] = JS_UNDEFINED;
+        if (ret) { JS_FreeValue(ctx, s->hdr.cap_promise); s->hdr.cap_promise = JS_UNDEFINED; return -1; }
+        s->result = s->hdr.cap_promise; s->hdr.cap_promise = JS_UNDEFINED;
+    }
+    return 0;
+}
+
+static JSValue js_promise_then_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSPromiseThen *s = st;
+    JSValue r = take_result ? s->result : (JS_FreeValue(ctx, s->result), JS_UNDEFINED);
+    JS_FreeValue(ctx, s->cb_args[0]);
+    JS_FreeValue(ctx, s->ctor);
+    js_free_rt(ctx->rt, s);
+    return r;
+}
+
+static const JSTrampStepDef js_promise_then_def = {
+    sizeof(JSPromiseThen), js_promise_then_step, js_promise_then_fini, 0
+};
 
 
 
@@ -78338,7 +78439,7 @@ static const JSCFunctionListEntry js_promise_funcs[] = {
 };
 
 static const JSCFunctionListEntry js_promise_proto_funcs[] = {
-    JS_CFUNC_DEF("then", 2, js_promise_then ),
+    JS_CFUNC_STEP_DEF("then", 2, STEPDEF_PROMISE_THEN ),
     JS_CFUNC_STEP_DEF("catch", 1, STEPDEF_PROMISE_CATCH ),
     JS_CFUNC_STEP_DEF("finally", 1, STEPDEF_PROMISE_FINALLY ),
     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "Promise", JS_PROP_CONFIGURABLE ),
