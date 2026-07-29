@@ -19102,6 +19102,38 @@ typedef struct JSOpKeyed {
                                   to is parked across them, exactly as a handler's trap READ parks it. It is the
                                   same nesting CONT_TRAP_GET already is: a keyed request whose outer is not a
                                   machine but another keyed OPERATION, carrying what waits on that one. */
+#define CONT_CTOR_PROTO    65  /* gp_outer = JSCtorProto: 10.2.2 [[Construct]] step 5's
+                                  OrdinaryCreateFromConstructor(newTarget, "%Object.prototype%"), whose step 2 is
+                                  `? Get(newTarget, "prototype")` — an ordinary [[Get]], so a new.target carrying
+                                  an accessor or a Proxy `get` trap runs the page's code there. The BASE-class
+                                  construct read it with js_create_from_ctor from C, before the callee frame
+                                  exists, so there was no flow to run it on and a loop in that getter aborted at
+                                  its back-edge (`Reflect.construct(class{}, [], new Proxy(f, {get(){for(;;){}}}))`).
+                                  The read is UNCONDITIONAL — a predicate that skipped it for an ordinary
+                                  new.target would be a fallback selecting the C body — and the keyed entry
+                                  answers an own data property in place, without a frame. The state is the parked
+                                  CONSTRUCT: everything do_construct_tramp reads out of the con_* registers, which
+                                  are interpreter locals and are gone when the read resumes. */
+typedef struct JSCtorProto {
+    /* the callee and new.target are BORROWED, exactly as `args` is and as do_construct_tramp itself borrows them:
+       whatever owns them across the construct owns them across this suspension too — the caller's operand slots
+       for `new C()`, con_super_ref plus the derived frame for super(), the machine's own buffer for a Construct
+       request. Duping them here instead leaked two references per construct, because the con_* registers the
+       resume hands them back to are borrowed registers that nothing frees. */
+    JSValueConst func, ntgt;
+    JSValue super_ref;       /* super()'s parent-class reference (owned; UNDEFINED for `new C()`) */
+    JSValueConst *args;      /* the arguments: a borrowed window onto the caller's operand stack or the derived
+                                frame's argv, both of which outlive the suspension, or args_owned's block */
+    JSValue *args_owned;     /* non-NULL = the block AND every element belong to this state */
+    int argc, cargc;
+    void *outer;             /* the machine that requested the construct, if any */
+    uint8_t outer_kind;
+    uint8_t from_super;
+    int8_t first;            /* tramp_first: -2 = the stack shape, 0 = super()'s */
+    uint8_t is_tail;
+} JSCtorProto;
+static void js_ctor_proto_free(JSContext *ctx, JSCtorProto *cp);
+
 #define CONT_ARRAY_LEN     64  /* tp_outer = JSArrayLen: 10.4.2.4 ArraySetLength steps 3-5, whose TWO coercions
                                   are the page's code — ToUint32(V) then ToNumber(V), both on the ORIGINAL V, so
                                   a substituted primitive cannot stand for them and the coerce-then-re-execute
@@ -19822,6 +19854,13 @@ static bool arr_len_write_needs_toprim(JSValueConst target, JSAtom atom, JSValue
     return prs && (prs->flags & JS_PROP_LENGTH) != 0;
 }
 
+static void js_ctor_proto_free(JSContext *ctx, JSCtorProto *cp)
+{
+    JS_FreeValue(ctx, cp->super_ref);
+    if (cp->args_owned) free_arg_list(ctx, cp->args_owned, cp->argc);
+    js_free_rt(ctx->rt, cp);
+}
+
 static void js_array_len_free(JSContext *ctx, JSArrayLen *al)
 {
     JS_FreeValue(ctx, al->obj);
@@ -20147,6 +20186,7 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_TOPRIM_GET:
     case CONT_DEFINE_CLASS:
     case CONT_ARRAY_LEN:
+    case CONT_CTOR_PROTO:
     case CONT_OP_KEYED:
     case CONT_FOR_IN_HAS:
     case CONT_OWNKEYS_CHK:
@@ -22962,6 +23002,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        because until a bound chain was flattened here they could not differ. */
     int con_cargc = -1;
     uint8_t con_from_super = 0; JSValue con_super_ref = JS_UNDEFINED;
+    /* 10.1.13 step 2's answer, delivered by CONT_CTOR_PROTO. UNINITIALIZED = the read has not happened yet, which
+       is what makes do_construct_tramp issue it; read+reset there, so a re-entry cannot re-read and a second
+       construct on this frame cannot inherit the first one's prototype. */
+    JSValue con_proto = JS_UNINITIALIZED;
     /* Promise-executor trampoline (do_promise_exec_tramp): the SAME builtin is reached by two entry shapes, so both
        set these before the goto — `new Promise(fn)` (OP_call_constructor: operands on the caller stack, popped at
        finish) and `super(fn)` from a Promise subclass (OP_init_ctor: args are the derived frame's argv, nothing to
@@ -24703,8 +24747,41 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 TrampFrame *ntf; JSValue *nlb, *narg_buf, *nvar_buf, *nstack_buf; JSStackFrame *nsf; int k;
                 if (nb->is_derived_class_constructor) {
                     cthis = JS_UNDEFINED;   /* bound by super(); body returns the object itself */
+                    DCHECK(JS_IsUninitialized(con_proto),
+                           "a derived constructor was handed a prototype: its `this` comes from super()");
+                } else if (JS_IsUninitialized(con_proto)) {
+                    /* 10.2.2 step 5 -> 10.1.13 step 2: `? Get(newTarget, "prototype")`, the page's code. The whole
+                       construct parks on the read; nothing of the callee frame has been built yet, so there is
+                       nothing to unwind if it throws. */
+                    JSCtorProto *cp = js_mallocz(ctx, sizeof(*cp));
+                    if (unlikely(!cp)) { free_arg_list(ctx, con_args_owned, con_argc); con_args_owned = NULL; JS_FreeValue(ctx, con_super_ref); JS_ThrowOutOfMemory(ctx); goto exception; }
+                    cp->func = nfunc; cp->ntgt = ntgt;   /* borrowed; see JSCtorProto */
+                    cp->super_ref = con_super_ref;   con_super_ref = JS_UNDEFINED;
+                    cp->args = con_args; cp->argc = con_argc;
+                    cp->args_owned = con_args_owned; con_args_owned = NULL;
+                    cp->cargc = con_cargc; con_cargc = -1;
+                    cp->from_super = con_from_super;
+                    cp->first = (int8_t)tramp_first; cp->is_tail = tramp_is_tail;
+                    cp->outer = con_outer; cp->outer_kind = con_outer_kind;
+                    con_outer = NULL; con_outer_kind = CONT_NONE;
+                    sf->cur_pc = pc;
+                    gp_outer = cp; gp_outer_kind = CONT_CTOR_PROTO;
+                    gp_obj = cp->ntgt; gp_atom = JS_ATOM_prototype;
+                    gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                    goto do_getprop_tramp;
                 } else {
-                    cthis = js_create_from_ctor(ctx, ntgt, JS_CLASS_OBJECT);
+                    /* 10.1.13 step 3: a non-object `prototype` falls back to the CONSTRUCTOR'S REALM intrinsic,
+                       which is read off the function without invoking it. */
+                    JSValue cproto = con_proto; con_proto = JS_UNINITIALIZED;
+                    if (!JS_IsObject(cproto)) {
+                        JSContext *crealm;
+                        JS_FreeValue(ctx, cproto);
+                        crealm = JS_GetFunctionRealm(ctx, ntgt);
+                        if (unlikely(!crealm)) { free_arg_list(ctx, con_args_owned, con_argc); con_args_owned = NULL; JS_FreeValue(ctx, con_super_ref); goto exception; }
+                        cproto = js_dup(crealm->class_proto[JS_CLASS_OBJECT]);
+                    }
+                    cthis = JS_NewObjectProtoClass(ctx, cproto, JS_CLASS_OBJECT);
+                    JS_FreeValue(ctx, cproto);
                     if (unlikely(JS_IsException(cthis))) { free_arg_list(ctx, con_args_owned, con_argc); con_args_owned = NULL; JS_FreeValue(ctx, con_super_ref); goto exception; }
                 }
                 cs = js_malloc_rt(rt, sizeof(*cs));
@@ -27526,6 +27603,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                           cont_st = gouter0;
                           goto do_toprim_have_method;
                       }
+                      if (gk == CONT_CTOR_PROTO) {
+                          /* the new.target's `prototype` is in hand: restore the parked CONSTRUCT and run it. */
+                          JSCtorProto *cp = gouter0;
+                          con_func = cp->func; con_ntgt = cp->ntgt;
+                          con_super_ref = cp->super_ref; cp->super_ref = JS_UNDEFINED;
+                          con_args = cp->args; con_argc = cp->argc;
+                          con_args_owned = cp->args_owned; cp->args_owned = NULL;
+                          con_cargc = cp->cargc; con_from_super = cp->from_super;
+                          tramp_first = cp->first; tramp_is_tail = cp->is_tail;
+                          con_outer = cp->outer; con_outer_kind = cp->outer_kind;
+                          con_proto = ret_val; ret_val = JS_UNDEFINED;
+                          js_ctor_proto_free(ctx, cp);
+                          goto do_construct_tramp;
+                      }
                       if (gk == CONT_ARRAY_LEN) {
                           /* the RE-ISSUED write finished. The sequence owned its operands and nothing else, so
                              it unwraps to whatever was waiting on the write and this label runs again for it. */
@@ -27773,6 +27864,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         gp_outer = gd->outer; gp_outer_kind = gd->outer_kind;
                         js_gopd_desc_free(ctx, gd);
                         goto getprop_throw;
+                    }
+                    if (gk3 == CONT_CTOR_PROTO) {
+                        /* the read threw in place (a revoked proxy, a poisoned C accessor): same unwind as the
+                           suspended arm — the requester is a CONSTRUCT requester, which the exception label owns. */
+                        JSCtorProto *cpt = gouter;
+                        con_outer = cpt->outer; con_outer_kind = cpt->outer_kind;
+                        cpt->outer = NULL; cpt->outer_kind = CONT_NONE;
+                        js_ctor_proto_free(ctx, cpt);
+                        goto exception;
                     }
                     if (gk3 == CONT_ARRAY_LEN) {
                         /* the re-issued write threw in place: unwrap and let the throw reach the same waiter. */
@@ -30770,7 +30870,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            || gouter_kind == CONT_OWNKEYS_CHK || gouter_kind == CONT_PROXY_INV
                            || gouter_kind == CONT_KEYED_INV || gouter_kind == CONT_WITH_HAS
                            || gouter_kind == CONT_SET_RECV || gouter_kind == CONT_TOPRIM_GET
-                           || gouter_kind == CONT_DEFINE_CLASS || gouter_kind == CONT_ARRAY_LEN,
+                           || gouter_kind == CONT_DEFINE_CLASS || gouter_kind == CONT_ARRAY_LEN
+                           || gouter_kind == CONT_CTOR_PROTO,
                            "property-get outer continuation: unknown machine kind");
                     if (gouter_kind == CONT_PROMISE_ALL_THEN) {
                         js_getprop_free(ctx, gp);
@@ -31179,6 +31280,35 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             goto getprop_throw;
                         }
                         goto do_ownkeys_chk_step;
+                    }
+                    if (gouter_kind == CONT_CTOR_PROTO) {
+                        JSCtorProto *cpx = gouter;
+                        if (unlikely(JS_IsException(ret_val))) {
+                            /* the getter threw after suspending: the construct can never run. Its requester is a
+                               CONSTRUCT requester, not a keyed one — the two kind namespaces overlap but their
+                               abrupt handling does not, and handing it to getprop_throw hit that label's terminal
+                               DCHECK. It goes back into con_outer, which the exception label already abandons at
+                               the one place every abrupt construct path converges; the operands stay on the
+                               caller's stack for the frame's own catch-search, as a throwing operator's do. */
+                            con_outer = cpx->outer; con_outer_kind = cpx->outer_kind;
+                            cpx->outer = NULL; cpx->outer_kind = CONT_NONE;
+                            js_ctor_proto_free(ctx, cpx);
+                            goto exception;
+                        }
+                        {
+                          /* the new.target's `prototype` is in hand: restore the parked CONSTRUCT and run it. */
+                            JSCtorProto *cp = cpx;
+                            con_func = cp->func; con_ntgt = cp->ntgt;
+                            con_super_ref = cp->super_ref; cp->super_ref = JS_UNDEFINED;
+                            con_args = cp->args; con_argc = cp->argc;
+                            con_args_owned = cp->args_owned; cp->args_owned = NULL;
+                            con_cargc = cp->cargc; con_from_super = cp->from_super;
+                            tramp_first = cp->first; tramp_is_tail = cp->is_tail;
+                            con_outer = cp->outer; con_outer_kind = cp->outer_kind;
+                            con_proto = ret_val; ret_val = JS_UNDEFINED;
+                            js_ctor_proto_free(ctx, cp);
+                            goto do_construct_tramp;
+                        }
                     }
                     if (gouter_kind == CONT_ARRAY_LEN) {
                         /* the re-issued write's own trap suspended and has now answered (or thrown). */
@@ -35629,7 +35759,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    || gk2 == CONT_ITER_CLOSE || gk2 == CONT_TRAP_GET || gk2 == CONT_GOPD_DESC
                    || gk2 == CONT_OWNKEYS_CHK || gk2 == CONT_PROXY_INV || gk2 == CONT_KEYED_INV
                    || gk2 == CONT_WITH_HAS || gk2 == CONT_SET_RECV || gk2 == CONT_TOPRIM_GET
-                   || gk2 == CONT_DEFINE_CLASS || gk2 == CONT_ARRAY_LEN
+                   || gk2 == CONT_DEFINE_CLASS || gk2 == CONT_ARRAY_LEN || gk2 == CONT_CTOR_PROTO
                    || gk2 == CONT_OP_KEYED
                    || gk2 == CONT_PROMISE_ALL_THEN || gk2 == CONT_AFS_GET
                    || gk2 == CONT_ITER_HELPER_GET || gk2 == CONT_PROMISE_ALL_GET
@@ -35704,6 +35834,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 goto getprop_throw;
             } else if (gouter && gk2 == CONT_WITH_HAS) {
                 js_with_has_free(ctx, gouter);
+                goto exception;
+            } else if (gouter && gk2 == CONT_CTOR_PROTO) {
+                /* the `prototype` getter threw after suspending: same unwind as the in-place arm. */
+                JSCtorProto *cpt = gouter;
+                con_outer = cpt->outer; con_outer_kind = cpt->outer_kind;
+                cpt->outer = NULL; cpt->outer_kind = CONT_NONE;
+                js_ctor_proto_free(ctx, cpt);
                 goto exception;
             } else if (gouter && gk2 == CONT_ARRAY_LEN) {
                 /* the re-issued write threw after suspending: unwrap one level, as the in-place arm does. */
