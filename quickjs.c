@@ -1498,6 +1498,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_JSON_STRINGIFY, STEPDEF_FOR_IN, STEPDEF_IMPORT_OPTS,
     STEPDEF_OBJ_HASOWN, STEPDEF_OBJ_HASOWNPROP,
     STEPDEF_OBJ_LOOKUPGETTER, STEPDEF_OBJ_LOOKUPSETTER,
+    STEPDEF_FUNC_BIND,
     STEPDEF_COUNT
 };
 #define HINT_NONE    2
@@ -58533,89 +58534,139 @@ static JSValue js_function_apply_fini(JSContext *ctx, void *st, bool take_result
     return r;
 }
 
-static JSValue js_function_bind(JSContext *ctx, JSValueConst this_val,
-                                int argc, JSValueConst *argv)
+/* 20.2.3.2 Function.prototype.bind. BoundFunctionCreate runs nothing of the page's, but the three steps the
+   spec states after it do: step 5's HasOwnProperty(Target, "length") is Target.[[GetOwnProperty]], and steps
+   6.a and 8 Get "length" and "name" — an accessor or a Proxy trap in every case. The C body performed all
+   three from C, one JS_GetOwnProperty and two JS_GetProperty, so
+   `Function.prototype.bind.call(new Proxy(f, {get(){for(;;){}}}))` had no flow base. */
+typedef struct JSFuncBind {
+    JSStepHdr hdr;      /* MUST be first */
+    JSValue func_obj;   /* the bound function, created BEFORE the reads the spec states after it (owned) */
+    JSValue result;     /* DONE (owned) */
+    int arg_count;      /* the bound arguments, which the target's `length` is reduced by */
+} JSFuncBind;
+enum { FB_LEN_OWN = 1, FB_LEN_OWN_GOT, FB_LEN_GOT, FB_NAME_GOT };
+
+/* steps 6-7's SetFunctionLength(F, L): the target's own `length`, reduced by the bound argument count and
+   clamped at zero, and anything that is not a Number contributes nothing. CONSUMES len_val. */
+static void js_func_bind_length(JSContext *ctx, JSFuncBind *s, JSValue len_val)
 {
-    JSBoundFunction *bf;
-    JSValue func_obj, name1, len_val;
-    JSObject *p;
-    int arg_count, i, ret;
-
-    if (check_function(ctx, this_val))
-        return JS_EXCEPTION;
-
-    func_obj = JS_NewObjectProtoClass(ctx, ctx->function_proto,
-                                 JS_CLASS_BOUND_FUNCTION);
-    if (JS_IsException(func_obj))
-        return JS_EXCEPTION;
-    p = JS_VALUE_GET_OBJ(func_obj);
-    p->is_constructor = JS_IsConstructor(ctx, this_val);
-    arg_count = max_int(0, argc - 1);
-    bf = js_malloc(ctx, sizeof(*bf) + arg_count * sizeof(JSValue));
-    if (!bf)
-        goto exception;
-    bf->func_obj = js_dup(this_val);
-    bf->this_val = js_dup(argv[0]);
-    bf->argc = arg_count;
-    for(i = 0; i < arg_count; i++) {
-        bf->argv[i] = js_dup(argv[i + 1]);
-    }
-    p->u.bound_function = bf;
-
-    /* XXX: the spec could be simpler by only using GetOwnProperty */
-    ret = JS_GetOwnProperty(ctx, NULL, this_val, JS_ATOM_length);
-    if (ret < 0)
-        goto exception;
-    if (!ret) {
-        len_val = js_int32(0);
-    } else {
-        len_val = JS_GetProperty(ctx, this_val, JS_ATOM_length);
-        if (JS_IsException(len_val))
-            goto exception;
-        if (JS_VALUE_GET_TAG(len_val) == JS_TAG_INT) {
-            /* most common case */
-            int len1 = JS_VALUE_GET_INT(len_val);
-            if (len1 <= arg_count)
-                len1 = 0;
-            else
-                len1 -= arg_count;
-            len_val = js_int32(len1);
-        } else if (JS_VALUE_GET_NORM_TAG(len_val) == JS_TAG_FLOAT64) {
-            double d = JS_VALUE_GET_FLOAT64(len_val);
-            if (isnan(d)) {
-                d = 0.0;
-            } else {
-                d = trunc(d);
-                if (d <= (double)arg_count)
-                    d = 0.0;
-                else
-                    d -= (double)arg_count; /* also converts -0 to +0 */
-            }
-            len_val = js_number(d);
+    int arg_count = s->arg_count;
+    if (JS_VALUE_GET_TAG(len_val) == JS_TAG_INT) {
+        int len1 = JS_VALUE_GET_INT(len_val);
+        len_val = js_int32(len1 <= arg_count ? 0 : len1 - arg_count);
+    } else if (JS_VALUE_GET_NORM_TAG(len_val) == JS_TAG_FLOAT64) {
+        double d = JS_VALUE_GET_FLOAT64(len_val);
+        if (isnan(d)) {
+            d = 0.0;
         } else {
-            JS_FreeValue(ctx, len_val);
-            len_val = js_int32(0);
+            d = trunc(d);
+            if (d <= (double)arg_count)
+                d = 0.0;               /* also converts -0 to +0 */
+            else
+                d -= (double)arg_count;
         }
+        len_val = js_number(d);
+    } else {
+        JS_FreeValue(ctx, len_val);
+        len_val = js_int32(0);
     }
-    JS_DefinePropertyValue(ctx, func_obj, JS_ATOM_length,
-                           len_val, JS_PROP_CONFIGURABLE);
+    JS_DefinePropertyValue(ctx, s->func_obj, JS_ATOM_length, len_val, JS_PROP_CONFIGURABLE);
+}
 
-    name1 = JS_GetProperty(ctx, this_val, JS_ATOM_name);
-    if (JS_IsException(name1))
-        goto exception;
-    if (!JS_IsString(name1)) {
-        JS_FreeValue(ctx, name1);
-        name1 = js_empty_string(ctx->rt);
+static int js_func_bind_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSFuncBind *s = st;
+    JSValue name1;
+
+    if (s->hdr.stage == 0) {
+        JSBoundFunction *bf;
+        JSObject *p;
+        int i;
+        JS_FreeValue(ctx, cb_result);
+        cb_result = JS_UNDEFINED;
+        s->func_obj = JS_UNDEFINED; s->result = JS_UNDEFINED;
+        if (check_function(ctx, s->hdr.this_val))       /* step 2: IsCallable(Target) */
+            return -1;
+        s->func_obj = JS_NewObjectProtoClass(ctx, ctx->function_proto, JS_CLASS_BOUND_FUNCTION);
+        if (JS_IsException(s->func_obj)) { s->func_obj = JS_UNDEFINED; return -1; }
+        p = JS_VALUE_GET_OBJ(s->func_obj);
+        p->is_constructor = JS_IsConstructor(ctx, s->hdr.this_val);
+        s->arg_count = max_int(0, s->hdr.argc - 1);
+        bf = js_malloc(ctx, sizeof(*bf) + s->arg_count * sizeof(JSValue));
+        if (!bf)
+            return -1;
+        bf->func_obj = js_dup(s->hdr.this_val);
+        bf->this_val = js_dup(step_arg(&s->hdr, 0));
+        bf->argc = s->arg_count;
+        for (i = 0; i < s->arg_count; i++)
+            bf->argv[i] = js_dup(step_arg(&s->hdr, i + 1));
+        p->u.bound_function = bf;                       /* step 3: BoundFunctionCreate */
+        s->hdr.stage = FB_LEN_OWN;
     }
-    name1 = JS_ConcatString3(ctx, "bound ", name1, "");
-    if (JS_IsException(name1))
-        goto exception;
-    JS_DefinePropertyValue(ctx, func_obj, JS_ATOM_name, name1,
-                           JS_PROP_CONFIGURABLE);
-    return func_obj;
- exception:
-    JS_FreeValue(ctx, func_obj);
-    return JS_EXCEPTION;
+    switch (s->hdr.stage) {
+    case FB_LEN_OWN:
+        /* step 5: HasOwnProperty(Target, "length"). Only whether it EXISTS is wanted, so the ordinary
+           descriptor-object answer says it — undefined means absent. */
+        JS_FreeValue(ctx, cb_result);
+        s->hdr.stage = FB_LEN_OWN_GOT;
+        s->hdr.cb_coerce[0] = s->hdr.this_val;   /* borrowed: the machine holds the target across the request */
+        *out_cb = s->hdr.cb_coerce; *out_argc = (int)JS_ATOM_length;
+        return 12;
+    case FB_LEN_OWN_GOT: {
+        bool has_len;
+        if (JS_IsException(cb_result))
+            return -1;
+        has_len = !JS_IsUndefined(cb_result);
+        JS_FreeValue(ctx, cb_result);
+        cb_result = JS_UNDEFINED;
+        if (has_len) {
+            s->hdr.stage = FB_LEN_GOT;               /* step 6.a: Get(Target, "length") */
+            s->hdr.cb_coerce[0] = s->hdr.this_val;
+            *out_cb = s->hdr.cb_coerce; *out_argc = (int)JS_ATOM_length;
+            return 6;
+        }
+        js_func_bind_length(ctx, s, js_int32(0));    /* step 4: L is 0 when the target has no own length */
+        goto want_name;
+    }
+    case FB_LEN_GOT:
+        if (JS_IsException(cb_result))
+            return -1;
+        js_func_bind_length(ctx, s, cb_result);      /* consumes it */
+        cb_result = JS_UNDEFINED;
+    want_name:
+        s->hdr.stage = FB_NAME_GOT;                  /* step 8: Get(Target, "name") */
+        s->hdr.cb_coerce[0] = s->hdr.this_val;
+        *out_cb = s->hdr.cb_coerce; *out_argc = (int)JS_ATOM_name;
+        return 6;
+    default:
+        DCHECK(s->hdr.stage == FB_NAME_GOT, "Function.prototype.bind's machine resumed in no stage");
+        if (JS_IsException(cb_result))
+            return -1;
+        name1 = cb_result;
+        if (!JS_IsString(name1)) {                   /* step 9 */
+            JS_FreeValue(ctx, name1);
+            name1 = js_empty_string(ctx->rt);
+        }
+        name1 = JS_ConcatString3(ctx, "bound ", name1, "");   /* step 10: SetFunctionName(F, name, "bound") */
+        if (JS_IsException(name1))
+            return -1;
+        JS_DefinePropertyValue(ctx, s->func_obj, JS_ATOM_name, name1, JS_PROP_CONFIGURABLE);
+        s->result = s->func_obj;
+        s->func_obj = JS_UNDEFINED;
+        return 0;
+    }
+}
+
+static JSValue js_func_bind_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSFuncBind *s = st;
+    JSValue r;
+    JS_FreeValue(ctx, s->func_obj);
+    r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    js_free(ctx, s);
+    return r;
 }
 
 static JSValue js_function_toString(JSContext *ctx, JSValueConst this_val,
@@ -58675,7 +58726,7 @@ static JSValue js_function_hasInstance(JSContext *ctx, JSValueConst this_val,
 static const JSCFunctionListEntry js_function_proto_funcs[] = {
     JS_CFUNC_STEP_DEF("call", 1, STEPDEF_FUNCTION_CALL ),
     JS_CFUNC_STEP_DEF("apply", 2, STEPDEF_FUNCTION_APPLY ),
-    JS_CFUNC_DEF("bind", 1, js_function_bind ),
+    JS_CFUNC_STEP_DEF("bind", 1, STEPDEF_FUNC_BIND ),
     JS_CFUNC_DEF("toString", 0, js_function_toString ),
     JS_CFUNC_DEF("[Symbol.hasInstance]", 1, js_function_hasInstance ),
     JS_CGETSET_DEF("fileName", js_function_proto_fileName, NULL ),
@@ -62150,6 +62201,7 @@ static const JSTrampStepDef js_hasown_def      = { sizeof(JSHasOwn), js_hasown_s
 static const JSTrampStepDef js_hasownprop_def  = { sizeof(JSHasOwn), js_hasown_step, js_hasown_fini, 0 };
 static const JSTrampStepDef js_lookupgetter_def = { sizeof(JSLookupAcc), js_lookup_acc_step, js_lookup_acc_fini, 0 };
 static const JSTrampStepDef js_lookupsetter_def = { sizeof(JSLookupAcc), js_lookup_acc_step, js_lookup_acc_fini, 1 };
+static const JSTrampStepDef js_func_bind_def   = { sizeof(JSFuncBind), js_func_bind_step, js_func_bind_fini, 0 };
 static const JSTrampStepDef js_import_opts_def  = {
     sizeof(JSImportOpts), js_import_opts_step, js_import_opts_fini, 0,
     /* body, body_proto, body_magic, precheck, midcheck, onerror */ {NULL}, 0, 0, NULL, NULL, NULL,
@@ -62625,6 +62677,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_OBJ_HASOWNPROP] = &js_hasownprop_def,
     [STEPDEF_OBJ_LOOKUPGETTER] = &js_lookupgetter_def,
     [STEPDEF_OBJ_LOOKUPSETTER] = &js_lookupsetter_def,
+    [STEPDEF_FUNC_BIND]      = &js_func_bind_def,
     [STEPDEF_IMPORT_OPTS]    = &js_import_opts_def,
     [STEPDEF_TA_SLICE]      = &js_ta_slice_def,
     [STEPDEF_STR_CONCAT]    = &js_str_concat_def,
@@ -62842,6 +62895,7 @@ STEP_STATE_HDR_FIRST(JSJsonStr);
 STEP_STATE_HDR_FIRST(JSForIn);
 STEP_STATE_HDR_FIRST(JSHasOwn);
 STEP_STATE_HDR_FIRST(JSLookupAcc);
+STEP_STATE_HDR_FIRST(JSFuncBind);
 STEP_STATE_HDR_FIRST(JSImportOpts);
 STEP_STATE_HDR_FIRST(JSStrCtor);
 STEP_STATE_HDR_FIRST(JSStrConcat);
