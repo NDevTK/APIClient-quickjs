@@ -20004,7 +20004,11 @@ typedef struct JSIteratorHelperData {
     uint8_t resume_pc;   /* coroutine resume position within a helper.next() (do_iter_helper_step) */
     uint8_t drive_mode;  /* how helper.next() was invoked: ITH_DIRECT / ITH_FOROF / ITH_ITERNEXT (finish differs) */
     int forof_off;       /* for-of/iternext: the helper iterator's caller-stack offset */
-    int orig_cargc; uint8_t orig_is_tail;   /* direct-mode operand shape for the finish */
+    /* The DECLARED operand shape of the .next() that started this drive, for EVERY mode that has one — the
+       delivery drops exactly what the call put on the stack. It used to be `sp - orig_cargc - 2`, which hardcodes
+       first=-2 and so is wrong for the reshaped forms do_generic_callee produces for a bound or proxied `next`;
+       the for-of and iternext modes had no shape at all because their opcodes jumped in without pushing. */
+    int orig_cfirst; int orig_cargc; uint8_t orig_is_tail;
     void *consumer;          /* ITH_CONSUME: the consumer step awaiting this helper's {value,done} — a JSIteratorHelperData
                                 (helper-drives-helper), a JSIterConsume (Array.from/spread/Set/Map), etc. per consumer_kind */
     uint8_t consumer_kind;   /* CONT_* of `consumer`: CONT_ITER_HELPER / CONT_ITER_CONSUME / ... — how to re-enter it */
@@ -22198,8 +22202,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSValue tramp_cap_funcs[2] = { JS_UNDEFINED, JS_UNDEFINED };
     uint8_t tramp_forawait_wrap = 0;                    /* the acquire about to run is `for await`'s SYNC branch: its iterator gets CreateAsyncFromSyncIterator before the enum_rec */
     int tramp_cont_forof = 0;                           /* CONT_FOROF_NEXT: the enum_rec stack offset for the .next() drive about to be pushed. Rides the frame's forof_off (read+reset in do_tramp_call) so no per-iteration heap state is allocated for what is one int. */
-    uint8_t tramp_ith_mode = ITH_DIRECT;                /* Iterator Helper drive: which DELIVERY the .next() owes (ITH_DIRECT / ITH_FOROF / ITH_ITERNEXT). read+reset by do_iter_helper_tramp */
-    int tramp_ith_forof = 0;                            /* ITH_FOROF only: the enum_rec's caller-stack offset */
     int tramp_gen_iternext = 0;                         /* 1 = OP_iterator_next drive (yield* / destructuring): iterator at sp[-4], arg at sp[-1], result OBJECT replaces sp[-1] */
     int tramp_gen_close = 0;                            /* 1 = OP_iterator_close drive (.return() on an unconsumed generator iterator at sp[-1]): body runs finally on the tramp, result DISCARDED */
     int tramp_gen_close_exc = 0;                        /* 1 = the close is happening DURING exception unwind (JS_IteratorClose(iter,true)): after the finally runs, restore the in-flight exception and continue unwinding (goto exception), never overwrite it */
@@ -22988,9 +22990,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     ap_func = call_argv[0]; ap_this = call_argv[1]; ap_array = call_argv[2];
                     ap_cfirst = -2; ap_cargc = call_argc;   /* operands [Reflect, apply, target, this, argsList] */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_apply_tramp;
-                }
-                if (tramp_can_call_iter_helper(call_argv[-1], call_argv[-2])) {   /* lazy Iterator Helper .next() over a generator source -> drive it on THIS chain */
-                    tramp_is_tail = (opcode == OP_tail_call_method); goto do_iter_helper_tramp;
                 }
                 /* iter.return(v) on a lazy Iterator Helper whose SOURCE is a generator: close the source (its finally
                    runs on the tramp), then deliver {value:v, done:true}. call_argv[-2]=helper, [-1]=return method. A
@@ -24323,6 +24322,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 if (tramp_step_def_of(call_argv[-1]))
                     goto do_step_tramp;
+                {   /* a lazy Iterator HELPER's own .next(): its step machine drives the source on this chain, and
+                       calling it in place is js_iterator_helper_next's DFAIL. Asked here and nowhere else. Its
+                       per-call-site copy lived at OP_call_method, so `h.next.bind(h)()` and every other spelling
+                       the operator could not see reached that DFAIL — and through a for-of, the opcode's own copy
+                       silently delivered in the wrong mode instead. */
+                    /* the RECEIVER is gthis, never call_argv[-2]: a plain `[f, args]` shape (tramp_first == -1)
+                       has no receiver slot, and reading one is a read BEFORE the operand block — the
+                       heap-buffer-overflow ASan caught the moment this question moved off OP_call_method, whose
+                       shape is always the method one. */
+                    if (tramp_can_call_iter_helper(call_argv[-1], gthis))
+                        goto do_iter_helper_tramp;
+                }
                 {   /* ag.next()/.throw()/.return(): the body runs on THIS chain, so a loop in it preempts the base
                        flow. Asked here and nowhere else — a bound or proxied `ag.next` re-enters this label after
                        its rewrite, so every spelling reaches the same driver. */
@@ -27459,18 +27470,40 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                DIRECT: helper at call_argv[-2]. FOR-OF: helper at sp[tramp_ith_forof]. ITERNEXT (yield* it.map(f)):
                helper at sp[-4]. The last two stay on the caller stack; only the delivery differs. */
             {
-                uint8_t ith_mode = tramp_ith_mode; int ith_off = tramp_ith_forof;   /* read + reset */
-                tramp_ith_mode = ITH_DIRECT; tramp_ith_forof = 0;
-                JSValueConst hval = (ith_mode == ITH_FOROF)    ? sp[ith_off]
-                                  : (ith_mode == ITH_ITERNEXT) ? sp[-4]
-                                                               : call_argv[-2];
-                JSObject *hp = JS_VALUE_GET_OBJ(hval);
+                /* WHICH delivery this .next() owes is the CONTINUATION the call already carries, never something
+                   a call site remembered to set: `for (x of {next: h.next.bind(h)})` failed the opcode's own
+                   helper recognizer, reached here through the convergence point with the mode register unset, and
+                   drove in DIRECT mode under a for-of continuation. The register is gone with that recognizer. */
+                uint8_t ith_mode = (tramp_cont_kind == CONT_FOROF_NEXT)   ? ITH_FOROF
+                                 : (tramp_cont_kind == CONT_ITER_NEXT_OP) ? ITH_ITERNEXT
+                                                                          : ITH_DIRECT;
+                int ith_off = (ith_mode == ITH_FOROF) ? tramp_cont_forof : 0;
+                /* the receiver is at call_argv[-2] because the ONE question that routes here already required
+                   the method shape — a plain `[f, args]` call has no receiver and cannot be a helper .next(). */
+                DCHECK(JS_VALUE_GET_TAG(call_argv[-2]) == JS_TAG_OBJECT
+                       && JS_VALUE_GET_OBJ(call_argv[-2])->class_id == JS_CLASS_ITERATOR_HELPER
+                       && JS_VALUE_GET_OBJ(call_argv[-2])->u.iterator_helper_data != NULL,
+                       "the iterator-helper drive was entered with a receiver that is not a live helper");
+                JSObject *hp = JS_VALUE_GET_OBJ(call_argv[-2]);
                 JSIteratorHelperData *it = hp->u.iterator_helper_data;
+                DCHECK(ith_mode != ITH_FOROF || ith_off <= -3,
+                       "a for-of helper drive carries no enum_rec offset");
+                tramp_cont_forof = 0; tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;
                 it->executing = 1;
                 it->resume_pc = ITHP_START;
                 it->drive_mode = ith_mode;
-                if (ith_mode == ITH_FOROF) it->forof_off = ith_off;
-                else if (ith_mode == ITH_DIRECT) { it->orig_cargc = call_argc; it->orig_is_tail = tramp_is_tail; }
+                it->forof_off = ith_off;
+                TAKE_CALL_SHAPE();
+                it->orig_cfirst = call_first_r; it->orig_cargc = call_pop;
+                it->orig_is_tail = tramp_is_tail;
+                /* The .next() ARGUMENT is discarded by 27.1.4 (a helper's next takes none), so a reshaped call's
+                   OWNED list has nothing left to hand over and is released here — the same point do_tramp_call
+                   releases its own once the frame has dup'd out of it. Only the caller's STACK operands outlive
+                   this, and the shape above is what drops them. */
+                if (call_args_owned) {
+                    free_arg_list(ctx, call_args_owned, call_args_owned_n);
+                    call_args_owned = NULL; call_args_owned_n = 0;
+                }
                 cont_st = it;
                 ret_val = JS_UNINITIALIZED;
                 goto do_iter_helper_step;
@@ -27571,29 +27604,40 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             DFAIL("do_iter_helper_step: ITH_CONSUME consumer_kind not routed");
                             goto exception;
                         }
-                        if (it->drive_mode == ITH_DIRECT) {
-                            uint8_t itail = it->orig_is_tail;
-                            JSValue *base = sp - it->orig_cargc - 2;   /* the helper operand (call_argv[-2]) */
-                            for (JSValue *p = base; p < sp; p++) JS_FreeValue(ctx, *p);
-                            sp = base;
-                            if (itail) { ret_val = out; goto do_return; }
-                            *sp++ = out;
+                        /* EVERY field this delivery needs is read BEFORE the drop, because the drop can free the
+                           STATE: in DIRECT mode the helper operand is the only reference to it, so `it` is a
+                           dangling pointer the instant its refcount reaches zero (the use-after-free ASan caught).
+                           Every remaining mode arrives through the ONE call entry, so every one drops the operand
+                           shape that call declared before it places its result. */
+                        {
+                            uint8_t hmode = it->drive_mode, htail = it->orig_is_tail;
+                            int hfirst = it->orig_cfirst, hargc = it->orig_cargc, hfof = it->forof_off;
+                            JSValue *hcargv = sp - hargc;
+                            DCHECK(hargc >= hfirst, "helper drive records operands ending below where they start");
+                            for (i = hfirst; i < hargc; i++) JS_FreeValue(ctx, hcargv[i]);
+                            sp += hfirst - hargc;
+                            if (hmode == ITH_DIRECT) {
+                                if (htail) { ret_val = out; goto do_return; }
+                                *sp++ = out;
+                                BREAK;
+                            }
+                            if (hmode == ITH_FOROF) {
+                                /* OP_for_of_next protocol: [value, done] above the restored sp (the enum_rec, and
+                                   the helper in it, stay at sp[forof_off]). The two reads are 7.4.6's, on an
+                                   object the helper BUILT, so they take the shared unpack label like every other
+                                   delivery — with the mode that places the pair for a loop whose enum_rec this
+                                   drive did not close. */
+                                ret_val = out;
+                                forof_unpack_off = hfof;
+                                forof_unpack_mode = FOU_YIELD_STAR;
+                                goto do_forof_unpack;
+                            }
+                            /* OP_iterator_next protocol: the {value,done} object REPLACES the resume argument at
+                               sp[-1] (the helper itself stays at sp[-4]); sp unchanged. */
+                            DCHECK(hmode == ITH_ITERNEXT, "an iterator helper finished in no drive mode");
+                            js_iternext_deliver(ctx, sp, out);
                             BREAK;
                         }
-                        if (it->drive_mode == ITH_FOROF) {
-                            /* OP_for_of_next protocol: unpack {value,done} to sp[0],sp[1]; sp += 2 (helper stays at sp[forof_off]). */
-                            JSValue v = JS_GetProperty(ctx, out, JS_ATOM_value);
-                            JSValue dv = JS_GetProperty(ctx, out, JS_ATOM_done);
-                            JS_FreeValue(ctx, out);
-                            if (JS_IsException(v) || JS_IsException(dv)) { JS_FreeValue(ctx, v); JS_FreeValue(ctx, dv); goto exception; }
-                            sp[0] = v; sp[1] = js_bool(JS_ToBoolFree(ctx, dv)); sp += 2;
-                            BREAK;
-                        }
-                        /* OP_iterator_next protocol: the {value,done} object REPLACES the resume argument at
-                           sp[-1] (the helper itself stays at sp[-4]); sp unchanged. */
-                        DCHECK(it->drive_mode == ITH_ITERNEXT, "an iterator helper finished in no drive mode");
-                        js_iternext_deliver(ctx, sp, out);
-                        BREAK;
                     }
                     /* st == 1: DRIVE the current target's .next() — the SOURCE (it->obj/it->next), or for flatMap
                        iterating an inner iterable, the INNER (it->inner/it->inner_next). Either can be a generator
@@ -30135,9 +30179,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int offset = -3 - pc[0];
                 pc += 1;
                 sf->cur_pc = pc;
-                if (tramp_can_call_iter_helper(sp[offset + 1], sp[offset])) {   /* for-of over a lazy Iterator Helper -> drive on THIS chain */
-                    tramp_ith_mode = ITH_FOROF; tramp_ith_forof = offset; goto do_iter_helper_tramp;
-                }
                 {
                     /* A PLAIN iterator whose .next() is a normal bytecode function — the ordinary
                        `{[Symbol.iterator]() { return { next() {…} } }}` shape. Its body runs on THIS chain so a
@@ -30518,12 +30559,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (wp2->class_id == JS_CLASS_ASYNC_FROM_SYNC_ITERATOR && wp2->u.async_from_sync_iterator_data) {
                         tramp_afs_mode = AFS_DELIVER_ITERNEXT; goto do_async_from_sync_tramp;
                     }
-                }
-                /* a lazy Iterator Helper delegated to (`yield* it.map(f)`): its step machine drives the source
-                   on THIS chain. Reaching js_iterator_helper_next from the JS_Call below was its DFAIL, which is
-                   what the ITH_ITERNEXT drive mode was declared for and never built. */
-                if (tramp_can_call_iter_helper(sp[-3], sp[-4])) {
-                    tramp_ith_mode = ITH_ITERNEXT; goto do_iter_helper_tramp;
                 }
                 /* EVERY other callee. IteratorNext(record, value) FORWARDS its value, so there is no wrapper
                    unwrap here — WrapForValidIterator.next takes no arguments (27.1.4.2.1 step 4), and unwrapping
