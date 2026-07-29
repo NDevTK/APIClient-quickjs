@@ -1488,7 +1488,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_OBJ_GETPROTO, STEPDEF_REFLECT_GETPROTO,
     STEPDEF_OBJ_ISEXT, STEPDEF_REFLECT_ISEXT, STEPDEF_OBJ_PREVEXT, STEPDEF_REFLECT_PREVEXT,
     STEPDEF_OBJ_SETPROTO, STEPDEF_REFLECT_SETPROTO,
-    STEPDEF_JSON_STRINGIFY,
+    STEPDEF_JSON_STRINGIFY, STEPDEF_FOR_IN,
     STEPDEF_COUNT
 };
 #define HINT_NONE    2
@@ -17040,151 +17040,9 @@ static JSValue js_build_mapped_arguments(JSContext *ctx, int argc,
     return JS_EXCEPTION;
 }
 
-static JSValue build_for_in_iterator(JSContext *ctx, JSValue obj)
-{
-    JSObject *p;
-    JSPropertyEnum *tab_atom;
-    int i;
-    JSValue enum_obj, obj1;
-    JSForInIterator *it;
-    uint32_t tag, tab_atom_count;
-
-    tag = JS_VALUE_GET_TAG(obj);
-    if (tag != JS_TAG_OBJECT && tag != JS_TAG_NULL && tag != JS_TAG_UNDEFINED) {
-        obj = JS_ToObjectFree(ctx, obj);
-    }
-
-    it = js_malloc(ctx, sizeof(*it));
-    if (!it) {
-        JS_FreeValue(ctx, obj);
-        return JS_EXCEPTION;
-    }
-    enum_obj = JS_NewObjectProtoClass(ctx, JS_NULL, JS_CLASS_FOR_IN_ITERATOR);
-    if (JS_IsException(enum_obj)) {
-        js_free(ctx, it);
-        JS_FreeValue(ctx, obj);
-        return JS_EXCEPTION;
-    }
-    it->is_array = false;
-    it->obj = obj;
-    it->idx = 0;
-    p = JS_VALUE_GET_OBJ(enum_obj);
-    p->u.for_in_iterator = it;
-
-    if (tag == JS_TAG_NULL || tag == JS_TAG_UNDEFINED)
-        return enum_obj;
-
-    /* FAST PATH: is there anything enumerable in the prototype chain at all? It is a pure optimisation — the
-       slow path below computes the same enumeration — so it must be UNOBSERVABLE, and on an ordinary object it
-       is: a shape walk with no user code in it.
-       An object whose class overrides [[OwnPropertyKeys]] or [[GetOwnProperty]] — a Proxy, a module namespace —
-       breaks that. Probing one calls its `ownKeys` trap and then its `getOwnPropertyDescriptor` trap per key,
-       and when the probe then falls through, the slow path calls both AGAIN: `for (k in Object.create(new
-       Proxy(…)))` fired each trap TWICE where 14.7.5.10 fires it once. Nothing chooses between two
-       implementations here; the probe simply must not run where running it is visible. */
-    obj1 = js_dup(obj);
-    for(;;) {
-        JSObject *pp;
-        obj1 = JS_GetPrototypeFree(ctx, obj1);
-        if (JS_IsNull(obj1))
-            break;
-        if (JS_IsException(obj1))
-            goto fail;
-        pp = JS_VALUE_GET_OBJ(obj1);
-        if (pp->is_exotic) {
-            const JSClassExoticMethods *em = ctx->rt->class_array[pp->class_id].exotic;
-            if (em && (em->get_own_property_names || em->get_own_property)) {
-                JS_FreeValue(ctx, obj1);
-                goto slow_path;
-            }
-        }
-        if (JS_GetOwnPropertyNamesInternal(ctx, &tab_atom, &tab_atom_count,
-                                           JS_VALUE_GET_OBJ(obj1),
-                                           JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY)) {
-            JS_FreeValue(ctx, obj1);
-            goto fail;
-        }
-        js_free_prop_enum(ctx, tab_atom, tab_atom_count);
-        if (tab_atom_count != 0) {
-            JS_FreeValue(ctx, obj1);
-            goto slow_path;
-        }
-        /* must check for timeout to avoid infinite loop */
-        if (js_poll_interrupts(ctx)) {
-            JS_FreeValue(ctx, obj1);
-            goto fail;
-        }
-    }
-
-    p = JS_VALUE_GET_OBJ(obj);
-
-    if (p->fast_array) {
-        JSShape *sh;
-        JSShapeProperty *prs;
-        /* check that there are no enumerable normal fields */
-        sh = p->shape;
-        for(i = 0, prs = get_shape_prop(sh); i < sh->prop_count; i++, prs++) {
-            if (prs->flags & JS_PROP_ENUMERABLE)
-                goto normal_case;
-        }
-        /* for fast arrays, we only store the number of elements */
-        it->is_array = true;
-        it->array_length = p->u.array.count;
-    } else {
-    normal_case:
-        if (JS_GetOwnPropertyNamesInternal(ctx, &tab_atom, &tab_atom_count, p,
-                                   JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY))
-            goto fail;
-        for(i = 0; i < tab_atom_count; i++) {
-            JS_SetPropertyInternal(ctx, enum_obj, tab_atom[i].atom, JS_NULL, 0);
-        }
-        js_free_prop_enum(ctx, tab_atom, tab_atom_count);
-    }
-    return enum_obj;
-
- slow_path:
-    /* non enumerable properties hide the enumerables ones in the
-       prototype chain */
-    obj1 = js_dup(obj);
-    for(;;) {
-        if (JS_GetOwnPropertyNamesInternal(ctx, &tab_atom, &tab_atom_count,
-                                           JS_VALUE_GET_OBJ(obj1),
-                                           JS_GPN_STRING_MASK | JS_GPN_SET_ENUM)) {
-            JS_FreeValue(ctx, obj1);
-            goto fail;
-        }
-        for(i = 0; i < tab_atom_count; i++) {
-            JS_DefinePropertyValue(ctx, enum_obj, tab_atom[i].atom, JS_NULL,
-                                   (tab_atom[i].is_enumerable ?
-                                    JS_PROP_ENUMERABLE : 0));
-        }
-        js_free_prop_enum(ctx, tab_atom, tab_atom_count);
-        obj1 = JS_GetPrototypeFree(ctx, obj1);
-        if (JS_IsNull(obj1))
-            break;
-        if (JS_IsException(obj1))
-            goto fail;
-        /* must check for timeout to avoid infinite loop */
-        if (js_poll_interrupts(ctx)) {
-            JS_FreeValue(ctx, obj1);
-            goto fail;
-        }
-    }
-    return enum_obj;
-
- fail:
-    JS_FreeValue(ctx, enum_obj);
-    return JS_EXCEPTION;
-}
-
-/* obj -> enum_obj */
-static __exception int js_for_in_start(JSContext *ctx, JSValue *sp)
-{
-    sp[-1] = build_for_in_iterator(ctx, sp[-1]);
-    if (JS_IsException(sp[-1]))
-        return -1;
-    return 0;
-}
+/* DELETED: build_for_in_iterator and js_for_in_start. The enumeration is a step machine (STEPDEF_FOR_IN)
+   driven from OP_for_in_start — see js_for_in_step. The C body ran [[GetPrototypeOf]] and the per-link key walk
+   from C, so `for (k in proxy)` reached three of the page's traps with no flow base. */
 
 /* enum_obj -> enum_obj value done */
 static __exception int js_for_in_next(JSContext *ctx, JSValue *sp)
@@ -21294,10 +21152,11 @@ static int js_desc_object_is_enumerable(JSContext *ctx, JSValueConst desc)
    this is one cursor rather than a second copy of that logic. */
 typedef struct JSEnumKeys {
     JSValue obj;               /* the object being walked (owned) */
-    JSPropertyEnum *atoms;     /* the snapshot, filtered in place down to the enumerable string keys */
+    JSPropertyEnum *atoms;     /* the snapshot, compacted in place down to the keys that still EXIST, each
+                                  carrying the `enumerable` its descriptor reported */
     uint32_t len;              /* how many the snapshot holds */
-    uint32_t kept;             /* how many have survived the filter so far */
-    uint32_t i;                /* the filter cursor */
+    uint32_t kept;             /* how many have survived so far */
+    uint32_t i;                /* the walk cursor */
     uint8_t phase;             /* EK_* */
     JSValue cb[1];             /* the request buffer: [the object] */
 } JSEnumKeys;
@@ -21317,7 +21176,12 @@ static void js_enum_keys_free(JSContext *ctx, JSEnumKeys *c)
     c->len = c->kept = c->i = 0;
 }
 
-/* `in` is the previous request's answer (UNDEFINED on entry). Returns 11 / 12 for the next request, 0 when the
+/* The cursor performs the SEQUENCE — [[OwnPropertyKeys]] then one [[GetOwnProperty]] per string key — and
+   reports the FACTS: which keys still exist and whether each is enumerable. It does not apply anyone's rule.
+   EnumerableOwnPropertyNames wants the enumerable ones (js_enum_keys_keep_enumerable); 14.7.5.10's for-in wants
+   ALL of them, because a non-enumerable key SHADOWS an enumerable one deeper in the prototype chain and
+   dropping it would enumerate a hidden property. Filtering here would have made for-in a second walk.
+   `in` is the previous request's answer (UNDEFINED on entry). Returns 11 / 12 for the next request, 0 when the
    snapshot in c->atoms[0..c->kept) is the answer, -1 having thrown. */
 static int js_enum_keys_run(JSContext *ctx, JSEnumKeys *c, JSValue in, JSValue **out_cb, int *out_argc)
 {
@@ -21374,25 +21238,260 @@ static int js_enum_keys_run(JSContext *ctx, JSEnumKeys *c, JSValue in, JSValue *
             int enumerable;
             in = JS_UNDEFINED;
             if (JS_IsException(desc)) return -1;
-            if (JS_IsUndefined(desc)) { c->i++; c->phase = EK_ASK_DESC; continue; }
+            /* undefined = the property is GONE between the snapshot and the read. It is not a key of the object
+               under any consumer's rule, so this is the one drop the cursor itself makes. */
+            if (JS_IsUndefined(desc)) {
+                JS_FreeAtom(ctx, c->atoms[c->i].atom);
+                c->atoms[c->i].atom = JS_ATOM_NULL;
+                c->i++; c->phase = EK_ASK_DESC;
+                continue;
+            }
             enumerable = js_desc_object_is_enumerable(ctx, desc);
             JS_FreeValue(ctx, desc);
             if (enumerable < 0) return -1;
-            if (enumerable) {
-                /* keep it, compacting in place: the survivors are atoms[0..kept). */
-                if (c->kept != c->i) {
-                    c->atoms[c->kept] = c->atoms[c->i];
-                    c->atoms[c->i].atom = JS_ATOM_NULL;
-                }
-                c->kept++;
-            } else {
-                JS_FreeAtom(ctx, c->atoms[c->i].atom);
+            /* keep it, compacting in place: the survivors are atoms[0..kept). */
+            if (c->kept != c->i) {
+                c->atoms[c->kept] = c->atoms[c->i];
                 c->atoms[c->i].atom = JS_ATOM_NULL;
             }
+            c->atoms[c->kept].is_enumerable = (enumerable != 0);
+            c->kept++;
             c->i++;
             c->phase = EK_ASK_DESC;
         }
     }
+}
+
+/* 7.3.23 EnumerableOwnPropertyNames' rule, applied to a COMPLETED cursor: drop the keys whose descriptor said
+   not enumerable. Its consumers hand the surviving allocation on, so the drop compacts in place and shrinks
+   `kept` rather than allocating a second list. */
+static void js_enum_keys_keep_enumerable(JSContext *ctx, JSEnumKeys *c)
+{
+    uint32_t i, kept = 0;
+    DCHECK(c->phase == EK_DONE, "the enumerable-only filter ran on a cursor that has not finished its walk");
+    for (i = 0; i < c->kept; i++) {
+        if (c->atoms[i].is_enumerable) {
+            if (kept != i) { c->atoms[kept] = c->atoms[i]; c->atoms[i].atom = JS_ATOM_NULL; }
+            kept++;
+        } else {
+            JS_FreeAtom(ctx, c->atoms[i].atom);
+            c->atoms[i].atom = JS_ATOM_NULL;
+        }
+    }
+    c->kept = kept;
+}
+
+/* ---- for-in's key collection, 14.7.5.10 EnumerateObjectProperties ----
+
+   build_for_in_iterator ran the whole enumeration from C: [[GetPrototypeOf]] per link (a Proxy's
+   `getPrototypeOf` trap) and [[OwnPropertyKeys]] + one [[GetOwnProperty]] per key per link (its `ownKeys` and
+   `getOwnPropertyDescriptor` traps). A loop in any of them preempted in an activation with no flow base, and
+   `for (k in proxy)` reached ALL THREE that way — the exotic guard added for the prototype PROBE was applied to
+   each link's prototype and never to the receiver itself, so the receiver's own traps were unguarded on both
+   the probe's first hop and the key walk under `normal_case`.
+
+   It is a step machine now, driven from OP_for_in_start. The fast path stays C and gets the guard it was
+   missing: it is a DIFFERENT ALGORITHM, not a fallback, and its whole precondition — the receiver AND every
+   link above it being an ordinary object — is decided without running anything, so the enumeration it computes
+   is observationally a shape walk. Anything failing that precondition is simply not this algorithm and takes
+   the request-driven walk, where each hop is a suspension point and an endless Proxy chain is a parkable flow
+   rather than a hang. */
+
+/* Is this object's [[GetPrototypeOf]], [[OwnPropertyKeys]] and [[GetOwnProperty]] all ordinary? A Proxy is the
+   one class whose [[GetPrototypeOf]] is a trap, and it also carries both key-walk exotics; a class that
+   overrides either of those two can compute keys, which is user code by another name. */
+static bool for_in_is_ordinary(JSContext *ctx, JSObject *p)
+{
+    const JSClassExoticMethods *em;
+    if (p->class_id == JS_CLASS_PROXY)
+        return false;
+    if (!p->is_exotic)
+        return true;
+    em = ctx->rt->class_array[p->class_id].exotic;
+    return !(em && (em->get_own_property_names || em->get_own_property));
+}
+
+typedef struct JSForIn {
+    JSStepHdr hdr;         /* MUST be first — enforced by STEP_STATE_HDR_FIRST below */
+    JSValue enum_obj;      /* the JS_CLASS_FOR_IN_ITERATOR being built (owned) */
+    JSValue cur;           /* the prototype-chain link being walked (owned) */
+    JSValue result;        /* DONE: the iterator (owned) */
+    JSEnumKeys *ek;        /* the current link's key walk (owned) */
+    uint8_t phase;
+} JSForIn;
+enum { FI_LINK = 0, FI_KEYS, FI_PROTO };
+
+/* The fast path, in full: the enumeration is exactly the receiver's own enumerable string keys, which holds
+   when nothing above it contributes any. Returns 1 = `it` is filled and the walk is over, 0 = not this
+   algorithm, -1 = threw. Runs NO user code — that is the precondition, not a hope. */
+static int for_in_fast(JSContext *ctx, JSValueConst obj, JSForInIterator *it, JSValueConst enum_obj)
+{
+    JSPropertyEnum *tab_atom;
+    uint32_t tab_atom_count;
+    JSValue obj1;
+    JSObject *p;
+    int i;
+
+    p = JS_VALUE_GET_OBJ(obj);
+    if (!for_in_is_ordinary(ctx, p))
+        return 0;
+    obj1 = js_dup(obj);
+    for (;;) {
+        JSObject *pp;
+        obj1 = JS_GetPrototypeFree(ctx, obj1);   /* the link it came from is ordinary: no trap */
+        if (JS_IsNull(obj1))
+            break;
+        if (JS_IsException(obj1))
+            return -1;
+        pp = JS_VALUE_GET_OBJ(obj1);
+        if (!for_in_is_ordinary(ctx, pp)) { JS_FreeValue(ctx, obj1); return 0; }
+        if (JS_GetOwnPropertyNamesInternal(ctx, &tab_atom, &tab_atom_count, pp,
+                                           JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY)) {
+            JS_FreeValue(ctx, obj1);
+            return -1;
+        }
+        js_free_prop_enum(ctx, tab_atom, tab_atom_count);
+        if (tab_atom_count != 0) { JS_FreeValue(ctx, obj1); return 0; }   /* something above contributes */
+        /* an ordinary prototype chain cannot be cyclic — JS_SetPrototype rejects that — so this terminates;
+           the interrupt check is the runtime's, not a bound on the enumeration. */
+        if (js_poll_interrupts(ctx)) { JS_FreeValue(ctx, obj1); return -1; }
+    }
+
+    if (p->fast_array) {
+        JSShape *sh = p->shape;
+        JSShapeProperty *prs;
+        bool named = false;
+        for (i = 0, prs = get_shape_prop(sh); i < sh->prop_count; i++, prs++) {
+            if (prs->flags & JS_PROP_ENUMERABLE) { named = true; break; }
+        }
+        if (!named) {
+            /* for a fast array the indices are the enumeration, so only their count is stored */
+            it->is_array = true;
+            it->array_length = p->u.array.count;
+            return 1;
+        }
+    }
+    if (JS_GetOwnPropertyNamesInternal(ctx, &tab_atom, &tab_atom_count, p,
+                                       JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY))
+        return -1;
+    for (i = 0; i < (int)tab_atom_count; i++)
+        JS_SetPropertyInternal(ctx, enum_obj, tab_atom[i].atom, JS_NULL, 0);
+    js_free_prop_enum(ctx, tab_atom, tab_atom_count);
+    return 1;
+}
+
+static int js_for_in_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSForIn *s = st;
+    int r;
+
+    if (s->hdr.stage == 0) {
+        JSValue obj;
+        JSForInIterator *it;
+        JSObject *p;
+        uint32_t tag;
+        s->hdr.stage = 1;
+        JS_FreeValue(ctx, cb_result);
+        cb_result = JS_UNDEFINED;
+        s->enum_obj = JS_UNDEFINED; s->cur = JS_UNDEFINED; s->result = JS_UNDEFINED;
+
+        obj = js_dup(step_arg(&s->hdr, 0));
+        tag = JS_VALUE_GET_TAG(obj);
+        if (tag != JS_TAG_OBJECT && tag != JS_TAG_NULL && tag != JS_TAG_UNDEFINED) {
+            obj = JS_ToObjectFree(ctx, obj);   /* a primitive wrapper: nothing to run */
+            if (JS_IsException(obj)) return -1;
+        }
+        it = js_malloc(ctx, sizeof(*it));
+        if (!it) { JS_FreeValue(ctx, obj); return -1; }
+        s->enum_obj = JS_NewObjectProtoClass(ctx, JS_NULL, JS_CLASS_FOR_IN_ITERATOR);
+        if (JS_IsException(s->enum_obj)) {
+            s->enum_obj = JS_UNDEFINED;
+            js_free(ctx, it);
+            JS_FreeValue(ctx, obj);
+            return -1;
+        }
+        it->is_array = false;
+        it->obj = obj;            /* the iterator owns it from here */
+        it->idx = 0;
+        p = JS_VALUE_GET_OBJ(s->enum_obj);
+        p->u.for_in_iterator = it;
+
+        if (tag == JS_TAG_NULL || tag == JS_TAG_UNDEFINED) {
+            s->result = s->enum_obj; s->enum_obj = JS_UNDEFINED;
+            return 0;
+        }
+        r = for_in_fast(ctx, obj, it, s->enum_obj);
+        if (r < 0) return -1;
+        if (r > 0) {
+            s->result = s->enum_obj; s->enum_obj = JS_UNDEFINED;
+            return 0;
+        }
+        s->cur = js_dup(obj);
+        s->phase = FI_LINK;
+        s->hdr.stage = 2;
+    }
+
+    for (;;) {
+        switch (s->phase) {
+        case FI_LINK:
+            if (JS_IsNull(s->cur)) {
+                JS_FreeValue(ctx, cb_result);
+                s->result = s->enum_obj; s->enum_obj = JS_UNDEFINED;
+                return 0;
+            }
+            /* 14.7.5.10's own-key list for THIS link. Non-enumerable keys are collected too: one of them
+               SHADOWS an enumerable key of the same name further up, so dropping it here would enumerate a
+               property the spec hides. */
+            s->ek = js_mallocz(ctx, sizeof(*s->ek));
+            if (!s->ek) { JS_FreeValue(ctx, cb_result); return -1; }
+            js_enum_keys_init(s->ek);
+            s->ek->obj = js_dup(s->cur);
+            s->phase = FI_KEYS;
+            continue;
+
+        case FI_KEYS: {
+            uint32_t k;
+            r = js_enum_keys_run(ctx, s->ek, cb_result, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r != 0) return r;
+            for (k = 0; k < s->ek->kept; k++) {
+                /* the properties are defined NON-CONFIGURABLE, so the SHALLOWEST definition of a name wins and
+                   every later one silently fails — which is exactly the shadowing rule. */
+                JS_DefinePropertyValue(ctx, s->enum_obj, s->ek->atoms[k].atom, JS_NULL,
+                                       s->ek->atoms[k].is_enumerable ? JS_PROP_ENUMERABLE : 0);
+            }
+            js_enum_keys_free(ctx, s->ek);
+            js_free(ctx, s->ek); s->ek = NULL;
+            /* the next link: [[GetPrototypeOf]], which on a Proxy is its trap. */
+            s->phase = FI_PROTO;
+            s->hdr.cb_coerce[0] = s->cur;   /* borrowed: the machine holds it across the request */
+            *out_cb = s->hdr.cb_coerce; *out_argc = 0;
+            return 18;
+        }
+
+        default:
+            DCHECK(s->phase == FI_PROTO, "the for-in key walk resumed in no phase");
+            JS_FreeValue(ctx, s->cur);
+            s->cur = cb_result;
+            cb_result = JS_UNDEFINED;
+            if (JS_IsException(s->cur)) { s->cur = JS_UNDEFINED; return -1; }
+            s->phase = FI_LINK;
+            continue;
+        }
+    }
+}
+
+static JSValue js_for_in_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSForIn *s = st;
+    JSValue r;
+    if (s->ek) { js_enum_keys_free(ctx, s->ek); js_free(ctx, s->ek); }
+    JS_FreeValue(ctx, s->enum_obj);
+    JS_FreeValue(ctx, s->cur);
+    r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    js_free(ctx, s);
+    return r;
 }
 
 
@@ -21837,6 +21936,8 @@ typedef struct JSJsonStr {
 
 static int js_json_str_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_json_str_fini(JSContext *ctx, void *st, bool take_result);
+static int js_for_in_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_for_in_fini(JSContext *ctx, void *st, bool take_result);
 static int js_json_parse_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_json_parse_vfini(JSContext *ctx, void *st, bool take_result);
 static int js_json_reviver_init(JSContext *ctx, struct JSJsonReviver *s, JSValueConst text_arg, JSValueConst reviver);
@@ -30646,8 +30747,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
         CASE(OP_for_in_start):
             sf->cur_pc = pc;
-            if (js_for_in_start(ctx, sp))
-                goto exception;
+            {
+                /* 14.7.5.10's key collection is a machine, driven straight from here: an opcode has no callee
+                   slot to reach a def through, so it names the def by id. The operand shape is a plain call
+                   with no arguments — first = -1, argc = 0 — which drops sp[-1] and places the iterator in the
+                   same slot, exactly what the compiled stack expects. The source stays on the stack and is
+                   BORROWED; the state dups it. */
+                JSValueConst fi_arg = sp[-1];
+                void *fi_stt = tramp_step_state_new(ctx, tramp_step_def_by_id(STEPDEF_FOR_IN),
+                                                    JS_UNDEFINED, 1, &fi_arg, JS_UNDEFINED);
+                if (unlikely(!fi_stt)) goto exception;
+                ((JSStepHdr *)fi_stt)->orig_cfirst = -1;
+                ((JSStepHdr *)fi_stt)->orig_cargc = 0;
+                ((JSStepHdr *)fi_stt)->orig_is_tail = 0;
+                cont_st = fi_stt;
+                ret_val = JS_UNDEFINED;
+                goto do_step_step;
+            }
             BREAK;
         CASE(OP_for_in_next):
             sf->cur_pc = pc;
@@ -60754,6 +60870,7 @@ static const JSTrampStepDef js_ta_map_def          = { sizeof(JSArrayEvery), js_
 static const JSTrampStepDef js_array_sort_def    = { sizeof(JSArraySort), js_array_sort_vstep, js_array_sort_vfini, 0 };
 static const JSTrampStepDef js_array_toSorted_def = { sizeof(JSArraySort), js_array_sort_vstep, js_array_sort_vfini, 1 };
 static const JSTrampStepDef js_json_parse_def    = { sizeof(JSJsonReviver), js_json_parse_vstep, js_json_parse_vfini, 0 };
+static const JSTrampStepDef js_for_in_def       = { sizeof(JSForIn), js_for_in_step, js_for_in_fini, 0 };
 static const JSTrampStepDef js_json_str_def      = { sizeof(JSJsonStr), js_json_str_step, js_json_str_fini, 0 };
 static const JSTrampStepDef js_ta_slice_def     = { sizeof(JSTASlice), js_ta_slice_step, js_ta_slice_fini, 0 };
 static const JSTrampStepDef js_str_concat_def   = { sizeof(JSStrConcat), js_str_concat_step, js_str_concat_fini, 0 };
@@ -61219,6 +61336,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_ARRAY_SORT]    = &js_array_sort_def,   [STEPDEF_ARRAY_TOSORTED] = &js_array_toSorted_def,
     [STEPDEF_JSON_PARSE]    = &js_json_parse_def,
     [STEPDEF_JSON_STRINGIFY] = &js_json_str_def,
+    [STEPDEF_FOR_IN]         = &js_for_in_def,
     [STEPDEF_TA_SLICE]      = &js_ta_slice_def,
     [STEPDEF_STR_CONCAT]    = &js_str_concat_def,
     [STEPDEF_STR_CTOR]      = &js_str_ctor_def,
@@ -61432,6 +61550,7 @@ STEP_STATE_HDR_FIRST(JSReSplit);
 STEP_STATE_HDR_FIRST(JSReSearch);
 STEP_STATE_HDR_FIRST(JSJsonReviver);
 STEP_STATE_HDR_FIRST(JSJsonStr);
+STEP_STATE_HDR_FIRST(JSForIn);
 STEP_STATE_HDR_FIRST(JSStrCtor);
 STEP_STATE_HDR_FIRST(JSStrConcat);
 STEP_STATE_HDR_FIRST(JSTASlice);
@@ -70104,7 +70223,9 @@ static int js_json_reviver_step(JSContext *ctx, JSJsonReviver *s, JSValue res, J
         int r = js_enum_keys_run(ctx, f->ek, res, &ekcb, &ekargc);
         if (r > 0) { s->ek_cb = ekcb; s->ek_argc = ekargc; return r; }
         if (r < 0) return -1;
-        /* the survivors become the frame's key list; the cursor's allocation is handed over whole. */
+        /* the survivors become the frame's key list; the cursor's allocation is handed over whole. 25.5.1.1
+           step 3.c is EnumerableOwnPropertyNames, so the non-enumerable ones go first. */
+        js_enum_keys_keep_enumerable(ctx, f->ek);
         f->atoms = f->ek->atoms; f->len = f->ek->kept;
         f->ek->atoms = NULL; f->ek->len = 0;
         js_enum_keys_free(ctx, f->ek);
@@ -70781,6 +70902,7 @@ static int js_json_str_walk(JSContext *ctx, JSJsonStr *s, JSValue in, JSValue **
             r = js_enum_keys_run(ctx, f->ek, in, out_cb, out_argc);
             in = JS_UNDEFINED;
             if (r != 0) return r;
+            js_enum_keys_keep_enumerable(ctx, f->ek);   /* 25.5.2.5 step 3 is EnumerableOwnPropertyNames */
             f->keys = js_malloc(ctx, sizeof(JSAtom) * (f->ek->kept ? f->ek->kept : 1));
             if (!f->keys) return -1;
             /* the survivors MOVE to the frame; the cursor keeps its array only to free what it dropped. */
