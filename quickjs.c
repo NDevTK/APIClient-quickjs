@@ -1498,7 +1498,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_JSON_STRINGIFY, STEPDEF_FOR_IN, STEPDEF_IMPORT_OPTS,
     STEPDEF_OBJ_HASOWN, STEPDEF_OBJ_HASOWNPROP,
     STEPDEF_OBJ_LOOKUPGETTER, STEPDEF_OBJ_LOOKUPSETTER,
-    STEPDEF_FUNC_BIND,
+    STEPDEF_FUNC_BIND, STEPDEF_ITER_SET_CTOR, STEPDEF_ITER_SET_TAG,
     STEPDEF_COUNT
 };
 #define HINT_NONE    2
@@ -17888,6 +17888,29 @@ static int step_defidx_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, int64
         if (atom == JS_ATOM_NULL) return -1;
         DCHECK(h->get_atom == JS_ATOM_NULL, "a keyed operation is already in flight on this machine's header");
         h->get_atom = atom;                 /* the conversion already owns it */
+        h->cb_coerce[0] = (JSValue)obj;     /* borrowed: the machine holds both across the define */
+        h->cb_coerce[1] = (JSValue)value;
+        *out_cb = h->cb_coerce; *out_argc = (int)atom;
+        h->get_phase = GET_PH_GOT;
+        return 10;
+    }
+    JS_FreeAtom(ctx, h->get_atom);
+    h->get_atom = JS_ATOM_NULL;
+    h->get_phase = GET_PH_START;
+    JS_FreeValue(ctx, in);                  /* a define delivers no value */
+    return 0;
+}
+
+/* CreateDataPropertyOrThrow(O, key, v) for a NAMED key — the sibling of step_setprop_run, and the same request
+   step_defidx_run issues for an index. On a Proxy it is the `defineProperty` trap.
+     0 = done, 10 = the caller must return that step code. */
+static int step_defprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAtom atom, JSValueConst value,
+                            JSValue in, JSValue **out_cb, int *out_argc)
+{
+    if (h->get_phase == GET_PH_START) {
+        JS_FreeValue(ctx, in);
+        DCHECK(h->get_atom == JS_ATOM_NULL, "a keyed operation is already in flight on this machine's header");
+        h->get_atom = JS_DupAtom(ctx, atom);
         h->cb_coerce[0] = (JSValue)obj;     /* borrowed: the machine holds both across the define */
         h->cb_coerce[1] = (JSValue)value;
         *out_cb = h->cb_coerce; *out_argc = (int)atom;
@@ -55933,6 +55956,7 @@ static int JS_InstantiateFunctionListItem(JSContext *ctx, JSValueConst obj,
         return 0;
     case JS_DEF_CGETSET: /* XXX: use autoinit again ? */
     case JS_DEF_CGETSET_MAGIC:
+    case JS_DEF_CGETSET_STEP:
         {
             JSValue getter, setter;
             char buf[64];
@@ -55945,7 +55969,12 @@ static int JS_InstantiateFunctionListItem(JSContext *ctx, JSValueConst obj,
                                           e->magic);
             }
             setter = JS_UNDEFINED;
-            if (e->u.getset.set.generic) {
+            if (e->def_type == JS_DEF_CGETSET_STEP) {
+                /* the setter IS a step machine, named by the entry's magic — the same declaration
+                   JS_CFUNC_STEP_DEF carries, on the half of an accessor the page hands a value to. */
+                snprintf(buf, sizeof(buf), "set %s", e->name);
+                setter = JS_NewCFunctionMagic(ctx, NULL, buf, 1, JS_CFUNC_step, e->magic);
+            } else if (e->u.getset.set.generic) {
                 snprintf(buf, sizeof(buf), "set %s", e->name);
                 setter = JS_NewCFunction2(ctx, e->u.getset.set.generic,
                                           buf, 1, e->def_type == JS_DEF_CGETSET_MAGIC ? JS_CFUNC_setter_magic : JS_CFUNC_setter,
@@ -62197,11 +62226,84 @@ static const JSTrampStepDef js_array_sort_def    = { sizeof(JSArraySort), js_arr
 static const JSTrampStepDef js_array_toSorted_def = { sizeof(JSArraySort), js_array_sort_vstep, js_array_sort_vfini, 1 };
 static const JSTrampStepDef js_json_parse_def    = { sizeof(JSJsonReviver), js_json_parse_vstep, js_json_parse_vfini, 0 };
 static const JSTrampStepDef js_for_in_def       = { sizeof(JSForIn), js_for_in_step, js_for_in_fini, 0 };
+static int check_iterator(JSContext *ctx, JSValueConst obj);
+
+/* 27.1.4.2 SetterThatIgnoresPrototypeProperties(this, home, p, v), which %Iterator.prototype% uses for BOTH of
+   its writable-looking accessors — `constructor` and @@toStringTag. Steps 3-5 are the page's: this
+   .[[GetOwnProperty]](p), then either CreateDataPropertyOrThrow or Set(this, p, v, true) — a trap apiece on a
+   Proxy receiver, and an inherited setter otherwise. TWO C bodies ran all of it, both through JS_GetOwnProperty,
+   which is what kept that public entry alive.
+   ONE machine, because the two differ only in p — and p IS the arg, so the difference is a spec operand rather
+   than a second implementation. `home` is %Iterator.prototype% for both. */
+typedef struct JSIterSetter {
+    JSStepHdr hdr;    /* MUST be first. arg = the property key */
+    JSValue result;   /* DONE (owned) */
+} JSIterSetter;
+enum { ITS_OWN = 1, ITS_OWN_GOT, ITS_SET, ITS_DEFINE };
+
+static int js_iter_setter_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSIterSetter *s = st;
+    JSAtom key = (JSAtom)s->hdr.arg;
+    int r;
+
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result);
+        cb_result = JS_UNDEFINED;
+        s->result = JS_UNDEFINED;
+        if (check_iterator(ctx, s->hdr.this_val) < 0)                          /* step 1 */
+            return -1;
+        if (js_same_value(ctx, s->hdr.this_val, ctx->class_proto[JS_CLASS_ITERATOR])) {
+            JS_ThrowTypeError(ctx, "Cannot assign to read only property");     /* step 2 */
+            return -1;
+        }
+        s->hdr.stage = ITS_OWN;
+    }
+    if (s->hdr.stage == ITS_OWN) {
+        /* step 3: this.[[GetOwnProperty]](p). Only whether it EXISTS is wanted, so the ordinary
+           descriptor-object answer says it — undefined means absent. */
+        JS_FreeValue(ctx, cb_result);
+        s->hdr.stage = ITS_OWN_GOT;
+        s->hdr.cb_coerce[0] = s->hdr.this_val;   /* borrowed: the machine holds the receiver across the request */
+        *out_cb = s->hdr.cb_coerce; *out_argc = (int)key;
+        return 12;
+    }
+    if (s->hdr.stage == ITS_OWN_GOT) {
+        bool own;
+        if (JS_IsException(cb_result))
+            return -1;
+        own = !JS_IsUndefined(cb_result);
+        JS_FreeValue(ctx, cb_result);
+        cb_result = JS_UNDEFINED;
+        s->hdr.stage = own ? ITS_SET : ITS_DEFINE;
+    }
+    if (s->hdr.stage == ITS_SET) {
+        r = step_setprop_run(ctx, &s->hdr, s->hdr.this_val, key,               /* step 5 */
+                             step_arg(&s->hdr, 0), cb_result, out_cb, out_argc);
+        return r != 0 ? r : 0;
+    }
+    DCHECK(s->hdr.stage == ITS_DEFINE, "the %Iterator.prototype% setter's machine resumed in no stage");
+    r = step_defprop_run(ctx, &s->hdr, s->hdr.this_val, key,                   /* step 4 */
+                         step_arg(&s->hdr, 0), cb_result, out_cb, out_argc);
+    return r != 0 ? r : 0;
+}
+
+static JSValue js_iter_setter_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSIterSetter *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    js_free(ctx, s);
+    return r;
+}
+
 static const JSTrampStepDef js_hasown_def      = { sizeof(JSHasOwn), js_hasown_step, js_hasown_fini, HASOWN_STATIC };
 static const JSTrampStepDef js_hasownprop_def  = { sizeof(JSHasOwn), js_hasown_step, js_hasown_fini, 0 };
 static const JSTrampStepDef js_lookupgetter_def = { sizeof(JSLookupAcc), js_lookup_acc_step, js_lookup_acc_fini, 0 };
 static const JSTrampStepDef js_lookupsetter_def = { sizeof(JSLookupAcc), js_lookup_acc_step, js_lookup_acc_fini, 1 };
 static const JSTrampStepDef js_func_bind_def   = { sizeof(JSFuncBind), js_func_bind_step, js_func_bind_fini, 0 };
+static const JSTrampStepDef js_iter_set_ctor_def = { sizeof(JSIterSetter), js_iter_setter_step, js_iter_setter_fini, JS_ATOM_constructor };
+static const JSTrampStepDef js_iter_set_tag_def  = { sizeof(JSIterSetter), js_iter_setter_step, js_iter_setter_fini, JS_ATOM_Symbol_toStringTag };
 static const JSTrampStepDef js_import_opts_def  = {
     sizeof(JSImportOpts), js_import_opts_step, js_import_opts_fini, 0,
     /* body, body_proto, body_magic, precheck, midcheck, onerror */ {NULL}, 0, 0, NULL, NULL, NULL,
@@ -62678,6 +62780,8 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_OBJ_LOOKUPGETTER] = &js_lookupgetter_def,
     [STEPDEF_OBJ_LOOKUPSETTER] = &js_lookupsetter_def,
     [STEPDEF_FUNC_BIND]      = &js_func_bind_def,
+    [STEPDEF_ITER_SET_CTOR]  = &js_iter_set_ctor_def,
+    [STEPDEF_ITER_SET_TAG]   = &js_iter_set_tag_def,
     [STEPDEF_IMPORT_OPTS]    = &js_import_opts_def,
     [STEPDEF_TA_SLICE]      = &js_ta_slice_def,
     [STEPDEF_STR_CONCAT]    = &js_str_concat_def,
@@ -62896,6 +63000,7 @@ STEP_STATE_HDR_FIRST(JSForIn);
 STEP_STATE_HDR_FIRST(JSHasOwn);
 STEP_STATE_HDR_FIRST(JSLookupAcc);
 STEP_STATE_HDR_FIRST(JSFuncBind);
+STEP_STATE_HDR_FIRST(JSIterSetter);
 STEP_STATE_HDR_FIRST(JSImportOpts);
 STEP_STATE_HDR_FIRST(JSStrCtor);
 STEP_STATE_HDR_FIRST(JSStrConcat);
@@ -64815,38 +64920,16 @@ static const JSCFunctionListEntry js_iterator_wrap_proto_funcs[] = {
     JS_CFUNC_STEP_DEF("return", 0, STEPDEF_ITER_WRAP_RETURN ),
 };
 
-static int check_iterator(JSContext *ctx, JSValueConst obj);
 
-static JSValue js_iterator_constructor_getset(JSContext *ctx,
-                                              JSValueConst this_val,
-                                              int argc, JSValueConst *argv,
-                                              int magic,
-                                              JSValueConst *func_data)
+/* Iterator.prototype.constructor's GETTER, which returns %Iterator% out of its closure data. Its setter used to
+   share this function under a magic flag; that setter was SetterThatIgnoresPrototypeProperties, which is a step
+   machine now (STEPDEF_ITER_SET_CTOR) and shares its implementation with @@toStringTag's instead. */
+static JSValue js_iterator_constructor_get(JSContext *ctx,
+                                           JSValueConst this_val,
+                                           int argc, JSValueConst *argv,
+                                           int magic,
+                                           JSValueConst *func_data)
 {
-    int ret;
-
-    if (magic) { // setter (the getter is registered with magic == 0)
-        // SetterThatIgnoresPrototypeProperties(%Iterator.prototype%, "constructor", v)
-        // argv[0] is the assigned value; it defaults to undefined because the
-        // setter is registered with length 1 (see JS_AddIntrinsicBaseObjects).
-        if (check_iterator(ctx, this_val) < 0)
-            return JS_EXCEPTION;
-        if (js_same_value(ctx, this_val, ctx->class_proto[JS_CLASS_ITERATOR]))
-            return JS_ThrowTypeError(ctx, "Cannot assign to read only property");
-        ret = JS_GetOwnProperty(ctx, NULL, this_val, JS_ATOM_constructor);
-        if (ret < 0)
-            return JS_EXCEPTION;
-        if (ret) {
-            if (JS_SetProperty(ctx, this_val, JS_ATOM_constructor, js_dup(argv[0])) < 0)
-                return JS_EXCEPTION;
-        } else {
-            if (JS_DefinePropertyValue(ctx, this_val, JS_ATOM_constructor,
-                                       js_dup(argv[0]),
-                                       JS_PROP_C_W_E | JS_PROP_THROW) < 0)
-                return JS_EXCEPTION;
-        }
-        return JS_UNDEFINED;
-    }
     return js_dup(func_data[0]);
 }
 
@@ -65263,27 +65346,6 @@ static JSValue js_iterator_proto_iterator(JSContext *ctx, JSValueConst this_val,
 static JSValue js_iterator_proto_get_toStringTag(JSContext *ctx, JSValueConst this_val)
 {
     return JS_AtomToString(ctx, JS_ATOM_Iterator);
-}
-
-static JSValue js_iterator_proto_set_toStringTag(JSContext *ctx, JSValueConst this_val, JSValueConst val)
-{
-    int res;
-
-    if (check_iterator(ctx, this_val) < 0)
-        return JS_EXCEPTION;
-    if (js_same_value(ctx, this_val, ctx->class_proto[JS_CLASS_ITERATOR]))
-        return JS_ThrowTypeError(ctx, "Cannot assign to read only property");
-    res = JS_GetOwnProperty(ctx, NULL, this_val, JS_ATOM_Symbol_toStringTag);
-    if (res < 0)
-        return JS_EXCEPTION;
-    if (res) {
-        if (JS_SetProperty(ctx, this_val, JS_ATOM_Symbol_toStringTag, js_dup(val)) < 0)
-            return JS_EXCEPTION;
-    } else {
-        if (JS_DefinePropertyValueConst(ctx, this_val, JS_ATOM_Symbol_toStringTag, val, JS_PROP_C_W_E | JS_PROP_THROW) < 0)
-            return JS_EXCEPTION;
-    }
-    return JS_UNDEFINED;
 }
 
 /* Iterator.prototype.{drop,take,map,filter,flatMap}: create the helper object over `this` (the source iterator).
@@ -65879,7 +65941,7 @@ static const JSCFunctionListEntry js_iterator_proto_funcs[] = {
     JS_CFUNC_CONSUME_DEF("find", 1, ITERCONS_ITERTERM_BASE + ITERTERM_FIND ),
     JS_CFUNC_DEF("[Symbol.dispose]", 0, js_iterator_proto_dispose ),
     JS_CFUNC_DEF("[Symbol.iterator]", 0, js_iterator_proto_iterator ),
-    JS_CGETSET_DEF("[Symbol.toStringTag]", js_iterator_proto_get_toStringTag, js_iterator_proto_set_toStringTag),
+    JS_CGETSET_STEP_DEF("[Symbol.toStringTag]", js_iterator_proto_get_toStringTag, STEPDEF_ITER_SET_TAG),
 };
 
 static const JSCFunctionListEntry js_iterator_helper_proto_funcs[] = {
@@ -79439,14 +79501,15 @@ int JS_AddIntrinsicBaseObjects(JSContext *ctx)
     // an accessor
     {
         JSValue getter, setter;
-        getter = JS_NewCFunctionData(ctx, js_iterator_constructor_getset,
+        getter = JS_NewCFunctionData(ctx, js_iterator_constructor_get,
                                      0, 0, 1, vc(&obj2));
         if (JS_IsException(getter)) {
             JS_FreeValue(ctx, obj2);
             return -1;
         }
-        setter = JS_NewCFunctionData(ctx, js_iterator_constructor_getset,
-                                     1, 1, 1, vc(&obj2));
+        /* the setter needs no closure data — SetterThatIgnoresPrototypeProperties reads its `home` from the
+           realm — so it is an ordinary step C function, the same declaration @@toStringTag's setter carries. */
+        setter = JS_NewCFunctionMagic(ctx, NULL, "", 1, JS_CFUNC_step, STEPDEF_ITER_SET_CTOR);
         if (JS_IsException(setter)) {
             JS_FreeValue(ctx, getter);
             JS_FreeValue(ctx, obj2);

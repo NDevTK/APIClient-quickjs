@@ -1551,6 +1551,7 @@ typedef struct JSCFunctionListEntry {
 #define JS_DEF_ALIAS          9
 #define JS_DEF_PROP_SYMBOL   10
 #define JS_DEF_PROP_BOOL     11
+#define JS_DEF_CGETSET_STEP  12
 
 /* Note: c++ does not like nested designators */
 #define JS_CFUNC_DEF(name, length, func1) { name, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE, JS_DEF_CFUNC, 0, { .func = { length, JS_CFUNC_generic, { .generic = func1 } } } }
@@ -1568,6 +1569,11 @@ typedef struct JSCFunctionListEntry {
 #define JS_ITERATOR_NEXT_DEF(name, length, func1, magic) { name, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE, JS_DEF_CFUNC, magic, { .func = { length, JS_CFUNC_iterator_next, { .iterator_next = func1 } } } }
 #define JS_CGETSET_DEF(name, fgetter, fsetter) { name, JS_PROP_CONFIGURABLE, JS_DEF_CGETSET, 0, { .getset = { .get = { .getter = fgetter }, .set = { .setter = fsetter } } } }
 #define JS_CGETSET_DEF2(name, fgetter, fsetter, prop_flags) { name, prop_flags, JS_DEF_CGETSET, 0, { .getset = { .get = { .getter = fgetter }, .set = { .setter = fsetter } } } }
+/* An ACCESSOR whose SETTER is a step machine. A setter is as much the page's entry point as a method is — the
+   value it is handed is the page's, and what it does with it (a [[GetOwnProperty]], a Set, a define) is the
+   page's code the moment the receiver is a Proxy. The getter stays an ordinary C function; `stepid` names the
+   machine the setter runs, exactly as JS_CFUNC_STEP_DEF does. */
+#define JS_CGETSET_STEP_DEF(name, fgetter, stepid) { name, JS_PROP_CONFIGURABLE, JS_DEF_CGETSET_STEP, stepid, { .getset = { .get = { .getter = fgetter }, .set = { .setter = NULL } } } }
 #define JS_CGETSET_MAGIC_DEF(name, fgetter, fsetter, magic) { name, JS_PROP_CONFIGURABLE, JS_DEF_CGETSET_MAGIC, magic, { .getset = { .get = { .getter_magic = fgetter }, .set = { .setter_magic = fsetter } } } }
 #define JS_PROP_STRING_DEF(name, cstr, prop_flags) { name, prop_flags, JS_DEF_PROP_STRING, 0, { .str = cstr } }
 #define JS_PROP_INT32_DEF(name, val, prop_flags) { name, prop_flags, JS_DEF_PROP_INT32, 0, { .i32 = val } }
