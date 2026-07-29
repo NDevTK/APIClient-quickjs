@@ -473,6 +473,64 @@ static void enumerate_tests(const char *path)
           namelist_cmp_indirect);
 }
 
+/* A DIAGNOSTIC string for a value, built WITHOUT invoking the page's `toString`. JS_ToCString does invoke it,
+   and at a C entry there is no flow to run it on — which since the coercion methods became step machines is the
+   state the engine's backstop names ("invoked outside the interpreter's dispatch; there is no second driver").
+   It is right to name it: a HOST that wants the page's code run has to run it FROM JS, and a test runner
+   reporting what went wrong must not depend on the code that went wrong. An object is its `name`/`message`
+   properties, falling back to its CONSTRUCTOR's name — test262's own Test262Error carries only `message` and a
+   custom `toString`, which is exactly the page code this must not run — and anything else is its class. The
+   result is malloc'd when *powned is set and a JS C-string otherwise, which is the only reason the caller has to
+   know which. */
+static const char *js_diag_cstring(JSContext *ctx, JSValueConst v, char **powned)
+{
+    JSValue n, m, t;
+    const char *ns, *ms, *r;
+    size_t need;
+
+    *powned = NULL;
+    if (!JS_IsObject(v))
+        return JS_ToCString(ctx, v);   /* a primitive's conversion invokes nothing */
+
+    n = JS_GetPropertyStr(ctx, v, "name");
+    if (!JS_IsString(n)) {
+        JSValue c = JS_GetPropertyStr(ctx, v, "constructor");
+        JS_FreeValue(ctx, n);
+        n = JS_IsObject(c) ? JS_GetPropertyStr(ctx, c, "name") : JS_UNDEFINED;
+        JS_FreeValue(ctx, c);
+    }
+    m = JS_GetPropertyStr(ctx, v, "message");
+    ns = JS_IsString(n) ? JS_ToCString(ctx, n) : NULL;
+    ms = JS_IsString(m) ? JS_ToCString(ctx, m) : NULL;
+    JS_FreeValue(ctx, n);
+    JS_FreeValue(ctx, m);
+    if (ns) {
+        need = strlen(ns) + (ms ? strlen(ms) + 2 : 0) + 1;
+        *powned = malloc(need);
+        if (*powned) {
+            if (ms && *ms) snprintf(*powned, need, "%s: %s", ns, ms);
+            else           snprintf(*powned, need, "%s", ns);
+        }
+    }
+    if (ns) JS_FreeCString(ctx, ns);
+    if (ms) JS_FreeCString(ctx, ms);
+    if (*powned)
+        return *powned;
+    JS_FreeValue(ctx, JS_GetException(ctx));
+    t = JS_ToObjectString(ctx, v);   /* "[object Class]": a class read, no user code */
+    if (JS_IsException(t))
+        return NULL;
+    r = JS_ToCString(ctx, t);
+    JS_FreeValue(ctx, t);
+    return r;
+}
+
+static void js_diag_free(JSContext *ctx, const char *s, char *owned)
+{
+    if (owned) free(owned);
+    else if (s) JS_FreeCString(ctx, s);
+}
+
 static JSValue js_print_262(JSContext *ctx, JSValueConst this_val,
                             int argc, JSValueConst *argv)
 {
@@ -482,15 +540,9 @@ static JSValue js_print_262(JSContext *ctx, JSValueConst this_val,
     int i;
 
     for (i = 0; i < argc; i++) {
+        char *owned = NULL;
         v = argv[i];
-        s = JS_ToCString(ctx, v);
-        // same logic as js_print in quickjs-libc.c
-        if (local && !s && JS_IsObject(v)) {
-            JS_FreeValue(ctx, JS_GetException(ctx));
-            JSValue t = JS_ToObjectString(ctx, v);
-            s = JS_ToCString(ctx, t);
-            JS_FreeValue(ctx, t);
-        }
+        s = js_diag_cstring(ctx, v, &owned);
         if (!s)
             return JS_EXCEPTION;
         if (!strcmp(s, "Test262:AsyncTestComplete")) {
@@ -505,7 +557,7 @@ static JSValue js_print_262(JSContext *ctx, JSValueConst this_val,
         }
         if (verbose > 1)
             printf("%s%s", &" "[i < 1], s);
-        JS_FreeCString(ctx, s);
+        js_diag_free(ctx, s, owned);
         if (verbose > 2 && JS_IsError(v)) {
             JSValue stack = JS_GetPropertyStr(ctx, v, "stack");
             s = JS_ToCString(ctx, stack);
@@ -1516,18 +1568,21 @@ static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,
         if (is_negative) {
             ret = 0;
             if (error_type) {
-                char *error_class;
-                const char *msg;
+                char *cls_owned = NULL;
+                const char *cls;
 
-                msg = JS_ToCString(ctx, exception_val);
-                if (msg == NULL) {
+                /* the expected class IS the error's name. Taking it from a ToString of the whole exception and
+                   then cutting at the first ':' meant invoking the page's `toString` from a C entry — the state
+                   the engine's step-builtin backstop names, and a needless one: the property is the answer. */
+                cls = js_diag_cstring(ctx, exception_val, &cls_owned);
+                if (cls == NULL) {
                     ret = -1;
                 } else {
-                    error_class = strdup_len(msg, strcspn(msg, ":"));
+                    char *error_class = strdup_len(cls, strcspn(cls, ":"));
                     if (!str_equal(error_class, error_type))
                         ret = -1;
                     free(error_class);
-                    JS_FreeCString(ctx, msg);
+                    js_diag_free(ctx, cls, cls_owned);
                 }
             }
         } else {
@@ -1542,6 +1597,7 @@ static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,
 
     if (verbose && is_test) {
         JSValue msg_val = JS_UNDEFINED;
+        char *msg_owned = NULL;
         const char *msg = NULL;
         int s_line;
         char *s = find_error(filename, &s_line, eval_flags & JS_EVAL_FLAG_STRICT);
@@ -1549,8 +1605,7 @@ static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,
         bool is_unexpected_error = true;
 
         if (!JS_IsUndefined(exception_val)) {
-            msg_val = JS_ToString(ctx, exception_val);
-            msg = JS_ToCString(ctx, msg_val);
+            msg = js_diag_cstring(ctx, exception_val, &msg_owned);
         }
         if (is_negative) {  // expect error
             if (ret == 0) {
@@ -1620,7 +1675,7 @@ static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,
             }
         }
         JS_FreeValue(ctx, msg_val);
-        JS_FreeCString(ctx, msg);
+        js_diag_free(ctx, msg, msg_owned);
         free(s);
     }
 

@@ -1532,7 +1532,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_ATOMICS_XOR, STEPDEF_ATOMICS_EXCHANGE, STEPDEF_ATOMICS_CMPXCHG, STEPDEF_ATOMICS_LOAD,
     STEPDEF_ATOMICS_STORE, STEPDEF_ATOMICS_ISLOCKFREE, STEPDEF_ATOMICS_WAIT, STEPDEF_ATOMICS_NOTIFY,
     STEPDEF_PROMISE_THEN,
-    STEPDEF_SYMBOL_CTOR,
+    STEPDEF_SYMBOL_CTOR, STEPDEF_ERROR_TOSTRING,
     STEPDEF_MAP_UPSERT, STEPDEF_MAP_UPSERT_COMPUTED,
     STEPDEF_WEAKMAP_UPSERT, STEPDEF_WEAKMAP_UPSERT_COMPUTED,
     STEPDEF_COUNT
@@ -22131,6 +22131,13 @@ enum { STRRECV_TRIM_START = 1, STRRECV_TRIM_END = 2, STRRECV_TRIM_BOTH = 3,
        STRRECV_CHARAT, STRRECV_CHARCODEAT,
        STRRECV_SLICE, STRRECV_SUBSTR, STRRECV_REPEAT,
        STRRECV_PADSTART, STRRECV_PADEND, STRRECV_LOCALECOMPARE };
+typedef struct JSErrToString {
+    JSStepHdr hdr;        /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    JSValue result;       /* DONE (owned) */
+    JSValue name;         /* step 4's answer, held across the `message` read (owned) */
+    JSValue raw;          /* a property held between its read and its ToString (owned) */
+} JSErrToString;
+
 typedef struct JSStrRecv {
     JSStepHdr hdr;
     JSValue str;          /* the receiver as a string (owned) */
@@ -59449,6 +59456,23 @@ static JSValue js_func_bind_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
+/* the function's OWN `name` data property, with no prototype walk, no accessor and no trap. An AUTOINIT slot is
+   instantiated first — that is engine code (the property list's own initialiser) and invokes nothing. */
+static JSValue js_function_own_name(JSContext *ctx, JSValueConst func)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(func);
+    JSProperty *pr;
+    JSShapeProperty *prs = find_own_property(&pr, p, JS_ATOM_name);
+    if (prs && (prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT) {
+        if (JS_AutoInitProperty(ctx, p, JS_ATOM_name, pr, prs))
+            return JS_EXCEPTION;
+        prs = find_own_property(&pr, p, JS_ATOM_name);
+    }
+    if (prs && (prs->flags & JS_PROP_TMASK) == 0 && JS_VALUE_GET_TAG(pr->u.value) == JS_TAG_STRING)
+        return js_dup(pr->u.value);
+    return js_empty_string(ctx->rt);
+}
+
 static JSValue js_function_toString(JSContext *ctx, JSValueConst this_val,
                                     int argc, JSValueConst *argv)
 {
@@ -59485,9 +59509,14 @@ static JSValue js_function_toString(JSContext *ctx, JSValueConst this_val,
             break;
         }
         suff = "() {\n    [native code]\n}";
-        name = JS_GetProperty(ctx, this_val, JS_ATOM_name);
-        if (JS_IsUndefined(name))
-            name = js_empty_string(ctx->rt);
+        /* 20.2.3.5 step 5: for a function with no [[SourceText]] the representation is IMPLEMENTATION-DEFINED,
+           required only to conform to the NativeFunction production — so the name in it is this engine's choice,
+           and reading it with JS_GetProperty made that choice the page's code. A Proxy's `get` trap ran from a C
+           activation with no flow base, and an accessor `name` anywhere on the chain did the same. The OWN data
+           property is the same string for every function that reaches here (a C builtin, a bound function, a
+           class) and reading it invokes nothing, so the read is not routed — it is REMOVED. A Proxy has no own
+           `name` slot and gets the empty one, which is what other engines produce for it. */
+        name = js_function_own_name(ctx, this_val);
         return JS_ConcatString3(ctx, pref, name, suff);
     }
 }
@@ -59888,33 +59917,76 @@ static JSValue js_error_ctor_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
-static JSValue js_error_toString(JSContext *ctx, JSValueConst this_val,
-                                 int argc, JSValueConst *argv)
+/* 20.5.3.4, one operation at a time. The two READS and the two ToStrings are the page's code; the stage says
+   which of the four an answer belongs to, and `raw` holds a property between its read and its coercion because
+   that coercion suspends. */
+enum { ETS_NAME_GET = 0, ETS_NAME_STR, ETS_MSG_GET, ETS_MSG_STR };
+
+static int js_error_tostring_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    JSValue name, msg;
+    JSErrToString *s = st;
+    JSValue msg;
+    int r;
 
-    if (!JS_IsObject(this_val))
-        return JS_ThrowTypeErrorNotAnObject(ctx);
-    name = JS_GetProperty(ctx, this_val, JS_ATOM_name);
-    if (JS_IsUndefined(name))
-        name = JS_AtomToString(ctx, JS_ATOM_Error);
-    else
-        name = JS_ToStringFree(ctx, name);
-    if (JS_IsException(name))
-        return JS_EXCEPTION;
-
-    msg = JS_GetProperty(ctx, this_val, JS_ATOM_message);
-    if (JS_IsUndefined(msg))
-        msg = js_empty_string(ctx->rt);
-    else
-        msg = JS_ToStringFree(ctx, msg);
-    if (JS_IsException(msg)) {
-        JS_FreeValue(ctx, name);
-        return JS_EXCEPTION;
+    if (s->hdr.stage == ETS_NAME_GET) {
+        if (s->hdr.get_phase == GET_PH_START) {
+            s->result = JS_UNDEFINED; s->name = JS_UNDEFINED; s->raw = JS_UNDEFINED;
+            if (!JS_IsObject(s->hdr.this_val)) {
+                JS_FreeValue(ctx, cb_result);
+                JS_ThrowTypeErrorNotAnObject(ctx);
+                return -1;
+            }
+        }
+        r = step_getprop_run(ctx, &s->hdr, s->hdr.this_val, JS_ATOM_name, cb_result, &s->raw, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = ETS_NAME_STR;
     }
-    if (!JS_IsEmptyString(name) && !JS_IsEmptyString(msg))
-        name = JS_ConcatString3(ctx, "", name, ": ");
-    return JS_ConcatString(ctx, name, msg);
+    if (s->hdr.stage == ETS_NAME_STR) {
+        /* step 4: an ABSENT name is "Error" and coerces nothing */
+        if (JS_IsUndefined(s->raw)) {
+            s->name = JS_AtomToString(ctx, JS_ATOM_Error);
+            if (JS_IsException(s->name)) { s->name = JS_UNDEFINED; return -1; }
+        } else {
+            r = step_tostring_run(ctx, &s->hdr, s->raw, cb_result, &s->name, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            JS_FreeValue(ctx, s->raw); s->raw = JS_UNDEFINED;
+        }
+        s->hdr.stage = ETS_MSG_GET;
+    }
+    if (s->hdr.stage == ETS_MSG_GET) {
+        r = step_getprop_run(ctx, &s->hdr, s->hdr.this_val, JS_ATOM_message, cb_result, &s->raw, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = ETS_MSG_STR;
+    }
+    DCHECK(s->hdr.stage == ETS_MSG_STR, "the Error toString resumed in no stage");
+    if (JS_IsUndefined(s->raw)) {
+        msg = js_empty_string(ctx->rt);
+        if (JS_IsException(msg)) return -1;
+    } else {
+        r = step_tostring_run(ctx, &s->hdr, s->raw, cb_result, &msg, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        JS_FreeValue(ctx, s->raw); s->raw = JS_UNDEFINED;
+    }
+    /* steps 7-9: two tests and a concatenation, none of it the page's */
+    if (!JS_IsEmptyString(s->name) && !JS_IsEmptyString(msg))
+        s->name = JS_ConcatString3(ctx, "", s->name, ": ");
+    s->result = JS_ConcatString(ctx, s->name, msg);
+    s->name = JS_UNDEFINED;   /* both consumed by the concatenations */
+    return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
+}
+
+static JSValue js_error_tostring_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSErrToString *s = st;
+    JSValue r = take_result ? s->result : (JS_FreeValue(ctx, s->result), JS_UNDEFINED);
+    JS_FreeValue(ctx, s->name);
+    JS_FreeValue(ctx, s->raw);
+    js_free_rt(ctx->rt, s);
+    return r;
 }
 
 static JSValue js_error_get_stack(JSContext *ctx, JSValueConst this_val)
@@ -59957,7 +60029,7 @@ static JSValue js_error_set_stack(JSContext *ctx, JSValueConst this_val,
 }
 
 static const JSCFunctionListEntry js_error_proto_funcs[] = {
-    JS_CFUNC_DEF("toString", 0, js_error_toString ),
+    JS_CFUNC_STEP_DEF("toString", 0, STEPDEF_ERROR_TOSTRING ),
     JS_PROP_STRING_DEF("name", "Error", JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE ),
     JS_PROP_STRING_DEF("message", "", JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE ),
     JS_CGETSET_DEF("stack", js_error_get_stack, js_error_set_stack ),
@@ -63460,6 +63532,15 @@ static int js_symbol_ctor_precheck(JSContext *ctx, JSStepHdr *h);
    invokes nothing — the coerce-then-compute declaration, with the NewTarget test as the leading validation
    because it must throw BEFORE the description's toString runs. js_symbol_constructor ran that ToString from
    its C entry, so `Symbol({toString(){for(;;){}}})` preempted with no flow base. */
+/* 20.5.3.4 Error.prototype.toString. Steps 3 and 5 are `? Get(O, "name")` and `? Get(O, "message")` and steps 4
+   and 6 are `? ToString` of each — four of the page's operations, and js_error_toString ran all four with
+   JS_GetProperty / JS_ToStringFree from its C entry, so
+   `Error.prototype.toString.call(new Proxy({}, {get(){for(;;){}}}))` aborted with no flow base. Everything after
+   them (the empty tests and the two concatenations) invokes nothing. */
+static int js_error_tostring_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_error_tostring_fini(JSContext *ctx, void *st, bool take_result);
+static const JSTrampStepDef js_error_tostring_def =
+    { sizeof(JSErrToString), js_error_tostring_step, js_error_tostring_fini, 0 };
 static const JSTrampStepDef js_symbol_ctor_def =
     { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, PRIMARGS(0x1, HINT_STRING, 1),
       { .generic = js_symbol_constructor }, JS_CFUNC_constructor_or_func, 0, js_symbol_ctor_precheck, NULL, NULL };
@@ -63967,6 +64048,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_ARRAY_COPYWITHIN] = &js_array_copyWithin_def,
     [STEPDEF_BIGINT_CTOR]   = &js_bigint_ctor_def,
     [STEPDEF_SYMBOL_CTOR]   = &js_symbol_ctor_def,
+    [STEPDEF_ERROR_TOSTRING] = &js_error_tostring_def,
     [STEPDEF_TA_WITH]       = &js_ta_with_def,
     [STEPDEF_TA_FILL]       = &js_ta_fill_def,
     [STEPDEF_TA_COPYWITHIN] = &js_ta_copyWithin_def,
