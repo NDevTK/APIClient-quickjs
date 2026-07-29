@@ -1515,6 +1515,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_DECODE_URI, STEPDEF_DECODE_URI_COMPONENT,
     STEPDEF_ENCODE_URI, STEPDEF_ENCODE_URI_COMPONENT,
     STEPDEF_GLOBAL_ESCAPE, STEPDEF_GLOBAL_UNESCAPE,
+    STEPDEF_INSTANCEOF, STEPDEF_ORDINARY_HAS_INSTANCE,
     STEPDEF_COUNT
 };
 #define HINT_NONE    2
@@ -9114,103 +9115,6 @@ int JS_SetLength(JSContext *ctx, JSValueConst obj, int64_t len) {
 }
 
 /* return true, false or (-1) in case of exception */
-static int JS_OrdinaryIsInstanceOf(JSContext *ctx, JSValueConst val,
-                                   JSValueConst obj)
-{
-    JSValue obj_proto;
-    JSObject *proto;
-    const JSObject *p, *proto1;
-    int ret;
-
-    if (!JS_IsFunction(ctx, obj))
-        return false;
-    p = JS_VALUE_GET_OBJ(obj);
-    if (p->class_id == JS_CLASS_BOUND_FUNCTION) {
-        JSBoundFunction *s = p->u.bound_function;
-        return JS_IsInstanceOf(ctx, val, s->func_obj);
-    }
-
-    /* Only explicitly boxed values are instances of constructors */
-    if (JS_VALUE_GET_TAG(val) != JS_TAG_OBJECT)
-        return false;
-    obj_proto = JS_GetProperty(ctx, obj, JS_ATOM_prototype);
-    if (JS_VALUE_GET_TAG(obj_proto) != JS_TAG_OBJECT) {
-        if (!JS_IsException(obj_proto))
-            JS_ThrowTypeError(ctx, "operand 'prototype' property is not an object");
-        ret = -1;
-        goto done;
-    }
-    proto = JS_VALUE_GET_OBJ(obj_proto);
-    p = JS_VALUE_GET_OBJ(val);
-    for(;;) {
-        proto1 = p->shape->proto;
-        if (!proto1) {
-            /* slow case if proxy in the prototype chain */
-            if (unlikely(p->class_id == JS_CLASS_PROXY)) {
-                JSValue obj1;
-                obj1 = js_dup(JS_MKPTR(JS_TAG_OBJECT, (JSObject *)p));
-                for(;;) {
-                    obj1 = JS_GetPrototypeFree(ctx, obj1);
-                    if (JS_IsException(obj1)) {
-                        ret = -1;
-                        break;
-                    }
-                    if (JS_IsNull(obj1)) {
-                        ret = false;
-                        break;
-                    }
-                    if (proto == JS_VALUE_GET_OBJ(obj1)) {
-                        JS_FreeValue(ctx, obj1);
-                        ret = true;
-                        break;
-                    }
-                    /* must check for timeout to avoid infinite loop */
-                    if (js_poll_interrupts(ctx)) {
-                        JS_FreeValue(ctx, obj1);
-                        ret = -1;
-                        break;
-                    }
-                }
-            } else {
-                ret = false;
-            }
-            break;
-        }
-        p = proto1;
-        if (proto == p) {
-            ret = true;
-            break;
-        }
-    }
-done:
-    JS_FreeValue(ctx, obj_proto);
-    return ret;
-}
-
-/* return true, false or (-1) in case of exception */
-int JS_IsInstanceOf(JSContext *ctx, JSValueConst val, JSValueConst obj)
-{
-    JSValue method;
-
-    if (!JS_IsObject(obj))
-        goto fail;
-    method = JS_GetProperty(ctx, obj, JS_ATOM_Symbol_hasInstance);
-    if (JS_IsException(method))
-        return -1;
-    if (!JS_IsNull(method) && !JS_IsUndefined(method)) {
-        JSValue ret;
-        ret = JS_CallFree(ctx, method, obj, 1, &val);
-        return JS_ToBoolFree(ctx, ret);
-    }
-
-    /* legacy case */
-    if (!JS_IsFunction(ctx, obj)) {
-    fail:
-        JS_ThrowTypeError(ctx, "invalid 'instanceof' right operand");
-        return -1;
-    }
-    return JS_OrdinaryIsInstanceOf(ctx, val, obj);
-}
 
 #include "builtin-array-fromasync.h"
 #include "builtin-iterator-zip-keyed.h"
@@ -16634,21 +16538,6 @@ static __exception int js_operator_private_in(JSContext *ctx, JSValue *sp)
     return 0;
 }
 
-static __exception int js_operator_instanceof(JSContext *ctx, JSValue *sp)
-{
-    JSValue op1, op2;
-    int ret;
-
-    op1 = sp[-2];
-    op2 = sp[-1];
-    ret = JS_IsInstanceOf(ctx, op1, op2);
-    if (ret < 0)
-        return ret;
-    JS_FreeValue(ctx, op1);
-    JS_FreeValue(ctx, op2);
-    sp[-2] = js_bool(ret);
-    return 0;
-}
 
 static __exception int js_operator_typeof(JSContext *ctx, JSValue op1)
 {
@@ -19495,7 +19384,10 @@ typedef struct JSIterFrom { int orig_cfirst, orig_cargc; uint8_t orig_is_tail;
                             JSValue *args_own; int args_own_n;
                             /* the acquired iterator, parked across GetIteratorDirect's nextMethod READ — page
                                code on an accessor or a Proxy, so a request, so a suspension. */
-                            JSValue acq; } JSIterFrom;
+                            JSValue acq;
+                            /* GetIteratorDirect's nextMethod, parked across step 3's OrdinaryHasInstance — a
+                               prototype walk whose links can be Proxies, so page code, so a suspension. */
+                            JSValue nextm; } JSIterFrom;
 #define CONT_ACQUIRE_GET  25   /* cont_state = JSAcquireGet: GetIterator step 3's READ of @@iterator, when reading it
                                   is itself the page's code (a getter, a Proxy trap). The consumer waiting on the
                                   acquire cannot be the read's outer continuation directly — a consumer's delivery
@@ -25612,6 +25504,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             ptry_finish_state = souter;
                             goto do_promise_try_finish;
                         }
+                        if (souter_kind == CONT_ITER_FROM) {
+                            /* the machine WAS Iterator.from's step-3 OrdinaryHasInstance. This arm dropped no
+                               operands (the state declared none), and the delivery below drops the call's. */
+                            goto do_iter_from_instof;
+                        }
                         if (souter_kind == CONT_AGEN_SETTLE) {
                             ret_val = r;
                             cont_st = souter;
@@ -26063,7 +25960,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                     JS_ThrowOutOfMemory(ctx); goto exception; }
                 /* Iterator.from's state is a JSIterFrom, not a consume — it has its own finish, so it does not
                    take the shared adoption yet. A sequence's Iterator.from is the next one to convert. */
-                s->acq = JS_UNDEFINED;   /* js_mallocz ZEROES it, and a zeroed JSValue is tag 0, not UNDEFINED */
+                /* js_mallocz ZEROES these, and a zeroed JSValue is tag 0 (int 0), not UNDEFINED — so every owned
+                   field is initialised explicitly or its teardown frees a bogus value. */
+                s->acq = JS_UNDEFINED;
+                s->nextm = JS_UNDEFINED;
                 TAKE_CALL_SHAPE(); s->orig_cfirst = call_first_r; s->orig_cargc = call_pop; s->orig_is_tail = tramp_is_tail;
                 s->args_own = call_args_owned; s->args_own_n = call_args_owned_n;
                 call_args_owned = NULL; call_args_owned_n = 0;
@@ -27352,6 +27252,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            propagates, exactly as GetIteratorDirect's does. */
                         JSIterFrom *fs = gouter;
                         JS_FreeValue(ctx, fs->acq);
+                        JS_FreeValue(ctx, fs->nextm);
                         js_free_rt(rt, fs);
                         goto exception;
                     }
@@ -27716,20 +27617,43 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
 
         do_iter_from_have_next:
-            /* Iterator.from's nextMethod, then 27.1.3.1 steps 2-3: %Iterator% hasInstance decides between the
-               iterator itself and a WrapForValidIterator around it. That test is the ORDINARY instanceof — a
-               prototype walk — so nothing after the read is the page's code. */
+            /* Iterator.from's nextMethod has arrived; 27.1.3.1 step 3 is next. This said the OrdinaryHasInstance
+               that follows is "a prototype walk — so nothing after the read is the page's code", which is FALSE
+               the moment a link is a Proxy: its [[GetPrototypeOf]] is a trap, and this ran the walk from C, so
+               `Iterator.from(Object.create(proxyWithGetPrototypeOf))` aborted. It is the same machine the
+               operator and Function.prototype[@@hasInstance] use, parked with this delivery as its outer. */
+            {
+                JSIterFrom *fs = (JSIterFrom *)cont_st;
+                void *if_stt;
+                JSValueConst if_arg = fs->acq;
+                DCHECK(JS_IsUndefined(fs->nextm), "Iterator.from parked two nextMethods on one state");
+                fs->nextm = ret_val; ret_val = JS_UNDEFINED;
+                if_stt = tramp_step_state_new(ctx, tramp_step_def_by_id(STEPDEF_ORDINARY_HAS_INSTANCE),
+                                              ctx->iterator_ctor, 1, &if_arg, JS_UNDEFINED);
+                if (unlikely(!if_stt)) goto exception;
+                ((JSStepHdr *)if_stt)->outer = fs;
+                ((JSStepHdr *)if_stt)->outer_kind = CONT_ITER_FROM;
+                /* the OPERANDS belong to the JSIterFrom, which drops them at the placement below. */
+                ((JSStepHdr *)if_stt)->orig_cfirst = 0;
+                ((JSStepHdr *)if_stt)->orig_cargc = 0;
+                ((JSStepHdr *)if_stt)->orig_is_tail = 0;
+                cont_st = if_stt;
+                ret_val = JS_UNDEFINED;
+                goto do_step_step;
+            }
+
+        do_iter_from_instof:
+            /* step 3's answer: the iterator itself when it IS an %Iterator%, else a WrapForValidIterator. */
             {
                 JSIterFrom *fs = (JSIterFrom *)cont_st;
                 JSValue acq = fs->acq; fs->acq = JS_UNDEFINED;
-                JSValue nextm = ret_val; ret_val = JS_UNDEFINED;
+                JSValue nextm = fs->nextm; fs->nextm = JS_UNDEFINED;
                 int cf = fs->orig_cfirst, cg = fs->orig_cargc; uint8_t itl = fs->orig_is_tail;
                 JSValue r;
                 JSIteratorWrapData *wd;
-                int isit;
+                int isit = JS_ToBoolFree(ctx, ret_val);
+                ret_val = JS_UNDEFINED;
                 js_free_rt(rt, fs);
-                isit = JS_OrdinaryIsInstanceOf(ctx, acq, ctx->iterator_ctor);
-                if (isit < 0) { JS_FreeValue(ctx, nextm); JS_FreeValue(ctx, acq); goto exception; }
                 if (isit) {
                     JS_FreeValue(ctx, nextm);   /* the record is complete; an Iterator instance needs no wrapper */
                     r = acq;
@@ -34031,38 +33955,28 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
         CASE(OP_instanceof):
             sf->cur_pc = pc;
-            /* 13.10.2 InstanceofOperator step 2: a user @@hasInstance is CALLED, and it was called from C
-               (JS_IsInstanceOf's JS_CallFree), so a loop in `static [Symbol.hasInstance]()` — the standard way to
-               make a brand check — drove to completion. Reshape [val, obj] into the method-call shape
-               [obj(this), method, val] and let the continuation do step 3.b's ToBoolean. */
-            if (JS_IsObject(sp[-1])) {
-                JSValue hi = JS_GetProperty(ctx, sp[-1], JS_ATOM_Symbol_hasInstance);
-                if (unlikely(JS_IsException(hi))) goto exception;
-                if (JS_IsFunction(ctx, hi)) {
-                    /* ANY callable @@hasInstance, which is what 13.10.2 step 2 says: "If instOfHandler is not
-                       undefined, return ToBoolean(? Call(instOfHandler, target, «V»))". Asking whether it had a
-                       BYTECODE body left a bound or proxied one on the C path, where `C[Symbol.hasInstance] =
-                       f.bind(null)` ran its body in an activation with no flow base. Which KIND of callee it is
-                       is the convergence point's question. */
-                    JSValue v = sp[-2], o = sp[-1];
-                    DCHECK(sp + 1 <= TRAMP_SP_LIMIT(sf),
-                           "@@hasInstance drive: operand reshape exceeds the frame's compiled stack_size");
-                    sp[-2] = o;          /* this = the right operand (the ref moves down a slot) */
-                    sp[-1] = hi;         /* the method (owned) */
-                    sp[0] = v;           /* arg 0 = the left operand (the ref moves up a slot) */
-                    sp++;
-                    call_argv = sp - 1; call_argc = 1; tramp_first = -2; tramp_is_tail = 0;
-                    tramp_cont_state = NULL; tramp_cont_kind = CONT_INSTANCEOF;
-                    goto do_generic_callee;
-                }
-                /* absent, nullish, or NOT CALLABLE: 13.10.2 step 3 is OrdinaryHasInstance, a DIFFERENT algorithm
-                   (a prototype-chain walk with nothing scriptable in it), not a fallback for the call above. */
-                JS_FreeValue(ctx, hi);
+            /* 13.10.2 InstanceofOperator, ALL of it, as one machine. The opcode used to read @@hasInstance from
+               C, route only the CALL when it was callable, and hand every other shape to js_operator_instanceof
+               -> JS_IsInstanceOf, which read @@hasInstance a SECOND time (13.10.2 reads it once) and then ran
+               OrdinaryHasInstance's `prototype` Get and its per-Proxy-link [[GetPrototypeOf]] from C. */
+            {
+                void *io_stt;
+                JSValueConst io_args[2];
+                io_args[0] = sp[-2];   /* V */
+                io_args[1] = sp[-1];   /* target */
+                io_stt = tramp_step_state_new(ctx, tramp_step_def_by_id(STEPDEF_INSTANCEOF), JS_UNDEFINED, 2, io_args, JS_UNDEFINED);
+                if (unlikely(!io_stt)) goto exception;
+                /* the DECLARED shape — two consumed, one pushed — is what the delivery drops; popping here as
+                   well is a double free (it segfaulted on the first fixture). */
+                ((JSStepHdr *)io_stt)->orig_cfirst = -2;
+                ((JSStepHdr *)io_stt)->orig_cargc = 0;
+                ((JSStepHdr *)io_stt)->orig_is_tail = 0;
+                cont_st = io_stt;
+                ret_val = JS_UNDEFINED;
+                goto do_step_step;
             }
-            if (js_operator_instanceof(ctx, sp))
-                goto exception;
-            sp--;
             BREAK;
+
         CASE(OP_typeof):
             {
                 JSValue op1;
@@ -35063,6 +34977,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             if (gouter && gk2 == CONT_ITER_FROM_NEXT_GET) {
                 JSIterFrom *fs = gouter;
                 JS_FreeValue(ctx, fs->acq);
+                JS_FreeValue(ctx, fs->nextm);
                 js_free_rt(rt, fs);
                 goto exception;
             }
@@ -59070,15 +58985,183 @@ static JSValue js_function_toString(JSContext *ctx, JSValueConst this_val,
     }
 }
 
-static JSValue js_function_hasInstance(JSContext *ctx, JSValueConst this_val,
-                                       int argc, JSValueConst *argv)
+/* 13.10.2 InstanceofOperator and 7.3.20 OrdinaryHasInstance — ONE machine with two entries, because step 2 of
+   the second IS the first: a BOUND function's `instanceof` recurses through the whole operator on its target,
+   re-reading @@hasInstance there. The arg picks the entry; Function.prototype[@@hasInstance] is the ordinary
+   one, and the operator is the other.
+
+   Three of the page's operations live in them and every one ran from C: GetMethod(target, @@hasInstance), the
+   `Get(C, "prototype")` of step 4, and a [[GetPrototypeOf]] per PROXY link of the walk. So
+
+       ({}) instanceof new Proxy(function(){}, {get(){for(;;){}}})
+
+   had no flow base. The operator ALSO read @@hasInstance a second time on the fallback path, through
+   JS_IsInstanceOf, which 13.10.2 performs once.
+
+   Step 2's GetMethod contract — a present, non-nullish, NON-CALLABLE @@hasInstance is a TypeError — is
+   unchanged and was already right: the old path reached it through step 4's IsCallable check instead, and a
+   probe suggesting otherwise had used `f[Symbol.hasInstance] = 1`, which sets nothing, because
+   Function.prototype's is non-writable. */
+typedef struct JSInstanceOf {
+    JSStepHdr hdr;      /* MUST be first. arg: INSTOF_OPERATOR or INSTOF_ORDINARY */
+    JSValue ctor;       /* C — what the value is tested against (owned) */
+    JSValue val;        /* O — the value, then the chain link being walked (owned) */
+    JSValue proto;      /* P, from step 4 (owned) */
+    JSValue handler;    /* @@hasInstance, held across its call (owned) */
+    JSValue result;     /* DONE (owned) */
+    uint8_t mode;       /* the CURRENT entry: a bound target restarts at the operator whichever entry began */
+} JSInstanceOf;
+#define INSTOF_OPERATOR 0   /* 13.10.2, from the top */
+#define INSTOF_ORDINARY 1   /* 7.3.20 directly — what Function.prototype[@@hasInstance] is */
+enum { IO_HI_GOT = 1, IO_CALL_GOT, IO_ORDINARY, IO_PROTO_GOT, IO_LINK_GOT };
+
+/* steps 6.a-c over ORDINARY links, which have no [[GetPrototypeOf]] of their own to run: the shape's proto is
+   the answer. Returns 0 = keep walking from s->val (a PROXY link needs the request), 1 = decided. */
+static int js_instanceof_walk(JSContext *ctx, JSInstanceOf *s)
 {
-    int ret;
-    ret = JS_OrdinaryIsInstanceOf(ctx, argv[0], this_val);
-    if (ret < 0)
-        return JS_EXCEPTION;
-    else
-        return js_bool(ret);
+    JSObject *proto = JS_VALUE_GET_OBJ(s->proto);
+    while (JS_VALUE_GET_TAG(s->val) == JS_TAG_OBJECT) {
+        JSObject *p = JS_VALUE_GET_OBJ(s->val);
+        JSObject *nxt;
+        if (p->class_id == JS_CLASS_PROXY)
+            return 0;                       /* its [[GetPrototypeOf]] is the page's: ask for it */
+        nxt = p->shape->proto;
+        if (!nxt) { s->result = JS_FALSE; return 1; }          /* step 6.b */
+        if (nxt == proto) { s->result = JS_TRUE; return 1; }   /* step 6.c */
+        JS_FreeValue(ctx, s->val);
+        s->val = js_dup(JS_MKPTR(JS_TAG_OBJECT, nxt));
+    }
+    s->result = JS_FALSE;
+    return 1;
+}
+
+static int js_instanceof_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSInstanceOf *s = st;
+
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        s->result = JS_UNDEFINED; s->proto = JS_UNDEFINED; s->handler = JS_UNDEFINED;
+        s->mode = (uint8_t)s->hdr.arg;
+        if (s->mode == INSTOF_ORDINARY) {
+            /* Function.prototype[@@hasInstance](V): the receiver is C and the argument is O. */
+            s->ctor = js_dup(s->hdr.this_val);
+            s->val = js_dup(step_arg(&s->hdr, 0));
+        } else {
+            /* the operator's shape: [V, target] — the machine is created with them as its arguments. */
+            s->val = js_dup(step_arg(&s->hdr, 0));
+            s->ctor = js_dup(step_arg(&s->hdr, 1));
+        }
+    }
+    for (;;) {
+        if (s->hdr.stage == 0) {
+            if (s->mode == INSTOF_ORDINARY) { s->hdr.stage = IO_ORDINARY; continue; }
+            if (!JS_IsObject(s->ctor)) {                     /* step 1 */
+                JS_ThrowTypeError(ctx, "invalid 'instanceof' right operand");
+                return -1;
+            }
+            s->hdr.stage = IO_HI_GOT;                        /* step 2: GetMethod(target, @@hasInstance) */
+            s->hdr.cb_coerce[0] = s->ctor;
+            *out_cb = s->hdr.cb_coerce; *out_argc = (int)JS_ATOM_Symbol_hasInstance;
+            return 6;
+        }
+        if (s->hdr.stage == IO_HI_GOT) {
+            if (JS_IsException(cb_result)) return -1;
+            s->handler = cb_result; cb_result = JS_UNDEFINED;
+            if (JS_IsUndefined(s->handler) || JS_IsNull(s->handler)) {
+                JS_FreeValue(ctx, s->handler); s->handler = JS_UNDEFINED;
+                s->hdr.stage = IO_ORDINARY;                  /* steps 4-5 */
+                continue;
+            }
+            if (!JS_IsFunction(ctx, s->handler)) {
+                JS_ThrowTypeError(ctx, "not a function");   /* GetMethod step 3 */
+                return -1;
+            }
+            s->hdr.stage = IO_CALL_GOT;                      /* step 3: Call(handler, target, <<V>>) */
+            s->hdr.cb_coerce[0] = s->ctor;
+            s->hdr.cb_coerce[1] = s->handler;
+            s->hdr.cb_coerce[2] = s->val;
+            *out_cb = s->hdr.cb_coerce; *out_argc = 1;
+            return 3;
+        }
+        if (s->hdr.stage == IO_CALL_GOT) {
+            if (JS_IsException(cb_result)) return -1;
+            s->result = js_bool(JS_ToBoolFree(ctx, cb_result));
+            return 0;
+        }
+        if (s->hdr.stage == IO_ORDINARY) {
+            JSObject *p;
+            JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+            if (!JS_IsFunction(ctx, s->ctor)) {
+                if (s->mode == INSTOF_OPERATOR) {            /* 13.10.2 step 4 */
+                    JS_ThrowTypeError(ctx, "invalid 'instanceof' right operand");
+                    return -1;
+                }
+                s->result = JS_FALSE;                        /* 7.3.20 step 1 */
+                return 0;
+            }
+            p = JS_VALUE_GET_OBJ(s->ctor);
+            if (p->class_id == JS_CLASS_BOUND_FUNCTION) {
+                /* step 2: the WHOLE operator on the bound target, @@hasInstance read again and all. */
+                JSBoundFunction *bf = p->u.bound_function;
+                JSValue tgt = js_dup(bf->func_obj);
+                JS_FreeValue(ctx, s->ctor);
+                s->ctor = tgt;
+                s->mode = INSTOF_OPERATOR;
+                s->hdr.stage = 0;
+                continue;
+            }
+            if (!JS_IsObject(s->val)) {                      /* step 3 */
+                s->result = JS_FALSE;
+                return 0;
+            }
+            s->hdr.stage = IO_PROTO_GOT;                     /* step 4: Get(C, "prototype") */
+            s->hdr.cb_coerce[0] = s->ctor;
+            *out_cb = s->hdr.cb_coerce; *out_argc = (int)JS_ATOM_prototype;
+            return 6;
+        }
+        if (s->hdr.stage == IO_PROTO_GOT) {
+            if (JS_IsException(cb_result)) return -1;
+            s->proto = cb_result; cb_result = JS_UNDEFINED;
+            if (!JS_IsObject(s->proto)) {                    /* step 5 */
+                JS_ThrowTypeError(ctx, "operand 'prototype' property is not an object");
+                return -1;
+            }
+            s->hdr.stage = IO_LINK_GOT;
+            if (js_instanceof_walk(ctx, s)) return 0;
+            s->hdr.cb_coerce[0] = s->val;                    /* step 6.a on a PROXY link: its trap */
+            *out_cb = s->hdr.cb_coerce; *out_argc = 0;
+            return 18;
+        }
+        DCHECK(s->hdr.stage == IO_LINK_GOT, "the instanceof machine resumed in no stage");
+        if (JS_IsException(cb_result)) return -1;
+        JS_FreeValue(ctx, s->val);
+        s->val = cb_result; cb_result = JS_UNDEFINED;
+        if (JS_IsNull(s->val)) { s->result = JS_FALSE; return 0; }          /* step 6.b */
+        if (JS_VALUE_GET_TAG(s->val) == JS_TAG_OBJECT
+            && JS_VALUE_GET_OBJ(s->val) == JS_VALUE_GET_OBJ(s->proto)) {    /* step 6.c */
+            s->result = JS_TRUE;
+            return 0;
+        }
+        if (js_instanceof_walk(ctx, s)) return 0;
+        s->hdr.cb_coerce[0] = s->val;
+        *out_cb = s->hdr.cb_coerce; *out_argc = 0;
+        return 18;
+    }
+}
+
+static JSValue js_instanceof_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSInstanceOf *s = st;
+    JSValue r;
+    JS_FreeValue(ctx, s->ctor);
+    JS_FreeValue(ctx, s->val);
+    JS_FreeValue(ctx, s->proto);
+    JS_FreeValue(ctx, s->handler);
+    r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    js_free(ctx, s);
+    return r;
 }
 
 static const JSCFunctionListEntry js_function_proto_funcs[] = {
@@ -59086,7 +59169,7 @@ static const JSCFunctionListEntry js_function_proto_funcs[] = {
     JS_CFUNC_STEP_DEF("apply", 2, STEPDEF_FUNCTION_APPLY ),
     JS_CFUNC_STEP_DEF("bind", 1, STEPDEF_FUNC_BIND ),
     JS_CFUNC_DEF("toString", 0, js_function_toString ),
-    JS_CFUNC_DEF("[Symbol.hasInstance]", 1, js_function_hasInstance ),
+    JS_CFUNC_STEP_DEF("[Symbol.hasInstance]", 1, STEPDEF_ORDINARY_HAS_INSTANCE ),
     JS_CGETSET_DEF("fileName", js_function_proto_fileName, NULL ),
     JS_CGETSET_MAGIC_DEF("lineNumber", js_function_proto_int32, NULL,
                          offsetof(JSFunctionBytecode, line_num)),
@@ -62705,6 +62788,8 @@ static const JSTrampStepDef js_lookupsetter_def = { sizeof(JSLookupAcc), js_look
 static const JSTrampStepDef js_func_bind_def   = { sizeof(JSFuncBind), js_func_bind_step, js_func_bind_fini, 0 };
 static const JSTrampStepDef js_iter_set_ctor_def = { sizeof(JSIterSetter), js_iter_setter_step, js_iter_setter_fini, JS_ATOM_constructor };
 static const JSTrampStepDef js_iter_set_tag_def  = { sizeof(JSIterSetter), js_iter_setter_step, js_iter_setter_fini, JS_ATOM_Symbol_toStringTag };
+static const JSTrampStepDef js_instanceof_def  = { sizeof(JSInstanceOf), js_instanceof_step, js_instanceof_fini, INSTOF_OPERATOR };
+static const JSTrampStepDef js_ordinary_hasinst_def = { sizeof(JSInstanceOf), js_instanceof_step, js_instanceof_fini, INSTOF_ORDINARY };
 static const JSTrampStepDef js_obj_tolocale_def = { sizeof(JSObjToLocale), js_object_tolocale_step, js_object_tolocale_fini, 0 };
 static const JSTrampStepDef js_obj_tostring_def = { sizeof(JSObjToString), js_object_tostring_step, js_object_tostring_fini, 0 };
 static const JSTrampStepDef js_obj_seal_def     = { sizeof(JSIntegrity), js_integrity_step, js_integrity_fini, 0 };
@@ -63206,6 +63291,8 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_ITER_SET_CTOR]  = &js_iter_set_ctor_def,
     [STEPDEF_ITER_SET_TAG]   = &js_iter_set_tag_def,
     [STEPDEF_ITER_HELPER_RETURN] = &js_iter_helper_return_def,
+    [STEPDEF_INSTANCEOF]     = &js_instanceof_def,
+    [STEPDEF_ORDINARY_HAS_INSTANCE] = &js_ordinary_hasinst_def,
     [STEPDEF_OBJ_TOSTRING]   = &js_obj_tostring_def,
     [STEPDEF_OBJ_TOLOCALESTRING] = &js_obj_tolocale_def,
     [STEPDEF_OBJ_SEAL]       = &js_obj_seal_def,
@@ -63441,6 +63528,7 @@ STEP_STATE_HDR_FIRST(JSIterHelperReturn);
 STEP_STATE_HDR_FIRST(JSIntegrity);
 STEP_STATE_HDR_FIRST(JSObjToString);
 STEP_STATE_HDR_FIRST(JSObjToLocale);
+STEP_STATE_HDR_FIRST(JSInstanceOf);
 STEP_STATE_HDR_FIRST(JSImportOpts);
 STEP_STATE_HDR_FIRST(JSStrCtor);
 STEP_STATE_HDR_FIRST(JSStrConcat);
