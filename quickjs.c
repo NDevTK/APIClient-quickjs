@@ -1238,15 +1238,16 @@ struct JSObject {
             JSCFunctionType c_function;
             uint8_t length;
             uint8_t cproto;
-            /* The WALK this builtin performs over its first argument when it CONSUMES one: ITERCONS_* + 1, or 0
-               for the builtins that consume nothing. A plain function declares this in `magic` (JS_CFUNC_consume),
-               but a CONSTRUCTOR's magic is already structural — js_map_constructor's carries MAGIC_SET/MAGIC_WEAK
-               and doubles as a class offset, a TypedArray's IS the class id — and both bodies are additionally
-               called straight from C with a raw kind, so the sink cannot ride there. It is a FIELD and not a
-               pointer in JSCFunctionType, which holds function pointers only (putting data there is the
-               strict-aliasing violation that passes at -O0 and segfaults at -O1). It costs nothing: this struct
-               is 20 bytes inside a 24-byte union. */
-            uint8_t consume_sink;
+            /* WHICH NATIVE MACHINE drives this builtin — NATIVE_* + 1, or 0 for the builtins that are just
+               their C body. It is the same thing JS_CFUNC_STEP_DEF says with `magic`, for the machines that are
+               not JSTrampStepDef step machines: a consuming constructor's walk, and the promise builtins whose
+               reject-and-yield needs a CONT kind of its own. It exists as a FIELD because `magic` is already
+               taken for every one of them — a constructor's carries MAGIC_SET/MAGIC_WEAK or IS a class id and
+               its body is additionally called straight from C with that raw kind, and Promise.all's selects
+               all/allSettled/any. It is not a pointer in JSCFunctionType, which holds function pointers only
+               (data there is the strict-aliasing violation that passes at -O0 and segfaults at -O1). It costs
+               nothing: this struct is 20 bytes inside a 24-byte union. */
+            uint8_t native_machine;
             int16_t magic;
         } cfunc;
         /* array part for fast arrays and typed arrays */
@@ -6802,7 +6803,7 @@ JSValue JS_NewCFunction3(JSContext *ctx, JSCFunction *func,
     p->u.cfunc.c_function.generic = func;
     p->u.cfunc.length = length;
     p->u.cfunc.cproto = cproto;
-    p->u.cfunc.consume_sink = 0;   /* declared afterwards by the few builtins that consume */
+    p->u.cfunc.native_machine = 0;   /* declared afterwards by the few builtins that are machines */
     p->u.cfunc.magic = magic;
     p->is_constructor = (cproto == JS_CFUNC_constructor ||
                          cproto == JS_CFUNC_constructor_magic ||
@@ -17615,26 +17616,26 @@ static inline bool tramp_is_iter_drive(JSValueConst func)
     fp = JS_VALUE_GET_OBJ(func);
     return fp->class_id == JS_CLASS_C_FUNCTION && fp->u.cfunc.cproto == JS_CFUNC_iterdrive;
 }
-/* The walk a CONSUMING CONSTRUCTOR declares over its first argument, or -1. The call-side sibling of
-   tramp_consume_sink_of, reading the field instead of magic for the reason the field exists. It replaced two
-   per-builtin identity tests — `c_function.constructor_magic != js_map_constructor` and the TypedArray one —
-   which is the shape the recognizer ban is about: the construct convergence point asks ONE question now and a
-   new consuming constructor answers it by declaring itself, not by being added to a chain. */
-static inline int tramp_consume_ctor_sink_of(JSValueConst func)
+/* WHICH machine a builtin declares, or -1 for none. The sibling of tramp_step_def_of and tramp_consume_sink_of
+   for the machines that cannot say it in `magic`. It replaced per-builtin identity tests — the callee compared
+   against js_map_constructor's address, the TypedArray constructor's, js_promise_try's — which is the shape the
+   recognizer ban is about: a convergence point asks ONE question and a new machine answers it by declaring
+   itself, never by being added to a chain of address comparisons. */
+static inline int tramp_native_machine_of(JSValueConst func)
 {
     JSObject *fp;
     if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return -1;
     fp = JS_VALUE_GET_OBJ(func);
     if (fp->class_id != JS_CLASS_C_FUNCTION) return -1;
-    return (int)fp->u.cfunc.consume_sink - 1;
+    return (int)fp->u.cfunc.native_machine - 1;
 }
-/* Declare it, at the registration of the constructor that performs it. */
-static void js_declare_consume_ctor(JSValueConst func_obj, int sink)
+/* Declare it, at the registration of the builtin the machine implements. */
+static void js_declare_native_machine(JSValueConst func_obj, int id)
 {
     JSObject *fp = JS_VALUE_GET_OBJ(func_obj);
-    DCHECK(fp->class_id == JS_CLASS_C_FUNCTION, "a consuming-constructor declaration on a non-C function");
-    DCHECK(sink >= 0 && sink < 255, "a consume sink outside the field's range");
-    fp->u.cfunc.consume_sink = (uint8_t)(sink + 1);
+    DCHECK(fp->class_id == JS_CLASS_C_FUNCTION, "a native-machine declaration on a non-C function");
+    DCHECK(id >= 0 && id < 255, "a native-machine id outside the field's range");
+    fp->u.cfunc.native_machine = (uint8_t)(id + 1);
 }
 static const JSTrampStepDef *tramp_step_def_of(JSValueConst func);
 static const JSTrampStepDef *tramp_step_ctor_def_of(JSValueConst func);
@@ -19182,7 +19183,7 @@ typedef struct JSPromiseExec {
     uint8_t orig_is_tail;        /* `return Reflect.construct(Promise, [fn])` IS a tail construct: the frame must
                                     RETURN the promise, not push it and run off the end of the tail-call opcode */
 } JSPromiseExec;
-static bool tramp_can_call_promise_exec(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc);
+static bool promise_exec_ready(JSContext *ctx, JSValueConst *call_argv, int call_argc);
 /* (was 18, which CONT_IMPORT already had: both a frame's cont_kind and a continuation's outer_kind draw from this
    ONE namespace, so two kinds sharing a number is a live misread waiting for the first ToPrimitive whose outer is a
    Promise.try. cont_kinds_are_distinct() below turns that into a compile error.) */
@@ -19315,7 +19316,6 @@ static void js_promise_try_abandon(JSContext *ctx, void *st)
     for (k = 0; k < s->nargs + 2; k++) JS_FreeValue(ctx, s->cb_args[k]);
     js_free_rt(ctx->rt, s);
 }
-static bool tramp_can_call_promise_try(JSValueConst func);
 /* String.prototype.replace/replaceAll: a step machine. It holds a StringBuffer + endOfLastMatch across each
    callback, so replaceAll's loop is preemptible at every callback boundary and the replacer's body at every
    back-edge. (Kind 15 was CONT_STR_REPLACE, back when a hand-written driver ran this walk.) */
@@ -20387,6 +20387,11 @@ typedef struct {
    class. That is a builtin declaring itself and its argument, not a table of who is special. */
 #define ITERCONS_SETMAP_CTOR_BASE 32   /* + (0 Map | MAGIC_SET | MAGIC_WEAK): new Map/Set/WeakMap/WeakSet(iterable) */
 #define ITERCONS_TA_CTOR_BASE     40   /* + (class_id - JS_CLASS_UINT8C_ARRAY): new Uint8Array(iterable) etc. */
+#define NATIVE_PROMISE_TRY        52   /* Promise.try(fn, ...args) — CONT_PROMISE_TRY, not a walk at all. The
+                                          field says WHICH MACHINE, and a walk was only the first kind of answer
+                                          it had to give. */
+#define NATIVE_PROMISE_EXEC       53   /* new Promise(executor) — CONT_PROMISE_EXEC */
+#define NATIVE_PROMISE_ALL_BASE   56   /* + PROMISE_MAGIC_*: all / allSettled / any / race, one walk, four rules */
 #define ITERCONS_ITERTERM_BASE 16
 #define ITERCONS_TA_FROM 10 /* %TypedArray%.from(source, mapfn?, thisArg?) — do_ta_consume_tramp's `from` shape */
 #define ITERCONS_TA_OF   11 /* %TypedArray%.of(...items) — the same create+set phases with the argument LIST as
@@ -20609,7 +20614,7 @@ static int js_promise_all_step(JSContext *ctx, struct JSPromiseAll *s, JSValue r
 static int js_promise_all_attach_args(JSContext *ctx, struct JSPromiseAll *s, int index,
                                       JSValue *out_re, JSValue *out_rj);
 static void js_promise_all_end(JSContext *ctx, struct JSPromiseAll *s);
-static bool tramp_can_call_promise_all(JSContext *ctx, JSValueConst func, JSValueConst recv, JSValueConst *call_argv, int call_argc, int *out_magic, JSValue *out_getiter);
+static bool promise_all_ready(JSContext *ctx, JSValueConst func, JSValueConst recv, JSValueConst *call_argv, int call_argc, int *out_magic, JSValue *out_getiter);   /* the machine is DECLARED; this asks about the receiver and the argument */
 
 /* A COROUTINE CREATE (generator or async generator) that fails BEFORE its frame exists must abandon the machine
    that asked for the coroutine: that machine can never be re-entered, and nothing else holds it — the create took
@@ -24354,17 +24359,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         goto do_step_step;
                     }
                 }
-                {
-                /* ONE question: what walk does this constructor DECLARE? It was two identity tests in a chain,
-                   each comparing the callee against a C function's address — so a new consuming constructor was
-                   a new link rather than a new declaration, which is the recognizer shape. What each arm still
-                   asks after that is about the ARGUMENT, not the callee: 24.1.1.1 step 2 and 23.2.5.1 step 6.a
-                   both select a DIFFERENT algorithm for a nullish or non-object source, one that iterates
-                   nothing. */
-                int cctor_sink = tramp_consume_ctor_sink_of(con_func);
-                if (cctor_sink >= ITERCONS_SETMAP_CTOR_BASE && cctor_sink < ITERCONS_SETMAP_CTOR_BASE + 4
+                /* ONE question: WHICH MACHINE does this constructor declare? It was three identity tests in a
+                   chain, each comparing the callee against a C function's address — js_map_constructor's, the
+                   TypedArray constructor's, js_promise_constructor's — so a new machine was a new LINK rather
+                   than a new declaration, which is the recognizer shape. What each arm still asks after that is
+                   about the ARGUMENT, never the callee: 24.1.1.1 step 2, 23.2.5.1 step 6.a and 27.2.3.1 step 2
+                   each select a DIFFERENT algorithm — an empty collection, a length, a TypeError — and none of
+                   them iterates. */
+                const int cmach = tramp_native_machine_of(con_func);
+                if (cmach >= ITERCONS_SETMAP_CTOR_BASE && cmach < ITERCONS_SETMAP_CTOR_BASE + 4
                     && setmap_consume_ready(ctx, con_args, con_argc, &tramp_iter_getiter)) {
-                    smc_magic = cctor_sink - ITERCONS_SETMAP_CTOR_BASE;
+                    smc_magic = cmach - ITERCONS_SETMAP_CTOR_BASE;
                     smc_outer = con_outer; smc_outer_kind = con_outer_kind;
                     con_outer = NULL; con_outer_kind = CONT_NONE;
                     smc_ntgt = con_ntgt; smc_items = (con_argc > 0) ? con_args[0] : JS_UNDEFINED;
@@ -24376,10 +24381,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     smc_super_ref = con_super_ref; con_super_ref = JS_UNDEFINED;
                     goto do_setmap_consume_tramp;
                 }
-                if (cctor_sink >= ITERCONS_TA_CTOR_BASE
-                    && cctor_sink < ITERCONS_TA_CTOR_BASE + JS_TYPED_ARRAY_COUNT
+                if (cmach >= ITERCONS_TA_CTOR_BASE
+                    && cmach < ITERCONS_TA_CTOR_BASE + JS_TYPED_ARRAY_COUNT
                     && ta_consume_ready(ctx, con_args, con_argc, &tramp_iter_getiter)) {
-                    ta_classid = cctor_sink - ITERCONS_TA_CTOR_BASE + JS_CLASS_UINT8C_ARRAY;
+                    ta_classid = cmach - ITERCONS_TA_CTOR_BASE + JS_CLASS_UINT8C_ARRAY;
                     tac_outer = con_outer; tac_outer_kind = con_outer_kind;
                     con_outer = NULL; con_outer_kind = CONT_NONE;
                     tac_args = con_args; tac_argc = con_argc; tac_ntgt = con_ntgt; tac_cfirst = tramp_first;
@@ -24389,8 +24394,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     tac_super_ref = con_super_ref; con_super_ref = JS_UNDEFINED;
                     goto do_ta_consume_tramp;
                 }
-                }
-                if (tramp_can_call_promise_exec(ctx, con_func, con_args, con_argc)) {
+                if (cmach == NATIVE_PROMISE_EXEC && promise_exec_ready(ctx, con_args, con_argc)) {
                     pe_outer = con_outer; pe_outer_kind = con_outer_kind;
                     con_outer = NULL; con_outer_kind = CONT_NONE;
                     pe_ntgt = con_ntgt; pe_executor = con_args[0];
@@ -24862,9 +24866,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         goto do_iter_consume_tramp;
                     }
                 }
-                if (tramp_can_call_promise_all(ctx, call_argv[-1], crecv, vc(call_argv), call_argc, &pa_magic, &tramp_iter_getiter))
+                if (promise_all_ready(ctx, call_argv[-1], crecv, vc(call_argv), call_argc, &pa_magic, &tramp_iter_getiter))
                     goto do_promise_all_consume_tramp;          /* Promise.all/allSettled/any/race(iterable) */
-                if (tramp_can_call_promise_try(call_argv[-1]))
+                if (tramp_native_machine_of(call_argv[-1]) == NATIVE_PROMISE_TRY)
                     goto do_promise_try_tramp;                  /* Promise.try(fn, ...args) */
                 /* no consumer matched: fall into the step/generic convergence below */
             }
@@ -75151,7 +75155,7 @@ int JS_AddIntrinsicMapSet(JSContext *ctx)
             return -1;
         /* 24.1.1.1 step 6 onwards is a WALK of the iterable, and it declares it here rather than being
            recognised by address at the construct convergence point. */
-        js_declare_consume_ctor(obj1, ITERCONS_SETMAP_CTOR_BASE + i);
+        js_declare_native_machine(obj1, ITERCONS_SETMAP_CTOR_BASE + i);
         JS_FreeValue(ctx, obj1);
     }
 
@@ -77118,7 +77122,7 @@ static void js_promise_all_end(JSContext *ctx, JSPromiseAll *s)
 
 /* Route Promise.all / allSettled / any over a GENERATOR-BACKED iterable (its .next() must run on the tramp); `race`
    and every other shape stay on the normal C path, which drives them correctly. */
-static bool tramp_can_call_promise_all(JSContext *ctx, JSValueConst func, JSValueConst recv, JSValueConst *call_argv, int call_argc, int *out_magic, JSValue *out_getiter)
+static bool promise_all_ready(JSContext *ctx, JSValueConst func, JSValueConst recv, JSValueConst *call_argv, int call_argc, int *out_magic, JSValue *out_getiter)
 {
     JSObject *fp;
     int magic;
@@ -77130,16 +77134,8 @@ static bool tramp_can_call_promise_all(JSContext *ctx, JSValueConst func, JSValu
        a distinct C function (js_promise_race, no magic) but consumes its iterable through the SAME tramp path
        (do_promise_all_step branches on s->magic == PROMISE_MAGIC_race), so it belongs here, not in a second
        recognizer with its own generator-only narrowing. */
-    if (fp->u.cfunc.cproto == JS_CFUNC_generic_magic
-        && fp->u.cfunc.c_function.generic_magic == js_promise_all) {
-        magic = fp->u.cfunc.magic;
-        if (magic != PROMISE_MAGIC_all && magic != PROMISE_MAGIC_allSettled && magic != PROMISE_MAGIC_any) return false;
-    } else if (fp->u.cfunc.cproto == JS_CFUNC_generic
-               && fp->u.cfunc.c_function.generic == js_promise_race) {
-        magic = PROMISE_MAGIC_race;
-    } else {
-        return false;
-    }
+    magic = tramp_native_machine_of(func) - NATIVE_PROMISE_ALL_BASE;
+    if (magic < 0 || magic > PROMISE_MAGIC_race) return false;
     /* the receiver (the constructor `this`) must be an Object — NewPromiseCapability(C) requires it. A non-object
        (Promise.all.call(5, x)) is rejected here so the C entry throws TypeErrorNotAnObject in spec order, BEFORE
        any iteration; a side-effect-free tag check, so probing it changes nothing. The RESOLVED receiver is
@@ -77165,18 +77161,14 @@ static bool tramp_can_call_promise_all(JSContext *ctx, JSValueConst func, JSValu
    A non-callable executor is NOT recognized — it must reach js_promise_constructor so step 2 throws the TypeError
    in spec order, BEFORE step 3 creates anything. A C/bound executor is not recognized either: it has no
    preemptible body, so the ordinary C path is already correct for it. */
-static bool tramp_can_call_promise_exec(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc)
+/* `new Promise(executor)` reaches its machine by DECLARATION (NATIVE_PROMISE_EXEC); what is left to ask is
+   about the ARGUMENT. A non-callable executor is 27.2.3.1 step 2's TypeError, thrown by the C entry in spec
+   order, and it iterates nothing — a different algorithm, not a fallback for this one. */
+static bool promise_exec_ready(JSContext *ctx, JSValueConst *call_argv, int call_argc)
 {
-    JSObject *fp;
-    if (call_argv && call_argc < 1) return false;   /* NULL call_argv = callee-only query (Reflect.construct) */
-    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
-    fp = JS_VALUE_GET_OBJ(func);
-    if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
-    if (fp->u.cfunc.cproto != JS_CFUNC_constructor) return false;
-    if (fp->u.cfunc.c_function.constructor != js_promise_constructor) return false;
     if (!call_argv) return true;   /* callee-only query (the Reflect.construct resolver): args live in an array */
-    return JS_IsFunction(ctx, call_argv[0]);   /* ANY callable executor; a non-callable falls through so
-                                                  js_promise_constructor throws the step-2 TypeError */
+    if (call_argc < 1) return false;
+    return JS_IsFunction(ctx, call_argv[0]);
 }
 
 /* Promise.try(fn, ...args): fn is called SYNCHRONOUSLY, so a loop in it must park. This asks ONE question — is
@@ -77186,15 +77178,6 @@ static bool tramp_can_call_promise_exec(JSContext *ctx, JSValueConst func, JSVal
    function and loops, and a GENERATOR fn creates a coroutine that then resumed off the chain. All three aborted
    (two @WHY preempt-in-a-non-coroutine, one drive-to-completion). The receiver and arity conditions were pure
    VALIDATION, which moved into the machine's prologue where the spec puts them. */
-static bool tramp_can_call_promise_try(JSValueConst func)
-{
-    JSObject *fp;
-    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
-    fp = JS_VALUE_GET_OBJ(func);
-    if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
-    if (fp->u.cfunc.cproto != JS_CFUNC_generic) return false;
-    return fp->u.cfunc.c_function.generic == js_promise_try;
-}
 
 static JSValue js_promise_race(JSContext *ctx, JSValueConst this_val,
                                int argc, JSValueConst *argv)
@@ -77527,7 +77510,7 @@ static const JSCFunctionListEntry js_promise_funcs[] = {
     JS_CFUNC_MAGIC_DEF("all", 1, js_promise_all, PROMISE_MAGIC_all ),
     JS_CFUNC_MAGIC_DEF("allSettled", 1, js_promise_all, PROMISE_MAGIC_allSettled ),
     JS_CFUNC_MAGIC_DEF("any", 1, js_promise_all, PROMISE_MAGIC_any ),
-    JS_CFUNC_DEF("try", 1, js_promise_try ),
+    JS_CFUNC_DEF("try", 1, js_promise_try ),   /* declared a machine in JS_AddIntrinsicPromise */
     JS_CFUNC_DEF("race", 1, js_promise_race ),
     JS_CFUNC_DEF("withResolvers", 0, js_promise_withResolvers ),
     JS_CGETSET_DEF("[Symbol.species]", js_get_this, NULL),
@@ -77832,6 +77815,28 @@ int JS_AddIntrinsicPromise(JSContext *ctx)
     if (JS_IsException(obj1))
         return -1;
     ctx->promise_ctor = obj1;
+    /* THE PROMISE MACHINES, each declared on the builtin it implements. Every one of these C bodies is residue —
+       js_promise_try is a bare DFAIL and the others have no algorithm left — so the address comparisons that used
+       to find them were choosing against nothing, which is this project's definition of a recognizer that has
+       become pure residue. */
+    js_declare_native_machine(obj1, NATIVE_PROMISE_EXEC);   /* new Promise(executor) */
+    {
+        static const struct { const char *name; int id; } promise_machines[] = {
+            { "try",        NATIVE_PROMISE_TRY },
+            { "all",        NATIVE_PROMISE_ALL_BASE + PROMISE_MAGIC_all },
+            { "allSettled", NATIVE_PROMISE_ALL_BASE + PROMISE_MAGIC_allSettled },
+            { "any",        NATIVE_PROMISE_ALL_BASE + PROMISE_MAGIC_any },
+            { "race",       NATIVE_PROMISE_ALL_BASE + PROMISE_MAGIC_race },
+        };
+        size_t mi;
+        for (mi = 0; mi < countof(promise_machines); mi++) {
+            JSValue m = JS_GetPropertyStr(ctx, obj1, promise_machines[mi].name);
+            if (JS_IsException(m))
+                return -1;
+            js_declare_native_machine(m, promise_machines[mi].id);
+            JS_FreeValue(ctx, m);
+        }
+    }
 
     /* AsyncFunction */
     obj1 = JS_NewCConstructor(ctx, JS_CLASS_ASYNC_FUNCTION, "AsyncFunction",
@@ -83487,7 +83492,7 @@ int JS_AddIntrinsicTypedArrays(JSContext *ctx)
             return -1;
         }
         /* 23.2.5.1 step 6.a's iterable branch is a WALK, declared here rather than recognised by address. */
-        js_declare_consume_ctor(obj, ITERCONS_TA_CTOR_BASE + i - JS_CLASS_UINT8C_ARRAY);
+        js_declare_native_machine(obj, ITERCONS_TA_CTOR_BASE + i - JS_CLASS_UINT8C_ARRAY);
         JS_FreeValue(ctx, obj);
     }
     JS_FreeValue(ctx, typed_array_base_func);
