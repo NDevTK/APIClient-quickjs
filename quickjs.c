@@ -72548,19 +72548,28 @@ static int js_proxy_preventExtensions(JSContext *ctx, JSValueConst obj)
    from a continuation, exactly as [[Get]]'s does. `ret` is the trap's boolean; returns it, or -1 having thrown. */
 static int js_proxy_has_invariant(JSContext *ctx, JSValueConst target, JSAtom atom, int ret)
 {
-    JSObject *p;
-    int desc_flags, res;
+    int desc_flags, res, ext;
     if (ret)
         return 1;
-    p = JS_VALUE_GET_OBJ(target);
-    res = JS_GetOwnPropertyFlagsInternal(ctx, &desc_flags, p, atom);
+    res = JS_GetOwnPropertyFlagsInternal(ctx, &desc_flags, JS_VALUE_GET_OBJ(target), atom);
     if (res < 0)
         return -1;
-    if (res && (!(desc_flags & JS_PROP_CONFIGURABLE) || !p->extensible)) {
-        JS_ThrowTypeError(ctx, "proxy: inconsistent has");
+    if (!res)
+        return 0;                                   /* step 9.a: the target has not got it either */
+    if (!(desc_flags & JS_PROP_CONFIGURABLE))       /* step 9.b.i */
+        goto fail;
+    /* step 9.b.ii is IsExtensible(target), the INTERNAL METHOD. This read `p->extensible`, the target
+       JSObject's storage bit, which for a Proxy target is the proxy's own flag rather than its answer — the
+       routed path was fixed when it became a machine and this, the C hook's half, was not. */
+    ext = JS_IsExtensible(ctx, target);
+    if (ext < 0)
         return -1;
-    }
+    if (!ext)                                       /* step 9.b.iii */
+        goto fail;
     return 0;
+fail:
+    JS_ThrowTypeError(ctx, "proxy: inconsistent has");
+    return -1;
 }
 
 static int js_proxy_has(JSContext *ctx, JSValueConst obj, JSAtom atom)
