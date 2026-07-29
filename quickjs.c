@@ -19177,6 +19177,10 @@ static int js_proxy_define_invariant(JSContext *ctx, JSValueConst target, JSAtom
    accessors and reads nothing of the page's, so it is the same operation wherever [[GetOwnProperty]] was
    performed — the C path, the in-place request, and the trap's continuation all end here. */
 static JSValue js_desc_to_object(JSContext *ctx, JSPropertyDescriptor *desc);
+static int js_proxy_gopd_pre(JSContext *ctx, JSValueConst obj, JSValueConst trap_result_obj,
+                             JSAtom prop, int *ptd_flags, int *ptd_ret, int *pextensible);
+static int js_proxy_gopd_post(JSContext *ctx, JSPropertyDescriptor *presult, int target_desc_flags,
+                              int target_desc_ret, int extensible_target, JSPropertyDescriptor *pdesc);
 static int js_proxy_gopd_check(JSContext *ctx, JSValueConst obj, JSAtom prop,
                                JSValue trap_result_obj, JSPropertyDescriptor *pdesc);
 
@@ -19276,6 +19280,12 @@ typedef struct JSOpKeyed {
                                   which is why it re-enters the one keyed-operation entry instead of getting a
                                   reader of its own, and why a handler that is a Proxy simply recurses through it
                                   with no C stack at all. This continuation is the operation WAITING for it. */
+#define CONT_GOPD_DESC     55  /* gp_outer = JSGopdDesc: 10.5.5 step 13's ToPropertyDescriptor of a
+                                  `getOwnPropertyDescriptor` TRAP's result. Twelve keyed operations on an object
+                                  the page returned, so twelve REQUESTS — and the [[GetOwnProperty]] they belong
+                                  to is parked across them, exactly as a handler's trap READ parks it. It is the
+                                  same nesting CONT_TRAP_GET already is: a keyed request whose outer is not a
+                                  machine but another keyed OPERATION, carrying what waits on that one. */
 typedef struct JSTrapGet {
     JSValue obj;         /* the proxy the operation is on (owned) */
     JSValue val;         /* GP_SET / GP_DEFINE's operand (owned) */
@@ -20147,6 +20157,7 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_FOROF_ENUMREC_GET:
     case CONT_FOROF_ENUMREC_WRAP:
     case CONT_TRAP_GET:
+    case CONT_GOPD_DESC:
     case CONT_OP_KEYED:
         break;
     }
@@ -21197,6 +21208,24 @@ static void js_desc_cursor_free(JSContext *ctx, JSDescCursor *c)
     JS_FreeValue(ctx, c->getter);
     JS_FreeValue(ctx, c->setter);
 }
+
+typedef struct JSGopdDesc {
+    JSValue obj;         /* the proxy the [[GetOwnProperty]] is on (owned) */
+    JSAtom atom;         /* its key (owned) */
+    void *outer;         /* what is waiting on the OPERATION, not on these reads */
+    uint8_t outer_kind;
+    int td_flags, td_ret, extensible;   /* steps 10 and 12, performed before the walk as the spec orders them */
+    JSDescCursor cur;    /* the walk itself, resumable between any two of its twelve operations */
+} JSGopdDesc;
+
+static void js_gopd_desc_free(JSContext *ctx, JSGopdDesc *gd)
+{
+    js_desc_cursor_free(ctx, &gd->cur);
+    JS_FreeValue(ctx, gd->obj);
+    JS_FreeAtom(ctx, gd->atom);
+    js_free_rt(ctx->rt, gd);
+}
+
 
 static int js_desc_cursor_run(JSContext *ctx, JSDescCursor *c, JSValueConst desc, JSValue in,
                               JSValue **out_cb, int *out_argc);
@@ -25636,6 +25665,44 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
 
+        do_gopd_desc_step:
+            /* 10.5.5 step 13, one keyed operation at a time. `ret_val` is the previous one's answer
+               (UNINITIALIZED on entry). When the walk finishes, steps 14-17 run on the parsed descriptor and the
+               [[GetOwnProperty]] the walk was parked inside delivers its result. */
+            {
+                JSGopdDesc *gd = (JSGopdDesc *)cont_st;
+                JSValue *dcb = NULL; int dargc = 0;
+                int dr = js_desc_cursor_run(ctx, &gd->cur, gd->cur.cb[0], ret_val, &dcb, &dargc);
+                ret_val = JS_UNDEFINED;
+                cont_st = NULL;
+                if (dr > 0) {
+                    DCHECK(dr == 6 || dr == 7, "the descriptor walk asked for something that is not a keyed read");
+                    gp_obj = gd->cur.cb[0]; gp_atom = (JSAtom)dargc;
+                    gp_op = (dr == 7) ? GP_HAS : GP_GET;
+                    gp_val = JS_UNDEFINED; gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
+                    gp_outer = gd; gp_outer_kind = CONT_GOPD_DESC;
+                    goto do_getprop_tramp;
+                }
+                {
+                    JSPropertyDescriptor rd, od;
+                    int pres;
+                    gp_outer = gd->outer; gp_outer_kind = gd->outer_kind;
+                    if (dr < 0) {   /* a field read or the walk's own validation threw */
+                        js_gopd_desc_free(ctx, gd);
+                        goto getprop_throw;
+                    }
+                    rd.flags = gd->cur.flags;
+                    rd.value = gd->cur.value; rd.getter = gd->cur.getter; rd.setter = gd->cur.setter;
+                    gd->cur.value = gd->cur.getter = gd->cur.setter = JS_UNDEFINED;   /* the record owns them now */
+                    pres = js_proxy_gopd_post(ctx, &rd, gd->td_flags, gd->td_ret, gd->extensible, &od);
+                    js_gopd_desc_free(ctx, gd);
+                    if (pres < 0) goto getprop_throw;
+                    ret_val = js_desc_to_object(ctx, &od);
+                    if (unlikely(JS_IsException(ret_val))) goto getprop_throw;
+                    goto do_getprop_complete;
+                }
+            }
+
         do_getprop_tramp:
             /* A keyed property OPERATION requested by a step machine — a READ or a HasProperty. Three shapes, ONE
                entry: a Proxy trap and a bytecode accessor are user code and run ON THIS CHAIN, so a loop in either
@@ -25909,7 +25976,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         ret_val = JS_GetPropertyInternal(ctx, fwd ? gp_fwd : gp_obj, gp_atom, gp_recv_r, false);
                         if (unlikely(JS_IsException(ret_val))) goto getprop_throw;
                     }
-                    cont_st = gp_outer;                            /* nothing suspended: straight to the machine */
+                do_getprop_complete:
+                    /* THE ONE delivery of a completed keyed OPERATION to whatever was waiting on it. Reached
+                       in-place (nothing suspended) and from the descriptor walk, whose twelve requests finish an
+                       operation that suspended long before. */
+                    cont_st = gp_outer;
                     { uint8_t gk = gp_outer_kind;
                       void *gouter0 = gp_outer;
                       gp_outer = NULL; gp_outer_kind = CONT_NONE; gp_atom = JS_ATOM_NULL;
@@ -25917,6 +25988,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                       /* the operation just completed owns its trap read no longer; its operands were borrowed
                          from it and are done being read. */
                       if (gp_trapst) { js_trapget_free(ctx, gp_trapst); gp_trapst = NULL; }
+                      if (gk == CONT_GOPD_DESC) {
+                          /* a descriptor field read that invoked nothing — the ordinary shape, since most trap
+                             results are plain objects. Back into the walk with the answer. */
+                          cont_st = gouter0;
+                          goto do_gopd_desc_step;
+                      }
                       if (gk == CONT_TRAP_GET) {
                           /* a handler TRAP READ that invoked nothing — a data property on the handler, which is
                              every ordinary proxy. Restore the operation waiting on it and re-enter with the
@@ -26058,6 +26135,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     gp_outer = NULL; gp_outer_kind = CONT_NONE; gp_atom = JS_ATOM_NULL;
                     gp_op = GP_GET; gp_val = JS_UNDEFINED;
                     if (gp_trapst) { js_trapget_free(ctx, gp_trapst); gp_trapst = NULL; }
+                    if (gk3 == CONT_GOPD_DESC) {
+                        /* a descriptor field read threw in place. The operation the walk is parked inside can
+                           never finish, so the throw unwinds one level and this very label handles it for
+                           whatever was waiting on that operation. */
+                        JSGopdDesc *gd = gouter;
+                        gp_outer = gd->outer; gp_outer_kind = gd->outer_kind;
+                        js_gopd_desc_free(ctx, gd);
+                        goto getprop_throw;
+                    }
                     if (gk3 == CONT_TRAP_GET) {
                         /* the handler's trap READ threw in place (a revoked handler, a poisoned accessor that
                            invoked nothing). The operation waiting on it can never run, so the throw unwinds one
@@ -28946,7 +29032,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                     DCHECK(gouter_kind == CONT_STEP || gouter_kind == CONT_ITER_CONSUME
                            || gouter_kind == CONT_ACQUIRE_GET || gouter_kind == CONT_ITER_CLOSE
-                           || gouter_kind == CONT_TRAP_GET || gouter_kind == CONT_OP_KEYED
+                           || gouter_kind == CONT_TRAP_GET || gouter_kind == CONT_GOPD_DESC
+                           || gouter_kind == CONT_OP_KEYED
                            || gouter_kind == CONT_FOROF_GET || gouter_kind == CONT_FORAWAIT_GET
                            || gouter_kind == CONT_FORAWAIT_SYNC_GET
                            || gouter_kind == CONT_ITER_CALL_GET || gouter_kind == CONT_ITER_CALL_GET_NOARG
@@ -29025,6 +29112,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (gk9 == CONT_FORAWAIT_SYNC_GET) goto do_forawait_have_sync_method;
                         goto do_forof_have_method;
                     }
+                    if (gouter_kind == CONT_GOPD_DESC) {
+                        /* a descriptor field was produced by USER CODE — an accessor on the trap's result, or a
+                           result that is itself a Proxy whose `get`/`has` trap ran on this chain. */
+                        JSGopdDesc *gd = gouter;
+                        if (!JS_IsUndefined(gp->target))
+                            ret_val = js_proxy_get_invariant(ctx, gp->target, gp->atom, ret_val);
+                        js_getprop_free(ctx, gp);
+                        if (unlikely(JS_IsException(ret_val))) {
+                            gp_outer = gd->outer; gp_outer_kind = gd->outer_kind;
+                            js_gopd_desc_free(ctx, gd);
+                            goto getprop_throw;
+                        }
+                        cont_st = gd;
+                        goto do_gopd_desc_step;
+                    }
                     if (gouter_kind == CONT_TRAP_GET) {
                         /* a handler's trap property was produced by USER CODE — an accessor on the handler, or a
                            handler that is itself a Proxy whose `get` trap ran on this chain. The operation
@@ -29084,12 +29186,32 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         goto do_consume_acquire_have_method;
                     }
                     if (gp->op == GP_GETOWNPROP) {
-                        /* the `getOwnPropertyDescriptor` trap returned. 10.5.5 steps 9-17 run on it — the same
-                           check the C hook performs — and the machine is handed the descriptor OBJECT, or
-                           undefined when the property is absent. */
-                        JSPropertyDescriptor gd;
-                        int gres = js_proxy_gopd_check(ctx, gp->value, gp->atom, ret_val, &gd);
-                        ret_val = (gres < 0) ? JS_EXCEPTION : gres ? js_desc_to_object(ctx, &gd) : JS_UNDEFINED;
+                        /* the `getOwnPropertyDescriptor` trap returned. Steps 9-12 run here — the trap result's
+                           shape, the TARGET's own descriptor and its extensibility, all ordered before the walk —
+                           and then step 13's ToPropertyDescriptor becomes TWELVE REQUESTS on an object the page
+                           returned. It used to be js_obj_to_desc from C, which is why a descriptor whose fields
+                           are accessors or a Proxy preempted with no flow base. */
+                        int td_flags = 0, td_ret = 0, ext = 0;
+                        int pres = js_proxy_gopd_pre(ctx, gp->value, ret_val, gp->atom, &td_flags, &td_ret, &ext);
+                        if (pres > 0) {
+                            JSGopdDesc *gd = js_mallocz(ctx, sizeof(*gd));
+                            if (unlikely(!gd)) { JS_FreeValue(ctx, ret_val); JS_ThrowOutOfMemory(ctx); ret_val = JS_EXCEPTION; }
+                            else {
+                                gd->obj = js_dup(gp->value);
+                                gd->atom = JS_DupAtom(ctx, gp->atom);
+                                gd->outer = gouter; gd->outer_kind = gouter_kind;
+                                gd->td_flags = td_flags; gd->td_ret = td_ret; gd->extensible = ext;
+                                js_desc_cursor_init(&gd->cur);
+                                gd->cur.cb[0] = ret_val;   /* the trap's result: the operand of all twelve */
+                                js_getprop_free(ctx, gp);
+                                cont_st = gd;
+                                ret_val = JS_UNINITIALIZED;
+                                goto do_gopd_desc_step;
+                            }
+                        } else {
+                            JS_FreeValue(ctx, ret_val);
+                            ret_val = (pres < 0) ? JS_EXCEPTION : JS_UNDEFINED;
+                        }
                     } else if (gp->op == GP_OWNKEYS) {
                         /* the `ownKeys` trap returned its List. 10.5.11 steps 8-22 run on it — the same check the
                            C hook performs, shared so the two cannot drift — and what the machine is handed is the
@@ -33087,7 +33209,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             void *gouter = gp->outer;
             uint8_t gk2 = gp->outer_kind;
             DCHECK(!gouter || gk2 == CONT_STEP || gk2 == CONT_ITER_CONSUME || gk2 == CONT_ACQUIRE_GET
-                   || gk2 == CONT_ITER_CLOSE || gk2 == CONT_TRAP_GET || gk2 == CONT_OP_KEYED
+                   || gk2 == CONT_ITER_CLOSE || gk2 == CONT_TRAP_GET || gk2 == CONT_GOPD_DESC
+                   || gk2 == CONT_OP_KEYED
                    || gk2 == CONT_PROMISE_ALL_THEN || gk2 == CONT_AFS_GET
                    || gk2 == CONT_ITER_HELPER_GET || gk2 == CONT_PROMISE_ALL_GET
                    || gk2 == CONT_FOROF_UNPACK || gk2 == CONT_CONSUME_NEXT_GET
@@ -33152,6 +33275,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSOpKeyed *ok = gouter;
                 JS_FreeAtom(ctx, ok->atom); js_free_rt(rt, ok);
                 gouter = NULL;
+            } else if (gouter && gk2 == CONT_GOPD_DESC) {
+                /* a descriptor field's accessor (or the result-Proxy's trap) threw after suspending. Same as the
+                   in-place arm: the operation can never finish, so the throw unwinds one level. */
+                JSGopdDesc *gd = gouter;
+                gp_outer = gd->outer; gp_outer_kind = gd->outer_kind;
+                js_gopd_desc_free(ctx, gd);
+                goto getprop_throw;
             } else if (gouter && gk2 == CONT_TRAP_GET) {
                 /* a handler's trap ACCESSOR (or a handler-Proxy's own `get` trap) threw after suspending. The
                    operation waiting for the trap can never run; the throw unwinds one level and the in-place
@@ -70759,42 +70889,51 @@ static JSValue js_create_desc(JSContext *ctx, JSValueConst val,
    the same split every proxy operation makes — so the check lives here, called both by the C hook below and by
    the tramp continuation, which has already run the trap on the interpreter's chain.
    CONSUMES trap_result_obj. Returns 1 with *pdesc filled, 0 for absent, -1 having thrown. */
-static int js_proxy_gopd_check(JSContext *ctx, JSValueConst obj, JSAtom prop,
-                               JSValue trap_result_obj, JSPropertyDescriptor *pdesc)
+/* 10.5.5 steps 9-12: the trap result's shape, the TARGET's own descriptor and its extensibility — every one of
+   them ordered BEFORE step 13's ToPropertyDescriptor. Split out because that ToPropertyDescriptor is twelve
+   keyed operations on an object the page returned, so on the interpreter's chain it suspends, and everything the
+   invariant needs afterwards has to have been computed and parked first.
+   Returns 1 = go on to the descriptor walk (trap_result_obj NOT consumed), 0 = the property is absent (consumed),
+   -1 = threw (consumed). */
+static int js_proxy_gopd_pre(JSContext *ctx, JSValueConst obj, JSValueConst trap_result_obj,
+                             JSAtom prop, int *ptd_flags, int *ptd_ret, int *pextensible)
 {
     JSProxyData *s = JS_VALUE_GET_OBJ(obj)->u.opaque;
     JSObject *p = JS_VALUE_GET_OBJ(s->target);
-    JSPropertyDescriptor result_desc, target_desc;
-    int res, target_desc_ret, ret;
+    JSPropertyDescriptor target_desc;
+    int target_desc_ret;
 
-    if (!JS_IsObject(trap_result_obj) && !JS_IsUndefined(trap_result_obj)) {
-        JS_FreeValue(ctx, trap_result_obj);
+    if (!JS_IsObject(trap_result_obj) && !JS_IsUndefined(trap_result_obj))
         goto fail;
-    }
     target_desc_ret = JS_GetOwnPropertyInternal(ctx, &target_desc, p, prop);
-    if (target_desc_ret < 0) {
-        JS_FreeValue(ctx, trap_result_obj);
+    if (target_desc_ret < 0)
         return -1;
-    }
     if (target_desc_ret)
-        js_free_desc(ctx, &target_desc);
+        js_free_desc(ctx, &target_desc);   /* only its FLAGS outlive it, and those are not owned */
+    *ptd_ret = target_desc_ret;
+    *ptd_flags = target_desc_ret ? target_desc.flags : 0;
     if (JS_IsUndefined(trap_result_obj)) {
-        if (target_desc_ret) {
-            if (!(target_desc.flags & JS_PROP_CONFIGURABLE) || !p->extensible)
-                goto fail;
-        }
-        ret = false;
-    } else {
-        int flags1, extensible_target;
-        extensible_target = JS_IsExtensible(ctx, s->target);
-        if (extensible_target < 0) {
-            JS_FreeValue(ctx, trap_result_obj);
-            return -1;
-        }
-        res = js_obj_to_desc(ctx, &result_desc, trap_result_obj);
-        JS_FreeValue(ctx, trap_result_obj);
-        if (res < 0)
-            return -1;
+        if (target_desc_ret && (!(target_desc.flags & JS_PROP_CONFIGURABLE) || !p->extensible))
+            goto fail;
+        return 0;
+    }
+    *pextensible = JS_IsExtensible(ctx, s->target);
+    if (*pextensible < 0)
+        return -1;
+    return 1;
+fail:
+    JS_ThrowTypeError(ctx, "proxy: inconsistent getOwnPropertyDescriptor");
+    return -1;
+}
+
+/* 10.5.5 steps 14-17, on the PARSED descriptor. CONSUMES result_desc. Returns 1 with *pdesc filled, -1 having
+   thrown. */
+static int js_proxy_gopd_post(JSContext *ctx, JSPropertyDescriptor *presult, int target_desc_flags,
+                              int target_desc_ret, int extensible_target, JSPropertyDescriptor *pdesc)
+{
+    JSPropertyDescriptor result_desc = *presult;
+    int flags1;
+    {
         /* js_obj_to_desc reads a descriptor OBJECT and reports which fields were PRESENT (JS_PROP_HAS_*); a
            [[GetOwnProperty]] result is a descriptor RECORD, whose accessor-ness is JS_PROP_GETSET. Every other
            object kind fills the record form, so a proxy has to as well — otherwise the same accessor property
@@ -70813,35 +70952,51 @@ static int js_proxy_gopd_check(JSContext *ctx, JSValueConst obj, JSAtom prop,
                 flags1 |= JS_PROP_HAS_VALUE | JS_PROP_HAS_WRITABLE;
             /* XXX: not complete check: need to compare value &
                getter/setter as in defineproperty */
-            if (!check_define_prop_flags(target_desc.flags, flags1))
+            if (!check_define_prop_flags(target_desc_flags, flags1))
                 goto fail1;
         } else {
             if (!extensible_target)
                 goto fail1;
         }
         if (!(result_desc.flags & JS_PROP_CONFIGURABLE)) {
-            if (!target_desc_ret || (target_desc.flags & JS_PROP_CONFIGURABLE))
+            if (!target_desc_ret || (target_desc_flags & JS_PROP_CONFIGURABLE))
                 goto fail1;
             if ((result_desc.flags &
                  (JS_PROP_GETSET | JS_PROP_WRITABLE)) == 0 &&
                 target_desc_ret &&
-                (target_desc.flags & JS_PROP_WRITABLE) != 0) {
+                (target_desc_flags & JS_PROP_WRITABLE) != 0) {
                 /* proxy-missing-checks */
             fail1:
                 js_free_desc(ctx, &result_desc);
-            fail:
                 JS_ThrowTypeError(ctx, "proxy: inconsistent getOwnPropertyDescriptor");
                 return -1;
             }
         }
-        ret = true;
         if (pdesc) {
             *pdesc = result_desc;
         } else {
             js_free_desc(ctx, &result_desc);
         }
     }
-    return ret;
+    return 1;
+}
+
+/* The C form: pre, the C-side ToPropertyDescriptor, post. Its ONE remaining caller is js_proxy_get_own_property,
+   the C [[GetOwnProperty]] hook — every consumer routed onto GP_GETOWNPROP runs the same three steps on the
+   interpreter's chain, with the walk as twelve requests instead. CONSUMES trap_result_obj. */
+static int js_proxy_gopd_check(JSContext *ctx, JSValueConst obj, JSAtom prop,
+                               JSValue trap_result_obj, JSPropertyDescriptor *pdesc)
+{
+    JSPropertyDescriptor result_desc;
+    int td_flags = 0, td_ret = 0, extensible = 0, r;
+
+    r = js_proxy_gopd_pre(ctx, obj, trap_result_obj, prop, &td_flags, &td_ret, &extensible);
+    if (r <= 0) { JS_FreeValue(ctx, trap_result_obj); return r; }
+    r = js_obj_to_desc(ctx, &result_desc, trap_result_obj);
+    JS_FreeValue(ctx, trap_result_obj);
+    if (r < 0)
+        return -1;
+    return js_proxy_gopd_post(ctx, &result_desc, td_flags, td_ret, extensible, pdesc);
 }
 
 static int js_proxy_get_own_property(JSContext *ctx, JSPropertyDescriptor *pdesc,
