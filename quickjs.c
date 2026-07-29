@@ -1496,6 +1496,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_OBJ_ISEXT, STEPDEF_REFLECT_ISEXT, STEPDEF_OBJ_PREVEXT, STEPDEF_REFLECT_PREVEXT,
     STEPDEF_OBJ_SETPROTO, STEPDEF_REFLECT_SETPROTO,
     STEPDEF_JSON_STRINGIFY, STEPDEF_FOR_IN, STEPDEF_IMPORT_OPTS,
+    STEPDEF_OBJ_HASOWN, STEPDEF_OBJ_HASOWNPROP,
     STEPDEF_COUNT
 };
 #define HINT_NONE    2
@@ -22243,6 +22244,8 @@ typedef struct JSJsonStr {
 static int js_json_str_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_json_str_fini(JSContext *ctx, void *st, bool take_result);
 static int js_for_in_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static int js_hasown_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_hasown_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_for_in_fini(JSContext *ctx, void *st, bool take_result);
 static int js_json_parse_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_json_parse_vfini(JSContext *ctx, void *st, bool take_result);
@@ -57293,57 +57296,86 @@ static JSValue js_object_preventExtensions(JSContext *ctx, JSValueConst this_val
     }
 }
 
-static JSValue js_object_hasOwnProperty(JSContext *ctx, JSValueConst this_val,
-                                        int argc, JSValueConst *argv)
-{
-    JSValue obj;
-    JSAtom atom;
-    JSObject *p;
-    int ret;
+/* 20.1.3.2 Object.prototype.hasOwnProperty and 20.1.2.13 Object.hasOwn: ONE machine, because they are the same
+   three steps and differ only in their ORDER — hasOwnProperty coerces the KEY first and hasOwn the OBJECT — which
+   is a spec operand and not a variation to hide behind two implementations. Both steps are the page's code:
+   ToPropertyKey runs a key object's toString, and HasOwnProperty(O, P) is O.[[GetOwnProperty]](P), a trap on a
+   Proxy. The C bodies ran both, and interned the key with JS_ValueToAtom rather than ToPropertyKey. */
+typedef struct JSHasOwn {
+    JSStepHdr hdr;    /* MUST be first */
+    JSValue obj;      /* ToObject's result (owned) */
+    JSAtom key;       /* ToPropertyKey's result (owned) */
+    JSValue result;   /* DONE (owned) */
+} JSHasOwn;
+#define HASOWN_STATIC 1   /* Object.hasOwn(O, P); 0 = Object.prototype.hasOwnProperty(V) */
 
-    atom = JS_ValueToAtom(ctx, argv[0]); /* must be done first */
-    if (unlikely(atom == JS_ATOM_NULL))
-        return JS_EXCEPTION;
-    obj = JS_ToObject(ctx, this_val);
-    if (JS_IsException(obj)) {
-        JS_FreeAtom(ctx, atom);
-        return obj;
-    }
-    p = JS_VALUE_GET_OBJ(obj);
-    ret = JS_GetOwnPropertyInternal(ctx, NULL, p, atom);
-    JS_FreeAtom(ctx, atom);
-    JS_FreeValue(ctx, obj);
-    if (ret < 0)
-        return JS_EXCEPTION;
-    else
-        return js_bool(ret);
+/* ToObject on the operand this form takes. It runs no user code — a primitive wraps, an object is itself — but
+   it THROWS for null/undefined, which is step 2 of one form and step 1 of the other. */
+static int js_hasown_toobject(JSContext *ctx, JSHasOwn *s)
+{
+    JSValueConst src = (s->hdr.arg & HASOWN_STATIC) ? step_arg(&s->hdr, 0) : s->hdr.this_val;
+    s->obj = JS_ToObject(ctx, src);
+    return JS_IsException(s->obj) ? -1 : 0;
 }
 
-static JSValue js_object_hasOwn(JSContext *ctx, JSValueConst this_val,
-                                int argc, JSValueConst *argv)
+static int js_hasown_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    JSValue obj;
-    JSAtom atom;
-    JSObject *p;
-    int ret;
+    JSHasOwn *s = st;
+    bool statik = (s->hdr.arg & HASOWN_STATIC) != 0;
+    JSValueConst keysrc = statik ? step_arg(&s->hdr, 1) : step_arg(&s->hdr, 0);
+    int r;
 
-    obj = JS_ToObject(ctx, argv[0]);
-    if (JS_IsException(obj))
-        return obj;
-    atom = JS_ValueToAtom(ctx, argv[1]);
-    if (unlikely(atom == JS_ATOM_NULL)) {
-        JS_FreeValue(ctx, obj);
-        return JS_EXCEPTION;
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result);
+        cb_result = JS_UNDEFINED;
+        s->obj = JS_UNDEFINED; s->key = JS_ATOM_NULL; s->result = JS_UNDEFINED;
+        s->hdr.stage = 1;
+        if (statik && js_hasown_toobject(ctx, s) < 0)   /* 20.1.2.13 step 1 */
+            return -1;
     }
-    p = JS_VALUE_GET_OBJ(obj);
-    ret = JS_GetOwnPropertyInternal(ctx, NULL, p, atom);
-    JS_FreeAtom(ctx, atom);
-    JS_FreeValue(ctx, obj);
-    if (ret < 0)
-        return JS_EXCEPTION;
-    else
-        return js_bool(ret);
+    if (s->hdr.stage == 1) {
+        /* ToPropertyKey: step 1 of the prototype form, step 2 of the static one. */
+        r = step_topropkey_run(ctx, &s->hdr, keysrc, cb_result, &s->key, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r != 0)
+            return r;
+        if (!statik && js_hasown_toobject(ctx, s) < 0)   /* 20.1.3.2 step 2 */
+            return -1;
+        s->hdr.stage = 2;
+    }
+    if (s->hdr.stage == 2) {
+        /* HasOwnProperty(O, P) — the object's [[GetOwnProperty]], which on a Proxy is its trap. Only whether it
+           EXISTS is wanted, so the ordinary descriptor-object answer says it: undefined means absent. */
+        JS_FreeValue(ctx, cb_result);
+        s->hdr.stage = 3;
+        s->hdr.cb_coerce[0] = s->obj;   /* borrowed: the machine holds the receiver across the request */
+        *out_cb = s->hdr.cb_coerce; *out_argc = (int)s->key;
+        return 12;
+    }
+    DCHECK(s->hdr.stage == 3, "Object.hasOwn's machine resumed in no stage");
+    if (JS_IsException(cb_result))
+        return -1;
+    s->result = js_bool(!JS_IsUndefined(cb_result));
+    JS_FreeValue(ctx, cb_result);
+    return 0;
 }
+
+static JSValue js_hasown_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSHasOwn *s = st;
+    JSValue r;
+    JS_FreeValue(ctx, s->obj);
+    JS_FreeAtom(ctx, s->key);
+    r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    js_free(ctx, s);
+    return r;
+}
+
+/* DELETED: js_object_hasOwn's C body, and js_object_hasOwnProperty's. Both performed HasOwnProperty(O, P) with
+   JS_GetOwnPropertyInternal from C — a Proxy's `getOwnPropertyDescriptor` trap with no flow base — and both
+   interned the key with JS_ValueToAtom rather than ToPropertyKey, so a key object's `toString` ran from C too.
+   They are one step machine (STEPDEF_OBJ_HASOWN), the arg choosing which of the two ORDERS the spec states. */
 
 static JSValue js_object_valueOf(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv)
@@ -57745,14 +57777,14 @@ static const JSCFunctionListEntry js_object_funcs[] = {
     JS_CFUNC_MAGIC_DEF("isSealed", 1, js_object_isSealed, 0 ),
     JS_CFUNC_MAGIC_DEF("isFrozen", 1, js_object_isSealed, 1 ),
     JS_CFUNC_CONSUME_DEF("fromEntries", 1, ITERCONS_OBJENTRIES ),
-    JS_CFUNC_DEF("hasOwn", 2, js_object_hasOwn ),
+    JS_CFUNC_STEP_DEF("hasOwn", 2, STEPDEF_OBJ_HASOWN ),
 };
 
 static const JSCFunctionListEntry js_object_proto_funcs[] = {
     JS_CFUNC_DEF("toString", 0, js_object_toString ),
     JS_CFUNC_DEF("toLocaleString", 0, js_object_toLocaleString ),
     JS_CFUNC_DEF("valueOf", 0, js_object_valueOf ),
-    JS_CFUNC_DEF("hasOwnProperty", 1, js_object_hasOwnProperty ),
+    JS_CFUNC_STEP_DEF("hasOwnProperty", 1, STEPDEF_OBJ_HASOWNPROP ),
     JS_CFUNC_DEF("isPrototypeOf", 1, js_object_isPrototypeOf ),
     JS_CFUNC_DEF("propertyIsEnumerable", 1, js_object_propertyIsEnumerable ),
     JS_CGETSET_DEF("__proto__", js_object_get___proto__, js_object_set___proto__ ),
@@ -61959,6 +61991,8 @@ static const JSTrampStepDef js_array_sort_def    = { sizeof(JSArraySort), js_arr
 static const JSTrampStepDef js_array_toSorted_def = { sizeof(JSArraySort), js_array_sort_vstep, js_array_sort_vfini, 1 };
 static const JSTrampStepDef js_json_parse_def    = { sizeof(JSJsonReviver), js_json_parse_vstep, js_json_parse_vfini, 0 };
 static const JSTrampStepDef js_for_in_def       = { sizeof(JSForIn), js_for_in_step, js_for_in_fini, 0 };
+static const JSTrampStepDef js_hasown_def      = { sizeof(JSHasOwn), js_hasown_step, js_hasown_fini, HASOWN_STATIC };
+static const JSTrampStepDef js_hasownprop_def  = { sizeof(JSHasOwn), js_hasown_step, js_hasown_fini, 0 };
 static const JSTrampStepDef js_import_opts_def  = {
     sizeof(JSImportOpts), js_import_opts_step, js_import_opts_fini, 0,
     /* body, body_proto, body_magic, precheck, midcheck, onerror */ {NULL}, 0, 0, NULL, NULL, NULL,
@@ -62430,6 +62464,8 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_JSON_PARSE]    = &js_json_parse_def,
     [STEPDEF_JSON_STRINGIFY] = &js_json_str_def,
     [STEPDEF_FOR_IN]         = &js_for_in_def,
+    [STEPDEF_OBJ_HASOWN]     = &js_hasown_def,
+    [STEPDEF_OBJ_HASOWNPROP] = &js_hasownprop_def,
     [STEPDEF_IMPORT_OPTS]    = &js_import_opts_def,
     [STEPDEF_TA_SLICE]      = &js_ta_slice_def,
     [STEPDEF_STR_CONCAT]    = &js_str_concat_def,
@@ -62645,6 +62681,7 @@ STEP_STATE_HDR_FIRST(JSReSearch);
 STEP_STATE_HDR_FIRST(JSJsonReviver);
 STEP_STATE_HDR_FIRST(JSJsonStr);
 STEP_STATE_HDR_FIRST(JSForIn);
+STEP_STATE_HDR_FIRST(JSHasOwn);
 STEP_STATE_HDR_FIRST(JSImportOpts);
 STEP_STATE_HDR_FIRST(JSStrCtor);
 STEP_STATE_HDR_FIRST(JSStrConcat);
