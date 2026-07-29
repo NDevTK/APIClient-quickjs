@@ -20023,6 +20023,18 @@ _Static_assert(CONT_ITER_CONSUME_FWD == CONT_ITER_CONSUME, "the forward alias us
 _Static_assert(CONT_PROMISE_ALL_FWD == CONT_PROMISE_ALL, "the forward alias used by the capability abandon must equal CONT_PROMISE_ALL");
 _Static_assert(CONT_ITER_HELPER_FWD == CONT_ITER_HELPER, "the forward alias used by the abandon walk must equal CONT_ITER_HELPER");
 
+#define CONT_WITH_HAS      60  /* cont_state = JSWithHas: 9.1.1.2.1 HasBinding step 2, the object Environment
+                                  Record's own HasProperty, which decides whether a `with` reference resolves
+                                  here or falls through to the enclosing scope. On a Proxy base it is the `has`
+                                  trap, and the opcode ran it from C. The record carries the operands the
+                                  opcode parsed, because a suspension resumes with none of its locals. */
+typedef struct JSWithHas {
+    JSAtom atom;         /* BORROWED from the bytecode's atom table, which outlives the frame */
+    int32_t diff;        /* the jump the FOUND path takes */
+    uint8_t op;          /* which OP_with_* this is */
+    uint8_t is_with;     /* 1 = a real `with`, so @@unscopables applies */
+} JSWithHas;
+
 #define CONT_KEYED_INV     59  /* gp_outer = JSKeyedInv: 10.5.7 step 9 / 10.5.10 steps 9-12, which read the
                                   TARGET's descriptor bits and its extensibility — internal methods both, so a
                                   Proxy target answers with its traps and neither can run from C. */
@@ -20106,6 +20118,7 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_OWNKEYS_CHK:
     case CONT_PROXY_INV:
     case CONT_KEYED_INV:
+    case CONT_WITH_HAS:
         break;
     }
 }
@@ -20700,6 +20713,7 @@ static void js_create_requester_abandon(JSContext *ctx, void *cont, uint8_t kind
     if (kind == CONT_OWNKEYS_CHK) { js_ownkeys_chk_free(ctx, cont); return; }
     if (kind == CONT_PROXY_INV) { js_proxy_inv_free(ctx, cont); return; }
     if (kind == CONT_KEYED_INV) { js_keyed_inv_free(ctx, cont); return; }
+    if (kind == CONT_WITH_HAS) { js_free_rt(ctx->rt, cont); return; }
     if (kind == CONT_STEP) { tramp_step_chain_free(ctx, cont); return; }
     if (kind == CONT_PROMISE_ALL) {
         js_promise_all_end(ctx, (struct JSPromiseAll *)cont); js_free_rt(ctx->rt, cont); return;
@@ -27210,6 +27224,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                           cont_st = gouter0;
                           goto do_opkeyed_place;
                       }
+                      if (gk == CONT_WITH_HAS) {
+                          /* HasBinding's HasProperty, answered with nothing suspended — every ordinary base. */
+                          cont_st = gouter0;
+                          goto do_with_has_deliver;
+                      }
                       if (gk == CONT_KEYED_INV) {
                           /* the keyed invariant's own request, answered with nothing suspended. */
                           cont_st = gouter0;
@@ -27370,6 +27389,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         gp_outer = gd->outer; gp_outer_kind = gd->outer_kind;
                         js_gopd_desc_free(ctx, gd);
                         goto getprop_throw;
+                    }
+                    if (gk3 == CONT_WITH_HAS) {
+                        /* the `has` trap threw in place: the opcode can never finish, and its base object is
+                           left for the frame's own catch-search like any throwing operator's operand. */
+                        js_free_rt(rt, gouter);
+                        goto exception;
                     }
                     if (gk3 == CONT_KEYED_INV) {
                         /* the keyed invariant's own read threw in place: the operation it is parked inside can
@@ -30296,7 +30321,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            || gouter_kind == CONT_ITER_HELPER_GET || gouter_kind == CONT_PROMISE_ALL_GET
                            || gouter_kind == CONT_FOROF_UNPACK || gouter_kind == CONT_FOR_IN_HAS
                            || gouter_kind == CONT_OWNKEYS_CHK || gouter_kind == CONT_PROXY_INV
-                           || gouter_kind == CONT_KEYED_INV,
+                           || gouter_kind == CONT_KEYED_INV || gouter_kind == CONT_WITH_HAS,
                            "property-get outer continuation: unknown machine kind");
                     if (gouter_kind == CONT_PROMISE_ALL_THEN) {
                         js_getprop_free(ctx, gp);
@@ -30659,6 +30684,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         /* for-in's deletion check whose `has` trap SUSPENDED. Same restoration as above, so the
                            iterator is back at sp[-1] and the loop resumes exactly where it asked. */
                         goto do_for_in_has_deliver;
+                    }
+                    if (gouter_kind == CONT_WITH_HAS) {
+                        /* HasBinding's `has` trap SUSPENDED. The frame's own operand drop above has restored sp
+                           to where the opcode left its base object, which is what the delivery reads. */
+                        cont_st = gouter;
+                        if (unlikely(JS_IsException(ret_val))) {
+                            js_free_rt(rt, gouter);
+                            goto exception;
+                        }
+                        goto do_with_has_deliver;
                     }
                     if (gouter_kind == CONT_KEYED_INV) {
                         /* one of the keyed invariant's own requests — the target's descriptor bits or its
@@ -34088,17 +34123,42 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int32_t diff;
                 JSValue obj, val;
                 int ret, is_with;
+                JSWithHas *wh;
                 atom = get_u32(pc);
                 diff = get_u32(pc + 4);
                 is_with = pc[8];
                 pc += 9;
                 sf->cur_pc = pc;
+                /* 9.1.1.2.1 HasBinding step 2 is the object Environment Record's own HasProperty, and on a
+                   Proxy base that is its `has` trap — this ran it from C, so a trap with a loop in it had no
+                   flow base. The REST of this opcode lives at the delivery below, entered only through the
+                   answer: one implementation, not one here and another there. */
+                wh = js_mallocz(ctx, sizeof(*wh));
+                if (unlikely(!wh)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                wh->atom = atom; wh->diff = diff; wh->op = (uint8_t)opcode; wh->is_with = (uint8_t)is_with;
+                gp_obj = sp[-1]; gp_atom = atom; gp_op = GP_HAS; gp_val = JS_UNDEFINED;
+                gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
+                gp_outer = wh; gp_outer_kind = CONT_WITH_HAS;
+                goto do_getprop_tramp;
+            }
+            BREAK;
+
+        do_with_has_deliver:
+            /* HasBinding answered. Everything the opcode still owes is here, reading the operands the record
+               carried across the suspension; `obj` is sp[-1], which the request left untouched. */
+            {
+                JSAtom atom;
+                int32_t diff;
+                JSValue obj, val;
+                int ret, is_with, opcode;
+                JSWithHas *wh = cont_st;
+                cont_st = NULL;
+                atom = wh->atom; diff = wh->diff; opcode = wh->op; is_with = wh->is_with;
+                js_free_rt(rt, wh);
+                ret = JS_ToBoolFree(ctx, ret_val);
+                ret_val = JS_UNDEFINED;
 
                 obj = sp[-1];
-                /* 9.1.1.2.1 HasBinding step 2 */
-                ret = JS_HasProperty(ctx, obj, atom);
-                if (unlikely(ret < 0))
-                    goto exception;
                 if (ret) {
                     if (is_with) {
                         ret = js_has_unscopable(ctx, obj, atom);
@@ -34676,6 +34736,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             DCHECK(!gouter || gk2 == CONT_STEP || gk2 == CONT_ITER_CONSUME || gk2 == CONT_ACQUIRE_GET
                    || gk2 == CONT_ITER_CLOSE || gk2 == CONT_TRAP_GET || gk2 == CONT_GOPD_DESC
                    || gk2 == CONT_OWNKEYS_CHK || gk2 == CONT_PROXY_INV || gk2 == CONT_KEYED_INV
+                   || gk2 == CONT_WITH_HAS
                    || gk2 == CONT_OP_KEYED
                    || gk2 == CONT_PROMISE_ALL_THEN || gk2 == CONT_AFS_GET
                    || gk2 == CONT_ITER_HELPER_GET || gk2 == CONT_PROMISE_ALL_GET
@@ -34748,6 +34809,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 gp_outer = gd->outer; gp_outer_kind = gd->outer_kind;
                 js_gopd_desc_free(ctx, gd);
                 goto getprop_throw;
+            } else if (gouter && gk2 == CONT_WITH_HAS) {
+                js_free_rt(rt, gouter);
+                goto exception;
             } else if (gouter && gk2 == CONT_KEYED_INV) {
                 /* the same for the keyed invariant once its read has suspended. */
                 JSKeyedInv *kit = gouter;
