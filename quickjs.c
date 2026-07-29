@@ -33188,6 +33188,42 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 atom = JS_ValueToAtom(ctx, sp[-2]);
                 if (unlikely(atom == JS_ATOM_NULL))
                     goto exception;
+                /* `super.x = v` / `super[k] = v`: the home object's PROTOTYPE at sp[-3] is what the write walks,
+                   but the RECEIVER is `this` at sp[-4] — the operand that makes this a different operation from
+                   OP_put_field, and the one the request already carries. This opcode routed NEITHER kind of page
+                   code on that walk while its read twin OP_get_super_value routed both, so a plain `set x(v){…}`
+                   on the superclass prototype was invoked by call_setter from C and a `set` trap by js_proxy_set,
+                   each aborting at its first back-edge with no flow base. Same two routes as the read, with the
+                   receiver taken from sp[-4] instead of sp[-3]. */
+                if ((tramp_px = tramp_proto_proxy(ctx, JS_VALUE_GET_OBJ(sp[-3]), atom)) != NULL) {
+                    /* [[Set]] on a Proxy is the `set` trap plus the READ of that trap off the handler: the one
+                       keyed-operation entry's GP_SET, the same request Reflect.set issues. no_throw is the
+                       WRITER's strictness — 6.2.5.6 PutValue step 6 turns a refused write into a TypeError only
+                       in strict code — and a class body is strict, but an object-literal method carrying a
+                       `super` reference need not be. */
+                    JSOpKeyed *ok = js_mallocz(ctx, sizeof(*ok));
+                    if (unlikely(!ok)) { JS_FreeAtom(ctx, atom); JS_ThrowOutOfMemory(ctx); goto exception; }
+                    ok->atom = atom; ok->pop = 4; ok->push = 0;
+                    gp_obj = JS_MKPTR(JS_TAG_OBJECT, tramp_px); gp_atom = ok->atom; gp_op = GP_SET; gp_val = sp[-1];
+                    gp_recv = sp[-4]; gp_no_throw = !sf->is_strict_mode;
+                    gp_outer = ok; gp_outer_kind = CONT_OP_KEYED;
+                    goto do_getprop_tramp;
+                } else {
+                    JSObject *st = tramp_accessor_setter(ctx, JS_VALUE_GET_OBJ(sp[-3]), atom);
+                    if (st) {   /* bytecode setter -> 1-arg method call [receiver=this, setter, value] */
+                        JSValue v = sp[-1];                             /* the value being written */
+                        JS_FreeAtom(ctx, atom);
+                        JS_FreeValue(ctx, sp[-2]);                      /* the key */
+                        JS_FreeValue(ctx, sp[-3]);                      /* the home object's prototype */
+                        sp[-3] = js_dup(JS_MKPTR(JS_TAG_OBJECT, st));
+                        sp[-2] = v;
+                        sp--;                                           /* [receiver=this][setter][value] */
+                        call_argc = 1; call_argv = sp - call_argc;
+                        tramp_first = -2; tramp_is_tail = 0;
+                        tramp_cont_state = NULL; tramp_cont_kind = CONT_SETTER;   /* do_return discards the result */
+                        goto do_generic_callee;   /* which KIND of callee the setter is, is asked there */
+                    }
+                }
                 ret = JS_SetPropertyInternal2(ctx,
                                               sp[-3], atom,
                                               sp[-1], sp[-4],
