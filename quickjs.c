@@ -1485,6 +1485,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
        into the middle renumbers every id after it — which is fine at compile time and NOT fine for anything that
        already holds one. */
     STEPDEF_ITER_MAP, STEPDEF_ITER_FILTER, STEPDEF_ITER_FLATMAP,
+    STEPDEF_OBJ_GETPROTO, STEPDEF_REFLECT_GETPROTO,
     STEPDEF_COUNT
 };
 #define HINT_NONE    2
@@ -19250,6 +19251,13 @@ typedef struct JSGetProp {
                          exactly what Object/Reflect.getOwnPropertyDescriptor return and what an enumerability
                          test reads. Every C caller of JS_GetOwnPropertyInternal ran that trap through
                          JS_CallFree. */
+#define GP_GETPROTO 7 /* step code 18. [[GetPrototypeOf]] — on a Proxy the `getPrototypeOf` trap, and 10.5.1's
+                         invariant runs on ITS result (an Object or null, and when the target is NOT extensible
+                         the SAME value the target's own [[GetPrototypeOf]] gives). Like [[OwnPropertyKeys]] it
+                         carries no key: the trap takes the target alone and the answer is the prototype. Every
+                         C caller of JS_GetPrototype ran that trap through JS_CallFree, so `Object
+                         .getPrototypeOf(new Proxy(t, {getPrototypeOf(){…loop…}}))` had no flow base — and so did
+                         every prototype-chain walk that crosses a proxy. */
 #define GP_OWNKEYS 5  /* step code 11. [[OwnPropertyKeys]] — on a Proxy the `ownKeys` trap, and 10.5.11's
                          invariant runs on ITS result (no duplicates, strings/symbols only, every
                          non-configurable target key present, and an exact match when the target is not
@@ -19265,6 +19273,7 @@ typedef struct JSGetProp {
 /* 10.5.11 steps 8-22 applied to the trap's result, then CreateArrayFromList over the validated keys — the
    answer GP_OWNKEYS delivers. CONSUMES prop_array. */
 static JSValue js_proxy_ownkeys_result(JSContext *ctx, JSValueConst proxy, JSValue prop_array);
+static JSValue js_proxy_getproto_invariant(JSContext *ctx, JSValueConst obj, JSValue ret);
 
 #define CONT_OP_KEYED      32  /* cont_state = JSOpKeyed: a keyed operation requested by a BYTECODE OPERATOR rather
                                   than by a step machine — `k in obj`. The operator is the one consumer whose answer
@@ -25211,6 +25220,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     gp_op = GP_GETOWNPROP; gp_val = JS_UNDEFINED;
                     goto do_getprop_tramp;
                 }
+                if (st == 18) {
+                    /* GETPROTO: *out_cb is [obj] and, like OWNKEYS, there is no key — the trap takes the target
+                       alone and its answer IS the result. Same entry for the same reason: the shapes it has to
+                       tell apart (an ordinary object, a trapless proxy, a C/bound trap, a bytecode trap) are the
+                       same ones, and 10.5.1's invariant rides the same continuation. */
+                    gp_outer = stt; gp_outer_kind = CONT_STEP;
+                    gp_obj = cb[0]; gp_atom = JS_ATOM_NULL;
+                    gp_op = GP_GETPROTO; gp_val = JS_UNDEFINED;
+                    goto do_getprop_tramp;
+                }
                 if (st == 11) {
                     /* OWNKEYS: *out_cb is [obj] and there is no key at all — the whole list is the answer, so
                        *out_argc is 0 rather than an atom. The one keyed-operation entry answers it because the
@@ -25900,6 +25919,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                           gp_op == GP_DELETE ? JS_ATOM_deleteProperty :
                                           gp_op == GP_DEFINE ? JS_ATOM_defineProperty :
                                           gp_op == GP_OWNKEYS ? JS_ATOM_ownKeys :
+                                          gp_op == GP_GETPROTO ? JS_ATOM_getPrototypeOf :
                                           gp_op == GP_GETOWNPROP ? JS_ATOM_getOwnPropertyDescriptor
                                                                  : JS_ATOM_get;
                             JSTrapGet *tg;
@@ -25964,7 +25984,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                drove one from C: `new Proxy(t, {ownKeys: Object.getOwnPropertyNames})` reached
                                js_call_c_function's DFAIL. Which KIND of callee it is, is the convergence point's
                                question, not this one's. */
-                            if (gp_op != GP_OWNKEYS) {   /* [[OwnPropertyKeys]] takes no key: the list IS the answer */
+                            if (gp_op != GP_OWNKEYS && gp_op != GP_GETPROTO) {   /* neither takes a key: the trap's answer IS the result */
                                 keyval = JS_AtomToValue(ctx, gp_atom);
                                 if (JS_IsException(keyval)) { JS_FreeValue(ctx, method); goto getprop_throw; }
                             }
@@ -26098,6 +26118,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (unlikely(gres < 0)) goto getprop_throw;
                         ret_val = gres ? js_desc_to_object(ctx, &gd) : JS_UNDEFINED;
                         if (unlikely(JS_IsException(ret_val))) goto getprop_throw;
+                    } else if (gp_op == GP_GETPROTO) {
+                        /* [[GetPrototypeOf]] with nothing user-written in it: an ordinary object (a slot read), a
+                           trapless proxy (JS_GetPrototype forwards), or a C/bound trap with no body to suspend. */
+                        ret_val = JS_GetPrototype(ctx, fwd ? gp_fwd : gp_obj);
+                        if (unlikely(JS_IsException(ret_val))) goto getprop_throw;
                     } else if (gp_op == GP_OWNKEYS) {
                         /* [[OwnPropertyKeys]] with nothing user-written in it: an ordinary object (a slot walk),
                            a trapless proxy (which forwards, and JS_GetOwnPropertyNamesInternal spells that
@@ -26206,7 +26231,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    [[IsRevoked]] between the trap and the check, so the check needs the proxy object. The `value`
                    slot is the write's operand and is otherwise unused, so it carries it. */
                 gp->value = (gp_op == GP_SET || gp_op == GP_DEFINE) ? js_dup(gp_val)
-                          : (gp_op == GP_OWNKEYS || gp_op == GP_GETOWNPROP) ? js_dup(gp_obj) : JS_UNDEFINED;
+                          : (gp_op == GP_OWNKEYS || gp_op == GP_GETOWNPROP || gp_op == GP_GETPROTO)
+                            ? js_dup(gp_obj) : JS_UNDEFINED;
                 gp->getter = (gp_op == GP_DEFINE) ? js_dup(gp_getter_r) : JS_UNDEFINED;
                 gp->setter = (gp_op == GP_DEFINE) ? js_dup(gp_setter_r) : JS_UNDEFINED;
                 gp->dflags = gp_dflags_r;
@@ -26233,8 +26259,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     gp->cb[3] = keyval;
                     /* has(target, key) takes two; get(target, key, receiver) three; set(target, key, value,
                        receiver) four. */
-                    if (gp_op == GP_OWNKEYS) {
-                        gp->nargs = 1;   /* ownKeys(target) — no key at all */
+                    if (gp_op == GP_OWNKEYS || gp_op == GP_GETPROTO) {
+                        gp->nargs = 1;   /* ownKeys(target) / getPrototypeOf(target) — no key at all */
                     } else if (gp_op == GP_HAS || gp_op == GP_DELETE || gp_op == GP_GETOWNPROP) {
                         gp->nargs = 2;   /* has / deleteProperty / getOwnPropertyDescriptor (target, key) */
                     } else if (gp_op == GP_DEFINE) {
@@ -29363,6 +29389,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            C hook performs, shared so the two cannot drift — and what the machine is handed is the
                            ARRAY CreateArrayFromList builds from the validated keys. */
                         ret_val = js_proxy_ownkeys_result(ctx, gp->value, ret_val);
+                    } else if (gp->op == GP_GETPROTO) {
+                        /* the `getPrototypeOf` trap returned. 10.5.1 steps 6-10 run on it — the same check the C
+                           hook performs, shared so the two cannot drift. */
+                        ret_val = js_proxy_getproto_invariant(ctx, gp->value, ret_val);
                     } else if (gp->op == GP_HAS) {
                         /* the `has` trap's boolean, then the target's [[HasProperty]] invariant on it */
                         int hres = js_proxy_has_invariant(ctx, gp->target, gp->atom, JS_ToBoolFree(ctx, ret_val));
@@ -55026,19 +55056,9 @@ static JSValue js_object_constructor(JSContext *ctx, JSValueConst new_target,
     return ret;
 }
 
-static JSValue js_object_getPrototypeOf(JSContext *ctx, JSValueConst this_val,
-                                        int argc, JSValueConst *argv, int magic)
-{
-    JSValueConst val = argv[0];
-    if (JS_VALUE_GET_TAG(val) != JS_TAG_OBJECT) {
-        /* ES6 feature non compatible with ES5.1: primitive types are
-           accepted */
-        if (magic || JS_VALUE_GET_TAG(val) == JS_TAG_NULL ||
-            JS_VALUE_GET_TAG(val) == JS_TAG_UNDEFINED)
-            return JS_ThrowTypeErrorNotAnObject(ctx);
-    }
-    return JS_GetPrototype(ctx, val);
-}
+/* DELETED: js_object_getPrototypeOf's C body. Its whole content was one JS_GetPrototype, which on a Proxy runs
+   the `getPrototypeOf` trap through JS_CallFree — the page's code with no flow base. It is a step machine now
+   (js_getproto_step), issuing that [[GetPrototypeOf]] as a request. */
 
 static JSValue js_object_setPrototypeOf(JSContext *ctx, JSValueConst this_val,
                                         int argc, JSValueConst *argv)
@@ -55226,6 +55246,50 @@ static JSValue js_object___defineGetter__(JSContext *ctx, JSValueConst this_val,
    on the key, then [[GetOwnProperty]], which on a Proxy is the `getOwnPropertyDescriptor` trap — and the body
    that used to sit here performed the second with JS_GetOwnPropertyInternal from C, so a trap containing a loop
    had no flow base. def->arg: 1 = Reflect's receiver rule. */
+/* Object/Reflect.getPrototypeOf. Its whole body is one [[GetPrototypeOf]], which on a Proxy is the
+   `getPrototypeOf` trap — the page's code, run from C by JS_GetPrototype. As a machine it is a single request
+   and a result. */
+typedef struct JSGetProto {
+    JSStepHdr hdr;
+    JSValue result;   /* the prototype, or null (owned) */
+} JSGetProto;
+
+static int js_getproto_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSGetProto *s = st;
+
+    if (s->hdr.stage == 0) {
+        JSValueConst val = step_arg(&s->hdr, 0);
+        JS_FreeValue(ctx, cb_result);
+        s->result = JS_UNDEFINED;   /* FIRST, before anything that can throw: the teardown frees what it holds */
+        if (JS_VALUE_GET_TAG(val) != JS_TAG_OBJECT) {
+            /* Object.getPrototypeOf boxes a primitive (the ES6 concession ES5.1 did not have); Reflect's form
+               rejects it. Either way a nullish argument is a TypeError. */
+            if (s->hdr.def->arg || JS_VALUE_GET_TAG(val) == JS_TAG_NULL
+                || JS_VALUE_GET_TAG(val) == JS_TAG_UNDEFINED) {
+                JS_ThrowTypeErrorNotAnObject(ctx);
+                return -1;
+            }
+        }
+        s->hdr.stage = 1;
+        s->hdr.cb_coerce[0] = val;   /* borrowed: the caller's stack holds it across the request */
+        *out_cb = s->hdr.cb_coerce; *out_argc = 0;
+        return 18;   /* GETPROTO */
+    }
+    if (JS_IsException(cb_result)) return -1;
+    s->result = cb_result;
+    return 0;
+}
+
+static JSValue js_getproto_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSGetProto *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    js_free(ctx, s);
+    return r;
+}
+
 typedef struct JSGopd {
     JSStepHdr hdr;
     JSValue obj;      /* the receiver, held across both requests (owned) */
@@ -56197,7 +56261,7 @@ exception:
 
 static const JSCFunctionListEntry js_object_funcs[] = {
     JS_CFUNC_STEP_DEF("create", 2, STEPDEF_OBJ_CREATE ),
-    JS_CFUNC_MAGIC_DEF("getPrototypeOf", 1, js_object_getPrototypeOf, 0 ),
+    JS_CFUNC_STEP_DEF("getPrototypeOf", 1, STEPDEF_OBJ_GETPROTO ),
     JS_CFUNC_DEF("setPrototypeOf", 2, js_object_setPrototypeOf ),
     JS_CFUNC_STEP_DEF("defineProperty", 3, STEPDEF_OBJ_DEFINEPROPERTY ),
     JS_CFUNC_STEP_DEF("defineProperties", 2, STEPDEF_OBJ_DEFINEPROPERTIES ),
@@ -60619,6 +60683,12 @@ static int js_gopd_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **o
 static JSValue js_gopd_fini(JSContext *ctx, void *st, bool take_result);
 static const JSTrampStepDef js_obj_gopd_def       = { sizeof(JSGopd), js_gopd_step, js_gopd_fini, 0 };
 static const JSTrampStepDef js_reflect_gopd_def   = { sizeof(JSGopd), js_gopd_step, js_gopd_fini, 1 };
+static int js_getproto_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_getproto_fini(JSContext *ctx, void *st, bool take_result);
+/* Object.getPrototypeOf and Reflect.getPrototypeOf differ only in whether a PRIMITIVE argument is boxed or
+   rejected — Object's ES6 concession — which is the arg, exactly as it was the C function's magic. */
+static const JSTrampStepDef js_obj_getproto_def     = { sizeof(JSGetProto), js_getproto_step, js_getproto_fini, 0 };
+static const JSTrampStepDef js_reflect_getproto_def = { sizeof(JSGetProto), js_getproto_step, js_getproto_fini, 1 };
 /* ALL FIVE iterator-helper factories, as ONE machine. take/drop were a coerce-then-compute definition and
    map/filter/flatMap were plain C functions, and the `next` READ their shared body performed could be routed from
    neither shape. The kind rides body_magic, exactly as it did on the C function; onerror is the IfAbruptClose. */
@@ -60972,6 +61042,8 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_NUM_CTOR]        = &js_num_ctor_def,
     [STEPDEF_BIGINT_ASUINTN]  = &js_bigint_asUintN_def,
     [STEPDEF_BIGINT_ASINTN]   = &js_bigint_asIntN_def,
+    [STEPDEF_OBJ_GETPROTO]    = &js_obj_getproto_def,
+    [STEPDEF_REFLECT_GETPROTO] = &js_reflect_getproto_def,
     [STEPDEF_OBJ_GOPD]        = &js_obj_gopd_def,
     [STEPDEF_OBJ_VALUES]      = &js_obj_values_def,
     [STEPDEF_OBJ_ENTRIES]     = &js_obj_entries_def,
@@ -70493,7 +70565,7 @@ static const JSCFunctionListEntry js_reflect_funcs[] = {
     JS_CFUNC_STEP_DEF("deleteProperty", 2, STEPDEF_REFLECT_DELETE ),
     JS_CFUNC_STEP_DEF("get", 2, STEPDEF_REFLECT_GET ),
     JS_CFUNC_STEP_DEF("getOwnPropertyDescriptor", 2, STEPDEF_REFLECT_GOPD ),
-    JS_CFUNC_MAGIC_DEF("getPrototypeOf", 1, js_object_getPrototypeOf, 1 ),
+    JS_CFUNC_STEP_DEF("getPrototypeOf", 1, STEPDEF_REFLECT_GETPROTO ),
     JS_CFUNC_STEP_DEF("has", 2, STEPDEF_REFLECT_HAS ),
     JS_CFUNC_MAGIC_DEF("isExtensible", 1, js_object_isExtensible, 1 ),
     JS_CFUNC_STEP_DEF("ownKeys", 1, STEPDEF_REFLECT_OWNKEYS ),
@@ -70589,6 +70661,37 @@ static JSProxyData *proxy_resolve_trapless(JSContext *ctx, JSValue *pmethod,
     }
 }
 
+/* 10.5.1 steps 6-10 on the trap's RESULT: an Object or null, and — when the target is not extensible — the same
+   value the target's own [[GetPrototypeOf]] gives. The trap CALL is the page's code and the check is not, the
+   same split every proxy operation makes, so this is shared by the C hook and the tramp delivery.
+   CONSUMES `ret`. */
+static JSValue js_proxy_getproto_invariant(JSContext *ctx, JSValueConst obj, JSValue ret)
+{
+    JSProxyData *s = JS_VALUE_GET_OBJ(obj)->u.opaque;
+    JSValue proto1;
+    int res;
+
+    if (JS_IsException(ret))
+        return ret;
+    if (JS_VALUE_GET_TAG(ret) != JS_TAG_NULL && JS_VALUE_GET_TAG(ret) != JS_TAG_OBJECT)
+        goto fail;
+    res = JS_IsExtensible(ctx, s->target);
+    if (res < 0) { JS_FreeValue(ctx, ret); return JS_EXCEPTION; }
+    if (!res) {
+        proto1 = JS_GetPrototype(ctx, s->target);
+        if (JS_IsException(proto1)) { JS_FreeValue(ctx, ret); return JS_EXCEPTION; }
+        if (JS_VALUE_GET_OBJ(proto1) != JS_VALUE_GET_OBJ(ret)) {
+            JS_FreeValue(ctx, proto1);
+            goto fail;
+        }
+        JS_FreeValue(ctx, proto1);
+    }
+    return ret;
+fail:
+    JS_FreeValue(ctx, ret);
+    return JS_ThrowTypeError(ctx, "proxy: inconsistent prototype");
+}
+
 static JSValue js_proxy_getPrototypeOf(JSContext *ctx, JSValueConst obj)
 {
     JSProxyData *s;
@@ -70600,34 +70703,11 @@ static JSValue js_proxy_getPrototypeOf(JSContext *ctx, JSValueConst obj)
         return JS_EXCEPTION;
     if (JS_IsUndefined(method))
         return JS_GetPrototype(ctx, s->target);
+    /* THE LAST C-driven `getPrototypeOf` trap. Every consumer routed onto GP_GETPROTO runs it on the
+       interpreter's chain instead; the ones still calling JS_GetPrototype from C reach it here, and a trap with
+       a loop in it aborts at its back-edge by name. */
     ret = JS_CallFree(ctx, method, s->handler, 1, vc(&s->target));
-    if (JS_IsException(ret))
-        return ret;
-    if (JS_VALUE_GET_TAG(ret) != JS_TAG_NULL &&
-        JS_VALUE_GET_TAG(ret) != JS_TAG_OBJECT) {
-        goto fail;
-    }
-    res = JS_IsExtensible(ctx, s->target);
-    if (res < 0) {
-        JS_FreeValue(ctx, ret);
-        return JS_EXCEPTION;
-    }
-    if (!res) {
-        /* check invariant */
-        proto1 = JS_GetPrototype(ctx, s->target);
-        if (JS_IsException(proto1)) {
-            JS_FreeValue(ctx, ret);
-            return JS_EXCEPTION;
-        }
-        if (JS_VALUE_GET_OBJ(proto1) != JS_VALUE_GET_OBJ(ret)) {
-            JS_FreeValue(ctx, proto1);
-        fail:
-            JS_FreeValue(ctx, ret);
-            return JS_ThrowTypeError(ctx, "proxy: inconsistent prototype");
-        }
-        JS_FreeValue(ctx, proto1);
-    }
-    return ret;
+    return js_proxy_getproto_invariant(ctx, obj, ret);
 }
 
 static int js_proxy_setPrototypeOf(JSContext *ctx, JSValueConst obj,
