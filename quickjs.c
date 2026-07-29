@@ -1634,7 +1634,7 @@ static bool js_get_fast_array(JSContext *ctx, JSValue obj,
                               JSValue **arrpp, uint32_t *countp);
 static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len);
 static JSValue JS_CreateAsyncFromSyncIterator(JSContext *ctx,
-                                              JSValue sync_iter);
+                                              JSValue sync_iter, JSValue next_method);
 static void js_c_function_data_finalizer(JSRuntime *rt, JSValueConst val);
 static void js_c_function_data_mark(JSRuntime *rt, JSValueConst val,
                                     JS_MarkFunc *mark_func);
@@ -19826,6 +19826,12 @@ typedef struct JSIterClose {
                                   a C recursion that drove it to completion. do_return applies IteratorNext's
                                   "result must be an object" check and IteratorComplete/IteratorValue, and places
                                   [value, done] exactly where js_for_of_next's tail does. */
+#define CONT_FOROF_ENUMREC_WRAP 53  /* the same read for `for await`'s SYNC branch. The wrap is 27.1.4.1, which
+                                       takes the sync iterator RECORD — so the read happens on the SYNC iterator
+                                       FIRST and the wrapper is built from what it produced; the wrapper's own
+                                       `next` is an intrinsic and needs no page-visible read. Doing it the other
+                                       way round (wrap, then read off the wrapper) meant CreateAsyncFromSyncIterator
+                                       read the sync iterator from C, a second observable Get with no flow base. */
 #define CONT_PROMISE_ALL_NEXT_GET 52  /* gp_outer = JSPromiseAll: GetIterator step 5.b for a Promise COMBINATOR.
                                          Same read, same page code; what differs is the abrupt arm — the
                                          combinator REJECTS its aggregate and yields it (IfAbruptRejectPromise),
@@ -20122,6 +20128,7 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_ITER_CALL_GET:
     case CONT_ITER_CALL_GET_NOARG:
     case CONT_FOROF_ENUMREC_GET:
+    case CONT_FOROF_ENUMREC_WRAP:
     case CONT_TRAP_GET:
     case CONT_OP_KEYED:
         break;
@@ -25910,7 +25917,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                           tramp_iter_getiter = ret_val;
                           goto do_consume_acquire_have_method;
                       }
-                      if (gk == CONT_FOROF_ENUMREC_GET) goto do_forof_enumrec_have_next;   /* the read invoked nothing */
+                      if (gk == CONT_FOROF_ENUMREC_GET || gk == CONT_FOROF_ENUMREC_WRAP) {
+                          forof_enumrec_wrap = (gk == CONT_FOROF_ENUMREC_WRAP);
+                          goto do_forof_enumrec_have_next;   /* the read invoked nothing */
+                      }
                       if (gk == CONT_ITER_CALL_GET || gk == CONT_ITER_CALL_GET_NOARG) {
                           itercall_noarg = (gk == CONT_ITER_CALL_GET_NOARG);
                           goto do_itercall_have_method;   /* the read invoked nothing */
@@ -26028,7 +26038,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                     if (gk3 == CONT_FOROF_GET || gk3 == CONT_FORAWAIT_GET || gk3 == CONT_FORAWAIT_SYNC_GET
                         || gk3 == CONT_ITER_CALL_GET || gk3 == CONT_ITER_CALL_GET_NOARG
-                        || gk3 == CONT_FOROF_ENUMREC_GET) {
+                        || gk3 == CONT_FOROF_ENUMREC_GET || gk3 == CONT_FOROF_ENUMREC_WRAP) {
                         /* the for-of's @@iterator read threw: its operand (the iterable) is on the stack and
                            belongs to the frame's catch-search, exactly as for any other throwing operator. */
                         goto exception;
@@ -28903,7 +28913,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            || gouter_kind == CONT_FOROF_GET || gouter_kind == CONT_FORAWAIT_GET
                            || gouter_kind == CONT_FORAWAIT_SYNC_GET
                            || gouter_kind == CONT_ITER_CALL_GET || gouter_kind == CONT_ITER_CALL_GET_NOARG
-                           || gouter_kind == CONT_FOROF_ENUMREC_GET || gouter_kind == CONT_CONSUME_NEXT_GET
+                           || gouter_kind == CONT_FOROF_ENUMREC_GET || gouter_kind == CONT_FOROF_ENUMREC_WRAP
+                           || gouter_kind == CONT_CONSUME_NEXT_GET
                            || gouter_kind == CONT_PROMISE_ALL_NEXT_GET
                            || gouter_kind == CONT_PROMISE_ALL_THEN || gouter_kind == CONT_AFS_GET
                            || gouter_kind == CONT_ITER_HELPER_GET || gouter_kind == CONT_PROMISE_ALL_GET
@@ -28947,9 +28958,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         cont_st = gouter;
                         goto do_consume_have_next;
                     }
-                    if (gouter_kind == CONT_FOROF_ENUMREC_GET) {
+                    if (gouter_kind == CONT_FOROF_ENUMREC_GET || gouter_kind == CONT_FOROF_ENUMREC_WRAP) {
                         /* a PROXIED iterator's `get` trap, or an accessor `next`, ran on this chain and the read
                            suspended. The iterator is at sp[-1] where the enum_rec wants it. */
+                        forof_enumrec_wrap = (gouter_kind == CONT_FOROF_ENUMREC_WRAP);
                         js_getprop_free(ctx, gp);
                         goto do_forof_enumrec_have_next;
                     }
@@ -30211,34 +30223,47 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JS_ThrowTypeErrorNotAnObject(ctx);
                     goto exception;
                 }
-                if (want_wrap) {
-                    /* `for await`'s SYNC branch: 27.1.4.3 step 1.b.iii CreateAsyncFromSyncIterator. The wrap
-                       happens BEFORE the read, so `next` is read off the WRAPPER, which is what the enum_rec
-                       drives. */
-                    JSValue wrapped = JS_CreateAsyncFromSyncIterator(ctx, ret_val);
-                    JS_FreeValue(ctx, ret_val);
-                    ret_val = wrapped;
-                    if (unlikely(JS_IsException(ret_val))) goto exception;
-                }
                 DCHECK(sp + 3 <= TRAMP_SP_LIMIT(sf),
                        "for-of acquire: enum_rec push exceeds the frame's compiled stack_size");
                 *sp++ = ret_val;                     /* sp[-1] = iterator; the read below can suspend, and this
                                                         slot is both where the enum_rec wants it and what the
                                                         frame's catch-search frees if the read throws. */
                 ret_val = JS_UNDEFINED;
-                gp_outer = NULL; gp_outer_kind = CONT_FOROF_ENUMREC_GET;
+                /* GetIterator step 5.b, on the SYNC iterator, BEFORE any wrap: 27.1.4.3's async branch completes
+                   the sync record first and hands it to CreateAsyncFromSyncIterator. Whether a wrap follows rides
+                   the KIND, because the read can suspend and the register would not survive it. */
+                gp_outer = NULL;
+                gp_outer_kind = want_wrap ? CONT_FOROF_ENUMREC_WRAP : CONT_FOROF_ENUMREC_GET;
                 gp_obj = sp[-1]; gp_atom = JS_ATOM_next; gp_op = GP_GET; gp_val = JS_UNDEFINED;
                 goto do_getprop_tramp;
             }
 
         do_forof_enumrec_have_next:
             /* the nextMethod, reached from the read whether it invoked user code or not. */
-            DCHECK(sp + 2 <= TRAMP_SP_LIMIT(sf),
-                   "for-of acquire: enum_rec push exceeds the frame's compiled stack_size");
-            *sp++ = ret_val;                     /* sp[-1]=next, sp[-2]=iterator */
-            ret_val = JS_UNDEFINED;
-            *sp++ = JS_NewCatchOffset(ctx, 0);   /* sp[-1]=catch, sp[-2]=next, sp[-3]=iterator */
-            BREAK;
+            {
+                uint8_t want_wrap = forof_enumrec_wrap;
+                forof_enumrec_wrap = 0;
+                DCHECK(sp + 2 <= TRAMP_SP_LIMIT(sf),
+                       "for-of acquire: enum_rec push exceeds the frame's compiled stack_size");
+                if (want_wrap) {
+                    /* 27.1.4.3 step 1.b.iii: the completed SYNC record becomes the wrapper's, and the enum_rec
+                       drives the WRAPPER's own `next` — %AsyncFromSyncIteratorPrototype%.next, a hidden
+                       intrinsic, which is why step 3 of 27.1.4.1 is an infallible Get. */
+                    JSValue wrapped = JS_CreateAsyncFromSyncIterator(ctx, sp[-1], ret_val);
+                    ret_val = JS_UNDEFINED;
+                    if (unlikely(JS_IsException(wrapped))) goto exception;
+                    JS_FreeValue(ctx, sp[-1]); sp[-1] = wrapped;
+                    DCHECK(!js_read_is_page_code(ctx, sp[-1], JS_ATOM_next),
+                           "the async-from-sync wrapper's `next` is an intrinsic — a page-reachable one would "
+                           "make 27.1.4.1 step 3's infallible Get run user code from here");
+                    ret_val = JS_GetProperty(ctx, sp[-1], JS_ATOM_next);
+                    if (unlikely(JS_IsException(ret_val))) goto exception;
+                }
+                *sp++ = ret_val;                     /* sp[-1]=next, sp[-2]=iterator */
+                ret_val = JS_UNDEFINED;
+                *sp++ = JS_NewCatchOffset(ctx, 0);   /* sp[-1]=catch, sp[-2]=next, sp[-3]=iterator */
+                BREAK;
+            }
 
         CASE(OP_for_of_next):
             {
@@ -74910,15 +74935,17 @@ static void js_async_from_sync_iterator_mark(JSRuntime *rt, JSValueConst val,
     }
 }
 
+/* 27.1.4.1 CreateAsyncFromSyncIterator. It takes the sync iterator RECORD — iterator plus nextMethod — because
+   that is what the spec passes it: the record was completed by GetIterator's own step 5.b, and step 3 here reads
+   `next` off the ASYNC wrapper, an intrinsic, not off the sync iterator again. Reading it off the sync iterator
+   here (what this did) was both a second observable Get on the page's object and a C-side one, with no flow base
+   for the accessor or Proxy trap that answers it. `next_method` is TRANSFERRED. */
 static JSValue JS_CreateAsyncFromSyncIterator(JSContext *ctx,
-                                              JSValue sync_iter)
+                                              JSValue sync_iter, JSValue next_method)
 {
-    JSValue async_iter, next_method;
+    JSValue async_iter;
     JSAsyncFromSyncIteratorData *s;
 
-    next_method = JS_GetProperty(ctx, sync_iter, JS_ATOM_next);
-    if (JS_IsException(next_method))
-        return JS_EXCEPTION;
     async_iter = JS_NewObjectClass(ctx, JS_CLASS_ASYNC_FROM_SYNC_ITERATOR);
     if (JS_IsException(async_iter)) {
         JS_FreeValue(ctx, next_method);
