@@ -17236,39 +17236,14 @@ static JSValue JS_GetIterator2(JSContext *ctx, JSValueConst obj,
     return enum_obj;
 }
 
-static JSValue JS_GetIterator(JSContext *ctx, JSValueConst obj, bool is_async)
-{
-    JSValue method, ret, sync_iter;
-
-    if (is_async) {
-        method = JS_GetProperty(ctx, obj, JS_ATOM_Symbol_asyncIterator);
-        if (JS_IsException(method))
-            return method;
-        if (JS_IsUndefined(method) || JS_IsNull(method)) {
-            method = JS_GetProperty(ctx, obj, JS_ATOM_Symbol_iterator);
-            if (JS_IsException(method))
-                return method;
-            sync_iter = JS_GetIterator2(ctx, obj, method);
-            JS_FreeValue(ctx, method);
-            if (JS_IsException(sync_iter))
-                return sync_iter;
-            ret = JS_CreateAsyncFromSyncIterator(ctx, sync_iter);
-            JS_FreeValue(ctx, sync_iter);
-            return ret;
-        }
-    } else {
-        method = JS_GetProperty(ctx, obj, JS_ATOM_Symbol_iterator);
-        if (JS_IsException(method))
-            return method;
-    }
-    if (!JS_IsFunction(ctx, method)) {
-        JS_FreeValue(ctx, method);
-        return JS_ThrowTypeError(ctx, "value is not iterable");
-    }
-    ret = JS_GetIterator2(ctx, obj, method);
-    JS_FreeValue(ctx, method);
-    return ret;
-}
+/* DELETED: JS_GetIterator. It was the whole of GetIterator performed from C — the @@asyncIterator and
+   @@iterator READS, the method Call through JS_GetIterator2, and the async-from-sync wrap — every step of it
+   page code with no flow base. Its last caller was new Map/Set's C entry, which used it only to decide whether
+   its source was iterable before a DFAIL; that decision is itself an @@iterator read, so the probe was doing the
+   forbidden thing in order to report that the forbidden thing had happened. Every acquire in the engine now runs
+   on the chain: OP_for_of_start / OP_for_await_of_start's request pair, and the consume machine's acquire for
+   the consumers. JS_GetIterator2 outlives it by exactly one caller — flatMap's INNER acquire — which is the next
+   one to route. */
 
 /* return *pdone = 2 if the iterator object is not parsed */
 
@@ -71468,16 +71443,16 @@ static JSValue js_map_constructor(JSContext *ctx, JSValueConst new_target,
            ONE consume machine (ITERCONS_MAP / ITERCONS_SET), which acquires on the tramp and performs
            IfAbruptCloseIterator itself. This loop drove .next and the adder from C, where a coroutine cannot
            suspend. An iterable reaching here means a call site was not routed. */
-        iter = JS_GetIterator(ctx, arr, false);   /* throws for a non-iterable, which is all that is left */
-        if (JS_IsException(iter))
-            goto fail;
-        DFAIL("new Map/Set reached its C entry with an ITERABLE source - route that call site onto the consume "
-              "machine; the iteration loop here no longer exists");
+        /* Reaching here with a non-nullish source at all is the unrouted construct shape. The line above used to
+           call JS_GetIterator first, "to throw for a non-iterable" — but deciding iterability means reading
+           @@iterator, which is the page's code, from C: the very thing the consume machine's acquire exists to
+           do on the chain. A NON-iterable source is not an exception to that; the machine's own acquire throws
+           the TypeError for it. So the probe was the last C acquire path in the engine, kept alive by a case that
+           does not need it, and it is gone with JS_GetIterator. */
+        DFAIL("new Map/Set reached its C entry with a non-nullish source - route that construct shape onto the "
+              "consume machine, which acquires on the chain and throws for a non-iterable itself");
         JS_ThrowTypeError(ctx, "new Map/Set: unrouted construct shape (no off-tramp implementation exists)");
         goto fail;
-        JS_FreeValue(ctx, next_method);
-        JS_FreeValue(ctx, iter);
-        JS_FreeValue(ctx, adder);
     }
     return obj;
  fail:
