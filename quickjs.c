@@ -19994,6 +19994,10 @@ _Static_assert(CONT_ITER_CONSUME_FWD == CONT_ITER_CONSUME, "the forward alias us
 _Static_assert(CONT_PROMISE_ALL_FWD == CONT_PROMISE_ALL, "the forward alias used by the capability abandon must equal CONT_PROMISE_ALL");
 _Static_assert(CONT_ITER_HELPER_FWD == CONT_ITER_HELPER, "the forward alias used by the abandon walk must equal CONT_ITER_HELPER");
 
+#define CONT_KEYED_INV     59  /* gp_outer = JSKeyedInv: 10.5.7 step 9 / 10.5.10 steps 9-12, which read the
+                                  TARGET's descriptor bits and its extensibility — internal methods both, so a
+                                  Proxy target answers with its traps and neither can run from C. */
+
 #define CONT_PROXY_INV     58  /* gp_outer = JSProxyInv: the four OBJECT-LEVEL invariants (10.5.1-10.5.4),
                                   each of which checks the trap's result against IsExtensible(target) and, for
                                   the prototype pair, target.[[GetPrototypeOf]](). Both are internal methods, so
@@ -20072,6 +20076,7 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_FOR_IN_HAS:
     case CONT_OWNKEYS_CHK:
     case CONT_PROXY_INV:
+    case CONT_KEYED_INV:
         break;
     }
 }
@@ -20646,6 +20651,8 @@ struct JSOwnKeysChk;
 static void js_ownkeys_chk_free(JSContext *ctx, struct JSOwnKeysChk *ok);
 struct JSProxyInv;
 static void js_proxy_inv_free(JSContext *ctx, struct JSProxyInv *pv);
+struct JSKeyedInv;
+static void js_keyed_inv_free(JSContext *ctx, struct JSKeyedInv *ki);
 static void js_create_requester_abandon(JSContext *ctx, void *cont, uint8_t kind)
 {
     /* keyed on the KIND, never on the pointer: a continuation whose whole state IS its kind carries a NULL one
@@ -20659,6 +20666,7 @@ static void js_create_requester_abandon(JSContext *ctx, void *cont, uint8_t kind
         return;   /* no owned state: the kind IS the continuation (or the helper is a GC object) */
     if (kind == CONT_OWNKEYS_CHK) { js_ownkeys_chk_free(ctx, cont); return; }
     if (kind == CONT_PROXY_INV) { js_proxy_inv_free(ctx, cont); return; }
+    if (kind == CONT_KEYED_INV) { js_keyed_inv_free(ctx, cont); return; }
     if (kind == CONT_STEP) { tramp_step_chain_free(ctx, cont); return; }
     if (kind == CONT_PROMISE_ALL) {
         js_promise_all_end(ctx, (struct JSPromiseAll *)cont); js_free_rt(ctx->rt, cont); return;
@@ -21218,6 +21226,36 @@ typedef struct JSProxyInv {
     int extensible;
 } JSProxyInv;
 enum { PI_EXT = 0, PI_EXT_GOT, PI_PROTO, PI_PROTO_GOT };
+
+/* ---- the KEYED invariants that need only the target's ATTRIBUTE BITS ----
+
+   10.5.7 [[HasProperty]] step 9 and 10.5.10 [[Delete]] steps 9-12 are the same algorithm: on the trap result
+   that needs checking, read target.[[GetOwnProperty]](P), and if the property is there require it to be
+   configurable and the target to be extensible. Both are internal methods, so a Proxy target answers with its
+   own traps — js_proxy_has_invariant and _delete_invariant ran them from C.
+
+   And `has` read the target JSObject's `extensible` STORAGE BIT where 10.5.7 step 9.b.ii says IsExtensible: for
+   a Proxy target that is the proxy's own flag rather than its answer, so step 9.b.iii never fired. Asking for
+   the internal method fixes that by construction, which is the second time this exact deviation has turned up
+   (10.5.5 step 11.c was the first). */
+typedef struct JSKeyedInv {
+    JSValue target;      /* the proxy's [[Target]] (owned) */
+    JSAtom atom;         /* the key (owned) */
+    void *outer;
+    uint8_t outer_kind;
+    uint8_t op;          /* GP_HAS / GP_DELETE — which answer and which message, not which algorithm */
+    uint8_t phase;       /* KI_* */
+    uint8_t no_throw;    /* GP_DELETE: yield the boolean rather than DeletePropertyOrThrow's TypeError */
+    int td_ret, td_flags;
+} JSKeyedInv;
+enum { KI_DESC = 0, KI_DESC_GOT, KI_EXT, KI_EXT_GOT };
+
+static void js_keyed_inv_free(JSContext *ctx, struct JSKeyedInv *ki)
+{
+    JS_FreeValue(ctx, ki->target);
+    JS_FreeAtom(ctx, ki->atom);
+    js_free_rt(ctx->rt, ki);
+}
 
 static void js_proxy_inv_free(JSContext *ctx, struct JSProxyInv *pv)
 {
@@ -26331,6 +26369,81 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
 
+        do_keyed_inv_step:
+            /* 10.5.7 step 9 / 10.5.10 steps 9-12. `ret_val` is the previous request's answer (UNINITIALIZED on
+               entry). One body: the two operations differ in what they ANSWER and what their message says, not
+               in what they check. */
+            {
+                JSKeyedInv *ki = (JSKeyedInv *)cont_st;
+                cont_st = NULL;
+                for (;;) {
+                    if (ki->phase == KI_DESC) {
+                        ki->phase = KI_DESC_GOT;
+                        gp_obj = ki->target; gp_atom = ki->atom;
+                        gp_op = GP_GETOWNPROP; gp_val = JS_UNDEFINED;
+                        gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
+                        gp_want_flags = 1;   /* the check wants the bits; the descriptor object is not needed */
+                        gp_outer = ki; gp_outer_kind = CONT_KEYED_INV;
+                        goto do_getprop_tramp;
+                    }
+                    if (ki->phase == KI_DESC_GOT) {
+                        int tf;
+                        DCHECK(JS_VALUE_GET_TAG(ret_val) == JS_TAG_INT,
+                               "a want_flags [[GetOwnProperty]] must answer with an int");
+                        tf = JS_VALUE_GET_INT(ret_val);
+                        ret_val = JS_UNDEFINED;
+                        ki->td_ret = (tf >= 0);
+                        ki->td_flags = (tf >= 0) ? tf : 0;
+                        if (!ki->td_ret) {
+                            /* the target has not got it either: nothing to be inconsistent with. */
+                            ret_val = (ki->op == GP_HAS) ? JS_FALSE : JS_TRUE;
+                            goto ki_answer;
+                        }
+                        if (!(ki->td_flags & JS_PROP_CONFIGURABLE))
+                            goto ki_fail;
+                        ki->phase = KI_EXT;
+                    }
+                    if (ki->phase == KI_EXT) {
+                        ki->phase = KI_EXT_GOT;
+                        gp_obj = ki->target; gp_atom = JS_ATOM_NULL;
+                        gp_op = GP_ISEXT; gp_val = JS_UNDEFINED;
+                        gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
+                        gp_outer = ki; gp_outer_kind = CONT_KEYED_INV;
+                        goto do_getprop_tramp;
+                    }
+                    DCHECK(ki->phase == KI_EXT_GOT, "a keyed proxy invariant resumed in no phase");
+                    {
+                        int ext = JS_ToBoolFree(ctx, ret_val);
+                        ret_val = JS_UNDEFINED;
+                        if (!ext)
+                            goto ki_fail;
+                        ret_val = (ki->op == GP_HAS) ? JS_FALSE : JS_TRUE;
+                        goto ki_answer;
+                    }
+                }
+            ki_answer:
+                /* a DELETE additionally owes DeletePropertyOrThrow, which is the CONSUMER's step and not the
+                   object's — the bare internal method yields the boolean instead. */
+                if (ki->op == GP_DELETE && !ki->no_throw) {
+                    if (JS_VALUE_GET_BOOL(ret_val)) {
+                        ret_val = JS_UNDEFINED;
+                    } else {
+                        JS_ThrowTypeError(ctx, "proxy: cannot delete property");
+                        goto ki_fail_thrown;
+                    }
+                }
+                gp_outer = ki->outer; gp_outer_kind = ki->outer_kind;
+                js_keyed_inv_free(ctx, ki);
+                goto do_getprop_complete;
+            ki_fail:
+                JS_ThrowTypeError(ctx, (ki->op == GP_HAS) ? "proxy: inconsistent has"
+                                                          : "proxy: inconsistent deleteProperty");
+            ki_fail_thrown:
+                gp_outer = ki->outer; gp_outer_kind = ki->outer_kind;
+                js_keyed_inv_free(ctx, ki);
+                goto getprop_throw;
+            }
+
         do_proxy_inv_step:
             /* 10.5.1 steps 7-11 / 10.5.2 steps 8-12 / 10.5.3 steps 7-8 / 10.5.4 steps 7-8, whichever this is.
                `ret_val` is the previous request's answer (UNINITIALIZED on entry). */
@@ -27014,6 +27127,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                           cont_st = gouter0;
                           goto do_opkeyed_place;
                       }
+                      if (gk == CONT_KEYED_INV) {
+                          /* the keyed invariant's own request, answered with nothing suspended. */
+                          cont_st = gouter0;
+                          goto do_keyed_inv_step;
+                      }
                       if (gk == CONT_PROXY_INV) {
                           /* an object-level invariant's own request, answered with nothing suspended — every
                              ordinary target. Back into the machine at the phase that asked. */
@@ -27168,6 +27286,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         JSGopdDesc *gd = gouter;
                         gp_outer = gd->outer; gp_outer_kind = gd->outer_kind;
                         js_gopd_desc_free(ctx, gd);
+                        goto getprop_throw;
+                    }
+                    if (gk3 == CONT_KEYED_INV) {
+                        /* the keyed invariant's own read threw in place: the operation it is parked inside can
+                           never finish, so the throw unwinds one level. */
+                        JSKeyedInv *kit = gouter;
+                        gp_outer = kit->outer; gp_outer_kind = kit->outer_kind;
+                        js_keyed_inv_free(ctx, kit);
                         goto getprop_throw;
                     }
                     if (gk3 == CONT_PROXY_INV) {
@@ -30086,7 +30212,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            || gouter_kind == CONT_PROMISE_ALL_THEN || gouter_kind == CONT_AFS_GET
                            || gouter_kind == CONT_ITER_HELPER_GET || gouter_kind == CONT_PROMISE_ALL_GET
                            || gouter_kind == CONT_FOROF_UNPACK || gouter_kind == CONT_FOR_IN_HAS
-                           || gouter_kind == CONT_OWNKEYS_CHK || gouter_kind == CONT_PROXY_INV,
+                           || gouter_kind == CONT_OWNKEYS_CHK || gouter_kind == CONT_PROXY_INV
+                           || gouter_kind == CONT_KEYED_INV,
                            "property-get outer continuation: unknown machine kind");
                     if (gouter_kind == CONT_PROMISE_ALL_THEN) {
                         js_getprop_free(ctx, gp);
@@ -30344,19 +30471,39 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 goto do_proxy_inv_step;
                             }
                         }
-                    } else if (gp->op == GP_HAS) {
-                        /* the `has` trap's boolean, then the target's [[HasProperty]] invariant on it */
-                        int hres = js_proxy_has_invariant(ctx, gp->target, gp->atom, JS_ToBoolFree(ctx, ret_val));
-                        ret_val = (hres < 0) ? JS_EXCEPTION : js_bool(hres);
-                    } else if (gp->op == GP_DELETE) {
-                        /* the `deleteProperty` trap's boolean owes the target's [[Delete]] invariant and then,
-                           because every consumer performs DeletePropertyOrThrow, a TypeError when it is false.
-                           The machine is handed UNDEFINED — a delete has no value to deliver. */
-                        int dres = js_proxy_delete_invariant(ctx, gp->target, gp->atom, JS_ToBoolFree(ctx, ret_val));
-                        if (dres < 0) ret_val = JS_EXCEPTION;
-                        else if (gp->no_throw) ret_val = js_bool(dres);
-                        else if (!dres) { JS_ThrowTypeError(ctx, "proxy: cannot delete property"); ret_val = JS_EXCEPTION; }
-                        else ret_val = JS_UNDEFINED;
+                    } else if (gp->op == GP_HAS || gp->op == GP_DELETE) {
+                        /* the trap's boolean, and then 10.5.7 step 9 / 10.5.10 steps 9-12 against the TARGET —
+                           its descriptor bits and its extensibility, both internal methods, which the C forms
+                           read directly. The machine below issues them. */
+                        int tb = JS_ToBoolFree(ctx, ret_val);
+                        ret_val = JS_UNDEFINED;
+                        if (gp->op == GP_HAS ? tb : !tb) {
+                            /* a `has` that says TRUE and a `delete` that says FALSE are the answer: neither
+                               reaches the target at all, so neither may run its traps. */
+                            if (gp->op == GP_HAS) {
+                                ret_val = JS_TRUE;
+                            } else if (gp->no_throw) {
+                                ret_val = JS_FALSE;
+                            } else {
+                                JS_ThrowTypeError(ctx, "proxy: cannot delete property");
+                                ret_val = JS_EXCEPTION;
+                            }
+                        } else {
+                            JSKeyedInv *ki = js_mallocz(ctx, sizeof(*ki));
+                            if (unlikely(!ki)) { JS_ThrowOutOfMemory(ctx); ret_val = JS_EXCEPTION; }
+                            else {
+                                ki->target = js_dup(gp->target);
+                                ki->atom = JS_DupAtom(ctx, gp->atom);
+                                ki->outer = gouter; ki->outer_kind = gouter_kind;
+                                ki->op = gp->op;
+                                ki->no_throw = gp->no_throw;
+                                ki->phase = KI_DESC;
+                                js_getprop_free(ctx, gp);
+                                cont_st = ki;
+                                ret_val = JS_UNINITIALIZED;
+                                goto do_keyed_inv_step;
+                            }
+                        }
                     } else if (gp->op == GP_DEFINE) {
                         /* the `defineProperty` trap's boolean owes the target's [[DefineOwnProperty]] invariant,
                            and then — because every consumer performs CreateDataPropertyOrThrow — a TypeError when
@@ -30398,6 +30545,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         /* for-in's deletion check whose `has` trap SUSPENDED. Same restoration as above, so the
                            iterator is back at sp[-1] and the loop resumes exactly where it asked. */
                         goto do_for_in_has_deliver;
+                    }
+                    if (gouter_kind == CONT_KEYED_INV) {
+                        /* one of the keyed invariant's own requests — the target's descriptor bits or its
+                           extensibility — whose trap suspended. */
+                        cont_st = gouter;
+                        if (unlikely(JS_IsException(ret_val))) {
+                            JSKeyedInv *kix = gouter;
+                            gp_outer = kix->outer; gp_outer_kind = kix->outer_kind;
+                            js_keyed_inv_free(ctx, kix);
+                            goto getprop_throw;
+                        }
+                        goto do_keyed_inv_step;
                     }
                     if (gouter_kind == CONT_PROXY_INV) {
                         /* one of an object-level invariant's own requests — IsExtensible(target) or the
@@ -34402,7 +34561,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             uint8_t gk2 = gp->outer_kind;
             DCHECK(!gouter || gk2 == CONT_STEP || gk2 == CONT_ITER_CONSUME || gk2 == CONT_ACQUIRE_GET
                    || gk2 == CONT_ITER_CLOSE || gk2 == CONT_TRAP_GET || gk2 == CONT_GOPD_DESC
-                   || gk2 == CONT_OWNKEYS_CHK || gk2 == CONT_PROXY_INV
+                   || gk2 == CONT_OWNKEYS_CHK || gk2 == CONT_PROXY_INV || gk2 == CONT_KEYED_INV
                    || gk2 == CONT_OP_KEYED
                    || gk2 == CONT_PROMISE_ALL_THEN || gk2 == CONT_AFS_GET
                    || gk2 == CONT_ITER_HELPER_GET || gk2 == CONT_PROMISE_ALL_GET
@@ -34474,6 +34633,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSGopdDesc *gd = gouter;
                 gp_outer = gd->outer; gp_outer_kind = gd->outer_kind;
                 js_gopd_desc_free(ctx, gd);
+                goto getprop_throw;
+            } else if (gouter && gk2 == CONT_KEYED_INV) {
+                /* the same for the keyed invariant once its read has suspended. */
+                JSKeyedInv *kit = gouter;
+                gp_outer = kit->outer; gp_outer_kind = kit->outer_kind;
+                js_keyed_inv_free(ctx, kit);
                 goto getprop_throw;
             } else if (gouter && gk2 == CONT_PROXY_INV) {
                 /* the same for an object-level invariant, whose reads suspend for the same reasons. */
