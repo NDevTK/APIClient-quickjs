@@ -20679,6 +20679,11 @@ typedef struct JSArraySort {
     int present;                    /* HasProperty(O, k) for that index — sort skips holes */
     uint8_t elem_ph;                /* 0 = the ask is due, 1 = the read is due */
     JSValue coerced;                /* the string a ToString delivered, until the slot adopts it (owned) */
+    JSValue cmpres;                 /* the comparator's RESULT, held across its own ToNumber (owned). 23.1.3.30
+                                       SortCompare step 3.a is `ToNumber(? Call(comparator, …))` and the operand
+                                       of that ToNumber is the page's value, so an object result runs its
+                                       valueOf/@@toPrimitive — which is a suspension point like any other and
+                                       therefore cannot live in a C local across it. */
     JSValue copy;                   /* toSorted's ArrayCreate(len), until it becomes the thing being sorted (owned) */
     JSValue el;                     /* an element held across its read while that copy is being built (owned) */
     JSValue cb_args[4];             /* [this=undefined, method, array[l].val, array[r].val]; call_argv=&cb_args[2], argc=2 */
@@ -65125,7 +65130,7 @@ static int js_array_sort_recv(JSContext *ctx, JSArraySort *s)
     s->obj = JS_UNDEFINED; s->method = step_arg(&s->hdr, 0); s->array = NULL; s->tmp = NULL;
     s->n = 0; s->len = 0; s->undefined_count = 0; s->pending = 0;
     s->width = 1; s->i = 0; s->lo = s->mid = s->hi = s->l = s->r = s->k = 0; s->wb = 0;
-    s->coerced = JS_UNDEFINED; s->copy = JS_UNDEFINED; s->el = JS_UNDEFINED;
+    s->coerced = JS_UNDEFINED; s->copy = JS_UNDEFINED; s->el = JS_UNDEFINED; s->cmpres = JS_UNDEFINED;
     for (i = 0; i < 4; i++) s->cb_args[i] = JS_UNDEFINED;
     s->obj = JS_ToObject(ctx, s->hdr.this_val);
     if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
@@ -65182,11 +65187,26 @@ static int js_array_sort_step(JSContext *ctx, JSArraySort *s, JSValue res, JSVal
     int rc;
     if (s->pending) {
         double v;
-        if (JS_ToFloat64Free(ctx, &v, res) < 0) return -1;   /* consumes res */
+        /* SortCompare step 3.a coerces what the comparator RETURNED, and JS_ToFloat64Free did that from C — so
+           a comparator returning an object ran its valueOf in an activation with no flow base, in the one
+           machine that had already been built to park everything else. The result is held on the state because
+           the coercion suspends. */
+        if (s->hdr.num_phase == NUM_PH_START) {
+            DCHECK(JS_IsUndefined(s->cmpres), "a comparator result is already being coerced on this sort");
+            s->cmpres = res;
+            res = JS_UNDEFINED;
+        }
+        rc = step_tofloat64_run(ctx, &s->hdr, s->cmpres, res, &v, out_cb, out_argc);
         res = JS_UNDEFINED;
+        if (rc) return rc < 0 ? -1 : rc;
+        JS_FreeValue(ctx, s->cmpres); s->cmpres = JS_UNDEFINED;
         s->pending = 0;
-        if (v <= 0) s->tmp[s->k++] = s->array[s->l++];   /* stable: <= keeps the left (earlier) element first */
-        else        s->tmp[s->k++] = s->array[s->r++];
+        /* step 3.b: a NaN v is +0, which a stable sort keeps in original order. `v <= 0` is FALSE for NaN, so
+           every comparison took the right element and `[1,2,3,4].sort(() => NaN)` came out reversed. Asking
+           whether v is GREATER than zero is the one form that answers both cases: NaN and 0 alike keep the
+           left (earlier) element, which is what stability means. */
+        if (!(v > 0)) s->tmp[s->k++] = s->array[s->l++];
+        else          s->tmp[s->k++] = s->array[s->r++];
     } else if (s->hdr.str_phase == STR_PH_START) {
         JS_FreeValue(ctx, res);   /* JS_UNDEFINED on the first call, or a stray value */
         res = JS_UNDEFINED;
@@ -65426,6 +65446,8 @@ static JSValue js_array_sort_vfini(JSContext *ctx, void *st, bool take_result)
     int64_t w;
     JS_FreeValue(ctx, s->coerced);   /* a ToString that landed just before an abandon */
     s->coerced = JS_UNDEFINED;
+    JS_FreeValue(ctx, s->cmpres);    /* a comparator result whose ToNumber was abandoned part-way */
+    s->cmpres = JS_UNDEFINED;
     JS_FreeValue(ctx, s->copy);      /* toSorted's result, if the copy walk was abandoned part-way through */
     JS_FreeValue(ctx, s->el);
     /* every slot the writeback has not consumed: all of them when the machine is abandoned before stage 7, the
