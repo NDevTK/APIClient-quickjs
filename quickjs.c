@@ -19994,6 +19994,11 @@ _Static_assert(CONT_ITER_CONSUME_FWD == CONT_ITER_CONSUME, "the forward alias us
 _Static_assert(CONT_PROMISE_ALL_FWD == CONT_PROMISE_ALL, "the forward alias used by the capability abandon must equal CONT_PROMISE_ALL");
 _Static_assert(CONT_ITER_HELPER_FWD == CONT_ITER_HELPER, "the forward alias used by the abandon walk must equal CONT_ITER_HELPER");
 
+#define CONT_PROXY_INV     58  /* gp_outer = JSProxyInv: the four OBJECT-LEVEL invariants (10.5.1-10.5.4),
+                                  each of which checks the trap's result against IsExtensible(target) and, for
+                                  the prototype pair, target.[[GetPrototypeOf]](). Both are internal methods, so
+                                  a Proxy target answers with its own trap and the check cannot run from C. */
+
 #define CONT_OWNKEYS_CHK   57  /* gp_outer = JSOwnKeysChk: 10.5.11's invariant, which reaches the object the
                                   `ownKeys` trap RETURNED (CreateListFromArrayLike) and three internal methods on
                                   the TARGET. js_proxy_ownkeys_check ran all six from C, so a proxy whose target
@@ -20066,6 +20071,7 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_OP_KEYED:
     case CONT_FOR_IN_HAS:
     case CONT_OWNKEYS_CHK:
+    case CONT_PROXY_INV:
         break;
     }
 }
@@ -20638,6 +20644,8 @@ static bool tramp_can_call_promise_all(JSContext *ctx, JSValueConst func, JSValu
    nothing on purpose — the helper is a GC object, so dropping the link is the whole teardown. */
 struct JSOwnKeysChk;
 static void js_ownkeys_chk_free(JSContext *ctx, struct JSOwnKeysChk *ok);
+struct JSProxyInv;
+static void js_proxy_inv_free(JSContext *ctx, struct JSProxyInv *pv);
 static void js_create_requester_abandon(JSContext *ctx, void *cont, uint8_t kind)
 {
     /* keyed on the KIND, never on the pointer: a continuation whose whole state IS its kind carries a NULL one
@@ -20650,6 +20658,7 @@ static void js_create_requester_abandon(JSContext *ctx, void *cont, uint8_t kind
         || kind == CONT_FOROF_NEXT || kind == CONT_ITER_NEXT_OP || kind == CONT_FOR_IN_HAS)
         return;   /* no owned state: the kind IS the continuation (or the helper is a GC object) */
     if (kind == CONT_OWNKEYS_CHK) { js_ownkeys_chk_free(ctx, cont); return; }
+    if (kind == CONT_PROXY_INV) { js_proxy_inv_free(ctx, cont); return; }
     if (kind == CONT_STEP) { tramp_step_chain_free(ctx, cont); return; }
     if (kind == CONT_PROMISE_ALL) {
         js_promise_all_end(ctx, (struct JSPromiseAll *)cont); js_free_rt(ctx->rt, cont); return;
@@ -21184,6 +21193,40 @@ typedef struct JSOwnKeysChk {
 } JSOwnKeysChk;
 enum { OKC_LEN = 0, OKC_LEN_GOT, OKC_ELEM, OKC_ELEM_GOT,
        OKC_EXT, OKC_EXT_GOT, OKC_TKEYS, OKC_TKEYS_GOT, OKC_TDESC, OKC_TDESC_GOT };
+
+/* ---- the four OBJECT-LEVEL proxy invariants, as one machine ----
+
+   10.5.1/2/3/4 all end the same way: the trap's result, checked against up to two facts about the TARGET —
+   IsExtensible(target) and, for the two prototype operations, target.[[GetPrototypeOf]](). Those are internal
+   methods, so for a Proxy target they are its traps, and js_proxy_getproto_invariant / _setproto_invariant /
+   _ext_invariant ran them from C.
+
+   ONE machine rather than four, because the four differ only in which facts they need and what they conclude —
+   the phases, the requests and the teardown are identical. It also keeps the SKIPS honest: 10.5.2 step 8 returns
+   on a false trap result before IsExtensible is reached, and 10.5.1/2 consult [[GetPrototypeOf]] only on a
+   non-extensible target. Asking anyway would run a trap for a step the spec never takes. */
+typedef struct JSProxyInv {
+    JSValue obj;         /* the proxy (owned) */
+    JSValue target;      /* its [[Target]] (owned) */
+    JSValue res;         /* GETPROTO: the trap's value. The others: nothing — `tres` holds their boolean. (owned) */
+    JSValue proto_arg;   /* SETPROTO's operand, for step 12's SameValue (owned) */
+    void *outer;
+    uint8_t outer_kind;
+    uint8_t op;          /* GP_GETPROTO / GP_ISEXT / GP_PREVEXT / GP_SETPROTO */
+    uint8_t phase;       /* PI_* */
+    int tres;            /* the trap's BOOLEAN, for the three that have one */
+    int extensible;
+} JSProxyInv;
+enum { PI_EXT = 0, PI_EXT_GOT, PI_PROTO, PI_PROTO_GOT };
+
+static void js_proxy_inv_free(JSContext *ctx, struct JSProxyInv *pv)
+{
+    JS_FreeValue(ctx, pv->obj);
+    JS_FreeValue(ctx, pv->target);
+    JS_FreeValue(ctx, pv->res);
+    JS_FreeValue(ctx, pv->proto_arg);
+    js_free_rt(ctx->rt, pv);
+}
 
 static void js_ownkeys_chk_free(JSContext *ctx, struct JSOwnKeysChk *ok)
 {
@@ -26288,6 +26331,87 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
 
+        do_proxy_inv_step:
+            /* 10.5.1 steps 7-11 / 10.5.2 steps 8-12 / 10.5.3 steps 7-8 / 10.5.4 steps 7-8, whichever this is.
+               `ret_val` is the previous request's answer (UNINITIALIZED on entry). */
+            {
+                JSProxyInv *pv = (JSProxyInv *)cont_st;
+                cont_st = NULL;
+                for (;;) {
+                    if (pv->phase == PI_EXT) {
+                        pv->phase = PI_EXT_GOT;
+                        gp_obj = pv->target; gp_atom = JS_ATOM_NULL;
+                        gp_op = GP_ISEXT; gp_val = JS_UNDEFINED;
+                        gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
+                        gp_outer = pv; gp_outer_kind = CONT_PROXY_INV;
+                        goto do_getprop_tramp;
+                    }
+                    if (pv->phase == PI_EXT_GOT) {
+                        pv->extensible = JS_ToBoolFree(ctx, ret_val);
+                        ret_val = JS_UNDEFINED;
+                        if (pv->op == GP_ISEXT) {
+                            /* 10.5.3 step 8: the trap must agree with the target. */
+                            if (pv->tres != pv->extensible) {
+                                JS_ThrowTypeError(ctx, "proxy: inconsistent isExtensible");
+                                goto pi_throw;
+                            }
+                            ret_val = js_bool(pv->tres);
+                            goto pi_done;
+                        }
+                        if (pv->op == GP_PREVEXT) {
+                            /* 10.5.4 step 7.b: claiming success requires the target to be non-extensible. */
+                            if (pv->extensible) {
+                                JS_ThrowTypeError(ctx, "proxy: inconsistent preventExtensions");
+                                goto pi_throw;
+                            }
+                            ret_val = JS_TRUE;
+                            goto pi_done;
+                        }
+                        /* the prototype pair: an extensible target constrains nothing (10.5.1 step 9 /
+                           10.5.2 step 10), so [[GetPrototypeOf]] is a step the spec does not take. */
+                        if (pv->extensible) {
+                            ret_val = (pv->op == GP_SETPROTO) ? JS_TRUE : pv->res;
+                            if (pv->op == GP_SETPROTO) JS_FreeValue(ctx, pv->res);
+                            pv->res = JS_UNDEFINED;
+                            goto pi_done;
+                        }
+                        pv->phase = PI_PROTO;
+                    }
+                    if (pv->phase == PI_PROTO) {
+                        pv->phase = PI_PROTO_GOT;
+                        gp_obj = pv->target; gp_atom = JS_ATOM_NULL;
+                        gp_op = GP_GETPROTO; gp_val = JS_UNDEFINED;
+                        gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
+                        gp_outer = pv; gp_outer_kind = CONT_PROXY_INV;
+                        goto do_getprop_tramp;
+                    }
+                    DCHECK(pv->phase == PI_PROTO_GOT, "an object-level proxy invariant resumed in no phase");
+                    {
+                        /* 10.5.1 step 11 / 10.5.2 step 12: SameValue against what the target actually has. */
+                        JSValueConst claimed = (pv->op == GP_SETPROTO) ? pv->proto_arg : pv->res;
+                        bool same = JS_VALUE_GET_OBJ(ret_val) == JS_VALUE_GET_OBJ(claimed);
+                        JS_FreeValue(ctx, ret_val);
+                        ret_val = JS_UNDEFINED;
+                        if (!same) {
+                            JS_ThrowTypeError(ctx, "proxy: inconsistent prototype");
+                            goto pi_throw;
+                        }
+                        ret_val = (pv->op == GP_SETPROTO) ? JS_TRUE : pv->res;
+                        if (pv->op == GP_SETPROTO) JS_FreeValue(ctx, pv->res);
+                        pv->res = JS_UNDEFINED;
+                        goto pi_done;
+                    }
+                }
+            pi_done:
+                gp_outer = pv->outer; gp_outer_kind = pv->outer_kind;
+                js_proxy_inv_free(ctx, pv);
+                goto do_getprop_complete;
+            pi_throw:
+                gp_outer = pv->outer; gp_outer_kind = pv->outer_kind;
+                js_proxy_inv_free(ctx, pv);
+                goto getprop_throw;
+            }
+
         do_ownkeys_chk_step:
             /* 10.5.11 steps 7-22, one request at a time. `ret_val` is the previous one's answer (UNINITIALIZED
                on entry). Steps 7-9 walk the object the TRAP returned; steps 14-16 and 17-21 are internal
@@ -26890,6 +27014,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                           cont_st = gouter0;
                           goto do_opkeyed_place;
                       }
+                      if (gk == CONT_PROXY_INV) {
+                          /* an object-level invariant's own request, answered with nothing suspended — every
+                             ordinary target. Back into the machine at the phase that asked. */
+                          cont_st = gouter0;
+                          goto do_proxy_inv_step;
+                      }
                       if (gk == CONT_OWNKEYS_CHK) {
                           /* the [[OwnPropertyKeys]] invariant's own request, answered with nothing suspended —
                              every ordinary target. Back into the machine at the phase that asked. */
@@ -27038,6 +27168,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         JSGopdDesc *gd = gouter;
                         gp_outer = gd->outer; gp_outer_kind = gd->outer_kind;
                         js_gopd_desc_free(ctx, gd);
+                        goto getprop_throw;
+                    }
+                    if (gk3 == CONT_PROXY_INV) {
+                        /* the invariant's own read threw in place — a revoked target, a poisoned C trap. The
+                           operation it is parked inside can never finish, so the throw unwinds one level. */
+                        JSProxyInv *pvt = gouter;
+                        gp_outer = pvt->outer; gp_outer_kind = pvt->outer_kind;
+                        js_proxy_inv_free(ctx, pvt);
                         goto getprop_throw;
                     }
                     if (gk3 == CONT_OWNKEYS_CHK) {
@@ -29948,7 +30086,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            || gouter_kind == CONT_PROMISE_ALL_THEN || gouter_kind == CONT_AFS_GET
                            || gouter_kind == CONT_ITER_HELPER_GET || gouter_kind == CONT_PROMISE_ALL_GET
                            || gouter_kind == CONT_FOROF_UNPACK || gouter_kind == CONT_FOR_IN_HAS
-                           || gouter_kind == CONT_OWNKEYS_CHK,
+                           || gouter_kind == CONT_OWNKEYS_CHK || gouter_kind == CONT_PROXY_INV,
                            "property-get outer continuation: unknown machine kind");
                     if (gouter_kind == CONT_PROMISE_ALL_THEN) {
                         js_getprop_free(ctx, gp);
@@ -30148,22 +30286,64 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 goto do_ownkeys_chk_step;
                             }
                         }
-                    } else if (gp->op == GP_SETPROTO) {
-                        /* the trap's boolean, then 10.5.2's invariant: a true result on a non-extensible target
-                           requires the prototype to be the one it already has. The proxy is the RECEIVER slot,
-                           because `value` is carrying the new prototype. */
-                        int sr = js_proxy_setproto_invariant(ctx, gp->target, gp->value,
-                                                             JS_ToBoolFree(ctx, ret_val));
-                        ret_val = (sr < 0) ? JS_EXCEPTION : js_bool(sr);
-                    } else if (gp->op == GP_ISEXT || gp->op == GP_PREVEXT) {
-                        /* the trap's boolean, then 10.5.3 / 10.5.4's invariant against the target's own state. */
-                        int xr = js_proxy_ext_invariant(ctx, gp->value, gp->op == GP_PREVEXT,
-                                                        JS_ToBoolFree(ctx, ret_val));
-                        ret_val = (xr < 0) ? JS_EXCEPTION : js_bool(xr);
-                    } else if (gp->op == GP_GETPROTO) {
-                        /* the `getPrototypeOf` trap returned. 10.5.1 steps 6-10 run on it — the same check the C
-                           hook performs, shared so the two cannot drift. */
-                        ret_val = js_proxy_getproto_invariant(ctx, gp->value, ret_val);
+                    } else if (gp->op == GP_SETPROTO || gp->op == GP_ISEXT
+                               || gp->op == GP_PREVEXT || gp->op == GP_GETPROTO) {
+                        /* one of the four OBJECT-LEVEL traps returned, and its invariant checks the result
+                           against IsExtensible(target) and — for the prototype pair — the target's own
+                           prototype. Both are internal methods, so they belong to the machine rather than to
+                           this delivery; the C form ran them here and could not park a Proxy target's trap. */
+                        int op6 = gp->op;
+                        bool early = false;
+                        int tres6 = 0;
+                        if (op6 == GP_GETPROTO) {
+                            /* 10.5.1 step 7: the result must be an Object or null, checked before the target is
+                               touched at all. */
+                            if (!JS_IsException(ret_val)
+                                && JS_VALUE_GET_TAG(ret_val) != JS_TAG_NULL
+                                && JS_VALUE_GET_TAG(ret_val) != JS_TAG_OBJECT) {
+                                JS_FreeValue(ctx, ret_val);
+                                JS_ThrowTypeError(ctx, "proxy: inconsistent prototype");
+                                ret_val = JS_EXCEPTION;
+                            }
+                        } else {
+                            tres6 = JS_ToBoolFree(ctx, ret_val);
+                            ret_val = JS_UNDEFINED;
+                            /* 10.5.2 step 8 / 10.5.4 step 8: a false trap result is the answer, and neither
+                               reaches IsExtensible — so neither may run the target's trap. */
+                            if (!tres6 && (op6 == GP_SETPROTO || op6 == GP_PREVEXT)) {
+                                ret_val = JS_FALSE;
+                                early = true;
+                            }
+                        }
+                        if (!early && !JS_IsException(ret_val)) {
+                            JSProxyInv *pv = js_mallocz(ctx, sizeof(*pv));
+                            if (unlikely(!pv)) {
+                                JS_FreeValue(ctx, ret_val); JS_ThrowOutOfMemory(ctx); ret_val = JS_EXCEPTION;
+                            } else {
+                                /* WHAT `value` HOLDS DIFFERS BY OP, and the C form read it accordingly: for
+                                   SETPROTO it is the new prototype and the TARGET rides `target`; for the other
+                                   three it is the PROXY, whose [[Target]] the invariant needs. */
+                                pv->obj = JS_UNDEFINED;
+                                if (op6 == GP_SETPROTO) {
+                                    pv->target = js_dup(gp->target);
+                                    pv->proto_arg = js_dup(gp->value);
+                                } else {
+                                    JSProxyData *pd7 = JS_VALUE_GET_OBJ(gp->value)->u.opaque;
+                                    pv->obj = js_dup(gp->value);
+                                    pv->target = js_dup(pd7->target);
+                                    pv->proto_arg = JS_UNDEFINED;
+                                }
+                                pv->res = (op6 == GP_GETPROTO) ? ret_val : JS_UNDEFINED;
+                                pv->outer = gouter; pv->outer_kind = gouter_kind;
+                                pv->op = (uint8_t)op6;
+                                pv->tres = tres6;
+                                pv->phase = PI_EXT;
+                                js_getprop_free(ctx, gp);
+                                cont_st = pv;
+                                ret_val = JS_UNINITIALIZED;
+                                goto do_proxy_inv_step;
+                            }
+                        }
                     } else if (gp->op == GP_HAS) {
                         /* the `has` trap's boolean, then the target's [[HasProperty]] invariant on it */
                         int hres = js_proxy_has_invariant(ctx, gp->target, gp->atom, JS_ToBoolFree(ctx, ret_val));
@@ -30218,6 +30398,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         /* for-in's deletion check whose `has` trap SUSPENDED. Same restoration as above, so the
                            iterator is back at sp[-1] and the loop resumes exactly where it asked. */
                         goto do_for_in_has_deliver;
+                    }
+                    if (gouter_kind == CONT_PROXY_INV) {
+                        /* one of an object-level invariant's own requests — IsExtensible(target) or the
+                           target's [[GetPrototypeOf]] — whose trap suspended. */
+                        cont_st = gouter;
+                        if (unlikely(JS_IsException(ret_val))) {
+                            JSProxyInv *pvx = gouter;
+                            gp_outer = pvx->outer; gp_outer_kind = pvx->outer_kind;
+                            js_proxy_inv_free(ctx, pvx);
+                            goto getprop_throw;
+                        }
+                        goto do_proxy_inv_step;
                     }
                     if (gouter_kind == CONT_OWNKEYS_CHK) {
                         /* one of the [[OwnPropertyKeys]] invariant's own requests — a trap-result read, or one
@@ -34210,7 +34402,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             uint8_t gk2 = gp->outer_kind;
             DCHECK(!gouter || gk2 == CONT_STEP || gk2 == CONT_ITER_CONSUME || gk2 == CONT_ACQUIRE_GET
                    || gk2 == CONT_ITER_CLOSE || gk2 == CONT_TRAP_GET || gk2 == CONT_GOPD_DESC
-                   || gk2 == CONT_OWNKEYS_CHK
+                   || gk2 == CONT_OWNKEYS_CHK || gk2 == CONT_PROXY_INV
                    || gk2 == CONT_OP_KEYED
                    || gk2 == CONT_PROMISE_ALL_THEN || gk2 == CONT_AFS_GET
                    || gk2 == CONT_ITER_HELPER_GET || gk2 == CONT_PROMISE_ALL_GET
@@ -34282,6 +34474,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSGopdDesc *gd = gouter;
                 gp_outer = gd->outer; gp_outer_kind = gd->outer_kind;
                 js_gopd_desc_free(ctx, gd);
+                goto getprop_throw;
+            } else if (gouter && gk2 == CONT_PROXY_INV) {
+                /* the same for an object-level invariant, whose reads suspend for the same reasons. */
+                JSProxyInv *pvt = gouter;
+                gp_outer = pvt->outer; gp_outer_kind = pvt->outer_kind;
+                js_proxy_inv_free(ctx, pvt);
                 goto getprop_throw;
             } else if (gouter && gk2 == CONT_OWNKEYS_CHK) {
                 /* the same for the ownKeys invariant, whose reads suspend for exactly the same reasons. */
