@@ -1495,7 +1495,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_OBJ_GETPROTO, STEPDEF_REFLECT_GETPROTO,
     STEPDEF_OBJ_ISEXT, STEPDEF_REFLECT_ISEXT, STEPDEF_OBJ_PREVEXT, STEPDEF_REFLECT_PREVEXT,
     STEPDEF_OBJ_SETPROTO, STEPDEF_REFLECT_SETPROTO,
-    STEPDEF_JSON_STRINGIFY, STEPDEF_FOR_IN,
+    STEPDEF_JSON_STRINGIFY, STEPDEF_FOR_IN, STEPDEF_IMPORT_OPTS,
     STEPDEF_COUNT
 };
 #define HINT_NONE    2
@@ -1598,8 +1598,7 @@ static void js_free_module_def(JSContext *ctx, JSModuleDef *m);
 static void js_mark_module_def(JSRuntime *rt, JSModuleDef *m,
                                JS_MarkFunc *mark_func);
 static JSValue js_import_meta(JSContext *ctx);
-static JSValue js_dynamic_import(JSContext *ctx, JSValueConst specifier,
-                                 JSValueConst options);
+
 static void free_var_ref(JSRuntime *rt, JSVarRef *var_ref);
 static JSValue js_new_promise_capability(JSContext *ctx,
                                          JSValue *resolving_funcs,
@@ -21151,18 +21150,30 @@ typedef struct JSEnumKeys {
     uint32_t kept;             /* how many have survived so far */
     uint32_t i;                /* the walk cursor */
     uint8_t phase;             /* EK_* */
+    /* 7.3.23's `kind` operand. key+value reads each surviving key's VALUE right after its descriptor, so the
+       page sees getOwnPropertyDescriptor(a), get(a), getOwnPropertyDescriptor(b), get(b) — interleaved, which
+       is what the algorithm states. Collecting every descriptor and then every value is a DIFFERENT observable
+       order, and it is the order import()'s attribute walk had. */
+    uint8_t want_values;
+    JSValue *vals;             /* want_values: one per survivor, indexed with atoms[] (owned) */
     JSValue cb[1];             /* the request buffer: [the object] */
 } JSEnumKeys;
-enum { EK_ASK_KEYS = 0, EK_GOT_KEYS, EK_ASK_DESC, EK_GOT_DESC, EK_DONE };
+enum { EK_ASK_KEYS = 0, EK_GOT_KEYS, EK_ASK_DESC, EK_GOT_DESC, EK_ASK_VAL, EK_GOT_VAL, EK_DONE };
 
 static void js_enum_keys_init(JSEnumKeys *c)
 {
     c->obj = JS_UNDEFINED; c->cb[0] = JS_UNDEFINED;
     c->atoms = NULL; c->len = c->kept = c->i = 0; c->phase = EK_ASK_KEYS;
+    c->want_values = 0; c->vals = NULL;
 }
 
 static void js_enum_keys_free(JSContext *ctx, JSEnumKeys *c)
 {
+    if (c->vals) {
+        uint32_t vi;
+        for (vi = 0; vi < c->kept; vi++) JS_FreeValue(ctx, c->vals[vi]);
+        js_free(ctx, c->vals); c->vals = NULL;
+    }
     if (c->atoms) { js_free_prop_enum(ctx, c->atoms, c->len); c->atoms = NULL; }
     JS_FreeValue(ctx, c->obj); c->obj = JS_UNDEFINED;
     c->cb[0] = JS_UNDEFINED;   /* borrowed by the requests; `obj` owns it */
@@ -21197,6 +21208,10 @@ static int js_enum_keys_run(JSContext *ctx, JSEnumKeys *c, JSValue in, JSValue *
             if (js_get_length32(ctx, &klen, keys)) { JS_FreeValue(ctx, keys); return -1; }
             c->atoms = klen ? js_mallocz(ctx, sizeof(c->atoms[0]) * klen) : NULL;
             if (klen && !c->atoms) { JS_FreeValue(ctx, keys); return -1; }
+            if (c->want_values && klen) {
+                c->vals = js_mallocz(ctx, sizeof(c->vals[0]) * klen);
+                if (!c->vals) { JS_FreeValue(ctx, keys); return -1; }
+            }
             for (ki = 0; ki < klen; ki++) {
                 JSValue kv = JS_GetPropertyUint32(ctx, keys, ki);
                 JSAtom at;
@@ -21221,6 +21236,20 @@ static int js_enum_keys_run(JSContext *ctx, JSEnumKeys *c, JSValue in, JSValue *
             c->cb[0] = c->obj;
             *out_cb = c->cb; *out_argc = (int)c->atoms[c->i].atom;
             return 12;
+        }
+        if (c->phase == EK_ASK_VAL) {
+            JS_FreeValue(ctx, in); in = JS_UNDEFINED;
+            c->phase = EK_GOT_VAL;
+            c->cb[0] = c->obj;
+            *out_cb = c->cb; *out_argc = (int)c->atoms[c->kept - 1].atom;
+            return 6;
+        }
+        if (c->phase == EK_GOT_VAL) {
+            if (JS_IsException(in)) return -1;
+            c->vals[c->kept - 1] = in;
+            in = JS_UNDEFINED;
+            c->phase = EK_ASK_DESC;
+            continue;
         }
         DCHECK(c->phase == EK_GOT_DESC, "the enumerable-keys cursor resumed in no phase");
         {
@@ -21250,8 +21279,13 @@ static int js_enum_keys_run(JSContext *ctx, JSEnumKeys *c, JSValue in, JSValue *
             c->atoms[c->kept].is_enumerable = (enumerable != 0);
             c->kept++;
             c->i++;
+            /* 7.3.23 step 3.a.ii.2: kind key+value reads the value HERE, between this key's descriptor and the
+               next key's. `enumerable` gates it, because a non-enumerable key's value is never read. */
+            if (c->want_values && enumerable) { c->phase = EK_ASK_VAL; continue; }
+            if (c->want_values) c->vals[c->kept - 1] = JS_UNDEFINED;
             c->phase = EK_ASK_DESC;
         }
+        continue;
     }
 }
 
@@ -21264,11 +21298,15 @@ static void js_enum_keys_keep_enumerable(JSContext *ctx, JSEnumKeys *c)
     DCHECK(c->phase == EK_DONE, "the enumerable-only filter ran on a cursor that has not finished its walk");
     for (i = 0; i < c->kept; i++) {
         if (c->atoms[i].is_enumerable) {
-            if (kept != i) { c->atoms[kept] = c->atoms[i]; c->atoms[i].atom = JS_ATOM_NULL; }
+            if (kept != i) {
+                c->atoms[kept] = c->atoms[i]; c->atoms[i].atom = JS_ATOM_NULL;
+                if (c->vals) { c->vals[kept] = c->vals[i]; c->vals[i] = JS_UNDEFINED; }
+            }
             kept++;
         } else {
             JS_FreeAtom(ctx, c->atoms[i].atom);
             c->atoms[i].atom = JS_ATOM_NULL;
+            if (c->vals) { JS_FreeValue(ctx, c->vals[i]); c->vals[i] = JS_UNDEFINED; }
         }
     }
     c->kept = kept;
@@ -30215,13 +30253,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     tp_slot = -2; tp_hint = HINT_STRING; tp_retry_pc = pc - 1;
                     goto do_toprim_tramp;
                 }
-                val = js_dynamic_import(ctx, sp[-2], sp[-1]);
-                if (JS_IsException(val))
-                    goto exception;
-                JS_FreeValue(ctx, sp[-2]);
-                JS_FreeValue(ctx, sp[-1]);
-                sp--;
-                sp[-1] = val;
+                /* 16.2.1.8 steps 4-12 with the specifier already primitive. The options walk runs the
+                   page's code — the `with` read, the `ownKeys`/`getOwnPropertyDescriptor` pair, and each
+                   attribute's value read — and every failure REJECTS rather than throwing, so it is a machine
+                   whose result is the promise on both paths. Operand shape: two consumed, one pushed. */
+                void *io_stt;
+                JSValueConst io_args[2];
+                (void)val;
+                io_args[0] = sp[-2]; io_args[1] = sp[-1];
+                io_stt = tramp_step_state_new(ctx, tramp_step_def_by_id(STEPDEF_IMPORT_OPTS),
+                                              JS_UNDEFINED, 2, io_args, JS_UNDEFINED);
+                if (unlikely(!io_stt)) goto exception;
+                ((JSStepHdr *)io_stt)->orig_cfirst = -2;
+                ((JSStepHdr *)io_stt)->orig_cargc = 0;
+                ((JSStepHdr *)io_stt)->orig_is_tail = 0;
+                cont_st = io_stt;
+                ret_val = JS_UNDEFINED;
+                goto do_step_step;
             }
             BREAK;
 
@@ -45900,109 +45948,167 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
     return JS_UNDEFINED;
 }
 
-static JSValue js_dynamic_import(JSContext *ctx, JSValueConst specifier,
-                                 JSValueConst options)
+/* ---- import()'s options, 16.2.1.8 steps 8-11, as a step machine ----
+
+   js_dynamic_import ran three of the page's operations from C: `Get(options, "with")`, the attribute record's
+   `ownKeys` + per-key `getOwnPropertyDescriptor`, and the `Get` of each attribute's VALUE. Every one of them is
+   a trap or an accessor, and a loop in any of them had no flow base — the specifier's ToString was already a
+   request (CONT_IMPORT), so this was the rest of the same opcode still in C.
+
+   And the walk was in the WRONG ORDER. 7.3.23 with kind key+value reads each surviving key's value between
+   that key's descriptor and the NEXT key's descriptor; the C body collected every descriptor first and then
+   every value, which a Proxy sees as a different sequence. The cursor performs the whole operation now, so the
+   order is the algorithm's rather than the implementation's.
+
+   Every failure here REJECTS the promise instead of throwing — 16.2.1.8 wraps steps 4 onward in
+   IfAbruptRejectPromise — so the machine's result is the promise whatever happens, and a throwing trap comes
+   back to it as a value (catches_abrupt). That also unifies the two capabilities the old code created: the
+   coercion's, made by OP_import for exactly this rejection, and js_dynamic_import's own. */
+typedef struct JSImportOpts {
+    JSStepHdr hdr;         /* MUST be first — argv[0] = specifier (a primitive), argv[1] = options */
+    JSValue promise;       /* the capability's promise: this machine's result on every path (owned) */
+    JSValue funcs[2];      /* [resolve, reject] (owned) */
+    JSValue basename_val;  /* the referrer, read before anything can suspend (owned) */
+    JSValue spec_str;      /* ToString(specifier) (owned) */
+    JSValue attrs_obj;     /* options.with (owned) */
+    JSValue attrs;         /* the null-prototype attribute record being built (owned) */
+    JSEnumKeys *ek;        /* 7.3.23 over attrs_obj, key+value (owned) */
+} JSImportOpts;
+
+/* The abrupt completion of any of steps 4-11 is a REJECTION. `err` is consumed. Always returns 0: the opcode
+   completes normally with the promise, which is the whole point of IfAbruptRejectPromise. */
+static int js_import_opts_reject(JSContext *ctx, JSImportOpts *s, JSValue err)
 {
-    JSAtom basename;
-    JSValue promise, resolving_funcs[2], basename_val, err, ret;
-    JSValue specifier_str = JS_UNDEFINED, attributes = JS_UNDEFINED;
-    JSValue attributes_obj = JS_UNDEFINED;
-    JSValue args[5];
-
-    basename = JS_GetScriptOrModuleName(ctx, 0);
-    if (basename == JS_ATOM_NULL)
-        basename_val = JS_NULL;
-    else
-        basename_val = JS_AtomToValue(ctx, basename);
-    JS_FreeAtom(ctx, basename);
-    if (JS_IsException(basename_val))
-        return basename_val;
-
-    promise = JS_NewPromiseCapability(ctx, resolving_funcs);
-    if (JS_IsException(promise)) {
-        JS_FreeValue(ctx, basename_val);
-        return promise;
-    }
-
-    /* the string conversion must occur here */
-    specifier_str = JS_ToString(ctx, specifier);
-    if (JS_IsException(specifier_str))
-        goto exception;
-
-    if (!JS_IsUndefined(options)) {
-        if (!JS_IsObject(options)) {
-            JS_ThrowTypeError(ctx, "options must be an object");
-            goto exception;
-        }
-        attributes_obj = JS_GetProperty(ctx, options, JS_ATOM_with);
-        if (JS_IsException(attributes_obj))
-            goto exception;
-        if (!JS_IsUndefined(attributes_obj)) {
-            JSPropertyEnum *atoms;
-            uint32_t atoms_len, i;
-            JSValue val;
-
-            if (!JS_IsObject(attributes_obj)) {
-                JS_ThrowTypeError(ctx, "options.with must be an object");
-                goto exception;
-            }
-            attributes = JS_NewObjectProto(ctx, JS_NULL);
-            if (JS_IsException(attributes))
-                goto exception;
-            if (JS_GetOwnPropertyNamesInternal(ctx, &atoms, &atoms_len, JS_VALUE_GET_OBJ(attributes_obj),
-                                               JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY)) {
-                goto exception;
-            }
-            for(i = 0; i < atoms_len; i++) {
-                val = JS_GetProperty(ctx, attributes_obj, atoms[i].atom);
-                if (JS_IsException(val))
-                    goto exception1;
-                if (!JS_IsString(val)) {
-                    JS_FreeValue(ctx, val);
-                    JS_ThrowTypeError(ctx, "module attribute values must be strings");
-                    goto exception1;
-                }
-                if (JS_DefinePropertyValue(ctx, attributes, atoms[i].atom, val,
-                                           JS_PROP_C_W_E) < 0) {
-                exception1:
-                    JS_FreePropertyEnum(ctx, atoms, atoms_len);
-                    goto exception;
-                }
-            }
-            JS_FreePropertyEnum(ctx, atoms, atoms_len);
-            if (ctx->rt->module_check_attrs &&
-                ctx->rt->module_check_attrs(ctx, ctx->rt->module_loader_opaque, attributes) < 0) {
-                goto exception;
-            }
-            JS_FreeValue(ctx, attributes_obj);
-            attributes_obj = JS_UNDEFINED;
-        }
-    }
-
-    args[0] = resolving_funcs[0];
-    args[1] = resolving_funcs[1];
-    args[2] = basename_val;
-    args[3] = specifier_str;
-    args[4] = attributes;
-
-    /* cannot run JS_LoadModuleInternal synchronously because it would
-       cause an unexpected recursion in js_evaluate_module() */
-    JS_EnqueueJob(ctx, js_dynamic_import_job, 5, vc(args));
-done:
-    JS_FreeValue(ctx, basename_val);
-    JS_FreeValue(ctx, resolving_funcs[0]);
-    JS_FreeValue(ctx, resolving_funcs[1]);
-    JS_FreeValue(ctx, specifier_str);
-    JS_FreeValue(ctx, attributes);
-    return promise;
- exception:
-    JS_FreeValue(ctx, attributes_obj);
-    err = JS_GetException(ctx);
-    ret = JS_Call(ctx, resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
-    JS_FreeValue(ctx, ret);
+    JSValue rr = JS_Call(ctx, s->funcs[1], JS_UNDEFINED, 1, vc(&err));
     JS_FreeValue(ctx, err);
-    goto done;
+    JS_FreeValue(ctx, rr);
+    return 0;
 }
+
+/* step 12: hand the resolved specifier and attribute record to the host. The load cannot run synchronously —
+   it would recurse into js_evaluate_module — so it is a job, and nothing here runs the page's code. */
+static int js_import_opts_enqueue(JSContext *ctx, JSImportOpts *s)
+{
+    JSValue args[5];
+    args[0] = s->funcs[0]; args[1] = s->funcs[1];
+    args[2] = s->basename_val; args[3] = s->spec_str; args[4] = s->attrs;
+    JS_EnqueueJob(ctx, js_dynamic_import_job, 5, vc(args));
+    return 0;
+}
+
+static int js_import_opts_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSImportOpts *s = st;
+    JSValueConst options = step_arg(&s->hdr, 1);
+    int r;
+
+    if (s->hdr.stage == 0) {
+        JSAtom basename;
+        JS_FreeValue(ctx, cb_result);
+        cb_result = JS_UNDEFINED;
+        s->promise = JS_UNDEFINED; s->funcs[0] = JS_UNDEFINED; s->funcs[1] = JS_UNDEFINED;
+        s->basename_val = JS_UNDEFINED; s->spec_str = JS_UNDEFINED;
+        s->attrs_obj = JS_UNDEFINED; s->attrs = JS_UNDEFINED;
+        /* the REFERRER, read here because it comes off the live stack frame and the machine is about to
+           suspend into somewhere else entirely. */
+        basename = JS_GetScriptOrModuleName(ctx, 0);
+        s->basename_val = (basename == JS_ATOM_NULL) ? JS_NULL : JS_AtomToValue(ctx, basename);
+        JS_FreeAtom(ctx, basename);
+        if (JS_IsException(s->basename_val)) { s->basename_val = JS_UNDEFINED; return -1; }
+        /* the capability, before anything that can fail: from here every failure is a rejection of it, so it
+           has to exist first. Creating one runs nothing — it is the intrinsic Promise. */
+        s->promise = JS_NewPromiseCapability(ctx, s->funcs);
+        if (JS_IsException(s->promise)) { s->promise = JS_UNDEFINED; return -1; }
+        s->hdr.stage = 1;
+
+        /* step 6: the specifier is a PRIMITIVE by now — an object one was coerced by OP_import's ToPrimitive
+           request before the opcode re-executed — so this runs nothing. It still throws for a Symbol, and that
+           throw rejects like every other. */
+        s->spec_str = JS_ToString(ctx, step_arg(&s->hdr, 0));
+        if (JS_IsException(s->spec_str)) {
+            s->spec_str = JS_UNDEFINED;
+            return js_import_opts_reject(ctx, s, JS_GetException(ctx));
+        }
+        if (JS_IsUndefined(options))
+            return js_import_opts_enqueue(ctx, s);          /* step 8: no options, no attributes */
+        if (!JS_IsObject(options)) {
+            JS_ThrowTypeError(ctx, "options must be an object");   /* step 9.a */
+            return js_import_opts_reject(ctx, s, JS_GetException(ctx));
+        }
+        /* step 9.b: `Get(options, "with")` — an accessor or a Proxy `get` trap. */
+        return step_getprop_run(ctx, &s->hdr, options, JS_ATOM_with, JS_UNDEFINED,
+                                &s->attrs_obj, out_cb, out_argc);
+    }
+
+    if (s->hdr.stage == 1) {
+        if (JS_IsException(cb_result))
+            return js_import_opts_reject(ctx, s, JS_GetException(ctx));
+        step_getprop_done(ctx, &s->hdr, cb_result, &s->attrs_obj);
+        cb_result = JS_UNDEFINED;
+        if (JS_IsUndefined(s->attrs_obj))
+            return js_import_opts_enqueue(ctx, s);          /* step 9.c: no `with`, no attributes */
+        if (!JS_IsObject(s->attrs_obj)) {
+            JS_ThrowTypeError(ctx, "options.with must be an object");   /* step 9.c.i */
+            return js_import_opts_reject(ctx, s, JS_GetException(ctx));
+        }
+        s->attrs = JS_NewObjectProto(ctx, JS_NULL);
+        if (JS_IsException(s->attrs)) { s->attrs = JS_UNDEFINED; return -1; }
+        /* step 9.c.ii: `EnumerableOwnProperties(attributesObj, key+value)` — the `ownKeys` trap, then per key
+           a `getOwnPropertyDescriptor` and, if it survives, a `get`, INTERLEAVED in that order. */
+        s->ek = js_mallocz(ctx, sizeof(*s->ek));
+        if (!s->ek) return -1;
+        js_enum_keys_init(s->ek);
+        s->ek->obj = js_dup(s->attrs_obj);
+        s->ek->want_values = 1;
+        s->hdr.stage = 2;
+        cb_result = JS_UNDEFINED;
+    }
+
+    DCHECK(s->hdr.stage == 2, "import()'s options machine resumed in no stage");
+    if (JS_IsException(cb_result))
+        return js_import_opts_reject(ctx, s, JS_GetException(ctx));
+    r = js_enum_keys_run(ctx, s->ek, cb_result, out_cb, out_argc);
+    if (r > 0) return r;
+    if (r < 0) return js_import_opts_reject(ctx, s, JS_GetException(ctx));
+    js_enum_keys_keep_enumerable(ctx, s->ek);
+    {
+        uint32_t k;
+        for (k = 0; k < s->ek->kept; k++) {
+            if (!JS_IsString(s->ek->vals[k])) {
+                JS_ThrowTypeError(ctx, "module attribute values must be strings");
+                return js_import_opts_reject(ctx, s, JS_GetException(ctx));
+            }
+            if (JS_DefinePropertyValue(ctx, s->attrs, s->ek->atoms[k].atom,
+                                       js_dup(s->ek->vals[k]), JS_PROP_C_W_E) < 0)
+                return js_import_opts_reject(ctx, s, JS_GetException(ctx));
+        }
+    }
+    if (ctx->rt->module_check_attrs
+        && ctx->rt->module_check_attrs(ctx, ctx->rt->module_loader_opaque, s->attrs) < 0)
+        return js_import_opts_reject(ctx, s, JS_GetException(ctx));
+    return js_import_opts_enqueue(ctx, s);
+}
+
+static JSValue js_import_opts_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSImportOpts *s = st;
+    JSValue r;
+    if (s->ek) { js_enum_keys_free(ctx, s->ek); js_free(ctx, s->ek); }
+    JS_FreeValue(ctx, s->funcs[0]);
+    JS_FreeValue(ctx, s->funcs[1]);
+    JS_FreeValue(ctx, s->basename_val);
+    JS_FreeValue(ctx, s->spec_str);
+    JS_FreeValue(ctx, s->attrs_obj);
+    JS_FreeValue(ctx, s->attrs);
+    r = take_result ? s->promise : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->promise);
+    js_free(ctx, s);
+    return r;
+}
+
+/* DELETED: js_dynamic_import. Its options walk is the machine above; its capability is the machine's, which is
+   also the one OP_import used to create separately for the specifier coercion's rejection — two capabilities
+   for one promise, of which the first was thrown away on the ordinary path. */
 
 static void js_set_module_evaluated(JSContext *ctx, JSModuleDef *m)
 {
@@ -60931,6 +61037,11 @@ static const JSTrampStepDef js_array_sort_def    = { sizeof(JSArraySort), js_arr
 static const JSTrampStepDef js_array_toSorted_def = { sizeof(JSArraySort), js_array_sort_vstep, js_array_sort_vfini, 1 };
 static const JSTrampStepDef js_json_parse_def    = { sizeof(JSJsonReviver), js_json_parse_vstep, js_json_parse_vfini, 0 };
 static const JSTrampStepDef js_for_in_def       = { sizeof(JSForIn), js_for_in_step, js_for_in_fini, 0 };
+static const JSTrampStepDef js_import_opts_def  = {
+    sizeof(JSImportOpts), js_import_opts_step, js_import_opts_fini, 0,
+    /* body, body_proto, body_magic, precheck, midcheck, onerror */ {NULL}, 0, 0, NULL, NULL, NULL,
+    .catches_abrupt = 1   /* 16.2.1.8 wraps steps 4 on in IfAbruptRejectPromise: a throw is a VALUE here */
+};
 static const JSTrampStepDef js_json_str_def      = { sizeof(JSJsonStr), js_json_str_step, js_json_str_fini, 0 };
 static const JSTrampStepDef js_ta_slice_def     = { sizeof(JSTASlice), js_ta_slice_step, js_ta_slice_fini, 0 };
 static const JSTrampStepDef js_str_concat_def   = { sizeof(JSStrConcat), js_str_concat_step, js_str_concat_fini, 0 };
@@ -61397,6 +61508,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_JSON_PARSE]    = &js_json_parse_def,
     [STEPDEF_JSON_STRINGIFY] = &js_json_str_def,
     [STEPDEF_FOR_IN]         = &js_for_in_def,
+    [STEPDEF_IMPORT_OPTS]    = &js_import_opts_def,
     [STEPDEF_TA_SLICE]      = &js_ta_slice_def,
     [STEPDEF_STR_CONCAT]    = &js_str_concat_def,
     [STEPDEF_STR_CTOR]      = &js_str_ctor_def,
@@ -61611,6 +61723,7 @@ STEP_STATE_HDR_FIRST(JSReSearch);
 STEP_STATE_HDR_FIRST(JSJsonReviver);
 STEP_STATE_HDR_FIRST(JSJsonStr);
 STEP_STATE_HDR_FIRST(JSForIn);
+STEP_STATE_HDR_FIRST(JSImportOpts);
 STEP_STATE_HDR_FIRST(JSStrCtor);
 STEP_STATE_HDR_FIRST(JSStrConcat);
 STEP_STATE_HDR_FIRST(JSTASlice);
