@@ -942,6 +942,13 @@ typedef struct JSForInIterator {
     bool is_array;
     uint32_t array_length;
     uint32_t idx;
+    /* The candidate key whose "was it deleted?" HasProperty is IN FLIGHT (owned), JS_ATOM_NULL otherwise.
+       14.7.5.10 re-checks each key against the object before yielding it, and that check is the page's code —
+       a `has` trap on any Proxy in the prototype chain. The check is a request now, so it SUSPENDS, and the
+       candidate has to outlive the C frame that chose it. It rides here because the iterator is what the
+       operand stack already holds across the suspension, which is why the continuation needs no state of its
+       own; the finalizer releases it, so an abandoned flow cannot leak it. */
+    JSAtom pending;
 } JSForInIterator;
 
 typedef struct JSRegExp {
@@ -7292,6 +7299,7 @@ static void js_for_in_iterator_finalizer(JSRuntime *rt, JSValueConst val)
     JSObject *p = JS_VALUE_GET_OBJ(val);
     JSForInIterator *it = p->u.for_in_iterator;
     JS_FreeValueRT(rt, it->obj);
+    JS_FreeAtomRT(rt, it->pending);   /* set only while a deletion check is in flight */
     js_free_rt(rt, it);
 }
 
@@ -17044,64 +17052,40 @@ static JSValue js_build_mapped_arguments(JSContext *ctx, int argc,
    driven from OP_for_in_start — see js_for_in_step. The C body ran [[GetPrototypeOf]] and the per-link key walk
    from C, so `for (k in proxy)` reached three of the page's traps with no flow base. */
 
-/* enum_obj -> enum_obj value done */
-static __exception int js_for_in_next(JSContext *ctx, JSValue *sp)
+/* Write 14.7.5.10's answer into the two slots OP_for_in_next grows the stack by. Both the "yielded a key" and
+   the "exhausted" endings go through here so the shape cannot drift between them. */
+static void js_for_in_deliver(JSContext *ctx, JSValue *sp, JSAtom prop)
 {
-    JSValue enum_obj;
-    JSObject *p;
-    JSAtom prop;
-    JSForInIterator *it;
-    int ret;
+    if (prop == JS_ATOM_NULL) { sp[0] = JS_UNDEFINED; sp[1] = JS_TRUE; return; }
+    sp[0] = JS_AtomToValue(ctx, prop);
+    sp[1] = JS_FALSE;
+}
 
-    enum_obj = sp[-1];
-    /* fail safe */
-    if (JS_VALUE_GET_TAG(enum_obj) != JS_TAG_OBJECT)
-        goto done;
-    p = JS_VALUE_GET_OBJ(enum_obj);
-    if (p->class_id != JS_CLASS_FOR_IN_ITERATOR)
-        goto done;
-    it = p->u.for_in_iterator;
-
-    for(;;) {
+/* The next CANDIDATE key, taken from the iterator's snapshot with the cursor advanced past it. No user code
+   runs here — the snapshot is the engine's own — so it stays a C function; deciding whether the candidate is
+   STILL there is the part that is the page's, and that is the request the opcode issues. JS_ATOM_NULL = the
+   snapshot is exhausted. */
+static JSAtom js_for_in_candidate(JSObject *p, JSForInIterator *it)
+{
+    for (;;) {
         if (it->is_array) {
-            if (it->idx >= it->array_length)
-                goto done;
-            prop = __JS_AtomFromUInt32(it->idx);
-            it->idx++;
+            if (it->idx >= it->array_length) return JS_ATOM_NULL;
+            return __JS_AtomFromUInt32(it->idx++);
         } else {
             JSShape *sh = p->shape;
             JSShapeProperty *prs;
-            if (it->idx >= sh->prop_count)
-                goto done;
+            if (it->idx >= sh->prop_count) return JS_ATOM_NULL;
             prs = &get_shape_prop(sh)[it->idx];
-            prop = prs->atom;
             it->idx++;
-            if (prop == JS_ATOM_NULL || !(prs->flags & JS_PROP_ENUMERABLE))
-                continue;
+            if (prs->atom == JS_ATOM_NULL || !(prs->flags & JS_PROP_ENUMERABLE)) continue;
+            return prs->atom;
         }
-        // check if the property was deleted unless we're dealing with a proxy
-        JSValue obj = it->obj;
-        if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
-            JSObject *p = JS_VALUE_GET_OBJ(obj);
-            if (p->class_id == JS_CLASS_PROXY)
-                break;
-        }
-        ret = JS_HasProperty(ctx, obj, prop);
-        if (ret < 0)
-            return ret;
-        if (ret)
-            break;
     }
-    /* return the property */
-    sp[0] = JS_AtomToValue(ctx, prop);
-    sp[1] = JS_FALSE;
-    return 0;
- done:
-    /* return the end */
-    sp[0] = JS_UNDEFINED;
-    sp[1] = JS_TRUE;
-    return 0;
 }
+
+/* DELETED: js_for_in_next. Its loop is OP_for_in_next's do_for_in_next_loop / do_for_in_has_deliver pair, so
+   the deletion check can be a request: JS_HasProperty from C fired a `has` trap on any Proxy in the receiver's
+   prototype chain — `for (k in Object.create(new Proxy(...)))` — with no flow base to preempt into. */
 
 /* DELETED: JS_GetIterator2. It was GetIteratorFromMethod's step 1 Call performed from C — the @@iterator method
    invoked with JS_Call, so an ordinary `[Symbol.iterator]() {…}` with a loop in it ran with no flow base. Its
@@ -19999,6 +19983,14 @@ _Static_assert(CONT_ITER_CONSUME_FWD == CONT_ITER_CONSUME, "the forward alias us
 _Static_assert(CONT_PROMISE_ALL_FWD == CONT_PROMISE_ALL, "the forward alias used by the capability abandon must equal CONT_PROMISE_ALL");
 _Static_assert(CONT_ITER_HELPER_FWD == CONT_ITER_HELPER, "the forward alias used by the abandon walk must equal CONT_ITER_HELPER");
 
+#define CONT_FOR_IN_HAS    56  /* cont_state = NULL: OP_for_in_next's "was this key deleted?" HasProperty, whose
+                                  answer decides whether the key is yielded or the loop moves to the next
+                                  candidate. It carries no state because the candidate rides the ITERATOR, which
+                                  is the operand the opcode left on the stack — so the delivery re-enters the
+                                  same loop the opcode entered, one implementation reached from two places.
+                                  js_for_in_next used to run JS_HasProperty from C, which fires a `has` trap on
+                                  any Proxy in the receiver's prototype chain. */
+
 /* THE CONT_* NAMESPACE IS ONE NAMESPACE. A TrampFrame's cont_kind and a continuation's outer_kind both hold values
    from it (a JSToPrim's outer is CONT_STEP / CONT_IMPORT / CONT_ITER_CONSUME; a JSGetProp's is CONT_STEP or
    CONT_ITER_CONSUME), so two kinds sharing a number silently routes one continuation's state through the other
@@ -20056,6 +20048,7 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_TRAP_GET:
     case CONT_GOPD_DESC:
     case CONT_OP_KEYED:
+    case CONT_FOR_IN_HAS:
         break;
     }
 }
@@ -20635,7 +20628,7 @@ static void js_create_requester_abandon(JSContext *ctx, void *cont, uint8_t kind
     if (kind == CONT_NONE)
         return;
     if (kind == CONT_ITER_HELPER || kind == CONT_INSTANCEOF || kind == CONT_SETTER
-        || kind == CONT_FOROF_NEXT || kind == CONT_ITER_NEXT_OP)
+        || kind == CONT_FOROF_NEXT || kind == CONT_ITER_NEXT_OP || kind == CONT_FOR_IN_HAS)
         return;   /* no owned state: the kind IS the continuation (or the helper is a GC object) */
     if (kind == CONT_STEP) { tramp_step_chain_free(ctx, cont); return; }
     if (kind == CONT_PROMISE_ALL) {
@@ -21401,7 +21394,10 @@ static int js_for_in_step(JSContext *ctx, void *st, JSValue cb_result, JSValue *
             obj = JS_ToObjectFree(ctx, obj);   /* a primitive wrapper: nothing to run */
             if (JS_IsException(obj)) return -1;
         }
-        it = js_malloc(ctx, sizeof(*it));
+        /* ZEROED, not js_malloc'd: `pending` is a field the C body never had, and an allocation that leaves
+           any field undefined makes adding one a silent bug at a site nobody edits. Zero IS this struct's
+           resting state — JS_ATOM_NULL is 0 — so the obligation is discharged by construction. */
+        it = js_mallocz(ctx, sizeof(*it));
         if (!it) { JS_FreeValue(ctx, obj); return -1; }
         s->enum_obj = JS_NewObjectProtoClass(ctx, JS_NULL, JS_CLASS_FOR_IN_ITERATOR);
         if (JS_IsException(s->enum_obj)) {
@@ -21413,6 +21409,7 @@ static int js_for_in_step(JSContext *ctx, void *st, JSValue cb_result, JSValue *
         it->is_array = false;
         it->obj = obj;            /* the iterator owns it from here */
         it->idx = 0;
+        it->pending = JS_ATOM_NULL;
         p = JS_VALUE_GET_OBJ(s->enum_obj);
         p->u.for_in_iterator = it;
 
@@ -25957,6 +25954,62 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
 
         if (0) {
+        do_for_in_next_loop:
+            /* 14.7.5.10's per-key step, reached from OP_for_in_next and re-entered from the delivery below —
+               ONE loop, not one in the opcode and another in a C helper. Taking the next candidate off the
+               iterator's own snapshot runs nothing; deciding whether that candidate is STILL a property is the
+               page's code, a `has` trap on any Proxy in the prototype chain, so it is a request. */
+            {
+                JSObject *fip;
+                JSForInIterator *fit;
+                JSAtom fprop;
+                if (JS_VALUE_GET_TAG(sp[-1]) != JS_TAG_OBJECT
+                    || JS_VALUE_GET_OBJ(sp[-1])->class_id != JS_CLASS_FOR_IN_ITERATOR) {
+                    js_for_in_deliver(ctx, sp, JS_ATOM_NULL);   /* fail safe: not an iterator, so it is spent */
+                    sp += 2;
+                    BREAK;
+                }
+                fip = JS_VALUE_GET_OBJ(sp[-1]);
+                fit = fip->u.for_in_iterator;
+                fprop = js_for_in_candidate(fip, fit);
+                if (fprop == JS_ATOM_NULL) { js_for_in_deliver(ctx, sp, JS_ATOM_NULL); sp += 2; BREAK; }
+                /* a PROXY receiver is not re-checked: its key list came from the `ownKeys` trap and the
+                   descriptor the `getOwnPropertyDescriptor` trap returned, and asking `has` on top of that
+                   would run a third trap the spec does not call for here. */
+                if (JS_VALUE_GET_TAG(fit->obj) == JS_TAG_OBJECT
+                    && JS_VALUE_GET_OBJ(fit->obj)->class_id == JS_CLASS_PROXY) {
+                    js_for_in_deliver(ctx, sp, fprop);
+                    sp += 2;
+                    BREAK;
+                }
+                /* the candidate is BORROWED from the shape, which the trap may reshape under us, so the
+                   iterator takes its own reference for the duration of the request. */
+                DCHECK(fit->pending == JS_ATOM_NULL,
+                       "a for-in deletion check is already in flight on this iterator");
+                fit->pending = JS_DupAtom(ctx, fprop);
+                gp_obj = fit->obj; gp_atom = fit->pending; gp_op = GP_HAS; gp_val = JS_UNDEFINED;
+                gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
+                gp_outer = NULL; gp_outer_kind = CONT_FOR_IN_HAS;
+                goto do_getprop_tramp;
+            }
+
+        do_for_in_has_deliver:
+            /* the deletion check answered. The iterator is still the operand the opcode left at sp[-1], which is
+               why this continuation needs no state: the candidate is parked on it. */
+            {
+                JSForInIterator *fit = JS_VALUE_GET_OBJ(sp[-1])->u.for_in_iterator;
+                JSAtom fprop = fit->pending;
+                int fhas;
+                fit->pending = JS_ATOM_NULL;
+                if (unlikely(JS_IsException(ret_val))) { JS_FreeAtom(ctx, fprop); goto exception; }
+                fhas = JS_ToBoolFree(ctx, ret_val);
+                ret_val = JS_UNDEFINED;
+                if (fhas < 0) { JS_FreeAtom(ctx, fprop); goto exception; }
+                if (fhas) { js_for_in_deliver(ctx, sp, fprop); JS_FreeAtom(ctx, fprop); sp += 2; BREAK; }
+                JS_FreeAtom(ctx, fprop);        /* deleted since the snapshot: skip it */
+                goto do_for_in_next_loop;
+            }
+
         do_opkeyed_place:
             /* THE ONE placement of a bytecode OPERATOR's keyed operation, reached whether the trap suspended or
                answered in place. The request's own arguments never touch the caller's stack, so the operator's
@@ -26414,6 +26467,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                           /* a bytecode OPERATOR's keyed operation, answered with nothing suspended. */
                           cont_st = gouter0;
                           goto do_opkeyed_place;
+                      }
+                      if (gk == CONT_FOR_IN_HAS) {
+                          /* for-in's deletion check, answered with nothing suspended — every ordinary receiver.
+                             The loop it re-enters is the opcode's, one implementation for both arms. */
+                          goto do_for_in_has_deliver;
                       }
                       if (gk == CONT_ACQUIRE_GET) {
                           /* the read invoked nothing (a data @@iterator, a primitive source, a nullish one whose
@@ -29451,7 +29509,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            || gouter_kind == CONT_PROMISE_ALL_NEXT_GET || gouter_kind == CONT_ITER_FROM_NEXT_GET
                            || gouter_kind == CONT_PROMISE_ALL_THEN || gouter_kind == CONT_AFS_GET
                            || gouter_kind == CONT_ITER_HELPER_GET || gouter_kind == CONT_PROMISE_ALL_GET
-                           || gouter_kind == CONT_FOROF_UNPACK,
+                           || gouter_kind == CONT_FOROF_UNPACK || gouter_kind == CONT_FOR_IN_HAS,
                            "property-get outer continuation: unknown machine kind");
                     if (gouter_kind == CONT_PROMISE_ALL_THEN) {
                         js_getprop_free(ctx, gp);
@@ -29691,6 +29749,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            SAME placement the in-place arm performs. */
                         cont_st = gouter;
                         goto do_opkeyed_place;
+                    }
+                    if (gouter_kind == CONT_FOR_IN_HAS) {
+                        /* for-in's deletion check whose `has` trap SUSPENDED. Same restoration as above, so the
+                           iterator is back at sp[-1] and the loop resumes exactly where it asked. */
+                        goto do_for_in_has_deliver;
                     }
                     cont_st = gouter;
                     if (gouter_kind == CONT_ITER_CONSUME) {
@@ -30767,10 +30830,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
         CASE(OP_for_in_next):
             sf->cur_pc = pc;
-            if (js_for_in_next(ctx, sp))
-                goto exception;
-            sp += 2;
-            BREAK;
+            goto do_for_in_next_loop;
         CASE(OP_for_of_start):
             sf->cur_pc = pc;
             {
