@@ -25279,18 +25279,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     ctx->pending_close_iter = js_dup(iterobj);
                     goto exception;
                 }
-                nextm = JS_GetProperty(ctx, iterobj, JS_ATOM_next);   /* GetIteratorDirect's nextMethod */
-                if (JS_IsException(nextm)) goto exception;
                 if (iterterm_kind == ITERTERM_TOARRAY) acc = JS_NewArray(ctx);
                 else if (iterterm_kind == ITERTERM_REDUCE)
                     acc = (call_argc >= 2) ? js_dup(call_argv[1]) : JS_UNINITIALIZED;   /* UNINITIALIZED = seed from the first element */
                 else acc = JS_UNDEFINED;
-                if (JS_IsException(acc)) { JS_FreeValue(ctx, nextm); goto exception; }
+                if (JS_IsException(acc)) goto exception;
                 s = js_iter_consume_new(ctx);
-                if (unlikely(!s)) { JS_FreeValue(ctx, nextm); JS_FreeValue(ctx, acc); JS_ThrowOutOfMemory(ctx); goto exception; }
+                if (unlikely(!s)) { JS_FreeValue(ctx, acc); JS_ThrowOutOfMemory(ctx); goto exception; }
                 s->r = acc;
                 s->iter = js_dup(iterobj);
-                s->next = nextm;
+                /* GetIteratorDirect's nextMethod is a READ on the page's iterator — an accessor or a Proxy — and
+                   it was a plain JS_GetProperty here. It is the same request the consumer's own acquire issues,
+                   so the machine is built first and the read fills it in. */
                 s->mapfn = (call_argc >= 1) ? js_dup(call_argv[0]) : JS_UNDEFINED;
                 s->k = 0;
                 s->sink = ITERCONS_ITERTERM;
@@ -25298,9 +25298,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 CONSUME_ADOPT_SHAPE(s);
                 s->args_own = call_args_owned; s->args_own_n = call_args_owned_n;
                 call_args_owned = NULL; call_args_owned_n = 0;
-                cont_st = s;
-                ret_val = JS_UNINITIALIZED;
-                goto do_iter_consume_step;
+                gp_outer = s; gp_outer_kind = CONT_CONSUME_NEXT_GET;
+                gp_obj = s->iter; gp_atom = JS_ATOM_next; gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                goto do_getprop_tramp;
             }
 
         do_setop_consume_tramp:
