@@ -1000,8 +1000,6 @@ JS_EXTERN int JS_SetPrototype(JSContext *ctx, JSValueConst obj, JSValueConst pro
 JS_EXTERN JSValue JS_GetPrototype(JSContext *ctx, JSValueConst val);
 JS_EXTERN int JS_GetLength(JSContext *ctx, JSValueConst obj, int64_t *pres);
 JS_EXTERN int JS_SetLength(JSContext *ctx, JSValueConst obj, int64_t len);
-JS_EXTERN int JS_SealObject(JSContext *ctx, JSValueConst obj);
-JS_EXTERN int JS_FreezeObject(JSContext *ctx, JSValueConst obj);
 
 #define JS_GPN_STRING_MASK  (1 << 0)
 #define JS_GPN_SYMBOL_MASK  (1 << 1)

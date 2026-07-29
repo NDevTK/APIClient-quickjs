@@ -1510,6 +1510,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_OBJ_LOOKUPGETTER, STEPDEF_OBJ_LOOKUPSETTER,
     STEPDEF_FUNC_BIND, STEPDEF_ITER_SET_CTOR, STEPDEF_ITER_SET_TAG,
     STEPDEF_ITER_HELPER_RETURN,
+    STEPDEF_OBJ_SEAL, STEPDEF_OBJ_FREEZE, STEPDEF_OBJ_ISSEALED, STEPDEF_OBJ_ISFROZEN,
     STEPDEF_COUNT
 };
 #define HINT_NONE    2
@@ -57665,129 +57666,204 @@ static JSValue js_object_toLocaleString(JSContext *ctx, JSValueConst this_val,
     return JS_Invoke(ctx, this_val, JS_ATOM_toString, 0, NULL);
 }
 
-static JSValue js_object_seal(JSContext *ctx, JSValueConst this_val,
-                              int argc, JSValueConst *argv, int freeze_flag)
+
+/* 7.3.15 SetIntegrityLevel and 7.3.16 TestIntegrityLevel — Object.seal / freeze / isSealed / isFrozen. ONE
+   machine, because the two algorithms are the same [[OwnPropertyKeys]] walk with a [[GetOwnProperty]] per key
+   and differ only in the operation they OPEN with and what they do per key; the level is the other arg bit.
+   Four of the page's operations live in them — [[PreventExtensions]] or [[IsExtensible]], [[OwnPropertyKeys]],
+   a [[GetOwnProperty]] per key, and for a Set a [[DefineOwnProperty]] per key — and the C bodies ran every one
+   from C, so `Object.freeze(new Proxy(o, {ownKeys(){for(;;){}}}))` had no flow base.
+
+   TestIntegrityLevel's extensibility check also moves to where the spec states it: step 1, BEFORE the keys are
+   read, with step 2 returning false immediately. js_object_isSealed asked it LAST, so an extensible Proxy saw
+   an ownKeys trap and a gopd per key that the spec never performs. */
+typedef struct JSIntegrity {
+    JSStepHdr hdr;        /* MUST be first. arg = INTEG_* bits */
+    JSValue obj;          /* the receiver (owned) */
+    JSValue keys;         /* [[OwnPropertyKeys]]' answer, an array this engine built (owned) */
+    JSValue result;       /* DONE (owned) */
+    JSDescFacts facts;    /* the current key's descriptor record (owned) */
+    JSAtom key;           /* the key being processed (owned) */
+    uint32_t i, len;
+} JSIntegrity;
+#define INTEG_FREEZE 1    /* the FROZEN level; 0 = sealed */
+#define INTEG_TEST   2    /* TestIntegrityLevel; 0 = SetIntegrityLevel */
+enum { IG_OPEN_GOT = 1, IG_KEYS_GOT, IG_NEXT, IG_DESC_GOT, IG_DEFINE_GOT };
+
+static int js_integrity_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    JSValueConst obj = argv[0];
-    JSObject *p;
-    JSTypedArray *ta;
-    JSArrayBuffer *abuf;
-    JSPropertyEnum *props;
-    uint32_t len, i;
-    int flags, desc_flags, res;
+    JSIntegrity *s = st;
+    bool is_test = (s->hdr.arg & INTEG_TEST) != 0;
+    bool is_freeze = (s->hdr.arg & INTEG_FREEZE) != 0;
 
-    if (!JS_IsObject(obj))
-        return js_dup(obj);
-
-    p = JS_VALUE_GET_OBJ(obj);
-    if (p->class_id == JS_CLASS_MODULE_NS) {
-        return JS_ThrowTypeError(ctx, "cannot %s module namespace",
-                                 freeze_flag ? "freeze" : "seal");
-    }
-
-    res = JS_PreventExtensions(ctx, obj);
-    if (res < 0)
-        return JS_EXCEPTION;
-    if (!res) {
-        return JS_ThrowTypeError(ctx, "proxy preventExtensions handler returned false");
-    }
-
-    if (freeze_flag && is_typed_array(p->class_id)) {
-        ta = p->u.typed_array;
-        abuf = ta->buffer->u.array_buffer;
-        if (array_buffer_is_resizable(abuf) || typed_array_is_oob(p))
-            return JS_ThrowTypeError(ctx, "cannot freeze resizable typed array");
-    }
-
-    flags = JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK;
-    if (JS_GetOwnPropertyNamesInternal(ctx, &props, &len, p, flags))
-        return JS_EXCEPTION;
-
-    for(i = 0; i < len; i++) {
-        int prop_flags;
-        JSAtom prop = props[i].atom;
-
-        desc_flags = JS_PROP_THROW | JS_PROP_HAS_CONFIGURABLE;
-        if (freeze_flag) {
-            res = JS_GetOwnPropertyFlagsInternal(ctx, &prop_flags, p, prop);
-            if (res < 0)
-                goto exception;
-            if (res) {
-                if (prop_flags & JS_PROP_WRITABLE)
-                    desc_flags |= JS_PROP_HAS_WRITABLE;
+    if (s->hdr.stage == 0) {
+        JSValueConst arg0 = step_arg(&s->hdr, 0);
+        JSObject *p;
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        s->obj = JS_UNDEFINED; s->keys = JS_UNDEFINED; s->result = JS_UNDEFINED;
+        s->key = JS_ATOM_NULL;
+        js_desc_facts_init(&s->facts);
+        if (!JS_IsObject(arg0)) {
+            /* 19.1.2.x step 1: a primitive is already sealed and frozen, and sealing one is a no-op. */
+            s->result = is_test ? JS_TRUE : js_dup(arg0);
+            return 0;
+        }
+        s->obj = js_dup(arg0);
+        p = JS_VALUE_GET_OBJ(s->obj);
+        if (!is_test) {
+            if (p->class_id == JS_CLASS_MODULE_NS) {
+                JS_ThrowTypeError(ctx, "cannot %s module namespace", is_freeze ? "freeze" : "seal");
+                return -1;
+            }
+            if (is_freeze && is_typed_array(p->class_id)) {
+                JSTypedArray *ta = p->u.typed_array;
+                JSArrayBuffer *abuf = ta->buffer->u.array_buffer;
+                if (array_buffer_is_resizable(abuf) || typed_array_is_oob(p)) {
+                    JS_ThrowTypeError(ctx, "cannot freeze resizable typed array");
+                    return -1;
+                }
             }
         }
-        if (JS_DefineProperty(ctx, obj, prop, JS_UNDEFINED,
-                              JS_UNDEFINED, JS_UNDEFINED, desc_flags) < 0)
-            goto exception;
+        s->hdr.stage = IG_OPEN_GOT;
+        s->hdr.cb_coerce[0] = s->obj;   /* borrowed: the machine holds the receiver across every request */
+        *out_cb = s->hdr.cb_coerce; *out_argc = 0;
+        return is_test ? 19 : 20;       /* 7.3.16 step 1 IsExtensible / 7.3.15 step 1 PreventExtensions */
     }
-    js_free_prop_enum(ctx, props, len);
-    return js_dup(obj);
-
- exception:
-    js_free_prop_enum(ctx, props, len);
-    return JS_EXCEPTION;
+    if (s->hdr.stage == IG_OPEN_GOT) {
+        int ok;
+        if (JS_IsException(cb_result)) return -1;
+        ok = JS_ToBoolFree(ctx, cb_result); cb_result = JS_UNDEFINED;
+        if (is_test && ok) {            /* step 2: an extensible object is at no integrity level */
+            s->result = JS_FALSE;
+            return 0;
+        }
+        if (!is_test && !ok) {
+            JS_ThrowTypeError(ctx, "proxy preventExtensions handler returned false");
+            return -1;
+        }
+        s->hdr.stage = IG_KEYS_GOT;     /* step 3: O.[[OwnPropertyKeys]]() */
+        s->hdr.cb_coerce[0] = s->obj;
+        *out_cb = s->hdr.cb_coerce; *out_argc = 0;
+        return 11;
+    }
+    if (s->hdr.stage == IG_KEYS_GOT) {
+        if (JS_IsException(cb_result)) return -1;
+        s->keys = cb_result; cb_result = JS_UNDEFINED;
+        if (js_get_length32(ctx, &s->len, s->keys)) return -1;
+        s->i = 0;
+        s->hdr.stage = IG_NEXT;
+    }
+    for (;;) {
+        if (s->hdr.stage == IG_NEXT) {
+            JSValue kv;
+            JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+            JS_FreeAtom(ctx, s->key); s->key = JS_ATOM_NULL;
+            if (s->i >= s->len) {
+                s->result = is_test ? JS_TRUE : js_dup(s->obj);
+                return 0;
+            }
+            /* the key list is an array this engine built and the invariant walk has already validated its
+               elements are Strings and Symbols, so reading one runs nothing of the page's. */
+            kv = JS_GetPropertyUint32(ctx, s->keys, s->i);
+            if (JS_IsException(kv)) return -1;
+            s->key = JS_ValueToAtom(ctx, kv);
+            JS_FreeValue(ctx, kv);
+            if (s->key == JS_ATOM_NULL) return -1;
+            if (!is_test && !is_freeze) {
+                /* step 4: the SEALED level defines {configurable:false} without reading the descriptor. */
+                s->hdr.stage = IG_DEFINE_GOT;
+                s->hdr.desc_get = JS_UNDEFINED; s->hdr.desc_set = JS_UNDEFINED;
+                s->hdr.desc_flags = JS_PROP_HAS_CONFIGURABLE | JS_PROP_THROW | JS_PROP_DEFINE_PROPERTY;
+                s->hdr.cb_coerce[0] = s->obj;
+                s->hdr.cb_coerce[1] = JS_UNDEFINED;
+                *out_cb = s->hdr.cb_coerce; *out_argc = (int)s->key;
+                return 10;
+            }
+            js_desc_facts_free(ctx, &s->facts);
+            s->hdr.stage = IG_DESC_GOT;   /* step 4/5's O.[[GetOwnProperty]](k), as a RECORD */
+            s->hdr.desc_facts = &s->facts;
+            s->hdr.cb_coerce[0] = s->obj;
+            *out_cb = s->hdr.cb_coerce; *out_argc = (int)s->key;
+            return 12;
+        }
+        if (s->hdr.stage == IG_DESC_GOT) {
+            if (JS_IsException(cb_result)) return -1;
+            JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+            if (s->facts.flags < 0) {     /* the property went away: both algorithms skip it */
+                s->i++;
+                s->hdr.stage = IG_NEXT;
+                continue;
+            }
+            if (is_test) {
+                if ((s->facts.flags & JS_PROP_CONFIGURABLE)
+                    || (is_freeze && !(s->facts.flags & JS_PROP_GETSET)
+                        && (s->facts.flags & JS_PROP_WRITABLE))) {
+                    s->result = JS_FALSE;   /* steps 4.b.i / 4.b.ii */
+                    return 0;
+                }
+                s->i++;
+                s->hdr.stage = IG_NEXT;
+                continue;
+            }
+            /* step 5.b: an accessor keeps only {configurable:false}; a data property also loses [[Writable]]. */
+            s->hdr.stage = IG_DEFINE_GOT;
+            s->hdr.desc_get = JS_UNDEFINED; s->hdr.desc_set = JS_UNDEFINED;
+            s->hdr.desc_flags = JS_PROP_HAS_CONFIGURABLE | JS_PROP_THROW | JS_PROP_DEFINE_PROPERTY;
+            if (!(s->facts.flags & JS_PROP_GETSET))
+                s->hdr.desc_flags |= JS_PROP_HAS_WRITABLE;
+            s->hdr.cb_coerce[0] = s->obj;
+            s->hdr.cb_coerce[1] = JS_UNDEFINED;
+            *out_cb = s->hdr.cb_coerce; *out_argc = (int)s->key;
+            return 10;
+        }
+        DCHECK(s->hdr.stage == IG_DEFINE_GOT, "the integrity-level machine resumed in no stage");
+        if (JS_IsException(cb_result)) return -1;
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        s->i++;
+        s->hdr.stage = IG_NEXT;
+    }
 }
 
-static JSValue js_object_isSealed(JSContext *ctx, JSValueConst this_val,
-                                  int argc, JSValueConst *argv, int is_frozen)
+static JSValue js_integrity_fini(JSContext *ctx, void *st, bool take_result)
 {
-    JSValueConst obj = argv[0];
-    JSObject *p;
+    JSIntegrity *s = st;
+    JSValue r;
+    js_desc_facts_free(ctx, &s->facts);
+    JS_FreeAtom(ctx, s->key);
+    JS_FreeValue(ctx, s->obj);
+    JS_FreeValue(ctx, s->keys);
+    r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    js_free(ctx, s);
+    return r;
+}
+
+/* 7.3.15 SetIntegrityLevel over an object this ENGINE built, where every one of its four operations is
+   ordinary and reaches no page code. The %ThrowTypeError% intrinsic is the only such caller, and it is frozen
+   before any script exists. It is a separate primitive rather than the machine because a machine needs a flow to
+   run on and there is none during intrinsic setup — and separate from the DELETED js_object_seal, whose whole
+   point was that its four operations are the PAGE's. The DCHECK is what keeps the two apart: an exotic receiver
+   here would mean a trap running from C during setup. */
+static int js_freeze_ordinary(JSContext *ctx, JSValueConst obj)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(obj);
     JSPropertyEnum *props;
     uint32_t len, i;
-    int flags, res;
-
-    if (!JS_IsObject(obj))
-        return JS_TRUE;
-
-    p = JS_VALUE_GET_OBJ(obj);
-    flags = JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK;
-    if (JS_GetOwnPropertyNamesInternal(ctx, &props, &len, p, flags))
-        return JS_EXCEPTION;
-
-    for(i = 0; i < len; i++) {
-        int prop_flags;
-        JSAtom prop = props[i].atom;
-
-        res = JS_GetOwnPropertyFlagsInternal(ctx, &prop_flags, p, prop);
-        if (res < 0)
-            goto exception;
-        if (res) {
-            if ((prop_flags & JS_PROP_CONFIGURABLE)
-            ||  (is_frozen && (prop_flags & JS_PROP_WRITABLE))) {
-                res = false;
-                goto done;
-            }
-        }
+    int res = 0;
+    DCHECK(p->class_id != JS_CLASS_PROXY && !JS_VALUE_GET_OBJ(obj)->is_exotic,
+           "js_freeze_ordinary on an exotic object: its integrity level is the page's operations, not these");
+    if (JS_PreventExtensions(ctx, obj) < 0)
+        return -1;
+    if (JS_GetOwnPropertyNamesInternal(ctx, &props, &len, p,
+                                       JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK))
+        return -1;
+    for (i = 0; i < len && res == 0; i++) {
+        if (JS_DefineProperty(ctx, obj, props[i].atom, JS_UNDEFINED, JS_UNDEFINED, JS_UNDEFINED,
+                              JS_PROP_THROW | JS_PROP_HAS_CONFIGURABLE | JS_PROP_HAS_WRITABLE) < 0)
+            res = -1;
     }
-    res = JS_IsExtensible(ctx, obj);
-    if (res < 0)
-        return JS_EXCEPTION;
-    res ^= 1;
-done:
     js_free_prop_enum(ctx, props, len);
-    return js_bool(res);
-
-exception:
-    js_free_prop_enum(ctx, props, len);
-    return JS_EXCEPTION;
-}
-
-int JS_SealObject(JSContext *ctx, JSValueConst obj)
-{
-    JSValue value = js_object_seal(ctx, JS_UNDEFINED, 1, &obj, 0);
-    int result = JS_IsException(value) ? -1 : true;
-    JS_FreeValue(ctx, value);
-    return result;
-}
-
-int JS_FreezeObject(JSContext *ctx, JSValueConst obj)
-{
-    JSValue value = js_object_seal(ctx, JS_UNDEFINED, 1, &obj, 1);
-    int result = JS_IsException(value) ? -1 : true;
-    JS_FreeValue(ctx, value);
-    return result;
+    return res;
 }
 
 /* DELETED: js_object_fromEntries. Its body was already only a DFAIL; with the capability declared at the
@@ -58037,10 +58113,10 @@ static const JSCFunctionListEntry js_object_funcs[] = {
     JS_CFUNC_STEP_DEF("getOwnPropertyDescriptors", 1, STEPDEF_OBJ_DESCS ),
     JS_CFUNC_DEF("is", 2, js_object_is ),
     JS_CFUNC_STEP_DEF("assign", 2, STEPDEF_OBJ_ASSIGN ),
-    JS_CFUNC_MAGIC_DEF("seal", 1, js_object_seal, 0 ),
-    JS_CFUNC_MAGIC_DEF("freeze", 1, js_object_seal, 1 ),
-    JS_CFUNC_MAGIC_DEF("isSealed", 1, js_object_isSealed, 0 ),
-    JS_CFUNC_MAGIC_DEF("isFrozen", 1, js_object_isSealed, 1 ),
+    JS_CFUNC_STEP_DEF("seal", 1, STEPDEF_OBJ_SEAL ),
+    JS_CFUNC_STEP_DEF("freeze", 1, STEPDEF_OBJ_FREEZE ),
+    JS_CFUNC_STEP_DEF("isSealed", 1, STEPDEF_OBJ_ISSEALED ),
+    JS_CFUNC_STEP_DEF("isFrozen", 1, STEPDEF_OBJ_ISFROZEN ),
     JS_CFUNC_CONSUME_DEF("fromEntries", 1, ITERCONS_OBJENTRIES ),
     JS_CFUNC_STEP_DEF("hasOwn", 2, STEPDEF_OBJ_HASOWN ),
 };
@@ -62471,6 +62547,10 @@ static const JSTrampStepDef js_lookupsetter_def = { sizeof(JSLookupAcc), js_look
 static const JSTrampStepDef js_func_bind_def   = { sizeof(JSFuncBind), js_func_bind_step, js_func_bind_fini, 0 };
 static const JSTrampStepDef js_iter_set_ctor_def = { sizeof(JSIterSetter), js_iter_setter_step, js_iter_setter_fini, JS_ATOM_constructor };
 static const JSTrampStepDef js_iter_set_tag_def  = { sizeof(JSIterSetter), js_iter_setter_step, js_iter_setter_fini, JS_ATOM_Symbol_toStringTag };
+static const JSTrampStepDef js_obj_seal_def     = { sizeof(JSIntegrity), js_integrity_step, js_integrity_fini, 0 };
+static const JSTrampStepDef js_obj_freeze_def   = { sizeof(JSIntegrity), js_integrity_step, js_integrity_fini, INTEG_FREEZE };
+static const JSTrampStepDef js_obj_issealed_def = { sizeof(JSIntegrity), js_integrity_step, js_integrity_fini, INTEG_TEST };
+static const JSTrampStepDef js_obj_isfrozen_def = { sizeof(JSIntegrity), js_integrity_step, js_integrity_fini, INTEG_TEST | INTEG_FREEZE };
 static const JSTrampStepDef js_iter_helper_return_def = { sizeof(JSIterHelperReturn), js_iter_helper_return_step, js_iter_helper_return_fini, 0 };
 static const JSTrampStepDef js_import_opts_def  = {
     sizeof(JSImportOpts), js_import_opts_step, js_import_opts_fini, 0,
@@ -62951,6 +63031,10 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_ITER_SET_CTOR]  = &js_iter_set_ctor_def,
     [STEPDEF_ITER_SET_TAG]   = &js_iter_set_tag_def,
     [STEPDEF_ITER_HELPER_RETURN] = &js_iter_helper_return_def,
+    [STEPDEF_OBJ_SEAL]       = &js_obj_seal_def,
+    [STEPDEF_OBJ_FREEZE]     = &js_obj_freeze_def,
+    [STEPDEF_OBJ_ISSEALED]   = &js_obj_issealed_def,
+    [STEPDEF_OBJ_ISFROZEN]   = &js_obj_isfrozen_def,
     [STEPDEF_IMPORT_OPTS]    = &js_import_opts_def,
     [STEPDEF_TA_SLICE]      = &js_ta_slice_def,
     [STEPDEF_STR_CONCAT]    = &js_str_concat_def,
@@ -63171,6 +63255,7 @@ STEP_STATE_HDR_FIRST(JSLookupAcc);
 STEP_STATE_HDR_FIRST(JSFuncBind);
 STEP_STATE_HDR_FIRST(JSIterSetter);
 STEP_STATE_HDR_FIRST(JSIterHelperReturn);
+STEP_STATE_HDR_FIRST(JSIntegrity);
 STEP_STATE_HDR_FIRST(JSImportOpts);
 STEP_STATE_HDR_FIRST(JSStrCtor);
 STEP_STATE_HDR_FIRST(JSStrConcat);
@@ -79587,7 +79672,8 @@ int JS_AddIntrinsicBaseObjects(JSContext *ctx)
                           JS_PROP_HAS_GET | JS_PROP_HAS_SET |
                           JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE) < 0)
         return -1;
-    JS_FreeValue(ctx, js_object_seal(ctx, JS_UNDEFINED, 1, vc(&ctx->throw_type_error), 1));
+    if (js_freeze_ordinary(ctx, ctx->throw_type_error) < 0)
+        return -1;
 
     /* Object */
     obj1 = JS_NewCConstructor(ctx, JS_CLASS_OBJECT, "Object",
