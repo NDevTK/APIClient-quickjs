@@ -19851,6 +19851,10 @@ typedef struct JSIterClose {
                                   a C recursion that drove it to completion. do_return applies IteratorNext's
                                   "result must be an object" check and IteratorComplete/IteratorValue, and places
                                   [value, done] exactly where js_for_of_next's tail does. */
+#define CONT_PROMISE_ALL_NEXT_GET 52  /* gp_outer = JSPromiseAll: GetIterator step 5.b for a Promise COMBINATOR.
+                                         Same read, same page code; what differs is the abrupt arm — the
+                                         combinator REJECTS its aggregate and yields it (IfAbruptRejectPromise),
+                                         never propagates, and the record is incomplete so nothing is closed. */
 #define CONT_CONSUME_NEXT_GET 51  /* gp_outer = JSIterConsume: GetIterator step 5.b for a CONSUMER (spread,
                                      Array.from, the Set/Map constructors, the set operations). A PROXIED source
                                      makes the read the `get` trap and an accessor `next` makes it a getter, and
@@ -25940,6 +25944,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                       if (gk == CONT_FORAWAIT_GET) goto do_forawait_have_async_method;
                       if (gk == CONT_FORAWAIT_SYNC_GET) goto do_forawait_have_sync_method;
                       if (gk == CONT_CONSUME_NEXT_GET) { cont_st = gouter0; goto do_consume_have_next; }
+                      if (gk == CONT_PROMISE_ALL_NEXT_GET) { cont_st = gouter0; goto do_promise_all_have_next; }
                       if (gk == CONT_ITER_CONSUME) goto do_iter_consume_step;
                       if (gk == CONT_ITER_CLOSE) { cont_st = gouter0; goto do_iter_close_method; }
                       if (gk == CONT_PROMISE_ALL_THEN) { cont_st = gouter0; goto do_promise_all_attach_call; }
@@ -26052,6 +26057,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         /* the for-of's @@iterator read threw: its operand (the iterable) is on the stack and
                            belongs to the frame's catch-search, exactly as for any other throwing operator. */
                         goto exception;
+                    }
+                    if (gk3 == CONT_PROMISE_ALL_NEXT_GET) {
+                        /* the read threw: IfAbruptRejectPromise, which is the combinator's own pre-retrieval
+                           reject-and-yield — the record is incomplete, so nothing is closed. */
+                        cont_st = gouter;
+                        ret_val = JS_UNINITIALIZED;
+                        goto consume_deliver_pa_reject;
                     }
                     if (gk3 == CONT_CONSUME_NEXT_GET) {
                         /* GetIteratorFromMethod step 4's abrupt: the record was never completed, so there is
@@ -26323,6 +26335,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
             }
 
+        do_promise_all_have_next:
+            /* the combinator's nextMethod, reached from the read whether it invoked user code or not. */
+            {
+                JSPromiseAll *ps = (JSPromiseAll *)cont_st;
+                DCHECK(JS_IsUndefined(ps->next), "a Promise combinator already holds a nextMethod");
+                ps->next = ret_val;
+                ret_val = JS_UNINITIALIZED;
+                goto do_promise_all_step;
+            }
+
         do_consume_have_next:
             /* the consumer's nextMethod, reached from the read whether it invoked user code or not. The record is
                complete; the drive starts with no previous result. */
@@ -26397,13 +26419,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     int cf; int cg; uint8_t itl;
                     if (JS_IsException(acq)) goto consume_deliver_pa_reject;
                     ps->iter = acq;
-                    ps->next = JS_GetProperty(ctx, acq, JS_ATOM_next);
-                    if (!JS_IsException(ps->next)) {
-                        cont_st = ps;
-                        ret_val = JS_UNINITIALIZED;
-                        goto do_promise_all_step;
-                    }
-                    ps->next = JS_UNDEFINED;
+                    /* GetIterator step 5.b: the nextMethod read is the page's code on a Proxy or an accessor. */
+                    gp_outer = ps; gp_outer_kind = CONT_PROMISE_ALL_NEXT_GET;
+                    gp_obj = ps->iter; gp_atom = JS_ATOM_next; gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                    goto do_getprop_tramp;
                 consume_deliver_pa_reject:
                     /* GetIterator / next lookup threw: Promise.all REJECTS its aggregate and yields it (never propagates). */
                     err = JS_GetException(ctx);
@@ -28910,6 +28929,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            || gouter_kind == CONT_FORAWAIT_SYNC_GET
                            || gouter_kind == CONT_ITER_CALL_GET || gouter_kind == CONT_ITER_CALL_GET_NOARG
                            || gouter_kind == CONT_FOROF_ENUMREC_GET || gouter_kind == CONT_CONSUME_NEXT_GET
+                           || gouter_kind == CONT_PROMISE_ALL_NEXT_GET
                            || gouter_kind == CONT_PROMISE_ALL_THEN || gouter_kind == CONT_AFS_GET
                            || gouter_kind == CONT_ITER_HELPER_GET || gouter_kind == CONT_PROMISE_ALL_GET
                            || gouter_kind == CONT_FOROF_UNPACK,
@@ -28941,6 +28961,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            request is not that call. Re-entering it would drop them a second time, with a stale
                            shape — the sp drift ASan caught. The phase on the state says which read this answers. */
                         goto do_async_from_sync_step;
+                    }
+                    if (gouter_kind == CONT_PROMISE_ALL_NEXT_GET) {
+                        js_getprop_free(ctx, gp);
+                        cont_st = gouter;
+                        goto do_promise_all_have_next;
                     }
                     if (gouter_kind == CONT_CONSUME_NEXT_GET) {
                         js_getprop_free(ctx, gp);
@@ -33023,7 +33048,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    || gk2 == CONT_ITER_CLOSE || gk2 == CONT_TRAP_GET || gk2 == CONT_OP_KEYED
                    || gk2 == CONT_PROMISE_ALL_THEN || gk2 == CONT_AFS_GET
                    || gk2 == CONT_ITER_HELPER_GET || gk2 == CONT_PROMISE_ALL_GET
-                   || gk2 == CONT_FOROF_UNPACK || gk2 == CONT_CONSUME_NEXT_GET,
+                   || gk2 == CONT_FOROF_UNPACK || gk2 == CONT_CONSUME_NEXT_GET
+                   || gk2 == CONT_PROMISE_ALL_NEXT_GET,
                    "property-get outer continuation: unknown machine kind");
             js_getprop_free(ctx, gp);
             if (gouter && gk2 == CONT_FOROF_UNPACK) {
@@ -33095,6 +33121,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 js_free_rt(rt, ag);
                 tramp_consume_acquired = JS_EXCEPTION;
                 goto do_consume_deliver_iterator;
+            }
+            if (gouter && gk2 == CONT_PROMISE_ALL_NEXT_GET) {
+                cont_st = gouter;
+                ret_val = JS_UNINITIALIZED;
+                goto consume_deliver_pa_reject;
             }
             if (gouter && gk2 == CONT_CONSUME_NEXT_GET) {
                 /* same as the in-place arm: an abrupt nextMethod read leaves an incomplete record with nothing
