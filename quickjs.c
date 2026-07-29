@@ -12072,34 +12072,6 @@ static int JS_DefineGlobalFunction(JSContext *ctx, JSAtom prop,
     return 0;
 }
 
-static JSValue JS_GetGlobalVar(JSContext *ctx, JSAtom prop,
-                               bool throw_ref_error)
-{
-    JSObject *p;
-    JSShapeProperty *prs;
-    JSProperty *pr;
-
-    /* no exotic behavior is possible in global_var_obj */
-    p = JS_VALUE_GET_OBJ(ctx->global_var_obj);
-    prs = find_own_property(&pr, p, prop);
-    if (prs) {
-        /* XXX: should handle JS_PROP_TMASK properties */
-        if (unlikely(JS_IsUninitialized(pr->u.value)))
-            return JS_ThrowReferenceErrorUninitialized(ctx, prs->atom);
-        return js_dup(pr->u.value);
-    }
-
-    /* fast path */
-    p = JS_VALUE_GET_OBJ(ctx->global_obj);
-    prs = find_own_property(&pr, p, prop);
-    if (prs) {
-        if (likely((prs->flags & JS_PROP_TMASK) == 0))
-            return js_dup(pr->u.value);
-    }
-    return JS_GetPropertyInternal(ctx, ctx->global_obj, prop,
-                                 ctx->global_obj, throw_ref_error);
-}
-
 /* construct a reference to a global variable */
 static int JS_GetGlobalVarRef(JSContext *ctx, JSAtom prop, JSValue *sp)
 {
@@ -16700,32 +16672,6 @@ static no_inline int js_strict_eq_slow(JSContext *ctx, JSValue *sp,
     return 0;
 }
 
-static __exception int js_operator_in(JSContext *ctx, JSValue *sp)
-{
-    JSValue op1, op2;
-    JSAtom atom;
-    int ret;
-
-    op1 = sp[-2];
-    op2 = sp[-1];
-
-    if (JS_VALUE_GET_TAG(op2) != JS_TAG_OBJECT) {
-        JS_ThrowTypeError(ctx, "invalid 'in' operand");
-        return -1;
-    }
-    atom = JS_ValueToAtom(ctx, op1);
-    if (unlikely(atom == JS_ATOM_NULL))
-        return -1;
-    ret = JS_HasProperty(ctx, op2, atom);
-    JS_FreeAtom(ctx, atom);
-    if (ret < 0)
-        return -1;
-    JS_FreeValue(ctx, op1);
-    JS_FreeValue(ctx, op2);
-    sp[-2] = js_bool(ret);
-    return 0;
-}
-
 static __exception int js_operator_private_in(JSContext *ctx, JSValue *sp)
 {
     JSValue op1, op2;
@@ -16759,24 +16705,6 @@ static __exception int js_operator_private_in(JSContext *ctx, JSValue *sp)
     JS_FreeValue(ctx, op2);
     sp[-2] = js_bool(ret);
     return 0;
-}
-
-static __exception int js_has_unscopable(JSContext *ctx, JSValue obj,
-                                         JSAtom atom)
-{
-    JSValue arr, val;
-    int ret;
-
-    arr = JS_GetProperty(ctx, obj, JS_ATOM_Symbol_unscopables);
-    if (JS_IsException(arr))
-        return -1;
-    ret = 0;
-    if (JS_IsObject(arr)) {
-        val = JS_GetProperty(ctx, arr, atom);
-        ret = JS_ToBoolFree(ctx, val);
-    }
-    JS_FreeValue(ctx, arr);
-    return ret;
 }
 
 static __exception int js_operator_instanceof(JSContext *ctx, JSValue *sp)
@@ -20035,6 +19963,8 @@ typedef struct JSWithHas {
     uint8_t is_with;     /* 1 = a real `with`, so @@unscopables applies */
     uint8_t phase;       /* WH_*: which answer the delivery is being re-entered with */
     uint8_t owns_atom;   /* the OP_with_* atoms are the bytecode's; a REFERENCE's is made by ToPropertyKey */
+    uint8_t jumps;       /* the OP_with_* forms branch into the with-body once the access is placed */
+    int8_t base;         /* the base object's DEPTH in the operand stack, or 0 = the GLOBAL object */
     JSValue arr;         /* @@unscopables' value, held across the read of its key (owned) */
 } JSWithHas;
 /* An object Environment Record's operations, in the order 9.1.1.2.x states them. FIVE of the page's operations
@@ -31240,16 +31170,50 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_get_var_undef):
         CASE(OP_get_var):
             {
-                JSValue val;
+                JSObject *gobj;
+                JSShapeProperty *prs;
+                JSProperty *pr;
                 JSAtom atom;
+                JSWithHas *wh;
                 atom = get_u32(pc);
                 pc += 4;
                 sf->cur_pc = pc;
 
-                val = JS_GetGlobalVar(ctx, atom, opcode - OP_get_var_undef);
-                if (unlikely(JS_IsException(val)))
-                    goto exception;
-                *sp++ = val;
+                /* 9.1.1.4.1 HasBinding then 9.1.1.4.6 GetBindingValue, on the GLOBAL Environment Record. Its
+                   DeclarativeRecord half is a plain slot on an engine object no page can make exotic, so it
+                   answers here. */
+                gobj = JS_VALUE_GET_OBJ(ctx->global_var_obj);
+                prs = find_own_property(&pr, gobj, atom);
+                if (prs) {
+                    if (unlikely(JS_IsUninitialized(pr->u.value))) {
+                        JS_ThrowReferenceErrorUninitialized(ctx, prs->atom);
+                        goto exception;
+                    }
+                    *sp++ = js_dup(pr->u.value);
+                    BREAK;
+                }
+                /* The ObjectRecord half. An OWN DATA property on the global object answers all three of the
+                   record's operations with the value it holds and reaches no page code doing it, so it is read
+                   here too. Everything else is the page's — an accessor, a longer chain, a Proxy anywhere on
+                   it — and JS_GetGlobalVar ran all of it from C, so `Object.defineProperty(globalThis, "x",
+                   {get(){for(;;){}}}); x` had no flow base. That half IS an object Environment Record over
+                   `global_obj` with withEnvironment false, which is why it is THIS machine with @@unscopables
+                   switched off rather than a second copy of it. */
+                gobj = JS_VALUE_GET_OBJ(ctx->global_obj);
+                DCHECK(gobj->class_id != JS_CLASS_PROXY,
+                       "the global object became a Proxy: the own-property answer above would skip its traps");
+                prs = find_own_property(&pr, gobj, atom);
+                if (prs && (prs->flags & JS_PROP_TMASK) == 0) {
+                    *sp++ = js_dup(pr->u.value);
+                    BREAK;
+                }
+                wh = js_mallocz(ctx, sizeof(*wh));
+                if (unlikely(!wh)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                wh->atom = atom; wh->op = (uint8_t)opcode; wh->phase = WH_HAS; wh->arr = JS_UNDEFINED;
+                gp_obj = ctx->global_obj; gp_atom = atom; gp_op = GP_HAS; gp_val = JS_UNDEFINED;
+                gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
+                gp_outer = wh; gp_outer_kind = CONT_WITH_HAS;
+                goto do_getprop_tramp;
             }
             BREAK;
 
@@ -33003,7 +32967,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    opcode lives at the shared delivery, entered only through the answer. */
                 wh = js_mallocz(ctx, sizeof(*wh));
                 if (unlikely(!wh)) { JS_FreeAtom(ctx, atom); JS_ThrowOutOfMemory(ctx); goto exception; }
-                wh->atom = atom; wh->owns_atom = 1; wh->op = (uint8_t)opcode;
+                wh->atom = atom; wh->owns_atom = 1; wh->op = (uint8_t)opcode; wh->base = 2;
                 wh->phase = WH_HAS2; wh->arr = JS_UNDEFINED;
                 gp_obj = sp[-2]; gp_atom = atom; gp_op = GP_HAS; gp_val = JS_UNDEFINED;
                 gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
@@ -33175,7 +33139,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp[-3] = js_dup(ctx->global_obj);
                     wh = js_mallocz(ctx, sizeof(*wh));
                     if (unlikely(!wh)) { JS_FreeAtom(ctx, atom); JS_ThrowOutOfMemory(ctx); goto exception; }
-                    wh->atom = atom; wh->owns_atom = 1; wh->op = (uint8_t)opcode;
+                    wh->atom = atom; wh->owns_atom = 1; wh->op = (uint8_t)opcode; wh->base = 3;
                     wh->phase = WH_ACCESS; wh->arr = JS_UNDEFINED;
                     gp_obj = sp[-3]; gp_atom = atom; gp_op = GP_SET; gp_val = sp[-1];
                     gp_recv = JS_UNINITIALIZED; gp_no_throw = is_strict_mode(ctx) ? 0 : 1;
@@ -33186,7 +33150,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    HasProperty — the page's `has` trap on a Proxy base, which this ran from C. */
                 wh = js_mallocz(ctx, sizeof(*wh));
                 if (unlikely(!wh)) { JS_FreeAtom(ctx, atom); JS_ThrowOutOfMemory(ctx); goto exception; }
-                wh->atom = atom; wh->owns_atom = 1; wh->op = (uint8_t)opcode;
+                wh->atom = atom; wh->owns_atom = 1; wh->op = (uint8_t)opcode; wh->base = 3;
                 wh->phase = WH_HAS2; wh->arr = JS_UNDEFINED;
                 gp_obj = sp[-3]; gp_atom = atom; gp_op = GP_HAS; gp_val = JS_UNDEFINED;
                 gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
@@ -34121,7 +34085,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 wh = js_mallocz(ctx, sizeof(*wh));
                 if (unlikely(!wh)) { JS_ThrowOutOfMemory(ctx); goto exception; }
                 wh->atom = atom; wh->diff = diff; wh->op = (uint8_t)opcode; wh->is_with = (uint8_t)is_with;
-                wh->phase = WH_HAS; wh->arr = JS_UNDEFINED;
+                wh->phase = WH_HAS; wh->arr = JS_UNDEFINED; wh->base = 1; wh->jumps = 1;
                 gp_obj = sp[-1]; gp_atom = atom; gp_op = GP_HAS; gp_val = JS_UNDEFINED;
                 gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
                 gp_outer = wh; gp_outer_kind = CONT_WITH_HAS;
@@ -34143,15 +34107,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    leaves the real one stale for every instruction after, which is a corruption with no
                    symptom at the site that caused it. */
                 int wop = wh->op;
+                int jumps = wh->jumps;
                 JSValueConst obj;
                 JSValue val;
                 int ret;
                 cont_st = NULL;
-                /* the request never touches the caller's operands, so the base object is still where the
-                   wop left it — at a depth that is the wop's own shape. */
-                obj = (wop == OP_get_ref_value) ? sp[-2]
-                    : (wop == OP_put_ref_value) ? sp[-3]
-                    : sp[-1];
+                /* the request never touches the caller's operands, so the base object is still at the depth
+                   the opcode recorded. The GLOBAL Environment Record's base is not an operand at all: its
+                   object half is an object Environment Record over `global_obj` with withEnvironment false,
+                   which is why it shares this machine instead of owning a second copy of it. */
+                obj = wh->base ? sp[-wh->base] : ctx->global_obj;
 
                 switch (wh->phase) {
                 case WH_HAS:
@@ -34238,6 +34203,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             with_resolved:
                 /* the reference belongs to this record. Which operation follows is the wop's. */
                 switch (wop) {
+                case OP_get_var:
+                case OP_get_var_undef:
                 case OP_with_get_var:
                 case OP_with_get_ref:
                 case OP_with_get_ref_undef:
@@ -34286,6 +34253,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp[-1] = js_bool(JS_ToBool(ctx, val));
                     JS_FreeValue(ctx, val);
                     break;
+                case OP_get_var:
+                case OP_get_var_undef:
+                    *sp++ = val;                       /* the global record's binding value */
+                    break;
                 case OP_get_ref_value:
                     *sp++ = val;                       /* the reference's value, above its two operands */
                     break;
@@ -34305,11 +34276,27 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     break;
                 }
                 js_with_has_free(ctx, wh);
-                if (wop != OP_get_ref_value && wop != OP_put_ref_value)
-                    pc += diff - 5;   /* the OP_with_* forms jump into the with-body; a reference just continues */
+                if (jumps)
+                    pc += diff - 5;   /* the OP_with_* forms jump into the with-body; the rest just continue */
                 BREAK;
 
             with_absent:
+                if (!wh->base) {
+                    /* the GLOBAL record is the last link of the scope chain, so HasBinding's no is final: an
+                       unresolvable Reference, which `typeof` reads as undefined and every other read throws
+                       (6.2.5.5 GetValue step 3). There is no enclosing scope to drop a base object for. */
+                    int is_typeof;
+                    DCHECK(wop == OP_get_var || wop == OP_get_var_undef,
+                           "a non-global opcode recorded no operand depth for its base object");
+                    is_typeof = (wop == OP_get_var_undef);
+                    if (!is_typeof)
+                        JS_ThrowReferenceErrorNotDefined(ctx, atom);
+                    js_with_has_free(ctx, wh);
+                    if (!is_typeof)
+                        goto exception;
+                    *sp++ = JS_UNDEFINED;
+                    BREAK;
+                }
                 /* the reference is not this record's: drop the base object and fall through to the enclosing
                    scope, which is where the bytecode continues. */
                 js_with_has_free(ctx, wh);
