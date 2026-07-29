@@ -65691,6 +65691,15 @@ static void iter_helper_close_source_abrupt(JSContext *ctx, JSIteratorHelperData
 static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue res, JSValue *out)
 {
     *out = JS_UNDEFINED;
+    if (it->resume_pc == ITHP_START && it->done) {
+        /* An EXHAUSTED helper answers {undefined, true} and drives nothing. It is answered HERE, at the start of
+           a drive, rather than declined back to js_iterator_helper_next's C entry: a case a recognizer hands to
+           the other implementation is a case that implementation has to keep existing for, whether or not any
+           page code is in it. `done` is also set DURING a drive (take's limit sets it before its close), which
+           is why this asks at the START and not on every re-entry. */
+        *out = js_create_iterator_result(ctx, JS_UNDEFINED, true);
+        return JS_IsException(*out) ? -1 : 0;
+    }
     switch (it->resume_pc) {
     case ITHP_START:   /* res is UNINITIALIZED — decide the first drive */
         switch (it->kind) {
@@ -65981,10 +65990,12 @@ static bool tramp_can_call_iter_helper(JSValueConst func, JSValueConst this_val)
     tp = JS_VALUE_GET_OBJ(this_val);
     if (tp->class_id != JS_CLASS_ITERATOR_HELPER) return false;
     it = tp->u.iterator_helper_data;
-    if (!it || it->executing || it->done) return false;
-    return it->kind == JS_ITERATOR_HELPER_KIND_DROP || it->kind == JS_ITERATOR_HELPER_KIND_TAKE
-        || it->kind == JS_ITERATOR_HELPER_KIND_MAP || it->kind == JS_ITERATOR_HELPER_KIND_FILTER
-        || it->kind == JS_ITERATOR_HELPER_KIND_FLAT_MAP;   /* built (the step dispatches gen vs plain vs inner) */
+    /* `it->done` is NOT a decline any more — the drive answers an exhausted helper itself. What is left is the
+       one state in which a drive cannot BEGIN: one is already running on this helper, which is 27.1.4's
+       GeneratorValidate TypeError, raised by the C entry below. Every KIND is driven, so there is no kind list
+       either; one that were not would reach that entry's DFAIL, which is the point. */
+    if (!it || it->executing) return false;
+    return true;
 }
 
 static void js_iterator_helper_finalizer(JSRuntime *rt, JSValueConst val)
@@ -66026,11 +66037,12 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
                                       int argc, JSValueConst *argv,
                                       int *pdone, int magic)
 {
-    /* The DRIVE runs on the tramp (do_iter_helper_tramp). What is left here is the ONE answer that reaches no
-       page code at all: an exhausted helper, whose .next() is {undefined, true}. `.return()` used to live here
-       too, closing the source with JS_IteratorClose from C on the claim that closing "iterates nothing" — it
-       does, and it is a step machine now (STEPDEF_ITER_HELPER_RETURN). Any OTHER reason to be here is a
-       source/kind whose tramp drive is not built: DFAIL, never a legacy C-loop fallback. */
+    /* The DRIVE runs on the tramp (do_iter_helper_tramp), and everything that used to be answered here instead
+       has moved into it: `.return()` is a step machine (STEPDEF_ITER_HELPER_RETURN), an exhausted helper is
+       answered at the drive's start, and every kind is driven. What is left is the ONE state in which a drive
+       cannot begin — one is already running on this helper — which is 27.1.4's GeneratorValidate TypeError and
+       not an algorithm. Any OTHER reason to be here is a source/kind whose drive is not built: DFAIL, never a
+       legacy C-loop fallback. */
     JSIteratorHelperData *it = JS_GetOpaque2(ctx, this_val, JS_CLASS_ITERATOR_HELPER);
     *pdone = false;
     if (!it) return JS_EXCEPTION;
@@ -66038,7 +66050,6 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
                               re-entered this helper) is a TypeError for every magic — a trivial guard, no drive. */
         return JS_ThrowTypeError(ctx, "Iterator Helper is already running");
     }
-    if (it->done) { *pdone = true; return JS_UNDEFINED; }   /* exhausted helper: .next() -> {undefined, done:true} */
     DFAIL("js_iterator_helper_next: helper source/kind not yet driven on the tramp — build do_iter_helper_step for it, never a legacy C-loop fallback");
     return JS_ThrowTypeError(ctx, "Iterator Helper .next() not on the tramp");
 }
