@@ -20881,7 +20881,9 @@ typedef struct JRFrame {
     int is_array;
     struct JSONParseRecord *fpr;    /* holder's parse record (borrowed); vpr = val's, resolved in phase 0 */
     struct JSONParseRecord *vpr;
-    uint8_t phase;                  /* 0=needs init, 1=iterating children, 2=reviver called (awaiting result) */
+    uint8_t phase;                  /* 0=needs init, 1=iterating children, 2=reviver called (awaiting result),
+                                       3=the enumerable-key walk is in flight (an OBJECT val only) */
+    struct JSEnumKeys *ek;          /* phase 3: EnumerableOwnPropertyNames' key half, resumable (owned) */
 } JRFrame;
 typedef struct JSJsonReviver {
     JSStepHdr hdr;                  /* MUST be first — enforced by STEP_STATE_HDR_FIRST below */
@@ -20893,6 +20895,7 @@ typedef struct JSJsonReviver {
     JRFrame *stack; int sp, cap;
     JSValue result;                 /* final revived value */
     JSValue cb_args[5];             /* [holder(this), reviver, name_val, val, context]; call_argv=&cb_args[2], argc=3 */
+    JSValue *ek_cb; int ek_argc;    /* the key walk's request buffer, relayed to the driver unchanged */
 } JSJsonReviver;
 /* String(x) / new String(x), 22.1.1.1. Its ToString(argv[0]) runs a user valueOf/toString/@@toPrimitive, which
    from a C body would be JS_CallFree with nowhere to suspend. As a step machine the coercion is a TOPRIMITIVE
@@ -21240,6 +21243,133 @@ static void js_gopd_desc_free(JSContext *ctx, JSGopdDesc *gd)
     JS_FreeValue(ctx, gd->obj);
     JS_FreeAtom(ctx, gd->atom);
     js_free_rt(ctx->rt, gd);
+}
+
+/* Is this FromPropertyDescriptor result enumerable? The read invokes nothing — every GP_GETOWNPROP delivery
+   rebuilds the record through js_desc_to_object, including a proxy's, whose trap result is parsed first — and
+   that is ASSERTED rather than claimed, because if it ever stopped holding this would be page code running from
+   C. ONE site, so the two enumerable-key walks that need it cannot drift and the descriptor-read ratchet counts
+   it once. */
+static int js_desc_object_is_enumerable(JSContext *ctx, JSValueConst desc)
+{
+    JSValue en;
+    DCHECK(!js_read_is_page_code(ctx, desc, JS_ATOM_enumerable),
+           "a property-walk descriptor came from somewhere other than FromPropertyDescriptor — its `enumerable` "
+           "read is page code and must become a request");
+    en = JS_GetProperty(ctx, desc, JS_ATOM_enumerable);
+    if (JS_IsException(en))
+        return -1;
+    return JS_ToBoolFree(ctx, en);
+}
+
+/* EnumerableOwnPropertyNames' key half (7.3.23 steps 1-3.a), as a resumable cursor. It is [[OwnPropertyKeys]]
+   followed by a [[GetOwnProperty]] per key for the enumerability test — on a Proxy the `ownKeys` trap and then
+   the `getOwnPropertyDescriptor` trap per key, so BOTH are the page's code and both have to be requests.
+   Six C callers still ask for this by passing JS_GPN_ENUM_ONLY to a names walk, which runs those traps from C;
+   each converts by driving this instead. The keys are SNAPSHOT first and each one's enumerability re-checked
+   afterwards, because a trap can redefine a later key in between — the same order JSPropWalk uses, which is why
+   this is one cursor rather than a second copy of that logic. */
+typedef struct JSEnumKeys {
+    JSValue obj;               /* the object being walked (owned) */
+    JSPropertyEnum *atoms;     /* the snapshot, filtered in place down to the enumerable string keys */
+    uint32_t len;              /* how many the snapshot holds */
+    uint32_t kept;             /* how many have survived the filter so far */
+    uint32_t i;                /* the filter cursor */
+    uint8_t phase;             /* EK_* */
+    JSValue cb[1];             /* the request buffer: [the object] */
+} JSEnumKeys;
+enum { EK_ASK_KEYS = 0, EK_GOT_KEYS, EK_ASK_DESC, EK_GOT_DESC, EK_DONE };
+
+static void js_enum_keys_init(JSEnumKeys *c)
+{
+    c->obj = JS_UNDEFINED; c->cb[0] = JS_UNDEFINED;
+    c->atoms = NULL; c->len = c->kept = c->i = 0; c->phase = EK_ASK_KEYS;
+}
+
+static void js_enum_keys_free(JSContext *ctx, JSEnumKeys *c)
+{
+    if (c->atoms) { js_free_prop_enum(ctx, c->atoms, c->len); c->atoms = NULL; }
+    JS_FreeValue(ctx, c->obj); c->obj = JS_UNDEFINED;
+    c->cb[0] = JS_UNDEFINED;   /* borrowed by the requests; `obj` owns it */
+    c->len = c->kept = c->i = 0;
+}
+
+/* `in` is the previous request's answer (UNDEFINED on entry). Returns 11 / 12 for the next request, 0 when the
+   snapshot in c->atoms[0..c->kept) is the answer, -1 having thrown. */
+static int js_enum_keys_run(JSContext *ctx, JSEnumKeys *c, JSValue in, JSValue **out_cb, int *out_argc)
+{
+    for (;;) {
+        if (c->phase == EK_ASK_KEYS) {
+            JS_FreeValue(ctx, in); in = JS_UNDEFINED;
+            c->phase = EK_GOT_KEYS;
+            c->cb[0] = c->obj;   /* borrowed: the cursor holds the reference */
+            *out_cb = c->cb; *out_argc = 0;
+            return 11;
+        }
+        if (c->phase == EK_GOT_KEYS) {
+            /* the key list arrived as an ARRAY. Turning it into an atom snapshot invokes nothing: it is a dense
+               array this engine built, of Strings and Symbols the [[OwnPropertyKeys]] invariant already
+               validated. Only the STRING keys are kept — every consumer of this cursor takes `key` or `value`
+               kinds, which 7.3.23 restricts to String keys. */
+            JSValue keys = in; uint32_t klen = 0, ki, kept = 0;
+            in = JS_UNDEFINED;
+            if (JS_IsException(keys)) return -1;
+            if (js_get_length32(ctx, &klen, keys)) { JS_FreeValue(ctx, keys); return -1; }
+            c->atoms = klen ? js_mallocz(ctx, sizeof(c->atoms[0]) * klen) : NULL;
+            if (klen && !c->atoms) { JS_FreeValue(ctx, keys); return -1; }
+            for (ki = 0; ki < klen; ki++) {
+                JSValue kv = JS_GetPropertyUint32(ctx, keys, ki);
+                JSAtom at;
+                if (JS_IsException(kv)) { JS_FreeValue(ctx, keys); c->len = kept; return -1; }
+                if (JS_IsSymbol(kv)) { JS_FreeValue(ctx, kv); continue; }
+                at = JS_ValueToAtom(ctx, kv);
+                JS_FreeValue(ctx, kv);
+                if (at == JS_ATOM_NULL) { JS_FreeValue(ctx, keys); c->len = kept; return -1; }
+                c->atoms[kept].atom = at;
+                c->atoms[kept].is_enumerable = false;
+                kept++;
+            }
+            JS_FreeValue(ctx, keys);
+            c->len = kept; c->i = 0; c->kept = 0;
+            c->phase = EK_ASK_DESC;
+            continue;
+        }
+        if (c->phase == EK_ASK_DESC) {
+            if (c->i >= c->len) { c->phase = EK_DONE; JS_FreeValue(ctx, in); return 0; }
+            JS_FreeValue(ctx, in); in = JS_UNDEFINED;
+            c->phase = EK_GOT_DESC;
+            c->cb[0] = c->obj;
+            *out_cb = c->cb; *out_argc = (int)c->atoms[c->i].atom;
+            return 12;
+        }
+        DCHECK(c->phase == EK_GOT_DESC, "the enumerable-keys cursor resumed in no phase");
+        {
+            /* the descriptor object, or undefined when the property is gone between the snapshot and here.
+               Reading `enumerable` off it invokes nothing: every GP_GETOWNPROP delivery rebuilds the record
+               through js_desc_to_object, which the walk asserts rather than assumes. */
+            JSValue desc = in;
+            int enumerable;
+            in = JS_UNDEFINED;
+            if (JS_IsException(desc)) return -1;
+            if (JS_IsUndefined(desc)) { c->i++; c->phase = EK_ASK_DESC; continue; }
+            enumerable = js_desc_object_is_enumerable(ctx, desc);
+            JS_FreeValue(ctx, desc);
+            if (enumerable < 0) return -1;
+            if (enumerable) {
+                /* keep it, compacting in place: the survivors are atoms[0..kept). */
+                if (c->kept != c->i) {
+                    c->atoms[c->kept] = c->atoms[c->i];
+                    c->atoms[c->i].atom = JS_ATOM_NULL;
+                }
+                c->kept++;
+            } else {
+                JS_FreeAtom(ctx, c->atoms[c->i].atom);
+                c->atoms[c->i].atom = JS_ATOM_NULL;
+            }
+            c->i++;
+            c->phase = EK_ASK_DESC;
+        }
+    }
 }
 
 
@@ -55353,17 +55483,12 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
                 s->i++; s->hdr.stage = 2;
                 continue;
             }
-            /* the comment above is a CLAIM about where `desc` came from, so it is asserted rather than trusted:
-               every GP_GETOWNPROP delivery rebuilds the record through js_desc_to_object, including a proxy's,
-               whose trap result is parsed first. If that ever stopped being true this read would be the page's
-               code running from C, which is exactly what the rest of this walk exists to avoid. */
-            DCHECK(!js_read_is_page_code(ctx, desc, JS_ATOM_enumerable),
-                   "a property-walk descriptor came from somewhere other than FromPropertyDescriptor — its "
-                   "`enumerable` read is page code and must become a request");
-            en = JS_GetProperty(ctx, desc, JS_ATOM_enumerable);
-            JS_FreeValue(ctx, desc);
-            if (JS_IsException(en)) return -1;
-            if (!JS_ToBoolFree(ctx, en)) { s->i++; s->hdr.stage = 2; continue; }
+            {
+                int enumerable = js_desc_object_is_enumerable(ctx, desc);
+                JS_FreeValue(ctx, desc);
+                if (enumerable < 0) return -1;
+                if (!enumerable) { s->i++; s->hdr.stage = 2; continue; }
+            }
             if (mode == PROPWALK_KEYS) {
                 /* 7.3.23 with kind = key: the KEY is the element, and there is no Get at all. */
                 JSValue kv = JS_AtomToValue(ctx, s->atoms[s->i].atom);
@@ -69604,7 +69729,7 @@ static int jr_push(JSContext *ctx, JSJsonReviver *s) {
     JRFrame *f = &s->stack[s->sp++];
     f->holder = JS_UNDEFINED; f->val = JS_UNDEFINED; f->context = JS_UNDEFINED;
     f->name = JS_ATOM_NULL; f->name_val = JS_UNDEFINED; f->atoms = NULL;
-    f->len = 0; f->i = 0; f->is_array = 0; f->fpr = NULL; f->vpr = NULL; f->phase = 0;
+    f->len = 0; f->i = 0; f->is_array = 0; f->fpr = NULL; f->vpr = NULL; f->phase = 0; f->ek = NULL;
     return 0;
 }
 /* descend a HOLDER's parse-record to the child `name` whose value is `cval`, mirroring internalize's pr walk. */
@@ -69659,6 +69784,20 @@ static int js_json_parse_vstep(JSContext *ctx, void *st, JSValue cb_result, JSVa
     r = js_json_reviver_step(ctx, s, cb_result, (JSValueConst *)&s->cb_args[2]);
     if (r < 0) return -1;
     if (r == 0) return 0;
+    while (r == 2) {
+        /* the frame just ENTERED the key walk, which has no request of its own yet; run the cursor's first step
+           rather than returning a code the driver has no meaning for. */
+        r = js_json_reviver_step(ctx, s, JS_UNDEFINED, (JSValueConst *)&s->cb_args[2]);
+        if (r < 0) return -1;
+        if (r == 0) return 0;
+    }
+    if (r == 6 || r == 11 || r == 12) {
+        /* a keyed operation the walk owes: 25.5.1.1's `Get(holder, P)`, or the enumerable-key cursor's
+           [[OwnPropertyKeys]] / [[GetOwnProperty]]. The machine relays the requester's own buffer, which holds
+           the object across the request. */
+        *out_cb = s->ek_cb; *out_argc = s->ek_argc;
+        return r;
+    }
     /* cb_args[0] (the holder, i.e. `this`) is set by the step itself; cb_args[1] is the reviver, which the caller
        supplies — omitting it left the driver calling an undefined callee, so the reviver was never invoked. */
     s->cb_args[1] = s->reviver;
@@ -69707,7 +69846,24 @@ static int js_json_reviver_init(JSContext *ctx, JSJsonReviver *s, JSValueConst t
 /* Drive the DFS until the next reviver call is needed (return 1, out_args=[name,val,context]) or done (0).
    `res` (owned) is the reviver's result for the just-completed node, or JS_UNDEFINED on the first call. */
 static int js_json_reviver_step(JSContext *ctx, JSJsonReviver *s, JSValue res, JSValueConst out_args[3]) {
-    if (s->sp > 0 && s->stack[s->sp - 1].phase == 2) {   /* a node's reviver just returned `res` */
+    if (s->sp > 0 && s->stack[s->sp - 1].phase == 3) {
+        /* the enumerable-key walk is in flight: `res` is the last request's answer, not a reviver result. */
+        JRFrame *f = &s->stack[s->sp - 1];
+        JSValue *ekcb = NULL; int ekargc = 0;
+        int r = js_enum_keys_run(ctx, f->ek, res, &ekcb, &ekargc);
+        if (r > 0) { s->ek_cb = ekcb; s->ek_argc = ekargc; return r; }
+        if (r < 0) return -1;
+        /* the survivors become the frame's key list; the cursor's allocation is handed over whole. */
+        f->atoms = f->ek->atoms; f->len = f->ek->kept;
+        f->ek->atoms = NULL; f->ek->len = 0;
+        js_enum_keys_free(ctx, f->ek);
+        js_free(ctx, f->ek); f->ek = NULL;
+        f->phase = 1;
+        res = JS_UNDEFINED;
+    }
+    if (s->sp > 0 && s->stack[s->sp - 1].phase == 4) {
+        /* the value read landed: `res` is it, not a reviver result. The frame's own arm below consumes it. */
+    } else if (s->sp > 0 && s->stack[s->sp - 1].phase == 2) {   /* a node's reviver just returned `res` */
         JRFrame *f = &s->stack[s->sp - 1];
         JSAtom fname = f->name;                          /* keep for the parent apply */
         if (f->atoms) js_free_prop_enum(ctx, f->atoms, f->len);
@@ -69730,11 +69886,21 @@ static int js_json_reviver_step(JSContext *ctx, JSJsonReviver *s, JSValue res, J
         JRFrame *f = &s->stack[s->sp - 1];
         /* DFS invariants: a live frame stack within its allocation, a valid phase, and (once past init) a child
            cursor that never runs past the key count. A violation is a walk-state bug; crash at its origin. */
-        assert(s->sp <= s->cap && f->phase <= 2);
-        assert(f->phase == 0 || f->i <= f->len);
+        assert(s->sp <= s->cap && f->phase <= 4);
+        assert(f->phase == 0 || f->phase == 4 || f->i <= f->len);
         if (f->phase == 0) {
-            f->val = JS_GetProperty(ctx, f->holder, f->name);
-            if (JS_IsException(f->val)) return -1;
+            /* 25.5.1.1 step 1: `Let val be ? Get(holder, P)`. The holder is parser-built at the root, but a
+               reviver returns arbitrary values into it, so by the time a deeper frame reads one the holder can be
+               a Proxy — its `get` trap, run from C by JS_GetProperty with no flow base. A request now, parked in
+               phase 4. */
+            s->ek_cb = &f->holder;   /* borrowed: the frame holds it across the request */
+            s->ek_argc = (int)f->name;
+            f->phase = 4;
+            return 6;
+        }
+        if (f->phase == 4) {
+            f->val = res; res = JS_UNDEFINED;
+            if (JS_IsException(f->val)) { f->val = JS_UNDEFINED; return -1; }
             f->vpr = jr_child_pr(ctx, f->fpr, f->name, f->val);   /* val's own parse record */
             f->context = JS_NewObject(ctx);
             if (JS_IsException(f->context)) return -1;
@@ -69742,8 +69908,19 @@ static int js_json_reviver_step(JSContext *ctx, JSJsonReviver *s, JSValue res, J
                 f->is_array = js_is_array(ctx, f->val);
                 if (f->is_array < 0) return -1;
                 if (f->is_array) { if (js_get_length32(ctx, &f->len, f->val)) return -1; }
-                else { int r = JS_GetOwnPropertyNamesInternal(ctx, &f->atoms, &f->len, JS_VALUE_GET_OBJ(f->val),
-                                                              JS_GPN_ENUM_ONLY | JS_GPN_STRING_MASK); if (r < 0) return -1; }
+                else {
+                    /* 25.5.1.1 step 3.c: `? EnumerableOwnPropertyNames(val, key)`. It was JS_GPN_ENUM_ONLY from
+                       C, which runs a Proxy's `ownKeys` and per-key `getOwnPropertyDescriptor` traps with no flow
+                       base — reachable, because a reviver runs bottom-up with `this` bound to the holder and can
+                       plant a proxy on a sibling key this walk has not reached yet. It is the shared cursor now:
+                       the frame parks in phase 3 and the driver relays its requests. */
+                    f->ek = js_mallocz(ctx, sizeof(*f->ek));
+                    if (!f->ek) return -1;
+                    js_enum_keys_init(f->ek);
+                    f->ek->obj = js_dup(f->val);
+                    f->phase = 3;
+                    return 2;   /* the driver re-enters with the cursor's request */
+                }
             } else if (f->vpr) {   /* primitive with a source record -> context.source */
                 JSValue src = JS_NewStringLen(ctx, s->text + f->vpr->u.primitive.source_pos, f->vpr->u.primitive.source_len);
                 if (JS_IsException(src)) return -1;
@@ -69774,6 +69951,9 @@ static int js_json_reviver_step(JSContext *ctx, JSJsonReviver *s, JSValue res, J
 static JSValue js_json_reviver_end(JSContext *ctx, JSJsonReviver *s, bool ok) {
     while (s->sp > 0) {   /* free any frames still open (exception mid-walk) */
         JRFrame *f = &s->stack[--s->sp];
+        /* a frame torn down MID-WALK still owns its cursor — the exception can arrive from inside one of its
+           twelve requests, which is precisely the state this list has to cover. */
+        if (f->ek) { js_enum_keys_free(ctx, f->ek); js_free(ctx, f->ek); f->ek = NULL; }
         if (f->atoms) js_free_prop_enum(ctx, f->atoms, f->len);
         JS_FreeValue(ctx, f->name_val);
         JS_FreeValue(ctx, f->val);
