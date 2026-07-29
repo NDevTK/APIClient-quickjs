@@ -22198,7 +22198,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSValue tramp_cap_funcs[2] = { JS_UNDEFINED, JS_UNDEFINED };
     uint8_t tramp_forawait_wrap = 0;                    /* the acquire about to run is `for await`'s SYNC branch: its iterator gets CreateAsyncFromSyncIterator before the enum_rec */
     int tramp_cont_forof = 0;                           /* CONT_FOROF_NEXT: the enum_rec stack offset for the .next() drive about to be pushed. Rides the frame's forof_off (read+reset in do_tramp_call) so no per-iteration heap state is allocated for what is one int. */
-    int tramp_gen_forof = 1;                            /* <0 = for-of iterator stack offset (always -3-.. ); 1 = direct .next() (no valid offset is positive) */
     uint8_t tramp_ith_mode = ITH_DIRECT;                /* Iterator Helper drive: which DELIVERY the .next() owes (ITH_DIRECT / ITH_FOROF / ITH_ITERNEXT). read+reset by do_iter_helper_tramp */
     int tramp_ith_forof = 0;                            /* ITH_FOROF only: the enum_rec's caller-stack offset */
     int tramp_gen_iternext = 0;                         /* 1 = OP_iterator_next drive (yield* / destructuring): iterator at sp[-4], arg at sp[-1], result OBJECT replaces sp[-1] */
@@ -27848,9 +27847,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;   /* consumed into the cc_ and gd_ locals plus the frame's cont fields; never leak onto an inner call the generator body makes (else its do_return misdispatches) */
                 JSValue close_exc_e = JS_UNINITIALIZED;   /* the saved in-flight exception (close_exc only) */
                 if (close_exc) { close_exc_e = rt->current_exception; rt->current_exception = JS_UNINITIALIZED; }
-                bool forof = (tramp_gen_forof < 0);   /* a real for-of offset is always negative (-3-..) */
-                int fofoff = tramp_gen_forof;
-                tramp_gen_forof = 1;   /* reset to the direct-call sentinel */
+                /* A for-of drive is one whose CALLER declared CONT_FOROF_NEXT — the same continuation every
+                   other callee kind carries — not one that some call site remembered to set a mode register for.
+                   It used to be the register, written only by an OP_for_of_next fast path that recognized the RAW
+                   generator .next(); a BOUND or PROXIED one fell through to do_generic_callee, which resolved it
+                   and routed here with the register unset, so the drive ran in DIRECT mode under a for-of
+                   continuation and the loop silently produced NOTHING. The kind cannot go missing the way the
+                   register could: it is what the call already carries. */
+                bool forof = (gd_ck == CONT_FOROF_NEXT);
+                int fofoff = forof ? tramp_cont_forof : 0;
+                if (forof) { tramp_cont_forof = 0; gd_cont = NULL; gd_ck = CONT_NONE; }
+                DCHECK(!forof || fofoff <= -3, "a for-of generator drive carries no enum_rec offset");
                 JSValueConst close_slot = tramp_gen_close_slot_gen; tramp_gen_close_slot_gen = JS_UNINITIALIZED;   /* read+reset */
                 bool close_from_slot = !JS_IsUninitialized(close_slot);   /* IfAbruptCloseIterator deferral: generator NOT on the stack */
                 JSValue close_deliver = tramp_gen_close_deliver; tramp_gen_close_deliver = JS_UNINITIALIZED;   /* helper .return(): {value,done:true} to PUSH after the close (owned), instead of discarding */
@@ -27858,7 +27865,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    result discarded. iternext: iterator at sp[-4], resume arg at sp[-1]. for-of: iterator at sp[fofoff].
                    cont-consume: generator in the state. direct: receiver at call_argv[-2]. */
                 JSValueConst gthis = cont_consume ? cc_iter
-                                   : (close ? (close_from_slot ? close_slot : sp[-1]) : (iternext ? sp[-4] : (forof ? sp[fofoff] : call_argv[-2])));
+                                   : (close ? (close_from_slot ? close_slot : sp[-1]) : (iternext ? sp[-4] : call_argv[-2]));
                 /* Every route here must have established the receiver IS a live generator — this reads the
                    generator_data union member unconditionally, so a non-generator yields a garbage pointer and
                    crashes thousands of lines away as a UAF (0xbaadf00d cur_sp) with nothing naming the caller.
@@ -27880,11 +27887,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    here is what lets do_generic_callee ask the generator question ONCE for every spelling — the
                    per-call-site copies that used to ask it could only ever see the stack form. */
                 bool gen_direct = !close && !iternext && !forof && !cont_consume;
+                /* A FOR-OF drive arrives through the one convergence point too, so its operands are a call shape
+                   exactly like a direct drive's — including the reshaped, OWNED list a bound or proxied `next`
+                   produces. Only `close`, `iternext` and the consumer drives keep their own operand models. */
+                bool gen_shaped = gen_direct || forof;
                 DCHECK(gen_direct || gd_ck == CONT_NONE,
                        "an opcode generator drive was handed a call continuation it cannot deliver");
                 JSValue *gen_owned = NULL; int gen_owned_n = 0;
                 int gen_cfirst = 0, gen_cpop = 0;
-                if (gen_direct) {
+                if (gen_shaped) {
                     TAKE_CALL_SHAPE();
                     gen_cfirst = call_first_r; gen_cpop = call_pop;
                     gen_owned = call_args_owned; gen_owned_n = call_args_owned_n;
@@ -27958,6 +27969,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         goto do_iter_consume_step;
                     }
                     if (forof) {
+                        JSValue *fcargv = sp - gen_cpop;
+                        for (i = gen_cfirst; i < gen_cpop; i++) JS_FreeValue(ctx, fcargv[i]);
+                        sp += gen_cfirst - gen_cpop;
+                        if (gen_owned) free_arg_list(ctx, gen_owned, gen_owned_n);
                         JS_FreeValue(ctx, gv);
                         if (do_throw) { JS_Throw(ctx, thr); goto exception; }
                         sp[0] = JS_UNDEFINED; sp[1] = JS_TRUE; sp += 2;
@@ -28020,10 +28035,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     gtf->is_tail = 2;
                     gtf->forof_off = -4;
                 } else if (forof) {
-                    /* the iterator STAYS on the caller stack (reused each loop) — no ref to hold, nothing to free;
-                       value+done are written above sp at settle. is_tail marks for-of mode. forof_off records the
-                       iterator's stack slot (caller_sp[fofoff] == gthis) so a concolic fork inside the body can
-                       recover the shared generator object (it is not held in the frame). */
+                    /* the iterator STAYS in the enum_rec on the caller stack (reused each loop) — no ref to hold —
+                       but the CALL's operands are the drive's own and are dropped here, exactly as the direct
+                       drive drops them, so caller_sp lands back on the enum_rec and value+done are written above
+                       it at settle. is_tail marks for-of mode; forof_off records the iterator's slot relative to
+                       that restored sp (caller_sp[fofoff] == gthis) so a concolic fork inside the body can
+                       recover the shared generator object. */
+                    JSValue *fcargv = sp - gen_cpop;
+                    for (i = gen_cfirst; i < gen_cpop; i++) JS_FreeValue(ctx, fcargv[i]);
+                    sp += gen_cfirst - gen_cpop;
+                    if (gen_owned) free_arg_list(ctx, gen_owned, gen_owned_n);
                     gtf->async_promise = JS_UNDEFINED;
                     gtf->caller_sp = sp;
                     gtf->is_tail = 1;
@@ -30114,11 +30135,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int offset = -3 - pc[0];
                 pc += 1;
                 sf->cur_pc = pc;
-                /* a GENERATOR iterator's .next() runs its body on THIS chain (do_generator_tramp for-of mode) so a
-                   body loop preempts the base flow — never the C-recursion js_for_of_next -> JS_Call would use. */
-                if (tramp_gen_method_magic(sp[offset + 1], sp[offset]) == GEN_MAGIC_NEXT) {
-                    tramp_gen_magic = GEN_MAGIC_NEXT; tramp_gen_forof = offset; goto do_generator_tramp;
-                }
                 if (tramp_can_call_iter_helper(sp[offset + 1], sp[offset])) {   /* for-of over a lazy Iterator Helper -> drive on THIS chain */
                     tramp_ith_mode = ITH_FOROF; tramp_ith_forof = offset; goto do_iter_helper_tramp;
                 }
