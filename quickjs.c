@@ -610,6 +610,15 @@ struct JSContext {
                                     loop) never runs in a C activation with no flow base. The label picks the route
                                     by ITERATOR KIND, the same split OP_iterator_close makes — which is why no
                                     site that parks one asks what kind it is. UNINITIALIZED when idle. */
+    /* A KEYED-OPERATION continuation whose unwind only the interpreter can perform, parked by an abandon walk that
+       reached it from OUTSIDE the interpreter. The two teardown walks are mutually recursive — getprop_throw and
+       do_getprop_abandon hand a CONT_TOPRIM_GET link to js_toprim_abandon, and a coercion requested BY a keyed
+       operation (10.4.2.4's two ToPrimitives) hands the link back — but only one of the two is a FUNCTION, so the
+       return direction has to be deferred. Every js_toprim_abandon caller goes to the exception label, and that
+       label is where the chain is drained into getprop_throw, exactly as the two fields above are drained. NULL
+       when idle. */
+    void *pending_gp_unwind;
+    uint8_t pending_gp_unwind_kind;
     JSValue error_prepare_stack;
     JSValue error_stack_trace_limit;
     JSValue iterator_ctor;
@@ -3088,6 +3097,8 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
     ctx->error_back_trace = JS_UNDEFINED;
     ctx->pending_close_iter = JS_UNINITIALIZED;
     ctx->pending_import_cap = NULL;
+    ctx->pending_gp_unwind = NULL;
+    ctx->pending_gp_unwind_kind = 0;   /* CONT_NONE */
     ctx->error_prepare_stack = JS_UNDEFINED;
     ctx->error_stack_trace_limit = js_int32(10);
     init_list_head(&ctx->loaded_modules);
@@ -3294,6 +3305,7 @@ void JS_FreeContext(JSContext *ctx)
     }
     JS_FreeValue(ctx, ctx->error_ctor);
     DCHECK(ctx->pending_import_cap == NULL, "a parked import capability outlived its context");
+    DCHECK(ctx->pending_gp_unwind == NULL, "a parked keyed-operation unwind outlived its context");
     JS_FreeValue(ctx, ctx->pending_close_iter);   /* normally UNINITIALIZED (drained at the exception label); free defensively */
     JS_FreeValue(ctx, ctx->error_back_trace);
     JS_FreeValue(ctx, ctx->error_prepare_stack);
@@ -10582,6 +10594,15 @@ static int set_array_length(JSContext *ctx, JSObject *p, JSValue val,
     uint32_t len, idx, cur_len;
     int i, ret;
 
+    /* 10.4.2.4 steps 3-4 are ToUint32(V) and ToNumber(V) — BOTH on the original V, which is why
+       JS_ToArrayLengthFree does the conversion twice and compares. For an OBJECT V that is the page's
+       valueOf/@@toPrimitive TWICE, and a C activation has no flow to run it on: the write hands that case to
+       CONT_ARRAY_LEN, which produces the validated uint32 and re-issues the operation with it. Reaching here
+       with an object means a write path was not routed — and the DEFINE path's comment used to claim `val is
+       guaranted to be a Uint32`, which `Object.defineProperty([1], "length", {value:{valueOf(){for(;;){}}}})`
+       disproved. */
+    DCHECK(JS_VALUE_GET_TAG(val) != JS_TAG_OBJECT,
+           "an Array length write reached set_array_length with an OBJECT value — route it through CONT_ARRAY_LEN");
     /* Note: this call can reallocate the properties of 'p' */
     ret = JS_ToArrayLengthFree(ctx, &len, val, false);
     if (ret)
@@ -19047,6 +19068,32 @@ typedef struct JSOpKeyed {
                                   to is parked across them, exactly as a handler's trap READ parks it. It is the
                                   same nesting CONT_TRAP_GET already is: a keyed request whose outer is not a
                                   machine but another keyed OPERATION, carrying what waits on that one. */
+#define CONT_ARRAY_LEN     64  /* tp_outer = JSArrayLen: 10.4.2.4 ArraySetLength steps 3-5, whose TWO coercions
+                                  are the page's code — ToUint32(V) then ToNumber(V), both on the ORIGINAL V, so
+                                  a substituted primitive cannot stand for them and the coerce-then-re-execute
+                                  idiom a TypedArray element write uses is the wrong shape (it made
+                                  `var n=0; [].length = {valueOf(){n++; return 0}}` run once where the spec runs
+                                  it twice). What the sequence produces is the VALIDATED uint32, and the write is
+                                  then re-issued with that in place of V — which is exactly step 6, so the
+                                  re-run's own conversions are of a number and invoke nothing. */
+typedef struct JSArrayLen {
+    JSValue obj;         /* the Array being written (owned) */
+    JSValue val;         /* V, coerced TWICE, so it is held rather than replaced (owned) */
+    JSAtom atom;         /* the key — always `length`, carried so the re-issue needs no second source (owned) */
+    void *outer;         /* what is waiting on the WRITE */
+    uint8_t outer_kind;
+    uint8_t op;          /* GP_SET or GP_DEFINE: which operation is re-issued */
+    uint8_t no_throw;    /* the operation's own bare/throwing form */
+    uint8_t phase;       /* AL_* */
+    uint32_t len;        /* step 3's answer, held across step 4's coercion */
+    JSValue coerced;     /* step 6's value as the re-issued request's operand (a number: nothing to own) */
+    /* GP_DEFINE's remaining operands, so the re-issue carries the same descriptor with only [[Value]] replaced */
+    JSValue getter, setter;
+    int dflags;
+} JSArrayLen;
+enum { AL_UINT32 = 0, AL_NUMBER, AL_COMPARE, AL_REISSUED };
+static void js_array_len_free(JSContext *ctx, JSArrayLen *al);
+
 #define CONT_DEFINE_CLASS  63  /* gp_outer = JSOpClass: 15.7.14 ClassDefinitionEvaluation step 8.d.i's
                                   `Get(superclass, "prototype")`. js_op_define_class read it with JS_GetProperty
                                   from C, so `class C extends new Proxy(f, {get(){for(;;){}}}) {}` had no flow
@@ -19594,6 +19641,21 @@ static void js_toprim_abandon(JSContext *ctx, struct JSToPrim *tp)
         js_iter_consume_abandon(ctx, touter);   /* IfAbruptCloseIterator, then the machine is gone */
         return;
     }
+    if (touter && tk == CONT_ARRAY_LEN) {
+        /* 10.4.2.4's coercion was abandoned. The WRITE can never finish, so the throw unwinds one level — and
+           everything waiting on the write goes with it, which is the KEYED chain and not a step chain (walking a
+           JSArrayLen as one would call through `obj` as a step-def pointer). That chain's teardown is
+           getprop_throw, a label, so the link is parked for the exception label every caller of this function
+           reaches. Freeing only the sequence here leaked its waiter — the write's JSOpKeyed for
+           `[].length = {valueOf(){throw}}`. */
+        JSArrayLen *al = touter;
+        DCHECK(ctx->pending_gp_unwind == NULL,
+               "pending_gp_unwind already set — a nested keyed-operation unwind needs a queue");
+        ctx->pending_gp_unwind = al->outer;
+        ctx->pending_gp_unwind_kind = al->outer_kind;
+        js_array_len_free(ctx, al);
+        return;
+    }
     DCHECK(!touter || tk == CONT_STEP,
            "ToPrimitive outer continuation: unknown machine kind");
     tramp_step_chain_free(ctx, touter);
@@ -19707,6 +19769,35 @@ typedef struct JSIterClose {
    NUMERIC INDEX — 10.4.5.5 [[Set]] step 1.b routes those to TypedArraySetElement, whose step 1 is ToNumber (or
    ToBigInt for the two 64-bit classes); every other key on a TypedArray is an ordinary set that reads val as-is.
    A non-object val coerces without running anything, so only an object needs the tramp. */
+static JSShapeProperty *find_own_property(JSProperty **ppr, JSObject *p, JSAtom atom);
+/* Does this write land on an ARRAY'S `length` with an OBJECT value — the one write besides a TypedArray element
+   whose target coerces V, and the only one that coerces it TWICE? JS_PROP_LENGTH is what routes a write to
+   set_array_length, so it is exactly the condition, and asking for the OWN slot keeps an inherited or shadowed
+   `length` out of it. */
+static bool arr_len_write_needs_toprim(JSValueConst target, JSAtom atom, JSValueConst val)
+{
+    JSObject *p;
+    JSShapeProperty *prs;
+    JSProperty *pr;
+    if (JS_VALUE_GET_TAG(val) != JS_TAG_OBJECT) return false;
+    if (JS_VALUE_GET_TAG(target) != JS_TAG_OBJECT) return false;
+    if (atom != JS_ATOM_length) return false;
+    p = JS_VALUE_GET_OBJ(target);
+    if (p->class_id != JS_CLASS_ARRAY) return false;
+    prs = find_own_property(&pr, p, atom);
+    return prs && (prs->flags & JS_PROP_LENGTH) != 0;
+}
+
+static void js_array_len_free(JSContext *ctx, JSArrayLen *al)
+{
+    JS_FreeValue(ctx, al->obj);
+    JS_FreeValue(ctx, al->val);
+    JS_FreeValue(ctx, al->getter);
+    JS_FreeValue(ctx, al->setter);
+    JS_FreeAtom(ctx, al->atom);
+    js_free_rt(ctx->rt, al);
+}
+
 static bool ta_write_needs_toprim(JSContext *ctx, JSValueConst target, JSValueConst key, JSValueConst val)
 {
     JSObject *p;
@@ -20021,6 +20112,7 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_SET_RECV:
     case CONT_TOPRIM_GET:
     case CONT_DEFINE_CLASS:
+    case CONT_ARRAY_LEN:
     case CONT_OP_KEYED:
     case CONT_FOR_IN_HAS:
     case CONT_OWNKEYS_CHK:
@@ -26287,6 +26379,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         /* MACHINE mode: a coercing BUILTIN asked for this primitive; it comes back as that step's
                            result, exactly as a callback's would. */
                         cont_st = touter;
+                        if (touter_kind == CONT_ARRAY_LEN) {
+                            /* an Array length write's step 3 or step 4 — the KEYED ENTRY parking across a
+                               coercion, which is the capability this kind exists to add. */
+                            goto do_array_len_step;
+                        }
                         if (touter_kind == CONT_ITER_CONSUME) { cont_st = touter; goto do_iter_consume_step; }
                         DCHECK(touter_kind == CONT_STEP, "ToPrimitive outer continuation: unknown machine kind");
                         goto do_step_step;
@@ -26890,6 +26987,65 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
             }
 
+        do_array_len_step:
+            /* 10.4.2.4 steps 3-5, ONE label with a phase because both coercions are of the SAME value and only
+               the phase distinguishes which primitive has arrived. */
+            {
+                JSArrayLen *al = (JSArrayLen *)cont_st;
+                uint32_t len1;
+                if (al->phase == AL_UINT32) {
+                    al->phase = AL_NUMBER;
+                    tp_outer = al; tp_outer_kind = CONT_ARRAY_LEN;
+                    tp_value = al->val; tp_hint = HINT_NUMBER;
+                    tp_slot = 0; tp_retry_pc = NULL;
+                    goto do_toprim_tramp;
+                }
+                if (al->phase == AL_NUMBER) {
+                    /* step 3 on the first primitive: a ToUint32 of a primitive invokes nothing. */
+                    if (unlikely(JS_ToUint32(ctx, &al->len, ret_val))) {
+                        JS_FreeValue(ctx, ret_val); ret_val = JS_UNDEFINED;
+                        goto do_array_len_throw;
+                    }
+                    JS_FreeValue(ctx, ret_val); ret_val = JS_UNDEFINED;
+                    al->phase = AL_COMPARE;
+                    tp_outer = al; tp_outer_kind = CONT_ARRAY_LEN;
+                    tp_value = al->val; tp_hint = HINT_NUMBER;
+                    tp_slot = 0; tp_retry_pc = NULL;
+                    goto do_toprim_tramp;
+                }
+                DCHECK(al->phase == AL_COMPARE, "the Array length coercion resumed in no phase");
+                /* an AL_REISSUED state is unwrapped at the delivery, never stepped */
+                /* steps 4-5 on the second primitive: the legacy double conversion and its comparison. */
+                if (unlikely(JS_ToArrayLengthFree(ctx, &len1, ret_val, false))) {
+                    ret_val = JS_UNDEFINED;
+                    goto do_array_len_throw;
+                }
+                ret_val = JS_UNDEFINED;
+                if (unlikely(len1 != al->len)) {
+                    JS_ThrowRangeError(ctx, "invalid array length");
+                    goto do_array_len_throw;
+                }
+                /* step 6: the validated uint32 IS the value the operation stores, so re-issuing with it in place
+                   of V is that step — and the re-run's own conversions are of a NUMBER, which invoke nothing and
+                   cannot match the predicate that sent us here. */
+                al->phase = AL_REISSUED;
+                al->coerced = js_uint32(al->len);
+                gp_obj = al->obj; gp_atom = al->atom;
+                gp_op = al->op; gp_val = al->coerced;
+                gp_recv = JS_UNINITIALIZED; gp_no_throw = al->no_throw;
+                gp_getter = al->getter; gp_setter = al->setter; gp_dflags = al->dflags;
+                /* the request BORROWS every operand, so the STATE stays alive as their owner and nests one level
+                   the way a [[GetOwnProperty]] nests inside its descriptor walk. Handing ownership to the
+                   registers instead leaked the array and the atom on every length write. */
+                gp_outer = al; gp_outer_kind = CONT_ARRAY_LEN;
+                goto do_getprop_tramp;
+
+            do_array_len_throw:
+                gp_outer = al->outer; gp_outer_kind = al->outer_kind;
+                js_array_len_free(ctx, al);
+                goto getprop_throw;
+            }
+
         do_set_recv_step:
             /* 10.1.9.2 step 3, one internal method at a time. `ret_val` is the previous one's answer. Both are
                requests on the RECEIVER, so a Proxy answers each with a trap on this chain and a loop inside
@@ -27178,6 +27334,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         int dres = JS_DeleteProperty(ctx, fwd ? gp_fwd : gp_obj, gp_atom, 0);
                         if (unlikely(dres < 0)) goto getprop_throw;
                         ret_val = js_bool(dres);
+                    } else if (arr_len_write_needs_toprim(fwd ? gp_fwd : gp_obj, gp_atom, gp_val)
+                               && (gp_op == GP_SET || (gp_op == GP_DEFINE && (gp_dflags_r & JS_PROP_HAS_VALUE)))) {
+                        /* 10.4.2.4's two coercions of V are the page's code, and this arm established that the
+                           walk itself invokes nothing — so the ONLY user code in the write is them. Both
+                           spellings that reach here (Reflect.set / a routed assignment, and
+                           Object.defineProperty) hand them to the same sequence. */
+                        if (fwd) gp_obj = gp_fwd;
+                        goto do_array_len_start;
                     } else if (gp_op == GP_SET && gp_nothrow_r) {
                         /* the bare [[Set]]: likewise, and with the receiver the operation was given. The WALK is
                            C — it invokes nothing, which is what this arm established — but 10.1.9.2 step 3 runs
@@ -27321,6 +27485,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                              ordinary case and used to be the ONLY one this handled. */
                           cont_st = gouter0;
                           goto do_toprim_have_method;
+                      }
+                      if (gk == CONT_ARRAY_LEN) {
+                          /* the RE-ISSUED write finished. The sequence owned its operands and nothing else, so
+                             it unwraps to whatever was waiting on the write and this label runs again for it. */
+                          JSArrayLen *alx = gouter0;
+                          DCHECK(alx->phase == AL_REISSUED,
+                                 "an Array length sequence was delivered a keyed answer before it re-issued");
+                          gp_outer = alx->outer; gp_outer_kind = alx->outer_kind;
+                          js_array_len_free(ctx, alx);
+                          goto do_getprop_complete;
                       }
                       if (gk == CONT_DEFINE_CLASS) {
                           /* the heritage's `prototype` was a plain data property, which is every ordinary
@@ -27493,6 +27667,30 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    callee in place without touching the caller. */
                 goto do_generic_callee;
 
+                do_array_len_start:
+                    /* the write's target coerces V TWICE (10.4.2.4 steps 3-4). Hand both coercions out and
+                       re-issue the operation with the validated uint32, which IS step 6. Entered with gp_obj
+                       already resolved past a trapless forward. */
+                    {
+                        JSArrayLen *al = js_mallocz(ctx, sizeof(*al));
+                        if (unlikely(!al)) { JS_ThrowOutOfMemory(ctx); goto getprop_throw; }
+                        al->obj = js_dup(gp_obj);
+                        al->val = js_dup(gp_val);
+                        al->atom = JS_DupAtom(ctx, gp_atom);
+                        al->op = (uint8_t)gp_op;
+                        al->no_throw = (uint8_t)gp_nothrow_r;
+                        al->getter = js_dup(gp_getter_r);
+                        al->setter = js_dup(gp_setter_r);
+                        al->dflags = gp_dflags_r;
+                        al->phase = AL_UINT32;
+                        al->coerced = JS_UNDEFINED;
+                        al->outer = gp_outer; al->outer_kind = gp_outer_kind;
+                        gp_outer = NULL; gp_outer_kind = CONT_NONE;
+                        if (gp_trapst) { js_trapget_free(ctx, gp_trapst); gp_trapst = NULL; }
+                        cont_st = al;
+                        goto do_array_len_step;
+                    }
+
                 do_set_recv_start:
                     /* the walk over O ended at 10.1.9.2 step 3 with a PROXY receiver. Everything step 3 needs is
                        here — the receiver, the key and the value are the request's own operands — so the whole
@@ -27534,6 +27732,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         JSGopdDesc *gd = gouter;
                         gp_outer = gd->outer; gp_outer_kind = gd->outer_kind;
                         js_gopd_desc_free(ctx, gd);
+                        goto getprop_throw;
+                    }
+                    if (gk3 == CONT_ARRAY_LEN) {
+                        /* the re-issued write threw in place: unwrap and let the throw reach the same waiter. */
+                        JSArrayLen *alt = gouter;
+                        gp_outer = alt->outer; gp_outer_kind = alt->outer_kind;
+                        js_array_len_free(ctx, alt);
                         goto getprop_throw;
                     }
                     if (gk3 == CONT_DEFINE_CLASS) {
@@ -30525,7 +30730,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            || gouter_kind == CONT_OWNKEYS_CHK || gouter_kind == CONT_PROXY_INV
                            || gouter_kind == CONT_KEYED_INV || gouter_kind == CONT_WITH_HAS
                            || gouter_kind == CONT_SET_RECV || gouter_kind == CONT_TOPRIM_GET
-                           || gouter_kind == CONT_DEFINE_CLASS,
+                           || gouter_kind == CONT_DEFINE_CLASS || gouter_kind == CONT_ARRAY_LEN,
                            "property-get outer continuation: unknown machine kind");
                     if (gouter_kind == CONT_PROMISE_ALL_THEN) {
                         js_getprop_free(ctx, gp);
@@ -30934,6 +31139,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             goto getprop_throw;
                         }
                         goto do_ownkeys_chk_step;
+                    }
+                    if (gouter_kind == CONT_ARRAY_LEN) {
+                        /* the re-issued write's own trap suspended and has now answered (or thrown). */
+                        JSArrayLen *alx = gouter;
+                        gp_outer = alx->outer; gp_outer_kind = alx->outer_kind;
+                        js_array_len_free(ctx, alx);
+                        if (unlikely(JS_IsException(ret_val))) goto getprop_throw;
+                        goto do_getprop_complete;
                     }
                     if (gouter_kind == CONT_DEFINE_CLASS) {
                         /* the heritage's `prototype` ACCESSOR (or a Proxy `get` trap) ran on this chain and
@@ -32955,6 +33168,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc += 4;
 
                 obj = sp[-2];
+                if (unlikely(arr_len_write_needs_toprim(obj, atom, sp[-1]))) {
+                    /* the target coerces V twice, which only the keyed entry can park across — so the whole
+                       write becomes the request it already knows how to drive, rather than a second driver here. */
+                    JSOpKeyed *ok;
+                    sf->cur_pc = pc;
+                    ok = js_mallocz(ctx, sizeof(*ok));
+                    if (unlikely(!ok)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                    ok->atom = JS_DupAtom(ctx, atom); ok->pop = 2; ok->push = 0;
+                    gp_obj = obj; gp_atom = ok->atom; gp_op = GP_SET; gp_val = sp[-1];
+                    gp_recv = JS_UNINITIALIZED; gp_no_throw = !sf->is_strict_mode;
+                    gp_outer = ok; gp_outer_kind = CONT_OP_KEYED;
+                    goto do_getprop_tramp;
+                }
                 if (unlikely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT
                              && (tramp_px = tramp_proto_proxy(ctx, JS_VALUE_GET_OBJ(obj), atom)) != NULL)) {
                     /* [[Set]] on a Proxy is the `set` trap plus the READ of that trap off the handler: the one
@@ -33539,6 +33765,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JSAtom katom = JS_ValueToAtom(ctx, sp[-2]);
                     if (unlikely(katom == JS_ATOM_NULL))
                         goto exception;
+                    if (unlikely(arr_len_write_needs_toprim(sp[-3], katom, sp[-1]))) {
+                        /* `a[k] = obj` where k resolves to `length`: 10.4.2.4 coerces V TWICE, which is the one
+                           thing the coerce-then-re-execute idiom above cannot express, so the whole write becomes
+                           the request the keyed entry drives. The DCHECK in set_array_length is what found this
+                           spelling after the other three were routed. */
+                        JSOpKeyed *ok = js_mallocz(ctx, sizeof(*ok));
+                        if (unlikely(!ok)) { JS_FreeAtom(ctx, katom); JS_ThrowOutOfMemory(ctx); goto exception; }
+                        ok->atom = katom; ok->pop = 3; ok->push = 0;
+                        gp_obj = sp[-3]; gp_atom = ok->atom; gp_op = GP_SET; gp_val = sp[-1];
+                        gp_recv = JS_UNINITIALIZED; gp_no_throw = !sf->is_strict_mode;
+                        gp_outer = ok; gp_outer_kind = CONT_OP_KEYED;
+                        goto do_getprop_tramp;
+                    }
                     if ((tramp_px = tramp_proto_proxy(ctx, JS_VALUE_GET_OBJ(sp[-3]), katom)) != NULL) {
                         /* the same GP_SET request as `o.x = v`, three operands instead of two. It sits HERE, not
                            at the top of the opcode where the old reshape did: the key must go through
@@ -34943,6 +35182,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     js_construct_requester_abandon(ctx, tac_outer, tac_outer_kind);  tac_outer = NULL; tac_outer_kind = CONT_NONE;
     js_construct_requester_abandon(ctx, smc_outer, smc_outer_kind);  smc_outer = NULL; smc_outer_kind = CONT_NONE;
 
+    if (unlikely(ctx->pending_gp_unwind != NULL)) {
+        /* THE ONE return direction of the two mutually recursive teardown walks: an abandon walk that ran outside
+           the interpreter (js_toprim_abandon, reached from a coercion method's throw) hit a link whose unwind is
+           getprop_throw's. No `sf` test as the import capability above needs one — this is not a value the opcode
+           still owes, it is state to release, and it is parked and drained within one visit to this label. */
+        gp_outer = ctx->pending_gp_unwind;
+        gp_outer_kind = ctx->pending_gp_unwind_kind;
+        ctx->pending_gp_unwind = NULL;
+        ctx->pending_gp_unwind_kind = CONT_NONE;
+        goto getprop_throw;
+    }
     if (unlikely(ctx->pending_import_cap != NULL && ctx->pending_import_cap->sf == sf)) {
         /* the unwind is back in the frame that issued OP_import, so its operands and its continuation pc are
            ours again: the throw becomes the capability's rejection and the promise becomes the opcode's result.
@@ -35339,7 +35589,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    || gk2 == CONT_ITER_CLOSE || gk2 == CONT_TRAP_GET || gk2 == CONT_GOPD_DESC
                    || gk2 == CONT_OWNKEYS_CHK || gk2 == CONT_PROXY_INV || gk2 == CONT_KEYED_INV
                    || gk2 == CONT_WITH_HAS || gk2 == CONT_SET_RECV || gk2 == CONT_TOPRIM_GET
-                   || gk2 == CONT_DEFINE_CLASS
+                   || gk2 == CONT_DEFINE_CLASS || gk2 == CONT_ARRAY_LEN
                    || gk2 == CONT_OP_KEYED
                    || gk2 == CONT_PROMISE_ALL_THEN || gk2 == CONT_AFS_GET
                    || gk2 == CONT_ITER_HELPER_GET || gk2 == CONT_PROMISE_ALL_GET
@@ -35415,6 +35665,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             } else if (gouter && gk2 == CONT_WITH_HAS) {
                 js_with_has_free(ctx, gouter);
                 goto exception;
+            } else if (gouter && gk2 == CONT_ARRAY_LEN) {
+                /* the re-issued write threw after suspending: unwrap one level, as the in-place arm does. */
+                JSArrayLen *alt = gouter;
+                gp_outer = alt->outer; gp_outer_kind = alt->outer_kind;
+                js_array_len_free(ctx, alt);
+                goto getprop_throw;
             } else if (gouter && gk2 == CONT_DEFINE_CLASS) {
                 /* the heritage's `prototype` accessor threw after suspending: same as the in-place arm. */
                 js_free_rt(rt, gouter);
