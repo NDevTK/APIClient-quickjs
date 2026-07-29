@@ -20033,7 +20033,19 @@ typedef struct JSWithHas {
     int32_t diff;        /* the jump the FOUND path takes */
     uint8_t op;          /* which OP_with_* this is */
     uint8_t is_with;     /* 1 = a real `with`, so @@unscopables applies */
+    uint8_t phase;       /* WH_*: which answer the delivery is being re-entered with */
+    uint8_t owns_atom;   /* the OP_with_* atoms are the bytecode's; a REFERENCE's is made by ToPropertyKey */
+    JSValue arr;         /* @@unscopables' value, held across the read of its key (owned) */
 } JSWithHas;
+/* An object Environment Record's operations, in the order 9.1.1.2.x states them. FIVE of the page's operations
+   live between HasBinding and the access itself, and every one is a trap on a Proxy base. */
+enum { WH_HAS = 0, WH_UNSCOP_ARR, WH_UNSCOP_KEY, WH_HAS2, WH_ACCESS };
+static void js_with_has_free(JSContext *ctx, JSWithHas *wh)
+{
+    JS_FreeValue(ctx, wh->arr);
+    if (wh->owns_atom) JS_FreeAtom(ctx, wh->atom);
+    js_free_rt(ctx->rt, wh);
+}
 
 #define CONT_KEYED_INV     59  /* gp_outer = JSKeyedInv: 10.5.7 step 9 / 10.5.10 steps 9-12, which read the
                                   TARGET's descriptor bits and its extensibility — internal methods both, so a
@@ -20713,7 +20725,7 @@ static void js_create_requester_abandon(JSContext *ctx, void *cont, uint8_t kind
     if (kind == CONT_OWNKEYS_CHK) { js_ownkeys_chk_free(ctx, cont); return; }
     if (kind == CONT_PROXY_INV) { js_proxy_inv_free(ctx, cont); return; }
     if (kind == CONT_KEYED_INV) { js_keyed_inv_free(ctx, cont); return; }
-    if (kind == CONT_WITH_HAS) { js_free_rt(ctx->rt, cont); return; }
+    if (kind == CONT_WITH_HAS) { js_with_has_free(ctx, cont); return; }
     if (kind == CONT_STEP) { tramp_step_chain_free(ctx, cont); return; }
     if (kind == CONT_PROMISE_ALL) {
         js_promise_all_end(ctx, (struct JSPromiseAll *)cont); js_free_rt(ctx->rt, cont); return;
@@ -27391,9 +27403,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         goto getprop_throw;
                     }
                     if (gk3 == CONT_WITH_HAS) {
-                        /* the `has` trap threw in place: the opcode can never finish, and its base object is
-                           left for the frame's own catch-search like any throwing operator's operand. */
-                        js_free_rt(rt, gouter);
+                        /* one of the record's operations threw in place: the opcode can never finish, and its
+                           base object is left for the frame's own catch-search like any throwing operator's. */
+                        js_with_has_free(ctx, gouter);
                         goto exception;
                     }
                     if (gk3 == CONT_KEYED_INV) {
@@ -30690,7 +30702,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            to where the opcode left its base object, which is what the delivery reads. */
                         cont_st = gouter;
                         if (unlikely(JS_IsException(ret_val))) {
-                            js_free_rt(rt, gouter);
+                            js_with_has_free(ctx, gouter);
                             goto exception;
                         }
                         goto do_with_has_deliver;
@@ -32973,9 +32985,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
         CASE(OP_get_ref_value):
             {
-                JSValue val;
                 JSAtom atom;
-                int ret;
+                JSWithHas *wh;
                 sf->cur_pc = pc;
                 atom = JS_ValueToAtom(ctx, sp[-1]);   /* already a property key: the ref carries an atom value */
                 if (unlikely(atom == JS_ATOM_NULL))
@@ -32988,34 +32999,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 /* 9.1.1.2.6 GetBindingValue step 2: the object Environment Record performs its OWN
                    HasProperty, separate from the HasBinding that resolved this reference. Observable — the
                    @@unscopables Get in between runs page code that can delete the binding, and a Proxy counts
-                   every trap. */
-                ret = JS_HasProperty(ctx, sp[-2], atom);
-                if (unlikely(ret < 0)) {
-                    JS_FreeAtom(ctx, atom);
-                    goto exception;
-                }
-                if (unlikely(!ret)) {
-                    /* step 3. A DECLARATIVE record's base (global_var_obj, or the null-proto dummy
-                       OP_make_var_ref_ref builds) always holds the binding, so only an object record can
-                       reach here. */
-                    DCHECK(!js_same_value(ctx, sp[-2], ctx->global_var_obj),
-                           "a declarative record's binding cannot vanish between HasBinding and GetBindingValue");
-                    if (is_strict_mode(ctx)) {
-                        JS_ThrowReferenceErrorNotDefined(ctx, atom);
-                        JS_FreeAtom(ctx, atom);
-                        goto exception;
-                    }
-                    JS_FreeAtom(ctx, atom);
-                    sp[0] = JS_UNDEFINED;
-                    sp++;
-                    BREAK;
-                }
-                val = JS_GetProperty(ctx, sp[-2], atom);   /* step 4 */
-                JS_FreeAtom(ctx, atom);
-                if (unlikely(JS_IsException(val)))
-                    goto exception;
-                sp[0] = val;
-                sp++;
+                   every trap — and on a Proxy base it IS that trap, which this ran from C. The rest of the
+                   opcode lives at the shared delivery, entered only through the answer. */
+                wh = js_mallocz(ctx, sizeof(*wh));
+                if (unlikely(!wh)) { JS_FreeAtom(ctx, atom); JS_ThrowOutOfMemory(ctx); goto exception; }
+                wh->atom = atom; wh->owns_atom = 1; wh->op = (uint8_t)opcode;
+                wh->phase = WH_HAS2; wh->arr = JS_UNDEFINED;
+                gp_obj = sp[-2]; gp_atom = atom; gp_op = GP_HAS; gp_val = JS_UNDEFINED;
+                gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
+                gp_outer = wh; gp_outer_kind = CONT_WITH_HAS;
+                goto do_getprop_tramp;
             }
             BREAK;
 
@@ -33164,49 +33157,41 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
         CASE(OP_put_ref_value):
             {
-                int ret;
                 JSAtom atom;
+                JSWithHas *wh;
                 sf->cur_pc = pc;
                 atom = JS_ValueToAtom(ctx, sp[-2]);   /* already a property key */
                 if (unlikely(atom == JS_ATOM_NULL))
                     goto exception;
                 if (unlikely(JS_IsUndefined(sp[-3]))) {
                     /* 6.2.5.6 PutValue step 2: an UNRESOLVABLE reference. Strict code throws; sloppy code
-                       creates the property on the global object. */
+                       creates the property on the global object, which is an ordinary object no page can
+                       replace — so that write needs no stillExists lookup and takes the access directly. */
                     if (is_strict_mode(ctx)) {
                         JS_ThrowReferenceErrorNotDefined(ctx, atom);
                         JS_FreeAtom(ctx, atom);
                         goto exception;
                     }
                     sp[-3] = js_dup(ctx->global_obj);
-                } else {
-                    /* 9.1.1.2.5 SetMutableBinding step 2: `stillExists`, the object Environment Record's OWN
-                       HasProperty. It replaces the JS_PROP_NO_ADD approximation that used to stand in for
-                       step 3 — that flag silently declined to add instead of throwing, and never ran the
-                       lookup a Proxy observes. */
-                    ret = JS_HasProperty(ctx, sp[-3], atom);
-                    if (unlikely(ret < 0)) {
-                        JS_FreeAtom(ctx, atom);
-                        goto exception;
-                    }
-                    if (unlikely(!ret)) {
-                        DCHECK(!js_same_value(ctx, sp[-3], ctx->global_var_obj),
-                               "a declarative record's binding cannot vanish between HasBinding and SetMutableBinding");
-                        if (is_strict_mode(ctx)) {
-                            JS_ThrowReferenceErrorNotDefined(ctx, atom);   /* step 3 */
-                            JS_FreeAtom(ctx, atom);
-                            goto exception;
-                        }
-                    }
+                    wh = js_mallocz(ctx, sizeof(*wh));
+                    if (unlikely(!wh)) { JS_FreeAtom(ctx, atom); JS_ThrowOutOfMemory(ctx); goto exception; }
+                    wh->atom = atom; wh->owns_atom = 1; wh->op = (uint8_t)opcode;
+                    wh->phase = WH_ACCESS; wh->arr = JS_UNDEFINED;
+                    gp_obj = sp[-3]; gp_atom = atom; gp_op = GP_SET; gp_val = sp[-1];
+                    gp_recv = JS_UNINITIALIZED; gp_no_throw = is_strict_mode(ctx) ? 0 : 1;
+                    gp_outer = wh; gp_outer_kind = CONT_WITH_HAS;
+                    goto do_getprop_tramp;
                 }
-                ret = JS_SetPropertyInternal(ctx, sp[-3], atom, sp[-1],   /* step 4 */
-                                             JS_PROP_THROW_STRICT);
-                JS_FreeAtom(ctx, atom);
-                JS_FreeValue(ctx, sp[-3]);
-                JS_FreeValue(ctx, sp[-2]);
-                sp -= 3;
-                if (unlikely(ret < 0))
-                    goto exception;
+                /* 9.1.1.2.5 SetMutableBinding step 2: `stillExists`, the object Environment Record's OWN
+                   HasProperty — the page's `has` trap on a Proxy base, which this ran from C. */
+                wh = js_mallocz(ctx, sizeof(*wh));
+                if (unlikely(!wh)) { JS_FreeAtom(ctx, atom); JS_ThrowOutOfMemory(ctx); goto exception; }
+                wh->atom = atom; wh->owns_atom = 1; wh->op = (uint8_t)opcode;
+                wh->phase = WH_HAS2; wh->arr = JS_UNDEFINED;
+                gp_obj = sp[-3]; gp_atom = atom; gp_op = GP_HAS; gp_val = JS_UNDEFINED;
+                gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
+                gp_outer = wh; gp_outer_kind = CONT_WITH_HAS;
+                goto do_getprop_tramp;
             }
             BREAK;
 
@@ -34136,6 +34121,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 wh = js_mallocz(ctx, sizeof(*wh));
                 if (unlikely(!wh)) { JS_ThrowOutOfMemory(ctx); goto exception; }
                 wh->atom = atom; wh->diff = diff; wh->op = (uint8_t)opcode; wh->is_with = (uint8_t)is_with;
+                wh->phase = WH_HAS; wh->arr = JS_UNDEFINED;
                 gp_obj = sp[-1]; gp_atom = atom; gp_op = GP_HAS; gp_val = JS_UNDEFINED;
                 gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
                 gp_outer = wh; gp_outer_kind = CONT_WITH_HAS;
@@ -34144,102 +34130,197 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         do_with_has_deliver:
-            /* HasBinding answered. Everything the opcode still owes is here, reading the operands the record
-               carried across the suspension; `obj` is sp[-1], which the request left untouched. */
+            /* An object Environment Record's operations, entered ONLY through an answer — the wop issues the
+               first request and every step after it is another. What used to be here in C was HasBinding's
+               HasProperty, @@unscopables' two reads, GetBindingValue/SetMutableBinding's SECOND HasProperty and
+               the access itself: five of the page's operations, each a trap on a Proxy base. */
             {
-                JSAtom atom;
-                int32_t diff;
-                JSValue obj, val;
-                int ret, is_with, opcode;
                 JSWithHas *wh = cont_st;
+                JSAtom atom = wh->atom;
+                int32_t diff = wh->diff;
+                /* NOT named `wop`: that is the interpreter's DISPATCH variable, and BREAK — which this block uses —
+                   expands to `wop = *pc++` plus the jump. A local of that name takes the assignment and
+                   leaves the real one stale for every instruction after, which is a corruption with no
+                   symptom at the site that caused it. */
+                int wop = wh->op;
+                JSValueConst obj;
+                JSValue val;
+                int ret;
                 cont_st = NULL;
-                atom = wh->atom; diff = wh->diff; opcode = wh->op; is_with = wh->is_with;
-                js_free_rt(rt, wh);
-                ret = JS_ToBoolFree(ctx, ret_val);
-                ret_val = JS_UNDEFINED;
+                /* the request never touches the caller's operands, so the base object is still where the
+                   wop left it — at a depth that is the wop's own shape. */
+                obj = (wop == OP_get_ref_value) ? sp[-2]
+                    : (wop == OP_put_ref_value) ? sp[-3]
+                    : sp[-1];
 
-                obj = sp[-1];
-                if (ret) {
-                    if (is_with) {
-                        ret = js_has_unscopable(ctx, obj, atom);
-                        if (unlikely(ret < 0))
-                            goto exception;
-                        if (ret)
-                            goto no_with;
-                    }
-                    /* HasBinding said yes, but it is a SEPARATE abstract operation from the one that follows:
-                       GetBindingValue (9.1.1.2.6 step 2) and SetMutableBinding (9.1.1.2.5 step 2) each perform
-                       their OWN HasProperty. That second lookup is observable — HasBinding's @@unscopables Get
-                       runs page code that can delete the binding, and a Proxy counts every trap. DeleteBinding
-                       (9.1.1.2.4) is the one that does not re-check: it is a bare [[Delete]]. */
-                    switch (opcode) {
-                    case OP_with_get_var:
-                    case OP_with_get_ref:
-                    case OP_with_get_ref_undef:
-                        ret = JS_HasProperty(ctx, obj, atom);   /* GetBindingValue step 2 */
-                        if (unlikely(ret < 0))
-                            goto exception;
+                switch (wh->phase) {
+                case WH_HAS:
+                    /* 9.1.1.2.1 step 2 answered. */
+                    if (!JS_ToBoolFree(ctx, ret_val)) { ret_val = JS_UNDEFINED; goto with_absent; }
+                    ret_val = JS_UNDEFINED;
+                    if (!wh->is_with) goto with_resolved;
+                    /* 9.1.1.2.1 step 3: Get(bindingObject, @@unscopables). */
+                    wh->phase = WH_UNSCOP_ARR;
+                    gp_obj = obj; gp_atom = JS_ATOM_Symbol_unscopables; gp_op = GP_GET;
+                    goto with_request;
+                case WH_UNSCOP_ARR:
+                    wh->arr = ret_val; ret_val = JS_UNDEFINED;
+                    if (!JS_IsObject(wh->arr)) goto with_resolved;   /* step 3.b: not an object, nothing blocked */
+                    /* step 3.c: Get(unscopables, N). */
+                    wh->phase = WH_UNSCOP_KEY;
+                    gp_obj = wh->arr; gp_atom = atom; gp_op = GP_GET;
+                    goto with_request;
+                case WH_UNSCOP_KEY:
+                    ret = JS_ToBoolFree(ctx, ret_val); ret_val = JS_UNDEFINED;
+                    if (ret) goto with_absent;   /* step 3.d: blocked, so the reference falls through */
+                    goto with_resolved;
+                case WH_HAS2:
+                    if (wop == OP_get_ref_value || wop == OP_put_ref_value) {
+                        /* a REFERENCE that HasBinding already resolved. Step 3's absent case is the same
+                           question for both, and a DECLARATIVE record's base always holds its binding, so only
+                           an object record can reach it. */
+                        ret = JS_ToBoolFree(ctx, ret_val); ret_val = JS_UNDEFINED;
                         if (!ret) {
-                            /* step 3: the binding is gone. Strict code throws; sloppy code reads undefined.
-                               Never a fall-through to the enclosing scope — the binding was RESOLVED here. */
-                            if (sf->is_strict_mode) {
+                            DCHECK(!js_same_value(ctx, obj, ctx->global_var_obj),
+                                   "a declarative record's binding cannot vanish between HasBinding and its access");
+                            if (is_strict_mode(ctx)) {
                                 JS_ThrowReferenceErrorNotDefined(ctx, atom);
-                                goto exception;
+                                goto with_throw;
                             }
-                            val = JS_UNDEFINED;
+                            if (wop == OP_get_ref_value) { val = JS_UNDEFINED; goto with_place; }
+                            /* a sloppy write to a vanished binding still performs the Set. */
+                        }
+                        wh->phase = WH_ACCESS;
+                        gp_obj = obj; gp_atom = atom;
+                        if (wop == OP_get_ref_value) {
+                            gp_op = GP_GET;
                         } else {
-                            val = JS_GetProperty(ctx, obj, atom);   /* step 4 */
-                            if (unlikely(JS_IsException(val)))
-                                goto exception;
+                            gp_op = GP_SET; gp_val = sp[-1];
+                            gp_no_throw = is_strict_mode(ctx) ? 0 : 1;
                         }
-                        if (opcode == OP_with_get_var) {
-                            set_value(ctx, &sp[-1], val);
-                        } else {
-                            if (opcode == OP_with_get_ref_undef) {
-                                /* produce a pair undefined/function on the stack */
-                                JS_FreeValue(ctx, sp[-1]);
-                                sp[-1] = JS_UNDEFINED;
-                            }
-                            /* OP_with_get_ref: produce a pair object/method on the stack */
-                            *sp++ = val;
-                        }
-                        break;
-                    case OP_with_put_var:
-                        ret = JS_HasProperty(ctx, obj, atom);   /* SetMutableBinding step 2, stillExists */
-                        if (unlikely(ret < 0))
-                            goto exception;
-                        if (!ret && sf->is_strict_mode) {
-                            JS_ThrowReferenceErrorNotDefined(ctx, atom);   /* step 3 */
-                            goto exception;
-                        }
-                        ret = JS_SetPropertyInternal(ctx, obj, atom, sp[-2],   /* step 4 */
-                                                     JS_PROP_THROW_STRICT);
-                        JS_FreeValue(ctx, sp[-1]);
-                        sp -= 2;
-                        if (unlikely(ret < 0))
-                            goto exception;
-                        break;
-                    case OP_with_delete_var:
-                        ret = JS_DeleteProperty(ctx, obj, atom, 0);
-                        if (unlikely(ret < 0))
-                            goto exception;
-                        JS_FreeValue(ctx, sp[-1]);
-                        sp[-1] = js_bool(ret);
-                        break;
-                    case OP_with_make_ref:
-                        /* produce a pair object/propname on the stack */
-                        *sp++ = JS_AtomToValue(ctx, atom);
-                        break;
+                        goto with_request;
                     }
-                    pc += diff - 5;
-                } else {
-                no_with:
-                    /* if not jumping, drop the object argument */
-                    JS_FreeValue(ctx, sp[-1]);
-                    sp--;
+                    /* GetBindingValue 9.1.1.2.6 step 2 / SetMutableBinding 9.1.1.2.5 step 2 answered. It is a
+                       SEPARATE operation from HasBinding's, and observably so: @@unscopables' Get ran in between
+                       and can have deleted the binding, and a Proxy counts every trap. */
+                    ret = JS_ToBoolFree(ctx, ret_val); ret_val = JS_UNDEFINED;
+                    if (wop == OP_with_put_var) {
+                        if (!ret && sf->is_strict_mode) {
+                            JS_ThrowReferenceErrorNotDefined(ctx, atom);   /* SetMutableBinding step 3 */
+                            goto with_throw;
+                        }
+                        /* step 5's Set(bindingObject, N, V, S): S is the STRICT flag, so a sloppy write that
+                           the object refuses yields false rather than throwing. */
+                        wh->phase = WH_ACCESS;
+                        gp_obj = obj; gp_atom = atom; gp_op = GP_SET; gp_val = sp[-2];
+                        gp_no_throw = sf->is_strict_mode ? 0 : 1;
+                        goto with_request;
+                    }
+                    if (!ret) {
+                        /* GetBindingValue step 3: the binding is gone. Strict code throws; sloppy code reads
+                           undefined. Never a fall-through — the reference was RESOLVED here. */
+                        if (sf->is_strict_mode) {
+                            JS_ThrowReferenceErrorNotDefined(ctx, atom);
+                            goto with_throw;
+                        }
+                        val = JS_UNDEFINED;
+                        goto with_place;
+                    }
+                    wh->phase = WH_ACCESS;                            /* step 4's Get */
+                    gp_obj = obj; gp_atom = atom; gp_op = GP_GET;
+                    goto with_request;
+                default:
+                    DCHECK(wh->phase == WH_ACCESS, "a `with` reference resumed in no phase");
+                    val = ret_val; ret_val = JS_UNDEFINED;
+                    goto with_place;
                 }
+
+            with_resolved:
+                /* the reference belongs to this record. Which operation follows is the wop's. */
+                switch (wop) {
+                case OP_with_get_var:
+                case OP_with_get_ref:
+                case OP_with_get_ref_undef:
+                case OP_with_put_var:
+                    wh->phase = WH_HAS2;
+                    gp_obj = obj; gp_atom = atom; gp_op = GP_HAS;
+                    goto with_request;
+                case OP_with_delete_var:
+                    /* 9.1.1.2.4 DeleteBinding is the one that does NOT re-check: a bare [[Delete]], whose
+                       boolean is the operator's value. */
+                    wh->phase = WH_ACCESS;
+                    gp_obj = obj; gp_atom = atom; gp_op = GP_DELETE; gp_no_throw = 1;
+                    goto with_request;
+                default:
+                    DCHECK(wop == OP_with_make_ref, "an unknown OP_with_* reached the record's dispatch");
+                    val = JS_AtomToValue(ctx, atom);   /* produce a pair object/propname; nothing to run */
+                    if (unlikely(JS_IsException(val))) goto with_throw;
+                    goto with_place;
+                }
+
+            with_request:
+                gp_val = (gp_op == GP_SET) ? gp_val : JS_UNDEFINED;
+                gp_recv = JS_UNINITIALIZED;
+                if (gp_op != GP_SET && gp_op != GP_DELETE) gp_no_throw = 0;
+                gp_outer = wh; gp_outer_kind = CONT_WITH_HAS;
+                goto do_getprop_tramp;
+
+            with_place:
+                /* `val` is the operation's result; place it as this wop's shape requires and take the jump
+                   into the with-body. */
+                switch (wop) {
+                case OP_with_get_var:
+                    set_value(ctx, &sp[-1], val);
+                    break;
+                case OP_with_get_ref_undef:
+                    JS_FreeValue(ctx, sp[-1]);
+                    sp[-1] = JS_UNDEFINED;
+                    *sp++ = val;                       /* a pair undefined/function */
+                    break;
+                case OP_with_get_ref:
+                case OP_with_make_ref:
+                    *sp++ = val;                       /* a pair object/method, or object/propname */
+                    break;
+                case OP_with_delete_var:
+                    JS_FreeValue(ctx, sp[-1]);
+                    sp[-1] = js_bool(JS_ToBool(ctx, val));
+                    JS_FreeValue(ctx, val);
+                    break;
+                case OP_get_ref_value:
+                    *sp++ = val;                       /* the reference's value, above its two operands */
+                    break;
+                case OP_put_ref_value:
+                    JS_FreeValue(ctx, val);            /* a sloppy Set's boolean is not the operator's value */
+                    JS_FreeValue(ctx, sp[-3]);
+                    JS_FreeValue(ctx, sp[-2]);
+                    JS_FreeValue(ctx, sp[-1]);
+                    sp -= 3;
+                    break;
+                default:
+                    DCHECK(wop == OP_with_put_var, "an unknown OP_with_* reached the record's placement");
+                    JS_FreeValue(ctx, val);            /* a sloppy Set's boolean is not the operator's value */
+                    JS_FreeValue(ctx, sp[-1]);
+                    JS_FreeValue(ctx, sp[-2]);
+                    sp -= 2;
+                    break;
+                }
+                js_with_has_free(ctx, wh);
+                if (wop != OP_get_ref_value && wop != OP_put_ref_value)
+                    pc += diff - 5;   /* the OP_with_* forms jump into the with-body; a reference just continues */
+                BREAK;
+
+            with_absent:
+                /* the reference is not this record's: drop the base object and fall through to the enclosing
+                   scope, which is where the bytecode continues. */
+                js_with_has_free(ctx, wh);
+                JS_FreeValue(ctx, sp[-1]);
+                sp--;
+                BREAK;
+
+            with_throw:
+                js_with_has_free(ctx, wh);
+                goto exception;
             }
-            BREAK;
 
         CASE(OP_await):
             ret_val = js_int32(FUNC_RET_AWAIT);
@@ -34810,7 +34891,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 js_gopd_desc_free(ctx, gd);
                 goto getprop_throw;
             } else if (gouter && gk2 == CONT_WITH_HAS) {
-                js_free_rt(rt, gouter);
+                js_with_has_free(ctx, gouter);
                 goto exception;
             } else if (gouter && gk2 == CONT_KEYED_INV) {
                 /* the same for the keyed invariant once its read has suspended. */
