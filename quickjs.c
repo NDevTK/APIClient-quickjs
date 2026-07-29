@@ -24904,8 +24904,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 if (tramp_step_def_of(call_argv[-1]))
                     goto do_step_tramp;
-                {   /* a lazy Iterator HELPER's own .next(): its step machine drives the source on this chain, and
-                       calling it in place is js_iterator_helper_next's DFAIL. Asked here and nowhere else. Its
+                {   /* a lazy Iterator HELPER's own .next(): its drive runs the source on this chain, and calling
+                       it in place is js_call_c_function's iterdrive DCHECK. Asked here and nowhere else. Its
                        per-call-site copy lived at OP_call_method, so `h.next.bind(h)()` and every other spelling
                        the operator could not see reached that DFAIL — and through a for-of, the opcode's own copy
                        silently delivered in the wrong mode instead. */
@@ -25738,7 +25738,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 if (iter_helper_drive_ready(call_argv[-1], call_argv[-2])) {
                     /* the callee is a lazy Iterator HELPER's own .next(): it IS a machine of a different kind,
-                       driven by do_iter_helper_step, and calling it in place is js_iterator_helper_next's DFAIL.
+                       driven by do_iter_helper_step, and calling it in place is the iterdrive DCHECK.
                        The same question the ONE .next() drive asks — a sequence asks it too, because a sequence
                        can hold an iterator (AggregateError's errors walk) exactly as a consumer can. */
                     JSIteratorHelperData *dh = JS_VALUE_GET_OBJ(call_argv[-2])->u.iterator_helper_data;
@@ -28825,7 +28825,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             /* ret_val = the source .next() {value,done} from the previous drive (UNINITIALIZED on the first step).
                ONE drive mechanism: the step decides skip/emit; a GENERATOR source .next() runs on the tramp (its body
                suspend/resumes, the settle re-enters here); a PLAIN source .next() (C or short bytecode — does not
-               suspend) is called in-loop. No legacy js_iterator_helper_next fallback. */
+               suspend) is called in-loop. There is no C entry to fall back to: the drive is the implementation. */
             {
                 JSIteratorHelperData *it = (JSIteratorHelperData *)cont_st;
                 for (;;) {
@@ -65694,8 +65694,8 @@ static JSValue js_iter_helper_new_fini(JSContext *ctx, void *st, bool take_resul
 
 /* Resumable driver for a lazy Iterator Helper's .next() over a GENERATOR source: `res` = the source .next()
    {value,done} from the previous tramp drive (UNINITIALIZED at the start; owned by this fn). On DONE *out receives
-   the {value,done} to deliver. Returns 0 = DONE, 1 = DRIVE the source .next() again. DROP built (skip `count`, then
-   pass values through); other kinds still use the plain-iterator js_iterator_helper_next path. */
+   the {value,done} to deliver. Returns 0 = DONE, 1 = DRIVE the source .next() again. EVERY kind runs here — the
+   line that said only DROP was built, and that the rest used a plain-iterator C path, outlived both. */
 /* IfAbruptCloseIterator: close a helper's SOURCE on an abrupt completion (mapper/predicate throw), PRESERVING the
    pending exception. Every source closes on the tramp — the exception label saves and restores the exception
    across the close and discards the close's own throw, spec-correct. Call with the pending exception set, then
@@ -65994,9 +65994,6 @@ static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue
     return -1;
 }
 
-/* Route a lazy Iterator Helper .next() whose SOURCE is a generator (the drive-to-completion case) and whose kind's
-   tramp drive is built (DROP) onto do_iter_helper_tramp. Plain-iterator sources / other kinds stay on the C
-   js_iterator_helper_next (a plain .next() call does not suspend). */
 /* Can a drive BEGIN on this receiver? Not which builtin the callee is — that is the declaration's answer now
    (tramp_is_iter_drive), and comparing against js_iterator_helper_next's address was the identity test the
    recognizer ban is about. What is left is about the RECEIVER: `.next` is reachable off %IteratorHelperPrototype%
