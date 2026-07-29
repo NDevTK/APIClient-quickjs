@@ -1516,7 +1516,18 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_ENCODE_URI, STEPDEF_ENCODE_URI_COMPONENT,
     STEPDEF_GLOBAL_ESCAPE, STEPDEF_GLOBAL_UNESCAPE,
     STEPDEF_INSTANCEOF, STEPDEF_ORDINARY_HAS_INSTANCE,
-    STEPDEF_TA_SORT, STEPDEF_TA_TOSORTED,
+    STEPDEF_TA_SORT, STEPDEF_TA_TOSORTED, STEPDEF_STR_LOCALECOMPARE,
+    /* 21.4.4.20-.28: one id per setter, because a coerce-then-compute definition carries the body's magic AND
+       the mask of arguments the spec coerces, and those differ per setter. */
+#define DATE_SET_LIST(F) \
+    F(MILLISECONDS, 0x671) F(UTC_MILLISECONDS, 0x670) F(SECONDS, 0x571) F(UTC_SECONDS, 0x570) \
+    F(MINUTES, 0x471) F(UTC_MINUTES, 0x470) F(HOURS, 0x371) F(UTC_HOURS, 0x370) \
+    F(DATE, 0x231) F(UTC_DATE, 0x230) F(MONTH, 0x131) F(UTC_MONTH, 0x130) \
+    F(FULLYEAR, 0x031) F(UTC_FULLYEAR, 0x030)
+#define DATE_SET_ID(N, M) STEPDEF_DATE_SET_##N,
+    DATE_SET_LIST(DATE_SET_ID)
+#undef DATE_SET_ID
+    STEPDEF_DATE_SETTIME, STEPDEF_DATE_SETYEAR,
     STEPDEF_COUNT
 };
 #define HINT_NONE    2
@@ -22077,7 +22088,7 @@ enum { STRRECV_TRIM_START = 1, STRRECV_TRIM_END = 2, STRRECV_TRIM_BOTH = 3,
        STRRECV_INDEXOF, STRRECV_LASTINDEXOF, STRRECV_NORMALIZE,
        STRRECV_CHARAT, STRRECV_CHARCODEAT,
        STRRECV_SLICE, STRRECV_SUBSTR, STRRECV_REPEAT,
-       STRRECV_PADSTART, STRRECV_PADEND };
+       STRRECV_PADSTART, STRRECV_PADEND, STRRECV_LOCALECOMPARE };
 typedef struct JSStrRecv {
     JSStepHdr hdr;
     JSValue str;          /* the receiver as a string (owned) */
@@ -63150,6 +63161,15 @@ static const JSTrampStepDef js_iter_wrap_return_def =
     { sizeof(JSIterWrapReturn), js_iter_wrap_return_step, js_iter_wrap_return_fini, 0 };
 static const JSTrampStepDef js_date_toJSON_def = { sizeof(JSDateToJSON), js_date_tojson_step, js_date_tojson_fini, 0 };
 static const JSTrampStepDef js_date_toPrim_def = { sizeof(JSDateToPrim), js_date_toprim_step, js_date_toprim_fini, 0 };
+/* the captured half of a Date setter: everything read at step 2, held across the argument coercions. */
+typedef struct JSDateSet {
+    JSStepHdr hdr;        /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    JSValue result;       /* DONE (owned) */
+    double fields[9];     /* derived from the [[DateValue]] read BEFORE any argument was coerced */
+    int res;              /* get_date_fields' answer: 0 = the stored time value was NaN */
+    int i, n;             /* the coercion cursor and how many arguments the spec names */
+    bool nonfinite;       /* an argument coerced to an infinity or a NaN */
+} JSDateSet;
 static const JSTrampStepDef js_date_ctor_def = { sizeof(JSDateCtor), js_date_ctor_step, js_date_ctor_fini, 0 };
 /* An OrdinaryCreateFromConstructor declaration: the CLASS and the body's DECLARED ARGUMENT COUNT in `arg`, the
    post-create body (NULL = the object is the result), and the same precheck hook the coerce-then-compute machines
@@ -63242,6 +63262,7 @@ static const JSTrampStepDef js_str_substr_def     = { sizeof(JSStrRecv), js_str_
 static const JSTrampStepDef js_str_repeat_def     = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_REPEAT };
 static const JSTrampStepDef js_str_padStart_def   = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_PADSTART };
 static const JSTrampStepDef js_str_padEnd_def     = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_PADEND };
+static const JSTrampStepDef js_str_localeCmp_def  = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_LOCALECOMPARE };
 static const JSTrampStepDef js_ta_at_def          = { sizeof(JSTAIdx), js_ta_idx_step, js_ta_idx_fini, TAIDX_AT };
 static const JSTrampStepDef js_ta_set_def         = { sizeof(JSTAIdx), js_ta_idx_step, js_ta_idx_fini, TAIDX_SET };
 static const JSTrampStepDef js_json_raw_def       = { sizeof(JSJsonRaw), js_json_raw_step, js_json_raw_fini, 0 };
@@ -63295,6 +63316,35 @@ static const JSTrampStepDef js_encodeURI_def      = PRIMARGS_DEF(PRIMARGS(0x1, H
 static const JSTrampStepDef js_encodeURIComp_def  = PRIMARGS_DEF(PRIMARGS(0x1, HINT_STRING, 1), generic_magic, js_global_encodeURI, 1);
 static const JSTrampStepDef js_global_escape_def  = PRIMARGS_DEF(PRIMARGS(0x1, HINT_STRING, 1), generic, js_global_escape, 0);
 static const JSTrampStepDef js_global_unescape_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_STRING, 1), generic, js_global_unescape, 0);
+static JSValue js_date_setTime(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static int js_date_this_precheck(JSContext *ctx, JSStepHdr *h);
+static int js_date_set_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_date_set_fini(JSContext *ctx, void *st, bool take_result);
+/* 21.4.4.20-.28 and B.2.3.1. Each setter reads [[DateValue]] at step 2, ToNumbers every argument the spec names
+   at steps 3-6 — unconditionally, which is why the C body carried a comment saying so — and computes from both.
+   set_date_field ran those coercions with JS_ToFloat64 from its C entry, so
+   `new Date(0).setFullYear({valueOf(){for(;;){}}})` preempted with no flow base.
+
+   It is NOT a coerce-then-compute declaration, for the reason 23.2.3.36's %TypedArray%.prototype.with is not:
+   step 2 reads the time value BEFORE the coercions and step 7 tests THAT value, so a valueOf that calls
+   `dt.setTime(NaN)` must not change the answer. Declaring it as one made the body re-read the slot afterwards
+   and test262's date-value-read-before-tonumber-when-date-is-valid caught it across a dozen setters. The
+   captured fields have to live on the state, which is what makes this a machine.
+
+   `arg` is the same 0xFEL magic the C body took — first field, end field, is_local — plus DATE_SET_MAKEFULLYEAR
+   for setYear, whose only difference from setFullYear is B.2.3.1 step 5's MakeFullYear on the coerced value. */
+#define DATE_SET_MAKEFULLYEAR 0x1000
+#define DATE_SET_DEF(magic) \
+    { sizeof(JSDateSet), js_date_set_step, js_date_set_fini, (magic) }
+#define DATE_SET_TABLE(N, M) static const JSTrampStepDef js_date_set_##N##_def = DATE_SET_DEF(M);
+DATE_SET_LIST(DATE_SET_TABLE)
+#undef DATE_SET_TABLE
+static const JSTrampStepDef js_date_setYear_def = DATE_SET_DEF(0x011 | DATE_SET_MAKEFULLYEAR);
+/* 21.4.4.27 setTime is the one that reads NOTHING from the stored value — step 2 validates the slot and step 3's
+   ToNumber is the whole input — so it IS a coerce-then-compute declaration, with the RequireInternalSlot as the
+   leading validation the `pre` hook exists for. */
+static const JSTrampStepDef js_date_setTime_def = PRIMARGS_DEF_PRE(PRIMARGS(0x1, HINT_NUMBER, 1), generic,
+                                                                  js_date_setTime, 0, js_date_this_precheck, NULL);
 static const JSTrampStepDef js_bigint_asUintN_def = PRIMARGS_DEF(PRIMARGS(0x3, HINT_NUMBER, 2), generic_magic, js_bigint_asUintN, 0);
 static const JSTrampStepDef js_bigint_asIntN_def  = PRIMARGS_DEF(PRIMARGS(0x3, HINT_NUMBER, 2), generic_magic, js_bigint_asUintN, 1);
 static int js_gopd_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
@@ -63659,6 +63709,12 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_STR_INDEXOF]     = &js_str_indexOf_def,
     [STEPDEF_STR_LASTINDEXOF] = &js_str_lastIndexOf_def,
     [STEPDEF_STR_NORMALIZE]   = &js_str_normalize_def,
+    [STEPDEF_STR_LOCALECOMPARE] = &js_str_localeCmp_def,
+#define DATE_SET_ENTRY(N, M) [STEPDEF_DATE_SET_##N] = &js_date_set_##N##_def,
+    DATE_SET_LIST(DATE_SET_ENTRY)
+#undef DATE_SET_ENTRY
+    [STEPDEF_DATE_SETTIME]  = &js_date_setTime_def,
+    [STEPDEF_DATE_SETYEAR]  = &js_date_setYear_def,
     [STEPDEF_STR_CHARAT]      = &js_str_charAt_def,
     [STEPDEF_STR_CHARCODEAT]  = &js_str_charCodeAt_def,
     [STEPDEF_TA_AT]           = &js_ta_at_def,
@@ -67602,6 +67658,8 @@ static int str_clamp(int64_t v, int len)
     return (int)v;
 }
 
+static int to_utf32_buf(JSContext *ctx, JSString *p, uint32_t **pbuf);
+
 static int js_str_recv_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSStrRecv *s = st;
@@ -67632,7 +67690,9 @@ static int js_str_recv_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
             cb_result = JS_UNDEFINED;
             if (r) return r < 0 ? -1 : r;
             break;
-        case STRRECV_INDEXOF: case STRRECV_LASTINDEXOF:
+        case STRRECV_INDEXOF: case STRRECV_LASTINDEXOF: case STRRECV_LOCALECOMPARE:
+            /* 22.1.3.12 step 3 is `? ToString(that)` — unconditional, so an absent argument coerces the
+               `undefined` rather than being skipped the way normalize's form is. */
             r = step_tostring_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->arg, out_cb, out_argc);
             cb_result = JS_UNDEFINED;
             if (r) return r < 0 ? -1 : r;
@@ -67812,6 +67872,32 @@ static int js_str_recv_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
             }
         }
         s->result = js_int32(ret);
+        return 0;
+    }
+    if (mode == STRRECV_LOCALECOMPARE) {
+        /* 22.1.3.12 with the default (root) locale: both operands are NFC-normalised and compared by code
+           point. Nothing below invokes user code — the two ToStrings above were the whole of it, and
+           js_string_localeCompare ran them from its C entry. */
+        uint32_t *as = NULL, *bs = NULL, *ts;
+        int an, bn, n, i, cmp;
+        an = to_utf32_buf(ctx, JS_VALUE_GET_STRING(s->str), &as);
+        bn = (an < 0) ? -1 : to_utf32_buf(ctx, JS_VALUE_GET_STRING(s->arg), &bs);
+        if (bn >= 0) {
+            an = unicode_normalize(&ts, as, an, UNICODE_NFC, ctx, (DynBufReallocFunc *)js_realloc);
+            if (an >= 0) { js_free(ctx, as); as = ts; }
+        }
+        if (an >= 0 && bn >= 0) {
+            bn = unicode_normalize(&ts, bs, bn, UNICODE_NFC, ctx, (DynBufReallocFunc *)js_realloc);
+            if (bn >= 0) { js_free(ctx, bs); bs = ts; }
+        }
+        if (an < 0 || bn < 0) { js_free(ctx, as); js_free(ctx, bs); return -1; }
+        n = min_int(an, bn);
+        for (i = 0; i < n; i++)
+            if (as[i] != bs[i])
+                break;
+        cmp = (i < n) ? compare_u32(as[i], bs[i]) : compare_u32(an, bn);
+        js_free(ctx, as); js_free(ctx, bs);
+        s->result = js_int32(cmp);
         return 0;
     }
     DCHECK(mode == STRRECV_NORMALIZE, "string receiver machine: unknown mode");
@@ -68901,66 +68987,10 @@ static int to_utf32_buf(JSContext *ctx, JSString *p, uint32_t **pbuf)
     return j;
 }
 
-static JSValue js_string_localeCompare(JSContext *ctx, JSValueConst this_val,
-                                       int argc, JSValueConst *argv)
-{
-    int i, n, an, bn, cmp;
-    uint32_t *as, *bs, *ts;
-    JSValue a, b, ret;
-
-    ret = JS_EXCEPTION;
-    as = NULL;
-    bs = NULL;
-
-    a = JS_ToStringCheckObject(ctx, this_val);
-    if (JS_IsException(a))
-        return JS_EXCEPTION;
-
-    b = JS_ToString(ctx, argv[0]);
-    if (JS_IsException(b))
-        goto exception;
-
-    an = to_utf32_buf(ctx, JS_VALUE_GET_STRING(a), &as);
-    if (an == -1)
-        goto exception;
-
-    bn = to_utf32_buf(ctx, JS_VALUE_GET_STRING(b), &bs);
-    if (bn == -1)
-        goto exception;
-
-    // TODO(bnoordhuis) skip normalization when input is latin1
-    an = unicode_normalize(&ts, as, an, UNICODE_NFC, ctx,
-                           (DynBufReallocFunc *)js_realloc);
-    if (an == -1)
-        goto exception;
-    js_free(ctx, as);
-    as = ts;
-
-    // TODO(bnoordhuis) skip normalization when input is latin1
-    bn = unicode_normalize(&ts, bs, bn, UNICODE_NFC, ctx,
-                           (DynBufReallocFunc *)js_realloc);
-    if (bn == -1)
-        goto exception;
-    js_free(ctx, bs);
-    bs = ts;
-
-    n = min_int(an, bn);
-    for (i = 0; i < n; i++)
-        if (as[i] != bs[i])
-            break;
-    if (i < n)
-        cmp = compare_u32(as[i], bs[i]);
-    else
-        cmp = compare_u32(an, bn);
-    ret = js_int32(cmp);
-
-exception:
-    JS_FreeValue(ctx, a);
-    JS_FreeValue(ctx, b);
-    js_free(ctx, as);
-    js_free(ctx, bs);
-    return ret;
-}
+/* DELETED: js_string_localeCompare. Its two ToStrings — the receiver's and `that`'s — were the only user code
+   in it and both ran from the C entry, so `"a".localeCompare({toString(){for(;;){}}})` preempted with no flow
+   base. The comparison itself is STRRECV_LOCALECOMPARE's tail: the same machine that already owns "coerce the
+   receiver to a string, coerce one argument, then compute". */
 
 static JSValue js_string_toLowerCase(JSContext *ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv, int to_lower)
@@ -69186,7 +69216,7 @@ static const JSCFunctionListEntry js_string_proto_funcs[] = {
     JS_ALIAS_DEF("trimLeft", "trimStart" ),
     JS_CFUNC_DEF("toString", 0, js_string_toString ),
     JS_CFUNC_DEF("valueOf", 0, js_string_toString ),
-    JS_CFUNC_DEF("localeCompare", 1, js_string_localeCompare ),
+    JS_CFUNC_STEP_DEF("localeCompare", 1, STEPDEF_STR_LOCALECOMPARE ),
     JS_CFUNC_STEP_DEF("normalize", 0, STEPDEF_STR_NORMALIZE ),
     JS_CFUNC_MAGIC_DEF("toLowerCase", 0, js_string_toLowerCase, 1 ),
     JS_CFUNC_MAGIC_DEF("toUpperCase", 0, js_string_toLowerCase, 0 ),
@@ -79109,40 +79139,84 @@ static JSValue get_date_field(JSContext *ctx, JSValueConst this_val,
     return js_number(fields[n]);
 }
 
-static JSValue set_date_field(JSContext *ctx, JSValueConst this_val,
-                              int argc, JSValueConst *argv, int magic)
+/* 21.4.4.27 step 1: RequireInternalSlot(dateObject, [[DateValue]]) precedes setTime's ToNumber, so a receiver
+   that is not a Date throws before the page's valueOf runs rather than after it. */
+static int js_date_this_precheck(JSContext *ctx, JSStepHdr *h)
 {
-    // _field(obj, first_field, end_field, args, is_local)
-    double fields[9];
-    int res, first_field, end_field, is_local, i, n;
-    double d, a;
+    double d;
+    return JS_ThisTimeValue(ctx, &d, h->this_val);
+}
 
-    d = NAN;
-    first_field = (magic >> 8) & 0x0F;
-    end_field = (magic >> 4) & 0x0F;
-    is_local = magic & 0x0F;
+/* DELETED: set_date_field and js_date_setYear. Both ran their ToNumbers with JS_ToFloat64 from a C entry, and
+   js_date_setYear then re-entered set_date_field, which read [[DateValue]] a SECOND time — after the coercion
+   that may have changed it. The one machine below performs the read once, at the step the spec puts it. */
+static int js_date_set_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSDateSet *s = st;
+    int magic = s->hdr.arg;
+    int first_field = (magic >> 8) & 0xF, end_field = (magic >> 4) & 0xF, is_local = magic & 0xF;
+    int r;
+    double a, d;
 
-    res = get_date_fields(ctx, this_val, fields, is_local, first_field == 0);
-    if (res < 0)
-        return JS_EXCEPTION;
-
-    // Argument coercion is observable and must be done unconditionally.
-    n = min_int(argc, end_field - first_field);
-    for(i = 0; i < n; i++) {
-        if (JS_ToFloat64(ctx, &a, argv[i]))
-            return JS_EXCEPTION;
-        if (!isfinite(a))
-            res = false;
-        fields[first_field + i] = trunc(a);
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result);
+        cb_result = JS_UNDEFINED;
+        s->result = JS_UNDEFINED;
+        /* steps 1-2: RequireInternalSlot and the [[DateValue]] read, both BEFORE the first coercion. `first_field
+           == 0` is B.2.3.1 step 4 / 21.4.4.21 step 4 — the setters that write the YEAR treat a NaN time value as
+           +0 instead of returning early. */
+        s->res = get_date_fields(ctx, s->hdr.this_val, s->fields, is_local, first_field == 0);
+        if (s->res < 0)
+            return -1;
+        s->n = min_int(s->hdr.argc, end_field - first_field);
+        s->i = 0;
+        s->nonfinite = false;
+        s->hdr.stage = 1;
     }
+    /* steps 3-6: every named argument, in argument order, and one beyond the count is not read at all. Each is
+       the page's code, which is the whole reason this is a machine. */
+    while (s->i < s->n) {
+        r = step_tofloat64_run(ctx, &s->hdr, step_arg(&s->hdr, s->i), cb_result, &a, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        if (magic & DATE_SET_MAKEFULLYEAR) {
+            /* B.2.3.1 step 5 MakeFullYear: a two-digit year is 1900-relative, and a NaN stays NaN. */
+            if (isfinite(a)) {
+                a = trunc(a);
+                if (a >= 0 && a < 100)
+                    a += 1900;
+            }
+        }
+        if (!isfinite(a))
+            s->nonfinite = true;
+        s->fields[first_field + s->i] = trunc(a);
+        s->i++;
+    }
+    JS_FreeValue(ctx, cb_result);
 
-    if (!res)
-        return JS_NAN;
+    /* step 7: `If t is NaN, return NaN` — on the value read at step 2, and the [[DateValue]] is NOT written. */
+    if (!s->res) {
+        s->result = JS_NAN;
+        return 0;
+    }
+    /* A NON-FINITE ARGUMENT is a different thing entirely: MakeTime/MakeDay yield NaN, TimeClip yields NaN, and
+       step 14 STORES it. One `res` flag stood for both, so `new Date(0).setUTCHours(Infinity)` returned NaN and
+       left the Date VALID — and so did setUTCFullYear(NaN) and every other setter given an infinity. It is also
+       the one case set_date_fields cannot be handed: a NaN field reaches days_from_year((int)NaN). */
+    d = NAN;
+    if (s->hdr.argc > 0)
+        d = s->nonfinite ? NAN : set_date_fields(s->fields, is_local);
+    s->result = JS_SetThisTimeValue(ctx, s->hdr.this_val, d);
+    return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
+}
 
-    if (argc > 0)
-        d = set_date_fields(fields, is_local);
-
-    return JS_SetThisTimeValue(ctx, this_val, d);
+static JSValue js_date_set_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSDateSet *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    js_free(ctx, s);
+    return r;
 }
 
 /* fmt:
@@ -79800,28 +79874,6 @@ static JSValue js_date_setTime(JSContext *ctx, JSValueConst this_val,
     return JS_SetThisTimeValue(ctx, this_val, time_clip(v));
 }
 
-static JSValue js_date_setYear(JSContext *ctx, JSValueConst this_val,
-                               int argc, JSValueConst *argv)
-{
-    // setYear(y)
-    double y;
-    JSValue d, ret;
-
-    if (JS_ThisTimeValue(ctx, &y, this_val) || JS_ToFloat64(ctx, &y, argv[0]))
-        return JS_EXCEPTION;
-    y = +y;
-    if (isnan(y))
-        return JS_SetThisTimeValue(ctx, this_val, y);
-    if (isfinite(y)) {
-        y = trunc(y);
-        if (y >= 0 && y < 100)
-            y += 1900;
-    }
-    d = js_float64(y);
-    ret = set_date_field(ctx, this_val, 1, vc(&d), 0x011);
-    JS_FreeValue(ctx, d);
-    return ret;
-}
 
 
 static const JSCFunctionListEntry js_date_funcs[] = {
@@ -79861,22 +79913,22 @@ static const JSCFunctionListEntry js_date_proto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("getUTCMilliseconds", 0, get_date_field, 0x60 ),
     JS_CFUNC_MAGIC_DEF("getDay", 0, get_date_field, 0x71 ),
     JS_CFUNC_MAGIC_DEF("getUTCDay", 0, get_date_field, 0x70 ),
-    JS_CFUNC_DEF("setTime", 1, js_date_setTime ),
-    JS_CFUNC_MAGIC_DEF("setMilliseconds", 1, set_date_field, 0x671 ),
-    JS_CFUNC_MAGIC_DEF("setUTCMilliseconds", 1, set_date_field, 0x670 ),
-    JS_CFUNC_MAGIC_DEF("setSeconds", 2, set_date_field, 0x571 ),
-    JS_CFUNC_MAGIC_DEF("setUTCSeconds", 2, set_date_field, 0x570 ),
-    JS_CFUNC_MAGIC_DEF("setMinutes", 3, set_date_field, 0x471 ),
-    JS_CFUNC_MAGIC_DEF("setUTCMinutes", 3, set_date_field, 0x470 ),
-    JS_CFUNC_MAGIC_DEF("setHours", 4, set_date_field, 0x371 ),
-    JS_CFUNC_MAGIC_DEF("setUTCHours", 4, set_date_field, 0x370 ),
-    JS_CFUNC_MAGIC_DEF("setDate", 1, set_date_field, 0x231 ),
-    JS_CFUNC_MAGIC_DEF("setUTCDate", 1, set_date_field, 0x230 ),
-    JS_CFUNC_MAGIC_DEF("setMonth", 2, set_date_field, 0x131 ),
-    JS_CFUNC_MAGIC_DEF("setUTCMonth", 2, set_date_field, 0x130 ),
-    JS_CFUNC_DEF("setYear", 1, js_date_setYear ),
-    JS_CFUNC_MAGIC_DEF("setFullYear", 3, set_date_field, 0x031 ),
-    JS_CFUNC_MAGIC_DEF("setUTCFullYear", 3, set_date_field, 0x030 ),
+    JS_CFUNC_STEP_DEF("setTime", 1, STEPDEF_DATE_SETTIME ),
+    JS_CFUNC_STEP_DEF("setMilliseconds", 1, STEPDEF_DATE_SET_MILLISECONDS ),
+    JS_CFUNC_STEP_DEF("setUTCMilliseconds", 1, STEPDEF_DATE_SET_UTC_MILLISECONDS ),
+    JS_CFUNC_STEP_DEF("setSeconds", 2, STEPDEF_DATE_SET_SECONDS ),
+    JS_CFUNC_STEP_DEF("setUTCSeconds", 2, STEPDEF_DATE_SET_UTC_SECONDS ),
+    JS_CFUNC_STEP_DEF("setMinutes", 3, STEPDEF_DATE_SET_MINUTES ),
+    JS_CFUNC_STEP_DEF("setUTCMinutes", 3, STEPDEF_DATE_SET_UTC_MINUTES ),
+    JS_CFUNC_STEP_DEF("setHours", 4, STEPDEF_DATE_SET_HOURS ),
+    JS_CFUNC_STEP_DEF("setUTCHours", 4, STEPDEF_DATE_SET_UTC_HOURS ),
+    JS_CFUNC_STEP_DEF("setDate", 1, STEPDEF_DATE_SET_DATE ),
+    JS_CFUNC_STEP_DEF("setUTCDate", 1, STEPDEF_DATE_SET_UTC_DATE ),
+    JS_CFUNC_STEP_DEF("setMonth", 2, STEPDEF_DATE_SET_MONTH ),
+    JS_CFUNC_STEP_DEF("setUTCMonth", 2, STEPDEF_DATE_SET_UTC_MONTH ),
+    JS_CFUNC_STEP_DEF("setYear", 1, STEPDEF_DATE_SETYEAR ),
+    JS_CFUNC_STEP_DEF("setFullYear", 3, STEPDEF_DATE_SET_FULLYEAR ),
+    JS_CFUNC_STEP_DEF("setUTCFullYear", 3, STEPDEF_DATE_SET_UTC_FULLYEAR ),
     JS_CFUNC_STEP_DEF("toJSON", 1, STEPDEF_DATE_TOJSON ),
 };
 
