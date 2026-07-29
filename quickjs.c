@@ -19136,7 +19136,6 @@ typedef struct JSGetProp {
 
 /* 10.5.11 steps 8-22 applied to the trap's result, then CreateArrayFromList over the validated keys — the
    answer GP_OWNKEYS delivers. CONSUMES prop_array. */
-static JSValue js_proxy_ownkeys_result(JSContext *ctx, JSValueConst proxy, JSValue prop_array);
 static JSValue js_proxy_getproto_invariant(JSContext *ctx, JSValueConst obj, JSValue ret);
 static int js_proxy_ext_invariant(JSContext *ctx, JSValueConst obj, bool prevent, int res);
 static int js_proxy_setproto_invariant(JSContext *ctx, JSValueConst target, JSValueConst proto_val, int res);
@@ -19995,6 +19994,11 @@ _Static_assert(CONT_ITER_CONSUME_FWD == CONT_ITER_CONSUME, "the forward alias us
 _Static_assert(CONT_PROMISE_ALL_FWD == CONT_PROMISE_ALL, "the forward alias used by the capability abandon must equal CONT_PROMISE_ALL");
 _Static_assert(CONT_ITER_HELPER_FWD == CONT_ITER_HELPER, "the forward alias used by the abandon walk must equal CONT_ITER_HELPER");
 
+#define CONT_OWNKEYS_CHK   57  /* gp_outer = JSOwnKeysChk: 10.5.11's invariant, which reaches the object the
+                                  `ownKeys` trap RETURNED (CreateListFromArrayLike) and three internal methods on
+                                  the TARGET. js_proxy_ownkeys_check ran all six from C, so a proxy whose target
+                                  is a proxy with an `ownKeys` trap had no flow base. */
+
 #define CONT_FOR_IN_HAS    56  /* cont_state = NULL: OP_for_in_next's "was this key deleted?" HasProperty, whose
                                   answer decides whether the key is yielded or the loop moves to the next
                                   candidate. It carries no state because the candidate rides the ITERATOR, which
@@ -20061,6 +20065,7 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_GOPD_DESC:
     case CONT_OP_KEYED:
     case CONT_FOR_IN_HAS:
+    case CONT_OWNKEYS_CHK:
         break;
     }
 }
@@ -20631,6 +20636,8 @@ static bool tramp_can_call_promise_all(JSContext *ctx, JSValueConst func, JSValu
    frame's next call. It is the create's counterpart to js_construct_requester_abandon and covers the create's own
    kind set; a kind with no teardown here CRASHES rather than leaking silently. CONT_ITER_HELPER is listed and does
    nothing on purpose — the helper is a GC object, so dropping the link is the whole teardown. */
+struct JSOwnKeysChk;
+static void js_ownkeys_chk_free(JSContext *ctx, struct JSOwnKeysChk *ok);
 static void js_create_requester_abandon(JSContext *ctx, void *cont, uint8_t kind)
 {
     /* keyed on the KIND, never on the pointer: a continuation whose whole state IS its kind carries a NULL one
@@ -20642,6 +20649,7 @@ static void js_create_requester_abandon(JSContext *ctx, void *cont, uint8_t kind
     if (kind == CONT_ITER_HELPER || kind == CONT_INSTANCEOF || kind == CONT_SETTER
         || kind == CONT_FOROF_NEXT || kind == CONT_ITER_NEXT_OP || kind == CONT_FOR_IN_HAS)
         return;   /* no owned state: the kind IS the continuation (or the helper is a GC object) */
+    if (kind == CONT_OWNKEYS_CHK) { js_ownkeys_chk_free(ctx, cont); return; }
     if (kind == CONT_STEP) { tramp_step_chain_free(ctx, cont); return; }
     if (kind == CONT_PROMISE_ALL) {
         js_promise_all_end(ctx, (struct JSPromiseAll *)cont); js_free_rt(ctx->rt, cont); return;
@@ -21114,6 +21122,8 @@ static void js_desc_cursor_free(JSContext *ctx, JSDescCursor *c)
     JS_FreeValue(ctx, c->setter);
 }
 
+static int find_prop_key(const JSPropertyEnum *tab, int n, JSAtom atom);
+
 typedef struct JSGopdDesc {
     JSValue obj;         /* the proxy the [[GetOwnProperty]] is on (owned) */
     JSValue target;      /* its [[Target]] — the receiver of steps 10 and 12 (owned) */
@@ -21142,6 +21152,122 @@ static void js_gopd_desc_free(JSContext *ctx, JSGopdDesc *gd)
     JS_FreeValue(ctx, gd->trap_res);
     JS_FreeAtom(ctx, gd->atom);
     js_free_rt(ctx->rt, gd);
+}
+
+/* ---- 10.5.11 [[OwnPropertyKeys]]'s invariant, as a phased machine ----
+
+   js_proxy_ownkeys_check ran SIX of the page's operations from C. Three are on the object the trap RETURNED —
+   CreateListFromArrayLike's `length` read and one read per index — and three are internal methods ON THE
+   TARGET: IsExtensible, [[OwnPropertyKeys]], and one [[GetOwnProperty]] per target key. When the target is
+   itself a Proxy those last three are its traps, which is why a proxy whose target is a proxy with an
+   `ownKeys` trap aborted with no flow base whichever consumer reached it.
+
+   The same shape JSGopdDesc took, one internal method over, and out of the same primitives: GP_ISEXT,
+   GP_OWNKEYS, and the GP_GETOWNPROP `want_flags` answer built for exactly this — a per-key loop that wants
+   attribute bits, not descriptor objects. The CHECKS are unchanged and stay in one place; only how the facts
+   are obtained differs between this and the C hook. */
+typedef struct JSOwnKeysChk {
+    JSValue obj;          /* the proxy (owned) */
+    JSValue target;       /* its [[Target]] (owned) */
+    JSValue trap_res;     /* the array the trap returned (owned) */
+    JSValue tkeys;        /* the target's own-key array, once step 15 has produced it (owned) */
+    void *outer;          /* what is waiting on the OPERATION */
+    uint8_t outer_kind;
+    uint8_t phase;        /* OKC_* */
+    JSPropertyEnum *tab;  /* the trap's keys, validated (owned) */
+    uint32_t len;
+    JSPropertyEnum *tab2; /* the target's own keys (owned) */
+    uint32_t len2;
+    uint32_t i;           /* whichever loop is running */
+    int64_t rlen;         /* CreateListFromArrayLike's length */
+    int is_extensible;
+} JSOwnKeysChk;
+enum { OKC_LEN = 0, OKC_LEN_GOT, OKC_ELEM, OKC_ELEM_GOT,
+       OKC_EXT, OKC_EXT_GOT, OKC_TKEYS, OKC_TKEYS_GOT, OKC_TDESC, OKC_TDESC_GOT };
+
+static void js_ownkeys_chk_free(JSContext *ctx, struct JSOwnKeysChk *ok)
+{
+    if (ok->tab) js_free_prop_enum(ctx, ok->tab, ok->len);
+    if (ok->tab2) js_free_prop_enum(ctx, ok->tab2, ok->len2);
+    JS_FreeValue(ctx, ok->obj);
+    JS_FreeValue(ctx, ok->target);
+    JS_FreeValue(ctx, ok->trap_res);
+    JS_FreeValue(ctx, ok->tkeys);
+    js_free_rt(ctx->rt, ok);
+}
+
+/* Turn an engine-built key ARRAY into an atom snapshot. It reads nothing of the page's: every [[OwnPropertyKeys]]
+   answer is an array THIS engine built, of Strings and Symbols the invariant has already validated. */
+static int js_ownkeys_atoms(JSContext *ctx, JSValueConst arr, JSPropertyEnum **ptab, uint32_t *plen)
+{
+    uint32_t n = 0, i;
+    JSPropertyEnum *tab = NULL;
+    if (js_get_length32(ctx, &n, arr))
+        return -1;
+    if (n) {
+        tab = js_mallocz(ctx, sizeof(tab[0]) * n);
+        if (!tab) return -1;
+    }
+    for (i = 0; i < n; i++) {
+        JSValue kv = JS_GetPropertyUint32(ctx, arr, i);
+        JSAtom at;
+        if (JS_IsException(kv)) { js_free_prop_enum(ctx, tab, i); return -1; }
+        at = JS_ValueToAtom(ctx, kv);
+        JS_FreeValue(ctx, kv);
+        if (at == JS_ATOM_NULL) { js_free_prop_enum(ctx, tab, i); return -1; }
+        tab[i].atom = at;
+        tab[i].is_enumerable = false;
+    }
+    *ptab = tab; *plen = n;
+    return 0;
+}
+
+/* 10.5.11 steps 8-9 on the collected trap keys: they must be unique. No user code. */
+static int js_ownkeys_no_duplicates(JSContext *ctx, JSPropertyEnum *tab, uint32_t len)
+{
+    uint32_t i;
+    for (i = 1; i < len; i++) {
+        if (find_prop_key(tab, i, tab[i].atom) >= 0) {
+            JS_ThrowTypeError(ctx, "proxy: duplicate property");
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* 10.5.11 steps 17-21 for ONE target key whose descriptor flags have arrived: a non-configurable one, and every
+   one at all when the target is not extensible, must appear in the trap's list. `tab[idx].is_enumerable` is the
+   "seen" marker the final sweep reads. Returns 0 = fine, -1 = threw. */
+static int js_ownkeys_target_key(JSContext *ctx, JSOwnKeysChk *ok, JSAtom atom, int found, int desc_flags)
+{
+    int idx;
+    if (!found)
+        return 0;   /* the property went away between the walk and the read */
+    if ((desc_flags & JS_PROP_CONFIGURABLE) && ok->is_extensible)
+        return 0;
+    idx = find_prop_key(ok->tab, ok->len, atom);
+    if (idx < 0) {
+        JS_ThrowTypeError(ctx, "proxy: target property must be present in proxy ownKeys");
+        return -1;
+    }
+    if (!ok->is_extensible)
+        ok->tab[idx].is_enumerable = true;
+    return 0;
+}
+
+/* 10.5.11 step 22: on a non-extensible target the two lists must match exactly, so nothing may be left unseen. */
+static int js_ownkeys_final(JSContext *ctx, JSOwnKeysChk *ok)
+{
+    uint32_t i;
+    if (ok->is_extensible)
+        return 0;
+    for (i = 0; i < ok->len; i++) {
+        if (!ok->tab[i].is_enumerable) {
+            JS_ThrowTypeError(ctx, "proxy: property not present in target");
+            return -1;
+        }
+    }
+    return 0;
 }
 
 /* Is this FromPropertyDescriptor result enumerable? The read invokes nothing — every GP_GETOWNPROP delivery
@@ -26162,6 +26288,155 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
 
+        do_ownkeys_chk_step:
+            /* 10.5.11 steps 7-22, one request at a time. `ret_val` is the previous one's answer (UNINITIALIZED
+               on entry). Steps 7-9 walk the object the TRAP returned; steps 14-16 and 17-21 are internal
+               methods on the TARGET, which for a Proxy target are its traps. When it finishes, the operation
+               waiting on it is handed the ARRAY CreateArrayFromList builds from the validated keys. */
+            {
+                JSOwnKeysChk *ok = (JSOwnKeysChk *)cont_st;
+                cont_st = NULL;
+                for (;;) {
+                    if (ok->phase == OKC_LEN) {
+                        ok->phase = OKC_LEN_GOT;
+                        gp_obj = ok->trap_res; gp_atom = JS_ATOM_length;
+                        gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                        gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
+                        gp_outer = ok; gp_outer_kind = CONT_OWNKEYS_CHK;
+                        goto do_getprop_tramp;
+                    }
+                    if (ok->phase == OKC_LEN_GOT) {
+                        /* CreateListFromArrayLike's LengthOfArrayLike. The ToLength that finishes it runs
+                           nothing once the read has produced a value. */
+                        if (JS_ToLengthFree(ctx, &ok->rlen, ret_val)) { ret_val = JS_UNDEFINED; goto okc_throw; }
+                        ret_val = JS_UNDEFINED;
+                        if (ok->rlen > 0) {
+                            ok->tab = js_mallocz(ctx, sizeof(ok->tab[0]) * (size_t)ok->rlen);
+                            if (!ok->tab) goto okc_throw;
+                        }
+                        ok->len = 0; ok->i = 0;
+                        ok->phase = OKC_ELEM;
+                    }
+                    if (ok->phase == OKC_ELEM) {
+                        if ((int64_t)ok->i >= ok->rlen) {
+                            if (js_ownkeys_no_duplicates(ctx, ok->tab, ok->len) < 0) goto okc_throw;
+                            ok->phase = OKC_EXT;
+                            continue;
+                        }
+                        ok->phase = OKC_ELEM_GOT;
+                        gp_obj = ok->trap_res; gp_atom = JS_NewAtomInt64(ctx, (int64_t)ok->i);
+                        if (gp_atom == JS_ATOM_NULL) goto okc_throw;
+                        gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                        gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
+                        gp_outer = ok; gp_outer_kind = CONT_OWNKEYS_CHK;
+                        goto do_getprop_tramp;
+                    }
+                    if (ok->phase == OKC_ELEM_GOT) {
+                        /* step 7's element type check, then the atom the rest of the algorithm compares by. */
+                        JSAtom at;
+                        if (!JS_IsString(ret_val) && !JS_IsSymbol(ret_val)) {
+                            JS_FreeValue(ctx, ret_val); ret_val = JS_UNDEFINED;
+                            JS_ThrowTypeError(ctx, "proxy: properties must be strings or symbols");
+                            goto okc_throw;
+                        }
+                        at = JS_ValueToAtom(ctx, ret_val);
+                        JS_FreeValue(ctx, ret_val); ret_val = JS_UNDEFINED;
+                        if (at == JS_ATOM_NULL) goto okc_throw;
+                        ok->tab[ok->len].atom = at;
+                        ok->tab[ok->len].is_enumerable = false;
+                        ok->len++;
+                        ok->i++;
+                        ok->phase = OKC_ELEM;
+                        continue;
+                    }
+                    if (ok->phase == OKC_EXT) {
+                        /* 10.5.11 re-reads [[IsRevoked]] AFTER the trap returned — the trap can revoke its own
+                           proxy, and steps 14 onward are on a target it may no longer name. Checked here and
+                           again per key below, exactly where the C form checked it. */
+                        if (((JSProxyData *)JS_VALUE_GET_OBJ(ok->obj)->u.opaque)->is_revoked) {
+                            JS_ThrowTypeErrorRevokedProxy(ctx);
+                            goto okc_throw;
+                        }
+                        ok->phase = OKC_EXT_GOT;
+                        gp_obj = ok->target; gp_atom = JS_ATOM_NULL;
+                        gp_op = GP_ISEXT; gp_val = JS_UNDEFINED;
+                        gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
+                        gp_outer = ok; gp_outer_kind = CONT_OWNKEYS_CHK;
+                        goto do_getprop_tramp;
+                    }
+                    if (ok->phase == OKC_EXT_GOT) {
+                        ok->is_extensible = JS_ToBoolFree(ctx, ret_val);
+                        ret_val = JS_UNDEFINED;
+                        ok->phase = OKC_TKEYS;
+                    }
+                    if (ok->phase == OKC_TKEYS) {
+                        ok->phase = OKC_TKEYS_GOT;
+                        gp_obj = ok->target; gp_atom = JS_ATOM_NULL;
+                        gp_op = GP_OWNKEYS; gp_val = JS_UNDEFINED;
+                        gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
+                        gp_outer = ok; gp_outer_kind = CONT_OWNKEYS_CHK;
+                        goto do_getprop_tramp;
+                    }
+                    if (ok->phase == OKC_TKEYS_GOT) {
+                        ok->tkeys = ret_val; ret_val = JS_UNDEFINED;
+                        if (js_ownkeys_atoms(ctx, ok->tkeys, &ok->tab2, &ok->len2) < 0) goto okc_throw;
+                        ok->i = 0;
+                        ok->phase = OKC_TDESC;
+                    }
+                    if (ok->phase == OKC_TDESC) {
+                        if (((JSProxyData *)JS_VALUE_GET_OBJ(ok->obj)->u.opaque)->is_revoked) {
+                            JS_ThrowTypeErrorRevokedProxy(ctx);
+                            goto okc_throw;
+                        }
+                        if (ok->i >= ok->len2) {
+                            JSValue res;
+                            if (js_ownkeys_final(ctx, ok) < 0) goto okc_throw;
+                            /* CreateArrayFromList over the VALIDATED trap keys — the answer the operation owes. */
+                            res = JS_NewArray(ctx);
+                            if (!JS_IsException(res)) {
+                                uint32_t k;
+                                for (k = 0; k < ok->len; k++) {
+                                    JSValue kv = JS_AtomToValue(ctx, ok->tab[k].atom);
+                                    if (JS_IsException(kv)
+                                        || JS_CreateDataPropertyUint32(ctx, res, k, kv, 0) < 0) {
+                                        JS_FreeValue(ctx, res); res = JS_EXCEPTION;
+                                        break;
+                                    }
+                                }
+                            }
+                            gp_outer = ok->outer; gp_outer_kind = ok->outer_kind;
+                            js_ownkeys_chk_free(ctx, ok);
+                            if (JS_IsException(res)) goto getprop_throw;
+                            ret_val = res;
+                            goto do_getprop_complete;
+                        }
+                        ok->phase = OKC_TDESC_GOT;
+                        gp_obj = ok->target; gp_atom = ok->tab2[ok->i].atom;
+                        gp_op = GP_GETOWNPROP; gp_val = JS_UNDEFINED;
+                        gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
+                        gp_want_flags = 1;   /* the check wants the BITS: this is the loop want_flags exists for */
+                        gp_outer = ok; gp_outer_kind = CONT_OWNKEYS_CHK;
+                        goto do_getprop_tramp;
+                    }
+                    DCHECK(ok->phase == OKC_TDESC_GOT, "the ownKeys invariant resumed in no phase");
+                    {
+                        int tf;
+                        DCHECK(JS_VALUE_GET_TAG(ret_val) == JS_TAG_INT,
+                               "a want_flags [[GetOwnProperty]] must answer with an int");
+                        tf = JS_VALUE_GET_INT(ret_val);
+                        ret_val = JS_UNDEFINED;
+                        if (js_ownkeys_target_key(ctx, ok, ok->tab2[ok->i].atom, tf >= 0, tf >= 0 ? tf : 0) < 0)
+                            goto okc_throw;
+                        ok->i++;
+                        ok->phase = OKC_TDESC;
+                    }
+                }
+            okc_throw:
+                gp_outer = ok->outer; gp_outer_kind = ok->outer_kind;
+                js_ownkeys_chk_free(ctx, ok);
+                goto getprop_throw;
+            }
+
         do_gopd_desc_step:
             /* 10.5.5 step 13, one keyed operation at a time. `ret_val` is the previous one's answer
                (UNINITIALIZED on entry). When the walk finishes, steps 14-17 run on the parsed descriptor and the
@@ -26615,6 +26890,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                           cont_st = gouter0;
                           goto do_opkeyed_place;
                       }
+                      if (gk == CONT_OWNKEYS_CHK) {
+                          /* the [[OwnPropertyKeys]] invariant's own request, answered with nothing suspended —
+                             every ordinary target. Back into the machine at the phase that asked. */
+                          cont_st = gouter0;
+                          goto do_ownkeys_chk_step;
+                      }
                       if (gk == CONT_FOR_IN_HAS) {
                           /* for-in's deletion check, answered with nothing suspended — every ordinary receiver.
                              The loop it re-enters is the opcode's, one implementation for both arms. */
@@ -26757,6 +27038,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         JSGopdDesc *gd = gouter;
                         gp_outer = gd->outer; gp_outer_kind = gd->outer_kind;
                         js_gopd_desc_free(ctx, gd);
+                        goto getprop_throw;
+                    }
+                    if (gk3 == CONT_OWNKEYS_CHK) {
+                        /* one of the ownKeys invariant's own reads threw in place — a poisoned index getter on
+                           the trap's result, a revoked target. Same unwind as its sibling above: the operation
+                           the check is parked inside can never finish. */
+                        JSOwnKeysChk *okt = gouter;
+                        gp_outer = okt->outer; gp_outer_kind = okt->outer_kind;
+                        js_ownkeys_chk_free(ctx, okt);
                         goto getprop_throw;
                     }
                     if (gk3 == CONT_TRAP_GET) {
@@ -29657,7 +29947,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            || gouter_kind == CONT_PROMISE_ALL_NEXT_GET || gouter_kind == CONT_ITER_FROM_NEXT_GET
                            || gouter_kind == CONT_PROMISE_ALL_THEN || gouter_kind == CONT_AFS_GET
                            || gouter_kind == CONT_ITER_HELPER_GET || gouter_kind == CONT_PROMISE_ALL_GET
-                           || gouter_kind == CONT_FOROF_UNPACK || gouter_kind == CONT_FOR_IN_HAS,
+                           || gouter_kind == CONT_FOROF_UNPACK || gouter_kind == CONT_FOR_IN_HAS
+                           || gouter_kind == CONT_OWNKEYS_CHK,
                            "property-get outer continuation: unknown machine kind");
                     if (gouter_kind == CONT_PROMISE_ALL_THEN) {
                         js_getprop_free(ctx, gp);
@@ -29834,10 +30125,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             goto do_gopd_desc_step;
                         }
                     } else if (gp->op == GP_OWNKEYS) {
-                        /* the `ownKeys` trap returned its List. 10.5.11 steps 8-22 run on it — the same check the
-                           C hook performs, shared so the two cannot drift — and what the machine is handed is the
-                           ARRAY CreateArrayFromList builds from the validated keys. */
-                        ret_val = js_proxy_ownkeys_result(ctx, gp->value, ret_val);
+                        /* the `ownKeys` trap returned its List, and 10.5.11 steps 7-22 run on it. Three of them
+                           read the object the TRAP returned and three are internal methods on the TARGET, so
+                           all six belong to the machine below — js_proxy_ownkeys_check ran every one from C. */
+                        if (JS_IsException(ret_val)) {
+                            /* the trap threw: there is nothing to check. */
+                        } else {
+                            JSOwnKeysChk *ok = js_mallocz(ctx, sizeof(*ok));
+                            if (unlikely(!ok)) {
+                                JS_FreeValue(ctx, ret_val); JS_ThrowOutOfMemory(ctx); ret_val = JS_EXCEPTION;
+                            } else {
+                                JSProxyData *pd6 = JS_VALUE_GET_OBJ(gp->value)->u.opaque;
+                                ok->obj = js_dup(gp->value);
+                                ok->target = js_dup(pd6->target);
+                                ok->trap_res = ret_val;
+                                ok->tkeys = JS_UNDEFINED;
+                                ok->outer = gouter; ok->outer_kind = gouter_kind;
+                                ok->phase = OKC_LEN;
+                                js_getprop_free(ctx, gp);
+                                cont_st = ok;
+                                ret_val = JS_UNINITIALIZED;
+                                goto do_ownkeys_chk_step;
+                            }
+                        }
                     } else if (gp->op == GP_SETPROTO) {
                         /* the trap's boolean, then 10.5.2's invariant: a true result on a non-extensible target
                            requires the prototype to be the one it already has. The proxy is the RECEIVER slot,
@@ -29908,6 +30218,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         /* for-in's deletion check whose `has` trap SUSPENDED. Same restoration as above, so the
                            iterator is back at sp[-1] and the loop resumes exactly where it asked. */
                         goto do_for_in_has_deliver;
+                    }
+                    if (gouter_kind == CONT_OWNKEYS_CHK) {
+                        /* one of the [[OwnPropertyKeys]] invariant's own requests — a trap-result read, or one
+                           of the three internal methods on the target — whose trap suspended. */
+                        cont_st = gouter;
+                        if (unlikely(JS_IsException(ret_val))) {
+                            JSOwnKeysChk *okx = gouter;
+                            gp_outer = okx->outer; gp_outer_kind = okx->outer_kind;
+                            js_ownkeys_chk_free(ctx, okx);
+                            goto getprop_throw;
+                        }
+                        goto do_ownkeys_chk_step;
                     }
                     if (gouter_kind == CONT_GOPD_DESC) {
                         /* one of the [[GetOwnProperty]] invariant's OWN requests — step 10's target descriptor or
@@ -33888,6 +34210,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             uint8_t gk2 = gp->outer_kind;
             DCHECK(!gouter || gk2 == CONT_STEP || gk2 == CONT_ITER_CONSUME || gk2 == CONT_ACQUIRE_GET
                    || gk2 == CONT_ITER_CLOSE || gk2 == CONT_TRAP_GET || gk2 == CONT_GOPD_DESC
+                   || gk2 == CONT_OWNKEYS_CHK
                    || gk2 == CONT_OP_KEYED
                    || gk2 == CONT_PROMISE_ALL_THEN || gk2 == CONT_AFS_GET
                    || gk2 == CONT_ITER_HELPER_GET || gk2 == CONT_PROMISE_ALL_GET
@@ -33959,6 +34282,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSGopdDesc *gd = gouter;
                 gp_outer = gd->outer; gp_outer_kind = gd->outer_kind;
                 js_gopd_desc_free(ctx, gd);
+                goto getprop_throw;
+            } else if (gouter && gk2 == CONT_OWNKEYS_CHK) {
+                /* the same for the ownKeys invariant, whose reads suspend for exactly the same reasons. */
+                JSOwnKeysChk *okt = gouter;
+                gp_outer = okt->outer; gp_outer_kind = okt->outer_kind;
+                js_ownkeys_chk_free(ctx, okt);
                 goto getprop_throw;
             } else if (gouter && gk2 == CONT_TRAP_GET) {
                 /* a handler's trap ACCESSOR (or a handler-Proxy's own `get` trap) threw after suspending. The
@@ -72488,24 +72817,10 @@ static int js_proxy_ownkeys_check(JSContext *ctx, JSValueConst obj, JSValue prop
     return -1;
 }
 
-static JSValue js_proxy_ownkeys_result(JSContext *ctx, JSValueConst proxy, JSValue prop_array)
-{
-    JSPropertyEnum *tab = NULL;
-    uint32_t len = 0, i;
-    JSValue r;
-    if (JS_IsException(prop_array)) return prop_array;   /* the trap threw: nothing to check */
-    if (js_proxy_ownkeys_check(ctx, proxy, prop_array, &tab, &len) < 0)
-        return JS_EXCEPTION;
-    r = JS_NewArray(ctx);
-    for (i = 0; i < len && !JS_IsException(r); i++) {
-        JSValue kv = JS_AtomToValue(ctx, tab[i].atom);
-        if (JS_IsException(kv) || JS_CreateDataPropertyUint32(ctx, r, i, kv, 0) < 0) {
-            JS_FreeValue(ctx, r); r = JS_EXCEPTION;
-        }
-    }
-    js_free_prop_enum(ctx, tab, len);
-    return r;
-}
+/* DELETED: js_proxy_ownkeys_result. It was 10.5.11's whole check performed from C at the routed delivery — the
+   trap-result array walk and the three internal methods on the target — and the machine above performs it as
+   requests. Its last caller went with it; keeping it beside the machine is the dual system these conversions
+   exist to close. js_proxy_ownkeys_check survives ONLY for the C hook, which is the counted, unrouted path. */
 
 static int js_proxy_get_own_property_names(JSContext *ctx,
                                            JSPropertyEnum **ptab,
