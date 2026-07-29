@@ -19719,7 +19719,7 @@ static bool ta_write_needs_toprim(JSContext *ctx, JSValueConst target, JSValueCo
 }
 typedef enum { ITERAT_DECLINE = 0, ITERAT_FOUND, ITERAT_ABSENT } JSIterAtState;
 static JSIterAtState iter_data_at_iterator(JSContext *ctx, JSValueConst items, JSValue *out);
-static bool tramp_can_call_gen_create(JSValueConst func);
+static bool tramp_body_is_gen(JSValueConst func);
 /* The same question for ANY key, on an object that is already an object: walk the prototype chain reading only OWN
    DATA properties. Both users need exactly this and neither may run user code to get it — the @@iterator probe
    above decides which algorithm a consumer takes, and the spread's fast-array check decides whether the built-in
@@ -20029,7 +20029,7 @@ static inline void cont_kinds_are_distinct(int k)
 struct JSConstruct { JSValue created_obj; JSValue super_ref; uint8_t from_super; void *outer; uint8_t outer_kind; };
 
 /* Only a NORMAL bytecode function trampolines (the common deep-recursion case). */
-static inline bool tramp_can_call(JSValueConst func) {
+static inline bool tramp_body_is_plain(JSValueConst func) {
     JSObject *fp;
     if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
     fp = JS_VALUE_GET_OBJ(func);
@@ -20225,7 +20225,7 @@ static bool js_read_is_page_code(JSContext *ctx, JSValueConst v, JSAtom atom)
 }
 /* An ASYNC function runs its body on the CALLER's tramp chain (do_async_tramp_call) so its sync-prefix loop
    preempts the base flow at any depth — never a nested C-recursion that would drive to completion. */
-static inline bool tramp_can_call_async(JSValueConst func) {
+static inline bool tramp_body_is_async(JSValueConst func) {
     JSObject *fp;
     if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
     fp = JS_VALUE_GET_OBJ(func);
@@ -20502,7 +20502,6 @@ static JSValue map_normalize_key(JSContext *ctx, JSValue key);
 static JSMapRecord *map_find_record(JSContext *ctx, JSMapState *s, JSValueConst key);
 static JSMapRecord *map_add_record(JSContext *ctx, JSMapState *s, JSValue key);
 static void map_delete_record(JSRuntime *rt, JSMapState *s, JSMapRecord *mr);
-static bool iter_consume_gen_backed(JSContext *ctx, JSValueConst items, JSValue *out_getiter);
 static JSValue js_map_constructor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv, int magic);
 static bool tramp_can_call_setmap_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_magic, JSValue *out_getiter);
 static int check_function(JSContext *ctx, JSValueConst obj);
@@ -22184,7 +22183,7 @@ static inline bool tramp_is_global_eval(JSValueConst method) {
         && mp->u.cfunc.c_function.generic == js_global_eval;
 }
 static JSProxyData *get_proxy_method(JSContext *ctx, JSValue *pmethod, JSValueConst obj, JSAtom name);
-static inline bool tramp_can_call(JSValueConst func);
+static inline bool tramp_body_is_plain(JSValueConst func);
 static int js_proxy_set_invariant(JSContext *ctx, JSValueConst target, JSAtom atom, JSValueConst value, int ret);
 /* PROXY [[Construct]]: `new proxy(...)`. Resolve the `construct` trap at the operator site and dispatch it as
    trap(target, argArray, newTarget) with `this` = handler, so a loop in the trap body parks. Layout-independent
@@ -22363,7 +22362,7 @@ static JSValue js_create_from_ctor(JSContext *ctx, JSValueConst ctor, int class_
 /* A generator FUNCTION call (g()) runs its params to OP_initial_yield on the caller's tramp chain
    (do_generator_create_tramp) so a PARAM-DEFAULT loop preempts the base flow; at initial_yield the generator
    object is created and returned. */
-static inline bool tramp_can_call_gen_create(JSValueConst func) {
+static inline bool tramp_body_is_gen(JSValueConst func) {
     JSObject *fp;
     if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
     fp = JS_VALUE_GET_OBJ(func);
@@ -22386,14 +22385,19 @@ typedef struct JSAsyncGeneratorData {
 
 /* An ASYNC generator function call ag() likewise binds its params up to OP_initial_yield; run that on the chain
    so a param-default loop preempts the base flow instead of DFAILing inside js_async_generator_function_call. */
-static inline bool tramp_can_call_agen_create(JSValueConst func) {
+static inline bool tramp_body_is_agen(JSValueConst func) {
     JSObject *fp;
     if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
     fp = JS_VALUE_GET_OBJ(func);
     return fp->class_id == JS_CLASS_ASYNC_GENERATOR_FUNCTION;
 }
 
-/* THE body-entry question, asked in exactly ONE place. A callee that HAS a bytecode body has exactly four ways in
+/* THE body-entry question, asked in exactly ONE place. These four are ROUTING, not recognizers, and they are
+   named for it: each answers WHICH of four different body-entry ALGORITHMS a callee has, and deleting any other
+   code would not make TBE_GEN unnecessary — which is this project's test for the difference. They were called
+   tramp_can_call_* and so were counted by the recognizer ratchet, which is a claim the name made and the code
+   did not; engine/check_recognizers.mjs now PINS their use sites so a future selector cannot hide among them.
+   THE body-entry question, asked in exactly ONE place. A callee that HAS a bytecode body has exactly four ways in
    (plain frame / async frame / generator create / async-generator create); which one is a property of the CALLEE,
    never of the call spelling. It was written out per call shape instead, and the copies drifted: OP_call and
    OP_call_method asked all four, do_forward_dispatch asked three — so `ag()` created its coroutine on the tramp
@@ -22403,10 +22407,10 @@ static inline bool tramp_can_call_agen_create(JSValueConst func) {
    be added to N sites correctly. Now a site declares only its OPERAND SHAPE and tail-ness; the list lives here. */
 typedef enum { TBE_NONE = 0, TBE_PLAIN, TBE_ASYNC, TBE_GEN, TBE_AGEN } JSTrampBodyEntry;
 static inline JSTrampBodyEntry tramp_body_entry(JSValueConst func) {
-    if (tramp_can_call(func))             return TBE_PLAIN;
-    if (tramp_can_call_async(func))       return TBE_ASYNC;
-    if (tramp_can_call_gen_create(func))  return TBE_GEN;
-    if (tramp_can_call_agen_create(func)) return TBE_AGEN;
+    if (tramp_body_is_plain(func)) return TBE_PLAIN;
+    if (tramp_body_is_async(func)) return TBE_ASYNC;
+    if (tramp_body_is_gen(func))   return TBE_GEN;
+    if (tramp_body_is_agen(func))  return TBE_AGEN;
     return TBE_NONE;   /* no bytecode body: the caller's own shape decides what to try next */
 }
 /* Expanded at each operand shape; `first` is tramp_first (-1 plain [f,args] / -2 method [this,f,args]). Falls
@@ -23516,7 +23520,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                                  JS_EVAL_TYPE_INDIRECT | JS_EVAL_FLAG_TRAMP_CLOSURE, -1);
                     JSValue *A;
                     if (unlikely(JS_IsException(eclo))) goto exception;
-                    DCHECK(tramp_can_call(eclo), "indirect eval closure is not a trampolinable bytecode function");
+                    DCHECK(tramp_body_is_plain(eclo), "indirect eval closure is not a trampolinable bytecode function");
                     A = (JSValue *)call_argv;
                     for (i = 0; i < call_argc; i++) JS_FreeValue(ctx, A[i]);
                     JS_FreeValue(ctx, A[-1]);
@@ -24823,7 +24827,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                (routing plain f() was exactly that gap, and each copy then needed its own tramp_first).
                THE BODY-ENTRY QUESTION IS ASKED HERE FOR THE SAME REASON. It used to be the ENTRANT's job, and the
                entrants that were not call opcodes asked a degraded TWO-way version of it —
-               `if (tramp_can_call(callee)) goto do_tramp_call;` — which is true only for a PLAIN body, so a
+               a bare "is this a plain bytecode body?" test guarding `goto do_tramp_call` — true only for a PLAIN body, so a
                generator or async generator in a step machine's callback slot, a consumer's mapfn, an adder, or a
                Promise.all resolve-element fell straight past it to the arms below and had its coroutine created by
                an ordinary C call that then resumed off the chain: the drive-to-completion DFAIL, at seven sites,
@@ -30956,7 +30960,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         JSValue eclo = JS_EvalObject(ctx, JS_UNDEFINED, obj,
                                                      JS_EVAL_TYPE_DIRECT | JS_EVAL_FLAG_TRAMP_CLOSURE, scope_idx);
                         if (unlikely(JS_IsException(eclo))) goto exception;
-                        DCHECK(tramp_can_call(eclo), "direct eval closure is not a trampolinable bytecode function");
+                        DCHECK(tramp_body_is_plain(eclo), "direct eval closure is not a trampolinable bytecode function");
                         /* reshape [eval, args..] -> the plain-call shape [closure] with 0 args */
                         for (i = -1; i < call_argc; i++) JS_FreeValue(ctx, call_argv[i]);
                         sp = (JSValue *)call_argv;
@@ -60124,46 +60128,6 @@ static JSIterAtState data_method_at(JSContext *ctx, JSObject *p, JSAtom atom, JS
     return st;
 }
 
-/* ONE caller is left: new TypedArray(iterable), whose js_array_from_iterator collect still drives the argument's
-   .next() from C. *out_getiter = the @@iterator method (owned) for the consume tramp. It accepts a generator/helper
-   source and any callable @@iterator that is not a BUILT-IN C function, and REFUSES the shapes the probe cannot read
-   side-effect-free (a getter, a Proxy) plus a built-in @@iterator — whose ITERATOR's .next may still be patched,
-   which is exactly what a probe of @@iterator alone cannot see.
-   Every refusal is a FALLBACK to that C loop, not a different algorithm, so this is the next widening. The spread
-   lost its equivalent by routing everything that is not the fast-array slot copy, and it answers the patched-.next
-   question by CREATING the built-in iterator (which runs nothing) and probing ITS .next. The move needs one thing
-   built first: 23.2.5.1 step 5.c makes a nullish @@iterator the ARRAY-LIKE algorithm, and the acquire's nullish arm
-   has no TypedArray destination to hand off to yet — Array.from's equivalent is JSArrayFromLike.
-   (This once read "GENERATOR-BACKED sources only", recording that broadening it had regressed 12 tests. That note
-   described the state before the consume machine could acquire on the tramp.) */
-static bool iter_consume_gen_backed(JSContext *ctx, JSValueConst items, JSValue *out_getiter)
-{
-    JSValue m;
-    *out_getiter = JS_UNDEFINED;
-    if (iter_data_at_iterator(ctx, items, &m) != ITERAT_FOUND) return false;
-    if (tramp_can_call_gen_create(m)) { *out_getiter = m; return true; }
-    if (JS_VALUE_GET_TAG(items) == JS_TAG_OBJECT) {
-        JSObject *ip = JS_VALUE_GET_OBJ(items);
-        if ((ip->class_id == JS_CLASS_GENERATOR && ip->u.generator_data)
-            || (ip->class_id == JS_CLASS_ITERATOR_HELPER && ip->u.iterator_helper_data
-                && !ip->u.iterator_helper_data->executing && !ip->u.iterator_helper_data->done)) {
-            *out_getiter = m; return true;
-        }
-    }
-    /* A NON-BUILT-IN callable @@iterator: the iterator it returns is user code, so its .next() body must run on the
-       chain. A BUILT-IN @@iterator is refused here because this cannot see whether the iterator's .next is still the
-       built-in one — `%ArrayIteratorPrototype%.next = function(){…}` is invisible to a probe of @@iterator alone.
-       The spread answers that exactly by CREATING the built-in iterator (which runs nothing) and probing ITS .next;
-       doing the same here is part of the same widening. */
-    if (JS_IsFunction(ctx, m)
-        && !(JS_VALUE_GET_TAG(m) == JS_TAG_OBJECT
-             && JS_VALUE_GET_OBJ(m)->class_id == JS_CLASS_C_FUNCTION)) {
-        *out_getiter = m; return true;
-    }
-    JS_FreeValue(ctx, m);
-    return false;
-}
-
 /* DELETED: tramp_can_call_iter_consume. Array.from and Math.sumPrecise declare their sinks at their own
    definitions now. It had two real declines left — argc 0, and a present-but-uncallable mapfn — and each was a
    case handed silently to the residual C body. Both are pure validation with no iteration in them, so they are
@@ -60212,10 +60176,11 @@ static bool tramp_can_call_setmap_consume(JSContext *ctx, JSValueConst func, JSV
    the state in which a recognizer is pure residue — it was choosing against something that no longer exists. */
 
 /* Route new TypedArray(iterable) — js_typed_array_constructor_obj collects it (js_array_from_iterator) in a C loop,
-   driving the argument's .next(). The gate is the shared iter_consume_gen_backed, so this widened with it: a plain
-   object iterator routes now too, and only a BUILT-IN @@iterator (whose .next() is C and invokes nothing) stays on
-   the C collect. *out_classid = the TA class (the ctor's magic). Fork-safe (the collected array's appends are
-   COW-captured). */
+   driving the argument's .next(). *out_classid = the TA class (the ctor's magic). Fork-safe (the collected array's
+   appends are COW-captured).
+   This named iter_consume_gen_backed as its gate; that predicate had already lost its last caller and is deleted.
+   What decides is the side-effect-free iter_data_at_iterator probe below, and only as a HINT the acquire may
+   reuse — every shape it cannot answer for is acquired on the tramp instead of refused. */
 static bool tramp_can_call_ta_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_classid, JSValue *out_getiter)
 {
     JSObject *fp;
