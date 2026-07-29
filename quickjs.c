@@ -58597,7 +58597,7 @@ typedef struct JSFuncBind {
     JSValue result;     /* DONE (owned) */
     int arg_count;      /* the bound arguments, which the target's `length` is reduced by */
 } JSFuncBind;
-enum { FB_LEN_OWN = 1, FB_LEN_OWN_GOT, FB_LEN_GOT, FB_NAME_GOT };
+enum { FB_PROTO_GOT = 1, FB_LEN_OWN, FB_LEN_OWN_GOT, FB_LEN_GOT, FB_NAME_GOT };
 
 /* steps 6-7's SetFunctionLength(F, L): the target's own `length`, reduced by the bound argument count and
    clamped at zero, and anything that is not a Number contributes nothing. CONSUMES len_val. */
@@ -58632,15 +58632,30 @@ static int js_func_bind_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
     JSValue name1;
 
     if (s->hdr.stage == 0) {
-        JSBoundFunction *bf;
-        JSObject *p;
-        int i;
         JS_FreeValue(ctx, cb_result);
         cb_result = JS_UNDEFINED;
         s->func_obj = JS_UNDEFINED; s->result = JS_UNDEFINED;
         if (check_function(ctx, s->hdr.this_val))       /* step 2: IsCallable(Target) */
             return -1;
-        s->func_obj = JS_NewObjectProtoClass(ctx, ctx->function_proto, JS_CLASS_BOUND_FUNCTION);
+        /* 10.4.1.3 BoundFunctionCreate step 1: proto is ? Target.[[GetPrototypeOf]](), which is a Proxy's
+           `getPrototypeOf` trap and, for an ordinary target, whatever the page set. The C body did not perform
+           this operation AT ALL — it used the realm's %Function.prototype% unconditionally, so
+           `Object.getPrototypeOf((new (class extends Function{})("")).bind())` answered %Function.prototype%
+           instead of the subclass's prototype, and a Proxy target's trap never ran. */
+        s->hdr.stage = FB_PROTO_GOT;
+        s->hdr.cb_coerce[0] = s->hdr.this_val;   /* borrowed: the machine holds the target across the request */
+        *out_cb = s->hdr.cb_coerce; *out_argc = 0;
+        return 18;
+    }
+    if (s->hdr.stage == FB_PROTO_GOT) {
+        JSBoundFunction *bf;
+        JSObject *p;
+        int i;
+        if (JS_IsException(cb_result))
+            return -1;
+        s->func_obj = JS_NewObjectProtoClass(ctx, cb_result, JS_CLASS_BOUND_FUNCTION);   /* step 2 */
+        JS_FreeValue(ctx, cb_result);
+        cb_result = JS_UNDEFINED;
         if (JS_IsException(s->func_obj)) { s->func_obj = JS_UNDEFINED; return -1; }
         p = JS_VALUE_GET_OBJ(s->func_obj);
         p->is_constructor = JS_IsConstructor(ctx, s->hdr.this_val);
@@ -58653,7 +58668,7 @@ static int js_func_bind_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
         bf->argc = s->arg_count;
         for (i = 0; i < s->arg_count; i++)
             bf->argv[i] = js_dup(step_arg(&s->hdr, i + 1));
-        p->u.bound_function = bf;                       /* step 3: BoundFunctionCreate */
+        p->u.bound_function = bf;                       /* steps 3-6: the bound target, this and arguments */
         s->hdr.stage = FB_LEN_OWN;
     }
     switch (s->hdr.stage) {
