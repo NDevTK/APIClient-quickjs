@@ -1499,6 +1499,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_OBJ_HASOWN, STEPDEF_OBJ_HASOWNPROP,
     STEPDEF_OBJ_LOOKUPGETTER, STEPDEF_OBJ_LOOKUPSETTER,
     STEPDEF_FUNC_BIND, STEPDEF_ITER_SET_CTOR, STEPDEF_ITER_SET_TAG,
+    STEPDEF_ITER_HELPER_RETURN,
     STEPDEF_COUNT
 };
 #define HINT_NONE    2
@@ -24884,57 +24885,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 if (tramp_step_def_of(call_argv[-1]))
                     goto do_step_tramp;
-                {   /* iter.return(v) on a lazy Iterator Helper whose SOURCE is a generator: close the source (its
-                       `finally` runs on THIS chain), then deliver {value:v, done:true}. Its per-call-site copy
-                       lived at OP_call_method, which a for-of `break` never reaches — that close goes through
-                       OP_iterator_close's generic 7.4.9 path, so it fell to js_iterator_helper_next's C entry and
-                       drove the generator's finally off the tramp. Asked here, where every spelling arrives. */
-                    if (JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT
-                        && JS_VALUE_GET_TAG(gthis) == JS_TAG_OBJECT) {
-                        JSObject *rmp = JS_VALUE_GET_OBJ(call_argv[-1]);
-                        JSObject *rhp = JS_VALUE_GET_OBJ(gthis);
-                        if (rmp->class_id == JS_CLASS_C_FUNCTION && rmp->u.cfunc.cproto == JS_CFUNC_iterator_next
-                            && rmp->u.cfunc.c_function.iterator_next == js_iterator_helper_next
-                            && rmp->u.cfunc.magic == GEN_MAGIC_RETURN
-                            && rhp->class_id == JS_CLASS_ITERATOR_HELPER && rhp->u.iterator_helper_data) {
-                            JSIteratorHelperData *it = rhp->u.iterator_helper_data;
-                            JSObject *srcp = (JS_VALUE_GET_TAG(it->obj) == JS_TAG_OBJECT) ? JS_VALUE_GET_OBJ(it->obj) : NULL;
-                            bool inner_is_gen = JS_VALUE_GET_TAG(it->inner) == JS_TAG_OBJECT
-                                && JS_VALUE_GET_OBJ(it->inner)->class_id == JS_CLASS_GENERATOR;
-                            if (!it->executing && !it->done && !inner_is_gen
-                                && srcp && srcp->class_id == JS_CLASS_GENERATOR && srcp->u.generator_data
-                                && ((JSGeneratorData *)srcp->u.generator_data)->state != JS_GENERATOR_STATE_EXECUTING) {
-                                JSValue arg = (call_argc >= 1) ? js_dup(call_argv[0]) : JS_UNDEFINED;
-                                JSValue result, gen;
-                                int rcfirst, rcpop;
-                                JSValue *rcargv;
-                                it->done = 1;
-                                if (!JS_IsUndefined(it->inner)) {   /* flatMap active PLAIN inner: close it inline */
-                                    JS_IteratorClose(ctx, it->inner, false);
-                                    JS_FreeValue(ctx, it->inner); it->inner = JS_UNDEFINED;
-                                    JS_FreeValue(ctx, it->inner_next); it->inner_next = JS_UNDEFINED;
-                                }
-                                result = js_create_iterator_result(ctx, arg, true);   /* {value:arg, done:true} */
-                                if (JS_IsException(result)) goto exception;
-                                gen = js_dup(it->obj);   /* the source generator (survives freeing the helper operand) */
-                                /* drop the DECLARED shape, not a hardcoded [-2, argc): a bound or proxied
-                                   `helper.return` reaches here reshaped, and its owned list is ours to release. */
-                                TAKE_CALL_SHAPE(); rcfirst = call_first_r; rcpop = call_pop;
-                                if (call_args_owned) {
-                                    free_arg_list(ctx, call_args_owned, call_args_owned_n);
-                                    call_args_owned = NULL; call_args_owned_n = 0;
-                                }
-                                rcargv = sp - rcpop;
-                                for (i = rcfirst; i < rcpop; i++) JS_FreeValue(ctx, rcargv[i]);
-                                sp += rcfirst - rcpop;
-                                *sp++ = gen;   /* sp[-1] = the generator for do_generator_tramp close mode */
-                                tramp_gen_close_deliver = result;   /* the settle pushes this in the result slot */
-                                tramp_gen_magic = GEN_MAGIC_RETURN; tramp_gen_close = 1;
-                                goto do_generator_tramp;
-                            }
-                        }
-                    }
-                }
                 {   /* a lazy Iterator HELPER's own .next(): its step machine drives the source on this chain, and
                        calling it in place is js_iterator_helper_next's DFAIL. Asked here and nowhere else. Its
                        per-call-site copy lived at OP_call_method, so `h.next.bind(h)()` and every other spelling
@@ -28969,11 +28919,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        iterating an inner iterable, the INNER (it->inner/it->inner_next). Either can be a generator
                        (runs on the tramp), a helper (ITH_CONSUME chain), or a plain iterator (in-loop call). take's
                        close-on-limit instead drives the source's .return() (drive_close) as a generator RETURN. */
-                    if (it->drive_close) {   /* take limit: close the GENERATOR source (.return() finally) on the tramp */
+                    if (it->drive_close) {
+                        /* take limit: 7.4.9 over the source, parked so BOTH of its operations run on the tramp.
+                           It used to jump straight into the generator drive, which is only right when the source
+                           IS a generator — and made the question "what kind is it?" the C step's, beside an
+                           inline JS_IteratorClose for every other kind. The parked close asks nothing: reading
+                           `return` is an ordinary request and calling it reaches a generator, a helper, a Proxy
+                           or a plain function through the one convergence point. */
+                        JSIterClose *hce = js_malloc(ctx, sizeof(*hce));
                         it->drive_close = 0;
-                        tramp_cont_state = it; tramp_cont_kind = CONT_ITER_HELPER; tramp_gen_cont_iter = it->obj;
-                        tramp_gen_cont_consume = 1; tramp_gen_magic = GEN_MAGIC_RETURN;
-                        goto do_generator_tramp;
+                        if (unlikely(!hce)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                        hce->iter = js_dup(it->obj);
+                        hce->saved_exc = JS_UNINITIALIZED;   /* a NORMAL completion: the close's own throw propagates */
+                        hce->outer = it; hce->outer_kind = CONT_ITER_HELPER;
+                        gp_obj = hce->iter; gp_atom = JS_ATOM_return; gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                        gp_outer = hce; gp_outer_kind = CONT_ITER_CLOSE;
+                        goto do_getprop_tramp;
                     }
                     JSValueConst drive_obj  = it->drive_inner ? it->inner : it->obj;
                     JSValueConst drive_next = it->drive_inner ? it->inner_next : it->next;
@@ -32169,6 +32130,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (!failed) JS_ThrowTypeError(ctx, "throw is not a method");
                     cont_st = co;
                     goto do_async_from_sync_abrupt;
+                }
+                if (co && ck == CONT_ITER_HELPER) {
+                    /* a lazy Iterator Helper closed its source at take's limit. Its resume point discards
+                       whatever the close produced and delivers {undefined, true}; a close that THREW propagates,
+                       which is 7.4.9 under a normal completion. */
+                    if (failed) {
+                        /* the drive is over either way, so it is torn down the way a failing STEP is: the helper
+                           is left not-executing, or every later .next() answers "already running" instead of the
+                           {undefined,true} an exhausted helper owes (test262 take/exhaustion-calls-return). */
+                        JSIteratorHelperData *hit = (JSIteratorHelperData *)co;
+                        hit->executing = 0;
+                        js_iter_helper_drop_consumer(ctx, hit);
+                        goto exception;
+                    }
+                    cont_st = co;
+                    ret_val = JS_UNDEFINED;
+                    goto do_iter_helper_step;
                 }
                 if (co) {
                     DCHECK(ck == CONT_ITER_CONSUME, "iterator close: unknown waiting-machine kind");
@@ -62266,6 +62244,133 @@ static const JSTrampStepDef js_json_parse_def    = { sizeof(JSJsonReviver), js_j
 static const JSTrampStepDef js_for_in_def       = { sizeof(JSForIn), js_for_in_step, js_for_in_fini, 0 };
 static int check_iterator(JSContext *ctx, JSValueConst obj);
 
+/* %IteratorHelperPrototype%.return: close flatMap's active inner if there is one, then the source, then answer
+   {value, done:true}. 7.4.9 IteratorClose is TWO of the page's operations — GetMethod(iterator, "return") and
+   the Call of what that produced — and the C body ran both through JS_IteratorClose, under the written claim
+   that closing "iterates nothing, so no drive-to-completion". It does: a plain source's looping `return`
+   aborted with no flow base, and an `Iterator.from` source aborted on the step-builtin backstop because that
+   wrapper's own `return` IS a machine. */
+typedef struct JSIterHelperReturn {
+    JSStepHdr hdr;         /* MUST be first */
+    JSValue result;        /* DONE (owned) */
+    JSValue arg;           /* the value the result object carries (owned) */
+    JSValue target;        /* the iterator being closed right now (owned) */
+    JSValue method;        /* its `return`, held across the Call (owned) */
+    JSValue pending;       /* the SOURCE, while an inner is being closed first (owned) */
+} JSIterHelperReturn;
+enum { IHR_METHOD = 1, IHR_METHOD_GOT, IHR_CALLED };
+
+/* Move to the next thing to close, or finish. 0 = DONE (result filled), 1 = keep going, -1 = threw. */
+static int js_iter_helper_return_next(JSContext *ctx, JSIterHelperReturn *s)
+{
+    JS_FreeValue(ctx, s->target);
+    s->target = s->pending;
+    s->pending = JS_UNDEFINED;
+    if (JS_VALUE_GET_TAG(s->target) == JS_TAG_OBJECT) {
+        s->hdr.stage = IHR_METHOD;
+        return 1;
+    }
+    s->result = js_create_iterator_result(ctx, js_dup(s->arg), true);
+    return JS_IsException(s->result) ? -1 : 0;
+}
+
+static int js_iter_helper_return_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSIterHelperReturn *s = st;
+    int r;
+
+    if (s->hdr.stage == 0) {
+        JSIteratorHelperData *it;
+        JS_FreeValue(ctx, cb_result);
+        cb_result = JS_UNDEFINED;
+        s->result = JS_UNDEFINED; s->arg = JS_UNDEFINED;
+        s->target = JS_UNDEFINED; s->method = JS_UNDEFINED; s->pending = JS_UNDEFINED;
+        it = JS_GetOpaque2(ctx, s->hdr.this_val, JS_CLASS_ITERATOR_HELPER);
+        if (!it)
+            return -1;
+        if (it->executing) {   /* GeneratorValidate: a source .next() re-entered its own helper */
+            JS_ThrowTypeError(ctx, "Iterator Helper is already running");
+            return -1;
+        }
+        s->arg = js_dup(step_arg(&s->hdr, 0));
+        if (it->done) {        /* an exhausted helper closes nothing */
+            s->result = js_create_iterator_result(ctx, js_dup(s->arg), true);
+            return JS_IsException(s->result) ? -1 : 0;
+        }
+        it->done = 1;
+        /* flatMap's ACTIVE inner is closed before the source, and it leaves the helper here so no later drive
+           can reach a half-closed one. */
+        s->pending = js_dup(it->obj);
+        s->target = it->inner; it->inner = JS_UNDEFINED;
+        JS_FreeValue(ctx, it->inner_next); it->inner_next = JS_UNDEFINED;
+        if (JS_VALUE_GET_TAG(s->target) != JS_TAG_OBJECT) {
+            r = js_iter_helper_return_next(ctx, s);
+            if (r <= 0) return r;
+        } else {
+            s->hdr.stage = IHR_METHOD;
+        }
+    }
+    for (;;) {
+        if (s->hdr.stage == IHR_METHOD) {
+            /* 7.4.9 step 3: GetMethod(iterator, "return") — a getter or a Proxy trap like any read. */
+            JS_FreeValue(ctx, cb_result);
+            cb_result = JS_UNDEFINED;
+            s->hdr.stage = IHR_METHOD_GOT;
+            s->hdr.cb_coerce[0] = s->target;   /* borrowed: the machine holds it across the read */
+            *out_cb = s->hdr.cb_coerce; *out_argc = (int)JS_ATOM_return;
+            return 6;
+        }
+        if (s->hdr.stage == IHR_METHOD_GOT) {
+            if (JS_IsException(cb_result))
+                return -1;
+            s->method = cb_result;
+            cb_result = JS_UNDEFINED;
+            if (JS_IsUndefined(s->method) || JS_IsNull(s->method)) {   /* step 4: nothing to call */
+                JS_FreeValue(ctx, s->method); s->method = JS_UNDEFINED;
+                r = js_iter_helper_return_next(ctx, s);
+                if (r <= 0) return r;
+                continue;
+            }
+            if (!JS_IsFunction(ctx, s->method)) {
+                JS_ThrowTypeError(ctx, "not a function");
+                return -1;
+            }
+            s->hdr.stage = IHR_CALLED;                   /* step 5: Call(return, iterator) */
+            s->hdr.cb_coerce[0] = s->target;             /* borrowed: this */
+            s->hdr.cb_coerce[1] = s->method;             /* borrowed: the callee */
+            *out_cb = s->hdr.cb_coerce; *out_argc = 0;
+            return 3;
+        }
+        DCHECK(s->hdr.stage == IHR_CALLED, "the helper's close machine resumed in no stage");
+        if (JS_IsException(cb_result))
+            return -1;
+        JS_FreeValue(ctx, s->method); s->method = JS_UNDEFINED;
+        if (!JS_IsObject(cb_result)) {                   /* step 6 */
+            JS_FreeValue(ctx, cb_result);
+            JS_ThrowTypeError(ctx, "iterator result is not an object");
+            return -1;
+        }
+        JS_FreeValue(ctx, cb_result);
+        cb_result = JS_UNDEFINED;
+        r = js_iter_helper_return_next(ctx, s);
+        if (r <= 0) return r;
+    }
+}
+
+static JSValue js_iter_helper_return_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSIterHelperReturn *s = st;
+    JSValue r;
+    JS_FreeValue(ctx, s->arg);
+    JS_FreeValue(ctx, s->target);
+    JS_FreeValue(ctx, s->method);
+    JS_FreeValue(ctx, s->pending);
+    r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    js_free(ctx, s);
+    return r;
+}
+
 /* 27.1.4.2 SetterThatIgnoresPrototypeProperties(this, home, p, v), which %Iterator.prototype% uses for BOTH of
    its writable-looking accessors — `constructor` and @@toStringTag. Steps 3-5 are the page's: this
    .[[GetOwnProperty]](p), then either CreateDataPropertyOrThrow or Set(this, p, v, true) — a trap apiece on a
@@ -62342,6 +62447,7 @@ static const JSTrampStepDef js_lookupsetter_def = { sizeof(JSLookupAcc), js_look
 static const JSTrampStepDef js_func_bind_def   = { sizeof(JSFuncBind), js_func_bind_step, js_func_bind_fini, 0 };
 static const JSTrampStepDef js_iter_set_ctor_def = { sizeof(JSIterSetter), js_iter_setter_step, js_iter_setter_fini, JS_ATOM_constructor };
 static const JSTrampStepDef js_iter_set_tag_def  = { sizeof(JSIterSetter), js_iter_setter_step, js_iter_setter_fini, JS_ATOM_Symbol_toStringTag };
+static const JSTrampStepDef js_iter_helper_return_def = { sizeof(JSIterHelperReturn), js_iter_helper_return_step, js_iter_helper_return_fini, 0 };
 static const JSTrampStepDef js_import_opts_def  = {
     sizeof(JSImportOpts), js_import_opts_step, js_import_opts_fini, 0,
     /* body, body_proto, body_magic, precheck, midcheck, onerror */ {NULL}, 0, 0, NULL, NULL, NULL,
@@ -62820,6 +62926,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_FUNC_BIND]      = &js_func_bind_def,
     [STEPDEF_ITER_SET_CTOR]  = &js_iter_set_ctor_def,
     [STEPDEF_ITER_SET_TAG]   = &js_iter_set_tag_def,
+    [STEPDEF_ITER_HELPER_RETURN] = &js_iter_helper_return_def,
     [STEPDEF_IMPORT_OPTS]    = &js_import_opts_def,
     [STEPDEF_TA_SLICE]      = &js_ta_slice_def,
     [STEPDEF_STR_CONCAT]    = &js_str_concat_def,
@@ -63039,6 +63146,7 @@ STEP_STATE_HDR_FIRST(JSHasOwn);
 STEP_STATE_HDR_FIRST(JSLookupAcc);
 STEP_STATE_HDR_FIRST(JSFuncBind);
 STEP_STATE_HDR_FIRST(JSIterSetter);
+STEP_STATE_HDR_FIRST(JSIterHelperReturn);
 STEP_STATE_HDR_FIRST(JSImportOpts);
 STEP_STATE_HDR_FIRST(JSStrCtor);
 STEP_STATE_HDR_FIRST(JSStrConcat);
@@ -65591,21 +65699,18 @@ static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue
             else it->resume_pc = ITHP_EMIT;
             return 1;
         case JS_ITERATOR_HELPER_KIND_TAKE:
-            if (it->count == 0) {   /* limit reached: close the source (spec IteratorClose), then deliver done. */
+            if (it->count == 0) {
+                /* limit reached: 7.4.9 IteratorClose on the source, then deliver done. It is parked on the tramp
+                   for EVERY source kind — GetMethod(source, "return") and the Call of what it produced are both
+                   the page's code, and the Call reaches whatever the source is through the convergence point.
+                   This used to ask whether the source was a GENERATOR and close anything else inline with
+                   JS_IteratorClose, which is one more selector picking a C path: a PLAIN source's looping
+                   `return` drove to completion, and `x.map(f).filter(g)` — a helper whose source is a helper —
+                   went through that C close as well. */
                 it->done = 1;
-                if (tramp_gen_method_magic(it->next, it->obj) == GEN_MAGIC_NEXT) {
-                    /* GENERATOR source: run its .return() (finally) on the tramp, then deliver {undefined,true} at
-                       ITHP_TAKE_CLOSE. Never a drive-to-completion, never left suspended. */
-                    it->drive_close = 1;
-                    it->resume_pc = ITHP_TAKE_CLOSE;
-                    return 1;
-                }
-                /* PLAIN / HELPER source: close inline, propagating its .return() throw. A helper chain that bottoms out
-                   at a GENERATOR hits the js_generator_next DFAIL — the forcing function to route that close onto the
-                   tramp too (not papered over). */
-                if (JS_IteratorClose(ctx, it->obj, false)) return -1;
-                *out = js_create_iterator_result(ctx, JS_UNDEFINED, true);
-                return JS_IsException(*out) ? -1 : 0;
+                it->drive_close = 1;
+                it->resume_pc = ITHP_TAKE_CLOSE;
+                return 1;
             }
             it->count--;
             it->resume_pc = ITHP_EMIT;
@@ -65921,37 +66026,17 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
                                       int argc, JSValueConst *argv,
                                       int *pdone, int magic)
 {
-    /* The DRIVE runs on the tramp (do_iter_helper_tramp), recognized at the call site — the recognition declines
-       (and this C entry runs) for a DONE helper (.next() -> {undefined,true}), which reaches no page code, and
-       for .return().
-       .return() IS PAGE CODE and this line used to claim otherwise ("those iterate nothing, so no
-       drive-to-completion"). 7.4.9 IteratorClose is GetMethod(iterator, "return") and then the CALL of what that
-       produced, and JS_IteratorClose below performs both from C, so
-           var src = { next: () => ({value:1,done:false}),
-                       return: () => { for (var i=0;i<200;i++); return {done:true}; } };
-           Iterator.prototype.take.call(src, 5).return(7);
-       aborts with no flow base. A step machine for this method fixes it and makes OP_iterator_close's
-       generator-source special-case dead, but only once the SAME close inside do_iter_helper_step
-       (JS_IteratorClose behind a `== GEN_MAGIC_NEXT` selector) drives any target kind through the convergence
-       point rather than only a generator — see engine/check_recognizers.mjs, which names that capability.
-       Any OTHER reason to be here is a source/kind whose tramp drive is not built — DFAIL, never a legacy
-       C-loop fallback. */
+    /* The DRIVE runs on the tramp (do_iter_helper_tramp). What is left here is the ONE answer that reaches no
+       page code at all: an exhausted helper, whose .next() is {undefined, true}. `.return()` used to live here
+       too, closing the source with JS_IteratorClose from C on the claim that closing "iterates nothing" — it
+       does, and it is a step machine now (STEPDEF_ITER_HELPER_RETURN). Any OTHER reason to be here is a
+       source/kind whose tramp drive is not built: DFAIL, never a legacy C-loop fallback. */
     JSIteratorHelperData *it = JS_GetOpaque2(ctx, this_val, JS_CLASS_ITERATOR_HELPER);
     *pdone = false;
     if (!it) return JS_EXCEPTION;
     if (it->executing) {   /* GeneratorValidate: resuming a helper whose drive is already running (a source .next()
                               re-entered this helper) is a TypeError for every magic — a trivial guard, no drive. */
         return JS_ThrowTypeError(ctx, "Iterator Helper is already running");
-    }
-    if (magic == GEN_MAGIC_RETURN) {   /* .return(): close the source, mark done, return {value|undefined, done:true} */
-        JSValue ret = (argc > 0) ? js_dup(argv[0]) : JS_UNDEFINED;
-        if (!it->done) {
-            it->done = 1;
-            /* IteratorClose PROPAGATES a throw from GetMethod(return)/the return call — never swallow it. */
-            if (JS_IteratorClose(ctx, it->obj, false)) { JS_FreeValue(ctx, ret); return JS_EXCEPTION; }
-        }
-        *pdone = true;
-        return ret;
     }
     if (it->done) { *pdone = true; return JS_UNDEFINED; }   /* exhausted helper: .next() -> {undefined, done:true} */
     DFAIL("js_iterator_helper_next: helper source/kind not yet driven on the tramp — build do_iter_helper_step for it, never a legacy C-loop fallback");
@@ -65997,7 +66082,7 @@ static const JSCFunctionListEntry js_iterator_helper_proto_funcs[] = {
     /* .next() is recognized at the call site and routed onto do_iter_helper_tramp for a generator source; the C
        js_iterator_helper_next handles plain-iterator sources (which do not suspend). */
     JS_ITERATOR_NEXT_DEF("next", 0, js_iterator_helper_next, GEN_MAGIC_NEXT ),
-    JS_ITERATOR_NEXT_DEF("return", 0, js_iterator_helper_next, GEN_MAGIC_RETURN ),
+    JS_CFUNC_STEP_DEF("return", 0, STEPDEF_ITER_HELPER_RETURN ),
     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "Iterator Helper", JS_PROP_CONFIGURABLE ),
 };
 
