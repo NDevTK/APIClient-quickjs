@@ -22196,8 +22196,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     int tramp_gen_close_exc = 0;                        /* 1 = the close is happening DURING exception unwind (JS_IteratorClose(iter,true)): after the finally runs, restore the in-flight exception and continue unwinding (goto exception), never overwrite it */
     JSValueConst tramp_gen_close_slot_gen = JS_UNINITIALIZED; /* close mode: the generator to close comes from ctx->pending_close_iter (an IfAbruptCloseIterator deferral), NOT sp[-1]; caller_sp stays put (nothing on the stack). read+reset in do_generator_tramp */
     JSValue tramp_gen_close_deliver = JS_UNINITIALIZED;  /* close-then-deliver (helper .return()): after the source generator closes, PUSH this pre-built {value,done:true} as the helper.return() result instead of discarding. read+reset in do_generator_tramp */
-    void *tramp_gen_create_cont_it = NULL;              /* non-NULL = this do_generator_create_tramp creates an iterator from a generator-function @@iterator called by a driver (flatMap inner or a C consumer): the settle stores the created iterator on that driver and re-enters its step, never pushes it. read+reset in do_generator_create_tramp */
-    uint8_t tramp_gen_create_cont_kind = 0;             /* CONT_* of tramp_gen_create_cont_it: CONT_ITER_HELPER (flatMap inner) / CONT_ITER_CONSUME (Array.from etc.) */
     JSValue tramp_iter_getiter = JS_UNDEFINED;          /* the @@iterator method the recognition probed (owned, callable); do_consume_acquire_iterator CALLS it to get the iterator */
     JSValueConst tramp_consume_iterable = JS_UNDEFINED; /* the iterable being consumed — the `this` of the @@iterator call */
     void *tramp_consume_state = NULL;                   /* the consumer state awaiting the iterator (JSIterConsume / JSPromiseAll) */
@@ -28648,16 +28646,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                PARAM-DEFAULT loop preempts the base flow), then at initial_yield (do_generator_create_settle)
                creates the generator object and returns it. Mirrors js_call_generator_function. */
             {
-                /* TWO DIFFERENT OBLIGATIONS, and conflating them is what made the generator a wrong ANSWER rather
-                   than a missing one. An ACQUIRE requester (tramp_gen_create_cont_it) called this generator
-                   function as its @@iterator, so the created generator IS its iterator. A CALL requester
-                   (tramp_cont_state, where every ordinary call leaves it) called it as a CALLBACK — a sequence's,
-                   a consumer's mapfn, a collection's adder — so the created generator is that call's RESULT and
-                   goes to the same delivery a plain bytecode callback's return uses. Read off the kind alone they
-                   are indistinguishable: CONT_ITER_CONSUME means both. */
-                void *gcreate_cont = tramp_gen_create_cont_it; tramp_gen_create_cont_it = NULL;   /* ACQUIRE: the settle hands over the iterator */
-                uint8_t gcreate_cont_kind = tramp_gen_create_cont_kind; tramp_gen_create_cont_kind = 0;
-                /* A CALL requester of ANY kind, not just CONT_STEP. Narrowed to sequences, every other machine
+                /* ONE requester kind reaches a create: the CALL that made it. There used to be a second — an
+                   ACQUIRE requester, set by a driver that had itself recognized a generator-function @@iterator
+                   and wanted the created generator handed straight back — and reading the two off the kind alone
+                   was impossible, since CONT_ITER_CONSUME meant both. Every one of those recognizers is gone:
+                   flatMap's inner acquire and the consumers' are ordinary calls at the convergence point, where a
+                   generator-function callee reaches this create through TRAMP_BODY_DISPATCH like any other body
+                   kind. The ambiguity cannot recur because the second channel no longer exists.
+                   A CALL requester is of ANY kind, not just CONT_STEP. Narrowed to sequences, every other machine
                    that puts a coroutine function in a callback slot — Array.from's mapfn, a Set subclass's adder,
                    an iterator helper's callback — had its generator PUSHED onto a stack it was not using while it
                    sat waiting for a result that never came. */
@@ -28671,9 +28667,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    requester is abandoned here — through the create's ONE teardown, which knows every kind that
                    can reach this label. The hand-rolled list this replaced knew two of them and silently leaked a
                    CONT_STEP requester, which is exactly the failure the shared function makes impossible. */
-                #define GEN_CREATE_FAIL_FREE_CONT() do {                             \
-                    js_create_requester_abandon(ctx, gcreate_cont, gcreate_cont_kind);   \
-                    js_create_requester_abandon(ctx, gcall_cont, gcall_cont_kind); } while (0)
+                #define GEN_CREATE_FAIL_FREE_CONT() \
+                    js_create_requester_abandon(ctx, gcall_cont, gcall_cont_kind)
                 if (unlikely(!s)) { GEN_CREATE_FAIL_FREE_CONT(); JS_ThrowOutOfMemory(ctx); goto exception; }
                 s->state = JS_GENERATOR_STATE_SUSPENDED_START;
                 {   /* async_func_init DUPS func + this + args, so the apply vector is dead the instant it returns —
@@ -28719,12 +28714,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 /* the SHAPE this call left on the caller's stack, recorded exactly as do_tramp_call records it
                    so the settle's drop is the same one do_return performs. */
                 gtf->call_first = call_first_r; gtf->call_argc = call_pop;
-                gtf->is_tail = gcreate_cont ? 0 : tramp_is_tail;
+                gtf->is_tail = tramp_is_tail;
                 gtf->async_data = NULL;
-                /* 0xFF = CREATING (run-to-initial_yield), not a GEN_MAGIC. cont (flatMap inner): the settle stores the
-                   created generator as the helper's inner and re-enters do_iter_helper_step instead of pushing it. */
+                /* 0xFF = CREATING (run-to-initial_yield), not a GEN_MAGIC. */
                 gtf->gen_data = s; gtf->gen_magic = 0xFF;
-                gtf->cont_state = gcreate_cont; gtf->cont_kind = gcreate_cont ? gcreate_cont_kind : CONT_NONE;
+                gtf->cont_state = NULL; gtf->cont_kind = CONT_NONE;
                 gtf->seq_req = gcall_cont; gtf->seq_req_kind = gcall_cont_kind;
                 gtf->forof_off = 0;   /* a CREATE never carries a for-of offset: OP_for_of_start's acquire is an
                                           ordinary CALL with a CONT_FOROF_ACQUIRE continuation, so its enum_rec is
@@ -28758,10 +28752,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSGeneratorData *s = gtf->gen_data;
                 JSValue gfunc = gtf->async_promise;
                 uint8_t gitail = gtf->is_tail;
-                uint8_t gcreate_cont_kind = gtf->cont_kind;   /* ACQUIRE requester: CONT_ITER_HELPER / CONT_ITER_CONSUME / CONT_PROMISE_ALL / CONT_ITER_FROM / CONT_NONE */
-                void *gcreate_cont = (gcreate_cont_kind == CONT_ITER_HELPER || gcreate_cont_kind == CONT_ITER_CONSUME
-                                      || gcreate_cont_kind == CONT_PROMISE_ALL
-                                      || gcreate_cont_kind == CONT_ITER_FROM) ? gtf->cont_state : NULL;
                 void *gcall_cont = gtf->seq_req; uint8_t gcall_cont_kind = gtf->seq_req_kind;   /* CALL requester */
                 int gcf = gtf->call_first, gcp = gtf->call_argc;   /* the shape this call left on the caller's stack */
                 JSValue obj;
@@ -28798,27 +28788,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 { JSValue *cargv0 = sp - gcp;
                   for (i = gcf; i < gcp; i++) JS_FreeValue(ctx, cargv0[i]);
                   sp += gcf - gcp; }
-                if (gcreate_cont && gcreate_cont_kind == CONT_ITER_HELPER) {
-                    /* flatMap inner: the mapped iterable's [Symbol.iterator] generator was created on the tramp.
-                       Store it as the helper's inner and re-enter do_iter_helper_step; ITHP_START drives the inner. */
-                    JSIteratorHelperData *cit = (JSIteratorHelperData *)gcreate_cont;
-                    cit->inner = obj;
-                    cit->inner_next = JS_GetProperty(ctx, obj, JS_ATOM_next);
-                    if (JS_IsException(cit->inner_next)) { cit->inner_next = JS_UNDEFINED; cit->executing = 0; goto exception; }
-                    cit->drive_inner = 1;
-                    cit->resume_pc = ITHP_START;
-                    cont_st = cit;
-                    ret_val = JS_UNINITIALIZED;
-                    goto do_iter_helper_step;
-                }
-                if (gcreate_cont && (gcreate_cont_kind == CONT_ITER_CONSUME || gcreate_cont_kind == CONT_PROMISE_ALL
-                                     || gcreate_cont_kind == CONT_ITER_FROM)) {
-                    /* A consumer's generator-function @@iterator was called on the tramp: hand the created iterator to
-                       the SAME deliver the inline acquire uses, so both arrive identically. */
-                    tramp_consume_state = gcreate_cont; tramp_consume_kind = gcreate_cont_kind;
-                    tramp_consume_acquired = obj;
-                    goto do_consume_deliver_iterator;
-                }
+                /* DELETED: the two ACQUIRE-requester arms. A create could be requested either BY A CALL (the arm
+                   above) or by a driver that had recognized a generator-function @@iterator and wanted the created
+                   generator handed straight to it — flatMap's inner, and the consumers'. Both of those recognizers
+                   are gone: their acquires are ordinary calls at the convergence point, so the create arrives with
+                   an ordinary CALL continuation and the arm above serves it. The flatMap arm also held the last
+                   C-side `Get(iterator, "next")` outside a request, which is why leaving it as dead code was not
+                   an option — a reader would have taken it for a live route that still reads page code from C.
+                   Their absence is asserted at the create's entry, not assumed here. */
                 if (gitail) { ret_val = obj; goto do_return; }
                 *sp++ = obj;
                 BREAK;
