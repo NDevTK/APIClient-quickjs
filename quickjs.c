@@ -1238,6 +1238,15 @@ struct JSObject {
             JSCFunctionType c_function;
             uint8_t length;
             uint8_t cproto;
+            /* The WALK this builtin performs over its first argument when it CONSUMES one: ITERCONS_* + 1, or 0
+               for the builtins that consume nothing. A plain function declares this in `magic` (JS_CFUNC_consume),
+               but a CONSTRUCTOR's magic is already structural — js_map_constructor's carries MAGIC_SET/MAGIC_WEAK
+               and doubles as a class offset, a TypedArray's IS the class id — and both bodies are additionally
+               called straight from C with a raw kind, so the sink cannot ride there. It is a FIELD and not a
+               pointer in JSCFunctionType, which holds function pointers only (putting data there is the
+               strict-aliasing violation that passes at -O0 and segfaults at -O1). It costs nothing: this struct
+               is 20 bytes inside a 24-byte union. */
+            uint8_t consume_sink;
             int16_t magic;
         } cfunc;
         /* array part for fast arrays and typed arrays */
@@ -6793,6 +6802,7 @@ JSValue JS_NewCFunction3(JSContext *ctx, JSCFunction *func,
     p->u.cfunc.c_function.generic = func;
     p->u.cfunc.length = length;
     p->u.cfunc.cproto = cproto;
+    p->u.cfunc.consume_sink = 0;   /* declared afterwards by the few builtins that consume */
     p->u.cfunc.magic = magic;
     p->is_constructor = (cproto == JS_CFUNC_constructor ||
                          cproto == JS_CFUNC_constructor_magic ||
@@ -17605,6 +17615,27 @@ static inline bool tramp_is_iter_drive(JSValueConst func)
     fp = JS_VALUE_GET_OBJ(func);
     return fp->class_id == JS_CLASS_C_FUNCTION && fp->u.cfunc.cproto == JS_CFUNC_iterdrive;
 }
+/* The walk a CONSUMING CONSTRUCTOR declares over its first argument, or -1. The call-side sibling of
+   tramp_consume_sink_of, reading the field instead of magic for the reason the field exists. It replaced two
+   per-builtin identity tests — `c_function.constructor_magic != js_map_constructor` and the TypedArray one —
+   which is the shape the recognizer ban is about: the construct convergence point asks ONE question now and a
+   new consuming constructor answers it by declaring itself, not by being added to a chain. */
+static inline int tramp_consume_ctor_sink_of(JSValueConst func)
+{
+    JSObject *fp;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return -1;
+    fp = JS_VALUE_GET_OBJ(func);
+    if (fp->class_id != JS_CLASS_C_FUNCTION) return -1;
+    return (int)fp->u.cfunc.consume_sink - 1;
+}
+/* Declare it, at the registration of the constructor that performs it. */
+static void js_declare_consume_ctor(JSValueConst func_obj, int sink)
+{
+    JSObject *fp = JS_VALUE_GET_OBJ(func_obj);
+    DCHECK(fp->class_id == JS_CLASS_C_FUNCTION, "a consuming-constructor declaration on a non-C function");
+    DCHECK(sink >= 0 && sink < 255, "a consume sink outside the field's range");
+    fp->u.cfunc.consume_sink = (uint8_t)(sink + 1);
+}
 static const JSTrampStepDef *tramp_step_def_of(JSValueConst func);
 static const JSTrampStepDef *tramp_step_ctor_def_of(JSValueConst func);
 /* the def a STEPDEF_* id names. A CALL reaches its def through the callee object; an OPCODE that drives a machine
@@ -20350,6 +20381,12 @@ typedef struct {
 /* Set.prototype's set-operations that FOLD a setlike's keys() in. Same shape as the terminals: the tag is a
    base plus the SETOP_* kind. */
 #define ITERCONS_SETOP_BASE 24
+/* A CONSUMING CONSTRUCTOR's walk, declared on the constructor object (u.cfunc.consume_sink). Base plus kind, the
+   way ITERCONS_SETOP_BASE and a STEPDEF id already name one machine among many: the base says WHICH walk and the
+   offset carries the argument that walk needs — the collection's MAGIC_SET/MAGIC_WEAK bits, or the TypedArray's
+   class. That is a builtin declaring itself and its argument, not a table of who is special. */
+#define ITERCONS_SETMAP_CTOR_BASE 32   /* + (0 Map | MAGIC_SET | MAGIC_WEAK): new Map/Set/WeakMap/WeakSet(iterable) */
+#define ITERCONS_TA_CTOR_BASE     40   /* + (class_id - JS_CLASS_UINT8C_ARRAY): new Uint8Array(iterable) etc. */
 #define ITERCONS_ITERTERM_BASE 16
 #define ITERCONS_TA_FROM 10 /* %TypedArray%.from(source, mapfn?, thisArg?) — do_ta_consume_tramp's `from` shape */
 #define ITERCONS_TA_OF   11 /* %TypedArray%.of(...items) — the same create+set phases with the argument LIST as
@@ -20503,11 +20540,11 @@ static JSMapRecord *map_find_record(JSContext *ctx, JSMapState *s, JSValueConst 
 static JSMapRecord *map_add_record(JSContext *ctx, JSMapState *s, JSValue key);
 static void map_delete_record(JSRuntime *rt, JSMapState *s, JSMapRecord *mr);
 static JSValue js_map_constructor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv, int magic);
-static bool tramp_can_call_setmap_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_magic, JSValue *out_getiter);
+static bool setmap_consume_ready(JSContext *ctx, JSValueConst *call_argv, int call_argc, JSValue *out_getiter);
 static int check_function(JSContext *ctx, JSValueConst obj);
 static void iter_helper_close_source_abrupt(JSContext *ctx, JSIteratorHelperData *it);
 static JSValue js_typed_array_constructor_obj(JSContext *ctx, JSValueConst new_target, JSValueConst obj, int classid);
-static bool tramp_can_call_ta_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_classid, JSValue *out_getiter);
+static bool ta_consume_ready(JSContext *ctx, JSValueConst *call_argv, int call_argc, JSValue *out_getiter);
 /* Promise.all(gen): drive the generator's .next() on the tramp chain, wrapping each yielded value in
    Promise.resolve(v).then(resolve_element) as js_promise_all's own loop does. iter/next drive the generator;
    result_promise is the returned aggregate; the other fields are the spec's per-call accumulation state. */
@@ -24317,7 +24354,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         goto do_step_step;
                     }
                 }
-                if (tramp_can_call_setmap_consume(ctx, con_func, con_args, con_argc, &smc_magic, &tramp_iter_getiter)) {
+                {
+                /* ONE question: what walk does this constructor DECLARE? It was two identity tests in a chain,
+                   each comparing the callee against a C function's address — so a new consuming constructor was
+                   a new link rather than a new declaration, which is the recognizer shape. What each arm still
+                   asks after that is about the ARGUMENT, not the callee: 24.1.1.1 step 2 and 23.2.5.1 step 6.a
+                   both select a DIFFERENT algorithm for a nullish or non-object source, one that iterates
+                   nothing. */
+                int cctor_sink = tramp_consume_ctor_sink_of(con_func);
+                if (cctor_sink >= ITERCONS_SETMAP_CTOR_BASE && cctor_sink < ITERCONS_SETMAP_CTOR_BASE + 4
+                    && setmap_consume_ready(ctx, con_args, con_argc, &tramp_iter_getiter)) {
+                    smc_magic = cctor_sink - ITERCONS_SETMAP_CTOR_BASE;
                     smc_outer = con_outer; smc_outer_kind = con_outer_kind;
                     con_outer = NULL; con_outer_kind = CONT_NONE;
                     smc_ntgt = con_ntgt; smc_items = (con_argc > 0) ? con_args[0] : JS_UNDEFINED;
@@ -24329,7 +24376,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     smc_super_ref = con_super_ref; con_super_ref = JS_UNDEFINED;
                     goto do_setmap_consume_tramp;
                 }
-                if (tramp_can_call_ta_consume(ctx, con_func, con_args, con_argc, &ta_classid, &tramp_iter_getiter)) {
+                if (cctor_sink >= ITERCONS_TA_CTOR_BASE
+                    && cctor_sink < ITERCONS_TA_CTOR_BASE + JS_TYPED_ARRAY_COUNT
+                    && ta_consume_ready(ctx, con_args, con_argc, &tramp_iter_getiter)) {
+                    ta_classid = cctor_sink - ITERCONS_TA_CTOR_BASE + JS_CLASS_UINT8C_ARRAY;
                     tac_outer = con_outer; tac_outer_kind = con_outer_kind;
                     con_outer = NULL; con_outer_kind = CONT_NONE;
                     tac_args = con_args; tac_argc = con_argc; tac_ntgt = con_ntgt; tac_cfirst = tramp_first;
@@ -24338,6 +24388,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     con_args_owned = NULL;   /* same as Map/Set: the state owns it for the whole consume */
                     tac_super_ref = con_super_ref; con_super_ref = JS_UNDEFINED;
                     goto do_ta_consume_tramp;
+                }
                 }
                 if (tramp_can_call_promise_exec(ctx, con_func, con_args, con_argc)) {
                     pe_outer = con_outer; pe_outer_kind = con_outer_kind;
@@ -60137,18 +60188,10 @@ static JSIterAtState data_method_at(JSContext *ctx, JSObject *p, JSAtom atom, JS
    to the direct-generator, non-weak case (WeakSet/WeakMap keys must be objects and are rarer); every other shape
    stays on the normal constructor path. *out_magic receives 0 (Map) or MAGIC_SET. Fork-safe now that a shared
    Set/Map's add is COW-isolated per flow (JSTimeTravelHooks.map_add). call_argv[0] is the iterable. */
-static bool tramp_can_call_setmap_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_magic, JSValue *out_getiter)
+static bool setmap_consume_ready(JSContext *ctx, JSValueConst *call_argv, int call_argc, JSValue *out_getiter)
 {
-    JSObject *fp;
-    int magic;
     *out_getiter = JS_UNDEFINED;
     if (call_argc < 1) return false;
-    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
-    fp = JS_VALUE_GET_OBJ(func);
-    if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
-    if (fp->u.cfunc.cproto != JS_CFUNC_constructor_magic) return false;
-    if (fp->u.cfunc.c_function.constructor_magic != js_map_constructor) return false;
-    magic = fp->u.cfunc.magic;
     /* WeakSet/WeakMap were excluded as "out of scope". They take the SAME constructor, the same adder selection
        (MAGIC_SET picks add over set) and the same per-element rule, so the exclusion bought nothing and cost the
        route: `new WeakMap([[k,v]])` reached the C entry, whose iteration loop is deleted, and aborted.
@@ -60159,7 +60202,6 @@ static bool tramp_can_call_setmap_consume(JSContext *ctx, JSValueConst func, JSV
        a nullish iterable, which per 24.1.1.1 step 2 yields the empty collection before the adder is even read. */
     if (JS_IsUndefined(call_argv[0]) || JS_IsNull(call_argv[0])) return false;
     iter_data_at_iterator(ctx, call_argv[0], out_getiter);   /* JS_UNDEFINED when absent/uncallable => the acquire decides */
-    *out_magic = magic;
     return true;
 }
 
@@ -60181,16 +60223,10 @@ static bool tramp_can_call_setmap_consume(JSContext *ctx, JSValueConst func, JSV
    This named iter_consume_gen_backed as its gate; that predicate had already lost its last caller and is deleted.
    What decides is the side-effect-free iter_data_at_iterator probe below, and only as a HINT the acquire may
    reuse — every shape it cannot answer for is acquired on the tramp instead of refused. */
-static bool tramp_can_call_ta_consume(JSContext *ctx, JSValueConst func, JSValueConst *call_argv, int call_argc, int *out_classid, JSValue *out_getiter)
+static bool ta_consume_ready(JSContext *ctx, JSValueConst *call_argv, int call_argc, JSValue *out_getiter)
 {
-    JSObject *fp;
     *out_getiter = JS_UNDEFINED;
     if (call_argc < 1) return false;
-    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
-    fp = JS_VALUE_GET_OBJ(func);
-    if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
-    if (fp->u.cfunc.cproto != JS_CFUNC_constructor_magic) return false;
-    if (fp->u.cfunc.c_function.constructor_magic != js_typed_array_constructor) return false;
     /* 23.2.5.1 step 6.a: only an OBJECT first argument reaches the iterable/array-like branch — a number is a
        length and takes a different algorithm entirely, as do a TypedArray source (an element-wise copy that
        invokes nothing) and an ArrayBuffer (a view over existing bytes, whose byteOffset/length ToIndex coercions
@@ -60205,7 +60241,6 @@ static bool tramp_can_call_ta_consume(JSContext *ctx, JSValueConst func, JSValue
        a getter, a Proxy, a built-in @@iterator whose iterator's .next may be patched — the acquire performs the
        real GetMethod on the tramp and picks step 5 or step 6 from its answer. */
     iter_data_at_iterator(ctx, call_argv[0], out_getiter);
-    *out_classid = fp->u.cfunc.magic;   /* JS_CLASS_UINT8C_ARRAY .. (nonzero) */
     return true;
 }
 
@@ -75114,6 +75149,9 @@ int JS_AddIntrinsicMapSet(JSContext *ctx)
                                   0);
         if (JS_IsException(obj1))
             return -1;
+        /* 24.1.1.1 step 6 onwards is a WALK of the iterable, and it declares it here rather than being
+           recognised by address at the construct convergence point. */
+        js_declare_consume_ctor(obj1, ITERCONS_SETMAP_CTOR_BASE + i);
         JS_FreeValue(ctx, obj1);
     }
 
@@ -83448,6 +83486,8 @@ int JS_AddIntrinsicTypedArrays(JSContext *ctx)
             JS_FreeValue(ctx, typed_array_base_func);
             return -1;
         }
+        /* 23.2.5.1 step 6.a's iterable branch is a WALK, declared here rather than recognised by address. */
+        js_declare_consume_ctor(obj, ITERCONS_TA_CTOR_BASE + i - JS_CLASS_UINT8C_ARRAY);
         JS_FreeValue(ctx, obj);
     }
     JS_FreeValue(ctx, typed_array_base_func);
