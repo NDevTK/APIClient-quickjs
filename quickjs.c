@@ -10773,9 +10773,16 @@ static void js_free_desc(JSContext *ctx, JSPropertyDescriptor *desc)
    JS_PROP_THROW or JS_PROP_THROW_STRICT. If JS_PROP_NO_ADD is set,
    the new property is not added and an error is raised.
    'obj' must be an object when obj != this_obj.
+
+   `recv_pending` is how a caller takes back 10.1.9.2 step 3 — the completion performed on the RECEIVER, whose
+   two internal methods are the page's `getOwnPropertyDescriptor` and `defineProperty` traps when the receiver is
+   a Proxy. Set it to true and this returns having done nothing but the walk; the caller owns the completion and
+   has somewhere to run it (the keyed-operation entry, as CONT_SET_RECV). Passing NULL asserts the receiver
+   cannot be a Proxy, and the DCHECK at the tail holds every caller to that.
    */
 static int JS_SetPropertyInternal2(JSContext *ctx, JSValueConst obj, JSAtom prop,
-                                   JSValue val, JSValueConst this_obj, int flags)
+                                   JSValue val, JSValueConst this_obj, int flags,
+                                   bool *recv_pending)
 {
     JSObject *p, *p1;
     JSShapeProperty *prs;
@@ -10993,6 +11000,16 @@ retry:
     // TODO(bnoordhuis) return JSProperty slot and update in place
     // when plain property (not is_exotic/setter/etc.) to avoid
     // calling find_own_property() thrice?
+    /* 10.1.9.2 STEP 3, on the Receiver. A Proxy receiver answers both of its internal methods with a trap, which
+       is the page's code and cannot run in this C activation — the caller that has a chain to run it on takes
+       the completion instead. Every other receiver class answers out of its own slots. */
+    if (unlikely(p->class_id == JS_CLASS_PROXY)) {
+        DCHECK(recv_pending,
+               "a [[Set]] completed step 3 on a PROXY receiver from C: route that call site through CONT_SET_RECV");
+        *recv_pending = true;
+        JS_FreeValue(ctx, val);
+        return false;   /* not the answer: the caller performs step 3 and produces one */
+    }
     ret = JS_GetOwnPropertyFlagsInternal(ctx, &desc_flags, p, prop);
     if (ret < 0)
         goto fail;
@@ -11036,7 +11053,9 @@ fail:
 static int JS_SetPropertyInternal(JSContext *ctx, JSValueConst obj, JSAtom prop,
                                   JSValue val, int flags)
 {
-    return JS_SetPropertyInternal2(ctx, obj, prop, val, obj, flags);
+    /* obj IS the receiver, so 10.1.9.2 step 3's `Receiver is O` branch runs and the receiver completion is
+       never reached: nothing here can be a Proxy's trap. */
+    return JS_SetPropertyInternal2(ctx, obj, prop, val, obj, flags, NULL);
 }
 
 int JS_SetProperty(JSContext *ctx, JSValueConst this_obj, JSAtom prop, JSValue val)
@@ -19013,6 +19032,16 @@ typedef struct JSOpKeyed {
                                   to is parked across them, exactly as a handler's trap READ parks it. It is the
                                   same nesting CONT_TRAP_GET already is: a keyed request whose outer is not a
                                   machine but another keyed OPERATION, carrying what waits on that one. */
+#define CONT_SET_RECV      61  /* gp_outer = JSSetRecv: 10.1.9.2 OrdinarySetWithOwnDescriptor step 3, the part of
+                                  a [[Set]] that runs on the RECEIVER once the walk over O found nothing to
+                                  answer with. Two internal methods on an object the walk never touched, so when
+                                  the receiver is a Proxy they are its `getOwnPropertyDescriptor` and
+                                  `defineProperty` traps — and JS_SetPropertyInternal2 ran both from C, with no
+                                  flow base, for every spelling that can give a [[Set]] a receiver of its own:
+                                  `Reflect.set(o, k, v, proxy)`, `super.x = v` where `this` is a Proxy, and every
+                                  write through a TRAPLESS proxy, whose forward keeps the proxy as the Receiver.
+                                  Same nesting as CONT_GOPD_DESC: a keyed OPERATION parked across the requests
+                                  that finish it. */
 typedef struct JSTrapGet {
     JSValue obj;         /* the proxy the operation is on (owned) */
     JSValue val;         /* GP_SET / GP_DEFINE's operand (owned) */
@@ -19937,6 +19966,7 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_FOROF_ENUMREC_WRAP:
     case CONT_TRAP_GET:
     case CONT_GOPD_DESC:
+    case CONT_SET_RECV:
     case CONT_OP_KEYED:
     case CONT_FOR_IN_HAS:
     case CONT_OWNKEYS_CHK:
@@ -21052,6 +21082,39 @@ static void js_gopd_desc_free(JSContext *ctx, JSGopdDesc *gd)
     JS_FreeValue(ctx, gd->trap_res);
     JS_FreeAtom(ctx, gd->atom);
     js_free_rt(ctx->rt, gd);
+}
+
+/* ---- 10.1.9.2 OrdinarySetWithOwnDescriptor step 3, as a phased machine ----
+
+   The walk over O decides only WHO answers; when nobody does — no own slot, no setter on the chain, no exotic
+   [[Set]] — the write is performed on the RECEIVER, out of two internal methods (3.b's [[GetOwnProperty]] and
+   3.e/3.f's [[DefineOwnProperty]]) applied to an object the walk never looked at. That independence is what
+   makes this a separate operation rather than a tail of JS_SetPropertyInternal2, and it is why the state needs
+   nothing from the walk: (Receiver, P, V) is the whole input.
+
+   `no_throw` is the difference between the two callers the spec has: the BARE [[Set]] hands its boolean back
+   (Reflect.set), while Set(O, P, V, true) turns a false into 7.3.4's TypeError. The C tail only had the first
+   half — 3.e's JS_DefineProperty was called with no throw flag, so a `defineProperty` trap REFUSING a write that
+   `super.x = v` performed in strict code reported success. */
+typedef struct JSSetRecv {
+    JSValue recv;        /* the Receiver (owned) */
+    JSValue val;         /* V (owned) */
+    JSAtom atom;         /* P (owned) */
+    void *outer;         /* what is waiting on the [[Set]], not on either of these two operations */
+    uint8_t outer_kind;
+    uint8_t phase;       /* SR_* */
+    uint8_t no_throw;    /* 1 = the bare internal method's boolean; 0 = Set(O,P,V,true) */
+    JSDescFacts facts;   /* step 3.b's answer, as the attribute bits 3.c tests (owned) */
+} JSSetRecv;
+enum { SR_GOPD = 0, SR_GOPD_GOT, SR_DEFINE_GOT };
+
+static void js_set_recv_free(JSContext *ctx, JSSetRecv *sr)
+{
+    js_desc_facts_free(ctx, &sr->facts);
+    JS_FreeValue(ctx, sr->recv);
+    JS_FreeValue(ctx, sr->val);
+    JS_FreeAtom(ctx, sr->atom);
+    js_free_rt(ctx->rt, sr);
 }
 
 /* ---- 10.5.11 [[OwnPropertyKeys]]'s invariant, as a phased machine ----
@@ -26687,6 +26750,80 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
             }
 
+        do_set_recv_step:
+            /* 10.1.9.2 step 3, one internal method at a time. `ret_val` is the previous one's answer. Both are
+               requests on the RECEIVER, so a Proxy answers each with a trap on this chain and a loop inside
+               either parks — which is the whole reason this is not the tail of JS_SetPropertyInternal2. */
+            {
+                JSSetRecv *sr = (JSSetRecv *)cont_st;
+                int sflags;
+                bool ok;
+                cont_st = NULL;
+                if (sr->phase == SR_GOPD) {
+                    /* 3.b: existingDescriptor is ? Receiver.[[GetOwnProperty]](P). The ATTRIBUTE BITS are what
+                       3.c tests, so it is asked for as a record — building a descriptor object for 3.c to take
+                       apart again would be twelve more reads of what was never lost. */
+                    sr->phase = SR_GOPD_GOT;
+                    gp_obj = sr->recv; gp_atom = sr->atom;
+                    gp_op = GP_GETOWNPROP; gp_val = JS_UNDEFINED;
+                    gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
+                    gp_desc_out = &sr->facts;
+                    gp_outer = sr; gp_outer_kind = CONT_SET_RECV;
+                    goto do_getprop_tramp;
+                }
+                if (sr->phase == SR_GOPD_GOT) {
+                    DCHECK(JS_IsUndefined(ret_val),
+                           "a record-answering [[GetOwnProperty]] delivers through the record, not the result");
+                    sflags = sr->facts.flags;
+                    if (sflags >= 0 && ((sflags & JS_PROP_TMASK) == JS_PROP_GETSET
+                                        || !(sflags & JS_PROP_WRITABLE))) {
+                        /* 3.c.i / 3.c.ii: an ACCESSOR on the receiver, or a non-writable data property, refuses
+                           the write outright — 3.e never runs, so the `defineProperty` trap must NOT fire. */
+                        ok = false;
+                        goto do_set_recv_answer;
+                    }
+                    sr->phase = SR_DEFINE_GOT;
+                    gp_obj = sr->recv; gp_atom = sr->atom;
+                    gp_op = GP_DEFINE; gp_val = sr->val;
+                    gp_getter = JS_UNDEFINED; gp_setter = JS_UNDEFINED;
+                    /* 3.e defines ONLY [[Value]] over the property that is already there; 3.f is
+                       CreateDataProperty, whose descriptor is the full writable/enumerable/configurable one. */
+                    gp_dflags = (sflags >= 0)
+                        ? JS_PROP_HAS_VALUE
+                        : (JS_PROP_HAS_VALUE | JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE
+                           | JS_PROP_HAS_CONFIGURABLE | JS_PROP_C_W_E);
+                    gp_recv = JS_UNINITIALIZED;
+                    gp_no_throw = 1;   /* the BARE [[DefineOwnProperty]]: its boolean IS step 3's answer */
+                    gp_outer = sr; gp_outer_kind = CONT_SET_RECV;
+                    goto do_getprop_tramp;
+                }
+                DCHECK(sr->phase == SR_DEFINE_GOT, "the [[Set]] receiver completion resumed in no phase");
+                ok = JS_ToBool(ctx, ret_val);
+                JS_FreeValue(ctx, ret_val);
+            do_set_recv_answer:
+                /* EVERY field is read BEFORE the free: js_set_recv_free owns the block. */
+                {
+                    bool sr_nothrow = sr->no_throw;
+                    JSAtom sr_atom = JS_DupAtom(ctx, sr->atom);
+                    gp_outer = sr->outer; gp_outer_kind = sr->outer_kind;
+                    js_set_recv_free(ctx, sr);
+                    if (sr_nothrow) {
+                        ret_val = js_bool(ok);       /* the bare [[Set]] reports it */
+                    } else if (!ok) {
+                        /* 7.3.4 Set(O, P, V, true) step 3: a refused write is the CALLER's TypeError. The C tail
+                           had no half of this — 3.e's JS_DefineProperty was called with no throw flag — so a
+                           receiver whose `defineProperty` trap returned false reported success to strict code. */
+                        JS_ThrowTypeErrorReadOnly(ctx, JS_PROP_THROW, sr_atom);
+                        JS_FreeAtom(ctx, sr_atom);
+                        goto getprop_throw;
+                    } else {
+                        ret_val = JS_UNDEFINED;
+                    }
+                    JS_FreeAtom(ctx, sr_atom);
+                }
+                goto do_getprop_complete;
+            }
+
         do_getprop_tramp:
             /* A keyed property OPERATION requested by a step machine — a READ or a HasProperty. Three shapes, ONE
                entry: a Proxy trap and a bytecode accessor are user code and run ON THIS CHAIN, so a loop in either
@@ -26795,6 +26932,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             gp_recv = gp_recv_r;
                             gp_no_throw = gp_nothrow_r;
                             gp_getter = gp_getter_r; gp_setter = gp_setter_r; gp_dflags = gp_dflags_r;
+                            /* the ANSWER SHAPE is an operand too, and this loop is one of the places the request
+                               is parked: dropping it made a forwarded [[GetOwnProperty]] build a descriptor
+                               OBJECT for a requester that had named a record, which then read the object as if
+                               it were the record's flags. Every operand of the request stands except the
+                               object — this one was missed because no requester asked for a record THROUGH a
+                               trapless proxy until the [[Set]] receiver completion did. */
+                            gp_desc_out = gp_descout_r;
                             if (gp_trapst) { js_trapget_free(ctx, gp_trapst); gp_trapst = NULL; }
                             goto do_getprop_tramp;
                         }
@@ -26895,9 +27039,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (unlikely(dres < 0)) goto getprop_throw;
                         ret_val = js_bool(dres);
                     } else if (gp_op == GP_SET && gp_nothrow_r) {
-                        /* the bare [[Set]]: likewise, and with the receiver the operation was given. */
+                        /* the bare [[Set]]: likewise, and with the receiver the operation was given. The WALK is
+                           C — it invokes nothing, which is what this arm established — but 10.1.9.2 step 3 runs
+                           on the RECEIVER, and a Proxy receiver answers it with two traps. Those come back here
+                           as a machine rather than being performed down there. */
+                        bool recv_pending = false;
                         int sres = JS_SetPropertyInternal2(ctx, fwd ? gp_fwd : gp_obj, gp_atom, js_dup(gp_val),
-                                                           gp_recv_r, 0);
+                                                           gp_recv_r, 0, &recv_pending);
+                        if (unlikely(recv_pending)) goto do_set_recv_start;
                         if (unlikely(sres < 0)) goto getprop_throw;
                         ret_val = js_bool(sres);
                     } else if (gp_op == GP_DELETE) {
@@ -26916,9 +27065,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         }
                         ret_val = JS_UNDEFINED;
                     } else if (gp_op == GP_SET) {
-                        /* Set(O, P, V, true): the write yields nothing to the machine, only its throw. */
-                        if (unlikely(JS_SetPropertyInternal2(ctx, fwd ? gp_fwd : gp_obj, gp_atom, js_dup(gp_val),
-                                                             gp_recv_r, JS_PROP_THROW) < 0))
+                        /* Set(O, P, V, true): the write yields nothing to the machine, only its throw. Same
+                           receiver completion as the bare form, and the machine carries which of the two it is
+                           finishing — 7.3.4 turns a false into the TypeError, where the bare one reports it. */
+                        bool recv_pending = false;
+                        int wres = JS_SetPropertyInternal2(ctx, fwd ? gp_fwd : gp_obj, gp_atom, js_dup(gp_val),
+                                                          gp_recv_r, JS_PROP_THROW, &recv_pending);
+                        if (unlikely(recv_pending)) goto do_set_recv_start;
+                        if (unlikely(wres < 0))
                             goto getprop_throw;
                         ret_val = JS_UNDEFINED;
                     } else if (gp_op == GP_DEFINE) {
@@ -27015,6 +27169,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                              results are plain objects. Back into the walk with the answer. */
                           cont_st = gouter0;
                           goto do_gopd_desc_step;
+                      }
+                      if (gk == CONT_SET_RECV) {
+                          /* one of the receiver completion's two internal methods, answered with nothing
+                             suspended — a trapless proxy receiver, a C trap. The phase says which. */
+                          cont_st = gouter0;
+                          goto do_set_recv_step;
                       }
                       if (gk == CONT_TRAP_GET) {
                           /* a handler TRAP READ that invoked nothing — a data property on the handler, which is
@@ -27180,6 +27340,30 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    continuation's OWN — which is what the empty shape states, and what lets its arms rewrite the
                    callee in place without touching the caller. */
                 goto do_generic_callee;
+
+                do_set_recv_start:
+                    /* the walk over O ended at 10.1.9.2 step 3 with a PROXY receiver. Everything step 3 needs is
+                       here — the receiver, the key and the value are the request's own operands — so the whole
+                       completion becomes a machine and the [[Set]] is parked across it, exactly as a
+                       [[GetOwnProperty]] parks across its descriptor walk. */
+                    {
+                        JSSetRecv *sr = js_mallocz(ctx, sizeof(*sr));
+                        if (unlikely(!sr)) { JS_ThrowOutOfMemory(ctx); goto getprop_throw; }
+                        sr->recv = js_dup(gp_recv_r);
+                        sr->val = js_dup(gp_val);
+                        sr->atom = JS_DupAtom(ctx, gp_atom);
+                        sr->no_throw = (uint8_t)gp_nothrow_r;
+                        sr->phase = SR_GOPD;
+                        js_desc_facts_init(&sr->facts);
+                        sr->outer = gp_outer; sr->outer_kind = gp_outer_kind;
+                        gp_outer = NULL; gp_outer_kind = CONT_NONE;
+                        /* the OPERATION owns its trap read no longer: the walk is over and the completion issues
+                           requests of its own, which must not resume into this one's handler lookup. */
+                        if (gp_trapst) { js_trapget_free(ctx, gp_trapst); gp_trapst = NULL; }
+                        cont_st = sr;
+                        ret_val = JS_UNDEFINED;
+                        goto do_set_recv_step;
+                    }
             }
 
             getprop_throw:
@@ -27198,6 +27382,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         JSGopdDesc *gd = gouter;
                         gp_outer = gd->outer; gp_outer_kind = gd->outer_kind;
                         js_gopd_desc_free(ctx, gd);
+                        goto getprop_throw;
+                    }
+                    if (gk3 == CONT_SET_RECV) {
+                        /* one of the receiver completion's two internal methods threw in place. The [[Set]] it
+                           is parked inside can never finish, so the throw unwinds one level and this very label
+                           handles it for whatever was waiting on the WRITE. */
+                        JSSetRecv *srt = gouter;
+                        gp_outer = srt->outer; gp_outer_kind = srt->outer_kind;
+                        js_set_recv_free(ctx, srt);
                         goto getprop_throw;
                     }
                     if (gk3 == CONT_WITH_HAS) {
@@ -30166,7 +30359,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            || gouter_kind == CONT_ITER_HELPER_GET || gouter_kind == CONT_PROMISE_ALL_GET
                            || gouter_kind == CONT_FOROF_UNPACK || gouter_kind == CONT_FOR_IN_HAS
                            || gouter_kind == CONT_OWNKEYS_CHK || gouter_kind == CONT_PROXY_INV
-                           || gouter_kind == CONT_KEYED_INV || gouter_kind == CONT_WITH_HAS,
+                           || gouter_kind == CONT_KEYED_INV || gouter_kind == CONT_WITH_HAS
+                           || gouter_kind == CONT_SET_RECV,
                            "property-get outer continuation: unknown machine kind");
                     if (gouter_kind == CONT_PROMISE_ALL_THEN) {
                         js_getprop_free(ctx, gp);
@@ -30575,6 +30769,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             goto getprop_throw;
                         }
                         goto do_ownkeys_chk_step;
+                    }
+                    if (gouter_kind == CONT_SET_RECV) {
+                        /* one of the receiver completion's own requests — 3.b's [[GetOwnProperty]] or 3.e/3.f's
+                           [[DefineOwnProperty]] — whose trap suspended. The machine takes the answer from
+                           `ret_val` in the phase that asked. */
+                        cont_st = gouter;
+                        if (unlikely(JS_IsException(ret_val))) {
+                            JSSetRecv *srx = gouter;
+                            gp_outer = srx->outer; gp_outer_kind = srx->outer_kind;
+                            js_set_recv_free(ctx, srx);
+                            goto getprop_throw;
+                        }
+                        goto do_set_recv_step;
                     }
                     if (gouter_kind == CONT_GOPD_DESC) {
                         /* one of the [[GetOwnProperty]] invariant's OWN requests — step 10's target descriptor or
@@ -32613,7 +32820,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         }
                     }
                     ret = JS_SetPropertyInternal2(ctx, obj, atom, sp[-1], obj,
-                                                  JS_PROP_THROW_STRICT);
+                                                  JS_PROP_THROW_STRICT, NULL);   /* obj IS the receiver */
                     JS_FreeValue(ctx, obj);
                     sp -= 2;
                     if (unlikely(ret < 0))
@@ -33195,20 +33402,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    on the superclass prototype was invoked by call_setter from C and a `set` trap by js_proxy_set,
                    each aborting at its first back-edge with no flow base. Same two routes as the read, with the
                    receiver taken from sp[-4] instead of sp[-3]. */
-                if ((tramp_px = tramp_proto_proxy(ctx, JS_VALUE_GET_OBJ(sp[-3]), atom)) != NULL) {
-                    /* [[Set]] on a Proxy is the `set` trap plus the READ of that trap off the handler: the one
-                       keyed-operation entry's GP_SET, the same request Reflect.set issues. no_throw is the
-                       WRITER's strictness — 6.2.5.6 PutValue step 6 turns a refused write into a TypeError only
-                       in strict code — and a class body is strict, but an object-literal method carrying a
-                       `super` reference need not be. */
-                    JSOpKeyed *ok = js_mallocz(ctx, sizeof(*ok));
-                    if (unlikely(!ok)) { JS_FreeAtom(ctx, atom); JS_ThrowOutOfMemory(ctx); goto exception; }
-                    ok->atom = atom; ok->pop = 4; ok->push = 0;
-                    gp_obj = JS_MKPTR(JS_TAG_OBJECT, tramp_px); gp_atom = ok->atom; gp_op = GP_SET; gp_val = sp[-1];
-                    gp_recv = sp[-4]; gp_no_throw = !sf->is_strict_mode;
-                    gp_outer = ok; gp_outer_kind = CONT_OP_KEYED;
-                    goto do_getprop_tramp;
-                } else {
+                tramp_px = tramp_proto_proxy(ctx, JS_VALUE_GET_OBJ(sp[-3]), atom);
+                if (!tramp_px) {
                     JSObject *st = tramp_accessor_setter(ctx, JS_VALUE_GET_OBJ(sp[-3]), atom);
                     if (st) {   /* bytecode setter -> 1-arg method call [receiver=this, setter, value] */
                         JSValue v = sp[-1];                             /* the value being written */
@@ -33224,10 +33419,30 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         goto do_generic_callee;   /* which KIND of callee the setter is, is asked there */
                     }
                 }
+                if (tramp_px
+                    || (JS_VALUE_GET_TAG(sp[-4]) == JS_TAG_OBJECT
+                        && JS_VALUE_GET_OBJ(sp[-4])->class_id == JS_CLASS_PROXY)) {
+                    /* Either the WALK reaches page code (a Proxy on the home prototype's chain — [[Set]] on it is
+                       the `set` trap plus the READ of that trap off the handler), or the RECEIVER does: 10.1.9.2
+                       step 3 finishes the write with two internal methods on `this`, and a Proxy `this` answers
+                       both with a trap. The second is why `super.x = v` is routed on a receiver test the other
+                       write opcodes have no need for — theirs write to the object they walked.
+                       no_throw is the WRITER's strictness — 6.2.5.6 PutValue step 6 turns a refused write into a
+                       TypeError only in strict code — and a class body is strict, but an object-literal method
+                       carrying a `super` reference need not be. */
+                    JSOpKeyed *ok = js_mallocz(ctx, sizeof(*ok));
+                    if (unlikely(!ok)) { JS_FreeAtom(ctx, atom); JS_ThrowOutOfMemory(ctx); goto exception; }
+                    ok->atom = atom; ok->pop = 4; ok->push = 0;
+                    gp_obj = tramp_px ? JS_MKPTR(JS_TAG_OBJECT, tramp_px) : sp[-3];
+                    gp_atom = ok->atom; gp_op = GP_SET; gp_val = sp[-1];
+                    gp_recv = sp[-4]; gp_no_throw = !sf->is_strict_mode;
+                    gp_outer = ok; gp_outer_kind = CONT_OP_KEYED;
+                    goto do_getprop_tramp;
+                }
                 ret = JS_SetPropertyInternal2(ctx,
                                               sp[-3], atom,
                                               sp[-1], sp[-4],
-                                              JS_PROP_THROW_STRICT);
+                                              JS_PROP_THROW_STRICT, NULL);
                 JS_FreeAtom(ctx, atom);
                 JS_FreeValue(ctx, sp[-4]);
                 JS_FreeValue(ctx, sp[-3]);
@@ -34895,7 +35110,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             DCHECK(!gouter || gk2 == CONT_STEP || gk2 == CONT_ITER_CONSUME || gk2 == CONT_ACQUIRE_GET
                    || gk2 == CONT_ITER_CLOSE || gk2 == CONT_TRAP_GET || gk2 == CONT_GOPD_DESC
                    || gk2 == CONT_OWNKEYS_CHK || gk2 == CONT_PROXY_INV || gk2 == CONT_KEYED_INV
-                   || gk2 == CONT_WITH_HAS
+                   || gk2 == CONT_WITH_HAS || gk2 == CONT_SET_RECV
                    || gk2 == CONT_OP_KEYED
                    || gk2 == CONT_PROMISE_ALL_THEN || gk2 == CONT_AFS_GET
                    || gk2 == CONT_ITER_HELPER_GET || gk2 == CONT_PROMISE_ALL_GET
@@ -34971,6 +35186,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             } else if (gouter && gk2 == CONT_WITH_HAS) {
                 js_with_has_free(ctx, gouter);
                 goto exception;
+            } else if (gouter && gk2 == CONT_SET_RECV) {
+                /* the same for the receiver completion, whose two internal methods suspend for the same
+                   reasons: the [[Set]] can never finish, so the throw unwinds one level. */
+                JSSetRecv *srt = gouter;
+                gp_outer = srt->outer; gp_outer_kind = srt->outer_kind;
+                js_set_recv_free(ctx, srt);
+                goto getprop_throw;
             } else if (gouter && gk2 == CONT_KEYED_INV) {
                 /* the same for the keyed invariant once its read has suspended. */
                 JSKeyedInv *kit = gouter;
@@ -59479,7 +59701,7 @@ static JSValue js_error_set_stack(JSContext *ctx, JSValueConst this_val,
             return JS_EXCEPTION;
     } else {
         if (JS_SetPropertyInternal2(ctx, this_val, JS_ATOM_stack, js_dup(value),
-                                    this_val, JS_PROP_THROW) < 0)
+                                    this_val, JS_PROP_THROW, NULL) < 0)   /* this_val IS the receiver */
             return JS_EXCEPTION;
     }
     return JS_UNDEFINED;
@@ -73658,8 +73880,13 @@ static int js_proxy_set(JSContext *ctx, JSValueConst obj, JSAtom atom,
     if (!s)
         return -1;
     if (JS_IsUndefined(method)) {
+        /* 10.5.9 step 6's forward keeps the PROXY as the Receiver, so this reaches the receiver completion
+           with a Proxy receiver whenever the target answers nothing — and there is no chain here to run its
+           traps on. The keyed-operation entry spells this forward out itself (gp_obj = target, receiver
+           unchanged), so every routed write goes there instead; a C write that still walks into a proxy
+           arrives here and the DCHECK at the completion names it. */
         return JS_SetPropertyInternal2(ctx, s->target, atom,
-                                       js_dup(value), receiver, flags);
+                                       js_dup(value), receiver, flags, NULL);
     }
     atom_val = JS_AtomToValue(ctx, atom);
     if (JS_IsException(atom_val)) {
