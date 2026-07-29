@@ -17921,11 +17921,15 @@ static int step_defidx_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, int64
     return 0;
 }
 
-/* CreateDataPropertyOrThrow(O, key, v) for a NAMED key — the sibling of step_setprop_run, and the same request
+/* CreateDataProperty(O, key, v) for a NAMED key — the sibling of step_setprop_run, and the same request
    step_defidx_run issues for an index. On a Proxy it is the `defineProperty` trap.
+   `or_throw` IS the spec's own distinction, not a convenience: CreateDataPropertyOrThrow raises a TypeError when
+   [[DefineOwnProperty]] answers false, and CreateDataProperty (25.5.1.1's, InternalizeJSONProperty) YIELDS that
+   false and carries on. A trap returning false is what tells the two apart, so the caller names which one the
+   step it is implementing says.
      0 = done, 10 = the caller must return that step code. */
 static int step_defprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAtom atom, JSValueConst value,
-                            JSValue in, JSValue **out_cb, int *out_argc)
+                            bool or_throw, JSValue in, JSValue **out_cb, int *out_argc)
 {
     if (h->get_phase == GET_PH_START) {
         JS_FreeValue(ctx, in);
@@ -17934,6 +17938,13 @@ static int step_defprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAt
         h->cb_coerce[0] = (JSValue)obj;     /* borrowed: the machine holds both across the define */
         h->cb_coerce[1] = (JSValue)value;
         *out_cb = h->cb_coerce; *out_argc = (int)atom;
+        if (!or_throw) {
+            /* the descriptor is CreateDataProperty's own; only the THROW bit differs, and the relay reads
+               gp_no_throw off its absence. */
+            DCHECK(h->desc_flags == 0, "a descriptor shape is already in flight on this machine's header");
+            h->desc_flags = JS_PROP_HAS_VALUE | JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE
+                          | JS_PROP_HAS_CONFIGURABLE | JS_PROP_C_W_E;
+        }
         h->get_phase = GET_PH_GOT;
         return 10;
     }
@@ -17941,6 +17952,29 @@ static int step_defprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAt
     h->get_atom = JS_ATOM_NULL;
     h->get_phase = GET_PH_START;
     JS_FreeValue(ctx, in);                  /* a define delivers no value */
+    return 0;
+}
+
+/* The BARE `O.[[Delete]](key)` for a NAMED key — 25.5.1.1's, which yields its boolean rather than throwing on
+   false, so it is request 15 and not the DeletePropertyOrThrow step_delidx_run issues. On a Proxy it is the
+   `deleteProperty` trap.
+     0 = done, 15 = the caller must return that step code. */
+static int step_delprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAtom atom,
+                            JSValue in, JSValue **out_cb, int *out_argc)
+{
+    if (h->get_phase == GET_PH_START) {
+        JS_FreeValue(ctx, in);
+        DCHECK(h->get_atom == JS_ATOM_NULL, "a keyed operation is already in flight on this machine's header");
+        h->get_atom = JS_DupAtom(ctx, atom);
+        h->cb_coerce[0] = (JSValue)obj;     /* borrowed: the machine holds it across the delete */
+        *out_cb = h->cb_coerce; *out_argc = (int)atom;
+        h->get_phase = GET_PH_GOT;
+        return 15;
+    }
+    JS_FreeAtom(ctx, h->get_atom);
+    h->get_atom = JS_ATOM_NULL;
+    h->get_phase = GET_PH_START;
+    JS_FreeValue(ctx, in);                  /* the boolean [[Delete]] answered is 25.5.1.1's to discard */
     return 0;
 }
 
@@ -20879,13 +20913,19 @@ typedef struct JRFrame {
     JSValue name_val;               /* JS_AtomToValue(name), owned, held across the reviver call */
     JSAtom name;                    /* the key of val in holder (owned) */
     struct JSPropertyEnum *atoms;   /* own enumerable keys of val (object case) */
-    uint32_t len, i;                /* key count + cursor */
+    int64_t len, i;                 /* key count + cursor. int64 because LengthOfArrayLike is ToLength, so an
+                                       array-like `length` reaches 2^53-1 and js_get_length32 truncated it */
     int is_array;
     struct JSONParseRecord *fpr;    /* holder's parse record (borrowed); vpr = val's, resolved in phase 0 */
     struct JSONParseRecord *vpr;
     uint8_t phase;                  /* 0=needs init, 1=iterating children, 2=reviver called (awaiting result),
-                                       3=the enumerable-key walk is in flight (an OBJECT val only) */
+                                       3=the enumerable-key walk is in flight (an OBJECT val only),
+                                       4=`Get(holder, P)` is in flight, 5=the child's apply is in flight,
+                                       6=LengthOfArrayLike is in flight */
     struct JSEnumKeys *ek;          /* phase 3: EnumerableOwnPropertyNames' key half, resumable (owned) */
+    JSValue applied;                /* phase 5: the child's revived value, owned across the CreateDataProperty */
+    JSAtom apply_name;              /* phase 5: the child's key (owned) */
+    uint8_t apply_del;              /* phase 5: 1 = the child revived to undefined, so the apply is a [[Delete]] */
 } JRFrame;
 typedef struct JSJsonReviver {
     JSStepHdr hdr;                  /* MUST be first — enforced by STEP_STATE_HDR_FIRST below */
@@ -63605,7 +63645,7 @@ static int js_iter_setter_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
     }
     DCHECK(s->hdr.stage == ITS_DEFINE, "the %Iterator.prototype% setter's machine resumed in no stage");
     r = step_defprop_run(ctx, &s->hdr, s->hdr.this_val, key,                   /* step 4 */
-                         step_arg(&s->hdr, 0), cb_result, out_cb, out_argc);
+                         step_arg(&s->hdr, 0), true, cb_result, out_cb, out_argc);
     return r != 0 ? r : 0;
 }
 
@@ -73036,6 +73076,7 @@ static int jr_push(JSContext *ctx, JSJsonReviver *s) {
     f->holder = JS_UNDEFINED; f->val = JS_UNDEFINED; f->context = JS_UNDEFINED;
     f->name = JS_ATOM_NULL; f->name_val = JS_UNDEFINED; f->atoms = NULL;
     f->len = 0; f->i = 0; f->is_array = 0; f->fpr = NULL; f->vpr = NULL; f->phase = 0; f->ek = NULL;
+    f->applied = JS_UNDEFINED; f->apply_name = JS_ATOM_NULL; f->apply_del = 0;
     return 0;
 }
 /* descend a HOLDER's parse-record to the child `name` whose value is `cval`, mirroring internalize's pr walk. */
@@ -73097,13 +73138,16 @@ static int js_json_parse_vstep(JSContext *ctx, void *st, JSValue cb_result, JSVa
         if (r < 0) return -1;
         if (r == 0) return 0;
     }
-    if (r == 6 || r == 11 || r == 12) {
-        /* a keyed operation the walk owes: 25.5.1.1's `Get(holder, P)`, or the enumerable-key cursor's
-           [[OwnPropertyKeys]] / [[GetOwnProperty]]. The machine relays the requester's own buffer, which holds
-           the object across the request. */
+    if (r == 5 || r == 6 || r == 10 || r == 11 || r == 12 || r == 15) {
+        /* an operation the walk owes: 25.5.1.1's `Get(holder, P)`, LengthOfArrayLike's read and its ToLength, the
+           apply's CreateDataProperty or bare [[Delete]], or the enumerable-key cursor's [[OwnPropertyKeys]] /
+           [[GetOwnProperty]]. The machine relays the requester's own buffer, which holds the operands across the
+           request. Every code the walk can produce is listed, and one it cannot answer for falls through to the
+           reviver CALL below with an undefined callee — so the list is asserted rather than assumed. */
         *out_cb = s->ek_cb; *out_argc = s->ek_argc;
         return r;
     }
+    DCHECK(r == 1, "the JSON reviver walk produced a step code its driver does not relay");
     /* cb_args[0] (the holder, i.e. `this`) is set by the step itself; cb_args[1] is the reviver, which the caller
        supplies — omitting it left the driver calling an undefined callee, so the reviver was never invoked. */
     s->cb_args[1] = s->reviver;
@@ -73169,26 +73213,52 @@ static int js_json_reviver_step(JSContext *ctx, JSJsonReviver *s, JSValue res, J
         f->phase = 1;
         res = JS_UNDEFINED;
     }
-    if (s->sp > 0 && s->stack[s->sp - 1].phase == 4) {
-        /* the value read landed: `res` is it, not a reviver result. The frame's own arm below consumes it. */
+    if (s->sp > 0 && (s->stack[s->sp - 1].phase == 4 || s->stack[s->sp - 1].phase == 6)) {
+        /* a read landed: `res` is the value or the raw `length`, not a reviver result. The frame's own arm below
+           consumes it. */
+    } else if (s->sp > 0 && s->stack[s->sp - 1].phase == 5) {
+        /* the apply's own request answered; the arm below re-enters the sub-sequence with it. */
     } else if (s->sp > 0 && s->stack[s->sp - 1].phase == 2) {   /* a node's reviver just returned `res` */
         JRFrame *f = &s->stack[s->sp - 1];
         JSAtom fname = f->name;                          /* keep for the parent apply */
-        if (f->atoms) js_free_prop_enum(ctx, f->atoms, f->len);
+        if (f->atoms) js_free_prop_enum(ctx, f->atoms, (uint32_t)f->len);
         JS_FreeValue(ctx, f->name_val);
         JS_FreeValue(ctx, f->val);
         JS_FreeValue(ctx, f->context);
         s->sp--;
         if (s->sp == 0) { JS_FreeAtom(ctx, fname); s->result = res; return 0; }   /* root: done */
-        JRFrame *p = &s->stack[s->sp - 1];
-        int ret;
-        if (JS_IsUndefined(res)) { JS_FreeValue(ctx, res); ret = JS_DeleteProperty(ctx, p->val, fname, 0); }
-        else ret = JS_DefinePropertyValue(ctx, p->val, fname, res, JS_PROP_C_W_E);   /* consumes res */
-        JS_FreeAtom(ctx, fname);
-        if (ret < 0) return -1;
-        p->i++;
+        {
+            /* 25.5.1.1 steps 2.b.ii.3/4 (and 2.c.ii.2/3): `? val.[[Delete]](P)` or
+               `? CreateDataProperty(val, P, newElement)`. Both are the page's code the moment `val` is a Proxy or
+               carries a non-configurable/non-writable property — and a reviver runs BOTTOM-UP with `this` bound to
+               the holder, so it can plant a proxy on the very object its parent is about to write back into.
+               JS_DeleteProperty / JS_DefinePropertyValue ran both from C. The apply is now a parked
+               sub-sequence, and the frame owns the operands across it because the machine's C locals are gone
+               when it resumes. */
+            JRFrame *p = &s->stack[s->sp - 1];
+            p->apply_del = JS_IsUndefined(res);
+            if (p->apply_del) JS_FreeValue(ctx, res);
+            else p->applied = res;                       /* owned until the define has been issued */
+            p->apply_name = fname;                       /* owned; the sub-sequence dups it */
+            p->phase = 5;
+            res = JS_UNDEFINED;
+        }
     } else {
         JS_FreeValue(ctx, res);                          /* JS_UNDEFINED on the first call */
+    }
+    if (s->sp > 0 && s->stack[s->sp - 1].phase == 5) {
+        JRFrame *p = &s->stack[s->sp - 1];
+        int r = p->apply_del
+            ? step_delprop_run(ctx, &s->hdr, p->val, p->apply_name, res, &s->ek_cb, &s->ek_argc)
+            : step_defprop_run(ctx, &s->hdr, p->val, p->apply_name, p->applied, false, res,
+                               &s->ek_cb, &s->ek_argc);
+        if (r > 0) return r;
+        if (r < 0) return -1;
+        JS_FreeAtom(ctx, p->apply_name); p->apply_name = JS_ATOM_NULL;
+        JS_FreeValue(ctx, p->applied); p->applied = JS_UNDEFINED;
+        p->phase = 1;
+        p->i++;
+        res = JS_UNDEFINED;
     }
     while (s->sp > 0) {
         JRFrame *f = &s->stack[s->sp - 1];
@@ -73215,7 +73285,15 @@ static int js_json_reviver_step(JSContext *ctx, JSJsonReviver *s, JSValue res, J
             if (JS_IsObject(f->val)) {
                 f->is_array = js_is_array(ctx, f->val);
                 if (f->is_array < 0) return -1;
-                if (f->is_array) { if (js_get_length32(ctx, &f->len, f->val)) return -1; }
+                if (f->is_array) {
+                    /* 25.5.1.1 step 2.b.i: `? LengthOfArrayLike(val)`, which is `? ToLength(? Get(val, "length"))`.
+                       js_get_length32 ran BOTH halves from C — the read is a Proxy `get` trap or an accessor, and
+                       the ToLength coerces whatever it produced — and it truncated to 32 bits where ToLength
+                       reaches 2^53-1. The shared sub-sequence performs both. */
+                    f->phase = 6;
+                    res = JS_UNDEFINED;
+                    goto array_len;
+                }
                 else {
                     /* 25.5.1.1 step 3.c: `? EnumerableOwnPropertyNames(val, key)`. It was JS_GPN_ENUM_ONLY from
                        C, which runs a Proxy's `ownKeys` and per-key `getOwnPropertyDescriptor` traps with no flow
@@ -73232,13 +73310,24 @@ static int js_json_reviver_step(JSContext *ctx, JSJsonReviver *s, JSValue res, J
             } else if (f->vpr) {   /* primitive with a source record -> context.source */
                 JSValue src = JS_NewStringLen(ctx, s->text + f->vpr->u.primitive.source_pos, f->vpr->u.primitive.source_len);
                 if (JS_IsException(src)) return -1;
+                /* f->context is this walk's own fresh object, so its define is not the page's code */
                 if (JS_DefinePropertyValue(ctx, f->context, JS_ATOM_source, src, JS_PROP_C_W_E) < 0) return -1;
             }
             f->phase = 1;
         }
-        if ((int64_t)f->i < (int64_t)f->len) {           /* descend into child i */
+        if (f->phase == 6) {
+        array_len:
+            {
+                int r = step_length_run(ctx, &s->hdr, f->val, res, &f->len, &s->ek_cb, &s->ek_argc);
+                res = JS_UNDEFINED;
+                if (r > 0) return r;
+                if (r < 0) return -1;
+                f->phase = 1;
+            }
+        }
+        if (f->i < f->len) {                             /* descend into child i */
             JSAtom prop;
-            if (f->is_array) { prop = JS_NewAtomUInt32(ctx, f->i); if (prop == JS_ATOM_NULL) return -1; }
+            if (f->is_array) { prop = JS_NewAtomInt64(ctx, f->i); if (prop == JS_ATOM_NULL) return -1; }
             else prop = JS_DupAtom(ctx, f->atoms[f->i].atom);
             JSValueConst pval = f->val; JSONParseRecord *pvpr = f->vpr;   /* snapshot before push may realloc s->stack */
             if (jr_push(ctx, s) < 0) { JS_FreeAtom(ctx, prop); return -1; }
@@ -73262,10 +73351,12 @@ static JSValue js_json_reviver_end(JSContext *ctx, JSJsonReviver *s, bool ok) {
         /* a frame torn down MID-WALK still owns its cursor — the exception can arrive from inside one of its
            twelve requests, which is precisely the state this list has to cover. */
         if (f->ek) { js_enum_keys_free(ctx, f->ek); js_free(ctx, f->ek); f->ek = NULL; }
-        if (f->atoms) js_free_prop_enum(ctx, f->atoms, f->len);
+        if (f->atoms) js_free_prop_enum(ctx, f->atoms, (uint32_t)f->len);
         JS_FreeValue(ctx, f->name_val);
         JS_FreeValue(ctx, f->val);
         JS_FreeValue(ctx, f->context);
+        JS_FreeValue(ctx, f->applied);
+        JS_FreeAtom(ctx, f->apply_name);
         JS_FreeAtom(ctx, f->name);
     }
     js_free(ctx, s->stack); s->stack = NULL;
