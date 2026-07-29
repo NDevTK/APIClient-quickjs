@@ -63466,8 +63466,10 @@ static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue
         }
     }
     case ITHP_FLATMAP_INNER:
-        /* res = INNER {value,done}: only IteratorComplete is read — the result object itself is what this helper
-           emits — so this unpack is one request rather than two. */
+        /* res = INNER {value,done}: 27.1.4.5's inner loop does IteratorStepValue — IteratorComplete then
+           IteratorValue — and YIELDS the value, so the helper builds a fresh CreateIterResultObject around it.
+           Emitting the inner's own result OBJECT instead (what this did) leaked the delegate's object identity
+           through `helper.next()`, and moved the `value` read from inside the helper to whoever consumed it. */
         if (!JS_IsObject(res)) {   /* 7.4.2 step 3 */
             JS_FreeValue(ctx, res);
             JS_ThrowTypeError(ctx, "iterator result not an object");
@@ -63479,18 +63481,22 @@ static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue
         return 6;
     case ITHP_INNER_DONE: {
         int d = JS_ToBoolFree(ctx, res);
-        JSValue inner_res = it->res_obj; it->res_obj = JS_UNDEFINED;
         if (d) {   /* inner exhausted: a naturally-done iterator needs no close; go back to the source */
-            JS_FreeValue(ctx, inner_res);
+            JS_FreeValue(ctx, it->res_obj); it->res_obj = JS_UNDEFINED;
             JS_FreeValue(ctx, it->inner); it->inner = JS_UNDEFINED;
             JS_FreeValue(ctx, it->inner_next); it->inner_next = JS_UNDEFINED;
             it->drive_inner = 0;
             it->resume_pc = ITHP_FLATMAP_SRC;
             return 1;   /* drive the source for the next inner iterable */
         }
+        it->resume_pc = ITHP_INNER_VALUE;
+        return 6;   /* IteratorValue on the inner's result — a request like every other keyed read */
+    }
+    case ITHP_INNER_VALUE: {
+        JS_FreeValue(ctx, it->res_obj); it->res_obj = JS_UNDEFINED;
         it->resume_pc = ITHP_START;   /* the next .next() continues this inner (START re-checks it->inner) */
-        *out = inner_res;   /* emit the inner {value, done:false} */
-        return 0;
+        *out = js_create_iterator_result(ctx, res, false);   /* a FRESH result, per Yield; consumes res */
+        return JS_IsException(*out) ? -1 : 0;
     }
     }
     DFAIL("js_iter_helper_step: bad resume_pc");
