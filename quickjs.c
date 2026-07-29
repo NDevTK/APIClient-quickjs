@@ -19639,7 +19639,10 @@ typedef struct JSIteratorWrapData {
 /* args_own mirrors JSIterConsume's: an .apply / spread CALL's arguments live in a heap list, and this state
    borrows the source out of it until the acquire delivers an iterator. */
 typedef struct JSIterFrom { int orig_cfirst, orig_cargc; uint8_t orig_is_tail;
-                            JSValue *args_own; int args_own_n; } JSIterFrom;
+                            JSValue *args_own; int args_own_n;
+                            /* the acquired iterator, parked across GetIteratorDirect's nextMethod READ — page
+                               code on an accessor or a Proxy, so a request, so a suspension. */
+                            JSValue acq; } JSIterFrom;
 #define CONT_ACQUIRE_GET  25   /* cont_state = JSAcquireGet: GetIterator step 3's READ of @@iterator, when reading it
                                   is itself the page's code (a getter, a Proxy trap). The consumer waiting on the
                                   acquire cannot be the read's outer continuation directly — a consumer's delivery
@@ -19823,6 +19826,11 @@ typedef struct JSIterClose {
                                        `next` is an intrinsic and needs no page-visible read. Doing it the other
                                        way round (wrap, then read off the wrapper) meant CreateAsyncFromSyncIterator
                                        read the sync iterator from C, a second observable Get with no flow base. */
+#define CONT_ITER_FROM_NEXT_GET 54  /* gp_outer = JSIterFrom: GetIteratorDirect's nextMethod read inside
+                                       Iterator.from. Read UNCONDITIONALLY, before the %Iterator% hasInstance
+                                       test, because 27.1.3.1 completes the record first — and the wrap decision
+                                       that follows needs the state, so the state outlives the read now instead
+                                       of being freed just before it. */
 #define CONT_PROMISE_ALL_NEXT_GET 52  /* gp_outer = JSPromiseAll: GetIterator step 5.b for a Promise COMBINATOR.
                                          Same read, same page code; what differs is the abrupt arm — the
                                          combinator REJECTS its aggregate and yields it (IfAbruptRejectPromise),
@@ -25384,6 +25392,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                     JS_ThrowOutOfMemory(ctx); goto exception; }
                 /* Iterator.from's state is a JSIterFrom, not a consume — it has its own finish, so it does not
                    take the shared adoption yet. A sequence's Iterator.from is the next one to convert. */
+                s->acq = JS_UNDEFINED;   /* js_mallocz ZEROES it, and a zeroed JSValue is tag 0, not UNDEFINED */
                 TAKE_CALL_SHAPE(); s->orig_cfirst = call_first_r; s->orig_cargc = call_pop; s->orig_is_tail = tramp_is_tail;
                 s->args_own = call_args_owned; s->args_own_n = call_args_owned_n;
                 call_args_owned = NULL; call_args_owned_n = 0;
@@ -25933,6 +25942,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                       if (gk == CONT_FORAWAIT_SYNC_GET) goto do_forawait_have_sync_method;
                       if (gk == CONT_CONSUME_NEXT_GET) { cont_st = gouter0; goto do_consume_have_next; }
                       if (gk == CONT_PROMISE_ALL_NEXT_GET) { cont_st = gouter0; goto do_promise_all_have_next; }
+                      if (gk == CONT_ITER_FROM_NEXT_GET) { cont_st = gouter0; goto do_iter_from_have_next; }
                       if (gk == CONT_ITER_CONSUME) goto do_iter_consume_step;
                       if (gk == CONT_ITER_CLOSE) { cont_st = gouter0; goto do_iter_close_method; }
                       if (gk == CONT_PROMISE_ALL_THEN) { cont_st = gouter0; goto do_promise_all_attach_call; }
@@ -26044,6 +26054,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         || gk3 == CONT_FOROF_ENUMREC_GET || gk3 == CONT_FOROF_ENUMREC_WRAP) {
                         /* the for-of's @@iterator read threw: its operand (the iterable) is on the stack and
                            belongs to the frame's catch-search, exactly as for any other throwing operator. */
+                        goto exception;
+                    }
+                    if (gk3 == CONT_ITER_FROM_NEXT_GET) {
+                        /* the read threw: the record was never completed, so nothing is closed and the throw
+                           propagates, exactly as GetIteratorDirect's does. */
+                        JSIterFrom *fs = gouter;
+                        JS_FreeValue(ctx, fs->acq);
+                        js_free_rt(rt, fs);
                         goto exception;
                     }
                     if (gk3 == CONT_PROMISE_ALL_NEXT_GET) {
@@ -26367,38 +26385,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        because the spec finishes the iterator record first — then step 2-3 (%Iterator%
                        hasInstance) decides between the iterator itself and a WrapForValidIterator around it. */
                     JSIterFrom *fs = (JSIterFrom *)cst;
-                    int cf = fs->orig_cfirst, cg = fs->orig_cargc; uint8_t itl = fs->orig_is_tail;
-                    JSValue nextm, r;
-                    JSIteratorWrapData *wd;
-                    int isit;
-                    if (fs->args_own) free_arg_list(ctx, fs->args_own, fs->args_own_n);
-                    js_free_rt(rt, fs);
-                    if (JS_IsException(acq)) goto exception;
+                    if (fs->args_own) { free_arg_list(ctx, fs->args_own, fs->args_own_n); fs->args_own = NULL; fs->args_own_n = 0; }
+                    if (JS_IsException(acq)) { js_free_rt(rt, fs); goto exception; }
                     if (!JS_IsObject(acq)) {
                         JS_FreeValue(ctx, acq);
+                        js_free_rt(rt, fs);
                         JS_ThrowTypeErrorNotAnObject(ctx);
                         goto exception;
                     }
-                    nextm = JS_GetProperty(ctx, acq, JS_ATOM_next);
-                    if (JS_IsException(nextm)) { JS_FreeValue(ctx, acq); goto exception; }
-                    isit = JS_OrdinaryIsInstanceOf(ctx, acq, ctx->iterator_ctor);
-                    if (isit < 0) { JS_FreeValue(ctx, nextm); JS_FreeValue(ctx, acq); goto exception; }
-                    if (isit) {
-                        JS_FreeValue(ctx, nextm);   /* the record is complete; an Iterator instance needs no wrapper */
-                        r = acq;
-                    } else {
-                        r = JS_NewObjectClass(ctx, JS_CLASS_ITERATOR_WRAP);
-                        if (JS_IsException(r)) { JS_FreeValue(ctx, nextm); JS_FreeValue(ctx, acq); goto exception; }
-                        wd = js_malloc(ctx, sizeof(*wd));
-                        if (unlikely(!wd)) { JS_FreeValue(ctx, r); JS_FreeValue(ctx, nextm); JS_FreeValue(ctx, acq); goto exception; }
-                        wd->wrapped_iter = acq;   /* transferred */
-                        wd->wrapped_next = nextm;
-                        JS_SetOpaqueInternal(r, wd);
-                    }
-                    { JSValue *cv = sp - cg; for (i = cf; i < cg; i++) JS_FreeValue(ctx, cv[i]); sp += cf - cg; }
-                    if (itl) { ret_val = r; goto do_return; }
-                    *sp++ = r;
-                    BREAK;
+                    fs->acq = acq;
+                    gp_outer = fs; gp_outer_kind = CONT_ITER_FROM_NEXT_GET;
+                    gp_obj = fs->acq; gp_atom = JS_ATOM_next; gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                    goto do_getprop_tramp;
                 }
                 DCHECK(ckind == CONT_PROMISE_ALL, "consume deliver: unknown consumer kind");
                 {
@@ -26424,6 +26422,39 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     *sp++ = r;
                     BREAK;
                 }
+            }
+
+        do_iter_from_have_next:
+            /* Iterator.from's nextMethod, then 27.1.3.1 steps 2-3: %Iterator% hasInstance decides between the
+               iterator itself and a WrapForValidIterator around it. That test is the ORDINARY instanceof — a
+               prototype walk — so nothing after the read is the page's code. */
+            {
+                JSIterFrom *fs = (JSIterFrom *)cont_st;
+                JSValue acq = fs->acq; fs->acq = JS_UNDEFINED;
+                JSValue nextm = ret_val; ret_val = JS_UNDEFINED;
+                int cf = fs->orig_cfirst, cg = fs->orig_cargc; uint8_t itl = fs->orig_is_tail;
+                JSValue r;
+                JSIteratorWrapData *wd;
+                int isit;
+                js_free_rt(rt, fs);
+                isit = JS_OrdinaryIsInstanceOf(ctx, acq, ctx->iterator_ctor);
+                if (isit < 0) { JS_FreeValue(ctx, nextm); JS_FreeValue(ctx, acq); goto exception; }
+                if (isit) {
+                    JS_FreeValue(ctx, nextm);   /* the record is complete; an Iterator instance needs no wrapper */
+                    r = acq;
+                } else {
+                    r = JS_NewObjectClass(ctx, JS_CLASS_ITERATOR_WRAP);
+                    if (JS_IsException(r)) { JS_FreeValue(ctx, nextm); JS_FreeValue(ctx, acq); goto exception; }
+                    wd = js_malloc(ctx, sizeof(*wd));
+                    if (unlikely(!wd)) { JS_FreeValue(ctx, r); JS_FreeValue(ctx, nextm); JS_FreeValue(ctx, acq); goto exception; }
+                    wd->wrapped_iter = acq;   /* transferred */
+                    wd->wrapped_next = nextm;
+                    JS_SetOpaqueInternal(r, wd);
+                }
+                { JSValue *cv = sp - cg; for (i = cf; i < cg; i++) JS_FreeValue(ctx, cv[i]); sp += cf - cg; }
+                if (itl) { ret_val = r; goto do_return; }
+                *sp++ = r;
+                BREAK;
             }
 
         do_setmap_consume_tramp:
@@ -28903,7 +28934,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            || gouter_kind == CONT_ITER_CALL_GET || gouter_kind == CONT_ITER_CALL_GET_NOARG
                            || gouter_kind == CONT_FOROF_ENUMREC_GET || gouter_kind == CONT_FOROF_ENUMREC_WRAP
                            || gouter_kind == CONT_CONSUME_NEXT_GET
-                           || gouter_kind == CONT_PROMISE_ALL_NEXT_GET
+                           || gouter_kind == CONT_PROMISE_ALL_NEXT_GET || gouter_kind == CONT_ITER_FROM_NEXT_GET
                            || gouter_kind == CONT_PROMISE_ALL_THEN || gouter_kind == CONT_AFS_GET
                            || gouter_kind == CONT_ITER_HELPER_GET || gouter_kind == CONT_PROMISE_ALL_GET
                            || gouter_kind == CONT_FOROF_UNPACK,
@@ -28935,6 +28966,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            request is not that call. Re-entering it would drop them a second time, with a stale
                            shape — the sp drift ASan caught. The phase on the state says which read this answers. */
                         goto do_async_from_sync_step;
+                    }
+                    if (gouter_kind == CONT_ITER_FROM_NEXT_GET) {
+                        js_getprop_free(ctx, gp);
+                        cont_st = gouter;
+                        goto do_iter_from_have_next;
                     }
                     if (gouter_kind == CONT_PROMISE_ALL_NEXT_GET) {
                         js_getprop_free(ctx, gp);
@@ -33037,7 +33073,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    || gk2 == CONT_PROMISE_ALL_THEN || gk2 == CONT_AFS_GET
                    || gk2 == CONT_ITER_HELPER_GET || gk2 == CONT_PROMISE_ALL_GET
                    || gk2 == CONT_FOROF_UNPACK || gk2 == CONT_CONSUME_NEXT_GET
-                   || gk2 == CONT_PROMISE_ALL_NEXT_GET,
+                   || gk2 == CONT_PROMISE_ALL_NEXT_GET || gk2 == CONT_ITER_FROM_NEXT_GET,
                    "property-get outer continuation: unknown machine kind");
             js_getprop_free(ctx, gp);
             if (gouter && gk2 == CONT_FOROF_UNPACK) {
@@ -33118,6 +33154,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 js_free_rt(rt, ag);
                 tramp_consume_acquired = JS_EXCEPTION;
                 goto do_consume_deliver_iterator;
+            }
+            if (gouter && gk2 == CONT_ITER_FROM_NEXT_GET) {
+                JSIterFrom *fs = gouter;
+                JS_FreeValue(ctx, fs->acq);
+                js_free_rt(rt, fs);
+                goto exception;
             }
             if (gouter && gk2 == CONT_PROMISE_ALL_NEXT_GET) {
                 cont_st = gouter;
