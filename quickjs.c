@@ -19058,6 +19058,25 @@ static JSValue js_create_desc(JSContext *ctx, JSValueConst val, JSValueConst get
                                   RESULT, so it has to ride a continuation. The driver performs the read whichever
                                   shape it is and delivers the value to the machine's next step, exactly as the
                                   TOPRIMITIVE sequence delivers a primitive. */
+/* The ANSWER of a [[GetOwnProperty]] request made by a proxy INVARIANT: what the target's own descriptor is, in
+   the form the check actually uses. `flags` is -1 when the property is absent. The three values are OWNED by
+   whoever declared the record, and its teardown releases them — which is why every machine that names one frees
+   it on both its normal and its abrupt path. */
+typedef struct JSDescFacts {
+    int flags;
+    JSValue value, getter, setter;
+} JSDescFacts;
+static inline void js_desc_facts_init(JSDescFacts *f)
+{
+    f->flags = -1;
+    f->value = JS_UNDEFINED; f->getter = JS_UNDEFINED; f->setter = JS_UNDEFINED;
+}
+static void js_desc_facts_free(JSContext *ctx, JSDescFacts *f)
+{
+    JS_FreeValue(ctx, f->value); JS_FreeValue(ctx, f->getter); JS_FreeValue(ctx, f->setter);
+    js_desc_facts_init(f);
+}
+
 typedef struct JSGetProp {
     JSValue target;      /* the proxy's [[Target]], for the invariant (owned); UNDEFINED for an accessor */
     JSAtom atom;         /* the key (owned) */
@@ -19078,14 +19097,16 @@ typedef struct JSGetProp {
     uint8_t no_throw;    /* 1 = yield the BOOLEAN a [[Set]]/[[Delete]] reports instead of throwing on false. The
                             spec has both forms — Set(O,P,V,true)/DeletePropertyOrThrow for a builtin that must
                             succeed, and the bare internal method for Reflect — and the request expresses which. */
-    uint8_t want_flags;  /* GP_GETOWNPROP only: 1 = answer with the descriptor's ATTRIBUTE BITS (a JS_PROP_* int,
-                            or -1 when the property is absent) instead of the descriptor OBJECT. The same
-                            operation, the same trap, the same invariant — only the answer's SHAPE differs, which
-                            is why this is a modifier and not a second op, exactly as no_throw is. It exists
-                            because a proxy INVARIANT wants the target's flags: 10.5.5 step 10 is
-                            target.[[GetOwnProperty]](P), and asking for that as an object would mean reading six
-                            fields back off a record this engine had just built — twelve C-side reads to recover
-                            what was never lost. */
+    JSDescFacts *desc_out;  /* GP_GETOWNPROP only: where the answer goes, when the requester wants the
+                            DESCRIPTOR RECORD rather than the descriptor OBJECT. The same operation, the same
+                            trap, the same invariant — only the answer's shape differs, which is why this is a
+                            modifier and not a second op, exactly as no_throw is.
+                            It is a RECORD and not a packed result for the reason the CAPABILITY request is
+                            three values: a proxy invariant wants the target's flags AND, depending on them, its
+                            [[Value]] or one of its accessors, and building a descriptor object for the consumer
+                            to take apart again is the engine unpacking a tuple it had just packed.
+                            NULL = answer with the OBJECT, which is what Object.getOwnPropertyDescriptor and the
+                            enumerability walks take. */
     uint8_t nargs;
     JSValue cb[6];       /* [this, fn, args…] — OWNED here, never on the caller's compiler-sized stack. The `set`
                             trap call needs six slots and the frame that invoked the builtin has no obligation to
@@ -19191,7 +19212,7 @@ typedef struct JSTrapGet {
                                 is parked. */
     uint8_t outer_kind;
     uint8_t op;
-    uint8_t want_flags;      /* the operation's ANSWER SHAPE. The trap read parks the whole operation, so every
+    JSDescFacts *desc_out;   /* the operation's ANSWER SHAPE. The trap read parks the whole operation, so every
                                 operand of it rides here — the same obligation `dflags` above records. */
     uint8_t no_throw;
 } JSTrapGet;
@@ -20653,6 +20674,10 @@ struct JSProxyInv;
 static void js_proxy_inv_free(JSContext *ctx, struct JSProxyInv *pv);
 struct JSKeyedInv;
 static void js_keyed_inv_free(JSContext *ctx, struct JSKeyedInv *ki);
+static int js_proxy_get_check(JSContext *ctx, const JSDescFacts *f, JSValueConst ret);
+static int js_proxy_set_check(JSContext *ctx, const JSDescFacts *f, JSValueConst value);
+static int js_proxy_define_check(JSContext *ctx, const JSDescFacts *f, JSValueConst val,
+                                 JSValueConst getter, JSValueConst setter, int flags, int extensible);
 static void js_create_requester_abandon(JSContext *ctx, void *cont, uint8_t kind)
 {
     /* keyed on the KIND, never on the pointer: a continuation whose whole state IS its kind carries a NULL one
@@ -21148,8 +21173,9 @@ typedef struct JSGopdDesc {
     JSAtom atom;         /* its key (owned) */
     void *outer;         /* what is waiting on the OPERATION, not on these reads */
     uint8_t outer_kind;
-    uint8_t want_flags;  /* the OPERATION's answer shape, so a nested target answers as ITS requester asked */
+    JSDescFacts *desc_out;  /* the OPERATION's answer shape, so a nested target answers as ITS requester asked */
     uint8_t phase;       /* GD_* */
+    JSDescFacts facts;   /* step 10's answer, when this machine is the one asking (owned) */
     int td_flags, td_ret, extensible;   /* steps 10 and 12, performed before the walk as the spec orders them */
     JSDescCursor cur;    /* the walk itself, resumable between any two of its twelve operations */
 } JSGopdDesc;
@@ -21163,6 +21189,7 @@ enum { GD_TARGET = 0, GD_TARGET_GOT, GD_EXT, GD_EXT_GOT, GD_WALK };
 
 static void js_gopd_desc_free(JSContext *ctx, JSGopdDesc *gd)
 {
+    js_desc_facts_free(ctx, &gd->facts);
     js_desc_cursor_free(ctx, &gd->cur);
     JS_FreeValue(ctx, gd->obj);
     JS_FreeValue(ctx, gd->target);
@@ -21198,6 +21225,7 @@ typedef struct JSOwnKeysChk {
     uint32_t i;           /* whichever loop is running */
     int64_t rlen;         /* CreateListFromArrayLike's length */
     int is_extensible;
+    JSDescFacts facts;    /* the target key's own descriptor, answered into here (owned) */
 } JSOwnKeysChk;
 enum { OKC_LEN = 0, OKC_LEN_GOT, OKC_ELEM, OKC_ELEM_GOT,
        OKC_EXT, OKC_EXT_GOT, OKC_TKEYS, OKC_TKEYS_GOT, OKC_TDESC, OKC_TDESC_GOT };
@@ -21246,12 +21274,21 @@ typedef struct JSKeyedInv {
     uint8_t op;          /* GP_HAS / GP_DELETE — which answer and which message, not which algorithm */
     uint8_t phase;       /* KI_* */
     uint8_t no_throw;    /* GP_DELETE: yield the boolean rather than DeletePropertyOrThrow's TypeError */
-    int td_ret, td_flags;
+    JSDescFacts facts;   /* the target's own descriptor, answered into here (owned) */
+    /* the operands the FIELD-comparing three check against: GET's trap result, SET's written value, and
+       DEFINE's whole incoming descriptor. They ride here because the check runs after a request that can
+       suspend, so nothing about the operation may live in an interpreter local. */
+    JSValue operand, in_getter, in_setter;
+    int in_flags;
 } JSKeyedInv;
 enum { KI_DESC = 0, KI_DESC_GOT, KI_EXT, KI_EXT_GOT };
 
 static void js_keyed_inv_free(JSContext *ctx, struct JSKeyedInv *ki)
 {
+    js_desc_facts_free(ctx, &ki->facts);
+    JS_FreeValue(ctx, ki->operand);
+    JS_FreeValue(ctx, ki->in_getter);
+    JS_FreeValue(ctx, ki->in_setter);
     JS_FreeValue(ctx, ki->target);
     JS_FreeAtom(ctx, ki->atom);
     js_free_rt(ctx->rt, ki);
@@ -21268,6 +21305,7 @@ static void js_proxy_inv_free(JSContext *ctx, struct JSProxyInv *pv)
 
 static void js_ownkeys_chk_free(JSContext *ctx, struct JSOwnKeysChk *ok)
 {
+    js_desc_facts_free(ctx, &ok->facts);
     if (ok->tab) js_free_prop_enum(ctx, ok->tab, ok->len);
     if (ok->tab2) js_free_prop_enum(ctx, ok->tab2, ok->len2);
     JS_FreeValue(ctx, ok->obj);
@@ -22830,7 +22868,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     uint8_t gp_op = GP_GET;                             /* the result is delivered to. */
     JSValueConst gp_recv = JS_UNINITIALIZED;            /* [[Get]]/[[Set]] receiver; UNINITIALIZED = the object itself. read+reset at do_getprop_tramp */
     int gp_no_throw = 0;                                /* 1 = a [[Set]]/[[Delete]] yields its boolean instead of throwing on false. read+reset there */
-    int gp_want_flags = 0;                              /* 1 = a GP_GETOWNPROP answers with the attribute BITS, not the descriptor object. read+reset there */
+    JSDescFacts *gp_desc_out = NULL;                    /* non-NULL = a GP_GETOWNPROP answers into that record, not with the descriptor object. read+reset there */
     int forof_unpack_off = 0;                           /* do_forof_unpack's inputs: the enum_rec's offset from sp, */
     uint8_t forof_unpack_mode = FOU_FOROF;              /* and which placement the pair takes */
     uint8_t forof_enumrec_wrap = 0;                     /* do_forof_enumrec's input: `for await`'s SYNC branch, whose
@@ -26382,26 +26420,43 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         gp_obj = ki->target; gp_atom = ki->atom;
                         gp_op = GP_GETOWNPROP; gp_val = JS_UNDEFINED;
                         gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
-                        gp_want_flags = 1;   /* the check wants the bits; the descriptor object is not needed */
+                        gp_desc_out = &ki->facts;   /* the check wants the RECORD, not a descriptor object */
                         gp_outer = ki; gp_outer_kind = CONT_KEYED_INV;
                         goto do_getprop_tramp;
                     }
                     if (ki->phase == KI_DESC_GOT) {
-                        int tf;
-                        DCHECK(JS_VALUE_GET_TAG(ret_val) == JS_TAG_INT,
-                               "a want_flags [[GetOwnProperty]] must answer with an int");
-                        tf = JS_VALUE_GET_INT(ret_val);
+                        DCHECK(JS_IsUndefined(ret_val),
+                               "a record-answering [[GetOwnProperty]] delivers through the record, not the result");
                         ret_val = JS_UNDEFINED;
-                        ki->td_ret = (tf >= 0);
-                        ki->td_flags = (tf >= 0) ? tf : 0;
-                        if (!ki->td_ret) {
+                        if (ki->op == GP_GET || ki->op == GP_SET) {
+                            /* 10.5.8 steps 10-11 / 10.5.9 steps 11-12: the comparison is against the target
+                               descriptor's FIELDS, and neither consults IsExtensible at all. */
+                            int cr = (ki->op == GP_GET) ? js_proxy_get_check(ctx, &ki->facts, ki->operand)
+                                                        : js_proxy_set_check(ctx, &ki->facts, ki->operand);
+                            if (cr < 0) goto ki_fail_thrown;
+                            if (ki->op == GP_GET) { ret_val = ki->operand; ki->operand = JS_UNDEFINED; }
+                            else ret_val = JS_TRUE;
+                            goto ki_answer;
+                        }
+                        if (ki->op == GP_DEFINE) {
+                            /* 10.5.6 step 16.a's IsExtensible is reached ONLY when the target has not got the
+                               property, so the trap must not run otherwise. */
+                            if (ki->facts.flags < 0) { ki->phase = KI_EXT; goto ki_next; }
+                            if (js_proxy_define_check(ctx, &ki->facts, ki->operand, ki->in_getter,
+                                                      ki->in_setter, ki->in_flags, 1) < 0)
+                                goto ki_fail_thrown;
+                            ret_val = JS_TRUE;
+                            goto ki_answer;
+                        }
+                        if (ki->facts.flags < 0) {
                             /* the target has not got it either: nothing to be inconsistent with. */
                             ret_val = (ki->op == GP_HAS) ? JS_FALSE : JS_TRUE;
                             goto ki_answer;
                         }
-                        if (!(ki->td_flags & JS_PROP_CONFIGURABLE))
+                        if (!(ki->facts.flags & JS_PROP_CONFIGURABLE))
                             goto ki_fail;
                         ki->phase = KI_EXT;
+                    ki_next: ;
                     }
                     if (ki->phase == KI_EXT) {
                         ki->phase = KI_EXT_GOT;
@@ -26415,6 +26470,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     {
                         int ext = JS_ToBoolFree(ctx, ret_val);
                         ret_val = JS_UNDEFINED;
+                        if (ki->op == GP_DEFINE) {
+                            if (js_proxy_define_check(ctx, &ki->facts, ki->operand, ki->in_getter,
+                                                      ki->in_setter, ki->in_flags, ext) < 0)
+                                goto ki_fail_thrown;
+                            ret_val = JS_TRUE;
+                            goto ki_answer;
+                        }
                         if (!ext)
                             goto ki_fail;
                         ret_val = (ki->op == GP_HAS) ? JS_FALSE : JS_TRUE;
@@ -26424,11 +26486,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             ki_answer:
                 /* a DELETE additionally owes DeletePropertyOrThrow, which is the CONSUMER's step and not the
                    object's — the bare internal method yields the boolean instead. */
-                if (ki->op == GP_DELETE && !ki->no_throw) {
+                if ((ki->op == GP_DELETE || ki->op == GP_DEFINE) && !ki->no_throw) {
                     if (JS_VALUE_GET_BOOL(ret_val)) {
                         ret_val = JS_UNDEFINED;
                     } else {
-                        JS_ThrowTypeError(ctx, "proxy: cannot delete property");
+                        JS_ThrowTypeError(ctx, (ki->op == GP_DELETE) ? "proxy: cannot delete property"
+                                                                     : "proxy: cannot define property");
                         goto ki_fail_thrown;
                     }
                 }
@@ -26651,18 +26714,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         gp_obj = ok->target; gp_atom = ok->tab2[ok->i].atom;
                         gp_op = GP_GETOWNPROP; gp_val = JS_UNDEFINED;
                         gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
-                        gp_want_flags = 1;   /* the check wants the BITS: this is the loop want_flags exists for */
+                        js_desc_facts_free(ctx, &ok->facts);   /* the previous key's, before the next answer */
+                        gp_desc_out = &ok->facts;
                         gp_outer = ok; gp_outer_kind = CONT_OWNKEYS_CHK;
                         goto do_getprop_tramp;
                     }
                     DCHECK(ok->phase == OKC_TDESC_GOT, "the ownKeys invariant resumed in no phase");
                     {
-                        int tf;
-                        DCHECK(JS_VALUE_GET_TAG(ret_val) == JS_TAG_INT,
-                               "a want_flags [[GetOwnProperty]] must answer with an int");
-                        tf = JS_VALUE_GET_INT(ret_val);
+                        DCHECK(JS_IsUndefined(ret_val),
+                               "a record-answering [[GetOwnProperty]] delivers through the record, not the result");
                         ret_val = JS_UNDEFINED;
-                        if (js_ownkeys_target_key(ctx, ok, ok->tab2[ok->i].atom, tf >= 0, tf >= 0 ? tf : 0) < 0)
+                        if (js_ownkeys_target_key(ctx, ok, ok->tab2[ok->i].atom,
+                                                  ok->facts.flags >= 0, ok->facts.flags) < 0)
                             goto okc_throw;
                         ok->i++;
                         ok->phase = OKC_TDESC;
@@ -26694,18 +26757,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         gp_obj = gd->target; gp_atom = gd->atom;
                         gp_op = GP_GETOWNPROP; gp_val = JS_UNDEFINED;
                         gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
-                        gp_want_flags = 1;                     /* the invariant wants the BITS, not an object */
+                        gp_desc_out = &gd->facts;              /* the invariant wants the RECORD, not an object */
                         gp_outer = gd; gp_outer_kind = CONT_GOPD_DESC;
                         goto do_getprop_tramp;
                     }
                     if (gd->phase == GD_TARGET_GOT) {
-                        int tf;
-                        DCHECK(JS_VALUE_GET_TAG(ret_val) == JS_TAG_INT,
-                               "a want_flags [[GetOwnProperty]] must answer with an int");
-                        tf = JS_VALUE_GET_INT(ret_val);
+                        DCHECK(JS_IsUndefined(ret_val),
+                               "a record-answering [[GetOwnProperty]] delivers through the record, not the result");
                         ret_val = JS_UNDEFINED;
-                        gd->td_ret = (tf >= 0);
-                        gd->td_flags = (tf >= 0) ? tf : 0;
+                        gd->td_ret = (gd->facts.flags >= 0);
+                        gd->td_flags = (gd->facts.flags >= 0) ? gd->facts.flags : 0;
                         gd->extensible = 1;   /* only read when the arm below actually asks for it */
                         gd->phase = GD_EXT;
                     }
@@ -26715,11 +26776,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             /* 11.a or 11.b settles it, and 11.c is a step the spec never reaches.
                                EVERY field is read BEFORE the free: js_gopd_desc_free owns the block. */
                             int ar = js_proxy_gopd_absent(ctx, gd->td_ret, gd->td_flags, 1);
-                            uint8_t wf0 = gd->want_flags;
+                            JSDescFacts *wf0 = gd->desc_out;
                             gp_outer = gd->outer; gp_outer_kind = gd->outer_kind;
                             js_gopd_desc_free(ctx, gd);
                             if (ar < 0) goto getprop_throw;
-                            ret_val = wf0 ? js_int32(-1) : JS_UNDEFINED;
+                            ret_val = JS_UNDEFINED;   /* absent: wf0's record already reads -1 */
+                            (void)wf0;
                             goto do_getprop_complete;
                         }
                         gd->phase = GD_EXT_GOT;
@@ -26734,11 +26796,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     ret_val = JS_UNDEFINED;
                     if (JS_IsUndefined(gd->trap_res)) {
                         int ar = js_proxy_gopd_absent(ctx, gd->td_ret, gd->td_flags, gd->extensible);
-                        uint8_t wf1 = gd->want_flags;   /* read BEFORE the free — the block is fini's */
+                        JSDescFacts *wf1 = gd->desc_out;   /* read BEFORE the free — the block is fini's */
                         gp_outer = gd->outer; gp_outer_kind = gd->outer_kind;
                         js_gopd_desc_free(ctx, gd);
                         if (ar < 0) goto getprop_throw;
-                        ret_val = wf1 ? js_int32(-1) : JS_UNDEFINED;
+                        ret_val = JS_UNDEFINED;   /* absent: wf1's record already reads -1 */
+                        (void)wf1;
                         goto do_getprop_complete;
                     }
                     /* step 13 opens: the trap's result is the operand of all twelve. */
@@ -26769,13 +26832,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     rd.value = gd->cur.value; rd.getter = gd->cur.getter; rd.setter = gd->cur.setter;
                     gd->cur.value = gd->cur.getter = gd->cur.setter = JS_UNDEFINED;   /* the record owns them now */
                     {
-                        uint8_t wf = gd->want_flags;
+                        JSDescFacts *wf = gd->desc_out;
                         pres = js_proxy_gopd_post(ctx, &rd, gd->td_flags, gd->td_ret, gd->extensible, &od);
                         js_gopd_desc_free(ctx, gd);
                         if (pres < 0) goto getprop_throw;
                         if (wf) {
-                            ret_val = js_int32(od.flags);
-                            js_free_desc(ctx, &od);
+                            wf->flags = od.flags;
+                            wf->value = od.value; wf->getter = od.getter; wf->setter = od.setter;
+                            ret_val = JS_UNDEFINED;   /* ownership transferred: no js_free_desc */
                         } else {
                             ret_val = js_desc_to_object(ctx, &od);
                             if (unlikely(JS_IsException(ret_val))) goto getprop_throw;
@@ -26802,10 +26866,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    what every builtin's Get/Set performs and what the spec's default receiver is. */
                 JSValueConst gp_recv_r = JS_IsUninitialized(gp_recv) ? gp_obj : gp_recv;
                 int gp_nothrow_r = gp_no_throw;
-                int gp_wantflags_r = gp_want_flags;
+                JSDescFacts *gp_descout_r = gp_desc_out;
                 JSValueConst gp_getter_r = gp_getter, gp_setter_r = gp_setter;
                 int gp_dflags_r = gp_dflags;
-                gp_recv = JS_UNINITIALIZED; gp_no_throw = 0; gp_want_flags = 0;
+                gp_recv = JS_UNINITIALIZED; gp_no_throw = 0; gp_desc_out = NULL;
                 gp_getter = gp_setter = JS_UNDEFINED;
                 gp_dflags = JS_PROP_HAS_VALUE | JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE
                           | JS_PROP_HAS_CONFIGURABLE | JS_PROP_C_W_E;
@@ -26856,7 +26920,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             tg->atom = JS_DupAtom(ctx, gp_atom);
                             tg->outer = gp_outer; tg->outer_kind = gp_outer_kind;
                             tg->op = gp_op; tg->no_throw = (uint8_t)gp_nothrow_r;
-                            tg->want_flags = (uint8_t)gp_wantflags_r;
+                            tg->desc_out = gp_descout_r;
                             gp_obj = pd->handler;   /* borrowed: the proxy tg holds is what keeps it alive */
                             gp_atom = trap;
                             gp_op = GP_GET; gp_val = JS_UNDEFINED;
@@ -27039,11 +27103,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         int gres = JS_GetOwnPropertyInternal(ctx, &gd,
                                                              JS_VALUE_GET_OBJ(fwd ? gp_fwd : gp_obj), gp_atom);
                         if (unlikely(gres < 0)) goto getprop_throw;
-                        if (gp_wantflags_r) {
-                            /* the requester asked for the attribute bits, and the record is right here — so they
-                               are read off it rather than built into an object for someone to take apart. */
-                            ret_val = js_int32(gres ? gd.flags : -1);
-                            if (gres) js_free_desc(ctx, &gd);
+                        if (gp_descout_r) {
+                            /* the requester named a record, and the descriptor is right here — so it MOVES into
+                               that record rather than being built into an object for someone to take apart. */
+                            if (gres) {
+                                gp_descout_r->flags = gd.flags;
+                                gp_descout_r->value = gd.value;
+                                gp_descout_r->getter = gd.getter;
+                                gp_descout_r->setter = gd.setter;   /* ownership transferred: no js_free_desc */
+                            }
+                            ret_val = JS_UNDEFINED;
                         } else {
                             ret_val = gres ? js_desc_to_object(ctx, &gd) : JS_UNDEFINED;
                             if (unlikely(JS_IsException(ret_val))) goto getprop_throw;
@@ -27116,7 +27185,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                           JSTrapGet *tg = gouter0;
                           tg->method = ret_val;
                           gp_obj = tg->obj; gp_atom = tg->atom; gp_op = tg->op; gp_val = tg->val;
-                          gp_recv = tg->recv; gp_no_throw = tg->no_throw; gp_want_flags = tg->want_flags;
+                          gp_recv = tg->recv; gp_no_throw = tg->no_throw; gp_desc_out = tg->desc_out;
                           gp_getter = tg->getter; gp_setter = tg->setter; gp_dflags = tg->dflags;
                           gp_outer = tg->outer; gp_outer_kind = tg->outer_kind;
                           gp_trapst = tg;
@@ -27207,7 +27276,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 gp->outer = gp_outer; gp->outer_kind = gp_outer_kind;
                 gp->op = gp_op;
                 gp->no_throw = (uint8_t)gp_nothrow_r;
-                gp->want_flags = (uint8_t)gp_wantflags_r;
+                gp->desc_out = gp_descout_r;
                 gp->recv = (JS_VALUE_GET_OBJ(gp_recv_r) == JS_VALUE_GET_OBJ(gp_obj)
                             && JS_VALUE_GET_TAG(gp_recv_r) == JS_VALUE_GET_TAG(gp_obj))
                            ? JS_UNINITIALIZED : js_dup(gp_recv_r);
@@ -30321,7 +30390,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         }
                         tg->method = ret_val;
                         gp_obj = tg->obj; gp_atom = tg->atom; gp_op = tg->op; gp_val = tg->val;
-                        gp_recv = tg->recv; gp_no_throw = tg->no_throw; gp_want_flags = tg->want_flags;
+                        gp_recv = tg->recv; gp_no_throw = tg->no_throw; gp_desc_out = tg->desc_out;
                         gp_getter = tg->getter; gp_setter = tg->setter; gp_dflags = tg->dflags;
                         gp_outer = tg->outer; gp_outer_kind = tg->outer_kind;
                         gp_trapst = tg;
@@ -30381,9 +30450,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             gd->trap_res = ret_val;        /* held across steps 10 and 12 */
                             gd->atom = JS_DupAtom(ctx, gp->atom);
                             gd->outer = gouter; gd->outer_kind = gouter_kind;
-                            gd->want_flags = gp->want_flags;
+                            gd->desc_out = gp->desc_out;
                             gd->phase = GD_TARGET;
                             js_desc_cursor_init(&gd->cur);
+                            js_desc_facts_init(&gd->facts);
                             js_getprop_free(ctx, gp);
                             cont_st = gd;
                             ret_val = JS_UNINITIALIZED;
@@ -30406,6 +30476,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 ok->trap_res = ret_val;
                                 ok->tkeys = JS_UNDEFINED;
                                 ok->outer = gouter; ok->outer_kind = gouter_kind;
+                                js_desc_facts_init(&ok->facts);
                                 ok->phase = OKC_LEN;
                                 js_getprop_free(ctx, gp);
                                 cont_st = ok;
@@ -30497,6 +30568,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 ki->outer = gouter; ki->outer_kind = gouter_kind;
                                 ki->op = gp->op;
                                 ki->no_throw = gp->no_throw;
+                                js_desc_facts_init(&ki->facts);
                                 ki->phase = KI_DESC;
                                 js_getprop_free(ctx, gp);
                                 cont_st = ki;
@@ -30504,34 +30576,62 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 goto do_keyed_inv_step;
                             }
                         }
-                    } else if (gp->op == GP_DEFINE) {
-                        /* the `defineProperty` trap's boolean owes the target's [[DefineOwnProperty]] invariant,
-                           and then — because every consumer performs CreateDataPropertyOrThrow — a TypeError when
-                           it is false. The invariant's own THROW flag covers that, so it is passed. */
-                        int fres = js_proxy_define_invariant(ctx, gp->target, gp->atom, gp->value,
-                                                             gp->getter, gp->setter,
-                                                             gp->dflags | (gp->no_throw ? 0 : JS_PROP_THROW),
-                                                             JS_ToBoolFree(ctx, ret_val));
-                        ret_val = (fres < 0) ? JS_EXCEPTION : gp->no_throw ? js_bool(fres) : JS_UNDEFINED;
-                    } else if (gp->op == GP_SET) {
-                        /* A SETTER yields nothing at all; a `set` TRAP yields a boolean that owes the target's
-                           [[Set]] invariant and then, because every consumer of this request performs
-                           Set(O, P, V, true), a TypeError when it is false. Either way the machine is handed
-                           UNDEFINED — a write has no value to deliver. */
-                        if (!JS_IsUndefined(gp->target)) {
-                            int sres = js_proxy_set_invariant(ctx, gp->target, gp->atom, gp->value,
-                                                              JS_ToBoolFree(ctx, ret_val));
-                            if (sres < 0) ret_val = JS_EXCEPTION;
-                            else if (gp->no_throw) ret_val = js_bool(sres);
-                            else if (!sres) { JS_ThrowTypeError(ctx, "proxy: cannot set property"); ret_val = JS_EXCEPTION; }
-                            else ret_val = JS_UNDEFINED;
-                        } else {
-                            /* a SETTER body: it yields nothing. A bare [[Set]] through one still succeeded. */
-                            JS_FreeValue(ctx, ret_val);
-                            ret_val = gp->no_throw ? JS_TRUE : JS_UNDEFINED;
+                    } else if (gp->op == GP_DEFINE
+                               || ((gp->op == GP_SET || gp->op == GP_GET) && !JS_IsUndefined(gp->target))) {
+                        /* the three whose invariant compares the TARGET DESCRIPTOR'S FIELDS. A `set` reaching a
+                           plain SETTER body has no target and no invariant at all, which is the one shape that
+                           is not this. */
+                        int op7 = gp->op;
+                        bool early7 = false;
+                        int tb7 = 0;
+                        DCHECK(!JS_IsUndefined(gp->target),
+                               "a setter-body [[Set]]/[[Get]] has no target and no invariant — it must not reach "
+                               "the machine");
+                        if (op7 != GP_GET) {
+                            tb7 = JS_ToBoolFree(ctx, ret_val);
+                            ret_val = JS_UNDEFINED;
+                            if (!tb7) {
+                                /* a trap that reports FAILURE is the answer: the target is never consulted, so
+                                   its traps must not run. What the consumer owes on top — Set(O,P,V,true)'s and
+                                   CreateDataPropertyOrThrow's TypeError — is the consumer's step. */
+                                if (gp->no_throw) {
+                                    ret_val = JS_FALSE;
+                                } else {
+                                    JS_ThrowTypeError(ctx, (op7 == GP_SET) ? "proxy: cannot set property"
+                                                                           : "proxy: cannot define property");
+                                    ret_val = JS_EXCEPTION;
+                                }
+                                early7 = true;
+                            }
                         }
-                    } else if (!JS_IsUndefined(gp->target)) {
-                        ret_val = js_proxy_get_invariant(ctx, gp->target, gp->atom, ret_val);
+                        if (!early7 && !JS_IsException(ret_val)) {
+                            JSKeyedInv *ki = js_mallocz(ctx, sizeof(*ki));
+                            if (unlikely(!ki)) {
+                                JS_FreeValue(ctx, ret_val); JS_ThrowOutOfMemory(ctx); ret_val = JS_EXCEPTION;
+                            } else {
+                                ki->target = js_dup(gp->target);
+                                ki->atom = JS_DupAtom(ctx, gp->atom);
+                                ki->outer = gouter; ki->outer_kind = gouter_kind;
+                                ki->op = (uint8_t)op7;
+                                ki->no_throw = gp->no_throw;
+                                /* GET checks against the trap's RESULT; SET and DEFINE against the operands the
+                                   request carries. */
+                                ki->operand = (op7 == GP_GET) ? ret_val : js_dup(gp->value);
+                                ki->in_getter = (op7 == GP_DEFINE) ? js_dup(gp->getter) : JS_UNDEFINED;
+                                ki->in_setter = (op7 == GP_DEFINE) ? js_dup(gp->setter) : JS_UNDEFINED;
+                                ki->in_flags = (op7 == GP_DEFINE) ? gp->dflags : 0;
+                                js_desc_facts_init(&ki->facts);
+                                ki->phase = KI_DESC;
+                                js_getprop_free(ctx, gp);
+                                cont_st = ki;
+                                ret_val = JS_UNINITIALIZED;
+                                goto do_keyed_inv_step;
+                            }
+                        }
+                    } else if (gp->op == GP_SET) {
+                        /* a SETTER body: it yields nothing, and a bare [[Set]] through one still succeeded. */
+                        JS_FreeValue(ctx, ret_val);
+                        ret_val = gp->no_throw ? JS_TRUE : JS_UNDEFINED;
                     }
                     js_getprop_free(ctx, gp);
                     if (gouter_kind == CONT_OP_KEYED) {
@@ -72496,28 +72596,118 @@ static int js_proxy_has(JSContext *ctx, JSValueConst obj, JSAtom atom)
    as the target's value, and must be undefined for a non-configurable accessor with no getter. ONE implementation,
    shared by the C path and by the trampolined trap's continuation — the check runs on the trap's RESULT, so the
    tramp path can only honour it from a continuation, which is what CONT_GETPROP carries. Consumes `ret`. */
+/* The PURE tails of the three keyed invariants that compare the target descriptor's FIELDS, over the record a
+   [[GetOwnProperty]] request answers into. No user code, so both forms reach the same three functions and only
+   HOW the record was obtained differs — the C hooks read it from C, the machines ask for it. 0 = consistent,
+   -1 = threw. */
+static int js_proxy_get_check(JSContext *ctx, const JSDescFacts *f, JSValueConst ret)
+{
+    if (f->flags < 0)
+        return 0;
+    if ((f->flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)) == 0) {
+        if (!js_same_value(ctx, f->value, ret))
+            goto fail;
+    } else if ((f->flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE)) == JS_PROP_GETSET) {
+        if (JS_IsUndefined(f->getter) && !JS_IsUndefined(ret))
+            goto fail;
+    }
+    return 0;
+fail:
+    JS_ThrowTypeError(ctx, "proxy: inconsistent get");
+    return -1;
+}
+
+static int js_proxy_set_check(JSContext *ctx, const JSDescFacts *f, JSValueConst value)
+{
+    if (f->flags < 0)
+        return 0;
+    if ((f->flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)) == 0) {
+        if (!js_same_value(ctx, f->value, value))
+            goto fail;
+    } else if ((f->flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE)) == JS_PROP_GETSET
+               && JS_IsUndefined(f->setter)) {
+        goto fail;
+    }
+    return 0;
+fail:
+    JS_ThrowTypeError(ctx, "proxy: inconsistent set");
+    return -1;
+}
+
+/* `extensible` is consulted ONLY when the property is absent from the target, which is why the machine asks for
+   it only then — running the target's `isExtensible` trap for a step 10.5.6 does not reach would be observable. */
+static int js_proxy_define_check(JSContext *ctx, const JSDescFacts *f, JSValueConst val,
+                                 JSValueConst getter, JSValueConst setter, int flags, int extensible)
+{
+    bool setting_not_configurable =
+        ((flags & (JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE)) == JS_PROP_HAS_CONFIGURABLE);
+    if (f->flags < 0) {
+        if (!extensible || setting_not_configurable)
+            goto fail;
+        return 0;
+    }
+    if (!check_define_prop_flags(f->flags, flags)
+        || ((f->flags & JS_PROP_CONFIGURABLE) && setting_not_configurable))
+        goto fail;
+    if (flags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET)) {
+        if ((f->flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE)) == JS_PROP_GETSET) {
+            if ((flags & JS_PROP_HAS_GET) && !js_same_value(ctx, getter, f->getter))
+                goto fail;
+            if ((flags & JS_PROP_HAS_SET) && !js_same_value(ctx, setter, f->setter))
+                goto fail;
+        }
+    } else if (flags & JS_PROP_HAS_VALUE) {
+        if ((f->flags & (JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)) == JS_PROP_WRITABLE
+            && !(flags & JS_PROP_WRITABLE))
+            goto fail;
+        else if ((f->flags & (JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)) == 0
+                 && !js_same_value(ctx, val, f->value))
+            goto fail;
+    }
+    if (flags & JS_PROP_HAS_WRITABLE) {
+        if ((f->flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)) == JS_PROP_WRITABLE)
+            goto fail;
+    }
+    return 0;
+fail:
+    JS_ThrowTypeError(ctx, "proxy: inconsistent defineProperty");
+    return -1;
+}
+
+/* Read a target's own descriptor into the record form, FROM C. This is the unrouted half — on a Proxy target it
+   runs its `getOwnPropertyDescriptor` trap here — and it exists so the C hooks reach the same three checks the
+   machines do. Returns 0 with `f` filled (flags -1 = absent), -1 having thrown. */
+static int js_proxy_facts_from_c(JSContext *ctx, JSValueConst target, JSAtom atom, JSDescFacts *f)
+{
+    JSPropertyDescriptor d;
+    int res;
+    js_desc_facts_init(f);
+    res = JS_GetOwnPropertyInternal(ctx, &d, JS_VALUE_GET_OBJ(target), atom);
+    if (res < 0)
+        return -1;
+    if (res) {
+        f->flags = d.flags;
+        f->value = d.value; f->getter = d.getter; f->setter = d.setter;   /* ownership transferred */
+    }
+    return 0;
+}
+
+
 static JSValue js_proxy_get_invariant(JSContext *ctx, JSValueConst target, JSAtom atom, JSValue ret)
 {
-    JSPropertyDescriptor desc;
-    int res = JS_GetOwnPropertyInternal(ctx, &desc, JS_VALUE_GET_OBJ(target), atom);
-    if (res < 0) {
+    JSDescFacts f;
+    if (JS_IsException(ret))
+        return ret;
+    if (js_proxy_facts_from_c(ctx, target, atom, &f) < 0) {
         JS_FreeValue(ctx, ret);
         return JS_EXCEPTION;
     }
-    if (res) {
-        if ((desc.flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)) == 0) {
-            if (!js_same_value(ctx, desc.value, ret))
-                goto fail;
-        } else if ((desc.flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE)) == JS_PROP_GETSET) {
-            if (JS_IsUndefined(desc.getter) && !JS_IsUndefined(ret)) {
-            fail:
-                js_free_desc(ctx, &desc);
-                JS_FreeValue(ctx, ret);
-                return JS_ThrowTypeError(ctx, "proxy: inconsistent get");
-            }
-        }
-        js_free_desc(ctx, &desc);
+    if (js_proxy_get_check(ctx, &f, ret) < 0) {
+        js_desc_facts_free(ctx, &f);
+        JS_FreeValue(ctx, ret);
+        return JS_EXCEPTION;
     }
+    js_desc_facts_free(ctx, &f);
     return ret;
 }
 
@@ -72559,27 +72749,15 @@ static JSValue js_proxy_get(JSContext *ctx, JSValueConst obj, JSAtom atom,
 static int js_proxy_set_invariant(JSContext *ctx, JSValueConst target, JSAtom atom,
                                   JSValueConst value, int ret)
 {
-    JSPropertyDescriptor desc;
-    int res;
+    JSDescFacts f;
+    int r;
     if (!ret)
         return 0;
-    res = JS_GetOwnPropertyInternal(ctx, &desc, JS_VALUE_GET_OBJ(target), atom);
-    if (res < 0)
+    if (js_proxy_facts_from_c(ctx, target, atom, &f) < 0)
         return -1;
-    if (res) {
-        if ((desc.flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)) == 0) {
-            if (!js_same_value(ctx, desc.value, value))
-                goto fail;
-        } else if ((desc.flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE)) == JS_PROP_GETSET
-                   && JS_IsUndefined(desc.setter)) {
-        fail:
-            js_free_desc(ctx, &desc);
-            JS_ThrowTypeError(ctx, "proxy: inconsistent set");
-            return -1;
-        }
-        js_free_desc(ctx, &desc);
-    }
-    return 1;
+    r = js_proxy_set_check(ctx, &f, value);
+    js_desc_facts_free(ctx, &f);
+    return (r < 0) ? -1 : 1;
 }
 
 static int js_proxy_set(JSContext *ctx, JSValueConst obj, JSAtom atom,
@@ -72930,70 +73108,28 @@ static int js_proxy_define_own_property(JSContext *ctx, JSValueConst obj,
 static int js_proxy_define_invariant(JSContext *ctx, JSValueConst target, JSAtom prop, JSValueConst val,
                                      JSValueConst getter, JSValueConst setter, int flags, bool ret)
 {
-    JSObject *p;
-    JSPropertyDescriptor desc;
-    int res;
-    bool setting_not_configurable;
+    JSDescFacts f;
+    int r, ext = 1;
 
     if (!ret) {
         if (flags & JS_PROP_THROW) {
             JS_ThrowTypeError(ctx, "proxy: defineProperty exception");
             return -1;
-        } else {
-            return 0;
         }
+        return 0;
     }
-    p = JS_VALUE_GET_OBJ(target);
-    res = JS_GetOwnPropertyInternal(ctx, &desc, p, prop);
-    if (res < 0)
+    if (js_proxy_facts_from_c(ctx, target, prop, &f) < 0)
         return -1;
-    setting_not_configurable = ((flags & (JS_PROP_HAS_CONFIGURABLE |
-                                          JS_PROP_CONFIGURABLE)) ==
-                                JS_PROP_HAS_CONFIGURABLE);
-    if (!res) {
-        if (!p->extensible || setting_not_configurable)
-            goto fail;
-    } else {
-        if (!check_define_prop_flags(desc.flags, flags) ||
-            ((desc.flags & JS_PROP_CONFIGURABLE) && setting_not_configurable)) {
-            goto fail1;
-        }
-        if (flags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET)) {
-            if ((desc.flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE)) ==
-                JS_PROP_GETSET) {
-                if ((flags & JS_PROP_HAS_GET) &&
-                    !js_same_value(ctx, getter, desc.getter)) {
-                    goto fail1;
-                }
-                if ((flags & JS_PROP_HAS_SET) &&
-                    !js_same_value(ctx, setter, desc.setter)) {
-                    goto fail1;
-                }
-            }
-        } else if (flags & JS_PROP_HAS_VALUE) {
-            if ((desc.flags & (JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)) ==
-                JS_PROP_WRITABLE && !(flags & JS_PROP_WRITABLE)) {
-                /* missing-proxy-check feature */
-                goto fail1;
-            } else if ((desc.flags & (JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)) == 0 &&
-                !js_same_value(ctx, val, desc.value)) {
-                goto fail1;
-            }
-        }
-        if (flags & JS_PROP_HAS_WRITABLE) {
-            if ((desc.flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE |
-                               JS_PROP_WRITABLE)) == JS_PROP_WRITABLE) {
-                /* proxy-missing-checks */
-            fail1:
-                js_free_desc(ctx, &desc);
-            fail:
-                JS_ThrowTypeError(ctx, "proxy: inconsistent defineProperty");
-                return -1;
-            }
-        }
-        js_free_desc(ctx, &desc);
+    if (f.flags < 0) {
+        /* 10.5.6 step 16.a is IsExtensible(target), the INTERNAL METHOD — this read `p->extensible`, the target
+           JSObject's storage bit, which for a Proxy target is the proxy's own flag rather than its answer. Third
+           instance of that deviation; the machine asks for the method and so does this. */
+        ext = JS_IsExtensible(ctx, target);
+        if (ext < 0) { js_desc_facts_free(ctx, &f); return -1; }
     }
-    return 1;
+    r = js_proxy_define_check(ctx, &f, val, getter, setter, flags, ext);
+    js_desc_facts_free(ctx, &f);
+    return (r < 0) ? -1 : 1;
 }
 
 /* [[Delete]] invariant: a trap that reports SUCCESS must be telling the truth about a non-configurable own property
