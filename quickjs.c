@@ -22964,7 +22964,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             /* the stack frame is already allocated */
             sf = &s->frame;
             if (unlikely(s->base_kind == FLOW_BASE_STEP_ROOT && !s->tramp_top)) {
-                /* FRESH call-root step base (reaction_step_flow_init): cur_func is a step closure, not bytecode, so
+                /* FRESH call-root step base (reaction_call_flow_init): cur_func is a step closure, not bytecode, so
                    there is no `b`. Dispatch the pre-pushed [this, closure, arg] through do_step_tramp; itail=1 routes
                    completion via do_return -> done, and the STEP_ROOT arm at `done` settles without touching b. Once
                    parked, the deepest (callback) frame resumes via tramp_top below, never through this branch. */
@@ -75962,14 +75962,16 @@ typedef struct JSReactionFlow {
 
 static JSValue js_reaction_resume_job(JSContext *ctx, int argc, JSValueConst *argv);
 
-/* Populate `fs` as a CALL-ROOT step flow base (FLOW_BASE_STEP_ROOT): a flow whose entire body is one call,
-   handler(arg), where `handler` is a STEP-MACHINE closure (a Promise reaction — resolve_element / then_finally).
-   cur_func is the closure (NOT bytecode); JS_CallInternal's flow-base entry sees base_kind and dispatches it
-   through do_step_tramp, so the callback the step drives (a user resolve/reject/onFinally) PARKS into this base —
-   the reaction runs as a first-class flow, never a JS_Call to completion. The frame's stack is pre-pushed with the
-   method-call operand shape [this=undefined, closure, arg] that do_step_tramp reads (call_argv = sp-1). */
+/* Populate `fs` as a CALL-ROOT flow base (FLOW_BASE_STEP_ROOT): a flow whose entire body is one call,
+   handler(arg), for a handler of ANY kind. cur_func is the handler (not necessarily bytecode);
+   JS_CallInternal's flow-base entry sees base_kind and dispatches the pre-pushed operands through the
+   CONVERGENCE POINT, so a bytecode body, a step-machine closure, a bound or proxied handler and a C one all
+   enter the way they would from any other call site — and whatever loops inside PARKS into this base rather
+   than driving to completion. It was named for the step closures that were its first caller; nothing in it is
+   step-specific, and reading it as step-only is what left a JS_Call fallback beside it. The frame's stack is
+   pre-pushed with the method-call operand shape [this=undefined, handler, arg] (call_argv = sp-1). */
 #define STEP_FLOW_SLOTS 16
-static int reaction_step_flow_init(JSContext *ctx, JSAsyncFunctionState *fs, JSValueConst handler, JSValueConst arg)
+static int reaction_call_flow_init(JSContext *ctx, JSAsyncFunctionState *fs, JSValueConst handler, JSValueConst arg)
 {
     JSStackFrame *sf = &fs->frame;
     JSValue *blk = js_malloc(ctx, sizeof(JSValue) * STEP_FLOW_SLOTS);
@@ -76021,7 +76023,7 @@ static int reaction_flow_settle_start(JSContext *ctx, JSReactionFlow *rf, JSValu
     func = is_reject ? rf->reject : rf->resolve;
     if (JS_IsUndefined(func)) { JS_FreeValue(ctx, res); return -1; }
     rf->phase = 1;
-    if (reaction_step_flow_init(ctx, &rf->fs, func, res) < 0) { JS_FreeValue(ctx, res); return -1; }
+    if (reaction_call_flow_init(ctx, &rf->fs, func, res) < 0) { JS_FreeValue(ctx, res); return -1; }
     JS_FreeValue(ctx, res);
     return 0;
 }
@@ -76078,7 +76080,7 @@ static int js_settle_as_flow(JSContext *ctx, JSValueConst func, JSValueConst val
     rf->resolve = js_dup(func);
     rf->reject = JS_UNDEFINED;
     rf->phase = 1;   /* there is no handler phase: the settle is the entire flow */
-    if (reaction_step_flow_init(ctx, &rf->fs, func, value) < 0) { reaction_flow_free(ctx, rf); return -1; }
+    if (reaction_call_flow_init(ctx, &rf->fs, func, value) < 0) { reaction_flow_free(ctx, rf); return -1; }
     return JS_IsException(reaction_flow_step(ctx, rf)) ? -1 : 0;
 }
 
@@ -76103,37 +76105,25 @@ static JSValue promise_reaction_job(JSContext *ctx, int argc,
         } else {
             res = js_dup(arg);
         }
-    } else if (tramp_can_call(handler)) {
-        /* a NORMAL handler has a preemptible body: run it as a FLOW so its loops park into the pump */
-        JSReactionFlow *rf = js_malloc(ctx, sizeof(*rf));
-        if (unlikely(!rf))
-            return JS_EXCEPTION;
-        memset(rf, 0, sizeof(*rf));
-        if (async_func_init(ctx, &rf->fs, handler, JS_UNDEFINED, 1, &arg)) {
-            js_free_rt(ctx->rt, rf);
-            return JS_EXCEPTION;
-        }
-        rf->resolve = js_dup(argv[0]);
-        rf->reject = js_dup(argv[1]);
-        return reaction_flow_step(ctx, rf);
-    } else if (tramp_step_def_of(handler)) {
-        /* a STEP-MACHINE closure handler (a Promise reaction — resolve_element / then_finally): its C body drives a
-           user callback (resolve / onFinally) that must PARK, so run it as a CALL-ROOT flow (base_kind STEP_ROOT)
-           rather than a JS_Call to completion. Same flow machinery as a bytecode handler, different base entry. */
-        JSReactionFlow *rf = js_malloc(ctx, sizeof(*rf));
-        if (unlikely(!rf))
-            return JS_EXCEPTION;
-        memset(rf, 0, sizeof(*rf));
-        if (reaction_step_flow_init(ctx, &rf->fs, handler, arg)) {
-            js_free_rt(ctx->rt, rf);
-            return JS_EXCEPTION;
-        }
-        rf->resolve = js_dup(argv[0]);
-        rf->reject = js_dup(argv[1]);
-        return reaction_flow_step(ctx, rf);
     } else {
-        /* a C-function / bound / proxy handler has no preemptible body */
-        res = JS_Call(ctx, handler, JS_UNDEFINED, 1, &arg);
+        /* EVERY handler runs as a CALL-ROOT flow. This asked what KIND the handler was and had three answers:
+           bytecode ran as a flow, a step-machine closure ran as a call-root flow, and everything else — a BOUND
+           handler, a PROXIED one, a C one, a generator function — fell to a JS_Call and drove to completion.
+           That is a claim about the CALLEE KIND, the one question a predicate is banned from answering, and it
+           was wrong in the ordinary case: `Promise.resolve(1).then(loops.bind(null))` aborted with no flow base.
+           The call root already answers it correctly for free — its base dispatches through the convergence
+           point, which is where every other call shape asks — so there is nothing left to ask here. */
+        JSReactionFlow *rf = js_malloc(ctx, sizeof(*rf));
+        if (unlikely(!rf))
+            return JS_EXCEPTION;
+        memset(rf, 0, sizeof(*rf));
+        if (reaction_call_flow_init(ctx, &rf->fs, handler, arg)) {
+            js_free_rt(ctx->rt, rf);
+            return JS_EXCEPTION;
+        }
+        rf->resolve = js_dup(argv[0]);
+        rf->reject = js_dup(argv[1]);
+        return reaction_flow_step(ctx, rf);
     }
     is_reject = JS_IsException(res);
     if (is_reject) {
