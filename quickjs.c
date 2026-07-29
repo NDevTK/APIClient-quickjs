@@ -1532,6 +1532,9 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_ATOMICS_XOR, STEPDEF_ATOMICS_EXCHANGE, STEPDEF_ATOMICS_CMPXCHG, STEPDEF_ATOMICS_LOAD,
     STEPDEF_ATOMICS_STORE, STEPDEF_ATOMICS_ISLOCKFREE, STEPDEF_ATOMICS_WAIT, STEPDEF_ATOMICS_NOTIFY,
     STEPDEF_PROMISE_THEN,
+    STEPDEF_SYMBOL_CTOR,
+    STEPDEF_MAP_UPSERT, STEPDEF_MAP_UPSERT_COMPUTED,
+    STEPDEF_WEAKMAP_UPSERT, STEPDEF_WEAKMAP_UPSERT_COMPUTED,
     STEPDEF_COUNT
 };
 #define HINT_NONE    2
@@ -63369,6 +63372,15 @@ static const JSTrampStepDef js_iterator_ctor_def =
 static const JSTrampStepDef js_bigint_ctor_def =
     { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, PRIMARGS(0x1, HINT_NUMBER, 1),
       { .generic = js_bigint_constructor }, JS_CFUNC_constructor_or_func, 0, NULL, NULL, NULL };
+static JSValue js_symbol_constructor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv);
+static int js_symbol_ctor_precheck(JSContext *ctx, JSStepHdr *h);
+/* 20.4.1.1 Symbol([description]): step 1 rejects a NewTarget, step 2 is `? ToString(description)`, and the rest
+   invokes nothing — the coerce-then-compute declaration, with the NewTarget test as the leading validation
+   because it must throw BEFORE the description's toString runs. js_symbol_constructor ran that ToString from
+   its C entry, so `Symbol({toString(){for(;;){}}})` preempted with no flow base. */
+static const JSTrampStepDef js_symbol_ctor_def =
+    { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, PRIMARGS(0x1, HINT_STRING, 1),
+      { .generic = js_symbol_constructor }, JS_CFUNC_constructor_or_func, 0, js_symbol_ctor_precheck, NULL, NULL };
 static const JSTrampStepDef js_array_indexOf_def     = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_INDEXOF };
 static const JSTrampStepDef js_array_lastIndexOf_def = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_LASTINDEXOF };
 static const JSTrampStepDef js_array_includes_def    = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_INCLUDES };
@@ -63785,6 +63797,25 @@ static const JSTrampStepDef js_promise_catch_def = {
 static const JSTrampStepDef js_promise_finally_def;
 /* likewise .then, whose PerformPromiseThen lives there. */
 static const JSTrampStepDef js_promise_then_def;
+/* likewise the Map upsert machine, defined with the map code it mutates. */
+static int js_map_upsert_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_map_upsert_fini(JSContext *ctx, void *st, bool take_result);
+/* the state: the callbackfn's operands and the result. Defined here rather than beside the map code because a
+   definition needs its SIZE. */
+struct JSMapUpsert {
+    JSStepHdr hdr;        /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    JSValue result;       /* DONE (owned) */
+    JSValue cb_args[3];   /* [this=undefined, callbackfn, key] */
+};
+/* 24.1.3.x getOrInsert / getOrInsertComputed. The COMPUTED form calls the page's callback and then resumes into
+   the map — a continuation-holding builtin, driven by js_map_getOrInsert with JS_Call from its C entry, so
+   `new Map().getOrInsertComputed(1, function(){ for(;;){} })` aborted with no flow base. `arg` is the same
+   `class_id << 1 | computed` magic the C body took. */
+#define MAP_UPSERT_DEF(magic) { sizeof(struct JSMapUpsert), js_map_upsert_step, js_map_upsert_fini, (magic) }
+static const JSTrampStepDef js_map_upsert_def      = MAP_UPSERT_DEF(JS_CLASS_MAP << 1 | 0);
+static const JSTrampStepDef js_map_upsert_comp_def = MAP_UPSERT_DEF(JS_CLASS_MAP << 1 | 1);
+static const JSTrampStepDef js_weakmap_upsert_def      = MAP_UPSERT_DEF(JS_CLASS_WEAKMAP << 1 | 0);
+static const JSTrampStepDef js_weakmap_upsert_comp_def = MAP_UPSERT_DEF(JS_CLASS_WEAKMAP << 1 | 1);
 /* likewise: the resolving-function machine is defined with the Promise code it settles. */
 static const JSTrampStepDef js_promise_resolvefn_def;
 
@@ -63793,6 +63824,10 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_PROMISE_CATCH]         = &js_promise_catch_def,
     [STEPDEF_PROMISE_FINALLY]       = &js_promise_finally_def,
     [STEPDEF_PROMISE_THEN]          = &js_promise_then_def,
+    [STEPDEF_MAP_UPSERT]            = &js_map_upsert_def,
+    [STEPDEF_MAP_UPSERT_COMPUTED]   = &js_map_upsert_comp_def,
+    [STEPDEF_WEAKMAP_UPSERT]        = &js_weakmap_upsert_def,
+    [STEPDEF_WEAKMAP_UPSERT_COMPUTED] = &js_weakmap_upsert_comp_def,
     [STEPDEF_PROMISE_REJECT]        = &js_promise_reject_def,
     [STEPDEF_ARRAY_FIND]            = &js_array_find_def,
     [STEPDEF_ARRAY_FIND_INDEX]      = &js_array_findIndex_def,
@@ -63849,6 +63884,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_ARRAY_FILL]    = &js_array_fill_def,
     [STEPDEF_ARRAY_COPYWITHIN] = &js_array_copyWithin_def,
     [STEPDEF_BIGINT_CTOR]   = &js_bigint_ctor_def,
+    [STEPDEF_SYMBOL_CTOR]   = &js_symbol_ctor_def,
     [STEPDEF_TA_WITH]       = &js_ta_with_def,
     [STEPDEF_TA_FILL]       = &js_ta_fill_def,
     [STEPDEF_TA_COPYWITHIN] = &js_ta_copyWithin_def,
@@ -74997,14 +75033,26 @@ JSValue JS_GetProxyHandler(JSContext *ctx, JSValueConst proxy)
 
 /* Symbol */
 
+/* 20.4.1.1 step 1: `new Symbol()` is a TypeError BEFORE the description is coerced. For a constructor step the
+   header's this_val IS new_target, which is the same operand the C body took. */
+static int js_symbol_ctor_precheck(JSContext *ctx, JSStepHdr *h)
+{
+    if (!JS_IsUndefined(h->this_val)) {
+        JS_ThrowTypeErrorNotAConstructor(ctx, h->this_val);
+        return -1;
+    }
+    return 0;
+}
+
 static JSValue js_symbol_constructor(JSContext *ctx, JSValueConst new_target,
                                      int argc, JSValueConst *argv)
 {
     JSValue str;
     JSString *p;
 
-    if (!JS_IsUndefined(new_target))
-        return JS_ThrowTypeErrorNotAConstructor(ctx, new_target);
+    /* the NewTarget test is the declaration's precheck and the ToString its coercion, so `argv[0]` is already a
+       primitive here and nothing below invokes the page's code. */
+    DCHECK(JS_IsUndefined(new_target), "the Symbol constructor body ran with a NewTarget the precheck rejects");
     if (argc == 0 || JS_IsUndefined(argv[0])) {
         p = NULL;
     } else {
@@ -75509,43 +75557,71 @@ static JSValue js_map_get(JSContext *ctx, JSValueConst this_val,
         return js_dup(mr->value);
 }
 
-static JSValue js_map_getOrInsert(JSContext *ctx, JSValueConst this_val,
-                                  int argc, JSValueConst *argv, int magic)
+/* 24.1.3.x getOrInsert / getOrInsertComputed, as ONE machine. The computed form's callbackfn is the page's
+   code AND the operation continues into the map afterwards — a continuation-holding builtin, which
+   js_map_getOrInsert drove with JS_Call from its C entry. Everything else in it (the record walk, the add, the
+   weak-target test) invokes nothing. */
+_Static_assert(offsetof(struct JSMapUpsert, hdr) == 0, "JSStepHdr must be first in JSMapUpsert");
+
+static int js_map_upsert_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    bool computed = magic & 1;
-    JSClassID class_id = magic >> 1;
-    JSMapState *s = JS_GetOpaque2(ctx, this_val, class_id);
-    JSMapRecord *mr;
+    struct JSMapUpsert *s = st;
+    bool computed = s->hdr.arg & 1;
+    JSClassID class_id = (JSClassID)(s->hdr.arg >> 1);
+    /* the state is re-derived at every entry: the CALLBACK can have added, deleted or rehashed records, so a
+       JSMapState * or a JSMapRecord * held across it is a pointer into a table that has moved. */
+    JSMapState *ms = JS_GetOpaque2(ctx, s->hdr.this_val, class_id);
     JSValueConst key;
+    JSMapRecord *mr;
     JSValue value;
 
-    if (!s)
-        return JS_EXCEPTION;
-    if (computed && check_function(ctx, argv[1]))
-        return JS_EXCEPTION;
-    key = map_normalize_key_const(ctx, argv[0]);
-    if (s->is_weak && !is_valid_weakref_target(key))
-        return JS_ThrowTypeError(ctx, "invalid value used as WeakMap key");
-    mr = map_find_record(ctx, s, key);
-    if (!mr) {
+    if (!ms) { JS_FreeValue(ctx, cb_result); return -1; }
+    key = map_normalize_key_const(ctx, step_arg(&s->hdr, 0));
+
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result);
+        s->result = JS_UNDEFINED;
+        s->cb_args[0] = JS_UNDEFINED; s->cb_args[1] = JS_UNDEFINED; s->cb_args[2] = JS_UNDEFINED;
+        if (computed && check_function(ctx, step_arg(&s->hdr, 1)))
+            return -1;
+        if (ms->is_weak && !is_valid_weakref_target(key)) {
+            JS_ThrowTypeError(ctx, "invalid value used as WeakMap key");
+            return -1;
+        }
+        mr = map_find_record(ctx, ms, key);
+        if (mr) { s->result = js_dup(mr->value); return 0; }
         if (computed) {
-            value = JS_Call(ctx, argv[1], JS_UNDEFINED, 1, &key);
-            if (JS_IsException(value))
-                return JS_EXCEPTION;
-            mr = map_find_record(ctx, s, key);
-            if (mr)
-                map_delete_record(ctx->rt, s, mr);
-        } else {
-            value = js_dup(argv[1]);
+            s->hdr.stage = 1;
+            s->cb_args[1] = js_dup(step_arg(&s->hdr, 1));
+            s->cb_args[2] = js_dup(key);
+            *out_cb = s->cb_args; *out_argc = 1;
+            return 3;   /* CALL */
         }
-        mr = map_add_record(ctx, s, key);
-        if (!mr) {
-            JS_FreeValue(ctx, value);
-            return JS_EXCEPTION;
-        }
-        mr->value = value;
+        value = js_dup(step_arg(&s->hdr, 1));
+    } else {
+        /* the callbackfn returned. It may have inserted the key itself, which the spec discards in favour of
+           this value — the same re-find-and-delete the C body performed, on a table it must look up again. */
+        DCHECK(s->hdr.stage == 1, "the map upsert resumed in no stage");
+        value = cb_result;
+        mr = map_find_record(ctx, ms, key);
+        if (mr)
+            map_delete_record(ctx->rt, ms, mr);
     }
-    return js_dup(mr->value);
+    mr = map_add_record(ctx, ms, key);
+    if (!mr) { JS_FreeValue(ctx, value); return -1; }
+    mr->value = value;
+    s->result = js_dup(value);
+    return 0;
+}
+
+static JSValue js_map_upsert_fini(JSContext *ctx, void *st, bool take_result)
+{
+    struct JSMapUpsert *s = st;
+    JSValue r = take_result ? s->result : (JS_FreeValue(ctx, s->result), JS_UNDEFINED);
+    int i;
+    for (i = 0; i < 3; i++) JS_FreeValue(ctx, s->cb_args[i]);
+    js_free_rt(ctx->rt, s);
+    return r;
 }
 
 static JSValue js_map_has(JSContext *ctx, JSValueConst this_val,
@@ -75954,10 +76030,8 @@ static const JSCFunctionListEntry js_set_funcs[] = {
 static const JSCFunctionListEntry js_map_proto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("set", 2, js_map_set, 0 ),
     JS_CFUNC_MAGIC_DEF("get", 1, js_map_get, 0 ),
-    JS_CFUNC_MAGIC_DEF("getOrInsert", 2, js_map_getOrInsert,
-                       JS_CLASS_MAP<<1 | /*computed*/false ),
-    JS_CFUNC_MAGIC_DEF("getOrInsertComputed", 2, js_map_getOrInsert,
-                       JS_CLASS_MAP<<1 | /*computed*/true ),
+    JS_CFUNC_STEP_DEF("getOrInsert", 2, STEPDEF_MAP_UPSERT ),
+    JS_CFUNC_STEP_DEF("getOrInsertComputed", 2, STEPDEF_MAP_UPSERT_COMPUTED ),
     JS_CFUNC_MAGIC_DEF("has", 1, js_map_has, 0 ),
     JS_CFUNC_MAGIC_DEF("delete", 1, js_map_delete, 0 ),
     JS_CFUNC_MAGIC_DEF("clear", 0, js_map_clear, 0 ),
@@ -76004,10 +76078,8 @@ static const JSCFunctionListEntry js_set_iterator_proto_funcs[] = {
 static const JSCFunctionListEntry js_weak_map_proto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("set", 2, js_map_set, MAGIC_WEAK ),
     JS_CFUNC_MAGIC_DEF("get", 1, js_map_get, MAGIC_WEAK ),
-    JS_CFUNC_MAGIC_DEF("getOrInsert", 2, js_map_getOrInsert,
-                       JS_CLASS_WEAKMAP<<1 | /*computed*/false ),
-    JS_CFUNC_MAGIC_DEF("getOrInsertComputed", 2, js_map_getOrInsert,
-                       JS_CLASS_WEAKMAP<<1 | /*computed*/true ),
+    JS_CFUNC_STEP_DEF("getOrInsert", 2, STEPDEF_WEAKMAP_UPSERT ),
+    JS_CFUNC_STEP_DEF("getOrInsertComputed", 2, STEPDEF_WEAKMAP_UPSERT_COMPUTED ),
     JS_CFUNC_MAGIC_DEF("has", 1, js_map_has, MAGIC_WEAK ),
     JS_CFUNC_MAGIC_DEF("delete", 1, js_map_delete, MAGIC_WEAK ),
     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "WeakMap", JS_PROP_CONFIGURABLE ),
@@ -80825,7 +80897,7 @@ int JS_AddIntrinsicBaseObjects(JSContext *ctx)
 
     /* ES6 Symbol */
     obj1 = JS_NewCConstructor(ctx, JS_CLASS_SYMBOL, "Symbol",
-                              js_symbol_constructor, 0, JS_CFUNC_constructor_or_func, 0,
+                              js_symbol_constructor, 0, JS_CFUNC_step_ctor, STEPDEF_SYMBOL_CTOR,
                               JS_UNDEFINED,
                               js_symbol_funcs, countof(js_symbol_funcs),
                               js_symbol_proto_funcs, countof(js_symbol_proto_funcs),
