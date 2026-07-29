@@ -69612,111 +69612,12 @@ JSValue JS_ParseJSON(JSContext *ctx, const char *buf, size_t buf_len, const char
     return JS_ParseJSON_internal(ctx, buf, buf_len, filename, NULL);
 }
 
-/* if pr != NULL, then pr->value = holder by construction */
-static JSValue internalize_json_property(JSContext *ctx, JSValueConst holder,
-                                         JSAtom name, JSValueConst reviver,
-                                         const char *text_str, JSONParseRecord *pr)
-{
-    JSValue val, new_el, name_val, res, context;
-    JSValueConst args[3];
-    int ret, is_array;
-    uint32_t i, len = 0;
-    JSAtom prop;
-    JSPropertyEnum *atoms = NULL;
-
-    if (js_check_stack_overflow(ctx->rt, 0)) {
-        return JS_ThrowStackOverflow(ctx);
-    }
-
-    val = JS_GetProperty(ctx, holder, name);
-    if (JS_IsException(val))
-        return val;
-
-    if (pr) {
-        if (js_is_array(ctx, pr->value)) {
-            if (__JS_AtomIsTaggedInt(name)) {
-                uint32_t idx = __JS_AtomToUInt32(name);
-                if (idx < pr->u.array.count) {
-                    pr = &pr->u.array.elements[idx];
-                } else {
-                    pr = NULL;
-                }
-            }
-        } else {
-            pr = json_parse_record_find(pr, name);
-        }
-        if (pr && !js_same_value(ctx, pr->value, val)) {
-            pr = NULL;
-        }
-    }
-
-    context = JS_NewObject(ctx);
-    if (JS_IsException(context))
-        goto fail;
-
-    if (JS_IsObject(val)) {
-        is_array = js_is_array(ctx, val);
-        if (is_array < 0)
-            goto fail;
-        if (is_array) {
-            if (js_get_length32(ctx, &len, val))
-                goto fail;
-        } else {
-            ret = JS_GetOwnPropertyNamesInternal(ctx, &atoms, &len, JS_VALUE_GET_OBJ(val), JS_GPN_ENUM_ONLY | JS_GPN_STRING_MASK);
-            if (ret < 0)
-                goto fail;
-        }
-        for(i = 0; i < len; i++) {
-            if (is_array) {
-                prop = JS_NewAtomUInt32(ctx, i);
-                if (prop == JS_ATOM_NULL)
-                    goto fail;
-            } else {
-                prop = JS_DupAtom(ctx, atoms[i].atom);
-            }
-            new_el = internalize_json_property(ctx, val, prop, reviver, text_str, pr);
-            if (JS_IsException(new_el)) {
-                JS_FreeAtom(ctx, prop);
-                goto fail;
-            }
-            if (JS_IsUndefined(new_el)) {
-                ret = JS_DeleteProperty(ctx, val, prop, 0);
-            } else {
-                ret = JS_DefinePropertyValue(ctx, val, prop, new_el, JS_PROP_C_W_E);
-            }
-            JS_FreeAtom(ctx, prop);
-            if (ret < 0)
-                goto fail;
-        }
-    } else {
-        if (pr) {
-            new_el = JS_NewStringLen(ctx, text_str + pr->u.primitive.source_pos,
-                                     pr->u.primitive.source_len);
-            if (JS_IsException(new_el))
-                goto fail;
-            if (JS_DefinePropertyValue(ctx, context, JS_ATOM_source, new_el, JS_PROP_C_W_E) < 0)
-                goto fail;
-        }
-    }
-    js_free_prop_enum(ctx, atoms, len);
-    atoms = NULL;
-    name_val = JS_AtomToValue(ctx, name);
-    if (JS_IsException(name_val))
-        goto fail;
-    args[0] = name_val;
-    args[1] = val;
-    args[2] = context;
-    res = JS_Call(ctx, reviver, holder, 3, args);
-    JS_FreeValue(ctx, name_val);
-    JS_FreeValue(ctx, val);
-    JS_FreeValue(ctx, context);
-    return res;
- fail:
-    js_free_prop_enum(ctx, atoms, len);
-    JS_FreeValue(ctx, context);
-    JS_FreeValue(ctx, val);
-    return JS_EXCEPTION;
-}
+/* DELETED: internalize_json_property. It was JSON.parse's recursive C reviver walker, and it had been
+   unreachable since js_json_reviver_step replaced it — its only remaining caller was its own recursion. Left in
+   place it read a value with JS_GetProperty, enumerated with JS_GPN_ENUM_ONLY and invoked the reviver with
+   JS_Call, all from C: a reader would have taken it for a live path that runs three of the page's operations
+   with no flow base, and the enum-only ratchet counted it as a consumer still to convert. Dead code that LOOKS
+   load-bearing is worse than none. */
 
 /* ---- Suspendable JSON.parse reviver (explicit-stack post-order walk; see JSJsonReviver) ---- */
 static int jr_push(JSContext *ctx, JSJsonReviver *s) {
