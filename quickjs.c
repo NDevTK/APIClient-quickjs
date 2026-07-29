@@ -17342,6 +17342,16 @@ static void js_iternext_deliver(JSContext *ctx, JSValue *sp, JSValue ret_val)
     sp[-1] = ret_val;
 }
 
+/* OP_iterator_call's tail. The delegated return()/throw() RESULT replaces the argument the opcode forwarded, and
+   the boolean pushed above it is `ret_flag` — false exactly when a method was found and ran, which is what tells
+   the bytecode below not to take the "no such method" path. The caller does the sp += 1. */
+static void js_itercall_deliver(JSContext *ctx, JSValue *sp, JSValue ret_val)
+{
+    JS_FreeValue(ctx, sp[-1]);
+    sp[-1] = ret_val;
+    sp[0] = js_bool(false);
+}
+
 /* DELETED: js_for_of_next. It was OP_for_of_next's C fallback — reached whenever the iterator's .next() was
    not a plain bytecode function — and it drove that .next() through JS_IteratorNext -> JS_Call, a C activation
    whose back-edge preempt has no flow base. The opcode routes EVERY .next() now: a bytecode body to
@@ -19848,6 +19858,21 @@ typedef struct JSIterClose {
                                   a C recursion that drove it to completion. do_return applies IteratorNext's
                                   "result must be an object" check and IteratorComplete/IteratorValue, and places
                                   [value, done] exactly where js_for_of_next's tail does. */
+#define CONT_ITER_CALL_GET 47  /* cont_state = NULL: OP_iterator_call's `? GetMethod(iterator, "return"/"throw")` —
+                                  the delegating close/throw of `yield*` and `for await`. The READ is the page's
+                                  code whenever that property is an accessor or the delegate is a Proxy, and the
+                                  opcode did it with a plain JS_GetProperty from C. The kind IS the continuation
+                                  because only one bit has to survive the read: whether the call that follows
+                                  forwards an argument. That is why there are two of these rather than a phase
+                                  byte on a heap state nothing else would read. */
+#define CONT_ITER_CALL_GET_NOARG 48  /* the same read for the flags&2 form — yield*'s own return() delegation,
+                                        which calls the method with NO argument. */
+#define CONT_ITER_CALL     49  /* cont_state = NULL: the Call that read produced. The method is user code of any
+                                  kind and the opcode finished it with JS_CallFree, a C activation with no flow
+                                  base — so `break`ing out of a for-of over a delegating generator aborted the
+                                  moment the delegate's `return` contained a loop. Its result REPLACES the
+                                  argument the opcode forwarded and the boolean below it is false, which is what
+                                  "a method was there and ran" means to the bytecode that follows. */
 #define CONT_ITER_NEXT_OP  30  /* cont_state = NULL: OP_iterator_next's .next(value) — yield* delegation and
                                   destructuring — where the callee is neither a generator (do_generator_tramp's
                                   iternext mode) nor a lazy helper (ITH_ITERNEXT). Its body runs on THIS chain,
@@ -20103,6 +20128,9 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_ITER_CLOSE:
     case CONT_ITER_CLOSE_CALL:
     case CONT_ITER_NEXT_OP:
+    case CONT_ITER_CALL:
+    case CONT_ITER_CALL_GET:
+    case CONT_ITER_CALL_GET_NOARG:
     case CONT_TRAP_GET:
     case CONT_OP_KEYED:
         break;
@@ -22127,6 +22155,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     int gp_no_throw = 0;                                /* 1 = a [[Set]]/[[Delete]] yields its boolean instead of throwing on false. read+reset there */
     int forof_unpack_off = 0;                           /* do_forof_unpack's inputs: the enum_rec's offset from sp, */
     uint8_t forof_unpack_mode = FOU_FOROF;              /* and which placement the pair takes */
+    uint8_t itercall_noarg = 0;                         /* do_itercall_have_method's input: the flags&2 form. The
+                                                           read that produced the method cannot re-derive it (the
+                                                           opcode byte is long gone), so the GET's KIND carries it
+                                                           across the suspension and each delivery hands it here. */
     JSValueConst gp_val = JS_UNDEFINED;                 /* GP_SET / GP_DEFINE: the value to write (borrowed from the machine) */
     /* GP_DEFINE's remaining descriptor fields. The request expressed only CreateDataProperty's shape — a data
        descriptor with all three attributes true — hardcoded at THREE sites (the in-place define, the trap's
@@ -24487,7 +24519,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         forof_unpack_off = dfof;
                         goto do_forof_unpack;
                     }
-                    if (dck == CONT_ITER_NEXT_OP) {
+                    if (dck == CONT_ITER_NEXT_OP || dck == CONT_ITER_CALL) {
                         JSValue *cargv;
                         int pop, first;
                         TAKE_CALL_SHAPE(); pop = call_pop; first = call_first_r;
@@ -24495,7 +24527,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         for (i = first; i < pop; i++) JS_FreeValue(ctx, cargv[i]);
                         sp += first - pop;
                         if (unlikely(JS_IsException(ret_val))) goto exception;
-                        js_iternext_deliver(ctx, sp, ret_val);
+                        if (dck == CONT_ITER_NEXT_OP) { js_iternext_deliver(ctx, sp, ret_val); BREAK; }
+                        js_itercall_deliver(ctx, sp, ret_val);
+                        sp += 1;
                         BREAK;
                     }
                     if (dck == CONT_AGEN_SETTLE) {
@@ -24812,13 +24846,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         JS_FreeValue(ctx, sp[foff1]); sp[foff1] = JS_UNDEFINED;
                         goto exception;
                     }
-                    if (sk0 == CONT_ITER_NEXT_OP) {
-                        /* a step-machine .next() that threw (the built-in ARRAY iterator's, on an accessor or a
-                           proxied length): drop its operands and propagate. Unlike for-of there is no enum_rec
-                           slot to clear — the delegating frame's own unwind owns the iterator. */
+                    if (sk0 == CONT_ITER_NEXT_OP || sk0 == CONT_ITER_CALL) {
+                        /* a step-machine .next()/.return() that threw (the built-in ARRAY iterator's, on an
+                           accessor or a proxied length): drop its operands and propagate. Unlike for-of there is
+                           no enum_rec slot to clear — the delegating frame's own unwind owns the iterator. */
                         int cfirst1 = h->orig_cfirst, cargc1 = h->orig_cargc;
                         JSValue *ncargv;
-                        DCHECK(souter0 == NULL, "an OP_iterator_next continuation carries no state");
+                        DCHECK(souter0 == NULL, "an OP_iterator_next/OP_iterator_call continuation carries no state");
                         tramp_step_state_free(ctx, stt, false);
                         ncargv = sp - cargc1;
                         for (i = cfirst1; i < cargc1; i++) JS_FreeValue(ctx, ncargv[i]);
@@ -24876,14 +24910,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         ret_val = r;
                         goto do_forof_unpack;
                     }
-                    if (souter_kind == CONT_ITER_NEXT_OP) {
-                        /* the machine WAS an OP_iterator_next .next(). Its operands are dropped and its result
-                           replaces the resume argument, exactly where a returned heap frame's does. */
+                    if (souter_kind == CONT_ITER_NEXT_OP || souter_kind == CONT_ITER_CALL) {
+                        /* the machine WAS an OP_iterator_next .next() or an OP_iterator_call .return()/.throw().
+                           Its operands are dropped and its result lands exactly where a returned heap frame's
+                           does. */
                         JSValue *ncargv = sp - cargc;
-                        DCHECK(souter == NULL, "an OP_iterator_next continuation carries no state");
+                        DCHECK(souter == NULL, "an OP_iterator_next/OP_iterator_call continuation carries no state");
                         for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, ncargv[i]);
                         sp += cfirst - cargc;
-                        js_iternext_deliver(ctx, sp, r);
+                        if (souter_kind == CONT_ITER_NEXT_OP) { js_iternext_deliver(ctx, sp, r); BREAK; }
+                        js_itercall_deliver(ctx, sp, r);
+                        sp += 1;
                         BREAK;
                     }
                     if (souter && (souter_kind == CONT_ITER_CONSUME || souter_kind == CONT_ITER_HELPER
@@ -25883,6 +25920,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                           tramp_iter_getiter = ret_val;
                           goto do_consume_acquire_have_method;
                       }
+                      if (gk == CONT_ITER_CALL_GET || gk == CONT_ITER_CALL_GET_NOARG) {
+                          itercall_noarg = (gk == CONT_ITER_CALL_GET_NOARG);
+                          goto do_itercall_have_method;   /* the read invoked nothing */
+                      }
                       if (gk == CONT_FOROF_GET) goto do_forof_have_method;   /* the read invoked nothing */
                       if (gk == CONT_FORAWAIT_GET) goto do_forawait_have_async_method;
                       if (gk == CONT_FORAWAIT_SYNC_GET) goto do_forawait_have_sync_method;
@@ -25992,7 +26033,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         js_trapget_free(ctx, tg);
                         goto getprop_throw;
                     }
-                    if (gk3 == CONT_FOROF_GET || gk3 == CONT_FORAWAIT_GET || gk3 == CONT_FORAWAIT_SYNC_GET) {
+                    if (gk3 == CONT_FOROF_GET || gk3 == CONT_FORAWAIT_GET || gk3 == CONT_FORAWAIT_SYNC_GET
+                        || gk3 == CONT_ITER_CALL_GET || gk3 == CONT_ITER_CALL_GET_NOARG) {
                         /* the for-of's @@iterator read threw: its operand (the iterable) is on the stack and
                            belongs to the frame's catch-search, exactly as for any other throwing operator. */
                         goto exception;
@@ -28748,6 +28790,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            || gouter_kind == CONT_TRAP_GET || gouter_kind == CONT_OP_KEYED
                            || gouter_kind == CONT_FOROF_GET || gouter_kind == CONT_FORAWAIT_GET
                            || gouter_kind == CONT_FORAWAIT_SYNC_GET
+                           || gouter_kind == CONT_ITER_CALL_GET || gouter_kind == CONT_ITER_CALL_GET_NOARG
                            || gouter_kind == CONT_PROMISE_ALL_THEN || gouter_kind == CONT_AFS_GET
                            || gouter_kind == CONT_ITER_HELPER_GET || gouter_kind == CONT_PROMISE_ALL_GET
                            || gouter_kind == CONT_FOROF_UNPACK,
@@ -28779,6 +28822,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            request is not that call. Re-entering it would drop them a second time, with a stale
                            shape — the sp drift ASan caught. The phase on the state says which read this answers. */
                         goto do_async_from_sync_step;
+                    }
+                    if (gouter_kind == CONT_ITER_CALL_GET || gouter_kind == CONT_ITER_CALL_GET_NOARG) {
+                        /* the delegate's `return`/`throw` was produced by USER CODE — an accessor on the
+                           iterator, a Proxy `get` trap — and the read suspended. The enum_rec and the forwarded
+                           argument are where they were; go on to the Call. */
+                        itercall_noarg = (gouter_kind == CONT_ITER_CALL_GET_NOARG);
+                        js_getprop_free(ctx, gp);
+                        goto do_itercall_have_method;
                     }
                     if (gouter_kind == CONT_FOROF_GET || gouter_kind == CONT_FORAWAIT_GET
                         || gouter_kind == CONT_FORAWAIT_SYNC_GET) {
@@ -28962,15 +29013,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     forof_unpack_off = dlv_forof;
                     goto do_forof_unpack;
                 }
-                if (dlv_ck == CONT_ITER_NEXT_OP) {
-                    /* the .next() returned: drop whatever operand shape the frame RECORDED (do_generic_callee's
-                       proxy and bound arms replace the three the opcode pushed), then the opcode's tail — the
-                       result replaces the resume argument. */
+                if (dlv_ck == CONT_ITER_NEXT_OP || dlv_ck == CONT_ITER_CALL) {
+                    /* the .next() / .return() / .throw() returned: drop whatever operand shape the frame RECORDED
+                       (do_generic_callee's proxy and bound arms replace the ones the opcode pushed), then the
+                       opcode's tail. */
                     JSValue *cargv = sp - dlv_cargc;
-                    DCHECK(dlv_cargc >= dlv_cfirst, "iterator-next frame records operands ending below where they start");
+                    DCHECK(dlv_cargc >= dlv_cfirst, "iterator-call frame records operands ending below where they start");
                     for (i = dlv_cfirst; i < dlv_cargc; i++) JS_FreeValue(ctx, cargv[i]);
                     sp += dlv_cfirst - dlv_cargc;
-                    js_iternext_deliver(ctx, sp, ret_val);
+                    if (dlv_ck == CONT_ITER_NEXT_OP) { js_iternext_deliver(ctx, sp, ret_val); BREAK; }
+                    js_itercall_deliver(ctx, sp, ret_val);
+                    sp += 1;
                     BREAK;
                 }
                 if (dlv_ck == CONT_FOROF_ACQUIRE || dlv_ck == CONT_FORAWAIT_WRAP) {
@@ -30481,42 +30534,61 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         goto do_async_from_sync_tramp;
                     }
                 }
-                method = JS_GetProperty(ctx, sp[-4], (flags & 1) ?
-                                        JS_ATOM_throw : JS_ATOM_return);
-                if (JS_IsException(method))
-                    goto exception;
-                if (JS_IsUndefined(method) || JS_IsNull(method)) {
-                    ret_flag = true;
-                } else {
-                    {   /* delegating .return()/.throw() onto an ASYNC generator: drive its body (its `finally`, or
-                           the catch its .throw() lands in) on THIS chain. The method is resolved by lookup here, so
-                           the question is asked on the RESOLVED method — a page that patched it gets its own. */
-                        int agmag = tramp_agen_method_magic(method, sp[-4]);
-                        if (agmag >= 0) {
-                            JS_FreeValue(ctx, method);
-                            tramp_agen_magic = agmag; tramp_agen_shape = AGEN_SHAPE_ITERCALL;
-                            tramp_agen_noarg = ((flags & 2) != 0);
-                            goto do_agen_drive_tramp;
-                        }
-                    }
-                    if (flags & 2) {
-                        /* no argument */
-                        ret = JS_CallFree(ctx, method, sp[-4],
-                                          0, NULL);
-                    } else {
-                        ret = JS_CallFree(ctx, method, sp[-4],
-                                          1, vc(sp - 1));
-                    }
-                    if (JS_IsException(ret))
-                        goto exception;
-                    JS_FreeValue(ctx, sp[-1]);
-                    sp[-1] = ret;
-                    ret_flag = false;
-                }
-                sp[0] = js_bool(ret_flag);
-                sp += 1;
+                /* `? GetMethod(iterator, "return"/"throw")`: an ACCESSOR or a Proxy on the delegate makes this
+                   read the page's own code, and it ran here as a plain JS_GetProperty. It is the one
+                   keyed-operation entry's GP_GET now; the delivery below performs the Call with the method in
+                   hand. The no-argument form rides the KIND because it is the only thing about the opcode that
+                   the read has to outlive. */
+                gp_outer = NULL;
+                gp_outer_kind = (flags & 2) ? CONT_ITER_CALL_GET_NOARG : CONT_ITER_CALL_GET;
+                gp_obj = sp[-4];
+                gp_atom = (flags & 1) ? JS_ATOM_throw : JS_ATOM_return;
+                gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                goto do_getprop_tramp;
             }
-            BREAK;
+
+        do_itercall_have_method:
+            /* GetMethod's result, reached from the read whether it invoked user code or not. The enum_rec is at
+               sp[-4..-2] and the forwarded argument at sp[-1], untouched by the read. */
+            {
+                JSValue method = ret_val;
+                bool noarg = (itercall_noarg != 0);
+                ret_val = JS_UNDEFINED;
+                itercall_noarg = 0;
+                if (JS_IsUndefined(method) || JS_IsNull(method)) {
+                    JS_FreeValue(ctx, method);
+                    sp[0] = js_bool(true);
+                    sp += 1;
+                    BREAK;
+                }
+                {   /* delegating .return()/.throw() onto an ASYNC generator: drive its body (its `finally`, or
+                       the catch its .throw() lands in) on THIS chain. The method is resolved by lookup here, so
+                       the question is asked on the RESOLVED method — a page that patched it gets its own. */
+                    int agmag = tramp_agen_method_magic(method, sp[-4]);
+                    if (agmag >= 0) {
+                        JS_FreeValue(ctx, method);
+                        tramp_agen_magic = agmag; tramp_agen_shape = AGEN_SHAPE_ITERCALL;
+                        tramp_agen_noarg = noarg;
+                        goto do_agen_drive_tramp;
+                    }
+                }
+                /* 7.4.x's Call, for ANY callable method. JS_CallFree ran it from C, so a bound, proxied, step-machine
+                   or merely loop-containing `return` had no flow base — the abort a `break` out of a for-of over a
+                   delegating generator hit. A NON-callable method is not rejected here: the Call itself throws the
+                   TypeError, which is what the spec's ? Call(...) does and what the C form did. */
+                {
+                    JSValueConst itv = sp[-4], argv0 = sp[-1];
+                    DCHECK(sp + 3 <= TRAMP_SP_LIMIT(sf),
+                           "iterator .return()/.throw() drive: operand push exceeds the frame's compiled stack_size");
+                    *sp++ = js_dup(itv);      /* this */
+                    *sp++ = method;           /* the resolved method */
+                    call_argv = sp; call_argc = noarg ? 0 : 1; tramp_first = -2; tramp_is_tail = 0;
+                    if (!noarg)
+                        *sp++ = js_dup(argv0);   /* the argument the opcode forwards */
+                    tramp_cont_state = NULL; tramp_cont_kind = CONT_ITER_CALL;
+                    goto do_generic_callee;
+                }
+            }
 
         CASE(OP_lnot):
             {
@@ -32959,11 +33031,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JSProxyCtor *pcs = xcs;
             if (pcs) { tramp_step_chain_free(ctx, pcs->outer); js_free_rt(rt, pcs); }
         } else if (xck == CONT_SETTER || xck == CONT_INSTANCEOF
-                   || xck == CONT_ITER_NEXT_OP || xck == CONT_FOROF_ACQUIRE
+                   || xck == CONT_ITER_NEXT_OP || xck == CONT_ITER_CALL
+                   || xck == CONT_FOROF_ACQUIRE
                    || xck == CONT_FORAWAIT_WRAP) {
-            /* a throwing setter body, a throwing proxy `construct` trap, an OP_iterator_next .next() that threw,
-               or a for-of's @@iterator that threw: no continuation state; the operands are on the caller stack and
-               freed by the caller's own catch-search, exactly like a normal method call. */
+            /* a throwing setter body, a throwing proxy `construct` trap, an OP_iterator_next .next() or an
+               OP_iterator_call .return()/.throw() that threw, or a for-of's @@iterator that threw: no
+               continuation state; the operands are on the caller stack and freed by the caller's own
+               catch-search, exactly like a normal method call. */
         } else if (xck == CONT_ASYNC_FROM_SYNC) {
             /* a driven sync .next() THREW while `for await` was awaiting the wrapper's promise. Like the Promise
                combinators, the wrapper must REJECT that promise and yield it — an escaping throw would be the
