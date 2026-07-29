@@ -1488,6 +1488,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_OBJ_GETPROTO, STEPDEF_REFLECT_GETPROTO,
     STEPDEF_OBJ_ISEXT, STEPDEF_REFLECT_ISEXT, STEPDEF_OBJ_PREVEXT, STEPDEF_REFLECT_PREVEXT,
     STEPDEF_OBJ_SETPROTO, STEPDEF_REFLECT_SETPROTO,
+    STEPDEF_JSON_STRINGIFY,
     STEPDEF_COUNT
 };
 #define HINT_NONE    2
@@ -21753,6 +21754,89 @@ typedef struct JSTASlice {
     uint8_t created;        /* 1 = `arr` exists; the next step does the copy */
 } JSTASlice;
 
+/* ---- JSON.stringify: SerializeJSONProperty as an explicit-stack step machine ----
+
+   js_json_check + js_json_to_str were a RECURSIVE C walker that ran seven of the page's operations straight out
+   of C with no flow base: the `toJSON` read and its call, the replacer call, LengthOfArrayLike, every element
+   and every member read, and EnumerableOwnPropertyNames' `ownKeys` plus its per-key `getOwnPropertyDescriptor`
+   traps. Any of them can hold a loop, so any of them preempted in an activation with no flow base; and the C
+   recursion meant a deep document could not be parked at any depth at all. The prologue was the same story —
+   LengthOfArrayLike and the element reads of a replacer ARRAY, and the ToString/ToNumber of a wrapper `space`.
+
+   One machine now, the shape the JSON.parse reviver already takes: a frame per SerializeJSONProperty
+   invocation, every page-code point a request, and the recursion in an explicit stack.
+
+   The frame boundary is 25.5.2.2's, not the C body's. SerializeJSONProperty OWNS the `Get(holder, key)` that
+   produces its value, so a child frame reads ITSELF; and it writes its OWN separator and quoted key
+   (SJ_PREAMBLE), because whether it writes anything at all is decided by steps 2-10, which only the child has
+   run. The C body inverted that — the parent called js_json_check and inspected what came back — which is
+   exactly why the check and the serialization had to be two functions. */
+
+typedef struct JSSJFrame {
+    JSValue holder;        /* SerializeJSONProperty's holder (owned) */
+    JSValue key;           /* its key, a String (owned) */
+    JSAtom key_atom;       /* the same key as an atom, for the Get (owned) */
+    JSValue val;           /* the value, once read and transformed (owned) */
+    JSValue indent;        /* state.Indent as this node's PARENT saw it (owned) */
+    JSValue indent1;       /* indent + gap: the indent this node's children see (owned) */
+    JSValue sep, sep1;     /* the newline+indent1 separator, and the space after a `:` (owned) */
+    JSAtom *keys;          /* an object node's own key list (owned), NULL when it uses the replacer's */
+    uint32_t nkeys;
+    int64_t i, len;        /* the child cursor, and an array node's length */
+    uint8_t phase;
+    uint8_t is_array;
+    uint8_t plist;         /* 1 = the keys come from the replacer array, which the MACHINE owns */
+    uint8_t raw;           /* 1 = a JSON.rawJSON payload: its text is the output, NOT a quoted string */
+    uint8_t has_content;   /* an object node has written something between its braces */
+    uint8_t pushed;        /* this node is on the cycle-detection stack and owes a pop */
+    struct JSEnumKeys *ek; /* SJ_KEYS: EnumerableOwnPropertyNames' key half, resumable (owned) */
+} JSSJFrame;
+
+enum {
+    SJ_GET = 0,        /* 25.5.2.2 step 1: Get(holder, key) */
+    SJ_GOT,            /* ...its value arrived */
+    SJ_TOJSON_GOT,     /* step 2.a: the `toJSON` read arrived */
+    SJ_TOJSON_CALLED,  /* step 2.b: its call returned */
+    SJ_REPLACER_CALLED,/* step 3: the replacer call returned */
+    SJ_UNWRAP_STR,     /* step 4.b: a [[StringData]] ToString is in flight */
+    SJ_UNWRAP_NUM,     /* step 4.a: a [[NumberData]] ToNumber is in flight */
+    SJ_PREAMBLE,       /* the value is settled: write this node's separator and key */
+    SJ_ARR_LEN,        /* 25.5.2.4 step 3: LengthOfArrayLike is in flight */
+    SJ_KEYS,           /* 25.5.2.5 step 3: the enumerable-key cursor is in flight */
+    SJ_LOOP,           /* walking children */
+};
+
+/* the prologue's own cursor — 25.5.2.1 steps 3 and 4, both of which run the page's code */
+enum {
+    SJP_START = 0,
+    SJP_RLEN,          /* LengthOfArrayLike(replacer) is in flight */
+    SJP_RGET,          /* Get(replacer, k) is in flight */
+    SJP_RSTR,          /* ToString of a Number/String-wrapper element is in flight */
+    SJP_SPACE,         /* a wrapper `space` is being unwrapped */
+    SJP_SPACE_NUM,     /* ...its ToNumber half */
+    SJP_GAP,           /* the coercions are done; state.Gap is computed from a primitive */
+};
+
+typedef struct JSJsonStr {
+    JSStepHdr hdr;         /* MUST be first — enforced by STEP_STATE_HDR_FIRST below */
+    JSValue stack;         /* the cycle-detection array, engine-owned (owned) */
+    JSValue gap;           /* state.Gap (owned) */
+    JSValue empty;         /* the empty string: the initial Indent, and the no-gap separator (owned) */
+    JSValue result;        /* DONE: the JSON text, or undefined (owned) */
+    JSValue pv;            /* a value held across a suspension: a wrapper being coerced, or `toJSON` (owned) */
+    JSValue space;         /* the space argument as the prologue has reduced it (owned) */
+    JSAtom *plist;         /* state.PropertyList as atoms (owned), NULL when the replacer was not an array */
+    uint32_t nplist, nplist_cap;
+    JSSJFrame *frames; int sp, cap;
+    StringBuffer b;
+    uint8_t b_live;        /* the buffer holds an allocation, so it owes a free */
+    uint8_t pro;           /* SJP_* */
+    int64_t pn, pi;        /* the replacer array's length and cursor */
+    JSValue cb_args[4];    /* [this, func, key, value] for a `toJSON` or replacer call */
+} JSJsonStr;
+
+static int js_json_str_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_json_str_fini(JSContext *ctx, void *st, bool take_result);
 static int js_json_parse_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_json_parse_vfini(JSContext *ctx, void *st, bool take_result);
 static int js_json_reviver_init(JSContext *ctx, struct JSJsonReviver *s, JSValueConst text_arg, JSValueConst reviver);
@@ -60670,6 +60754,7 @@ static const JSTrampStepDef js_ta_map_def          = { sizeof(JSArrayEvery), js_
 static const JSTrampStepDef js_array_sort_def    = { sizeof(JSArraySort), js_array_sort_vstep, js_array_sort_vfini, 0 };
 static const JSTrampStepDef js_array_toSorted_def = { sizeof(JSArraySort), js_array_sort_vstep, js_array_sort_vfini, 1 };
 static const JSTrampStepDef js_json_parse_def    = { sizeof(JSJsonReviver), js_json_parse_vstep, js_json_parse_vfini, 0 };
+static const JSTrampStepDef js_json_str_def      = { sizeof(JSJsonStr), js_json_str_step, js_json_str_fini, 0 };
 static const JSTrampStepDef js_ta_slice_def     = { sizeof(JSTASlice), js_ta_slice_step, js_ta_slice_fini, 0 };
 static const JSTrampStepDef js_str_concat_def   = { sizeof(JSStrConcat), js_str_concat_step, js_str_concat_fini, 0 };
 static const JSTrampStepDef js_str_ctor_def     = { sizeof(JSStrCtor), js_str_ctor_step, js_str_ctor_fini, 0 };
@@ -61133,6 +61218,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_TA_FILTER]     = &js_ta_filter_def,
     [STEPDEF_ARRAY_SORT]    = &js_array_sort_def,   [STEPDEF_ARRAY_TOSORTED] = &js_array_toSorted_def,
     [STEPDEF_JSON_PARSE]    = &js_json_parse_def,
+    [STEPDEF_JSON_STRINGIFY] = &js_json_str_def,
     [STEPDEF_TA_SLICE]      = &js_ta_slice_def,
     [STEPDEF_STR_CONCAT]    = &js_str_concat_def,
     [STEPDEF_STR_CTOR]      = &js_str_ctor_def,
@@ -61345,6 +61431,7 @@ STEP_STATE_HDR_FIRST(JSReMatchAll);
 STEP_STATE_HDR_FIRST(JSReSplit);
 STEP_STATE_HDR_FIRST(JSReSearch);
 STEP_STATE_HDR_FIRST(JSJsonReviver);
+STEP_STATE_HDR_FIRST(JSJsonStr);
 STEP_STATE_HDR_FIRST(JSStrCtor);
 STEP_STATE_HDR_FIRST(JSStrConcat);
 STEP_STATE_HDR_FIRST(JSTASlice);
@@ -70220,413 +70307,621 @@ static JSValue js_json_raw_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
-typedef struct JSONStringifyContext {
-    JSValueConst replacer_func;
-    JSValue stack;
-    JSValue property_list;
-    JSValue gap;
-    JSValue empty;
-    StringBuffer *b;
-} JSONStringifyContext;
-
 static JSValue JS_ToQuotedStringFree(JSContext *ctx, JSValue val) {
     JSValue r = JS_ToQuotedString(ctx, val);
     JS_FreeValue(ctx, val);
     return r;
 }
 
-static JSValue js_json_check(JSContext *ctx, JSONStringifyContext *jsc,
-                             JSValueConst holder, JSValue val,
-                             JSValueConst key)
+static int sj_push(JSContext *ctx, JSJsonStr *s)
 {
-    JSValue v;
-    JSValueConst args[2];
-
-    if (JS_IsObject(val) || JS_IsBigInt(val)) {
-		JSValue f = JS_GetProperty(ctx, val, JS_ATOM_toJSON);
-		if (JS_IsException(f))
-			goto exception;
-		if (JS_IsFunction(ctx, f)) {
-			v = JS_CallFree(ctx, f, val, 1, &key);
-			JS_FreeValue(ctx, val);
-			val = v;
-			if (JS_IsException(val))
-				goto exception;
-		} else {
-			JS_FreeValue(ctx, f);
-		}
-	}
-
-    if (!JS_IsUndefined(jsc->replacer_func)) {
-        args[0] = key;
-        args[1] = val;
-        v = JS_Call(ctx, jsc->replacer_func, holder, 2, args);
-        JS_FreeValue(ctx, val);
-        val = v;
-        if (JS_IsException(val))
-            goto exception;
+    JSSJFrame *f;
+    if (s->sp >= s->cap) {
+        int nc = s->cap ? s->cap * 2 : 16;
+        JSSJFrame *ns = js_realloc(ctx, s->frames, (size_t)nc * sizeof(JSSJFrame));
+        if (!ns) return -1;
+        s->frames = ns; s->cap = nc;
     }
-
-    switch (JS_VALUE_GET_NORM_TAG(val)) {
-    case JS_TAG_OBJECT:
-        if (JS_IsFunction(ctx, val))
-            break;
-    case JS_TAG_STRING:
-    case JS_TAG_STRING_ROPE:
-    case JS_TAG_INT:
-    case JS_TAG_FLOAT64:
-    case JS_TAG_BOOL:
-    case JS_TAG_NULL:
-    case JS_TAG_SHORT_BIG_INT:
-    case JS_TAG_BIG_INT:
-    case JS_TAG_EXCEPTION:
-        return val;
-    default:
-        break;
-    }
-    JS_FreeValue(ctx, val);
-    return JS_UNDEFINED;
-
-exception:
-    JS_FreeValue(ctx, val);
-    return JS_EXCEPTION;
+    f = &s->frames[s->sp++];
+    memset(f, 0, sizeof(*f));
+    f->holder = JS_UNDEFINED; f->key = JS_UNDEFINED; f->val = JS_UNDEFINED;
+    f->indent = JS_UNDEFINED; f->indent1 = JS_UNDEFINED;
+    f->sep = JS_UNDEFINED; f->sep1 = JS_UNDEFINED;
+    f->key_atom = JS_ATOM_NULL;
+    f->phase = SJ_GET;
+    return 0;
 }
 
-static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
-                          JSValueConst holder, JSValue val,
-                          JSValueConst indent)
+/* Release the top frame. The cycle-detection pop rides here rather than at the one normal-completion site
+   because the walk is a DFS: frames leave in reverse order of arrival, which is exactly the order a stack
+   truncation needs, and a frame torn down MID-WALK owes the same pop as one that finished. */
+static void sj_pop(JSContext *ctx, JSJsonStr *s)
 {
-    JSValue indent1, sep, sep1, tab, v, prop;
-    JSObject *p;
-    int64_t i, len;
-    int cl, ret;
-    bool has_content;
-
-    indent1 = JS_UNDEFINED;
-    sep = JS_UNDEFINED;
-    sep1 = JS_UNDEFINED;
-    tab = JS_UNDEFINED;
-    prop = JS_UNDEFINED;
-
-    if (js_check_stack_overflow(ctx->rt, 0)) {
-        JS_ThrowStackOverflow(ctx);
-        goto exception;
+    JSSJFrame *f = &s->frames[--s->sp];
+    if (f->pushed) js_array_private_pop(ctx, s->stack);
+    if (f->ek) { js_enum_keys_free(ctx, f->ek); js_free(ctx, f->ek); }
+    if (f->keys) {
+        uint32_t k;
+        for (k = 0; k < f->nkeys; k++) JS_FreeAtom(ctx, f->keys[k]);
+        js_free(ctx, f->keys);
     }
+    JS_FreeAtom(ctx, f->key_atom);
+    JS_FreeValue(ctx, f->holder); JS_FreeValue(ctx, f->key); JS_FreeValue(ctx, f->val);
+    JS_FreeValue(ctx, f->indent); JS_FreeValue(ctx, f->indent1);
+    JS_FreeValue(ctx, f->sep); JS_FreeValue(ctx, f->sep1);
+}
 
-    if (JS_IsObject(val)) {
-        p = JS_VALUE_GET_OBJ(val);
-        cl = p->class_id;
-        if (cl == JS_CLASS_STRING) {
-            val = JS_ToStringFree(ctx, val);
-            if (JS_IsException(val))
-                goto exception;
-            goto concat_primitive;
-        } else if (cl == JS_CLASS_NUMBER) {
-            val = JS_ToNumberFree(ctx, val);
-            if (JS_IsException(val))
-                goto exception;
-            goto concat_primitive;
-        } else if (cl == JS_CLASS_BOOLEAN || cl == JS_CLASS_BIG_INT) {
-            set_value(ctx, &val, js_dup(p->u.object_data));
-            goto concat_primitive;
-        } else if (cl == JS_CLASS_RAWJSON) {
-            JSValue val1;
-            val1 = JS_GetProperty(ctx, val, JS_ATOM_rawJSON);
-            if (JS_IsException(val1))
-                goto exception;
-            JS_FreeValue(ctx, val);
-            val = val1;
-            goto concat_value;
-        }
-        if (js_internal_array_includes(ctx, jsc->stack, val)) {
-            JS_ThrowTypeError(ctx, "circular reference");
-            goto exception;
-        }
-        indent1 = JS_ConcatString(ctx, js_dup(indent), js_dup(jsc->gap));
-        if (JS_IsException(indent1))
-            goto exception;
-        if (!JS_IsEmptyString(jsc->gap)) {
-            sep = JS_ConcatString3(ctx, "\n", js_dup(indent1), "");
-            if (JS_IsException(sep))
-                goto exception;
-            sep1 = js_new_string8(ctx, " ");
-            if (JS_IsException(sep1))
-                goto exception;
-        } else {
-            sep = js_dup(jsc->empty);
-            sep1 = js_dup(jsc->empty);
-        }
-        v = js_int32(js_array_private_push(ctx, jsc->stack, val));
-        if (check_exception_free(ctx, v))
-            goto exception;
-        ret = js_is_array(ctx, val);
-        if (ret < 0)
-            goto exception;
-        if (ret) {
-            if (js_get_length64(ctx, &len, val))
-                goto exception;
-            string_buffer_putc8(jsc->b, '[');
-            for(i = 0; i < len; i++) {
-                if (i > 0)
-                    string_buffer_putc8(jsc->b, ',');
-                string_buffer_concat_value(jsc->b, sep);
-                v = JS_GetPropertyInt64(ctx, val, i);
-                if (JS_IsException(v))
-                    goto exception;
-                /* XXX: could do this string conversion only when needed */
-                prop = JS_ToStringFree(ctx, js_int64(i));
-                if (JS_IsException(prop))
-                    goto exception;
-                v = js_json_check(ctx, jsc, val, v, prop);
-                JS_FreeValue(ctx, prop);
-                prop = JS_UNDEFINED;
-                if (JS_IsException(v))
-                    goto exception;
-                if (JS_IsUndefined(v))
-                    v = JS_NULL;
-                if (js_json_to_str(ctx, jsc, val, v, indent1))
-                    goto exception;
+/* state.PropertyList's append, 25.5.2.1 step 3.b.iv: the key joins unless an equal one is already there.
+   Comparing ATOMS performs that SameValue on strings once, at interning, instead of per element. `atom` is
+   CONSUMED either way. */
+static int sj_plist_add(JSContext *ctx, JSJsonStr *s, JSAtom atom)
+{
+    uint32_t k;
+    for (k = 0; k < s->nplist; k++) {
+        if (s->plist[k] == atom) { JS_FreeAtom(ctx, atom); return 0; }
+    }
+    if (s->nplist >= s->nplist_cap) {
+        uint32_t nc = s->nplist_cap ? s->nplist_cap * 2 : 8;
+        JSAtom *na = js_realloc(ctx, s->plist, (size_t)nc * sizeof(JSAtom));
+        if (!na) { JS_FreeAtom(ctx, atom); return -1; }
+        s->plist = na; s->nplist_cap = nc;
+    }
+    s->plist[s->nplist++] = atom;
+    return 0;
+}
+
+/* 25.5.2.1 steps 3-7. `in` is the previous request's answer, owned. 0 = the prologue is complete, a step code =
+   the caller must return it, -1 = threw. */
+static int js_json_str_prologue(JSContext *ctx, JSJsonStr *s, JSValue in, JSValue **out_cb, int *out_argc)
+{
+    JSValueConst replacer = step_arg(&s->hdr, 1);
+    int r;
+
+    for (;;) {
+        switch (s->pro) {
+        case SJP_START:
+            JS_FreeValue(ctx, in); in = JS_UNDEFINED;
+            s->space = js_dup(step_arg(&s->hdr, 2));
+            if (JS_IsFunction(ctx, replacer)) { s->pro = SJP_SPACE; continue; }
+            r = js_is_array(ctx, replacer);
+            if (r < 0) return -1;
+            if (!r) { s->pro = SJP_SPACE; continue; }
+            /* PropertyList exists from here on even if the array turns out to be empty — an empty one
+               serializes every object as {} — so the allocation, not the count, is what records it. */
+            s->nplist = 0;
+            s->nplist_cap = 4;
+            s->plist = js_mallocz(ctx, sizeof(JSAtom) * s->nplist_cap);
+            if (!s->plist) return -1;
+            s->pro = SJP_RLEN;
+            continue;
+
+        case SJP_RLEN:
+            /* `? LengthOfArrayLike(replacer)` — a `length` accessor or a Proxy `get` trap. */
+            r = step_length_run(ctx, &s->hdr, replacer, in, &s->pn, out_cb, out_argc);
+            in = JS_UNDEFINED;
+            if (r != 0) return r;
+            s->pi = 0;
+            s->pro = SJP_RGET;
+            continue;
+
+        case SJP_RGET: {
+            JSValue v;
+            if (s->hdr.get_phase == GET_PH_START) {
+                JSAtom at;
+                JS_FreeValue(ctx, in); in = JS_UNDEFINED;
+                if (s->pi >= s->pn) { s->pro = SJP_SPACE; continue; }
+                at = JS_NewAtomInt64(ctx, s->pi);
+                if (at == JS_ATOM_NULL) return -1;
+                return step_getprop_begin(ctx, &s->hdr, replacer, at, out_cb, out_argc);
             }
-            if (len > 0 && !JS_IsEmptyString(jsc->gap)) {
-                string_buffer_putc8(jsc->b, '\n');
-                string_buffer_concat_value(jsc->b, indent);
+            step_getprop_done(ctx, &s->hdr, in, &v);
+            in = JS_UNDEFINED;
+            if (JS_IsException(v)) return -1;
+            s->pi++;
+            /* 25.5.2.1 step 3.b.iii: a String or a Number is the item; an Object with [[StringData]] or
+               [[NumberData]] is ToString'd, which is the page's code; anything else is skipped. */
+            if (JS_IsString(v) || JS_IsNumber(v)) {
+                JSAtom at;
+                v = JS_ToStringFree(ctx, v);   /* a string or a primitive number: nothing to run */
+                if (JS_IsException(v)) return -1;
+                at = JS_ValueToAtom(ctx, v);
+                JS_FreeValue(ctx, v);
+                if (at == JS_ATOM_NULL) return -1;
+                if (sj_plist_add(ctx, s, at) < 0) return -1;
+                continue;
             }
-            string_buffer_putc8(jsc->b, ']');
-        } else {
-            if (!JS_IsUndefined(jsc->property_list))
-                tab = js_dup(jsc->property_list);
-            else
-                /* Object.keys is a step machine now, so JSON.stringify's own key walk performs the
-                   operation directly. It is an UNCONVERTED consumer: both [[OwnPropertyKeys]] and
-                   [[GetOwnProperty]] run from C here, and a proxy trap with a loop in it aborts by name. */
-                tab = JS_GetOwnPropertyNames2(ctx, val, JS_GPN_ENUM_ONLY | JS_GPN_STRING_MASK);
-            if (JS_IsException(tab))
-                goto exception;
-            if (js_get_length64(ctx, &len, tab))
-                goto exception;
-            string_buffer_putc8(jsc->b, '{');
-            has_content = false;
-            for(i = 0; i < len; i++) {
-                JS_FreeValue(ctx, prop);
-                prop = JS_GetPropertyInt64(ctx, tab, i);
-                if (JS_IsException(prop))
-                    goto exception;
-                v = JS_GetPropertyValue(ctx, val, js_dup(prop));
-                if (JS_IsException(v))
-                    goto exception;
-                v = js_json_check(ctx, jsc, val, v, prop);
-                if (JS_IsException(v))
-                    goto exception;
-                if (!JS_IsUndefined(v)) {
-                    if (has_content)
-                        string_buffer_putc8(jsc->b, ',');
-                    prop = JS_ToQuotedStringFree(ctx, prop);
-                    if (JS_IsException(prop)) {
-                        JS_FreeValue(ctx, v);
-                        goto exception;
-                    }
-                    string_buffer_concat_value(jsc->b, sep);
-                    string_buffer_concat_value(jsc->b, prop);
-                    string_buffer_putc8(jsc->b, ':');
-                    string_buffer_concat_value(jsc->b, sep1);
-                    if (js_json_to_str(ctx, jsc, val, v, indent1))
-                        goto exception;
-                    has_content = true;
+            if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT) {
+                JSObject *p = JS_VALUE_GET_OBJ(v);
+                if (p->class_id == JS_CLASS_STRING || p->class_id == JS_CLASS_NUMBER) {
+                    s->pv = v;
+                    s->pro = SJP_RSTR;
+                    continue;
                 }
             }
-            if (has_content && JS_VALUE_GET_STRING(jsc->gap)->len != 0) {
-                string_buffer_putc8(jsc->b, '\n');
-                string_buffer_concat_value(jsc->b, indent);
-            }
-            string_buffer_putc8(jsc->b, '}');
+            JS_FreeValue(ctx, v);
+            continue;
         }
-        if (js_array_private_pop(ctx, jsc->stack) < 0)
-            goto exception;
-        JS_FreeValue(ctx, val);
-        JS_FreeValue(ctx, tab);
-        JS_FreeValue(ctx, sep);
-        JS_FreeValue(ctx, sep1);
-        JS_FreeValue(ctx, indent1);
-        JS_FreeValue(ctx, prop);
-        return 0;
+
+        case SJP_RSTR: {
+            JSValue str;
+            JSAtom at;
+            r = step_tostring_run(ctx, &s->hdr, s->pv, in, &str, out_cb, out_argc);
+            in = JS_UNDEFINED;
+            if (r != 0) return r;
+            JS_FreeValue(ctx, s->pv); s->pv = JS_UNDEFINED;
+            at = JS_ValueToAtom(ctx, str);
+            JS_FreeValue(ctx, str);
+            if (at == JS_ATOM_NULL) return -1;
+            if (sj_plist_add(ctx, s, at) < 0) return -1;
+            s->pro = SJP_RGET;
+            continue;
+        }
+
+        case SJP_SPACE:
+            /* 25.5.2.1 step 4: a wrapper `space` is unwrapped, which runs the page's toString/valueOf. */
+            if (JS_VALUE_GET_TAG(s->space) == JS_TAG_OBJECT) {
+                JSObject *p = JS_VALUE_GET_OBJ(s->space);
+                if (p->class_id == JS_CLASS_NUMBER) { s->pro = SJP_SPACE_NUM; continue; }
+                if (p->class_id == JS_CLASS_STRING) {
+                    JSValue str;
+                    r = step_tostring_run(ctx, &s->hdr, s->space, in, &str, out_cb, out_argc);
+                    in = JS_UNDEFINED;
+                    if (r != 0) return r;
+                    JS_FreeValue(ctx, s->space);
+                    s->space = str;
+                }
+            }
+            JS_FreeValue(ctx, in); in = JS_UNDEFINED;
+            s->pro = SJP_GAP;
+            continue;
+
+        case SJP_SPACE_NUM: {
+            JSValue prim;
+            r = step_toprim_run(ctx, &s->hdr, s->space, HINT_NUMBER, in, &prim, out_cb, out_argc);
+            in = JS_UNDEFINED;
+            if (r != 0) return r;
+            JS_FreeValue(ctx, s->space);
+            s->space = JS_ToNumberFree(ctx, prim);
+            if (JS_IsException(s->space)) { s->space = JS_UNDEFINED; return -1; }
+            s->pro = SJP_GAP;
+            continue;
+        }
+
+        default:
+            DCHECK(s->pro == SJP_GAP, "the JSON.stringify prologue resumed in no phase");
+            JS_FreeValue(ctx, in);
+            /* 25.5.2.1 steps 5-7. `space` is a primitive by now, so nothing here runs. */
+            if (JS_IsNumber(s->space)) {
+                int n;
+                if (JS_ToInt32Clamp(ctx, &n, s->space, 0, 10, 0)) return -1;
+                s->gap = JS_NewStringLen(ctx, "          ", n);
+            } else if (JS_IsString(s->space)) {
+                JSString *p = JS_VALUE_GET_STRING(s->space);
+                s->gap = js_sub_string(ctx, p, 0, min_int(p->len, 10));
+            } else {
+                s->gap = js_dup(s->empty);
+            }
+            return JS_IsException(s->gap) ? -1 : 0;
+        }
     }
- concat_primitive:
+}
+
+/* A container node's separator strings and its place on the cycle stack, 25.5.2.4/25.5.2.5 step 4. Nothing here
+   runs the page's code, so it is one block rather than a phase. */
+static int sj_open_container(JSContext *ctx, JSJsonStr *s, JSSJFrame *f)
+{
+    f->indent1 = JS_ConcatString(ctx, js_dup(f->indent), js_dup(s->gap));
+    if (JS_IsException(f->indent1)) { f->indent1 = JS_UNDEFINED; return -1; }
+    if (!JS_IsEmptyString(s->gap)) {
+        f->sep = JS_ConcatString3(ctx, "\n", js_dup(f->indent1), "");
+        if (JS_IsException(f->sep)) { f->sep = JS_UNDEFINED; return -1; }
+        f->sep1 = js_new_string8(ctx, " ");
+        if (JS_IsException(f->sep1)) { f->sep1 = JS_UNDEFINED; return -1; }
+    } else {
+        f->sep = js_dup(s->empty);
+        f->sep1 = js_dup(s->empty);
+    }
+    if (js_array_private_push(ctx, s->stack, f->val) < 0) return -1;
+    f->pushed = 1;
+    return 0;
+}
+
+/* 25.5.2.2 steps 5-9 on a value that is not a serializable object: write it. `val` is CONSUMED. */
+static int sj_write_primitive(JSContext *ctx, JSJsonStr *s, JSValue val)
+{
     switch (JS_VALUE_GET_NORM_TAG(val)) {
     case JS_TAG_STRING:
     case JS_TAG_STRING_ROPE:
         val = JS_ToQuotedStringFree(ctx, val);
-        if (JS_IsException(val))
-            goto exception;
-        goto concat_value;
+        if (JS_IsException(val)) return -1;
+        break;
     case JS_TAG_FLOAT64:
-        if (!isfinite(JS_VALUE_GET_FLOAT64(val))) {
-            val = JS_NULL;
-        }
-        goto concat_value;
-    case JS_TAG_INT:
-    case JS_TAG_BOOL:
-    case JS_TAG_NULL:
-    concat_value:
-        return string_buffer_concat_value_free(jsc->b, val);
+        if (!isfinite(JS_VALUE_GET_FLOAT64(val))) val = JS_NULL;
+        break;
     case JS_TAG_SHORT_BIG_INT:
     case JS_TAG_BIG_INT:
-        JS_ThrowTypeError(ctx, "BigInt are forbidden in JSON.stringify");
-        goto exception;
-    default:
         JS_FreeValue(ctx, val);
+        JS_ThrowTypeError(ctx, "BigInt are forbidden in JSON.stringify");
+        return -1;
+    default:
+        DCHECK(JS_VALUE_GET_NORM_TAG(val) == JS_TAG_INT || JS_VALUE_GET_NORM_TAG(val) == JS_TAG_BOOL
+               || JS_VALUE_GET_NORM_TAG(val) == JS_TAG_NULL,
+               "a value SerializeJSONProperty said writes nothing reached the primitive writer");
+        break;
+    }
+    return string_buffer_concat_value_free(&s->b, val) < 0 ? -1 : 0;
+}
+
+/* Does SerializeJSONProperty write anything for this value? 25.5.2.2's steps 5-11 answer it, and step 11's
+   "return undefined" is the whole of the no. A callable object and a Symbol are the two kinds that reach it. */
+static int sj_writes(JSContext *ctx, JSValueConst val)
+{
+    switch (JS_VALUE_GET_NORM_TAG(val)) {
+    case JS_TAG_OBJECT:
+        return !JS_IsFunction(ctx, val);
+    case JS_TAG_STRING: case JS_TAG_STRING_ROPE: case JS_TAG_INT: case JS_TAG_FLOAT64:
+    case JS_TAG_BOOL: case JS_TAG_NULL: case JS_TAG_SHORT_BIG_INT: case JS_TAG_BIG_INT:
+        return 1;
+    default:
         return 0;
     }
+}
 
-exception:
-    JS_FreeValue(ctx, val);
-    JS_FreeValue(ctx, tab);
-    JS_FreeValue(ctx, sep);
-    JS_FreeValue(ctx, sep1);
-    JS_FreeValue(ctx, indent1);
-    JS_FreeValue(ctx, prop);
+/* Drive the walk until the next request (return its step code) or completion (0). `in` (owned) is the previous
+   request's answer, JS_UNDEFINED on entry. */
+static int js_json_str_walk(JSContext *ctx, JSJsonStr *s, JSValue in, JSValue **out_cb, int *out_argc)
+{
+    int r;
+
+    while (s->sp > 0) {
+        JSSJFrame *f = &s->frames[s->sp - 1];
+        /* DFS invariants: a live frame within its allocation, a valid phase, and a child cursor that never runs
+           past the child count. A violation is a walk-state bug; crash where it is born. */
+        DCHECK(s->sp <= s->cap, "the JSON.stringify frame stack ran past its allocation");
+        DCHECK(f->phase <= SJ_LOOP, "a JSON.stringify frame resumed in no phase");
+
+        switch (f->phase) {
+        case SJ_GET:
+            /* 25.5.2.2 step 1: `Let value be ? Get(holder, key)`. The root's holder is the engine-built
+               wrapper, but every deeper one is the page's object — an accessor, or a Proxy whose `get` trap the
+               C body ran with no flow base. */
+            f->phase = SJ_GOT;
+            return step_getprop_begin(ctx, &s->hdr, f->holder, JS_DupAtom(ctx, f->key_atom), out_cb, out_argc);
+
+        case SJ_GOT:
+            step_getprop_done(ctx, &s->hdr, in, &f->val);
+            in = JS_UNDEFINED;
+            if (JS_IsException(f->val)) { f->val = JS_UNDEFINED; return -1; }
+            /* step 2: `If value is an Object or a BigInt, let toJSON be ? GetV(value, "toJSON")`. */
+            if (JS_IsObject(f->val) || JS_IsBigInt(f->val)) {
+                f->phase = SJ_TOJSON_GOT;
+                return step_getprop_begin(ctx, &s->hdr, f->val, JS_DupAtom(ctx, JS_ATOM_toJSON),
+                                          out_cb, out_argc);
+            }
+            f->phase = SJ_REPLACER_CALLED;
+            goto replacer;
+
+        case SJ_TOJSON_GOT: {
+            JSValue fn;
+            step_getprop_done(ctx, &s->hdr, in, &fn);
+            in = JS_UNDEFINED;
+            if (JS_IsException(fn)) return -1;
+            if (!JS_IsFunction(ctx, fn)) {
+                JS_FreeValue(ctx, fn);
+                f->phase = SJ_REPLACER_CALLED;
+                goto replacer;
+            }
+            /* step 2.b: `Set value to ? Call(toJSON, value, « key »)`. The machine holds the callee across the
+               call; the receiver and the key belong to the frame, which outlives it. */
+            s->pv = fn;
+            s->cb_args[0] = f->val;   /* borrowed: the frame holds the receiver */
+            s->cb_args[1] = s->pv;
+            s->cb_args[2] = f->key;
+            f->phase = SJ_TOJSON_CALLED;
+            *out_cb = s->cb_args; *out_argc = 1;
+            return 3;
+        }
+
+        case SJ_TOJSON_CALLED:
+            JS_FreeValue(ctx, s->pv); s->pv = JS_UNDEFINED;
+            JS_FreeValue(ctx, f->val);
+            f->val = in;
+            in = JS_UNDEFINED;
+            f->phase = SJ_REPLACER_CALLED;
+            goto replacer;
+
+        replacer:
+            /* step 3: `If state.[[ReplacerFunction]] is not undefined, set value to
+               ? Call(state.[[ReplacerFunction]], holder, « key, value »)`. Arriving here with the phase already
+               set is what makes the no-replacer case a fallthrough rather than a second copy of step 4. */
+            if (JS_IsFunction(ctx, step_arg(&s->hdr, 1))) {
+                s->cb_args[0] = f->holder;                       /* borrowed: the frame holds it */
+                s->cb_args[1] = (JSValue)step_arg(&s->hdr, 1);   /* borrowed: the header holds it */
+                s->cb_args[2] = f->key;
+                s->cb_args[3] = f->val;
+                *out_cb = s->cb_args; *out_argc = 2;
+                return 3;
+            }
+            goto unwrap;
+
+        case SJ_REPLACER_CALLED:
+            JS_FreeValue(ctx, f->val);
+            f->val = in;
+            in = JS_UNDEFINED;
+            goto unwrap;
+
+        unwrap:
+            /* step 4: unwrap a Number/String/Boolean/BigInt wrapper. The first two run the page's code. */
+            if (JS_VALUE_GET_TAG(f->val) == JS_TAG_OBJECT) {
+                JSObject *p = JS_VALUE_GET_OBJ(f->val);
+                if (p->class_id == JS_CLASS_STRING) { f->phase = SJ_UNWRAP_STR; continue; }
+                if (p->class_id == JS_CLASS_NUMBER) { f->phase = SJ_UNWRAP_NUM; continue; }
+                if (p->class_id == JS_CLASS_BOOLEAN || p->class_id == JS_CLASS_BIG_INT) {
+                    set_value(ctx, &f->val, js_dup(p->u.object_data));
+                } else if (p->class_id == JS_CLASS_RAWJSON) {
+                    /* JSON.rawJSON's object is null-prototyped, of a class only that builtin creates, and its
+                       one property is a non-configurable non-writable data property — so this read reaches no
+                       accessor and no trap. Asserted rather than assumed. */
+                    JSValue raw;
+                    DCHECK(!js_read_is_page_code(ctx, f->val, JS_ATOM_rawJSON),
+                           "a rawJSON object's own property became reachable page code — route the read");
+                    raw = JS_GetProperty(ctx, f->val, JS_ATOM_rawJSON);
+                    if (JS_IsException(raw)) return -1;
+                    JS_FreeValue(ctx, f->val);
+                    f->val = raw;
+                    f->raw = 1;
+                }
+            }
+            f->phase = SJ_PREAMBLE;
+            continue;
+
+        case SJ_UNWRAP_STR: {
+            JSValue str;
+            r = step_tostring_run(ctx, &s->hdr, f->val, in, &str, out_cb, out_argc);
+            in = JS_UNDEFINED;
+            if (r != 0) return r;
+            JS_FreeValue(ctx, f->val);
+            f->val = str;
+            f->phase = SJ_PREAMBLE;
+            continue;
+        }
+
+        case SJ_UNWRAP_NUM: {
+            JSValue prim;
+            r = step_toprim_run(ctx, &s->hdr, f->val, HINT_NUMBER, in, &prim, out_cb, out_argc);
+            in = JS_UNDEFINED;
+            if (r != 0) return r;
+            JS_FreeValue(ctx, f->val);
+            f->val = JS_ToNumberFree(ctx, prim);
+            if (JS_IsException(f->val)) { f->val = JS_UNDEFINED; return -1; }
+            f->phase = SJ_PREAMBLE;
+            continue;
+        }
+
+        case SJ_PREAMBLE: {
+            /* The value is settled, so whether this node writes anything is finally known — and THAT decides
+               the separator, the quoted key and, for an array element, the literal `null` that stands in for an
+               unserializable one (25.5.2.4 step 6.c). A parent cannot make that decision, which is why the
+               preamble belongs to the child. */
+            int writes = sj_writes(ctx, f->val);
+            JSSJFrame *par = (s->sp >= 2) ? &s->frames[s->sp - 2] : NULL;
+            if (!par) {
+                /* the root: an unserializable value is JSON.stringify's undefined result. */
+                if (!writes) { sj_pop(ctx, s); s->result = JS_UNDEFINED; return 0; }
+            } else if (par->is_array) {
+                if (par->i > 0) string_buffer_putc8(&s->b, ',');
+                string_buffer_concat_value(&s->b, par->sep);
+                if (!writes) {
+                    if (string_buffer_concat_value_free(&s->b, JS_NULL) < 0) return -1;
+                    goto child_done;
+                }
+            } else {
+                JSValue q;
+                if (!writes) goto child_done;
+                if (par->has_content) string_buffer_putc8(&s->b, ',');
+                string_buffer_concat_value(&s->b, par->sep);
+                q = JS_ToQuotedString(ctx, f->key);
+                if (JS_IsException(q)) return -1;
+                string_buffer_concat_value_free(&s->b, q);
+                string_buffer_putc8(&s->b, ':');
+                string_buffer_concat_value(&s->b, par->sep1);
+                par->has_content = 1;
+            }
+            if (JS_VALUE_GET_TAG(f->val) != JS_TAG_OBJECT) {
+                JSValue v = f->val;
+                f->val = JS_UNDEFINED;
+                /* a rawJSON payload IS the serialization: its text is spliced in unquoted, which is the whole
+                   point of the proposal and the one value that skips 25.5.2.2's step 6 QuoteJSONString. */
+                if (f->raw) {
+                    if (string_buffer_concat_value_free(&s->b, v) < 0) return -1;
+                } else if (sj_write_primitive(ctx, s, v) < 0) {
+                    return -1;
+                }
+                goto child_done;
+            }
+            /* step 10: a serializable object. 25.5.2.4 / 25.5.2.5 open here. */
+            if (js_internal_array_includes(ctx, s->stack, f->val)) {
+                JS_ThrowTypeError(ctx, "circular reference");
+                return -1;
+            }
+            r = js_is_array(ctx, f->val);
+            if (r < 0) return -1;
+            f->is_array = r;
+            if (sj_open_container(ctx, s, f) < 0) return -1;
+            f->i = 0;
+            if (f->is_array) { f->phase = SJ_ARR_LEN; continue; }
+            string_buffer_putc8(&s->b, '{');
+            if (s->plist) {
+                /* 25.5.2.5 step 2: PropertyList replaces the enumeration entirely. */
+                f->plist = 1;
+                f->nkeys = s->nplist;
+                f->phase = SJ_LOOP;
+                continue;
+            }
+            /* step 3: `? EnumerableOwnPropertyNames(value, key)` — the `ownKeys` trap and one
+               `getOwnPropertyDescriptor` per key, both of which the C body ran with no flow base. */
+            f->ek = js_mallocz(ctx, sizeof(*f->ek));
+            if (!f->ek) return -1;
+            js_enum_keys_init(f->ek);
+            f->ek->obj = js_dup(f->val);
+            f->phase = SJ_KEYS;
+            continue;
+        }
+
+        case SJ_ARR_LEN:
+            r = step_length_run(ctx, &s->hdr, f->val, in, &f->len, out_cb, out_argc);
+            in = JS_UNDEFINED;
+            if (r != 0) return r;
+            string_buffer_putc8(&s->b, '[');
+            f->phase = SJ_LOOP;
+            continue;
+
+        case SJ_KEYS: {
+            uint32_t k;
+            r = js_enum_keys_run(ctx, f->ek, in, out_cb, out_argc);
+            in = JS_UNDEFINED;
+            if (r != 0) return r;
+            f->keys = js_malloc(ctx, sizeof(JSAtom) * (f->ek->kept ? f->ek->kept : 1));
+            if (!f->keys) return -1;
+            /* the survivors MOVE to the frame; the cursor keeps its array only to free what it dropped. */
+            for (k = 0; k < f->ek->kept; k++) {
+                f->keys[k] = f->ek->atoms[k].atom;
+                f->ek->atoms[k].atom = JS_ATOM_NULL;
+            }
+            f->nkeys = f->ek->kept;
+            js_enum_keys_free(ctx, f->ek);
+            js_free(ctx, f->ek); f->ek = NULL;
+            f->phase = SJ_LOOP;
+            continue;
+        }
+
+        case SJ_LOOP: {
+            JSAtom at;
+            int64_t nchild = f->is_array ? f->len : (int64_t)f->nkeys;
+            if (f->i >= nchild) {
+                /* the closing bracket, 25.5.2.4 step 7 / 25.5.2.5 step 7 */
+                bool any = f->is_array ? (f->len > 0) : (f->has_content != 0);
+                if (any && !JS_IsEmptyString(s->gap)) {
+                    string_buffer_putc8(&s->b, '\n');
+                    string_buffer_concat_value(&s->b, f->indent);
+                }
+                string_buffer_putc8(&s->b, f->is_array ? ']' : '}');
+                goto child_done;
+            }
+            if (f->is_array) {
+                at = JS_NewAtomInt64(ctx, f->i);
+                if (at == JS_ATOM_NULL) return -1;
+            } else {
+                at = JS_DupAtom(ctx, f->plist ? s->plist[f->i] : f->keys[f->i]);
+            }
+            {
+                JSValueConst pval = f->val;        /* snapshot: the push may realloc the frame array */
+                JSValueConst pind = f->indent1;
+                JSValue kv = JS_AtomToValue(ctx, at);
+                JSSJFrame *child;
+                if (JS_IsException(kv)) { JS_FreeAtom(ctx, at); return -1; }
+                if (sj_push(ctx, s) < 0) { JS_FreeAtom(ctx, at); JS_FreeValue(ctx, kv); return -1; }
+                child = &s->frames[s->sp - 1];
+                child->holder = js_dup(pval);
+                child->key = kv;
+                child->key_atom = at;
+                child->indent = js_dup(pind);
+            }
+            continue;
+        }
+
+        child_done:
+            /* this node is fully written. The root's completion is the whole result. */
+            sj_pop(ctx, s);
+            if (s->sp == 0) {
+                s->result = string_buffer_end(&s->b);
+                s->b_live = 0;
+                return JS_IsException(s->result) ? -1 : 0;
+            }
+            s->frames[s->sp - 1].i++;
+            continue;
+        }
+    }
+    DFAIL("the JSON.stringify walk ran out of frames without producing a result");
     return -1;
 }
 
-JSValue JS_JSONStringify(JSContext *ctx, JSValueConst obj,
-                         JSValueConst replacer, JSValueConst space0)
+static int js_json_str_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    StringBuffer b_s;
-    JSONStringifyContext jsc_s, *jsc = &jsc_s;
-    JSValue val, v, space, ret, wrapper;
-    int res;
-    int64_t i, j, n;
+    JSJsonStr *s = st;
+    int r;
 
-    jsc->replacer_func = JS_UNDEFINED;
-    jsc->stack = JS_UNDEFINED;
-    jsc->property_list = JS_UNDEFINED;
-    jsc->gap = JS_UNDEFINED;
-    jsc->b = &b_s;
-    jsc->empty = js_empty_string(ctx->rt);
-    ret = JS_UNDEFINED;
-    wrapper = JS_UNDEFINED;
-
-    string_buffer_init(ctx, jsc->b, 0);
-    jsc->stack = JS_NewArray(ctx);
-    if (JS_IsException(jsc->stack))
-        goto exception;
-    if (JS_IsFunction(ctx, replacer)) {
-        jsc->replacer_func = replacer;
-    } else {
-        res = js_is_array(ctx, replacer);
-        if (res < 0)
-            goto exception;
-        if (res) {
-            /* XXX: enumeration is not fully correct */
-            jsc->property_list = JS_NewArray(ctx);
-            if (JS_IsException(jsc->property_list))
-                goto exception;
-            if (js_get_length64(ctx, &n, replacer))
-                goto exception;
-            for (i = j = 0; i < n; i++) {
-                JSValue present;
-                v = JS_GetPropertyInt64(ctx, replacer, i);
-                if (JS_IsException(v))
-                    goto exception;
-                if (JS_IsObject(v)) {
-                    JSObject *p = JS_VALUE_GET_OBJ(v);
-                    if (p->class_id == JS_CLASS_STRING ||
-                        p->class_id == JS_CLASS_NUMBER) {
-                        v = JS_ToStringFree(ctx, v);
-                        if (JS_IsException(v))
-                            goto exception;
-                    } else {
-                        JS_FreeValue(ctx, v);
-                        continue;
-                    }
-                } else if (JS_IsNumber(v)) {
-                    v = JS_ToStringFree(ctx, v);
-                    if (JS_IsException(v))
-                        goto exception;
-                } else if (!JS_IsString(v)) {
-                    JS_FreeValue(ctx, v);
-                    continue;
-                }
-                if (!js_internal_array_includes(ctx, jsc->property_list, v)) {
-                    JS_SetPropertyInt64(ctx, jsc->property_list, j++, v);
-                } else {
-                    JS_FreeValue(ctx, v);
-                }
-            }
+    if (s->hdr.stage == 0) {
+        JSValue wrapper;
+        JSSJFrame *root;
+        s->hdr.stage = 1;
+        JS_FreeValue(ctx, cb_result);
+        cb_result = JS_UNDEFINED;
+        s->stack = JS_UNDEFINED; s->gap = JS_UNDEFINED; s->result = JS_UNDEFINED;
+        s->pv = JS_UNDEFINED; s->space = JS_UNDEFINED;
+        s->empty = js_empty_string(ctx->rt);
+        string_buffer_init(ctx, &s->b, 0);
+        s->b_live = 1;
+        s->stack = JS_NewArray(ctx);
+        if (JS_IsException(s->stack)) { s->stack = JS_UNDEFINED; return -1; }
+        /* 25.5.2.1 step 11: the root holder is `{ "": value }`, engine-built. Its Get is a request like every
+           other one — the walk has one entry, not an entry and a special case for the root. */
+        wrapper = JS_NewObject(ctx);
+        if (JS_IsException(wrapper)) return -1;
+        if (JS_DefinePropertyValue(ctx, wrapper, JS_ATOM_empty_string,
+                                   js_dup(step_arg(&s->hdr, 0)), JS_PROP_C_W_E) < 0) {
+            JS_FreeValue(ctx, wrapper);
+            return -1;
         }
+        if (sj_push(ctx, s) < 0) { JS_FreeValue(ctx, wrapper); return -1; }
+        root = &s->frames[0];
+        root->holder = wrapper;
+        root->key = js_dup(s->empty);
+        root->key_atom = JS_DupAtom(ctx, JS_ATOM_empty_string);
+        root->indent = js_dup(s->empty);
     }
-    space = js_dup(space0);
-    if (JS_IsObject(space)) {
-        JSObject *p = JS_VALUE_GET_OBJ(space);
-        if (p->class_id == JS_CLASS_NUMBER) {
-            space = JS_ToNumberFree(ctx, space);
-        } else if (p->class_id == JS_CLASS_STRING) {
-            space = JS_ToStringFree(ctx, space);
-        }
-        if (JS_IsException(space)) {
-            JS_FreeValue(ctx, space);
-            goto exception;
-        }
+    if (s->hdr.stage == 1) {
+        r = js_json_str_prologue(ctx, s, cb_result, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r != 0) return r;
+        s->hdr.stage = 2;
     }
-    if (JS_IsNumber(space)) {
-        int n;
-        if (JS_ToInt32Clamp(ctx, &n, space, 0, 10, 0))
-            goto exception;
-        jsc->gap = JS_NewStringLen(ctx, "          ", n);
-    } else if (JS_IsString(space)) {
-        JSString *p = JS_VALUE_GET_STRING(space);
-        jsc->gap = js_sub_string(ctx, p, 0, min_int(p->len, 10));
-    } else {
-        jsc->gap = js_dup(jsc->empty);
-    }
-    JS_FreeValue(ctx, space);
-    if (JS_IsException(jsc->gap))
-        goto exception;
-    wrapper = JS_NewObject(ctx);
-    if (JS_IsException(wrapper))
-        goto exception;
-    if (JS_DefinePropertyValue(ctx, wrapper, JS_ATOM_empty_string,
-                               js_dup(obj), JS_PROP_C_W_E) < 0)
-        goto exception;
-    val = js_dup(obj);
-
-    val = js_json_check(ctx, jsc, wrapper, val, jsc->empty);
-    if (JS_IsException(val))
-        goto exception;
-    if (JS_IsUndefined(val)) {
-        ret = JS_UNDEFINED;
-        goto done1;
-    }
-    if (js_json_to_str(ctx, jsc, wrapper, val, jsc->empty))
-        goto exception;
-
-    ret = string_buffer_end(jsc->b);
-    goto done;
-
-exception:
-    ret = JS_EXCEPTION;
-done1:
-    string_buffer_free(jsc->b);
-done:
-    JS_FreeValue(ctx, wrapper);
-    JS_FreeValue(ctx, jsc->empty);
-    JS_FreeValue(ctx, jsc->gap);
-    JS_FreeValue(ctx, jsc->property_list);
-    JS_FreeValue(ctx, jsc->stack);
-    return ret;
+    return js_json_str_walk(ctx, s, cb_result, out_cb, out_argc);
 }
 
-static JSValue js_json_stringify(JSContext *ctx, JSValueConst this_val,
-                                 int argc, JSValueConst *argv)
+static JSValue js_json_str_fini(JSContext *ctx, void *st, bool take_result)
 {
-    // stringify(val, replacer, space)
-    return JS_JSONStringify(ctx, argv[0], argv[1], argv[2]);
+    JSJsonStr *s = st;
+    JSValue r;
+    while (s->sp > 0) sj_pop(ctx, s);
+    js_free(ctx, s->frames);
+    if (s->plist) {
+        uint32_t k;
+        for (k = 0; k < s->nplist; k++) JS_FreeAtom(ctx, s->plist[k]);
+        js_free(ctx, s->plist);
+    }
+    if (s->b_live) string_buffer_free(&s->b);
+    JS_FreeValue(ctx, s->stack);
+    JS_FreeValue(ctx, s->gap);
+    JS_FreeValue(ctx, s->empty);
+    JS_FreeValue(ctx, s->pv);
+    JS_FreeValue(ctx, s->space);
+    r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    js_free(ctx, s);
+    return r;
 }
+
+/* DELETED: JS_JSONStringify, js_json_check, js_json_to_str and JSONStringifyContext. The public C entry was a
+   SECOND implementation of this algorithm — the one that drove toJSON, the replacer, every read and the proxy
+   traps from C — and keeping it beside the machine is exactly the dual-system seam these conversions exist to
+   close. quickjs.h loses the declaration with it. */
 
 static const JSCFunctionListEntry js_json_funcs[] = {
     JS_CFUNC_DEF("isRawJSON", 1, js_json_isRawJSON ),
     JS_CFUNC_STEP_DEF("parse", 2, STEPDEF_JSON_PARSE ),
     JS_CFUNC_STEP_DEF("rawJSON", 1, STEPDEF_JSON_RAWJSON ),
-    JS_CFUNC_DEF("stringify", 3, js_json_stringify ),
+    JS_CFUNC_STEP_DEF("stringify", 3, STEPDEF_JSON_STRINGIFY ),
     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "JSON", JS_PROP_CONFIGURABLE ),
 };
 

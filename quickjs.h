@@ -1071,8 +1071,9 @@ JS_EXTERN void *JS_GetAnyOpaque(JSValueConst obj, JSClassID *class_id);
 /* 'buf' must be zero terminated i.e. buf[buf_len] = '\0'. */
 JS_EXTERN JSValue JS_ParseJSON(JSContext *ctx, const char *buf, size_t buf_len,
                                const char *filename);
-JS_EXTERN JSValue JS_JSONStringify(JSContext *ctx, JSValueConst obj,
-                                   JSValueConst replacer, JSValueConst space0);
+/* JS_JSONStringify is DELETED. Serialization runs the page's code — toJSON, the replacer, every element and
+   member read, and a Proxy's ownKeys/getOwnPropertyDescriptor traps — so it is a step machine reached through
+   the flow machinery, and a C entry beside it would be a second implementation of the same algorithm. */
 
 typedef void JSFreeArrayBufferDataFunc(JSRuntime *rt, void *opaque, void *ptr);
 JS_EXTERN JSValue JS_NewArrayBuffer(JSContext *ctx, uint8_t *buf, size_t len,
