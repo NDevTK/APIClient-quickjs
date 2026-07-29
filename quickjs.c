@@ -22978,7 +22978,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 sf->prev_frame = rt->current_stack_frame;
                 rt->current_stack_frame = sf;
                 gen_state = s;
-                call_argv = sp - 1; call_argc = 1; tramp_first = -2; tramp_is_tail = 1;
+                call_argc = sf->arg_count; call_argv = sp - call_argc;
+                tramp_first = -2; tramp_is_tail = 1;
                 /* the CONVERGENCE POINT, not do_step_tramp: a call root's callee is whatever the capability
                    holds — a step-machine closure (a Promise reaction), a native resolving function, a subclass's
                    BYTECODE resolve, a bound or proxied one. Asking the kind here is the same question every
@@ -75971,10 +75972,14 @@ static JSValue js_reaction_resume_job(JSContext *ctx, int argc, JSValueConst *ar
    step-specific, and reading it as step-only is what left a JS_Call fallback beside it. The frame's stack is
    pre-pushed with the method-call operand shape [this=undefined, handler, arg] (call_argv = sp-1). */
 #define STEP_FLOW_SLOTS 16
-static int reaction_call_flow_init(JSContext *ctx, JSAsyncFunctionState *fs, JSValueConst handler, JSValueConst arg)
+static int reaction_call_flow_init(JSContext *ctx, JSAsyncFunctionState *fs, JSValueConst this_val,
+                                   JSValueConst handler, int argc, JSValueConst *argv)
 {
     JSStackFrame *sf = &fs->frame;
-    JSValue *blk = js_malloc(ctx, sizeof(JSValue) * STEP_FLOW_SLOTS);
+    JSValue *blk;
+    int i;
+    DCHECK(argc >= 0 && argc + 2 <= STEP_FLOW_SLOTS, "a call-root flow's arguments exceed its pre-pushed block");
+    blk = js_malloc(ctx, sizeof(JSValue) * STEP_FLOW_SLOTS);
     if (unlikely(!blk))
         return -1;
     fs->this_val = JS_UNDEFINED;
@@ -75991,10 +75996,14 @@ static int reaction_call_flow_init(JSContext *ctx, JSAsyncFunctionState *fs, JSV
     sf->is_constructor = false;
     sf->cur_func = js_dup(handler);
     sf->cur_pc = NULL;
-    blk[0] = JS_UNDEFINED;         /* this */
-    blk[1] = js_dup(handler);      /* the step closure — call_argv[-1] */
-    blk[2] = js_dup(arg);          /* the sole argument — call_argv[0] */
-    sf->cur_sp = blk + 3;
+    blk[0] = js_dup(this_val);     /* this */
+    blk[1] = js_dup(handler);      /* the callee — call_argv[-1] */
+    for (i = 0; i < argc; i++)
+        blk[2 + i] = js_dup(argv[i]);
+    /* the flow base reads the argument count back off the frame; a call root is not always the ONE-argument
+       shape a reaction has (PromiseResolveThenableJob's is then.call(thenable, resolve, reject)). */
+    sf->arg_count = argc;
+    sf->cur_sp = blk + 2 + argc;
     return 0;
 }
 
@@ -76023,7 +76032,7 @@ static int reaction_flow_settle_start(JSContext *ctx, JSReactionFlow *rf, JSValu
     func = is_reject ? rf->reject : rf->resolve;
     if (JS_IsUndefined(func)) { JS_FreeValue(ctx, res); return -1; }
     rf->phase = 1;
-    if (reaction_call_flow_init(ctx, &rf->fs, func, res) < 0) { JS_FreeValue(ctx, res); return -1; }
+    if (reaction_call_flow_init(ctx, &rf->fs, JS_UNDEFINED, func, 1, vc(&res)) < 0) { JS_FreeValue(ctx, res); return -1; }
     JS_FreeValue(ctx, res);
     return 0;
 }
@@ -76080,7 +76089,7 @@ static int js_settle_as_flow(JSContext *ctx, JSValueConst func, JSValueConst val
     rf->resolve = js_dup(func);
     rf->reject = JS_UNDEFINED;
     rf->phase = 1;   /* there is no handler phase: the settle is the entire flow */
-    if (reaction_call_flow_init(ctx, &rf->fs, func, value) < 0) { reaction_flow_free(ctx, rf); return -1; }
+    if (reaction_call_flow_init(ctx, &rf->fs, JS_UNDEFINED, func, 1, vc(&value)) < 0) { reaction_flow_free(ctx, rf); return -1; }
     return JS_IsException(reaction_flow_step(ctx, rf)) ? -1 : 0;
 }
 
@@ -76117,7 +76126,7 @@ static JSValue promise_reaction_job(JSContext *ctx, int argc,
         if (unlikely(!rf))
             return JS_EXCEPTION;
         memset(rf, 0, sizeof(*rf));
-        if (reaction_call_flow_init(ctx, &rf->fs, handler, arg)) {
+        if (reaction_call_flow_init(ctx, &rf->fs, JS_UNDEFINED, handler, 1, vc(&arg))) {
             js_free_rt(ctx->rt, rf);
             return JS_EXCEPTION;
         }
@@ -76219,16 +76228,19 @@ static JSValue js_promise_resolve_thenable_job(JSContext *ctx,
     if (js_create_resolving_functions(ctx, args, promise) < 0)
         return JS_EXCEPTION;
     rt = ctx->rt;
-    if (tramp_can_call(then) && !rt->promise_hook) {
-        /* the thenable's .then is USER bytecode that can loop — run then.call(thenable, resolve, reject) as a FLOW
-           so it parks into the job pump, never a JS_Call to completion. On success its result is DISCARDED (the
-           .then already settled the promise via resolve/reject); on throw, reaction_flow_settle calls rf->reject
-           (= the reject resolving function), which is exactly PromiseResolveThenableJob's abrupt step. The BEFORE/
-           AFTER promise hooks bracket a single synchronous call, so a hook forces the inline path below. */
+    if (!rt->promise_hook) {
+        /* the thenable's .then is the PAGE's — run then.call(thenable, resolve, reject) as a call-root FLOW so it
+           parks into the job pump, never a JS_Call to completion. This also asked whether `then` was plain
+           BYTECODE, which handed a bound, proxied, C or step-machine `.then` to the same JS_Call the reaction
+           job used to fall to; the call root routes every kind through the convergence point instead.
+           On success the result is DISCARDED (the .then already settled the promise via resolve/reject); on
+           throw, reaction_flow_settle calls rf->reject, which is PromiseResolveThenableJob's abrupt step. The
+           BEFORE/AFTER promise hooks must bracket ONE synchronous call — an embedder contract, not a claim about
+           the callee — so a hook still forces the inline path below. */
         JSReactionFlow *rf = js_malloc(ctx, sizeof(*rf));
         if (unlikely(!rf)) { JS_FreeValue(ctx, args[0]); JS_FreeValue(ctx, args[1]); return JS_EXCEPTION; }
         memset(rf, 0, sizeof(*rf));
-        if (async_func_init(ctx, &rf->fs, then, thenable, 2, vc(args))) {
+        if (reaction_call_flow_init(ctx, &rf->fs, thenable, then, 2, vc(args))) {
             js_free_rt(rt, rf); JS_FreeValue(ctx, args[0]); JS_FreeValue(ctx, args[1]); return JS_EXCEPTION;
         }
         rf->resolve = JS_UNDEFINED;     /* success: discard the .then result */
