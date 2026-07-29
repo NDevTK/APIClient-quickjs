@@ -1516,6 +1516,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_ENCODE_URI, STEPDEF_ENCODE_URI_COMPONENT,
     STEPDEF_GLOBAL_ESCAPE, STEPDEF_GLOBAL_UNESCAPE,
     STEPDEF_INSTANCEOF, STEPDEF_ORDINARY_HAS_INSTANCE,
+    STEPDEF_TA_SORT, STEPDEF_TA_TOSORTED,
     STEPDEF_COUNT
 };
 #define HINT_NONE    2
@@ -20692,6 +20693,35 @@ static int js_array_sort_step(JSContext *ctx, struct JSArraySort *s, JSValue res
                               JSValue **out_cb, int *out_argc);
 static int js_array_sort_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_sort_vfini(JSContext *ctx, void *st, bool take_result);
+
+/* 23.2.3.29 %TypedArray%.prototype.sort and 23.2.3.34 toSorted, as ONE machine.
+
+   js_typed_array_sort drove cutils' rqsort with js_TA_cmp_generic, which called the comparator with JS_Call: the
+   sort's whole state was the C stack, so the comparator could not suspend at any depth — a DRIVE-TO-COMPLETION,
+   not merely an unrouted call. Two more of the page's operations rode inside that comparator: 23.2.4.7 step 2.a
+   is `ToNumber(? Call(comparator, …))`, coerced there with JS_ToFloat64Free.
+
+   Making it a machine also makes it the SPEC's algorithm. SortIndexedProperties reads every element into a List
+   FIRST and sorts THAT; js_TA_cmp_generic re-read the live buffer at each comparison, so a comparator that wrote
+   to the array changed what later comparisons saw, and it needed detach/bounds guards inside the comparison to
+   survive one that resized. A snapshot of Numbers and BigInts needs neither: the elements cannot be reached
+   again, and step 9's write-back is where a shrunk buffer shows up, as the no-op 10.4.5.5 makes it.
+
+   The DEFAULT ordering (no comparator) is not a fallback beside this and is not tracked as one: 23.2.4.7 steps
+   3-9 are a numeric comparison of two elements the buffer holds, reaching no property, no coercion and no
+   callable. It is the raw in-place sort, run inside stage 0, and nothing about it can suspend. */
+typedef struct JSTASort {
+    JSStepHdr hdr;          /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    JSValue obj;            /* what the sorted list is written to — the receiver, or toSorted's fresh copy (owned) */
+    JSValue *items;         /* SortIndexedProperties' List: `len` Numbers or BigInts (owned) */
+    JSValue *tmp;           /* merge scratch. Its entries ALIAS items' during a block, so items is the one owner */
+    JSValue cmpres;         /* the comparator's result, held across its own ToNumber (owned) */
+    int64_t len, width, i, lo, mid, hi, l, r, k, wb;
+    uint8_t pending;        /* a comparator result is awaited */
+    JSValue cb_args[4];     /* [this=undefined, comparator, x, y]; call_argv=&cb_args[2], argc=2 */
+} JSTASort;
+static int js_ta_sort_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_ta_sort_vfini(JSContext *ctx, void *st, bool take_result);
 
 /* JSON.parse(text, reviver): a SUSPENDABLE post-order tree walk. internalize_json_property recurses on the C
    stack and calls the reviver deep in that recursion; this coroutine flattens the recursion into an explicit
@@ -62842,6 +62872,8 @@ static const JSTrampStepDef js_ta_every_def        = { sizeof(JSArrayEvery), js_
 static const JSTrampStepDef js_ta_some_def         = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_some | special_TA };
 static const JSTrampStepDef js_ta_forEach_def      = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_forEach | special_TA };
 static const JSTrampStepDef js_ta_map_def          = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_map | special_TA };
+static const JSTrampStepDef js_ta_sort_def       = { sizeof(JSTASort), js_ta_sort_vstep, js_ta_sort_vfini, 0 };
+static const JSTrampStepDef js_ta_toSorted_def   = { sizeof(JSTASort), js_ta_sort_vstep, js_ta_sort_vfini, 1 };
 static const JSTrampStepDef js_array_sort_def    = { sizeof(JSArraySort), js_array_sort_vstep, js_array_sort_vfini, 0 };
 static const JSTrampStepDef js_array_toSorted_def = { sizeof(JSArraySort), js_array_sort_vstep, js_array_sort_vfini, 1 };
 static const JSTrampStepDef js_json_parse_def    = { sizeof(JSJsonReviver), js_json_parse_vstep, js_json_parse_vfini, 0 };
@@ -63543,6 +63575,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_TA_FOREACH]    = &js_ta_forEach_def,    [STEPDEF_TA_MAP]        = &js_ta_map_def,
     [STEPDEF_TA_FILTER]     = &js_ta_filter_def,
     [STEPDEF_ARRAY_SORT]    = &js_array_sort_def,   [STEPDEF_ARRAY_TOSORTED] = &js_array_toSorted_def,
+    [STEPDEF_TA_SORT]       = &js_ta_sort_def,     [STEPDEF_TA_TOSORTED]    = &js_ta_toSorted_def,
     [STEPDEF_JSON_PARSE]    = &js_json_parse_def,
     [STEPDEF_JSON_STRINGIFY] = &js_json_str_def,
     [STEPDEF_FOR_IN]         = &js_for_in_def,
@@ -82562,232 +82595,238 @@ static JSValue js_TA_get_float64(JSContext *ctx, const void *a) {
     return js_float64(*(const double *)a);
 }
 
-struct TA_sort_context {
-    JSContext *ctx;
-    int exception;
-    JSValueConst arr;
-    JSValueConst cmp;
-    JSValue (*getfun)(JSContext *ctx, const void *a);
-    int elt_size;
-};
+/* DELETED: struct TA_sort_context and js_TA_cmp_generic. The context existed only to smuggle the JSContext, the
+   array and the comparator through rqsort's void*, and the comparator ran JS_Call inside rqsort's own recursion —
+   the sort's state was the C stack, so nothing about it could suspend. Its detach/bounds guards
+   (`typed_array_is_oob`, `a_idx >= count` -> 0) and its index-permutation write-back existed because it re-read
+   the LIVE buffer at every comparison; SortIndexedProperties snapshots first, so there is nothing left for them
+   to guard. The typed cmpfuns beside them stay: they are the default ordering, which invokes nothing. */
 
-static int js_TA_cmp_generic(const void *a, const void *b, void *opaque) {
-    struct TA_sort_context *psc = opaque;
-    JSContext *ctx = psc->ctx;
-    uint32_t a_idx, b_idx;
-    JSValue argv[2];
-    JSValue res;
-    JSObject *p;
-    int cmp;
+/* the element reader for a class, which is how SortIndexedProperties' List gets built. */
+static JSValue (*js_ta_getfun(int class_id))(JSContext *ctx, const void *a)
+{
+    switch (class_id) {
+    case JS_CLASS_INT8_ARRAY:       return js_TA_get_int8;
+    case JS_CLASS_UINT8C_ARRAY:
+    case JS_CLASS_UINT8_ARRAY:      return js_TA_get_uint8;
+    case JS_CLASS_INT16_ARRAY:      return js_TA_get_int16;
+    case JS_CLASS_UINT16_ARRAY:     return js_TA_get_uint16;
+    case JS_CLASS_INT32_ARRAY:      return js_TA_get_int32;
+    case JS_CLASS_UINT32_ARRAY:     return js_TA_get_uint32;
+    case JS_CLASS_BIG_INT64_ARRAY:  return js_TA_get_int64;
+    case JS_CLASS_BIG_UINT64_ARRAY: return js_TA_get_uint64;
+    case JS_CLASS_FLOAT16_ARRAY:    return js_TA_get_float16;
+    case JS_CLASS_FLOAT32_ARRAY:    return js_TA_get_float32;
+    case JS_CLASS_FLOAT64_ARRAY:    return js_TA_get_float64;
+    }
+    DFAIL("a typed array class with no element reader");
+    return NULL;
+}
 
-    p = JS_VALUE_GET_OBJ(psc->arr);
-    if (typed_array_is_oob(p))
+/* 23.2.4.7 steps 3-9 as the raw in-place sort: with no comparator the comparison reads two elements of the
+   buffer and nothing else, so the whole sort is a computation with no suspension point in it. */
+static int (*js_ta_rawcmp(int class_id))(const void *a, const void *b, void *opaque)
+{
+    switch (class_id) {
+    case JS_CLASS_INT8_ARRAY:       return js_TA_cmp_int8;
+    case JS_CLASS_UINT8C_ARRAY:
+    case JS_CLASS_UINT8_ARRAY:      return js_TA_cmp_uint8;
+    case JS_CLASS_INT16_ARRAY:      return js_TA_cmp_int16;
+    case JS_CLASS_UINT16_ARRAY:     return js_TA_cmp_uint16;
+    case JS_CLASS_INT32_ARRAY:      return js_TA_cmp_int32;
+    case JS_CLASS_UINT32_ARRAY:     return js_TA_cmp_uint32;
+    case JS_CLASS_BIG_INT64_ARRAY:  return js_TA_cmp_int64;
+    case JS_CLASS_BIG_UINT64_ARRAY: return js_TA_cmp_uint64;
+    case JS_CLASS_FLOAT16_ARRAY:    return js_TA_cmp_float16;
+    case JS_CLASS_FLOAT32_ARRAY:    return js_TA_cmp_float32;
+    case JS_CLASS_FLOAT64_ARRAY:    return js_TA_cmp_float64;
+    }
+    DFAIL("a typed array class with no element comparison");
+    return NULL;
+}
+
+/* 23.2.3.29 step 9 / 23.2.3.34 step 8: Set(obj, ! ToString(𝔽(j)), sortedList[j], true). On a typed array that is
+   10.4.5.5 -> TypedArraySetElement, whose conversion runs nothing here because the value came out of a typed
+   array of the same class; and an index that is no longer valid is a NO-OP, which is exactly what a comparator
+   that shrank a resizable buffer leaves behind. */
+static int js_ta_sort_put(JSContext *ctx, JSValueConst obj, int64_t j, JSValueConst v)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(obj);
+    uint64_t v64;
+    if (typed_array_is_oob(p) || j >= (int64_t)p->u.array.count)
         return 0;
+    if (js_typed_array_fill_value(ctx, p, v, &v64))
+        return -1;
+    switch (typed_array_size_log2(p->class_id)) {
+    case 0: p->u.array.u.uint8_ptr[j]  = (uint8_t)v64;  break;
+    case 1: p->u.array.u.uint16_ptr[j] = (uint16_t)v64; break;
+    case 2: p->u.array.u.uint32_ptr[j] = (uint32_t)v64; break;
+    case 3: p->u.array.u.uint64_ptr[j] = v64;           break;
+    default: DFAIL("a typed array element size that is not 1, 2, 4 or 8");
+    }
+    return 0;
+}
 
-    cmp = 0;
-    if (!psc->exception) {
-        a_idx = *(uint32_t *)a;
-        b_idx = *(uint32_t *)b;
-        if (a_idx >= p->u.array.count || b_idx >= p->u.array.count)
+enum { TAS_MERGE = 3, TAS_WRITEBACK = 7 };
+
+static int js_ta_sort_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSTASort *s = st;
+    JSValueConst method = step_arg(&s->hdr, 0);
+    int rc;
+
+    if (s->hdr.stage == 0) {
+        JSObject *p;
+        JSValue (*getfun)(JSContext *, const void *);
+        int elt_size;
+        int64_t j;
+        JS_FreeValue(ctx, cb_result);
+        cb_result = JS_UNDEFINED;
+        /* js_mallocz leaves a JSValue reading as JS_TAG_INT 0, not JS_UNDEFINED, so every owned field is stated
+           here — the coercion's own DCHECK is what catches the omission, and did. */
+        s->obj = JS_UNDEFINED; s->cmpres = JS_UNDEFINED;
+        s->items = NULL; s->tmp = NULL; s->pending = 0;
+        s->len = 0; s->width = 0; s->i = 0; s->lo = 0; s->mid = 0; s->hi = 0;
+        s->l = 0; s->r = 0; s->k = 0; s->wb = 0;
+        { int q; for (q = 0; q < 4; q++) s->cb_args[q] = JS_UNDEFINED; }
+        /* step 1: a non-callable comparator throws BEFORE the receiver is even validated */
+        if (!JS_IsUndefined(method) && check_function(ctx, method))
+            return -1;
+        p = get_typed_array(ctx, s->hdr.this_val);            /* step 3: ValidateTypedArray */
+        if (!p)
+            return -1;
+        if (typed_array_is_oob(p))
+            return JS_ThrowTypeErrorArrayBufferOOB(ctx), -1;
+        s->len = p->u.array.count;                            /* step 4: TypedArrayLength */
+        if (s->hdr.arg) {
+            /* 23.2.3.34 step 5: TypedArrayCreateSameType(O, «len») — an ordinary allocation, no species */
+            s->obj = js_typed_array_constructor_ta(ctx, JS_UNDEFINED, s->hdr.this_val,
+                                                   p->class_id, (uint32_t)s->len);
+            if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
+        } else {
+            if (typed_array_is_immutable(p))
+                return JS_ThrowTypeErrorImmutableArrayBuffer(ctx), -1;
+            s->obj = js_dup(s->hdr.this_val);
+        }
+        if (s->len <= 1)
             return 0;
-        argv[0] = psc->getfun(ctx, (char *)p->u.array.u.ptr +
-                              a_idx * (size_t)psc->elt_size);
-        argv[1] = psc->getfun(ctx, (char *)p->u.array.u.ptr +
-                              b_idx * (size_t)(psc->elt_size));
-        res = JS_Call(ctx, psc->cmp, JS_UNDEFINED, 2, vc(argv));
-        if (JS_IsException(res)) {
-            psc->exception = 1;
-            goto done;
+        if (JS_IsUndefined(method)) {
+            /* the default ordering: nothing in it can suspend, so it is done in place right here. toSorted sorts
+               its COPY, which already holds the receiver's elements. */
+            JSObject *d = JS_VALUE_GET_OBJ(s->obj);
+            elt_size = 1 << typed_array_size_log2(d->class_id);
+            rqsort(d->u.array.u.ptr, (size_t)s->len, elt_size, js_ta_rawcmp(d->class_id), NULL);
+            return 0;
         }
-        if (JS_VALUE_GET_TAG(res) == JS_TAG_INT) {
-            int val = JS_VALUE_GET_INT(res);
-            cmp = (val > 0) - (val < 0);
-        } else {
-            double val;
-            if (JS_ToFloat64Free(ctx, &val, res) < 0) {
-                psc->exception = 1;
-                goto done;
-            } else {
-                cmp = (val > 0) - (val < 0);
-            }
-        }
-        if (cmp == 0) {
-            /* make sort stable: compare array offsets */
-            cmp = (a_idx > b_idx) - (a_idx < b_idx);
-        }
-    done:
-        JS_FreeValue(ctx, argv[0]);
-        JS_FreeValue(ctx, argv[1]);
-    }
-    return cmp;
-}
-
-static JSValue js_typed_array_sort(JSContext *ctx, JSValueConst this_val,
-                                   int argc, JSValueConst *argv)
-{
-    JSObject *p;
-    int len;
-    size_t elt_size;
-    struct TA_sort_context tsc;
-    int (*cmpfun)(const void *a, const void *b, void *opaque);
-
-    p = get_typed_array(ctx, this_val);
-    if (!p)
-        return JS_EXCEPTION;
-    if (typed_array_is_immutable(p))
-        return JS_ThrowTypeErrorImmutableArrayBuffer(ctx);
-    if (typed_array_is_oob(p))
-        return JS_ThrowTypeErrorArrayBufferOOB(ctx);
-
-    tsc.ctx = ctx;
-    tsc.exception = 0;
-    tsc.arr = this_val;
-    tsc.cmp = argv[0];
-
-    if (!JS_IsUndefined(tsc.cmp) && check_function(ctx, tsc.cmp))
-        return JS_EXCEPTION;
-
-    len = p->u.array.count;
-    if (len > 1) {
-        switch (p->class_id) {
-        case JS_CLASS_INT8_ARRAY:
-            tsc.getfun = js_TA_get_int8;
-            cmpfun = js_TA_cmp_int8;
-            break;
-        case JS_CLASS_UINT8C_ARRAY:
-        case JS_CLASS_UINT8_ARRAY:
-            tsc.getfun = js_TA_get_uint8;
-            cmpfun = js_TA_cmp_uint8;
-            break;
-        case JS_CLASS_INT16_ARRAY:
-            tsc.getfun = js_TA_get_int16;
-            cmpfun = js_TA_cmp_int16;
-            break;
-        case JS_CLASS_UINT16_ARRAY:
-            tsc.getfun = js_TA_get_uint16;
-            cmpfun = js_TA_cmp_uint16;
-            break;
-        case JS_CLASS_INT32_ARRAY:
-            tsc.getfun = js_TA_get_int32;
-            cmpfun = js_TA_cmp_int32;
-            break;
-        case JS_CLASS_UINT32_ARRAY:
-            tsc.getfun = js_TA_get_uint32;
-            cmpfun = js_TA_cmp_uint32;
-            break;
-        case JS_CLASS_BIG_INT64_ARRAY:
-            tsc.getfun = js_TA_get_int64;
-            cmpfun = js_TA_cmp_int64;
-            break;
-        case JS_CLASS_BIG_UINT64_ARRAY:
-            tsc.getfun = js_TA_get_uint64;
-            cmpfun = js_TA_cmp_uint64;
-            break;
-        case JS_CLASS_FLOAT16_ARRAY:
-            tsc.getfun = js_TA_get_float16;
-            cmpfun = js_TA_cmp_float16;
-            break;
-        case JS_CLASS_FLOAT32_ARRAY:
-            tsc.getfun = js_TA_get_float32;
-            cmpfun = js_TA_cmp_float32;
-            break;
-        case JS_CLASS_FLOAT64_ARRAY:
-            tsc.getfun = js_TA_get_float64;
-            cmpfun = js_TA_cmp_float64;
-            break;
-        default:
-            abort();
-        }
+        /* steps 5-7: SortIndexedProperties reads the whole List BEFORE any comparison, which is what makes the
+           comparator unable to change what a later comparison sees. Each read is an element of a typed array,
+           so not one of them is the page's code. */
+        getfun = js_ta_getfun(p->class_id);
         elt_size = 1 << typed_array_size_log2(p->class_id);
-        if (!JS_IsUndefined(tsc.cmp)) {
-            uint32_t *array_idx;
-            void *array_tmp;
-            size_t i, j;
-
-            /* XXX: a stable sort would use less memory */
-            array_idx = js_malloc(ctx, len * sizeof(array_idx[0]));
-            if (!array_idx)
-                return JS_EXCEPTION;
-            for(i = 0; i < len; i++)
-                array_idx[i] = i;
-            tsc.elt_size = elt_size;
-            rqsort(array_idx, len, sizeof(array_idx[0]),
-                   js_TA_cmp_generic, &tsc);
-            if (tsc.exception)
-                goto fail;
-            // per spec: typed array can be detached mid-iteration
-            if (typed_array_is_oob(p))
-                goto done;
-            len = min_int(len, p->u.array.count);
-            if (len == 0)
-                goto done;
-            array_tmp = js_malloc(ctx, len * elt_size);
-            if (!array_tmp) {
-            fail:
-                js_free(ctx, array_idx);
-                return JS_EXCEPTION;
-            }
-            memcpy(array_tmp, p->u.array.u.ptr, len * elt_size);
-            switch(elt_size) {
-            case 1:
-                for(i = 0; i < len; i++) {
-                    j = array_idx[i];
-                    if (j < len)
-                        p->u.array.u.uint8_ptr[i] = ((uint8_t *)array_tmp)[j];
-                }
-                break;
-            case 2:
-                for(i = 0; i < len; i++) {
-                    j = array_idx[i];
-                    if (j < len)
-                        p->u.array.u.uint16_ptr[i] = ((uint16_t *)array_tmp)[j];
-                }
-                break;
-            case 4:
-                for(i = 0; i < len; i++) {
-                    j = array_idx[i];
-                    if (j < len)
-                        p->u.array.u.uint32_ptr[i] = ((uint32_t *)array_tmp)[j];
-                }
-                break;
-            case 8:
-                for(i = 0; i < len; i++) {
-                    j = array_idx[i];
-                    if (j < len)
-                        p->u.array.u.uint64_ptr[i] = ((uint64_t *)array_tmp)[j];
-                }
-                break;
-            default:
-                abort();
-            }
-            js_free(ctx, array_tmp);
-        done:
-            js_free(ctx, array_idx);
-        } else {
-            rqsort(p->u.array.u.ptr, len, elt_size, cmpfun, &tsc);
-            if (tsc.exception)
-                return JS_EXCEPTION;
-        }
+        s->items = js_malloc(ctx, (size_t)s->len * sizeof(JSValue));
+        if (!s->items)
+            return -1;
+        for (j = 0; j < s->len; j++)
+            s->items[j] = getfun(ctx, (char *)p->u.array.u.ptr + j * (size_t)elt_size);
+        s->tmp = js_malloc(ctx, (size_t)s->len * sizeof(JSValue));
+        if (!s->tmp)
+            return -1;
+        s->width = 1; s->i = 0;
+        s->lo = 0; s->mid = 1 < s->len ? 1 : s->len; s->hi = 2 < s->len ? 2 : s->len;
+        s->l = 0; s->r = s->mid; s->k = 0;
+        s->hdr.stage = TAS_MERGE;
     }
-    return js_dup(this_val);
+
+    if (s->hdr.stage == TAS_MERGE) {
+        if (s->pending) {
+            double v;
+            /* 23.2.4.7 step 2.a coerces what the comparator RETURNED, so an object result runs its valueOf. It
+               is held on the state because that coercion suspends. */
+            if (s->hdr.num_phase == NUM_PH_START) {
+                DCHECK(JS_IsUndefined(s->cmpres), "a comparator result is already being coerced on this sort");
+                s->cmpres = cb_result;
+                cb_result = JS_UNDEFINED;
+            }
+            rc = step_tofloat64_run(ctx, &s->hdr, s->cmpres, cb_result, &v, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (rc) return rc < 0 ? -1 : rc;
+            JS_FreeValue(ctx, s->cmpres); s->cmpres = JS_UNDEFINED;
+            s->pending = 0;
+            /* step 2.b: a NaN v is +0, and a stable sort keeps the earlier element for +0 — which asking
+               whether v is GREATER than zero answers for both. */
+            if (!(v > 0)) s->tmp[s->k++] = s->items[s->l++];
+            else          s->tmp[s->k++] = s->items[s->r++];
+        } else {
+            JS_FreeValue(ctx, cb_result);
+            cb_result = JS_UNDEFINED;
+        }
+        for (;;) {
+            if (s->width >= s->len) break;
+            if (s->i >= s->len) {
+                s->width *= 2; s->i = 0;
+                if (s->width >= s->len) break;
+                s->lo = 0; s->mid = s->width < s->len ? s->width : s->len;
+                s->hi = 2 * s->width < s->len ? 2 * s->width : s->len;
+                s->l = 0; s->r = s->mid; s->k = 0;
+                continue;
+            }
+            /* the merge invariants: an active block with ordered cursors, and the exactly-conserved output count.
+               A violation is a state-machine bug, so it crashes where it is born. */
+            DCHECK(s->lo <= s->l && s->l <= s->mid && s->mid <= s->r && s->r <= s->hi && s->hi <= s->len,
+                   "the typed-array merge left its block");
+            DCHECK(s->k - s->lo == (s->l - s->lo) + (s->r - s->mid),
+                   "the typed-array merge placed a different number of elements than it consumed");
+            if (s->l < s->mid && s->r < s->hi) {
+                s->cb_args[0] = JS_UNDEFINED;      /* the comparator gets this = undefined */
+                s->cb_args[1] = method;
+                s->cb_args[2] = s->items[s->l];    /* borrowed: items owns them for the machine's whole life */
+                s->cb_args[3] = s->items[s->r];
+                s->pending = 1;
+                *out_cb = s->cb_args; *out_argc = 2;
+                return 3;
+            }
+            while (s->l < s->mid) s->tmp[s->k++] = s->items[s->l++];
+            while (s->r < s->hi)  s->tmp[s->k++] = s->items[s->r++];
+            { int64_t t; for (t = s->lo; t < s->hi; t++) s->items[t] = s->tmp[t]; }
+            s->i += 2 * s->width;
+            if (s->i < s->len) {
+                s->lo = s->i; s->mid = s->i + s->width < s->len ? s->i + s->width : s->len;
+                s->hi = s->i + 2 * s->width < s->len ? s->i + 2 * s->width : s->len;
+                s->l = s->lo; s->r = s->mid; s->k = s->lo;
+            }
+        }
+        s->wb = 0;
+        s->hdr.stage = TAS_WRITEBACK;
+    }
+
+    DCHECK(s->hdr.stage == TAS_WRITEBACK, "the typed-array sort resumed in no stage");
+    JS_FreeValue(ctx, cb_result);
+    /* the write-back invokes nothing, so it is one pass rather than a resumable loop — the values are already
+       of the array's own kind and an out-of-range index is the spec's no-op. */
+    for (; s->wb < s->len; s->wb++) {
+        if (js_ta_sort_put(ctx, s->obj, s->wb, s->items[s->wb]))
+            return -1;
+    }
+    return 0;
 }
 
-static JSValue js_typed_array_toSorted(JSContext *ctx, JSValueConst this_val,
-                                       int argc, JSValueConst *argv)
+static JSValue js_ta_sort_vfini(JSContext *ctx, void *st, bool take_result)
 {
-    JSValue arr, ret;
-    JSObject *p;
-
-    p = get_typed_array(ctx, this_val);
-    if (!p)
-        return JS_EXCEPTION;
-    arr = js_typed_array_constructor_ta(ctx, JS_UNDEFINED, this_val,
-                                        p->class_id, p->u.array.count);
-    if (JS_IsException(arr))
-        return JS_EXCEPTION;
-    ret = js_typed_array_sort(ctx, arr, argc, argv);
-    JS_FreeValue(ctx, arr);
-    return ret;
+    JSTASort *s = st;
+    JSValue r;
+    int64_t j;
+    JS_FreeValue(ctx, s->cmpres);   /* a comparator result whose ToNumber was abandoned part-way */
+    if (s->items) {
+        /* items is the ONE owner: tmp's entries alias it within the block being merged, and the block's
+           elements are all still reachable from items until the copy-back permutes them. */
+        for (j = 0; j < s->len; j++) JS_FreeValue(ctx, s->items[j]);
+        js_free(ctx, s->items);
+    }
+    js_free(ctx, s->tmp);
+    r = take_result ? s->obj : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->obj);
+    js_free(ctx, s);
+    return r;
 }
 
 static const JSCFunctionListEntry js_typed_array_base_funcs[] = {
@@ -82826,8 +82865,8 @@ static const JSCFunctionListEntry js_typed_array_base_proto_funcs[] = {
     JS_CFUNC_DEF("toReversed", 0, js_typed_array_toReversed ),
     JS_CFUNC_STEP_DEF("slice", 2, STEPDEF_TA_SLICE ),
     JS_CFUNC_STEP_DEF("subarray", 2, STEPDEF_TA_SUBARRAY ),
-    JS_CFUNC_DEF("sort", 1, js_typed_array_sort ),
-    JS_CFUNC_DEF("toSorted", 1, js_typed_array_toSorted ),
+    JS_CFUNC_STEP_DEF("sort", 1, STEPDEF_TA_SORT ),
+    JS_CFUNC_STEP_DEF("toSorted", 1, STEPDEF_TA_TOSORTED ),
     JS_CFUNC_STEP_DEF("join", 1, STEPDEF_TA_JOIN ),
     JS_CFUNC_STEP_DEF("toLocaleString", 0, STEPDEF_TA_TOLOCALESTRING ),
     JS_CFUNC_STEP_DEF("indexOf", 1, STEPDEF_TA_INDEXOF ),
