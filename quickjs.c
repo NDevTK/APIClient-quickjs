@@ -19124,11 +19124,13 @@ typedef struct TrampFrame {
     int forof_off;   /* for a FOR-OF generator drive (is_tail, async_promise UNDEFINED): the iterator's caller-stack
                         offset (caller_sp[forof_off] is the generator object). Lets a concolic fork inside a for-of
                         body recover the shared generator to record its per-flow gen_data swap. Unused otherwise. */
-    uint8_t agen_fin;    /* CONT_AGEN_DRIVE: what the OPERAND SHAPE that started this drive wants done with the
-                            settlement promise — AGEN_FIN_PUSH / _PUSH_FALSE / _DISCARD. The shape is the only
-                            thing that differs between `ag.next()`, yield*'s OP_iterator_next / OP_iterator_call
-                            delegation and a for-await `break`'s OP_iterator_close, so it is the only thing they
-                            declare; everything after the enqueue is the same drive. */
+    void *agen_cont; uint8_t agen_ck;   /* CONT_AGEN_DRIVE: the continuation waiting for the settlement promise.
+                            It used to be an OPERAND-SHAPE enum (AGEN_FIN_PUSH / _PUSH_FALSE / _DISCARD) that four
+                            call sites chose between — and choosing it required each site to RECOGNIZE the async
+                            generator itself, so `ag.next.bind(ag)` and every other spelling reached the drive
+                            through the convergence point with the shape defaulted to CALL and the protocol's
+                            operands left on the stack. The drive is an ordinary call now; where its result goes is
+                            the continuation the call already carries, exactly as for a returning heap frame. */
     JSValue agen_hold;   /* CONT_AGEN_DRIVE: the async-generator OBJECT, held across the body run — the receiver
                             operand was its only reference and this frame freed it, exactly as the sync generator
                             drive holds its receiver in async_promise. (async_promise carries the SETTLEMENT
@@ -19155,16 +19157,6 @@ typedef struct TrampFrame {
 #define CONT_AGEN_CREATE   3   /* cont_state = JSAsyncGeneratorData: an async generator's params are binding on
                                   this chain (run-to-initial_yield); settles at OP_initial_yield by creating the
                                   async-generator object. Mirrors the sync gen_magic==0xFF creation frame. */
-/* The OPERAND SHAPES that can start an async-generator drive, and what each wants back. A shape declares only
-   where its receiver/argument sit and what the protocol expects on the stack afterwards — never how the body is
-   driven, which is the same for all of them. */
-#define AGEN_SHAPE_CALL      0   /* ag.next(v): [this, f, args] at call_argv, tail-able; result is the call's value */
-#define AGEN_SHAPE_ITERNEXT  1   /* OP_iterator_next (yield* delegation): iterator sp[-4], arg sp[-1] -> promise at sp[-1] */
-#define AGEN_SHAPE_ITERCALL  2   /* OP_iterator_call (yield* .return/.throw): same, plus the `false` ret_flag above it */
-#define AGEN_SHAPE_CLOSE     3   /* OP_iterator_close (break out of for-await): iterator sp[-1], promise DISCARDED */
-#define AGEN_FIN_PUSH        0
-#define AGEN_FIN_PUSH_FALSE  1
-#define AGEN_FIN_DISCARD     2
 #define CONT_AGEN_DRIVE   26   /* cont_state = JSAsyncGeneratorData: an async generator's BODY is running on this
                                   chain, driving one queued .next()/.throw()/.return() request. At await / yield /
                                   yield* / return / exception it settles through the ONE state machine
@@ -19445,7 +19437,8 @@ typedef struct JSAgenSettle {
     JSValue prom, hold;            /* the drive's own outcome, deferred across the call (owned) */
     int caller_depth;              /* where the drive's finish restores sp to, as a DEPTH: a park rebuilds the
                                       frame, so a raw pointer would be stale on resume */
-    uint8_t fin, is_tail;
+    void *cont; uint8_t ck;         /* where the finish delivers the promise (the drive's own continuation) */
+    uint8_t is_tail;
 } JSAgenSettle;
 typedef struct JSAsyncSettle {
     JSValue promise;      /* the async function's own promise (owned): the CALL's result is discarded, this is not */
@@ -22145,9 +22138,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        those labels and the frame push that follows it — the frame is what holds the drive while the body runs, so
        a nested `ag.next()` inside the body cannot observe them. */
     int tramp_agen_magic = 0;
-    uint8_t tramp_agen_shape = AGEN_SHAPE_CALL;         /* read+reset by do_agen_drive_tramp */
-    uint8_t tramp_agen_noarg = 0;                       /* ITERCALL: the no-argument delegation form (flags & 2) */
-    uint8_t agen_fin = AGEN_FIN_PUSH;
+    void *agen_cont = NULL; uint8_t agen_ck = CONT_NONE;  /* where the drive's settlement promise is delivered */
     JSAsyncGeneratorData *agen_s = NULL;                /* the machine being driven */
     JSValue agen_prom = JS_UNDEFINED;                   /* its settlement promise: the drive's synchronous result */
     JSValue agen_hold = JS_UNDEFINED;                   /* the generator object, held across the body run */
@@ -28383,12 +28374,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                never asked for: the park slot then holds the generator, its frame, its bytecode and that bytecode's
                realm until something drains the pump, which for a script that never awaits is never. */
             {
-                uint8_t agshape = tramp_agen_shape; tramp_agen_shape = AGEN_SHAPE_CALL;
-                bool agnoarg = (tramp_agen_noarg != 0); tramp_agen_noarg = 0;
-                JSValueConst agthis = (agshape == AGEN_SHAPE_CALL)  ? call_argv[-2]
-                                    : (agshape == AGEN_SHAPE_CLOSE) ? sp[-1] : sp[-4];
-                JSValueConst agarg = (agshape == AGEN_SHAPE_CALL) ? ((call_argc >= 1) ? call_argv[0] : JS_UNDEFINED)
-                                   : (agshape == AGEN_SHAPE_CLOSE || agnoarg) ? JS_UNDEFINED : sp[-1];
+                /* ONE operand shape: the drive is reached only through the call convergence point, so its
+                   receiver and argument are where every other call's are. The three protocol shapes that used to
+                   arrive here with their operands untouched (OP_iterator_next, OP_iterator_call and a for-await
+                   break's OP_iterator_close) push a real call now and take this one. */
+                JSValueConst agthis = call_argv[-2];
+                JSValueConst agarg = (call_argc >= 1) ? call_argv[0] : JS_UNDEFINED;
                 int agpop, agfirst;
                 JSValue *agargv;
                 DCHECK(JS_VALUE_GET_TAG(agthis) == JS_TAG_OBJECT
@@ -28399,27 +28390,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 agen_s = JS_VALUE_GET_OBJ(agthis)->u.async_generator_data;
                 agen_hold = js_dup(agthis);   /* the receiver operand is its only ref and this block frees it */
                 agen_prom = js_async_generator_enqueue(ctx, agen_s, tramp_agen_magic, agarg);
-                agen_fin = (agshape == AGEN_SHAPE_ITERCALL) ? AGEN_FIN_PUSH_FALSE
-                         : (agshape == AGEN_SHAPE_CLOSE)    ? AGEN_FIN_DISCARD : AGEN_FIN_PUSH;
-                if (agshape == AGEN_SHAPE_CALL) {
-                    /* the operands go now, in whatever shape the call was written in — the promise is this call's
-                       result no matter what the body does, so nothing below needs them. */
-                    TAKE_CALL_SHAPE(); agpop = call_pop; agfirst = call_first_r;
-                    agargv = sp - agpop;
-                    if (call_args_owned) {
-                        free_arg_list(ctx, call_args_owned, call_args_owned_n);
-                        call_args_owned = NULL; call_args_owned_n = 0;
-                    }
-                    for (i = agfirst; i < agpop; i++) JS_FreeValue(ctx, agargv[i]);
-                    sp += agfirst - agpop;
-                    agen_tail = tramp_is_tail;
-                } else {
-                    /* the iterator-protocol shapes all consume exactly one slot: the resume argument
-                       (ITERNEXT/ITERCALL) or the iterator itself (CLOSE). What replaces it is agen_fin's job. */
-                    JS_FreeValue(ctx, sp[-1]);
-                    sp--;
-                    agen_tail = 0;
+                agen_cont = tramp_cont_state; agen_ck = tramp_cont_kind;
+                tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;
+                /* the operands go now, in whatever shape the call was written in — the promise is this call's
+                   result no matter what the body does, so nothing below needs them. */
+                TAKE_CALL_SHAPE(); agpop = call_pop; agfirst = call_first_r;
+                agargv = sp - agpop;
+                if (call_args_owned) {
+                    free_arg_list(ctx, call_args_owned, call_args_owned_n);
+                    call_args_owned = NULL; call_args_owned_n = 0;
                 }
+                for (i = agfirst; i < agpop; i++) JS_FreeValue(ctx, agargv[i]);
+                sp += agfirst - agpop;
+                agen_tail = tramp_is_tail;
+                DCHECK(agen_ck == CONT_NONE || !agen_tail,
+                       "an async-generator drive is both a tail call and a continuation's callee");
                 agen_caller_sp = sp;
                 if (unlikely(JS_IsException(agen_prom))) { JS_FreeValue(ctx, agen_hold); goto exception; }
                 /* AsyncGeneratorEnqueue on a RUNNING body only queues: the body is already on some chain (this one,
@@ -28449,7 +28434,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 dtf3->call_first = -1; dtf3->call_argc = 0; dtf3->is_tail = agen_tail;
                 dtf3->async_data = NULL; dtf3->gen_data = NULL; dtf3->gen_magic = 0; dtf3->gen_tailcall = 0;
                 dtf3->forof_off = 0;
-                dtf3->async_promise = agen_prom; dtf3->agen_hold = agen_hold; dtf3->agen_fin = agen_fin;
+                dtf3->async_promise = agen_prom; dtf3->agen_hold = agen_hold;
+                dtf3->agen_cont = agen_cont; dtf3->agen_ck = agen_ck;
                 dtf3->close_saved_exc = JS_UNINITIALIZED;
                 dtf3->cont_state = agen_s; dtf3->cont_kind = CONT_AGEN_DRIVE;
                 dtf3->b = NULL; dtf3->local_buf = NULL;   /* the body frame owns its buffers via agen_s->func_state */
@@ -28479,14 +28465,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                settled — either is correct, the caller only ever sees the promise). */
             sp = agen_caller_sp;
             JS_FreeValue(ctx, agen_hold); agen_hold = JS_UNDEFINED;
-            if (agen_fin == AGEN_FIN_DISCARD) {   /* OP_iterator_close: the promise is never awaited */
-                JS_FreeValue(ctx, agen_prom); agen_prom = JS_UNDEFINED;
-                BREAK;
+            {
+                JSValue apr = agen_prom; agen_prom = JS_UNDEFINED;
+                void *acont = agen_cont; uint8_t ack = agen_ck;
+                agen_cont = NULL; agen_ck = CONT_NONE;
+                if (ack == CONT_NONE) {
+                    if (agen_tail) { ret_val = apr; goto do_return; }
+                    *sp++ = apr;
+                    BREAK;
+                }
+                /* the operands are already gone, so the shape handed to a delivery that drops one is empty. */
+                call_first_r = 0; call_pop = 0;
+                if (ack == CONT_ITER_NEXT_OP) { js_iternext_deliver(ctx, sp, apr); BREAK; }
+                if (ack == CONT_ITER_CALL) { js_itercall_deliver(ctx, sp, apr); sp += 1; BREAK; }
+                if (ack == CONT_ITER_CLOSE_CALL) { cont_st = acont; ret_val = apr; goto do_iter_close_deliver; }
+                DFAIL("an async-generator drive carried a continuation kind this delivery does not route");
+                goto exception;
             }
-            if (agen_tail) { ret_val = agen_prom; agen_prom = JS_UNDEFINED; goto do_return; }
-            *sp++ = agen_prom; agen_prom = JS_UNDEFINED;
-            if (agen_fin == AGEN_FIN_PUSH_FALSE) *sp++ = JS_FALSE;   /* OP_iterator_call's ret_flag: a method ran */
-            BREAK;
 
         do_agen_drive_settle:
             /* the body reached await / yield / yield* / return / an uncaught throw (ret_val says which). Pop back
@@ -28498,7 +28493,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 agen_s = (JSAsyncGeneratorData *)dtf3->cont_state;
                 agen_prom = dtf3->async_promise;
                 agen_hold = dtf3->agen_hold;
-                agen_fin = dtf3->agen_fin;
+                agen_cont = dtf3->agen_cont; agen_ck = dtf3->agen_ck;
                 agen_tail = dtf3->is_tail;
                 agen_caller_sp = dtf3->caller_sp;
                 sf->cur_pc = pc; sf->cur_sp = sp;   /* the body-frame state js_async_generator_post reads */
@@ -28529,7 +28524,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         ags->post = apost; ags->s = agen_s;
                         ags->prom = agen_prom; agen_prom = JS_UNDEFINED;
                         ags->hold = agen_hold; agen_hold = JS_UNDEFINED;
-                        ags->fin = agen_fin; ags->is_tail = agen_tail;
+                        ags->cont = agen_cont; ags->ck = agen_ck; ags->is_tail = agen_tail;
                         ags->caller_depth = (int)(agen_caller_sp - stack_buf);
                         DCHECK(sp + 3 <= TRAMP_SP_LIMIT(sf),
                                "async generator await: operand push exceeds the frame's compiled stack_size");
@@ -28556,7 +28551,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JS_FreeValue(ctx, ret_val);
                 fr = js_async_generator_await_finish(ctx, &ags->post, ags->s);
                 agen_prom = ags->prom; agen_hold = ags->hold;
-                agen_fin = ags->fin; agen_tail = ags->is_tail;
+                agen_cont = ags->cont; agen_ck = ags->ck; agen_tail = ags->is_tail;
                 agen_caller_sp = stack_buf + ags->caller_depth;
                 js_free_rt(rt, ags);
                 if (unlikely(fr < 0)) {
@@ -30271,12 +30266,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (ip->class_id == JS_CLASS_GENERATOR && ip->u.generator_data) {
                         tramp_gen_magic = GEN_MAGIC_RETURN; tramp_gen_close = 1; goto do_generator_tramp;
                     }
-                    if (ip->class_id == JS_CLASS_ASYNC_GENERATOR && ip->u.async_generator_data) {
-                        /* the ASYNC generator's .return(): its `finally` runs on THIS chain. The promise the
-                           request settles with is never awaited on this path, so the drive discards it. */
-                        tramp_agen_magic = GEN_MAGIC_RETURN; tramp_agen_shape = AGEN_SHAPE_CLOSE;
-                        goto do_agen_drive_tramp;
-                    }
                     /* `for await (x of syncGen)` early-close: the wrapper's .return() would drive the sync generator
                        off-tramp (js_async_from_sync_iterator_next -> JS_IteratorNext2 -> js_generator_next). Route it
                        through the async-from-sync tramp in CLOSE mode: syncGen.return() runs its finally on the tramp,
@@ -30538,14 +30527,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (tramp_gen_method_magic(sp[-3], sp[-4]) == GEN_MAGIC_NEXT) {
                     tramp_gen_magic = GEN_MAGIC_NEXT; tramp_gen_iternext = 1; goto do_generator_tramp;
                 }
-                {   /* the same delegation over an ASYNC generator (`yield* ag()`): its body runs on THIS chain and
-                       the .next() promise takes the resume-argument slot, which the following OP_await consumes. */
-                    int agmag = tramp_agen_method_magic(sp[-3], sp[-4]);
-                    if (agmag >= 0) {
-                        tramp_agen_magic = agmag; tramp_agen_shape = AGEN_SHAPE_ITERNEXT;
-                        goto do_agen_drive_tramp;
-                    }
-                }
                 /* `for await (x of syncGen)` and `yield* asyncFromSync`: the iterator is the async-from-sync
                    WRAPPER, whose .next() drives the sync iterator from C
                    (js_async_from_sync_iterator_next -> JS_IteratorNext2 -> js_generator_next). OP_call_method
@@ -30632,17 +30613,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp[0] = js_bool(true);
                     sp += 1;
                     BREAK;
-                }
-                {   /* delegating .return()/.throw() onto an ASYNC generator: drive its body (its `finally`, or
-                       the catch its .throw() lands in) on THIS chain. The method is resolved by lookup here, so
-                       the question is asked on the RESOLVED method — a page that patched it gets its own. */
-                    int agmag = tramp_agen_method_magic(method, sp[-4]);
-                    if (agmag >= 0) {
-                        JS_FreeValue(ctx, method);
-                        tramp_agen_magic = agmag; tramp_agen_shape = AGEN_SHAPE_ITERCALL;
-                        tramp_agen_noarg = noarg;
-                        goto do_agen_drive_tramp;
-                    }
                 }
                 /* 7.4.x's Call, for ANY callable method. JS_CallFree ran it from C, so a bound, proxied, step-machine
                    or merely loop-containing `return` had no flow base — the abort a `break` out of a for-of over a
