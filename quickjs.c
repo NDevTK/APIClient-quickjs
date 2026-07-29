@@ -65922,9 +65922,20 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
                                       int *pdone, int magic)
 {
     /* The DRIVE runs on the tramp (do_iter_helper_tramp), recognized at the call site — the recognition declines
-       (and this C entry runs) only for the TRIVIAL non-drive cases: a DONE helper (.next() -> {undefined,true}) and
-       .return()/.throw() (close). Those iterate nothing, so no drive-to-completion. Any OTHER reason to be here is a
-       source/kind whose tramp drive is not built — DFAIL, never a legacy C-loop fallback. */
+       (and this C entry runs) for a DONE helper (.next() -> {undefined,true}), which reaches no page code, and
+       for .return().
+       .return() IS PAGE CODE and this line used to claim otherwise ("those iterate nothing, so no
+       drive-to-completion"). 7.4.9 IteratorClose is GetMethod(iterator, "return") and then the CALL of what that
+       produced, and JS_IteratorClose below performs both from C, so
+           var src = { next: () => ({value:1,done:false}),
+                       return: () => { for (var i=0;i<200;i++); return {done:true}; } };
+           Iterator.prototype.take.call(src, 5).return(7);
+       aborts with no flow base. A step machine for this method fixes it and makes OP_iterator_close's
+       generator-source special-case dead, but only once the SAME close inside do_iter_helper_step
+       (JS_IteratorClose behind a `== GEN_MAGIC_NEXT` selector) drives any target kind through the convergence
+       point rather than only a generator — see engine/check_recognizers.mjs, which names that capability.
+       Any OTHER reason to be here is a source/kind whose tramp drive is not built — DFAIL, never a legacy
+       C-loop fallback. */
     JSIteratorHelperData *it = JS_GetOpaque2(ctx, this_val, JS_CLASS_ITERATOR_HELPER);
     *pdone = false;
     if (!it) return JS_EXCEPTION;
