@@ -19047,6 +19047,13 @@ typedef struct JSOpKeyed {
                                   to is parked across them, exactly as a handler's trap READ parks it. It is the
                                   same nesting CONT_TRAP_GET already is: a keyed request whose outer is not a
                                   machine but another keyed OPERATION, carrying what waits on that one. */
+#define CONT_TOPRIM_GET    62  /* gp_outer = JSToPrim: 7.1.1 step 2.a's GetMethod(input, @@toPrimitive) and
+                                  7.1.1.1 step 2's Get(O, "toString"/"valueOf"). All three are [[Get]]s on the
+                                  object being coerced, so an accessor or a Proxy `get` trap is the page's code —
+                                  and the sequence read them with JS_GetProperty from C, behind a comment
+                                  claiming a coercion method "is a data property in every real case". Measured
+                                  false: `String(new Proxy({}, {get(t,k){ if (k === Symbol.toPrimitive) for(;;){} }}))`
+                                  aborted with no flow base, and EVERY coercion in the engine reaches this. */
 #define CONT_SET_RECV      61  /* gp_outer = JSSetRecv: 10.1.9.2 OrdinarySetWithOwnDescriptor step 3, the part of
                                   a [[Set]] that runs on the RECEIVER once the walk over O found nothing to
                                   answer with. Two internal methods on an object the walk never touched, so when
@@ -19524,6 +19531,9 @@ typedef struct JSToPrim {
     uint8_t hint;             /* HINT_STRING / HINT_NUMBER (the ordinary-method order) */
     uint8_t hint_none;        /* 1 = the caller's hint was HINT_NONE: @@toPrimitive gets "default" */
     uint8_t stage;            /* 0 = @@toPrimitive, 1 = its result pending, 2/3 = the ordinary methods */
+    uint8_t reading;          /* 1 = a METHOD READ is in flight, so the next delivery is a method and not a
+                                 method's RESULT. The stage alone cannot say: stage 1 means both "the
+                                 @@toPrimitive read is out" and "its call is out". */
     JSValue cb[3];            /* [this, method, hint?] — the coercion call's operands, OWNED here. They used to be
                                  pushed onto the CALLER's stack, guarded by a DCHECK against its compiled
                                  stack_size — a frame that merely wrote `a + b` has no obligation to have three
@@ -19997,6 +20007,7 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_TRAP_GET:
     case CONT_GOPD_DESC:
     case CONT_SET_RECV:
+    case CONT_TOPRIM_GET:
     case CONT_OP_KEYED:
     case CONT_FOR_IN_HAS:
     case CONT_OWNKEYS_CHK:
@@ -26152,6 +26163,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValue method;
                 JSAtom mname;
                 js_toprim_free_cb(ctx, tp);   /* the call that produced ret_val is finished with its operands */
+                DCHECK(!tp->reading, "a ToPrimitive method RESULT was delivered while a method read was in flight");
                 if (JS_VALUE_GET_TAG(ret_val) != JS_TAG_UNINITIALIZED) {
                     if (tp->stage == 1 && !JS_IsUninitialized(ret_val)) {
                         /* @@toPrimitive's result: 7.1.1 step 2.d — it MUST be primitive, there is no fallback.
@@ -26172,27 +26184,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JS_FreeValue(ctx, ret_val);   /* an object result: fall through to the next method */
                     ret_val = JS_UNINITIALIZED;
                 }
+            toprim_walk:
+                /* every method READ is a request: 7.1.1 step 2.a and 7.1.1.1 step 2 are [[Get]]s on the object
+                   being coerced, so an accessor or a Proxy `get` trap runs the page's code and must run on this
+                   chain. `tp` is re-derived at the label because a goto into this block skips the declaration's
+                   initialiser. */
+                tp = (JSToPrim *)cont_st;
                 for (;;) {
                     if (tp->stage == 0) {
                         tp->stage = 1;
-                        method = JS_GetProperty(ctx, tp->obj, JS_ATOM_Symbol_toPrimitive);
-                        if (JS_IsException(method)) goto toprim_throw;
-                        /* test262 uses null as a non-callable converter, which the spec's "not undefined" wording
-                           does not cover — quickjs has always treated both as absent here. */
-                        if (!JS_IsUndefined(method) && !JS_IsNull(method)) {
-                            JSValue harg = JS_AtomToString(ctx, tp->hint_none ? JS_ATOM_default
-                                                           : (tp->hint == HINT_STRING ? JS_ATOM_string : JS_ATOM_number));
-                            if (JS_IsException(harg)) { JS_FreeValue(ctx, method); goto toprim_throw; }
-                            tp->cb[0] = js_dup(tp->obj);   /* this */
-                            tp->cb[1] = method;            /* the method (owned, transferred) */
-                            tp->cb[2] = harg;              /* the hint string */
-                            call_argv = (JSValueConst *)&tp->cb[2]; call_argc = 1;
-                            tramp_first = -2; tramp_is_tail = 0;
-                            goto toprim_dispatch;
-                        }
-                        JS_FreeValue(ctx, method);
-                        tp->stage = 2;   /* no @@toPrimitive: OrdinaryToPrimitive from the first method */
-                        continue;
+                        tp->reading = 1;
+                        gp_obj = tp->obj; gp_atom = JS_ATOM_Symbol_toPrimitive;
+                        gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                        gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
+                        gp_outer = tp; gp_outer_kind = CONT_TOPRIM_GET;
+                        goto do_getprop_tramp;
                     }
                     if (tp->stage >= 4) {   /* both ordinary methods returned objects */
                         JS_ThrowTypeError(ctx, "cannot convert to primitive");
@@ -26202,15 +26208,45 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        first, HINT_NUMBER valueOf first — the (i ^ hint) rule, spelled out. */
                     mname = ((tp->stage - 2) ^ tp->hint) == 0 ? JS_ATOM_toString : JS_ATOM_valueOf;
                     tp->stage++;
-                    method = JS_GetProperty(ctx, tp->obj, mname);
-                    if (JS_IsException(method)) goto toprim_throw;
-                    if (!JS_IsFunction(ctx, method)) { JS_FreeValue(ctx, method); continue; }
-                    tp->cb[0] = js_dup(tp->obj);
-                    tp->cb[1] = method;
-                    call_argv = (JSValueConst *)&tp->cb[2]; call_argc = 0;
-                    tramp_first = -2; tramp_is_tail = 0;
-                    goto toprim_dispatch;
+                    tp->reading = 1;
+                    gp_obj = tp->obj; gp_atom = mname;
+                    gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                    gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
+                    gp_outer = tp; gp_outer_kind = CONT_TOPRIM_GET;
+                    goto do_getprop_tramp;
                 }
+            do_toprim_have_method:
+                /* ret_val = the method the read produced. Which read it answers is the STAGE, already advanced
+                   past the one that asked. */
+                tp = (JSToPrim *)cont_st;
+                DCHECK(tp->reading, "a ToPrimitive method arrived with no read in flight");
+                tp->reading = 0;
+                method = ret_val;
+                ret_val = JS_UNINITIALIZED;
+                if (tp->stage == 1) {
+                    /* test262 uses null as a non-callable converter, which the spec's "not undefined" wording
+                       does not cover — quickjs has always treated both as absent here. */
+                    if (!JS_IsUndefined(method) && !JS_IsNull(method)) {
+                        JSValue harg = JS_AtomToString(ctx, tp->hint_none ? JS_ATOM_default
+                                                       : (tp->hint == HINT_STRING ? JS_ATOM_string : JS_ATOM_number));
+                        if (JS_IsException(harg)) { JS_FreeValue(ctx, method); goto toprim_throw; }
+                        tp->cb[0] = js_dup(tp->obj);   /* this */
+                        tp->cb[1] = method;            /* the method (owned, transferred) */
+                        tp->cb[2] = harg;              /* the hint string */
+                        call_argv = (JSValueConst *)&tp->cb[2]; call_argc = 1;
+                        tramp_first = -2; tramp_is_tail = 0;
+                        goto toprim_dispatch;
+                    }
+                    JS_FreeValue(ctx, method);
+                    tp->stage = 2;   /* no @@toPrimitive: OrdinaryToPrimitive from the first method */
+                    goto toprim_walk;
+                }
+                if (!JS_IsFunction(ctx, method)) { JS_FreeValue(ctx, method); goto toprim_walk; }
+                tp->cb[0] = js_dup(tp->obj);
+                tp->cb[1] = method;
+                call_argv = (JSValueConst *)&tp->cb[2]; call_argc = 0;
+                tramp_first = -2; tramp_is_tail = 0;
+                goto toprim_dispatch;
             toprim_dispatch:
                 cd_outer = tp; cd_outer_kind = CONT_TOPRIM;
                 goto do_cont_dispatch;
@@ -27260,6 +27296,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                           cont_st = gouter0;
                           goto do_set_recv_step;
                       }
+                      if (gk == CONT_TOPRIM_GET) {
+                          /* a coercion method read that invoked nothing — a data property, which is the
+                             ordinary case and used to be the ONLY one this handled. */
+                          cont_st = gouter0;
+                          goto do_toprim_have_method;
+                      }
                       if (gk == CONT_TRAP_GET) {
                           /* a handler TRAP READ that invoked nothing — a data property on the handler, which is
                              every ordinary proxy. Restore the operation waiting on it and re-enter with the
@@ -27467,6 +27509,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         gp_outer = gd->outer; gp_outer_kind = gd->outer_kind;
                         js_gopd_desc_free(ctx, gd);
                         goto getprop_throw;
+                    }
+                    if (gk3 == CONT_TOPRIM_GET) {
+                        /* a coercion method read threw in place (a revoked proxy, a poisoned C accessor). The
+                           coercion can never finish, and it abandons whatever asked for the primitive. */
+                        js_toprim_abandon(ctx, (JSToPrim *)gouter);
+                        goto exception;
                     }
                     if (gk3 == CONT_SET_RECV) {
                         /* one of the receiver completion's two internal methods threw in place. The [[Set]] it
@@ -30444,7 +30492,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            || gouter_kind == CONT_FOROF_UNPACK || gouter_kind == CONT_FOR_IN_HAS
                            || gouter_kind == CONT_OWNKEYS_CHK || gouter_kind == CONT_PROXY_INV
                            || gouter_kind == CONT_KEYED_INV || gouter_kind == CONT_WITH_HAS
-                           || gouter_kind == CONT_SET_RECV,
+                           || gouter_kind == CONT_SET_RECV || gouter_kind == CONT_TOPRIM_GET,
                            "property-get outer continuation: unknown machine kind");
                     if (gouter_kind == CONT_PROMISE_ALL_THEN) {
                         js_getprop_free(ctx, gp);
@@ -30853,6 +30901,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             goto getprop_throw;
                         }
                         goto do_ownkeys_chk_step;
+                    }
+                    if (gouter_kind == CONT_TOPRIM_GET) {
+                        /* a coercion method's ACCESSOR (or a Proxy `get` trap) ran on this chain and suspended.
+                           The invariant on a proxied read has already been applied by the operation itself. */
+                        cont_st = gouter;
+                        if (unlikely(JS_IsException(ret_val))) {
+                            js_toprim_abandon(ctx, (JSToPrim *)gouter);
+                            goto exception;
+                        }
+                        goto do_toprim_have_method;
                     }
                     if (gouter_kind == CONT_SET_RECV) {
                         /* one of the receiver completion's own requests — 3.b's [[GetOwnProperty]] or 3.e/3.f's
@@ -35194,7 +35252,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             DCHECK(!gouter || gk2 == CONT_STEP || gk2 == CONT_ITER_CONSUME || gk2 == CONT_ACQUIRE_GET
                    || gk2 == CONT_ITER_CLOSE || gk2 == CONT_TRAP_GET || gk2 == CONT_GOPD_DESC
                    || gk2 == CONT_OWNKEYS_CHK || gk2 == CONT_PROXY_INV || gk2 == CONT_KEYED_INV
-                   || gk2 == CONT_WITH_HAS || gk2 == CONT_SET_RECV
+                   || gk2 == CONT_WITH_HAS || gk2 == CONT_SET_RECV || gk2 == CONT_TOPRIM_GET
                    || gk2 == CONT_OP_KEYED
                    || gk2 == CONT_PROMISE_ALL_THEN || gk2 == CONT_AFS_GET
                    || gk2 == CONT_ITER_HELPER_GET || gk2 == CONT_PROMISE_ALL_GET
@@ -35269,6 +35327,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 goto getprop_throw;
             } else if (gouter && gk2 == CONT_WITH_HAS) {
                 js_with_has_free(ctx, gouter);
+                goto exception;
+            } else if (gouter && gk2 == CONT_TOPRIM_GET) {
+                /* the same for a coercion method read whose accessor threw after suspending. `gp` is already
+                   released above this chain — every other arm relies on that too. */
+                js_toprim_abandon(ctx, (JSToPrim *)gouter);
                 goto exception;
             } else if (gouter && gk2 == CONT_SET_RECV) {
                 /* the same for the receiver completion, whose two internal methods suspend for the same
