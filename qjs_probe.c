@@ -1495,7 +1495,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_OBJ_VALUES, STEPDEF_OBJ_ENTRIES, STEPDEF_OBJ_ASSIGN, STEPDEF_OBJ_SPREAD,
     STEPDEF_ARRAY_FLAT, STEPDEF_ARRAY_FLATMAP, STEPDEF_ARRAY_FROMLIKE, STEPDEF_ARRAY_WITH, STEPDEF_ARRAY_FILL, STEPDEF_ARRAY_COPYWITHIN, STEPDEF_BIGINT_CTOR, STEPDEF_TA_WITH, STEPDEF_TA_FILL, STEPDEF_TA_COPYWITHIN, STEPDEF_TA_INDEXOF, STEPDEF_TA_LASTINDEXOF, STEPDEF_TA_INCLUDES, STEPDEF_TA_SUBARRAY, STEPDEF_AB_SLICE, STEPDEF_AB_SLICE_IMM, STEPDEF_SAB_SLICE, STEPDEF_AB_CTOR, STEPDEF_SAB_CTOR, STEPDEF_AB_RESIZE, STEPDEF_SAB_GROW, STEPDEF_AB_TRANSFER, STEPDEF_AB_TRANSFER_IMM, STEPDEF_AB_TRANSFER_FIX, STEPDEF_DATAVIEW_CTOR, STEPDEF_DATE_TOJSON, STEPDEF_DATE_TOPRIM, STEPDEF_DATE_CTOR,
     STEPDEF_MATH_ABS, STEPDEF_MATH_FLOOR, STEPDEF_MATH_CEIL, STEPDEF_MATH_ROUND, STEPDEF_MATH_SQRT, STEPDEF_MATH_ACOS, STEPDEF_MATH_ASIN, STEPDEF_MATH_ATAN, STEPDEF_MATH_COS, STEPDEF_MATH_EXP, STEPDEF_MATH_LOG, STEPDEF_MATH_SIN, STEPDEF_MATH_TAN, STEPDEF_MATH_TRUNC, STEPDEF_MATH_SIGN, STEPDEF_MATH_COSH, STEPDEF_MATH_SINH, STEPDEF_MATH_TANH, STEPDEF_MATH_ACOSH, STEPDEF_MATH_ASINH, STEPDEF_MATH_ATANH, STEPDEF_MATH_EXPM1, STEPDEF_MATH_LOG1P, STEPDEF_MATH_LOG2, STEPDEF_MATH_LOG10, STEPDEF_MATH_CBRT, STEPDEF_MATH_F16ROUND, STEPDEF_MATH_FROUND, STEPDEF_MATH_ATAN2, STEPDEF_MATH_POW, STEPDEF_MATH_MIN, STEPDEF_MATH_MAX, STEPDEF_MATH_HYPOT, STEPDEF_MATH_IMUL, STEPDEF_MATH_CLZ32, STEPDEF_STR_FROMCHARCODE, STEPDEF_STR_FROMCODEPOINT, STEPDEF_DATE_UTC,
-    STEPDEF_REGEXP_EXEC, STEPDEF_REGEXP_TEST, STEPDEF_REGEXP_FLAGS, STEPDEF_REGEXP_TOSTRING,
+    STEPDEF_REGEXP_EXEC, STEPDEF_REGEXP_TEST,
     STEPDEF_ITER_TAKE, STEPDEF_ITER_DROP, STEPDEF_ITER_WRAP_RETURN,
     STEPDEF_ITER_CONCAT_NEXT, STEPDEF_ITER_CONCAT_RETURN, STEPDEF_ARRAY_ITER_NEXT,
     STEPDEF_OWNKEYS_NAMES, STEPDEF_OWNKEYS_SYMBOLS, STEPDEF_REFLECT_OWNKEYS, STEPDEF_PROP_IS_ENUM, STEPDEF_PROTO_GET, STEPDEF_PROTO_SET, STEPDEF_PROTO_CHAIN,
@@ -23780,7 +23780,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     if (unlikely(g_flow_base_gen != NULL)) {
         /* A BYTECODE BODY ENTERED BY C RECURSION while a flow exists. It cannot suspend: the scheduler has no way
            to park it, so it runs to completion. See g_sync_drive_to_completion. */
-        FLOW_PREEMPT_COUNT(g_sync_drive_to_completion);
+        DFAIL("SYNCDRIVE");
     }
 
     if (unlikely(argc < b->arg_count || (flags & JS_CALL_FLAG_COPY_ARGV))) {
@@ -60413,34 +60413,6 @@ static JSValue js_object_is(JSContext *ctx, JSValueConst this_val,
    JS_GetPrototype / JS_SetPrototypeInternal ran them from C, so `proxy.__proto__` aborted at a looping trap's
    back-edge. ONE machine for both, `arg` naming which internal method, because the two differ only in that and in
    the operand. */
-/* 22.2.6.4 `get RegExp.prototype.flags` performs a Get for each of the eight flag names, in a fixed order, on
-   the receiver — and on a subclass or a Proxy every one of those is the page's code. js_regexp_get_flags did all
-   eight with JS_GetPropertyStr from C, so `class R extends RegExp { get global() { for(;;){} } }` and
-   `new Proxy(re, {get(){for(;;){}}})` preempted in an activation with no flow base. One stage per Get.
-   The getter half of an accessor can be a step machine — __proto__'s already is — but the accessor TABLE can
-   name only one step id, so this pair is built where the intrinsic is, exactly as that one is. */
-typedef struct JSRegExpFlags {
-    JSStepHdr hdr;        /* MUST be first: the generic step driver casts the state to JSStepHdr * */
-    JSValue result;       /* DONE (owned) */
-    char buf[8];          /* the flags collected so far, in spec order */
-    int n;
-} JSRegExpFlags;
-static const char * const js_regexp_flag_names[8] = {
-    "hasIndices", "global", "ignoreCase", "multiline", "dotAll", "unicode", "unicodeSets", "sticky",
-};
-static const char js_regexp_flag_chars[8] = { 'd', 'g', 'i', 'm', 's', 'u', 'v', 'y' };
-
-/* 22.2.6.13 RegExp.prototype.toString: `? ToString(? Get(R, "source"))` then the same for "flags". Both Gets
-   are accessors — the page's code on a subclass or a Proxy, and `flags` is now itself a step machine — and both
-   ToStrings can be a user `toString`. js_regexp_toString did all four from C, which is what the step getter's
-   backstop DFAIL named the moment `flags` stopped being a plain C body. */
-typedef struct JSRegExpToString {
-    JSStepHdr hdr;        /* MUST be first: the generic step driver casts the state to JSStepHdr * */
-    JSValue result;       /* DONE (owned) */
-    JSValue pattern;      /* Get(R,"source") and then its ToString (owned) */
-    JSValue flags;        /* Get(R,"flags") and then its ToString (owned) */
-} JSRegExpToString;
-
 typedef struct JSProtoAccessor {
     JSStepHdr hdr;
     JSValue result;   /* DONE (owned) */
@@ -65033,10 +65005,6 @@ static int js_ta_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
 static JSValue js_ta_slice_fini(JSContext *ctx, void *st, bool take_result);
 static int js_array_at_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_array_with_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
-static int js_regexp_flags_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
-static int js_regexp_tostring_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
-static JSValue js_regexp_tostring_fini(JSContext *ctx, void *st, bool take_result);
-static JSValue js_regexp_flags_fini(JSContext *ctx, void *st, bool take_result);
 static int js_array_fill_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_ta_with_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_ta_coerce_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
@@ -65691,8 +65659,6 @@ static const JSTrampStepDef js_ta_at_def          = { sizeof(JSTAIdx), js_ta_idx
 static const JSTrampStepDef js_ta_set_def         = { sizeof(JSTAIdx), js_ta_idx_step, js_ta_idx_fini, TAIDX_SET };
 static const JSTrampStepDef js_json_raw_def       = { sizeof(JSJsonRaw), js_json_raw_step, js_json_raw_fini, 0 };
 static const JSTrampStepDef js_proto_chain_def    = { sizeof(JSProtoChain), js_proto_chain_step, js_proto_chain_fini, 0 };
-static const JSTrampStepDef js_regexp_tostring_def = { sizeof(JSRegExpToString), js_regexp_tostring_step, js_regexp_tostring_fini, 0 };
-static const JSTrampStepDef js_regexp_flags_def   = { sizeof(JSRegExpFlags), js_regexp_flags_step, js_regexp_flags_fini, 0 };
 static const JSTrampStepDef js_proto_get_def      = { sizeof(JSProtoAccessor), js_proto_accessor_step, js_proto_accessor_fini, PROTOACC_GET };
 static const JSTrampStepDef js_proto_set_def      = { sizeof(JSProtoAccessor), js_proto_accessor_step, js_proto_accessor_fini, PROTOACC_SET };
 static const JSTrampStepDef js_prop_is_enum_def   = { sizeof(JSHasOwnEnum), js_has_own_enum_step, js_has_own_enum_fini, 0 };
@@ -67401,8 +67367,6 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_OWNKEYS_SYMBOLS] = &js_ownkeys_syms_def,
     [STEPDEF_REFLECT_OWNKEYS] = &js_reflect_ownkeys_def,
     [STEPDEF_PROP_IS_ENUM] = &js_prop_is_enum_def,
-    [STEPDEF_REGEXP_FLAGS] = &js_regexp_flags_def,
-    [STEPDEF_REGEXP_TOSTRING] = &js_regexp_tostring_def,
     [STEPDEF_PROTO_GET]    = &js_proto_get_def,
     [STEPDEF_PROTO_SET]    = &js_proto_set_def,
     [STEPDEF_PROTO_CHAIN]  = &js_proto_chain_def,
@@ -74170,126 +74134,85 @@ static JSValue js_regexp_get_flag(JSContext *ctx, JSValueConst this_val, int mas
     return js_bool(flags & mask);
 }
 
-static int js_regexp_flags_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+static JSValue js_regexp_get_flags(JSContext *ctx, JSValueConst this_val)
 {
-    JSRegExpFlags *s = st;
-    int r;
+    char str[8], *p = str;
+    int res;
 
-    if (s->hdr.stage == 0) {
-        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
-        /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
-        s->result = JS_UNDEFINED;
-        s->n = 0;
-        /* 22.2.6.4 step 2: a non-object receiver is a TypeError before any Get happens. */
-        if (!JS_IsObject(s->hdr.this_val)) {
-            JS_ThrowTypeErrorNotAnObject(ctx);
-            return -1;
-        }
-        s->hdr.stage = 1;
-    }
-    while (s->hdr.stage <= 8) {
-        int i = s->hdr.stage - 1, b;
-        JSValue got = JS_UNDEFINED;
-        JSAtom a = JS_NewAtom(ctx, js_regexp_flag_names[i]);
-        if (unlikely(a == JS_ATOM_NULL)) { JS_FreeValue(ctx, cb_result); return -1; }
-        /* interning the name runs nothing; the GET is the page's code and is the request. */
-        r = step_getprop_run(ctx, &s->hdr, s->hdr.this_val, a, cb_result, &got, out_cb, out_argc);
-        JS_FreeAtom(ctx, a);
-        cb_result = JS_UNDEFINED;
-        if (r) return r < 0 ? -1 : r;
-        b = JS_ToBoolFree(ctx, got);   /* ToBoolean invokes nothing */
-        if (unlikely(b < 0)) return -1;
-        if (b)
-            s->buf[s->n++] = js_regexp_flag_chars[i];
-        s->hdr.stage++;
-    }
-    JS_FreeValue(ctx, cb_result);
-    s->result = s->n ? js_new_string8_len(ctx, s->buf, s->n) : js_empty_string(ctx->rt);
-    if (unlikely(JS_IsException(s->result))) { s->result = JS_UNDEFINED; return -1; }
-    return 0;
+    if (JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT)
+        return JS_ThrowTypeErrorNotAnObject(ctx);
+
+    res = JS_ToBoolFree(ctx, JS_GetPropertyStr(ctx, this_val, "hasIndices"));
+    if (res < 0)
+        goto exception;
+    if (res)
+        *p++ = 'd';
+    res = JS_ToBoolFree(ctx, JS_GetProperty(ctx, this_val, JS_ATOM_global));
+    if (res < 0)
+        goto exception;
+    if (res)
+        *p++ = 'g';
+    res = JS_ToBoolFree(ctx, JS_GetPropertyStr(ctx, this_val, "ignoreCase"));
+    if (res < 0)
+        goto exception;
+    if (res)
+        *p++ = 'i';
+    res = JS_ToBoolFree(ctx, JS_GetPropertyStr(ctx, this_val, "multiline"));
+    if (res < 0)
+        goto exception;
+    if (res)
+        *p++ = 'm';
+    res = JS_ToBoolFree(ctx, JS_GetPropertyStr(ctx, this_val, "dotAll"));
+    if (res < 0)
+        goto exception;
+    if (res)
+        *p++ = 's';
+    res = JS_ToBoolFree(ctx, JS_GetProperty(ctx, this_val, JS_ATOM_unicode));
+    if (res < 0)
+        goto exception;
+    if (res)
+        *p++ = 'u';
+    res = JS_ToBoolFree(ctx, JS_GetPropertyStr(ctx, this_val, "unicodeSets"));
+    if (res < 0)
+        goto exception;
+    if (res)
+        *p++ = 'v';
+    res = JS_ToBoolFree(ctx, JS_GetPropertyStr(ctx, this_val, "sticky"));
+    if (res < 0)
+        goto exception;
+    if (res)
+        *p++ = 'y';
+    if (p == str)
+        return js_empty_string(ctx->rt);
+    return js_new_string8_len(ctx, str, p - str);
+
+exception:
+    return JS_EXCEPTION;
 }
 
-static JSValue js_regexp_flags_fini(JSContext *ctx, void *st, bool take_result)
+static JSValue js_regexp_toString(JSContext *ctx, JSValueConst this_val,
+                                  int argc, JSValueConst *argv)
 {
-    JSRegExpFlags *s = st;
-    JSValue r = take_result ? js_dup(s->result) : JS_UNDEFINED;
-    JS_FreeValue(ctx, s->result);
-    js_free(ctx, s);
-    return r;
-}
+    JSValue pattern, flags;
+    StringBuffer b_s, *b = &b_s;
 
-static int js_regexp_tostring_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
-{
-    JSRegExpToString *s = st;
-    int r;
+    if (!JS_IsObject(this_val))
+        return JS_ThrowTypeErrorNotAnObject(ctx);
 
-    if (s->hdr.stage == 0) {
-        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
-        /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
-        s->result = JS_UNDEFINED;
-        s->pattern = JS_UNDEFINED;
-        s->flags = JS_UNDEFINED;
-        if (!JS_IsObject(s->hdr.this_val)) {   /* step 2 */
-            JS_ThrowTypeErrorNotAnObject(ctx);
-            return -1;
-        }
-        s->hdr.stage = 1;
-    }
-    if (s->hdr.stage == 1) {
-        r = step_getprop_run(ctx, &s->hdr, s->hdr.this_val, JS_ATOM_source, cb_result, &s->pattern,
-                             out_cb, out_argc);
-        cb_result = JS_UNDEFINED;
-        if (r) return r < 0 ? -1 : r;
-        s->hdr.stage = 2;
-    }
-    if (s->hdr.stage == 2) {
-        JSValue str = JS_UNDEFINED;
-        r = step_tostring_run(ctx, &s->hdr, s->pattern, cb_result, &str, out_cb, out_argc);
-        cb_result = JS_UNDEFINED;
-        if (r) return r < 0 ? -1 : r;
-        JS_FreeValue(ctx, s->pattern);
-        s->pattern = str;
-        s->hdr.stage = 3;
-    }
-    if (s->hdr.stage == 3) {
-        r = step_getprop_run(ctx, &s->hdr, s->hdr.this_val, JS_ATOM_flags, cb_result, &s->flags,
-                             out_cb, out_argc);
-        cb_result = JS_UNDEFINED;
-        if (r) return r < 0 ? -1 : r;
-        s->hdr.stage = 4;
-    }
-    if (s->hdr.stage == 4) {
-        JSValue str = JS_UNDEFINED;
-        r = step_tostring_run(ctx, &s->hdr, s->flags, cb_result, &str, out_cb, out_argc);
-        cb_result = JS_UNDEFINED;
-        if (r) return r < 0 ? -1 : r;
-        JS_FreeValue(ctx, s->flags);
-        s->flags = str;
-        s->hdr.stage = 5;
-    }
-    JS_FreeValue(ctx, cb_result);
-    {   /* step 5: assembling the three pieces invokes nothing. */
-        StringBuffer b_s, *b = &b_s;
-        string_buffer_init(ctx, b, 0);
-        string_buffer_putc8(b, '/');
-        if (string_buffer_concat_value(b, s->pattern)) { string_buffer_free(b); return -1; }
-        string_buffer_putc8(b, '/');
-        if (string_buffer_concat_value(b, s->flags)) { string_buffer_free(b); return -1; }
-        s->result = string_buffer_end(b);
-        if (unlikely(JS_IsException(s->result))) { s->result = JS_UNDEFINED; return -1; }
-    }
-    return 0;
-}
+    string_buffer_init(ctx, b, 0);
+    string_buffer_putc8(b, '/');
+    pattern = JS_GetProperty(ctx, this_val, JS_ATOM_source);
+    if (string_buffer_concat_value_free(b, pattern))
+        goto fail;
+    string_buffer_putc8(b, '/');
+    flags = JS_GetProperty(ctx, this_val, JS_ATOM_flags);
+    if (string_buffer_concat_value_free(b, flags))
+        goto fail;
+    return string_buffer_end(b);
 
-static JSValue js_regexp_tostring_fini(JSContext *ctx, void *st, bool take_result)
-{
-    JSRegExpToString *s = st;
-    JSValue r = take_result ? js_dup(s->result) : JS_UNDEFINED;
-    JS_FreeValue(ctx, s->result);
-    JS_FreeValue(ctx, s->pattern);
-    JS_FreeValue(ctx, s->flags);
-    js_free(ctx, s);
-    return r;
+fail:
+    string_buffer_free(b);
+    return JS_EXCEPTION;
 }
 
 bool lre_check_stack_overflow(void *opaque, size_t alloca_size)
@@ -75839,6 +75762,7 @@ static const JSCFunctionListEntry js_regexp_funcs[] = {
 };
 
 static const JSCFunctionListEntry js_regexp_proto_funcs[] = {
+    JS_CGETSET_DEF("flags", js_regexp_get_flags, NULL ),
     JS_CGETSET_DEF("source", js_regexp_get_source, NULL ),
     JS_CGETSET_MAGIC_DEF("global", js_regexp_get_flag, NULL, LRE_FLAG_GLOBAL ),
     JS_CGETSET_MAGIC_DEF("ignoreCase", js_regexp_get_flag, NULL, LRE_FLAG_IGNORECASE ),
@@ -75851,7 +75775,7 @@ static const JSCFunctionListEntry js_regexp_proto_funcs[] = {
     JS_CFUNC_STEP_DEF("exec", 1, STEPDEF_REGEXP_EXEC ),
     JS_CFUNC_DEF("compile", 2, js_regexp_compile ),
     JS_CFUNC_STEP_DEF("test", 1, STEPDEF_REGEXP_TEST ),
-    JS_CFUNC_STEP_DEF("toString", 0, STEPDEF_REGEXP_TOSTRING ),
+    JS_CFUNC_DEF("toString", 0, js_regexp_toString ),
     JS_CFUNC_STEP_DEF("[Symbol.replace]", 2, STEPDEF_RE_REPLACE ),
     JS_CFUNC_STEP_DEF("[Symbol.match]", 1, STEPDEF_RE_MATCH ),
     JS_CFUNC_STEP_DEF("[Symbol.matchAll]", 1, STEPDEF_RE_MATCHALL ),
@@ -75879,16 +75803,6 @@ int JS_AddIntrinsicRegExp(JSContext *ctx)
     if (JS_SetPropertyFunctionList(ctx, proto, js_regexp_proto_funcs,
                                    countof(js_regexp_proto_funcs))) {
         return -1;
-    }
-    {
-        /* 22.2.6.4 `get RegExp.prototype.flags`: eight Gets on the receiver, every one of them the page's code.
-           The accessor TABLE cannot name a step id for the GETTER half (JS_DEF_CGETSET_STEP names one, and it is
-           the setter's), so the accessor is built here — the same reason __proto__'s pair is. */
-        JSValue fget = JS_NewCFunctionMagic(ctx, NULL, "get flags", 0, JS_CFUNC_step, STEPDEF_REGEXP_FLAGS);
-        if (JS_IsException(fget))
-            return -1;
-        if (JS_DefinePropertyGetSet(ctx, proto, JS_ATOM_flags, fget, JS_UNDEFINED, JS_PROP_CONFIGURABLE) < 0)
-            return -1;
     }
     /* Registered as a STEP machine: cproto JS_CFUNC_step_ctor with the definition id in magic, so both
        `RegExp(x)` and `new RegExp(x)` reach do_step_tramp. The function pointer is unused on that cproto.
