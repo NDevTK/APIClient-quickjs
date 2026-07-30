@@ -17541,9 +17541,13 @@ static const JSTrampStepDef *tramp_step_def_by_id(int id);
                                   JS_ToPrimitiveFree calls @@toPrimitive / valueOf / toString with JS_CallFree, from
                                   C — so a user coercion method containing a loop preempts in an activation with no
                                   flow base. The operator site drives the method here instead, writes the primitive
-                                  back into the operand slot, and RE-EXECUTES its opcode: everything before the
-                                  coercion is a tag test, so re-running it is free and the remaining operands are
-                                  coerced in spec order by the same retry. */
+                                  back into the operand slot, and CONTINUES AT THE LABEL its `resume_at` names,
+                                  placed immediately after that coercion. It does NOT re-execute the opcode: a
+                                  replay re-decides from operands the coercion method has had a chance to touch,
+                                  and its correctness rests on an unstated purity property of everything above the
+                                  coercion. Where an operator owes a second coercion (13.15.3's two operands,
+                                  7.2.13's two), the label re-asks only that question, which is a decision about
+                                  the values as they NOW are. */
 #define CONT_STEP          17  /* cont_state = a step builtin's state; ONE continuation kind for ALL of them. */
 #define CONT_IMPORT        18  /* ToPrimitive outer = JSImportCap: the specifier coercion of `import(obj)`. Its
                                   abrupt completion is a REJECTION of the capability created before it, not a
