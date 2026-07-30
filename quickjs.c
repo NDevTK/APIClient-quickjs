@@ -1569,6 +1569,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_DISPOSE_SYNC, STEPDEF_DISPOSE_ASYNC,
     STEPDEF_MAP_FOREACH, STEPDEF_SET_FOREACH,
     STEPDEF_DISPOSABLE_CTOR, STEPDEF_ASYNC_DISPOSABLE_CTOR,
+    STEPDEF_STR_TOLOWER, STEPDEF_STR_TOUPPER,
     STEPDEF_COUNT
 };
 #define HINT_NONE    2
@@ -22628,7 +22629,8 @@ enum { STRRECV_TRIM_START = 1, STRRECV_TRIM_END = 2, STRRECV_TRIM_BOTH = 3,
        STRRECV_INDEXOF, STRRECV_LASTINDEXOF, STRRECV_NORMALIZE,
        STRRECV_CHARAT, STRRECV_CHARCODEAT,
        STRRECV_SLICE, STRRECV_SUBSTR, STRRECV_REPEAT,
-       STRRECV_PADSTART, STRRECV_PADEND, STRRECV_LOCALECOMPARE };
+       STRRECV_PADSTART, STRRECV_PADEND, STRRECV_LOCALECOMPARE,
+       STRRECV_TOLOWER, STRRECV_TOUPPER };
 typedef struct JSErrToString {
     JSStepHdr hdr;        /* MUST be first: the generic step driver casts the state to JSStepHdr * */
     JSValue result;       /* DONE (owned) */
@@ -65201,6 +65203,8 @@ static const JSTrampStepDef js_str_repeat_def     = { sizeof(JSStrRecv), js_str_
 static const JSTrampStepDef js_str_padStart_def   = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_PADSTART };
 static const JSTrampStepDef js_str_padEnd_def     = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_PADEND };
 static const JSTrampStepDef js_str_localeCmp_def  = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_LOCALECOMPARE };
+static const JSTrampStepDef js_str_toLower_def    = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_TOLOWER };
+static const JSTrampStepDef js_str_toUpper_def    = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_TOUPPER };
 static const JSTrampStepDef js_ta_at_def          = { sizeof(JSTAIdx), js_ta_idx_step, js_ta_idx_fini, TAIDX_AT };
 static const JSTrampStepDef js_ta_set_def         = { sizeof(JSTAIdx), js_ta_idx_step, js_ta_idx_fini, TAIDX_SET };
 static const JSTrampStepDef js_json_raw_def       = { sizeof(JSJsonRaw), js_json_raw_step, js_json_raw_fini, 0 };
@@ -66790,6 +66794,8 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_DISPOSE_SYNC] = &js_dispose_sync_def,
     [STEPDEF_MAP_FOREACH] = &js_map_foreach_def,
     [STEPDEF_DISPOSABLE_CTOR] = &js_disposable_ctor_def,
+    [STEPDEF_STR_TOLOWER] = &js_str_toLower_def,
+    [STEPDEF_STR_TOUPPER] = &js_str_toUpper_def,
     [STEPDEF_ASYNC_DISPOSABLE_CTOR] = &js_async_disposable_ctor_def,
     [STEPDEF_SET_FOREACH] = &js_set_foreach_def,
     [STEPDEF_DISPOSE_ASYNC] = &js_dispose_async_def,
@@ -70907,6 +70913,7 @@ static int str_clamp(int64_t v, int len)
 }
 
 static int to_utf32_buf(JSContext *ctx, JSString *p, uint32_t **pbuf);
+static JSValue js_string_case_body(JSContext *ctx, JSValueConst strv, int to_lower);
 
 static int js_str_recv_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
@@ -71147,6 +71154,10 @@ static int js_str_recv_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
         js_free(ctx, as); js_free(ctx, bs);
         s->result = js_int32(cmp);
         return 0;
+    }
+    if (mode == STRRECV_TOLOWER || mode == STRRECV_TOUPPER) {
+        s->result = js_string_case_body(ctx, s->str, mode == STRRECV_TOLOWER);
+        return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
     }
     DCHECK(mode == STRRECV_NORMALIZE, "string receiver machine: unknown mode");
     {
@@ -71436,16 +71447,18 @@ done:
     return ret;
 }
 
-static JSValue js_string_toWellFormed_body(JSContext *ctx, JSValueConst this_val)
+/* Handed the ALREADY-COERCED receiver by js_string_wellformed_step, which performed 22.1.3 step 1-2 as a
+   request. The JS_ToStringCheckObject that stood here was a second coercion of a value that is already a
+   string — harmless today only because it is, and a live C coercion the moment anything hands this an object. */
+static JSValue js_string_toWellFormed_body(JSContext *ctx, JSValueConst strv)
 {
     JSValue str;
     JSValue ret;
     JSString *p;
     uint32_t c, i, n;
 
-    str = JS_ToStringCheckObject(ctx, this_val);
-    if (JS_IsException(str))
-        return JS_EXCEPTION;
+    DCHECK(JS_IsString(strv), "the toWellFormed body takes the receiver its machine already coerced");
+    str = js_dup(strv);
 
     p = JS_VALUE_GET_STRING(str);
     if (!p->is_wide_char || p->len == 0)
@@ -72362,8 +72375,9 @@ static int to_utf32_buf(JSContext *ctx, JSString *p, uint32_t **pbuf)
    base. The comparison itself is STRRECV_LOCALECOMPARE's tail: the same machine that already owns "coerce the
    receiver to a string, coerce one argument, then compute". */
 
-static JSValue js_string_toLowerCase(JSContext *ctx, JSValueConst this_val,
-                                     int argc, JSValueConst *argv, int to_lower)
+/* 22.1.3.28/29 and their locale twins, minus steps 1-2: the receiver is coerced by js_str_recv_step, which
+   performs RequireObjectCoercible + ToString as a request. This body runs no user code at all. */
+static JSValue js_string_case_body(JSContext *ctx, JSValueConst strv, int to_lower)
 {
     JSValue val;
     StringBuffer b_s, *b = &b_s;
@@ -72371,9 +72385,8 @@ static JSValue js_string_toLowerCase(JSContext *ctx, JSValueConst this_val,
     int i, c, j, l;
     uint32_t res[LRE_CC_RES_LEN_MAX];
 
-    val = JS_ToStringCheckObject(ctx, this_val);
-    if (JS_IsException(val))
-        return val;
+    DCHECK(JS_IsString(strv), "the case-conversion body takes the receiver its machine already coerced");
+    val = js_dup(strv);
     p = JS_VALUE_GET_STRING(val);
     if (p->len == 0)
         return val;
@@ -72588,10 +72601,10 @@ static const JSCFunctionListEntry js_string_proto_funcs[] = {
     JS_CFUNC_DEF("valueOf", 0, js_string_toString ),
     JS_CFUNC_STEP_DEF("localeCompare", 1, STEPDEF_STR_LOCALECOMPARE ),
     JS_CFUNC_STEP_DEF("normalize", 0, STEPDEF_STR_NORMALIZE ),
-    JS_CFUNC_MAGIC_DEF("toLowerCase", 0, js_string_toLowerCase, 1 ),
-    JS_CFUNC_MAGIC_DEF("toUpperCase", 0, js_string_toLowerCase, 0 ),
-    JS_CFUNC_MAGIC_DEF("toLocaleLowerCase", 0, js_string_toLowerCase, 1 ),
-    JS_CFUNC_MAGIC_DEF("toLocaleUpperCase", 0, js_string_toLowerCase, 0 ),
+    JS_CFUNC_STEP_DEF("toLowerCase", 0, STEPDEF_STR_TOLOWER ),
+    JS_CFUNC_STEP_DEF("toUpperCase", 0, STEPDEF_STR_TOUPPER ),
+    JS_CFUNC_STEP_DEF("toLocaleLowerCase", 0, STEPDEF_STR_TOLOWER ),
+    JS_CFUNC_STEP_DEF("toLocaleUpperCase", 0, STEPDEF_STR_TOUPPER ),
     JS_CFUNC_STEP_DEF("[Symbol.iterator]", 0, STEPDEF_STR_ITERATOR ),
     /* ES6 Annex B 2.3.2 etc. */
     JS_CFUNC_MAGIC_DEF("anchor", 1, js_string_CreateHTML, magic_string_anchor ),
