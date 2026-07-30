@@ -19628,6 +19628,7 @@ static int js_str_replace_step(JSContext *ctx, JSStrReplace *s, JSValue cb_resul
                                JSValue **out_cb, int *out_argc);
 static JSValue js_promise_constructor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv);
 static JSValue js_promise_new(JSContext *ctx, JSValueConst new_target, JSValue *resolving_funcs);
+static JSValue js_promise_init_from_obj(JSContext *ctx, JSValue obj, JSValue *resolving_funcs);
 /* WrapForValidIterator's [[Iterated]] record — defined HERE (not at its finalizer) because the interpreter builds
    one: Iterator.from's wrapper is created by the CONT_ITER_FROM deliver, on the tramp. */
 typedef struct JSIteratorWrapData {
@@ -80588,16 +80589,15 @@ static void js_promise_mark(JSRuntime *rt, JSValueConst val,
 
 /* Create a new promise object with resolving functions. Returns the promise
    and sets resolving_funcs[0] (resolve) and resolving_funcs[1] (reject). */
-static JSValue js_promise_new(JSContext *ctx, JSValueConst new_target,
-                               JSValue *resolving_funcs)
+/* 27.2.3.1 steps 4-8 with the object ALREADY created: the [[PromiseState]] slots and CreateResolvingFunctions,
+   none of which is the page's code. Split out because step 3's `prototype` read IS the page's code and belongs to
+   whoever can suspend in it — the interpreter, through CONT_CTOR_PROTO, which is where the construct dispatch's
+   promise arm is being moved. Consumes `obj`. */
+static JSValue js_promise_init_from_obj(JSContext *ctx, JSValue obj, JSValue *resolving_funcs)
 {
-    JSValue obj;
     JSPromiseData *s;
     JSRuntime *rt;
 
-    obj = js_create_from_ctor(ctx, new_target, JS_CLASS_PROMISE);
-    if (JS_IsException(obj))
-        return JS_EXCEPTION;
     s = js_mallocz(ctx, sizeof(*s));
     if (!s) {
         JS_FreeValue(ctx, obj);
@@ -80622,6 +80622,19 @@ static JSValue js_promise_new(JSContext *ctx, JSValueConst new_target,
                          rt->promise_hook_opaque);
     }
     return obj;
+}
+
+/* The entry that still performs step 3 itself. Two of its three callers pass new_target = undefined and read
+   nothing; the third is do_promise_exec_tramp, which passes a REAL new.target and therefore runs 10.1.14 — the
+   page's code — from C. That is the remaining gap, and the DCHECK asserting it belongs in the diff that routes
+   that arm, not ahead of it: armed on its own it only turns a green corpus red without moving the capability. */
+static JSValue js_promise_new(JSContext *ctx, JSValueConst new_target, JSValue *resolving_funcs)
+{
+    JSValue obj;
+    obj = js_create_from_ctor(ctx, new_target, JS_CLASS_PROMISE);
+    if (JS_IsException(obj))
+        return JS_EXCEPTION;
+    return js_promise_init_from_obj(ctx, obj, resolving_funcs);
 }
 
 static JSValue js_promise_constructor(JSContext *ctx, JSValueConst new_target,
