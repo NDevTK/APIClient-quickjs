@@ -1504,6 +1504,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_ITER_CONCAT,
     STEPDEF_STR_ITERATOR,
     STEPDEF_STR_INCLUDES, STEPDEF_STR_ENDSWITH, STEPDEF_STR_STARTSWITH,
+    STEPDEF_STR_ISWELLFORMED, STEPDEF_STR_TOWELLFORMED,
     STEPDEF_ITER_ZIP, STEPDEF_ITER_ZIP_KEYED, STEPDEF_ITER_ZIP_NEXT, STEPDEF_ITER_ZIP_RETURN,
     STEPDEF_FUNCTION_CTOR, STEPDEF_GENERATOR_FUNCTION_CTOR,
     STEPDEF_ASYNC_FUNCTION_CTOR, STEPDEF_ASYNC_GENERATOR_FUNCTION_CTOR,
@@ -21434,6 +21435,11 @@ typedef struct JSStrIncludes {
     JSValue str;     /* the coerced receiver (owned) */
     JSValue v;       /* the coerced search string (owned) */
 } JSStrIncludes;
+
+typedef struct JSStrWellFormed {
+    JSStepHdr hdr;
+    JSValue result;
+} JSStrWellFormed;
 
 typedef struct JSIterZip {
     JSStepHdr hdr;
@@ -64707,6 +64713,12 @@ static const JSTrampStepDef js_str_includes_def   = STR_INCLUDES_DEF(0);
 static const JSTrampStepDef js_str_endswith_def   = STR_INCLUDES_DEF(2);
 static const JSTrampStepDef js_str_startswith_def = STR_INCLUDES_DEF(1);
 #undef STR_INCLUDES_DEF
+static int js_string_wellformed_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_string_wellformed_fini(JSContext *ctx, void *st, bool take_result);
+static const JSTrampStepDef js_str_iswellformed_def =
+    { sizeof(JSStrWellFormed), js_string_wellformed_step, js_string_wellformed_fini, 0 };
+static const JSTrampStepDef js_str_towellformed_def =
+    { sizeof(JSStrWellFormed), js_string_wellformed_step, js_string_wellformed_fini, 1 };
 static const JSTrampStepDef js_str_iterator_def =
     { sizeof(JSStrIterCreate), js_string_iterator_create_step, js_string_iterator_create_fini, 0 };
 static const JSTrampStepDef js_iter_zip_def =
@@ -66596,6 +66608,8 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_GLOBAL_EVAL]     = &js_global_eval_def,
     [STEPDEF_ITER_CONCAT]     = &js_iter_concat_def,
     [STEPDEF_STR_ITERATOR]    = &js_str_iterator_def,
+    [STEPDEF_STR_ISWELLFORMED] = &js_str_iswellformed_def,
+    [STEPDEF_STR_TOWELLFORMED] = &js_str_towellformed_def,
     [STEPDEF_STR_INCLUDES]    = &js_str_includes_def,
     [STEPDEF_STR_ENDSWITH]    = &js_str_endswith_def,
     [STEPDEF_STR_STARTSWITH]  = &js_str_startswith_def,
@@ -70975,18 +70989,41 @@ static int64_t string_advance_index(JSString *p, int64_t index, bool unicode)
     return index;
 }
 
-static JSValue js_string_isWellFormed(JSContext *ctx, JSValueConst this_val,
-                                      int argc, JSValueConst *argv)
+/* 22.1.3.11 isWellFormed / 22.1.3.34 toWellFormed. Their ONLY page-visible step is the receiver's
+   `? RequireObjectCoercible(this)` then `? ToString(this)`, which they performed with JS_ToStringCheckObject from
+   C — the case step_thisstring_run's own note names, "even a ZERO-ARGUMENT one could not stay a C body". The scan
+   that follows sees only a JSString and invokes nothing, so the body keeps it and takes the coerced string. */
+static JSValue js_string_isWellFormed_body(JSContext *ctx, JSValueConst strv);
+static JSValue js_string_toWellFormed_body(JSContext *ctx, JSValueConst strv);
+
+static int js_string_wellformed_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    JSValue str;
+    JSStrWellFormed *s = st;
+    JSValue str = JS_UNDEFINED;
+    int r = step_thisstring_run(ctx, &s->hdr, cb_result, &str, out_cb, out_argc);
+    if (r) return r < 0 ? -1 : r;
+    s->result = s->hdr.arg ? js_string_toWellFormed_body(ctx, str) : js_string_isWellFormed_body(ctx, str);
+    JS_FreeValue(ctx, str);
+    return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
+}
+
+static JSValue js_string_wellformed_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSStrWellFormed *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    js_free(ctx, s);
+    return r;
+}
+
+static JSValue js_string_isWellFormed_body(JSContext *ctx, JSValueConst strv)
+{
+    JSValue str = js_dup(strv);
     JSValue ret;
     JSString *p;
     uint32_t c, i, n;
 
     ret = JS_TRUE;
-    str = JS_ToStringCheckObject(ctx, this_val);
-    if (JS_IsException(str))
-        return JS_EXCEPTION;
 
     p = JS_VALUE_GET_STRING(str);
     if (!p->is_wide_char || p->len == 0)
@@ -71011,8 +71048,7 @@ done:
     return ret;
 }
 
-static JSValue js_string_toWellFormed(JSContext *ctx, JSValueConst this_val,
-                                      int argc, JSValueConst *argv)
+static JSValue js_string_toWellFormed_body(JSContext *ctx, JSValueConst this_val)
 {
     JSValue str;
     JSValue ret;
@@ -72093,8 +72129,8 @@ static const JSCFunctionListEntry js_string_proto_funcs[] = {
     JS_CFUNC_STEP_DEF("charAt", 1, STEPDEF_STR_CHARAT ),
     JS_CFUNC_STEP_DEF("concat", 1, STEPDEF_STR_CONCAT ),
     JS_CFUNC_STEP_DEF("codePointAt", 1, STEPDEF_STR_CODEPOINTAT ),
-    JS_CFUNC_DEF("isWellFormed", 0, js_string_isWellFormed ),
-    JS_CFUNC_DEF("toWellFormed", 0, js_string_toWellFormed ),
+    JS_CFUNC_STEP_DEF("isWellFormed", 0, STEPDEF_STR_ISWELLFORMED ),
+    JS_CFUNC_STEP_DEF("toWellFormed", 0, STEPDEF_STR_TOWELLFORMED ),
     JS_CFUNC_STEP_DEF("indexOf", 1, STEPDEF_STR_INDEXOF ),
     JS_CFUNC_STEP_DEF("lastIndexOf", 1, STEPDEF_STR_LASTINDEXOF ),
     JS_CFUNC_STEP_DEF("includes", 1, STEPDEF_STR_INCLUDES ),
