@@ -1570,6 +1570,9 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_MAP_FOREACH, STEPDEF_SET_FOREACH,
     STEPDEF_DISPOSABLE_CTOR, STEPDEF_ASYNC_DISPOSABLE_CTOR,
     STEPDEF_STR_TOLOWER, STEPDEF_STR_TOUPPER,
+    /* thirteen contiguous ids, one per CreateHTML tag: JS_CFUNC_STEP_DEF spends the builtin's magic
+       on the step id, so the tag has to come from the id. */
+    STEPDEF_STR_HTML_BASE, STEPDEF_STR_HTML_LAST = STEPDEF_STR_HTML_BASE + 12,
     STEPDEF_COUNT
 };
 #define HINT_NONE    2
@@ -22630,7 +22633,11 @@ enum { STRRECV_TRIM_START = 1, STRRECV_TRIM_END = 2, STRRECV_TRIM_BOTH = 3,
        STRRECV_CHARAT, STRRECV_CHARCODEAT,
        STRRECV_SLICE, STRRECV_SUBSTR, STRRECV_REPEAT,
        STRRECV_PADSTART, STRRECV_PADEND, STRRECV_LOCALECOMPARE,
-       STRRECV_TOLOWER, STRRECV_TOUPPER };
+       STRRECV_TOLOWER, STRRECV_TOUPPER,
+       /* B.2.2 CreateHTML, one mode per tag: `arg` is STRRECV_HTML_BASE + the method's magic, so the thirteen
+          share one machine and one body the way they shared one C function. */
+       STRRECV_HTML_BASE };
+#define STRRECV_HTML_COUNT 13
 typedef struct JSErrToString {
     JSStepHdr hdr;        /* MUST be first: the generic step driver casts the state to JSStepHdr * */
     JSValue result;       /* DONE (owned) */
@@ -65205,6 +65212,13 @@ static const JSTrampStepDef js_str_padEnd_def     = { sizeof(JSStrRecv), js_str_
 static const JSTrampStepDef js_str_localeCmp_def  = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_LOCALECOMPARE };
 static const JSTrampStepDef js_str_toLower_def    = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_TOLOWER };
 static const JSTrampStepDef js_str_toUpper_def    = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_TOUPPER };
+#define STR_HTML_DEF(k) { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_HTML_BASE + (k) }
+static const JSTrampStepDef js_str_html_defs[STRRECV_HTML_COUNT] = {
+    STR_HTML_DEF(0), STR_HTML_DEF(1), STR_HTML_DEF(2), STR_HTML_DEF(3), STR_HTML_DEF(4),
+    STR_HTML_DEF(5), STR_HTML_DEF(6), STR_HTML_DEF(7), STR_HTML_DEF(8), STR_HTML_DEF(9),
+    STR_HTML_DEF(10), STR_HTML_DEF(11), STR_HTML_DEF(12),
+};
+#undef STR_HTML_DEF
 static const JSTrampStepDef js_ta_at_def          = { sizeof(JSTAIdx), js_ta_idx_step, js_ta_idx_fini, TAIDX_AT };
 static const JSTrampStepDef js_ta_set_def         = { sizeof(JSTAIdx), js_ta_idx_step, js_ta_idx_fini, TAIDX_SET };
 static const JSTrampStepDef js_json_raw_def       = { sizeof(JSJsonRaw), js_json_raw_step, js_json_raw_fini, 0 };
@@ -66796,6 +66810,19 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_DISPOSABLE_CTOR] = &js_disposable_ctor_def,
     [STEPDEF_STR_TOLOWER] = &js_str_toLower_def,
     [STEPDEF_STR_TOUPPER] = &js_str_toUpper_def,
+    [STEPDEF_STR_HTML_BASE + 0] = &js_str_html_defs[0],
+    [STEPDEF_STR_HTML_BASE + 1] = &js_str_html_defs[1],
+    [STEPDEF_STR_HTML_BASE + 2] = &js_str_html_defs[2],
+    [STEPDEF_STR_HTML_BASE + 3] = &js_str_html_defs[3],
+    [STEPDEF_STR_HTML_BASE + 4] = &js_str_html_defs[4],
+    [STEPDEF_STR_HTML_BASE + 5] = &js_str_html_defs[5],
+    [STEPDEF_STR_HTML_BASE + 6] = &js_str_html_defs[6],
+    [STEPDEF_STR_HTML_BASE + 7] = &js_str_html_defs[7],
+    [STEPDEF_STR_HTML_BASE + 8] = &js_str_html_defs[8],
+    [STEPDEF_STR_HTML_BASE + 9] = &js_str_html_defs[9],
+    [STEPDEF_STR_HTML_BASE + 10] = &js_str_html_defs[10],
+    [STEPDEF_STR_HTML_BASE + 11] = &js_str_html_defs[11],
+    [STEPDEF_STR_HTML_BASE + 12] = &js_str_html_defs[12],
     [STEPDEF_ASYNC_DISPOSABLE_CTOR] = &js_async_disposable_ctor_def,
     [STEPDEF_SET_FOREACH] = &js_set_foreach_def,
     [STEPDEF_DISPOSE_ASYNC] = &js_dispose_async_def,
@@ -70914,6 +70941,11 @@ static int str_clamp(int64_t v, int len)
 
 static int to_utf32_buf(JSContext *ctx, JSString *p, uint32_t **pbuf);
 static JSValue js_string_case_body(JSContext *ctx, JSValueConst strv, int to_lower);
+static JSValue js_string_CreateHTML(JSContext *ctx, JSValueConst strv, JSValueConst valuev, int magic);
+/* which CreateHTML tags take an attribute, i.e. which perform step 4.a's ToString. It is a bitmask
+   rather than a second copy of the defs table: the machine needs only that one bit, and two tables
+   that must agree are two chances to disagree. Bits: a/name, font/color, font/size, a/href. */
+#define STRRECV_HTML_HAS_ATTR ((1u << 0) | (1u << 5) | (1u << 6) | (1u << 8))
 
 static int js_str_recv_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
@@ -70951,6 +70983,16 @@ static int js_str_recv_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
             r = step_tostring_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->arg, out_cb, out_argc);
             cb_result = JS_UNDEFINED;
             if (r) return r < 0 ? -1 : r;
+            break;
+        default:
+            if (mode >= STRRECV_HTML_BASE) {
+                /* step 4.a runs ONLY for a tag with an attribute; the others coerce nothing at all. */
+                if (STRRECV_HTML_HAS_ATTR & (1u << (mode - STRRECV_HTML_BASE))) {
+                    r = step_tostring_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->arg, out_cb, out_argc);
+                    cb_result = JS_UNDEFINED;
+                    if (r) return r < 0 ? -1 : r;
+                }
+            }
             break;
         case STRRECV_NORMALIZE:
             /* an absent or undefined form is NFC and coerces nothing. The UTF-32 conversion the C body did first
@@ -71154,6 +71196,10 @@ static int js_str_recv_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
         js_free(ctx, as); js_free(ctx, bs);
         s->result = js_int32(cmp);
         return 0;
+    }
+    if (mode >= STRRECV_HTML_BASE) {
+        s->result = js_string_CreateHTML(ctx, s->str, s->arg, mode - STRRECV_HTML_BASE);
+        return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
     }
     if (mode == STRRECV_TOLOWER || mode == STRRECV_TOUPPER) {
         s->result = js_string_case_body(ctx, s->str, mode == STRRECV_TOLOWER);
@@ -72506,8 +72552,10 @@ enum {
     magic_string_sup,
 };
 
-static JSValue js_string_CreateHTML(JSContext *ctx, JSValueConst this_val,
-                                    int argc, JSValueConst *argv, int magic)
+/* B.2.2.2.1 CreateHTML from step 3 on: the receiver's RequireObjectCoercible + ToString (steps 1-2) and the
+   attribute value's ToString (step 4.a) are the page's code and are performed by js_str_recv_step as requests.
+   `valuev` is the ALREADY-COERCED attribute string, or UNINITIALIZED for a tag that takes none. */
+static JSValue js_string_CreateHTML(JSContext *ctx, JSValueConst strv, JSValueConst valuev, int magic)
 {
     JSValue str;
     JSString *p;
@@ -72519,9 +72567,8 @@ static JSValue js_string_CreateHTML(JSContext *ctx, JSValueConst this_val,
         { "sub", NULL }, { "sup", NULL },
     };
 
-    str = JS_ToStringCheckObject(ctx, this_val);
-    if (JS_IsException(str))
-        return JS_EXCEPTION;
+    DCHECK(JS_IsString(strv), "the CreateHTML body takes the receiver its machine already coerced");
+    str = js_dup(strv);
     string_buffer_init(ctx, b, 7);
     string_buffer_putc8(b, '<');
     string_buffer_puts8(b, defs[magic].tag);
@@ -72533,12 +72580,11 @@ static JSValue js_string_CreateHTML(JSContext *ctx, JSValueConst this_val,
         string_buffer_putc8(b, ' ');
         string_buffer_puts8(b, defs[magic].attr);
         string_buffer_puts8(b, "=\"");
-        value = JS_ToStringCheckObject(ctx, argv[0]);
-        if (JS_IsException(value)) {
-            JS_FreeValue(ctx, str);
-            string_buffer_free(b);
-            return JS_EXCEPTION;
-        }
+        /* step 4.a is `? ToString(value)`, NOT RequireObjectCoercible-then-ToString: `"x".fontcolor()` is
+           <font color="undefined">x</font>, and JS_ToStringCheckObject threw a TypeError for it instead. No test
+           covers this — annexB is not in test262.conf — which is why it survived; the spec is the oracle. */
+        DCHECK(JS_IsString(valuev), "the CreateHTML body takes the attribute value its machine already coerced");
+        value = js_dup(valuev);
         p = JS_VALUE_GET_STRING(value);
         for (i = 0; i < p->len; i++) {
             int c = string_get(p, i);
@@ -72607,19 +72653,19 @@ static const JSCFunctionListEntry js_string_proto_funcs[] = {
     JS_CFUNC_STEP_DEF("toLocaleUpperCase", 0, STEPDEF_STR_TOUPPER ),
     JS_CFUNC_STEP_DEF("[Symbol.iterator]", 0, STEPDEF_STR_ITERATOR ),
     /* ES6 Annex B 2.3.2 etc. */
-    JS_CFUNC_MAGIC_DEF("anchor", 1, js_string_CreateHTML, magic_string_anchor ),
-    JS_CFUNC_MAGIC_DEF("big", 0, js_string_CreateHTML, magic_string_big ),
-    JS_CFUNC_MAGIC_DEF("blink", 0, js_string_CreateHTML, magic_string_blink ),
-    JS_CFUNC_MAGIC_DEF("bold", 0, js_string_CreateHTML, magic_string_bold ),
-    JS_CFUNC_MAGIC_DEF("fixed", 0, js_string_CreateHTML, magic_string_fixed ),
-    JS_CFUNC_MAGIC_DEF("fontcolor", 1, js_string_CreateHTML, magic_string_fontcolor ),
-    JS_CFUNC_MAGIC_DEF("fontsize", 1, js_string_CreateHTML, magic_string_fontsize ),
-    JS_CFUNC_MAGIC_DEF("italics", 0, js_string_CreateHTML, magic_string_italics ),
-    JS_CFUNC_MAGIC_DEF("link", 1, js_string_CreateHTML, magic_string_link ),
-    JS_CFUNC_MAGIC_DEF("small", 0, js_string_CreateHTML, magic_string_small ),
-    JS_CFUNC_MAGIC_DEF("strike", 0, js_string_CreateHTML, magic_string_strike ),
-    JS_CFUNC_MAGIC_DEF("sub", 0, js_string_CreateHTML, magic_string_sub ),
-    JS_CFUNC_MAGIC_DEF("sup", 0, js_string_CreateHTML, magic_string_sup ),
+    JS_CFUNC_STEP_DEF("anchor", 1, STEPDEF_STR_HTML_BASE + magic_string_anchor ),
+    JS_CFUNC_STEP_DEF("big", 0, STEPDEF_STR_HTML_BASE + magic_string_big ),
+    JS_CFUNC_STEP_DEF("blink", 0, STEPDEF_STR_HTML_BASE + magic_string_blink ),
+    JS_CFUNC_STEP_DEF("bold", 0, STEPDEF_STR_HTML_BASE + magic_string_bold ),
+    JS_CFUNC_STEP_DEF("fixed", 0, STEPDEF_STR_HTML_BASE + magic_string_fixed ),
+    JS_CFUNC_STEP_DEF("fontcolor", 1, STEPDEF_STR_HTML_BASE + magic_string_fontcolor ),
+    JS_CFUNC_STEP_DEF("fontsize", 1, STEPDEF_STR_HTML_BASE + magic_string_fontsize ),
+    JS_CFUNC_STEP_DEF("italics", 0, STEPDEF_STR_HTML_BASE + magic_string_italics ),
+    JS_CFUNC_STEP_DEF("link", 1, STEPDEF_STR_HTML_BASE + magic_string_link ),
+    JS_CFUNC_STEP_DEF("small", 0, STEPDEF_STR_HTML_BASE + magic_string_small ),
+    JS_CFUNC_STEP_DEF("strike", 0, STEPDEF_STR_HTML_BASE + magic_string_strike ),
+    JS_CFUNC_STEP_DEF("sub", 0, STEPDEF_STR_HTML_BASE + magic_string_sub ),
+    JS_CFUNC_STEP_DEF("sup", 0, STEPDEF_STR_HTML_BASE + magic_string_sup ),
 };
 
 static const JSCFunctionListEntry js_string_iterator_proto_funcs[] = {
