@@ -1566,6 +1566,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_SYMBOL_CTOR, STEPDEF_ERROR_TOSTRING,
     STEPDEF_MAP_UPSERT, STEPDEF_MAP_UPSERT_COMPUTED,
     STEPDEF_WEAKMAP_UPSERT, STEPDEF_WEAKMAP_UPSERT_COMPUTED,
+    STEPDEF_DISPOSE_SYNC,
     STEPDEF_COUNT
 };
 #define HINT_NONE    2
@@ -36861,6 +36862,24 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             if (itail) { ret_val = r; goto do_return; }
             *sp++ = r;
             BREAK;
+        } else if (xck == CONT_STEP && ((JSStepHdr *)xcs)->def->catches_abrupt) {
+            /* The machine's algorithm CATCHES this call's abrupt completion instead of propagating it —
+               DisposeResources keeps disposing and folds the throw into a SuppressedError, the way 16.2.1.8 folds
+               a throwing trap into a rejection. catches_abrupt already said this for a GETPROP request; a CALL is
+               the same declaration about a different request, and without it the only way to write such an
+               algorithm was a JS_Call from C with the result inspected in place — which is the drive-to-completion
+               this whole mechanism exists to remove.
+               The DRIVE's own operands (the callee, receiver and arguments this machine pushed onto the caller's
+               stack) are dropped here, exactly as the async-from-sync and combinator arms above drop theirs; the
+               machine's ORIGINAL invocation shape is untouched, because it is still live and its own completion
+               will pop it. */
+            JSValue *dcargv = sp - xcg;
+            DCHECK(xcg >= xcf, "a catches_abrupt step call records operands ending below where they start");
+            for (i = xcf; i < xcg; i++) JS_FreeValue(ctx, dcargv[i]);
+            sp += xcf - xcg;
+            cont_st = xcs;
+            ret_val = JS_EXCEPTION;
+            goto do_step_step;
         } else if (xck != CONT_NONE) {
             /* the throwing frame was a C-builtin-driven CALLBACK: abandon the iteration (its state owns the
                object/accumulator/element) and re-raise in the builtin's ORIGINAL caller, whose stack still holds
@@ -66631,6 +66650,20 @@ static const JSTrampStepDef js_weakmap_upsert_comp_def = MAP_UPSERT_DEF(JS_CLASS
 /* likewise: the resolving-function machine is defined with the Promise code it settles. */
 static const JSTrampStepDef js_promise_resolvefn_def;
 
+/* DisposeResources' state. It lives here rather than beside its step functions because the table below names
+   the definition, and the definition names this size — the resource list is reached through a forward tag so the
+   explicit-resource-management types can stay where they belong. */
+struct JSDisposableResource;
+typedef struct JSDisposeRun {
+    JSStepHdr hdr;
+    struct JSDisposableResource *res;   /* the STOLEN resource list (owned, js_free'd by fini) */
+    int n;                              /* its length */
+    int i;                              /* the LIFO cursor: the resource whose call is in flight */
+    JSValue error;                      /* the accumulated completion error (owned); UNINITIALIZED = none */
+    JSValue cb[3];                      /* the CALL request's [this, method, arg] */
+} JSDisposeRun;
+static const JSTrampStepDef js_dispose_sync_def;
+
 static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_PROMISE_RESOLVE]       = &js_promise_resolve_def,
     [STEPDEF_PROMISE_CATCH]         = &js_promise_catch_def,
@@ -66683,6 +66716,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_ITER_HELPER_RETURN] = &js_iter_helper_return_def,
     [STEPDEF_INSTANCEOF]     = &js_instanceof_def,
     [STEPDEF_ORDINARY_HAS_INSTANCE] = &js_ordinary_hasinst_def,
+    [STEPDEF_DISPOSE_SYNC] = &js_dispose_sync_def,
     [STEPDEF_OBJ_TOSTRING]   = &js_obj_tostring_def,
     [STEPDEF_OBJ_TOLOCALESTRING] = &js_obj_tolocale_def,
     [STEPDEF_OBJ_SEAL]       = &js_obj_seal_def,
@@ -66953,6 +66987,7 @@ STEP_STATE_HDR_FIRST(JSIntegrity);
 STEP_STATE_HDR_FIRST(JSObjToString);
 STEP_STATE_HDR_FIRST(JSObjToLocale);
 STEP_STATE_HDR_FIRST(JSInstanceOf);
+STEP_STATE_HDR_FIRST(JSDisposeRun);
 STEP_STATE_HDR_FIRST(JSImportOpts);
 STEP_STATE_HDR_FIRST(JSStrCtor);
 STEP_STATE_HDR_FIRST(JSStrConcat);
@@ -78797,68 +78832,116 @@ static JSValue js_new_suppressed_error(JSContext *ctx, JSValueConst error,
     return obj;
 }
 
-/* Perform DisposeResources. Returns 0 on success, -1 on exception.
-   completion_error is the pending error (JS_UNDEFINED if none).
-   It is consumed (freed) by this function. */
-static int js_dispose_resources(JSContext *ctx, JSDisposableStack *ds,
-                                JSValue completion_error)
+/* 27.3.3.3 DisposableStack.prototype.dispose, i.e. DisposeResources with the sync-dispose hint.
+   Every resource's dispose method is the PAGE'S CODE, so the loop that runs them is a step machine and each call
+   is a request — the JS_Call loop that stood here entered a bytecode body by C recursion below the live flow, and
+   a `finally` or a loop inside a dispose method could not park.
+   It is also the first machine whose algorithm CATCHES a CALL's abrupt completion: step 3.d folds each throw into
+   a SuppressedError and keeps disposing. That is what `catches_abrupt` declares, and the call-unwind arm that
+   honours it for a CALL was built for this.
+   THE RESOURCE LIST IS STOLEN, not iterated in place. A dispose method can call `move()` or `use()` on the very
+   stack being disposed, so the array the old loop held a pointer into could be transferred or reallocated under
+   it while user code ran — reachable from script, not a theoretical race. The machine owns the list from stage 0
+   and its teardown releases whatever is left, so the stack object is inert for the whole disposal. */
+/* fold this throw into the completion the spec carries: the first one IS the error, a later one SUPPRESSES it. */
+static void js_dispose_fold_error(JSContext *ctx, JSDisposeRun *s)
 {
-    JSValue error = completion_error;
-    bool has_error = !JS_IsUndefined(error);
-    int i;
+    JSValue new_error = JS_GetException(ctx);
+    if (JS_IsUninitialized(s->error)) {
+        s->error = new_error;
+        return;
+    }
+    {
+        JSValue suppressed = js_new_suppressed_error(ctx, new_error, s->error);
+        JS_FreeValue(ctx, new_error);
+        JS_FreeValue(ctx, s->error);
+        /* SuppressedError's own construction can throw (an OOM, or a patched %SuppressedError%): that throw is
+           then the completion, exactly as the value it failed to build would have been. */
+        s->error = JS_IsException(suppressed) ? JS_GetException(ctx) : suppressed;
+    }
+}
 
-    ds->disposed = true;
-    /* dispose in LIFO order */
-    for (i = ds->resource_count - 1; i >= 0; i--) {
-        JSDisposableResource *res = &ds->resources[i];
-        JSValue ret;
-        if (JS_IsUndefined(res->method)) {
-            /* null/undefined resource, skip */
-            JS_FreeValue(ctx, res->value);
-            res->value = JS_UNDEFINED;
+static int js_dispose_sync_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSDisposeRun *s = st;
+
+    if (s->hdr.stage == 0) {
+        JSDisposableStack *ds = JS_GetOpaque2(ctx, s->hdr.this_val, JS_CLASS_DISPOSABLE_STACK);
+        JS_FreeValue(ctx, cb_result);
+        s->error = JS_UNINITIALIZED;
+        s->hdr.stage = 1;
+        if (!ds)
+            return -1;
+        if (ds->disposed)
+            return 0;                       /* already disposed: undefined, and nothing to run */
+        ds->disposed = true;
+        s->res = ds->resources;             /* STEAL it — see above */
+        s->n = ds->resource_count;
+        ds->resources = NULL;
+        ds->resource_count = 0;
+        ds->resource_capacity = 0;
+        s->i = s->n - 1;
+    } else {
+        /* the dispose method returned, or THREW and this machine catches it (catches_abrupt) */
+        if (JS_IsException(cb_result))
+            js_dispose_fold_error(ctx, s);
+        else
+            JS_FreeValue(ctx, cb_result);
+        s->i--;
+    }
+
+    for (; s->i >= 0; s->i--) {
+        JSDisposableResource *r = &s->res[s->i];
+        JSValue method = r->method, value = r->value;
+        r->method = JS_UNDEFINED;
+        r->value = JS_UNDEFINED;            /* the machine hands both to the request; the list keeps neither */
+        if (JS_IsUndefined(method)) {
+            JS_FreeValue(ctx, value);       /* a null/undefined resource disposes to nothing */
             continue;
         }
-        switch (res->hint) {
-        case JS_DISPOSE_HINT_ADOPT:
-            ret = JS_Call(ctx, res->method, JS_UNDEFINED, 1, vc(&res->value));
-            break;
-        case JS_DISPOSE_HINT_DEFER:
-            ret = JS_Call(ctx, res->method, JS_UNDEFINED, 0, NULL);
-            break;
-        default: /* JS_DISPOSE_HINT_SYNC */
-            ret = JS_Call(ctx, res->method, res->value, 0, NULL);
-            break;
+        JS_FreeValue(ctx, s->cb[0]); JS_FreeValue(ctx, s->cb[1]); JS_FreeValue(ctx, s->cb[2]);
+        s->cb[2] = JS_UNDEFINED;
+        switch (r->hint) {
+        case JS_DISPOSE_HINT_ADOPT:  s->cb[0] = JS_UNDEFINED; s->cb[2] = value;             break;
+        case JS_DISPOSE_HINT_DEFER:  s->cb[0] = JS_UNDEFINED; JS_FreeValue(ctx, value);     break;
+        default: /* SYNC */          s->cb[0] = value;                                      break;
         }
-        JS_FreeValue(ctx, res->value);
-        JS_FreeValue(ctx, res->method);
-        res->value = JS_UNDEFINED;
-        res->method = JS_UNDEFINED;
-        if (JS_IsException(ret)) {
-            JSValue new_error = JS_GetException(ctx);
-            if (has_error) {
-                JSValue suppressed = js_new_suppressed_error(ctx, new_error, error);
-                JS_FreeValue(ctx, new_error);
-                JS_FreeValue(ctx, error);
-                if (JS_IsException(suppressed)) {
-                    error = JS_GetException(ctx);
-                } else {
-                    error = suppressed;
-                }
-            } else {
-                error = new_error;
-                has_error = true;
-            }
-        } else {
-            JS_FreeValue(ctx, ret);
-        }
+        s->cb[1] = method;
+        *out_cb = s->cb;
+        *out_argc = (r->hint == JS_DISPOSE_HINT_ADOPT) ? 1 : 0;
+        return 3;                           /* CALL: the dispose method runs on the tramp and can park */
     }
-    ds->resource_count = 0;
-    if (has_error) {
-        JS_Throw(ctx, error);
+    if (!JS_IsUninitialized(s->error)) {
+        JS_Throw(ctx, s->error);
+        s->error = JS_UNINITIALIZED;
         return -1;
     }
     return 0;
 }
+
+static JSValue js_dispose_sync_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSDisposeRun *s = st;
+    int i;
+    /* An ABANDON (the flow was torn down mid-disposal) leaves the tail of the stolen list still owned here —
+       the stack object no longer holds it, so this is the only release there is. */
+    for (i = 0; i <= s->i && i < s->n; i++) {
+        JS_FreeValue(ctx, s->res[i].value);
+        JS_FreeValue(ctx, s->res[i].method);
+    }
+    js_free(ctx, s->res);
+    JS_FreeValue(ctx, s->cb[0]); JS_FreeValue(ctx, s->cb[1]); JS_FreeValue(ctx, s->cb[2]);
+    if (!JS_IsUninitialized(s->error))
+        JS_FreeValue(ctx, s->error);
+    js_free(ctx, s);
+    return JS_UNDEFINED;   /* 27.3.3.3 returns undefined on every path */
+}
+
+static const JSTrampStepDef js_dispose_sync_def = {
+    sizeof(JSDisposeRun), js_dispose_sync_step, js_dispose_sync_fini, 0,
+    /* body, body_proto, body_magic, precheck, midcheck, onerror */ {NULL}, 0, 0, NULL, NULL, NULL,
+    .catches_abrupt = 1   /* step 3.d: a throwing dispose method is a VALUE — it becomes the SuppressedError */
+};
 
 static void js_disposable_stack_clear(JSRuntime *rt, JSDisposableStack *ds)
 {
@@ -79194,6 +79277,8 @@ static JSValue js_disposable_stack_dispose(JSContext *ctx,
 {
     JSDisposableStack *s;
 
+    DCHECK(class_id == JS_CLASS_ASYNC_DISPOSABLE_STACK,
+           "the SYNC dispose is js_dispose_sync_def, a step machine — this entry is disposeAsync's only");
     s = JS_GetOpaque2(ctx, this_val, class_id);
     if (!s) {
         if (class_id == JS_CLASS_ASYNC_DISPOSABLE_STACK) {
@@ -79349,9 +79434,8 @@ static JSValue js_disposable_stack_dispose(JSContext *ctx,
         s->resource_count = 0;
         return JS_EXCEPTION;
     }
-    if (js_dispose_resources(ctx, s, JS_UNDEFINED) < 0)
-        return JS_EXCEPTION;
-    return JS_UNDEFINED;
+    DFAIL("the synchronous dispose reached disposeAsync's C entry — it is js_dispose_sync_def");
+    return JS_EXCEPTION;
 }
 
 static JSValue js_disposable_stack_move(JSContext *ctx, JSValueConst this_val,
@@ -79401,7 +79485,7 @@ static JSValue js_disposable_stack_get_disposed(JSContext *ctx,
 static const JSCFunctionListEntry js_disposable_stack_proto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("adopt", 2, js_disposable_stack_adopt, JS_CLASS_DISPOSABLE_STACK ),
     JS_CFUNC_MAGIC_DEF("defer", 1, js_disposable_stack_defer, JS_CLASS_DISPOSABLE_STACK ),
-    JS_CFUNC_MAGIC_DEF("dispose", 0, js_disposable_stack_dispose, JS_CLASS_DISPOSABLE_STACK ),
+    JS_CFUNC_STEP_DEF("dispose", 0, STEPDEF_DISPOSE_SYNC ),
     JS_CFUNC_MAGIC_DEF("move", 0, js_disposable_stack_move, JS_CLASS_DISPOSABLE_STACK ),
     JS_CFUNC_MAGIC_DEF("use", 1, js_disposable_stack_use, JS_CLASS_DISPOSABLE_STACK ),
     JS_CGETSET_MAGIC_DEF("disposed", js_disposable_stack_get_disposed, NULL, JS_CLASS_DISPOSABLE_STACK ),
