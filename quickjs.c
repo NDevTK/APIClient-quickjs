@@ -21344,6 +21344,7 @@ typedef struct JSJsonReviver {
     JSValue result;                 /* final revived value */
     JSValue cb_args[5];             /* [holder(this), reviver, name_val, val, context]; call_argv=&cb_args[2], argc=3 */
     JSValue *ek_cb; int ek_argc;    /* the key walk's request buffer, relayed to the driver unchanged */
+    JSValue text_str;               /* 25.5.1 step 1's ? ToString(text), held across the parse (owned) */
 } JSJsonReviver;
 /* String(x) / new String(x), 22.1.1.1. Its ToString(argv[0]) runs a user valueOf/toString/@@toPrimitive, which
    from a C body would be JS_CallFree with nowhere to suspend. As a step machine the coercion is a TOPRIMITIVE
@@ -28266,6 +28267,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         accessor = gp_op == GP_GET ? tramp_accessor_getter(ctx, JS_MKPTR(JS_TAG_OBJECT, po), gp_atom)
                                                    : tramp_accessor_setter(ctx, JS_MKPTR(JS_TAG_OBJECT, po), gp_atom);
                     }
+                } else if (gp_op == GP_GET || gp_op == GP_SET) {
+                    /* a PRIMITIVE base. 10.1.8.1 walks the primitive's INTRINSIC prototype, and a page can put an
+                       accessor there — `Object.defineProperty(BigInt.prototype, "toJSON", {get(){…}})` is a
+                       test262 case — so the read is the page's code exactly as it is on an object, with the
+                       primitive itself as the getter's receiver. The whole accessor lookup sat inside the
+                       "is it an object" test, so every one of these fell to JS_GetPropertyInternal /
+                       JS_SetPropertyInternal2 and ran the body from C: JSON.stringify's toJSON read off a BigInt
+                       is what named it. */
+                    JSValueConst pproto = JS_GetPrototypePrimitive(ctx, gp_obj);
+                    if (JS_VALUE_GET_TAG(pproto) == JS_TAG_OBJECT)
+                        accessor = gp_op == GP_GET ? tramp_accessor_getter(ctx, pproto, gp_atom)
+                                                   : tramp_accessor_setter(ctx, pproto, gp_atom);
                 }
                 if (JS_IsUndefined(method) && !accessor) {
                     /* nothing user-written is involved: do it right here and hand the machine its answer. A
@@ -77540,7 +77553,7 @@ static JSONParseRecord *jr_child_pr(JSContext *ctx, JSONParseRecord *holder_pr, 
    called the reviver through JS_Call — is deleted, so there is one walk, not two. */
 static int js_json_parse_prologue(JSContext *ctx, JSJsonReviver *s)
 {
-    JSValueConst text = step_arg(&s->hdr, 0);
+    JSValueConst text = s->text_str;   /* step 1's ToString has already run, as a request */
     JSValueConst reviver = step_arg(&s->hdr, 1);
 
     if (!JS_IsFunction(ctx, reviver)) {
@@ -77556,15 +77569,28 @@ static int js_json_parse_prologue(JSContext *ctx, JSJsonReviver *s)
     return js_json_reviver_init(ctx, s, text, reviver);
 }
 
+/* stage 0 is the PROLOGUE, JP_TOSTRING is the coercion it waits on, JP_WALK the reviver walk. A resumption must
+   never land on 0, whose first act is to free cb_result — see the base64 machine, where it did. */
+enum { JP_TOSTRING = 1, JP_WALK };
+
 static int js_json_parse_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSJsonReviver *s = st;
     int r;
     if (s->hdr.stage == 0) {
-        s->hdr.stage = 1;
+        s->hdr.stage = JP_TOSTRING;
         JS_FreeValue(ctx, cb_result);
         cb_result = JS_UNDEFINED;
-        s->root = JS_UNDEFINED; s->result = JS_UNDEFINED;
+        s->root = JS_UNDEFINED; s->result = JS_UNDEFINED; s->text_str = JS_UNDEFINED;
+        s->early = 0; s->text = NULL; s->pr = NULL; s->stack = NULL; s->sp = 0; s->cap = 0;
+    }
+    if (s->hdr.stage == JP_TOSTRING) {
+        /* 25.5.1 step 1: `? ToString(text)`. JS_ToCStringLen ran it from C, so `JSON.parse({toString(){…}})` had
+           its toString driven with no flow base. */
+        r = step_tostring_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->text_str, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r;
+        s->hdr.stage = JP_WALK;
         if (js_json_parse_prologue(ctx, s))
             return -1;
     }
@@ -77600,6 +77626,8 @@ static JSValue js_json_parse_vfini(JSContext *ctx, void *st, bool take_result)
 {
     JSJsonReviver *s = st;
     JSValue r;
+    JS_FreeValue(ctx, s->text_str);
+    s->text_str = JS_UNDEFINED;
     if (s->early) {
         r = take_result ? s->result : JS_UNDEFINED;
         if (!take_result) JS_FreeValue(ctx, s->result);
@@ -77614,9 +77642,10 @@ static JSValue js_json_parse_vfini(JSContext *ctx, void *st, bool take_result)
 
 static int js_json_reviver_init(JSContext *ctx, JSJsonReviver *s, JSValueConst text_arg, JSValueConst reviver) {
     size_t len; JSValue parsed; JSONParseRecord *pr1; int size = 0;
-    s->reviver = reviver; s->text = NULL; s->root = JS_UNDEFINED; s->pr = NULL;
-    s->stack = NULL; s->sp = 0; s->cap = 0; s->result = JS_UNDEFINED;
+    s->reviver = reviver;
     for (int i = 0; i < 5; i++) s->cb_args[i] = JS_UNDEFINED;
+    /* text_arg is ALREADY the step-1 string, so this cannot run user code and cannot fail on a coercion. */
+    DCHECK(JS_IsString(text_arg), "the reviver walk was handed a text that step 1's ToString had not produced");
     s->text = JS_ToCStringLen(ctx, &len, text_arg);
     if (!s->text) return -1;
     s->pr = js_mallocz(ctx, sizeof(JSONParseRecord));
