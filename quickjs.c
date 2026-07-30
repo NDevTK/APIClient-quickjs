@@ -1692,8 +1692,6 @@ static __exception int js_get_length64(JSContext *ctx, int64_t *pres,
 static __exception int js_set_length64(JSContext *ctx, JSValueConst obj,
                                        int64_t len);
 static void free_arg_list(JSContext *ctx, JSValue *tab, uint32_t len);
-static JSValue *build_arg_list(JSContext *ctx, uint32_t *plen,
-                               JSValueConst array_arg);
 static JSValue js_create_array(JSContext *ctx, int len, JSValueConst *tab);
 static bool js_get_fast_array(JSContext *ctx, JSValue obj,
                               JSValue **arrpp, uint32_t *countp);
@@ -24039,63 +24037,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     ap_cfirst = -2; ap_cargc = call_argc;   /* operands [Reflect, apply, target, this, argsList] */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_apply_tramp;
                 }
-                /* generator .next() via APPLY reflection — the two forms whose C-function target the apply site above
-                   rejects (tramp_can_call is false for js_generator_next), so they'd fall to the js_generator_next
-                   drive-to-completion. Reshape to the [this=generator, method, resumeArg] shape do_generator_tramp
-                   reads and route it. The args array is read faithfully (build_arg_list = CreateListFromArrayLike,
-                   firing every element getter) though a generator consumes only arg0. */
-                if (tramp_is_function_apply(call_argv[-1])) {   /* g.next.apply(gen, argsArray) */
-                    JSValueConst gen_at = (call_argc >= 1) ? call_argv[0] : JS_UNDEFINED;
-                    JSValueConst arr = (call_argc >= 2) ? call_argv[1] : JS_UNDEFINED;
-                    int arrtag = JS_VALUE_GET_TAG(arr);
-                    int gmag;
-                    if ((arrtag == JS_TAG_UNDEFINED || arrtag == JS_TAG_NULL || arrtag == JS_TAG_OBJECT)
-                        && (gmag = tramp_gen_method_magic(call_argv[-2], gen_at)) >= 0) {
-                        JSValue gnext = (JSValue)call_argv[-2];   /* -> method operand */
-                        JSValue genv = (JSValue)gen_at;           /* -> `this` operand */
-                        JSValue resumeVal = JS_UNDEFINED;
-                        if (arrtag == JS_TAG_OBJECT) {
-                            uint32_t alen = 0; JSValue *atab = build_arg_list(ctx, &alen, arr);
-                            if (!atab) goto exception;
-                            if (alen >= 1) resumeVal = js_dup(atab[0]);
-                            for (uint32_t k = 0; k < alen; k++) JS_FreeValue(ctx, atab[k]);
-                            js_free(ctx, atab);
-                        }
-                        JS_FreeValue(ctx, (JSValue)call_argv[-1]);              /* Function.prototype.apply */
-                        for (int k = 1; k < call_argc; k++) JS_FreeValue(ctx, (JSValue)call_argv[k]);  /* args array + any extra operands */
-                        ((JSValue *)call_argv)[-2] = genv;
-                        ((JSValue *)call_argv)[-1] = gnext;
-                        ((JSValue *)call_argv)[0]  = resumeVal;
-                        sp = (JSValue *)&call_argv[1];
-                        call_argc = 1; tramp_first = -2; tramp_gen_magic = gmag;
-                        tramp_is_tail = (opcode == OP_tail_call_method);
-                        goto do_generator_tramp;
-                    }
-                }
-                if (tramp_is_reflect_apply(call_argv[-1]) && call_argc >= 3
-                    && JS_VALUE_GET_TAG(call_argv[2]) == JS_TAG_OBJECT) {   /* Reflect.apply(g.next, gen, argsList) */
-                    int gmag = tramp_gen_method_magic(call_argv[0], call_argv[1]);
-                    if (gmag >= 0) {
-                        JSValue gnext = (JSValue)call_argv[0];   /* target -> method operand */
-                        JSValue genv = (JSValue)call_argv[1];    /* thisArg -> `this` operand */
-                        JSValue resumeVal = JS_UNDEFINED;
-                        { uint32_t alen = 0; JSValue *atab = build_arg_list(ctx, &alen, call_argv[2]);
-                          if (!atab) goto exception;
-                          if (alen >= 1) resumeVal = js_dup(atab[0]);
-                          for (uint32_t k = 0; k < alen; k++) JS_FreeValue(ctx, atab[k]);
-                          js_free(ctx, atab); }
-                        JS_FreeValue(ctx, (JSValue)call_argv[-2]);   /* Reflect */
-                        JS_FreeValue(ctx, (JSValue)call_argv[-1]);   /* apply */
-                        for (int k = 2; k < call_argc; k++) JS_FreeValue(ctx, (JSValue)call_argv[k]);  /* argsList + any extra operands */
-                        ((JSValue *)call_argv)[-2] = genv;
-                        ((JSValue *)call_argv)[-1] = gnext;
-                        ((JSValue *)call_argv)[0]  = resumeVal;
-                        sp = (JSValue *)&call_argv[1];
-                        call_argc = 1; tramp_first = -2; tramp_gen_magic = gmag;
-                        tramp_is_tail = (opcode == OP_tail_call_method);
-                        goto do_generator_tramp;
-                    }
-                }
+                /* DELETED: the two generator-via-APPLY reshapes (`g.next.apply(gen, args)` and
+                   `Reflect.apply(g.next, gen, args)`). They were UNREACHABLE: the general `.apply` and
+                   `Reflect.apply` routes above test the SAME operand shapes — an undefined/null/object argument
+                   list — and jump to do_apply_tramp first, so nothing could fall this far. They were also the last
+                   two places in the interpreter that read a CreateListFromArrayLike list with build_arg_list from
+                   C, which is what made them worth finding: dead code that would run the page's element getters
+                   with no flow base if anything ever reached it. They existed because deleting the general routes
+                   used to break a generator target; the general routes stayed, so these became residue instead. */
                 tramp_first = -2; tramp_is_tail = (opcode == OP_tail_call_method);
                 goto do_consumer_dispatch;   /* consumers, then fall to do_generic_callee */
             }
@@ -32250,19 +32199,36 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 scope_idx = get_u16(pc) - 1;
                 pc += 2;
                 sf->cur_pc = pc;
-                tab = build_arg_list(ctx, &len, sp[-1]);
-                if (!tab)
-                    goto exception;
-                if (js_same_value(ctx, sp[-2], ctx->eval_obj)) {
-                    if (len >= 1)
-                        obj = tab[0];
-                    else
-                        obj = JS_UNDEFINED;
-                    ret_val = JS_EvalObject(ctx, JS_UNDEFINED, obj,
-                                            JS_EVAL_TYPE_DIRECT, scope_idx);
-                } else {
-                    ret_val = JS_Call(ctx, sp[-2], JS_UNDEFINED, len, vc(tab));
+                if (!js_same_value(ctx, sp[-2], ctx->eval_obj)) {
+                    /* `eval` that resolved to something ELSE is an ORDINARY call with a spread argument list, and
+                       JS_Call ran that callee to COMPLETION from C — a bytecode body's loop preempted with no flow
+                       base, and a step-machine or consumer callee reached its C entry. It is the apply shape
+                       exactly (callee, argument list, no `this`), so it goes where every other one goes; the two
+                       operands are what cfirst -2 with cargc 0 frees. */
+                    ap_func = sp[-2]; ap_this = JS_UNDEFINED; ap_array = sp[-1];
+                    ap_cfirst = -2; ap_cargc = 0; tramp_is_tail = 0;
+                    goto do_apply_tramp;
                 }
+                {
+                    /* DIRECT eval takes only the FIRST element. The operand is the SPREAD's own array, which the
+                       compiler emits (OP_array_from + OP_append), so reading it is a slot read and invokes
+                       nothing — ASSERTED here rather than claimed in a comment, because that is the only thing
+                       separating this from every other list that has to be read on the tramp. */
+                    uint32_t elen = 0;
+                    bool efast = arg_list_is_fast(ctx, sp[-1], &elen);
+                    DCHECK(efast, "OP_apply_eval's operand is the spread's own compiler-built array; a non-fast "
+                                  "one means another site feeds this opcode and its list needs CONT_ARG_LIST");
+                    if (unlikely(!efast)) {
+                        JS_ThrowInternalError(ctx, "eval spread operand is not a compiler-built array");
+                        goto exception;
+                    }
+                    tab = arg_list_fast_build(ctx, sp[-1], elen);
+                    if (unlikely(!tab))
+                        goto exception;
+                    len = elen;
+                }
+                obj = (len >= 1) ? tab[0] : JS_UNDEFINED;
+                ret_val = JS_EvalObject(ctx, JS_UNDEFINED, obj, JS_EVAL_TYPE_DIRECT, scope_idx);
                 free_arg_list(ctx, tab, len);
                 if (unlikely(JS_IsException(ret_val)))
                     goto exception;
@@ -59888,50 +59854,13 @@ static void free_arg_list(JSContext *ctx, JSValue *tab, uint32_t len)
     js_free(ctx, tab);
 }
 
-/* XXX: should use ValueArray */
-static JSValue *build_arg_list(JSContext *ctx, uint32_t *plen,
-                               JSValueConst array_arg)
-{
-    uint32_t len, i;
-    JSValue *tab, ret;
-    JSObject *p;
-
-    if (JS_VALUE_GET_TAG(array_arg) != JS_TAG_OBJECT) {
-        JS_ThrowTypeError(ctx, "not a object");
-        return NULL;
-    }
-    if (js_get_length32(ctx, &len, array_arg))
-        return NULL;
-    if (len > JS_MAX_LOCAL_VARS) {
-        // XXX: check for stack overflow?
-        JS_ThrowRangeError(ctx, "too many arguments in function call (only %d allowed)",
-                           JS_MAX_LOCAL_VARS);
-        return NULL;
-    }
-    /* avoid allocating 0 bytes */
-    tab = js_mallocz(ctx, sizeof(tab[0]) * max_uint32(1, len));
-    if (!tab)
-        return NULL;
-    p = JS_VALUE_GET_OBJ(array_arg);
-    if ((p->class_id == JS_CLASS_ARRAY || p->class_id == JS_CLASS_ARGUMENTS) &&
-        p->fast_array &&
-        len == p->u.array.count) {
-        for(i = 0; i < len; i++) {
-            tab[i] = js_dup(p->u.array.u.values[i]);
-        }
-    } else {
-        for(i = 0; i < len; i++) {
-            ret = JS_GetPropertyUint32(ctx, array_arg, i);
-            if (JS_IsException(ret)) {
-                free_arg_list(ctx, tab, i);
-                return NULL;
-            }
-            tab[i] = ret;
-        }
-    }
-    *plen = len;
-    return tab;
-}
+/* DELETED: build_arg_list. It WAS 19.2.3.1 CreateListFromArrayLike performed from C — `? LengthOfArrayLike(obj)`
+   with js_get_length32 and a `? Get(obj, index)` loop with JS_GetPropertyUint32 — which is the page's code at every
+   step, and it had ten callers across the apply trampoline, the construct dispatch, two unreachable
+   generator reshapes, OP_apply_eval and three unregistered C bodies. CONT_ARG_LIST performs the operation on the
+   tramp with a cursor; arg_list_is_fast / arg_list_fast_build answer for the compiler-built lists that invoke
+   nothing. There is no C form left, which is why this comment stands where the function did: the operation exists
+   once. */
 
 /* magic value: 0 = normal apply, 1 = apply for constructor, 2 =
    Reflect.apply */
