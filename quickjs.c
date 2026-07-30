@@ -19717,7 +19717,7 @@ typedef struct JSConsumeGetIter { void *consumer; uint8_t consumer_kind; } JSCon
    immediately AFTER the coercion it belongs to, so nothing before it re-executes. TPR_NONE is the unconverted
    sites' retry and goes when they do. */
 enum { TPR_NONE = 0, TPR_ARITH_AFTER_LEFT, TPR_ARITH_AFTER_RIGHT, TPR_ADD_AFTER_COERCE,
-       TPR_PROPKEY, TPR_PROPKEY2 };
+       TPR_PROPKEY, TPR_PROPKEY2, TPR_IN, TPR_DELETE };
 typedef struct JSToPrim {
     JSValue obj;              /* the object being coerced (owned) */
     const uint8_t *retry_pc;  /* OPERAND mode, LEGACY: the opcode byte to RE-EXECUTE once the slot holds a
@@ -27022,6 +27022,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (rat == TPR_ADD_AFTER_COERCE) goto do_add_after_coerce;
                         if (rat == TPR_PROPKEY) goto do_propkey_classify;
                         if (rat == TPR_PROPKEY2) goto do_propkey2_classify;
+                        if (rat == TPR_IN) goto do_in_after_key;
+                        if (rat == TPR_DELETE) goto do_delete_after_key;
                         DCHECK(rat == TPR_ARITH_AFTER_RIGHT, "an operand coercion resumed at an unknown point");
                         goto do_arith_after_right;
                     }
@@ -35791,7 +35793,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             /* ToPropertyKey on the LEFT operand is the page's @@toPrimitive/valueOf/toString, and `in` was the one
                keyed operator that never joined key_toprim — both js_operator_in and the old proxy reshape reached
                it through JS_ValueToAtom from C. */
-            if (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT) { tp_slot = -2; tp_retry_pc = pc - 1; goto key_toprim; }
+            if (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT) { tp_slot = -2; tp_retry_pc = pc - 1;
+                                                              tp_resume_at = TPR_IN; goto key_toprim; }
+        do_in_after_key:
+            /* THE RESUME POINT: the key coercion is the first thing this opcode does, so everything from here on
+               is the operation itself and nothing above it re-executes. */
             /* `k in obj` IS [[HasProperty]], which on a Proxy is the `has` trap and therefore the page's code —
                and so is the READ of that trap off the handler. Both are the ONE keyed-operation entry's GP_HAS,
                the same request Reflect.has issues, so every trap kind runs on this chain and the operator holds
@@ -35863,7 +35869,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             sf->cur_pc = pc;
             /* ToPropertyKey on the key operand is the page's code; js_operator_delete and the old proxy reshape
                both reached it through JS_ValueToAtom from C. */
-            if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) { tp_slot = -1; tp_retry_pc = pc - 1; goto key_toprim; }
+            if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) { tp_slot = -1; tp_retry_pc = pc - 1;
+                                                              tp_resume_at = TPR_DELETE; goto key_toprim; }
+        do_delete_after_key:
+            /* the same: the coercion is this opcode's first act, so the resume is simply the rest of it. */
             /* `delete obj[k]` step 5 IS the BARE [[Delete]] — on a Proxy the `deleteProperty` trap, and its read
                off the handler — so it is the one keyed-operation entry's GP_DELETE with no_throw, the same request
                Reflect.deleteProperty issues. Step 6's strict-mode TypeError is the OPERATOR's and rides
