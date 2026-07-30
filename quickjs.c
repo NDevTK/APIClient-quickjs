@@ -19056,6 +19056,24 @@ typedef struct JSOpKeyed {
                                   to is parked across them, exactly as a handler's trap READ parks it. It is the
                                   same nesting CONT_TRAP_GET already is: a keyed request whose outer is not a
                                   machine but another keyed OPERATION, carrying what waits on that one. */
+#define CONT_SETMAP_CTOR   67  /* gp_outer = JSSetMapCtor: `new Set(gen)` / `new Map(gen)` runs TWO of the page's
+                                  operations before it can consume anything — 10.1.13 step 2's
+                                  `Get(newTarget, "prototype")` inside js_map_constructor, and 24.1.1.1 step 5's
+                                  `Get(map, "add"/"set")`, which a subclass can make an accessor or put on a
+                                  Proxy. Both ran from C. Two reads is why this is a sequence with a PHASE rather
+                                  than another copy of CONT_TA_TARGET: the second read has no analogue there. */
+typedef struct JSSetMapCtor {
+    void *consume;          /* the JSIterConsume the instance belongs to; OWNED until the acquire adopts it */
+    JSValue ntgt;           /* new_target (owned): 10.1.13 step 3's realm fallback inspects it, invoking nothing */
+    JSValue getiter;        /* the probed @@iterator (owned), restored into tramp_iter_getiter on delivery */
+    JSValueConst iterable;  /* borrowed: the caller's own operand, which outlives the suspension */
+    int magic;              /* 0 = Map, MAGIC_SET = Set — the class id and the adder's name both follow from it */
+    uint8_t phase;          /* SMC_PROTO / SMC_ADDER */
+} JSSetMapCtor;
+enum { SMC_PROTO = 0, SMC_ADDER };
+static void js_setmap_ctor_free(JSContext *ctx, JSSetMapCtor *sc);
+static int js_map_state_init(JSContext *ctx, JSValueConst obj, int magic);
+
 #define CONT_TA_TARGET     66  /* gp_outer = JSTATarget: 23.2.5.1 step 6.a.i's AllocateTypedArray, whose
                                   OrdinaryCreateFromConstructor reads `Get(newTarget, "prototype")` — the same
                                   page-visible read CONT_CTOR_PROTO parks a construct across, reached here from
@@ -19827,6 +19845,17 @@ static bool arr_len_write_needs_toprim(JSValueConst target, JSAtom atom, JSValue
 /* The read threw or was abandoned: the typed array can never be allocated, so the CONSUME machine goes with it —
    by its own rule, which is js_iter_consume_end plus the block, because the machine holds the argument list and
    the requester that the throw must not leak. */
+/* Either read threw or was abandoned: the instance can never be consumed into, so the CONSUME machine goes with
+   it by its own teardown — it holds the argument list, the construct requester and (past the first read) the
+   instance itself. */
+static void js_setmap_ctor_free(JSContext *ctx, JSSetMapCtor *sc)
+{
+    if (sc->consume) { js_iter_consume_end(ctx, sc->consume); js_free_rt(ctx->rt, sc->consume); }
+    JS_FreeValue(ctx, sc->ntgt);
+    JS_FreeValue(ctx, sc->getiter);
+    js_free_rt(ctx->rt, sc);
+}
+
 static void js_ta_target_free(JSContext *ctx, JSTATarget *tt)
 {
     if (tt->consume) { js_iter_consume_end(ctx, tt->consume); js_free_rt(ctx->rt, tt->consume); }
@@ -20169,6 +20198,7 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_ARRAY_LEN:
     case CONT_CTOR_PROTO:
     case CONT_TA_TARGET:
+    case CONT_SETMAP_CTOR:
     case CONT_OP_KEYED:
     case CONT_FOR_IN_HAS:
     case CONT_OWNKEYS_CHK:
@@ -27632,6 +27662,50 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                           cont_st = gouter0;
                           goto do_toprim_have_method;
                       }
+                      if (gk == CONT_SETMAP_CTOR) {
+                          JSSetMapCtor *sc = gouter0;
+                          JSIterConsume *scs = sc->consume;
+                          JSValue rv = ret_val; ret_val = JS_UNDEFINED;
+                          if (sc->phase == SMC_PROTO) {
+                              /* 10.1.13 step 3's realm fallback, then the instance and its [[MapData]] slot. */
+                              if (!JS_IsObject(rv)) {
+                                  JSContext *srealm;
+                                  JS_FreeValue(ctx, rv);
+                                  srealm = JS_GetFunctionRealm(ctx, sc->ntgt);
+                                  if (unlikely(!srealm)) { js_setmap_ctor_free(ctx, sc); goto exception; }
+                                  rv = js_dup(srealm->class_proto[JS_CLASS_MAP + sc->magic]);
+                              }
+                              scs->r = JS_NewObjectProtoClass(ctx, rv, JS_CLASS_MAP + sc->magic);
+                              JS_FreeValue(ctx, rv);
+                              if (unlikely(JS_IsException(scs->r))) {
+                                  scs->r = JS_UNDEFINED; js_setmap_ctor_free(ctx, sc); goto exception;
+                              }
+                              if (unlikely(js_map_state_init(ctx, scs->r, sc->magic) < 0)) {
+                                  js_setmap_ctor_free(ctx, sc); goto exception;
+                              }
+                              /* 24.1.1.1 step 5: `? Get(map, "add"/"set")`, the page's code for a subclass. */
+                              sc->phase = SMC_ADDER;
+                              gp_outer = sc; gp_outer_kind = CONT_SETMAP_CTOR;
+                              gp_obj = scs->r; gp_atom = (sc->magic & MAGIC_SET) ? JS_ATOM_add : JS_ATOM_set;
+                              gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                              goto do_getprop_tramp;
+                          }
+                          DCHECK(sc->phase == SMC_ADDER, "the Set/Map construct sequence resumed in no phase");
+                          if (!JS_IsFunction(ctx, rv)) {   /* step 6's IsCallable check */
+                              JS_FreeValue(ctx, rv);
+                              JS_ThrowTypeError(ctx, "%s is not a function",
+                                                (sc->magic & MAGIC_SET) ? "add" : "set");
+                              js_setmap_ctor_free(ctx, sc);
+                              goto exception;
+                          }
+                          scs->adder = rv;
+                          tramp_iter_getiter = sc->getiter; sc->getiter = JS_UNDEFINED;
+                          tramp_consume_iterable = sc->iterable;
+                          tramp_consume_state = scs; tramp_consume_kind = CONT_ITER_CONSUME;
+                          sc->consume = NULL;   /* the machine is the acquire's now */
+                          js_setmap_ctor_free(ctx, sc);
+                          goto do_consume_acquire_iterator;
+                      }
                       if (gk == CONT_TA_TARGET) {
                           /* the new_target's `prototype` is in hand: 10.1.13 step 3's realm fallback, then the
                              object lands on the consume machine and the acquire starts. */
@@ -27920,6 +27994,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         gp_outer = gd->outer; gp_outer_kind = gd->outer_kind;
                         js_gopd_desc_free(ctx, gd);
                         goto getprop_throw;
+                    }
+                    if (gk3 == CONT_SETMAP_CTOR) {
+                        /* either read threw: the instance can never be consumed into, and the machine goes with
+                           it by its own teardown. */
+                        js_setmap_ctor_free(ctx, gouter);
+                        goto exception;
                     }
                     if (gk3 == CONT_TA_TARGET) {
                         /* the `prototype` read threw: the typed array can never be allocated and the consume
@@ -28444,26 +28524,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                OP_call_constructor recognition; call_argv[-2]=ctor, [-1]=new.target, [0]=the generator. Fork-safe:
                each arm's adder call is COW-isolated by the map_add capture. */
             {
-                JSValueConst ntgt = smc_ntgt;
-                int magic = smc_magic;
                 JSIterConsume *s;
-                JSValue obj, adder;
-                obj = js_map_constructor(ctx, ntgt, 0, NULL, magic);   /* empty Set/Map */
-                if (JS_IsException(obj)) { JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED; goto exception; }
-                adder = JS_GetProperty(ctx, obj, (magic & MAGIC_SET) ? JS_ATOM_add : JS_ATOM_set);
-                if (JS_IsException(adder)) { JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED; JS_FreeValue(ctx, obj); goto exception; }
-                if (!JS_IsFunction(ctx, adder)) {
-                    JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED;
-                    JS_FreeValue(ctx, adder); JS_FreeValue(ctx, obj);
-                    JS_ThrowTypeError(ctx, "%s is not a function", (magic & MAGIC_SET) ? "add" : "set");
-                    goto exception;
-                }
+                JSSetMapCtor *sc;
+                /* the machine is built FIRST, exactly as the TypedArray arm's is: everything it takes from the
+                   smc_* registers is pure state assignment, and those registers do not survive the two reads
+                   below. What it still lacks is its INSTANCE and its ADDER, which are what the reads produce. */
                 s = js_iter_consume_new(ctx);
-                if (unlikely(!s)) { JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED; JS_FreeValue(ctx, adder); JS_FreeValue(ctx, obj); JS_ThrowOutOfMemory(ctx); goto exception; }
-                s->r = obj;
-                s->adder = adder;
+                if (unlikely(!s)) { JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED; JS_ThrowOutOfMemory(ctx); goto exception; }
                 s->k = 0;
-                s->sink = (magic & MAGIC_SET) ? ITERCONS_SET : ITERCONS_MAP;
+                s->sink = (smc_magic & MAGIC_SET) ? ITERCONS_SET : ITERCONS_MAP;
                 s->outer = smc_outer; s->outer_kind = smc_outer_kind;
                 /* a machine's own Construct borrows ITS buffer, so there is nothing on the stack to pop — the
                    same rule the step-constructor arm states one branch away. */
@@ -28474,8 +28543,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->super_ref = smc_super_ref; smc_super_ref = JS_UNDEFINED;   /* super() entry owns it */
                 s->args_own = smc_args_own; s->args_own_n = smc_args_own_n;   /* NULL for an operand shape */
                 smc_args_own = NULL; smc_args_own_n = 0;
-                tramp_consume_iterable = smc_items; tramp_consume_state = s; tramp_consume_kind = CONT_ITER_CONSUME;
-                goto do_consume_acquire_iterator;
+                sc = js_mallocz(ctx, sizeof(*sc));
+                if (unlikely(!sc)) {
+                    js_iter_consume_end(ctx, s); js_free_rt(rt, s);
+                    JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED;
+                    JS_ThrowOutOfMemory(ctx); goto exception;
+                }
+                sc->consume = s;
+                sc->ntgt = js_dup(smc_ntgt);
+                sc->getiter = tramp_iter_getiter; tramp_iter_getiter = JS_UNDEFINED;
+                sc->iterable = smc_items;
+                sc->magic = smc_magic;
+                sc->phase = SMC_PROTO;
+                sf->cur_pc = pc;
+                gp_outer = sc; gp_outer_kind = CONT_SETMAP_CTOR;
+                gp_obj = sc->ntgt; gp_atom = JS_ATOM_prototype;
+                gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                goto do_getprop_tramp;
             }
 
         do_groupby_consume_tramp:
@@ -30947,7 +31031,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            || gouter_kind == CONT_KEYED_INV || gouter_kind == CONT_WITH_HAS
                            || gouter_kind == CONT_SET_RECV || gouter_kind == CONT_TOPRIM_GET
                            || gouter_kind == CONT_DEFINE_CLASS || gouter_kind == CONT_ARRAY_LEN
-                           || gouter_kind == CONT_CTOR_PROTO || gouter_kind == CONT_TA_TARGET,
+                           || gouter_kind == CONT_CTOR_PROTO || gouter_kind == CONT_TA_TARGET
+                           || gouter_kind == CONT_SETMAP_CTOR,
                            "property-get outer continuation: unknown machine kind");
                     if (gouter_kind == CONT_PROMISE_ALL_THEN) {
                         js_getprop_free(ctx, gp);
@@ -31356,6 +31441,58 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             goto getprop_throw;
                         }
                         goto do_ownkeys_chk_step;
+                    }
+                    if (gouter_kind == CONT_SETMAP_CTOR) {
+                        if (unlikely(JS_IsException(ret_val))) {
+                        /* either read threw: the instance can never be consumed into, and the machine goes with
+                               it by its own teardown. */
+                            js_setmap_ctor_free(ctx, gouter);
+                            goto exception;
+                        }
+                        {
+                          JSSetMapCtor *sc = gouter;
+                            JSIterConsume *scs = sc->consume;
+                            JSValue rv = ret_val; ret_val = JS_UNDEFINED;
+                            if (sc->phase == SMC_PROTO) {
+                                /* 10.1.13 step 3's realm fallback, then the instance and its [[MapData]] slot. */
+                                if (!JS_IsObject(rv)) {
+                                    JSContext *srealm;
+                                    JS_FreeValue(ctx, rv);
+                                    srealm = JS_GetFunctionRealm(ctx, sc->ntgt);
+                                    if (unlikely(!srealm)) { js_setmap_ctor_free(ctx, sc); goto exception; }
+                                    rv = js_dup(srealm->class_proto[JS_CLASS_MAP + sc->magic]);
+                                }
+                                scs->r = JS_NewObjectProtoClass(ctx, rv, JS_CLASS_MAP + sc->magic);
+                                JS_FreeValue(ctx, rv);
+                                if (unlikely(JS_IsException(scs->r))) {
+                                    scs->r = JS_UNDEFINED; js_setmap_ctor_free(ctx, sc); goto exception;
+                                }
+                                if (unlikely(js_map_state_init(ctx, scs->r, sc->magic) < 0)) {
+                                    js_setmap_ctor_free(ctx, sc); goto exception;
+                                }
+                                /* 24.1.1.1 step 5: `? Get(map, "add"/"set")`, the page's code for a subclass. */
+                                sc->phase = SMC_ADDER;
+                                gp_outer = sc; gp_outer_kind = CONT_SETMAP_CTOR;
+                                gp_obj = scs->r; gp_atom = (sc->magic & MAGIC_SET) ? JS_ATOM_add : JS_ATOM_set;
+                                gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                                goto do_getprop_tramp;
+                            }
+                            DCHECK(sc->phase == SMC_ADDER, "the Set/Map construct sequence resumed in no phase");
+                            if (!JS_IsFunction(ctx, rv)) {   /* step 6's IsCallable check */
+                                JS_FreeValue(ctx, rv);
+                                JS_ThrowTypeError(ctx, "%s is not a function",
+                                                  (sc->magic & MAGIC_SET) ? "add" : "set");
+                                js_setmap_ctor_free(ctx, sc);
+                                goto exception;
+                            }
+                            scs->adder = rv;
+                            tramp_iter_getiter = sc->getiter; sc->getiter = JS_UNDEFINED;
+                            tramp_consume_iterable = sc->iterable;
+                            tramp_consume_state = scs; tramp_consume_kind = CONT_ITER_CONSUME;
+                            sc->consume = NULL;   /* the machine is the acquire's now */
+                            js_setmap_ctor_free(ctx, sc);
+                            goto do_consume_acquire_iterator;
+                        }
                     }
                     if (gouter_kind == CONT_TA_TARGET) {
                         if (unlikely(JS_IsException(ret_val))) {
@@ -35938,7 +36075,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    || gk2 == CONT_OWNKEYS_CHK || gk2 == CONT_PROXY_INV || gk2 == CONT_KEYED_INV
                    || gk2 == CONT_WITH_HAS || gk2 == CONT_SET_RECV || gk2 == CONT_TOPRIM_GET
                    || gk2 == CONT_DEFINE_CLASS || gk2 == CONT_ARRAY_LEN || gk2 == CONT_CTOR_PROTO
-                   || gk2 == CONT_TA_TARGET
+                   || gk2 == CONT_TA_TARGET || gk2 == CONT_SETMAP_CTOR
                    || gk2 == CONT_OP_KEYED
                    || gk2 == CONT_PROMISE_ALL_THEN || gk2 == CONT_AFS_GET
                    || gk2 == CONT_ITER_HELPER_GET || gk2 == CONT_PROMISE_ALL_GET
@@ -36013,6 +36150,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 goto getprop_throw;
             } else if (gouter && gk2 == CONT_WITH_HAS) {
                 js_with_has_free(ctx, gouter);
+                goto exception;
+            } else if (gouter && gk2 == CONT_SETMAP_CTOR) {
+                        /* either read threw: the instance can never be consumed into, and the machine goes with
+                   it by its own teardown. */
+                js_setmap_ctor_free(ctx, gouter);
                 goto exception;
             } else if (gouter && gk2 == CONT_TA_TARGET) {
                         /* the `prototype` read threw: the typed array can never be allocated and the consume
@@ -76117,6 +76259,26 @@ static const JSCFunctionListEntry js_symbol_funcs[] = {
 #define MAGIC_SET (1 << 0)
 #define MAGIC_WEAK (1 << 1)
 
+/* 24.1.1.1 step 3 / 24.2.1.1 step 3: the [[MapData]] / [[SetData]] slot. It is not the page's code and it is not
+   the object's creation either, so it is its own function — the interpreter's consume arm creates the object from a
+   ROUTED `prototype` read and then needs exactly this. -1 = threw. */
+static int js_map_state_init(JSContext *ctx, JSValueConst obj, int magic)
+{
+    JSMapState *s = js_mallocz(ctx, sizeof(*s));
+    if (!s)
+        return -1;
+    init_list_head(&s->records);
+    s->is_weak = ((magic & MAGIC_WEAK) != 0);
+    JS_SetOpaqueInternal(unsafe_unconst(obj), s);
+    s->hash_size = 1;
+    s->hash_table = js_malloc(ctx, sizeof(s->hash_table[0]) * s->hash_size);
+    if (!s->hash_table)
+        return -1;   /* the state is on the object now; the object's finalizer owns it */
+    init_list_head(&s->hash_table[0]);
+    s->record_count_threshold = 4;
+    return 0;
+}
+
 static JSValue js_map_constructor(JSContext *ctx, JSValueConst new_target,
                                   int argc, JSValueConst *argv, int magic)
 {
@@ -76130,18 +76292,10 @@ static JSValue js_map_constructor(JSContext *ctx, JSValueConst new_target,
     obj = js_create_from_ctor(ctx, new_target, JS_CLASS_MAP + magic);
     if (JS_IsException(obj))
         return JS_EXCEPTION;
-    s = js_mallocz(ctx, sizeof(*s));
-    if (!s)
+    if (js_map_state_init(ctx, obj, magic) < 0)
         goto fail;
-    init_list_head(&s->records);
-    s->is_weak = is_weak;
-    JS_SetOpaqueInternal(obj, s);
-    s->hash_size = 1;
-    s->hash_table = js_malloc(ctx, sizeof(s->hash_table[0]) * s->hash_size);
-    if (!s->hash_table)
-        goto fail;
-    init_list_head(&s->hash_table[0]);
-    s->record_count_threshold = 4;
+    s = JS_GetOpaque(obj, JS_CLASS_MAP + magic);
+    (void)s; (void)is_weak;
 
     arr = JS_UNDEFINED;
     if (argc > 0)
