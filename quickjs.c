@@ -1503,6 +1503,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_GLOBAL_EVAL,
     STEPDEF_ITER_CONCAT,
     STEPDEF_STR_ITERATOR,
+    STEPDEF_STR_INCLUDES, STEPDEF_STR_ENDSWITH, STEPDEF_STR_STARTSWITH,
     STEPDEF_ITER_ZIP, STEPDEF_ITER_ZIP_KEYED, STEPDEF_ITER_ZIP_NEXT, STEPDEF_ITER_ZIP_RETURN,
     STEPDEF_FUNCTION_CTOR, STEPDEF_GENERATOR_FUNCTION_CTOR,
     STEPDEF_ASYNC_FUNCTION_CTOR, STEPDEF_ASYNC_GENERATOR_FUNCTION_CTOR,
@@ -21426,6 +21427,13 @@ typedef struct JSStrIterCreate {
     JSStepHdr hdr;
     JSValue result;
 } JSStrIterCreate;
+
+typedef struct JSStrIncludes {
+    JSStepHdr hdr;
+    JSValue result;
+    JSValue str;     /* the coerced receiver (owned) */
+    JSValue v;       /* the coerced search string (owned) */
+} JSStrIncludes;
 
 typedef struct JSIterZip {
     JSStepHdr hdr;
@@ -64692,6 +64700,13 @@ static int js_iter_zip_drive_step(JSContext *ctx, void *st, JSValue cb_result, J
 static JSValue js_iter_zip_drive_fini(JSContext *ctx, void *st, bool take_result);
 static int js_string_iterator_create_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_string_iterator_create_fini(JSContext *ctx, void *st, bool take_result);
+static int js_string_includes_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_string_includes_fini(JSContext *ctx, void *st, bool take_result);
+#define STR_INCLUDES_DEF(mg) { sizeof(JSStrIncludes), js_string_includes_step, js_string_includes_fini, mg }
+static const JSTrampStepDef js_str_includes_def   = STR_INCLUDES_DEF(0);
+static const JSTrampStepDef js_str_endswith_def   = STR_INCLUDES_DEF(2);
+static const JSTrampStepDef js_str_startswith_def = STR_INCLUDES_DEF(1);
+#undef STR_INCLUDES_DEF
 static const JSTrampStepDef js_str_iterator_def =
     { sizeof(JSStrIterCreate), js_string_iterator_create_step, js_string_iterator_create_fini, 0 };
 static const JSTrampStepDef js_iter_zip_def =
@@ -66581,6 +66596,9 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_GLOBAL_EVAL]     = &js_global_eval_def,
     [STEPDEF_ITER_CONCAT]     = &js_iter_concat_def,
     [STEPDEF_STR_ITERATOR]    = &js_str_iterator_def,
+    [STEPDEF_STR_INCLUDES]    = &js_str_includes_def,
+    [STEPDEF_STR_ENDSWITH]    = &js_str_endswith_def,
+    [STEPDEF_STR_STARTSWITH]  = &js_str_startswith_def,
     [STEPDEF_ITER_ZIP]        = &js_iter_zip_def,
     [STEPDEF_ITER_ZIP_KEYED]  = &js_iter_zip_keyed_def,
     [STEPDEF_ITER_ZIP_NEXT]   = &js_iter_zip_next_def,
@@ -71036,35 +71054,99 @@ static JSValue js_string_toWellFormed(JSContext *ctx, JSValueConst this_val,
 /* return < 0 if exception or true/false */
 static int js_is_regexp(JSContext *ctx, JSValueConst obj);
 
-static JSValue js_string_includes(JSContext *ctx, JSValueConst this_val,
-                                  int argc, JSValueConst *argv, int magic)
+static JSRegExp *js_get_regexp(JSContext *ctx, JSValueConst obj, bool throw_error);
+
+/* 22.1.3.8 includes / 22.1.3.7 endsWith / 22.1.3.24 startsWith. FOUR of their steps are the page's code and every
+   one ran from C: the receiver's ToString, IsRegExp's `? Get(searchString, @@match)`, the search string's own
+   ToString, and ToIntegerOrInfinity on the position. Their ORDER is observable and is the order the stages are in;
+   everything after is a string compare that invokes nothing, which is why the search is its own function taking
+   both strings already coerced. */
+enum { SI_THIS = 0, SI_MATCH, SI_SEARCH, SI_POS };
+
+static JSValue js_string_includes_search(JSContext *ctx, JSValueConst strv, JSValueConst vv, int pos_in,
+                                         bool has_pos, int magic);
+
+static int js_string_includes_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    JSValue str, v = JS_UNDEFINED;
+    JSStrIncludes *s = st;
+    int magic = s->hdr.arg;
+    JSValueConst search = step_arg(&s->hdr, 0), position = step_arg(&s->hdr, 1);
+    bool has_pos = s->hdr.argc > 1 && !JS_IsUndefined(position);
+    int pos = 0, r;
+
+    if (s->hdr.stage == SI_THIS) {
+        r = step_thisstring_run(ctx, &s->hdr, cb_result, &s->str, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = SI_MATCH;
+        if (!JS_IsObject(search))
+            goto not_regexp;            /* IsRegExp step 1: a primitive is not one, and reads nothing */
+        r = step_getprop_run(ctx, &s->hdr, search, JS_ATOM_Symbol_match, JS_UNDEFINED, &cb_result,
+                             out_cb, out_argc);
+        if (r) return r < 0 ? -1 : r;
+    }
+    if (s->hdr.stage == SI_MATCH) {
+        JSValue m = JS_UNDEFINED;
+        r = step_getprop_run(ctx, &s->hdr, search, JS_ATOM_Symbol_match, cb_result, &m, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        /* IsRegExp steps 2-4: a DEFINED @@match decides by ToBoolean, otherwise the [[RegExpMatcher]] slot does. */
+        if (JS_IsUndefined(m) ? js_get_regexp(ctx, search, false) != NULL : JS_ToBoolFree(ctx, m)) {
+            JS_ThrowTypeError(ctx, "regexp not supported");
+            return -1;
+        }
+    not_regexp:
+        s->hdr.stage = SI_SEARCH;
+        r = step_tostring_run(ctx, &s->hdr, search, JS_UNDEFINED, &s->v, out_cb, out_argc);
+        if (r) return r < 0 ? -1 : r;
+        goto have_search;
+    }
+    if (s->hdr.stage == SI_SEARCH) {
+        r = step_tostring_run(ctx, &s->hdr, search, cb_result, &s->v, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+    have_search:
+        s->hdr.stage = SI_POS;
+        if (!has_pos)
+            goto have_pos;
+        r = step_toint32sat_run(ctx, &s->hdr, position, JS_UNDEFINED, &pos, out_cb, out_argc);
+        if (r) return r < 0 ? -1 : r;
+        goto have_pos;
+    }
+    DCHECK(s->hdr.stage == SI_POS, "String.prototype.includes resumed in an unknown stage");
+    r = step_toint32sat_run(ctx, &s->hdr, position, cb_result, &pos, out_cb, out_argc);
+    if (r) return r < 0 ? -1 : r;
+ have_pos:
+    s->result = js_string_includes_search(ctx, s->str, s->v, pos, has_pos, magic);
+    return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
+}
+
+static JSValue js_string_includes_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSStrIncludes *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    JS_FreeValue(ctx, s->str);
+    JS_FreeValue(ctx, s->v);
+    js_free(ctx, s);
+    return r;
+}
+
+static JSValue js_string_includes_search(JSContext *ctx, JSValueConst strv, JSValueConst vv, int pos_in,
+                                         bool has_pos, int magic)
+{
+    JSValueConst str = strv, v = vv;
     int i, len, v_len, pos, start, stop, ret;
     JSString *p;
     JSString *p1;
 
-    str = JS_ToStringCheckObject(ctx, this_val);
-    if (JS_IsException(str))
-        return str;
-    ret = js_is_regexp(ctx, argv[0]);
-    if (ret) {
-        if (ret > 0)
-            JS_ThrowTypeError(ctx, "regexp not supported");
-        goto fail;
-    }
-    v = JS_ToString(ctx, argv[0]);
-    if (JS_IsException(v))
-        goto fail;
     p = JS_VALUE_GET_STRING(str);
     p1 = JS_VALUE_GET_STRING(v);
     len = p->len;
     v_len = p1->len;
     pos = (magic == 2) ? len : 0;
-    if (argc > 1 && !JS_IsUndefined(argv[1])) {
-        if (JS_ToInt32Clamp(ctx, &pos, argv[1], 0, len, 0))
-            goto fail;
-    }
+    if (has_pos)
+        pos = min_int(max_int(pos_in, 0), len);
     len -= v_len;
     ret = 0;
     if (magic == 0) {
@@ -71090,14 +71172,7 @@ static JSValue js_string_includes(JSContext *ctx, JSValueConst this_val,
         }
     }
  done:
-    JS_FreeValue(ctx, str);
-    JS_FreeValue(ctx, v);
-    return js_bool(ret);
-
-fail:
-    JS_FreeValue(ctx, str);
-    JS_FreeValue(ctx, v);
-    return JS_EXCEPTION;
+    return js_bool(ret);   /* both strings are BORROWED: the machine owns them and its fini frees them */
 }
 
 static int check_regexp_g_flag(JSContext *ctx, JSValueConst regexp)
@@ -72022,9 +72097,9 @@ static const JSCFunctionListEntry js_string_proto_funcs[] = {
     JS_CFUNC_DEF("toWellFormed", 0, js_string_toWellFormed ),
     JS_CFUNC_STEP_DEF("indexOf", 1, STEPDEF_STR_INDEXOF ),
     JS_CFUNC_STEP_DEF("lastIndexOf", 1, STEPDEF_STR_LASTINDEXOF ),
-    JS_CFUNC_MAGIC_DEF("includes", 1, js_string_includes, 0 ),
-    JS_CFUNC_MAGIC_DEF("endsWith", 1, js_string_includes, 2 ),
-    JS_CFUNC_MAGIC_DEF("startsWith", 1, js_string_includes, 1 ),
+    JS_CFUNC_STEP_DEF("includes", 1, STEPDEF_STR_INCLUDES ),
+    JS_CFUNC_STEP_DEF("endsWith", 1, STEPDEF_STR_ENDSWITH ),
+    JS_CFUNC_STEP_DEF("startsWith", 1, STEPDEF_STR_STARTSWITH ),
     JS_CFUNC_STEP_DEF("match", 1, STEPDEF_STR_MATCH ),
     JS_CFUNC_STEP_DEF("matchAll", 1, STEPDEF_STR_MATCHALL ),
     JS_CFUNC_STEP_DEF("search", 1, STEPDEF_STR_SEARCH ),
