@@ -562,7 +562,6 @@ typedef enum {
 
 enum {
     JS_BUILTIN_ARRAY_FROMASYNC = 1,
-    JS_BUILTIN_ITERATOR_ZIP_KEYED,
 };
 
 /* must be large enough to have a negligible runtime cost and small
@@ -1493,7 +1492,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_REGEXP_EXEC, STEPDEF_REGEXP_TEST,
     STEPDEF_ITER_TAKE, STEPDEF_ITER_DROP, STEPDEF_ITER_WRAP_RETURN,
     STEPDEF_ITER_CONCAT_NEXT, STEPDEF_ITER_CONCAT_RETURN, STEPDEF_ARRAY_ITER_NEXT,
-    STEPDEF_OWNKEYS_NAMES, STEPDEF_OWNKEYS_SYMBOLS, STEPDEF_REFLECT_OWNKEYS, STEPDEF_HAS_OWN_ENUM, STEPDEF_PROP_IS_ENUM, STEPDEF_PROTO_GET, STEPDEF_PROTO_SET, STEPDEF_PROTO_CHAIN,
+    STEPDEF_OWNKEYS_NAMES, STEPDEF_OWNKEYS_SYMBOLS, STEPDEF_REFLECT_OWNKEYS, STEPDEF_PROP_IS_ENUM, STEPDEF_PROTO_GET, STEPDEF_PROTO_SET, STEPDEF_PROTO_CHAIN,
     STEPDEF_OBJ_KEYS, STEPDEF_OBJ_DESCS,
     STEPDEF_REFLECT_GET, STEPDEF_REFLECT_SET, STEPDEF_REFLECT_HAS, STEPDEF_REFLECT_DELETE,
     STEPDEF_PROMISE_RESOLVE, STEPDEF_PROMISE_REJECT, STEPDEF_PROMISE_CATCH, STEPDEF_PROMISE_FINALLY,
@@ -1503,7 +1502,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_ERROR_CTOR_LAST = STEPDEF_ERROR_CTOR_BASE + JS_PLAIN_ERROR,
     STEPDEF_GLOBAL_EVAL,
     STEPDEF_ITER_CONCAT,
-    STEPDEF_ITER_ZIP, STEPDEF_ITER_ZIP_NEXT, STEPDEF_ITER_ZIP_RETURN,
+    STEPDEF_ITER_ZIP, STEPDEF_ITER_ZIP_KEYED, STEPDEF_ITER_ZIP_NEXT, STEPDEF_ITER_ZIP_RETURN,
     STEPDEF_FUNCTION_CTOR, STEPDEF_GENERATOR_FUNCTION_CTOR,
     STEPDEF_ASYNC_FUNCTION_CTOR, STEPDEF_ASYNC_GENERATOR_FUNCTION_CTOR,
     STEPDEF_DV_FIRST,
@@ -9166,7 +9165,6 @@ int JS_SetLength(JSContext *ctx, JSValueConst obj, int64_t len) {
 /* return true, false or (-1) in case of exception */
 
 #include "builtin-array-fromasync.h"
-#include "builtin-iterator-zip-keyed.h"
 
 // like Function.prototype.call but monkey patch-proof
 static JSValue js_call_function(JSContext *ctx, JSValueConst this_val,
@@ -9233,29 +9231,6 @@ static JSValue js_bytecode_autoinit(JSContext *ctx, JSObject *p, JSAtom atom,
             return js_bytecode_eval(ctx, qjsc_builtin_array_fromasync,
                                     sizeof(qjsc_builtin_array_fromasync),
                                     countof(argv), argv);
-        }
-    case JS_BUILTIN_ITERATOR_ZIP_KEYED:
-        {
-            JSValue argv[] = {
-                js_dup(ctx->class_proto[JS_CLASS_ITERATOR_HELPER]),
-                JS_NewCFunctionMagic(ctx, NULL, "InternalError",
-                                     1, JS_CFUNC_step_ctor,
-                                      STEPDEF_ERROR_CTOR_BASE + JS_INTERNAL_ERROR),
-                JS_NewCFunctionMagic(ctx, NULL, "TypeError",
-                                     1, JS_CFUNC_step_ctor,
-                                      STEPDEF_ERROR_CTOR_BASE + JS_TYPE_ERROR),
-                JS_NewCFunction(ctx, js_call_function, "call", 2),
-                JS_NewCFunctionMagic(ctx, NULL, "hasOwnEnumProperty", 2,
-                                     JS_CFUNC_step, STEPDEF_HAS_OWN_ENUM),
-                JS_NewCFunctionMagic(ctx, NULL, "getOwnPropertyKeys", 1,
-                                     JS_CFUNC_step, STEPDEF_REFLECT_OWNKEYS),
-                JS_AtomToValue(ctx, JS_ATOM_Symbol_iterator),
-            };
-            JSValue result = js_bytecode_eval(ctx, qjsc_builtin_iterator_zip_keyed,
-                                              sizeof(qjsc_builtin_iterator_zip_keyed),
-                                              countof(argv), argv);
-            JS_SetConstructorBit(ctx, result, false);
-            return result;
         }
     }
     return JS_UNDEFINED;
@@ -21477,6 +21452,24 @@ typedef struct JSIterZipDrive {
     uint8_t owns;        /* validation passed: the teardown owes the generator `completed` and every input it
                             still holds an IteratorClose under that abrupt completion */
 } JSIterZipDrive;
+
+typedef struct JSIterZipKeyed {
+    JSStepHdr hdr;
+    JSValue result;
+    JSValue padding;
+    JSValue held;
+    JSValue elem;                    /* the property value being flattened (owned) */
+    JSValue cb[2];
+    JSDescFacts facts;               /* the descriptor as the BITS this step tests (owned) — the RECORD answer
+                                        shape, so no descriptor object is built and no field is read back off one */
+    JSAtom *atoms;                   /* the [[OwnPropertyKeys]] SNAPSHOT (owned), taken before any read */
+    uint32_t alen, ai;
+    JSAtom *keys;                    /* the keys kept, in snapshot order (owned) */
+    JSValue *iters, *nexts, *pads;
+    uint32_t n, cap, pad_i;
+    uint8_t mode;
+    uint8_t gi_phase;
+} JSIterZipKeyed;
 
 typedef struct JSIterConcatReturn {
     JSStepHdr hdr;    /* MUST be first: the generic step driver casts the state to JSStepHdr * */
@@ -58238,9 +58231,13 @@ static JSValue js_obj_defprop_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
-/* 27.1.3.4 step 4.c: `desc = ? iterables.[[GetOwnProperty]](key)`, then whether it exists and is enumerable.
-   JS_GetOwnPropertyFlagsInternal ran the `getOwnPropertyDescriptor` trap and its invariant from C. The RECORD
-   answer shape is what this wants — the two attribute bits, not a descriptor object to read fields back off. */
+/* 20.1.3.4 Object.prototype.propertyIsEnumerable: `? ToPropertyKey(V)` FIRST (the page's code), then
+   `? ToObject(this)`, then `? O.[[GetOwnProperty]](key)` and whether it exists and is enumerable.
+   js_object_propertyIsEnumerable ran the coercion and the descriptor read from C, and in the wrong ORDER besides.
+   The RECORD answer shape is what this wants — the two attribute bits, not a descriptor object to read back off.
+   It had a SECOND mode (HOE_ARGS, taking the object and an already-validated key as arguments) whose only caller
+   was builtin-iterator-zip-keyed.js. That blob is gone and js_iterator_zip_keyed_step asks for the descriptor
+   itself, so the mode went with it rather than staying as a shape nothing selects. */
 typedef struct JSHasOwnEnum {
     JSStepHdr hdr;
     JSValue result;      /* DONE (owned) */
@@ -58248,16 +58245,9 @@ typedef struct JSHasOwnEnum {
     JSAtom key;          /* the key being asked about (owned) */
     JSDescFacts facts;   /* the descriptor, as the bits the step tests (owned) */
 } JSHasOwnEnum;
-/* Two spellings of the same three steps, so ONE machine and the operand SHAPE in the declaration:
-   HOE_ARGS — (object, key) as arguments, the key already a property key from an [[OwnPropertyKeys]] list.
-   HOE_THIS — 20.1.3.4 Object.prototype.propertyIsEnumerable: `? ToPropertyKey(V)` FIRST (the page's code), then
-              `? ToObject(this)`, then the same [[GetOwnProperty]]. js_object_propertyIsEnumerable ran the
-              coercion and the descriptor read from C, and ran them in the wrong ORDER besides. */
-enum { HOE_ARGS = 0, HOE_THIS };
 static int js_has_own_enum_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSHasOwnEnum *s = st;
-    bool from_this = s->hdr.def->arg == HOE_THIS;
     int r;
 
     if (s->hdr.stage == 0) {
@@ -58267,25 +58257,11 @@ static int js_has_own_enum_step(JSContext *ctx, void *st, JSValue cb_result, JSV
             s->key = JS_ATOM_NULL;
             js_desc_facts_init(&s->facts);
         }
-        if (from_this) {
-            r = step_topropkey_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->key, out_cb, out_argc);
-            cb_result = JS_UNDEFINED;
-            if (r) return r < 0 ? -1 : r;
-            s->obj = JS_ToObject(ctx, s->hdr.this_val);          /* step 2, AFTER the coercion */
-            if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
-        } else {
-            JSValueConst obj = step_arg(&s->hdr, 0);
-            JS_FreeValue(ctx, cb_result);
-            if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT) {
-                JS_ThrowTypeErrorNotAnObject(ctx);
-                return -1;
-            }
-            /* the key comes from the [[OwnPropertyKeys]] list the invariant walk already validated as Strings and
-               Symbols, so this is a lookup and not a coercion. */
-            s->key = JS_ValueToAtomInternal(ctx, step_arg(&s->hdr, 1), JS_TO_STRING_NO_SIDE_EFFECTS);
-            if (s->key == JS_ATOM_NULL) return -1;
-            s->obj = js_dup(obj);
-        }
+        r = step_topropkey_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->key, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->obj = JS_ToObject(ctx, s->hdr.this_val);              /* step 2, AFTER the coercion */
+        if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
         s->hdr.stage = 1;
         s->hdr.desc_facts = &s->facts;
         s->hdr.cb_coerce[0] = s->obj;   /* borrowed: the state holds it across the request */
@@ -64609,6 +64585,10 @@ static int js_iter_zip_drive_step(JSContext *ctx, void *st, JSValue cb_result, J
 static JSValue js_iter_zip_drive_fini(JSContext *ctx, void *st, bool take_result);
 static const JSTrampStepDef js_iter_zip_def =
     { sizeof(JSIterZip), js_iterator_zip_step, js_iterator_zip_fini, 0 };
+static int js_iterator_zip_keyed_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_iterator_zip_keyed_fini(JSContext *ctx, void *st, bool take_result);
+static const JSTrampStepDef js_iter_zip_keyed_def =
+    { sizeof(JSIterZipKeyed), js_iterator_zip_keyed_step, js_iterator_zip_keyed_fini, 0 };
 static const JSTrampStepDef js_iter_zip_next_def =
     { sizeof(JSIterZipDrive), js_iter_zip_drive_step, js_iter_zip_drive_fini, ZIP_DRIVE_NEXT };
 static const JSTrampStepDef js_iter_zip_return_def =
@@ -64768,8 +64748,7 @@ static const JSTrampStepDef js_json_raw_def       = { sizeof(JSJsonRaw), js_json
 static const JSTrampStepDef js_proto_chain_def    = { sizeof(JSProtoChain), js_proto_chain_step, js_proto_chain_fini, 0 };
 static const JSTrampStepDef js_proto_get_def      = { sizeof(JSProtoAccessor), js_proto_accessor_step, js_proto_accessor_fini, PROTOACC_GET };
 static const JSTrampStepDef js_proto_set_def      = { sizeof(JSProtoAccessor), js_proto_accessor_step, js_proto_accessor_fini, PROTOACC_SET };
-static const JSTrampStepDef js_has_own_enum_def   = { sizeof(JSHasOwnEnum), js_has_own_enum_step, js_has_own_enum_fini, HOE_ARGS };
-static const JSTrampStepDef js_prop_is_enum_def   = { sizeof(JSHasOwnEnum), js_has_own_enum_step, js_has_own_enum_fini, HOE_THIS };
+static const JSTrampStepDef js_prop_is_enum_def   = { sizeof(JSHasOwnEnum), js_has_own_enum_step, js_has_own_enum_fini, 0 };
 static const JSTrampStepDef js_obj_defprop_def    = { sizeof(JSObjDefProp), js_obj_defprop_step, js_obj_defprop_fini, 0 };
 static const JSTrampStepDef js_obj_defgetter_def  = { sizeof(JSObjDefAccessor), js_obj_defaccessor_step, js_obj_defaccessor_fini, 0 };
 static const JSTrampStepDef js_obj_defsetter_def  = { sizeof(JSObjDefAccessor), js_obj_defaccessor_step, js_obj_defaccessor_fini, 1 };
@@ -65119,13 +65098,17 @@ typedef struct JSIteratorZipData {
     JSValue *iters;    /* [count] — UNDEFINED once the input is exhausted or closed */
     JSValue *nexts;    /* [count] */
     JSValue *pads;     /* [count] — `longest` only; UNDEFINED everywhere else */
+    JSAtom *keys;      /* [count] — zipKeyed ONLY; NULL for Iterator.zip. Its PRESENCE is the whole difference
+                          between the two builtins' zippers: it makes each result an object keyed by these rather
+                          than an array indexed by position, and the drive is otherwise identical. */
 } JSIteratorZipData;
 
 /* ONE allocation: the three vectors are exactly as long-lived as the record, and a second allocation is a second
    free to forget. */
-static JSIteratorZipData *js_iter_zip_data_new(JSContext *ctx, uint32_t count)
+static JSIteratorZipData *js_iter_zip_data_new(JSContext *ctx, uint32_t count, bool keyed)
 {
-    JSIteratorZipData *it = js_malloc(ctx, sizeof(*it) + (size_t)count * 3 * sizeof(JSValue));
+    JSIteratorZipData *it = js_malloc(ctx, sizeof(*it) + (size_t)count * 3 * sizeof(JSValue)
+                                           + (keyed ? (size_t)count * sizeof(JSAtom) : 0));
     uint32_t i;
     if (unlikely(!it))
         return NULL;
@@ -65136,8 +65119,11 @@ static JSIteratorZipData *js_iter_zip_data_new(JSContext *ctx, uint32_t count)
     it->iters = (JSValue *)(it + 1);
     it->nexts = it->iters + count;
     it->pads  = it->nexts + count;
+    it->keys  = keyed ? (JSAtom *)(it->pads + count) : NULL;
     for (i = 0; i < count * 3; i++)
         it->iters[i] = JS_UNDEFINED;
+    for (i = 0; keyed && i < count; i++)
+        it->keys[i] = JS_ATOM_NULL;
     return it;
 }
 
@@ -65148,6 +65134,8 @@ static void js_iter_zip_data_free(JSRuntime *rt, JSIteratorZipData *it)
         return;
     for (i = 0; i < it->count * 3; i++)
         JS_FreeValueRT(rt, it->iters[i]);
+    for (i = 0; it->keys && i < it->count; i++)
+        JS_FreeAtomRT(rt, it->keys[i]);
     js_free_rt(rt, it);
 }
 
@@ -65197,6 +65185,16 @@ static void js_iter_zip_defer_closes(JSContext *ctx, JSIteratorZipData *it, int3
     }
     it->alive = 0;
     it->state = ZIP_ST_DONE;
+}
+
+/* Where a tuple slot goes: a position in an Array for Iterator.zip, a KEY on a null-prototype object for
+   Iterator.zipKeyed. One function, because the drive is otherwise identical and a second copy of it is what the
+   two self-hosted builtins were. */
+static int zip_put_result(JSContext *ctx, JSIteratorZipData *it, JSValueConst results, uint32_t k, JSValue v)
+{
+    if (it->keys)
+        return JS_DefinePropertyValue(ctx, results, JS_DupAtom(ctx, it->keys[k]), v, JS_PROP_C_W_E);
+    return JS_DefinePropertyValueUint32(ctx, results, k, v, JS_PROP_C_W_E);
 }
 
 /* GetIterator (7.4.2) and GetIteratorFlattenable (7.4.3) are the same four operations — GetMethod(@@iterator), the
@@ -65607,7 +65605,7 @@ static int js_iterator_zip_step(JSContext *ctx, void *st, JSValue cb_result, JSV
     }
 
  build:
-    it = js_iter_zip_data_new(ctx, s->n);
+    it = js_iter_zip_data_new(ctx, s->n, false);
     if (unlikely(!it))
         return -1;
     it->mode = s->mode;
@@ -65672,6 +65670,286 @@ static JSValue js_iterator_zip_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
+/* --- 27.1.3.4 Iterator.zipKeyed. It WAS builtin-iterator-zip-keyed.js, and the two C helpers that blob needed —
+   a `getOwnPropertyKeys` over JS_GetOwnPropertyNames2 and a `hasOwnEnumProperty` over
+   JS_GetOwnPropertyFlagsInternal — were an `ownKeys` trap and a `getOwnPropertyDescriptor` trap performed from C.
+   Both are requests here. The zipper it builds is the SAME record and the SAME drive: the whole difference is that
+   the record carries KEYS, which is what makes each result an object keyed by them instead of an array. --- */
+enum { ZK_INIT = 0, ZK_MODE, ZK_PADDING, ZK_KEYS, ZK_HASOWN, ZK_VALUE, ZK_ITER, ZK_PAD };
+
+
+static int js_zipk_push(JSContext *ctx, JSIterZipKeyed *s, JSAtom key, JSValue iter, JSValue nextm)
+{
+    if (s->n == s->cap) {
+        uint32_t ncap = s->cap ? s->cap * 2 : 4;
+        JSAtom *nk = js_realloc(ctx, s->keys, sizeof(JSAtom) * (size_t)ncap);
+        JSValue *ni, *nn;
+        if (unlikely(!nk)) goto fail;
+        s->keys = nk;
+        ni = js_realloc(ctx, s->iters, sizeof(JSValue) * (size_t)ncap);
+        if (unlikely(!ni)) goto fail;
+        s->iters = ni;
+        nn = js_realloc(ctx, s->nexts, sizeof(JSValue) * (size_t)ncap);
+        if (unlikely(!nn)) goto fail;
+        s->nexts = nn;
+        s->cap = ncap;
+    }
+    s->keys[s->n] = JS_DupAtom(ctx, key);
+    s->iters[s->n] = iter;
+    s->nexts[s->n] = nextm;
+    s->n++;
+    return 0;
+ fail:
+    JS_FreeValue(ctx, iter);
+    JS_FreeValue(ctx, nextm);
+    return -1;
+}
+
+static int js_iterator_zip_keyed_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSIterZipKeyed *s = st;
+    JSIteratorZipData *it;
+    JSValue obj;
+    uint32_t i;
+    int r;
+
+    if (s->hdr.stage == ZK_INIT) {
+        JSValueConst options = step_arg(&s->hdr, 1);
+        JSValue m = JS_UNDEFINED;
+        JS_FreeValue(ctx, cb_result);
+        cb_result = JS_UNDEFINED;
+        s->result = JS_UNDEFINED; s->padding = JS_UNDEFINED; s->held = JS_UNDEFINED; s->elem = JS_UNDEFINED;
+        s->cb[0] = JS_UNDEFINED; s->cb[1] = JS_UNDEFINED;
+        js_desc_facts_init(&s->facts);
+        if (!JS_IsObject(step_arg(&s->hdr, 0))) {
+            JS_ThrowTypeErrorNotAnObject(ctx);
+            return -1;
+        }
+        if (!JS_IsUndefined(options) && !JS_IsObject(options)) {
+            JS_ThrowTypeErrorNotAnObject(ctx);
+            return -1;
+        }
+        s->hdr.stage = ZK_MODE;
+        if (!JS_IsUndefined(options)) {
+            r = step_getprop_run(ctx, &s->hdr, options, JS_ATOM_mode, JS_UNDEFINED, &m, out_cb, out_argc);
+            if (r) return r < 0 ? -1 : r;
+        }
+        cb_result = m;
+    } else if (s->hdr.stage == ZK_MODE) {
+        JSValue m = JS_UNDEFINED;
+        r = step_getprop_run(ctx, &s->hdr, step_arg(&s->hdr, 1), JS_ATOM_mode, cb_result, &m, out_cb, out_argc);
+        if (r) return r < 0 ? -1 : r;
+        cb_result = m;
+    }
+    if (s->hdr.stage == ZK_MODE) {
+        if (js_zip_mode_of(ctx, cb_result, &s->mode) < 0) { JS_FreeValue(ctx, cb_result); return -1; }
+        JS_FreeValue(ctx, cb_result);
+        cb_result = JS_UNDEFINED;
+        s->hdr.stage = ZK_PADDING;
+        if (s->mode != ZIP_MODE_LONGEST)
+            goto keys_req;
+        r = step_getprop_run(ctx, &s->hdr, step_arg(&s->hdr, 1), JS_ATOM_padding, JS_UNDEFINED, &s->padding,
+                             out_cb, out_argc);
+        if (r) return r < 0 ? -1 : r;
+        goto have_padding;
+    }
+    if (s->hdr.stage == ZK_PADDING) {
+        r = step_getprop_run(ctx, &s->hdr, step_arg(&s->hdr, 1), JS_ATOM_padding, cb_result, &s->padding,
+                             out_cb, out_argc);
+        if (r) return r < 0 ? -1 : r;
+    have_padding:
+        if (!JS_IsUndefined(s->padding) && !JS_IsObject(s->padding)) {
+            JS_ThrowTypeErrorNotAnObject(ctx);
+            return -1;
+        }
+    keys_req:
+        /* `? iterables.[[OwnPropertyKeys]]()`. The snapshot is taken WITHOUT an enum-only filter and each key's
+           enumerability re-checked below, because the reads run between the snapshot and the check and one of them
+           can flip a later key's visibility — which is the whole reason the self-hosted version collected
+           everything first. On a Proxy this is the `ownKeys` trap. */
+        s->hdr.stage = ZK_KEYS;
+        s->hdr.cb_coerce[0] = (JSValue)step_arg(&s->hdr, 0);   /* borrowed: argv holds it */
+        *out_cb = s->hdr.cb_coerce; *out_argc = 0;
+        return 11;
+    }
+    if (s->hdr.stage == ZK_KEYS) {
+        /* the key list arrived as an ARRAY this engine built, of Strings and Symbols the invariant validated, so
+           turning it into atoms invokes nothing. zipKeyed keeps BOTH kinds. */
+        JSValue keys = cb_result;
+        uint32_t klen = 0;
+        cb_result = JS_UNDEFINED;
+        if (JS_IsException(keys)) return -1;
+        if (js_get_length32(ctx, &klen, keys)) { JS_FreeValue(ctx, keys); return -1; }
+        s->atoms = klen ? js_mallocz(ctx, sizeof(JSAtom) * (size_t)klen) : NULL;
+        if (klen && !s->atoms) { JS_FreeValue(ctx, keys); return -1; }
+        for (i = 0; i < klen; i++) {
+            JSValue kv = JS_GetPropertyUint32(ctx, keys, i);
+            JSAtom at;
+            if (JS_IsException(kv)) { JS_FreeValue(ctx, keys); return -1; }
+            at = JS_ValueToAtom(ctx, kv);
+            JS_FreeValue(ctx, kv);
+            if (at == JS_ATOM_NULL) { JS_FreeValue(ctx, keys); return -1; }
+            s->atoms[s->alen++] = at;
+        }
+        JS_FreeValue(ctx, keys);
+        s->hdr.stage = ZK_HASOWN;
+    }
+
+    for (;;) {
+        if (s->hdr.stage == ZK_HASOWN) {
+            if (s->ai >= s->alen) {
+                if (s->mode == ZIP_MODE_LONGEST && JS_IsObject(s->padding) && s->n > 0) {
+                    s->pads = js_malloc(ctx, sizeof(JSValue) * (size_t)s->n);
+                    if (unlikely(!s->pads)) return -1;
+                    for (i = 0; i < s->n; i++) s->pads[i] = JS_UNDEFINED;
+                    s->hdr.stage = ZK_PAD;
+                    cb_result = JS_UNDEFINED;
+                    continue;
+                }
+                goto build;
+            }
+            /* `? iterables.[[GetOwnProperty]](key)` — the `getOwnPropertyDescriptor` trap on a Proxy, which is why
+               it is a request and not JS_GetOwnPropertyFlagsInternal. */
+            JS_FreeValue(ctx, cb_result);
+            s->hdr.stage = ZK_VALUE;
+            s->hdr.desc_facts = &s->facts;   /* answer with the RECORD, not a descriptor object */
+            s->hdr.cb_coerce[0] = (JSValue)step_arg(&s->hdr, 0);
+            *out_cb = s->hdr.cb_coerce; *out_argc = (int)s->atoms[s->ai];
+            return 12;
+        }
+        if (s->hdr.stage == ZK_VALUE) {
+            /* the descriptor arrived as the RECORD (facts.flags < 0 = the key is gone). Asking for the OBJECT and
+               reading `enumerable` back off it would be a ToPropertyDescriptor walk performed from C, which is the
+               shape the ratchet forbids and which this step has no need of: it wants one attribute bit.
+               A non-enumerable or absent key is DROPPED, and so is one whose value is undefined; those keys never
+               reach the zipper. */
+            bool keep = s->facts.flags >= 0 && (s->facts.flags & JS_PROP_ENUMERABLE) != 0;
+            if (JS_IsException(cb_result)) return -1;
+            JS_FreeValue(ctx, cb_result);
+            cb_result = JS_UNDEFINED;
+            js_desc_facts_free(ctx, &s->facts);
+            js_desc_facts_init(&s->facts);
+            if (!keep) {
+                s->ai++;
+                s->hdr.stage = ZK_HASOWN;
+                continue;
+            }
+            s->hdr.stage = ZK_ITER;
+            r = step_getprop_run(ctx, &s->hdr, step_arg(&s->hdr, 0), s->atoms[s->ai], JS_UNDEFINED, &s->elem,
+                                 out_cb, out_argc);
+            if (r) return r < 0 ? -1 : r;
+            goto have_elem;
+        }
+        if (s->hdr.stage == ZK_ITER) {
+            if (s->gi_phase == GI_START && JS_IsUndefined(s->elem)) {
+                r = step_getprop_run(ctx, &s->hdr, step_arg(&s->hdr, 0), s->atoms[s->ai], cb_result, &s->elem,
+                                     out_cb, out_argc);
+                cb_result = JS_UNDEFINED;
+                if (r) return r < 0 ? -1 : r;
+            have_elem:
+                if (JS_IsUndefined(s->elem)) {   /* an undefined property value drops its key too */
+                    s->ai++;
+                    s->hdr.stage = ZK_HASOWN;
+                    cb_result = JS_UNDEFINED;
+                    continue;
+                }
+                cb_result = JS_UNDEFINED;
+            }
+            {
+                JSValue eiter = JS_UNDEFINED, enext = JS_UNDEFINED;
+                r = zip_get_iter_run(ctx, &s->hdr, &s->gi_phase, &s->held, s->cb, s->elem, GI_FLATTEN,
+                                     cb_result, &eiter, &enext, out_cb, out_argc);
+                cb_result = JS_UNDEFINED;
+                if (r) return r < 0 ? -1 : r;
+                JS_FreeValue(ctx, s->elem); s->elem = JS_UNDEFINED;
+                if (js_zipk_push(ctx, s, s->atoms[s->ai], eiter, enext) < 0)
+                    return -1;
+            }
+            s->ai++;
+            s->hdr.stage = ZK_HASOWN;
+            continue;
+        }
+        if (s->hdr.stage == ZK_PAD) {
+            /* zipKeyed's padding is read PER KEY off the padding object — `? Get(padding, key)` — not walked as an
+               iterator the way Iterator.zip's is. */
+            while (s->pad_i < s->n) {
+                JSValue pv = JS_UNDEFINED;
+                r = step_getprop_run(ctx, &s->hdr, s->padding, s->keys[s->pad_i], cb_result, &pv,
+                                     out_cb, out_argc);
+                cb_result = JS_UNDEFINED;
+                if (r) return r < 0 ? -1 : r;
+                s->pads[s->pad_i++] = pv;
+            }
+            goto build;
+        }
+        DFAIL("Iterator.zipKeyed resumed in an unknown stage");
+        return -1;
+    }
+
+ build:
+    it = js_iter_zip_data_new(ctx, s->n, true);
+    if (unlikely(!it))
+        return -1;
+    it->mode = s->mode;
+    for (i = 0; i < s->n; i++) {
+        it->keys[i]  = s->keys[i];
+        it->iters[i] = s->iters[i];
+        it->nexts[i] = s->nexts[i];
+        it->pads[i]  = (s->pads && i < s->pad_i) ? s->pads[i] : JS_UNDEFINED;
+    }
+    s->n = 0; s->pad_i = 0;   /* the record owns them now */
+    obj = JS_NewObjectProtoClass(ctx, ctx->class_proto[JS_CLASS_ITERATOR_HELPER], JS_CLASS_ITERATOR_ZIP);
+    if (JS_IsException(obj)) {
+        js_iter_zip_data_free(ctx->rt, it);
+        return -1;
+    }
+    JS_SetOpaqueInternal(obj, it);
+    if (JS_DefinePropertyValue(ctx, obj, JS_ATOM_next,
+                               JS_NewCFunctionMagic(ctx, NULL, "next", 0, JS_CFUNC_step, STEPDEF_ITER_ZIP_NEXT),
+                               JS_PROP_C_W_E) < 0
+     || JS_DefinePropertyValue(ctx, obj, JS_ATOM_return,
+                               JS_NewCFunctionMagic(ctx, NULL, "return", 0, JS_CFUNC_step, STEPDEF_ITER_ZIP_RETURN),
+                               JS_PROP_C_W_E) < 0) {
+        JS_FreeValue(ctx, obj);
+        return -1;
+    }
+    s->result = obj;
+    return 0;
+}
+
+static JSValue js_iterator_zip_keyed_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSIterZipKeyed *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    uint32_t i;
+
+    if (!take_result) {
+        /* IfAbruptCloseIterators over the inputs collected so far, in reverse index order (the drain pops). There
+           is no inputIter to exclude here: zipKeyed reads properties rather than walking an iterator. */
+        JS_FreeValue(ctx, s->result);
+        for (i = 0; i < s->n; i++)
+            iter_close_defer(ctx, s->iters[i]);
+    }
+    js_desc_facts_free(ctx, &s->facts);
+    JS_FreeValue(ctx, s->padding);
+    JS_FreeValue(ctx, s->held);
+    JS_FreeValue(ctx, s->elem);
+    for (i = 0; i < s->alen; i++) JS_FreeAtom(ctx, s->atoms[i]);
+    js_free(ctx, s->atoms);
+    for (i = 0; i < s->n; i++) {
+        JS_FreeAtom(ctx, s->keys[i]);
+        JS_FreeValue(ctx, s->iters[i]);
+        JS_FreeValue(ctx, s->nexts[i]);
+    }
+    js_free(ctx, s->keys);
+    js_free(ctx, s->iters);
+    js_free(ctx, s->nexts);
+    for (i = 0; i < s->pad_i; i++) JS_FreeValue(ctx, s->pads[i]);
+    js_free(ctx, s->pads);
+    js_free(ctx, s);
+    return r;
+}
+
 /* --- the zipper's next() and return(). ONE machine: the walk that closes every remaining input is the whole of
    `return` and the tail of several of `next`'s arms, so the difference is which arm runs first. --- */
 
@@ -65722,7 +66000,8 @@ static int js_iter_zip_drive_step(JSContext *ctx, void *st, JSValue cb_result, J
             s->j = it->count;
             s->hdr.stage = ZD_CLOSEALL;
         } else {
-            s->results = JS_NewArray(ctx);
+            /* zipKeyed's tuple is a NULL-prototype object, zip's an Array. */
+            s->results = it->keys ? JS_NewObjectProto(ctx, JS_NULL) : JS_NewArray(ctx);
             if (JS_IsException(s->results)) { s->results = JS_UNDEFINED; return -1; }
             s->hdr.stage = ZD_STEP;
         }
@@ -65736,7 +66015,7 @@ static int js_iter_zip_drive_step(JSContext *ctx, void *st, JSValue cb_result, J
             if (JS_IsUndefined(it->iters[k])) {
                 /* an input already exhausted: only `longest` keeps going past one, and it pads. */
                 DCHECK(it->mode == ZIP_MODE_LONGEST, "a zipper kept a spent input in a mode that finishes on one");
-                if (JS_DefinePropertyValueUint32(ctx, s->results, k, js_dup(it->pads[k]), JS_PROP_C_W_E) < 0)
+                if (zip_put_result(ctx, it, s->results, k, js_dup(it->pads[k])) < 0)
                     return -1;
                 s->i++;
                 continue;
@@ -65760,7 +66039,7 @@ static int js_iter_zip_drive_step(JSContext *ctx, void *st, JSValue cb_result, J
                     JS_ThrowTypeError(ctx, "zip inputs have mismatched lengths");
                     return -1;
                 }
-                if (JS_DefinePropertyValueUint32(ctx, s->results, k, value, JS_PROP_C_W_E) < 0)
+                if (zip_put_result(ctx, it, s->results, k, value) < 0)
                     return -1;
                 s->values++;
                 s->i++;
@@ -65779,7 +66058,7 @@ static int js_iter_zip_drive_step(JSContext *ctx, void *st, JSValue cb_result, J
             if (it->mode == ZIP_MODE_LONGEST) {
                 if (it->alive < 1)
                     goto finish_done;
-                if (JS_DefinePropertyValueUint32(ctx, s->results, k, js_dup(it->pads[k]), JS_PROP_C_W_E) < 0)
+                if (zip_put_result(ctx, it, s->results, k, js_dup(it->pads[k])) < 0)
                     return -1;
                 s->i++;
                 continue;
@@ -66097,7 +66376,6 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_OWNKEYS_NAMES] = &js_ownkeys_names_def,
     [STEPDEF_OWNKEYS_SYMBOLS] = &js_ownkeys_syms_def,
     [STEPDEF_REFLECT_OWNKEYS] = &js_reflect_ownkeys_def,
-    [STEPDEF_HAS_OWN_ENUM] = &js_has_own_enum_def,
     [STEPDEF_PROP_IS_ENUM] = &js_prop_is_enum_def,
     [STEPDEF_PROTO_GET]    = &js_proto_get_def,
     [STEPDEF_PROTO_SET]    = &js_proto_set_def,
@@ -66192,6 +66470,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_GLOBAL_EVAL]     = &js_global_eval_def,
     [STEPDEF_ITER_CONCAT]     = &js_iter_concat_def,
     [STEPDEF_ITER_ZIP]        = &js_iter_zip_def,
+    [STEPDEF_ITER_ZIP_KEYED]  = &js_iter_zip_keyed_def,
     [STEPDEF_ITER_ZIP_NEXT]   = &js_iter_zip_next_def,
     [STEPDEF_ITER_ZIP_RETURN] = &js_iter_zip_return_def,
     [STEPDEF_FUNCTION_CTOR]   = &js_function_ctor_def,
@@ -69215,6 +69494,7 @@ static void js_iterator_helper_mark(JSRuntime *rt, JSValueConst val,
 static const JSCFunctionListEntry js_iterator_funcs[] = {
     JS_CFUNC_STEP_DEF("concat", 0, STEPDEF_ITER_CONCAT ),
     JS_CFUNC_STEP_DEF("zip", 1, STEPDEF_ITER_ZIP ),
+    JS_CFUNC_STEP_DEF("zipKeyed", 1, STEPDEF_ITER_ZIP_KEYED ),
     JS_CFUNC_CONSUME_DEF("from", 1, ITERCONS_ITERFROM ),
 };
 
@@ -82566,9 +82846,6 @@ int JS_AddIntrinsicBaseObjects(JSContext *ctx)
         JS_FreeValue(ctx, setter);
     }
     ctx->iterator_ctor = obj2;
-    JS_DefineAutoInitProperty(ctx, obj2, JS_ATOM_zipKeyed, JS_AUTOINIT_ID_BYTECODE,
-                              (void *)(uintptr_t)JS_BUILTIN_ITERATOR_ZIP_KEYED,
-                              JS_PROP_WRITABLE|JS_PROP_CONFIGURABLE);
 
     ctx->class_proto[JS_CLASS_ITERATOR_CONCAT] =
         JS_NewObjectProtoList(ctx, ctx->class_proto[JS_CLASS_ITERATOR],
