@@ -19470,6 +19470,9 @@ typedef struct JSStrReplace {
     uint8_t is_first;
     uint8_t is_replaceAll;
     uint8_t cb_pending;     /* 1 = the value delivered to the next step is the replacer's result */
+    JSValue flags_val;      /* replaceAll's `Get(searchValue, "flags")` result, held across ITS ToString — both
+                               are the page's code, so they are separate stages and the value cannot live in a
+                               C local across the suspension between them (owned) */
 } JSStrReplace;
 static int js_str_replace_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_str_replace_fini(JSContext *ctx, void *st, bool take_result);
@@ -71550,35 +71553,6 @@ static JSValue js_string_includes_search(JSContext *ctx, JSValueConst strv, JSVa
     return js_bool(ret);   /* both strings are BORROWED: the machine owns them and its fini frees them */
 }
 
-static int check_regexp_g_flag(JSContext *ctx, JSValueConst regexp)
-{
-    int ret;
-    JSValue flags;
-
-    ret = js_is_regexp(ctx, regexp);
-    if (ret < 0)
-        return -1;
-    if (ret) {
-        flags = JS_GetProperty(ctx, regexp, JS_ATOM_flags);
-        if (JS_IsException(flags))
-            return -1;
-        if (JS_IsUndefined(flags) || JS_IsNull(flags)) {
-            JS_ThrowTypeError(ctx, "cannot convert to object");
-            return -1;
-        }
-        flags = JS_ToStringFree(ctx, flags);
-        if (JS_IsException(flags))
-            return -1;
-        ret = string_indexof_char(JS_VALUE_GET_STRING(flags), 'g', 0);
-        JS_FreeValue(ctx, flags);
-        if (ret < 0) {
-            JS_ThrowTypeError(ctx, "regexp must have the 'g' flag");
-            return -1;
-        }
-    }
-    return 0;
-}
-
 /* 21.1.3.11 String.prototype.match, 21.1.3.12 .matchAll and 21.1.3.16 .search — ONE machine, the @@-method's
    atom in hdr.arg, exactly as js_string_match was one body with a magic. It called the @@-method with
    JS_CallFree straight out of C, and that method is itself a step machine, so the call reached the DFAIL that
@@ -71923,24 +71897,90 @@ finish:
    itself a step builtin, so calling it from C ran its callbacks through an inline JS_Call that cannot suspend.
    The dispatch is now step code 3 — @@replace is invoked ON THE TRAMP like any other call — so the whole chain
    (str.replace -> @@replace -> the replacer) is preemptible end to end, and no recognizer is involved anywhere. */
-static int js_str_replace_prologue(JSContext *ctx, JSStrReplace *s)
+/* 22.1.3.19 step 2 and 22.1.3.20 step 2. FOUR reads of the page's code lived in a prologue that cannot suspend:
+   IsRegExp's `? Get(searchValue, %Symbol.match%)`, replaceAll's `? Get(searchValue, "flags")`, the ToString on
+   that result, and `? GetMethod(searchValue, %Symbol.replace%)`. Each was a JS_GetProperty / JS_ToStringFree
+   straight out of C, so an accessor, a Proxy trap or a toString containing a loop had no flow base and aborted.
+   They are stages now, in the spec's order — which is also observable: the flags read precedes the @@replace
+   read, and only replaceAll performs the IsRegExp check at all. */
+enum { SR_MATCH = 20, SR_FLAGS, SR_FLAGS_STR, SR_REPLACER };
+
+static int js_str_replace_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    JSValueConst this_val = s->hdr.this_val;
+    JSStrReplace *s = st;
     JSValueConst searchValue = step_arg(&s->hdr, 0);
-    JSValueConst repArg = step_arg(&s->hdr, 1);
-    int is_replaceAll = s->hdr.arg;
-
-    if (JS_IsUndefined(this_val) || JS_IsNull(this_val)) {
-        JS_ThrowTypeError(ctx, "cannot convert to object");
-        return -1;
+    int rr;
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result);
+        cb_result = JS_UNDEFINED;
+        if (JS_IsUndefined(s->hdr.this_val) || JS_IsNull(s->hdr.this_val)) {
+            JS_ThrowTypeError(ctx, "cannot convert to object");
+            return -1;
+        }
+        s->is_replaceAll = s->hdr.arg;
+        s->hdr.stage = SR_MATCH;
+        if (!JS_IsObject(searchValue))
+            goto plain_walk;          /* step 2 does not apply to a primitive: it reads nothing */
+        if (!s->is_replaceAll)
+            goto have_gflag;          /* only replaceAll performs IsRegExp and the 'g' requirement */
+        rr = step_getprop_run(ctx, &s->hdr, searchValue, JS_ATOM_Symbol_match, JS_UNDEFINED,
+                              &cb_result, out_cb, out_argc);
+        if (rr) return rr < 0 ? -1 : rr;
     }
-    s->is_replaceAll = is_replaceAll;
-
-    if (JS_IsObject(searchValue)) {
-        JSValue replacer;
-        if (is_replaceAll && check_regexp_g_flag(ctx, searchValue) < 0) return -1;
-        replacer = JS_GetProperty(ctx, searchValue, JS_ATOM_Symbol_replace);
-        if (JS_IsException(replacer)) return -1;
+    if (s->hdr.stage == SR_MATCH) {
+        JSValue m = JS_UNDEFINED;
+        rr = step_getprop_run(ctx, &s->hdr, searchValue, JS_ATOM_Symbol_match, cb_result, &m, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (rr) return rr < 0 ? -1 : rr;
+        s->hdr.stage = SR_FLAGS;
+        /* IsRegExp steps 2-4: a DEFINED @@match decides by ToBoolean, otherwise the [[RegExpMatcher]] slot does */
+        if (JS_IsUndefined(m) ? js_get_regexp(ctx, searchValue, false) == NULL : !JS_ToBoolFree(ctx, m))
+            goto have_gflag;
+        rr = step_getprop_run(ctx, &s->hdr, searchValue, JS_ATOM_flags, JS_UNDEFINED,
+                              &cb_result, out_cb, out_argc);
+        if (rr) return rr < 0 ? -1 : rr;
+    }
+    if (s->hdr.stage == SR_FLAGS) {
+        JSValue flags = JS_UNDEFINED;
+        rr = step_getprop_run(ctx, &s->hdr, searchValue, JS_ATOM_flags, cb_result, &flags, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (rr) return rr < 0 ? -1 : rr;
+        if (JS_IsUndefined(flags) || JS_IsNull(flags)) {
+            JS_FreeValue(ctx, flags);
+            JS_ThrowTypeError(ctx, "cannot convert to object");
+            return -1;
+        }
+        s->flags_val = flags;         /* held across its own ToString, which is a separate suspension point */
+        s->hdr.stage = SR_FLAGS_STR;
+        rr = step_tostring_run(ctx, &s->hdr, s->flags_val, JS_UNDEFINED, &cb_result, out_cb, out_argc);
+        if (rr) return rr < 0 ? -1 : rr;
+    }
+    if (s->hdr.stage == SR_FLAGS_STR) {
+        JSValue fs = JS_UNDEFINED;
+        int has_g;
+        rr = step_tostring_run(ctx, &s->hdr, s->flags_val, cb_result, &fs, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (rr) return rr < 0 ? -1 : rr;
+        has_g = string_indexof_char(JS_VALUE_GET_STRING(fs), 'g', 0);
+        JS_FreeValue(ctx, fs);
+        JS_FreeValue(ctx, s->flags_val);
+        s->flags_val = JS_UNDEFINED;
+        if (has_g < 0) {
+            JS_ThrowTypeError(ctx, "regexp must have the 'g' flag");
+            return -1;
+        }
+    have_gflag:
+        s->hdr.stage = SR_REPLACER;
+        rr = step_getprop_run(ctx, &s->hdr, searchValue, JS_ATOM_Symbol_replace, JS_UNDEFINED,
+                              &cb_result, out_cb, out_argc);
+        if (rr) return rr < 0 ? -1 : rr;
+    }
+    if (s->hdr.stage == SR_REPLACER) {
+        JSValue replacer = JS_UNDEFINED;
+        rr = step_getprop_run(ctx, &s->hdr, searchValue, JS_ATOM_Symbol_replace, cb_result, &replacer,
+                              out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (rr) return rr < 0 ? -1 : rr;
         if (!JS_IsUndefined(replacer) && !JS_IsNull(replacer)) {
             const JSTrampStepDef *isd = tramp_step_def_of(replacer);
             if (isd) {
@@ -71950,47 +71990,34 @@ static int js_str_replace_prologue(JSContext *ctx, JSStrReplace *s)
                    str.replace -> @@replace -> replacer chain is a single preemptible walk. */
                 JSValueConst iargv[2];
                 void *inner;
-                iargv[0] = this_val;   /* the subject */
-                iargv[1] = repArg;     /* the replacer */
+                iargv[0] = s->hdr.this_val;      /* the subject */
+                iargv[1] = step_arg(&s->hdr, 1); /* the replacer */
                 inner = tramp_step_state_new(ctx, isd, searchValue, 2, iargv, replacer);
                 JS_FreeValue(ctx, replacer);
                 if (!inner) return -1;
                 s->inner = inner;
                 s->mode = 3;
-                return 0;
+                s->hdr.stage = 1;
+                goto have_mode;
             }
             /* a USER-DEFINED @@replace: an ordinary callable, invoked on the tramp like any other call */
             s->mode = 1;
-            s->cb_args[0] = js_dup(searchValue);                     /* this = the searchValue */
-            s->cb_args[1] = replacer;                                /* owned */
-            s->cb_args[2] = js_dup(this_val);                        /* the subject */
-            s->cb_args[3] = js_dup(repArg);
-            return 0;
+            s->cb_args[0] = js_dup(searchValue);              /* this = the searchValue */
+            s->cb_args[1] = replacer;                         /* owned */
+            s->cb_args[2] = js_dup(s->hdr.this_val);          /* the subject */
+            s->cb_args[3] = js_dup(step_arg(&s->hdr, 1));
+            s->hdr.stage = 1;
+            goto have_mode;
         }
         JS_FreeValue(ctx, replacer);
-    }
-    /* The plain string-search walk — ONE walk for both replacer kinds. A callable drives step-code 3; anything
-       else is ToString'd once and fed to GetSubstitution inside the same loop. There is no separate no-callback
-       body: that duplicate walk is deleted. */
-    /* The three ToStrings run the page's coercion methods, and this prologue is not a step — it cannot suspend.
-       They are stages 10..12 of the machine instead; `mode` staying 4 is what tells the vstep to run them. */
-    s->functional = JS_IsFunction(ctx, repArg);
-    if (s->functional)
-        s->cb_args[1] = js_dup(repArg);
-    s->mode = 4;
-    return 0;
-}
-
-static int js_str_replace_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
-{
-    JSStrReplace *s = st;
-    int rr;
-    if (s->hdr.stage == 0) {
-        JS_FreeValue(ctx, cb_result);
-        cb_result = JS_UNDEFINED;
-        if (js_str_replace_prologue(ctx, s))
-            return -1;
-        s->hdr.stage = (s->mode == 4) ? 10 : 1;
+    plain_walk:
+        /* The plain string-search walk — ONE walk for both replacer kinds. A callable drives step-code 3;
+           anything else is ToString'd once and fed to GetSubstitution inside the same loop. */
+        s->functional = JS_IsFunction(ctx, step_arg(&s->hdr, 1));
+        if (s->functional)
+            s->cb_args[1] = js_dup(step_arg(&s->hdr, 1));
+        s->mode = 4;
+        s->hdr.stage = 10;
     }
     /* 22.1.3.19 steps 3, 5 and 8: ToString on the receiver, the search value and — when it is not callable —
        the replacement. Each is the page's code, so each is its own stage. */
@@ -72017,6 +72044,7 @@ static int js_str_replace_vstep(JSContext *ctx, void *st, JSValue cb_result, JSV
         s->mode = 0;
         s->hdr.stage = 1;
     }
+ have_mode:
     if (s->mode == 3)   /* delegated: the built-in @@replace machine IS the walk */
         return ((JSStepHdr *)s->inner)->def->step(ctx, s->inner, cb_result, out_cb, out_argc);
     if (s->mode == 2)
@@ -72046,6 +72074,7 @@ static JSValue js_str_replace_fini(JSContext *ctx, void *st, bool take_result)
         DCHECK(s->inner != NULL, "str.replace mode 3 without a delegated machine");
         r = tramp_step_state_free(ctx, s->inner, take_result);
         JS_FreeValue(ctx, s->str); JS_FreeValue(ctx, s->search_str);
+        JS_FreeValue(ctx, s->flags_val);
         js_free(ctx, s);
         return r;
     }
@@ -72060,6 +72089,7 @@ static JSValue js_str_replace_fini(JSContext *ctx, void *st, bool take_result)
                                                                   prologue threw before string_buffer_init */
     }
     JS_FreeValue(ctx, s->str); JS_FreeValue(ctx, s->search_str); JS_FreeValue(ctx, s->rep_val);
+    JS_FreeValue(ctx, s->flags_val);
     js_free(ctx, s);
     return r;
 }
