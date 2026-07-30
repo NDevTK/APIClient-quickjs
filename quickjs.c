@@ -18885,10 +18885,6 @@ typedef struct TrampFrame {
                                   where the operands ARE the caller's. */
 typedef struct JSProxyCtor { void *outer; uint8_t outer_kind; } JSProxyCtor;
 static JSValue js_proxy_get_invariant(JSContext *ctx, JSValueConst target, JSAtom atom, JSValue ret);
-static int js_proxy_has_invariant(JSContext *ctx, JSValueConst target, JSAtom atom, int ret);
-static int js_proxy_delete_invariant(JSContext *ctx, JSValueConst target, JSAtom atom, int ret);
-static int js_proxy_define_invariant(JSContext *ctx, JSValueConst target, JSAtom prop, JSValueConst val,
-                                     JSValueConst getter, JSValueConst setter, int flags, bool ret);
 /* 6.2.6.4 FromPropertyDescriptor over a filled JSPropertyDescriptor. CONSUMES the descriptor. It builds no
    accessors and reads nothing of the page's, so it is the same operation wherever [[GetOwnProperty]] was
    performed — the C path, the in-place request, and the trap's continuation all end here. */
@@ -22590,7 +22586,6 @@ static inline bool tramp_is_global_eval(JSValueConst method) {
 }
 static JSProxyData *get_proxy_method(JSContext *ctx, JSValue *pmethod, JSValueConst obj, JSAtom name);
 static inline bool tramp_body_is_plain(JSValueConst func);
-static int js_proxy_set_invariant(JSContext *ctx, JSValueConst target, JSAtom atom, JSValueConst value, int ret);
 /* PROXY [[Construct]]: `new proxy(...)`. Resolve the `construct` trap at the operator site and dispatch it as
    trap(target, argArray, newTarget) with `this` = handler, so a loop in the trap body parks. Layout-independent
    like [[Set]]'s: fills out[0..4] with [handler, trap, target, argArray, newTarget] (owning every one) because the
@@ -57906,103 +57901,10 @@ static int js_desc_cursor_run(JSContext *ctx, JSDescCursor *c, JSValueConst desc
     return 0;
 }
 
-static int js_obj_to_desc(JSContext *ctx, JSPropertyDescriptor *d,
-                          JSValueConst desc)
-{
-    JSValue val, getter, setter;
-    int present;
-    int flags;
-
-    if (!JS_IsObject(desc)) {
-        JS_ThrowTypeError(ctx, "Property description must be an object");
-        return -1;
-    }
-    flags = 0;
-    val = JS_UNDEFINED;
-    getter = JS_UNDEFINED;
-    setter = JS_UNDEFINED;
-    present = JS_HasProperty(ctx, desc, JS_ATOM_enumerable);
-    if (present < 0)
-        goto fail;
-    if (present) {
-        JSValue prop = JS_GetProperty(ctx, desc, JS_ATOM_enumerable);
-        if (JS_IsException(prop))
-            goto fail;
-        flags |= JS_PROP_HAS_ENUMERABLE;
-        if (JS_ToBoolFree(ctx, prop))
-            flags |= JS_PROP_ENUMERABLE;
-    }
-    present = JS_HasProperty(ctx, desc, JS_ATOM_configurable);
-    if (present < 0)
-        goto fail;
-    if (present) {
-        JSValue prop = JS_GetProperty(ctx, desc, JS_ATOM_configurable);
-        if (JS_IsException(prop))
-            goto fail;
-        flags |= JS_PROP_HAS_CONFIGURABLE;
-        if (JS_ToBoolFree(ctx, prop))
-            flags |= JS_PROP_CONFIGURABLE;
-    }
-    present = JS_HasProperty(ctx, desc, JS_ATOM_value);
-    if (present < 0)
-        goto fail;
-    if (present) {
-        flags |= JS_PROP_HAS_VALUE;
-        val = JS_GetProperty(ctx, desc, JS_ATOM_value);
-        if (JS_IsException(val))
-            goto fail;
-    }
-    present = JS_HasProperty(ctx, desc, JS_ATOM_writable);
-    if (present < 0)
-        goto fail;
-    if (present) {
-        JSValue prop = JS_GetProperty(ctx, desc, JS_ATOM_writable);
-        if (JS_IsException(prop))
-            goto fail;
-        flags |= JS_PROP_HAS_WRITABLE;
-        if (JS_ToBoolFree(ctx, prop))
-            flags |= JS_PROP_WRITABLE;
-    }
-    present = JS_HasProperty(ctx, desc, JS_ATOM_get);
-    if (present < 0)
-        goto fail;
-    if (present) {
-        flags |= JS_PROP_HAS_GET;
-        getter = JS_GetProperty(ctx, desc, JS_ATOM_get);
-        if (JS_IsException(getter) ||
-            !(JS_IsUndefined(getter) || JS_IsFunction(ctx, getter))) {
-            JS_ThrowTypeError(ctx, "Getter must be a function");
-            goto fail;
-        }
-    }
-    present = JS_HasProperty(ctx, desc, JS_ATOM_set);
-    if (present < 0)
-        goto fail;
-    if (present) {
-        flags |= JS_PROP_HAS_SET;
-        setter = JS_GetProperty(ctx, desc, JS_ATOM_set);
-        if (JS_IsException(setter) ||
-            !(JS_IsUndefined(setter) || JS_IsFunction(ctx, setter))) {
-            JS_ThrowTypeError(ctx, "Setter must be a function");
-            goto fail;
-        }
-    }
-    if ((flags & (JS_PROP_HAS_SET | JS_PROP_HAS_GET)) &&
-        (flags & (JS_PROP_HAS_VALUE | JS_PROP_HAS_WRITABLE))) {
-        JS_ThrowTypeError(ctx, "Invalid property descriptor. Cannot both specify accessors and a value or writable attribute");
-        goto fail;
-    }
-    d->flags = flags;
-    d->value = val;
-    d->getter = getter;
-    d->setter = setter;
-    return 0;
- fail:
-    JS_FreeValue(ctx, val);
-    JS_FreeValue(ctx, getter);
-    JS_FreeValue(ctx, setter);
-    return -1;
-}
+/* DELETED: js_obj_to_desc. It was 6.2.6.5 ToPropertyDescriptor performed from C — six HasProperty/Get PAIRS on a
+   descriptor OBJECT, i.e. twelve of the page's operations, since any of those fields can be an accessor or a Proxy
+   trap. Every routed descriptor walk is JSDescCursor; this survived only for the Proxy getOwnPropertyDescriptor
+   trap-result read, and that hook's body is now gone. The ToPropertyDescriptor C-read ratchet reaches 0 with it. */
 
 static JSValue js_object_constructor(JSContext *ctx, JSValueConst new_target,
                                      int argc, JSValueConst *argv)
@@ -75181,60 +75083,22 @@ static int js_proxy_preventExtensions(JSContext *ctx, JSValueConst obj)
    property of the target, and about a non-extensible target. ONE implementation, shared by the C path and by the
    trampolined trap's continuation — the check runs on the trap's RESULT, so the tramp path can only honour it
    from a continuation, exactly as [[Get]]'s does. `ret` is the trap's boolean; returns it, or -1 having thrown. */
-static int js_proxy_has_invariant(JSContext *ctx, JSValueConst target, JSAtom atom, int ret)
-{
-    int desc_flags, res, ext;
-    if (ret)
-        return 1;
-    res = JS_GetOwnPropertyFlagsInternal(ctx, &desc_flags, JS_VALUE_GET_OBJ(target), atom);
-    if (res < 0)
-        return -1;
-    if (!res)
-        return 0;                                   /* step 9.a: the target has not got it either */
-    if (!(desc_flags & JS_PROP_CONFIGURABLE))       /* step 9.b.i */
-        goto fail;
-    /* step 9.b.ii is IsExtensible(target), the INTERNAL METHOD. This read `p->extensible`, the target
-       JSObject's storage bit, which for a Proxy target is the proxy's own flag rather than its answer — the
-       routed path was fixed when it became a machine and this, the C hook's half, was not. */
-    ext = JS_IsExtensible(ctx, target);
-    if (ext < 0)
-        return -1;
-    if (!ext)                                       /* step 9.b.iii */
-        goto fail;
-    return 0;
-fail:
-    JS_ThrowTypeError(ctx, "proxy: inconsistent has");
-    return -1;
-}
+/* DELETED: js_proxy_has_invariant. 10.5.7 step 9's check, performed with the target's [[GetOwnProperty]] and
+   [[IsExtensible]] read FROM C — its own traps when the target is a Proxy. The routed path performs the same check
+   over a JSDescFacts it obtained by request (CONT_KEYED_INV), and this survived only for the C hook whose body is
+   gone. */
 
 static int js_proxy_has(JSContext *ctx, JSValueConst obj, JSAtom atom)
 {
+    /* THE BODY IS DELETED. Every consumer is routed onto the keyed entry's GP_HAS and the whole corpus runs with
+       this DFAIL armed without reaching it, so what stood here was a second implementation of 10.5.7 — the `has` trap, plus its invariant's [[GetOwnProperty]] and [[IsExtensible]] on the target,
+       run from an activation with no flow base. In RELEASE the DFAIL compiles out and this FAILS VISIBLY rather
+       than answering from the proxy's own empty shape — the honest outcome for a capability that only the routed
+       path implements. */
     DFAIL("a C-side [[HasProperty]] reached a Proxy — the page's trap has no flow base here; route that caller onto the keyed entry's GP_HAS");
-    JSProxyData *s;
-    JSValue method, ret1, atom_val;
-    int res;
-    JSObject *p;
-    JSValueConst args[2];
-    bool ret, res2;
-
-    s = proxy_resolve_trapless(ctx, &method, obj, JS_ATOM_has);
-    if (!s)
-        return -1;
-    if (JS_IsUndefined(method))
-        return JS_HasProperty(ctx, s->target, atom);
-    atom_val = JS_AtomToValue(ctx, atom);
-    if (JS_IsException(atom_val)) {
-        JS_FreeValue(ctx, method);
-        return -1;
-    }
-    args[0] = s->target;
-    args[1] = atom_val;
-    ret1 = JS_CallFree(ctx, method, s->handler, 2, args);
-    JS_FreeValue(ctx, atom_val);
-    if (JS_IsException(ret1))
-        return -1;
-    ret = JS_ToBoolFree(ctx, ret1);
-    return js_proxy_has_invariant(ctx, s->target, atom, ret);
+    (void)atom; (void)obj;
+    JS_ThrowInternalError(ctx, "[[HasProperty]] on a Proxy is only implemented on the interpreter's chain");
+    return -1;
 }
 
 /* [[Get]] invariant: a trap result for a non-configurable/non-writable own property of the target must be SameValue
@@ -75359,30 +75223,15 @@ static JSValue js_proxy_get_invariant(JSContext *ctx, JSValueConst target, JSAto
 static JSValue js_proxy_get(JSContext *ctx, JSValueConst obj, JSAtom atom,
                             JSValueConst receiver)
 {
+    /* THE BODY IS DELETED. Every consumer is routed onto the keyed entry's GP_GET and the whole corpus runs with
+       this DFAIL armed without reaching it, so what stood here was a second implementation of 10.5.8 — the `get` trap and its result invariant against the target's own descriptor,
+       run from an activation with no flow base. In RELEASE the DFAIL compiles out and this FAILS VISIBLY rather
+       than answering from the proxy's own empty shape — the honest outcome for a capability that only the routed
+       path implements. */
     DFAIL("a C-side [[Get]] reached a Proxy — the page's trap has no flow base here; route that caller onto the keyed entry's GP_GET");
-    JSProxyData *s;
-    JSValue method, ret, atom_val;
-    JSValueConst args[3];
-
-    s = proxy_resolve_trapless(ctx, &method, obj, JS_ATOM_get);
-    if (!s)
-        return JS_EXCEPTION;
-    /* the RECEIVER never changes across a forward, so the last hop's target answers for the whole chain */
-    if (JS_IsUndefined(method))
-        return JS_GetPropertyInternal(ctx, s->target, atom, receiver, false);
-    atom_val = JS_AtomToValue(ctx, atom);
-    if (JS_IsException(atom_val)) {
-        JS_FreeValue(ctx, method);
-        return JS_EXCEPTION;
-    }
-    args[0] = s->target;
-    args[1] = atom_val;
-    args[2] = receiver;
-    ret = JS_CallFree(ctx, method, s->handler, 3, args);
-    JS_FreeValue(ctx, atom_val);
-    if (JS_IsException(ret))
-        return JS_EXCEPTION;
-    return js_proxy_get_invariant(ctx, s->target, atom, ret);
+    (void)atom; (void)obj; (void)receiver;
+    JS_ThrowInternalError(ctx, "[[Get]] on a Proxy is only implemented on the interpreter's chain");
+    return JS_EXCEPTION;
 }
 
 /* [[Set]] invariant: a trap that reports SUCCESS must be telling the truth — a non-configurable, non-writable data
@@ -75392,63 +75241,20 @@ static JSValue js_proxy_get(JSContext *ctx, JSValueConst obj, JSAtom atom,
    that is why the continuation has to carry the written VALUE as well as (target, key). `ret` is the trap's boolean;
    returns it, or -1 having thrown. The strict-mode throw a `false` result owes stays with the caller, which is the
    only place that knows the write's flags. */
-static int js_proxy_set_invariant(JSContext *ctx, JSValueConst target, JSAtom atom,
-                                  JSValueConst value, int ret)
-{
-    JSDescFacts f;
-    int r;
-    if (!ret)
-        return 0;
-    if (js_proxy_facts_from_c(ctx, target, atom, &f) < 0)
-        return -1;
-    r = js_proxy_set_check(ctx, &f, value);
-    js_desc_facts_free(ctx, &f);
-    return (r < 0) ? -1 : 1;
-}
+/* DELETED: js_proxy_set_invariant, 10.5.9 step 9's check with the target's descriptor read from C. */
 
 static int js_proxy_set(JSContext *ctx, JSValueConst obj, JSAtom atom,
                         JSValueConst value, JSValueConst receiver, int flags)
 {
+    /* THE BODY IS DELETED. Every consumer is routed onto the keyed entry's GP_SET and the whole corpus runs with
+       this DFAIL armed without reaching it, so what stood here was a second implementation of 10.5.9 — the `set` trap and its result invariant,
+       run from an activation with no flow base. In RELEASE the DFAIL compiles out and this FAILS VISIBLY rather
+       than answering from the proxy's own empty shape — the honest outcome for a capability that only the routed
+       path implements. */
     DFAIL("a C-side [[Set]] reached a Proxy — the page's trap has no flow base here; route that caller onto the keyed entry's GP_SET");
-    JSProxyData *s;
-    JSValue method, ret1, atom_val;
-    int ret;
-    JSValueConst args[4];
-
-    s = proxy_resolve_trapless(ctx, &method, obj, JS_ATOM_set);
-    if (!s)
-        return -1;
-    if (JS_IsUndefined(method)) {
-        /* 10.5.9 step 6's forward keeps the PROXY as the Receiver, so this reaches the receiver completion
-           with a Proxy receiver whenever the target answers nothing — and there is no chain here to run its
-           traps on. The keyed-operation entry spells this forward out itself (gp_obj = target, receiver
-           unchanged), so every routed write goes there instead; a C write that still walks into a proxy
-           arrives here and the DCHECK at the completion names it. */
-        return JS_SetPropertyInternal2(ctx, s->target, atom,
-                                       js_dup(value), receiver, flags, NULL);
-    }
-    atom_val = JS_AtomToValue(ctx, atom);
-    if (JS_IsException(atom_val)) {
-        JS_FreeValue(ctx, method);
-        return -1;
-    }
-    args[0] = s->target;
-    args[1] = atom_val;
-    args[2] = value;
-    args[3] = receiver;
-    ret1 = JS_CallFree(ctx, method, s->handler, 4, args);
-    JS_FreeValue(ctx, atom_val);
-    if (JS_IsException(ret1))
-        return -1;
-    ret = js_proxy_set_invariant(ctx, s->target, atom, value, JS_ToBoolFree(ctx, ret1));
-    if (ret < 0)
-        return -1;
-    if (!ret && ((flags & JS_PROP_THROW) ||
-                 ((flags & JS_PROP_THROW_STRICT) && is_strict_mode(ctx)))) {
-        JS_ThrowTypeError(ctx, "proxy: cannot set property");
-        return -1;
-    }
-    return ret;
+    (void)atom; (void)obj; (void)value; (void)receiver; (void)flags;
+    JS_ThrowInternalError(ctx, "[[Set]] on a Proxy is only implemented on the interpreter's chain");
+    return -1;
 }
 
 static JSValue js_desc_to_object(JSContext *ctx, JSPropertyDescriptor *desc)
@@ -75576,37 +75382,10 @@ fail:
    so the CHECKS cannot drift between them; only how the facts are obtained differs.
    Returns 1 = go on to the descriptor walk (trap_result_obj NOT consumed), 0 = the property is absent
    (consumed), -1 = threw (consumed). */
-static int js_proxy_gopd_pre(JSContext *ctx, JSValueConst obj, JSValueConst trap_result_obj,
-                             JSAtom prop, int *ptd_flags, int *ptd_ret, int *pextensible)
-{
-    JSProxyData *s = JS_VALUE_GET_OBJ(obj)->u.opaque;
-    JSObject *p = JS_VALUE_GET_OBJ(s->target);
-    JSPropertyDescriptor target_desc;
-    int target_desc_ret, ext;
-
-    if (js_proxy_gopd_shape(ctx, trap_result_obj) < 0)
-        return -1;
-    target_desc_ret = JS_GetOwnPropertyInternal(ctx, &target_desc, p, prop);   /* step 10 */
-    if (target_desc_ret < 0)
-        return -1;
-    if (target_desc_ret)
-        js_free_desc(ctx, &target_desc);   /* only its FLAGS outlive it, and those are not owned */
-    *ptd_ret = target_desc_ret;
-    *ptd_flags = target_desc_ret ? target_desc.flags : 0;
-    if (JS_IsUndefined(trap_result_obj)) {
-        ext = 1;
-        if (js_proxy_gopd_needs_ext(*ptd_ret, *ptd_flags)) {
-            ext = JS_IsExtensible(ctx, s->target);          /* step 11.c */
-            if (ext < 0)
-                return -1;
-        }
-        return js_proxy_gopd_absent(ctx, *ptd_ret, *ptd_flags, ext);
-    }
-    *pextensible = JS_IsExtensible(ctx, s->target);         /* step 12 */
-    if (*pextensible < 0)
-        return -1;
-    return 1;
-}
+/* DELETED: js_proxy_gopd_pre. It was 10.5.5 steps 9-12 with the TARGET FACTS read from C — the target's
+   [[GetOwnProperty]] and [[IsExtensible]], which for a Proxy target are its own traps. The routed path obtains the
+   same facts as GD_TARGET / GD_EXT requests and reaches the same invariant helpers, so deleting this removes a WAY
+   OF ASKING and not a check. */
 
 /* 10.5.5 steps 14-17, on the PARSED descriptor. CONSUMES result_desc. Returns 1 with *pdesc filled, -1 having
    thrown. */
@@ -75666,49 +75445,25 @@ static int js_proxy_gopd_post(JSContext *ctx, JSPropertyDescriptor *presult, int
 /* The C form: pre, the C-side ToPropertyDescriptor, post. Its ONE remaining caller is js_proxy_get_own_property,
    the C [[GetOwnProperty]] hook — every consumer routed onto GP_GETOWNPROP runs the same three steps on the
    interpreter's chain, with the walk as twelve requests instead. CONSUMES trap_result_obj. */
-static int js_proxy_gopd_check(JSContext *ctx, JSValueConst obj, JSAtom prop,
-                               JSValue trap_result_obj, JSPropertyDescriptor *pdesc)
-{
-    JSPropertyDescriptor result_desc;
-    int td_flags = 0, td_ret = 0, extensible = 0, r;
-
-    r = js_proxy_gopd_pre(ctx, obj, trap_result_obj, prop, &td_flags, &td_ret, &extensible);
-    if (r <= 0) { JS_FreeValue(ctx, trap_result_obj); return r; }
-    r = js_obj_to_desc(ctx, &result_desc, trap_result_obj);
-    JS_FreeValue(ctx, trap_result_obj);
-    if (r < 0)
-        return -1;
-    return js_proxy_gopd_post(ctx, &result_desc, td_flags, td_ret, extensible, pdesc);
-}
+/* DELETED: js_proxy_gopd_check, the C form of 10.5.5 steps 9-17. Its one caller was the C [[GetOwnProperty]]
+   hook, whose body is gone. */
 
 static int js_proxy_get_own_property(JSContext *ctx, JSPropertyDescriptor *pdesc,
                                      JSValueConst obj, JSAtom prop)
 {
+    /* THE BODY IS DELETED, for the same reason the [[OwnPropertyKeys]] hook's is: every consumer is routed onto
+       GP_GETOWNPROP and the whole corpus runs with this DFAIL armed without reaching it. What stood here was a
+       second implementation of 10.5.5 — the `getOwnPropertyDescriptor` trap through JS_CallFree, then
+       js_proxy_gopd_check: the target's [[GetOwnProperty]] and [[IsExtensible]], and js_obj_to_desc reading the
+       trap RESULT's twelve descriptor fields with JS_HasProperty / JS_GetProperty. Every one is the page's code
+       from an activation with no flow base. The routed path keeps the INVARIANT helpers, so the checks cannot
+       drift; only the C way of obtaining the facts is gone.
+       In RELEASE the DFAIL compiles out and this FAILS visibly rather than answering from the proxy's own empty
+       shape, which is the honest outcome for a capability only the routed path implements. */
     DFAIL("a C-side [[GetOwnProperty]] reached a Proxy — the page's trap has no flow base here; route that caller onto the keyed entry's GP_GETOWNPROP");
-    JSProxyData *s;
-    JSValue method, trap_result_obj, prop_val;
-    JSValueConst args[2];
-
-    s = proxy_resolve_trapless(ctx, &method, obj, JS_ATOM_getOwnPropertyDescriptor);
-    if (!s)
-        return -1;
-    if (JS_IsUndefined(method))
-        return JS_GetOwnPropertyInternal(ctx, pdesc, JS_VALUE_GET_OBJ(s->target), prop);
-    prop_val = JS_AtomToValue(ctx, prop);
-    if (JS_IsException(prop_val)) {
-        JS_FreeValue(ctx, method);
-        return -1;
-    }
-    args[0] = s->target;
-    args[1] = prop_val;
-    /* THE LAST C-driven `getOwnPropertyDescriptor` trap. Every consumer routed onto GP_GETOWNPROP runs it on the
-       interpreter's chain instead; the ones still calling JS_GetOwnPropertyInternal from C reach it here, and a
-       trap with a loop in it aborts at its back-edge by name. */
-    trap_result_obj = JS_CallFree(ctx, method, s->handler, 2, args);
-    JS_FreeValue(ctx, prop_val);
-    if (JS_IsException(trap_result_obj))
-        return -1;
-    return js_proxy_gopd_check(ctx, obj, prop, trap_result_obj, pdesc);
+    (void)pdesc; (void)prop; (void)obj;
+    JS_ThrowInternalError(ctx, "[[GetOwnProperty]] on a Proxy is only implemented on the interpreter's chain");
+    return -1;
 }
 
 static int js_proxy_define_own_property(JSContext *ctx, JSValueConst obj,
@@ -75716,42 +75471,15 @@ static int js_proxy_define_own_property(JSContext *ctx, JSValueConst obj,
                                         JSValueConst getter,
                                         JSValueConst setter, int flags)
 {
+    /* THE BODY IS DELETED. Every consumer is routed onto the keyed entry's GP_DEFINE and the whole corpus runs with
+       this DFAIL armed without reaching it, so what stood here was a second implementation of 10.5.6 — the `defineProperty` trap, the descriptor object it is handed, and its result invariant,
+       run from an activation with no flow base. In RELEASE the DFAIL compiles out and this FAILS VISIBLY rather
+       than answering from the proxy's own empty shape — the honest outcome for a capability that only the routed
+       path implements. */
     DFAIL("a C-side [[DefineOwnProperty]] reached a Proxy — the page's trap has no flow base here; route that caller onto the keyed entry's GP_DEFINE");
-    JSProxyData *s;
-    JSValue method, ret1, prop_val, desc_val;
-    int res;
-    JSObject *p;
-    JSValueConst args[3];
-    JSPropertyDescriptor desc;
-    bool ret, setting_not_configurable;
-
-    s = proxy_resolve_trapless(ctx, &method, obj, JS_ATOM_defineProperty);
-    if (!s)
-        return -1;
-    if (JS_IsUndefined(method)) {
-        return JS_DefineProperty(ctx, s->target, prop, val, getter, setter, flags);
-    }
-    prop_val = JS_AtomToValue(ctx, prop);
-    if (JS_IsException(prop_val)) {
-        JS_FreeValue(ctx, method);
-        return -1;
-    }
-    desc_val = js_create_desc(ctx, val, getter, setter, flags);
-    if (JS_IsException(desc_val)) {
-        JS_FreeValue(ctx, prop_val);
-        JS_FreeValue(ctx, method);
-        return -1;
-    }
-    args[0] = s->target;
-    args[1] = prop_val;
-    args[2] = desc_val;
-    ret1 = JS_CallFree(ctx, method, s->handler, 3, args);
-    JS_FreeValue(ctx, prop_val);
-    JS_FreeValue(ctx, desc_val);
-    if (JS_IsException(ret1))
-        return -1;
-    ret = JS_ToBoolFree(ctx, ret1);
-    return js_proxy_define_invariant(ctx, s->target, prop, val, getter, setter, flags, ret);
+    (void)prop; (void)obj; (void)val; (void)getter; (void)setter; (void)flags;
+    JS_ThrowInternalError(ctx, "[[DefineOwnProperty]] on a Proxy is only implemented on the interpreter's chain");
+    return -1;
 }
 
 /* [[DefineOwnProperty]] invariant (10.5.6 steps 13-16): a trap that reports SUCCESS must be consistent with the
@@ -75759,91 +75487,28 @@ static int js_proxy_define_own_property(JSContext *ctx, JSValueConst obj,
    trampolined trap's continuation — it runs on the trap's RESULT, so the tramp path can only honour it from a
    continuation, exactly as [[Get]]'s, [[HasProperty]]'s and [[Delete]]'s do. `ret` is the trap's boolean;
    returns 1, 0 (rejected with no THROW flag), or -1 having thrown. */
-static int js_proxy_define_invariant(JSContext *ctx, JSValueConst target, JSAtom prop, JSValueConst val,
-                                     JSValueConst getter, JSValueConst setter, int flags, bool ret)
-{
-    JSDescFacts f;
-    int r, ext = 1;
-
-    if (!ret) {
-        if (flags & JS_PROP_THROW) {
-            JS_ThrowTypeError(ctx, "proxy: defineProperty exception");
-            return -1;
-        }
-        return 0;
-    }
-    if (js_proxy_facts_from_c(ctx, target, prop, &f) < 0)
-        return -1;
-    if (f.flags < 0) {
-        /* 10.5.6 step 16.a is IsExtensible(target), the INTERNAL METHOD — this read `p->extensible`, the target
-           JSObject's storage bit, which for a Proxy target is the proxy's own flag rather than its answer. Third
-           instance of that deviation; the machine asks for the method and so does this. */
-        ext = JS_IsExtensible(ctx, target);
-        if (ext < 0) { js_desc_facts_free(ctx, &f); return -1; }
-    }
-    r = js_proxy_define_check(ctx, &f, val, getter, setter, flags, ext);
-    js_desc_facts_free(ctx, &f);
-    return (r < 0) ? -1 : 1;
-}
+/* DELETED: js_proxy_define_invariant, 10.5.6 steps 15-17 with the target's descriptor and extensibility read
+   from C. */
 
 /* [[Delete]] invariant: a trap that reports SUCCESS must be telling the truth about a non-configurable own property
    of the target, and about a non-extensible target. ONE implementation, shared by the C path and by the trampolined
    trap's continuation — the check runs on the trap's RESULT, so the tramp path can only honour it from a
    continuation, exactly as [[Get]]'s and [[HasProperty]]'s do. `ret` is the trap's boolean; returns it, or -1
    having thrown. */
-static int js_proxy_delete_invariant(JSContext *ctx, JSValueConst target, JSAtom atom, int ret)
-{
-    int desc_flags, res2, is_extensible;
-    if (!ret)
-        return 0;
-    res2 = JS_GetOwnPropertyFlagsInternal(ctx, &desc_flags, JS_VALUE_GET_OBJ(target), atom);
-    if (res2 < 0)
-        return -1;
-    if (res2) {
-        if (!(desc_flags & JS_PROP_CONFIGURABLE)) {
-            JS_ThrowTypeError(ctx, "proxy: inconsistent deleteProperty");
-            return -1;
-        }
-        is_extensible = JS_IsExtensible(ctx, target);
-        if (is_extensible < 0)
-            return -1;
-        if (!is_extensible) {
-            /* proxy-missing-checks */
-            JS_ThrowTypeError(ctx, "proxy: inconsistent deleteProperty");
-            return -1;
-        }
-    }
-    return 1;
-}
+/* DELETED: js_proxy_delete_invariant, 10.5.10 steps 10-12, the same story as its `has` sibling. */
 
 static int js_proxy_delete_property(JSContext *ctx, JSValueConst obj,
                                     JSAtom atom)
 {
+    /* THE BODY IS DELETED. Every consumer is routed onto the keyed entry's GP_DELETE and the whole corpus runs with
+       this DFAIL armed without reaching it, so what stood here was a second implementation of 10.5.10 — the `deleteProperty` trap and its non-configurable invariant,
+       run from an activation with no flow base. In RELEASE the DFAIL compiles out and this FAILS VISIBLY rather
+       than answering from the proxy's own empty shape — the honest outcome for a capability that only the routed
+       path implements. */
     DFAIL("a C-side [[Delete]] reached a Proxy — the page's trap has no flow base here; route that caller onto the keyed entry's GP_DELETE");
-    JSProxyData *s;
-    JSValue method, ret, atom_val;
-    bool res;
-    JSValueConst args[2];
-
-    s = proxy_resolve_trapless(ctx, &method, obj, JS_ATOM_deleteProperty);
-    if (!s)
-        return -1;
-    if (JS_IsUndefined(method)) {
-        return JS_DeleteProperty(ctx, s->target, atom, 0);
-    }
-    atom_val = JS_AtomToValue(ctx, atom);;
-    if (JS_IsException(atom_val)) {
-        JS_FreeValue(ctx, method);
-        return -1;
-    }
-    args[0] = s->target;
-    args[1] = atom_val;
-    ret = JS_CallFree(ctx, method, s->handler, 2, args);
-    JS_FreeValue(ctx, atom_val);
-    if (JS_IsException(ret))
-        return -1;
-    res = JS_ToBoolFree(ctx, ret);
-    return js_proxy_delete_invariant(ctx, s->target, atom, res);
+    (void)atom; (void)obj;
+    JS_ThrowInternalError(ctx, "[[Delete]] on a Proxy is only implemented on the interpreter's chain");
+    return -1;
 }
 
 /* return the index of the property or -1 if not found */
@@ -75863,113 +75528,10 @@ static int find_prop_key(const JSPropertyEnum *tab, int n, JSAtom atom)
    check is not, which is exactly the split every proxy operation makes — so the check lives here, called both by
    the C hook below (whose trap call is still a JS_CallFree) and by the tramp continuation, which has already run
    the trap on the interpreter's chain. CONSUMES prop_array either way. */
-static int js_proxy_ownkeys_check(JSContext *ctx, JSValueConst obj, JSValue prop_array,
-                                  JSPropertyEnum **ptab, uint32_t *plen)
-{
-    JSProxyData *s = JS_VALUE_GET_OBJ(obj)->u.opaque;
-    JSValue val;
-    uint32_t len, i, len2;
-    JSPropertyEnum *tab, *tab2;
-    JSAtom atom;
-    int res, is_extensible, idx;
-
-    tab = NULL;
-    len = 0;
-    tab2 = NULL;
-    len2 = 0;
-    if (js_get_length32(ctx, &len, prop_array))
-        goto fail;
-    if (len > 0) {
-        tab = js_mallocz(ctx, sizeof(tab[0]) * len);
-        if (!tab)
-            goto fail;
-    }
-    for(i = 0; i < len; i++) {
-        val = JS_GetPropertyUint32(ctx, prop_array, i);
-        if (JS_IsException(val))
-            goto fail;
-        if (!JS_IsString(val) && !JS_IsSymbol(val)) {
-            JS_FreeValue(ctx, val);
-            JS_ThrowTypeError(ctx, "proxy: properties must be strings or symbols");
-            goto fail;
-        }
-        atom = JS_ValueToAtom(ctx, val);
-        JS_FreeValue(ctx, val);
-        if (atom == JS_ATOM_NULL)
-            goto fail;
-        tab[i].atom = atom;
-        tab[i].is_enumerable = false; /* XXX: redundant? */
-    }
-
-    /* check duplicate properties (XXX: inefficient, could store the
-     * properties an a temporary object to use the hash) */
-    for(i = 1; i < len; i++) {
-        if (find_prop_key(tab, i, tab[i].atom) >= 0) {
-            JS_ThrowTypeError(ctx, "proxy: duplicate property");
-            goto fail;
-        }
-    }
-
-    is_extensible = JS_IsExtensible(ctx, s->target);
-    if (is_extensible < 0)
-        goto fail;
-
-    /* check if there are non configurable properties */
-    if (s->is_revoked) {
-        JS_ThrowTypeErrorRevokedProxy(ctx);
-        goto fail;
-    }
-    if (JS_GetOwnPropertyNamesInternal(ctx, &tab2, &len2, JS_VALUE_GET_OBJ(s->target),
-                               JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK))
-        goto fail;
-    for(i = 0; i < len2; i++) {
-        if (s->is_revoked) {
-            JS_ThrowTypeErrorRevokedProxy(ctx);
-            goto fail;
-        }
-        {
-            int desc_flags;
-            res = JS_GetOwnPropertyFlagsInternal(ctx, &desc_flags, JS_VALUE_GET_OBJ(s->target),
-                                    tab2[i].atom);
-            if (res < 0)
-                goto fail;
-            if (res) {  /* safety, property should be found */
-                if (!(desc_flags & JS_PROP_CONFIGURABLE) || !is_extensible) {
-                    idx = find_prop_key(tab, len, tab2[i].atom);
-                    if (idx < 0) {
-                        JS_ThrowTypeError(ctx, "proxy: target property must be present in proxy ownKeys");
-                        goto fail;
-                    }
-                    /* mark the property as found */
-                    if (!is_extensible)
-                        tab[idx].is_enumerable = true;
-                }
-            }
-        }
-    }
-    if (!is_extensible) {
-        /* check that all property in 'tab' were checked */
-        for(i = 0; i < len; i++) {
-            if (!tab[i].is_enumerable) {
-                JS_ThrowTypeError(ctx, "proxy: property not present in target were returned by non extensible proxy");
-                goto fail;
-            }
-        }
-    }
-
-    js_free_prop_enum(ctx, tab2, len2);
-    JS_FreeValue(ctx, prop_array);
-    *ptab = tab;
-    *plen = len;
-    return 0;
- fail:
-    js_free_prop_enum(ctx, tab2, len2);
-    js_free_prop_enum(ctx, tab, len);
-    JS_FreeValue(ctx, prop_array);
-    *ptab = NULL;
-    *plen = 0;
-    return -1;
-}
+/* DELETED: js_proxy_ownkeys_check. It was 10.5.11 steps 5-11 performed from C — CreateListFromArrayLike on the
+   TRAP RESULT (a page array, so its `length` and every element are the page's code), then [[OwnPropertyKeys]] and
+   [[IsExtensible]] on the target and a [[GetOwnProperty]] per key. The machine performs all of it as requests, and
+   its only remaining caller was the C hook whose body is now gone with it. */
 
 /* DELETED: js_proxy_ownkeys_result. It was 10.5.11's whole check performed from C at the routed delivery — the
    trap-result array walk and the three internal methods on the target — and the machine above performs it as
@@ -75981,25 +75543,18 @@ static int js_proxy_get_own_property_names(JSContext *ctx,
                                            uint32_t *plen,
                                            JSValueConst obj)
 {
+    /* THE BODY IS DELETED. Every consumer of [[OwnPropertyKeys]] is routed onto GP_OWNKEYS, and the whole corpus
+       runs with this DFAIL armed without reaching it — so what stood here was a second implementation of 10.5.11
+       that nothing could reach: the `ownKeys` trap through JS_CallFree, and then js_proxy_ownkeys_check's SIX
+       page-visible operations (the trap-result array's `length` and every element, plus [[GetOwnProperty]] per key,
+       [[OwnPropertyKeys]] and [[IsExtensible]] on the target), all from an activation with no flow base.
+       In RELEASE the DFAIL is compiled out and there is nothing to fall back to, which is correct: the capability
+       is not supportable outside the routed path, so it FAILS visibly rather than answering from the proxy's own
+       empty shape. */
     DFAIL("a C-side [[OwnPropertyKeys]] reached a Proxy — the page's trap has no flow base here; route that caller onto the keyed entry's GP_OWNKEYS");
-    JSProxyData *s;
-    JSValue method, prop_array;
-
-    s = proxy_resolve_trapless(ctx, &method, obj, JS_ATOM_ownKeys);
-    if (!s)
-        return -1;
-    if (JS_IsUndefined(method)) {
-        return JS_GetOwnPropertyNamesInternal(ctx, ptab, plen,
-                                      JS_VALUE_GET_OBJ(s->target),
-                                      JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK);
-    }
-    /* THE LAST C-driven `ownKeys` trap. Every consumer routed onto GP_OWNKEYS runs it on the interpreter's chain
-       instead; the ones still calling JS_GetOwnPropertyNamesInternal from C reach it here, and a trap with a loop
-       in it aborts at its back-edge by name. Converting a consumer is what removes one more of those. */
-    prop_array = JS_CallFree(ctx, method, s->handler, 1, vc(&s->target));
-    if (JS_IsException(prop_array))
-        return -1;
-    return js_proxy_ownkeys_check(ctx, obj, prop_array, ptab, plen);
+    (void)ptab; (void)plen; (void)obj;
+    JS_ThrowInternalError(ctx, "[[OwnPropertyKeys]] on a Proxy is only implemented on the interpreter's chain");
+    return -1;
 }
 
 static JSValue js_proxy_call_constructor(JSContext *ctx, JSValueConst func_obj,
