@@ -17748,9 +17748,22 @@ static int step_getprop_begin(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JS
     return 6;
 }
 
-/* the tail both entries share: the value arrived, so the key is done. */
-static int step_getprop_done(JSContext *ctx, JSStepHdr *h, JSValue in, JSValue *pout)
+/* the tail both entries share: the value arrived, so the key is done.
+
+   THE TWO-PHASE CONTRACT, asserted here because violating it is otherwise SILENT. A sub-sequence parks on its
+   first call and answers on its second, and the parked key lives on the HEADER — so the second call must be the
+   SAME call site. A machine that advances its own phase before the request completes re-enters at the NEXT call
+   site instead, which takes the answering branch and receives the OTHER read's value as its own. That produced
+   a hang with no diagnostic: `@@asyncIterator`'s parked read was answered at the `@@iterator` call site, which
+   consumed it and asked for nothing, forever. `atom` is JS_ATOM_NULL from the INDEX forms, which recompute
+   nothing on the answering path and so have no key to check. */
+static int step_getprop_done(JSContext *ctx, JSStepHdr *h, JSAtom atom, JSValue in, JSValue *pout)
 {
+    DCHECK(h->get_atom != JS_ATOM_NULL, "a keyed read was delivered with none in flight on this header");
+    DCHECK(atom == JS_ATOM_NULL || atom == h->get_atom,
+           "a keyed read was answered at a DIFFERENT call site than the one that parked it — the machine "
+           "advanced its phase before the request completed; a two-phase sub-sequence keeps its phase until it "
+           "returns 0");
     JS_FreeAtom(ctx, h->get_atom);
     h->get_atom = JS_ATOM_NULL;
     h->get_phase = GET_PH_START;
@@ -17766,7 +17779,7 @@ static int step_getprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAt
         JS_FreeValue(ctx, in);
         return step_getprop_begin(ctx, h, obj, JS_DupAtom(ctx, atom), out_cb, out_argc);
     }
-    return step_getprop_done(ctx, h, in, pout);
+    return step_getprop_done(ctx, h, atom, in, pout);
 }
 
 /* A keyed WRITE, Set(O, key, value, true) — the mirror of the read above and the half that was missing. Every
@@ -17788,6 +17801,10 @@ static int step_setprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAt
         h->get_phase = GET_PH_GOT;
         return 8;
     }
+    DCHECK(h->get_atom != JS_ATOM_NULL, "a keyed write was delivered with none in flight on this header");
+    DCHECK(atom == JS_ATOM_NULL || atom == h->get_atom,
+           "a keyed write was answered at a DIFFERENT call site than the one that parked it — see the read's "
+           "contract above");
     JS_FreeAtom(ctx, h->get_atom);
     h->get_atom = JS_ATOM_NULL;
     h->get_phase = GET_PH_START;
@@ -17807,7 +17824,9 @@ static int step_getidx_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, int64
         if (atom == JS_ATOM_NULL) return -1;
         return step_getprop_begin(ctx, h, obj, atom, out_cb, out_argc);
     }
-    return step_getprop_done(ctx, h, in, pout);
+    /* the INDEX form has no key to check on the answering path: recomputing the atom to satisfy a DCHECK would
+       allocate on the hot path, so it passes NULL and the "one is in flight" half of the contract still holds. */
+    return step_getprop_done(ctx, h, JS_ATOM_NULL, in, pout);
 }
 
 /* Set(O, ! ToString(𝔽(idx)), v, true) — the write half of an element access. A setter or a Proxy `set` trap is
@@ -49684,7 +49703,7 @@ static int js_import_opts_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
     if (s->hdr.stage == 1) {
         if (JS_IsException(cb_result))
             return js_import_opts_reject(ctx, s, JS_GetException(ctx));
-        step_getprop_done(ctx, &s->hdr, cb_result, &s->attrs_obj);
+        step_getprop_done(ctx, &s->hdr, JS_ATOM_NULL, cb_result, &s->attrs_obj);
         cb_result = JS_UNDEFINED;
         if (JS_IsUndefined(s->attrs_obj))
             return js_import_opts_enqueue(ctx, s);          /* step 9.c: no `with`, no attributes */
@@ -77111,7 +77130,7 @@ static int js_json_str_prologue(JSContext *ctx, JSJsonStr *s, JSValue in, JSValu
                 if (at == JS_ATOM_NULL) return -1;
                 return step_getprop_begin(ctx, &s->hdr, replacer, at, out_cb, out_argc);
             }
-            step_getprop_done(ctx, &s->hdr, in, &v);
+            step_getprop_done(ctx, &s->hdr, JS_ATOM_NULL, in, &v);   /* an INDEX key: nothing to check */
             in = JS_UNDEFINED;
             if (JS_IsException(v)) return -1;
             s->pi++;
@@ -77286,7 +77305,7 @@ static int js_json_str_walk(JSContext *ctx, JSJsonStr *s, JSValue in, JSValue **
             return step_getprop_begin(ctx, &s->hdr, f->holder, JS_DupAtom(ctx, f->key_atom), out_cb, out_argc);
 
         case SJ_GOT:
-            step_getprop_done(ctx, &s->hdr, in, &f->val);
+            step_getprop_done(ctx, &s->hdr, f->key_atom, in, &f->val);
             in = JS_UNDEFINED;
             if (JS_IsException(f->val)) { f->val = JS_UNDEFINED; return -1; }
             /* step 2: `If value is an Object or a BigInt, let toJSON be ? GetV(value, "toJSON")`. */
@@ -77300,7 +77319,7 @@ static int js_json_str_walk(JSContext *ctx, JSJsonStr *s, JSValue in, JSValue **
 
         case SJ_TOJSON_GOT: {
             JSValue fn;
-            step_getprop_done(ctx, &s->hdr, in, &fn);
+            step_getprop_done(ctx, &s->hdr, JS_ATOM_toJSON, in, &fn);
             in = JS_UNDEFINED;
             if (JS_IsException(fn)) return -1;
             if (!JS_IsFunction(ctx, fn)) {
