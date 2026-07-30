@@ -33652,6 +33652,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     cont_st = co;
                     goto do_async_from_sync_abrupt;
                 }
+                if (co && ck == CONT_PROMISE_ALL) {
+                    /* the combinator asked for this close on its way to rejecting its aggregate. 7.4.9 has
+                       already restored the completion the close interrupted; whatever the close itself produced
+                       is discarded, which is exactly what IfAbruptCloseIterator says. */
+                    DCHECK(failed, "a Promise combinator close ended with no completion to reject with");
+                    cont_st = co;
+                    goto do_promise_all_reject;
+                }
                 if (co && ck == CONT_ITER_HELPER) {
                     /* a lazy Iterator Helper closed its source at take's limit. Its resume point discards
                        whatever the close produced and delivers {undefined, true}; a close that THREW propagates,
@@ -36345,19 +36353,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             /* Promise.all(gen): a throw from the consumed generator REJECTS the aggregate promise and yields it to
                the caller (js_promise_all's fail_reject), never propagates. sp is now the caller's stack with the
                original Promise.all operands; pop them and push the rejected aggregate. */
-            JSValue err = JS_GetException(ctx), rr;
-            JSValue r = js_dup(pa_throw->result_promise);
-            int cfirst = pa_throw->orig_cfirst, cargc = pa_throw->orig_cargc; uint8_t itail = pa_throw->orig_is_tail;
-            JSValue *cargv;
-            JS_IteratorClose(ctx, pa_throw->iter, true);
-            rr = JS_Call(ctx, pa_throw->resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
-            JS_FreeValue(ctx, err); JS_FreeValue(ctx, rr);
-            js_promise_all_end(ctx, pa_throw); js_free_rt(rt, pa_throw);
-            cargv = sp - cargc;
-            for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
-            sp += cfirst - cargc;
-            if (itail) { ret_val = r; goto do_return; }
-            *sp++ = r;
+            /* The close and the reject are the SAME two steps the unwind arm performs, so they are the same
+               label: park 7.4.9 on the chain (the iterator's `return` is the page's code and JS_IteratorClose ran
+               it by C recursion) and land on do_promise_all_reject, which pops these very operands. */
+            JSIterClose *ce = js_malloc(ctx, sizeof(*ce));
+            cont_st = pa_throw;
+            if (unlikely(!ce)) { JS_ThrowOutOfMemory(ctx); goto do_promise_all_reject; }
+            ce->iter = js_dup(pa_throw->iter);
+            ce->saved_exc = rt->current_exception;
+            rt->current_exception = JS_UNINITIALIZED;
+            ce->outer = pa_throw; ce->outer_kind = CONT_PROMISE_ALL;
+            gp_obj = ce->iter; gp_atom = JS_ATOM_return; gp_op = GP_GET; gp_val = JS_UNDEFINED;
+            gp_outer = ce; gp_outer_kind = CONT_ITER_CLOSE;
+            goto do_getprop_tramp;
             BREAK;
         }
         if (afs_throw) {
@@ -36845,11 +36853,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                tramp, js_promise_all_step caught this inline (return -1 -> promise_all_err), so routing the callback
                onto the tramp made this the site that must reproduce that catch. */
             JSPromiseAll *ps = xcs;
-            JSValue err, rr;
-            JSValue r = js_dup(ps->result_promise);
-            int cfirst = ps->orig_cfirst, cargc = ps->orig_cargc;
-            uint8_t itail = ps->orig_is_tail;
-            JSValue *cargv;
             /* THE DRIVE'S OWN OPERANDS, which sit ABOVE the original call's — the same thing the async-from-sync
                arm owes. This arm assumed there were none, which held while every drive this machine made read its
                operands out of the machine's own buffer; the per-element `C.resolve(value)` and the finalize settle
@@ -36862,22 +36865,49 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 for (i = xcf; i < xcg; i++) JS_FreeValue(ctx, dcargv[i]);
                 sp += xcf - xcg;
             }
-            err = JS_GetException(ctx);
+            cont_st = ps;   /* the reject label below reads the machine from here, as every label does */
             /* Close ONLY for a post-retrieval throw (fail_reject1). A .next() drive that threw (driving_next) or a
                finalize-stage settle that threw (iter_done) leaves the iterator [[Done]] — no close (fail_reject). */
-            if (!JS_IsUndefined(ps->iter) && !ps->driving_next && !ps->iter_done)
-                JS_IteratorClose(ctx, ps->iter, true);   /* best-effort per IfAbruptCloseIterator; its own throw is ignored */
-            rr = JS_Call(ctx, ps->resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
-            JS_FreeValue(ctx, err);
-            js_promise_all_end(ctx, ps); js_free_rt(rt, ps);
-            cargv = sp - cargc;
-            for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
-            sp += cfirst - cargc;
-            if (unlikely(JS_IsException(rr))) { JS_FreeValue(ctx, r); JS_FreeValue(ctx, rr); goto exception; }
-            JS_FreeValue(ctx, rr);
-            if (itail) { ret_val = r; goto do_return; }
-            *sp++ = r;
-            BREAK;
+            if (!JS_IsUndefined(ps->iter) && !ps->driving_next && !ps->iter_done) {
+                /* 7.4.9 ON THE CHAIN. The iterator's `return` is the page's code and JS_IteratorClose ran it by C
+                   recursion below the live flow. Parked exactly the way an async-from-sync close is: the pending
+                   completion becomes the close's saved exception, this machine is named as the waiter, and
+                   do_iter_close_finish restores that completion and comes back to the reject below.
+                   THE DEFERRED-CLOSE QUEUE CANNOT SERVE THIS ARM — its drain is the exception label, and this
+                   path never reaches it, because Promise.all(x) RETURNS a rejected promise rather than raising.
+                   That is why the close needs a continuation rather than a deferral. */
+                JSIterClose *ce = js_malloc(ctx, sizeof(*ce));
+                if (unlikely(!ce)) { JS_ThrowOutOfMemory(ctx); goto do_promise_all_reject; }
+                ce->iter = js_dup(ps->iter);
+                ce->saved_exc = rt->current_exception;
+                rt->current_exception = JS_UNINITIALIZED;
+                ce->outer = ps; ce->outer_kind = CONT_PROMISE_ALL;
+                gp_obj = ce->iter; gp_atom = JS_ATOM_return; gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                gp_outer = ce; gp_outer_kind = CONT_ITER_CLOSE;
+                goto do_getprop_tramp;
+            }
+        do_promise_all_reject:
+            /* IfAbruptRejectPromise: the aggregate is REJECTED and yielded; the throw never propagates. Reached
+               directly when there was nothing to close, and from do_iter_close_finish once there was. */
+            {
+                JSPromiseAll *ps2 = (JSPromiseAll *)cont_st;
+                JSValue err = JS_GetException(ctx), rr;
+                JSValue r = js_dup(ps2->result_promise);
+                int cfirst = ps2->orig_cfirst, cargc = ps2->orig_cargc;
+                uint8_t itail = ps2->orig_is_tail;
+                JSValue *cargv;
+                rr = JS_Call(ctx, ps2->resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
+                JS_FreeValue(ctx, err);
+                js_promise_all_end(ctx, ps2); js_free_rt(rt, ps2);
+                cargv = sp - cargc;
+                for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
+                sp += cfirst - cargc;
+                if (unlikely(JS_IsException(rr))) { JS_FreeValue(ctx, r); JS_FreeValue(ctx, rr); goto exception; }
+                JS_FreeValue(ctx, rr);
+                if (itail) { ret_val = r; goto do_return; }
+                *sp++ = r;
+                BREAK;
+            }
         } else if (xck == CONT_STEP && ((JSStepHdr *)xcs)->def->catches_abrupt) {
             /* The machine's algorithm CATCHES this call's abrupt completion instead of propagating it —
                DisposeResources keeps disposing and folds the throw into a SuppressedError, the way 16.2.1.8 folds
