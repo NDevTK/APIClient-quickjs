@@ -1490,6 +1490,8 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
        The block is contiguous and indexed by JSErrorEnum, with JS_PLAIN_ERROR last. */
     STEPDEF_ERROR_CTOR_BASE,
     STEPDEF_ERROR_CTOR_LAST = STEPDEF_ERROR_CTOR_BASE + JS_PLAIN_ERROR,
+    STEPDEF_GLOBAL_EVAL,
+    STEPDEF_ITER_CONCAT,
     STEPDEF_FUNCTION_CTOR, STEPDEF_GENERATOR_FUNCTION_CTOR,
     STEPDEF_ASYNC_FUNCTION_CTOR, STEPDEF_ASYNC_GENERATOR_FUNCTION_CTOR,
     STEPDEF_DV_FIRST,
@@ -17636,7 +17638,7 @@ typedef struct JSStepHdr {
     JSValue cb_coerce[3];   /* three, because the BARE [[Set]] request carries [obj, receiver, value] — the
                                receiver is a separate operand in the spec and a builtin's Set(O,P,V,true) is the
                                one form that can leave it implicit. */
-    uint8_t len_phase, spc_phase, num_phase, str_phase, get_phase, cs_phase, exec_phase;
+    uint8_t len_phase, spc_phase, num_phase, str_phase, get_phase, cs_phase, exec_phase, prog_phase;
     /* an ARGUMENT COERCION is outstanding, so an abandon here is the spec's abrupt-completion case (take/drop's
        IfAbruptCloseIterator). It lives on the header because the teardown is what has to act on it, and the
        teardown releases this_val — the receiver the handler needs — before the machine's own fini can see it. */
@@ -18231,6 +18233,58 @@ static int step_topropkey_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSVa
     *pres = JS_ValueToAtom(ctx, in);
     JS_FreeValue(ctx, in);
     return (*pres == JS_ATOM_NULL) ? -1 : 0;
+}
+
+/* PerformEval's / CreateDynamicFunction's EVALUATION of a source string. A script's body is a BYTECODE BODY, so
+   evaluating one is a CALL and belongs on the tramp: performed from C it gets an activation off the chain, and a
+   loop inside it has no flow base to park into. Two builtins perform it — indirect eval (19.2.1.1) and
+   CreateDynamicFunction, whose parse-and-create this engine performs by evaluating the synthesized
+   `(function anonymous(…){…})` source — so it is a shared sub-sequence rather than a stage each of them
+   re-spells. The receiver is the GLOBAL OBJECT: an indirect eval's program is global scope whatever the code's
+   strictness, so a `"use strict"` prologue must still see the global and not undefined.
+     0 = *pout is the program's value, 3 = the caller must return that step code, -1 = threw. */
+enum { PROG_PH_START = 0, PROG_PH_RAN };
+
+static inline bool tramp_body_is_plain(JSValueConst func);
+
+static int step_program_run(JSContext *ctx, JSStepHdr *h, JSValueConst src, JSValue in, JSValue *pout,
+                            JSValue **out_cb, int *out_argc)
+{
+    if (h->prog_phase == PROG_PH_START) {
+        JSValue clo;
+        const char *str;
+        size_t len;
+        JS_FreeValue(ctx, in);
+        if (!JS_IsString(src)) {
+            *pout = js_dup(src);   /* 19.2.1.1 step 2: a non-string source is the result, unevaluated */
+            return 0;
+        }
+        str = JS_ToCStringLen(ctx, &len, src);
+        if (!str)
+            return -1;
+        clo = JS_EvalInternal(ctx, ctx->global_obj, str, len, "<input>", 1,
+                              JS_EVAL_TYPE_INDIRECT | JS_EVAL_FLAG_TRAMP_CLOSURE, -1);
+        JS_FreeCString(ctx, str);
+        if (JS_IsException(clo))
+            return -1;
+        DCHECK(tramp_body_is_plain(clo), "a program closure is not a trampolinable bytecode function");
+        DCHECK(JS_VALUE_GET_TAG(h->coerce) != JS_TAG_OBJECT,
+               "a coercion is already in flight on this machine's header");
+        h->coerce = clo;                     /* owned across the call */
+        h->cb_coerce[0] = ctx->global_obj;   /* borrowed: the context holds the global object */
+        h->cb_coerce[1] = h->coerce;         /* borrowed view */
+        *out_cb = h->cb_coerce; *out_argc = 0;
+        h->prog_phase = PROG_PH_RAN;
+        return 3;
+    }
+    DCHECK(h->prog_phase == PROG_PH_RAN, "a program evaluation resumed in an unknown phase");
+    JS_FreeValue(ctx, h->coerce);
+    h->coerce = JS_UNDEFINED;
+    h->cb_coerce[0] = JS_UNDEFINED;
+    h->cb_coerce[1] = JS_UNDEFINED;
+    h->prog_phase = PROG_PH_START;
+    *pout = in;
+    return 0;
 }
 
 /* JS_ToStringCheckObject on the RECEIVER — RequireObjectCoercible, then ToString. Every String.prototype method
@@ -21353,6 +21407,14 @@ typedef struct JSIterConcatNext {
     uint8_t held;     /* 1 = this machine raised `running` and owes it back */
 } JSIterConcatNext;
 
+typedef struct JSIterConcat {
+    JSStepHdr hdr;
+    JSValue result;
+    struct JSIteratorConcatData *it;   /* owned until the iterator object adopts it */
+    int i;
+    uint8_t checked;            /* step 3.a has run for argument i; the read is what remains */
+} JSIterConcat;
+
 typedef struct JSIterConcatReturn {
     JSStepHdr hdr;    /* MUST be first: the generic step driver casts the state to JSStepHdr * */
     JSValue self;     /* owned, for the same reason */
@@ -22587,20 +22649,7 @@ static JSValue js_json_reviver_end(JSContext *ctx, struct JSJsonReviver *s, bool
    an input iterator's .next). It holds NO continuation, so like f.call it is RESOLVED at the operator site and the
    ultimate target dispatched on this chain; JS_Call'ing it from C would drive a generator .next off the tramp. */
 static JSValue js_call_function(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
-/* INDIRECT eval — (0,eval)(src) reaches the js_global_eval C builtin, which would run the program in its own
-   activation off the chain (a loop inside it then has no base to park into). Recognize it at the call site and
-   trampoline the compiled closure, exactly as OP_eval does for direct eval. */
-static JSValue js_global_eval(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
-static inline bool tramp_is_global_eval(JSValueConst method) {
-    JSObject *mp;
-    if (JS_VALUE_GET_TAG(method) != JS_TAG_OBJECT) return false;
-    mp = JS_VALUE_GET_OBJ(method);
-    return mp->class_id == JS_CLASS_C_FUNCTION
-        && mp->u.cfunc.cproto == JS_CFUNC_generic
-        && mp->u.cfunc.c_function.generic == js_global_eval;
-}
 static JSProxyData *get_proxy_method(JSContext *ctx, JSValue *pmethod, JSValueConst obj, JSAtom name);
-static inline bool tramp_body_is_plain(JSValueConst func);
 /* PROXY [[Construct]]: `new proxy(...)`. Resolve the `construct` trap at the operator site and dispatch it as
    trap(target, argArray, newTarget) with `this` = handler, so a loop in the trap body parks. Layout-independent
    like [[Set]]'s: fills out[0..4] with [handler, trap, target, argArray, newTarget] (owning every one) because the
@@ -23963,33 +24012,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    `m()` parked — the OP_call_method chain never grew the copy. */
                 if (tramp_is_call_function(call_argv[-1]) && call_argc >= 2) {   /* builtins' call(thisArg,f,...) -> dispatch f here */
                     tramp_is_tail = (opcode == OP_tail_call); goto do_forward_callfn;
-                }
-                /* Same-realm only: js_call_c_function would switch to the eval function's realm, so a cross-realm
-                   (0,evalFromOtherRealm)(src) must keep the C path — its program belongs to THAT realm's global. */
-                if (tramp_is_global_eval(call_argv[-1]) && call_argc >= 1 && JS_IsString(call_argv[0])
-                    && js_same_value(ctx, call_argv[-1], ctx->eval_obj)) {
-                    /* INDIRECT eval: compile to a closure and run its body on THIS chain so its loops park.
-                       Its receiver is the GLOBAL OBJECT — indirect eval is global scope whatever the code's
-                       strictness, which the C path gets by passing ctx->global_obj to JS_CallFree. Dispatching
-                       it in the PLAIN shape gave this = undefined, and a `"use strict"` prologue then kept it
-                       undefined instead of resolving to the global (10.4.3-1-20-s / -20gs). The operands are
-                       reshaped UP by one into the METHOD shape — the eval function's own slot becomes the
-                       receiver and the first argument's slot the callee, both of which this call site owns, and
-                       do_return then drops exactly those two and lands the result where the callee sat. */
-                    JSValue eclo = JS_EvalObject(ctx, ctx->global_obj, call_argv[0],
-                                                 JS_EVAL_TYPE_INDIRECT | JS_EVAL_FLAG_TRAMP_CLOSURE, -1);
-                    JSValue *A;
-                    if (unlikely(JS_IsException(eclo))) goto exception;
-                    DCHECK(tramp_body_is_plain(eclo), "indirect eval closure is not a trampolinable bytecode function");
-                    A = (JSValue *)call_argv;
-                    for (i = 0; i < call_argc; i++) JS_FreeValue(ctx, A[i]);
-                    JS_FreeValue(ctx, A[-1]);
-                    A[-1] = js_dup(ctx->global_obj);
-                    A[0]  = eclo;
-                    sp = A + 1;
-                    call_argv = (JSValueConst *)(A + 1);
-                    call_argc = 0; tramp_first = -2; tramp_is_tail = (opcode == OP_tail_call);
-                    goto do_tramp_call;
                 }
                 tramp_first = -1; tramp_is_tail = (opcode == OP_tail_call);
                 goto do_consumer_dispatch;
@@ -36843,26 +36865,38 @@ static int step_speciesctor_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, 
     }
 }
 
-static int step_create_from_ctor_run(JSContext *ctx, JSStepHdr *h, JSValueConst ctor, int class_id,
-                                     JSValue in, JSValue *pout, JSValue **out_cb, int *out_argc)
+/* GetPrototypeFromConstructor (10.1.14) on its own. 10.1.13 is this operation followed by OrdinaryObjectCreate,
+   and CreateDynamicFunction's function is created by the PARSER rather than by that step while still ending in
+   this same read (20.2.1.1.1 step 29) — which is what makes the two separate sub-sequences instead of one.
+     0 = *pout holds the prototype, 6 = the caller must return that step code, -1 = threw. */
+static int step_proto_from_ctor_run(JSContext *ctx, JSStepHdr *h, JSValueConst ctor, int class_id,
+                                    JSValue in, JSValue *pout, JSValue **out_cb, int *out_argc)
 {
-    JSValue proto;
     JSContext *realm;
     int r;
 
     if (JS_IsUndefined(ctor)) {
         JS_FreeValue(ctx, in);
-        proto = js_dup(ctx->class_proto[class_id]);
-    } else {
-        r = step_getprop_run(ctx, h, ctor, JS_ATOM_prototype, in, &proto, out_cb, out_argc);
-        if (r) return r;
-        if (!JS_IsObject(proto)) {
-            JS_FreeValue(ctx, proto);
-            realm = JS_GetFunctionRealm(ctx, ctor);
-            if (!realm) return -1;
-            proto = js_dup(realm->class_proto[class_id]);
-        }
+        *pout = js_dup(ctx->class_proto[class_id]);
+        return 0;
     }
+    r = step_getprop_run(ctx, h, ctor, JS_ATOM_prototype, in, pout, out_cb, out_argc);
+    if (r) return r;
+    if (!JS_IsObject(*pout)) {
+        JS_FreeValue(ctx, *pout);
+        realm = JS_GetFunctionRealm(ctx, ctor);
+        if (!realm) { *pout = JS_UNDEFINED; return -1; }
+        *pout = js_dup(realm->class_proto[class_id]);
+    }
+    return 0;
+}
+
+static int step_create_from_ctor_run(JSContext *ctx, JSStepHdr *h, JSValueConst ctor, int class_id,
+                                     JSValue in, JSValue *pout, JSValue **out_cb, int *out_argc)
+{
+    JSValue proto;
+    int r = step_proto_from_ctor_run(ctx, h, ctor, class_id, in, &proto, out_cb, out_argc);
+    if (r) return r;
     *pout = JS_NewObjectProtoClass(ctx, proto, class_id);
     JS_FreeValue(ctx, proto);
     return JS_IsException(*pout) ? (*pout = JS_UNDEFINED, -1) : 0;
@@ -57772,10 +57806,31 @@ static JSValue JS_NewCConstructor(JSContext *ctx, int class_id, const char *name
     return JS_EXCEPTION;
 }
 
-static JSValue js_global_eval(JSContext *ctx, JSValueConst this_val,
-                              int argc, JSValueConst *argv)
+/* 19.2.1 eval — PerformEval with direct = false. Its whole algorithm IS the program evaluation, so the machine
+   is that one sub-sequence and nothing else. It was a C body, recognized at OP_call and reshaped there, which
+   made the routing depend on how the call was WRITTEN: `eval.call(null, src)`, `Reflect.apply(eval, …)`, a bound
+   eval and an eval reached through a Proxy all missed the reshape and drove the program to completion, and the
+   reshape narrowed itself out of cross-realm calls on top of that. The callee carries the capability instead, so
+   every spelling reaches it and step_realm supplies the realm the C body used to get from js_call_c_function. */
+typedef struct JSProgEval {
+    JSStepHdr hdr;
+    JSValue result;
+} JSProgEval;
+
+static int js_global_eval_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    return JS_EvalObject(ctx, ctx->global_obj, argv[0], JS_EVAL_TYPE_INDIRECT, -1);
+    JSProgEval *s = st;
+    int r = step_program_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->result, out_cb, out_argc);
+    return r ? (r < 0 ? -1 : r) : 0;
+}
+
+static JSValue js_global_eval_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSProgEval *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    js_free(ctx, s);
+    return r;
 }
 
 /* isNaN (arg 0) and isFinite (arg 1): stage 0 is ToNumber(argv[0]); the predicate needs no stage of its own. */
@@ -59464,35 +59519,8 @@ static JSValue js_object_is(JSContext *ctx, JSValueConst this_val,
     return js_bool(js_same_value(ctx, argv[0], argv[1]));
 }
 
-static JSValue JS_SpeciesConstructor(JSContext *ctx, JSValueConst obj,
-                                     JSValueConst defaultConstructor)
-{
-    JSValue ctor, species;
-
-    if (!JS_IsObject(obj))
-        return JS_ThrowTypeErrorNotAnObject(ctx);
-    ctor = JS_GetProperty(ctx, obj, JS_ATOM_constructor);
-    if (JS_IsException(ctor))
-        return ctor;
-    if (JS_IsUndefined(ctor))
-        return js_dup(defaultConstructor);
-    if (!JS_IsObject(ctor)) {
-        JS_FreeValue(ctx, ctor);
-        return JS_ThrowTypeErrorNotAnObject(ctx);
-    }
-    species = JS_GetProperty(ctx, ctor, JS_ATOM_Symbol_species);
-    JS_FreeValue(ctx, ctor);
-    if (JS_IsException(species))
-        return species;
-    if (JS_IsUndefined(species) || JS_IsNull(species))
-        return js_dup(defaultConstructor);
-    if (!JS_IsConstructor(ctx, species)) {
-        JS_ThrowTypeErrorNotAConstructor(ctx, species);
-        JS_FreeValue(ctx, species);
-        return JS_EXCEPTION;
-    }
-    return species;
-}
+/* DELETED: JS_SpeciesConstructor. 7.3.22's two reads are step_speciesctor_run, and %TypedArray%.prototype.slice
+   was the last site still performing them from C. */
 
 /* B.2.2.1.1 / B.2.2.1.2 — Object.prototype.__proto__, BOTH halves. Each is one internal method on the receiver:
    the getter's `? O.[[GetPrototypeOf]]()` and the setter's `? O.[[SetPrototypeOf]](proto)`. On a Proxy those are
@@ -59778,74 +59806,129 @@ static JSValue js_function_proto(JSContext *ctx, JSValueConst this_val,
 }
 
 /* XXX: add a specific eval mode so that Function("}), ({") is rejected */
-static JSValue js_function_constructor(JSContext *ctx, JSValueConst new_target,
-                                       int argc, JSValueConst *argv, int magic)
+/* 20.2.1.1.1 CreateDynamicFunction step 15's `prefix ( parameters ) { body }`, assembled from arguments that are
+   already STRINGS — so it runs nothing and cannot fail except on allocation. */
+static JSValue js_dynfunc_source(JSContext *ctx, JSFunctionKindEnum func_kind, JSValue *strs, int n)
 {
-    JSFunctionKindEnum func_kind = magic;
-    int i, n, ret;
-    JSValue s, proto, obj = JS_UNDEFINED;
     StringBuffer b_s, *b = &b_s;
+    int i;
 
     string_buffer_init(ctx, b, 0);
     string_buffer_putc8(b, '(');
-
-    if (func_kind == JS_FUNC_ASYNC || func_kind == JS_FUNC_ASYNC_GENERATOR) {
+    if (func_kind == JS_FUNC_ASYNC || func_kind == JS_FUNC_ASYNC_GENERATOR)
         string_buffer_puts8(b, "async ");
-    }
     string_buffer_puts8(b, "function");
-
-    if (func_kind == JS_FUNC_GENERATOR || func_kind == JS_FUNC_ASYNC_GENERATOR) {
+    if (func_kind == JS_FUNC_GENERATOR || func_kind == JS_FUNC_ASYNC_GENERATOR)
         string_buffer_putc8(b, '*');
-    }
     string_buffer_puts8(b, " anonymous(");
-
-    n = argc - 1;
-    for(i = 0; i < n; i++) {
-        if (i != 0) {
+    for (i = 0; i < n - 1; i++) {
+        if (i != 0)
             string_buffer_putc8(b, ',');
-        }
-        if (string_buffer_concat_value(b, argv[i]))
+        if (string_buffer_concat_value(b, strs[i]))
             goto fail;
     }
     string_buffer_puts8(b, "\n) {\n");
-    if (n >= 0) {
-        if (string_buffer_concat_value(b, argv[n]))
-            goto fail;
-    }
+    if (n > 0 && string_buffer_concat_value(b, strs[n - 1]))
+        goto fail;
     string_buffer_puts8(b, "\n})");
-    s = string_buffer_end(b);
-    if (JS_IsException(s))
-        goto fail1;
-
-    obj = JS_EvalObject(ctx, ctx->global_obj, s, JS_EVAL_TYPE_INDIRECT, -1);
-    JS_FreeValue(ctx, s);
-    if (JS_IsException(obj))
-        goto fail1;
-    if (!JS_IsUndefined(new_target)) {
-        /* set the prototype */
-        proto = JS_GetProperty(ctx, new_target, JS_ATOM_prototype);
-        if (JS_IsException(proto))
-            goto fail1;
-        if (!JS_IsObject(proto)) {
-            JSContext *realm;
-            JS_FreeValue(ctx, proto);
-            realm = JS_GetFunctionRealm(ctx, new_target);
-            if (!realm)
-                goto fail1;
-            proto = js_dup(realm->class_proto[func_kind_to_class_id[func_kind]]);
-        }
-        ret = JS_SetPrototypeInternal(ctx, obj, proto, true);
-        JS_FreeValue(ctx, proto);
-        if (ret < 0)
-            goto fail1;
-    }
-    return obj;
-
+    return string_buffer_end(b);
  fail:
     string_buffer_free(b);
- fail1:
-    JS_FreeValue(ctx, obj);
     return JS_EXCEPTION;
+}
+
+/* new Function(a, b, body) and the generator/async variants — 20.2.1.1.1 CreateDynamicFunction. THREE of its steps
+   are the page's code and all three ran from C. The ToStrings (steps 8 and 10) were a coerce-then-compute
+   declaration, which was already wrong for this builtin: that declaration asserts the body has no user code LEFT
+   once its arguments are primitive, and this body then evaluated the synthesized source — a BYTECODE BODY, run by
+   C recursion below a live flow with no way to park — and finished with GetPrototypeFromConstructor's
+   `Get(newTarget, "prototype")` (step 29), a [[Get]] a Proxy new.target traps. Each of the three is a request
+   here, and the parse-and-create is the shared program sub-sequence indirect eval also performs. */
+typedef struct JSDynFunc {
+    JSStepHdr hdr;
+    JSValue result;
+    JSValue func;    /* the created function, held across the `prototype` read */
+    JSValue *strs;   /* the ToString'd arguments, in argument order */
+    int nstrs;
+} JSDynFunc;
+
+static int js_dynfunc_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSDynFunc *s = st;
+    JSFunctionKindEnum func_kind = s->hdr.arg;
+    bool created = false;
+    JSValue proto;
+    int r;
+
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result);
+        cb_result = JS_UNDEFINED;
+        s->result = JS_UNDEFINED;
+        s->func = JS_UNDEFINED;
+        if (s->hdr.argc > 0) {
+            s->strs = js_malloc(ctx, sizeof(JSValue) * (size_t)s->hdr.argc);
+            if (unlikely(!s->strs))
+                return -1;
+        }
+        s->hdr.stage = 1;
+    }
+    if (s->hdr.stage == 1) {
+        JSValue src;
+        while (s->nstrs < s->hdr.argc) {
+            JSValue str;
+            r = step_tostring_run(ctx, &s->hdr, step_arg(&s->hdr, s->nstrs), cb_result, &str, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->strs[s->nstrs++] = str;
+        }
+        src = js_dynfunc_source(ctx, func_kind, s->strs, s->nstrs);
+        if (JS_IsException(src))
+            return -1;
+        s->hdr.stage = 2;
+        r = step_program_run(ctx, &s->hdr, src, JS_UNDEFINED, &s->func, out_cb, out_argc);
+        JS_FreeValue(ctx, src);
+        if (r) return r < 0 ? -1 : r;
+        created = true;
+    } else if (s->hdr.stage == 2) {
+        r = step_program_run(ctx, &s->hdr, JS_UNDEFINED, cb_result, &s->func, out_cb, out_argc);
+        if (r) return r < 0 ? -1 : r;
+        created = true;
+    }
+    if (created) {
+        cb_result = JS_UNDEFINED;
+        s->hdr.stage = 3;
+        /* The CALL form leaves new.target undefined, and the synthesized source already gave the function the
+           intrinsic prototype of its own kind, so there is no read and nothing to set. */
+        if (JS_IsUndefined(s->hdr.this_val)) {
+            s->result = s->func;
+            s->func = JS_UNDEFINED;
+            return 0;
+        }
+    }
+    DCHECK(s->hdr.stage == 3, "CreateDynamicFunction resumed in an unknown stage");
+    r = step_proto_from_ctor_run(ctx, &s->hdr, s->hdr.this_val, func_kind_to_class_id[func_kind],
+                                 cb_result, &proto, out_cb, out_argc);
+    if (r) return r < 0 ? -1 : r;
+    r = JS_SetPrototypeInternal(ctx, s->func, proto, true);
+    JS_FreeValue(ctx, proto);
+    if (r < 0)
+        return -1;
+    s->result = s->func;
+    s->func = JS_UNDEFINED;
+    return 0;
+}
+
+static JSValue js_dynfunc_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSDynFunc *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    int i;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    JS_FreeValue(ctx, s->func);
+    for (i = 0; i < s->nstrs; i++) JS_FreeValue(ctx, s->strs[i]);
+    js_free(ctx, s->strs);
+    js_free(ctx, s);
+    return r;
 }
 
 static __exception int js_get_length32(JSContext *ctx, uint32_t *pres,
@@ -64461,6 +64544,10 @@ static int js_array_iter_next_step(JSContext *ctx, void *st, JSValue cb_result, 
 static JSValue js_array_iter_next_fini(JSContext *ctx, void *st, bool take_result);
 static const JSTrampStepDef js_array_iter_next_def =
     { sizeof(JSArrayIterNext), js_array_iter_next_step, js_array_iter_next_fini, 0 };
+static int js_iterator_concat_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_iterator_concat_fini(JSContext *ctx, void *st, bool take_result);
+static const JSTrampStepDef js_iter_concat_def =
+    { sizeof(JSIterConcat), js_iterator_concat_step, js_iterator_concat_fini, 0 };
 static int js_iter_concat_next_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_iter_concat_next_fini(JSContext *ctx, void *st, bool take_result);
 static const JSTrampStepDef js_iter_concat_next_def =
@@ -64845,13 +64932,14 @@ static const JSTrampStepDef js_math_clz32_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_
 static const JSTrampStepDef js_str_fromCharCode_def = PRIMARGS_DEF(PRIMARGS_ALL | PRIMARGS(0, HINT_NUMBER, 1), generic, js_string_fromCharCode, 0);
 static const JSTrampStepDef js_str_fromCodePoint_def = PRIMARGS_DEF(PRIMARGS_ALL | PRIMARGS(0, HINT_NUMBER, 1), generic, js_string_fromCodePoint, 0);
 static const JSTrampStepDef js_date_UTC_def = PRIMARGS_DEF(PRIMARGS_ALL | PRIMARGS(0, HINT_NUMBER, 7), generic, js_Date_UTC, 0);
-/* new Function(a, b, body) / the generator and async variants: 20.2.1.1 CreateDynamicFunction ToStrings every
-   argument in order and everything after is the parser. The receiver slot is new_target on a constructor step,
-   which is exactly what the body reads. */
-static const JSTrampStepDef js_function_ctor_def  = PRIMARGS_DEF(PRIMARGS_ALL | PRIMARGS(0, HINT_STRING, 0), generic_magic, js_function_constructor, JS_FUNC_NORMAL);
-static const JSTrampStepDef js_genfn_ctor_def     = PRIMARGS_DEF(PRIMARGS_ALL | PRIMARGS(0, HINT_STRING, 0), generic_magic, js_function_constructor, JS_FUNC_GENERATOR);
-static const JSTrampStepDef js_asyncfn_ctor_def   = PRIMARGS_DEF(PRIMARGS_ALL | PRIMARGS(0, HINT_STRING, 0), generic_magic, js_function_constructor, JS_FUNC_ASYNC);
-static const JSTrampStepDef js_asyncgenfn_ctor_def= PRIMARGS_DEF(PRIMARGS_ALL | PRIMARGS(0, HINT_STRING, 0), generic_magic, js_function_constructor, JS_FUNC_ASYNC_GENERATOR);
+/* new Function(a, b, body) / the generator and async variants. The receiver slot is new_target on a constructor
+   step, which is what step 29's GetPrototypeFromConstructor reads. */
+#define DYNFUNC_DEF(kind) { sizeof(JSDynFunc), js_dynfunc_step, js_dynfunc_fini, kind }
+static const JSTrampStepDef js_function_ctor_def  = DYNFUNC_DEF(JS_FUNC_NORMAL);
+static const JSTrampStepDef js_genfn_ctor_def     = DYNFUNC_DEF(JS_FUNC_GENERATOR);
+static const JSTrampStepDef js_asyncfn_ctor_def   = DYNFUNC_DEF(JS_FUNC_ASYNC);
+static const JSTrampStepDef js_asyncgenfn_ctor_def= DYNFUNC_DEF(JS_FUNC_ASYNC_GENERATOR);
+#undef DYNFUNC_DEF
 #define DV_STEPDEF_DEF(N) \
     static const JSTrampStepDef js_dv_get_##N##_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 2), generic_magic, js_dataview_getValue, JS_CLASS_##N##_ARRAY); \
     static const JSTrampStepDef js_dv_set_##N##_def = PRIMARGS_DEF_PRE(PRIMARGS(0x3, HINT_NUMBER, 3), generic_magic, js_dataview_setValue, JS_CLASS_##N##_ARRAY, js_dataview_set_precheck, js_dataview_set_midcheck);
@@ -64863,6 +64951,7 @@ static const JSTrampStepDef js_num_tolocale_def   = { sizeof(JSNumberFmt), js_nu
 static const JSTrampStepDef js_num_tofixed_def    = { sizeof(JSNumberFmt), js_number_fmt_step, js_number_fmt_fini, NUMFMT_TOFIXED };
 static const JSTrampStepDef js_num_toexp_def      = { sizeof(JSNumberFmt), js_number_fmt_step, js_number_fmt_fini, NUMFMT_TOEXPONENTIAL };
 static const JSTrampStepDef js_num_toprec_def     = { sizeof(JSNumberFmt), js_number_fmt_step, js_number_fmt_fini, NUMFMT_TOPRECISION };
+static const JSTrampStepDef js_global_eval_def    = { sizeof(JSProgEval), js_global_eval_step, js_global_eval_fini, 0 };
 static const JSTrampStepDef js_isNaN_def          = { sizeof(JSCoerce1), js_coerce1_step, js_coerce1_fini, 0 };
 static const JSTrampStepDef js_isFinite_def       = { sizeof(JSCoerce1), js_coerce1_step, js_coerce1_fini, 1 };
 static const JSTrampStepDef js_function_call_def  = { sizeof(JSFuncCall), js_function_call_step, js_function_call_fini, 0 };
@@ -65279,6 +65368,8 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
 #undef ERRCTOR_ROW
     [STEPDEF_REGEXP_EXEC]     = &js_regexp_exec_def,
     [STEPDEF_REGEXP_TEST]     = &js_re_test_def,
+    [STEPDEF_GLOBAL_EVAL]     = &js_global_eval_def,
+    [STEPDEF_ITER_CONCAT]     = &js_iter_concat_def,
     [STEPDEF_FUNCTION_CTOR]   = &js_function_ctor_def,
     [STEPDEF_GENERATOR_FUNCTION_CTOR] = &js_genfn_ctor_def,
     [STEPDEF_ASYNC_FUNCTION_CTOR] = &js_asyncfn_ctor_def,
@@ -67588,47 +67679,77 @@ static const JSCFunctionListEntry js_iterator_concat_proto_funcs[] = {
     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "Iterator Concat", JS_PROP_CONFIGURABLE ),
 };
 
-static JSValue js_iterator_concat(JSContext *ctx, JSValueConst this_val,
-                                  int argc, JSValueConst *argv)
+/* 27.1.2.1 Iterator.concat. Step 3.b reads `@@iterator` on EVERY argument, which is the page's [[Get]] — an
+   accessor body or a Proxy `get` trap — and it ran from C once per argument. The requirement is not just that the
+   read routes: the spec INTERLEAVES it with step 3.a's object check, so argument 1's check happens after argument
+   0's read, which is why the walk is a cursor over the machine rather than a loop that validates up front. */
+static int js_iterator_concat_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
+    JSIterConcat *s = st;
     JSIteratorConcatData *it;
-    JSValue obj, method;
+    JSValue obj;
 
-    it = js_malloc(ctx, sizeof(*it) + 2*argc * sizeof(it->values[0]));
-    if (!it)
-        return JS_EXCEPTION;
-    it->running = false;
-    it->index = 0;
-    it->count = 0;
-    it->iter = JS_UNDEFINED;
-    it->next = JS_UNDEFINED;
-    for (int i = 0; i < argc; i++) {
-        JSValueConst obj = argv[i];
-        if (!JS_IsObject(obj)) {
-            JS_ThrowTypeErrorNotAnObject(ctx);
-            goto fail;
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result);
+        cb_result = JS_UNDEFINED;
+        s->result = JS_UNDEFINED;
+        s->it = js_malloc(ctx, sizeof(*s->it) + 2 * (size_t)s->hdr.argc * sizeof(s->it->values[0]));
+        if (unlikely(!s->it))
+            return -1;
+        s->it->running = false;
+        s->it->index = 0;
+        s->it->count = 0;
+        s->it->iter = JS_UNDEFINED;
+        s->it->next = JS_UNDEFINED;
+        s->hdr.stage = 1;
+    }
+    it = s->it;
+    while (s->i < s->hdr.argc) {
+        JSValueConst arg = step_arg(&s->hdr, s->i);
+        JSValue method;
+        int r;
+        if (!s->checked) {
+            if (!JS_IsObject(arg)) {
+                JS_FreeValue(ctx, cb_result);
+                JS_ThrowTypeErrorNotAnObject(ctx);
+                return -1;
+            }
+            s->checked = 1;
         }
-        method = JS_GetProperty(ctx, obj, JS_ATOM_Symbol_iterator);
-        if (JS_IsException(method))
-            goto fail;
+        r = step_getprop_run(ctx, &s->hdr, arg, JS_ATOM_Symbol_iterator, cb_result, &method, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
         if (!JS_IsFunction(ctx, method)) {
             JS_ThrowTypeErrorNotAFunction(ctx);
             JS_FreeValue(ctx, method);
-            goto fail;
+            return -1;
         }
-        it->values[it->count++] = js_dup(obj);
+        it->values[it->count++] = js_dup(arg);
         it->values[it->count++] = method;
+        s->i++;
+        s->checked = 0;
     }
     obj = JS_NewObjectClass(ctx, JS_CLASS_ITERATOR_CONCAT);
     if (JS_IsException(obj))
-        goto fail;
+        return -1;
     JS_SetOpaqueInternal(obj, it);
-    return obj;
-fail:
-    for (uint32_t i = 0; i < it->count; i++)
-        JS_FreeValue(ctx, it->values[i]);
-    js_free(ctx, it);
-    return JS_EXCEPTION;
+    s->it = NULL;   /* the iterator object owns the record now */
+    s->result = obj;
+    return 0;
+}
+
+static JSValue js_iterator_concat_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSIterConcat *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    uint32_t i;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    if (s->it) {
+        for (i = 0; i < s->it->count; i++) JS_FreeValue(ctx, s->it->values[i]);
+        js_free(ctx, s->it);
+    }
+    js_free(ctx, s);
+    return r;
 }
 
 /* DELETED: js_iterator_from. Its body was already only a DFAIL — the whole of 27.1.3.1 is do_iterfrom_tramp —
@@ -68272,7 +68393,7 @@ static void js_iterator_helper_mark(JSRuntime *rt, JSValueConst val,
    suspend, so a C loop here is NOT drive-to-completion. A GENERATOR source is routed onto the tramp before reaching
    here; one that slips through hits the js_generator_next DFAIL. Keeps the recognition identity. */
 static const JSCFunctionListEntry js_iterator_funcs[] = {
-    JS_CFUNC_DEF("concat", 0, js_iterator_concat ),
+    JS_CFUNC_STEP_DEF("concat", 0, STEPDEF_ITER_CONCAT ),
     JS_CFUNC_CONSUME_DEF("from", 1, ITERCONS_ITERFROM ),
 };
 
@@ -80088,7 +80209,7 @@ static const JSCFunctionListEntry js_global_funcs[] = {
     JS_PROP_U2D_DEF("NaN", 0x7FF8ull<<48, 0 ),
     JS_PROP_UNDEFINED_DEF("undefined", 0 ),
     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "global", JS_PROP_CONFIGURABLE ),
-    JS_CFUNC_DEF("eval", 1, js_global_eval ),
+    JS_CFUNC_STEP_DEF("eval", 1, STEPDEF_GLOBAL_EVAL ),
 };
 
 /* Date */
@@ -83497,10 +83618,18 @@ static int js_ta_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
         s->hdr.stage = 3;
         s->count = max_int(s->final - s->start, 0);
         s->cb_args[1] = js_int32(s->count);
+        cb_result = JS_UNDEFINED;
+        /* fall through */
+    case 3:
         /* SpeciesConstructor reads .constructor and @@species IN THIS ORDER, after the indices and before the
-           length is computed into the argument — keep the observable reads where the spec puts them. */
-        { JSValue ctor = JS_SpeciesConstructor(ctx, s->hdr.this_val, JS_UNDEFINED);
-          if (JS_IsException(ctor)) return -1;
+           length is computed into the argument — keep the observable reads where the spec puts them. BOTH are the
+           page's [[Get]]s, so they are requests: JS_SpeciesConstructor ran them from C, and a getter with a loop
+           in it aborted at its back-edge with no flow base. */
+        { JSValue ctor;
+          int r = step_speciesctor_run(ctx, &s->hdr, s->hdr.this_val, JS_UNDEFINED, cb_result, &ctor,
+                                       out_cb, out_argc);
+          if (r) return r < 0 ? -1 : r;
+          s->hdr.stage = 4;
           if (JS_IsUndefined(ctor)) {
               /* no species: the default constructor for this element type, which is C — nothing to suspend, so
                  it is created here and the machine goes straight to the copy. */
