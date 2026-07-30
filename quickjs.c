@@ -1567,6 +1567,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_MAP_UPSERT, STEPDEF_MAP_UPSERT_COMPUTED,
     STEPDEF_WEAKMAP_UPSERT, STEPDEF_WEAKMAP_UPSERT_COMPUTED,
     STEPDEF_DISPOSE_SYNC, STEPDEF_DISPOSE_ASYNC,
+    STEPDEF_MAP_FOREACH, STEPDEF_SET_FOREACH,
     STEPDEF_COUNT
 };
 #define HINT_NONE    2
@@ -66664,6 +66665,20 @@ typedef struct JSDisposeRun {
     JSValue error;                      /* the accumulated completion error (owned); UNINITIALIZED = none */
     JSValue cb[3];                      /* the CALL request's [this, method, arg] */
 } JSDisposeRun;
+/* Map.prototype.forEach / Set.prototype.forEach. The record the callback runs over is LOCKED (its ref_count is
+   raised) so a callback that deletes it cannot free the link the cursor is about to read — the same protocol the
+   C loop used, now spanning a suspension, which is why it rides the state instead of a C local. */
+struct JSMapState;
+struct JSMapRecord;
+typedef struct JSMapForEach {
+    JSStepHdr hdr;
+    struct JSMapState *s;      /* borrowed: hdr.this_val holds the collection object alive */
+    struct list_head *el;      /* the cursor into s->records */
+    struct JSMapRecord *lock;  /* the record this machine holds a ref to across the callback, or NULL */
+    JSValue cb[5];             /* [thisArg, callback, value, key, collection] */
+} JSMapForEach;
+static const JSTrampStepDef js_map_foreach_def;
+static const JSTrampStepDef js_set_foreach_def;
 static const JSTrampStepDef js_dispose_sync_def;
 /* disposeAsync's own machine. Its FIRST dispose call is synchronous (the spec's Await comes after it, and
    test262 observes the difference), so it cannot be folded into the .then chain the rest of the resources use —
@@ -66747,6 +66762,8 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_INSTANCEOF]     = &js_instanceof_def,
     [STEPDEF_ORDINARY_HAS_INSTANCE] = &js_ordinary_hasinst_def,
     [STEPDEF_DISPOSE_SYNC] = &js_dispose_sync_def,
+    [STEPDEF_MAP_FOREACH] = &js_map_foreach_def,
+    [STEPDEF_SET_FOREACH] = &js_set_foreach_def,
     [STEPDEF_DISPOSE_ASYNC] = &js_dispose_async_def,
     [STEPDEF_OBJ_TOSTRING]   = &js_obj_tostring_def,
     [STEPDEF_OBJ_TOLOCALESTRING] = &js_obj_tolocale_def,
@@ -67019,6 +67036,7 @@ STEP_STATE_HDR_FIRST(JSObjToString);
 STEP_STATE_HDR_FIRST(JSObjToLocale);
 STEP_STATE_HDR_FIRST(JSInstanceOf);
 STEP_STATE_HDR_FIRST(JSDisposeRun);
+STEP_STATE_HDR_FIRST(JSMapForEach);
 STEP_STATE_HDR_FIRST(JSDisposeAsync);
 STEP_STATE_HDR_FIRST(JSAsyncDisposeLink);
 STEP_STATE_HDR_FIRST(JSSyncDisposeWrap);
@@ -78363,53 +78381,82 @@ static JSValue js_map_get_size(JSContext *ctx, JSValueConst this_val, int magic)
     return js_uint32(s->record_count);
 }
 
-static JSValue js_map_forEach(JSContext *ctx, JSValueConst this_val,
-                              int argc, JSValueConst *argv, int magic)
+/* 24.1.3.5 Map.prototype.forEach / 24.2.4.6 Set.prototype.forEach. The callback is the page's code and the loop
+   drove it with JS_Call from C, so a callback containing a loop preempted in an activation with no flow base —
+   and between them Map and Set were the whole of their directories' residual drive count.
+   The traversal is unchanged, including the part that is not obvious: the record is LOCKED across the call and
+   the cursor advanced only afterwards, because the callback is allowed to delete it (and to add entries, which
+   the spec then requires this loop to visit). What changes is that "across the call" now means across a
+   SUSPENSION — so the locked record and the cursor live on the state, and fini releases the lock, because an
+   abandoned machine is the one path a C local could not have covered. */
+static int js_map_foreach_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    JSMapState *s = JS_GetOpaque2(ctx, this_val, JS_CLASS_MAP + magic);
-    JSValueConst func, this_arg;
-    JSValue ret, args[3];
-    struct list_head *el;
-    JSMapRecord *mr;
+    JSMapForEach *m = st;
+    int magic = m->hdr.arg;
+    JSMapState *s;
 
-    if (!s)
-        return JS_EXCEPTION;
-    func = argv[0];
-    if (argc > 1)
-        this_arg = argv[1];
-    else
-        this_arg = JS_UNDEFINED;
-    if (check_function(ctx, func))
-        return JS_EXCEPTION;
-    /* Note: the list can be modified while traversing it, but the
-       current element is locked */
-    el = s->records.next;
-    while (el != &s->records) {
-        mr = list_entry(el, JSMapRecord, link);
-        if (!mr->empty) {
-            mr->ref_count++;
-            /* must duplicate in case the record is deleted */
-            args[1] = js_dup(mr->key);
-            if (magic)
-                args[0] = args[1];
-            else
-                args[0] = js_dup(mr->value);
-            args[2] = unsafe_unconst(this_val);
-            ret = JS_Call(ctx, func, this_arg, 3, vc(args));
-            JS_FreeValue(ctx, args[0]);
-            if (!magic)
-                JS_FreeValue(ctx, args[1]);
-            el = el->next;
-            map_decref_record(ctx->rt, mr);
-            if (JS_IsException(ret))
-                return ret;
-            JS_FreeValue(ctx, ret);
-        } else {
-            el = el->next;
-        }
+    if (m->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result);
+        m->hdr.stage = 1;
+        s = JS_GetOpaque2(ctx, m->hdr.this_val, JS_CLASS_MAP + magic);
+        if (!s)
+            return -1;
+        if (check_function(ctx, step_arg(&m->hdr, 0)))
+            return -1;
+        m->s = (struct JSMapState *)s;
+        m->el = s->records.next;
+        m->cb[0] = js_dup(step_arg(&m->hdr, 1));   /* thisArg — constant, dup'd once */
+        m->cb[1] = js_dup(step_arg(&m->hdr, 0));   /* the callback */
+        m->cb[4] = js_dup(m->hdr.this_val);        /* the collection, the third argument */
+    } else {
+        /* the callback RETURNED. A throw never arrives here — forEach catches nothing, so the driver unwinds
+           and fini releases the lock. Advance then unlock, in that order: the lock is what keeps el->next
+           readable after a callback that deleted this record. */
+        JS_FreeValue(ctx, cb_result);
+        DCHECK(m->lock != NULL, "a forEach callback returned with no locked record");
+        m->el = m->el->next;
+        map_decref_record(ctx->rt, (JSMapRecord *)m->lock);
+        m->lock = NULL;
+        JS_FreeValue(ctx, m->cb[2]); m->cb[2] = JS_UNDEFINED;
+        JS_FreeValue(ctx, m->cb[3]); m->cb[3] = JS_UNDEFINED;
     }
-    return JS_UNDEFINED;
+
+    s = (JSMapState *)m->s;
+    while (m->el != &s->records) {
+        JSMapRecord *mr = list_entry(m->el, JSMapRecord, link);
+        if (mr->empty) {
+            m->el = m->el->next;
+            continue;
+        }
+        mr->ref_count++;                       /* LOCK for the duration of the call */
+        m->lock = (struct JSMapRecord *)mr;
+        /* dup'd because the callback may delete the record: both values must outlive it */
+        m->cb[3] = js_dup(mr->key);
+        m->cb[2] = magic ? js_dup(mr->key) : js_dup(mr->value);   /* a Set passes the key twice */
+        *out_cb = m->cb; *out_argc = 3;
+        return 3;
+    }
+    return 0;
 }
+
+static JSValue js_map_foreach_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSMapForEach *m = st;
+    int i;
+    if (m->lock)
+        map_decref_record(ctx->rt, (JSMapRecord *)m->lock);
+    for (i = 0; i < 5; i++)
+        JS_FreeValue(ctx, m->cb[i]);
+    js_free(ctx, m);
+    return JS_UNDEFINED;   /* forEach returns undefined on every path */
+}
+
+static const JSTrampStepDef js_map_foreach_def = {
+    sizeof(JSMapForEach), js_map_foreach_step, js_map_foreach_fini, 0
+};
+static const JSTrampStepDef js_set_foreach_def = {
+    sizeof(JSMapForEach), js_map_foreach_step, js_map_foreach_fini, MAGIC_SET
+};
 
 
 static void js_map_finalizer(JSRuntime *rt, JSValueConst val)
@@ -78716,7 +78763,7 @@ static const JSCFunctionListEntry js_map_proto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("delete", 1, js_map_delete, 0 ),
     JS_CFUNC_MAGIC_DEF("clear", 0, js_map_clear, 0 ),
     JS_CGETSET_MAGIC_DEF("size", js_map_get_size, NULL, 0),
-    JS_CFUNC_MAGIC_DEF("forEach", 1, js_map_forEach, 0 ),
+    JS_CFUNC_STEP_DEF("forEach", 1, STEPDEF_MAP_FOREACH ),
     JS_CFUNC_MAGIC_DEF("values", 0, js_create_map_iterator, (JS_ITERATOR_KIND_VALUE << 2) | 0 ),
     JS_CFUNC_MAGIC_DEF("keys", 0, js_create_map_iterator, (JS_ITERATOR_KIND_KEY << 2) | 0 ),
     JS_CFUNC_MAGIC_DEF("entries", 0, js_create_map_iterator, (JS_ITERATOR_KIND_KEY_AND_VALUE << 2) | 0 ),
@@ -78735,7 +78782,7 @@ static const JSCFunctionListEntry js_set_proto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("delete", 1, js_map_delete, MAGIC_SET ),
     JS_CFUNC_MAGIC_DEF("clear", 0, js_map_clear, MAGIC_SET ),
     JS_CGETSET_MAGIC_DEF("size", js_map_get_size, NULL, MAGIC_SET ),
-    JS_CFUNC_MAGIC_DEF("forEach", 1, js_map_forEach, MAGIC_SET ),
+    JS_CFUNC_STEP_DEF("forEach", 1, STEPDEF_SET_FOREACH ),
     JS_CFUNC_CONSUME_DEF("isDisjointFrom", 1, ITERCONS_SETOP_BASE + SETOP_DISJOINT ),
     JS_CFUNC_CONSUME_DEF("isSubsetOf", 1, ITERCONS_SETOP_BASE + SETOP_SUBSET ),
     JS_CFUNC_CONSUME_DEF("isSupersetOf", 1, ITERCONS_SETOP_BASE + SETOP_SUPERSET ),
