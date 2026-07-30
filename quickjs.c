@@ -27720,20 +27720,35 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JS_ThrowRangeError(ctx, "invalid array length");
                     goto do_array_len_throw;
                 }
-                /* step 6: the validated uint32 IS the value the operation stores, so re-issuing with it in place
-                   of V is that step — and the re-run's own conversions are of a NUMBER, which invoke nothing and
-                   cannot match the predicate that sent us here. */
-                al->phase = AL_REISSUED;
-                al->coerced = js_uint32(al->len);
-                gp_obj = al->obj; gp_atom = al->atom;
-                gp_op = al->op; gp_val = al->coerced;
-                gp_recv = JS_UNINITIALIZED; gp_no_throw = al->no_throw;
-                gp_getter = al->getter; gp_setter = al->setter; gp_dflags = al->dflags;
-                /* the request BORROWS every operand, so the STATE stays alive as their owner and nests one level
-                   the way a [[GetOwnProperty]] nests inside its descriptor walk. Handing ownership to the
-                   registers instead leaked the array and the atom on every length write. */
-                gp_outer = al; gp_outer_kind = CONT_ARRAY_LEN;
-                goto do_getprop_tramp;
+                /* step 6: the validated uint32 IS the value the operation stores — and the sequence PERFORMS
+                   that step here rather than re-issuing the request with it substituted. Re-issuing meant
+                   re-entering do_getprop_tramp and re-walking the prototype chain, the proxy checks and the
+                   accessor checks that had already resolved this very arm: a replay, defended by "the re-run's
+                   conversions are of a number, so they invoke nothing", which is an argument about today's code
+                   and not about the shape. The walk resolved the target once; this is the continuation of that
+                   walk, not a second one.
+                   The receiver is the object itself (the arm parks gp_recv UNINITIALIZED), and the arm's own
+                   condition guarantees op is GP_SET or GP_DEFINE, so the remaining step is exactly one call. */
+                {
+                    JSValue coerced = js_uint32(al->len);
+                    int wres;
+                    if (al->op == GP_DEFINE) {
+                        wres = JS_DefineProperty(ctx, al->obj, al->atom, coerced,
+                                                 al->getter, al->setter,
+                                                 al->dflags | (al->no_throw ? 0 : JS_PROP_THROW));
+                        if (unlikely(wres < 0)) goto do_array_len_throw;
+                        ret_val = al->no_throw ? js_bool(wres) : JS_UNDEFINED;
+                    } else {
+                        DCHECK(al->op == GP_SET, "the Array length sequence resumed on an operation it cannot finish");
+                        wres = JS_SetPropertyInternal2(ctx, al->obj, al->atom, coerced, al->obj,
+                                                       al->no_throw ? 0 : JS_PROP_THROW, NULL);
+                        if (unlikely(wres < 0)) goto do_array_len_throw;
+                        ret_val = al->no_throw ? js_bool(wres) : JS_UNDEFINED;
+                    }
+                }
+                gp_outer = al->outer; gp_outer_kind = al->outer_kind;
+                js_array_len_free(ctx, al);
+                goto do_getprop_complete;
 
             do_array_len_throw:
                 gp_outer = al->outer; gp_outer_kind = al->outer_kind;
