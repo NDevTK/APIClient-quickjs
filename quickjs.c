@@ -21474,6 +21474,8 @@ typedef struct JSTACtor {
     JSValue argp[3];   /* the operands the plan reads, with the coerced primitives in place */
     JSTAViewPlan plan; /* held across the `prototype` read, which the spec orders after every check it makes */
     uint8_t planned;   /* the plan owns a buffer the teardown must release */
+    uint8_t is_copy;   /* the TYPED-ARRAY source form: no plan, and the tail copies instead of viewing */
+    uint32_t src_len;  /* its source's element count, read before the `prototype` read can change anything */
 } JSTACtor;
 
 typedef struct JSIterZip {
@@ -62709,7 +62711,12 @@ static bool ta_buffer_ctor_ready(JSValueConst *call_argv, int call_argc)
     if (call_argc < 1 || JS_VALUE_GET_TAG(call_argv[0]) != JS_TAG_OBJECT)
         return true;   /* the ELEMENT-COUNT form (and `new Uint8Array()`): the body implements it itself */
     sp0 = JS_VALUE_GET_OBJ(call_argv[0]);
-    return sp0->class_id == JS_CLASS_ARRAY_BUFFER || sp0->class_id == JS_CLASS_SHARED_ARRAY_BUFFER;
+    /* WIDENED to the TYPED-ARRAY source (23.2.5.1 step 5, InitializeTypedArrayFromTypedArray) rather than given
+       a third arm of its own. That branch performs the same 10.1.14 `prototype` read the other two do, and the
+       machine already branches on the argument's tag; a second predicate beside this one would be the same
+       question asked twice, and every case one of them failed to answer would have gone silently to the C body. */
+    return sp0->class_id == JS_CLASS_ARRAY_BUFFER || sp0->class_id == JS_CLASS_SHARED_ARRAY_BUFFER
+        || is_typed_array(sp0->class_id);
 }
 
 /* Route TypedArray.from(gen) (no mapfn) — js_typed_array_from's IterableToList drives the generator. this_val is the
@@ -86327,21 +86334,20 @@ static JSValue js_typed_array_constructor_obj(JSContext *ctx,
     return JS_EXCEPTION;
 }
 
-static JSValue js_typed_array_constructor_ta(JSContext *ctx,
-                                             JSValueConst new_target,
-                                             JSValueConst src_obj,
-                                             int classid, uint32_t len)
+/* 23.2.5.1 step 5's tail: the object EXISTS (10.1.14 having been performed by whoever created it), so this is
+   InitializeTypedArrayFromTypedArray from the source re-validation on. Split out for the reason the view branch
+   split: the `prototype` read is the page's code and belongs to the machine, and everything here invokes none.
+   Consumes `obj`. */
+static JSValue js_ta_copy_finish(JSContext *ctx, JSValue obj, JSValueConst src_obj,
+                                 int classid, uint32_t len)
 {
     JSObject *p, *src_buffer;
     JSTypedArray *ta;
-    JSValue obj, buffer;
+    JSValue buffer;
     uint32_t i;
     int size_log2;
     JSArrayBuffer *src_abuf, *abuf;
 
-    obj = js_create_from_ctor(ctx, new_target, classid);
-    if (JS_IsException(obj))
-        return obj;
     p = JS_VALUE_GET_OBJ(src_obj);
     if (typed_array_is_oob(p)) {
         JS_ThrowTypeErrorArrayBufferOOB(ctx);
@@ -86388,6 +86394,16 @@ static JSValue js_typed_array_constructor_ta(JSContext *ctx,
     return JS_EXCEPTION;
 }
 
+/* The unrouted entry: an internal caller with new_target = undefined, whose 10.1.14 reads nothing. */
+static JSValue js_typed_array_constructor_ta(JSContext *ctx, JSValueConst new_target,
+                                             JSValueConst src_obj, int classid, uint32_t len)
+{
+    JSValue obj = js_create_from_ctor(ctx, new_target, classid);
+    if (JS_IsException(obj))
+        return obj;
+    return js_ta_copy_finish(ctx, obj, src_obj, classid, len);
+}
+
 static int js_ta_view_plan(JSContext *ctx, JSTAViewPlan *pl, int argc, JSValueConst *argv, int classid);
 static JSValue js_ta_view_finish(JSContext *ctx, JSValue obj, JSTAViewPlan *pl);
 
@@ -86413,6 +86429,15 @@ static int js_ta_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
         DCHECK(ta_buffer_ctor_ready((JSValueConst *)s->argp, s->hdr.argc > 0 ? s->hdr.argc : 1),
                "the TypedArray view entry was reached with a source the consume walk owns");
         s->hdr.stage = TAC_OFFSET;
+        if (JS_VALUE_GET_TAG(s->argp[0]) == JS_TAG_OBJECT
+            && is_typed_array(JS_VALUE_GET_OBJ(s->argp[0])->class_id)) {
+            /* 23.2.5.1 step 5: a TYPED-ARRAY source takes no byteOffset or length, so it coerces nothing — its
+               only user code is the `prototype` read the shared tail performs. The element count is read HERE,
+               before that read, which is where the C body read it. */
+            s->is_copy = 1;
+            s->src_len = JS_VALUE_GET_OBJ(s->argp[0])->u.array.count;
+            goto have_length;
+        }
         if (JS_VALUE_GET_TAG(s->argp[0]) != JS_TAG_OBJECT)
             goto have_length;                /* the element-count form coerces nothing here: its argument is
                                                 already primitive, and ToIndex on a primitive invokes nothing */
@@ -86460,7 +86485,7 @@ static int js_ta_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
            detached buffer throws, before new.target's prototype getter is allowed to run. Then the read itself:
            an ordinary [[Get]] a Proxy traps, which js_create_from_ctor performed from C. */
         JSValue proto = JS_UNDEFINED, obj;
-        if (!s->planned) {
+        if (!s->planned && !s->is_copy) {
             if (js_ta_view_plan(ctx, &s->plan, s->hdr.argc, (JSValueConst *)s->argp, s->hdr.arg) < 0)
                 return -1;
             s->planned = 1;
@@ -86472,8 +86497,12 @@ static int js_ta_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
         JS_FreeValue(ctx, proto);
         if (JS_IsException(obj))
             return -1;
-        s->planned = 0;                      /* the finish takes the plan's buffer */
-        s->result = js_ta_view_finish(ctx, obj, &s->plan);
+        if (s->is_copy) {
+            s->result = js_ta_copy_finish(ctx, obj, s->argp[0], s->hdr.arg, s->src_len);
+        } else {
+            s->planned = 0;                  /* the finish takes the plan's buffer */
+            s->result = js_ta_view_finish(ctx, obj, &s->plan);
+        }
     }
     return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
 }
