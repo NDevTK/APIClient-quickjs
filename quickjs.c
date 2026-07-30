@@ -18511,7 +18511,7 @@ typedef struct JSArrayFind {
     JSValue obj, func, this_arg, val, result;
     int64_t len, k, end;
     int dir, mode;
-    uint8_t cb_pending;
+    uint8_t cb_pending;     /* 1 = the next step's cb_result is the CALLBACK's, 2 = it is the ELEMENT READ's */
     JSValue cb_args[5];      /* [thisArg, fn, val, index, receiver] */
 } JSArrayFind;
 
@@ -19056,6 +19056,30 @@ typedef struct JSOpKeyed {
                                   to is parked across them, exactly as a handler's trap READ parks it. It is the
                                   same nesting CONT_TRAP_GET already is: a keyed request whose outer is not a
                                   machine but another keyed OPERATION, carrying what waits on that one. */
+#define CONT_ARG_LIST      68  /* gp_outer AND tp_outer = JSArgList: 19.2.3.1 CreateListFromArrayLike, which
+                                  `f.apply(t, arrayLike)`, `Reflect.apply` and the `f(...arr)` spread all reach.
+                                  Step 3 is `? LengthOfArrayLike(obj)` and step 5 is `? Get(obj, index)` PER
+                                  ELEMENT — an accessor or a Proxy trap every one of them — and build_arg_list
+                                  performed the lot from C. It is the first of these sequences whose length is not
+                                  known when it starts, so it carries a CURSOR rather than a phase alone, and the
+                                  list it is filling has to survive every suspension in the middle of it. */
+typedef struct JSArgList {
+    JSValue *tab;           /* the list being built (owned): tab[0..n) are values, the rest UNDEFINED */
+    uint32_t n;             /* how many slots are filled — also what a teardown frees */
+    int64_t len;            /* LengthOfArrayLike(src), once step 3 has answered */
+    int64_t i;              /* the collect cursor: an element read suspends, so it cannot be a C local */
+    JSAtom idx;             /* the index atom the current element read borrows (owned) */
+    JSValue coerce;         /* the raw `length` value across its ToPrimitive (owned) */
+    uint8_t phase;          /* ARGL_* */
+    /* the apply shape to resume into. All BORROWED: every entry to do_apply_tramp is a caller-stack operand
+       shape, and those slots outlive the suspension exactly as an operator's do. */
+    JSValueConst func, this_arg, src;
+    int cfirst, cargc;
+    uint8_t is_tail;
+} JSArgList;
+enum { ARGL_LEN = 0, ARGL_LEN_PRIM, ARGL_ELEM };
+static void js_arg_list_free(JSContext *ctx, JSArgList *al);
+
 #define CONT_SETMAP_CTOR   67  /* gp_outer = JSSetMapCtor: `new Set(gen)` / `new Map(gen)` runs TWO of the page's
                                   operations before it can consume anything — 10.1.13 step 2's
                                   `Get(newTarget, "prototype")` inside js_map_constructor, and 24.1.1.1 step 5's
@@ -19695,6 +19719,12 @@ static void js_toprim_abandon(JSContext *ctx, struct JSToPrim *tp)
         js_iter_consume_abandon(ctx, touter);   /* IfAbruptCloseIterator, then the machine is gone */
         return;
     }
+    if (touter && tk == CONT_ARG_LIST) {
+        /* 19.2.3.1's length coercion was abandoned: the list can never be completed, and it owns nothing the
+           interpreter has to answer for — its operands are the caller's. */
+        js_arg_list_free(ctx, touter);
+        return;
+    }
     if (touter && tk == CONT_ARRAY_LEN) {
         /* 10.4.2.4's coercion was abandoned. The WRITE can never finish, so the throw unwinds one level — and
            everything waiting on the write goes with it, which is the KEYED chain and not a step chain (walking a
@@ -19848,6 +19878,40 @@ static bool arr_len_write_needs_toprim(JSValueConst target, JSAtom atom, JSValue
 /* Either read threw or was abandoned: the instance can never be consumed into, so the CONSUME machine goes with
    it by its own teardown — it holds the argument list, the construct requester and (past the first read) the
    instance itself. */
+/* The list can never be completed: free the values already collected and the block, exactly as free_arg_list does
+   for a finished one — `n` is the count precisely so a mid-collect teardown frees no more than was filled. */
+static void js_arg_list_free(JSContext *ctx, JSArgList *al)
+{
+    uint32_t k;
+    for (k = 0; k < al->n; k++) JS_FreeValue(ctx, al->tab[k]);
+    js_free(ctx, al->tab);
+    JS_FreeValue(ctx, al->coerce);
+    JS_FreeAtom(ctx, al->idx);
+    js_free_rt(ctx->rt, al);
+}
+
+/* Can CreateListFromArrayLike(src) be performed without invoking anything? Only for a FAST array or arguments
+   object: `length` is then an own data slot whose value IS u.array.count, and every element is a slot read, so
+   19.2.3.1's Get steps invoke nothing and the C loop is not a fallback to the routed path but the same answer
+   arrived at without a request. Anything else — an accessor `length`, a Proxy anywhere on the chain, a sparse
+   array, an ordinary array-like — is the page's code and MUST be routed. */
+static bool arg_list_is_fast(JSContext *ctx, JSValueConst src, uint32_t *plen)
+{
+    JSObject *p;
+    JSShapeProperty *prs;
+    JSProperty *pr;
+    if (JS_VALUE_GET_TAG(src) != JS_TAG_OBJECT) return false;
+    p = JS_VALUE_GET_OBJ(src);
+    if (p->class_id != JS_CLASS_ARRAY && p->class_id != JS_CLASS_ARGUMENTS) return false;
+    if (!p->fast_array) return false;
+    prs = find_own_property(&pr, p, JS_ATOM_length);
+    if (!prs || (prs->flags & JS_PROP_TMASK) != 0) return false;
+    if (JS_VALUE_GET_TAG(pr->u.value) != JS_TAG_INT) return false;
+    if ((uint32_t)JS_VALUE_GET_INT(pr->u.value) != p->u.array.count) return false;
+    *plen = p->u.array.count;
+    return true;
+}
+
 static void js_setmap_ctor_free(JSContext *ctx, JSSetMapCtor *sc)
 {
     if (sc->consume) { js_iter_consume_end(ctx, sc->consume); js_free_rt(ctx->rt, sc->consume); }
@@ -20199,6 +20263,7 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_CTOR_PROTO:
     case CONT_TA_TARGET:
     case CONT_SETMAP_CTOR:
+    case CONT_ARG_LIST:
     case CONT_OP_KEYED:
     case CONT_FOR_IN_HAS:
     case CONT_OWNKEYS_CHK:
@@ -23074,6 +23139,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        ap_cfirst/ap_cargc parameterize do_return's operand cleanup for the two operand shapes. */
     JSValueConst ap_func = JS_UNDEFINED, ap_this = JS_UNDEFINED, ap_array = JS_UNDEFINED;
     int ap_cfirst = -2, ap_cargc = 0;
+    /* 19.2.3.1's answer, delivered by CONT_ARG_LIST. ap_list_n < 0 = the list has not been built yet, which is
+       what makes do_apply_tramp issue the sequence; read+reset there, so a second apply on this frame cannot
+       inherit the first one's arguments. */
+    JSValue *ap_list = NULL; int ap_list_n = -1;
     /* A continuation-holding builtin's state is handed to the callback frame that do_tramp_call pushes, so its
        do_return re-enters that builtin's step instead of returning to bytecode. */
     void *tramp_cont_state = NULL, *cont_st = NULL;
@@ -24979,7 +25048,47 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValueConst thisArg = ap_this;
                 JSValueConst arrayArg = ap_array;
                 JSObject *np;
-                JSTrampBodyEntry ap_tbe = tramp_body_entry(nfunc);
+                JSValue *ap_tab; int ap_tab_n;
+                JSTrampBodyEntry ap_tbe;
+                if (ap_list_n < 0) {
+                    /* 19.2.3.1 CreateListFromArrayLike, ONCE and BEFORE the target's kind is asked — which is why
+                       it is here and not at each of the three arms below, where build_arg_list used to sit three
+                       times. Its `length` read and every element read are the page's code, so the whole apply
+                       parks on them unless the operand is a fast array, for which the reads invoke nothing. */
+                    uint32_t fastlen = 0;
+                    if (JS_IsUndefined(arrayArg) || JS_IsNull(arrayArg)) {
+                        ap_list = NULL; ap_list_n = 0;   /* `f.apply(t)`: no list at all */
+                    } else if (JS_VALUE_GET_TAG(arrayArg) != JS_TAG_OBJECT) {
+                        JS_ThrowTypeError(ctx, "not a object");   /* 19.2.3.1 step 2 */
+                        goto exception;
+                    } else if (arg_list_is_fast(ctx, arrayArg, &fastlen)) {
+                        JSObject *fp = JS_VALUE_GET_OBJ(arrayArg);
+                        uint32_t fk;
+                        if (unlikely(fastlen > JS_MAX_LOCAL_VARS)) {
+                            JS_ThrowRangeError(ctx, "too many arguments in function call (only %d allowed)",
+                                               JS_MAX_LOCAL_VARS);
+                            goto exception;
+                        }
+                        ap_list = js_mallocz(ctx, sizeof(JSValue) * (size_t)max_uint32(1, fastlen));
+                        if (unlikely(!ap_list)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                        for (fk = 0; fk < fastlen; fk++) ap_list[fk] = js_dup(fp->u.array.u.values[fk]);
+                        ap_list_n = (int)fastlen;
+                    } else {
+                        JSArgList *agl = js_mallocz(ctx, sizeof(*agl));
+                        if (unlikely(!agl)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                        agl->coerce = JS_UNDEFINED;
+                        agl->idx = JS_ATOM_NULL;
+                        agl->phase = ARGL_LEN;
+                        agl->func = nfunc; agl->this_arg = thisArg; agl->src = arrayArg;
+                        agl->cfirst = ap_cfirst; agl->cargc = ap_cargc; agl->is_tail = tramp_is_tail;
+                        sf->cur_pc = pc;
+                        cont_st = agl;
+                        goto do_arg_list_step;
+                    }
+                }
+                ap_tab = ap_list; ap_tab_n = ap_list_n;   /* read + reset: one list per apply */
+                ap_list = NULL; ap_list_n = -1;
+                ap_tbe = tramp_body_entry(nfunc);
                 if (ap_tbe != TBE_NONE && ap_tbe != TBE_PLAIN) {
                     /* A COROUTINE target reached through an apply-shaped call. Asking only `tramp_can_call` here
                        sent `gen(...spread)`, `agen.apply(o,a)` and `Reflect.apply(asyncFn,…)` to the JS_Call
@@ -24988,11 +25097,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        apply-mode vector, so the ONLY thing this shape has to do is fill it and restate its
                        operands in the method shape those entries clean up ([f, thisArg, array] at
                        call_argv[-2..0], which is exactly ap_cfirst/-2 + ap_cargc). */
-                    uint32_t alen4 = 0; JSValue *atab4;
-                    if (JS_VALUE_GET_TAG(arrayArg) != JS_TAG_UNDEFINED && JS_VALUE_GET_TAG(arrayArg) != JS_TAG_NULL) {
-                        atab4 = build_arg_list(ctx, &alen4, arrayArg);   /* reads the array (may throw) */
-                        if (unlikely(!atab4)) goto exception;
-                    } else {
+                    uint32_t alen4 = (uint32_t)ap_tab_n; JSValue *atab4 = ap_tab;
+                    if (!atab4) {
                         atab4 = js_malloc(ctx, sizeof(JSValue));   /* never NULL: NULL is the not-in-apply-mode sentinel */
                         if (unlikely(!atab4)) goto exception;
                     }
@@ -25015,12 +25121,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        those chains read, and it means neither of them needs to know the list exists. What the
                        chain does need to know is that the OPERANDS are still the apply triple on the stack:
                        call_cargc says so, and each arm reads-and-consumes it through TAKE_CALL_POP. */
-                    uint32_t alen3 = 0; JSValue *atab3 = NULL, *pre3;
+                    uint32_t alen3 = (uint32_t)ap_tab_n; JSValue *atab3 = ap_tab, *pre3;
                     uint32_t k3;
-                    if (JS_VALUE_GET_TAG(arrayArg) != JS_TAG_UNDEFINED && JS_VALUE_GET_TAG(arrayArg) != JS_TAG_NULL) {
-                        atab3 = build_arg_list(ctx, &alen3, arrayArg);
-                        if (unlikely(!atab3)) goto exception;
-                    }
                     pre3 = js_malloc(ctx, sizeof(JSValue) * (size_t)(alen3 + 2));
                     if (unlikely(!pre3)) { free_arg_list(ctx, atab3, alen3); goto exception; }
                     pre3[0] = js_dup(thisArg);
@@ -25037,13 +25139,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 np = JS_VALUE_GET_OBJ(nfunc);
                 JSFunctionBytecode *nb = np->u.func.function_bytecode;
-                uint32_t alen = 0; JSValue *atab = NULL;
+                uint32_t alen = (uint32_t)ap_tab_n; JSValue *atab = ap_tab;
                 int eff_argc, narg_alloc; size_t asize;
                 TrampFrame *ntf; JSValue *nlb, *narg_buf, *nvar_buf, *nstack_buf; JSStackFrame *nsf; int k;
-                if (JS_VALUE_GET_TAG(arrayArg) != JS_TAG_UNDEFINED && JS_VALUE_GET_TAG(arrayArg) != JS_TAG_NULL) {
-                    atab = build_arg_list(ctx, &alen, arrayArg);   /* reads the array (may throw) */
-                    if (unlikely(!atab)) goto exception;
-                }
                 eff_argc = (int)alen;
                 narg_alloc = (eff_argc < nb->arg_count) ? nb->arg_count : eff_argc;   /* always own the args (in atab, not the stack) */
                 asize = sizeof(JSValue) * TRAMP_FRAME_SLOTS(narg_alloc, nb)
@@ -26555,6 +26653,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         /* MACHINE mode: a coercing BUILTIN asked for this primitive; it comes back as that step's
                            result, exactly as a callback's would. */
                         cont_st = touter;
+                        if (touter_kind == CONT_ARG_LIST) {
+                            /* the arg list's `length` coercion answered. */
+                            goto do_arg_list_step;
+                        }
                         if (touter_kind == CONT_ARRAY_LEN) {
                             /* an Array length write's step 3 or step 4 — the KEYED ENTRY parking across a
                                coercion, which is the capability this kind exists to add. */
@@ -27163,6 +27265,81 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
             }
 
+        do_arg_list_step:
+            /* 19.2.3.1 CreateListFromArrayLike, ONE label with a phase and a cursor. `ret_val` is whichever
+               request just answered. The whole apply shape rides the state, so the resume re-enters
+               do_apply_tramp with the list already built. */
+            {
+                JSArgList *al = (JSArgList *)cont_st;
+                if (al->phase == ARGL_LEN) {
+                    /* step 3's `? Get(obj, "length")` — an accessor or a Proxy trap. */
+                    al->phase = ARGL_LEN_PRIM;
+                    gp_outer = al; gp_outer_kind = CONT_ARG_LIST;
+                    gp_obj = al->src; gp_atom = JS_ATOM_length;
+                    gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                    goto do_getprop_tramp;
+                }
+                if (al->phase == ARGL_LEN_PRIM) {
+                    /* the rest of step 3 is ToLength, whose ToPrimitive is the page's code for an OBJECT. */
+                    if (JS_VALUE_GET_TAG(ret_val) == JS_TAG_OBJECT) {
+                        DCHECK(JS_IsUndefined(al->coerce), "the arg-list length is coerced once");
+                        al->coerce = ret_val; ret_val = JS_UNDEFINED;
+                        tp_outer = al; tp_outer_kind = CONT_ARG_LIST;
+                        tp_value = al->coerce; tp_hint = HINT_NUMBER;
+                        tp_slot = 0; tp_retry_pc = NULL;
+                        goto do_toprim_tramp;
+                    }
+                    JS_FreeValue(ctx, al->coerce); al->coerce = JS_UNDEFINED;
+                    if (unlikely(JS_ToLengthFree(ctx, &al->len, ret_val))) {
+                        ret_val = JS_UNDEFINED;
+                        goto do_arg_list_throw;
+                    }
+                    ret_val = JS_UNDEFINED;
+                    if (unlikely(al->len > JS_MAX_LOCAL_VARS)) {
+                        /* the engine's own argument-count floor, which the spec leaves to the implementation. It
+                           is a CAPACITY limit on one call's operands, not a bound on exploration. */
+                        JS_ThrowRangeError(ctx, "too many arguments in function call (only %d allowed)",
+                                           JS_MAX_LOCAL_VARS);
+                        goto do_arg_list_throw;
+                    }
+                    /* avoid allocating 0 bytes, exactly as the C form did */
+                    al->tab = js_mallocz(ctx, sizeof(JSValue) * (size_t)max_uint32(1, (uint32_t)al->len));
+                    if (unlikely(!al->tab)) { JS_ThrowOutOfMemory(ctx); goto do_arg_list_throw; }
+                    al->i = 0;
+                    al->phase = ARGL_ELEM;
+                    goto do_arg_list_elem;
+                }
+                DCHECK(al->phase == ARGL_ELEM, "the arg-list sequence resumed in no phase");
+                /* the previous element arrived */
+                JS_FreeAtom(ctx, al->idx); al->idx = JS_ATOM_NULL;
+                al->tab[al->n++] = ret_val; ret_val = JS_UNDEFINED;
+                al->i++;
+            do_arg_list_elem:
+                if (al->i < al->len) {
+                    /* step 5's `? Get(obj, ! ToString(𝔽(index)))`, one element at a time. */
+                    al->idx = JS_NewAtomInt64(ctx, al->i);
+                    if (unlikely(al->idx == JS_ATOM_NULL)) goto do_arg_list_throw;
+                    gp_outer = al; gp_outer_kind = CONT_ARG_LIST;
+                    gp_obj = al->src; gp_atom = al->idx;
+                    gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                    goto do_getprop_tramp;
+                }
+                /* the list is complete: hand it to the apply shape and re-enter it. */
+                DCHECK((int64_t)al->n == al->len, "the arg list finished with fewer values than its length");
+                ap_list = al->tab; ap_list_n = (int)al->n;
+                al->tab = NULL; al->n = 0;
+                ap_func = al->func; ap_this = al->this_arg; ap_array = al->src;
+                ap_cfirst = al->cfirst; ap_cargc = al->cargc; tramp_is_tail = al->is_tail;
+                js_arg_list_free(ctx, al);
+                goto do_apply_tramp;
+
+            do_arg_list_throw:
+                /* the read threw: the operands are the caller's and its catch-search frees them, as for any
+                   throwing operator. */
+                js_arg_list_free(ctx, al);
+                goto exception;
+            }
+
         do_array_len_step:
             /* 10.4.2.4 steps 3-5, ONE label with a phase because both coercions are of the SAME value and only
                the phase distinguishes which primitive has arrived. */
@@ -27662,6 +27839,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                           cont_st = gouter0;
                           goto do_toprim_have_method;
                       }
+                      if (gk == CONT_ARG_LIST) {
+                          cont_st = gouter0;
+                          goto do_arg_list_step;
+                      }
                       if (gk == CONT_SETMAP_CTOR) {
                           JSSetMapCtor *sc = gouter0;
                           JSIterConsume *scs = sc->consume;
@@ -27994,6 +28175,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         gp_outer = gd->outer; gp_outer_kind = gd->outer_kind;
                         js_gopd_desc_free(ctx, gd);
                         goto getprop_throw;
+                    }
+                    if (gk3 == CONT_ARG_LIST) {
+                        js_arg_list_free(ctx, (JSArgList *)gouter);
+                        goto exception;
                     }
                     if (gk3 == CONT_SETMAP_CTOR) {
                         /* either read threw: the instance can never be consumed into, and the machine goes with
@@ -31032,7 +31217,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            || gouter_kind == CONT_SET_RECV || gouter_kind == CONT_TOPRIM_GET
                            || gouter_kind == CONT_DEFINE_CLASS || gouter_kind == CONT_ARRAY_LEN
                            || gouter_kind == CONT_CTOR_PROTO || gouter_kind == CONT_TA_TARGET
-                           || gouter_kind == CONT_SETMAP_CTOR,
+                           || gouter_kind == CONT_SETMAP_CTOR || gouter_kind == CONT_ARG_LIST,
                            "property-get outer continuation: unknown machine kind");
                     if (gouter_kind == CONT_PROMISE_ALL_THEN) {
                         js_getprop_free(ctx, gp);
@@ -31441,6 +31626,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             goto getprop_throw;
                         }
                         goto do_ownkeys_chk_step;
+                    }
+                    if (gouter_kind == CONT_ARG_LIST) {
+                        cont_st = gouter;
+                        if (unlikely(JS_IsException(ret_val))) {
+                            ret_val = JS_UNDEFINED;
+                            js_arg_list_free(ctx, (JSArgList *)cont_st);
+                            goto exception;
+                        }
+                        goto do_arg_list_step;
                     }
                     if (gouter_kind == CONT_SETMAP_CTOR) {
                         if (unlikely(JS_IsException(ret_val))) {
@@ -36075,7 +36269,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    || gk2 == CONT_OWNKEYS_CHK || gk2 == CONT_PROXY_INV || gk2 == CONT_KEYED_INV
                    || gk2 == CONT_WITH_HAS || gk2 == CONT_SET_RECV || gk2 == CONT_TOPRIM_GET
                    || gk2 == CONT_DEFINE_CLASS || gk2 == CONT_ARRAY_LEN || gk2 == CONT_CTOR_PROTO
-                   || gk2 == CONT_TA_TARGET || gk2 == CONT_SETMAP_CTOR
+                   || gk2 == CONT_TA_TARGET || gk2 == CONT_SETMAP_CTOR || gk2 == CONT_ARG_LIST
                    || gk2 == CONT_OP_KEYED
                    || gk2 == CONT_PROMISE_ALL_THEN || gk2 == CONT_AFS_GET
                    || gk2 == CONT_ITER_HELPER_GET || gk2 == CONT_PROMISE_ALL_GET
@@ -36150,6 +36344,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 goto getprop_throw;
             } else if (gouter && gk2 == CONT_WITH_HAS) {
                 js_with_has_free(ctx, gouter);
+                goto exception;
+            } else if (gouter && gk2 == CONT_ARG_LIST) {
+                js_arg_list_free(ctx, (JSArgList *)gouter);
                 goto exception;
             } else if (gouter && gk2 == CONT_SETMAP_CTOR) {
                         /* either read threw: the instance can never be consumed into, and the machine goes with
@@ -63778,6 +63975,16 @@ static int js_array_find_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
     }
     is_index = (s->mode == ArrayFindIndex || s->mode == ArrayFindLastIndex);
 
+    if (s->cb_pending == 2) {
+        /* 23.1.3.9 step 5.b's `? Get(O, Pk)` landed. It was JS_GetPropertyValue from C — an accessor or a Proxy
+           `get` trap on the receiver, which is the page's code, so a looping getter preempted with no flow base
+           even though the CALLBACK beside it was already routed. */
+        int rg = step_getidx_run(ctx, &s->hdr, s->obj, s->k, cb_result, &s->val, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (rg) return rg < 0 ? -1 : rg;
+        s->cb_pending = 0;
+        goto have_elem;
+    }
     if (s->cb_pending) {
         bool truthy = JS_ToBoolFree(ctx, cb_result);
         s->cb_pending = 0;
@@ -63790,9 +63997,12 @@ static int js_array_find_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
         s->k += s->dir;
     }
     for (; s->k != s->end; s->k += s->dir) {
-        s->val = JS_GetPropertyValue(ctx, s->obj, js_int64(s->k));
-        if (JS_IsException(s->val))
-            return -1;
+        int rg;
+        s->cb_pending = 2;
+        rg = step_getidx_run(ctx, &s->hdr, s->obj, s->k, JS_UNDEFINED, &s->val, out_cb, out_argc);
+        if (rg) return rg < 0 ? -1 : rg;
+        s->cb_pending = 0;
+    have_elem:
         s->cb_args[0] = s->this_arg;
         s->cb_args[1] = s->func;
         s->cb_args[2] = s->val;
