@@ -19204,9 +19204,13 @@ static void js_ctor_proto_free(JSContext *ctx, JSCtorProto *cp);
                                   then re-issued with that in place of V — which is exactly step 6, so the
                                   re-run's own conversions are of a number and invoke nothing. */
 typedef struct JSArrayLen {
-    JSValue obj;         /* the Array being written (owned) */
-    JSValue val;         /* V, coerced TWICE, so it is held rather than replaced (owned) */
-    JSAtom atom;         /* the key — always `length`, carried so the re-issue needs no second source (owned) */
+    JSValue obj;         /* the Array or TypedArray being written (owned) */
+    JSValue val;         /* V — coerced TWICE by the `length` write, so it is held rather than replaced (owned) */
+    JSValue recv;        /* the resolved Receiver, or UNINITIALIZED for "the object itself" (owned). 10.4.2.4's
+                            `length` write has no receiver gate, which is why the carrier did without one; a
+                            TypedArray element write does — 10.4.5.5 step 1 applies TypedArraySetElement only
+                            when SameValue(O, Receiver), so the receiver decides whether V is coerced at all. */
+    JSAtom atom;         /* the key — `length`, or the TypedArray's canonical numeric index (owned) */
     void *outer;         /* what is waiting on the WRITE */
     uint8_t outer_kind;
     uint8_t op;          /* GP_SET or GP_DEFINE: which operation is re-issued */
@@ -19218,7 +19222,10 @@ typedef struct JSArrayLen {
     JSValue getter, setter;
     int dflags;
 } JSArrayLen;
-enum { AL_UINT32 = 0, AL_NUMBER, AL_COMPARE };
+/* AL_UINT32/AL_NUMBER/AL_COMPARE are 10.4.2.4's two coercions of V and their comparison. AL_TA_PRIM/AL_TA_WRITE
+   are 10.4.5.16 TypedArraySetElement step 1's SINGLE coercion — a different algorithm in the same carrier,
+   because what the carrier IS is "a keyed write parked across a coercion of V, finished here". */
+enum { AL_UINT32 = 0, AL_NUMBER, AL_COMPARE, AL_TA_PRIM, AL_TA_WRITE };
 static void js_array_len_free(JSContext *ctx, JSArrayLen *al);
 
 #define CONT_DEFINE_CLASS  63  /* gp_outer = JSOpClass: 15.7.14 ClassDefinitionEvaluation step 8.d.i's
@@ -20057,6 +20064,7 @@ static void js_array_len_free(JSContext *ctx, JSArrayLen *al)
 {
     JS_FreeValue(ctx, al->obj);
     JS_FreeValue(ctx, al->val);
+    JS_FreeValue(ctx, al->recv);
     JS_FreeValue(ctx, al->getter);
     JS_FreeValue(ctx, al->setter);
     JS_FreeAtom(ctx, al->atom);
@@ -20086,6 +20094,54 @@ static bool ta_write_needs_toprim(JSContext *ctx, JSValueConst target, JSValueCo
         return false;   /* a symbol, a bool, null/undefined: an ordinary set */
     }
 }
+/* The same question the interpreter's write site asks, in the form the KEYED ENTRY can ask it: the entry has
+   resolved the key to an atom already, so the canonical-numeric-index test is a property of that atom and needs
+   no second conversion. `recv` is the entry's resolved receiver, UNINITIALIZED meaning "the object itself" —
+   10.4.5.5 step 1 reaches TypedArraySetElement only when SameValue(O, Receiver), and an ordinary [[Set]] with a
+   foreign receiver coerces nothing, so the receiver is part of the question and not a caller's detail.
+   GP_DEFINE has no receiver at all (10.4.5.3 goes straight to TypedArraySetElement), which is why the caller
+   passes UNINITIALIZED for it. */
+static bool ta_atom_write_needs_toprim(JSContext *ctx, JSValueConst target, JSValueConst recv,
+                                       JSAtom atom, JSValueConst val)
+{
+    JSObject *p;
+    if (JS_VALUE_GET_TAG(val) != JS_TAG_OBJECT) return false;
+    if (JS_VALUE_GET_TAG(target) != JS_TAG_OBJECT) return false;
+    p = JS_VALUE_GET_OBJ(target);
+    if (!is_typed_array(p->class_id)) return false;
+    if (!JS_IsUninitialized(recv) && JS_VALUE_GET_PTR(recv) != JS_VALUE_GET_PTR(target)) return false;
+    return JS_AtomIsNumericIndex(ctx, atom) > 0;
+}
+
+/* 10.4.5.14 IsValidIntegerIndex, answered from the ATOM the entry has already resolved — 10.4.5.3 step 1.a.
+   A detached buffer leaves u.array.count at 0, so the bound test covers detachment as well as length. A
+   canonical numeric index that is not a non-negative integer ("1.5", "1e21", "-0") is never a valid index and
+   is not a tagged int either, so the tagged-int test answers it. */
+static bool js_ta_index_is_valid(JSContext *ctx, JSValueConst target, JSAtom atom)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(target);
+    if (!__JS_AtomIsTaggedInt(atom)) return false;
+    if (typed_array_is_oob(p)) return false;
+    return __JS_AtomToUInt32(atom) < (uint32_t)p->u.array.count;
+}
+
+/* 10.4.5.3 [[DefineOwnProperty]] steps 1.b-1.e: a canonical-numeric-index define reaches step 1.f's
+   TypedArraySetElement — the only step that coerces V — ONLY past four descriptor rejections. They must be
+   answered BEFORE the coercion is parked, because a descriptor that fails one of them returns false without
+   ever touching V; parking first would run a valueOf the spec never reaches. Step 1.a (IsValidIntegerIndex) is
+   deliberately NOT here: it is answered before the coercion too, but by the define itself, and its answer is
+   decided at that moment — a valueOf that detaches the buffer afterwards does not turn the already-true 1.a
+   false, which is exactly what re-running the whole define after the coercion got wrong. */
+static bool ta_define_reaches_set(int dflags, JSValueConst getter, JSValueConst setter)
+{
+    if ((dflags & JS_PROP_HAS_CONFIGURABLE) && !(dflags & JS_PROP_CONFIGURABLE)) return false;
+    if ((dflags & JS_PROP_HAS_ENUMERABLE) && !(dflags & JS_PROP_ENUMERABLE)) return false;
+    if ((dflags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET)) || !JS_IsUndefined(getter) || !JS_IsUndefined(setter))
+        return false;
+    if ((dflags & JS_PROP_HAS_WRITABLE) && !(dflags & JS_PROP_WRITABLE)) return false;
+    return true;
+}
+
 typedef enum { ITERAT_DECLINE = 0, ITERAT_FOUND, ITERAT_ABSENT } JSIterAtState;
 static JSIterAtState iter_data_at_iterator(JSContext *ctx, JSValueConst items, JSValue *out);
 static bool tramp_body_is_gen(JSValueConst func);
@@ -23440,6 +23496,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSValueConst gp_recv = JS_UNINITIALIZED;            /* [[Get]]/[[Set]] receiver; UNINITIALIZED = the object itself. read+reset at do_getprop_tramp */
     int gp_no_throw = 0;                                /* 1 = a [[Set]]/[[Delete]] yields its boolean instead of throwing on false. read+reset there */
     JSDescFacts *gp_desc_out = NULL;                    /* non-NULL = a GP_GETOWNPROP answers into that record, not with the descriptor object. read+reset there */
+    int gp_al_phase = AL_UINT32;                        /* WHICH coercion algorithm do_array_len_start builds: 10.4.2.4's `length` pair or 10.4.5.16's single TypedArray element one. read+reset there */
     int forof_unpack_off = 0;                           /* do_forof_unpack's inputs: the enum_rec's offset from sp, */
     uint8_t forof_unpack_mode = FOU_FOROF;              /* and which placement the pair takes */
     uint8_t forof_enumrec_wrap = 0;                     /* do_forof_enumrec's input: `for await`'s SYNC branch, whose
@@ -27748,6 +27805,36 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     tp_slot = 0;
                     goto do_toprim_tramp;
                 }
+                if (al->phase == AL_TA_PRIM) {
+                    al->phase = AL_TA_WRITE;
+                    tp_outer = al; tp_outer_kind = CONT_ARRAY_LEN;
+                    tp_value = al->val; tp_hint = HINT_NUMBER;
+                    tp_slot = 0;
+                    goto do_toprim_tramp;
+                }
+                if (al->phase == AL_TA_WRITE) {
+                    /* 10.4.5.16 step 1 is done, so what remains is STEPS 2-3 AND NOTHING ELSE: store if the
+                       index is still valid, and either way the operation succeeds. Re-running the enclosing
+                       [[Set]]/[[DefineOwnProperty]] instead would re-ask questions the spec already answered
+                       before the coercion — a valueOf that DETACHES the buffer would turn 10.4.5.3 step 1.a
+                       false on the second reading and make the define report failure, where the spec says it
+                       returns true with the store simply skipped. JS_SetPropertyValue on a PRIMITIVE V is
+                       exactly steps 1-3 with step 1 already spent, including the out-of-bounds no-op. */
+                    JSValue coerced = ret_val, key;
+                    int wres;
+                    ret_val = JS_UNDEFINED;
+                    key = JS_AtomIsNumericIndex1(ctx, al->atom);
+                    DCHECK(!JS_IsUndefined(key) && !JS_IsException(key),
+                           "the TypedArray element coercion resumed on a key that is not a canonical numeric "
+                           "index, which its own predicate required");
+                    wres = JS_SetPropertyValue(ctx, al->obj, key, coerced, JS_PROP_THROW);
+                    if (unlikely(wres < 0)) goto do_array_len_throw;
+                    /* both spellings SUCCEED: 10.4.5.5 returns true and 10.4.5.3 step 1.g returns true. */
+                    ret_val = al->no_throw ? JS_TRUE : JS_UNDEFINED;
+                    gp_outer = al->outer; gp_outer_kind = al->outer_kind;
+                    js_array_len_free(ctx, al);
+                    goto do_getprop_complete;
+                }
                 if (al->phase == AL_NUMBER) {
                     /* step 3 on the first primitive: a ToUint32 of a primitive invokes nothing. */
                     if (unlikely(JS_ToUint32(ctx, &al->len, ret_val))) {
@@ -28096,6 +28183,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         int dres = JS_DeleteProperty(ctx, fwd ? gp_fwd : gp_obj, gp_atom, 0);
                         if (unlikely(dres < 0)) goto getprop_throw;
                         ret_val = js_bool(dres);
+                    } else if (ta_atom_write_needs_toprim(ctx, fwd ? gp_fwd : gp_obj,
+                                                          gp_op == GP_DEFINE ? JS_UNINITIALIZED : gp_recv_r,
+                                                          gp_atom, gp_val)
+                               && (gp_op == GP_SET
+                                   || (gp_op == GP_DEFINE && (gp_dflags_r & JS_PROP_HAS_VALUE)
+                                       && ta_define_reaches_set(gp_dflags_r, gp_getter_r, gp_setter_r)
+                                       && js_ta_index_is_valid(ctx, fwd ? gp_fwd : gp_obj, gp_atom)))) {
+                        /* 10.4.5.16 TypedArraySetElement step 1: the element write coerces V with ToNumber
+                           (ToBigInt for the 64-bit classes) BEFORE the bounds test, and for an OBJECT V that is
+                           the page's @@toPrimitive/valueOf. The interpreter's own write site guards this; every
+                           C caller reaches the write through THIS entry and none of them did, so
+                           `[0].fill({valueOf(){ while(x){} }})` on a TypedArray receiver and the TypedArray
+                           constructors' element stores all ran a user body from C. One arm here answers for all
+                           of them. */
+                        if (fwd) gp_obj = gp_fwd;
+                        gp_al_phase = AL_TA_PRIM;
+                        goto do_array_len_start;
                     } else if (arr_len_write_needs_toprim(fwd ? gp_fwd : gp_obj, gp_atom, gp_val)
                                && (gp_op == GP_SET || (gp_op == GP_DEFINE && (gp_dflags_r & JS_PROP_HAS_VALUE)))) {
                         /* 10.4.2.4's two coercions of V are the page's code, and this arm established that the
@@ -28516,21 +28620,26 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 goto do_generic_callee;
 
                 do_array_len_start:
-                    /* the write's target coerces V TWICE (10.4.2.4 steps 3-4). Hand both coercions out and
-                       re-issue the operation with the validated uint32, which IS step 6. Entered with gp_obj
-                       already resolved past a trapless forward. */
+                    /* A KEYED WRITE PARKED ACROSS A COERCION OF V, finished at do_array_len_step. Two writes need
+                       that and they are different algorithms: `length` coerces V TWICE (10.4.2.4 steps 3-4) and a
+                       TypedArray element coerces it once (10.4.5.16 step 1). The ENTRY phase says which, so the
+                       carrier is built once. Entered with gp_obj already resolved past a trapless forward. */
                     {
                         JSArrayLen *al = js_mallocz(ctx, sizeof(*al));
                         if (unlikely(!al)) { JS_ThrowOutOfMemory(ctx); goto getprop_throw; }
                         al->obj = js_dup(gp_obj);
                         al->val = js_dup(gp_val);
+                        al->recv = js_dup(gp_recv_r);
                         al->atom = JS_DupAtom(ctx, gp_atom);
                         al->op = (uint8_t)gp_op;
                         al->no_throw = (uint8_t)gp_nothrow_r;
                         al->getter = js_dup(gp_getter_r);
                         al->setter = js_dup(gp_setter_r);
                         al->dflags = gp_dflags_r;
-                        al->phase = AL_UINT32;
+                        DCHECK(gp_al_phase == AL_UINT32 || gp_al_phase == AL_TA_PRIM,
+                               "a keyed write parked across a coercion with no algorithm selected");
+                        al->phase = (uint8_t)gp_al_phase;
+                        gp_al_phase = AL_UINT32;   /* read + reset */
                         al->coerced = JS_UNDEFINED;
                         al->outer = gp_outer; al->outer_kind = gp_outer_kind;
                         gp_outer = NULL; gp_outer_kind = CONT_NONE;
