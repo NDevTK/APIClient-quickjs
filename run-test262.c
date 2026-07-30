@@ -66,6 +66,10 @@ typedef struct {
     /* list of AgentReport.link */
     struct list_head report_list;
     int async_done;
+    /* $DONE(err)'s message, so a FAILING async test reports what failed. Without it async_done goes to 2 and
+       the check below reports "$DONE() not called" — which is not what happened, and sends the reader looking
+       for a hang instead of reading the assertion. */
+    char async_fail[512];
 } ThreadLocalStorage;
 
 typedef struct namelist_t {
@@ -548,7 +552,11 @@ static JSValue js_print_262(JSContext *ctx, JSValueConst this_val,
         if (!strcmp(s, "Test262:AsyncTestComplete")) {
             tls->async_done++;
         } else if (js__strstart(s, "Test262:AsyncTestFailure", NULL)) {
+            const char *why = s + sizeof("Test262:AsyncTestFailure:") - 1;
             tls->async_done = 2; /* force an error */
+            /* KEEP the message: this is the only place it exists, and the report below is the only place it is
+               read. Truncation is fine; losing it entirely is not. */
+            snprintf(tls->async_fail, sizeof(tls->async_fail), "%s", why);
         }
         if (outfile) {
             if (i != 0)
@@ -634,6 +642,7 @@ static void init_thread_local_storage(ThreadLocalStorage *p)
     js_mutex_init(&p->report_mutex);
     init_list_head(&p->report_list);
     p->async_done = 0;
+    p->async_fail[0] = '\0';
 }
 
 typedef struct {
@@ -1478,6 +1487,7 @@ static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,
     /* a module evaluation returns a promise */
     ret_promise = ((eval_flags & JS_EVAL_TYPE_MODULE) != 0);
     tls->async_done = 0; /* counter of "Test262:AsyncTestComplete" messages */
+    tls->async_fail[0] = '\0';   /* per TEST, beside the counter it explains — a stale one would mislabel the next */
 
     start = get_clock_ms();
     if (fork_preempt_enabled())
@@ -1512,7 +1522,10 @@ static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,
                 if (is_async) {
                     /* test if the test called $DONE() once */
                     if (tls->async_done != 1) {
-                        res_val = JS_ThrowTypeError(ctx, "$DONE() not called");
+                        if (tls->async_fail[0])
+                            res_val = JS_ThrowTypeError(ctx, "async test FAILED: %s", tls->async_fail);
+                        else
+                            res_val = JS_ThrowTypeError(ctx, "$DONE() not called");
                     } else {
                         res_val = JS_UNDEFINED;
                     }
