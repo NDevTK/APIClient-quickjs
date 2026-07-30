@@ -1381,8 +1381,6 @@ static __maybe_unused void JS_DumpValue(JSRuntime *rt, JSValueConst val);
 static __maybe_unused void JS_DumpAtoms(JSRuntime *rt);
 static __maybe_unused void JS_DumpShapes(JSRuntime *rt);
 
-static JSValue js_function_apply(JSContext *ctx, JSValueConst this_val,
-                                 int argc, JSValueConst *argv, int magic);
 static void js_array_finalizer(JSRuntime *rt, JSValueConst val);
 static void js_array_mark(JSRuntime *rt, JSValueConst val,
                           JS_MarkFunc *mark_func);
@@ -22696,7 +22694,6 @@ static inline bool tramp_is_function_call(JSValueConst method) {
    into the callee's OWN arg_buf. It is the STEP-DEF identity that names it now, exactly as .call's does: the
    moment `apply` declared itself a machine this predicate stopped matching the C-function shape, and every
    consumer reached through `.apply` lost the operator-site reshape without anything saying so. */
-static JSValue js_function_apply(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
 static inline bool tramp_is_function_apply(JSValueConst method) {
     JSObject *mp;
     if (JS_VALUE_GET_TAG(method) != JS_TAG_OBJECT) return false;
@@ -22706,13 +22703,11 @@ static inline bool tramp_is_function_apply(JSValueConst method) {
 }
 /* Reflect.apply(target, thisArg, argsList) — js_reflect_apply forwards to js_function_apply; route it into
    do_apply_tramp with the Reflect operand shape ([Reflect, apply, target, thisArg, argsList]). */
-static JSValue js_reflect_apply(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 /* Reflect.construct is CALL-SITE-RESOLVED, exactly as Reflect.apply already is: it holds no continuation, so the
    operator site resolves it to the ultimate construct rather than letting a C entry perform it. Without this,
    Reflect.construct(Promise, [fn]) reaches js_promise_constructor — which no longer has an executor body to run,
    because that body was the second implementation. Routing the spelling is the replacement; leaving the body
    there for it would be the fallback. */
-static JSValue js_reflect_construct(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 
 static inline bool tramp_is_reflect_apply(JSValueConst method) {
     JSObject *mp;
@@ -24140,14 +24135,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         goto do_construct_dispatch;
                     }
                 }
-                ret_val = js_function_apply(ctx, sp[-3], 2, vc(&sp[-2]), magic);
-                if (unlikely(JS_IsException(ret_val)))
+                /* THE RESIDUE, and all that is left of this opcode's C fall-through: a non-object, non-nullish
+                   argument list. Both arms above cover every list a call can actually be made with, so what
+                   remains is two throws in spec order — 19.2.3.6 step 1's IsCallable, then 19.2.3.1 step 2's
+                   "not a object" — and js_function_apply was being called to perform exactly those. Doing them
+                   here is what let its C body be deleted instead of kept for them. The operands stay on the stack
+                   for the frame's own catch-search, as for any throwing operator. */
+                if (check_function(ctx, sp[-3]))
                     goto exception;
-                JS_FreeValue(ctx, sp[-3]);
-                JS_FreeValue(ctx, sp[-2]);
-                JS_FreeValue(ctx, sp[-1]);
-                sp -= 3;
-                *sp++ = ret_val;
+                JS_ThrowTypeError(ctx, "not a object");
+                goto exception;
             }
             BREAK;
         CASE(OP_return):
@@ -59893,32 +59890,12 @@ static JSValue *build_arg_list(JSContext *ctx, uint32_t *plen,
 
 /* magic value: 0 = normal apply, 1 = apply for constructor, 2 =
    Reflect.apply */
-static JSValue js_function_apply(JSContext *ctx, JSValueConst this_val,
-                                 int argc, JSValueConst *argv, int magic)
-{
-    JSValueConst this_arg, array_arg;
-    uint32_t len;
-    JSValue *tab, ret;
-
-    if (check_function(ctx, this_val))
-        return JS_EXCEPTION;
-    this_arg = argv[0];
-    array_arg = argv[1];
-    if ((JS_VALUE_GET_TAG(array_arg) == JS_TAG_UNDEFINED ||
-         JS_VALUE_GET_TAG(array_arg) == JS_TAG_NULL) && magic != 2) {
-        return JS_Call(ctx, this_val, this_arg, 0, NULL);
-    }
-    tab = build_arg_list(ctx, &len, array_arg);
-    if (!tab)
-        return JS_EXCEPTION;
-    if (magic & 1) {
-        ret = JS_CallConstructor2(ctx, this_val, this_arg, len, vc(tab));
-    } else {
-        ret = JS_Call(ctx, this_val, this_arg, len, vc(tab));
-    }
-    free_arg_list(ctx, tab, len);
-    return ret;
-}
+/* DELETED: js_function_apply's C body. Function.prototype.apply and Reflect.apply are STEPDEF_FUNCTION_APPLY /
+   STEPDEF_REFLECT_APPLY — ONE machine whose magic selects the spelling — and the direct spellings are
+   call-site-resolved onto do_apply_tramp. Its last reachable use was the OP_apply residue, which is two throws in
+   spec order and which that site now performs itself. While the body stood it built its argument list with
+   build_arg_list from C, so an array-like whose `length` getter loops preempted with no flow base: a live defect
+   in a body nothing was meant to reach, which is exactly why a superseded body is not allowed to keep compiling. */
 
 /* THE coerce-then-compute machine. Stage 0 walks the declared argument positions, requesting a TOPRIMITIVE for
    each OBJECT among them; stage 1 receives one and replaces that argument. When none is left the body runs with
@@ -74869,35 +74846,12 @@ int JS_AddIntrinsicJSON(JSContext *ctx)
 
 /* Reflect */
 
-static JSValue js_reflect_apply(JSContext *ctx, JSValueConst this_val,
-                                int argc, JSValueConst *argv)
-{
-    return js_function_apply(ctx, argv[0], max_int(0, argc - 1), argv + 1, 2);
-}
+/* DELETED: js_reflect_apply's C body. It only forwarded to js_function_apply, which is deleted below for the
+   same reason: Reflect.apply is STEPDEF_REFLECT_APPLY, the same machine Function.prototype.apply is. */
 
-static JSValue js_reflect_construct(JSContext *ctx, JSValueConst this_val,
-                                    int argc, JSValueConst *argv)
-{
-    JSValueConst func, array_arg, new_target;
-    JSValue *tab, ret;
-    uint32_t len;
-
-    func = argv[0];
-    array_arg = argv[1];
-    if (argc > 2) {
-        new_target = argv[2];
-        if (!JS_IsConstructor(ctx, new_target))
-            return JS_ThrowTypeErrorNotAConstructor(ctx, new_target);
-    } else {
-        new_target = func;
-    }
-    tab = build_arg_list(ctx, &len, array_arg);
-    if (!tab)
-        return JS_EXCEPTION;
-    ret = JS_CallConstructor2(ctx, func, new_target, len, vc(tab));
-    free_arg_list(ctx, tab, len);
-    return ret;
-}
+/* DELETED: js_reflect_construct's C body. Reflect.construct is STEPDEF_REFLECT_CONSTRUCT; this body was
+   unregistered and unreachable, and it read its argsList with build_arg_list — so it read as a live path that
+   performs 19.2.3.1's element getters from C with no flow base. */
 
 
 
