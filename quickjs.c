@@ -19056,6 +19056,22 @@ typedef struct JSOpKeyed {
                                   to is parked across them, exactly as a handler's trap READ parks it. It is the
                                   same nesting CONT_TRAP_GET already is: a keyed request whose outer is not a
                                   machine but another keyed OPERATION, carrying what waits on that one. */
+#define CONT_TA_TARGET     66  /* gp_outer = JSTATarget: 23.2.5.1 step 6.a.i's AllocateTypedArray, whose
+                                  OrdinaryCreateFromConstructor reads `Get(newTarget, "prototype")` — the same
+                                  page-visible read CONT_CTOR_PROTO parks a construct across, reached here from
+                                  `new Int8Array(iterable)` with a Proxy new_target. The object belongs to the
+                                  CONSUME machine and the read happens BEFORE the source is touched (which is what
+                                  step 6.a.i states), so what parks is the consume SETUP: the machine exists, its
+                                  ta_target does not yet, and the acquire cannot start until it does. */
+typedef struct JSTATarget {
+    void *consume;          /* the JSIterConsume the object belongs to; OWNED until the object lands on it */
+    JSValue ntgt;           /* new_target (owned): 10.1.13 step 3's realm fallback inspects it, invoking nothing */
+    JSValue getiter;        /* the probed @@iterator (owned), restored into tramp_iter_getiter on delivery */
+    JSValueConst iterable;  /* borrowed: the caller's own operand, which outlives the suspension */
+    int class_id;
+} JSTATarget;
+static void js_ta_target_free(JSContext *ctx, JSTATarget *tt);
+
 #define CONT_CTOR_PROTO    65  /* gp_outer = JSCtorProto: 10.2.2 [[Construct]] step 5's
                                   OrdinaryCreateFromConstructor(newTarget, "%Object.prototype%"), whose step 2 is
                                   `? Get(newTarget, "prototype")` — an ordinary [[Get]], so a new.target carrying
@@ -19808,6 +19824,17 @@ static bool arr_len_write_needs_toprim(JSValueConst target, JSAtom atom, JSValue
     return prs && (prs->flags & JS_PROP_LENGTH) != 0;
 }
 
+/* The read threw or was abandoned: the typed array can never be allocated, so the CONSUME machine goes with it —
+   by its own rule, which is js_iter_consume_end plus the block, because the machine holds the argument list and
+   the requester that the throw must not leak. */
+static void js_ta_target_free(JSContext *ctx, JSTATarget *tt)
+{
+    if (tt->consume) { js_iter_consume_end(ctx, tt->consume); js_free_rt(ctx->rt, tt->consume); }
+    JS_FreeValue(ctx, tt->ntgt);
+    JS_FreeValue(ctx, tt->getiter);
+    js_free_rt(ctx->rt, tt);
+}
+
 static void js_ctor_proto_free(JSContext *ctx, JSCtorProto *cp)
 {
     JS_FreeValue(ctx, cp->super_ref);
@@ -20141,6 +20168,7 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_DEFINE_CLASS:
     case CONT_ARRAY_LEN:
     case CONT_CTOR_PROTO:
+    case CONT_TA_TARGET:
     case CONT_OP_KEYED:
     case CONT_FOR_IN_HAS:
     case CONT_OWNKEYS_CHK:
@@ -27604,6 +27632,33 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                           cont_st = gouter0;
                           goto do_toprim_have_method;
                       }
+                      if (gk == CONT_TA_TARGET) {
+                          /* the new_target's `prototype` is in hand: 10.1.13 step 3's realm fallback, then the
+                             object lands on the consume machine and the acquire starts. */
+                          JSTATarget *tt = gouter0;
+                          JSValue tproto = ret_val; ret_val = JS_UNDEFINED;
+                          JSIterConsume *tcs = tt->consume;
+                          if (!JS_IsObject(tproto)) {
+                              JSContext *trealm;
+                              JS_FreeValue(ctx, tproto);
+                              trealm = JS_GetFunctionRealm(ctx, tt->ntgt);
+                              if (unlikely(!trealm)) { js_ta_target_free(ctx, tt); goto exception; }
+                              tproto = js_dup(trealm->class_proto[tt->class_id]);
+                          }
+                          tcs->ta_target = JS_NewObjectProtoClass(ctx, tproto, tt->class_id);
+                          JS_FreeValue(ctx, tproto);
+                          if (unlikely(JS_IsException(tcs->ta_target))) {
+                              tcs->ta_target = JS_UNDEFINED;
+                              js_ta_target_free(ctx, tt);
+                              goto exception;
+                          }
+                          tramp_iter_getiter = tt->getiter; tt->getiter = JS_UNDEFINED;
+                          tramp_consume_iterable = tt->iterable;
+                          tramp_consume_state = tcs; tramp_consume_kind = CONT_ITER_CONSUME;
+                          tt->consume = NULL;   /* the machine is the acquire's now, not this state's */
+                          js_ta_target_free(ctx, tt);
+                          goto do_consume_acquire_iterator;
+                      }
                       if (gk == CONT_CTOR_PROTO) {
                           /* the new.target's `prototype` is in hand: restore the parked CONSTRUCT and run it. */
                           JSCtorProto *cp = gouter0;
@@ -27865,6 +27920,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         gp_outer = gd->outer; gp_outer_kind = gd->outer_kind;
                         js_gopd_desc_free(ctx, gd);
                         goto getprop_throw;
+                    }
+                    if (gk3 == CONT_TA_TARGET) {
+                        /* the `prototype` read threw: the typed array can never be allocated and the consume
+                           machine goes with it, by its own teardown. Its operands are the caller's, freed by the
+                           frame's catch-search as for any throwing operator. */
+                        js_ta_target_free(ctx, gouter);
+                        goto exception;
                     }
                     if (gk3 == CONT_CTOR_PROTO) {
                         /* the read threw in place (a revoked proxy, a poisoned C accessor): same unwind as the
@@ -28559,19 +28621,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->mapfn_this = (is_from && ta_argc >= 3) ? js_dup(ta_argv[2]) : JS_UNDEFINED;
                 s->ta_classid = is_from ? 0 : ta_classid;   /* the from path CONSTRUCTS the receiver; only new TypedArray(iterable) creates by class id */
                 s->ta_isfrom = is_from;
-                if (!is_from) {
-                    /* 23.2.5.1 step 6.a.i: AllocateTypedArray runs BEFORE the source is read at all — a Proxy
-                       new_target sees its `prototype` get before the iterator does anything, and an iteration that
-                       throws leaves an already-allocated object behind. Only the BUFFER waits for the length, so
-                       the create is here and js_typed_array_alloc_len is at the collect's end. */
-                    s->ta_target = js_create_from_ctor(ctx, ntgt, ta_classid);
-                    if (JS_IsException(s->ta_target)) {
-                        s->ta_target = JS_UNDEFINED;
-                        js_iter_consume_end(ctx, s); js_free_rt(rt, s);
-                        JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED;
-                        goto exception;
-                    }
-                }
                 s->k = 0;
                 s->sink = ITERCONS_FROM;
                 s->orig_cfirst = s->outer ? 0 : tac_cfirst;
@@ -28579,6 +28628,32 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->orig_is_tail = s->outer ? 0 : tramp_is_tail;
                 tac_cargc = -1;   /* read + reset */
                 DCHECK(ta_argc >= 1, "the TypedArray consume arm reads its source; the recognizers refuse argc 0");
+                if (!is_from) {
+                    /* 23.2.5.1 step 6.a.i: AllocateTypedArray runs BEFORE the source is read at all — a Proxy
+                       new_target sees its `prototype` get before the iterator does anything, and an iteration that
+                       throws leaves an already-allocated object behind. Only the BUFFER waits for the length, so
+                       the create is here and js_typed_array_alloc_len is at the collect's end.
+                       That read is 10.1.13 step 2, the page's code, and js_create_from_ctor performed it from C.
+                       The machine's own setup above is finished first — it is pure state assignment with nothing
+                       observable in it — so the whole ACQUIRE parks on the read and resumes with the object in
+                       hand. */
+                    JSTATarget *tt = js_mallocz(ctx, sizeof(*tt));
+                    if (unlikely(!tt)) {
+                        js_iter_consume_end(ctx, s); js_free_rt(rt, s);
+                        JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED;
+                        JS_ThrowOutOfMemory(ctx); goto exception;
+                    }
+                    tt->consume = s;
+                    tt->ntgt = js_dup(ntgt);
+                    tt->getiter = tramp_iter_getiter; tramp_iter_getiter = JS_UNDEFINED;
+                    tt->iterable = ta_argv[0];
+                    tt->class_id = ta_classid;
+                    sf->cur_pc = pc;
+                    gp_outer = tt; gp_outer_kind = CONT_TA_TARGET;
+                    gp_obj = tt->ntgt; gp_atom = JS_ATOM_prototype;
+                    gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                    goto do_getprop_tramp;
+                }
                 tramp_consume_iterable = ta_argv[0];
                 tramp_consume_state = s; tramp_consume_kind = CONT_ITER_CONSUME;
                 goto do_consume_acquire_iterator;
@@ -30872,7 +30947,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            || gouter_kind == CONT_KEYED_INV || gouter_kind == CONT_WITH_HAS
                            || gouter_kind == CONT_SET_RECV || gouter_kind == CONT_TOPRIM_GET
                            || gouter_kind == CONT_DEFINE_CLASS || gouter_kind == CONT_ARRAY_LEN
-                           || gouter_kind == CONT_CTOR_PROTO,
+                           || gouter_kind == CONT_CTOR_PROTO || gouter_kind == CONT_TA_TARGET,
                            "property-get outer continuation: unknown machine kind");
                     if (gouter_kind == CONT_PROMISE_ALL_THEN) {
                         js_getprop_free(ctx, gp);
@@ -31281,6 +31356,42 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             goto getprop_throw;
                         }
                         goto do_ownkeys_chk_step;
+                    }
+                    if (gouter_kind == CONT_TA_TARGET) {
+                        if (unlikely(JS_IsException(ret_val))) {
+                        /* the `prototype` read threw: the typed array can never be allocated and the consume
+                               machine goes with it, by its own teardown. Its operands are the caller's, freed by the
+                               frame's catch-search as for any throwing operator. */
+                            js_ta_target_free(ctx, gouter);
+                            goto exception;
+                        }
+                        {
+                          /* the new_target's `prototype` is in hand: 10.1.13 step 3's realm fallback, then the
+                               object lands on the consume machine and the acquire starts. */
+                            JSTATarget *tt = gouter;
+                            JSValue tproto = ret_val; ret_val = JS_UNDEFINED;
+                            JSIterConsume *tcs = tt->consume;
+                            if (!JS_IsObject(tproto)) {
+                                JSContext *trealm;
+                                JS_FreeValue(ctx, tproto);
+                                trealm = JS_GetFunctionRealm(ctx, tt->ntgt);
+                                if (unlikely(!trealm)) { js_ta_target_free(ctx, tt); goto exception; }
+                                tproto = js_dup(trealm->class_proto[tt->class_id]);
+                            }
+                            tcs->ta_target = JS_NewObjectProtoClass(ctx, tproto, tt->class_id);
+                            JS_FreeValue(ctx, tproto);
+                            if (unlikely(JS_IsException(tcs->ta_target))) {
+                                tcs->ta_target = JS_UNDEFINED;
+                                js_ta_target_free(ctx, tt);
+                                goto exception;
+                            }
+                            tramp_iter_getiter = tt->getiter; tt->getiter = JS_UNDEFINED;
+                            tramp_consume_iterable = tt->iterable;
+                            tramp_consume_state = tcs; tramp_consume_kind = CONT_ITER_CONSUME;
+                            tt->consume = NULL;   /* the machine is the acquire's now, not this state's */
+                            js_ta_target_free(ctx, tt);
+                            goto do_consume_acquire_iterator;
+                        }
                     }
                     if (gouter_kind == CONT_CTOR_PROTO) {
                         JSCtorProto *cpx = gouter;
@@ -35827,6 +35938,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    || gk2 == CONT_OWNKEYS_CHK || gk2 == CONT_PROXY_INV || gk2 == CONT_KEYED_INV
                    || gk2 == CONT_WITH_HAS || gk2 == CONT_SET_RECV || gk2 == CONT_TOPRIM_GET
                    || gk2 == CONT_DEFINE_CLASS || gk2 == CONT_ARRAY_LEN || gk2 == CONT_CTOR_PROTO
+                   || gk2 == CONT_TA_TARGET
                    || gk2 == CONT_OP_KEYED
                    || gk2 == CONT_PROMISE_ALL_THEN || gk2 == CONT_AFS_GET
                    || gk2 == CONT_ITER_HELPER_GET || gk2 == CONT_PROMISE_ALL_GET
@@ -35901,6 +36013,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 goto getprop_throw;
             } else if (gouter && gk2 == CONT_WITH_HAS) {
                 js_with_has_free(ctx, gouter);
+                goto exception;
+            } else if (gouter && gk2 == CONT_TA_TARGET) {
+                        /* the `prototype` read threw: the typed array can never be allocated and the consume
+                   machine goes with it, by its own teardown. Its operands are the caller's, freed by the
+                   frame's catch-search as for any throwing operator. */
+                js_ta_target_free(ctx, gouter);
                 goto exception;
             } else if (gouter && gk2 == CONT_CTOR_PROTO) {
                 /* the `prototype` getter threw after suspending: same unwind as the in-place arm. */
