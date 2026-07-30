@@ -19183,6 +19183,14 @@ typedef struct JSCtorProto {
     uint8_t from_super;
     int8_t first;            /* tramp_first: -2 = the stack shape, 0 = super()'s */
     uint8_t is_tail;
+    /* WHAT THE RESUME RE-EXECUTES, captured so it can be CHECKED rather than trusted. The delivery re-enters
+       do_construct_tramp from the top, which recomputes the callee's bytecode header, is_derived_class_constructor
+       and narg_alloc before reaching the read. That is sound ONLY while every one of those is a pure function of
+       state this struct parked — none of them may observe anything the `prototype` getter could have changed. It
+       is an invariant, not a comment, so the resume asserts it: a line added to that prologue that reads mutable
+       state makes these diverge and crashes at the origin instead of silently re-deciding. */
+    uint16_t chk_arg_count;
+    uint8_t chk_is_derived;
 } JSCtorProto;
 static void js_ctor_proto_free(JSContext *ctx, JSCtorProto *cp);
 
@@ -23350,6 +23358,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        is what makes do_construct_tramp issue it; read+reset there, so a re-entry cannot re-read and a second
        construct on this frame cannot inherit the first one's prototype. */
     JSValue con_proto = JS_UNINITIALIZED;
+    /* what the prologue computed BEFORE the read suspended, so the re-entry can prove it recomputed the same
+       thing. Only meaningful while con_proto is set. */
+    uint16_t con_proto_chk_arg_count = 0;
+    uint8_t con_proto_chk_is_derived = 0;
     /* Promise-executor trampoline (do_promise_exec_tramp): the SAME builtin is reached by two entry shapes, so both
        set these before the goto — `new Promise(fn)` (OP_call_constructor: operands on the caller stack, popped at
        finish) and `super(fn)` from a Promise subclass (OP_init_ctor: args are the derived frame's argv, nothing to
@@ -25074,6 +25086,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 size_t asize = sizeof(JSValue) * TRAMP_FRAME_SLOTS(narg_alloc, nb)
                              + sizeof(JSVarRef *) * nb->var_ref_count;
                 TrampFrame *ntf; JSValue *nlb, *narg_buf, *nvar_buf, *nstack_buf; JSStackFrame *nsf; int k;
+                /* THE RESUME'S PURITY CHECK. con_proto set means this is a re-entry after the `prototype`
+                   read suspended, and everything above has just been recomputed from parked state. If any of it
+                   now differs, the prologue read something the page's getter could change and the re-entry is a
+                   REPLAY that can decide differently than the suspension did — banned, and caught here rather
+                   than surfacing as a wrong construct. */
+                DCHECK(JS_IsUninitialized(con_proto)
+                       || (con_proto_chk_arg_count == nb->arg_count
+                           && con_proto_chk_is_derived == (uint8_t)nb->is_derived_class_constructor),
+                       "the construct prologue recomputed differently after the prototype read — it is observing "
+                       "mutable state, so re-entering it is a replay, not a resume");
                 if (nb->is_derived_class_constructor) {
                     cthis = JS_UNDEFINED;   /* bound by super(); body returns the object itself */
                     DCHECK(JS_IsUninitialized(con_proto),
@@ -25091,6 +25113,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     cp->cargc = con_cargc; con_cargc = -1;
                     cp->from_super = con_from_super;
                     cp->first = (int8_t)tramp_first; cp->is_tail = tramp_is_tail;
+                    cp->chk_arg_count = (uint16_t)nb->arg_count;
+                    cp->chk_is_derived = (uint8_t)nb->is_derived_class_constructor;
                     cp->outer = con_outer; cp->outer_kind = con_outer_kind;
                     con_outer = NULL; con_outer_kind = CONT_NONE;
                     sf->cur_pc = pc;
@@ -28200,6 +28224,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                           tramp_first = cp->first; tramp_is_tail = cp->is_tail;
                           con_outer = cp->outer; con_outer_kind = cp->outer_kind;
                           con_proto = ret_val; ret_val = JS_UNDEFINED;
+                          con_proto_chk_arg_count = cp->chk_arg_count;
+                          con_proto_chk_is_derived = cp->chk_is_derived;
                           js_ctor_proto_free(ctx, cp);
                           goto do_construct_tramp;
                       }
@@ -32060,6 +32086,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             tramp_first = cp->first; tramp_is_tail = cp->is_tail;
                             con_outer = cp->outer; con_outer_kind = cp->outer_kind;
                             con_proto = ret_val; ret_val = JS_UNDEFINED;
+                            con_proto_chk_arg_count = cp->chk_arg_count;
+                            con_proto_chk_is_derived = cp->chk_is_derived;
                             js_ctor_proto_free(ctx, cp);
                             goto do_construct_tramp;
                         }
