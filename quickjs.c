@@ -1502,6 +1502,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_ERROR_CTOR_LAST = STEPDEF_ERROR_CTOR_BASE + JS_PLAIN_ERROR,
     STEPDEF_GLOBAL_EVAL,
     STEPDEF_ITER_CONCAT,
+    STEPDEF_STR_ITERATOR,
     STEPDEF_ITER_ZIP, STEPDEF_ITER_ZIP_KEYED, STEPDEF_ITER_ZIP_NEXT, STEPDEF_ITER_ZIP_RETURN,
     STEPDEF_FUNCTION_CTOR, STEPDEF_GENERATOR_FUNCTION_CTOR,
     STEPDEF_ASYNC_FUNCTION_CTOR, STEPDEF_ASYNC_GENERATOR_FUNCTION_CTOR,
@@ -19766,7 +19767,20 @@ static void js_toprim_abandon(JSContext *ctx, struct JSToPrim *tp)
     }
     DCHECK(!touter || tk == CONT_STEP,
            "ToPrimitive outer continuation: unknown machine kind");
-    tramp_step_chain_free(ctx, touter);
+    {
+        /* The chain this walk frees can END in a requester only the interpreter can unwind — a step machine whose
+           own outer is a consumer's @@iterator acquire, which is what String.prototype[@@iterator] became. This
+           function is not a label and cannot goto, so the leftover is PARKED for the exception label every caller
+           of this walk reaches; that slot is exactly what it is for. */
+        uint8_t left = 0;
+        void *rest = tramp_step_chain_free_upto(ctx, touter, &left);
+        if (rest) {
+            DCHECK(ctx->pending_gp_unwind == NULL,
+                   "pending_gp_unwind already set — a nested keyed-operation unwind needs a queue");
+            ctx->pending_gp_unwind = rest;
+            ctx->pending_gp_unwind_kind = left;
+        }
+    }
 }
 
 /* DEFER one IteratorClose to the interpreter's exception label. The reference is OWNED by the queue until the
@@ -21407,6 +21421,11 @@ typedef struct JSIterConcat {
     int i;
     uint8_t checked;            /* step 3.a has run for argument i; the read is what remains */
 } JSIterConcat;
+
+typedef struct JSStrIterCreate {
+    JSStepHdr hdr;
+    JSValue result;
+} JSStrIterCreate;
 
 typedef struct JSIterZip {
     JSStepHdr hdr;
@@ -26050,6 +26069,38 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (sk0 == CONT_PROMISE_ALL) goto do_promise_all_deliver;
                         goto do_iter_close_deliver;
                     }
+                    if (sk0 == CONT_FOROF_ACQUIRE || sk0 == CONT_FORAWAIT_WRAP) {
+                        /* the for-of acquire's method THREW. Drop the operands it pushed and propagate, exactly as
+                           the frame delivery's exception arm does. */
+                        int cfirst0 = h->orig_cfirst, cargc0 = h->orig_cargc;
+                        JSValue *fcargv;
+                        DCHECK(souter0 == NULL, "a for-of acquire continuation carries no state");
+                        h->outer = NULL; h->outer_kind = CONT_NONE;
+                        tramp_step_state_free(ctx, stt, false);
+                        fcargv = sp - cargc0;
+                        for (i = cfirst0; i < cargc0; i++) JS_FreeValue(ctx, fcargv[i]);
+                        sp += cfirst0 - cargc0;
+                        goto exception;
+                    }
+                    if (sk0 == CONT_CONSUME_GETITER) {
+                        /* the machine WAS a consumer's @@iterator (GetIterator step 4) and it threw. GetIterator
+                           propagates the abrupt completion to the CONSUMER, which finishes it by its own rule —
+                           the same arm the bytecode and inline acquires reach, so all three acquire shapes fail
+                           identically. This cont owns the two operands it pushed. */
+                        JSConsumeGetIter *gi0 = souter0;
+                        int cfirst0 = h->orig_cfirst, cargc0 = h->orig_cargc;
+                        JSValue *gcargv;
+                        h->outer = NULL; h->outer_kind = CONT_NONE;
+                        tramp_step_state_free(ctx, stt, false);
+                        gcargv = sp - cargc0;
+                        for (i = cfirst0; i < cargc0; i++) JS_FreeValue(ctx, gcargv[i]);
+                        sp += cfirst0 - cargc0;
+                        tramp_consume_state = gi0->consumer; tramp_consume_kind = gi0->consumer_kind;
+                        js_free_rt(rt, gi0);
+                        tramp_consume_acquired = JS_EXCEPTION;
+                        ret_val = JS_UNDEFINED;
+                        goto do_consume_deliver_iterator;
+                    }
                     if (sk0 == CONT_GETPROP) {
                         /* the machine WAS a proxy trap and it threw: the request's teardown owns what happens
                            next (a consumer still owes IfAbruptCloseIterator, an acquire delivers the throw as an
@@ -26095,6 +26146,43 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         js_itercall_deliver(ctx, sp, r);
                         sp += 1;
                         BREAK;
+                    }
+                    if (souter_kind == CONT_FOROF_ACQUIRE || souter_kind == CONT_FORAWAIT_WRAP) {
+                        /* the @@iterator method WAS a step machine and this is a FOR-OF acquire (`for (c of "abc")`
+                           reaches String.prototype[@@iterator], which is one). Same as the frame delivery: drop the
+                           call's operands and enter the one enum-record label, which runs GetIterator step 5 and
+                           the `next` read. */
+                        bool want_wrap = (souter_kind == CONT_FORAWAIT_WRAP);
+                        JSValue *fcargv = sp - cargc;
+                        DCHECK(souter == NULL, "a for-of acquire continuation carries no state");
+                        DCHECK(cargc >= cfirst, "for-of acquire step records operands ending below where they start");
+                        for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, fcargv[i]);
+                        sp += cfirst - cargc;
+                        ret_val = r;
+                        if (unlikely(JS_IsException(ret_val))) goto exception;
+                        forof_enumrec_wrap = want_wrap;
+                        goto do_forof_enumrec;
+                    }
+                    if (souter && souter_kind == CONT_CONSUME_GETITER) {
+                        /* the @@iterator method WAS a step machine — String.prototype[@@iterator] is one, because
+                           its receiver coercion is the page's ToString. Same three things the bytecode acquire's
+                           delivery does: drop the call's operands, GetIterator step 5's object check, then the one
+                           shared hand-off, so every acquire shape reaches the consumer identically. */
+                        JSConsumeGetIter *gi = souter;
+                        JSValue *gcargv = sp - cargc;
+                        DCHECK(cargc >= cfirst, "consume getiter step records operands ending below where they start");
+                        for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, gcargv[i]);
+                        sp += cfirst - cargc;
+                        if (unlikely(!JS_IsObject(r))) {
+                            JS_FreeValue(ctx, r);
+                            JS_ThrowTypeErrorNotAnObject(ctx);
+                            r = JS_EXCEPTION;
+                        }
+                        tramp_consume_state = gi->consumer; tramp_consume_kind = gi->consumer_kind;
+                        js_free_rt(rt, gi);
+                        tramp_consume_acquired = r;
+                        ret_val = JS_UNDEFINED;
+                        goto do_consume_deliver_iterator;
                     }
                     if (souter && (souter_kind == CONT_ITER_CONSUME || souter_kind == CONT_ITER_HELPER
                                    || souter_kind == CONT_ITER_CLOSE_CALL
@@ -35993,6 +36081,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         gp_outer_kind = ctx->pending_gp_unwind_kind;
         ctx->pending_gp_unwind = NULL;
         ctx->pending_gp_unwind_kind = CONT_NONE;
+        if (gp_outer_kind == CONT_CONSUME_GETITER) {
+            /* not a keyed continuation: a consumer's @@iterator acquire whose step machine threw while suspended
+               in a coercion. GetIterator hands the abrupt completion to the CONSUMER, which finishes it by its own
+               rule — the same arm the inline and bytecode acquires reach. The cont owns the two operands it
+               pushed, on this path as on those. */
+            JSConsumeGetIter *gi = gp_outer;
+            JSValue *gcargv;
+            gp_outer = NULL; gp_outer_kind = CONT_NONE;
+            DCHECK(gi->consumer != NULL, "a consume-getiter unwind with no consumer to answer to");
+            gcargv = sp - 2;
+            JS_FreeValue(ctx, gcargv[0]);
+            JS_FreeValue(ctx, gcargv[1]);
+            sp -= 2;
+            tramp_consume_state = gi->consumer; tramp_consume_kind = gi->consumer_kind;
+            js_free_rt(rt, gi);
+            tramp_consume_acquired = JS_EXCEPTION;
+            ret_val = JS_UNDEFINED;
+            goto do_consume_deliver_iterator;
+        }
         goto getprop_throw;
     }
     if (unlikely(ctx->pending_import_cap != NULL && ctx->pending_import_cap->sf == sf)) {
@@ -64583,6 +64690,10 @@ static int js_iterator_zip_step(JSContext *ctx, void *st, JSValue cb_result, JSV
 static JSValue js_iterator_zip_fini(JSContext *ctx, void *st, bool take_result);
 static int js_iter_zip_drive_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_iter_zip_drive_fini(JSContext *ctx, void *st, bool take_result);
+static int js_string_iterator_create_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_string_iterator_create_fini(JSContext *ctx, void *st, bool take_result);
+static const JSTrampStepDef js_str_iterator_def =
+    { sizeof(JSStrIterCreate), js_string_iterator_create_step, js_string_iterator_create_fini, 0 };
 static const JSTrampStepDef js_iter_zip_def =
     { sizeof(JSIterZip), js_iterator_zip_step, js_iterator_zip_fini, 0 };
 static int js_iterator_zip_keyed_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
@@ -66469,6 +66580,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_REGEXP_TEST]     = &js_re_test_def,
     [STEPDEF_GLOBAL_EVAL]     = &js_global_eval_def,
     [STEPDEF_ITER_CONCAT]     = &js_iter_concat_def,
+    [STEPDEF_STR_ITERATOR]    = &js_str_iterator_def,
     [STEPDEF_ITER_ZIP]        = &js_iter_zip_def,
     [STEPDEF_ITER_ZIP_KEYED]  = &js_iter_zip_keyed_def,
     [STEPDEF_ITER_ZIP_NEXT]   = &js_iter_zip_next_def,
@@ -68268,15 +68380,14 @@ static JSValue js_create_array_iterator(JSContext *ctx, JSValueConst this_val,
     JSIteratorKindEnum kind;
     int class_id;
 
+    /* ARRAY and TypedArray iterators only. Their receiver coercion is ToObject, which invokes nothing; the STRING
+       iterator's is `? RequireObjectCoercible(this)` then `? ToString(this)` — the page's toString/@@toPrimitive —
+       which this function used to perform with JS_ToStringCheckObject from C, so it is a step machine of its own
+       (js_string_iterator_create_step) rather than a magic bit on this one. */
+    DCHECK((magic & ~3) == 0, "the string-iterator magic is gone: that receiver coercion is its own machine");
     kind = magic & 3;
-    if (magic & 4) {
-        /* string iterator case */
-        arr = JS_ToStringCheckObject(ctx, this_val);
-        class_id = JS_CLASS_STRING_ITERATOR;
-    } else {
-        arr = JS_ToObject(ctx, this_val);
-        class_id = JS_CLASS_ARRAY_ITERATOR;
-    }
+    class_id = JS_CLASS_ARRAY_ITERATOR;
+    arr = JS_ToObject(ctx, this_val);
     if (JS_IsException(arr))
         goto fail;
     enum_obj = JS_NewObjectClass(ctx, class_id);
@@ -68295,6 +68406,38 @@ static JSValue js_create_array_iterator(JSContext *ctx, JSValueConst this_val,
  fail:
     JS_FreeValue(ctx, arr);
     return JS_EXCEPTION;
+}
+
+/* 22.1.3.36 String.prototype[@@iterator]. Its two opening steps are the page's code — RequireObjectCoercible and
+   then ToString on the RECEIVER — and step_thisstring_run is exactly that pair as a request. A receiver whose
+   toString loops aborted at its back-edge in an activation with no flow base. */
+static int js_string_iterator_create_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb,
+                                          int *out_argc)
+{
+    JSStrIterCreate *s = st;
+    JSValue str = JS_UNDEFINED, enum_obj;
+    JSArrayIteratorData *it;
+    int r = step_thisstring_run(ctx, &s->hdr, cb_result, &str, out_cb, out_argc);
+    if (r) return r < 0 ? -1 : r;
+    enum_obj = JS_NewObjectClass(ctx, JS_CLASS_STRING_ITERATOR);
+    if (JS_IsException(enum_obj)) { JS_FreeValue(ctx, str); return -1; }
+    it = js_malloc(ctx, sizeof(*it));
+    if (unlikely(!it)) { JS_FreeValue(ctx, enum_obj); JS_FreeValue(ctx, str); return -1; }
+    it->obj = str;               /* the iterator record owns the coerced string */
+    it->kind = JS_ITERATOR_KIND_VALUE;
+    it->idx = 0;
+    JS_SetOpaqueInternal(enum_obj, it);
+    s->result = enum_obj;
+    return 0;
+}
+
+static JSValue js_string_iterator_create_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSStrIterCreate *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    js_free(ctx, s);
+    return r;
 }
 
 static int js_array_iter_next_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
@@ -71907,7 +72050,7 @@ static const JSCFunctionListEntry js_string_proto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("toUpperCase", 0, js_string_toLowerCase, 0 ),
     JS_CFUNC_MAGIC_DEF("toLocaleLowerCase", 0, js_string_toLowerCase, 1 ),
     JS_CFUNC_MAGIC_DEF("toLocaleUpperCase", 0, js_string_toLowerCase, 0 ),
-    JS_CFUNC_MAGIC_DEF("[Symbol.iterator]", 0, js_create_array_iterator, JS_ITERATOR_KIND_VALUE | 4 ),
+    JS_CFUNC_STEP_DEF("[Symbol.iterator]", 0, STEPDEF_STR_ITERATOR ),
     /* ES6 Annex B 2.3.2 etc. */
     JS_CFUNC_MAGIC_DEF("anchor", 1, js_string_CreateHTML, magic_string_anchor ),
     JS_CFUNC_MAGIC_DEF("big", 0, js_string_CreateHTML, magic_string_big ),
