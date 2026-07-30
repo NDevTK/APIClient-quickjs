@@ -19713,9 +19713,20 @@ typedef struct JSConsumeGetIter { void *consumer; uint8_t consumer_kind; } JSCon
 /* Abandon a machine AND every machine waiting on it. `arr.map(String)` is an outer waiting on an inner; a
    coercion requested by that inner adds a third. Six sites had this loop written out and each one was a chance
    to stop at the first link — which is exactly how the ToPrimitive unwind leaked the realm. */
+/* Where an OPERAND-mode ToPrimitive continues once its primitive is in hand. Each value names a label placed
+   immediately AFTER the coercion it belongs to, so nothing before it re-executes. TPR_NONE is the unconverted
+   sites' retry and goes when they do. */
+enum { TPR_NONE = 0, TPR_ARITH_AFTER_LEFT, TPR_ARITH_AFTER_RIGHT };
 typedef struct JSToPrim {
     JSValue obj;              /* the object being coerced (owned) */
-    const uint8_t *retry_pc;  /* OPERAND mode: the opcode byte to re-execute once the slot holds a primitive */
+    const uint8_t *retry_pc;  /* OPERAND mode, LEGACY: the opcode byte to RE-EXECUTE once the slot holds a
+                                 primitive. That is a replay — the opcode runs again and re-decides from operands
+                                 the coercion method has had a chance to touch — and it is being converted site by
+                                 site to `resume_at`. Zero once the last site is converted; the DCHECK at the
+                                 delivery is what keeps the two from both being set. */
+    const uint8_t *op_byte;   /* the opcode's own byte, RESTORED (not re-executed) so a resumed site can read the
+                                 operator it belongs to; `opcode` is a C local and does not survive a suspension */
+    uint8_t resume_at;        /* OPERAND mode: WHERE to continue, past the coercion. TPR_NONE = the legacy retry */
     int slot;                 /* OPERAND mode: the operand's offset from sp (negative) */
     void *outer;              /* MACHINE mode: the step machine awaiting the primitive (NULL = operand mode) */
     uint8_t outer_kind;       /* CONT_* of outer */
@@ -23416,6 +23427,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     int tp_slot = 0;                                    /* do_toprim_tramp inputs. OPERAND mode: the operand's offset from sp + the opcode byte to re-execute. MACHINE mode: tp_outer is set and the primitive is delivered to that step instead. */
     int tp_hint = HINT_NONE;
     const uint8_t *tp_retry_pc = NULL;
+    int tp_resume_at = 0;                               /* TPR_*: where an operand coercion continues; 0 = the legacy retry */
     JSValueConst tp_value = JS_UNDEFINED;               /* MACHINE mode: the value to coerce (borrowed) */
     void *tp_outer = NULL;
     JSValueConst gp_obj = JS_UNDEFINED;                 /* do_getprop_tramp inputs: the receiver, the key, WHICH */
@@ -26853,6 +26865,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 tp->outer = tp_outer; tp->outer_kind = tp_outer_kind;
                 tp->obj = js_dup(tp_outer ? tp_value : sp[tp_slot]);
                 tp->retry_pc = tp_retry_pc;
+                tp->op_byte = tp_retry_pc;
+                tp->resume_at = (uint8_t)tp_resume_at; tp_resume_at = TPR_NONE;
                 tp->slot = tp_slot;
                 { int th = tp_hint & ~HINT_FORCE_ORDINARY;
                   tp->hint = (th == HINT_STRING) ? HINT_STRING : HINT_NUMBER;   /* NONE uses the NUMBER order */
@@ -26966,6 +26980,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             toprim_deliver:
                 {
                     const uint8_t *rpc = tp->retry_pc;
+                    const uint8_t *opb = tp->op_byte;
+                    uint8_t rat = tp->resume_at;
                     int slot = tp->slot;
                     void *touter = tp->outer; uint8_t touter_kind = tp->outer_kind;
                     js_toprim_free(ctx, tp);
@@ -26996,7 +27012,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JS_FreeValue(ctx, sp[slot]);
                     sp[slot] = ret_val;       /* the operand is now a primitive */
                     ret_val = JS_UNDEFINED;
-                    pc = rpc;                 /* re-execute the operator; its prefix is pure tag tests */
+                    if (rat != TPR_NONE) {
+                        /* RESUME: continue past the coercion. `opcode` is a C local and did not survive the
+                           suspension, so it is RESTORED from the parked byte — reading a parked byte is not
+                           re-executing an opcode. */
+                        opcode = *opb;
+                        if (rat == TPR_ARITH_AFTER_LEFT) goto do_arith_after_left;
+                        DCHECK(rat == TPR_ARITH_AFTER_RIGHT, "an operand coercion resumed at an unknown point");
+                        goto do_arith_after_right;
+                    }
+                    pc = rpc;                 /* LEGACY retry, at the sites not yet converted */
                     BREAK;
                 }
             toprim_throw:
@@ -35341,8 +35366,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                this label is one byte, so `pc - 1` is its own byte. */
             if (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT) {
                 tp_slot = -2; tp_hint = HINT_NUMBER; tp_retry_pc = pc - 1;
+                tp_resume_at = TPR_ARITH_AFTER_LEFT;
                 goto do_toprim_tramp;
             }
+        do_arith_after_left:
             if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) {
                 /* These operators are ToNumeric(lhs) THEN ToNumeric(rhs), and ToNumeric is ToPrimitive plus the
                    numeric conversion — so the LEFT operand's conversion must COMPLETE before the right is touched
@@ -35353,8 +35380,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 sp[-2] = JS_ToNumericFree(ctx, sp[-2]);
                 if (unlikely(JS_IsException(sp[-2]))) { sp[-2] = JS_UNDEFINED; goto exception; }
                 tp_slot = -1; tp_hint = HINT_NUMBER; tp_retry_pc = pc - 1;
+                tp_resume_at = TPR_ARITH_AFTER_RIGHT;
                 goto do_toprim_tramp;
             }
+        do_arith_after_right:
             if (js_binary_arith_slow(ctx, sp, opcode))
                 goto exception;
             sp--;
