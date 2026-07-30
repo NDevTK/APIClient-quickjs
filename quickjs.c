@@ -1568,6 +1568,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_WEAKMAP_UPSERT, STEPDEF_WEAKMAP_UPSERT_COMPUTED,
     STEPDEF_DISPOSE_SYNC, STEPDEF_DISPOSE_ASYNC,
     STEPDEF_MAP_FOREACH, STEPDEF_SET_FOREACH,
+    STEPDEF_DISPOSABLE_CTOR, STEPDEF_ASYNC_DISPOSABLE_CTOR,
     STEPDEF_COUNT
 };
 #define HINT_NONE    2
@@ -58148,6 +58149,17 @@ static JSValue JS_NewGlobalCConstructor(JSContext *ctx, const char *name,
     return func_obj;
 }
 
+/* A global constructor whose implementation is a STEP MACHINE. Same two lines as the two above; only the
+   cproto differs, and `magic` names the machine rather than a mode. It exists because a constructor that
+   performs 10.1.14's `? Get(newTarget, "prototype")` from C runs the page's getter below the live flow. */
+static JSValue JS_NewGlobalCConstructorStep(JSContext *ctx, const char *name, int length,
+                                            JSValueConst proto, int stepid)
+{
+    JSValue func_obj = JS_NewCFunctionMagic(ctx, NULL, name, length, JS_CFUNC_step_ctor, stepid);
+    JS_NewGlobalCConstructor2(ctx, func_obj, name, proto);
+    return func_obj;
+}
+
 static JSValue JS_NewGlobalCConstructorMagic(JSContext *ctx, const char *name,
                                              JSCFunctionMagic *func, int length,
                                              JSValueConst proto, int magic)
@@ -65121,6 +65133,19 @@ static int js_finrec_ctor_precheck(JSContext *ctx, const JSStepHdr *h);
 static JSValue js_finrec_ctor_body(JSContext *ctx, JSValueConst obj_, int argc, JSValueConst *argv);
 static const JSTrampStepDef js_weakref_ctor_def =
     CREATECTOR_DEF_FULL(JS_CLASS_WEAK_REF, 1, generic, js_weakref_ctor_body, 0, js_weakref_ctor_precheck);
+/* DisposableStack / AsyncDisposableStack. js_disposable_stack_constructor performed 10.1.14's
+   `? Get(newTarget, "prototype")` with js_create_from_ctor from C, so a getter or a Proxy trap on a subclass's
+   prototype ran below the live flow — the same read the TypedArray view constructor's conversion built
+   step_proto_from_ctor_run for. Nothing new is built here: js_creatector_step IS OrdinaryCreateFromConstructor,
+   and this is a DECLARATION of it. Two defs because the class id rides `arg`. */
+static int js_disposable_ctor_precheck(JSContext *ctx, const JSStepHdr *h);
+static JSValue js_disposable_ctor_body(JSContext *ctx, JSValueConst obj_, int argc, JSValueConst *argv);
+static const JSTrampStepDef js_disposable_ctor_def =
+    CREATECTOR_DEF_FULL(JS_CLASS_DISPOSABLE_STACK, 0, generic, js_disposable_ctor_body, 0,
+                        js_disposable_ctor_precheck);
+static const JSTrampStepDef js_async_disposable_ctor_def =
+    CREATECTOR_DEF_FULL(JS_CLASS_ASYNC_DISPOSABLE_STACK, 0, generic, js_disposable_ctor_body, 0,
+                        js_disposable_ctor_precheck);
 static const JSTrampStepDef js_finrec_ctor_def =
     CREATECTOR_DEF_FULL(JS_CLASS_FINALIZATION_REGISTRY, 1, generic, js_finrec_ctor_body, 0,
                         js_finrec_ctor_precheck);
@@ -66763,6 +66788,8 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_ORDINARY_HAS_INSTANCE] = &js_ordinary_hasinst_def,
     [STEPDEF_DISPOSE_SYNC] = &js_dispose_sync_def,
     [STEPDEF_MAP_FOREACH] = &js_map_foreach_def,
+    [STEPDEF_DISPOSABLE_CTOR] = &js_disposable_ctor_def,
+    [STEPDEF_ASYNC_DISPOSABLE_CTOR] = &js_async_disposable_ctor_def,
     [STEPDEF_SET_FOREACH] = &js_set_foreach_def,
     [STEPDEF_DISPOSE_ASYNC] = &js_dispose_async_def,
     [STEPDEF_OBJ_TOSTRING]   = &js_obj_tostring_def,
@@ -79183,20 +79210,24 @@ static JSValue js_get_dispose_method(JSContext *ctx, JSValueConst value, int hin
     return method;
 }
 
-static JSValue js_disposable_stack_constructor(JSContext *ctx,
-                                               JSValueConst new_target,
-                                               int argc, JSValueConst *argv,
-                                               int class_id)
+static int js_disposable_ctor_precheck(JSContext *ctx, const JSStepHdr *h)
 {
-    JSDisposableStack *s;
-    JSValue obj;
+    /* 27.3.2.1 step 1 / 27.4.2.1 step 1: NewTarget undefined means the CALL form, which these constructors
+       reject before anything is created — and therefore before the `prototype` read. */
+    if (JS_IsUndefined(h->this_val)) {
+        JS_ThrowTypeError(ctx, "Constructor requires 'new'");
+        return -1;
+    }
+    return 0;
+}
 
-    if (JS_IsUndefined(new_target))
-        return JS_ThrowTypeError(ctx, "Constructor requires 'new'");
-    obj = js_create_from_ctor(ctx, new_target, class_id);
-    if (JS_IsException(obj))
-        return JS_EXCEPTION;
-    s = js_mallocz(ctx, sizeof(*s));
+/* Steps 3-4: the created object gets its [[DisposeCapability]]. The class id is already baked into `obj`.
+   The body CONSUMES the object js_creatector_step created — its return value IS the machine's result, so a
+   js_dup here leaks the step's own reference on every construction (the gc_obj_list walk caught exactly that). */
+static JSValue js_disposable_ctor_body(JSContext *ctx, JSValueConst obj_, int argc, JSValueConst *argv)
+{
+    JSValue obj = (JSValue)obj_;
+    JSDisposableStack *s = js_mallocz(ctx, sizeof(*s));
     if (!s) {
         JS_FreeValue(ctx, obj);
         return JS_EXCEPTION;
@@ -81796,10 +81827,9 @@ int JS_AddIntrinsicPromise(JSContext *ctx)
     JS_SetPropertyFunctionList(ctx, ctx->class_proto[JS_CLASS_ASYNC_DISPOSABLE_STACK],
                                js_async_disposable_stack_proto_funcs,
                                countof(js_async_disposable_stack_proto_funcs));
-    JS_NewGlobalCConstructorMagic(ctx, "AsyncDisposableStack",
-                                  js_disposable_stack_constructor, 0,
-                                  ctx->class_proto[JS_CLASS_ASYNC_DISPOSABLE_STACK],
-                                  JS_CLASS_ASYNC_DISPOSABLE_STACK);
+    JS_NewGlobalCConstructorStep(ctx, "AsyncDisposableStack", 0,
+                                 ctx->class_proto[JS_CLASS_ASYNC_DISPOSABLE_STACK],
+                                 STEPDEF_ASYNC_DISPOSABLE_CTOR);
     return 0;
 }
 
@@ -83788,10 +83818,9 @@ int JS_AddIntrinsicBaseObjects(JSContext *ctx)
     JS_SetPropertyFunctionList(ctx, ctx->class_proto[JS_CLASS_DISPOSABLE_STACK],
                                js_disposable_stack_proto_funcs,
                                countof(js_disposable_stack_proto_funcs));
-    JS_NewGlobalCConstructorMagic(ctx, "DisposableStack",
-                                  js_disposable_stack_constructor, 0,
-                                  ctx->class_proto[JS_CLASS_DISPOSABLE_STACK],
-                                  JS_CLASS_DISPOSABLE_STACK);
+    JS_NewGlobalCConstructorStep(ctx, "DisposableStack", 0,
+                                 ctx->class_proto[JS_CLASS_DISPOSABLE_STACK],
+                                 STEPDEF_DISPOSABLE_CTOR);
 
     /* global properties */
     ctx->eval_obj = JS_GetProperty(ctx, ctx->global_obj, JS_ATOM_eval);
