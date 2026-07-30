@@ -19721,7 +19721,7 @@ enum { TPR_NONE = 0, TPR_ARITH_AFTER_LEFT, TPR_ARITH_AFTER_RIGHT, TPR_ADD_AFTER_
        TPR_PROPKEY, TPR_PROPKEY2, TPR_IN, TPR_DELETE, TPR_GET_ARRAY_EL, TPR_GET_ARRAY_EL2,
        TPR_GET_SUPER, TPR_PUT_SUPER, TPR_DEFINE_METHOD, TPR_PUT_ARRAY_EL_KEY, TPR_PUT_ARRAY_EL_VAL,
        TPR_UNARY_AFTER_COERCE, TPR_LOGIC_AFTER_LEFT, TPR_LOGIC_AFTER_RIGHT, TPR_CMP_AFTER_COERCE,
-       TPR_IMPORT };
+       TPR_IMPORT, TPR_UNARY_LOC_AFTER_COERCE };
 typedef struct JSToPrim {
     JSValue obj;              /* the object being coerced (owned) */
     const uint8_t *op_byte;   /* the opcode's own byte, RESTORED (not re-executed) so a resumed site can read the
@@ -27042,6 +27042,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (rat == TPR_LOGIC_AFTER_RIGHT) goto do_logic_after_right;
                         if (rat == TPR_CMP_AFTER_COERCE) goto do_cmp_after_coerce;
                         if (rat == TPR_IMPORT) goto do_import_after_spec;
+                        if (rat == TPR_UNARY_LOC_AFTER_COERCE) goto do_unary_loc_after_coerce;
                         if (rat == TPR_ARITH_AFTER_RIGHT) goto do_arith_after_right;
                         DFAIL("an operand-mode ToPrimitive completed with no resume point — the coercion site "
                               "must set tp_resume_at to a label placed immediately after it");
@@ -35237,24 +35238,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (JS_VALUE_GET_TAG(op1) == JS_TAG_OBJECT || JS_VALUE_GET_TAG(op2) == JS_TAG_OBJECT) {
                         tp_slot = (JS_VALUE_GET_TAG(op1) == JS_TAG_OBJECT) ? -2 : -1;
                         tp_hint = HINT_NONE;
-                        tp_op_byte = pc - 1;
+                        /* OP_add is one byte; OP_add_loc carries its local index, so its own byte is one
+                           further back. Both are read from the bytecode, not carried in a C local. */
+                        tp_op_byte = (opcode == OP_add_loc) ? pc - 2 : pc - 1;
                         tp_resume_at = TPR_ADD_AFTER_COERCE;
                         goto do_toprim_tramp;
                     }
                     if (js_add_slow(ctx, sp))
                         goto exception;
                     sp--;
+                    if (opcode == OP_add_loc) {
+                        /* `x += v` on a local: the sum is transferred out of the stack slot into the local,
+                           whose index is pc[-1] for the same reason the operator is pc[-2]. */
+                        set_value(ctx, &var_buf[pc[-1]], sp[-1]);
+                        sp--;
+                    }
                 }
             }
             BREAK;
         CASE(OP_add_loc):
             {
                 JSValue *pv;
-                int idx;
-                idx = *pc;
+                pv = &var_buf[*pc];
                 pc += 1;
-
-                pv = &var_buf[idx];
                 if (likely(JS_VALUE_IS_BOTH_INT(*pv, sp[-1]))) {
                     int64_t r;
                     r = (int64_t)JS_VALUE_GET_INT(*pv) +
@@ -35264,32 +35270,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     else
                         *pv = js_int32(r);
                     sp--;
-                } else if (JS_VALUE_GET_TAG(*pv) == JS_TAG_STRING) {
-                    JSValue op1;
-                    op1 = sp[-1];
-                    sp--;
-                    sf->cur_pc = pc;
-                    op1 = JS_ToPrimitiveFree(ctx, op1, HINT_NONE);
-                    if (JS_IsException(op1))
-                        goto exception;
-                    op1 = JS_ConcatString(ctx, js_dup(*pv), op1);
-                    if (JS_IsException(op1))
-                        goto exception;
-                    set_value(ctx, pv, op1);
-                } else {
-                    JSValue ops[2];
-                    /* In case of exception, js_add_slow frees ops[0]
-                       and ops[1], so we must duplicate *pv */
-                    sf->cur_pc = pc;
-                    ops[0] = js_dup(*pv);
-                    ops[1] = sp[-1];
-                    sp--;
-                    if (js_add_slow(ctx, ops + 2))
-                        goto exception;
-                    set_value(ctx, pv, ops[0]);
+                    BREAK;
                 }
+                /* `x += v` on a local ran BOTH of 13.15.3's ToPrimitives from C — the string arm called
+                   JS_ToPrimitiveFree directly and the general arm handed js_add_slow a two-element `ops` array
+                   in the C FRAME — so a valueOf with a loop in it preempted in an activation with no flow base,
+                   and a C-frame operand could not have been parked anyway. The local's value becomes the LEFT
+                   operand on the real operand stack and the operator's own shared coercion takes it from there;
+                   the string arm goes with it, because js_add_slow concatenates a string left operand by the
+                   same 13.15.3 steps and running the general path is not a fallback, it is the operation. */
+                sp[0] = sp[-1];
+                sp[-1] = js_dup(*pv);
+                sp++;
+                sf->cur_pc = pc;
+                goto do_add_after_coerce;
             }
-            BREAK;
         CASE(OP_sub):
             {
                 JSValue op1, op2;
@@ -35606,60 +35601,41 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
         CASE(OP_inc_loc):
-            {
-                JSValue op1;
-                JSValue *pv;
-                int val;
-                int idx;
-                idx = *pc;
-                pc += 1;
-
-                pv = &var_buf[idx];
-                op1 = *pv;
-                if (JS_VALUE_GET_TAG(op1) == JS_TAG_INT) {
-                    val = JS_VALUE_GET_INT(op1);
-                    if (unlikely(val == INT32_MAX))
-                        goto inc_loc_slow;
-                    *pv = js_int32(val + 1);
-                } else {
-                inc_loc_slow:
-                    sf->cur_pc = pc;
-                    /* must duplicate otherwise the variable value may
-                       be destroyed before JS code accesses it */
-                    op1 = js_dup(op1);
-                    if (js_unary_arith_slow(ctx, &op1 + 1, OP_inc))
-                        goto exception;
-                    set_value(ctx, pv, op1);
-                }
-            }
-            BREAK;
         CASE(OP_dec_loc):
             {
-                JSValue op1;
                 JSValue *pv;
                 int val;
-                int idx;
-                idx = *pc;
+                pv = &var_buf[*pc];
                 pc += 1;
-
-                pv = &var_buf[idx];
-                op1 = *pv;
-                if (JS_VALUE_GET_TAG(op1) == JS_TAG_INT) {
-                    val = JS_VALUE_GET_INT(op1);
-                    if (unlikely(val == INT32_MIN))
-                        goto dec_loc_slow;
-                    *pv = js_int32(val - 1);
-                } else {
-                dec_loc_slow:
-                    sf->cur_pc = pc;
-                    /* must duplicate otherwise the variable value may
-                       be destroyed before JS code accesses it */
-                    op1 = js_dup(op1);
-                    if (js_unary_arith_slow(ctx, &op1 + 1, OP_dec))
-                        goto exception;
-                    set_value(ctx, pv, op1);
+                if (JS_VALUE_GET_TAG(*pv) == JS_TAG_INT) {
+                    val = JS_VALUE_GET_INT(*pv);
+                    if (likely(opcode == OP_inc_loc ? val != INT32_MAX : val != INT32_MIN)) {
+                        *pv = js_int32(opcode == OP_inc_loc ? val + 1 : val - 1);
+                        BREAK;
+                    }
+                }
+                /* `++x` on a local holding an OBJECT is 13.4.4.1's ToNumeric, which is the page's
+                   valueOf/@@toPrimitive — and this pair ran it through js_unary_arith_slow over `&op1 + 1`, a
+                   one-element stack in the C FRAME. That is why they were the two unary operators the tramp
+                   never reached: a C-frame operand cannot survive a suspension, so a loop in that valueOf
+                   preempted in an activation with no flow base. The value goes on the real operand stack
+                   instead, where the family's coercion can park it. */
+                *sp++ = js_dup(*pv);
+                sf->cur_pc = pc;
+                if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) {
+                    tp_slot = -1; tp_hint = HINT_NUMBER; tp_op_byte = pc - 2;
+                    tp_resume_at = TPR_UNARY_LOC_AFTER_COERCE;
+                    goto do_toprim_tramp;
                 }
             }
+        do_unary_loc_after_coerce:
+            /* THE RESUME POINT. Neither the local's INDEX nor the operator is carried in a C local: `pc` is
+               restored from sf->cur_pc and points past the operand byte on both entries, so the index is
+               pc[-1] and the opcode byte pc[-2] — read from the bytecode, which is what it is for. */
+            if (js_unary_arith_slow(ctx, sp, opcode == OP_inc_loc ? OP_inc : OP_dec))
+                goto exception;
+            set_value(ctx, &var_buf[pc[-1]], sp[-1]);   /* the result is transferred out of the stack slot */
+            sp--;
             BREAK;
         CASE(OP_not):
             {
