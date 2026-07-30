@@ -18811,6 +18811,21 @@ static bool needs_backtrace(JSValue exc)
    proxies and step machines are all trampolined too (do_generator_tramp, js_tramp_proxy_*,
    do_step_tramp); what is left on the recursive path is a callee with NO preemptible body — a plain C function,
    which has nothing to suspend. */
+/* Release what a TrampFrame OWNS before it is freed. Only the callee can be owned, and only on the
+   owned-invocation-list call path (see owns_func) — every other field is borrowed from the caller. Written once
+   so a new teardown site cannot silently skip it. */
+/* Every TrampFrame is born HERE so `owns_func` can never be a stale malloc byte. An uninitialised one makes the
+   teardown free a random JSValue — a segfault far from the allocation, in a directory that passed under ASan at
+   -O0 and crashed at -O1, which is the signature of reading uninitialised memory rather than freed memory. Nine
+   allocation sites is nine chances to forget; one constructor is none. */
+#define TRAMP_FRAME_RELEASE(rt_, tf_) do { \
+        if (unlikely((tf_)->owns_func)) { \
+            (tf_)->owns_func = 0; \
+            JS_FreeValueRT((rt_), (tf_)->sf.cur_func); \
+            (tf_)->sf.cur_func = JS_UNDEFINED; \
+        } \
+    } while (0)
+
 typedef struct TrampFrame {
     JSStackFrame sf;                 /* the callee's own frame (heap-resident) */
     JSFunctionBytecode *b;
@@ -18835,6 +18850,13 @@ typedef struct TrampFrame {
     int call_first;                  /* first caller-stack slot to free on return: -1 call, -2 method */
     int call_argc;
     uint8_t is_tail;
+    /* Normally the frame BORROWS its callee: the caller's operand owns it for the whole call. An OWNED
+       invocation list (a bound or spread call, whose [this, f, args...] lives on the heap) is released the
+       moment the args are copied out, so on that one path there is no such owner and the frame takes a
+       reference of its own — without it `sf->cur_func` dangles for the rest of the call, and the resume path
+       reads its var_refs out of freed memory (ASan: heap-use-after-free at the frame rebuild, reached the
+       moment an async-from-sync method call arrived through a resumed request). */
+    uint8_t owns_func;
     /* the CALLEE's own interpreter locals (for deep-preempt resume — the caller's are above). */
     JSValueConst this_val, new_target;
     int arg_allocated, callee_argc;
@@ -18881,6 +18903,14 @@ typedef struct TrampFrame {
     void *cont_state;
     uint8_t cont_kind;   /* CONT_NONE / CONT_STEP / … */
 } TrampFrame;
+
+static TrampFrame *tramp_frame_new(JSRuntime *rt)
+{
+    TrampFrame *tf = js_malloc_rt(rt, sizeof(TrampFrame));
+    if (likely(tf != NULL))
+        tf->owns_func = 0;   /* the ONE field whose default has to be right at birth; the rest each site assigns */
+    return tf;
+}
 
 #define CONT_NONE          0
 /* 1, 2, 6 and 7 were CONT_ARRAY_ITER / CONT_ARRAY_REDUCE / CONT_SORT / CONT_JSON_REVIVE — one continuation kind
@@ -21134,7 +21164,8 @@ typedef struct JSAsyncFromSync {
        read them with JS_GetProperty from C. They are requests now, one phase each, and the
        result parks here across them. */
     JSValue res_obj;             /* the sync iterator result being unpacked (owned) */
-    uint8_t res_ph;              /* 0 = none, 1 = the `done` read is in flight, 2 = the `value` read is */
+    uint8_t res_ph;              /* 0 = none, 1 = the `done` read is in flight, 2 = the `value` read is,
+                                    3 = 27.1.4.4/.5's GetMethod of the sync iterator's own return/throw is */
     uint8_t res_done;            /* what the `done` read produced, held across the `value` read */
     void *call_outer;            /* AFS_DELIVER_CALL: the machine or sequence WAITING for this call's result — the
                                     wrapper's method is an ordinary callee at do_generic_callee, so whoever made
@@ -21142,6 +21173,12 @@ typedef struct JSAsyncFromSync {
                                     (CONT_ITER_CLOSE_CALL). Dropping it pushed the promise as a bare operand and
                                     freed the caller's operands against the wrong shape. NULL otherwise. */
     uint8_t call_outer_kind;     /* CONT_* of `call_outer`, CONT_NONE when there is none */
+    uint8_t iter_magic;          /* GEN_MAGIC_NEXT / _RETURN / _THROW: WHICH of the wrapper's three operations is
+                                    running. A C local until the GetMethod below became a request — and a
+                                    suspension erases C locals, so the phase that resumes has to read it here.
+                                    It was recoverable by inverting close_on_rejection, which is a coincidence of
+                                    that flag's definition and not a contract; re-deriving state instead of
+                                    carrying it is the mistake tp_op_byte's stale-pointer segfault taught. */
     uint8_t close_then_typeerror; /* 27.1.4.2.4 step 7: `.throw()` on a sync iterator with no `throw` closes it
                                      under a NORMAL completion (so the close's OWN throw is what rejects — step
                                      7d is an IfAbruptRejectPromise) and only then rejects with a fresh TypeError.
@@ -24435,7 +24472,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 size_t asize = sizeof(JSValue) * TRAMP_FRAME_SLOTS(narg_alloc, nb)
                              + sizeof(JSVarRef *) * nb->var_ref_count;
                 TrampFrame *ntf; JSValue *nlb, *narg_buf, *nvar_buf, *nstack_buf; JSStackFrame *nsf; int k;
-                ntf = js_malloc_rt(rt, sizeof(TrampFrame));
+                ntf = tramp_frame_new(rt);
                 if (unlikely(!ntf)) { JS_ThrowOutOfMemory(ctx); goto exception; }
                 nlb = js_malloc_rt(rt, asize ? asize : sizeof(JSValue));
                 if (unlikely(!nlb)) { js_free_rt(rt, ntf); JS_ThrowOutOfMemory(ctx); goto exception; }
@@ -24453,7 +24490,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 ntf->b = nb; ntf->ctx = nb->realm; ntf->local_buf = nlb;
                 nsf = &ntf->sf;
                 nsf->is_strict_mode = nb->is_strict_mode;
-                nsf->cur_func = unsafe_unconst(nfunc);
+                /* An OWNED invocation list is released a few lines below, and on the bound/spread path it is the
+                   SOLE owner of the callee — call_argv points into it and call_argv[-1] IS nfunc. Every other
+                   call shape leaves the callee on the caller's operand stack, which owns it for the whole call.
+                   So on that one path the frame takes its own reference; borrowing left sf->cur_func dangling
+                   for the rest of the call, and the frame rebuild read np->u.func.var_refs out of freed memory. */
+                ntf->owns_func = (call_args_owned != NULL);
+                nsf->cur_func = ntf->owns_func ? js_dup(nfunc) : unsafe_unconst(nfunc);
                 nsf->arg_count = eff_argc;
                 if (narg_alloc) {
                     int n = min_int(eff_argc, narg_alloc);
@@ -25259,7 +25302,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 cs->super_ref = con_super_ref; cs->from_super = con_from_super;
                 cs->outer = con_outer; cs->outer_kind = con_outer_kind;
                 con_outer = NULL; con_outer_kind = CONT_NONE;   /* read + reset: never leak onto the body's own constructs */
-                ntf = js_malloc_rt(rt, sizeof(TrampFrame));
+                ntf = tramp_frame_new(rt);
                 if (unlikely(!ntf)) { free_arg_list(ctx, con_args_owned, con_argc); con_args_owned = NULL; JS_FreeValue(ctx, cthis); JS_FreeValue(ctx, con_super_ref); js_free_rt(rt, cs); JS_ThrowOutOfMemory(ctx); goto exception; }
                 nlb = js_malloc_rt(rt, asize ? asize : sizeof(JSValue));
                 if (unlikely(!nlb)) { free_arg_list(ctx, con_args_owned, con_argc); con_args_owned = NULL; JS_FreeValue(ctx, cthis); JS_FreeValue(ctx, con_super_ref); js_free_rt(rt, cs); js_free_rt(rt, ntf); JS_ThrowOutOfMemory(ctx); goto exception; }
@@ -25283,6 +25326,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 ntf->b = nb; ntf->ctx = nb->realm; ntf->local_buf = nlb;
                 nsf = &ntf->sf;
                 nsf->is_strict_mode = nb->is_strict_mode;
+                ntf->owns_func = 0;   /* the constructor stays on the caller's stack for the whole construct */
                 nsf->cur_func = unsafe_unconst(nfunc);
                 nsf->arg_count = eff_argc;
                 if (narg_alloc) {
@@ -25479,7 +25523,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 narg_alloc = (eff_argc < nb->arg_count) ? nb->arg_count : eff_argc;   /* always own the args (in atab, not the stack) */
                 asize = sizeof(JSValue) * TRAMP_FRAME_SLOTS(narg_alloc, nb)
                       + sizeof(JSVarRef *) * nb->var_ref_count;
-                ntf = js_malloc_rt(rt, sizeof(TrampFrame));
+                ntf = tramp_frame_new(rt);
                 if (unlikely(!ntf)) { if (atab) free_arg_list(ctx, atab, alen); JS_ThrowOutOfMemory(ctx); goto exception; }
                 nlb = js_malloc_rt(rt, asize ? asize : sizeof(JSValue));
                 if (unlikely(!nlb)) { js_free_rt(rt, ntf); if (atab) free_arg_list(ctx, atab, alen); JS_ThrowOutOfMemory(ctx); goto exception; }
@@ -25496,6 +25540,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 ntf->b = nb; ntf->ctx = nb->realm; ntf->local_buf = nlb;
                 nsf = &ntf->sf;
                 nsf->is_strict_mode = nb->is_strict_mode;
+                ntf->owns_func = 0;   /* atab holds the ARGUMENTS; the callee is the caller's own operand */
                 nsf->cur_func = unsafe_unconst(nfunc);
                 narg_buf = nlb;
                 for (k = 0; k < eff_argc; k++) narg_buf[k] = js_dup(atab[k]);
@@ -28527,7 +28572,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                       if (gk == CONT_ITER_CLOSE) { cont_st = gouter0; goto do_iter_close_method; }
                       if (gk == CONT_PROMISE_ALL_RESOLVE) { cont_st = gouter0; goto do_promise_all_have_resolve; }
                       if (gk == CONT_PROMISE_ALL_THEN) { cont_st = gouter0; goto do_promise_all_attach_call; }
-                      if (gk == CONT_AFS_GET) { cont_st = gouter0; goto do_async_from_sync_step; }
+                      if (gk == CONT_AFS_GET) {
+                          cont_st = gouter0;
+                          /* 27.1.4.4/.5's GetMethod continues INSIDE the entry block, not at the step: the rest
+                             of that operation pushes the drive's operands onto THIS frame's stack, and the step
+                             label is a different point in the loop. Resuming there ran those pushes against a
+                             frame whose closure var_refs the return path then read as garbage — a segfault in
+                             OP_get_var_ref0, found by a fixture and by nothing in the corpus. */
+                          if (((JSAsyncFromSync *)gouter0)->res_ph == 3) goto do_afs_itercall_method;
+                          goto do_async_from_sync_step;
+                      }
                       if (gk == CONT_ITER_HELPER_GET) { cont_st = gouter0; goto do_iter_helper_step; }
                       if (gk == CONT_PROMISE_ALL_GET) { cont_st = gouter0; goto do_promise_all_step; }
                       if (gk == CONT_FOROF_UNPACK) { cont_st = gouter0; goto do_forof_unpack_step; }
@@ -30054,6 +30108,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSAsyncFromSyncIteratorData *ws = wp->u.async_from_sync_iterator_data;
                 JSAsyncFromSync *s = js_mallocz(ctx, sizeof(*s));
                 JSValue prom;
+                JSValue m;   /* the sync iterator's own return/throw, once its request has answered */
                 if (unlikely(!s)) { JS_ThrowOutOfMemory(ctx); goto exception; }
                 prom = JS_NewPromiseCapability(ctx, s->resolving_funcs);
                 if (JS_IsException(prom)) { js_free_rt(rt, s); goto exception; }
@@ -30088,6 +30143,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    iterator to close, so neither step 6 nor step 14 may close it again. .next()/.throw() pass
                    true. AFS_DELIVER_CLOSE is OP_iterator_close driving the wrapper's own .return(). */
                 s->close_on_rejection = !(afs_itercall && afs_iter_magic == GEN_MAGIC_RETURN);
+                s->iter_magic = (uint8_t)afs_iter_magic;
                 /* CONSUME the pending call shape — the CALL entry must not assume [this, f, args] on the caller's
                    stack. 7.4.9's unwind close builds an OWNED list instead and declares (0, 0), because the
                    exception path has no headroom to push into; hardcoding -2 there freed two slots BELOW the
@@ -30101,14 +30157,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     /* 27.1.4.4 / .5: .return(v) and .throw(v) do NOT reuse [[NextMethod]] — they GetMethod the SYNC
                        iterator's own `return`/`throw` first, and an ABSENT one settles without any drive at all
                        (return resolves {value:v,done:true}; throw closes the sync iterator and rejects with a
-                       TypeError). The whole operation lives here, so the read happens EXACTLY once — probing it at
-                       the opcode to decide whether to route would have run a getter twice. */
-                    JSValue m = JS_GetProperty(ctx, s->sync_iter,
-                                               afs_iter_magic == GEN_MAGIC_RETURN ? JS_ATOM_return : JS_ATOM_throw);
-                    if (JS_IsException(m)) goto do_afs_itercall_reject;
+                       TypeError). That read is the PAGE's code on an accessor, so it is the machine's own
+                       request; the operation continues at do_afs_itercall_method with the method in hand. The
+                       read still happens EXACTLY once — probing it at the opcode to decide whether to route would
+                       have run a getter twice. */
+                    s->res_ph = 3;
+                    sf->cur_pc = pc;   /* the read can SUSPEND, so the frame must name where it continues */
+                    gp_outer = s; gp_outer_kind = CONT_AFS_GET;
+                    gp_obj = s->sync_iter;
+                    gp_atom = afs_iter_magic == GEN_MAGIC_RETURN ? JS_ATOM_return : JS_ATOM_throw;
+                    gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                    gp_recv = JS_UNINITIALIZED; gp_no_throw = 0;
+                    goto do_getprop_tramp;
+
+                do_afs_itercall_method:
+                    /* THE RESUME POINT. Every C local the entry had is gone, so the operation reads its identity
+                       off the state (s->iter_magic) — the reason that field exists. `s` and `m` are re-derived
+                       from the continuation the delivery hands back. */
+                    s = (JSAsyncFromSync *)cont_st;
+                    m = ret_val; ret_val = JS_UNDEFINED;
+                    s->res_ph = 0;
                     if (JS_IsUndefined(m) || JS_IsNull(m)) {
                         JS_FreeValue(ctx, m);
-                        if (afs_iter_magic == GEN_MAGIC_RETURN) {
+                        if (s->iter_magic == GEN_MAGIC_RETURN) {
                             ret_val = js_create_iterator_result(ctx, js_dup(s->drive_arg), true);
                             if (JS_IsException(ret_val)) goto do_afs_itercall_reject;
                             cont_st = s;
@@ -30123,11 +30194,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         cont_st = s;
                         goto do_afs_park_close;
                     }
-                    if (tramp_gen_method_magic(m, s->sync_iter) == afs_iter_magic) {
+                    if (tramp_gen_method_magic(m, s->sync_iter) == s->iter_magic) {
                         JS_FreeValue(ctx, m);   /* the built-in: drive the generator body on the tramp */
                         tramp_cont_state = s; tramp_cont_kind = CONT_ASYNC_FROM_SYNC; tramp_gen_cont_iter = s->sync_iter;
                         tramp_gen_cont_arg = JS_IsUninitialized(s->drive_arg) ? JS_UNDEFINED : s->drive_arg;
-                        tramp_gen_cont_consume = 1; tramp_gen_magic = afs_iter_magic;
+                        tramp_gen_cont_consume = 1; tramp_gen_magic = s->iter_magic;
                         goto do_generator_tramp;
                     }
                     /* every OTHER return/throw — a plain object's, a replaced one on a generator, a bound or
@@ -30138,6 +30209,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     {
                         DCHECK(sp + 3 <= TRAMP_SP_LIMIT(sf),
                                "async-from-sync return/throw drive: operand push exceeds the frame's compiled stack_size");
+                        sf->cur_pc = pc;
                         *sp++ = js_dup(s->sync_iter);   /* this */
                         *sp++ = m;                      /* the method, owned -> transferred to the operand */
                         call_argv = sp; call_argc = 0; tramp_first = -2; tramp_is_tail = 0;
@@ -30579,7 +30651,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (ainit) { JS_FreeValue(ctx, aprom); js_async_function_free(rt, as); goto exception; }
                 }
                 as->is_active = true;
-                atf = js_malloc_rt(rt, sizeof(TrampFrame));
+                atf = tramp_frame_new(rt);
                 if (unlikely(!atf)) { JS_FreeValue(ctx, aprom); js_async_function_free(rt, as); JS_ThrowOutOfMemory(ctx); goto exception; }
                 atf->up = tf_top;
                 atf->caller_sf = sf; atf->caller_b = b; atf->caller_ctx = ctx;
@@ -30665,6 +30737,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    caller frame from atf (NOT sf->prev_frame, which would be a use-after-free of the freed async frame;
                    the async frame's prev_frame IS atf->caller_sf, set when it was pushed). Free ONLY the TrampFrame. */
                 rt->current_stack_frame = atf->caller_sf;
+                TRAMP_FRAME_RELEASE(rt, atf);
                 tf_top = atf->up;
                 sf = atf->caller_sf; b = atf->caller_b; ctx = atf->caller_ctx;
                 local_buf = atf->caller_local_buf; stack_buf = atf->caller_stack_buf;
@@ -30947,7 +31020,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     BREAK;
                 }
                 gs->state = JS_GENERATOR_STATE_EXECUTING;
-                gtf = js_malloc_rt(rt, sizeof(TrampFrame));
+                gtf = tramp_frame_new(rt);
                 if (unlikely(!gtf)) { JS_ThrowOutOfMemory(ctx); goto exception; }
                 gtf->seq_req = NULL; gtf->seq_req_kind = CONT_NONE;   /* a DRIVE was not requested BY a call */
                 if (close) {
@@ -31081,6 +31154,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     gdone = true;
                 }
                 rt->current_stack_frame = gtf->caller_sf;
+                TRAMP_FRAME_RELEASE(rt, gtf);
                 tf_top = gtf->up;
                 sf = gtf->caller_sf; b = gtf->caller_b; ctx = gtf->caller_ctx;
                 local_buf = gtf->caller_local_buf; stack_buf = gtf->caller_stack_buf;
@@ -31201,7 +31275,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         goto exception;
                     }
                 }
-                atf2 = js_malloc_rt(rt, sizeof(TrampFrame));
+                atf2 = tramp_frame_new(rt);
                 if (unlikely(!atf2)) { js_async_generator_free(rt, s);
                                        js_create_requester_abandon(ctx, acreate_cont, acreate_cont_kind);
                                        JS_ThrowOutOfMemory(ctx); goto exception; }
@@ -31344,7 +31418,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             if (!js_async_generator_pre(ctx, agen_s))
                 goto do_agen_drive_finish;
             {
-                TrampFrame *dtf3 = js_malloc_rt(rt, sizeof(TrampFrame));
+                TrampFrame *dtf3 = tramp_frame_new(rt);
                 JSStackFrame *dsf3; JSObject *dfp3; JSFunctionBytecode *db3;
                 if (unlikely(!dtf3)) { JS_FreeValue(ctx, agen_hold); JS_FreeValue(ctx, agen_prom); JS_ThrowOutOfMemory(ctx); goto exception; }
                 dtf3->seq_req = NULL; dtf3->seq_req_kind = CONT_NONE;   /* a DRIVE was not requested BY a call */
@@ -31531,7 +31605,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         free_generator_stack_rt(rt, s); js_free_rt(rt, s); GEN_CREATE_FAIL_FREE_CONT(); goto exception;
                     }
                 }
-                gtf = js_malloc_rt(rt, sizeof(TrampFrame));
+                gtf = tramp_frame_new(rt);
                 if (unlikely(!gtf)) { free_generator_stack_rt(rt, s); js_free_rt(rt, s); GEN_CREATE_FAIL_FREE_CONT(); JS_ThrowOutOfMemory(ctx); goto exception; }
                 #undef GEN_CREATE_FAIL_FREE_CONT
                 gtf->async_promise = js_dup(gfunc);   /* held for js_create_from_ctor at initial_yield */
@@ -31605,6 +31679,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 sf->cur_pc = pc; sf->cur_sp = sp;   /* suspend at initial_yield (state stays SUSPENDED_START) */
                 obj = js_create_from_ctor(ctx, gfunc, JS_CLASS_GENERATOR);   /* uses the ctor's realm */
                 rt->current_stack_frame = gtf->caller_sf;
+                TRAMP_FRAME_RELEASE(rt, gtf);
                 tf_top = gtf->up;
                 sf = gtf->caller_sf; b = gtf->caller_b; ctx = gtf->caller_ctx;
                 local_buf = gtf->caller_local_buf; stack_buf = gtf->caller_stack_buf;
@@ -31658,6 +31733,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 for (pval = local_buf; pval < sp; pval++) JS_FreeValue(ctx, *pval);
                 js_free_rt(rt, local_buf);
                 rt->current_stack_frame = sf->prev_frame;
+                TRAMP_FRAME_RELEASE(rt, rtf);
                 tf_top = rtf->up;
                 sf = rtf->caller_sf; b = rtf->caller_b; ctx = rtf->caller_ctx;
                 local_buf = rtf->caller_local_buf; stack_buf = rtf->caller_stack_buf;
@@ -31793,7 +31869,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         cont_st = gouter;
                         /* the UNPACK, not the deliver: the deliver's own head drops the DRIVE's operands and this
                            request is not that call. Re-entering it would drop them a second time, with a stale
-                           shape — the sp drift ASan caught. The phase on the state says which read this answers. */
+                           shape — the sp drift ASan caught. The phase on the state says which read this answers,
+                           and 27.1.4.4/.5's GetMethod continues inside the ENTRY block instead — this is the
+                           SUSPENDED delivery, and patching only the in-place one left an accessor `return` (a
+                           bytecode getter, so it always suspends) resuming in the wrong phase and never
+                           settling. */
+                        if (((JSAsyncFromSync *)gouter)->res_ph == 3) goto do_afs_itercall_method;
                         goto do_async_from_sync_step;
                     }
                     if (gouter_kind == CONT_ITER_FROM_NEXT_GET) {
@@ -36729,6 +36810,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         if (creating) js_free_rt(rt, gtf->gen_data);   /* not yet owned by a generator object -> free the orphan */
         JS_FreeValue(ctx, ghold);   /* drop the held ref (creating: the function; running: the generator object) */
         rt->current_stack_frame = gtf->caller_sf;
+        TRAMP_FRAME_RELEASE(rt, gtf);
         tf_top = gtf->up;
         sf = gtf->caller_sf; b = gtf->caller_b; ctx = gtf->caller_ctx;
         local_buf = gtf->caller_local_buf; stack_buf = gtf->caller_stack_buf;
@@ -36822,6 +36904,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         for (pval = local_buf; pval < sp; pval++) JS_FreeValue(ctx, *pval);
         js_free_rt(rt, local_buf);
         rt->current_stack_frame = sf->prev_frame;
+        TRAMP_FRAME_RELEASE(rt, rtf);
         tf_top = rtf->up;
         sf = rtf->caller_sf; b = rtf->caller_b; ctx = rtf->caller_ctx;
         local_buf = rtf->caller_local_buf; stack_buf = rtf->caller_stack_buf;
@@ -38023,6 +38106,10 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
         if (!ct) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }   /* OOM: partial leak on the abort path */
         ca[i] = ct;
         *ct = *otf;   /* scalars + BORROWED values (cur_func/this_val/new_target stay borrowed); fix pointers below */
+        /* ...except an OWNED callee: the struct copy duplicates the FLAG, so the clone must duplicate the
+           REFERENCE too or both frames release the same one. */
+        if (ct->owns_func)
+            ct->sf.cur_func = js_dup(ct->sf.cur_func);
         DCHECK(otf->cont_kind != CONT_AGEN_DRIVE,
                "clone_deep_flow: a concolic fork inside an ASYNC GENERATOR body on the tramp — the sibling needs "
                "its OWN JSAsyncGeneratorData (cloned body frame, fresh queue and settlement capability), like the "
