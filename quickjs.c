@@ -1574,7 +1574,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_ATOMICS_ADD, STEPDEF_ATOMICS_AND, STEPDEF_ATOMICS_OR, STEPDEF_ATOMICS_SUB,
     STEPDEF_ATOMICS_XOR, STEPDEF_ATOMICS_EXCHANGE, STEPDEF_ATOMICS_CMPXCHG, STEPDEF_ATOMICS_LOAD,
     STEPDEF_ATOMICS_STORE, STEPDEF_ATOMICS_ISLOCKFREE, STEPDEF_ATOMICS_WAIT, STEPDEF_ATOMICS_NOTIFY,
-    STEPDEF_PROMISE_THEN,
+    STEPDEF_PROMISE_THEN, STEPDEF_PROMISE_WITHRESOLVERS,
     STEPDEF_SYMBOL_CTOR, STEPDEF_ERROR_TOSTRING,
     STEPDEF_MAP_UPSERT, STEPDEF_MAP_UPSERT_COMPUTED,
     STEPDEF_WEAKMAP_UPSERT, STEPDEF_WEAKMAP_UPSERT_COMPUTED,
@@ -16896,56 +16896,11 @@ static void js_itercall_deliver(JSContext *ctx, JSValue *sp, JSValue ret_val)
    a second construction site is a second chance to forget. Consumes `method`. */
 static JSValue js_new_sync_dispose_wrapper(JSContext *ctx, JSValue method);
 
-static __exception int js_op_using_check(JSContext *ctx, JSValueConst val,
-                                         int hint, JSValue *pmethod)
-{
-    JSValue method;
-    bool is_sync_fallback = false;
-
-    *pmethod = JS_UNDEFINED;
-    if (JS_IsNull(val) || JS_IsUndefined(val))
-        return 0;
-    if (!JS_IsObject(val)) {
-        JS_ThrowTypeErrorNotAnObject(ctx);
-        return -1;
-    }
-    if (hint == 1) {
-        method = JS_GetProperty(ctx, val, JS_ATOM_Symbol_asyncDispose);
-        if (JS_IsException(method))
-            return -1;
-        if (JS_IsUndefined(method) || JS_IsNull(method)) {
-            JS_FreeValue(ctx, method);
-            method = JS_GetProperty(ctx, val, JS_ATOM_Symbol_dispose);
-            if (JS_IsException(method))
-                return -1;
-            is_sync_fallback = true;
-        }
-    } else {
-        method = JS_GetProperty(ctx, val, JS_ATOM_Symbol_dispose);
-        if (JS_IsException(method))
-            return -1;
-    }
-    if (JS_IsUndefined(method) || JS_IsNull(method)) {
-        JS_ThrowTypeError(ctx, "value is not disposable");
-        return -1;
-    }
-    if (!JS_IsFunction(ctx, method)) {
-        JS_FreeValue(ctx, method);
-        JS_ThrowTypeError(ctx, "dispose method is not a function");
-        return -1;
-    }
-    if (is_sync_fallback) {
-        JSValueConst data[1];
-        JSValue wrapped;
-        data[0] = method;
-        wrapped = js_new_sync_dispose_wrapper(ctx, method);
-        if (JS_IsException(wrapped))
-            return -1;
-        method = wrapped;
-    }
-    *pmethod = method;
-    return 0;
-}
+/* DELETED: js_op_using_check. 27.3.1.1 GetDisposeMethod is one or two ordinary [[Get]]s on a value the page
+   supplies, so each is an accessor or a Proxy trap away from being the page's code — and this ran them with
+   JS_GetProperty from C, below the live flow, which is what Symbol.asyncDispose-getter.js reached. The reads are
+   requests at do_using_check_read now; everything else the helper did (the null/undefined skip, the two
+   TypeErrors, the sync-fallback wrap) is at the opcode and its delivery, where the operand stack is. */
 
 static JSValue js_create_iterator_result(JSContext *ctx,
                                          JSValue val,
@@ -19383,6 +19338,20 @@ static bool promise_exec_ready(JSContext *ctx, JSValueConst *call_argv, int call
                                   returns a rejected promise, never raises) — the same shape as the executor. */
 #define CONT_PROMISE_TRY_SETTLE 39  /* cont_state = JSPromiseTry: the capability's resolve(value), which a
                                        subclass may have wrapped in its own bytecode. */
+#define CONT_USING_GET     71  /* gp_outer = JSUsingCheck: `using`/`await using`'s GetDisposeMethod — the
+                                  @@asyncDispose read, its @@dispose fallback, and the plain sync read. All three
+                                  are the page's code (an accessor, a Proxy trap) and js_op_using_check performed
+                                  them with JS_GetProperty from C, so a getter with a loop in it had no flow base. */
+typedef struct JSUsingCheck {
+    JSValue val;      /* the disposable (owned) */
+    uint8_t ph;       /* 1 = the @@asyncDispose read is in flight, 2 = the @@dispose read is */
+    uint8_t fallback; /* 1 = this @@dispose read is the ASYNC hint's fallback, so the method gets wrapped */
+} JSUsingCheck;
+#define CONT_PROMISE_ALL_SETTLE 70 /* cont_state = JSPromiseAll: the AGGREGATE capability's reject(error). The
+                                      capability is NewPromiseCapability(C) with C the `this` value, so a subclass
+                                      supplies its own resolving functions and this is the page's bytecode — three
+                                      sites settled it with a JS_Call from C, which is the whole of Promise's
+                                      remaining drive-to-completion. ONE settle now, the way Promise.try has one. */
 #define CONT_ASYNC_SETTLE  40  /* cont_state = JSAsyncSettle: an async body that completed ON THE TRAMP CHAIN
                                   settling its promise. The resolving function is page code — a subclass's, or
                                   the native one whose `Get(resolution,"then")` on a thenable RESULT is a request
@@ -20460,6 +20429,8 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_AGEN_SETTLE:
     case CONT_ASYNC_SETTLE:
     case CONT_PROMISE_TRY_SETTLE:
+    case CONT_PROMISE_ALL_SETTLE:
+    case CONT_USING_GET:
     case CONT_PROMISE_CAP:
     case CONT_PROMISE_TRY:
     case CONT_STEP:
@@ -24915,6 +24886,48 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 goto do_generic_callee;
             }
 
+        do_promise_all_settle:
+            /* THE ONE PLACE A COMBINATOR'S AGGREGATE IS REJECTED. 27.2.4.1's IfAbruptRejectPromise is reached
+               three ways — GetIterator/`next` threw during the acquire, the setup (GetPromiseResolve, the values
+               array) failed, and a post-retrieval throw after its IfAbruptCloseIterator — and each of them called
+               reject with a JS_Call from C. `Promise.all.call(SubClass, x)` makes that reject the SUBCLASS's own
+               bytecode, so a loop in it had no flow base; and three copies of the push are three chances to
+               disagree about what is on the stack. Entered with the throw LIVE and the state in cont_st; the
+               original combinator operands are still on the caller's stack and the settle's three go above them.
+               A throwing reject propagates (IfAbruptRejectPromise's Call is a ? step), which the unwind arm owes. */
+            {
+                JSPromiseAll *ps = (JSPromiseAll *)cont_st;
+                JSValue err = JS_GetException(ctx);
+                DCHECK(sp + 3 <= TRAMP_SP_LIMIT(sf),
+                       "combinator settle: operand push exceeds the frame's compiled stack_size");
+                *sp++ = JS_UNDEFINED;                          /* this */
+                *sp++ = js_dup(ps->resolving_funcs[1]);
+                *sp++ = err;                                   /* the reason (owned, transferred) */
+                call_argv = sp - 1; call_argc = 1; tramp_first = -2; tramp_is_tail = 0;
+                tramp_cont_state = ps; tramp_cont_kind = CONT_PROMISE_ALL_SETTLE;
+                goto do_generic_callee;
+            }
+
+        do_promise_all_settled:
+            /* reject returned (its result is discarded): release the state and yield the AGGREGATE, popping the
+               original combinator operands. The settle call's own were dropped by whichever delivery got here. */
+            {
+                JSPromiseAll *ps = (JSPromiseAll *)cont_st;
+                JSValue r = js_dup(ps->result_promise);
+                int cfirst = ps->orig_cfirst, cargc = ps->orig_cargc;
+                uint8_t itail = ps->orig_is_tail;
+                JSValue *cargv;
+                cont_st = NULL;
+                JS_FreeValue(ctx, ret_val);
+                js_promise_all_end(ctx, ps); js_free_rt(rt, ps);
+                cargv = sp - cargc;
+                for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
+                sp += cfirst - cargc;
+                if (itail) { ret_val = r; goto do_return; }
+                *sp++ = r;
+            }
+            BREAK;
+
         do_promise_try_settled:
             /* resolve returned (its result is discarded): release the state and yield the promise, popping the
                ORIGINAL Promise.try operands. ret_val is resolve's result and `sp` is already back to those
@@ -26088,6 +26101,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         cont_st = dcs;
                         goto do_async_settled;
                     }
+                    if (dck == CONT_PROMISE_ALL_SETTLE) {
+                        /* a C reject (the native capability's) called in place. */
+                        JSValue *cargv;
+                        int pop, first;
+                        TAKE_CALL_SHAPE(); pop = call_pop; first = call_first_r;
+                        cargv = sp - pop;
+                        for (i = first; i < pop; i++) JS_FreeValue(ctx, cargv[i]);
+                        sp += first - pop;
+                        if (unlikely(JS_IsException(ret_val))) {
+                            js_promise_all_end(ctx, (JSPromiseAll *)dcs); js_free_rt(rt, dcs);
+                            goto exception;
+                        }
+                        cont_st = dcs;
+                        goto do_promise_all_settled;
+                    }
                     if (dck == CONT_PROMISE_TRY_SETTLE) {
                         /* a C resolve (the native capability's) called in place. */
                         JSValue *cargv;
@@ -26544,6 +26572,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             ret_val = r;
                             cont_st = souter;
                             goto do_async_settled;
+                        }
+                        if (souter_kind == CONT_PROMISE_ALL_SETTLE) {
+                            /* the machine WAS the aggregate capability's reject — the native resolving function
+                               is one. Its operands are already dropped, which is what the settled label expects. */
+                            ret_val = r;
+                            cont_st = souter;
+                            goto do_promise_all_settled;
                         }
                         if (souter_kind == CONT_PROMISE_TRY_SETTLE) {
                             /* the machine WAS the capability's resolve or reject. A NATIVE promise's resolving
@@ -28618,6 +28653,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                       if (gk == CONT_ITER_HELPER_GET) { cont_st = gouter0; goto do_iter_helper_step; }
                       if (gk == CONT_PROMISE_ALL_GET) { cont_st = gouter0; goto do_promise_all_step; }
                       if (gk == CONT_FOROF_UNPACK) { cont_st = gouter0; goto do_forof_unpack_step; }
+                      if (gk == CONT_USING_GET) { cont_st = gouter0; goto do_using_check_step; }
                       DCHECK(gk == CONT_STEP, "property-get outer continuation: unknown machine kind"); }
                     goto do_step_step;
                 }
@@ -28939,6 +28975,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (gouter) { cont_st = gouter; goto do_iter_close_finish; }
                         goto exception;
                     }
+                    if (gk3 == CONT_USING_GET) {
+                        /* a dispose-method getter that threw IN PLACE (a C getter, a revoked proxy). Nothing is
+                           pushed and the throw propagates, exactly as the suspended abandon does it. */
+                        JSUsingCheck *uc3 = gouter;
+                        JS_FreeValue(ctx, uc3->val);
+                        js_free_rt(rt, uc3);
+                        goto exception;
+                    }
                     DCHECK(gk3 == CONT_STEP, "property-get outer continuation: unknown machine kind");
                     if (((JSStepHdr *)gouter)->def->catches_abrupt) {
                         step_hdr_request_abandon(ctx, (JSStepHdr *)gouter);
@@ -29244,17 +29288,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     gp_obj = ps->iter; gp_atom = JS_ATOM_next; gp_op = GP_GET; gp_val = JS_UNDEFINED;
                     goto do_getprop_tramp;
                 consume_deliver_pa_reject:
-                    /* GetIterator / next lookup threw: Promise.all REJECTS its aggregate and yields it (never propagates). */
-                    err = JS_GetException(ctx);
-                    rr = JS_Call(ctx, ps->resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
-                    JS_FreeValue(ctx, err); JS_FreeValue(ctx, rr);
-                    r = js_dup(ps->result_promise);
-                    cf = ps->orig_cfirst; cg = ps->orig_cargc; itl = ps->orig_is_tail;
-                    js_promise_all_end(ctx, ps); js_free_rt(rt, ps);
-                    { JSValue *cv = sp - cg; for (i = cf; i < cg; i++) JS_FreeValue(ctx, cv[i]); sp += cf - cg; }
-                    if (itl) { ret_val = r; goto do_return; }
-                    *sp++ = r;
-                    BREAK;
+                    /* GetIterator / next lookup threw: Promise.all REJECTS its aggregate and yields it (never
+                       propagates). The reject is a SUBCLASS's bytecode when C is one, so it goes to the one
+                       settle rather than being called from here. */
+                    cont_st = ps;
+                    goto do_promise_all_settle;
                 }
             }
 
@@ -29911,14 +29949,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        value (resolve-not-callable-reject-with-typeerror). */
                     if (JS_IsUninitialized(rt->current_exception))
                         JS_ThrowTypeError(ctx, "Promise resolve is not a function");
-                    JSValue err = JS_GetException(ctx), rr;
                     JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED;
-                    rr = JS_Call(ctx, s->resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
-                    JS_FreeValue(ctx, err); JS_FreeValue(ctx, rr);
-                    { JSValue r = js_dup(s->result_promise); int cf = s->orig_cfirst, cg = s->orig_cargc; uint8_t it = s->orig_is_tail;
-                      js_promise_all_end(ctx, s); js_free_rt(rt, s);
-                      JSValue *cv = sp - cg; for (i = cf; i < cg; i++) JS_FreeValue(ctx, cv[i]); sp += cf - cg;
-                      if (it) { ret_val = r; goto do_return; } *sp++ = r; BREAK; }
+                    cont_st = s;
+                    goto do_promise_all_settle;
                 }
                 tramp_consume_iterable = s->acq_iterable;   /* borrowed from the STATE, which outlives the acquire */
                 tramp_consume_state = s; tramp_consume_kind = CONT_PROMISE_ALL;
@@ -31889,7 +31922,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            || gouter_kind == CONT_PROMISE_ALL_THEN || gouter_kind == CONT_AFS_GET
                            || gouter_kind == CONT_PROMISE_ALL_RESOLVE
                            || gouter_kind == CONT_ITER_HELPER_GET || gouter_kind == CONT_PROMISE_ALL_GET
-                           || gouter_kind == CONT_FOROF_UNPACK || gouter_kind == CONT_FOR_IN_HAS
+                           || gouter_kind == CONT_FOROF_UNPACK || gouter_kind == CONT_USING_GET
+                           || gouter_kind == CONT_FOR_IN_HAS
                            || gouter_kind == CONT_OWNKEYS_CHK || gouter_kind == CONT_PROXY_INV
                            || gouter_kind == CONT_KEYED_INV || gouter_kind == CONT_WITH_HAS
                            || gouter_kind == CONT_SET_RECV || gouter_kind == CONT_TOPRIM_GET
@@ -31911,6 +31945,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         js_getprop_free(ctx, gp);
                         cont_st = gouter;
                         goto do_forof_unpack_step;
+                    }
+                    if (gouter_kind == CONT_USING_GET) {
+                        js_getprop_free(ctx, gp);
+                        cont_st = gouter;
+                        goto do_using_check_step;
                     }
                     if (gouter_kind == CONT_PROMISE_ALL_GET) {
                         js_getprop_free(ctx, gp);
@@ -32653,6 +32692,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp += dlv_cfirst - dlv_cargc;
                     cont_st = dlv_cs;
                     goto do_async_settled;
+                } else if (dlv_ck == CONT_PROMISE_ALL_SETTLE) {
+                    /* a BYTECODE reject (a subclass's) returned — the case the JS_Call could never park. */
+                    JSValue *scargv = sp - dlv_cargc;
+                    for (i = dlv_cfirst; i < dlv_cargc; i++) JS_FreeValue(ctx, scargv[i]);
+                    sp += dlv_cfirst - dlv_cargc;
+                    cont_st = dlv_cs;
+                    goto do_promise_all_settled;
                 } else if (dlv_ck == CONT_PROMISE_TRY_SETTLE) {
                     JSValue *scargv = sp - dlv_cargc;
                     for (i = dlv_cfirst; i < dlv_cargc; i++) JS_FreeValue(ctx, scargv[i]);
@@ -34214,17 +34260,71 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         CASE(OP_using_check):
+            /* 27.3.1.1 GetDisposeMethod + 14.6's "is not disposable". The value's own reads are REQUESTS, so a
+               `get [Symbol.dispose]()` with a loop in it parks like any other page code. `sp` does not move
+               across them — the disposable stays at sp[-1] and the method is pushed by the delivery — so the
+               operand shape is valid over a suspension. */
             {
                 int hint = pc[0];
-                JSValue method;
+                JSUsingCheck *uc;
                 pc += 1;
                 sf->cur_pc = pc;
-                if (js_op_using_check(ctx, sp[-1], hint, &method))
-                    goto exception;
-                sp[0] = method;
-                sp++;
+                if (JS_IsNull(sp[-1]) || JS_IsUndefined(sp[-1])) { *sp++ = JS_UNDEFINED; BREAK; }
+                if (!JS_IsObject(sp[-1])) { JS_ThrowTypeErrorNotAnObject(ctx); goto exception; }
+                uc = js_malloc_rt(rt, sizeof(*uc));
+                if (unlikely(!uc)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                uc->val = js_dup(sp[-1]);
+                uc->ph = (hint == 1) ? 1 : 2;
+                uc->fallback = 0;
+                cont_st = uc;
             }
-            BREAK;
+            /* fall through */
+        do_using_check_read:
+            {
+                JSUsingCheck *uc = (JSUsingCheck *)cont_st;
+                gp_outer = uc; gp_outer_kind = CONT_USING_GET;
+                gp_obj = uc->val;
+                gp_atom = (uc->ph == 1) ? JS_ATOM_Symbol_asyncDispose : JS_ATOM_Symbol_dispose;
+                gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                goto do_getprop_tramp;
+            }
+
+        do_using_check_step:
+            /* ret_val = whichever read just answered; the phase says which. */
+            {
+                JSUsingCheck *uc = (JSUsingCheck *)cont_st;
+                JSValue method = ret_val;
+                ret_val = JS_UNDEFINED;
+                if (uc->ph == 1 && (JS_IsUndefined(method) || JS_IsNull(method))) {
+                    /* step 1.b: no @@asyncDispose, so @@dispose is read instead and its method WRAPPED, because
+                       an async disposal must await what a sync method returns. */
+                    JS_FreeValue(ctx, method);
+                    uc->ph = 2; uc->fallback = 1;
+                    goto do_using_check_read;
+                }
+                cont_st = NULL;
+                if (JS_IsUndefined(method) || JS_IsNull(method)) {
+                    JS_ThrowTypeError(ctx, "value is not disposable");
+                    goto using_check_throw;
+                }
+                if (!JS_IsFunction(ctx, method)) {
+                    JS_FreeValue(ctx, method);
+                    JS_ThrowTypeError(ctx, "dispose method is not a function");
+                    goto using_check_throw;
+                }
+                if (uc->fallback) {
+                    method = js_new_sync_dispose_wrapper(ctx, method);   /* consumes it */
+                    if (unlikely(JS_IsException(method))) goto using_check_throw;
+                }
+                JS_FreeValue(ctx, uc->val);
+                js_free_rt(rt, uc);
+                *sp++ = method;
+                BREAK;
+            using_check_throw:
+                JS_FreeValue(ctx, uc->val);
+                js_free_rt(rt, uc);
+                goto exception;
+            }
 
         CASE(OP_iterator_next):
             /* stack: iter_obj next catch_offset val */
@@ -37079,6 +37179,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             js_free_rt(rt, ass);
             xcs = NULL;
             goto exception;
+        } else if (xck == CONT_PROMISE_ALL_SETTLE) {
+            /* the aggregate capability's reject THREW. IfAbruptRejectPromise's Call is a `?` step, so the throw
+               propagates rather than settling anything; the state can never be reached again. Its operands are on
+               the caller stack and the caller's own catch-search frees them, like any method call. */
+            js_promise_all_end(ctx, (JSPromiseAll *)xcs); js_free_rt(rt, xcs);
+            xcs = NULL;
+            goto exception;
         } else if (xck == CONT_PROMISE_TRY_SETTLE) {
             /* the capability's resolve THREW. 27.2.6's Call is a `?` step, so the throw propagates rather than
                settling anything; the state can never be reached again. Its operands are on the caller stack and
@@ -37118,10 +37225,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    || gk2 == CONT_PROMISE_ALL_THEN || gk2 == CONT_AFS_GET
                    || gk2 == CONT_PROMISE_ALL_RESOLVE
                    || gk2 == CONT_ITER_HELPER_GET || gk2 == CONT_PROMISE_ALL_GET
-                   || gk2 == CONT_FOROF_UNPACK || gk2 == CONT_CONSUME_NEXT_GET
+                   || gk2 == CONT_FOROF_UNPACK || gk2 == CONT_USING_GET || gk2 == CONT_CONSUME_NEXT_GET
                    || gk2 == CONT_PROMISE_ALL_NEXT_GET || gk2 == CONT_ITER_FROM_NEXT_GET,
                    "property-get outer continuation: unknown machine kind");
             js_getprop_free(ctx, gp);
+            if (gouter && gk2 == CONT_USING_GET) {
+                /* a dispose-method getter threw: nothing is pushed and the throw propagates, which is what the
+                   `?` in GetDisposeMethod's steps says. */
+                JSUsingCheck *uc2 = gouter;
+                JS_FreeValue(ctx, uc2->val);
+                js_free_rt(rt, uc2);
+                goto exception;
+            }
             if (gouter && gk2 == CONT_FOROF_UNPACK) {
                 /* the protocol tail's read threw: the loop's enum_rec must not be closed (the iterator has
                    already stepped), which is what clearing the slot says, and the throw propagates. */
@@ -37426,25 +37541,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         do_promise_all_reject:
             /* IfAbruptRejectPromise: the aggregate is REJECTED and yielded; the throw never propagates. Reached
                directly when there was nothing to close, and from do_iter_close_finish once there was. */
-            {
-                JSPromiseAll *ps2 = (JSPromiseAll *)cont_st;
-                JSValue err = JS_GetException(ctx), rr;
-                JSValue r = js_dup(ps2->result_promise);
-                int cfirst = ps2->orig_cfirst, cargc = ps2->orig_cargc;
-                uint8_t itail = ps2->orig_is_tail;
-                JSValue *cargv;
-                rr = JS_Call(ctx, ps2->resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
-                JS_FreeValue(ctx, err);
-                js_promise_all_end(ctx, ps2); js_free_rt(rt, ps2);
-                cargv = sp - cargc;
-                for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
-                sp += cfirst - cargc;
-                if (unlikely(JS_IsException(rr))) { JS_FreeValue(ctx, r); JS_FreeValue(ctx, rr); goto exception; }
-                JS_FreeValue(ctx, rr);
-                if (itail) { ret_val = r; goto do_return; }
-                *sp++ = r;
-                BREAK;
-            }
+            goto do_promise_all_settle;
         } else if (xck == CONT_STEP && ((JSStepHdr *)xcs)->def->catches_abrupt) {
             /* The machine's algorithm CATCHES this call's abrupt completion instead of propagating it —
                DisposeResources keeps disposing and folds the throw into a SuppressedError, the way 16.2.1.8 folds
@@ -68129,6 +68226,7 @@ static const JSTrampStepDef js_promise_catch_def = {
 static const JSTrampStepDef js_promise_finally_def;
 /* likewise .then, whose PerformPromiseThen lives there. */
 static const JSTrampStepDef js_promise_then_def;
+static const JSTrampStepDef js_promise_withresolvers_def;
 /* likewise the Map upsert machine, defined with the map code it mutates. */
 static int js_map_upsert_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_map_upsert_fini(JSContext *ctx, void *st, bool take_result);
@@ -68212,6 +68310,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_PROMISE_CATCH]         = &js_promise_catch_def,
     [STEPDEF_PROMISE_FINALLY]       = &js_promise_finally_def,
     [STEPDEF_PROMISE_THEN]          = &js_promise_then_def,
+    [STEPDEF_PROMISE_WITHRESOLVERS] = &js_promise_withresolvers_def,
     [STEPDEF_MAP_UPSERT]            = &js_map_upsert_def,
     [STEPDEF_MAP_UPSERT_COMPUTED]   = &js_map_upsert_comp_def,
     [STEPDEF_WEAKMAP_UPSERT]        = &js_weakmap_upsert_def,
@@ -82264,40 +82363,67 @@ static JSValue js_promise_resolve_native(JSContext *ctx, JSValueConst ctor,
     return result_promise;
 }
 
-static JSValue js_promise_withResolvers(JSContext *ctx, JSValueConst this_val,
-                                        int argc, JSValueConst *argv)
+/* 27.2.4.9 Promise.withResolvers as a STEP MACHINE. Its one page-visible step is NewPromiseCapability(C), whose
+   Construct is a SUBCLASS CONSTRUCTOR — bytecode — and js_new_promise_capability ran it with JS_CallConstructor
+   from C, so `class P extends Promise { constructor(e){ super(e); while(...); } }; P.withResolvers()` drove that
+   body to completion below a live flow. The capability is a request; everything after it (three
+   CreateDataProperty writes onto a fresh ordinary object) invokes nothing. */
+typedef struct JSPromiseWithResolvers {
+    JSStepHdr hdr;         /* MUST be first */
+    JSValue result;        /* owned: the { promise, resolve, reject } object */
+} JSPromiseWithResolvers;
+_Static_assert(offsetof(JSPromiseWithResolvers, hdr) == 0,
+               "JSStepHdr must be first in JSPromiseWithResolvers");
+
+static int js_promise_withresolvers_step(JSContext *ctx, void *st, JSValue cb_result,
+                                         JSValue **out_cb, int *out_argc)
 {
-    JSValue result_promise, resolving_funcs[2], obj;
-    if (!JS_IsObject(this_val))
-        return JS_ThrowTypeErrorNotAnObject(ctx);
-    result_promise = js_new_promise_capability(ctx, resolving_funcs, this_val);
-    if (JS_IsException(result_promise))
-        return JS_EXCEPTION;
+    JSPromiseWithResolvers *s = st;
+    JSValue obj;
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result);
+        s->result = JS_UNDEFINED;
+        /* step 1: NewPromiseCapability's own "C is not a constructor" comes from the request; this is
+           withResolvers' receiver check, which the spec performs first. */
+        if (!JS_IsObject(s->hdr.this_val)) { JS_ThrowTypeErrorNotAnObject(ctx); return -1; }
+        s->hdr.stage = 1;
+        s->result = js_dup(s->hdr.this_val);   /* the request BORROWS cb[0]; the machine holds the reference */
+        *out_cb = &s->result; *out_argc = 0;
+        return 16;   /* CAPABILITY */
+    }
+    DCHECK(s->hdr.stage == 1, "Promise.withResolvers resumed in an unknown stage");
+    JS_FreeValue(ctx, cb_result);
+    JS_FreeValue(ctx, s->result); s->result = JS_UNDEFINED;
     obj = JS_NewObject(ctx);
-    if (JS_IsException(obj))
-        goto exception;
-    if (JS_DefinePropertyValue(ctx, obj, JS_ATOM_promise, result_promise,
-                               JS_PROP_C_W_E) < 0) {
-        goto exception;
+    if (JS_IsException(obj)) return -1;
+    /* steps 3-5. The record is TAKEN off the header: the header holds one capability and this is its consumer. */
+    if (JS_DefinePropertyValue(ctx, obj, JS_ATOM_promise, s->hdr.cap_promise, JS_PROP_C_W_E) < 0) {
+        s->hdr.cap_promise = JS_UNDEFINED; JS_FreeValue(ctx, obj); return -1;
     }
-    result_promise = JS_UNDEFINED;
-    if (JS_DefinePropertyValue(ctx, obj, JS_ATOM_resolve, resolving_funcs[0],
-                               JS_PROP_C_W_E) < 0) {
-        goto exception;
+    s->hdr.cap_promise = JS_UNDEFINED;
+    if (JS_DefinePropertyValue(ctx, obj, JS_ATOM_resolve, s->hdr.cap_funcs[0], JS_PROP_C_W_E) < 0) {
+        s->hdr.cap_funcs[0] = JS_UNDEFINED; JS_FreeValue(ctx, obj); return -1;
     }
-    resolving_funcs[0] = JS_UNDEFINED;
-    if (JS_DefinePropertyValue(ctx, obj, JS_ATOM_reject, resolving_funcs[1],
-                               JS_PROP_C_W_E) < 0) {
-        goto exception;
+    s->hdr.cap_funcs[0] = JS_UNDEFINED;
+    if (JS_DefinePropertyValue(ctx, obj, JS_ATOM_reject, s->hdr.cap_funcs[1], JS_PROP_C_W_E) < 0) {
+        s->hdr.cap_funcs[1] = JS_UNDEFINED; JS_FreeValue(ctx, obj); return -1;
     }
-    return obj;
-exception:
-    JS_FreeValue(ctx, resolving_funcs[0]);
-    JS_FreeValue(ctx, resolving_funcs[1]);
-    JS_FreeValue(ctx, result_promise);
-    JS_FreeValue(ctx, obj);
-    return JS_EXCEPTION;
+    s->hdr.cap_funcs[1] = JS_UNDEFINED;
+    s->result = obj;
+    return 0;
 }
+
+static JSValue js_promise_withresolvers_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSPromiseWithResolvers *s = st;
+    JSValue r = take_result ? s->result : (JS_FreeValue(ctx, s->result), JS_UNDEFINED);
+    js_free_rt(ctx->rt, s);
+    return r;
+}
+
+static const JSTrampStepDef js_promise_withresolvers_def = {
+    sizeof(JSPromiseWithResolvers), js_promise_withresolvers_step, js_promise_withresolvers_fini, 0
+};
 
 static JSValue js_promise_try(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv)
@@ -83156,7 +83282,7 @@ static const JSCFunctionListEntry js_promise_funcs[] = {
     JS_CFUNC_MAGIC_DEF("any", 1, js_promise_all, PROMISE_MAGIC_any ),
     JS_CFUNC_DEF("try", 1, js_promise_try ),   /* declared a machine in JS_AddIntrinsicPromise */
     JS_CFUNC_DEF("race", 1, js_promise_race ),
-    JS_CFUNC_DEF("withResolvers", 0, js_promise_withResolvers ),
+    JS_CFUNC_STEP_DEF("withResolvers", 0, STEPDEF_PROMISE_WITHRESOLVERS ),
     JS_CGETSET_DEF("[Symbol.species]", js_get_this, NULL),
 };
 
