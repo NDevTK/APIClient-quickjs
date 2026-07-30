@@ -21620,11 +21620,19 @@ static void js_ownkeys_chk_free(JSContext *ctx, struct JSOwnKeysChk *ok)
 }
 
 /* Turn an engine-built key ARRAY into an atom snapshot. It reads nothing of the page's: every [[OwnPropertyKeys]]
-   answer is an array THIS engine built, of Strings and Symbols the invariant has already validated. */
+   answer is an array THIS engine built, of Strings and Symbols the invariant has already validated — and that is
+   ASSERTED rather than said, because it is the whole reason this may read `length` and every element from C. The
+   moment a caller hands it a page array (a Proxy `ownKeys` trap result BEFORE 10.5.11's own
+   CreateListFromArrayLike, say) the reads become the page's code and the list has to be built on the tramp. */
 static int js_ownkeys_atoms(JSContext *ctx, JSValueConst arr, JSPropertyEnum **ptab, uint32_t *plen)
 {
     uint32_t n = 0, i;
     JSPropertyEnum *tab = NULL;
+    uint32_t fastn = 0;
+    DCHECK(arg_list_is_fast(ctx, arr, &fastn),
+           "an [[OwnPropertyKeys]] snapshot was handed a list this engine did not build — its `length` and elements "
+           "are then the page's code and it needs CONT_ARG_LIST, not a C loop");
+    (void)fastn;
     if (js_get_length32(ctx, &n, arr))
         return -1;
     if (n) {
@@ -23990,24 +23998,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_forward_call;
                 }
                 if (tramp_is_function_apply(call_argv[-1])) {   /* target kind is NOT a call-site question */
-                    /* only when arr is undefined/null (0 args) or an object (array-like); a primitive arr must
-                       throw a realm-correct TypeError from the C js_function_apply BEFORE the target runs.
-                       NAMED, and the reason this route still stands: it collects with build_arg_list from C, so
-                       an array-like whose `length` or element getter LOOPS preempts here while the same source
-                       through a bound `.apply` collects on the tramp in the machine. Deleting the route is the
-                       fix — the machine builds its own argument block, which is the only thing the route existed
-                       for — but doing so sends a CONSUMER target (Reflect.apply(Array.from, …)) into
-                       do_consumer_dispatch from a SEQUENCE's call, which assumes caller-stack operands and says
-                       so by name.
-                       That capability is now MOSTLY built. A consume state adopts the requester through
-                       CONSUME_ADOPT_SHAPE, and a sequence's call reaches the consumer recognizers at all —
-                       do_cont_dispatch jumped PAST them to do_generic_callee, so a sequence was the one spelling
-                       that never asked, and `Set.prototype.isSubsetOf.apply(s, [t])` hit the consume builtin's
-                       own DFAIL. Deleting this route and Reflect.apply's takes ten aborting fixtures to two, and
-                       both are the same remaining case: `.apply` whose TARGET is a generator or async-generator
-                       method (`g.next.apply(g, [])`), which returns through the bodyless-callee delivery carrying
-                       a caller-stack shape it does not own. That drive needs the cont-consume shape the
-                       operator's own generator-via-apply reshape hands it, and then both routes go. */
+                    /* only when arr is undefined/null (0 args) or an object (array-like); a primitive arr is
+                       19.2.3.1 step 2's TypeError, which the opcode's residue below raises in spec order.
+                       THIS ROUTE IS THE INTENDED DESIGN, not a debt: `.apply` is CALL-SITE-RESOLVED, so the
+                       operator resolves it and trampolines the ultimate target with no C round-trip, exactly as
+                       `.call` and the spread are. The note that used to stand here said the opposite — that the
+                       route only survived because it collected with build_arg_list from C and that deleting it
+                       was the fix. That debt is DISCHARGED: do_apply_tramp reads its list through CONT_ARG_LIST,
+                       so an array-like whose `length` or element getter loops now suspends here exactly as it does
+                       in the machine, and the two spellings no longer differ. A comment that keeps advertising a
+                       fixed defect sends the next reader to delete the wrong thing. */
                     JSValueConst aa = (call_argc >= 2) ? call_argv[1] : JS_UNDEFINED;
                     int atag = JS_VALUE_GET_TAG(aa);
                     if (atag == JS_TAG_UNDEFINED || atag == JS_TAG_NULL || atag == JS_TAG_OBJECT) {
@@ -24030,9 +24030,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 if (tramp_is_reflect_apply(call_argv[-1]) && call_argc >= 3
                     && JS_VALUE_GET_TAG(call_argv[2]) == JS_TAG_OBJECT) {   /* Reflect.apply(target, this, argsList) */
-                    /* Same standing gap as `.apply` above, and the same one fix: these two were one C body taking
-                       a magic and are one machine now, so this route is the machine's twin — kept only until a
-                       consumer target can be reached from a sequence's call. */
+                    /* The same call-site resolution as `.apply` above, for the same reason and through the same
+                       label — one operand shape apart. It is not the machine's twin: the machine answers the VALUE
+                       spelling (a bound Reflect.apply, a callback), this answers the operator, and both read their
+                       list through CONT_ARG_LIST. */
                     ap_func = call_argv[0]; ap_this = call_argv[1]; ap_array = call_argv[2];
                     ap_cfirst = -2; ap_cargc = call_argc;   /* operands [Reflect, apply, target, this, argsList] */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_apply_tramp;
