@@ -47728,6 +47728,7 @@ static JSResolveResultEnum js_resolve_export1(JSContext *ctx,
 {
     JSExportEntry *me;
 
+ again:
     *pmodule = NULL;
     *pme = NULL;
     if (find_resolve_entry(s, m, export_name) >= 0)
@@ -47751,8 +47752,14 @@ static JSResolveResultEnum js_resolve_export1(JSContext *ctx,
                 *pme = me;
                 return JS_RESOLVE_RES_FOUND;
             } else {
-                return js_resolve_export1(ctx, pmodule, pme, m1,
-                                          me->local_name, s);
+                /* An INDIRECT export forwards the whole resolution to another module — `export { v } from "m"` —
+                   and it did so with a TAIL call, so a chain of N re-exports was N C frames. A re-export chain is
+                   the page's data; its length is not the C stack's business, and 40000 of them segfaulted. The
+                   star-export case below is a real branching walk and stays recursive; this one is a loop.
+                   The resolve state `s` already carries the visited set, so the cycle guard is unaffected. */
+                m = m1;
+                export_name = me->local_name;
+                goto again;
             }
         }
     } else {
