@@ -20958,6 +20958,10 @@ typedef struct JSPromiseAll {
     uint8_t driving_next;        /* 1 while a .next() is being driven / its result extracted: the iterator has NOT
                                     yet successfully stepped, so an error here is an IteratorNext abrupt and must
                                     NOT close it (spec fail_reject, not fail_reject1). Cleared once value is in hand. */
+    uint8_t close_then_step;     /* 1 while IfAbruptCloseIterator runs ON THE CHAIN for the step-dispatch error
+                                    path. That path does not tear the machine down — it falls into the FINALIZE
+                                    drive — so the close owes a DIFFERENT continuation than the two that reach
+                                    do_promise_all_reject, and only the state can say which. */
     uint8_t iter_done;           /* 1 after {done:true}: the iterator is exhausted, so a finalize-stage error must
                                     NOT close it either. Only a post-retrieval error (resolve/attach) closes. */
     JSValue fin_arg;             /* the finalize argument (values dup / AggregateError), owned only in the brief
@@ -29611,7 +29615,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                either wrap the next value into Promise.resolve(v).then(resolve_element) and drive the next .next(), or
                finalize (decrement remainingElementsCount; resolve with `values` when it hits 0) and yield the promise. */
             {
-                JSPromiseAll *s = (JSPromiseAll *)cont_st;
+                JSPromiseAll *s = (JSPromiseAll *)cont_st;   /* re-derived at do_promise_all_finalize too */
                 int st;
                 if (unlikely(s->reattach_pending > 0 && !s->attaching)) {
                     /* freshly-forked sibling: re-attach the retained pre-fork element wrappers [0..reattach_pending)
@@ -29647,16 +29651,30 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (unlikely(st < 0)) {   /* an error: reject the aggregate, yield it (do not throw out of Promise.all) */
                 promise_all_err:;
                     JSValue err = JS_GetException(ctx);
-                    /* Close ONLY when an element was retrieved and a LATER stage (Constructor.resolve / attach)
-                       threw — spec fail_reject1. An IteratorNext abrupt (driving_next) or a finalize-stage throw
-                       (iter_done) leaves [[Done]] true, so no close (spec fail_reject). */
-                    if (!s->driving_next && !s->iter_done)
-                        JS_IteratorClose(ctx, s->iter, true);
                     /* reject(err) is USER bytecode for a custom Promise subclass — route it through the SAME tramp
                        finalize drive as resolve, so a looping reject parks instead of driving to completion. reject
                        is idempotent, so if it throws on the tramp the CONT_PROMISE_ALL exception arm's own reject is
                        a harmless second call (no re-loop). */
                     s->fin_arg = err; s->fin_is_reject = 1; s->finalizing = 1;
+                    /* Close ONLY when an element was retrieved and a LATER stage (Constructor.resolve / attach)
+                       threw — spec fail_reject1. An IteratorNext abrupt (driving_next) or a finalize-stage throw
+                       (iter_done) leaves [[Done]] true, so no close (spec fail_reject).
+                       ON THE CHAIN, like the other two sites: the `return` method is the page's code. The
+                       rejection is already parked in fin_arg, so the close carries NO saved exception and its own
+                       throw is discarded — which is 7.4.9 under an abrupt completion. */
+                    if (!s->driving_next && !s->iter_done) {
+                        JSIterClose *ce = js_malloc(ctx, sizeof(*ce));
+                        if (likely(ce != NULL)) {
+                            ce->iter = js_dup(s->iter);
+                            ce->saved_exc = JS_UNINITIALIZED;
+                            ce->outer = s; ce->outer_kind = CONT_PROMISE_ALL;
+                            s->close_then_step = 1;
+                            gp_obj = ce->iter; gp_atom = JS_ATOM_return; gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                            gp_outer = ce; gp_outer_kind = CONT_ITER_CLOSE;
+                            goto do_getprop_tramp;
+                        }
+                        JS_FreeValue(ctx, JS_GetException(ctx));   /* the OOM; the rejection still stands */
+                    }
                     st = 2;   /* fall through to the FINALIZE drive below, then DONE */
                 }
                 if (st == 7) {
@@ -29701,6 +29719,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto do_generic_callee;
                 }
                 if (st == 2) {
+                do_promise_all_finalize:
+                    /* `s` is RE-DERIVED, not inherited: the close-finish arm jumps in from outside this block, so
+                       the block's own local is indeterminate on that path. cont_st is what every entry sets. */
+                    s = (JSPromiseAll *)cont_st;
                     /* FINALIZE: call resolving_funcs[fin_is_reject](fin_arg) — the aggregate settle. A user
                        Promise subclass's resolve/reject is user code of ANY kind, so it goes to the convergence
                        point like every other call: "a native (C) resolve has no loop" was true of the native one
@@ -33651,6 +33673,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (!failed) JS_ThrowTypeError(ctx, "throw is not a method");
                     cont_st = co;
                     goto do_async_from_sync_abrupt;
+                }
+                if (co && ck == CONT_PROMISE_ALL && ((JSPromiseAll *)co)->close_then_step) {
+                    /* the STEP-dispatch error path asked for it: fin_arg and finalizing are already set, so the
+                       close's own completion is discarded and the FINALIZE DRIVE is resumed directly.
+                       NOT do_promise_all_step — `finalizing` makes that step return DONE at once, so re-entering
+                       it skips the settle and the aggregate never resolves. That mistake cost five tests and is
+                       why the drive carries a label of its own. */
+                    ((JSPromiseAll *)co)->close_then_step = 0;
+                    if (failed) JS_FreeValue(ctx, JS_GetException(ctx));
+                    cont_st = co;
+                    goto do_promise_all_finalize;
                 }
                 if (co && ck == CONT_PROMISE_ALL) {
                     /* the combinator asked for this close on its way to rejecting its aggregate. 7.4.9 has
