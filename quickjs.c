@@ -557,12 +557,13 @@ typedef enum {
     JS_AUTOINIT_ID_PROTOTYPE,
     JS_AUTOINIT_ID_MODULE_NS,
     JS_AUTOINIT_ID_PROP,
-    JS_AUTOINIT_ID_BYTECODE,
 } JSAutoInitIDEnum;
 
-enum {
-    JS_BUILTIN_ARRAY_FROMASYNC = 1,
-};
+/* DELETED: JS_AUTOINIT_ID_BYTECODE and JS_BUILTIN_ARRAY_FROMASYNC. Array.fromAsync was the last self-hosted
+   builtin — a compiled JS module read back with JS_ReadObject and EVALUATED FROM C on the first property read,
+   which is why the whole of built-ins/Array/fromAsync reported drive-to-completion without fromAsync's own body
+   ever appearing in a backtrace. It is now a step machine (js_array_fromasync_def), so nothing reaches this id
+   and the eval, the autoinit and the .js/.h pair go with it. */
 
 /* must be large enough to have a negligible runtime cost and small
    enough to call the interrupt callback often. */
@@ -599,6 +600,12 @@ struct JSContext {
        step machine there is nothing to run it from C. This is that algorithm as a callable the engine holds and
        never exposes, so the "call the algorithm" step is the same CALL request every other spelling issues. */
     JSValue regexp_builtin_exec;
+    /* 27.1.4.1 CreateAsyncFromSyncIterator step 3 is `! Get(asyncIterator, "next")` — infallible because the
+       object is a hidden intrinsic no page can reach. Performed as a real property read it was still a C-side
+       read of JS_ATOM_next, indistinguishable at the call site from a consumer running the iterator protocol
+       from C, which is the thing the ratchet exists to keep at zero. The method is the SAME object for every
+       wrapper in a realm, so the realm holds it and the AO hands back a complete Iterator Record. */
+    JSValue async_from_sync_next;
     JSValue promise_ctor;
     JSValue native_error_proto[JS_NATIVE_ERROR_COUNT];
     JSValue error_ctor;
@@ -1497,7 +1504,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_BIGINT_ASUINTN, STEPDEF_BIGINT_ASINTN,
     STEPDEF_OBJ_GOPD, STEPDEF_REFLECT_GOPD,
     STEPDEF_OBJ_VALUES, STEPDEF_OBJ_ENTRIES, STEPDEF_OBJ_ASSIGN, STEPDEF_OBJ_SPREAD,
-    STEPDEF_ARRAY_FLAT, STEPDEF_ARRAY_FLATMAP, STEPDEF_ARRAY_FROMLIKE, STEPDEF_ARRAY_WITH, STEPDEF_ARRAY_FILL, STEPDEF_ARRAY_COPYWITHIN, STEPDEF_BIGINT_CTOR, STEPDEF_TA_WITH, STEPDEF_TA_FILL, STEPDEF_TA_COPYWITHIN, STEPDEF_TA_INDEXOF, STEPDEF_TA_LASTINDEXOF, STEPDEF_TA_INCLUDES, STEPDEF_TA_SUBARRAY, STEPDEF_AB_SLICE, STEPDEF_AB_SLICE_IMM, STEPDEF_SAB_SLICE, STEPDEF_AB_CTOR, STEPDEF_SAB_CTOR, STEPDEF_AB_RESIZE, STEPDEF_SAB_GROW, STEPDEF_AB_TRANSFER, STEPDEF_AB_TRANSFER_IMM, STEPDEF_AB_TRANSFER_FIX, STEPDEF_DATAVIEW_CTOR, STEPDEF_DATE_TOJSON, STEPDEF_DATE_TOPRIM, STEPDEF_DATE_CTOR,
+    STEPDEF_ARRAY_FROMASYNC, STEPDEF_ARRAY_FLAT, STEPDEF_ARRAY_FLATMAP, STEPDEF_ARRAY_FROMLIKE, STEPDEF_ARRAY_WITH, STEPDEF_ARRAY_FILL, STEPDEF_ARRAY_COPYWITHIN, STEPDEF_BIGINT_CTOR, STEPDEF_TA_WITH, STEPDEF_TA_FILL, STEPDEF_TA_COPYWITHIN, STEPDEF_TA_INDEXOF, STEPDEF_TA_LASTINDEXOF, STEPDEF_TA_INCLUDES, STEPDEF_TA_SUBARRAY, STEPDEF_AB_SLICE, STEPDEF_AB_SLICE_IMM, STEPDEF_SAB_SLICE, STEPDEF_AB_CTOR, STEPDEF_SAB_CTOR, STEPDEF_AB_RESIZE, STEPDEF_SAB_GROW, STEPDEF_AB_TRANSFER, STEPDEF_AB_TRANSFER_IMM, STEPDEF_AB_TRANSFER_FIX, STEPDEF_DATAVIEW_CTOR, STEPDEF_DATE_TOJSON, STEPDEF_DATE_TOPRIM, STEPDEF_DATE_CTOR,
     STEPDEF_MATH_ABS, STEPDEF_MATH_FLOOR, STEPDEF_MATH_CEIL, STEPDEF_MATH_ROUND, STEPDEF_MATH_SQRT, STEPDEF_MATH_ACOS, STEPDEF_MATH_ASIN, STEPDEF_MATH_ATAN, STEPDEF_MATH_COS, STEPDEF_MATH_EXP, STEPDEF_MATH_LOG, STEPDEF_MATH_SIN, STEPDEF_MATH_TAN, STEPDEF_MATH_TRUNC, STEPDEF_MATH_SIGN, STEPDEF_MATH_COSH, STEPDEF_MATH_SINH, STEPDEF_MATH_TANH, STEPDEF_MATH_ACOSH, STEPDEF_MATH_ASINH, STEPDEF_MATH_ATANH, STEPDEF_MATH_EXPM1, STEPDEF_MATH_LOG1P, STEPDEF_MATH_LOG2, STEPDEF_MATH_LOG10, STEPDEF_MATH_CBRT, STEPDEF_MATH_F16ROUND, STEPDEF_MATH_FROUND, STEPDEF_MATH_ATAN2, STEPDEF_MATH_POW, STEPDEF_MATH_MIN, STEPDEF_MATH_MAX, STEPDEF_MATH_HYPOT, STEPDEF_MATH_IMUL, STEPDEF_MATH_CLZ32, STEPDEF_STR_FROMCHARCODE, STEPDEF_STR_FROMCODEPOINT, STEPDEF_DATE_UTC,
     STEPDEF_REGEXP_EXEC, STEPDEF_REGEXP_TEST, STEPDEF_REGEXP_FLAGS, STEPDEF_REGEXP_TOSTRING,
     STEPDEF_RE_STR_ITER_NEXT,
@@ -1731,7 +1738,7 @@ static bool js_get_fast_array(JSContext *ctx, JSValue obj,
                               JSValue **arrpp, uint32_t *countp);
 static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len);
 static JSValue JS_CreateAsyncFromSyncIterator(JSContext *ctx,
-                                              JSValue sync_iter, JSValue next_method);
+                                              JSValue sync_iter, JSValue next_method, JSValue *pnext);
 static void js_c_function_data_finalizer(JSRuntime *rt, JSValueConst val);
 static void js_c_function_data_mark(JSRuntime *rt, JSValueConst val,
                                     JS_MarkFunc *mark_func);
@@ -3126,6 +3133,7 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
     ctx->iterator_ctor_getset = JS_NULL;
     ctx->regexp_ctor = JS_NULL;
     ctx->regexp_builtin_exec = JS_NULL;
+    ctx->async_from_sync_next = JS_NULL;
     ctx->promise_ctor = JS_NULL;
     ctx->error_ctor = JS_NULL;
     ctx->error_back_trace = JS_UNDEFINED;
@@ -3274,6 +3282,7 @@ static void JS_MarkContext(JSRuntime *rt, JSContext *ctx,
     JS_MarkValue(rt, ctx->array_ctor, mark_func);
     JS_MarkValue(rt, ctx->regexp_ctor, mark_func);
     JS_MarkValue(rt, ctx->regexp_builtin_exec, mark_func);
+    JS_MarkValue(rt, ctx->async_from_sync_next, mark_func);
     JS_MarkValue(rt, ctx->function_ctor, mark_func);
     JS_MarkValue(rt, ctx->function_proto, mark_func);
 
@@ -3363,6 +3372,7 @@ void JS_FreeContext(JSContext *ctx)
     JS_FreeValue(ctx, ctx->array_ctor);
     JS_FreeValue(ctx, ctx->regexp_ctor);
     JS_FreeValue(ctx, ctx->regexp_builtin_exec);
+    JS_FreeValue(ctx, ctx->async_from_sync_next);
     JS_FreeValue(ctx, ctx->function_ctor);
     JS_FreeValue(ctx, ctx->function_proto);
 
@@ -9189,8 +9199,6 @@ int JS_SetLength(JSContext *ctx, JSValueConst obj, int64_t len) {
 
 /* return true, false or (-1) in case of exception */
 
-#include "builtin-array-fromasync.h"
-
 // like Function.prototype.call but monkey patch-proof
 static JSValue js_call_function(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv)
@@ -9205,65 +9213,6 @@ static JSValue js_call_function(JSContext *ctx, JSValueConst this_val,
    rather than a second spelling of it. */
 
 
-// note: takes ownership of |argv|
-static JSValue js_bytecode_eval(JSContext *ctx, const uint8_t *bytecode,
-                                size_t len, int argc, JSValue *argv)
-{
-    JSValue obj, fun, result;
-    int i;
-
-    obj = JS_ReadObject(ctx, bytecode, len, JS_READ_OBJ_BYTECODE);
-    if (JS_IsException(obj))
-        return JS_EXCEPTION;
-    fun = JS_EvalFunction(ctx, obj);
-    if (JS_IsException(fun))
-        return JS_EXCEPTION;
-    assert(JS_IsFunction(ctx, fun));
-    result = JS_Call(ctx, fun, JS_UNDEFINED, argc, vc(argv));
-    for (i = 0; i < argc; i++)
-        JS_FreeValue(ctx, argv[i]);
-    JS_FreeValue(ctx, fun);
-    if (JS_SetPrototypeInternal(ctx, result, ctx->function_proto,
-                                /*throw_flag*/true) < 0) {
-        JS_FreeValue(ctx, result);
-        return JS_EXCEPTION;
-    }
-    return result;
-}
-
-static JSValue js_bytecode_autoinit(JSContext *ctx, JSObject *p, JSAtom atom,
-                                    void *opaque)
-{
-    switch ((uintptr_t)opaque) {
-    default:
-        abort();
-    case JS_BUILTIN_ARRAY_FROMASYNC:
-        {
-            JSValue argv[] = {
-                /* the same builtin the global one is: a step ctor, so the helper's `new C(n)` performs
-                   new.target's `prototype` read on the tramp like any other construct */
-                JS_NewCFunctionMagic(ctx, NULL, "Array", 1, JS_CFUNC_step_ctor, STEPDEF_ARRAY_CTOR),
-                JS_NewCFunctionMagic(ctx, NULL, "TypeError",
-                                     1, JS_CFUNC_step_ctor,
-                                      STEPDEF_ERROR_CTOR_BASE + JS_TYPE_ERROR),
-                JS_AtomToValue(ctx, JS_ATOM_Symbol_asyncIterator),
-                /* the same builtin the global one is: a step machine, so the helper's call to it routes
-                   through the interpreter's dispatch like any other */
-                JS_NewCFunctionMagic(ctx, NULL, "Object.defineProperty", 3,
-                                     JS_CFUNC_step, STEPDEF_OBJ_DEFINEPROPERTY),
-                JS_AtomToValue(ctx, JS_ATOM_Symbol_iterator),
-                /* LengthOfArrayLike's truncation. Passed in rather than reached through the global Math so a
-                   page that replaces Math.floor cannot change what the builtin computes. */
-                JS_NewCFunctionMagic(ctx, NULL, "floor", 1, JS_CFUNC_step, STEPDEF_MATH_FLOOR),
-            };
-            return js_bytecode_eval(ctx, qjsc_builtin_array_fromasync,
-                                    sizeof(qjsc_builtin_array_fromasync),
-                                    countof(argv), argv);
-        }
-    }
-    return JS_UNDEFINED;
-}
-
 /* return the value associated to the autoinit property or an exception */
 typedef JSValue JSAutoInitFunc(JSContext *ctx, JSObject *p, JSAtom atom, void *opaque);
 
@@ -9271,7 +9220,6 @@ static JSAutoInitFunc *const js_autoinit_func_table[] = {
     js_instantiate_prototype, /* JS_AUTOINIT_ID_PROTOTYPE */
     js_module_ns_autoinit, /* JS_AUTOINIT_ID_MODULE_NS */
     JS_InstantiateFunctionListItem2, /* JS_AUTOINIT_ID_PROP */
-    js_bytecode_autoinit, /* JS_AUTOINIT_ID_BYTECODE */
 };
 
 /* warning: 'prs' is reallocated after it */
@@ -17771,6 +17719,21 @@ static int step_getprop_done(JSContext *ctx, JSStepHdr *h, JSAtom atom, JSValue 
     return 0;
 }
 
+/* An ABRUPT delivery ENDS the request the machine parked on, so the in-flight key is released HERE — the same
+   thing step_getprop_done does on the normal path, and the only other way a request finishes. Without it a
+   catches_abrupt machine that ran a two-phase sub-sequence keeps the key on its header forever: the NEXT
+   sub-sequence it starts finds get_phase already GOT, takes the answering branch, and reads a value it never
+   asked for. Array.fromAsync found it — a failing CreateDataPropertyOrThrow is caught by step 12 and the close
+   that follows reads `return`, which is the next call site. */
+static void step_hdr_request_abandon(JSContext *ctx, JSStepHdr *h)
+{
+    if (h->get_atom != JS_ATOM_NULL) {
+        JS_FreeAtom(ctx, h->get_atom);
+        h->get_atom = JS_ATOM_NULL;
+    }
+    h->get_phase = GET_PH_START;
+}
+
 /* a NAMED key, borrowed from the caller (a permanent atom in every current use). */
 static int step_getprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAtom atom, JSValue in,
                             JSValue *pout, JSValue **out_cb, int *out_argc)
@@ -24820,6 +24783,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSStepHdr *ch = tramp_cap_outer;
                 cont_st = tramp_cap_outer;
                 tramp_cap_outer = NULL; tramp_cap_kind = CONT_NONE;
+                /* THE HEADER HOLDS ONE CAPABILITY. A machine that asks for a second has already consumed the
+                   first — by TAKING the record out of these slots, which is what every consumer does. Storing
+                   over a live one leaked a promise and its two resolving functions per request, and a leaked
+                   resolving function pins the whole graph it can reach: Array.fromAsync asks once per Await, so
+                   `Array.fromAsync([])` alone left 376 live objects behind. */
+                DCHECK(JS_IsUndefined(ch->cap_promise) && JS_IsUndefined(ch->cap_funcs[0])
+                       && JS_IsUndefined(ch->cap_funcs[1]),
+                       "a promise capability is already on this machine's header — the requester must TAKE the "
+                       "record it asked for before asking for another");
                 ch->cap_promise = tramp_cap_promise; tramp_cap_promise = JS_UNDEFINED;
                 ch->cap_funcs[0] = tramp_cap_funcs[0]; tramp_cap_funcs[0] = JS_UNDEFINED;
                 ch->cap_funcs[1] = tramp_cap_funcs[1]; tramp_cap_funcs[1] = JS_UNDEFINED;
@@ -28968,6 +28940,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         goto exception;
                     }
                     DCHECK(gk3 == CONT_STEP, "property-get outer continuation: unknown machine kind");
+                    if (((JSStepHdr *)gouter)->def->catches_abrupt) {
+                        step_hdr_request_abandon(ctx, (JSStepHdr *)gouter);
+                        /* the machine's own algorithm catches it. WHERE the read threw — in place here, or after
+                           a suspension at do_getprop_abandon — is not something the algorithm can observe, so
+                           both paths must answer this ONE question the same way. They did not: Array.fromAsync's
+                           `Get(null, @@asyncIterator)` throws before anything suspends, and this label freed the
+                           chain and propagated, so the builtin THREW where the spec rejects its promise. */
+                        cont_st = gouter;
+                        ret_val = JS_EXCEPTION;
+                        goto do_step_step;
+                    }
                     tramp_step_chain_free(ctx, gouter);
                     goto exception;
                 }
@@ -30390,6 +30373,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     call_first_r = cfirst; call_pop = cargc;
                     cont_st = couter; ret_val = r;
                     if (cok == CONT_ITER_CLOSE_CALL) goto do_iter_close_deliver;
+                    /* a STEP MACHINE called the wrapper's method — Array.fromAsync drives the async-from-sync
+                       record's `next` exactly as the spec's loop does, so the wrapper's promise is that CALL
+                       request's result like any other callee's. Both deliveries need the arm: the promise is
+                       the result whether it settles or rejects, because the wrapper never throws to its caller. */
+                    if (cok == CONT_STEP) goto do_step_step;
                     DFAIL("an async-from-sync wrapper method was called with a continuation kind this delivery "
                           "does not route — add its arm here");
                     goto exception;
@@ -30455,6 +30443,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     call_first_r = cfirst; call_pop = cargc;
                     cont_st = couter; ret_val = r;
                     if (cok == CONT_ITER_CLOSE_CALL) goto do_iter_close_deliver;
+                    /* a STEP MACHINE called the wrapper's method — Array.fromAsync drives the async-from-sync
+                       record's `next` exactly as the spec's loop does, so the wrapper's promise is that CALL
+                       request's result like any other callee's. Both deliveries need the arm: the promise is
+                       the result whether it settles or rejects, because the wrapper never throws to its caller. */
+                    if (cok == CONT_STEP) goto do_step_step;
                     DFAIL("an async-from-sync wrapper method was called with a continuation kind this delivery "
                           "does not route — add its arm here");
                     goto exception;
@@ -31540,6 +31533,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (ack == CONT_ITER_NEXT_OP) { js_iternext_deliver(ctx, sp, apr); BREAK; }
                 if (ack == CONT_ITER_CALL) { js_itercall_deliver(ctx, sp, apr); sp += 1; BREAK; }
                 if (ack == CONT_ITER_CLOSE_CALL) { cont_st = acont; ret_val = apr; goto do_iter_close_deliver; }
+                /* a STEP MACHINE drove the generator's method — Array.fromAsync calls an async generator's
+                   `next` exactly as its own loop does, so the settlement promise is that CALL request's result
+                   like any other callee's. */
+                if (ack == CONT_STEP) { cont_st = acont; ret_val = apr; goto do_step_step; }
                 DFAIL("an async-generator drive carried a continuation kind this delivery does not route");
                 goto exception;
             }
@@ -33833,15 +33830,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     /* 27.1.4.3 step 1.b.iii: the completed SYNC record becomes the wrapper's, and the enum_rec
                        drives the WRAPPER's own `next` — %AsyncFromSyncIteratorPrototype%.next, a hidden
                        intrinsic, which is why step 3 of 27.1.4.1 is an infallible Get. */
-                    JSValue wrapped = JS_CreateAsyncFromSyncIterator(ctx, sp[-1], ret_val);
+                    JSValue wnext, wrapped = JS_CreateAsyncFromSyncIterator(ctx, sp[-1], ret_val, &wnext);
                     ret_val = JS_UNDEFINED;
                     if (unlikely(JS_IsException(wrapped))) goto exception;
                     JS_FreeValue(ctx, sp[-1]); sp[-1] = wrapped;
-                    DCHECK(!js_read_is_page_code(ctx, sp[-1], JS_ATOM_next),
-                           "the async-from-sync wrapper's `next` is an intrinsic — a page-reachable one would "
-                           "make 27.1.4.1 step 3's infallible Get run user code from here");
-                    ret_val = JS_GetProperty(ctx, sp[-1], JS_ATOM_next);
-                    if (unlikely(JS_IsException(ret_val))) goto exception;
+                    ret_val = wnext;
                 }
                 *sp++ = ret_val;                     /* sp[-1]=next, sp[-2]=iterator */
                 ret_val = JS_UNDEFINED;
@@ -37314,6 +37307,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             } else if (gouter && gk2 == CONT_STEP && ((JSStepHdr *)gouter)->def->catches_abrupt) {
                 /* the read threw and the machine's own algorithm catches it: hand the exception back to step()
                    with the throw still live, exactly as a normal result is handed back. */
+                step_hdr_request_abandon(ctx, (JSStepHdr *)gouter);
                 cont_st = gouter;
                 ret_val = JS_EXCEPTION;
                 goto do_step_step;
@@ -62438,6 +62432,813 @@ static JSValue js_array_constructor(JSContext *ctx, JSValueConst new_target,
     return js_array_ctor_body(ctx, obj, argc, argv);
 }
 
+/* ---- 27.1.4.1 Array.fromAsync ---------------------------------------------------------------------
+   THE LAST SELF-HOSTED BUILTIN. It was a compiled JS module read back through JS_AUTOINIT_ID_BYTECODE, and that
+   AUTOINIT — evaluating the module's top-level program from C on the first property read — was the whole of
+   Array/fromAsync's 190 drives; fromAsync's own body never appeared in a backtrace. Porting it deletes the
+   autoinit machinery with it.
+
+   The spec runs fromAsync as an ASYNC FUNCTION: a capability created up front (step 2), a closure that runs
+   synchronously to its first Await, and one resumption per Await. A step machine cannot suspend on a promise —
+   its state is freed when it returns — so the work lives in a REACTION CLOSURE and the loop state in a JS array
+   those closures share by reference. That is the shape disposeAsync's chain already uses, and the array is
+   engine-private: it never escapes, so every read and write of it invokes nothing. */
+enum {
+    FA_ITEMS = 0,   /* asyncItems */
+    FA_MAPFN,       /* undefined = no mapping */
+    FA_THISARG,
+    FA_CTOR,        /* the `this` value, C */
+    FA_A,           /* the result object */
+    FA_ITER,        /* the iterator record's [[Iterator]], or the array-like object */
+    FA_NEXT,        /* its [[NextMethod]]; undefined on the array-like branch */
+    FA_SYNC,        /* 1 = the record came from @@iterator and needs CreateAsyncFromSyncIterator */
+    FA_RESOLVE, FA_REJECT,
+    FA_K,           /* the cursor */
+    FA_LEN,         /* the array-like length */
+    FA_HELD,        /* whatever the current phase is holding across a request (the iterator result, a value) */
+    FA_PHASE,       /* WHERE a resumption continues; it must outlive the instance, so it lives here */
+    FA_RESUME,      /* the phase an Await continues at once its promise FULFILS */
+    FA_RESUME_REJ,  /* and the phase it continues at when it REJECTS — which is not always "reject the
+                       capability": step 9.d closes the iterator first, and the close's own Await discards its
+                       settlement entirely. The phase says all of it, which is why there is no is-this-the-
+                       rejection-half flag on the instance. */
+    FA_ONABRUPT,    /* WHAT AN ABRUPT COMPLETION MEANS HERE, as a phase. The spec spells this out step by step —
+                       steps 3-8 of the loop are plain `?` (reject), steps 9.b/12 are IfAbruptCloseAsyncIterator
+                       (close, then reject), and inside the close step 4 discards it — so it is a value the
+                       algorithm carries, not a property of the request that threw. */
+    FA_ERR,         /* the completion AsyncIteratorClose was entered with; it wins over anything the close does */
+    FA_AWPROM,      /* an Await's own capability promise, held across the resolve CALL */
+    FA_NFIELDS
+};
+
+/* WHERE a resumption continues. The synchronous phases are requests answered by the driver; the AWAIT_ ones are
+   answered by a promise reaction, which is the only place a fresh machine instance takes over from a dead one. */
+enum {
+    FA_PH_ASYNC_METHOD = 0, /* Get(items, @@asyncIterator) */
+    FA_PH_PICK_ASYNC,       /* decide on it, and GetIterator(async) if present */
+    FA_PH_SYNC_METHOD,      /* Get(items, @@iterator) */
+    FA_PH_PICK_SYNC,        /* decide: GetIterator(sync), or the array-like branch */
+    FA_PH_GOT_ITER,         /* the CALL's iterator */
+    FA_PH_GET_NEXT,         /* Get(iterator, "next"), then the async-from-sync wrap */
+    FA_PH_MAKE_A,           /* Construct(C) or ArrayCreate(0) */
+    FA_PH_GOT_A,            /* the CONSTRUCT's result */
+    FA_PH_NEXT_CALL,        /* Call(next, iterator) */
+    FA_PH_AWAIT_RESULT,     /* Await(nextResult) */
+    FA_PH_RESULT_OBJ,       /* it must be an Object */
+    FA_PH_DONE,             /* Get(result, "done") */
+    FA_PH_VALUE,            /* Get(result, "value") */
+    FA_PH_MAP_CALL,         /* Call(mapfn, thisArg, value, k) */
+    FA_PH_AWAIT_MAPPED,     /* Await(mappedValue) */
+    FA_PH_MAPPED_IN,        /* it arrived */
+    FA_PH_DEFINE,           /* CreateDataPropertyOrThrow(A, k, v) */
+    FA_PH_SET_LEN,          /* Set(A, "length", k) */
+    FA_PH_AL_LEN,           /* LengthOfArrayLike(arrayLike) */
+    FA_PH_AL_MAKE_A,        /* Construct(C, len) or ArrayCreate(len) */
+    FA_PH_AL_GOT_A,
+    FA_PH_AL_STEP,          /* the k < len test */
+    FA_PH_AL_GET_K,         /* Get(arrayLike, k) */
+    FA_PH_AL_AWAIT_K,       /* Await(kValue) */
+    FA_PH_AL_MAP_CALL,
+    FA_PH_AL_AWAIT_MAPPED,
+    FA_PH_AL_MAPPED_IN,
+    FA_PH_AL_DEFINE,
+    FA_PH_AL_SET_LEN,
+    FA_PH_AWAIT_CAP,       /* Await: NewPromiseCapability(%Promise%) */
+    FA_PH_AWAIT_RESOLVE,   /* Await: resolve(value), as a CALL */
+    FA_PH_AWAIT_THEN,      /* Await: PerformPromiseThen with this algorithm's two continuations */
+    /* 7.4.14 AsyncIteratorClose, entered by IfAbruptCloseAsyncIterator with a THROW completion in hand. That
+       completion wins over everything the close itself does (step 4), so the close's only job is to RUN — get
+       `return`, call it, await the result — and then reject with the error it was entered with. */
+    FA_PH_CLOSE_ENTER,     /* `in` is the reason; it becomes FA_ERR */
+    FA_PH_CLOSE_GET_RETURN,/* GetMethod(iterator, "return") */
+    FA_PH_CLOSE_PICK,      /* undefined/null/uncallable all end the close; otherwise Call(return, iterator) */
+    FA_PH_CLOSE_AWAIT,     /* step 3.d: Await(innerResult) — its settlement is discarded, but it happens */
+    FA_PH_CLOSE_FINISH,    /* reject with FA_ERR */
+    FA_PH_REJECT,          /* `in` is the reason: IfAbruptRejectPromise, plain */
+    FA_PH_SETTLED          /* the capability's resolve/reject has been called; nothing follows */
+};
+
+typedef struct JSFromAsync {
+    JSStepHdr hdr;        /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    JSValue result;       /* DONE (owned) */
+    JSValue st;           /* the shared state array (owned) */
+    JSValue cb[4];        /* the operands a CALL/CONSTRUCT request lends the driver */
+    uint8_t phase;        /* the resumption point this instance is answering */
+} JSFromAsync;
+
+static const JSTrampStepDef js_fromasync_def;
+
+static JSValue fa_get(JSContext *ctx, JSValueConst st, int i)
+{
+    /* the state array is engine-private and always a fast array, so this reads a slot and invokes nothing */
+    return JS_GetPropertyUint32(ctx, st, i);
+}
+
+static void fa_set(JSContext *ctx, JSValueConst st, int i, JSValue v)
+{
+    JS_SetPropertyUint32(ctx, (JSValue)st, i, v);
+}
+
+/* The state array and the reaction closures that carry it form a CYCLE: each closure holds the state, and the
+   state's RESOLVE/REJECT hold the capability's functions. Nothing else refers to it once the closure has
+   settled, so the last act of the algorithm is to empty it — the alternative is leaving the cycle for the
+   collector, which the leak walk counts as 754 live objects for a two-element fromAsync. */
+static void fa_clear(JSContext *ctx, JSValueConst st)
+{
+    int i;
+    for (i = 0; i < FA_NFIELDS; i++)
+        JS_SetPropertyUint32(ctx, (JSValue)st, i, JS_UNDEFINED);
+}
+
+static int64_t fa_get_int(JSContext *ctx, JSValueConst st, int i)
+{
+    JSValue v = fa_get(ctx, st, i);
+    int64_t r = 0;
+    JS_ToInt64(ctx, &r, v);   /* always a number this code put there */
+    JS_FreeValue(ctx, v);
+    return r;
+}
+
+/* The closure's C entry. It exists only because JS_NewCFunctionData takes a function pointer; the
+   implementation is js_fromasync_def, and both dispatches reach it — the tramp's and the job pump's reaction
+   dispatch, which runs a handler as a call-root flow. Arriving here is a call shape that was never routed. */
+static JSValue js_fromasync_c_entry(JSContext *ctx, JSValueConst this_val, int argc,
+                                    JSValueConst *argv, int magic, JSValueConst *func_data)
+{
+    DFAIL("an Array.fromAsync continuation reached its C entry — route that call shape onto do_step_tramp");
+    return JS_ThrowTypeError(ctx, "Array.fromAsync continuation reached its C entry");
+}
+
+/* One resumption point, as a promise-reaction closure that shares the state array. `phase` says where it
+   continues — including WHICH half it is, because the fulfil and reject halves of an Await do not always differ
+   by a flag: the mapped value's rejection closes the iterator and the close's own Await discards both. */
+static JSValue fa_link(JSContext *ctx, JSValueConst st, int phase)
+{
+    JSValueConst data[2];
+    JSValue ph = js_int32(phase), f;
+    data[0] = st; data[1] = ph;
+    f = JS_NewCFunctionData(ctx, js_fromasync_c_entry, 1, 0, 2, data);
+    JS_FreeValue(ctx, ph);
+    if (JS_IsException(f))
+        return f;
+    promise_closure_set_step(f, &js_fromasync_def);
+    return f;
+}
+
+/* THE CLOSURE BODY, one resumption at a time.
+
+   TWO KINDS OF PHASE, and confusing them is what made the first version hang. A `step_*_run` sub-sequence is
+   TWO-PHASE: the first call parks and the second returns the value, and it must be re-entered AT THE SAME CALL
+   SITE — so a phase that performs one KEEPS its phase until the sub-sequence returns 0, and threads `in` into
+   it. An explicit request code (3 CALL, 4 CONSTRUCT) is answered by the driver at a different logical point, so
+   the phase ADVANCES before returning it. The first version advanced in both cases, so `@@asyncIterator`'s
+   parked read was answered at the `@@iterator` call site, which consumed the pending get as its own.
+   Each phase therefore does exactly ONE thing: perform a sub-sequence, or decide and issue a request. A value
+   that has to survive between them is stashed on the state, never left in `in`.
+
+   `in` is what this phase was waiting for. Every abrupt completion REJECTS the capability rather than throwing:
+   the caller is holding a promise, so an escaping throw would be the wrong completion. */
+static int fa_advance(JSContext *ctx, JSFromAsync *s, JSValue in, JSValue **out_cb, int *out_argc)
+{
+    JSValueConst st = s->st;
+    int phase = (int)fa_get_int(ctx, st, FA_PHASE);
+    JSValue v, a, held, mapfn;
+    int64_t k, len;
+    int r;
+
+    /* the operands a CALL/CONSTRUCT request lent the driver are the MACHINE's to release once it answers — the
+       driver borrows them. Overwriting them at the next request instead leaked one C function object per
+       iteration, and a leaked C function pins its realm, which is how two elements became 754 live objects. */
+    { int i; for (i = 0; i < 4; i++) { JS_FreeValue(ctx, s->cb[i]); s->cb[i] = JS_UNDEFINED; } }
+
+    /* catches_abrupt: a request that THREW is delivered as JS_EXCEPTION with the throw still live, exactly as a
+       value is. It is not a value — treating it as one is what hung the mapfn-throws cases, because the next
+       phase stored an exception marker on the state and waited for a settle that could never come. */
+    if (JS_IsException(in)) {
+        in = JS_UNDEFINED;
+        goto abrupt;
+    }
+
+again:
+    for (;;) {
+        switch (phase) {
+
+        /* ---- choosing the source, steps 3.c-3.g ---- */
+        case FA_PH_ASYNC_METHOD:
+            v = fa_get(ctx, st, FA_ITEMS);
+            r = step_getprop_run(ctx, &s->hdr, v, JS_ATOM_Symbol_asyncIterator, in, &held, out_cb, out_argc);
+            JS_FreeValue(ctx, v);
+            in = JS_UNDEFINED;
+            if (r) { if (r < 0) goto abrupt; return r; }
+            fa_set(ctx, st, FA_HELD, held);
+            phase = FA_PH_PICK_ASYNC;
+            break;
+
+        case FA_PH_PICK_ASYNC:
+            held = fa_get(ctx, st, FA_HELD);
+            fa_set(ctx, st, FA_HELD, JS_UNDEFINED);
+            if (JS_IsUndefined(held) || JS_IsNull(held)) {
+                JS_FreeValue(ctx, held);
+                phase = FA_PH_SYNC_METHOD;
+                break;
+            }
+            if (!JS_IsFunction(ctx, held)) {
+                JS_FreeValue(ctx, held);
+                JS_ThrowTypeError(ctx, "@@asyncIterator is not a function");
+                goto abrupt;
+            }
+            /* step 3.f: GetIterator(asyncItems, async) — the record is already async, so no wrap. */
+            fa_set(ctx, st, FA_SYNC, js_int32(0));
+            s->cb[0] = fa_get(ctx, st, FA_ITEMS);
+            s->cb[1] = held;
+            *out_cb = s->cb; *out_argc = 0;
+            fa_set(ctx, st, FA_PHASE, js_int32(FA_PH_GOT_ITER));
+            return 3;   /* CALL */
+
+        case FA_PH_SYNC_METHOD:
+            v = fa_get(ctx, st, FA_ITEMS);
+            r = step_getprop_run(ctx, &s->hdr, v, JS_ATOM_Symbol_iterator, in, &held, out_cb, out_argc);
+            JS_FreeValue(ctx, v);
+            in = JS_UNDEFINED;
+            if (r) { if (r < 0) goto abrupt; return r; }
+            fa_set(ctx, st, FA_HELD, held);
+            phase = FA_PH_PICK_SYNC;
+            break;
+
+        case FA_PH_PICK_SYNC:
+            held = fa_get(ctx, st, FA_HELD);
+            fa_set(ctx, st, FA_HELD, JS_UNDEFINED);
+            if (JS_IsUndefined(held) || JS_IsNull(held)) {
+                /* step 3.i: neither iterable, so it is an array-like. ToObject invokes nothing. */
+                JSValue items = fa_get(ctx, st, FA_ITEMS);
+                JSValue obj = JS_ToObject(ctx, items);
+                JS_FreeValue(ctx, items);
+                JS_FreeValue(ctx, held);
+                if (JS_IsException(obj)) goto abrupt;
+                fa_set(ctx, st, FA_ITER, obj);
+                phase = FA_PH_AL_LEN;
+                break;
+            }
+            if (!JS_IsFunction(ctx, held)) {
+                JS_FreeValue(ctx, held);
+                JS_ThrowTypeError(ctx, "@@iterator is not a function");
+                goto abrupt;
+            }
+            /* step 3.g: a SYNC record gets CreateAsyncFromSyncIterator, so the loop below is ONE algorithm for
+               both sources — which is what the wrapper exists for. */
+            fa_set(ctx, st, FA_SYNC, js_int32(1));
+            s->cb[0] = fa_get(ctx, st, FA_ITEMS);
+            s->cb[1] = held;
+            *out_cb = s->cb; *out_argc = 0;
+            fa_set(ctx, st, FA_PHASE, js_int32(FA_PH_GOT_ITER));
+            return 3;   /* CALL */
+
+        case FA_PH_GOT_ITER:
+            /* 7.4.2 step 4: the iterator must be an Object. */
+            if (!JS_IsObject(in)) {
+                JS_FreeValue(ctx, in); in = JS_UNDEFINED;
+                JS_ThrowTypeError(ctx, "iterator is not an object");
+                goto abrupt;
+            }
+            fa_set(ctx, st, FA_ITER, in); in = JS_UNDEFINED;
+            phase = FA_PH_GET_NEXT;
+            break;
+
+        case FA_PH_GET_NEXT:
+            v = fa_get(ctx, st, FA_ITER);
+            r = step_getprop_run(ctx, &s->hdr, v, JS_ATOM_next, in, &held, out_cb, out_argc);
+            JS_FreeValue(ctx, v);
+            in = JS_UNDEFINED;
+            if (r) { if (r < 0) goto abrupt; return r; }
+            if (fa_get_int(ctx, st, FA_SYNC)) {
+                JSValue iter = fa_get(ctx, st, FA_ITER);
+                /* the wrapper BORROWS sync_iter (it dups it) and TRANSFERS next_method — so this reference is
+                   still ours to release. Leaking it pinned a C function, and a leaked C function pins its
+                   realm: 750 live objects for a two-element fromAsync, and only on this branch. */
+                JSValue wrapped = JS_CreateAsyncFromSyncIterator(ctx, iter, held, &held);
+                JS_FreeValue(ctx, iter);
+                if (JS_IsException(wrapped)) goto abrupt;
+                fa_set(ctx, st, FA_ITER, wrapped);
+            }
+            fa_set(ctx, st, FA_NEXT, held);
+            phase = FA_PH_MAKE_A;
+            break;
+
+        case FA_PH_MAKE_A: {
+            /* step 3.h.i: IsConstructor(C) ? Construct(C) : ArrayCreate(0) */
+            JSValue ctor = fa_get(ctx, st, FA_CTOR);
+            JS_FreeValue(ctx, in); in = JS_UNDEFINED;
+            if (JS_IsConstructor(ctx, ctor)) {
+                s->cb[0] = ctor;
+                *out_cb = s->cb; *out_argc = 0;
+                fa_set(ctx, st, FA_PHASE, js_int32(FA_PH_GOT_A));
+                return 4;   /* CONSTRUCT */
+            }
+            JS_FreeValue(ctx, ctor);
+            a = JS_NewArray(ctx);
+            if (JS_IsException(a)) goto abrupt;
+            fa_set(ctx, st, FA_A, a);
+            phase = FA_PH_NEXT_CALL;
+            break;
+        }
+        case FA_PH_GOT_A:
+            fa_set(ctx, st, FA_A, in); in = JS_UNDEFINED;
+            phase = FA_PH_NEXT_CALL;
+            break;
+
+        /* ---- the iterator loop, step 3.h.iv ---- */
+        case FA_PH_NEXT_CALL:
+            JS_FreeValue(ctx, in); in = JS_UNDEFINED;
+            /* steps 3-8 are plain `?`: the next call, the result-object check and the done/value reads all
+               propagate WITHOUT closing — the iterator is the thing that failed. */
+            fa_set(ctx, st, FA_ONABRUPT, js_int32(FA_PH_REJECT));
+            k = fa_get_int(ctx, st, FA_K);
+            if (k >= MAX_SAFE_INTEGER) {
+                /* step 1.b: this one DOES close. */
+                fa_set(ctx, st, FA_ONABRUPT, js_int32(FA_PH_CLOSE_ENTER));
+                JS_ThrowTypeError(ctx, "array length out of range");
+                goto abrupt;
+            }
+            s->cb[0] = fa_get(ctx, st, FA_ITER);
+            s->cb[1] = fa_get(ctx, st, FA_NEXT);
+            *out_cb = s->cb; *out_argc = 0;
+            fa_set(ctx, st, FA_PHASE, js_int32(FA_PH_AWAIT_RESULT));
+            return 3;   /* CALL: nextMethod(iterator) */
+
+        case FA_PH_AWAIT_RESULT:
+            /* step 3.h.iv.5: Await(nextResult) */
+            fa_set(ctx, st, FA_HELD, in); in = JS_UNDEFINED;
+            fa_set(ctx, st, FA_RESUME, js_int32(FA_PH_RESULT_OBJ));
+            fa_set(ctx, st, FA_RESUME_REJ, js_int32(FA_PH_REJECT));
+            phase = FA_PH_AWAIT_CAP;
+            break;   /* parked: this instance is finished */
+
+        case FA_PH_RESULT_OBJ:
+            /* step 3.h.iv.4: the awaited result must be an Object */
+            if (!JS_IsObject(in)) {
+                JS_FreeValue(ctx, in); in = JS_UNDEFINED;
+                JS_ThrowTypeError(ctx, "iterator result is not an object");
+                goto abrupt;
+            }
+            fa_set(ctx, st, FA_HELD, in); in = JS_UNDEFINED;
+            phase = FA_PH_DONE;
+            break;
+
+        case FA_PH_DONE:
+            v = fa_get(ctx, st, FA_HELD);
+            r = step_getprop_run(ctx, &s->hdr, v, JS_ATOM_done, in, &held, out_cb, out_argc);
+            JS_FreeValue(ctx, v);
+            in = JS_UNDEFINED;
+            if (r) { if (r < 0) goto abrupt; return r; }
+            {
+                bool done = JS_ToBool(ctx, held);
+                JS_FreeValue(ctx, held);
+                phase = done ? FA_PH_SET_LEN : FA_PH_VALUE;
+                if (done) fa_set(ctx, st, FA_HELD, JS_UNDEFINED);
+            }
+            break;
+
+        case FA_PH_VALUE:
+            v = fa_get(ctx, st, FA_HELD);
+            r = step_getprop_run(ctx, &s->hdr, v, JS_ATOM_value, in, &held, out_cb, out_argc);
+            JS_FreeValue(ctx, v);
+            in = JS_UNDEFINED;
+            if (r) { if (r < 0) goto abrupt; return r; }
+            fa_set(ctx, st, FA_HELD, held);
+            phase = FA_PH_MAP_CALL;
+            break;
+
+        case FA_PH_MAP_CALL:
+            held = fa_get(ctx, st, FA_HELD);
+            fa_set(ctx, st, FA_HELD, JS_UNDEFINED);
+            mapfn = fa_get(ctx, st, FA_MAPFN);
+            if (JS_IsUndefined(mapfn)) {
+                JS_FreeValue(ctx, mapfn);
+                fa_set(ctx, st, FA_HELD, held);
+                phase = FA_PH_DEFINE;
+                break;
+            }
+            /* step 3.h.iv.9: Call(mapfn, thisArg, value, k). Steps 9.b and 9.d wrap it and the Await that
+               follows in IfAbruptCloseAsyncIterator, and step 12 wraps the define — so the close stays declared
+               from here until the element lands. */
+            fa_set(ctx, st, FA_ONABRUPT, js_int32(FA_PH_CLOSE_ENTER));
+            k = fa_get_int(ctx, st, FA_K);
+            s->cb[0] = fa_get(ctx, st, FA_THISARG);
+            s->cb[1] = mapfn;
+            s->cb[2] = held;
+            s->cb[3] = js_int64(k);
+            *out_cb = s->cb; *out_argc = 2;
+            fa_set(ctx, st, FA_PHASE, js_int32(FA_PH_AWAIT_MAPPED));
+            return 3;   /* CALL */
+
+        case FA_PH_AWAIT_MAPPED:
+            /* step 3.h.iv.9.c: Await(mappedValue); 9.d closes on its rejection. */
+            fa_set(ctx, st, FA_HELD, in); in = JS_UNDEFINED;
+            fa_set(ctx, st, FA_RESUME, js_int32(FA_PH_MAPPED_IN));
+            fa_set(ctx, st, FA_RESUME_REJ, js_int32(FA_PH_CLOSE_ENTER));
+            phase = FA_PH_AWAIT_CAP;
+            break;
+
+        case FA_PH_MAPPED_IN:
+            fa_set(ctx, st, FA_HELD, in); in = JS_UNDEFINED;
+            phase = FA_PH_DEFINE;
+            break;
+
+        case FA_PH_DEFINE:
+            /* step 3.h.iv.11: CreateDataPropertyOrThrow(A, k, v) — {w,e,c} all true, which is the thing the
+               self-hosted descriptor got wrong. The value is BORROWED by the request and the request can PARK,
+               so it stays on the state until the delivery. Step 12: an abrupt define CLOSES the iterator, which
+               is true whether or not there was a mapfn — so it is declared here and not only at the map call. */
+            fa_set(ctx, st, FA_ONABRUPT, js_int32(FA_PH_CLOSE_ENTER));
+            k = fa_get_int(ctx, st, FA_K);
+            a = fa_get(ctx, st, FA_A);
+            v = fa_get(ctx, st, FA_HELD);
+            r = step_defidx_run(ctx, &s->hdr, a, k, v, in, out_cb, out_argc);
+            JS_FreeValue(ctx, a);
+            JS_FreeValue(ctx, v);
+            in = JS_UNDEFINED;
+            if (r) { if (r < 0) goto abrupt; return r; }
+            fa_set(ctx, st, FA_HELD, JS_UNDEFINED);
+            fa_set(ctx, st, FA_K, js_int64(k + 1));
+            phase = FA_PH_NEXT_CALL;
+            break;
+
+        case FA_PH_SET_LEN:
+            /* step 3.h.iv.7.a: Set(A, "length", k) */
+            k = fa_get_int(ctx, st, FA_K);
+            a = fa_get(ctx, st, FA_A);
+            r = step_setprop_run(ctx, &s->hdr, a, JS_ATOM_length, js_int64(k), in, out_cb, out_argc);
+            JS_FreeValue(ctx, a);
+            in = JS_UNDEFINED;
+            if (r) { if (r < 0) goto abrupt; return r; }
+            goto resolve_a;
+
+        /* ---- the array-like branch, step 3.i ---- */
+        case FA_PH_AL_LEN:
+            v = fa_get(ctx, st, FA_ITER);
+            r = step_length_run(ctx, &s->hdr, v, in, &len, out_cb, out_argc);
+            JS_FreeValue(ctx, v);
+            in = JS_UNDEFINED;
+            if (r) { if (r < 0) goto abrupt; return r; }
+            fa_set(ctx, st, FA_LEN, js_int64(len));
+            phase = FA_PH_AL_MAKE_A;
+            break;
+
+        case FA_PH_AL_MAKE_A: {
+            JSValue ctor = fa_get(ctx, st, FA_CTOR);
+            len = fa_get_int(ctx, st, FA_LEN);
+            if (JS_IsConstructor(ctx, ctor)) {
+                s->cb[0] = ctor;
+                s->cb[1] = js_int64(len);
+                *out_cb = s->cb; *out_argc = 1;
+                fa_set(ctx, st, FA_PHASE, js_int32(FA_PH_AL_GOT_A));
+                return 4;   /* CONSTRUCT(C, len) */
+            }
+            JS_FreeValue(ctx, ctor);
+            /* ArrayCreate(len): the intrinsic prototype and no new.target, so it runs nothing. */
+            a = JS_NewArray(ctx);
+            if (JS_IsException(a)) goto abrupt;
+            if (JS_SetPropertyStr(ctx, a, "length", js_int64(len)) < 0) { JS_FreeValue(ctx, a); goto abrupt; }
+            fa_set(ctx, st, FA_A, a);
+            phase = FA_PH_AL_STEP;
+            break;
+        }
+        case FA_PH_AL_GOT_A:
+            fa_set(ctx, st, FA_A, in); in = JS_UNDEFINED;
+            phase = FA_PH_AL_STEP;
+            break;
+
+        case FA_PH_AL_STEP:
+            JS_FreeValue(ctx, in); in = JS_UNDEFINED;
+            k = fa_get_int(ctx, st, FA_K);
+            len = fa_get_int(ctx, st, FA_LEN);
+            phase = (k < len) ? FA_PH_AL_GET_K : FA_PH_AL_SET_LEN;
+            break;
+
+        case FA_PH_AL_GET_K:
+            k = fa_get_int(ctx, st, FA_K);
+            v = fa_get(ctx, st, FA_ITER);
+            r = step_getidx_run(ctx, &s->hdr, v, k, in, &held, out_cb, out_argc);
+            JS_FreeValue(ctx, v);
+            in = JS_UNDEFINED;
+            if (r) { if (r < 0) goto abrupt; return r; }
+            phase = FA_PH_AL_AWAIT_K;
+            fa_set(ctx, st, FA_PHASE, js_int32(FA_PH_AL_AWAIT_K));
+            in = held;
+            break;
+
+        case FA_PH_AL_AWAIT_K:
+            /* step 3.i.vii.3: Await(kValue). The array-like branch has no iterator, so every abrupt on it is
+               a plain IfAbruptRejectPromise. */
+            fa_set(ctx, st, FA_HELD, in); in = JS_UNDEFINED;
+            fa_set(ctx, st, FA_RESUME, js_int32(FA_PH_AL_MAP_CALL));
+            fa_set(ctx, st, FA_RESUME_REJ, js_int32(FA_PH_REJECT));
+            phase = FA_PH_AWAIT_CAP;
+            break;
+
+        case FA_PH_AL_MAP_CALL:
+            mapfn = fa_get(ctx, st, FA_MAPFN);
+            if (JS_IsUndefined(mapfn)) {
+                JS_FreeValue(ctx, mapfn);
+                fa_set(ctx, st, FA_HELD, in); in = JS_UNDEFINED;
+                phase = FA_PH_AL_DEFINE;
+                break;
+            }
+            k = fa_get_int(ctx, st, FA_K);
+            s->cb[0] = fa_get(ctx, st, FA_THISARG);
+            s->cb[1] = mapfn;
+            s->cb[2] = in; in = JS_UNDEFINED;
+            s->cb[3] = js_int64(k);
+            *out_cb = s->cb; *out_argc = 2;
+            fa_set(ctx, st, FA_PHASE, js_int32(FA_PH_AL_AWAIT_MAPPED));
+            return 3;   /* CALL */
+
+        case FA_PH_AL_AWAIT_MAPPED:
+            fa_set(ctx, st, FA_HELD, in); in = JS_UNDEFINED;
+            fa_set(ctx, st, FA_RESUME, js_int32(FA_PH_AL_MAPPED_IN));
+            fa_set(ctx, st, FA_RESUME_REJ, js_int32(FA_PH_REJECT));
+            phase = FA_PH_AWAIT_CAP;
+            break;
+
+        case FA_PH_AL_MAPPED_IN:
+            fa_set(ctx, st, FA_HELD, in); in = JS_UNDEFINED;
+            phase = FA_PH_AL_DEFINE;
+            break;
+
+        case FA_PH_AL_DEFINE:
+            k = fa_get_int(ctx, st, FA_K);
+            a = fa_get(ctx, st, FA_A);
+            v = fa_get(ctx, st, FA_HELD);
+            r = step_defidx_run(ctx, &s->hdr, a, k, v, in, out_cb, out_argc);
+            JS_FreeValue(ctx, a);
+            JS_FreeValue(ctx, v);
+            in = JS_UNDEFINED;
+            if (r) { if (r < 0) goto abrupt; return r; }
+            fa_set(ctx, st, FA_HELD, JS_UNDEFINED);
+            fa_set(ctx, st, FA_K, js_int64(k + 1));
+            phase = FA_PH_AL_STEP;
+            break;
+
+        /* ---- Await, 6.2.4 ---- three phases because PromiseResolve is not a C-side call: resolving with a
+           THENABLE makes the resolving function READ `.then`, which is the page's code, and its C entry DFAILs
+           on exactly that. The capability is requested, resolve(value) is issued as a CALL, and only the
+           PerformPromiseThen at the end runs nothing. */
+        case FA_PH_AWAIT_CAP:
+            JS_FreeValue(ctx, in); in = JS_UNDEFINED;
+            s->cb[0] = js_dup(ctx->promise_ctor);
+            *out_cb = s->cb; *out_argc = 0;
+            fa_set(ctx, st, FA_PHASE, js_int32(FA_PH_AWAIT_RESOLVE));
+            return 16;   /* CAPABILITY */
+
+        case FA_PH_AWAIT_RESOLVE:
+            JS_FreeValue(ctx, in); in = JS_UNDEFINED;
+            /* TAKE the record: the header holds one at a time and the next Await asks for another. 6.2.4 uses
+               only the RESOLVE half — Await never rejects its own capability — so the reject function is
+               released here rather than carried. */
+            fa_set(ctx, st, FA_AWPROM, s->hdr.cap_promise); s->hdr.cap_promise = JS_UNDEFINED;
+            s->cb[0] = JS_UNDEFINED;
+            s->cb[1] = s->hdr.cap_funcs[0]; s->hdr.cap_funcs[0] = JS_UNDEFINED;
+            JS_FreeValue(ctx, s->hdr.cap_funcs[1]); s->hdr.cap_funcs[1] = JS_UNDEFINED;
+            s->cb[2] = fa_get(ctx, st, FA_HELD);
+            fa_set(ctx, st, FA_HELD, JS_UNDEFINED);
+            *out_cb = s->cb; *out_argc = 1;
+            fa_set(ctx, st, FA_PHASE, js_int32(FA_PH_AWAIT_THEN));
+            return 3;   /* CALL resolve(value) */
+
+        case FA_PH_AWAIT_THEN: {
+            JSValue prom = fa_get(ctx, st, FA_AWPROM), ful, rej, none[2];
+            int resume = (int)fa_get_int(ctx, st, FA_RESUME), rr;
+            JS_FreeValue(ctx, in); in = JS_UNDEFINED;
+            fa_set(ctx, st, FA_AWPROM, JS_UNDEFINED);
+            ful = fa_link(ctx, st, resume);
+            if (JS_IsException(ful)) { JS_FreeValue(ctx, prom); goto abrupt; }
+            rej = fa_link(ctx, st, (int)fa_get_int(ctx, st, FA_RESUME_REJ));
+            if (JS_IsException(rej)) { JS_FreeValue(ctx, prom); JS_FreeValue(ctx, ful); goto abrupt; }
+            none[0] = JS_UNDEFINED; none[1] = JS_UNDEFINED;
+            { JSValueConst h[2]; h[0] = ful; h[1] = rej;
+              rr = perform_promise_then(ctx, prom, h, vc(none)); }
+            JS_FreeValue(ctx, prom);
+            JS_FreeValue(ctx, ful);
+            JS_FreeValue(ctx, rej);
+            if (rr) goto abrupt;
+            return 0;   /* parked: this instance is finished */
+        }
+
+        /* ---- 7.4.14 AsyncIteratorClose. Entered only with a THROW completion, so step 4 fires every time and
+           the close's own result is discarded — but it RUNS, and test262 pins each observable step of it. ---- */
+        case FA_PH_CLOSE_ENTER:
+            fa_set(ctx, st, FA_ERR, in); in = JS_UNDEFINED;
+            /* step 4 in advance: nothing the close does can change the completion, so an abrupt inside it goes
+               straight to the finish. */
+            fa_set(ctx, st, FA_ONABRUPT, js_int32(FA_PH_CLOSE_FINISH));
+            phase = FA_PH_CLOSE_GET_RETURN;
+            break;
+
+        case FA_PH_CLOSE_GET_RETURN:
+            v = fa_get(ctx, st, FA_ITER);
+            r = step_getprop_run(ctx, &s->hdr, v, JS_ATOM_return, in, &held, out_cb, out_argc);
+            JS_FreeValue(ctx, v);
+            in = JS_UNDEFINED;
+            if (r) { if (r < 0) goto abrupt; return r; }
+            fa_set(ctx, st, FA_HELD, held);
+            phase = FA_PH_CLOSE_PICK;
+            break;
+
+        case FA_PH_CLOSE_PICK:
+            held = fa_get(ctx, st, FA_HELD);
+            fa_set(ctx, st, FA_HELD, JS_UNDEFINED);
+            if (JS_IsUndefined(held) || JS_IsNull(held) || !JS_IsFunction(ctx, held)) {
+                /* GetMethod maps null onto undefined (step 3.b returns the completion) and throws for a
+                   non-callable (an abrupt innerResult, which step 4 discards) — one destination either way. */
+                JS_FreeValue(ctx, held);
+                phase = FA_PH_CLOSE_FINISH;
+                break;
+            }
+            s->cb[0] = fa_get(ctx, st, FA_ITER);
+            s->cb[1] = held;
+            *out_cb = s->cb; *out_argc = 0;
+            fa_set(ctx, st, FA_PHASE, js_int32(FA_PH_CLOSE_AWAIT));
+            return 3;   /* step 3.c: Call(return, iterator) */
+
+        case FA_PH_CLOSE_AWAIT:
+            /* step 3.d: Await(innerResult). Both settlements land on the finish, which rejects with FA_ERR —
+               the close cannot change the completion, but the await still happens and the page can see it. */
+            fa_set(ctx, st, FA_HELD, in); in = JS_UNDEFINED;
+            fa_set(ctx, st, FA_RESUME, js_int32(FA_PH_CLOSE_FINISH));
+            fa_set(ctx, st, FA_RESUME_REJ, js_int32(FA_PH_CLOSE_FINISH));
+            phase = FA_PH_AWAIT_CAP;
+            break;
+
+        case FA_PH_CLOSE_FINISH:
+            JS_FreeValue(ctx, in);
+            in = fa_get(ctx, st, FA_ERR);
+            fa_set(ctx, st, FA_ERR, JS_UNDEFINED);
+            goto reject_in;
+
+        case FA_PH_REJECT:
+            goto reject_in;   /* `in` is the reason */
+
+        case FA_PH_SETTLED:
+            /* the settle answered; the algorithm is over. */
+            JS_FreeValue(ctx, in);
+            return 0;
+
+        case FA_PH_AL_SET_LEN:
+            /* step 3.i.viii: Set(A, "length", len) */
+            len = fa_get_int(ctx, st, FA_LEN);
+            a = fa_get(ctx, st, FA_A);
+            r = step_setprop_run(ctx, &s->hdr, a, JS_ATOM_length, js_int64(len), in, out_cb, out_argc);
+            JS_FreeValue(ctx, a);
+            in = JS_UNDEFINED;
+            if (r) { if (r < 0) goto abrupt; return r; }
+            goto resolve_a;
+
+        default:
+            DFAIL("Array.fromAsync resumed in an unknown phase");
+            JS_FreeValue(ctx, in);
+            return -1;
+        }
+        fa_set(ctx, st, FA_PHASE, js_int32(phase));
+    }
+
+resolve_a: {
+        /* the capability's RESOLVE is a CALL request, not a JS_Call: resolving with a THENABLE makes the
+           resolving function read `.then`, which is the page's code — the C entry's DFAIL said so the moment a
+           subclass constructor handed back a thenable. Reject cannot read anything, but it goes the same way so
+           there is one settle path rather than two. */
+        s->cb[0] = JS_UNDEFINED;
+        s->cb[1] = fa_get(ctx, st, FA_RESOLVE);
+        s->cb[2] = fa_get(ctx, st, FA_A);
+        fa_clear(ctx, st);
+        *out_cb = s->cb; *out_argc = 1;
+        fa_set(ctx, st, FA_PHASE, js_int32(FA_PH_SETTLED));
+        return 3;
+    }
+
+abrupt:
+    /* THE ONE abrupt route. A synchronous throw becomes a VALUE, and the phase the algorithm declared in
+       FA_ONABRUPT says what the spec does with it HERE — reject, or close the iterator first, or (inside the
+       close) discard everything the close did and reject with what it was entered with. */
+    in = JS_GetException(ctx);
+    phase = (int)fa_get_int(ctx, st, FA_ONABRUPT);
+    fa_set(ctx, st, FA_PHASE, js_int32(phase));
+    goto again;
+
+reject_in: {
+        s->cb[0] = JS_UNDEFINED;
+        s->cb[1] = fa_get(ctx, st, FA_REJECT);
+        s->cb[2] = in;
+        fa_clear(ctx, st);
+        *out_cb = s->cb; *out_argc = 1;
+        fa_set(ctx, st, FA_PHASE, js_int32(FA_PH_SETTLED));
+        return 3;
+    }
+}
+
+/* The two drivers. They differ only in where the state comes from: the BUILTIN creates it, a LINK reads the one
+   its closure carries. Everything after that is fa_advance. */
+static int js_fromasync_step(JSContext *ctx, void *stt, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSFromAsync *s = stt;
+    if (s->hdr.stage == 0) {
+        JSCFunctionDataRecord *rec = JS_VALUE_GET_OBJ(s->hdr.func_obj)->u.c_function_data_record;
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        s->result = JS_UNDEFINED;
+        s->st = js_dup(rec->data[0]);
+        s->cb[0] = JS_UNDEFINED; s->cb[1] = JS_UNDEFINED;
+        s->cb[2] = JS_UNDEFINED; s->cb[3] = JS_UNDEFINED;
+        fa_set(ctx, s->st, FA_PHASE, js_dup(rec->data[1]));
+        s->hdr.stage = 1;
+        /* the settled value the reaction was called with */
+        return fa_advance(ctx, s, js_dup(step_arg(&s->hdr, 0)), out_cb, out_argc);
+    }
+    return fa_advance(ctx, s, cb_result, out_cb, out_argc);
+}
+
+static JSValue js_fromasync_fini(JSContext *ctx, void *stt, bool take_result)
+{
+    JSFromAsync *s = stt;
+    JSValue r = take_result ? js_dup(s->result) : JS_UNDEFINED;
+    int i;
+    JS_FreeValue(ctx, s->result);
+    JS_FreeValue(ctx, s->st);
+    for (i = 0; i < 4; i++) JS_FreeValue(ctx, s->cb[i]);
+    js_free(ctx, s);
+    return r;
+}
+
+static const JSTrampStepDef js_fromasync_def = {
+    sizeof(JSFromAsync), js_fromasync_step, js_fromasync_fini, 0,
+    .catches_abrupt = 1   /* every abrupt completion of the closure is IfAbruptRejectPromise: the caller holds
+                             the capability's promise, so a throw is a VALUE this algorithm settles with */
+};
+
+/* 27.1.4.1 steps 1-2 and 4-5: create the capability, build the state, and run the closure to its first Await.
+   The capability's promise is the answer whatever the closure does after that. */
+static int js_array_fromasync_step(JSContext *ctx, void *stt, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSFromAsync *s = stt;
+
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        s->result = JS_UNDEFINED;
+        s->st = JS_UNDEFINED;
+        s->cb[0] = JS_UNDEFINED; s->cb[1] = JS_UNDEFINED;
+        s->cb[2] = JS_UNDEFINED; s->cb[3] = JS_UNDEFINED;
+        s->hdr.stage = 1;
+        s->cb[0] = js_dup(ctx->promise_ctor);
+        *out_cb = s->cb; *out_argc = 0;
+        return 16;   /* CAPABILITY (step 2) */
+    }
+    if (s->hdr.stage != 1)
+        return fa_advance(ctx, s, cb_result, out_cb, out_argc);   /* a request answered; just continue */
+    /* step 2 itself: there is no capability yet to reject with, so its failure is the ONE completion that
+       propagates. Every later abrupt is inside the capability and settles it. */
+    if (JS_IsException(cb_result))
+        return -1;
+    /* stage 1 runs ONCE: the capability has arrived, so build the state and start the closure. Without a stage
+       past it every request delivery re-ran this block and rebuilt the state at phase 0 forever. */
+    s->hdr.stage = 2;
+    JS_FreeValue(ctx, cb_result);
+    JS_FreeValue(ctx, s->cb[0]); s->cb[0] = JS_UNDEFINED;
+    {
+        JSValueConst mapfn = step_arg(&s->hdr, 1);
+        JSValue st = JS_NewArray(ctx);
+        int i;
+        if (JS_IsException(st)) return -1;
+        for (i = 0; i < FA_NFIELDS; i++)
+            JS_SetPropertyUint32(ctx, st, i, JS_UNDEFINED);
+        s->st = st;
+        fa_set(ctx, st, FA_ITEMS, js_dup(step_arg(&s->hdr, 0)));
+        fa_set(ctx, st, FA_MAPFN, js_dup(mapfn));
+        fa_set(ctx, st, FA_THISARG, js_dup(step_arg(&s->hdr, 2)));
+        fa_set(ctx, st, FA_CTOR, js_dup(s->hdr.this_val));
+        fa_set(ctx, st, FA_RESOLVE, s->hdr.cap_funcs[0]); s->hdr.cap_funcs[0] = JS_UNDEFINED;
+        fa_set(ctx, st, FA_REJECT, s->hdr.cap_funcs[1]); s->hdr.cap_funcs[1] = JS_UNDEFINED;
+        fa_set(ctx, st, FA_K, js_int32(0));
+        fa_set(ctx, st, FA_ONABRUPT, js_int32(FA_PH_REJECT));
+        fa_set(ctx, st, FA_PHASE, js_int32(FA_PH_ASYNC_METHOD));
+        s->result = s->hdr.cap_promise; s->hdr.cap_promise = JS_UNDEFINED;
+        /* step 3.b: a present-but-uncallable mapfn is the closure's own abrupt completion, so it REJECTS —
+           through the SAME abrupt route every other one takes, not a C-side JS_Call of the resolving function. */
+        if (!JS_IsUndefined(mapfn) && !JS_IsFunction(ctx, mapfn)) {
+            JS_ThrowTypeError(ctx, "Array.fromAsync mapfn is not a function");
+            return fa_advance(ctx, s, JS_EXCEPTION, out_cb, out_argc);
+        }
+        return fa_advance(ctx, s, JS_UNDEFINED, out_cb, out_argc);
+    }
+}
+
+static JSValue js_array_fromasync_fini(JSContext *ctx, void *stt, bool take_result)
+{
+    return js_fromasync_fini(ctx, stt, take_result);
+}
+
+static const JSTrampStepDef js_array_fromasync_def = {
+    sizeof(JSFromAsync), js_array_fromasync_step, js_array_fromasync_fini, 0,
+    .catches_abrupt = 1   /* as above: steps 3 on run inside the capability, so they REJECT rather than throw */
+};
+
 /* DELETED: js_array_from. Every branch it had is a machine: the ITERABLE walk is ITERCONS_FROM, the ARRAY-LIKE
    walk is STEPDEF_ARRAY_FROMLIKE, and the two validations it was still kept alive for — a present-but-uncallable
    mapfn, and the 0-argument call — are the consume prologue and the acquire's GetIterator. With the sink declared
@@ -67491,6 +68292,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_STR_CTOR]      = &js_str_ctor_def,
     [STEPDEF_ARRAY_AT]      = &js_array_at_def,
     [STEPDEF_ARRAY_WITH]    = &js_array_with_def,
+    [STEPDEF_ARRAY_FROMASYNC] = &js_array_fromasync_def,
     [STEPDEF_ARRAY_FILL]    = &js_array_fill_def,
     [STEPDEF_ARRAY_COPYWITHIN] = &js_array_copyWithin_def,
     [STEPDEF_BIGINT_CTOR]   = &js_bigint_ctor_def,
@@ -82554,12 +83356,17 @@ static void js_async_from_sync_iterator_mark(JSRuntime *rt, JSValueConst val,
    `next` off the ASYNC wrapper, an intrinsic, not off the sync iterator again. Reading it off the sync iterator
    here (what this did) was both a second observable Get on the page's object and a C-side one, with no flow base
    for the accessor or Proxy trap that answers it. `next_method` is TRANSFERRED. */
+/* 27.1.4.1 CreateAsyncFromSyncIterator returns an ITERATOR RECORD, not an object, and both callers needed the
+   [[NextMethod]] half — so both performed step 3's Get themselves, from C, against JS_ATOM_next. The AO hands
+   the whole record back instead: `sync_iter` is BORROWED, `next_method` is CONSUMED, and *pnext receives the
+   wrapper's own next method, which the realm already holds. */
 static JSValue JS_CreateAsyncFromSyncIterator(JSContext *ctx,
-                                              JSValue sync_iter, JSValue next_method)
+                                              JSValue sync_iter, JSValue next_method, JSValue *pnext)
 {
     JSValue async_iter;
     JSAsyncFromSyncIteratorData *s;
 
+    *pnext = JS_UNDEFINED;
     async_iter = JS_NewObjectClass(ctx, JS_CLASS_ASYNC_FROM_SYNC_ITERATOR);
     if (JS_IsException(async_iter)) {
         JS_FreeValue(ctx, next_method);
@@ -82574,6 +83381,7 @@ static JSValue JS_CreateAsyncFromSyncIterator(JSContext *ctx,
     s->sync_iter = js_dup(sync_iter);
     s->next_method = next_method;
     JS_SetOpaqueInternal(async_iter, s);
+    *pnext = js_dup(ctx->async_from_sync_next);
     return async_iter;
 }
 
@@ -82595,11 +83403,10 @@ static JSValue js_async_from_sync_iterator_next(JSContext *ctx, JSValueConst thi
     return JS_EXCEPTION;
 }
 
-static const JSCFunctionListEntry js_async_from_sync_iterator_proto_funcs[] = {
-    JS_CFUNC_MAGIC_DEF("next", 1, js_async_from_sync_iterator_next, GEN_MAGIC_NEXT ),
-    JS_CFUNC_MAGIC_DEF("return", 1, js_async_from_sync_iterator_next, GEN_MAGIC_RETURN ),
-    JS_CFUNC_MAGIC_DEF("throw", 1, js_async_from_sync_iterator_next, GEN_MAGIC_THROW ),
-};
+/* DELETED: js_async_from_sync_iterator_proto_funcs. The three methods are built one at a time below so the
+   realm can KEEP the `next` it made — 27.1.4.1 step 3 needs the record's [[NextMethod]], and reading it back off
+   the prototype was a C-side JS_GetProperty against JS_ATOM_next, the exact shape a consumer running the
+   iterator protocol from C has. The list could not hand a member back, so the list is gone. */
 
 /* AsyncGeneratorFunction */
 
@@ -82699,13 +83506,31 @@ int JS_AddIntrinsicPromise(JSContext *ctx)
     if (JS_IsException(ctx->async_iterator_proto))
         return -1;
 
-    /* AsyncFromSyncIteratorPrototype */
-    ctx->class_proto[JS_CLASS_ASYNC_FROM_SYNC_ITERATOR] =
-        JS_NewObjectProtoList(ctx, ctx->async_iterator_proto,
-                              js_async_from_sync_iterator_proto_funcs,
-                              countof(js_async_from_sync_iterator_proto_funcs));
-    if (JS_IsException(ctx->class_proto[JS_CLASS_ASYNC_FROM_SYNC_ITERATOR]))
-        return -1;
+    /* AsyncFromSyncIteratorPrototype. Built member by member rather than from a JSCFunctionListEntry list,
+       because the realm KEEPS the `next` it creates: that object is the Iterator Record's [[NextMethod]] for
+       every wrapper in this realm, and the interpreter routes a wrapper call by asking what the CALLEE is, so
+       it has to be this exact function. */
+    {
+        static const struct { const char *name; int magic; } afs_methods[] = {
+            { "next", GEN_MAGIC_NEXT }, { "return", GEN_MAGIC_RETURN }, { "throw", GEN_MAGIC_THROW },
+        };
+        JSValue afs_proto = JS_NewObjectProto(ctx, ctx->async_iterator_proto);
+        size_t mi;
+        ctx->class_proto[JS_CLASS_ASYNC_FROM_SYNC_ITERATOR] = afs_proto;
+        if (JS_IsException(afs_proto))
+            return -1;
+        for (mi = 0; mi < countof(afs_methods); mi++) {
+            JSValue m = JS_NewCFunctionMagic(ctx, js_async_from_sync_iterator_next, afs_methods[mi].name, 1,
+                                             JS_CFUNC_generic_magic, afs_methods[mi].magic);
+            if (JS_IsException(m))
+                return -1;
+            if (mi == 0)
+                ctx->async_from_sync_next = js_dup(m);
+            if (JS_DefinePropertyValueStr(ctx, afs_proto, afs_methods[mi].name, m,
+                                          JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE) < 0)
+                return -1;
+        }
+    }
 
     /* AsyncGeneratorPrototype */
     ctx->class_proto[JS_CLASS_ASYNC_GENERATOR] =
@@ -84605,10 +85430,17 @@ int JS_AddIntrinsicBaseObjects(JSContext *ctx)
     if (JS_IsException(obj1))
         return -1;
     ctx->array_ctor = obj1;
-    JS_DefineAutoInitProperty(ctx, obj1, JS_ATOM_fromAsync,
-                              JS_AUTOINIT_ID_BYTECODE,
-                              (void *)(uintptr_t)JS_BUILTIN_ARRAY_FROMASYNC,
-                              JS_PROP_WRITABLE|JS_PROP_CONFIGURABLE);
+    {
+        /* 27.1.4.1, a step machine. It was the LAST self-hosted builtin, read back through an autoinit that
+           evaluated its module's program from C on the first property read — the whole of Array/fromAsync's
+           190 drives. */
+        JSValue fa = JS_NewCFunctionMagic(ctx, NULL, "fromAsync", 1, JS_CFUNC_step, STEPDEF_ARRAY_FROMASYNC);
+        if (JS_IsException(fa))
+            return -1;
+        if (JS_DefinePropertyValue(ctx, obj1, JS_ATOM_fromAsync, fa,
+                                   JS_PROP_WRITABLE|JS_PROP_CONFIGURABLE) < 0)
+            return -1;
+    }
 
     /* needed to initialize arguments[Symbol.iterator] */
     ctx->array_proto_values =

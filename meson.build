@@ -635,17 +635,6 @@ alias_target('codegen',
       files('examples/test_fib.js'),
     ],
   ),
-  run_target(
-    'codegen_builtin-array-fromasync.h',
-    command: [
-      qjsc_exe,
-      '-C',
-      '-ss',
-      '-o', files('builtin-array-fromasync.h'),
-      '-n', 'builtin-array-fromasync.js',
-      files('builtin-array-fromasync.js'),
-    ],
-  ),
 )
 
 if examples.allowed()
