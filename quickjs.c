@@ -37447,6 +37447,15 @@ int JS_FlowResume(JSContext *ctx, JSValue *flow, JSValue *pres) {
 }
 void JS_FlowFree(JSContext *ctx, JSValue *flow) {
     JSAsyncFunctionState *s = (JSAsyncFunctionState *)flow;
+    /* JS_FlowResume deliberately LEAVES the base installed when it returns, so the host's post-eval job drain is
+       still measured against it. That is only sound while the flow is alive. Freeing it here ends the base's
+       lifetime, and without this the global DANGLES: every later read is of freed memory. The reads are not
+       harmless — `gen_state == g_flow_base_gen` is a pointer identity test, so once the allocator hands the same
+       address to an unrelated JSAsyncFunctionState it answers TRUE and a nested async body preempts as if it were
+       the base the pump is driving. It also silently inflated SyncDriveToCompletion: the next evaluation's module
+       link ran `JS_Call(m->func_obj, JS_TRUE)` with no flow live at all and was counted against this corpse. */
+    if (g_flow_base_gen == s)
+        g_flow_base_gen = NULL;
     if (s->frame.cur_sp != NULL) {
         async_func_free(ctx->rt, s);   /* never-run or BASE-suspended: full generator-frame cleanup */
     } else if (s->tramp_top != NULL) {
