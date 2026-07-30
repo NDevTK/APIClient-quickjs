@@ -19193,7 +19193,7 @@ static void js_ctor_proto_free(JSContext *ctx, JSCtorProto *cp);
 
 #define CONT_ARRAY_LEN     64  /* tp_outer = JSArrayLen: 10.4.2.4 ArraySetLength steps 3-5, whose TWO coercions
                                   are the page's code — ToUint32(V) then ToNumber(V), both on the ORIGINAL V, so
-                                  a substituted primitive cannot stand for them and the coerce-then-re-execute
+                                  a substituted primitive cannot stand for them and the coerce-then-resume
                                   idiom a TypedArray element write uses is the wrong shape (it made
                                   `var n=0; [].length = {valueOf(){n++; return 0}}` run once where the spec runs
                                   it twice). What the sequence produces is the VALIDATED uint32, and the write is
@@ -19714,20 +19714,19 @@ typedef struct JSConsumeGetIter { void *consumer; uint8_t consumer_kind; } JSCon
    coercion requested by that inner adds a third. Six sites had this loop written out and each one was a chance
    to stop at the first link — which is exactly how the ToPrimitive unwind leaked the realm. */
 /* Where an OPERAND-mode ToPrimitive continues once its primitive is in hand. Each value names a label placed
-   immediately AFTER the coercion it belongs to, so nothing before it re-executes. TPR_NONE is the unconverted
-   sites' retry and goes when they do. */
+   immediately AFTER the coercion it belongs to, so nothing before it re-executes. TPR_NONE is MACHINE mode,
+   where a step machine takes the primitive as its result and no interpreter label is involved; an operand-mode
+   coercion carrying it is a site that was never given a resume point, and the delivery DFAILs on it. */
 enum { TPR_NONE = 0, TPR_ARITH_AFTER_LEFT, TPR_ARITH_AFTER_RIGHT, TPR_ADD_AFTER_COERCE,
-       TPR_PROPKEY, TPR_PROPKEY2, TPR_IN, TPR_DELETE };
+       TPR_PROPKEY, TPR_PROPKEY2, TPR_IN, TPR_DELETE, TPR_GET_ARRAY_EL, TPR_GET_ARRAY_EL2,
+       TPR_GET_SUPER, TPR_PUT_SUPER, TPR_DEFINE_METHOD, TPR_PUT_ARRAY_EL_KEY, TPR_PUT_ARRAY_EL_VAL,
+       TPR_UNARY_AFTER_COERCE, TPR_LOGIC_AFTER_LEFT, TPR_LOGIC_AFTER_RIGHT, TPR_CMP_AFTER_COERCE,
+       TPR_IMPORT };
 typedef struct JSToPrim {
     JSValue obj;              /* the object being coerced (owned) */
-    const uint8_t *retry_pc;  /* OPERAND mode, LEGACY: the opcode byte to RE-EXECUTE once the slot holds a
-                                 primitive. That is a replay — the opcode runs again and re-decides from operands
-                                 the coercion method has had a chance to touch — and it is being converted site by
-                                 site to `resume_at`. Zero once the last site is converted; the DCHECK at the
-                                 delivery is what keeps the two from both being set. */
     const uint8_t *op_byte;   /* the opcode's own byte, RESTORED (not re-executed) so a resumed site can read the
                                  operator it belongs to; `opcode` is a C local and does not survive a suspension */
-    uint8_t resume_at;        /* OPERAND mode: WHERE to continue, past the coercion. TPR_NONE = the legacy retry */
+    uint8_t resume_at;        /* OPERAND mode: WHERE to continue, past the coercion. Every site names one. */
     int slot;                 /* OPERAND mode: the operand's offset from sp (negative) */
     void *outer;              /* MACHINE mode: the step machine awaiting the primitive (NULL = operand mode) */
     uint8_t outer_kind;       /* CONT_* of outer */
@@ -23425,9 +23424,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     uint8_t agen_tail = 0;                              /* `return ag.next()`: the promise IS the caller's return */
     void *tramp_step_outer = NULL;                      /* non-NULL = the step about to be pushed delivers its result to this machine's step, not to the operand stack (read+reset in do_step_tramp) */
     uint8_t tramp_step_outer_kind = CONT_NONE;
-    int tp_slot = 0;                                    /* do_toprim_tramp inputs. OPERAND mode: the operand's offset from sp + the opcode byte to re-execute. MACHINE mode: tp_outer is set and the primitive is delivered to that step instead. */
+    int tp_slot = 0;                                    /* do_toprim_tramp inputs. OPERAND mode: the operand's offset from sp, plus tp_op_byte and a tp_resume_at naming where to continue. MACHINE mode: tp_outer is set and the primitive is delivered to that step instead. */
     int tp_hint = HINT_NONE;
-    const uint8_t *tp_retry_pc = NULL;
+    const uint8_t *tp_op_byte = NULL;
     int tp_resume_at = 0;                               /* TPR_*: where an operand coercion continues; 0 = the legacy retry */
     JSValueConst tp_value = JS_UNDEFINED;               /* MACHINE mode: the value to coerce (borrowed) */
     void *tp_outer = NULL;
@@ -26512,7 +26511,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        coercion runs on the tramp instead and its primitive returns as the next step's result. */
                     tp_outer = stt; tp_outer_kind = CONT_STEP;
                     tp_value = cb[0]; tp_hint = cbn;
-                    tp_slot = 0; tp_retry_pc = NULL;
+                    tp_slot = 0;
                     goto do_toprim_tramp;
                 }
                 if (st == 4) {
@@ -26857,7 +26856,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
         do_toprim_tramp:
             /* 7.1.1 ToPrimitive, with its METHOD CALL on this chain. Entered with tp_slot / tp_hint /
-               tp_retry_pc; a JSToPrim carries the sequence position across the call so a suspended coercion
+               tp_op_byte; a JSToPrim carries the sequence position across the call so a suspended coercion
                resumes where it left off. The property READS stay inline (a coercion method is a data property in
                every real case; an accessor one is the getter-from-C family, not this one). */
             {
@@ -26865,8 +26864,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (unlikely(!tp)) { JS_ThrowOutOfMemory(ctx); goto exception; }
                 tp->outer = tp_outer; tp->outer_kind = tp_outer_kind;
                 tp->obj = js_dup(tp_outer ? tp_value : sp[tp_slot]);
-                tp->retry_pc = tp_retry_pc;
-                tp->op_byte = tp_retry_pc;
+                DCHECK(tp_outer != NULL || tp_op_byte != NULL,
+                       "an operand-mode ToPrimitive reached the tramp with no opcode byte — the site must set "
+                       "tp_op_byte, which is what the delivery restores `opcode` from");
+                tp->op_byte = tp_op_byte;
+                tp_op_byte = NULL;   /* read + reset: a site that forgets to set it DCHECKs above rather than
+                                         inheriting the previous coercion's opcode, which is a wild jump */
                 tp->resume_at = (uint8_t)tp_resume_at; tp_resume_at = TPR_NONE;
                 tp->slot = tp_slot;
                 { int th = tp_hint & ~HINT_FORCE_ORDINARY;
@@ -26980,7 +26983,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 goto do_cont_dispatch;
             toprim_deliver:
                 {
-                    const uint8_t *rpc = tp->retry_pc;
                     const uint8_t *opb = tp->op_byte;
                     uint8_t rat = tp->resume_at;
                     int slot = tp->slot;
@@ -26988,8 +26990,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     js_toprim_free(ctx, tp);
                     if (touter && touter_kind == CONT_IMPORT) {
                         /* the specifier coerced without throwing, so the capability created for the abrupt case
-                           is never observed — drop it and let the re-executed opcode make its own. Creating one
-                           runs none of the page's code (the intrinsic Promise), which is what makes that sound. */
+                           is never observed — drop it, and the resumed opcode makes its own below the label.
+                           Creating one runs none of the page's code (the intrinsic Promise), which is what makes
+                           that sound. */
                         js_import_cap_free(ctx, (JSImportCap *)touter);
                         touter = NULL;
                     }
@@ -27010,10 +27013,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         DCHECK(touter_kind == CONT_STEP, "ToPrimitive outer continuation: unknown machine kind");
                         goto do_step_step;
                     }
+                    DCHECK(JS_VALUE_GET_TAG(ret_val) != JS_TAG_OBJECT,
+                           "7.1.1 ToPrimitive completed with an OBJECT — the walk returned without converting, so "
+                           "every resume below is about to run the slow path on the operand it was meant to replace");
                     JS_FreeValue(ctx, sp[slot]);
                     sp[slot] = ret_val;       /* the operand is now a primitive */
                     ret_val = JS_UNDEFINED;
-                    if (rat != TPR_NONE) {
+                    {
                         /* RESUME: continue past the coercion. `opcode` is a C local and did not survive the
                            suspension, so it is RESTORED from the parked byte — reading a parked byte is not
                            re-executing an opcode. */
@@ -27024,11 +27030,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (rat == TPR_PROPKEY2) goto do_propkey2_classify;
                         if (rat == TPR_IN) goto do_in_after_key;
                         if (rat == TPR_DELETE) goto do_delete_after_key;
-                        DCHECK(rat == TPR_ARITH_AFTER_RIGHT, "an operand coercion resumed at an unknown point");
-                        goto do_arith_after_right;
+                        if (rat == TPR_GET_ARRAY_EL) goto do_get_array_el_after_key;
+                        if (rat == TPR_GET_ARRAY_EL2) goto do_get_array_el2_after_key;
+                        if (rat == TPR_GET_SUPER) goto do_get_super_after_key;
+                        if (rat == TPR_PUT_SUPER) goto do_put_super_after_key;
+                        if (rat == TPR_DEFINE_METHOD) goto do_define_method_after_key;
+                        if (rat == TPR_PUT_ARRAY_EL_KEY) goto do_put_array_el_after_key;
+                        if (rat == TPR_PUT_ARRAY_EL_VAL) goto do_put_array_el_after_value;
+                        if (rat == TPR_UNARY_AFTER_COERCE) goto do_unary_after_coerce;
+                        if (rat == TPR_LOGIC_AFTER_LEFT) goto do_logic_after_left;
+                        if (rat == TPR_LOGIC_AFTER_RIGHT) goto do_logic_after_right;
+                        if (rat == TPR_CMP_AFTER_COERCE) goto do_cmp_after_coerce;
+                        if (rat == TPR_IMPORT) goto do_import_after_spec;
+                        if (rat == TPR_ARITH_AFTER_RIGHT) goto do_arith_after_right;
+                        DFAIL("an operand-mode ToPrimitive completed with no resume point — the coercion site "
+                              "must set tp_resume_at to a label placed immediately after it");
                     }
-                    pc = rpc;                 /* LEGACY retry, at the sites not yet converted */
-                    BREAK;
                 }
             toprim_throw:
                 {
@@ -27644,7 +27661,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         al->coerce = ret_val; ret_val = JS_UNDEFINED;
                         tp_outer = al; tp_outer_kind = CONT_ARG_LIST;
                         tp_value = al->coerce; tp_hint = HINT_NUMBER;
-                        tp_slot = 0; tp_retry_pc = NULL;
+                        tp_slot = 0;
                         goto do_toprim_tramp;
                     }
                     JS_FreeValue(ctx, al->coerce); al->coerce = JS_UNDEFINED;
@@ -27723,7 +27740,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     al->phase = AL_NUMBER;
                     tp_outer = al; tp_outer_kind = CONT_ARRAY_LEN;
                     tp_value = al->val; tp_hint = HINT_NUMBER;
-                    tp_slot = 0; tp_retry_pc = NULL;
+                    tp_slot = 0;
                     goto do_toprim_tramp;
                 }
                 if (al->phase == AL_NUMBER) {
@@ -27736,7 +27753,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     al->phase = AL_COMPARE;
                     tp_outer = al; tp_outer_kind = CONT_ARRAY_LEN;
                     tp_value = al->val; tp_hint = HINT_NUMBER;
-                    tp_slot = 0; tp_retry_pc = NULL;
+                    tp_slot = 0;
                     goto do_toprim_tramp;
                 }
                 DCHECK(al->phase == AL_COMPARE, "the Array length coercion resumed in no phase");
@@ -29484,7 +29501,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                "the consume machine's ToPrimitive arm was entered with no coercion in flight");
                         tp_value = s->ent_key; tp_hint = HINT_STRING;
                     }
-                    tp_slot = 0; tp_retry_pc = NULL;
+                    tp_slot = 0;
                     goto do_toprim_tramp;
                 }
                 if (st == 4) {
@@ -32714,9 +32731,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (unlikely(JS_IsException(ic->promise))) { js_free(ctx, ic); goto exception; }
                     ic->next_pc = pc; ic->sf = sf;
                     tp_outer = ic; tp_outer_kind = CONT_IMPORT; tp_value = sp[-2];
-                    tp_slot = -2; tp_hint = HINT_STRING; tp_retry_pc = pc - 1;
+                    tp_slot = -2; tp_hint = HINT_STRING; tp_op_byte = pc - 1;
+                    tp_resume_at = TPR_IMPORT;
                     goto do_toprim_tramp;
                 }
+            do_import_after_spec:
+                /* THE RESUME POINT: the specifier coercion is this opcode's first act, so what follows is the
+                   operation itself. The capability created above for the abrupt case is dropped by the delivery
+                   when the coercion completes normally — it was never observed, and creating one runs none of the
+                   page's code — which is why nothing above this label needs to run again. */
                 /* 16.2.1.8 steps 4-12 with the specifier already primitive. The options walk runs the
                    page's code — the `with` read, the `ownKeys`/`getOwnPropertyDescriptor` pair, and each
                    attribute's value read — and every failure REJECTS rather than throwing, so it is a machine
@@ -34442,8 +34465,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 is_computed = (opcode == OP_define_method_computed);
                 if (is_computed) {
                     if (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT) {
-                        sf->cur_pc = pc; tp_slot = -2; tp_retry_pc = pc - 1; goto key_toprim;
+                        sf->cur_pc = pc; tp_slot = -2; tp_op_byte = pc - 1;
+                        tp_resume_at = TPR_DEFINE_METHOD; goto key_toprim;
                     }
+                do_define_method_after_key:
+                    /* THE RESUME POINT. `is_computed` is a C local and does not survive a suspension, so it is
+                       DERIVED from the parked opcode byte by the same expression the prologue used — not restated
+                       as a constant, which would be a second place to keep in step with that expression. */
+                    is_computed = (opcode == OP_define_method_computed);
+                    DCHECK(is_computed, "the define-method key coercion resumed on the non-computed spelling, "
+                                        "which coerces nothing");
                     atom = JS_ValueToAtom(ctx, sp[-2]);
                     if (unlikely(atom == JS_ATOM_NULL))
                         goto exception;
@@ -34553,8 +34584,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                for an OBJECT V that is the page's @@toPrimitive/valueOf. Every C write site reached it through
                JS_ToNumberFree, so `ta[0] = {valueOf(){ while(x){} }}` preempted in an activation with no flow base
                — and so did every builtin that fills a TypedArray from user values, since they all end at this same
-               [[Set]]. Coerce on the tramp and re-execute: on the retry V is a primitive and the ToNumber inside
-               [[Set]] runs nothing. Entered with tp_slot naming the VALUE operand. */
+               [[Set]]. Coerce on the tramp and CONTINUE at the site's resume label with V primitive, so the
+               ToNumber inside [[Set]] runs nothing. Entered with tp_slot naming the VALUE operand. */
             tp_hint = HINT_NUMBER;
             goto do_toprim_tramp;
 
@@ -34563,9 +34594,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                interpreter site that needs a key reached it through JS_ValueToAtom — from C, so a loop in that
                method preempted in an activation with no flow base, and an ARRAY key reaches
                Array.prototype.toString, a step machine no C body can drive at all. Coerce the key on the tramp
-               with hint STRING and re-execute the opcode: on the retry the key is a primitive, so the atom
+               with hint STRING and CONTINUE at the site's resume label with the key primitive, so the atom
                conversion (and the getter/setter probe that follows it) runs nothing. Entered with tp_slot naming
-               the key operand and tp_retry_pc the opcode's own byte. */
+               the key operand, tp_op_byte the opcode's own byte and tp_resume_at the label to continue at. */
             tp_hint = HINT_STRING;
             goto do_toprim_tramp;
 
@@ -34597,7 +34628,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 /* 6.2.5.5 GetValue step 3.a ToObject(base) precedes step 3.c ToPropertyKey, so a NULLISH base
                    throws its TypeError before the key is coerced at all. */
                 if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT
-                    && !JS_IsUndefined(sp[-2]) && !JS_IsNull(sp[-2])) { tp_slot = -1; tp_retry_pc = pc - 1; goto key_toprim; }
+                    && !JS_IsUndefined(sp[-2]) && !JS_IsNull(sp[-2])) { tp_slot = -1; tp_op_byte = pc - 1;
+                                                              tp_resume_at = TPR_GET_ARRAY_EL; goto key_toprim; }
+        do_get_array_el_after_key:
+            /* THE RESUME POINT, placed BELOW the int-index fast paths rather than at the opcode's byte. The retry
+               re-entered from the top, so a key whose @@toPrimitive returned a number took the fast path on the
+               second pass and the generic path on the first — one opcode with two routes depending on whether it
+               had suspended. Continuing here takes the slow path the suspending pass was already on; the fast
+               path is an int-key shortcut for the SAME value JS_GetPropertyValue computes below. */
                 /* the base is not an object: a PRIMITIVE one still walks its prototype (tramp_walk_base), and
                    only a NULLISH one has no walk — and its TypeError precedes the key coercion, which is why the
                    test is spelled that way and not as a tag test. */
@@ -34681,7 +34719,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 /* 6.2.5.5 GetValue step 3.a ToObject(base) precedes step 3.c ToPropertyKey, so a NULLISH base
                    throws its TypeError before the key is coerced at all. */
                 if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT
-                    && !JS_IsUndefined(sp[-2]) && !JS_IsNull(sp[-2])) { tp_slot = -1; tp_retry_pc = pc - 1; goto key_toprim; }
+                    && !JS_IsUndefined(sp[-2]) && !JS_IsNull(sp[-2])) { tp_slot = -1; tp_op_byte = pc - 1;
+                                                              tp_resume_at = TPR_GET_ARRAY_EL2; goto key_toprim; }
+        do_get_array_el2_after_key:
+            /* the same resume point for the read-and-keep-the-object spelling, below the same fast paths. */
                 /* `o[k]++` / `o[k] += v` read through THIS opcode, which keeps the object for the write-back — so
                    the value lands at sp[-1] and the reshape is based there. OP_get_array_el had both routings and
                    this one had neither, which is the per-spelling drift: the same getter suspended for `o[k]` and
@@ -34783,7 +34824,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValue val;
                 JSAtom atom;
                 sf->cur_pc = pc;
-                if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) { tp_slot = -1; tp_retry_pc = pc - 1; goto key_toprim; }
+                if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) { tp_slot = -1; tp_op_byte = pc - 1;
+                                                                 tp_resume_at = TPR_GET_SUPER; goto key_toprim; }
+        do_get_super_after_key:
+            /* THE RESUME POINT: the key coercion is this opcode's first act, so everything below it is the
+               operation itself. */
                 atom = JS_ValueToAtom(ctx, sp[-1]);
                 if (unlikely(atom == JS_ATOM_NULL))
                     goto exception;
@@ -34880,10 +34925,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 /* 6.2.5.5 PutValue step 5.a ToObject(base) precedes step 3.c ToPropertyKey, so a NULLISH base
                    throws its TypeError before the key is coerced at all. */
                 if (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT
-                    && !JS_IsUndefined(sp[-3]) && !JS_IsNull(sp[-3])) { tp_slot = -2; tp_retry_pc = pc - 1; goto key_toprim; }
+                    && !JS_IsUndefined(sp[-3]) && !JS_IsNull(sp[-3])) { tp_slot = -2; tp_op_byte = pc - 1;
+                                                            tp_resume_at = TPR_PUT_ARRAY_EL_KEY; goto key_toprim; }
+        do_put_array_el_after_key:
+            /* THE KEY'S RESUME POINT, below the int-index and append-at-count fast paths and below the typed-array
+               store: the retry re-entered all three with a key that had BECOME an int, so the write took a
+               different route on the second pass than the pass that suspended was on. This opcode is the one with
+               TWO coercions, and their ORDER is observable — resuming here rather than at the opcode byte is also
+               what keeps the value coercion below from being reached twice. */
                 /* ToPropertyKey first (above), then the TypedArray element coercion — spec order, and the key must
                    be a primitive before it can be tested for a canonical numeric index. */
-                if (ta_write_needs_toprim(ctx, sp[-3], sp[-2], sp[-1])) { tp_slot = -1; tp_retry_pc = pc - 1; goto value_tonum_toprim; }
+                if (ta_write_needs_toprim(ctx, sp[-3], sp[-2], sp[-1])) { tp_slot = -1; tp_op_byte = pc - 1;
+                                                            tp_resume_at = TPR_PUT_ARRAY_EL_VAL; goto value_tonum_toprim; }
+        do_put_array_el_after_value:
+            /* THE VALUE'S RESUME POINT: 10.4.5.16 step 1's ToNumber is done, so the write itself continues. */
                 /* A computed key that resolves to a bytecode setter -> route as a 1-arg method call so the
                    setter body preempts. */
                 /* the base is not an object: a PRIMITIVE one still walks its prototype (tramp_walk_base), and
@@ -34913,7 +34968,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         goto exception;
                     if (unlikely(arr_len_write_needs_toprim(sp[-3], katom, sp[-1]))) {
                         /* `a[k] = obj` where k resolves to `length`: 10.4.2.4 coerces V TWICE, which is the one
-                           thing the coerce-then-re-execute idiom above cannot express, so the whole write becomes
+                           thing the coerce-then-resume idiom above cannot express, so the whole write becomes
                            the request the keyed entry drives. The DCHECK in set_array_length is what found this
                            spelling after the other three were routed. */
                         JSOpKeyed *ok = js_mallocz(ctx, sizeof(*ok));
@@ -35004,7 +35059,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JS_ThrowTypeErrorNotAnObject(ctx);
                     goto exception;
                 }
-                if (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT) { tp_slot = -2; tp_retry_pc = pc - 1; goto key_toprim; }
+                if (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT) { tp_slot = -2; tp_op_byte = pc - 1;
+                                                                 tp_resume_at = TPR_PUT_SUPER; goto key_toprim; }
+        do_put_super_after_key:
+            /* THE RESUME POINT: the home object's not-an-object TypeError above precedes the key coercion and is
+               NOT re-run — that check is exactly what the retry repeated. */
                 atom = JS_ValueToAtom(ctx, sp[-2]);
                 if (unlikely(atom == JS_ATOM_NULL))
                     goto exception;
@@ -35178,7 +35237,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (JS_VALUE_GET_TAG(op1) == JS_TAG_OBJECT || JS_VALUE_GET_TAG(op2) == JS_TAG_OBJECT) {
                         tp_slot = (JS_VALUE_GET_TAG(op1) == JS_TAG_OBJECT) ? -2 : -1;
                         tp_hint = HINT_NONE;
-                        tp_retry_pc = pc - 1;
+                        tp_op_byte = pc - 1;
                         tp_resume_at = TPR_ADD_AFTER_COERCE;
                         goto do_toprim_tramp;
                     }
@@ -35372,11 +35431,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             /* The same 13.15.3 problem OP_add already routes: ToNumeric on each operand runs the page's
                valueOf/toString/@@toPrimitive, and js_binary_arith_slow does it with JS_CallFree from C — where a
                loop in that method preempts in an activation with no flow base. Coerce the LEFT object operand on
-               the tramp and re-execute; the prefix above is pure tag tests, so the retry costs nothing and the
-               right operand is coerced by the same path on the next pass, in spec order. Every opcode reaching
-               this label is one byte, so `pc - 1` is its own byte. */
+               the tramp and continue at do_arith_after_left, where the right operand is coerced by the same
+               path, in spec order. Every opcode reaching this label is one byte, so `pc - 1` is its own byte. */
             if (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT) {
-                tp_slot = -2; tp_hint = HINT_NUMBER; tp_retry_pc = pc - 1;
+                tp_slot = -2; tp_hint = HINT_NUMBER; tp_op_byte = pc - 1;
                 tp_resume_at = TPR_ARITH_AFTER_LEFT;
                 goto do_toprim_tramp;
             }
@@ -35390,7 +35448,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    primitive here, so this conversion runs no user code — it only throws. */
                 sp[-2] = JS_ToNumericFree(ctx, sp[-2]);
                 if (unlikely(JS_IsException(sp[-2]))) { sp[-2] = JS_UNDEFINED; goto exception; }
-                tp_slot = -1; tp_hint = HINT_NUMBER; tp_retry_pc = pc - 1;
+                tp_slot = -1; tp_hint = HINT_NUMBER; tp_op_byte = pc - 1;
                 tp_resume_at = TPR_ARITH_AFTER_RIGHT;
                 goto do_toprim_tramp;
             }
@@ -35400,16 +35458,45 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             sp--;
             BREAK;
 
-        unary_arith_toprim:
+        unary_arith_slow:
             /* The SAME 13.5.4/13.5.6/13.4 problem the binary label routes, for the one-operand operators:
                ToNumeric on the operand runs the page's valueOf/toString/@@toPrimitive, and js_unary_arith_slow /
                js_not_slow / js_post_inc_slow all reach it with JS_CallFree from C — where a loop in that method
                preempts in an activation with no flow base, and an ARRAY operand reaches Array.prototype.toString,
-               which is a step machine no C body can drive at all. Coerce on the tramp and re-execute: the prefix
-               of every one of these opcodes is a pure tag test, so the retry costs nothing. Each is a
-               single-byte opcode, so `pc - 1` is its own byte. */
-            tp_slot = -1; tp_hint = HINT_NUMBER; tp_retry_pc = pc - 1;
-            goto do_toprim_tramp;
+               which is a step machine no C body can drive at all. Coerce on the tramp, then continue at the
+               operator's own slow call. Each is a single-byte opcode, so `pc - 1` is its own byte.
+               THE WHOLE SLOW TAIL LIVES HERE, not in each opcode's else-arm, which is what makes the resume
+               possible: a resume must land at ONE place, and while the slow call was written out seven times
+               there was no such place — the retry re-entered the opcode only to reach its own copy of it. The
+               shape is binary_arith_slow's, one label owning the family's slow path. */
+            sf->cur_pc = pc;
+            if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) {
+                tp_slot = -1; tp_hint = HINT_NUMBER; tp_op_byte = pc - 1;
+                tp_resume_at = TPR_UNARY_AFTER_COERCE;
+                goto do_toprim_tramp;
+            }
+        do_unary_after_coerce:
+            /* THE RESUME POINT. The operand is a primitive, so what is left is the operator's own conversion,
+               selected from the restored opcode byte — the same selection the seven else-arms used to make, now
+               made once. */
+            switch (opcode) {
+            case OP_not:
+                if (js_not_slow(ctx, sp))
+                    goto exception;
+                break;
+            case OP_post_inc:
+            case OP_post_dec:
+                /* these two PUSH the pre-conversion value, so the family's shared tail owns their sp++ too */
+                if (js_post_inc_slow(ctx, sp, opcode))
+                    goto exception;
+                sp++;
+                break;
+            default:
+                if (js_unary_arith_slow(ctx, sp, opcode))
+                    goto exception;
+                break;
+            }
+            BREAK;
 
         CASE(OP_plus):
             {
@@ -35419,10 +35506,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 tag = JS_VALUE_GET_TAG(op1);
                 if (tag == JS_TAG_INT || JS_TAG_IS_FLOAT64(tag)) {
                 } else {
-                    sf->cur_pc = pc;
-                    if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) goto unary_arith_toprim;
-                    if (js_unary_arith_slow(ctx, sp, opcode))
-                        goto exception;
+                    goto unary_arith_slow;
                 }
             }
             BREAK;
@@ -35451,10 +35535,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 neg_fp_res:
                     sp[-1] = js_float64(d);
                 } else {
-                    sf->cur_pc = pc;
-                    if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) goto unary_arith_toprim;
-                    if (js_unary_arith_slow(ctx, sp, opcode))
-                        goto exception;
+                    goto unary_arith_slow;
                 }
             }
             BREAK;
@@ -35470,10 +35551,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp[-1] = js_int32(val + 1);
                 } else {
                 inc_slow:
-                    sf->cur_pc = pc;
-                    if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) goto unary_arith_toprim;
-                    if (js_unary_arith_slow(ctx, sp, opcode))
-                        goto exception;
+                    goto unary_arith_slow;
                 }
             }
             BREAK;
@@ -35489,10 +35567,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp[-1] = js_int32(val - 1);
                 } else {
                 dec_slow:
-                    sf->cur_pc = pc;
-                    if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) goto unary_arith_toprim;
-                    if (js_unary_arith_slow(ctx, sp, opcode))
-                        goto exception;
+                    goto unary_arith_slow;
                 }
             }
             BREAK;
@@ -35508,10 +35583,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp[0] = js_int32(val + 1);
                 } else {
                 post_inc_slow:
-                    sf->cur_pc = pc;
-                    if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) goto unary_arith_toprim;
-                    if (js_post_inc_slow(ctx, sp, opcode))
-                        goto exception;
+                    goto unary_arith_slow;
                 }
                 sp++;
             }
@@ -35528,10 +35600,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp[0] = js_int32(val - 1);
                 } else {
                 post_dec_slow:
-                    sf->cur_pc = pc;
-                    if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) goto unary_arith_toprim;
-                    if (js_post_inc_slow(ctx, sp, opcode))
-                        goto exception;
+                    goto unary_arith_slow;
                 }
                 sp++;
             }
@@ -35599,10 +35668,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (JS_VALUE_GET_TAG(op1) == JS_TAG_INT) {
                     sp[-1] = js_int32(~JS_VALUE_GET_INT(op1));
                 } else {
-                    sf->cur_pc = pc;
-                    if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) goto unary_arith_toprim;
-                    if (js_not_slow(ctx, sp))
-                        goto exception;
+                    goto unary_arith_slow;
                 }
             }
             BREAK;
@@ -35696,25 +35762,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     /* ONE slow path for the whole bitwise/shift family, the same shape binary_arith_slow already
                        has: `&|^<<>>>>>`'s ToNumeric runs the page's valueOf/toString/@@toPrimitive, and
                        js_binary_logic_slow did it with JS_CallFree from C, where a loop in that method preempts in
-                       an activation with no flow base. Coerce the LEFT object operand on the tramp and re-execute
-                       the opcode; the fast prefix is pure tag tests, so the retry is free and the right operand is
-                       coerced by the same path on the next pass, in spec order. It was five arms each calling the
-                       C slow path, which is why the arithmetic family's routing never reached them.
+                       an activation with no flow base. Coerce the LEFT object operand on the tramp and continue
+                       at do_logic_after_left, where the right operand is coerced by the same path, in spec order.
+                       It was five arms each calling the C slow path, which is why the arithmetic family's routing
+                       never reached them.
                        Every opcode reaching this label is one byte, so `pc - 1` is its own byte. */
                     sf->cur_pc = pc;
                     if (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT) {
-                        tp_slot = -2; tp_hint = HINT_NUMBER; tp_retry_pc = pc - 1;
+                        tp_slot = -2; tp_hint = HINT_NUMBER; tp_op_byte = pc - 1;
+                        tp_resume_at = TPR_LOGIC_AFTER_LEFT;
                         goto do_toprim_tramp;
                     }
+                do_logic_after_left:
                     if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) {
                         /* ToNumeric(lhs) must COMPLETE before the rhs is touched (the same ordering rule the
                            arithmetic label spells out). The left is already primitive here, so this conversion
                            runs no user code — it only throws. */
                         sp[-2] = JS_ToNumericFree(ctx, sp[-2]);
                         if (unlikely(JS_IsException(sp[-2]))) { sp[-2] = JS_UNDEFINED; goto exception; }
-                        tp_slot = -1; tp_hint = HINT_NUMBER; tp_retry_pc = pc - 1;
+                        tp_slot = -1; tp_hint = HINT_NUMBER; tp_op_byte = pc - 1;
+                        tp_resume_at = TPR_LOGIC_AFTER_RIGHT;
                         goto do_toprim_tramp;
                     }
+                do_logic_after_right:
                     /* >>> is the one with its own tail (an unsigned result), so the family's shared label names it
                        rather than growing a second copy of the coercion above. */
                     if (opcode == OP_shr ? js_shr_slow(ctx, sp)
@@ -35726,13 +35796,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
 
-/* `coerce_hint` is the ToPrimitive hint this comparison owes its operands, or -1 when it owes them none. The
-   RELATIONAL four run ToPrimitive(number) on both (7.2.13 step 1), so an object operand is coerced on the tramp
-   and the opcode re-executed, exactly as OP_add does. STRICT equality coerces nothing. Loose ==/!= is the one
-   that is CONDITIONAL — two objects compare by reference with no coercion at all, and null/undefined never
-   coerce — so it keeps its C slow path and says so by aborting at the preempt if a valueOf there loops; a
-   blanket coercion here would be a spec bug, not a routing gap. */
-#define OP_CMP(opcode, binary_op, coerce_hint, slow_call)              \
+/* The eight comparison operators share ONE slow path, `cmp_slow`, the shape binary_arith_slow and
+   unary_arith_slow already have. The macro keeps only the both-int fast path, which is the sole part that
+   differs per operator (its C operator); everything else — WHICH hint the operator owes its operands, the
+   coercion itself, and the slow call — is derived from the opcode at that one label. Written out eight times it
+   could not be resumed: a resume must land at ONE place, and re-entering the opcode to reach its own copy of
+   the slow path is the replay. */
+#define OP_CMP(opcode, binary_op)                                      \
             CASE(opcode):                                 \
                 {                                         \
                 JSValue op1, op2;                         \
@@ -35742,58 +35812,102 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp[-2] = js_bool(JS_VALUE_GET_INT(op1) binary_op JS_VALUE_GET_INT(op2)); \
                     sp--;                                               \
                 } else {                                                \
-                    sf->cur_pc = pc;                                    \
-                    if ((coerce_hint) >= 0                              \
-                        && (JS_VALUE_GET_TAG(op1) == JS_TAG_OBJECT       \
-                            || JS_VALUE_GET_TAG(op2) == JS_TAG_OBJECT)) { \
-                        tp_slot = (JS_VALUE_GET_TAG(op1) == JS_TAG_OBJECT) ? -2 : -1; \
-                        tp_hint = (coerce_hint);                        \
-                        tp_retry_pc = pc - 1;                           \
-                        goto do_toprim_tramp;                           \
-                    }                                                   \
-                    /* 7.2.14 steps 10-11: LOOSE equality coerces exactly one shape — an Object on one side and \
-                       a Number, BigInt, String, Symbol or Boolean on the other. It cannot use the hint>=0 arm \
-                       above, which coerces whenever EITHER side is an object: `obj == obj` is step 1's \
-                       reference comparison and `obj == null` is step 12, and neither performs ToPrimitive. So \
-                       the operator states its own condition and js_eq_slow's copy of it stops being reachable \
-                       with an object — it ran that ToPrimitive with JS_CallFree from C, where a `valueOf` \
-                       containing a loop had no flow base. A Boolean counts because steps 6-7 convert it with no \
-                       user code and step 11 then coerces the object anyway. */ \
-                    if ((coerce_hint) == HINT_LOOSE_EQ) {               \
-                        int lt1 = JS_VALUE_GET_TAG(op1), lt2 = JS_VALUE_GET_TAG(op2); \
-                        bool lo1 = (lt1 == JS_TAG_OBJECT), lo2 = (lt2 == JS_TAG_OBJECT); \
-                        int lother = lo1 ? lt2 : lt1;                   \
-                        if (lo1 != lo2                                  \
-                            && (tag_is_number(lother) || tag_is_string(lother) \
-                                || lother == JS_TAG_SYMBOL || lother == JS_TAG_BOOL)) { \
-                            tp_slot = lo1 ? -2 : -1;                    \
-                            tp_hint = HINT_NONE;                        \
-                            tp_retry_pc = pc - 1;                       \
-                            goto do_toprim_tramp;                       \
-                        }                                               \
-                    }                                                   \
-                    if (slow_call)                                      \
-                        goto exception;                                 \
-                    sp--;                                               \
+                    goto cmp_slow;                                      \
                 }                                                       \
                 }                                                       \
             BREAK
 
-            OP_CMP(OP_lt,  <,  HINT_NUMBER, js_relational_slow(ctx, sp, opcode));
-            OP_CMP(OP_lte, <=, HINT_NUMBER, js_relational_slow(ctx, sp, opcode));
-            OP_CMP(OP_gt,  >,  HINT_NUMBER, js_relational_slow(ctx, sp, opcode));
-            OP_CMP(OP_gte, >=, HINT_NUMBER, js_relational_slow(ctx, sp, opcode));
-            OP_CMP(OP_eq,  ==, HINT_LOOSE_EQ, js_eq_slow(ctx, sp, 0));
-            OP_CMP(OP_neq, !=, HINT_LOOSE_EQ, js_eq_slow(ctx, sp, 1));
-            OP_CMP(OP_strict_eq,  ==, -1, js_strict_eq_slow(ctx, sp, 0));
-            OP_CMP(OP_strict_neq, !=, -1, js_strict_eq_slow(ctx, sp, 1));
+            OP_CMP(OP_lt,  <);
+            OP_CMP(OP_lte, <=);
+            OP_CMP(OP_gt,  >);
+            OP_CMP(OP_gte, >=);
+            OP_CMP(OP_eq,  ==);
+            OP_CMP(OP_neq, !=);
+            OP_CMP(OP_strict_eq,  ==);
+            OP_CMP(OP_strict_neq, !=);
+
+        cmp_slow:
+            /* The hint this comparison owes its operands, or -1 when it owes them none. The RELATIONAL four run
+               ToPrimitive(number) on both (7.2.13 step 1) — and on all four the LEFT SOURCE operand is coerced
+               first: `a > b` is IsLessThan(b, a, LeftFirst=false), whose step 3 coerces py, which is `a`. STRICT
+               equality coerces nothing. Loose ==/!= is the CONDITIONAL one, handled by its own arm below. */
+            sf->cur_pc = pc;
+        do_cmp_after_coerce:
+            /* THE RESUME POINT, and it is the TOP of the slow path rather than the operation: 7.2.13 coerces BOTH
+               operands, so one delivered primitive can still leave an object on the other side and the question
+               "is there another operand to coerce" has to be asked again — a decision about the values as they
+               NOW are, which is what a continuation is for. What the retry re-ran was the both-int fast path in
+               the macro above, which the pass that suspended had already been past. Each coercion strictly
+               removes one object, so this re-entry cannot cycle. */
+            {
+                int chint;
+                switch (opcode) {
+                case OP_lt: case OP_lte: case OP_gt: case OP_gte: chint = HINT_NUMBER; break;
+                case OP_eq: case OP_neq:                          chint = HINT_LOOSE_EQ; break;
+                default:
+                    DCHECK(opcode == OP_strict_eq || opcode == OP_strict_neq,
+                           "an opcode reached the comparison slow path that is not one of the eight");
+                    chint = -1;
+                    break;
+                }
+                if (chint >= 0
+                    && (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT
+                        || JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT)) {
+                    tp_slot = (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT) ? -2 : -1;
+                    tp_hint = chint;
+                    tp_op_byte = pc - 1;
+                    tp_resume_at = TPR_CMP_AFTER_COERCE;
+                    goto do_toprim_tramp;
+                }
+                /* 7.2.14 steps 10-11: LOOSE equality coerces exactly one shape — an Object on one side and
+                   a Number, BigInt, String, Symbol or Boolean on the other. It cannot use the hint>=0 arm
+                   above, which coerces whenever EITHER side is an object: `obj == obj` is step 1's
+                   reference comparison and `obj == null` is step 12, and neither performs ToPrimitive. So
+                   the operator states its own condition and js_eq_slow's copy of it stops being reachable
+                   with an object — it ran that ToPrimitive with JS_CallFree from C, where a `valueOf`
+                   containing a loop had no flow base. A Boolean counts because steps 6-7 convert it with no
+                   user code and step 11 then coerces the object anyway. */
+                if (chint == HINT_LOOSE_EQ) {
+                    int lt1 = JS_VALUE_GET_TAG(sp[-2]), lt2 = JS_VALUE_GET_TAG(sp[-1]);
+                    bool lo1 = (lt1 == JS_TAG_OBJECT), lo2 = (lt2 == JS_TAG_OBJECT);
+                    int lother = lo1 ? lt2 : lt1;
+                    if (lo1 != lo2
+                        && (tag_is_number(lother) || tag_is_string(lother)
+                            || lother == JS_TAG_SYMBOL || lother == JS_TAG_BOOL)) {
+                        tp_slot = lo1 ? -2 : -1;
+                        tp_hint = HINT_NONE;
+                        tp_op_byte = pc - 1;
+                        tp_resume_at = TPR_CMP_AFTER_COERCE;
+                        goto do_toprim_tramp;
+                    }
+                }
+            }
+            switch (opcode) {
+            case OP_lt: case OP_lte: case OP_gt: case OP_gte:
+                if (js_relational_slow(ctx, sp, opcode)) goto exception;
+                break;
+            case OP_eq:
+                if (js_eq_slow(ctx, sp, 0)) goto exception;
+                break;
+            case OP_neq:
+                if (js_eq_slow(ctx, sp, 1)) goto exception;
+                break;
+            case OP_strict_eq:
+                if (js_strict_eq_slow(ctx, sp, 0)) goto exception;
+                break;
+            default:
+                if (js_strict_eq_slow(ctx, sp, 1)) goto exception;
+                break;
+            }
+            sp--;
+            BREAK;
 
         CASE(OP_in):
             sf->cur_pc = pc;
             /* ToPropertyKey on the LEFT operand is the page's @@toPrimitive/valueOf/toString, and `in` was the one
                keyed operator that never joined key_toprim — both js_operator_in and the old proxy reshape reached
                it through JS_ValueToAtom from C. */
-            if (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT) { tp_slot = -2; tp_retry_pc = pc - 1;
+            if (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT) { tp_slot = -2; tp_op_byte = pc - 1;
                                                               tp_resume_at = TPR_IN; goto key_toprim; }
         do_in_after_key:
             /* THE RESUME POINT: the key coercion is the first thing this opcode does, so everything from here on
@@ -35869,7 +35983,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             sf->cur_pc = pc;
             /* ToPropertyKey on the key operand is the page's code; js_operator_delete and the old proxy reshape
                both reached it through JS_ValueToAtom from C. */
-            if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) { tp_slot = -1; tp_retry_pc = pc - 1;
+            if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) { tp_slot = -1; tp_op_byte = pc - 1;
                                                               tp_resume_at = TPR_DELETE; goto key_toprim; }
         do_delete_after_key:
             /* the same: the coercion is this opcode's first act, so the resume is simply the rest of it. */
@@ -35950,7 +36064,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             case JS_TAG_SYMBOL:
                 break;
             case JS_TAG_OBJECT:
-                sf->cur_pc = pc; tp_slot = -1; tp_retry_pc = pc - 1;
+                sf->cur_pc = pc; tp_slot = -1; tp_op_byte = pc - 1;
                 tp_resume_at = TPR_PROPKEY; goto key_toprim;
             default:
                 sf->cur_pc = pc;
@@ -35978,7 +36092,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             case JS_TAG_SYMBOL:
                 break;
             case JS_TAG_OBJECT:
-                sf->cur_pc = pc; tp_slot = -1; tp_retry_pc = pc - 1;
+                sf->cur_pc = pc; tp_slot = -1; tp_op_byte = pc - 1;
                 tp_resume_at = TPR_PROPKEY2; goto key_toprim;
             default:
                 sf->cur_pc = pc;
@@ -49335,7 +49449,7 @@ static int js_import_opts_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
         s->hdr.stage = 1;
 
         /* step 6: the specifier is a PRIMITIVE by now — an object one was coerced by OP_import's ToPrimitive
-           request before the opcode re-executed — so this runs nothing. It still throws for a Symbol, and that
+           request before the opcode resumed — so this runs nothing. It still throws for a Symbol, and that
            throw rejects like every other. */
         s->spec_str = JS_ToString(ctx, step_arg(&s->hdr, 0));
         if (JS_IsException(s->spec_str)) {
