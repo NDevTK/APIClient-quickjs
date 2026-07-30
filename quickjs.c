@@ -19183,14 +19183,6 @@ typedef struct JSCtorProto {
     uint8_t from_super;
     int8_t first;            /* tramp_first: -2 = the stack shape, 0 = super()'s */
     uint8_t is_tail;
-    /* WHAT THE RESUME RE-EXECUTES, captured so it can be CHECKED rather than trusted. The delivery re-enters
-       do_construct_tramp from the top, which recomputes the callee's bytecode header, is_derived_class_constructor
-       and narg_alloc before reaching the read. That is sound ONLY while every one of those is a pure function of
-       state this struct parked — none of them may observe anything the `prototype` getter could have changed. It
-       is an invariant, not a comment, so the resume asserts it: a line added to that prologue that reads mutable
-       state makes these diverge and crashes at the origin instead of silently re-deciding. */
-    uint16_t chk_arg_count;
-    uint8_t chk_is_derived;
 } JSCtorProto;
 static void js_ctor_proto_free(JSContext *ctx, JSCtorProto *cp);
 
@@ -23359,10 +23351,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        is what makes do_construct_tramp issue it; read+reset there, so a re-entry cannot re-read and a second
        construct on this frame cannot inherit the first one's prototype. */
     JSValue con_proto = JS_UNINITIALIZED;
-    /* what the prologue computed BEFORE the read suspended, so the re-entry can prove it recomputed the same
-       thing. Only meaningful while con_proto is set. */
-    uint16_t con_proto_chk_arg_count = 0;
-    uint8_t con_proto_chk_is_derived = 0;
     /* Promise-executor trampoline (do_promise_exec_tramp): the SAME builtin is reached by two entry shapes, so both
        set these before the goto — `new Promise(fn)` (OP_call_constructor: operands on the caller stack, popped at
        finish) and `super(fn)` from a Promise subclass (OP_init_ctor: args are the derived frame's argv, nothing to
@@ -25060,6 +25048,36 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         do_construct_tramp:
+            /* 10.2.2 step 5 -> 10.1.13 step 2: `? Get(newTarget, "prototype")`, the page's code, performed HERE —
+               BEFORE any of the frame setup below — so that setup is entered exactly once per construct and
+               nothing in it is ever re-executed. It used to sit INSIDE the block, which meant the delivery had to
+               re-enter from the top and re-decide with `JS_IsUninitialized(con_proto)`: a REPLAY, sound only
+               while every line above the read stayed pure, which is not a property anyone can maintain. The
+               resume now lands at do_construct_have_proto, past this, and the purity check that guarded the
+               replay is deleted with it — the state it asserted about can no longer arise. */
+            if (JS_IsUninitialized(con_proto)) {
+                JSObject *pf0 = JS_VALUE_GET_OBJ(con_func);
+                if (!pf0->u.func.function_bytecode->is_derived_class_constructor) {
+                    /* a derived constructor binds `this` via super() and is never handed a prototype */
+                    JSCtorProto *cp = js_mallocz(ctx, sizeof(*cp));
+                    if (unlikely(!cp)) { free_arg_list(ctx, con_args_owned, con_argc); con_args_owned = NULL; JS_FreeValue(ctx, con_super_ref); JS_ThrowOutOfMemory(ctx); goto exception; }
+                    cp->func = con_func; cp->ntgt = con_ntgt;   /* borrowed; see JSCtorProto */
+                    cp->super_ref = con_super_ref;   con_super_ref = JS_UNDEFINED;
+                    cp->args = con_args; cp->argc = con_argc;
+                    cp->args_owned = con_args_owned; con_args_owned = NULL;
+                    cp->cargc = con_cargc; con_cargc = -1;
+                    cp->from_super = con_from_super;
+                    cp->first = (int8_t)tramp_first; cp->is_tail = tramp_is_tail;
+                    cp->outer = con_outer; cp->outer_kind = con_outer_kind;
+                    con_outer = NULL; con_outer_kind = CONT_NONE;
+                    sf->cur_pc = pc;
+                    gp_outer = cp; gp_outer_kind = CONT_CTOR_PROTO;
+                    gp_obj = cp->ntgt; gp_atom = JS_ATOM_prototype;
+                    gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                    goto do_getprop_tramp;
+                }
+            }
+        do_construct_have_proto:
             /* Run a bytecode CONSTRUCTOR body on THIS chain (so a loop in the constructor body preempts the base
                flow) instead of C-recursing through JS_CallConstructorInternal. Two entry shapes feed it via the
                con_* locals: `new C()` (OP_call_constructor, con_from_super=0, args + func/new_target on the caller
@@ -25087,43 +25105,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 size_t asize = sizeof(JSValue) * TRAMP_FRAME_SLOTS(narg_alloc, nb)
                              + sizeof(JSVarRef *) * nb->var_ref_count;
                 TrampFrame *ntf; JSValue *nlb, *narg_buf, *nvar_buf, *nstack_buf; JSStackFrame *nsf; int k;
-                /* THE RESUME'S PURITY CHECK. con_proto set means this is a re-entry after the `prototype`
-                   read suspended, and everything above has just been recomputed from parked state. If any of it
-                   now differs, the prologue read something the page's getter could change and the re-entry is a
-                   REPLAY that can decide differently than the suspension did — banned, and caught here rather
-                   than surfacing as a wrong construct. */
-                DCHECK(JS_IsUninitialized(con_proto)
-                       || (con_proto_chk_arg_count == nb->arg_count
-                           && con_proto_chk_is_derived == (uint8_t)nb->is_derived_class_constructor),
-                       "the construct prologue recomputed differently after the prototype read — it is observing "
-                       "mutable state, so re-entering it is a replay, not a resume");
                 if (nb->is_derived_class_constructor) {
                     cthis = JS_UNDEFINED;   /* bound by super(); body returns the object itself */
                     DCHECK(JS_IsUninitialized(con_proto),
                            "a derived constructor was handed a prototype: its `this` comes from super()");
-                } else if (JS_IsUninitialized(con_proto)) {
-                    /* 10.2.2 step 5 -> 10.1.13 step 2: `? Get(newTarget, "prototype")`, the page's code. The whole
-                       construct parks on the read; nothing of the callee frame has been built yet, so there is
-                       nothing to unwind if it throws. */
-                    JSCtorProto *cp = js_mallocz(ctx, sizeof(*cp));
-                    if (unlikely(!cp)) { free_arg_list(ctx, con_args_owned, con_argc); con_args_owned = NULL; JS_FreeValue(ctx, con_super_ref); JS_ThrowOutOfMemory(ctx); goto exception; }
-                    cp->func = nfunc; cp->ntgt = ntgt;   /* borrowed; see JSCtorProto */
-                    cp->super_ref = con_super_ref;   con_super_ref = JS_UNDEFINED;
-                    cp->args = con_args; cp->argc = con_argc;
-                    cp->args_owned = con_args_owned; con_args_owned = NULL;
-                    cp->cargc = con_cargc; con_cargc = -1;
-                    cp->from_super = con_from_super;
-                    cp->first = (int8_t)tramp_first; cp->is_tail = tramp_is_tail;
-                    cp->chk_arg_count = (uint16_t)nb->arg_count;
-                    cp->chk_is_derived = (uint8_t)nb->is_derived_class_constructor;
-                    cp->outer = con_outer; cp->outer_kind = con_outer_kind;
-                    con_outer = NULL; con_outer_kind = CONT_NONE;
-                    sf->cur_pc = pc;
-                    gp_outer = cp; gp_outer_kind = CONT_CTOR_PROTO;
-                    gp_obj = cp->ntgt; gp_atom = JS_ATOM_prototype;
-                    gp_op = GP_GET; gp_val = JS_UNDEFINED;
-                    goto do_getprop_tramp;
                 } else {
+                    DCHECK(!JS_IsUninitialized(con_proto),
+                           "a base constructor reached the frame setup with no prototype — the read is hoisted "
+                           "above this block precisely so it cannot");
                     /* 10.1.13 step 3: a non-object `prototype` falls back to the CONSTRUCTOR'S REALM intrinsic,
                        which is read off the function without invoking it. */
                     JSValue cproto = con_proto; con_proto = JS_UNINITIALIZED;
@@ -28225,10 +28214,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                           tramp_first = cp->first; tramp_is_tail = cp->is_tail;
                           con_outer = cp->outer; con_outer_kind = cp->outer_kind;
                           con_proto = ret_val; ret_val = JS_UNDEFINED;
-                          con_proto_chk_arg_count = cp->chk_arg_count;
-                          con_proto_chk_is_derived = cp->chk_is_derived;
                           js_ctor_proto_free(ctx, cp);
-                          goto do_construct_tramp;
+                          goto do_construct_have_proto;   /* PAST the read: nothing above it re-executes */
                       }
                       if (gk == CONT_ARRAY_LEN) {
                           /* the RE-ISSUED write finished. The sequence owned its operands and nothing else, so
@@ -32087,10 +32074,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             tramp_first = cp->first; tramp_is_tail = cp->is_tail;
                             con_outer = cp->outer; con_outer_kind = cp->outer_kind;
                             con_proto = ret_val; ret_val = JS_UNDEFINED;
-                            con_proto_chk_arg_count = cp->chk_arg_count;
-                            con_proto_chk_is_derived = cp->chk_is_derived;
                             js_ctor_proto_free(ctx, cp);
-                            goto do_construct_tramp;
+                            goto do_construct_have_proto;   /* PAST the read: nothing above it re-executes */
                         }
                     }
                     if (gouter_kind == CONT_ARRAY_LEN) {
