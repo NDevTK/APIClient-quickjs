@@ -19214,7 +19214,7 @@ typedef struct JSArrayLen {
     JSValue getter, setter;
     int dflags;
 } JSArrayLen;
-enum { AL_UINT32 = 0, AL_NUMBER, AL_COMPARE, AL_REISSUED };
+enum { AL_UINT32 = 0, AL_NUMBER, AL_COMPARE };
 static void js_array_len_free(JSContext *ctx, JSArrayLen *al);
 
 #define CONT_DEFINE_CLASS  63  /* gp_outer = JSOpClass: 15.7.14 ClassDefinitionEvaluation step 8.d.i's
@@ -27709,7 +27709,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto do_toprim_tramp;
                 }
                 DCHECK(al->phase == AL_COMPARE, "the Array length coercion resumed in no phase");
-                /* an AL_REISSUED state is unwrapped at the delivery, never stepped */
                 /* steps 4-5 on the second primitive: the legacy double conversion and its comparison. */
                 if (unlikely(JS_ToArrayLengthFree(ctx, &len1, ret_val, false))) {
                     ret_val = JS_UNDEFINED;
@@ -28288,16 +28287,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                           }
                           goto do_construct_have_proto;   /* PAST the read: nothing above it re-executes */
                       }
-                      if (gk == CONT_ARRAY_LEN) {
-                          /* the RE-ISSUED write finished. The sequence owned its operands and nothing else, so
-                             it unwraps to whatever was waiting on the write and this label runs again for it. */
-                          JSArrayLen *alx = gouter0;
-                          DCHECK(alx->phase == AL_REISSUED,
-                                 "an Array length sequence was delivered a keyed answer before it re-issued");
-                          gp_outer = alx->outer; gp_outer_kind = alx->outer_kind;
-                          js_array_len_free(ctx, alx);
-                          goto do_getprop_complete;
-                      }
+                      DCHECK(gk != CONT_ARRAY_LEN,
+                             "an Array length sequence was delivered a keyed answer — it performs its own write "
+                             "now and issues no second request, so nothing can deliver one to it");
                       if (gk == CONT_DEFINE_CLASS) {
                           /* the heritage's `prototype` was a plain data property, which is every ordinary
                              `class C extends D`. */
