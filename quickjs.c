@@ -19183,7 +19183,12 @@ typedef struct JSCtorProto {
     uint8_t from_super;
     int8_t first;            /* tramp_first: -2 = the stack shape, 0 = super()'s */
     uint8_t is_tail;
+    /* WHICH ARM SUSPENDED, so the delivery resumes INTO IT past its own predicate. Re-testing the arm conditions
+       on the way back would re-decide from operands the `prototype` getter has had a chance to mutate — a replay,
+       which is what the hoist above do_construct_tramp exists to remove. */
+    uint8_t resume_arm;
 } JSCtorProto;
+enum { CTOR_RESUME_CONSTRUCT = 0, CTOR_RESUME_PROMISE_EXEC };
 static void js_ctor_proto_free(JSContext *ctx, JSCtorProto *cp);
 
 #define CONT_ARRAY_LEN     64  /* tp_outer = JSArrayLen: 10.4.2.4 ArraySetLength steps 3-5, whose TWO coercions
@@ -23351,6 +23356,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        is what makes do_construct_tramp issue it; read+reset there, so a re-entry cannot re-read and a second
        construct on this frame cannot inherit the first one's prototype. */
     JSValue con_proto = JS_UNINITIALIZED;
+    /* the prototype the promise arm's own suspension delivered, consumed by do_promise_exec_tramp */
+    JSValue pe_proto = JS_UNINITIALIZED;
     /* Promise-executor trampoline (do_promise_exec_tramp): the SAME builtin is reached by two entry shapes, so both
        set these before the goto — `new Promise(fn)` (OP_call_constructor: operands on the caller stack, popped at
        finish) and `super(fn)` from a Promise subclass (OP_init_ctor: args are the derived frame's argv, nothing to
@@ -24432,7 +24439,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 JSPromiseExec *s;
                 JSValue rfuncs[2], pobj;
-                pobj = js_promise_new(ctx, pe_ntgt, rfuncs);   /* steps 3-8 (OrdinaryCreateFromConstructor uses NewTarget) */
+                /* step 3 is ALREADY DONE — the arm suspended on it and resumed past its own predicate. 10.1.13
+                   step 3's fallback takes the CONSTRUCTOR's realm, not the running one. */
+                {
+                    JSValue pproto = pe_proto; pe_proto = JS_UNINITIALIZED;
+                    DCHECK(!JS_IsUninitialized(pproto),
+                           "the promise executor arm ran without its prototype read — it must suspend for it");
+                    if (!JS_IsObject(pproto)) {
+                        JSContext *prealm = JS_GetFunctionRealm(ctx, pe_ntgt);
+                        JS_FreeValue(ctx, pproto);
+                        if (unlikely(!prealm)) goto promise_exec_abort;
+                        pproto = js_dup(prealm->class_proto[JS_CLASS_PROMISE]);
+                    }
+                    pobj = JS_NewObjectProtoClass(ctx, pproto, JS_CLASS_PROMISE);
+                    JS_FreeValue(ctx, pproto);
+                    if (unlikely(JS_IsException(pobj))) goto promise_exec_abort;
+                    pobj = js_promise_init_from_obj(ctx, pobj, rfuncs);   /* steps 4-8 */
+                }
                 if (unlikely(JS_IsException(pobj))) goto promise_exec_abort;
                 s = js_malloc_rt(rt, sizeof(*s));
                 if (unlikely(!s)) {
@@ -24980,6 +25003,34 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto do_step_step;
                 }
                 if (cmach == NATIVE_PROMISE_EXEC && promise_exec_ready(ctx, con_args, con_argc)) {
+                    if (JS_IsUninitialized(con_proto)) {
+                        /* 27.2.3.1 step 3, the same hoist do_construct_tramp uses: the read happens BEFORE the
+                           arm's body, and the delivery resumes at do_promise_exec_arm past this — the arm was
+                           chosen before the read and is never re-tested after it. */
+                        JSCtorProto *cp = js_mallocz(ctx, sizeof(*cp));
+                        if (unlikely(!cp)) { free_arg_list(ctx, con_args_owned, con_argc); con_args_owned = NULL;
+                                             JS_FreeValue(ctx, con_super_ref); JS_ThrowOutOfMemory(ctx); goto exception; }
+                        cp->func = con_func; cp->ntgt = con_ntgt;   /* borrowed; see JSCtorProto */
+                        cp->super_ref = con_super_ref;   con_super_ref = JS_UNDEFINED;
+                        cp->args = con_args; cp->argc = con_argc;
+                        cp->args_owned = con_args_owned; con_args_owned = NULL;
+                        cp->cargc = con_cargc;
+                        cp->from_super = con_from_super;
+                        cp->first = (int8_t)tramp_first; cp->is_tail = tramp_is_tail;
+                        cp->outer = con_outer; cp->outer_kind = con_outer_kind;
+                        con_outer = NULL; con_outer_kind = CONT_NONE;
+                        cp->resume_arm = CTOR_RESUME_PROMISE_EXEC;
+                        sf->cur_pc = pc;
+                        gp_outer = cp; gp_outer_kind = CONT_CTOR_PROTO;
+                        gp_obj = cp->ntgt; gp_atom = JS_ATOM_prototype;
+                        gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                        goto do_getprop_tramp;
+                    }
+                    goto do_promise_exec_arm;
+                }
+                goto do_construct_no_arm;
+            do_promise_exec_arm:
+                {
                     pe_outer = con_outer; pe_outer_kind = con_outer_kind;
                     con_outer = NULL; con_outer_kind = CONT_NONE;
                     pe_ntgt = con_ntgt; pe_executor = con_args[0];
@@ -24991,8 +25042,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                     pe_cfirst = tramp_first; pe_cargc = con_pop;
                     pe_super_ref = con_super_ref; con_super_ref = JS_UNDEFINED;
+                    pe_proto = con_proto; con_proto = JS_UNINITIALIZED;   /* read+reset, as the dispatch does */
                     goto do_promise_exec_tramp;
                 }
+            do_construct_no_arm:
                 /* No arm matched: a C constructor with no body to suspend. The cleanup is fully determined by the
                    operand shape, which is why these were two blocks. */
                 if (tramp_first == -2) {
@@ -28214,7 +28267,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                           tramp_first = cp->first; tramp_is_tail = cp->is_tail;
                           con_outer = cp->outer; con_outer_kind = cp->outer_kind;
                           con_proto = ret_val; ret_val = JS_UNDEFINED;
-                          js_ctor_proto_free(ctx, cp);
+                          {   uint8_t ra = cp->resume_arm;
+                              js_ctor_proto_free(ctx, cp);
+                              if (ra == CTOR_RESUME_PROMISE_EXEC) goto do_promise_exec_arm;
+                          }
                           goto do_construct_have_proto;   /* PAST the read: nothing above it re-executes */
                       }
                       if (gk == CONT_ARRAY_LEN) {
@@ -32074,7 +32130,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             tramp_first = cp->first; tramp_is_tail = cp->is_tail;
                             con_outer = cp->outer; con_outer_kind = cp->outer_kind;
                             con_proto = ret_val; ret_val = JS_UNDEFINED;
-                            js_ctor_proto_free(ctx, cp);
+                            {   uint8_t ra = cp->resume_arm;
+                                js_ctor_proto_free(ctx, cp);
+                                if (ra == CTOR_RESUME_PROMISE_EXEC) goto do_promise_exec_arm;
+                            }
                             goto do_construct_have_proto;   /* PAST the read: nothing above it re-executes */
                         }
                     }
