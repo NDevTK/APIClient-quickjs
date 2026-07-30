@@ -78094,11 +78094,10 @@ static JSValue js_map_constructor(JSContext *ctx, JSValueConst new_target,
                                   int argc, JSValueConst *argv, int magic)
 {
     JSMapState *s;
-    JSValue obj, adder = JS_UNDEFINED, iter = JS_UNDEFINED, next_method = JS_UNDEFINED;
+    JSValue obj;
     JSValueConst arr;
-    bool is_set, is_weak;
+    bool is_weak;
 
-    is_set = magic & MAGIC_SET;
     is_weak = ((magic & MAGIC_WEAK) != 0);
     obj = js_create_from_ctor(ctx, new_target, JS_CLASS_MAP + magic);
     if (JS_IsException(obj))
@@ -78112,27 +78111,17 @@ static JSValue js_map_constructor(JSContext *ctx, JSValueConst new_target,
     if (argc > 0)
         arr = argv[0];
     if (!JS_IsUndefined(arr) && !JS_IsNull(arr)) {
-        JSValue item, ret;
-        int done;
-
-        adder = JS_GetProperty(ctx, obj, is_set ? JS_ATOM_add : JS_ATOM_set);
-        if (JS_IsException(adder))
-            goto fail;
-        if (!JS_IsFunction(ctx, adder)) {
-            JS_ThrowTypeError(ctx, "%s is not a function", is_set ? "set" : "add");
-            goto fail;
-        }
-
         /* DELETED: the iteration loop. new Map/Set(iterable) over any callable @@iterator is driven by the
-           ONE consume machine (ITERCONS_MAP / ITERCONS_SET), which acquires on the tramp and performs
-           IfAbruptCloseIterator itself. This loop drove .next and the adder from C, where a coroutine cannot
-           suspend. An iterable reaching here means a call site was not routed. */
-        /* Reaching here with a non-nullish source at all is the unrouted construct shape. The line above used to
-           call JS_GetIterator first, "to throw for a non-iterable" — but deciding iterability means reading
-           @@iterator, which is the page's code, from C: the very thing the consume machine's acquire exists to
-           do on the chain. A NON-iterable source is not an exception to that; the machine's own acquire throws
-           the TypeError for it. So the probe was the last C acquire path in the engine, kept alive by a case that
-           does not need it, and it is gone with JS_GetIterator. */
+           ONE consume machine (ITERCONS_MAP / ITERCONS_SET), which acquires on the tramp, reads `set`/`add`
+           there, and performs IfAbruptCloseIterator itself. This loop drove .next and the adder from C, where a
+           coroutine cannot suspend. An iterable reaching here means a call site was not routed.
+           WHAT WENT WITH IT THIS TIME: the `adder` read, the iterator locals and the fail-path IteratorClose.
+           All three sat DOWNSTREAM of the DFAIL — the adder read ran first, but only on a path that then aborts
+           — so they were the deleted acquire's residue, kept alive by a `fail:` label whose iterator could never
+           be an object. 24.1.1.1 step 6's `? Get(map, "set")` is the page's code and belongs to the machine that
+           can suspend in it, which is where it already lives; a second copy here is the legacy twin the ban is
+           about, and being unreachable is not being absent. It was also the last inline JS_IteratorClose left in
+           a builtin. */
         DFAIL("new Map/Set reached its C entry with a non-nullish source - route that construct shape onto the "
               "consume machine, which acquires on the chain and throws for a non-iterable itself");
         JS_ThrowTypeError(ctx, "new Map/Set: unrouted construct shape (no off-tramp implementation exists)");
@@ -78140,13 +78129,6 @@ static JSValue js_map_constructor(JSContext *ctx, JSValueConst new_target,
     }
     return obj;
  fail:
-    if (JS_IsObject(iter)) {
-        /* close the iterator object, preserving pending exception */
-        JS_IteratorClose(ctx, iter, true);
-    }
-    JS_FreeValue(ctx, next_method);
-    JS_FreeValue(ctx, iter);
-    JS_FreeValue(ctx, adder);
     JS_FreeValue(ctx, obj);
     return JS_EXCEPTION;
 }
