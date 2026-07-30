@@ -1469,6 +1469,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_STR_CHARAT, STEPDEF_STR_CHARCODEAT, STEPDEF_STR_SLICE, STEPDEF_STR_SUBSTR, STEPDEF_STR_REPEAT,
     STEPDEF_STR_PADSTART, STEPDEF_STR_PADEND,
     STEPDEF_TA_AT, STEPDEF_TA_SET, STEPDEF_JSON_RAWJSON,
+    STEPDEF_BOOLEAN_CTOR,
     STEPDEF_OBJ_DEFINEPROPERTY, STEPDEF_REFLECT_DEFINEPROPERTY, STEPDEF_OBJ_DEFINEPROPERTIES,
     STEPDEF_OBJ_DEFGETTER, STEPDEF_OBJ_DEFSETTER,
     STEPDEF_OBJ_CREATE,
@@ -1483,7 +1484,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_REGEXP_EXEC, STEPDEF_REGEXP_TEST,
     STEPDEF_ITER_TAKE, STEPDEF_ITER_DROP, STEPDEF_ITER_WRAP_RETURN,
     STEPDEF_ITER_CONCAT_NEXT, STEPDEF_ITER_CONCAT_RETURN, STEPDEF_ARRAY_ITER_NEXT,
-    STEPDEF_OWNKEYS_NAMES, STEPDEF_OWNKEYS_SYMBOLS, STEPDEF_REFLECT_OWNKEYS, STEPDEF_HAS_OWN_ENUM,
+    STEPDEF_OWNKEYS_NAMES, STEPDEF_OWNKEYS_SYMBOLS, STEPDEF_REFLECT_OWNKEYS, STEPDEF_HAS_OWN_ENUM, STEPDEF_PROP_IS_ENUM,
     STEPDEF_OBJ_KEYS, STEPDEF_OBJ_DESCS,
     STEPDEF_REFLECT_GET, STEPDEF_REFLECT_SET, STEPDEF_REFLECT_HAS, STEPDEF_REFLECT_DELETE,
     STEPDEF_PROMISE_RESOLVE, STEPDEF_PROMISE_REJECT, STEPDEF_PROMISE_CATCH, STEPDEF_PROMISE_FINALLY,
@@ -23442,6 +23443,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 atom = JS_ATOM_length;
 
                 obj = sp[-1];
+                if (unlikely((tramp_px = tramp_proto_proxy(ctx, obj, atom)) != NULL)) {
+                    /* `x.length` is the SAME [[Get]] as `x.f`, and this opcode had no route for it at all: a
+                       Proxy anywhere on the chain reached js_proxy_get from JS_GetPropertyInternal with no flow
+                       base, which is what `new Proxy(new Proxy(t, {}), {}).length` aborted on. One keyed entry,
+                       the same GP_GET the field read issues, with `length` as the key. */
+                    JSOpKeyed *ok;
+                    sf->cur_pc = pc;
+                    ok = js_mallocz(ctx, sizeof(*ok));
+                    if (unlikely(!ok)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                    ok->atom = JS_DupAtom(ctx, atom); ok->pop = 1; ok->push = 1;
+                    gp_obj = JS_MKPTR(JS_TAG_OBJECT, tramp_px); gp_atom = ok->atom;
+                    gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                    gp_recv = obj; gp_no_throw = 0;   /* the RECEIVER stays the original base */
+                    gp_outer = ok; gp_outer_kind = CONT_OP_KEYED;
+                    goto do_getprop_tramp;
+                }
                 if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
                     p = JS_VALUE_GET_OBJ(obj);
                     for(;;) {
@@ -56841,8 +56858,7 @@ JSValue JS_ReadObject(JSContext *ctx, const uint8_t *buf, size_t buf_len,
 /*******************************************************************/
 /* runtime functions & objects */
 
-static JSValue js_boolean_constructor(JSContext *ctx, JSValueConst this_val,
-                                      int argc, JSValueConst *argv);
+static JSValue js_boolean_ctor_body(JSContext *ctx, JSValueConst obj_, int argc, JSValueConst *argv);
 
 static int check_function(JSContext *ctx, JSValueConst obj)
 {
@@ -57689,30 +57705,51 @@ static JSValue js_obj_defprop_fini(JSContext *ctx, void *st, bool take_result)
 typedef struct JSHasOwnEnum {
     JSStepHdr hdr;
     JSValue result;      /* DONE (owned) */
+    JSValue obj;         /* the object asked (owned) — held across the request */
     JSAtom key;          /* the key being asked about (owned) */
     JSDescFacts facts;   /* the descriptor, as the bits the step tests (owned) */
 } JSHasOwnEnum;
+/* Two spellings of the same three steps, so ONE machine and the operand SHAPE in the declaration:
+   HOE_ARGS — (object, key) as arguments, the key already a property key from an [[OwnPropertyKeys]] list.
+   HOE_THIS — 20.1.3.4 Object.prototype.propertyIsEnumerable: `? ToPropertyKey(V)` FIRST (the page's code), then
+              `? ToObject(this)`, then the same [[GetOwnProperty]]. js_object_propertyIsEnumerable ran the
+              coercion and the descriptor read from C, and ran them in the wrong ORDER besides. */
+enum { HOE_ARGS = 0, HOE_THIS };
 static int js_has_own_enum_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSHasOwnEnum *s = st;
+    bool from_this = s->hdr.def->arg == HOE_THIS;
+    int r;
 
     if (s->hdr.stage == 0) {
-        JSValueConst obj = step_arg(&s->hdr, 0);
-        JS_FreeValue(ctx, cb_result);
-        s->result = JS_UNDEFINED;
-        s->key = JS_ATOM_NULL;
-        js_desc_facts_init(&s->facts);
-        if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT) {
-            JS_ThrowTypeErrorNotAnObject(ctx);
-            return -1;
+        if (s->hdr.str_phase == STR_PH_START) {
+            s->result = JS_UNDEFINED;
+            s->obj = JS_UNDEFINED;
+            s->key = JS_ATOM_NULL;
+            js_desc_facts_init(&s->facts);
         }
-        /* the key comes from the [[OwnPropertyKeys]] list the invariant walk already validated as Strings and
-           Symbols, so this is a lookup and not a coercion. */
-        s->key = JS_ValueToAtomInternal(ctx, step_arg(&s->hdr, 1), JS_TO_STRING_NO_SIDE_EFFECTS);
-        if (s->key == JS_ATOM_NULL) return -1;
+        if (from_this) {
+            r = step_topropkey_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->key, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->obj = JS_ToObject(ctx, s->hdr.this_val);          /* step 2, AFTER the coercion */
+            if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
+        } else {
+            JSValueConst obj = step_arg(&s->hdr, 0);
+            JS_FreeValue(ctx, cb_result);
+            if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT) {
+                JS_ThrowTypeErrorNotAnObject(ctx);
+                return -1;
+            }
+            /* the key comes from the [[OwnPropertyKeys]] list the invariant walk already validated as Strings and
+               Symbols, so this is a lookup and not a coercion. */
+            s->key = JS_ValueToAtomInternal(ctx, step_arg(&s->hdr, 1), JS_TO_STRING_NO_SIDE_EFFECTS);
+            if (s->key == JS_ATOM_NULL) return -1;
+            s->obj = js_dup(obj);
+        }
         s->hdr.stage = 1;
         s->hdr.desc_facts = &s->facts;
-        s->hdr.cb_coerce[0] = obj;   /* borrowed: the caller's argument outlives the request */
+        s->hdr.cb_coerce[0] = s->obj;   /* borrowed: the state holds it across the request */
         *out_cb = s->hdr.cb_coerce; *out_argc = (int)s->key;
         return 12;
     }
@@ -57728,6 +57765,7 @@ static JSValue js_has_own_enum_fini(JSContext *ctx, void *st, bool take_result)
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (!take_result) JS_FreeValue(ctx, s->result);
     js_desc_facts_free(ctx, &s->facts);
+    JS_FreeValue(ctx, s->obj);
     JS_FreeAtom(ctx, s->key);
     js_free(ctx, s);
     return r;
@@ -59094,35 +59132,10 @@ exception:
     return JS_EXCEPTION;
 }
 
-static JSValue js_object_propertyIsEnumerable(JSContext *ctx, JSValueConst this_val,
-                                              int argc, JSValueConst *argv)
-{
-    JSValue obj, res = JS_EXCEPTION;
-    JSAtom prop = JS_ATOM_NULL;
-    int prop_flags;
-    int has_prop;
-
-    obj = JS_ToObject(ctx, this_val);
-    if (JS_IsException(obj))
-        goto exception;
-    prop = JS_ValueToAtom(ctx, argv[0]);
-    if (unlikely(prop == JS_ATOM_NULL))
-        goto exception;
-
-    has_prop = JS_GetOwnPropertyFlagsInternal(ctx, &prop_flags, JS_VALUE_GET_OBJ(obj), prop);
-    if (has_prop < 0)
-        goto exception;
-    if (has_prop) {
-        res = js_bool(prop_flags & JS_PROP_ENUMERABLE);
-    } else {
-        res = JS_FALSE;
-    }
-
-exception:
-    JS_FreeAtom(ctx, prop);
-    JS_FreeValue(ctx, obj);
-    return res;
-}
+/* DELETED: js_object_propertyIsEnumerable's C body. 20.1.3.4 is ToPropertyKey (the page's code), ToObject, then
+   `? O.[[GetOwnProperty]](P)` (a `getOwnPropertyDescriptor` trap on a Proxy) — and it ran the first from C with
+   JS_ValueToAtom, the third from C with JS_GetOwnPropertyFlagsInternal, and the two in the WRONG ORDER besides.
+   It is STEPDEF_PROP_IS_ENUM, the same machine Iterator.zipKeyed's own-enumerable probe uses. */
 
 /* B.2.2.2 __lookupGetter__ / B.2.2.3 __lookupSetter__: ToObject, ToPropertyKey, then walk the prototype chain
    asking each link for its own descriptor until one answers. THREE of the page's operations, and the C body ran
@@ -59250,7 +59263,7 @@ static const JSCFunctionListEntry js_object_proto_funcs[] = {
     JS_CFUNC_DEF("valueOf", 0, js_object_valueOf ),
     JS_CFUNC_STEP_DEF("hasOwnProperty", 1, STEPDEF_OBJ_HASOWNPROP ),
     JS_CFUNC_DEF("isPrototypeOf", 1, js_object_isPrototypeOf ),
-    JS_CFUNC_DEF("propertyIsEnumerable", 1, js_object_propertyIsEnumerable ),
+    JS_CFUNC_STEP_DEF("propertyIsEnumerable", 1, STEPDEF_PROP_IS_ENUM ),
     JS_CGETSET_DEF("__proto__", js_object_get___proto__, js_object_set___proto__ ),
     JS_CFUNC_STEP_DEF("__defineGetter__", 2, STEPDEF_OBJ_DEFGETTER ),
     JS_CFUNC_STEP_DEF("__defineSetter__", 2, STEPDEF_OBJ_DEFSETTER ),
@@ -59579,6 +59592,14 @@ static JSValue js_primargs_fini(JSContext *ctx, void *st, bool take_result)
 #define CREATECTOR_ARG(class_id, nargs) ((class_id) | ((nargs) << 16))
 #define CREATECTOR_CLASS(a) ((a) & 0xffff)
 #define CREATECTOR_NARGS(a) (((a) >> 16) & 0xff)
+/* A WRAPPER constructor — Boolean, and every other builtin whose CALL form returns a PRIMITIVE rather than an
+   object (20.3.1.1 step 2 returns `b` when NewTarget is undefined). For those the call form is not
+   OrdinaryCreateFromConstructor degenerating to the intrinsic prototype, it is a different algorithm: the body
+   runs with NO object and its value IS the result. Declaring it is what lets the ONE create-from-ctor machine
+   serve both kinds; without it, `Boolean(0)` would answer with a Boolean OBJECT. */
+#define CREATECTOR_WRAP 0x1000000
+#define CREATECTOR_ARG_WRAP(class_id, nargs) (CREATECTOR_ARG(class_id, nargs) | CREATECTOR_WRAP)
+#define CREATECTOR_IS_WRAP(a) (((a) & CREATECTOR_WRAP) != 0)
 typedef struct JSCreateCtor {
     JSStepHdr hdr;
     JSValue result;
@@ -59600,11 +59621,21 @@ static int js_creatector_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
             return -1;
         s->hdr.stage = 1;
     }
-    /* new.target UNDEFINED is the call form of a constructor_or_func builtin (`Array(3)`): the spec's
-       OrdinaryCreateFromConstructor degenerates to the intrinsic prototype, which reads nothing. */
-    r = step_create_from_ctor_run(ctx, &s->hdr, s->hdr.this_val, CREATECTOR_CLASS(s->hdr.arg), cb_result, &obj,
-                                  out_cb, out_argc);
-    if (r) return r < 0 ? -1 : r;
+    if (CREATECTOR_IS_WRAP(s->hdr.arg) && JS_IsUndefined(s->hdr.this_val)) {
+        /* the CALL form of a WRAPPER constructor: 20.3.1.1 step 2 returns the primitive, so there is no object to
+           create and the body says what the value is. */
+        JS_FreeValue(ctx, cb_result);
+        cb_result = JS_UNDEFINED;
+        obj = JS_UNDEFINED;
+    } else {
+        /* new.target UNDEFINED is the call form of a constructor_or_func builtin (`Array(3)`): the spec's
+           OrdinaryCreateFromConstructor degenerates to the intrinsic prototype, which reads nothing. */
+        r = step_create_from_ctor_run(ctx, &s->hdr, s->hdr.this_val, CREATECTOR_CLASS(s->hdr.arg), cb_result, &obj,
+                                      out_cb, out_argc);
+        if (r) return r < 0 ? -1 : r;
+    }
+    DCHECK(s->hdr.def->body.generic || !CREATECTOR_IS_WRAP(s->hdr.arg),
+           "a wrapper constructor declares no body, so its call form has no value to answer with");
     if (!s->hdr.def->body.generic) {
         s->result = obj;
         return 0;
@@ -64077,6 +64108,9 @@ static const JSTrampStepDef js_finrec_ctor_def =
 /* 27.1.3.1 Iterator: steps 1-2 are the abstract-class validation, step 3 is the whole constructor. */
 static const JSTrampStepDef js_iterator_ctor_def =
     CREATECTOR_DEF_FULL(JS_CLASS_ITERATOR, 0, generic, NULL, 0, js_iterator_ctor_precheck);
+static const JSTrampStepDef js_boolean_ctor_def =
+    { sizeof(JSCreateCtor), js_creatector_step, js_creatector_fini, CREATECTOR_ARG_WRAP(JS_CLASS_BOOLEAN, 1),
+      { .generic = js_boolean_ctor_body }, JS_CFUNC_generic, 0, NULL, NULL, NULL };
 static const JSTrampStepDef js_bigint_ctor_def =
     { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, PRIMARGS(0x1, HINT_NUMBER, 1),
       { .generic = js_bigint_constructor }, JS_CFUNC_constructor_or_func, 0, NULL, NULL, NULL };
@@ -64125,7 +64159,8 @@ static const JSTrampStepDef js_str_localeCmp_def  = { sizeof(JSStrRecv), js_str_
 static const JSTrampStepDef js_ta_at_def          = { sizeof(JSTAIdx), js_ta_idx_step, js_ta_idx_fini, TAIDX_AT };
 static const JSTrampStepDef js_ta_set_def         = { sizeof(JSTAIdx), js_ta_idx_step, js_ta_idx_fini, TAIDX_SET };
 static const JSTrampStepDef js_json_raw_def       = { sizeof(JSJsonRaw), js_json_raw_step, js_json_raw_fini, 0 };
-static const JSTrampStepDef js_has_own_enum_def   = { sizeof(JSHasOwnEnum), js_has_own_enum_step, js_has_own_enum_fini, 0 };
+static const JSTrampStepDef js_has_own_enum_def   = { sizeof(JSHasOwnEnum), js_has_own_enum_step, js_has_own_enum_fini, HOE_ARGS };
+static const JSTrampStepDef js_prop_is_enum_def   = { sizeof(JSHasOwnEnum), js_has_own_enum_step, js_has_own_enum_fini, HOE_THIS };
 static const JSTrampStepDef js_obj_defprop_def    = { sizeof(JSObjDefProp), js_obj_defprop_step, js_obj_defprop_fini, 0 };
 static const JSTrampStepDef js_obj_defgetter_def  = { sizeof(JSObjDefAccessor), js_obj_defaccessor_step, js_obj_defaccessor_fini, 0 };
 static const JSTrampStepDef js_obj_defsetter_def  = { sizeof(JSObjDefAccessor), js_obj_defaccessor_step, js_obj_defaccessor_fini, 1 };
@@ -64585,6 +64620,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_OBJ_LOOKUPSETTER] = &js_lookupsetter_def,
     [STEPDEF_FUNC_BIND]      = &js_func_bind_def,
     [STEPDEF_ITER_SET_CTOR]  = &js_iter_set_ctor_def,
+    [STEPDEF_BOOLEAN_CTOR]   = &js_boolean_ctor_def,
     [STEPDEF_ERROR_SET_STACK] = &js_error_set_stack_def,
     [STEPDEF_ITER_SET_TAG]   = &js_iter_set_tag_def,
     [STEPDEF_ITER_HELPER_RETURN] = &js_iter_helper_return_def,
@@ -64695,6 +64731,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_OWNKEYS_SYMBOLS] = &js_ownkeys_syms_def,
     [STEPDEF_REFLECT_OWNKEYS] = &js_reflect_ownkeys_def,
     [STEPDEF_HAS_OWN_ENUM] = &js_has_own_enum_def,
+    [STEPDEF_PROP_IS_ENUM] = &js_prop_is_enum_def,
     [STEPDEF_PARSEINT]        = &js_parseInt_def,
     [STEPDEF_PARSEFLOAT]      = &js_parseFloat_def,
     [STEPDEF_STR_SPLIT]       = &js_str_split_def,
@@ -68180,19 +68217,19 @@ static const JSCFunctionListEntry js_number_proto_funcs[] = {
 
 
 /* Boolean */
-static JSValue js_boolean_constructor(JSContext *ctx, JSValueConst new_target,
-                                     int argc, JSValueConst *argv)
+/* 20.3.1.1 Boolean(value). ToBoolean invokes nothing and neither does storing [[BooleanData]], so the ONLY
+   page-visible operation is step 3's OrdinaryCreateFromConstructor — an ordinary `Get(newTarget, "prototype")`,
+   which js_create_from_ctor ran from C, so `Reflect.construct(Boolean, [], new Proxy(f, {get(){for(;;){}}}))`
+   aborted at the getter's back-edge. The create-from-ctor DECLARATION performs it on the tramp and hands the
+   object here; `obj` is UNDEFINED for the call form (step 2) and OWNED otherwise. */
+static JSValue js_boolean_ctor_body(JSContext *ctx, JSValueConst obj_, int argc, JSValueConst *argv)
 {
-    JSValue val, obj;
-    val = js_bool(JS_ToBool(ctx, argv[0]));
-    if (!JS_IsUndefined(new_target)) {
-        obj = js_create_from_ctor(ctx, new_target, JS_CLASS_BOOLEAN);
-        if (!JS_IsException(obj))
-            JS_SetObjectData(ctx, obj, val);
-        return obj;
-    } else {
-        return val;
-    }
+    JSValue obj = unsafe_unconst(obj_);
+    JSValue val = js_bool(JS_ToBool(ctx, argv[0]));
+    if (JS_IsUndefined(obj))
+        return val;                        /* step 2: the call form IS the primitive */
+    JS_SetObjectData(ctx, obj, val);       /* step 4; consumes val, leaves obj ours */
+    return obj;
 }
 
 static JSValue js_thisBooleanValue(JSContext *ctx, JSValueConst this_val)
@@ -74773,6 +74810,7 @@ fail:
 
 static int js_proxy_has(JSContext *ctx, JSValueConst obj, JSAtom atom)
 {
+    DFAIL("a C-side [[HasProperty]] reached a Proxy — the page's trap has no flow base here; route that caller onto the keyed entry's GP_HAS");
     JSProxyData *s;
     JSValue method, ret1, atom_val;
     int res;
@@ -74922,6 +74960,7 @@ static JSValue js_proxy_get_invariant(JSContext *ctx, JSValueConst target, JSAto
 static JSValue js_proxy_get(JSContext *ctx, JSValueConst obj, JSAtom atom,
                             JSValueConst receiver)
 {
+    DFAIL("a C-side [[Get]] reached a Proxy — the page's trap has no flow base here; route that caller onto the keyed entry's GP_GET");
     JSProxyData *s;
     JSValue method, ret, atom_val;
     JSValueConst args[3];
@@ -74971,6 +75010,7 @@ static int js_proxy_set_invariant(JSContext *ctx, JSValueConst target, JSAtom at
 static int js_proxy_set(JSContext *ctx, JSValueConst obj, JSAtom atom,
                         JSValueConst value, JSValueConst receiver, int flags)
 {
+    DFAIL("a C-side [[Set]] reached a Proxy — the page's trap has no flow base here; route that caller onto the keyed entry's GP_SET");
     JSProxyData *s;
     JSValue method, ret1, atom_val;
     int ret;
@@ -75245,6 +75285,7 @@ static int js_proxy_gopd_check(JSContext *ctx, JSValueConst obj, JSAtom prop,
 static int js_proxy_get_own_property(JSContext *ctx, JSPropertyDescriptor *pdesc,
                                      JSValueConst obj, JSAtom prop)
 {
+    DFAIL("a C-side [[GetOwnProperty]] reached a Proxy — the page's trap has no flow base here; route that caller onto the keyed entry's GP_GETOWNPROP");
     JSProxyData *s;
     JSValue method, trap_result_obj, prop_val;
     JSValueConst args[2];
@@ -75276,6 +75317,7 @@ static int js_proxy_define_own_property(JSContext *ctx, JSValueConst obj,
                                         JSValueConst getter,
                                         JSValueConst setter, int flags)
 {
+    DFAIL("a C-side [[DefineOwnProperty]] reached a Proxy — the page's trap has no flow base here; route that caller onto the keyed entry's GP_DEFINE");
     JSProxyData *s;
     JSValue method, ret1, prop_val, desc_val;
     int res;
@@ -75378,6 +75420,7 @@ static int js_proxy_delete_invariant(JSContext *ctx, JSValueConst target, JSAtom
 static int js_proxy_delete_property(JSContext *ctx, JSValueConst obj,
                                     JSAtom atom)
 {
+    DFAIL("a C-side [[Delete]] reached a Proxy — the page's trap has no flow base here; route that caller onto the keyed entry's GP_DELETE");
     JSProxyData *s;
     JSValue method, ret, atom_val;
     bool res;
@@ -75539,6 +75582,7 @@ static int js_proxy_get_own_property_names(JSContext *ctx,
                                            uint32_t *plen,
                                            JSValueConst obj)
 {
+    DFAIL("a C-side [[OwnPropertyKeys]] reached a Proxy — the page's trap has no flow base here; route that caller onto the keyed entry's GP_OWNKEYS");
     JSProxyData *s;
     JSValue method, prop_array;
 
@@ -81630,7 +81674,7 @@ int JS_AddIntrinsicBaseObjects(JSContext *ctx)
 
     /* Boolean */
     obj1 = JS_NewCConstructor(ctx, JS_CLASS_BOOLEAN, "Boolean",
-                              js_boolean_constructor, 1, JS_CFUNC_constructor_or_func, 0,
+                              NULL, 1, JS_CFUNC_step_ctor, STEPDEF_BOOLEAN_CTOR,
                               JS_UNDEFINED,
                               NULL, 0,
                               js_boolean_proto_funcs, countof(js_boolean_proto_funcs),
