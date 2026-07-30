@@ -20907,6 +20907,8 @@ static int check_function(JSContext *ctx, JSValueConst obj);
 static void iter_helper_close_source_abrupt(JSContext *ctx, JSIteratorHelperData *it);
 static JSValue js_typed_array_constructor_obj(JSContext *ctx, JSValueConst new_target, JSValueConst obj, int classid);
 static bool ta_consume_ready(JSContext *ctx, JSValueConst *call_argv, int call_argc, JSValue *out_getiter);
+static bool ta_buffer_ctor_ready(JSValueConst *call_argv, int call_argc);
+static const JSTrampStepDef js_ta_ctor_defs[JS_TYPED_ARRAY_COUNT];
 /* Promise.all(gen): drive the generator's .next() on the tramp chain, wrapping each yielded value in
    Promise.resolve(v).then(resolve_element) as js_promise_all's own loop does. iter/next drive the generator;
    result_promise is the returned aggregate; the other fields are the spec's per-call accumulation state. */
@@ -21447,6 +21449,12 @@ typedef struct JSStrWellFormed {
     JSStepHdr hdr;
     JSValue result;
 } JSStrWellFormed;
+
+typedef struct JSTACtor {
+    JSStepHdr hdr;
+    JSValue result;
+    JSValue argp[3];   /* the operands the body reads, with the coerced primitives in place */
+} JSTACtor;
 
 typedef struct JSIterZip {
     JSStepHdr hdr;
@@ -24910,6 +24918,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     con_args_owned = NULL;   /* same as Map/Set: the state owns it for the whole consume */
                     tac_super_ref = con_super_ref; con_super_ref = JS_UNDEFINED;
                     goto do_ta_consume_tramp;
+                }
+                if (cmach >= ITERCONS_TA_CTOR_BASE
+                    && cmach < ITERCONS_TA_CTOR_BASE + JS_TYPED_ARRAY_COUNT
+                    && ta_buffer_ctor_ready(con_args, con_argc)) {
+                    /* The SECOND entry under the same declaration: 23.2.5.1 step 6.b's view-over-a-buffer form,
+                       whose byteOffset and length are ToIndex'd — the page's code. The walk above declined it, so
+                       the branch test the spec already makes is what chose between them. */
+                    const JSTrampStepDef *bsd = &js_ta_ctor_defs[cmach - ITERCONS_TA_CTOR_BASE];
+                    void *bstt = tramp_step_state_new(ctx, bsd, con_ntgt, con_argc, con_args, con_func);
+                    if (con_args_owned) {
+                        free_arg_list(ctx, con_args_owned, con_argc); con_args_owned = NULL; con_args = NULL;
+                    }
+                    JS_FreeValue(ctx, con_super_ref); con_super_ref = JS_UNDEFINED;
+                    if (unlikely(!bstt)) goto exception;
+                    ((JSStepHdr *)bstt)->outer = con_outer;
+                    ((JSStepHdr *)bstt)->outer_kind = con_outer_kind;
+                    ((JSStepHdr *)bstt)->orig_cfirst = con_outer ? 0 : tramp_first;
+                    ((JSStepHdr *)bstt)->orig_cargc = con_outer ? 0 : con_pop;
+                    ((JSStepHdr *)bstt)->orig_is_tail = con_outer ? 0 : tramp_is_tail;
+                    con_outer = NULL; con_outer_kind = CONT_NONE;
+                    cont_st = bstt;
+                    ret_val = JS_UNDEFINED;
+                    goto do_step_step;
                 }
                 if (cmach == NATIVE_PROMISE_EXEC && promise_exec_ready(ctx, con_args, con_argc)) {
                     pe_outer = con_outer; pe_outer_kind = con_outer_kind;
@@ -62586,8 +62617,9 @@ static bool ta_consume_ready(JSContext *ctx, JSValueConst *call_argv, int call_a
     if (call_argc < 1) return false;
     /* 23.2.5.1 step 6.a: only an OBJECT first argument reaches the iterable/array-like branch — a number is a
        length and takes a different algorithm entirely, as do a TypedArray source (an element-wise copy that
-       invokes nothing) and an ArrayBuffer (a view over existing bytes, whose byteOffset/length ToIndex coercions
-       are a separate unbuilt piece). */
+       invokes nothing) and an ArrayBuffer (a view over existing bytes). The BUFFER case is the constructor's other
+       routed entry — ta_buffer_ctor_ready below — under the same declaration; declining it here is what picks
+       between the two, and it is the spec's own step 6 branch test, not a recognizer. */
     if (JS_VALUE_GET_TAG(call_argv[0]) != JS_TAG_OBJECT) return false;
     {
         JSObject *sp0 = JS_VALUE_GET_OBJ(call_argv[0]);
@@ -62599,6 +62631,22 @@ static bool ta_consume_ready(JSContext *ctx, JSValueConst *call_argv, int call_a
        real GetMethod on the tramp and picks step 5 or step 6 from its answer. */
     iter_data_at_iterator(ctx, call_argv[0], out_getiter);
     return true;
+}
+
+/* 23.2.5.1 step 6.b: `new Uint8Array(buffer, byteOffset, length)` is a VIEW over existing bytes, and its two
+   ToIndex coercions are the page's code — the constructor body reached them with JS_ToIndex from C, so a valueOf
+   with a loop in it preempted in an activation with no flow base. It is the constructor's second routed entry,
+   under the SAME declaration the iterable walk uses: one declaration on the callee, and the spec's own branch
+   test picks which entry runs. A declaration cannot say "only when the first argument is a buffer", which is why
+   a step-ctor wrapped in FRONT of the whole constructor was the wrong shape — it intercepted the object arguments
+   the consume walk owns. */
+static bool ta_buffer_ctor_ready(JSValueConst *call_argv, int call_argc)
+{
+    JSObject *sp0;
+    if (call_argc < 1 || JS_VALUE_GET_TAG(call_argv[0]) != JS_TAG_OBJECT)
+        return false;
+    sp0 = JS_VALUE_GET_OBJ(call_argv[0]);
+    return sp0->class_id == JS_CLASS_ARRAY_BUFFER || sp0->class_id == JS_CLASS_SHARED_ARRAY_BUFFER;
 }
 
 /* Route TypedArray.from(gen) (no mapfn) — js_typed_array_from's IterableToList drives the generator. this_val is the
@@ -85954,6 +86002,85 @@ static JSValue js_typed_array_constructor_ta(JSContext *ctx,
     JS_FreeValue(ctx, obj);
     return JS_EXCEPTION;
 }
+
+/* The buffer branch's two coercions, as requests. Reached ONLY with an ArrayBuffer first argument
+   (ta_buffer_ctor_ready), so the object branches the consume walk owns never arrive here and the body's own
+   js_typed_array_constructor_obj DFAIL stays unreachable. The body is not a legacy twin: with both operands
+   primitive its JS_ToIndex calls invoke nothing, which is exactly what this entry asserts, and it keeps its C
+   entry because six internal callers construct typed arrays with operands the engine itself made. */
+enum { TAC_START = 0, TAC_OFFSET, TAC_LENGTH };
+
+static int js_ta_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSTACtor *s = st;
+    int r;
+
+    if (s->hdr.stage == TAC_START) {
+        int i;
+        JS_FreeValue(ctx, cb_result);
+        cb_result = JS_UNDEFINED;
+        s->result = JS_UNDEFINED;
+        for (i = 0; i < 3; i++)
+            s->argp[i] = js_dup(step_arg(&s->hdr, i));
+        DCHECK(ta_buffer_ctor_ready((JSValueConst *)s->argp, s->hdr.argc > 0 ? s->hdr.argc : 1),
+               "the TypedArray buffer entry was reached without an ArrayBuffer first argument");
+        s->hdr.stage = TAC_OFFSET;
+        if (JS_VALUE_GET_TAG(s->argp[1]) != JS_TAG_OBJECT)
+            goto have_offset;                /* already primitive: its ToIndex invokes nothing */
+        r = step_toprim_run(ctx, &s->hdr, s->argp[1], HINT_NUMBER, JS_UNDEFINED, &cb_result, out_cb, out_argc);
+        if (r) return r < 0 ? -1 : r;
+    }
+    if (s->hdr.stage == TAC_OFFSET) {
+        JSValue prim = JS_UNDEFINED;
+        r = step_toprim_run(ctx, &s->hdr, s->argp[1], HINT_NUMBER, cb_result, &prim, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        JS_FreeValue(ctx, s->argp[1]);
+        s->argp[1] = prim;                   /* the primitive REPLACES the operand the body reads */
+    have_offset:
+        s->hdr.stage = TAC_LENGTH;
+        /* step 6.b.iii reads the length only when it is not undefined, and only AFTER the offset's own coercion —
+           which is why it is a stage of its own rather than a second bit in one mask. */
+        if (JS_IsUndefined(s->argp[2]) || JS_VALUE_GET_TAG(s->argp[2]) != JS_TAG_OBJECT)
+            goto body;
+        r = step_toprim_run(ctx, &s->hdr, s->argp[2], HINT_NUMBER, JS_UNDEFINED, &cb_result, out_cb, out_argc);
+        if (r) return r < 0 ? -1 : r;
+    }
+    if (s->hdr.stage == TAC_LENGTH) {
+        JSValue prim = JS_UNDEFINED;
+        r = step_toprim_run(ctx, &s->hdr, s->argp[2], HINT_NUMBER, cb_result, &prim, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        JS_FreeValue(ctx, s->argp[2]);
+        s->argp[2] = prim;
+    }
+ body:
+    s->result = js_typed_array_constructor(ctx, s->hdr.this_val, s->hdr.argc, (JSValueConst *)s->argp, s->hdr.arg);
+    return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
+}
+
+static JSValue js_ta_ctor_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSTACtor *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    int i;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    for (i = 0; i < 3; i++) JS_FreeValue(ctx, s->argp[i]);
+    js_free(ctx, s);
+    return r;
+}
+
+#define TACTOR_DEF(k) { sizeof(JSTACtor), js_ta_ctor_step, js_ta_ctor_fini, JS_CLASS_UINT8C_ARRAY + (k) }
+/* one per element type; `arg` carries the class id the body switches on. No STEPDEF id: the dispatch names the
+   definition by pointer, the way a DELEGATE does. */
+static const JSTrampStepDef js_ta_ctor_defs[JS_TYPED_ARRAY_COUNT] = {
+    TACTOR_DEF(0), TACTOR_DEF(1), TACTOR_DEF(2), TACTOR_DEF(3), TACTOR_DEF(4), TACTOR_DEF(5),
+    TACTOR_DEF(6), TACTOR_DEF(7), TACTOR_DEF(8), TACTOR_DEF(9), TACTOR_DEF(10), TACTOR_DEF(11),
+};
+#undef TACTOR_DEF
+_Static_assert(JS_TYPED_ARRAY_COUNT == 12,
+               "an element type was added: give it a TACTOR_DEF row, or its buffer-view constructor's argument "
+               "coercions silently lose their definition");
 
 static JSValue js_typed_array_constructor(JSContext *ctx,
                                           JSValueConst new_target,
