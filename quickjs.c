@@ -1577,6 +1577,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_PROMISE_THEN, STEPDEF_PROMISE_WITHRESOLVERS,
     STEPDEF_GET_DISPOSE_SYNC, STEPDEF_GET_DISPOSE_ASYNC, STEPDEF_DISPOSABLE_USE, STEPDEF_ASYNC_DISPOSABLE_USE,
     STEPDEF_U8_TOBASE64, STEPDEF_U8_FROMBASE64, STEPDEF_U8_SETFROMBASE64,
+    STEPDEF_ITER_DISPOSE, STEPDEF_ASYNC_ITER_DISPOSE,
     STEPDEF_SYMBOL_CTOR, STEPDEF_ERROR_TOSTRING,
     STEPDEF_MAP_UPSERT, STEPDEF_MAP_UPSERT_COMPUTED,
     STEPDEF_WEAKMAP_UPSERT, STEPDEF_WEAKMAP_UPSERT_COMPUTED,
@@ -17737,6 +17738,66 @@ static int step_strop_run(JSContext *ctx, JSStepHdr *h, JSValueConst options, JS
     JS_FreeCString(ctx, str);
     JS_ThrowTypeError(ctx, "invalid option value");
     return -1;
+}
+
+/* PromiseResolve(%Promise%, x), 27.2.4.7, as a SUB-SEQUENCE. TWO of its steps are the page's code and
+   js_promise_resolve_native performs both from C: the `constructor` READ on an x that is already a promise (an
+   accessor or a Proxy supplies it — return-suspendedStart-broken-promise.js defines exactly that), and the
+   capability's RESOLVE, which reads `.then` off a THENABLE x. That C route is sound only for a caller with
+   nowhere to suspend, which is why the comment on it names its remaining callers rather than guarding them; a
+   machine uses this instead.
+   `pout` is written EXACTLY ONCE, on the return-0 exit, like every other sub-sequence: the promise exists before
+   the resolve request parks, so holding it in the caller's local would lose it across the suspension — it lives
+   in cb[3] instead, which the caller already owns for the duration. `cb` is a 4-slot buffer the CALLER lends and
+   OWNS; its fini must free it, because the resolve request can park and the machine can be abandoned inside it. */
+enum { PRR_START = 0, PRR_CTOR, PRR_RESOLVE };
+static int step_promiseresolve_run(JSContext *ctx, JSStepHdr *h, uint8_t *phase, JSValueConst x,
+                                   JSValue *pout, JSValue *cb, JSValue in, JSValue **out_cb, int *out_argc)
+{
+    JSValue ctorv = JS_UNDEFINED, funcs[2];
+    int r;
+
+    if (*phase == PRR_START) {
+        if (!JS_GetOpaque(x, JS_CLASS_PROMISE))
+            goto build;                    /* step 3: not a promise, so no `constructor` read at all */
+        *phase = PRR_CTOR;
+        r = step_getprop_run(ctx, h, x, JS_ATOM_constructor, in, &ctorv, out_cb, out_argc);
+        in = JS_UNDEFINED;                 /* consumed either way */
+        if (r) return r;
+        goto have_ctor;
+    }
+    if (*phase == PRR_CTOR) {
+        r = step_getprop_run(ctx, h, x, JS_ATOM_constructor, in, &ctorv, out_cb, out_argc);
+        in = JS_UNDEFINED;
+        if (r) return r;
+    have_ctor:
+        {
+            bool same = js_same_value(ctx, ctorv, ctx->promise_ctor);
+            JS_FreeValue(ctx, ctorv);
+            if (same) { *phase = PRR_START; *pout = js_dup(x); return 0; }   /* step 2.b: x IS the answer */
+        }
+    build:
+        JS_FreeValue(ctx, in);
+        /* NewPromiseCapability(%Promise%): the native one, so there is no Construct and nothing observable. */
+        cb[3] = js_new_promise_capability(ctx, funcs, JS_UNDEFINED);
+        if (JS_IsException(cb[3])) { cb[3] = JS_UNDEFINED; return -1; }
+        cb[0] = JS_UNDEFINED;
+        cb[1] = funcs[0];
+        cb[2] = js_dup(x);
+        JS_FreeValue(ctx, funcs[1]);       /* step 4 calls resolve only; reject is never reachable from here */
+        *phase = PRR_RESOLVE;
+        *out_cb = cb; *out_argc = 1;
+        return 3;
+    }
+    DCHECK(*phase == PRR_RESOLVE, "PromiseResolve resumed in an unknown phase");
+    JS_FreeValue(ctx, cb[1]); cb[1] = JS_UNDEFINED;
+    JS_FreeValue(ctx, cb[2]); cb[2] = JS_UNDEFINED;
+    JS_FreeValue(ctx, in);                 /* resolve's result is discarded */
+    *pout = cb[3]; cb[3] = JS_UNDEFINED;
+    DCHECK(JS_GetOpaque(*pout, JS_CLASS_PROMISE) != NULL,
+           "PromiseResolve answered with something that is not a promise");
+    *phase = PRR_START;
+    return 0;
 }
 
 /* A keyed WRITE, Set(O, key, value, true) — the mirror of the read above and the half that was missing. Every
@@ -68205,6 +68266,8 @@ static const JSTrampStepDef js_async_disposable_use_def;
 static const JSTrampStepDef js_u8_tobase64_def;
 static const JSTrampStepDef js_u8_frombase64_def;
 static const JSTrampStepDef js_u8_setfrombase64_def;
+static const JSTrampStepDef js_iter_dispose_def;
+static const JSTrampStepDef js_async_iter_dispose_def;
 /* likewise the Map upsert machine, defined with the map code it mutates. */
 static int js_map_upsert_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_map_upsert_fini(JSContext *ctx, void *st, bool take_result);
@@ -68296,6 +68359,8 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_U8_TOBASE64]           = &js_u8_tobase64_def,
     [STEPDEF_U8_FROMBASE64]         = &js_u8_frombase64_def,
     [STEPDEF_U8_SETFROMBASE64]      = &js_u8_setfrombase64_def,
+    [STEPDEF_ITER_DISPOSE]          = &js_iter_dispose_def,
+    [STEPDEF_ASYNC_ITER_DISPOSE]    = &js_async_iter_dispose_def,
     [STEPDEF_MAP_UPSERT]            = &js_map_upsert_def,
     [STEPDEF_MAP_UPSERT_COMPUTED]   = &js_map_upsert_comp_def,
     [STEPDEF_WEAKMAP_UPSERT]        = &js_weakmap_upsert_def,
@@ -71009,65 +71074,143 @@ static JSValue js_async_dispose_to_undef(JSContext *ctx, JSValueConst this_val,
                                          int argc, JSValueConst *argv,
                                          int magic, JSValueConst *func_data);
 
-static JSValue js_iterator_proto_dispose(JSContext *ctx, JSValueConst this_val,
-                                         int argc, JSValueConst *argv)
-{
-    JSValue method;
+/* %IteratorPrototype%[@@dispose] and %AsyncIteratorPrototype%[@@asyncDispose] as STEP MACHINES. Both are
+   `GetMethod(O, "return")` followed by `Call(return, O)`, and both ran BOTH from C — the read through
+   JS_GetProperty and the call through JS_Call/JS_CallFree — so an iterator whose `return` is an accessor, or
+   whose body loops, had no flow base. `arg` says which: the async one wraps its result in a promise. */
+typedef struct JSIterDispose {
+    JSStepHdr hdr;        /* MUST be first */
+    JSValue result;       /* owned: undefined for the sync form, the capability's promise for the async one */
+    JSValue method;       /* `return`, held across its call (owned) */
+    JSValue inner;        /* the call's result, held across PromiseResolve (owned) */
+    JSValue cb[4];        /* the call/resolve operands this state OWNS — a parked request can be abandoned.
+                             Four, not three: PromiseResolve holds its promise in the last slot across its own
+                             request, which is what makes `pout` a single write on the return-0 exit. */
+    JSValue cap_funcs[2]; /* the ASYNC form's own capability, whose promise IS `result` (owned) */
+    uint8_t pr_phase;     /* step_promiseresolve_run's */
+} JSIterDispose;
+_Static_assert(offsetof(JSIterDispose, hdr) == 0, "JSStepHdr must be first in JSIterDispose");
 
-    method = JS_GetProperty(ctx, this_val, JS_ATOM_return);
-    if (JS_IsException(method))
-        return JS_EXCEPTION;
-    if (JS_IsUndefined(method))
-        return JS_UNDEFINED;
-    return JS_CallFree(ctx, method, this_val, 0, NULL);
+enum { IDSP_READ = 1, IDSP_CALLED, IDSP_WRAP, IDSP_ATTACH };
+
+static JSValue js_async_dispose_to_undef(JSContext *ctx, JSValueConst this_val,
+                                         int argc, JSValueConst *argv,
+                                         int magic, JSValueConst *func_data);
+
+static int js_iter_dispose_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSIterDispose *s = st;
+    bool is_async = (s->hdr.arg != 0);
+    int r;
+
+    if (is_async && JS_IsException(cb_result)) {
+        /* IfAbruptRejectPromise — steps 4, 6.b and 7.b, which is every request this machine makes. catches_abrupt
+           hands the throw back as a VALUE with the exception still live; treating it as a value instead is what
+           hung throw-return.js, because the next stage handed an exception marker to PromiseResolve and waited
+           for a settle that could never come. The capability is the NATIVE one (step 2 is `!`), so its reject
+           runs no page code and is called from here rather than issued as a request. */
+        JSValue err = JS_GetException(ctx), rr;
+        rr = JS_Call(ctx, s->cap_funcs[1], JS_UNDEFINED, 1, vc(&err));
+        JS_FreeValue(ctx, err);
+        if (JS_IsException(rr)) return -1;
+        JS_FreeValue(ctx, rr);
+        return 0;
+    }
+
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        s->result = JS_UNDEFINED; s->method = JS_UNDEFINED; s->inner = JS_UNDEFINED;
+        s->cb[0] = JS_UNDEFINED; s->cb[1] = JS_UNDEFINED;
+        s->cb[2] = JS_UNDEFINED; s->cb[3] = JS_UNDEFINED;
+        s->cap_funcs[0] = JS_UNDEFINED; s->cap_funcs[1] = JS_UNDEFINED;
+        s->pr_phase = PRR_START;
+        if (is_async) {
+            /* step 2: ! NewPromiseCapability(%Promise%) — the native one, so nothing observable happens. It is
+               created FIRST because every later abrupt completion is an IfAbruptRejectPromise against it. */
+            s->result = js_new_promise_capability(ctx, s->cap_funcs, JS_UNDEFINED);
+            if (JS_IsException(s->result)) { s->result = JS_UNDEFINED; return -1; }
+        }
+        s->hdr.stage = IDSP_READ;
+    }
+    if (s->hdr.stage == IDSP_READ) {
+        r = step_getprop_run(ctx, &s->hdr, s->hdr.this_val, JS_ATOM_return, cb_result, &s->method,
+                             out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r;
+        /* GetMethod maps null onto undefined and rejects anything else uncallable. */
+        if (JS_IsNull(s->method)) { JS_FreeValue(ctx, s->method); s->method = JS_UNDEFINED; }
+        if (JS_IsUndefined(s->method)) {
+            if (!is_async) return 0;              /* the sync form's step 4: undefined */
+            s->hdr.stage = IDSP_WRAP;             /* the async form still awaits `undefined` */
+        } else if (!JS_IsFunction(ctx, s->method)) {
+            JS_FreeValue(ctx, s->method); s->method = JS_UNDEFINED;
+            JS_ThrowTypeErrorNotAFunction(ctx);
+            return -1;
+        } else {
+            s->cb[0] = js_dup(s->hdr.this_val);
+            s->cb[1] = s->method; s->method = JS_UNDEFINED;
+            s->hdr.stage = IDSP_CALLED;
+            *out_cb = s->cb; *out_argc = 0;
+            return 3;   /* Call(return, O) */
+        }
+    }
+    if (s->hdr.stage == IDSP_CALLED) {
+        JS_FreeValue(ctx, s->cb[0]); s->cb[0] = JS_UNDEFINED;
+        JS_FreeValue(ctx, s->cb[1]); s->cb[1] = JS_UNDEFINED;
+        if (!is_async) { JS_FreeValue(ctx, cb_result); return 0; }
+        s->inner = cb_result; cb_result = JS_UNDEFINED;
+        s->hdr.stage = IDSP_WRAP;
+    }
+    if (s->hdr.stage == IDSP_WRAP) {
+        /* step 7: PromiseResolve(%Promise%, result). Its `constructor` read and its resolve are the page's code,
+           which is exactly what the sub-sequence exists for. `inner` is reused to hold the WRAPPER. */
+        JSValue wrapper;
+        r = step_promiseresolve_run(ctx, &s->hdr, &s->pr_phase, s->inner, &wrapper, s->cb,
+                                    cb_result, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r;
+        JS_FreeValue(ctx, s->inner);
+        s->inner = wrapper;
+        s->hdr.stage = IDSP_ATTACH;
+    }
+    DCHECK(s->hdr.stage == IDSP_ATTACH, "an iterator dispose resumed in an unknown stage");
+    JS_FreeValue(ctx, cb_result);
+    {
+        /* step 10: PerformPromiseThen(resultWrapper, unwrap, undefined, promiseCapability). No page code — the
+           reaction is registered, not run — so it is a plain call. */
+        JSValue undef_fn = JS_NewCFunctionData(ctx, js_async_dispose_to_undef, 0, 0, 0, NULL);
+        JSValueConst handlers[2];
+        int rr;
+        if (JS_IsException(undef_fn)) return -1;
+        handlers[0] = undef_fn; handlers[1] = JS_UNDEFINED;
+        rr = perform_promise_then(ctx, s->inner, handlers, vc(s->cap_funcs));
+        JS_FreeValue(ctx, undef_fn);
+        if (rr) return -1;
+    }
+    return 0;
 }
 
-static JSValue js_async_iterator_proto_dispose(JSContext *ctx,
-                                               JSValueConst this_val,
-                                               int argc, JSValueConst *argv)
+static JSValue js_iter_dispose_fini(JSContext *ctx, void *st, bool take_result)
 {
-    JSValue method, ret, promise, undef_fn, then_args[2], result;
-    JSValue undef = JS_UNDEFINED;
-
-    method = JS_GetProperty(ctx, this_val, JS_ATOM_return);
-    if (JS_IsException(method)) {
-        JSValue exc = JS_GetException(ctx);
-        JSValue p = js_promise_resolve_native(ctx, ctx->promise_ctor, 1, vc(&exc), 1);
-        JS_FreeValue(ctx, exc);
-        return p;
-    }
-    if (JS_IsUndefined(method)) {
-        return js_promise_resolve_native(ctx, ctx->promise_ctor, 1, vc(&undef), 0);
-    }
-    ret = JS_Call(ctx, method, this_val, 0, NULL);
-    JS_FreeValue(ctx, method);
-    if (JS_IsException(ret)) {
-        JSValue exc = JS_GetException(ctx);
-        JSValue p = js_promise_resolve_native(ctx, ctx->promise_ctor, 1, vc(&exc), 1);
-        JS_FreeValue(ctx, exc);
-        return p;
-    }
-    /* Wrap in Promise.resolve(ret).then(() => undefined) */
-    promise = js_promise_resolve_native(ctx, ctx->promise_ctor, 1, vc(&ret), 0);
-    JS_FreeValue(ctx, ret);
-    if (JS_IsException(promise))
-        return promise;
-    undef_fn = JS_NewCFunctionData(ctx, js_async_dispose_to_undef, 0, 0, 0,
-                                   NULL);
-    if (JS_IsException(undef_fn)) {
-        JS_FreeValue(ctx, promise);
-        return JS_EXCEPTION;
-    }
-    then_args[0] = undef_fn;
-    /* this is an AWAIT — PerformPromiseThen on a capability — not Promise.prototype.then, and `promise` is the
-       engine's own PromiseResolve(%Promise%, ret). Spelling it as an Invoke made it read a property and CALL the
-       method, which since `then` became a step machine is a builtin driven from C. */
-    then_args[1] = JS_UNDEFINED;
-    result = js_promise_then_native(ctx, promise, vc(then_args));
-    JS_FreeValue(ctx, undef_fn);
-    JS_FreeValue(ctx, promise);
-    return result;
+    JSIterDispose *s = st;
+    JSValue r = take_result ? s->result : (JS_FreeValue(ctx, s->result), JS_UNDEFINED);
+    int i;
+    JS_FreeValue(ctx, s->method);
+    JS_FreeValue(ctx, s->inner);
+    for (i = 0; i < 4; i++) JS_FreeValue(ctx, s->cb[i]);
+    JS_FreeValue(ctx, s->cap_funcs[0]);
+    JS_FreeValue(ctx, s->cap_funcs[1]);
+    js_free_rt(ctx->rt, s);
+    return r;
 }
+
+static const JSTrampStepDef js_iter_dispose_def = {
+    sizeof(JSIterDispose), js_iter_dispose_step, js_iter_dispose_fini, 0
+};
+static const JSTrampStepDef js_async_iter_dispose_def = {
+    sizeof(JSIterDispose), js_iter_dispose_step, js_iter_dispose_fini, 1,
+    .catches_abrupt = 1   /* steps 4/6/7 are IfAbruptRejectPromise: an abrupt is this algorithm's VALUE */
+};
 
 static JSValue js_iterator_proto_iterator(JSContext *ctx, JSValueConst this_val,
                                           int argc, JSValueConst *argv)
@@ -71659,7 +71802,7 @@ static const JSCFunctionListEntry js_iterator_proto_funcs[] = {
     JS_CFUNC_CONSUME_DEF("some", 1, ITERCONS_ITERTERM_BASE + ITERTERM_SOME ),
     JS_CFUNC_CONSUME_DEF("every", 1, ITERCONS_ITERTERM_BASE + ITERTERM_EVERY ),
     JS_CFUNC_CONSUME_DEF("find", 1, ITERCONS_ITERTERM_BASE + ITERTERM_FIND ),
-    JS_CFUNC_DEF("[Symbol.dispose]", 0, js_iterator_proto_dispose ),
+    JS_CFUNC_STEP_DEF("[Symbol.dispose]", 0, STEPDEF_ITER_DISPOSE ),
     JS_CFUNC_DEF("[Symbol.iterator]", 0, js_iterator_proto_iterator ),
     JS_CGETSET_STEP_DEF("[Symbol.toStringTag]", js_iterator_proto_get_toStringTag, STEPDEF_ITER_SET_TAG),
 };
@@ -83518,7 +83661,7 @@ static int js_async_from_sync_continuation(JSContext *ctx, JSValueConst sync_ite
 
 static const JSCFunctionListEntry js_async_iterator_proto_funcs[] = {
     JS_CFUNC_DEF("[Symbol.asyncIterator]", 0, js_iterator_proto_iterator ),
-    JS_CFUNC_DEF("[Symbol.asyncDispose]", 0, js_async_iterator_proto_dispose ),
+    JS_CFUNC_STEP_DEF("[Symbol.asyncDispose]", 0, STEPDEF_ASYNC_ITER_DISPOSE ),
 };
 
 /* AsyncFromSyncIteratorPrototype */
