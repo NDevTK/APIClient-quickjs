@@ -19069,13 +19069,17 @@ typedef struct JSArgList {
     JSAtom idx;             /* the index atom the current element read borrows (owned) */
     JSValue coerce;         /* the raw `length` value across its ToPrimitive (owned) */
     uint8_t phase;          /* ARGL_* */
-    /* the apply shape to resume into. All BORROWED: every entry to do_apply_tramp is a caller-stack operand
-       shape, and those slots outlive the suspension exactly as an operator's do. */
+    /* WHERE the finished list goes. One sequence, several consumers: the list is an operand and reading it is the
+       same algorithm whoever asked, so the resumption point is a field rather than a second continuation. */
+    uint8_t resume;         /* ARGL_TO_APPLY / ARGL_TO_CONSTRUCT */
+    /* the shape to resume into. All BORROWED: every entry that parks here is a caller-stack operand shape, and
+       those slots outlive the suspension exactly as an operator's do. */
     JSValueConst func, this_arg, src;
     int cfirst, cargc;
     uint8_t is_tail;
 } JSArgList;
 enum { ARGL_LEN = 0, ARGL_LEN_PRIM, ARGL_ELEM };
+enum { ARGL_TO_APPLY = 0, ARGL_TO_CONSTRUCT };
 static void js_arg_list_free(JSContext *ctx, JSArgList *al);
 
 #define CONT_SETMAP_CTOR   67  /* gp_outer = JSSetMapCtor: `new Set(gen)` / `new Map(gen)` runs TWO of the page's
@@ -24119,9 +24123,34 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     int atag = JS_VALUE_GET_TAG(carr);
                     if (atag == JS_TAG_UNDEFINED || atag == JS_TAG_NULL || atag == JS_TAG_OBJECT) {
                         uint32_t alen7 = 0; JSValue *atab7 = NULL;
+                        if (atag == JS_TAG_OBJECT && !arg_list_is_fast(ctx, carr, &alen7)) {
+                            /* 19.2.3.1 on an array-like: `length` and every element are the page's code, so the
+                               whole construct parks on the sequence and resumes AT the dispatch. */
+                            JSArgList *agl = js_mallocz(ctx, sizeof(*agl));
+                            if (unlikely(!agl)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                            agl->coerce = JS_UNDEFINED;
+                            agl->idx = JS_ATOM_NULL;
+                            agl->phase = ARGL_LEN;
+                            agl->resume = ARGL_TO_CONSTRUCT;
+                            agl->func = cf; agl->this_arg = cnt; agl->src = carr;
+                            agl->cfirst = -2; agl->cargc = 1;   /* the caller pushed the triple, not the list */
+                            agl->is_tail = 0;
+                            sf->cur_pc = pc;
+                            cont_st = agl;
+                            goto do_arg_list_step;
+                        }
                         if (atag == JS_TAG_OBJECT) {
-                            atab7 = build_arg_list(ctx, &alen7, carr);   /* reads the array (may throw) */
-                            if (unlikely(!atab7)) goto exception;
+                            /* a FAST array answers without invoking anything — the same list, no request. */
+                            JSObject *fp7 = JS_VALUE_GET_OBJ(carr);
+                            uint32_t fk7;
+                            if (unlikely(alen7 > JS_MAX_LOCAL_VARS)) {
+                                JS_ThrowRangeError(ctx, "too many arguments in function call (only %d allowed)",
+                                                   JS_MAX_LOCAL_VARS);
+                                goto exception;
+                            }
+                            atab7 = js_mallocz(ctx, sizeof(JSValue) * (size_t)max_uint32(1, alen7));
+                            if (unlikely(!atab7)) { JS_ThrowOutOfMemory(ctx); goto exception; }
+                            for (fk7 = 0; fk7 < alen7; fk7++) atab7[fk7] = js_dup(fp7->u.array.u.values[fk7]);
                         }
                         /* WHAT the target is stays the dispatch's question, not this site's: asking it here is
                            the per-construct-shape predicate the ratchet bans, and every arm the site failed to
@@ -27321,8 +27350,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     gp_op = GP_GET; gp_val = JS_UNDEFINED;
                     goto do_getprop_tramp;
                 }
-                /* the list is complete: hand it to the apply shape and re-enter it. */
+                /* the list is complete: hand it to whoever asked and re-enter there. */
                 DCHECK((int64_t)al->n == al->len, "the arg list finished with fewer values than its length");
+                if (al->resume == ARGL_TO_CONSTRUCT) {
+                    /* `new C(...arr)` / `super(...args)`: the arguments are the LIST and the operands are the
+                       fixed [func, new_target, array] triple, which is what con_cargc says. WHAT the target is
+                       stays the dispatch's question. */
+                    con_func = al->func; con_ntgt = al->this_arg;
+                    con_args = (JSValueConst *)al->tab; con_argc = (int)al->n; con_args_owned = al->tab;
+                    al->tab = NULL; al->n = 0;
+                    con_cargc = al->cargc;
+                    con_from_super = 0; con_super_ref = JS_UNDEFINED;
+                    con_outer = NULL; con_outer_kind = CONT_NONE;
+                    tramp_first = (int)al->cfirst; tramp_is_tail = al->is_tail;
+                    js_arg_list_free(ctx, al);
+                    goto do_construct_dispatch;
+                }
+                DCHECK(al->resume == ARGL_TO_APPLY, "the arg list finished with no resumption point");
                 ap_list = al->tab; ap_list_n = (int)al->n;
                 al->tab = NULL; al->n = 0;
                 ap_func = al->func; ap_this = al->this_arg; ap_array = al->src;
