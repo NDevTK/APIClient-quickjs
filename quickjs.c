@@ -1566,7 +1566,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_SYMBOL_CTOR, STEPDEF_ERROR_TOSTRING,
     STEPDEF_MAP_UPSERT, STEPDEF_MAP_UPSERT_COMPUTED,
     STEPDEF_WEAKMAP_UPSERT, STEPDEF_WEAKMAP_UPSERT_COMPUTED,
-    STEPDEF_DISPOSE_SYNC,
+    STEPDEF_DISPOSE_SYNC, STEPDEF_DISPOSE_ASYNC,
     STEPDEF_COUNT
 };
 #define HINT_NONE    2
@@ -16927,9 +16927,9 @@ static void js_itercall_deliver(JSContext *ctx, JSValue *sp, JSValue ret_val)
    What made the fallback removable was giving do_generic_callee's direct-call arm a continuation: until then a
    callee with no heap frame could only push its result, so the opcode had to keep a second way to finish. */
 
-static JSValue js_sync_dispose_wrapper(JSContext *ctx, JSValueConst this_val,
-                                       int argc, JSValueConst *argv,
-                                       int magic, JSValueConst *func_data);
+/* ONE place builds the sync-dispose wrapper closure, because building it means DECLARING it a step machine and
+   a second construction site is a second chance to forget. Consumes `method`. */
+static JSValue js_new_sync_dispose_wrapper(JSContext *ctx, JSValue method);
 
 static __exception int js_op_using_check(JSContext *ctx, JSValueConst val,
                                          int hint, JSValue *pmethod)
@@ -16973,9 +16973,7 @@ static __exception int js_op_using_check(JSContext *ctx, JSValueConst val,
         JSValueConst data[1];
         JSValue wrapped;
         data[0] = method;
-        wrapped = JS_NewCFunctionData(ctx, js_sync_dispose_wrapper, 0, 0,
-                                      1, data);
-        JS_FreeValue(ctx, method);
+        wrapped = js_new_sync_dispose_wrapper(ctx, method);
         if (JS_IsException(wrapped))
             return -1;
         method = wrapped;
@@ -17527,6 +17525,7 @@ static void js_declare_native_machine(JSValueConst func_obj, int id)
     DCHECK(id >= 0 && id < 255, "a native-machine id outside the field's range");
     fp->u.cfunc.native_machine = (uint8_t)(id + 1);
 }
+static void promise_closure_set_step(JSValueConst closure, const JSTrampStepDef *def);
 static const JSTrampStepDef *tramp_step_def_of(JSValueConst func);
 static const JSTrampStepDef *tramp_step_ctor_def_of(JSValueConst func);
 /* the def a STEPDEF_* id names. A CALL reaches its def through the callee object; an OPCODE that drives a machine
@@ -66663,6 +66662,34 @@ typedef struct JSDisposeRun {
     JSValue cb[3];                      /* the CALL request's [this, method, arg] */
 } JSDisposeRun;
 static const JSTrampStepDef js_dispose_sync_def;
+/* disposeAsync's own machine. Its FIRST dispose call is synchronous (the spec's Await comes after it, and
+   test262 observes the difference), so it cannot be folded into the .then chain the rest of the resources use —
+   which is why the builtin itself is a machine rather than only its chain closures. */
+typedef struct JSDisposeAsync {
+    JSStepHdr hdr;
+    struct JSDisposableResource *res;   /* the STOLEN resource list (owned), for the same reason the sync one steals */
+    int n;                              /* its length */
+    int i;                              /* the cursor: n-1 while the first call is in flight, then the chain build */
+    JSValue result;                     /* the promise this builtin returns, on every path (owned) */
+    JSValue cb[3];                      /* the first dispose method's [this, method, arg] */
+} JSDisposeAsync;
+static const JSTrampStepDef js_dispose_async_def;
+/* One link of that chain: `await`-then-dispose-the-next. Its dispose method is the page's code too, so the
+   closure DECLARES itself a step machine (JSCFunctionDataRecord::step_def) and the call is a request. */
+typedef struct JSAsyncDisposeLink {
+    JSStepHdr hdr;
+    JSValue result;
+    JSValue cb[3];
+} JSAsyncDisposeLink;
+static const JSTrampStepDef js_async_dispose_link_def;
+/* GetDisposeMethod's sync fallback on an ASYNC stack: call the object's %Symbol.dispose% and DISCARD its
+   result (the spec does not await it). The call is the page's code, so the wrapper is a step machine — it was a
+   JS_Call from C, invisible while the loop that reached it was itself a drive-to-completion, and it DFAILed the
+   moment that loop became a request. */
+typedef struct JSSyncDisposeWrap {
+    JSStepHdr hdr;
+    JSValue cb[3];
+} JSSyncDisposeWrap;
 
 static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_PROMISE_RESOLVE]       = &js_promise_resolve_def,
@@ -66717,6 +66744,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_INSTANCEOF]     = &js_instanceof_def,
     [STEPDEF_ORDINARY_HAS_INSTANCE] = &js_ordinary_hasinst_def,
     [STEPDEF_DISPOSE_SYNC] = &js_dispose_sync_def,
+    [STEPDEF_DISPOSE_ASYNC] = &js_dispose_async_def,
     [STEPDEF_OBJ_TOSTRING]   = &js_obj_tostring_def,
     [STEPDEF_OBJ_TOLOCALESTRING] = &js_obj_tolocale_def,
     [STEPDEF_OBJ_SEAL]       = &js_obj_seal_def,
@@ -66988,6 +67016,9 @@ STEP_STATE_HDR_FIRST(JSObjToString);
 STEP_STATE_HDR_FIRST(JSObjToLocale);
 STEP_STATE_HDR_FIRST(JSInstanceOf);
 STEP_STATE_HDR_FIRST(JSDisposeRun);
+STEP_STATE_HDR_FIRST(JSDisposeAsync);
+STEP_STATE_HDR_FIRST(JSAsyncDisposeLink);
+STEP_STATE_HDR_FIRST(JSSyncDisposeWrap);
 STEP_STATE_HDR_FIRST(JSImportOpts);
 STEP_STATE_HDR_FIRST(JSStrCtor);
 STEP_STATE_HDR_FIRST(JSStrConcat);
@@ -78974,16 +79005,58 @@ static int js_disposable_stack_add(JSContext *ctx, JSDisposableStack *ds,
     return 0;
 }
 
+static int js_sync_dispose_wrap_step(JSContext *ctx, void *st, JSValue cb_result,
+                                     JSValue **out_cb, int *out_argc)
+{
+    JSSyncDisposeWrap *s = st;
+    if (s->hdr.stage == 0) {
+        JSCFunctionDataRecord *rec = JS_VALUE_GET_OBJ(s->hdr.func_obj)->u.c_function_data_record;
+        JS_FreeValue(ctx, cb_result);
+        s->hdr.stage = 1;
+        s->cb[0] = js_dup(s->hdr.this_val);
+        s->cb[1] = js_dup(rec->data[0]);
+        s->cb[2] = JS_UNDEFINED;
+        *out_cb = s->cb; *out_argc = 0;
+        return 3;
+    }
+    DCHECK(s->hdr.stage == 1, "a sync-dispose wrapper resumed in an unknown stage");
+    JS_FreeValue(ctx, cb_result);   /* DISCARDED: that is what the wrapper is for */
+    return 0;
+}
+
+static JSValue js_sync_dispose_wrap_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSSyncDisposeWrap *s = st;
+    JS_FreeValue(ctx, s->cb[0]); JS_FreeValue(ctx, s->cb[1]); JS_FreeValue(ctx, s->cb[2]);
+    js_free(ctx, s);
+    return JS_UNDEFINED;   /* the wrapper's value is always undefined */
+}
+
+static const JSTrampStepDef js_sync_dispose_wrap_def = {
+    sizeof(JSSyncDisposeWrap), js_sync_dispose_wrap_step, js_sync_dispose_wrap_fini, 0
+};
+
+/* The wrapper's C entry, for the reason the chain link has one: JS_NewCFunctionData takes a function pointer and
+   the implementation is the machine above. */
 static JSValue js_sync_dispose_wrapper(JSContext *ctx, JSValueConst this_val,
                                        int argc, JSValueConst *argv,
                                        int magic, JSValueConst *func_data)
 {
-    JSValueConst method = func_data[0];
-    JSValue ret = JS_Call(ctx, method, this_val, 0, NULL);
-    if (JS_IsException(ret))
-        return JS_EXCEPTION;
-    JS_FreeValue(ctx, ret);
-    return JS_UNDEFINED;
+    DFAIL("a sync-dispose wrapper reached its C entry — route that call shape onto do_step_tramp");
+    return JS_ThrowTypeError(ctx, "sync-dispose wrapper reached its C entry");
+}
+
+static JSValue js_new_sync_dispose_wrapper(JSContext *ctx, JSValue method)
+{
+    JSValueConst data[1];
+    JSValue wrapped;
+    data[0] = method;
+    wrapped = JS_NewCFunctionData(ctx, js_sync_dispose_wrapper, 0, 0, 1, data);
+    JS_FreeValue(ctx, method);
+    if (JS_IsException(wrapped))
+        return wrapped;
+    promise_closure_set_step(wrapped, &js_sync_dispose_wrap_def);
+    return wrapped;
 }
 
 static JSValue js_get_dispose_method(JSContext *ctx, JSValueConst value, int hint)
@@ -79016,12 +79089,7 @@ static JSValue js_get_dispose_method(JSContext *ctx, JSValueConst value, int hin
         }
 
         {
-            JSValue data[1], wrapped;
-            data[0] = method;
-            wrapped = JS_NewCFunctionData(ctx, js_sync_dispose_wrapper, 0, 0,
-                                          1, vc(data));
-            JS_FreeValue(ctx, method);
-            return wrapped;
+            return js_new_sync_dispose_wrapper(ctx, method);
         }
     }
 
@@ -79200,243 +79268,275 @@ static JSValue js_async_dispose_rethrow(JSContext *ctx, JSValueConst this_val,
     }
 }
 
+/* The chain closure's C entry. It exists only because JS_NewCFunctionData takes a function pointer: the
+   implementation is js_async_dispose_link_def, and both dispatches reach it — the tramp's, and the job pump's,
+   which runs a reaction handler as a call-root flow through JS_CallInternal. Arriving here is a call shape that
+   was never routed, not a slower path. */
 static JSValue js_async_dispose_step(JSContext *ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv,
                                      int magic, JSValueConst *func_data)
 {
-    JSValueConst value = func_data[0];
-    JSValueConst method = func_data[1];
-    int hint = JS_VALUE_GET_INT(func_data[2]);
-    bool has_prev_err = (magic == 1);
-    JSValue ret;
+    DFAIL("an async-dispose chain link reached its C entry — route that call shape onto do_step_tramp");
+    return JS_ThrowTypeError(ctx, "async-dispose chain link reached its C entry");
+}
 
-    if (JS_IsUndefined(method)) {
-        /* null/undefined resource on async stack: Await(undefined) */
-        if (has_prev_err)
-            return JS_Throw(ctx, js_dup(argv[0]));
-        return JS_UNDEFINED;
+/* ONE link of disposeAsync's chain: dispose this resource, then Await its result. `func_data` is
+   [value, method, hint] and the magic says whether a previous link already failed (so this one's completion is a
+   SuppressedError). The dispose method is the page's code, so it is a CALL request rather than a JS_Call — the
+   closure declares itself a step machine and the job pump's reaction dispatch drives it on the tramp. */
+static int js_async_dispose_link_step(JSContext *ctx, void *st, JSValue cb_result,
+                                      JSValue **out_cb, int *out_argc)
+{
+    JSAsyncDisposeLink *s = st;
+    JSCFunctionDataRecord *rec = JS_VALUE_GET_OBJ(s->hdr.func_obj)->u.c_function_data_record;
+    bool has_prev_err = (rec->magic == 1);
+
+    if (s->hdr.stage == 0) {
+        JSValueConst method = rec->data[1];
+        int hint = JS_VALUE_GET_INT(rec->data[2]);
+        JS_FreeValue(ctx, cb_result);
+        s->hdr.stage = 1;
+        if (JS_IsUndefined(method)) {
+            /* a null/undefined resource on an async stack still performs Await(undefined) */
+            if (!has_prev_err)
+                return 0;
+            JS_Throw(ctx, js_dup(step_arg(&s->hdr, 0)));
+            return -1;
+        }
+        s->cb[0] = JS_UNDEFINED;
+        s->cb[1] = js_dup(method);
+        s->cb[2] = JS_UNDEFINED;
+        switch (hint) {
+        case JS_DISPOSE_HINT_ADOPT: s->cb[2] = js_dup(rec->data[0]); *out_argc = 1; break;
+        case JS_DISPOSE_HINT_DEFER:                                  *out_argc = 0; break;
+        default: /* SYNC */         s->cb[0] = js_dup(rec->data[0]); *out_argc = 0; break;
+        }
+        *out_cb = s->cb;
+        return 3;
     }
-
-    switch (hint) {
-    case JS_DISPOSE_HINT_ADOPT:
-        ret = JS_Call(ctx, method, JS_UNDEFINED, 1, &value);
-        break;
-    case JS_DISPOSE_HINT_DEFER:
-        ret = JS_Call(ctx, method, JS_UNDEFINED, 0, NULL);
-        break;
-    default:
-        ret = JS_Call(ctx, method, value, 0, NULL);
-        break;
-    }
-
-    if (JS_IsException(ret)) {
+    DCHECK(s->hdr.stage == 1, "an async dispose link resumed in an unknown stage");
+    if (JS_IsException(cb_result)) {
         JSValue new_err = JS_GetException(ctx);
         if (has_prev_err) {
-            JSValue se = js_new_suppressed_error(ctx, new_err, argv[0]);
+            JSValue se = js_new_suppressed_error(ctx, new_err, step_arg(&s->hdr, 0));
             JS_FreeValue(ctx, new_err);
             if (JS_IsException(se))
-                return JS_EXCEPTION;
-            return JS_Throw(ctx, se);
+                return -1;
+            JS_Throw(ctx, se);
+            return -1;
         }
-        return JS_Throw(ctx, new_err);
+        JS_Throw(ctx, new_err);
+        return -1;
     }
-
     if (!has_prev_err) {
-        /* Propagate method result; next .then awaits it */
-        return ret;
+        s->result = cb_result;   /* the next link awaits it */
+        return 0;
     }
-
-    /* Await ret, then rethrow the stored error (possibly wrapped) */
     {
-        JSValueConst prev_err = argv[0];
-        JSValue ret_promise, resolve_fn, reject_fn, then_args[2], result;
-        ret_promise = js_promise_resolve_native(ctx, ctx->promise_ctor, 1, vc(&ret), 0);
-        JS_FreeValue(ctx, ret);
+        /* Await the method's result, then re-raise the error this link is carrying (wrapped, if the method's own
+           completion suppresses it). */
+        JSValueConst prev_err = step_arg(&s->hdr, 0);
+        JSValue ret_promise, resolve_fn, reject_fn, then_args[2];
+        ret_promise = js_promise_resolve_native(ctx, ctx->promise_ctor, 1, vc(&cb_result), 0);
+        JS_FreeValue(ctx, cb_result);
         if (JS_IsException(ret_promise))
-            return JS_EXCEPTION;
-        resolve_fn = JS_NewCFunctionData(ctx, js_async_dispose_rethrow, 0, 0,
-                                         1, &prev_err);
-        reject_fn = JS_NewCFunctionData(ctx, js_async_dispose_rethrow, 0, 1,
-                                        1, &prev_err);
+            return -1;
+        resolve_fn = JS_NewCFunctionData(ctx, js_async_dispose_rethrow, 0, 0, 1, &prev_err);
+        reject_fn  = JS_NewCFunctionData(ctx, js_async_dispose_rethrow, 0, 1, 1, &prev_err);
+        if (JS_IsException(resolve_fn) || JS_IsException(reject_fn)) {
+            JS_FreeValue(ctx, resolve_fn); JS_FreeValue(ctx, reject_fn);
+            JS_FreeValue(ctx, ret_promise);
+            return -1;
+        }
         then_args[0] = resolve_fn;
         then_args[1] = reject_fn;
-        /* the same Await, on the engine's own PromiseResolve(%Promise%, ret) */
-        result = js_promise_then_native(ctx, ret_promise, vc(then_args));
+        s->result = js_promise_then_native(ctx, ret_promise, vc(then_args));
         JS_FreeValue(ctx, resolve_fn);
         JS_FreeValue(ctx, reject_fn);
         JS_FreeValue(ctx, ret_promise);
-        return result;
+        return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
     }
 }
 
-static JSValue js_disposable_stack_dispose(JSContext *ctx,
-                                           JSValueConst this_val,
-                                           int argc,
-                                           JSValueConst *argv,
-                                           int class_id)
+static JSValue js_async_dispose_link_fini(JSContext *ctx, void *st, bool take_result)
 {
-    JSDisposableStack *s;
-
-    DCHECK(class_id == JS_CLASS_ASYNC_DISPOSABLE_STACK,
-           "the SYNC dispose is js_dispose_sync_def, a step machine — this entry is disposeAsync's only");
-    s = JS_GetOpaque2(ctx, this_val, class_id);
-    if (!s) {
-        if (class_id == JS_CLASS_ASYNC_DISPOSABLE_STACK) {
-            JSValue exc = JS_GetException(ctx);
-            JSValue p = js_promise_resolve_native(ctx, ctx->promise_ctor, 1, vc(&exc),
-                                           /*is_reject*/1);
-            JS_FreeValue(ctx, exc);
-            return p;
-        }
-        return JS_EXCEPTION;
-    }
-    if (s->disposed) {
-        if (class_id == JS_CLASS_ASYNC_DISPOSABLE_STACK) {
-            JSValue undef = JS_UNDEFINED;
-            return js_promise_resolve_native(ctx, ctx->promise_ctor, 1, vc(&undef),
-                                      /*is_reject*/0);
-        }
-        return JS_UNDEFINED;
-    }
-    if (class_id == JS_CLASS_ASYNC_DISPOSABLE_STACK) {
-        /* Per spec DisposeResources: iterate resources in LIFO order and
-           for each do Call + Await. The first Call happens synchronously
-           inside disposeAsync(); subsequent Calls fire in microtasks via a
-           Promise.then() chain so that each call sees the previous
-           dispose's promise already settled. */
-        int i, count = s->resource_count;
-        JSValue chain, undef, ret;
-
-        s->disposed = true;
-
-        /* First (top-of-stack) resource: synchronous Call. */
-        undef = JS_UNDEFINED;
-        i = count - 1;
-        if (i < 0) {
-            chain = js_promise_resolve_native(ctx, ctx->promise_ctor, 1, vc(&undef),
-                                       /*is_reject*/0);
-            if (JS_IsException(chain))
-                goto async_dispose_fail;
-        } else {
-            JSDisposableResource *res = &s->resources[i];
-            if (JS_IsUndefined(res->method)) {
-                /* null/undefined resource: Await(undefined) */
-                chain = js_promise_resolve_native(ctx, ctx->promise_ctor, 1,
-                                           vc(&undef), /*is_reject*/0);
-            } else {
-                switch (res->hint) {
-                case JS_DISPOSE_HINT_ADOPT:
-                    ret = JS_Call(ctx, res->method, JS_UNDEFINED, 1,
-                                  vc(&res->value));
-                    break;
-                case JS_DISPOSE_HINT_DEFER:
-                    ret = JS_Call(ctx, res->method, JS_UNDEFINED, 0, NULL);
-                    break;
-                default:
-                    ret = JS_Call(ctx, res->method, res->value, 0, NULL);
-                    break;
-                }
-                if (JS_IsException(ret)) {
-                    JSValue err = JS_GetException(ctx);
-                    chain = js_promise_resolve_native(ctx, ctx->promise_ctor, 1,
-                                               vc(&err), /*is_reject*/1);
-                    JS_FreeValue(ctx, err);
-                } else {
-                    chain = js_promise_resolve_native(ctx, ctx->promise_ctor, 1,
-                                               vc(&ret), /*is_reject*/0);
-                    JS_FreeValue(ctx, ret);
-                }
-            }
-            JS_FreeValue(ctx, res->value);
-            JS_FreeValue(ctx, res->method);
-            res->value = JS_UNDEFINED;
-            res->method = JS_UNDEFINED;
-            if (JS_IsException(chain)) {
-                i--;
-                goto async_dispose_fail;
-            }
-            i--;
-        }
-
-        /* Remaining resources: chain lazy steps. */
-        for (; i >= 0; i--) {
-            JSDisposableResource *res = &s->resources[i];
-            JSValueConst data[3];
-            JSValue hint_val, resolve_fn, reject_fn, then_args[2], new_chain;
-
-            hint_val = JS_NewInt32(ctx, res->hint);
-            data[0] = res->value;
-            data[1] = res->method;
-            data[2] = hint_val;
-            resolve_fn = JS_NewCFunctionData(ctx, js_async_dispose_step, 0, 0,
-                                             3, data);
-            reject_fn = JS_NewCFunctionData(ctx, js_async_dispose_step, 0, 1,
-                                            3, data);
-            JS_FreeValue(ctx, hint_val);
-            JS_FreeValue(ctx, res->value);
-            JS_FreeValue(ctx, res->method);
-            res->value = JS_UNDEFINED;
-            res->method = JS_UNDEFINED;
-            if (JS_IsException(resolve_fn) || JS_IsException(reject_fn)) {
-                JS_FreeValue(ctx, resolve_fn);
-                JS_FreeValue(ctx, reject_fn);
-                JS_FreeValue(ctx, chain);
-                chain = JS_EXCEPTION;
-                goto async_dispose_fail;
-            }
-            then_args[0] = resolve_fn;
-            then_args[1] = reject_fn;
-            /* DisposeResources' async chain is a sequence of AWAITs, and Await is PerformPromiseThen on a
-               capability — never Promise.prototype.then. Spelling it as an Invoke of `then` made it READ a
-               property (page code for a subclass or a thenable) and then CALL the method, which since `then`
-               became a step machine is a builtin driven from C. `chain` is an engine-built native promise at
-               every link, so the abstract operation is what this always was; the DFAIL that stood here recording
-               "hand its Invoke out" is discharged by there being no Invoke to hand out. */
-            new_chain = js_promise_then_native(ctx, chain, vc(then_args));
-            JS_FreeValue(ctx, resolve_fn);
-            JS_FreeValue(ctx, reject_fn);
-            JS_FreeValue(ctx, chain);
-            if (JS_IsException(new_chain)) {
-                chain = JS_EXCEPTION;
-                goto async_dispose_fail;
-            }
-            chain = new_chain;
-        }
-        s->resource_count = 0;
-
-        if (count > 0) {
-            JSValue undef_fn, then_args[2], new_chain;
-            undef_fn = JS_NewCFunctionData(ctx, js_async_dispose_to_undef,
-                                           0, 0, 0, NULL);
-            if (JS_IsException(undef_fn)) {
-                JS_FreeValue(ctx, chain);
-                return JS_EXCEPTION;
-            }
-            then_args[0] = undef_fn;
-            /* the same Await with only an onFulfilled: PerformPromiseThen takes both handlers, and an absent
-               onRejected IS undefined. */
-            then_args[1] = JS_UNDEFINED;
-            new_chain = js_promise_then_native(ctx, chain, vc(then_args));
-            JS_FreeValue(ctx, undef_fn);
-            JS_FreeValue(ctx, chain);
-            return new_chain;
-        }
-        return chain;
-
-    async_dispose_fail:
-        for (; i >= 0; i--) {
-            JSDisposableResource *res = &s->resources[i];
-            JS_FreeValue(ctx, res->value);
-            JS_FreeValue(ctx, res->method);
-            res->value = JS_UNDEFINED;
-            res->method = JS_UNDEFINED;
-        }
-        s->resource_count = 0;
-        return JS_EXCEPTION;
-    }
-    DFAIL("the synchronous dispose reached disposeAsync's C entry — it is js_dispose_sync_def");
-    return JS_EXCEPTION;
+    JSAsyncDisposeLink *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    JS_FreeValue(ctx, s->cb[0]); JS_FreeValue(ctx, s->cb[1]); JS_FreeValue(ctx, s->cb[2]);
+    js_free(ctx, s);
+    return r;
 }
+
+static const JSTrampStepDef js_async_dispose_link_def = {
+    sizeof(JSAsyncDisposeLink), js_async_dispose_link_step, js_async_dispose_link_fini, 0,
+    /* body, body_proto, body_magic, precheck, midcheck, onerror */ {NULL}, 0, 0, NULL, NULL, NULL,
+    .catches_abrupt = 1   /* a throwing dispose method is this algorithm's VALUE: it becomes the completion */
+};
+
+/* Build one chain link's two reaction closures over [value, method, hint], both declared step machines. The
+   resource's value and method are CONSUMED. */
+static int js_async_dispose_link_new(JSContext *ctx, JSValue value, JSValue method, int hint,
+                                     JSValue *out_resolve, JSValue *out_reject)
+{
+    JSValueConst data[3];
+    JSValue hint_val = JS_NewInt32(ctx, hint);
+    data[0] = value; data[1] = method; data[2] = hint_val;
+    *out_resolve = JS_NewCFunctionData(ctx, js_async_dispose_step, 0, 0, 3, data);
+    *out_reject  = JS_NewCFunctionData(ctx, js_async_dispose_step, 0, 1, 3, data);
+    JS_FreeValue(ctx, hint_val);
+    JS_FreeValue(ctx, value);
+    JS_FreeValue(ctx, method);
+    if (JS_IsException(*out_resolve) || JS_IsException(*out_reject)) {
+        JS_FreeValue(ctx, *out_resolve); JS_FreeValue(ctx, *out_reject);
+        *out_resolve = JS_UNDEFINED; *out_reject = JS_UNDEFINED;
+        return -1;
+    }
+    promise_closure_set_step(*out_resolve, &js_async_dispose_link_def);
+    promise_closure_set_step(*out_reject,  &js_async_dispose_link_def);
+    return 0;
+}
+
+/* 27.4.3.3 AsyncDisposableStack.prototype.disposeAsync -> DisposeResources with the async-dispose hint.
+   The FIRST resource's dispose method is called SYNCHRONOUSLY (the Await comes after it), so that one call is a
+   request made by this machine; the rest become a chain of js_async_dispose_link closures, each of which is a
+   step machine too. The resource list is STOLEN for the reason the sync machine steals it — that first call is
+   the page's code and can reach move()/use() on this same stack. */
+static void js_dispose_async_drop(JSContext *ctx, JSDisposeAsync *s, int from)
+{
+    int i;
+    for (i = 0; i <= from && i < s->n; i++) {
+        JS_FreeValue(ctx, s->res[i].value);
+        JS_FreeValue(ctx, s->res[i].method);
+        s->res[i].value = JS_UNDEFINED;
+        s->res[i].method = JS_UNDEFINED;
+    }
+}
+
+static JSValue js_dispose_async_settled(JSContext *ctx, JSValue v, int is_reject)
+{
+    JSValue p = js_promise_resolve_native(ctx, ctx->promise_ctor, 1, vc(&v), is_reject);
+    JS_FreeValue(ctx, v);
+    return p;
+}
+
+static int js_dispose_async_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSDisposeAsync *s = st;
+
+    if (s->hdr.stage == 0) {
+        JSDisposableStack *ds = JS_GetOpaque2(ctx, s->hdr.this_val, JS_CLASS_ASYNC_DISPOSABLE_STACK);
+        JSDisposableResource *top;
+        JS_FreeValue(ctx, cb_result);
+        s->hdr.stage = 1;
+        if (!ds) {
+            /* every failure of this builtin is a REJECTION, never a throw */
+            s->result = js_dispose_async_settled(ctx, JS_GetException(ctx), 1);
+            return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
+        }
+        if (ds->disposed) {
+            s->result = js_dispose_async_settled(ctx, JS_UNDEFINED, 0);
+            return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
+        }
+        ds->disposed = true;
+        s->res = ds->resources;
+        s->n = ds->resource_count;
+        ds->resources = NULL;
+        ds->resource_count = 0;
+        ds->resource_capacity = 0;
+        s->i = s->n - 1;
+        if (s->i < 0) {
+            s->result = js_dispose_async_settled(ctx, JS_UNDEFINED, 0);
+            return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
+        }
+        top = &s->res[s->i];
+        if (!JS_IsUndefined(top->method)) {
+            JSValue method = top->method, value = top->value;
+            top->method = JS_UNDEFINED;
+            top->value = JS_UNDEFINED;
+            s->cb[0] = JS_UNDEFINED; s->cb[1] = method; s->cb[2] = JS_UNDEFINED;
+            switch (top->hint) {
+            case JS_DISPOSE_HINT_ADOPT: s->cb[2] = value;                        *out_argc = 1; break;
+            case JS_DISPOSE_HINT_DEFER: JS_FreeValue(ctx, value);                *out_argc = 0; break;
+            default: /* SYNC */         s->cb[0] = value;                        *out_argc = 0; break;
+            }
+            *out_cb = s->cb;
+            s->hdr.stage = 2;
+            return 3;
+        }
+        /* a null/undefined top resource: its Await(undefined) IS the start of the chain */
+        JS_FreeValue(ctx, top->value);
+        top->value = JS_UNDEFINED;
+        cb_result = JS_UNDEFINED;
+        s->result = js_dispose_async_settled(ctx, JS_UNDEFINED, 0);
+        if (JS_IsException(s->result)) { s->result = JS_UNDEFINED; js_dispose_async_drop(ctx, s, s->i - 1); return -1; }
+    } else {
+        DCHECK(s->hdr.stage == 2, "disposeAsync resumed in an unknown stage");
+        /* the first dispose method returned or threw; either way it starts the chain as a SETTLED promise */
+        if (JS_IsException(cb_result))
+            s->result = js_dispose_async_settled(ctx, JS_GetException(ctx), 1);
+        else
+            s->result = js_dispose_async_settled(ctx, cb_result, 0);
+        if (JS_IsException(s->result)) { s->result = JS_UNDEFINED; js_dispose_async_drop(ctx, s, s->i - 1); return -1; }
+    }
+    s->i--;
+
+    for (; s->i >= 0; s->i--) {
+        JSDisposableResource *r = &s->res[s->i];
+        JSValue value = r->value, method = r->method, resolve_fn, reject_fn, then_args[2], new_chain;
+        r->value = JS_UNDEFINED;
+        r->method = JS_UNDEFINED;
+        if (js_async_dispose_link_new(ctx, value, method, r->hint, &resolve_fn, &reject_fn) < 0) {
+            js_dispose_async_drop(ctx, s, s->i - 1);
+            return -1;
+        }
+        then_args[0] = resolve_fn;
+        then_args[1] = reject_fn;
+        /* DisposeResources' async chain is a sequence of AWAITs, and Await is PerformPromiseThen on a
+           capability — never Promise.prototype.then, which would READ a property and CALL a method. Every link
+           of `chain` is an engine-built native promise, so the abstract operation is what this always was. */
+        new_chain = js_promise_then_native(ctx, s->result, vc(then_args));
+        JS_FreeValue(ctx, resolve_fn);
+        JS_FreeValue(ctx, reject_fn);
+        JS_FreeValue(ctx, s->result);
+        s->result = JS_UNDEFINED;
+        if (JS_IsException(new_chain)) { js_dispose_async_drop(ctx, s, s->i - 1); return -1; }
+        s->result = new_chain;
+    }
+    {
+        /* the same Await with only an onFulfilled: PerformPromiseThen takes both handlers, and an absent
+           onRejected IS undefined. It normalises the chain's value to undefined. */
+        JSValue undef_fn = JS_NewCFunctionData(ctx, js_async_dispose_to_undef, 0, 0, 0, NULL);
+        JSValue then_args[2], new_chain;
+        if (JS_IsException(undef_fn))
+            return -1;
+        then_args[0] = undef_fn;
+        then_args[1] = JS_UNDEFINED;
+        new_chain = js_promise_then_native(ctx, s->result, vc(then_args));
+        JS_FreeValue(ctx, undef_fn);
+        JS_FreeValue(ctx, s->result);
+        s->result = JS_IsException(new_chain) ? JS_UNDEFINED : new_chain;
+        return JS_IsException(new_chain) ? -1 : 0;
+    }
+}
+
+static JSValue js_dispose_async_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSDisposeAsync *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    js_dispose_async_drop(ctx, s, s->i);   /* an abandon leaves the un-chained tail owned here and nowhere else */
+    js_free(ctx, s->res);
+    JS_FreeValue(ctx, s->cb[0]); JS_FreeValue(ctx, s->cb[1]); JS_FreeValue(ctx, s->cb[2]);
+    js_free(ctx, s);
+    return r;
+}
+
+static const JSTrampStepDef js_dispose_async_def = {
+    sizeof(JSDisposeAsync), js_dispose_async_step, js_dispose_async_fini, 0,
+    /* body, body_proto, body_magic, precheck, midcheck, onerror */ {NULL}, 0, 0, NULL, NULL, NULL,
+    .catches_abrupt = 1   /* the first dispose method's throw REJECTS the returned promise, it does not propagate */
+};
 
 static JSValue js_disposable_stack_move(JSContext *ctx, JSValueConst this_val,
                                         int argc, JSValueConst *argv, int class_id)
@@ -79496,7 +79596,7 @@ static const JSCFunctionListEntry js_disposable_stack_proto_funcs[] = {
 static const JSCFunctionListEntry js_async_disposable_stack_proto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("adopt", 2, js_disposable_stack_adopt, JS_CLASS_ASYNC_DISPOSABLE_STACK ),
     JS_CFUNC_MAGIC_DEF("defer", 1, js_disposable_stack_defer, JS_CLASS_ASYNC_DISPOSABLE_STACK ),
-    JS_CFUNC_MAGIC_DEF("disposeAsync", 0, js_disposable_stack_dispose, JS_CLASS_ASYNC_DISPOSABLE_STACK ),
+    JS_CFUNC_STEP_DEF("disposeAsync", 0, STEPDEF_DISPOSE_ASYNC ),
     JS_CFUNC_MAGIC_DEF("move", 0, js_disposable_stack_move, JS_CLASS_ASYNC_DISPOSABLE_STACK ),
     JS_CFUNC_MAGIC_DEF("use", 1, js_disposable_stack_use, JS_CLASS_ASYNC_DISPOSABLE_STACK ),
     JS_CGETSET_MAGIC_DEF("disposed", js_disposable_stack_get_disposed, NULL, JS_CLASS_ASYNC_DISPOSABLE_STACK ),
