@@ -1575,6 +1575,8 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_ATOMICS_XOR, STEPDEF_ATOMICS_EXCHANGE, STEPDEF_ATOMICS_CMPXCHG, STEPDEF_ATOMICS_LOAD,
     STEPDEF_ATOMICS_STORE, STEPDEF_ATOMICS_ISLOCKFREE, STEPDEF_ATOMICS_WAIT, STEPDEF_ATOMICS_NOTIFY,
     STEPDEF_PROMISE_THEN, STEPDEF_PROMISE_WITHRESOLVERS,
+    STEPDEF_GET_DISPOSE_SYNC, STEPDEF_GET_DISPOSE_ASYNC, STEPDEF_DISPOSABLE_USE, STEPDEF_ASYNC_DISPOSABLE_USE,
+    STEPDEF_U8_TOBASE64, STEPDEF_U8_FROMBASE64, STEPDEF_U8_SETFROMBASE64,
     STEPDEF_SYMBOL_CTOR, STEPDEF_ERROR_TOSTRING,
     STEPDEF_MAP_UPSERT, STEPDEF_MAP_UPSERT_COMPUTED,
     STEPDEF_WEAKMAP_UPSERT, STEPDEF_WEAKMAP_UPSERT_COMPUTED,
@@ -17700,6 +17702,43 @@ static int step_getprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAt
     return step_getprop_done(ctx, h, atom, in, pout);
 }
 
+/* GetOption(options, key) for an ENUMERATED STRING option, over step_getprop_run. The read is an ordinary
+   [[Get]] on a bag the PAGE supplies, so it is an accessor or a Proxy trap away from being the page's code — the
+   base64 family performed all five of theirs with JS_GetPropertyStr from C. `allowed` is a NULL-terminated list
+   and the answer is its INDEX; `fallback` is what undefined means. Two-phase like every sub-sequence: it parks on
+   the read and answers at the SAME call site.
+     0 = *pout is set, 6 = the caller must return that step code, -1 = threw. */
+static int step_strop_run(JSContext *ctx, JSStepHdr *h, JSValueConst options, JSAtom key,
+                          const char *const *allowed, int fallback, JSValue in, int *pout,
+                          JSValue **out_cb, int *out_argc)
+{
+    JSValue v;
+    const char *str;
+    int i, r;
+
+    if (h->get_phase == GET_PH_START) {
+        if (JS_IsUndefined(options)) { JS_FreeValue(ctx, in); *pout = fallback; return 0; }
+        return step_getprop_run(ctx, h, options, key, in, &v, out_cb, out_argc);
+    }
+    r = step_getprop_run(ctx, h, options, key, in, &v, out_cb, out_argc);
+    DCHECK(r == 0, "an option read answered with something other than its value");
+    if (JS_IsUndefined(v)) { *pout = fallback; return 0; }
+    if (!JS_IsString(v)) {
+        JS_FreeValue(ctx, v);
+        JS_ThrowTypeError(ctx, "option value must be a string");
+        return -1;
+    }
+    str = JS_ToCString(ctx, v);
+    JS_FreeValue(ctx, v);
+    if (!str) return -1;
+    for (i = 0; allowed[i]; i++) {
+        if (!strcmp(str, allowed[i])) { JS_FreeCString(ctx, str); *pout = i; return 0; }
+    }
+    JS_FreeCString(ctx, str);
+    JS_ThrowTypeError(ctx, "invalid option value");
+    return -1;
+}
+
 /* A keyed WRITE, Set(O, key, value, true) — the mirror of the read above and the half that was missing. Every
    builtin that copies properties (Object.assign's target, Array.from's final `length`) performed it with
    JS_SetProperty straight out of C, so a SETTER or a Proxy `set` trap with a loop in it had no flow base. WHICH
@@ -19338,15 +19377,6 @@ static bool promise_exec_ready(JSContext *ctx, JSValueConst *call_argv, int call
                                   returns a rejected promise, never raises) — the same shape as the executor. */
 #define CONT_PROMISE_TRY_SETTLE 39  /* cont_state = JSPromiseTry: the capability's resolve(value), which a
                                        subclass may have wrapped in its own bytecode. */
-#define CONT_USING_GET     71  /* gp_outer = JSUsingCheck: `using`/`await using`'s GetDisposeMethod — the
-                                  @@asyncDispose read, its @@dispose fallback, and the plain sync read. All three
-                                  are the page's code (an accessor, a Proxy trap) and js_op_using_check performed
-                                  them with JS_GetProperty from C, so a getter with a loop in it had no flow base. */
-typedef struct JSUsingCheck {
-    JSValue val;      /* the disposable (owned) */
-    uint8_t ph;       /* 1 = the @@asyncDispose read is in flight, 2 = the @@dispose read is */
-    uint8_t fallback; /* 1 = this @@dispose read is the ASYNC hint's fallback, so the method gets wrapped */
-} JSUsingCheck;
 #define CONT_PROMISE_ALL_SETTLE 70 /* cont_state = JSPromiseAll: the AGGREGATE capability's reject(error). The
                                       capability is NewPromiseCapability(C) with C the `this` value, so a subclass
                                       supplies its own resolving functions and this is the page's bytecode — three
@@ -20430,7 +20460,6 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_ASYNC_SETTLE:
     case CONT_PROMISE_TRY_SETTLE:
     case CONT_PROMISE_ALL_SETTLE:
-    case CONT_USING_GET:
     case CONT_PROMISE_CAP:
     case CONT_PROMISE_TRY:
     case CONT_STEP:
@@ -28653,7 +28682,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                       if (gk == CONT_ITER_HELPER_GET) { cont_st = gouter0; goto do_iter_helper_step; }
                       if (gk == CONT_PROMISE_ALL_GET) { cont_st = gouter0; goto do_promise_all_step; }
                       if (gk == CONT_FOROF_UNPACK) { cont_st = gouter0; goto do_forof_unpack_step; }
-                      if (gk == CONT_USING_GET) { cont_st = gouter0; goto do_using_check_step; }
                       DCHECK(gk == CONT_STEP, "property-get outer continuation: unknown machine kind"); }
                     goto do_step_step;
                 }
@@ -28973,14 +29001,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            the iterator it left on the stack is freed by the ordinary unwind; for an UNWIND close
                            the read's throw is discarded and the original exception wins. */
                         if (gouter) { cont_st = gouter; goto do_iter_close_finish; }
-                        goto exception;
-                    }
-                    if (gk3 == CONT_USING_GET) {
-                        /* a dispose-method getter that threw IN PLACE (a C getter, a revoked proxy). Nothing is
-                           pushed and the throw propagates, exactly as the suspended abandon does it. */
-                        JSUsingCheck *uc3 = gouter;
-                        JS_FreeValue(ctx, uc3->val);
-                        js_free_rt(rt, uc3);
                         goto exception;
                     }
                     DCHECK(gk3 == CONT_STEP, "property-get outer continuation: unknown machine kind");
@@ -31922,8 +31942,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            || gouter_kind == CONT_PROMISE_ALL_THEN || gouter_kind == CONT_AFS_GET
                            || gouter_kind == CONT_PROMISE_ALL_RESOLVE
                            || gouter_kind == CONT_ITER_HELPER_GET || gouter_kind == CONT_PROMISE_ALL_GET
-                           || gouter_kind == CONT_FOROF_UNPACK || gouter_kind == CONT_USING_GET
-                           || gouter_kind == CONT_FOR_IN_HAS
+                           || gouter_kind == CONT_FOROF_UNPACK || gouter_kind == CONT_FOR_IN_HAS
                            || gouter_kind == CONT_OWNKEYS_CHK || gouter_kind == CONT_PROXY_INV
                            || gouter_kind == CONT_KEYED_INV || gouter_kind == CONT_WITH_HAS
                            || gouter_kind == CONT_SET_RECV || gouter_kind == CONT_TOPRIM_GET
@@ -31945,11 +31964,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         js_getprop_free(ctx, gp);
                         cont_st = gouter;
                         goto do_forof_unpack_step;
-                    }
-                    if (gouter_kind == CONT_USING_GET) {
-                        js_getprop_free(ctx, gp);
-                        cont_st = gouter;
-                        goto do_using_check_step;
                     }
                     if (gouter_kind == CONT_PROMISE_ALL_GET) {
                         js_getprop_free(ctx, gp);
@@ -34260,70 +34274,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         CASE(OP_using_check):
-            /* 27.3.1.1 GetDisposeMethod + 14.6's "is not disposable". The value's own reads are REQUESTS, so a
-               `get [Symbol.dispose]()` with a loop in it parks like any other page code. `sp` does not move
-               across them — the disposable stays at sp[-1] and the method is pushed by the delivery — so the
-               operand shape is valid over a suspension. */
+            /* 27.3.1.2 CreateDisposableResource: undefined/null has no method, and everything else is
+               GetDisposeMethod — THE machine, the same one DisposableStack.prototype.use delegates to. An opcode
+               has no callee slot to reach a def through, so it names the def by id; the hint picks which.
+               The operand shape is first = 0, argc = 0: nothing is dropped, so the disposable stays at sp[-1]
+               and the method is placed above it, which is what the compiled stack expects. */
             {
                 int hint = pc[0];
-                JSUsingCheck *uc;
+                JSValueConst uc_arg = sp[-1];
+                void *uc_stt;
                 pc += 1;
                 sf->cur_pc = pc;
                 if (JS_IsNull(sp[-1]) || JS_IsUndefined(sp[-1])) { *sp++ = JS_UNDEFINED; BREAK; }
-                if (!JS_IsObject(sp[-1])) { JS_ThrowTypeErrorNotAnObject(ctx); goto exception; }
-                uc = js_malloc_rt(rt, sizeof(*uc));
-                if (unlikely(!uc)) { JS_ThrowOutOfMemory(ctx); goto exception; }
-                uc->val = js_dup(sp[-1]);
-                uc->ph = (hint == 1) ? 1 : 2;
-                uc->fallback = 0;
-                cont_st = uc;
-            }
-            /* fall through */
-        do_using_check_read:
-            {
-                JSUsingCheck *uc = (JSUsingCheck *)cont_st;
-                gp_outer = uc; gp_outer_kind = CONT_USING_GET;
-                gp_obj = uc->val;
-                gp_atom = (uc->ph == 1) ? JS_ATOM_Symbol_asyncDispose : JS_ATOM_Symbol_dispose;
-                gp_op = GP_GET; gp_val = JS_UNDEFINED;
-                goto do_getprop_tramp;
-            }
-
-        do_using_check_step:
-            /* ret_val = whichever read just answered; the phase says which. */
-            {
-                JSUsingCheck *uc = (JSUsingCheck *)cont_st;
-                JSValue method = ret_val;
+                uc_stt = tramp_step_state_new(ctx,
+                                              tramp_step_def_by_id(hint == 1 ? STEPDEF_GET_DISPOSE_ASYNC
+                                                                             : STEPDEF_GET_DISPOSE_SYNC),
+                                              JS_UNDEFINED, 1, &uc_arg, JS_UNDEFINED);
+                if (unlikely(!uc_stt)) goto exception;
+                ((JSStepHdr *)uc_stt)->orig_cfirst = 0;
+                ((JSStepHdr *)uc_stt)->orig_cargc = 0;
+                ((JSStepHdr *)uc_stt)->orig_is_tail = 0;
+                cont_st = uc_stt;
                 ret_val = JS_UNDEFINED;
-                if (uc->ph == 1 && (JS_IsUndefined(method) || JS_IsNull(method))) {
-                    /* step 1.b: no @@asyncDispose, so @@dispose is read instead and its method WRAPPED, because
-                       an async disposal must await what a sync method returns. */
-                    JS_FreeValue(ctx, method);
-                    uc->ph = 2; uc->fallback = 1;
-                    goto do_using_check_read;
-                }
-                cont_st = NULL;
-                if (JS_IsUndefined(method) || JS_IsNull(method)) {
-                    JS_ThrowTypeError(ctx, "value is not disposable");
-                    goto using_check_throw;
-                }
-                if (!JS_IsFunction(ctx, method)) {
-                    JS_FreeValue(ctx, method);
-                    JS_ThrowTypeError(ctx, "dispose method is not a function");
-                    goto using_check_throw;
-                }
-                if (uc->fallback) {
-                    method = js_new_sync_dispose_wrapper(ctx, method);   /* consumes it */
-                    if (unlikely(JS_IsException(method))) goto using_check_throw;
-                }
-                JS_FreeValue(ctx, uc->val);
-                js_free_rt(rt, uc);
-                *sp++ = method;
-                BREAK;
-            using_check_throw:
-                JS_FreeValue(ctx, uc->val);
-                js_free_rt(rt, uc);
-                goto exception;
+                goto do_step_step;
             }
 
         CASE(OP_iterator_next):
@@ -37225,18 +37198,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    || gk2 == CONT_PROMISE_ALL_THEN || gk2 == CONT_AFS_GET
                    || gk2 == CONT_PROMISE_ALL_RESOLVE
                    || gk2 == CONT_ITER_HELPER_GET || gk2 == CONT_PROMISE_ALL_GET
-                   || gk2 == CONT_FOROF_UNPACK || gk2 == CONT_USING_GET || gk2 == CONT_CONSUME_NEXT_GET
+                   || gk2 == CONT_FOROF_UNPACK || gk2 == CONT_CONSUME_NEXT_GET
                    || gk2 == CONT_PROMISE_ALL_NEXT_GET || gk2 == CONT_ITER_FROM_NEXT_GET,
                    "property-get outer continuation: unknown machine kind");
             js_getprop_free(ctx, gp);
-            if (gouter && gk2 == CONT_USING_GET) {
-                /* a dispose-method getter threw: nothing is pushed and the throw propagates, which is what the
-                   `?` in GetDisposeMethod's steps says. */
-                JSUsingCheck *uc2 = gouter;
-                JS_FreeValue(ctx, uc2->val);
-                js_free_rt(rt, uc2);
-                goto exception;
-            }
             if (gouter && gk2 == CONT_FOROF_UNPACK) {
                 /* the protocol tail's read threw: the loop's enum_rec must not be closed (the iterator has
                    already stepped), which is what clearing the slot says, and the throw propagates. */
@@ -56410,21 +56375,14 @@ typedef enum BCTagEnum {
 } BCTagEnum;
 
 #define BC_VERSION 28
-/* The serialized form embeds RAW OPCODE BYTES, so the opcode set is part of the wire format — and this binary
-   deserializes blobs written by a PREVIOUS build of itself: the builtin-*.h bytecode compiled into it
-   (Array.fromAsync, Iterator.zip). Deleting one opcode shifted every later opcode's value, and the stale
-   Array.fromAsync blob then read an operand as an atom index — surfacing as "invalid atom index" from an unrelated
-   property access, several thousand tests away from the cause, because the version byte still matched. This assert
-   is the gate: change the opcode set and the BUILD fails until BC_VERSION is bumped and `make codegen` has
-   regenerated the blobs. */
-_Static_assert(OP_COUNT == 255,
-               "the opcode set changed: bump BC_VERSION and run `make codegen` to regenerate builtin-*.h");
-/* The SAME trap through the other table. A blob names a built-in atom by its INDEX, so inserting one anywhere
-   before the symbols shifts every later name and the blob silently resolves the wrong one — Iterator.zip started
-   reading `done` off the atom next to it, five tests deep in a directory that has nothing to do with the atom that
-   was added. Adding `toISOString` for Date.prototype.toJSON is what found it. Same gate, same fix. */
-_Static_assert(JS_ATOM_END == 246,
-               "the atom table changed: run `make codegen` to regenerate builtin-*.h, then update this count");
+/* DELETED: the OP_COUNT and JS_ATOM_END asserts. They guarded ONE thing — the builtin-*.h bytecode COMPILED INTO
+   this file, which named opcodes and atoms by index and so silently resolved the wrong one when either table
+   shifted (Iterator.zip read `done` off the atom next to it, thousands of tests from the cause). Every one of
+   those blobs is gone: Array.fromAsync was the last self-hosted builtin and this translation unit now
+   deserializes nothing it was built with. What remains — qjsc output and gen/*.c for the shell — is regenerated
+   by `make codegen` and version-checked at READ time by the BC_VERSION byte below, which is the real mechanism;
+   a build-time magic number that has to be bumped for a guarantee nothing needs is scaffolding for a deleted
+   system, and it made every added atom look like a wire-format change. */
 
 typedef struct BCWriterState {
     JSContext *ctx;
@@ -68227,6 +68185,13 @@ static const JSTrampStepDef js_promise_finally_def;
 /* likewise .then, whose PerformPromiseThen lives there. */
 static const JSTrampStepDef js_promise_then_def;
 static const JSTrampStepDef js_promise_withresolvers_def;
+static const JSTrampStepDef js_get_dispose_sync_def;
+static const JSTrampStepDef js_get_dispose_async_def;
+static const JSTrampStepDef js_disposable_use_def;
+static const JSTrampStepDef js_async_disposable_use_def;
+static const JSTrampStepDef js_u8_tobase64_def;
+static const JSTrampStepDef js_u8_frombase64_def;
+static const JSTrampStepDef js_u8_setfrombase64_def;
 /* likewise the Map upsert machine, defined with the map code it mutates. */
 static int js_map_upsert_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_map_upsert_fini(JSContext *ctx, void *st, bool take_result);
@@ -68311,6 +68276,13 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_PROMISE_FINALLY]       = &js_promise_finally_def,
     [STEPDEF_PROMISE_THEN]          = &js_promise_then_def,
     [STEPDEF_PROMISE_WITHRESOLVERS] = &js_promise_withresolvers_def,
+    [STEPDEF_GET_DISPOSE_SYNC]      = &js_get_dispose_sync_def,
+    [STEPDEF_GET_DISPOSE_ASYNC]     = &js_get_dispose_async_def,
+    [STEPDEF_DISPOSABLE_USE]        = &js_disposable_use_def,
+    [STEPDEF_ASYNC_DISPOSABLE_USE]  = &js_async_disposable_use_def,
+    [STEPDEF_U8_TOBASE64]           = &js_u8_tobase64_def,
+    [STEPDEF_U8_FROMBASE64]         = &js_u8_frombase64_def,
+    [STEPDEF_U8_SETFROMBASE64]      = &js_u8_setfrombase64_def,
     [STEPDEF_MAP_UPSERT]            = &js_map_upsert_def,
     [STEPDEF_MAP_UPSERT_COMPUTED]   = &js_map_upsert_comp_def,
     [STEPDEF_WEAKMAP_UPSERT]        = &js_weakmap_upsert_def,
@@ -80958,52 +80930,83 @@ static JSValue js_new_sync_dispose_wrapper(JSContext *ctx, JSValue method)
     return wrapped;
 }
 
-static JSValue js_get_dispose_method(JSContext *ctx, JSValueConst value, int hint)
+/* 27.3.1.1 GetDisposeMethod + 27.3.1.2 CreateDisposableResource's object check, as THE step machine — one
+   implementation for both callers. There were two: this C helper (for DisposableStack.prototype.use) and the
+   `using` opcode's own inline reads, and both ran the [[Get]]s from C, so a dispose ACCESSOR or a Proxy get trap
+   had no flow base. The reads are requests here, and `hint` rides the DEFINITION's `arg` — which is why there
+   are two defs over one body, the same way Promise.resolve and Promise.reject are.
+   The caller is responsible for the null/undefined case, because the two callers differ on it: `using` skips
+   (no method), and an ASYNC DisposableStack still records the resource so disposeAsync performs its Await. */
+typedef struct JSGetDisposeMethod {
+    JSStepHdr hdr;      /* MUST be first */
+    JSValue result;     /* owned: the method */
+} JSGetDisposeMethod;
+_Static_assert(offsetof(JSGetDisposeMethod, hdr) == 0, "JSStepHdr must be first in JSGetDisposeMethod");
+
+enum { GDM_FIRST = 0, GDM_ASYNC_GOT, GDM_SYNC_GOT };
+
+static int js_get_dispose_method_step(JSContext *ctx, void *st, JSValue cb_result,
+                                      JSValue **out_cb, int *out_argc)
 {
+    JSGetDisposeMethod *s = st;
+    bool is_async = (s->hdr.arg != 0);
     JSValue method;
 
-    if (hint == 1) {
-        /* async: try Symbol.asyncDispose first */
-        method = JS_GetProperty(ctx, value, JS_ATOM_Symbol_asyncDispose);
-        if (JS_IsException(method))
-            return JS_EXCEPTION;
-        if (!JS_IsUndefined(method) && !JS_IsNull(method)) {
-            if (!JS_IsFunction(ctx, method)) {
-                JS_FreeValue(ctx, method);
-                return JS_ThrowTypeError(ctx, "property is not a function");
-            }
-            return method;
+    if (s->hdr.stage == GDM_FIRST) {
+        JS_FreeValue(ctx, cb_result);
+        s->result = JS_UNDEFINED;
+        if (!JS_IsObject(step_arg(&s->hdr, 0))) {
+            JS_ThrowTypeErrorNotAnObject(ctx);
+            return -1;
         }
-        JS_FreeValue(ctx, method);
-        /* Fall back to Symbol.dispose, but wrap it so its return value is
-           NOT awaited (per spec GetDisposeMethod). */
-        method = JS_GetProperty(ctx, value, JS_ATOM_Symbol_dispose);
-        if (JS_IsException(method))
-            return JS_EXCEPTION;
-        if (JS_IsUndefined(method) || JS_IsNull(method))
-            return JS_ThrowTypeError(ctx, "property is not a function");
-        if (!JS_IsFunction(ctx, method)) {
-            JS_FreeValue(ctx, method);
-            return JS_ThrowTypeError(ctx, "property is not a function");
-        }
-
-        {
-            return js_new_sync_dispose_wrapper(ctx, method);
-        }
+        s->hdr.stage = is_async ? GDM_ASYNC_GOT : GDM_SYNC_GOT;
+        s->result = js_dup(step_arg(&s->hdr, 0));   /* the request BORROWS cb[0]; the machine holds it */
+        *out_cb = &s->result;
+        *out_argc = (int)(is_async ? JS_ATOM_Symbol_asyncDispose : JS_ATOM_Symbol_dispose);
+        return 6;   /* GETPROP */
     }
-
-    /* sync dispose */
-    method = JS_GetProperty(ctx, value, JS_ATOM_Symbol_dispose);
-    if (JS_IsException(method))
-        return JS_EXCEPTION;
-    if (JS_IsUndefined(method) || JS_IsNull(method))
-        return JS_ThrowTypeError(ctx, "property is not a function");
+    method = cb_result;
+    JS_FreeValue(ctx, s->result); s->result = JS_UNDEFINED;
+    if (s->hdr.stage == GDM_ASYNC_GOT && (JS_IsUndefined(method) || JS_IsNull(method))) {
+        /* step 1.b: no @@asyncDispose, so @@dispose is read instead — and its method is WRAPPED, because an
+           async disposal must not await what a sync method returns. */
+        JS_FreeValue(ctx, method);
+        s->hdr.stage = GDM_SYNC_GOT;
+        s->result = js_dup(step_arg(&s->hdr, 0));
+        *out_cb = &s->result; *out_argc = (int)JS_ATOM_Symbol_dispose;
+        return 6;
+    }
+    if (JS_IsUndefined(method) || JS_IsNull(method)) {
+        JS_ThrowTypeError(ctx, "value is not disposable");
+        return -1;
+    }
     if (!JS_IsFunction(ctx, method)) {
         JS_FreeValue(ctx, method);
-        return JS_ThrowTypeError(ctx, "property is not a function");
+        JS_ThrowTypeError(ctx, "dispose method is not a function");
+        return -1;
     }
-    return method;
+    if (is_async && s->hdr.stage == GDM_SYNC_GOT) {
+        method = js_new_sync_dispose_wrapper(ctx, method);   /* consumes it */
+        if (unlikely(JS_IsException(method))) return -1;
+    }
+    s->result = method;
+    return 0;
 }
+
+static JSValue js_get_dispose_method_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSGetDisposeMethod *s = st;
+    JSValue r = take_result ? s->result : (JS_FreeValue(ctx, s->result), JS_UNDEFINED);
+    js_free_rt(ctx->rt, s);
+    return r;
+}
+
+static const JSTrampStepDef js_get_dispose_sync_def = {
+    sizeof(JSGetDisposeMethod), js_get_dispose_method_step, js_get_dispose_method_fini, 0
+};
+static const JSTrampStepDef js_get_dispose_async_def = {
+    sizeof(JSGetDisposeMethod), js_get_dispose_method_step, js_get_dispose_method_fini, 1
+};
 
 static int js_disposable_ctor_precheck(JSContext *ctx, const JSStepHdr *h)
 {
@@ -81076,40 +81079,77 @@ static JSDisposableStack *js_disposable_stack_get(JSContext *ctx,
     return s;
 }
 
-static JSValue js_disposable_stack_use(JSContext *ctx, JSValueConst this_val,
-                                       int argc, JSValueConst *argv, int class_id)
-{
-    JSDisposableStack *s;
-    JSValueConst value;
-    JSValue method;
-    int hint = (class_id == JS_CLASS_ASYNC_DISPOSABLE_STACK) ? 1 : 0;
+/* 27.3.3.4 / 27.4.3.4 DisposableStack.prototype.use as a STEP MACHINE. Its one page-visible step is
+   GetDisposeMethod, which it DELEGATES to — the same machine the `using` opcode drives, so there is one
+   implementation of 27.3.1.1 and not a builtin's copy beside an opcode's. `arg` carries the class id, exactly
+   as the C body's magic did. */
+typedef struct JSDisposableUse {
+    JSStepHdr hdr;      /* MUST be first */
+    JSValue result;     /* owned: the value, which `use` returns */
+} JSDisposableUse;
+_Static_assert(offsetof(JSDisposableUse, hdr) == 0, "JSStepHdr must be first in JSDisposableUse");
 
-    s = js_disposable_stack_get(ctx, this_val, class_id);
-    if (!s)
-        return JS_EXCEPTION;
-    value = argv[0];
-    if (JS_IsNull(value) || JS_IsUndefined(value)) {
-        /* For async stacks, a null/undefined resource still needs a record
-           so disposeAsync performs the required Await(undefined). */
-        if (class_id == JS_CLASS_ASYNC_DISPOSABLE_STACK) {
-            if (js_disposable_stack_add(ctx, s, JS_UNDEFINED, JS_UNDEFINED,
-                                        JS_DISPOSE_HINT_SYNC) < 0)
-                return JS_EXCEPTION;
+static int js_disposable_stack_use_step(JSContext *ctx, void *st, JSValue cb_result,
+                                        JSValue **out_cb, int *out_argc)
+{
+    JSDisposableUse *s = st;
+    int class_id = s->hdr.arg;
+    JSValueConst value = step_arg(&s->hdr, 0);
+    JSDisposableStack *ds;
+
+    ds = js_disposable_stack_get(ctx, s->hdr.this_val, class_id);
+    if (!ds) { if (s->hdr.stage == 0) s->result = JS_UNDEFINED; JS_FreeValue(ctx, cb_result); return -1; }
+
+    if (s->hdr.stage == 0) {
+        void *inner;
+        JS_FreeValue(ctx, cb_result);
+        s->result = JS_UNDEFINED;
+        if (JS_IsNull(value) || JS_IsUndefined(value)) {
+            /* an ASYNC stack still records it, so disposeAsync performs the required Await(undefined). */
+            if (class_id == JS_CLASS_ASYNC_DISPOSABLE_STACK
+                && js_disposable_stack_add(ctx, ds, JS_UNDEFINED, JS_UNDEFINED, JS_DISPOSE_HINT_SYNC) < 0)
+                return -1;
+            s->result = js_dup(value);
+            return 0;
         }
-        return js_dup(value);
+        s->hdr.stage = 1;
+        inner = tramp_step_state_new(ctx,
+                                     class_id == JS_CLASS_ASYNC_DISPOSABLE_STACK ? &js_get_dispose_async_def
+                                                                                 : &js_get_dispose_sync_def,
+                                     JS_UNDEFINED, 1, &value, JS_UNDEFINED);
+        if (!inner) return -1;
+        s->hdr.delegate = inner;
+        return 17;   /* DELEGATE */
     }
-    if (!JS_IsObject(value))
-        return JS_ThrowTypeError(ctx, "not an object");
-    method = js_get_dispose_method(ctx, value, hint);
-    if (JS_IsException(method))
-        return JS_EXCEPTION;
-    if (js_disposable_stack_add(ctx, s, value, method, JS_DISPOSE_HINT_SYNC) < 0) {
-        JS_FreeValue(ctx, method);
-        return JS_EXCEPTION;
+    DCHECK(s->hdr.stage == 1, "DisposableStack.prototype.use resumed in an unknown stage");
+    /* cb_result = the dispose method. The RECORD is added under the stack the receiver holds NOW: the getter or
+       trap that produced the method is the page's code and can have disposed or replaced it, which is why the
+       receiver is re-validated above rather than captured at stage 0. */
+    if (js_disposable_stack_add(ctx, ds, value, cb_result, JS_DISPOSE_HINT_SYNC) < 0) {
+        JS_FreeValue(ctx, cb_result);
+        return -1;
     }
-    JS_FreeValue(ctx, method);
-    return js_dup(value);
+    JS_FreeValue(ctx, cb_result);
+    s->result = js_dup(value);
+    return 0;
 }
+
+static JSValue js_disposable_stack_use_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSDisposableUse *s = st;
+    JSValue r = take_result ? s->result : (JS_FreeValue(ctx, s->result), JS_UNDEFINED);
+    js_free_rt(ctx->rt, s);
+    return r;
+}
+
+static const JSTrampStepDef js_disposable_use_def = {
+    sizeof(JSDisposableUse), js_disposable_stack_use_step, js_disposable_stack_use_fini,
+    JS_CLASS_DISPOSABLE_STACK
+};
+static const JSTrampStepDef js_async_disposable_use_def = {
+    sizeof(JSDisposableUse), js_disposable_stack_use_step, js_disposable_stack_use_fini,
+    JS_CLASS_ASYNC_DISPOSABLE_STACK
+};
 
 static JSValue js_disposable_stack_adopt(JSContext *ctx, JSValueConst this_val,
                                          int argc, JSValueConst *argv, int class_id)
@@ -81490,7 +81530,7 @@ static const JSCFunctionListEntry js_disposable_stack_proto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("defer", 1, js_disposable_stack_defer, JS_CLASS_DISPOSABLE_STACK ),
     JS_CFUNC_STEP_DEF("dispose", 0, STEPDEF_DISPOSE_SYNC ),
     JS_CFUNC_MAGIC_DEF("move", 0, js_disposable_stack_move, JS_CLASS_DISPOSABLE_STACK ),
-    JS_CFUNC_MAGIC_DEF("use", 1, js_disposable_stack_use, JS_CLASS_DISPOSABLE_STACK ),
+    JS_CFUNC_STEP_DEF("use", 1, STEPDEF_DISPOSABLE_USE ),
     JS_CGETSET_MAGIC_DEF("disposed", js_disposable_stack_get_disposed, NULL, JS_CLASS_DISPOSABLE_STACK ),
     JS_ALIAS_DEF("[Symbol.dispose]", "dispose" ),
     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "DisposableStack", JS_PROP_CONFIGURABLE ),
@@ -81501,7 +81541,7 @@ static const JSCFunctionListEntry js_async_disposable_stack_proto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("defer", 1, js_disposable_stack_defer, JS_CLASS_ASYNC_DISPOSABLE_STACK ),
     JS_CFUNC_STEP_DEF("disposeAsync", 0, STEPDEF_DISPOSE_ASYNC ),
     JS_CFUNC_MAGIC_DEF("move", 0, js_disposable_stack_move, JS_CLASS_ASYNC_DISPOSABLE_STACK ),
-    JS_CFUNC_MAGIC_DEF("use", 1, js_disposable_stack_use, JS_CLASS_ASYNC_DISPOSABLE_STACK ),
+    JS_CFUNC_STEP_DEF("use", 1, STEPDEF_ASYNC_DISPOSABLE_USE ),
     JS_CGETSET_MAGIC_DEF("disposed", js_disposable_stack_get_disposed, NULL, JS_CLASS_ASYNC_DISPOSABLE_STACK ),
     JS_ALIAS_DEF("[Symbol.asyncDispose]", "disposeAsync" ),
     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "AsyncDisposableStack", JS_PROP_CONFIGURABLE),
@@ -91138,154 +91178,184 @@ static int get_uint8array_bytes(JSContext *ctx, JSObject *p,
     return 0;
 }
 
-/* Validate options is undefined or an object (GetOptionsObject).
-   Returns 0 on success, -1 on error (throws). */
-static int check_options_object(JSContext *ctx, JSValueConst options)
+/* DELETED: parse_alphabet_option and parse_last_chunk_option. Both performed 27.x's GetOption with
+   JS_GetPropertyStr from C, and an options BAG is the page's object — `{ get alphabet() { … } }` or a Proxy makes
+   each read the page's code with no flow base. They are step_strop_run calls on the machines below, which is one
+   sub-sequence rather than two hand-rolled copies of the same read-and-match.
+
+   THE ALLOWED VALUES ARE THE SPEC'S LISTS, and the index IS the mode, which is why the enums below are ordered to
+   match rather than mapped. */
+static const char *const b64_alphabet_names[] = { "base64", "base64url", NULL };
+static const char *const b64_lastchunk_names[] = { "loose", "strict", "stop-before-partial", NULL };
+
+/* The base64 family as STEP MACHINES. Each reads one or two options — the only page-visible steps it has — and
+   everything after them (the buffer access, the codec, the result) invokes nothing. The spec ORDER is preserved:
+   the options are read before the buffer is touched, which is what the deleted helpers' call sites spelled out
+   and what the machines' stages now carry. */
+typedef struct JSB64Op {
+    JSStepHdr hdr;       /* MUST be first */
+    JSValue result;      /* owned */
+    JSValueConst options;/* borrowed from the invocation the header holds */
+    int alphabet;
+    int last_chunk;      /* also carries omitPadding for toBase64 */
+} JSB64Op;
+_Static_assert(offsetof(JSB64Op, hdr) == 0, "JSStepHdr must be first in JSB64Op");
+
+enum { B64OP_TO = 0, B64OP_FROM, B64OP_SET_FROM };
+static JSValue js_b64op_finish(JSContext *ctx, JSB64Op *s);
+static JSValue js_make_read_written(JSContext *ctx, size_t read, size_t written);
+/* stage 0 is the PROLOGUE and nothing else: it starts at 1 so a resumption after a parked read cannot land
+   on it. It did — B64ST_ALPHABET was 0, so the re-entry re-ran the prologue, whose first act is to FREE
+   cb_result, and the option's value was destroyed before the sub-sequence could be handed it. Every option
+   silently read as undefined and took its fallback; the two-phase DCHECK cannot see this, because the read
+   WAS answered at the site that parked it, just with a value that had been thrown away. */
+enum { B64ST_ALPHABET = 1, B64ST_SECOND, B64ST_DONE };
+
+static int js_b64op_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    if (JS_IsUndefined(options))
-        return 0;
-    if (!JS_IsObject(options)) {
-        JS_ThrowTypeError(ctx, "options must be an object");
-        return -1;
+    JSB64Op *s = st;
+    int which = s->hdr.arg;
+    int r;
+
+    if (s->hdr.stage == 0) {
+        JSValueConst opt_arg;
+        int optidx = (which == B64OP_TO) ? 0 : 1;
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        s->result = JS_UNDEFINED;
+        /* the RECEIVER and ARGUMENT validations the spec performs before any option read. */
+        if (which != B64OP_FROM) {
+            JSObject *p = check_uint8array(ctx, s->hdr.this_val);
+            if (!p) return -1;
+            if (which == B64OP_SET_FROM && typed_array_is_immutable(p))
+                return (JS_ThrowTypeErrorImmutableArrayBuffer(ctx), -1);
+        }
+        if (which != B64OP_TO && !JS_IsString(step_arg(&s->hdr, 0)))
+            return (JS_ThrowTypeError(ctx, "expected string"), -1);
+        opt_arg = (s->hdr.argc > optidx) ? step_arg(&s->hdr, optidx) : JS_UNDEFINED;
+        if (!JS_IsUndefined(opt_arg) && !JS_IsObject(opt_arg))
+            return (JS_ThrowTypeError(ctx, "options must be an object"), -1);
+        s->options = opt_arg;           /* borrowed: the header owns the invocation for the machine's life */
+        s->hdr.stage = B64ST_ALPHABET;
     }
-    return 0;
+    if (s->hdr.stage == B64ST_ALPHABET) {
+        r = step_strop_run(ctx, &s->hdr, s->options, JS_ATOM_alphabet, b64_alphabet_names,
+                           B64_ALPHABET_BASE64, cb_result, &s->alphabet, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r;
+        s->hdr.stage = B64ST_SECOND;
+    }
+    if (s->hdr.stage == B64ST_SECOND) {
+        if (which == B64OP_TO) {
+            /* omitPadding is ToBoolean, not an enumerated string, so it is the plain read. */
+            JSValue v;
+            if (JS_IsUndefined(s->options)) { s->last_chunk = 0; JS_FreeValue(ctx, cb_result); }
+            else {
+                r = step_getprop_run(ctx, &s->hdr, s->options, JS_ATOM_omitPadding, cb_result, &v,
+                                     out_cb, out_argc);
+                cb_result = JS_UNDEFINED;
+                if (r) return r;
+                s->last_chunk = JS_ToBool(ctx, v);
+                JS_FreeValue(ctx, v);
+            }
+        } else {
+            r = step_strop_run(ctx, &s->hdr, s->options, JS_ATOM_lastChunkHandling, b64_lastchunk_names,
+                               B64_LAST_LOOSE, cb_result, &s->last_chunk, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r;
+        }
+        s->hdr.stage = B64ST_DONE;
+    }
+    DCHECK(s->hdr.stage == B64ST_DONE, "a base64 operation resumed in an unknown stage");
+    JS_FreeValue(ctx, cb_result);
+    s->result = js_b64op_finish(ctx, s);
+    return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
 }
 
-/* Parse the 'alphabet' option from an options object.
-   Returns B64_ALPHABET_BASE64 or B64_ALPHABET_BASE64URL, or -1 on error. */
-static int parse_alphabet_option(JSContext *ctx, JSValueConst options)
+static JSValue js_b64op_fini(JSContext *ctx, void *st, bool take_result)
 {
-    JSValue val;
-    const char *str;
-    int ret;
-
-    if (JS_IsUndefined(options))
-        return B64_ALPHABET_BASE64;
-
-    val = JS_GetPropertyStr(ctx, options, "alphabet");
-    if (JS_IsException(val))
-        return -1;
-    if (JS_IsUndefined(val))
-        return B64_ALPHABET_BASE64;
-    if (!JS_IsString(val)) {
-        JS_FreeValue(ctx, val);
-        JS_ThrowTypeError(ctx, "expected string for alphabet");
-        return -1;
-    }
-
-    str = JS_ToCString(ctx, val);
-    JS_FreeValue(ctx, val);
-    if (!str)
-        return -1;
-
-    if (!strcmp(str, "base64"))
-        ret = B64_ALPHABET_BASE64;
-    else if (!strcmp(str, "base64url"))
-        ret = B64_ALPHABET_BASE64URL;
-    else {
-        JS_ThrowTypeError(ctx, "invalid alphabet");
-        ret = -1;
-    }
-    JS_FreeCString(ctx, str);
-    return ret;
+    JSB64Op *s = st;
+    JSValue r = take_result ? s->result : (JS_FreeValue(ctx, s->result), JS_UNDEFINED);
+    js_free_rt(ctx->rt, s);
+    return r;
 }
 
-/* Parse the 'lastChunkHandling' option. Returns mode or -1 on error. */
-static int parse_last_chunk_option(JSContext *ctx, JSValueConst options)
+static const JSTrampStepDef js_u8_tobase64_def =
+    { sizeof(JSB64Op), js_b64op_step, js_b64op_fini, B64OP_TO };
+static const JSTrampStepDef js_u8_frombase64_def =
+    { sizeof(JSB64Op), js_b64op_step, js_b64op_fini, B64OP_FROM };
+static const JSTrampStepDef js_u8_setfrombase64_def =
+    { sizeof(JSB64Op), js_b64op_step, js_b64op_fini, B64OP_SET_FROM };
+
+/* Everything AFTER the options: the buffer access, the codec and the result. Not one step of it is the page's
+   code, which is why it is a plain C tail and only the reads above became requests. One function for all three
+   operations because the receiver checks, the option order and the OOB re-check are shared and splitting them
+   was how the C bodies came to disagree about when the buffer is read. */
+static JSValue js_b64op_finish(JSContext *ctx, JSB64Op *s)
 {
-    JSValue val;
-    const char *str;
-    int ret;
-
-    if (JS_IsUndefined(options))
-        return B64_LAST_LOOSE;
-
-    val = JS_GetPropertyStr(ctx, options, "lastChunkHandling");
-    if (JS_IsException(val))
-        return -1;
-    if (JS_IsUndefined(val))
-        return B64_LAST_LOOSE;
-    if (!JS_IsString(val)) {
-        JS_FreeValue(ctx, val);
-        JS_ThrowTypeError(ctx, "expected string for lastChunkHandling");
-        return -1;
-    }
-
-    str = JS_ToCString(ctx, val);
-    JS_FreeValue(ctx, val);
-    if (!str)
-        return -1;
-
-    if (!strcmp(str, "loose"))
-        ret = B64_LAST_LOOSE;
-    else if (!strcmp(str, "strict"))
-        ret = B64_LAST_STRICT;
-    else if (!strcmp(str, "stop-before-partial"))
-        ret = B64_LAST_STOP_BEFORE_PARTIAL;
-    else {
-        JS_ThrowTypeError(ctx, "invalid lastChunkHandling option");
-        ret = -1;
-    }
-    JS_FreeCString(ctx, str);
-    return ret;
-}
-
-/* Uint8Array.prototype.toBase64([options]) */
-static JSValue js_uint8array_to_base64(JSContext *ctx, JSValueConst this_val,
-                                       int argc, JSValueConst *argv)
-{
+    int which = s->hdr.arg;
     uint8_t *data;
-    size_t len;
-    JSValue options;
-    JSObject *p;
-    int alphabet, omit_padding;
-    size_t out_len, written;
-    JSString *ostr;
-    char *dst;
+    size_t len, str_len, read_pos, decoded_len;
+    const char *str;
+    int err;
 
-    p = check_uint8array(ctx, this_val);
-    if (!p)
-        return JS_EXCEPTION;
-
-    options = argc > 0 ? unsafe_unconst(argv[0]) : JS_UNDEFINED;
-    if (check_options_object(ctx, options))
-        return JS_EXCEPTION;
-    alphabet = parse_alphabet_option(ctx, options);
-    if (alphabet < 0)
-        return JS_EXCEPTION;
-
-    omit_padding = 0;
-    if (!JS_IsUndefined(options)) {
-        JSValue op_val = JS_GetPropertyStr(ctx, options, "omitPadding");
-        if (JS_IsException(op_val))
+    if (which == B64OP_TO) {
+        JSObject *p = check_uint8array(ctx, s->hdr.this_val);
+        size_t out_len, written;
+        JSString *ostr;
+        char *dst;
+        DCHECK(p != NULL, "toBase64's receiver was validated at stage 0 and cannot have changed");
+        /* the OOB re-check belongs HERE: an option getter is the page's code and can detach the buffer. */
+        if (get_uint8array_bytes(ctx, p, &data, &len))
             return JS_EXCEPTION;
-        omit_padding = JS_ToBool(ctx, op_val);
-        JS_FreeValue(ctx, op_val);
+        out_len = 4 * ((len + 2) / 3);
+        if (unlikely(out_len > JS_STRING_LEN_MAX))
+            return JS_ThrowRangeError(ctx, "output too large");
+        ostr = js_alloc_string(ctx, out_len, 0);
+        if (!ostr)
+            return JS_EXCEPTION;
+        dst = (char *)str8(ostr);
+        written = b64_encode(data, len, dst,
+                             s->alphabet == B64_ALPHABET_BASE64URL ? b64url_enc : b64_enc);
+        if (s->last_chunk) {   /* omitPadding */
+            while (written > 0 && dst[written - 1] == '=')
+                written--;
+        }
+        dst[written] = '\0';
+        ostr->len = written;
+        return JS_MKPTR(JS_TAG_STRING, ostr);
     }
 
-    if (get_uint8array_bytes(ctx, p, &data, &len))
+    str = JS_ToCStringLen(ctx, &str_len, step_arg(&s->hdr, 0));
+    if (!str)
         return JS_EXCEPTION;
 
-    out_len = 4 * ((len + 2) / 3);
-
-    if (unlikely(out_len > JS_STRING_LEN_MAX))
-        return JS_ThrowRangeError(ctx, "output too large");
-
-    ostr = js_alloc_string(ctx, out_len, 0);
-    if (!ostr)
-        return JS_EXCEPTION;
-
-    dst = (char *)str8(ostr);
-    written = b64_encode(data, len, dst,
-                         alphabet == B64_ALPHABET_BASE64URL ? b64url_enc : b64_enc);
-    if (omit_padding) {
-        while (written > 0 && dst[written - 1] == '=')
-            written--;
+    if (which == B64OP_FROM) {
+        size_t out_cap = (str_len / 4) * 3 + 3;
+        uint8_t *buf = js_malloc(ctx, out_cap ? out_cap : 1);
+        JSValue result;
+        if (!buf) { JS_FreeCString(ctx, str); return JS_EXCEPTION; }
+        decoded_len = from_base64(str, str_len, buf, out_cap,
+                                  s->alphabet == B64_ALPHABET_BASE64URL ? b64_flags_url : b64_flags,
+                                  s->last_chunk, &read_pos, &err);
+        JS_FreeCString(ctx, str);
+        if (err) { js_free(ctx, buf); return JS_ThrowSyntaxError(ctx, "invalid base64 string"); }
+        result = JS_NewUint8ArrayCopy(ctx, buf, decoded_len);
+        js_free(ctx, buf);
+        return result;
     }
-    dst[written] = '\0';
 
-    ostr->len = written;
-    return JS_MKPTR(JS_TAG_STRING, ostr);
+    {
+        JSObject *p = check_uint8array(ctx, s->hdr.this_val);
+        DCHECK(p != NULL, "setFromBase64's receiver was validated at stage 0 and cannot have changed");
+        if (get_uint8array_bytes(ctx, p, &data, &len)) { JS_FreeCString(ctx, str); return JS_EXCEPTION; }
+        decoded_len = from_base64(str, str_len, data, len,
+                                  s->alphabet == B64_ALPHABET_BASE64URL ? b64_flags_url : b64_flags,
+                                  s->last_chunk, &read_pos, &err);
+        JS_FreeCString(ctx, str);
+        if (err)
+            return JS_ThrowSyntaxError(ctx, "invalid base64 string");
+        return js_make_read_written(ctx, read_pos, decoded_len);
+    }
 }
 
 /* Uint8Array.prototype.toHex() */
@@ -91314,62 +91384,6 @@ static JSValue js_uint8array_to_hex(JSContext *ctx, JSValueConst this_val,
     u8a_hex_encode(data, len, (char *)str8(ostr));
     str8(ostr)[out_len] = '\0';
     return JS_MKPTR(JS_TAG_STRING, ostr);
-}
-
-/* Uint8Array.fromBase64(string[, options]) */
-static JSValue js_uint8array_from_base64(JSContext *ctx, JSValueConst this_val,
-                                         int argc, JSValueConst *argv)
-{
-    const char *str;
-    size_t str_len, read_pos, decoded_len, out_cap;
-    int alphabet, last_chunk, err;
-    uint8_t *buf;
-    JSValue result, options;
-
-    if (!JS_IsString(argv[0]))
-        return JS_ThrowTypeError(ctx, "expected string");
-
-    str = JS_ToCStringLen(ctx, &str_len, argv[0]);
-    if (!str)
-        return JS_EXCEPTION;
-
-    options = argc > 1 ? unsafe_unconst(argv[1]) : JS_UNDEFINED;
-    if (check_options_object(ctx, options)) {
-        JS_FreeCString(ctx, str);
-        return JS_EXCEPTION;
-    }
-    alphabet = parse_alphabet_option(ctx, options);
-    if (alphabet < 0) {
-        JS_FreeCString(ctx, str);
-        return JS_EXCEPTION;
-    }
-    last_chunk = parse_last_chunk_option(ctx, options);
-    if (last_chunk < 0) {
-        JS_FreeCString(ctx, str);
-        return JS_EXCEPTION;
-    }
-
-    out_cap = (str_len / 4) * 3 + 3;
-    buf = js_malloc(ctx, out_cap ? out_cap : 1);
-    if (!buf) {
-        JS_FreeCString(ctx, str);
-        return JS_EXCEPTION;
-    }
-
-    decoded_len = from_base64(str, str_len, buf, out_cap,
-                              alphabet == B64_ALPHABET_BASE64URL
-                                  ? b64_flags_url : b64_flags,
-                              last_chunk, &read_pos, &err);
-    JS_FreeCString(ctx, str);
-
-    if (err) {
-        js_free(ctx, buf);
-        return JS_ThrowSyntaxError(ctx, "invalid base64 string");
-    }
-
-    result = JS_NewUint8ArrayCopy(ctx, buf, decoded_len);
-    js_free(ctx, buf);
-    return result;
 }
 
 /* Uint8Array.fromHex(string) */
@@ -91428,65 +91442,6 @@ fail:
 }
 
 /* Uint8Array.prototype.setFromBase64(string[, options]) */
-static JSValue js_uint8array_set_from_base64(JSContext *ctx,
-                                             JSValueConst this_val,
-                                             int argc, JSValueConst *argv)
-{
-    uint8_t *data;
-    size_t len;
-    const char *str;
-    size_t str_len, read_pos, decoded_len;
-    JSObject *p;
-    int alphabet, last_chunk, err;
-    JSValue options;
-
-    p = check_uint8array(ctx, this_val);
-    if (!p)
-        return JS_EXCEPTION;
-
-    if (typed_array_is_immutable(p))
-        return JS_ThrowTypeErrorImmutableArrayBuffer(ctx);
-
-    if (!JS_IsString(argv[0]))
-        return JS_ThrowTypeError(ctx, "expected string");
-
-    str = JS_ToCStringLen(ctx, &str_len, argv[0]);
-    if (!str)
-        return JS_EXCEPTION;
-
-    options = argc > 1 ? unsafe_unconst(argv[1]) : JS_UNDEFINED;
-    if (check_options_object(ctx, options)) {
-        JS_FreeCString(ctx, str);
-        return JS_EXCEPTION;
-    }
-    alphabet = parse_alphabet_option(ctx, options);
-    if (alphabet < 0) {
-        JS_FreeCString(ctx, str);
-        return JS_EXCEPTION;
-    }
-    last_chunk = parse_last_chunk_option(ctx, options);
-    if (last_chunk < 0) {
-        JS_FreeCString(ctx, str);
-        return JS_EXCEPTION;
-    }
-
-    if (get_uint8array_bytes(ctx, p, &data, &len)) {
-        JS_FreeCString(ctx, str);
-        return JS_EXCEPTION;
-    }
-
-    decoded_len = from_base64(str, str_len, data, len,
-                              alphabet == B64_ALPHABET_BASE64URL
-                                  ? b64_flags_url : b64_flags,
-                              last_chunk, &read_pos, &err);
-    JS_FreeCString(ctx, str);
-
-    if (err)
-        return JS_ThrowSyntaxError(ctx, "invalid base64 string");
-
-    return js_make_read_written(ctx, read_pos, decoded_len);
-}
-
 /* Uint8Array.prototype.setFromHex(string) */
 static JSValue js_uint8array_set_from_hex(JSContext *ctx,
                                           JSValueConst this_val,
@@ -91528,14 +91483,14 @@ static JSValue js_uint8array_set_from_hex(JSContext *ctx,
 }
 
 static const JSCFunctionListEntry js_uint8array_proto_funcs[] = {
-    JS_CFUNC_DEF("toBase64", 0, js_uint8array_to_base64),
+    JS_CFUNC_STEP_DEF("toBase64", 0, STEPDEF_U8_TOBASE64),
     JS_CFUNC_DEF("toHex", 0, js_uint8array_to_hex),
-    JS_CFUNC_DEF("setFromBase64", 1, js_uint8array_set_from_base64),
+    JS_CFUNC_STEP_DEF("setFromBase64", 1, STEPDEF_U8_SETFROMBASE64),
     JS_CFUNC_DEF("setFromHex", 1, js_uint8array_set_from_hex),
 };
 
 static const JSCFunctionListEntry js_uint8array_funcs[] = {
-    JS_CFUNC_DEF("fromBase64", 1, js_uint8array_from_base64),
+    JS_CFUNC_STEP_DEF("fromBase64", 1, STEPDEF_U8_FROMBASE64),
     JS_CFUNC_DEF("fromHex", 1, js_uint8array_from_hex),
 };
 
