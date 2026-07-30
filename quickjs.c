@@ -58,9 +58,14 @@
 /* Forced-exec fork-local assert — MIRRORS engine/host/check.h (the quickjs submodule is a separate repo and
    cannot include the host header, exactly as extension/check.js mirrors the same law on the JS side). Same
    semantics: DFAIL = a DEV-ONLY should-never-happen (design invariant / not-yet-built capability) — emits
-   @WHY at the origin then aborts; QJS_CHECK_FAIL = ALWAYS fatal (dev AND release) for a "must-not-proceed
+   @WHY at the origin then aborts; CHECK/CHECK_FAIL = ALWAYS fatal (dev AND release) for a "must-not-proceed
    even in production" invariant. DFAIL compiles out in release (APICLIENT_DEV=0); its condition must be
-   side-effect-free and never recoverable control flow. */
+   side-effect-free and never recoverable control flow.
+   The NAMES are the host header's, not a prefixed variant of them. CLAUDE.md's rule is to use the established
+   name rather than coin a system, and two spellings of one mechanism across two files is that coinage: a reader
+   has to learn which file says QJS_CHECK_FAIL and which says CHECK_FAIL, and the second name is what invites a
+   third. Only the EMIT is this file's (a plain @WHY/@E line rather than the host's JSON), because the submodule
+   cannot include the host header. */
 #if defined(APICLIENT_DEV) && APICLIENT_DEV == 0
 #define DFAIL(msg)         ((void)0)
 #define DCHECK(cond, msg)  ((void)0)
@@ -68,7 +73,8 @@
 #define DFAIL(msg)         do { fprintf(stderr, "@WHY %s (%s:%d)\n", (msg), __FILE__, __LINE__); abort(); } while (0)
 #define DCHECK(cond, msg)  do { if (!(cond)) DFAIL(msg); } while (0)
 #endif
-#define QJS_CHECK_FAIL(msg) do { fprintf(stderr, "@E %s (%s:%d)\n", (msg), __FILE__, __LINE__); abort(); } while (0)
+#define CHECK_FAIL(msg)    do { fprintf(stderr, "@E %s (%s:%d)\n", (msg), __FILE__, __LINE__); abort(); } while (0)
+#define CHECK(cond, msg)   do { if (!(cond)) CHECK_FAIL(msg); } while (0)
 
 #if defined(__APPLE__)
 #define MALLOC_OVERHEAD  0
@@ -603,13 +609,18 @@ struct JSContext {
        that can push the promise as the opcode's RESULT — rejects it once the unwind has returned to the frame
        named in `sf`. NULL whenever no import coercion is in flight. */
     struct JSImportCap *pending_import_cap;
-    JSValue pending_close_iter;  /* IfAbruptCloseIterator deferred an iterator close to its interpreter caller:
-                                    the JS_CallInternal exception label runs 7.4.9 on the tramp, saving and
-                                    restoring the in-flight exception across it, so the page's `return` (a
-                                    generator's finally, an accessor, a proxy trap, a plain method containing a
-                                    loop) never runs in a C activation with no flow base. The label picks the route
-                                    by ITERATOR KIND, the same split OP_iterator_close makes — which is why no
-                                    site that parks one asks what kind it is. UNINITIALIZED when idle. */
+    /* IfAbruptCloseIterator / IteratorCloseAll deferred to this context's interpreter caller: the JS_CallInternal
+       exception label runs 7.4.9 on the tramp for each entry, saving and restoring the in-flight exception across
+       it, so the page's `return` (a generator's finally, an accessor, a proxy trap, a plain method containing a
+       loop) never runs in a C activation with no flow base. The label picks each route by ITERATOR KIND, the same
+       split OP_iterator_close makes — which is why no site that defers one asks what kind it is.
+       A STACK rather than a slot, because 7.4.11 IteratorCloseAll closes `in reverse List order`: a site that owes
+       SEVERAL pushes them in the order it wants them closed LAST-first, and the drain pops. Six sites used to
+       assert the slot was free with the same message naming this exact gap; the queue is that message built. Every
+       close under an abrupt completion discards its own throw, which is what makes a whole list drainable in one
+       unwind — the completion the drain restores is always the one the first failure raised. */
+    JSValue *pending_close_iters;
+    int pending_close_n, pending_close_cap;
     /* A KEYED-OPERATION continuation whose unwind only the interpreter can perform, parked by an abandon walk that
        reached it from OUTSIDE the interpreter. The two teardown walks are mutually recursive — getprop_throw and
        do_getprop_abandon hand a CONT_TOPRIM_GET link to js_toprim_abandon, and a coercion requested BY a keyed
@@ -3095,7 +3106,9 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
     ctx->promise_ctor = JS_NULL;
     ctx->error_ctor = JS_NULL;
     ctx->error_back_trace = JS_UNDEFINED;
-    ctx->pending_close_iter = JS_UNINITIALIZED;
+    ctx->pending_close_iters = NULL;
+    ctx->pending_close_n = 0;
+    ctx->pending_close_cap = 0;
     ctx->pending_import_cap = NULL;
     ctx->pending_gp_unwind = NULL;
     ctx->pending_gp_unwind_kind = 0;   /* CONT_NONE */
@@ -3216,6 +3229,8 @@ static void JS_MarkContext(JSRuntime *rt, JSContext *ctx,
 
     JS_MarkValue(rt, ctx->throw_type_error, mark_func);
     JS_MarkValue(rt, ctx->eval_obj, mark_func);
+    for(i = 0; i < ctx->pending_close_n; i++)
+        JS_MarkValue(rt, ctx->pending_close_iters[i], mark_func);
 
     JS_MarkValue(rt, ctx->array_proto_values, mark_func);
     for(i = 0; i < JS_NATIVE_ERROR_COUNT; i++) {
@@ -3306,7 +3321,9 @@ void JS_FreeContext(JSContext *ctx)
     JS_FreeValue(ctx, ctx->error_ctor);
     DCHECK(ctx->pending_import_cap == NULL, "a parked import capability outlived its context");
     DCHECK(ctx->pending_gp_unwind == NULL, "a parked keyed-operation unwind outlived its context");
-    JS_FreeValue(ctx, ctx->pending_close_iter);   /* normally UNINITIALIZED (drained at the exception label); free defensively */
+    while (ctx->pending_close_n > 0)   /* normally empty (drained at the exception label); free defensively */
+        JS_FreeValue(ctx, ctx->pending_close_iters[--ctx->pending_close_n]);
+    js_free_rt(rt, ctx->pending_close_iters);
     JS_FreeValue(ctx, ctx->error_back_trace);
     JS_FreeValue(ctx, ctx->error_prepare_stack);
     JS_FreeValue(ctx, ctx->error_stack_trace_limit);
@@ -19795,8 +19812,27 @@ static void js_toprim_abandon(JSContext *ctx, struct JSToPrim *tp)
     tramp_step_chain_free(ctx, touter);
 }
 
+/* DEFER one IteratorClose to the interpreter's exception label. The reference is OWNED by the queue until the
+   drain takes it. PUSH ORDER IS THE REVERSE OF CLOSE ORDER, because 7.4.11 IteratorCloseAll closes in reverse
+   List order and the drain pops: a site owing « inputIter, iters… » pushes inputIter FIRST and iters in index
+   order, so the drain closes iters[n-1] … iters[0] then inputIter.
+   Allocation here is a CHECK, not a recoverable error: dropping an owed close means the page's `return` never
+   runs, so the iterator is left un-finalised in production, and every caller is already on an unwind with no way
+   to report a second failure. */
+static void iter_close_defer(JSContext *ctx, JSValueConst iter)
+{
+    if (ctx->pending_close_n == ctx->pending_close_cap) {
+        int ncap = ctx->pending_close_cap ? ctx->pending_close_cap * 2 : 4;
+        JSValue *nq = js_realloc(ctx, ctx->pending_close_iters, sizeof(JSValue) * (size_t)ncap);
+        CHECK(nq != NULL, "out of memory growing the deferred-IteratorClose queue: an owed close cannot be dropped");
+        ctx->pending_close_iters = nq;
+        ctx->pending_close_cap = ncap;
+    }
+    ctx->pending_close_iters[ctx->pending_close_n++] = js_dup(iter);
+}
+
 /* 7.4.9 IteratorClose requested DURING an exception unwind — IfAbruptCloseIterator, deferred to the interpreter
-   through ctx->pending_close_iter. The OPCODE's close is stateless because its iterator is its own operand at
+   through ctx->pending_close_iters. The OPCODE's close is stateless because its iterator is its own operand at
    sp[-1]; an unwind has no operand to borrow, and it must carry the in-flight exception across a close that can
    SUSPEND, so neither can live in an interpreter local. This state is that difference and nothing else, which is
    why the two modes share the CONT_* kinds and the whole sequence: the state's PRESENCE is the mode. */
@@ -23318,7 +23354,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     int tramp_gen_iternext = 0;                         /* 1 = OP_iterator_next drive (yield* / destructuring): iterator at sp[-4], arg at sp[-1], result OBJECT replaces sp[-1] */
     int tramp_gen_close = 0;                            /* 1 = OP_iterator_close drive (.return() on an unconsumed generator iterator at sp[-1]): body runs finally on the tramp, result DISCARDED */
     int tramp_gen_close_exc = 0;                        /* 1 = the close is happening DURING exception unwind (JS_IteratorClose(iter,true)): after the finally runs, restore the in-flight exception and continue unwinding (goto exception), never overwrite it */
-    JSValueConst tramp_gen_close_slot_gen = JS_UNINITIALIZED; /* close mode: the generator to close comes from ctx->pending_close_iter (an IfAbruptCloseIterator deferral), NOT sp[-1]; caller_sp stays put (nothing on the stack). read+reset in do_generator_tramp */
+    JSValueConst tramp_gen_close_slot_gen = JS_UNINITIALIZED; /* close mode: the generator to close comes from the ctx->pending_close_iters drain (an IfAbruptCloseIterator deferral), NOT sp[-1]; caller_sp stays put (nothing on the stack). read+reset in do_generator_tramp */
     JSValue tramp_gen_close_deliver = JS_UNINITIALIZED;  /* close-then-deliver (helper .return()): after the source generator closes, PUSH this pre-built {value,done:true} as the helper.return() result instead of discarding. read+reset in do_generator_tramp */
     JSValue tramp_iter_getiter = JS_UNDEFINED;          /* the @@iterator method the recognition probed (owned, callable); do_consume_acquire_iterator CALLS it to get the iterator */
     JSValueConst tramp_consume_iterable = JS_UNDEFINED; /* the iterable being consumed — the `this` of the @@iterator call */
@@ -26422,9 +26458,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     && check_function(ctx, (call_argc >= 1) ? call_argv[0] : JS_UNDEFINED)) {
                     /* IfAbruptCloseIterator: an invalid callback still closes the underlying iterator, and the
                        page's `return` runs on the tramp — park it for the exception label, which owns the routing. */
-                    DCHECK(JS_IsUninitialized(ctx->pending_close_iter),
-                           "pending_close_iter already set — a nested IfAbruptCloseIterator needs a queue");
-                    ctx->pending_close_iter = js_dup(iterobj);
+                    iter_close_defer(ctx, iterobj);
                     goto exception;
                 }
                 if (iterterm_kind == ITERTERM_TOARRAY) acc = JS_NewArray(ctx);
@@ -29025,9 +29059,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        (the close's own throw is discarded — the original wins). A generator closes on the tramp via
                        the exception label's deferral. */
                     if (s->sink == ITERCONS_ITERTERM && !JS_IsUndefined(s->iter)) {
-                        DCHECK(JS_IsUninitialized(ctx->pending_close_iter),
-                               "pending_close_iter already set — a nested IfAbruptCloseIterator needs a queue");
-                        ctx->pending_close_iter = js_dup(s->iter);
+                        iter_close_defer(ctx, s->iter);
                     }
                     js_iter_consume_end(ctx, s); js_free_rt(rt, s); goto exception;
                 }
@@ -35962,14 +35994,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         js_import_cap_free(ctx, ic);
         goto restart;
     }
-    if (unlikely(!JS_IsUninitialized(ctx->pending_close_iter))) {
+    if (unlikely(ctx->pending_close_n > 0)) {
         /* THE ONE ROUTER for a deferred IfAbruptCloseIterator. The kind test lived at each of the six sites that
-           park one, and each of those sites had the same non-generator FALLBACK beside it: JS_IteratorClose from
+           defer one, and each of those sites had the same non-generator FALLBACK beside it: JS_IteratorClose from
            C, which invokes the page's `return` with JS_CallFree in an activation with no flow base — so a `return`
            containing a loop aborted at its back-edge. That fallback is gone; every kind is routed here, by the
-           same split OP_iterator_close makes, and a kind with no route CRASHES rather than driving from C. */
-        JSValue ci = ctx->pending_close_iter;
-        ctx->pending_close_iter = JS_UNINITIALIZED;
+           same split OP_iterator_close makes, and a kind with no route CRASHES rather than driving from C.
+           ONE entry per pass: every route ends by re-entering this label (a close with no waiting machine falls
+           through to `goto exception`), so the stack drains itself in 7.4.11's reverse List order with no loop
+           here and with each close's own throw discarded by the completion the state restores. */
+        JSValue ci = ctx->pending_close_iters[--ctx->pending_close_n];
         if (JS_VALUE_GET_TAG(ci) == JS_TAG_OBJECT) {
             JSObject *ip = JS_VALUE_GET_OBJ(ci);
             if (ip->class_id == JS_CLASS_GENERATOR && ip->u.generator_data) {
@@ -36014,7 +36048,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (pos == 0) {
                     /* An enum_rec being unwound past: 7.4.9 IteratorClose under an ABRUPT completion, which is the
                        SAME operation IfAbruptCloseIterator defers, so it goes through the SAME router
-                       (ctx->pending_close_iter, at the top of this label) instead of a second copy of the kind
+                       (ctx->pending_close_iters, at the top of this label) instead of a second copy of the kind
                        test. The copy that used to live here asked what KIND of iterator it was — a generator, a
                        lazy helper over a generator source, an async-from-sync wrapper over a generator source —
                        and every shape it did not name fell through to JS_IteratorClose from C, which invokes the
@@ -36026,9 +36060,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        consumed, so the close cannot run twice. */
                     JS_FreeValue(ctx, sp[-1]); /* drop the next method */
                     sp--;
-                    DCHECK(JS_IsUninitialized(ctx->pending_close_iter),
-                           "pending_close_iter already set — a nested IfAbruptCloseIterator needs a queue");
-                    ctx->pending_close_iter = js_dup(sp[-1]);
+                    iter_close_defer(ctx, sp[-1]);
                     sf->cur_pc = pc;
                     goto exception;
                 } else {
@@ -36658,9 +36690,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    `Array.from(gen, mapfnThatThrows)` left the generator's `finally` UNRUN. Every consumer whose
                    callback threw is an IfAbruptCloseIterator site, whatever its source. */
                 struct JSIterConsume *cs2 = (struct JSIterConsume *)xcs;
-                DCHECK(JS_IsUninitialized(ctx->pending_close_iter),
-                       "pending_close_iter already set — a nested IfAbruptCloseIterator needs a queue");
-                ctx->pending_close_iter = js_dup(cs2->iter);
+                iter_close_defer(ctx, cs2->iter);
             }
             if (xck == CONT_ITER_CONSUME)
                 js_iter_consume_end(ctx, (struct JSIterConsume *)xcs);
@@ -62116,9 +62146,7 @@ static void js_iter_consume_abandon(JSContext *ctx, void *st)
 {
     JSIterConsume *s = st;
     if (!JS_IsUndefined(s->iter)) {
-        DCHECK(JS_IsUninitialized(ctx->pending_close_iter),
-               "pending_close_iter already set — a nested IfAbruptCloseIterator needs a queue");
-        ctx->pending_close_iter = js_dup(s->iter);
+        iter_close_defer(ctx, s->iter);
     }
     js_iter_consume_end(ctx, s);
     js_free_rt(ctx->rt, s);
@@ -67849,9 +67877,7 @@ static JSValue js_iterator_proto_get_toStringTag(JSContext *ctx, JSValueConst th
    abrupt-coercion hook, because the spec makes no distinction: step 5 of take/drop closes for BOTH. */
 static void js_iterator_helper_close(JSContext *ctx, JSValueConst this_val, int magic)
 {
-    DCHECK(JS_IsUninitialized(ctx->pending_close_iter),
-           "pending_close_iter already set — a nested IfAbruptCloseIterator needs a queue");
-    ctx->pending_close_iter = js_dup(this_val);
+    iter_close_defer(ctx, this_val);
 }
 
 /* The build, with GetIteratorDirect's nextMethod already in hand (TRANSFERRED) and `limit` already primitive.
@@ -68028,9 +68054,7 @@ static JSValue js_iter_helper_new_fini(JSContext *ctx, void *st, bool take_resul
    return -1. */
 static void iter_helper_close_source_abrupt(JSContext *ctx, JSIteratorHelperData *it)
 {
-    DCHECK(JS_IsUninitialized(ctx->pending_close_iter),
-           "pending_close_iter already set — a nested IfAbruptCloseIterator needs a queue");
-    ctx->pending_close_iter = js_dup(it->obj);
+    iter_close_defer(ctx, it->obj);
 }
 
 static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue res, JSValue *out)
