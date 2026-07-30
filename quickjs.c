@@ -80668,13 +80668,16 @@ static JSValue js_promise_init_from_obj(JSContext *ctx, JSValue obj, JSValue *re
     return obj;
 }
 
-/* The entry that still performs step 3 itself. Two of its three callers pass new_target = undefined and read
-   nothing; the third is do_promise_exec_tramp, which passes a REAL new.target and therefore runs 10.1.14 — the
-   page's code — from C. That is the remaining gap, and the DCHECK asserting it belongs in the diff that routes
-   that arm, not ahead of it: armed on its own it only turns a green corpus red without moving the capability. */
+/* The entry for a caller whose new_target reads NOTHING. Both remaining ones pass undefined; the third — the
+   construct dispatch's promise arm — now performs step 3 as a request and calls js_promise_init_from_obj
+   directly. The DCHECK is what stops that gap coming back: a real NewTarget here would run 10.1.13 step 2, the
+   page's code, from C. */
 static JSValue js_promise_new(JSContext *ctx, JSValueConst new_target, JSValue *resolving_funcs)
 {
     JSValue obj;
+    DCHECK(JS_IsUndefined(new_target),
+           "js_promise_new with a NewTarget performs 10.1.13 step 2 from C — route that caller through the "
+           "construct dispatch's prototype read, as the promise executor arm does");
     obj = js_create_from_ctor(ctx, new_target, JS_CLASS_PROMISE);
     if (JS_IsException(obj))
         return JS_EXCEPTION;
