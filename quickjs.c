@@ -61,11 +61,8 @@
    @WHY at the origin then aborts; CHECK/CHECK_FAIL = ALWAYS fatal (dev AND release) for a "must-not-proceed
    even in production" invariant. DFAIL compiles out in release (APICLIENT_DEV=0); its condition must be
    side-effect-free and never recoverable control flow.
-   The NAMES are the host header's, not a prefixed variant of them. CLAUDE.md's rule is to use the established
-   name rather than coin a system, and two spellings of one mechanism across two files is that coinage: a reader
-   has to learn which file says QJS_CHECK_FAIL and which says CHECK_FAIL, and the second name is what invites a
-   third. Only the EMIT is this file's (a plain @WHY/@E line rather than the host's JSON), because the submodule
-   cannot include the host header. */
+   All four names are the host header's and the JS mirror's. Only the EMIT is this file's (a plain @WHY/@E line
+   rather than the host's JSON), because the submodule cannot include the host header. */
 #if defined(APICLIENT_DEV) && APICLIENT_DEV == 0
 #define DFAIL(msg)         ((void)0)
 #define DCHECK(cond, msg)  ((void)0)
