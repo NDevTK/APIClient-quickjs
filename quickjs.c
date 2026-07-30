@@ -19716,7 +19716,7 @@ typedef struct JSConsumeGetIter { void *consumer; uint8_t consumer_kind; } JSCon
 /* Where an OPERAND-mode ToPrimitive continues once its primitive is in hand. Each value names a label placed
    immediately AFTER the coercion it belongs to, so nothing before it re-executes. TPR_NONE is the unconverted
    sites' retry and goes when they do. */
-enum { TPR_NONE = 0, TPR_ARITH_AFTER_LEFT, TPR_ARITH_AFTER_RIGHT };
+enum { TPR_NONE = 0, TPR_ARITH_AFTER_LEFT, TPR_ARITH_AFTER_RIGHT, TPR_ADD_AFTER_COERCE };
 typedef struct JSToPrim {
     JSValue obj;              /* the object being coerced (owned) */
     const uint8_t *retry_pc;  /* OPERAND mode, LEGACY: the opcode byte to RE-EXECUTE once the slot holds a
@@ -27018,6 +27018,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            re-executing an opcode. */
                         opcode = *opb;
                         if (rat == TPR_ARITH_AFTER_LEFT) goto do_arith_after_left;
+                        if (rat == TPR_ADD_AFTER_COERCE) goto do_add_after_coerce;
                         DCHECK(rat == TPR_ARITH_AFTER_RIGHT, "an operand coercion resumed at an unknown point");
                         goto do_arith_after_right;
                     }
@@ -35160,15 +35161,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 } else {
                 add_slow_case:
                     sf->cur_pc = pc;
+                do_add_after_coerce:
                     /* 13.15.3: ToPrimitive(left) then ToPrimitive(right), and BOTH call user code. js_add_slow
                        does them with JS_CallFree from C, so a `valueOf`/`toString`/@@toPrimitive with a loop in it
-                       preempts in an activation with no flow base. Coerce the LEFT operand first, on the tramp,
-                       then re-execute this opcode — the prefix above is pure tag tests, so the retry costs
-                       nothing and the right operand is coerced by the same path on the next pass, in order. */
+                       preempts in an activation with no flow base. Each coercion RESUMES HERE — past the numeric
+                       fast paths above, which the retry used to re-enter — and the second operand is coerced by
+                       this same test, in order. The operands are RELOADED because op1/op2 are C locals and do not
+                       survive a suspension; reloading from the stack is restoring state, not re-executing. */
+                    op1 = sp[-2];
+                    op2 = sp[-1];
                     if (JS_VALUE_GET_TAG(op1) == JS_TAG_OBJECT || JS_VALUE_GET_TAG(op2) == JS_TAG_OBJECT) {
                         tp_slot = (JS_VALUE_GET_TAG(op1) == JS_TAG_OBJECT) ? -2 : -1;
                         tp_hint = HINT_NONE;
                         tp_retry_pc = pc - 1;
+                        tp_resume_at = TPR_ADD_AFTER_COERCE;
                         goto do_toprim_tramp;
                     }
                     if (js_add_slow(ctx, sp))
