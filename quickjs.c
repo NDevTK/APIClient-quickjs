@@ -19438,6 +19438,8 @@ static bool promise_exec_ready(JSContext *ctx, JSValueConst *call_argv, int call
                                   returns a rejected promise, never raises) — the same shape as the executor. */
 #define CONT_PROMISE_TRY_SETTLE 39  /* cont_state = JSPromiseTry: the capability's resolve(value), which a
                                        subclass may have wrapped in its own bytecode. */
+#define CONT_AFS_CONT      73  /* outer = JSAsyncFromSync: 27.1.4.4 steps 5-15, whose step 5 reads `constructor`
+                                  off the value and is therefore the page's code. */
 #define CONT_AGEN_AWAIT_RET 72 /* cont_state = JSAgenSettle (post unused): the drive's own outcome, deferred
                                   across 27.6.3.2 AsyncGeneratorAwaitReturn's requests. The machine finishes the
                                   algorithm itself, so this carries only what do_agen_drive_finish needs. */
@@ -20522,6 +20524,7 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_PROMISE_ALL_RESOLVE:
     case CONT_PROMISE_ALL_THEN:
     case CONT_AGEN_AWAIT_RET:
+    case CONT_AFS_CONT:
     case CONT_ASYNC_SETTLE:
     case CONT_PROMISE_TRY_SETTLE:
     case CONT_PROMISE_ALL_SETTLE:
@@ -21296,8 +21299,9 @@ enum { AFS_DELIVER_CALL = 0, AFS_DELIVER_CLOSE, AFS_DELIVER_ITERNEXT, AFS_DELIVE
 static JSValue js_promise_resolve_native(JSContext *ctx, JSValueConst ctor, int argc, JSValueConst *argv, int magic);
 static __exception int perform_promise_then(JSContext *ctx, JSValueConst promise, JSValueConst *resolve_reject, JSValueConst *cap_resolving_funcs);
 static JSValue js_async_from_sync_iterator_unwrap_func_create(JSContext *ctx, bool done);
-static int js_async_from_sync_continuation(JSContext *ctx, JSValueConst sync_iter, JSValue value, int done,
-                                           bool close_on_rejection, JSValueConst *resolving_funcs);
+static JSValue js_new_afs_cont(JSContext *ctx, JSValueConst sync_iter, JSValueConst resolve,
+                               JSValueConst reject, int done, int close_on_rejection);
+static const JSTrampStepDef js_afs_cont_def;
 static void js_async_from_sync_end(JSContext *ctx, struct JSAsyncFromSync *s);
 static JSValue js_async_from_sync_iterator_next(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
 static JSValue js_promise_all(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
@@ -26443,6 +26447,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (sk0 == CONT_PROMISE_ALL) goto do_promise_all_deliver;
                         goto do_iter_close_deliver;
                     }
+                    if (sk0 == CONT_AFS_CONT) {
+                        /* the continuation threw (a failed closure build, or step 5 abrupt with nothing to
+                           close): step 7's IfAbruptRejectPromise, with the exception still live. */
+                        h->outer = NULL; h->outer_kind = CONT_NONE;
+                        tramp_step_state_free(ctx, stt, false);
+                        cont_st = souter0;
+                        goto do_async_from_sync_abrupt;
+                    }
                     if (sk0 == CONT_FOROF_ACQUIRE || sk0 == CONT_FORAWAIT_WRAP) {
                         /* the for-of acquire's method THREW. Drop the operands it pushed and propagate, exactly as
                            the frame delivery's exception arm does. */
@@ -26600,6 +26612,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             /* the machine WAS Iterator.from's step-3 OrdinaryHasInstance. This arm dropped no
                                operands (the state declared none), and the delivery below drops the call's. */
                             goto do_iter_from_instof;
+                        }
+                        if (souter_kind == CONT_AFS_CONT) {
+                            /* steps 5-15 finished. TRUE means step 5 was abrupt and step 6's IteratorClose is
+                               still owed, with the exception live for its saved completion. */
+                            bool needs_close = JS_ToBool(ctx, r);
+                            JS_FreeValue(ctx, r);
+                            cont_st = souter;
+                            if (needs_close) goto do_afs_park_close;
+                            goto do_afs_cont_done;
                         }
                         if (souter_kind == CONT_AGEN_AWAIT_RET) {
                             /* the machine WAS AsyncGeneratorAwaitReturn; it answers nothing and has already
@@ -30415,20 +30436,31 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 /* res_ph == 2: giter is the `value`. */
                 done = s->res_done;
                 value = giter;
-                s->res_ph = 0; s->res_done = 0;
+                s->res_ph = 0; s->res_done = 0;   /* `done` is read out FIRST: the machine below needs it */
                 JS_FreeValue(ctx, s->res_obj); s->res_obj = JS_UNDEFINED;
-                rcont = js_async_from_sync_continuation(ctx, s->sync_iter, value, done,   /* steps 5-15 */
-                                                       s->close_on_rejection, vc(s->resolving_funcs));
-                if (rcont > 0) {
-                    /* step 6: IteratorClose(syncIteratorRecord, the abrupt step-5 completion) — the SAME parked
-                       close every other abrupt close uses, so it asks nothing about the source. The arm that used
-                       to be here recognised a generator `return` and ran everything else through JS_IteratorClose
-                       from C, where a looping `return` had no flow base. */
-                    cont_st = s;
-                    goto do_afs_park_close;
+                {
+                    /* steps 5-15 as a MACHINE on this chain: step 5's PromiseResolve reads `constructor` off the
+                       value, which is the page's code, and the C version ran it through js_promise_resolve_native
+                       with no flow base. Its RESULT says what is still owed — TRUE for step 6's IteratorClose. */
+                    JSValue cfn = js_new_afs_cont(ctx, s->sync_iter, s->resolving_funcs[0],
+                                                  s->resolving_funcs[1], done, s->close_on_rejection);
+                    JSValueConst cv = value;
+                    void *c_stt;
+                    if (unlikely(JS_IsException(cfn))) { JS_FreeValue(ctx, value); goto async_from_sync_reject; }
+                    c_stt = tramp_step_state_new(ctx, &js_afs_cont_def, JS_UNDEFINED, 1, &cv, cfn);
+                    JS_FreeValue(ctx, cfn);
+                    JS_FreeValue(ctx, value);
+                    if (unlikely(!c_stt)) goto async_from_sync_reject;
+                    ((JSStepHdr *)c_stt)->outer = s;
+                    ((JSStepHdr *)c_stt)->outer_kind = CONT_AFS_CONT;
+                    ((JSStepHdr *)c_stt)->orig_cfirst = 0;
+                    ((JSStepHdr *)c_stt)->orig_cargc = 0;
+                    ((JSStepHdr *)c_stt)->orig_is_tail = 0;
+                    cont_st = c_stt;
+                    ret_val = JS_UNDEFINED;
+                    goto do_step_step;
                 }
-                if (rcont)
-                    goto async_from_sync_reject;
+            do_afs_cont_done:
                 {
                     JSValue r = js_dup(s->promise);
                     int cfirst = s->orig_cfirst, cargc = s->orig_cargc; uint8_t itail = s->orig_is_tail, deliver = s->deliver;
@@ -83663,26 +83695,54 @@ static JSValue js_iter_close_throw_create(JSContext *ctx, JSValueConst sync_iter
     return f;
 }
 
-/* 27.1.4.4 AsyncFromSyncIteratorContinuation steps 5-15, shared by the trampolined settle and the direct
-   %AsyncFromSyncIteratorPrototype% methods. Consumes `value`.
-   Returns 0 on success; -1 with an exception pending for the caller's IfAbruptRejectPromise; or 1 meaning
-   "step 5 completed abruptly and step 6 requires IteratorClose first" — the caller owns that close because for
-   a GENERATOR sync iterator it runs a coroutine body that must suspend on the tramp. */
-static int js_async_from_sync_continuation(JSContext *ctx, JSValueConst sync_iter,
-                                          JSValue value, int done,
-                                          bool close_on_rejection,
-                                          JSValueConst *resolving_funcs)
-{
-    JSValue value_wrapper, unwrap, on_rejected = JS_UNDEFINED;
-    JSValueConst rr[2];
-    int res;
+/* 27.1.4.4 AsyncFromSyncIteratorContinuation steps 5-15 as a STEP MACHINE. Step 5 is
+   PromiseResolve(%Promise%, value), whose `constructor` READ on an already-native value is the page's code, and
+   the C version performed it through js_promise_resolve_native — the last of that helper's drives. Everything
+   after it (the unwrap closure, the onRejected closure, PerformPromiseThen) invokes nothing.
+   The RESULT says what the caller still owes: TRUE means step 5 completed abruptly and step 6 requires
+   IteratorClose FIRST, with the exception left live for the close's saved completion. Undefined means done. A
+   -1 means the caller owes IfAbruptRejectPromise, with the exception live for the same reason.
+   The operands ride FUNC_DATA — the sync iterator, the capability's two functions, and the two flags — because
+   the machine is instantiated by an interpreter label with no receiver to carry them. */
+typedef struct JSAfsCont {
+    JSStepHdr hdr;      /* MUST be first */
+    JSValue result;     /* owned: TRUE = the caller owes IteratorClose, undefined = nothing left */
+    JSValue cb[4];      /* step_promiseresolve_run's buffer, OWNED here */
+    uint8_t pr_phase;
+} JSAfsCont;
+_Static_assert(offsetof(JSAfsCont, hdr) == 0, "JSStepHdr must be first in JSAfsCont");
 
-    value_wrapper = js_promise_resolve_native(ctx, ctx->promise_ctor, 1, vc(&value), 0);   /* step 5 */
-    JS_FreeValue(ctx, value);
-    if (JS_IsException(value_wrapper)) {
-        /* PromiseResolve itself completed abruptly — a poisoned `constructor` getter on the value. */
-        return (!done && close_on_rejection) ? 1 : -1;   /* step 6 needs the close; step 7 rejects either way */
+static JSValue js_iter_close_throw_create(JSContext *ctx, JSValueConst sync_iter);
+
+static int js_afs_cont_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSAfsCont *m = st;
+    JSCFunctionDataRecord *rec = JS_VALUE_GET_OBJ(m->hdr.func_obj)->u.c_function_data_record;
+    JSValueConst sync_iter = rec->data[0];
+    int done = JS_VALUE_GET_INT(rec->data[3]);
+    int close_on_rejection = JS_VALUE_GET_INT(rec->data[4]);
+    JSValue value_wrapper, unwrap, on_rejected = JS_UNDEFINED;
+    JSValueConst rr[2], caps[2];
+    int r, res;
+
+    if (m->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        m->result = JS_UNDEFINED;
+        m->cb[0] = JS_UNDEFINED; m->cb[1] = JS_UNDEFINED;
+        m->cb[2] = JS_UNDEFINED; m->cb[3] = JS_UNDEFINED;
+        m->pr_phase = PRR_START;
+        m->hdr.stage = 1;
     }
+    DCHECK(m->hdr.stage == 1, "AsyncFromSyncIteratorContinuation resumed in an unknown stage");
+    if (JS_IsException(cb_result)) {
+        /* step 5 completed abruptly — a poisoned `constructor` getter on the value. The exception stays LIVE:
+           step 6's close takes it as its saved completion, and step 7's reject takes it otherwise. */
+        if (!done && close_on_rejection) { m->result = JS_TRUE; return 0; }
+        return -1;
+    }
+    r = step_promiseresolve_run(ctx, &m->hdr, &m->pr_phase, step_arg(&m->hdr, 0), &value_wrapper, m->cb,
+                                cb_result, out_cb, out_argc);
+    if (r) return r;
     unwrap = js_async_from_sync_iterator_unwrap_func_create(ctx, done);   /* steps 8-9 */
     if (JS_IsException(unwrap)) {
         JS_FreeValue(ctx, value_wrapper);
@@ -83700,11 +83760,47 @@ static int js_async_from_sync_continuation(JSContext *ctx, JSValueConst sync_ite
     }
     rr[0] = unwrap;
     rr[1] = on_rejected;
-    res = perform_promise_then(ctx, value_wrapper, rr, resolving_funcs);   /* step 15 */
+    caps[0] = rec->data[1]; caps[1] = rec->data[2];
+    res = perform_promise_then(ctx, value_wrapper, rr, caps);   /* step 15 */
     JS_FreeValue(ctx, value_wrapper);
     JS_FreeValue(ctx, unwrap);
     JS_FreeValue(ctx, on_rejected);
-    return res;
+    return res ? -1 : 0;
+}
+
+static JSValue js_afs_cont_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSAfsCont *m = st;
+    JSValue r = take_result ? m->result : (JS_FreeValue(ctx, m->result), JS_UNDEFINED);
+    int i;
+    for (i = 0; i < 4; i++) JS_FreeValue(ctx, m->cb[i]);
+    js_free_rt(ctx->rt, m);
+    return r;
+}
+
+static const JSTrampStepDef js_afs_cont_def = {
+    sizeof(JSAfsCont), js_afs_cont_step, js_afs_cont_fini, 0,
+    .catches_abrupt = 1   /* step 5's abrupt is a VALUE here: it selects between the close and the reject */
+};
+
+static JSValue js_afs_cont_c_entry(JSContext *ctx, JSValueConst this_val, int argc,
+                                   JSValueConst *argv, int magic, JSValueConst *func_data)
+{
+    DFAIL("AsyncFromSyncIteratorContinuation reached its C entry — route that call shape onto do_step_tramp");
+    return JS_ThrowTypeError(ctx, "AsyncFromSyncIteratorContinuation reached its C entry");
+}
+
+static JSValue js_new_afs_cont(JSContext *ctx, JSValueConst sync_iter, JSValueConst resolve,
+                               JSValueConst reject, int done, int close_on_rejection)
+{
+    JSValueConst data[5];
+    JSValue dv = js_int32(done), cv = js_int32(close_on_rejection), f;
+    data[0] = sync_iter; data[1] = resolve; data[2] = reject; data[3] = dv; data[4] = cv;
+    f = JS_NewCFunctionData(ctx, js_afs_cont_c_entry, 1, 0, 5, data);
+    if (JS_IsException(f))
+        return f;
+    promise_closure_set_step(f, &js_afs_cont_def);
+    return f;
 }
 
 /* AsyncIteratorPrototype */
