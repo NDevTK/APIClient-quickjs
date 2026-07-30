@@ -19359,6 +19359,10 @@ enum { FOU_FOROF = 0,      /* OP_for_of_next: value at sp[0], done at sp[1]; a d
 #define CONT_AFS_GET       43  /* gp_outer = JSAsyncFromSync: the wrapper's IteratorComplete / IteratorValue on
                                   the sync .next()'s result. Both are page code on a hand-written iterator, and
                                   the deliver read them from C. */
+#define CONT_PROMISE_ALL_RESOLVE 69 /* gp_outer = JSPromiseAll: 27.2.4.1 step 4's `? Get(constructor,
+                                  "resolve")`. On a subclass that is an accessor or a Proxy trap, and it was read
+                                  with JS_GetProperty from the block that BUILDS the machine's state — a block
+                                  with no stage to suspend in, which is why it needed a label of its own. */
 #define CONT_PROMISE_ALL_THEN 42  /* gp_outer = JSPromiseAll: the per-element attach's `Get(next_promise, "then")`.
                                      Both halves of that Invoke are page code for a subclass or a thenable, and
                                      js_promise_all_attach did them with JS_InvokeFree from C — the last live one
@@ -20320,6 +20324,7 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_PROMISE_ALL_GET:
     case CONT_ITER_HELPER_GET:
     case CONT_AFS_GET:
+    case CONT_PROMISE_ALL_RESOLVE:
     case CONT_PROMISE_ALL_THEN:
     case CONT_AGEN_SETTLE:
     case CONT_ASYNC_SETTLE:
@@ -28287,6 +28292,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                       if (gk == CONT_ITER_FROM_NEXT_GET) { cont_st = gouter0; goto do_iter_from_have_next; }
                       if (gk == CONT_ITER_CONSUME) goto do_iter_consume_step;
                       if (gk == CONT_ITER_CLOSE) { cont_st = gouter0; goto do_iter_close_method; }
+                      if (gk == CONT_PROMISE_ALL_RESOLVE) { cont_st = gouter0; goto do_promise_all_have_resolve; }
                       if (gk == CONT_PROMISE_ALL_THEN) { cont_st = gouter0; goto do_promise_all_attach_call; }
                       if (gk == CONT_AFS_GET) { cont_st = gouter0; goto do_async_from_sync_step; }
                       if (gk == CONT_ITER_HELPER_GET) { cont_st = gouter0; goto do_iter_helper_step; }
@@ -29534,14 +29540,27 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         do_promise_all_have_cap:
             {
                 JSPromiseAll *s = tramp_cap_outer;
-                JSValueConst thisv;
                 tramp_cap_outer = NULL; tramp_cap_kind = CONT_NONE;
                 s->result_promise = tramp_cap_promise; tramp_cap_promise = JS_UNDEFINED;
                 s->resolving_funcs[0] = tramp_cap_funcs[0]; tramp_cap_funcs[0] = JS_UNDEFINED;
                 s->resolving_funcs[1] = tramp_cap_funcs[1]; tramp_cap_funcs[1] = JS_UNDEFINED;
+                /* 27.2.4.1 step 4's `? Get(constructor, "resolve")` — an accessor or a Proxy trap on a subclass,
+                   read with JS_GetProperty from here until now. The acquire's method STAYS on the state across
+                   the request: tramp_iter_getiter is an interpreter register and does not survive a suspension,
+                   which is the same reason it moved onto the state for the capability Construct above. */
+                gp_obj = s->this_val; gp_atom = JS_ATOM_resolve; gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                gp_outer = s; gp_outer_kind = CONT_PROMISE_ALL_RESOLVE;
+                goto do_getprop_tramp;
+            }
+
+        do_promise_all_have_resolve:
+            {
+                JSPromiseAll *s = (JSPromiseAll *)cont_st;
+                /* the delivered method, or UNDEFINED when the read THREW — the abrupt arm jumps here with the
+                   exception still pending, and the setup-failed branch below is the one place that handles it,
+                   exactly as it already handles a non-callable `resolve`. */
+                s->promise_resolve = ret_val;
                 tramp_iter_getiter = s->acq_method; s->acq_method = JS_UNDEFINED;
-                thisv = s->this_val;
-                s->promise_resolve = JS_GetProperty(ctx, thisv, JS_ATOM_resolve);
                 s->values = JS_NewArray(ctx);
                 s->resolve_element_env = JS_NewArray(ctx);
                 s->elem_promises = JS_NewArray(ctx);
@@ -31496,6 +31515,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            || gouter_kind == CONT_CONSUME_NEXT_GET
                            || gouter_kind == CONT_PROMISE_ALL_NEXT_GET || gouter_kind == CONT_ITER_FROM_NEXT_GET
                            || gouter_kind == CONT_PROMISE_ALL_THEN || gouter_kind == CONT_AFS_GET
+                           || gouter_kind == CONT_PROMISE_ALL_RESOLVE
                            || gouter_kind == CONT_ITER_HELPER_GET || gouter_kind == CONT_PROMISE_ALL_GET
                            || gouter_kind == CONT_FOROF_UNPACK || gouter_kind == CONT_FOR_IN_HAS
                            || gouter_kind == CONT_OWNKEYS_CHK || gouter_kind == CONT_PROXY_INV
@@ -31505,6 +31525,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            || gouter_kind == CONT_CTOR_PROTO || gouter_kind == CONT_TA_TARGET
                            || gouter_kind == CONT_SETMAP_CTOR || gouter_kind == CONT_ARG_LIST,
                            "property-get outer continuation: unknown machine kind");
+                    if (gouter_kind == CONT_PROMISE_ALL_RESOLVE) {
+                        js_getprop_free(ctx, gp);
+                        cont_st = gouter;
+                        goto do_promise_all_have_resolve;
+                    }
                     if (gouter_kind == CONT_PROMISE_ALL_THEN) {
                         js_getprop_free(ctx, gp);
                         cont_st = gouter;
@@ -36622,6 +36647,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    || gk2 == CONT_TA_TARGET || gk2 == CONT_SETMAP_CTOR || gk2 == CONT_ARG_LIST
                    || gk2 == CONT_OP_KEYED
                    || gk2 == CONT_PROMISE_ALL_THEN || gk2 == CONT_AFS_GET
+                   || gk2 == CONT_PROMISE_ALL_RESOLVE
                    || gk2 == CONT_ITER_HELPER_GET || gk2 == CONT_PROMISE_ALL_GET
                    || gk2 == CONT_FOROF_UNPACK || gk2 == CONT_CONSUME_NEXT_GET
                    || gk2 == CONT_PROMISE_ALL_NEXT_GET || gk2 == CONT_ITER_FROM_NEXT_GET,
@@ -36670,6 +36696,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 cont_st = gouter;
                 ret_val = JS_UNINITIALIZED;
                 goto do_afs_read_throw;
+            }
+            if (gouter && gk2 == CONT_PROMISE_ALL_RESOLVE) {
+                /* step 4's read THREW. Every failure of the combinator's setup rejects the aggregate rather than
+                   propagating, and the setup-failed branch is where that lives — so this lands there with the
+                   exception still pending and UNDEFINED as the method it never got. */
+                cont_st = gouter;
+                ret_val = JS_UNDEFINED;
+                goto do_promise_all_have_resolve;
             }
             if (gouter && gk2 == CONT_PROMISE_ALL_THEN) {
                 /* the attach's `then` READ threw. It is a post-retrieval stage, so it rejects the aggregate and
