@@ -74978,21 +74978,10 @@ static JSProxyData *get_proxy_method(JSContext *ctx, JSValue *pmethod,
    revoked proxy or a throwing handler read. The chain needs no cycle guard: a proxy's [[ProxyTarget]] is fixed
    at construction and the target must already exist to be passed, so every hop moves to a strictly older
    object. */
-static JSProxyData *proxy_resolve_trapless(JSContext *ctx, JSValue *pmethod,
-                                           JSValueConst obj, JSAtom name)
-{
-    for (;;) {
-        JSProxyData *s = get_proxy_method(ctx, pmethod, obj, name);
-        if (!s)
-            return NULL;
-        if (!JS_IsUndefined(*pmethod))
-            return s;
-        if (JS_VALUE_GET_TAG(s->target) != JS_TAG_OBJECT
-            || JS_VALUE_GET_OBJ(s->target)->class_id != JS_CLASS_PROXY)
-            return s;
-        obj = s->target;   /* borrowed: the head the caller holds owns the whole chain */
-    }
-}
+/* DELETED: proxy_resolve_trapless. It was the shared prologue of every C-driven Proxy internal method — the
+   revoked check and the READ of the trap off the handler, which is itself the page's code (a handler can be a Proxy,
+   or carry an accessor). Its last caller went when the thirteenth hook body did. The routed path reads a trap
+   through CONT_TRAP_GET, which is that read as a request. */
 
 /* 10.5.1 steps 6-10 on the trap's RESULT: an Object or null, and — when the target is not extensible — the same
    value the target's own [[GetPrototypeOf]] gives. The trap CALL is the page's code and the check is not, the
@@ -75088,92 +75077,51 @@ static int js_proxy_ext_invariant(JSContext *ctx, JSValueConst obj, bool prevent
 
 static JSValue js_proxy_getPrototypeOf(JSContext *ctx, JSValueConst obj)
 {
+    /* THE BODY IS DELETED. Every consumer is routed, and the whole corpus runs with this DFAIL armed without
+       reaching it — so what stood here was a second implementation of 10.5.1 — the `getPrototypeOf` trap and its invariant against a non-extensible target,
+       run from an activation with no flow base. In RELEASE the DFAIL compiles out and there is deliberately
+       nothing to fall back to: FAILING VISIBLY is right where answering wrongly is not. */
     DFAIL("a C-side [[GetPrototypeOf]] reached a Proxy — the page's trap has no flow base here; route that caller onto the keyed entry's GP_GETPROTO");
-    JSProxyData *s;
-    JSValue method, ret, proto1;
-    int res;
-
-    s = proxy_resolve_trapless(ctx, &method, obj, JS_ATOM_getPrototypeOf);
-    if (!s)
-        return JS_EXCEPTION;
-    if (JS_IsUndefined(method))
-        return JS_GetPrototype(ctx, s->target);
-    /* THE LAST C-driven `getPrototypeOf` trap. Every consumer routed onto GP_GETPROTO runs it on the
-       interpreter's chain instead; the ones still calling JS_GetPrototype from C reach it here, and a trap with
-       a loop in it aborts at its back-edge by name. */
-    ret = JS_CallFree(ctx, method, s->handler, 1, vc(&s->target));
-    return js_proxy_getproto_invariant(ctx, obj, ret);
+    (void)obj;
+    JS_ThrowInternalError(ctx, "[[GetPrototypeOf]] on a Proxy is only implemented on the interpreter's chain");
+    return JS_EXCEPTION;
 }
 
 static int js_proxy_setPrototypeOf(JSContext *ctx, JSValueConst obj,
                                    JSValueConst proto_val, bool throw_flag)
 {
+    /* THE BODY IS DELETED. Every consumer is routed, and the whole corpus runs with this DFAIL armed without
+       reaching it — so what stood here was a second implementation of 10.5.2 — the `setPrototypeOf` trap and its invariant,
+       run from an activation with no flow base. In RELEASE the DFAIL compiles out and there is deliberately
+       nothing to fall back to: FAILING VISIBLY is right where answering wrongly is not. */
     DFAIL("a C-side [[SetPrototypeOf]] reached a Proxy — the page's trap has no flow base here; route that caller onto the keyed entry's GP_SETPROTO");
-    JSProxyData *s;
-    JSValue method, ret, proto1;
-    JSValueConst args[2];
-    bool res;
-    int res2;
-
-    s = proxy_resolve_trapless(ctx, &method, obj, JS_ATOM_setPrototypeOf);
-    if (!s)
-        return -1;
-    if (JS_IsUndefined(method))
-        return JS_SetPrototypeInternal(ctx, s->target, proto_val, throw_flag);
-    args[0] = s->target;
-    args[1] = proto_val;
-    /* THE LAST C-driven `setPrototypeOf` trap: every consumer routed onto GP_SETPROTO runs it on the chain. */
-    ret = JS_CallFree(ctx, method, s->handler, 2, args);
-    if (JS_IsException(ret))
-        return -1;
-    res2 = js_proxy_setproto_invariant(ctx, s->target, proto_val, JS_ToBoolFree(ctx, ret));
-    if (res2 < 0)
-        return -1;
-    if (!res2 && throw_flag) {
-        JS_ThrowTypeError(ctx, "proxy: bad prototype");
-        return -1;
-    }
-    return res2;
+    (void)obj; (void)proto_val; (void)throw_flag;
+    JS_ThrowInternalError(ctx, "[[SetPrototypeOf]] on a Proxy is only implemented on the interpreter's chain");
+    return -1;
 }
 
 static int js_proxy_isExtensible(JSContext *ctx, JSValueConst obj)
 {
+    /* THE BODY IS DELETED. Every consumer is routed, and the whole corpus runs with this DFAIL armed without
+       reaching it — so what stood here was a second implementation of 10.5.3 — the `isExtensible` trap and its must-agree-with-the-target invariant,
+       run from an activation with no flow base. In RELEASE the DFAIL compiles out and there is deliberately
+       nothing to fall back to: FAILING VISIBLY is right where answering wrongly is not. */
     DFAIL("a C-side [[IsExtensible]] reached a Proxy — the page's trap has no flow base here; route that caller onto the keyed entry's GP_ISEXT");
-    JSProxyData *s;
-    JSValue method, ret;
-    bool res;
-    int res2;
-
-    s = proxy_resolve_trapless(ctx, &method, obj, JS_ATOM_isExtensible);
-    if (!s)
-        return -1;
-    if (JS_IsUndefined(method))
-        return JS_IsExtensible(ctx, s->target);
-    /* THE LAST C-driven `isExtensible` trap: every consumer routed onto GP_ISEXT runs it on the chain. */
-    ret = JS_CallFree(ctx, method, s->handler, 1, vc(&s->target));
-    if (JS_IsException(ret))
-        return -1;
-    return js_proxy_ext_invariant(ctx, obj, false, JS_ToBoolFree(ctx, ret));
+    (void)obj;
+    JS_ThrowInternalError(ctx, "[[IsExtensible]] on a Proxy is only implemented on the interpreter's chain");
+    return -1;
 }
 
 static int js_proxy_preventExtensions(JSContext *ctx, JSValueConst obj)
 {
+    /* THE BODY IS DELETED. Every consumer is routed, and the whole corpus runs with this DFAIL armed without
+       reaching it — so what stood here was a second implementation of 10.5.4 — the `preventExtensions` trap and its invariant,
+       run from an activation with no flow base. In RELEASE the DFAIL compiles out and there is deliberately
+       nothing to fall back to: FAILING VISIBLY is right where answering wrongly is not. */
     DFAIL("a C-side [[PreventExtensions]] reached a Proxy — the page's trap has no flow base here; route that caller onto the keyed entry's GP_PREVEXT");
-    JSProxyData *s;
-    JSValue method, ret;
-    bool res;
-    int res2;
-
-    s = proxy_resolve_trapless(ctx, &method, obj, JS_ATOM_preventExtensions);
-    if (!s)
-        return -1;
-    if (JS_IsUndefined(method))
-        return JS_PreventExtensions(ctx, s->target);
-    /* THE LAST C-driven `preventExtensions` trap: every consumer routed onto GP_PREVEXT runs it on the chain. */
-    ret = JS_CallFree(ctx, method, s->handler, 1, vc(&s->target));
-    if (JS_IsException(ret))
-        return -1;
-    return js_proxy_ext_invariant(ctx, obj, true, JS_ToBoolFree(ctx, ret));
+    (void)obj;
+    JS_ThrowInternalError(ctx, "[[PreventExtensions]] on a Proxy is only implemented on the interpreter's chain");
+    return -1;
 }
 
 /* [[HasProperty]] invariant: a trap that reports ABSENT must be telling the truth about a non-configurable own
@@ -75658,73 +75606,28 @@ static JSValue js_proxy_call_constructor(JSContext *ctx, JSValueConst func_obj,
                                          JSValueConst new_target,
                                          int argc, JSValueConst *argv)
 {
+    /* THE BODY IS DELETED. Every consumer is routed, and the whole corpus runs with this DFAIL armed without
+       reaching it — so what stood here was a second implementation of 10.5.13 — the `construct` trap, the argument array it is handed, and its must-return-an-object invariant,
+       run from an activation with no flow base. In RELEASE the DFAIL compiles out and there is deliberately
+       nothing to fall back to: FAILING VISIBLY is right where answering wrongly is not. */
     DFAIL("a C-side [[Construct]] reached a Proxy — the page's trap has no flow base here; route that caller onto the construct dispatch");
-    JSProxyData *s;
-    JSValue method, arg_array, ret;
-    JSValueConst args[3];
-
-    s = proxy_resolve_trapless(ctx, &method, func_obj, JS_ATOM_construct);
-    if (!s)
-        return JS_EXCEPTION;
-    if (!JS_IsConstructor(ctx, s->target)) {
-        JS_FreeValue(ctx, method);   /* the trap was already read: returning without it leaked the handler's function */
-        return JS_ThrowTypeErrorNotAConstructor(ctx, s->target);
-    }
-    if (JS_IsUndefined(method))
-        return JS_CallConstructor2(ctx, s->target, new_target, argc, argv);
-    arg_array = js_create_array(ctx, argc, argv);
-    if (JS_IsException(arg_array)) {
-        ret = JS_EXCEPTION;
-        goto fail;
-    }
-    args[0] = s->target;
-    args[1] = arg_array;
-    args[2] = new_target;
-    ret = JS_Call(ctx, method, s->handler, 3, args);
-    if (!JS_IsException(ret) && JS_VALUE_GET_TAG(ret) != JS_TAG_OBJECT) {
-        JS_FreeValue(ctx, ret);
-        ret = JS_ThrowTypeErrorNotAnObject(ctx);
-    }
- fail:
-    JS_FreeValue(ctx, method);
-    JS_FreeValue(ctx, arg_array);
-    return ret;
+    (void)func_obj; (void)new_target; (void)argc; (void)argv;
+    JS_ThrowInternalError(ctx, "[[Construct]] on a Proxy is only implemented on the interpreter's chain");
+    return JS_EXCEPTION;
 }
 
 static JSValue js_proxy_call(JSContext *ctx, JSValueConst func_obj,
                              JSValueConst this_obj,
                              int argc, JSValueConst *argv, int flags)
 {
+    /* THE BODY IS DELETED. Every consumer is routed, and the whole corpus runs with this DFAIL armed without
+       reaching it — so what stood here was a second implementation of 10.5.12 — the `apply` trap and the argument array it is handed,
+       run from an activation with no flow base. In RELEASE the DFAIL compiles out and there is deliberately
+       nothing to fall back to: FAILING VISIBLY is right where answering wrongly is not. */
     DFAIL("a C-side [[Call]] reached a Proxy — the page's trap has no flow base here; route that caller onto the call convergence point");
-    JSProxyData *s;
-    JSValue method, arg_array, ret;
-    JSValueConst args[3];
-
-    if (flags & JS_CALL_FLAG_CONSTRUCTOR)
-        return js_proxy_call_constructor(ctx, func_obj, this_obj, argc, argv);
-
-    s = proxy_resolve_trapless(ctx, &method, func_obj, JS_ATOM_apply);
-    if (!s)
-        return JS_EXCEPTION;
-    if (!s->is_func) {
-        JS_FreeValue(ctx, method);
-        return JS_ThrowTypeErrorNotAFunction(ctx);
-    }
-    if (JS_IsUndefined(method))
-        return JS_Call(ctx, s->target, this_obj, argc, argv);
-    arg_array = js_create_array(ctx, argc, argv);
-    if (JS_IsException(arg_array)) {
-        ret = JS_EXCEPTION;
-        goto fail;
-    }
-    args[0] = s->target;
-    args[1] = this_obj;
-    args[2] = arg_array;
-    ret = JS_Call(ctx, method, s->handler, 3, args);
- fail:
-    JS_FreeValue(ctx, method);
-    JS_FreeValue(ctx, arg_array);
-    return ret;
+    (void)func_obj; (void)this_obj; (void)argc; (void)argv; (void)flags;
+    JS_ThrowInternalError(ctx, "[[Call]] on a Proxy is only implemented on the interpreter's chain");
+    return JS_EXCEPTION;
 }
 
 static int js_proxy_isArray(JSContext *ctx, JSValueConst obj)
