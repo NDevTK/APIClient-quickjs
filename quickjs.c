@@ -187,6 +187,7 @@ enum {
     JS_CLASS_WEAKSET,           /* u.map_state */
     JS_CLASS_ITERATOR,
     JS_CLASS_ITERATOR_CONCAT,   /* u.iterator_concat_data */
+    JS_CLASS_ITERATOR_ZIP,      /* u.iterator_zip_data */
     JS_CLASS_ITERATOR_HELPER,   /* u.iterator_helper_data */
     JS_CLASS_ITERATOR_WRAP,     /* u.iterator_wrap_data */
     JS_CLASS_MAP_ITERATOR,      /* u.map_iterator_data */
@@ -561,7 +562,6 @@ typedef enum {
 
 enum {
     JS_BUILTIN_ARRAY_FROMASYNC = 1,
-    JS_BUILTIN_ITERATOR_ZIP,
     JS_BUILTIN_ITERATOR_ZIP_KEYED,
 };
 
@@ -1236,6 +1236,7 @@ struct JSObject {
         struct JSRegExpStringIteratorData *regexp_string_iterator_data; /* JS_CLASS_REGEXP_STRING_ITERATOR */
         struct JSGeneratorData *generator_data; /* JS_CLASS_GENERATOR */
         struct JSIteratorConcatData *iterator_concat_data; /* JS_CLASS_ITERATOR_CONCAT */
+        struct JSIteratorZipData *iterator_zip_data; /* JS_CLASS_ITERATOR_ZIP */
         struct JSIteratorHelperData *iterator_helper_data; /* JS_CLASS_ITERATOR_HELPER */
         struct JSIteratorWrapData *iterator_wrap_data; /* JS_CLASS_ITERATOR_WRAP */
         struct JSProxyData *proxy_data; /* JS_CLASS_PROXY */
@@ -1428,6 +1429,8 @@ static void js_array_iterator_finalizer(JSRuntime *rt, JSValueConst val);
 static void js_array_iterator_mark(JSRuntime *rt, JSValueConst val,
                                 JS_MarkFunc *mark_func);
 static void js_iterator_concat_finalizer(JSRuntime *rt, JSValueConst val);
+static void js_iterator_zip_finalizer(JSRuntime *rt, JSValueConst val);
+static void js_iterator_zip_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func);
 static void js_iterator_concat_mark(JSRuntime *rt, JSValueConst val,
                                     JS_MarkFunc *mark_func);
 static void js_iterator_helper_finalizer(JSRuntime *rt, JSValueConst val);
@@ -1500,6 +1503,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_ERROR_CTOR_LAST = STEPDEF_ERROR_CTOR_BASE + JS_PLAIN_ERROR,
     STEPDEF_GLOBAL_EVAL,
     STEPDEF_ITER_CONCAT,
+    STEPDEF_ITER_ZIP, STEPDEF_ITER_ZIP_NEXT, STEPDEF_ITER_ZIP_RETURN,
     STEPDEF_FUNCTION_CTOR, STEPDEF_GENERATOR_FUNCTION_CTOR,
     STEPDEF_ASYNC_FUNCTION_CTOR, STEPDEF_ASYNC_GENERATOR_FUNCTION_CTOR,
     STEPDEF_DV_FIRST,
@@ -2452,6 +2456,7 @@ static JSClassShortDef const js_std_class_def[] = {
     { JS_ATOM_WeakSet, js_map_finalizer, NULL },         /* JS_CLASS_WEAKSET */
     { JS_ATOM_Iterator, NULL, NULL },                           /* JS_CLASS_ITERATOR */
     { JS_ATOM_IteratorConcat, js_iterator_concat_finalizer, js_iterator_concat_mark }, /* JS_CLASS_ITERATOR_CONCAT */
+    { JS_ATOM_IteratorZip, js_iterator_zip_finalizer, js_iterator_zip_mark }, /* JS_CLASS_ITERATOR_ZIP */
     { JS_ATOM_IteratorHelper, js_iterator_helper_finalizer, js_iterator_helper_mark }, /* JS_CLASS_ITERATOR_HELPER */
     { JS_ATOM_IteratorWrap, js_iterator_wrap_finalizer, js_iterator_wrap_mark }, /* JS_CLASS_ITERATOR_WRAP */
     { JS_ATOM_Map_Iterator, js_map_iterator_finalizer, js_map_iterator_mark }, /* JS_CLASS_MAP_ITERATOR */
@@ -9162,7 +9167,6 @@ int JS_SetLength(JSContext *ctx, JSValueConst obj, int64_t len) {
 
 #include "builtin-array-fromasync.h"
 #include "builtin-iterator-zip-keyed.h"
-#include "builtin-iterator-zip.h"
 
 // like Function.prototype.call but monkey patch-proof
 static JSValue js_call_function(JSContext *ctx, JSValueConst this_val,
@@ -9229,25 +9233,6 @@ static JSValue js_bytecode_autoinit(JSContext *ctx, JSObject *p, JSAtom atom,
             return js_bytecode_eval(ctx, qjsc_builtin_array_fromasync,
                                     sizeof(qjsc_builtin_array_fromasync),
                                     countof(argv), argv);
-        }
-    case JS_BUILTIN_ITERATOR_ZIP:
-        {
-            JSValue argv[] = {
-                js_dup(ctx->class_proto[JS_CLASS_ITERATOR_HELPER]),
-                JS_NewCFunctionMagic(ctx, NULL, "InternalError",
-                                     1, JS_CFUNC_step_ctor,
-                                      STEPDEF_ERROR_CTOR_BASE + JS_INTERNAL_ERROR),
-                JS_NewCFunctionMagic(ctx, NULL, "TypeError",
-                                     1, JS_CFUNC_step_ctor,
-                                      STEPDEF_ERROR_CTOR_BASE + JS_TYPE_ERROR),
-                JS_NewCFunction(ctx, js_call_function, "call", 2),
-                JS_AtomToValue(ctx, JS_ATOM_Symbol_iterator),
-            };
-            JSValue result = js_bytecode_eval(ctx, qjsc_builtin_iterator_zip,
-                                              sizeof(qjsc_builtin_iterator_zip),
-                                              countof(argv), argv);
-            JS_SetConstructorBit(ctx, result, false);
-            return result;
         }
     case JS_BUILTIN_ITERATOR_ZIP_KEYED:
         {
@@ -21447,6 +21432,51 @@ typedef struct JSIterConcat {
     int i;
     uint8_t checked;            /* step 3.a has run for argument i; the read is what remains */
 } JSIterConcat;
+
+typedef struct JSIterZip {
+    JSStepHdr hdr;
+    JSValue result;
+    JSValue padding;                 /* the `padding` option (owned) */
+    JSValue input_iter, input_next;  /* the `iterables` iterator record (owned) */
+    JSValue pad_iter, pad_next;      /* the padding iterator record (owned) */
+    JSValue held;                    /* whichever sub-sequence is in flight holds its value here (owned) */
+    JSValue elem;                    /* the element being flattened, held across GetIteratorFlattenable (owned) */
+    JSValue closing;                 /* the padding iterator DURING its close, taken out of pad_iter so a throwing
+                                        `return` cannot be called a second time by the teardown (owned) */
+    /* The sub-sequences' call buffer. Every entry is BORROWED — cb[0] is a receiver the record, argv or `elem`
+       already holds and cb[1] a method `held` already holds — which is the same convention step_getprop_run's
+       cb_coerce follows, and do_cont_dispatch only READS the slots (it dups what the frame keeps). The teardown
+       must therefore NOT free them: doing so double-freed the element's iterator the moment an abrupt
+       GetIteratorFlattenable tore the machine down. */
+    JSValue cb[2];
+    JSValue *iters, *nexts;          /* the inputs collected so far; transferred into the record at the end */
+    JSValue *pads;
+    uint32_t n, cap, pad_n;
+    uint8_t mode;
+    uint8_t gi_phase, is_phase, zc_phase;
+} JSIterZip;
+
+enum { ZIP_DRIVE_NEXT = 0, ZIP_DRIVE_RETURN };
+enum { ZD_INIT = 0, ZD_STEP, ZD_CLOSEALL };
+
+typedef struct JSIterZipDrive {
+    JSStepHdr hdr;
+    JSValue result;
+    JSValue self;        /* the zipper (owned): its data is re-read at every resume, never cached */
+    JSValue held;
+    JSValue results;     /* the fresh result Array this next() is filling (owned) */
+    JSValue closing;     /* the input whose IteratorClose is in flight, taken OUT of the record so the teardown
+                            cannot defer a second close for it (owned) */
+    JSValue cb[2];
+    uint32_t i, j;       /* the input cursor, and the closeall cursor walking down */
+    int32_t stepping;    /* the input whose IteratorStepValue is IN FLIGHT, or -1. The teardown needs it because an
+                            abrupt step leaves that record [[Done]] and un-closed, and only the machine knows which
+                            one it asked for. */
+    uint32_t dones, values;
+    uint8_t is_phase, zc_phase;
+    uint8_t owns;        /* validation passed: the teardown owes the generator `completed` and every input it
+                            still holds an IteratorClose under that abrupt completion */
+} JSIterZipDrive;
 
 typedef struct JSIterConcatReturn {
     JSStepHdr hdr;    /* MUST be first: the generic step driver casts the state to JSStepHdr * */
@@ -55320,7 +55350,7 @@ _Static_assert(OP_COUNT == 255,
    before the symbols shifts every later name and the blob silently resolves the wrong one — Iterator.zip started
    reading `done` off the atom next to it, five tests deep in a directory that has nothing to do with the atom that
    was added. Adding `toISOString` for Date.prototype.toJSON is what found it. Same gate, same fix. */
-_Static_assert(JS_ATOM_END == 243,
+_Static_assert(JS_ATOM_END == 246,
                "the atom table changed: run `make codegen` to regenerate builtin-*.h, then update this count");
 
 typedef struct BCWriterState {
@@ -64573,6 +64603,16 @@ static int js_iterator_concat_step(JSContext *ctx, void *st, JSValue cb_result, 
 static JSValue js_iterator_concat_fini(JSContext *ctx, void *st, bool take_result);
 static const JSTrampStepDef js_iter_concat_def =
     { sizeof(JSIterConcat), js_iterator_concat_step, js_iterator_concat_fini, 0 };
+static int js_iterator_zip_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_iterator_zip_fini(JSContext *ctx, void *st, bool take_result);
+static int js_iter_zip_drive_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_iter_zip_drive_fini(JSContext *ctx, void *st, bool take_result);
+static const JSTrampStepDef js_iter_zip_def =
+    { sizeof(JSIterZip), js_iterator_zip_step, js_iterator_zip_fini, 0 };
+static const JSTrampStepDef js_iter_zip_next_def =
+    { sizeof(JSIterZipDrive), js_iter_zip_drive_step, js_iter_zip_drive_fini, ZIP_DRIVE_NEXT };
+static const JSTrampStepDef js_iter_zip_return_def =
+    { sizeof(JSIterZipDrive), js_iter_zip_drive_step, js_iter_zip_drive_fini, ZIP_DRIVE_RETURN };
 static int js_iter_concat_next_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_iter_concat_next_fini(JSContext *ctx, void *st, bool take_result);
 static const JSTrampStepDef js_iter_concat_next_def =
@@ -65052,6 +65092,762 @@ static int js_promise_resolve_step(JSContext *ctx, void *st, JSValue cb_result, 
     return 0;
 }
 
+/* ================================================================================================================
+   27.1.3.3 Iterator.zip. It WAS self-hosted JavaScript — builtin-iterator-zip.js, compiled by qjsc and instantiated
+   by EVALUATING that bytecode from C on a lazy property read. Two things were wrong with that and only one of them
+   is about the counter: a browser feature written in JavaScript is what CLAUDE.md's architecture forbids outright,
+   and the program body plus the factory call it performed are BYTECODE BODIES entered by C recursion below a live
+   flow, which the scheduler has no way to park. Eager instantiation would not have fixed the second one either —
+   `$262.createRealm` (an iframe) builds a realm from page JS, so context setup itself runs below a live flow.
+   Every page-visible step is a request here: the two option reads, GetIterator on `iterables`,
+   GetIteratorFlattenable on each element, the padding walk, and — in the zipper's own next/return — each input's
+   `.next()`, its result's `done` and `value`, and each IteratorClose.
+   ================================================================================================================ */
+
+enum { ZIP_MODE_SHORTEST = 0, ZIP_MODE_LONGEST, ZIP_MODE_STRICT };
+/* The spec models the zipper as a GENERATOR, and %IteratorHelperPrototype%'s next/return validate its
+   [[GeneratorState]] — which is why these are the spec's four states and not a private flag: `executing` is
+   GeneratorValidate's TypeError, and `completed` is what makes a re-entrant next() answer {undefined, true}
+   instead of throwing (suspended-start-iterator-close-calls-next.js turns on exactly that). */
+enum { ZIP_ST_START = 0, ZIP_ST_SUSPEND, ZIP_ST_EXECUTE, ZIP_ST_DONE };
+
+typedef struct JSIteratorZipData {
+    uint8_t mode;
+    uint8_t state;
+    uint32_t count;
+    uint32_t alive;    /* inputs not yet exhausted; `longest` finishes when it reaches zero */
+    JSValue *iters;    /* [count] — UNDEFINED once the input is exhausted or closed */
+    JSValue *nexts;    /* [count] */
+    JSValue *pads;     /* [count] — `longest` only; UNDEFINED everywhere else */
+} JSIteratorZipData;
+
+/* ONE allocation: the three vectors are exactly as long-lived as the record, and a second allocation is a second
+   free to forget. */
+static JSIteratorZipData *js_iter_zip_data_new(JSContext *ctx, uint32_t count)
+{
+    JSIteratorZipData *it = js_malloc(ctx, sizeof(*it) + (size_t)count * 3 * sizeof(JSValue));
+    uint32_t i;
+    if (unlikely(!it))
+        return NULL;
+    it->mode = ZIP_MODE_SHORTEST;
+    it->state = ZIP_ST_START;
+    it->count = count;
+    it->alive = count;
+    it->iters = (JSValue *)(it + 1);
+    it->nexts = it->iters + count;
+    it->pads  = it->nexts + count;
+    for (i = 0; i < count * 3; i++)
+        it->iters[i] = JS_UNDEFINED;
+    return it;
+}
+
+static void js_iter_zip_data_free(JSRuntime *rt, JSIteratorZipData *it)
+{
+    uint32_t i;
+    if (!it)
+        return;
+    for (i = 0; i < it->count * 3; i++)
+        JS_FreeValueRT(rt, it->iters[i]);
+    js_free_rt(rt, it);
+}
+
+static void js_iterator_zip_finalizer(JSRuntime *rt, JSValueConst val)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(val);
+    js_iter_zip_data_free(rt, p->u.iterator_zip_data);
+}
+
+static void js_iterator_zip_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(val);
+    JSIteratorZipData *it = p->u.iterator_zip_data;
+    uint32_t i;
+    if (it) {
+        for (i = 0; i < it->count * 3; i++)
+            JS_MarkValue(rt, it->iters[i], mark_func);
+    }
+}
+
+/* 7.4.11 IteratorCloseAll for whatever inputs this zipper still owns, DEFERRED to the interpreter's unwind. It is
+   reached from a machine's TEARDOWN, which is where the spec's IfAbruptCloseIterators is: whatever went wrong — an
+   input's `.next()` threw, its result's `done`/`value` accessor threw, `strict` found a length mismatch, or a close
+   earlier in this very walk threw — the remaining inputs are still owed a close, and each of those runs under an
+   abrupt completion so its own throw is discarded. Ascending push order is what gives the drain the spec's reverse
+   List order. This is the whole reason the deferral is a queue: it is the first site that owes more than one. */
+static void js_iter_zip_defer_closes(JSContext *ctx, JSIteratorZipData *it, int32_t stepping)
+{
+    uint32_t i;
+    if (!it)
+        return;
+    for (i = 0; i < it->count; i++) {
+        if (JS_IsUndefined(it->iters[i]))
+            continue;
+        /* `stepping` is the input whose IteratorStepValue is what went abrupt. 7.4.8 marks that record [[Done]] and
+           returns WITHOUT closing it — the source is what went wrong — so it is dropped rather than closed. Closing
+           it anyway called `return` on an iterator whose `next` had just thrown, which four tests name one by one
+           as an "unexpected call ... return". */
+        if ((int32_t)i == stepping) {
+            JS_FreeValue(ctx, it->iters[i]); it->iters[i] = JS_UNDEFINED;
+            JS_FreeValue(ctx, it->nexts[i]); it->nexts[i] = JS_UNDEFINED;
+            continue;
+        }
+        iter_close_defer(ctx, it->iters[i]);
+        JS_FreeValue(ctx, it->iters[i]); it->iters[i] = JS_UNDEFINED;
+        JS_FreeValue(ctx, it->nexts[i]); it->nexts[i] = JS_UNDEFINED;
+    }
+    it->alive = 0;
+    it->state = ZIP_ST_DONE;
+}
+
+/* GetIterator (7.4.2) and GetIteratorFlattenable (7.4.3) are the same four operations — GetMethod(@@iterator), the
+   call, the object check, Get "next" — differing only in what an ABSENT method means: GetIterator step 3 throws,
+   GetIteratorFlattenable step 3.a uses the object itself. Iterator.zip performs one or the other three times (the
+   `iterables` argument, every element of it, and the padding), so it is a sub-sequence rather than three copies.
+   The cursor and the held method live in the CALLER's state because a request suspends and this function's locals
+   are gone when it resumes.
+     0 = *piter/*pnext are filled, 3 or 6 = the caller must return that step code, -1 = threw. */
+enum { GI_START = 0, GI_METHOD, GI_ITER, GI_NEXTM };
+enum { GI_REQUIRED = 0, GI_FLATTEN };
+
+static int zip_get_iter_run(JSContext *ctx, JSStepHdr *h, uint8_t *phase, JSValue *held, JSValue *cb,
+                            JSValueConst obj, int flatten, JSValue in, JSValue *piter, JSValue *pnext,
+                            JSValue **out_cb, int *out_argc)
+{
+    int r;
+
+    if (*phase == GI_START) {
+        if (flatten == GI_FLATTEN && !JS_IsObject(obj)) {
+            /* GetIteratorFlattenable step 1 with reject-strings: a primitive is a TypeError even when it is a
+               String, which is why a String OBJECT is accepted and a string primitive is not. */
+            JS_FreeValue(ctx, in);
+            JS_ThrowTypeErrorNotAnObject(ctx);
+            return -1;
+        }
+        *phase = GI_METHOD;
+        r = step_getprop_run(ctx, h, obj, JS_ATOM_Symbol_iterator, in, held, out_cb, out_argc);
+        if (r) return r;
+        in = JS_UNDEFINED;
+        goto have_method;
+    }
+    if (*phase == GI_METHOD) {
+        r = step_getprop_run(ctx, h, obj, JS_ATOM_Symbol_iterator, in, held, out_cb, out_argc);
+        if (r) return r;
+        in = JS_UNDEFINED;
+    have_method:
+        /* GetMethod steps 3-4: undefined AND null both mean absent; anything else must be callable. */
+        if (JS_IsUndefined(*held) || JS_IsNull(*held)) {
+            JS_FreeValue(ctx, *held); *held = JS_UNDEFINED;
+            if (flatten == GI_REQUIRED) {
+                JS_ThrowTypeError(ctx, "value is not iterable");
+                return -1;
+            }
+            *phase = GI_ITER;
+            in = js_dup(obj);       /* GetIteratorFlattenable step 3.a: the object IS the iterator */
+            goto have_iter;
+        }
+        if (!JS_IsFunction(ctx, *held)) {
+            JS_FreeValue(ctx, *held); *held = JS_UNDEFINED;
+            JS_ThrowTypeErrorNotAFunction(ctx);
+            return -1;
+        }
+        cb[0] = (JSValue)obj;   /* borrowed: the caller holds the object across the call */
+        cb[1] = *held;          /* borrowed view: `held` owns the method */
+        *phase = GI_ITER;
+        *out_cb = cb; *out_argc = 0;
+        return 3;
+    }
+    if (*phase == GI_ITER) {
+        JS_FreeValue(ctx, *held); *held = JS_UNDEFINED;
+        cb[0] = JS_UNDEFINED; cb[1] = JS_UNDEFINED;
+    have_iter:
+        if (!JS_IsObject(in)) {   /* GetIteratorFromMethod step 2 / GetIteratorFlattenable step 5 */
+            JS_FreeValue(ctx, in);
+            JS_ThrowTypeErrorNotAnObject(ctx);
+            return -1;
+        }
+        *held = in;               /* the iterator, held across the `next` read */
+        *phase = GI_NEXTM;
+        in = JS_UNDEFINED;
+    }
+    DCHECK(*phase == GI_NEXTM, "GetIterator resumed in an unknown phase");
+    r = step_getprop_run(ctx, h, *held, JS_ATOM_next, in, pnext, out_cb, out_argc);
+    if (r) return r;
+    *piter = *held;               /* GetIteratorDirect: the record is (iterator, nextMethod) */
+    *held = JS_UNDEFINED;
+    *phase = GI_START;
+    return 0;
+}
+
+/* IteratorStepValue (7.4.8): Call(nextMethod, iterator), the result must be an Object, then `done` and `value`.
+   Iterator.zip performs it in three places (the `iterables` walk, the padding walk, and every input in the
+   zipper's own next()), and the ORDER of the two reads is observable — which is why `value_always` is a parameter
+   rather than a difference each copy would get to make: the padding walk reads BOTH before testing `done`, the
+   other two read `value` only when `done` is falsy.
+     0 = *pvalue/*pdone are filled, 3 or 6 = the caller must return that step code, -1 = threw. */
+/* IS_VALUE_DONE is not a spelling variant of IS_VALUE: `done` is decided BEFORE the `value` read and reported
+   AFTER it, so it has to survive a suspension, and the caller's `bool done` local cannot — it is re-initialised on
+   every re-entry. Putting the answer in the PHASE is what makes the two reads one resumable operation; without it
+   the padding walk saw every exhausted padding iterator as not-done and closed it. */
+enum { IS_START = 0, IS_ITEM, IS_DONE, IS_VALUE, IS_VALUE_DONE };
+
+static int zip_iter_step_run(JSContext *ctx, JSStepHdr *h, uint8_t *phase, JSValue *held, JSValue *cb,
+                             JSValueConst iter, JSValueConst nextm, bool value_always, JSValue in,
+                             JSValue *pvalue, bool *pdone, JSValue **out_cb, int *out_argc)
+{
+    int r;
+
+    if (*phase == IS_START) {
+        JS_FreeValue(ctx, in);
+        cb[0] = (JSValue)iter;    /* borrowed: the caller holds both across the call */
+        cb[1] = (JSValue)nextm;
+        *phase = IS_ITEM;
+        *out_cb = cb; *out_argc = 0;
+        return 3;
+    }
+    if (*phase == IS_ITEM) {
+        cb[0] = JS_UNDEFINED; cb[1] = JS_UNDEFINED;
+        if (!JS_IsObject(in)) {   /* IteratorNext step 3 */
+            JS_FreeValue(ctx, in);
+            JS_ThrowTypeError(ctx, "iterator result not an object");
+            return -1;
+        }
+        *held = in;               /* the result object, held across its two reads */
+        *phase = IS_DONE;
+        in = JS_UNDEFINED;
+    }
+    if (*phase == IS_DONE) {
+        JSValue dv = JS_UNDEFINED;
+        r = step_getprop_run(ctx, h, *held, JS_ATOM_done, in, &dv, out_cb, out_argc);
+        if (r) return r;
+        if (JS_ToBoolFree(ctx, dv)) {
+            if (!value_always) {
+                JS_FreeValue(ctx, *held); *held = JS_UNDEFINED;
+                *pvalue = JS_UNDEFINED;
+                *pdone = true;
+                *phase = IS_START;
+                return 0;
+            }
+            *phase = IS_VALUE_DONE;
+        } else {
+            *phase = IS_VALUE;
+        }
+        in = JS_UNDEFINED;
+    }
+    DCHECK(*phase == IS_VALUE || *phase == IS_VALUE_DONE, "IteratorStepValue resumed in an unknown phase");
+    *pdone = (*phase == IS_VALUE_DONE);
+    r = step_getprop_run(ctx, h, *held, JS_ATOM_value, in, pvalue, out_cb, out_argc);
+    if (r) return r;
+    JS_FreeValue(ctx, *held); *held = JS_UNDEFINED;
+    *phase = IS_START;
+    return 0;
+}
+
+/* 7.4.9 IteratorClose under a NORMAL completion, as requests: GetMethod(iterator, "return"), the call, and step 6's
+   object check on what came back. It exists only for the normal-completion sites — Iterator.zip's padding close and
+   the IteratorCloseAll its next/return perform before answering — because under an ABRUPT completion the close is
+   DEFERRED to the interpreter instead (iter_close_defer), where its own throw is discarded and the unwind is
+   already in progress.
+     0 = the close is done, 3 or 6 = the caller must return that step code, -1 = threw. */
+enum { ZC_START = 0, ZC_METHOD, ZC_CALL };
+
+static int zip_close_run(JSContext *ctx, JSStepHdr *h, uint8_t *phase, JSValue *held, JSValue *cb,
+                         JSValueConst iter, JSValue in, JSValue **out_cb, int *out_argc)
+{
+    int r;
+
+    if (*phase == ZC_START) {
+        *phase = ZC_METHOD;
+        r = step_getprop_run(ctx, h, iter, JS_ATOM_return, in, held, out_cb, out_argc);
+        if (r) return r;
+        goto have_method;
+    }
+    if (*phase == ZC_METHOD) {
+        r = step_getprop_run(ctx, h, iter, JS_ATOM_return, in, held, out_cb, out_argc);
+        if (r) return r;
+    have_method:
+        if (JS_IsUndefined(*held) || JS_IsNull(*held)) {   /* 7.4.9 step 4.b: nothing to call */
+            JS_FreeValue(ctx, *held); *held = JS_UNDEFINED;
+            *phase = ZC_START;
+            return 0;
+        }
+        if (!JS_IsFunction(ctx, *held)) {
+            JS_FreeValue(ctx, *held); *held = JS_UNDEFINED;
+            JS_ThrowTypeErrorNotAFunction(ctx);
+            return -1;
+        }
+        cb[0] = (JSValue)iter;   /* borrowed: the caller holds the iterator across the call */
+        cb[1] = *held;           /* borrowed view: `held` owns the method */
+        *phase = ZC_CALL;
+        *out_cb = cb; *out_argc = 0;
+        return 3;
+    }
+    DCHECK(*phase == ZC_CALL, "IteratorClose resumed in an unknown phase");
+    JS_FreeValue(ctx, *held); *held = JS_UNDEFINED;
+    cb[0] = JS_UNDEFINED; cb[1] = JS_UNDEFINED;
+    *phase = ZC_START;
+    if (!JS_IsObject(in)) {   /* 7.4.9 step 6 */
+        JS_FreeValue(ctx, in);
+        JS_ThrowTypeError(ctx, "iterator return result not an object");
+        return -1;
+    }
+    JS_FreeValue(ctx, in);
+    return 0;
+}
+
+/* --- Iterator.zip itself (27.1.3.3 steps 1-16) --- */
+enum { ZS_INIT = 0, ZS_MODE, ZS_PADDING, ZS_IN_ITER, ZS_ELEM_STEP, ZS_ELEM_ITER, ZS_PAD_ITER, ZS_PAD_STEP,
+       ZS_PAD_CLOSE };
+
+
+static int js_zip_push_input(JSContext *ctx, JSIterZip *s, JSValue iter, JSValue nextm)
+{
+    if (s->n == s->cap) {
+        uint32_t ncap = s->cap ? s->cap * 2 : 4;
+        JSValue *ni = js_realloc(ctx, s->iters, sizeof(JSValue) * (size_t)ncap);
+        JSValue *nn;
+        if (unlikely(!ni)) goto fail;
+        s->iters = ni;
+        nn = js_realloc(ctx, s->nexts, sizeof(JSValue) * (size_t)ncap);
+        if (unlikely(!nn)) goto fail;
+        s->nexts = nn;
+        s->cap = ncap;
+    }
+    s->iters[s->n] = iter;
+    s->nexts[s->n] = nextm;
+    s->n++;
+    return 0;
+ fail:
+    JS_FreeValue(ctx, iter);
+    JS_FreeValue(ctx, nextm);
+    return -1;
+}
+
+static int js_zip_mode_of(JSContext *ctx, JSValueConst v, uint8_t *pmode)
+{
+    const char *str;
+    if (JS_IsUndefined(v)) { *pmode = ZIP_MODE_SHORTEST; return 0; }   /* step 5.b */
+    if (!JS_IsString(v))
+        goto bad;
+    str = JS_ToCString(ctx, v);
+    if (!str)
+        return -1;
+    if (!strcmp(str, "shortest"))     *pmode = ZIP_MODE_SHORTEST;
+    else if (!strcmp(str, "longest")) *pmode = ZIP_MODE_LONGEST;
+    else if (!strcmp(str, "strict"))  *pmode = ZIP_MODE_STRICT;
+    else { JS_FreeCString(ctx, str); goto bad; }
+    JS_FreeCString(ctx, str);
+    return 0;
+ bad:
+    JS_ThrowTypeError(ctx, "invalid zip mode");
+    return -1;
+}
+
+static int js_iterator_zip_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSIterZip *s = st;
+    JSIteratorZipData *it;
+    JSValue obj, value = JS_UNDEFINED;
+    bool done = false;
+    uint32_t i;
+    int r;
+
+    if (s->hdr.stage == ZS_INIT) {
+        JSValueConst options = step_arg(&s->hdr, 1);
+        JS_FreeValue(ctx, cb_result);
+        cb_result = JS_UNDEFINED;
+        /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
+        s->result = JS_UNDEFINED; s->padding = JS_UNDEFINED; s->held = JS_UNDEFINED; s->elem = JS_UNDEFINED;
+        s->input_iter = JS_UNDEFINED; s->input_next = JS_UNDEFINED;
+        s->pad_iter = JS_UNDEFINED; s->pad_next = JS_UNDEFINED; s->closing = JS_UNDEFINED;
+        s->cb[0] = JS_UNDEFINED; s->cb[1] = JS_UNDEFINED;
+        if (!JS_IsObject(step_arg(&s->hdr, 0))) {   /* step 2 */
+            JS_ThrowTypeErrorNotAnObject(ctx);
+            return -1;
+        }
+        if (!JS_IsUndefined(options) && !JS_IsObject(options)) {   /* step 3 */
+            JS_ThrowTypeErrorNotAnObject(ctx);
+            return -1;
+        }
+        s->hdr.stage = ZS_MODE;
+        if (JS_IsUndefined(options)) {
+            /* step 3.a: OrdinaryObjectCreate(null) — both reads answer undefined and run nothing. */
+            value = JS_UNDEFINED;
+        } else {
+            r = step_getprop_run(ctx, &s->hdr, options, JS_ATOM_mode, JS_UNDEFINED, &value, out_cb, out_argc);
+            if (r) return r < 0 ? -1 : r;
+        }
+        cb_result = value;
+        /* fall through with `mode` in cb_result */
+    } else if (s->hdr.stage == ZS_MODE) {
+        JSValue m = JS_UNDEFINED;
+        r = step_getprop_run(ctx, &s->hdr, step_arg(&s->hdr, 1), JS_ATOM_mode, cb_result, &m, out_cb, out_argc);
+        if (r) return r < 0 ? -1 : r;
+        cb_result = m;
+    }
+    if (s->hdr.stage == ZS_MODE) {
+        if (js_zip_mode_of(ctx, cb_result, &s->mode) < 0) { JS_FreeValue(ctx, cb_result); return -1; }
+        JS_FreeValue(ctx, cb_result);
+        cb_result = JS_UNDEFINED;
+        s->hdr.stage = ZS_PADDING;
+        if (s->mode != ZIP_MODE_LONGEST)
+            goto input_iter;   /* step 6 reads `padding` only for `longest` */
+        r = step_getprop_run(ctx, &s->hdr, step_arg(&s->hdr, 1), JS_ATOM_padding, JS_UNDEFINED, &s->padding,
+                             out_cb, out_argc);
+        if (r) return r < 0 ? -1 : r;
+        goto have_padding;
+    }
+    if (s->hdr.stage == ZS_PADDING) {
+        r = step_getprop_run(ctx, &s->hdr, step_arg(&s->hdr, 1), JS_ATOM_padding, cb_result, &s->padding,
+                             out_cb, out_argc);
+        if (r) return r < 0 ? -1 : r;
+        cb_result = JS_UNDEFINED;
+    have_padding:
+        if (!JS_IsUndefined(s->padding) && !JS_IsObject(s->padding)) {   /* step 6.b */
+            JS_ThrowTypeErrorNotAnObject(ctx);
+            return -1;
+        }
+    input_iter:
+        s->hdr.stage = ZS_IN_ITER;
+        cb_result = JS_UNDEFINED;
+    }
+
+    for (;;) {
+        if (s->hdr.stage == ZS_IN_ITER) {
+            /* step 10: GetIterator(iterables, sync) */
+            r = zip_get_iter_run(ctx, &s->hdr, &s->gi_phase, &s->held, s->cb, step_arg(&s->hdr, 0), GI_REQUIRED,
+                                 cb_result, &s->input_iter, &s->input_next, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->hdr.stage = ZS_ELEM_STEP;
+        }
+        if (s->hdr.stage == ZS_ELEM_STEP) {
+            /* step 12.a: IteratorStepValue(inputIter). An abrupt one closes `iters` and NOT inputIter — 7.4.8
+               marks the record done and does not close a source whose own next threw — which is why the teardown
+               reads the STAGE to decide: inputIter is closed only while step 12.c.i is running. */
+            r = zip_iter_step_run(ctx, &s->hdr, &s->is_phase, &s->held, s->cb, s->input_iter, s->input_next,
+                                 false, cb_result, &value, &done, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            if (done) {
+                JS_FreeValue(ctx, value);
+                /* the walk is over, so inputIter is owed nothing further */
+                JS_FreeValue(ctx, s->input_iter); s->input_iter = JS_UNDEFINED;
+                JS_FreeValue(ctx, s->input_next); s->input_next = JS_UNDEFINED;
+                if (JS_IsUndefined(s->padding))
+                    goto build;
+                s->hdr.stage = ZS_PAD_ITER;
+                continue;
+            }
+            s->elem = value;   /* held across GetIteratorFlattenable */
+            s->hdr.stage = ZS_ELEM_ITER;
+        }
+        if (s->hdr.stage == ZS_ELEM_ITER) {
+            /* step 12.c.i: GetIteratorFlattenable(next, reject-strings) */
+            JSValue eiter = JS_UNDEFINED, enext = JS_UNDEFINED;
+            r = zip_get_iter_run(ctx, &s->hdr, &s->gi_phase, &s->held, s->cb, s->elem, GI_FLATTEN,
+                                 cb_result, &eiter, &enext, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            JS_FreeValue(ctx, s->elem); s->elem = JS_UNDEFINED;
+            if (js_zip_push_input(ctx, s, eiter, enext) < 0)
+                return -1;
+            s->hdr.stage = ZS_ELEM_STEP;
+            continue;
+        }
+        if (s->hdr.stage == ZS_PAD_ITER) {
+            /* step 13.b: GetIterator(paddingOption, sync) */
+            r = zip_get_iter_run(ctx, &s->hdr, &s->gi_phase, &s->held, s->cb, s->padding, GI_REQUIRED,
+                                 cb_result, &s->pad_iter, &s->pad_next, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            if (s->n > 0) {
+                s->pads = js_malloc(ctx, sizeof(JSValue) * (size_t)s->n);
+                if (unlikely(!s->pads)) return -1;
+                for (i = 0; i < s->n; i++) s->pads[i] = JS_UNDEFINED;
+            }
+            s->hdr.stage = ZS_PAD_STEP;
+        }
+        if (s->hdr.stage == ZS_PAD_STEP) {
+            /* An abrupt step on the PADDING iterator does not close it either (7.4.8 again), which is what the
+               teardown reads this stage for. */
+            /* step 13.d: one IteratorStepValue per input. `done` AND `value` are BOTH read every time here, even
+               on the done result — the order is observable and this walk differs from the other two in it. */
+            while (s->pad_n < s->n) {
+                r = zip_iter_step_run(ctx, &s->hdr, &s->is_phase, &s->held, s->cb, s->pad_iter, s->pad_next,
+                                     true, cb_result, &value, &done, out_cb, out_argc);
+                cb_result = JS_UNDEFINED;
+                if (r) return r < 0 ? -1 : r;
+                if (done) {
+                    JS_FreeValue(ctx, value);
+                    /* the padding ran out: it is exhausted, so nothing is owed it */
+                    JS_FreeValue(ctx, s->pad_iter); s->pad_iter = JS_UNDEFINED;
+                    JS_FreeValue(ctx, s->pad_next); s->pad_next = JS_UNDEFINED;
+                    goto build;
+                }
+                s->pads[s->pad_n++] = value;
+            }
+            s->hdr.stage = ZS_PAD_CLOSE;
+        }
+        if (s->hdr.stage == ZS_PAD_CLOSE) {
+            /* step 13.e: the padding iterator is closed under a NORMAL completion once every input has a pad, so
+               its throw PROPAGATES (and the teardown then closes the inputs). */
+            if (s->zc_phase == ZC_START) {
+                s->closing = s->pad_iter; s->pad_iter = JS_UNDEFINED;
+                JS_FreeValue(ctx, s->pad_next); s->pad_next = JS_UNDEFINED;
+            }
+            r = zip_close_run(ctx, &s->hdr, &s->zc_phase, &s->held, s->cb, s->closing, cb_result,
+                              out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            JS_FreeValue(ctx, s->closing); s->closing = JS_UNDEFINED;
+            goto build;
+        }
+        DFAIL("Iterator.zip resumed in an unknown stage");
+        return -1;
+    }
+
+ build:
+    it = js_iter_zip_data_new(ctx, s->n);
+    if (unlikely(!it))
+        return -1;
+    it->mode = s->mode;
+    for (i = 0; i < s->n; i++) {
+        it->iters[i] = s->iters[i];
+        it->nexts[i] = s->nexts[i];
+        it->pads[i]  = (s->pads && i < s->pad_n) ? s->pads[i] : JS_UNDEFINED;
+    }
+    s->n = 0; s->pad_n = 0;   /* the record owns them now */
+    obj = JS_NewObjectProtoClass(ctx, ctx->class_proto[JS_CLASS_ITERATOR_HELPER], JS_CLASS_ITERATOR_ZIP);
+    if (JS_IsException(obj)) {
+        js_iter_zip_data_free(ctx->rt, it);
+        return -1;
+    }
+    JS_SetOpaqueInternal(obj, it);
+    /* The zipper's own `next` and `return`, as the object-literal properties the spec's CreateIteratorFromClosure
+       result presents: writable, enumerable, configurable. */
+    if (JS_DefinePropertyValue(ctx, obj, JS_ATOM_next,
+                               JS_NewCFunctionMagic(ctx, NULL, "next", 0, JS_CFUNC_step, STEPDEF_ITER_ZIP_NEXT),
+                               JS_PROP_C_W_E) < 0
+     || JS_DefinePropertyValue(ctx, obj, JS_ATOM_return,
+                               JS_NewCFunctionMagic(ctx, NULL, "return", 0, JS_CFUNC_step, STEPDEF_ITER_ZIP_RETURN),
+                               JS_PROP_C_W_E) < 0) {
+        JS_FreeValue(ctx, obj);
+        return -1;
+    }
+    s->result = obj;
+    return 0;
+}
+
+static JSValue js_iterator_zip_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSIterZip *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    uint32_t i;
+
+    if (!take_result) {
+        /* IfAbruptCloseIterators. Push order is the REVERSE of close order, because the drain pops: the padding
+           iterator and then inputIter go under the inputs, so the inputs close first and in reverse index order —
+           7.4.11 over « inputIter » ++ iters exactly. inputIter is owed a close only while step 12.c.i is running,
+           which is what the stage says; an abrupt IteratorStepValue on it does not close it. */
+        JS_FreeValue(ctx, s->result);
+        if (s->hdr.stage != ZS_PAD_STEP && JS_IsObject(s->pad_iter))
+            iter_close_defer(ctx, s->pad_iter);
+        if (s->hdr.stage == ZS_ELEM_ITER && JS_IsObject(s->input_iter))
+            iter_close_defer(ctx, s->input_iter);
+        for (i = 0; i < s->n; i++)
+            iter_close_defer(ctx, s->iters[i]);
+    }
+    JS_FreeValue(ctx, s->padding);
+    JS_FreeValue(ctx, s->held);
+    JS_FreeValue(ctx, s->elem);
+    JS_FreeValue(ctx, s->closing);
+    JS_FreeValue(ctx, s->input_iter); JS_FreeValue(ctx, s->input_next);
+    JS_FreeValue(ctx, s->pad_iter);   JS_FreeValue(ctx, s->pad_next);
+    for (i = 0; i < s->n; i++) { JS_FreeValue(ctx, s->iters[i]); JS_FreeValue(ctx, s->nexts[i]); }
+    js_free(ctx, s->iters);
+    js_free(ctx, s->nexts);
+    for (i = 0; i < s->pad_n; i++) JS_FreeValue(ctx, s->pads[i]);
+    js_free(ctx, s->pads);
+    js_free(ctx, s);
+    return r;
+}
+
+/* --- the zipper's next() and return(). ONE machine: the walk that closes every remaining input is the whole of
+   `return` and the tail of several of `next`'s arms, so the difference is which arm runs first. --- */
+
+static JSIteratorZipData *js_iter_zip_data(JSContext *ctx, JSValueConst this_val)
+{
+    return JS_GetOpaque2(ctx, this_val, JS_CLASS_ITERATOR_ZIP);
+}
+
+static int js_iter_zip_drive_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSIterZipDrive *s = st;
+    JSIteratorZipData *it;
+    JSValue value = JS_UNDEFINED;
+    bool done = false;
+    int r;
+
+    if (s->hdr.stage == ZD_INIT) {
+        JS_FreeValue(ctx, cb_result);
+        cb_result = JS_UNDEFINED;
+        s->result = JS_UNDEFINED; s->self = JS_UNDEFINED; s->held = JS_UNDEFINED;
+        s->results = JS_UNDEFINED; s->closing = JS_UNDEFINED;
+        s->cb[0] = JS_UNDEFINED; s->cb[1] = JS_UNDEFINED;
+        s->stepping = -1;
+        it = js_iter_zip_data(ctx, s->hdr.this_val);
+        if (!it)
+            return -1;
+        /* GeneratorValidate + GeneratorResume's completed shortcut. `executing` is a TypeError and NOT this
+           generator's own abrupt completion, so it must not mark the zipper completed on the way out — which is
+           why held_state is only raised once the state has actually been taken. */
+        if (it->state == ZIP_ST_EXECUTE) {
+            JS_ThrowTypeError(ctx, "Iterator Helper is already running");
+            return -1;
+        }
+        if (it->state == ZIP_ST_DONE) {
+            s->result = js_create_iterator_result(ctx, JS_UNDEFINED, true);
+            return JS_IsException(s->result) ? -1 : 0;
+        }
+        s->self = js_dup(s->hdr.this_val);
+        if (s->hdr.arg == ZIP_DRIVE_RETURN && it->state == ZIP_ST_START) {
+            /* %IteratorHelperPrototype%.return step 4: suspended-start is COMPLETED before IteratorCloseAll runs,
+               so a next() re-entered from an input's own `return` answers {undefined, true} instead of throwing. */
+            it->state = ZIP_ST_DONE;
+        } else {
+            it->state = ZIP_ST_EXECUTE;
+        }
+        s->owns = 1;
+        if (s->hdr.arg == ZIP_DRIVE_RETURN) {
+            s->j = it->count;
+            s->hdr.stage = ZD_CLOSEALL;
+        } else {
+            s->results = JS_NewArray(ctx);
+            if (JS_IsException(s->results)) { s->results = JS_UNDEFINED; return -1; }
+            s->hdr.stage = ZD_STEP;
+        }
+    }
+    it = js_iter_zip_data(ctx, s->self);
+    DCHECK(it != NULL, "the zipper lost its data mid-drive");
+
+    if (s->hdr.stage == ZD_STEP) {
+        while (s->i < it->count) {
+            uint32_t k = s->i;
+            if (JS_IsUndefined(it->iters[k])) {
+                /* an input already exhausted: only `longest` keeps going past one, and it pads. */
+                DCHECK(it->mode == ZIP_MODE_LONGEST, "a zipper kept a spent input in a mode that finishes on one");
+                if (JS_DefinePropertyValueUint32(ctx, s->results, k, js_dup(it->pads[k]), JS_PROP_C_W_E) < 0)
+                    return -1;
+                s->i++;
+                continue;
+            }
+            s->stepping = (int32_t)k;
+            r = zip_iter_step_run(ctx, &s->hdr, &s->is_phase, &s->held, s->cb, it->iters[k], it->nexts[k],
+                                 false, cb_result, &value, &done, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->stepping = -1;
+            it = js_iter_zip_data(ctx, s->self);
+            DCHECK(it != NULL, "the zipper lost its data across an input's step");
+            if (!done) {
+                if (it->mode == ZIP_MODE_STRICT && s->dones > 0) {
+                    /* IfAbruptCloseIterators(throw TypeError, iters): the completion is ABRUPT before the closes
+                       run, so each close discards its own throw and the TypeError propagates. Running the closes
+                       first and throwing after let a `return` that threw win instead, which
+                       strict-iterator-close-i-is-{zero,not-zero}-abrupt-completion.js report as "Expected a
+                       TypeError but got a Test262Error". The teardown performs the deferred closes. */
+                    JS_FreeValue(ctx, value);
+                    JS_ThrowTypeError(ctx, "zip inputs have mismatched lengths");
+                    return -1;
+                }
+                if (JS_DefinePropertyValueUint32(ctx, s->results, k, value, JS_PROP_C_W_E) < 0)
+                    return -1;
+                s->values++;
+                s->i++;
+                continue;
+            }
+            JS_FreeValue(ctx, value);
+            it->alive--;
+            s->dones++;
+            JS_FreeValue(ctx, it->iters[k]); it->iters[k] = JS_UNDEFINED;
+            JS_FreeValue(ctx, it->nexts[k]); it->nexts[k] = JS_UNDEFINED;
+            if (it->mode == ZIP_MODE_SHORTEST) {
+                s->j = it->count;
+                s->hdr.stage = ZD_CLOSEALL;
+                goto closeall;
+            }
+            if (it->mode == ZIP_MODE_LONGEST) {
+                if (it->alive < 1)
+                    goto finish_done;
+                if (JS_DefinePropertyValueUint32(ctx, s->results, k, js_dup(it->pads[k]), JS_PROP_C_W_E) < 0)
+                    return -1;
+                s->i++;
+                continue;
+            }
+            DCHECK(it->mode == ZIP_MODE_STRICT, "a zipper input finished in an unknown mode");
+            if (s->values > 0) {
+                JS_ThrowTypeError(ctx, "zip inputs have mismatched lengths");
+                return -1;
+            }
+            s->i++;
+        }
+        if (s->values == 0)
+            goto finish_done;
+        it->state = ZIP_ST_SUSPEND;
+        s->owns = 0;
+        s->result = js_create_iterator_result(ctx, s->results, false);
+        s->results = JS_UNDEFINED;
+        return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
+    }
+
+ closeall:
+    DCHECK(s->hdr.stage == ZD_CLOSEALL, "a zipper drive resumed in an unknown stage");
+    while (s->j > 0) {
+        uint32_t k = s->j - 1;
+        if (s->zc_phase == ZC_START) {
+            if (JS_IsUndefined(it->iters[k])) { s->j--; continue; }
+            /* take the input OUT of the record for the duration: if this close throws, the teardown must not
+               defer a SECOND close for the iterator whose `return` has already run. */
+            s->closing = it->iters[k]; it->iters[k] = JS_UNDEFINED;
+            JS_FreeValue(ctx, it->nexts[k]); it->nexts[k] = JS_UNDEFINED;
+        }
+        r = zip_close_run(ctx, &s->hdr, &s->zc_phase, &s->held, s->cb, s->closing, cb_result, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        JS_FreeValue(ctx, s->closing); s->closing = JS_UNDEFINED;
+        it = js_iter_zip_data(ctx, s->self);
+        DCHECK(it != NULL, "the zipper lost its data across an input's close");
+        s->j--;
+    }
+ finish_done:
+    it->state = ZIP_ST_DONE;
+    s->owns = 0;
+    s->result = js_create_iterator_result(ctx, JS_UNDEFINED, true);
+    return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
+}
+
+static JSValue js_iter_zip_drive_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSIterZipDrive *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+
+    if (!take_result) {
+        JS_FreeValue(ctx, s->result);
+        if (s->owns && JS_IsObject(s->self)) {
+            /* the generator's own abrupt completion: it is COMPLETED, and every input it still holds is owed a
+               close under that completion — 7.4.11 with each throw discarded, which is the deferral. JS_GetOpaque
+               and not JS_GetOpaque2: a teardown must not raise a second exception over the one it is unwinding. */
+            js_iter_zip_defer_closes(ctx, JS_GetOpaque(s->self, JS_CLASS_ITERATOR_ZIP), s->stepping);
+        }
+    }
+    JS_FreeValue(ctx, s->self);
+    JS_FreeValue(ctx, s->held);
+    JS_FreeValue(ctx, s->results);
+    JS_FreeValue(ctx, s->closing);   /* cb[] is borrowed — see JSIterZip's note */
+    js_free(ctx, s);
+    return r;
+}
+
 static JSValue js_promise_resolve_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSPromiseResolveM *s = st;
@@ -65395,6 +66191,9 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_REGEXP_TEST]     = &js_re_test_def,
     [STEPDEF_GLOBAL_EVAL]     = &js_global_eval_def,
     [STEPDEF_ITER_CONCAT]     = &js_iter_concat_def,
+    [STEPDEF_ITER_ZIP]        = &js_iter_zip_def,
+    [STEPDEF_ITER_ZIP_NEXT]   = &js_iter_zip_next_def,
+    [STEPDEF_ITER_ZIP_RETURN] = &js_iter_zip_return_def,
     [STEPDEF_FUNCTION_CTOR]   = &js_function_ctor_def,
     [STEPDEF_GENERATOR_FUNCTION_CTOR] = &js_genfn_ctor_def,
     [STEPDEF_ASYNC_FUNCTION_CTOR] = &js_asyncfn_ctor_def,
@@ -68415,6 +69214,7 @@ static void js_iterator_helper_mark(JSRuntime *rt, JSValueConst val,
    here; one that slips through hits the js_generator_next DFAIL. Keeps the recognition identity. */
 static const JSCFunctionListEntry js_iterator_funcs[] = {
     JS_CFUNC_STEP_DEF("concat", 0, STEPDEF_ITER_CONCAT ),
+    JS_CFUNC_STEP_DEF("zip", 1, STEPDEF_ITER_ZIP ),
     JS_CFUNC_CONSUME_DEF("from", 1, ITERCONS_ITERFROM ),
 };
 
@@ -81766,9 +82566,6 @@ int JS_AddIntrinsicBaseObjects(JSContext *ctx)
         JS_FreeValue(ctx, setter);
     }
     ctx->iterator_ctor = obj2;
-    JS_DefineAutoInitProperty(ctx, obj2, JS_ATOM_zip, JS_AUTOINIT_ID_BYTECODE,
-                              (void *)(uintptr_t)JS_BUILTIN_ITERATOR_ZIP,
-                              JS_PROP_WRITABLE|JS_PROP_CONFIGURABLE);
     JS_DefineAutoInitProperty(ctx, obj2, JS_ATOM_zipKeyed, JS_AUTOINIT_ID_BYTECODE,
                               (void *)(uintptr_t)JS_BUILTIN_ITERATOR_ZIP_KEYED,
                               JS_PROP_WRITABLE|JS_PROP_CONFIGURABLE);
