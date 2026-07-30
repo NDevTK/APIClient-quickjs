@@ -19716,7 +19716,8 @@ typedef struct JSConsumeGetIter { void *consumer; uint8_t consumer_kind; } JSCon
 /* Where an OPERAND-mode ToPrimitive continues once its primitive is in hand. Each value names a label placed
    immediately AFTER the coercion it belongs to, so nothing before it re-executes. TPR_NONE is the unconverted
    sites' retry and goes when they do. */
-enum { TPR_NONE = 0, TPR_ARITH_AFTER_LEFT, TPR_ARITH_AFTER_RIGHT, TPR_ADD_AFTER_COERCE };
+enum { TPR_NONE = 0, TPR_ARITH_AFTER_LEFT, TPR_ARITH_AFTER_RIGHT, TPR_ADD_AFTER_COERCE,
+       TPR_PROPKEY, TPR_PROPKEY2 };
 typedef struct JSToPrim {
     JSValue obj;              /* the object being coerced (owned) */
     const uint8_t *retry_pc;  /* OPERAND mode, LEGACY: the opcode byte to RE-EXECUTE once the slot holds a
@@ -27019,6 +27020,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         opcode = *opb;
                         if (rat == TPR_ARITH_AFTER_LEFT) goto do_arith_after_left;
                         if (rat == TPR_ADD_AFTER_COERCE) goto do_add_after_coerce;
+                        if (rat == TPR_PROPKEY) goto do_propkey_classify;
+                        if (rat == TPR_PROPKEY2) goto do_propkey2_classify;
                         DCHECK(rat == TPR_ARITH_AFTER_RIGHT, "an operand coercion resumed at an unknown point");
                         goto do_arith_after_right;
                     }
@@ -35927,15 +35930,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         CASE(OP_to_propkey):
+        do_propkey_classify:
+            /* THE RESUME POINT. The coerced value is classified HERE, not by re-executing the opcode: a primitive
+               that is already an INT is left alone (element access wants the int, not its string atom), and only
+               the other tags reach ToPropertyKey. That classification is a decision about the NEW value, which is
+               what a continuation is for; what the retry re-ran was everything before it. */
             switch (JS_VALUE_GET_TAG(sp[-1])) {
             case JS_TAG_INT:
             case JS_TAG_STRING:
             case JS_TAG_SYMBOL:
                 break;
             case JS_TAG_OBJECT:
-                /* ToPropertyKey on an object runs the page's coercion methods; route it, exactly as the
-                   element-access opcodes do, and re-execute with the primitive in the slot. */
-                sf->cur_pc = pc; tp_slot = -1; tp_retry_pc = pc - 1; goto key_toprim;
+                sf->cur_pc = pc; tp_slot = -1; tp_retry_pc = pc - 1;
+                tp_resume_at = TPR_PROPKEY; goto key_toprim;
             default:
                 sf->cur_pc = pc;
                 ret_val = JS_ToPropertyKey(ctx, sp[-1]);
@@ -35953,15 +35960,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JS_ThrowTypeError(ctx, "value has no property");
                 goto exception;
             }
+        do_propkey2_classify:
+            /* the same resume point for the two-operand spelling; the null check on sp[-2] above is NOT re-run,
+               which is the part the retry repeated. */
             switch (JS_VALUE_GET_TAG(sp[-1])) {
             case JS_TAG_INT:
             case JS_TAG_STRING:
             case JS_TAG_SYMBOL:
                 break;
             case JS_TAG_OBJECT:
-                /* ToPropertyKey on an object runs the page's coercion methods; route it, exactly as the
-                   element-access opcodes do, and re-execute with the primitive in the slot. */
-                sf->cur_pc = pc; tp_slot = -1; tp_retry_pc = pc - 1; goto key_toprim;
+                sf->cur_pc = pc; tp_slot = -1; tp_retry_pc = pc - 1;
+                tp_resume_at = TPR_PROPKEY2; goto key_toprim;
             default:
                 sf->cur_pc = pc;
                 ret_val = JS_ToPropertyKey(ctx, sp[-1]);
