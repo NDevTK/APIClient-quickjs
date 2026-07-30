@@ -20410,6 +20410,21 @@ static bool tramp_walk_continues(JSContext *ctx, JSObject *p, JSAtom atom)
         return JS_GetOwnPropertyInternal(ctx, NULL, p, atom) == 0;
     return true;
 }
+/* DIRECT eval, compiled to a CLOSURE for the tramp and never run here. Both spellings of a direct eval — `eval(x)`
+   and `eval(...arr)` — reach it, which is the point: the eval'd program's body must run on THIS tramp chain so a
+   loop inside it parks for the scheduler exactly like one in any other function, and JS_EvalObject's own JS_CallFree
+   would give it an activation off the chain with no base to park into. The plainness ASSERT lives here rather than
+   at each site, so there is one body-entry question and not one per spelling. */
+static JSValue eval_direct_closure(JSContext *ctx, JSValueConst src, int scope_idx)
+{
+    JSValue clo = JS_EvalObject(ctx, JS_UNDEFINED, src,
+                                JS_EVAL_TYPE_DIRECT | JS_EVAL_FLAG_TRAMP_CLOSURE, scope_idx);
+    if (unlikely(JS_IsException(clo)))
+        return clo;
+    DCHECK(tramp_body_is_plain(clo), "direct eval closure is not a trampolinable bytecode function");
+    return clo;
+}
+
 /* The object an ordinary property walk STARTS at. For an OBJECT it is the object; for a PRIMITIVE base
    6.2.5.5 GetValue / 6.2.5.6 PutValue box it, so the walk begins at the primitive's PROTOTYPE — where anything can
    be put, which is why `(0).x` and `(0).x = 1` are as much the page's code as any object's read and write. NULL
@@ -23011,12 +23026,27 @@ static uint64_t g_flow_preempt_fired = 0;
    drive-to-completion the tramp routing has not yet subsumed. The goal is 0 across the corpus (pure suspend/resume
    at any depth). Unlike a per-test crash it aggregates ALL sites in one bulk run rather than aborting at the first. */
 static uint64_t g_drive_to_completion = 0;
+/* THE SAME DETECTOR ONE LEVEL WIDER. The count above sees only a COROUTINE body driven off-tramp; an ORDINARY
+   bytecode body entered by C recursion is the same defect and nothing counted it, because the existing forcing
+   function — the back-edge preempt DFAIL — only fires when that body happens to contain a LOOP. A getter, a
+   callback, a direct `eval` with no back-edge runs to completion in silence.
+   The condition is structural, not a list of callers: the tramp never re-enters JS_CallInternal (it pushes a heap
+   frame and `goto restart`s) and the flow base enters through the JS_CALL_FLAG_GENERATOR branch above, so ANY
+   arrival here while a flow exists is by construction a C-recursive drive. It does NOT exempt the host boundary:
+   JS_Eval is not exempt from suspend/resume either — a host entry that wants to run page code creates a flow
+   (JS_FlowNew / JS_FlowResume) and runs it there, which is what fork_preempt_eval does. An earlier version of this
+   condition also required rt->current_stack_frame != NULL, which quietly wrote that exemption in; only
+   g_flow_base_gen == NULL is exempt, and that is baseline setup before any flow exists, exactly as for the
+   coroutine count. Bulk-counted first rather than asserted, so ONE corpus run reports the whole queue instead of
+   aborting at the first caller. */
+static uint64_t g_sync_drive_to_completion = 0;
 #define FLOW_PREEMPT_COUNT(c) __atomic_fetch_add(&(c), 1, __ATOMIC_RELAXED)
 void JS_FlowPreemptStats(uint64_t *requested, uint64_t *fired) {
     if (requested) *requested = __atomic_load_n(&g_flow_preempt_requested, __ATOMIC_RELAXED);
     if (fired)     *fired     = __atomic_load_n(&g_flow_preempt_fired, __ATOMIC_RELAXED);
 }
 uint64_t JS_DriveToCompletionCount(void) { return __atomic_load_n(&g_drive_to_completion, __ATOMIC_RELAXED); }
+uint64_t JS_SyncDriveToCompletionCount(void) { return __atomic_load_n(&g_sync_drive_to_completion, __ATOMIC_RELAXED); }
 
 /* Concolic branch arm + snapshot fork. The branch hook returns the arm (0/1), ORed with 0x100 when it forked
    a sibling here. On a fork we snapshot the CURRENT frame AT the OP_if (cond still on the stack) so the
@@ -23476,6 +23506,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                          argv, flags);
     }
     b = p->u.func.function_bytecode;
+
+    if (unlikely(g_flow_base_gen != NULL)) {
+        /* A BYTECODE BODY ENTERED BY C RECURSION while a flow exists. It cannot suspend: the scheduler has no way
+           to park it, so it runs to completion. See g_sync_drive_to_completion. */
+        FLOW_PREEMPT_COUNT(g_sync_drive_to_completion);
+    }
 
     if (unlikely(argc < b->arg_count || (flags & JS_CALL_FLAG_COPY_ARGV))) {
         arg_allocated_size = b->arg_count;
@@ -32147,14 +32183,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     else
                         obj = JS_UNDEFINED;
                     if (JS_IsString(obj)) {
-                        /* DIRECT eval: compile to a CLOSURE and run its body on THIS tramp chain, so a loop inside
-                           the eval'd program parks for the scheduler exactly like one in any other function. Running
-                           it via JS_CallFree would give it its own activation off the chain, where a back-edge
-                           preempt has no base to park into. */
-                        JSValue eclo = JS_EvalObject(ctx, JS_UNDEFINED, obj,
-                                                     JS_EVAL_TYPE_DIRECT | JS_EVAL_FLAG_TRAMP_CLOSURE, scope_idx);
+                        JSValue eclo = eval_direct_closure(ctx, obj, scope_idx);
                         if (unlikely(JS_IsException(eclo))) goto exception;
-                        DCHECK(tramp_body_is_plain(eclo), "direct eval closure is not a trampolinable bytecode function");
                         /* reshape [eval, args..] -> the plain-call shape [closure] with 0 args */
                         for (i = -1; i < call_argc; i++) JS_FreeValue(ctx, call_argv[i]);
                         sp = (JSValue *)call_argv;
@@ -32224,10 +32254,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     len = elen;
                 }
                 obj = (len >= 1) ? tab[0] : JS_UNDEFINED;
-                ret_val = JS_EvalObject(ctx, JS_UNDEFINED, obj, JS_EVAL_TYPE_DIRECT, scope_idx);
+                if (JS_IsString(obj)) {
+                    /* DIRECT eval, the SPREAD spelling — and it ran the eval'd program with JS_EvalObject's own
+                       JS_CallFree, i.e. by C recursion, while `eval(x)` a few opcodes up compiled to a CLOSURE and
+                       ran it on the tramp. One operation answering differently by how it was written is exactly what
+                       this file forbids, and the difference was invisible because the eval'd program only aborts if
+                       it happens to contain a loop. Same ROUTE and now the same CALL. */
+                    JSValue eclo = eval_direct_closure(ctx, obj, scope_idx);
+                    free_arg_list(ctx, tab, len);
+                    if (unlikely(JS_IsException(eclo))) goto exception;
+                    /* reshape [callee, array] -> the plain-call shape [closure] with 0 args */
+                    JS_FreeValue(ctx, sp[-2]);
+                    JS_FreeValue(ctx, sp[-1]);
+                    sp[-2] = eclo;
+                    sp--;
+                    call_argv = sp; call_argc = 0; tramp_first = -1; tramp_is_tail = 0;
+                    goto do_tramp_call;
+                }
+                ret_val = js_dup(obj);   /* a non-string direct eval yields its argument unchanged */
                 free_arg_list(ctx, tab, len);
-                if (unlikely(JS_IsException(ret_val)))
-                    goto exception;
                 JS_FreeValue(ctx, sp[-2]);
                 JS_FreeValue(ctx, sp[-1]);
                 sp -= 2;

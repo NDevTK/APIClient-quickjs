@@ -1293,6 +1293,7 @@ JS_EXTERN void     JS_FlowPreemptStats(uint64_t *requested, uint64_t *fired);
 /* DRIVE-TO-COMPLETION detector: total sites where a coroutine body ran to completion instead of suspend/resume on
    the tramp chain (a generator/async body driven off-tramp). 0 across a test262 corpus = pure suspend/resume. */
 JS_EXTERN uint64_t  JS_DriveToCompletionCount(void);
+JS_EXTERN uint64_t  JS_SyncDriveToCompletionCount(void);
 
 /* THE PUMP. A flow that preempts inside job-driven code (an async-generator body) parks here instead of
    re-queuing behind the job FIFO — re-queuing lets other microtasks run first and CHANGES observable

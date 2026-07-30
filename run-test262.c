@@ -2527,6 +2527,9 @@ int main(int argc, char **argv)
                tramp chain. 0 across the corpus = pure suspend/resume-at-any-depth; >0 names remaining bypasses. */
             fprintf(stderr, "DriveToCompletion: %llu (0 = pure suspend/resume; >0 = tests ran a coroutine to completion off-tramp)\n",
                     (unsigned long long)JS_DriveToCompletionCount());
+            fprintf(stderr, "SyncDriveToCompletion: %llu (0 = every bytecode body runs on the tramp; >0 = that many "
+                            "ran by C recursion below a live activation, unable to suspend)\n",
+                    (unsigned long long)JS_SyncDriveToCompletionCount());
         }
     }
 
