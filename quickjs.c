@@ -19608,7 +19608,8 @@ static int js_is_standard_regexp(JSContext *ctx, JSValueConst rx);
 static int string_indexof_char(JSString *p, int c, int from);
 static int64_t string_advance_index(JSString *p, int64_t idx, bool unicode);
 static JSValue JS_RegExpExec(JSContext *ctx, JSValueConst r, JSValueConst s);
-static int js_str_replace_step(JSContext *ctx, JSStrReplace *s, JSValue cb_result);
+static int js_str_replace_step(JSContext *ctx, JSStrReplace *s, JSValue cb_result,
+                               JSValue **out_cb, int *out_argc);
 static JSValue js_promise_constructor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv);
 static JSValue js_promise_new(JSContext *ctx, JSValueConst new_target, JSValue *resolving_funcs);
 /* WrapForValidIterator's [[Iterated]] record — defined HERE (not at its finalizer) because the interpreter builds
@@ -71859,20 +71860,35 @@ exception:
 
 
 
-/* 0 = DONE (s->result is the answer), 3 = CALL the replacer on the tramp, -1 = error.
-   Mirrors the C loop exactly, split at the one point where it re-enters JS. */
-static int js_str_replace_step(JSContext *ctx, JSStrReplace *s, JSValue cb_result)
+/* 0 = DONE (s->result is the answer), 3 = CALL the replacer on the tramp, 5 = ToString on its result, -1 = error.
+   Mirrors the C loop exactly, split at the points where it re-enters JS — of which there are TWO, not one.
+   22.1.3.19 states the replacer step as `? ToString(? Call(replaceValue, undefined, «searched, position,
+   string»))`: converting the CALL to a request left the ToString a JS_ToString from C, so a replacer returning
+   an object with a toString still ran that toString below the live flow. cb_pending now says WHICH of the two
+   is outstanding, because both suspend and the walk has to resume into the right one. */
+static int js_str_replace_step(JSContext *ctx, JSStrReplace *s, JSValue cb_result,
+                               JSValue **out_cb, int *out_argc)
 {
     JSString *sp = JS_VALUE_GET_STRING(s->str);
     JSString *searchp = JS_VALUE_GET_STRING(s->search_str);
 
     if (s->cb_pending) {
-        /* the replacer returned: ToString its result, then splice it in at the recorded position */
-        JSValue repl = JS_ToString(ctx, cb_result);
-        JS_FreeValue(ctx, cb_result);
+        /* the replacer returned: ToString its result AS A REQUEST, then splice it in at the recorded position */
+        JSValue repl = JS_UNDEFINED;
+        int r;
+        if (s->cb_pending == 1) {
+            s->cb_pending = 2;
+            /* step_tostring_run dups the operand into the header when it has to hold it across the coercion,
+               so this reference can be released either way. */
+            r = step_tostring_run(ctx, &s->hdr, cb_result, JS_UNDEFINED, &repl, out_cb, out_argc);
+            JS_FreeValue(ctx, cb_result);
+        } else {
+            DCHECK(s->cb_pending == 2, "the replace walk resumed with an unknown outstanding request");
+            r = step_tostring_run(ctx, &s->hdr, JS_UNDEFINED, cb_result, &repl, out_cb, out_argc);
+        }
+        if (r)
+            return r < 0 ? -1 : r;
         s->cb_pending = 0;
-        if (JS_IsException(repl))
-            return -1;
         string_buffer_concat(&s->b, sp, s->endOfLastMatch, s->pos);
         string_buffer_concat_value_free(&s->b, repl);
         s->endOfLastMatch = s->pos + searchp->len;
@@ -72104,8 +72120,9 @@ static int js_str_replace_vstep(JSContext *ctx, void *st, JSValue cb_result, JSV
         *out_cb = s->cb_args; *out_argc = 2;
         return 3;
     }
-    {   /* mode 0: the string-search walk, one match per step */
-        int r = js_str_replace_step(ctx, s, cb_result);
+    {   /* mode 0: the string-search walk, one match per step. The walk sets its OWN request buffer for a
+           ToString (step-code 5); only the replacer CALL uses the machine's cb_args. */
+        int r = js_str_replace_step(ctx, s, cb_result, out_cb, out_argc);
         if (r == 3) { *out_cb = s->cb_args; *out_argc = 3; }
         return r;
     }
