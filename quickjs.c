@@ -19730,7 +19730,7 @@ typedef struct JSConsumeGetIter { void *consumer; uint8_t consumer_kind; } JSCon
    coercion carrying it is a site that was never given a resume point, and the delivery DFAILs on it. */
 enum { TPR_NONE = 0, TPR_ARITH_AFTER_LEFT, TPR_ARITH_AFTER_RIGHT, TPR_ADD_AFTER_COERCE,
        TPR_PROPKEY, TPR_PROPKEY2, TPR_IN, TPR_DELETE, TPR_GET_ARRAY_EL, TPR_GET_ARRAY_EL2,
-       TPR_GET_SUPER, TPR_PUT_SUPER, TPR_DEFINE_METHOD, TPR_PUT_ARRAY_EL_KEY, TPR_PUT_ARRAY_EL_VAL,
+       TPR_GET_SUPER, TPR_PUT_SUPER, TPR_DEFINE_METHOD, TPR_PUT_ARRAY_EL_KEY,
        TPR_UNARY_AFTER_COERCE, TPR_LOGIC_AFTER_LEFT, TPR_LOGIC_AFTER_RIGHT, TPR_CMP_AFTER_COERCE,
        TPR_IMPORT, TPR_UNARY_LOC_AFTER_COERCE };
 typedef struct JSToPrim {
@@ -27097,7 +27097,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (rat == TPR_PUT_SUPER) goto do_put_super_after_key;
                         if (rat == TPR_DEFINE_METHOD) goto do_define_method_after_key;
                         if (rat == TPR_PUT_ARRAY_EL_KEY) goto do_put_array_el_after_key;
-                        if (rat == TPR_PUT_ARRAY_EL_VAL) goto do_put_array_el_after_value;
                         if (rat == TPR_UNARY_AFTER_COERCE) goto do_unary_after_coerce;
                         if (rat == TPR_LOGIC_AFTER_LEFT) goto do_logic_after_left;
                         if (rat == TPR_LOGIC_AFTER_RIGHT) goto do_logic_after_right;
@@ -34692,17 +34691,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
 
-        value_tonum_toprim:
-            /* 10.4.5.5 [[Set]] -> 10.4.5.16 TypedArraySetElement step 1: a write through a TypedArray's canonical
-               numeric index coerces V with ToNumber (ToBigInt for the 64-bit classes) BEFORE the bounds test, and
-               for an OBJECT V that is the page's @@toPrimitive/valueOf. Every C write site reached it through
-               JS_ToNumberFree, so `ta[0] = {valueOf(){ while(x){} }}` preempted in an activation with no flow base
-               — and so did every builtin that fills a TypedArray from user values, since they all end at this same
-               [[Set]]. Coerce on the tramp and CONTINUE at the site's resume label with V primitive, so the
-               ToNumber inside [[Set]] runs nothing. Entered with tp_slot naming the VALUE operand. */
-            tp_hint = HINT_NUMBER;
-            goto do_toprim_tramp;
-
         key_toprim:
             /* ToPropertyKey (7.1.19) on an OBJECT key runs the page's @@toPrimitive/valueOf/toString, and every
                interpreter site that needs a key reached it through JS_ValueToAtom — from C, so a loop in that
@@ -35047,12 +35035,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                different route on the second pass than the pass that suspended was on. This opcode is the one with
                TWO coercions, and their ORDER is observable — resuming here rather than at the opcode byte is also
                what keeps the value coercion below from being reached twice. */
-                /* ToPropertyKey first (above), then the TypedArray element coercion — spec order, and the key must
-                   be a primitive before it can be tested for a canonical numeric index. */
-                if (ta_write_needs_toprim(ctx, sp[-3], sp[-2], sp[-1])) { tp_slot = -1; tp_op_byte = pc - 1;
-                                                            tp_resume_at = TPR_PUT_ARRAY_EL_VAL; goto value_tonum_toprim; }
-        do_put_array_el_after_value:
-            /* THE VALUE'S RESUME POINT: 10.4.5.16 step 1's ToNumber is done, so the write itself continues. */
                 /* A computed key that resolves to a bytecode setter -> route as a 1-arg method call so the
                    setter body preempts. */
                 /* the base is not an object: a PRIMITIVE one still walks its prototype (tramp_walk_base), and
@@ -35080,6 +35062,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JSAtom katom = JS_ValueToAtom(ctx, sp[-2]);
                     if (unlikely(katom == JS_ATOM_NULL))
                         goto exception;
+                    if (unlikely(ta_atom_write_needs_toprim(ctx, sp[-3], JS_UNINITIALIZED, katom, sp[-1]))) {
+                        /* `ta[i] = obj`: 10.4.5.16 step 1's ToNumber/ToBigInt on V is the page's code, and the
+                           opcode used to coerce it inline and then take its own JS_SetPropertyValue tail — so
+                           the same question was asked in two places, here and at the keyed entry that every C
+                           caller reaches. The whole write is the entry's request now, exactly as the `length`
+                           spelling below already was, and the inline coercion goes with it. */
+                        JSOpKeyed *ok = js_mallocz(ctx, sizeof(*ok));
+                        if (unlikely(!ok)) { JS_FreeAtom(ctx, katom); JS_ThrowOutOfMemory(ctx); goto exception; }
+                        ok->atom = katom; ok->pop = 3; ok->push = 0;
+                        gp_obj = sp[-3]; gp_atom = ok->atom; gp_op = GP_SET; gp_val = sp[-1];
+                        gp_recv = JS_UNINITIALIZED; gp_no_throw = !sf->is_strict_mode;
+                        gp_outer = ok; gp_outer_kind = CONT_OP_KEYED;
+                        goto do_getprop_tramp;
+                    }
                     if (unlikely(arr_len_write_needs_toprim(sp[-3], katom, sp[-1]))) {
                         /* `a[k] = obj` where k resolves to `length`: 10.4.2.4 coerces V TWICE, which is the one
                            thing the coerce-then-resume idiom above cannot express, so the whole write becomes
