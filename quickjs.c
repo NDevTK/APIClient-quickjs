@@ -19914,6 +19914,23 @@ static bool arg_list_is_fast(JSContext *ctx, JSValueConst src, uint32_t *plen)
     return true;
 }
 
+/* The fast answer itself, so the two sites that ask arg_list_is_fast do not each spell the loop. NULL = threw
+   (the argument-count floor, or OOM). */
+static JSValue *arg_list_fast_build(JSContext *ctx, JSValueConst src, uint32_t len)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(src);
+    JSValue *tab;
+    uint32_t k;
+    if (unlikely(len > JS_MAX_LOCAL_VARS)) {
+        JS_ThrowRangeError(ctx, "too many arguments in function call (only %d allowed)", JS_MAX_LOCAL_VARS);
+        return NULL;
+    }
+    tab = js_mallocz(ctx, sizeof(JSValue) * (size_t)max_uint32(1, len));   /* avoid allocating 0 bytes */
+    if (unlikely(!tab)) { JS_ThrowOutOfMemory(ctx); return NULL; }
+    for (k = 0; k < len; k++) tab[k] = js_dup(p->u.array.u.values[k]);
+    return tab;
+}
+
 static void js_setmap_ctor_free(JSContext *ctx, JSSetMapCtor *sc)
 {
     if (sc->consume) { js_iter_consume_end(ctx, sc->consume); js_free_rt(ctx->rt, sc->consume); }
@@ -24141,16 +24158,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         }
                         if (atag == JS_TAG_OBJECT) {
                             /* a FAST array answers without invoking anything — the same list, no request. */
-                            JSObject *fp7 = JS_VALUE_GET_OBJ(carr);
-                            uint32_t fk7;
-                            if (unlikely(alen7 > JS_MAX_LOCAL_VARS)) {
-                                JS_ThrowRangeError(ctx, "too many arguments in function call (only %d allowed)",
-                                                   JS_MAX_LOCAL_VARS);
-                                goto exception;
-                            }
-                            atab7 = js_mallocz(ctx, sizeof(JSValue) * (size_t)max_uint32(1, alen7));
-                            if (unlikely(!atab7)) { JS_ThrowOutOfMemory(ctx); goto exception; }
-                            for (fk7 = 0; fk7 < alen7; fk7++) atab7[fk7] = js_dup(fp7->u.array.u.values[fk7]);
+                            atab7 = arg_list_fast_build(ctx, carr, alen7);
+                            if (unlikely(!atab7)) goto exception;
                         }
                         /* WHAT the target is stays the dispatch's question, not this site's: asking it here is
                            the per-construct-shape predicate the ratchet bans, and every arm the site failed to
@@ -25088,16 +25097,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         JS_ThrowTypeError(ctx, "not a object");   /* 19.2.3.1 step 2 */
                         goto exception;
                     } else if (arg_list_is_fast(ctx, arrayArg, &fastlen)) {
-                        JSObject *fp = JS_VALUE_GET_OBJ(arrayArg);
-                        uint32_t fk;
-                        if (unlikely(fastlen > JS_MAX_LOCAL_VARS)) {
-                            JS_ThrowRangeError(ctx, "too many arguments in function call (only %d allowed)",
-                                               JS_MAX_LOCAL_VARS);
-                            goto exception;
-                        }
-                        ap_list = js_mallocz(ctx, sizeof(JSValue) * (size_t)max_uint32(1, fastlen));
-                        if (unlikely(!ap_list)) { JS_ThrowOutOfMemory(ctx); goto exception; }
-                        for (fk = 0; fk < fastlen; fk++) ap_list[fk] = js_dup(fp->u.array.u.values[fk]);
+                        ap_list = arg_list_fast_build(ctx, arrayArg, fastlen);
+                        if (unlikely(!ap_list)) goto exception;
                         ap_list_n = (int)fastlen;
                     } else {
                         JSArgList *agl = js_mallocz(ctx, sizeof(*agl));
