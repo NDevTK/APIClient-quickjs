@@ -9252,6 +9252,9 @@ static JSValue js_bytecode_autoinit(JSContext *ctx, JSObject *p, JSAtom atom,
                 JS_NewCFunctionMagic(ctx, NULL, "Object.defineProperty", 3,
                                      JS_CFUNC_step, STEPDEF_OBJ_DEFINEPROPERTY),
                 JS_AtomToValue(ctx, JS_ATOM_Symbol_iterator),
+                /* LengthOfArrayLike's truncation. Passed in rather than reached through the global Math so a
+                   page that replaces Math.floor cannot change what the builtin computes. */
+                JS_NewCFunctionMagic(ctx, NULL, "floor", 1, JS_CFUNC_step, STEPDEF_MATH_FLOOR),
             };
             return js_bytecode_eval(ctx, qjsc_builtin_array_fromasync,
                                     sizeof(qjsc_builtin_array_fromasync),

@@ -1,4 +1,4 @@
-;(function(Array, TypeError, Symbol·asyncIterator, Object·defineProperty, Symbol·iterator) {
+;(function(Array, TypeError, Symbol·asyncIterator, Object·defineProperty, Symbol·iterator, Math·floor) {
     "use strict" // result.length=i should throw if .length is not writable
     return async function fromAsync(arrayLike, mapFn=undefined, thisArg=undefined) {
         if (mapFn !== undefined && typeof mapFn !== "function") throw new TypeError("not a function")
@@ -7,13 +7,17 @@
         if (method == null) sync = true, method = arrayLike[Symbol·iterator]
         if (method == null) {
             let {length} = arrayLike
-            length = +length || 0
+            // 7.1.20 LengthOfArrayLike is ToLength, not `+x || 0`: it TRUNCATES toward zero and CLAMPS to
+            // [0, 2**53-1]. `+x || 0` left -3 and 2.7 alone, and Array(-3) / Array(2.7) then threw a RangeError
+            // where the spec yields [] and a length-2 array.
+            length = Math·floor(+length)
+            length = length !== length || length <= 0 ? 0 : length > 9007199254740991 ? 9007199254740991 : length
             result = isConstructor ? new this(length) : Array(length)
             while (i < length) {
                 let value = arrayLike[i]
                 if (sync) value = await value
                 if (mapFn) value = await mapFn.call(thisArg, value, i)
-                Object·defineProperty(result, i++, {value, configurable: true, writable: true})
+                Object·defineProperty(result, i++, {value, configurable: true, writable: true, enumerable: true})
             }
         } else {
             const iter = method.call(arrayLike)
@@ -24,7 +28,7 @@
                     if (done) break
                     if (sync) value = await value
                     if (mapFn) value = await mapFn.call(thisArg, value, i)
-                    Object·defineProperty(result, i++, {value, configurable: true, writable: true})
+                    Object·defineProperty(result, i++, {value, configurable: true, writable: true, enumerable: true})
                 }
             } finally {
                 if (iter.return) iter.return()
