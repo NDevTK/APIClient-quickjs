@@ -617,6 +617,12 @@ struct JSContext {
        unwind — the completion the drain restores is always the one the first failure raised. */
     JSValue *pending_close_iters;
     int pending_close_n, pending_close_cap;
+    /* A module-import resolution WALK is in progress on this context. Resolving a module's imports LOADS them, and
+       the embedder's loader compiles each one, which resolves ITS imports — so the walk recursed OUT through the
+       loader and back in, and the module graph's depth became the C stack's. The walk is an explicit frame stack
+       now; this flag is what makes the re-entrant call from the loader a no-op, because the outer walk sees the
+       freshly loaded module through rme->module and descends into it at exactly the point the recursion did. */
+    bool module_resolving;
     /* A KEYED-OPERATION continuation whose unwind only the interpreter can perform, parked by an abandon walk that
        reached it from OUTSIDE the interpreter. The two teardown walks are mutually recursive — getprop_throw and
        do_getprop_abandon hand a CONT_TOPRIM_GET link to js_toprim_abandon, and a coercion requested BY a keyed
@@ -3110,6 +3116,7 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
     ctx->promise_ctor = JS_NULL;
     ctx->error_ctor = JS_NULL;
     ctx->error_back_trace = JS_UNDEFINED;
+    ctx->module_resolving = false;
     ctx->pending_close_iters = NULL;
     ctx->pending_close_n = 0;
     ctx->pending_close_cap = 0;
@@ -48202,35 +48209,77 @@ static void js_module_reexport_imported_bindings(JSContext *ctx, JSModuleDef *m,
     }
 }
 
+/* Resolve a module's imports, and theirs, as an EXPLICIT FRAME STACK. The recursion this replaces went OUT through
+   the embedder — resolve loads a module, the loader compiles it, compiling resolves its imports — so a deep import
+   chain exhausted the C stack and surfaced as the PARSER's "Maximum call stack size exceeded". A module graph is
+   the page's data and its depth is not the C stack's business; nothing caps this walk.
+   The ORDER is the recursion's exactly: a child is descended into immediately after it is loaded, before the
+   parent's next import, which is where the recursive call sat. The re-entrant call the loader makes is a no-op —
+   the outer walk sees the loaded module through rme->module and pushes it itself. */
+typedef struct JSModuleResolveFrame {
+    JSModuleDef *m;
+    int i;              /* cursor over m->req_module_entries */
+} JSModuleResolveFrame;
+
 static int js_resolve_module(JSContext *ctx, JSModuleDef *m)
 {
-    int i;
-    JSModuleDef *m1;
+    JSModuleResolveFrame *frames = NULL;
+    int depth = 0, cap = 0, ret = -1;
 
     if (m->resolved)
         return 0;
-#ifdef ENABLE_DUMPS // JS_DUMP_MODULE_RESOLVE
-    if (check_dump_flag(ctx->rt, JS_DUMP_MODULE_RESOLVE)) {
-        char buf1[ATOM_GET_STR_BUF_SIZE];
-        printf("resolving module '%s':\n", JS_AtomGetStr(ctx, buf1, sizeof(buf1), m->module_name));
-    }
-#endif
+    if (ctx->module_resolving)
+        return 0;   /* re-entered from the loader: the walk below owns this module */
+    ctx->module_resolving = true;
     m->resolved = true;
-    /* resolve each requested module */
-    for(i = 0; i < m->req_module_entries_count; i++) {
-        JSReqModuleEntry *rme = &m->req_module_entries[i];
-        m1 = js_host_resolve_imported_module_atom(ctx, m->module_name,
-                                                  rme->module_name,
-                                                  rme->attributes);
-        if (!m1)
-            return -1;
-        rme->module = m1;
-        /* already done in js_host_resolve_imported_module() except if
-           the module was loaded with JS_EvalBinary() */
-        if (js_resolve_module(ctx, m1) < 0)
-            return -1;
+    for (;;) {
+        JSModuleResolveFrame *f;
+        if (depth == cap) {
+            int ncap = cap ? cap * 2 : 8;
+            JSModuleResolveFrame *nf = js_realloc(ctx, frames, sizeof(*nf) * (size_t)ncap);
+            if (unlikely(!nf))
+                goto done;
+            frames = nf;
+            cap = ncap;
+        }
+#ifdef ENABLE_DUMPS // JS_DUMP_MODULE_RESOLVE
+        if (check_dump_flag(ctx->rt, JS_DUMP_MODULE_RESOLVE)) {
+            char buf1[ATOM_GET_STR_BUF_SIZE];
+            printf("resolving module '%s':\n", JS_AtomGetStr(ctx, buf1, sizeof(buf1), m->module_name));
+        }
+#endif
+        frames[depth].m = m;
+        frames[depth].i = 0;
+        depth++;
+        for (;;) {
+            JSModuleDef *m1;
+            JSReqModuleEntry *rme;
+            f = &frames[depth - 1];
+            if (f->i >= f->m->req_module_entries_count) {
+                depth--;
+                if (depth == 0) { ret = 0; goto done; }
+                continue;
+            }
+            rme = &f->m->req_module_entries[f->i];
+            f->i++;
+            m1 = js_host_resolve_imported_module_atom(ctx, f->m->module_name, rme->module_name, rme->attributes);
+            if (!m1)
+                goto done;
+            rme->module = m1;
+            /* js_host_resolve_imported_module() normally resolves as it loads; it cannot while this walk owns the
+               resolution, and a module loaded with JS_EvalBinary() was never resolved there either. Both are the
+               same case now: an unresolved child is descended into here. */
+            if (!m1->resolved) {
+                m1->resolved = true;
+                m = m1;
+                break;   /* push a frame for m1 */
+            }
+        }
     }
-    return 0;
+ done:
+    ctx->module_resolving = false;
+    js_free(ctx, frames);
+    return ret;
 }
 
 static JSVarRef *js_create_module_var(JSContext *ctx, bool is_lexical)
@@ -48303,14 +48352,13 @@ static int js_create_module_bytecode_function(JSContext *ctx, JSModuleDef *m)
 }
 
 /* must be done before js_link_module() because of cyclic references */
-static int js_create_module_function(JSContext *ctx, JSModuleDef *m)
+/* Create ONE module's function and exported variable slots. The walk over the dependency graph is
+   js_create_module_function below; this half creates nothing recursively and runs no user code. */
+static int js_create_module_function_one(JSContext *ctx, JSModuleDef *m)
 {
     bool is_c_module;
     int i;
     JSVarRef *var_ref;
-
-    if (m->func_created)
-        return 0;
 
     is_c_module = (m->init_func != NULL);
 
@@ -48329,24 +48377,54 @@ static int js_create_module_function(JSContext *ctx, JSModuleDef *m)
         if (js_create_module_bytecode_function(ctx, m))
             return -1;
     }
-    m->func_created = true;
-
-    /* do it on the dependencies */
-
-    for(i = 0; i < m->req_module_entries_count; i++) {
-        JSReqModuleEntry *rme = &m->req_module_entries[i];
-        if (js_create_module_function(ctx, rme->module) < 0)
-            return -1;
-    }
-
     return 0;
+}
+
+/* The dependency walk, as an explicit stack. It recursed with NO overflow guard at all, so a deep module graph did
+   not even get an error: 32649 frames of js_create_module_function and then a SEGFAULT inside malloc. Children are
+   pushed in reverse so the visit order is the recursion's pre-order exactly; nothing here runs user code, so the
+   order is not observable, but a conversion that changes what it does not have to is harder to trust. */
+static int js_create_module_function(JSContext *ctx, JSModuleDef *m)
+{
+    JSModuleDef **stack = NULL;
+    int depth = 0, cap = 0, ret = -1, i;
+
+    if (m->func_created)
+        return 0;
+    for (;;) {
+        if (js_create_module_function_one(ctx, m) < 0)
+            goto done;
+        m->func_created = true;
+        if (depth + m->req_module_entries_count > cap) {
+            int ncap = cap ? cap * 2 : 16;
+            JSModuleDef **ns;
+            while (ncap < depth + m->req_module_entries_count)
+                ncap *= 2;
+            ns = js_realloc(ctx, stack, sizeof(*ns) * (size_t)ncap);
+            if (unlikely(!ns))
+                goto done;
+            stack = ns;
+            cap = ncap;
+        }
+        for (i = m->req_module_entries_count - 1; i >= 0; i--)
+            stack[depth++] = m->req_module_entries[i].module;
+        do {
+            if (depth == 0) { ret = 0; goto done; }
+            m = stack[--depth];
+        } while (m->func_created);
+    }
+ done:
+    js_free(ctx, stack);
+    return ret;
 }
 
 
 /* Prepare a module to be executed by resolving all the imported
    variables. */
-static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
-                                   JSModuleDef **pstack_top, int index)
+/* THE POST-ORDER half of InnerModuleLinking (16.2.1.5.2 steps 9-11): the indirect-export check, the import
+   resolution, and the `initialize the global variables` call. It is its own function because the WALK around it is
+   no longer C recursion — see js_inner_module_linking below. */
+static int js_module_linking_finish(JSContext *ctx, JSModuleDef *m, JSModuleDef **pstack_top)
 {
     int i;
     JSImportEntry *mi;
@@ -48355,49 +48433,6 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
     JSObject *p;
     bool is_c_module;
     JSValue ret_val;
-
-    if (js_check_stack_overflow(ctx->rt, 0)) {
-        JS_ThrowStackOverflow(ctx);
-        return -1;
-    }
-
-#ifdef ENABLE_DUMPS // JS_DUMP_MODULE_RESOLVE
-    if (check_dump_flag(ctx->rt, JS_DUMP_MODULE_RESOLVE)) {
-        char buf1[ATOM_GET_STR_BUF_SIZE];
-        printf("js_inner_module_linking '%s':\n", JS_AtomGetStr(ctx, buf1, sizeof(buf1), m->module_name));
-    }
-#endif
-
-    if (m->status == JS_MODULE_STATUS_LINKING ||
-        m->status == JS_MODULE_STATUS_LINKED ||
-        m->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
-        m->status == JS_MODULE_STATUS_EVALUATED)
-        return index;
-
-    assert(m->status == JS_MODULE_STATUS_UNLINKED);
-    m->status = JS_MODULE_STATUS_LINKING;
-    m->dfs_index = index;
-    m->dfs_ancestor_index = index;
-    index++;
-    /* push 'm' on stack */
-    m->stack_prev = *pstack_top;
-    *pstack_top = m;
-
-    for(i = 0; i < m->req_module_entries_count; i++) {
-        JSReqModuleEntry *rme = &m->req_module_entries[i];
-        m1 = rme->module;
-        index = js_inner_module_linking(ctx, m1, pstack_top, index);
-        if (index < 0)
-            goto fail;
-        assert(m1->status == JS_MODULE_STATUS_LINKING ||
-               m1->status == JS_MODULE_STATUS_LINKED ||
-               m1->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
-               m1->status == JS_MODULE_STATUS_EVALUATED);
-        if (m1->status == JS_MODULE_STATUS_LINKING) {
-            m->dfs_ancestor_index = min_int(m->dfs_ancestor_index,
-                                            m1->dfs_ancestor_index);
-        }
-    }
 
 #ifdef ENABLE_DUMPS // JS_DUMP_MODULE_RESOLVE
     if (check_dump_flag(ctx->rt, JS_DUMP_MODULE_RESOLVE)) {
@@ -48549,9 +48584,120 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
         printf("js_inner_module_linking done\n");
     }
 #endif
-    return index;
+    return 0;
  fail:
     return -1;
+}
+
+/* 16.2.1.5.2 InnerModuleLinking, as an EXPLICIT WORKLIST rather than C recursion. Two things were wrong with the
+   recursive form and only one of them is about depth.
+     The DEPTH: it opened with js_check_stack_overflow and a JS_ThrowStackOverflow, so a module graph deeper than
+   the C stack failed with a synthetic error. That is a BOUND on the input, which this engine does not have — the
+   whole point of the heap trampoline is that nesting is not the C stack's business — and a graph is data, so its
+   depth is the page's to choose. The frame array grows; nothing caps it.
+     The SUSPENSION: step 9's InitializeEnvironment ends in `JS_Call(m->func_obj, JS_TRUE)`, which runs the module
+   body's `OP_push_this; OP_if_false` prologue — a BYTECODE BODY entered by C recursion below a live flow, and the
+   largest single contributor to SyncDriveToCompletion. A C-recursive walk can never park, so it could not be
+   routed at all while the recursion stood; flattening it is that conversion's prerequisite and not a substitute
+   for it. The call is still made from C here, and still counted.
+     The traversal is Tarjan's, unchanged: `index` and the dfs/ancestor indices are threaded exactly as the
+   recursion threaded them, and the parent's ancestor-index minimum is taken after a child is entered (the
+   already-visited case) or finished (the recursed case), which is where the recursive form took it. */
+typedef struct JSModuleLinkFrame {
+    JSModuleDef *m;
+    int i;              /* cursor over m->req_module_entries: which child comes next */
+} JSModuleLinkFrame;
+
+/* the PRE-ORDER half (steps 3-7): claim the module, number it, push it on the SCC stack. Returns the new index, or
+   -1 when the module needs no visit at all — which is the recursive form's early `return index`. */
+static int js_module_linking_enter(JSModuleDef *m, JSModuleDef **pstack_top, int index)
+{
+    if (m->status == JS_MODULE_STATUS_LINKING ||
+        m->status == JS_MODULE_STATUS_LINKED ||
+        m->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
+        m->status == JS_MODULE_STATUS_EVALUATED)
+        return -1;
+    assert(m->status == JS_MODULE_STATUS_UNLINKED);
+    m->status = JS_MODULE_STATUS_LINKING;
+    m->dfs_index = index;
+    m->dfs_ancestor_index = index;
+    /* push 'm' on stack */
+    m->stack_prev = *pstack_top;
+    *pstack_top = m;
+    return index + 1;
+}
+
+static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
+                                   JSModuleDef **pstack_top, int index)
+{
+    JSModuleLinkFrame *frames = NULL;
+    int depth = 0, cap = 0, ret = -1, nindex;
+
+#ifdef ENABLE_DUMPS // JS_DUMP_MODULE_RESOLVE
+    if (check_dump_flag(ctx->rt, JS_DUMP_MODULE_RESOLVE)) {
+        char buf1[ATOM_GET_STR_BUF_SIZE];
+        printf("js_inner_module_linking '%s':\n", JS_AtomGetStr(ctx, buf1, sizeof(buf1), m->module_name));
+    }
+#endif
+
+    nindex = js_module_linking_enter(m, pstack_top, index);
+    if (nindex < 0)
+        return index;                      /* already linking or linked: nothing to walk */
+    index = nindex;
+    for (;;) {
+        JSModuleLinkFrame *f;
+        if (depth == cap) {
+            int ncap = cap ? cap * 2 : 8;
+            JSModuleLinkFrame *nf = js_realloc(ctx, frames, sizeof(*nf) * (size_t)ncap);
+            if (unlikely(!nf))
+                goto done;
+            frames = nf;
+            cap = ncap;
+        }
+        frames[depth].m = m;
+        frames[depth].i = 0;
+        depth++;
+    descend:
+        f = &frames[depth - 1];
+        while (f->i < f->m->req_module_entries_count) {
+            JSModuleDef *m1 = f->m->req_module_entries[f->i].module;
+            f->i++;
+            nindex = js_module_linking_enter(m1, pstack_top, index);
+            if (nindex < 0) {
+                /* already visited: take the minimum the recursive form took on return */
+                if (m1->status == JS_MODULE_STATUS_LINKING)
+                    f->m->dfs_ancestor_index = min_int(f->m->dfs_ancestor_index, m1->dfs_ancestor_index);
+                continue;
+            }
+            index = nindex;
+            m = m1;                        /* descend: a frame for m1 goes on top */
+            goto push;
+        }
+        /* every child is done, so this module's post-order half runs */
+        if (js_module_linking_finish(ctx, f->m, pstack_top) < 0)
+            goto done;
+        depth--;
+        if (depth == 0) {
+            ret = index;                   /* the root finished */
+            goto done;
+        }
+        {
+            JSModuleDef *child = f->m;
+            JSModuleLinkFrame *pf = &frames[depth - 1];
+            assert(child->status == JS_MODULE_STATUS_LINKING ||
+                   child->status == JS_MODULE_STATUS_LINKED ||
+                   child->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
+                   child->status == JS_MODULE_STATUS_EVALUATED);
+            if (child->status == JS_MODULE_STATUS_LINKING)
+                pf->m->dfs_ancestor_index = min_int(pf->m->dfs_ancestor_index, child->dfs_ancestor_index);
+        }
+        goto descend;
+    push:
+        continue;
+    }
+ done:
+    js_free(ctx, frames);
+    return ret;
 }
 
 /* Prepare a module to be executed by resolving all the imported
@@ -49210,81 +49356,11 @@ fail:
 
 /* spec: InnerModuleEvaluation. Return (index, JS_UNDEFINED) or (-1,
    exception) */
-static int js_inner_module_evaluation(JSContext *ctx, JSModuleDef *m,
-                                      int index, JSModuleDef **pstack_top,
-                                      JSValue *pvalue)
+/* 16.2.1.5.3 InnerModuleEvaluation, split so the WALK around it is an explicit frame stack rather than C
+   recursion — see js_inner_module_evaluation below. This is its POST-ORDER half (steps 12-16). */
+static int js_module_eval_finish(JSContext *ctx, JSModuleDef *m, JSModuleDef **pstack_top, JSValue *pvalue)
 {
     JSModuleDef *m1;
-    int i;
-
-    if (js_check_stack_overflow(ctx->rt, 0)) {
-        JS_ThrowStackOverflow(ctx);
-        *pvalue = JS_GetException(ctx);
-        return -1;
-    }
-
-#ifdef ENABLE_DUMPS // JS_DUMP_MODULE_RESOLVE
-    if (check_dump_flag(ctx->rt, JS_DUMP_MODULE_RESOLVE)) {
-        char buf1[ATOM_GET_STR_BUF_SIZE];
-        printf("js_inner_module_evaluation '%s':\n", JS_AtomGetStr(ctx, buf1, sizeof(buf1), m->module_name));
-    }
-#endif
-
-    if (m->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
-        m->status == JS_MODULE_STATUS_EVALUATED) {
-        if (m->eval_has_exception) {
-            *pvalue = js_dup(m->eval_exception);
-            return -1;
-        } else {
-            *pvalue = JS_UNDEFINED;
-            return index;
-        }
-    }
-    if (m->status == JS_MODULE_STATUS_EVALUATING) {
-        *pvalue = JS_UNDEFINED;
-        return index;
-    }
-    assert(m->status == JS_MODULE_STATUS_LINKED);
-
-    m->status = JS_MODULE_STATUS_EVALUATING;
-    m->dfs_index = index;
-    m->dfs_ancestor_index = index;
-    m->pending_async_dependencies = 0;
-    index++;
-    /* push 'm' on stack */
-    m->stack_prev = *pstack_top;
-    *pstack_top = m;
-
-    for(i = 0; i < m->req_module_entries_count; i++) {
-        JSReqModuleEntry *rme = &m->req_module_entries[i];
-        m1 = rme->module;
-        index = js_inner_module_evaluation(ctx, m1, index, pstack_top, pvalue);
-        if (index < 0)
-            return -1;
-        assert(m1->status == JS_MODULE_STATUS_EVALUATING ||
-               m1->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
-               m1->status == JS_MODULE_STATUS_EVALUATED);
-        if (m1->status == JS_MODULE_STATUS_EVALUATING) {
-            m->dfs_ancestor_index = min_int(m->dfs_ancestor_index,
-                                            m1->dfs_ancestor_index);
-        } else {
-            m1 = m1->cycle_root;
-            assert(m1->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
-                   m1->status == JS_MODULE_STATUS_EVALUATED);
-            if (m1->eval_has_exception) {
-                *pvalue = js_dup(m1->eval_exception);
-                return -1;
-            }
-        }
-        if (m1->async_evaluation) {
-            m->pending_async_dependencies++;
-            if (js_resize_array(ctx, (void **)&m1->async_parent_modules, sizeof(m1->async_parent_modules[0]), &m1->async_parent_modules_size, m1->async_parent_modules_count + 1)) {
-                *pvalue = JS_GetException(ctx);
-                return -1;
-            }
-            m1->async_parent_modules[m1->async_parent_modules_count++] = m;
-        }
-    }
 
     if (m->pending_async_dependencies > 0) {
         assert(!m->async_evaluation);
@@ -49325,7 +49401,130 @@ static int js_inner_module_evaluation(JSContext *ctx, JSModuleDef *m,
         }
     }
     *pvalue = JS_UNDEFINED;
-    return index;
+    return 0;
+}
+
+/* Steps 11.b-11.d: what the parent does once a child has been entered (already evaluating) or finished. It is its
+   own function because the flattened walk reaches it from two places — a child that needed no visit, and a child
+   whose frame has just been popped — which is the one point the recursion reached it from. */
+static int js_module_eval_after_child(JSContext *ctx, JSModuleDef *m, JSModuleDef *m1, JSValue *pvalue)
+{
+    assert(m1->status == JS_MODULE_STATUS_EVALUATING ||
+           m1->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
+           m1->status == JS_MODULE_STATUS_EVALUATED);
+    if (m1->status == JS_MODULE_STATUS_EVALUATING) {
+        m->dfs_ancestor_index = min_int(m->dfs_ancestor_index,
+                            m1->dfs_ancestor_index);
+    } else {
+        m1 = m1->cycle_root;
+        assert(m1->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
+           m1->status == JS_MODULE_STATUS_EVALUATED);
+        if (m1->eval_has_exception) {
+        *pvalue = js_dup(m1->eval_exception);
+        return -1;
+        }
+    }
+    if (m1->async_evaluation) {
+        m->pending_async_dependencies++;
+        if (js_resize_array(ctx, (void **)&m1->async_parent_modules, sizeof(m1->async_parent_modules[0]), &m1->async_parent_modules_size, m1->async_parent_modules_count + 1)) {
+        *pvalue = JS_GetException(ctx);
+        return -1;
+        }
+        m1->async_parent_modules[m1->async_parent_modules_count++] = m;
+    }
+    return 0;
+}
+
+/* The PRE-ORDER half (steps 4-10). *pdid says whether a frame is owed: a module already evaluating or evaluated
+   needs no visit, which is the recursion's early return. */
+static int js_module_eval_enter(JSContext *ctx, JSModuleDef *m, int index, JSModuleDef **pstack_top,
+                                JSValue *pvalue, int *pdid)
+{
+    *pdid = 0;
+    *pvalue = JS_UNDEFINED;
+#ifdef ENABLE_DUMPS // JS_DUMP_MODULE_RESOLVE
+    if (check_dump_flag(ctx->rt, JS_DUMP_MODULE_RESOLVE)) {
+        char buf1[ATOM_GET_STR_BUF_SIZE];
+        printf("js_inner_module_evaluation '%s':\n", JS_AtomGetStr(ctx, buf1, sizeof(buf1), m->module_name));
+    }
+#endif
+    if (m->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
+        m->status == JS_MODULE_STATUS_EVALUATED) {
+        if (m->eval_has_exception) {
+            *pvalue = js_dup(m->eval_exception);
+            return -1;
+        }
+        return index;
+    }
+    if (m->status == JS_MODULE_STATUS_EVALUATING)
+        return index;
+    assert(m->status == JS_MODULE_STATUS_LINKED);
+    m->status = JS_MODULE_STATUS_EVALUATING;
+    m->dfs_index = index;
+    m->dfs_ancestor_index = index;
+    m->pending_async_dependencies = 0;
+    /* push 'm' on stack */
+    m->stack_prev = *pstack_top;
+    *pstack_top = m;
+    *pdid = 1;
+    return index + 1;
+}
+
+/* The walk. It recursed with a js_check_stack_overflow guard, so a module graph deeper than the C stack failed
+   with a synthetic RangeError — a BOUND on the page's own data, which this engine does not have. Nothing caps the
+   frame array. The traversal is unchanged: `index`, the dfs/ancestor indices and the per-child bookkeeping are
+   threaded exactly where the recursion threaded them. */
+typedef struct JSModuleEvalFrame {
+    JSModuleDef *m;
+    int i;              /* cursor over m->req_module_entries */
+} JSModuleEvalFrame;
+
+static int js_inner_module_evaluation(JSContext *ctx, JSModuleDef *m,
+                                      int index, JSModuleDef **pstack_top,
+                                      JSValue *pvalue)
+{
+    JSModuleEvalFrame *frames = NULL;
+    int depth = 0, cap = 0, ret = -1, did = 0, nindex;
+
+    nindex = js_module_eval_enter(ctx, m, index, pstack_top, pvalue, &did);
+    if (nindex < 0)
+        return -1;
+    index = nindex;
+    if (!did)
+        return index;
+    for (;;) {
+        JSModuleEvalFrame *f;
+        if (depth == cap) {
+            int ncap = cap ? cap * 2 : 8;
+            JSModuleEvalFrame *nf = js_realloc(ctx, frames, sizeof(*nf) * (size_t)ncap);
+            if (unlikely(!nf)) { *pvalue = JS_GetException(ctx); goto done; }
+            frames = nf;
+            cap = ncap;
+        }
+        frames[depth].m = m;
+        frames[depth].i = 0;
+        depth++;
+        for (;;) {
+            f = &frames[depth - 1];
+            if (f->i < f->m->req_module_entries_count) {
+                JSModuleDef *m1 = f->m->req_module_entries[f->i].module;
+                f->i++;
+                nindex = js_module_eval_enter(ctx, m1, index, pstack_top, pvalue, &did);
+                if (nindex < 0) goto done;
+                index = nindex;
+                if (did) { m = m1; break; }          /* descend */
+                if (js_module_eval_after_child(ctx, f->m, m1, pvalue) < 0) goto done;
+                continue;
+            }
+            if (js_module_eval_finish(ctx, f->m, pstack_top, pvalue) < 0) goto done;
+            depth--;
+            if (depth == 0) { ret = index; *pvalue = JS_UNDEFINED; goto done; }
+            if (js_module_eval_after_child(ctx, frames[depth - 1].m, f->m, pvalue) < 0) goto done;
+        }
+    }
+ done:
+    js_free(ctx, frames);
+    return ret;
 }
 
 /* Run the <eval> function of the module and of all its requested
