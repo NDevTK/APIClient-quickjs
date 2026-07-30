@@ -1482,7 +1482,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_REGEXP_EXEC, STEPDEF_REGEXP_TEST,
     STEPDEF_ITER_TAKE, STEPDEF_ITER_DROP, STEPDEF_ITER_WRAP_RETURN,
     STEPDEF_ITER_CONCAT_NEXT, STEPDEF_ITER_CONCAT_RETURN, STEPDEF_ARRAY_ITER_NEXT,
-    STEPDEF_OWNKEYS_NAMES, STEPDEF_OWNKEYS_SYMBOLS, STEPDEF_REFLECT_OWNKEYS, STEPDEF_HAS_OWN_ENUM, STEPDEF_PROP_IS_ENUM,
+    STEPDEF_OWNKEYS_NAMES, STEPDEF_OWNKEYS_SYMBOLS, STEPDEF_REFLECT_OWNKEYS, STEPDEF_HAS_OWN_ENUM, STEPDEF_PROP_IS_ENUM, STEPDEF_PROTO_GET, STEPDEF_PROTO_SET, STEPDEF_PROTO_CHAIN,
     STEPDEF_OBJ_KEYS, STEPDEF_OBJ_DESCS,
     STEPDEF_REFLECT_GET, STEPDEF_REFLECT_SET, STEPDEF_REFLECT_HAS, STEPDEF_REFLECT_DELETE,
     STEPDEF_PROMISE_RESOLVE, STEPDEF_PROMISE_REJECT, STEPDEF_PROMISE_CATCH, STEPDEF_PROMISE_FINALLY,
@@ -36468,7 +36468,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 cont_st = gouter;
                 goto do_iter_close_finish;
             } else {
-                tramp_step_chain_free(ctx, gouter);
+                uint8_t sleft = 0;
+                void *srest = tramp_step_chain_free_upto(ctx, gouter, &sleft);
+                if (srest && sleft == CONT_GETPROP) {
+                    /* The machine that asked for this operation was itself invoked BY a keyed operation — an
+                       ACCESSOR the walk found on behalf of another request's GP_GET/GP_SET, which is what an
+                       accessor that is a step machine looks like from here. That operation can never finish
+                       either, so the teardown unwinds one more level through this very label. Reaching
+                       tramp_step_chain_free's DCHECK is what said so: `Object.prototype.__proto__`'s setter became
+                       a machine, and a throwing `setPrototypeOf` trap under it ended the chain in a requester the
+                       plain walk does not own. */
+                    cont_st = srest;
+                    goto do_getprop_abandon;
+                }
+                DCHECK(!srest, "a step chain under a keyed operation ended in a requester this label does not own");
+                (void)srest;
             }
         } else if (xck == CONT_CONSTRUCT) {
             /* the throwing frame was a constructor body: drop the created `this` and the super ctor ref. For
@@ -59435,69 +59449,137 @@ static JSValue JS_SpeciesConstructor(JSContext *ctx, JSValueConst obj,
     return species;
 }
 
-static JSValue js_object_get___proto__(JSContext *ctx, JSValueConst this_val)
+/* B.2.2.1.1 / B.2.2.1.2 — Object.prototype.__proto__, BOTH halves. Each is one internal method on the receiver:
+   the getter's `? O.[[GetPrototypeOf]]()` and the setter's `? O.[[SetPrototypeOf]](proto)`. On a Proxy those are
+   the `getPrototypeOf` / `setPrototypeOf` traps plus 10.5.1 / 10.5.2's invariants — the page's code — and
+   JS_GetPrototype / JS_SetPrototypeInternal ran them from C, so `proxy.__proto__` aborted at a looping trap's
+   back-edge. ONE machine for both, `arg` naming which internal method, because the two differ only in that and in
+   the operand. */
+typedef struct JSProtoAccessor {
+    JSStepHdr hdr;
+    JSValue result;   /* DONE (owned) */
+    JSValue obj;      /* ToObject(this) for the getter, the receiver itself for the setter (owned) */
+} JSProtoAccessor;
+enum { PROTOACC_GET = 0, PROTOACC_SET };
+static int js_proto_accessor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
-    JSValue val, ret;
+    JSProtoAccessor *s = st;
+    bool is_set = s->hdr.def->arg == PROTOACC_SET;
 
-    val = JS_ToObject(ctx, this_val);
-    if (JS_IsException(val))
-        return val;
-    ret = JS_GetPrototype(ctx, val);
-    JS_FreeValue(ctx, val);
-    return ret;
-}
-
-static JSValue js_object_set___proto__(JSContext *ctx, JSValueConst this_val,
-                                       JSValueConst proto)
-{
-    if (JS_IsUndefined(this_val) || JS_IsNull(this_val))
-        return JS_ThrowTypeErrorNotAnObject(ctx);
-    if (!JS_IsObject(proto) && !JS_IsNull(proto))
-        return JS_UNDEFINED;
-    if (JS_SetPrototypeInternal(ctx, this_val, proto, true) < 0)
-        return JS_EXCEPTION;
-    else
-        return JS_UNDEFINED;
-}
-
-static JSValue js_object_isPrototypeOf(JSContext *ctx, JSValueConst this_val,
-                                       int argc, JSValueConst *argv)
-{
-    JSValue obj, v1;
-    JSValueConst v;
-    int res;
-
-    v = argv[0];
-    if (!JS_IsObject(v))
-        return JS_FALSE;
-    obj = JS_ToObject(ctx, this_val);
-    if (JS_IsException(obj))
-        return JS_EXCEPTION;
-    v1 = js_dup(v);
-    for(;;) {
-        v1 = JS_GetPrototypeFree(ctx, v1);
-        if (JS_IsException(v1))
-            goto exception;
-        if (JS_IsNull(v1)) {
-            res = false;
-            break;
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result);
+        s->result = JS_UNDEFINED;
+        s->obj = JS_UNDEFINED;
+        if (is_set) {
+            /* B.2.2.1.2 steps 1-4: RequireObjectCoercible, then a non-object non-null VALUE is a no-op and so is a
+               non-object receiver — both decided BEFORE any internal method runs. */
+            JSValueConst proto = step_arg(&s->hdr, 0);
+            if (JS_IsUndefined(s->hdr.this_val) || JS_IsNull(s->hdr.this_val)) {
+                JS_ThrowTypeErrorNotAnObject(ctx);
+                return -1;
+            }
+            if (!JS_IsObject(proto) && !JS_IsNull(proto))
+                return 0;
+            if (!JS_IsObject(s->hdr.this_val))
+                return 0;
+            s->obj = js_dup(s->hdr.this_val);
+            s->hdr.stage = 1;
+            s->hdr.cb_coerce[0] = s->obj;              /* borrowed: the state holds it across the request */
+            s->hdr.cb_coerce[1] = (JSValue)proto;
+            *out_cb = s->hdr.cb_coerce; *out_argc = 0;
+            return 21;                                 /* SETPROTO */
         }
-        if (JS_VALUE_GET_OBJ(obj) == JS_VALUE_GET_OBJ(v1)) {
-            res = true;
-            break;
-        }
-        /* avoid infinite loop (possible with proxies) */
-        if (js_poll_interrupts(ctx))
-            goto exception;
+        s->obj = JS_ToObject(ctx, s->hdr.this_val);     /* B.2.2.1.1 step 1 */
+        if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
+        s->hdr.stage = 1;
+        s->hdr.cb_coerce[0] = s->obj;
+        *out_cb = s->hdr.cb_coerce; *out_argc = 0;
+        return 18;                                     /* GETPROTO */
     }
-    JS_FreeValue(ctx, v1);
-    JS_FreeValue(ctx, obj);
-    return js_bool(res);
+    DCHECK(s->hdr.stage == 1, "the __proto__ accessor's machine resumed in no stage");
+    if (JS_IsException(cb_result)) return -1;
+    if (is_set) {
+        /* B.2.2.1.2 step 5: a FALSE status is a TypeError, which is the accessor's own step and not the internal
+           method's — Reflect.setPrototypeOf yields the same boolean instead. Discarding it made
+           `__proto__ = cycle` and a non-extensible receiver silently succeed, which set-cycle.js and
+           set-non-extensible.js caught. */
+        bool ok = JS_ToBool(ctx, cb_result);
+        JS_FreeValue(ctx, cb_result);
+        if (!ok) {
+            JS_ThrowTypeError(ctx, "not a valid prototype");
+            return -1;
+        }
+        s->result = JS_UNDEFINED;
+    } else {
+        s->result = cb_result;
+    }
+    return 0;
+}
+static JSValue js_proto_accessor_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSProtoAccessor *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    JS_FreeValue(ctx, s->obj);
+    js_free(ctx, s);
+    return r;
+}
 
-exception:
-    JS_FreeValue(ctx, v1);
-    JS_FreeValue(ctx, obj);
-    return JS_EXCEPTION;
+/* DELETED: js_object_set___proto__'s C body — it is the machine above, PROTOACC_SET. */
+
+/* 20.1.3.3 Object.prototype.isPrototypeOf(V) — a WALK of `? V.[[GetPrototypeOf]]()`, which on a Proxy is the
+   `getPrototypeOf` trap plus 10.5.1's invariant: the page's code once per link, and the C body ran the whole loop
+   with JS_GetPrototypeFree. It also carried a js_poll_interrupts "avoid infinite loop (possible with proxies)"
+   guard, which is a BOUND — a proxy chain that keeps answering is unbounded work the scheduler is supposed to
+   preempt and page, not something a builtin cuts short. Routing the read removes the reason the guard existed: the
+   loop now suspends at every link like any other flow. */
+typedef struct JSProtoChain {
+    JSStepHdr hdr;
+    JSValue result;   /* DONE (owned) */
+    JSValue obj;      /* ToObject(this) (owned) */
+    JSValue cur;      /* the link being walked (owned) */
+} JSProtoChain;
+static int js_proto_chain_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSProtoChain *s = st;
+
+    if (s->hdr.stage == 0) {
+        JSValueConst v = step_arg(&s->hdr, 0);
+        JS_FreeValue(ctx, cb_result);
+        s->result = JS_UNDEFINED;
+        s->obj = JS_UNDEFINED;
+        s->cur = JS_UNDEFINED;
+        if (!JS_IsObject(v)) { s->result = JS_FALSE; return 0; }      /* step 1 */
+        s->obj = JS_ToObject(ctx, s->hdr.this_val);                   /* step 2 */
+        if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
+        s->cur = js_dup(v);
+        s->hdr.stage = 1;
+        goto ask;
+    }
+    DCHECK(s->hdr.stage == 1, "isPrototypeOf's walk resumed in no stage");
+    if (JS_IsException(cb_result)) return -1;
+    JS_FreeValue(ctx, s->cur);
+    s->cur = cb_result;                                               /* step 3.a's answer */
+    if (JS_IsNull(s->cur)) { s->result = JS_FALSE; return 0; }         /* step 3.b */
+    if (JS_VALUE_GET_TAG(s->cur) == JS_TAG_OBJECT
+        && JS_VALUE_GET_OBJ(s->obj) == JS_VALUE_GET_OBJ(s->cur)) {
+        s->result = JS_TRUE;                                          /* step 3.c */
+        return 0;
+    }
+ask:
+    s->hdr.cb_coerce[0] = s->cur;   /* borrowed: the state holds the link across the request */
+    *out_cb = s->hdr.cb_coerce; *out_argc = 0;
+    return 18;                      /* GETPROTO */
+}
+static JSValue js_proto_chain_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSProtoChain *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (!take_result) JS_FreeValue(ctx, s->result);
+    JS_FreeValue(ctx, s->obj);
+    JS_FreeValue(ctx, s->cur);
+    js_free(ctx, s);
+    return r;
 }
 
 /* DELETED: js_object_propertyIsEnumerable's C body. 20.1.3.4 is ToPropertyKey (the page's code), ToObject, then
@@ -59630,9 +59712,12 @@ static const JSCFunctionListEntry js_object_proto_funcs[] = {
     JS_CFUNC_STEP_DEF("toLocaleString", 0, STEPDEF_OBJ_TOLOCALESTRING ),
     JS_CFUNC_DEF("valueOf", 0, js_object_valueOf ),
     JS_CFUNC_STEP_DEF("hasOwnProperty", 1, STEPDEF_OBJ_HASOWNPROP ),
-    JS_CFUNC_DEF("isPrototypeOf", 1, js_object_isPrototypeOf ),
+    JS_CFUNC_STEP_DEF("isPrototypeOf", 1, STEPDEF_PROTO_CHAIN ),
     JS_CFUNC_STEP_DEF("propertyIsEnumerable", 1, STEPDEF_PROP_IS_ENUM ),
-    JS_CGETSET_DEF("__proto__", js_object_get___proto__, js_object_set___proto__ ),
+    /* __proto__ is installed after this table: BOTH halves are step machines, and an accessor ENTRY can carry a
+       machine on the setter only (JS_DEF_CGETSET_STEP names one step id). Giving the entry a second id would put
+       another data field in a union that already holds function pointers — the strict-aliasing trap this file
+       learned the hard way — so the pair is built where the intrinsic is. */
     JS_CFUNC_STEP_DEF("__defineGetter__", 2, STEPDEF_OBJ_DEFGETTER ),
     JS_CFUNC_STEP_DEF("__defineSetter__", 2, STEPDEF_OBJ_DEFSETTER ),
     JS_CFUNC_STEP_DEF("__lookupGetter__", 1, STEPDEF_OBJ_LOOKUPGETTER ),
@@ -64483,6 +64568,9 @@ static const JSTrampStepDef js_str_localeCmp_def  = { sizeof(JSStrRecv), js_str_
 static const JSTrampStepDef js_ta_at_def          = { sizeof(JSTAIdx), js_ta_idx_step, js_ta_idx_fini, TAIDX_AT };
 static const JSTrampStepDef js_ta_set_def         = { sizeof(JSTAIdx), js_ta_idx_step, js_ta_idx_fini, TAIDX_SET };
 static const JSTrampStepDef js_json_raw_def       = { sizeof(JSJsonRaw), js_json_raw_step, js_json_raw_fini, 0 };
+static const JSTrampStepDef js_proto_chain_def    = { sizeof(JSProtoChain), js_proto_chain_step, js_proto_chain_fini, 0 };
+static const JSTrampStepDef js_proto_get_def      = { sizeof(JSProtoAccessor), js_proto_accessor_step, js_proto_accessor_fini, PROTOACC_GET };
+static const JSTrampStepDef js_proto_set_def      = { sizeof(JSProtoAccessor), js_proto_accessor_step, js_proto_accessor_fini, PROTOACC_SET };
 static const JSTrampStepDef js_has_own_enum_def   = { sizeof(JSHasOwnEnum), js_has_own_enum_step, js_has_own_enum_fini, HOE_ARGS };
 static const JSTrampStepDef js_prop_is_enum_def   = { sizeof(JSHasOwnEnum), js_has_own_enum_step, js_has_own_enum_fini, HOE_THIS };
 static const JSTrampStepDef js_obj_defprop_def    = { sizeof(JSObjDefProp), js_obj_defprop_step, js_obj_defprop_fini, 0 };
@@ -65056,6 +65144,9 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_REFLECT_OWNKEYS] = &js_reflect_ownkeys_def,
     [STEPDEF_HAS_OWN_ENUM] = &js_has_own_enum_def,
     [STEPDEF_PROP_IS_ENUM] = &js_prop_is_enum_def,
+    [STEPDEF_PROTO_GET]    = &js_proto_get_def,
+    [STEPDEF_PROTO_SET]    = &js_proto_set_def,
+    [STEPDEF_PROTO_CHAIN]  = &js_proto_chain_def,
     [STEPDEF_PARSEINT]        = &js_parseInt_def,
     [STEPDEF_PARSEFLOAT]      = &js_parseFloat_def,
     [STEPDEF_STR_SPLIT]       = &js_str_split_def,
@@ -65218,6 +65309,8 @@ STEP_STATE_HDR_FIRST(JSJsonRaw);
 STEP_STATE_HDR_FIRST(JSObjDefProp);
 STEP_STATE_HDR_FIRST(JSObjDefAccessor);
 STEP_STATE_HDR_FIRST(JSHasOwnEnum);
+STEP_STATE_HDR_FIRST(JSProtoAccessor);
+STEP_STATE_HDR_FIRST(JSProtoChain);
 STEP_STATE_HDR_FIRST(JSParseNum);
 STEP_STATE_HDR_FIRST(JSStrSplit);
 STEP_STATE_HDR_FIRST(JSArrayJoin);
@@ -74995,6 +75088,7 @@ static int js_proxy_ext_invariant(JSContext *ctx, JSValueConst obj, bool prevent
 
 static JSValue js_proxy_getPrototypeOf(JSContext *ctx, JSValueConst obj)
 {
+    DFAIL("a C-side [[GetPrototypeOf]] reached a Proxy — the page's trap has no flow base here; route that caller onto the keyed entry's GP_GETPROTO");
     JSProxyData *s;
     JSValue method, ret, proto1;
     int res;
@@ -75014,6 +75108,7 @@ static JSValue js_proxy_getPrototypeOf(JSContext *ctx, JSValueConst obj)
 static int js_proxy_setPrototypeOf(JSContext *ctx, JSValueConst obj,
                                    JSValueConst proto_val, bool throw_flag)
 {
+    DFAIL("a C-side [[SetPrototypeOf]] reached a Proxy — the page's trap has no flow base here; route that caller onto the keyed entry's GP_SETPROTO");
     JSProxyData *s;
     JSValue method, ret, proto1;
     JSValueConst args[2];
@@ -75043,6 +75138,7 @@ static int js_proxy_setPrototypeOf(JSContext *ctx, JSValueConst obj,
 
 static int js_proxy_isExtensible(JSContext *ctx, JSValueConst obj)
 {
+    DFAIL("a C-side [[IsExtensible]] reached a Proxy — the page's trap has no flow base here; route that caller onto the keyed entry's GP_ISEXT");
     JSProxyData *s;
     JSValue method, ret;
     bool res;
@@ -75062,6 +75158,7 @@ static int js_proxy_isExtensible(JSContext *ctx, JSValueConst obj)
 
 static int js_proxy_preventExtensions(JSContext *ctx, JSValueConst obj)
 {
+    DFAIL("a C-side [[PreventExtensions]] reached a Proxy — the page's trap has no flow base here; route that caller onto the keyed entry's GP_PREVEXT");
     JSProxyData *s;
     JSValue method, ret;
     bool res;
@@ -75561,6 +75658,7 @@ static JSValue js_proxy_call_constructor(JSContext *ctx, JSValueConst func_obj,
                                          JSValueConst new_target,
                                          int argc, JSValueConst *argv)
 {
+    DFAIL("a C-side [[Construct]] reached a Proxy — the page's trap has no flow base here; route that caller onto the construct dispatch");
     JSProxyData *s;
     JSValue method, arg_array, ret;
     JSValueConst args[3];
@@ -75597,6 +75695,7 @@ static JSValue js_proxy_call(JSContext *ctx, JSValueConst func_obj,
                              JSValueConst this_obj,
                              int argc, JSValueConst *argv, int flags)
 {
+    DFAIL("a C-side [[Call]] reached a Proxy — the page's trap has no flow base here; route that caller onto the call convergence point");
     JSProxyData *s;
     JSValue method, arg_array, ret;
     JSValueConst args[3];
@@ -81467,6 +81566,21 @@ int JS_AddIntrinsicBaseObjects(JSContext *ctx)
     if (JS_IsException(obj1))
         return -1;
     JS_FreeValue(ctx, obj1);
+    {
+        /* B.2.2.1 Object.prototype.__proto__, both halves as step machines: each performs ONE internal method on
+           the receiver, and on a Proxy that is a trap. The accessor table cannot name two step ids, so the pair is
+           built here — an accessor holds function OBJECTS, and a step-machine function object is reached through
+           tramp_accessor_getter / _setter like any other callable. */
+        JSValue pget = JS_NewCFunctionMagic(ctx, NULL, "get __proto__", 0, JS_CFUNC_step, STEPDEF_PROTO_GET);
+        JSValue pset = JS_NewCFunctionMagic(ctx, NULL, "set __proto__", 1, JS_CFUNC_step, STEPDEF_PROTO_SET);
+        if (JS_IsException(pget) || JS_IsException(pset)) {
+            JS_FreeValue(ctx, pget); JS_FreeValue(ctx, pset);
+            return -1;
+        }
+        if (JS_DefinePropertyGetSet(ctx, ctx->class_proto[JS_CLASS_OBJECT], JS_ATOM___proto__,
+                                    pget, pset, JS_PROP_CONFIGURABLE) < 0)
+            return -1;
+    }
 
     /* Function */
     obj1 = JS_NewCConstructor(ctx, JS_CLASS_BYTECODE_FUNCTION, "Function",
