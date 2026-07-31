@@ -9178,10 +9178,18 @@ JS_ThrowError(JSContext *ctx, JSErrorEnum error_num,
     JSStackFrame *sf;
     bool add_backtrace;
 
-    /* the backtrace is added later if called from a bytecode function */
+    /* The backtrace is added later if the innermost frame is a bytecode one, because THAT frame's program
+       counter is only synced at the unwind and capturing now would give it a stale position.
+
+       Unless a STEP MACHINE is running. Then the innermost activation is the BUILTIN, not that frame — and
+       that frame's pc was stored by the call opcode which invoked the builtin, so there is nothing left to
+       wait for. Waiting costs the builtin: by the time the unwind captures, the machine has returned and
+       `[1,2,3].map(1)` reports the caller of map with no mention of map. The condition names the moment the
+       innermost activation is not a bytecode frame, and a running machine is that moment as much as a C
+       function is. */
     sf = rt->current_stack_frame;
     add_backtrace = !rt->in_out_of_memory &&
-        (!sf || (JS_GetFunctionBytecode(sf->cur_func) == NULL));
+        (!sf || JS_GetFunctionBytecode(sf->cur_func) == NULL || g_step_running != NULL);
     return JS_ThrowError2(ctx, error_num, add_backtrace, fmt, ap);
 }
 
