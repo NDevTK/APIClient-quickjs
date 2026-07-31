@@ -26056,8 +26056,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (tramp_is_tail) goto do_return;   /* the operands are already popped, as the step DONE does */
                 } else {
                     DCHECK(tramp_first == 0, "a construct shape with no stack operands cannot also pop them");
-                    DCHECK(!con_args_owned, "a shapeless construct never owns its argument list");
                     ret_val = JS_CallConstructor2(ctx, con_func, con_ntgt, con_argc, con_args);
+                    /* A shapeless construct CAN own its argument list. It could not while the only two were
+                       super() and a machine borrowing its own cb buffer, and this asserted that — but a consume
+                       machine's TypedArrayCreateFromConstructor builds a one-element list precisely because the
+                       `goto` leaves the scope its operand would otherwise live in. The list is freed here for the
+                       same reason the -2 branch frees its own, and the assert that said it could not exist is
+                       deleted rather than worked around: the state it forbade is now correct. */
+                    if (con_args_owned) {
+                        free_arg_list(ctx, con_args_owned, con_argc); con_args_owned = NULL; con_args = NULL;
+                    }
                     JS_FreeValue(ctx, con_super_ref); con_super_ref = JS_UNDEFINED;
                     if (con_outer) {
                         /* the machine that ASKED for this construct takes the object; a C constructor has no body
@@ -26084,6 +26092,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 goto exception;
                             }
                             goto do_from_ctor_deliver;
+                        }
+                        if (ckind == CONT_ITER_CONSUME) {
+                            /* a CONSUME machine asked for this construct — 23.2.2.1 step 5.c's
+                               TypedArrayCreateFromConstructor is the case. The bytecode settle has always
+                               delivered to it; this arm is what lets the in-place path do the same, and without
+                               it the consume machine could only ask for a construct whose target had a bytecode
+                               body. */
+                            if (unlikely(JS_IsException(ret_val))) {
+                                js_iter_consume_abandon(ctx, cont_st);
+                                cont_st = NULL;
+                                goto exception;
+                            }
+                            goto do_iter_consume_step;
                         }
                         DCHECK(ckind == CONT_STEP, "do_construct_dispatch: unknown outer sequence kind");
                         if (unlikely(JS_IsException(ret_val))) goto step_abandon;
@@ -30557,27 +30578,28 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        receiver, which is why this is a phase and not a finish. A bytecode constructor runs its body
                        on THIS chain (the outer continuation feeds the object back to this step); a C constructor has
                        no body to suspend and is constructed in place. */
-                    JSValue lenv;
+                    /* The target is whatever the page named — `Uint8Array.of()` makes it the TypedArray
+                       constructor, a subclass makes it a bytecode body, and `Reflect.construct`-style plumbing
+                       can make it bound or proxied. So this goes to the CONVERGENCE POINT, which answers every
+                       one of those kinds, and not to do_construct_tramp, which is the bytecode BODY entry.
+                       It used to ask `tramp_can_construct(s->adder)` and hand every other kind to
+                       JS_CallConstructor — the recognizer shape: a C constructor was constructed from C below a
+                       live flow, and once the TypedArray constructor became a declared machine that call landed
+                       on js_call_c_function's DFAIL. `Uint8Array.of()` is where it surfaced. */
+                    JSValue *lenl;
                     s->ta_phase = 2;   /* whichever way it settles, the next entry ADOPTS the object + validates */
-                    if (tramp_can_construct(s->adder)) {
-                        /* the argument goes in an OWNED one-element list, not a block-local: the `goto` leaves
-                           this scope while con_args still points at it, and the constructor's frame setup reads
-                           it afterwards — a stack-use-after-scope that ASan sees and -O1 happens to survive. */
-                        JSValue *lenl = js_malloc(ctx, sizeof(JSValue));
-                        if (unlikely(!lenl)) { js_iter_consume_end(ctx, s); js_free_rt(rt, s); goto exception; }
-                        lenl[0] = js_int64(s->k);
-                        con_func = s->adder; con_ntgt = s->adder;
-                        con_args = (JSValueConst *)lenl; con_argc = 1; con_args_owned = lenl;
-                        con_from_super = 0; con_super_ref = JS_UNDEFINED;
-                        con_outer = s; con_outer_kind = CONT_ITER_CONSUME;
-                        tramp_first = 0; tramp_is_tail = 0;   /* no operands pushed: do_return frees nothing */
-                        goto do_construct_tramp;              /* settle -> do_iter_consume_step with the object */
-                    }
-                    lenv = js_int64(s->k);
-                    ret_val = JS_CallConstructor(ctx, s->adder, 1, vc(&lenv));
-                    JS_FreeValue(ctx, lenv);
-                    if (JS_IsException(ret_val)) { js_iter_consume_end(ctx, s); js_free_rt(rt, s); goto exception; }
-                    goto do_iter_consume_step;
+                    /* the argument goes in an OWNED one-element list, not a block-local: the `goto` leaves this
+                       scope while con_args still points at it, and the constructor's frame setup reads it
+                       afterwards — a stack-use-after-scope that ASan sees and -O1 happens to survive. */
+                    lenl = js_malloc(ctx, sizeof(JSValue));
+                    if (unlikely(!lenl)) { js_iter_consume_end(ctx, s); js_free_rt(rt, s); goto exception; }
+                    lenl[0] = js_int64(s->k);
+                    con_func = s->adder; con_ntgt = s->adder;
+                    con_args = (JSValueConst *)lenl; con_argc = 1; con_args_owned = lenl;
+                    con_from_super = 0; con_super_ref = JS_UNDEFINED;
+                    con_outer = s; con_outer_kind = CONT_ITER_CONSUME;
+                    tramp_first = 0; tramp_is_tail = 0;   /* no operands pushed: do_return frees nothing */
+                    goto do_construct_dispatch;           /* settle -> do_iter_consume_step with the object */
                 }
                 if (st == 2) {
                     /* the sink short-circuited (Set.prototype.isSupersetOf found a miss, an entry was not an
