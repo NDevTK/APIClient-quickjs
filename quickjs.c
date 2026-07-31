@@ -77747,28 +77747,77 @@ static JSONParseRecord *json_parse_record_find(JSONParseRecord *pr, JSAtom key)
     return NULL;
 }
 
+/* The record tree is exactly as deep as the JSON that built it, so this walk had the SAME page-controlled depth
+   json_parse_value did — and flattening only the parser made things WORSE, not better: the parse then accepted
+   200k levels and this SEGFAULTED freeing them, where before the parser's stack-overflow guard had rejected the
+   input early. Flattening one half of a recursive pair converts a wrong-but-safe RangeError into a crash. Both
+   halves or neither.
+   POST-ORDER over an explicit stack: a child record lives INSIDE its parent's array, so the parent's arrays can
+   only be released once every child is done. */
+typedef struct JSONFreeFrame {
+    JSONParseRecord *pr;
+    int i;                  /* the next child to visit */
+    uint8_t kind;           /* 0 = leaf, 1 = array, 2 = object */
+} JSONFreeFrame;
+
 static void json_free_parse_record(JSContext *ctx, JSONParseRecord *pr)
 {
-    int i;
+    JSONFreeFrame inline_st[32], *st = inline_st;
+    int sp = 0, st_size = (int)countof(inline_st);
+    bool st_heap = false;
+
     if (!pr)
         return;
-    if (JS_IsObject(pr->value)) {
-        if (js_is_array(ctx, pr->value)) {
-            for(i = 0; i < pr->u.array.count; i++) {
-                json_free_parse_record(ctx, &pr->u.array.elements[i]);
+    for (;;) {
+        /* PUSH pr */
+        if (sp >= st_size) {
+            int n = st_size * 2;
+            JSONFreeFrame *ns;
+            if (st_heap) {
+                ns = js_realloc(ctx, st, sizeof(*ns) * (size_t)n);
+            } else {
+                ns = js_malloc(ctx, sizeof(*ns) * (size_t)n);
+                if (ns) memcpy(ns, st, sizeof(*ns) * (size_t)st_size);
             }
-            js_free(ctx, pr->u.array.elements);
-        } else {
-            for(i = 0; i < pr->u.obj.count; i++) {
-                JS_FreeAtom(ctx, pr->u.obj.entries[i].atom);
-                json_free_parse_record(ctx, &pr->u.obj.entries[i].parse_record);
+            /* a TEARDOWN that cannot allocate cannot leave the tree half-released: there is no completion to
+               fall back to, which is what CHECK is for. */
+            CHECK(ns != NULL, "the JSON parse-record teardown could not grow its walk stack");
+            st = ns; st_size = n; st_heap = true;
+        }
+        st[sp].pr = pr;
+        st[sp].i = 0;
+        st[sp].kind = 0;
+        if (JS_IsObject(pr->value))
+            st[sp].kind = js_is_array(ctx, pr->value) ? 1 : 2;
+        sp++;
+
+        for (;;) {
+            JSONFreeFrame *f = &st[sp - 1];
+            if (f->kind == 1 && f->i < f->pr->u.array.count) {
+                pr = &f->pr->u.array.elements[f->i++];
+                break;                                  /* descend */
             }
-            js_free(ctx, pr->u.obj.entries);
-            js_free(ctx, pr->u.obj.hash_table);
+            if (f->kind == 2 && f->i < f->pr->u.obj.count) {
+                JS_FreeAtom(ctx, f->pr->u.obj.entries[f->i].atom);
+                pr = &f->pr->u.obj.entries[f->i].parse_record;
+                f->i++;
+                break;                                  /* descend */
+            }
+            /* every child is done, so the node's own storage goes */
+            if (f->kind == 1) {
+                js_free(ctx, f->pr->u.array.elements);
+            } else if (f->kind == 2) {
+                js_free(ctx, f->pr->u.obj.entries);
+                js_free(ctx, f->pr->u.obj.hash_table);
+            }
+            JS_FreeValue(ctx, f->pr->value);
+            f->pr->value = JS_UNDEFINED; /* fail safe: a second release of the same node is a no-op */
+            if (--sp == 0) {
+                if (st_heap) js_free(ctx, st);
+                return;
+            }
         }
     }
-    JS_FreeValue(ctx, pr->value);
-    pr->value = JS_UNDEFINED; /* fail safe */
 }
 
 /* 'pr' can be NULL */
