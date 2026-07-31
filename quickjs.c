@@ -46622,6 +46622,17 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
 
         parse_array_access:
             prev_op = get_prev_opcode(fd);
+            if (prev_op == OP_get_super) {
+                /* 13.3.4 SuperProperty : super [ Expression ] evaluates the KEY before step 7's
+                   MakeSuperPropertyReference, so GetSuperBase has not run yet — `super[ruin()]`, where ruin()
+                   sets the home object's prototype to null, is a TypeError and not a read through a base that
+                   was captured too early. The primary emitted that read already because every other `super`
+                   form wants it there; take it back off and re-emit it after the key. */
+                DCHECK(fd->byte_code.buf[fd->last_opcode_pos] == OP_get_super,
+                       "get_prev_opcode named an opcode that is not at last_opcode_pos");
+                fd->byte_code.size = fd->last_opcode_pos;
+                fd->last_opcode_pos = -1;
+            }
             if (has_optional_chain) {
                 optional_chain_test(s, &optional_chaining_label, 1);
             }
@@ -46632,6 +46643,9 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
             if (js_parse_expect(s, ']'))
                 return -1;
             if (prev_op == OP_get_super) {
+                emit_op(s, OP_swap);        /* this home key -> this key home */
+                emit_op(s, OP_get_super);   /*              -> this key base  */
+                emit_op(s, OP_swap);        /*              -> this base key  */
                 emit_op(s, OP_get_super_value);
             } else {
                 emit_op(s, OP_get_array_el);
