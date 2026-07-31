@@ -23064,10 +23064,6 @@ static int js_enum_keys_run(JSContext *ctx, JSEnumKeys *c, JSValue in, JSValue *
             if (js_get_length32(ctx, &klen, keys)) { JS_FreeValue(ctx, keys); return -1; }
             c->atoms = klen ? js_mallocz(ctx, sizeof(c->atoms[0]) * klen) : NULL;
             if (klen && !c->atoms) { JS_FreeValue(ctx, keys); return -1; }
-            if (c->want_values && klen) {
-                c->vals = js_mallocz(ctx, sizeof(c->vals[0]) * klen);
-                if (!c->vals) { JS_FreeValue(ctx, keys); return -1; }
-            }
             for (ki = 0; ki < klen; ki++) {
                 JSValue kv = JS_GetPropertyUint32(ctx, keys, ki);
                 JSAtom at;
@@ -23082,6 +23078,13 @@ static int js_enum_keys_run(JSContext *ctx, JSEnumKeys *c, JSValue in, JSValue *
             }
             JS_FreeValue(ctx, keys);
             c->len = kept; c->i = 0; c->kept = 0;
+            /* one slot per SURVIVING key, allocated once that count is known rather than at the raw key count —
+               `len` is then the block's extent under its own name, which is what lets the ownership declaration
+               state it. Symbols are dropped above, so the two differ whenever the object has any. */
+            if (c->want_values && c->len) {
+                c->vals = js_mallocz(ctx, sizeof(c->vals[0]) * c->len);
+                if (!c->vals) return -1;
+            }
             c->phase = EK_ASK_DESC;
             continue;
         }
@@ -39774,20 +39777,29 @@ static int js_async_await_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
     return js_async_function_await_finish(ctx, &post) < 0 ? -1 : 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The PromiseResolve request buffer, which this machine dup'd
+   into rather than borrowing — an await's PromiseResolve runs it against a capability nothing else holds. */
+static void js_async_await_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSAsyncAwait *m = st;
+    int i;
+    v->val(ctx, &m->result);
+    for (i = 0; i < 4; i++) v->val(ctx, &m->cb[i]);
+}
+
 static JSValue js_async_await_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSAsyncAwait *m = st;
-    JSValue r = take_result ? m->result : (JS_FreeValue(ctx, m->result), JS_UNDEFINED);
-    int i;
-    for (i = 0; i < 4; i++) JS_FreeValue(ctx, m->cb[i]);
+    JSValue r = take_result ? m->result : JS_UNDEFINED;
+    if (take_result) m->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, m);
     js_free_rt(ctx->rt, m);
     return r;
 }
 
 static const JSTrampStepDef js_async_await_def = {
     sizeof(JSAsyncAwait), js_async_await_step, js_async_await_fini, 0,
-    .catches_abrupt = 1
-};
+    .catches_abrupt = 1, .visit = js_async_await_visit };
 
 static JSValue js_async_await_c_entry(JSContext *ctx, JSValueConst this_val, int argc,
                                       JSValueConst *argv, int magic, JSValueConst *func_data)
@@ -40232,12 +40244,22 @@ static int js_agen_await_ret_step(JSContext *ctx, void *st, JSValue cb_result, J
     return res ? -1 : 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The PromiseResolve request buffer, which this machine dup'd
+   into rather than borrowing — an async generator's awaited return runs it against a capability nothing else holds. */
+static void js_agen_await_ret_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSAgenAwaitRet *m = st;
+    int i;
+    v->val(ctx, &m->result);
+    for (i = 0; i < 4; i++) v->val(ctx, &m->cb[i]);
+}
+
 static JSValue js_agen_await_ret_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSAgenAwaitRet *m = st;
-    JSValue r = take_result ? m->result : (JS_FreeValue(ctx, m->result), JS_UNDEFINED);
-    int i;
-    for (i = 0; i < 4; i++) JS_FreeValue(ctx, m->cb[i]);
+    JSValue r = take_result ? m->result : JS_UNDEFINED;
+    if (take_result) m->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, m);
     js_free_rt(ctx->rt, m);
     return r;
 }
@@ -40246,12 +40268,10 @@ static JSValue js_agen_await_ret_fini(JSContext *ctx, void *st, bool take_result
    arg 1 = 27.6.3.8 AsyncGeneratorAwait (the generator's own). */
 static const JSTrampStepDef js_agen_await_ret_def = {
     sizeof(JSAgenAwaitRet), js_agen_await_ret_step, js_agen_await_ret_fini, 0,
-    .catches_abrupt = 1   /* step 7: an abrupt PromiseResolve is this algorithm's VALUE, not a raise */
-};
+    .catches_abrupt = 1   /* step 7: an abrupt PromiseResolve is this algorithm's VALUE, not a raise */, .visit = js_agen_await_ret_visit };
 static const JSTrampStepDef js_agen_await_def = {
     sizeof(JSAgenAwaitRet), js_agen_await_ret_step, js_agen_await_ret_fini, 1,
-    .catches_abrupt = 1
-};
+    .catches_abrupt = 1, .visit = js_agen_await_ret_visit };
 
 static JSValue js_agen_await_ret_c_entry(JSContext *ctx, JSValueConst this_val, int argc,
                                          JSValueConst *argv, int magic, JSValueConst *func_data)
@@ -51035,19 +51055,28 @@ static int js_import_opts_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
     return js_import_opts_enqueue(ctx, s);
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The capability it answers with, the referrer and specifier it
+   read before anything could suspend, the options object and the record it is building from it, and the key
+   cursor walking that object — one cursor, declared as the single-element block it is. */
+static void js_import_opts_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSImportOpts *s = st;
+    v->val(ctx, &s->promise);
+    v->val(ctx, &s->funcs[0]);
+    v->val(ctx, &s->funcs[1]);
+    v->val(ctx, &s->basename_val);
+    v->val(ctx, &s->spec_str);
+    v->val(ctx, &s->attrs_obj);
+    v->val(ctx, &s->attrs);
+    v->array(ctx, (void **)&s->ek, sizeof(JSEnumKeys), 1, 1, js_enum_keys_visit);
+}
+
 static JSValue js_import_opts_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSImportOpts *s = st;
-    JSValue r;
-    if (s->ek) { js_enum_keys_free(ctx, s->ek); js_free(ctx, s->ek); }
-    JS_FreeValue(ctx, s->funcs[0]);
-    JS_FreeValue(ctx, s->funcs[1]);
-    JS_FreeValue(ctx, s->basename_val);
-    JS_FreeValue(ctx, s->spec_str);
-    JS_FreeValue(ctx, s->attrs_obj);
-    JS_FreeValue(ctx, s->attrs);
-    r = take_result ? s->promise : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->promise);
+    JSValue r = take_result ? s->promise : JS_UNDEFINED;
+    if (take_result) s->promise = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -62508,15 +62537,23 @@ static int js_dynfunc_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The created function, held across the `prototype` read, and
+   the ToString'd arguments — one per argument the call supplied, which is the block's extent whatever the
+   coercion cursor has reached. */
+static void js_dynfunc_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSDynFunc *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->func);
+    v->array(ctx, (void **)&s->strs, sizeof(JSValue), s->nstrs, s->hdr.argc, js_step_visit_value_elem);
+}
+
 static JSValue js_dynfunc_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSDynFunc *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    int i;
-    if (!take_result) JS_FreeValue(ctx, s->result);
-    JS_FreeValue(ctx, s->func);
-    for (i = 0; i < s->nstrs; i++) JS_FreeValue(ctx, s->strs[i]);
-    js_free(ctx, s->strs);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -63727,17 +63764,27 @@ static int js_error_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The error it is building — which is also its result — the one
+   value held across whichever suspension is in flight, AggregateError's iterator record and collected list, and
+   the request buffer this machine dup'd into. */
+static void js_error_ctor_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSErrorCtor *s = st;
+    int i;
+    v->val(ctx, &s->obj);
+    v->val(ctx, &s->held);
+    v->val(ctx, &s->iter);
+    v->val(ctx, &s->next);
+    v->val(ctx, &s->arr);
+    for (i = 0; i < 2; i++) v->val(ctx, &s->cb[i]);
+}
+
 static JSValue js_error_ctor_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSErrorCtor *s = st;
     JSValue r = take_result ? s->obj : JS_UNDEFINED;
-    int i;
-    if (!take_result) JS_FreeValue(ctx, s->obj);
-    for (i = 0; i < 2; i++) JS_FreeValue(ctx, s->cb[i]);
-    JS_FreeValue(ctx, s->arr);
-    JS_FreeValue(ctx, s->next);
-    JS_FreeValue(ctx, s->iter);
-    JS_FreeValue(ctx, s->held);
+    if (take_result) s->obj = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -64908,14 +64955,23 @@ static int js_fromasync_step(JSContext *ctx, void *stt, JSValue cb_result, JSVal
     return fa_advance(ctx, s, cb_result, out_cb, out_argc);
 }
 
-static JSValue js_fromasync_fini(JSContext *ctx, void *stt, bool take_result)
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The shared state array every phase of Array.fromAsync reads,
+   and the request buffer it lends the driver. */
+static void js_fromasync_visit(JSContext *ctx, void *st, JSStepVisit *v)
 {
-    JSFromAsync *s = stt;
-    JSValue r = take_result ? js_dup(s->result) : JS_UNDEFINED;
+    JSFromAsync *s = st;
     int i;
-    JS_FreeValue(ctx, s->result);
-    JS_FreeValue(ctx, s->st);
-    for (i = 0; i < 4; i++) JS_FreeValue(ctx, s->cb[i]);
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->st);
+    for (i = 0; i < 4; i++) v->val(ctx, &s->cb[i]);
+}
+
+static JSValue js_fromasync_fini(JSContext *ctx, void *ctx_st, bool take_result)
+{
+    JSFromAsync *s = ctx_st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -64923,8 +64979,7 @@ static JSValue js_fromasync_fini(JSContext *ctx, void *stt, bool take_result)
 static const JSTrampStepDef js_fromasync_def = {
     sizeof(JSFromAsync), js_fromasync_step, js_fromasync_fini, 0,
     .catches_abrupt = 1   /* every abrupt completion of the closure is IfAbruptRejectPromise: the caller holds
-                             the capability's promise, so a throw is a VALUE this algorithm settles with */
-};
+                             the capability's promise, so a throw is a VALUE this algorithm settles with */, .visit = js_fromasync_visit };
 
 /* 27.1.4.1 steps 1-2 and 4-5: create the capability, build the state, and run the closure to its first Await.
    The capability's promise is the answer whatever the closure does after that. */
@@ -64982,14 +65037,15 @@ static int js_array_fromasync_step(JSContext *ctx, void *stt, JSValue cb_result,
     }
 }
 
-static JSValue js_array_fromasync_fini(JSContext *ctx, void *stt, bool take_result)
-{
-    return js_fromasync_fini(ctx, stt, take_result);
-}
-
+/* DELETED: js_array_fromasync_fini, a one-line forward to js_fromasync_fini. The two definitions differ in
+   their STEP — the entry sets the walk up, the closure resumes it — and share one state, so they share its
+   teardown and its ownership declaration; a wrapper whose only content is the call it forwards gave the entry a
+   second name for one behaviour and left the declaration attachable to only one of them. */
 static const JSTrampStepDef js_array_fromasync_def = {
-    sizeof(JSFromAsync), js_array_fromasync_step, js_array_fromasync_fini, 0,
-    .catches_abrupt = 1   /* as above: steps 3 on run inside the capability, so they REJECT rather than throw */
+    sizeof(JSFromAsync), js_array_fromasync_step, js_fromasync_fini, 0,
+    /* body, body_proto, body_magic, precheck, midcheck, onerror */ {NULL}, 0, 0, NULL, NULL, NULL,
+    .catches_abrupt = 1,  /* as above: steps 3 on run inside the capability, so they REJECT rather than throw */
+    .visit = js_fromasync_visit
 };
 
 /* DELETED: js_array_from. Every branch it had is a machine: the ITERABLE walk is ITERCONS_FROM, the ARRAY-LIKE
@@ -67119,13 +67175,22 @@ static int js_array_concat_step(JSContext *ctx, void *st, JSValue cb_result, JSV
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The coerced receiver, ArraySpeciesCreate's target, which is the page's constructor, and the
+   element held across its read. */
+static void js_array_concat_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSArrayConcat *s = st;
+    v->val(ctx, &s->arr);
+    v->val(ctx, &s->obj);
+    v->val(ctx, &s->el);
+}
+
 static JSValue js_array_concat_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSArrayConcat *s = st;
     JSValue r = take_result ? s->arr : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->arr);
-    JS_FreeValue(ctx, s->obj);
-    JS_FreeValue(ctx, s->el);
+    if (take_result) s->arr = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -68410,7 +68475,8 @@ static const JSTrampStepDef js_iter_helper_return_def = { sizeof(JSIterHelperRet
 static const JSTrampStepDef js_import_opts_def  = {
     sizeof(JSImportOpts), js_import_opts_step, js_import_opts_fini, 0,
     /* body, body_proto, body_magic, precheck, midcheck, onerror */ {NULL}, 0, 0, NULL, NULL, NULL,
-    .catches_abrupt = 1   /* 16.2.1.8 wraps steps 4 on in IfAbruptRejectPromise: a throw is a VALUE here */
+    .catches_abrupt = 1,  /* 16.2.1.8 wraps steps 4 on in IfAbruptRejectPromise: a throw is a VALUE here */
+    .visit = js_import_opts_visit
 };
 static const JSTrampStepDef js_json_str_def      = { sizeof(JSJsonStr), js_json_str_step, js_json_str_fini, 0, .visit = js_json_str_visit };
 static const JSTrampStepDef js_ta_slice_def     = { sizeof(JSTASlice), js_ta_slice_step, js_ta_slice_fini, 0, .visit = js_ta_slice_visit };
@@ -68439,8 +68505,9 @@ static const JSTrampStepDef js_ab_sliceImm_def   = { sizeof(JSABSlice), js_ab_sl
 static const JSTrampStepDef js_sab_slice_def     = { sizeof(JSABSlice), js_ab_slice_step, js_ab_slice_fini, JS_CLASS_SHARED_ARRAY_BUFFER*2 + 0, .visit = js_ab_slice_visit };
 static int js_error_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_error_ctor_fini(JSContext *ctx, void *st, bool take_result);
+static void js_error_ctor_visit(JSContext *ctx, void *st, JSStepVisit *v);
 /* `arg` carries the KIND, which is the only thing that differs between the ten definitions. */
-#define ERRCTOR_DEF(k) { sizeof(JSErrorCtor), js_error_ctor_step, js_error_ctor_fini, (k) },
+#define ERRCTOR_DEF(k) { sizeof(JSErrorCtor), js_error_ctor_step, js_error_ctor_fini, (k), .visit = js_error_ctor_visit },
 static const JSTrampStepDef js_error_ctor_defs[JS_PLAIN_ERROR + 1] = {
     ERRCTOR_DEF(0) ERRCTOR_DEF(1) ERRCTOR_DEF(2) ERRCTOR_DEF(3) ERRCTOR_DEF(4)
     ERRCTOR_DEF(5) ERRCTOR_DEF(6) ERRCTOR_DEF(7) ERRCTOR_DEF(8) ERRCTOR_DEF(JS_PLAIN_ERROR)
@@ -68468,7 +68535,8 @@ static JSValue js_string_iterator_create_fini(JSContext *ctx, void *st, bool tak
 static void js_string_iterator_create_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static int js_string_includes_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_string_includes_fini(JSContext *ctx, void *st, bool take_result);
-#define STR_INCLUDES_DEF(mg) { sizeof(JSStrIncludes), js_string_includes_step, js_string_includes_fini, mg }
+static void js_string_includes_visit(JSContext *ctx, void *st, JSStepVisit *v);
+#define STR_INCLUDES_DEF(mg) { sizeof(JSStrIncludes), js_string_includes_step, js_string_includes_fini, mg, .visit = js_string_includes_visit }
 static const JSTrampStepDef js_str_includes_def   = STR_INCLUDES_DEF(0);
 static const JSTrampStepDef js_str_endswith_def   = STR_INCLUDES_DEF(2);
 static const JSTrampStepDef js_str_startswith_def = STR_INCLUDES_DEF(1);
@@ -68549,19 +68617,23 @@ static const JSTrampStepDef js_array_of_def = { sizeof(JSArrayOf), js_array_of_s
 static int js_array_concat_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_array_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_slice_fini(JSContext *ctx, void *st, bool take_result);
+static void js_array_slice_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static JSValue js_array_ctor_body(JSContext *ctx, JSValueConst obj_, int argc, JSValueConst *argv);
 static int js_array_reverse_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_reverse_fini(JSContext *ctx, void *st, bool take_result);
+static void js_array_reverse_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static const JSTrampStepDef js_array_reverse_def =
-    { sizeof(JSArrayReverse), js_array_reverse_step, js_array_reverse_fini, 0 };
+    { sizeof(JSArrayReverse), js_array_reverse_step, js_array_reverse_fini, 0, .visit = js_array_reverse_visit };
 static int js_array_toreversed_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_toreversed_fini(JSContext *ctx, void *st, bool take_result);
+static void js_array_toreversed_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static const JSTrampStepDef js_array_toReversed_def =
-    { sizeof(JSArrayToReversed), js_array_toreversed_step, js_array_toreversed_fini, 0 };
+    { sizeof(JSArrayToReversed), js_array_toreversed_step, js_array_toreversed_fini, 0, .visit = js_array_toreversed_visit };
 static int js_array_tospliced_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_tospliced_fini(JSContext *ctx, void *st, bool take_result);
+static void js_array_tospliced_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static const JSTrampStepDef js_array_toSpliced_def =
-    { sizeof(JSArrayToSpliced), js_array_tospliced_step, js_array_tospliced_fini, 0 };
+    { sizeof(JSArrayToSpliced), js_array_tospliced_step, js_array_tospliced_fini, 0, .visit = js_array_tospliced_visit };
 static int js_array_pop_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_pop_fini(JSContext *ctx, void *st, bool take_result);
 static void js_array_pop_visit(JSContext *ctx, void *st, JSStepVisit *v);
@@ -68575,12 +68647,13 @@ static const JSTrampStepDef js_array_unshift_def = { sizeof(JSArrayPush), js_arr
 static const JSTrampStepDef js_array_ctor_def =
     CREATECTOR_DEF(JS_CLASS_ARRAY, 0, generic, js_array_ctor_body, 0);
 static const JSTrampStepDef js_array_slice_def  =
-    { sizeof(JSArraySlice), js_array_slice_step, js_array_slice_fini, 0 };
+    { sizeof(JSArraySlice), js_array_slice_step, js_array_slice_fini, 0, .visit = js_array_slice_visit };
 static const JSTrampStepDef js_array_splice_def =
-    { sizeof(JSArraySlice), js_array_slice_step, js_array_slice_fini, 1 };
+    { sizeof(JSArraySlice), js_array_slice_step, js_array_slice_fini, 1, .visit = js_array_slice_visit };
 static JSValue js_array_concat_fini(JSContext *ctx, void *st, bool take_result);
+static void js_array_concat_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static const JSTrampStepDef js_array_concat_def =
-    { sizeof(JSArrayConcat), js_array_concat_step, js_array_concat_fini, 0 };
+    { sizeof(JSArrayConcat), js_array_concat_step, js_array_concat_fini, 0, .visit = js_array_concat_visit };
 static int js_iterator_ctor_precheck(JSContext *ctx, const JSStepHdr *h);
 static int js_weakref_ctor_precheck(JSContext *ctx, const JSStepHdr *h);
 static JSValue js_weakref_ctor_body(JSContext *ctx, JSValueConst obj_, int argc, JSValueConst *argv);
@@ -68662,8 +68735,9 @@ static const JSTrampStepDef js_array_lastIndexOf_def = { sizeof(JSArraySearch), 
 static const JSTrampStepDef js_array_includes_def    = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_INCLUDES, .visit = js_array_search_visit };
 static int js_string_raw_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_string_raw_fini(JSContext *ctx, void *st, bool take_result);
+static void js_string_raw_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static const JSTrampStepDef js_string_raw_def =
-    { sizeof(JSStringRaw), js_string_raw_step, js_string_raw_fini, 0 };
+    { sizeof(JSStringRaw), js_string_raw_step, js_string_raw_fini, 0, .visit = js_string_raw_visit };
 static const JSTrampStepDef js_str_trim_def       = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_TRIM_BOTH, .visit = js_str_recv_visit };
 static const JSTrampStepDef js_str_trimStart_def  = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_TRIM_START, .visit = js_str_recv_visit };
 static const JSTrampStepDef js_str_trimEnd_def    = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_TRIM_END, .visit = js_str_recv_visit };
@@ -68760,6 +68834,7 @@ static JSValue js_date_setTime(JSContext *ctx, JSValueConst this_val, int argc, 
 static int js_date_this_precheck(JSContext *ctx, const JSStepHdr *h);
 static int js_date_set_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_date_set_fini(JSContext *ctx, void *st, bool take_result);
+static void js_date_set_visit(JSContext *ctx, void *st, JSStepVisit *v);
 /* 21.4.4.20-.28 and B.2.3.1. Each setter reads [[DateValue]] at step 2, ToNumbers every argument the spec names
    at steps 3-6 — unconditionally, which is why the C body carried a comment saying so — and computes from both.
    set_date_field ran those coercions with JS_ToFloat64 from its C entry, so
@@ -68775,7 +68850,7 @@ static JSValue js_date_set_fini(JSContext *ctx, void *st, bool take_result);
    for setYear, whose only difference from setFullYear is B.2.3.1 step 5's MakeFullYear on the coerced value. */
 #define DATE_SET_MAKEFULLYEAR 0x1000
 #define DATE_SET_DEF(magic) \
-    { sizeof(JSDateSet), js_date_set_step, js_date_set_fini, (magic) }
+    { sizeof(JSDateSet), js_date_set_step, js_date_set_fini, (magic), .visit = js_date_set_visit }
 #define DATE_SET_TABLE(N, M) static const JSTrampStepDef js_date_set_##N##_def = DATE_SET_DEF(M);
 DATE_SET_LIST(DATE_SET_TABLE)
 #undef DATE_SET_TABLE
@@ -68802,6 +68877,7 @@ static JSValue js_atomics_wait(JSContext *ctx, JSValueConst this_obj, int argc, 
 static JSValue js_atomics_notify(JSContext *ctx, JSValueConst this_obj, int argc, JSValueConst *argv);
 static int js_atomics_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_atomics_fini(JSContext *ctx, void *st, bool take_result);
+static void js_atomics_visit(JSContext *ctx, void *st, JSStepVisit *v);
 
 /* 25.4.4-.15. Every Atomics operation is ValidateIntegerTypedArray, then ValidateAtomicAccess — which reads the
    LENGTH, then ToIndex(index), then tests one against the other — and then ToNumber/ToBigInt on the value(s).
@@ -68825,7 +68901,7 @@ static JSValue js_atomics_fini(JSContext *ctx, void *st, bool take_result);
 #define ATOMICS_NARGS(a)    (((a) >> 16) & 0xff)
 #define ATOMICS_DEF(mask, nargs, waitable, write, proto, fn, magic) \
     { sizeof(JSAtomics), js_atomics_step, js_atomics_fini, ATOMICS_ARG(mask, nargs, waitable, write), \
-      { .proto = (fn) }, JS_CFUNC_##proto, (magic) }
+      { .proto = (fn) }, JS_CFUNC_##proto, (magic), .visit = js_atomics_visit }
 /* the read-modify-write eight: index and value(s), access mode ~write~ */
 static const JSTrampStepDef js_atomics_add_def   = ATOMICS_DEF(0x6, 3, 0, 1, generic_magic, js_atomics_op, ATOMICS_OP_ADD);
 static const JSTrampStepDef js_atomics_and_def   = ATOMICS_DEF(0x6, 3, 0, 1, generic_magic, js_atomics_op, ATOMICS_OP_AND);
@@ -68937,7 +69013,7 @@ static const JSTrampStepDef js_str_fromCodePoint_def = PRIMARGS_DEF(PRIMARGS_ALL
 static const JSTrampStepDef js_date_UTC_def = PRIMARGS_DEF(PRIMARGS_ALL | PRIMARGS(0, HINT_NUMBER, 7), generic, js_Date_UTC, 0);
 /* new Function(a, b, body) / the generator and async variants. The receiver slot is new_target on a constructor
    step, which is what step 29's GetPrototypeFromConstructor reads. */
-#define DYNFUNC_DEF(kind) { sizeof(JSDynFunc), js_dynfunc_step, js_dynfunc_fini, kind }
+#define DYNFUNC_DEF(kind) { sizeof(JSDynFunc), js_dynfunc_step, js_dynfunc_fini, kind, .visit = js_dynfunc_visit }
 static const JSTrampStepDef js_function_ctor_def  = DYNFUNC_DEF(JS_FUNC_NORMAL);
 static const JSTrampStepDef js_genfn_ctor_def     = DYNFUNC_DEF(JS_FUNC_GENERATOR);
 static const JSTrampStepDef js_asyncfn_ctor_def   = DYNFUNC_DEF(JS_FUNC_ASYNC);
@@ -71383,13 +71459,22 @@ static int js_array_reverse_step(JSContext *ctx, void *st, JSValue cb_result, JS
     }
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). reverse answers with its RECEIVER, so `obj` is both the source
+   and the result; the two elements are held across the asks and the writes, each of which is the page's code. */
+static void js_array_reverse_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSArrayReverse *s = st;
+    v->val(ctx, &s->obj);
+    v->val(ctx, &s->lval);
+    v->val(ctx, &s->hval);
+}
+
 static JSValue js_array_reverse_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSArrayReverse *s = st;
     JSValue r = take_result ? s->obj : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->obj);
-    JS_FreeValue(ctx, s->lval);
-    JS_FreeValue(ctx, s->hval);
+    if (take_result) s->obj = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -71455,13 +71540,22 @@ static int js_array_toreversed_step(JSContext *ctx, void *st, JSValue cb_result,
     }
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The coerced receiver, the fresh dense Array it is filling, and the
+   element held across its read. */
+static void js_array_toreversed_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSArrayToReversed *s = st;
+    v->val(ctx, &s->arr);
+    v->val(ctx, &s->obj);
+    v->val(ctx, &s->el);
+}
+
 static JSValue js_array_toreversed_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSArrayToReversed *s = st;
     JSValue r = take_result ? s->arr : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->arr);
-    JS_FreeValue(ctx, s->obj);
-    JS_FreeValue(ctx, s->el);
+    if (take_result) s->arr = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -71636,13 +71730,22 @@ static int js_array_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The coerced receiver, ArraySpeciesCreate's target, which is the page's constructor, and the
+   element held across its read. */
+static void js_array_slice_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSArraySlice *s = st;
+    v->val(ctx, &s->arr);
+    v->val(ctx, &s->obj);
+    v->val(ctx, &s->el);
+}
+
 static JSValue js_array_slice_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSArraySlice *s = st;
     JSValue r = take_result ? s->arr : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->arr);
-    JS_FreeValue(ctx, s->obj);
-    JS_FreeValue(ctx, s->el);
+    if (take_result) s->arr = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -71765,13 +71868,22 @@ static int js_array_tospliced_step(JSContext *ctx, void *st, JSValue cb_result, 
     }
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The coerced receiver, the fresh dense Array it is filling, and the
+   element held across its read. */
+static void js_array_tospliced_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSArrayToSpliced *s = st;
+    v->val(ctx, &s->arr);
+    v->val(ctx, &s->obj);
+    v->val(ctx, &s->el);
+}
+
 static JSValue js_array_tospliced_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSArrayToSpliced *s = st;
     JSValue r = take_result ? s->arr : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->arr);
-    JS_FreeValue(ctx, s->obj);
-    JS_FreeValue(ctx, s->el);
+    if (take_result) s->arr = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -74783,19 +74895,24 @@ static int js_string_raw_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The template and its `raw`, the literal held between its read
+   and its coercion, and the accumulator — which needs no take_result guard here either: string_buffer_end NULLs
+   the buffer on every path that consumed it, so the release below is right whether the result was produced or
+   not. This machine is the one whose result IS the buffer, so the completion builds it before the release. */
+static void js_string_raw_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSStringRaw *s = st;
+    v->val(ctx, &s->cooked);
+    v->val(ctx, &s->literals);
+    v->val(ctx, &s->el);
+    v->strbuf(ctx, &s->b);
+}
+
 static JSValue js_string_raw_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSStringRaw *s = st;
-    JSValue r;
-    JS_FreeValue(ctx, s->cooked);
-    JS_FreeValue(ctx, s->literals);
-    JS_FreeValue(ctx, s->el);
-    if (take_result) {
-        r = string_buffer_end(&s->b);
-    } else {
-        string_buffer_free(&s->b);
-        r = JS_UNDEFINED;
-    }
+    JSValue r = take_result ? string_buffer_end(&s->b) : JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -75542,13 +75659,22 @@ static int js_string_includes_step(JSContext *ctx, void *st, JSValue cb_result, 
     return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The two coerced strings, each held across the other's
+   coercion. */
+static void js_string_includes_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSStrIncludes *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->str);
+    v->val(ctx, &s->v);
+}
+
 static JSValue js_string_includes_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSStrIncludes *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->result);
-    JS_FreeValue(ctx, s->str);
-    JS_FreeValue(ctx, s->v);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -80795,6 +80921,11 @@ static void js_enum_keys_visit(JSContext *ctx, void *elem, JSStepVisit *v)
     JSEnumKeys *ek = elem;
     v->val(ctx, &ek->obj);
     v->props(ctx, &ek->atoms, ek->len);
+    /* the key+VALUE form's collected values. They were missing from this list, which no consumer noticed while
+       every machine reading the declaration used the key-only form — import()'s attribute walk is the one that
+       wants values, and converting its teardown to the declaration leaked 390 objects per corpus run the moment
+       it did. cb is the request buffer and borrows `obj`. */
+    v->array(ctx, (void **)&ek->vals, sizeof(JSValue), (int)ek->kept, (int)ek->len, js_step_visit_value_elem);
 }
 
 /* WHAT ONE WALK FRAME OWNS. `holder` is borrowed from its parent's `val`, and fpr/vpr are borrowed into the
@@ -82929,17 +83060,25 @@ static int js_symbol_for_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
     return JS_IsException(m->result) ? (m->result = JS_UNDEFINED, -1) : 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The symbol; the key's ToString is the header's coercion. */
+static void js_symbol_for_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSSymbolFor *m = st;
+    v->val(ctx, &m->result);
+}
+
 static JSValue js_symbol_for_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSSymbolFor *m = st;
-    JSValue r = take_result ? m->result : (JS_FreeValue(ctx, m->result), JS_UNDEFINED);
+    JSValue r = take_result ? m->result : JS_UNDEFINED;
+    if (take_result) m->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, m);
     js_free_rt(ctx->rt, m);
     return r;
 }
 
 static const JSTrampStepDef js_symbol_for_def = {
-    sizeof(JSSymbolFor), js_symbol_for_step, js_symbol_for_fini, 0
-};
+    sizeof(JSSymbolFor), js_symbol_for_step, js_symbol_for_fini, 0, .visit = js_symbol_for_visit };
 
 static JSValue js_symbol_keyFor(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv)
@@ -88040,11 +88179,20 @@ static int js_date_set_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
     return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). Only the result: the captured date fields are doubles read
+   before any argument was coerced, and the argument coercions run on the header's own captures. */
+static void js_date_set_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSDateSet *s = st;
+    v->val(ctx, &s->result);
+}
+
 static JSValue js_date_set_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSDateSet *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->result);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -92058,19 +92206,29 @@ static int js_ta_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
     return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The three operands with their coerced primitives in place,
+   and — only once the plan has been made — the buffer that plan holds across the `prototype` read. `planned` is
+   that condition, which is why the buffer is an `if` around the visit rather than a field in a list. */
+static void js_ta_ctor_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSTACtor *s = st;
+    int i;
+    v->val(ctx, &s->result);
+    for (i = 0; i < 3; i++) v->val(ctx, &s->argp[i]);
+    if (s->planned) v->val(ctx, &s->plan.buffer);
+}
+
 static JSValue js_ta_ctor_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSTACtor *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    int i;
-    if (!take_result) JS_FreeValue(ctx, s->result);
-    if (s->planned) JS_FreeValue(ctx, s->plan.buffer);
-    for (i = 0; i < 3; i++) JS_FreeValue(ctx, s->argp[i]);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
 
-#define TACTOR_DEF(k) { sizeof(JSTACtor), js_ta_ctor_step, js_ta_ctor_fini, JS_CLASS_UINT8C_ARRAY + (k) }
+#define TACTOR_DEF(k) { sizeof(JSTACtor), js_ta_ctor_step, js_ta_ctor_fini, JS_CLASS_UINT8C_ARRAY + (k), .visit = js_ta_ctor_visit }
 /* one per element type; `arg` carries the class id the body switches on. No STEPDEF id: the dispatch names the
    definition by pointer, the way a DELEGATE does. */
 static const JSTrampStepDef js_ta_ctor_defs[JS_TYPED_ARRAY_COUNT] = {
@@ -92916,14 +93074,22 @@ static int js_atomics_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
     return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The coerced argument vector — the machine's own block, since
+   each coercion is the page's valueOf and a fork can land between two of them. cb is the ToPrimitive request's
+   buffer and borrows out of that vector. */
+static void js_atomics_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSAtomics *s = st;
+    v->val(ctx, &s->result);
+    v->array(ctx, (void **)&s->argp, sizeof(JSValue), s->nargp, s->nargp, js_step_visit_value_elem);
+}
+
 static JSValue js_atomics_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSAtomics *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    int i;
-    if (!take_result) JS_FreeValue(ctx, s->result);
-    for (i = 0; i < s->nargp; i++) JS_FreeValue(ctx, s->argp[i]);
-    js_free(ctx, s->argp);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -95141,20 +95307,30 @@ static int js_b64op_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **
     return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). Only the result: `options` is a borrowed view of the
+   invocation the header holds, which is what its JSValueConst says. */
+static void js_b64op_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSB64Op *s = st;
+    v->val(ctx, &s->result);
+}
+
 static JSValue js_b64op_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSB64Op *s = st;
-    JSValue r = take_result ? s->result : (JS_FreeValue(ctx, s->result), JS_UNDEFINED);
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free_rt(ctx->rt, s);
     return r;
 }
 
 static const JSTrampStepDef js_u8_tobase64_def =
-    { sizeof(JSB64Op), js_b64op_step, js_b64op_fini, B64OP_TO };
+    { sizeof(JSB64Op), js_b64op_step, js_b64op_fini, B64OP_TO, .visit = js_b64op_visit };
 static const JSTrampStepDef js_u8_frombase64_def =
-    { sizeof(JSB64Op), js_b64op_step, js_b64op_fini, B64OP_FROM };
+    { sizeof(JSB64Op), js_b64op_step, js_b64op_fini, B64OP_FROM, .visit = js_b64op_visit };
 static const JSTrampStepDef js_u8_setfrombase64_def =
-    { sizeof(JSB64Op), js_b64op_step, js_b64op_fini, B64OP_SET_FROM };
+    { sizeof(JSB64Op), js_b64op_step, js_b64op_fini, B64OP_SET_FROM, .visit = js_b64op_visit };
 
 /* Everything AFTER the options: the buffer access, the codec and the result. Not one step of it is the page's
    code, which is why it is a plain C tail and only the reads above became requests. One function for all three
