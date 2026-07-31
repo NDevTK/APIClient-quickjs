@@ -1576,28 +1576,65 @@ static int re_parse_nested_class(REParseState *s, REStringList *cr_out, const ui
                 goto fail;
             if (*p == '-' && p[1] != ']') {
                 const uint8_t *p0 = p + 1;
+                REStringList cr_b_s, *cr_b = &cr_b_s;
+                bool c1_is_list, c2_is_list;
                 if (p[1] == '-' && s->unicode_sets && f->is_first)
                     goto class_atom; /* first character class followed by '--' */
-                if (c1 >= CLASS_RANGE_BASE) {
-                    if (s->is_unicode) {
+                c2 = get_class_atom(s, cr_b, &p0, true);
+                if ((int)c2 < 0) {
+                    if (c1 >= CLASS_RANGE_BASE)
                         re_string_list_free(cr1);
-                        goto invalid_class_range;
-                    }
-                    /* Annex B: match '-' character */
-                    goto class_atom;
-                }
-                c2 = get_class_atom(s, cr1, &p0, true);
-                if ((int)c2 < 0)
                     goto fail;
-                if (c2 >= CLASS_RANGE_BASE) {
-                    re_string_list_free(cr1);
+                }
+                c1_is_list = c1 >= CLASS_RANGE_BASE;
+                c2_is_list = c2 >= CLASS_RANGE_BASE;
+                p = p0;
+                if (c1_is_list || c2_is_list) {
+                    /* B.1.2 CharacterRangeOrUnion. A ClassAtom that is a class ESCAPE has no single character
+                       to be the bound of a range, so `\s-0` is not a range: it is the UNION of `\s`, a literal
+                       `-`, and `0` — and, the part that was wrong, the class then resumes AFTER that second
+                       atom. Unioning only the first atom and re-parsing from the `-` made `[\s-0-9]` read a
+                       fresh `0-9` range and match every digit; V8's regexp.js asserts it matches `0` and `9`
+                       and not `1`, which is the union this produces. In a /u or /v pattern there is no
+                       Annex B and the same shape is a syntax error, which is why that check comes first. */
                     if (s->is_unicode) {
+                        if (c1_is_list) re_string_list_free(cr1);
+                        if (c2_is_list) re_string_list_free(cr_b);
                         goto invalid_class_range;
                     }
-                    /* Annex B: match '-' character */
-                    goto class_atom;
+                    if (c1_is_list) {
+                        ret = re_string_list_op(cr, cr1, CR_OP_UNION);
+                        re_string_list_free(cr1);
+                        if (ret) {
+                            if (c2_is_list) re_string_list_free(cr_b);
+                            goto memory_error;
+                        }
+                    } else {
+                        if (s->ignore_case)
+                            c1 = lre_canonicalize(c1, s->is_unicode);
+                        if (cr_union_interval(&cr->cr, c1, c1)) {
+                            if (c2_is_list) re_string_list_free(cr_b);
+                            goto memory_error;
+                        }
+                    }
+                    if (cr_union_interval(&cr->cr, '-', '-')) {
+                        if (c2_is_list) re_string_list_free(cr_b);
+                        goto memory_error;
+                    }
+                    if (c2_is_list) {
+                        ret = re_string_list_op(cr, cr_b, CR_OP_UNION);
+                        re_string_list_free(cr_b);
+                        if (ret)
+                            goto memory_error;
+                    } else {
+                        if (s->ignore_case)
+                            c2 = lre_canonicalize(c2, s->is_unicode);
+                        if (cr_union_interval(&cr->cr, c2, c2))
+                            goto memory_error;
+                    }
+                    f->is_first = false; /* union operation */
+                    goto after_class_item;
                 }
-                p = p0;
                 if (c2 < c1) {
                 invalid_class_range:
                     re_parse_error(s, "invalid class range");
@@ -1633,6 +1670,7 @@ static int re_parse_nested_class(REParseState *s, REStringList *cr_out, const ui
                         goto memory_error;
                 }
             }
+        after_class_item: ;
         }
         if (s->unicode_sets && f->is_first) {
             if (*p == '&' && p[1] == '&' && p[2] != '&') {
