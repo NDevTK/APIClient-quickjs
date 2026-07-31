@@ -21886,6 +21886,12 @@ typedef struct JSIterConsume {
                             done path is re-entered after it) */
     uint8_t closing; /* 1 = the sink short-circuited: close the iterator on the tramp, then finish */
     uint8_t cb_pending; /* ITERTERM: 1 = `res` on the next step entry is the CALLBACK's result, not an iterator result */
+    /* THE ITERATOR RECORD'S [[Done]]. 7.4.9 IteratorStepValue step 2 sets it when the `next` CALL completes
+       abruptly, and every consumer's step is then a plain `? IteratorStepValue(...)` — NOT an
+       IfAbruptCloseIterator — so a throwing `next` propagates without closing anything. The close sites read
+       this: `iter.every(fn)` on an iterator whose `next` throws must leave `return` uncalled, and it did not,
+       because the sink's abrupt path could not tell WHICH operation had been abrupt. */
+    uint8_t iter_done;
     uint8_t drive_pending; /* 1 = the call now in flight is the record's .next() DRIVE, not a callback or an adder.
                               The operand shape cannot answer this — a PROXIED .next() is reshaped to the trap's
                               five operands — so the machine that asked records what it asked for. */
@@ -30491,6 +30497,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValue *cargv = sp - call_pop;
                 int drive = ((JSIterConsume *)cont_st)->drive_pending;
                 ((JSIterConsume *)cont_st)->drive_pending = 0;
+                /* 7.4.9 step 2: an abrupt `next` marks the RECORD done, and a done record is never closed. */
+                if (drive && JS_IsException(ret_val)) ((JSIterConsume *)cont_st)->iter_done = 1;
                 DCHECK(call_pop >= call_first_r, "consume call records operands ending below where they start");
                 for (i = call_first_r; i < call_pop; i++) JS_FreeValue(ctx, cargv[i]);
                 sp += call_first_r - call_pop;
@@ -30514,7 +30522,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     /* An Iterator.prototype terminal whose predicate/reducer threw must CLOSE the underlying iterator
                        (the close's own throw is discarded — the original wins). A generator closes on the tramp via
                        the exception label's deferral. */
-                    if (s->sink == ITERCONS_ITERTERM && !JS_IsUndefined(s->iter)) {
+                    if (s->sink == ITERCONS_ITERTERM && !JS_IsUndefined(s->iter) && !s->iter_done) {
                         iter_close_defer(ctx, s->iter);
                     }
                     js_iter_consume_end(ctx, s); js_free_rt(rt, s); goto exception;
@@ -37952,11 +37960,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             /* the map/filter/flatMap callback THREW. Control never reaches the step's resume, so IfAbruptCloseIterator
                must happen HERE - the spec closes the underlying iterator when the callback throws, and skipping it is
                what mapper-throws / mapper-throws-then-closing-iterator-also-throws detect. */
+            /* ...EXCEPT when the call that threw was the record's own `next`. 7.4.9 IteratorStepValue step 2
+               marks the record DONE on an abrupt `next`, and 27.1.4.x's helper reads it with a plain
+               `? IteratorStepValue(...)`, so that throw closes nothing. `drive_pending` says which call this
+               was, and only a successful delivery clears it — the eager terminals had the same gap and it is
+               the same rule. */
             JSIteratorHelperData *cit = (JSIteratorHelperData *)xcs;
+            /* WHICH RECORD the abrupt `next` belonged to is the whole question. flatMap holds TWO: an abrupt on
+               the INNER is 27.1.4.4 step 6.c.i.ii's IfAbruptCloseIterator(innerNext, ITERATED) — it closes the
+               OUTER — while an abrupt on the outer's own `next` is 7.4.9 step 2, which marks that record done
+               and closes nothing. `drive_close` is take's close-on-limit `.return()`, whose own throw
+               propagates rather than provoking a second close. */
+            int close_owed = !cit->drive_pending || cit->drive_inner;
             JS_FreeValue(ctx, cit->cb_value); cit->cb_value = JS_UNDEFINED;
             cit->done = 1;
             cit->executing = 0;
-            iter_helper_close_source_abrupt(ctx, cit);
+            if (close_owed) iter_helper_close_source_abrupt(ctx, cit);
             js_iter_helper_drop_consumer(ctx, cit);
         } else if (xck == CONT_TOPRIM) {
             /* the coercion method THREW: 7.1.1 propagates it (there is no next-method fallback on an abrupt
@@ -38427,9 +38446,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    inline, which resumes a generator body OFF the tramp. The second reason is gone — the close is
                    parked and the exception label runs it on the tramp — and the first was never true:
                    `Array.from(gen, mapfnThatThrows)` left the generator's `finally` UNRUN. Every consumer whose
-                   callback threw is an IfAbruptCloseIterator site, whatever its source. */
+                   callback threw is an IfAbruptCloseIterator site, whatever its source.
+                   THE ONE CALL THIS DOES NOT COVER IS THE RECORD'S OWN `next`. 7.4.9 IteratorStepValue step 2
+                   marks the record DONE when the `next` call completes abruptly, and every consumer then reads
+                   it with a plain `? IteratorStepValue(...)` — not IfAbruptCloseIterator — so a throwing `next`
+                   propagates having closed nothing. `drive_pending` is exactly that distinction and it is still
+                   set here, because only the successful delivery clears it. Without this, an iterator whose
+                   `next` throws had its `return` called by every eager terminal and every lazy helper. */
                 struct JSIterConsume *cs2 = (struct JSIterConsume *)xcs;
-                iter_close_defer(ctx, cs2->iter);
+                if (cs2->drive_pending) cs2->iter_done = 1;
+                else                    iter_close_defer(ctx, cs2->iter);
             }
             if (xck == CONT_ITER_CONSUME)
                 js_iter_consume_end(ctx, (struct JSIterConsume *)xcs);
@@ -65817,7 +65843,7 @@ static void js_iter_consume_end(JSContext *ctx, JSIterConsume *s)
 static void js_iter_consume_abandon(JSContext *ctx, void *st)
 {
     JSIterConsume *s = st;
-    if (!JS_IsUndefined(s->iter)) {
+    if (!JS_IsUndefined(s->iter) && !s->iter_done) {
         iter_close_defer(ctx, s->iter);
     }
     js_iter_consume_end(ctx, s);
@@ -68282,7 +68308,12 @@ static int js_iter_helper_return_step(JSContext *ctx, void *st, JSValue cb_resul
             JS_ThrowTypeError(ctx, "Iterator Helper is already running");
             return -1;
         }
-        s->arg = js_dup(step_arg(&s->hdr, 0));
+        /* 27.1.4.1.3 %IteratorHelperPrototype%.return builds its answer from ReturnCompletion(UNDEFINED) and
+           CreateIterResultObject(undefined, true) — the ARGUMENT is never read. It was carried into the result,
+           so `helper.return("ignored")` answered {done:true, value:"ignored"}. The field stays because the
+           machine's completion still needs a value to build the result around; what changed is that the value
+           the spec names is undefined, on every one of its paths. */
+        s->arg = JS_UNDEFINED;
         if (it->done) {        /* an exhausted helper closes nothing */
             s->result = js_create_iterator_result(ctx, js_dup(s->arg), true);
             return JS_IsException(s->result) ? -1 : 0;
@@ -73984,14 +74015,23 @@ static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue
         if (!JS_IsObject(res)) {   /* 7.4.2 step 3 */
             JS_FreeValue(ctx, res);
             JS_ThrowTypeError(ctx, "iterator result not an object");
+            /* step 6.c.i.ii: the INNER's IteratorNext is inside IfAbruptCloseIterator(innerNext, ITERATED), so
+               a bad inner result closes the OUTER source. */
+            it->done = 1; iter_helper_close_source_abrupt(ctx, it);
             return -1;
         }
         DCHECK(JS_IsUndefined(it->res_obj), "the helper is already unpacking a result");
         it->res_obj = res;
         it->resume_pc = ITHP_INNER_DONE; it->read_atom = JS_ATOM_done;
+        /* steps 6.c.i.iv and .vii wrap the inner's IteratorComplete and IteratorValue in
+           IfAbruptCloseIterator(…, ITERATED) — the OUTER, not the inner. The source's OWN done/value reads are
+           not inside one (7.4.9 marks that record done instead), which is why this flag is per-read. */
+        it->read_closes_source = 1;
         return 6;
     case ITHP_INNER_DONE: {
-        int d = JS_ToBoolFree(ctx, res);
+        int d;
+        it->read_closes_source = 0;
+        d = JS_ToBoolFree(ctx, res);
         if (d) {   /* inner exhausted: a naturally-done iterator needs no close; go back to the source */
             JS_FreeValue(ctx, it->res_obj); it->res_obj = JS_UNDEFINED;
             JS_FreeValue(ctx, it->inner); it->inner = JS_UNDEFINED;
@@ -74001,9 +74041,11 @@ static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue
             return 1;   /* drive the source for the next inner iterable */
         }
         it->resume_pc = ITHP_INNER_VALUE; it->read_atom = JS_ATOM_value;
+        it->read_closes_source = 1;   /* step 6.c.i.vii, the same IfAbruptCloseIterator over the OUTER */
         return 6;   /* IteratorValue on the inner's result — a request like every other keyed read */
     }
     case ITHP_INNER_VALUE: {
+        it->read_closes_source = 0;
         JS_FreeValue(ctx, it->res_obj); it->res_obj = JS_UNDEFINED;
         it->resume_pc = ITHP_START;   /* the next .next() continues this inner (START re-checks it->inner) */
         *out = js_create_iterator_result(ctx, res, false);   /* a FRESH result, per Yield; consumes res */
