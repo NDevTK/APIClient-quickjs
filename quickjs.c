@@ -17796,6 +17796,18 @@ struct JSStepVisit {
        delegation composes rather than being a hole — a fork inside `str.replace`'s built-in @@replace is a
        fork inside the machine it handed its whole walk to. */
     void (*machine)(JSContext *ctx, void **slot);
+    /* An ARRAY OF SUB-OBJECTS: `n` live elements of `size` bytes in a `cap`-element allocation, each visited by
+       `each`. ONE operation rather than a buffer plus a loop in the machine, because the two consumers need
+       OPPOSITE ORDER — the clone must copy the array before taking references into it, the teardown must
+       release those references before freeing it — and getting that backwards is a use-after-free the machine
+       should never be in a position to write. */
+    void (*array)(JSContext *ctx, void **slot, size_t size, int n, int cap,
+                  void (*each)(JSContext *ctx, void *elem, JSStepVisit *v));
+    /* A REFCOUNTED READ-ONLY structure two flows may SHARE. Sharing rather than copying is not a shortcut here,
+       it is the correct answer: nothing writes it after it is built, which is also what keeps pointers already
+       taken INTO it valid in both arms — a copy would leave the sibling's interior pointers naming the
+       original's tree. The clone takes a reference, the teardown drops one and destroys at zero. */
+    void (*shared)(JSContext *ctx, void **slot, int *refs, void (*destroy)(JSContext *ctx, void *p));
 };
 /* HOISTED to here, for the reason JSStepHdr is: the visitor above names it and the machine that owns one is
    thousands of lines below. A sorted element carries the value AND the string a default comparison coerced it
@@ -19133,12 +19145,46 @@ static void js_step_visit_dup_machine(JSContext *ctx, void **slot) {
 static void js_step_visit_free_machine(JSContext *ctx, void **slot) {
     if (*slot) { JS_FreeValue(ctx, tramp_step_state_free(ctx, *slot, false)); *slot = NULL; }
 }
+static const JSStepVisit js_step_visit_dup;
+static const JSStepVisit js_step_visit_free;
+static void js_step_visit_dup_array(JSContext *ctx, void **slot, size_t size, int n, int cap,
+                                    void (*each)(JSContext *, void *, JSStepVisit *)) {
+    uint8_t *src = *slot, *cp;
+    int i;
+    if (!src) return;
+    cp = js_malloc(ctx, size * (size_t)(cap > 0 ? cap : 1));
+    if (!cp) { *slot = NULL; return; }
+    memcpy(cp, src, size * (size_t)(cap > 0 ? cap : 0));
+    *slot = cp;                                        /* COPY FIRST, then take references into the copy */
+    for (i = 0; i < n; i++) each(ctx, cp + size * (size_t)i, (JSStepVisit *)&js_step_visit_dup);
+}
+static void js_step_visit_free_array(JSContext *ctx, void **slot, size_t size, int n, int cap,
+                                     void (*each)(JSContext *, void *, JSStepVisit *)) {
+    uint8_t *a = *slot;
+    int i;
+    (void)cap;
+    if (!a) return;
+    for (i = 0; i < n; i++) each(ctx, a + size * (size_t)i, (JSStepVisit *)&js_step_visit_free);
+    js_free(ctx, a);                                   /* RELEASE FIRST, then free the storage */
+    *slot = NULL;
+}
+static void js_step_visit_dup_shared(JSContext *ctx, void **slot, int *refs, void (*destroy)(JSContext *, void *)) {
+    (void)ctx; (void)destroy;
+    if (*slot) (*refs)++;
+}
+static void js_step_visit_free_shared(JSContext *ctx, void **slot, int *refs, void (*destroy)(JSContext *, void *)) {
+    if (!*slot) return;
+    if (--(*refs) == 0) destroy(ctx, *slot);
+    *slot = NULL;
+}
 static const JSStepVisit js_step_visit_dup  = { js_step_visit_dup_val,  js_step_visit_dup_strbuf,  js_step_visit_dup_props,
                                                 js_step_visit_dup_slots,  js_step_visit_dup_scratch,
-                                                js_step_visit_dup_atom,  js_step_visit_dup_machine };
+                                                js_step_visit_dup_atom,  js_step_visit_dup_machine,
+                                                js_step_visit_dup_array,  js_step_visit_dup_shared };
 static const JSStepVisit js_step_visit_free = { js_step_visit_free_val, js_step_visit_free_strbuf, js_step_visit_free_props,
                                                 js_step_visit_free_slots, js_step_visit_free_scratch,
-                                                js_step_visit_free_atom, js_step_visit_free_machine };
+                                                js_step_visit_free_atom, js_step_visit_free_machine,
+                                                js_step_visit_free_array, js_step_visit_free_shared };
 /* A machine's teardown releases what it owns through the SAME declaration the clone reads, so the two cannot
    disagree about which fields those are. */
 static void tramp_step_visit_free(JSContext *ctx, void *st) {
@@ -23728,6 +23774,7 @@ static JSValue js_lookup_acc_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_for_in_fini(JSContext *ctx, void *st, bool take_result);
 static int js_json_parse_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_json_parse_vfini(JSContext *ctx, void *st, bool take_result);
+static void js_json_reviver_visit(JSContext *ctx, void *st, JSStepVisit *v);
 /* js_call_function — the builtins' monkey-patch-proof Function.prototype.call (Iterator.zip/zipKeyed use it to invoke
    an input iterator's .next). It holds NO continuation, so like f.call it is RESOLVED at the operator site and the
    ultimate target dispatched on this chain; JS_Call'ing it from C would drive a generator .next off the tramp. */
@@ -41051,6 +41098,11 @@ typedef struct {
 } JSONParseRecordObject;
 
 typedef struct JSONParseRecord {
+    /* ROOT ONLY. The tree is built once and never written again, so two flows forked during the reviver walk
+       SHARE it — which is what keeps each frame's borrowed fpr/vpr valid in both arms, where a copy would leave
+       the sibling's naming the original's nodes. Children are inline in their parent's allocation and have no
+       count of their own. */
+    int ref_count;
     JSValue value;
     union {
         JSONParseRecordObject obj;
@@ -67818,7 +67870,7 @@ static const JSTrampStepDef js_ta_sort_def       = { sizeof(JSTASort), js_ta_sor
 static const JSTrampStepDef js_ta_toSorted_def   = { sizeof(JSTASort), js_ta_sort_vstep, js_ta_sort_vfini, 1 };
 static const JSTrampStepDef js_array_sort_def    = { sizeof(JSArraySort), js_array_sort_vstep, js_array_sort_vfini, 0, .visit = js_array_sort_visit };
 static const JSTrampStepDef js_array_toSorted_def = { sizeof(JSArraySort), js_array_sort_vstep, js_array_sort_vfini, 1, .visit = js_array_sort_visit };
-static const JSTrampStepDef js_json_parse_def    = { sizeof(JSJsonReviver), js_json_parse_vstep, js_json_parse_vfini, 0 };
+static const JSTrampStepDef js_json_parse_def    = { sizeof(JSJsonReviver), js_json_parse_vstep, js_json_parse_vfini, 0, .visit = js_json_reviver_visit };
 static const JSTrampStepDef js_for_in_def       = { sizeof(JSForIn), js_for_in_step, js_for_in_fini, 0 };
 static int check_iterator(JSContext *ctx, JSValueConst obj);
 
@@ -79682,6 +79734,7 @@ static int js_json_parse_begin(JSContext *ctx, JSJsonReviver *s)
         s->reviver = reviver;
         for (i = 0; i < 5; i++) s->cb_args[i] = JS_UNDEFINED;
         s->pr = js_mallocz(ctx, sizeof(JSONParseRecord));
+        if (s->pr) s->pr->ref_count = 1;   /* this machine's reference; a deep-fork clone takes another */
         if (!s->pr) return -1;
         s->root = JS_NewObject(ctx);
         if (JS_IsException(s->root)) return -1;
@@ -79755,6 +79808,7 @@ enum { JP_TOSTRING = 1, JP_PARSE, JP_WALK };
 
 static int js_json_reviver_step(JSContext *ctx, JSJsonReviver *s, JSValue res, JSValueConst out_args[3]);
 static JSValue js_json_reviver_end(JSContext *ctx, JSJsonReviver *s, bool ok);
+static void js_json_reviver_visit(JSContext *ctx, void *st, JSStepVisit *v);
 
 static int js_json_parse_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
@@ -79998,26 +80052,60 @@ static int js_json_reviver_step(JSContext *ctx, JSJsonReviver *s, JSValue res, J
     }
     return 0;
 }
+/* WHAT AN ENUMERABLE-KEY CURSOR OWNS: a frame holds one while phase 3's key walk is in flight. */
+static void js_enum_keys_visit(JSContext *ctx, void *elem, JSStepVisit *v)
+{
+    JSEnumKeys *ek = elem;
+    v->val(ctx, &ek->obj);
+    v->props(ctx, &ek->atoms, ek->len);
+}
+
+/* WHAT ONE WALK FRAME OWNS. `holder` is borrowed from its parent's `val`, and fpr/vpr are borrowed into the
+   parse record — which the machine SHARES rather than copies, so they stay valid in a clone. Everything else
+   is the frame's, including a cursor parked mid-request: the exception that tears a frame down can arrive from
+   inside any of its twelve requests, and so can a fork. */
+static void js_jrframe_visit(JSContext *ctx, void *elem, JSStepVisit *v)
+{
+    JRFrame *f = elem;
+    v->array(ctx, (void **)&f->ek, sizeof(JSEnumKeys), f->ek ? 1 : 0, f->ek ? 1 : 0, js_enum_keys_visit);
+    v->props(ctx, &f->atoms, (uint32_t)f->len);
+    v->val(ctx, &f->name_val);
+    v->val(ctx, &f->val);
+    v->val(ctx, &f->context);
+    v->val(ctx, &f->applied);
+    v->atom(ctx, &f->apply_name);
+    v->atom(ctx, &f->name);
+}
+
+static void json_destroy_parse_record(JSContext *ctx, void *p)
+{
+    json_free_parse_record(ctx, (JSONParseRecord *)p);
+    js_free(ctx, p);
+}
+
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The reviver is the page's code called once per node, so a
+   concolic branch inside it forks the walk and each arm revives its own subtree from there — its own frame
+   stack, its own holders, its own result. The parse record is SHARED by reference for the reason stated at its
+   refcount, and `text` is a C string the machine holds for the whole walk. */
+static void js_json_reviver_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSJsonReviver *s = st;
+    v->array(ctx, (void **)&s->stack, sizeof(JRFrame), s->sp, s->cap, js_jrframe_visit);
+    v->shared(ctx, (void **)&s->pr, s->pr ? &s->pr->ref_count : NULL, json_destroy_parse_record);
+    v->val(ctx, &s->root);
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->text_str);
+}
+
 static JSValue js_json_reviver_end(JSContext *ctx, JSJsonReviver *s, bool ok) {
-    while (s->sp > 0) {   /* free any frames still open (exception mid-walk) */
-        JRFrame *f = &s->stack[--s->sp];
-        /* a frame torn down MID-WALK still owns its cursor — the exception can arrive from inside one of its
-           twelve requests, which is precisely the state this list has to cover. */
-        if (f->ek) { js_enum_keys_free(ctx, f->ek); js_free(ctx, f->ek); f->ek = NULL; }
-        if (f->atoms) js_free_prop_enum(ctx, f->atoms, (uint32_t)f->len);
-        JS_FreeValue(ctx, f->name_val);
-        JS_FreeValue(ctx, f->val);
-        JS_FreeValue(ctx, f->context);
-        JS_FreeValue(ctx, f->applied);
-        JS_FreeAtom(ctx, f->apply_name);
-        JS_FreeAtom(ctx, f->name);
-    }
-    js_free(ctx, s->stack); s->stack = NULL;
-    if (s->pr) { json_free_parse_record(ctx, s->pr); js_free(ctx, s->pr); s->pr = NULL; }
-    JS_FreeValue(ctx, s->root); s->root = JS_UNDEFINED;
+    JSValue r;
+    /* sp is the LIVE frame count the declaration reads, so it must still be intact here — every frame still
+       open (an exception, or a fork, arriving from inside one of its requests) is released through it. */
+    if (ok) { r = s->result; s->result = JS_UNDEFINED; } else r = JS_EXCEPTION;
+    tramp_step_visit_free(ctx, s);
+    s->sp = 0;
     if (s->text) { JS_FreeCString(ctx, s->text); s->text = NULL; }
-    if (!ok) { JS_FreeValue(ctx, s->result); return JS_EXCEPTION; }
-    return s->result;
+    return r;
 }
 /* The JSON.parse recognizer is DELETED — it existed only to pick the suspendable walk over
    internalize_json_property, and that walker is gone. */
