@@ -2783,6 +2783,179 @@ static int re_parse_disjunction(REParseState *s, bool is_backward_dir)
 }
 
 
+/* ---- The one-byte filter. -----------------------------------------------------------------------------
+   `Ā` cannot match any code unit of a Latin1 subject, so a program that must consume one cannot match at all —
+   and the loop in FRONT of it need never be explored. That is the difference between `/(((.*)*)*x)Ā/`
+   finishing and not: measured on this engine, instant on an 8-character subject and unbounded at 12, because
+   the `(((.*)*)*x)` backtracks 2^n times before ever reaching the character that makes the whole thing
+   impossible. V8 removes such nodes when it compiles for a one-byte subject; this is the same conclusion
+   reached by reading the finished program instead.
+
+   It is NOT a bound. A bound refuses work that has an answer; this proves the answer is "no match" and stops
+   computing it. The soundness argument is one line per opcode: a character opcode whose every alternative
+   needs a unit above 0xFF has no successor when the subject is one-byte, and everything else keeps the
+   successors it always had. */
+
+/* Does this character opcode have ANY alternative a one-byte subject could supply? */
+static bool re_op_matches_latin1(const uint8_t *bc, int pos)
+{
+    int opcode = bc[pos];
+    uint32_t n, i, lo;
+
+    switch (opcode) {
+    case REOP_char:
+    case REOP_char_i:
+        return get_u16(bc + pos + 1) <= 0xff;
+    case REOP_char32:
+    case REOP_char32_i:
+        return get_u32(bc + pos + 1) <= 0xff;
+    case REOP_range:
+    case REOP_range_i:
+        n = get_u16(bc + pos + 1);
+        for (i = 0; i < n; i++) {
+            lo = get_u16(bc + pos + 3 + i * 4);
+            if (lo <= 0xff)
+                return true;      /* the interval starts inside Latin1 */
+        }
+        return false;
+    case REOP_range32:
+    case REOP_range32_i:
+        n = get_u16(bc + pos + 1);
+        for (i = 0; i < n; i++) {
+            lo = get_u32(bc + pos + 3 + i * 8);
+            if (lo <= 0xff)
+                return true;
+        }
+        return false;
+    default:
+        return true;              /* dot/any/space/back-reference/… — never impossible on its charset alone */
+    }
+}
+
+/* Is a code unit above 0xFF REQUIRED anywhere in the program? Answered once, at compile time, and recorded in
+   the header so an ordinary pattern never pays for the analysis below. */
+static bool re_program_has_non_latin1(const uint8_t *bc, int len)
+{
+    int pos = 0, opcode, oplen;
+    while (pos < len) {
+        opcode = bc[pos];
+        oplen = reopcode_info[opcode].size;
+        switch (opcode) {
+        case REOP_range: case REOP_range_i:
+            oplen += get_u16(bc + pos + 1) * 4;
+            break;
+        case REOP_range32: case REOP_range32_i:
+            oplen += get_u16(bc + pos + 1) * 8;
+            break;
+        case REOP_back_reference: case REOP_back_reference_i:
+        case REOP_backward_back_reference: case REOP_backward_back_reference_i:
+            oplen += re_get_idx(bc + pos + 1) * RE_IDX_SZ;
+            break;
+        default:
+            break;
+        }
+        if (!re_op_matches_latin1(bc, pos))
+            return true;
+        pos += oplen;
+    }
+    return false;
+}
+
+/* CAN THIS POINT STILL SUCCEED, on a one-byte subject? `reach[pos]` is true when the terminator of the
+   construct `pos` sits in — REOP_match at the top level, REOP_lookahead_match or its negative twin inside a
+   lookaround — is reachable from it. A character opcode that no one-byte unit can satisfy has NO successor,
+   which is the whole of the analysis; everything else keeps the successors the executor gives it.
+
+   A least fixpoint, computed by sweeping the program until nothing changes. Monotone (a point only ever goes
+   from unreachable to reachable) so it converges, and the sweep is linear, so the cost is O(program × passes)
+   for the small minority of patterns the header flag admits.
+
+   The one place the reasoning is not mechanical is a lookaround: `lookahead`'s own success depends on its
+   BODY reaching lookahead_match, while `negative_lookahead` succeeds precisely when its body does NOT — so
+   its continuation is reachable either way, and its body's reachability is a separate question the executor
+   asks for itself. Getting that backwards would turn "always succeeds" into "cannot match", which is why the
+   two are spelled out rather than shared. */
+static bool re_compute_reach(const uint8_t *bc, int len, uint8_t *reach)
+{
+    int pos, opcode, oplen, target, changed, guard;
+
+    memset(reach, 0, len);
+    /* `guard` bounds the sweeps at one per instruction, which is the fixpoint's own depth bound and not a cap
+       on anything the pattern can express: a value can flip only once, so len sweeps is the worst case. */
+    for (guard = 0; guard <= len; guard++) {
+        changed = 0;
+        pos = 0;
+        while (pos < len) {
+            bool now;
+            opcode = bc[pos];
+            oplen = reopcode_info[opcode].size;
+            switch (opcode) {
+            case REOP_range: case REOP_range_i:
+                oplen += get_u16(bc + pos + 1) * 4;
+                break;
+            case REOP_range32: case REOP_range32_i:
+                oplen += get_u16(bc + pos + 1) * 8;
+                break;
+            case REOP_back_reference: case REOP_back_reference_i:
+            case REOP_backward_back_reference: case REOP_backward_back_reference_i:
+                oplen += re_get_idx(bc + pos + 1) * RE_IDX_SZ;
+                break;
+            default:
+                break;
+            }
+            switch (opcode) {
+            case REOP_match:
+            case REOP_lookahead_match:
+            case REOP_negative_lookahead_match:
+                now = true;                                   /* the terminators ARE success */
+                break;
+            case REOP_goto:
+                target = pos + 5 + (int)get_u32(bc + pos + 1);
+                now = (target >= 0 && target < len) ? reach[target] : false;
+                break;
+            case REOP_split_goto_first:
+            case REOP_split_next_first:
+                target = pos + 5 + (int)get_u32(bc + pos + 1);
+                now = (pos + oplen < len && reach[pos + oplen]) ||
+                      (target >= 0 && target < len && reach[target]);
+                break;
+            case REOP_loop:
+                target = pos + oplen + (int)get_u32(bc + pos + 1 + RE_IDX_SZ);
+                now = (pos + oplen < len && reach[pos + oplen]) ||
+                      (target >= 0 && target < len && reach[target]);
+                break;
+            case REOP_loop_split_goto_first:
+            case REOP_loop_split_next_first:
+            case REOP_loop_check_adv_split_goto_first:
+            case REOP_loop_check_adv_split_next_first:
+                target = pos + oplen + (int)get_u32(bc + pos + 1 + RE_IDX_SZ + 4);
+                now = (pos + oplen < len && reach[pos + oplen]) ||
+                      (target >= 0 && target < len && reach[target]);
+                break;
+            case REOP_lookahead:
+                /* it succeeds only if its BODY does, and then the continuation must succeed too */
+                target = pos + 5 + (int)get_u32(bc + pos + 1);
+                now = (pos + oplen < len && reach[pos + oplen]) &&
+                      (target >= 0 && target < len && reach[target]);
+                break;
+            case REOP_negative_lookahead:
+                /* it succeeds when the body does NOT, so the continuation carries the answer by itself */
+                target = pos + 5 + (int)get_u32(bc + pos + 1);
+                now = (target >= 0 && target < len) ? reach[target] : false;
+                break;
+            default:
+                now = re_op_matches_latin1(bc, pos) && pos + oplen < len && reach[pos + oplen];
+                break;
+            }
+            if (now && !reach[pos]) { reach[pos] = 1; changed = 1; }
+            pos += oplen;
+        }
+        if (!changed)
+            break;
+    }
+    return reach[0] != 0;
+}
+
 /* Allocate the registers as a stack. The control flow is recursive so
    the analysis can be linear. */
 static int compute_register_count(uint8_t *bc_buf, int bc_buf_len)
@@ -2945,6 +3118,12 @@ uint8_t *lre_compile(int *plen, char *error_msg, int error_msg_size,
     put_u32(s->byte_code.buf + RE_HEADER_REGISTER_COUNT, register_count);
     put_u32(s->byte_code.buf + RE_HEADER_BYTECODE_LEN,
             s->byte_code.size - RE_HEADER_LEN);
+
+    if (re_program_has_non_latin1(s->byte_code.buf + RE_HEADER_LEN,
+                                  s->byte_code.size - RE_HEADER_LEN)) {
+        put_u16(s->byte_code.buf + RE_HEADER_FLAGS,
+                lre_get_flags(s->byte_code.buf) | LRE_FLAG_NON_LATIN1);
+    }
 
     /* add the named groups if needed */
     if (s->group_names.size > (s->capture_count - 1) * LRE_GROUP_NAME_TRAILER_LEN) {
@@ -3163,6 +3342,15 @@ static intptr_t lre_exec_backtrack(REExecContext *s)
     printf("%5s %5s %5s %5s %s\n", "PC", "CP", "BP", "SP", "OPCODE");
 #endif    
     for(;;) {
+        /* THE ONE-BYTE FILTER, asked once per opcode. `reach[pc]` false means the terminator of the construct
+           this point sits in cannot be reached from here on a subject of this charset, so the path is already
+           lost — which is exactly `no_match`, the same conclusion backtracking would reach after exploring it.
+           Asked HERE rather than at the branch opcodes because that is what prunes a single ALTERNATIVE:
+           `/(a|(((.*)*)*x)ă|(((.*)*)*x)\u0100)/` has one live branch and two dead ones, and the dead ones are
+           where the exponential lives. It subsumes the lookaround cases for free — a negative lookaround whose
+           body cannot succeed simply fails its body, which IS how it succeeds. */
+        if (unlikely(s->reach != NULL) && !s->reach[pc - s->bc_body])
+            goto no_match;
         opcode = *pc++;
 #ifdef DUMP_EXEC
         printf("%5ld %5ld %5ld %5ld %s\n",
@@ -3669,6 +3857,16 @@ int lre_exec_begin(REExecContext *s, uint8_t **capture,
     s->stack_size = countof(s->static_stack_buf);
     s->sp_off = 0;
     s->bp_off = 0;
+    s->reach = NULL;
+    s->bc_body = bc_buf + RE_HEADER_LEN;
+    s->impossible = false;
+    if (cbuf_type == 0 && (re_flags & LRE_FLAG_NON_LATIN1)) {
+        int blen = (int)get_u32(bc_buf + RE_HEADER_BYTECODE_LEN);
+        s->reach = lre_realloc(s->opaque, NULL, blen);
+        if (!s->reach)
+            return LRE_RET_MEMORY_ERROR;
+        s->impossible = !re_compute_reach(bc_buf + RE_HEADER_LEN, blen, s->reach);
+    }
 
     for(i = 0; i < s->capture_count * 2; i++)
         capture[i] = NULL;
@@ -3688,6 +3886,11 @@ int lre_exec_begin(REExecContext *s, uint8_t **capture,
 /* Run until the match finishes or the host asks for the thread back. LRE_RET_YIELD means call again. */
 int lre_exec_step(REExecContext *s)
 {
+    /* The whole program cannot consume what this subject is made of, so there is nothing to search — and this
+       is the case that matters, because the pattern that reaches it is the one whose loop would have
+       backtracked exponentially before finding out. */
+    if (s->impossible)
+        return 0;
     return lre_exec_backtrack(s);
 }
 
@@ -3695,6 +3898,10 @@ int lre_exec_step(REExecContext *s)
    point of the caller owning the context. */
 void lre_exec_end(REExecContext *s)
 {
+    if (s->reach) {
+        lre_realloc(s->opaque, s->reach, 0);
+        s->reach = NULL;
+    }
     if (s->stack_buf != s->static_stack_buf) {
         lre_realloc(s->opaque, s->stack_buf, 0);
         s->stack_buf = s->static_stack_buf;

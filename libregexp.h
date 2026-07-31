@@ -43,6 +43,11 @@ extern "C" {
 #define LRE_FLAG_INDICES    (1 << 6) /* Unused by libregexp, just recorded. */
 #define LRE_FLAG_NAMED_GROUPS (1 << 7) /* named groups are present in the regexp */
 #define LRE_FLAG_UNICODE_SETS (1 << 8)
+/* INTERNAL, like LRE_FLAG_NAMED_GROUPS: the compiled program contains a character or a range that needs a
+   code unit above 0xFF. It is the gate on the one-byte reachability analysis — without it that analysis would
+   run for every match of every pattern, and it can only ever change the answer for a pattern that has such a
+   character in it. */
+#define LRE_FLAG_NON_LATIN1 (1 << 9)
 
 #define LRE_RET_MEMORY_ERROR   (-1)
 #define LRE_RET_YIELD          (-2)
@@ -112,6 +117,13 @@ typedef struct REExecContext {
     const uint8_t *cptr;        /* the input cursor */
     size_t sp_off, bp_off;      /* the two cursors into stack_buf, as OFFSETS: stack_realloc moves the buffer */
     uint8_t **capture;          /* the caller's capture/register array, live for the whole match */
+
+    /* The one-byte filter's answer for THIS match: one byte per program offset, saying whether success is
+       still reachable from there. NULL when the filter does not apply — an ordinary pattern, or a two-byte
+       subject — and `impossible` is the whole-program verdict the entry point reads. */
+    uint8_t *reach;
+    const uint8_t *bc_body;   /* the program's first opcode: `reach` is indexed by the offset from here */
+    bool impossible;
 
     StackElem *stack_buf;
     size_t stack_size;
