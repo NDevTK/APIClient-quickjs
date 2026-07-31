@@ -67352,14 +67352,24 @@ static JSValue js_array_search_fini(JSContext *ctx, void *st, bool take_result)
    machine, and the JS_Call loop that used to live here is DELETED — not kept beside it. A recognizer only ever
    existed to choose between the two implementations; with the legacy one gone there is nothing to choose, so the
    builtin is simply DEFINED as a step machine (JS_CFUNC_STEP_DEF) and every caller drives that. */
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). `func` and `this_arg` are its own references rather than
+   borrowed header captures — the prologue duplicates them — and cb_args is [thisArg, fn, val, index, receiver],
+   every entry a borrowed view of one of those or of the loop's index. The clone side is what a concolic branch
+   inside the PREDICATE needs: each arm scans the array with its own cursor and settles on its own element. */
+static void js_array_find_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSArrayFind *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->obj);
+    v->val(ctx, &s->func);
+    v->val(ctx, &s->this_arg);
+    v->val(ctx, &s->val);
+}
+
 static void js_array_find_end(JSContext *ctx, JSArrayFind *s, bool take_result)
 {
-    if (!take_result)
-        JS_FreeValue(ctx, s->result);
-    JS_FreeValue(ctx, s->obj);
-    JS_FreeValue(ctx, s->func);
-    JS_FreeValue(ctx, s->this_arg);
-    JS_FreeValue(ctx, s->val);
+    if (take_result) s->result = JS_UNDEFINED;   /* handed to the caller, which read it before this ran */
+    tramp_step_visit_free(ctx, s);
 }
 
 static int js_array_find_recv(JSContext *ctx, JSArrayFind *s)
@@ -67598,14 +67608,14 @@ static JSValue js_array_tostring_fini(JSContext *ctx, void *st, bool take_result
 /* One NAMED definition per builtin, referenced by its JS_CFUNC_STEP_DEF registration through the id above — the same shape as
    JS_CFUNC_MAGIC_DEF naming its C function, so the registration line tells you what runs. An index into a side
    table would be a second list to keep in sync and a magic number that silently repoints when a row is inserted. */
-static const JSTrampStepDef js_array_find_def          = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFind };
-static const JSTrampStepDef js_array_findIndex_def     = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFindIndex };
-static const JSTrampStepDef js_array_findLast_def      = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFindLast };
-static const JSTrampStepDef js_array_findLastIndex_def = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFindLastIndex };
-static const JSTrampStepDef js_ta_find_def             = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFind | FIND_TA };
-static const JSTrampStepDef js_ta_findIndex_def        = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFindIndex | FIND_TA };
-static const JSTrampStepDef js_ta_findLast_def         = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFindLast | FIND_TA };
-static const JSTrampStepDef js_ta_findLastIndex_def    = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFindLastIndex | FIND_TA };
+static const JSTrampStepDef js_array_find_def          = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFind , .visit = js_array_find_visit };
+static const JSTrampStepDef js_array_findIndex_def     = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFindIndex , .visit = js_array_find_visit };
+static const JSTrampStepDef js_array_findLast_def      = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFindLast , .visit = js_array_find_visit };
+static const JSTrampStepDef js_array_findLastIndex_def = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFindLastIndex , .visit = js_array_find_visit };
+static const JSTrampStepDef js_ta_find_def             = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFind | FIND_TA , .visit = js_array_find_visit };
+static const JSTrampStepDef js_ta_findIndex_def        = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFindIndex | FIND_TA , .visit = js_array_find_visit };
+static const JSTrampStepDef js_ta_findLast_def         = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFindLast | FIND_TA , .visit = js_array_find_visit };
+static const JSTrampStepDef js_ta_findLastIndex_def    = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFindLastIndex | FIND_TA , .visit = js_array_find_visit };
 static const JSTrampStepDef js_re_replace_def          = { sizeof(JSReRep), js_re_rep_vstep, js_re_rep_fini, 0 };
 static int js_re_match_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_re_match_fini(JSContext *ctx, void *st, bool take_result);
