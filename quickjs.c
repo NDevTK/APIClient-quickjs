@@ -463,6 +463,11 @@ typedef struct JSStackFrame {
        "(missing)" behind a FIXME, and the walk that feeds Error.prepareStackTrace subtracted from a null
        pointer and read a line number out of the result. It is not an activation, so it is not a frame. */
     bool is_call_root;
+    /* THE RECEIVER of this call, BORROWED for the frame's lifetime exactly as cur_func is — the operand stack,
+       the heap frame or the coroutine state that holds the callee holds `this` beside it. A stack trace needs
+       it: V8's CallSite exposes getThis and getTypeName, and isToplevel is a question ABOUT the receiver
+       ("was this called on the global object"), so a frame that does not carry one cannot answer any of them. */
+    JSValueConst this_val;
     /* only used in generators. Current stack pointer value. NULL if
        the function is running. */
     JSValue *cur_sp;
@@ -1328,8 +1333,10 @@ typedef struct JSCallSiteData {
     JSValue filename;
     JSValue func;
     JSValue func_name;
+    JSValue this_val;   /* the frame's RECEIVER: getThis, getTypeName and isToplevel are all about it */
     bool native;
     bool constructor;
+    bool strict;        /* a strict frame does not hand its receiver or its function to a stack formatter */
     int line_num;
     int col_num;
 } JSCallSiteData;
@@ -7030,6 +7037,7 @@ static JSValue js_call_c_function_data(JSContext *ctx, JSValueConst func_obj,
     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
     sf->is_call_root = false;
     sf->cur_func = unsafe_unconst(func_obj);
+    sf->this_val = this_val;
     sf->arg_count = argc;
     ret = s->func(ctx, this_val, argc, arg_buf, s->magic, vc(s->data));
     rt->current_stack_frame = sf->prev_frame;
@@ -7171,6 +7179,7 @@ static JSValue js_call_c_closure(JSContext *ctx, JSValueConst func_obj,
     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
     sf->is_call_root = false;
     sf->cur_func = unsafe_unconst(func_obj);
+    sf->this_val = this_val;
     sf->arg_count = argc;
     ret = s->func(ctx, this_val, argc, arg_buf, s->magic, s->opaque);
     rt->current_stack_frame = sf->prev_frame;
@@ -8806,6 +8815,7 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
             JS_FreeValue(ctx, csd[k].filename);
             JS_FreeValue(ctx, csd[k].func);
             JS_FreeValue(ctx, csd[k].func_name);
+            JS_FreeValue(ctx, csd[k].this_val);
         }
         /* Error.prepareStackTrace is the PAGE's code, and build_backtrace runs under every internal throw —
            an activation with no flow base, where a JS_Call drives the hook's body to completion and its first
@@ -8826,6 +8836,7 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
             JS_FreeValue(ctx, csd[k].filename);
             JS_FreeValue(ctx, csd[k].func);
             JS_FreeValue(ctx, csd[k].func_name);
+            JS_FreeValue(ctx, csd[k].this_val);
         }
         /* `prepare` is whatever Error.prepareStackTrace held; a non-function value was read and never released
            before, which leaked one reference per throw for a page that assigned an object to it. */
@@ -18778,6 +18789,7 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
     sf->is_call_root = false;
     sf->cur_func = unsafe_unconst(func_obj);
+    sf->this_val = this_obj;
     sf->arg_count = argc;
     arg_buf = argv;
 
@@ -24181,6 +24193,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     /* sf->cur_pc must we set to pc before any recursive calls to JS_CallInternal. */
     sf->cur_pc = NULL;
     sf->is_call_root = false;
+    sf->this_val = this_obj;
     sf->prev_frame = rt->current_stack_frame;
     rt->current_stack_frame = sf;
     ctx = b->realm; /* set the current realm */
@@ -24851,6 +24864,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 tf_top = ntf;
                 new_target = JS_UNDEFINED;
                 ntf->this_val = this_obj; ntf->new_target = new_target;
+                nsf->this_val = this_obj;   /* the frame borrows the receiver, as the TrampFrame beside it does */
+                nsf->is_constructor = false;
                 ntf->arg_allocated = narg_alloc; ntf->callee_argc = eff_argc;
                 ntf->async_data = NULL; ntf->async_promise = JS_UNDEFINED; ntf->gen_data = NULL;
                 ntf->cont_state = tramp_cont_state; ntf->cont_kind = tramp_cont_kind; tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;   /* NORMAL frame; iter_state set only for an array-iteration callback */
@@ -25725,6 +25740,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 this_obj = cthis;        /* borrowed alias of cs->created_obj during the body */
                 new_target = ntgt;
                 ntf->this_val = this_obj; ntf->new_target = new_target;
+                nsf->this_val = this_obj;   /* the frame borrows the receiver, as the TrampFrame beside it does */
+                nsf->is_constructor = true;
                 ntf->arg_allocated = narg_alloc; ntf->callee_argc = eff_argc;
                 ntf->async_data = NULL; ntf->async_promise = JS_UNDEFINED; ntf->gen_data = NULL;
                 ntf->cont_state = cs; ntf->cont_kind = CONT_CONSTRUCT;
@@ -25932,6 +25949,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 this_obj = thisArg;   /* borrowed from the caller stack; freed by do_return's operand cleanup */
                 new_target = JS_UNDEFINED;
                 ntf->this_val = this_obj; ntf->new_target = new_target;
+                nsf->this_val = this_obj;   /* the frame borrows the receiver, as the TrampFrame beside it does */
+                nsf->is_constructor = false;
                 ntf->arg_allocated = narg_alloc; ntf->callee_argc = eff_argc;
                 ntf->async_data = NULL; ntf->async_promise = JS_UNDEFINED; ntf->gen_data = NULL;
                 /* ADOPT the requester here too. This frame is an ordinary bytecode frame, so do_return's delivery
@@ -38286,6 +38305,10 @@ static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s,
         return -1;
     sf->cur_func = js_dup(func_obj);
     s->this_val = js_dup(this_obj);
+    sf->this_val = s->this_val;   /* the state OWNS it; the frame borrows, as it does cur_func. AFTER the
+                                     assignment above, not before it — reading the field first put whatever the
+                                     allocator had left in the state onto the frame, and a stack trace then
+                                     reported the top-level script's receiver as an integer. */
     s->argc = argc;
     s->base_kind = FLOW_BASE_BYTECODE;   /* cur_func is bytecode; completion uses its b (the default) */
     sf->arg_count = arg_buf_len;
@@ -83067,6 +83090,7 @@ static int reaction_call_flow_init(JSContext *ctx, JSAsyncFunctionState *fs, JSV
     sf->is_strict_mode = false;
     sf->is_constructor = false;
     sf->is_call_root = true;   /* no bytecode of its own runs here: the handler's activation is a frame ON TOP */
+    sf->this_val = JS_UNDEFINED;
     sf->cur_func = js_dup(handler);
     sf->cur_pc = NULL;
     blk[0] = js_dup(this_val);     /* this */
@@ -91649,6 +91673,7 @@ static void js_callsite_finalizer(JSRuntime *rt, JSValueConst val)
         JS_FreeValueRT(rt, csd->filename);
         JS_FreeValueRT(rt, csd->func);
         JS_FreeValueRT(rt, csd->func_name);
+        JS_FreeValueRT(rt, csd->this_val);
         js_free_rt(rt, csd);
     }
 }
@@ -91661,6 +91686,7 @@ static void js_callsite_mark(JSRuntime *rt, JSValueConst val,
         JS_MarkValue(rt, csd->filename, mark_func);
         JS_MarkValue(rt, csd->func, mark_func);
         JS_MarkValue(rt, csd->func_name, mark_func);
+        JS_MarkValue(rt, csd->this_val, mark_func);
     }
 }
 
@@ -91682,12 +91708,55 @@ static JSValue js_new_callsite(JSContext *ctx, JSCallSiteData *csd) {
     return obj;
 }
 
+/* THE FRAME'S `this` BINDING, which is not always the receiver it was called with. 10.2.1.2
+   OrdinaryCallBindThis converts for a non-strict function: undefined or null becomes the realm's global
+   object, and a primitive becomes its wrapper. quickjs performs that conversion lazily, at the body's
+   OP_push_this, and stores the result in the function's own `this` VAR — so for every function that can
+   OBSERVE the binding, the exact object is sitting in the live frame and this reads it. A function that never
+   mentions `this` has no var and no way to tell one conversion from another, so the spec's conversion is
+   applied here instead; there is nothing for it to disagree with. Reads no property and runs no code: a
+   backtrace is built with an exception in flight. */
+static JSValue js_frame_this_binding(JSContext *ctx, JSStackFrame *sf)
+{
+    JSObject *p;
+    JSFunctionBytecode *b;
+    int i;
+
+    if (sf->is_strict_mode || JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
+        return js_dup(sf->this_val);
+    p = JS_VALUE_GET_OBJ(sf->cur_func);
+    if (!js_class_has_bytecode(p->class_id))
+        return js_dup(sf->this_val);
+    b = p->u.func.function_bytecode;
+    if (b->vardefs && sf->var_buf) {
+        for (i = 0; i < b->var_count; i++) {
+            if (b->vardefs[b->arg_count + i].var_name != JS_ATOM_this)
+                continue;
+            /* a derived constructor's `this` before super() — the binding does not exist yet */
+            if (JS_IsUninitialized(sf->var_buf[i]))
+                return JS_UNDEFINED;
+            return js_dup(sf->var_buf[i]);
+        }
+    }
+    if (JS_IsUndefined(sf->this_val) || JS_IsNull(sf->this_val))
+        return js_dup(ctx->global_obj);
+    if (JS_VALUE_GET_TAG(sf->this_val) == JS_TAG_OBJECT)
+        return js_dup(sf->this_val);
+    return JS_ToObject(ctx, sf->this_val);
+}
+
 static void js_new_callsite_data(JSContext *ctx, JSCallSiteData *csd, JSStackFrame *sf)
 {
     const char *func_name_str;
     JSObject *p;
 
     csd->constructor = sf->is_constructor;
+    csd->strict = sf->is_strict_mode;
+    csd->this_val = js_frame_this_binding(ctx, sf);
+    if (JS_IsException(csd->this_val)) {
+        csd->this_val = JS_UNDEFINED;
+        JS_FreeValue(ctx, JS_GetException(ctx));   /* an OOM in the conversion, like the filename read below */
+    }
     csd->func = js_dup(sf->cur_func);
     /* func_name_str is UTF-8 encoded if needed */
     func_name_str = get_func_name(ctx, sf->cur_func);
@@ -91736,8 +91805,10 @@ static void js_new_callsite_data2(JSContext *ctx, JSCallSiteData *csd, const cha
 {
     csd->func = JS_NULL;
     csd->func_name = JS_NULL;
+    csd->this_val = JS_UNDEFINED;   /* a parse error has no activation, so it has no receiver either */
     csd->native = false;
     csd->constructor = false;
+    csd->strict = false;
     csd->line_num = line_num;
     csd->col_num = col_num;
     /* filename is UTF-8 encoded if needed (original argument to __JS_EvalInternal()) */
@@ -91773,6 +91844,80 @@ static JSValue js_callsite_isconstructor(JSContext *ctx, JSValueConst this_val, 
     return js_bool(csd->constructor);
 }
 
+/* IS THIS A TOP-LEVEL INVOCATION — was the function called with the global object as its receiver, or with
+   none at all? V8 answers exactly that (IsJSGlobalProxy(receiver) || IsNullOrUndefined(receiver)), and it is
+   the question its own stack formatter asks before deciding to prefix a frame with a type name. */
+static JSValue js_callsite_istoplevel(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+    JSCallSiteData *csd = JS_GetOpaque2(ctx, this_val, JS_CLASS_CALL_SITE);
+    if (!csd)
+        return JS_EXCEPTION;
+    if (JS_IsUndefined(csd->this_val) || JS_IsNull(csd->this_val))
+        return js_bool(true);
+    return js_bool(JS_VALUE_GET_TAG(csd->this_val) == JS_TAG_OBJECT &&
+                   JS_VALUE_GET_OBJ(csd->this_val) == JS_VALUE_GET_OBJ(ctx->global_obj));
+}
+
+/* THE RECEIVER, but never out of a strict frame: strict mode is what makes `this` and `arguments.callee`
+   unreachable from the outside, and a stack formatter is the outside. V8 returns undefined for a strict or
+   native frame for that reason, not as a simplification. */
+static JSValue js_callsite_getthis(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+    JSCallSiteData *csd = JS_GetOpaque2(ctx, this_val, JS_CLASS_CALL_SITE);
+    if (!csd)
+        return JS_EXCEPTION;
+    if (csd->strict || csd->native)
+        return JS_UNDEFINED;
+    return js_dup(csd->this_val);
+}
+
+/* THE NAME OF THE RECEIVER'S TYPE, read WITHOUT running a line of the page's code — the same discipline
+   get_func_name follows, and for the same reason: a stack trace is built while an exception is in flight, so
+   invoking a getter here would run user code at a point nothing is prepared for. V8 takes the name off the
+   map's constructor; quickjs has no such link, so the equivalent is the prototype's OWN `constructor` data
+   property, which is where `new Foo()` records Foo. A Proxy is answered by name rather than walked, because
+   walking it is a trap call. */
+static JSValue js_callsite_gettypename(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+    JSCallSiteData *csd = JS_GetOpaque2(ctx, this_val, JS_CLASS_CALL_SITE);
+    JSObject *p, *proto;
+    JSProperty *pr;
+    JSShapeProperty *prs;
+    const char *name;
+    JSValue r;
+
+    if (!csd)
+        return JS_EXCEPTION;
+    /* V8: a type name belongs to a METHOD call — not to a top-level one, and not to a construct, whose name
+       the formatter already spells as "new F". */
+    if (csd->constructor)
+        return JS_NULL;
+    if (JS_IsUndefined(csd->this_val) || JS_IsNull(csd->this_val))
+        return JS_NULL;
+    if (JS_VALUE_GET_TAG(csd->this_val) != JS_TAG_OBJECT)
+        return JS_NULL;
+    p = JS_VALUE_GET_OBJ(csd->this_val);
+    if (p == JS_VALUE_GET_OBJ(ctx->global_obj))
+        return JS_NULL;
+    if (p->class_id == JS_CLASS_PROXY)
+        return JS_NewString(ctx, "Proxy");
+    for (proto = p->shape->proto; proto != NULL; proto = proto->shape->proto) {
+        if (proto->class_id == JS_CLASS_PROXY)
+            break;
+        prs = find_own_property(&pr, proto, JS_ATOM_constructor);
+        if (!prs || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+            continue;
+        name = get_func_name(ctx, pr->u.value);
+        if (!name)
+            continue;
+        r = JS_NewString(ctx, name);
+        JS_FreeCString(ctx, name);
+        return r;
+    }
+    /* no constructor to name: the object's own class, which is what [[Class]] gives V8 in the same case */
+    return JS_AtomToString(ctx, ctx->rt->class_array[p->class_id].class_name);
+}
+
 static JSValue js_callsite_getnumber(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic)
 {
     JSCallSiteData *csd = JS_GetOpaque2(ctx, this_val, JS_CLASS_CALL_SITE);
@@ -91785,6 +91930,9 @@ static JSValue js_callsite_getnumber(JSContext *ctx, JSValueConst this_val, int 
 static const JSCFunctionListEntry js_callsite_proto_funcs[] = {
     JS_CFUNC_DEF("isNative", 0, js_callsite_isnative),
     JS_CFUNC_DEF("isConstructor", 0, js_callsite_isconstructor),
+    JS_CFUNC_DEF("isToplevel", 0, js_callsite_istoplevel),
+    JS_CFUNC_DEF("getThis", 0, js_callsite_getthis),
+    JS_CFUNC_DEF("getTypeName", 0, js_callsite_gettypename),
     JS_CFUNC_MAGIC_DEF("getFileName", 0, js_callsite_getfield, offsetof(JSCallSiteData, filename)),
     JS_CFUNC_MAGIC_DEF("getFunction", 0, js_callsite_getfield, offsetof(JSCallSiteData, func)),
     JS_CFUNC_MAGIC_DEF("getFunctionName", 0, js_callsite_getfield, offsetof(JSCallSiteData, func_name)),
