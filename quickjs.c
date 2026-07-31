@@ -32326,6 +32326,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     ret_val = giter;
                     goto do_return;
                 }
+                if (gck == CONT_ITER_CALL) {
+                    /* OP_iterator_call's delegated .return()/.throw() landed on a GENERATOR, and a generator that
+                       SUSPENDS at a yield settles here instead of returning through a heap frame. The opcode's
+                       tail is not a bare push: the result REPLACES the argument it forwarded and a `false` sits
+                       above it, which is how the bytecode knows a method was found. Pushing the result alone left
+                       that boolean slot holding the result object — truthy — so `yield* g()` answered
+                       "iterator does not have a throw method" for an iterator whose throw had just RUN, and the
+                       delegated `.return()` took its no-method path and returned the forwarded value by luck. */
+                    js_itercall_deliver(ctx, sp, giter);
+                    sp += 1;
+                    BREAK;
+                }
+                DCHECK(gck == CONT_NONE,
+                       "a generator settle reached the bare push with a requester still waiting on its result");
                 *sp++ = giter;
                 BREAK;
             }
@@ -48980,6 +48994,10 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
 
                 push_scope(s);  /* catch variable */
                 emit_label(s, label_catch);
+                /* 14.15.3 steps 2-3: when the Block completed ABRUPTLY the catch clause's completion REPLACES
+                   it, so whatever the try block's last statement left in the eval-completion register is
+                   discarded. `eval("try { 'try'; throw 0; } catch (e) {}")` is undefined, not 'try'. */
+                set_eval_ret_undefined(s);
 
                 if (s->token.val == '{') {
                     /* support optional-catch-binding feature */
