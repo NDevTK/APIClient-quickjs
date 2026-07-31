@@ -67368,8 +67368,14 @@ static int js_array_every_vstep(JSContext *ctx, void *st, JSValue cb_result, JSV
     r = js_array_every_step(ctx, s, cb_result, (JSValueConst *)&s->cb_args[2], out_cb, out_argc);   /* consumes cb_result */
     if (r < 0)
         return -1;
-    if (r == 6 || r == 7 || r == 10)
-        return r;   /* the element's keyed operation, or the result write: the driver performs it and re-enters */
+    /* WHICH CODES ARE REQUESTS is not a list. This tested `r == 6 || r == 7 || r == 10` — the keyed reads and
+       the result write, the requests the walk happened to issue when this was written — so the walk could not
+       gain one without the wrapper silently mis-delivering it: adding the TypedArray write's ToPrimitive (5)
+       made the wrapper fall through to the callback dispatch below and hand the driver a CALL built out of a
+       half-set cb_args. The walk has exactly TWO answers of its own, 0 (done) and 1 (the callback is due);
+       everything else is a request it issued and this must propagate, whatever it is. */
+    if (r != 0 && r != 1)
+        return r;
     if (r == 0) {
         if (s->special != (special_filter | special_TA))
             return 0;
