@@ -41812,6 +41812,26 @@ static __exception int ident_realloc(JSContext *ctx, char **pbuf, size_t *psize,
 #ifndef QJS_DISABLE_PARSER
 
 /* convert a TOK_IDENT to a keyword when needed */
+/* The [Await] parameter in force at this point. It belongs to the enclosing FUNCTION: an arrow's PARAMETER LIST
+   does not introduce one — ArrowParameters[?Yield, ?Await] passes it straight through — and it passes through as
+   many nested arrow heads as happen to be open. Asking only the IMMEDIATE parent made
+   `async function f(){ (a = (b = await 1) => {}) => {} }` legal at the second level and an Early Error at the
+   first, which is one rule answering differently by nesting depth. */
+static bool js_parse_await_is_reserved(JSParseState *s)
+{
+    JSFunctionDef *fd = s->cur_func;
+
+    if (s->is_module)
+        return true;
+    /* An ASYNC arrow's head is [+Await] in its own right (AsyncArrowHead's ArrowFormalParameters carry it), so
+       the walk stops there; a plain arrow's head only PASSES ON whatever it was given. */
+    while (!(fd->func_kind & JS_FUNC_ASYNC) &&
+           fd->func_type == JS_PARSE_FUNC_ARROW && !fd->in_function_body && fd->parent)
+        fd = fd->parent;
+    return (fd->func_kind & JS_FUNC_ASYNC) != 0 ||
+           fd->func_type == JS_PARSE_FUNC_CLASS_STATIC_INIT;
+}
+
 static void update_token_ident(JSParseState *s)
 {
     /* `using` is contextually reserved, not a true keyword. Leave it as
@@ -41828,14 +41848,7 @@ static void update_token_ident(JSParseState *s)
           (s->cur_func->func_type == JS_PARSE_FUNC_ARROW &&
            !s->cur_func->in_function_body && s->cur_func->parent &&
            (s->cur_func->parent->func_kind & JS_FUNC_GENERATOR)))) ||
-        (s->token.u.ident.atom == JS_ATOM_await &&
-         (s->is_module ||
-          (s->cur_func->func_kind & JS_FUNC_ASYNC) ||
-          s->cur_func->func_type == JS_PARSE_FUNC_CLASS_STATIC_INIT ||
-          (s->cur_func->func_type == JS_PARSE_FUNC_ARROW &&
-           !s->cur_func->in_function_body && s->cur_func->parent &&
-           ((s->cur_func->parent->func_kind & JS_FUNC_ASYNC) ||
-            s->cur_func->parent->func_type == JS_PARSE_FUNC_CLASS_STATIC_INIT))))) {
+        (s->token.u.ident.atom == JS_ATOM_await && js_parse_await_is_reserved(s))) {
         if (s->token.u.ident.has_escape) {
             s->token.u.ident.is_reserved = true;
             s->token.val = TOK_IDENT;
@@ -57024,7 +57037,13 @@ static __exception int js_parse_function_decl2(JSParseState *s,
     has_opt_arg = false;
     if (func_type == JS_PARSE_FUNC_ARROW && s->token.val == TOK_IDENT) {
         JSAtom name;
-        if (s->token.u.ident.is_reserved) {
+        /* AsyncArrowBindingIdentifier is BindingIdentifier[+Await] whatever the enclosing context is, so
+           `async await => 1` is an Early Error. The token's own `is_reserved` cannot say so: it was decided when
+           the identifier was scanned, which for this form is BEFORE the arrow -- and therefore before its
+           async-ness -- existed. The parenthesised spelling `async (await) => 1` is parsed inside the arrow and
+           was already rejected; the two differed only in where the question got asked. */
+        if (s->token.u.ident.is_reserved ||
+            ((fd->func_kind & JS_FUNC_ASYNC) && s->token.u.ident.atom == JS_ATOM_await)) {
             js_parse_error_reserved_identifier(s);
             goto fail;
         }
@@ -62775,10 +62794,12 @@ static JSValue js_function_proto(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
-/* XXX: add a specific eval mode so that Function("}), ({") is rejected */
-/* 20.2.1.1.1 CreateDynamicFunction step 15's `prefix ( parameters ) { body }`, assembled from arguments that are
-   already STRINGS — so it runs nothing and cannot fail except on allocation. */
-static JSValue js_dynfunc_source(JSContext *ctx, JSFunctionKindEnum func_kind, JSValue *strs, int n)
+/* 20.2.1.1.1 CreateDynamicFunction step 18's `prefix ( parameters ) { body }`, assembled from arguments that are
+   already STRINGS — so it runs nothing and cannot fail except on allocation. DYNSRC_PARAMS and DYNSRC_BODY are
+   the same assembly with the OTHER half empty; steps 20-23 parse each half on its own. */
+enum { DYNSRC_ALL, DYNSRC_PARAMS, DYNSRC_BODY };
+
+static JSValue js_dynfunc_source(JSContext *ctx, JSFunctionKindEnum func_kind, JSValue *strs, int n, int mode)
 {
     StringBuffer b_s, *b = &b_s;
     int i;
@@ -62791,20 +62812,53 @@ static JSValue js_dynfunc_source(JSContext *ctx, JSFunctionKindEnum func_kind, J
     if (func_kind == JS_FUNC_GENERATOR || func_kind == JS_FUNC_ASYNC_GENERATOR)
         string_buffer_putc8(b, '*');
     string_buffer_puts8(b, " anonymous(");
-    for (i = 0; i < n - 1; i++) {
-        if (i != 0)
-            string_buffer_putc8(b, ',');
-        if (string_buffer_concat_value(b, strs[i]))
-            goto fail;
+    if (mode != DYNSRC_BODY) {
+        for (i = 0; i < n - 1; i++) {
+            if (i != 0)
+                string_buffer_putc8(b, ',');
+            if (string_buffer_concat_value(b, strs[i]))
+                goto fail;
+        }
     }
     string_buffer_puts8(b, "\n) {\n");
-    if (n > 0 && string_buffer_concat_value(b, strs[n - 1]))
+    if (mode != DYNSRC_PARAMS && n > 0 && string_buffer_concat_value(b, strs[n - 1]))
         goto fail;
     string_buffer_puts8(b, "\n})");
     return string_buffer_end(b);
  fail:
     string_buffer_free(b);
     return JS_EXCEPTION;
+}
+
+/* Steps 20-23: `parameters` and `body` are ALSO parsed on their OWN — the spec's own NOTE says it is "to ensure
+   that each is valid alone" — and that is the whole of what rejects `new Function("/*", "*&#47;) {")`, whose two
+   halves parse only once concatenated. Assembling each probe from the SAME builder is what gives the parameter
+   list the right goal for the kind (a generator's [+Yield], an async function's [+Await]) with no second
+   spelling of that mapping. Parsing runs none of the page's code, so this needs no trampoline. */
+static int js_dynfunc_check_halves(JSContext *ctx, JSFunctionKindEnum func_kind, JSValue *strs, int n)
+{
+    int mode;
+
+    for (mode = DYNSRC_PARAMS; mode <= DYNSRC_BODY; mode++) {
+        JSValue src, fn;
+        const char *cstr;
+        size_t len;
+        src = js_dynfunc_source(ctx, func_kind, strs, n, mode);
+        if (JS_IsException(src))
+            return -1;
+        cstr = JS_ToCStringLen(ctx, &len, src);
+        JS_FreeValue(ctx, src);
+        if (!cstr)
+            return -1;
+        fn = JS_EvalInternal(ctx, ctx->global_obj, cstr, len, "<input>", 1,
+                             JS_EVAL_TYPE_INDIRECT | JS_EVAL_FLAG_COMPILE_ONLY |
+                             JS_EVAL_FLAG_FUNCTION_CTOR, -1);
+        JS_FreeCString(ctx, cstr);
+        if (JS_IsException(fn))
+            return -1;
+        JS_FreeValue(ctx, fn);
+    }
+    return 0;
 }
 
 /* new Function(a, b, body) and the generator/async variants — 20.2.1.1.1 CreateDynamicFunction. THREE of its steps
@@ -62851,7 +62905,9 @@ static int js_dynfunc_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
             if (r) return r < 0 ? -1 : r;
             s->strs[s->nstrs++] = str;
         }
-        src = js_dynfunc_source(ctx, func_kind, s->strs, s->nstrs);
+        if (js_dynfunc_check_halves(ctx, func_kind, s->strs, s->nstrs) < 0)
+            return -1;
+        src = js_dynfunc_source(ctx, func_kind, s->strs, s->nstrs, DYNSRC_ALL);
         if (JS_IsException(src))
             return -1;
         s->hdr.stage = 2;
