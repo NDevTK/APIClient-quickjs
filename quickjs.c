@@ -83641,6 +83641,167 @@ static void promise_reaction_data_free(JSRuntime *rt,
     js_free_rt(rt, rd);
 }
 
+/* THE SETTLEMENT OF A SHARED ASYNC OBJECT, saved and restored whole. A promise created before a fork is
+   baseline state, and settling it is a write no property hook can see: the state enum, the result, and the
+   REACTION LIST all live in internal slots, and the reactions are consumed by the settle — enqueued as jobs and
+   freed. So the save COPIES the records (each is three JSValues) rather than detaching them, and the restore
+   rebuilds the list from those copies; the promise the flow rewinds to is pending with its handlers still
+   attached, exactly as the sibling's timeline needs it.
+   A resolving-FUNCTION pair carries the other half: its already_resolved latch. Both arms of a fork call the
+   same pre-fork `resolve`, and without restoring that latch the second call returns silently and the arm's
+   value is simply lost — which is the visible symptom, one value where two were expected. */
+typedef struct JSAsyncStateBlob {
+    uint8_t kind;                 /* 0 = promise, 1 = resolving-function latch */
+    uint8_t already_resolved;
+    uint8_t is_handled;           /* whether a rejection has been observed — part of the promise's settlement */
+    JSPromiseStateEnum promise_state;
+    JSValue promise_result;
+    struct list_head reactions[2];   /* copies, owned by the blob until it is restored or freed */
+} JSAsyncStateBlob;
+enum { JS_ASYNC_BLOB_PROMISE = 0, JS_ASYNC_BLOB_LATCH = 1 };
+
+static void js_async_blob_clear_reactions(JSRuntime *rt, JSAsyncStateBlob *b)
+{
+    int i;
+    struct list_head *el, *el1;
+    for (i = 0; i < 2; i++) {
+        list_for_each_safe(el, el1, &b->reactions[i]) {
+            JSPromiseReactionData *rd = list_entry(el, JSPromiseReactionData, link);
+            list_del(&rd->link);
+            promise_reaction_data_free(rt, rd);
+        }
+    }
+}
+
+/* Copy one reaction list. A record is three owned values and nothing else, so a copy is a real record the
+   restore can splice straight back in. */
+static int js_async_copy_reactions(JSContext *ctx, struct list_head *dst, struct list_head *src)
+{
+    struct list_head *el;
+    list_for_each(el, src) {
+        JSPromiseReactionData *rd = list_entry(el, JSPromiseReactionData, link);
+        JSPromiseReactionData *cp = js_mallocz(ctx, sizeof(*cp));
+        if (!cp) return -1;
+        cp->resolving_funcs[0] = js_dup(rd->resolving_funcs[0]);
+        cp->resolving_funcs[1] = js_dup(rd->resolving_funcs[1]);
+        cp->handler = js_dup(rd->handler);
+        list_add_tail(&cp->link, dst);
+    }
+    return 0;
+}
+
+void *JS_AsyncStateSave(JSContext *ctx, JSValueConst obj)
+{
+    JSObject *p;
+    JSAsyncStateBlob *b;
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT) return NULL;
+    p = JS_VALUE_GET_OBJ(obj);
+    if (p->class_id == JS_CLASS_PROMISE) {
+        JSPromiseData *s = p->u.promise_data;
+        if (!s) return NULL;
+        b = js_mallocz(ctx, sizeof(*b));
+        if (!b) return NULL;
+        b->kind = JS_ASYNC_BLOB_PROMISE;
+        b->promise_state = s->promise_state;
+        b->is_handled = s->is_handled;
+        b->promise_result = js_dup(s->promise_result);
+        /* BOTH heads are initialised before either copy runs, because the failure path frees the blob by
+           WALKING both lists — a half-built blob is torn down by the same code as a whole one. */
+        init_list_head(&b->reactions[0]);
+        init_list_head(&b->reactions[1]);
+        if (js_async_copy_reactions(ctx, &b->reactions[0], &s->promise_reactions[0]) < 0
+            || js_async_copy_reactions(ctx, &b->reactions[1], &s->promise_reactions[1]) < 0) {
+            JS_AsyncStateFree(ctx->rt, b);
+            return NULL;
+        }
+        return b;
+    }
+    if (p->class_id == JS_CLASS_PROMISE_RESOLVE_FUNCTION || p->class_id == JS_CLASS_PROMISE_REJECT_FUNCTION) {
+        JSPromiseFunctionData *s = p->u.promise_function_data;
+        if (!s || !s->presolved) return NULL;
+        b = js_mallocz(ctx, sizeof(*b));
+        if (!b) return NULL;
+        b->kind = JS_ASYNC_BLOB_LATCH;
+        b->already_resolved = s->presolved->already_resolved;
+        b->promise_result = JS_UNDEFINED;
+        init_list_head(&b->reactions[0]);
+        init_list_head(&b->reactions[1]);
+        return b;
+    }
+    return NULL;
+}
+
+void JS_AsyncStateRestore(JSContext *ctx, JSValueConst obj, void *blob)
+{
+    JSAsyncStateBlob *b = blob;
+    JSObject *p;
+    int i;
+    if (!b || JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT) return;
+    p = JS_VALUE_GET_OBJ(obj);
+    if (b->kind == JS_ASYNC_BLOB_LATCH) {
+        JSPromiseFunctionData *s = p->u.promise_function_data;
+        DCHECK(p->class_id == JS_CLASS_PROMISE_RESOLVE_FUNCTION || p->class_id == JS_CLASS_PROMISE_REJECT_FUNCTION,
+               "an async-state latch blob was restored onto an object that is not a resolving function");
+        if (s && s->presolved) s->presolved->already_resolved = b->already_resolved;
+        return;
+    }
+    {
+        JSPromiseData *s = p->u.promise_data;
+        struct list_head *el, *el1;
+        DCHECK(p->class_id == JS_CLASS_PROMISE,
+               "an async-state promise blob was restored onto an object that is not a promise");
+        if (!s) return;
+        s->promise_state = b->promise_state;
+        s->is_handled = b->is_handled;
+        set_value(ctx, &s->promise_result, js_dup(b->promise_result));
+        /* The live lists are whatever THIS flow left behind; drop them and re-COPY the blob's. A restore must
+           not consume the blob: a delta is unapplied and re-applied every time the scheduler switches flows, so
+           the baseline it holds has to survive being restored any number of times. */
+        for (i = 0; i < 2; i++) {
+            list_for_each_safe(el, el1, &s->promise_reactions[i]) {
+                JSPromiseReactionData *rd = list_entry(el, JSPromiseReactionData, link);
+                list_del(&rd->link);
+                promise_reaction_data_free(ctx->rt, rd);
+            }
+            init_list_head(&s->promise_reactions[i]);
+            if (js_async_copy_reactions(ctx, &s->promise_reactions[i], &b->reactions[i]) < 0)
+                JS_ThrowOutOfMemory(ctx);
+        }
+    }
+}
+
+/* An independent copy, for the fork that gives a sibling delta its own baseline. Same reason the delta copies
+   everything else at a branch: the two flows must share no mutable state. */
+void *JS_AsyncStateClone(JSContext *ctx, void *blob)
+{
+    JSAsyncStateBlob *b = blob, *c;
+    if (!b) return NULL;
+    c = js_mallocz(ctx, sizeof(*c));
+    if (!c) return NULL;
+    c->kind = b->kind;
+    c->already_resolved = b->already_resolved;
+    c->is_handled = b->is_handled;
+    c->promise_state = b->promise_state;
+    c->promise_result = js_dup(b->promise_result);
+    init_list_head(&c->reactions[0]);
+    init_list_head(&c->reactions[1]);
+    if (js_async_copy_reactions(ctx, &c->reactions[0], &b->reactions[0]) < 0
+        || js_async_copy_reactions(ctx, &c->reactions[1], &b->reactions[1]) < 0) {
+        JS_AsyncStateFree(ctx->rt, c);
+        return NULL;
+    }
+    return c;
+}
+
+void JS_AsyncStateFree(JSRuntime *rt, void *blob)
+{
+    JSAsyncStateBlob *b = blob;
+    if (!b) return;
+    JS_FreeValueRT(rt, b->promise_result);
+    js_async_blob_clear_reactions(rt, b);
+    js_free_rt(rt, b);
+}
+
 #ifdef ENABLE_DUMPS // JS_DUMP_PROMISE
 #define promise_trace(ctx, ...) \
    do { \
@@ -83885,6 +84046,8 @@ static void fulfill_or_reject_promise(JSContext *ctx, JSValueConst promise,
 
     if (!s || s->promise_state != JS_PROMISE_PENDING)
         return; /* should never happen */
+    if (g_time_travel.async_settle)
+        g_time_travel.async_settle(ctx, promise);   /* time-travel: the baseline settlement, before it is gone */
     set_value(ctx, &s->promise_result, js_dup(value));
     s->promise_state = JS_PROMISE_FULFILLED + is_reject;
 
@@ -84059,6 +84222,17 @@ typedef struct JSPromiseResolveFn {
 } JSPromiseResolveFn;
 _Static_assert(offsetof(JSPromiseResolveFn, hdr) == 0, "JSStepHdr must be first in JSPromiseResolveFn");
 
+/* [[AlreadyResolved]] latches in exactly two places — the step machine below and the C entry a JS_Call from C
+   still reaches — so the time-travel capture of it lives WITH the latch rather than beside each of them. Both
+   arms of a fork call the same pre-fork `resolve`, and a latch that does not rewind makes the second call a
+   silent no-op, which loses that arm's value entirely. */
+static void js_promise_latch_resolved(JSContext *ctx, JSValueConst func_obj, JSPromiseFunctionData *s)
+{
+    if (g_time_travel.async_settle)
+        g_time_travel.async_settle(ctx, func_obj);
+    s->presolved->already_resolved = true;
+}
+
 /* the settle every terminal step performs; a resolving function returns undefined whatever it did. */
 static int js_promise_resolvefn_settle(JSContext *ctx, JSPromiseFunctionData *s, JSValueConst v, bool is_reject)
 {
@@ -84079,7 +84253,7 @@ static int js_promise_resolvefn_step(JSContext *ctx, void *st, JSValue cb_result
         m->cb[0] = JS_UNDEFINED;   /* before anything that can throw: the teardown frees what the state holds */
         /* step 1-3: the pair fires ONCE, and [[AlreadyResolved]] is shared with its twin. */
         if (!s || s->presolved->already_resolved) return 0;
-        s->presolved->already_resolved = true;
+        js_promise_latch_resolved(ctx, m->hdr.func_obj, s);
         if (is_reject || !JS_IsObject(resolution))
             return js_promise_resolvefn_settle(ctx, s, resolution, is_reject);   /* step 7 / RejectPromise */
         if (js_same_value(ctx, resolution, s->promise)) {
@@ -84167,7 +84341,7 @@ static JSValue js_promise_resolve_function_call(JSContext *ctx,
               "code — hand that caller's call out and place it on a flow, as every settle and Await now do");
         return JS_EXCEPTION;
     }
-    s->presolved->already_resolved = true;
+    js_promise_latch_resolved(ctx, func_obj, s);
     if (is_reject || !JS_IsObject(resolution)) {
         fulfill_or_reject_promise(ctx, s->promise, resolution, is_reject);
     } else if (js_same_value(ctx, resolution, s->promise)) {

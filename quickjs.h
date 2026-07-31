@@ -1235,7 +1235,23 @@ typedef struct JSTimeTravelHooks {
        The host records a reversible undo-log entry so a snapshot-forked sibling stays isolated: apply replays the
        op, unapply inverts it (overwrite restores old; delete re-adds old). Completes map_add's add-only capture. */
     void (*map_mutate)(JSContext *ctx, JSValueConst obj, JSValueConst key, JSValueConst old_val, JSValueConst val, int op);
+    /* Before a flow changes the SETTLEMENT of a shared async object: a promise leaving PENDING, or a
+       resolving-function pair latching already_resolved. A promise created before a fork is shared baseline
+       state like any other object, and settling it is a WRITE — but one no property hook can see, because it
+       lives in the promise's internal slots and its reaction list. Without this the first arm to resolve wins
+       and every sibling's resolve is a silent no-op, so a value that differs per arm is simply lost.
+       The host captures the object's whole settlement with JS_AsyncStateSave and puts it on the running flow's
+       delta; the swap restores it. Two classes, one hook, because "the settlement state of this shared async
+       object" is one concept and which internal slots that means is the engine's business. */
+    void (*async_settle)(JSContext *ctx, JSValueConst obj);
 } JSTimeTravelHooks;
+/* The settlement state of a promise (state + result + the pending reaction records) or of a resolving-function
+   pair (its already_resolved latch), as an opaque owned blob. NULL for an object that has neither. Restore
+   puts it back exactly, so a flow's timeline is reproduced rather than replayed. */
+JS_EXTERN void *JS_AsyncStateSave(JSContext *ctx, JSValueConst obj);
+JS_EXTERN void  JS_AsyncStateRestore(JSContext *ctx, JSValueConst obj, void *blob);
+JS_EXTERN void *JS_AsyncStateClone(JSContext *ctx, void *blob);
+JS_EXTERN void  JS_AsyncStateFree(JSRuntime *rt, void *blob);
 #define JS_MAP_MUTATE_OVERWRITE 1
 #define JS_MAP_MUTATE_DELETE    2
 JS_EXTERN void JS_SetFlowLocalMark(int m);
