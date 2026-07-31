@@ -19206,10 +19206,18 @@ static const JSStepVisit js_step_visit_free = { js_step_visit_free_val, js_step_
                                                 js_step_visit_free_array, js_step_visit_free_shared,
                                                 js_step_visit_free_maprec };
 /* A machine's teardown releases what it owns through the SAME declaration the clone reads, so the two cannot
-   disagree about which fields those are. */
+   disagree about which fields those are.
+   The declaration is REQUIRED here, not consulted: a teardown that calls this has no other release path, so a
+   missing visit is not "nothing to free" — it is EVERYTHING leaked, silently. That is not a hypothetical. The
+   shared coerce-then-compute and OrdinaryCreateFromConstructor teardowns were converted to read the declaration
+   while their definitions (built by PRIMARGS_DEF_FULL / CREATECTOR_DEF_FULL, which the attaching edit's pattern
+   never matched) still declared none, and the whole corpus leaked 41,820 objects while reporting zero errors.
+   A no-op `if` is what let that be silent, so the condition is an assertion instead. */
 static void tramp_step_visit_free(JSContext *ctx, void *st) {
     JSStepHdr *h = st;
-    if (h->def->visit) h->def->visit(ctx, st, (JSStepVisit *)&js_step_visit_free);
+    DCHECK(h->def->visit, "a machine whose teardown reads its ownership declaration must HAVE one — "
+                          "without it the teardown frees nothing and every field the machine owns leaks");
+    h->def->visit(ctx, st, (JSStepVisit *)&js_step_visit_free);
 }
 
 /* DEEP-FORK: the sibling flow gets its OWN machine. The generic half is here because it is the same at every
@@ -68657,7 +68665,7 @@ static const JSTrampStepDef js_date_ctor_def = { sizeof(JSDateCtor), js_date_cto
    operands, so a body that reads argv[1] of a zero-argument call needs the padding built here. */
 #define CREATECTOR_DEF_FULL(class_id, nargs, proto, fn, magic, pre) \
     { sizeof(JSCreateCtor), js_creatector_step, js_creatector_fini, CREATECTOR_ARG(class_id, nargs), \
-      { .proto = (fn) }, JS_CFUNC_##proto, (magic), (pre), NULL, NULL }
+      { .proto = (fn) }, JS_CFUNC_##proto, (magic), (pre), NULL, NULL, .visit = js_creatector_visit }
 #define CREATECTOR_DEF(class_id, nargs, proto, fn, magic) \
     CREATECTOR_DEF_FULL(class_id, nargs, proto, fn, magic, NULL)
 static int js_array_of_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
@@ -68733,10 +68741,10 @@ static const JSTrampStepDef js_iterator_ctor_def =
     CREATECTOR_DEF_FULL(JS_CLASS_ITERATOR, 0, generic, NULL, 0, js_iterator_ctor_precheck);
 static const JSTrampStepDef js_boolean_ctor_def =
     { sizeof(JSCreateCtor), js_creatector_step, js_creatector_fini, CREATECTOR_ARG_WRAP(JS_CLASS_BOOLEAN, 1),
-      { .generic = js_boolean_ctor_body }, JS_CFUNC_generic, 0, NULL, NULL, NULL };
+      { .generic = js_boolean_ctor_body }, JS_CFUNC_generic, 0, NULL, NULL, NULL, .visit = js_creatector_visit };
 static const JSTrampStepDef js_bigint_ctor_def =
     { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, PRIMARGS(0x1, HINT_NUMBER, 1),
-      { .generic = js_bigint_constructor }, JS_CFUNC_constructor_or_func, 0, NULL, NULL, NULL };
+      { .generic = js_bigint_constructor }, JS_CFUNC_constructor_or_func, 0, NULL, NULL, NULL, .visit = js_primargs_visit };
 static JSValue js_symbol_constructor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv);
 static int js_symbol_ctor_precheck(JSContext *ctx, const JSStepHdr *h);
 /* 20.4.1.1 Symbol([description]): step 1 rejects a NewTarget, step 2 is `? ToString(description)`, and the rest
@@ -68755,7 +68763,8 @@ static const JSTrampStepDef js_error_tostring_def =
     { sizeof(JSErrToString), js_error_tostring_step, js_error_tostring_fini, 0 , .visit = js_error_tostring_visit };
 static const JSTrampStepDef js_symbol_ctor_def =
     { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, PRIMARGS(0x1, HINT_STRING, 1),
-      { .generic = js_symbol_constructor }, JS_CFUNC_constructor_or_func, 0, js_symbol_ctor_precheck, NULL, NULL };
+      { .generic = js_symbol_constructor }, JS_CFUNC_constructor_or_func, 0, js_symbol_ctor_precheck, NULL, NULL,
+      .visit = js_primargs_visit };
 static const JSTrampStepDef js_array_indexOf_def     = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_INDEXOF, .visit = js_array_search_visit };
 static const JSTrampStepDef js_array_lastIndexOf_def = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_LASTINDEXOF, .visit = js_array_search_visit };
 static const JSTrampStepDef js_array_includes_def    = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_INCLUDES, .visit = js_array_search_visit };
@@ -68782,7 +68791,8 @@ static const JSTrampStepDef js_str_padEnd_def     = { sizeof(JSStrRecv), js_str_
 static const JSTrampStepDef js_str_localeCmp_def  = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_LOCALECOMPARE, .visit = js_str_recv_visit };
 static const JSTrampStepDef js_str_toLower_def    = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_TOLOWER, .visit = js_str_recv_visit };
 static const JSTrampStepDef js_str_toUpper_def    = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_TOUPPER, .visit = js_str_recv_visit };
-#define STR_HTML_DEF(k) { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_HTML_BASE + (k) }
+#define STR_HTML_DEF(k) { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_HTML_BASE + (k), \
+                          .visit = js_str_recv_visit }
 static const JSTrampStepDef js_str_html_defs[STRRECV_HTML_COUNT] = {
     STR_HTML_DEF(0), STR_HTML_DEF(1), STR_HTML_DEF(2), STR_HTML_DEF(3), STR_HTML_DEF(4),
     STR_HTML_DEF(5), STR_HTML_DEF(6), STR_HTML_DEF(7), STR_HTML_DEF(8), STR_HTML_DEF(9),
@@ -68835,7 +68845,8 @@ static const JSTrampStepDef js_array_flat_def      = { sizeof(JSArrayFlat), js_a
 static const JSTrampStepDef js_array_flatMap_def   = { sizeof(JSArrayFlat), js_array_flat_step, js_array_flat_fini, ARRAYFLAT_FLATMAP, .visit = js_array_flat_visit };
 static const JSTrampStepDef js_array_fromlike_def  = { sizeof(JSArrayFromLike), js_array_fromlike_step, js_array_fromlike_fini, 0, .visit = js_array_fromlike_visit };
 #define PRIMARGS_DEF_FULL(spec, proto, fn, magic, pre, mid, err) \
-    { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, (spec), { .proto = (fn) }, JS_CFUNC_##proto, (magic), (pre), (mid), (err) }
+    { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, (spec), { .proto = (fn) }, JS_CFUNC_##proto, (magic), (pre), (mid), (err), \
+      .visit = js_primargs_visit }
 #define PRIMARGS_DEF(spec, proto, fn, magic)                PRIMARGS_DEF_FULL(spec, proto, fn, magic, NULL, NULL, NULL)
 #define PRIMARGS_DEF_PRE(spec, proto, fn, magic, pre, mid)  PRIMARGS_DEF_FULL(spec, proto, fn, magic, pre, mid, NULL)
 static JSValue js_global_decodeURI(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int isComponent);
