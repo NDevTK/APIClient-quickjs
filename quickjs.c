@@ -17833,6 +17833,15 @@ struct JSStepVisit {
        the page's callback cannot delete the cursor out from under it, and a clone standing on the same record
        needs its own lock or the first arm to finish frees what the second is still reading. */
     void (*maprec)(JSContext *ctx, struct JSMapRecord **slot);
+    /* A LIVE REGEXP MATCH. The one owned thing whose two consumers are not the same walk over the same fields:
+       the teardown's job IS lre_exec_end, and the fork's is to give the sibling its own backtracking stack and
+       its own `reach` filter AND to re-point the two SELF-REFERENCES a byte copy leaves aimed at the original —
+       the inline stack buffer, and the machine's capture array. That is why this is an operation and not a
+       list: a machine must never learn which consumer is visiting it, and here the two do different work.
+       `capture` is the MACHINE's block, already visited by the time this runs, so the context is re-pointed at
+       whichever copy it now belongs to. Every other pointer in the context aims into the subject string or the
+       compiled bytecode, and both arms hold their own reference to those, so both stay valid unchanged. */
+    void (*reexec)(JSContext *ctx, struct REExecContext *ec, uint8_t **capture);
 };
 /* HOISTED to here, for the reason JSStepHdr is: the visitor above names it and the machine that owns one is
    thousands of lines below. A sorted element carries the value AND the string a default comparison coerced it
@@ -19215,16 +19224,39 @@ struct JSMapRecord;
 static void map_decref_record(JSRuntime *rt, struct JSMapRecord *mr);
 static void js_step_visit_dup_maprec(JSContext *ctx, struct JSMapRecord **slot);
 static void js_step_visit_free_maprec(JSContext *ctx, struct JSMapRecord **slot);
+static void js_step_visit_dup_reexec(JSContext *ctx, REExecContext *ec, uint8_t **capture) {
+    /* the sibling gets its OWN backtracking state. sp_off/bp_off are offsets precisely so a moved stack stays
+       usable, so the copy resumes at the same opcode against the same input with nothing replayed. */
+    if (ec->stack_is_static) {
+        ec->stack_buf = ec->static_stack_buf;   /* the byte copy still points at the ORIGINAL's inline array */
+    } else {
+        StackElem *cp = js_malloc(ctx, ec->stack_size * sizeof(StackElem));
+        if (!cp) { ec->stack_buf = NULL; return; }   /* OOM: the fork is abandoned by the caller */
+        memcpy(cp, ec->stack_buf, ec->stack_size * sizeof(StackElem));
+        ec->stack_buf = cp;
+    }
+    if (ec->reach) {
+        uint8_t *rp = js_malloc(ctx, ec->reach_size ? ec->reach_size : 1);
+        if (rp) memcpy(rp, ec->reach, ec->reach_size);
+        ec->reach = rp;   /* NULL on OOM disables the filter, which is a slower match and not a wrong one */
+    }
+    ec->capture = capture;
+    ec->opaque = ctx;
+}
+static void js_step_visit_free_reexec(JSContext *ctx, REExecContext *ec, uint8_t **capture) {
+    (void)ctx; (void)capture;
+    lre_exec_end(ec);   /* which is exactly this side's job, and already knows both buffers */
+}
 static const JSStepVisit js_step_visit_dup  = { js_step_visit_dup_val,  js_step_visit_dup_strbuf,  js_step_visit_dup_props,
                                                 js_step_visit_dup_slots,  js_step_visit_dup_buf,
                                                 js_step_visit_dup_atom,  js_step_visit_dup_machine,
                                                 js_step_visit_dup_array,  js_step_visit_dup_shared,
-                                                js_step_visit_dup_maprec };
+                                                js_step_visit_dup_maprec, js_step_visit_dup_reexec };
 static const JSStepVisit js_step_visit_free = { js_step_visit_free_val, js_step_visit_free_strbuf, js_step_visit_free_props,
                                                 js_step_visit_free_slots, js_step_visit_free_buf,
                                                 js_step_visit_free_atom, js_step_visit_free_machine,
                                                 js_step_visit_free_array, js_step_visit_free_shared,
-                                                js_step_visit_free_maprec };
+                                                js_step_visit_free_maprec, js_step_visit_free_reexec };
 /* A machine's teardown releases what it owns through the SAME declaration the clone reads, so the two cannot
    disagree about which fields those are.
    The declaration is REQUIRED here, not consulted: a teardown that calls this has no other release path, so a
@@ -20537,7 +20569,7 @@ enum { RE_REP_LOOP = 30, RE_REP_SUBST = 40 };
 
 static int js_re_rep_step(JSContext *ctx, struct JSReRep *s, JSValue cb_result,
                           JSValue **out_cb, int *out_argc);
-static void js_re_rep_end(JSContext *ctx, struct JSReRep *s, bool take_result);
+static void js_re_rep_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static int js_re_rep_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_re_rep_fini(JSContext *ctx, void *st, bool take_result);
 static int js_is_standard_regexp(JSContext *ctx, JSValueConst rx);
@@ -20560,6 +20592,7 @@ typedef struct JSIteratorWrapData {
 } JSIteratorWrapData;
 static int js_regexp_exec_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_regexp_exec_fini(JSContext *ctx, void *st, bool take_result);
+static void js_regexp_exec_visit(JSContext *ctx, void *st, JSStepVisit *v);
  JSIteratorWrapData;
 #define CONT_ITER_FROM     12  /* cont_state = JSIterFrom: Iterator.from(obj) — GetIterator(obj) is performed by the
                                   shared acquire (so a generator-function @@iterator is created ON THE TRAMP) and the
@@ -62022,8 +62055,16 @@ typedef struct JSRegExpExec {
     JSValue result;       /* DONE (owned) */
     JSValue str_val;      /* ToString(S) (owned) */
     JSValue li_val;       /* Get(R,"lastIndex"), held across its ToLength (owned) */
-    JSString *bytecode;   /* the matcher this run used, held (refcounted) so a re-compile mid-run cannot free it */
+    /* the matcher this run used, HELD so a re-compile mid-run cannot free it under the result build. A
+       JSValue rather than a bare JSString*, because that is what makes it an ordinary owned reference the
+       declaration below can name — the bare pointer was the one owned thing here that no visitor operation
+       could express. UNDEFINED until stage 4 reads the regexp's slots. */
+    JSValue bytecode;
     uint8_t **capture;    /* the match's capture buffer (owned, js_free) */
+    /* its LENGTH, which is lre_get_alloc_count — capture_count*2 PLUS the executor's registers, not
+       capture_count*2. Stated for the reason REExecContext::reach_size is: a match that suspends can be
+       forked, and the fork has to copy this block. */
+    int cap_alloc;
     REExecContext ec;     /* THE MATCH, by value: a pattern that backtracks catastrophically parks in here */
     uint8_t matching;     /* 1 = ec is live and owes an lre_exec_end */
     int64_t last_index;
@@ -68058,7 +68099,7 @@ static const JSTrampStepDef js_ta_find_def             = { sizeof(JSArrayFind), 
 static const JSTrampStepDef js_ta_findIndex_def        = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFindIndex | FIND_TA , .visit = js_array_find_visit };
 static const JSTrampStepDef js_ta_findLast_def         = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFindLast | FIND_TA , .visit = js_array_find_visit };
 static const JSTrampStepDef js_ta_findLastIndex_def    = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFindLastIndex | FIND_TA , .visit = js_array_find_visit };
-static const JSTrampStepDef js_re_replace_def          = { sizeof(JSReRep), js_re_rep_vstep, js_re_rep_fini, 0 };
+static const JSTrampStepDef js_re_replace_def          = { sizeof(JSReRep), js_re_rep_vstep, js_re_rep_fini, 0, .visit = js_re_rep_visit };
 static int js_re_match_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_re_match_fini(JSContext *ctx, void *st, bool take_result);
 static void js_re_match_visit(JSContext *ctx, void *st, JSStepVisit *v);
@@ -68069,27 +68110,31 @@ static void js_re_ctor_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static const JSTrampStepDef js_re_ctor_def            = { sizeof(JSReCtor), js_re_ctor_step, js_re_ctor_fini, 0, .visit = js_re_ctor_visit };
 static int js_re_matchall_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_re_matchall_fini(JSContext *ctx, void *st, bool take_result);
+static void js_re_matchall_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static const JSTrampStepDef js_re_matchall_def =
-    { sizeof(JSReMatchAll), js_re_matchall_step, js_re_matchall_fini, 0 };
+    { sizeof(JSReMatchAll), js_re_matchall_step, js_re_matchall_fini, 0, .visit = js_re_matchall_visit };
 static int js_re_split_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_re_split_fini(JSContext *ctx, void *st, bool take_result);
+static void js_re_split_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static const JSTrampStepDef js_re_split_def =
-    { sizeof(JSReSplit), js_re_split_step, js_re_split_fini, 0 };
+    { sizeof(JSReSplit), js_re_split_step, js_re_split_fini, 0, .visit = js_re_split_visit };
 static int js_re_search_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_re_search_fini(JSContext *ctx, void *st, bool take_result);
+static void js_re_search_visit(JSContext *ctx, void *st, JSStepVisit *v);
 /* `test` KEEPS its definition id: it was already a step machine, just one whose body ran RegExpExec from C. */
 static const JSTrampStepDef js_re_test_def =
-    { sizeof(JSReSearch), js_re_search_step, js_re_search_fini, 0 };
+    { sizeof(JSReSearch), js_re_search_step, js_re_search_fini, 0, .visit = js_re_search_visit };
 static const JSTrampStepDef js_re_search_def =
-    { sizeof(JSReSearch), js_re_search_step, js_re_search_fini, 1 };
+    { sizeof(JSReSearch), js_re_search_step, js_re_search_fini, 1, .visit = js_re_search_visit };
 static int js_str_match_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_str_match_fini(JSContext *ctx, void *st, bool take_result);
+static void js_str_match_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static const JSTrampStepDef js_str_match_def =
-    { sizeof(JSStrMatch), js_str_match_step, js_str_match_fini, JS_ATOM_Symbol_match };
+    { sizeof(JSStrMatch), js_str_match_step, js_str_match_fini, JS_ATOM_Symbol_match, .visit = js_str_match_visit };
 static const JSTrampStepDef js_str_matchAll_def =
-    { sizeof(JSStrMatch), js_str_match_step, js_str_match_fini, JS_ATOM_Symbol_matchAll };
+    { sizeof(JSStrMatch), js_str_match_step, js_str_match_fini, JS_ATOM_Symbol_matchAll, .visit = js_str_match_visit };
 static const JSTrampStepDef js_str_search_def =
-    { sizeof(JSStrMatch), js_str_match_step, js_str_match_fini, JS_ATOM_Symbol_search };
+    { sizeof(JSStrMatch), js_str_match_step, js_str_match_fini, JS_ATOM_Symbol_search, .visit = js_str_match_visit };
 static const JSTrampStepDef js_str_replace_def         = { sizeof(JSStrReplace), js_str_replace_vstep, js_str_replace_fini, 0, .visit = js_str_replace_visit };
 static const JSTrampStepDef js_str_replaceAll_def      = { sizeof(JSStrReplace), js_str_replace_vstep, js_str_replace_fini, 1, .visit = js_str_replace_visit };
 static const JSTrampStepDef js_array_every_def     = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_every, .visit = js_array_every_visit };
@@ -68824,7 +68869,7 @@ static const JSTrampStepDef js_sab_grow_def      = PRIMARGS_DEF_PRE(PRIMARGS(0x1
 static const JSTrampStepDef js_ab_transfer_def   = PRIMARGS_DEF_PRE(PRIMARGS(0x1, HINT_NUMBER, 1), generic_magic, js_array_buffer_transfer, JS_ARRAY_BUFFER_TRANSFER, js_array_buffer_transfer_precheck, NULL);
 static const JSTrampStepDef js_ab_transferImm_def = PRIMARGS_DEF_PRE(PRIMARGS(0x1, HINT_NUMBER, 1), generic_magic, js_array_buffer_transfer, JS_ARRAY_BUFFER_TRANSFER_TO_IMMUTABLE, js_array_buffer_transfer_precheck, NULL);
 static const JSTrampStepDef js_ab_transferFix_def = PRIMARGS_DEF_PRE(PRIMARGS(0x1, HINT_NUMBER, 1), generic_magic, js_array_buffer_transfer, JS_ARRAY_BUFFER_TRANSFER_TO_FIXED_LENGTH, js_array_buffer_transfer_precheck, NULL);
-static const JSTrampStepDef js_regexp_exec_def    = { sizeof(JSRegExpExec), js_regexp_exec_step, js_regexp_exec_fini, 0 };
+static const JSTrampStepDef js_regexp_exec_def    = { sizeof(JSRegExpExec), js_regexp_exec_step, js_regexp_exec_fini, 0, .visit = js_regexp_exec_visit };
 /* THE WHOLE numeric-coercion surface, declared rather than re-implemented. Every one of these performed its
    ToNumber from C — js_call_c_function does it for the f_f/f_f_f prototypes, and the generic ones call JS_ToFloat64
    themselves — so a page's `valueOf` containing a loop aborted in `Math.max(o, 1)` while the identical method
@@ -75570,15 +75615,24 @@ static int js_str_match_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). cb is a request buffer whose four slots are BORROWED views of
+   these fields, the header's captures and the intrinsic RegExp constructor — never visited. */
+static void js_str_match_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSStrMatch *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->matcher);
+    v->val(ctx, &s->str);
+    v->val(ctx, &s->rx);
+    v->val(ctx, &s->flags);
+}
+
 static JSValue js_str_match_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSStrMatch *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->result);
-    JS_FreeValue(ctx, s->matcher);
-    JS_FreeValue(ctx, s->str);
-    JS_FreeValue(ctx, s->rx);
-    JS_FreeValue(ctx, s->flags);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -77545,18 +77599,28 @@ assign:
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The receiver it answers with, and the coerced source it holds
+   from the pattern's ToString across the FLAGS coercion — which is the page's code, so a fork can land between
+   the two. */
+static void js_regexp_compile_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSRegExpCompile *m = st;
+    v->val(ctx, &m->result);
+    v->val(ctx, &m->pattern);
+}
+
 static JSValue js_regexp_compile_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSRegExpCompile *m = st;
-    JSValue r = take_result ? m->result : (JS_FreeValue(ctx, m->result), JS_UNDEFINED);
-    JS_FreeValue(ctx, m->pattern);
+    JSValue r = take_result ? m->result : JS_UNDEFINED;
+    if (take_result) m->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, m);
     js_free_rt(ctx->rt, m);
     return r;
 }
 
 static const JSTrampStepDef js_regexp_compile_def = {
-    sizeof(JSRegExpCompile), js_regexp_compile_step, js_regexp_compile_fini, 0
-};
+    sizeof(JSRegExpCompile), js_regexp_compile_step, js_regexp_compile_fini, 0, .visit = js_regexp_compile_visit };
 
 /* Write `c` as an escape if it is a LineTerminator, and say whether it did. The two-code-unit ones keep the
    spelling a reader expects; U+2028 and U+2029 have no short form and take the six-unit one. */
@@ -78145,7 +78209,7 @@ static int js_regexp_exec_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
         s->result = JS_UNDEFINED;
         s->str_val = JS_UNDEFINED;
         s->li_val = JS_UNDEFINED;
-        s->bytecode = NULL;
+        s->bytecode = JS_UNDEFINED;
         s->capture = NULL;
         s->last_index = 0;
         s->rc = 0;
@@ -78191,9 +78255,8 @@ static int js_regexp_exec_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
         if (!re) return -1;
         /* the matcher this run uses, HELD as a value so a `lastIndex` setter calling compile() cannot free it
            under the result build below — the C body kept it as a bare pointer in a local across that Set. */
-        js_dup(JS_MKPTR(JS_TAG_STRING, re->bytecode));
-        s->bytecode = re->bytecode;
-        re_bytecode = str8(s->bytecode);
+        s->bytecode = js_dup(JS_MKPTR(JS_TAG_STRING, re->bytecode));
+        re_bytecode = str8(JS_VALUE_GET_STRING(s->bytecode));
         re_flags = lre_get_flags(re_bytecode);
         if ((re_flags & (LRE_FLAG_GLOBAL | LRE_FLAG_STICKY)) == 0)
             s->last_index = 0;
@@ -78207,6 +78270,7 @@ static int js_regexp_exec_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
         if (alloc_count > 0) {
             s->capture = js_malloc(ctx, sizeof(s->capture[0]) * alloc_count);
             if (!s->capture) return -1;
+            s->cap_alloc = alloc_count;
         }
         shift = str->is_wide_char;
         str_buf = str8(str);
@@ -78239,7 +78303,7 @@ static int js_regexp_exec_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
             s->matching = 0;
         }
         /* re-derived rather than parked: both sources are HELD by this machine, so they cannot have moved. */
-        re_bytecode = str8(s->bytecode);
+        re_bytecode = str8(JS_VALUE_GET_STRING(s->bytecode));
         re_flags = lre_get_flags(re_bytecode);
         str = JS_VALUE_GET_STRING(s->str_val);
         shift = str->is_wide_char;
@@ -78306,24 +78370,37 @@ static int js_regexp_exec_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
     {   /* steps 17-34, on objects this call creates: no page code, so it stays one C body. */
         JSValue str_val = s->str_val;
         s->str_val = JS_UNDEFINED;               /* CONSUMED as the result's `input` */
-        s->result = js_regexp_build_result(ctx, s->bytecode, str_val, s->capture);
+        s->result = js_regexp_build_result(ctx, JS_VALUE_GET_STRING(s->bytecode), str_val, s->capture);
         if (JS_IsException(s->result)) { s->result = JS_UNDEFINED; return -1; }
     }
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The three references, the compiled matcher it pinned for the
+   duration of the run, the capture array — and, ONLY while a match is in flight, the match itself. `matching`
+   is that condition: before stage 4 and after the match answers, `ec` holds nothing, which is why the
+   ownership is an `if` around the visit rather than something a list could state.
+   ORDER MATTERS between the last two: the capture block is visited first so the context can be re-pointed at
+   whichever copy it now belongs to. The context's remaining pointers aim into the subject string and the
+   bytecode, and both are visited above, so both arms keep them alive. */
+static void js_regexp_exec_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSRegExpExec *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->str_val);
+    v->val(ctx, &s->li_val);
+    v->val(ctx, &s->bytecode);
+    v->buf(ctx, (void **)&s->capture, sizeof(uint8_t *) * (size_t)s->cap_alloc);
+    if (s->matching)
+        v->reexec(ctx, &s->ec, s->capture);
+}
+
 static JSValue js_regexp_exec_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSRegExpExec *s = st;
-    JSValue r = take_result ? js_dup(s->result) : JS_UNDEFINED;
-    if (s->matching)          /* torn down while parked mid-match: the backtracking stack is still ours */
-        lre_exec_end(&s->ec);
-    JS_FreeValue(ctx, s->result);
-    JS_FreeValue(ctx, s->str_val);
-    JS_FreeValue(ctx, s->li_val);
-    if (s->bytecode)
-        JS_FreeValue(ctx, JS_MKPTR(JS_TAG_STRING, s->bytecode));
-    js_free(ctx, s->capture);
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -78765,15 +78842,24 @@ static int js_re_matchall_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). cb is the Construct request's buffer, borrowing ctor, the
+   receiver and flags from where they already live. */
+static void js_re_matchall_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSReMatchAll *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->str);
+    v->val(ctx, &s->ctor);
+    v->val(ctx, &s->flags);
+    v->val(ctx, &s->matcher);
+}
+
 static JSValue js_re_matchall_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSReMatchAll *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->result);
-    JS_FreeValue(ctx, s->str);
-    JS_FreeValue(ctx, s->ctor);
-    JS_FreeValue(ctx, s->flags);
-    JS_FreeValue(ctx, s->matcher);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -79197,37 +79283,45 @@ static JSValue js_re_rep_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSReRep *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    js_re_rep_end(ctx, s, take_result);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
 
-static void js_re_rep_end(JSContext *ctx, struct JSReRep *s, bool take_result)
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). Two ARRAYS and an accumulator, which is why this one needed
+   the sub-object operations rather than a list of values:
+     - `results` is phase 1's collected matches, `nresults` live in a `rcap` block;
+     - `cb_buf` IS the spec's captures List, [this, fn, matched, caps…, position, string, groups?], allocated
+       once nCaptures is known and filled as each capture lands. Slot 0 is the callback's `this`, a plain
+       UNDEFINED that holds no reference, so the whole block visits uniformly — 2 + cb_nargs live in a block
+       sized for the worst case;
+     - `b` is the accumulator, and it needs no take_result guard: string_buffer_end NULLs the buffer on every
+       path that consumed it, so the release is right whether the result was produced or not, and a NULL ctx is
+       the prologue having thrown before it was built.
+   `cbx` is RegExpExec's request buffer and borrows; the substitution's own three fields are declared once, by
+   js_getsubst_visit, because str.replace holds the same walk. */
+static void js_re_rep_visit(JSContext *ctx, void *st, JSStepVisit *v)
 {
-    int i;
-    js_re_rep_free_cb(ctx, s);
-    /* torn down while PARKED on `groups[name]`: the substitution's buffer, its key and the operands it was
-       holding are still ours */
-    js_getsubst_free(ctx, &s->gs);
-    JS_FreeValue(ctx, s->gs_tab);
-    JS_FreeValue(ctx, s->gs_named);
-    if (!take_result) {
-        if (s->b.ctx) string_buffer_free(&s->b);   /* NULL ctx = the prologue threw before string_buffer_init */
-        JS_FreeValue(ctx, s->result);
-    }
-    for (i = 0; i < s->nresults; i++)
-        JS_FreeValue(ctx, s->results[i]);
-    js_free(ctx, s->results);
-    JS_FreeValue(ctx, s->rx);
-    JS_FreeValue(ctx, s->str);
-    JS_FreeValue(ctx, s->rep);
-    JS_FreeValue(ctx, s->matched);
-    JS_FreeValue(ctx, s->flags);
-    JS_FreeValue(ctx, s->mres);
-    JS_FreeValue(ctx, s->m0);
-    JS_FreeValue(ctx, s->cap);
-    JS_FreeValue(ctx, s->named);
-    JS_FreeValue(ctx, s->repres);
+    JSReRep *s = st;
+    v->val(ctx, &s->result);
+    v->strbuf(ctx, &s->b);
+    js_getsubst_visit(ctx, &s->gs, v);
+    v->val(ctx, &s->gs_tab);
+    v->val(ctx, &s->gs_named);
+    v->array(ctx, (void **)&s->results, sizeof(JSValue), s->nresults, s->rcap, js_step_visit_value_elem);
+    v->array(ctx, (void **)&s->cb_buf, sizeof(JSValue), 2 + s->cb_nargs,
+             (int)(2 + s->nCaptures + 4), js_step_visit_value_elem);
+    v->val(ctx, &s->rx);
+    v->val(ctx, &s->str);
+    v->val(ctx, &s->rep);
+    v->val(ctx, &s->matched);
+    v->val(ctx, &s->flags);
+    v->val(ctx, &s->mres);
+    v->val(ctx, &s->m0);
+    v->val(ctx, &s->cap);
+    v->val(ctx, &s->named);
+    v->val(ctx, &s->repres);
 }
 
 
@@ -79321,14 +79415,25 @@ static int js_re_search_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). cbx is RegExpExec's request buffer, a BORROWED view of the
+   receiver, the header's `exec` and this state's `str` — it is not visited, or the clone would over-count what
+   those three already are. `prevLast` is the saved lastIndex, which the restore hands back BORROWED for the
+   same reason. */
+static void js_re_search_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSReSearch *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->str);
+    v->val(ctx, &s->prevLast);
+    v->val(ctx, &s->res);
+}
+
 static JSValue js_re_search_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSReSearch *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->result);
-    JS_FreeValue(ctx, s->str);
-    JS_FreeValue(ctx, s->prevLast);
-    JS_FreeValue(ctx, s->res);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -79512,17 +79617,26 @@ static int js_re_split_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The result array is `arr` rather than a `result` field —
+   @@split builds its answer as it goes — and the two request buffers borrow. */
+static void js_re_split_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSReSplit *s = st;
+    v->val(ctx, &s->arr);
+    v->val(ctx, &s->str);
+    v->val(ctx, &s->ctor);
+    v->val(ctx, &s->flags);
+    v->val(ctx, &s->splitter);
+    v->val(ctx, &s->z);
+    v->val(ctx, &s->cap);
+}
+
 static JSValue js_re_split_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSReSplit *s = st;
     JSValue r = take_result ? s->arr : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->arr);
-    JS_FreeValue(ctx, s->str);
-    JS_FreeValue(ctx, s->ctor);
-    JS_FreeValue(ctx, s->flags);
-    JS_FreeValue(ctx, s->splitter);
-    JS_FreeValue(ctx, s->z);
-    JS_FreeValue(ctx, s->cap);
+    if (take_result) s->arr = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }

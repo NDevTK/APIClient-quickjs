@@ -3261,12 +3261,13 @@ static no_inline int stack_realloc(REExecContext *s, size_t n)
     new_size = s->stack_size * 3 / 2;
     if (new_size < n)
         new_size = n;
-    if (s->stack_buf == s->static_stack_buf) {
+    if (s->stack_is_static) {
         new_stack = lre_realloc(s->opaque, NULL, new_size * sizeof(StackElem));
         if (!new_stack)
             return -1;
         /* XXX: could use correct size */
         memcpy(new_stack, s->stack_buf, s->stack_size * sizeof(StackElem));
+        s->stack_is_static = false;
     } else {
         new_stack = lre_realloc(s->opaque, s->stack_buf, new_size * sizeof(StackElem));
         if (!new_stack)
@@ -3877,9 +3878,11 @@ int lre_exec_begin(REExecContext *s, uint8_t **capture,
 
     s->stack_buf = s->static_stack_buf;
     s->stack_size = countof(s->static_stack_buf);
+    s->stack_is_static = true;
     s->sp_off = 0;
     s->bp_off = 0;
     s->reach = NULL;
+    s->reach_size = 0;
     s->bc_body = bc_buf + RE_HEADER_LEN;
     s->impossible = false;
     if (cbuf_type == 0 && (re_flags & LRE_FLAG_NON_LATIN1)) {
@@ -3887,6 +3890,7 @@ int lre_exec_begin(REExecContext *s, uint8_t **capture,
         s->reach = lre_realloc(s->opaque, NULL, blen);
         if (!s->reach)
             return LRE_RET_MEMORY_ERROR;
+        s->reach_size = (size_t)blen;
         s->impossible = !re_compute_reach(s, bc_buf + RE_HEADER_LEN, blen, s->reach);
     }
 
@@ -3923,11 +3927,13 @@ void lre_exec_end(REExecContext *s)
     if (s->reach) {
         lre_realloc(s->opaque, s->reach, 0);
         s->reach = NULL;
+        s->reach_size = 0;
     }
-    if (s->stack_buf != s->static_stack_buf) {
+    if (!s->stack_is_static) {
         lre_realloc(s->opaque, s->stack_buf, 0);
         s->stack_buf = s->static_stack_buf;
         s->stack_size = countof(s->static_stack_buf);
+        s->stack_is_static = true;
     }
 }
 

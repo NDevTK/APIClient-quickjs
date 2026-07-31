@@ -122,11 +122,19 @@ typedef struct REExecContext {
        still reachable from there. NULL when the filter does not apply — an ordinary pattern, or a two-byte
        subject — and `impossible` is the whole-program verdict the entry point reads. */
     uint8_t *reach;
+    /* `reach`'s LENGTH, which is the program's bytecode length. It is stated rather than re-derived from
+       bc_body, because a match that SUSPENDS can be forked, and the fork has to copy this buffer — an owner
+       that cannot say how big the thing it owns is cannot hand it over. 0 exactly when reach is NULL. */
+    size_t reach_size;
     const uint8_t *bc_body;   /* the program's first opcode: `reach` is indexed by the offset from here */
     bool impossible;
 
     StackElem *stack_buf;
     size_t stack_size;
+    /* WHERE the stack lives, stated rather than inferred from `stack_buf == static_stack_buf`. The inference is
+       right for a teardown, which sees the context it is destroying; it is WRONG for a fork, which sees a byte
+       copy whose stack_buf still holds the ORIGINAL's inline address and cannot compute what that was. */
+    bool stack_is_static;
     StackElem static_stack_buf[32]; /* static stack to avoid allocation in most cases */
 } REExecContext;
 
