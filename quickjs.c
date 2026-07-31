@@ -23380,7 +23380,7 @@ static void js_enum_keys_visit(JSContext *ctx, void *elem, JSStepVisit *v);
 static void js_for_in_visit(JSContext *ctx, void *st, JSStepVisit *v)
 {
     JSForIn *s = st;
-    v->array(ctx, (void **)&s->ek, sizeof(JSEnumKeys), s->ek ? 1 : 0, s->ek ? 1 : 0, js_enum_keys_visit);
+    v->array(ctx, (void **)&s->ek, sizeof(JSEnumKeys), 1, 1, js_enum_keys_visit);
     v->val(ctx, &s->enum_obj);
     v->val(ctx, &s->cur);
     v->val(ctx, &s->result);
@@ -61339,8 +61339,11 @@ static void js_prop_walk_visit(JSContext *ctx, void *st, JSStepVisit *v)
        REFUSED fork — the deep copy did not exist — and it is declared now that the element-array operation
        does, which is what removing a refusal looks like rather than keeping it as a permanent carve-out. */
     js_desc_cursor_visit(ctx, &s->dcur, v);
-    v->array(ctx, (void **)&s->dl, sizeof(JSPropertyDescriptor), (int)s->nd, (int)s->nd, js_prop_desc_visit);
-    v->array(ctx, (void **)&s->dk, sizeof(JSAtom), (int)s->nd, (int)s->nd, js_prop_dkey_visit);
+    /* one descriptor per snapshot key is the ALLOCATION; nd is how many are complete so far, and the walk keeps
+       writing up to that allocation after a fork lands in one of the page's getters. */
+    v->array(ctx, (void **)&s->dl, sizeof(JSPropertyDescriptor), (int)s->nd,
+             (int)(s->len ? s->len : 1), js_prop_desc_visit);
+    v->array(ctx, (void **)&s->dk, sizeof(JSAtom), (int)s->nd, (int)(s->len ? s->len : 1), js_prop_dkey_visit);
 }
 
 static JSValue js_prop_walk_fini(JSContext *ctx, void *st, bool take_result)
@@ -69599,9 +69602,13 @@ static void js_iterator_zip_visit(JSContext *ctx, void *st, JSStepVisit *v)
     v->val(ctx, &s->closing);
     v->val(ctx, &s->input_iter); v->val(ctx, &s->input_next);
     v->val(ctx, &s->pad_iter);   v->val(ctx, &s->pad_next);
-    v->array(ctx, (void **)&s->iters, sizeof(JSValue), (int)s->n, (int)s->n, js_step_visit_value_elem);
-    v->array(ctx, (void **)&s->nexts, sizeof(JSValue), (int)s->n, (int)s->n, js_step_visit_value_elem);
-    v->array(ctx, (void **)&s->pads,  sizeof(JSValue), (int)s->pad_n, (int)s->pad_n, js_step_visit_value_elem);
+    /* the CAPACITY is what the block was ALLOCATED with, never the live count. iters/nexts grow by doubling, so
+       a fork taken with n < cap must hand the sibling a cap-sized block — given an n-sized one, its next
+       js_zip_push_input sees n != cap, skips the realloc, and writes past the end. pads is allocated at n and
+       filled to pad_n, so its capacity is n for the same reason. */
+    v->array(ctx, (void **)&s->iters, sizeof(JSValue), (int)s->n, (int)s->cap, js_step_visit_value_elem);
+    v->array(ctx, (void **)&s->nexts, sizeof(JSValue), (int)s->n, (int)s->cap, js_step_visit_value_elem);
+    v->array(ctx, (void **)&s->pads,  sizeof(JSValue), (int)s->pad_n, (int)s->n, js_step_visit_value_elem);
 }
 
 static JSValue js_iterator_zip_fini(JSContext *ctx, void *st, bool take_result)
@@ -72034,7 +72041,7 @@ static void js_array_flat_visit(JSContext *ctx, void *st, JSStepVisit *v)
     v->val(ctx, &s->arr);
     v->val(ctx, &s->el);
     v->val(ctx, &s->obj);
-    v->array(ctx, (void **)&s->fr, sizeof(JSFlatFrame), s->sp, s->sp, js_flat_frame_visit);
+    v->array(ctx, (void **)&s->fr, sizeof(JSFlatFrame), s->sp, s->cap, js_flat_frame_visit);
 }
 
 static JSValue js_array_flat_fini(JSContext *ctx, void *st, bool take_result)
@@ -80704,7 +80711,7 @@ static void js_enum_keys_visit(JSContext *ctx, void *elem, JSStepVisit *v)
 static void js_jrframe_visit(JSContext *ctx, void *elem, JSStepVisit *v)
 {
     JRFrame *f = elem;
-    v->array(ctx, (void **)&f->ek, sizeof(JSEnumKeys), f->ek ? 1 : 0, f->ek ? 1 : 0, js_enum_keys_visit);
+    v->array(ctx, (void **)&f->ek, sizeof(JSEnumKeys), 1, 1, js_enum_keys_visit);
     v->props(ctx, &f->atoms, (uint32_t)f->len);
     v->val(ctx, &f->name_val);
     v->val(ctx, &f->val);
@@ -80874,7 +80881,7 @@ static int sj_push(JSContext *ctx, JSJsonStr *s)
 static void js_sj_frame_visit(JSContext *ctx, void *elem, JSStepVisit *v)
 {
     JSSJFrame *f = elem;
-    v->array(ctx, (void **)&f->ek, sizeof(JSEnumKeys), f->ek ? 1 : 0, f->ek ? 1 : 0, js_enum_keys_visit);
+    v->array(ctx, (void **)&f->ek, sizeof(JSEnumKeys), 1, 1, js_enum_keys_visit);
     v->array(ctx, (void **)&f->keys, sizeof(JSAtom), (int)f->nkeys, (int)f->nkeys, js_step_visit_atom_elem);
     v->atom(ctx, &f->key_atom);
     v->val(ctx, &f->holder); v->val(ctx, &f->key); v->val(ctx, &f->val);
@@ -81437,7 +81444,7 @@ static void js_json_str_visit(JSContext *ctx, void *st, JSStepVisit *v)
 {
     JSJsonStr *s = st;
     v->array(ctx, (void **)&s->frames, sizeof(JSSJFrame), s->sp, s->cap, js_sj_frame_visit);
-    v->array(ctx, (void **)&s->plist, sizeof(JSAtom), (int)s->nplist, (int)s->nplist, js_step_visit_atom_elem);
+    v->array(ctx, (void **)&s->plist, sizeof(JSAtom), (int)s->nplist, (int)s->nplist_cap, js_step_visit_atom_elem);
     if (s->b_live) v->strbuf(ctx, &s->b);
     v->val(ctx, &s->stack);
     v->val(ctx, &s->gap);
