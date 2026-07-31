@@ -100,6 +100,11 @@ typedef struct {
     int total_capture_count; /* -1 = not computed yet */
     int has_named_captures; /* -1 = don't know, 0 = no, 1 = yes */
     void *opaque;
+    /* `\q{…}` and get_class_atom call each OTHER, which reads as unbounded recursion and is not: the call
+       below passes cr=NULL and inclass=false, and the \q branch needs both, so the depth is two by
+       construction. That is a structural invariant, so it gets an assert rather than a frame stack —
+       flattening a descent that cannot descend would manufacture debt instead of removing it. */
+    bool in_class_string_disjunction;
     DynBuf group_names;
     union {
         char error_msg[TMP_BUF_SIZE];
@@ -1034,9 +1039,17 @@ static int parse_class_string_disjunction(REParseState *s, REStringList *cr,
     DynBuf str;
     int c;
     
+    DCHECK(!s->in_class_string_disjunction,
+           "\\q{…} re-entered itself: the only thing keeping this pair from being unbounded recursion is that "
+           "its get_class_atom call passes cr=NULL, which makes the \\q branch unreachable — someone has just "
+           "changed that, and this now needs a frame stack like the other two class productions");
+    s->in_class_string_disjunction = true;
+
     p = *pp;
-    if (*p != '{')
+    if (*p != '{') {
+        s->in_class_string_disjunction = false;
         return re_parse_error(s, "expecting '{' after \\q");
+    }
 
     dbuf_init2(&str, s->opaque, lre_realloc);
     re_string_list_init(s, cr);
@@ -1068,10 +1081,12 @@ static int parse_class_string_disjunction(REParseState *s, REStringList *cr,
     p++; /* skip the '}' */
     dbuf_free(&str);
     *pp = p;
+    s->in_class_string_disjunction = false;
     return 0;
  fail:
     dbuf_free(&str);
     re_string_list_free(cr);
+    s->in_class_string_disjunction = false;
     return -1;
 }
 
@@ -1386,63 +1401,126 @@ static int re_emit_string_list(REParseState *s, const REStringList *sl)
     return 0;
 }
 
-static int re_parse_nested_class(REParseState *s, REStringList *cr, const uint8_t **pp);
+/* ClassSetExpression, as ONE machine over an explicit FRAME STACK. `[[[[a]]]]` in `v` mode is a class nested
+   inside a class, and re_parse_nested_class recursed on the C stack for each level with the depth chosen by the
+   input; the lre_check_stack_overflow in front of it turned that into "stack overflow", which is the same BOUND
+   in an error's clothing the disjunction parser had. re_parse_class_set_operand was the other half of the cycle
+   — its only job was to forward a `[` operand to that recursion — so it is INLINED here and deleted; what is
+   left of it (the single-character operand) cannot recurse and is the helper below.
 
-static int re_parse_class_set_operand(REParseState *s, REStringList *cr, const uint8_t **pp)
+   ONE frame per nested class. `cr` is where THIS level builds, and its storage belongs to the level above: a
+   child's result is the parent's `cr1` scratch, which is exactly the aliasing the recursive version got from C
+   locals. `resume` says what the parent does with that result — union it, intersect it, or subtract it. */
+enum { CS_ROOT = 0, CS_UNION, CS_INTER, CS_SUB };
+
+typedef struct REClassFrame {
+    REStringList cr1;        /* scratch: a child's result, or a class atom's range */
+    const uint8_t *p;        /* this level's cursor; a completed child writes its own back into the parent's */
+    uint8_t resume;          /* CS_*: what the level above does with this level's result */
+    bool invert, is_first;
+} REClassFrame;
+
+/* WHERE A LEVEL BUILDS, derived from its DEPTH and never stored. Level i builds into level i-1's scratch, and
+   the root into the caller's out-param. Storing that as a pointer is what a first version did, and growing the
+   stack then moved the array out from under every one of them — the frames survive a realloc, addresses into
+   them do not. */
+#define CS_LIST(i)  ((i) == 0 ? cr_out : &st[(i) - 1].cr1)
+
+static int re_class_frame_push(REParseState *s, REClassFrame **pst, int *psp, int *psize,
+                               const uint8_t *p, int resume)
 {
-    int c1;
-    const uint8_t *p = *pp;
-    
-    if (*p == '[') {
-        if (re_parse_nested_class(s, cr, pp))
+    REClassFrame *st = *pst, *f;
+    if (*psp >= *psize) {
+        int n = *psize ? *psize * 2 : 8;
+        REClassFrame *ns = lre_realloc(s->opaque, st, sizeof(*ns) * (size_t)n);
+        if (!ns)
+            return re_parse_out_of_memory(s);
+        *pst = st = ns;
+        *psize = n;
+    }
+    f = &st[(*psp)++];
+    memset(f, 0, sizeof(*f));
+    f->p = p;
+    f->resume = resume;
+    return 0;
+}
+
+/* A ClassSetOperand that is NOT a nested class: one character, as a one-element range. It was the other arm of
+   re_parse_class_set_operand, and it is the arm that cannot recurse. */
+static int re_parse_class_set_char_operand(REParseState *s, REStringList *cr, const uint8_t **pp)
+{
+    int c1 = get_class_atom(s, cr, pp, true);
+    if (c1 < 0)
+        return -1;
+    if (c1 < CLASS_RANGE_BASE) {
+        /* create a range with a single character */
+        re_string_list_init(s, cr);
+        if (s->ignore_case)
+            c1 = lre_canonicalize(c1, s->is_unicode);
+        if (cr_union_interval(&cr->cr, c1, c1)) {
+            re_string_list_free(cr);
             return -1;
-    } else {
-        c1 = get_class_atom(s, cr, pp, true);
-        if (c1 < 0)
-            return -1;
-        if (c1 < CLASS_RANGE_BASE) {
-            /* create a range with a single character */
-            re_string_list_init(s, cr);
-            if (s->ignore_case)
-                c1 = lre_canonicalize(c1, s->is_unicode);
-            if (cr_union_interval(&cr->cr, c1, c1)) {
-                re_string_list_free(cr);
-                return -1;
-            }
         }
     }
     return 0;
 }
 
-static int re_parse_nested_class(REParseState *s, REStringList *cr, const uint8_t **pp)
+static int re_parse_nested_class(REParseState *s, REStringList *cr_out, const uint8_t **pp)
 {
+    REClassFrame *st = NULL, *f = NULL;
+    int sp = 0, st_size = 0, ret = 0;
     const uint8_t *p;
     uint32_t c1, c2;
-    int ret;
-    REStringList cr1_s, *cr1 = &cr1_s;
-    bool invert, is_first;
+    REStringList *cr, *cr1;
 
-    if (lre_check_stack_overflow(s->opaque, 0))
-        return re_parse_error(s, "stack overflow");
+/* DESCEND into a nested class: park the cursor, push a frame whose result lands in THIS frame's scratch, and
+   restart the machine at cs_enter. The `goto` is the call. */
+#define CS_DESCEND(rr)                                                          \
+    do {                                                                        \
+        f->p = p;                                                               \
+        /* `rr` is the CHILD's return address and belongs to the frame being PUSHED. Writing it onto this
+           frame too clobbered its own — `[[a--[b]]]` made the inner class descend for its `--` operand, which
+           overwrote the outer descent's CS_UNION with CS_SUB, and the level above then subtracted where it
+           should have unioned. */                                              \
+        if (re_class_frame_push(s, &st, &sp, &st_size, p, (rr)))                 \
+            goto fail;                                                          \
+        goto cs_enter;                                                          \
+    } while (0)
+/* …and the return: the frame below is on top again, holding the child's list in its scratch. */
+#define CS_RESUMED()                                                            \
+    do {                                                                        \
+        f = &st[sp - 1];                                                        \
+        cr = CS_LIST(sp - 1);                                                   \
+        cr1 = &f->cr1;                                                          \
+        p = f->p;                                                               \
+    } while (0)
 
+    if (re_class_frame_push(s, &st, &sp, &st_size, *pp, CS_ROOT))
+        goto fail;
+
+ cs_enter:
+    f = &st[sp - 1];
+    cr = CS_LIST(sp - 1);
+    cr1 = &f->cr1;
     re_string_list_init(s, cr);
-    p = *pp;
+    p = f->p;
     p++;    /* skip '[' */
 
-    invert = false;
+    f->invert = false;
     if (*p == '^') {
         p++;
-        invert = true;
+        f->invert = true;
     }
-    
+
     /* handle unions */
-    is_first = true;
+    f->is_first = true;
     for(;;) {
         if (*p == ']')
             break;
         if (*p == '[' && s->unicode_sets) {
-            if (re_parse_nested_class(s, cr1, &p))
-                goto fail;
+            CS_DESCEND(CS_UNION);
+        after_union_child:
+            CS_RESUMED();
             goto class_union;
         } else {
             c1 = get_class_atom(s, cr1, &p, true);
@@ -1450,7 +1528,7 @@ static int re_parse_nested_class(REParseState *s, REStringList *cr, const uint8_
                 goto fail;
             if (*p == '-' && p[1] != ']') {
                 const uint8_t *p0 = p + 1;
-                if (p[1] == '-' && s->unicode_sets && is_first)
+                if (p[1] == '-' && s->unicode_sets && f->is_first)
                     goto class_atom; /* first character class followed by '--' */
                 if (c1 >= CLASS_RANGE_BASE) {
                     if (s->is_unicode) {
@@ -1491,7 +1569,7 @@ static int re_parse_nested_class(REParseState *s, REStringList *cr, const uint8_
                     if (cr_union_interval(&cr->cr, c1, c2))
                         goto memory_error;
                 }
-                is_first = false; /* union operation */
+                f->is_first = false; /* union operation */
             } else {
             class_atom:
                 if (c1 >= CLASS_RANGE_BASE) {
@@ -1508,7 +1586,7 @@ static int re_parse_nested_class(REParseState *s, REStringList *cr, const uint8_
                 }
             }
         }
-        if (s->unicode_sets && is_first) {
+        if (s->unicode_sets && f->is_first) {
             if (*p == '&' && p[1] == '&' && p[2] != '&') {
                 /* handle '&&' */
                 for(;;) {
@@ -1519,8 +1597,14 @@ static int re_parse_nested_class(REParseState *s, REStringList *cr, const uint8_
                     } else {
                         goto invalid_operation;
                     }
-                    if (re_parse_class_set_operand(s, cr1, &p))
-                        goto fail;
+                    if (*p == '[') {
+                        CS_DESCEND(CS_INTER);
+                    after_inter_child:
+                        CS_RESUMED();
+                    } else {
+                        if (re_parse_class_set_char_operand(s, cr1, &p))
+                            goto fail;
+                    }
                     ret = re_string_list_op(cr, cr1, CR_OP_INTER);
                     re_string_list_free(cr1);
                     if (ret)
@@ -1538,8 +1622,14 @@ static int re_parse_nested_class(REParseState *s, REStringList *cr, const uint8_
                         re_parse_error(s, "invalid operation in regular expression");
                         goto fail;
                     }
-                    if (re_parse_class_set_operand(s, cr1, &p))
-                        goto fail;
+                    if (*p == '[') {
+                        CS_DESCEND(CS_SUB);
+                    after_sub_child:
+                        CS_RESUMED();
+                    } else {
+                        if (re_parse_class_set_char_operand(s, cr1, &p))
+                            goto fail;
+                    }
                     ret = re_string_list_op(cr, cr1, CR_OP_SUB);
                     re_string_list_free(cr1);
                     if (ret)
@@ -1547,12 +1637,11 @@ static int re_parse_nested_class(REParseState *s, REStringList *cr, const uint8_
                 }
             }
         }
-        is_first = false;
+        f->is_first = false;
     }
 
     p++;    /* skip ']' */
-    *pp = p;
-    if (invert) {
+    if (f->invert) {
         /* XXX: add may_contain_string syntax check to be fully
            compliant. The test here accepts more input than the
            spec. */
@@ -1563,12 +1652,41 @@ static int re_parse_nested_class(REParseState *s, REStringList *cr, const uint8_
         if (cr_invert(&cr->cr))
             goto memory_error;
     }
-    return 0;
+    /* this class is complete: hand its cursor and its list back to the level that descended into it */
+    {
+        int resume = f->resume;
+        sp--;
+        if (sp == 0) {
+            *pp = p;
+            ret = 0;
+            goto done;
+        }
+        st[sp - 1].p = p;
+        switch (resume) {
+        case CS_UNION: goto after_union_child;
+        case CS_INTER: goto after_inter_child;
+        case CS_SUB:   goto after_sub_child;
+        default: break;
+        }
+        DFAIL("a nested regexp class completed with no descent recorded on the frame below it");
+    }
+
  memory_error:
     re_parse_out_of_memory(s);
  fail:
-    re_string_list_free(cr);
-    return -1;
+    /* Every OPEN level owns the list it was building and, where one is live, its scratch. The recursive
+       version got this from each frame's own `fail:`; here the whole stack unwinds at once. */
+    while (sp > 0) {
+        sp--;
+        re_string_list_free(CS_LIST(sp));
+    }
+    ret = -1;
+ done:
+    lre_realloc(s->opaque, st, 0);
+    return ret;
+#undef CS_DESCEND
+#undef CS_RESUMED
+#undef CS_LIST
 }
 
 static int re_parse_char_class(REParseState *s, const uint8_t **pp)
@@ -2698,6 +2816,7 @@ uint8_t *lre_compile(int *plen, char *error_msg, int error_msg_size,
     s->dotall = ((re_flags & LRE_FLAG_DOTALL) != 0);
     s->unicode_sets = ((re_flags & LRE_FLAG_UNICODE_SETS) != 0);
     s->capture_count = 1;
+    s->in_class_string_disjunction = false;
     s->total_capture_count = -1;
     s->has_named_captures = -1;
 
@@ -3551,11 +3670,6 @@ const char *lre_get_groupnames(const uint8_t *bc_buf)
 }
 
 #ifdef TEST
-
-bool lre_check_stack_overflow(void *opaque, size_t alloca_size)
-{
-    return false;
-}
 
 void *lre_realloc(void *opaque, void *ptr, size_t size)
 {

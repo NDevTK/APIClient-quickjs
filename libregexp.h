@@ -124,8 +124,10 @@ void lre_exec_end(REExecContext *s);
 int lre_parse_escape(const uint8_t **pp, int allow_utf16);
 /* lre_is_space() is provided as an inline in libunicode.h */
 
-/* must be provided by the user */
-bool lre_check_stack_overflow(void *opaque, size_t alloca_size);
+/* DELETED: lre_check_stack_overflow. It was asked at the top of re_parse_disjunction and
+   re_parse_nested_class, and its answer was "stack overflow" — a BOUND in an error's clothing, since both
+   grammars have an answer at every depth. Both are frame stacks now and nothing in this engine asks the C
+   stack how deep it may go. */
 /* must be provided by the user: non-zero when a running match should give the thread back at its next
    back-edge. It REPLACES lre_check_timeout, which was a watchdog — a bound that truncated a match instead of
    parking it. The host answers from its scheduler, and the match resumes exactly where it stopped. */

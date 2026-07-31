@@ -76083,12 +76083,6 @@ static JSValue js_regexp_tostring_fini(JSContext *ctx, void *st, bool take_resul
     return r;
 }
 
-bool lre_check_stack_overflow(void *opaque, size_t alloca_size)
-{
-    JSContext *ctx = opaque;
-    return js_check_stack_overflow(ctx->rt, alloca_size);
-}
-
 /* Should a running match give the thread back at its next back-edge? It REPLACES lre_check_timeout, which
    asked the embedder's interrupt handler every 10000 opcodes and TRUNCATED the match — a watchdog, which is a
    bound. The scheduler answers instead, and the match parks and resumes at the exact opcode. */
