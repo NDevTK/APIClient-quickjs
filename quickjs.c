@@ -853,6 +853,14 @@ typedef struct JSClosureVar {
 #define ARG_SCOPE_INDEX 1
 #define ARG_SCOPE_END (-2)
 
+/* One provisional Annex B.3.2.1 var store: the name it writes, the scope the FunctionDeclaration lives in, and
+   where its OP_scope_put_var sits in the byte code. `bc_pos` is -1 once the store has been patched out. */
+typedef struct JSAnnexBFuncVar {
+    JSAtom name;
+    int scope_level;
+    int bc_pos;
+} JSAnnexBFuncVar;
+
 typedef struct JSVarScope {
     int parent;  /* index into fd->scopes of the enclosing scope */
     int first;   /* index into fd->vars of the last variable in this scope */
@@ -41032,6 +41040,15 @@ typedef struct JSFunctionDef {
     int using_decl_size;
     JSUsingDecl *using_decls;
 
+    /* B.3.2.1's var stores that are still PROVISIONAL. The condition "replacing the FunctionDeclaration with a
+       VariableStatement would produce no Early Error" is false when a block ENCLOSING the function's own
+       declares the name lexically — and that declaration can be written AFTER the block the function sits in,
+       so it is not known where the store is emitted. Each entry names the store's byte position; a later
+       lexical declaration that encloses it patches the store out. */
+    int annexb_var_count;
+    int annexb_var_size;
+    JSAnnexBFuncVar *annexb_vars;
+
     DynBuf byte_code;
     int last_opcode_pos; /* -1 if no last opcode */
     /* the last emitted opcode is a call that came from `CallExpression TemplateLiteral`, whose
@@ -43142,6 +43159,45 @@ static JSGlobalVar *find_lexical_global_var(JSFunctionDef *fd, JSAtom name)
         return NULL;
 }
 
+/* Record an Annex B var store as PROVISIONAL. `bc_pos` is where its OP_scope_put_var begins. */
+static void annexb_func_var_record(JSParseState *s, JSFunctionDef *fd, JSAtom name, int bc_pos)
+{
+    JSAnnexBFuncVar *v;
+    if (js_resize_array(s->ctx, (void **)&fd->annexb_vars, sizeof(fd->annexb_vars[0]),
+                        &fd->annexb_var_size, fd->annexb_var_count + 1))
+        return;   /* out of memory: the store stands, which is what it did before it was provisional */
+    v = &fd->annexb_vars[fd->annexb_var_count++];
+    v->name = name;
+    v->scope_level = fd->scope_level;
+    v->bc_pos = bc_pos;
+}
+
+/* A lexical declaration of `name` has just been added to `scope_level`. Every provisional Annex B store for that
+   name whose FunctionDeclaration lives in a scope this one ENCLOSES loses its condition: the VariableStatement
+   replacement would be an Early Error, so B.3.2.1 does not apply. Patch the store out in place — OP_drop plus
+   nops is exactly the seven bytes OP_scope_put_var occupies, and the value the OP_dup above pushed still has to
+   go. */
+static void annexb_func_var_revoke(JSContext *ctx, JSFunctionDef *fd, JSAtom name, int scope_level)
+{
+    int i, sl;
+    for (i = 0; i < fd->annexb_var_count; i++) {
+        JSAnnexBFuncVar *v = &fd->annexb_vars[i];
+        if (v->name != name || v->bc_pos < 0)
+            continue;
+        for (sl = v->scope_level; sl >= 0; sl = fd->scopes[sl].parent)
+            if (sl == scope_level)
+                break;
+        if (sl != scope_level)
+            continue;   /* a sibling scope, not an enclosing one */
+        DCHECK(fd->byte_code.buf[v->bc_pos] == OP_scope_put_var,
+               "the provisional Annex B store is not where it was recorded");
+        JS_FreeAtom(ctx, (JSAtom)get_u32(fd->byte_code.buf + v->bc_pos + 1));
+        fd->byte_code.buf[v->bc_pos] = OP_drop;
+        memset(fd->byte_code.buf + v->bc_pos + 1, OP_nop, 6);
+        v->bc_pos = -1;
+    }
+}
+
 static int find_lexical_decl(JSContext *ctx, JSFunctionDef *fd, JSAtom name,
                              int scope_idx, bool check_catch_var)
 {
@@ -43444,6 +43500,15 @@ static int define_var(JSParseState *s, JSFunctionDef *fd, JSAtom name,
         if (find_var_in_child_scope(ctx, fd, name, fd->scope_level) >= 0) {
             return js_parse_error(s, "invalid redefinition of a variable");
         }
+
+        /* A lexical declaration HERE retracts every provisional Annex B store this scope encloses: the
+           VariableStatement replacement B.3.2.1 tests would now be an Early Error. The `let` can be written
+           after the block the function sits in — `{ { function x(){} } let x; }` — which is why the store is
+           provisional rather than decided where it was emitted. A function declaration is not one of these
+           kinds; B.3.3.4 lets those redefine each other. */
+        if (var_def_type == JS_VAR_DEF_LET || var_def_type == JS_VAR_DEF_CONST ||
+            var_def_type == JS_VAR_DEF_USING)
+            annexb_func_var_revoke(ctx, fd, name, fd->scope_level);
 
         if (fd->is_global_var) {
             JSGlobalVar *hf;
@@ -48388,6 +48453,22 @@ static void set_eval_ret_undefined(JSParseState *s)
     }
 }
 
+/* One CLAUSE of an if-statement. B.3.4's productions name a FunctionDeclaration in that position and mean the
+   Block `{ FunctionDeclaration }`, so the clause gets its own scope — and only then, because every other clause
+   is an ordinary Statement that must not gain one. */
+static __exception int js_parse_statement_or_decl(JSParseState *s, int decl_mask);
+static __exception int js_parse_if_clause(JSParseState *s, int decl_mask)
+{
+    bool own_scope = (decl_mask & DECL_MASK_FUNC) && s->token.val == TOK_FUNCTION;
+    int ret;
+    if (own_scope && push_scope(s) < 0)
+        return -1;
+    ret = js_parse_statement_or_decl(s, decl_mask);
+    if (own_scope)
+        pop_scope(s);
+    return ret;
+}
+
 static __exception int js_parse_statement_or_decl(JSParseState *s,
                                                   int decl_mask)
 {
@@ -48541,7 +48622,12 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
             else
                 mask = DECL_MASK_FUNC; /* Annex B.3.4 */
 
-            if (js_parse_statement_or_decl(s, mask))
+            /* B.3.4 makes `if (x) function f(){}` mean `if (x) { function f(){} }` — each CLAUSE is its own
+               Block, so each has its own binding for the name. The scope pushed above is the if-statement's own
+               (it is what lets `let f; if (1) function f(){}` be legal); sharing it between the two clauses put
+               both declarations in ONE scope, where the scope-entry hoisting created them both and the later
+               one won regardless of which branch ran. */
+            if (js_parse_if_clause(s, mask))
                 goto fail;
 
             if (s->token.val == TOK_ELSE) {
@@ -48550,7 +48636,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
                     goto fail;
 
                 emit_label(s, label1);
-                if (js_parse_statement_or_decl(s, mask))
+                if (js_parse_if_clause(s, mask))
                     goto fail;
 
                 label1 = label2;
@@ -52409,6 +52495,7 @@ static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd)
     }
     js_free(ctx, fd->global_vars);
     js_free(ctx, fd->using_decls);   /* plain ints: no owned atoms to release */
+    js_free(ctx, fd->annexb_vars);   /* the atoms belong to the byte code, which was freed above */
 
     for(i = 0; i < fd->closure_var_count; i++) {
         JSClosureVar *cv = &fd->closure_var[i];
@@ -54540,6 +54627,7 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
                                          NULL, NULL, pos_next);
             JS_FreeAtom(ctx, var_name);
             break;
+
         case OP_scope_make_ref:
             {
                 int label;
@@ -57279,8 +57367,27 @@ done:
                 }
             }
         } else if (func_type == JS_PARSE_FUNC_VAR) {
-            emit_op(s, OP_fclosure);
-            emit_u32(s, idx);
+            if (lexical_func_idx >= 0)
+                s->cur_func->vars[lexical_func_idx].func_pool_idx = idx;   /* initialized on entering the scope */
+            /* THE VALUE the Annex B store writes. B.3.2.1 step 3 is
+                   fobj = benv.GetBindingValue(F);  genv.SetMutableBinding(F, fobj)
+               — it reads the BLOCK's binding, it does not build a second function. For a block-scoped
+               declaration this code made a whole new closure here and stored THAT, so
+               `{ function x(){} o = x; }` left the outer `x` and the inner one two different objects, and with
+               two declarations of one name the outer kept the first where the block held the last. The
+               scope-entry hoisting already created the one object; read it. */
+            if (lexical_func_idx >= 0) {
+                if (create_func_var) {
+                    emit_op(s, OP_scope_get_var);
+                    emit_atom(s, func_name);
+                    emit_u16(s, s->cur_func->scope_level);
+                }
+            } else {
+                emit_op(s, OP_fclosure);
+                emit_u32(s, idx);
+                if (create_func_var)
+                    emit_op(s, OP_dup);
+            }
             if (create_func_var) {
                 if (s->cur_func->is_global_var) {
                     JSGlobalVar *hf;
@@ -57294,11 +57401,6 @@ done:
                        checks) */
                     hf->scope_level = 0;
                     hf->force_init = s->cur_func->is_strict_mode;
-                    /* store directly into global var, bypass lexical scope */
-                    emit_op(s, OP_dup);
-                    emit_op(s, OP_scope_put_var);
-                    emit_atom(s, func_name);
-                    emit_u16(s, 0);
                 } else {
                     /* do not call define_var to bypass lexical scope check */
                     func_idx = find_var(ctx, s->cur_func, func_name);
@@ -57307,18 +57409,16 @@ done:
                         if (func_idx < 0)
                             goto fail;
                     }
-                    /* store directly into local var, bypass lexical catch scope */
-                    emit_op(s, OP_dup);
-                    emit_op(s, OP_scope_put_var);
-                    emit_atom(s, func_name);
-                    emit_u16(s, 0);
                 }
+                /* store directly into the var, bypassing the lexical scope. The store is PROVISIONAL: an
+                   enclosing block may declare the name lexically LATER, and then the VariableStatement
+                   replacement B.3.2.1 tests would be an Early Error. define_var patches it out if that happens. */
+                annexb_func_var_record(s, s->cur_func, func_name, s->cur_func->byte_code.size);
+                emit_op(s, OP_scope_put_var);
+                emit_atom(s, func_name);
+                emit_u16(s, 0);
             }
-            if (lexical_func_idx >= 0) {
-                /* lexical variable will be initialized upon entering scope */
-                s->cur_func->vars[lexical_func_idx].func_pool_idx = idx;
-                emit_op(s, OP_drop);
-            } else {
+            if (lexical_func_idx < 0) {
                 /* store function object into its lexical name */
                 /* XXX: could use OP_put_loc directly */
                 emit_op(s, OP_scope_put_var_init);
