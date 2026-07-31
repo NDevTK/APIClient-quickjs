@@ -17771,7 +17771,13 @@ static void close_lexical_var(JSContext *ctx, JSFunctionBytecode *b,
 typedef struct JSStepVisit JSStepVisit;
 struct JSStepVisit {
     void (*val)(JSContext *ctx, JSValue *slot);
+    /* An ACCUMULATOR the machine is building into. Not a JSValue and not shareable: two forked arms each append
+       their own remaining elements, so the clone needs its own storage holding what has been accumulated so
+       far. Declared as its own operation rather than left to the machine because a machine must never learn
+       WHICH consumer is visiting it — that is what keeps the one declaration honest. */
+    void (*strbuf)(JSContext *ctx, StringBuffer *slot);
 };
+typedef struct StringBuffer StringBuffer;
 
 /* At FILE SCOPE, before JSTrampStepDef names it in a function-pointer parameter list. Without this, the first
    `struct JSStepHdr` the compiler sees is inside that prototype, where a struct tag's scope ENDS with the
@@ -19007,12 +19013,36 @@ static JSValue tramp_step_state_free(JSContext *ctx, void *st, bool take_result)
     return h->def->fini(ctx, st, take_result);
 }
 
+/* A machine may hold a pointer to ANOTHER machine on the same flow's continuation chain — the join's enclosing
+   join is the one today. Those are borrowed and correct only within one chain, so a clone that copied one would
+   hand the sibling a link into the flow it forked away from. Asked once, here, rather than trusted to each
+   visit: a machine that acquires such a link acquires it as a field, and the fork refuses rather than aliasing. */
+static bool js_step_has_borrowed_link(const JSStepHdr *h);
+
 /* THE TWO CONSUMERS of a machine's `visit`. Neither knows anything about any machine, and no machine knows
    which of them it is being visited by. */
 static void js_step_visit_dup_val(JSContext *ctx, JSValue *slot) { (void)ctx; *slot = js_dup(*slot); }
 static void js_step_visit_free_val(JSContext *ctx, JSValue *slot) { JS_FreeValue(ctx, *slot); *slot = JS_UNDEFINED; }
-static const JSStepVisit js_step_visit_dup  = { js_step_visit_dup_val };
-static const JSStepVisit js_step_visit_free = { js_step_visit_free_val };
+/* The byte-copy left this buffer ALIASING the original's storage — a second free of one allocation and two arms
+   appending into one array. Take what has been accumulated so far, give the copy its own storage, and put it
+   back. A buffer already in its error state stays in it: the clone inherits the failure rather than silently
+   starting clean, because the arm it belongs to is the same computation. */
+static void js_step_visit_dup_strbuf(JSContext *ctx, StringBuffer *slot) {
+    JSString *shared = slot->str;
+    int len = slot->len, err = slot->error_status;
+    if (!slot->ctx) return;   /* never initialised (a prologue threw first): nothing to own */
+    if (string_buffer_init2(ctx, slot, len, slot->is_wide_char) < 0) return;   /* leaves it in error_status */
+    if (!err && shared && len > 0)
+        string_buffer_concat(slot, shared, 0, (uint32_t)len);
+    else if (err)
+        slot->error_status = err;
+}
+static void js_step_visit_free_strbuf(JSContext *ctx, StringBuffer *slot) {
+    (void)ctx;
+    if (slot->ctx) string_buffer_free(slot);
+}
+static const JSStepVisit js_step_visit_dup  = { js_step_visit_dup_val,  js_step_visit_dup_strbuf };
+static const JSStepVisit js_step_visit_free = { js_step_visit_free_val, js_step_visit_free_strbuf };
 /* A machine's teardown releases what it owns through the SAME declaration the clone reads, so the two cannot
    disagree about which fields those are. */
 static void tramp_step_visit_free(JSContext *ctx, void *st) {
@@ -19036,6 +19066,10 @@ static void *tramp_step_state_clone(JSContext *ctx, const void *src)
            "deep-fork of a step machine that does not declare what it OWNS — give it a `visit` in its "
            "JSTrampStepDef (one v->val per owned field, borrowed cb views left alone); the sibling flow cannot "
            "share a state both arms would advance and both would free");
+    DCHECK(!js_step_has_borrowed_link(o),
+           "deep-fork of a step machine holding a BORROWED link into another machine on this flow's chain — "
+           "the sibling's copy would still name the ORIGINAL flow's, so the link has to be re-resolved against "
+           "the clone chain before this is allowed");
     DCHECK(o->outer == NULL && o->delegate == NULL,
            "deep-fork of a step machine that is nested (an outer machine waiting on it, or an inner it has not "
            "handed over) — the clone must walk the whole chain so the sibling's links point at its OWN copies");
@@ -67535,6 +67569,7 @@ static int js_str_split_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
 static JSValue js_str_split_fini(JSContext *ctx, void *st, bool take_result);
 static int js_array_join_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_join_fini(JSContext *ctx, void *st, bool take_result);
+static void js_array_join_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_array_flat_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_array_fromlike_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
@@ -68170,10 +68205,10 @@ static const JSTrampStepDef js_reflect_ownkeys_def = { sizeof(JSOwnKeys), js_own
 static const JSTrampStepDef js_parseInt_def       = { sizeof(JSParseNum), js_parse_num_step, js_parse_num_fini, 1 };
 static const JSTrampStepDef js_parseFloat_def     = { sizeof(JSParseNum), js_parse_num_step, js_parse_num_fini, 0 };
 static const JSTrampStepDef js_str_split_def      = { sizeof(JSStrSplit), js_str_split_step, js_str_split_fini, 0 };
-static const JSTrampStepDef js_array_join_def     = { sizeof(JSArrayJoin), js_array_join_step, js_array_join_fini, JOIN_ARRAY };
-static const JSTrampStepDef js_array_tolocale_def = { sizeof(JSArrayJoin), js_array_join_step, js_array_join_fini, JOIN_ARRAY_LOCALE };
-static const JSTrampStepDef js_ta_join_def        = { sizeof(JSArrayJoin), js_array_join_step, js_array_join_fini, JOIN_TA };
-static const JSTrampStepDef js_ta_tolocale_def    = { sizeof(JSArrayJoin), js_array_join_step, js_array_join_fini, JOIN_TA_LOCALE };
+static const JSTrampStepDef js_array_join_def     = { sizeof(JSArrayJoin), js_array_join_step, js_array_join_fini, JOIN_ARRAY, .visit = js_array_join_visit };
+static const JSTrampStepDef js_array_tolocale_def = { sizeof(JSArrayJoin), js_array_join_step, js_array_join_fini, JOIN_ARRAY_LOCALE, .visit = js_array_join_visit };
+static const JSTrampStepDef js_ta_join_def        = { sizeof(JSArrayJoin), js_array_join_step, js_array_join_fini, JOIN_TA, .visit = js_array_join_visit };
+static const JSTrampStepDef js_ta_tolocale_def    = { sizeof(JSArrayJoin), js_array_join_step, js_array_join_fini, JOIN_TA_LOCALE, .visit = js_array_join_visit };
 static const JSTrampStepDef js_obj_values_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_VALUES };
 static const JSTrampStepDef js_obj_keys_def       = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_KEYS };
 static const JSTrampStepDef js_obj_descs_def      = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_DESCS };
@@ -70384,18 +70419,36 @@ static int js_array_join_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
     return JS_IsException(s->result) ? -1 : 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit), the accumulator included — an element's toString is the page's
+   code, so a concolic branch inside it forks the join mid-build and each arm must append its own remainder to
+   its own buffer. `outer_join` is BORROWED and deliberately not visited; a fork with one set is asserted
+   against at the clone, because the sibling's link would still name the ORIGINAL flow's enclosing join. */
+static void js_array_join_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSArrayJoin *s = st;
+    int i;
+    DCHECK(s->b.ctx != NULL, "the join buffer is initialised by stage 0's first statement, before any throw");
+    v->strbuf(ctx, &s->b);
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->obj);
+    v->val(ctx, &s->sep);
+    v->val(ctx, &s->el);
+    for (i = 0; i < 2; i++) v->val(ctx, &s->cb[i]);
+}
+
+/* The one machine that holds a link into its chain (see js_step_has_borrowed_link). */
+static bool js_step_has_borrowed_link(const JSStepHdr *h)
+{
+    if (h->def->visit == js_array_join_visit) return ((const JSArrayJoin *)h)->outer_join != NULL;
+    return false;
+}
+
 static JSValue js_array_join_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSArrayJoin *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    int i;
-    DCHECK(s->b.ctx != NULL, "the join buffer is initialised by stage 0's first statement, before any throw");
-    string_buffer_free(&s->b);
-    if (!take_result) JS_FreeValue(ctx, s->result);
-    JS_FreeValue(ctx, s->obj);
-    JS_FreeValue(ctx, s->sep);
-    JS_FreeValue(ctx, s->el);
-    for (i = 0; i < 2; i++) JS_FreeValue(ctx, s->cb[i]);
+    if (take_result) s->result = JS_UNDEFINED;   /* handed out, read above before the rest is released */
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
