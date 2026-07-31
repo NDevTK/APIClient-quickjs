@@ -47382,8 +47382,12 @@ static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags)
             abort();
         }
 
-        /* XXX: we disable the OP_put_ref_value optimization by not
-           using put_lvalue() otherwise depth_lvalue is not correct */
+        /* The shaping above IS PUT_LVALUE_KEEP_TOP's, so it looks like a duplicate — it is not, and it must not
+           be collapsed into one. put_lvalue emits a reference's LABEL before the shaping opcode, which is the
+           pattern resolve_scope_var's optimizer recognises, and that optimizer REMOVES the reference's two stack
+           slots. The short-circuit path below pops those slots by the parse-time `depth_lvalue`, which cannot
+           know whether the optimizer will fire; letting it fire underflows that path. Hence NOKEEP_DEPTH here
+           and the label after the shape: this form keeps a real reference on purpose. */
         put_lvalue(s, opcode, scope, name, label, PUT_LVALUE_NOKEEP_DEPTH,
                    false);
         label2 = emit_goto(s, OP_goto, -1);
@@ -52984,10 +52988,34 @@ static int optimize_scope_make_ref(JSContext *ctx, JSFunctionDef *s,
     bc_buf[pos] = get_op + 1;
     put_u16(bc_buf + pos + 1, var_idx);
     pos += 3;
+    DCHECK(pos <= end_pos, "the reference put was rewritten into something longer than the slot it replaced");
     /* pad with OP_nop */
     while (pos < end_pos)
         bc_buf[pos++] = OP_nop;
     return pos_next;
+}
+
+/* Rewrite the WRITE through a reference to a `const` binding into its TypeError, in place, leaving the
+   reference and its read alone. Where the optimizer cannot collapse the reference — the logical forms keep a
+   real one on purpose, see js_parse_assign_expr2 — the put still sits immediately after its OP_label, and those
+   two are 5 + 1 bytes, exactly the six an OP_throw_error needs. Returns false when the put is not where it is
+   expected, in which case the caller falls back to throwing at the reference itself. */
+static bool scope_make_ref_put_ro(JSContext *ctx, uint8_t *bc_buf, LabelSlot *ls, JSAtom var_name)
+{
+    int pos = ls->pos - 5, put = ls->pos;
+    if (pos < 0 || bc_buf[pos] != OP_label)
+        return false;
+    if (bc_buf[put] != OP_put_ref_value) {
+        if (!can_opt_put_ref_value(bc_buf, put))
+            return false;
+        put++;                       /* label, then the stack-shaping opcode, then the put */
+    }
+    bc_buf[pos] = OP_throw_error;
+    put_u32(bc_buf + pos + 1, JS_DupAtom(ctx, var_name));
+    bc_buf[pos + 5] = JS_THROW_VAR_RO;
+    for (pos += 6; pos <= put; pos++)
+        bc_buf[pos] = OP_nop;
+    return true;
 }
 
 static int add_var_this(JSContext *ctx, JSFunctionDef *fd)
@@ -53081,9 +53109,10 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
     int label_done;
     JSFunctionDef *fd;
     JSVarDef *vd;
-    bool is_pseudo_var, is_arg_scope;
+    bool is_pseudo_var, is_arg_scope, ref_is_const;
 
     label_done = -1;
+    ref_is_const = false;
 
     /* XXX: could be simpler to use a specific function to
        resolve the pseudo variables */
@@ -53097,13 +53126,17 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
     for (idx = s->scopes[scope_level].first; idx >= 0;) {
         vd = &s->vars[idx];
         if (vd->var_name == var_name) {
-            if (op == OP_scope_put_var || op == OP_scope_make_ref) {
-                if (vd->is_const) {
+            if (vd->is_const) {
+                if (op == OP_scope_put_var) {
                     dbuf_putc(bc, OP_throw_error);
                     dbuf_put_u32(bc, JS_DupAtom(ctx, var_name));
                     dbuf_putc(bc, JS_THROW_VAR_RO);
                     goto done;
                 }
+                /* a REFERENCE to a const is legal to create; only its PutValue throws, and the make_ref arm
+                   below puts the throw exactly where the write was. */
+                if (op == OP_scope_make_ref)
+                    ref_is_const = true;
             }
             var_idx = idx;
             break;
@@ -53142,16 +53175,27 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
             s->vars[var_idx].is_const) {
             /* only happens when assigning a function expression name
                in strict mode */
-            dbuf_putc(bc, OP_throw_error);
-            dbuf_put_u32(bc, JS_DupAtom(ctx, var_name));
-            dbuf_putc(bc, JS_THROW_VAR_RO);
-            goto done;
+            if (op == OP_scope_make_ref) {
+                ref_is_const = true;
+            } else {
+                dbuf_putc(bc, OP_throw_error);
+                dbuf_put_u32(bc, JS_DupAtom(ctx, var_name));
+                dbuf_putc(bc, JS_THROW_VAR_RO);
+                goto done;
+            }
         }
         /* OP_scope_put_var_init is only used to initialize a
            lexical variable, so it is never used in a with or var object. It
            can be used with a closure (module global variable case). */
         switch (op) {
         case OP_scope_make_ref:
+            if (ref_is_const && !scope_make_ref_put_ro(ctx, bc_buf, ls, var_name)) {
+                /* the write is not in a shape that can be rewritten: throw at the REFERENCE, the older order */
+                dbuf_putc(bc, OP_throw_error);
+                dbuf_put_u32(bc, JS_DupAtom(ctx, var_name));
+                dbuf_putc(bc, JS_THROW_VAR_RO);
+                goto done;
+            }
             if (!(var_idx & ARGUMENT_VAR_OFFSET) &&
                 s->vars[var_idx].var_kind == JS_VAR_FUNCTION_NAME) {
                 /* Create a dummy object reference for the func_var */
@@ -53163,7 +53207,9 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
                 dbuf_putc(bc, OP_push_atom_value);
                 dbuf_put_u32(bc, JS_DupAtom(ctx, var_name));
             } else
-            if (label_done == -1 && can_opt_put_ref_value(bc_buf, ls->pos)) {
+            if (!ref_is_const && label_done == -1 && can_opt_put_ref_value(bc_buf, ls->pos)) {
+                /* A const reference is never collapsed: its write has ALREADY been rewritten into the throw
+                   above, and this would overwrite that with a plain put. */
                 int get_op;
                 if (var_idx & ARGUMENT_VAR_OFFSET) {
                     get_op = OP_get_arg;
@@ -53174,8 +53220,7 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
                     else
                         get_op = OP_get_loc;
                 }
-                pos_next = optimize_scope_make_ref(ctx, s, bc, bc_buf, ls,
-                                                   pos_next, get_op, var_idx);
+                pos_next = optimize_scope_make_ref(ctx, s, bc, bc_buf, ls, pos_next, get_op, var_idx);
             } else {
                 /* Create a dummy object with a named slot that is
                    a reference to the local variable */
@@ -53271,13 +53316,16 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
         for (idx = fd->scopes[scope_level].first; idx >= 0;) {
             vd = &fd->vars[idx];
             if (vd->var_name == var_name) {
-                if (op == OP_scope_put_var || op == OP_scope_make_ref) {
-                    if (vd->is_const) {
+                if (vd->is_const) {
+                    if (op == OP_scope_put_var) {
                         dbuf_putc(bc, OP_throw_error);
                         dbuf_put_u32(bc, JS_DupAtom(ctx, var_name));
                         dbuf_putc(bc, JS_THROW_VAR_RO);
                         goto done;
                     }
+                    /* an enclosing function's const, same rule: the reference is legal, the write is not. */
+                    if (op == OP_scope_make_ref)
+                        ref_is_const = true;
                 }
                 var_idx = idx;
                 break;
@@ -53401,15 +53449,25 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
         }
         if (idx >= 0) {
         has_idx:
-            if ((op == OP_scope_put_var || op == OP_scope_make_ref) &&
-                s->closure_var[idx].is_const) {
-                dbuf_putc(bc, OP_throw_error);
-                dbuf_put_u32(bc, JS_DupAtom(ctx, var_name));
-                dbuf_putc(bc, JS_THROW_VAR_RO);
-                goto done;
+            if (s->closure_var[idx].is_const) {
+                if (op == OP_scope_put_var) {
+                    dbuf_putc(bc, OP_throw_error);
+                    dbuf_put_u32(bc, JS_DupAtom(ctx, var_name));
+                    dbuf_putc(bc, JS_THROW_VAR_RO);
+                    goto done;
+                }
+                /* a captured const, same rule as a local one: the reference is legal, the write is not. */
+                if (op == OP_scope_make_ref)
+                    ref_is_const = true;
             }
             switch (op) {
             case OP_scope_make_ref:
+                if (ref_is_const && !scope_make_ref_put_ro(ctx, bc_buf, ls, var_name)) {
+                    dbuf_putc(bc, OP_throw_error);
+                    dbuf_put_u32(bc, JS_DupAtom(ctx, var_name));
+                    dbuf_putc(bc, JS_THROW_VAR_RO);
+                    goto done;
+                }
                 if (s->closure_var[idx].var_kind == JS_VAR_FUNCTION_NAME) {
                     /* Create a dummy object reference for the func_var */
                     dbuf_putc(bc, OP_object);
@@ -53420,7 +53478,7 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
                     dbuf_putc(bc, OP_push_atom_value);
                     dbuf_put_u32(bc, JS_DupAtom(ctx, var_name));
                 } else
-                if (label_done == -1 &&
+                if (!ref_is_const && label_done == -1 &&
                     can_opt_put_ref_value(bc_buf, ls->pos)) {
                     int get_op;
                     if (s->closure_var[idx].is_lexical)
@@ -53428,8 +53486,7 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
                     else
                         get_op = OP_get_var_ref;
                     pos_next = optimize_scope_make_ref(ctx, s, bc, bc_buf, ls,
-                                                       pos_next,
-                                                       get_op, idx);
+                                                       pos_next, get_op, idx);
                 } else {
                     /* Create a dummy object with a named slot that is
                        a reference to the closure variable */
