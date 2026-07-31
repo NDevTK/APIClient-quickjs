@@ -39218,6 +39218,12 @@ static JSValue *tramp_buf_base(TrampFrame *t) {
     return (t->async_data || t->gen_data) ? tramp_live_sf(t)->arg_buf : t->local_buf;
 }
 
+/* The join-chain search, declared here because clone_deep_flow re-derives each cloned join's cached
+   enclosing-join pointer with it. */
+struct JSArrayJoin;
+static struct JSArrayJoin *js_join_chain_find(const void *st, uint8_t kind);
+static void js_array_join_visit(JSContext *ctx, void *st, JSStepVisit *v);
+
 static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
     JSStackFrame *ob = &s->frame;
     /* Collect the chain deepest(tramp_top)-first .. bottom-last. arr[i].up == arr[i+1]; bottom.up == NULL. */
@@ -39505,6 +39511,25 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
         ct->caller_var_refs  = caller_clone->var_refs;
     }
     #undef XL
+    /* RE-RESOLVE each cloned join's enclosing join against the SIBLING'S chain. `outer_join` is a CACHE of a
+       walk this chain already answers — found once at join entry so the cycle test costs one pointer compare
+       per level instead of five link dispatches — and the byte-copy left every one of them naming a machine on
+       the ORIGINAL flow's chain. Re-deriving it here is the same search that set it, run over the frames just
+       built, so the cache is correct rather than merely absent: a sibling with NULL would miss a cycle and
+       recurse forever on `a[0] = a`. This is why the fork no longer has to refuse a join that has one. */
+    for (int ji = 0; ji < n; ji++) {
+        TrampFrame *tf = ca[ji];
+        struct JSArrayJoin *j;
+        int k;
+        if (tf->cont_kind != CONT_STEP || !tf->cont_state) continue;
+        if (((JSStepHdr *)tf->cont_state)->def->visit != js_array_join_visit) continue;
+        j = (struct JSArrayJoin *)tf->cont_state;
+        j->outer_join = NULL;
+        for (k = ji + 1; k < n; k++) {   /* outward along the clone chain, exactly as js_join_enclosing walks up */
+            struct JSArrayJoin *o = js_join_chain_find(ca[k]->cont_state, ca[k]->cont_kind);
+            if (o) { j->outer_join = o; break; }
+        }
+    }
     c->tramp_top = ca[0];
     js_free(ctx, oa); js_free(ctx, ca);
     return (JSValue *)c;
@@ -70702,9 +70727,13 @@ static void js_array_join_visit(JSContext *ctx, void *st, JSStepVisit *v)
 
 /* The machines holding state a clone must not copy: a link into this flow's own chain, or a collection whose
    deep copy is a capability that has not been built. Both refuse the fork rather than aliasing. */
+/* No machine holds a link a clone cannot resolve any more. The joins' `outer_join` — the last one — is
+   RE-DERIVED against the sibling's own chain at the end of clone_deep_flow, so the question this asked has an
+   answer instead of a refusal. It stays as the place a future such field is caught: a machine that starts
+   holding a pointer into its own chain has to say so here, and says it once rather than in each visit. */
 static bool js_step_has_borrowed_link(const JSStepHdr *h)
 {
-    if (h->def->visit == js_array_join_visit) return ((const JSArrayJoin *)h)->outer_join != NULL;
+    (void)h;
     return false;
 }
 
