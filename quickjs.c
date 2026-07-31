@@ -21890,6 +21890,15 @@ typedef struct JSAsyncFromSync {
                                     abrupt step-5 completion that step 4 makes the result no matter what the
                                     close does. UNINITIALIZED otherwise. */
 } JSAsyncFromSync;
+/* EVERY owned JSValue of that state, exactly once, in TWO lists — because the two consumers differ on exactly
+   one thing. js_async_from_sync_end frees both; the deep-fork clone dups only REST and mints a FRESH capability,
+   since each arm delivers its own wrapper promise to its own OP_await. Written here, beside the fields, so a new
+   one cannot be freed in the teardown and forgotten in the clone: that omission co-owned `drive_next`, `res_obj`
+   and `drive_arg` across two flows and underflowed their refcounts — the same bug ITERCONS_OWNED was written to
+   end, in a second costume. `res_obj`/`drive_arg`/`pending_error` are UNDEFINED or UNINITIALIZED when their
+   phase is not in flight, and both operations are no-ops on those. */
+#define AFS_OWNED_CAP(F)  F(promise) F(resolving_funcs[0]) F(resolving_funcs[1])
+#define AFS_OWNED_REST(F) F(sync_iter) F(drive_next) F(res_obj) F(drive_arg) F(pending_error)
 /* CALL: OP_call_method on wrapper.next(v) — pop the call operands, push the promise.
    CLOSE: OP_iterator_close — the promise is never awaited: discard it and pop the iterator operand (sp[-1]).
    ITERNEXT: OP_iterator_next (`for await` / yield* delegation) — the promise REPLACES the argument at sp[-1];
@@ -39046,18 +39055,22 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
            REFERENCE too or both frames release the same one. */
         if (ct->owns_func)
             ct->sf.cur_func = js_dup(ct->sf.cur_func);
-        DCHECK(otf->cont_kind != CONT_STEP_YIELD,
-               "clone_deep_flow: a concolic fork of a flow parked INSIDE a step machine — the sibling needs its "
-               "OWN machine state, and cloning one is not built. The struct copy below would duplicate the "
-               "cont_state POINTER and hand both flows the same state, which is the owns_func bug in a second "
-               "costume; crash here instead of sharing it.");
         DCHECK(otf->cont_kind != CONT_AGEN_DRIVE,
                "clone_deep_flow: a concolic fork inside an ASYNC GENERATOR body on the tramp — the sibling needs "
                "its OWN JSAsyncGeneratorData (cloned body frame, fresh queue and settlement capability), like the "
                "async_data and gen_data arms below; the struct copy would share the parent's machine and settle "
                "both arms' requests off one queue");
 
-        if (otf->async_data) {
+        if (otf->cont_kind == CONT_STEP_YIELD) {
+            /* A step machine PARKED AT ITS OWN BACK-EDGE. The anchor frame is bodyless — no bytecode, no
+               local_buf, its sf memset to zero — so it carries nothing but the machine, and the sibling needs
+               its own for the same reason a CONT_STEP callback frame does. It comes FIRST because the branches
+               below read cur_func's bytecode, which this frame has none of. */
+            void *ns = tramp_step_state_clone(ctx, otf->cont_state);
+            if (!ns) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
+            ct->cont_state = ns;
+            ct->local_buf = NULL; ct->b = NULL;
+        } else if (otf->async_data) {
             /* ASYNC body on the chain: clone a FRESH async_data with its OWN return-promise capability. The fork
                also cloned the caller's mid-OP_call (the async call site), so each arm re-derives and awaits ITS
                OWN promise — no shared-promise conflict, so no promise-state-on-COW is needed. The body's live
@@ -39149,13 +39162,21 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                 JSAsyncFromSync *os = (JSAsyncFromSync *)otf->cont_state;
                 JSAsyncFromSync *ns = js_mallocz(ctx, sizeof(*ns));
                 if (!ns) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
-                *ns = *os;   /* copies os's OWNED promise/resolving_funcs/sync_iter as borrowed — reassign each below */
+                *ns = *os;   /* copies every OWNED field as borrowed — the two lists below take them properly */
+                #define AFS_DUP_ONE(f) ns->f = js_dup(os->f);
+                AFS_OWNED_REST(AFS_DUP_ONE)   /* sync_iter (== genobj, gen-COW-isolated), the nextMethod, and the
+                                                 in-flight unpack/argument/close values — each a real reference */
+                #undef AFS_DUP_ONE
                 ns->promise = JS_NewPromiseCapability(ctx, ns->resolving_funcs);   /* fresh (overwrites the copied funcs): sibling delivers ITS own promise */
-                if (JS_IsException(ns->promise)) { js_free(ctx, ns); js_free(ctx, oa); js_free(ctx, ca); return NULL; }
-                ns->sync_iter = js_dup(os->sync_iter);
-                /* a fork mid step-6-close: each arm owns its own copy of the completion it will reject with */
-                if (!JS_IsUninitialized(os->pending_error))
-                    ns->pending_error = js_dup(os->pending_error);
+                if (JS_IsException(ns->promise)) {
+                    ns->promise = JS_UNDEFINED;
+                    ns->resolving_funcs[0] = ns->resolving_funcs[1] = JS_UNDEFINED;
+                    js_async_from_sync_end(ctx, ns); js_free(ctx, ns); js_free(ctx, oa); js_free(ctx, ca); return NULL;
+                }
+                DCHECK(os->call_outer == NULL,
+                       "clone_deep_flow: a for-await drive forked while a machine WAITS on its wrapper call — the "
+                       "sibling's call_outer still points at the ORIGINAL waiter, so the two arms would deliver "
+                       "into one continuation; clone the waiting link too");
                 ct->cont_state = ns;
             } else if (otf->cont_kind == CONT_PROMISE_ALL) {
                 /* Promise.all(gen) forked mid-consume. The sibling gets a FRESH aggregate (own result_promise +
@@ -84808,15 +84829,10 @@ have_value:
 /* Free a for-await async-from-sync state's owned fields (promise dup'd out by the caller before this). */
 static void js_async_from_sync_end(JSContext *ctx, JSAsyncFromSync *s)
 {
-    JS_FreeValue(ctx, s->promise);
-    JS_FreeValue(ctx, s->resolving_funcs[0]);
-    JS_FreeValue(ctx, s->resolving_funcs[1]);
-    JS_FreeValue(ctx, s->sync_iter);
-    JS_FreeValue(ctx, s->drive_next);
-    JS_FreeValue(ctx, s->res_obj);             /* set only while the result unpack is in flight */
-    JS_FreeValue(ctx, s->drive_arg);           /* UNINITIALIZED (a no-op free) for the no-argument forms */
-    if (!JS_IsUninitialized(s->pending_error))
-        JS_FreeValue(ctx, s->pending_error);   /* only set while step 6's close is in flight */
+    #define AFS_FREE_ONE(f) JS_FreeValue(ctx, s->f);
+    AFS_OWNED_CAP(AFS_FREE_ONE)
+    AFS_OWNED_REST(AFS_FREE_ONE)
+    #undef AFS_FREE_ONE
 }
 
 /* Free a Promise.all(gen) state's owned fields (result_promise moved out by the caller before this on the happy path). */
