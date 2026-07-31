@@ -120,6 +120,13 @@ static const REOpCode reopcode_info[REOP_COUNT] = {
 #undef DEF
 };
 
+/* THE OPCODE'S OWN SIZE, from the one table that defines it. The quantifier emitter below inserts room for a
+   prefix it is about to write, and it used to spell those sizes as literals — 3 for save_reset, 5 for a split,
+   11 for a split plus a set_i32 — which is the same layout knowledge written twice, in a place where being
+   wrong corrupts byte code silently rather than failing. It is also what makes a capture index wider than a
+   byte a table edit instead of a hunt: CAPTURE_COUNT_MAX is 255 because REOP_save_start carries a u8. */
+#define REOP_SZ(op)  ((int)reopcode_info[op].size)
+
 #define RE_HEADER_FLAGS          0
 #define RE_HEADER_CAPTURE_COUNT  2
 #define RE_HEADER_REGISTER_COUNT 3
@@ -1997,12 +2004,12 @@ static int re_parse_disjunction(REParseState *s, bool is_backward_dir)
         len = s->byte_code.size - f->dj_start;
 
         /* insert a split before the first alternative */
-        if (dbuf_insert(&s->byte_code, f->dj_start, 5)) {
+        if (dbuf_insert(&s->byte_code, f->dj_start, REOP_SZ(REOP_split_next_first))) {
             re_parse_out_of_memory(s);
             goto fail;
         }
         s->byte_code.buf[f->dj_start] = REOP_split_next_first;
-        put_u32(s->byte_code.buf + f->dj_start + 1, len + 5);
+        put_u32(s->byte_code.buf + f->dj_start + 1, len + REOP_SZ(REOP_split_next_first));
 
         f->goto_pos = re_emit_op_u32(s, REOP_goto, 0);
 
@@ -2462,7 +2469,7 @@ static int re_parse_disjunction(REParseState *s, bool is_backward_dir)
                    need to reset once the captures in case the atom
                    does not match. */
                 if (need_capture_init && last_capture_count != s->capture_count) {
-                    if (dbuf_insert(&s->byte_code, last_atom_start, 3))
+                    if (dbuf_insert(&s->byte_code, last_atom_start, REOP_SZ(REOP_save_reset)))
                         goto out_of_memory;
                     int pos = last_atom_start;
                     s->byte_code.buf[pos++] = REOP_save_reset;
@@ -2475,7 +2482,7 @@ static int re_parse_disjunction(REParseState *s, bool is_backward_dir)
                     /* need to reset the capture in case the atom is
                        not executed */
                     if (!need_capture_init && last_capture_count != s->capture_count) {
-                        if (dbuf_insert(&s->byte_code, last_atom_start, 3))
+                        if (dbuf_insert(&s->byte_code, last_atom_start, REOP_SZ(REOP_save_reset)))
                             goto out_of_memory;
                         s->byte_code.buf[last_atom_start++] = REOP_save_reset;
                         s->byte_code.buf[last_atom_start++] = last_capture_count;
@@ -2485,25 +2492,35 @@ static int re_parse_disjunction(REParseState *s, bool is_backward_dir)
                         s->byte_code.size = last_atom_start;
                     } else if (quant_max == 1 || quant_max == INT32_MAX) {
                         bool has_goto = (quant_max == INT32_MAX);
-                        if (dbuf_insert(&s->byte_code, last_atom_start, 5 + add_zero_advance_check * 2))
+                        if (dbuf_insert(&s->byte_code, last_atom_start,
+                                        REOP_SZ(REOP_split_goto_first)
+                                        + add_zero_advance_check * REOP_SZ(REOP_set_char_pos)))
                             goto out_of_memory;
                         s->byte_code.buf[last_atom_start] = REOP_split_goto_first +
                             greedy;
                         put_u32(s->byte_code.buf + last_atom_start + 1,
-                                len + 5 * has_goto + add_zero_advance_check * 2 * 2);
+                                len + REOP_SZ(REOP_goto) * has_goto
+                                + add_zero_advance_check * (REOP_SZ(REOP_set_char_pos)
+                                                            + REOP_SZ(REOP_check_advance)));
                         if (add_zero_advance_check) {
-                            s->byte_code.buf[last_atom_start + 1 + 4] = REOP_set_char_pos;
-                            s->byte_code.buf[last_atom_start + 1 + 4 + 1] = 0;
+                            int cpos = last_atom_start + REOP_SZ(REOP_split_goto_first);
+                            s->byte_code.buf[cpos] = REOP_set_char_pos;
+                            s->byte_code.buf[cpos + 1] = 0;
                             re_emit_op_u8(s, REOP_check_advance, 0);
                         }
                         if (has_goto)
                             re_emit_goto(s, REOP_goto, last_atom_start);
                     } else {
-                        if (dbuf_insert(&s->byte_code, last_atom_start, 11 + add_zero_advance_check * 2))
+                        if (dbuf_insert(&s->byte_code, last_atom_start,
+                                        REOP_SZ(REOP_split_goto_first) + REOP_SZ(REOP_set_i32)
+                                        + add_zero_advance_check * REOP_SZ(REOP_set_char_pos)))
                             goto out_of_memory;
                         pos = last_atom_start;
                         s->byte_code.buf[pos++] = REOP_split_goto_first + greedy;
-                        put_u32(s->byte_code.buf + pos, 6 + add_zero_advance_check * 2 + len + 10);
+                        put_u32(s->byte_code.buf + pos,
+                                REOP_SZ(REOP_set_i32)
+                                + add_zero_advance_check * REOP_SZ(REOP_set_char_pos)
+                                + len + REOP_SZ(REOP_loop_split_next_first));
                         pos += 4;
 
                         s->byte_code.buf[pos++] = REOP_set_i32;
@@ -2524,7 +2541,9 @@ static int re_parse_disjunction(REParseState *s, bool is_backward_dir)
                 } else {
                     if (quant_min == quant_max)
                         add_zero_advance_check = false;
-                    if (dbuf_insert(&s->byte_code, last_atom_start, 6 + add_zero_advance_check * 2))
+                    if (dbuf_insert(&s->byte_code, last_atom_start,
+                                    REOP_SZ(REOP_set_i32)
+                                    + add_zero_advance_check * REOP_SZ(REOP_set_char_pos)))
                         goto out_of_memory;
                     /* Note: we assume the string length is < INT32_MAX */
                     pos = last_atom_start;
