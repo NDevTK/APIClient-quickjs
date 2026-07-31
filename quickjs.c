@@ -19756,14 +19756,9 @@ static bool js_callsite_running_step(JSContext *ctx, JSCallSiteData *csd)
                                   OPERATOR. 13.10.2 step 3.b is ToBoolean(result) and nothing else, so the
                                   continuation is that coercion — the operator cannot do it, having already returned
                                   to the interpreter loop when the method's body runs. */
-#define CONT_PROXY_CONSTRUCT 23 /* cont_state = NULL, or a JSProxyCtor: a trampolined proxy [[Construct]] trap.
-                                  What it owes after the call is 9.5.14 step 13 — the trap's result MUST be an
-                                  object — which needs no state, and that is why it had none. A construct
-                                  requested BY a machine (`Reflect.construct(proxyWithTrap, args)` from the
-                                  Reflect.construct machine) owes one thing more: the object goes to that machine
-                                  instead of onto a caller stack it does not own. NULL means the ordinary case,
-                                  where the operands ARE the caller's. */
-typedef struct JSProxyCtor { void *outer; uint8_t outer_kind; } JSProxyCtor;
+/* 23 was CONT_PROXY_CONSTRUCT, with a JSProxyCtor to carry a requesting machine across the reshape. Proxy
+   [[Construct]] is a step machine, so step 9's must-return-an-object check is its completion stage and
+   its requester is the ordinary step outer — there is no continuation left for the kind to name. */
 static JSValue js_proxy_get_invariant(JSContext *ctx, JSValueConst target, JSAtom atom, JSValue ret);
 /* 6.2.6.4 FromPropertyDescriptor over a filled JSPropertyDescriptor. CONSUMES the descriptor. It builds no
    accessors and reads nothing of the page's, so it is the same operation wherever [[GetOwnProperty]] was
@@ -21285,7 +21280,6 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_ASYNC_FROM_SYNC:
     case CONT_ITER_HELPER:
     case CONT_ITER_FROM:
-    case CONT_PROXY_CONSTRUCT:
     case CONT_INSTANCEOF:
     case CONT_PROMISE_EXEC:
     case CONT_FOROF_UNPACK:
@@ -23833,109 +23827,14 @@ static void js_json_reviver_visit(JSContext *ctx, void *st, JSStepVisit *v);
    ultimate target dispatched on this chain; JS_Call'ing it from C would drive a generator .next off the tramp. */
 static JSValue js_call_function(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 static JSProxyData *get_proxy_method(JSContext *ctx, JSValue *pmethod, JSValueConst obj, JSAtom name);
-/* PROXY [[Construct]]: `new proxy(...)`. Resolve the `construct` trap at the operator site and dispatch it as
-   trap(target, argArray, newTarget) with `this` = handler, so a loop in the trap body parks. Layout-independent
-   like [[Set]]'s: fills out[0..4] with [handler, trap, target, argArray, newTarget] (owning every one) because the
-   operand count the caller consumes depends on its argc. Returns 1 = routed, 2 = no trap, re-dispatch against
-   *out_target (which may itself be a proxy), 0 = not a proxy / non-bytecode trap, -1 = pending exception. */
-static JSValue JS_ThrowTypeErrorNotAConstructor(JSContext *ctx, JSValueConst val);
-static int js_tramp_proxy_construct(JSContext *ctx, JSValueConst func, JSValueConst new_target,
-                                    int argc, JSValueConst *argv, JSValue *out /* 5 slots */,
-                                    JSValue *out_target)
-{
-    JSProxyData *s;
-    JSValue method, arr;
-    *out_target = JS_UNDEFINED;
-    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT
-        || JS_VALUE_GET_OBJ(func)->class_id != JS_CLASS_PROXY) return 0;
-    s = get_proxy_method(ctx, &method, func, JS_ATOM_construct);
-    if (!s) return -1;
-    if (!JS_IsConstructor(ctx, s->target)) {
-        JS_FreeValue(ctx, method);
-        JS_ThrowTypeErrorNotAConstructor(ctx, s->target);
-        return -1;
-    }
-    if (JS_IsUndefined(method)) {
-        *out_target = js_dup(s->target);   /* 9.5.14 step 6: Construct(target, args, newTarget) */
-        return 2;
-    }
-    arr = js_create_array(ctx, argc, argv);
-    if (JS_IsException(arr)) { JS_FreeValue(ctx, method); return -1; }
-    out[0] = js_dup(s->handler);   /* this */
-    out[1] = method;               /* the trap (owned) */
-    out[2] = js_dup(s->target);
-    out[3] = arr;
-    out[4] = js_dup(new_target);
-    return 1;
-}
-/* PROXY [[Call]]: resolve the `apply` trap at the operator site and dispatch it on THIS chain as
-   trap(target, thisArg, argArray) with `this` = handler. With NO trap the call forwards to the TARGET, which is
-   itself re-dispatched here, so recursion through a proxy reference is unbounded. [[Call]] has no result invariant
-   (unlike [[Get]]/[[Construct]]), so no continuation is needed — do_return places the trap's result where the call's
-   result belongs. Returns 1 = routed as a 3-arg method call (operands written at out_slots[0..3]),
-   2 = no trap, forward to `*out_target`, 0 = not a proxy / non-bytecode trap, -1 = pending exception. */
-static bool tramp_resolve_proxy_callee(JSContext *ctx, JSValueConst func, JSValue *out);
-static int js_tramp_proxy_apply(JSContext *ctx, JSValueConst func_obj, JSValueConst this_obj,
-                                int argc, JSValueConst *argv,
-                                JSValue *out_slots /* 4: handler, trap, target, thisArg, argArray via [0..3] */,
-                                JSValue *out_target)
-{
-    JSProxyData *s;
-    JSValue method, arr;
-    *out_target = JS_UNDEFINED;
-    if (JS_VALUE_GET_TAG(func_obj) != JS_TAG_OBJECT
-        || JS_VALUE_GET_OBJ(func_obj)->class_id != JS_CLASS_PROXY) return 0;
-    s = get_proxy_method(ctx, &method, func_obj, JS_ATOM_apply);
-    if (!s) return -1;
-    if (!s->is_func) { JS_FreeValue(ctx, method); JS_ThrowTypeErrorNotAFunction(ctx); return -1; }
-    if (JS_IsUndefined(method)) {
-        /* no trap: forward to the target — and keep walking, so a proxy wrapping a proxy wrapping a function
-           resolves to the ultimate callee in one step instead of falling to the C path at the second hop. */
-        JS_FreeValue(ctx, method);
-        if (!tramp_resolve_proxy_callee(ctx, func_obj, out_target)) return -1;
-        DCHECK(!JS_IsUndefined(*out_target), "no-trap proxy walk must reach a callee");
-        return 2;
-    }
-    arr = js_create_array(ctx, argc, argv);
-    if (JS_IsException(arr)) { JS_FreeValue(ctx, method); return -1; }
-    out_slots[0] = js_dup(s->handler);   /* this */
-    out_slots[1] = method;               /* trap (owned) */
-    out_slots[2] = js_dup(s->target);
-    out_slots[3] = js_dup(this_obj);
-    out_slots[4] = arr;
-    return 1;
-}
-/* Resolve a callee through PROXIES for the apply/Reflect.apply paths, which dispatch a normal bytecode target
-   directly. [[Call]] on a proxy reads its `apply` trap, so reading it here is the spec's own order; when the trap is
-   absent the call forwards to the target, and that walk continues (a proxy wrapping a proxy wrapping a function).
-   A PRESENT trap declines (*out stays JS_UNDEFINED) — that shape is routed at the call site instead.
-   Returns false on a revoked proxy / throwing handler-get, with the exception pending. */
-static bool tramp_resolve_proxy_callee(JSContext *ctx, JSValueConst func, JSValue *out)
-{
-    JSValueConst cur = func;
-    *out = JS_UNDEFINED;
-    /* The walk terminates STRUCTURALLY, so there is nothing here to bound: a proxy's [[ProxyTarget]] is fixed at
-       construction and the target must already exist to be passed, so every hop moves to a strictly OLDER object
-       and the chain cannot cycle. A `< 10000` counter used to stand here; a magic number asserting something the
-       construction rule already guarantees is a cap wearing an assert's clothes, and it would have fired on a
-       legitimately deep chain. */
-    while (JS_VALUE_GET_TAG(cur) == JS_TAG_OBJECT
-           && JS_VALUE_GET_OBJ(cur)->class_id == JS_CLASS_PROXY) {
-        JSProxyData *s;
-        JSValue method;
-        s = get_proxy_method(ctx, &method, cur, JS_ATOM_apply);
-        if (!s) return false;                       /* revoked / handler get threw */
-        if (!JS_IsUndefined(method)) { JS_FreeValue(ctx, method); break; }   /* trap here: stop AT this proxy */
-        JS_FreeValue(ctx, method);
-        if (!s->is_func) { JS_ThrowTypeErrorNotAFunction(ctx); return false; }
-        cur = s->target;
-    }
-    /* Always yields the node the walk STOPPED at — a plain callee, or the proxy whose trap must run. The caller
-       re-dispatches it, so a no-trap proxy wrapping a TRAP-bearing proxy routes the inner trap instead of being
-       collapsed past it. */
-    *out = js_dup(cur);
-    return true;
-}
+/* DELETED: js_tramp_proxy_construct, the operator site's copy of 10.5.13. It read the `construct` trap with
+   JS_GetProperty from C, which is the page's [[Get]] on the handler. Proxy [[Construct]] is a step machine
+   now (js_proxy_construct_def), reached through the one step-constructor entry. */
+/* DELETED: js_tramp_proxy_apply and tramp_resolve_proxy_callee, the operator site's own copy of 10.5.12.
+   Both read the `apply` trap off the handler with JS_GetProperty from C, which is the page's [[Get]] — so a
+   proxied handler reached js_proxy_get's DFAIL and an accessor handler ran off the tramp. Proxy [[Call]] is
+   a step machine now (js_proxy_call_def), reached through the one step entry, and its trapless arm is a CALL
+   request the driver re-dispatches, which is what the walk was for. */
 static inline bool tramp_is_call_function(JSValueConst method) {
     JSObject *mp;
     if (JS_VALUE_GET_TAG(method) != JS_TAG_OBJECT) return false;
@@ -25306,17 +25205,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         tramp_is_tail = (opcode == OP_tail_call_method); goto do_apply_tramp;
                     }
                 }
-                if (tramp_is_reflect_apply(call_argv[-1]) && call_argc >= 3
-                    && JS_VALUE_GET_TAG(call_argv[0]) == JS_TAG_OBJECT
-                    && JS_VALUE_GET_OBJ(call_argv[0])->class_id == JS_CLASS_PROXY) {
-                    /* Reflect.apply(proxy, ...): collapse no-trap proxies to the ultimate callee IN the operand slot,
-                       so the generator-create / normal-apply routes below see it. [[Call]] reads the apply trap, so
-                       this is the spec's own order; a trap-bearing proxy stays put and takes the C path. */
-                    JSValue rtgt2;
-                    if (unlikely(!tramp_resolve_proxy_callee(ctx, call_argv[0], &rtgt2))) goto exception;
-                    JS_FreeValue(ctx, (JSValue)call_argv[0]);
-                    ((JSValue *)call_argv)[0] = rtgt2;
-                }
+                /* DELETED: the Reflect.apply trapless-proxy collapse. It read the `apply` trap from C to walk
+                   past no-trap proxies so the routes below would see the ultimate callee. Those routes see it
+                   anyway now: [[Call]] on a proxy is a machine whose trapless arm issues a CALL request against
+                   the target, and the driver re-dispatches that at the one convergence point — where the
+                   generator, agen and consumer questions are asked. */
                 if (tramp_is_reflect_apply(call_argv[-1]) && call_argc >= 3
                     && JS_VALUE_GET_TAG(call_argv[2]) == JS_TAG_OBJECT) {   /* Reflect.apply(target, this, argsList) */
                     /* The same call-site resolution as `.apply` above, for the same reason and through the same
@@ -25965,78 +25858,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int con_cargc_in = con_cargc;
                 int con_pop = tramp_first ? (con_cargc_in >= 0 ? con_cargc_in : con_argc) : 0;
                 con_cargc = -1;
-                if (JS_VALUE_GET_TAG(con_func) == JS_TAG_OBJECT
-                    && JS_VALUE_GET_OBJ(con_func)->class_id == JS_CLASS_PROXY) {
-                    /* Proxy [[Construct]]: run the trap on THIS chain. This used to sit at OP_call_constructor,
-                       which is why `new P(...arr)` — the spread shape, which never passes that opcode — fell to
-                       JS_CallConstructorInternal and drove the trap (or the target's body) to completion. It
-                       belongs where the other construct-target questions are asked, and from here it serves
-                       every shape: the operands to drop are whatever con_pop says, and the five the trap call
-                       needs are pushed at sp rather than written over the caller's slots, so the reshape no
-                       longer assumes the arguments are ON that stack. Trapless proxies resolve through to the
-                       ultimate target and fall into the arms below, so a consumer behind one is routed too. */
-                    JSValue px[5], ptgt = JS_UNDEFINED, resolved = JS_UNDEFINED;
-                    int px_ret = js_tramp_proxy_construct(ctx, con_func, con_ntgt, con_argc, con_args, px, &ptgt);
-                    while (px_ret == 2) {   /* no trap: construct the TARGET, which may itself be a proxy */
-                        JS_FreeValue(ctx, resolved);
-                        resolved = ptgt; ptgt = JS_UNDEFINED;
-                        con_func = resolved;
-                        px_ret = js_tramp_proxy_construct(ctx, con_func, con_ntgt, con_argc, con_args, px, &ptgt);
-                    }
-                    if (unlikely(px_ret < 0)) { JS_FreeValue(ctx, resolved); goto exception; }
-                    if (px_ret > 0) {
-                        JSProxyCtor *pcs = NULL;
-                        if (con_outer) {
-                            pcs = js_mallocz(ctx, sizeof(*pcs));
-                            if (unlikely(!pcs)) { JS_FreeValue(ctx, resolved); JS_ThrowOutOfMemory(ctx); goto exception; }
-                            pcs->outer = con_outer; pcs->outer_kind = con_outer_kind;
-                            con_outer = NULL; con_outer_kind = CONT_NONE;
-                        }
-                        JS_FreeValue(ctx, resolved);
-                        if (tramp_first == -2) {
-                            JSValue *cargv = sp - con_pop;
-                            for (i = -2; i < con_pop; i++) JS_FreeValue(ctx, cargv[i]);
-                            sp -= con_pop + 2;
-                        }
-                        if (con_args_owned) {
-                            free_arg_list(ctx, con_args_owned, con_argc); con_args_owned = NULL; con_args = NULL;
-                        }
-                        JS_FreeValue(ctx, con_super_ref); con_super_ref = JS_UNDEFINED;
-                        DCHECK(sp + 5 <= TRAMP_SP_LIMIT(sf),
-                               "proxy construct trap: operand reshape exceeds the frame's compiled stack_size");
-                        sp[0] = px[0]; sp[1] = px[1]; sp[2] = px[2]; sp[3] = px[3]; sp[4] = px[4];
-                        call_argv = (JSValueConst *)(sp + 2); call_argc = 3; sp += 5;
-                        tramp_first = -2; tramp_is_tail = 0;
-                        tramp_cont_state = pcs; tramp_cont_kind = CONT_PROXY_CONSTRUCT;
-                        /* ANY callable trap, exactly as on the [[Call]] side: asking whether it had a BYTECODE
-                           body and declining otherwise left the PROXY as the target, so js_proxy_call_constructor
-                           drove a C, bound or proxied trap from C. The continuation (10.5.13's must-return-object
-                           check) rides tramp_cont_kind either way, so the reshape can take the body dispatch or
-                           re-enter the convergence point with the trap as the callee. */
-                        TRAMP_BODY_DISPATCH(-2, 0);
-                        tramp_first = -2;
-                        goto do_generic_callee;
-                    }
-                    /* px_ret == 0: con_func is now the ultimate target — a bytecode ctor, a consumer builtin, a
-                       step machine, a plain C one. The arms below answer that, so the resolution keeps no copy
-                       of the question. What it does have to answer is WHO OWNS the resolved target: the arms
-                       BORROW con_func, so the reference has to live where a callee's already does. For a stack
-                       shape that is the callee operand — which is exactly why the old copy wrote it there. For a
-                       shapeless one (super(), a machine's Construct) it is con_super_ref, which IS the owned
-                       reference to con_func at those entries. */
-                    if (!JS_IsUndefined(resolved)) {
-                        if (tramp_first == -2) {
-                            JSValue *slot = sp - con_pop - 2;   /* the callee operand, under new_target and args */
-                            JS_FreeValue(ctx, *slot);
-                            *slot = resolved;
-                            con_func = *slot;
-                        } else {
-                            JS_FreeValue(ctx, con_super_ref);
-                            con_super_ref = resolved;
-                            con_func = resolved;
-                        }
-                    }
-                }
+                /* Proxy [[Construct]] is answered by the step-constructor question below: a Proxy DECLARES
+                   itself a construct machine (10.5.13 reads the `construct` trap off the handler, the page's
+                   [[Get]]). What stood here read that trap with JS_GetProperty from C — so a proxied handler
+                   aborted at js_proxy_get's DFAIL — reshaped five operands onto the stack, walked a trapless
+                   chain in a loop, and carried step 9's must-return-an-object check on its own continuation
+                   kind. The machine's forward arm is a CONSTRUCT request the driver re-dispatches, and step 9
+                   is its completion stage, so all three of those went with it. */
                 if (JS_VALUE_GET_TAG(con_func) == JS_TAG_OBJECT
                     && JS_VALUE_GET_OBJ(con_func)->class_id == JS_CLASS_BOUND_FUNCTION) {
                     /* 10.4.1.2: a bound function's [[Construct]] constructs the ULTIMATE target with the
@@ -26762,77 +26590,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             TRAMP_BODY_DISPATCH(tramp_first, tramp_is_tail);
             {
                 JSValueConst gthis = (tramp_first == -2) ? call_argv[-2] : JS_UNDEFINED;
-                if (JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT
-                    && JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_PROXY) {
-                    /* Proxy [[Call]], asked HERE and nowhere else. do_forward_dispatch had the only copy, and the
-                       .apply / spread route does not pass it — so a trap with a loop in it ran to completion under
-                       `p(...arr)` while `p(x)` parked, and a trapless proxy over a consumer fell to that
-                       consumer's C entry. A trap becomes trap(target, thisArg, argArray) on this chain; a trapless
-                       one resolves to the ultimate callee and the arms below answer it.
-                       The five reshaped operands go in an OWNED list rather than over the caller's slots, because
-                       an apply shape's operands are not where the arguments are — the same reason the construct
-                       side pushes its reshape instead of writing it. */
-                    JSValue px[5], ptgt = JS_UNDEFINED;
-                    int resolved9 = 0;   /* did the walk actually REPLACE the callee? */
-                    int px_ret = js_tramp_proxy_apply(ctx, call_argv[-1], gthis, call_argc, vc(call_argv), px, &ptgt);
-                    while (px_ret == 2) {   /* no trap: same shape, resolved callee (may be another proxy) */
-                        resolved9 = 1;
-                        if (call_args_owned) {
-                            JS_FreeValue(ctx, call_args_owned[1]);
-                            call_args_owned[1] = ptgt;
-                        } else {
-                            JS_FreeValue(ctx, (JSValue)call_argv[-1]);
-                            ((JSValue *)call_argv)[-1] = ptgt;
-                        }
-                        ptgt = JS_UNDEFINED;
-                        px_ret = js_tramp_proxy_apply(ctx, call_argv[-1], gthis, call_argc, vc(call_argv),
-                                                      px, &ptgt);
-                    }
-                    if (unlikely(px_ret < 0)) goto exception;
-                    if (px_ret == 1) {
-                        /* The five reshaped operands REPLACE the caller's, on the stack — the trap call is an
-                           ordinary method call and the frame machinery reads its shape from tramp_first, so a
-                           heap list would have to carry a second `first` alongside its count. The construct side
-                           pushes for the same reason. px[] already holds its own references, so dropping the
-                           originals (including the proxy) first is safe. */
-                        int pop9, first9;
-                        JSValue *cargv9;
-                        TAKE_CALL_SHAPE(); pop9 = call_pop; first9 = call_first_r;
-                        cargv9 = sp - pop9;
-                        if (call_args_owned) {
-                            free_arg_list(ctx, call_args_owned, call_args_owned_n);
-                            call_args_owned = NULL; call_args_owned_n = 0;
-                        }
-                        for (i = first9; i < pop9; i++) JS_FreeValue(ctx, cargv9[i]);
-                        sp += first9 - pop9;
-                        DCHECK(sp + 5 <= TRAMP_SP_LIMIT(sf),
-                               "proxy apply trap: operand reshape exceeds the frame's compiled stack_size");
-                        sp[0] = px[0];   /* this = handler */
-                        sp[1] = px[1];   /* the trap */
-                        sp[2] = px[2]; sp[3] = px[3]; sp[4] = px[4];   /* target, thisArg, argArray */
-                        call_argv = (JSValueConst *)(sp + 2); call_argc = 3; sp += 5;
-                        /* ANY callable trap is dispatched here, once. Asking whether it had a BYTECODE body and
-                           declining otherwise left the PROXY as the callee, so the arms below reached
-                           js_proxy_call and drove a C, bound, proxied or step-machine trap from C — the
-                           recognizer shape, and `new Proxy(f, {apply: Reflect.apply})` reached the backstop
-                           DFAIL. Which KIND of callee the trap is, is the question the rest of THIS label
-                           already answers, so the reshape RE-ENTERS it: the operands now name the trap and its
-                           own `this` (the handler), which is why this is a jump to the top rather than a fall
-                           through — gthis is computed there, and every arm above this one (the bound unwrap
-                           among them) has to see the trap too. */
-                        TRAMP_BODY_DISPATCH(-2, tramp_is_tail);   /* a bytecode trap runs here and can park */
-                        tramp_first = -2;
-                        goto do_generic_callee;                   /* every other kind is answered at the top */
-                    }
-                    /* px_ret == 0 with a REPLACED callee: none of the questions above this label have been
-                       asked of it — not the body entry, not the consumer recognizers — so re-enter the chain
-                       from the top, exactly as the construct side re-enters after rewriting a trapless proxy.
-                       px_ret == 0 with the callee UNCHANGED means it was never a proxy at all. */
-                    if (resolved9) {
-                        TRAMP_BODY_DISPATCH(tramp_first, tramp_is_tail);
-                        goto do_consumer_dispatch;
-                    }
-                }
+                /* Proxy [[Call]] is answered by the step question immediately below: a Proxy DECLARES
+                   itself a machine (10.5.12 reads the `apply` trap off the handler, which is the page's
+                   [[Get]]), so it routes through the one step entry like every other machine. What stood
+                   here reshaped the operands from C after reading that trap with JS_GetProperty — which is
+                   why a proxied handler aborted at js_proxy_get's DFAIL — and walked a trapless chain in a
+                   loop; the machine's trapless arm is a CALL request against the target, so the driver
+                   re-dispatches each hop and the walk has nothing left to do. */
                 if (tramp_step_def_of(call_argv[-1]))
                     goto do_step_tramp;
                 {   /* a lazy Iterator HELPER's own .next(): its drive runs the source on this chain, and calling
@@ -27152,38 +26916,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         JS_FreeValue(ctx, ret_val);
                         BREAK;
                     }
-                    if (dck == CONT_PROXY_CONSTRUCT) {
-                        /* 10.5.13 step 9: the `construct` trap MUST return an Object. The check is the same one
-                           the frame-return path runs; it only needed an arm here once a C, bound or proxied trap
-                           could be the callee — before that the trap was always a bytecode body, which is exactly
-                           the narrowing this diff removed. */
-                        JSValue *cargv;
-                        int pop, first;
-                        TAKE_CALL_SHAPE(); pop = call_pop; first = call_first_r;
-                        cargv = sp - pop;
-                        for (i = first; i < pop; i++) JS_FreeValue(ctx, cargv[i]);
-                        sp += first - pop;
-                        JSProxyCtor *pcs = dcs;
-                        if (unlikely(JS_IsException(ret_val))
-                            || unlikely(JS_VALUE_GET_TAG(ret_val) != JS_TAG_OBJECT)) {
-                            if (!JS_IsException(ret_val)) {
-                                JS_FreeValue(ctx, ret_val);
-                                JS_ThrowTypeErrorNotAnObject(ctx);
-                            }
-                            if (pcs) { tramp_step_chain_free(ctx, pcs->outer); js_free_rt(rt, pcs); }
-                            goto exception;
-                        }
-                        if (pcs) {
-                            void *pouter = pcs->outer;
-                            DCHECK(pcs->outer_kind == CONT_STEP,
-                                   "proxy-construct outer continuation: unknown machine kind");
-                            js_free_rt(rt, pcs);
-                            cont_st = pouter;
-                            goto do_step_step;
-                        }
-                        *sp++ = ret_val;
-                        BREAK;
-                    }
+                    /* DELETED: the CONT_PROXY_CONSTRUCT arm. 10.5.13 step 9 is the Proxy [[Construct]]
+                       MACHINE's completion stage now, so no continuation carries it and nothing has to
+                       hand a requesting machine its object across a reshape. */
                     if (dck == CONT_PROMISE_TRY) {
                         /* Promise.try's fn with no bytecode body — a C one (`Promise.try(Math.max)`), a bound one,
                            a proxied one, a step machine, and the ABSENT one that `Promise.try()` leaves behind
@@ -33811,28 +33546,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     /* 13.10.2 step 3.b: ToBoolean the @@hasInstance result, then the normal placement below drops
                        the three reshaped operands and pushes the boolean where `instanceof` expects it. */
                     ret_val = js_bool(JS_ToBoolFree(ctx, ret_val));
-                } else if (dlv_ck == CONT_PROXY_CONSTRUCT) {
-                    /* 9.5.14 step 13: the `construct` trap's result must be an object. Then the normal placement
-                       below drops the five reshaped operands and pushes it where `new` expects its result —
-                       unless a MACHINE asked for this construct, in which case the object is delivered to it and
-                       there is no `new` waiting for a push. */
-                    JSProxyCtor *pcs = dlv_cs;
-                    if (unlikely(JS_VALUE_GET_TAG(ret_val) != JS_TAG_OBJECT)) {
-                        JS_FreeValue(ctx, ret_val);
-                        JS_ThrowTypeErrorNotAnObject(ctx);
-                        if (pcs) { tramp_step_chain_free(ctx, pcs->outer); js_free_rt(rt, pcs); }
-                        goto exception;
-                    }
-                    if (pcs) {
-                        void *pouter = pcs->outer; uint8_t pkind = pcs->outer_kind;
-                        JSValue *cargv2 = sp - dlv_cargc;
-                        DCHECK(pkind == CONT_STEP, "proxy-construct outer continuation: unknown machine kind");
-                        js_free_rt(rt, pcs);
-                        for (i = dlv_cfirst; i < dlv_cargc; i++) JS_FreeValue(ctx, cargv2[i]);
-                        sp += dlv_cfirst - dlv_cargc;
-                        cont_st = pouter;
-                        goto do_step_step;
-                    }
                 } else if (dlv_ck == CONT_SETTER) {
                     /* setter returned: free the operands (this,setter,value) on the caller stack exactly like a
                        method call, but DISCARD the return value — a property write pushes nothing. */
@@ -38510,11 +38223,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
             }
             js_free_rt(rt, cs);
-        } else if (xck == CONT_PROXY_CONSTRUCT) {
-            /* the trap body THREW. Its operands are on the caller stack and the caller's own catch-search frees
-               them, as for any method call; what is ours is the requester, which can never be re-entered. */
-            JSProxyCtor *pcs = xcs;
-            if (pcs) { tramp_step_chain_free(ctx, pcs->outer); js_free_rt(rt, pcs); }
         } else if (xck == CONT_SETTER || xck == CONT_INSTANCEOF
                    || xck == CONT_ITER_NEXT_OP || xck == CONT_ITER_CALL
                    || xck == CONT_FOROF_ACQUIRE
@@ -70330,6 +70038,8 @@ static const JSTrampStepDef js_weakmap_upsert_def      = MAP_UPSERT_DEF(JS_CLASS
 static const JSTrampStepDef js_weakmap_upsert_comp_def = MAP_UPSERT_DEF(JS_CLASS_WEAKMAP << 1 | 1);
 /* likewise: the resolving-function machine is defined with the Promise code it settles. */
 static const JSTrampStepDef js_promise_resolvefn_def;
+static const JSTrampStepDef js_proxy_call_def;
+static const JSTrampStepDef js_proxy_construct_def;
 
 /* DisposeResources' state. It lives here rather than beside its step functions because the table below names
    the definition, and the definition names this size — the resource list is reached through a forward tag so the
@@ -70789,6 +70499,12 @@ static const JSTrampStepDef *tramp_step_def_of(JSValueConst func)
         JSCFunctionDataRecord *s = fp->u.c_function_data_record;
         return s ? s->step_def : NULL;
     }
+    if (fp->class_id == JS_CLASS_PROXY) {
+        /* a Proxy IS a step machine: 10.5.12's trap read is the page's [[Get]] on the handler. The same answer
+           the resolving functions below give, for the same reason — the algorithm has user-code steps, so it
+           belongs on the tramp rather than in a class hook that reads with JS_GetProperty from C. */
+        return &js_proxy_call_def;
+    }
     if (fp->class_id == JS_CLASS_PROMISE_RESOLVE_FUNCTION
         || fp->class_id == JS_CLASS_PROMISE_REJECT_FUNCTION) {
         /* a resolving function IS a step machine — there is exactly one algorithm (27.2.1.3.2), and which of the
@@ -70812,6 +70528,13 @@ static const JSTrampStepDef *tramp_step_ctor_def_of(JSValueConst func)
     JSObject *fp;
     if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return NULL;
     fp = JS_VALUE_GET_OBJ(func);
+    if (fp->class_id == JS_CLASS_PROXY) {
+        /* a Proxy is a CONSTRUCT machine too, for the reason it is a call machine: 10.5.13 step 3 reads the
+           `construct` trap off the handler, which is the page's [[Get]]. Answered here rather than by delegating
+           to tramp_step_def_of, because that one answers the [[Call]] algorithm — the two are different machines
+           over the same object, which is exactly what these two predicates are for. */
+        return &js_proxy_construct_def;
+    }
     if (fp->class_id != JS_CLASS_C_FUNCTION || fp->u.cfunc.cproto != JS_CFUNC_step_ctor) return NULL;
     return tramp_step_def_of(func);
 }
@@ -71122,15 +70845,21 @@ static JSValue js_array_join_fini(JSContext *ctx, void *st, bool take_result)
 }
 
 /* Append to / pop from an ENGINE-PRIVATE array — JSON.stringify's cycle stack, the property-walk accumulators.
-   The receiver is one this engine made and the page has never seen, so there is no accessor, no trap and no
-   prototype lookup to reach: this is the same computation the builtins' fast-array span performs, with none of
-   the observable steps that made them machines. It is NOT a fallback for those — nothing routes here. */
+   The receiver is one this engine made and the page has never seen, so no TRAP and no own accessor can be on it.
+   Its PROTOTYPE is not private, though, and that is the correction this comment used to get wrong: it claimed
+   there was "no prototype lookup to reach", and an ordinary [[Set]] walks exactly that chain. A page that runs
+   `Object.defineProperty(Array.prototype, 0, {set(){…}})` then had its setter invoked by JSON.stringify's cycle
+   stack — from JS_SetPropertyInt64, in C, below a live flow, which is the drive-to-completion DFAIL and would
+   have been a spec violation even if it could suspend. Appending to an INTERNAL LIST is not a [[Set]]: it is
+   CreateDataPropertyOrThrow, which defines an own property and consults nothing.
+   `length` needs no such care in either direction — it is an own non-configurable data property of every array,
+   so the read and the truncate below find it on the receiver. */
 static int js_array_private_push(JSContext *ctx, JSValueConst arr, JSValueConst v)
 {
     int64_t len;
     if (js_get_length64(ctx, &len, arr))
         return -1;
-    return JS_SetPropertyInt64(ctx, arr, len, js_dup(v)) < 0 ? -1 : 0;
+    return JS_DefinePropertyValueInt64(ctx, arr, len, js_dup(v), JS_PROP_C_W_E) < 0 ? -1 : 0;
 }
 
 static int js_array_private_pop(JSContext *ctx, JSValueConst arr)
@@ -81635,6 +81364,223 @@ static JSValue JS_ThrowTypeErrorRevokedProxy(JSContext *ctx)
 {
     return JS_ThrowTypeError(ctx, "revoked proxy");
 }
+
+/* PROXY [[Call]] — 10.5.12, as ONE machine, for the reason a Promise resolving function is one: step 3 is
+   `GetMethod(handler, "apply")`, which is the PAGE'S CODE. It is an ordinary [[Get]], so the handler may be an
+   accessor-bearing object or ANOTHER PROXY with a `get` trap, and the operator site read it with JS_GetProperty
+   from C — an activation with no flow base. `new Proxy(f, new Proxy({}, {get(){…}}))()` aborted at
+   js_proxy_get's DFAIL, and a handler with a plain `get apply(){ for(;;){} }` accessor ran that loop off the
+   tramp without even that much notice.
+   As a machine the trap read is a request like any other, so every handler shape suspends. Two more things
+   follow from it rather than being arranged: the TRAPLESS forward (step 4) is a CALL request against the
+   target, which the driver re-dispatches — so a proxy wrapping a proxy wrapping a function re-enters this
+   machine per hop and needs no walk of its own; and the trap CALL (step 6) is an ordinary dispatch, so a trap
+   that is a bound function, a C function, a step machine or another proxy is answered by the one convergence
+   point instead of by a recognizer asking whether it had a bytecode body. */
+typedef struct JSProxyCall {
+    JSStepHdr hdr;      /* MUST be first; hdr.func_obj IS the proxy, hdr.this_val the thisArgument */
+    JSValue result;     /* owned: the call's result */
+    JSValue *cb;        /* [this, fn, args…] — its own block: the trapless shape is argc-sized, the trap's is 3 */
+    int ncb;
+} JSProxyCall;
+
+static JSValue js_create_array(JSContext *ctx, int len, JSValueConst *tab);
+
+static int js_proxy_call_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSProxyCall *s = st;
+    JSProxyData *pd = JS_GetOpaque(s->hdr.func_obj, JS_CLASS_PROXY);
+    int i, n;
+
+    DCHECK(pd != NULL, "the Proxy [[Call]] machine was entered on a callee that is not a Proxy");
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result);
+        cb_result = JS_UNDEFINED;
+        s->result = JS_UNDEFINED;
+        if (pd->is_revoked) { JS_ThrowTypeErrorRevokedProxy(ctx); return -1; }
+        /* A proxy whose target is not callable HAS no [[Call]] — the TypeError is the caller's and precedes
+           every step, which is why it is asked before the handler read rather than after it. */
+        if (!pd->is_func) { JS_ThrowTypeErrorNotAFunction(ctx); return -1; }
+        s->hdr.stage = 1;
+    }
+    if (s->hdr.stage == 1) {
+        JSValue trap;
+        int r = step_getprop_run(ctx, &s->hdr, pd->handler, JS_ATOM_apply, cb_result, &trap, out_cb, out_argc);
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = 2;
+        if (JS_IsUndefined(trap) || JS_IsNull(trap)) {
+            /* step 4: Call(target, thisArgument, argumentsList). */
+            JS_FreeValue(ctx, trap);
+            n = s->hdr.argc;
+            s->cb = js_malloc(ctx, sizeof(JSValue) * (size_t)(n + 2));
+            if (unlikely(!s->cb)) return -1;
+            s->ncb = n + 2;
+            s->cb[0] = js_dup(s->hdr.this_val);
+            s->cb[1] = js_dup(pd->target);
+            for (i = 0; i < n; i++) s->cb[i + 2] = js_dup(s->hdr.argv[i]);
+            *out_cb = s->cb; *out_argc = n;
+            return 3;   /* CALL */
+        }
+        /* 7.3.11 GetMethod step 4: a present trap that is not callable is a TypeError HERE, before step 5's
+           CreateArrayFromList. */
+        if (!JS_IsFunction(ctx, trap)) {
+            JS_FreeValue(ctx, trap);
+            JS_ThrowTypeErrorNotAFunction(ctx);
+            return -1;
+        }
+        {
+            JSValue arr = js_create_array(ctx, s->hdr.argc, (JSValueConst *)s->hdr.argv);
+            if (JS_IsException(arr)) { JS_FreeValue(ctx, trap); return -1; }
+            s->cb = js_malloc(ctx, sizeof(JSValue) * 5);
+            if (unlikely(!s->cb)) { JS_FreeValue(ctx, trap); JS_FreeValue(ctx, arr); return -1; }
+            s->ncb = 5;
+            s->cb[0] = js_dup(pd->handler);   /* the trap's `this` */
+            s->cb[1] = trap;                  /* owned */
+            s->cb[2] = js_dup(pd->target);
+            s->cb[3] = js_dup(s->hdr.this_val);
+            s->cb[4] = arr;
+            *out_cb = s->cb; *out_argc = 3;
+            return 3;   /* CALL: trap(target, thisArg, argArray) */
+        }
+    }
+    /* [[Call]] has NO result invariant — unlike [[Get]] and [[Construct]], 10.5.12 returns the trap's value
+       unexamined — so this stage is the completion and nothing else. */
+    s->result = cb_result;
+    return 0;
+}
+
+/* PROXY [[Construct]] — 10.5.13, the [[Call]] machine's twin and for the identical reason: step 3 is
+   `GetMethod(handler, "construct")`, the page's [[Get]]. `new (new Proxy(f, new Proxy({}, {get(){…}})))()`
+   aborted at js_proxy_get's DFAIL from js_tramp_proxy_construct's C read.
+   Step 9's must-return-an-Object check is the one thing this owes that [[Call]] does not, and as a machine it is
+   simply the completion stage — which is what deletes CONT_PROXY_CONSTRUCT and the JSProxyCtor that carried an
+   outer sequence across it. The trapless arm (step 5) is a CONSTRUCT request against the target, so a proxy
+   wrapping a proxy re-enters this machine per hop; step 9 does not apply to it, because Construct already
+   guarantees an object, which is why the two arms complete at different stages. */
+typedef struct JSProxyConstruct {
+    JSStepHdr hdr;      /* MUST be first; hdr.func_obj IS the proxy, hdr.this_val the NEW TARGET */
+    JSValue result;     /* owned */
+    JSValue *cb;        /* [target, args…] for the trapless CONSTRUCT, or [handler, trap, target, arr, ntgt] */
+    int ncb;
+} JSProxyConstruct;
+
+/* the two completions, which differ only in whether step 9's check applies */
+enum { PXC_ST_TRAP = 2, PXC_ST_FORWARD = 3 };
+
+static JSValue JS_ThrowTypeErrorNotAnObject(JSContext *ctx);
+
+static int js_proxy_construct_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSProxyConstruct *s = st;
+    JSProxyData *pd = JS_GetOpaque(s->hdr.func_obj, JS_CLASS_PROXY);
+    int i, n;
+
+    DCHECK(pd != NULL, "the Proxy [[Construct]] machine was entered on a target that is not a Proxy");
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result);
+        cb_result = JS_UNDEFINED;
+        s->result = JS_UNDEFINED;
+        if (pd->is_revoked) { JS_ThrowTypeErrorRevokedProxy(ctx); return -1; }
+        /* a proxy whose target is not a constructor HAS no [[Construct]]: the TypeError precedes every step */
+        if (!JS_IsConstructor(ctx, pd->target)) { JS_ThrowTypeErrorNotAConstructor(ctx, pd->target); return -1; }
+        s->hdr.stage = 1;
+    }
+    if (s->hdr.stage == 1) {
+        JSValue trap;
+        int r = step_getprop_run(ctx, &s->hdr, pd->handler, JS_ATOM_construct, cb_result, &trap, out_cb, out_argc);
+        if (r) return r < 0 ? -1 : r;
+        n = s->hdr.argc;
+        if (JS_IsUndefined(trap) || JS_IsNull(trap)) {
+            /* step 5: Construct(target, argumentsList, newTarget). */
+            JS_FreeValue(ctx, trap);
+            s->cb = js_malloc(ctx, sizeof(JSValue) * (size_t)(n + 1));
+            if (unlikely(!s->cb)) return -1;
+            s->ncb = n + 1;
+            s->cb[0] = js_dup(pd->target);
+            for (i = 0; i < n; i++) s->cb[i + 1] = js_dup(s->hdr.argv[i]);
+            s->hdr.ctor_ntgt = js_dup(s->hdr.this_val);
+            s->hdr.stage = PXC_ST_FORWARD;
+            *out_cb = s->cb; *out_argc = n;
+            return 4;   /* CONSTRUCT */
+        }
+        if (!JS_IsFunction(ctx, trap)) {   /* 7.3.11 GetMethod step 4 */
+            JS_FreeValue(ctx, trap);
+            JS_ThrowTypeErrorNotAFunction(ctx);
+            return -1;
+        }
+        {
+            JSValue arr = js_create_array(ctx, n, (JSValueConst *)s->hdr.argv);
+            if (JS_IsException(arr)) { JS_FreeValue(ctx, trap); return -1; }
+            s->cb = js_malloc(ctx, sizeof(JSValue) * 5);
+            if (unlikely(!s->cb)) { JS_FreeValue(ctx, trap); JS_FreeValue(ctx, arr); return -1; }
+            s->ncb = 5;
+            s->cb[0] = js_dup(pd->handler);   /* the trap's `this` */
+            s->cb[1] = trap;                  /* owned */
+            s->cb[2] = js_dup(pd->target);
+            s->cb[3] = arr;
+            s->cb[4] = js_dup(s->hdr.this_val);   /* newTarget */
+            s->hdr.stage = PXC_ST_TRAP;
+            *out_cb = s->cb; *out_argc = 3;
+            return 3;   /* CALL: trap(target, argArray, newTarget) */
+        }
+    }
+    if (s->hdr.stage == PXC_ST_TRAP && JS_VALUE_GET_TAG(cb_result) != JS_TAG_OBJECT) {
+        /* step 9. It applies to the TRAP's value only — the forward arm's Construct answers with an object by
+           construction, and running the check there would be asserting something the callee already owes. */
+        JS_FreeValue(ctx, cb_result);
+        JS_ThrowTypeErrorNotAnObject(ctx);
+        return -1;
+    }
+    DCHECK(s->hdr.stage == PXC_ST_TRAP || s->hdr.stage == PXC_ST_FORWARD, "Proxy [[Construct]]: unknown stage");
+    s->result = cb_result;
+    return 0;
+}
+
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The same shape as the [[Call]] machine's. */
+static void js_proxy_construct_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSProxyConstruct *s = st;
+    v->val(ctx, &s->result);
+    v->array(ctx, (void **)&s->cb, sizeof(JSValue), s->ncb, s->ncb, js_step_visit_value_elem);
+}
+
+static JSValue js_proxy_construct_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSProxyConstruct *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
+    js_free(ctx, s);
+    return r;
+}
+
+static const JSTrampStepDef js_proxy_construct_def = {
+    sizeof(JSProxyConstruct), js_proxy_construct_step, js_proxy_construct_fini, 0,
+    .visit = js_proxy_construct_visit
+};
+
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). Its result and its own request block, whose LENGTH depends on
+   which of the two shapes step 1 chose — which is why the count rides the state. */
+static void js_proxy_call_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSProxyCall *s = st;
+    v->val(ctx, &s->result);
+    v->array(ctx, (void **)&s->cb, sizeof(JSValue), s->ncb, s->ncb, js_step_visit_value_elem);
+}
+
+static JSValue js_proxy_call_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSProxyCall *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
+    js_free(ctx, s);
+    return r;
+}
+
+static const JSTrampStepDef js_proxy_call_def = {
+    sizeof(JSProxyCall), js_proxy_call_step, js_proxy_call_fini, 0, .visit = js_proxy_call_visit
+};
 
 static JSProxyData *get_proxy_method(JSContext *ctx, JSValue *pmethod,
                                      JSValueConst obj, JSAtom name)
