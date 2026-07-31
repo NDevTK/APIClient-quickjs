@@ -43821,7 +43821,10 @@ static int __exception js_parse_property_name(JSParseState *s,
     } else if (s->token.val == '[') {
         if (next_token(s))
             goto fail;
-        if (js_parse_expr(s))
+        /* An ASSIGNMENT expression, not an Expression: the production is `[ AssignmentExpression ]`, so a comma
+           expression is not one of these — `({[1, 2]: 3})` and `({set [1, 2](a) {}})` are Syntax Errors. Member
+           access `a[x, y]` is `[ Expression ]` and keeps the comma; the two spellings are different grammars. */
+        if (js_parse_assign_expr(s))
             goto fail;
         if (js_parse_expect(s, ']'))
             goto fail;
@@ -56952,6 +56955,15 @@ static __exception int js_parse_function_decl2(JSParseState *s,
             int idx, has_initializer;
 
             if (s->token.val == TOK_ELLIPSIS) {
+                /* An accessor's parameter list is not a FormalParameters: 15.5.1 gives a getter `( )` and a
+                   setter `( PropertySetParameterList )`, and PropertySetParameterList is a single
+                   FormalParameter — a BindingRestElement is not in either grammar. The arity check below caught
+                   `set x(a, b)` and `set x()` but counted a rest as the one parameter it demands, so
+                   `({ set x(...a) {} })` parsed. */
+                if (func_type == JS_PARSE_FUNC_GETTER || func_type == JS_PARSE_FUNC_SETTER) {
+                    js_parse_error(s, "rest parameter is not allowed in a getter or setter");
+                    goto fail;
+                }
                 fd->has_simple_parameter_list = false;
                 rest = true;
                 if (next_token(s))
@@ -57119,7 +57131,13 @@ static __exception int js_parse_function_decl2(JSParseState *s,
     push_scope(s);  /* enter body scope */
     fd->body_scope = fd->scope_level;
 
-    if (s->token.val == TOK_ARROW) {
+    /* Only an ARROW has a `=>` between its parameters and its body. Asking the TOKEN instead of the FUNCTION
+       KIND let every other kind borrow the arrow body: `({ a() => 0 })`, `({ *a() => 0 })`, `({ get a() => 0 })`
+       and `class C { a() => 0 }` all parsed, where a MethodDefinition's body is `{ FunctionBody }` and nothing
+       else. With the kind asked, the `{` expectation below is what rejects them. */
+    if (func_type == JS_PARSE_FUNC_ARROW) {
+        DCHECK(s->token.val == TOK_ARROW,
+               "an arrow function reached its body with no `=>` — the caller only enters here having seen one");
         if (next_token(s))
             goto fail;
 
