@@ -17809,6 +17809,10 @@ struct JSStepVisit {
        taken INTO it valid in both arms — a copy would leave the sibling's interior pointers naming the
        original's tree. The clone takes a reference, the teardown drops one and destroys at zero. */
     void (*shared)(JSContext *ctx, void **slot, int *refs, void (*destroy)(JSContext *ctx, void *p));
+    /* A COLLECTION RECORD a machine LOCKS across a callback. Map.forEach holds the record it is standing on so
+       the page's callback cannot delete the cursor out from under it, and a clone standing on the same record
+       needs its own lock or the first arm to finish frees what the second is still reading. */
+    void (*maprec)(JSContext *ctx, struct JSMapRecord **slot);
 };
 /* HOISTED to here, for the reason JSStepHdr is: the visitor above names it and the machine that owns one is
    thousands of lines below. A sorted element carries the value AND the string a default comparison coerced it
@@ -19187,14 +19191,20 @@ static void js_step_visit_free_shared(JSContext *ctx, void **slot, int *refs, vo
     if (--(*refs) == 0) destroy(ctx, *slot);
     *slot = NULL;
 }
+struct JSMapRecord;
+static void map_decref_record(JSRuntime *rt, struct JSMapRecord *mr);
+static void js_step_visit_dup_maprec(JSContext *ctx, struct JSMapRecord **slot);
+static void js_step_visit_free_maprec(JSContext *ctx, struct JSMapRecord **slot);
 static const JSStepVisit js_step_visit_dup  = { js_step_visit_dup_val,  js_step_visit_dup_strbuf,  js_step_visit_dup_props,
                                                 js_step_visit_dup_slots,  js_step_visit_dup_buf,
                                                 js_step_visit_dup_atom,  js_step_visit_dup_machine,
-                                                js_step_visit_dup_array,  js_step_visit_dup_shared };
+                                                js_step_visit_dup_array,  js_step_visit_dup_shared,
+                                                js_step_visit_dup_maprec };
 static const JSStepVisit js_step_visit_free = { js_step_visit_free_val, js_step_visit_free_strbuf, js_step_visit_free_props,
                                                 js_step_visit_free_slots, js_step_visit_free_buf,
                                                 js_step_visit_free_atom, js_step_visit_free_machine,
-                                                js_step_visit_free_array, js_step_visit_free_shared };
+                                                js_step_visit_free_array, js_step_visit_free_shared,
+                                                js_step_visit_free_maprec };
 /* A machine's teardown releases what it owns through the SAME declaration the clone reads, so the two cannot
    disagree about which fields those are. */
 static void tramp_step_visit_free(JSContext *ctx, void *st) {
@@ -83072,23 +83082,44 @@ static int js_map_foreach_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
     return 0;
 }
 
-static JSValue js_map_foreach_fini(JSContext *ctx, void *st, bool take_result)
+/* The two halves of the record LOCK, defined here where the record type is complete. */
+static void js_step_visit_dup_maprec(JSContext *ctx, struct JSMapRecord **slot)
+{
+    (void)ctx;
+    if (*slot) ((JSMapRecord *)*slot)->ref_count++;
+}
+static void js_step_visit_free_maprec(JSContext *ctx, struct JSMapRecord **slot)
+{
+    if (*slot) { map_decref_record(ctx->rt, (JSMapRecord *)*slot); *slot = NULL; }
+}
+
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). Map.forEach and Set.forEach drive the page's callback once
+   per record, so a concolic branch inside one forks the walk — and each arm then stands on the SAME record
+   with its own lock, which is what stops the first to finish freeing what the second is still reading. `el` is
+   the cursor into the collection's record list, kept alive by exactly that lock; `s` is borrowed, the receiver
+   on the header holds the collection. */
+static void js_map_foreach_visit(JSContext *ctx, void *st, JSStepVisit *v)
 {
     JSMapForEach *m = st;
     int i;
-    if (m->lock)
-        map_decref_record(ctx->rt, (JSMapRecord *)m->lock);
-    for (i = 0; i < 5; i++)
-        JS_FreeValue(ctx, m->cb[i]);
+    v->maprec(ctx, (struct JSMapRecord **)&m->lock);
+    for (i = 0; i < 5; i++) v->val(ctx, &m->cb[i]);
+}
+
+static JSValue js_map_foreach_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSMapForEach *m = st;
+    (void)take_result;
+    tramp_step_visit_free(ctx, m);
     js_free(ctx, m);
     return JS_UNDEFINED;   /* forEach returns undefined on every path */
 }
 
 static const JSTrampStepDef js_map_foreach_def = {
-    sizeof(JSMapForEach), js_map_foreach_step, js_map_foreach_fini, 0
+    sizeof(JSMapForEach), js_map_foreach_step, js_map_foreach_fini, 0, .visit = js_map_foreach_visit
 };
 static const JSTrampStepDef js_set_foreach_def = {
-    sizeof(JSMapForEach), js_map_foreach_step, js_map_foreach_fini, MAGIC_SET
+    sizeof(JSMapForEach), js_map_foreach_step, js_map_foreach_fini, MAGIC_SET, .visit = js_map_foreach_visit
 };
 
 
