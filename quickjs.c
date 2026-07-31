@@ -10421,6 +10421,18 @@ int JS_IsExtensible(JSContext *ctx, JSValueConst obj)
 }
 
 /* return -1 if exception (Proxy object only) or true/false */
+/* 10.4.5.9 IsTypedArrayFixedLength(O). Step 1: an AUTO length (a length-tracking view) is not fixed. Step 3: a
+   view over a RESIZABLE, non-shared buffer is not fixed either, however its own length was written — the buffer
+   can shrink under it. A growable SharedArrayBuffer is excluded by step 3's second test, so only step 1 can
+   answer for one. */
+static bool typed_array_is_fixed_length(JSObject *p)
+{
+    JSTypedArray *ta = p->u.typed_array;
+    JSArrayBuffer *abuf = ta->buffer->u.array_buffer;
+    if (ta->track_rab) return false;
+    return !(array_buffer_is_resizable(abuf) && !abuf->shared);
+}
+
 int JS_PreventExtensions(JSContext *ctx, JSValueConst obj)
 {
     JSObject *p;
@@ -10430,6 +10442,12 @@ int JS_PreventExtensions(JSContext *ctx, JSValueConst obj)
     p = JS_VALUE_GET_OBJ(obj);
     if (unlikely(p->class_id == JS_CLASS_PROXY))
         return js_proxy_preventExtensions(ctx, obj);
+    /* 10.4.5.4 step 2: a TypedArray whose length is not fixed REFUSES. The extensibility methods behave as if
+       the array had a fixed set of index properties, and it does not — so the refusal is the whole of the
+       exotic behaviour, and every caller inherits it: Object.preventExtensions and Object.seal turn the false
+       into 7.3.15's TypeError, Reflect.preventExtensions reports it. */
+    if (unlikely(is_typed_array(p->class_id)) && !typed_array_is_fixed_length(p))
+        return false;
     p->extensible = false;
     return true;
 }
@@ -61773,14 +61791,13 @@ static int js_integrity_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
                 JS_ThrowTypeError(ctx, "cannot %s module namespace", is_freeze ? "freeze" : "seal");
                 return -1;
             }
-            if (is_freeze && is_typed_array(p->class_id)) {
-                JSTypedArray *ta = p->u.typed_array;
-                JSArrayBuffer *abuf = ta->buffer->u.array_buffer;
-                if (array_buffer_is_resizable(abuf) || typed_array_is_oob(p)) {
-                    JS_ThrowTypeError(ctx, "cannot freeze resizable typed array");
-                    return -1;
-                }
-            }
+            /* DELETED: the freeze-only "cannot freeze resizable typed array" throw. It was this algorithm's
+               own copy of 10.4.5.4 step 2, and it answered for FREEZE alone — so `Object.seal` and
+               `Object.preventExtensions` on a length-tracking typed array silently succeeded, and
+               `Reflect.preventExtensions` reported true. [[PreventExtensions]] refuses at its root now, and
+               step 3 below turns that refusal into this algorithm's TypeError for every one of them.
+               The OOB half went with it for the same reason: an out-of-bounds view is out of bounds because
+               its buffer is resizable, which the root test already covers. */
         }
         s->hdr.stage = IG_OPEN_GOT;
         s->hdr.cb_coerce[0] = s->obj;   /* borrowed: the machine holds the receiver across every request */
@@ -61796,7 +61813,10 @@ static int js_integrity_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
             return 0;
         }
         if (!is_test && !ok) {
-            JS_ThrowTypeError(ctx, "proxy preventExtensions handler returned false");
+            /* 7.3.15 step 3: PreventExtensions reported false. A Proxy trap is one way to get here and a
+               length-tracking TypedArray is another, so the message names the operation rather than one of its
+               causes — it said "proxy" and was then reached by an ordinary typed array. */
+            JS_ThrowTypeError(ctx, "object refused to become non-extensible");
             return -1;
         }
         s->hdr.stage = IG_KEYS_GOT;     /* step 3: O.[[OwnPropertyKeys]]() */
@@ -77807,6 +77827,7 @@ static JSValue js_regexp_escape(JSContext *ctx, JSValueConst this_val,
     JSValue str, ret;
     JSString *p;
     uint32_t c, i;
+    int idx;
     char s[16];
 
     if (!JS_IsString(argv[0]))
@@ -77820,8 +77841,14 @@ static JSValue js_regexp_escape(JSContext *ctx, JSValueConst this_val,
     }
     p = JS_VALUE_GET_STRING(str);
     string_buffer_init2(ctx, b, 0, p->is_wide_char);
-    for (i = 0; i < p->len; i++) {
-        c = p->is_wide_char ? (uint32_t)str16(p)[i] : (uint32_t)str8(p)[i];
+    /* 22.2.2.2 step 3 is `StringToCodePoints(S)`, so the walk is over CODE POINTS. It was over code UNITS, and
+       the difference is exactly a valid surrogate PAIR: as two units each looks like a lone surrogate and got
+       \u-escaped by EncodeForRegExpEscape step 5, so `RegExp.escape("\u{10000}")` answered "\ud800\udc00"
+       where the spec answers the character itself. A LONE surrogate is still a code point in the surrogate
+       range and is still escaped there — that test does not change, it just now asks about a code point. */
+    for (idx = 0; idx < (int)p->len; ) {
+        i = (uint32_t)idx;
+        c = (uint32_t)string_getc(p, &idx);
         if (c < 33) {
             if (c >= 9 && c <= 13) {
                 string_buffer_putc8(b, '\\');
@@ -77846,10 +77873,12 @@ static JSValue js_regexp_escape(JSContext *ctx, JSValueConst this_val,
             snprintf(s, sizeof(s), "\\x%02x", c);
             string_buffer_puts8(b, s);
         } else if (is_surrogate(c) || lre_is_white_space(c) || c == 0xFEFF) {
+            /* step 5.c-d: a code point above the BMP would be TWO \u escapes, but nothing above the BMP
+               reaches here — a supplementary code point is neither a surrogate nor whitespace. */
             snprintf(s, sizeof(s), "\\u%04x", c);
             string_buffer_puts8(b, s);
         } else {
-            string_buffer_putc16(b, c);
+            string_buffer_putc(b, c);   /* step 6: UTF16EncodeCodePoint, which re-pairs a supplementary one */
         }
     }
     ret = string_buffer_end(b);
