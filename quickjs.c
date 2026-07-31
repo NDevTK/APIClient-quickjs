@@ -22193,6 +22193,7 @@ typedef struct JSTASort {
 } JSTASort;
 static int js_ta_sort_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_ta_sort_vfini(JSContext *ctx, void *st, bool take_result);
+static void js_ta_sort_visit(JSContext *ctx, void *st, JSStepVisit *v);
 
 /* String(x) / new String(x), 22.1.1.1. Its ToString(argv[0]) runs a user valueOf/toString/@@toPrimitive, which
    from a C body would be JS_CallFree with nowhere to suspend. As a step machine the coercion is a TOPRIMITIVE
@@ -60361,11 +60362,19 @@ static int js_global_eval_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
     return r ? (r < 0 ? -1 : r) : 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). */
+static void js_global_eval_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSProgEval *s = st;
+    v->val(ctx, &s->result);
+}
+
 static JSValue js_global_eval_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSProgEval *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->result);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -66391,12 +66400,20 @@ static int js_date_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). */
+static void js_date_ctor_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSDateCtor *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->prim);
+}
+
 static JSValue js_date_ctor_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSDateCtor *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->result);
-    JS_FreeValue(ctx, s->prim);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -66600,14 +66617,24 @@ static int js_ab_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
     return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). @@species is the page's, and the bounds are coerced before it is consulted. */
+static void js_ab_slice_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSABSlice *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->ctor);
+    v->val(ctx, &s->prim[0]);
+    v->val(ctx, &s->prim[1]);
+    v->val(ctx, &s->cargs[0]);
+    v->val(ctx, &s->cargs[1]);
+}
+
 static JSValue js_ab_slice_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSABSlice *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    int i;
-    if (!take_result) JS_FreeValue(ctx, s->result);
-    for (i = 0; i < 2; i++) { JS_FreeValue(ctx, s->cargs[i]); JS_FreeValue(ctx, s->prim[i]); }
-    JS_FreeValue(ctx, s->ctor);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -66717,16 +66744,27 @@ static int js_ta_subarray_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). */
+static void js_ta_subarray_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSTASubarray *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->ctor);
+    v->val(ctx, &s->buffer);
+    v->val(ctx, &s->prim[0]);
+    v->val(ctx, &s->prim[1]);
+    v->val(ctx, &s->cargs[0]);
+    v->val(ctx, &s->cargs[1]);
+    v->val(ctx, &s->cargs[2]);
+    v->val(ctx, &s->cargs[3]);
+}
+
 static JSValue js_ta_subarray_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSTASubarray *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    int i;
-    if (!take_result) JS_FreeValue(ctx, s->result);
-    for (i = 0; i < 4; i++) JS_FreeValue(ctx, s->cargs[i]);
-    for (i = 0; i < 2; i++) JS_FreeValue(ctx, s->prim[i]);
-    JS_FreeValue(ctx, s->ctor);
-    JS_FreeValue(ctx, s->buffer);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -66856,12 +66894,20 @@ static int js_ta_with_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
     return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). */
+static void js_ta_with_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSTAWith *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->val);
+}
+
 static JSValue js_ta_with_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSTAWith *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->result);
-    JS_FreeValue(ctx, s->val);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -67970,19 +68016,25 @@ static int js_ta_subarray_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
 static int js_ab_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_ab_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_ab_ctor_fini(JSContext *ctx, void *st, bool take_result);
+static void js_ab_ctor_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static int js_dataview_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_dataview_ctor_fini(JSContext *ctx, void *st, bool take_result);
+static void js_dataview_ctor_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static JSValue js_ab_slice_fini(JSContext *ctx, void *st, bool take_result);
+static void js_ab_slice_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static JSValue js_ta_subarray_fini(JSContext *ctx, void *st, bool take_result);
+static void js_ta_subarray_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static JSValue js_ta_coerce_fini(JSContext *ctx, void *st, bool take_result);
 static void js_ta_coerce_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static int js_date_tojson_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_date_toprim_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_date_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_date_ctor_fini(JSContext *ctx, void *st, bool take_result);
+static void js_date_ctor_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static JSValue js_date_toprim_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_date_tojson_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_ta_with_fini(JSContext *ctx, void *st, bool take_result);
+static void js_ta_with_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static int js_array_copywithin_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_copywithin_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_array_fill_fini(JSContext *ctx, void *st, bool take_result);
@@ -68153,8 +68205,8 @@ static const JSTrampStepDef js_ta_every_def        = { sizeof(JSArrayEvery), js_
 static const JSTrampStepDef js_ta_some_def         = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_some | special_TA, .visit = js_array_every_visit };
 static const JSTrampStepDef js_ta_forEach_def      = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_forEach | special_TA, .visit = js_array_every_visit };
 static const JSTrampStepDef js_ta_map_def          = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_map | special_TA, .visit = js_array_every_visit };
-static const JSTrampStepDef js_ta_sort_def       = { sizeof(JSTASort), js_ta_sort_vstep, js_ta_sort_vfini, 0 };
-static const JSTrampStepDef js_ta_toSorted_def   = { sizeof(JSTASort), js_ta_sort_vstep, js_ta_sort_vfini, 1 };
+static const JSTrampStepDef js_ta_sort_def       = { sizeof(JSTASort), js_ta_sort_vstep, js_ta_sort_vfini, 0, .visit = js_ta_sort_visit };
+static const JSTrampStepDef js_ta_toSorted_def   = { sizeof(JSTASort), js_ta_sort_vstep, js_ta_sort_vfini, 1, .visit = js_ta_sort_visit };
 static const JSTrampStepDef js_array_sort_def    = { sizeof(JSArraySort), js_array_sort_vstep, js_array_sort_vfini, 0, .visit = js_array_sort_visit };
 static const JSTrampStepDef js_array_toSorted_def = { sizeof(JSArraySort), js_array_sort_vstep, js_array_sort_vfini, 1, .visit = js_array_sort_visit };
 static const JSTrampStepDef js_json_parse_def    = { sizeof(JSJsonReviver), js_json_parse_vstep, js_json_parse_vfini, 0, .visit = js_json_reviver_visit };
@@ -68408,19 +68460,19 @@ static JSValue js_bigint_constructor(JSContext *ctx, JSValueConst new_target, in
 /* 21.2.1.1 BigInt(value): its ONLY user code is step 2's ToPrimitive on the argument — everything after runs on a
    primitive. It is callable AND a constructor (which throws), which is what the constructor_or_func body
    prototype is for. */
-static const JSTrampStepDef js_ta_with_def = { sizeof(JSTAWith), js_ta_with_step, js_ta_with_fini, 0 };
+static const JSTrampStepDef js_ta_with_def = { sizeof(JSTAWith), js_ta_with_step, js_ta_with_fini, 0, .visit = js_ta_with_visit };
 static const JSTrampStepDef js_ta_fill_def = { sizeof(JSTACoerce), js_ta_coerce_step, js_ta_coerce_fini, TAPRO_FILL, .visit = js_ta_coerce_visit };
 static const JSTrampStepDef js_ta_copyWithin_def = { sizeof(JSTACoerce), js_ta_coerce_step, js_ta_coerce_fini, TAPRO_COPYWITHIN, .visit = js_ta_coerce_visit };
 static const JSTrampStepDef js_ta_indexOf_def     = { sizeof(JSTACoerce), js_ta_coerce_step, js_ta_coerce_fini, TAPRO_SEARCH_ARG(special_indexOf), .visit = js_ta_coerce_visit };
 static const JSTrampStepDef js_ta_lastIndexOf_def = { sizeof(JSTACoerce), js_ta_coerce_step, js_ta_coerce_fini, TAPRO_SEARCH_ARG(special_lastIndexOf), .visit = js_ta_coerce_visit };
 static const JSTrampStepDef js_ta_includes_def    = { sizeof(JSTACoerce), js_ta_coerce_step, js_ta_coerce_fini, TAPRO_SEARCH_ARG(special_includes), .visit = js_ta_coerce_visit };
-static const JSTrampStepDef js_ta_subarray_def    = { sizeof(JSTASubarray), js_ta_subarray_step, js_ta_subarray_fini, 0 };
-static const JSTrampStepDef js_ab_ctor_def       = { sizeof(JSABCtor), js_ab_ctor_step, js_ab_ctor_fini, JS_CLASS_ARRAY_BUFFER };
-static const JSTrampStepDef js_sab_ctor_def      = { sizeof(JSABCtor), js_ab_ctor_step, js_ab_ctor_fini, JS_CLASS_SHARED_ARRAY_BUFFER };
-static const JSTrampStepDef js_dataview_ctor_def = { sizeof(JSDataViewCtor), js_dataview_ctor_step, js_dataview_ctor_fini, 0 };
-static const JSTrampStepDef js_ab_slice_def      = { sizeof(JSABSlice), js_ab_slice_step, js_ab_slice_fini, JS_CLASS_ARRAY_BUFFER*2 + 0 };
-static const JSTrampStepDef js_ab_sliceImm_def   = { sizeof(JSABSlice), js_ab_slice_step, js_ab_slice_fini, JS_CLASS_ARRAY_BUFFER*2 + 1 };
-static const JSTrampStepDef js_sab_slice_def     = { sizeof(JSABSlice), js_ab_slice_step, js_ab_slice_fini, JS_CLASS_SHARED_ARRAY_BUFFER*2 + 0 };
+static const JSTrampStepDef js_ta_subarray_def    = { sizeof(JSTASubarray), js_ta_subarray_step, js_ta_subarray_fini, 0, .visit = js_ta_subarray_visit };
+static const JSTrampStepDef js_ab_ctor_def       = { sizeof(JSABCtor), js_ab_ctor_step, js_ab_ctor_fini, JS_CLASS_ARRAY_BUFFER, .visit = js_ab_ctor_visit };
+static const JSTrampStepDef js_sab_ctor_def      = { sizeof(JSABCtor), js_ab_ctor_step, js_ab_ctor_fini, JS_CLASS_SHARED_ARRAY_BUFFER, .visit = js_ab_ctor_visit };
+static const JSTrampStepDef js_dataview_ctor_def = { sizeof(JSDataViewCtor), js_dataview_ctor_step, js_dataview_ctor_fini, 0, .visit = js_dataview_ctor_visit };
+static const JSTrampStepDef js_ab_slice_def      = { sizeof(JSABSlice), js_ab_slice_step, js_ab_slice_fini, JS_CLASS_ARRAY_BUFFER*2 + 0, .visit = js_ab_slice_visit };
+static const JSTrampStepDef js_ab_sliceImm_def   = { sizeof(JSABSlice), js_ab_slice_step, js_ab_slice_fini, JS_CLASS_ARRAY_BUFFER*2 + 1, .visit = js_ab_slice_visit };
+static const JSTrampStepDef js_sab_slice_def     = { sizeof(JSABSlice), js_ab_slice_step, js_ab_slice_fini, JS_CLASS_SHARED_ARRAY_BUFFER*2 + 0, .visit = js_ab_slice_visit };
 static int js_error_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_error_ctor_fini(JSContext *ctx, void *st, bool take_result);
 /* `arg` carries the KIND, which is the only thing that differs between the ten definitions. */
@@ -68505,7 +68557,7 @@ typedef struct JSDateSet {
     int i, n;             /* the coercion cursor and how many arguments the spec names */
     bool nonfinite;       /* an argument coerced to an infinity or a NaN */
 } JSDateSet;
-static const JSTrampStepDef js_date_ctor_def = { sizeof(JSDateCtor), js_date_ctor_step, js_date_ctor_fini, 0 };
+static const JSTrampStepDef js_date_ctor_def = { sizeof(JSDateCtor), js_date_ctor_step, js_date_ctor_fini, 0, .visit = js_date_ctor_visit };
 /* An OrdinaryCreateFromConstructor declaration: the CLASS and the body's DECLARED ARGUMENT COUNT in `arg`, the
    post-create body (NULL = the object is the result), and the same precheck hook the coerce-then-compute machines
    use for a leading validation. The count is part of the declaration for the same reason PRIMARGS carries its
@@ -68906,7 +68958,7 @@ static const JSTrampStepDef js_num_tolocale_def   = { sizeof(JSNumberFmt), js_nu
 static const JSTrampStepDef js_num_tofixed_def    = { sizeof(JSNumberFmt), js_number_fmt_step, js_number_fmt_fini, NUMFMT_TOFIXED, .visit = js_number_fmt_visit };
 static const JSTrampStepDef js_num_toexp_def      = { sizeof(JSNumberFmt), js_number_fmt_step, js_number_fmt_fini, NUMFMT_TOEXPONENTIAL, .visit = js_number_fmt_visit };
 static const JSTrampStepDef js_num_toprec_def     = { sizeof(JSNumberFmt), js_number_fmt_step, js_number_fmt_fini, NUMFMT_TOPRECISION, .visit = js_number_fmt_visit };
-static const JSTrampStepDef js_global_eval_def    = { sizeof(JSProgEval), js_global_eval_step, js_global_eval_fini, 0 };
+static const JSTrampStepDef js_global_eval_def    = { sizeof(JSProgEval), js_global_eval_step, js_global_eval_fini, 0, .visit = js_global_eval_visit };
 static const JSTrampStepDef js_isNaN_def          = { sizeof(JSCoerce1), js_coerce1_step, js_coerce1_fini, 0 };
 static const JSTrampStepDef js_isFinite_def       = { sizeof(JSCoerce1), js_coerce1_step, js_coerce1_fini, 1 };
 static const JSTrampStepDef js_function_call_def  = { sizeof(JSFuncCall), js_function_call_step, js_function_call_fini, 0, .visit = js_function_call_visit };
@@ -88930,12 +88982,20 @@ static int js_ab_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
     return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). */
+static void js_ab_ctor_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSABCtor *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->prim);
+}
+
 static JSValue js_ab_ctor_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSABCtor *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->result);
-    JS_FreeValue(ctx, s->prim);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -90991,21 +91051,26 @@ static int js_ta_sort_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). `items` is the ONE owner of the sorted list — tmp's entries
+   ALIAS it within the block being merged, and every element stays reachable from items until the copy-back
+   permutes them — so items is an element array and tmp is a plain buffer. Getting those two the wrong way round
+   is a double free in one direction and a lost merge block in the other, which is exactly why the operations
+   are separate and the machine says which is which. */
+static void js_ta_sort_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSTASort *s = st;
+    v->val(ctx, &s->cmpres);
+    v->val(ctx, &s->obj);
+    v->array(ctx, (void **)&s->items, sizeof(JSValue), (int)s->len, (int)s->len, js_step_visit_value_elem);
+    v->buf(ctx, (void **)&s->tmp, (size_t)s->len * sizeof(JSValue));
+}
+
 static JSValue js_ta_sort_vfini(JSContext *ctx, void *st, bool take_result)
 {
     JSTASort *s = st;
-    JSValue r;
-    int64_t j;
-    JS_FreeValue(ctx, s->cmpres);   /* a comparator result whose ToNumber was abandoned part-way */
-    if (s->items) {
-        /* items is the ONE owner: tmp's entries alias it within the block being merged, and the block's
-           elements are all still reachable from items until the copy-back permutes them. */
-        for (j = 0; j < s->len; j++) JS_FreeValue(ctx, s->items[j]);
-        js_free(ctx, s->items);
-    }
-    js_free(ctx, s->tmp);
-    r = take_result ? s->obj : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->obj);
+    JSValue r = take_result ? s->obj : JS_UNDEFINED;
+    if (take_result) s->obj = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -91578,12 +91643,20 @@ static int js_dataview_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JS
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). */
+static void js_dataview_ctor_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSDataViewCtor *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->prim);
+}
+
 static JSValue js_dataview_ctor_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSDataViewCtor *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->result);
-    JS_FreeValue(ctx, s->prim);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
