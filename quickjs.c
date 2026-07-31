@@ -463,6 +463,14 @@ typedef struct JSStackFrame {
        "(missing)" behind a FIXME, and the walk that feeds Error.prepareStackTrace subtracted from a null
        pointer and read a line number out of the result. It is not an activation, so it is not a frame. */
     bool is_call_root;
+    /* THE BUILTIN WHOSE ACTIVATION INVOKED THIS FRAME, when one did — `Array.prototype.map` for the callback
+       it is driving. A continuation-holding builtin is a STEP MACHINE in this engine, and a step machine
+       pushes no JSStackFrame of its own: it is driven from the interpreter's activation, so its callback's
+       frame is linked straight to the caller and the builtin vanished from every stack trace. V8 reports it
+       (`at Array.map`), and it is the truthful answer — the builtin really is on the stack between the two.
+       BORROWED from the step state, which outlives every callback it drives. The RECEIVER comes too: the
+       builtin's frame is a method call on it, and `map` without it reads as a bare function. */
+    JSValueConst step_func, step_this;
     /* THE RECEIVER of this call, BORROWED for the frame's lifetime exactly as cur_func is — the operand stack,
        the heap frame or the coroutine state that holds the callee holds `this` beside it. A stack trace needs
        it: V8's CallSite exposes getThis and getTypeName, and isToplevel is a question ABOUT the receiver
@@ -7046,6 +7054,7 @@ static JSValue js_call_c_function_data(JSContext *ctx, JSValueConst func_obj,
     sf->is_strict_mode = false;
     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
     sf->is_call_root = false;
+    sf->step_func = sf->step_this = JS_UNDEFINED;
     sf->cur_func = unsafe_unconst(func_obj);
     sf->this_val = this_val;
     sf->arg_count = argc;
@@ -7188,6 +7197,7 @@ static JSValue js_call_c_closure(JSContext *ctx, JSValueConst func_obj,
     sf->is_strict_mode = false;
     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
     sf->is_call_root = false;
+    sf->step_func = sf->step_this = JS_UNDEFINED;
     sf->cur_func = unsafe_unconst(func_obj);
     sf->this_val = this_val;
     sf->arg_count = argc;
@@ -8460,7 +8470,40 @@ static JSValue js_callsite_method_name(JSContext *ctx, const JSCallSiteData *csd
     return JS_AtomToString(ctx, found);
 }
 
+/* The step machine whose step function is executing, declared here because build_backtrace below asks it
+   what builtin it is inside. Defined with the frame chain it is bracketed alongside. */
+static _Thread_local struct JSStepHdr *g_step_running;
 static const char *get_func_name(JSContext *ctx, JSValueConst func);
+/* Fill `csd` from the step machine currently executing, and say whether there was one. It lives beside that
+   machine's declaration rather than here because JSStepHdr's shape belongs down there; what belongs up here
+   is the question. */
+static bool js_callsite_running_step(JSContext *ctx, JSCallSiteData *csd);
+
+/* A record for a frame that has no JSStackFrame: a step machine's activation. It is native by construction —
+   there is no bytecode and no position — and it carries the builtin as both function and name, which is what
+   makes it render as `Array.map` once the receiver supplies the type. */
+static void js_new_callsite_data_step(JSContext *ctx, JSCallSiteData *csd, JSValueConst func,
+                                      JSValueConst this_val)
+{
+    const char *name;
+
+    csd->constructor = false;
+    csd->strict = true;    /* a builtin hands out neither its receiver nor itself */
+    csd->this_val = js_dup(this_val);
+    csd->func = js_dup(func);
+    name = get_func_name(ctx, func);
+    csd->func_name = (name && name[0]) ? JS_NewString(ctx, name) : JS_NULL;
+    JS_FreeCString(ctx, name);
+    if (JS_IsException(csd->func_name))
+        csd->func_name = JS_NULL;
+    csd->native = true;
+    csd->is_eval = false;
+    csd->eval_origin = JS_NULL;
+    csd->line_num = -1;
+    csd->col_num = -1;
+    csd->filename = JS_NULL;
+}
+
 static JSValue js_callsite_type_name(JSContext *ctx, const JSCallSiteData *csd)
 {
     JSObject *p, *proto;
@@ -8473,6 +8516,18 @@ static JSValue js_callsite_type_name(JSContext *ctx, const JSCallSiteData *csd)
        the formatter already spells as "new F". */
     if (csd->constructor)
         return JS_NULL;
+    /* A PRIMITIVE receiver still has a type, and a builtin is the case that has one: `"abc".replace(…)` runs
+       with the string itself, not a wrapper, because a C builtin does no ToObject. Naming it costs nothing —
+       the wrapper would only be allocated to read its class back off. */
+    switch (JS_VALUE_GET_NORM_TAG(csd->this_val)) {
+    case JS_TAG_STRING:      return JS_NewString(ctx, "String");
+    case JS_TAG_INT:
+    case JS_TAG_FLOAT64:     return JS_NewString(ctx, "Number");
+    case JS_TAG_BOOL:        return JS_NewString(ctx, "Boolean");
+    case JS_TAG_SYMBOL:      return JS_NewString(ctx, "Symbol");
+    case JS_TAG_BIG_INT:     return JS_NewString(ctx, "BigInt");
+    default:                 break;
+    }
     if (JS_VALUE_GET_TAG(csd->this_val) != JS_TAG_OBJECT)
         return JS_NULL;
     p = JS_VALUE_GET_OBJ(csd->this_val);
@@ -8920,6 +8975,18 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
     if (filename && (backtrace_flags & JS_BACKTRACE_FLAG_SINGLE_LEVEL))
         goto done;
 
+    /* The step machine RUNNING right now, if the throw came from inside a builtin rather than from a callback
+       it drives. It is the innermost activation there is, so it goes first. */
+    /* …unless the running machine IS the one building this trace. That is what SKIP_FIRST_LEVEL has always
+       meant — "the innermost activation is this builtin's own" — and it was right to drop when a step machine
+       had no frame at all. It has one now, so the flag applies to it. */
+    if (backtrace_flags & JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL) {
+        if (g_step_running != NULL)
+            backtrace_flags &= ~JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL;
+    } else if (i < (uint32_t)stack_trace_limit && js_callsite_running_step(ctx, &csd[i])) {
+        i++;
+    }
+
     sf_start = rt->current_stack_frame;
 
     /* Find the frame we want to start from. Note that when a filter is used the filter
@@ -8955,6 +9022,13 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
 
         js_new_callsite_data(ctx, &csd[i], sf);
         i++;
+
+        /* The builtin that DROVE this frame sits between it and the caller, and it has no JSStackFrame of its
+           own to be found by the walk — a step machine is driven from the interpreter's activation. */
+        if (JS_VALUE_GET_TAG(sf->step_func) == JS_TAG_OBJECT && i < (uint32_t)stack_trace_limit) {
+            js_new_callsite_data_step(ctx, &csd[i], sf->step_func, sf->step_this);
+            i++;
+        }
 
         /* stop backtrace if JS_EVAL_FLAG_BACKTRACE_BARRIER was used */
         if (backtrace_barrier)
@@ -18962,6 +19036,7 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
     sf->is_strict_mode = false;
     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
     sf->is_call_root = false;
+    sf->step_func = sf->step_this = JS_UNDEFINED;
     sf->cur_func = unsafe_unconst(func_obj);
     sf->this_val = this_obj;
     sf->arg_count = argc;
@@ -19297,6 +19372,17 @@ static TrampFrame *tramp_frame_new(JSRuntime *rt)
    A step function never re-enters the driver (it RETURNS a request and the driver performs it), so this cannot
    be read across a suspension — it is live only for the duration of one step call. */
 static _Thread_local TrampFrame *g_step_chain = NULL;
+static bool js_callsite_running_step(JSContext *ctx, JSCallSiteData *csd)
+{
+    if (!g_step_running || JS_VALUE_GET_TAG(g_step_running->func_obj) != JS_TAG_OBJECT)
+        return false;
+    js_new_callsite_data_step(ctx, csd, g_step_running->func_obj, g_step_running->this_val);
+    return true;
+}
+
+/* g_step_running is declared beside build_backtrace, which reads it: a builtin that throws before it calls
+   anything — `[].map(1)` — has no callback frame to be named from, and it is on the stack. Set and restored
+   around the one step invocation below, so it is never read outside that window. */
 
 #define CONT_NONE          0
 /* 1, 2, 6 and 7 were CONT_ARRAY_ITER / CONT_ARRAY_REDUCE / CONT_SORT / CONT_JSON_REVIVE — one continuation kind
@@ -24367,6 +24453,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     /* sf->cur_pc must we set to pc before any recursive calls to JS_CallInternal. */
     sf->cur_pc = NULL;
     sf->is_call_root = false;
+    sf->step_func = sf->step_this = JS_UNDEFINED;
     sf->this_val = this_obj;
     sf->prev_frame = rt->current_stack_frame;
     rt->current_stack_frame = sf;
@@ -24995,6 +25082,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 nsf = &ntf->sf;
                 nsf->is_strict_mode = nb->is_strict_mode;
                 nsf->is_call_root = false;
+                nsf->step_func = nsf->step_this = JS_UNDEFINED;
                 /* An OWNED invocation list is released a few lines below, and on the bound/spread path it is the
                    SOLE owner of the callee — call_argv points into it and call_argv[-1] IS nfunc. Every other
                    call shape leaves the callee on the caller's operand stack, which owns it for the whole call.
@@ -25042,6 +25130,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 nsf->is_constructor = false;
                 ntf->arg_allocated = narg_alloc; ntf->callee_argc = eff_argc;
                 ntf->async_data = NULL; ntf->async_promise = JS_UNDEFINED; ntf->gen_data = NULL;
+                /* A CONT_STEP continuation means a step machine is driving this call — record the builtin so
+                   the frame can name it. Read BEFORE the reset below, which is why it is here and not beside
+                   the other frame fields. */
+                if (tramp_cont_kind == CONT_STEP && tramp_cont_state) {
+                    nsf->step_func = ((JSStepHdr *)tramp_cont_state)->func_obj;
+                    nsf->step_this = ((JSStepHdr *)tramp_cont_state)->this_val;
+                }
                 ntf->cont_state = tramp_cont_state; ntf->cont_kind = tramp_cont_kind; tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;   /* NORMAL frame; iter_state set only for an array-iteration callback */
                 ntf->forof_off = tramp_cont_forof; tramp_cont_forof = 0;   /* CONT_FOROF_NEXT's enum_rec offset; 0 (never a valid offset) otherwise */
                 sf = nsf; b = nb; ctx = nb->realm;
@@ -25885,6 +25980,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 nsf = &ntf->sf;
                 nsf->is_strict_mode = nb->is_strict_mode;
                 nsf->is_call_root = false;
+                nsf->step_func = nsf->step_this = JS_UNDEFINED;
                 ntf->owns_func = 0;   /* the constructor stays on the caller's stack for the whole construct */
                 nsf->cur_func = unsafe_unconst(nfunc);
                 nsf->arg_count = eff_argc;
@@ -26102,6 +26198,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 nsf = &ntf->sf;
                 nsf->is_strict_mode = nb->is_strict_mode;
                 nsf->is_call_root = false;
+                nsf->step_func = nsf->step_this = JS_UNDEFINED;
                 ntf->owns_func = 0;   /* atab holds the ARGUMENTS; the callee is the caller's own operand */
                 nsf->cur_func = unsafe_unconst(nfunc);
                 narg_buf = nlb;
@@ -26810,10 +26907,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSStepHdr *h = stt;
                 JSValue *cb = NULL; int cbn = 0;
                 TrampFrame *prev_chain = g_step_chain;
+                JSStepHdr *prev_running = g_step_running;
                 int st;
-                g_step_chain = tf_top;
+                g_step_chain = tf_top; g_step_running = h;
                 st = h->def->step(step_realm(ctx, h), stt, ret_val, &cb, &cbn);
-                g_step_chain = prev_chain;
+                g_step_chain = prev_chain; g_step_running = prev_running;
                 if (unlikely(st < 0)) {
                     void *souter0 = h->outer; uint8_t sk0 = h->outer_kind;
                     if (sk0 == CONT_FOROF_NEXT) {
@@ -38467,6 +38565,7 @@ static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s,
     sf->is_strict_mode = b->is_strict_mode;
     sf->is_constructor = false;
     sf->is_call_root = false;
+    sf->step_func = sf->step_this = JS_UNDEFINED;
     sf->cur_pc = b->byte_code_buf;
     arg_buf_len = max_int(b->arg_count, argc);
     /* This frame hosts the flow BASE and every generator/async body, so its operands are reshaped by the same
@@ -63131,12 +63230,10 @@ static int js_error_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
         JS_DefinePropertyValue(ctx, s->obj, JS_ATOM_suppressed, js_dup(step_arg(&s->hdr, 1)),
                                JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
     }
-    /* NO SKIP. The flag means "the innermost frame is this builtin's own", and it was right while the Error
-       constructor was a C function: js_call_c_function pushes a JSStackFrame for the builtin, and reporting it
-       would name Error() as the place the error came from. A step machine pushes no frame — it is driven from
-       the interpreter's own activation — so the innermost frame is the PAGE's, the one that wrote `new Error`,
-       and skipping it threw away the only frame a top-level `new Error().stack` had. */
-    build_backtrace(ctx, s->obj, JS_UNDEFINED, NULL, 0, 0, 0);
+    /* SKIP the Error constructor's own activation: naming Error() as the place the error came from is the one
+       thing a stack trace must not do. The skip had to be dropped when a step machine pushed no frame at all —
+       it was eating the PAGE's frame instead — and comes back now that the machine has one of its own. */
+    build_backtrace(ctx, s->obj, JS_UNDEFINED, NULL, 0, 0, JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL);
     return 0;
 }
 
@@ -67726,7 +67823,7 @@ static JSValue js_domexception_ctor_body(JSContext *ctx, JSValueConst obj_, int 
                                          int backtrace_flags);
 static const JSTrampStepDef js_domexception_ctor_def =
     CREATECTOR_DEF_FULL(JS_CLASS_DOM_EXCEPTION, 2, generic_magic, js_domexception_ctor_body,
-                        0, js_domexception_ctor_precheck);   /* a step machine has no frame to skip — see the Error ctor */
+                        JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL, js_domexception_ctor_precheck);
 static int js_finrec_ctor_precheck(JSContext *ctx, const JSStepHdr *h);
 static JSValue js_finrec_ctor_body(JSContext *ctx, JSValueConst obj_, int argc, JSValueConst *argv);
 static const JSTrampStepDef js_weakref_ctor_def =
@@ -83321,6 +83418,7 @@ static int reaction_call_flow_init(JSContext *ctx, JSAsyncFunctionState *fs, JSV
     sf->is_strict_mode = false;
     sf->is_constructor = false;
     sf->is_call_root = true;   /* no bytecode of its own runs here: the handler's activation is a frame ON TOP */
+    sf->step_func = sf->step_this = JS_UNDEFINED;
     sf->this_val = JS_UNDEFINED;
     sf->cur_func = js_dup(handler);
     sf->cur_pc = NULL;
