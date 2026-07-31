@@ -11145,10 +11145,24 @@ static int JS_SetPropertyInternal2(JSContext *ctx, JSValueConst obj, JSAtom prop
 
     switch(JS_VALUE_GET_TAG(this_obj)) {
     case JS_TAG_NULL:
-        JS_ThrowTypeErrorAtom(ctx, "cannot set property '%s' of null", prop);
-        goto fail;
     case JS_TAG_UNDEFINED:
-        JS_ThrowTypeErrorAtom(ctx, "cannot set property '%s' of undefined", prop);
+        /* A nullish RECEIVER is not an error. OrdinarySetWithOwnDescriptor step 2.b returns FALSE for any
+           Receiver that is not an Object, and its accessor arm calls the setter with that this-value — the same
+           treatment every other primitive receiver gets below, which is why this shares that arm rather than
+           having one of its own. `Reflect.set({}, "x", 0, undefined)` is false, not a throw.
+           The TypeError is PutValue's step 5.a ToObject(BASE), a different operation, and it is reached only
+           when the base itself is the nullish value. */
+        if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
+            p = NULL;
+            p1 = JS_VALUE_GET_OBJ(obj);
+            goto prototype_lookup;
+        }
+        DCHECK(js_same_value(ctx, obj, this_obj),
+               "a nullish receiver over a primitive base is neither PutValue's error nor OrdinarySet's false");
+        if (JS_IsNull(this_obj))
+            JS_ThrowTypeErrorAtom(ctx, "cannot set property '%s' of null", prop);
+        else
+            JS_ThrowTypeErrorAtom(ctx, "cannot set property '%s' of undefined", prop);
         goto fail;
     case JS_TAG_OBJECT:
         p = JS_VALUE_GET_OBJ(this_obj);
@@ -19375,6 +19389,18 @@ static void *tramp_step_chain_free_upto(JSContext *ctx, void *st, uint8_t *out_k
 }
 /* The common case: nothing is left for the interpreter to answer for. A requester this walk does not own reaching
    here would be one whose abrupt handling was silently skipped, so it CRASHES rather than leaking the answer. */
+/* Tear down a machine that reported ABRUPT — and assert the thing that makes -1 MEAN something. By the time
+   this returns the completion VALUE exists: the machine either threw inside step(), or throws from fini, as the
+   async-from-sync closeIterator does because its stored rejection must REPLACE whatever its `return` call
+   raised. A -1 that leaves NEITHER behind propagates the runtime's no-exception sentinel as if it were the
+   thrown value — which is how `new Int8Array(1).find()` came to throw "[uninitialized]" out of an argc guard
+   that short-circuited past check_function. */
+static void tramp_step_abrupt_free(JSContext *ctx, void *st)
+{
+    tramp_step_state_free(ctx, st, false);
+    DCHECK(JS_HasException(ctx), "a step machine reported ABRUPT and left no completion value behind");
+}
+
 static void tramp_step_chain_free(JSContext *ctx, void *st)
 {
     uint8_t left = 0;
@@ -19827,14 +19853,10 @@ static JSValue js_proxy_get_invariant(JSContext *ctx, JSValueConst target, JSAto
    performed — the C path, the in-place request, and the trap's continuation all end here. */
 static JSValue js_desc_to_object(JSContext *ctx, JSPropertyDescriptor *desc);
 static int js_proxy_gopd_shape(JSContext *ctx, JSValueConst trap_result_obj);
-static bool js_proxy_gopd_needs_ext(int td_ret, int td_flags);
-static int js_proxy_gopd_absent(JSContext *ctx, int td_ret, int td_flags, int extensible);
-static int js_proxy_gopd_pre(JSContext *ctx, JSValueConst obj, JSValueConst trap_result_obj,
-                             JSAtom prop, int *ptd_flags, int *ptd_ret, int *pextensible);
-static int js_proxy_gopd_post(JSContext *ctx, JSPropertyDescriptor *presult, int target_desc_flags,
-                              int target_desc_ret, int extensible_target, JSPropertyDescriptor *pdesc);
-static int js_proxy_gopd_check(JSContext *ctx, JSValueConst obj, JSAtom prop,
-                               JSValue trap_result_obj, JSPropertyDescriptor *pdesc);
+static bool js_proxy_gopd_needs_ext(const JSDescFacts *tf);
+static int js_proxy_gopd_absent(JSContext *ctx, const JSDescFacts *tf, int extensible);
+static int js_proxy_gopd_post(JSContext *ctx, JSPropertyDescriptor *presult, const JSDescFacts *tf,
+                              int extensible_target, JSPropertyDescriptor *pdesc);
 
 static JSValue js_create_desc(JSContext *ctx, JSValueConst val, JSValueConst getter, JSValueConst setter,
                               int flags);
@@ -21901,6 +21923,12 @@ typedef struct JSIterConsume {
     uint8_t len_written; /* ITERCONS_FROM: the closing Set(A,"length") has been performed (it is a phase, and the
                             done path is re-entered after it) */
     uint8_t closing; /* 1 = the sink short-circuited: close the iterator on the tramp, then finish */
+    uint8_t setop_seed; /* 1 = the result Set still owes its copy of THIS's [[SetData]]. union (24.2.4.10) and
+                           symmetricDifference (24.2.4.9) take that copy in the step AFTER GetKeysIterator, and
+                           GetKeysIterator runs the page's `keys()` and reads `next` off what it returned — so a
+                           `get next()` that clears THIS is observed by the copy. Seeding it while the record was
+                           being read was one step too early. difference (24.2.4.4) copies BEFORE and is not
+                           flagged; intersection starts empty. */
     uint8_t cb_pending; /* ITERTERM: 1 = `res` on the next step entry is the CALLBACK's result, not an iterator result */
     /* THE ITERATOR RECORD'S [[Done]]. 7.4.9 IteratorStepValue step 2 sets it when the `next` CALL completes
        abruptly, and every consumer's step is then a plain `? IteratorStepValue(...)` — NOT an
@@ -21951,6 +21979,12 @@ typedef struct JSIterConsume {
        the key, 3 = define. */
     uint8_t ent_ph;
     uint8_t ent_pending; /* 1 = an entry sequence is in flight, so `res` is its phase result, not a .next() one */
+    /* THE CALLEE'S REALM. A consume machine IS a builtin invocation, so the intrinsics it creates come from the
+       builtin's own [[Realm]] and not the caller's — the same rule step_realm states for a step machine, which
+       gets it from its header's func_obj. This machine keeps no callee, so the entry that builds it records the
+       answer. `var from = otherRealm.Array.from; from([1,2,3])` is the observation: C is undefined, so step 4.a
+       is a plain ArrayCreate, and it belongs to the realm of `from`. Defaults to the creating context. */
+    JSContext *realm;
     /* Array.from's receiver, held ACROSS GetIterator. 23.1.2.1 does step 3's GetMethod BEFORE step 4.a's
        Construct(C), and constructing first was unobservable only while @@iterator could not be a getter. It can
        be now, so the result object is created at the deliver arm instead. UNDEFINED for every other sink. */
@@ -22004,6 +22038,7 @@ static JSIterConsume *js_iter_consume_new(JSContext *ctx)
 {
     JSIterConsume *s = js_mallocz(ctx, sizeof(*s));
     if (unlikely(!s)) return NULL;
+    s->realm = ctx;
     ITERCONS_OWNED(ITERCONS_INIT_ONE)
     return s;
 }
@@ -22560,10 +22595,12 @@ typedef struct JSTACtor {
     JSStepHdr hdr;
     JSValue result;
     JSValue argp[3];   /* the operands the plan reads, with the coerced primitives in place */
-    JSTAViewPlan plan; /* held across the `prototype` read, which the spec orders after every check it makes */
+    JSValue proto;     /* NewTarget.prototype, when 23.2.5.1 step 6.b.i read it BEFORE anything was coerced (owned) */
+    uint64_t offset;   /* the byteOffset, ToIndex'd and alignment-checked before the length is even coerced */
+    JSTAViewPlan plan; /* the buffer view, made once every operand it reads is primitive */
     uint8_t planned;   /* the plan owns a buffer the teardown must release */
+    uint8_t proto_read;/* `proto` holds the allocation's prototype; the tail must not read it a second time */
     uint8_t is_copy;   /* the TYPED-ARRAY source form: no plan, and the tail copies instead of viewing */
-    uint32_t src_len;  /* its source's element count, read before the `prototype` read can change anything */
 } JSTACtor;
 
 typedef struct JSIterZip {
@@ -22741,8 +22778,10 @@ typedef struct JSGopdDesc {
     uint8_t outer_kind;
     JSDescFacts *desc_out;  /* the OPERATION's answer shape, so a nested target answers as ITS requester asked */
     uint8_t phase;       /* GD_* */
-    JSDescFacts facts;   /* step 10's answer, when this machine is the one asking (owned) */
-    int td_flags, td_ret, extensible;   /* steps 10 and 12, performed before the walk as the spec orders them */
+    JSDescFacts facts;   /* step 10's answer -- the target's own descriptor, and the ONLY record of it. The
+                            attribute bits were also copied out into a second pair of fields for the invariant
+                            to read; the value comparison needs the record anyway, so the copy is gone. (owned) */
+    int extensible;      /* step 12's answer, read only where 11.c is actually reached */
     JSDescCursor cur;    /* the walk itself, resumable between any two of its twelve operations */
 } JSGopdDesc;
 /* 10.5.5's own steps, in the order it states them. Steps 10 and 12 are INTERNAL METHODS on the TARGET, so when
@@ -25290,6 +25329,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JSValueConst aa = (call_argc >= 2) ? call_argv[1] : JS_UNDEFINED;
                     int atag = JS_VALUE_GET_TAG(aa);
                     if (atag == JS_TAG_UNDEFINED || atag == JS_TAG_NULL || atag == JS_TAG_OBJECT) {
+                        /* 20.2.3.1 step 1, BEFORE step 3's CreateListFromArrayLike. The step machine that answers
+                           the value spelling already ran it first; this route reached the list build without it,
+                           so the same call read `argArray.length` — the page's getter — for a target that was
+                           never callable. The spread below has no such step (ArgumentListEvaluation precedes
+                           EvaluateCall's IsCallable), which is why this lives here and not at the shared label. */
+                        if (check_function(ctx, call_argv[-2]))
+                            goto exception;
                         ap_func = call_argv[-2];
                         ap_this = (call_argc >= 1) ? call_argv[0] : JS_UNDEFINED;
                         ap_array = aa; ap_cfirst = -2; ap_cargc = call_argc;
@@ -25307,6 +25353,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        label — one operand shape apart. It is not the machine's twin: the machine answers the VALUE
                        spelling (a bound Reflect.apply, a callback), this answers the operator, and both read their
                        list through CONT_ARG_LIST. */
+                    if (check_function(ctx, call_argv[0]))   /* 28.1.1 step 1, before step 2's list build */
+                        goto exception;
                     ap_func = call_argv[0]; ap_this = call_argv[1]; ap_array = call_argv[2];
                     ap_cfirst = -2; ap_cargc = call_argc;   /* operands [Reflect, apply, target, this, argsList] */
                     tramp_is_tail = (opcode == OP_tail_call_method); goto do_apply_tramp;
@@ -27162,7 +27210,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         int cfirst1 = h->orig_cfirst, cargc1 = h->orig_cargc, foff1 = h->outer_forof;
                         JSValue *fcargv;
                         DCHECK(foff1 <= -3, "a for-of .next() step machine carries no enum_rec offset");
-                        tramp_step_state_free(ctx, stt, false);
+                        tramp_step_abrupt_free(ctx, stt);
                         fcargv = sp - cargc1;
                         for (i = cfirst1; i < cargc1; i++) JS_FreeValue(ctx, fcargv[i]);
                         sp += cfirst1 - cargc1;
@@ -27176,7 +27224,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         int cfirst1 = h->orig_cfirst, cargc1 = h->orig_cargc;
                         JSValue *ncargv;
                         DCHECK(souter0 == NULL, "an OP_iterator_next/OP_iterator_call continuation carries no state");
-                        tramp_step_state_free(ctx, stt, false);
+                        tramp_step_abrupt_free(ctx, stt);
                         ncargv = sp - cargc1;
                         for (i = cfirst1; i < cargc1; i++) JS_FreeValue(ctx, ncargv[i]);
                         sp += cfirst1 - cargc1;
@@ -27191,7 +27239,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            frame's throw is; unwinding here instead would tear the sequence down behind its back. */
                         int cfirst0 = h->orig_cfirst, cargc0 = h->orig_cargc;
                         h->outer = NULL; h->outer_kind = CONT_NONE;
-                        tramp_step_state_free(ctx, stt, false);
+                        tramp_step_abrupt_free(ctx, stt);
                         ret_val = JS_EXCEPTION; cont_st = souter0;
                         call_first_r = cfirst0; call_pop = cargc0;
                         if (sk0 == CONT_ITER_CONSUME) goto do_consume_deliver;
@@ -27206,7 +27254,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            requester does — the same arm the C prepare's failure took. */
                         JSAsyncSettle *ass0 = souter0;
                         h->outer = NULL; h->outer_kind = CONT_NONE;
-                        tramp_step_state_free(ctx, stt, false);
+                        tramp_step_abrupt_free(ctx, stt);
                         JS_FreeValue(ctx, ass0->promise);
                         if (ass0->cont_kind != CONT_NONE)
                             js_create_requester_abandon(ctx, ass0->cont, ass0->cont_kind);
@@ -27217,7 +27265,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         /* the continuation threw (a failed closure build, or step 5 abrupt with nothing to
                            close): step 7's IfAbruptRejectPromise, with the exception still live. */
                         h->outer = NULL; h->outer_kind = CONT_NONE;
-                        tramp_step_state_free(ctx, stt, false);
+                        tramp_step_abrupt_free(ctx, stt);
                         cont_st = souter0;
                         goto do_async_from_sync_abrupt;
                     }
@@ -27228,7 +27276,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         JSValue *fcargv;
                         DCHECK(souter0 == NULL, "a for-of acquire continuation carries no state");
                         h->outer = NULL; h->outer_kind = CONT_NONE;
-                        tramp_step_state_free(ctx, stt, false);
+                        tramp_step_abrupt_free(ctx, stt);
                         fcargv = sp - cargc0;
                         for (i = cfirst0; i < cargc0; i++) JS_FreeValue(ctx, fcargv[i]);
                         sp += cfirst0 - cargc0;
@@ -27243,7 +27291,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         int cfirst0 = h->orig_cfirst, cargc0 = h->orig_cargc;
                         JSValue *gcargv;
                         h->outer = NULL; h->outer_kind = CONT_NONE;
-                        tramp_step_state_free(ctx, stt, false);
+                        tramp_step_abrupt_free(ctx, stt);
                         gcargv = sp - cargc0;
                         for (i = cfirst0; i < cargc0; i++) JS_FreeValue(ctx, gcargv[i]);
                         sp += cfirst0 - cargc0;
@@ -27258,11 +27306,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            next (a consumer still owes IfAbruptCloseIterator, an acquire delivers the throw as an
                            acquisition failure), and it must not be walked as a step chain — gp is not one. */
                         h->outer = NULL; h->outer_kind = CONT_NONE;
-                        tramp_step_state_free(ctx, stt, false);
+                        tramp_step_abrupt_free(ctx, stt);
                         cont_st = souter0;
                         goto do_getprop_abandon;
                     }
                     tramp_step_chain_free(ctx, stt);   /* and the machines waiting on it */
+                    DCHECK(JS_HasException(ctx), "a step machine reported ABRUPT and left no completion value behind");
                     goto exception;
                 }
                 if (st == 0) {
@@ -27765,6 +27814,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->mapfn_this = (sink0 == ITERCONS_FROM && call_argc >= 3) ? js_dup(call_argv[2]) : JS_UNDEFINED;
                 s->k = 0;
                 s->sink = sink0;
+                s->realm = js_callee_realm(ctx, call_argv[-1]);
                 s->from_ctor = (sink0 == ITERCONS_FROM) ? js_dup(thisv) : JS_UNDEFINED;
                 s->from_owes_result = (sink0 == ITERCONS_FROM);
                 if (sink0 == ITERCONS_SUMPRECISE) sum_precise_init(&s->sum);
@@ -28627,17 +28677,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         DCHECK(JS_IsUndefined(ret_val),
                                "a record-answering [[GetOwnProperty]] delivers through the record, not the result");
                         ret_val = JS_UNDEFINED;
-                        gd->td_ret = (gd->facts.flags >= 0);
-                        gd->td_flags = (gd->facts.flags >= 0) ? gd->facts.flags : 0;
                         gd->extensible = 1;   /* only read when the arm below actually asks for it */
                         gd->phase = GD_EXT;
                     }
                     if (gd->phase == GD_EXT) {
                         bool absent = JS_IsUndefined(gd->trap_res);
-                        if (absent && !js_proxy_gopd_needs_ext(gd->td_ret, gd->td_flags)) {
+                        if (absent && !js_proxy_gopd_needs_ext(&gd->facts)) {
                             /* 11.a or 11.b settles it, and 11.c is a step the spec never reaches.
                                EVERY field is read BEFORE the free: js_gopd_desc_free owns the block. */
-                            int ar = js_proxy_gopd_absent(ctx, gd->td_ret, gd->td_flags, 1);
+                            int ar = js_proxy_gopd_absent(ctx, &gd->facts, 1);
                             JSDescFacts *wf0 = gd->desc_out;
                             gp_outer = gd->outer; gp_outer_kind = gd->outer_kind;
                             js_gopd_desc_free(ctx, gd);
@@ -28657,7 +28705,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     gd->extensible = JS_ToBoolFree(ctx, ret_val);
                     ret_val = JS_UNDEFINED;
                     if (JS_IsUndefined(gd->trap_res)) {
-                        int ar = js_proxy_gopd_absent(ctx, gd->td_ret, gd->td_flags, gd->extensible);
+                        int ar = js_proxy_gopd_absent(ctx, &gd->facts, gd->extensible);
                         JSDescFacts *wf1 = gd->desc_out;   /* read BEFORE the free — the block is fini's */
                         gp_outer = gd->outer; gp_outer_kind = gd->outer_kind;
                         js_gopd_desc_free(ctx, gd);
@@ -28695,7 +28743,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     gd->cur.value = gd->cur.getter = gd->cur.setter = JS_UNDEFINED;   /* the record owns them now */
                     {
                         JSDescFacts *wf = gd->desc_out;
-                        pres = js_proxy_gopd_post(ctx, &rd, gd->td_flags, gd->td_ret, gd->extensible, &od);
+                        pres = js_proxy_gopd_post(ctx, &rd, &gd->facts, gd->extensible, &od);
                         js_gopd_desc_free(ctx, gd);
                         if (pres < 0) goto getprop_throw;
                         if (wf) {
@@ -30058,7 +30106,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         DCHECK(JS_IsUndefined(fs->r), "Array.from's result object is built exactly once");
                         if (!JS_IsConstructor(ctx, ctor)) {
                             JS_FreeValue(ctx, ctor);
-                            fs->r = JS_NewArray(ctx);   /* ArrayCreate(0): no user code at all */
+                            fs->r = JS_NewArray(fs->realm);   /* ArrayCreate(0) in `from`'s OWN realm; no user code at all */
                             if (JS_IsException(fs->r)) {
                                 fs->r = JS_UNDEFINED;
                                 JS_FreeValue(ctx, method);
@@ -65135,9 +65183,36 @@ static int ta_elem_set(JSContext *ctx, JSIterConsume *s, JSValue v)
    the first step. Returns 1 = drive iter.next() again, 0 = DONE (s->r is the finished array), -1 = exception.
    Consumes `res`. The generator's .next() body runs on the tramp chain (the caller re-enters this step at the
    generator settle), so a generator loop over opaque input suspend/resumes here instead of driving to completion. */
+/* "resultSetData is a copy of O.[[SetData]]" — the one statement every result-building set-operation but
+   intersection begins with. It is a direct [[SetData]] copy because the spec forbids calling the result's `add`,
+   and it is READ AT THE MOMENT IT RUNS: union and symmetricDifference take it after GetKeysIterator, so a
+   `get next()` that mutates THIS is observed here. */
+static int setop_copy_this(JSContext *ctx, JSIterConsume *s)
+{
+    JSMapState *ss = JS_GetOpaque(s->adder, JS_CLASS_SET);
+    JSMapState *ts = JS_GetOpaque(s->r, JS_CLASS_SET);
+    struct list_head *el;
+    DCHECK(ss != NULL, "setop seed: the receiver stopped being a Set");
+    DCHECK(ts != NULL, "setop seed: the result must be a Set");
+    list_for_each(el, &ss->records) {
+        JSMapRecord *mr = list_entry(el, JSMapRecord, link), *nr;
+        if (mr->empty) continue;
+        nr = map_add_record(ctx, ts, mr->key);
+        if (!nr) { JS_ThrowOutOfMemory(ctx); return -1; }
+        nr->value = JS_UNDEFINED;
+    }
+    return 0;
+}
+
 static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
 {
     if (s->abrupt) { JS_FreeValue(ctx, res); return -1; }   /* close done; the original exception propagates */
+    if (s->setop_seed) {
+        /* GetKeysIterator has returned — its `keys()` call and its `next` read are behind us, and THIS is
+           whatever they left it as. This is the first re-entry after the acquire, so it is the spec's step. */
+        s->setop_seed = 0;
+        if (setop_copy_this(ctx, s) < 0) { JS_FreeValue(ctx, res); return -1; }
+    }
     if (s->setrec_pending) {
         /* 24.2.1.2 GetSetRecord, one property at a time. `res` is what the tramp produced for the phase in
            flight, or UNINITIALIZED on the first entry when nothing has been read yet. There is no iterator to
@@ -65225,22 +65300,25 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
             }
             s->r = js_map_new(ctx, MAGIC_SET);
             if (JS_IsException(s->r)) { s->r = JS_UNDEFINED; return -1; }
-            ts = JS_GetOpaque(s->r, JS_CLASS_SET);
             /* intersection is the one result-building operation that starts EMPTY: its elements are the ones both
-               sides have, so there is nothing to seed. The other three start from THIS's records. */
-            if (s->setop != SETOP_INTERSECT) {
-                list_for_each(el, &ss->records) {
-                    JSMapRecord *mr = list_entry(el, JSMapRecord, link), *nr;
-                    if (mr->empty) continue;
-                    nr = map_add_record(ctx, ts, mr->key);
-                    if (!nr) { JS_ThrowOutOfMemory(ctx); return -1; }
-                    nr->value = JS_UNDEFINED;
-                }
+               sides have, so there is nothing to seed. The other three start from THIS's records — but WHEN they
+               take that copy differs, and it is observable: difference (24.2.4.4 step 4) copies before it decides
+               which side to walk, union and symmetricDifference copy in the step AFTER GetKeysIterator. */
+            if (s->setop == SETOP_UNION || s->setop == SETOP_SYMDIFF) {
+                s->setop_seed = 1;
+            } else if (s->setop != SETOP_INTERSECT) {
+                if (setop_copy_this(ctx, s) < 0) return -1;
             }
             if ((s->setop == SETOP_INTERSECT || s->setop == SETOP_DIFF)
                 && ss->record_count <= s->setrec_size) {
-                /* the smaller side is walked, exactly as isDisjointFrom decides it */
-                s->iter = js_create_map_iterator(ctx, s->adder, 0, NULL, MAGIC_SET);
+                /* the smaller side is walked, exactly as isDisjointFrom decides it — but difference walks the
+                   COPY, not THIS. 24.2.4.4 step 5.c.i reads resultSetData[index], and the `has` it calls per
+                   element is the page's code that can `clear()` and re-fill THIS: walking THIS live then handed
+                   `has` keys the receiver never originally held, and stopped short of the ones it did.
+                   intersection has no copy to walk (its result starts empty), so step 6.c.i genuinely reads
+                   O.[[SetData]] live — a different algorithm, not the same one with a different source. */
+                s->iter = js_create_map_iterator(ctx, s->setop == SETOP_DIFF ? s->r : s->adder,
+                                                 0, NULL, MAGIC_SET);
                 if (JS_IsException(s->iter)) { s->iter = JS_UNDEFINED; return -1; }
                 goto setop_has_walk;
             }
@@ -65773,19 +65851,22 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
                 s->closing = 1;      /* spec: IteratorClose before returning */
                 return 2;            /* close the iterator (on the tramp if it is a generator), then finish */
             }
-            if (s->setop == SETOP_INTERSECT || s->setop == SETOP_DIFF) {
-                /* the other side of the same two rules: a key THIS also has is appended (intersection) or removed
-                   (difference); one it does not have changes nothing either way. */
-                bool present = (NULL != map_find_record(ctx, ts, value));
-                if (present) {
-                    mr = map_find_record(ctx, rs, value);
-                    if (s->setop == SETOP_DIFF) {
-                        if (mr) map_delete_record(ctx->rt, rs, mr);
-                    } else if (!mr) {
-                        mr = map_add_record(ctx, rs, value);
-                        if (!mr) { JS_FreeValue(ctx, value); return -1; }
-                        mr->value = JS_UNDEFINED;
-                    }
+            if (s->setop == SETOP_DIFF) {
+                /* 24.2.4.4 step 6.c.ii: remove the key from resultSetData if it is there. THIS is NOT consulted —
+                   the copy already answers "did THIS have it", and consulting the LIVE receiver instead meant a
+                   `*keys()` that clears THIS mid-walk removed nothing. */
+                mr = map_find_record(ctx, rs, value);
+                if (mr) map_delete_record(ctx->rt, rs, mr);
+                JS_FreeValue(ctx, value);
+                return 1;
+            }
+            if (s->setop == SETOP_INTERSECT) {
+                /* 24.2.4.8 step 7.c.ii.2: intersection has no copy, so it DOES read O.[[SetData]] live, and the
+                   spec's own NOTE covers the duplicate the other side may yield. */
+                if (map_find_record(ctx, ts, value) && !map_find_record(ctx, rs, value)) {
+                    mr = map_add_record(ctx, rs, value);
+                    if (!mr) { JS_FreeValue(ctx, value); return -1; }
+                    mr->value = JS_UNDEFINED;
                 }
                 JS_FreeValue(ctx, value);
                 return 1;
@@ -66891,14 +66972,17 @@ static int js_ta_with_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
     int r;
 
     if (s->hdr.stage == 0) {
-        JSObject *p;
+        int vlen;
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
         s->val = JS_UNDEFINED; s->result = JS_UNDEFINED;
         s->idx = 0; s->len = 0;
-        p = get_typed_array(ctx, s->hdr.this_val);
-        if (!p) return -1;
-        s->len = p->u.array.count;   /* step 2, before either coercion */
+        /* Steps 2-3 are ValidateTypedArray THEN TypedArrayLength, and the validate is what throws the TypeError
+           for a view that is ALREADY detached — a step the class check alone does not perform, so
+           `ta.with(0, 0)` on a detached array reached step 9 and answered its RangeError instead. */
+        vlen = js_typed_array_get_length_unsafe(ctx, s->hdr.this_val);
+        if (vlen < 0) return -1;
+        s->len = vlen;
         s->hdr.stage = 1;
     }
     if (s->hdr.stage == 1) {
@@ -67971,8 +68055,13 @@ static int js_array_find_seed(JSContext *ctx, JSArrayFind *s)
 {
     int mode = s->hdr.arg & ~FIND_TA;   /* only the length differed; every later test is on the plain mode */
 
-    if (s->hdr.argc < 1 || check_function(ctx, s->hdr.argv[0])) return -1;
-    s->func = js_dup(s->hdr.argv[0]);
+    /* `predicate` ABSENT is `predicate` undefined — IsCallable(undefined) is false and the TypeError is the same
+       one. Short-circuiting on argc instead returned -1 with NO exception set, so `new Int8Array(1).find()` threw
+       the runtime's no-exception sentinel and `assert.throws` reported "Thrown value was not an object". step_arg
+       is the primitive that makes an out-of-range read impossible, which is why the guard can go rather than
+       learn to throw. */
+    if (check_function(ctx, step_arg(&s->hdr, 0))) return -1;
+    s->func = js_dup(step_arg(&s->hdr, 0));
     s->this_arg = js_dup(step_arg(&s->hdr, 1));
     s->mode = mode;
     if (mode == ArrayFindLast || mode == ArrayFindLastIndex) { s->k = s->len - 1; s->dir = -1; s->end = -1; }
@@ -82612,19 +82701,19 @@ static int js_proxy_gopd_shape(JSContext *ctx, JSValueConst trap_result_obj)
 /* Does step 11 need 11.c's IsExtensible at all? 11.a and 11.b both finish without it, and asking anyway would
    run a Proxy target's `isExtensible` trap for a step the spec never reaches. The routed path asks this before
    issuing the request and the C hook before making the call, so the condition is stated ONCE. */
-static bool js_proxy_gopd_needs_ext(int td_ret, int td_flags)
+static bool js_proxy_gopd_needs_ext(const JSDescFacts *tf)
 {
-    return td_ret && (td_flags & JS_PROP_CONFIGURABLE);
+    return tf->flags >= 0 && (tf->flags & JS_PROP_CONFIGURABLE);
 }
 
 /* 10.5.5 step 11, the arm taken when the trap returned undefined, given the target facts steps 10 and 11.c
    produced. `extensible` is consulted only when js_proxy_gopd_needs_ext said it would be.
    0 = the property is absent, -1 = threw. */
-static int js_proxy_gopd_absent(JSContext *ctx, int td_ret, int td_flags, int extensible)
+static int js_proxy_gopd_absent(JSContext *ctx, const JSDescFacts *tf, int extensible)
 {
-    if (!td_ret)
+    if (tf->flags < 0)
         return 0;                                          /* step 11.a */
-    if (!(td_flags & JS_PROP_CONFIGURABLE))                /* step 11.b */
+    if (!(tf->flags & JS_PROP_CONFIGURABLE))               /* step 11.b */
         goto fail;
     if (!extensible)                                       /* step 11.d, on 11.c's IsExtensible(target) */
         goto fail;
@@ -82647,10 +82736,12 @@ fail:
 
 /* 10.5.5 steps 14-17, on the PARSED descriptor. CONSUMES result_desc. Returns 1 with *pdesc filled, -1 having
    thrown. */
-static int js_proxy_gopd_post(JSContext *ctx, JSPropertyDescriptor *presult, int target_desc_flags,
-                              int target_desc_ret, int extensible_target, JSPropertyDescriptor *pdesc)
+static int js_proxy_gopd_post(JSContext *ctx, JSPropertyDescriptor *presult, const JSDescFacts *tf,
+                              int extensible_target, JSPropertyDescriptor *pdesc)
 {
     JSPropertyDescriptor result_desc = *presult;
+    int target_desc_ret = (tf->flags >= 0);
+    int target_desc_flags = target_desc_ret ? tf->flags : 0;
     int flags1;
     {
         /* js_obj_to_desc reads a descriptor OBJECT and reports which fields were PRESENT (JS_PROP_HAS_*); a
@@ -82669,10 +82760,26 @@ static int js_proxy_gopd_post(JSContext *ctx, JSPropertyDescriptor *presult, int
                 flags1 |= JS_PROP_HAS_GET | JS_PROP_HAS_SET;
             else
                 flags1 |= JS_PROP_HAS_VALUE | JS_PROP_HAS_WRITABLE;
-            /* XXX: not complete check: need to compare value &
-               getter/setter as in defineproperty */
             if (!check_define_prop_flags(target_desc_flags, flags1))
                 goto fail1;
+            /* IsCompatiblePropertyDescriptor's other half. check_define_prop_flags is the FLAG comparison, and
+               that was all this step did — the trap could report any value it liked for a property the target
+               pins. ValidateAndApplyPropertyDescriptor 4.d.i-ii and 4.e.ii are the SameValue tests on the
+               contents, and the trap result is a COMPLETED descriptor so every field it needs is present. */
+            if (!(target_desc_flags & JS_PROP_CONFIGURABLE)) {
+                if ((target_desc_flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
+                    DCHECK(result_desc.flags & JS_PROP_GETSET,
+                           "the flag check already rejected a data descriptor against an accessor target");
+                    if (!js_same_value(ctx, result_desc.getter, tf->getter) ||
+                        !js_same_value(ctx, result_desc.setter, tf->setter))
+                        goto fail1;
+                } else if (!(target_desc_flags & JS_PROP_WRITABLE)) {
+                    DCHECK(!(result_desc.flags & JS_PROP_GETSET),
+                           "the flag check already rejected an accessor descriptor against a data target");
+                    if (!js_same_value(ctx, result_desc.value, tf->value))
+                        goto fail1;
+                }
+            }
         } else {
             if (!extensible_target)
                 goto fail1;
@@ -90677,13 +90784,12 @@ static JSValue js_typed_array_with_build(JSContext *ctx, JSValueConst this_val, 
         JS_FreeValue(ctx, val);
         return JS_EXCEPTION;
     }
-    /* re-validate after user code (spec step 9: IsValidIntegerIndex) */
-    if (typed_array_is_oob(p)) {
-        JS_FreeValue(ctx, val);
-        return JS_ThrowTypeErrorArrayBufferOOB(ctx);
-    }
+    /* Step 9 is ONE predicate — IsValidIntegerIndex(O, actualIndex) — and its failure is ONE error. A detached or
+       out-of-bounds view makes it false at its first clause exactly as an out-of-range index does at its last, so
+       `ta.with(0, {valueOf(){ detach(ta.buffer); return 0 }})` is a RangeError. Splitting the OOB clause out into
+       a TypeError of its own answered a step the spec does not have. */
     newlen = p->u.array.count;
-    if (idx < 0 || idx >= newlen) {
+    if (typed_array_is_oob(p) || idx < 0 || idx >= newlen) {
         JS_FreeValue(ctx, val);
         return JS_ThrowRangeError(ctx, "invalid typed array index");
     }
@@ -90705,12 +90811,10 @@ static JSValue js_typed_array_with_build(JSContext *ctx, JSValueConst this_val, 
         JS_FreeValue(ctx, arr);
         return JS_EXCEPTION;
     }
-    if (typed_array_is_oob(p)) {
-        JS_FreeValue(ctx, val);
-        JS_FreeValue(ctx, buffer);
-        JS_FreeValue(ctx, arr);
-        return JS_ThrowTypeErrorArrayBufferOOB(ctx);
-    }
+    /* Steps 10-11 (TypedArrayCreateSameType with an undefined new_target, then the backing buffer) run NO page
+       code, so the view step 9 just validated cannot have become out-of-bounds underneath them. This was a
+       second OOB test answering a step that does not exist; the invariant is what it was really asserting. */
+    DCHECK(!typed_array_is_oob(p), "the source view went out of bounds with no page code in between");
     abuf = JS_GetOpaque(buffer, JS_CLASS_ARRAY_BUFFER);
     if (typed_array_init(ctx, arr, buffer, 0, len, /*track_rab*/false)) {
         JS_FreeValue(ctx, val);
@@ -91545,12 +91649,7 @@ static int js_ta_idx_step(JSContext *ctx, void *st, JSValue cb_result, JSValue *
                 s->hdr.stage = 4;
                 JS_FreeValue(ctx, s->el);     /* the OBJECT the primitive came from; cb_coerce only borrowed it */
                 s->el = JS_UNDEFINED;
-                p = get_typed_array(ctx, s->hdr.this_val);
-                if (p && !typed_array_is_oob(p)) {
-                    if (JS_SetPropertyUint32(ctx, s->hdr.this_val, s->idx + s->i, cb_result) < 0) return -1;
-                } else {
-                    JS_FreeValue(ctx, cb_result);
-                }
+                if (JS_SetPropertyUint32(ctx, s->hdr.this_val, s->idx + s->i, cb_result) < 0) return -1;
                 cb_result = JS_UNDEFINED;
                 s->i++;
             }
@@ -91564,24 +91663,26 @@ static int js_ta_idx_step(JSContext *ctx, void *st, JSValue cb_result, JSValue *
                 s->hdr.stage = 4;
             }
         ta_have_element:
-            /* Per spec, detaching mid-iteration is allowed and must not throw: iterating the SOURCE is
-               observable, so the walk continues and only the stores stop. */
+            /* TypedArraySetElement (10.4.5.16) is TWO steps and only the SECOND one is conditional: the value is
+               coerced to the target's content type FIRST -- ? ToBigInt for a BigInt view, ? ToNumber otherwise --
+               and only then does IsValidIntegerIndex decide whether the store happens. Skipping the whole
+               element when the view has gone out of bounds skipped the COERCION too, so
+               `bigIntTA.set({get length(){ detach(); return 1 }, 0: {valueOf: () => "huzzah!"}})` threw nothing
+               where ToBigInt owes a SyntaxError. The write path already coerces before it range-checks, and an
+               out-of-bounds index is not an error there -- which is exactly the spec's shape, so the guard is
+               not needed for the store either. */
             if (JS_VALUE_GET_TAG(s->el) == JS_TAG_OBJECT) {
                 s->hdr.stage = 5;
                 s->hdr.cb_coerce[0] = s->el;   /* borrowed: the state holds it */
                 *out_cb = s->hdr.cb_coerce; *out_argc = HINT_NUMBER;
                 return 5;
             }
-            p = get_typed_array(ctx, s->hdr.this_val);
-            if (p && !typed_array_is_oob(p)) {
-                if (JS_SetPropertyUint32(ctx, s->hdr.this_val, s->idx + s->i, s->el) < 0) {
-                    s->el = JS_UNDEFINED;
+            {
+                JSValue el = s->el;
+                s->el = JS_UNDEFINED;
+                if (JS_SetPropertyUint32(ctx, s->hdr.this_val, s->idx + s->i, el) < 0)
                     return -1;
-                }
-            } else {
-                JS_FreeValue(ctx, s->el);
             }
-            s->el = JS_UNDEFINED;
             s->i++;
         }
     }
@@ -92181,7 +92282,9 @@ static JSValue js_typed_array_constructor_ta(JSContext *ctx, JSValueConst new_ta
     return js_ta_copy_finish(ctx, obj, src_obj, classid, len);
 }
 
-static int js_ta_view_plan(JSContext *ctx, JSTAViewPlan *pl, int argc, JSValueConst *argv, int classid);
+static int ta_view_offset(JSContext *ctx, JSValueConst byte_offset, int size_log2, uint64_t *poffset);
+static int js_ta_view_plan(JSContext *ctx, JSTAViewPlan *pl, int argc, JSValueConst *argv, int classid,
+                           uint64_t offset);
 static JSValue js_ta_view_finish(JSContext *ctx, JSValue obj, JSTAViewPlan *pl);
 
 /* The buffer branch's two coercions, as requests. Reached ONLY with an ArrayBuffer first argument
@@ -92189,7 +92292,13 @@ static JSValue js_ta_view_finish(JSContext *ctx, JSValue obj, JSTAViewPlan *pl);
    js_typed_array_constructor_obj DFAIL stays unreachable. The body is not a legacy twin: with both operands
    primitive its JS_ToIndex calls invoke nothing, which is exactly what this entry asserts, and it keeps its C
    entry because six internal callers construct typed arrays with operands the engine itself made. */
-enum { TAC_START = 0, TAC_OFFSET, TAC_LENGTH, TAC_PROTO };
+/* 23.2.5.1 branches on WHAT the first argument is, and the two arms order their user code oppositely: an
+   OBJECT first argument reaches step 6.b.i, which ALLOCATES -- reading NewTarget.prototype -- before
+   InitializeTypedArrayFromArrayBuffer coerces a byteOffset or looks at the buffer at all; a PRIMITIVE one
+   reaches step 6.c.ii, whose ToIndex runs first and whose allocation is last. One order was implemented for
+   both, so `Reflect.construct(Int32Array, [buffer, poisoned, 0], ctorWithThrowingPrototype)` reported the
+   byteOffset's throw where the spec reports the prototype getter's. */
+enum { TAC_START = 0, TAC_PROTO_EARLY, TAC_OFFSET, TAC_LENGTH, TAC_PROTO };
 
 static int js_ta_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
@@ -92201,23 +92310,33 @@ static int js_ta_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
         JS_FreeValue(ctx, cb_result);
         cb_result = JS_UNDEFINED;
         s->result = JS_UNDEFINED;
+        s->proto = JS_UNDEFINED;
+        s->offset = 0;
         for (i = 0; i < 3; i++)
             s->argp[i] = js_dup(step_arg(&s->hdr, i));
         DCHECK(ta_buffer_ctor_ready((JSValueConst *)s->argp, s->hdr.argc > 0 ? s->hdr.argc : 1),
                "the TypedArray view entry was reached with a source the consume walk owns");
-        s->hdr.stage = TAC_OFFSET;
-        if (JS_VALUE_GET_TAG(s->argp[0]) == JS_TAG_OBJECT
-            && is_typed_array(JS_VALUE_GET_OBJ(s->argp[0])->class_id)) {
-            /* 23.2.5.1 step 5: a TYPED-ARRAY source takes no byteOffset or length, so it coerces nothing — its
-               only user code is the `prototype` read the shared tail performs. The element count is read HERE,
-               before that read, which is where the C body read it. */
-            s->is_copy = 1;
-            s->src_len = JS_VALUE_GET_OBJ(s->argp[0])->u.array.count;
+        if (JS_VALUE_GET_TAG(s->argp[0]) != JS_TAG_OBJECT) {
+            /* step 6.c: ToIndex(firstArgument) THEN AllocateTypedArray. The argument is already primitive, so
+               that ToIndex invokes nothing and the plan in the tail performs it. */
+            s->hdr.stage = TAC_OFFSET;
             goto have_length;
         }
-        if (JS_VALUE_GET_TAG(s->argp[0]) != JS_TAG_OBJECT)
-            goto have_length;                /* the element-count form coerces nothing here: its argument is
-                                                already primitive, and ToIndex on a primitive invokes nothing */
+        s->is_copy = is_typed_array(JS_VALUE_GET_OBJ(s->argp[0])->class_id);
+        s->hdr.stage = TAC_PROTO_EARLY;
+        cb_result = JS_UNDEFINED;
+    }
+    if (s->hdr.stage == TAC_PROTO_EARLY) {
+        /* step 6.b.i AllocateTypedArray: NewTarget.prototype is an ordinary [[Get]] a Proxy traps, and for an
+           object first argument it is the FIRST page code the constructor runs. */
+        r = step_proto_from_ctor_run(ctx, &s->hdr, s->hdr.this_val, s->hdr.arg, cb_result, &s->proto,
+                                     out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->proto_read = 1;
+        s->hdr.stage = TAC_OFFSET;
+        if (s->is_copy)
+            goto have_length;                /* InitializeTypedArrayFromTypedArray coerces nothing */
         if (JS_VALUE_GET_TAG(s->argp[1]) != JS_TAG_OBJECT)
             goto have_offset;                /* already primitive: its ToIndex invokes nothing */
         r = step_toprim_run(ctx, &s->hdr, s->argp[1], HINT_NUMBER, JS_UNDEFINED, &cb_result, out_cb, out_argc);
@@ -92232,8 +92351,11 @@ static int js_ta_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
         s->argp[1] = prim;                   /* the primitive REPLACES the operand the body reads */
     have_offset:
         s->hdr.stage = TAC_LENGTH;
-        /* step 6.b.iii reads the length only when it is not undefined, and only AFTER the offset's own coercion —
-           which is why it is a stage of its own rather than a second bit in one mask. */
+        /* Steps 2-3 HERE, not in the plan: the alignment RangeError is ordered before step 5's ToIndex(length),
+           and that ToIndex may need a ToPrimitive this machine can only perform as a request. Which is also why
+           the length is a stage of its own rather than a second bit in one mask. */
+        if (ta_view_offset(ctx, s->argp[1], typed_array_size_log2(s->hdr.arg), &s->offset) < 0)
+            return -1;
         if (JS_IsUndefined(s->argp[2]) || JS_VALUE_GET_TAG(s->argp[2]) != JS_TAG_OBJECT)
             goto have_length;
         r = step_toprim_run(ctx, &s->hdr, s->argp[2], HINT_NUMBER, JS_UNDEFINED, &cb_result, out_cb, out_argc);
@@ -92257,25 +92379,32 @@ static int js_ta_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
         cb_result = JS_UNDEFINED;
     }
     {
-        /* The plan runs FIRST and holds an owned buffer across the read, because every ToIndex and range check it
-           performs is ordered BEFORE 10.1.14 by the spec — a Symbol element count throws ToIndex's TypeError, and a
-           detached buffer throws, before new.target's prototype getter is allowed to run. Then the read itself:
-           an ordinary [[Get]] a Proxy traps, which js_create_from_ctor performed from C. */
-        JSValue proto = JS_UNDEFINED, obj;
+        /* Every operand is primitive now, so the plan's ToIndex and range checks invoke nothing and can run
+           wherever the spec puts them: AFTER the allocation for an object first argument (the read already
+           happened), BEFORE it for the element-count form, whose ToIndex is step 6.c.ii. */
+        JSValue proto, obj;
         if (!s->planned && !s->is_copy) {
-            if (js_ta_view_plan(ctx, &s->plan, s->hdr.argc, (JSValueConst *)s->argp, s->hdr.arg) < 0)
+            if (js_ta_view_plan(ctx, &s->plan, s->hdr.argc, (JSValueConst *)s->argp, s->hdr.arg, s->offset) < 0)
                 return -1;
             s->planned = 1;
         }
-        r = step_proto_from_ctor_run(ctx, &s->hdr, s->hdr.this_val, s->hdr.arg, cb_result, &proto,
-                                     out_cb, out_argc);
-        if (r) return r < 0 ? -1 : r;
+        if (s->proto_read) {
+            proto = s->proto; s->proto = JS_UNDEFINED;
+        } else {
+            proto = JS_UNDEFINED;
+            r = step_proto_from_ctor_run(ctx, &s->hdr, s->hdr.this_val, s->hdr.arg, cb_result, &proto,
+                                         out_cb, out_argc);
+            if (r) return r < 0 ? -1 : r;
+        }
         obj = JS_NewObjectProtoClass(ctx, proto, s->hdr.arg);
         JS_FreeValue(ctx, proto);
         if (JS_IsException(obj))
             return -1;
         if (s->is_copy) {
-            s->result = js_ta_copy_finish(ctx, obj, s->argp[0], s->hdr.arg, s->src_len);
+            /* InitializeTypedArrayFromTypedArray reads the source's length AFTER the allocation, so a
+               `prototype` getter that resizes or detaches the source is observed by this read. */
+            JSObject *sp0 = JS_VALUE_GET_OBJ(s->argp[0]);
+            s->result = js_ta_copy_finish(ctx, obj, s->argp[0], s->hdr.arg, sp0->u.array.count);
         } else {
             s->planned = 0;                  /* the finish takes the plan's buffer */
             s->result = js_ta_view_finish(ctx, obj, &s->plan);
@@ -92284,14 +92413,16 @@ static int js_ta_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
     return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
 }
 
-/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The three operands with their coerced primitives in place,
-   and — only once the plan has been made — the buffer that plan holds across the `prototype` read. `planned` is
-   that condition, which is why the buffer is an `if` around the visit rather than a field in a list. */
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The three operands with their coerced primitives in place, the
+   allocation's prototype when it was read first, and — only once the plan has been made — the buffer that plan
+   holds. `planned` is that condition, which is why the buffer is an `if` around the visit rather than a field in
+   a list; `proto` needs no such guard because it is UNDEFINED until it is read. */
 static void js_ta_ctor_visit(JSContext *ctx, void *st, JSStepVisit *v)
 {
     JSTACtor *s = st;
     int i;
     v->val(ctx, &s->result);
+    v->val(ctx, &s->proto);
     for (i = 0; i < 3; i++) v->val(ctx, &s->argp[i]);
     if (s->planned) v->val(ctx, &s->plan.buffer);
 }
@@ -92324,13 +92455,29 @@ _Static_assert(JS_TYPED_ARRAY_COUNT == 12,
    every ToIndex and every range check the spec puts BEFORE the `prototype` read. Splitting here is what lets the
    routed entry perform that read as a request without moving it: a Symbol element count must throw ToIndex's
    TypeError before new.target's prototype getter runs, and a detached buffer must throw before it too. */
-static int js_ta_view_plan(JSContext *ctx, JSTAViewPlan *pl, int argc, JSValueConst *argv, int classid)
+/* InitializeTypedArrayFromArrayBuffer steps 2-3, ALONE. They are their own function because the spec runs them
+   before step 5's ToIndex(length), and that ToIndex may need a ToPrimitive the machine can only perform as a
+   request — so `new Int32Array(buffer, 1, {valueOf(){ throw }})` must report the misaligned offset's RangeError
+   and never reach the length at all. */
+static int ta_view_offset(JSContext *ctx, JSValueConst byte_offset, int size_log2, uint64_t *poffset)
+{
+    if (JS_ToIndex(ctx, poffset, byte_offset))
+        return -1;
+    if ((*poffset & (((uint64_t)1 << size_log2) - 1)) != 0) {
+        JS_ThrowRangeError(ctx, "invalid offset");
+        return -1;
+    }
+    return 0;
+}
+
+static int js_ta_view_plan(JSContext *ctx, JSTAViewPlan *pl, int argc, JSValueConst *argv, int classid,
+                           uint64_t offset)
 {
     bool track_rab = false;
     JSValue buffer;
     JSArrayBuffer *abuf;
     int size_log2;
-    uint64_t len, offset;
+    uint64_t len;
 
     size_log2 = typed_array_size_log2(classid);
     if (JS_VALUE_GET_TAG(argv[0]) != JS_TAG_OBJECT) {
@@ -92344,31 +92491,35 @@ static int js_ta_view_plan(JSContext *ctx, JSTAViewPlan *pl, int argc, JSValueCo
         JSObject *p = JS_VALUE_GET_OBJ(argv[0]);
         DCHECK(p->class_id == JS_CLASS_ARRAY_BUFFER || p->class_id == JS_CLASS_SHARED_ARRAY_BUFFER,
                "the view plan was handed a source the consume walk or the typed-array copy owns");
+        uint64_t elem_size = (uint64_t)1 << size_log2, buf_len;
+        bool fixed_length;
         abuf = p->u.array_buffer;
-        if (JS_ToIndex(ctx, &offset, argv[1]))
+        /* InitializeTypedArrayFromArrayBuffer steps 4-10, in the order it states them. Every operand reaching
+           here is already primitive, so no page code runs BETWEEN these steps — what the order decides is WHICH
+           error a bad call reports, and testing detachment before the alignment made
+           `new Int32Array(detachedBuffer, 1, 0)` answer the TypeError of step 6 where the spec answers the
+           RangeError of step 3. */
+        DCHECK((offset & (elem_size - 1)) == 0,
+               "steps 2-3 ran before the length was coerced; the offset reaching the plan is already aligned");
+        fixed_length = !array_buffer_is_resizable(abuf);        /* step 4 */
+        if (!JS_IsUndefined(argv[2]) && JS_ToIndex(ctx, &len, argv[2]))   /* step 5 */
             return -1;
-        if (abuf->detached) {
+        if (abuf->detached) {                                   /* step 6 */
             JS_ThrowTypeErrorDetachedArrayBuffer(ctx);
             return -1;
         }
-        if ((offset & ((1 << size_log2) - 1)) != 0 || offset > abuf->byte_length) {
-            JS_ThrowRangeError(ctx, "invalid offset");
-            return -1;
-        }
+        buf_len = abuf->byte_length;                            /* step 7 */
         if (JS_IsUndefined(argv[2])) {
-            track_rab = array_buffer_is_resizable(abuf);
-            if (!track_rab)
-                if ((abuf->byte_length & ((1 << size_log2) - 1)) != 0)
-                    goto invalid_length;
-            len = (abuf->byte_length - offset) >> size_log2;
+            track_rab = !fixed_length;
+            /* step 8 for a length-tracking view, step 9 for a fixed one: the first only requires the offset to
+               be inside the buffer, the second also requires the WHOLE buffer to divide into elements. */
+            if (fixed_length && (buf_len & (elem_size - 1)) != 0)
+                goto invalid_length;
+            if (offset > buf_len)
+                goto invalid_length;
+            len = (buf_len - offset) >> size_log2;
         } else {
-            if (JS_ToIndex(ctx, &len, argv[2]))
-                return -1;
-            if (abuf->detached) {
-                JS_ThrowTypeErrorDetachedArrayBuffer(ctx);
-                return -1;
-            }
-            if ((offset + (len << size_log2)) > abuf->byte_length) {
+            if ((offset + (len << size_log2)) > buf_len) {       /* step 10.b */
             invalid_length:
                 JS_ThrowRangeError(ctx, "invalid length");
                 return -1;
@@ -92432,6 +92583,7 @@ static JSValue js_typed_array_constructor(JSContext *ctx,
 {
     JSTAViewPlan pl;
     JSValue obj;
+    uint64_t offset = 0;
 
     if (JS_VALUE_GET_TAG(argv[0]) == JS_TAG_OBJECT) {
         JSObject *p = JS_VALUE_GET_OBJ(argv[0]);
@@ -92440,8 +92592,10 @@ static JSValue js_typed_array_constructor(JSContext *ctx,
                 return js_typed_array_constructor_ta(ctx, new_target, argv[0], classid, p->u.array.count);
             return js_typed_array_constructor_obj(ctx, new_target, argv[0], classid);
         }
+        if (ta_view_offset(ctx, argv[1], typed_array_size_log2(classid), &offset) < 0)
+            return JS_EXCEPTION;
     }
-    if (js_ta_view_plan(ctx, &pl, argc, argv, classid) < 0)
+    if (js_ta_view_plan(ctx, &pl, argc, argv, classid, offset) < 0)
         return JS_EXCEPTION;
     obj = js_create_from_ctor(ctx, new_target, classid);
     if (JS_IsException(obj)) {

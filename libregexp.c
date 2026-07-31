@@ -2844,25 +2844,51 @@ static int re_parse_disjunction(REParseState *s, bool is_backward_dir)
    successors it always had. */
 
 /* Does this character opcode have ANY alternative a one-byte subject could supply? */
-static bool re_op_matches_latin1(const uint8_t *bc, int pos)
+/* WHAT A ONE-BYTE SUBJECT UNIT CAN PRESENT TO A COMPARISON. Without ignoreCase that is the unit itself, so an
+   operand above 0xFF is unreachable. WITH ignoreCase the executor compares Canonicalize(unit) against the
+   already-canonicalised operand, and Canonicalize maps SEVERAL Latin-1 units ABOVE Latin-1: micro sign U+00B5
+   uppercases to U+039C, y-with-diaeresis U+00FF to U+0178. Testing the raw operand against 0xFF therefore
+   pruned real matches — `/\u039C/i.test("\xB5")` answered false — so the question is asked the only way that
+   is exact: run the real Canonicalize over all 256 units and see whether any lands in [lo,hi]. */
+static bool re_latin1_canon_hits(uint32_t lo, uint32_t hi, bool ignore_case, bool is_unicode)
+{
+    uint32_t c;
+    if (!ignore_case)
+        return lo <= 0xff;
+    for (c = 0; c <= 0xff; c++) {
+        uint32_t k = (uint32_t)lre_canonicalize(c, is_unicode);
+        if (k >= lo && k <= hi)
+            return true;
+    }
+    return false;
+}
+
+static bool re_op_matches_latin1(const uint8_t *bc, int pos, bool is_unicode)
 {
     int opcode = bc[pos];
-    uint32_t n, i, lo;
+    uint32_t n, i, lo, hi;
 
     switch (opcode) {
     case REOP_char:
-    case REOP_char_i:
         return get_u16(bc + pos + 1) <= 0xff;
+    case REOP_char_i:
+        lo = get_u16(bc + pos + 1);
+        return re_latin1_canon_hits(lo, lo, true, is_unicode);
     case REOP_char32:
-    case REOP_char32_i:
         return get_u32(bc + pos + 1) <= 0xff;
+    case REOP_char32_i:
+        lo = get_u32(bc + pos + 1);
+        return re_latin1_canon_hits(lo, lo, true, is_unicode);
     case REOP_range:
     case REOP_range_i:
         n = get_u16(bc + pos + 1);
         for (i = 0; i < n; i++) {
             lo = get_u16(bc + pos + 3 + i * 4);
-            if (lo <= 0xff)
-                return true;      /* the interval starts inside Latin1 */
+            hi = get_u16(bc + pos + 3 + i * 4 + 2);
+            if (hi == 0xffff)
+                hi = UINT32_MAX;          /* re_emit_range's own +infinity spelling */
+            if (re_latin1_canon_hits(lo, hi, opcode == REOP_range_i, is_unicode))
+                return true;
         }
         return false;
     case REOP_range32:
@@ -2870,7 +2896,8 @@ static bool re_op_matches_latin1(const uint8_t *bc, int pos)
         n = get_u16(bc + pos + 1);
         for (i = 0; i < n; i++) {
             lo = get_u32(bc + pos + 3 + i * 8);
-            if (lo <= 0xff)
+            hi = get_u32(bc + pos + 3 + i * 8 + 4);
+            if (re_latin1_canon_hits(lo, hi, opcode == REOP_range32_i, is_unicode))
                 return true;
         }
         return false;
@@ -2881,11 +2908,11 @@ static bool re_op_matches_latin1(const uint8_t *bc, int pos)
 
 /* Is a code unit above 0xFF REQUIRED anywhere in the program? Answered once, at compile time, and recorded in
    the header so an ordinary pattern never pays for the analysis below. */
-static bool re_program_has_non_latin1(const uint8_t *bc, int len)
+static bool re_program_has_non_latin1(const uint8_t *bc, int len, bool is_unicode)
 {
     int pos = 0;
     while (pos < len) {
-        if (!re_op_matches_latin1(bc, pos))
+        if (!re_op_matches_latin1(bc, pos, is_unicode))
             return true;
         pos += re_ins_len(bc, pos);
     }
@@ -2982,7 +3009,7 @@ static bool re_compute_reach(REExecContext *s, const uint8_t *bc, int len, uint8
                 now = (target >= 0 && target < len) ? reach[target] : false;
                 break;
             default:
-                now = re_op_matches_latin1(bc, pos) && nxt < len && reach[nxt];
+                now = re_op_matches_latin1(bc, pos, s->is_unicode) && nxt < len && reach[nxt];
                 break;
             }
             if (now && !reach[pos]) { reach[pos] = 1; changed = 1; }
@@ -3142,7 +3169,7 @@ uint8_t *lre_compile(int *plen, char *error_msg, int error_msg_size,
             s->byte_code.size - RE_HEADER_LEN);
 
     if (re_program_has_non_latin1(s->byte_code.buf + RE_HEADER_LEN,
-                                  s->byte_code.size - RE_HEADER_LEN)) {
+                                  s->byte_code.size - RE_HEADER_LEN, s->is_unicode)) {
         put_u16(s->byte_code.buf + RE_HEADER_FLAGS,
                 lre_get_flags(s->byte_code.buf) | LRE_FLAG_NON_LATIN1);
     }
