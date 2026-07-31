@@ -29877,6 +29877,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            this label exists for. Hand the throw to the machine instead, the same way the SUSPENDED
                            read's delivery does — the consume step owns IfAbruptCloseIterator and closes the source
                            before the exception propagates. */
+                        /* ...unless the read was IteratorComplete's or IteratorValue's. 7.4.9 IteratorStepValue
+                           marks the record [[Done]] for ALL THREE of its abrupts — the `next` call, the `done`
+                           read and the `value` read — and the caller's plain `?` then closes nothing. */
+                        if (((struct JSIterConsume *)gouter)->iterres_ph)
+                            ((struct JSIterConsume *)gouter)->iter_done = 1;
                         cont_st = gouter;
                         ret_val = JS_EXCEPTION;
                         goto do_iter_consume_step;
@@ -38314,7 +38319,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             if (gouter && gk2 == CONT_ITER_CONSUME) {
                 /* the entry's accessor threw: IfAbruptCloseIterator still owes the source a close, and the machine
-                   that asked for the read can never be re-entered — abandon does both. */
+                   that asked for the read can never be re-entered — abandon does both. The ONE read for which it
+                   owes no close is IteratorComplete's or IteratorValue's: 7.4.9 marks the record done there, the
+                   same as for an abrupt `next`, and the abandon reads that flag. */
+                if (((struct JSIterConsume *)gouter)->iterres_ph)
+                    ((struct JSIterConsume *)gouter)->iter_done = 1;
                 js_iter_consume_abandon(ctx, gouter);
             } else if (gouter && gk2 == CONT_STEP && ((JSStepHdr *)gouter)->def->catches_abrupt) {
                 /* the read threw and the machine's own algorithm catches it: hand the exception back to step()
@@ -82410,14 +82419,19 @@ static int js_proxy_define_check(JSContext *ctx, const JSDescFacts *f, JSValueCo
                 goto fail;
         }
     } else if (flags & JS_PROP_HAS_VALUE) {
-        if ((f->flags & (JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)) == JS_PROP_WRITABLE
-            && !(flags & JS_PROP_WRITABLE))
-            goto fail;
-        else if ((f->flags & (JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)) == 0
-                 && !js_same_value(ctx, val, f->value))
+        /* a non-configurable, NON-writable data property pins its value (10.5.6 step 16 ->
+           ValidateAndApplyPropertyDescriptor step 4.d.ii). A non-configurable WRITABLE one does not: its value
+           may change freely, and only its writable BIT is protected — which is the rule below. */
+        if ((f->flags & (JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)) == 0
+            && !js_same_value(ctx, val, f->value))
             goto fail;
     }
-    if (flags & JS_PROP_HAS_WRITABLE) {
+    /* ...and that bit is protected only against a descriptor that actually CARRIES it. Both tests here read the
+       WRITABLE bit without first asking whether the descriptor HAS a [[Writable]] field, and an absent field
+       reads as false — so a value-only descriptor against a non-configurable writable target was rejected.
+       `Reflect.defineProperty(proxyOverArray, "length", {value: 0})` is the shape, and OrdinarySetWithOwnDescriptor
+       builds exactly that descriptor, so every `proxy.length = n` through a forwarding trap threw. */
+    if ((flags & (JS_PROP_HAS_WRITABLE | JS_PROP_WRITABLE)) == JS_PROP_HAS_WRITABLE) {
         if ((f->flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)) == JS_PROP_WRITABLE)
             goto fail;
     }
