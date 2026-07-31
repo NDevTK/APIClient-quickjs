@@ -1274,10 +1274,17 @@ JS_EXTERN int JS_MapDeleteRecord(JSContext *ctx, JSValueConst obj, JSValueConst 
             sp[-2] — this is how `'/api/' + id` carries the URL shape.
      - cmp: propagation through == / === . A concolic operand yields a concolic BOOL carrying the {src,op,tok}
             constraint, so `if (x === 'admin')` FORKS instead of collapsing to a concrete false. is_neq flips
-            the recorded op. */
+            the recorded op.
+     - is:  the domain-carrying PREDICATE, and the reason the other two are ever reached. A concolic value is a
+            real JSObject of a host-registered class, so an operator that asks the raw tag sees an ordinary
+            object and coerces it: 7.1.1 then reads @@toPrimitive/valueOf off the concolic, whose exotic [[Get]]
+            answers with another concolic, and the walk CALLS it. `+` and == must ask this before deciding a
+            coercion applies — the operand is not an ordinary object and its coercion is the solver's, not the
+            page's. Never a binary know-nothing test: it names the solver's value class, nothing more. */
 typedef struct JSConcolicHooks {
     int (*add)(JSContext *ctx, JSValue *sp);
     int (*cmp)(JSContext *ctx, JSValue *sp, int is_neq);
+    int (*is)(JSValueConst v);
 } JSConcolicHooks;
 JS_EXTERN void JS_SetConcolicHooks(const JSConcolicHooks *hooks);
 

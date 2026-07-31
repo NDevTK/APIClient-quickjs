@@ -6471,8 +6471,21 @@ uint32_t JS_ObjFlowGen(JSValueConst obj) {
    bypasses the property path. Installed once by JS_SetTimeTravelHooks. */
 static _Thread_local JSTimeTravelHooks g_time_travel = { NULL, NULL, NULL };
 /* forced-exec CONCOLIC-VALUE hooks (see JSConcolicHooks in quickjs.h): .add propagates a concolic value through
-   `+` (js_add_slow), .cmp through == / === . One struct, installed by JS_SetConcolicHooks. */
-static _Thread_local JSConcolicHooks g_concolic = { NULL, NULL };
+   `+` (js_add_slow), .cmp through == / === , .is names the solver's value class. One struct, installed by
+   JS_SetConcolicHooks. */
+static _Thread_local JSConcolicHooks g_concolic = { NULL, NULL, NULL };
+
+/* 7.1.1 ToPrimitive is defined over ORDINARY objects. A CONCOLIC operand is not one: it is the solver's value
+   class standing for unknown external input, and its coercion belongs to the concolic hooks — opacity SURVIVES
+   coercion so the operand keeps forking control flow instead of collapsing. Routing one into the walk reads
+   @@toPrimitive off it, gets a derived concolic back from its exotic [[Get]], and calls that — "not a function"
+   in the page, from an operator the page never wrote. So an operator asks THIS where it would have asked the
+   raw tag, and the concolic reaches the operator's slow path where the .add / .cmp hook already is.
+   do_toprim_tramp asserts the other side of this: no concolic may reach the walk. */
+static bool js_toprim_operand(JSValueConst v)
+{
+    return JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && !(g_concolic.is && g_concolic.is(v));
+}
 /* Ask the host to record an object's pre-write state (for per-flow revert). Whether a FLOW_LOCAL object is
    skipped is decided by the HOST hook, NOT here: a snapshot fork SHARES the parent frame's flow_local objects
    with the sibling, so once a flow has forked those objects are shared and their mutations MUST be captured. The
@@ -17801,6 +17814,17 @@ typedef struct JSTrampStepDef {
        serve %Iterator.prototype%'s two accessors and Error.prototype.stack. 0 (JS_CLASS_OBJECT) for every other
        definition; those machines never read it. */
     int      home_class;
+    /* DEEP-FORK. A concolic branch inside a CALLBACK forks the flow at that depth, so the sibling needs its own
+       copy of the machine driving the callback — `[1,2].forEach(e => cfg.admin ? …)` is the ordinary case, and
+       without it the two arms share one accumulator. The generic half (the whole allocation, every reference the
+       HEADER owns, and the offsets of `argv` and any cb buffer) is tramp_step_state_clone's, because it is the
+       same at every machine. THIS is the half that is not: only the machine knows which of its own fields are
+       OWNED — take a second reference, deep-copy a buffer — and which are BORROWED views of its cb array or of
+       the header's captures, where a dup would be an over-count. `st` is the fresh byte-copy: dup in place.
+       Returns 0, or -1 having taken NOTHING (the caller releases the header and drops the copy without running
+       fini, so a partial take would double-free). A machine with no clone is a capability that has not been
+       built and says so at the fork; declaring one is part of declaring the machine. */
+    int      (*clone)(JSContext *ctx, void *st);
 } JSTrampStepDef;
 /* The SINK a consuming builtin declares at its definition, or -1. The same shape as tramp_step_def_of: the
    callee carries the capability, so the interpreter asks one question rather than testing it against a list of
@@ -18932,12 +18956,14 @@ static int step_length_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSVal
     return step_getlen_run(ctx, h, obj, JS_ATOM_length, in, plen, out_cb, out_argc);
 }
 
-static JSValue tramp_step_state_free(JSContext *ctx, void *st, bool take_result)
+/* Release everything the HEADER owns, leaving the machine-private half alone. Split out because the CLONE's
+   failure path needs exactly this and nothing else: the byte-copy's private fields are still unowned second
+   references at that point, so running fini over them would free the ORIGINAL machine's values. One
+   implementation, so the two cannot drift as the header grows. */
+static JSValue tramp_step_state_free(JSContext *ctx, void *st, bool take_result);
+static void tramp_step_hdr_release(JSContext *ctx, JSStepHdr *h)
 {
-    JSStepHdr *h = st;
     int i;
-    if (!take_result && h->coercing && h->def->onerror)
-        h->def->onerror(ctx, h->this_val, h->def->body_magic);   /* BEFORE the receiver is released */
     JS_FreeValue(ctx, h->this_val);
     JS_FreeValue(ctx, h->func_obj);
     JS_FreeValue(ctx, h->coerce);   /* set only while a prologue coercion is in flight */
@@ -18958,7 +18984,59 @@ static JSValue tramp_step_state_free(JSContext *ctx, void *st, bool take_result)
     h->argc = 0;                     /* fini frees the block; nothing may read the captures after this */
     h->this_val = JS_UNDEFINED;
     h->func_obj = JS_UNDEFINED;
+}
+
+static JSValue tramp_step_state_free(JSContext *ctx, void *st, bool take_result)
+{
+    JSStepHdr *h = st;
+    if (!take_result && h->coercing && h->def->onerror)
+        h->def->onerror(ctx, h->this_val, h->def->body_magic);   /* BEFORE the receiver is released */
+    tramp_step_hdr_release(ctx, h);
     return h->def->fini(ctx, st, take_result);
+}
+
+/* DEEP-FORK: the sibling flow gets its OWN machine. The generic half is here because it is the same at every
+   one — the whole allocation is byte-copied, which keeps `argv` and the machine's cb buffer at their offsets
+   (the caller relocates the in-flight callback's arg_buf by that same offset), and then every reference the
+   HEADER owns is taken a second time. The private half is the def's `clone`. Returns NULL on OOM or on an
+   unbuilt clone, and the caller aborts the fork rather than sharing a state two flows would both free. */
+static void *tramp_step_state_clone(JSContext *ctx, const void *src)
+{
+    const JSStepHdr *o = src;
+    JSStepHdr *h;
+    size_t sz;
+    int i;
+
+    DCHECK(o->def->clone != NULL,
+           "deep-fork of a step machine with no `clone` in its JSTrampStepDef — declare it beside the machine "
+           "(dup the fields it OWNS, leave the borrowed cb views alone); the sibling flow cannot share a state "
+           "both arms would advance and both would free");
+    DCHECK(o->outer == NULL && o->delegate == NULL,
+           "deep-fork of a step machine that is nested (an outer machine waiting on it, or an inner it has not "
+           "handed over) — the clone must walk the whole chain so the sibling's links point at its OWN copies");
+    if (!o->def->clone) return NULL;
+    sz = STEP_ARGV_OFFSET(o->def->size) + sizeof(JSValue) * (size_t)(o->argc > 0 ? o->argc : 0);
+    h = js_malloc(ctx, sz);
+    if (unlikely(!h)) return NULL;
+    memcpy(h, o, sz);
+    h->argv = (JSValue *)((uint8_t *)h + STEP_ARGV_OFFSET(o->def->size));
+    for (i = 0; i < h->argc; i++) h->argv[i] = js_dup(h->argv[i]);
+    h->this_val = js_dup(h->this_val);
+    h->func_obj = js_dup(h->func_obj);
+    h->coerce = js_dup(h->coerce);
+    h->ctor_ntgt = js_dup(h->ctor_ntgt);   /* UNINITIALIZED is not refcounted, so the absent case needs no test */
+    h->cap_promise = js_dup(h->cap_promise);
+    h->cap_funcs[0] = js_dup(h->cap_funcs[0]);
+    h->cap_funcs[1] = js_dup(h->cap_funcs[1]);
+    if (h->get_atom != JS_ATOM_NULL) h->get_atom = JS_DupAtom(ctx, h->get_atom);
+    if (o->def->clone(ctx, h) < 0) {
+        /* the private half took NOTHING, so releasing the header is the whole undo — running fini here would
+           free the fields still shared with the ORIGINAL machine. */
+        tramp_step_hdr_release(ctx, h);
+        js_free(ctx, h);
+        return NULL;
+    }
+    return h;
 }
 
 struct JSToPrim;
@@ -21376,6 +21454,12 @@ typedef struct JSArrayEvery {
     JSValue def_val;      /* the element being WRITTEN into the result, held across the write (owned) */
     int64_t def_k;        /* its index — captured, because filter's n advances once and the write can suspend */
     uint8_t def_ph;       /* 1 = a write into the result is in flight */
+    /* cb_args[0..2] are BORROWED views for the callback drive, with ONE exception: the TypedArray-filter
+       writeback holds an OWNED [dest, `set`, collected] there across the call to the destination's `set`. That
+       is a fact about the three slots, so it is a flag on them and not something inferred from a stage — the
+       stage advances before the values are stored, and a teardown between the two would have released the
+       BORROWED values still sitting there. Both the teardown and the deep-fork clone read this. */
+    uint8_t cb_owned;
 } JSArrayEvery;
 /* Array iteration builtins (forEach/map/every/some/filter) drive a JS callback from a C loop — the
    CONTINUATION-HOLDING re-entrant. They are a step machine, so that drive runs on the tramp chain: each callback
@@ -27722,6 +27806,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (unlikely(!tp)) { JS_ThrowOutOfMemory(ctx); goto exception; }
                 tp->outer = tp_outer; tp->outer_kind = tp_outer_kind;
                 tp->obj = js_dup(tp_outer ? tp_value : sp[tp_slot]);
+                /* The other side of js_toprim_operand, asserted where the walk BEGINS rather than at each of the
+                   eighteen sites that can reach it: a concolic here means this site has no concolic semantics
+                   yet (unary arithmetic and ToNumber, a property KEY, `in`, `delete`, an import specifier, a
+                   coercing builtin). Each is a capability to BUILD — what the operator does with unknown
+                   external input — and it crashes naming itself instead of minting a concolic @@toPrimitive and
+                   throwing "not a function" inside the page's own expression. */
+                DCHECK(!(g_concolic.is && g_concolic.is(tp->obj)),
+                       "a CONCOLIC operand reached 7.1.1 ToPrimitive — this coercion site has no concolic "
+                       "semantics yet; give the operator its concolic result (the .add/.cmp hooks' shape) and "
+                       "have the site ask js_toprim_operand instead of the raw object tag");
                 DCHECK(tp_outer != NULL || tp_op_byte != NULL,
                        "an operand-mode ToPrimitive reached the tramp with no opcode byte — the site must set "
                        "tp_op_byte, which is what the delivery restores `opcode` from");
@@ -36283,8 +36377,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        survive a suspension; reloading from the stack is restoring state, not re-executing. */
                     op1 = sp[-2];
                     op2 = sp[-1];
-                    if (JS_VALUE_GET_TAG(op1) == JS_TAG_OBJECT || JS_VALUE_GET_TAG(op2) == JS_TAG_OBJECT) {
-                        tp_slot = (JS_VALUE_GET_TAG(op1) == JS_TAG_OBJECT) ? -2 : -1;
+                    if (js_toprim_operand(op1) || js_toprim_operand(op2)) {
+                        tp_slot = js_toprim_operand(op1) ? -2 : -1;
                         tp_hint = HINT_NONE;
                         /* OP_add is one byte; OP_add_loc carries its local index, so its own byte is one
                            further back. Both are read from the bytecode, not carried in a C local. */
@@ -36875,9 +36969,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     break;
                 }
                 if (chint >= 0
-                    && (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT
-                        || JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT)) {
-                    tp_slot = (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT) ? -2 : -1;
+                    && (js_toprim_operand(sp[-2]) || js_toprim_operand(sp[-1]))) {
+                    tp_slot = js_toprim_operand(sp[-2]) ? -2 : -1;
                     tp_hint = chint;
                     tp_op_byte = pc - 1;
                     tp_resume_at = TPR_CMP_AFTER_COERCE;
@@ -36893,7 +36986,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    user code and step 11 then coerces the object anyway. */
                 if (chint == HINT_LOOSE_EQ) {
                     int lt1 = JS_VALUE_GET_TAG(sp[-2]), lt2 = JS_VALUE_GET_TAG(sp[-1]);
-                    bool lo1 = (lt1 == JS_TAG_OBJECT), lo2 = (lt2 == JS_TAG_OBJECT);
+                    bool lo1 = js_toprim_operand(sp[-2]), lo2 = js_toprim_operand(sp[-1]);
                     int lother = lo1 ? lt2 : lt1;
                     if (lo1 != lo2
                         && (tag_is_number(lother) || tag_is_string(lother)
@@ -39150,19 +39243,28 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                 ct->cont_state = ns;
                 if (otf->sf.arg_buf == &os->cb_args[2])
                     ct->sf.arg_buf = &ns->cb_args[2];
+            } else if (otf->cont_kind == CONT_STEP) {
+                /* A STEP MACHINE drove this callback, and the sibling needs its own — two arms of the same
+                   `[1,2].forEach(e => cfg.admin ? …)` must not share one cursor and one result array. The state
+                   is byte-copied and its owned references re-taken (tramp_step_state_clone), which keeps every
+                   internal offset, so the in-flight callback's arg_buf — a borrowed view of the machine's cb
+                   buffer, an EXTERNAL allocation the generic XL relocation does not cover — moves by that same
+                   byte offset. Which fields the machine owns is the DEF's answer, not this driver's. */
+                void *ns = tramp_step_state_clone(ctx, otf->cont_state);
+                if (!ns) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
+                ct->cont_state = ns;
+                {
+                    const JSStepHdr *oh = otf->cont_state;
+                    size_t ssz = STEP_ARGV_OFFSET(oh->def->size) + sizeof(JSValue) * (size_t)(oh->argc > 0 ? oh->argc : 0);
+                    const uint8_t *ob = otf->cont_state;
+                    if ((const uint8_t *)otf->sf.arg_buf >= ob && (const uint8_t *)otf->sf.arg_buf < ob + ssz)
+                        ct->sf.arg_buf = (JSValue *)((uint8_t *)ns + ((const uint8_t *)otf->sf.arg_buf - ob));
+                }
             } else {
-                /* The two arms that used to stand here cloned JSArrayEvery and JSArrayReduce for the hand-written
-                   array-iteration and reduce drivers. Those drivers are gone, so the arms were unreachable — and
-                   what replaced them, CONT_STEP, has no arm at all. The named capability is a `clone` in
-                   JSTrampStepDef: only the machine knows which of its fields are OWNED (dup them), which are
-                   BORROWED from the caller's stack (plain copy — XL would corrupt an object value), and how to
-                   rebuild its cb_args as borrowed views of the CLONE, after which the in-flight callback's
-                   sf.arg_buf is repointed from &os->cb_args[k] into the clone's. That is per-machine knowledge
-                   the driver cannot synthesise, which is why it belongs in the def and not here. */
                 DCHECK(otf->cont_kind == CONT_NONE,
-                       "clone_deep_flow: deep-fork of a C-continuation callback frame is not built — a step "
-                       "machine needs a `clone` in its JSTrampStepDef (dup the owned fields, rebuild cb_args as "
-                       "borrowed views of the clone, repoint the callback frame's arg_buf into them)");
+                       "clone_deep_flow: deep-fork of a C-continuation callback frame whose kind is neither a "
+                       "step machine nor a Promise executor — give that continuation its own clone arm, as the "
+                       "sibling must not share a state both flows would advance and both would free");
             }
         }
         ct->up = (i == n - 1) ? NULL : ca[i + 1];
@@ -66788,6 +66890,34 @@ static void js_array_every_end(JSContext *ctx, JSArrayEvery *s, bool take_ret)
     JS_FreeValue(ctx, s->obj);
     s->ret = JS_UNDEFINED; s->val = JS_UNDEFINED; s->obj = JS_UNDEFINED;    JS_FreeValue(ctx, s->ta_dest);
     s->ta_dest = JS_UNDEFINED;
+    if (s->cb_owned) {
+        /* the TypedArray-filter writeback's [dest, `set`, collected], held across that call — `set` throwing
+           used to leak all three. */
+        JS_FreeValue(ctx, s->cb_args[0]); JS_FreeValue(ctx, s->cb_args[1]); JS_FreeValue(ctx, s->cb_args[2]);
+        s->cb_args[0] = s->cb_args[1] = s->cb_args[2] = JS_UNDEFINED;
+        s->cb_owned = 0;
+    }
+}
+
+/* DEEP-FORK (JSTrampStepDef.clone): a concolic branch inside the callback forks the flow mid-iteration, so each
+   arm walks the array with its own cursor and its own result. Exactly the fields js_array_every_end releases,
+   taken a second time; cb_args[3..4] are an index and a borrowed view of obj, and cb_args[0..2] are borrowed
+   except in the one stage above. */
+static int js_array_every_clone(JSContext *ctx, void *st)
+{
+    JSArrayEvery *s = st;
+    (void)ctx;
+    s->ret = js_dup(s->ret);
+    s->val = js_dup(s->val);
+    s->obj = js_dup(s->obj);
+    s->def_val = js_dup(s->def_val);
+    s->ta_dest = js_dup(s->ta_dest);
+    if (s->cb_owned) {
+        s->cb_args[0] = js_dup(s->cb_args[0]);
+        s->cb_args[1] = js_dup(s->cb_args[1]);
+        s->cb_args[2] = js_dup(s->cb_args[2]);
+    }
+    return 0;
 }
 
 /* every/some/forEach/map/filter (and their TypedArray twins) as a STEP builtin. js_array_every was ALREADY split
@@ -66840,6 +66970,7 @@ static int js_array_every_vstep(JSContext *ctx, void *st, JSValue cb_result, JSV
         s->cb_args[0] = js_dup(s->ta_dest);
         s->cb_args[1] = m;                    /* owned */
         s->cb_args[2] = js_dup(s->ret);       /* the collected plain array */
+        s->cb_owned = 1;
         *out_cb = s->cb_args; *out_argc = 1;
         return 3;
     }
@@ -66848,6 +66979,7 @@ static int js_array_every_vstep(JSContext *ctx, void *st, JSValue cb_result, JSV
         JS_FreeValue(ctx, s->cb_args[0]); s->cb_args[0] = JS_UNDEFINED;
         JS_FreeValue(ctx, s->cb_args[1]); s->cb_args[1] = JS_UNDEFINED;
         JS_FreeValue(ctx, s->cb_args[2]); s->cb_args[2] = JS_UNDEFINED;
+        s->cb_owned = 0;
         JS_FreeValue(ctx, s->ret);
         s->ret = s->ta_dest;
         s->ta_dest = JS_UNDEFINED;
@@ -66995,6 +67127,19 @@ static void js_array_reduce_end(JSContext *ctx, JSArrayReduce *s, bool take_acc)
     JS_FreeValue(ctx, s->val);
     JS_FreeValue(ctx, s->obj);
     s->acc = JS_UNDEFINED; s->val = JS_UNDEFINED; s->obj = JS_UNDEFINED;
+}
+
+/* DEEP-FORK (JSTrampStepDef.clone): the reducer branches mid-fold, so each arm threads its OWN accumulator
+   across the remaining elements. cb_args is [undefined, func, acc, val, index, obj] — all borrowed views of the
+   header's captures and of the three fields taken here. */
+static int js_array_reduce_clone(JSContext *ctx, void *st)
+{
+    JSArrayReduce *s = st;
+    (void)ctx;
+    s->acc = js_dup(s->acc);
+    s->val = js_dup(s->val);
+    s->obj = js_dup(s->obj);
+    return 0;
 }
 
 /* reduce/reduceRight (+ TypedArray twins) as a STEP builtin. js_array_reduce_recv/seed/step/end and
@@ -67468,15 +67613,15 @@ static const JSTrampStepDef js_str_search_def =
     { sizeof(JSStrMatch), js_str_match_step, js_str_match_fini, JS_ATOM_Symbol_search };
 static const JSTrampStepDef js_str_replace_def         = { sizeof(JSStrReplace), js_str_replace_vstep, js_str_replace_fini, 0 };
 static const JSTrampStepDef js_str_replaceAll_def      = { sizeof(JSStrReplace), js_str_replace_vstep, js_str_replace_fini, 1 };
-static const JSTrampStepDef js_array_every_def     = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_every };
-static const JSTrampStepDef js_array_some_def      = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_some };
-static const JSTrampStepDef js_array_forEach_def   = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_forEach };
-static const JSTrampStepDef js_array_map_def       = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_map };
-static const JSTrampStepDef js_array_filter_def    = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_filter };
-static const JSTrampStepDef js_ta_every_def        = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_every | special_TA };
-static const JSTrampStepDef js_ta_some_def         = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_some | special_TA };
-static const JSTrampStepDef js_ta_forEach_def      = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_forEach | special_TA };
-static const JSTrampStepDef js_ta_map_def          = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_map | special_TA };
+static const JSTrampStepDef js_array_every_def     = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_every, .clone = js_array_every_clone };
+static const JSTrampStepDef js_array_some_def      = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_some, .clone = js_array_every_clone };
+static const JSTrampStepDef js_array_forEach_def   = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_forEach, .clone = js_array_every_clone };
+static const JSTrampStepDef js_array_map_def       = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_map, .clone = js_array_every_clone };
+static const JSTrampStepDef js_array_filter_def    = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_filter, .clone = js_array_every_clone };
+static const JSTrampStepDef js_ta_every_def        = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_every | special_TA, .clone = js_array_every_clone };
+static const JSTrampStepDef js_ta_some_def         = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_some | special_TA, .clone = js_array_every_clone };
+static const JSTrampStepDef js_ta_forEach_def      = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_forEach | special_TA, .clone = js_array_every_clone };
+static const JSTrampStepDef js_ta_map_def          = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_map | special_TA, .clone = js_array_every_clone };
 static const JSTrampStepDef js_ta_sort_def       = { sizeof(JSTASort), js_ta_sort_vstep, js_ta_sort_vfini, 0 };
 static const JSTrampStepDef js_ta_toSorted_def   = { sizeof(JSTASort), js_ta_sort_vstep, js_ta_sort_vfini, 1 };
 static const JSTrampStepDef js_array_sort_def    = { sizeof(JSArraySort), js_array_sort_vstep, js_array_sort_vfini, 0 };
@@ -68223,11 +68368,11 @@ static const JSTrampStepDef js_function_apply_def = { sizeof(JSFuncApply), js_fu
 static const JSTrampStepDef js_reflect_apply_def  = { sizeof(JSFuncApply), js_function_apply_step, js_function_apply_fini, 1 };
 static const JSTrampStepDef js_reflect_construct_def = { sizeof(JSFuncApply), js_reflect_construct_step, js_function_apply_fini, 0 };
 static const JSTrampStepDef js_array_tostring_def = { sizeof(JSArrayToString), js_array_tostring_step, js_array_tostring_fini, 0 };
-static const JSTrampStepDef js_array_reduce_def  = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduce };
-static const JSTrampStepDef js_array_reduceR_def = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduceRight };
-static const JSTrampStepDef js_ta_reduce_def     = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduce | special_TA };
-static const JSTrampStepDef js_ta_reduceR_def    = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduceRight | special_TA };
-static const JSTrampStepDef js_ta_filter_def       = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_filter | special_TA };
+static const JSTrampStepDef js_array_reduce_def  = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduce, .clone = js_array_reduce_clone };
+static const JSTrampStepDef js_array_reduceR_def = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduceRight, .clone = js_array_reduce_clone };
+static const JSTrampStepDef js_ta_reduce_def     = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduce | special_TA, .clone = js_array_reduce_clone };
+static const JSTrampStepDef js_ta_reduceR_def    = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduceRight | special_TA, .clone = js_array_reduce_clone };
+static const JSTrampStepDef js_ta_filter_def       = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_filter | special_TA, .clone = js_array_every_clone };
 
 /* Designated initializers, so each row states WHICH id it serves. Inserting a builtin cannot silently repoint an
    existing registration the way a positional table would. */
