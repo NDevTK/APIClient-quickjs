@@ -61250,12 +61250,21 @@ static int js_ownkeys_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). Both fields, and nothing borrowed — the request that suspends
+   it is a Proxy `ownKeys` TRAP, which is the page's code and can therefore branch on unknown input. */
+static void js_ownkeys_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSOwnKeys *s = st;
+    v->val(ctx, &s->keys);
+    v->val(ctx, &s->obj);
+}
+
 static JSValue js_ownkeys_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSOwnKeys *s = st;
     JSValue r = take_result ? s->keys : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->keys);
-    JS_FreeValue(ctx, s->obj);
+    if (take_result) s->keys = JS_UNDEFINED;   /* handed out, read above before this releases the rest */
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -68155,9 +68164,9 @@ static const JSTrampStepDef js_obj_defsetter_def  = { sizeof(JSObjDefAccessor), 
 static const JSTrampStepDef js_refl_defprop_def   = { sizeof(JSObjDefProp), js_obj_defprop_step, js_obj_defprop_fini, 1 };
 static int js_ownkeys_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_ownkeys_fini(JSContext *ctx, void *st, bool take_result);
-static const JSTrampStepDef js_ownkeys_names_def  = { sizeof(JSOwnKeys), js_ownkeys_step, js_ownkeys_fini, JS_GPN_STRING_MASK };
-static const JSTrampStepDef js_ownkeys_syms_def   = { sizeof(JSOwnKeys), js_ownkeys_step, js_ownkeys_fini, JS_GPN_SYMBOL_MASK };
-static const JSTrampStepDef js_reflect_ownkeys_def = { sizeof(JSOwnKeys), js_ownkeys_step, js_ownkeys_fini, OWNKEYS_REFLECT };
+static const JSTrampStepDef js_ownkeys_names_def  = { sizeof(JSOwnKeys), js_ownkeys_step, js_ownkeys_fini, JS_GPN_STRING_MASK, .visit = js_ownkeys_visit };
+static const JSTrampStepDef js_ownkeys_syms_def   = { sizeof(JSOwnKeys), js_ownkeys_step, js_ownkeys_fini, JS_GPN_SYMBOL_MASK, .visit = js_ownkeys_visit };
+static const JSTrampStepDef js_reflect_ownkeys_def = { sizeof(JSOwnKeys), js_ownkeys_step, js_ownkeys_fini, OWNKEYS_REFLECT, .visit = js_ownkeys_visit };
 static const JSTrampStepDef js_parseInt_def       = { sizeof(JSParseNum), js_parse_num_step, js_parse_num_fini, 1 };
 static const JSTrampStepDef js_parseFloat_def     = { sizeof(JSParseNum), js_parse_num_step, js_parse_num_fini, 0 };
 static const JSTrampStepDef js_str_split_def      = { sizeof(JSStrSplit), js_str_split_step, js_str_split_fini, 0 };
