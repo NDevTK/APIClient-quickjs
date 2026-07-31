@@ -85036,33 +85036,20 @@ static const JSTrampStepDef js_promise_then_finally_def = {
     sizeof(JSPromiseThenFinally), js_promise_then_finally_step, js_promise_then_finally_fini, 0
 };
 
-/* The C-body dispatch (job path, no step routing) — drives both onFinally and .then inline (to completion). */
+/* The wrapper's C entry. It exists only because JS_NewCFunctionData takes a function pointer: the
+   implementation is js_promise_then_finally_def, which the closure declares beside it, and both dispatches
+   reach that — the tramp's, and the job pump's, which runs a reaction handler as a call-root flow.
+   IT USED TO BE THE OTHER IMPLEMENTATION. It called onFinally with JS_Call and then Invoked `then`, both
+   inline, both the page's code, both able to loop — a second, non-suspending copy of the machine sitting
+   beside it and picked by whichever path arrived. Its own first line said so. That is the dual system: the
+   fix is not a predicate that chooses better, it is that there is nothing left to choose. Arriving here is a
+   call shape that was never routed, not a slower path. */
 static JSValue js_promise_then_finally_func(JSContext *ctx, JSValueConst this_val,
                                             int argc, JSValueConst *argv,
                                             int magic, JSValueConst *func_data)
 {
-    JSValueConst ctor = func_data[0];
-    JSValueConst onFinally = func_data[1];
-    JSValue res, promise, then_func, ret;
-    res = JS_Call(ctx, onFinally, JS_UNDEFINED, 0, NULL);
-    if (JS_IsException(res))
-        return res;
-    promise = js_promise_resolve_native(ctx, ctor, 1, vc(&res), 0);
-    JS_FreeValue(ctx, res);
-    if (JS_IsException(promise))
-        return promise;
-    then_func = JS_NewCFunctionData(ctx, magic == 0 ? js_promise_finally_value_thunk : js_promise_finally_thrower,
-                                    0, 0, 1, argv);
-    if (JS_IsException(then_func)) { JS_FreeValue(ctx, promise); return then_func; }
-    /* 27.2.5.3 step 6's Invoke(promise, "then", ...): the `then` READ this Invoke performs is PAGE CODE for a subclass or a thenable, and a C
-       activation has no flow base to run it on. Not built here — every settle and Await that could be
-       converted was, and this one has no request to hand its call out to yet, so it CRASHES naming
-       itself rather than running an accessor or a Proxy trap off the chain. */
-    if (js_read_is_page_code(ctx, promise, JS_ATOM_then))
-        DFAIL("Promise.prototype.finally's inner then reads `then` from C — hand its Invoke out and place it on a flow");
-    ret = JS_InvokeFree(ctx, promise, JS_ATOM_then, 1, vc(&then_func));
-    JS_FreeValue(ctx, then_func);
-    return ret;
+    DFAIL("Promise.prototype.finally's reaction reached its C entry — route that call shape onto do_step_tramp");
+    return JS_ThrowTypeError(ctx, "finally reaction reached its C entry");
 }
 
 /* Promise.prototype.finally (27.2.5.3) as a STEP MACHINE. Three of its steps are the page's code:
