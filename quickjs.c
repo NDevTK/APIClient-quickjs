@@ -17788,6 +17788,14 @@ struct JSStepVisit {
        none of the contents. Distinguished from a slot array precisely because it holds no references — saying
        so is what stops it being swept up by the operation that does. */
     void (*scratch)(JSContext *ctx, void **slot, size_t bytes);
+    /* An ATOM reference. Not a JSValue, and a machine that parked one mid-read owns it exactly as it owns a
+       value — GetSubstitution holds the key between `$<` and `>` across the read it names. */
+    void (*atom)(JSContext *ctx, JSAtom *slot);
+    /* A DELEGATED MACHINE: one step machine performing an abstract operation that is itself a machine, held
+       until the driver adopts it. It clones through the same tramp_step_state_clone as any other, so
+       delegation composes rather than being a hole — a fork inside `str.replace`'s built-in @@replace is a
+       fork inside the machine it handed its whole walk to. */
+    void (*machine)(JSContext *ctx, void **slot);
 };
 /* HOISTED to here, for the reason JSStepHdr is: the visitor above names it and the machine that owns one is
    thousands of lines below. A sorted element carries the value AND the string a default comparison coerced it
@@ -19110,10 +19118,27 @@ static void js_step_visit_free_scratch(JSContext *ctx, void **slot, size_t bytes
     js_free(ctx, *slot);
     *slot = NULL;
 }
+static void js_step_visit_dup_atom(JSContext *ctx, JSAtom *slot) {
+    if (*slot != JS_ATOM_NULL) *slot = JS_DupAtom(ctx, *slot);
+}
+static void js_step_visit_free_atom(JSContext *ctx, JSAtom *slot) {
+    JS_FreeAtom(ctx, *slot); *slot = JS_ATOM_NULL;
+}
+static void *tramp_step_state_clone(JSContext *ctx, const void *src);
+static JSValue tramp_step_state_free(JSContext *ctx, void *st, bool take_result);
+static void js_step_visit_dup_machine(JSContext *ctx, void **slot) {
+    if (*slot) *slot = tramp_step_state_clone(ctx, *slot);   /* NULL if that machine declares no ownership: the
+                                                                fork's own DCHECK names it, one level down */
+}
+static void js_step_visit_free_machine(JSContext *ctx, void **slot) {
+    if (*slot) { JS_FreeValue(ctx, tramp_step_state_free(ctx, *slot, false)); *slot = NULL; }
+}
 static const JSStepVisit js_step_visit_dup  = { js_step_visit_dup_val,  js_step_visit_dup_strbuf,  js_step_visit_dup_props,
-                                                js_step_visit_dup_slots,  js_step_visit_dup_scratch };
+                                                js_step_visit_dup_slots,  js_step_visit_dup_scratch,
+                                                js_step_visit_dup_atom,  js_step_visit_dup_machine };
 static const JSStepVisit js_step_visit_free = { js_step_visit_free_val, js_step_visit_free_strbuf, js_step_visit_free_props,
-                                                js_step_visit_free_slots, js_step_visit_free_scratch };
+                                                js_step_visit_free_slots, js_step_visit_free_scratch,
+                                                js_step_visit_free_atom, js_step_visit_free_machine };
 /* A machine's teardown releases what it owns through the SAME declaration the clone reads, so the two cannot
    disagree about which fields those are. */
 static void tramp_step_visit_free(JSContext *ctx, void *st) {
@@ -20279,6 +20304,7 @@ typedef struct JSStrReplace {
 } JSStrReplace;
 static int js_str_replace_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_str_replace_fini(JSContext *ctx, void *st, bool take_result);
+static void js_str_replace_visit(JSContext *ctx, void *st, JSStepVisit *v);
 /* RegExp.prototype[@@replace] with a function replacer: a step machine. Phase 1 collects every match; phase 2
    holds the StringBuffer + nextSourcePosition + result index across each callback and substitutes one match per
    step. (Kind 16 was CONT_RE_REPLACE.) */
@@ -67777,8 +67803,8 @@ static const JSTrampStepDef js_str_matchAll_def =
     { sizeof(JSStrMatch), js_str_match_step, js_str_match_fini, JS_ATOM_Symbol_matchAll };
 static const JSTrampStepDef js_str_search_def =
     { sizeof(JSStrMatch), js_str_match_step, js_str_match_fini, JS_ATOM_Symbol_search };
-static const JSTrampStepDef js_str_replace_def         = { sizeof(JSStrReplace), js_str_replace_vstep, js_str_replace_fini, 0 };
-static const JSTrampStepDef js_str_replaceAll_def      = { sizeof(JSStrReplace), js_str_replace_vstep, js_str_replace_fini, 1 };
+static const JSTrampStepDef js_str_replace_def         = { sizeof(JSStrReplace), js_str_replace_vstep, js_str_replace_fini, 0, .visit = js_str_replace_visit };
+static const JSTrampStepDef js_str_replaceAll_def      = { sizeof(JSStrReplace), js_str_replace_vstep, js_str_replace_fini, 1, .visit = js_str_replace_visit };
 static const JSTrampStepDef js_array_every_def     = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_every, .visit = js_array_every_visit };
 static const JSTrampStepDef js_array_some_def      = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_some, .visit = js_array_every_visit };
 static const JSTrampStepDef js_array_forEach_def   = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_forEach, .visit = js_array_every_visit };
@@ -75218,16 +75244,20 @@ exception:
 }
 
 /* Release a substitution abandoned mid-walk — the machine was torn down while parked on `groups[name]`. */
+/* WHAT A SUBSTITUTION CURSOR OWNS. Nested inside its machine's declaration rather than beside it, because it
+   is a sub-object with its own lifetime: `active` says whether the accumulator has been initialised at all,
+   and the key parked between `$<` and `>` is an atom reference held across the read it names. */
+static void js_getsubst_visit(JSContext *ctx, JSGetSubst *gs, JSStepVisit *v)
+{
+    if (gs->active) v->strbuf(ctx, &gs->b);
+    v->atom(ctx, &gs->name_atom);
+    v->val(ctx, &gs->pending);
+}
+
 static void js_getsubst_free(JSContext *ctx, JSGetSubst *gs)
 {
-    if (gs->active) {
-        string_buffer_free(&gs->b);
-        gs->active = 0;
-    }
-    JS_FreeAtom(ctx, gs->name_atom);
-    gs->name_atom = JS_ATOM_NULL;
-    JS_FreeValue(ctx, gs->pending);
-    gs->pending = JS_UNDEFINED;
+    js_getsubst_visit(ctx, gs, (JSStepVisit *)&js_step_visit_free);
+    gs->active = 0;
 }
 
 /* String.prototype.replace / replaceAll with a FUNCTION replacer (22.1.3.19). The builtin holds a StringBuffer
@@ -75515,31 +75545,48 @@ static int js_str_replace_vstep(JSContext *ctx, void *st, JSValue cb_result, JSV
     }
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit), which in mode 3 is a DELEGATED MACHINE — the built-in
+   @@replace it handed its whole walk to. That composes: the delegate clones through the same path as any other
+   machine, so a fork inside it is a fork inside a machine, not a hole. The subject strings are held in every
+   mode; the accumulator and the cb_args are held per mode, and stating which is what stopped mode 0's replacer
+   reference and mode 1's four operands from being released twice or not at all. */
+static void js_str_replace_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSStrReplace *s = st;
+    v->val(ctx, &s->str);
+    v->val(ctx, &s->search_str);
+    v->val(ctx, &s->flags_val);
+    if (s->mode == 3) { v->machine(ctx, &s->inner); return; }   /* the delegate owns the rest of the walk */
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->rep_val);
+    js_getsubst_visit(ctx, &s->gs, v);
+    if (s->mode == 1) {
+        int i;
+        for (i = 0; i < 4; i++) v->val(ctx, &s->cb_args[i]);
+    } else if (s->mode == 0) {
+        if (s->functional) v->val(ctx, &s->cb_args[1]);   /* the replacer dup'd by the prologue */
+        if (s->b.ctx) v->strbuf(ctx, &s->b);              /* NULL ctx = the prologue threw before it was built */
+    }
+}
+
 static JSValue js_str_replace_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSStrReplace *s = st;
     JSValue r;
     if (s->mode == 3) {
+        /* the RESULT is the delegate's, so the hand-out is a teardown of the inner machine rather than a field
+           of this one — the one thing the declaration above cannot say for it. */
         DCHECK(s->inner != NULL, "str.replace mode 3 without a delegated machine");
         r = tramp_step_state_free(ctx, s->inner, take_result);
-        JS_FreeValue(ctx, s->str); JS_FreeValue(ctx, s->search_str);
-        JS_FreeValue(ctx, s->flags_val);
+        s->inner = NULL;
+        tramp_step_visit_free(ctx, s);
         js_free(ctx, s);
         return r;
     }
     r = take_result ? s->result : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->result);
-    js_getsubst_free(ctx, &s->gs);
-    if (s->mode == 1) {
-        JS_FreeValue(ctx, s->cb_args[0]); JS_FreeValue(ctx, s->cb_args[1]);
-        JS_FreeValue(ctx, s->cb_args[2]); JS_FreeValue(ctx, s->cb_args[3]);
-    } else if (s->mode == 0) {
-        if (s->functional) JS_FreeValue(ctx, s->cb_args[1]);   /* the replacer dup'd by the prologue */
-        if (s->b.ctx) string_buffer_free(&s->b);               /* unconsumed on the error path; NULL ctx = the
-                                                                  prologue threw before string_buffer_init */
-    }
-    JS_FreeValue(ctx, s->str); JS_FreeValue(ctx, s->search_str); JS_FreeValue(ctx, s->rep_val);
-    JS_FreeValue(ctx, s->flags_val);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
+    s->gs.active = 0;
     js_free(ctx, s);
     return r;
 }
