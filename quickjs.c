@@ -45364,6 +45364,10 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
     FuncCallType call_type;
     int optional_chaining_label;
     bool accept_lparen = (parse_flags & PF_POSTFIX_CALL) != 0;
+    /* WHERE A CALL IS, for the stack trace that will name it: the start of the expression being called —
+       `geval` in `geval(source)`, `a` in `a.b()`, the `new` in `new Plonk()`. Taken here because this is where
+       that expression begins, and kept for the whole postfix chain so `f()()` attributes both calls to `f`. */
+    int call_line_num = s->token.line_num, call_col_num = s->token.col_num;
 
     call_type = FUNC_CALL_NORMAL;
     switch(s->token.val) {
@@ -45897,6 +45901,12 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
                 if (next_token(s))
                     return -1;
             emit_func_call:
+                /* The call opcode's OWN position, emitted here rather than before the arguments — an argument
+                   is an expression and emits positions of its own, so the marker left at the head of the call
+                   was overwritten by the last one parsed. Every stack trace pointed at the final argument:
+                   `a(   )` reported the `)`, and V8's eval-origin test, which pins the column of the eval
+                   call, disagreed by five. */
+                emit_source_loc_at(s, call_line_num, call_col_num);
                 switch(opcode) {
                 case OP_get_field:
                 case OP_scope_get_private_field:
