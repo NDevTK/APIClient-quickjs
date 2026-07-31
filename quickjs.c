@@ -1641,7 +1641,6 @@ static int js_proxy_setPrototypeOf(JSContext *ctx, JSValueConst obj,
                                    JSValueConst proto_val, bool throw_flag);
 static int js_proxy_isExtensible(JSContext *ctx, JSValueConst obj);
 static int js_proxy_preventExtensions(JSContext *ctx, JSValueConst obj);
-static int js_proxy_isArray(JSContext *ctx, JSValueConst obj);
 static int JS_CreateProperty(JSContext *ctx, JSObject *p,
                              JSAtom prop, JSValueConst val,
                              JSValueConst getter, JSValueConst setter,
@@ -15077,17 +15076,31 @@ bool JS_IsArray(JSValueConst val)
 }
 
 /* return -1 if exception (proxy case) or true/false */
+/* 7.2.2 IsArray. Step 3.c is `Return ? IsArray(proxyTarget)` — TAIL recursion, so it is a WALK, and it was run
+   as C recursion with ONE FRAME PER PROXY HOP and the depth chosen by the page: `Array.isArray(chain)` over a
+   deep `new Proxy(new Proxy(...))` was a stack overflow. What stood in for an answer was a
+   js_check_stack_overflow that threw RangeError — a BOUND in an error's clothes, reported for a question the
+   spec always answers. The loop has no depth to run out of, and js_proxy_isArray is deleted with it: it existed
+   only to be the other half of the cycle. Found by engine/check_recursion.mjs, which named the two-function
+   cycle; no test had ever built a chain deep enough to fail. */
 static int js_is_array(JSContext *ctx, JSValueConst val)
 {
-    JSObject *p;
-    if (JS_VALUE_GET_TAG(val) == JS_TAG_OBJECT) {
+    for (;;) {
+        JSObject *p;
+        JSProxyData *s;
+        if (JS_VALUE_GET_TAG(val) != JS_TAG_OBJECT)
+            return false;                                  /* step 1 */
         p = JS_VALUE_GET_OBJ(val);
-        if (unlikely(p->class_id == JS_CLASS_PROXY))
-            return js_proxy_isArray(ctx, val);
-        else
-            return p->class_id == JS_CLASS_ARRAY;
-    } else {
-        return false;
+        if (likely(p->class_id != JS_CLASS_PROXY))
+            return p->class_id == JS_CLASS_ARRAY;          /* steps 2 and 4 */
+        s = JS_GetOpaque(val, JS_CLASS_PROXY);
+        if (!s)
+            return false;
+        if (s->is_revoked) {                               /* step 3.a: ValidateNonRevokedProxy */
+            JS_ThrowTypeErrorRevokedProxy(ctx);
+            return -1;
+        }
+        val = s->target;                                   /* step 3.c, as a STEP rather than a frame */
     }
 }
 
@@ -79846,23 +79859,7 @@ static JSValue js_proxy_call(JSContext *ctx, JSValueConst func_obj,
     return JS_EXCEPTION;
 }
 
-static int js_proxy_isArray(JSContext *ctx, JSValueConst obj)
-{
-    JSProxyData *s = JS_GetOpaque(obj, JS_CLASS_PROXY);
-    if (!s)
-        return false;
-
-    if (js_check_stack_overflow(ctx->rt, 0)) {
-        JS_ThrowStackOverflow(ctx);
-        return -1;
-    }
-
-    if (s->is_revoked) {
-        JS_ThrowTypeErrorRevokedProxy(ctx);
-        return -1;
-    }
-    return js_is_array(ctx, s->target);
-}
+/* DELETED: js_proxy_isArray. It was the other half of IsArray's two-function cycle and nothing else called it. */
 
 static const JSClassExoticMethods js_proxy_exotic_methods = {
     .get_own_property = js_proxy_get_own_property,
