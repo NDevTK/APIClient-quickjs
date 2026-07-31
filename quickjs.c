@@ -19654,6 +19654,22 @@ static void js_promise_try_abandon(JSContext *ctx, void *st)
     for (k = 0; k < s->nargs + 2; k++) JS_FreeValue(ctx, s->cb_args[k]);
     js_free_rt(ctx->rt, s);
 }
+/* GetSubstitution's resumable state. The walk over the replacement template is pure string work EXCEPT for
+   `$<name>`, whose `Get(namedCaptures, name)` reads the PAGE's `groups` object — an accessor or a Proxy trap —
+   and whose result is then ToString'd. Both ran from C, which is the last drive-to-completion the harness
+   reported. Only the buffer and the cursor have to survive that suspension; everything else is re-derived from
+   the operands the calling machine already holds. */
+typedef struct JSGetSubst {
+    StringBuffer b;
+    JSValue pending;      /* the `groups[name]` read's result, held across its ToString (owned) */
+    JSAtom name_atom;     /* the key between `$<` and `>` (owned) */
+    uint32_t position, matched_len, captures_len;
+    int i, j, j0;         /* the walk cursor */
+    uint8_t stage;        /* GS_*: where a delivered answer lands */
+    uint8_t active;       /* 1 = b is initialised and owed a teardown */
+} JSGetSubst;
+enum { GS_START = 0, GS_WALK, GS_NAMED_GET, GS_NAMED_STR };
+
 /* String.prototype.replace/replaceAll: a step machine. It holds a StringBuffer + endOfLastMatch across each
    callback, so replaceAll's loop is preemptible at every callback boundary and the replacer's body at every
    back-edge. (Kind 15 was CONT_STR_REPLACE, back when a hand-written driver ran this walk.) */
@@ -19673,6 +19689,7 @@ typedef struct JSStrReplace {
     uint8_t is_first;
     uint8_t is_replaceAll;
     uint8_t cb_pending;     /* 1 = the value delivered to the next step is the replacer's result */
+    JSGetSubst gs;          /* the non-functional walk's substitution; never suspends here (no `groups`) */
     JSValue flags_val;      /* replaceAll's `Get(searchValue, "flags")` result, held across ITS ToString — both
                                are the page's code, so they are separate stages and the value cannot live in a
                                C local across the suspension between them (owned) */
@@ -19695,6 +19712,9 @@ typedef struct JSReRep {
     int64_t n;               /* the capture cursor */
     JSValue cap;             /* a capture held across its read and its ToString (owned) */
     JSValue named;           /* Get(result,"groups") (owned) */
+    JSGetSubst gs;           /* the non-functional walk's substitution, which CAN suspend on `groups[name]` */
+    JSValue gs_tab;          /* the captures array GetSubstitution reads, held across its suspensions (owned) */
+    JSValue gs_named;        /* ToObject(named) for the same reason (owned) */
     JSValue repres;          /* the replacer's return, held across its ToString (owned) */
     JSValue rx;              /* the regexp (owned) */
     JSValue str;             /* the subject string (owned) */
@@ -19810,6 +19830,11 @@ typedef struct JSReMatch {
     uint8_t is_global, fullUnicode;
     JSValue cbx[3];          /* [this, exec, S] — RegExpExec's call request */
 } JSReMatch;
+
+/* 40 rather than a number in the 30..39 run: the substitution sits INSIDE that loop, and renumbering the tail
+   to slot it in would make a stage constant mean two different things across a suspension. RE_REP_LOOP is the
+   loop head it returns to. */
+enum { RE_REP_LOOP = 30, RE_REP_SUBST = 40 };
 
 static int js_re_rep_step(JSContext *ctx, struct JSReRep *s, JSValue cb_result,
                           JSValue **out_cb, int *out_argc);
@@ -74120,76 +74145,106 @@ static JSValue js_str_match_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
-static JSValue js_string___GetSubstitution(JSContext *ctx, JSValueConst this_val,
-                                           int argc, JSValueConst *argv)
+/* GetSubstitution (22.1.3.19.1) as a RESUMABLE sub-sequence. Two-phase like every other one: it parks on the
+   `$<name>` read (or on the ToString of what that read returned) and answers at the SAME call site.
+     0 = *pout is the finished string, >0 = the caller must return that step code, -1 = threw.
+   Everything else in the template walk is pure string work — `$&`, `` $` ``, `$'` and `$1`..`$99` read a
+   matched substring or the caller's own captures array, neither of which can run the page's code. */
+static int step_getsubst_run(JSContext *ctx, JSStepHdr *h, JSGetSubst *gs,
+                             JSValueConst matched, JSValueConst str, JSValueConst captures,
+                             JSValueConst namedCaptures, JSValueConst rep,
+                             JSValue in, JSValue *pout, JSValue **out_cb, int *out_argc)
 {
-    // GetSubstitution(matched, str, position, captures, namedCaptures, rep)
-    JSValueConst matched, str, captures, namedCaptures, rep;
-    JSValue capture, name, s;
-    uint32_t position, len, matched_len, captures_len;
-    int i, j, j0, k, k1;
-    int c, c1;
-    StringBuffer b_s, *b = &b_s;
+    StringBuffer *b = &gs->b;
     JSString *sp, *rp;
+    JSValue s, tmp;
+    uint32_t len;
+    int c, c1, k, k1, r;
 
-    matched = argv[0];
-    str = argv[1];
-    captures = argv[3];
-    namedCaptures = argv[4];
-    rep = argv[5];
-
-    if (!JS_IsString(rep) || !JS_IsString(str))
-        return JS_ThrowTypeError(ctx, "not a string");
-
+    if (!JS_IsString(rep) || !JS_IsString(str)) {
+        JS_FreeValue(ctx, in);
+        JS_ThrowTypeError(ctx, "not a string");
+        return -1;
+    }
     sp = JS_VALUE_GET_STRING(str);
     rp = JS_VALUE_GET_STRING(rep);
-
-    string_buffer_init(ctx, b, 0);
-
-    captures_len = 0;
-    if (!JS_IsUndefined(captures)) {
-        if (js_get_length32(ctx, &captures_len, captures))
-            goto exception;
-    }
-    if (js_get_length32(ctx, &matched_len, matched))
-        goto exception;
-    if (JS_ToUint32(ctx, &position, argv[2]) < 0)
-        goto exception;
-
     len = rp->len;
-    i = 0;
+
+    if (gs->stage == GS_START) {
+        JS_FreeValue(ctx, in);
+        in = JS_UNDEFINED;
+        string_buffer_init(ctx, b, 0);
+        gs->active = 1;
+        gs->pending = JS_UNDEFINED;
+        gs->name_atom = JS_ATOM_NULL;
+        gs->captures_len = 0;
+        if (!JS_IsUndefined(captures)) {
+            if (js_get_length32(ctx, &gs->captures_len, captures))
+                goto exception;
+        }
+        if (js_get_length32(ctx, &gs->matched_len, matched))
+            goto exception;
+        gs->i = 0;
+        gs->stage = GS_WALK;
+    } else if (gs->stage == GS_NAMED_GET) {
+        r = step_getprop_run(ctx, h, namedCaptures, gs->name_atom, in, &gs->pending, out_cb, out_argc);
+        if (r) return r < 0 ? -1 : r;
+        gs->stage = GS_NAMED_STR;
+        in = JS_UNDEFINED;
+        goto named_str;
+    } else {
+        DCHECK(gs->stage == GS_NAMED_STR, "GetSubstitution resumed in an unknown stage");
+     named_str:
+        if (JS_IsUndefined(gs->pending)) {
+            JS_FreeValue(ctx, in);
+        } else {
+            r = step_tostring_run(ctx, h, gs->pending, in, &tmp, out_cb, out_argc);
+            if (r) return r < 0 ? -1 : r;
+            JS_FreeValue(ctx, gs->pending);
+            gs->pending = JS_UNDEFINED;
+            if (string_buffer_concat_value_free(b, tmp))
+                goto exception;
+        }
+        JS_FreeAtom(ctx, gs->name_atom);
+        gs->name_atom = JS_ATOM_NULL;
+        gs->i = gs->j;
+        gs->stage = GS_WALK;
+    }
+
     for(;;) {
-        j = string_indexof_char(rp, '$', i);
-        if (j < 0 || j + 1 >= len)
+        gs->j = string_indexof_char(rp, '$', gs->i);
+        if (gs->j < 0 || gs->j + 1 >= (int)len)
             break;
-        string_buffer_concat(b, rp, i, j);
-        j0 = j++;
-        c = string_get(rp, j++);
+        string_buffer_concat(b, rp, gs->i, gs->j);
+        gs->j0 = gs->j++;
+        c = string_get(rp, gs->j++);
         if (c == '$') {
             string_buffer_putc8(b, '$');
         } else if (c == '&') {
             if (string_buffer_concat_value(b, matched))
                 goto exception;
         } else if (c == '`') {
-            string_buffer_concat(b, sp, 0, position);
+            string_buffer_concat(b, sp, 0, gs->position);
         } else if (c == '\'') {
-            string_buffer_concat(b, sp, position + matched_len, sp->len);
+            string_buffer_concat(b, sp, gs->position + gs->matched_len, sp->len);
         } else if (c >= '0' && c <= '9') {
             k = c - '0';
-            if (j < len) {
-                c1 = string_get(rp, j);
+            if (gs->j < (int)len) {
+                c1 = string_get(rp, gs->j);
                 if (c1 >= '0' && c1 <= '9') {
                     /* This behavior is specified in ES6 and refined in ECMA 2019 */
                     /* ECMA 2019 does not have the extra test, but
                        Test262 S15.5.4.11_A3_T1..3 require this behavior */
                     k1 = k * 10 + c1 - '0';
-                    if (k1 >= 1 && k1 < captures_len) {
+                    if (k1 >= 1 && k1 < (int)gs->captures_len) {
                         k = k1;
-                        j++;
+                        gs->j++;
                     }
                 }
             }
-            if (k >= 1 && k < captures_len) {
+            if (k >= 1 && k < (int)gs->captures_len) {
+                /* the caller's OWN array of already-coerced captures: an ordinary element read on an engine
+                   object, which is why this one is not a request. */
                 s = JS_GetPropertyInt64(ctx, captures, k);
                 if (JS_IsException(s))
                     goto exception;
@@ -74201,31 +74256,60 @@ static JSValue js_string___GetSubstitution(JSContext *ctx, JSValueConst this_val
                 goto norep;
             }
         } else if (c == '<' && !JS_IsUndefined(namedCaptures)) {
-            k = string_indexof_char(rp, '>', j);
+            JSValue name;
+            k = string_indexof_char(rp, '>', gs->j);
             if (k < 0)
                 goto norep;
-            name = js_sub_string(ctx, rp, j, k);
+            name = js_sub_string(ctx, rp, gs->j, k);
             if (JS_IsException(name))
                 goto exception;
-            capture = JS_GetPropertyValue(ctx, namedCaptures, name);
-            if (JS_IsException(capture))
+            gs->name_atom = JS_ValueToAtom(ctx, name);
+            JS_FreeValue(ctx, name);
+            if (gs->name_atom == JS_ATOM_NULL)
                 goto exception;
-            if (!JS_IsUndefined(capture)) {
-                if (string_buffer_concat_value_free(b, capture))
-                    goto exception;
-            }
-            j = k + 1;
+            /* THE SUSPENSION. `groups` is the page's object, so this read is a request and so is the ToString
+               of whatever it returns. gs->j moves past the `>` on the way back in. */
+            gs->j = k + 1;
+            gs->stage = GS_NAMED_GET;
+            r = step_getprop_run(ctx, h, namedCaptures, gs->name_atom, JS_UNDEFINED,
+                                 &gs->pending, out_cb, out_argc);
+            if (r) return r < 0 ? -1 : r;
+            gs->stage = GS_NAMED_STR;
+            in = JS_UNDEFINED;
+            goto named_str;
         } else {
         norep:
-            string_buffer_concat(b, rp, j0, j);
+            string_buffer_concat(b, rp, gs->j0, gs->j);
         }
-        i = j;
+        gs->i = gs->j;
     }
-    string_buffer_concat(b, rp, i, rp->len);
-    return string_buffer_end(b);
+    string_buffer_concat(b, rp, gs->i, rp->len);
+    gs->active = 0;
+    gs->stage = GS_START;
+    *pout = string_buffer_end(b);
+    return JS_IsException(*pout) ? -1 : 0;
 exception:
     string_buffer_free(b);
-    return JS_EXCEPTION;
+    gs->active = 0;
+    gs->stage = GS_START;
+    JS_FreeAtom(ctx, gs->name_atom);
+    gs->name_atom = JS_ATOM_NULL;
+    JS_FreeValue(ctx, gs->pending);
+    gs->pending = JS_UNDEFINED;
+    return -1;
+}
+
+/* Release a substitution abandoned mid-walk — the machine was torn down while parked on `groups[name]`. */
+static void js_getsubst_free(JSContext *ctx, JSGetSubst *gs)
+{
+    if (gs->active) {
+        string_buffer_free(&gs->b);
+        gs->active = 0;
+    }
+    JS_FreeAtom(ctx, gs->name_atom);
+    gs->name_atom = JS_ATOM_NULL;
+    JS_FreeValue(ctx, gs->pending);
+    gs->pending = JS_UNDEFINED;
 }
 
 /* String.prototype.replace / replaceAll with a FUNCTION replacer (22.1.3.19). The builtin holds a StringBuffer
@@ -74297,12 +74381,18 @@ static int js_str_replace_step(JSContext *ctx, JSStrReplace *s, JSValue cb_resul
         if (!s->functional) {
             /* same walk, different substitution SOURCE: GetSubstitution instead of a callback, spliced here and
                on to the next match. Not a separate no-callback body. */
-            JSValueConst gargs[6];
-            JSValue repl;
-            gargs[0] = s->search_str; gargs[1] = s->str;    gargs[2] = js_int32(s->pos);
-            gargs[3] = JS_UNDEFINED;  gargs[4] = JS_UNDEFINED; gargs[5] = s->rep_val;
-            repl = js_string___GetSubstitution(ctx, JS_UNDEFINED, 6, gargs);
-            if (JS_IsException(repl))
+            JSValue repl = JS_UNDEFINED;
+            int gsr;
+            s->gs.stage = GS_START;
+            s->gs.position = s->pos;
+            /* No captures and no `groups`: `$<name>` is inert and `$1` has nothing to read, so this walk has
+               no page-observable operation in it and cannot park. Same ONE implementation as @@replace's; the
+               DCHECK is what says the difference is structural and not a second driver. */
+            gsr = step_getsubst_run(ctx, &s->hdr, &s->gs, s->search_str, s->str, JS_UNDEFINED,
+                                    JS_UNDEFINED, s->rep_val, JS_UNDEFINED, &repl, out_cb, out_argc);
+            DCHECK(gsr <= 0, "String.prototype.replace's substitution asked to suspend, which needs a `groups` "
+                             "object it is never given");
+            if (gsr < 0)
                 return -1;
             string_buffer_concat(&s->b, sp, s->endOfLastMatch, s->pos);
             string_buffer_concat_value_free(&s->b, repl);
@@ -74481,6 +74571,7 @@ static int js_str_replace_vstep(JSContext *ctx, void *st, JSValue cb_result, JSV
         string_buffer_init(ctx, &s->b, 0);
         s->is_first = 1;
         s->mode = 0;
+        s->gs.pending = JS_UNDEFINED; s->gs.name_atom = JS_ATOM_NULL; s->gs.active = 0;
         s->hdr.stage = 1;
     }
  have_mode:
@@ -74520,6 +74611,7 @@ static JSValue js_str_replace_fini(JSContext *ctx, void *st, bool take_result)
     }
     r = take_result ? s->result : JS_UNDEFINED;
     if (!take_result) JS_FreeValue(ctx, s->result);
+    js_getsubst_free(ctx, &s->gs);
     if (s->mode == 1) {
         JS_FreeValue(ctx, s->cb_args[0]); JS_FreeValue(ctx, s->cb_args[1]);
         JS_FreeValue(ctx, s->cb_args[2]); JS_FreeValue(ctx, s->cb_args[3]);
@@ -77346,44 +77438,57 @@ static int js_re_rep_step(JSContext *ctx, struct JSReRep *s, JSValue cb_result,
             if (r) return r < 0 ? -1 : r;
             s->hdr.stage = 37;
         }
-        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
-        s->cb_buf[2 + s->cb_nargs++] = js_int32(s->position);
-        s->cb_buf[2 + s->cb_nargs++] = js_dup(s->str);
-        if (s->functional) {
-            /* step 14.k: Call(replaceValue, undefined, «matched, ...captures, position, string, groups?»). The
-               spec builds a LIST, not an array — the JS array a C path materializes is never observable, so the
-               args go straight into the call buffer. */
-            if (!JS_IsUndefined(s->named)) {
-                s->cb_buf[2 + s->cb_nargs++] = s->named;   /* ownership moves into the buffer */
-                s->named = JS_UNDEFINED;
-            }
-            s->hdr.stage = 38;
-            *out_cb = s->cb_buf; *out_argc = s->cb_nargs;
-            return 3;
-        }
-        {   /* step 14.l: a NON-callable replacement is the same walk with a different substitution SOURCE —
-               GetSubstitution instead of a callback — so it runs HERE, in the one machine, and continues to the
-               next match. It is not a separate no-callback body: that duplicate walk is deleted. */
-            JSValueConst gargs[6];
-            JSValue tab, ncap1, rep_str;
-            int64_t gn;
-            tab = JS_NewArray(ctx);
-            if (JS_IsException(tab)) return -1;
-            for (gn = 0; gn <= s->nCaptures; gn++) {
-                if (JS_DefinePropertyValueInt64(ctx, tab, gn, js_dup(s->cb_buf[2 + gn]),
-                                                JS_PROP_C_W_E | JS_PROP_THROW) < 0) {
-                    JS_FreeValue(ctx, tab);
-                    return -1;
+        /* STAGE-GUARDED, and it has to be: the substitution below can now SUSPEND, and on the way back in
+           these three statements would run a second time — appending past cb_buf and freeing the answer that
+           was just delivered. They were unconditional because nothing after them could re-enter. */
+        if (s->hdr.stage == 37) {
+            JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+            s->cb_buf[2 + s->cb_nargs++] = js_int32(s->position);
+            s->cb_buf[2 + s->cb_nargs++] = js_dup(s->str);
+            if (s->functional) {
+                /* step 14.k: Call(replaceValue, undefined, «matched, ...captures, position, string, groups?»).
+                   The spec builds a LIST, not an array — the JS array a C path materializes is never
+                   observable, so the args go straight into the call buffer. */
+                if (!JS_IsUndefined(s->named)) {
+                    s->cb_buf[2 + s->cb_nargs++] = s->named;   /* ownership moves into the buffer */
+                    s->named = JS_UNDEFINED;
                 }
+                s->hdr.stage = 38;
+                *out_cb = s->cb_buf; *out_argc = s->cb_nargs;
+                return 3;
             }
-            ncap1 = JS_IsUndefined(s->named) ? JS_UNDEFINED : JS_ToObject(ctx, s->named);
-            if (JS_IsException(ncap1)) { JS_FreeValue(ctx, tab); return -1; }
-            JS_FreeValue(ctx, s->named); s->named = JS_UNDEFINED;
-            gargs[0] = s->matched; gargs[1] = s->str; gargs[2] = js_int32(s->position);
-            gargs[3] = tab;        gargs[4] = ncap1;  gargs[5] = s->rep;
-            rep_str = js_string___GetSubstitution(ctx, JS_UNDEFINED, 6, gargs);
-            JS_FreeValue(ctx, tab); JS_FreeValue(ctx, ncap1);
-            if (JS_IsException(rep_str)) return -1;
+            /* step 14.l: a NON-callable replacement is the same walk with a different substitution SOURCE —
+               GetSubstitution instead of a callback — so it runs HERE, in the one machine, and continues to the
+               next match. It is not a separate no-callback body: that duplicate walk is deleted.
+               The captures array and the ToObject'd `groups` move onto the MACHINE because the walk parks on
+               `groups[name]`; as C locals they were live only until the C frame returned. */
+            {
+                int64_t gn;
+                s->gs_tab = JS_NewArray(ctx);
+                if (JS_IsException(s->gs_tab)) { s->gs_tab = JS_UNDEFINED; return -1; }
+                for (gn = 0; gn <= s->nCaptures; gn++) {
+                    if (JS_DefinePropertyValueInt64(ctx, s->gs_tab, gn, js_dup(s->cb_buf[2 + gn]),
+                                                    JS_PROP_C_W_E | JS_PROP_THROW) < 0)
+                        return -1;
+                }
+                s->gs_named = JS_IsUndefined(s->named) ? JS_UNDEFINED : JS_ToObject(ctx, s->named);
+                if (JS_IsException(s->gs_named)) { s->gs_named = JS_UNDEFINED; return -1; }
+                JS_FreeValue(ctx, s->named); s->named = JS_UNDEFINED;
+            }
+            s->gs.stage = GS_START;
+            s->gs.position = s->position;
+            s->hdr.stage = RE_REP_SUBST;
+        }
+        if (s->hdr.stage == RE_REP_SUBST) {
+            JSValue rep_str = JS_UNDEFINED;
+            int gsr;
+            gsr = step_getsubst_run(ctx, &s->hdr, &s->gs, s->matched, s->str, s->gs_tab,
+                                    s->gs_named, s->rep, cb_result, &rep_str, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (gsr) return gsr < 0 ? -1 : gsr;
+            JS_FreeValue(ctx, s->gs_tab);   s->gs_tab = JS_UNDEFINED;
+            JS_FreeValue(ctx, s->gs_named); s->gs_named = JS_UNDEFINED;
+            s->hdr.stage = RE_REP_LOOP;
             js_re_rep_splice(ctx, s, rep_str);
         }
     }
@@ -77432,6 +77537,8 @@ static int js_re_rep_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue 
         string_buffer_init(ctx, &s->b, 0);
         s->flags = JS_UNDEFINED; s->mres = JS_UNDEFINED; s->m0 = JS_UNDEFINED;
         s->cap = JS_UNDEFINED; s->named = JS_UNDEFINED; s->repres = JS_UNDEFINED;
+        s->gs_tab = JS_UNDEFINED; s->gs_named = JS_UNDEFINED;
+        s->gs.pending = JS_UNDEFINED; s->gs.name_atom = JS_ATOM_NULL; s->gs.active = 0;
         s->rx = js_dup(s->hdr.this_val);
         s->hdr.stage = 10;
     }
@@ -77560,6 +77667,11 @@ static void js_re_rep_end(JSContext *ctx, struct JSReRep *s, bool take_result)
 {
     int i;
     js_re_rep_free_cb(ctx, s);
+    /* torn down while PARKED on `groups[name]`: the substitution's buffer, its key and the operands it was
+       holding are still ours */
+    js_getsubst_free(ctx, &s->gs);
+    JS_FreeValue(ctx, s->gs_tab);
+    JS_FreeValue(ctx, s->gs_named);
     if (!take_result) {
         if (s->b.ctx) string_buffer_free(&s->b);   /* NULL ctx = the prologue threw before string_buffer_init */
         JS_FreeValue(ctx, s->result);
