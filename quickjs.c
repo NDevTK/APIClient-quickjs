@@ -8606,8 +8606,19 @@ static void js_callsite_data_line(JSContext *ctx, DynBuf *dbuf, const JSCallSite
     if (csd->native) {
         dbuf_printf(dbuf, " (native)");
     } else {
+        dbuf_printf(dbuf, " (");
+        /* Code that came from an eval is located by WHERE THE eval WAS as well as by where it is: a file name
+           of `<input>` and a line of 1 says nothing on its own, and the origin is the only thing that ties the
+           frame back to the page. V8 puts it in the same parentheses, before the position, and this is the
+           rendering its stack-traces.js looks for. */
+        if (JS_IsString(csd->eval_origin)) {
+            s = JS_ToCString(ctx, csd->eval_origin);
+            if (s && s[0])
+                dbuf_printf(dbuf, "%s, ", s);
+            JS_FreeCString(ctx, s);
+        }
         s = JS_IsNull(csd->filename) ? NULL : JS_ToCString(ctx, csd->filename);
-        dbuf_printf(dbuf, " (%s", s ? s : "<null>");
+        dbuf_printf(dbuf, "%s", s ? s : "<null>");
         JS_FreeCString(ctx, s);
         if (csd->line_num != -1)
             dbuf_printf(dbuf, ":%d:%d", csd->line_num, csd->col_num);
@@ -8859,8 +8870,18 @@ static JSAtom js_eval_origin_atom(JSContext *ctx)
     }
     if (b && sf->cur_pc) {
         line = find_line_num(ctx, b, sf->cur_pc - b->byte_code_buf - 1, &col);
+        dbuf_printf(&dbuf, " (");
+        /* An eval CALLED FROM eval'd code carries the whole chain: `eval at Inner (eval at Outer (f:73:3),
+           <input>:1:20)`. It is the same composition the frame rendering uses, for the same reason — the
+           innermost position means nothing without the one that produced it. */
+        if (b->from_eval && b->eval_origin != JS_ATOM_NULL) {
+            const char *outer = JS_AtomToCString(ctx, b->eval_origin);
+            if (outer && outer[0])
+                dbuf_printf(&dbuf, "%s, ", outer);
+            JS_FreeCString(ctx, outer);
+        }
         file = b->filename ? JS_AtomToCString(ctx, b->filename) : NULL;
-        dbuf_printf(&dbuf, " (%s", file ? file : "<null>");
+        dbuf_printf(&dbuf, "%s", file ? file : "<null>");
         JS_FreeCString(ctx, file);
         if (line != -1)
             dbuf_printf(&dbuf, ":%d:%d", line, col);
