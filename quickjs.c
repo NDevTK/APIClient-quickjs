@@ -17776,6 +17776,10 @@ struct JSStepVisit {
        far. Declared as its own operation rather than left to the machine because a machine must never learn
        WHICH consumer is visiting it — that is what keeps the one declaration honest. */
     void (*strbuf)(JSContext *ctx, StringBuffer *slot);
+    /* An OWN-KEY SNAPSHOT: the JSPropertyEnum array a walk took of its source, `n` entries, each holding an
+       atom reference. Its own operation for the same reason the accumulator is — it is one allocation the
+       byte-copy would leave two states pointing at, and its elements are atoms rather than values. */
+    void (*props)(JSContext *ctx, JSPropertyEnum **slot, uint32_t n);
 };
 typedef struct StringBuffer StringBuffer;
 
@@ -19041,8 +19045,23 @@ static void js_step_visit_free_strbuf(JSContext *ctx, StringBuffer *slot) {
     (void)ctx;
     if (slot->ctx) string_buffer_free(slot);
 }
-static const JSStepVisit js_step_visit_dup  = { js_step_visit_dup_val,  js_step_visit_dup_strbuf };
-static const JSStepVisit js_step_visit_free = { js_step_visit_free_val, js_step_visit_free_strbuf };
+/* The snapshot is one allocation holding n atom references: the copy needs both its own array and its own
+   reference to every atom in it, or the two states race to free one array and under-count every atom. */
+static void js_step_visit_dup_props(JSContext *ctx, JSPropertyEnum **slot, uint32_t n) {
+    JSPropertyEnum *src = *slot, *cp;
+    uint32_t i;
+    if (!src) return;
+    cp = js_malloc(ctx, sizeof(*cp) * (n > 0 ? n : 1));
+    if (!cp) { *slot = NULL; return; }   /* the copy walks no keys rather than sharing the original's */
+    for (i = 0; i < n; i++) { cp[i].is_enumerable = src[i].is_enumerable; cp[i].atom = JS_DupAtom(ctx, src[i].atom); }
+    *slot = cp;
+}
+static void js_step_visit_free_props(JSContext *ctx, JSPropertyEnum **slot, uint32_t n) {
+    js_free_prop_enum(ctx, *slot, n);
+    *slot = NULL;
+}
+static const JSStepVisit js_step_visit_dup  = { js_step_visit_dup_val,  js_step_visit_dup_strbuf,  js_step_visit_dup_props };
+static const JSStepVisit js_step_visit_free = { js_step_visit_free_val, js_step_visit_free_strbuf, js_step_visit_free_props };
 /* A machine's teardown releases what it owns through the SAME declaration the clone reads, so the two cannot
    disagree about which fields those are. */
 static void tramp_step_visit_free(JSContext *ctx, void *st) {
@@ -61195,16 +61214,29 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
     }
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit) for the walk itself — every source key read is the page's
+   getter or a Proxy trap, which is what makes Object.values / entries / assign / spread machines a fork
+   reaches. The DEFINEPROPS-only collection (dcur, dl, dk) is NOT here: it holds descriptor records whose deep
+   copy is its own capability, and js_step_has_borrowed_link refuses a fork while one is in flight rather than
+   letting the sibling share them. */
+static void js_prop_walk_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSPropWalk *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->el);
+    v->val(ctx, &s->obj);
+    v->val(ctx, &s->cb[0]);
+    v->val(ctx, &s->cb[1]);
+    v->props(ctx, &s->atoms, s->len);
+}
+
 static JSValue js_prop_walk_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSPropWalk *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->result);
-    JS_FreeValue(ctx, s->el);
-    JS_FreeValue(ctx, s->obj);
-    if (s->atoms) js_free_prop_enum(ctx, s->atoms, s->len);
+    if (take_result) s->result = JS_UNDEFINED;   /* handed out, read above before the rest is released */
+    tramp_step_visit_free(ctx, s);
     js_desc_cursor_free(ctx, &s->dcur);
-    JS_FreeValue(ctx, s->cb[0]); JS_FreeValue(ctx, s->cb[1]);
     if (s->dl) {
         uint32_t k;
         for (k = 0; k < s->nd; k++) {
@@ -67577,6 +67609,7 @@ static int js_array_fromlike_step(JSContext *ctx, void *st, JSValue cb_result, J
 static JSValue js_array_fromlike_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_array_flat_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_prop_walk_fini(JSContext *ctx, void *st, bool take_result);
+static void js_prop_walk_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static JSValue js_bigint_asUintN(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int asIntN);
 static JSValue js_object_getOwnPropertyDescriptor(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
 static int js_iter_helper_new_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
@@ -68210,20 +68243,20 @@ static const JSTrampStepDef js_array_join_def     = { sizeof(JSArrayJoin), js_ar
 static const JSTrampStepDef js_array_tolocale_def = { sizeof(JSArrayJoin), js_array_join_step, js_array_join_fini, JOIN_ARRAY_LOCALE, .visit = js_array_join_visit };
 static const JSTrampStepDef js_ta_join_def        = { sizeof(JSArrayJoin), js_array_join_step, js_array_join_fini, JOIN_TA, .visit = js_array_join_visit };
 static const JSTrampStepDef js_ta_tolocale_def    = { sizeof(JSArrayJoin), js_array_join_step, js_array_join_fini, JOIN_TA_LOCALE, .visit = js_array_join_visit };
-static const JSTrampStepDef js_obj_values_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_VALUES };
-static const JSTrampStepDef js_obj_keys_def       = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_KEYS };
-static const JSTrampStepDef js_obj_descs_def      = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_DESCS };
+static const JSTrampStepDef js_obj_values_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_VALUES, .visit = js_prop_walk_visit };
+static const JSTrampStepDef js_obj_keys_def       = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_KEYS, .visit = js_prop_walk_visit };
+static const JSTrampStepDef js_obj_descs_def      = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_DESCS, .visit = js_prop_walk_visit };
 static int js_reflect_prop_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_reflect_prop_fini(JSContext *ctx, void *st, bool take_result);
 static const JSTrampStepDef js_reflect_get_def    = { sizeof(JSReflectProp), js_reflect_prop_step, js_reflect_prop_fini, GP_GET };
 static const JSTrampStepDef js_reflect_set_def    = { sizeof(JSReflectProp), js_reflect_prop_step, js_reflect_prop_fini, GP_SET };
 static const JSTrampStepDef js_reflect_has_def    = { sizeof(JSReflectProp), js_reflect_prop_step, js_reflect_prop_fini, GP_HAS };
 static const JSTrampStepDef js_reflect_del_def    = { sizeof(JSReflectProp), js_reflect_prop_step, js_reflect_prop_fini, GP_DELETE };
-static const JSTrampStepDef js_obj_entries_def    = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_ENTRIES };
-static const JSTrampStepDef js_obj_assign_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_ASSIGN };
-static const JSTrampStepDef js_obj_defprops_def   = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_DEFPROPS };
-static const JSTrampStepDef js_obj_create_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_OBJCREATE };
-static const JSTrampStepDef js_obj_spread_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_SPREAD };
+static const JSTrampStepDef js_obj_entries_def    = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_ENTRIES, .visit = js_prop_walk_visit };
+static const JSTrampStepDef js_obj_assign_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_ASSIGN, .visit = js_prop_walk_visit };
+static const JSTrampStepDef js_obj_defprops_def   = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_DEFPROPS, .visit = js_prop_walk_visit };
+static const JSTrampStepDef js_obj_create_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_OBJCREATE, .visit = js_prop_walk_visit };
+static const JSTrampStepDef js_obj_spread_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_SPREAD, .visit = js_prop_walk_visit };
 static const JSTrampStepDef js_array_flat_def      = { sizeof(JSArrayFlat), js_array_flat_step, js_array_flat_fini, ARRAYFLAT_FLAT };
 static const JSTrampStepDef js_array_flatMap_def   = { sizeof(JSArrayFlat), js_array_flat_step, js_array_flat_fini, ARRAYFLAT_FLATMAP };
 static const JSTrampStepDef js_array_fromlike_def  = { sizeof(JSArrayFromLike), js_array_fromlike_step, js_array_fromlike_fini, 0 };
@@ -70437,10 +70470,20 @@ static void js_array_join_visit(JSContext *ctx, void *st, JSStepVisit *v)
     for (i = 0; i < 2; i++) v->val(ctx, &s->cb[i]);
 }
 
-/* The one machine that holds a link into its chain (see js_step_has_borrowed_link). */
+/* The machines holding state a clone must not copy: a link into this flow's own chain, or a collection whose
+   deep copy is a capability that has not been built. Both refuse the fork rather than aliasing. */
 static bool js_step_has_borrowed_link(const JSStepHdr *h)
 {
     if (h->def->visit == js_array_join_visit) return ((const JSArrayJoin *)h)->outer_join != NULL;
+    if (h->def->visit == js_prop_walk_visit) {
+        /* Object.defineProperties collects every descriptor before defining any (20.1.2.3.1 is explicitly two
+           loops). Those records own three values and an atom each, which is a deep copy of its own — until it
+           exists a fork mid-collection would hand both arms one list. The WALK modes carry none of it. */
+        const JSPropWalk *w = (const JSPropWalk *)h;
+        return w->dl != NULL || w->dcur.field != 0 || w->dcur.phase != DESC_PH_ASK
+               || !JS_IsUndefined(w->dcur.value) || !JS_IsUndefined(w->dcur.getter)
+               || !JS_IsUndefined(w->dcur.setter);
+    }
     return false;
 }
 
