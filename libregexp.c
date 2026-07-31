@@ -30,6 +30,7 @@
 
 #include "cutils.h"
 #include "libregexp.h"
+#include "quickjs-check.h"
 #include "libunicode.h"
 
 /* ASCII identifier tables, used by lre_js_is_ident_first/next in libregexp.h
@@ -1815,8 +1816,6 @@ static bool is_duplicate_group_name(REParseState *s, const char *name, int scope
     return false;
 }
 
-static int re_parse_disjunction(REParseState *s, bool is_backward_dir);
-
 static int re_parse_modifiers(REParseState *s, const uint8_t **pp)
 {
     const uint8_t *p = *pp;
@@ -1852,13 +1851,190 @@ static bool update_modifier(bool val, int add_mask, int remove_mask,
     return val;
 }
 
-static int re_parse_term(REParseState *s, bool is_backward_dir)
+/* Disjunction, Alternative and Term — 22.2.1's three mutually recursive productions, as ONE machine over an
+   explicit FRAME STACK. They were C recursion one frame per `(` of nesting with the depth chosen by the input,
+   and the lre_check_stack_overflow in front of re_parse_disjunction turned that into "stack overflow" — a BOUND
+   in an error's clothing, for a grammar that has an answer at every depth. `new RegExp("(".repeat(100000))` is
+   a valid-shaped pattern the parser simply refused to look at.
+
+   ONE frame per DISJUNCTION level. It holds that disjunction's own state (where its byte code began, the
+   REOP_goto awaiting a patch), the alternative loop's reversal window, and the TERM in flight — because a term
+   is always inside exactly one alternative of exactly one disjunction, and only a NESTED disjunction needs a
+   frame of its own. `resume` is where that nested disjunction's completion lands: the four places a term
+   descends are `(?:`, `(?i-m:`, a lookaround, and a capture, and each has different work waiting after it.
+   Found by engine/check_recursion.mjs. */
+enum { RR_ROOT = 0, RR_NONCAP, RR_MODIFIER, RR_LOOKAHEAD, RR_CAPTURE };
+
+typedef struct REParseFrame {
+    uint8_t resume;                 /* RR_*: where this frame's CHILD disjunction returns to */
+    bool is_backward_dir;
+    int dj_start;                   /* byte_code.size when this disjunction began */
+    int goto_pos;                   /* the REOP_goto of the alternative in flight, or -1 */
+    size_t alt_start, term_start;   /* the backward-dir term reversal window */
+    /* the TERM's locals, saved across the child. Only these outlive a descent: every other local is either
+       recomputed from s->buf_ptr or dead by the time the child runs. */
+    int last_atom_start, last_capture_count;
+    int pos, capture_index;
+    bool is_neg;
+    bool saved_ignore_case, saved_multi_line, saved_dotall;
+} REParseFrame;
+
+static int re_frame_push(REParseState *s, REParseFrame **pst, int *psp, int *psize,
+                         bool is_backward_dir)
 {
+    REParseFrame *st = *pst, *f;
+    if (*psp >= *psize) {
+        int n = *psize ? *psize * 2 : 16;
+        REParseFrame *ns = lre_realloc(s->opaque, st, sizeof(*ns) * (size_t)n);
+        if (!ns)
+            return re_parse_out_of_memory(s);
+        *pst = st = ns;
+        *psize = n;
+    }
+    f = &st[(*psp)++];
+    memset(f, 0, sizeof(*f));
+    f->resume = RR_ROOT;
+    f->is_backward_dir = is_backward_dir;
+    f->goto_pos = -1;
+    return 0;
+}
+
+static int re_parse_disjunction(REParseState *s, bool is_backward_dir)
+{
+    REParseFrame *st = NULL, *f = NULL;
+    int sp = 0, st_size = 0, ret = 0;
     const uint8_t *p;
     int c, last_atom_start, quant_min, quant_max, last_capture_count;
+    int pos, capture_index;
     bool greedy, is_neg, is_backward_lookahead;
+    bool saved_ignore_case, saved_multi_line, saved_dotall;
     REStringList cr_s, *cr = &cr_s;
+    size_t start, term_start, end, term_size;
+    int len;
 
+/* An error inside the term: report it, then unwind the whole stack through `fail`. re_parse_error always
+   returns -1, so nothing is lost by dropping its value. */
+#define RE_ERROR(...)   do { re_parse_error(__VA_ARGS__); goto fail; } while (0)
+/* DESCEND into a nested disjunction: park the term's live locals on THIS frame, push the child's, and restart
+   the machine at dj_enter. The `goto` is the call. */
+#define RE_DESCEND(rr, dir)                                                     \
+    do {                                                                        \
+        f->resume = (rr);                                                       \
+        f->last_atom_start = last_atom_start;                                   \
+        f->last_capture_count = last_capture_count;                             \
+        f->pos = pos;                                                           \
+        f->capture_index = capture_index;                                       \
+        f->is_neg = is_neg;                                                     \
+        f->saved_ignore_case = saved_ignore_case;                               \
+        f->saved_multi_line = saved_multi_line;                                 \
+        f->saved_dotall = saved_dotall;                                         \
+        if (re_frame_push(s, &st, &sp, &st_size, (dir)))                        \
+            goto fail;                                                          \
+        goto dj_enter;                                                          \
+    } while (0)
+/* …and the return: the frame is back on top, so restore what the descent parked. */
+#define RE_RESUMED()                                                            \
+    do {                                                                        \
+        f = &st[sp - 1];                                                        \
+        is_backward_dir = f->is_backward_dir;                                   \
+        last_atom_start = f->last_atom_start;                                   \
+        last_capture_count = f->last_capture_count;                             \
+        pos = f->pos;                                                           \
+        capture_index = f->capture_index;                                       \
+        is_neg = f->is_neg;                                                     \
+        saved_ignore_case = f->saved_ignore_case;                               \
+        saved_multi_line = f->saved_multi_line;                                 \
+        saved_dotall = f->saved_dotall;                                         \
+    } while (0)
+
+    if (re_frame_push(s, &st, &sp, &st_size, is_backward_dir))
+        goto fail;
+
+ dj_enter:
+    f = &st[sp - 1];
+    f->dj_start = s->byte_code.size;
+    f->goto_pos = -1;
+
+ alt_enter:
+    f->alt_start = s->byte_code.size;
+
+ alt_loop:
+    is_backward_dir = f->is_backward_dir;
+    p = s->buf_ptr;
+    if (p >= s->buf_end || *p == '|' || *p == ')')
+        goto alt_done;
+    f->term_start = s->byte_code.size;
+    goto term_enter;
+
+ term_done:
+    f = &st[sp - 1];
+    if (f->is_backward_dir) {
+        /* reverse the order of the terms (XXX: inefficient, but
+           speed is not really critical here) */
+        start = f->alt_start;
+        term_start = f->term_start;
+        end = s->byte_code.size;
+        term_size = end - term_start;
+        if (dbuf_claim(&s->byte_code, term_size))
+            goto fail;
+        memmove(s->byte_code.buf + start + term_size,
+                s->byte_code.buf + start,
+                end - start);
+        memcpy(s->byte_code.buf + start, s->byte_code.buf + end,
+               term_size);
+    }
+    goto alt_loop;
+
+ alt_done:
+    if (f->goto_pos >= 0) {
+        /* patch the goto of the alternative that just finished */
+        len = s->byte_code.size - (f->goto_pos + 4);
+        put_u32(s->byte_code.buf + f->goto_pos, len);
+        f->goto_pos = -1;
+    }
+    if (*s->buf_ptr == '|') {
+        s->buf_ptr++;
+
+        len = s->byte_code.size - f->dj_start;
+
+        /* insert a split before the first alternative */
+        if (dbuf_insert(&s->byte_code, f->dj_start, 5)) {
+            re_parse_out_of_memory(s);
+            goto fail;
+        }
+        s->byte_code.buf[f->dj_start] = REOP_split_next_first;
+        put_u32(s->byte_code.buf + f->dj_start + 1, len + 5);
+
+        f->goto_pos = re_emit_op_u32(s, REOP_goto, 0);
+
+        s->group_name_scope++;
+
+        goto alt_enter;
+    }
+    /* this disjunction is complete: hand control back to the term that descended into it */
+    sp--;
+    if (sp == 0) {
+        ret = 0;
+        goto done;
+    }
+    switch (st[sp - 1].resume) {
+    case RR_NONCAP:    goto after_noncap;
+    case RR_MODIFIER:  goto after_modifier;
+    case RR_LOOKAHEAD: goto after_lookahead;
+    case RR_CAPTURE:   goto after_capture;
+    default: break;
+    }
+    DFAIL("a nested regexp disjunction completed with no descent recorded on the frame below it");
+
+ term_enter:
+    f = &st[sp - 1];
+    is_backward_dir = f->is_backward_dir;
+    pos = 0;
+    capture_index = 0;
+    is_neg = false;
+    saved_ignore_case = s->ignore_case;
+    saved_multi_line = s->multi_line;
+    saved_dotall = s->dotall;
     last_atom_start = -1;
     last_capture_count = 0;
     p = s->buf_ptr;
@@ -1884,7 +2060,7 @@ static int re_parse_term(REParseState *s, bool is_backward_dir)
         break;
     case '{':
         if (s->is_unicode) {
-            return re_parse_error(s, "syntax error");
+            RE_ERROR(s, "syntax error");
         } else if (!lre_is_digit(p[1])) {
             /* Annex B: we accept '{' not followed by digits as a
                normal atom */
@@ -1907,7 +2083,7 @@ static int re_parse_term(REParseState *s, bool is_backward_dir)
     case '*':
     case '+':
     case '?':
-        return re_parse_error(s, "nothing to repeat");
+        RE_ERROR(s, "nothing to repeat");
     case '(':
         if (p[1] == '?') {
             if (p[2] == ':') {
@@ -1915,31 +2091,31 @@ static int re_parse_term(REParseState *s, bool is_backward_dir)
                 last_atom_start = s->byte_code.size;
                 last_capture_count = s->capture_count;
                 s->buf_ptr = p;
-                if (re_parse_disjunction(s, is_backward_dir))
-                    return -1;
+                RE_DESCEND(RR_NONCAP, is_backward_dir);
+            after_noncap:
+                RE_RESUMED();
                 p = s->buf_ptr;
                 if (re_parse_expect(s, &p, ')'))
-                    return -1;
+                    goto fail;
             } else if (p[2] == 'i' || p[2] == 'm' || p[2] == 's' || p[2] == '-') {
-                bool saved_ignore_case, saved_multi_line, saved_dotall;
                 int add_mask, remove_mask;
                 p += 2;
                 remove_mask = 0;
                 add_mask = re_parse_modifiers(s, &p);
                 if (add_mask < 0)
-                    return -1;
+                    goto fail;
                 if (*p == '-') {
                     p++;
                     remove_mask = re_parse_modifiers(s, &p);
                     if (remove_mask < 0)
-                        return -1;
+                        goto fail;
                 }
                 if ((add_mask == 0 && remove_mask == 0) ||
                     (add_mask & remove_mask) != 0) {
-                    return re_parse_error(s, "invalid modifiers");
+                    RE_ERROR(s, "invalid modifiers");
                 }
                 if (re_parse_expect(s, &p, ':'))
-                    return -1;
+                    goto fail;
                 saved_ignore_case = s->ignore_case;
                 saved_multi_line = s->multi_line;
                 saved_dotall = s->dotall;
@@ -1950,11 +2126,12 @@ static int re_parse_term(REParseState *s, bool is_backward_dir)
                 last_atom_start = s->byte_code.size;
                 last_capture_count = s->capture_count;
                 s->buf_ptr = p;
-                if (re_parse_disjunction(s, is_backward_dir))
-                    return -1;
+                RE_DESCEND(RR_MODIFIER, is_backward_dir);
+            after_modifier:
+                RE_RESUMED();
                 p = s->buf_ptr;
                 if (re_parse_expect(s, &p, ')'))
-                    return -1;
+                    goto fail;
                 s->ignore_case = saved_ignore_case;
                 s->multi_line = saved_multi_line;
                 s->dotall = saved_dotall;
@@ -1979,27 +2156,28 @@ static int re_parse_term(REParseState *s, bool is_backward_dir)
                 }
                 pos = re_emit_op_u32(s, REOP_lookahead + is_neg, 0);
                 s->buf_ptr = p;
-                if (re_parse_disjunction(s, is_backward_lookahead))
-                    return -1;
+                RE_DESCEND(RR_LOOKAHEAD, is_backward_lookahead);
+            after_lookahead:
+                RE_RESUMED();
                 p = s->buf_ptr;
                 if (re_parse_expect(s, &p, ')'))
-                    return -1;
+                    goto fail;
                 re_emit_op(s, REOP_lookahead_match + is_neg);
                 /* jump after the 'match' after the lookahead is successful */
                 if (dbuf_error(&s->byte_code))
-                    return -1;
+                    goto fail;
                 put_u32(s->byte_code.buf + pos, s->byte_code.size - (pos + 4));
             } else if (p[2] == '<') {
                 p += 3;
                 if (re_parse_group_name(s->u.tmp_buf, sizeof(s->u.tmp_buf),
                                         &p)) {
-                    return re_parse_error(s, "invalid group name");
+                    RE_ERROR(s, "invalid group name");
                 }
                 /* poor's man method to test duplicate group
                    names. */
                 /* XXX: this method does not catch all the errors*/
                 if (is_duplicate_group_name(s, s->u.tmp_buf, s->group_name_scope)) {
-                    return re_parse_error(s, "duplicate group name");
+                    RE_ERROR(s, "duplicate group name");
                 }
                 /* group name with a trailing zero */
                 dbuf_put(&s->group_names, (uint8_t *)s->u.tmp_buf,
@@ -2008,7 +2186,7 @@ static int re_parse_term(REParseState *s, bool is_backward_dir)
                 s->has_named_captures = 1;
                 goto parse_capture;
             } else {
-                return re_parse_error(s, "invalid group");
+                RE_ERROR(s, "invalid group");
             }
         } else {
             int capture_index;
@@ -2018,7 +2196,7 @@ static int re_parse_term(REParseState *s, bool is_backward_dir)
             dbuf_putc(&s->group_names, 0);
         parse_capture:
             if (s->capture_count >= CAPTURE_COUNT_MAX)
-                return re_parse_error(s, "too many captures");
+                RE_ERROR(s, "too many captures");
             last_atom_start = s->byte_code.size;
             last_capture_count = s->capture_count;
             capture_index = s->capture_count++;
@@ -2026,15 +2204,16 @@ static int re_parse_term(REParseState *s, bool is_backward_dir)
                           capture_index);
 
             s->buf_ptr = p;
-            if (re_parse_disjunction(s, is_backward_dir))
-                return -1;
+            RE_DESCEND(RR_CAPTURE, is_backward_dir);
+        after_capture:
+            RE_RESUMED();
             p = s->buf_ptr;
 
             re_emit_op_u8(s, REOP_save_start + 1 - is_backward_dir,
                           capture_index);
 
             if (re_parse_expect(s, &p, ')'))
-                return -1;
+                goto fail;
         }
         break;
     case '\\':
@@ -2060,7 +2239,7 @@ static int re_parse_term(REParseState *s, bool is_backward_dir)
                        unicode mode if there is no named capture
                        definition */
                     if (s->is_unicode || re_has_named_captures(s))
-                        return re_parse_error(s, "expecting group name");
+                        RE_ERROR(s, "expecting group name");
                     else
                         goto parse_class_atom;
                 }
@@ -2068,7 +2247,7 @@ static int re_parse_term(REParseState *s, bool is_backward_dir)
                 if (re_parse_group_name(s->u.tmp_buf, sizeof(s->u.tmp_buf),
                                         &p1)) {
                     if (s->is_unicode || re_has_named_captures(s))
-                        return re_parse_error(s, "invalid group name");
+                        RE_ERROR(s, "invalid group name");
                     else
                         goto parse_class_atom;
                 }
@@ -2080,7 +2259,7 @@ static int re_parse_term(REParseState *s, bool is_backward_dir)
                     n = re_parse_captures(s, &dummy_res, s->u.tmp_buf, false);
                     if (n == 0) {
                         if (s->is_unicode || re_has_named_captures(s))
-                            return re_parse_error(s, "group name not defined");
+                            RE_ERROR(s, "group name not defined");
                         else
                             goto parse_class_atom;
                     }
@@ -2104,7 +2283,7 @@ static int re_parse_term(REParseState *s, bool is_backward_dir)
             c = 0;
             if (s->is_unicode) {
                 if (lre_is_digit(*p)) {
-                    return re_parse_error(s, "invalid decimal escape in regular expression");
+                    RE_ERROR(s, "invalid decimal escape in regular expression");
                 }
             } else {
                 /* Annex B.1.4: accept legacy octal */
@@ -2142,7 +2321,7 @@ static int re_parse_term(REParseState *s, bool is_backward_dir)
                         }
                         goto normal_char;
                     }
-                    return re_parse_error(s, "back reference out of range in regular expression");
+                    RE_ERROR(s, "back reference out of range in regular expression");
                 }
                 last_atom_start = s->byte_code.size;
                 last_capture_count = s->capture_count;
@@ -2161,20 +2340,20 @@ static int re_parse_term(REParseState *s, bool is_backward_dir)
         if (is_backward_dir)
             re_emit_op(s, REOP_prev);
         if (re_parse_char_class(s, &p))
-            return -1;
+            goto fail;
         if (is_backward_dir)
             re_emit_op(s, REOP_prev);
         break;
     case ']':
     case '}':
         if (s->is_unicode)
-            return re_parse_error(s, "syntax error");
+            RE_ERROR(s, "syntax error");
         goto parse_class_atom;
     default:
     parse_class_atom:
         c = get_class_atom(s, cr, &p, false);
         if ((int)c < 0)
-            return -1;
+            goto fail;
     normal_char:
         last_atom_start = s->byte_code.size;
         last_capture_count = s->capture_count;
@@ -2192,7 +2371,7 @@ static int re_parse_term(REParseState *s, bool is_backward_dir)
             }
             re_string_list_free(cr);
             if (ret)
-                return -1;
+                goto fail;
         } else {
             if (s->ignore_case)
                 c = lre_canonicalize(c, s->is_unicode);
@@ -2241,7 +2420,7 @@ static int re_parse_term(REParseState *s, bool is_backward_dir)
                         quant_max = parse_digits(&p, true);
                         if (quant_max < quant_min) {
                         invalid_quant_count:
-                            return re_parse_error(s, "invalid repetition count");
+                            RE_ERROR(s, "invalid repetition count");
                         }
                     } else {
                         quant_max = INT32_MAX; /* infinity */
@@ -2253,7 +2432,7 @@ static int re_parse_term(REParseState *s, bool is_backward_dir)
                     break;
                 }
                 if (re_parse_expect(s, &p, '}'))
-                    return -1;
+                    goto fail;
             }
         quantifier:
             greedy = true;
@@ -2262,11 +2441,11 @@ static int re_parse_term(REParseState *s, bool is_backward_dir)
                 greedy = false;
             }
             if (last_atom_start < 0) {
-                return re_parse_error(s, "nothing to repeat");
+                RE_ERROR(s, "nothing to repeat");
             }
             {
                 bool need_capture_init, add_zero_advance_check;
-                int len, pos;
+                int len;
                 
                 /* the spec tells that if there is no advance when
                    running the atom after the first quant_min times,
@@ -2374,80 +2553,20 @@ static int re_parse_term(REParseState *s, bool is_backward_dir)
         }
     }
     s->buf_ptr = p;
-    return 0;
+    goto term_done;
  out_of_memory:
-    return re_parse_out_of_memory(s);
+    re_parse_out_of_memory(s);
+    goto fail;
+ fail:
+    ret = -1;
+ done:
+    lre_realloc(s->opaque, st, 0);
+    return ret;
+#undef RE_ERROR
+#undef RE_DESCEND
+#undef RE_RESUMED
 }
 
-static int re_parse_alternative(REParseState *s, bool is_backward_dir)
-{
-    const uint8_t *p;
-    int ret;
-    size_t start, term_start, end, term_size;
-
-    start = s->byte_code.size;
-    for(;;) {
-        p = s->buf_ptr;
-        if (p >= s->buf_end)
-            break;
-        if (*p == '|' || *p == ')')
-            break;
-        term_start = s->byte_code.size;
-        ret = re_parse_term(s, is_backward_dir);
-        if (ret)
-            return ret;
-        if (is_backward_dir) {
-            /* reverse the order of the terms (XXX: inefficient, but
-               speed is not really critical here) */
-            end = s->byte_code.size;
-            term_size = end - term_start;
-            if (dbuf_claim(&s->byte_code, term_size))
-                return -1;
-            memmove(s->byte_code.buf + start + term_size,
-                    s->byte_code.buf + start,
-                    end - start);
-            memcpy(s->byte_code.buf + start, s->byte_code.buf + end,
-                   term_size);
-        }
-    }
-    return 0;
-}
-
-static int re_parse_disjunction(REParseState *s, bool is_backward_dir)
-{
-    int start, len, pos;
-
-    if (lre_check_stack_overflow(s->opaque, 0))
-        return re_parse_error(s, "stack overflow");
-
-    start = s->byte_code.size;
-    if (re_parse_alternative(s, is_backward_dir))
-        return -1;
-    while (*s->buf_ptr == '|') {
-        s->buf_ptr++;
-
-        len = s->byte_code.size - start;
-
-        /* insert a split before the first alternative */
-        if (dbuf_insert(&s->byte_code, start, 5)) {
-            return re_parse_out_of_memory(s);
-        }
-        s->byte_code.buf[start] = REOP_split_next_first;
-        put_u32(s->byte_code.buf + start + 1, len + 5);
-
-        pos = re_emit_op_u32(s, REOP_goto, 0);
-
-        s->group_name_scope++;
-        
-        if (re_parse_alternative(s, is_backward_dir))
-            return -1;
-
-        /* patch the goto */
-        len = s->byte_code.size - (pos + 4);
-        put_u32(s->byte_code.buf + pos, len);
-    }
-    return 0;
-}
 
 /* Allocate the registers as a stack. The control flow is recursive so
    the analysis can be linear. */
