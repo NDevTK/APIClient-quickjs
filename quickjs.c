@@ -1530,6 +1530,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_STR_PADSTART, STEPDEF_STR_PADEND,
     STEPDEF_TA_AT, STEPDEF_TA_SET, STEPDEF_JSON_RAWJSON,
     STEPDEF_BOOLEAN_CTOR,
+    STEPDEF_OBJECT_CTOR,
     STEPDEF_OBJ_DEFINEPROPERTY, STEPDEF_REFLECT_DEFINEPROPERTY, STEPDEF_OBJ_DEFINEPROPERTIES,
     STEPDEF_OBJ_DEFGETTER, STEPDEF_OBJ_DEFSETTER,
     STEPDEF_OBJ_CREATE,
@@ -60303,27 +60304,22 @@ static int js_desc_cursor_run(JSContext *ctx, JSDescCursor *c, JSValueConst desc
    trap. Every routed descriptor walk is JSDescCursor; this survived only for the Proxy getOwnPropertyDescriptor
    trap-result read, and that hook's body is now gone. The ToPropertyDescriptor C-read ratchet reaches 0 with it. */
 
-static JSValue js_object_constructor(JSContext *ctx, JSValueConst new_target,
-                                     int argc, JSValueConst *argv)
+/* 20.1.1.1 Object(value), everything AFTER step 1. Step 1 is OrdinaryCreateFromConstructor and it is the
+   MACHINE's — a subclass's NewTarget makes it read `prototype`, which is the page's [[Get]] and can be a
+   getter or a Proxy trap; js_object_constructor performed it with js_create_from_ctor from its C entry, so
+   `Reflect.construct(Object, [], new Proxy(f, {get(){…}}))` aborted at js_proxy_get's DFAIL.
+   The object arriving here therefore means "step 1 ran and this is its answer", which step 1 RETURNS. Steps 2
+   and 3 are the other case, and neither invokes anything — which is exactly what the declaration asserts. */
+static JSValue js_object_ctor_body(JSContext *ctx, JSValueConst obj_, int argc, JSValueConst *argv)
 {
-    JSValue ret;
-    if (!JS_IsUndefined(new_target) &&
-        JS_VALUE_GET_OBJ(new_target) !=
-        JS_VALUE_GET_OBJ(JS_GetActiveFunction(ctx))) {
-        ret = js_create_from_ctor(ctx, new_target, JS_CLASS_OBJECT);
-    } else {
-        int tag = JS_VALUE_GET_NORM_TAG(argv[0]);
-        switch(tag) {
-        case JS_TAG_NULL:
-        case JS_TAG_UNDEFINED:
-            ret = JS_NewObject(ctx);
-            break;
-        default:
-            ret = JS_ToObject(ctx, argv[0]);
-            break;
-        }
-    }
-    return ret;
+    JSValue obj = unsafe_unconst(obj_);
+    int tag;
+    if (!JS_IsUndefined(obj))
+        return obj;                        /* step 1's object, already ours */
+    tag = JS_VALUE_GET_NORM_TAG(argv[0]);
+    if (tag == JS_TAG_NULL || tag == JS_TAG_UNDEFINED)
+        return JS_NewObject(ctx);          /* step 2 */
+    return JS_ToObject(ctx, argv[0]);      /* step 3 */
 }
 
 /* DELETED: js_object_getPrototypeOf's C body. Its whole content was one JS_GetPrototype, which on a Proxy runs
@@ -62610,6 +62606,14 @@ static JSValue js_primargs_fini(JSContext *ctx, void *st, bool take_result)
 #define CREATECTOR_WRAP 0x1000000
 #define CREATECTOR_ARG_WRAP(class_id, nargs) (CREATECTOR_ARG(class_id, nargs) | CREATECTOR_WRAP)
 #define CREATECTOR_IS_WRAP(a) (((a) & CREATECTOR_WRAP) != 0)
+/* 20.1.1.1 step 1 guards OrdinaryCreateFromConstructor with "NewTarget is neither undefined NOR THE ACTIVE
+   FUNCTION OBJECT" — so `new Object()` performs no create at all and only a SUBCLASS's NewTarget does. That
+   second half is Object's alone, and it is declared rather than written into a body because it decides whether
+   the machine's own create step happens; a body cannot un-perform a [[Get]] the machine already made. */
+#define CREATECTOR_SELF_PLAIN 0x2000000
+#define CREATECTOR_ARG_SELF_PLAIN(class_id, nargs) \
+    (CREATECTOR_ARG(class_id, nargs) | CREATECTOR_WRAP | CREATECTOR_SELF_PLAIN)
+#define CREATECTOR_IS_SELF_PLAIN(a) (((a) & CREATECTOR_SELF_PLAIN) != 0)
 typedef struct JSCreateCtor {
     JSStepHdr hdr;
     JSValue result;
@@ -62622,6 +62626,7 @@ static int js_creatector_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
     JSCreateCtor *s = st;
     JSValue obj;
     int r;
+    bool plain;
 
     if (s->hdr.stage == 0) {
         JS_FreeValue(ctx, cb_result);
@@ -62631,7 +62636,13 @@ static int js_creatector_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
             return -1;
         s->hdr.stage = 1;
     }
-    if (CREATECTOR_IS_WRAP(s->hdr.arg) && JS_IsUndefined(s->hdr.this_val)) {
+    /* the NEW TARGET this algorithm treats as ABSENT. Undefined always is (the CALL form); Object additionally
+       counts ITSELF, which is 20.1.1.1 step 1's second clause and the whole of the difference. */
+    plain = JS_IsUndefined(s->hdr.this_val)
+         || (CREATECTOR_IS_SELF_PLAIN(s->hdr.arg)
+             && JS_VALUE_GET_TAG(s->hdr.this_val) == JS_TAG_OBJECT
+             && JS_VALUE_GET_OBJ(s->hdr.this_val) == JS_VALUE_GET_OBJ(s->hdr.func_obj));
+    if (CREATECTOR_IS_WRAP(s->hdr.arg) && plain) {
         /* the CALL form of a WRAPPER constructor: 20.3.1.1 step 2 returns the primitive, so there is no object to
            create and the body says what the value is. */
         JS_FreeValue(ctx, cb_result);
@@ -68447,6 +68458,12 @@ static const JSTrampStepDef js_finrec_ctor_def =
 /* 27.1.3.1 Iterator: steps 1-2 are the abstract-class validation, step 3 is the whole constructor. */
 static const JSTrampStepDef js_iterator_ctor_def =
     CREATECTOR_DEF_FULL(JS_CLASS_ITERATOR, 0, generic, NULL, 0, js_iterator_ctor_precheck);
+static JSValue js_object_ctor_body(JSContext *ctx, JSValueConst obj_, int argc, JSValueConst *argv);
+/* 20.1.1.1: WRAP because the absent-NewTarget form's value is the body's, SELF_PLAIN because step 1 counts the
+   Object constructor itself as absent. */
+static const JSTrampStepDef js_object_ctor_def =
+    { sizeof(JSCreateCtor), js_creatector_step, js_creatector_fini, CREATECTOR_ARG_SELF_PLAIN(JS_CLASS_OBJECT, 1),
+      { .generic = js_object_ctor_body }, JS_CFUNC_generic, 0, NULL, NULL, NULL, .visit = js_creatector_visit };
 static const JSTrampStepDef js_boolean_ctor_def =
     { sizeof(JSCreateCtor), js_creatector_step, js_creatector_fini, CREATECTOR_ARG_WRAP(JS_CLASS_BOOLEAN, 1),
       { .generic = js_boolean_ctor_body }, JS_CFUNC_generic, 0, NULL, NULL, NULL, .visit = js_creatector_visit };
@@ -70156,6 +70173,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_FUNC_BIND]      = &js_func_bind_def,
     [STEPDEF_ITER_SET_CTOR]  = &js_iter_set_ctor_def,
     [STEPDEF_BOOLEAN_CTOR]   = &js_boolean_ctor_def,
+    [STEPDEF_OBJECT_CTOR]    = &js_object_ctor_def,
     [STEPDEF_ERROR_SET_STACK] = &js_error_set_stack_def,
     [STEPDEF_ERROR_GET_STACK] = &js_error_get_stack_def,
     [STEPDEF_ITER_SET_TAG]   = &js_iter_set_tag_def,
@@ -88780,7 +88798,7 @@ int JS_AddIntrinsicBaseObjects(JSContext *ctx)
 
     /* Object */
     obj1 = JS_NewCConstructor(ctx, JS_CLASS_OBJECT, "Object",
-                              js_object_constructor, 1, JS_CFUNC_constructor_or_func, 0,
+                              NULL, 1, JS_CFUNC_step_ctor, STEPDEF_OBJECT_CTOR,
                               JS_UNDEFINED,
                               js_object_funcs, countof(js_object_funcs),
                               js_object_proto_funcs, countof(js_object_proto_funcs),
