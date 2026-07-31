@@ -70206,22 +70206,32 @@ static JSValue js_iter_zip_drive_fini(JSContext *ctx, void *st, bool take_result
     return r;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The whole request buffer: the resolving function was captured
+   out of the capability and the value out of the call, so both outlive the callback frame that borrows them. */
+static void js_promise_resolve_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSPromiseResolveM *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->cb_args[0]);
+    v->val(ctx, &s->cb_args[1]);
+    v->val(ctx, &s->cb_args[2]);
+}
+
 static JSValue js_promise_resolve_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSPromiseResolveM *s = st;
-    JSValue r = take_result ? s->result : (JS_FreeValue(ctx, s->result), JS_UNDEFINED);
-    JS_FreeValue(ctx, s->cb_args[0]);
-    JS_FreeValue(ctx, s->cb_args[1]);
-    JS_FreeValue(ctx, s->cb_args[2]);
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free_rt(ctx->rt, s);
     return r;
 }
 
 static const JSTrampStepDef js_promise_resolve_def = {
-    sizeof(JSPromiseResolveM), js_promise_resolve_step, js_promise_resolve_fini, 0
+    sizeof(JSPromiseResolveM), js_promise_resolve_step, js_promise_resolve_fini, 0, .visit = js_promise_resolve_visit
 };
 static const JSTrampStepDef js_promise_reject_def = {
-    sizeof(JSPromiseResolveM), js_promise_resolve_step, js_promise_resolve_fini, 1
+    sizeof(JSPromiseResolveM), js_promise_resolve_step, js_promise_resolve_fini, 1, .visit = js_promise_resolve_visit
 };
 
 /* Promise.prototype.catch (27.2.5.1) as a STEP MACHINE. It is `Invoke(promise, "then", «undefined, onRejected»)`
@@ -70258,18 +70268,28 @@ static int js_promise_catch_step(JSContext *ctx, void *st, JSValue cb_result, JS
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). [this=promise, then, undefined, onRejected] — the promise and
+   the `then` read off it are references this machine took, and onRejected was dup'd out of the call. */
+static void js_promise_catch_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSPromiseCatch *s = st;
+    int k;
+    v->val(ctx, &s->result);
+    for (k = 0; k < 4; k++) v->val(ctx, &s->cb_args[k]);
+}
+
 static JSValue js_promise_catch_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSPromiseCatch *s = st;
-    JSValue r = take_result ? s->result : (JS_FreeValue(ctx, s->result), JS_UNDEFINED);
-    int k;
-    for (k = 0; k < 4; k++) JS_FreeValue(ctx, s->cb_args[k]);
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free_rt(ctx->rt, s);
     return r;
 }
 
 static const JSTrampStepDef js_promise_catch_def = {
-    sizeof(JSPromiseCatch), js_promise_catch_step, js_promise_catch_fini, 0
+    sizeof(JSPromiseCatch), js_promise_catch_step, js_promise_catch_fini, 0, .visit = js_promise_catch_visit
 };
 
 /* .finally's machine is defined with the rest of the Promise code, below this table, because it builds the
@@ -83821,20 +83841,34 @@ static int js_dispose_sync_step(JSContext *ctx, void *st, JSValue cb_result, JSV
     return 0;
 }
 
+/* One STOLEN resource. Its own declaration because both disposal machines hold the same list and a sub-object
+   array is visited element-wise; writing the two fields twice is the drift the declaration exists to stop. */
+static void js_disposable_resource_visit(JSContext *ctx, void *elem, JSStepVisit *v)
+{
+    JSDisposableResource *r = elem;
+    v->val(ctx, &r->value);
+    v->val(ctx, &r->method);
+}
+
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The stolen list is owned only up to the LIFO cursor: the
+   resources past it have already been disposed and released, so `i + 1` (clamped) is the live count in a list
+   of `n`. The accumulated error is a JSValue whose UNINITIALIZED sentinel means "no error yet" — that tag
+   carries no reference, so both consumers pass it through unchanged and the sentinel survives a fork.
+   The stack object no longer holds the list, so on an ABANDON this is the only release there is. */
+static void js_dispose_sync_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSDisposeRun *s = st;
+    int live = s->i + 1 < s->n ? s->i + 1 : s->n;
+    v->array(ctx, (void **)&s->res, sizeof(JSDisposableResource), live < 0 ? 0 : live, s->n,
+             js_disposable_resource_visit);
+    v->val(ctx, &s->cb[0]); v->val(ctx, &s->cb[1]); v->val(ctx, &s->cb[2]);
+    v->val(ctx, &s->error);
+}
+
 static JSValue js_dispose_sync_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSDisposeRun *s = st;
-    int i;
-    /* An ABANDON (the flow was torn down mid-disposal) leaves the tail of the stolen list still owned here —
-       the stack object no longer holds it, so this is the only release there is. */
-    for (i = 0; i <= s->i && i < s->n; i++) {
-        JS_FreeValue(ctx, s->res[i].value);
-        JS_FreeValue(ctx, s->res[i].method);
-    }
-    js_free(ctx, s->res);
-    JS_FreeValue(ctx, s->cb[0]); JS_FreeValue(ctx, s->cb[1]); JS_FreeValue(ctx, s->cb[2]);
-    if (!JS_IsUninitialized(s->error))
-        JS_FreeValue(ctx, s->error);
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return JS_UNDEFINED;   /* 27.3.3.3 returns undefined on every path */
 }
@@ -83842,7 +83876,8 @@ static JSValue js_dispose_sync_fini(JSContext *ctx, void *st, bool take_result)
 static const JSTrampStepDef js_dispose_sync_def = {
     sizeof(JSDisposeRun), js_dispose_sync_step, js_dispose_sync_fini, 0,
     /* body, body_proto, body_magic, precheck, midcheck, onerror */ {NULL}, 0, 0, NULL, NULL, NULL,
-    .catches_abrupt = 1   /* step 3.d: a throwing dispose method is a VALUE — it becomes the SuppressedError */
+    .catches_abrupt = 1,  /* step 3.d: a throwing dispose method is a VALUE — it becomes the SuppressedError */
+    .visit = js_dispose_sync_visit
 };
 
 static void js_disposable_stack_clear(JSRuntime *rt, JSDisposableStack *ds)
@@ -83895,16 +83930,24 @@ static int js_sync_dispose_wrap_step(JSContext *ctx, void *st, JSValue cb_result
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). Only the request buffer — the wrapper's value is always
+   undefined, so there is no result a completion could hand out. */
+static void js_sync_dispose_wrap_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSSyncDisposeWrap *s = st;
+    v->val(ctx, &s->cb[0]); v->val(ctx, &s->cb[1]); v->val(ctx, &s->cb[2]);
+}
+
 static JSValue js_sync_dispose_wrap_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSSyncDisposeWrap *s = st;
-    JS_FreeValue(ctx, s->cb[0]); JS_FreeValue(ctx, s->cb[1]); JS_FreeValue(ctx, s->cb[2]);
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return JS_UNDEFINED;   /* the wrapper's value is always undefined */
 }
 
 static const JSTrampStepDef js_sync_dispose_wrap_def = {
-    sizeof(JSSyncDisposeWrap), js_sync_dispose_wrap_step, js_sync_dispose_wrap_fini, 0
+    sizeof(JSSyncDisposeWrap), js_sync_dispose_wrap_step, js_sync_dispose_wrap_fini, 0, .visit = js_sync_dispose_wrap_visit
 };
 
 /* The wrapper's C entry, for the reason the chain link has one: JS_NewCFunctionData takes a function pointer and
@@ -83993,19 +84036,28 @@ static int js_get_dispose_method_step(JSContext *ctx, void *st, JSValue cb_resul
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The method it read. */
+static void js_get_dispose_method_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSGetDisposeMethod *s = st;
+    v->val(ctx, &s->result);
+}
+
 static JSValue js_get_dispose_method_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSGetDisposeMethod *s = st;
-    JSValue r = take_result ? s->result : (JS_FreeValue(ctx, s->result), JS_UNDEFINED);
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free_rt(ctx->rt, s);
     return r;
 }
 
 static const JSTrampStepDef js_get_dispose_sync_def = {
-    sizeof(JSGetDisposeMethod), js_get_dispose_method_step, js_get_dispose_method_fini, 0
+    sizeof(JSGetDisposeMethod), js_get_dispose_method_step, js_get_dispose_method_fini, 0, .visit = js_get_dispose_method_visit
 };
 static const JSTrampStepDef js_get_dispose_async_def = {
-    sizeof(JSGetDisposeMethod), js_get_dispose_method_step, js_get_dispose_method_fini, 1
+    sizeof(JSGetDisposeMethod), js_get_dispose_method_step, js_get_dispose_method_fini, 1, .visit = js_get_dispose_method_visit
 };
 
 static int js_disposable_ctor_precheck(JSContext *ctx, const JSStepHdr *h)
@@ -84134,21 +84186,30 @@ static int js_disposable_stack_use_step(JSContext *ctx, void *st, JSValue cb_res
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The value `use` returns. */
+static void js_disposable_stack_use_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSDisposableUse *s = st;
+    v->val(ctx, &s->result);
+}
+
 static JSValue js_disposable_stack_use_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSDisposableUse *s = st;
-    JSValue r = take_result ? s->result : (JS_FreeValue(ctx, s->result), JS_UNDEFINED);
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free_rt(ctx->rt, s);
     return r;
 }
 
 static const JSTrampStepDef js_disposable_use_def = {
     sizeof(JSDisposableUse), js_disposable_stack_use_step, js_disposable_stack_use_fini,
-    JS_CLASS_DISPOSABLE_STACK
+    JS_CLASS_DISPOSABLE_STACK, .visit = js_disposable_stack_use_visit
 };
 static const JSTrampStepDef js_async_disposable_use_def = {
     sizeof(JSDisposableUse), js_disposable_stack_use_step, js_disposable_stack_use_fini,
-    JS_CLASS_ASYNC_DISPOSABLE_STACK
+    JS_CLASS_ASYNC_DISPOSABLE_STACK, .visit = js_disposable_stack_use_visit
 };
 
 static JSValue js_disposable_stack_adopt(JSContext *ctx, JSValueConst this_val,
@@ -84303,12 +84364,20 @@ static int js_async_dispose_link_step(JSContext *ctx, void *st, JSValue cb_resul
     }
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The link's promise and its request buffer. */
+static void js_async_dispose_link_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSAsyncDisposeLink *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->cb[0]); v->val(ctx, &s->cb[1]); v->val(ctx, &s->cb[2]);
+}
+
 static JSValue js_async_dispose_link_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSAsyncDisposeLink *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->result);
-    JS_FreeValue(ctx, s->cb[0]); JS_FreeValue(ctx, s->cb[1]); JS_FreeValue(ctx, s->cb[2]);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -84316,7 +84385,8 @@ static JSValue js_async_dispose_link_fini(JSContext *ctx, void *st, bool take_re
 static const JSTrampStepDef js_async_dispose_link_def = {
     sizeof(JSAsyncDisposeLink), js_async_dispose_link_step, js_async_dispose_link_fini, 0,
     /* body, body_proto, body_magic, precheck, midcheck, onerror */ {NULL}, 0, 0, NULL, NULL, NULL,
-    .catches_abrupt = 1   /* a throwing dispose method is this algorithm's VALUE: it becomes the completion */
+    .catches_abrupt = 1,  /* a throwing dispose method is this algorithm's VALUE: it becomes the completion */
+    .visit = js_async_dispose_link_visit
 };
 
 /* Build one chain link's two reaction closures over [value, method, hint], both declared step machines. The
@@ -84465,14 +84535,26 @@ static int js_dispose_async_step(JSContext *ctx, void *st, JSValue cb_result, JS
     }
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The same partial ownership of the stolen list the sync
+   machine has — everything up to the cursor, which is the un-chained tail an abandon leaves owned here and
+   nowhere else. The chaining steps release ahead of the cursor by writing UNDEFINED into the slot, so a slot
+   inside the live range that has already gone is a value that holds nothing, not a second free. */
+static void js_dispose_async_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSDisposeAsync *s = st;
+    int live = s->i + 1 < s->n ? s->i + 1 : s->n;
+    v->val(ctx, &s->result);
+    v->array(ctx, (void **)&s->res, sizeof(JSDisposableResource), live < 0 ? 0 : live, s->n,
+             js_disposable_resource_visit);
+    v->val(ctx, &s->cb[0]); v->val(ctx, &s->cb[1]); v->val(ctx, &s->cb[2]);
+}
+
 static JSValue js_dispose_async_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSDisposeAsync *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->result);
-    js_dispose_async_drop(ctx, s, s->i);   /* an abandon leaves the un-chained tail owned here and nowhere else */
-    js_free(ctx, s->res);
-    JS_FreeValue(ctx, s->cb[0]); JS_FreeValue(ctx, s->cb[1]); JS_FreeValue(ctx, s->cb[2]);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -84480,7 +84562,8 @@ static JSValue js_dispose_async_fini(JSContext *ctx, void *st, bool take_result)
 static const JSTrampStepDef js_dispose_async_def = {
     sizeof(JSDisposeAsync), js_dispose_async_step, js_dispose_async_fini, 0,
     /* body, body_proto, body_magic, precheck, midcheck, onerror */ {NULL}, 0, 0, NULL, NULL, NULL,
-    .catches_abrupt = 1   /* the first dispose method's throw REJECTS the returned promise, it does not propagate */
+    .catches_abrupt = 1,  /* the first dispose method's throw REJECTS the returned promise, it does not propagate */
+    .visit = js_dispose_async_visit
 };
 
 static JSValue js_disposable_stack_move(JSContext *ctx, JSValueConst this_val,
@@ -85296,10 +85379,18 @@ static int js_promise_resolvefn_step(JSContext *ctx, void *st, JSValue cb_result
     }
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). Only the resolution: a resolving function has no result of its
+   own — it settles the capability it closes over — so there is nothing a completion could hand out. */
+static void js_promise_resolvefn_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSPromiseResolveFn *m = st;
+    v->val(ctx, &m->cb[0]);
+}
+
 static JSValue js_promise_resolvefn_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSPromiseResolveFn *m = st;
-    JS_FreeValue(ctx, m->cb[0]);
+    tramp_step_visit_free(ctx, m);
     js_free_rt(ctx->rt, m);
     return JS_UNDEFINED;   /* a resolving function has no result of its own */
 }
@@ -85307,7 +85398,8 @@ static JSValue js_promise_resolvefn_fini(JSContext *ctx, void *st, bool take_res
 static const JSTrampStepDef js_promise_resolvefn_def = {
     sizeof(JSPromiseResolveFn), js_promise_resolvefn_step, js_promise_resolvefn_fini, 0,
     /* body, body_proto, body_magic, precheck, midcheck, onerror */ {NULL}, 0, 0, NULL, NULL, NULL,
-    .catches_abrupt = 1   /* step 9: a throwing `then` read REJECTS, it does not propagate */
+    .catches_abrupt = 1   /* step 9: a throwing `then` read REJECTS, it does not propagate */,
+    .visit = js_promise_resolvefn_visit
 };
 
 static JSValue js_promise_resolve_function_call(JSContext *ctx,
@@ -85632,16 +85724,26 @@ static int js_promise_withresolvers_step(JSContext *ctx, void *st, JSValue cb_re
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The { promise, resolve, reject } object it is building; the
+   capability's three references live on that object once it is populated. */
+static void js_promise_withresolvers_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSPromiseWithResolvers *s = st;
+    v->val(ctx, &s->result);
+}
+
 static JSValue js_promise_withresolvers_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSPromiseWithResolvers *s = st;
-    JSValue r = take_result ? s->result : (JS_FreeValue(ctx, s->result), JS_UNDEFINED);
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free_rt(ctx->rt, s);
     return r;
 }
 
 static const JSTrampStepDef js_promise_withresolvers_def = {
-    sizeof(JSPromiseWithResolvers), js_promise_withresolvers_step, js_promise_withresolvers_fini, 0
+    sizeof(JSPromiseWithResolvers), js_promise_withresolvers_step, js_promise_withresolvers_fini, 0, .visit = js_promise_withresolvers_visit
 };
 
 static JSValue js_promise_try(JSContext *ctx, JSValueConst this_val,
@@ -85779,17 +85881,26 @@ static int js_promise_resolve_elem_step(JSContext *ctx, void *st, JSValue cb_res
     return 0;   /* DONE: a reaction's result is ignored */
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). cb_args[0] is the callback's `this`, a plain undefined that
+   holds no reference; the settle function and its argument are the two this machine took. An element resolver
+   has no result of its own — the combinator's promise is what settles. */
+static void js_promise_resolve_elem_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSPromiseResolveElem *s = st;
+    v->val(ctx, &s->cb_args[1]);
+    v->val(ctx, &s->cb_args[2]);
+}
+
 static JSValue js_promise_resolve_elem_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSPromiseResolveElem *s = st;
-    JS_FreeValue(ctx, s->cb_args[1]);
-    JS_FreeValue(ctx, s->cb_args[2]);
+    tramp_step_visit_free(ctx, s);
     js_free_rt(ctx->rt, s);
     return JS_UNDEFINED;
 }
 
 static const JSTrampStepDef js_promise_resolve_elem_def = {
-    sizeof(JSPromiseResolveElem), js_promise_resolve_elem_step, js_promise_resolve_elem_fini, 0
+    sizeof(JSPromiseResolveElem), js_promise_resolve_elem_step, js_promise_resolve_elem_fini, 0, .visit = js_promise_resolve_elem_visit
 };
 
 /* Mark a freshly-created resolve/reject element closure as a step machine, so its synchronous (thenable-driven)
@@ -86360,21 +86471,32 @@ static int js_promise_then_finally_step(JSContext *ctx, void *st, JSValue cb_res
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The settled value it replays through the thunk, the species
+   constructor it holds from phase 0 to phase 1, and all three request slots — which carry different things in
+   each phase ([undefined, onFinally] then [promise, then_method, then_func]) and are owned in both. */
+static void js_promise_then_finally_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSPromiseThenFinally *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->value);
+    v->val(ctx, &s->ctor);
+    v->val(ctx, &s->cb_args[0]);
+    v->val(ctx, &s->cb_args[1]);
+    v->val(ctx, &s->cb_args[2]);
+}
+
 static JSValue js_promise_then_finally_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSPromiseThenFinally *s = st;
-    JSValue r = take_result ? s->result : (JS_FreeValue(ctx, s->result), JS_UNDEFINED);
-    JS_FreeValue(ctx, s->cb_args[0]);
-    JS_FreeValue(ctx, s->cb_args[1]);
-    JS_FreeValue(ctx, s->cb_args[2]);
-    JS_FreeValue(ctx, s->ctor);
-    JS_FreeValue(ctx, s->value);
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free_rt(ctx->rt, s);
     return r;
 }
 
 static const JSTrampStepDef js_promise_then_finally_def = {
-    sizeof(JSPromiseThenFinally), js_promise_then_finally_step, js_promise_then_finally_fini, 0
+    sizeof(JSPromiseThenFinally), js_promise_then_finally_step, js_promise_then_finally_fini, 0, .visit = js_promise_then_finally_visit
 };
 
 /* The wrapper's C entry. It exists only because JS_NewCFunctionData takes a function pointer: the
@@ -86469,19 +86591,29 @@ static int js_promise_finally_step(JSContext *ctx, void *st, JSValue cb_result, 
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The species constructor captured into the two wrappers, and
+   the whole [promise, then, wrapper, wrapper] request buffer. */
+static void js_promise_finally_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSPromiseFinally *s = st;
+    int k;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->ctor);
+    for (k = 0; k < 4; k++) v->val(ctx, &s->cb_args[k]);
+}
+
 static JSValue js_promise_finally_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSPromiseFinally *s = st;
-    JSValue r = take_result ? s->result : (JS_FreeValue(ctx, s->result), JS_UNDEFINED);
-    int k;
-    for (k = 0; k < 4; k++) JS_FreeValue(ctx, s->cb_args[k]);
-    JS_FreeValue(ctx, s->ctor);
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free_rt(ctx->rt, s);
     return r;
 }
 
 static const JSTrampStepDef js_promise_finally_def = {
-    sizeof(JSPromiseFinally), js_promise_finally_step, js_promise_finally_fini, 0
+    sizeof(JSPromiseFinally), js_promise_finally_step, js_promise_finally_fini, 0, .visit = js_promise_finally_visit
 };
 
 static const JSCFunctionListEntry js_promise_funcs[] = {
@@ -86574,21 +86706,32 @@ static int js_iter_close_throw_step(JSContext *ctx, void *st, JSValue cb_result,
     return -1;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The stored rejection reason and the [iterator, return_fn]
+   request buffer. */
+static void js_iter_close_throw_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSIterCloseThrow *s = st;
+    v->val(ctx, &s->error);
+    v->val(ctx, &s->cb_args[0]);
+    v->val(ctx, &s->cb_args[1]);
+}
+
 static JSValue js_iter_close_throw_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSIterCloseThrow *s = st;
     DCHECK(!take_result, "IteratorClose-throw never completes normally");
-    JS_FreeValue(ctx, s->cb_args[0]);
-    JS_FreeValue(ctx, s->cb_args[1]);
     /* step 4: the stored completion is the result, REPLACING whatever the `return` call or the GetMethod
-       raised. */
+       raised. JS_Throw TAKES the reference, so the error leaves the machine here the way a result does — the
+       declaration below is what the OTHER consumer, the fork, reads. */
     JS_Throw(ctx, s->error);
+    s->error = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free_rt(ctx->rt, s);
     return JS_EXCEPTION;
 }
 
 static const JSTrampStepDef js_iter_close_throw_def = {
-    sizeof(JSIterCloseThrow), js_iter_close_throw_step, js_iter_close_throw_fini, 0
+    sizeof(JSIterCloseThrow), js_iter_close_throw_step, js_iter_close_throw_fini, 0, .visit = js_iter_close_throw_visit
 };
 
 /* The closure has no C body: its only dispatch is as a Promise reaction, and promise_reaction_job routes a
@@ -86684,19 +86827,30 @@ static int js_afs_cont_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
     return res ? -1 : 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The completion flag it answers with, and the whole
+   PromiseResolve request buffer — which is this machine's, not the sub-run's, whatever phase it is in. */
+static void js_afs_cont_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSAfsCont *m = st;
+    int i;
+    v->val(ctx, &m->result);
+    for (i = 0; i < 4; i++) v->val(ctx, &m->cb[i]);
+}
+
 static JSValue js_afs_cont_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSAfsCont *m = st;
-    JSValue r = take_result ? m->result : (JS_FreeValue(ctx, m->result), JS_UNDEFINED);
-    int i;
-    for (i = 0; i < 4; i++) JS_FreeValue(ctx, m->cb[i]);
+    JSValue r = take_result ? m->result : JS_UNDEFINED;
+    if (take_result) m->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, m);
     js_free_rt(ctx->rt, m);
     return r;
 }
 
 static const JSTrampStepDef js_afs_cont_def = {
     sizeof(JSAfsCont), js_afs_cont_step, js_afs_cont_fini, 0,
-    .catches_abrupt = 1   /* step 5's abrupt is a VALUE here: it selects between the close and the reject */
+    .catches_abrupt = 1,  /* step 5's abrupt is a VALUE here: it selects between the close and the reject */
+    .visit = js_afs_cont_visit
 };
 
 static JSValue js_afs_cont_c_entry(JSContext *ctx, JSValueConst this_val, int argc,
