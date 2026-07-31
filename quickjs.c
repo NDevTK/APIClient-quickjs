@@ -8418,6 +8418,48 @@ static bool js_error_stack_is_pending(JSValueConst v);
    map's constructor; quickjs has no such link, so the equivalent is the prototype's OWN `constructor` data
    property, which is where `new Foo()` records Foo. A Proxy is answered by name rather than walked, because
    walking it is a trap call. JS_NULL when the frame is not a method call. */
+/* THE PROPERTY THE CALL USED. `Nirk.prototype.valueOf = function () {}` gives the function no name of its
+   own — 13.15.2 applies NamedEvaluation to an IdentifierReference target, not to a MemberExpression — so the
+   only place `valueOf` still exists is the receiver, and V8 recovers it by looking for the function there.
+   It is also what tells `Wookie.a$b$c$d [as d]` apart from a plain method call: the function's own name and
+   the property it was reached through are different, and both are worth saying.
+
+   Own data properties only, along the prototype chain, running nothing: an accessor is not searched (reading
+   it is page code) and a Proxy is not walked (walking it is a trap). Two DIFFERENT names for the same
+   function is not a name, so it answers JS_NULL — V8 gives up on the same ambiguity. */
+static JSValue js_callsite_method_name(JSContext *ctx, const JSCallSiteData *csd)
+{
+    JSObject *p;
+    JSShape *sh;
+    JSShapeProperty *prs;
+    JSAtom found = JS_ATOM_NULL;
+    int i;
+
+    if (JS_VALUE_GET_TAG(csd->func) != JS_TAG_OBJECT ||
+        JS_VALUE_GET_TAG(csd->this_val) != JS_TAG_OBJECT)
+        return JS_NULL;
+    for (p = JS_VALUE_GET_OBJ(csd->this_val); p != NULL; p = p->shape->proto) {
+        if (p->class_id == JS_CLASS_PROXY)
+            break;
+        sh = p->shape;
+        for (i = 0, prs = get_shape_prop(sh); i < sh->prop_count; i++, prs++) {
+            if (prs->atom == JS_ATOM_NULL)
+                continue;
+            if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+                continue;
+            if (JS_VALUE_GET_PTR(p->prop[i].u.value) != JS_VALUE_GET_PTR(csd->func) ||
+                JS_VALUE_GET_TAG(p->prop[i].u.value) != JS_VALUE_GET_TAG(csd->func))
+                continue;
+            if (found != JS_ATOM_NULL && found != prs->atom)
+                return JS_NULL;          /* two names for one function is not a name */
+            found = prs->atom;
+        }
+    }
+    if (found == JS_ATOM_NULL)
+        return JS_NULL;
+    return JS_AtomToString(ctx, found);
+}
+
 static const char *get_func_name(JSContext *ctx, JSValueConst func);
 static JSValue js_callsite_type_name(JSContext *ctx, const JSCallSiteData *csd)
 {
@@ -8478,21 +8520,34 @@ static void js_callsite_data_line(JSContext *ctx, DynBuf *dbuf, const JSCallSite
        is "Foo.bar". Both are already in the record — the second is the receiver's type, which is why a frame
        had to learn its receiver before this line could be written. */
     dbuf_printf(dbuf, "    at ");
-    if (csd->constructor) {
-        dbuf_printf(dbuf, "new ");
-    } else {
-        JSValue tn = js_callsite_type_name(ctx, csd);
+    {
+        const char *fn = JS_IsNull(csd->func_name) ? NULL : JS_ToCString(ctx, csd->func_name);
+        JSValue tn = csd->constructor ? JS_NULL : js_callsite_type_name(ctx, csd);
+        JSValue mn = JS_IsString(tn) ? js_callsite_method_name(ctx, csd) : JS_NULL;
+        const char *mname = JS_IsString(mn) ? JS_ToCString(ctx, mn) : NULL;
+
+        if (csd->constructor)
+            dbuf_printf(dbuf, "new ");
         if (JS_IsString(tn)) {
             s = JS_ToCString(ctx, tn);
             if (s && s[0])
                 dbuf_printf(dbuf, "%s.", s);
             JS_FreeCString(ctx, s);
         }
+        /* A function with no name of its own is named by the property it was reached through; one whose name
+           DIFFERS from that property says both, because either alone sends a reader to the wrong place. */
+        if (fn && fn[0]) {
+            dbuf_printf(dbuf, "%s", fn);
+            if (mname && mname[0] && strcmp(fn, mname) != 0)
+                dbuf_printf(dbuf, " [as %s]", mname);
+        } else {
+            dbuf_printf(dbuf, "%s", (mname && mname[0]) ? mname : "<anonymous>");
+        }
+        JS_FreeCString(ctx, mname);
+        JS_FreeCString(ctx, fn);
+        JS_FreeValue(ctx, mn);
         JS_FreeValue(ctx, tn);
     }
-    s = JS_IsNull(csd->func_name) ? NULL : JS_ToCString(ctx, csd->func_name);
-    dbuf_printf(dbuf, "%s", (s && s[0]) ? s : "<anonymous>");
-    JS_FreeCString(ctx, s);
     if (csd->native) {
         dbuf_printf(dbuf, " (native)");
     } else {
@@ -92074,6 +92129,14 @@ static JSValue js_callsite_gettypename(JSContext *ctx, JSValueConst this_val, in
     return js_callsite_type_name(ctx, csd);
 }
 
+static JSValue js_callsite_getmethodname(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+    JSCallSiteData *csd = JS_GetOpaque2(ctx, this_val, JS_CLASS_CALL_SITE);
+    if (!csd)
+        return JS_EXCEPTION;
+    return js_callsite_method_name(ctx, csd);
+}
+
 /* IS THIS FRAME EVAL CODE, and WHERE WAS THAT eval CALLED. V8's stack formatter asks isEval before every
    other question about a frame, which is why its absence took out mjsunit's formatter entirely. */
 static JSValue js_callsite_iseval(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
@@ -92101,6 +92164,7 @@ static const JSCFunctionListEntry js_callsite_proto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("getEvalOrigin", 0, js_callsite_getfield, offsetof(JSCallSiteData, eval_origin)),
     JS_CFUNC_DEF("getThis", 0, js_callsite_getthis),
     JS_CFUNC_DEF("getTypeName", 0, js_callsite_gettypename),
+    JS_CFUNC_DEF("getMethodName", 0, js_callsite_getmethodname),
     JS_CFUNC_MAGIC_DEF("getFileName", 0, js_callsite_getfield, offsetof(JSCallSiteData, filename)),
     JS_CFUNC_MAGIC_DEF("getFunction", 0, js_callsite_getfield, offsetof(JSCallSiteData, func)),
     JS_CFUNC_MAGIC_DEF("getFunctionName", 0, js_callsite_getfield, offsetof(JSCallSiteData, func_name)),
