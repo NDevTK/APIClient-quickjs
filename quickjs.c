@@ -1578,7 +1578,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_GET_DISPOSE_SYNC, STEPDEF_GET_DISPOSE_ASYNC, STEPDEF_DISPOSABLE_USE, STEPDEF_ASYNC_DISPOSABLE_USE,
     STEPDEF_U8_TOBASE64, STEPDEF_U8_FROMBASE64, STEPDEF_U8_SETFROMBASE64,
     STEPDEF_ITER_DISPOSE, STEPDEF_ASYNC_ITER_DISPOSE,
-    STEPDEF_SYMBOL_FOR,
+    STEPDEF_SYMBOL_FOR, STEPDEF_REGEXP_COMPILE,
     STEPDEF_SYMBOL_CTOR, STEPDEF_ERROR_TOSTRING,
     STEPDEF_MAP_UPSERT, STEPDEF_MAP_UPSERT_COMPUTED,
     STEPDEF_WEAKMAP_UPSERT, STEPDEF_WEAKMAP_UPSERT_COMPUTED,
@@ -20229,18 +20229,6 @@ static bool ta_write_needs_toprim(JSContext *ctx, JSValueConst target, JSValueCo
    foreign receiver coerces nothing, so the receiver is part of the question and not a caller's detail.
    GP_DEFINE has no receiver at all (10.4.5.3 goes straight to TypedArraySetElement), which is why the caller
    passes UNINITIALIZED for it. */
-static bool ta_atom_write_needs_toprim(JSContext *ctx, JSValueConst target, JSValueConst recv,
-                                       JSAtom atom, JSValueConst val)
-{
-    JSObject *p;
-    if (JS_VALUE_GET_TAG(val) != JS_TAG_OBJECT) return false;
-    if (JS_VALUE_GET_TAG(target) != JS_TAG_OBJECT) return false;
-    p = JS_VALUE_GET_OBJ(target);
-    if (!is_typed_array(p->class_id)) return false;
-    if (!JS_IsUninitialized(recv) && JS_VALUE_GET_PTR(recv) != JS_VALUE_GET_PTR(target)) return false;
-    return JS_AtomIsNumericIndex(ctx, atom) > 0;
-}
-
 /* 10.4.5.14 IsValidIntegerIndex, answered from the ATOM the entry has already resolved — 10.4.5.3 step 1.a.
    A detached buffer leaves u.array.count at 0, so the bound test covers detachment as well as length. A
    canonical numeric index that is not a non-negative integer ("1.5", "1e21", "-0") is never a valid index and
@@ -20797,6 +20785,54 @@ static inline JSObject *tramp_proto_proxy(JSContext *ctx, JSValueConst obj, JSAt
         if (!p) return NULL;
     }
 }
+/* The TYPED ARRAY whose exotic [[Set]] a canonical-numeric-index write will land on, at or above `obj` —
+   10.1.9.2 step 3's `parent.[[Set]](P, V, Receiver)` resolved. That write's ToNumber/ToBigInt of V is the page's
+   code, and the predicate below used to look only at the IMMEDIATE object: `Reflect.set(Object.create(ta), 100,
+   v, ta)` puts the typed array ONE HOP up the chain, so the coercion ran inside JS_SetPropertyInternal2 from C.
+   Same stopping rule as the other two walkers — an own slot answers before the parent — plus the Proxy, which
+   the entry's own branch answers first and must not be walked past here. */
+static inline JSObject *tramp_proto_typed_array(JSContext *ctx, JSValueConst obj, JSAtom atom) {
+    JSObject *p = tramp_walk_base(ctx, obj, atom);
+    if (!p) return NULL;
+    for (;;) {
+        if (p->class_id == JS_CLASS_PROXY) return NULL;   /* before is_exotic: the proxy branch owns it */
+        if (is_typed_array(p->class_id)) return p;        /* its [[Set]] owns every canonical numeric index */
+        if (find_own_property1(p, atom)) return NULL;
+        if (!tramp_walk_continues(ctx, p, atom)) return NULL;
+        p = p->shape->proto;
+        if (!p) return NULL;
+    }
+}
+/* WHICH typed array a keyed write's coercion belongs to, or NULL. It ANSWERS with the object rather than a
+   boolean because a [[Set]] can reach one through the prototype chain, and the coercion's re-issue has to target
+   the object the spec's step i actually names — re-issuing against the object the request started from would run
+   step i with the wrong receiver and silently skip the store.
+   `forwards` is true for [[Set]] only: 10.1.9.2 step 3 hands the operation to the parent, while
+   [[DefineOwnProperty]] is never forwarded, so a define looks at the immediate object and nothing else. */
+static JSObject *ta_atom_write_needs_toprim(JSContext *ctx, JSValueConst target, JSValueConst recv,
+                                            JSAtom atom, JSValueConst val, bool forwards)
+{
+    JSObject *p;
+    if (JS_VALUE_GET_TAG(val) != JS_TAG_OBJECT) return NULL;
+    if (forwards) {
+        p = tramp_proto_typed_array(ctx, target, atom);
+        if (!p) return NULL;
+    } else {
+        if (JS_VALUE_GET_TAG(target) != JS_TAG_OBJECT) return NULL;
+        p = JS_VALUE_GET_OBJ(target);
+        if (!is_typed_array(p->class_id)) return NULL;
+    }
+    /* 10.4.5.5 step i: only a write whose RECEIVER is that typed array performs TypedArraySetElement; step ii
+       returns without coercing anything. An UNINITIALIZED receiver means "the object the request named", which
+       after a chain hop is NOT the typed array — so the comparison is against the SITE, both ways. */
+    if (JS_IsUninitialized(recv)) {
+        if (JS_VALUE_GET_TAG(target) != JS_TAG_OBJECT || JS_VALUE_GET_OBJ(target) != p) return NULL;
+    } else if (JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT || JS_VALUE_GET_OBJ(recv) != p) {
+        return NULL;
+    }
+    return JS_AtomIsNumericIndex(ctx, atom) > 0 ? p : NULL;
+}
+
 /* The setter twin of tramp_accessor_getter, and ANY callable setter for the same reason: a property WRITE whose
    slot is a `set x(v){…}` invokes the setter, and asking for a NORMAL bytecode body dropped every other kind into
    JS_SetPropertyInternal2, which calls it from C. A GENERATOR setter created its coroutine off the chain and a
@@ -23629,6 +23665,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSAsyncGeneratorData *agen_s = NULL;                /* the machine being driven */
     JSValue agen_prom = JS_UNDEFINED;                   /* its settlement promise: the drive's synchronous result */
     JSValue agen_hold = JS_UNDEFINED;                   /* the generator object, held across the body run */
+    JSObject *gp_ta_site = NULL;                        /* the typed array a keyed write's coercion belongs to,
+                                                           resolved by ta_atom_write_needs_toprim (borrowed) */
     JSValue agen_await_val = JS_UNDEFINED;              /* the value do_agen_await_ret_start awaits (owned) */
     uint8_t agen_await_is_await = 0;                    /* 0 = 27.6.3.2 AwaitReturn, 1 = 27.6.3.8 Await */
     JSValue *agen_caller_sp = NULL;                     /* the caller's sp with the drive's operands already freed */
@@ -28402,9 +28440,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         int dres = JS_DeleteProperty(ctx, fwd ? gp_fwd : gp_obj, gp_atom, 0);
                         if (unlikely(dres < 0)) goto getprop_throw;
                         ret_val = js_bool(dres);
-                    } else if (ta_atom_write_needs_toprim(ctx, fwd ? gp_fwd : gp_obj,
+                    } else if ((gp_ta_site = ta_atom_write_needs_toprim(ctx, fwd ? gp_fwd : gp_obj,
                                                           gp_op == GP_DEFINE ? JS_UNINITIALIZED : gp_recv_r,
-                                                          gp_atom, gp_val)
+                                                          gp_atom, gp_val, gp_op == GP_SET)) != NULL
                                && (gp_op == GP_SET
                                    || (gp_op == GP_DEFINE && (gp_dflags_r & JS_PROP_HAS_VALUE)
                                        && ta_define_reaches_set(gp_dflags_r, gp_getter_r, gp_setter_r)
@@ -28417,6 +28455,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            constructors' element stores all ran a user body from C. One arm here answers for all
                            of them. */
                         if (fwd) gp_obj = gp_fwd;
+                        /* the write belongs to the TYPED ARRAY the predicate resolved, which for a [[Set]] may be
+                           a PROTOTYPE of the object the request named (10.1.9.2 step 3). The coercion's re-issue
+                           has to target IT: re-issuing against the original object would run 10.4.5.5 step i
+                           with that object as the receiver, fail SameValue, and skip the store. */
+                        gp_obj = JS_MKPTR(JS_TAG_OBJECT, gp_ta_site);
                         gp_al_phase = AL_TA_PRIM;
                         goto do_array_len_start;
                     } else if (arr_len_write_needs_toprim(fwd ? gp_fwd : gp_obj, gp_atom, gp_val)
@@ -35406,7 +35449,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JSAtom katom = JS_ValueToAtom(ctx, sp[-2]);
                     if (unlikely(katom == JS_ATOM_NULL))
                         goto exception;
-                    if (unlikely(ta_atom_write_needs_toprim(ctx, sp[-3], JS_UNINITIALIZED, katom, sp[-1]))) {
+                    if (unlikely(ta_atom_write_needs_toprim(ctx, sp[-3], JS_UNINITIALIZED, katom, sp[-1],
+                                                            true) != NULL)) {
                         /* `ta[i] = obj`: 10.4.5.16 step 1's ToNumber/ToBigInt on V is the page's code, and the
                            opcode used to coerce it inline and then take its own JS_SetPropertyValue tail — so
                            the same question was asked in two places, here and at the keyed entry that every C
@@ -68487,6 +68531,7 @@ static const JSTrampStepDef js_u8_setfrombase64_def;
 static const JSTrampStepDef js_iter_dispose_def;
 static const JSTrampStepDef js_async_iter_dispose_def;
 static const JSTrampStepDef js_symbol_for_def;
+static const JSTrampStepDef js_regexp_compile_def;
 /* likewise the Map upsert machine, defined with the map code it mutates. */
 static int js_map_upsert_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_map_upsert_fini(JSContext *ctx, void *st, bool take_result);
@@ -68581,6 +68626,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_ITER_DISPOSE]          = &js_iter_dispose_def,
     [STEPDEF_ASYNC_ITER_DISPOSE]    = &js_async_iter_dispose_def,
     [STEPDEF_SYMBOL_FOR]            = &js_symbol_for_def,
+    [STEPDEF_REGEXP_COMPILE]        = &js_regexp_compile_def,
     [STEPDEF_MAP_UPSERT]            = &js_map_upsert_def,
     [STEPDEF_MAP_UPSERT_COMPUTED]   = &js_map_upsert_comp_def,
     [STEPDEF_WEAKMAP_UPSERT]        = &js_weakmap_upsert_def,
@@ -75473,49 +75519,101 @@ static JSValue js_re_ctor_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
-static JSValue js_regexp_compile(JSContext *ctx, JSValueConst this_val,
-                                 int argc, JSValueConst *argv)
-{
-    JSRegExp *re1, *re;
-    JSValueConst pattern1, flags1;
-    JSValue bc, pattern;
+/* B.2.4.1 RegExp.prototype.compile as a STEP MACHINE. RegExpInitialize coerces BOTH of its arguments —
+   `? ToString(pattern)` then `? ToString(flags)` — and for an OBJECT argument each is the page's
+   @@toPrimitive/valueOf/toString. The C body ran the first with JS_ToString and the second inside
+   js_compile_regexp's JS_ToCStringLen, so `re.compile({toString(){ while(x){} }})` had no flow base. Compiling
+   the pattern and writing the two slots invokes nothing, and `lastIndex` is a non-configurable data property on
+   every RegExp instance, so its Set cannot be an accessor either. */
+typedef struct JSRegExpCompile {
+    JSStepHdr hdr;      /* MUST be first */
+    JSValue result;     /* owned: the receiver */
+    JSValue pattern;    /* the coerced source, held across the FLAGS coercion (owned) */
+} JSRegExpCompile;
+_Static_assert(offsetof(JSRegExpCompile, hdr) == 0, "JSStepHdr must be first in JSRegExpCompile");
 
-    re = js_get_regexp(ctx, this_val, true);
-    if (!re)
-        return JS_EXCEPTION;
-    pattern1 = argv[0];
-    flags1 = argv[1];
-    re1 = js_get_regexp(ctx, pattern1, false);
-    if (re1) {
-        if (!JS_IsUndefined(flags1))
-            return JS_ThrowTypeError(ctx, "flags must be undefined");
-        pattern = js_dup(JS_MKPTR(JS_TAG_STRING, re1->pattern));
-        bc = js_dup(JS_MKPTR(JS_TAG_STRING, re1->bytecode));
-    } else {
-        bc = JS_UNDEFINED;
-        if (JS_IsUndefined(pattern1))
-            pattern = js_empty_string(ctx->rt);
-        else
-            pattern = JS_ToString(ctx, pattern1);
-        if (JS_IsException(pattern))
-            goto fail;
-        bc = js_compile_regexp(ctx, pattern, flags1);
-        if (JS_IsException(bc))
-            goto fail;
+enum { RC_PATTERN = 1, RC_FLAGS, RC_BUILD };
+
+static int js_regexp_compile_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
+{
+    JSRegExpCompile *m = st;
+    JSValueConst this_val = m->hdr.this_val;
+    JSValueConst pattern1 = step_arg(&m->hdr, 0), flags1 = step_arg(&m->hdr, 1);
+    JSValue bc = JS_UNDEFINED, flags = JS_UNDEFINED;
+    JSRegExp *re, *re1;
+    int r;
+
+    if (m->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        m->result = JS_UNDEFINED; m->pattern = JS_UNDEFINED;
+        /* every validation the spec performs before either coercion */
+        if (!js_get_regexp(ctx, this_val, true)) return -1;
+        re1 = js_get_regexp(ctx, pattern1, false);
+        if (re1) {
+            /* step 2: a RegExp source is copied whole, so nothing is coerced at all. */
+            if (!JS_IsUndefined(flags1))
+                return (JS_ThrowTypeError(ctx, "flags must be undefined"), -1);
+            m->pattern = js_dup(JS_MKPTR(JS_TAG_STRING, re1->pattern));
+            bc = js_dup(JS_MKPTR(JS_TAG_STRING, re1->bytecode));
+            m->hdr.stage = RC_BUILD;
+            goto assign;
+        }
+        if (JS_IsUndefined(pattern1)) {
+            m->pattern = js_empty_string(ctx->rt);
+            m->hdr.stage = RC_FLAGS;
+        } else {
+            m->hdr.stage = RC_PATTERN;
+        }
     }
+    if (m->hdr.stage == RC_PATTERN) {
+        r = step_tostring_run(ctx, &m->hdr, pattern1, cb_result, &m->pattern, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r;
+        m->hdr.stage = RC_FLAGS;
+    }
+    if (m->hdr.stage == RC_FLAGS) {
+        if (JS_IsUndefined(flags1)) {
+            JS_FreeValue(ctx, cb_result);
+        } else {
+            r = step_tostring_run(ctx, &m->hdr, flags1, cb_result, &flags, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r;
+        }
+        /* the coercions are spent; compiling reads the two strings and invokes nothing. */
+        bc = js_compile_regexp(ctx, m->pattern, flags);
+        JS_FreeValue(ctx, flags);
+        if (JS_IsException(bc)) return -1;
+        m->hdr.stage = RC_BUILD;
+    }
+assign:
+    DCHECK(m->hdr.stage == RC_BUILD, "RegExp.prototype.compile resumed in an unknown stage");
+    /* the receiver is re-validated: a `toString` above is the page's code and can have been handed a different
+       object entirely, and js_get_regexp is the only thing that says this one still has the slots. */
+    re = js_get_regexp(ctx, this_val, true);
+    if (!re) { JS_FreeValue(ctx, bc); return -1; }
     JS_FreeValue(ctx, JS_MKPTR(JS_TAG_STRING, re->pattern));
     JS_FreeValue(ctx, JS_MKPTR(JS_TAG_STRING, re->bytecode));
-    re->pattern = JS_VALUE_GET_STRING(pattern);
+    re->pattern = JS_VALUE_GET_STRING(m->pattern);   /* ownership moves into the slots */
     re->bytecode = JS_VALUE_GET_STRING(bc);
-    if (JS_SetProperty(ctx, this_val, JS_ATOM_lastIndex,
-                       js_int32(0)) < 0)
-        return JS_EXCEPTION;
-    return js_dup(this_val);
- fail:
-    JS_FreeValue(ctx, pattern);
-    JS_FreeValue(ctx, bc);
-    return JS_EXCEPTION;
+    m->pattern = JS_UNDEFINED;
+    if (JS_SetProperty(ctx, this_val, JS_ATOM_lastIndex, js_int32(0)) < 0)
+        return -1;
+    m->result = js_dup(this_val);
+    return 0;
 }
+
+static JSValue js_regexp_compile_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSRegExpCompile *m = st;
+    JSValue r = take_result ? m->result : (JS_FreeValue(ctx, m->result), JS_UNDEFINED);
+    JS_FreeValue(ctx, m->pattern);
+    js_free_rt(ctx->rt, m);
+    return r;
+}
+
+static const JSTrampStepDef js_regexp_compile_def = {
+    sizeof(JSRegExpCompile), js_regexp_compile_step, js_regexp_compile_fini, 0
+};
 
 static JSValue js_regexp_get_source(JSContext *ctx, JSValueConst this_val)
 {
@@ -77406,7 +77504,7 @@ static const JSCFunctionListEntry js_regexp_proto_funcs[] = {
     JS_CGETSET_MAGIC_DEF("sticky", js_regexp_get_flag, NULL, LRE_FLAG_STICKY ),
     JS_CGETSET_MAGIC_DEF("hasIndices", js_regexp_get_flag, NULL, LRE_FLAG_INDICES ),
     JS_CFUNC_STEP_DEF("exec", 1, STEPDEF_REGEXP_EXEC ),
-    JS_CFUNC_DEF("compile", 2, js_regexp_compile ),
+    JS_CFUNC_STEP_DEF("compile", 2, STEPDEF_REGEXP_COMPILE ),
     JS_CFUNC_STEP_DEF("test", 1, STEPDEF_REGEXP_TEST ),
     JS_CFUNC_STEP_DEF("toString", 0, STEPDEF_REGEXP_TOSTRING ),
     JS_CFUNC_STEP_DEF("[Symbol.replace]", 2, STEPDEF_RE_REPLACE ),
