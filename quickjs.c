@@ -68027,6 +68027,7 @@ static JSValue js_bigint_asUintN(JSContext *ctx, JSValueConst this_val, int argc
 static JSValue js_object_getOwnPropertyDescriptor(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
 static int js_iter_helper_new_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_iter_helper_new_fini(JSContext *ctx, void *st, bool take_result);
+static void js_iter_helper_new_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static void js_iterator_helper_close(JSContext *ctx, JSValueConst this_val, int magic);
 enum {
     JS_ARRAY_BUFFER_TRANSFER,
@@ -68448,17 +68449,20 @@ static const JSTrampStepDef js_error_ctor_defs[JS_PLAIN_ERROR + 1] = {
 _Static_assert(JS_PLAIN_ERROR == 9, "the error-constructor definition block is written out per kind");
 static int js_array_iter_next_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_iter_next_fini(JSContext *ctx, void *st, bool take_result);
+static void js_array_iter_next_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static const JSTrampStepDef js_array_iter_next_def =
-    { sizeof(JSArrayIterNext), js_array_iter_next_step, js_array_iter_next_fini, 0 };
+    { sizeof(JSArrayIterNext), js_array_iter_next_step, js_array_iter_next_fini, 0, .visit = js_array_iter_next_visit };
 static int js_iterator_concat_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_iterator_concat_fini(JSContext *ctx, void *st, bool take_result);
+static void js_iterator_concat_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static const JSTrampStepDef js_iter_concat_def =
-    { sizeof(JSIterConcat), js_iterator_concat_step, js_iterator_concat_fini, 0 };
+    { sizeof(JSIterConcat), js_iterator_concat_step, js_iterator_concat_fini, 0, .visit = js_iterator_concat_visit };
 static int js_iterator_zip_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_iterator_zip_fini(JSContext *ctx, void *st, bool take_result);
 static void js_iterator_zip_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static int js_iter_zip_drive_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_iter_zip_drive_fini(JSContext *ctx, void *st, bool take_result);
+static void js_iter_zip_drive_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static int js_string_iterator_create_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_string_iterator_create_fini(JSContext *ctx, void *st, bool take_result);
 static void js_string_iterator_create_visit(JSContext *ctx, void *st, JSStepVisit *v);
@@ -68482,24 +68486,28 @@ static const JSTrampStepDef js_iter_zip_def =
     { sizeof(JSIterZip), js_iterator_zip_step, js_iterator_zip_fini, 0, .visit = js_iterator_zip_visit };
 static int js_iterator_zip_keyed_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_iterator_zip_keyed_fini(JSContext *ctx, void *st, bool take_result);
+static void js_iterator_zip_keyed_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static const JSTrampStepDef js_iter_zip_keyed_def =
-    { sizeof(JSIterZipKeyed), js_iterator_zip_keyed_step, js_iterator_zip_keyed_fini, 0 };
+    { sizeof(JSIterZipKeyed), js_iterator_zip_keyed_step, js_iterator_zip_keyed_fini, 0, .visit = js_iterator_zip_keyed_visit };
 static const JSTrampStepDef js_iter_zip_next_def =
-    { sizeof(JSIterZipDrive), js_iter_zip_drive_step, js_iter_zip_drive_fini, ZIP_DRIVE_NEXT };
+    { sizeof(JSIterZipDrive), js_iter_zip_drive_step, js_iter_zip_drive_fini, ZIP_DRIVE_NEXT, .visit = js_iter_zip_drive_visit };
 static const JSTrampStepDef js_iter_zip_return_def =
-    { sizeof(JSIterZipDrive), js_iter_zip_drive_step, js_iter_zip_drive_fini, ZIP_DRIVE_RETURN };
+    { sizeof(JSIterZipDrive), js_iter_zip_drive_step, js_iter_zip_drive_fini, ZIP_DRIVE_RETURN, .visit = js_iter_zip_drive_visit };
 static int js_iter_concat_next_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_iter_concat_next_fini(JSContext *ctx, void *st, bool take_result);
+static void js_iter_concat_next_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static const JSTrampStepDef js_iter_concat_next_def =
-    { sizeof(JSIterConcatNext), js_iter_concat_next_step, js_iter_concat_next_fini, 0 };
+    { sizeof(JSIterConcatNext), js_iter_concat_next_step, js_iter_concat_next_fini, 0, .visit = js_iter_concat_next_visit };
 static int js_iter_concat_return_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_iter_concat_return_fini(JSContext *ctx, void *st, bool take_result);
+static void js_iter_concat_return_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static const JSTrampStepDef js_iter_concat_return_def =
-    { sizeof(JSIterConcatReturn), js_iter_concat_return_step, js_iter_concat_return_fini, 0 };
+    { sizeof(JSIterConcatReturn), js_iter_concat_return_step, js_iter_concat_return_fini, 0, .visit = js_iter_concat_return_visit };
 static int js_iter_wrap_return_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_iter_wrap_return_fini(JSContext *ctx, void *st, bool take_result);
+static void js_iter_wrap_return_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static const JSTrampStepDef js_iter_wrap_return_def =
-    { sizeof(JSIterWrapReturn), js_iter_wrap_return_step, js_iter_wrap_return_fini, 0 };
+    { sizeof(JSIterWrapReturn), js_iter_wrap_return_step, js_iter_wrap_return_fini, 0, .visit = js_iter_wrap_return_visit };
 static const JSTrampStepDef js_date_toJSON_def = { sizeof(JSDateToJSON), js_date_tojson_step, js_date_tojson_fini, 0 , .visit = js_date_tojson_visit };
 static const JSTrampStepDef js_date_toPrim_def = { sizeof(JSDateToPrim), js_date_toprim_step, js_date_toprim_fini, 0 , .visit = js_date_toprim_visit };
 /* the captured half of an Atomics operation: the length ValidateAtomicAccess reads at step 1, held across the
@@ -68870,7 +68878,7 @@ static const JSTrampStepDef js_reflect_setproto_def = { sizeof(JSSetProto), js_s
    neither shape. The kind rides body_magic, exactly as it did on the C function; onerror is the IfAbruptClose. */
 #define ITER_HELPER_NEW_DEF(kind) \
     { sizeof(JSIterHelperNew), js_iter_helper_new_step, js_iter_helper_new_fini, 0, { .generic = NULL }, 0, \
-      (kind), NULL, NULL, js_iterator_helper_close }
+      (kind), NULL, NULL, js_iterator_helper_close, .visit = js_iter_helper_new_visit }
 static const JSTrampStepDef js_iter_take_def      = ITER_HELPER_NEW_DEF(JS_ITERATOR_HELPER_KIND_TAKE);
 static const JSTrampStepDef js_iter_drop_def      = ITER_HELPER_NEW_DEF(JS_ITERATOR_HELPER_KIND_DROP);
 static const JSTrampStepDef js_iter_map_def       = ITER_HELPER_NEW_DEF(JS_ITERATOR_HELPER_KIND_MAP);
@@ -69749,6 +69757,11 @@ static int js_iterator_zip_keyed_step(JSContext *ctx, void *st, JSValue cb_resul
         if (js_get_length32(ctx, &klen, keys)) { JS_FreeValue(ctx, keys); return -1; }
         s->atoms = klen ? js_mallocz(ctx, sizeof(JSAtom) * (size_t)klen) : NULL;
         if (klen && !s->atoms) { JS_FreeValue(ctx, keys); return -1; }
+        /* alen is the SNAPSHOT'S LENGTH, recorded with the allocation rather than counted up by the fill —
+           they are the same number, and stating it once is what lets the ownership declaration name the block's
+           extent. The fill invokes nothing (an engine-built array of validated Strings and Symbols), so no fork
+           lands inside it; a ToAtom that fails leaves the tail JS_ATOM_NULL, which the release skips. */
+        s->alen = klen;
         for (i = 0; i < klen; i++) {
             JSValue kv = JS_GetPropertyUint32(ctx, keys, i);
             JSAtom at;
@@ -69756,7 +69769,7 @@ static int js_iterator_zip_keyed_step(JSContext *ctx, void *st, JSValue cb_resul
             at = JS_ValueToAtom(ctx, kv);
             JS_FreeValue(ctx, kv);
             if (at == JS_ATOM_NULL) { JS_FreeValue(ctx, keys); return -1; }
-            s->atoms[s->alen++] = at;
+            s->atoms[i] = at;
         }
         JS_FreeValue(ctx, keys);
         s->hdr.stage = ZK_HASOWN;
@@ -69884,6 +69897,26 @@ static int js_iterator_zip_keyed_step(JSContext *ctx, void *st, JSValue cb_resul
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). Four arrays, and their capacities are the allocations rather
+   than the cursors: keys/iters/nexts grow together by doubling into `cap`, `pads` is allocated at one per input
+   and filled to pad_i, and `atoms` is a fixed snapshot whose length IS alen. The CLOSES are not here, for the
+   reason Iterator.zip's are not: IfAbruptCloseIterators is the algorithm unwinding, not references being
+   released, and a clone must copy the inputs without closing any of them. */
+static void js_iterator_zip_keyed_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSIterZipKeyed *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->padding);
+    v->val(ctx, &s->held);
+    v->val(ctx, &s->elem);
+    js_desc_facts_visit(ctx, &s->facts, v);
+    v->array(ctx, (void **)&s->atoms, sizeof(JSAtom), (int)s->alen, (int)s->alen, js_step_visit_atom_elem);
+    v->array(ctx, (void **)&s->keys,  sizeof(JSAtom), (int)s->n, (int)s->cap, js_step_visit_atom_elem);
+    v->array(ctx, (void **)&s->iters, sizeof(JSValue), (int)s->n, (int)s->cap, js_step_visit_value_elem);
+    v->array(ctx, (void **)&s->nexts, sizeof(JSValue), (int)s->n, (int)s->cap, js_step_visit_value_elem);
+    v->array(ctx, (void **)&s->pads,  sizeof(JSValue), (int)s->pad_i, (int)s->n, js_step_visit_value_elem);
+}
+
 static JSValue js_iterator_zip_keyed_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSIterZipKeyed *s = st;
@@ -69891,28 +69924,15 @@ static JSValue js_iterator_zip_keyed_fini(JSContext *ctx, void *st, bool take_re
     uint32_t i;
 
     if (!take_result) {
-        /* IfAbruptCloseIterators over the inputs collected so far, in reverse index order (the drain pops). There
-           is no inputIter to exclude here: zipKeyed reads properties rather than walking an iterator. */
-        JS_FreeValue(ctx, s->result);
+        /* IfAbruptCloseIterators over the inputs collected so far — run while every one is still held, before
+           the declaration releases them. There is no inputIter to exclude here: zipKeyed reads properties
+           rather than walking an iterator. */
         for (i = 0; i < s->n; i++)
             iter_close_defer(ctx, s->iters[i]);
+    } else {
+        s->result = JS_UNDEFINED;
     }
-    js_desc_facts_free(ctx, &s->facts);
-    JS_FreeValue(ctx, s->padding);
-    JS_FreeValue(ctx, s->held);
-    JS_FreeValue(ctx, s->elem);
-    for (i = 0; i < s->alen; i++) JS_FreeAtom(ctx, s->atoms[i]);
-    js_free(ctx, s->atoms);
-    for (i = 0; i < s->n; i++) {
-        JS_FreeAtom(ctx, s->keys[i]);
-        JS_FreeValue(ctx, s->iters[i]);
-        JS_FreeValue(ctx, s->nexts[i]);
-    }
-    js_free(ctx, s->keys);
-    js_free(ctx, s->iters);
-    js_free(ctx, s->nexts);
-    for (i = 0; i < s->pad_i; i++) JS_FreeValue(ctx, s->pads[i]);
-    js_free(ctx, s->pads);
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -70072,13 +70092,26 @@ static int js_iter_zip_drive_step(JSContext *ctx, void *st, JSValue cb_result, J
     return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). cb is borrowed throughout — see JSIterZip's note. The
+   deferred CLOSES the teardown owes are not ownership: they are 7.4.11 running under an abrupt completion, and
+   a clone copies the drive without closing anything. */
+static void js_iter_zip_drive_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSIterZipDrive *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->self);
+    v->val(ctx, &s->held);
+    v->val(ctx, &s->results);
+    v->val(ctx, &s->closing);
+}
+
 static JSValue js_iter_zip_drive_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSIterZipDrive *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
 
+    if (take_result) s->result = JS_UNDEFINED;
     if (!take_result) {
-        JS_FreeValue(ctx, s->result);
         if (s->owns && JS_IsObject(s->self)) {
             /* the generator's own abrupt completion: it is COMPLETED, and every input it still holds is owed a
                close under that completion — 7.4.11 with each throw discarded, which is the deferral. JS_GetOpaque
@@ -70086,10 +70119,7 @@ static JSValue js_iter_zip_drive_fini(JSContext *ctx, void *st, bool take_result
             js_iter_zip_defer_closes(ctx, JS_GetOpaque(s->self, JS_CLASS_ITERATOR_ZIP), s->stepping);
         }
     }
-    JS_FreeValue(ctx, s->self);
-    JS_FreeValue(ctx, s->held);
-    JS_FreeValue(ctx, s->results);
-    JS_FreeValue(ctx, s->closing);   /* cb[] is borrowed — see JSIterZip's note */
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -72672,13 +72702,22 @@ static int js_array_iter_next_step(JSContext *ctx, void *st, JSValue cb_result, 
     return JS_IsException(s->result) ? -1 : 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The source it holds across both reads and the element it
+   holds across its own. */
+static void js_array_iter_next_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSArrayIterNext *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->el);
+    v->val(ctx, &s->obj);
+}
+
 static JSValue js_array_iter_next_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSArrayIterNext *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->result);
-    JS_FreeValue(ctx, s->el);
-    JS_FreeValue(ctx, s->obj);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -72770,14 +72809,23 @@ static int js_iter_wrap_return_step(JSContext *ctx, void *st, JSValue cb_result,
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The wrapped iterator and the [iterator, `return`] request,
+   both of which this machine dup'd. */
+static void js_iter_wrap_return_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSIterWrapReturn *s = st;
+    int i;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->iter);
+    for (i = 0; i < 2; i++) v->val(ctx, &s->cb[i]);
+}
+
 static JSValue js_iter_wrap_return_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSIterWrapReturn *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    int i;
-    if (!take_result) JS_FreeValue(ctx, s->result);
-    for (i = 0; i < 2; i++) JS_FreeValue(ctx, s->cb[i]);
-    JS_FreeValue(ctx, s->iter);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -72985,20 +73033,30 @@ static int js_iter_concat_next_step(JSContext *ctx, void *st, JSValue cb_result,
     }
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). Its own reference to the receiver — the header's is released
+   by the shared teardown before fini runs — the iterator result it holds across two reads, and the request
+   buffer, which this machine dup'd into rather than borrowing. */
+static void js_iter_concat_next_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSIterConcatNext *s = st;
+    int i;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->item);
+    v->val(ctx, &s->self);
+    for (i = 0; i < 2; i++) v->val(ctx, &s->cb[i]);
+}
+
 static JSValue js_iter_concat_next_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSIterConcatNext *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    int i;
+    if (take_result) s->result = JS_UNDEFINED;
     if (s->held) {   /* the re-entrancy guard is lowered however the walk ended */
         JSIteratorConcatData *it = JS_GetOpaque(s->self, JS_CLASS_ITERATOR_CONCAT);
         DCHECK(it != NULL, "Iterator.concat: the receiver lost its data before its guard was lowered");
         it->running = false;
     }
-    if (!take_result) JS_FreeValue(ctx, s->result);
-    for (i = 0; i < 2; i++) JS_FreeValue(ctx, s->cb[i]);
-    JS_FreeValue(ctx, s->item);
-    JS_FreeValue(ctx, s->self);
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -73060,19 +73118,27 @@ static int js_iter_concat_return_step(JSContext *ctx, void *st, JSValue cb_resul
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The same shape as the `next` machine's, one field shorter. */
+static void js_iter_concat_return_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSIterConcatReturn *s = st;
+    int i;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->self);
+    for (i = 0; i < 2; i++) v->val(ctx, &s->cb[i]);
+}
+
 static JSValue js_iter_concat_return_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSIterConcatReturn *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    int i;
+    if (take_result) s->result = JS_UNDEFINED;
     if (s->held) {
         JSIteratorConcatData *it = JS_GetOpaque(s->self, JS_CLASS_ITERATOR_CONCAT);
         DCHECK(it != NULL, "Iterator.concat: the receiver lost its data before its guard was lowered");
         it->running = false;
     }
-    if (!take_result) JS_FreeValue(ctx, s->result);
-    for (i = 0; i < 2; i++) JS_FreeValue(ctx, s->cb[i]);
-    JS_FreeValue(ctx, s->self);
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -73142,16 +73208,34 @@ static int js_iterator_concat_step(JSContext *ctx, void *st, JSValue cb_result, 
     return 0;
 }
 
+/* the (iterator, method) PAIRS gathered so far. Its own declaration because the record is a flexible-array
+   struct that states its own live length; `iter` and `next` belong to the iterator OBJECT that adopts it, not
+   to this machine, which is why the release has never touched them. */
+static void js_iter_concat_data_visit(JSContext *ctx, void *elem, JSStepVisit *v)
+{
+    JSIteratorConcatData *it = elem;
+    uint32_t i;
+    for (i = 0; i < it->count; i++) v->val(ctx, &it->values[i]);
+}
+
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The record is ONE element whose SIZE carries its extent — the
+   argument count fixes it at construction — so the array operation gets the ordering right (copy the block,
+   then take references into the copy; release them, then free the block) without a capacity to state. */
+static void js_iterator_concat_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSIterConcat *s = st;
+    v->val(ctx, &s->result);
+    v->array(ctx, (void **)&s->it,
+             sizeof(*s->it) + 2 * (size_t)s->hdr.argc * sizeof(s->it->values[0]), 1, 1,
+             js_iter_concat_data_visit);
+}
+
 static JSValue js_iterator_concat_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSIterConcat *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    uint32_t i;
-    if (!take_result) JS_FreeValue(ctx, s->result);
-    if (s->it) {
-        for (i = 0; i < s->it->count; i++) JS_FreeValue(ctx, s->it->values[i]);
-        js_free(ctx, s->it);
-    }
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -73499,12 +73583,21 @@ static int js_iter_helper_new_step(JSContext *ctx, void *st, JSValue cb_result, 
     }
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The limit argument, replaced in place by its primitive and
+   held across the `next` read; cb is the ToPrimitive request's buffer and borrows it. */
+static void js_iter_helper_new_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSIterHelperNew *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->limit);
+}
+
 static JSValue js_iter_helper_new_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSIterHelperNew *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->result);
-    JS_FreeValue(ctx, s->limit);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
