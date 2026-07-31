@@ -23777,8 +23777,10 @@ static JSValue js_json_str_fini(JSContext *ctx, void *st, bool take_result);
 static int js_for_in_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_hasown_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_hasown_fini(JSContext *ctx, void *st, bool take_result);
+static void js_hasown_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static int js_lookup_acc_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_lookup_acc_fini(JSContext *ctx, void *st, bool take_result);
+static void js_lookup_acc_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static JSValue js_for_in_fini(JSContext *ctx, void *st, bool take_result);
 static int js_json_parse_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_json_parse_vfini(JSContext *ctx, void *st, bool take_result);
@@ -61006,11 +61008,19 @@ static int js_getproto_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). */
+static void js_getproto_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSGetProto *s = st;
+    v->val(ctx, &s->result);
+}
+
 static JSValue js_getproto_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSGetProto *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->result);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -61056,13 +61066,21 @@ static int js_gopd_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **o
     return JS_IsException(s->result) ? -1 : 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). */
+static void js_gopd_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSGopd *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->obj);
+    v->atom(ctx, &s->atom);
+}
+
 static JSValue js_gopd_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSGopd *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->result);
-    JS_FreeValue(ctx, s->obj);
-    JS_FreeAtom(ctx, s->atom);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -61649,14 +61667,21 @@ static int js_hasown_step(JSContext *ctx, void *st, JSValue cb_result, JSValue *
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). */
+static void js_hasown_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSHasOwn *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->obj);
+    v->atom(ctx, &s->key);
+}
+
 static JSValue js_hasown_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSHasOwn *s = st;
-    JSValue r;
-    JS_FreeValue(ctx, s->obj);
-    JS_FreeAtom(ctx, s->key);
-    r = take_result ? s->result : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->result);
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -62383,15 +62408,22 @@ static int js_lookup_acc_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
     }
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). __lookupGetter__ walks the chain, and each link's own descriptor is a record held across the read that produced it. */
+static void js_lookup_acc_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSLookupAcc *s = st;
+    js_desc_facts_visit(ctx, &s->facts, v);
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->cur);
+    v->atom(ctx, &s->key);
+}
+
 static JSValue js_lookup_acc_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSLookupAcc *s = st;
-    JSValue r;
-    js_desc_facts_free(ctx, &s->facts);
-    JS_FreeValue(ctx, s->cur);
-    JS_FreeAtom(ctx, s->key);
-    r = take_result ? s->result : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->result);
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -63517,16 +63549,23 @@ static int js_instanceof_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
     }
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). @@hasInstance is the page's method and the prototype chain walk is a series of [[GetPrototypeOf]] a Proxy can trap. */
+static void js_instanceof_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSInstanceOf *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->ctor);
+    v->val(ctx, &s->val);
+    v->val(ctx, &s->proto);
+    v->val(ctx, &s->handler);
+}
+
 static JSValue js_instanceof_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSInstanceOf *s = st;
-    JSValue r;
-    JS_FreeValue(ctx, s->ctor);
-    JS_FreeValue(ctx, s->val);
-    JS_FreeValue(ctx, s->proto);
-    JS_FreeValue(ctx, s->handler);
-    r = take_result ? s->result : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->result);
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -65957,11 +65996,19 @@ static int js_array_of_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). */
+static void js_array_of_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSArrayOf *s = st;
+    v->val(ctx, &s->result);
+}
+
 static JSValue js_array_of_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSArrayOf *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->result);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -66045,12 +66092,20 @@ static int js_array_at_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). Every element read is the page's code, so the coerced receiver and the answer are held across it. */
+static void js_array_at_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSArrayAt *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->obj);
+}
+
 static JSValue js_array_at_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSArrayAt *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->result);
-    JS_FreeValue(ctx, s->obj);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -66791,11 +66846,18 @@ static int js_array_fill_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). `obj` is both the state and the RESULT, so the hand-out takes its own reference and the declaration still releases the machine's. */
+static void js_array_fill_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSArrayFill *s = st;
+    v->val(ctx, &s->obj);
+}
+
 static JSValue js_array_fill_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSArrayFill *s = st;
     JSValue r = take_result ? js_dup(s->obj) : JS_UNDEFINED;
-    JS_FreeValue(ctx, s->obj);
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -66879,13 +66941,21 @@ static int js_array_with_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). */
+static void js_array_with_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSArrayWith *s = st;
+    v->val(ctx, &s->arr);
+    v->val(ctx, &s->el);
+    v->val(ctx, &s->obj);
+}
+
 static JSValue js_array_with_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSArrayWith *s = st;
     JSValue r = take_result ? s->arr : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->arr);
-    JS_FreeValue(ctx, s->el);
-    JS_FreeValue(ctx, s->obj);
+    if (take_result) s->arr = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -67659,13 +67729,21 @@ found:
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). indexOf / lastIndexOf / includes read every element through a getter the page can define. */
+static void js_array_search_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSArraySearch *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->val);
+    v->val(ctx, &s->obj);
+}
+
 static JSValue js_array_search_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSArraySearch *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->result);
-    JS_FreeValue(ctx, s->val);
-    JS_FreeValue(ctx, s->obj);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -67832,10 +67910,14 @@ static JSValue js_ta_with_fini(JSContext *ctx, void *st, bool take_result);
 static int js_array_copywithin_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_copywithin_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_array_fill_fini(JSContext *ctx, void *st, bool take_result);
+static void js_array_fill_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static JSValue js_array_with_fini(JSContext *ctx, void *st, bool take_result);
+static void js_array_with_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static JSValue js_array_at_fini(JSContext *ctx, void *st, bool take_result);
+static void js_array_at_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static int js_array_search_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_search_fini(JSContext *ctx, void *st, bool take_result);
+static void js_array_search_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static int js_str_recv_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_str_recv_fini(JSContext *ctx, void *st, bool take_result);
 static void js_str_recv_visit(JSContext *ctx, void *st, JSStepVisit *v);
@@ -67935,6 +68017,7 @@ static int js_function_apply_step(JSContext *ctx, void *st, JSValue cb_result, J
 static JSValue js_function_call_fini(JSContext *ctx, void *st, bool take_result);
 static int js_array_tostring_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_tostring_fini(JSContext *ctx, void *st, bool take_result);
+static void js_array_tostring_visit(JSContext *ctx, void *st, JSStepVisit *v);
 /* One NAMED definition per builtin, referenced by its JS_CFUNC_STEP_DEF registration through the id above — the same shape as
    JS_CFUNC_MAGIC_DEF naming its C function, so the registration line tells you what runs. An index into a side
    table would be a second list to keep in sync and a magic number that silently repoints when a row is inserted. */
@@ -68197,10 +68280,10 @@ static JSValue js_iter_setter_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
-static const JSTrampStepDef js_hasown_def      = { sizeof(JSHasOwn), js_hasown_step, js_hasown_fini, HASOWN_STATIC };
-static const JSTrampStepDef js_hasownprop_def  = { sizeof(JSHasOwn), js_hasown_step, js_hasown_fini, 0 };
-static const JSTrampStepDef js_lookupgetter_def = { sizeof(JSLookupAcc), js_lookup_acc_step, js_lookup_acc_fini, 0 };
-static const JSTrampStepDef js_lookupsetter_def = { sizeof(JSLookupAcc), js_lookup_acc_step, js_lookup_acc_fini, 1 };
+static const JSTrampStepDef js_hasown_def      = { sizeof(JSHasOwn), js_hasown_step, js_hasown_fini, HASOWN_STATIC, .visit = js_hasown_visit };
+static const JSTrampStepDef js_hasownprop_def  = { sizeof(JSHasOwn), js_hasown_step, js_hasown_fini, 0, .visit = js_hasown_visit };
+static const JSTrampStepDef js_lookupgetter_def = { sizeof(JSLookupAcc), js_lookup_acc_step, js_lookup_acc_fini, 0, .visit = js_lookup_acc_visit };
+static const JSTrampStepDef js_lookupsetter_def = { sizeof(JSLookupAcc), js_lookup_acc_step, js_lookup_acc_fini, 1, .visit = js_lookup_acc_visit };
 static const JSTrampStepDef js_func_bind_def   = { sizeof(JSFuncBind), js_func_bind_step, js_func_bind_fini, 0 };
 static const JSTrampStepDef js_iter_set_ctor_def = { sizeof(JSIterSetter), js_iter_setter_step, js_iter_setter_fini, JS_ATOM_constructor,
                                                     .home_class = JS_CLASS_ITERATOR };
@@ -68209,8 +68292,8 @@ static const JSTrampStepDef js_iter_set_tag_def  = { sizeof(JSIterSetter), js_it
 static const JSTrampStepDef js_error_get_stack_def = { sizeof(JSErrGetStack), js_error_get_stack_step, js_error_get_stack_fini, 0 };
 static const JSTrampStepDef js_error_set_stack_def = { sizeof(JSIterSetter), js_iter_setter_step, js_iter_setter_fini, JS_ATOM_stack,
                                                       .home_class = JS_CLASS_ERROR, .precheck = js_error_stack_precheck };
-static const JSTrampStepDef js_instanceof_def  = { sizeof(JSInstanceOf), js_instanceof_step, js_instanceof_fini, INSTOF_OPERATOR };
-static const JSTrampStepDef js_ordinary_hasinst_def = { sizeof(JSInstanceOf), js_instanceof_step, js_instanceof_fini, INSTOF_ORDINARY };
+static const JSTrampStepDef js_instanceof_def  = { sizeof(JSInstanceOf), js_instanceof_step, js_instanceof_fini, INSTOF_OPERATOR, .visit = js_instanceof_visit };
+static const JSTrampStepDef js_ordinary_hasinst_def = { sizeof(JSInstanceOf), js_instanceof_step, js_instanceof_fini, INSTOF_ORDINARY, .visit = js_instanceof_visit };
 static const JSTrampStepDef js_obj_tolocale_def = { sizeof(JSObjToLocale), js_object_tolocale_step, js_object_tolocale_fini, 0 };
 static const JSTrampStepDef js_obj_tostring_def = { sizeof(JSObjToString), js_object_tostring_step, js_object_tostring_fini, 0 };
 static const JSTrampStepDef js_obj_seal_def     = { sizeof(JSIntegrity), js_integrity_step, js_integrity_fini, 0, .visit = js_integrity_visit };
@@ -68227,9 +68310,9 @@ static const JSTrampStepDef js_json_str_def      = { sizeof(JSJsonStr), js_json_
 static const JSTrampStepDef js_ta_slice_def     = { sizeof(JSTASlice), js_ta_slice_step, js_ta_slice_fini, 0 };
 static const JSTrampStepDef js_str_concat_def   = { sizeof(JSStrConcat), js_str_concat_step, js_str_concat_fini, 0, .visit = js_str_concat_visit };
 static const JSTrampStepDef js_str_ctor_def     = { sizeof(JSStrCtor), js_str_ctor_step, js_str_ctor_fini, 0 };
-static const JSTrampStepDef js_array_at_def     = { sizeof(JSArrayAt), js_array_at_step, js_array_at_fini, 0 };
-static const JSTrampStepDef js_array_with_def   = { sizeof(JSArrayWith), js_array_with_step, js_array_with_fini, 0 };
-static const JSTrampStepDef js_array_fill_def   = { sizeof(JSArrayFill), js_array_fill_step, js_array_fill_fini, 0 };
+static const JSTrampStepDef js_array_at_def     = { sizeof(JSArrayAt), js_array_at_step, js_array_at_fini, 0, .visit = js_array_at_visit };
+static const JSTrampStepDef js_array_with_def   = { sizeof(JSArrayWith), js_array_with_step, js_array_with_fini, 0, .visit = js_array_with_visit };
+static const JSTrampStepDef js_array_fill_def   = { sizeof(JSArrayFill), js_array_fill_step, js_array_fill_fini, 0, .visit = js_array_fill_visit };
 static const JSTrampStepDef js_array_copyWithin_def = { sizeof(JSArrayCopyWithin), js_array_copywithin_step, js_array_copywithin_fini, 0 };
 static JSValue js_bigint_constructor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv);
 /* 21.2.1.1 BigInt(value): its ONLY user code is step 2's ToPrimitive on the argument — everything after runs on a
@@ -68345,7 +68428,8 @@ static const JSTrampStepDef js_date_ctor_def = { sizeof(JSDateCtor), js_date_cto
     CREATECTOR_DEF_FULL(class_id, nargs, proto, fn, magic, NULL)
 static int js_array_of_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_of_fini(JSContext *ctx, void *st, bool take_result);
-static const JSTrampStepDef js_array_of_def = { sizeof(JSArrayOf), js_array_of_step, js_array_of_fini, 0 };
+static void js_array_of_visit(JSContext *ctx, void *st, JSStepVisit *v);
+static const JSTrampStepDef js_array_of_def = { sizeof(JSArrayOf), js_array_of_step, js_array_of_fini, 0, .visit = js_array_of_visit };
 static int js_array_concat_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_array_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_slice_fini(JSContext *ctx, void *st, bool take_result);
@@ -68364,12 +68448,14 @@ static const JSTrampStepDef js_array_toSpliced_def =
     { sizeof(JSArrayToSpliced), js_array_tospliced_step, js_array_tospliced_fini, 0 };
 static int js_array_pop_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_pop_fini(JSContext *ctx, void *st, bool take_result);
+static void js_array_pop_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static int js_array_push_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_push_fini(JSContext *ctx, void *st, bool take_result);
-static const JSTrampStepDef js_array_pop_def     = { sizeof(JSArrayPop),  js_array_pop_step,  js_array_pop_fini,  0 };
-static const JSTrampStepDef js_array_shift_def   = { sizeof(JSArrayPop),  js_array_pop_step,  js_array_pop_fini,  1 };
-static const JSTrampStepDef js_array_push_def    = { sizeof(JSArrayPush), js_array_push_step, js_array_push_fini, 0 };
-static const JSTrampStepDef js_array_unshift_def = { sizeof(JSArrayPush), js_array_push_step, js_array_push_fini, 1 };
+static void js_array_push_visit(JSContext *ctx, void *st, JSStepVisit *v);
+static const JSTrampStepDef js_array_pop_def     = { sizeof(JSArrayPop),  js_array_pop_step,  js_array_pop_fini,  0, .visit = js_array_pop_visit };
+static const JSTrampStepDef js_array_shift_def   = { sizeof(JSArrayPop),  js_array_pop_step,  js_array_pop_fini,  1, .visit = js_array_pop_visit };
+static const JSTrampStepDef js_array_push_def    = { sizeof(JSArrayPush), js_array_push_step, js_array_push_fini, 0, .visit = js_array_push_visit };
+static const JSTrampStepDef js_array_unshift_def = { sizeof(JSArrayPush), js_array_push_step, js_array_push_fini, 1, .visit = js_array_push_visit };
 static const JSTrampStepDef js_array_ctor_def =
     CREATECTOR_DEF(JS_CLASS_ARRAY, 0, generic, js_array_ctor_body, 0);
 static const JSTrampStepDef js_array_slice_def  =
@@ -68435,9 +68521,9 @@ static const JSTrampStepDef js_error_tostring_def =
 static const JSTrampStepDef js_symbol_ctor_def =
     { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, PRIMARGS(0x1, HINT_STRING, 1),
       { .generic = js_symbol_constructor }, JS_CFUNC_constructor_or_func, 0, js_symbol_ctor_precheck, NULL, NULL };
-static const JSTrampStepDef js_array_indexOf_def     = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_INDEXOF };
-static const JSTrampStepDef js_array_lastIndexOf_def = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_LASTINDEXOF };
-static const JSTrampStepDef js_array_includes_def    = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_INCLUDES };
+static const JSTrampStepDef js_array_indexOf_def     = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_INDEXOF, .visit = js_array_search_visit };
+static const JSTrampStepDef js_array_lastIndexOf_def = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_LASTINDEXOF, .visit = js_array_search_visit };
+static const JSTrampStepDef js_array_includes_def    = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_INCLUDES, .visit = js_array_search_visit };
 static int js_string_raw_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_string_raw_fini(JSContext *ctx, void *st, bool take_result);
 static const JSTrampStepDef js_string_raw_def =
@@ -68627,14 +68713,16 @@ static const JSTrampStepDef js_bigint_asUintN_def = PRIMARGS_DEF(PRIMARGS(0x3, H
 static const JSTrampStepDef js_bigint_asIntN_def  = PRIMARGS_DEF(PRIMARGS(0x3, HINT_NUMBER, 2), generic_magic, js_bigint_asUintN, 1);
 static int js_gopd_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_gopd_fini(JSContext *ctx, void *st, bool take_result);
-static const JSTrampStepDef js_obj_gopd_def       = { sizeof(JSGopd), js_gopd_step, js_gopd_fini, 0 };
-static const JSTrampStepDef js_reflect_gopd_def   = { sizeof(JSGopd), js_gopd_step, js_gopd_fini, 1 };
+static void js_gopd_visit(JSContext *ctx, void *st, JSStepVisit *v);
+static const JSTrampStepDef js_obj_gopd_def       = { sizeof(JSGopd), js_gopd_step, js_gopd_fini, 0, .visit = js_gopd_visit };
+static const JSTrampStepDef js_reflect_gopd_def   = { sizeof(JSGopd), js_gopd_step, js_gopd_fini, 1, .visit = js_gopd_visit };
 static int js_getproto_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_getproto_fini(JSContext *ctx, void *st, bool take_result);
+static void js_getproto_visit(JSContext *ctx, void *st, JSStepVisit *v);
 /* Object.getPrototypeOf and Reflect.getPrototypeOf differ only in whether a PRIMITIVE argument is boxed or
    rejected — Object's ES6 concession — which is the arg, exactly as it was the C function's magic. */
-static const JSTrampStepDef js_obj_getproto_def     = { sizeof(JSGetProto), js_getproto_step, js_getproto_fini, 0 };
-static const JSTrampStepDef js_reflect_getproto_def = { sizeof(JSGetProto), js_getproto_step, js_getproto_fini, 1 };
+static const JSTrampStepDef js_obj_getproto_def     = { sizeof(JSGetProto), js_getproto_step, js_getproto_fini, 0, .visit = js_getproto_visit };
+static const JSTrampStepDef js_reflect_getproto_def = { sizeof(JSGetProto), js_getproto_step, js_getproto_fini, 1, .visit = js_getproto_visit };
 static int js_extop_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_extop_fini(JSContext *ctx, void *st, bool take_result);
 static void js_extop_visit(JSContext *ctx, void *st, JSStepVisit *v);
@@ -68735,7 +68823,7 @@ static const JSTrampStepDef js_function_call_def  = { sizeof(JSFuncCall), js_fun
 static const JSTrampStepDef js_function_apply_def = { sizeof(JSFuncApply), js_function_apply_step, js_function_apply_fini, 0, .visit = js_function_apply_visit };
 static const JSTrampStepDef js_reflect_apply_def  = { sizeof(JSFuncApply), js_function_apply_step, js_function_apply_fini, 1, .visit = js_function_apply_visit };
 static const JSTrampStepDef js_reflect_construct_def = { sizeof(JSFuncApply), js_reflect_construct_step, js_function_apply_fini, 0, .visit = js_function_apply_visit };
-static const JSTrampStepDef js_array_tostring_def = { sizeof(JSArrayToString), js_array_tostring_step, js_array_tostring_fini, 0 };
+static const JSTrampStepDef js_array_tostring_def = { sizeof(JSArrayToString), js_array_tostring_step, js_array_tostring_fini, 0, .visit = js_array_tostring_visit };
 static const JSTrampStepDef js_array_reduce_def  = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduce, .visit = js_array_reduce_visit };
 static const JSTrampStepDef js_array_reduceR_def = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduceRight, .visit = js_array_reduce_visit };
 static const JSTrampStepDef js_ta_reduce_def     = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduce | special_TA, .visit = js_array_reduce_visit };
@@ -70496,14 +70584,22 @@ static int js_array_tostring_step(JSContext *ctx, void *st, JSValue cb_result, J
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). */
+static void js_array_tostring_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSArrayToString *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->obj);
+    v->val(ctx, &s->cb[0]);
+    v->val(ctx, &s->cb[1]);
+}
+
 static JSValue js_array_tostring_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSArrayToString *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    int i;
-    if (!take_result) JS_FreeValue(ctx, s->result);
-    JS_FreeValue(ctx, s->obj);
-    for (i = 0; i < 2; i++) JS_FreeValue(ctx, s->cb[i]);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -70843,12 +70939,20 @@ static int js_array_pop_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). */
+static void js_array_pop_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSArrayPop *s = st;
+    v->val(ctx, &s->res);
+    v->val(ctx, &s->obj);
+}
+
 static JSValue js_array_pop_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSArrayPop *s = st;
     JSValue r = take_result ? s->res : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->res);
-    JS_FreeValue(ctx, s->obj);
+    if (take_result) s->res = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -70942,11 +71046,18 @@ static int js_array_push_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The result is a length rather than a held value, so the declaration covers everything the machine owns. */
+static void js_array_push_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSArrayPush *s = st;
+    v->val(ctx, &s->obj);
+}
+
 static JSValue js_array_push_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSArrayPush *s = st;
     JSValue r = take_result ? js_int64(s->newLen) : JS_UNDEFINED;
-    JS_FreeValue(ctx, s->obj);
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
