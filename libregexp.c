@@ -95,11 +95,21 @@ typedef struct {
     bool ignore_case;
     bool multi_line;
     bool dotall;
-    uint8_t group_name_scope;
+    /* THE ALTERNATIVE TREE. Two same-named capture groups are legal exactly when they lie in DIFFERENT
+       alternatives of some common enclosing Disjunction — that is a question about the parse TREE, and the
+       flat uint8_t counter that used to answer it could not see nesting: `(?<b>.)((?<a>.)|(?<b>.))` gave the
+       two `b`s different counter values because the inner disjunction had bumped it, so an outer group that
+       is always reachable read as an alternative of the inner one. It also wrapped at 255, which made two
+       unrelated alternatives collide and rejected a legal pattern. Each alternative gets an id and a parent;
+       two groups conflict iff one's alternative is an ancestor of (or the same as) the other's. */
+    int *alt_parent;
+    int alt_count, alt_size;
+    int cur_alt;
     int capture_count;
     int total_capture_count; /* -1 = not computed yet */
     int has_named_captures; /* -1 = don't know, 0 = no, 1 = yes */
     void *opaque;
+    DynBuf group_alts;    /* one u32 per capture, in declaration order: the alternative it was declared in */
     /* `\q{…}` and get_class_atom call each OTHER, which reads as unbounded recursion and is not: the call
        below passes cr=NULL and inclass=false, and the \q branch needs both, so the depth is two by
        construction. That is a structural invariant, so it gets an assert rather than a frame stack —
@@ -179,6 +189,12 @@ typedef struct {
        1. */
     CharRange cr;
     uint32_t n_strings;
+    /* 22.2.1's MayContainStrings, which is a STATIC property of the productions that built this list and NOT a
+       question about what is in it. The two differ exactly where a set operation empties the strings out:
+       `[^\q{foo}&&\q{bar}]` intersects {"foo"} with {"bar"} to nothing, so n_strings is 0, and the negation
+       is still an early error because MayContainStrings of a ClassIntersection is true when BOTH operands may
+       contain strings. Reading n_strings instead accepted it — the gap the XXX at the negation check named. */
+    bool may_contain_strings;
     uint32_t hash_size;
     int hash_bits;
     REString **hash_table;
@@ -198,6 +214,7 @@ static void re_string_list_init(REParseState *s1, REStringList *s)
 {
     cr_init(&s->cr, s1->opaque, lre_realloc);
     s->n_strings = 0;
+    s->may_contain_strings = false;
     s->hash_size = 0;
     s->hash_bits = 0;
     s->hash_table = NULL;
@@ -333,6 +350,9 @@ static int re_string_add(REStringList *s, int len, const uint32_t *buf)
     if (len == 1) {
         return cr_union_interval(&s->cr, buf[0], buf[0]);
     }
+    /* MayContainStrings of a ClassStringDisjunction is true when any ClassString has length != 1 — which is
+       this branch, and the empty string reaches it too (`[^\q{}]` is an early error). */
+    s->may_contain_strings = true;
     if (re_string_find(s, len, buf, true) < 0)
         return -1;
     return 0;
@@ -346,6 +366,15 @@ static int re_string_list_op(REStringList *a, REStringList *b, int op)
 
     if (cr_op1(&a->cr, b->cr.points, b->cr.len, op))
         return -1;
+
+    /* ClassUnion: true if EITHER operand may. ClassIntersection: true only if BOTH may. ClassSubtraction:
+       the FIRST operand's, unchanged — the right-hand side removes members, it cannot introduce strings. */
+    switch (op) {
+    case CR_OP_UNION: a->may_contain_strings = a->may_contain_strings || b->may_contain_strings; break;
+    case CR_OP_INTER: a->may_contain_strings = a->may_contain_strings && b->may_contain_strings; break;
+    case CR_OP_SUB:   break;
+    default:          abort();
+    }
 
     switch(op) {
     case CR_OP_UNION:
@@ -401,6 +430,7 @@ static int re_string_list_canonicalize(REParseState *s1,
         re_string_list_init(s1, a);
 
         a->n_strings = s->n_strings;
+        a->may_contain_strings = s->may_contain_strings;
         a->hash_size = s->hash_size;
         a->hash_bits = s->hash_bits;
         a->hash_table = s->hash_table;
@@ -1642,11 +1672,11 @@ static int re_parse_nested_class(REParseState *s, REStringList *cr_out, const ui
 
     p++;    /* skip ']' */
     if (f->invert) {
-        /* XXX: add may_contain_string syntax check to be fully
-           compliant. The test here accepts more input than the
-           spec. */
-        if (cr->n_strings != 0) {
-            re_parse_error(s, "negated character class with strings in regular expression debugger eval code");
+        /* 22.2.1: it is a Syntax Error if MayContainStrings of the ClassContents is true. That is the STATIC
+           property, not "did any strings survive" — `[^\q{foo}&&\q{bar}]` intersects to the empty set and is
+           still an error, which is the case the n_strings test used to let through. */
+        if (cr->may_contain_strings) {
+            re_parse_error(s, "negated character class with strings in regular expression");
             goto fail;
         }
         if (cr_invert(&cr->cr))
@@ -1931,25 +1961,59 @@ static int find_group_name(REParseState *s, const char *name, bool emit_group_in
     return n;
 }
 
-static bool is_duplicate_group_name(REParseState *s, const char *name, int scope)
+/* Open a new alternative whose enclosing alternative is `parent`, and make it current. */
+static int re_alt_open(REParseState *s, int parent)
 {
+    if (s->alt_count >= s->alt_size) {
+        int n = s->alt_size ? s->alt_size * 2 : 16;
+        int *na = lre_realloc(s->opaque, s->alt_parent, sizeof(*na) * (size_t)n);
+        if (!na)
+            return re_parse_out_of_memory(s);
+        s->alt_parent = na;
+        s->alt_size = n;
+    }
+    s->alt_parent[s->alt_count] = parent;
+    s->cur_alt = s->alt_count++;
+    return 0;
+}
+
+/* Is `a` on the path from `b` to the root? Then every position in `b` is also inside `a`, so two groups there
+   can both match and the name is a duplicate. */
+static bool re_alt_encloses(const REParseState *s, int a, int b)
+{
+    while (b >= 0) {
+        if (b == a)
+            return true;
+        b = s->alt_parent[b];
+    }
+    return false;
+}
+
+static bool is_duplicate_group_name(REParseState *s, const char *name, int alt)
+{
+    DCHECK(alt >= 0, "a capture group was declared outside any alternative — the top-level Disjunction opens "
+                     "one before the first term, so reaching here means cur_alt was not maintained");
     const char *p, *buf_end;
+    const uint8_t *alts;
     size_t len, name_len;
-    int scope1;
-    
+    uint32_t i = 0;
+
     p = (char *)s->group_names.buf;
     if (!p)
         return 0;
+    alts = s->group_alts.buf;
     buf_end = (char *)s->group_names.buf + s->group_names.size;
     name_len = strlen(name);
     while (p < buf_end) {
         len = strlen(p);
         if (len == name_len && memcmp(name, p, name_len) == 0) {
-            scope1 = (uint8_t)p[len + 1];
-            if (scope == scope1)
+            int alt1 = (int)get_u32(alts + i * 4);
+            /* legal only if the two alternatives DIVERGE — neither contains the other */
+            if (re_alt_encloses(s, alt, alt1) || re_alt_encloses(s, alt1, alt))
                 return true;
         }
         p += len + LRE_GROUP_NAME_TRAILER_LEN;
+        i++;
     }
     return false;
 }
@@ -2013,6 +2077,7 @@ typedef struct REParseFrame {
        recomputed from s->buf_ptr or dead by the time the child runs. */
     int last_atom_start, last_capture_count;
     int pos, capture_index;
+    int enclosing_alt;              /* the alternative this Disjunction sits in; its own alternatives' parent */
     bool is_neg;
     bool saved_ignore_case, saved_multi_line, saved_dotall;
 } REParseFrame;
@@ -2092,8 +2157,12 @@ static int re_parse_disjunction(REParseState *s, bool is_backward_dir)
     f = &st[sp - 1];
     f->dj_start = s->byte_code.size;
     f->goto_pos = -1;
+    f->enclosing_alt = s->cur_alt;
 
  alt_enter:
+    /* every Alternative is a node of the tree, sibling to this Disjunction's others */
+    if (re_alt_open(s, f->enclosing_alt))
+        goto fail;
     f->alt_start = s->byte_code.size;
 
  alt_loop:
@@ -2145,11 +2214,10 @@ static int re_parse_disjunction(REParseState *s, bool is_backward_dir)
 
         f->goto_pos = re_emit_op_u32(s, REOP_goto, 0);
 
-        s->group_name_scope++;
-
         goto alt_enter;
     }
     /* this disjunction is complete: hand control back to the term that descended into it */
+    s->cur_alt = f->enclosing_alt;
     sp--;
     if (sp == 0) {
         ret = 0;
@@ -2311,16 +2379,13 @@ static int re_parse_disjunction(REParseState *s, bool is_backward_dir)
                                         &p)) {
                     RE_ERROR(s, "invalid group name");
                 }
-                /* poor's man method to test duplicate group
-                   names. */
-                /* XXX: this method does not catch all the errors*/
-                if (is_duplicate_group_name(s, s->u.tmp_buf, s->group_name_scope)) {
+                if (is_duplicate_group_name(s, s->u.tmp_buf, s->cur_alt)) {
                     RE_ERROR(s, "duplicate group name");
                 }
                 /* group name with a trailing zero */
                 dbuf_put(&s->group_names, (uint8_t *)s->u.tmp_buf,
                          strlen(s->u.tmp_buf) + 1);
-                dbuf_putc(&s->group_names, s->group_name_scope);
+                dbuf_put_u32(&s->group_alts, s->cur_alt);
                 s->has_named_captures = 1;
                 goto parse_capture;
             } else {
@@ -2330,8 +2395,8 @@ static int re_parse_disjunction(REParseState *s, bool is_backward_dir)
             int capture_index;
             p++;
             /* capture without group name */
-            dbuf_putc(&s->group_names, 0);
-            dbuf_putc(&s->group_names, 0);
+            dbuf_putc(&s->group_names, 0);            /* an empty name */
+            dbuf_put_u32(&s->group_alts, s->cur_alt);   /* lockstep with group_names, so index i matches */
         parse_capture:
             last_atom_start = s->byte_code.size;
             last_capture_count = s->capture_count;
@@ -2822,6 +2887,11 @@ uint8_t *lre_compile(int *plen, char *error_msg, int error_msg_size,
 
     dbuf_init2(&s->byte_code, opaque, lre_bytecode_realloc);
     dbuf_init2(&s->group_names, opaque, lre_realloc);
+    dbuf_init2(&s->group_alts, opaque, lre_realloc);
+    s->alt_parent = NULL;
+    s->alt_count = 0;
+    s->alt_size = 0;
+    s->cur_alt = -1;   /* the top-level Disjunction opens the first alternative, whose parent is the root */
 
     /* RESERVE the whole header and patch it at the end. Writing it field by field meant the reservation and
        RE_HEADER_LEN were two statements of the same layout, and widening the counts made them disagree. */
@@ -2846,6 +2916,8 @@ uint8_t *lre_compile(int *plen, char *error_msg, int error_msg_size,
     error:
         dbuf_free(&s->byte_code);
         dbuf_free(&s->group_names);
+        dbuf_free(&s->group_alts);
+        lre_realloc(s->opaque, s->alt_parent, 0);
         js__pstrcpy(error_msg, error_msg_size, s->u.error_msg);
         *plen = 0;
         return NULL;
@@ -2881,6 +2953,8 @@ uint8_t *lre_compile(int *plen, char *error_msg, int error_msg_size,
                 lre_get_flags(s->byte_code.buf) | LRE_FLAG_NAMED_GROUPS);
     }
     dbuf_free(&s->group_names);
+    dbuf_free(&s->group_alts);
+    lre_realloc(s->opaque, s->alt_parent, 0);
 
 #ifdef DUMP_REOP
     lre_dump_bytecode(s->byte_code.buf, s->byte_code.size);

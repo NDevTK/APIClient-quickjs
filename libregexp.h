@@ -48,8 +48,11 @@ extern "C" {
 #define LRE_RET_YIELD          (-2)
 #define LRE_RET_BYTECODE_ERROR (-3)
 
-/* trailer length after the group name including the trailing '\0' */
-#define LRE_GROUP_NAME_TRAILER_LEN 2
+/* trailer length after the group name including the trailing '\0'. It was 2: the NUL plus a per-group
+   "scope" byte that only the parser read, and which is gone now that duplicate group names are decided by an
+   alternative TREE the parser keeps on the side. A byte the compiled byte code carries and nobody reads is a
+   lie about the format. */
+#define LRE_GROUP_NAME_TRAILER_LEN 1
 
 uint8_t *lre_compile(int *plen, char *error_msg, int error_msg_size,
                      const char *buf, size_t buf_len, int re_flags,
