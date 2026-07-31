@@ -275,6 +275,12 @@ DEF(using_dispose_merge, 1, 2, 1, none)
 DEF(  using_dispose_end, 1, 1, 0, none)
 DEF(        using_check, 2, 1, 2, u8)
 /* must be the last non short and non temporary opcode */
+/* The strictness of a REGION, not of a function: 15.7.1 makes every part of a class definition strict code, and
+   the heritage expression and the computed property names of its elements run in the ENCLOSING function's frame.
+   Compiled only where that function is sloppy, so strict code never pays for it, and the operand is what the
+   frame's strictness returns to -- which is always 0, because the marker is only ever emitted around a strict
+   region inside a sloppy one. */
+DEF(     set_strict, 2, 0, 0, u8)
 DEF(            nop, 1, 0, 0, none)
 
 /* temporary opcodes: never emitted in the final bytecode */

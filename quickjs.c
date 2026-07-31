@@ -24656,15 +24656,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #define DEF(id, size, n_pop, n_push, f) && case_OP_ ## id,
 #define def(id, size, n_pop, n_push, f)
 #include "quickjs-opcode.h"
-        /* The DEFs fill slots 0..OP_COUNT-1; every remaining byte an indirect jump could read must still land
-           somewhere, so the tail goes to the default label. A NULL slot here is a jump to address 0 on the first
-           corrupt or hostile bytecode byte. */
-        [OP_COUNT ... 255] = &&case_default,
+        /* NO tail fill: the DEFs now occupy every one of the 256 slots, so there is no byte an indirect jump
+           could read that is not a real opcode — the fill it used to need was for the unused tail, and there is
+           none. The assert is what makes a 257th opcode a build failure rather than a table that is one entry
+           short, and a 255th one a NULL slot (a jump to address 0 on the first corrupt byte). */
     };
-    /* The range designator above is EMPTY (and ill-formed) at exactly 256 opcodes, which is where the set stood
-       until OP_using_dispose_async was deleted. Adding a 256th opcode back must delete the designator in the same
-       diff — this assert is what makes that a build failure instead of a silent [256 ... 255]. */
-    _Static_assert(OP_COUNT < 256, "the dispatch tail fill [OP_COUNT ... 255] needs at least one unused opcode byte");
+    _Static_assert(OP_COUNT == 256, "the dispatch table has exactly one slot per opcode and no tail to fill");
 #define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) __extension__ ({ goto *dispatch_table[opcode = *pc++]; });
 #define CASE(op)        case_ ## op
 #define DEFAULT         case_default
@@ -37687,6 +37684,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             ret_val = JS_UNDEFINED;
             goto done_generator;
 
+        CASE(OP_set_strict):
+            /* 15.7.1: a class definition is strict code, and its heritage expression and its elements' computed
+               property names are evaluated in the ENCLOSING function's frame. Strictness is a property of the
+               frame, so a sloppy function containing a class had nowhere to say that, and
+               `class C { [Object.preventExtensions({}).p = 4]() {} }` in sloppy code silently ignored a write
+               that must throw. The marker moves the frame in and out of the region; it is compiled ONLY into a
+               sloppy function, so a strict one emits nothing and pays nothing. */
+            sf->is_strict_mode = *pc++;
+            BREAK;
         CASE(OP_nop):
             BREAK;
         CASE(OP_is_undefined_or_null):
@@ -37739,6 +37745,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         }
     }
  exception:
+    /* A strict REGION (OP_set_strict, a class definition inside a sloppy function) cannot contain a catch
+       handler of this frame — a class head is an expression, and every statement in it belongs to some nested
+       function — so an abrupt completion always LEAVES the region, and whatever handler runs next belongs to the
+       function's own strictness. Restoring here is what makes the marker's `pop` unnecessary on the throw path. */
+    if (b) sf->is_strict_mode = b->is_strict_mode;
     /* An arm that threw BEFORE adopting the call shape must not leave it behind: the list would leak and the
        resolved pop count would be read by the next call this frame makes (a catch resumes in this same frame).
        The same rule as the construct side's con_cargc, applied where every abrupt path converges. */
@@ -44404,6 +44415,11 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
     /* classes are parsed and executed in strict mode */
     is_strict_mode = fd->is_strict_mode;
     fd->is_strict_mode = true;
+    if (!is_strict_mode) {
+        /* the heritage and the elements' computed property names run in THIS function's frame, which is sloppy */
+        emit_op(s, OP_set_strict);
+        emit_u8(s, 1);
+    }
     if (next_token(s))
         goto fail;
     if (s->token.val == TOK_IDENT) {
@@ -44842,6 +44858,15 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
         emit_op(s, OP_scope_put_var_init);
         emit_atom(s, JS_ATOM_class_fields_init);
         emit_u16(s, s->cur_func->scope_level);
+    }
+
+    /* The class's own code ends HERE: everything below is the engine's own shaping, and the field initializers
+       it calls are separate functions with their own strictness. The marker leaves the region at this point
+       rather than at the end of the function so that OP_set_class_name stays the LAST opcode — set_object_name
+       finds an anonymous class expression's inferred name by exactly that pattern. */
+    if (!is_strict_mode) {
+        emit_op(s, OP_set_strict);
+        emit_u8(s, 0);
     }
 
     /* drop the prototype */
