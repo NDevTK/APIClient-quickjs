@@ -77772,177 +77772,103 @@ static void json_free_parse_record(JSContext *ctx, JSONParseRecord *pr)
 }
 
 /* 'pr' can be NULL */
+/* JSON's value grammar, as an explicit FRAME STACK. It was C recursion one frame per nesting level with the
+   depth chosen by the input — `JSON.parse("[".repeat(1e6) + ...)` — and the js_check_stack_overflow standing in
+   front of it turned that into a RangeError, which is a BOUND in an error's clothes: the grammar has an answer
+   at every depth and the parser refused to give it. Nothing here is a state machine for suspension's sake; the
+   descent simply IS a stack, so it is written as one. Found by engine/check_recursion.mjs. */
+typedef struct JSONFrame {
+    JSValue container;      /* the object or array being built (owned) */
+    JSONParseRecord *pr;    /* its parse record, or NULL when there is no reviver */
+    int pr_size;            /* json_parse_record_add / js_resize_array's capacity cursor */
+    uint32_t idx;           /* ARRAY: the next element index */
+    JSAtom prop_name;       /* OBJECT: the key whose value is being parsed (owned), else JS_ATOM_NULL */
+    uint8_t is_array;
+} JSONFrame;
+
 static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
 {
     JSContext *ctx = s->ctx;
     JSValue val = JS_NULL;
+    JSONFrame *st = NULL;
+    int sp = 0, st_size = 0;
+    JSONParseRecord *pr_cur = pr;   /* the record for the value about to be parsed */
+    JSONFrame *top;
+    JSONParseRecord *pr1;
     int ret;
 
-    if (js_check_stack_overflow(ctx->rt, 0)) {
-        return JS_ThrowStackOverflow(ctx);
-    }
+#define JSON_PUSH_FRAME(container_, is_array_)                                          \
+    do {                                                                                \
+        if (js_resize_array(ctx, (void **)&st, sizeof(st[0]), &st_size, sp + 1)) {       \
+            JS_FreeValue(ctx, (container_));                                            \
+            goto fail;                                                                  \
+        }                                                                               \
+        top = &st[sp++];                                                                \
+        top->container = (container_);                                                  \
+        top->pr = pr_cur;                                                               \
+        top->pr_size = 0;                                                               \
+        top->idx = 0;                                                                   \
+        top->prop_name = JS_ATOM_NULL;                                                  \
+        top->is_array = (is_array_);                                                    \
+    } while (0)
 
-    if (pr) {
-        pr->value = JS_UNDEFINED;
-    }
+ parse_value:
+    if (pr_cur)
+        pr_cur->value = JS_UNDEFINED;
 
     switch(s->token.val) {
     case '{':
         {
-            JSValue prop_val;
-            JSAtom prop_name;
-            JSONParseRecord *pr1;
-            int pr_size;
-
+            JSValue obj;
             if (json_next_token(s))
                 goto fail;
-            val = JS_NewObject(ctx);
-            if (JS_IsException(val))
+            obj = JS_NewObject(ctx);
+            if (JS_IsException(obj))
                 goto fail;
-            if (pr) {
-                json_parse_record_init_obj(ctx, pr, val);
-                pr_size = 0;
+            if (pr_cur)
+                json_parse_record_init_obj(ctx, pr_cur, obj);
+            JSON_PUSH_FRAME(obj, 0);
+            if (s->token.val == '}') {
+                if (json_next_token(s))
+                    goto fail;
+                goto container_done;
             }
-            if (s->token.val != '}') {
-                for(;;) {
-                    if (s->token.val == TOK_STRING) {
-                        prop_name = JS_ValueToAtom(ctx, s->token.u.str.str);
-                        if (prop_name == JS_ATOM_NULL)
-                            goto fail;
-                    } else {
-                        json_parse_error(s, s->token.ptr, "Expected property name or '}'");
-                        goto fail;
-                    }
-                    if (json_next_token(s))
-                        goto fail1;
-                    if (s->token.val != ':') {
-                        json_parse_error(s, s->token.ptr, "Expected ':' after property name");
-                        goto fail1;
-                    }
-                    if (json_next_token(s))
-                        goto fail1;
-                    if (pr) {
-                        pr1 = json_parse_record_add(ctx, pr, prop_name, &pr_size);
-                        if (!pr1)
-                            goto fail1;
-                    } else {
-                        pr1 = NULL;
-                    }
-                    prop_val = json_parse_value(s, pr1);
-                    if (JS_IsException(prop_val)) {
-                    fail1:
-                        JS_FreeAtom(ctx, prop_name);
-                        goto fail;
-                    }
-                    ret = JS_DefinePropertyValue(ctx, val, prop_name,
-                                                 prop_val, JS_PROP_C_W_E);
-                    JS_FreeAtom(ctx, prop_name);
-                    if (ret < 0)
-                        goto fail;
-
-                    if (s->token.val == '}')
-                        break;
-                    if (s->token.val != ',') {
-                        json_parse_error(s, s->token.ptr, "Expected ',' or '}' after property value");
-                        goto fail;
-                    }
-                    if (json_next_token(s))
-                        goto fail;
-                }
-            }
-            if (json_next_token(s))
-                goto fail;
+            goto object_key;
         }
-        break;
     case '[':
         {
-            JSValue el;
-            uint32_t idx;
-            JSONParseRecord *pr1;
-            int pr_size;
-
+            JSValue arr;
             if (json_next_token(s))
                 goto fail;
-            val = JS_NewArray(ctx);
-            if (JS_IsException(val))
+            arr = JS_NewArray(ctx);
+            if (JS_IsException(arr))
                 goto fail;
-            if (pr) {
-                json_parse_record_init_array(ctx, pr, val);
-                pr_size = 0;
+            if (pr_cur)
+                json_parse_record_init_array(ctx, pr_cur, arr);
+            JSON_PUSH_FRAME(arr, 1);
+            if (s->token.val == ']') {
+                if (json_next_token(s))
+                    goto fail;
+                goto container_done;
             }
-            if (s->token.val != ']') {
-                for(idx = 0;; idx++) {
-                    if (pr) {
-                        if (js_resize_array(ctx, (void **)&pr->u.array.elements, sizeof(pr->u.array.elements[0]),
-                                            &pr_size, pr->u.array.count + 1))
-                            goto fail;
-                        pr1 = &pr->u.array.elements[pr->u.array.count++];
-                        pr1->value = JS_UNDEFINED;
-                    } else {
-                        pr1 = NULL;
-                    }
-                    el = json_parse_value(s, pr1);
-                    if (JS_IsException(el))
-                        goto fail;
-                    ret = JS_DefinePropertyValueUint32(ctx, val, idx, el, JS_PROP_C_W_E);
-                    if (ret < 0)
-                        goto fail;
-                    if (s->token.val == ']')
-                        break;
-                    if (s->token.val != ',') {
-                        json_parse_error(s, s->token.ptr, "Expected ',' or ']' after array element");
-                        goto fail;
-                    }
-                    if (json_next_token(s))
-                        goto fail;
-                }
-            }
-            if (json_next_token(s))
-                goto fail;
+            goto array_element;
         }
-        break;
     case TOK_STRING:
         val = js_dup(s->token.u.str.str);
-        if (pr) {
-            json_parse_record_init_primitive(ctx, pr, val,
-                                             s->token.ptr - s->buf_start,
-                                             s->buf_ptr - s->token.ptr);
-        }
-        if (json_next_token(s))
-            goto fail;
-        break;
+        goto primitive;
     case TOK_NUMBER:
         val = s->token.u.num.val;
-        if (pr) {
-            json_parse_record_init_primitive(ctx, pr, val,
-                                             s->token.ptr - s->buf_start,
-                                             s->buf_ptr - s->token.ptr);
-        }
-        if (json_next_token(s))
-            goto fail;
-        break;
+        goto primitive;
     case TOK_IDENT:
         if (s->token.u.ident.atom == JS_ATOM_false ||
             s->token.u.ident.atom == JS_ATOM_true) {
             val = js_bool(s->token.u.ident.atom == JS_ATOM_true);
-            if (pr) {
-                json_parse_record_init_primitive(ctx, pr, val,
-                                                 s->token.ptr - s->buf_start,
-                                                 s->buf_ptr - s->token.ptr);
-            }
         } else if (s->token.u.ident.atom == JS_ATOM_null) {
             val = JS_NULL;
-            if (pr) {
-                json_parse_record_init_primitive(ctx, pr, val,
-                                                 s->token.ptr - s->buf_start,
-                                                 s->buf_ptr - s->token.ptr);
-            }
         } else {
             goto def_token;
         }
-        if (json_next_token(s))
-            goto fail;
-        break;
+        goto primitive;
     default:
     def_token:
         if (s->token.val == TOK_EOF) {
@@ -77953,11 +77879,124 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
         }
         goto fail;
     }
-    return val;
+
+ primitive:
+    if (pr_cur) {
+        json_parse_record_init_primitive(ctx, pr_cur, val,
+                                         s->token.ptr - s->buf_start,
+                                         s->buf_ptr - s->token.ptr);
+    }
+    if (json_next_token(s))
+        goto fail;
+    /* fall through: a completed value belongs to the frame below it, if there is one */
+
+ value_done:
+    if (sp == 0) {
+        js_free(ctx, st);
+        return val;
+    }
+    top = &st[sp - 1];
+    if (top->is_array) {
+        ret = JS_DefinePropertyValueUint32(ctx, top->container, top->idx++, val, JS_PROP_C_W_E);
+        val = JS_NULL;
+        if (ret < 0)
+            goto fail;
+        if (s->token.val == ']') {
+            if (json_next_token(s))
+                goto fail;
+            goto container_done;
+        }
+        if (s->token.val != ',') {
+            json_parse_error(s, s->token.ptr, "Expected ',' or ']' after array element");
+            goto fail;
+        }
+        if (json_next_token(s))
+            goto fail;
+        goto array_element;
+    }
+    ret = JS_DefinePropertyValue(ctx, top->container, top->prop_name, val, JS_PROP_C_W_E);
+    val = JS_NULL;
+    JS_FreeAtom(ctx, top->prop_name);
+    top->prop_name = JS_ATOM_NULL;
+    if (ret < 0)
+        goto fail;
+    if (s->token.val == '}') {
+        if (json_next_token(s))
+            goto fail;
+        goto container_done;
+    }
+    if (s->token.val != ',') {
+        json_parse_error(s, s->token.ptr, "Expected ',' or '}' after property value");
+        goto fail;
+    }
+    if (json_next_token(s))
+        goto fail;
+    goto object_key;
+
+ array_element:
+    top = &st[sp - 1];
+    if (top->pr) {
+        if (js_resize_array(ctx, (void **)&top->pr->u.array.elements,
+                            sizeof(top->pr->u.array.elements[0]),
+                            &top->pr_size, top->pr->u.array.count + 1))
+            goto fail;
+        pr1 = &top->pr->u.array.elements[top->pr->u.array.count++];
+        pr1->value = JS_UNDEFINED;
+    } else {
+        pr1 = NULL;
+    }
+    pr_cur = pr1;
+    goto parse_value;
+
+ object_key:
+    top = &st[sp - 1];
+    if (s->token.val != TOK_STRING) {
+        json_parse_error(s, s->token.ptr, "Expected property name or '}'");
+        goto fail;
+    }
+    top->prop_name = JS_ValueToAtom(ctx, s->token.u.str.str);
+    if (top->prop_name == JS_ATOM_NULL)
+        goto fail;
+    if (json_next_token(s))
+        goto fail;
+    if (s->token.val != ':') {
+        json_parse_error(s, s->token.ptr, "Expected ':' after property name");
+        goto fail;
+    }
+    if (json_next_token(s))
+        goto fail;
+    if (top->pr) {
+        pr1 = json_parse_record_add(ctx, top->pr, top->prop_name, &top->pr_size);
+        if (!pr1)
+            goto fail;
+    } else {
+        pr1 = NULL;
+    }
+    pr_cur = pr1;
+    goto parse_value;
+
+ container_done:
+    /* the frame is complete: it becomes the VALUE the frame below it was waiting for. */
+    top = &st[--sp];
+    val = top->container;
+    top->container = JS_UNDEFINED;
+    DCHECK(top->prop_name == JS_ATOM_NULL, "a finished JSON object frame still holds a key");
+    goto value_done;
+
  fail:
+    /* the ROOT record owns the whole tree — json_free_parse_record clears each value as it goes, so a child
+       already released by a nested failure is a no-op the second time, which is what the recursive version
+       relied on too. */
     json_free_parse_record(ctx, pr);
     JS_FreeValue(ctx, val);
+    while (sp > 0) {
+        top = &st[--sp];
+        JS_FreeValue(ctx, top->container);
+        JS_FreeAtom(ctx, top->prop_name);
+    }
+    js_free(ctx, st);
     return JS_EXCEPTION;
+#undef JSON_PUSH_FRAME
 }
 
 static JSValue JS_ParseJSON_internal(JSContext *ctx, const char *buf, size_t buf_len,
