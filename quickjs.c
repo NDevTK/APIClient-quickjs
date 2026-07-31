@@ -79269,7 +79269,12 @@ static int js_re_search_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
         s->hdr.stage = r ? 6 : 8;
     }
     if (s->hdr.stage == 8) {
-        r = step_setprop_run(ctx, &s->hdr, s->hdr.this_val, JS_ATOM_lastIndex, js_dup(s->prevLast), cb_result,
+        /* BORROWED, like every other value handed to a keyed write: the request buffer takes no reference and
+           the machine holds `prevLast` across the write in its own slot. A `js_dup` here created a reference
+           nobody ever freed — one per @@search whose lastIndex was an OBJECT — and because that object is
+           reachable from the page's own graph the leaked reference pinned the entire runtime: 383 objects
+           reported at teardown for a four-line fixture. */
+        r = step_setprop_run(ctx, &s->hdr, s->hdr.this_val, JS_ATOM_lastIndex, s->prevLast, cb_result,
                              out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
