@@ -73,7 +73,6 @@ typedef enum {
 #define REGISTER_COUNT_MAX 255
 /* must be large enough to have a negligible runtime cost and small
    enough to call the interrupt callback often. */
-#define INTERRUPT_COUNTER_INIT 10000
 
 /* unicode code points */
 #define CP_LS   0x2028
@@ -2830,52 +2829,6 @@ static bool is_line_terminator(uint32_t c)
         }                                                               \
     } while (0)
 
-typedef enum {
-    RE_EXEC_STATE_SPLIT,
-    RE_EXEC_STATE_LOOKAHEAD,
-    RE_EXEC_STATE_NEGATIVE_LOOKAHEAD,
-} REExecStateEnum;
-
-#if INTPTR_MAX >= INT64_MAX
-#define BP_TYPE_BITS 3
-#else
-#define BP_TYPE_BITS 2
-#endif
-
-typedef union {
-    uint8_t *ptr;
-    intptr_t val; /* for bp, the low BP_SHIFT bits store REExecStateEnum */
-    struct {
-        uintptr_t val : sizeof(uintptr_t) * 8 - BP_TYPE_BITS;
-        uintptr_t type : BP_TYPE_BITS;
-    } bp;
-} StackElem;
-
-typedef struct {
-    const uint8_t *cbuf;
-    const uint8_t *cbuf_end;
-    /* 0 = 8 bit chars, 1 = 16 bit chars, 2 = 16 bit chars, UTF-16 */
-    int cbuf_type;
-    int capture_count;
-    bool is_unicode;
-    int interrupt_counter;
-    void *opaque; /* used for stack overflow check */
-
-    StackElem *stack_buf;
-    size_t stack_size;
-    StackElem static_stack_buf[32]; /* static stack to avoid allocation in most cases */
-} REExecContext;
-
-static int lre_poll_timeout(REExecContext *s)
-{
-    if (unlikely(--s->interrupt_counter <= 0)) {
-        s->interrupt_counter = INTERRUPT_COUNTER_INIT;
-        if (lre_check_timeout(s->opaque))
-            return LRE_RET_TIMEOUT;
-    }
-    return 0;
-}
-
 static no_inline int stack_realloc(REExecContext *s, size_t n)
 {
     StackElem *new_stack;
@@ -2899,23 +2852,43 @@ static no_inline int stack_realloc(REExecContext *s, size_t n)
     return 0;
 }
 
-/* return 1 if match, 0 if not match or < 0 if error. */
-static intptr_t lre_exec_backtrack(REExecContext *s, uint8_t **capture,
-                                   const uint8_t *pc, const uint8_t *cptr)
+/* ONE SLICE of a match: 1 if it matched, 0 if it did not, LRE_RET_YIELD if the host asked for the thread back
+   at a back-edge (call again to continue at the exact opcode), or < 0 for an error.
+   The four values that make a match RESUMABLE — pc, cptr and the two stack cursors — are loaded from the
+   context here and written back at the yield. Everything else below is per-opcode and is rebuilt on re-entry;
+   the offsets are offsets rather than pointers because stack_realloc moves the buffer. */
+static intptr_t lre_exec_backtrack(REExecContext *s)
 {
+    uint8_t **capture = s->capture;
+    const uint8_t *pc = s->pc;
+    const uint8_t *cptr = s->cptr;
     int opcode;
     int cbuf_type;
     uint32_t val, c, idx;
     const uint8_t *cbuf_end;
     StackElem *sp, *bp, *stack_end;
 #ifdef DUMP_EXEC
-    const uint8_t *pc_start = pc; /* TEST */
+    const uint8_t *pc_start = s->pc; /* TEST */
 #endif
     cbuf_type = s->cbuf_type;
     cbuf_end = s->cbuf_end;
 
-    sp = s->stack_buf;
-    bp = s->stack_buf;
+    sp = s->stack_buf + s->sp_off;
+    bp = s->stack_buf + s->bp_off;
+
+/* THE BACK-EDGE. It sits at exactly the four places the regexp program can loop — a goto, the two counted-loop
+   opcodes, and the pop that resumes an alternative — which is where a catastrophically backtracking pattern
+   spends all of its time. Asking costs one predicted call; parking costs four stores. */
+#define RE_YIELD_POINT()                                        \
+    do {                                                        \
+        if (unlikely(lre_want_yield(s->opaque))) {              \
+            s->pc = pc;                                         \
+            s->cptr = cptr;                                     \
+            s->sp_off = sp - s->stack_buf;                      \
+            s->bp_off = bp - s->stack_buf;                      \
+            return LRE_RET_YIELD;                               \
+        }                                                       \
+    } while (0)
     stack_end = s->stack_buf + s->stack_size;
     
 #define CHECK_STACK_SPACE(n)                            \
@@ -2997,8 +2970,7 @@ static intptr_t lre_exec_backtrack(REExecContext *s, uint8_t **capture,
                 if (type != RE_EXEC_STATE_LOOKAHEAD)
                     break;
             }
-            if (lre_poll_timeout(s))
-                return LRE_RET_TIMEOUT;
+            RE_YIELD_POINT();
             break;
         case REOP_lookahead_match:
             /* pop all the saved states until reaching the start of
@@ -3108,8 +3080,7 @@ static intptr_t lre_exec_backtrack(REExecContext *s, uint8_t **capture,
         case REOP_goto:
             val = get_u32(pc);
             pc += 4 + (int)val;
-            if (lre_poll_timeout(s))
-                return LRE_RET_TIMEOUT;
+            RE_YIELD_POINT();
             break;
         case REOP_line_start:
         case REOP_line_start_m:
@@ -3200,8 +3171,7 @@ static intptr_t lre_exec_backtrack(REExecContext *s, uint8_t **capture,
                 SAVE_CAPTURE_CHECK(idx, (void *)(uintptr_t)val2);
                 if (val2 != 0) {
                     pc += (int)val;
-                    if (lre_poll_timeout(s))
-                        return LRE_RET_TIMEOUT;
+                    RE_YIELD_POINT();
                 }
             }
             break;
@@ -3224,8 +3194,7 @@ static intptr_t lre_exec_backtrack(REExecContext *s, uint8_t **capture,
                 if (val2 > limit) {
                     /* normal loop if counter > limit */
                     pc += (int)val;
-                    if (lre_poll_timeout(s))
-                        return LRE_RET_TIMEOUT;
+                    RE_YIELD_POINT();
                 } else {
                     /* check advance */
                     if ((opcode == REOP_loop_check_adv_split_goto_first ||
@@ -3449,17 +3418,16 @@ static intptr_t lre_exec_backtrack(REExecContext *s, uint8_t **capture,
             abort();
         }
     }
+#undef RE_YIELD_POINT
 }
 
-/* Return 1 if match, 0 if not match or < 0 if error (see LRE_RET_x). cindex is the
-   starting position of the match and must be such as 0 <= cindex <=
-   clen. */
-int lre_exec(uint8_t **capture,
-             const uint8_t *bc_buf, const uint8_t *cbuf, int cindex, int clen,
-             int cbuf_type, void *opaque)
+/* Seed a match. cindex is the starting position and must be such as 0 <= cindex <= clen. The capture array
+   and the input buffer must both stay alive until lre_exec_end: a suspended match points into them. */
+int lre_exec_begin(REExecContext *s, uint8_t **capture,
+                   const uint8_t *bc_buf, const uint8_t *cbuf, int cindex, int clen,
+                   int cbuf_type, void *opaque)
 {
-    REExecContext s_s, *s = &s_s;
-    int re_flags, i, ret;
+    int re_flags, i;
     const uint8_t *cptr;
 
     re_flags = lre_get_flags(bc_buf);
@@ -3470,11 +3438,13 @@ int lre_exec(uint8_t **capture,
     s->cbuf_type = cbuf_type;
     if (s->cbuf_type == 1 && s->is_unicode)
         s->cbuf_type = 2;
-    s->interrupt_counter = INTERRUPT_COUNTER_INIT;
     s->opaque = opaque;
+    s->capture = capture;
 
     s->stack_buf = s->static_stack_buf;
     s->stack_size = countof(s->static_stack_buf);
+    s->sp_off = 0;
+    s->bp_off = 0;
 
     for(i = 0; i < s->capture_count * 2; i++)
         capture[i] = NULL;
@@ -3486,12 +3456,26 @@ int lre_exec(uint8_t **capture,
             cptr = (const uint8_t *)(p - 1);
         }
     }
+    s->pc = bc_buf + RE_HEADER_LEN;
+    s->cptr = cptr;
+    return 0;
+}
 
-    ret = lre_exec_backtrack(s, capture, bc_buf + RE_HEADER_LEN, cptr);
+/* Run until the match finishes or the host asks for the thread back. LRE_RET_YIELD means call again. */
+int lre_exec_step(REExecContext *s)
+{
+    return lre_exec_backtrack(s);
+}
 
-    if (s->stack_buf != s->static_stack_buf)
+/* Release the backtracking stack. Safe on a match that yielded and was then abandoned, which is the whole
+   point of the caller owning the context. */
+void lre_exec_end(REExecContext *s)
+{
+    if (s->stack_buf != s->static_stack_buf) {
         lre_realloc(s->opaque, s->stack_buf, 0);
-    return ret;
+        s->stack_buf = s->static_stack_buf;
+        s->stack_size = countof(s->static_stack_buf);
+    }
 }
 
 int lre_get_alloc_count(const uint8_t *bc_buf)
@@ -3555,6 +3539,7 @@ int main(int argc, char **argv)
     uint8_t *capture;
     const char *input;
     int input_len, capture_count;
+    REExecContext ec;
 
     if (argc < 4) {
         printf("usage: %s regexp flags input\n", argv[0]);
@@ -3572,7 +3557,11 @@ int main(int argc, char **argv)
     input_len = strlen(input);
 
     capture = malloc(sizeof(capture[0]) * lre_get_alloc_count(bc));
-    ret = lre_exec(capture, bc, (uint8_t *)input, 0, input_len, 0, NULL);
+    lre_exec_begin(&ec, capture, bc, (uint8_t *)input, 0, input_len, 0, NULL);
+    do {
+        ret = lre_exec_step(&ec);
+    } while (ret == LRE_RET_YIELD);
+    lre_exec_end(&ec);
     printf("ret=%d\n", ret);
     if (ret == 1) {
         capture_count = lre_get_capture_count(bc);

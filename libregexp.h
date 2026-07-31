@@ -26,6 +26,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "libunicode.h"
 
@@ -44,7 +45,7 @@ extern "C" {
 #define LRE_FLAG_UNICODE_SETS (1 << 8)
 
 #define LRE_RET_MEMORY_ERROR   (-1)
-#define LRE_RET_TIMEOUT        (-2)
+#define LRE_RET_YIELD          (-2)
 #define LRE_RET_BYTECODE_ERROR (-3)
 
 /* trailer length after the group name including the trailing '\0' */
@@ -58,17 +59,77 @@ int lre_check_bytecode(const uint8_t *bc_buf, int bc_buf_len);
 int lre_get_capture_count(const uint8_t *bc_buf);
 int lre_get_flags(const uint8_t *bc_buf);
 const char *lre_get_groupnames(const uint8_t *bc_buf);
-int lre_exec(uint8_t **capture,
-             const uint8_t *bc_buf, const uint8_t *cbuf, int cindex, int clen,
-             int cbuf_type, void *opaque);
+/* ---- One MATCH, suspendably. ------------------------------------------------------------------------
+   lre_exec_backtrack's interpreter loop never recursed — it has always been an explicit backtracking stack —
+   but "does not recurse" is not "can be interrupted". Its position (the regexp program counter, the input
+   cursor, and the two offsets into the backtracking stack) lived in C locals, so a catastrophically
+   backtracking pattern — the ReDoS shape, `/(a+)+b/.exec("a".repeat(40))` — held the thread from the first
+   opcode to the last. Those four live on the CONTEXT, which the CALLER owns, and the loop's back-edges
+   (REOP_goto, the loop opcodes, and the backtrack pop) are suspension points.
+
+   lre_exec_begin seeds a match, lre_exec_step runs it until it finishes or the host asks for the thread back
+   (LRE_RET_YIELD — call again and it continues at the exact opcode, never re-matching), lre_exec_end releases
+   the stack. There is deliberately NO run-to-completion entry: a caller that cannot park is a caller that has
+   not been routed yet, and one would be the second driver that hides that. */
+/* The context is DEFINED here rather than inside libregexp.c because the caller now owns it: a suspended
+   match's state has to outlive the frame that began it, and by value is the arrangement with no second
+   allocation to lose — static_stack_buf exists precisely so an ordinary match allocates nothing. */
+typedef enum {
+    RE_EXEC_STATE_SPLIT,
+    RE_EXEC_STATE_LOOKAHEAD,
+    RE_EXEC_STATE_NEGATIVE_LOOKAHEAD,
+} REExecStateEnum;
+
+#if INTPTR_MAX >= INT64_MAX
+#define BP_TYPE_BITS 3
+#else
+#define BP_TYPE_BITS 2
+#endif
+
+typedef union {
+    uint8_t *ptr;
+    intptr_t val; /* for bp, the low BP_SHIFT bits store REExecStateEnum */
+    struct {
+        uintptr_t val : sizeof(uintptr_t) * 8 - BP_TYPE_BITS;
+        uintptr_t type : BP_TYPE_BITS;
+    } bp;
+} StackElem;
+
+typedef struct REExecContext {
+    const uint8_t *cbuf;
+    const uint8_t *cbuf_end;
+    /* 0 = 8 bit chars, 1 = 16 bit chars, 2 = 16 bit chars, UTF-16 */
+    int cbuf_type;
+    int capture_count;
+    bool is_unicode;
+    void *opaque; /* used for the stack-overflow check and the yield question */
+
+    /* THE SUSPENSION POINT: everything else in the interpreter loop is per-opcode. */
+    const uint8_t *pc;          /* the regexp program counter */
+    const uint8_t *cptr;        /* the input cursor */
+    size_t sp_off, bp_off;      /* the two cursors into stack_buf, as OFFSETS: stack_realloc moves the buffer */
+    uint8_t **capture;          /* the caller's capture/register array, live for the whole match */
+
+    StackElem *stack_buf;
+    size_t stack_size;
+    StackElem static_stack_buf[32]; /* static stack to avoid allocation in most cases */
+} REExecContext;
+
+int lre_exec_begin(REExecContext *s, uint8_t **capture,
+                   const uint8_t *bc_buf, const uint8_t *cbuf, int cindex, int clen,
+                   int cbuf_type, void *opaque);
+int lre_exec_step(REExecContext *s);
+void lre_exec_end(REExecContext *s);
 
 int lre_parse_escape(const uint8_t **pp, int allow_utf16);
 /* lre_is_space() is provided as an inline in libunicode.h */
 
 /* must be provided by the user */
 bool lre_check_stack_overflow(void *opaque, size_t alloca_size);
-/* must be provided by the user, return non zero if time out */
-int lre_check_timeout(void *opaque);
+/* must be provided by the user: non-zero when a running match should give the thread back at its next
+   back-edge. It REPLACES lre_check_timeout, which was a watchdog — a bound that truncated a match instead of
+   parking it. The host answers from its scheduler, and the match resumes exactly where it stopped. */
+int lre_want_yield(void *opaque);
 void *lre_realloc(void *opaque, void *ptr, size_t size);
 
 /* JS identifier test */

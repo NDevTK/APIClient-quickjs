@@ -61184,8 +61184,10 @@ typedef struct JSRegExpExec {
     JSValue li_val;       /* Get(R,"lastIndex"), held across its ToLength (owned) */
     JSString *bytecode;   /* the matcher this run used, held (refcounted) so a re-compile mid-run cannot free it */
     uint8_t **capture;    /* the match's capture buffer (owned, js_free) */
+    REExecContext ec;     /* THE MATCH, by value: a pattern that backtracks catastrophically parks in here */
+    uint8_t matching;     /* 1 = ec is live and owes an lre_exec_end */
     int64_t last_index;
-    int rc;               /* lre_exec's answer, held across the lastIndex write */
+    int rc;               /* the match's answer, held across the lastIndex write */
     int32_t set_val;      /* the value stage 5 writes, when it writes one */
     uint8_t set_pending;  /* 1 = steps 12.a/15/18 owe a Set(R,"lastIndex") before the result is built */
 } JSRegExpExec;
@@ -76084,12 +76086,13 @@ bool lre_check_stack_overflow(void *opaque, size_t alloca_size)
     return js_check_stack_overflow(ctx->rt, alloca_size);
 }
 
-int lre_check_timeout(void *opaque)
+/* Should a running match give the thread back at its next back-edge? It REPLACES lre_check_timeout, which
+   asked the embedder's interrupt handler every 10000 opcodes and TRUNCATED the match — a watchdog, which is a
+   bound. The scheduler answers instead, and the match parks and resumes at the exact opcode. */
+int lre_want_yield(void *opaque)
 {
-    JSContext *ctx = opaque;
-    JSRuntime *rt = ctx->rt;
-    return (rt->interrupt_handler &&
-            rt->interrupt_handler(rt, rt->interrupt_opaque));
+    (void)opaque;
+    return g_flow_control.preempt != NULL && g_flow_control.preempt();
 }
 
 void *lre_realloc(void *opaque, void *ptr, size_t size)
@@ -76325,6 +76328,11 @@ fail:
     return ret;
 }
 
+/* The matcher sits between stage 4 (which sets it up) and stage 5 (the lastIndex write). It is numbered out of
+   the sequence rather than renumbering the tail, so a stage constant never means two different things across a
+   suspension — the base64 machine learned that the hard way. */
+enum { REX_MATCH = 40 };
+
 static int js_regexp_exec_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSRegExpExec *s = st;
@@ -76342,6 +76350,7 @@ static int js_regexp_exec_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
         s->last_index = 0;
         s->rc = 0;
         s->set_pending = 0;
+        s->matching = 0;
         if (!js_get_regexp(ctx, s->hdr.this_val, true))   /* 22.2.6.2 steps 1-2: RequireInternalSlot */
             return -1;
         s->hdr.stage = 1;
@@ -76404,15 +76413,39 @@ static int js_regexp_exec_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
         if (s->last_index > str->len) {
             s->rc = 2;
         } else {
-            s->rc = lre_exec(s->capture, re_bytecode,
-                             str_buf, s->last_index, str->len,
-                             shift, ctx);
+            lre_exec_begin(&s->ec, s->capture, re_bytecode,
+                           str_buf, s->last_index, str->len, shift, ctx);
+            s->matching = 1;
+            s->rc = LRE_RET_YIELD;
         }
+        s->hdr.stage = REX_MATCH;
+    }
+    if (s->hdr.stage == REX_MATCH) {
+        /* THE MATCH. It runs one slice per entry and parks between them, so `/(a+)+b/.exec("a".repeat(40))` —
+           the ReDoS shape, exponential in the input — is ordinary preemptible work rather than a thread the
+           engine has given away. A yield is an exact position (program counter, input cursor, backtracking
+           stack), never a re-match. */
+        const uint8_t *re_bytecode;
+        JSString *str;
+        int re_flags, shift;
+        uint8_t *str_buf;
+
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        if (s->matching) {
+            s->rc = lre_exec_step(&s->ec);
+            if (s->rc == LRE_RET_YIELD)
+                return 22;
+            lre_exec_end(&s->ec);
+            s->matching = 0;
+        }
+        /* re-derived rather than parked: both sources are HELD by this machine, so they cannot have moved. */
+        re_bytecode = str8(s->bytecode);
+        re_flags = lre_get_flags(re_bytecode);
+        str = JS_VALUE_GET_STRING(s->str_val);
+        shift = str->is_wide_char;
+        str_buf = str8(str);
         if (s->rc < 0) {
             switch(s->rc) {
-            case LRE_RET_TIMEOUT:
-                JS_ThrowInterrupted(ctx);
-                break;
             case LRE_RET_MEMORY_ERROR:
                 JS_ThrowInternalError(ctx, "out of memory in regexp execution");
                 break;
@@ -76469,6 +76502,8 @@ static JSValue js_regexp_exec_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSRegExpExec *s = st;
     JSValue r = take_result ? js_dup(s->result) : JS_UNDEFINED;
+    if (s->matching)          /* torn down while parked mid-match: the backtracking stack is still ours */
+        lre_exec_end(&s->ec);
     JS_FreeValue(ctx, s->result);
     JS_FreeValue(ctx, s->str_val);
     JS_FreeValue(ctx, s->li_val);
@@ -76479,115 +76514,10 @@ static JSValue js_regexp_exec_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
-/* delete portions of a string that match a given regex */
-static JSValue JS_RegExpDelete(JSContext *ctx, JSValueConst this_val, JSValue arg)
-{
-    JSRegExp *re = js_get_regexp(ctx, this_val, true);
-    JSString *str;
-    JSValue str_val, val;
-    uint8_t *re_bytecode;
-    int ret;
-    uint8_t **capture, *str_buf;
-    int alloc_count, shift, re_flags;
-    int next_src_pos, start, end;
-    int64_t last_index;
-    StringBuffer b_s, *b = &b_s;
-
-    if (!re)
-        return JS_EXCEPTION;
-
-    string_buffer_init(ctx, b, 0);
-
-    capture = NULL;
-    str_val = JS_ToString(ctx, arg);
-    if (JS_IsException(str_val))
-        goto fail;
-    str = JS_VALUE_GET_STRING(str_val);
-    re_bytecode = str8(re->bytecode);
-    re_flags = lre_get_flags(re_bytecode);
-    if ((re_flags & (LRE_FLAG_GLOBAL | LRE_FLAG_STICKY)) == 0) {
-        last_index = 0;
-    } else {
-        val = JS_GetProperty(ctx, this_val, JS_ATOM_lastIndex);
-        if (JS_IsException(val) || JS_ToLengthFree(ctx, &last_index, val))
-            goto fail;
-    }
-    /* size by alloc_count: the register executor uses capture[] beyond
-       the capture positions for its registers (see js_regexp_exec). */
-    alloc_count = lre_get_alloc_count(re_bytecode);
-    if (alloc_count > 0) {
-        capture = js_malloc(ctx, sizeof(capture[0]) * alloc_count);
-        if (!capture)
-            goto fail;
-    }
-    shift = str->is_wide_char;
-    str_buf = str8(str);
-    next_src_pos = 0;
-    for (;;) {
-        if (last_index > str->len)
-            break;
-
-        ret = lre_exec(capture, re_bytecode,
-                       str_buf, last_index, str->len, shift, ctx);
-        if (ret != 1) {
-            if (ret >= 0) {
-                if (ret == 2 || (re_flags & (LRE_FLAG_GLOBAL | LRE_FLAG_STICKY))) {
-                    if (JS_SetProperty(ctx, this_val, JS_ATOM_lastIndex,
-                                       js_int32(0)) < 0)
-                        goto fail;
-                }
-            } else {
-                switch(ret) {
-                case LRE_RET_TIMEOUT:
-                    JS_ThrowInterrupted(ctx);
-                    break;
-                case LRE_RET_MEMORY_ERROR:
-                    JS_ThrowInternalError(ctx, "out of memory in regexp execution");
-                    break;
-                case LRE_RET_BYTECODE_ERROR:
-                    JS_ThrowInternalError(ctx, "corrupted bytecode in regexp execution");
-                    break;
-                default:
-                    abort();
-                }
-                goto fail;
-            }
-            break;
-        }
-        start = (capture[0] - str_buf) >> shift;
-        end = (capture[1] - str_buf) >> shift;
-        last_index = end;
-        if (next_src_pos < start) {
-            if (string_buffer_concat(b, str, next_src_pos, start))
-                goto fail;
-        }
-        next_src_pos = end;
-        if (!(re_flags & LRE_FLAG_GLOBAL)) {
-            if (JS_SetProperty(ctx, this_val, JS_ATOM_lastIndex,
-                               js_int32(end)) < 0)
-                goto fail;
-            break;
-        }
-        if (end == start) {
-            if (!(re_flags & (LRE_FLAG_UNICODE | LRE_FLAG_UNICODE_SETS)) || (unsigned)end >= str->len || !str->is_wide_char) {
-                end++;
-            } else {
-                string_getc(str, &end);
-            }
-        }
-        last_index = end;
-    }
-    if (string_buffer_concat(b, str, next_src_pos, str->len))
-        goto fail;
-    JS_FreeValue(ctx, str_val);
-    js_free(ctx, capture);
-    return string_buffer_end(b);
-fail:
-    JS_FreeValue(ctx, str_val);
-    js_free(ctx, capture);
-    string_buffer_free(b);
-    return JS_EXCEPTION;
-}
+/* DELETED: JS_RegExpDelete. It matched a regexp against a string and spliced out the matches, from C, in
+   a loop — and it had NO CALLERS. Left in place it was a second copy of RegExpBuiltinExec that a reader would
+   take for a live path, and the only remaining lre_exec call site outside the exec machine, which is what the
+   suspendable executor has to convert. Dead code that LOOKS load-bearing is worse than none. */
 
 enum { EX_PH_START = 0, EX_PH_CALL };
 

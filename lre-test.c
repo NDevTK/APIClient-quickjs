@@ -11,9 +11,9 @@ bool lre_check_stack_overflow(void *opaque, size_t alloca_size)
     return false;
 }
 
-int lre_check_timeout(void *opaque)
+int lre_want_yield(void *opaque)
 {
-    return 0;
+    return 0;   /* no scheduler here: this harness runs one match straight through */
 }
 
 void *lre_realloc(void *opaque, void *ptr, size_t size)
@@ -41,7 +41,13 @@ static void oob_save_index(void)
     };
 
     uint8_t *capture[2] = {NULL, NULL};
-    int ret = lre_exec(capture, bc, (const uint8_t *)"a", 0, 1, 0, NULL);
+    REExecContext ec;
+    int ret;
+    lre_exec_begin(&ec, capture, bc, (const uint8_t *)"a", 0, 1, 0, NULL);
+    do {
+        ret = lre_exec_step(&ec);
+    } while (ret == LRE_RET_YIELD);
+    lre_exec_end(&ec);
     assert(ret < 0);
 }
 
