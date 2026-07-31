@@ -1531,6 +1531,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_TA_AT, STEPDEF_TA_SET, STEPDEF_JSON_RAWJSON,
     STEPDEF_BOOLEAN_CTOR,
     STEPDEF_OBJECT_CTOR,
+    STEPDEF_MAP_CTOR, STEPDEF_SET_CTOR, STEPDEF_WEAKMAP_CTOR, STEPDEF_WEAKSET_CTOR,
     STEPDEF_OBJ_DEFINEPROPERTY, STEPDEF_REFLECT_DEFINEPROPERTY, STEPDEF_OBJ_DEFINEPROPERTIES,
     STEPDEF_OBJ_DEFGETTER, STEPDEF_OBJ_DEFSETTER,
     STEPDEF_OBJ_CREATE,
@@ -21937,7 +21938,7 @@ static JSValue map_normalize_key(JSContext *ctx, JSValue key);
 static JSMapRecord *map_find_record(JSContext *ctx, JSMapState *s, JSValueConst key);
 static JSMapRecord *map_add_record(JSContext *ctx, JSMapState *s, JSValue key);
 static void map_delete_record(JSRuntime *rt, JSMapState *s, JSMapRecord *mr);
-static JSValue js_map_constructor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv, int magic);
+static JSValue js_map_new(JSContext *ctx, int magic);
 static bool setmap_consume_ready(JSContext *ctx, JSValueConst *call_argv, int call_argc, JSValue *out_getiter);
 static int check_function(JSContext *ctx, JSValueConst obj);
 static void iter_helper_close_source_abrupt(JSContext *ctx, JSIteratorHelperData *it);
@@ -25901,34 +25902,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     con_cargc = con_cargc_in;                 /* the body entry reads and resets it itself */
                     goto do_construct_tramp;                  /* a bytecode ctor: its body runs on this chain */
                 }
-                {
-                    /* A CONSTRUCTOR step machine, asked HERE and nowhere else. This was written out three times —
-                       OP_call_constructor reshaped its operands, OP_init_ctor's super() built the state by hand,
-                       and a step machine's own Construct request had no copy at all, so `ab.slice()` reaching
-                       `new ArrayBuffer(n)` fell through to JS_CallConstructor and js_call_c_function's DFAIL. The
-                       state takes callee, new_target and args EXPLICITLY, which is what lets both construct operand
-                       shapes reach it without any reshape: -2 pops [func, new_target, args] off the caller stack,
-                       0 (super(), and a machine's own cb buffer) pops nothing. */
-                    const JSTrampStepDef *csd = tramp_step_ctor_def_of(con_func);
-                    if (csd) {
-                        void *cstt = tramp_step_state_new(ctx, csd, con_ntgt, con_argc, con_args, con_func);
-                        if (con_args_owned) {   /* the state dup'd what it keeps */
-                            free_arg_list(ctx, con_args_owned, con_argc); con_args_owned = NULL; con_args = NULL;
-                        }
-                        JS_FreeValue(ctx, con_super_ref); con_super_ref = JS_UNDEFINED;
-                        if (unlikely(!cstt)) goto exception;
-                        ((JSStepHdr *)cstt)->outer = con_outer;
-                        ((JSStepHdr *)cstt)->outer_kind = con_outer_kind;
-                        /* a machine's own Construct borrows ITS buffer, so there is nothing on the stack to pop */
-                        ((JSStepHdr *)cstt)->orig_cfirst = con_outer ? 0 : tramp_first;
-                        ((JSStepHdr *)cstt)->orig_cargc = con_outer ? 0 : con_pop;
-                        ((JSStepHdr *)cstt)->orig_is_tail = con_outer ? 0 : tramp_is_tail;
-                        con_outer = NULL; con_outer_kind = CONT_NONE;
-                        cont_st = cstt;
-                        ret_val = JS_UNDEFINED;
-                        goto do_step_step;
-                    }
-                }
                 /* ONE question: WHICH MACHINE does this constructor declare? It was three identity tests in a
                    chain, each comparing the callee against a C function's address — js_map_constructor's, the
                    TypedArray constructor's, js_promise_constructor's — so a new machine was a new LINK rather
@@ -26012,6 +25985,41 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         goto do_getprop_tramp;
                     }
                     goto do_promise_exec_arm;
+                }
+                /* THE DECLARED CONSTRUCTOR MACHINE is asked AFTER the arms above, not before them, and the
+                   reason is Map/Set: 24.1.1.1 is ONE algorithm whose step 4 and step 6 are two different
+                   continuations, and which one runs is decided by the ARGUMENT — a nullish source finishes at
+                   step 4, an iterable becomes the walk. So the constructor carries BOTH declarations (a
+                   create-from-ctor machine and a consume machine), and the argument question, which those arms
+                   already ask, is what chooses. Asked first, the create-from-ctor declaration would have
+                   swallowed `new Map(iterable)` and never reached the walk. */
+                {
+                    /* A CONSTRUCTOR step machine, asked HERE and nowhere else. This was written out three times —
+                       OP_call_constructor reshaped its operands, OP_init_ctor's super() built the state by hand,
+                       and a step machine's own Construct request had no copy at all, so `ab.slice()` reaching
+                       `new ArrayBuffer(n)` fell through to JS_CallConstructor and js_call_c_function's DFAIL. The
+                       state takes callee, new_target and args EXPLICITLY, which is what lets both construct operand
+                       shapes reach it without any reshape: -2 pops [func, new_target, args] off the caller stack,
+                       0 (super(), and a machine's own cb buffer) pops nothing. */
+                    const JSTrampStepDef *csd = tramp_step_ctor_def_of(con_func);
+                    if (csd) {
+                        void *cstt = tramp_step_state_new(ctx, csd, con_ntgt, con_argc, con_args, con_func);
+                        if (con_args_owned) {   /* the state dup'd what it keeps */
+                            free_arg_list(ctx, con_args_owned, con_argc); con_args_owned = NULL; con_args = NULL;
+                        }
+                        JS_FreeValue(ctx, con_super_ref); con_super_ref = JS_UNDEFINED;
+                        if (unlikely(!cstt)) goto exception;
+                        ((JSStepHdr *)cstt)->outer = con_outer;
+                        ((JSStepHdr *)cstt)->outer_kind = con_outer_kind;
+                        /* a machine's own Construct borrows ITS buffer, so there is nothing on the stack to pop */
+                        ((JSStepHdr *)cstt)->orig_cfirst = con_outer ? 0 : tramp_first;
+                        ((JSStepHdr *)cstt)->orig_cargc = con_outer ? 0 : con_pop;
+                        ((JSStepHdr *)cstt)->orig_is_tail = con_outer ? 0 : tramp_is_tail;
+                        con_outer = NULL; con_outer_kind = CONT_NONE;
+                        cont_st = cstt;
+                        ret_val = JS_UNDEFINED;
+                        goto do_step_step;
+                    }
                 }
                 goto do_construct_no_arm;
             do_promise_exec_arm:
@@ -30191,7 +30199,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSIterConsume *s;
                 JSValue box = (groupby_kind == GROUPBY_PROPERTY)
                               ? JS_NewObjectProto(ctx, JS_NULL)
-                              : js_map_constructor(ctx, JS_UNDEFINED, 0, NULL, 0);
+                              : js_map_new(ctx, 0);
                 DCHECK(JS_IsUndefined(tramp_iter_getiter),
                        "GroupBy answers above the @@iterator probe, so there is none to hand to its acquire");
                 if (JS_IsException(box)) goto exception;
@@ -64996,7 +65004,7 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
                 if (ss->record_count < s->setrec_size) { s->k = 0; s->r = js_bool(false); return 0; }
                 return 12;
             }
-            s->r = js_map_constructor(ctx, JS_UNDEFINED, 0, NULL, MAGIC_SET);
+            s->r = js_map_new(ctx, MAGIC_SET);
             if (JS_IsException(s->r)) { s->r = JS_UNDEFINED; return -1; }
             ts = JS_GetOpaque(s->r, JS_CLASS_SET);
             /* intersection is the one result-building operation that starts EMPTY: its elements are the ones both
@@ -68458,6 +68466,18 @@ static const JSTrampStepDef js_finrec_ctor_def =
 /* 27.1.3.1 Iterator: steps 1-2 are the abstract-class validation, step 3 is the whole constructor. */
 static const JSTrampStepDef js_iterator_ctor_def =
     CREATECTOR_DEF_FULL(JS_CLASS_ITERATOR, 0, generic, NULL, 0, js_iterator_ctor_precheck);
+static JSValue js_map_ctor_body(JSContext *ctx, JSValueConst obj_, int argc, JSValueConst *argv, int magic);
+static int js_map_ctor_precheck(JSContext *ctx, const JSStepHdr *h);
+/* Map/Set/WeakMap/WeakSet: one algorithm, four class ids, so four declarations — the class rides `arg` and the
+   MAGIC rides body_magic, which is what the data slot needs. `nargs` is 0: the spec's `iterable` is optional and
+   the body reads it through argc, so there is nothing to pad. */
+#define MAP_CTOR_DEF(magic) \
+    { sizeof(JSCreateCtor), js_creatector_step, js_creatector_fini, CREATECTOR_ARG(JS_CLASS_MAP + (magic), 0), \
+      { .generic_magic = js_map_ctor_body }, JS_CFUNC_generic_magic, (magic), js_map_ctor_precheck, NULL, NULL, \
+      .visit = js_creatector_visit }
+static const JSTrampStepDef js_map_ctor_defs[4] = {
+    MAP_CTOR_DEF(0), MAP_CTOR_DEF(1), MAP_CTOR_DEF(2), MAP_CTOR_DEF(3),
+};
 static JSValue js_object_ctor_body(JSContext *ctx, JSValueConst obj_, int argc, JSValueConst *argv);
 /* 20.1.1.1: WRAP because the absent-NewTarget form's value is the body's, SELF_PLAIN because step 1 counts the
    Object constructor itself as absent. */
@@ -70174,6 +70194,10 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_ITER_SET_CTOR]  = &js_iter_set_ctor_def,
     [STEPDEF_BOOLEAN_CTOR]   = &js_boolean_ctor_def,
     [STEPDEF_OBJECT_CTOR]    = &js_object_ctor_def,
+    [STEPDEF_MAP_CTOR]       = &js_map_ctor_defs[0],
+    [STEPDEF_SET_CTOR]       = &js_map_ctor_defs[1],
+    [STEPDEF_WEAKMAP_CTOR]   = &js_map_ctor_defs[2],
+    [STEPDEF_WEAKSET_CTOR]   = &js_map_ctor_defs[3],
     [STEPDEF_ERROR_SET_STACK] = &js_error_set_stack_def,
     [STEPDEF_ERROR_GET_STACK] = &js_error_get_stack_def,
     [STEPDEF_ITER_SET_TAG]   = &js_iter_set_tag_def,
@@ -82656,22 +82680,44 @@ static int js_map_state_init(JSContext *ctx, JSValueConst obj, int magic)
     return 0;
 }
 
-static JSValue js_map_constructor(JSContext *ctx, JSValueConst new_target,
-                                  int argc, JSValueConst *argv, int magic)
+/* An ENGINE-OWNED Map/Set: Map.groupBy's container, the Set-method results, an internal materialisation. There
+   is no NewTarget, so 24.1.1.1 step 2 degenerates to OrdinaryObjectCreate over the intrinsic prototype and reads
+   NOTHING — which is why this is a plain function and the CONSTRUCTOR is a machine. */
+static JSValue js_map_new(JSContext *ctx, int magic)
 {
-    JSMapState *s;
-    JSValue obj;
-    JSValueConst arr;
-    bool is_weak;
-
-    is_weak = ((magic & MAGIC_WEAK) != 0);
-    obj = js_create_from_ctor(ctx, new_target, JS_CLASS_MAP + magic);
+    JSValue obj = JS_NewObjectClass(ctx, JS_CLASS_MAP + magic);
     if (JS_IsException(obj))
+        return obj;
+    if (js_map_state_init(ctx, obj, magic) < 0) {
+        JS_FreeValue(ctx, obj);
         return JS_EXCEPTION;
+    }
+    return obj;
+}
+
+static int js_map_ctor_precheck(JSContext *ctx, const JSStepHdr *h)
+{
+    /* 24.1.1.1 step 1: the CALL form is rejected before anything is created, and therefore before the
+       `prototype` read the create performs. */
+    if (JS_IsUndefined(h->this_val)) {
+        JS_ThrowTypeError(ctx, "constructor requires 'new'");
+        return -1;
+    }
+    return 0;
+}
+
+/* 24.1.1.1 / 24.2.1.1 / 24.3.1.1 / 24.4.1.1 after step 2. Step 2 is OrdinaryCreateFromConstructor, whose
+   `Get(newTarget, "prototype")` is the page's code — a getter, or a Proxy trap — and js_map_constructor
+   performed it with js_create_from_ctor from its C entry, so `Reflect.construct(Map, [], proxiedCtor)` aborted
+   at js_proxy_get's DFAIL. Step 3 (the data slot) and step 4 (return, for a nullish source) invoke nothing,
+   which is what the declaration asserts. Steps 5-6 are the WALK and belong to the consume machine. */
+static JSValue js_map_ctor_body(JSContext *ctx, JSValueConst obj_, int argc, JSValueConst *argv, int magic)
+{
+    JSValue obj = unsafe_unconst(obj_);
+    JSValueConst arr;
+
     if (js_map_state_init(ctx, obj, magic) < 0)
         goto fail;
-    s = JS_GetOpaque(obj, JS_CLASS_MAP + magic);
-    (void)s; (void)is_weak;
 
     arr = JS_UNDEFINED;
     if (argc > 0)
@@ -83423,7 +83469,7 @@ static JSValue js_map_read(BCReaderState *s, int magic)
 
     argv[0] = JS_UNDEFINED;
     argv[1] = JS_UNDEFINED;
-    obj = js_map_constructor(ctx, JS_UNDEFINED, 0, NULL, magic);
+    obj = js_map_new(ctx, magic);
     if (JS_IsException(obj))
         return JS_EXCEPTION;
     if (BC_add_object_ref(s, obj))
@@ -83618,9 +83664,6 @@ int JS_AddIntrinsicMapSet(JSContext *ctx)
     int i;
     JSValue obj1;
     char buf[ATOM_GET_STR_BUF_SIZE];
-    /* Used to squelch a -Wcast-function-type warning. */
-    JSCFunctionType ft = { .constructor_magic = js_map_constructor };
-
     for(i = 0; i < 4; i++) {
         const char *name = JS_AtomGetStr(ctx, buf, sizeof(buf),
                                          JS_ATOM_Map + i);
@@ -83638,7 +83681,7 @@ int JS_AddIntrinsicMapSet(JSContext *ctx)
             n_ctor_funcs = 0;
         }
         obj1 = JS_NewCConstructor(ctx, class_id, name,
-                                  ft.generic, 0, JS_CFUNC_constructor_magic, i,
+                                  NULL, 0, JS_CFUNC_step_ctor, STEPDEF_MAP_CTOR + i,
                                   JS_UNDEFINED,
                                   ctor_funcs, n_ctor_funcs,
                                   js_map_proto_funcs_ptr[i], js_map_proto_funcs_count[i],
