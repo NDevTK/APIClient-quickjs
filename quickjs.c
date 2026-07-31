@@ -43629,11 +43629,24 @@ static int add_private_class_field(JSParseState *s, JSFunctionDef *fd,
 }
 
 static __exception int js_parse_expr(JSParseState *s);
+/* allow the 'in' binary operator. It is the [In] parameter of the production being parsed, and it reaches the
+   function parsers too: an arrow's ConciseBody is ExpressionBody[?In, ~Await], so `for (x => 0 in 1;;)` must
+   reject the `in` exactly as `for (0 in 1;;)` does. */
+#define PF_IN_ACCEPTED  (1 << 0)
+/* allow function calls parsing in js_parse_postfix_expr() */
+#define PF_POSTFIX_CALL (1 << 1)
+/* allow the exponentiation operator in js_parse_unary() */
+#define PF_POW_ALLOWED  (1 << 2)
+/* forbid the exponentiation operator in js_parse_unary() */
+#define PF_POW_FORBIDDEN (1 << 3)
+#define PF_AWAIT_USING   (1 << 4)
+
 static __exception int js_parse_function_decl(JSParseState *s,
                                               JSParseFunctionEnum func_type,
                                               JSFunctionKindEnum func_kind,
                                               JSAtom func_name, const uint8_t *ptr,
-                                              int start_line, int start_col);
+                                              int start_line, int start_col,
+                                              int parse_flags);
 static JSFunctionDef *js_parse_function_class_fields_init(JSParseState *s);
 static __exception int js_parse_function_decl2(JSParseState *s,
                                                JSParseFunctionEnum func_type,
@@ -43643,7 +43656,8 @@ static __exception int js_parse_function_decl2(JSParseState *s,
                                                int function_line_num,
                                                int function_col_num,
                                                JSParseExportEnum export_flag,
-                                               JSFunctionDef **pfd);
+                                               JSFunctionDef **pfd,
+                                               int parse_flags);
 static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags);
 static __exception int js_parse_assign_expr(JSParseState *s);
 static __exception int js_parse_unary(JSParseState *s, int parse_flags);
@@ -44233,7 +44247,7 @@ static __exception int js_parse_object_literal(JSParseState *s)
                     func_kind = JS_FUNC_ASYNC_GENERATOR;
             }
             if (js_parse_function_decl(s, func_type, func_kind, JS_ATOM_NULL,
-                                       start_ptr, start_line, start_col))
+                                       start_ptr, start_line, start_col, PF_IN_ACCEPTED))
                 goto fail;
             if (name == JS_ATOM_NULL) {
                 emit_op(s, OP_define_method_computed);
@@ -44286,15 +44300,6 @@ static __exception int js_parse_object_literal(JSParseState *s)
     return -1;
 }
 
-/* allow the 'in' binary operator */
-#define PF_IN_ACCEPTED  (1 << 0)
-/* allow function calls parsing in js_parse_postfix_expr() */
-#define PF_POSTFIX_CALL (1 << 1)
-/* allow the exponentiation operator in js_parse_unary() */
-#define PF_POW_ALLOWED  (1 << 2)
-/* forbid the exponentiation operator in js_parse_unary() */
-#define PF_POW_FORBIDDEN (1 << 3)
-#define PF_AWAIT_USING   (1 << 4)
 
 static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags);
 
@@ -44604,7 +44609,7 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
                                             s->token.ptr,
                                             s->token.line_num,
                                             s->token.col_num,
-                                            JS_PARSE_EXPORT_NONE, &init) < 0) {
+                                            JS_PARSE_EXPORT_NONE, &init, PF_IN_ACCEPTED) < 0) {
                     goto fail;
                 }
                 // stack is now: fclosure
@@ -44688,7 +44693,7 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
                                         start_ptr,
                                         s->token.line_num,
                                         s->token.col_num,
-                                        JS_PARSE_EXPORT_NONE, &method_fd))
+                                        JS_PARSE_EXPORT_NONE, &method_fd, PF_IN_ACCEPTED))
                 goto fail;
             if (is_private) {
                 method_fd->need_home_object = true; /* needed for brand check */
@@ -44843,7 +44848,7 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
                                         start_ptr,
                                         s->token.line_num,
                                         s->token.col_num,
-                                        JS_PARSE_EXPORT_NONE, &method_fd))
+                                        JS_PARSE_EXPORT_NONE, &method_fd, PF_IN_ACCEPTED))
                 goto fail;
             if (func_type == JS_PARSE_FUNC_DERIVED_CLASS_CONSTRUCTOR ||
                 func_type == JS_PARSE_FUNC_CLASS_CONSTRUCTOR) {
@@ -46173,7 +46178,7 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
                                    JS_FUNC_NORMAL, JS_ATOM_NULL,
                                    s->token.ptr,
                                    s->token.line_num,
-                                   s->token.col_num))
+                                   s->token.col_num, PF_IN_ACCEPTED))
             return -1;
         break;
     case TOK_CLASS:
@@ -46232,7 +46237,7 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
                                                JS_FUNC_ASYNC, JS_ATOM_NULL,
                                                source_ptr,
                                                source_line_num,
-                                               source_col_num))
+                                               source_col_num, PF_IN_ACCEPTED))
                         return -1;
                 } else {
                     name = JS_DupAtom(s->ctx, JS_ATOM_async);
@@ -46375,6 +46380,15 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
 
         if (s->token.val == TOK_QUESTION_MARK_DOT) {
             /* optional chaining */
+            if (!accept_lparen) {
+                /* NewExpression : new MemberExpression Arguments. An OptionalChain is reachable only from
+                   LeftHandSideExpression : OptionalExpression, never from a MemberExpression, so `new o?.C()`
+                   and `new o?.["C"]()` are Syntax Errors — the same grammar fact the tagged-template rule one
+                   branch down already states for its own production. `accept_lparen` IS "this is a
+                   MemberExpression": the `new` callee is the one thing parsed with PF_POSTFIX_CALL clear,
+                   because a call is not part of that production either. */
+                return js_parse_error(s, "invalid optional chain in a `new` expression");
+            }
             if (next_token(s))
                 return -1;
             has_optional_chain = true;
@@ -47388,7 +47402,7 @@ static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags)
         return js_parse_function_decl(s, JS_PARSE_FUNC_ARROW,
                                       JS_FUNC_NORMAL, JS_ATOM_NULL,
                                       s->token.ptr, s->token.line_num,
-                                      s->token.col_num);
+                                      s->token.col_num, parse_flags);
     } else if (token_is_pseudo_keyword(s, JS_ATOM_async)) {
         const uint8_t *source_ptr;
         int tok, source_line_num, source_col_num;
@@ -47412,7 +47426,7 @@ static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags)
             return js_parse_function_decl(s, JS_PARSE_FUNC_ARROW,
                                           JS_FUNC_ASYNC, JS_ATOM_NULL,
                                           source_ptr, source_line_num,
-                                          source_col_num);
+                                          source_col_num, parse_flags);
         } else {
             /* undo the token parsing */
             if (js_parse_seek_token(s, &pos))
@@ -47423,7 +47437,7 @@ static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags)
         return js_parse_function_decl(s, JS_PARSE_FUNC_ARROW,
                                       JS_FUNC_NORMAL, JS_ATOM_NULL,
                                       s->token.ptr, s->token.line_num,
-                                      s->token.col_num);
+                                      s->token.col_num, parse_flags);
     }
  next:
     if (s->token.val == '[' || s->token.val == '{') {
@@ -49348,7 +49362,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
                                        JS_FUNC_NORMAL, JS_ATOM_NULL,
                                        s->token.ptr,
                                        s->token.line_num,
-                                       s->token.col_num))
+                                       s->token.col_num, PF_IN_ACCEPTED))
                 goto fail;
             break;
         }
@@ -52002,7 +52016,7 @@ static __exception int js_parse_export(JSParseState *s)
                                        s->token.ptr,
                                        s->token.line_num,
                                        s->token.col_num,
-                                       JS_PARSE_EXPORT_NAMED, NULL);
+                                       JS_PARSE_EXPORT_NAMED, NULL, PF_IN_ACCEPTED);
     }
 
     if (next_token(s))
@@ -52127,7 +52141,7 @@ static __exception int js_parse_export(JSParseState *s)
                                            s->token.ptr,
                                            s->token.line_num,
                                            s->token.col_num,
-                                           JS_PARSE_EXPORT_DEFAULT, NULL);
+                                           JS_PARSE_EXPORT_DEFAULT, NULL, PF_IN_ACCEPTED);
         } else {
             if (js_parse_assign_expr(s))
                 return -1;
@@ -52338,7 +52352,7 @@ static __exception int js_parse_source_element(JSParseState *s)
                                    JS_FUNC_NORMAL, JS_ATOM_NULL,
                                    s->token.ptr,
                                    s->token.line_num,
-                                   s->token.col_num))
+                                   s->token.col_num, PF_IN_ACCEPTED))
             return -1;
     } else if (s->token.val == TOK_EXPORT && fd->module) {
         if (js_parse_export(s))
@@ -56838,6 +56852,9 @@ static JSFunctionDef *js_parse_function_class_fields_init(JSParseState *s)
 
 /* func_name must be JS_ATOM_NULL for JS_PARSE_FUNC_STATEMENT and
    JS_PARSE_FUNC_EXPR, JS_PARSE_FUNC_ARROW and JS_PARSE_FUNC_VAR */
+/* `parse_flags` carries the [In] parameter of the production this function came from. It matters for exactly one
+   thing: an arrow's ConciseBody is ExpressionBody[?In, ~Await], so `for (x => 0 in 1;;)` must reject the `in`
+   the same way `for (0 in 1;;)` does. Every other body is a Block, where `in` is always accepted. */
 static __exception int js_parse_function_decl2(JSParseState *s,
                                                JSParseFunctionEnum func_type,
                                                JSFunctionKindEnum func_kind,
@@ -56846,7 +56863,8 @@ static __exception int js_parse_function_decl2(JSParseState *s,
                                                int function_line_num,
                                                int function_col_num,
                                                JSParseExportEnum export_flag,
-                                               JSFunctionDef **pfd)
+                                               JSFunctionDef **pfd,
+                                               int parse_flags)
 {
     JSContext *ctx = s->ctx;
     JSFunctionDef *fd = s->cur_func;
@@ -56888,6 +56906,14 @@ static __exception int js_parse_function_decl2(JSParseState *s,
                 return js_parse_error_reserved_identifier(s);
             }
         }
+        /* A GeneratorExpression's BindingIdentifier is [+Yield] and an AsyncFunctionExpression's is [+Await], so
+           the name cannot be `yield`/`await` — and where the ENCLOSING context already spells them as keywords
+           the token is not TOK_IDENT, which is the only reason the check above missed them. That is how
+           `function* g() { (function* yield() {}); }` parsed while the same expression in a non-generator did
+           not: one rule answering differently by where it appeared. */
+        if ((s->token.val == TOK_YIELD && (func_kind & JS_FUNC_GENERATOR)) ||
+            (s->token.val == TOK_AWAIT && (func_kind & JS_FUNC_ASYNC)))
+            return js_parse_error_reserved_identifier(s);
         if (s->token.val == TOK_IDENT ||
             (((s->token.val == TOK_YIELD && !fd->is_strict_mode) ||
              (s->token.val == TOK_AWAIT && !s->is_module)) &&
@@ -57268,7 +57294,7 @@ static __exception int js_parse_function_decl2(JSParseState *s,
             if (js_parse_function_check_names(s, fd, func_name))
                 goto fail;
 
-            if (js_parse_assign_expr(s))
+            if (js_parse_assign_expr2(s, parse_flags & PF_IN_ACCEPTED))
                 goto fail;
 
             if (func_kind != JS_FUNC_NORMAL)
@@ -57491,11 +57517,12 @@ static __exception int js_parse_function_decl(JSParseState *s,
                                               JSAtom func_name,
                                               const uint8_t *ptr,
                                               int start_line,
-                                              int start_col)
+                                              int start_col,
+                                              int parse_flags)
 {
     return js_parse_function_decl2(s, func_type, func_kind, func_name, ptr,
                                    start_line, start_col,
-                                   JS_PARSE_EXPORT_NONE, NULL);
+                                   JS_PARSE_EXPORT_NONE, NULL, parse_flags);
 }
 
 static __exception int js_parse_program(JSParseState *s)
