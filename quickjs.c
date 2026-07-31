@@ -56887,7 +56887,10 @@ typedef enum BCTagEnum {
     BC_TAG_SYMBOL,
 } BCTagEnum;
 
-#define BC_VERSION 28
+/* 29: a regexp's compiled byte code changed shape — a capture or register index is a u32 where it was a
+   byte, and the header grew with it. Serialized byte code from an older build would be read as the new format
+   and mis-execute, so the version byte is what refuses it. */
+#define BC_VERSION 29
 /* DELETED: the OP_COUNT and JS_ATOM_END asserts. They guarded ONE thing — the builtin-*.h bytecode COMPILED INTO
    this file, which named opcodes and atoms by index and so silently resolved the wrong one when either table
    shifted (Iterator.zip read `done` off the atom next to it, thousands of tests from the cause). Every one of

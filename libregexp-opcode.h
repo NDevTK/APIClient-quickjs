@@ -24,6 +24,13 @@
 
 #ifdef DEF
 
+/* A CAPTURE or REGISTER index is a u32, not a byte. It was a byte, and CAPTURE_COUNT_MAX was 255 because of
+   it — a cap on distinct work: `/(a)(b)(c)…/` with three hundred groups is a valid pattern with an answer, and
+   the parser refused to give it. Every index-carrying opcode below therefore carries four bytes where it
+   carried one; the sizes here are the ONE place that says so, which is why the emitter was made to read them.
+   The remaining limit is memory (the capture array is 2 * capture_count pointers), which is the physical floor
+   this project allows and not a number anybody chose. */
+
 DEF(invalid, 1) /* never used */
 DEF(char, 3)
 DEF(char_i, 3)
@@ -43,31 +50,31 @@ DEF(split_next_first, 5)
 DEF(match, 1)
 DEF(lookahead_match, 1)
 DEF(negative_lookahead_match, 1) /* must come after */
-DEF(save_start, 2) /* save start position */
-DEF(save_end, 2) /* save end position, must come after saved_start */
-DEF(save_reset, 3) /* reset save positions */
-DEF(loop, 6) /* decrement the top the stack and goto if != 0 */
-DEF(loop_split_goto_first, 10) /* loop and then split */
-DEF(loop_split_next_first, 10)
-DEF(loop_check_adv_split_goto_first, 10) /* loop and then check advance and split */
-DEF(loop_check_adv_split_next_first, 10)
-DEF(set_i32, 6) /* store the immediate value to a register */
+DEF(save_start, 5) /* save start position */
+DEF(save_end, 5) /* save end position, must come after saved_start */
+DEF(save_reset, 9) /* reset save positions */
+DEF(loop, 9) /* decrement the top the stack and goto if != 0 */
+DEF(loop_split_goto_first, 13) /* loop and then split */
+DEF(loop_split_next_first, 13)
+DEF(loop_check_adv_split_goto_first, 13) /* loop and then check advance and split */
+DEF(loop_check_adv_split_next_first, 13)
+DEF(set_i32, 9) /* store the immediate value to a register */
 DEF(word_boundary, 1)
 DEF(word_boundary_i, 1)
 DEF(not_word_boundary, 1)
 DEF(not_word_boundary_i, 1)
-DEF(back_reference, 2) /* variable length */
-DEF(back_reference_i, 2) /* must come after */
-DEF(backward_back_reference, 2) /* must come after */
-DEF(backward_back_reference_i, 2) /* must come after */
+DEF(back_reference, 5) /* variable length */
+DEF(back_reference_i, 5) /* must come after */
+DEF(backward_back_reference, 5) /* must come after */
+DEF(backward_back_reference_i, 5) /* must come after */
 DEF(range, 3) /* variable length */
 DEF(range_i, 3) /* variable length */
 DEF(range32, 3) /* variable length */
 DEF(range32_i, 3) /* variable length */
 DEF(lookahead, 5)
 DEF(negative_lookahead, 5) /* must come after */
-DEF(set_char_pos, 2) /* store the character position to a register */
-DEF(check_advance, 2) /* check that the register is different from the character position */
+DEF(set_char_pos, 5) /* store the character position to a register */
+DEF(check_advance, 5) /* check that the register is different from the character position */
 DEF(prev, 1) /* go to the previous char */
 
 #endif /* DEF */
