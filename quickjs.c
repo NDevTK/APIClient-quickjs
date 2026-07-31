@@ -61953,16 +61953,33 @@ static int js_integrity_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
     }
 }
 
+/* WHAT A DESCRIPTOR RECORD OWNS. Nested in its machine's declaration, like the substitution cursor's: it is a
+   sub-object whose three values are held across the request that produced them. */
+static void js_desc_facts_visit(JSContext *ctx, JSDescFacts *f, JSStepVisit *v)
+{
+    v->val(ctx, &f->value);
+    v->val(ctx, &f->getter);
+    v->val(ctx, &f->setter);
+}
+
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). Every key it walks is a [[GetOwnProperty]] the page can trap,
+   so a fork lands mid-walk with its own key, its own descriptor record and its own answer. */
+static void js_integrity_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSIntegrity *s = st;
+    js_desc_facts_visit(ctx, &s->facts, v);
+    v->atom(ctx, &s->key);
+    v->val(ctx, &s->obj);
+    v->val(ctx, &s->keys);
+    v->val(ctx, &s->result);
+}
+
 static JSValue js_integrity_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSIntegrity *s = st;
-    JSValue r;
-    js_desc_facts_free(ctx, &s->facts);
-    JS_FreeAtom(ctx, s->key);
-    JS_FreeValue(ctx, s->obj);
-    JS_FreeValue(ctx, s->keys);
-    r = take_result ? s->result : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->result);
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -67721,6 +67738,7 @@ static int js_array_search_step(JSContext *ctx, void *st, JSValue cb_result, JSV
 static JSValue js_array_search_fini(JSContext *ctx, void *st, bool take_result);
 static int js_str_recv_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_str_recv_fini(JSContext *ctx, void *st, bool take_result);
+static void js_str_recv_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static int js_ta_idx_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_ta_idx_fini(JSContext *ctx, void *st, bool take_result);
 static int js_json_raw_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
@@ -67807,6 +67825,7 @@ static int js_num_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
 static JSValue js_num_ctor_fini(JSContext *ctx, void *st, bool take_result);
 static int js_number_fmt_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_number_fmt_fini(JSContext *ctx, void *st, bool take_result);
+static void js_number_fmt_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static int js_coerce1_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_coerce1_fini(JSContext *ctx, void *st, bool take_result);
 static int js_function_call_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
@@ -68092,10 +68111,10 @@ static const JSTrampStepDef js_instanceof_def  = { sizeof(JSInstanceOf), js_inst
 static const JSTrampStepDef js_ordinary_hasinst_def = { sizeof(JSInstanceOf), js_instanceof_step, js_instanceof_fini, INSTOF_ORDINARY };
 static const JSTrampStepDef js_obj_tolocale_def = { sizeof(JSObjToLocale), js_object_tolocale_step, js_object_tolocale_fini, 0 };
 static const JSTrampStepDef js_obj_tostring_def = { sizeof(JSObjToString), js_object_tostring_step, js_object_tostring_fini, 0 };
-static const JSTrampStepDef js_obj_seal_def     = { sizeof(JSIntegrity), js_integrity_step, js_integrity_fini, 0 };
-static const JSTrampStepDef js_obj_freeze_def   = { sizeof(JSIntegrity), js_integrity_step, js_integrity_fini, INTEG_FREEZE };
-static const JSTrampStepDef js_obj_issealed_def = { sizeof(JSIntegrity), js_integrity_step, js_integrity_fini, INTEG_TEST };
-static const JSTrampStepDef js_obj_isfrozen_def = { sizeof(JSIntegrity), js_integrity_step, js_integrity_fini, INTEG_TEST | INTEG_FREEZE };
+static const JSTrampStepDef js_obj_seal_def     = { sizeof(JSIntegrity), js_integrity_step, js_integrity_fini, 0, .visit = js_integrity_visit };
+static const JSTrampStepDef js_obj_freeze_def   = { sizeof(JSIntegrity), js_integrity_step, js_integrity_fini, INTEG_FREEZE, .visit = js_integrity_visit };
+static const JSTrampStepDef js_obj_issealed_def = { sizeof(JSIntegrity), js_integrity_step, js_integrity_fini, INTEG_TEST, .visit = js_integrity_visit };
+static const JSTrampStepDef js_obj_isfrozen_def = { sizeof(JSIntegrity), js_integrity_step, js_integrity_fini, INTEG_TEST | INTEG_FREEZE, .visit = js_integrity_visit };
 static const JSTrampStepDef js_iter_helper_return_def = { sizeof(JSIterHelperReturn), js_iter_helper_return_step, js_iter_helper_return_fini, 0 };
 static const JSTrampStepDef js_import_opts_def  = {
     sizeof(JSImportOpts), js_import_opts_step, js_import_opts_fini, 0,
@@ -68321,25 +68340,25 @@ static int js_string_raw_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
 static JSValue js_string_raw_fini(JSContext *ctx, void *st, bool take_result);
 static const JSTrampStepDef js_string_raw_def =
     { sizeof(JSStringRaw), js_string_raw_step, js_string_raw_fini, 0 };
-static const JSTrampStepDef js_str_trim_def       = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_TRIM_BOTH };
-static const JSTrampStepDef js_str_trimStart_def  = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_TRIM_START };
-static const JSTrampStepDef js_str_trimEnd_def    = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_TRIM_END };
-static const JSTrampStepDef js_str_at_def         = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_AT };
-static const JSTrampStepDef js_str_codePointAt_def= { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_CODEPOINTAT };
-static const JSTrampStepDef js_str_substring_def  = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_SUBSTRING };
-static const JSTrampStepDef js_str_indexOf_def    = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_INDEXOF };
-static const JSTrampStepDef js_str_lastIndexOf_def= { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_LASTINDEXOF };
-static const JSTrampStepDef js_str_normalize_def  = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_NORMALIZE };
-static const JSTrampStepDef js_str_charAt_def     = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_CHARAT };
-static const JSTrampStepDef js_str_charCodeAt_def = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_CHARCODEAT };
-static const JSTrampStepDef js_str_slice_def      = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_SLICE };
-static const JSTrampStepDef js_str_substr_def     = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_SUBSTR };
-static const JSTrampStepDef js_str_repeat_def     = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_REPEAT };
-static const JSTrampStepDef js_str_padStart_def   = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_PADSTART };
-static const JSTrampStepDef js_str_padEnd_def     = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_PADEND };
-static const JSTrampStepDef js_str_localeCmp_def  = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_LOCALECOMPARE };
-static const JSTrampStepDef js_str_toLower_def    = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_TOLOWER };
-static const JSTrampStepDef js_str_toUpper_def    = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_TOUPPER };
+static const JSTrampStepDef js_str_trim_def       = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_TRIM_BOTH, .visit = js_str_recv_visit };
+static const JSTrampStepDef js_str_trimStart_def  = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_TRIM_START, .visit = js_str_recv_visit };
+static const JSTrampStepDef js_str_trimEnd_def    = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_TRIM_END, .visit = js_str_recv_visit };
+static const JSTrampStepDef js_str_at_def         = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_AT, .visit = js_str_recv_visit };
+static const JSTrampStepDef js_str_codePointAt_def= { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_CODEPOINTAT, .visit = js_str_recv_visit };
+static const JSTrampStepDef js_str_substring_def  = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_SUBSTRING, .visit = js_str_recv_visit };
+static const JSTrampStepDef js_str_indexOf_def    = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_INDEXOF, .visit = js_str_recv_visit };
+static const JSTrampStepDef js_str_lastIndexOf_def= { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_LASTINDEXOF, .visit = js_str_recv_visit };
+static const JSTrampStepDef js_str_normalize_def  = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_NORMALIZE, .visit = js_str_recv_visit };
+static const JSTrampStepDef js_str_charAt_def     = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_CHARAT, .visit = js_str_recv_visit };
+static const JSTrampStepDef js_str_charCodeAt_def = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_CHARCODEAT, .visit = js_str_recv_visit };
+static const JSTrampStepDef js_str_slice_def      = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_SLICE, .visit = js_str_recv_visit };
+static const JSTrampStepDef js_str_substr_def     = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_SUBSTR, .visit = js_str_recv_visit };
+static const JSTrampStepDef js_str_repeat_def     = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_REPEAT, .visit = js_str_recv_visit };
+static const JSTrampStepDef js_str_padStart_def   = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_PADSTART, .visit = js_str_recv_visit };
+static const JSTrampStepDef js_str_padEnd_def     = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_PADEND, .visit = js_str_recv_visit };
+static const JSTrampStepDef js_str_localeCmp_def  = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_LOCALECOMPARE, .visit = js_str_recv_visit };
+static const JSTrampStepDef js_str_toLower_def    = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_TOLOWER, .visit = js_str_recv_visit };
+static const JSTrampStepDef js_str_toUpper_def    = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_TOUPPER, .visit = js_str_recv_visit };
 #define STR_HTML_DEF(k) { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_HTML_BASE + (k) }
 static const JSTrampStepDef js_str_html_defs[STRRECV_HTML_COUNT] = {
     STR_HTML_DEF(0), STR_HTML_DEF(1), STR_HTML_DEF(2), STR_HTML_DEF(3), STR_HTML_DEF(4),
@@ -68379,10 +68398,11 @@ static const JSTrampStepDef js_obj_keys_def       = { sizeof(JSPropWalk), js_pro
 static const JSTrampStepDef js_obj_descs_def      = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_DESCS, .visit = js_prop_walk_visit };
 static int js_reflect_prop_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_reflect_prop_fini(JSContext *ctx, void *st, bool take_result);
-static const JSTrampStepDef js_reflect_get_def    = { sizeof(JSReflectProp), js_reflect_prop_step, js_reflect_prop_fini, GP_GET };
-static const JSTrampStepDef js_reflect_set_def    = { sizeof(JSReflectProp), js_reflect_prop_step, js_reflect_prop_fini, GP_SET };
-static const JSTrampStepDef js_reflect_has_def    = { sizeof(JSReflectProp), js_reflect_prop_step, js_reflect_prop_fini, GP_HAS };
-static const JSTrampStepDef js_reflect_del_def    = { sizeof(JSReflectProp), js_reflect_prop_step, js_reflect_prop_fini, GP_DELETE };
+static void js_reflect_prop_visit(JSContext *ctx, void *st, JSStepVisit *v);
+static const JSTrampStepDef js_reflect_get_def    = { sizeof(JSReflectProp), js_reflect_prop_step, js_reflect_prop_fini, GP_GET, .visit = js_reflect_prop_visit };
+static const JSTrampStepDef js_reflect_set_def    = { sizeof(JSReflectProp), js_reflect_prop_step, js_reflect_prop_fini, GP_SET, .visit = js_reflect_prop_visit };
+static const JSTrampStepDef js_reflect_has_def    = { sizeof(JSReflectProp), js_reflect_prop_step, js_reflect_prop_fini, GP_HAS, .visit = js_reflect_prop_visit };
+static const JSTrampStepDef js_reflect_del_def    = { sizeof(JSReflectProp), js_reflect_prop_step, js_reflect_prop_fini, GP_DELETE, .visit = js_reflect_prop_visit };
 static const JSTrampStepDef js_obj_entries_def    = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_ENTRIES, .visit = js_prop_walk_visit };
 static const JSTrampStepDef js_obj_assign_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_ASSIGN, .visit = js_prop_walk_visit };
 static const JSTrampStepDef js_obj_defprops_def   = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_DEFPROPS, .visit = js_prop_walk_visit };
@@ -68599,11 +68619,11 @@ static const JSTrampStepDef js_asyncgenfn_ctor_def= DYNFUNC_DEF(JS_FUNC_ASYNC_GE
 DV_STEPDEF_LIST(DV_STEPDEF_DEF)
 #undef DV_STEPDEF_DEF
 static const JSTrampStepDef js_num_ctor_def       = { sizeof(JSNumCtor), js_num_ctor_step, js_num_ctor_fini, 0 };
-static const JSTrampStepDef js_num_tostring_def   = { sizeof(JSNumberFmt), js_number_fmt_step, js_number_fmt_fini, NUMFMT_TOSTRING };
-static const JSTrampStepDef js_num_tolocale_def   = { sizeof(JSNumberFmt), js_number_fmt_step, js_number_fmt_fini, NUMFMT_TOLOCALESTRING };
-static const JSTrampStepDef js_num_tofixed_def    = { sizeof(JSNumberFmt), js_number_fmt_step, js_number_fmt_fini, NUMFMT_TOFIXED };
-static const JSTrampStepDef js_num_toexp_def      = { sizeof(JSNumberFmt), js_number_fmt_step, js_number_fmt_fini, NUMFMT_TOEXPONENTIAL };
-static const JSTrampStepDef js_num_toprec_def     = { sizeof(JSNumberFmt), js_number_fmt_step, js_number_fmt_fini, NUMFMT_TOPRECISION };
+static const JSTrampStepDef js_num_tostring_def   = { sizeof(JSNumberFmt), js_number_fmt_step, js_number_fmt_fini, NUMFMT_TOSTRING, .visit = js_number_fmt_visit };
+static const JSTrampStepDef js_num_tolocale_def   = { sizeof(JSNumberFmt), js_number_fmt_step, js_number_fmt_fini, NUMFMT_TOLOCALESTRING, .visit = js_number_fmt_visit };
+static const JSTrampStepDef js_num_tofixed_def    = { sizeof(JSNumberFmt), js_number_fmt_step, js_number_fmt_fini, NUMFMT_TOFIXED, .visit = js_number_fmt_visit };
+static const JSTrampStepDef js_num_toexp_def      = { sizeof(JSNumberFmt), js_number_fmt_step, js_number_fmt_fini, NUMFMT_TOEXPONENTIAL, .visit = js_number_fmt_visit };
+static const JSTrampStepDef js_num_toprec_def     = { sizeof(JSNumberFmt), js_number_fmt_step, js_number_fmt_fini, NUMFMT_TOPRECISION, .visit = js_number_fmt_visit };
 static const JSTrampStepDef js_global_eval_def    = { sizeof(JSProgEval), js_global_eval_step, js_global_eval_fini, 0 };
 static const JSTrampStepDef js_isNaN_def          = { sizeof(JSCoerce1), js_coerce1_step, js_coerce1_fini, 0 };
 static const JSTrampStepDef js_isFinite_def       = { sizeof(JSCoerce1), js_coerce1_step, js_coerce1_fini, 1 };
@@ -73805,12 +73825,20 @@ static int js_number_fmt_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
     return JS_IsException(s->result) ? -1 : 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). */
+static void js_number_fmt_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSNumberFmt *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->val);
+}
+
 static JSValue js_number_fmt_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSNumberFmt *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->result);
-    JS_FreeValue(ctx, s->val);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -74571,13 +74599,22 @@ static int js_str_recv_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
     }
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The receiver's ToString and the argument's are each the
+   page's code, so a branch inside one forks the operation with its own coerced operands. */
+static void js_str_recv_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSStrRecv *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->str);
+    v->val(ctx, &s->arg);
+}
+
 static JSValue js_str_recv_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSStrRecv *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->result);
-    JS_FreeValue(ctx, s->str);
-    JS_FreeValue(ctx, s->arg);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -80888,13 +80925,22 @@ static int js_reflect_prop_step(JSContext *ctx, void *st, JSValue cb_result, JSV
     return JS_IsException(s->result) ? -1 : 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The key's ToPropertyKey is the page's code, and the atom it
+   produced is held across the operation that uses it. */
+static void js_reflect_prop_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSReflectProp *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->obj);
+    v->atom(ctx, &s->atom);
+}
+
 static JSValue js_reflect_prop_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSReflectProp *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->result);
-    JS_FreeValue(ctx, s->obj);
-    JS_FreeAtom(ctx, s->atom);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
