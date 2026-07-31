@@ -37568,8 +37568,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     *sp++ = val;                       /* a pair undefined/function */
                     break;
                 case OP_with_get_ref:
+                    /* The pair is (base, method) and the base becomes the call's this-value. That is right for a
+                       `with` object -- an object Environment Record with withEnvironment true is the one kind
+                       whose WithBaseObject is not undefined -- and wrong for the eval VAR-object, which exists
+                       only because a direct eval's `var`s need somewhere addressable and is a DECLARATIVE record
+                       in the spec's terms. Its WithBaseObject is undefined, so
+                       `function f(a = eval("function g(){'use strict'; return this} with({}) { g() }")){}`
+                       handed a strict `g` the var-object as `this` instead of undefined. */
+                    if (!wh->is_with) {
+                        JS_FreeValue(ctx, sp[-1]);
+                        sp[-1] = JS_UNDEFINED;
+                    }
+                    *sp++ = val;                       /* a pair base/method */
+                    break;
                 case OP_with_make_ref:
-                    *sp++ = val;                       /* a pair object/method, or object/propname */
+                    *sp++ = val;                       /* a pair object/propname — a WRITE lands on the object */
                     break;
                 case OP_with_delete_var:
                     JS_FreeValue(ctx, sp[-1]);
