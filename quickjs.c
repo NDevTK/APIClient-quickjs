@@ -17780,7 +17780,23 @@ struct JSStepVisit {
        atom reference. Its own operation for the same reason the accumulator is — it is one allocation the
        byte-copy would leave two states pointing at, and its elements are atoms rather than values. */
     void (*props)(JSContext *ctx, JSPropertyEnum **slot, uint32_t n);
+    /* A SLOT ARRAY a machine is sorting or gathering into: `cap` entries of storage, of which [from,to) hold
+       live references. Sort's comparator is the page's code, so a fork mid-sort is ordinary, and the two arms
+       merge independently from there — one array cannot serve both. */
+    void (*slots)(JSContext *ctx, struct ValueSlot **slot, int64_t cap, int64_t from, int64_t to);
+    /* PURE SCRATCH: storage a machine reads only after writing it, so the copy needs its own allocation and
+       none of the contents. Distinguished from a slot array precisely because it holds no references — saying
+       so is what stops it being swept up by the operation that does. */
+    void (*scratch)(JSContext *ctx, void **slot, size_t bytes);
 };
+/* HOISTED to here, for the reason JSStepHdr is: the visitor above names it and the machine that owns one is
+   thousands of lines below. A sorted element carries the value AND the string a default comparison coerced it
+   to, which is why a slot is a struct and its release is not a JS_FreeValue. */
+typedef struct ValueSlot {
+    JSValue val;
+    JSString *str;
+    int64_t pos;
+} ValueSlot;
 typedef struct StringBuffer StringBuffer;
 
 /* At FILE SCOPE, before JSTrampStepDef names it in a function-pointer parameter list. Without this, the first
@@ -19060,8 +19076,44 @@ static void js_step_visit_free_props(JSContext *ctx, JSPropertyEnum **slot, uint
     js_free_prop_enum(ctx, *slot, n);
     *slot = NULL;
 }
-static const JSStepVisit js_step_visit_dup  = { js_step_visit_dup_val,  js_step_visit_dup_strbuf,  js_step_visit_dup_props };
-static const JSStepVisit js_step_visit_free = { js_step_visit_free_val, js_step_visit_free_strbuf, js_step_visit_free_props };
+static void sort_slot_release(JSContext *ctx, ValueSlot *v);
+static void js_step_visit_dup_slots(JSContext *ctx, ValueSlot **slot, int64_t cap, int64_t from, int64_t to) {
+    ValueSlot *src = *slot, *cp;
+    int64_t i;
+    if (!src) return;
+    cp = js_malloc(ctx, (size_t)(cap > 0 ? cap : 1) * sizeof(*cp));
+    if (!cp) { *slot = NULL; return; }
+    memcpy(cp, src, (size_t)(cap > 0 ? cap : 0) * sizeof(*cp));
+    for (i = from; i < to; i++) {   /* only the LIVE range holds references; the rest is written-before-read */
+        cp[i].val = js_dup(cp[i].val);
+        if (cp[i].str) js_dup(JS_MKPTR(JS_TAG_STRING, cp[i].str));
+    }
+    *slot = cp;
+}
+static void js_step_visit_free_slots(JSContext *ctx, ValueSlot **slot, int64_t cap, int64_t from, int64_t to) {
+    ValueSlot *a = *slot;
+    int64_t i;
+    (void)cap;
+    if (!a) return;
+    for (i = from; i < to; i++) sort_slot_release(ctx, &a[i]);
+    js_free(ctx, a);
+    *slot = NULL;
+}
+static void js_step_visit_dup_scratch(JSContext *ctx, void **slot, size_t bytes) {
+    void *cp;
+    if (!*slot) return;
+    cp = js_malloc(ctx, bytes ? bytes : 1);   /* contents are written before they are read: storage only */
+    *slot = cp;                               /* NULL on OOM is the same state a machine that has not built it yet is in */
+}
+static void js_step_visit_free_scratch(JSContext *ctx, void **slot, size_t bytes) {
+    (void)bytes;
+    js_free(ctx, *slot);
+    *slot = NULL;
+}
+static const JSStepVisit js_step_visit_dup  = { js_step_visit_dup_val,  js_step_visit_dup_strbuf,  js_step_visit_dup_props,
+                                                js_step_visit_dup_slots,  js_step_visit_dup_scratch };
+static const JSStepVisit js_step_visit_free = { js_step_visit_free_val, js_step_visit_free_strbuf, js_step_visit_free_props,
+                                                js_step_visit_free_slots, js_step_visit_free_scratch };
 /* A machine's teardown releases what it owns through the SAME declaration the clone reads, so the two cannot
    disagree about which fields those are. */
 static void tramp_step_visit_free(JSContext *ctx, void *st) {
@@ -22030,6 +22082,7 @@ static int js_array_sort_step(JSContext *ctx, struct JSArraySort *s, JSValue res
                               JSValue **out_cb, int *out_argc);
 static int js_array_sort_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_sort_vfini(JSContext *ctx, void *st, bool take_result);
+static void js_array_sort_visit(JSContext *ctx, void *st, JSStepVisit *v);
 
 /* 23.2.3.29 %TypedArray%.prototype.sort and 23.2.3.34 toSorted, as ONE machine.
 
@@ -67737,8 +67790,8 @@ static const JSTrampStepDef js_ta_forEach_def      = { sizeof(JSArrayEvery), js_
 static const JSTrampStepDef js_ta_map_def          = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_map | special_TA, .visit = js_array_every_visit };
 static const JSTrampStepDef js_ta_sort_def       = { sizeof(JSTASort), js_ta_sort_vstep, js_ta_sort_vfini, 0 };
 static const JSTrampStepDef js_ta_toSorted_def   = { sizeof(JSTASort), js_ta_sort_vstep, js_ta_sort_vfini, 1 };
-static const JSTrampStepDef js_array_sort_def    = { sizeof(JSArraySort), js_array_sort_vstep, js_array_sort_vfini, 0 };
-static const JSTrampStepDef js_array_toSorted_def = { sizeof(JSArraySort), js_array_sort_vstep, js_array_sort_vfini, 1 };
+static const JSTrampStepDef js_array_sort_def    = { sizeof(JSArraySort), js_array_sort_vstep, js_array_sort_vfini, 0, .visit = js_array_sort_visit };
+static const JSTrampStepDef js_array_toSorted_def = { sizeof(JSArraySort), js_array_sort_vstep, js_array_sort_vfini, 1, .visit = js_array_sort_visit };
 static const JSTrampStepDef js_json_parse_def    = { sizeof(JSJsonReviver), js_json_parse_vstep, js_json_parse_vfini, 0 };
 static const JSTrampStepDef js_for_in_def       = { sizeof(JSForIn), js_for_in_step, js_for_in_fini, 0 };
 static int check_iterator(JSContext *ctx, JSValueConst obj);
@@ -71479,11 +71532,7 @@ static JSValue js_array_flat_fini(JSContext *ctx, void *st, bool take_result)
 }
 /* Array sort */
 
-typedef struct ValueSlot {
-    JSValue val;
-    JSString *str;
-    int64_t pos;
-} ValueSlot;
+/* DEFINED at its sort machine, above — hoisted so the ownership visitor can release a slot. */
 
 struct array_sort_context {
     JSContext *ctx;
@@ -71872,25 +71921,30 @@ static int js_array_sort_vstep(JSContext *ctx, void *st, JSValue cb_result, JSVa
     }
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The comparator is the page's code and 23.1.3.30 step 3.a runs
+   ToNumber on whatever it returns, so a concolic branch inside either forks the sort mid-merge and each arm
+   merges its own array from there. `method` is BORROWED — a value on the caller's stack, which the frame clone
+   carries — and cb_args are borrowed views of two live slots. The LIVE range of `array` is [wb, n): everything
+   below wb the writeback has already consumed, everything above n was never gathered. `tmp` is merge scratch,
+   written before it is read, so the copy needs storage and none of the contents. */
+static void js_array_sort_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSArraySort *s = st;
+    v->val(ctx, &s->obj);
+    v->val(ctx, &s->coerced);   /* a ToString that landed just before a suspension */
+    v->val(ctx, &s->cmpres);    /* a comparator result held across its own ToNumber */
+    v->val(ctx, &s->copy);      /* toSorted's result while the copy walk is in flight */
+    v->val(ctx, &s->el);
+    v->slots(ctx, &s->array, s->len, s->wb, s->n);
+    v->scratch(ctx, (void **)&s->tmp, (size_t)s->n * sizeof(ValueSlot));
+}
+
 static JSValue js_array_sort_vfini(JSContext *ctx, void *st, bool take_result)
 {
     JSArraySort *s = st;
-    JSValue r;
-    int64_t w;
-    JS_FreeValue(ctx, s->coerced);   /* a ToString that landed just before an abandon */
-    s->coerced = JS_UNDEFINED;
-    JS_FreeValue(ctx, s->cmpres);    /* a comparator result whose ToNumber was abandoned part-way */
-    s->cmpres = JS_UNDEFINED;
-    JS_FreeValue(ctx, s->copy);      /* toSorted's result, if the copy walk was abandoned part-way through */
-    JS_FreeValue(ctx, s->el);
-    /* every slot the writeback has not consumed: all of them when the machine is abandoned before stage 7, the
-       tail of them when a `set` trap threw part-way through it. */
-    for (w = s->wb; w < s->n; w++)
-        sort_slot_release(ctx, &s->array[w]);
-    js_free(ctx, s->array); s->array = NULL;
-    js_free(ctx, s->tmp);   s->tmp = NULL;
-    r = take_result ? s->obj : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->obj);
+    JSValue r = take_result ? s->obj : JS_UNDEFINED;
+    if (take_result) s->obj = JS_UNDEFINED;   /* handed out, read above before the rest is released */
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
