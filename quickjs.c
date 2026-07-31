@@ -553,6 +553,14 @@ typedef enum {
    enough to call the interrupt callback often. */
 #define JS_INTERRUPT_COUNTER_INIT 10000
 
+/* The order is the accessor magic, so a getter is one array read. Paren1..9 are contiguous on purpose. */
+enum {
+    RE_LEGACY_INPUT, RE_LEGACY_LAST_MATCH, RE_LEGACY_LAST_PAREN,
+    RE_LEGACY_LEFT_CONTEXT, RE_LEGACY_RIGHT_CONTEXT,
+    RE_LEGACY_PAREN1,
+    RE_LEGACY_COUNT = RE_LEGACY_PAREN1 + 9
+};
+
 struct JSContext {
     JSGCObjectHeader header; /* must come first */
     JSRuntime *rt;
@@ -580,6 +588,12 @@ struct JSContext {
     JSValue function_ctor;
     JSValue array_ctor;
     JSValue regexp_ctor;
+    /* The RegExp Legacy Features proposal's static slots on %RegExp%: [[RegExpInput]], [[RegExpLastMatch]],
+       [[RegExpLastParen]], [[RegExpLeftContext]], [[RegExpRightContext]] and [[RegExpParen1]]..[[RegExpParen9]].
+       They belong to the INTRINSIC, so there is one set per realm and it lives here. JS_UNINITIALIZED is the
+       proposal's `empty`, the state the getters answer with a TypeError — the slots start there and go back
+       there whenever a NON-legacy regexp matches. */
+    JSValue regexp_legacy[RE_LEGACY_COUNT];
     /* 22.2.7.1 step 4 performs RegExpBuiltinExec DIRECTLY, with no function object to call — and with exec a
        step machine there is nothing to run it from C. This is that algorithm as a callable the engine holds and
        never exposes, so the "call the algorithm" step is the same CALL request every other spelling issues. */
@@ -971,6 +985,10 @@ typedef struct JSForInIterator {
 typedef struct JSRegExp {
     JSString *pattern;
     JSString *bytecode; /* also contains the flags */
+    /* [[LegacyFeaturesEnabled]] (proposal-regexp-legacy-features). True only when %RegExp% itself constructed
+       this object — a subclass instance must not be able to write the intrinsic's static slots, which is the
+       whole point of the flag: `RegExp.$1` is shared mutable state reachable from any script on the page. */
+    bool legacy_features_enabled;
 } JSRegExp;
 
 typedef struct JSProxyData {
@@ -1491,6 +1509,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_ARRAY_FROMASYNC, STEPDEF_ARRAY_FLAT, STEPDEF_ARRAY_FLATMAP, STEPDEF_ARRAY_FROMLIKE, STEPDEF_ARRAY_WITH, STEPDEF_ARRAY_FILL, STEPDEF_ARRAY_COPYWITHIN, STEPDEF_BIGINT_CTOR, STEPDEF_TA_WITH, STEPDEF_TA_FILL, STEPDEF_TA_COPYWITHIN, STEPDEF_TA_INDEXOF, STEPDEF_TA_LASTINDEXOF, STEPDEF_TA_INCLUDES, STEPDEF_TA_SUBARRAY, STEPDEF_AB_SLICE, STEPDEF_AB_SLICE_IMM, STEPDEF_SAB_SLICE, STEPDEF_AB_CTOR, STEPDEF_SAB_CTOR, STEPDEF_AB_RESIZE, STEPDEF_SAB_GROW, STEPDEF_AB_TRANSFER, STEPDEF_AB_TRANSFER_IMM, STEPDEF_AB_TRANSFER_FIX, STEPDEF_DATAVIEW_CTOR, STEPDEF_DATE_TOJSON, STEPDEF_DATE_TOPRIM, STEPDEF_DATE_CTOR,
     STEPDEF_MATH_ABS, STEPDEF_MATH_FLOOR, STEPDEF_MATH_CEIL, STEPDEF_MATH_ROUND, STEPDEF_MATH_SQRT, STEPDEF_MATH_ACOS, STEPDEF_MATH_ASIN, STEPDEF_MATH_ATAN, STEPDEF_MATH_COS, STEPDEF_MATH_EXP, STEPDEF_MATH_LOG, STEPDEF_MATH_SIN, STEPDEF_MATH_TAN, STEPDEF_MATH_TRUNC, STEPDEF_MATH_SIGN, STEPDEF_MATH_COSH, STEPDEF_MATH_SINH, STEPDEF_MATH_TANH, STEPDEF_MATH_ACOSH, STEPDEF_MATH_ASINH, STEPDEF_MATH_ATANH, STEPDEF_MATH_EXPM1, STEPDEF_MATH_LOG1P, STEPDEF_MATH_LOG2, STEPDEF_MATH_LOG10, STEPDEF_MATH_CBRT, STEPDEF_MATH_F16ROUND, STEPDEF_MATH_FROUND, STEPDEF_MATH_ATAN2, STEPDEF_MATH_POW, STEPDEF_MATH_MIN, STEPDEF_MATH_MAX, STEPDEF_MATH_HYPOT, STEPDEF_MATH_IMUL, STEPDEF_MATH_CLZ32, STEPDEF_STR_FROMCHARCODE, STEPDEF_STR_FROMCODEPOINT, STEPDEF_DATE_UTC,
     STEPDEF_REGEXP_EXEC, STEPDEF_REGEXP_TEST, STEPDEF_REGEXP_FLAGS, STEPDEF_REGEXP_TOSTRING,
+    STEPDEF_REGEXP_SET_INPUT,
     STEPDEF_RE_STR_ITER_NEXT,
     STEPDEF_ITER_TAKE, STEPDEF_ITER_DROP, STEPDEF_ITER_WRAP_RETURN,
     STEPDEF_ITER_CONCAT_NEXT, STEPDEF_ITER_CONCAT_RETURN, STEPDEF_ARRAY_ITER_NEXT,
@@ -3119,6 +3138,8 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
     ctx->iterator_ctor = JS_NULL;
     ctx->iterator_ctor_getset = JS_NULL;
     ctx->regexp_ctor = JS_NULL;
+    for (i = 0; i < RE_LEGACY_COUNT; i++)
+        ctx->regexp_legacy[i] = JS_UNINITIALIZED;   /* the proposal's `empty` */
     ctx->regexp_builtin_exec = JS_NULL;
     ctx->async_from_sync_next = JS_NULL;
     ctx->promise_ctor = JS_NULL;
@@ -3268,6 +3289,8 @@ static void JS_MarkContext(JSRuntime *rt, JSContext *ctx,
     JS_MarkValue(rt, ctx->promise_ctor, mark_func);
     JS_MarkValue(rt, ctx->array_ctor, mark_func);
     JS_MarkValue(rt, ctx->regexp_ctor, mark_func);
+    for (i = 0; i < RE_LEGACY_COUNT; i++)
+        JS_MarkValue(rt, ctx->regexp_legacy[i], mark_func);
     JS_MarkValue(rt, ctx->regexp_builtin_exec, mark_func);
     JS_MarkValue(rt, ctx->async_from_sync_next, mark_func);
     JS_MarkValue(rt, ctx->function_ctor, mark_func);
@@ -3358,6 +3381,8 @@ void JS_FreeContext(JSContext *ctx)
     JS_FreeValue(ctx, ctx->promise_ctor);
     JS_FreeValue(ctx, ctx->array_ctor);
     JS_FreeValue(ctx, ctx->regexp_ctor);
+    for (i = 0; i < RE_LEGACY_COUNT; i++)
+        JS_FreeValue(ctx, ctx->regexp_legacy[i]);
     JS_FreeValue(ctx, ctx->regexp_builtin_exec);
     JS_FreeValue(ctx, ctx->async_from_sync_next);
     JS_FreeValue(ctx, ctx->function_ctor);
@@ -6560,6 +6585,7 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
     case JS_CLASS_REGEXP:
         p->u.regexp.pattern = NULL;
         p->u.regexp.bytecode = NULL;
+        p->u.regexp.legacy_features_enabled = false;
         goto set_exotic;
     default:
     set_exotic:
@@ -19687,6 +19713,17 @@ typedef struct JSReRep {
 /* 22.2.4.1 RegExp ( pattern, flags ). Every step is the page's code: IsRegExp's `? Get(pattern, @@match)`,
    step 2.b.i's `? Get(pattern, "constructor")`, step 5's `? Get(pattern, "source")` and `? Get(pattern,
    "flags")`, RegExpAlloc's `? Get(newTarget, "prototype")`, and RegExpInitialize's two ToStrings. */
+/* `RegExp.input = x` / `RegExp.$_ = x` — the one WRITABLE legacy static slot. Its ToString is the page's
+   code, which is why the setter is a step machine and the fourteen getters are plain C. */
+typedef struct JSReSetInput {
+    JSStepHdr hdr;        /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    JSValue result;       /* DONE (owned) */
+    JSValue str;          /* the coerced value, held until it reaches the slot (owned) */
+} JSReSetInput;
+
+static int js_regexp_set_input_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static JSValue js_regexp_set_input_fini(JSContext *ctx, void *st, bool take_result);
+
 typedef struct JSReCtor {
     JSStepHdr hdr;           /* MUST be first: the generic step driver casts the state to JSStepHdr * */
     JSValue pat;             /* P — the pattern source, held across its coercion (owned) */
@@ -62259,6 +62296,64 @@ static JSValue js_function_own_name(JSContext *ctx, JSValueConst func)
     return js_empty_string(ctx->rt);
 }
 
+/* Can this built-in's `name` appear as the PropertyName of a NativeFunction? An optional `get `/`set ` prefix
+   is the production's NativeFunctionAccessor and is not part of the name; what follows must be an
+   IdentifierName, or the `[…]` form the engine already uses for a symbol-keyed accessor, or nothing. */
+static bool js_native_name_is_emittable(JSContext *ctx, JSValueConst name)
+{
+    JSString *p;
+    int i, len, c;
+
+    if (!JS_IsString(name))
+        return false;
+    p = JS_VALUE_GET_STRING(name);
+    len = p->len;
+    i = 0;
+    if (len >= 4 && (string_get(p, 0) == 'g' || string_get(p, 0) == 's')) {
+        if ((string_get(p, 0) == 'g' && string_get(p, 1) == 'e' && string_get(p, 2) == 't' &&
+             string_get(p, 3) == ' ') ||
+            (string_get(p, 0) == 's' && string_get(p, 1) == 'e' && string_get(p, 2) == 't' &&
+             string_get(p, 3) == ' '))
+            i = 4;
+    }
+    if (i == len)
+        return true;                      /* accessor with no name — the production allows it */
+    if (string_get(p, i) == '[')
+        return true;                      /* the computed form, already emitted for symbol keys */
+    if (!lre_js_is_ident_first(string_get(p, i)))
+        return false;
+    for (i++; i < len; i++) {
+        c = string_get(p, i);
+        if (!lre_js_is_ident_next(c))
+            return false;
+    }
+    return true;
+}
+
+/* "get " / "set " / "" — the part of an unemittable name that IS grammar and has to survive. */
+static JSValue js_native_accessor_prefix(JSContext *ctx, JSValueConst func_obj)
+{
+    JSValue name = js_function_own_name(ctx, func_obj);
+    JSString *p;
+    bool is_get, is_set;
+
+    if (!JS_IsString(name)) {
+        JS_FreeValue(ctx, name);
+        return JS_AtomToString(ctx, JS_ATOM_empty_string);
+    }
+    p = JS_VALUE_GET_STRING(name);
+    is_get = p->len >= 4 && string_get(p, 0) == 'g' && string_get(p, 1) == 'e' &&
+             string_get(p, 2) == 't' && string_get(p, 3) == ' ';
+    is_set = p->len >= 4 && string_get(p, 0) == 's' && string_get(p, 1) == 'e' &&
+             string_get(p, 2) == 't' && string_get(p, 3) == ' ';
+    JS_FreeValue(ctx, name);
+    if (is_get)
+        return JS_NewString(ctx, "get ");
+    if (is_set)
+        return JS_NewString(ctx, "set ");
+    return JS_AtomToString(ctx, JS_ATOM_empty_string);
+}
+
 static JSValue js_function_toString(JSContext *ctx, JSValueConst this_val,
                                     int argc, JSValueConst *argv)
 {
@@ -62303,6 +62398,15 @@ static JSValue js_function_toString(JSContext *ctx, JSValueConst this_val,
            class) and reading it invokes nothing, so the read is not routed — it is REMOVED. A Proxy has no own
            `name` slot and gets the empty one, which is what other engines produce for it. */
         name = js_function_own_name(ctx, this_val);
+        /* …and it must still PARSE as one. A built-in's name can be anything a property key can be, and
+           RegExp's legacy statics put `get $&`, `get $+`, "get $`" and `get $'` on an intrinsic: none of those
+           tails is an IdentifierName, so emitting them produced `function get $&() { [native code] }`, which
+           is not a NativeFunction. PropertyName is OPTIONAL in the production, so a name that cannot appear in
+           it is omitted rather than mangled — the accessor prefix stays, because that part is grammar. */
+        if (!js_native_name_is_emittable(ctx, name)) {
+            JS_FreeValue(ctx, name);
+            name = js_native_accessor_prefix(ctx, this_val);
+        }
         return JS_ConcatString3(ctx, pref, name, suff);
     }
 }
@@ -67328,6 +67432,7 @@ static const JSTrampStepDef js_json_raw_def       = { sizeof(JSJsonRaw), js_json
 static const JSTrampStepDef js_proto_chain_def    = { sizeof(JSProtoChain), js_proto_chain_step, js_proto_chain_fini, 0 };
 static const JSTrampStepDef js_regexp_tostring_def = { sizeof(JSRegExpToString), js_regexp_tostring_step, js_regexp_tostring_fini, 0 };
 static const JSTrampStepDef js_re_str_iter_def    = { sizeof(JSReStrIter), js_re_str_iter_step, js_re_str_iter_fini, 0 };
+static const JSTrampStepDef js_regexp_set_input_def = { sizeof(JSReSetInput), js_regexp_set_input_step, js_regexp_set_input_fini, 0 };
 static const JSTrampStepDef js_regexp_flags_def   = { sizeof(JSRegExpFlags), js_regexp_flags_step, js_regexp_flags_fini, 0 };
 static const JSTrampStepDef js_proto_get_def      = { sizeof(JSProtoAccessor), js_proto_accessor_step, js_proto_accessor_fini, PROTOACC_GET };
 static const JSTrampStepDef js_proto_set_def      = { sizeof(JSProtoAccessor), js_proto_accessor_step, js_proto_accessor_fini, PROTOACC_SET };
@@ -69066,6 +69171,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_RE_STR_ITER_NEXT] = &js_re_str_iter_def,
     [STEPDEF_REGEXP_FLAGS] = &js_regexp_flags_def,
     [STEPDEF_REGEXP_TOSTRING] = &js_regexp_tostring_def,
+    [STEPDEF_REGEXP_SET_INPUT] = &js_regexp_set_input_def,
     [STEPDEF_PROTO_GET]    = &js_proto_get_def,
     [STEPDEF_PROTO_SET]    = &js_proto_set_def,
     [STEPDEF_PROTO_CHAIN]  = &js_proto_chain_def,
@@ -75569,6 +75675,8 @@ static JSValue js_regexp_constructor_internal(JSContext *ctx, JSValueConst ctor,
     re = &p->u.regexp;
     re->pattern = JS_VALUE_GET_STRING(pattern);
     re->bytecode = JS_VALUE_GET_STRING(bc);
+    /* the ctor-less form is %RegExp% building its own instance (a literal, or @@split's internal splitter) */
+    re->legacy_features_enabled = JS_IsUndefined(ctor);
     return obj;
 fail:
     JS_FreeValue(ctx, bc);
@@ -75759,6 +75867,10 @@ static int js_re_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
         JSObject *p = JS_VALUE_GET_OBJ(s->obj);
         p->u.regexp.pattern = JS_VALUE_GET_STRING(s->pat);
         p->u.regexp.bytecode = JS_VALUE_GET_STRING(s->bc);
+        /* [[LegacyFeaturesEnabled]] is true only when %RegExp% ITSELF is the NewTarget. A subclass instance
+           must not be able to write the intrinsic's static slots — `class R extends RegExp {}` exists in
+           real bundles, and the proposal's whole safety argument is that it cannot reach `RegExp.$1`. */
+        p->u.regexp.legacy_features_enabled = js_same_value(ctx, s->ntgt, ctx->regexp_ctor);
         s->pat = JS_UNDEFINED;   /* the object adopts both */
         s->bc = JS_UNDEFINED;
         s->result = s->obj;
@@ -76163,6 +76275,79 @@ static JSValue js_regexp_escape(JSContext *ctx, JSValueConst this_val,
    all. That is why this half stays a plain C body while the three property accesses around it became requests.
    `str_val` is CONSUMED (it becomes the result's `input`), and `bytecode` is BORROWED from the state, which
    holds a reference for exactly this call. */
+/* InvalidateLegacyRegExpStaticProperties: every slot goes back to `empty`, so every getter throws until a
+   legacy regexp matches again. A NON-legacy regexp (a subclass instance, or one whose prototype was swapped)
+   matching is what triggers it — the proposal's point being that a page cannot use a subclass to smuggle its
+   own values into an intrinsic every other script can read. */
+static void js_regexp_legacy_invalidate(JSContext *ctx)
+{
+    int i;
+    for (i = 0; i < RE_LEGACY_COUNT; i++) {
+        JS_FreeValue(ctx, ctx->regexp_legacy[i]);
+        ctx->regexp_legacy[i] = JS_UNINITIALIZED;
+    }
+}
+
+static void js_regexp_legacy_set(JSContext *ctx, int slot, JSValue v)
+{
+    JS_FreeValue(ctx, ctx->regexp_legacy[slot]);
+    ctx->regexp_legacy[slot] = v;
+}
+
+/* UpdateLegacyRegExpStaticProperties. `capture` holds the match's byte pointers into str_buf, which is what
+   the caller already has; every slot is a substring of S, so this allocates strings and runs nothing. */
+static int js_regexp_legacy_update(JSContext *ctx, JSValueConst str_val, uint8_t **capture,
+                                   int capture_count, const uint8_t *str_buf, int shift)
+{
+    JSString *str = JS_VALUE_GET_STRING(str_val);
+    int i, start, end, last_paren = -1;
+    JSValue v;
+
+    start = (int)((capture[0] - str_buf) >> shift);
+    end = (int)((capture[1] - str_buf) >> shift);
+
+    js_regexp_legacy_set(ctx, RE_LEGACY_INPUT, js_dup(str_val));
+    v = js_sub_string(ctx, str, start, end);
+    if (JS_IsException(v)) return -1;
+    js_regexp_legacy_set(ctx, RE_LEGACY_LAST_MATCH, v);
+    v = js_sub_string(ctx, str, 0, start);
+    if (JS_IsException(v)) return -1;
+    js_regexp_legacy_set(ctx, RE_LEGACY_LEFT_CONTEXT, v);
+    v = js_sub_string(ctx, str, end, str->len);
+    if (JS_IsException(v)) return -1;
+    js_regexp_legacy_set(ctx, RE_LEGACY_RIGHT_CONTEXT, v);
+
+    /* $1..$9 are the first nine captures; a group that did not participate is the empty string, not
+       undefined — these are the legacy accessors, and they predate `groups`. */
+    for (i = 1; i <= 9; i++) {
+        if (i < capture_count && capture[2 * i] && capture[2 * i + 1]) {
+            int cs = (int)((capture[2 * i] - str_buf) >> shift);
+            int ce = (int)((capture[2 * i + 1] - str_buf) >> shift);
+            v = js_sub_string(ctx, str, cs, ce);
+            if (JS_IsException(v)) return -1;
+        } else {
+            v = JS_AtomToString(ctx, JS_ATOM_empty_string);
+        }
+        js_regexp_legacy_set(ctx, RE_LEGACY_PAREN1 + i - 1, v);
+    }
+    /* [[RegExpLastParen]] is the LAST capture that participated, over all of them and not just the first
+       nine — `lastParen` on a pattern with twelve groups reports the twelfth. */
+    for (i = 1; i < capture_count; i++) {
+        if (capture[2 * i] && capture[2 * i + 1])
+            last_paren = i;
+    }
+    if (last_paren > 0) {
+        int cs = (int)((capture[2 * last_paren] - str_buf) >> shift);
+        int ce = (int)((capture[2 * last_paren + 1] - str_buf) >> shift);
+        v = js_sub_string(ctx, str, cs, ce);
+        if (JS_IsException(v)) return -1;
+    } else {
+        v = JS_AtomToString(ctx, JS_ATOM_empty_string);
+    }
+    js_regexp_legacy_set(ctx, RE_LEGACY_LAST_PAREN, v);
+    return 0;
+}
+
 static JSValue js_regexp_build_result(JSContext *ctx, JSString *bytecode, JSValue str_val,
                                       uint8_t **capture)
 {
@@ -76455,6 +76640,20 @@ static int js_regexp_exec_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
                 abort();
             }
             return -1;
+        }
+        if (s->rc == 1) {
+            /* RegExpBuiltinExec, proposal-regexp-legacy-features: a match by a regexp %RegExp% itself built
+               updates the intrinsic's static slots; a match by anything else INVALIDATES them. Done here
+               rather than in the result build because a `lastIndex` setter runs between the two and could
+               observe the difference. */
+            JSObject *rp = JS_VALUE_GET_OBJ(s->hdr.this_val);
+            if (rp->u.regexp.legacy_features_enabled) {
+                if (js_regexp_legacy_update(ctx, s->str_val, s->capture,
+                                            lre_get_capture_count(re_bytecode), str_buf, shift) < 0)
+                    return -1;
+            } else {
+                js_regexp_legacy_invalidate(ctx);
+            }
         }
         if (s->rc != 1) {
             /* steps 12.a / 15: no match — reset lastIndex when the regexp is stateful or the start was past
@@ -77672,9 +77871,81 @@ static JSValue js_re_split_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
+/* The RegExp Legacy Features proposal's static accessors. Every one is `if SameValue(this, %RegExp%) is false,
+   throw a TypeError` followed by an internal-slot read — no user code, so a plain C getter is the whole of it.
+   `empty` is JS_UNINITIALIZED and is also a TypeError: a getter that answered `undefined` would be reporting
+   the last match of a regexp the page is not allowed to observe. */
+static JSValue js_regexp_get_legacy_magic(JSContext *ctx, JSValueConst this_val, int slot)
+{
+    if (!js_same_value(ctx, this_val, ctx->regexp_ctor))
+        return JS_ThrowTypeError(ctx, "RegExp legacy static properties are only readable on %RegExp% itself");
+    if (JS_IsUninitialized(ctx->regexp_legacy[slot]))
+        return JS_ThrowTypeError(ctx, "RegExp legacy static property is not available");
+    return js_dup(ctx->regexp_legacy[slot]);
+}
+
+/* JS_CGETSET_STEP_DEF's getter half is the plain (no-magic) shape, so `input` and `$_` need this one line. */
+static JSValue js_regexp_get_input(JSContext *ctx, JSValueConst this_val)
+{
+    return js_regexp_get_legacy_magic(ctx, this_val, RE_LEGACY_INPUT);
+}
+
+static int js_regexp_set_input_step(JSContext *ctx, void *st, JSValue cb_result,
+                                    JSValue **out_cb, int *out_argc)
+{
+    JSReSetInput *s = st;
+    int r;
+
+    if (s->hdr.stage == 0) {
+        s->hdr.stage = 1;
+        s->result = JS_UNDEFINED;
+        s->str = JS_UNDEFINED;
+        if (!js_same_value(ctx, s->hdr.this_val, ctx->regexp_ctor)) {
+            JS_FreeValue(ctx, cb_result);
+            JS_ThrowTypeError(ctx, "RegExp legacy static properties are only writable on %RegExp% itself");
+            return -1;
+        }
+    }
+    r = step_tostring_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->str, out_cb, out_argc);
+    if (r) return r < 0 ? -1 : r;
+    js_regexp_legacy_set(ctx, RE_LEGACY_INPUT, s->str);
+    s->str = JS_UNDEFINED;
+    return 0;
+}
+
+static JSValue js_regexp_set_input_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSReSetInput *s = st;
+    JSValue r = take_result ? s->result : (JS_FreeValue(ctx, s->result), JS_UNDEFINED);
+    JS_FreeValue(ctx, s->str);
+    js_free_rt(ctx->rt, s);
+    return r;
+}
+
 static const JSCFunctionListEntry js_regexp_funcs[] = {
     JS_CFUNC_DEF("escape", 1, js_regexp_escape ),
     JS_CGETSET_DEF("[Symbol.species]", js_get_this, NULL ),
+    /* proposal-regexp-legacy-features. Both spellings of each are the SAME pair of accessor functions in every
+       engine that ships this, and the aliases are what real bundles actually use. */
+    JS_CGETSET_STEP_DEF("input", js_regexp_get_input, STEPDEF_REGEXP_SET_INPUT ),
+    JS_CGETSET_STEP_DEF("$_", js_regexp_get_input, STEPDEF_REGEXP_SET_INPUT ),
+    JS_CGETSET_MAGIC_DEF("lastMatch", js_regexp_get_legacy_magic, NULL, RE_LEGACY_LAST_MATCH ),
+    JS_CGETSET_MAGIC_DEF("$&", js_regexp_get_legacy_magic, NULL, RE_LEGACY_LAST_MATCH ),
+    JS_CGETSET_MAGIC_DEF("lastParen", js_regexp_get_legacy_magic, NULL, RE_LEGACY_LAST_PAREN ),
+    JS_CGETSET_MAGIC_DEF("$+", js_regexp_get_legacy_magic, NULL, RE_LEGACY_LAST_PAREN ),
+    JS_CGETSET_MAGIC_DEF("leftContext", js_regexp_get_legacy_magic, NULL, RE_LEGACY_LEFT_CONTEXT ),
+    JS_CGETSET_MAGIC_DEF("$`", js_regexp_get_legacy_magic, NULL, RE_LEGACY_LEFT_CONTEXT ),
+    JS_CGETSET_MAGIC_DEF("rightContext", js_regexp_get_legacy_magic, NULL, RE_LEGACY_RIGHT_CONTEXT ),
+    JS_CGETSET_MAGIC_DEF("$'", js_regexp_get_legacy_magic, NULL, RE_LEGACY_RIGHT_CONTEXT ),
+    JS_CGETSET_MAGIC_DEF("$1", js_regexp_get_legacy_magic, NULL, RE_LEGACY_PAREN1 + 0 ),
+    JS_CGETSET_MAGIC_DEF("$2", js_regexp_get_legacy_magic, NULL, RE_LEGACY_PAREN1 + 1 ),
+    JS_CGETSET_MAGIC_DEF("$3", js_regexp_get_legacy_magic, NULL, RE_LEGACY_PAREN1 + 2 ),
+    JS_CGETSET_MAGIC_DEF("$4", js_regexp_get_legacy_magic, NULL, RE_LEGACY_PAREN1 + 3 ),
+    JS_CGETSET_MAGIC_DEF("$5", js_regexp_get_legacy_magic, NULL, RE_LEGACY_PAREN1 + 4 ),
+    JS_CGETSET_MAGIC_DEF("$6", js_regexp_get_legacy_magic, NULL, RE_LEGACY_PAREN1 + 5 ),
+    JS_CGETSET_MAGIC_DEF("$7", js_regexp_get_legacy_magic, NULL, RE_LEGACY_PAREN1 + 6 ),
+    JS_CGETSET_MAGIC_DEF("$8", js_regexp_get_legacy_magic, NULL, RE_LEGACY_PAREN1 + 7 ),
+    JS_CGETSET_MAGIC_DEF("$9", js_regexp_get_legacy_magic, NULL, RE_LEGACY_PAREN1 + 8 ),
 };
 
 static const JSCFunctionListEntry js_regexp_proto_funcs[] = {
