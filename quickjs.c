@@ -1126,8 +1126,12 @@ typedef struct JSExportEntry {
         int req_module_idx; /* module for indirect export */
     } u;
     JSExportTypeEnum export_type;
-    JSAtom local_name; /* '*' if export ns from. not used for local
-                          export after compilation */
+    /* `export * as ns from "m"`. It used to be spelled by setting local_name to the atom for "*", which IS a
+       legal ModuleExportName -- a module may `export {x as "*"}` -- so a program using that name collided with
+       the engine's own marker and its import resolved to the namespace object. The marker is a property of the
+       ENTRY, not a value in the user's name space. */
+    bool is_namespace;
+    JSAtom local_name; /* the imported name for an indirect export; meaningless when is_namespace */
     JSAtom export_name; /* exported variable name */
 } JSExportEntry;
 
@@ -1137,7 +1141,8 @@ typedef struct JSStarExportEntry {
 
 typedef struct JSImportEntry {
     int var_idx; /* closure variable index */
-    JSAtom import_name;
+    bool is_namespace; /* `import * as ns from "m"` — see JSExportEntry.is_namespace */
+    JSAtom import_name; /* meaningless when is_namespace */
     int req_module_idx; /* in req_module_entries */
 } JSImportEntry;
 
@@ -50023,7 +50028,7 @@ static JSResolveResultEnum js_resolve_export1(JSContext *ctx,
             /* indirect export */
             JSModuleDef *m1;
             m1 = m->req_module_entries[me->u.req_module_idx].module;
-            if (me->local_name == JS_ATOM__star_) {
+            if (me->is_namespace) {
                 /* export ns from */
                 *pmodule = m;
                 *pme = me;
@@ -50066,9 +50071,9 @@ static JSResolveResultEnum js_resolve_export1(JSContext *ctx,
                            namespace look ambiguous. */
                         JSModuleDef *a_mod = res_m, *b_mod = *pmodule;
                         bool a_ns = (res_me->export_type == JS_EXPORT_TYPE_INDIRECT &&
-                                     res_me->local_name == JS_ATOM__star_);
+                                     res_me->is_namespace);
                         bool b_ns = ((*pme)->export_type == JS_EXPORT_TYPE_INDIRECT &&
-                                     (*pme)->local_name == JS_ATOM__star_);
+                                     (*pme)->is_namespace);
                         if (a_ns)
                             a_mod = res_m->req_module_entries[res_me->u.req_module_idx].module;
                         if (b_ns)
@@ -50140,6 +50145,11 @@ static JSVarRef *js_get_local_export_var_ref1(JSContext *ctx, JSModuleDef *m,
 
         if (mi->var_idx != me->u.local.var_idx)
             continue;
+        /* a namespace import's slot holds the namespace OBJECT — there is no exported binding behind it to
+           follow, and its import_name is the `*` the user wrote, which would otherwise be looked up as a
+           real export name. */
+        if (mi->is_namespace)
+            return NULL;
         if (find_resolve_entry(s, m, mi->import_name) >= 0)
             return NULL;
         if (add_resolve_entry(ctx, s, m, mi->import_name) < 0)
@@ -50147,7 +50157,7 @@ static JSVarRef *js_get_local_export_var_ref1(JSContext *ctx, JSModuleDef *m,
         m1 = m->req_module_entries[mi->req_module_idx].module;
         if (js_resolve_export1(ctx, &res_m, &res_me, m1, mi->import_name, s) ==
                 JS_RESOLVE_RES_FOUND &&
-            res_me->local_name != JS_ATOM__star_)
+            !res_me->is_namespace)
             return js_get_local_export_var_ref1(ctx, res_m, res_me, s);
         break;
     }
@@ -50368,7 +50378,7 @@ static JSValue js_build_module_ns(JSContext *ctx, JSModuleDef *m)
                    module, not from m; report the target and the looked-up name */
                 JSExportEntry *me = find_export_entry(ctx, m, en->export_name);
                 if (me && me->export_type == JS_EXPORT_TYPE_INDIRECT &&
-                    me->local_name != JS_ATOM__star_) {
+                    !me->is_namespace) {
                     JSModuleDef *m1 =
                         m->req_module_entries[me->u.req_module_idx].module;
                     js_resolve_export_throw_error(ctx, res, m1, me->local_name);
@@ -50379,7 +50389,7 @@ static JSValue js_build_module_ns(JSContext *ctx, JSModuleDef *m)
             }
             en->export_type = EXPORTED_NAME_AMBIGUOUS;
         } else {
-            if (res_me->local_name == JS_ATOM__star_) {
+            if (res_me->is_namespace) {
                 en->export_type = EXPORTED_NAME_NS;
                 en->u.module = res_m->req_module_entries[res_me->u.req_module_idx].module;
             } else {
@@ -50485,7 +50495,10 @@ static void js_module_reexport_imported_bindings(JSContext *ctx, JSModuleDef *m,
             if (fd->closure_var[mi->var_idx].var_name != me->local_name)
                 continue;
             JS_FreeAtom(ctx, me->local_name);
-            me->local_name = JS_DupAtom(ctx, mi->import_name);   /* `*` for a namespace import */
+            me->local_name = JS_DupAtom(ctx, mi->import_name);
+            /* the `all` form is carried by the FLAG, not by the name: `import {"*" as x} from "m"; export {x}`
+               re-exports a binding literally named "*" and must not become a namespace re-export. */
+            me->is_namespace = mi->is_namespace;
             me->export_type = JS_EXPORT_TYPE_INDIRECT;
             me->u.req_module_idx = mi->req_module_idx;
             break;
@@ -50728,7 +50741,7 @@ static int js_module_linking_finish(JSContext *ctx, JSModuleDef *m, JSModuleDef 
     for(i = 0; i < m->export_entries_count; i++) {
         JSExportEntry *me = &m->export_entries[i];
         if (me->export_type == JS_EXPORT_TYPE_INDIRECT &&
-            me->local_name != JS_ATOM__star_) {
+            !me->is_namespace) {
             JSResolveResultEnum ret;
             JSExportEntry *res_me;
             JSModuleDef *res_m, *m1;
@@ -50772,7 +50785,7 @@ static int js_module_linking_finish(JSContext *ctx, JSModuleDef *m, JSModuleDef 
             }
 #endif
             m1 = m->req_module_entries[mi->req_module_idx].module;
-            if (mi->import_name == JS_ATOM__star_) {
+            if (mi->is_namespace) {
                 JSValue val;
                 /* name space import */
                 val = JS_GetModuleNamespace(ctx, m1);
@@ -50793,7 +50806,7 @@ static int js_module_linking_finish(JSContext *ctx, JSModuleDef *m, JSModuleDef 
                     js_resolve_export_throw_error(ctx, ret, m1, mi->import_name);
                     goto fail;
                 }
-                if (res_me->local_name == JS_ATOM__star_) {
+                if (res_me->is_namespace) {
                     JSValue val;
                     JSModuleDef *m2;
                     /* name space import from */
@@ -52148,6 +52161,7 @@ static __exception int js_parse_export(JSParseState *s)
             JS_FreeAtom(ctx, export_name);
             if (!me)
                 return -1;
+            me->is_namespace = true;   /* local_name is the `*` the user wrote, and nothing reads it */
             me->u.req_module_idx = idx;
         } else {
             idx = js_parse_from_clause(s, m);
@@ -52207,7 +52221,7 @@ static int add_closure_var(JSContext *ctx, JSFunctionDef *s,
                            JSVarKindEnum var_kind);
 
 static int add_import(JSParseState *s, JSModuleDef *m,
-                      JSAtom local_name, JSAtom import_name)
+                      JSAtom local_name, JSAtom import_name, bool is_namespace)
 {
     JSContext *ctx = s->ctx;
     int i, var_idx;
@@ -52224,7 +52238,7 @@ static int add_import(JSParseState *s, JSModuleDef *m,
         }
     }
 
-    if (import_name == JS_ATOM__star_)
+    if (is_namespace)
         closure_type = JS_CLOSURE_MODULE_DECL;
     else
         closure_type = JS_CLOSURE_MODULE_IMPORT;
@@ -52239,6 +52253,7 @@ static int add_import(JSParseState *s, JSModuleDef *m,
                         m->import_entries_count + 1))
         return -1;
     mi = &m->import_entries[m->import_entries_count++];
+    mi->is_namespace = is_namespace;
     mi->import_name = JS_DupAtom(ctx, import_name);
     mi->var_idx = var_idx;
     return 0;
@@ -52281,7 +52296,7 @@ static __exception int js_parse_import(JSParseState *s)
             import_name = JS_ATOM_default;
             if (next_token(s))
                 goto fail;
-            if (add_import(s, m, local_name, import_name))
+            if (add_import(s, m, local_name, import_name, /*is_namespace*/false))
                 goto fail;
             JS_FreeAtom(ctx, local_name);
 
@@ -52304,10 +52319,10 @@ static __exception int js_parse_import(JSParseState *s)
                 return -1;
             }
             local_name = JS_DupAtom(ctx, s->token.u.ident.atom);
-            import_name = JS_ATOM__star_;
+            import_name = JS_ATOM__star_;   /* the `*` the user wrote; is_namespace is what is READ */
             if (next_token(s))
                 goto fail;
-            if (add_import(s, m, local_name, import_name))
+            if (add_import(s, m, local_name, import_name, /*is_namespace*/true))
                 goto fail;
             JS_FreeAtom(ctx, local_name);
         } else if (s->token.val == '{') {
@@ -52344,7 +52359,7 @@ static __exception int js_parse_import(JSParseState *s)
                 } else {
                     local_name = JS_DupAtom(ctx, import_name);
                 }
-                if (add_import(s, m, local_name, import_name))
+                if (add_import(s, m, local_name, import_name, /*is_namespace*/false))
                     goto fail;
                 JS_FreeAtom(ctx, local_name);
                 JS_FreeAtom(ctx, import_name);
@@ -58092,9 +58107,11 @@ typedef enum BCTagEnum {
 /* 29: a regexp's compiled byte code changed shape — a capture or register index is a u32 where it was a
    byte, and the header grew with it.
    30: its group-name section lost a byte per group (LRE_GROUP_NAME_TRAILER_LEN 2 -> 1).
+   31: a module's export/import entries carry an explicit is_namespace byte. It used to be inferred from the
+   name being the atom for "*", which is a legal ModuleExportName, so the flag has to be written.
    Serialized byte code from an older build would be read as the new format and mis-execute, so the version
    byte is what refuses it. */
-#define BC_VERSION 30
+#define BC_VERSION 31
 /* DELETED: the OP_COUNT and JS_ATOM_END asserts. They guarded ONE thing — the builtin-*.h bytecode COMPILED INTO
    this file, which named opcodes and atoms by index and so silently resolved the wrong one when either table
    shifted (Iterator.zip read `done` off the atom next to it, thousands of tests from the cause). Every one of
@@ -58499,6 +58516,9 @@ static int JS_WriteModule(BCWriterState *s, JSValueConst obj)
         } else {
             bc_put_leb128(s, me->u.req_module_idx);
             bc_put_atom(s, me->local_name);
+            /* `export * as ns from` is a property of the ENTRY, not of local_name — a module may legally
+               export the name "*", so the reader cannot infer this back from the atom. */
+            bc_put_u8(s, me->is_namespace);
         }
         bc_put_atom(s, me->export_name);
     }
@@ -58514,6 +58534,7 @@ static int JS_WriteModule(BCWriterState *s, JSValueConst obj)
         JSImportEntry *mi = &m->import_entries[i];
         bc_put_leb128(s, mi->var_idx);
         bc_put_atom(s, mi->import_name);
+        bc_put_u8(s, mi->is_namespace);
         bc_put_leb128(s, mi->req_module_idx);
     }
 
@@ -59613,6 +59634,9 @@ static JSValue JS_ReadModule(BCReaderState *s)
                     goto fail;
                 if (bc_get_atom(s, &me->local_name))
                     goto fail;
+                if (bc_get_u8(s, &v8))
+                    goto fail;
+                me->is_namespace = (v8 != 0);
             }
             if (bc_get_atom(s, &me->export_name))
                 goto fail;
@@ -59646,6 +59670,9 @@ static JSValue JS_ReadModule(BCReaderState *s)
                 goto fail;
             if (bc_get_atom(s, &mi->import_name))
                 goto fail;
+            if (bc_get_u8(s, &v8))
+                goto fail;
+            mi->is_namespace = (v8 != 0);
             if (bc_get_leb128_int(s, &mi->req_module_idx))
                 goto fail;
         }
