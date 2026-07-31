@@ -19458,6 +19458,15 @@ static bool promise_exec_ready(JSContext *ctx, JSValueConst *call_argv, int call
                                   returns a rejected promise, never raises) — the same shape as the executor. */
 #define CONT_PROMISE_TRY_SETTLE 39  /* cont_state = JSPromiseTry: the capability's resolve(value), which a
                                        subclass may have wrapped in its own bytecode. */
+#define CONT_STEP_YIELD    75  /* TrampFrame.cont_state = a step machine PARKED AT ITS OWN BACK-EDGE. A machine
+                                  reached through do_step_tramp lives in `cont_st`, an interpreter local, and
+                                  survives today's suspensions only because a REQUEST pushes a frame for its
+                                  CALLEE and the machine hangs off that frame. A machine with more work but no
+                                  callee has no such frame — so a long C loop inside a builtin could not be
+                                  parked at all, and JSON.parse of any size ran to completion inside one opcode.
+                                  This frame is that missing anchor: bodyless (no bytecode, no func_state), it
+                                  exists only between the yield and the resume, and it is the ONE way a machine
+                                  parks. */
 #define CONT_ASYNC_AWAIT   74  /* cont_state = JSAsyncSettle (post unused): the async call's own outcome, deferred
                                   across 27.7.5.3 Await's machine. */
 #define CONT_AFS_CONT      73  /* outer = JSAsyncFromSync: 27.1.4.4 steps 5-15, whose step 5 reads `constructor`
@@ -20541,6 +20550,7 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_AGEN_AWAIT_RET:
     case CONT_AFS_CONT:
     case CONT_ASYNC_AWAIT:
+    case CONT_STEP_YIELD:
     case CONT_ASYNC_SETTLE:
     case CONT_PROMISE_TRY_SETTLE:
     case CONT_PROMISE_ALL_SETTLE:
@@ -23924,6 +23934,31 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    bottom prev_frame still points at &s->frame, so the whole chain deepest->...->base is intact.
                    Re-enter the DEEPEST frame at its saved pc/sp. */
                 TrampFrame *dtf = s->tramp_top;
+                if (dtf->cont_kind == CONT_STEP_YIELD) {
+                    /* A STEP MACHINE parked at its own back-edge. It has no body to restart, so this cannot take
+                       the `goto restart` below: the frame is popped, the interpreter registers are restored from
+                       the frame's caller record (the same reconstruction do_return performs), and the MACHINE is
+                       re-entered where it left off. Nothing is replayed — the machine's own state is where the
+                       parse position lives. */
+                    void *ystt = dtf->cont_state;
+                    s->tramp_top = NULL;
+                    tf_top = dtf->up;
+                    sf = dtf->caller_sf; b = dtf->caller_b; ctx = dtf->caller_ctx;
+                    local_buf = dtf->caller_local_buf; stack_buf = dtf->caller_stack_buf;
+                    var_buf = dtf->caller_var_buf; arg_buf = dtf->caller_arg_buf;
+                    this_obj = dtf->caller_this; new_target = dtf->caller_new_target;
+                    var_refs = dtf->caller_var_refs;
+                    argc = dtf->caller_argc; argv = dtf->caller_argv;
+                    arg_allocated_size = dtf->caller_arg_allocated_size;
+                    sp = dtf->caller_sp;
+                    pc = sf->cur_pc;
+                    sf->cur_sp = NULL;   /* running again */
+                    rt->current_stack_frame = sf;
+                    js_free_rt(rt, dtf);
+                    cont_st = ystt;
+                    ret_val = JS_UNDEFINED;
+                    goto do_step_step;
+                }
                 /* An ASYNC or GENERATOR frame's sf IS its func_state.frame (not the embedded dtf->sf); re-enter it
                    there so a preempted async/generator body loop resumes correctly. */
                 /* An agen-CREATE frame likewise keeps its sf in its state (cont_state), not the embedded sf —
@@ -26868,6 +26903,51 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     tramp_cap_ctor = cb[0];
                     tramp_cap_outer = stt; tramp_cap_kind = CONT_STEP;
                     goto do_promise_cap_tramp;
+                }
+                if (st == 22) {
+                    /* YIELD: "I have more work; preempt me if you want." The BYTECODE half of this exists — a
+                       loop back-edge asks g_flow_control.preempt() and takes do_preempt — and a step machine had
+                       no equivalent, which is why a long parse inside a builtin ran to completion inside one
+                       opcode however the frame stack under it was written. Flattening a parser's recursion is
+                       the substrate; THIS is the feature.
+                       When nobody is waiting the machine is simply re-entered, which costs one predicted call
+                       per back-edge and is why a machine may ask at every iteration. */
+                    if (likely(g_flow_control.preempt == NULL || !g_flow_control.preempt())) {
+                        ret_val = JS_UNDEFINED;
+                        goto do_step_step;
+                    }
+                    FLOW_PREEMPT_COUNT(g_flow_preempt_requested);
+                    if (gen_state != g_flow_base_gen)
+                        DFAIL("a step machine yielded in an activation that is not the flow base — give that "
+                              "driver a resume-as-flow path, never drive it to completion");
+                    FLOW_PREEMPT_COUNT(g_flow_preempt_fired);
+                    {
+                        /* the ANCHOR. do_preempt stashes tf_top into the base, so a machine that is on the chain
+                           is parked by the ordinary back-edge path with nothing special about it. */
+                        TrampFrame *ytf = tramp_frame_new(rt);
+                        if (unlikely(!ytf)) { tramp_step_chain_free(ctx, stt); JS_ThrowOutOfMemory(ctx); goto exception; }
+                        memset(&ytf->sf, 0, sizeof(ytf->sf));
+                        ytf->b = NULL; ytf->local_buf = NULL; ytf->ctx = ctx;
+                        ytf->seq_req = NULL; ytf->seq_req_kind = CONT_NONE;
+                        ytf->up = tf_top;
+                        ytf->caller_sf = sf; ytf->caller_b = b; ytf->caller_ctx = ctx;
+                        ytf->caller_local_buf = local_buf; ytf->caller_stack_buf = stack_buf;
+                        ytf->caller_var_buf = var_buf; ytf->caller_arg_buf = arg_buf;
+                        ytf->caller_this = this_obj; ytf->caller_new_target = new_target;
+                        ytf->caller_var_refs = var_refs;
+                        ytf->caller_argc = argc; ytf->caller_argv = argv;
+                        ytf->caller_arg_allocated_size = arg_allocated_size;
+                        ytf->caller_sp = sp;
+                        ytf->call_first = 0; ytf->call_argc = 0; ytf->is_tail = 0;
+                        ytf->async_data = NULL; ytf->gen_data = NULL;
+                        ytf->gen_magic = 0; ytf->gen_tailcall = 0;
+                        ytf->forof_off = 0;
+                        ytf->async_promise = JS_UNDEFINED;
+                        ytf->close_saved_exc = JS_UNINITIALIZED;
+                        ytf->cont_state = stt; ytf->cont_kind = CONT_STEP_YIELD;
+                        tf_top = ytf;
+                        goto do_preempt;
+                    }
                 }
                 if (st == 17) {
                     /* DELEGATE: the machine hands the driver an inner machine (h->delegate) and stops being the
@@ -38415,6 +38495,11 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
            REFERENCE too or both frames release the same one. */
         if (ct->owns_func)
             ct->sf.cur_func = js_dup(ct->sf.cur_func);
+        DCHECK(otf->cont_kind != CONT_STEP_YIELD,
+               "clone_deep_flow: a concolic fork of a flow parked INSIDE a step machine — the sibling needs its "
+               "OWN machine state, and cloning one is not built. The struct copy below would duplicate the "
+               "cont_state POINTER and hand both flows the same state, which is the owns_func bug in a second "
+               "costume; crash here instead of sharing it.");
         DCHECK(otf->cont_kind != CONT_AGEN_DRIVE,
                "clone_deep_flow: a concolic fork inside an ASYNC GENERATOR body on the tramp — the sibling needs "
                "its OWN JSAsyncGeneratorData (cloned body frame, fresh queue and settlement capability), like the "
