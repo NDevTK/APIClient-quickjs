@@ -68524,6 +68524,7 @@ static const JSTrampStepDef js_iter_concat_def =
     { sizeof(JSIterConcat), js_iterator_concat_step, js_iterator_concat_fini, 0 };
 static int js_iterator_zip_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_iterator_zip_fini(JSContext *ctx, void *st, bool take_result);
+static void js_iterator_zip_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static int js_iter_zip_drive_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_iter_zip_drive_fini(JSContext *ctx, void *st, bool take_result);
 static int js_string_iterator_create_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
@@ -68544,7 +68545,7 @@ static const JSTrampStepDef js_str_towellformed_def =
 static const JSTrampStepDef js_str_iterator_def =
     { sizeof(JSStrIterCreate), js_string_iterator_create_step, js_string_iterator_create_fini, 0 };
 static const JSTrampStepDef js_iter_zip_def =
-    { sizeof(JSIterZip), js_iterator_zip_step, js_iterator_zip_fini, 0 };
+    { sizeof(JSIterZip), js_iterator_zip_step, js_iterator_zip_fini, 0, .visit = js_iterator_zip_visit };
 static int js_iterator_zip_keyed_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_iterator_zip_keyed_fini(JSContext *ctx, void *st, bool take_result);
 static const JSTrampStepDef js_iter_zip_keyed_def =
@@ -69630,6 +69631,26 @@ static int js_iterator_zip_step(JSContext *ctx, void *st, JSValue cb_result, JSV
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). Iterator.zip drives N input iterators and their `next`
+   methods, all the page's, so a fork lands mid-round and each arm zips its own remainder from its own inputs.
+   The CLOSES below are NOT here: IfAbruptCloseIterators is the algorithm unwinding on an abrupt completion,
+   not references being released, and a clone must copy the state without closing anything — the same split
+   JSON.stringify's cycle-stack pop has. */
+static void js_iterator_zip_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSIterZip *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->padding);
+    v->val(ctx, &s->held);
+    v->val(ctx, &s->elem);
+    v->val(ctx, &s->closing);
+    v->val(ctx, &s->input_iter); v->val(ctx, &s->input_next);
+    v->val(ctx, &s->pad_iter);   v->val(ctx, &s->pad_next);
+    v->array(ctx, (void **)&s->iters, sizeof(JSValue), (int)s->n, (int)s->n, js_step_visit_value_elem);
+    v->array(ctx, (void **)&s->nexts, sizeof(JSValue), (int)s->n, (int)s->n, js_step_visit_value_elem);
+    v->array(ctx, (void **)&s->pads,  sizeof(JSValue), (int)s->pad_n, (int)s->pad_n, js_step_visit_value_elem);
+}
+
 static JSValue js_iterator_zip_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSIterZip *s = st;
@@ -69637,29 +69658,21 @@ static JSValue js_iterator_zip_fini(JSContext *ctx, void *st, bool take_result)
     uint32_t i;
 
     if (!take_result) {
-        /* IfAbruptCloseIterators. Push order is the REVERSE of close order, because the drain pops: the padding
-           iterator and then inputIter go under the inputs, so the inputs close first and in reverse index order —
-           7.4.11 over « inputIter » ++ iters exactly. inputIter is owed a close only while step 12.c.i is running,
+        /* IfAbruptCloseIterators, THE UNWIND — run while every iterator is still held, before the declaration
+           releases them. Push order is the REVERSE of close order, because the drain pops: the padding iterator
+           and then inputIter go under the inputs, so the inputs close first and in reverse index order — 7.4.11
+           over « inputIter » ++ iters exactly. inputIter is owed a close only while step 12.c.i is running,
            which is what the stage says; an abrupt IteratorStepValue on it does not close it. */
-        JS_FreeValue(ctx, s->result);
         if (s->hdr.stage != ZS_PAD_STEP && JS_IsObject(s->pad_iter))
             iter_close_defer(ctx, s->pad_iter);
         if (s->hdr.stage == ZS_ELEM_ITER && JS_IsObject(s->input_iter))
             iter_close_defer(ctx, s->input_iter);
         for (i = 0; i < s->n; i++)
             iter_close_defer(ctx, s->iters[i]);
+    } else {
+        s->result = JS_UNDEFINED;
     }
-    JS_FreeValue(ctx, s->padding);
-    JS_FreeValue(ctx, s->held);
-    JS_FreeValue(ctx, s->elem);
-    JS_FreeValue(ctx, s->closing);
-    JS_FreeValue(ctx, s->input_iter); JS_FreeValue(ctx, s->input_next);
-    JS_FreeValue(ctx, s->pad_iter);   JS_FreeValue(ctx, s->pad_next);
-    for (i = 0; i < s->n; i++) { JS_FreeValue(ctx, s->iters[i]); JS_FreeValue(ctx, s->nexts[i]); }
-    js_free(ctx, s->iters);
-    js_free(ctx, s->nexts);
-    for (i = 0; i < s->pad_n; i++) JS_FreeValue(ctx, s->pads[i]);
-    js_free(ctx, s->pads);
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
