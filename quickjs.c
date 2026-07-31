@@ -21451,44 +21451,6 @@ typedef struct JSTASort {
 static int js_ta_sort_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_ta_sort_vfini(JSContext *ctx, void *st, bool take_result);
 
-/* JSON.parse(text, reviver): a SUSPENDABLE post-order tree walk. internalize_json_property recurses on the C
-   stack and calls the reviver deep in that recursion; this coroutine flattens the recursion into an explicit
-   DFS stack (JRFrame[]) so the reviver runs on the tramp chain and a reviver body loop preempts. Each frame is
-   one node: its holder/name, its value, its own-key list, the cursor into that list, its parse-record and the
-   JSON-source `context`. The ONE suspension point is reviver.call(holder, name, val, context). */
-struct JSPropertyEnum; struct JSONParseRecord;
-typedef struct JRFrame {
-    JSValue holder, val, context;   /* holder (borrowed from parent's val), val (owned), context (owned) */
-    JSValue name_val;               /* JS_AtomToValue(name), owned, held across the reviver call */
-    JSAtom name;                    /* the key of val in holder (owned) */
-    struct JSPropertyEnum *atoms;   /* own enumerable keys of val (object case) */
-    int64_t len, i;                 /* key count + cursor. int64 because LengthOfArrayLike is ToLength, so an
-                                       array-like `length` reaches 2^53-1 and js_get_length32 truncated it */
-    int is_array;
-    struct JSONParseRecord *fpr;    /* holder's parse record (borrowed); vpr = val's, resolved in phase 0 */
-    struct JSONParseRecord *vpr;
-    uint8_t phase;                  /* 0=needs init, 1=iterating children, 2=reviver called (awaiting result),
-                                       3=the enumerable-key walk is in flight (an OBJECT val only),
-                                       4=`Get(holder, P)` is in flight, 5=the child's apply is in flight,
-                                       6=LengthOfArrayLike is in flight */
-    struct JSEnumKeys *ek;          /* phase 3: EnumerableOwnPropertyNames' key half, resumable (owned) */
-    JSValue applied;                /* phase 5: the child's revived value, owned across the CreateDataProperty */
-    JSAtom apply_name;              /* phase 5: the child's key (owned) */
-    uint8_t apply_del;              /* phase 5: 1 = the child revived to undefined, so the apply is a [[Delete]] */
-} JRFrame;
-typedef struct JSJsonReviver {
-    JSStepHdr hdr;                  /* MUST be first — enforced by STEP_STATE_HDR_FIRST below */
-    uint8_t early;                  /* 1 = NO reviver: no JS re-entry, so result was produced in init */
-    JSValueConst reviver;           /* borrowed from the caller stack */
-    const char *text;               /* JSON source (owned CString; freed at end) */
-    JSValue root;                   /* {"" : parsed} holder (owned) */
-    struct JSONParseRecord *pr;     /* root parse record (owned; json_free_parse_record at end) */
-    JRFrame *stack; int sp, cap;
-    JSValue result;                 /* final revived value */
-    JSValue cb_args[5];             /* [holder(this), reviver, name_val, val, context]; call_argv=&cb_args[2], argc=3 */
-    JSValue *ek_cb; int ek_argc;    /* the key walk's request buffer, relayed to the driver unchanged */
-    JSValue text_str;               /* 25.5.1 step 1's ? ToString(text), held across the parse (owned) */
-} JSJsonReviver;
 /* String(x) / new String(x), 22.1.1.1. Its ToString(argv[0]) runs a user valueOf/toString/@@toPrimitive, which
    from a C body would be JS_CallFree with nowhere to suspend. As a step machine the coercion is a TOPRIMITIVE
    step; the wrapper creation that follows runs no user code. ONE machine serves both spellings — new_target
@@ -23064,9 +23026,6 @@ static JSValue js_lookup_acc_fini(JSContext *ctx, void *st, bool take_result);
 static JSValue js_for_in_fini(JSContext *ctx, void *st, bool take_result);
 static int js_json_parse_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_json_parse_vfini(JSContext *ctx, void *st, bool take_result);
-static int js_json_reviver_init(JSContext *ctx, struct JSJsonReviver *s, JSValueConst text_arg, JSValueConst reviver);
-static int js_json_reviver_step(JSContext *ctx, struct JSJsonReviver *s, JSValue res, JSValueConst out_args[3]);
-static JSValue js_json_reviver_end(JSContext *ctx, struct JSJsonReviver *s, bool ok);
 /* js_call_function — the builtins' monkey-patch-proof Function.prototype.call (Iterator.zip/zipKeyed use it to invoke
    an input iterator's .next). It holds NO continuation, so like f.call it is RESOLVED at the operator site and the
    ultimate target dispatched on this chain; JS_Call'ing it from C would drive a generator .next off the tramp. */
@@ -40304,6 +40263,111 @@ typedef struct JSParseState {
     bool is_module; /* parsing a module */
     bool allow_html_comments;
 } JSParseState;
+
+/* ---- JSON.parse's data types. They sit HERE, below JSParseState, because the step machine at the end of
+   this block embeds a JSParseState and a JSONParse BY VALUE: a JSON.parse that parks mid-parse owns its
+   tokenizer and its frame stack, and by-value is the only arrangement with no second allocation to lose. */
+typedef struct {
+    int count;
+    uint32_t hash_size;
+    struct JSONParseRecordEntry *entries;
+    uint32_t *hash_table;
+} JSONParseRecordObject;
+
+typedef struct JSONParseRecord {
+    JSValue value;
+    union {
+        JSONParseRecordObject obj;
+        struct {
+            int count;
+            struct JSONParseRecord *elements;
+        } array;
+        struct {
+            uint32_t source_pos;
+            uint32_t source_len;
+        } primitive;
+    } u;
+} JSONParseRecord;
+
+typedef struct JSONParseRecordEntry {
+    JSAtom atom;
+    uint32_t hash_next;
+    JSONParseRecord parse_record;
+} JSONParseRecordEntry;
+
+/* JSON's value grammar, as an explicit FRAME STACK. It was C recursion one frame per nesting level with the
+   depth chosen by the input — `JSON.parse("[".repeat(1e6) + ...)` — and the js_check_stack_overflow standing in
+   front of it turned that into a RangeError, which is a BOUND in an error's clothes: the grammar has an answer
+   at every depth and the parser refused to give it. Nothing here is a state machine for suspension's sake; the
+   descent simply IS a stack, so it is written as one. Found by engine/check_recursion.mjs. */
+typedef struct JSONFrame {
+    JSValue container;      /* the object or array being built (owned) */
+    JSONParseRecord *pr;    /* its parse record, or NULL when there is no reviver */
+    int pr_size;            /* json_parse_record_add / js_resize_array's capacity cursor */
+    uint32_t idx;           /* ARRAY: the next element index */
+    JSAtom prop_name;       /* OBJECT: the key whose value is being parsed (owned), else JS_ATOM_NULL */
+    uint8_t is_array;
+} JSONFrame;
+
+/* THE PARSE'S WHOLE STATE, owned by the CALLER. Flattening the recursion took the parse off the C STACK; this
+   takes it out of json_parse_value's LOCALS, and together they are what let the scheduler park a parse mid-way:
+   it can only suspend a loop whose state it owns. `resume` is where a re-entry continues — an exact position,
+   not a re-parse. */
+typedef struct JSONParse {
+    JSONFrame *st;           /* the frame stack (owned) */
+    int sp, st_size;
+    JSValue val;             /* the value most recently completed, flowing into the frame below (owned) */
+    JSONParseRecord *pr_cur; /* the record for the value about to be parsed (borrowed from the tree) */
+    JSONParseRecord *pr_root;/* the caller's record, which owns the whole tree on the failure path */
+    uint8_t resume;
+} JSONParse;
+enum { JPR_START = 0, JPR_VALUE, JPR_DONE_VALUE, JPR_ARRAY_ELEMENT, JPR_OBJECT_KEY };
+
+/* JSON.parse(text, reviver): a SUSPENDABLE post-order tree walk. internalize_json_property recurses on the C
+   stack and calls the reviver deep in that recursion; this coroutine flattens the recursion into an explicit
+   DFS stack (JRFrame[]) so the reviver runs on the tramp chain and a reviver body loop preempts. Each frame is
+   one node: its holder/name, its value, its own-key list, the cursor into that list, its parse-record and the
+   JSON-source `context`. The ONE suspension point is reviver.call(holder, name, val, context). */
+struct JSPropertyEnum;
+typedef struct JRFrame {
+    JSValue holder, val, context;   /* holder (borrowed from parent's val), val (owned), context (owned) */
+    JSValue name_val;               /* JS_AtomToValue(name), owned, held across the reviver call */
+    JSAtom name;                    /* the key of val in holder (owned) */
+    struct JSPropertyEnum *atoms;   /* own enumerable keys of val (object case) */
+    int64_t len, i;                 /* key count + cursor. int64 because LengthOfArrayLike is ToLength, so an
+                                       array-like `length` reaches 2^53-1 and js_get_length32 truncated it */
+    int is_array;
+    struct JSONParseRecord *fpr;    /* holder's parse record (borrowed); vpr = val's, resolved in phase 0 */
+    struct JSONParseRecord *vpr;
+    uint8_t phase;                  /* 0=needs init, 1=iterating children, 2=reviver called (awaiting result),
+                                       3=the enumerable-key walk is in flight (an OBJECT val only),
+                                       4=`Get(holder, P)` is in flight, 5=the child's apply is in flight,
+                                       6=LengthOfArrayLike is in flight */
+    struct JSEnumKeys *ek;          /* phase 3: EnumerableOwnPropertyNames' key half, resumable (owned) */
+    JSValue applied;                /* phase 5: the child's revived value, owned across the CreateDataProperty */
+    JSAtom apply_name;              /* phase 5: the child's key (owned) */
+    uint8_t apply_del;              /* phase 5: 1 = the child revived to undefined, so the apply is a [[Delete]] */
+} JRFrame;
+typedef struct JSJsonReviver {
+    JSStepHdr hdr;                  /* MUST be first — enforced by STEP_STATE_HDR_FIRST below */
+    uint8_t early;                  /* 1 = NO reviver: no JS re-entry, so result was produced in init */
+    JSValueConst reviver;           /* borrowed from the caller stack */
+    const char *text;               /* JSON source (owned CString; freed at end) */
+    JSValue root;                   /* {"" : parsed} holder (owned) */
+    JSONParseRecord *pr;            /* root parse record (owned; json_free_parse_record at end) */
+    /* THE PARSE ITSELF, by value. `JSON.parse` on a megabyte of nesting is real work, and it is the machine's
+       work: jps holds the tokenizer's position in `text`, jp holds the frame stack and the resume point. While
+       `parsing` is 1 the pair is LIVE and owed a teardown, which is what lets JP_PARSE hand a 22 (YIELD) back
+       to the scheduler at every completed value and be re-entered at that exact character. */
+    JSParseState jps;
+    JSONParse jp;
+    uint8_t parsing;                /* 1 = jps/jp are live: the flow may be parked mid-parse */
+    JRFrame *stack; int sp, cap;
+    JSValue result;                 /* final revived value */
+    JSValue cb_args[5];             /* [holder(this), reviver, name_val, val, context]; call_argv=&cb_args[2], argc=3 */
+    JSValue *ek_cb; int ek_argc;    /* the key walk's request buffer, relayed to the driver unchanged */
+    JSValue text_str;               /* 25.5.1 step 1's ? ToString(text), held across the parse (owned) */
+} JSJsonReviver;
 
 typedef struct JSOpCode {
 #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_*
@@ -77702,33 +77766,6 @@ int JS_AddIntrinsicRegExp(JSContext *ctx)
 
 /* JSON */
 
-typedef struct {
-    int count;
-    uint32_t hash_size;
-    struct JSONParseRecordEntry *entries;
-    uint32_t *hash_table;
-} JSONParseRecordObject;
-
-typedef struct JSONParseRecord {
-    JSValue value;
-    union {
-        JSONParseRecordObject obj;
-        struct {
-            int count;
-            struct JSONParseRecord *elements;
-        } array;
-        struct {
-            uint32_t source_pos;
-            uint32_t source_len;
-        } primitive;
-    } u;
-} JSONParseRecord;
-
-typedef struct JSONParseRecordEntry {
-    JSAtom atom;
-    uint32_t hash_next;
-    JSONParseRecord parse_record;
-} JSONParseRecordEntry;
 
 static void json_parse_record_init_obj(JSContext *ctx, JSONParseRecord *pr, JSValueConst val)
 {
@@ -77906,30 +77943,35 @@ static void json_free_parse_record(JSContext *ctx, JSONParseRecord *pr)
 }
 
 /* 'pr' can be NULL */
-/* JSON's value grammar, as an explicit FRAME STACK. It was C recursion one frame per nesting level with the
-   depth chosen by the input — `JSON.parse("[".repeat(1e6) + ...)` — and the js_check_stack_overflow standing in
-   front of it turned that into a RangeError, which is a BOUND in an error's clothes: the grammar has an answer
-   at every depth and the parser refused to give it. Nothing here is a state machine for suspension's sake; the
-   descent simply IS a stack, so it is written as one. Found by engine/check_recursion.mjs. */
-typedef struct JSONFrame {
-    JSValue container;      /* the object or array being built (owned) */
-    JSONParseRecord *pr;    /* its parse record, or NULL when there is no reviver */
-    int pr_size;            /* json_parse_record_add / js_resize_array's capacity cursor */
-    uint32_t idx;           /* ARRAY: the next element index */
-    JSAtom prop_name;       /* OBJECT: the key whose value is being parsed (owned), else JS_ATOM_NULL */
-    uint8_t is_array;
-} JSONFrame;
 
-static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
+/* ONE STEP of the parse. 0 = done (p->val is the result), 1 = MORE (the scheduler asked for the flow; call
+   again to continue at the exact point), -1 = threw. */
+static int json_parse_step(JSParseState *s, JSONParse *p)
 {
     JSContext *ctx = s->ctx;
-    JSValue val = JS_NULL;
-    JSONFrame *st = NULL;
-    int sp = 0, st_size = 0;
-    JSONParseRecord *pr_cur = pr;   /* the record for the value about to be parsed */
+    /* LOADED into locals and STORED back at each of the three exits. The state is the caller's — that is what
+       makes the parse parkable — but the hot loop should not read through a pointer on every token, and naming
+       them as locals also keeps `val` from colliding with s->token.val. */
+    JSONFrame *st;
+    int sp, st_size;
+    JSValue val;
+    JSONParseRecord *pr_cur, *pr = p->pr_root;
     JSONFrame *top;
     JSONParseRecord *pr1;
     int ret;
+
+    if (p->resume == JPR_START) {
+        st = NULL; sp = 0; st_size = 0; val = JS_NULL; pr_cur = pr;
+    } else {
+        st = p->st; sp = p->sp; st_size = p->st_size; val = p->val; pr_cur = p->pr_cur;
+    }
+#define JSON_SAVE() do { p->st = st; p->sp = sp; p->st_size = st_size; p->val = val; p->pr_cur = pr_cur; } while (0)
+    switch (p->resume) {
+    case JPR_DONE_VALUE:   goto value_done_resumed;
+    case JPR_ARRAY_ELEMENT:goto array_element;
+    case JPR_OBJECT_KEY:   goto object_key;
+    default:               break;   /* JPR_START / JPR_VALUE fall into parse_value below */
+    }
 
 #define JSON_PUSH_FRAME(container_, is_array_)                                          \
     do {                                                                                \
@@ -78025,9 +78067,24 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
     /* fall through: a completed value belongs to the frame below it, if there is one */
 
  value_done:
+    /* THE BACK-EDGE, once per completed value. Asking here rather than per token keeps the check off the
+       character loop while still bounding how long a parse can hold the flow: a value is the unit of progress. */
+    if (unlikely(g_flow_control.preempt != NULL) && g_flow_control.preempt()) {
+        p->resume = JPR_DONE_VALUE;
+        JSON_SAVE();
+        return 1;
+    }
+ value_done_resumed:
+    /* the RESUME lands BELOW the check. Landing on it re-asked the scheduler the instant the flow came back,
+       and with a preempt hook that keeps saying yes the parse yielded forever without consuming a token — a
+       live-lock, not a slow parse. A back-edge check belongs before the work of an iteration, and a resume
+       belongs after it. */
     if (sp == 0) {
         js_free(ctx, st);
-        return val;
+        st = NULL;
+        p->resume = JPR_START;
+        JSON_SAVE();
+        return 0;
     }
     top = &st[sp - 1];
     if (top->is_array) {
@@ -78046,6 +78103,7 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
         }
         if (json_next_token(s))
             goto fail;
+        p->resume = JPR_ARRAY_ELEMENT;
         goto array_element;
     }
     ret = JS_DefinePropertyValue(ctx, top->container, top->prop_name, val, JS_PROP_C_W_E);
@@ -78065,6 +78123,7 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
     }
     if (json_next_token(s))
         goto fail;
+    p->resume = JPR_OBJECT_KEY;
     goto object_key;
 
  array_element:
@@ -78080,6 +78139,7 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
         pr1 = NULL;
     }
     pr_cur = pr1;
+    p->resume = JPR_VALUE;
     goto parse_value;
 
  object_key:
@@ -78107,6 +78167,7 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
         pr1 = NULL;
     }
     pr_cur = pr1;
+    p->resume = JPR_VALUE;
     goto parse_value;
 
  container_done:
@@ -78129,22 +78190,39 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
         JS_FreeAtom(ctx, top->prop_name);
     }
     js_free(ctx, st);
-    return JS_EXCEPTION;
+    st = NULL;
+    val = JS_NULL;
+    p->resume = JPR_START;
+    JSON_SAVE();
+    return -1;
 #undef JSON_PUSH_FRAME
+#undef JSON_SAVE
 }
 
+/* The C-API driver. JS_ParseJSON is an embedder entry with no flow to park into, so it runs the step to
+   completion — the same one implementation the JS-visible JSON.parse drives, differing only in that the other
+   one can hand a MORE back to the scheduler. That is the split the async generator already documents between
+   its tramp entry and its resume-as-flow driver; there is no second parser. */
 static JSValue JS_ParseJSON_internal(JSContext *ctx, const char *buf, size_t buf_len,
                                      const char *filename, JSONParseRecord *pr)
 {
     JSParseState s1, *s = &s1;
+    JSONParse p1, *p = &p1;
     JSValue val = JS_UNDEFINED;
+    int r;
 
     js_parse_init(ctx, s, buf, buf_len, filename, 1);
+    p->resume = JPR_START;
+    p->pr_root = pr;
     if (json_next_token(s))
         goto fail;
-    val = json_parse_value(s, pr);
-    if (JS_IsException(val))
+    do {
+        r = json_parse_step(s, p);
+    } while (r > 0);
+    if (r < 0)
         goto fail;
+    val = p->val;
+    p->val = JS_NULL;
     if (s->token.val != TOK_EOF) {
         if (js_parse_error(s, "unexpected data at the end")) {
             json_free_parse_record(ctx, pr);
@@ -78202,29 +78280,102 @@ static JSONParseRecord *jr_child_pr(JSContext *ctx, JSONParseRecord *holder_pr, 
     return pr;
 }
 /* JSON.parse as a STEP builtin. The reviver walk is js_json_reviver_step; the NO-reviver case has no JS re-entry
-   at all, so init parses and reports DONE immediately. internalize_json_property — the recursive C walker that
-   called the reviver through JS_Call — is deleted, so there is one walk, not two. */
-static int js_json_parse_prologue(JSContext *ctx, JSJsonReviver *s)
-{
-    JSValueConst text = s->text_str;   /* step 1's ToString has already run, as a request */
-    JSValueConst reviver = step_arg(&s->hdr, 1);
+   at all, but it still PARSES, and a parse is unbounded work — so both cases run through JP_PARSE and both can
+   park. internalize_json_property — the recursive C walker that called the reviver through JS_Call — is
+   deleted, so there is one walk, not two.
 
-    if (!JS_IsFunction(ctx, reviver)) {
-        const char *str; size_t len;
-        s->early = 1;   /* no reviver: no JS re-entry at all, so the whole parse happens right here */
-        str = JS_ToCStringLen(ctx, &len, text);
-        if (!str) return -1;
-        s->result = JS_ParseJSON_internal(ctx, str, len, "<input>", NULL);
-        JS_FreeCString(ctx, str);
-        if (JS_IsException(s->result)) { s->result = JS_UNDEFINED; return -1; }
-        return 0;
+   25.5.1 steps 2-3: START the parse. The tokenizer (jps) and the frame stack (jp) live ON THE MACHINE from here
+   until js_json_parse_finish or js_json_parse_abandon, which is the whole point: every completed value in
+   between is a place the flow can park with its position in the text intact. */
+static int js_json_parse_begin(JSContext *ctx, JSJsonReviver *s)
+{
+    JSValueConst reviver = step_arg(&s->hdr, 1);
+    JSONParseRecord *pr1 = NULL;
+    size_t len;
+    int size = 0, i;
+
+    /* text_str is ALREADY step 1's string, so nothing here can run user code or fail on a coercion. */
+    DCHECK(JS_IsString(s->text_str), "the JSON parse was handed a text that step 1's ToString had not produced");
+    s->text = JS_ToCStringLen(ctx, &len, s->text_str);
+    if (!s->text)
+        return -1;
+    if (JS_IsFunction(ctx, reviver)) {
+        s->reviver = reviver;
+        for (i = 0; i < 5; i++) s->cb_args[i] = JS_UNDEFINED;
+        s->pr = js_mallocz(ctx, sizeof(JSONParseRecord));
+        if (!s->pr) return -1;
+        s->root = JS_NewObject(ctx);
+        if (JS_IsException(s->root)) return -1;
+        json_parse_record_init_obj(ctx, s->pr, s->root);
+        pr1 = json_parse_record_add(ctx, s->pr, JS_ATOM_empty_string, &size);
+        if (!pr1) return -1;
+    } else {
+        s->early = 1;   /* no reviver: once the parse is done there is no JS re-entry at all */
     }
-    return js_json_reviver_init(ctx, s, text, reviver);
+    js_parse_init(ctx, &s->jps, s->text, len, "<input>", 1);
+    s->jp.resume = JPR_START;
+    s->jp.pr_root = pr1;
+    s->parsing = 1;
+    if (json_next_token(&s->jps))
+        return -1;
+    return 0;
 }
 
-/* stage 0 is the PROLOGUE, JP_TOSTRING is the coercion it waits on, JP_WALK the reviver walk. A resumption must
-   never land on 0, whose first act is to free cb_result — see the base64 machine, where it did. */
-enum { JP_TOSTRING = 1, JP_WALK };
+/* The parse reported DONE: take its value, enforce the EOF, and seed the reviver walk from it. */
+static int js_json_parse_finish(JSContext *ctx, JSJsonReviver *s)
+{
+    JSValue val = s->jp.val;
+    s->jp.val = JS_NULL;
+    s->parsing = 0;
+    if (s->jps.token.val != TOK_EOF) {
+        js_parse_error(&s->jps, "unexpected data at the end");
+        /* the record's own value goes to UNDEFINED, which is what keeps the reviver's root record from
+           releasing this subtree a second time. */
+        json_free_parse_record(ctx, s->jp.pr_root);
+        JS_FreeValue(ctx, val);
+        free_token(&s->jps, &s->jps.token);
+        return -1;
+    }
+    if (s->early) {
+        s->result = val;
+        return 0;
+    }
+    if (JS_DefinePropertyValue(ctx, s->root, JS_ATOM_empty_string, val, JS_PROP_C_W_E) < 0)
+        return -1;
+    if (jr_push(ctx, s) < 0)                            /* the root frame: holder={""}, name="", record=pr */
+        return -1;
+    s->stack[0].holder = s->root;
+    s->stack[0].name = JS_DupAtom(ctx, JS_ATOM_empty_string);
+    s->stack[0].fpr = s->pr;
+    return 0;
+}
+
+/* The machine is torn down with a parse still in flight — the flow parked at a completed value and was then
+   discarded. This is the same release json_parse_step's own fail path performs, MINUS the parse records: those
+   hang off the reviver's root record, which js_json_reviver_end owns. Nothing here can fail. */
+static void js_json_parse_abandon(JSContext *ctx, JSJsonReviver *s)
+{
+    JSONParse *p = &s->jp;
+    JS_FreeValue(ctx, p->val);
+    p->val = JS_NULL;
+    while (p->sp > 0) {
+        JSONFrame *top = &p->st[--p->sp];
+        JS_FreeValue(ctx, top->container);
+        JS_FreeAtom(ctx, top->prop_name);
+    }
+    js_free(ctx, p->st);
+    p->st = NULL;
+    free_token(&s->jps, &s->jps.token);
+    s->parsing = 0;
+}
+
+/* stage 0 is the PROLOGUE, JP_TOSTRING the coercion it waits on, JP_PARSE the parse itself (the stage that
+   yields), JP_WALK the reviver walk. A resumption must never land on 0, whose first act is to free cb_result —
+   see the base64 machine, where it did. */
+enum { JP_TOSTRING = 1, JP_PARSE, JP_WALK };
+
+static int js_json_reviver_step(JSContext *ctx, JSJsonReviver *s, JSValue res, JSValueConst out_args[3]);
+static JSValue js_json_reviver_end(JSContext *ctx, JSJsonReviver *s, bool ok);
 
 static int js_json_parse_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
@@ -78236,6 +78387,7 @@ static int js_json_parse_vstep(JSContext *ctx, void *st, JSValue cb_result, JSVa
         cb_result = JS_UNDEFINED;
         s->root = JS_UNDEFINED; s->result = JS_UNDEFINED; s->text_str = JS_UNDEFINED;
         s->early = 0; s->text = NULL; s->pr = NULL; s->stack = NULL; s->sp = 0; s->cap = 0;
+        s->parsing = 0;
     }
     if (s->hdr.stage == JP_TOSTRING) {
         /* 25.5.1 step 1: `? ToString(text)`. JS_ToCStringLen ran it from C, so `JSON.parse({toString(){…}})` had
@@ -78243,11 +78395,30 @@ static int js_json_parse_vstep(JSContext *ctx, void *st, JSValue cb_result, JSVa
         r = step_tostring_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->text_str, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r;
-        s->hdr.stage = JP_WALK;
-        if (js_json_parse_prologue(ctx, s))
+        s->hdr.stage = JP_PARSE;
+        if (js_json_parse_begin(ctx, s))
             return -1;
     }
-    if (s->early) { JS_FreeValue(ctx, cb_result); return 0; }
+    if (s->hdr.stage == JP_PARSE) {
+        /* THE PARSE, one completed value per entry. A YIELD returns with the stage still JP_PARSE, so the
+           resume falls straight back in here and json_parse_step continues at the exact character it stopped
+           on — the tokenizer's position and the frame stack are fields of this machine, not C locals. */
+        JS_FreeValue(ctx, cb_result);
+        cb_result = JS_UNDEFINED;
+        r = json_parse_step(&s->jps, &s->jp);
+        if (r > 0)
+            return 22;
+        if (r < 0) {
+            s->parsing = 0;
+            free_token(&s->jps, &s->jps.token);
+            return -1;
+        }
+        if (js_json_parse_finish(ctx, s))
+            return -1;
+        s->hdr.stage = JP_WALK;
+        if (s->early)
+            return 0;
+    }
     r = js_json_reviver_step(ctx, s, cb_result, (JSValueConst *)&s->cb_args[2]);
     if (r < 0) return -1;
     if (r == 0) return 0;
@@ -78279,9 +78450,12 @@ static JSValue js_json_parse_vfini(JSContext *ctx, void *st, bool take_result)
 {
     JSJsonReviver *s = st;
     JSValue r;
+    if (s->parsing)
+        js_json_parse_abandon(ctx, s);
     JS_FreeValue(ctx, s->text_str);
     s->text_str = JS_UNDEFINED;
     if (s->early) {
+        if (s->text) { JS_FreeCString(ctx, s->text); s->text = NULL; }
         r = take_result ? s->result : JS_UNDEFINED;
         if (!take_result) JS_FreeValue(ctx, s->result);
         js_free(ctx, s);
@@ -78293,29 +78467,6 @@ static JSValue js_json_parse_vfini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
-static int js_json_reviver_init(JSContext *ctx, JSJsonReviver *s, JSValueConst text_arg, JSValueConst reviver) {
-    size_t len; JSValue parsed; JSONParseRecord *pr1; int size = 0;
-    s->reviver = reviver;
-    for (int i = 0; i < 5; i++) s->cb_args[i] = JS_UNDEFINED;
-    /* text_arg is ALREADY the step-1 string, so this cannot run user code and cannot fail on a coercion. */
-    DCHECK(JS_IsString(text_arg), "the reviver walk was handed a text that step 1's ToString had not produced");
-    s->text = JS_ToCStringLen(ctx, &len, text_arg);
-    if (!s->text) return -1;
-    s->pr = js_mallocz(ctx, sizeof(JSONParseRecord));
-    if (!s->pr) return -1;
-    s->root = JS_NewObject(ctx);
-    if (JS_IsException(s->root)) return -1;
-    json_parse_record_init_obj(ctx, s->pr, s->root);
-    pr1 = json_parse_record_add(ctx, s->pr, JS_ATOM_empty_string, &size);
-    if (!pr1) return -1;
-    parsed = JS_ParseJSON_internal(ctx, s->text, len, "<input>", pr1);
-    if (JS_IsException(parsed)) return -1;
-    if (JS_DefinePropertyValue(ctx, s->root, JS_ATOM_empty_string, parsed, JS_PROP_C_W_E) < 0) return -1;
-    if (jr_push(ctx, s) < 0) return -1;                 /* the root frame: holder={""}, name="", holder-record=pr */
-    s->stack[0].holder = s->root; s->stack[0].name = JS_DupAtom(ctx, JS_ATOM_empty_string);
-    s->stack[0].fpr = s->pr;
-    return 0;
-}
 /* Drive the DFS until the next reviver call is needed (return 1, out_args=[name,val,context]) or done (0).
    `res` (owned) is the reviver's result for the just-completed node, or JS_UNDEFINED on the first call. */
 static int js_json_reviver_step(JSContext *ctx, JSJsonReviver *s, JSValue res, JSValueConst out_args[3]) {
