@@ -455,6 +455,14 @@ typedef struct JSStackFrame {
     uint16_t arg_count;
     bool is_strict_mode;
     bool is_constructor; /* true if invoked as a constructor (new) */
+    /* THIS FRAME IS A FLOW'S CALL ROOT, not an activation of anything. A promise reaction's flow base
+       (reaction_call_flow_init) holds the handler in cur_func because the handler is what it is about to call —
+       but the handler's own activation is a SEPARATE frame pushed on top, so the root is a second frame naming
+       the same function, executing no bytecode and holding no program counter. A stack trace that reports it
+       prints the handler twice, the second time with no position at all: upstream's walk rendered that as
+       "(missing)" behind a FIXME, and the walk that feeds Error.prepareStackTrace subtracted from a null
+       pointer and read a line number out of the result. It is not an activation, so it is not a frame. */
+    bool is_call_root;
     /* only used in generators. Current stack pointer value. NULL if
        the function is running. */
     JSValue *cur_sp;
@@ -1399,7 +1407,7 @@ static __exception int JS_ToArrayLengthFree(JSContext *ctx, uint32_t *plen,
 static JSValue JS_EvalObject(JSContext *ctx, JSValueConst this_obj,
                              JSValueConst val, int flags, int scope_idx);
 static JSValue js_new_suppressed_error(JSContext *ctx, JSValueConst error,
-                                       JSValueConst suppressed);
+                                       JSValueConst suppressed, int backtrace_flags);
 static __maybe_unused void JS_DumpString(JSRuntime *rt, JSString *p);
 static __maybe_unused void JS_DumpObjectHeader(JSRuntime *rt);
 static __maybe_unused void JS_DumpObject(JSRuntime *rt, JSObject *p);
@@ -7020,6 +7028,7 @@ static JSValue js_call_c_function_data(JSContext *ctx, JSValueConst func_obj,
     ctx = s->realm;   /* change the current realm, exactly as js_call_c_function does */
     sf->is_strict_mode = false;
     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
+    sf->is_call_root = false;
     sf->cur_func = unsafe_unconst(func_obj);
     sf->arg_count = argc;
     ret = s->func(ctx, this_val, argc, arg_buf, s->magic, vc(s->data));
@@ -7160,6 +7169,7 @@ static JSValue js_call_c_closure(JSContext *ctx, JSValueConst func_obj,
     ctx = s->realm;   /* change the current realm, exactly as js_call_c_function does */
     sf->is_strict_mode = false;
     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
+    sf->is_call_root = false;
     sf->cur_func = unsafe_unconst(func_obj);
     sf->arg_count = argc;
     ret = s->func(ctx, this_val, argc, arg_buf, s->magic, s->opaque);
@@ -8381,11 +8391,93 @@ JSValue JS_Throw(JSContext *ctx, JSValue obj)
 }
 
 /* return the pending exception (cannot be called twice). */
+static bool js_error_stack_is_pending(JSValueConst v);
+
+/* ONE LINE OF THE DEFAULT STACK FORMATTING. There were two renderings of a captured frame — this one, and the
+   DynBuf the backtrace walk printed as it went — and having the second inside the walk is what made the default
+   formatting unreachable from anywhere else. It has to be reachable from the `.stack` accessor: a read that
+   happens INSIDE a prepareStackTrace call gets the default, and the accessor has only the CallSite objects.
+   A record with no function at all is the synthetic frame a parse error carries, and it renders as the bare
+   `at file:line:col` it always did — the parenthesised form names a function, and there is none. */
+static void js_callsite_data_line(JSContext *ctx, DynBuf *dbuf, const JSCallSiteData *csd)
+{
+    const char *s;
+
+    if (JS_IsNull(csd->func) && JS_IsNull(csd->func_name)) {
+        s = JS_IsNull(csd->filename) ? NULL : JS_ToCString(ctx, csd->filename);
+        dbuf_printf(dbuf, "    at %s", s ? s : "<null>");
+        JS_FreeCString(ctx, s);
+        if (csd->line_num != -1)
+            dbuf_printf(dbuf, ":%d:%d", csd->line_num, csd->col_num);
+        dbuf_putc(dbuf, '\n');
+        return;
+    }
+    s = JS_IsNull(csd->func_name) ? NULL : JS_ToCString(ctx, csd->func_name);
+    dbuf_printf(dbuf, "    at %s", (s && s[0]) ? s : "<anonymous>");
+    JS_FreeCString(ctx, s);
+    if (csd->native) {
+        dbuf_printf(dbuf, " (native)");
+    } else {
+        s = JS_IsNull(csd->filename) ? NULL : JS_ToCString(ctx, csd->filename);
+        dbuf_printf(dbuf, " (%s", s ? s : "<null>");
+        JS_FreeCString(ctx, s);
+        if (csd->line_num != -1)
+            dbuf_printf(dbuf, ":%d:%d", csd->line_num, csd->col_num);
+        dbuf_putc(dbuf, ')');
+    }
+    dbuf_putc(dbuf, '\n');
+}
+
+/* The default `.stack` text for a captured trace. JS_NULL on allocation failure, which is what the slot has
+   always held for a trace that could not be rendered. */
+static JSValue js_callsite_data_render(JSContext *ctx, const JSCallSiteData *csd, uint32_t n)
+{
+    DynBuf dbuf;
+    JSValue r;
+    uint32_t k;
+
+    js_dbuf_init(ctx, &dbuf);
+    for (k = 0; k < n; k++)
+        js_callsite_data_line(ctx, &dbuf, &csd[k]);
+    r = dbuf_error(&dbuf) ? JS_NULL : JS_NewStringLen(ctx, (char *)dbuf.buf, dbuf.size);
+    dbuf_free(&dbuf);
+    return r;
+}
+
+/* The same text, from the CallSite OBJECTS a pending trace holds. The accessor renders from these because by
+   then the records belong to the objects; the rendering is the one above, not a second copy. */
+static JSValue js_callsite_array_render(JSContext *ctx, JSValueConst arr)
+{
+    DynBuf dbuf;
+    JSValue r;
+    uint32_t k, n;
+
+    if (js_get_length32(ctx, &n, arr))
+        return JS_EXCEPTION;
+    js_dbuf_init(ctx, &dbuf);
+    for (k = 0; k < n; k++) {
+        JSValue v = JS_GetPropertyUint32(ctx, arr, k);
+        JSCallSiteData *csd;
+        if (JS_IsException(v)) { dbuf_free(&dbuf); return JS_EXCEPTION; }
+        csd = JS_GetOpaque(v, JS_CLASS_CALL_SITE);
+        DCHECK(csd != NULL, "a pending stack trace held something that is not a CallSite — only "
+               "build_backtrace fills that array, and it fills it with CallSites");
+        if (csd)
+            js_callsite_data_line(ctx, &dbuf, csd);
+        JS_FreeValue(ctx, v);
+    }
+    r = dbuf_error(&dbuf) ? JS_NULL : JS_NewStringLen(ctx, (char *)dbuf.buf, dbuf.size);
+    dbuf_free(&dbuf);
+    return r;
+}
+
 /* The recorded stack of an Error, WITHOUT running any of the page's code — for a host printing a diagnostic.
    Reading the `stack` PROPERTY invokes the accessor, and that accessor may have to call Error.prepareStackTrace,
    which is the page's function: a host diagnostic must no more run page code than safeFetch's chokepoint may be
-   bypassed. When the trace is still the pending [prepare, callsites] pair the honest answer is UNDEFINED — the
-   engine has no rendering of its own to give, and inventing one would be a second formatter. */
+   bypassed. When the trace is still the pending [prepare, callsites] pair the answer is the DEFAULT rendering —
+   the same one the accessor gives a read that happens inside the hook. It used to be UNDEFINED, on the grounds
+   that the engine had no rendering of its own and inventing one would be a second formatter; there is one
+   formatter now, so the diagnostic gets the real frames without running a line of the page's code. */
 JSValue JS_GetErrorStackString(JSContext *ctx, JSValueConst error)
 {
     JSObject *p;
@@ -8394,6 +8486,14 @@ JSValue JS_GetErrorStackString(JSContext *ctx, JSValueConst error)
     p = JS_VALUE_GET_OBJ(error);
     if (p->class_id != JS_CLASS_ERROR)
         return JS_GetPropertyStr(ctx, error, "stack");   /* a DOMException & co. keep an own DATA property */
+    if (js_error_stack_is_pending(p->u.object_data)) {
+        JSValue sites = JS_GetPropertyUint32(ctx, p->u.object_data, 1), r;
+        if (JS_IsException(sites))
+            return JS_UNDEFINED;
+        r = js_callsite_array_render(ctx, sites);
+        JS_FreeValue(ctx, sites);
+        return JS_IsException(r) ? JS_UNDEFINED : r;
+    }
     if (!JS_IsString(p->u.object_data))
         return JS_UNDEFINED;
     return js_dup(p->u.object_data);
@@ -8584,9 +8684,6 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
 {
     JSStackFrame *sf, *sf_start;
     JSValue stack, prepare, saved_exception, error_obj;
-    DynBuf dbuf;
-    const char *func_name_str;
-    const char *str1;
     JSObject *p;
     JSFunctionBytecode *b;
     bool backtrace_barrier, has_prepare, has_filter_func;
@@ -8601,6 +8698,7 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
         return;
     rt->in_build_stack_trace = true;
     error_obj = js_dup(error_val);
+    prepare = JS_UNDEFINED;   /* read only when there IS an %Error%; the release below is unconditional */
 
     // Save exception because conversion to double may fail.
     saved_exception = JS_GetException(ctx);
@@ -8631,24 +8729,17 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
         has_prepare = JS_IsFunction(ctx, prepare);
     }
 
-    if (has_prepare) {
-        saved_exception = JS_GetException(ctx);
-        if (stack_trace_limit == 0)
-            goto done;
-        if (filename)
-            js_new_callsite_data2(ctx, &csd[i++], filename, line_num, col_num);
-    } else {
-        js_dbuf_init(ctx, &dbuf);
-        if (stack_trace_limit == 0)
-            goto done;
-        if (filename) {
-            i++;
-            dbuf_printf(&dbuf, "    at %s", filename);
-            if (line_num != -1)
-                dbuf_printf(&dbuf, ":%d:%d", line_num, col_num);
-            dbuf_putc(&dbuf, '\n');
-        }
-    }
+    /* ONE capture, whether or not a hook is installed. The two used to be different walks — one filling
+       JSCallSiteData records for Error.prepareStackTrace, one printing straight into a DynBuf — and the second
+       walk is what made the DEFAULT formatting unreachable from anywhere but here. It has to be reachable: V8
+       returns the default formatting for a `.stack` read that happens INSIDE a prepareStackTrace call, and
+       mjsunit's formatter is built on exactly that (it re-reads error.stack from inside itself). So the frames
+       are captured once, as records, and rendering them is a separate function with one implementation. */
+    saved_exception = JS_GetException(ctx);
+    if (stack_trace_limit == 0)
+        goto done;
+    if (filename)
+        js_new_callsite_data2(ctx, &csd[i++], filename, line_num, col_num);
 
     if (filename && (backtrace_flags & JS_BACKTRACE_FLAG_SINGLE_LEVEL))
         goto done;
@@ -8667,6 +8758,11 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
     }
 
     for (sf = sf_start; sf != NULL && i < stack_trace_limit; sf = sf->prev_frame) {
+        /* A flow's CALL ROOT is not an activation — see JSStackFrame.is_call_root. Skipping it before the skip
+           of the first level is deliberate: the root is not a level, so consuming the skip on it would drop a
+           real frame instead. */
+        if (sf->is_call_root)
+            continue;
         if (backtrace_flags & JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL) {
             backtrace_flags &= ~JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL;
             continue;
@@ -8681,41 +8777,7 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
             backtrace_barrier = b->backtrace_barrier;
         }
 
-        if (has_prepare) {
-            js_new_callsite_data(ctx, &csd[i], sf);
-        } else {
-            /* func_name_str is UTF-8 encoded if needed */
-            func_name_str = get_func_name(ctx, sf->cur_func);
-            if (!func_name_str || func_name_str[0] == '\0')
-                str1 = "<anonymous>";
-            else
-                str1 = func_name_str;
-            dbuf_printf(&dbuf, "    at %s", str1);
-            JS_FreeCString(ctx, func_name_str);
-
-            if (b && sf->cur_pc) {
-                const char *atom_str;
-                int line_num1, col_num1;
-                uint32_t pc;
-
-                pc = sf->cur_pc - b->byte_code_buf - 1;
-                line_num1 = find_line_num(ctx, b, pc, &col_num1);
-                atom_str = b->filename ? JS_AtomToCString(ctx, b->filename) : NULL;
-                dbuf_printf(&dbuf, " (%s", atom_str ? atom_str : "<null>");
-                JS_FreeCString(ctx, atom_str);
-                if (line_num1 != -1)
-                    dbuf_printf(&dbuf, ":%d:%d", line_num1, col_num1);
-                dbuf_putc(&dbuf, ')');
-            } else if (b) {
-                // FIXME(bnoordhuis) Missing `sf->cur_pc = pc` in bytecode
-                // handler in JS_CallInternal. Almost never user observable
-                // except with intercepting JS proxies that throw exceptions.
-                dbuf_printf(&dbuf, " (missing)");
-            } else {
-                dbuf_printf(&dbuf, " (native)");
-            }
-            dbuf_putc(&dbuf, '\n');
-        }
+        js_new_callsite_data(ctx, &csd[i], sf);
         i++;
 
         /* stop backtrace if JS_EVAL_FLAG_BACKTRACE_BARRIER was used */
@@ -8755,14 +8817,21 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
         stack = JS_NewArrayFrom(ctx, 2, pending);
         if (JS_IsException(stack))
             stack = JS_NULL;
-        JS_Throw(ctx, saved_exception);
     } else {
-        if (dbuf_error(&dbuf))
-            stack = JS_NULL;
-        else
-            stack = JS_NewStringLen(ctx, (char *)dbuf.buf, dbuf.size);
-        dbuf_free(&dbuf);
+        uint32_t k;
+        stack = js_callsite_data_render(ctx, csd, i);
+        /* Nothing adopted the records on this path, so this walk owns them. The hook path hands each one to a
+           CallSite object instead, which is why only one of the two frees. */
+        for (k = 0; k < i; k++) {
+            JS_FreeValue(ctx, csd[k].filename);
+            JS_FreeValue(ctx, csd[k].func);
+            JS_FreeValue(ctx, csd[k].func_name);
+        }
+        /* `prepare` is whatever Error.prepareStackTrace held; a non-function value was read and never released
+           before, which leaked one reference per throw for a page that assigned an object to it. */
+        JS_FreeValue(ctx, prepare);
     }
+    JS_Throw(ctx, saved_exception);
 
     if (JS_IsUndefined(ctx->error_back_trace))
         ctx->error_back_trace = js_dup(stack);
@@ -18707,6 +18776,7 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
 
     sf->is_strict_mode = false;
     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
+    sf->is_call_root = false;
     sf->cur_func = unsafe_unconst(func_obj);
     sf->arg_count = argc;
     arg_buf = argv;
@@ -19031,6 +19101,16 @@ static TrampFrame *tramp_frame_new(JSRuntime *rt)
         tf->owns_func = 0;   /* the ONE field whose default has to be right at birth; the rest each site assigns */
     return tf;
 }
+
+/* THE HEAP FRAME CHAIN THE RUNNING STEP CALL SITS ON. The driver sets it around its one invocation of a step
+   function and restores it after, so a machine that has to know what ENCLOSES it can look. The Error stack
+   accessor is the case that needed it: V8 answers "is a prepareStackTrace call already in flight?" with an
+   isolate-wide flag, and a flag is the wrong shape here — a flow parked inside the hook must not change what a
+   sibling flow's `.stack` read does, because the two flows have different stacks. The question is about a call
+   stack, so it is asked of the frames, which are per-flow and travel with the snapshot.
+   A step function never re-enters the driver (it RETURNS a request and the driver performs it), so this cannot
+   be read across a suspension — it is live only for the duration of one step call. */
+static _Thread_local TrampFrame *g_step_chain = NULL;
 
 #define CONT_NONE          0
 /* 1, 2, 6 and 7 were CONT_ARRAY_ITER / CONT_ARRAY_REDUCE / CONT_SORT / CONT_JSON_REVIVE — one continuation kind
@@ -24100,6 +24180,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     pc = b->byte_code_buf;
     /* sf->cur_pc must we set to pc before any recursive calls to JS_CallInternal. */
     sf->cur_pc = NULL;
+    sf->is_call_root = false;
     sf->prev_frame = rt->current_stack_frame;
     rt->current_stack_frame = sf;
     ctx = b->realm; /* set the current realm */
@@ -24726,6 +24807,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 ntf->b = nb; ntf->ctx = nb->realm; ntf->local_buf = nlb;
                 nsf = &ntf->sf;
                 nsf->is_strict_mode = nb->is_strict_mode;
+                nsf->is_call_root = false;
                 /* An OWNED invocation list is released a few lines below, and on the bound/spread path it is the
                    SOLE owner of the callee — call_argv points into it and call_argv[-1] IS nfunc. Every other
                    call shape leaves the callee on the caller's operand stack, which owns it for the whole call.
@@ -25613,6 +25695,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 ntf->b = nb; ntf->ctx = nb->realm; ntf->local_buf = nlb;
                 nsf = &ntf->sf;
                 nsf->is_strict_mode = nb->is_strict_mode;
+                nsf->is_call_root = false;
                 ntf->owns_func = 0;   /* the constructor stays on the caller's stack for the whole construct */
                 nsf->cur_func = unsafe_unconst(nfunc);
                 nsf->arg_count = eff_argc;
@@ -25827,6 +25910,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 ntf->b = nb; ntf->ctx = nb->realm; ntf->local_buf = nlb;
                 nsf = &ntf->sf;
                 nsf->is_strict_mode = nb->is_strict_mode;
+                nsf->is_call_root = false;
                 ntf->owns_func = 0;   /* atab holds the ARGUMENTS; the callee is the caller's own operand */
                 nsf->cur_func = unsafe_unconst(nfunc);
                 narg_buf = nlb;
@@ -26532,7 +26616,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 void *stt = cont_st;
                 JSStepHdr *h = stt;
                 JSValue *cb = NULL; int cbn = 0;
-                int st = h->def->step(step_realm(ctx, h), stt, ret_val, &cb, &cbn);
+                TrampFrame *prev_chain = g_step_chain;
+                int st;
+                g_step_chain = tf_top;
+                st = h->def->step(step_realm(ctx, h), stt, ret_val, &cb, &cbn);
+                g_step_chain = prev_chain;
                 if (unlikely(st < 0)) {
                     void *souter0 = h->outer; uint8_t sk0 = h->outer_kind;
                     if (sk0 == CONT_FOROF_NEXT) {
@@ -34555,8 +34643,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValue error_state = sp[-2];
                 sp--;
                 if (!JS_IsUninitialized(error_state)) {
-                    JSValue se = js_new_suppressed_error(ctx, new_error,
-                                                         error_state);
+                    /* the interpreter's own activation is the innermost frame — nothing to skip */
+                    JSValue se = js_new_suppressed_error(ctx, new_error, error_state, 0);
                     JS_FreeValue(ctx, new_error);
                     JS_FreeValue(ctx, error_state);
                     if (JS_IsException(se)) {
@@ -38185,6 +38273,7 @@ static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s,
     b = p->u.func.function_bytecode;
     sf->is_strict_mode = b->is_strict_mode;
     sf->is_constructor = false;
+    sf->is_call_root = false;
     sf->cur_pc = b->byte_code_buf;
     arg_buf_len = max_int(b->arg_count, argc);
     /* This frame hosts the flow BASE and every generator/async body, so its operands are reshaped by the same
@@ -62812,8 +62901,12 @@ static int js_error_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
         JS_DefinePropertyValue(ctx, s->obj, JS_ATOM_suppressed, js_dup(step_arg(&s->hdr, 1)),
                                JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
     }
-    /* the Error() function itself is skipped in the backtrace, as it was from the C entry */
-    build_backtrace(ctx, s->obj, JS_UNDEFINED, NULL, 0, 0, JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL);
+    /* NO SKIP. The flag means "the innermost frame is this builtin's own", and it was right while the Error
+       constructor was a C function: js_call_c_function pushes a JSStackFrame for the builtin, and reporting it
+       would name Error() as the place the error came from. A step machine pushes no frame — it is driven from
+       the interpreter's own activation — so the innermost frame is the PAGE's, the one that wrote `new Error`,
+       and skipping it threw away the only frame a top-level `new Error().stack` had. */
+    build_backtrace(ctx, s->obj, JS_UNDEFINED, NULL, 0, 0, 0);
     return 0;
 }
 
@@ -62916,6 +63009,28 @@ static bool js_error_stack_is_pending(JSValueConst v)
 }
 
 static int js_error_get_stack_step(JSContext *ctx, void *st, JSValue cb_result,
+                                   JSValue **out_cb, int *out_argc);
+
+/* IS A prepareStackTrace CALL ALREADY RUNNING ON THIS FLOW? V8 keeps this on the isolate
+   (Isolate::formatting_stack_trace) and returns the DEFAULT formatting while it is set — which is not a
+   fallback but the documented contract: mjsunit's own formatter ends with `catch (e) {}; return error.stack;`,
+   deliberately re-entering to get the default. Without the answer that re-entry calls the hook again, and with
+   no stack bound in this engine (the calls trampoline onto the heap) it does not overflow — it runs until the
+   machine is killed, which is how a V8 regression file that finishes in milliseconds there became an OOM here.
+   The scope of the question is a CALL STACK, so it is asked of the running flow's frames rather than of a
+   process-wide flag: two flows have two stacks, and one parked inside a hook must not answer for the other. */
+static bool js_error_stack_formatting(void)
+{
+    const TrampFrame *f;
+
+    for (f = g_step_chain; f != NULL; f = f->up)
+        if (f->cont_kind == CONT_STEP &&
+            ((const JSStepHdr *)f->cont_state)->def->step == js_error_get_stack_step)
+            return true;
+    return false;
+}
+
+static int js_error_get_stack_step(JSContext *ctx, void *st, JSValue cb_result,
                                    JSValue **out_cb, int *out_argc)
 {
     JSErrGetStack *s = st;
@@ -62942,6 +63057,17 @@ static int js_error_get_stack_step(JSContext *ctx, void *st, JSValue cb_result,
                    "something other than build_backtrace wrote it");
             s->result = js_dup(d);
             return 0;
+        }
+        if (js_error_stack_formatting()) {
+            /* Inside the hook: the default rendering, and NOT memoized — the pending pair stays, so a later
+               read from outside the hook still runs it. That is V8's behaviour and it is what makes the
+               `return error.stack` idiom terminate. */
+            JSValue sites = JS_GetPropertyUint32(ctx, d, 1);
+            if (JS_IsException(sites))
+                return -1;
+            s->result = js_callsite_array_render(ctx, sites);
+            JS_FreeValue(ctx, sites);
+            return JS_IsException(s->result) ? -1 : 0;
         }
         /* [prepare, callsites] -> prepare.call(Error, error, callsites). The pair's own elements are taken
            into the request buffer so the memoizing write below cannot free them out from under the call. */
@@ -67370,7 +67496,7 @@ static JSValue js_domexception_ctor_body(JSContext *ctx, JSValueConst obj_, int 
                                          int backtrace_flags);
 static const JSTrampStepDef js_domexception_ctor_def =
     CREATECTOR_DEF_FULL(JS_CLASS_DOM_EXCEPTION, 2, generic_magic, js_domexception_ctor_body,
-                        JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL, js_domexception_ctor_precheck);
+                        0, js_domexception_ctor_precheck);   /* a step machine has no frame to skip — see the Error ctor */
 static int js_finrec_ctor_precheck(JSContext *ctx, const JSStepHdr *h);
 static JSValue js_finrec_ctor_body(JSContext *ctx, JSValueConst obj_, int argc, JSValueConst *argv);
 static const JSTrampStepDef js_weakref_ctor_def =
@@ -81957,7 +82083,7 @@ typedef struct JSDisposableStack {
 } JSDisposableStack;
 
 static JSValue js_new_suppressed_error(JSContext *ctx, JSValueConst error,
-                                       JSValueConst suppressed)
+                                       JSValueConst suppressed, int backtrace_flags)
 {
     JSValue obj;
 
@@ -81972,8 +82098,10 @@ static JSValue js_new_suppressed_error(JSContext *ctx, JSValueConst error,
                            JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
     JS_DefinePropertyValue(ctx, obj, JS_ATOM_suppressed, js_dup(suppressed),
                            JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
-    build_backtrace(ctx, obj, JS_UNDEFINED, NULL, 0, 0,
-                    JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL);
+    /* No skip, for the reason the Error constructor has none: every caller of this reaches it from the
+       interpreter or from a step machine, neither of which pushes a frame of its own. The one caller with a
+       real builtin frame is the C-data closure below, and it says so at its call. */
+    build_backtrace(ctx, obj, JS_UNDEFINED, NULL, 0, 0, backtrace_flags);
     return obj;
 }
 
@@ -81997,7 +82125,7 @@ static void js_dispose_fold_error(JSContext *ctx, JSDisposeRun *s)
         return;
     }
     {
-        JSValue suppressed = js_new_suppressed_error(ctx, new_error, s->error);
+        JSValue suppressed = js_new_suppressed_error(ctx, new_error, s->error, 0);
         JS_FreeValue(ctx, new_error);
         JS_FreeValue(ctx, s->error);
         /* SuppressedError's own construction can throw (an OOM, or a patched %SuppressedError%): that throw is
@@ -82446,7 +82574,9 @@ static JSValue js_async_dispose_rethrow(JSContext *ctx, JSValueConst this_val,
     if (magic == 0) {
         return JS_Throw(ctx, prev_err);
     } else {
-        JSValue se = js_new_suppressed_error(ctx, argv[0], prev_err);
+        /* THIS one has a frame of its own: the rejection handler is a C closure, and js_call_c_function_data
+           pushed a JSStackFrame for it. It is engine plumbing, not a place in the page, so it is skipped. */
+        JSValue se = js_new_suppressed_error(ctx, argv[0], prev_err, JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL);
         JS_FreeValue(ctx, prev_err);
         if (JS_IsException(se))
             return JS_EXCEPTION;
@@ -82504,7 +82634,7 @@ static int js_async_dispose_link_step(JSContext *ctx, void *st, JSValue cb_resul
     if (JS_IsException(cb_result)) {
         JSValue new_err = JS_GetException(ctx);
         if (has_prev_err) {
-            JSValue se = js_new_suppressed_error(ctx, new_err, step_arg(&s->hdr, 0));
+            JSValue se = js_new_suppressed_error(ctx, new_err, step_arg(&s->hdr, 0), 0);
             JS_FreeValue(ctx, new_err);
             if (JS_IsException(se))
                 return -1;
@@ -82936,6 +83066,7 @@ static int reaction_call_flow_init(JSContext *ctx, JSAsyncFunctionState *fs, JSV
     sf->arg_count = 0;
     sf->is_strict_mode = false;
     sf->is_constructor = false;
+    sf->is_call_root = true;   /* no bytecode of its own runs here: the handler's activation is a frame ON TOP */
     sf->cur_func = js_dup(handler);
     sf->cur_pc = NULL;
     blk[0] = js_dup(this_val);     /* this */
@@ -91572,6 +91703,16 @@ static void js_new_callsite_data(JSContext *ctx, JSCallSiteData *csd, JSStackFra
     if (js_class_has_bytecode(p->class_id)) {
         JSFunctionBytecode *b = p->u.func.function_bytecode;
         int line_num1, col_num1;
+        /* Upstream's other walk printed "(missing)" here and carried a FIXME saying a bytecode handler in
+           JS_CallInternal forgets `sf->cur_pc = pc`, "almost never user observable except with intercepting JS
+           proxies that throw exceptions" — and this walk, the one that feeds Error.prepareStackTrace, never had
+           the check at all: it subtracts from a null pointer and reads a line number out of the result. Both
+           spellings of "carry on with a frame whose position is unknown" are gone; a bytecode frame on the stack
+           has a program counter, and if one does not the walk says so where it is born. Proxy traps trampoline
+           in this engine, which is the FIXME's own scenario, so this is the assertion that decides whether the
+           upstream bug survived the conversion. */
+        DCHECK(sf->cur_pc != NULL, "a bytecode frame on the stack has no program counter, so its position in a "
+               "stack trace cannot be computed — the call path that pushed it never stored one");
         line_num1 = find_line_num(ctx, b,
                                   sf->cur_pc - b->byte_code_buf - 1,
                                   &col_num1);
