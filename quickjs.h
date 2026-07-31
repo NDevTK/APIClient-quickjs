@@ -841,6 +841,9 @@ static inline bool JS_IsModule(JSValueConst v)
 
 JS_EXTERN JSValue JS_Throw(JSContext *ctx, JSValue obj);
 JS_EXTERN JSValue JS_GetException(JSContext *ctx);
+/* An Error's recorded stack as a string, or undefined. Never invokes an accessor, so it never runs the
+   page's Error.prepareStackTrace — use it wherever a HOST prints a diagnostic. */
+JS_EXTERN JSValue JS_GetErrorStackString(JSContext *ctx, JSValueConst error);
 JS_EXTERN bool JS_HasException(JSContext *ctx);
 JS_EXTERN bool JS_IsError(JSValueConst val);
 JS_EXTERN bool JS_IsUncatchableError(JSValueConst val);
@@ -1532,6 +1535,10 @@ typedef struct JSCFunctionListEntry {
             JSCFunctionType set;
         } getset;
         struct {
+            int16_t get_id;     /* step-definition id of the getter */
+            int16_t set_id;     /* step-definition id of the setter, or -1 for a getter-only accessor */
+        } getset_step;
+        struct {
             const char *name;
             int base;
         } alias;
@@ -1560,6 +1567,7 @@ typedef struct JSCFunctionListEntry {
 #define JS_DEF_PROP_SYMBOL   10
 #define JS_DEF_PROP_BOOL     11
 #define JS_DEF_CGETSET_STEP  12
+#define JS_DEF_CGETSET_STEP_BOTH 13
 
 /* Note: c++ does not like nested designators */
 #define JS_CFUNC_DEF(name, length, func1) { name, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE, JS_DEF_CFUNC, 0, { .func = { length, JS_CFUNC_generic, { .generic = func1 } } } }
@@ -1583,6 +1591,10 @@ typedef struct JSCFunctionListEntry {
    page's code the moment the receiver is a Proxy. The getter stays an ordinary C function; `stepid` names the
    machine the setter runs, exactly as JS_CFUNC_STEP_DEF does. */
 #define JS_CGETSET_STEP_DEF(name, fgetter, stepid) { name, JS_PROP_CONFIGURABLE, JS_DEF_CGETSET_STEP, stepid, { .getset = { .get = { .getter = fgetter }, .set = { .setter = NULL } } } }
+/* BOTH halves of an accessor are step machines. The ids go in a data member of the entry union, never in
+   JSCFunctionType — that union holds FUNCTION pointers, and a data pointer in it is the strict-aliasing trap
+   this file learned the hard way. A set_id of -1 declares a getter-only accessor. */
+#define JS_CGETSET_STEP_BOTH_DEF(name, get_stepid, set_stepid) { name, JS_PROP_CONFIGURABLE, JS_DEF_CGETSET_STEP_BOTH, 0, { .getset_step = { get_stepid, set_stepid } } }
 #define JS_CGETSET_MAGIC_DEF(name, fgetter, fsetter, magic) { name, JS_PROP_CONFIGURABLE, JS_DEF_CGETSET_MAGIC, magic, { .getset = { .get = { .getter_magic = fgetter }, .set = { .setter_magic = fsetter } } } }
 #define JS_PROP_STRING_DEF(name, cstr, prop_flags) { name, prop_flags, JS_DEF_PROP_STRING, 0, { .str = cstr } }
 #define JS_PROP_INT32_DEF(name, val, prop_flags) { name, prop_flags, JS_DEF_PROP_INT32, 0, { .i32 = val } }

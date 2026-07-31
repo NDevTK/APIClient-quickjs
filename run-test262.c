@@ -567,7 +567,7 @@ static JSValue js_print_262(JSContext *ctx, JSValueConst this_val,
             printf("%s%s", &" "[i < 1], s);
         js_diag_free(ctx, s, owned);
         if (verbose > 2 && JS_IsError(v)) {
-            JSValue stack = JS_GetPropertyStr(ctx, v, "stack");
+            JSValue stack = JS_GetErrorStackString(ctx, v);
             s = JS_ToCString(ctx, stack);
             JS_FreeValue(ctx, stack);
             if (s) {
@@ -1559,7 +1559,7 @@ static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,
 
             name = JS_GetPropertyStr(ctx, exception_val, "name");
             error_name = JS_ToCString(ctx, name);
-            stack = JS_GetPropertyStr(ctx, exception_val, "stack");
+            stack = JS_GetErrorStackString(ctx, exception_val);
             if (!JS_IsUndefined(stack)) {
                 stack_str = JS_ToCString(ctx, stack);
                 if (stack_str) {
@@ -1676,7 +1676,7 @@ static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,
             }
         }
         if (is_unexpected_error && verbose > 1 && JS_IsException(exception_val)) {
-            JSValue val = JS_GetPropertyStr(ctx, exception_val, "stack");
+            JSValue val = JS_GetErrorStackString(ctx, exception_val);
             if (!JS_IsException(val) &&
                 !JS_IsUndefined(val) &&
                 !JS_IsNull(val)) {

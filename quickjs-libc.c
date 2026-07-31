@@ -4734,7 +4734,7 @@ static void js_std_dump_error1(JSContext *ctx, JSValueConst exception_val)
         is_error = JS_IsError(current);
         js_dump_obj(ctx, stderr, current);
         if (is_error) {
-            val = JS_GetPropertyStr(ctx, current, "stack");
+            val = JS_GetErrorStackString(ctx, current);
         } else if (depth == 0) {
             js_std_cmd(/*ErrorBackTrace*/2, ctx, &val);
         } else {

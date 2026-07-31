@@ -55,23 +55,7 @@
 #define DIRECT_DISPATCH  1
 #endif
 
-/* Forced-exec fork-local assert — MIRRORS engine/host/check.h (the quickjs submodule is a separate repo and
-   cannot include the host header, exactly as extension/check.js mirrors the same law on the JS side). Same
-   semantics: DFAIL = a DEV-ONLY should-never-happen (design invariant / not-yet-built capability) — emits
-   @WHY at the origin then aborts; CHECK/CHECK_FAIL = ALWAYS fatal (dev AND release) for a "must-not-proceed
-   even in production" invariant. DFAIL compiles out in release (APICLIENT_DEV=0); its condition must be
-   side-effect-free and never recoverable control flow.
-   All four names are the host header's and the JS mirror's. Only the EMIT is this file's (a plain @WHY/@E line
-   rather than the host's JSON), because the submodule cannot include the host header. */
-#if defined(APICLIENT_DEV) && APICLIENT_DEV == 0
-#define DFAIL(msg)         ((void)0)
-#define DCHECK(cond, msg)  ((void)0)
-#else
-#define DFAIL(msg)         do { fprintf(stderr, "@WHY %s (%s:%d)\n", (msg), __FILE__, __LINE__); abort(); } while (0)
-#define DCHECK(cond, msg)  do { if (!(cond)) DFAIL(msg); } while (0)
-#endif
-#define CHECK_FAIL(msg)    do { fprintf(stderr, "@E %s (%s:%d)\n", (msg), __FILE__, __LINE__); abort(); } while (0)
-#define CHECK(cond, msg)   do { if (!(cond)) CHECK_FAIL(msg); } while (0)
+#include "quickjs-check.h"
 
 #if defined(__APPLE__)
 #define MALLOC_OVERHEAD  0
@@ -1579,7 +1563,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_U8_TOBASE64, STEPDEF_U8_FROMBASE64, STEPDEF_U8_SETFROMBASE64,
     STEPDEF_ITER_DISPOSE, STEPDEF_ASYNC_ITER_DISPOSE,
     STEPDEF_SYMBOL_FOR, STEPDEF_REGEXP_COMPILE,
-    STEPDEF_SYMBOL_CTOR, STEPDEF_ERROR_TOSTRING,
+    STEPDEF_SYMBOL_CTOR, STEPDEF_ERROR_TOSTRING, STEPDEF_ERROR_GET_STACK,
     STEPDEF_MAP_UPSERT, STEPDEF_MAP_UPSERT_COMPUTED,
     STEPDEF_WEAKMAP_UPSERT, STEPDEF_WEAKMAP_UPSERT_COMPUTED,
     STEPDEF_DISPOSE_SYNC, STEPDEF_DISPOSE_ASYNC,
@@ -8371,6 +8355,24 @@ JSValue JS_Throw(JSContext *ctx, JSValue obj)
 }
 
 /* return the pending exception (cannot be called twice). */
+/* The recorded stack of an Error, WITHOUT running any of the page's code — for a host printing a diagnostic.
+   Reading the `stack` PROPERTY invokes the accessor, and that accessor may have to call Error.prepareStackTrace,
+   which is the page's function: a host diagnostic must no more run page code than safeFetch's chokepoint may be
+   bypassed. When the trace is still the pending [prepare, callsites] pair the honest answer is UNDEFINED — the
+   engine has no rendering of its own to give, and inventing one would be a second formatter. */
+JSValue JS_GetErrorStackString(JSContext *ctx, JSValueConst error)
+{
+    JSObject *p;
+    if (JS_VALUE_GET_TAG(error) != JS_TAG_OBJECT)
+        return JS_UNDEFINED;
+    p = JS_VALUE_GET_OBJ(error);
+    if (p->class_id != JS_CLASS_ERROR)
+        return JS_GetPropertyStr(ctx, error, "stack");   /* a DOMException & co. keep an own DATA property */
+    if (!JS_IsString(p->u.object_data))
+        return JS_UNDEFINED;
+    return js_dup(p->u.object_data);
+}
+
 JSValue JS_GetException(JSContext *ctx)
 {
     JSValue val;
@@ -8717,17 +8719,16 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
             JS_FreeValue(ctx, csd[k].func);
             JS_FreeValue(ctx, csd[k].func_name);
         }
-        JSValueConst args[] = {
-            error_obj,
-            stack,
-        };
-        JSValue stack2 = JS_Call(ctx, prepare, ctx->error_ctor, countof(args), args);
-        JS_FreeValue(ctx, stack);
-        if (JS_IsException(stack2))
+        /* Error.prepareStackTrace is the PAGE's code, and build_backtrace runs under every internal throw —
+           an activation with no flow base, where a JS_Call drives the hook's body to completion and its first
+           loop back-edge aborts. The call belongs to the `.stack` ACCESSOR, which is a step machine and can
+           suspend, so what is parked here is the PENDING PAIR [prepare, callsites] and nothing runs.
+           V8 formats lazily for the same reason; capturing `prepare` here rather than reading it at access
+           time keeps the hook that was installed when the error was created. */
+        JSValue pending[2] = { prepare, stack };   /* both references are HANDED OVER to the array */
+        stack = JS_NewArrayFrom(ctx, 2, pending);
+        if (JS_IsException(stack))
             stack = JS_NULL;
-        else
-            stack = stack2;
-        JS_FreeValue(ctx, prepare);
         JS_Throw(ctx, saved_exception);
     } else {
         if (dbuf_error(&dbuf))
@@ -22893,6 +22894,14 @@ enum { STRRECV_TRIM_START = 1, STRRECV_TRIM_END = 2, STRRECV_TRIM_BOTH = 3,
           share one machine and one body the way they shared one C function. */
        STRRECV_HTML_BASE };
 #define STRRECV_HTML_COUNT 13
+/* `get Error.prototype.stack`: the only thing it runs is the page's Error.prepareStackTrace, so the whole
+   state is that one call's request buffer plus the answer. */
+typedef struct JSErrGetStack {
+    JSStepHdr hdr;        /* MUST be first: the generic step driver casts the state to JSStepHdr * */
+    JSValue result;       /* DONE (owned) */
+    JSValue cb[4];        /* [this=%Error%, prepare, error, callsites]; call_argv=&cb[2], argc=2 */
+} JSErrGetStack;
+
 typedef struct JSErrToString {
     JSStepHdr hdr;        /* MUST be first: the generic step driver casts the state to JSStepHdr * */
     JSValue result;       /* DONE (owned) */
@@ -59118,6 +59127,23 @@ static int JS_InstantiateFunctionListItem(JSContext *ctx, JSValueConst obj,
         JS_DefineAutoInitProperty(ctx, obj, atom, JS_AUTOINIT_ID_PROP,
                                   (void *)e, prop_flags);
         return 0;
+    case JS_DEF_CGETSET_STEP_BOTH:
+        {
+            /* BOTH halves are step machines. Before this entry existed the table could name a machine for the
+               setter only, so every accessor whose GETTER runs the page's code (Error.prototype.stack,
+               RegExp.prototype.flags, __proto__) was hand-installed beside its intrinsic — three copies of the
+               same four lines, each a place to forget one. */
+            char buf[64];
+            JSValue getter, setter = JS_UNDEFINED;
+            snprintf(buf, sizeof(buf), "get %s", e->name);
+            getter = JS_NewCFunctionMagic(ctx, NULL, buf, 0, JS_CFUNC_step, e->u.getset_step.get_id);
+            if (e->u.getset_step.set_id >= 0) {
+                snprintf(buf, sizeof(buf), "set %s", e->name);
+                setter = JS_NewCFunctionMagic(ctx, NULL, buf, 1, JS_CFUNC_step, e->u.getset_step.set_id);
+            }
+            JS_DefinePropertyGetSet(ctx, obj, atom, getter, setter, prop_flags);
+            return 0;
+        }
     case JS_DEF_CGETSET: /* XXX: use autoinit again ? */
     case JS_DEF_CGETSET_MAGIC:
     case JS_DEF_CGETSET_STEP:
@@ -61117,9 +61143,7 @@ static JSValue js_object_is(JSContext *ctx, JSValueConst this_val,
 /* 22.2.6.4 `get RegExp.prototype.flags` performs a Get for each of the eight flag names, in a fixed order, on
    the receiver — and on a subclass or a Proxy every one of those is the page's code. js_regexp_get_flags did all
    eight with JS_GetPropertyStr from C, so `class R extends RegExp { get global() { for(;;){} } }` and
-   `new Proxy(re, {get(){for(;;){}}})` preempted in an activation with no flow base. One stage per Get.
-   The getter half of an accessor can be a step machine — __proto__'s already is — but the accessor TABLE can
-   name only one step id, so this pair is built where the intrinsic is, exactly as that one is. */
+   `new Proxy(re, {get(){for(;;){}}})` preempted in an activation with no flow base. One stage per Get. */
 typedef struct JSRegExpFlags {
     JSStepHdr hdr;        /* MUST be first: the generic step driver casts the state to JSStepHdr * */
     JSValue result;       /* DONE (owned) */
@@ -61432,10 +61456,9 @@ static const JSCFunctionListEntry js_object_proto_funcs[] = {
     JS_CFUNC_STEP_DEF("hasOwnProperty", 1, STEPDEF_OBJ_HASOWNPROP ),
     JS_CFUNC_STEP_DEF("isPrototypeOf", 1, STEPDEF_PROTO_CHAIN ),
     JS_CFUNC_STEP_DEF("propertyIsEnumerable", 1, STEPDEF_PROP_IS_ENUM ),
-    /* __proto__ is installed after this table: BOTH halves are step machines, and an accessor ENTRY can carry a
-       machine on the setter only (JS_DEF_CGETSET_STEP names one step id). Giving the entry a second id would put
-       another data field in a union that already holds function pointers — the strict-aliasing trap this file
-       learned the hard way — so the pair is built where the intrinsic is. */
+    /* B.2.2.1 Object.prototype.__proto__: BOTH halves are step machines, because each performs ONE internal
+       method on the receiver and on a Proxy that is a trap. */
+    JS_CGETSET_STEP_BOTH_DEF("__proto__", STEPDEF_PROTO_GET, STEPDEF_PROTO_SET ),
     JS_CFUNC_STEP_DEF("__defineGetter__", 2, STEPDEF_OBJ_DEFGETTER ),
     JS_CFUNC_STEP_DEF("__defineSetter__", 2, STEPDEF_OBJ_DEFSETTER ),
     JS_CFUNC_STEP_DEF("__lookupGetter__", 1, STEPDEF_OBJ_LOOKUPGETTER ),
@@ -62745,16 +62768,78 @@ static JSValue js_error_tostring_fini(JSContext *ctx, void *st, bool take_result
     return r;
 }
 
-static JSValue js_error_get_stack(JSContext *ctx, JSValueConst this_val)
+/* `get Error.prototype.stack`. u.object_data for an Error is EXACTLY one of: UNDEFINED (no trace was built),
+   the FORMATTED stack (a string, or null when the format failed), or the PENDING PAIR — the two-element array
+   [prepareStackTrace, callsites] that build_backtrace parks there instead of calling the page's hook from a
+   throw. Formatting it is this machine's only job, and the result is memoized so the hook runs once. */
+static bool js_error_stack_is_pending(JSValueConst v)
 {
+    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
+        return false;
+    return JS_VALUE_GET_OBJ(v)->class_id == JS_CLASS_ARRAY;
+}
+
+static int js_error_get_stack_step(JSContext *ctx, void *st, JSValue cb_result,
+                                   JSValue **out_cb, int *out_argc)
+{
+    JSErrGetStack *s = st;
     JSObject *p;
 
-    if (JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT)
-        return JS_ThrowTypeErrorNotAnObject(ctx);
-    p = JS_VALUE_GET_OBJ(this_val);
-    if (p->class_id != JS_CLASS_ERROR)
-        return JS_UNDEFINED;
-    return js_dup(p->u.object_data);
+    if (s->hdr.stage == 0) {
+        JSValue d;
+        JS_FreeValue(ctx, cb_result);
+        s->hdr.stage = 1;
+        s->result = JS_UNDEFINED;
+        s->cb[0] = JS_UNDEFINED; s->cb[1] = JS_UNDEFINED;
+        s->cb[2] = JS_UNDEFINED; s->cb[3] = JS_UNDEFINED;
+        if (JS_VALUE_GET_TAG(s->hdr.this_val) != JS_TAG_OBJECT) {
+            JS_ThrowTypeErrorNotAnObject(ctx);
+            return -1;
+        }
+        p = JS_VALUE_GET_OBJ(s->hdr.this_val);
+        if (p->class_id != JS_CLASS_ERROR)
+            return 0;
+        d = p->u.object_data;
+        if (!js_error_stack_is_pending(d)) {
+            DCHECK(JS_IsUndefined(d) || JS_IsString(d) || JS_IsNull(d),
+                   "an Error's u.object_data is neither a formatted stack nor the pending prepare pair — "
+                   "something other than build_backtrace wrote it");
+            s->result = js_dup(d);
+            return 0;
+        }
+        /* [prepare, callsites] -> prepare.call(Error, error, callsites). The pair's own elements are taken
+           into the request buffer so the memoizing write below cannot free them out from under the call. */
+        s->cb[0] = js_dup(ctx->error_ctor);           /* `this` */
+        s->cb[1] = JS_GetPropertyUint32(ctx, d, 0);   /* the callee: prepareStackTrace */
+        s->cb[2] = js_dup(s->hdr.this_val);
+        s->cb[3] = JS_GetPropertyUint32(ctx, d, 1);
+        if (JS_IsException(s->cb[1]) || JS_IsException(s->cb[3]))
+            return -1;
+        *out_cb = s->cb; *out_argc = 2;
+        return 3;
+    }
+    DCHECK(s->hdr.stage == 1, "the Error stack accessor resumed in an unknown stage");
+    /* the hook's THROW propagates out of the accessor, exactly as any getter's does. build_backtrace used to
+       swallow it because it ran under a live exception; there is no exception here to protect. */
+    if (JS_IsException(cb_result))
+        return -1;
+    p = JS_VALUE_GET_OBJ(s->hdr.this_val);
+    DCHECK(p->class_id == JS_CLASS_ERROR && js_error_stack_is_pending(p->u.object_data),
+           "the Error whose stack was being formatted stopped being one mid-call");
+    JS_FreeValue(ctx, p->u.object_data);
+    p->u.object_data = cb_result;                 /* memoized: the hook runs once per error */
+    s->result = js_dup(p->u.object_data);
+    return 0;
+}
+
+static JSValue js_error_get_stack_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSErrGetStack *s = st;
+    JSValue r = take_result ? s->result : (JS_FreeValue(ctx, s->result), JS_UNDEFINED);
+    int i;
+    for (i = 0; i < 4; i++) JS_FreeValue(ctx, s->cb[i]);
+    js_free_rt(ctx->rt, s);
+    return r;
 }
 
 /* DELETED: js_error_set_stack's C body. The error-stack accessor's setter IS
@@ -62776,7 +62861,7 @@ static const JSCFunctionListEntry js_error_proto_funcs[] = {
     JS_CFUNC_STEP_DEF("toString", 0, STEPDEF_ERROR_TOSTRING ),
     JS_PROP_STRING_DEF("name", "Error", JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE ),
     JS_PROP_STRING_DEF("message", "", JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE ),
-    JS_CGETSET_STEP_DEF("stack", js_error_get_stack, STEPDEF_ERROR_SET_STACK ),
+    JS_CGETSET_STEP_BOTH_DEF("stack", STEPDEF_ERROR_GET_STACK, STEPDEF_ERROR_SET_STACK ),
 };
 
 static JSValue js_error_isError(JSContext *ctx, JSValueConst this_val,
@@ -66968,6 +67053,7 @@ static const JSTrampStepDef js_iter_set_ctor_def = { sizeof(JSIterSetter), js_it
                                                     .home_class = JS_CLASS_ITERATOR };
 static const JSTrampStepDef js_iter_set_tag_def  = { sizeof(JSIterSetter), js_iter_setter_step, js_iter_setter_fini, JS_ATOM_Symbol_toStringTag,
                                                     .home_class = JS_CLASS_ITERATOR };
+static const JSTrampStepDef js_error_get_stack_def = { sizeof(JSErrGetStack), js_error_get_stack_step, js_error_get_stack_fini, 0 };
 static const JSTrampStepDef js_error_set_stack_def = { sizeof(JSIterSetter), js_iter_setter_step, js_iter_setter_fini, JS_ATOM_stack,
                                                       .home_class = JS_CLASS_ERROR, .precheck = js_error_stack_precheck };
 static const JSTrampStepDef js_instanceof_def  = { sizeof(JSInstanceOf), js_instanceof_step, js_instanceof_fini, INSTOF_OPERATOR };
@@ -68838,6 +68924,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_ITER_SET_CTOR]  = &js_iter_set_ctor_def,
     [STEPDEF_BOOLEAN_CTOR]   = &js_boolean_ctor_def,
     [STEPDEF_ERROR_SET_STACK] = &js_error_set_stack_def,
+    [STEPDEF_ERROR_GET_STACK] = &js_error_get_stack_def,
     [STEPDEF_ITER_SET_TAG]   = &js_iter_set_tag_def,
     [STEPDEF_ITER_HELPER_RETURN] = &js_iter_helper_return_def,
     [STEPDEF_INSTANCEOF]     = &js_instanceof_def,
@@ -77671,6 +77758,7 @@ static const JSCFunctionListEntry js_regexp_proto_funcs[] = {
     JS_CGETSET_MAGIC_DEF("unicodeSets", js_regexp_get_flag, NULL, LRE_FLAG_UNICODE_SETS ),
     JS_CGETSET_MAGIC_DEF("sticky", js_regexp_get_flag, NULL, LRE_FLAG_STICKY ),
     JS_CGETSET_MAGIC_DEF("hasIndices", js_regexp_get_flag, NULL, LRE_FLAG_INDICES ),
+    JS_CGETSET_STEP_BOTH_DEF("flags", STEPDEF_REGEXP_FLAGS, -1 ),
     JS_CFUNC_STEP_DEF("exec", 1, STEPDEF_REGEXP_EXEC ),
     JS_CFUNC_STEP_DEF("compile", 2, STEPDEF_REGEXP_COMPILE ),
     JS_CFUNC_STEP_DEF("test", 1, STEPDEF_REGEXP_TEST ),
@@ -77702,16 +77790,6 @@ int JS_AddIntrinsicRegExp(JSContext *ctx)
     if (JS_SetPropertyFunctionList(ctx, proto, js_regexp_proto_funcs,
                                    countof(js_regexp_proto_funcs))) {
         return -1;
-    }
-    {
-        /* 22.2.6.4 `get RegExp.prototype.flags`: eight Gets on the receiver, every one of them the page's code.
-           The accessor TABLE cannot name a step id for the GETTER half (JS_DEF_CGETSET_STEP names one, and it is
-           the setter's), so the accessor is built here — the same reason __proto__'s pair is. */
-        JSValue fget = JS_NewCFunctionMagic(ctx, NULL, "get flags", 0, JS_CFUNC_step, STEPDEF_REGEXP_FLAGS);
-        if (JS_IsException(fget))
-            return -1;
-        if (JS_DefinePropertyGetSet(ctx, proto, JS_ATOM_flags, fget, JS_UNDEFINED, JS_PROP_CONFIGURABLE) < 0)
-            return -1;
     }
     /* 22.2.7.1 step 4 performs RegExpBuiltinExec DIRECTLY, with no function object to call. With exec a step
        machine there is nothing to run from C, so the engine holds the algorithm as a callable of its own and
@@ -86371,22 +86449,6 @@ int JS_AddIntrinsicBaseObjects(JSContext *ctx)
     if (JS_IsException(obj1))
         return -1;
     JS_FreeValue(ctx, obj1);
-    {
-        /* B.2.2.1 Object.prototype.__proto__, both halves as step machines: each performs ONE internal method on
-           the receiver, and on a Proxy that is a trap. The accessor table cannot name two step ids, so the pair is
-           built here — an accessor holds function OBJECTS, and a step-machine function object is reached through
-           tramp_accessor_getter / _setter like any other callable. */
-        JSValue pget = JS_NewCFunctionMagic(ctx, NULL, "get __proto__", 0, JS_CFUNC_step, STEPDEF_PROTO_GET);
-        JSValue pset = JS_NewCFunctionMagic(ctx, NULL, "set __proto__", 1, JS_CFUNC_step, STEPDEF_PROTO_SET);
-        if (JS_IsException(pget) || JS_IsException(pset)) {
-            JS_FreeValue(ctx, pget); JS_FreeValue(ctx, pset);
-            return -1;
-        }
-        if (JS_DefinePropertyGetSet(ctx, ctx->class_proto[JS_CLASS_OBJECT], JS_ATOM___proto__,
-                                    pget, pset, JS_PROP_CONFIGURABLE) < 0)
-            return -1;
-    }
-
     /* Function */
     obj1 = JS_NewCConstructor(ctx, JS_CLASS_BYTECODE_FUNCTION, "Function",
                               NULL, 1, JS_CFUNC_step_ctor, STEPDEF_FUNCTION_CTOR,
