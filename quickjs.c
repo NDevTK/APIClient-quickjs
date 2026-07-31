@@ -23161,6 +23161,12 @@ typedef struct JSArrayJoin {
     StringBuffer b;
     int64_t len, i;
     int64_t oldlen;       /* TypedArray only: the count before a separator coercion could resize the buffer */
+    /* The nearest join ENCLOSING this one on the same flow, found once when this machine starts (the search is
+       O(1): the enclosing join is a handful of continuation links up). BORROWED — an enclosing join outlives
+       every join its element coercion reaches. It makes the cycle question a walk over joins alone instead of
+       over the whole continuation chain, which is the difference between comparing one pointer per level and
+       dispatching on five links per level. */
+    struct JSArrayJoin *outer_join;
 } JSArrayJoin;
 
 /* Number.prototype's five formatting methods: the receiver unwrap runs nothing, but the digits/radix argument
@@ -63346,6 +63352,17 @@ static bool js_error_stack_is_pending(JSValueConst v)
 static int js_error_get_stack_step(JSContext *ctx, void *st, JSValue cb_result,
                                    JSValue **out_cb, int *out_argc);
 
+/* IS THIS OBJECT ALREADY BEING JOINED further out on this flow's stack? `a[0] = a; String(a)` asks join for
+   the string of an element that IS the array, so join coerces it, which calls join, forever. Every engine
+   answers "" for the self-referential element, and that answer is not optional: the operation has no other
+   result, and without it the flow never finishes. It is not a bound — nothing distinct is truncated, because
+   the recursion has no output to lose; it is what the operation MEANS on a cyclic input.
+
+   Asked of the FRAMES, like the prepareStackTrace guard above and for the same reason: two flows have two
+   stacks, and one parked inside a join must not decide what another flow's join does. A nested join reaches
+   its outer one through the frame that outer pushed to coerce the element — cont_kind CONT_STEP, cont_state
+   the outer machine — which is what this walk reads. */
+
 /* IS A prepareStackTrace CALL ALREADY RUNNING ON THIS FLOW? V8 keeps this on the isolate
    (Isolate::formatting_stack_trace) and returns the DEFAULT formatting while it is set — which is not a
    fallback but the documented contract: mjsunit's own formatter ends with `catch (e) {}; return error.stack;`,
@@ -69952,6 +69969,52 @@ static JSValue js_array_tostring_fini(JSContext *ctx, void *st, bool take_result
 /* 23.1.3.18 join / 23.1.3.33 toLocaleString. Stages: 0 ToObject, 1 LengthOfArrayLike, 2 ToString(separator),
    then the loop — 3 its head (the separator), 8 read element i, 4 dispatch on it, 5 the toLocaleString method,
    6 its call's result, 7 ToString(element) and append. The loop returns to 3 until i reaches len. */
+/* Follow one continuation chain outward until a join is found. The chain is not homogeneous — a machine's
+   outer is another machine, EXCEPT that a machine waiting on a coercion is waited on by a ToPrimitive
+   sequence — so the walk asks the kind rather than assuming, exactly as the step-chain teardown does. An
+   element's coercion goes join -> ToPrimitive -> toString -> join, so the ToPrimitive link is not an edge
+   case here: it is the every-time shape, and the join it is looking for is a few links away. */
+static JSArrayJoin *js_join_chain_find(const void *st, uint8_t kind)
+{
+    while (st) {
+        if (kind == CONT_STEP) {
+            const JSStepHdr *h = st;
+            if (h->def->step == js_array_join_step)
+                return (JSArrayJoin *)h;
+            kind = h->outer_kind;
+            st = h->outer;
+        } else if (kind == CONT_TOPRIM) {
+            const JSToPrim *tp = st;
+            kind = tp->outer_kind;
+            st = tp->outer;
+        } else {
+            return NULL;   /* a requester of some other kind: nothing further out is a join */
+        }
+    }
+    return NULL;
+}
+
+/* The join this one is nested inside, on this flow. Searched outside the machine asking — a join is not
+   inside itself — and through the FRAMES too, because an element's toString can be the page's own code, which
+   calls join again with ordinary bytecode frames in between. */
+static JSArrayJoin *js_join_enclosing(void)
+{
+    const TrampFrame *f;
+    JSArrayJoin *j;
+
+    if (g_step_running) {
+        j = js_join_chain_find(g_step_running->outer, g_step_running->outer_kind);
+        if (j)
+            return j;
+    }
+    for (f = g_step_chain; f != NULL; f = f->up) {
+        j = js_join_chain_find(f->cont_state, f->cont_kind);
+        if (j)
+            return j;
+    }
+    return NULL;
+}
+
 static int js_array_join_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSArrayJoin *s = st;
@@ -69979,6 +70042,21 @@ static int js_array_join_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
         } else {
             s->obj = JS_ToObject(ctx, s->hdr.this_val);
             if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
+        }
+        /* A join of an object THIS FLOW IS ALREADY JOINING contributes nothing: coercing an element led back
+           here, and continuing would lead back again. The question is asked about the RECEIVER rather than
+           about each element, because the cycle need not run through the array itself — `e.name = [e]` closes
+           it through the Error, whose toString coerces `name` and arrives at this same array. */
+        {
+            JSArrayJoin *j;
+            s->outer_join = js_join_enclosing();
+            for (j = s->outer_join; j != NULL; j = j->outer_join) {
+                if (JS_VALUE_GET_TAG(j->obj) == JS_TAG_OBJECT &&
+                    JS_VALUE_GET_PTR(j->obj) == JS_VALUE_GET_PTR(s->obj)) {
+                    s->result = JS_AtomToString(ctx, JS_ATOM_empty_string);
+                    return 0;
+                }
+            }
         }
         s->hdr.stage = 1;
     }
