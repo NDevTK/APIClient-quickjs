@@ -18130,10 +18130,15 @@ static inline JSValueConst step_arg(const JSStepHdr *h, int i)
    in the wrong realm, the Function constructor is just the first one for which that is observable. A CLOSURE
    step machine (a Promise reaction, class JS_CLASS_C_FUNCTION_DATA) names the realm recorded on its own data
    record — the same one js_call_c_function_data now switches to. */
-static inline JSContext *step_realm(JSContext *ctx, const JSStepHdr *h)
+/* THE REALM A BUILTIN RUNS IN, from the callee alone. Split out of step_realm because a step machine is not the
+   only machine that IS a builtin: the Iterator.prototype eager terminals are consume machines, and they were
+   throwing their TypeErrors and building their arrays out of the CALLER's intrinsics —
+   `otherRealm.Iterator.prototype.every.call(iter)` answered with this realm's TypeError, and
+   `otherRealm.Iterator.prototype.toArray.call(iter)` with this realm's Array. */
+static inline JSContext *js_callee_realm(JSContext *ctx, JSValueConst func)
 {
-    if (JS_VALUE_GET_TAG(h->func_obj) == JS_TAG_OBJECT) {
-        JSObject *p = JS_VALUE_GET_OBJ(h->func_obj);
+    if (JS_VALUE_GET_TAG(func) == JS_TAG_OBJECT) {
+        JSObject *p = JS_VALUE_GET_OBJ(func);
         if (p->class_id == JS_CLASS_C_FUNCTION && p->u.cfunc.realm)
             return p->u.cfunc.realm;
         if (p->class_id == JS_CLASS_C_FUNCTION_DATA) {
@@ -18143,6 +18148,11 @@ static inline JSContext *step_realm(JSContext *ctx, const JSStepHdr *h)
         }
     }
     return ctx;
+}
+
+static inline JSContext *step_realm(JSContext *ctx, const JSStepHdr *h)
+{
+    return js_callee_realm(ctx, h->func_obj);
 }
 
 
@@ -20606,7 +20616,13 @@ typedef struct JSIterFrom { int orig_cfirst, orig_cargc; uint8_t orig_is_tail;
                             JSValue acq;
                             /* GetIteratorDirect's nextMethod, parked across step 3's OrdinaryHasInstance — a
                                prototype walk whose links can be Proxies, so page code, so a suspension. */
-                            JSValue nextm; } JSIterFrom;
+                            JSValue nextm;
+                            /* THE METHOD'S REALM. 27.1.2.1 step 2 tests against %Iterator% and step 4 creates a
+                               %WrapForValidIteratorPrototype% object — both intrinsics of the FUNCTION being
+                               called, not of its caller. Reading them off `ctx` made
+                               `otherRealm.Iterator.from(iter)` answer with `iter` itself, because it asked
+                               whether iter was an Iterator in THIS realm. */
+                            JSContext *realm; } JSIterFrom;
 #define CONT_ACQUIRE_GET  25   /* cont_state = JSAcquireGet: GetIterator step 3's READ of @@iterator, when reading it
                                   is itself the page's code (a getter, a Proxy trap). The consumer waiting on the
                                   acquire cannot be the read's outer continuation directly — a consumer's delivery
@@ -27769,14 +27785,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValueConst iterobj = crecv;
                 JSIterConsume *s;
                 JSValue nextm, acc;
+                /* the METHOD's realm, not the caller's: 27.1.4.x's TypeError and toArray's Array both belong to
+                   the function being invoked, which is what js_call_c_function would have switched to for a C
+                   body and what step_realm gives every step machine. */
+                JSContext *mrealm = js_callee_realm(ctx, call_argv[-1]);
                 if (iterterm_kind != ITERTERM_TOARRAY
-                    && check_function(ctx, (call_argc >= 1) ? call_argv[0] : JS_UNDEFINED)) {
+                    && check_function(mrealm, (call_argc >= 1) ? call_argv[0] : JS_UNDEFINED)) {
                     /* IfAbruptCloseIterator: an invalid callback still closes the underlying iterator, and the
                        page's `return` runs on the tramp — park it for the exception label, which owns the routing. */
                     iter_close_defer(ctx, iterobj);
                     goto exception;
                 }
-                if (iterterm_kind == ITERTERM_TOARRAY) acc = JS_NewArray(ctx);
+                if (iterterm_kind == ITERTERM_TOARRAY) acc = JS_NewArray(mrealm);
                 else if (iterterm_kind == ITERTERM_REDUCE)
                     acc = (call_argc >= 2) ? js_dup(call_argv[1]) : JS_UNINITIALIZED;   /* UNINITIALIZED = seed from the first element */
                 else acc = JS_UNDEFINED;
@@ -27887,6 +27907,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    field is initialised explicitly or its teardown frees a bogus value. */
                 s->acq = JS_UNDEFINED;
                 s->nextm = JS_UNDEFINED;
+                s->realm = js_callee_realm(ctx, call_argv[-1]);
                 TAKE_CALL_SHAPE(); s->orig_cfirst = call_first_r; s->orig_cargc = call_pop; s->orig_is_tail = tramp_is_tail;
                 s->args_own = call_args_owned; s->args_own_n = call_args_owned_n;
                 call_args_owned = NULL; call_args_owned_n = 0;
@@ -30193,7 +30214,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 DCHECK(JS_IsUndefined(fs->nextm), "Iterator.from parked two nextMethods on one state");
                 fs->nextm = ret_val; ret_val = JS_UNDEFINED;
                 if_stt = tramp_step_state_new(ctx, tramp_step_def_by_id(STEPDEF_ORDINARY_HAS_INSTANCE),
-                                              ctx->iterator_ctor, 1, &if_arg, JS_UNDEFINED);
+                                              fs->realm->iterator_ctor, 1, &if_arg, JS_UNDEFINED);
                 if (unlikely(!if_stt)) goto exception;
                 ((JSStepHdr *)if_stt)->outer = fs;
                 ((JSStepHdr *)if_stt)->outer_kind = CONT_ITER_FROM;
@@ -30215,6 +30236,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int cf = fs->orig_cfirst, cg = fs->orig_cargc; uint8_t itl = fs->orig_is_tail;
                 JSValue r;
                 JSIteratorWrapData *wd;
+                JSContext *frealm = fs->realm;
                 int isit = JS_ToBoolFree(ctx, ret_val);
                 ret_val = JS_UNDEFINED;
                 js_free_rt(rt, fs);
@@ -30222,7 +30244,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JS_FreeValue(ctx, nextm);   /* the record is complete; an Iterator instance needs no wrapper */
                     r = acq;
                 } else {
-                    r = JS_NewObjectClass(ctx, JS_CLASS_ITERATOR_WRAP);
+                    r = JS_NewObjectClass(frealm, JS_CLASS_ITERATOR_WRAP);
                     if (JS_IsException(r)) { JS_FreeValue(ctx, nextm); JS_FreeValue(ctx, acq); goto exception; }
                     wd = js_malloc(ctx, sizeof(*wd));
                     if (unlikely(!wd)) { JS_FreeValue(ctx, r); JS_FreeValue(ctx, nextm); JS_FreeValue(ctx, acq); goto exception; }
