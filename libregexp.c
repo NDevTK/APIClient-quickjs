@@ -153,6 +153,30 @@ static const REOpCode reopcode_info[REOP_COUNT] = {
 static inline uint32_t re_get_idx(const uint8_t *p) { return get_u32(p); }
 static inline void re_set_idx(uint8_t *p, uint32_t v) { put_u32(p, v); }
 
+/* THE INSTRUCTION'S TOTAL LENGTH — the opcode's own size plus the variable payload that three opcode families
+   carry after it. Every walker over the byte code needs this and each one used to spell the rule out again;
+   five copies of one decoding rule means a newly added variable-length opcode is a silent desync in whichever
+   copy was missed, and a desynced walker reads the next instruction from the middle of this one. It lives
+   here, once, beside the index accessor its payloads are counted in. */
+static int re_ins_len(const uint8_t *bc, int pos)
+{
+    int opcode = bc[pos];
+
+    DCHECK(opcode < REOP_COUNT, "a regexp byte code walker read a byte that is not an opcode — it is decoding "
+           "the program at an offset that is not an instruction boundary");
+    switch (opcode) {
+    case REOP_range: case REOP_range_i:
+        return REOP_SZ(opcode) + get_u16(bc + pos + 1) * 4;
+    case REOP_range32: case REOP_range32_i:
+        return REOP_SZ(opcode) + get_u16(bc + pos + 1) * 8;
+    case REOP_back_reference: case REOP_back_reference_i:
+    case REOP_backward_back_reference: case REOP_backward_back_reference_i:
+        return REOP_SZ(opcode) + (int)re_get_idx(bc + pos + 1) * RE_IDX_SZ;
+    default:
+        return REOP_SZ(opcode);
+    }
+}
+
 /* The header's counts are u32 for the same reason the opcodes' indices are, and aligned rather than packed
    because nothing reads this format off disk from another build. */
 #define RE_HEADER_FLAGS          0    /* u16 */
@@ -562,15 +586,12 @@ static __maybe_unused void lre_dump_bytecode(const uint8_t *buf,
     while (pos < bc_len) {
         printf("%5u: ", pos);
         opcode = buf[pos];
-        len = reopcode_info[opcode].size;
-        if (opcode >= REOP_COUNT) {
-            printf(" invalid opcode=0x%02x\n", opcode);
-            break;
-        }
-        if ((pos + len) > bc_len) {
-            printf(" buffer overflow (opcode=0x%02x)\n", opcode);
-            break;
-        }
+        /* This dump reads the byte code THIS compiler just emitted, so an opcode that is not one, or an
+           instruction running past the end, is a bug in the emitter and not a malformed input to survive.
+           It used to print a line and stop, which turns the emitter's bug into a truncated listing. */
+        len = re_ins_len(buf, pos);
+        DCHECK(pos + len <= bc_len, "a regexp instruction runs past the end of the program the compiler "
+               "emitted — the byte code length or the instruction's payload count is wrong");
         printf("%s", reopcode_info[opcode].name);
         switch(opcode) {
         case REOP_char:
@@ -628,7 +649,6 @@ static __maybe_unused void lre_dump_bytecode(const uint8_t *buf,
             {
                 uint32_t n; int i;
                 n = re_get_idx(buf + pos + 1);
-                len += n * RE_IDX_SZ;
                 for(i = 0; i < (int)n; i++) {
                     if (i != 0)
                         printf(",");
@@ -654,7 +674,6 @@ static __maybe_unused void lre_dump_bytecode(const uint8_t *buf,
             {
                 int n, i;
                 n = get_u16(buf + pos + 1);
-                len += n * 4;
                 for(i = 0; i < n * 2; i++) {
                     val = get_u16(buf + pos + 3 + i * 2);
                     printf(" 0x%04x", val);
@@ -666,7 +685,6 @@ static __maybe_unused void lre_dump_bytecode(const uint8_t *buf,
             {
                 int n, i;
                 n = get_u16(buf + pos + 1);
-                len += n * 8;
                 for(i = 0; i < n * 2; i++) {
                     val = get_u32(buf + pos + 3 + i * 4);
                     printf(" 0x%08x", val);
@@ -1741,7 +1759,6 @@ static bool re_need_check_adv_and_capture_init(bool *pneed_capture_init,
                                                const uint8_t *bc_buf, int bc_buf_len)
 {
     int pos, opcode, len;
-    uint32_t val;
     bool need_check_adv, need_capture_init;
 
     need_check_adv = true;
@@ -1749,18 +1766,12 @@ static bool re_need_check_adv_and_capture_init(bool *pneed_capture_init,
     pos = 0;
     while (pos < bc_buf_len) {
         opcode = bc_buf[pos];
-        len = reopcode_info[opcode].size;
+        len = re_ins_len(bc_buf, pos);
         switch(opcode) {
         case REOP_range:
         case REOP_range_i:
-            val = get_u16(bc_buf + pos + 1);
-            len += val * 4;
-            need_check_adv = false;
-            break;
         case REOP_range32:
         case REOP_range32_i:
-            val = get_u16(bc_buf + pos + 1);
-            len += val * 8;
             need_check_adv = false;
             break;
         case REOP_char:
@@ -1794,8 +1805,6 @@ static bool re_need_check_adv_and_capture_init(bool *pneed_capture_init,
         case REOP_back_reference_i:
         case REOP_backward_back_reference:
         case REOP_backward_back_reference_i:
-            val = re_get_idx(bc_buf + pos + 1);
-            len += val * RE_IDX_SZ;
             need_capture_init = true;
             break;
         default:
@@ -2836,27 +2845,11 @@ static bool re_op_matches_latin1(const uint8_t *bc, int pos)
    the header so an ordinary pattern never pays for the analysis below. */
 static bool re_program_has_non_latin1(const uint8_t *bc, int len)
 {
-    int pos = 0, opcode, oplen;
+    int pos = 0;
     while (pos < len) {
-        opcode = bc[pos];
-        oplen = reopcode_info[opcode].size;
-        switch (opcode) {
-        case REOP_range: case REOP_range_i:
-            oplen += get_u16(bc + pos + 1) * 4;
-            break;
-        case REOP_range32: case REOP_range32_i:
-            oplen += get_u16(bc + pos + 1) * 8;
-            break;
-        case REOP_back_reference: case REOP_back_reference_i:
-        case REOP_backward_back_reference: case REOP_backward_back_reference_i:
-            oplen += re_get_idx(bc + pos + 1) * RE_IDX_SZ;
-            break;
-        default:
-            break;
-        }
         if (!re_op_matches_latin1(bc, pos))
             return true;
-        pos += oplen;
+        pos += re_ins_len(bc, pos);
     }
     return false;
 }
@@ -2875,34 +2868,41 @@ static bool re_program_has_non_latin1(const uint8_t *bc, int len)
    its continuation is reachable either way, and its body's reachability is a separate question the executor
    asks for itself. Getting that backwards would turn "always succeeds" into "cannot match", which is why the
    two are spelled out rather than shared. */
-static bool re_compute_reach(const uint8_t *bc, int len, uint8_t *reach)
+static bool re_compute_reach(REExecContext *s, const uint8_t *bc, int len, uint8_t *reach)
 {
-    int pos, opcode, oplen, target, changed, guard;
+    int pos, nxt, opcode, target, changed, guard, i, n_ins;
+    int *offs;
 
     memset(reach, 0, len);
+
+    /* The instruction OFFSETS, so the sweep below can run in REVERSE program order. Information here flows
+       backward — from the terminators toward the entry — and a forward sweep advances it by one instruction
+       per pass, which is O(program^2): measured, `/(\u0100|x)(a?){32000}b/` took ten seconds where the same
+       pattern without the analysis took none. In reverse order a straight-line program converges in ONE pass
+       and only a backward branch costs another, so the guard below is a formality rather than the cost. */
+    n_ins = 0;
+    for (pos = 0; pos < len; pos += re_ins_len(bc, pos))
+        n_ins++;
+    offs = lre_realloc(s->opaque, NULL, sizeof(*offs) * (size_t)(n_ins ? n_ins : 1));
+    if (!offs)
+        return true;   /* no analysis, so no pruning — the match runs exactly as it did before */
+    i = 0;
+    for (pos = 0; pos < len; pos += re_ins_len(bc, pos))
+        offs[i++] = pos;
+
     /* `guard` bounds the sweeps at one per instruction, which is the fixpoint's own depth bound and not a cap
-       on anything the pattern can express: a value can flip only once, so len sweeps is the worst case. */
-    for (guard = 0; guard <= len; guard++) {
+       on anything the pattern can express: a value can flip only once, so n_ins sweeps is the worst case. */
+    for (guard = 0; guard <= n_ins; guard++) {
         changed = 0;
-        pos = 0;
-        while (pos < len) {
+        for (i = n_ins - 1; i >= 0; i--) {
             bool now;
+            /* `nxt` is where this instruction's CONTINUATION begins — the next offset in the table, or the end
+               of the program for the last one. Every branch operand in this byte code is relative to it, so it
+               is also the base every `target` below is computed from; taking it from the table rather than
+               re-decoding the instruction is what keeps a sweep linear in instructions. */
+            pos = offs[i];
+            nxt = (i + 1 < n_ins) ? offs[i + 1] : len;
             opcode = bc[pos];
-            oplen = reopcode_info[opcode].size;
-            switch (opcode) {
-            case REOP_range: case REOP_range_i:
-                oplen += get_u16(bc + pos + 1) * 4;
-                break;
-            case REOP_range32: case REOP_range32_i:
-                oplen += get_u16(bc + pos + 1) * 8;
-                break;
-            case REOP_back_reference: case REOP_back_reference_i:
-            case REOP_backward_back_reference: case REOP_backward_back_reference_i:
-                oplen += re_get_idx(bc + pos + 1) * RE_IDX_SZ;
-                break;
-            default:
-                break;
-            }
             switch (opcode) {
             case REOP_match:
             case REOP_lookahead_match:
@@ -2910,49 +2910,49 @@ static bool re_compute_reach(const uint8_t *bc, int len, uint8_t *reach)
                 now = true;                                   /* the terminators ARE success */
                 break;
             case REOP_goto:
-                target = pos + 5 + (int)get_u32(bc + pos + 1);
+                target = nxt + (int)get_u32(bc + pos + 1);
                 now = (target >= 0 && target < len) ? reach[target] : false;
                 break;
             case REOP_split_goto_first:
             case REOP_split_next_first:
-                target = pos + 5 + (int)get_u32(bc + pos + 1);
-                now = (pos + oplen < len && reach[pos + oplen]) ||
+                target = nxt + (int)get_u32(bc + pos + 1);
+                now = (nxt < len && reach[nxt]) ||
                       (target >= 0 && target < len && reach[target]);
                 break;
             case REOP_loop:
-                target = pos + oplen + (int)get_u32(bc + pos + 1 + RE_IDX_SZ);
-                now = (pos + oplen < len && reach[pos + oplen]) ||
+                target = nxt + (int)get_u32(bc + pos + 1 + RE_IDX_SZ);
+                now = (nxt < len && reach[nxt]) ||
                       (target >= 0 && target < len && reach[target]);
                 break;
             case REOP_loop_split_goto_first:
             case REOP_loop_split_next_first:
             case REOP_loop_check_adv_split_goto_first:
             case REOP_loop_check_adv_split_next_first:
-                target = pos + oplen + (int)get_u32(bc + pos + 1 + RE_IDX_SZ + 4);
-                now = (pos + oplen < len && reach[pos + oplen]) ||
+                target = nxt + (int)get_u32(bc + pos + 1 + RE_IDX_SZ + 4);
+                now = (nxt < len && reach[nxt]) ||
                       (target >= 0 && target < len && reach[target]);
                 break;
             case REOP_lookahead:
                 /* it succeeds only if its BODY does, and then the continuation must succeed too */
-                target = pos + 5 + (int)get_u32(bc + pos + 1);
-                now = (pos + oplen < len && reach[pos + oplen]) &&
+                target = nxt + (int)get_u32(bc + pos + 1);
+                now = (nxt < len && reach[nxt]) &&
                       (target >= 0 && target < len && reach[target]);
                 break;
             case REOP_negative_lookahead:
                 /* it succeeds when the body does NOT, so the continuation carries the answer by itself */
-                target = pos + 5 + (int)get_u32(bc + pos + 1);
+                target = nxt + (int)get_u32(bc + pos + 1);
                 now = (target >= 0 && target < len) ? reach[target] : false;
                 break;
             default:
-                now = re_op_matches_latin1(bc, pos) && pos + oplen < len && reach[pos + oplen];
+                now = re_op_matches_latin1(bc, pos) && nxt < len && reach[nxt];
                 break;
             }
             if (now && !reach[pos]) { reach[pos] = 1; changed = 1; }
-            pos += oplen;
         }
         if (!changed)
             break;
     }
+    lre_realloc(s->opaque, offs, 0);
     return reach[0] != 0;
 }
 
@@ -2961,7 +2961,6 @@ static bool re_compute_reach(const uint8_t *bc, int len, uint8_t *reach)
 static int compute_register_count(uint8_t *bc_buf, int bc_buf_len)
 {
     int stack_size, stack_size_max, pos, opcode, len;
-    uint32_t val;
 
     stack_size = 0;
     stack_size_max = 0;
@@ -2970,9 +2969,9 @@ static int compute_register_count(uint8_t *bc_buf, int bc_buf_len)
     pos = 0;
     while (pos < bc_buf_len) {
         opcode = bc_buf[pos];
-        len = reopcode_info[opcode].size;
-        assert(opcode < REOP_COUNT);
-        assert((pos + len) <= bc_buf_len);
+        len = re_ins_len(bc_buf, pos);
+        DCHECK(pos + len <= bc_buf_len, "the regexp register allocator walked an instruction that runs past "
+               "the end of the program — the emitter and this walker disagree on an instruction's length");
         switch(opcode) {
         case REOP_set_i32:
         case REOP_set_char_pos:
@@ -2985,32 +2984,17 @@ static int compute_register_count(uint8_t *bc_buf, int bc_buf_len)
         case REOP_loop:
         case REOP_loop_split_goto_first:
         case REOP_loop_split_next_first:
-            assert(stack_size > 0);
+            DCHECK(stack_size > 0, "a regexp loop opcode popped a register the program never pushed — the "
+                   "emitter's set/loop pairing is unbalanced");
             stack_size--;
             re_set_idx(bc_buf + pos + 1, stack_size);
             break;
         case REOP_loop_check_adv_split_goto_first:
         case REOP_loop_check_adv_split_next_first:
-            assert(stack_size >= 2);
+            DCHECK(stack_size >= 2, "a fused loop opcode popped two registers the program never pushed — the "
+                   "emitter's set/loop pairing is unbalanced");
             stack_size -= 2;
             re_set_idx(bc_buf + pos + 1, stack_size);
-            break;
-        case REOP_range:
-        case REOP_range_i:
-            val = get_u16(bc_buf + pos + 1);
-            len += val * 4;
-            break;
-        case REOP_range32:
-        case REOP_range32_i:
-            val = get_u16(bc_buf + pos + 1);
-            len += val * 8;
-            break;
-        case REOP_back_reference:
-        case REOP_back_reference_i:
-        case REOP_backward_back_reference:
-        case REOP_backward_back_reference_i:
-            val = re_get_idx(bc_buf + pos + 1);
-            len += val * RE_IDX_SZ;
             break;
         }
         pos += len;
@@ -3865,7 +3849,7 @@ int lre_exec_begin(REExecContext *s, uint8_t **capture,
         s->reach = lre_realloc(s->opaque, NULL, blen);
         if (!s->reach)
             return LRE_RET_MEMORY_ERROR;
-        s->impossible = !re_compute_reach(bc_buf + RE_HEADER_LEN, blen, s->reach);
+        s->impossible = !re_compute_reach(s, bc_buf + RE_HEADER_LEN, blen, s->reach);
     }
 
     for(i = 0; i < s->capture_count * 2; i++)
