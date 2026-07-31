@@ -24438,9 +24438,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     b = p->u.func.function_bytecode;
 
     if (unlikely(g_flow_base_gen != NULL)) {
-        /* A BYTECODE BODY ENTERED BY C RECURSION while a flow exists. It cannot suspend: the scheduler has no way
-           to park it, so it runs to completion. See g_sync_drive_to_completion. */
-        FLOW_PREEMPT_COUNT(g_sync_drive_to_completion);
+        /* A BYTECODE BODY ENTERED BY C RECURSION while a flow exists. It cannot suspend — the scheduler has no
+           way to park it — so it runs to completion, and a loop inside it holds the whole frontier.
+           THIS IS A DFAIL, NOT A COUNT. It was a counter, and a counter is the shape the design forbids: it
+           lets a suite stay green while a non-suspending path keeps running, and it reports only what the run
+           happened to exercise. The corpus has read 0 for a while, which is what makes the crash affordable —
+           when it fires it names a C entry that still drives the page's code, and the fix is to route that
+           call shape through the trampoline or make its builtin a step machine, never to re-add the register. */
+        DFAIL("a bytecode body was entered by C recursion below a live flow — it cannot suspend, so a loop "
+              "inside it drives to completion; route that call site through the trampoline or make its "
+              "builtin a step machine");
+        FLOW_PREEMPT_COUNT(g_sync_drive_to_completion);   /* release: no fix is possible, so it is counted */
     }
 
     if (unlikely(argc < b->arg_count || (flags & JS_CALL_FLAG_COPY_ARGV))) {
