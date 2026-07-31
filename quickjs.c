@@ -17360,6 +17360,12 @@ static void close_lexical_var(JSContext *ctx, JSFunctionBytecode *b,
    captures the invocation into the header, and calls step with stage 0, so a prologue requests work exactly the
    way a body does. Allocation is the driver's because a machine that allocates its own state has, by that fact,
    a phase that runs before it can step. */
+/* At FILE SCOPE, before JSTrampStepDef names it in a function-pointer parameter list. Without this, the first
+   `struct JSStepHdr` the compiler sees is inside that prototype, where a struct tag's scope ENDS with the
+   prototype — so the field's type and the real JSStepHdr are DIFFERENT types, and every precheck assigned to it
+   is an incompatible-function-pointer initialisation. gcc says so and our `-w` build swallowed it; clang, run
+   for the call-graph checker, is what surfaced it. The ABI matched, so nothing ever failed. */
+struct JSStepHdr;
 typedef struct JSTrampStepDef {
     size_t   size;
     int     (*step)(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
@@ -67011,7 +67017,7 @@ static const JSTrampStepDef js_bigint_ctor_def =
     { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, PRIMARGS(0x1, HINT_NUMBER, 1),
       { .generic = js_bigint_constructor }, JS_CFUNC_constructor_or_func, 0, NULL, NULL, NULL };
 static JSValue js_symbol_constructor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv);
-static int js_symbol_ctor_precheck(JSContext *ctx, JSStepHdr *h);
+static int js_symbol_ctor_precheck(JSContext *ctx, const JSStepHdr *h);
 /* 20.4.1.1 Symbol([description]): step 1 rejects a NewTarget, step 2 is `? ToString(description)`, and the rest
    invokes nothing — the coerce-then-compute declaration, with the NewTarget test as the leading validation
    because it must throw BEFORE the description's toString runs. js_symbol_constructor ran that ToString from
@@ -67124,7 +67130,7 @@ static const JSTrampStepDef js_encodeURIComp_def  = PRIMARGS_DEF(PRIMARGS(0x1, H
 static const JSTrampStepDef js_global_escape_def  = PRIMARGS_DEF(PRIMARGS(0x1, HINT_STRING, 1), generic, js_global_escape, 0);
 static const JSTrampStepDef js_global_unescape_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_STRING, 1), generic, js_global_unescape, 0);
 static JSValue js_date_setTime(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
-static int js_date_this_precheck(JSContext *ctx, JSStepHdr *h);
+static int js_date_this_precheck(JSContext *ctx, const JSStepHdr *h);
 static int js_date_set_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_date_set_fini(JSContext *ctx, void *st, bool take_result);
 /* 21.4.4.20-.28 and B.2.3.1. Each setter reads [[DateValue]] at step 2, ToNumbers every argument the spec names
@@ -80023,7 +80029,7 @@ JSValue JS_GetProxyHandler(JSContext *ctx, JSValueConst proxy)
 
 /* 20.4.1.1 step 1: `new Symbol()` is a TypeError BEFORE the description is coerced. For a constructor step the
    header's this_val IS new_target, which is the same operand the C body took. */
-static int js_symbol_ctor_precheck(JSContext *ctx, JSStepHdr *h)
+static int js_symbol_ctor_precheck(JSContext *ctx, const JSStepHdr *h)
 {
     if (!JS_IsUndefined(h->this_val)) {
         JS_ThrowTypeErrorNotAConstructor(ctx, h->this_val);
@@ -84847,7 +84853,7 @@ static JSValue get_date_field(JSContext *ctx, JSValueConst this_val,
 
 /* 21.4.4.27 step 1: RequireInternalSlot(dateObject, [[DateValue]]) precedes setTime's ToNumber, so a receiver
    that is not a Date throws before the page's valueOf runs rather than after it. */
-static int js_date_this_precheck(JSContext *ctx, JSStepHdr *h)
+static int js_date_this_precheck(JSContext *ctx, const JSStepHdr *h)
 {
     double d;
     return JS_ThisTimeValue(ctx, &d, h->this_val);
