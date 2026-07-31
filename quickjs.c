@@ -56819,10 +56819,26 @@ static __exception int js_parse_function_decl2(JSParseState *s,
     }
 
     if (func_type == JS_PARSE_FUNC_VAR) {
+        /* B.3.2.1's condition, in the order it states it. A lexical declaration of the same name is what makes
+           "replacing the FunctionDeclaration with a VariableStatement would produce an Early Error" true — with
+           ONE exception: the binding this very declaration is about to create, or the one an EARLIER function
+           declaration in the same block already created, which B.3.3.4 explicitly allows to be redefined.
+           Excluding those too meant only the FIRST of `{ function f(){3}; function f(){4} }` reached the var, so
+           the outer binding kept the function the block's own binding no longer held. */
+        int lex_idx = find_lexical_decl(ctx, fd, func_name, fd->scope_first, false);
+        bool lex_is_redefinable_func =
+            (lex_idx >= 0 && lex_idx < GLOBAL_VAR_OFFSET &&
+             fd->vars[lex_idx].scope_level == fd->scope_level &&
+             fd->vars[lex_idx].var_kind == JS_VAR_FUNCTION_DECL);
         if (!fd->is_strict_mode
         && func_kind == JS_FUNC_NORMAL
-        &&  find_lexical_decl(ctx, fd, func_name, fd->scope_first, false) < 0
+        &&  (lex_idx < 0 || lex_is_redefinable_func)
         &&  !((func_idx = find_var(ctx, fd, func_name)) >= 0 && (func_idx & ARGUMENT_VAR_OFFSET))
+        /* "F is not an element of parameterNames", and FunctionDeclarationInstantiation step 22.f APPENDS
+           "arguments" to parameterNames whenever the arguments object is needed — so a block-level
+           `function arguments(){}` never reaches the enclosing binding and `arguments` stays the Arguments
+           object. (sm/lexical-environment/block-scoped-functions-annex-b-arguments asserts the opposite; the
+           spec citation and annexB/.../block-decl-func-skip-arguments are the oracle.) */
         &&  !(func_name == JS_ATOM_arguments && fd->has_arguments_binding)) {
             create_func_var = true;
         }
