@@ -21674,7 +21674,9 @@ typedef struct JSArrayEvery {
     JSValue ta_dest;      /* filter|TA: the species-created typed array, held across its `set` (owned) */
     JSValue def_val;      /* the element being WRITTEN into the result, held across the write (owned) */
     int64_t def_k;        /* its index — captured, because filter's n advances once and the write can suspend */
-    uint8_t def_ph;       /* 1 = a write into the result is in flight */
+    uint8_t def_ph;       /* 1 = a DEFINE into the result is in flight; 2 = a TypedArray SET is, whose value is
+                             being coerced. Two states rather than two flags because they are the same fact —
+                             which write is suspended — and only one write is ever in flight. */
     /* cb_args[0..2] are BORROWED views for the callback drive, with ONE exception: the TypedArray-filter
        writeback holds an OWNED [dest, `set`, collected] there across the call to the destination's `set`. That
        is a fact about the three slots, so it is a flag on them and not something inferred from a stage — the
@@ -67086,6 +67088,8 @@ static int js_array_every_step(JSContext *ctx, JSArrayEvery *s, JSValue res, JSV
        index whose callback result is `res` now — a drift would double-process or skip an element. */
     assert(s->k >= 0 && s->k <= s->len);
     assert(s->pending_k == -1 || (s->pending_k >= 0 && s->pending_k < s->len));
+    if (s->def_ph == 2)          /* re-entered mid-coercion of a TypedArray write's value */
+        goto do_ta_write;
     if (s->def_ph)               /* re-entered mid-write: the driver has performed it */
         goto do_result_write;
     if (s->pending_k >= 0) {
@@ -67107,8 +67111,13 @@ static int js_array_every_step(JSContext *ctx, JSArrayEvery *s, JSValue res, JSV
             res = JS_UNDEFINED;
             goto do_result_write;
         case special_map | special_TA:
-            if (JS_SetPropertyValue(ctx, s->ret, js_int32(k), res, JS_PROP_THROW) < 0) return -1;
-            break;
+            /* 23.2.3.20 step 6.c is `? Set(A, Pk, mappedValue, true)`, and 10.4.5.16 TypedArraySetElement's
+               FIRST step coerces the value with ToBigInt or ToNumber — the page's valueOf or toString whenever
+               the callback returned an object. JS_SetPropertyValue performed that coercion inside itself, from
+               C, below a live flow, so `ta.map(() => ({valueOf(){ … }}))` drove it to completion. */
+            s->def_k = k; s->def_val = res; s->def_ph = 2;
+            res = JS_UNDEFINED;
+            goto do_ta_write;
         case special_filter:
         case special_filter | special_TA:
             if (JS_ToBoolFree(ctx, res)) {
@@ -67125,6 +67134,22 @@ static int js_array_every_step(JSContext *ctx, JSArrayEvery *s, JSValue res, JSV
         JS_FreeValue(ctx, s->val);
         s->val = JS_UNDEFINED;
         res = JS_UNDEFINED;   /* the switch above consumed it on every arm */
+    }
+    goto advance;
+
+ do_ta_write:
+    /* 10.4.5.16 step 1/2, as a request. Once the value is a PRIMITIVE the store's own ToNumber/ToBigInt invokes
+       nothing, so the write itself is ordinary C — and the coercion has demonstrably happened BEFORE the index
+       is tested for validity, which is the order TypedArraySetElement states. */
+    {
+        JSValue prim;
+        r = step_toprim_run(ctx, &s->hdr, s->def_val, HINT_NUMBER, res, &prim, out_cb, out_argc);
+        res = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        JS_FreeValue(ctx, s->def_val); s->def_val = JS_UNDEFINED;
+        s->def_ph = 0;
+        if (JS_SetPropertyValue(ctx, s->ret, js_int32(s->def_k), prim, JS_PROP_THROW) < 0) return -1;
+        JS_FreeValue(ctx, s->val); s->val = JS_UNDEFINED;
     }
     goto advance;
 
