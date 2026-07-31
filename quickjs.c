@@ -8412,6 +8412,49 @@ JSValue JS_Throw(JSContext *ctx, JSValue obj)
 /* return the pending exception (cannot be called twice). */
 static bool js_error_stack_is_pending(JSValueConst v);
 
+/* THE NAME OF THE RECEIVER'S TYPE, read WITHOUT running a line of the page's code — the same discipline
+   get_func_name follows, and for the same reason: a stack trace is built while an exception is in flight, so
+   invoking a getter here would run user code at a point nothing is prepared for. V8 takes the name off the
+   map's constructor; quickjs has no such link, so the equivalent is the prototype's OWN `constructor` data
+   property, which is where `new Foo()` records Foo. A Proxy is answered by name rather than walked, because
+   walking it is a trap call. JS_NULL when the frame is not a method call. */
+static const char *get_func_name(JSContext *ctx, JSValueConst func);
+static JSValue js_callsite_type_name(JSContext *ctx, const JSCallSiteData *csd)
+{
+    JSObject *p, *proto;
+    JSProperty *pr;
+    JSShapeProperty *prs;
+    const char *name;
+    JSValue r;
+
+    /* V8: a type name belongs to a METHOD call — not to a top-level one, and not to a construct, whose name
+       the formatter already spells as "new F". */
+    if (csd->constructor)
+        return JS_NULL;
+    if (JS_VALUE_GET_TAG(csd->this_val) != JS_TAG_OBJECT)
+        return JS_NULL;
+    p = JS_VALUE_GET_OBJ(csd->this_val);
+    if (p == JS_VALUE_GET_OBJ(ctx->global_obj))
+        return JS_NULL;
+    if (p->class_id == JS_CLASS_PROXY)
+        return JS_NewString(ctx, "Proxy");
+    for (proto = p->shape->proto; proto != NULL; proto = proto->shape->proto) {
+        if (proto->class_id == JS_CLASS_PROXY)
+            break;
+        prs = find_own_property(&pr, proto, JS_ATOM_constructor);
+        if (!prs || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+            continue;
+        name = get_func_name(ctx, pr->u.value);
+        if (!name)
+            continue;
+        r = JS_NewString(ctx, name);
+        JS_FreeCString(ctx, name);
+        return r;
+    }
+    /* no constructor to name: the object's own class, which is what [[Class]] gives V8 in the same case */
+    return JS_AtomToString(ctx, ctx->rt->class_array[p->class_id].class_name);
+}
+
 /* ONE LINE OF THE DEFAULT STACK FORMATTING. There were two renderings of a captured frame — this one, and the
    DynBuf the backtrace walk printed as it went — and having the second inside the walk is what made the default
    formatting unreachable from anywhere else. It has to be reachable from the `.stack` accessor: a read that
@@ -8431,8 +8474,24 @@ static void js_callsite_data_line(JSContext *ctx, DynBuf *dbuf, const JSCallSite
         dbuf_putc(dbuf, '\n');
         return;
     }
+    /* V8's default rendering names the FRAME, not just the function: a construct is "new Plonk", a method call
+       is "Foo.bar". Both are already in the record — the second is the receiver's type, which is why a frame
+       had to learn its receiver before this line could be written. */
+    dbuf_printf(dbuf, "    at ");
+    if (csd->constructor) {
+        dbuf_printf(dbuf, "new ");
+    } else {
+        JSValue tn = js_callsite_type_name(ctx, csd);
+        if (JS_IsString(tn)) {
+            s = JS_ToCString(ctx, tn);
+            if (s && s[0])
+                dbuf_printf(dbuf, "%s.", s);
+            JS_FreeCString(ctx, s);
+        }
+        JS_FreeValue(ctx, tn);
+    }
     s = JS_IsNull(csd->func_name) ? NULL : JS_ToCString(ctx, csd->func_name);
-    dbuf_printf(dbuf, "    at %s", (s && s[0]) ? s : "<anonymous>");
+    dbuf_printf(dbuf, "%s", (s && s[0]) ? s : "<anonymous>");
     JS_FreeCString(ctx, s);
     if (csd->native) {
         dbuf_printf(dbuf, " (native)");
@@ -92010,42 +92069,9 @@ static JSValue js_callsite_getthis(JSContext *ctx, JSValueConst this_val, int ar
 static JSValue js_callsite_gettypename(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
 {
     JSCallSiteData *csd = JS_GetOpaque2(ctx, this_val, JS_CLASS_CALL_SITE);
-    JSObject *p, *proto;
-    JSProperty *pr;
-    JSShapeProperty *prs;
-    const char *name;
-    JSValue r;
-
     if (!csd)
         return JS_EXCEPTION;
-    /* V8: a type name belongs to a METHOD call — not to a top-level one, and not to a construct, whose name
-       the formatter already spells as "new F". */
-    if (csd->constructor)
-        return JS_NULL;
-    if (JS_IsUndefined(csd->this_val) || JS_IsNull(csd->this_val))
-        return JS_NULL;
-    if (JS_VALUE_GET_TAG(csd->this_val) != JS_TAG_OBJECT)
-        return JS_NULL;
-    p = JS_VALUE_GET_OBJ(csd->this_val);
-    if (p == JS_VALUE_GET_OBJ(ctx->global_obj))
-        return JS_NULL;
-    if (p->class_id == JS_CLASS_PROXY)
-        return JS_NewString(ctx, "Proxy");
-    for (proto = p->shape->proto; proto != NULL; proto = proto->shape->proto) {
-        if (proto->class_id == JS_CLASS_PROXY)
-            break;
-        prs = find_own_property(&pr, proto, JS_ATOM_constructor);
-        if (!prs || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
-            continue;
-        name = get_func_name(ctx, pr->u.value);
-        if (!name)
-            continue;
-        r = JS_NewString(ctx, name);
-        JS_FreeCString(ctx, name);
-        return r;
-    }
-    /* no constructor to name: the object's own class, which is what [[Class]] gives V8 in the same case */
-    return JS_AtomToString(ctx, ctx->rt->class_array[p->class_id].class_name);
+    return js_callsite_type_name(ctx, csd);
 }
 
 /* IS THIS FRAME EVAL CODE, and WHERE WAS THAT eval CALLED. V8's stack formatter asks isEval before every
