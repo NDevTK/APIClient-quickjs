@@ -932,7 +932,11 @@ typedef struct JSFunctionBytecode {
     uint8_t super_allowed : 1;
     uint8_t arguments_allowed : 1;
     uint8_t backtrace_barrier : 1; /* stop backtrace on this function */
-    /* XXX: 5 bits available */
+    /* THIS CODE CAME FROM AN eval, which is a property of the SCRIPT and not of the function: a function
+       declared inside an eval'd source is eval code too, so the flag rides down the whole nest. V8's
+       CallSite#isEval reports it, and its own stack formatter asks before anything else. */
+    uint8_t from_eval : 1;
+    /* XXX: 4 bits available */
     uint8_t *byte_code_buf; /* (self pointer) */
     int byte_code_len;
     JSAtom func_name;
@@ -948,6 +952,10 @@ typedef struct JSFunctionBytecode {
     JSContext *realm; /* function realm */
     JSValue *cpool; /* constant pool (self pointer) */
     JSAtom filename;
+    /* WHERE THE eval WAS CALLED, rendered once at compile time — "eval at f (file:12:3)", the string V8's
+       CallSite#getEvalOrigin returns. It is the CALLER's position, so it can only be read while that caller is
+       still on the stack, which is exactly when the code is being compiled. JS_ATOM_NULL unless from_eval. */
+    JSAtom eval_origin;
     int line_num;
     int col_num;
     int source_len;
@@ -1334,7 +1342,9 @@ typedef struct JSCallSiteData {
     JSValue func;
     JSValue func_name;
     JSValue this_val;   /* the frame's RECEIVER: getThis, getTypeName and isToplevel are all about it */
+    JSValue eval_origin; /* JS_NULL unless is_eval: the compile-time rendering of where the eval was called */
     bool native;
+    bool is_eval;       /* this code, or the code it is nested in, came from an eval */
     bool constructor;
     bool strict;        /* a strict frame does not hand its receiver or its function to a stack formatter */
     int line_num;
@@ -8650,6 +8660,49 @@ static const char *get_func_name(JSContext *ctx, JSValueConst func)
     return JS_ToCString(ctx, val);
 }
 
+/* "eval at f (file:12:3)" — V8's rendering of WHERE an eval was called, for CallSite#getEvalOrigin. The
+   caller is the frame this compile is happening under, so this is only meaningful at compile time; the atom it
+   returns rides the compiled code. JS_ATOM_NULL when there is no caller frame (the host called eval itself),
+   which is what V8 reports as an eval with no origin. Runs no page code, for the same reason get_func_name
+   does not: it is called with whatever the caller was doing still in flight. */
+static JSAtom js_eval_origin_atom(JSContext *ctx)
+{
+    JSStackFrame *sf = ctx->rt->current_stack_frame;
+    JSFunctionBytecode *b = NULL;
+    const char *name, *file;
+    int line = -1, col = -1;
+    JSObject *p;
+    DynBuf dbuf;
+    JSAtom atom;
+
+    while (sf && sf->is_call_root)
+        sf = sf->prev_frame;
+    if (!sf)
+        return JS_ATOM_NULL;
+    js_dbuf_init(ctx, &dbuf);
+    name = get_func_name(ctx, sf->cur_func);
+    dbuf_printf(&dbuf, "eval at %s", (name && name[0]) ? name : "<anonymous>");
+    JS_FreeCString(ctx, name);
+    if (JS_VALUE_GET_TAG(sf->cur_func) == JS_TAG_OBJECT) {
+        p = JS_VALUE_GET_OBJ(sf->cur_func);
+        if (js_class_has_bytecode(p->class_id))
+            b = p->u.func.function_bytecode;
+    }
+    if (b && sf->cur_pc) {
+        line = find_line_num(ctx, b, sf->cur_pc - b->byte_code_buf - 1, &col);
+        file = b->filename ? JS_AtomToCString(ctx, b->filename) : NULL;
+        dbuf_printf(&dbuf, " (%s", file ? file : "<null>");
+        JS_FreeCString(ctx, file);
+        if (line != -1)
+            dbuf_printf(&dbuf, ":%d:%d", line, col);
+        dbuf_putc(&dbuf, ')');
+    }
+    dbuf_putc(&dbuf, '\0');
+    atom = dbuf_error(&dbuf) ? JS_ATOM_NULL : JS_NewAtom(ctx, (char *)dbuf.buf);
+    dbuf_free(&dbuf);
+    return atom;
+}
+
 /* Note: it is important that no exception is returned by this function */
 static bool can_add_backtrace(JSValueConst obj)
 {
@@ -8816,6 +8869,7 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
             JS_FreeValue(ctx, csd[k].func);
             JS_FreeValue(ctx, csd[k].func_name);
             JS_FreeValue(ctx, csd[k].this_val);
+            JS_FreeValue(ctx, csd[k].eval_origin);
         }
         /* Error.prepareStackTrace is the PAGE's code, and build_backtrace runs under every internal throw —
            an activation with no flow base, where a JS_Call drives the hook's body to completion and its first
@@ -8837,6 +8891,7 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
             JS_FreeValue(ctx, csd[k].func);
             JS_FreeValue(ctx, csd[k].func_name);
             JS_FreeValue(ctx, csd[k].this_val);
+            JS_FreeValue(ctx, csd[k].eval_origin);
         }
         /* `prepare` is whatever Error.prepareStackTrace held; a non-function value was read and never released
            before, which leaked one reference per throw for a page that assigned an object to it. */
@@ -18416,8 +18471,13 @@ enum { PROG_PH_START = 0, PROG_PH_RAN };
 
 static inline bool tramp_body_is_plain(JSValueConst func);
 
+/* `origin_flags` is JS_EVAL_FLAG_FUNCTION_CTOR for the Function constructor and 0 for the indirect eval. The
+   two share this body because their algorithm IS the same program evaluation — and they are not the same
+   ORIGIN: `new Function` produces code with no eval origin and CallSite#isEval must say so. Passing the flag
+   in rather than hardcoding it here is the difference between one implementation and one implementation that
+   quietly asserts both callers are the same thing; hardcoded, indirect eval reported itself as not an eval. */
 static int step_program_run(JSContext *ctx, JSStepHdr *h, JSValueConst src, JSValue in, JSValue *pout,
-                            JSValue **out_cb, int *out_argc)
+                            JSValue **out_cb, int *out_argc, int origin_flags)
 {
     if (h->prog_phase == PROG_PH_START) {
         JSValue clo;
@@ -18432,7 +18492,7 @@ static int step_program_run(JSContext *ctx, JSStepHdr *h, JSValueConst src, JSVa
         if (!str)
             return -1;
         clo = JS_EvalInternal(ctx, ctx->global_obj, str, len, "<input>", 1,
-                              JS_EVAL_TYPE_INDIRECT | JS_EVAL_FLAG_TRAMP_CLOSURE, -1);
+                              JS_EVAL_TYPE_INDIRECT | JS_EVAL_FLAG_TRAMP_CLOSURE | origin_flags, -1);
         JS_FreeCString(ctx, str);
         if (JS_IsException(clo))
             return -1;
@@ -40285,6 +40345,8 @@ typedef struct JSFunctionDef {
     /* Pack all boolean flags together as 1-bit fields to reduce struct size
     while avoiding padding and compiler deoptimization. */
     bool is_eval : 1; /* true if eval code */
+    bool from_eval : 1; /* true if this code, or the code it is nested in, came from an eval (not a script,
+                           and not the Function constructor) — inherited from the parent def */
     bool is_global_var : 1; /* true if variables are not defined locally:
                            eval global, eval module or non strict eval */
     bool is_func_expr : 1; /* true if function expression */
@@ -40390,6 +40452,7 @@ typedef struct JSFunctionDef {
 
     /* pc2line table */
     JSAtom filename;
+    JSAtom eval_origin;   /* JS_ATOM_NULL unless from_eval: see JSFunctionBytecode.eval_origin */
     int line_num;
     int col_num;
     DynBuf pc2line;
@@ -51575,6 +51638,11 @@ static JSFunctionDef *js_new_function_def(JSContext *ctx,
     fd->filename = JS_NewAtom(ctx, filename);
     fd->line_num = line_num;
     fd->col_num = col_num;
+    /* eval-ness is a property of the SCRIPT: a function declared inside an eval'd source is eval code too.
+       The program def sets both from its eval_type; every nested def inherits them here. */
+    fd->from_eval = parent ? parent->from_eval : false;
+    fd->eval_origin = (parent && parent->eval_origin != JS_ATOM_NULL)
+                      ? JS_DupAtom(ctx, parent->eval_origin) : JS_ATOM_NULL;
 
     js_dbuf_init(ctx, &fd->pc2line);
     //fd->pc2line_last_line_num = line_num;
@@ -51674,6 +51742,7 @@ static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd)
         js_free(ctx, fd->scopes);
 
     JS_FreeAtom(ctx, fd->filename);
+    JS_FreeAtom(ctx, fd->eval_origin);
     dbuf_free(&fd->pc2line);
 
     js_free(ctx, fd->source);
@@ -55653,6 +55722,9 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
        JSFunctionBytecode structure, avoiding allocation overhead
      */
     b->filename = fd->filename;
+    b->from_eval = fd->from_eval;
+    b->eval_origin = fd->eval_origin;   /* HANDED OVER, like filename above; the def no longer owns it */
+    fd->eval_origin = JS_ATOM_NULL;
     b->line_num = fd->line_num;
     b->col_num = fd->col_num;
 
@@ -55737,6 +55809,7 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
 
     JS_FreeAtomRT(rt, b->func_name);
     JS_FreeAtomRT(rt, b->filename);
+    JS_FreeAtomRT(rt, b->eval_origin);
     js_free_rt(rt, b->pc2line_buf);
     js_free_rt(rt, b->source);
 
@@ -56752,6 +56825,14 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
     s->cur_func = fd;
     fd->eval_type = eval_type;
     fd->has_this_binding = (eval_type != JS_EVAL_TYPE_DIRECT);
+    /* EVAL ORIGIN. `new Function` compiles as an indirect eval and is not one, which is the only thing
+       JS_EVAL_FLAG_FUNCTION_CTOR exists to say. For a real eval the origin is the CALLER's position, so it is
+       taken here — while that caller is still on the stack — and rendered once; a CallSite cannot go looking
+       for it later, because by then the frame is gone. */
+    fd->from_eval = (eval_type == JS_EVAL_TYPE_DIRECT || eval_type == JS_EVAL_TYPE_INDIRECT) &&
+                    !(flags & JS_EVAL_FLAG_FUNCTION_CTOR);
+    if (fd->from_eval)
+        fd->eval_origin = js_eval_origin_atom(ctx);
     fd->backtrace_barrier = ((flags & JS_EVAL_FLAG_BACKTRACE_BARRIER) != 0);
     if (eval_type == JS_EVAL_TYPE_DIRECT) {
         fd->new_target_allowed = b->new_target_allowed;
@@ -59628,7 +59709,7 @@ typedef struct JSProgEval {
 static int js_global_eval_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSProgEval *s = st;
-    int r = step_program_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->result, out_cb, out_argc);
+    int r = step_program_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->result, out_cb, out_argc, 0);
     return r ? (r < 0 ? -1 : r) : 0;
 }
 
@@ -61734,12 +61815,14 @@ static int js_dynfunc_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
         if (JS_IsException(src))
             return -1;
         s->hdr.stage = 2;
-        r = step_program_run(ctx, &s->hdr, src, JS_UNDEFINED, &s->func, out_cb, out_argc);
+        r = step_program_run(ctx, &s->hdr, src, JS_UNDEFINED, &s->func, out_cb, out_argc,
+                             JS_EVAL_FLAG_FUNCTION_CTOR);
         JS_FreeValue(ctx, src);
         if (r) return r < 0 ? -1 : r;
         created = true;
     } else if (s->hdr.stage == 2) {
-        r = step_program_run(ctx, &s->hdr, JS_UNDEFINED, cb_result, &s->func, out_cb, out_argc);
+        r = step_program_run(ctx, &s->hdr, JS_UNDEFINED, cb_result, &s->func, out_cb, out_argc,
+                             JS_EVAL_FLAG_FUNCTION_CTOR);
         if (r) return r < 0 ? -1 : r;
         created = true;
     }
@@ -91674,6 +91757,7 @@ static void js_callsite_finalizer(JSRuntime *rt, JSValueConst val)
         JS_FreeValueRT(rt, csd->func);
         JS_FreeValueRT(rt, csd->func_name);
         JS_FreeValueRT(rt, csd->this_val);
+        JS_FreeValueRT(rt, csd->eval_origin);
         js_free_rt(rt, csd);
     }
 }
@@ -91687,6 +91771,7 @@ static void js_callsite_mark(JSRuntime *rt, JSValueConst val,
         JS_MarkValue(rt, csd->func, mark_func);
         JS_MarkValue(rt, csd->func_name, mark_func);
         JS_MarkValue(rt, csd->this_val, mark_func);
+        JS_MarkValue(rt, csd->eval_origin, mark_func);
     }
 }
 
@@ -91786,6 +91871,13 @@ static void js_new_callsite_data(JSContext *ctx, JSCallSiteData *csd, JSStackFra
                                   sf->cur_pc - b->byte_code_buf - 1,
                                   &col_num1);
         csd->native = false;
+        csd->is_eval = b->from_eval;
+        csd->eval_origin = b->eval_origin != JS_ATOM_NULL
+                           ? JS_AtomToString(ctx, b->eval_origin) : JS_NULL;
+        if (JS_IsException(csd->eval_origin)) {
+            csd->eval_origin = JS_NULL;
+            JS_FreeValue(ctx, JS_GetException(ctx));
+        }
         csd->line_num = line_num1;
         csd->col_num = col_num1;
         csd->filename = JS_AtomToString(ctx, b->filename);
@@ -91795,6 +91887,8 @@ static void js_new_callsite_data(JSContext *ctx, JSCallSiteData *csd, JSStackFra
         }
     } else {
         csd->native = true;
+        csd->is_eval = false;
+        csd->eval_origin = JS_NULL;
         csd->line_num = -1;
         csd->col_num = -1;
         csd->filename = JS_NULL;
@@ -91806,7 +91900,9 @@ static void js_new_callsite_data2(JSContext *ctx, JSCallSiteData *csd, const cha
     csd->func = JS_NULL;
     csd->func_name = JS_NULL;
     csd->this_val = JS_UNDEFINED;   /* a parse error has no activation, so it has no receiver either */
+    csd->eval_origin = JS_NULL;
     csd->native = false;
+    csd->is_eval = false;
     csd->constructor = false;
     csd->strict = false;
     csd->line_num = line_num;
@@ -91918,6 +92014,16 @@ static JSValue js_callsite_gettypename(JSContext *ctx, JSValueConst this_val, in
     return JS_AtomToString(ctx, ctx->rt->class_array[p->class_id].class_name);
 }
 
+/* IS THIS FRAME EVAL CODE, and WHERE WAS THAT eval CALLED. V8's stack formatter asks isEval before every
+   other question about a frame, which is why its absence took out mjsunit's formatter entirely. */
+static JSValue js_callsite_iseval(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+    JSCallSiteData *csd = JS_GetOpaque2(ctx, this_val, JS_CLASS_CALL_SITE);
+    if (!csd)
+        return JS_EXCEPTION;
+    return js_bool(csd->is_eval);
+}
+
 static JSValue js_callsite_getnumber(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic)
 {
     JSCallSiteData *csd = JS_GetOpaque2(ctx, this_val, JS_CLASS_CALL_SITE);
@@ -91931,6 +92037,8 @@ static const JSCFunctionListEntry js_callsite_proto_funcs[] = {
     JS_CFUNC_DEF("isNative", 0, js_callsite_isnative),
     JS_CFUNC_DEF("isConstructor", 0, js_callsite_isconstructor),
     JS_CFUNC_DEF("isToplevel", 0, js_callsite_istoplevel),
+    JS_CFUNC_DEF("isEval", 0, js_callsite_iseval),
+    JS_CFUNC_MAGIC_DEF("getEvalOrigin", 0, js_callsite_getfield, offsetof(JSCallSiteData, eval_origin)),
     JS_CFUNC_DEF("getThis", 0, js_callsite_getthis),
     JS_CFUNC_DEF("getTypeName", 0, js_callsite_gettypename),
     JS_CFUNC_MAGIC_DEF("getFileName", 0, js_callsite_getfield, offsetof(JSCallSiteData, filename)),

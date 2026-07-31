@@ -451,7 +451,11 @@ static inline bool JS_VALUE_IS_NAN(JSValue v)
 #define JS_EVAL_TYPE_MASK     (3 << 0)
 
 #define JS_EVAL_FLAG_STRICT   (1 << 3) /* force 'strict' mode */
-#define JS_EVAL_FLAG_UNUSED   (1 << 4) /* unused */
+/* INTERNAL: the source is the FUNCTION CONSTRUCTOR's body, not an eval. It compiles as an indirect eval and
+   is not one: `new Function("...")` creates a function whose code has no eval origin, and CallSite#isEval
+   must say so. The bit was `JS_EVAL_FLAG_UNUSED` and now says which of the two callers of indirect eval this
+   is — the only thing that can tell them apart, since everything else about the two calls is identical. */
+#define JS_EVAL_FLAG_FUNCTION_CTOR (1 << 4)
 /* compile but do not run. The result is an object with a
    JS_TAG_FUNCTION_BYTECODE or JS_TAG_MODULE tag. It can be executed
    with JS_EvalFunction(). */
