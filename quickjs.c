@@ -45703,7 +45703,12 @@ static int js_parse_destructuring_element(JSParseState *s, int tok,
             label_lvalue = -1;
             depth_lvalue = 0;
             if (prop_type == PROP_TYPE_IDENT) {
-                if (next_token(s))
+                /* BindingProperty : PropertyName `:` BindingElement. The SHORTHAND is PROP_TYPE_VAR, and only a
+                   non-reserved IdentifierReference ever becomes one — a string, a number, a computed name or a
+                   reserved word therefore OWES a colon here. Skipping the next token without asking what it was
+                   made `var {'', q} = {q: 0}` mean `var {'': q}` and `function f({q, 'bad', c}){}` legal, while
+                   the same names alone were rejected a token later for a different reason. */
+                if (js_parse_expect(s, ':'))
                     goto prop_error;
                 if ((s->token.val == '[' || s->token.val == '{')
                     &&  ((tok1 = js_parse_skip_parens_token(s, &skip_bits, false)) == ',' ||
