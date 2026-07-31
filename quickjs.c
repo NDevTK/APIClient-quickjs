@@ -19152,6 +19152,8 @@ static const JSStepVisit js_step_visit_free;
 /* The element visit for an array OF PLAIN VALUES — a machine's own gathered argument block. Shared, because
    more than one machine builds one and the element question has exactly one answer. */
 static void js_step_visit_value_elem(JSContext *ctx, void *elem, JSStepVisit *v) { v->val(ctx, (JSValue *)elem); }
+/* The element visit for an array of plain ATOMS — a collected key list. Shared for the reason above. */
+static void js_step_visit_atom_elem(JSContext *ctx, void *elem, JSStepVisit *v) { v->atom(ctx, (JSAtom *)elem); }
 /* The sub-object declarations, forward-declared here because machines far apart in the file share them. */
 typedef struct JSDescFacts JSDescFacts;
 static void js_desc_facts_visit(JSContext *ctx, JSDescFacts *f, JSStepVisit *v);
@@ -23795,6 +23797,7 @@ typedef struct JSJsonStr {
 
 static int js_json_str_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_json_str_fini(JSContext *ctx, void *st, bool take_result);
+static void js_json_str_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static int js_for_in_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_hasown_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_hasown_fini(JSContext *ctx, void *st, bool take_result);
@@ -67998,6 +68001,7 @@ static JSValue js_str_concat_fini(JSContext *ctx, void *st, bool take_result);
 static void js_str_concat_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static int js_ta_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_ta_slice_fini(JSContext *ctx, void *st, bool take_result);
+static void js_ta_slice_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static int js_array_at_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_array_with_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_re_str_iter_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
@@ -68072,6 +68076,7 @@ static int js_array_fromlike_step(JSContext *ctx, void *st, JSValue cb_result, J
 static JSValue js_array_fromlike_fini(JSContext *ctx, void *st, bool take_result);
 static void js_array_fromlike_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static JSValue js_array_flat_fini(JSContext *ctx, void *st, bool take_result);
+static void js_array_flat_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static JSValue js_prop_walk_fini(JSContext *ctx, void *st, bool take_result);
 static void js_prop_walk_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static JSValue js_bigint_asUintN(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int asIntN);
@@ -68448,8 +68453,8 @@ static const JSTrampStepDef js_import_opts_def  = {
     /* body, body_proto, body_magic, precheck, midcheck, onerror */ {NULL}, 0, 0, NULL, NULL, NULL,
     .catches_abrupt = 1   /* 16.2.1.8 wraps steps 4 on in IfAbruptRejectPromise: a throw is a VALUE here */
 };
-static const JSTrampStepDef js_json_str_def      = { sizeof(JSJsonStr), js_json_str_step, js_json_str_fini, 0 };
-static const JSTrampStepDef js_ta_slice_def     = { sizeof(JSTASlice), js_ta_slice_step, js_ta_slice_fini, 0 };
+static const JSTrampStepDef js_json_str_def      = { sizeof(JSJsonStr), js_json_str_step, js_json_str_fini, 0, .visit = js_json_str_visit };
+static const JSTrampStepDef js_ta_slice_def     = { sizeof(JSTASlice), js_ta_slice_step, js_ta_slice_fini, 0, .visit = js_ta_slice_visit };
 static const JSTrampStepDef js_str_concat_def   = { sizeof(JSStrConcat), js_str_concat_step, js_str_concat_fini, 0, .visit = js_str_concat_visit };
 static const JSTrampStepDef js_str_ctor_def     = { sizeof(JSStrCtor), js_str_ctor_step, js_str_ctor_fini, 0, .visit = js_str_ctor_visit };
 static const JSTrampStepDef js_array_at_def     = { sizeof(JSArrayAt), js_array_at_step, js_array_at_fini, 0, .visit = js_array_at_visit };
@@ -68738,8 +68743,8 @@ static const JSTrampStepDef js_obj_assign_def     = { sizeof(JSPropWalk), js_pro
 static const JSTrampStepDef js_obj_defprops_def   = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_DEFPROPS, .visit = js_prop_walk_visit };
 static const JSTrampStepDef js_obj_create_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_OBJCREATE, .visit = js_prop_walk_visit };
 static const JSTrampStepDef js_obj_spread_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_SPREAD, .visit = js_prop_walk_visit };
-static const JSTrampStepDef js_array_flat_def      = { sizeof(JSArrayFlat), js_array_flat_step, js_array_flat_fini, ARRAYFLAT_FLAT };
-static const JSTrampStepDef js_array_flatMap_def   = { sizeof(JSArrayFlat), js_array_flat_step, js_array_flat_fini, ARRAYFLAT_FLATMAP };
+static const JSTrampStepDef js_array_flat_def      = { sizeof(JSArrayFlat), js_array_flat_step, js_array_flat_fini, ARRAYFLAT_FLAT, .visit = js_array_flat_visit };
+static const JSTrampStepDef js_array_flatMap_def   = { sizeof(JSArrayFlat), js_array_flat_step, js_array_flat_fini, ARRAYFLAT_FLATMAP, .visit = js_array_flat_visit };
 static const JSTrampStepDef js_array_fromlike_def  = { sizeof(JSArrayFromLike), js_array_fromlike_step, js_array_fromlike_fini, 0, .visit = js_array_fromlike_visit };
 #define PRIMARGS_DEF_FULL(spec, proto, fn, magic, pre, mid, err) \
     { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, (spec), { .proto = (fn) }, JS_CFUNC_##proto, (magic), (pre), (mid), (err) }
@@ -71975,16 +71980,31 @@ static int js_array_flat_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
     }
 }
 
+/* WHAT A FLATTEN LEVEL OWNS: the array being flattened there. */
+static void js_flat_frame_visit(JSContext *ctx, void *elem, JSStepVisit *v)
+{
+    JSFlatFrame *f = elem;
+    v->val(ctx, &f->source);
+}
+
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). FlattenIntoArray is recursive in the spec and an explicit
+   level stack here, and flatMap calls the page's mapper at every element — so a fork lands with the stack live
+   and each arm flattens its own remainder. cb is borrowed views throughout. */
+static void js_array_flat_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSArrayFlat *s = st;
+    v->val(ctx, &s->arr);
+    v->val(ctx, &s->el);
+    v->val(ctx, &s->obj);
+    v->array(ctx, (void **)&s->fr, sizeof(JSFlatFrame), s->sp, s->sp, js_flat_frame_visit);
+}
+
 static JSValue js_array_flat_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSArrayFlat *s = st;
     JSValue r = take_result ? s->arr : JS_UNDEFINED;
-    int i;
-    if (!take_result) JS_FreeValue(ctx, s->arr);
-    JS_FreeValue(ctx, s->el);
-    JS_FreeValue(ctx, s->obj);
-    for (i = 0; i < s->sp; i++) JS_FreeValue(ctx, s->fr[i].source);
-    js_free(ctx, s->fr);
+    if (take_result) s->arr = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -80701,20 +80721,24 @@ static int sj_push(JSContext *ctx, JSJsonStr *s)
 /* Release the top frame. The cycle-detection pop rides here rather than at the one normal-completion site
    because the walk is a DFS: frames leave in reverse order of arrival, which is exactly the order a stack
    truncation needs, and a frame torn down MID-WALK owes the same pop as one that finished. */
+/* WHAT ONE SERIALIZE LEVEL OWNS. `pushed` is NOT here: popping the cycle-detection stack is the algorithm
+   UNWINDING, not a reference being released, and a clone must copy the frame without unwinding anything. */
+static void js_sj_frame_visit(JSContext *ctx, void *elem, JSStepVisit *v)
+{
+    JSSJFrame *f = elem;
+    v->array(ctx, (void **)&f->ek, sizeof(JSEnumKeys), f->ek ? 1 : 0, f->ek ? 1 : 0, js_enum_keys_visit);
+    v->array(ctx, (void **)&f->keys, sizeof(JSAtom), (int)f->nkeys, (int)f->nkeys, js_step_visit_atom_elem);
+    v->atom(ctx, &f->key_atom);
+    v->val(ctx, &f->holder); v->val(ctx, &f->key); v->val(ctx, &f->val);
+    v->val(ctx, &f->indent); v->val(ctx, &f->indent1);
+    v->val(ctx, &f->sep); v->val(ctx, &f->sep1);
+}
+
 static void sj_pop(JSContext *ctx, JSJsonStr *s)
 {
     JSSJFrame *f = &s->frames[--s->sp];
-    if (f->pushed) js_array_private_pop(ctx, s->stack);
-    if (f->ek) { js_enum_keys_free(ctx, f->ek); js_free(ctx, f->ek); }
-    if (f->keys) {
-        uint32_t k;
-        for (k = 0; k < f->nkeys; k++) JS_FreeAtom(ctx, f->keys[k]);
-        js_free(ctx, f->keys);
-    }
-    JS_FreeAtom(ctx, f->key_atom);
-    JS_FreeValue(ctx, f->holder); JS_FreeValue(ctx, f->key); JS_FreeValue(ctx, f->val);
-    JS_FreeValue(ctx, f->indent); JS_FreeValue(ctx, f->indent1);
-    JS_FreeValue(ctx, f->sep); JS_FreeValue(ctx, f->sep1);
+    if (f->pushed) js_array_private_pop(ctx, s->stack);   /* the unwind, which the declaration deliberately omits */
+    js_sj_frame_visit(ctx, f, (JSStepVisit *)&js_step_visit_free);
 }
 
 /* state.PropertyList's append, 25.5.2.1 step 3.b.iv: the key joins unless an equal one is already there.
@@ -81256,25 +81280,34 @@ static int js_json_str_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
     return js_json_str_walk(ctx, s, cb_result, out_cb, out_argc);
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). `toJSON` and an array replacer are the page's code called at
+   every node, so a fork lands with the level stack live and each arm serializes its own remainder into its own
+   accumulator. The cycle-detection array is SHARED by reference on purpose: its push and pop go through the
+   ordinary property path, so the per-flow COW delta isolates it the way it isolates any other shared array.
+   cb_args are borrowed views of the current frame's holder, key and value. */
+static void js_json_str_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSJsonStr *s = st;
+    v->array(ctx, (void **)&s->frames, sizeof(JSSJFrame), s->sp, s->cap, js_sj_frame_visit);
+    v->array(ctx, (void **)&s->plist, sizeof(JSAtom), (int)s->nplist, (int)s->nplist, js_step_visit_atom_elem);
+    if (s->b_live) v->strbuf(ctx, &s->b);
+    v->val(ctx, &s->stack);
+    v->val(ctx, &s->gap);
+    v->val(ctx, &s->empty);
+    v->val(ctx, &s->pv);
+    v->val(ctx, &s->space);
+    v->val(ctx, &s->result);
+}
+
 static JSValue js_json_str_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSJsonStr *s = st;
-    JSValue r;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    /* the UNWIND first, while the cycle stack is still alive: sj_pop pops it for a frame that pushed. Only
+       then does the declaration release everything, the frame array included. */
     while (s->sp > 0) sj_pop(ctx, s);
-    js_free(ctx, s->frames);
-    if (s->plist) {
-        uint32_t k;
-        for (k = 0; k < s->nplist; k++) JS_FreeAtom(ctx, s->plist[k]);
-        js_free(ctx, s->plist);
-    }
-    if (s->b_live) string_buffer_free(&s->b);
-    JS_FreeValue(ctx, s->stack);
-    JS_FreeValue(ctx, s->gap);
-    JS_FreeValue(ctx, s->empty);
-    JS_FreeValue(ctx, s->pv);
-    JS_FreeValue(ctx, s->space);
-    r = take_result ? s->result : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->result);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -90395,12 +90428,19 @@ static JSValue js_typed_array_toReversed(JSContext *ctx, JSValueConst this_val,
    tests do) had nowhere to suspend. As a step machine the create is a CONSTRUCT step; the copy that follows is
    pure C over two typed arrays and needs no further suspension. */
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). cb_args[1] is the count, a number rather than a reference. */
+static void js_ta_slice_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSTASlice *s = st;
+    v->val(ctx, &s->arr);
+    v->val(ctx, &s->src);
+    v->val(ctx, &s->cb_args[0]);
+}
+
 static void js_ta_slice_end(JSContext *ctx, JSTASlice *s, bool take_result)
 {
-    if (!take_result)
-        JS_FreeValue(ctx, s->arr);
-    JS_FreeValue(ctx, s->src);
-    JS_FreeValue(ctx, s->cb_args[0]);
+    if (take_result) s->arr = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
 }
 
 /* Request ToPrimitive on hdr.argv[i] when it is an object, so a user valueOf on `start` or `end` SUSPENDS.
