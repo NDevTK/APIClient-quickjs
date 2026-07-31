@@ -76313,6 +76313,19 @@ static const JSTrampStepDef js_regexp_compile_def = {
     sizeof(JSRegExpCompile), js_regexp_compile_step, js_regexp_compile_fini, 0
 };
 
+/* Write `c` as an escape if it is a LineTerminator, and say whether it did. The two-code-unit ones keep the
+   spelling a reader expects; U+2028 and U+2029 have no short form and take the six-unit one. */
+static bool js_regexp_escape_line_terminator(StringBuffer *b, int c)
+{
+    switch (c) {
+    case '\n':   string_buffer_puts8(b, "\\n"); return true;
+    case '\r':   string_buffer_puts8(b, "\\r"); return true;
+    case 0x2028: string_buffer_puts8(b, "\\u2028"); return true;
+    case 0x2029: string_buffer_puts8(b, "\\u2029"); return true;
+    default:     return false;
+    }
+}
+
 static JSValue js_regexp_get_source(JSContext *ctx, JSValueConst this_val)
 {
     JSRegExp *re;
@@ -76338,14 +76351,29 @@ static JSValue js_regexp_get_source(JSContext *ctx, JSValueConst this_val)
     }
     string_buffer_init2(ctx, b, p->len, p->is_wide_char);
 
-    /* Escape '/' and newline sequences as needed */
+    /* 22.2.6.13.1 EscapeRegExpPattern: the result must be re-readable as the body of a RegularExpressionLiteral
+       with the same meaning. A RegularExpressionLiteral admits no LineTerminator ANYWHERE — not at the top
+       level, not inside a class, and not after a backslash — so all four of them are escaped, and `/` is
+       escaped outside a class (inside one it is an ordinary RegularExpressionClassChar).
+
+       Two of the three were missing. U+2028 and U+2029 are LineTerminators and went through raw, so
+       `new RegExp("\u2028").source` produced a string that cannot be parsed back. And the backslash arm copied
+       the next code unit VERBATIM, so an escaped line terminator stayed raw as well: `\<LF>` came out as a
+       backslash and a real newline. Neither is expressible as the (c, c2) pair this loop used to emit, which is
+       what the pair cost — an escape here is up to six code units, so the emit says so. */
     bra = 0;
     for (i = 0, n = p->len; i < n;) {
         c2 = -1;
         switch (c = string_get(p, i++)) {
         case '\\':
-            if (i < n)
+            if (i < n) {
                 c2 = string_get(p, i++);
+                /* `\<LineTerminator>` is an IdentityEscape for that terminator — the same character the raw
+                   spelling denotes — so the PAIR is re-escaped as one, and the backslash is not re-emitted.
+                   Emitting it as well would produce `\\u2028`, which reads as a literal backslash. */
+                if (js_regexp_escape_line_terminator(b, c2))
+                    continue;
+            }
             break;
         case ']':
             bra = 0;
@@ -76357,19 +76385,15 @@ static JSValue js_regexp_get_source(JSContext *ctx, JSValueConst this_val)
                 bra = 1;
             }
             break;
-        case '\n':
-            c = '\\';
-            c2 = 'n';
-            break;
-        case '\r':
-            c = '\\';
-            c2 = 'r';
-            break;
         case '/':
             if (!bra) {
                 c = '\\';
                 c2 = '/';
             }
+            break;
+        default:
+            if (js_regexp_escape_line_terminator(b, c))
+                continue;
             break;
         }
         string_buffer_putc16(b, c);
