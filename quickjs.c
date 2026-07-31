@@ -41140,6 +41140,10 @@ typedef struct JSParseState {
     JSFunctionDef *cur_func;
     bool is_module; /* parsing a module */
     bool allow_html_comments;
+    /* the next FUNCTION EXPRESSION parsed is the Function constructor's own synthesized wrapper, which is
+       parsed but never EVALUATED as an expression — so it has no self-name binding. Consumed by the first one,
+       which is always the outer wrapper: nothing inside its parameter list is parsed before it exists. */
+    bool fn_ctor_toplevel;
 } JSParseState;
 
 /* ---- JSON.parse's data types. They sit HERE, below JSParseState, because the step machine at the end of
@@ -48273,6 +48277,11 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
             return -1;
         }
         if (var_name != JS_ATOM_NULL) {
+            /* B.3.5's `for ( var BindingIdentifier Initializer in Expression )` names an anonymous initializer
+               after the binding, exactly as an ordinary `var x = function(){}` does — its step 3 is
+               NamedEvaluation with bindingId. This head is parsed by its own function and had no such step, so
+               `for (var forInHead = function(){} in {})` left the function's name "". */
+            set_object_name(s, var_name);
             emit_op(s, OP_scope_put_var);
             emit_atom(s, var_name);
             emit_u16(s, fd->scope_level);
@@ -57006,6 +57015,12 @@ static __exception int js_parse_function_decl2(JSParseState *s,
         JS_FreeAtom(ctx, func_name);
         return -1;
     }
+    if (s->fn_ctor_toplevel && func_type == JS_PARSE_FUNC_EXPR) {
+        /* the Function constructor's own synthesized wrapper — see js_parse_init's caller. `is_func_expr` is
+           read for exactly one thing, the self-name binding, and this function does not have one. */
+        s->fn_ctor_toplevel = false;
+        fd->is_func_expr = false;
+    }
     if (pfd)
         *pfd = fd;
     s->cur_func = fd;
@@ -57765,6 +57780,12 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
         fd->func_kind = JS_FUNC_ASYNC;
     }
     s->is_module = (m != NULL);
+    /* 20.2.1.1.1 does NOT evaluate the synthesized `(function anonymous(…){…})`: steps 25-28 parse it and then
+       OrdinaryFunctionCreate builds the function from the PARSED parameters and body with the global
+       environment. A named function EXPRESSION would additionally bind its own name in a scope of its own, and
+       that binding does not exist here — `new Function("return typeof anonymous")()` is "undefined". The name
+       stays in the source text, which is what [[SourceText]] and toString report. */
+    s->fn_ctor_toplevel = (flags & JS_EVAL_FLAG_FUNCTION_CTOR) != 0;
     s->allow_html_comments = !s->is_module;
 
     push_scope(s); /* body scope */
