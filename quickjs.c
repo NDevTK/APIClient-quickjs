@@ -60402,11 +60402,19 @@ static int js_coerce1_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). */
+static void js_coerce1_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSCoerce1 *s = st;
+    v->val(ctx, &s->result);
+}
+
 static JSValue js_coerce1_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSCoerce1 *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->result);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -60658,12 +60666,20 @@ static int js_parse_num_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
     return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). */
+static void js_parse_num_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSParseNum *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->str);
+}
+
 static JSValue js_parse_num_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSParseNum *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->result);
-    JS_FreeValue(ctx, s->str);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -62837,14 +62853,20 @@ static int js_primargs_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
     return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The COERCED argument vector is the machine's own block — each coercion is the page's valueOf, so a fork can land between two of them. */
+static void js_primargs_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSPrimArgs *s = st;
+    v->val(ctx, &s->result);
+    v->array(ctx, (void **)&s->argp, sizeof(JSValue), s->nargp, s->nargp, js_step_visit_value_elem);
+}
+
 static JSValue js_primargs_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSPrimArgs *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    int i;
-    if (!take_result) JS_FreeValue(ctx, s->result);
-    for (i = 0; i < s->nargp; i++) JS_FreeValue(ctx, s->argp[i]);
-    js_free(ctx, s->argp);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -62938,14 +62960,20 @@ static int js_creatector_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
     return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The padded argument vector is the machine's own block. */
+static void js_creatector_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSCreateCtor *s = st;
+    v->val(ctx, &s->result);
+    v->array(ctx, (void **)&s->argp, sizeof(JSValue), s->nargp, s->nargp, js_step_visit_value_elem);
+}
+
 static JSValue js_creatector_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSCreateCtor *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    int i;
-    if (!take_result) JS_FreeValue(ctx, s->result);
-    for (i = 0; i < s->nargp; i++) JS_FreeValue(ctx, s->argp[i]);
-    js_free(ctx, s->argp);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -63935,13 +63963,22 @@ static int js_error_tostring_step(JSContext *ctx, void *st, JSValue cb_result, J
     return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). */
+static void js_error_tostring_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSErrToString *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->name);
+    v->val(ctx, &s->raw);
+}
+
 static JSValue js_error_tostring_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSErrToString *s = st;
-    JSValue r = take_result ? s->result : (JS_FreeValue(ctx, s->result), JS_UNDEFINED);
-    JS_FreeValue(ctx, s->name);
-    JS_FreeValue(ctx, s->raw);
-    js_free_rt(ctx->rt, s);
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
+    js_free(ctx, s);
     return r;
 }
 
@@ -66470,11 +66507,19 @@ static int js_date_toprim_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). */
+static void js_date_toprim_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSDateToPrim *s = st;
+    v->val(ctx, &s->result);
+}
+
 static JSValue js_date_toprim_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSDateToPrim *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->result);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -66523,15 +66568,23 @@ static int js_date_tojson_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). toISOString is looked up on the receiver and called, both the page's. */
+static void js_date_tojson_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSDateToJSON *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->tv);
+    v->val(ctx, &s->obj);
+    v->val(ctx, &s->cb[0]);
+    v->val(ctx, &s->cb[1]);
+}
+
 static JSValue js_date_tojson_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSDateToJSON *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    int i;
-    if (!take_result) JS_FreeValue(ctx, s->result);
-    for (i = 0; i < 2; i++) JS_FreeValue(ctx, s->cb[i]);
-    JS_FreeValue(ctx, s->tv);
-    JS_FreeValue(ctx, s->obj);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -68053,7 +68106,9 @@ static int js_date_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
 static JSValue js_date_ctor_fini(JSContext *ctx, void *st, bool take_result);
 static void js_date_ctor_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static JSValue js_date_toprim_fini(JSContext *ctx, void *st, bool take_result);
+static void js_date_toprim_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static JSValue js_date_tojson_fini(JSContext *ctx, void *st, bool take_result);
+static void js_date_tojson_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static JSValue js_ta_with_fini(JSContext *ctx, void *st, bool take_result);
 static void js_ta_with_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static int js_array_copywithin_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
@@ -68082,6 +68137,7 @@ static JSValue js_obj_defprop_fini(JSContext *ctx, void *st, bool take_result);
 static void js_obj_defprop_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static int js_parse_num_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_parse_num_fini(JSContext *ctx, void *st, bool take_result);
+static void js_parse_num_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static int js_str_split_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_str_split_fini(JSContext *ctx, void *st, bool take_result);
 static void js_str_split_visit(JSContext *ctx, void *st, JSStepVisit *v);
@@ -68159,6 +68215,7 @@ static int js_dataview_set_precheck(JSContext *ctx, const JSStepHdr *h);
 static int js_dataview_set_midcheck(JSContext *ctx, JSValueConst *argp, int magic);
 static int js_primargs_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_primargs_fini(JSContext *ctx, void *st, bool take_result);
+static void js_primargs_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static int js_num_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_num_ctor_fini(JSContext *ctx, void *st, bool take_result);
 static void js_num_ctor_visit(JSContext *ctx, void *st, JSStepVisit *v);
@@ -68167,6 +68224,7 @@ static JSValue js_number_fmt_fini(JSContext *ctx, void *st, bool take_result);
 static void js_number_fmt_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static int js_coerce1_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_coerce1_fini(JSContext *ctx, void *st, bool take_result);
+static void js_coerce1_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static int js_function_call_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_function_apply_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_function_call_fini(JSContext *ctx, void *st, bool take_result);
@@ -68529,6 +68587,7 @@ static int js_iter_zip_drive_step(JSContext *ctx, void *st, JSValue cb_result, J
 static JSValue js_iter_zip_drive_fini(JSContext *ctx, void *st, bool take_result);
 static int js_string_iterator_create_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_string_iterator_create_fini(JSContext *ctx, void *st, bool take_result);
+static void js_string_iterator_create_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static int js_string_includes_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_string_includes_fini(JSContext *ctx, void *st, bool take_result);
 #define STR_INCLUDES_DEF(mg) { sizeof(JSStrIncludes), js_string_includes_step, js_string_includes_fini, mg }
@@ -68538,12 +68597,13 @@ static const JSTrampStepDef js_str_startswith_def = STR_INCLUDES_DEF(1);
 #undef STR_INCLUDES_DEF
 static int js_string_wellformed_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_string_wellformed_fini(JSContext *ctx, void *st, bool take_result);
+static void js_string_wellformed_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static const JSTrampStepDef js_str_iswellformed_def =
-    { sizeof(JSStrWellFormed), js_string_wellformed_step, js_string_wellformed_fini, 0 };
+    { sizeof(JSStrWellFormed), js_string_wellformed_step, js_string_wellformed_fini, 0 , .visit = js_string_wellformed_visit };
 static const JSTrampStepDef js_str_towellformed_def =
-    { sizeof(JSStrWellFormed), js_string_wellformed_step, js_string_wellformed_fini, 1 };
+    { sizeof(JSStrWellFormed), js_string_wellformed_step, js_string_wellformed_fini, 1 , .visit = js_string_wellformed_visit };
 static const JSTrampStepDef js_str_iterator_def =
-    { sizeof(JSStrIterCreate), js_string_iterator_create_step, js_string_iterator_create_fini, 0 };
+    { sizeof(JSStrIterCreate), js_string_iterator_create_step, js_string_iterator_create_fini, 0 , .visit = js_string_iterator_create_visit };
 static const JSTrampStepDef js_iter_zip_def =
     { sizeof(JSIterZip), js_iterator_zip_step, js_iterator_zip_fini, 0, .visit = js_iterator_zip_visit };
 static int js_iterator_zip_keyed_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
@@ -68566,8 +68626,8 @@ static int js_iter_wrap_return_step(JSContext *ctx, void *st, JSValue cb_result,
 static JSValue js_iter_wrap_return_fini(JSContext *ctx, void *st, bool take_result);
 static const JSTrampStepDef js_iter_wrap_return_def =
     { sizeof(JSIterWrapReturn), js_iter_wrap_return_step, js_iter_wrap_return_fini, 0 };
-static const JSTrampStepDef js_date_toJSON_def = { sizeof(JSDateToJSON), js_date_tojson_step, js_date_tojson_fini, 0 };
-static const JSTrampStepDef js_date_toPrim_def = { sizeof(JSDateToPrim), js_date_toprim_step, js_date_toprim_fini, 0 };
+static const JSTrampStepDef js_date_toJSON_def = { sizeof(JSDateToJSON), js_date_tojson_step, js_date_tojson_fini, 0 , .visit = js_date_tojson_visit };
+static const JSTrampStepDef js_date_toPrim_def = { sizeof(JSDateToPrim), js_date_toprim_step, js_date_toprim_fini, 0 , .visit = js_date_toprim_visit };
 /* the captured half of an Atomics operation: the length ValidateAtomicAccess reads at step 1, held across the
    index's own coercion, plus the argument vector the body will read. */
 typedef struct JSAtomics {
@@ -68690,8 +68750,9 @@ static int js_symbol_ctor_precheck(JSContext *ctx, const JSStepHdr *h);
    them (the empty tests and the two concatenations) invokes nothing. */
 static int js_error_tostring_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_error_tostring_fini(JSContext *ctx, void *st, bool take_result);
+static void js_error_tostring_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static const JSTrampStepDef js_error_tostring_def =
-    { sizeof(JSErrToString), js_error_tostring_step, js_error_tostring_fini, 0 };
+    { sizeof(JSErrToString), js_error_tostring_step, js_error_tostring_fini, 0 , .visit = js_error_tostring_visit };
 static const JSTrampStepDef js_symbol_ctor_def =
     { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, PRIMARGS(0x1, HINT_STRING, 1),
       { .generic = js_symbol_constructor }, JS_CFUNC_constructor_or_func, 0, js_symbol_ctor_precheck, NULL, NULL };
@@ -68748,8 +68809,8 @@ static JSValue js_ownkeys_fini(JSContext *ctx, void *st, bool take_result);
 static const JSTrampStepDef js_ownkeys_names_def  = { sizeof(JSOwnKeys), js_ownkeys_step, js_ownkeys_fini, JS_GPN_STRING_MASK, .visit = js_ownkeys_visit };
 static const JSTrampStepDef js_ownkeys_syms_def   = { sizeof(JSOwnKeys), js_ownkeys_step, js_ownkeys_fini, JS_GPN_SYMBOL_MASK, .visit = js_ownkeys_visit };
 static const JSTrampStepDef js_reflect_ownkeys_def = { sizeof(JSOwnKeys), js_ownkeys_step, js_ownkeys_fini, OWNKEYS_REFLECT, .visit = js_ownkeys_visit };
-static const JSTrampStepDef js_parseInt_def       = { sizeof(JSParseNum), js_parse_num_step, js_parse_num_fini, 1 };
-static const JSTrampStepDef js_parseFloat_def     = { sizeof(JSParseNum), js_parse_num_step, js_parse_num_fini, 0 };
+static const JSTrampStepDef js_parseInt_def       = { sizeof(JSParseNum), js_parse_num_step, js_parse_num_fini, 1 , .visit = js_parse_num_visit };
+static const JSTrampStepDef js_parseFloat_def     = { sizeof(JSParseNum), js_parse_num_step, js_parse_num_fini, 0 , .visit = js_parse_num_visit };
 static const JSTrampStepDef js_str_split_def      = { sizeof(JSStrSplit), js_str_split_step, js_str_split_fini, 0, .visit = js_str_split_visit };
 static const JSTrampStepDef js_array_join_def     = { sizeof(JSArrayJoin), js_array_join_step, js_array_join_fini, JOIN_ARRAY, .visit = js_array_join_visit };
 static const JSTrampStepDef js_array_tolocale_def = { sizeof(JSArrayJoin), js_array_join_step, js_array_join_fini, JOIN_ARRAY_LOCALE, .visit = js_array_join_visit };
@@ -68991,8 +69052,8 @@ static const JSTrampStepDef js_num_tofixed_def    = { sizeof(JSNumberFmt), js_nu
 static const JSTrampStepDef js_num_toexp_def      = { sizeof(JSNumberFmt), js_number_fmt_step, js_number_fmt_fini, NUMFMT_TOEXPONENTIAL, .visit = js_number_fmt_visit };
 static const JSTrampStepDef js_num_toprec_def     = { sizeof(JSNumberFmt), js_number_fmt_step, js_number_fmt_fini, NUMFMT_TOPRECISION, .visit = js_number_fmt_visit };
 static const JSTrampStepDef js_global_eval_def    = { sizeof(JSProgEval), js_global_eval_step, js_global_eval_fini, 0, .visit = js_global_eval_visit };
-static const JSTrampStepDef js_isNaN_def          = { sizeof(JSCoerce1), js_coerce1_step, js_coerce1_fini, 0 };
-static const JSTrampStepDef js_isFinite_def       = { sizeof(JSCoerce1), js_coerce1_step, js_coerce1_fini, 1 };
+static const JSTrampStepDef js_isNaN_def          = { sizeof(JSCoerce1), js_coerce1_step, js_coerce1_fini, 0 , .visit = js_coerce1_visit };
+static const JSTrampStepDef js_isFinite_def       = { sizeof(JSCoerce1), js_coerce1_step, js_coerce1_fini, 1 , .visit = js_coerce1_visit };
 static const JSTrampStepDef js_function_call_def  = { sizeof(JSFuncCall), js_function_call_step, js_function_call_fini, 0, .visit = js_function_call_visit };
 static const JSTrampStepDef js_function_apply_def = { sizeof(JSFuncApply), js_function_apply_step, js_function_apply_fini, 0, .visit = js_function_apply_visit };
 static const JSTrampStepDef js_reflect_apply_def  = { sizeof(JSFuncApply), js_function_apply_step, js_function_apply_fini, 1, .visit = js_function_apply_visit };
@@ -72575,11 +72636,19 @@ static int js_string_iterator_create_step(JSContext *ctx, void *st, JSValue cb_r
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). */
+static void js_string_iterator_create_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSStrIterCreate *s = st;
+    v->val(ctx, &s->result);
+}
+
 static JSValue js_string_iterator_create_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSStrIterCreate *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->result);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -75275,11 +75344,19 @@ static int js_string_wellformed_step(JSContext *ctx, void *st, JSValue cb_result
     return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). */
+static void js_string_wellformed_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSStrWellFormed *s = st;
+    v->val(ctx, &s->result);
+}
+
 static JSValue js_string_wellformed_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSStrWellFormed *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->result);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
