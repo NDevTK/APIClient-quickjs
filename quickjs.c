@@ -67519,6 +67519,7 @@ static int js_str_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
 static JSValue js_str_ctor_fini(JSContext *ctx, void *st, bool take_result);
 static int js_str_concat_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_str_concat_fini(JSContext *ctx, void *st, bool take_result);
+static void js_str_concat_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static int js_ta_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_ta_slice_fini(JSContext *ctx, void *st, bool take_result);
 static int js_array_at_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
@@ -67939,7 +67940,7 @@ static const JSTrampStepDef js_import_opts_def  = {
 };
 static const JSTrampStepDef js_json_str_def      = { sizeof(JSJsonStr), js_json_str_step, js_json_str_fini, 0 };
 static const JSTrampStepDef js_ta_slice_def     = { sizeof(JSTASlice), js_ta_slice_step, js_ta_slice_fini, 0 };
-static const JSTrampStepDef js_str_concat_def   = { sizeof(JSStrConcat), js_str_concat_step, js_str_concat_fini, 0 };
+static const JSTrampStepDef js_str_concat_def   = { sizeof(JSStrConcat), js_str_concat_step, js_str_concat_fini, 0, .visit = js_str_concat_visit };
 static const JSTrampStepDef js_str_ctor_def     = { sizeof(JSStrCtor), js_str_ctor_step, js_str_ctor_fini, 0 };
 static const JSTrampStepDef js_array_at_def     = { sizeof(JSArrayAt), js_array_at_step, js_array_at_fini, 0 };
 static const JSTrampStepDef js_array_with_def   = { sizeof(JSArrayWith), js_array_with_step, js_array_with_fini, 0 };
@@ -74521,11 +74522,21 @@ static int js_str_concat_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). One value: cb[0] is a borrowed view of a header capture, and
+   the receiver and arguments are the header's. Each argument's coercion is the page's toString, so a concolic
+   branch inside one forks the concatenation and each arm accumulates its own remainder. */
+static void js_str_concat_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSStrConcat *s = st;
+    v->val(ctx, &s->acc);
+}
+
 static JSValue js_str_concat_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSStrConcat *s = st;
     JSValue r = take_result ? s->acc : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->acc);
+    if (take_result) s->acc = JS_UNDEFINED;   /* handed out, read above before the rest is released */
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
