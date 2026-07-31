@@ -1333,6 +1333,15 @@ typedef void JSFlowParkFn(JSContext *ctx, void *opaque);
 JS_EXTERN void     JS_ParkFlow(JSContext *ctx, JSFlowParkFn *fn, void *opaque);
 JS_EXTERN bool     JS_HasParkedFlow(JSRuntime *rt);
 JS_EXTERN bool     JS_ResumeParkedFlow(JSRuntime *rt);
+/* A PARKED FLOW IS A PIECE OF ONE FLOW'S TIMELINE, so a host that INTERLEAVES flows must carry it with the flow
+   rather than leave it in the runtime. Its continuation owns a suspended async activation and resumes under
+   that flow's COW delta; a scheduler that switched to a sibling and resumed it there would run it against the
+   wrong heap, and one that simply left it behind would DROP it — the one thing the frontier may never do.
+   So the switch takes it out and the switch back puts it in, exactly as the delta and the decision cursor swap.
+   Take returns false and writes nothing when no flow is parked; Put with a NULL fn restores nothing. A host
+   that runs ONE flow (run-test262) never needs either: its slot is emptied before anything else runs. */
+JS_EXTERN bool     JS_TakeParkedFlow(JSRuntime *rt, JSContext **pctx, JSFlowParkFn **pfn, void **popaque);
+JS_EXTERN void     JS_PutParkedFlow(JSRuntime *rt, JSContext *ctx, JSFlowParkFn *fn, void *opaque);
 /* Frame-snapshot fork: deep-copy a SUSPENDED flow into an INDEPENDENT clone that resumes from the same point.
    No fallback — an un-built frame shape (deep tramp chain / live closures) crashes loud. */
 JS_EXTERN JSValue *JS_FlowClone(JSContext *ctx, JSValue *flow);

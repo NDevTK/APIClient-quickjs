@@ -24203,6 +24203,17 @@ void JS_ParkFlow(JSContext *ctx, JSFlowParkFn *fn, void *opaque) {
     rt->parked_flow.ctx = ctx; rt->parked_flow.fn = fn; rt->parked_flow.opaque = opaque;
 }
 bool JS_HasParkedFlow(JSRuntime *rt) { return rt->parked_flow.fn != NULL; }
+bool JS_TakeParkedFlow(JSRuntime *rt, JSContext **pctx, JSFlowParkFn **pfn, void **popaque) {
+    if (!rt->parked_flow.fn) return false;
+    *pctx = rt->parked_flow.ctx; *pfn = rt->parked_flow.fn; *popaque = rt->parked_flow.opaque;
+    rt->parked_flow.fn = NULL; rt->parked_flow.opaque = NULL; rt->parked_flow.ctx = NULL;
+    return true;
+}
+void JS_PutParkedFlow(JSRuntime *rt, JSContext *ctx, JSFlowParkFn *fn, void *opaque) {
+    if (!fn) return;
+    DCHECK(rt->parked_flow.fn == NULL, "a flow was switched in while another one's park is still in the slot");
+    rt->parked_flow.ctx = ctx; rt->parked_flow.fn = fn; rt->parked_flow.opaque = opaque;
+}
 bool JS_ResumeParkedFlow(JSRuntime *rt) {
     JSFlowParkFn *fn = rt->parked_flow.fn;
     JSContext *ctx = rt->parked_flow.ctx;
