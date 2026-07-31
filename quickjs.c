@@ -66305,12 +66305,19 @@ static int js_array_copywithin_step(JSContext *ctx, void *st, JSValue cb_result,
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). `obj` is both the state and the RESULT, so the hand-out takes its own reference. */
+static void js_array_copywithin_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSArrayCopyWithin *s = st;
+    v->val(ctx, &s->obj);
+    v->val(ctx, &s->el);
+}
+
 static JSValue js_array_copywithin_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSArrayCopyWithin *s = st;
     JSValue r = take_result ? js_dup(s->obj) : JS_UNDEFINED;
-    JS_FreeValue(ctx, s->el);
-    JS_FreeValue(ctx, s->obj);
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -68051,6 +68058,7 @@ static JSValue js_ta_with_fini(JSContext *ctx, void *st, bool take_result);
 static void js_ta_with_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static int js_array_copywithin_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_copywithin_fini(JSContext *ctx, void *st, bool take_result);
+static void js_array_copywithin_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static JSValue js_array_fill_fini(JSContext *ctx, void *st, bool take_result);
 static void js_array_fill_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static JSValue js_array_with_fini(JSContext *ctx, void *st, bool take_result);
@@ -68428,11 +68436,19 @@ static int js_iter_setter_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
     return r != 0 ? r : 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). */
+static void js_iter_setter_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSIterSetter *s = st;
+    v->val(ctx, &s->result);
+}
+
 static JSValue js_iter_setter_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSIterSetter *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    if (!take_result) JS_FreeValue(ctx, s->result);
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free(ctx, s);
     return r;
 }
@@ -68443,12 +68459,12 @@ static const JSTrampStepDef js_lookupgetter_def = { sizeof(JSLookupAcc), js_look
 static const JSTrampStepDef js_lookupsetter_def = { sizeof(JSLookupAcc), js_lookup_acc_step, js_lookup_acc_fini, 1, .visit = js_lookup_acc_visit };
 static const JSTrampStepDef js_func_bind_def   = { sizeof(JSFuncBind), js_func_bind_step, js_func_bind_fini, 0, .visit = js_func_bind_visit };
 static const JSTrampStepDef js_iter_set_ctor_def = { sizeof(JSIterSetter), js_iter_setter_step, js_iter_setter_fini, JS_ATOM_constructor,
-                                                    .home_class = JS_CLASS_ITERATOR };
+                                                    .home_class = JS_CLASS_ITERATOR, .visit = js_iter_setter_visit };
 static const JSTrampStepDef js_iter_set_tag_def  = { sizeof(JSIterSetter), js_iter_setter_step, js_iter_setter_fini, JS_ATOM_Symbol_toStringTag,
-                                                    .home_class = JS_CLASS_ITERATOR };
+                                                    .home_class = JS_CLASS_ITERATOR, .visit = js_iter_setter_visit };
 static const JSTrampStepDef js_error_get_stack_def = { sizeof(JSErrGetStack), js_error_get_stack_step, js_error_get_stack_fini, 0, .visit = js_error_get_stack_visit };
 static const JSTrampStepDef js_error_set_stack_def = { sizeof(JSIterSetter), js_iter_setter_step, js_iter_setter_fini, JS_ATOM_stack,
-                                                      .home_class = JS_CLASS_ERROR, .precheck = js_error_stack_precheck };
+                                                      .home_class = JS_CLASS_ERROR, .precheck = js_error_stack_precheck, .visit = js_iter_setter_visit };
 static const JSTrampStepDef js_instanceof_def  = { sizeof(JSInstanceOf), js_instanceof_step, js_instanceof_fini, INSTOF_OPERATOR, .visit = js_instanceof_visit };
 static const JSTrampStepDef js_ordinary_hasinst_def = { sizeof(JSInstanceOf), js_instanceof_step, js_instanceof_fini, INSTOF_ORDINARY, .visit = js_instanceof_visit };
 static const JSTrampStepDef js_obj_tolocale_def = { sizeof(JSObjToLocale), js_object_tolocale_step, js_object_tolocale_fini, 0, .visit = js_object_tolocale_visit };
@@ -68470,7 +68486,7 @@ static const JSTrampStepDef js_str_ctor_def     = { sizeof(JSStrCtor), js_str_ct
 static const JSTrampStepDef js_array_at_def     = { sizeof(JSArrayAt), js_array_at_step, js_array_at_fini, 0, .visit = js_array_at_visit };
 static const JSTrampStepDef js_array_with_def   = { sizeof(JSArrayWith), js_array_with_step, js_array_with_fini, 0, .visit = js_array_with_visit };
 static const JSTrampStepDef js_array_fill_def   = { sizeof(JSArrayFill), js_array_fill_step, js_array_fill_fini, 0, .visit = js_array_fill_visit };
-static const JSTrampStepDef js_array_copyWithin_def = { sizeof(JSArrayCopyWithin), js_array_copywithin_step, js_array_copywithin_fini, 0 };
+static const JSTrampStepDef js_array_copyWithin_def = { sizeof(JSArrayCopyWithin), js_array_copywithin_step, js_array_copywithin_fini, 0, .visit = js_array_copywithin_visit };
 static JSValue js_bigint_constructor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv);
 /* 21.2.1.1 BigInt(value): its ONLY user code is step 2's ToPrimitive on the argument — everything after runs on a
    primitive. It is callable AND a constructor (which throws), which is what the constructor_or_func body
@@ -73245,26 +73261,37 @@ static int js_iter_dispose_step(JSContext *ctx, void *st, JSValue cb_result, JSV
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). `using` disposal calls the resource's own `return`, and the async form owns the capability it settles. */
+static void js_iter_dispose_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSIterDispose *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->method);
+    v->val(ctx, &s->inner);
+    v->val(ctx, &s->cb[0]);
+    v->val(ctx, &s->cb[1]);
+    v->val(ctx, &s->cb[2]);
+    v->val(ctx, &s->cb[3]);
+    v->val(ctx, &s->cap_funcs[0]);
+    v->val(ctx, &s->cap_funcs[1]);
+}
+
 static JSValue js_iter_dispose_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSIterDispose *s = st;
-    JSValue r = take_result ? s->result : (JS_FreeValue(ctx, s->result), JS_UNDEFINED);
-    int i;
-    JS_FreeValue(ctx, s->method);
-    JS_FreeValue(ctx, s->inner);
-    for (i = 0; i < 4; i++) JS_FreeValue(ctx, s->cb[i]);
-    JS_FreeValue(ctx, s->cap_funcs[0]);
-    JS_FreeValue(ctx, s->cap_funcs[1]);
-    js_free_rt(ctx->rt, s);
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
+    js_free(ctx, s);
     return r;
 }
 
 static const JSTrampStepDef js_iter_dispose_def = {
-    sizeof(JSIterDispose), js_iter_dispose_step, js_iter_dispose_fini, 0
+    sizeof(JSIterDispose), js_iter_dispose_step, js_iter_dispose_fini, 0, .visit = js_iter_dispose_visit
 };
 static const JSTrampStepDef js_async_iter_dispose_def = {
     sizeof(JSIterDispose), js_iter_dispose_step, js_iter_dispose_fini, 1,
-    .catches_abrupt = 1   /* steps 4/6/7 are IfAbruptRejectPromise: an abrupt is this algorithm's VALUE */
+    .catches_abrupt = 1   /* steps 4/6/7 are IfAbruptRejectPromise: an abrupt is this algorithm's VALUE */, .visit = js_iter_dispose_visit
 };
 
 static JSValue js_iterator_proto_iterator(JSContext *ctx, JSValueConst this_val,
@@ -86120,18 +86147,27 @@ static int js_promise_then_step(JSContext *ctx, void *st, JSValue cb_result, JSV
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). @@species is the page's, so the result promise's constructor is a request. */
+static void js_promise_then_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSPromiseThen *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->ctor);
+    v->val(ctx, &s->cb_args[0]);
+}
+
 static JSValue js_promise_then_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSPromiseThen *s = st;
-    JSValue r = take_result ? s->result : (JS_FreeValue(ctx, s->result), JS_UNDEFINED);
-    JS_FreeValue(ctx, s->cb_args[0]);
-    JS_FreeValue(ctx, s->ctor);
-    js_free_rt(ctx->rt, s);
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
+    js_free(ctx, s);
     return r;
 }
 
 static const JSTrampStepDef js_promise_then_def = {
-    sizeof(JSPromiseThen), js_promise_then_step, js_promise_then_fini, 0
+    sizeof(JSPromiseThen), js_promise_then_step, js_promise_then_fini, 0, .visit = js_promise_then_visit
 };
 
 
