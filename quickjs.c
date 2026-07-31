@@ -30336,7 +30336,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->orig_cargc = s->outer ? 0 : (tac_cfirst ? (tac_cargc >= 0 ? tac_cargc : ta_argc) : 0);
                 s->orig_is_tail = s->outer ? 0 : tramp_is_tail;
                 tac_cargc = -1;   /* read + reset */
-                DCHECK(ta_argc >= 1, "the TypedArray consume arm reads its source; the recognizers refuse argc 0");
+                /* An ABSENT source is `undefined`, which is what the spec's parameter list already says and what
+                   every step below then does with it: 23.2.2.1 step 4's GetMethod(undefined, @@iterator) throws a
+                   TypeError, and it throws it at the ACQUIRE, on the tramp, exactly as `TypedArray.from(undefined)`
+                   does. A DCHECK stood here claiming the recognizers refuse argc 0; they do not, and
+                   `Uint8Array.from()` aborted on it. Nothing was refusing the shape — the arm was reading a slot
+                   that is not there. (`of()` with no items is legitimate and never reaches this: its own branch
+                   above builds the list from the argument vector and has no source at all.) */
+                JSValueConst ta_src = (ta_argc >= 1) ? ta_argv[0] : JS_UNDEFINED;
                 if (!is_from) {
                     /* 23.2.5.1 step 6.a.i: AllocateTypedArray runs BEFORE the source is read at all — a Proxy
                        new_target sees its `prototype` get before the iterator does anything, and an iteration that
@@ -30355,7 +30362,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     tt->consume = s;
                     tt->ntgt = js_dup(ntgt);
                     tt->getiter = tramp_iter_getiter; tramp_iter_getiter = JS_UNDEFINED;
-                    tt->iterable = ta_argv[0];
+                    tt->iterable = ta_src;
                     tt->class_id = ta_classid;
                     sf->cur_pc = pc;
                     gp_outer = tt; gp_outer_kind = CONT_TA_TARGET;
@@ -30363,7 +30370,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     gp_op = GP_GET; gp_val = JS_UNDEFINED;
                     goto do_getprop_tramp;
                 }
-                tramp_consume_iterable = ta_argv[0];
+                tramp_consume_iterable = ta_src;
                 tramp_consume_state = s; tramp_consume_kind = CONT_ITER_CONSUME;
                 goto do_consume_acquire_iterator;
             }
