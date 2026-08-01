@@ -18016,6 +18016,17 @@ typedef struct StringBuffer StringBuffer;
    is an incompatible-function-pointer initialisation. gcc says so and our `-w` build swallowed it; clang, run
    for the call-graph checker, is what surfaced it. The ABI matched, so nothing ever failed. */
 struct JSStepHdr;
+/* THE HOST-FACING DOOR IS NOT OPEN YET, AND THIS IS WHERE IT GOES.
+   A browser component under engine/host/browser cannot declare a step machine: JS_CFUNC_STEP_DEF is public in
+   quickjs.h but the STEPDEF_* ids it takes index js_tramp_step_defs[], a static table in this file, and
+   JSTrampStepDef / JSStepHdr / JSStepVisit / step_getprop_run are all internal to it. So every Web IDL
+   attribute read a component performs is forced to be a JS_GetPropertyStr from C — which is exactly what the
+   twelve internal-method entries abort on, and core/fetch/fetch.c hit it on `fetch(new Proxy({url:"/q"},…))`
+   the first time it ran.
+   Opening it is: this struct plus JSStepHdr, JSStepVisit and the step_*_run request helpers move to a public
+   quickjs-step.h, and js_tramp_step_defs gains a runtime tail so JS_RegisterStepDef can hand a host component
+   an id past STEPDEF_COUNT. Until then a component handles what it can read without touching the page's
+   objects and DFAILs on the rest at its own name. */
 typedef struct JSTrampStepDef {
     size_t   size;
     int     (*step)(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
