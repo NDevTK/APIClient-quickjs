@@ -89227,7 +89227,12 @@ static bool string_get_tzoffset(const uint8_t *sp, int *pp, int *tzp, bool stric
         if (!string_get_digits(sp, &p, &hh, 1, 0))
             return false;
         n = p - n;
+        /* The Date Time String Format writes the offset as `+HH:mm` -- the colon is part of the grammar. Web
+           reality adds `+HHmm`, which every engine accepts there, but a BARE `+HH` is legacy-parser-only:
+           `1997-03-08T11:19:10-07` is NaN in Chrome while `1997-03-08 11:19:10-07` is not. */
         if (strict && n != 2 && n != 4)
+            return false;
+        if (strict && n == 2 && sp[p] != ':')
             return false;
         while (n > 4) {
             n -= 2;
@@ -89293,9 +89298,15 @@ static bool string_get_month(const uint8_t *sp, int *pp, int *pval) {
     return true;
 }
 
-/* parse toISOString format */
+/* Parse the Date Time String Format (21.4.1.15) and the one RELAXATION every engine shares with it: the same
+   grammar with a SPACE where the `T` goes, and then months, days, hours, minutes and seconds of one OR two
+   digits and a bare `+HH` offset. The relaxed form is what a page gets from a database or a `<input type=
+   datetime-local>`, and it is this grammar rather than the free-form legacy scanner -- `1997-3-8 11:19:20` is
+   an ISO date with a one-digit month, not a sentence about a date. The strict form stays strict: the same
+   string written with a `T` is NaN. */
 static bool js_date_parse_isostring(const uint8_t *sp, int fields[9], bool *is_local) {
-    int sgn, i, p = 0;
+    int sgn, i, p = 0, lo;
+    bool relaxed;
 
     /* initialize fields to the beginning of the Epoch */
     for (i = 0; i < 9; i++) {
@@ -89318,37 +89329,47 @@ static bool js_date_parse_isostring(const uint8_t *sp, int fields[9], bool *is_l
         if (!string_get_digits(sp, &p, &fields[0], 4, 4))
             return false;
     }
+    /* Which separator follows the date decides the whole rest of the grammar, so it is read BEFORE the month
+       and day: a one-digit month is legal only in the relaxed form. */
+    relaxed = false;
+    for (i = p; sp[i] == '-' || (sp[i] >= '0' && sp[i] <= '9') || sp[i] == ':'; i++)
+        continue;
+    if (sp[i] == ' ')
+        relaxed = true;
+    lo = relaxed ? 1 : 2;
     if (string_skip_char(sp, &p, '-')) {
-        if (!string_get_digits(sp, &p, &fields[1], 2, 2))  /* month */
+        if (!string_get_digits(sp, &p, &fields[1], lo, 2))  /* month */
             return false;
         if (fields[1] < 1)
             return false;
         fields[1] -= 1;
         if (string_skip_char(sp, &p, '-')) {
-            if (!string_get_digits(sp, &p, &fields[2], 2, 2))  /* day */
+            if (!string_get_digits(sp, &p, &fields[2], lo, 2))  /* day */
                 return false;
             if (fields[2] < 1)
                 return false;
         }
     }
-    if (string_skip_char(sp, &p, 'T')) {
+    if (string_skip_char(sp, &p, relaxed ? ' ' : 'T')) {
         *is_local = true;
-        if (!string_get_digits(sp, &p, &fields[3], 2, 2)  /* hour */
+        if (!string_get_digits(sp, &p, &fields[3], lo, 2)  /* hour */
         ||  !string_skip_char(sp, &p, ':')
-        ||  !string_get_digits(sp, &p, &fields[4], 2, 2)) {  /* minute */
-            fields[3] = 100;  // reject unconditionally
+        ||  !string_get_digits(sp, &p, &fields[4], lo, 2)) {  /* minute */
+            if (relaxed)
+                return false;   /* not this grammar: let the legacy parser see the string */
+            fields[3] = 100;  /* a `T` commits to this grammar, so a malformed time is NaN, never retried */
             return true;
         }
         if (string_skip_char(sp, &p, ':')) {
-            if (!string_get_digits(sp, &p, &fields[5], 2, 2))  /* second */
+            if (!string_get_digits(sp, &p, &fields[5], lo, 2))  /* second */
                 return false;
             string_get_milliseconds(sp, &p, &fields[6]);
         }
     }
-    /* parse the time zone offset if present: [+-]HH:mm or [+-]HHmm */
+    /* parse the time zone offset if present: [+-]HH:mm, [+-]HHmm, `Z`, and [+-]HH when relaxed */
     if (sp[p]) {
         *is_local = false;
-        if (!string_get_tzoffset(sp, &p, &fields[8], true))
+        if (!string_get_tzoffset(sp, &p, &fields[8], !relaxed))
             return false;
     }
     /* error if extraneous characters */
@@ -89445,10 +89466,18 @@ static bool js_date_parse_otherstring(const uint8_t *sp,
                 has_time = true;
             } else {
                 if (p - p_start > 2) {
+                    if (has_year)
+                        return false;
                     fields[0] = val;
                     has_year = true;
                 } else
                 if (val < 1 || val > 31) {
+                    /* A number that cannot be a day or a month is the year -- and a string cannot have TWO
+                       years. It used to overwrite the first one and leave the leftover count looking legal, so
+                       `99/1/99` became 1999-01-01 (day 99 silently gone) and `0/10/0` became a date at all.
+                       Both are NaN in Chrome, because neither string names three fields that fit. */
+                    if (has_year)
+                        return false;
                     fields[0] = val + (val < 100) * 1900 + (val < 50) * 100;
                     has_year = true;
                 } else {
