@@ -21686,8 +21686,17 @@ static bool tramp_walk_continues(JSContext *ctx, JSObject *p, JSAtom atom)
     if (p->fast_array)
         return !(__JS_AtomIsTaggedInt(atom) && __JS_AtomToUInt32(atom) < p->u.array.count);
     em = ctx->rt->class_array[p->class_id].exotic;
-    if (em && em->get_own_property)
+    if (em && em->get_own_property) {
+        /* Exactly two classes define that hook, and the Proxy is already gone above -- so the only one that can
+           reach here is the String exotic's index lookup, which is pure C. ASSERTED rather than claimed, the
+           same way the spread's exclusion list is: if a third class ever defines the hook, this line is where
+           the page's code would start running from C with no flow base, and it says so at that point instead of
+           being discovered by a hang. */
+        DCHECK(p->class_id == JS_CLASS_STRING,
+               "an exotic [[GetOwnProperty]] other than the String index lookup reached the accessor walk — "
+               "route that class onto the keyed entry's GP_GETOWNPROP before it runs page code from C");
         return JS_GetOwnPropertyInternal(ctx, NULL, p, atom) == 0;
+    }
     return true;
 }
 /* DIRECT eval, compiled to a CLOSURE for the tramp and never run here. Both spellings of a direct eval — `eval(x)`
