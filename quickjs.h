@@ -1348,6 +1348,11 @@ JS_EXTERN JSValue  JS_FlowEvalModule(JSContext *ctx, const char *src, size_t len
 /* 1 = suspended (preempted), 0 = completed. *pres receives the program's COMPLETION VALUE (or JS_EXCEPTION) on
    completion, JS_UNDEFINED while suspended — a script's completion value is part of its completion, so it is not
    optional: pres==NULL is a DCHECK, never a licence to discard the value the program produced. */
+/* JS_FlowResume's third answer. 0 = completed (the caller frees the flow), 1 = suspended (the caller resumes it
+   later), and this = the flow's base has been HANDED OFF and is no longer the caller's to free. It happens when
+   a base registers itself as a continuation somewhere else — a module body reaching a top-level await moves its
+   state onto the awaited promise's reaction — so the scheduler must forget the flow WITHOUT tearing it down. */
+#define JS_FLOW_DETACHED 2
 JS_EXTERN int      JS_FlowResume(JSContext *ctx, JSValue *flow, JSValue *pres);
 JS_EXTERN void     JS_FlowFree(JSContext *ctx, JSValue *flow);
 /* Feature-engagement counters (anti-fake-green): requested = back-edge preempt points reached; fired = actually

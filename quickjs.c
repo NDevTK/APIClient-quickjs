@@ -39220,10 +39220,26 @@ int JS_FlowResume(JSContext *ctx, JSValue *flow, JSValue *pres) {
         {
             JSAsyncPost post;
             int st = js_async_function_post_prepare(ctx, d, r, &post);
-            if (st == ASYNC_POST_AWAIT)
-                DFAIL("a FORKED module body reached a top-level await — its continuation has to transfer from "
-                      "the scheduler's flow to the promise reaction, which is the await half of running a module "
-                      "body as a scheduler flow");
+            if (st == ASYNC_POST_AWAIT) {
+                /* TOP-LEVEL AWAIT in a forked module body. The continuation stops being the scheduler's here:
+                   27.7.5.3 registers it on the awaited promise, and the JSAsyncFunctionData's ownership goes
+                   with it. So this flow is done as a SCHEDULER flow — but its frame is now somebody else's and
+                   must not be torn down, which is what the third answer says. */
+                JSValue awfn = js_new_async_await(ctx, post.st);
+                int ar;
+                js_async_function_free(ctx->rt, post.st);
+                post.st = NULL;
+                if (JS_IsException(awfn)) {
+                    JS_FreeValue(ctx, post.value);
+                    return JS_FLOW_DETACHED;
+                }
+                ar = js_settle_as_flow(ctx, awfn, post.value);
+                JS_FreeValue(ctx, awfn);
+                JS_FreeValue(ctx, post.value);
+                DCHECK(ar == 0, "registering a forked module body's await threw — PromiseResolve on the "
+                                "intrinsic Promise cannot");
+                return JS_FLOW_DETACHED;
+            }
             if (st == ASYNC_POST_CALL) {
                 int cr = js_settle_as_flow(ctx, post.func, post.value);
                 JS_FreeValue(ctx, post.func);
