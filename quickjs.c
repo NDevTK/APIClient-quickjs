@@ -39173,6 +39173,8 @@ JSValue JS_FlowEvalModule(JSContext *ctx, const char *src, size_t len, const cha
     return JS_EvalFunction(ctx, bc);   /* create the module function, link the graph, evaluate; consumes bc */
 }
 
+static JSAsyncFunctionData *flow_async_data(JSAsyncFunctionState *s);
+
 int JS_FlowResume(JSContext *ctx, JSValue *flow, JSValue *pres) {
     JSAsyncFunctionState *s = (JSAsyncFunctionState *)flow;
     DCHECK(pres != NULL, "JS_FlowResume: the completion value is part of the completion — the caller must take it");
@@ -39186,6 +39188,44 @@ int JS_FlowResume(JSContext *ctx, JSValue *flow, JSValue *pres) {
     JSAsyncFunctionState *outer_base = g_flow_base_gen;
     bool nested = (outer_base != NULL && outer_base != s);
     int result;
+    /* AN ASYNC-CALL BASE COMPLETES BY SETTLING ITS PROMISE, not by handing a value back. A flow whose base is a
+       module body (or any async function entered from C) is the sibling of a fork inside one; the scheduler
+       drives it here, but the completion is the async driver's — post_prepare reads the return value off the
+       suspended frame and the resolving function runs as its own call-root flow. Reporting `completed` with the
+       value, the way a classic script's base does, would leave the module's evaluation promise pending forever
+       in this arm's world. Suspension is reported to the SCHEDULER (return 1) rather than parked in the async
+       pump's slot: the scheduler owns this flow, and two drivers for one state is how a flow gets resumed twice. */
+    if (s->base_kind == FLOW_BASE_ASYNC_CALL) {
+        JSAsyncFunctionData *d = flow_async_data(s);
+        JSValue r;
+        g_flow_base_gen = s;
+        s->throw_flag = false;   /* a preempt-resume is a continuation, never a re-throw */
+        r = async_func_resume(ctx, s);
+        if (nested) g_flow_base_gen = outer_base;
+        *pres = JS_UNDEFINED;
+        {
+            int fr = JS_VALUE_GET_TAG(r) == JS_TAG_INT ? JS_VALUE_GET_INT(r) : -1;
+            if (JS_VALUE_GET_TAG(r) == JS_TAG_INT &&
+                (fr == FUNC_RET_PREEMPT || fr == FUNC_RET_YIELD || fr == FUNC_RET_YIELD_STAR))
+                return 1;   /* suspended: the scheduler resumes it, with its COW delta swapped back in */
+        }
+        {
+            JSAsyncPost post;
+            int st = js_async_function_post_prepare(ctx, d, r, &post);
+            if (st == ASYNC_POST_AWAIT)
+                DFAIL("a FORKED module body reached a top-level await — its continuation has to transfer from "
+                      "the scheduler's flow to the promise reaction, which is the await half of running a module "
+                      "body as a scheduler flow");
+            if (st == ASYNC_POST_CALL) {
+                int cr = js_settle_as_flow(ctx, post.func, post.value);
+                JS_FreeValue(ctx, post.func);
+                JS_FreeValue(ctx, post.value);
+                DCHECK(cr == 0, "settling a forked module body's promise threw — the capability is the intrinsic "
+                                "Promise's, so nothing in it can throw");
+            }
+        }
+        return 0;   /* completed: the promise this base owed is settled on THIS flow's timeline */
+    }
     for (;;) {
         g_flow_base_gen = s;   /* this is the flow's BASE activation — a branch here may snapshot-fork; a branch
                                   in a nested async call (different gen_state) forks by replay instead */
@@ -39231,6 +39271,15 @@ void JS_FlowFree(JSContext *ctx, JSValue *flow) {
        link ran `JS_Call(m->func_obj, JS_TRUE)` with no flow live at all and was counted against this corpse. */
     if (g_flow_base_gen == s)
         g_flow_base_gen = NULL;
+    /* An ASYNC_CALL base is not this allocation's owner — the JSAsyncFunctionData around it is, and it holds the
+       capability too. Releasing it through the container is the only teardown that frees both. */
+    if (s->base_kind == FLOW_BASE_ASYNC_CALL) {
+        JSAsyncFunctionData *d = flow_async_data(s);
+        if (s->frame.cur_sp == NULL && s->tramp_top == NULL)
+            d->is_active = false;   /* completed via `done:`, which already released the frame's contents */
+        js_async_function_free(ctx->rt, d);
+        return;
+    }
     if (s->frame.cur_sp != NULL) {
         async_func_free(ctx->rt, s);   /* never-run or BASE-suspended: full generator-frame cleanup */
     } else if (s->tramp_top != NULL) {
@@ -39295,6 +39344,53 @@ static JSValue *tramp_buf_base(TrampFrame *t) {
     return (t->async_data || t->gen_data) ? tramp_live_sf(t)->arg_buf : t->local_buf;
 }
 
+/* An ASYNC_CALL base is EMBEDDED in the JSAsyncFunctionData that holds the capability its completion settles. */
+static JSAsyncFunctionData *flow_async_data(JSAsyncFunctionState *s)
+{
+    DCHECK(s->base_kind == FLOW_BASE_ASYNC_CALL,
+           "flow_async_data asked for the owner of a base that is not an async-call base");
+    return (JSAsyncFunctionData *)((char *)s - offsetof(JSAsyncFunctionData, func_state));
+}
+
+/* Allocate the state a CLONE of `src` must live in. The base KIND says what owns it, so the clone has to be BORN
+   in the right container — relocating it afterwards would dangle the tramp chain's caller_sf back-pointers into
+   the base frame. An ASYNC_CALL clone SHARES the capability rather than minting one: it settles the SAME promise
+   object, and the COW delta captures that settlement per flow (async_settle), so each arm settles it on its own
+   timeline. A fresh capability would settle a promise nothing is waiting on — the module's evaluation chain is
+   registered on this one. */
+static JSAsyncFunctionState *flow_clone_state_alloc(JSContext *ctx, JSAsyncFunctionState *src)
+{
+    JSAsyncFunctionState *c;
+
+    if (src->base_kind == FLOW_BASE_ASYNC_CALL) {
+        JSAsyncFunctionData *sd = flow_async_data(src), *d = js_mallocz(ctx, sizeof(*d));
+        if (!d) return NULL;
+        JS_REF_COUNT(d) = 1;
+        add_gc_object(ctx->rt, &d->header, JS_GC_OBJ_TYPE_ASYNC_FUNCTION);
+        d->resolving_funcs[0] = js_dup(sd->resolving_funcs[0]);
+        d->resolving_funcs[1] = js_dup(sd->resolving_funcs[1]);
+        d->is_active = true;   /* the frame is filled in by the caller; a failure path releases it through here */
+        c = &d->func_state;
+    } else {
+        c = js_mallocz(ctx, sizeof(*c));
+        if (!c) return NULL;
+    }
+    c->base_kind = src->base_kind;   /* a clone completes the way its ORIGINAL does */
+    return c;
+}
+
+/* Release a clone shell whose frame was never completed (an allocation failure mid-clone). */
+static void flow_clone_state_free_shell(JSContext *ctx, JSAsyncFunctionState *c)
+{
+    if (c->base_kind == FLOW_BASE_ASYNC_CALL) {
+        JSAsyncFunctionData *d = flow_async_data(c);
+        d->is_active = false;            /* nothing to tear down: the frame was never built */
+        js_async_function_free(ctx->rt, d);
+        return;
+    }
+    js_free(ctx, c);
+}
+
 /* The join-chain search, declared here because clone_deep_flow re-derives each cloned join's cached
    enclosing-join pointer with it. */
 struct JSArrayJoin;
@@ -39315,10 +39411,10 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
 
     /* ---- clone the base frame (dormant, mid-call): live end = the bottom frame's caller_sp ---- */
     ptrdiff_t blive = oa[n - 1]->caller_sp - ob->arg_buf;
-    JSAsyncFunctionState *c = js_mallocz(ctx, sizeof(*c));
+    JSAsyncFunctionState *c = flow_clone_state_alloc(ctx, s);
     if (!c) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
     JSStackFrame *cb = &c->frame;
-    if (clone_susp_frame(ctx, cb, ob, blive) < 0) { js_free(ctx, c); js_free(ctx, oa); js_free(ctx, ca); return NULL; }
+    if (clone_susp_frame(ctx, cb, ob, blive) < 0) { flow_clone_state_free_shell(ctx, c); js_free(ctx, oa); js_free(ctx, ca); return NULL; }
     c->this_val = js_dup(s->this_val);
     c->argc = s->argc; c->throw_flag = s->throw_flag;
     cb->cur_sp = NULL;         /* dormant: the live point is in the chain */
@@ -39618,15 +39714,6 @@ JSValue *JS_FlowClone(JSContext *ctx, JSValue *flow) {
     /* A flow is SUSPENDED iff a base frame saved cur_sp OR a deep chain is stashed in tramp_top (a deep
        suspend leaves the BASE cur_sp NULL — its live point is in the chain, not the base). */
     DCHECK(sf->cur_sp != NULL || s->tramp_top != NULL, "JS_FlowClone: flow is not SUSPENDED (only a paused frame can be snapshot-forked)");
-    /* A MODULE BODY (and any async function entered from C rather than through the interpreter) runs as its own
-       flow base owned by a JSAsyncFunctionData. Cloning that base produces a state with no data behind it: the
-       sibling's completion has no promise to settle and the original's data is freed while the clone still reads
-       it — which is heap corruption, not a missing feature, so it crashes here rather than there. The fix is not
-       a clone variant: the body must run ON THE FLOW'S CHAIN like every other async activation
-       (do_async_tramp_call), so a fork sees an ordinary nested frame and the promise stays with its owner. */
-    DCHECK(s->base_kind != FLOW_BASE_ASYNC_CALL,
-           "a flow forked inside an async body entered from C (a module evaluation) — route that body through "
-           "the trampoline so the fork clones a nested activation, not a promise's own state");
     if (s->tramp_top != NULL) return clone_deep_flow(ctx, s);   /* deep: base + tramp chain */
     /* Captured-local cells are CLOSED heap cells now (V8 Context model) — the clone SHARES them (one COW-
        swappable cell per captured var, isolated per-flow by the delta) and takes its own ownership ref. */
@@ -39636,11 +39723,11 @@ JSValue *JS_FlowClone(JSContext *ctx, JSValue *flow) {
     int local_count = arg_buf_len + b->var_count + b->stack_size;
     size_t alloc_size = sizeof(JSValue) * (local_count > 0 ? local_count : 1) + sizeof(JSVarRef *) * b->var_ref_count;
 
-    JSAsyncFunctionState *c = js_mallocz(ctx, sizeof(*c));
+    JSAsyncFunctionState *c = flow_clone_state_alloc(ctx, s);
     if (!c) return NULL;
     JSStackFrame *cf = &c->frame;
     cf->arg_buf = js_malloc(ctx, alloc_size);
-    if (!cf->arg_buf) { js_free(ctx, c); return NULL; }
+    if (!cf->arg_buf) { flow_clone_state_free_shell(ctx, c); return NULL; }
 
     cf->is_strict_mode = sf->is_strict_mode;
     cf->cur_func = js_dup(sf->cur_func);
@@ -40162,13 +40249,19 @@ static JSValue js_async_function_resolve_call(JSContext *ctx,
     return JS_UNDEFINED;
 }
 
-static JSValue js_async_function_call(JSContext *ctx, JSValueConst func_obj,
-                                      JSValueConst this_obj,
-                                      int argc, JSValueConst *argv, int flags)
+/* START an async call: create the JSAsyncFunctionData and its capability, WITHOUT running the body. Split out
+   because a consumer that must register a continuation on the promise has to do it BEFORE the body runs — the
+   body can fork, and a sibling forked mid-body inherits a world in which a registration made after the call
+   returned never happened. C must not hold a continuation across a point where the page's code can fork.
+   Returns the promise; *pdata receives the state, whose ownership passes to js_async_function_run. */
+static JSValue js_async_function_start(JSContext *ctx, JSValueConst func_obj,
+                                       JSValueConst this_obj, int argc, JSValueConst *argv,
+                                       JSAsyncFunctionData **pdata)
 {
     JSValue promise;
     JSAsyncFunctionData *s;
 
+    *pdata = NULL;
     s = js_mallocz(ctx, sizeof(*s));
     if (!s)
         return JS_EXCEPTION;
@@ -40190,16 +40283,38 @@ static JSValue js_async_function_call(JSContext *ctx, JSValueConst func_obj,
     }
     s->is_active = true;
     s->func_state.base_kind = FLOW_BASE_ASYNC_CALL;   /* this state belongs to `s`, and a fork must say so */
+    *pdata = s;
+    return promise;
+}
 
-    /* Run the body AS A FLOW: a loop/await PARKS at a back-edge and re-enters via the job pump — never driven to
-       completion (that resume is DELETED). This is the only caller path for module bodies (js_execute_sync_module /
-       js_execute_async_module), so module evaluation suspend/resumes on the flow machinery; a parked body leaves
-       `promise` PENDING, which js_execute_sync_module treats as async evaluation. */
+/* Run a started async call's body AS A FLOW: a loop/await PARKS at a back-edge and re-enters via the job pump —
+   never driven to completion (that resume is DELETED). This is the only caller path for module bodies
+   (js_execute_sync_module / js_execute_async_module), so module evaluation suspend/resumes on the flow
+   machinery; a parked body leaves its promise PENDING, which js_execute_sync_module treats as async evaluation.
+   Consumes the reference `js_async_function_start` handed out. */
+static bool js_async_function_run(JSContext *ctx, JSAsyncFunctionData *s)
+{
     if (!js_async_function_resume_as_flow(ctx, s))
-        goto fail;
-
+        return false;
     js_async_function_free(ctx->rt, s);
+    return true;
+}
 
+static JSValue js_async_function_call(JSContext *ctx, JSValueConst func_obj,
+                                      JSValueConst this_obj, int argc, JSValueConst *argv,
+                                      int flags)
+{
+    JSAsyncFunctionData *s;
+    JSValue promise;
+
+    (void)flags;
+    promise = js_async_function_start(ctx, func_obj, this_obj, argc, argv, &s);
+    if (JS_IsException(promise))
+        return promise;
+    if (!js_async_function_run(ctx, s)) {
+        JS_FreeValue(ctx, promise);
+        return JS_EXCEPTION;
+    }
     return promise;
 }
 
@@ -51834,11 +51949,19 @@ static JSValue js_async_module_execution_fulfilled(JSContext *ctx, JSValueConst 
     return JS_UNDEFINED;
 }
 
+/* THE REACTIONS ARE REGISTERED BEFORE THE BODY RUNS, and the order is the whole point. The body can FORK — a
+   concolic branch in a module's top level is ordinary — and a sibling forked mid-body inherits the world as it
+   was AT the branch. Registering afterwards put `js_async_module_execution_fulfilled` on the promise only in the
+   arm that reached the end of this C function, so every other arm evaluated its module and then settled a
+   promise with no reactions on it: the module never became EVALUATED in that world and the importing
+   `.then(m => …)` never ran. Splitting the call is what makes the registration precede the fork point. */
 static int js_execute_async_module(JSContext *ctx, JSModuleDef *m)
 {
     JSValue promise, m_obj;
-    JSValue resolve_funcs[2], ret_val;
-    promise = js_async_function_call(ctx, m->func_obj, JS_UNDEFINED, 0, NULL, 0);
+    JSValue resolve_funcs[2];
+    JSAsyncFunctionData *s;
+
+    promise = js_async_function_start(ctx, m->func_obj, JS_UNDEFINED, 0, NULL, &s);
     if (JS_IsException(promise))
         return -1;
     m_obj = JS_NewModuleValue(ctx, m);
@@ -51849,6 +51972,8 @@ static int js_execute_async_module(JSContext *ctx, JSModuleDef *m)
     JS_FreeValue(ctx, resolve_funcs[0]);
     JS_FreeValue(ctx, resolve_funcs[1]);
     JS_FreeValue(ctx, promise);
+    if (!js_async_function_run(ctx, s))
+        return -1;
     return 0;
 }
 
@@ -51912,6 +52037,8 @@ static int js_module_eval_finish(JSContext *ctx, JSModuleDef *m, JSModuleDef **p
 {
     JSModuleDef *m1;
 
+    bool exec_async = false;
+
     if (m->pending_async_dependencies > 0) {
         assert(!m->async_evaluation);
         m->async_evaluation = true;
@@ -51926,7 +52053,7 @@ static int js_module_eval_finish(JSContext *ctx, JSModuleDef *m, JSModuleDef **p
         m->async_evaluation = true;
         m->async_evaluation_timestamp =
             ctx->rt->module_async_evaluation_next_timestamp++;
-        js_execute_async_module(ctx, m);
+        exec_async = true;   /* run BELOW, after the SCC pop — see the note there */
     } else {
         /* C init_func module: truly synchronous, never parks. */
         if (js_execute_sync_module(ctx, m, pvalue) < 0)
@@ -51950,6 +52077,17 @@ static int js_module_eval_finish(JSContext *ctx, JSModuleDef *m, JSModuleDef **p
                 break;
         }
     }
+    /* THE BODY RUNS AFTER THE SCC POP, and the reason is forking. 16.2.1.5.3 executes at step 13 and pops at
+       steps 14-16, which is sound only because the body's asynchronous CONTINUATION cannot run before the pop —
+       and AsyncModuleExecutionFulfilled asserts exactly that (`[[Status]] is EVALUATING-ASYNC`). A forked flow
+       breaks the "cannot": the sibling's world is the one that existed AT the branch inside the body, where the
+       pop had not happened, and it then settles the body's promise and reaches that assert with status
+       EVALUATING. The pop is pure state — no page code runs in it — so performing it first makes every arm of a
+       fork see the state the continuation requires. It also makes an unhandled case defined rather than
+       asserting: a module body that dynamically imports ITSELF reached js_evaluate_module with status
+       EVALUATING, which is not one of the three that function accepts. */
+    if (exec_async)
+        js_execute_async_module(ctx, m);
     *pvalue = JS_UNDEFINED;
     return 0;
 }
