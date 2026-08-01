@@ -1317,6 +1317,10 @@ typedef struct JSConcolicHooks {
     int (*is)(JSValueConst v);
     JSValue (*absent)(JSContext *ctx, JSAtom name);
     int (*rel)(JSContext *ctx, JSValue *sp, int op);
+    /* `typeof v`. Returns the type STRING to use, or JS_UNINITIALIZED to run the real js_operator_typeof. An
+       unknown value's type is unknown, and the engine must not answer it from the host object's REPRESENTATION
+       (a callable placeholder would say "function" and decide `typeof x === "function"` for the program). */
+    JSValue (*type_of)(JSContext *ctx, JSValueConst v);
 } JSConcolicHooks;
 JS_EXTERN void JS_SetConcolicHooks(const JSConcolicHooks *hooks);
 

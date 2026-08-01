@@ -24359,6 +24359,32 @@ void JS_SetFlowControlHooks(const JSFlowControlHooks *h) { g_flow_control = *h; 
 void JS_SetTimeTravelHooks(const JSTimeTravelHooks *h) { g_time_travel = *h; }
 void JS_SetConcolicHooks(const JSConcolicHooks *h) { g_concolic = *h; }
 
+/* `typeof x === "undefined"` and `=== "function"` are FUSED by the peephole into ONE opcode that never reaches
+   OP_typeof or OP_strict_eq — so without this the concolic decision depended on WHICH STRING the program
+   compared against: `typeof f === "object"` forked both arms while `=== "function"` silently took the arm the
+   host object's representation implied. The two spellings must reach the same two hooks, so the fused opcode
+   asks them itself: the type of an unknown is an unknown string, and comparing it forks. Returns 1 with the
+   concolic comparison result in sp[-1]. */
+static int js_typeof_is_concolic(JSContext *ctx, JSValue *sp, JSAtom expected)
+{
+    JSValue t, pair[2];
+
+    if (!g_concolic.type_of)
+        return 0;
+    t = g_concolic.type_of(ctx, sp[-1]);
+    if (JS_IsUninitialized(t))
+        return 0;
+    pair[0] = t;
+    pair[1] = JS_AtomToString(ctx, expected);
+    /* The operand IS concolic (type_of answered), so the comparison hook owns this compare. */
+    DCHECK(g_concolic.cmp != NULL, "a concolic typeof result with no comparison hook to decide it");
+    if (!g_concolic.cmp(ctx, pair + 2, /*is_neq*/false))
+        DFAIL("the concolic comparison hook declined a concolic typeof result");
+    JS_FreeValue(ctx, sp[-1]);
+    sp[-1] = pair[0];
+    return 1;
+}
+
 /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
 static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                JSValueConst this_obj, JSValueConst new_target,
@@ -37258,6 +37284,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSAtom atom;
 
                 op1 = sp[-1];
+                if (g_concolic.type_of) {
+                    JSValue t = g_concolic.type_of(ctx, op1);
+                    if (!JS_IsUninitialized(t)) {
+                        JS_FreeValue(ctx, op1);
+                        sp[-1] = t;
+                        BREAK;
+                    }
+                }
                 atom = js_operator_typeof(ctx, op1);
                 JS_FreeValue(ctx, op1);
                 sp[-1] = JS_AtomToString(ctx, atom);
@@ -37740,12 +37774,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             /* XXX: could merge to a single opcode */
         CASE(OP_typeof_is_undefined):
             /* different from OP_is_undefined because of isHTMLDDA */
+            if (js_typeof_is_concolic(ctx, sp, JS_ATOM_undefined))
+                BREAK;
             if (js_operator_typeof(ctx, sp[-1]) == JS_ATOM_undefined) {
                 goto free_and_set_true;
             } else {
                 goto free_and_set_false;
             }
         CASE(OP_typeof_is_function):
+            if (js_typeof_is_concolic(ctx, sp, JS_ATOM_function))
+                BREAK;
             if (js_operator_typeof(ctx, sp[-1]) == JS_ATOM_function) {
                 goto free_and_set_true;
             } else {
