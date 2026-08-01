@@ -17948,6 +17948,11 @@ struct JSStepVisit {
        far. Declared as its own operation rather than left to the machine because a machine must never learn
        WHICH consumer is visiting it — that is what keeps the one declaration honest. */
     void (*strbuf)(JSContext *ctx, StringBuffer *slot);
+    /* `struct ValueSlot` is defined below, and naming it first INSIDE the `slots` prototype below would declare
+       a fresh tag scoped to that prototype -- a different type from the file-scope one, so every visitor that
+       assigns js_step_visit_*_slots is an incompatible-pointer error. gcc -w hid all three; the project's
+       clang build does not. */
+    struct ValueSlot;
     /* An OWN-KEY SNAPSHOT: the JSPropertyEnum array a walk took of its source, `n` entries, each holding an
        atom reference. Its own operation for the same reason the accumulator is — it is one allocation the
        byte-copy would leave two states pointing at, and its elements are atoms rather than values. */
