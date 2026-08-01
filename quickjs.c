@@ -645,6 +645,12 @@ struct JSContext {
        that can push the promise as the opcode's RESULT — rejects it once the unwind has returned to the frame
        named in `sf`. NULL whenever no import coercion is in flight. */
     struct JSImportCap *pending_import_cap;
+    /* HostLoadImportedModule (16.2.1.9) is ASYNCHRONOUS, and a browser's always is — the module's source comes
+       off the network. A loader that cannot answer synchronously calls JS_ModuleLoadPending with a promise that
+       settles with the SOURCE TEXT and returns NULL; this is the slot it hands it over in, read by the one
+       caller that can wait (JS_LoadModuleInternal) immediately after the loader returns. JS_UNDEFINED whenever
+       no load is parked, which is every moment except that handoff. */
+    JSValue module_load_pending;
     /* IfAbruptCloseIterator / IteratorCloseAll deferred to this context's interpreter caller: the JS_CallInternal
        exception label runs 7.4.9 on the tramp for each entry, saving and restoring the in-flight exception across
        it, so the page's `return` (a generator's finally, an accessor, a proxy trap, a plain method containing a
@@ -3219,6 +3225,7 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
     ctx->pending_close_n = 0;
     ctx->pending_close_cap = 0;
     ctx->pending_import_cap = NULL;
+    ctx->module_load_pending = JS_UNDEFINED;
     ctx->pending_gp_unwind = NULL;
     ctx->pending_gp_unwind_kind = 0;   /* CONT_NONE */
     ctx->error_prepare_stack = JS_UNDEFINED;
@@ -3439,6 +3446,9 @@ void JS_FreeContext(JSContext *ctx)
     }
     JS_FreeValue(ctx, ctx->error_ctor);
     DCHECK(ctx->pending_import_cap == NULL, "a parked import capability outlived its context");
+    DCHECK(JS_IsUndefined(ctx->module_load_pending),
+           "a module load parked on a source promise that nothing ever took — the loader called "
+           "JS_ModuleLoadPending from a path that cannot wait for it");
     DCHECK(ctx->pending_gp_unwind == NULL, "a parked keyed-operation unwind outlived its context");
     while (ctx->pending_close_n > 0)   /* normally empty (drained at the exception label); free defensively */
         JS_FreeValue(ctx, ctx->pending_close_iters[--ctx->pending_close_n]);
@@ -21410,7 +21420,19 @@ static inline bool tramp_body_is_plain(JSValueConst func) {
     if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
     fp = JS_VALUE_GET_OBJ(func);
     if (fp->class_id != JS_CLASS_BYTECODE_FUNCTION) return false;
-    return fp->u.func.function_bytecode->func_kind == JS_FUNC_NORMAL;
+    /* THE CLASS is the object's own statement of how it is entered, and js_closure picks it from func_kind — a
+       coroutine FUNCTION has its own class, so asking func_kind again here answers a question the class already
+       answered. It answered it WRONG for one object: a MODULE's func_obj is created as JS_CLASS_BYTECODE_FUNCTION
+       on purpose (module code is never entered by an ordinary call) while its body is compiled async-kind whether
+       or not it has top-level await. Its two entries are different algorithms and neither is a coroutine create —
+       evaluation goes through js_execute_*_module's async frame without ever asking this, and LINKING runs the
+       hoisted-definition prologue (this === true), which the compiler ends in a PLAIN return. Excluding it here
+       sent that prologue to the generic C-recursive call, which is where the module graph still drove the page's
+       code from C. */
+    DCHECK(fp->u.func.function_bytecode->func_kind == JS_FUNC_NORMAL ||
+           fp->u.func.function_bytecode->func_kind == JS_FUNC_ASYNC,
+           "a JS_CLASS_BYTECODE_FUNCTION carrying a generator body — no route creates its coroutine");
+    return true;
 }
 /* A bound function's chain, FLATTENED. `f.bind(a, x).bind(b, y)()` calls f with this = the INNERMOST bind's
    this_val and args = innermost bound args ++ … ++ outermost bound args ++ the call args, so the walk fills the
@@ -49900,6 +49922,8 @@ static bool keyed_by_attributes(JSContext *ctx, JSAtom key, const char *cname)
     return same;
 }
 
+static JSValue js_module_take_pending(JSContext *ctx);
+
 static JSModuleDef *js_host_resolve_imported_module(JSContext *ctx,
                                                     const char *base_cname,
                                                     const char *cname1,
@@ -49985,6 +50009,13 @@ static JSModuleDef *js_host_resolve_imported_module_atom(JSContext *ctx,
         return NULL;
     }
     m = js_host_resolve_imported_module(ctx, base_cname, cname, attributes);
+    if (!m && !JS_IsUndefined(ctx->module_load_pending)) {
+        JS_FreeValue(ctx, js_module_take_pending(ctx));
+        DFAIL("a STATIC import parked on a source promise, and this walk cannot wait for it: js_resolve_module "
+              "links the graph from C with no point to suspend at. Build the parking resolve — the walk becomes "
+              "a step machine that REQUESTS each not-yet-loaded module and is re-entered with it, the way the "
+              "dynamic import already resumes on its source promise");
+    }
     JS_FreeCString(ctx, base_cname);
     JS_FreeCString(ctx, cname);
     return m;
@@ -50753,6 +50784,36 @@ static int js_create_module_function(JSContext *ctx, JSModuleDef *m)
 
 /* Prepare a module to be executed by resolving all the imported
    variables. */
+static int reaction_call_flow_init(JSContext *ctx, JSAsyncFunctionState *fs, JSValueConst this_val,
+                                   JSValueConst handler, int argc, JSValueConst *argv);
+
+/* `func.call(this_val, ...argv)` as a CALL-ROOT FLOW that must COMPLETE. The call-root base is the same one a
+   promise reaction runs on, so the callee enters through the convergence point and anything that loops inside it
+   PARKS instead of driving to completion — which is what a plain JS_Call from C could not do. The difference
+   from the reaction driver is the contract, not the mechanism: this is for a callee the COMPILER emits with no
+   back-edge, so a park is a should-never-happen and `parked_msg` names the machinery that would have to exist
+   for that callee to suspend. Returns the completion value (JS_EXCEPTION with the throw in flight). */
+static JSValue js_call_flow_complete(JSContext *ctx, JSValueConst func, JSValueConst this_val,
+                                     int argc, JSValueConst *argv, const char *parked_msg)
+{
+    JSAsyncFunctionState fs, *prev_base = g_flow_base_gen;
+    JSValue res;
+
+    if (reaction_call_flow_init(ctx, &fs, this_val, func, argc, argv) < 0)
+        return JS_EXCEPTION;
+    fs.throw_flag = false;
+    g_flow_base_gen = &fs;
+    res = async_func_resume(ctx, &fs);
+    g_flow_base_gen = prev_base;
+    if (fs.frame.cur_sp != NULL || fs.tramp_top != NULL)
+        DFAIL(parked_msg);
+    /* completed via `done:`, which frees the stack + var_refs inline but not the frame block or its cur_func */
+    js_free_rt(ctx->rt, fs.frame.arg_buf);
+    JS_FreeValue(ctx, fs.frame.cur_func);
+    JS_FreeValue(ctx, fs.this_val);
+    return res;
+}
+
 /* THE POST-ORDER half of InnerModuleLinking (16.2.1.5.2 steps 9-11): the indirect-export check, the import
    resolution, and the `initialize the global variables` call. It is its own function because the WALK around it is
    no longer C recursion — see js_inner_module_linking below. */
@@ -50892,8 +50953,18 @@ static int js_module_linking_finish(JSContext *ctx, JSModuleDef *m, JSModuleDef 
             }
         }
 
-        /* initialize the global variables */
-        ret_val = JS_Call(ctx, m->func_obj, JS_TRUE, 0, NULL);
+        /* 16.2.1.6.4 InitializeEnvironment's tail: run the module body's `OP_push_this; OP_if_false <body>`
+           prologue, which with `this === true` performs the hoisted-definition pass and returns. AS A FLOW —
+           the same entry module EVALUATION uses — because a bytecode body entered by plain JS_Call from C
+           cannot suspend, and this was the last such entry in the module machinery (the walk around it is
+           already an explicit worklist). The prologue has no back-edge, so nothing in it can park; that is an
+           invariant of the shape the compiler emits, and the DFAIL below is what makes it one rather than an
+           assumption. */
+        ret_val = js_call_flow_complete(ctx, m->func_obj, JS_TRUE, 0, NULL,
+                                        "a module's hoisted-definition prologue PARKED — it is compiled with no "
+                                        "back-edge, so nothing in it can preempt. A prologue that does park "
+                                        "makes LINKING asynchronous: the link worklist must hold its frame "
+                                        "across the suspension and resume on the parked flow");
         if (JS_IsException(ret_val))
             goto fail;
         JS_FreeValue(ctx, ret_val);
@@ -51176,19 +51247,24 @@ static JSValue js_load_module_fulfilled(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
-static void JS_LoadModuleInternal(JSContext *ctx, const char *basename,
-                                  const char *filename,
-                                  JSValueConst *resolving_funcs,
-                                  JSValueConst attributes)
+/* The in-flight exception REJECTS the import's capability. Every failure of a load reaches this, whether the
+   module was answered synchronously or its source arrived later. */
+static void js_load_module_reject_pending(JSContext *ctx, JSValueConst *resolving_funcs)
+{
+    JSValue err = JS_GetException(ctx);
+    JSValue ret = JS_Call(ctx, resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
+    JS_FreeValue(ctx, ret); /* XXX: what to do if exception ? */
+    JS_FreeValue(ctx, err);
+}
+
+/* THE TAIL OF A LOAD, shared by the synchronous answer and the asynchronous one: link the graph, evaluate it,
+   and settle the capability with the namespace once evaluation's own promise does. */
+static void js_load_module_evaluate(JSContext *ctx, JSModuleDef *m,
+                                    JSValueConst *resolving_funcs)
 {
     JSValue evaluate_promise;
-    JSModuleDef *m;
-    JSValue ret, err, func_obj, evaluate_resolving_funcs[2];
+    JSValue func_obj, evaluate_resolving_funcs[2];
     JSValueConst func_data[3];
-
-    m = js_host_resolve_imported_module(ctx, basename, filename, attributes);
-    if (!m)
-        goto fail;
 
     if (js_resolve_module(ctx, m) < 0) {
         js_free_modules(ctx, JS_FREE_MODULE_NOT_RESOLVED);
@@ -51200,10 +51276,7 @@ static void JS_LoadModuleInternal(JSContext *ctx, const char *basename,
     evaluate_promise = JS_EvalFunction(ctx, func_obj);
     if (JS_IsException(evaluate_promise)) {
     fail:
-        err = JS_GetException(ctx);
-        ret = JS_Call(ctx, resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
-        JS_FreeValue(ctx, ret); /* XXX: what to do if exception ? */
-        JS_FreeValue(ctx, err);
+        js_load_module_reject_pending(ctx, resolving_funcs);
         return;
     }
 
@@ -51218,6 +51291,123 @@ static void JS_LoadModuleInternal(JSContext *ctx, const char *basename,
     JS_FreeValue(ctx, evaluate_resolving_funcs[0]);
     JS_FreeValue(ctx, evaluate_resolving_funcs[1]);
     JS_FreeValue(ctx, evaluate_promise);
+}
+
+/* The source arrived. func_data = [resolve, reject, module_name]; argv[0] is the module's SOURCE TEXT. Compiling
+   it here registers the record under that name, so a second import of the same specifier finds it loaded and
+   never asks the host again. This is the resume of the load the loader parked — the importing flow's
+   continuation is the reaction chain this runs on, never a re-run of the importing scope. */
+static JSValue js_module_source_fulfilled(JSContext *ctx, JSValueConst this_val,
+                                          int argc, JSValueConst *argv, int magic,
+                                          JSValueConst *func_data)
+{
+    JSValueConst *resolving_funcs = func_data;
+    const char *src, *name;
+    size_t src_len;
+    JSValue func_obj;
+    JSModuleDef *m;
+    JSAtom name_atom;
+
+    /* ALREADY LOADED? Two flows exploring the same page park on the same specifier, and both resume with the
+       same body — the loader ran once per flow because neither had finished when the other asked. Compiling it
+       twice would put a second record under one name. The module map is the load's memo (16.2.1.9 finishes a
+       load that another already completed by handing back the existing record), so this asks it first. */
+    name_atom = JS_ValueToAtom(ctx, func_data[2]);
+    if (name_atom == JS_ATOM_NULL)
+        goto fail;
+    m = js_find_loaded_module(ctx, name_atom);
+    JS_FreeAtom(ctx, name_atom);
+    if (m) {
+        js_load_module_evaluate(ctx, m, resolving_funcs);
+        return JS_UNDEFINED;
+    }
+
+    src = JS_ToCStringLen(ctx, &src_len, argv[0]);
+    if (!src)
+        goto fail;
+    name = JS_ToCString(ctx, func_data[2]);
+    if (!name) {
+        JS_FreeCString(ctx, src);
+        goto fail;
+    }
+    func_obj = JS_Eval(ctx, src, src_len, name,
+                       JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    JS_FreeCString(ctx, name);
+    JS_FreeCString(ctx, src);
+    if (JS_IsException(func_obj))
+        goto fail;
+    DCHECK(JS_VALUE_GET_TAG(func_obj) == JS_TAG_MODULE,
+           "compiling a module source did not produce a module record");
+    m = JS_VALUE_GET_PTR(func_obj);
+    /* js_load_module_evaluate takes its own reference through JS_NewModuleValue. */
+    JS_FreeValue(ctx, func_obj);
+    js_load_module_evaluate(ctx, m, resolving_funcs);
+    return JS_UNDEFINED;
+ fail:
+    js_load_module_reject_pending(ctx, resolving_funcs);
+    return JS_UNDEFINED;
+}
+
+/* The source fetch itself failed: the import rejects with whatever the host settled the source promise with,
+   which is what a browser does for a module whose network request did not succeed. */
+static JSValue js_module_source_rejected(JSContext *ctx, JSValueConst this_val,
+                                         int argc, JSValueConst *argv, int magic,
+                                         JSValueConst *func_data)
+{
+    JSValue ret = JS_Call(ctx, func_data[1], JS_UNDEFINED, 1, argv);
+    JS_FreeValue(ctx, ret);
+    return JS_UNDEFINED;
+}
+
+void JS_ModuleLoadPending(JSContext *ctx, JSValue source_promise)
+{
+    DCHECK(JS_IsUndefined(ctx->module_load_pending),
+           "two module loads parked on one handoff slot — a loader parked without its caller taking the first");
+    ctx->module_load_pending = source_promise;
+}
+
+/* Did the loader just park? Consumes the handoff slot: JS_UNDEFINED means it answered synchronously (with a
+   module, or with a throw). Every caller of js_host_resolve_imported_module asks, because a caller that cannot
+   wait must say so rather than silently drop the load. */
+static JSValue js_module_take_pending(JSContext *ctx)
+{
+    JSValue p = ctx->module_load_pending;
+    ctx->module_load_pending = JS_UNDEFINED;
+    return p;
+}
+
+static void JS_LoadModuleInternal(JSContext *ctx, const char *basename,
+                                  const char *filename,
+                                  JSValueConst *resolving_funcs,
+                                  JSValueConst attributes)
+{
+    JSModuleDef *m;
+    JSValue pending, name_val, reactions[2];
+    JSValueConst func_data[3];
+
+    m = js_host_resolve_imported_module(ctx, basename, filename, attributes);
+    if (m) {
+        js_load_module_evaluate(ctx, m, resolving_funcs);
+        return;
+    }
+    pending = js_module_take_pending(ctx);
+    if (JS_IsUndefined(pending)) {
+        js_load_module_reject_pending(ctx, resolving_funcs);
+        return;
+    }
+    /* 16.2.1.9: the host finishes the load later. The capability is kept alive by the reactions, so this
+       returns with the import still pending and the flow that issued it still suspended on it. */
+    name_val = JS_NewString(ctx, filename);
+    func_data[0] = resolving_funcs[0];
+    func_data[1] = resolving_funcs[1];
+    func_data[2] = name_val;
+    reactions[0] = JS_NewCFunctionData(ctx, js_module_source_fulfilled, 1, 0, 3, func_data);
+    reactions[1] = JS_NewCFunctionData(ctx, js_module_source_rejected, 1, 0, 3, func_data);
+    JS_FreeValue(ctx, name_val);
+    JS_FreeValue(ctx, js_promise_then_native(ctx, pending, vc(reactions)));
+    JS_FreeValue(ctx, reactions[0]);
+    JS_FreeValue(ctx, reactions[1]);
+    JS_FreeValue(ctx, pending);
 }
 
 /* Return a promise or an exception in case of memory error. Used by

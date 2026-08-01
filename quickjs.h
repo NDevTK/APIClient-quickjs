@@ -1407,6 +1407,15 @@ JS_EXTERN void JS_SetModuleLoaderFunc2(JSRuntime *rt,
                                        JSModuleCheckSupportedImportAttributes *module_check_attrs,
                                        void *opaque);
 
+/* HostLoadImportedModule (16.2.1.9) is permitted to complete ASYNCHRONOUSLY, and a browser's always does — a
+   module's source comes off the network. A loader that has the bytes returns the JSModuleDef as before; one
+   that must fetch them calls this with a promise that settles with the module's SOURCE TEXT and then returns
+   NULL WITHOUT throwing. The load finishes on that promise's reaction: the source is compiled under the
+   specifier (so a second import of it finds the record loaded), linked, evaluated, and the import's promise
+   settles with the namespace. The importing flow stays suspended on its own `await` throughout — the scope that
+   ran the import is never re-run, which would be a replay. */
+JS_EXTERN void JS_ModuleLoadPending(JSContext *ctx, JSValue source_promise);
+
 /* Set an attributes-aware module normalizer. Call after JS_SetModuleLoaderFunc2. */
 JS_EXTERN void JS_SetModuleNormalizeFunc2(JSRuntime *rt,
                                           JSModuleNormalizeFunc2 *module_normalize);
