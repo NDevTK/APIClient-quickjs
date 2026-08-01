@@ -1304,12 +1304,19 @@ JS_EXTERN int JS_MapDeleteRecord(JSContext *ctx, JSValueConst obj, JSValueConst 
             one, so the read is SYMBOLIC and the auth gate FORKS to the logged-in arm. Collapsing it to
             `undefined` throws on the first field access and buries every endpoint behind it, which is the
             surface this engine exists to reach.
-            Returns the concolic value, or JS_UNINITIALIZED to leave the read exactly as it was. */
+            Returns the concolic value, or JS_UNINITIALIZED to leave the read exactly as it was.
+     - rel: propagation through < <= > >= , the same shape as cmp and for the same reason. These coerce with
+            ToPrimitive, which a concolic cannot satisfy — it is an object whose @@toPrimitive answers with
+            another concolic — so the operator threw TypeError and took the program with it: a session check
+            like `cookie.indexOf("role=admin") >= 0` explored NEITHER arm. §solver requires opacity to survive
+            coercion precisely so control flow keeps forking, and equality already had a hook while ordering
+            did not. `op` is the OP_lt/lte/gt/gte opcode. */
 typedef struct JSConcolicHooks {
     int (*add)(JSContext *ctx, JSValue *sp);
     int (*cmp)(JSContext *ctx, JSValue *sp, int is_neq);
     int (*is)(JSValueConst v);
     JSValue (*absent)(JSContext *ctx, JSAtom name);
+    int (*rel)(JSContext *ctx, JSValue *sp, int op);
 } JSConcolicHooks;
 JS_EXTERN void JS_SetConcolicHooks(const JSConcolicHooks *hooks);
 

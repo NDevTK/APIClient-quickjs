@@ -6515,7 +6515,7 @@ static _Thread_local JSTimeTravelHooks g_time_travel = { NULL, NULL, NULL };
 /* forced-exec CONCOLIC-VALUE hooks (see JSConcolicHooks in quickjs.h): .add propagates a concolic value through
    `+` (js_add_slow), .cmp through == / === , .is names the solver's value class. One struct, installed by
    JS_SetConcolicHooks. */
-static _Thread_local JSConcolicHooks g_concolic = { NULL, NULL, NULL };
+static _Thread_local JSConcolicHooks g_concolic;
 
 /* 7.1.1 ToPrimitive is defined over ORDINARY objects. A CONCOLIC operand is not one: it is the solver's value
    class standing for unknown external input, and its coercion belongs to the concolic hooks — opacity SURVIVES
@@ -16497,6 +16497,12 @@ static no_inline int js_relational_slow(JSContext *ctx, JSValue *sp,
     op2 = sp[-1];
     tag1 = JS_VALUE_GET_NORM_TAG(op1);
     tag2 = JS_VALUE_GET_NORM_TAG(op2);
+
+    /* An ORDERING over an unknown is unknown, and asking ToPrimitive for it throws — the operand is an object
+       whose coercion answers with another concolic. The solver decides the result the way it already decides
+       equality's, so the comparison forks instead of aborting the program. */
+    if (g_concolic.rel && g_concolic.rel(ctx, sp, op))
+        return 0;
 
     op1 = JS_ToPrimitiveFree(ctx, op1, HINT_NUMBER);
     if (JS_IsException(op1)) {
