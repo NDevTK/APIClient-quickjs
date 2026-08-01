@@ -19745,6 +19745,14 @@ typedef struct TrampFrame {
     /* the CALLEE's own interpreter locals (for deep-preempt resume — the caller's are above). */
     JSValueConst this_val, new_target;
     int arg_allocated, callee_argc;
+    /* THE SIZE OF local_buf, IN JSValue SLOTS — recorded at birth, never re-derived. The frame layout law
+       (TRAMP_FRAME_SLOTS) is applied ONCE, where the buffer is allocated; the snapshot-fork copies this number
+       instead of re-computing it. It had been re-computed, from sf.arg_count rather than arg_allocated and
+       without the scratch reserve, and the clone's relocated var-ref array then landed past the end of its own
+       allocation — a heap-buffer-overflow that only a forking page reached. A size that is stored cannot drift
+       from the size that was allocated. 0 = this frame owns no local_buf (an async/generator body's buffer
+       belongs to its func_state). */
+    int local_slots;
     /* ASYNC frame on the tramp chain: an async function body runs HERE (gen_state stays the caller's base) so its
        sync-prefix loop preempts the BASE flow like any tramp-depth loop — never drive-to-completion. When
        async_data != NULL this frame's sf IS async_data->func_state.frame (not the embedded ntf->sf); at OP_await /
@@ -25558,6 +25566,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 TAKE_CALL_SHAPE();
                 ntf->call_first = call_first_r; ntf->call_argc = call_pop; ntf->is_tail = tramp_is_tail;
                 ntf->b = nb; ntf->ctx = nb->realm; ntf->local_buf = nlb;
+                ntf->local_slots = TRAMP_FRAME_SLOTS(narg_alloc, nb);   /* the layout law, applied ONCE, here */
                 nsf = &ntf->sf;
                 nsf->is_strict_mode = nb->is_strict_mode;
                 nsf->is_call_root = false;
@@ -26419,6 +26428,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 con_cargc = -1;   /* read + reset: never leak the shape onto the body's own constructs */
                 ntf->is_tail = cs->outer ? 0 : tramp_is_tail;
                 ntf->b = nb; ntf->ctx = nb->realm; ntf->local_buf = nlb;
+                ntf->local_slots = TRAMP_FRAME_SLOTS(narg_alloc, nb);   /* the layout law, applied ONCE, here */
                 nsf = &ntf->sf;
                 nsf->is_strict_mode = nb->is_strict_mode;
                 nsf->is_call_root = false;
@@ -26637,6 +26647,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 ntf->caller_sp = sp;
                 ntf->call_first = ap_cfirst; ntf->call_argc = ap_cargc; ntf->is_tail = tramp_is_tail;
                 ntf->b = nb; ntf->ctx = nb->realm; ntf->local_buf = nlb;
+                ntf->local_slots = TRAMP_FRAME_SLOTS(narg_alloc, nb);   /* the layout law, applied ONCE, here */
                 nsf = &ntf->sf;
                 nsf->is_strict_mode = nb->is_strict_mode;
                 nsf->is_call_root = false;
@@ -27686,7 +27697,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         TrampFrame *ytf = tramp_frame_new(rt);
                         if (unlikely(!ytf)) { tramp_step_chain_free(ctx, stt); JS_ThrowOutOfMemory(ctx); goto exception; }
                         memset(&ytf->sf, 0, sizeof(ytf->sf));
-                        ytf->b = NULL; ytf->local_buf = NULL; ytf->ctx = ctx;
+                        ytf->b = NULL; ytf->local_buf = NULL; ytf->ctx = ctx; ytf->local_slots = 0;
                         ytf->seq_req = NULL; ytf->seq_req_kind = CONT_NONE;
                         ytf->up = tf_top;
                         ytf->caller_sf = sf; ytf->caller_b = b; ytf->caller_ctx = ctx;
@@ -31829,7 +31840,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 atf->cont_state = tramp_cont_state; atf->cont_kind = tramp_cont_kind;
                 tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;
                 atf->forof_off = tramp_cont_forof; tramp_cont_forof = 0;
-                atf->b = NULL; atf->local_buf = NULL;   /* async frame owns its buffers via as->func_state */
+                atf->b = NULL; atf->local_buf = NULL; atf->local_slots = 0;   /* async frame owns its buffers via as->func_state */
                 /* enter the async body frame (mirror the generator-resume entry; gen_state stays the base) */
                 asf = &as->func_state.frame;
                 ap = JS_VALUE_GET_OBJ(afunc);
@@ -32261,7 +32272,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 gtf->gen_data = gs; gtf->gen_magic = (uint8_t)gmagic;
                 gtf->cont_state = cont_consume ? cc_state : gd_cont;   /* a consumer drive carries its state so the settle re-enters the step; a direct drive carries its caller's continuation */
                 gtf->cont_kind = cont_consume ? cc_kind : gd_ck;
-                gtf->b = NULL; gtf->local_buf = NULL;   /* the body frame owns its buffers via gs->func_state */
+                gtf->b = NULL; gtf->local_buf = NULL; gtf->local_slots = 0;   /* the body frame owns its buffers via gs->func_state */
                 gfp = JS_VALUE_GET_OBJ(gsf->cur_func);
                 gb = gfp->u.func.function_bytecode;
                 gtf->ctx = gb->realm;
@@ -32471,7 +32482,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 atf2->call_first = call_first_r; atf2->call_argc = call_pop; atf2->is_tail = tramp_is_tail;
                 atf2->async_data = NULL; atf2->gen_data = NULL; atf2->gen_magic = 0;
                 atf2->cont_state = s; atf2->cont_kind = CONT_AGEN_CREATE;
-                atf2->b = NULL; atf2->local_buf = NULL;
+                atf2->b = NULL; atf2->local_buf = NULL; atf2->local_slots = 0;
                 asf2 = &((JSAsyncGeneratorData *)s)->func_state.frame;
                 afp = JS_VALUE_GET_OBJ(asf2->cur_func);
                 ab2 = afp->u.func.function_bytecode;
@@ -32619,7 +32630,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 dtf3->agen_cont = agen_cont; dtf3->agen_ck = agen_ck;
                 dtf3->close_saved_exc = JS_UNINITIALIZED;
                 dtf3->cont_state = agen_s; dtf3->cont_kind = CONT_AGEN_DRIVE;
-                dtf3->b = NULL; dtf3->local_buf = NULL;   /* the body frame owns its buffers via agen_s->func_state */
+                dtf3->b = NULL; dtf3->local_buf = NULL; dtf3->local_slots = 0;   /* the body frame owns its buffers via agen_s->func_state */
                 dsf3 = &agen_s->func_state.frame;
                 dfp3 = JS_VALUE_GET_OBJ(dsf3->cur_func);
                 db3 = dfp3->u.func.function_bytecode;
@@ -32849,7 +32860,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 gtf->forof_off = 0;   /* a CREATE never carries a for-of offset: OP_for_of_start's acquire is an
                                           ordinary CALL with a CONT_FOROF_ACQUIRE continuation, so its enum_rec is
                                           finished by that delivery and not by a second copy in this settle. */
-                gtf->b = NULL; gtf->local_buf = NULL;
+                gtf->b = NULL; gtf->local_buf = NULL; gtf->local_slots = 0;
                 gsf = &s->func_state.frame;
                 gfp = JS_VALUE_GET_OBJ(gsf->cur_func);
                 gb = gfp->u.func.function_bytecode;
@@ -39407,17 +39418,18 @@ void JS_FlowFree(JSContext *ctx, JSValue *flow) {
 #define STEP_FLOW_SLOTS 16
 static int clone_susp_frame(JSContext *ctx, JSStackFrame *cf, const JSStackFrame *of, ptrdiff_t live) {
     JSObject *p = JS_VALUE_GET_OBJ(of->cur_func);
-    JSFunctionBytecode *b;
-    int al, lc, nrefs;
+    JSFunctionBytecode *b = NULL;
+    int al = of->arg_count, lc, nrefs;
 
     if (of->is_call_root) {
-        al = of->arg_count;
         lc = STEP_FLOW_SLOTS;
         nrefs = 0;
     } else {
+        /* the ONE layout law — the clone is the SAME frame, so it is sized by the same macro the interpreter
+           and async_func_init use. Re-deriving the arithmetic here dropped TRAMP_SCRATCH_SLOTS and the var-ref
+           array was written one scratch reserve PAST the allocation. */
         b = p->u.func.function_bytecode;
-        al = of->arg_count;
-        lc = al + b->var_count + b->stack_size;
+        lc = TRAMP_FRAME_SLOTS(al, b);
         nrefs = b->var_ref_count;
     }
     cf->arg_buf = js_malloc(ctx, sizeof(JSValue) * (lc > 0 ? lc : 1) + sizeof(JSVarRef *) * nrefs);
@@ -39428,7 +39440,11 @@ static int clone_susp_frame(JSContext *ctx, JSStackFrame *cf, const JSStackFrame
     cf->arg_count = al;
     /* a call root's stack starts AT the block (0 args, 0 vars); a bytecode frame's after its arguments */
     cf->var_buf = cf->arg_buf + (of->is_call_root ? 0 : al);
-    cf->var_refs = (JSVarRef **)(cf->arg_buf + lc);
+    cf->var_refs = of->is_call_root ? (JSVarRef **)(cf->arg_buf + STEP_FLOW_SLOTS)
+                                    : TRAMP_VAR_REFS(cf->var_buf + b->var_count, b);
+    DCHECK((JSValue *)cf->var_refs == cf->arg_buf + lc,
+           "clone_susp_frame: the var-ref array is not at the end of the frame slots — the allocation size and "
+           "the placement come from the same layout law and must agree");
     cf->var_ref_count = of->var_ref_count;   /* share the frame's closed cells + take a ref */
     for (int vi = 0; vi < of->var_ref_count; vi++) { cf->var_refs[vi] = of->var_refs[vi]; if (cf->var_refs[vi]) JS_REF_COUNT(cf->var_refs[vi])++; }
     cf->cur_pc = of->cur_pc;
@@ -39452,6 +39468,17 @@ static JSStackFrame *tramp_live_sf(TrampFrame *t) {
    async/generator frame's buffer is its func_state.frame.arg_buf; a normal frame's is local_buf. */
 static JSValue *tramp_buf_base(TrampFrame *t) {
     return (t->async_data || t->gen_data) ? tramp_live_sf(t)->arg_buf : t->local_buf;
+}
+/* The SIZE of that buffer, in JSValue slots — the twin of tramp_buf_base, and the bound every pointer
+   translated out of it must respect. A plain frame RECORDED it at birth; an async/generator body's buffer is
+   its func_state frame, built by async_func_init from the SAME layout law over sf->arg_count. */
+static int tramp_buf_slots(TrampFrame *t) {
+    JSStackFrame *lsf;
+    JSFunctionBytecode *lb;
+    if (!(t->async_data || t->gen_data)) return t->local_slots;
+    lsf = tramp_live_sf(t);
+    lb = JS_VALUE_GET_OBJ(lsf->cur_func)->u.func.function_bytecode;
+    return TRAMP_FRAME_SLOTS(lsf->arg_count, lb);
 }
 
 /* A STEP_ROOT base is EMBEDDED in the JSReactionFlow that holds the DERIVED PROMISE its completion settles. The
@@ -39553,9 +39580,21 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
         TrampFrame *otf = oa[i];
         /* the caller is the base (bottom frame, i==n-1) or the next-shallower frame's clone (already built),
            sourced async-aware: an async/generator caller's stack is its func_state.frame, not local_buf. */
-        JSStackFrame *caller_clone; JSValue *cob, *ccb;
-        if (i == n - 1) { caller_clone = cb;                    cob = ob->arg_buf;               ccb = cb->arg_buf; }
-        else            { caller_clone = tramp_live_sf(ca[i+1]); cob = tramp_buf_base(oa[i + 1]); ccb = tramp_buf_base(ca[i + 1]); }
+        JSStackFrame *caller_clone, *caller_orig; JSValue *cob, *ccb; int cslots;
+        if (i == n - 1) { caller_clone = cb;                     caller_orig = ob;
+                          cob = ob->arg_buf;                     ccb = cb->arg_buf;
+                          cslots = TRAMP_FRAME_SLOTS(ob->arg_count,
+                                       JS_VALUE_GET_OBJ(ob->cur_func)->u.func.function_bytecode); }
+        else            { caller_clone = tramp_live_sf(ca[i+1]); caller_orig = tramp_live_sf(oa[i + 1]);
+                          cob = tramp_buf_base(oa[i + 1]);       ccb = tramp_buf_base(ca[i + 1]);
+                          cslots = tramp_buf_slots(oa[i + 1]); }
+        /* A pointer translated out of the caller's buffer must have been INSIDE it. That holds for the caller's
+           own STACK POSITION and for nothing else: a caller that BORROWED its arguments has caller_arg_buf and
+           caller_argv pointing into the GRANDcaller's buffer, and translating those against this buffer produced
+           a wild pointer the clone then read through. They are not translated any more — they are TAKEN from the
+           cloned caller frame, which already resolved that question when it was built. */
+        #define XL_OK(p) DCHECK(!(p) || ((JSValue *)(p) >= cob && (JSValue *)(p) <= cob + cslots), \
+            "clone_deep_flow: a caller pointer being relocated lies OUTSIDE the caller's own frame buffer")
         JSStackFrame *osf = tramp_live_sf(otf);
         /* live end: the deepest (i==0) is running -> cur_sp; a mid-call frame -> the sp it called its callee at */
         JSValue *live_end = (i == 0) ? osf->cur_sp : oa[i - 1]->caller_sp;
@@ -39582,7 +39621,7 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
             void *ns = tramp_step_state_clone(ctx, otf->cont_state);
             if (!ns) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
             ct->cont_state = ns;
-            ct->local_buf = NULL; ct->b = NULL;
+            ct->local_buf = NULL; ct->b = NULL; ct->local_slots = 0;
         } else if (otf->async_data) {
             /* ASYNC body on the chain: clone a FRESH async_data with its OWN return-promise capability. The fork
                also cloned the caller's mid-OP_call (the async call site), so each arm re-derives and awaits ITS
@@ -39608,7 +39647,7 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
             as2->func_state.frame.cur_sp = (i == 0) ? as2->func_state.frame.arg_buf + (osf->cur_sp - aof->arg_buf) : NULL;
             ct->async_data = as2;
             ct->async_promise = aprom2;        /* fresh capability's promise (owned by this frame) */
-            ct->local_buf = NULL; ct->b = NULL; /* async frame owns its buffers via as2->func_state */
+            ct->local_buf = NULL; ct->b = NULL; ct->local_slots = 0; /* async frame owns its buffers via as2->func_state */
         } else if (otf->gen_data) {
             /* GENERATOR body on the chain: clone a FRESH gen_data with its OWN cloned body frame so the sibling's
                generator advances on an independent timeline (mirrors the async_data branch, minus the promise —
@@ -39647,7 +39686,7 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
             /* direct .next(): the clone holds its OWN ref to the generator (settle frees it). for-of: no held ref
                (async_promise stays UNDEFINED from *ct=*otf); the iterator rides the cloned caller stack instead. */
             if (!gen_forof) ct->async_promise = js_dup(genobj);
-            ct->local_buf = NULL; ct->b = NULL;   /* the gen frame owns its buffers via g1->func_state */
+            ct->local_buf = NULL; ct->b = NULL; ct->local_slots = 0;   /* the gen frame owns its buffers via g1->func_state */
             if (otf->cont_kind == CONT_ITER_CONSUME) {
                 /* Array.from(gen) forked mid-consume: clone the consumer state so the sibling accumulates
                    INDEPENDENTLY. r is the SHARED result array (js_dup, COW-isolated per-flow like any post-fork
@@ -39741,8 +39780,14 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
             if (g_time_travel.gen_fork) g_time_travel.gen_fork(ctx, genobj, g0, g1);
         } else {
             JSFunctionBytecode *wb = JS_VALUE_GET_OBJ(otf->sf.cur_func)->u.func.function_bytecode;
-            int wal = otf->sf.arg_count, wlc = wal + wb->var_count + wb->stack_size;
-            int arg_in_frame = (otf->sf.arg_buf >= otf->local_buf && otf->sf.arg_buf < otf->local_buf + wlc + 1);
+            /* The clone is the SAME frame, so it gets the SAME buffer — the size the interpreter RECORDED when
+               it applied the layout law, never a second derivation of it. `arg_allocated` is 0 when the args
+               were BORROWED from the caller's operand stack and are not in this buffer at all. */
+            int wal = otf->arg_allocated, wlc = otf->local_slots;
+            int arg_in_frame = (wal != 0);
+            DCHECK(wlc == TRAMP_FRAME_SLOTS(wal, wb),
+                   "clone_deep_flow: the frame's recorded slot count is not what the layout law gives for its "
+                   "bytecode — the buffer was allocated by one rule and is being read by another");
             ct->local_buf = js_malloc(ctx, sizeof(JSValue) * (wlc > 0 ? wlc : 1) + sizeof(JSVarRef *) * wb->var_ref_count);
             if (!ct->local_buf) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
             ptrdiff_t wlive = live_end - otf->local_buf;
@@ -39751,6 +39796,9 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                                            : XL(otf->sf.arg_buf, cob, ccb);   /* borrowed from the caller's stack */
             ct->sf.var_buf  = XL(otf->sf.var_buf, otf->local_buf, ct->local_buf);
             ct->sf.var_refs = (JSVarRef **)XL((JSValue *)otf->sf.var_refs, otf->local_buf, ct->local_buf);
+            DCHECK((JSValue *)ct->sf.var_refs == ct->local_buf + wlc,
+                   "clone_deep_flow: the relocated var-ref array is not at the end of the frame slots — the "
+                   "allocation size and the interpreter's placement come from the same layout law and must agree");
             ct->sf.cur_sp   = (i == 0) ? XL(otf->sf.cur_sp, otf->local_buf, ct->local_buf) : NULL;   /* only deepest runs */
             ct->sf.var_ref_count = otf->sf.var_ref_count;   /* share this frame's closed cells + take a ref */
             for (int vi = 0; vi < otf->sf.var_ref_count; vi++) { ct->sf.var_refs[vi] = otf->sf.var_refs[vi]; if (ct->sf.var_refs[vi]) JS_REF_COUNT(ct->sf.var_refs[vi])++; }
@@ -39794,22 +39842,64 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                     if ((const uint8_t *)otf->sf.arg_buf >= ob && (const uint8_t *)otf->sf.arg_buf < ob + ssz)
                         ct->sf.arg_buf = (JSValue *)((uint8_t *)ns + ((const uint8_t *)otf->sf.arg_buf - ob));
                 }
+            } else if (otf->cont_kind == CONT_CONSTRUCT) {
+                /* A CONCOLIC BRANCH INSIDE A CONSTRUCTOR BODY. `new C()` runs the body on this chain with the
+                   created `this` riding the continuation, and a branch in it forks like a branch anywhere else —
+                   testharness.js's own `new Tests()` is one, which is why every WPT document stopped here. The
+                   sibling needs its OWN continuation record because do_return consumes it (it substitutes the
+                   created object for a non-object result and frees what it holds), and two flows advancing and
+                   freeing one record is the shape this whole clone exists to prevent.
+                   The created OBJECT is shared, not re-created: it existed before the branch, so it is ordinary
+                   pre-fork state whose per-arm property writes the COW delta already isolates — the same rule
+                   the Promise executor's promise follows one arm up. */
+                struct JSConstruct *ocs = (struct JSConstruct *)otf->cont_state;
+                struct JSConstruct *ncs = js_malloc(ctx, sizeof(*ncs));
+                if (!ncs) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
+                *ncs = *ocs;
+                ncs->created_obj = js_dup(ocs->created_obj);
+                ncs->super_ref = js_dup(ocs->super_ref);
+                /* An OUTER continuation is a second record under this one (a `new` reached through another
+                   continuation). Cloning it is that kind's arm, not this one's. */
+                DCHECK(ocs->outer == NULL,
+                       "clone_deep_flow: a constructor continuation with an OUTER continuation under it — clone "
+                       "that kind through its own arm before this one adopts the pointer");
+                ct->cont_state = ncs;
             } else {
-                DCHECK(otf->cont_kind == CONT_NONE,
-                       "clone_deep_flow: deep-fork of a C-continuation callback frame whose kind is neither a "
-                       "step machine nor a Promise executor — give that continuation its own clone arm, as the "
-                       "sibling must not share a state both flows would advance and both would free");
+                /* The KIND is the one fact needed to act on this, so it is in the message. A DFAIL that says
+                   "some other continuation" sends the reader back to a bisection to learn what it already knew. */
+                char why[192];
+                snprintf(why, sizeof why,
+                         "clone_deep_flow: deep-fork of a C-continuation callback frame of kind %d — neither a "
+                         "step machine nor a Promise executor. Give THAT continuation its own clone arm: the "
+                         "sibling must not share a state both flows advance and both free",
+                         (int)otf->cont_kind);
+                DCHECK(otf->cont_kind == CONT_NONE, why);
             }
         }
         ct->up = (i == n - 1) ? NULL : ca[i + 1];
         ct->caller_sf        = caller_clone;
-        ct->caller_local_buf = XL(otf->caller_local_buf, cob, ccb);
-        ct->caller_stack_buf = XL(otf->caller_stack_buf, cob, ccb);
-        ct->caller_var_buf   = XL(otf->caller_var_buf, cob, ccb);
-        ct->caller_arg_buf   = XL(otf->caller_arg_buf, cob, ccb);
+        /* the caller's record IS the caller's frame — assert that on the ORIGINAL side, then take the clone's. */
+        DCHECK(otf->caller_local_buf == cob,
+               "clone_deep_flow: the frame's caller_local_buf is not the caller's own buffer base");
+        DCHECK(otf->caller_var_buf == caller_orig->var_buf,
+               "clone_deep_flow: the frame's caller_var_buf is not the caller's own var_buf");
+        DCHECK(otf->caller_arg_buf == caller_orig->arg_buf,
+               "clone_deep_flow: the frame's caller_arg_buf is not the caller's own arg_buf");
+        DCHECK(!otf->caller_b || otf->caller_stack_buf == caller_orig->var_buf + otf->caller_b->var_count,
+               "clone_deep_flow: the frame's caller_stack_buf is not where the caller's bytecode puts it");
+        XL_OK(otf->caller_sp);   /* the caller's live stack position — the ONE pointer that is genuinely its own */
+        ct->caller_local_buf = ccb;
+        ct->caller_var_buf   = caller_clone->var_buf;
+        /* the caller's stack begins a fixed number of slots past its vars — a distance INSIDE the caller's own
+           buffer, so it survives the move unchanged (and needs no bytecode, which a call-root caller has none of). */
+        ct->caller_stack_buf = caller_clone->var_buf + (otf->caller_stack_buf - otf->caller_var_buf);
+        ct->caller_arg_buf   = caller_clone->arg_buf;
         ct->caller_sp        = XL(otf->caller_sp, cob, ccb);
-        ct->caller_argv      = (JSValueConst *)XL((JSValue *)otf->caller_argv, cob, ccb);
+        /* argv is normalised to arg_buf the moment a frame resumes (the rebuild path does exactly this), and the
+           padded arg_buf holds the same values for every index < argc, so this IS the caller's argv. */
+        ct->caller_argv      = (JSValueConst *)caller_clone->arg_buf;
         ct->caller_var_refs  = caller_clone->var_refs;
+        #undef XL_OK
     }
     #undef XL
     /* RE-RESOLVE each cloned join's enclosing join against the SIBLING'S chain. `outer_join` is a CACHE of a
@@ -39856,7 +39946,8 @@ JSValue *JS_FlowClone(JSContext *ctx, JSValue *flow) {
            "there is nothing at that branch to clone");
     b = p->u.func.function_bytecode;
     arg_buf_len = sf->arg_count;
-    int local_count = arg_buf_len + b->var_count + b->stack_size;
+    /* the ONE layout law — same frame, same size (scratch reserve included) as async_func_init built. */
+    int local_count = TRAMP_FRAME_SLOTS(arg_buf_len, b);
     size_t alloc_size = sizeof(JSValue) * (local_count > 0 ? local_count : 1) + sizeof(JSVarRef *) * b->var_ref_count;
 
     JSAsyncFunctionState *c = flow_clone_state_alloc(ctx, s);
@@ -39872,7 +39963,13 @@ JSValue *JS_FlowClone(JSContext *ctx, JSValue *flow) {
     c->throw_flag = s->throw_flag;
     cf->arg_count = sf->arg_count;
     cf->var_buf = cf->arg_buf + arg_buf_len;
-    cf->var_refs = (JSVarRef **)(cf->arg_buf + local_count);
+    cf->var_refs = TRAMP_VAR_REFS(cf->var_buf + b->var_count, b);
+    DCHECK((JSValue *)cf->var_refs == cf->arg_buf + local_count,
+           "JS_FlowClone: the var-ref array is not at the end of the frame slots — the allocation size and the "
+           "placement come from the same layout law and must agree");
+    DCHECK(sf->var_ref_count == b->var_ref_count,
+           "JS_FlowClone: the frame's var-ref count disagrees with its bytecode's — the clone is sized from the "
+           "bytecode, so a larger frame count writes past the allocation");
     cf->var_ref_count = sf->var_ref_count;   /* share the closed cells; take an ownership ref on each */
     for (int vi = 0; vi < sf->var_ref_count; vi++) {
         cf->var_refs[vi] = sf->var_refs[vi];
@@ -39884,6 +39981,9 @@ JSValue *JS_FlowClone(JSContext *ctx, JSValue *flow) {
     /* deep-copy the LIVE frame slots [arg_buf, cur_sp): args + vars + live stack — each value dup'd, so the
        clone owns its own state and the two frames never alias. */
     ptrdiff_t live = sf->cur_sp - sf->arg_buf;
+    DCHECK(live >= 0 && live <= local_count,
+           "JS_FlowClone: the source frame's live region is outside its own frame slots — cur_sp has run past "
+           "the layout law's reserve, so the copy writes past the clone's allocation");
     for (ptrdiff_t i = 0; i < live; i++) cf->arg_buf[i] = js_dup(sf->arg_buf[i]);
     cf->cur_sp = cf->arg_buf + live;
     return (JSValue *)c;
@@ -39938,8 +40038,15 @@ static JSAsyncFunctionData *js_async_frame_clone(JSContext *ctx, JSAsyncFunction
     DCHECK(js_class_has_bytecode(fp->class_id), "an async continuation whose cur_func has no bytecode");
     b = fp->u.func.function_bytecode;
     al = sf->arg_count;
-    lc = al + b->var_count + b->stack_size;
+    /* the ONE layout law — this frame was built by async_func_init, which sizes with TRAMP_FRAME_SLOTS because
+       its operands are reshaped by the same tramp pushes an interpreter frame's are. */
+    lc = TRAMP_FRAME_SLOTS(al, b);
     live = sf->cur_sp - sf->arg_buf;
+    DCHECK(live >= 0 && live <= lc,
+           "js_async_frame_clone: the activation's live region is outside its own frame slots");
+    DCHECK(sf->var_ref_count == b->var_ref_count,
+           "js_async_frame_clone: the frame's var-ref count disagrees with its bytecode's — the clone is sized "
+           "from the bytecode, so a larger frame count writes past the allocation");
 
     d = js_mallocz(ctx, sizeof(*d));
     if (!d)
@@ -39961,7 +40068,10 @@ static JSAsyncFunctionData *js_async_frame_clone(JSContext *ctx, JSAsyncFunction
     cf->cur_func = js_dup(sf->cur_func);
     cf->arg_count = al;
     cf->var_buf = cf->arg_buf + al;
-    cf->var_refs = (JSVarRef **)(cf->arg_buf + lc);
+    cf->var_refs = TRAMP_VAR_REFS(cf->var_buf + b->var_count, b);
+    DCHECK((JSValue *)cf->var_refs == cf->arg_buf + lc,
+           "js_async_frame_clone: the var-ref array is not at the end of the frame slots — the allocation size "
+           "and the placement come from the same layout law and must agree");
     cf->var_ref_count = sf->var_ref_count;   /* closed cells are shared and isolated by the delta */
     for (int vi = 0; vi < sf->var_ref_count; vi++) {
         cf->var_refs[vi] = sf->var_refs[vi];
