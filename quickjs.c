@@ -31746,6 +31746,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (ainit) { JS_FreeValue(ctx, aprom); js_async_function_free(rt, as); goto exception; }
                 }
                 as->is_active = true;
+                /* THE STATE BELONGS TO `as`, whoever ends up driving it. While the body runs here it is a frame
+                   on the caller's chain and this says nothing; the moment an await settles, the continuation is
+                   resumed with THIS state as the flow base (js_async_function_resolve_call), and a fork after
+                   that await clones a base whose completion has to settle `as`'s promise. Unmarked, the clone
+                   looked like a plain script base: the scheduler resumed it, read a done_generator suspend as a
+                   completion code, and walked off the end of the body's bytecode. */
+                as->func_state.base_kind = FLOW_BASE_ASYNC_CALL;
                 atf = tramp_frame_new(rt);
                 if (unlikely(!atf)) { JS_FreeValue(ctx, aprom); js_async_function_free(rt, as); JS_ThrowOutOfMemory(ctx); goto exception; }
                 atf->up = tf_top;
@@ -39359,22 +39366,46 @@ void JS_FlowFree(JSContext *ctx, JSValue *flow) {
    SHARES the closed var_ref cells (+ref, COW-isolated per-flow by the delta), dups cur_func, and copies
    is_strict/pc/arg_count. The caller sets cur_sp (deepest=live point via XL; a dormant/mid-call frame=NULL).
    ONE contract used by BOTH the base frame and an async-body frame — never two copies of the frame-clone logic. */
+/* A CALL-ROOT frame has NO BYTECODE — it is a fixed block of STEP_FLOW_SLOTS operands with the callee at [1],
+   built by reaction_call_flow_init — so its size cannot be read off cur_func's bytecode. Reading it anyway is
+   what a clone of a promise-reaction base used to do: cur_func there is a step CLOSURE whose union member is a
+   JSCFunctionDataRecord, so every size came out of unrelated memory and the resumed sibling walked into the
+   "non-bytecode cur_func" DCHECK — an async body that forked AFTER an await, which is as ordinary as this
+   engine gets. */
+#define STEP_FLOW_SLOTS 16
 static int clone_susp_frame(JSContext *ctx, JSStackFrame *cf, const JSStackFrame *of, ptrdiff_t live) {
     JSObject *p = JS_VALUE_GET_OBJ(of->cur_func);
-    JSFunctionBytecode *b = p->u.func.function_bytecode;
-    int al = of->arg_count, lc = al + b->var_count + b->stack_size;
-    cf->arg_buf = js_malloc(ctx, sizeof(JSValue) * (lc > 0 ? lc : 1) + sizeof(JSVarRef *) * b->var_ref_count);
+    JSFunctionBytecode *b;
+    int al, lc, nrefs;
+
+    if (of->is_call_root) {
+        al = of->arg_count;
+        lc = STEP_FLOW_SLOTS;
+        nrefs = 0;
+    } else {
+        b = p->u.func.function_bytecode;
+        al = of->arg_count;
+        lc = al + b->var_count + b->stack_size;
+        nrefs = b->var_ref_count;
+    }
+    cf->arg_buf = js_malloc(ctx, sizeof(JSValue) * (lc > 0 ? lc : 1) + sizeof(JSVarRef *) * nrefs);
     if (!cf->arg_buf) return -1;
     for (ptrdiff_t i = 0; i < live; i++) cf->arg_buf[i] = js_dup(of->arg_buf[i]);
     cf->is_strict_mode = of->is_strict_mode;
     cf->cur_func = js_dup(of->cur_func);   /* the frame OWNS its cur_func */
     cf->arg_count = al;
-    cf->var_buf = cf->arg_buf + al;
+    /* a call root's stack starts AT the block (0 args, 0 vars); a bytecode frame's after its arguments */
+    cf->var_buf = cf->arg_buf + (of->is_call_root ? 0 : al);
     cf->var_refs = (JSVarRef **)(cf->arg_buf + lc);
     cf->var_ref_count = of->var_ref_count;   /* share the frame's closed cells + take a ref */
     for (int vi = 0; vi < of->var_ref_count; vi++) { cf->var_refs[vi] = of->var_refs[vi]; if (cf->var_refs[vi]) JS_REF_COUNT(cf->var_refs[vi])++; }
     cf->cur_pc = of->cur_pc;
     cf->prev_frame = NULL;
+    cf->is_call_root = of->is_call_root;
+    cf->is_constructor = of->is_constructor;
+    cf->step_func = js_dup(of->step_func);
+    cf->step_this = js_dup(of->step_this);
+    cf->this_val = js_dup(of->this_val);
     return 0;
 }
 
@@ -39783,8 +39814,16 @@ JSValue *JS_FlowClone(JSContext *ctx, JSValue *flow) {
     /* Captured-local cells are CLOSED heap cells now (V8 Context model) — the clone SHARES them (one COW-
        swappable cell per captured var, isolated per-flow by the delta) and takes its own ownership ref. */
     JSObject *p = JS_VALUE_GET_OBJ(sf->cur_func);
-    JSFunctionBytecode *b = p->u.func.function_bytecode;
-    int arg_buf_len = sf->arg_count;
+    JSFunctionBytecode *b;
+    int arg_buf_len;
+    /* A base suspended with an EMPTY chain is suspended in its own bytecode, and a call root has none: its
+       "body" is the callee's frame, which is exactly what the chain holds. A fork here would be a fork before
+       anything ran. */
+    DCHECK(!sf->is_call_root,
+           "a call-root base was snapshot-forked with no tramp chain — its body has not been dispatched yet, so "
+           "there is nothing at that branch to clone");
+    b = p->u.func.function_bytecode;
+    arg_buf_len = sf->arg_count;
     int local_count = arg_buf_len + b->var_count + b->stack_size;
     size_t alloc_size = sizeof(JSValue) * (local_count > 0 ? local_count : 1) + sizeof(JSVarRef *) * b->var_ref_count;
 
@@ -40296,6 +40335,20 @@ static JSValue js_async_function_resolve_call(JSContext *ctx,
     JSAsyncFunctionData *s = p->u.async_function_data;
     bool is_reject = p->class_id - JS_CLASS_ASYNC_FUNCTION_RESOLVE;
     JSValueConst arg;
+
+    /* A SUSPENDED ASYNC FRAME IS PER-FLOW STATE AND DOES NOT RIDE THE COW DELTA YET. `await p` on a promise
+       created before a fork leaves one continuation reachable from BOTH arms: each arm settles the promise on
+       its own timeline (async_state captures that), and each then resumes THIS state — but the first arm's
+       completion terminates it, so the second dereferences a frame whose cur_func has been freed. Found by
+       localising a "non-bytecode cur_func" abort down to an ASYNC_CALL base, which is what a torn-down frame
+       looks like from the resume side.
+       The build is the one CLAUDE.md names: the continuation, its frame and its resolve/reject capability
+       belong to the FLOW, so a fork has to clone them the way it clones a generator's execution state
+       (JSTimeTravelHooks.gen_fork) rather than sharing one. Until that exists this crashes HERE, where the
+       second resume happens, instead of inside the freed frame. */
+    DCHECK(s->is_active,
+           "two flows resumed ONE suspended async continuation — the first consumed it. A suspended async frame "
+           "is per-flow state: fork it onto the arm's COW delta the way a generator's state is forked");
 
     if (argc > 0)
         arg = argv[0];
@@ -86681,7 +86734,6 @@ static JSValue js_reaction_resume_job(JSContext *ctx, int argc, JSValueConst *ar
    than driving to completion. It was named for the step closures that were its first caller; nothing in it is
    step-specific, and reading it as step-only is what left a JS_Call fallback beside it. The frame's stack is
    pre-pushed with the method-call operand shape [this=undefined, handler, arg] (call_argv = sp-1). */
-#define STEP_FLOW_SLOTS 16
 static int reaction_call_flow_init(JSContext *ctx, JSAsyncFunctionState *fs, JSValueConst this_val,
                                    JSValueConst handler, int argc, JSValueConst *argv)
 {
