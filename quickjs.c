@@ -670,6 +670,11 @@ struct JSContext {
     JSValue async_iterator_proto;
     JSValue array_proto_values;
     JSValue throw_type_error;
+    /* 16.1 Forbidden Extensions bullet 1 permits a non-strict FunctionDeclaration/FunctionExpression to carry
+       own `caller`/`arguments` properties, and that is where the legacy reflection every browser ships lives.
+       One accessor pair per realm, installed on each eligible function object. */
+    JSValue legacy_reflect_get[2];   /* [0] = caller, [1] = arguments */
+    JSValue legacy_reflect_set;
     JSValue eval_obj;
 
     JSValue global_obj; /* global object */
@@ -952,7 +957,12 @@ typedef struct JSFunctionBytecode {
        declared inside an eval'd source is eval code too, so the flag rides down the whole nest. V8's
        CallSite#isEval reports it, and its own stack formatter asks before anything else. */
     uint8_t from_eval : 1;
-    /* XXX: 4 bits available */
+    /* THE TOP-LEVEL PROGRAM ITSELF -- a script, a module, or the body of one eval -- compiled as a function
+       because that is how the interpreter runs it, but not an activation of anything the page can name. The
+       legacy `f.caller` walk needs to tell it apart from a function DECLARED inside eval code, which carries
+       from_eval too and IS a real activation. */
+    uint8_t is_program : 1;
+    /* XXX: 3 bits available */
     uint8_t *byte_code_buf; /* (self pointer) */
     int byte_code_len;
     JSAtom func_name;
@@ -3316,6 +3326,9 @@ static void JS_MarkContext(JSRuntime *rt, JSContext *ctx,
     JS_MarkValue(rt, ctx->global_var_obj, mark_func);
 
     JS_MarkValue(rt, ctx->throw_type_error, mark_func);
+    JS_MarkValue(rt, ctx->legacy_reflect_get[0], mark_func);
+    JS_MarkValue(rt, ctx->legacy_reflect_get[1], mark_func);
+    JS_MarkValue(rt, ctx->legacy_reflect_set, mark_func);
     JS_MarkValue(rt, ctx->eval_obj, mark_func);
     for(i = 0; i < ctx->pending_close_n; i++)
         JS_MarkValue(rt, ctx->pending_close_iters[i], mark_func);
@@ -3404,6 +3417,9 @@ void JS_FreeContext(JSContext *ctx)
     JS_FreeValue(ctx, ctx->global_var_obj);
 
     JS_FreeValue(ctx, ctx->throw_type_error);
+    JS_FreeValue(ctx, ctx->legacy_reflect_get[0]);
+    JS_FreeValue(ctx, ctx->legacy_reflect_get[1]);
+    JS_FreeValue(ctx, ctx->legacy_reflect_set);
     JS_FreeValue(ctx, ctx->eval_obj);
 
     JS_FreeValue(ctx, ctx->array_proto_values);
@@ -17021,14 +17037,20 @@ static __exception int js_operator_delete(JSContext *ctx, JSValue *sp)
     return 0;
 }
 
+/* %ThrowTypeError% (10.2.4.1) is one step: "Throw a TypeError exception." It has no parameters and reads
+   nothing, which is what makes it usable as the [[Get]] AND [[Set]] of Function.prototype.caller/arguments and
+   as an unmapped arguments object's `callee` getter.
+   It used to answer JS_UNDEFINED when `this` was a sloppy ordinary function -- a stand-in for the legacy
+   `f.caller`/`f.arguments` reflection that browsers put on Function.prototype and that this engine does not
+   implement. That is not a partial implementation of the legacy feature, it is a broken %ThrowTypeError%:
+   the same function object reached through a strict arguments object's `callee` then answered undefined for a
+   function argument instead of throwing. The legacy accessors, if built, are their OWN accessor pair -- as they
+   are in V8, where Function.prototype.caller's getter is NOT %ThrowTypeError% -- and they do not get there by
+   teaching this one to lie. */
 static JSValue js_throw_type_error(JSContext *ctx, JSValueConst this_val,
                                    int argc, JSValueConst *argv)
 {
-    JSFunctionBytecode *b = JS_GetFunctionBytecode(this_val);
-    if (!b || b->is_strict_mode || !b->has_prototype) {
-        return JS_ThrowTypeError(ctx, "invalid property access");
-    }
-    return JS_UNDEFINED;
+    return JS_ThrowTypeError(ctx, "invalid property access");
 }
 
 static JSValue js_function_proto_fileName(JSContext *ctx,
@@ -17112,6 +17134,101 @@ static JSValue js_build_arguments(JSContext *ctx, int argc, JSValueConst *argv)
  fail:
     JS_FreeValue(ctx, val);
     return JS_EXCEPTION;
+}
+
+
+/* THE LEGACY FUNCTION REFLECTION -- `f.caller` and `f.arguments`.
+   16.1 Forbidden Extensions, bullet 1, lists exactly which function forms must NOT be created with own
+   properties of those names: strict functions, arrows, methods, generators, async functions, classes, bound
+   functions and built-ins. What it leaves out -- a non-strict FunctionDeclaration or FunctionExpression -- is
+   the form on which the extension is permitted, and every browser ships it. It is an OWN accessor pair on
+   those functions, not a replacement for Function.prototype's: 10.2.4 fixes those to %ThrowTypeError%, which
+   is why a strict function's `.caller` throws (it has no own property and inherits that one).
+   Bullet 2 constrains what the getter may answer: never a strict function. Everything the walk below refuses
+   to reveal answers null. */
+static bool js_function_legacy_eligible(JSValueConst func)
+{
+    JSFunctionBytecode *b = JS_GetFunctionBytecode(func);
+    return b != NULL && !b->is_strict_mode && b->has_prototype && !b->is_program &&
+           b->func_kind == JS_FUNC_NORMAL;
+}
+
+/* The activation of `func` nearest the top of the stack, or NULL when it is not executing. */
+static JSStackFrame *js_function_top_activation(JSRuntime *rt, JSValueConst func)
+{
+    JSStackFrame *sf;
+
+    for (sf = rt->current_stack_frame; sf != NULL; sf = sf->prev_frame) {
+        if (sf->is_call_root)
+            continue;   /* names the function it is about to call; not an activation of it */
+        if (JS_VALUE_GET_TAG(sf->cur_func) == JS_TAG_OBJECT &&
+            JS_VALUE_GET_OBJ(sf->cur_func) == JS_VALUE_GET_OBJ(func))
+            return sf;
+    }
+    return NULL;
+}
+
+static JSValue js_function_legacy_reflect(JSContext *ctx, JSValueConst this_val, int magic)
+{
+    JSStackFrame *sf;
+
+    /* reachable with any receiver through `Object.getOwnPropertyDescriptor(f, "caller").get.call(x)`, so the
+       eligibility that decided where the property was installed is re-asked here. */
+    if (!js_function_legacy_eligible(this_val))
+        return JS_ThrowTypeError(ctx, "invalid property access");
+    sf = js_function_top_activation(ctx->rt, this_val);
+    if (!sf)
+        return JS_NULL;
+    if (magic != 0)
+        return js_build_arguments(ctx, sf->arg_count, vc(sf->arg_buf));
+    /* A continuation-holding builtin driving this callback (`[0].map(f)`) is genuinely between the two frames
+       and pushes no frame of its own; the caller is that builtin, which is not revealable. */
+    if (!JS_IsUndefined(sf->step_func))
+        return JS_NULL;
+    for (sf = sf->prev_frame; sf != NULL; sf = sf->prev_frame) {
+        JSFunctionBytecode *b;
+        if (sf->is_call_root)
+            continue;
+        b = JS_GetFunctionBytecode(sf->cur_func);
+        /* the eval'd PROGRAM is transparent: inside `eval("f()")`, `f.caller` is the function that ran the
+           eval. A function DECLARED in eval code carries from_eval too but is a real activation. */
+        if (b != NULL && b->is_program && b->from_eval)
+            continue;
+        if (!js_function_legacy_eligible(sf->cur_func))
+            return JS_NULL;
+        return js_dup(sf->cur_func);
+    }
+    return JS_NULL;
+}
+
+/* The setter is a silent no-op on an eligible function, which is what a page assigning `f.caller = x` sees in
+   a browser. It exists so that the property is a complete accessor: a getter-only one would make the same
+   assignment throw in strict mode. */
+static JSValue js_function_legacy_reflect_set(JSContext *ctx, JSValueConst this_val,
+                                              int argc, JSValueConst *argv)
+{
+    if (!js_function_legacy_eligible(this_val))
+        return JS_ThrowTypeError(ctx, "invalid property access");
+    return JS_UNDEFINED;
+}
+
+/* Install the pair on a function that 16.1 allows to carry it. Configurable, non-enumerable -- the shape
+   test262's forbidden-extension tests redefine over. */
+static int js_function_add_legacy_reflection(JSContext *ctx, JSValueConst func_obj)
+{
+    static const JSAtom names[2] = { JS_ATOM_caller, JS_ATOM_arguments };
+    int i;
+
+    DCHECK(js_function_legacy_eligible(func_obj),
+           "the legacy caller/arguments pair was installed on a function 16.1 forbids it on");
+    for (i = 0; i < 2; i++) {
+        if (JS_DefineProperty(ctx, func_obj, names[i], JS_UNDEFINED,
+                              ctx->legacy_reflect_get[i], ctx->legacy_reflect_set,
+                              JS_PROP_HAS_GET | JS_PROP_HAS_SET |
+                              JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE) < 0)
+            return -1;
+    }
+    return 0;
 }
 
 #define GLOBAL_VAR_OFFSET 0x40000000
@@ -17642,6 +17759,14 @@ static JSValue js_closure(JSContext *ctx, JSValue bfunc,
         JS_DefineAutoInitProperty(ctx, func_obj, JS_ATOM_prototype,
                                   JS_AUTOINIT_ID_PROTOTYPE, NULL,
                                   JS_PROP_WRITABLE);
+    }
+    if (js_function_legacy_eligible(func_obj)) {
+        /* the pair is a realm intrinsic, so a function reaching here before the realm has one would silently
+           get an accessor with no getter -- read as undefined -- instead of the reflection. */
+        DCHECK(JS_IsFunction(ctx, ctx->legacy_reflect_get[0]),
+               "a legacy-eligible function was closed before its realm built the caller/arguments accessors");
+        if (js_function_add_legacy_reflection(ctx, func_obj))
+            goto fail;
     }
     return func_obj;
  fail:
@@ -56681,6 +56806,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
      */
     b->filename = fd->filename;
     b->from_eval = fd->from_eval;
+    b->is_program = (fd->parent == NULL);
     b->eval_origin = fd->eval_origin;   /* HANDED OVER, like filename above; the def no longer owns it */
     fd->eval_origin = JS_ATOM_NULL;
     b->line_num = fd->line_num;
@@ -58177,11 +58303,13 @@ typedef enum BCTagEnum {
 /* 29: a regexp's compiled byte code changed shape — a capture or register index is a u32 where it was a
    byte, and the header grew with it.
    30: its group-name section lost a byte per group (LRE_GROUP_NAME_TRAILER_LEN 2 -> 1).
+   32: a function's flag word carries from_eval and is_program, which were computed at parse time and then
+   dropped on the way out -- so a deserialized function claimed to be neither eval code nor a program.
    31: a module's export/import entries carry an explicit is_namespace byte. It used to be inferred from the
    name being the atom for "*", which is a legal ModuleExportName, so the flag has to be written.
    Serialized byte code from an older build would be read as the new format and mis-execute, so the version
    byte is what refuses it. */
-#define BC_VERSION 31
+#define BC_VERSION 32
 /* DELETED: the OP_COUNT and JS_ATOM_END asserts. They guarded ONE thing — the builtin-*.h bytecode COMPILED INTO
    this file, which named opcodes and atoms by index and so silently resolved the wrong one when either table
    shifted (Iterator.zip read `done` off the atom next to it, thousands of tests from the cause). Every one of
@@ -58486,6 +58614,8 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
     bc_set_flags(&flags, &idx, b->super_allowed, 1);
     bc_set_flags(&flags, &idx, b->arguments_allowed, 1);
     bc_set_flags(&flags, &idx, b->backtrace_barrier, 1);
+    bc_set_flags(&flags, &idx, b->from_eval, 1);
+    bc_set_flags(&flags, &idx, b->is_program, 1);
     bc_set_flags(&flags, &idx, s->allow_debug, 1);
     assert(idx <= 16);
     bc_put_u16(s, flags);
@@ -59422,6 +59552,8 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
     bc.super_allowed = bc_get_flags(v16, &idx, 1);
     bc.arguments_allowed = bc_get_flags(v16, &idx, 1);
     bc.backtrace_barrier = bc_get_flags(v16, &idx, 1);
+    bc.from_eval = bc_get_flags(v16, &idx, 1);
+    bc.is_program = bc_get_flags(v16, &idx, 1);
     has_debug_info = bc_get_flags(v16, &idx, 1);
     if (bc_get_u8(s, &v8))
         goto fail;
@@ -89960,6 +90092,18 @@ int JS_AddIntrinsicBaseObjects(JSContext *ctx)
                           JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE) < 0)
         return -1;
     if (js_freeze_ordinary(ctx, ctx->throw_type_error) < 0)
+        return -1;
+
+    /* 16.1's permitted extension, one pair per realm. NOT %ThrowTypeError%: these answer, and 10.2.4 already
+       spent %ThrowTypeError% on Function.prototype's own caller/arguments, which is what a strict function
+       inherits. */
+    ctx->legacy_reflect_get[0] = JS_NewCFunctionMagic(ctx, (JSCFunctionMagic *)js_function_legacy_reflect,
+                                                      "get caller", 0, JS_CFUNC_getter_magic, 0);
+    ctx->legacy_reflect_get[1] = JS_NewCFunctionMagic(ctx, (JSCFunctionMagic *)js_function_legacy_reflect,
+                                                      "get arguments", 0, JS_CFUNC_getter_magic, 1);
+    ctx->legacy_reflect_set = JS_NewCFunction(ctx, js_function_legacy_reflect_set, "set caller", 1);
+    if (JS_IsException(ctx->legacy_reflect_get[0]) || JS_IsException(ctx->legacy_reflect_get[1]) ||
+        JS_IsException(ctx->legacy_reflect_set))
         return -1;
 
     /* Object */
