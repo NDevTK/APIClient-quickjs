@@ -1225,6 +1225,12 @@ struct JSModuleDef {
     bool async_evaluation;
     int64_t async_evaluation_timestamp;
     JSModuleDef *cycle_root;
+    /* Has this module's EVALUATION been started? It used to be inferred from `promise != undefined`, which
+       stopped being the same fact once a consumer could take the capability BEFORE evaluating (so it could
+       register its continuation ahead of a fork inside the body). Inferred, a dynamic import of an
+       already-EVALUATED module — whose evaluation created no capability of its own, because only a cycle root
+       gets one — was read as "in flight" and handed back an undefined promise that nothing would ever settle. */
+    bool eval_started;
     JSValue promise; /* corresponds to spec field: capability */
     JSValue resolving_funcs[2]; /* corresponds to spec field: capability */
     /* true if evaluation yielded an exception. It is saved in
@@ -51433,10 +51439,13 @@ static void js_load_module_reject_pending(JSContext *ctx, JSValueConst *resolvin
 
 /* THE TAIL OF A LOAD, shared by the synchronous answer and the asynchronous one: link the graph, evaluate it,
    and settle the capability with the namespace once evaluation's own promise does. */
+static JSValue js_module_eval_capability(JSContext *ctx, JSModuleDef *m);
+static JSValue js_evaluate_module(JSContext *ctx, JSModuleDef *m);
+
 static void js_load_module_evaluate(JSContext *ctx, JSModuleDef *m,
                                     JSValueConst *resolving_funcs)
 {
-    JSValue evaluate_promise;
+    JSValue cap, ret_val;
     JSValue func_obj, evaluate_resolving_funcs[2];
     JSValueConst func_data[3];
 
@@ -51444,11 +51453,18 @@ static void js_load_module_evaluate(JSContext *ctx, JSModuleDef *m,
         js_free_modules(ctx, JS_FREE_MODULE_NOT_RESOLVED);
         goto fail;
     }
-
-    /* Evaluate the module code */
-    func_obj = JS_NewModuleValue(ctx, m);
-    evaluate_promise = JS_EvalFunction(ctx, func_obj);
-    if (JS_IsException(evaluate_promise)) {
+    /* LINK, then take the capability, THEN evaluate — spelled as the three steps rather than as JS_EvalFunction
+       precisely so the registration below lands between the second and the third. The module body can FORK; a
+       sibling forked mid-body inherits the world as it was at the branch, and this continuation has to already
+       be on the capability in that world or the importing `.then(m => …)` never runs there. Linking runs only
+       the hoisted-definition prologue, which the compiler emits with no back-edge and which therefore cannot
+       fork. */
+    if (js_create_module_function(ctx, m) < 0)
+        goto fail;
+    if (js_link_module(ctx, m) < 0)
+        goto fail;
+    cap = js_module_eval_capability(ctx, m);
+    if (JS_IsException(cap)) {
     fail:
         js_load_module_reject_pending(ctx, resolving_funcs);
         return;
@@ -51461,10 +51477,17 @@ static void js_load_module_evaluate(JSContext *ctx, JSModuleDef *m,
     evaluate_resolving_funcs[0] = JS_NewCFunctionData(ctx, js_load_module_fulfilled, 0, 0, 3, func_data);
     evaluate_resolving_funcs[1] = JS_NewCFunctionData(ctx, js_load_module_rejected, 0, 0, 3, func_data);
     JS_FreeValue(ctx, func_obj);
-    JS_FreeValue(ctx, js_promise_then_native(ctx, evaluate_promise, vc(evaluate_resolving_funcs)));
+    JS_FreeValue(ctx, js_promise_then_native(ctx, cap, vc(evaluate_resolving_funcs)));
     JS_FreeValue(ctx, evaluate_resolving_funcs[0]);
     JS_FreeValue(ctx, evaluate_resolving_funcs[1]);
-    JS_FreeValue(ctx, evaluate_promise);
+    JS_FreeValue(ctx, cap);
+
+    ret_val = js_evaluate_module(ctx, m);
+    /* The capability exists, so the only failure js_evaluate_module can still report is the one that creates it;
+       every evaluation error settles that capability instead, which is what the reactions above are for. */
+    DCHECK(!JS_IsException(ret_val), "module evaluation threw after its capability existed — an evaluation error "
+                                     "settles the capability, it does not throw past it");
+    JS_FreeValue(ctx, ret_val);
 }
 
 /* The source arrived. func_data = [resolve, reject, module_name]; argv[0] is the module's SOURCE TEXT. Compiling
@@ -52269,6 +52292,7 @@ static int js_inner_module_evaluation(JSContext *ctx, JSModuleDef *m,
    whether a flow evaluates AT ALL. */
 typedef struct JSModuleEvalState {
     JSModuleStatus status;
+    bool eval_started;
     int dfs_index, dfs_ancestor_index;
     JSModuleDef *stack_prev;
     int pending_async_dependencies;
@@ -52294,6 +52318,7 @@ void *JS_ModuleEvalStateSave(JSContext *ctx, void *mod)
            "a module's evaluation state is being captured while it has async parents — the parent list must "
            "join the blob before a top-level-await graph can time-travel");
     b->status = m->status;
+    b->eval_started = m->eval_started;
     b->dfs_index = m->dfs_index;
     b->dfs_ancestor_index = m->dfs_ancestor_index;
     b->stack_prev = m->stack_prev;
@@ -52320,6 +52345,7 @@ void JS_ModuleEvalStateRestore(JSContext *ctx, void *mod, void *blob)
     JS_FreeValue(ctx, m->resolving_funcs[1]);
     JS_FreeValue(ctx, m->eval_exception);
     m->status = b->status;
+    m->eval_started = b->eval_started;
     m->dfs_index = b->dfs_index;
     m->dfs_ancestor_index = b->dfs_ancestor_index;
     m->stack_prev = b->stack_prev;
@@ -52370,6 +52396,24 @@ static void js_module_eval_capture(JSContext *ctx, JSModuleDef *m)
         g_time_travel.module_eval(ctx, m);
 }
 
+/* THE MODULE'S EVALUATION CAPABILITY, created WITHOUT evaluating. A consumer has to be able to register its
+   continuation on it BEFORE the body runs: the body can FORK, and a sibling forked mid-body inherits the world
+   as it was at the branch, where a registration made after evaluation returned never happened. A promise may be
+   created only on the cycle_root of a cycle. Returns a dup, or JS_EXCEPTION on allocation failure. */
+static JSValue js_module_eval_capability(JSContext *ctx, JSModuleDef *m)
+{
+    js_module_eval_capture(ctx, m);
+    if (m->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
+        m->status == JS_MODULE_STATUS_EVALUATED)
+        m = m->cycle_root;
+    if (JS_IsUndefined(m->promise)) {
+        m->promise = JS_NewPromiseCapability(ctx, m->resolving_funcs);
+        if (JS_IsException(m->promise))
+            return JS_EXCEPTION;
+    }
+    return js_dup(m->promise);
+}
+
 static JSValue js_evaluate_module(JSContext *ctx, JSModuleDef *m)
 {
     JSModuleDef *m1, *stack_top;
@@ -52385,12 +52429,22 @@ static JSValue js_evaluate_module(JSContext *ctx, JSModuleDef *m)
         m->status == JS_MODULE_STATUS_EVALUATED) {
         m = m->cycle_root;
     }
-    /* a promise may be created only on the cycle_root of a cycle */
-    if (!JS_IsUndefined(m->promise))
+    /* ALREADY EVALUATING OR EVALUATED: the capability IS the answer. The test is the STATUS, not "does a
+       capability exist" — a consumer may have taken the capability first precisely so it could register before
+       the body ran, and reading that as "already evaluated" would return a promise nothing will ever settle. */
+    /* ALREADY STARTED: the capability IS the answer, and the walk below must not run a second time. */
+    if (m->eval_started) {
+        DCHECK(!JS_IsUndefined(m->promise),
+               "a module whose evaluation started has no capability — its consumers have nothing to wait on");
         return js_dup(m->promise);
-    m->promise = JS_NewPromiseCapability(ctx, m->resolving_funcs);
-    if (JS_IsException(m->promise))
-        return JS_EXCEPTION;
+    }
+    m->eval_started = true;
+    {
+        JSValue cap = js_module_eval_capability(ctx, m);
+        if (JS_IsException(cap))
+            return JS_EXCEPTION;
+        JS_FreeValue(ctx, cap);
+    }
 
     stack_top = NULL;
     if (js_inner_module_evaluation(ctx, m, 0, &stack_top, &result) < 0) {
@@ -86874,8 +86928,8 @@ static void fulfill_or_reject_promise(JSContext *ctx, JSValueConst promise,
 
     if (!s || s->promise_state != JS_PROMISE_PENDING)
         return; /* should never happen */
-    if (g_time_travel.async_settle)
-        g_time_travel.async_settle(ctx, promise);   /* time-travel: the baseline settlement, before it is gone */
+    if (g_time_travel.async_state)
+        g_time_travel.async_state(ctx, promise);   /* time-travel: the baseline settlement, before it is gone */
     set_value(ctx, &s->promise_result, js_dup(value));
     s->promise_state = JS_PROMISE_FULFILLED + is_reject;
 
@@ -87056,8 +87110,8 @@ _Static_assert(offsetof(JSPromiseResolveFn, hdr) == 0, "JSStepHdr must be first 
    silent no-op, which loses that arm's value entirely. */
 static void js_promise_latch_resolved(JSContext *ctx, JSValueConst func_obj, JSPromiseFunctionData *s)
 {
-    if (g_time_travel.async_settle)
-        g_time_travel.async_settle(ctx, func_obj);
+    if (g_time_travel.async_state)
+        g_time_travel.async_state(ctx, func_obj);
     s->presolved->already_resolved = true;
 }
 
@@ -87985,6 +88039,12 @@ static __exception int perform_promise_then(JSContext *ctx,
     }
 
     if (s->promise_state == JS_PROMISE_PENDING) {
+        /* ATTACHING a reaction to a shared pending promise is a WRITE to it, exactly as settling it is: the
+           record joins a list every flow can reach. `if (flag) p.then(h1); else p.then(h2);` forks BEFORE the
+           attach, so each arm owns its own registration — and without this capture the arm that attached second
+           ran both handlers, because it inherited the other arm's record. */
+        if (g_time_travel.async_state)
+            g_time_travel.async_state(ctx, promise);
         for(i = 0; i < 2; i++)
             list_add_tail(&rd_array[i]->link, &s->promise_reactions[i]);
     } else {

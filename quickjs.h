@@ -1235,15 +1235,17 @@ typedef struct JSTimeTravelHooks {
        The host records a reversible undo-log entry so a snapshot-forked sibling stays isolated: apply replays the
        op, unapply inverts it (overwrite restores old; delete re-adds old). Completes map_add's add-only capture. */
     void (*map_mutate)(JSContext *ctx, JSValueConst obj, JSValueConst key, JSValueConst old_val, JSValueConst val, int op);
-    /* Before a flow changes the SETTLEMENT of a shared async object: a promise leaving PENDING, or a
-       resolving-function pair latching already_resolved. A promise created before a fork is shared baseline
+    /* Before a flow changes the ASYNC STATE of a shared object: a promise leaving PENDING, a REACTION being
+       attached to one that is still pending, or a resolving-function pair latching already_resolved. The
+       reaction list belongs here for the same reason the settlement does — `if (flag) p.then(h1); else
+       p.then(h2);` attaches h1 in one arm only, and without capturing the attach the other arm ran h1 too. A promise created before a fork is shared baseline
        state like any other object, and settling it is a WRITE — but one no property hook can see, because it
        lives in the promise's internal slots and its reaction list. Without this the first arm to resolve wins
        and every sibling's resolve is a silent no-op, so a value that differs per arm is simply lost.
        The host captures the object's whole settlement with JS_AsyncStateSave and puts it on the running flow's
        delta; the swap restores it. Two classes, one hook, because "the settlement state of this shared async
        object" is one concept and which internal slots that means is the engine's business. */
-    void (*async_settle)(JSContext *ctx, JSValueConst obj);
+    void (*async_state)(JSContext *ctx, JSValueConst obj);
     /* Before a flow changes a MODULE's evaluation state (16.2.1.5.3's status/capability/cycle fields). A
        module's BINDINGS are closure cells and already ride the delta through cell_write, but its evaluation
        state did not — so the first flow to evaluate a module left the record EVALUATED for every sibling, and a
