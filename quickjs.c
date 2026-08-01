@@ -53385,6 +53385,17 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
             var_idx = add_func_var(ctx, s, var_name);
         }
     }
+    /* A function expression's self-name binding lives in the funcEnv that InstantiateOrdinaryFunctionExpression
+       builds AROUND the function, so it is OUTSIDE the function's own variable environment — a `var` of the same
+       name that a direct eval created in varEnv shadows it. Every other local resolved above is IN varEnv and
+       therefore wins over the eval var object, which is why this is the one kind that has to look there first. */
+    if (var_idx >= 0 && !is_arg_scope && !is_pseudo_var && s->var_object_idx >= 0 &&
+        !(var_idx & ARGUMENT_VAR_OFFSET) &&
+        s->vars[var_idx].var_kind == JS_VAR_FUNCTION_NAME) {
+        dbuf_putc(bc, OP_get_loc);
+        dbuf_put_u16(bc, s->var_object_idx);
+        var_object_test(ctx, s, var_name, op, bc, &label_done, 0);
+    }
     if (var_idx >= 0) {
         if ((op == OP_scope_put_var || op == OP_scope_make_ref) &&
             !(var_idx & ARGUMENT_VAR_OFFSET) &&
@@ -54394,6 +54405,27 @@ static bool code_match(CodeContext *s, int pos, ...)
     return ret;
 }
 
+/* Is this closure variable a binding of the enclosing function's VARIABLE environment?
+   16.1.7 EvalDeclarationInstantiation step 9 creates a direct eval's `var` in varEnv unless varEnv ALREADY has
+   that binding — and only the enclosing function's parameters and top-level `var`s are in varEnv. A `let`/`const`
+   /block-scoped function lives in a declarative env INSIDE varEnv; a catch parameter lives in the catch clause's
+   own env (which B.3.4 explicitly walks PAST rather than erroring on); a function expression's self-name lives in
+   the funcEnv OUTSIDE varEnv. Treating any of those as "varEnv already has it" made the eval's declaration
+   vanish entirely: `try{}catch(x){ eval("var x=42") }` never created x in the function, so a later write to x
+   escaped to the global, and `(function f(){ eval("var f=1"); return f })()` returned the function. */
+static bool closure_var_is_var_env(const JSFunctionDef *s, const JSClosureVar *cv)
+{
+    /* Only a DIRECT eval's closure holds bindings of ENCLOSING scopes, which is where the distinction between
+       varEnv and the environments nested inside it exists at all. A module's closure variables are the module's
+       OWN top-level bindings -- one Module Environment Record is both its lexical and its variable environment --
+       so a `let` there is the very binding being instantiated and must be initialized, not redefined. */
+    if (s->eval_type != JS_EVAL_TYPE_DIRECT)
+        return true;
+    return !cv->is_lexical &&
+           cv->var_kind != JS_VAR_CATCH &&
+           cv->var_kind != JS_VAR_FUNCTION_NAME;
+}
+
 static void instantiate_hoisted_definitions(JSContext *ctx, JSFunctionDef *s, DynBuf *bc)
 {
     int i, idx, label_next = -1;
@@ -54448,7 +54480,7 @@ static void instantiate_hoisted_definitions(JSContext *ctx, JSFunctionDef *s, Dy
            create a property for the variable there */
         for(idx = 0; idx < s->closure_var_count; idx++) {
             JSClosureVar *cv = &s->closure_var[idx];
-            if (cv->var_name == hf->var_name) {
+            if (cv->var_name == hf->var_name && closure_var_is_var_env(s, cv)) {
                 has_closure = 2;
                 force_init = false;
                 break;
