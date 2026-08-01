@@ -87209,20 +87209,43 @@ static JSValue promise_reaction_job(JSContext *ctx, int argc,
     return res2;
 }
 
-/* ENQUEUE A CALL OF `func(arg)` AS A JOB. The host edges need a route from C to a page callback that is not a
-   JS_Call: a listener body holds loops, awaits and concolic branches, so running it inside a C activation is the
-   drive-to-completion the engine aborts on. A promise reaction is already exactly "call this handler as a
-   call-root flow, later", so this is that job with no capability to settle — the reaction machinery, named for
-   what the platform actually needs it for. */
-void JS_EnqueueCallJob(JSContext *ctx, JSValueConst func, JSValueConst arg)
+/* THE JOB A HOST EDGE ENQUEUES: `func(...args)` as a CALL-ROOT FLOW, later. The platform needs a route from C
+   to a page callback that is not a JS_Call — a listener or a timer body holds loops, awaits and concolic
+   branches, so running it inside a C activation is the drive-to-completion the engine aborts on. A promise
+   reaction is already "call this handler as a call-root flow", so this is that, with no capability to settle
+   and with the callback's OWN argument list rather than a promise's single result. */
+static JSValue host_call_job(JSContext *ctx, int argc, JSValueConst *argv)
 {
-    JSValueConst args[5];
-    args[0] = JS_UNDEFINED;   /* no derived promise: nothing settles when the callback returns */
-    args[1] = JS_UNDEFINED;
-    args[2] = func;
-    args[3] = JS_FALSE;
-    args[4] = arg;
-    JS_EnqueueJob(ctx, promise_reaction_job, 5, args);
+    JSReactionFlow *rf = js_malloc(ctx, sizeof(*rf));
+    if (unlikely(!rf))
+        return JS_EXCEPTION;
+    memset(rf, 0, sizeof(*rf));
+    /* argv[0] is the callee; everything after it is what the platform passes the callback. */
+    if (reaction_call_flow_init(ctx, &rf->fs, JS_UNDEFINED, argv[0], argc - 1, argv + 1)) {
+        js_free_rt(ctx->rt, rf);
+        return JS_EXCEPTION;
+    }
+    rf->resolve = JS_UNDEFINED;   /* nothing settles when this returns */
+    rf->reject = JS_UNDEFINED;
+    return reaction_flow_step(ctx, rf);
+}
+
+void JS_EnqueueCallJob(JSContext *ctx, JSValueConst func, int argc, JSValueConst *argv)
+{
+    JSValueConst stack[9], *args = stack;
+    int i;
+
+    DCHECK(argc >= 0, "JS_EnqueueCallJob with a negative argument count");
+    if (argc + 1 > (int)countof(stack)) {
+        args = js_malloc(ctx, sizeof(*args) * (size_t)(argc + 1));
+        if (!args) { JS_ThrowOutOfMemory(ctx); return; }
+    }
+    args[0] = func;
+    for (i = 0; i < argc; i++)
+        args[i + 1] = argv[i];
+    JS_EnqueueJob(ctx, host_call_job, argc + 1, args);
+    if (args != stack)
+        js_free(ctx, (void *)args);
 }
 
 void JS_SetPromiseHook(JSRuntime *rt, JSPromiseHook promise_hook, void *opaque)

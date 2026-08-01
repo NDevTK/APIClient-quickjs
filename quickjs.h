@@ -1166,7 +1166,7 @@ typedef void JSPromiseHook(JSContext *ctx, JSPromiseHookType type,
 /* Enqueue `func(arg)` as a JOB that runs as a CALL-ROOT FLOW — the platform's route from a host edge to a page
    callback (an event listener, a timer). Not a JS_Call: the callback is the page's code and must be able to
    loop, await and fork, which a C activation cannot host. */
-JS_EXTERN void JS_EnqueueCallJob(JSContext *ctx, JSValueConst func, JSValueConst arg);
+JS_EXTERN void JS_EnqueueCallJob(JSContext *ctx, JSValueConst func, int argc, JSValueConst *argv);
 JS_EXTERN void JS_SetPromiseHook(JSRuntime *rt, JSPromiseHook promise_hook,
                                  void *opaque);
 
