@@ -53296,6 +53296,23 @@ static int resolve_pseudo_var(JSContext *ctx, JSFunctionDef *s,
     return var_idx;
 }
 
+/* 10.2.11 FunctionDeclarationInstantiation gives a function with parameter expressions TWO environments, and
+   `arguments` exists in BOTH: step 21 binds it in the parameter env, and step 28 copies it into the separate
+   variable env the body runs in. They are distinct bindings, so a default initializer that closes over
+   `arguments` keeps seeing the object after the body's `var arguments = 0` overwrites the body's copy. Resolving
+   `arguments` in the PARAMETER scope therefore has to name the parameter-scope slot, not the body's. */
+static int resolve_arguments_var(JSContext *ctx, JSFunctionDef *fd, bool is_arg_scope)
+{
+    if (is_arg_scope && fd->has_parameter_expressions) {
+        if (add_arguments_arg(ctx, fd) < 0)
+            return -1;
+        DCHECK(fd->arguments_arg_idx >= 0,
+               "add_arguments_arg reported success without leaving a parameter-scope arguments slot");
+        return fd->arguments_arg_idx;
+    }
+    return add_arguments_var(ctx, fd);
+}
+
 /* test if 'var_name' is in the variable object on the stack. If is it
    the case, handle it and jump to 'label_done' */
 static void var_object_test(JSContext *ctx, JSFunctionDef *s,
@@ -53393,7 +53410,7 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
         if (var_idx < 0 && var_name == JS_ATOM_arguments &&
             s->has_arguments_binding) {
             /* 'arguments' pseudo variable */
-            var_idx = add_arguments_var(ctx, s);
+            var_idx = resolve_arguments_var(ctx, s, is_arg_scope);
         }
         if (var_idx < 0 && s->is_func_expr && var_name == s->func_name) {
             /* add a new variable with the function name */
@@ -53597,7 +53614,7 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
                 break;
         }
         if (var_name == JS_ATOM_arguments && fd->has_arguments_binding) {
-            var_idx = add_arguments_var(ctx, fd);
+            var_idx = resolve_arguments_var(ctx, fd, is_arg_scope);
             break;
         }
         if (fd->is_func_expr && fd->func_name == var_name) {
@@ -55370,8 +55387,11 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
             put_short_code(&bc_out, OP_put_loc, s->this_var_idx);
         }
     }
-    /* initialize the 'arguments' variable if needed */
-    if (s->arguments_var_idx >= 0) {
+    /* initialize the 'arguments' variable if needed. A function with parameter expressions has the binding in
+       BOTH environments (FunctionDeclarationInstantiation steps 21 and 28) and either one alone is reason to
+       build the object: `function f(x = arguments[0]) { let arguments; }` references it only from the parameter
+       scope, and the body's lexical declaration means there is no body copy at all. */
+    if (s->arguments_var_idx >= 0 || s->arguments_arg_idx >= 0) {
         if (s->is_strict_mode || !s->has_simple_parameter_list) {
             dbuf_putc(&bc_out, OP_special_object);
             dbuf_putc(&bc_out, OP_SPECIAL_OBJECT_ARGUMENTS);
@@ -55384,8 +55404,10 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
             dbuf_putc(&bc_out, OP_SPECIAL_OBJECT_MAPPED_ARGUMENTS);
         }
         if (s->arguments_arg_idx >= 0)
-            put_short_code(&bc_out, OP_set_loc, s->arguments_arg_idx);
-        put_short_code(&bc_out, OP_put_loc, s->arguments_var_idx);
+            put_short_code(&bc_out, s->arguments_var_idx >= 0 ? OP_set_loc : OP_put_loc,
+                           s->arguments_arg_idx);
+        if (s->arguments_var_idx >= 0)
+            put_short_code(&bc_out, OP_put_loc, s->arguments_var_idx);
     }
     /* initialize a reference to the current function if needed */
     if (s->func_var_idx >= 0) {
@@ -80753,7 +80775,11 @@ static JSONParseRecord *json_parse_record_find(JSONParseRecord *pr, JSAtom key)
     uint32_t h, i;
 
     if (po->hash_size == 0) {
-        for(i = 0; i < po->count; i++) {
+        /* BACKWARD, because a JSON object may repeat a member name and the LAST one is what the constructed
+           object holds -- that member's text is the source of the value the reviver is handed. The hashed path
+           below already answered that way (entries are chained newest-first), so a forward scan here made
+           `{"b":2,"b":1,"b":4}` lose its source while the same object with nine more members kept it. */
+        for(i = po->count; i-- > 0; ) {
             if (po->entries[i].atom == key)
                 return &po->entries[i].parse_record;
         }
