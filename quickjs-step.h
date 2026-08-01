@@ -248,4 +248,25 @@ typedef struct JSStepHdr {
    one state. */
 JS_EXTERN int JS_RegisterStepDef(JSRuntime *rt, const JSTrampStepDef *def);
 
+/* WHAT step() RETURNS. A machine reports one of these at every stage, and a host machine reports them for the
+   same reasons the engine's own do. */
+#define JS_STEP_DONE     0   /* the machine is finished; fini yields its result */
+#define JS_STEP_ABRUPT (-1)  /* it threw; the completion value is live in the context */
+#define JS_STEP_REQUEST  6   /* it parked on a sub-sequence's request and will be re-entered with the answer */
+
+/* The machine's own arguments, borrowed. Out-of-range reads undefined, which is what the IDL's optional
+   arguments mean at this level. */
+static inline JSValueConst step_arg(const JSStepHdr *h, int i)
+{
+    return i < h->argc ? h->argv[i] : JS_UNDEFINED;
+}
+
+/* [[Get]] AS A REQUEST — the operation a browser component needs and the reason this header exists. Reading a
+   Web IDL attribute off an object the page supplied is one accessor or Proxy trap away from being the page's
+   code, so it cannot be a JS_GetPropertyStr from C; this parks the machine on the read and answers at the SAME
+   call site when it is re-entered. Returns JS_STEP_REQUEST (the caller returns it), 0 once *pout is set, or -1.
+   `atom` is BORROWED. */
+JS_EXTERN int step_getprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAtom atom, JSValue in,
+                               JSValue *pout, JSValue **out_cb, int *out_argc);
+
 #endif

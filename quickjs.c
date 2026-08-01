@@ -18083,10 +18083,6 @@ static void *tramp_step_state_new(JSContext *ctx, const JSTrampStepDef *sd, JSVa
 /* argv[i] for i >= argc is UNDEFINED. js_call_c_function pads its arg_buf out to the function's declared arity,
    so a C body may read argv[1] of a zero-argument call; a step machine is handed the CALL's real operands, so
    the padding has to happen here or `[].forEach()` reads one slot past the captured vector. */
-static inline JSValueConst step_arg(const JSStepHdr *h, int i)
-{
-    return i < h->argc ? h->argv[i] : JS_UNDEFINED;
-}
 
 /* js_call_c_function switches the CURRENT REALM to the callee's before running a C builtin, and a step machine is
    the same builtin — without this `new otherRealm.Function("")` builds its function, and its prototype, out of
@@ -18182,8 +18178,8 @@ static void step_hdr_request_abandon(JSContext *ctx, JSStepHdr *h)
 }
 
 /* a NAMED key, borrowed from the caller (a permanent atom in every current use). */
-static int step_getprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAtom atom, JSValue in,
-                            JSValue *pout, JSValue **out_cb, int *out_argc)
+int step_getprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAtom atom, JSValue in,
+                     JSValue *pout, JSValue **out_cb, int *out_argc)
 {
     if (h->get_phase == GET_PH_START) {
         JS_FreeValue(ctx, in);
