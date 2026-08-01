@@ -24712,7 +24712,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
 #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_STEP
 #define DUMP_BYTECODE_OR_DONT(pc) \
-    if (check_dump_flag(ctx->rt, JS_DUMP_BYTECODE_STEP)) dump_single_byte_code(ctx, pc, b, 0);
+    do { if (check_dump_flag(ctx->rt, JS_DUMP_BYTECODE_STEP)) dump_single_byte_code(ctx, pc, b, 0); } while (0);
 #else
 #define DUMP_BYTECODE_OR_DONT(pc)
 #endif
@@ -24733,10 +24733,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
            short, and a 255th one a NULL slot (a jump to address 0 on the first corrupt byte). */
     };
     _Static_assert(OP_COUNT == 256, "the dispatch table has exactly one slot per opcode and no tail to fill");
-#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) __extension__ ({ goto *dispatch_table[opcode = *pc++]; });
+/* ONE STATEMENT, always. `BREAK` is written as `if (cond) BREAK;` all over the interpreter, so a macro that
+   expands to a SEQUENCE of statements silently detaches everything after the first one from the `if` — and with
+   ENABLE_DUMPS the per-opcode dump IS a first statement, so `if (cond) BREAK;` became "maybe dump, then always
+   dispatch". Every guarded BREAK in the interpreter fired unconditionally in a dumps build: `typeof x ===
+   "function"` left its OPERAND on the stack and the branch tested that instead, so a plain object took the
+   `function` arm. The production wasm is built with ENABLE_DUMPS and test262 was not, which is why 43239 tests
+   said nothing about it. Wrapping the dispatch in do/while is what makes the macro a statement. */
+#define DISPATCH()      do { DUMP_BYTECODE_OR_DONT(pc) goto *dispatch_table[opcode = *pc++]; } while (0)
+#define SWITCH(pc)      DISPATCH();
 #define CASE(op)        case_ ## op
 #define DEFAULT         case_default
-#define BREAK           SWITCH(pc)
+#define BREAK           DISPATCH()
 #endif
 
     if (js_poll_interrupts(caller_ctx))
