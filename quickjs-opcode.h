@@ -297,6 +297,10 @@ def(scope_delete_var, 7, 0, 1, atom_u16) /* emitted in phase 1, removed in phase
 def( scope_make_ref, 11, 0, 2, atom_label_u16) /* emitted in phase 1, removed in phase 2 */
 def(  scope_get_ref, 7, 0, 2, atom_u16) /* emitted in phase 1, removed in phase 2 */
 def(scope_put_var_init, 7, 0, 2, atom_u16) /* emitted in phase 1, removed in phase 2 */
+/* Store into the VARIABLE environment binding, walking past every object environment (a `with`) between here
+   and it. Annex B.3.2.1 / B.3.3.3 end in `varEnv.SetMutableBinding(F, ...)` -- not a reference resolution -- so
+   the synthesized function var must not be diverted onto a `with` object the declaration happens to sit in. */
+def(scope_put_var_env, 7, 1, 0, atom_u16) /* emitted in phase 1, removed in phase 2 */
 def(scope_get_private_field, 7, 1, 1, atom_u16) /* obj -> value, emitted in phase 1, removed in phase 2 */
 def(scope_get_private_field2, 7, 1, 2, atom_u16) /* obj -> obj value, emitted in phase 1, removed in phase 2 */
 def(scope_put_private_field, 7, 2, 0, atom_u16) /* obj value ->, emitted in phase 1, removed in phase 2 */

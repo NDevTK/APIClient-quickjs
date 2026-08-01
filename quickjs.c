@@ -854,7 +854,7 @@ typedef struct JSClosureVar {
 #define ARG_SCOPE_END (-2)
 
 /* One provisional Annex B.3.2.1 var store: the name it writes, the scope the FunctionDeclaration lives in, and
-   where its OP_scope_put_var sits in the byte code. `bc_pos` is -1 once the store has been patched out. */
+   where its OP_scope_put_var_env sits in the byte code. `bc_pos` is -1 once the store has been patched out. */
 typedef struct JSAnnexBFuncVar {
     JSAtom name;
     int scope_level;
@@ -43194,7 +43194,7 @@ static JSGlobalVar *find_lexical_global_var(JSFunctionDef *fd, JSAtom name)
         return NULL;
 }
 
-/* Record an Annex B var store as PROVISIONAL. `bc_pos` is where its OP_scope_put_var begins. */
+/* Record an Annex B var store as PROVISIONAL. `bc_pos` is where its OP_scope_put_var_env begins. */
 static void annexb_func_var_record(JSParseState *s, JSFunctionDef *fd, JSAtom name, int bc_pos)
 {
     JSAnnexBFuncVar *v;
@@ -43210,7 +43210,7 @@ static void annexb_func_var_record(JSParseState *s, JSFunctionDef *fd, JSAtom na
 /* A lexical declaration of `name` has just been added to `scope_level`. Every provisional Annex B store for that
    name whose FunctionDeclaration lives in a scope this one ENCLOSES loses its condition: the VariableStatement
    replacement would be an Early Error, so B.3.2.1 does not apply. Patch the store out in place — OP_drop plus
-   nops is exactly the seven bytes OP_scope_put_var occupies, and the value the OP_dup above pushed still has to
+   nops is exactly the seven bytes OP_scope_put_var_env occupies, and the value the OP_dup above pushed still has to
    go. */
 static void annexb_func_var_revoke(JSContext *ctx, JSFunctionDef *fd, JSAtom name, int scope_level)
 {
@@ -43224,7 +43224,7 @@ static void annexb_func_var_revoke(JSContext *ctx, JSFunctionDef *fd, JSAtom nam
                 break;
         if (sl != scope_level)
             continue;   /* a sibling scope, not an enclosing one */
-        DCHECK(fd->byte_code.buf[v->bc_pos] == OP_scope_put_var,
+        DCHECK(fd->byte_code.buf[v->bc_pos] == OP_scope_put_var_env,
                "the provisional Annex B store is not where it was recorded");
         JS_FreeAtom(ctx, (JSAtom)get_u32(fd->byte_code.buf + v->bc_pos + 1));
         fd->byte_code.buf[v->bc_pos] = OP_drop;
@@ -53148,6 +53148,16 @@ static int get_closure_var(JSContext *ctx, JSFunctionDef *s,
                            is_const, is_lexical, var_kind);
 }
 
+/* The scope opcode is mapped onto its `with` twin by SUBTRACTION, so the two runs must stay parallel and
+   adjacent. An opcode inserted INSIDE the scope run silently remaps every member after it -- `with(o){var x=1}`
+   then assigns through with_make_ref instead of with_put_var and the byte code no longer balances. Nothing in
+   the build catches that, so state it here. */
+_Static_assert(OP_scope_put_var    - OP_scope_get_var == OP_with_put_var    - OP_with_get_var &&
+               OP_scope_delete_var - OP_scope_get_var == OP_with_delete_var - OP_with_get_var &&
+               OP_scope_make_ref   - OP_scope_get_var == OP_with_make_ref   - OP_with_get_var &&
+               OP_scope_get_ref    - OP_scope_get_var == OP_with_get_ref    - OP_with_get_var,
+               "the scope_xxx and with_xxx opcode runs are no longer parallel");
+
 static int get_with_scope_opcode(int op)
 {
     if (op == OP_scope_get_var_undef)
@@ -53325,10 +53335,15 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
     int label_done;
     JSFunctionDef *fd;
     JSVarDef *vd;
-    bool is_pseudo_var, is_arg_scope, ref_is_const;
+    bool is_pseudo_var, is_arg_scope, ref_is_const, skip_object_env;
 
     label_done = -1;
     ref_is_const = false;
+    /* An Annex B var store names varEnv directly, so the object environments nested inside it are not on its
+       path. Past this point it IS an ordinary put -- only the `with` probes below are suppressed. */
+    skip_object_env = (op == OP_scope_put_var_env);
+    if (skip_object_env)
+        op = OP_scope_put_var;
 
     /* XXX: could be simpler to use a specific function to
        resolve the pseudo variables */
@@ -53357,7 +53372,7 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
             var_idx = idx;
             break;
         } else
-        if (vd->var_name == JS_ATOM__with_ && !is_pseudo_var) {
+        if (vd->var_name == JS_ATOM__with_ && !is_pseudo_var && !skip_object_env) {
             dbuf_putc(bc, OP_get_loc);
             dbuf_put_u16(bc, idx);
             var_object_test(ctx, s, var_name, op, bc, &label_done, 1);
@@ -53556,7 +53571,7 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
                 }
                 var_idx = idx;
                 break;
-            } else if (vd->var_name == JS_ATOM__with_ && !is_pseudo_var) {
+            } else if (vd->var_name == JS_ATOM__with_ && !is_pseudo_var && !skip_object_env) {
                 capture_var(fd, vd);
                 idx = get_closure_var(ctx, s, fd, JS_CLOSURE_LOCAL, idx, vd->var_name, false, false, JS_VAR_NORMAL);
                 if (idx >= 0) {
@@ -53640,7 +53655,7 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
                 goto has_idx;
             } else if ((cv->var_name == JS_ATOM__var_ ||
                         cv->var_name == JS_ATOM__arg_var_ ||
-                        cv->var_name == JS_ATOM__with_) && !is_pseudo_var) {
+                        (cv->var_name == JS_ATOM__with_ && !skip_object_env)) && !is_pseudo_var) {
                 int is_with = (cv->var_name == JS_ATOM__with_);
                 if (fd != s) {
                     idx = get_closure_var(ctx, s, fd,
@@ -54719,6 +54734,7 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
         case OP_scope_get_var_undef:
         case OP_scope_get_var:
         case OP_scope_put_var:
+        case OP_scope_put_var_env:
         case OP_scope_delete_var:
         case OP_scope_get_ref:
         case OP_scope_put_var_init:
@@ -57539,7 +57555,7 @@ done:
                    enclosing block may declare the name lexically LATER, and then the VariableStatement
                    replacement B.3.2.1 tests would be an Early Error. define_var patches it out if that happens. */
                 annexb_func_var_record(s, s->cur_func, func_name, s->cur_func->byte_code.size);
-                emit_op(s, OP_scope_put_var);
+                emit_op(s, OP_scope_put_var_env);
                 emit_atom(s, func_name);
                 emit_u16(s, 0);
             }
