@@ -1296,11 +1296,20 @@ JS_EXTERN int JS_MapDeleteRecord(JSContext *ctx, JSValueConst obj, JSValueConst 
             object and coerces it: 7.1.1 then reads @@toPrimitive/valueOf off the concolic, whose exotic [[Get]]
             answers with another concolic, and the walk CALLS it. `+` and == must ask this before deciding a
             coercion applies — the operand is not an ordinary object and its coercion is the solver's, not the
-            page's. Never a binary know-nothing test: it names the solver's value class, nothing more. */
+            page's. Never a binary know-nothing test: it names the solver's value class, nothing more.
+     - absent: a GLOBAL the page reads and nothing defines. Two different things wear that shape and must not
+            be conflated. A missing WEB API is honestly absent — the page's own ReferenceError is the forcing
+            function naming the component to build — while server-injected APP STATE (window.__FLAGS / __USER /
+            __NEXT_DATA__) is unknown INPUT: the server writes it for a logged-in visitor and did not for this
+            one, so the read is SYMBOLIC and the auth gate FORKS to the logged-in arm. Collapsing it to
+            `undefined` throws on the first field access and buries every endpoint behind it, which is the
+            surface this engine exists to reach.
+            Returns the concolic value, or JS_UNINITIALIZED to leave the read exactly as it was. */
 typedef struct JSConcolicHooks {
     int (*add)(JSContext *ctx, JSValue *sp);
     int (*cmp)(JSContext *ctx, JSValue *sp, int is_neq);
     int (*is)(JSValueConst v);
+    JSValue (*absent)(JSContext *ctx, JSAtom name);
 } JSConcolicHooks;
 JS_EXTERN void JS_SetConcolicHooks(const JSConcolicHooks *hooks);
 

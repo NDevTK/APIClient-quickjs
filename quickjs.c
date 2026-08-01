@@ -37580,6 +37580,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (!wh->base) {
                     /* the GLOBAL record is the last link of the scope chain, so HasBinding's no is final: an
                        unresolvable Reference. There is no enclosing scope to drop a base object for. */
+                    /* WHAT the name is decides the answer. Server-injected app state is unknown INPUT — the
+                       server writes __FLAGS/__USER for a logged-in visitor and did not for this one — so the
+                       read is SYMBOLIC and the auth gate FORKS; `undefined` would throw on the first field
+                       access and bury every endpoint behind it. A web API this engine has not built stays
+                       unresolvable, because its ReferenceError names the component to write. Only a plain
+                       VALUE read asks: `typeof`, `delete` and a Reference are defined on an unresolvable one
+                       and answer without needing to know what it would have held. */
+                    if (wop == OP_get_var && g_concolic.absent) {
+                        JSValue cv = g_concolic.absent(ctx, atom);
+                        if (!JS_IsUninitialized(cv)) {
+                            js_with_has_free(ctx, wh);
+                            *sp++ = cv;
+                            BREAK;
+                        }
+                    }
                     if (wop == OP_get_var_undef || wop == OP_delete_var) {
                         /* 13.5.3 typeof and 13.5.1.2 step 3 delete are DEFINED on an unresolvable Reference,
                            and neither throws for one. */
