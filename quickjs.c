@@ -1090,6 +1090,12 @@ typedef struct JSTypedArray {
 enum {
     FLOW_BASE_BYTECODE = 0,   /* cur_func is a bytecode function; entry/completion use its b (the default) */
     FLOW_BASE_STEP_ROOT,      /* cur_func is a STEP CLOSURE; the flow's whole body is one call handler(arg) */
+    /* cur_func is bytecode, but this state is EMBEDDED IN a JSAsyncFunctionData whose promise its completion
+       settles (js_async_function_call). Entry and completion are BYTECODE's; what differs is ownership, and the
+       one thing that must know is the snapshot FORK — a clone of this base is a bare state with no
+       JSAsyncFunctionData behind it, so its completion has no promise to settle and the original's data is freed
+       from under it. */
+    FLOW_BASE_ASYNC_CALL,
 };
 typedef struct JSAsyncFunctionState {
     JSValue this_val; /* 'this' generator argument */
@@ -39612,6 +39618,15 @@ JSValue *JS_FlowClone(JSContext *ctx, JSValue *flow) {
     /* A flow is SUSPENDED iff a base frame saved cur_sp OR a deep chain is stashed in tramp_top (a deep
        suspend leaves the BASE cur_sp NULL — its live point is in the chain, not the base). */
     DCHECK(sf->cur_sp != NULL || s->tramp_top != NULL, "JS_FlowClone: flow is not SUSPENDED (only a paused frame can be snapshot-forked)");
+    /* A MODULE BODY (and any async function entered from C rather than through the interpreter) runs as its own
+       flow base owned by a JSAsyncFunctionData. Cloning that base produces a state with no data behind it: the
+       sibling's completion has no promise to settle and the original's data is freed while the clone still reads
+       it — which is heap corruption, not a missing feature, so it crashes here rather than there. The fix is not
+       a clone variant: the body must run ON THE FLOW'S CHAIN like every other async activation
+       (do_async_tramp_call), so a fork sees an ordinary nested frame and the promise stays with its owner. */
+    DCHECK(s->base_kind != FLOW_BASE_ASYNC_CALL,
+           "a flow forked inside an async body entered from C (a module evaluation) — route that body through "
+           "the trampoline so the fork clones a nested activation, not a promise's own state");
     if (s->tramp_top != NULL) return clone_deep_flow(ctx, s);   /* deep: base + tramp chain */
     /* Captured-local cells are CLOSED heap cells now (V8 Context model) — the clone SHARES them (one COW-
        swappable cell per captured var, isolated per-flow by the delta) and takes its own ownership ref. */
@@ -40174,6 +40189,7 @@ static JSValue js_async_function_call(JSContext *ctx, JSValueConst func_obj,
         return JS_EXCEPTION;
     }
     s->is_active = true;
+    s->func_state.base_kind = FLOW_BASE_ASYNC_CALL;   /* this state belongs to `s`, and a fork must say so */
 
     /* Run the body AS A FLOW: a loop/await PARKS at a back-edge and re-enters via the job pump — never driven to
        completion (that resume is DELETED). This is the only caller path for module bodies (js_execute_sync_module /
@@ -51706,6 +51722,7 @@ static int js_execute_async_module(JSContext *ctx, JSModuleDef *m);
 static int js_execute_sync_module(JSContext *ctx, JSModuleDef *m,
                                   JSValue *pvalue);
 static void js_promise_set_handled(JSContext *ctx, JSValueConst promise);
+static void js_module_eval_capture(JSContext *ctx, JSModuleDef *m);
 
 static JSValue js_async_module_execution_rejected(JSContext *ctx, JSValueConst this_val,
                                                   int argc, JSValueConst *argv, int magic,
@@ -51718,6 +51735,7 @@ static JSValue js_async_module_execution_rejected(JSContext *ctx, JSValueConst t
     if (js_check_stack_overflow(ctx->rt, 0))
         return JS_ThrowStackOverflow(ctx);
 
+    js_module_eval_capture(ctx, module);   /* this reaction is a WRITE to the module's evaluation state */
     if (module->status == JS_MODULE_STATUS_EVALUATED) {
         assert(module->eval_has_exception);
         return JS_UNDEFINED;
@@ -51760,6 +51778,7 @@ static JSValue js_async_module_execution_fulfilled(JSContext *ctx, JSValueConst 
     ExecModuleList exec_list_s, *exec_list = &exec_list_s;
     int i;
 
+    js_module_eval_capture(ctx, module);   /* this reaction is a WRITE to the module's evaluation state */
     if (module->status == JS_MODULE_STATUS_EVALUATED) {
         assert(module->eval_has_exception);
         return JS_UNDEFINED;
@@ -51973,6 +51992,7 @@ static int js_module_eval_enter(JSContext *ctx, JSModuleDef *m, int index, JSMod
 {
     *pdid = 0;
     *pvalue = JS_UNDEFINED;
+    js_module_eval_capture(ctx, m);   /* the status this reads is per-flow, so capture precedes the read */
 #ifdef ENABLE_DUMPS // JS_DUMP_MODULE_RESOLVE
     if (check_dump_flag(ctx->rt, JS_DUMP_MODULE_RESOLVE)) {
         char buf1[ATOM_GET_STR_BUF_SIZE];
@@ -52060,11 +52080,123 @@ static int js_inner_module_evaluation(JSContext *ctx, JSModuleDef *m,
 
 /* Run the <eval> function of the module and of all its requested
    modules. Return a promise or an exception. */
+/* THE MODULE'S EVALUATION STATE, as one owned blob — the module twin of JS_AsyncStateSave, and for the same
+   reason: it is shared baseline state that a flow WRITES, through fields no property hook can see. These are
+   exactly 16.2.1.5.3's per-evaluation fields (the struct already groups them under "temp use during
+   js_module_evaluate") plus the capability and the status they drive. The module's BINDINGS need nothing here —
+   they are closure cells and cell_write already captures them; what was missing is the state that decides
+   whether a flow evaluates AT ALL. */
+typedef struct JSModuleEvalState {
+    JSModuleStatus status;
+    int dfs_index, dfs_ancestor_index;
+    JSModuleDef *stack_prev;
+    int pending_async_dependencies;
+    bool async_evaluation;
+    int64_t async_evaluation_timestamp;
+    JSModuleDef *cycle_root;
+    bool eval_has_exception;
+    JSValue promise;
+    JSValue resolving_funcs[2];
+    JSValue eval_exception;
+} JSModuleEvalState;
+
+void *JS_ModuleEvalStateSave(JSContext *ctx, void *mod)
+{
+    JSModuleDef *m = mod;
+    JSModuleEvalState *b = js_malloc(ctx, sizeof(*b));
+    if (!b)
+        return NULL;
+    /* A module with async PARENTS is mid-flight in a top-level-await graph, and that list is a heap array whose
+       ownership this blob does not take — restoring a stale one would hand two owners the same array. No flow
+       has reached that shape yet; when one does, the array joins the blob. */
+    DCHECK(m->async_parent_modules_count == 0,
+           "a module's evaluation state is being captured while it has async parents — the parent list must "
+           "join the blob before a top-level-await graph can time-travel");
+    b->status = m->status;
+    b->dfs_index = m->dfs_index;
+    b->dfs_ancestor_index = m->dfs_ancestor_index;
+    b->stack_prev = m->stack_prev;
+    b->pending_async_dependencies = m->pending_async_dependencies;
+    b->async_evaluation = m->async_evaluation;
+    b->async_evaluation_timestamp = m->async_evaluation_timestamp;
+    b->cycle_root = m->cycle_root;
+    b->eval_has_exception = m->eval_has_exception;
+    b->promise = js_dup(m->promise);
+    b->resolving_funcs[0] = js_dup(m->resolving_funcs[0]);
+    b->resolving_funcs[1] = js_dup(m->resolving_funcs[1]);
+    b->eval_exception = js_dup(m->eval_exception);
+    return b;
+}
+
+void JS_ModuleEvalStateRestore(JSContext *ctx, void *mod, void *blob)
+{
+    JSModuleDef *m = mod;
+    JSModuleEvalState *b = blob;
+    if (!b)
+        return;
+    JS_FreeValue(ctx, m->promise);
+    JS_FreeValue(ctx, m->resolving_funcs[0]);
+    JS_FreeValue(ctx, m->resolving_funcs[1]);
+    JS_FreeValue(ctx, m->eval_exception);
+    m->status = b->status;
+    m->dfs_index = b->dfs_index;
+    m->dfs_ancestor_index = b->dfs_ancestor_index;
+    m->stack_prev = b->stack_prev;
+    m->pending_async_dependencies = b->pending_async_dependencies;
+    m->async_evaluation = b->async_evaluation;
+    m->async_evaluation_timestamp = b->async_evaluation_timestamp;
+    m->cycle_root = b->cycle_root;
+    m->eval_has_exception = b->eval_has_exception;
+    m->promise = js_dup(b->promise);
+    m->resolving_funcs[0] = js_dup(b->resolving_funcs[0]);
+    m->resolving_funcs[1] = js_dup(b->resolving_funcs[1]);
+    m->eval_exception = js_dup(b->eval_exception);
+}
+
+void *JS_ModuleEvalStateClone(JSContext *ctx, void *blob)
+{
+    JSModuleEvalState *b = blob, *c;
+    if (!b)
+        return NULL;
+    c = js_malloc(ctx, sizeof(*c));
+    if (!c)
+        return NULL;
+    *c = *b;
+    c->promise = js_dup(b->promise);
+    c->resolving_funcs[0] = js_dup(b->resolving_funcs[0]);
+    c->resolving_funcs[1] = js_dup(b->resolving_funcs[1]);
+    c->eval_exception = js_dup(b->eval_exception);
+    return c;
+}
+
+void JS_ModuleEvalStateFree(JSRuntime *rt, void *blob)
+{
+    JSModuleEvalState *b = blob;
+    if (!b)
+        return;
+    JS_FreeValueRT(rt, b->promise);
+    JS_FreeValueRT(rt, b->resolving_funcs[0]);
+    JS_FreeValueRT(rt, b->resolving_funcs[1]);
+    JS_FreeValueRT(rt, b->eval_exception);
+    js_free_rt(rt, b);
+}
+
+/* Announce that this flow is about to change `m`'s evaluation state. Fired at every point that writes one of the
+   captured fields; the host captures the FIRST one per flow and ignores the rest. */
+static void js_module_eval_capture(JSContext *ctx, JSModuleDef *m)
+{
+    if (g_time_travel.module_eval)
+        g_time_travel.module_eval(ctx, m);
+}
+
 static JSValue js_evaluate_module(JSContext *ctx, JSModuleDef *m)
 {
     JSModuleDef *m1, *stack_top;
     JSValue ret_val, result;
 
+    /* BEFORE the status is even READ: whether this flow evaluates at all is decided by state a sibling may have
+       written, so the capture has to precede the test, not the write. */
+    js_module_eval_capture(ctx, m);
     assert(m->status == JS_MODULE_STATUS_LINKED ||
            m->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
            m->status == JS_MODULE_STATUS_EVALUATED);

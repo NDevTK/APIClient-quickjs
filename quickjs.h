@@ -1244,7 +1244,20 @@ typedef struct JSTimeTravelHooks {
        delta; the swap restores it. Two classes, one hook, because "the settlement state of this shared async
        object" is one concept and which internal slots that means is the engine's business. */
     void (*async_settle)(JSContext *ctx, JSValueConst obj);
+    /* Before a flow changes a MODULE's evaluation state (16.2.1.5.3's status/capability/cycle fields). A
+       module's BINDINGS are closure cells and already ride the delta through cell_write, but its evaluation
+       state did not — so the first flow to evaluate a module left the record EVALUATED for every sibling, and a
+       sibling that forked before the import skipped evaluation and read the exports it never wrote: TDZ
+       (`region is not initialized`) instead of its own values. Under forced multi-path execution each flow is a
+       possible world and each world evaluates the module once, so the state is per-flow like every other write.
+       `m` is an opaque JSModuleDef*; JS_ModuleEvalStateSave/Restore is what "that state" means. */
+    void (*module_eval)(JSContext *ctx, void *m);
 } JSTimeTravelHooks;
+/* The evaluation state of a module record, as an opaque owned blob — the module twin of JS_AsyncStateSave. */
+JS_EXTERN void *JS_ModuleEvalStateSave(JSContext *ctx, void *m);
+JS_EXTERN void  JS_ModuleEvalStateRestore(JSContext *ctx, void *m, void *blob);
+JS_EXTERN void *JS_ModuleEvalStateClone(JSContext *ctx, void *blob);
+JS_EXTERN void  JS_ModuleEvalStateFree(JSRuntime *rt, void *blob);
 /* The settlement state of a promise (state + result + the pending reaction records) or of a resolving-function
    pair (its already_resolved latch), as an opaque owned blob. NULL for an object that has neither. Restore
    puts it back exactly, so a flow's timeline is reproduced rather than replayed. */
