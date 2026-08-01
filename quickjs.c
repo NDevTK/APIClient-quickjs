@@ -9834,9 +9834,19 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
     }
     if (unlikely(throw_ref_error)) {
         return JS_ThrowReferenceErrorNotDefined(ctx, prop);
-    } else {
-        return JS_UNDEFINED;
     }
+    /* A miss ON THE GLOBAL OBJECT is the same question a bare unresolved name asks, reached through `window.`
+       instead. Server-injected app state is written onto the global, so `window.__FLAGS` and `__FLAGS` are one
+       read spelled two ways — and every real bundle spells it the first way. Answering undefined here would
+       throw on the first field access and bury the gated surface exactly as it did before the hook existed.
+       Only the global: any other object's missing property is genuinely undefined. */
+    if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT &&
+        JS_VALUE_GET_OBJ(obj) == JS_VALUE_GET_OBJ(ctx->global_obj) && g_concolic.absent) {
+        JSValue a = g_concolic.absent(ctx, prop);
+        if (!JS_IsUninitialized(a))
+            return a;
+    }
+    return JS_UNDEFINED;
 }
 
 JSValue JS_GetProperty(JSContext *ctx, JSValueConst this_obj, JSAtom prop)
@@ -35434,7 +35444,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         }
                         p = p->shape->proto;
                         if (!p) {
+                            /* The chain is exhausted. A miss ON THE GLOBAL OBJECT is the same question a
+                               bare unresolved name asks, reached through `window.` instead: server-injected app
+                               state is written onto the global, so `window.__FLAGS` and `__FLAGS` are one read
+                               spelled two ways and every real bundle spells it the first way. This opcode
+                               answers its own misses instead of calling the generic walk, so the question has to
+                               be asked here too or the two spellings disagree. */
                             val = JS_UNDEFINED;
+                            if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT &&
+                                JS_VALUE_GET_OBJ(obj) == JS_VALUE_GET_OBJ(ctx->global_obj) &&
+                                g_concolic.absent) {
+                                JSValue a_ = g_concolic.absent(ctx, atom);
+                                if (!JS_IsUninitialized(a_)) val = a_;
+                            }
                             break;
                         }
                     }
@@ -35509,7 +35531,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         }
                         p = p->shape->proto;
                         if (!p) {
+                            /* The chain is exhausted. A miss ON THE GLOBAL OBJECT is the same question a
+                               bare unresolved name asks, reached through `window.` instead: server-injected app
+                               state is written onto the global, so `window.__FLAGS` and `__FLAGS` are one read
+                               spelled two ways and every real bundle spells it the first way. This opcode
+                               answers its own misses instead of calling the generic walk, so the question has to
+                               be asked here too or the two spellings disagree. */
                             val = JS_UNDEFINED;
+                            if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT &&
+                                JS_VALUE_GET_OBJ(obj) == JS_VALUE_GET_OBJ(ctx->global_obj) &&
+                                g_concolic.absent) {
+                                JSValue a_ = g_concolic.absent(ctx, atom);
+                                if (!JS_IsUninitialized(a_)) val = a_;
+                            }
                             break;
                         }
                     }
