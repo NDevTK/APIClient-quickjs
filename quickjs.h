@@ -1163,6 +1163,10 @@ typedef enum JSPromiseHookType {
 typedef void JSPromiseHook(JSContext *ctx, JSPromiseHookType type,
                            JSValueConst promise, JSValueConst parent_promise,
                            void *opaque);
+/* Enqueue `func(arg)` as a JOB that runs as a CALL-ROOT FLOW — the platform's route from a host edge to a page
+   callback (an event listener, a timer). Not a JS_Call: the callback is the page's code and must be able to
+   loop, await and fork, which a C activation cannot host. */
+JS_EXTERN void JS_EnqueueCallJob(JSContext *ctx, JSValueConst func, JSValueConst arg);
 JS_EXTERN void JS_SetPromiseHook(JSRuntime *rt, JSPromiseHook promise_hook,
                                  void *opaque);
 
@@ -1303,6 +1307,10 @@ JS_EXTERN void *JS_GetObjGenData(JSValueConst genobj);
 JS_EXTERN void  JS_GenDataRef(void *gd);
 JS_EXTERN void  JS_GenDataUnref(JSContext *ctx, void *gd);
 /* A closure cell is opaque here (JSVarRef is engine-internal); the host reads/writes its value via these. */
+/* A captured closure cell is OWNED by whoever holds its pointer across time — a COW delta restores cells on
+   every context switch, and the cell's own frames may be long gone by then. */
+JS_EXTERN void    JS_VarRefRef(void *cell);
+JS_EXTERN void    JS_VarRefUnref(JSContext *ctx, void *cell);
 JS_EXTERN JSValue JS_VarRefGetValue(void *cell);
 JS_EXTERN void    JS_VarRefSetValue(JSContext *ctx, void *cell, JSValue val);
 /* Per-flow Set/Map COW: manipulate a Set/Map's internal record directly (bypassing any JS-level method override),

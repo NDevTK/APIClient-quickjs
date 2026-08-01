@@ -17695,6 +17695,25 @@ static JSVarRef *get_var_ref(JSContext *ctx, JSStackFrame *sf, int var_idx,
 
 /* forced-exec COW closure-cell accessors — cow.c reads/writes a shared JSVarRef's value through these (the
    type is engine-internal). Get returns an OWNED dup (caller frees); Set consumes val. */
+/* THE DELTA OWNS THE CELLS IT CAPTURED. A closure cell is refcounted and freed by close_var_refs the moment its
+   last frame and closure let go — and a COW delta holds cells by POINTER, to restore them on every context
+   switch. It used to hold them on the ASSUMPTION that "the shared function object keeps the cell alive", which
+   is true only while that function is alive: a listener's closure dies when its reaction flow completes, and the
+   next swap of a delta that captured one of its cells read freed memory (ASan: heap-use-after-free on a cell
+   freed by close_var_refs). An ownership assumption that is not a reference is a bug waiting for a lifetime to
+   get shorter, and the event loop is what shortened it. */
+void JS_VarRefRef(void *vref)
+{
+    DCHECK(vref != NULL, "JS_VarRefRef of no cell");
+    JS_REF_COUNT((JSVarRef *)vref)++;
+}
+
+void JS_VarRefUnref(JSContext *ctx, void *vref)
+{
+    DCHECK(vref != NULL, "JS_VarRefUnref of no cell");
+    free_var_ref(ctx->rt, (JSVarRef *)vref);
+}
+
 JSValue JS_VarRefGetValue(void *vref) { return js_dup(*((JSVarRef *)vref)->pvalue); }
 void JS_VarRefSetValue(JSContext *ctx, void *vref, JSValue val) { set_value(ctx, ((JSVarRef *)vref)->pvalue, val); }
 
@@ -87070,6 +87089,22 @@ static JSValue promise_reaction_job(JSContext *ctx, int argc,
     JS_FreeValue(ctx, res);
 
     return res2;
+}
+
+/* ENQUEUE A CALL OF `func(arg)` AS A JOB. The host edges need a route from C to a page callback that is not a
+   JS_Call: a listener body holds loops, awaits and concolic branches, so running it inside a C activation is the
+   drive-to-completion the engine aborts on. A promise reaction is already exactly "call this handler as a
+   call-root flow, later", so this is that job with no capability to settle — the reaction machinery, named for
+   what the platform actually needs it for. */
+void JS_EnqueueCallJob(JSContext *ctx, JSValueConst func, JSValueConst arg)
+{
+    JSValueConst args[5];
+    args[0] = JS_UNDEFINED;   /* no derived promise: nothing settles when the callback returns */
+    args[1] = JS_UNDEFINED;
+    args[2] = func;
+    args[3] = JS_FALSE;
+    args[4] = arg;
+    JS_EnqueueJob(ctx, promise_reaction_job, 5, args);
 }
 
 void JS_SetPromiseHook(JSRuntime *rt, JSPromiseHook promise_hook, void *opaque)
