@@ -39174,6 +39174,8 @@ JSValue JS_FlowEvalModule(JSContext *ctx, const char *src, size_t len, const cha
 }
 
 static JSAsyncFunctionData *flow_async_data(JSAsyncFunctionState *s);
+static int  flow_reaction_complete(JSContext *ctx, JSAsyncFunctionState *s, JSValue res);
+static void flow_reaction_free(JSContext *ctx, JSAsyncFunctionState *s);
 
 int JS_FlowResume(JSContext *ctx, JSValue *flow, JSValue *pres) {
     JSAsyncFunctionState *s = (JSAsyncFunctionState *)flow;
@@ -39225,6 +39227,25 @@ int JS_FlowResume(JSContext *ctx, JSValue *flow, JSValue *pres) {
             }
         }
         return 0;   /* completed: the promise this base owed is settled on THIS flow's timeline */
+    }
+    /* A CALL-ROOT (promise reaction) BASE OWES ITS DERIVED PROMISE. reaction_flow_step holds that settlement in
+       C across the handler's body — and the body can FORK, so the sibling's base is a clone whose settle nobody
+       runs: `p.then(h).then(g)` reached g in the arm that finished inside reaction_flow_step and in no other.
+       The settle is PHASE 1 of the same flow, so completing the handler hands the flow back to the scheduler
+       with one more thing to run rather than calling the resolving function from here — a capability's resolve
+       is page code, and it belongs on a flow like everything else. */
+    if (s->base_kind == FLOW_BASE_STEP_ROOT) {
+        JSValue r;
+        g_flow_base_gen = s;
+        s->throw_flag = false;   /* a preempt-resume is a continuation, never a re-throw */
+        r = async_func_resume(ctx, s);
+        if (nested) g_flow_base_gen = outer_base;
+        *pres = JS_UNDEFINED;
+        if (s->frame.cur_sp != NULL || s->tramp_top != NULL) {
+            JS_FreeValue(ctx, r);
+            return 1;   /* suspended: the scheduler resumes it with its COW delta swapped back in */
+        }
+        return flow_reaction_complete(ctx, s, r);
     }
     for (;;) {
         g_flow_base_gen = s;   /* this is the flow's BASE activation — a branch here may snapshot-fork; a branch
@@ -39278,6 +39299,10 @@ void JS_FlowFree(JSContext *ctx, JSValue *flow) {
         if (s->frame.cur_sp == NULL && s->tramp_top == NULL)
             d->is_active = false;   /* completed via `done:`, which already released the frame's contents */
         js_async_function_free(ctx->rt, d);
+        return;
+    }
+    if (s->base_kind == FLOW_BASE_STEP_ROOT) {
+        flow_reaction_free(ctx, s);
         return;
     }
     if (s->frame.cur_sp != NULL) {
@@ -39344,6 +39369,17 @@ static JSValue *tramp_buf_base(TrampFrame *t) {
     return (t->async_data || t->gen_data) ? tramp_live_sf(t)->arg_buf : t->local_buf;
 }
 
+/* A STEP_ROOT base is EMBEDDED in the JSReactionFlow that holds the DERIVED PROMISE its completion settles. The
+   four operations live next to that struct (container_of needs the complete type) and are declared here because
+   the flow API — clone, resume, free — is what needs them. */
+typedef struct JSReactionFlow JSReactionFlow;
+static JSAsyncFunctionState *flow_reaction_clone_alloc(JSContext *ctx, JSAsyncFunctionState *src);
+static void flow_reaction_shell_free(JSContext *ctx, JSAsyncFunctionState *c);
+/* The handler body finished: settle the derived promise. Returns 1 when the flow has MORE to run (the settle is
+   phase 1 of the same flow, so the scheduler resumes it once more), 0 when it is finished. `res` is consumed. */
+static int flow_reaction_complete(JSContext *ctx, JSAsyncFunctionState *s, JSValue res);
+static void flow_reaction_free(JSContext *ctx, JSAsyncFunctionState *s);
+
 /* An ASYNC_CALL base is EMBEDDED in the JSAsyncFunctionData that holds the capability its completion settles. */
 static JSAsyncFunctionData *flow_async_data(JSAsyncFunctionState *s)
 {
@@ -39371,6 +39407,9 @@ static JSAsyncFunctionState *flow_clone_state_alloc(JSContext *ctx, JSAsyncFunct
         d->resolving_funcs[1] = js_dup(sd->resolving_funcs[1]);
         d->is_active = true;   /* the frame is filled in by the caller; a failure path releases it through here */
         c = &d->func_state;
+    } else if (src->base_kind == FLOW_BASE_STEP_ROOT) {
+        c = flow_reaction_clone_alloc(ctx, src);
+        if (!c) return NULL;
     } else {
         c = js_mallocz(ctx, sizeof(*c));
         if (!c) return NULL;
@@ -39386,6 +39425,10 @@ static void flow_clone_state_free_shell(JSContext *ctx, JSAsyncFunctionState *c)
         JSAsyncFunctionData *d = flow_async_data(c);
         d->is_active = false;            /* nothing to tear down: the frame was never built */
         js_async_function_free(ctx->rt, d);
+        return;
+    }
+    if (c->base_kind == FLOW_BASE_STEP_ROOT) {
+        flow_reaction_shell_free(ctx, c);
         return;
     }
     js_free(ctx, c);
@@ -86635,6 +86678,59 @@ static int reaction_flow_settle_start(JSContext *ctx, JSReactionFlow *rf, JSValu
     if (reaction_call_flow_init(ctx, &rf->fs, JS_UNDEFINED, func, 1, vc(&res)) < 0) { JS_FreeValue(ctx, res); return -1; }
     JS_FreeValue(ctx, res);
     return 0;
+}
+
+/* THE FLOW API's four operations on a call-root base, defined here because container_of needs the complete type.
+   A promise reaction's derived promise is state the C driver holds ACROSS the handler body, and the body can
+   fork; these are what let a forked sibling carry that state instead of dropping it. */
+static JSAsyncFunctionState *flow_reaction_clone_alloc(JSContext *ctx, JSAsyncFunctionState *src)
+{
+    JSReactionFlow *sr = (JSReactionFlow *)src, *c = js_mallocz(ctx, sizeof(*c));
+    if (!c)
+        return NULL;
+    /* the sibling settles the SAME derived promise, whose settlement the COW delta captures per flow */
+    c->resolve = js_dup(sr->resolve);
+    c->reject = js_dup(sr->reject);
+    c->phase = sr->phase;
+    return &c->fs;
+}
+
+static void flow_reaction_shell_free(JSContext *ctx, JSAsyncFunctionState *c)
+{
+    reaction_flow_free(ctx, (JSReactionFlow *)c);
+}
+
+static int flow_reaction_complete(JSContext *ctx, JSAsyncFunctionState *s, JSValue res)
+{
+    JSReactionFlow *rf = (JSReactionFlow *)s;
+
+    /* COMPLETED via `done:` — that path frees the stack/vars inline but not the frame buffer + cur_func/this */
+    js_free_rt(ctx->rt, rf->fs.frame.arg_buf);
+    JS_FreeValue(ctx, rf->fs.frame.cur_func);
+    JS_FreeValue(ctx, rf->fs.this_val);
+    rf->fs.frame.arg_buf = NULL;
+    rf->fs.frame.cur_func = JS_UNDEFINED;
+    rf->fs.this_val = JS_UNDEFINED;
+    if (rf->phase == 0 && reaction_flow_settle_start(ctx, rf, res) == 0)
+        return 1;   /* PHASE 1 is the same flow: the scheduler resumes it and the resolve runs on this base */
+    if (rf->phase != 0)
+        JS_FreeValue(ctx, res);   /* phase 1: the resolving function's own result is not observable */
+    return 0;
+}
+
+static void flow_reaction_free(JSContext *ctx, JSAsyncFunctionState *s)
+{
+    JSReactionFlow *rf = (JSReactionFlow *)s;
+    if (rf->fs.frame.cur_sp != NULL)
+        async_func_free(ctx->rt, &rf->fs);   /* suspended: full frame cleanup */
+    else if (rf->fs.tramp_top != NULL)
+        DFAIL("freeing a DEEP-suspended reaction flow — free_tramp_chain is not built");
+    else if (rf->fs.frame.arg_buf) {
+        js_free_rt(ctx->rt, rf->fs.frame.arg_buf);
+        JS_FreeValue(ctx, rf->fs.frame.cur_func);
+        JS_FreeValue(ctx, rf->fs.this_val);
+    }
+    reaction_flow_free(ctx, rf);
 }
 
 /* One slice of the handler flow: resume it as its own base; a preempt parks it back into the job pump. */
