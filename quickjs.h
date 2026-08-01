@@ -1254,6 +1254,11 @@ typedef struct JSTimeTravelHooks {
        possible world and each world evaluates the module once, so the state is per-flow like every other write.
        `m` is an opaque JSModuleDef*; JS_ModuleEvalStateSave/Restore is what "that state" means. */
     void (*module_eval)(JSContext *ctx, void *m);
+    /* Before a flow RESUMES a shared suspended async activation — which consumes it. `base_data` is the
+       activation every other arm still finds, `cur_data` a clone this flow owns; the host installs the clone on
+       `closure` for the duration of this flow and records the swap on its delta, exactly as gen_fork does for a
+       generator's execution state. The delta OWNS cur_data (JS_AsyncDataRef/Unref). */
+    void (*async_fork)(JSContext *ctx, JSValueConst closure, void *base_data, void *cur_data);
 } JSTimeTravelHooks;
 /* The evaluation state of a module record, as an opaque owned blob — the module twin of JS_AsyncStateSave. */
 JS_EXTERN void *JS_ModuleEvalStateSave(JSContext *ctx, void *m);
@@ -1273,6 +1278,12 @@ JS_EXTERN void JS_SetFlowLocalMark(int m);
 /* Whether obj was created flow-local. The COW hook consults this: a never-forked flow skips its flow_local
    writes (truly private), but AFTER a fork those objects are shared with the snapshot sibling and must be captured. */
 JS_EXTERN int  JS_IsFlowLocal(JSValueConst obj);
+/* The running flow's FORK GENERATION, set by the scheduler beside its delta, and the test built on it: is this
+   object shared with a sibling (created at or before the last fork) rather than private to this flow? It is the
+   same question the delta asks before capturing a write, asked by the engine where a shared ACTIVATION is about
+   to be consumed. */
+JS_EXTERN void JS_SetFlowForkGen(uint32_t gen);
+JS_EXTERN int  JS_IsFlowShared(JSValueConst obj);
 /* forced-exec generational flow-local marking: JS_ObjFlowGen returns the fork generation an object was created at
    (0 = baseline); JS_FlowGen the current generation; JS_FlowBumpGen increments it (called by the host at a fork).
    An object is flow-PRIVATE to a delta iff JS_ObjFlowGen(obj) > delta's fork generation. */
@@ -1284,6 +1295,9 @@ JS_EXTERN int  JS_ArraySetLength(JSContext *ctx, JSValueConst obj, uint32_t len)
 JS_EXTERN void JS_SetTimeTravelHooks(const JSTimeTravelHooks *hooks);
 /* Per-flow generator-state COW: swap a shared generator object's execution-state pointer and own clones by
    refcount (see JSTimeTravelHooks.gen_fork). The clone is opaque to the host (JSGeneratorData is engine-internal). */
+JS_EXTERN void  JS_SetObjAsyncData(JSValueConst closure, void *ad);
+JS_EXTERN void  JS_AsyncDataRef(void *ad);
+JS_EXTERN void  JS_AsyncDataUnref(JSContext *ctx, void *ad);
 JS_EXTERN void  JS_SetObjGenData(JSValueConst genobj, void *gd);
 JS_EXTERN void *JS_GetObjGenData(JSValueConst genobj);
 JS_EXTERN void  JS_GenDataRef(void *gd);

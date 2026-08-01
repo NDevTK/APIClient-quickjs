@@ -6571,6 +6571,19 @@ int JS_IsFlowLocal(JSValueConst obj) {
     return JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT && JS_VALUE_GET_OBJ(obj)->flow_gen > 0;
 }
 
+/* THE RUNNING FLOW'S FORK GENERATION — the same number its delta uses, kept here so the engine can ask the one
+   question the delta asks: is this object SHARED with a sibling? "flow_local" alone cannot answer it (it only
+   says "not baseline", which is true of every object the run created, forked or not), and the difference is the
+   whole invariant: an object created BEFORE this flow's last fork is shared and its state must diverge; one
+   created after is private and cloning it would be delta bloat. The scheduler sets this whenever it switches a
+   flow in, next to cow_set_current. */
+static _Thread_local uint32_t g_flow_fork_gen = 0;
+void JS_SetFlowForkGen(uint32_t gen) { g_flow_fork_gen = gen; }
+int JS_IsFlowShared(JSValueConst obj) {
+    return JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT &&
+           JS_VALUE_GET_OBJ(obj)->flow_gen <= g_flow_fork_gen;
+}
+
 /* Host COW helper: is this an ARRAY element slot (obj is an array, atom an integer index)? On a hit *idx is the
    index. cow_unapply removes a flow-CREATED array append by TRUNCATING the array to *idx (set_array_length frees
    the tail) instead of JS_DeleteProperty, which would convert the fast array to slow and leave the element. */
@@ -39883,6 +39896,86 @@ static void js_generator_finalizer(JSRuntime *rt, JSValueConst obj)
     }
 }
 
+/* CLONE A SUSPENDED ASYNC ACTIVATION. `await p` parks the whole thing — the heap frame, its argument/local/stack
+   block, and the capability its completion settles — in a JSAsyncFunctionData the promise's reaction records
+   reach through a resolve/reject closure pair. That activation is FLOW state: when two arms settle one promise
+   (which they do the moment a fork inherits a pending reply), both resume it, and the first arm's completion
+   tears the frame down under the second. The capability is SHARED and not re-minted — it is the async function's
+   own promise, whose settlement the delta already isolates per flow. */
+static JSAsyncFunctionData *js_async_frame_clone(JSContext *ctx, JSAsyncFunctionData *s)
+{
+    JSStackFrame *sf = &s->func_state.frame, *cf;
+    JSAsyncFunctionData *d;
+    JSObject *fp;
+    JSFunctionBytecode *b;
+    int al, lc;
+    ptrdiff_t live;
+
+    DCHECK(s->is_active, "cloning an async activation that has already been torn down");
+    DCHECK(sf->cur_sp != NULL, "cloning an async activation that is not suspended — an awaiting one always is");
+    DCHECK(s->func_state.tramp_top == NULL,
+           "an awaiting activation with a live tramp chain — an await suspends at the base, not mid-descent");
+    fp = JS_VALUE_GET_OBJ(sf->cur_func);
+    DCHECK(js_class_has_bytecode(fp->class_id), "an async continuation whose cur_func has no bytecode");
+    b = fp->u.func.function_bytecode;
+    al = sf->arg_count;
+    lc = al + b->var_count + b->stack_size;
+    live = sf->cur_sp - sf->arg_buf;
+
+    d = js_mallocz(ctx, sizeof(*d));
+    if (!d)
+        return NULL;
+    JS_REF_COUNT(d) = 1;
+    add_gc_object(ctx->rt, &d->header, JS_GC_OBJ_TYPE_ASYNC_FUNCTION);
+    d->resolving_funcs[0] = js_dup(s->resolving_funcs[0]);
+    d->resolving_funcs[1] = js_dup(s->resolving_funcs[1]);
+    cf = &d->func_state.frame;
+    cf->arg_buf = js_malloc(ctx, sizeof(JSValue) * (lc > 0 ? lc : 1) + sizeof(JSVarRef *) * b->var_ref_count);
+    if (!cf->arg_buf) {
+        d->is_active = false;
+        js_async_function_free(ctx->rt, d);
+        return NULL;
+    }
+    for (ptrdiff_t i = 0; i < live; i++)
+        cf->arg_buf[i] = js_dup(sf->arg_buf[i]);
+    cf->is_strict_mode = sf->is_strict_mode;
+    cf->cur_func = js_dup(sf->cur_func);
+    cf->arg_count = al;
+    cf->var_buf = cf->arg_buf + al;
+    cf->var_refs = (JSVarRef **)(cf->arg_buf + lc);
+    cf->var_ref_count = sf->var_ref_count;   /* closed cells are shared and isolated by the delta */
+    for (int vi = 0; vi < sf->var_ref_count; vi++) {
+        cf->var_refs[vi] = sf->var_refs[vi];
+        if (cf->var_refs[vi]) JS_REF_COUNT(cf->var_refs[vi])++;
+    }
+    cf->cur_pc = sf->cur_pc;
+    cf->cur_sp = cf->arg_buf + live;
+    cf->prev_frame = NULL;
+    d->func_state.this_val = js_dup(s->func_state.this_val);
+    d->func_state.argc = s->func_state.argc;
+    d->func_state.throw_flag = s->func_state.throw_flag;
+    d->func_state.base_kind = s->func_state.base_kind;
+    d->func_state.tramp_top = NULL;
+    d->is_active = true;
+    return d;
+}
+
+/* The per-flow ASYNC-activation swap, the exact twin of the generator one below: the resolve/reject CLOSURE is
+   shared across a fork, and the host swaps which activation it names while each flow runs. */
+void JS_SetObjAsyncData(JSValueConst closure, void *ad) {
+    JSObject *p = JS_VALUE_GET_OBJ(closure);
+    DCHECK(p->class_id == JS_CLASS_ASYNC_FUNCTION_RESOLVE || p->class_id == JS_CLASS_ASYNC_FUNCTION_REJECT,
+           "JS_SetObjAsyncData: not an async resolve/reject closure");
+    p->u.async_function_data = (JSAsyncFunctionData *)ad;
+}
+void JS_AsyncDataRef(void *ad) {
+    JS_REF_COUNT((JSAsyncFunctionData *)ad)++;
+}
+void JS_AsyncDataUnref(JSContext *ctx, void *ad) {
+    js_async_function_free(ctx->rt, (JSAsyncFunctionData *)ad);
+    (void)ctx;
+}
+
 /* Per-flow generator-state COW (see JSGeneratorData.cow_ref). The generator object is shared across a concolic
    fork; these let the host swap its u.generator_data pointer per flow and own the clones by refcount. */
 void JS_SetObjGenData(JSValueConst genobj, void *gd) {
@@ -40336,19 +40429,26 @@ static JSValue js_async_function_resolve_call(JSContext *ctx,
     bool is_reject = p->class_id - JS_CLASS_ASYNC_FUNCTION_RESOLVE;
     JSValueConst arg;
 
-    /* A SUSPENDED ASYNC FRAME IS PER-FLOW STATE AND DOES NOT RIDE THE COW DELTA YET. `await p` on a promise
-       created before a fork leaves one continuation reachable from BOTH arms: each arm settles the promise on
-       its own timeline (async_state captures that), and each then resumes THIS state — but the first arm's
-       completion terminates it, so the second dereferences a frame whose cur_func has been freed. Found by
-       localising a "non-bytecode cur_func" abort down to an ASYNC_CALL base, which is what a torn-down frame
-       looks like from the resume side.
-       The build is the one CLAUDE.md names: the continuation, its frame and its resolve/reject capability
-       belong to the FLOW, so a fork has to clone them the way it clones a generator's execution state
-       (JSTimeTravelHooks.gen_fork) rather than sharing one. Until that exists this crashes HERE, where the
-       second resume happens, instead of inside the freed frame. */
+    /* A SUSPENDED ASYNC ACTIVATION IS PER-FLOW STATE, and this is where it diverges. Resuming it CONSUMES it —
+       the completion tears the frame down — so a flow about to resume a SHARED one takes its own clone first and
+       leaves the original as the baseline every other arm still finds. Two arms settle one promise as a matter
+       of course now: a fork inherits the replies still in flight, so both deliver the same fetch on their own
+       timelines. Without this the first arm's completion freed the frame under the second.
+       The generational test is the same one every other capture uses: an activation created after this flow's
+       last fork is private and needs no clone. */
+    if (g_time_travel.async_fork && s && s->is_active && JS_IsFlowShared(func_obj)) {
+        JSAsyncFunctionData *c = js_async_frame_clone(ctx, s);
+        if (unlikely(!c))
+            return JS_EXCEPTION;
+        /* The host installs `c` and keeps `s` as the baseline — or DECLINES (no delta owns the swap, so there
+           is no sibling to isolate from and nothing to undo it). Either way the closure is the authority on
+           which activation this flow resumes, so it is re-read rather than assumed. */
+        g_time_travel.async_fork(ctx, func_obj, s, c);
+        s = p->u.async_function_data;
+    }
     DCHECK(s->is_active,
-           "two flows resumed ONE suspended async continuation — the first consumed it. A suspended async frame "
-           "is per-flow state: fork it onto the arm's COW delta the way a generator's state is forked");
+           "a flow resumed a suspended async continuation that was already consumed — the per-flow activation "
+           "swap did not isolate it");
 
     if (argc > 0)
         arg = argv[0];
