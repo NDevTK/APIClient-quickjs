@@ -15815,6 +15815,16 @@ static no_inline __exception int js_unary_arith_slow(JSContext *ctx,
     JSBigIntBuf buf1;
     JSBigInt *p1;
 
+    /* forced-exec: unknown external input has a concolic RESULT here, computed by the operator, because the
+       conversion boundary below owes C a real number and must never be handed one. */
+    if (g_concolic.arith) {
+        int cop = op == OP_neg ? JS_CARITH_NEG : op == OP_plus ? JS_CARITH_PLUS
+                : op == OP_not ? JS_CARITH_NOT : op == OP_inc ? JS_CARITH_INC
+                : op == OP_dec ? JS_CARITH_DEC : -1;
+        if (cop >= 0 && g_concolic.arith(ctx, sp, cop, 1))
+            return 0;
+    }
+
     op1 = sp[-1];
     /* fast path for float64 */
     if (JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(op1)))
@@ -15966,6 +15976,11 @@ static no_inline int js_not_slow(JSContext *ctx, JSValue *sp)
 {
     JSValue op1;
 
+    /* the unary-arithmetic rule: `~x` over unknown external input has a concolic result, computed here, because
+       the conversion below owes C a real number. */
+    if (g_concolic.arith && g_concolic.arith(ctx, sp, JS_CARITH_NOT, 1))
+        return 0;
+
     op1 = sp[-1];
     op1 = JS_ToNumericFree(ctx, op1);
     if (JS_IsException(op1))
@@ -15997,6 +16012,15 @@ static no_inline __exception int js_binary_arith_slow(JSContext *ctx, JSValue *s
     JSValue op1, op2;
     uint32_t tag1, tag2;
     double d1, d2;
+
+    /* the unary path's rule, for two operands. */
+    if (g_concolic.arith) {
+        int cop = op == OP_sub ? JS_CARITH_SUB : op == OP_mul ? JS_CARITH_MUL
+                : op == OP_div ? JS_CARITH_DIV : op == OP_mod ? JS_CARITH_MOD
+                : op == OP_pow ? JS_CARITH_POW : -1;
+        if (cop >= 0 && g_concolic.arith(ctx, sp, cop, 2))
+            return 0;
+    }
 
     op1 = sp[-2];
     op2 = sp[-1];
@@ -75812,6 +75836,20 @@ static int js_num_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
     /* stage 1 = the value is computed and parked on the state; only the wrapper's prototype read is left */
     if (s->hdr.stage == 1)
         goto made_value;
+    /* 21.1.1.1 over UNKNOWN INPUT: Number(x) of unknown external input is unknown, source kept — the operator
+       answers, because the ToNumber boundary owes C a real number. `new Number(x)` is a wrapper and is not this
+       case. The derived value IS the number-hint coercion, so .arith's identity operator is what names it. */
+    if (!s->coerced && s->hdr.argc > 0 && JS_IsUndefined(nt) &&
+        g_concolic.arith && g_concolic.is && g_concolic.is(arg)) {
+        JSValue slot[1];
+        slot[0] = JS_DupValue(ctx, arg);
+        if (g_concolic.arith(ctx, slot + 1, JS_CARITH_PLUS, 1)) {
+            JS_FreeValue(ctx, cb_result);
+            s->result = slot[0];
+            return 0;
+        }
+        JS_FreeValue(ctx, slot[0]);
+    }
     if (!s->coerced && s->hdr.argc > 0 && JS_VALUE_GET_TAG(arg) == JS_TAG_OBJECT) {
         s->coerced = 1;
         s->cb[0] = (JSValue)arg;   /* borrowed: hdr.argv holds the reference */
@@ -76268,6 +76306,19 @@ static int js_str_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
     /* stage 1 = the string is computed and parked on the state; only the wrapper's prototype read is left */
     if (s->hdr.stage == 1)
         goto made_value;
+    /* 22.1.1.1 over UNKNOWN INPUT: String(x) of unknown external input is unknown, with the source kept — the
+       operator answers, because the ToString boundary below owes C a real string. `new String(x)` is a wrapper
+       object and is not this case. */
+    if (!s->coerced && JS_IsUndefined(nt) && g_concolic.to_str && g_concolic.is && g_concolic.is(arg)) {
+        JSValue c = g_concolic.to_str(ctx, arg);
+        if (!JS_IsUninitialized(c)) {
+            /* the RESULT is the derived concolic itself — a plain call returns the string, and there is no
+               wrapper to build (made_value below reads a real string's length off s->val). */
+            JS_FreeValue(ctx, cb_result);
+            s->result = c;
+            return 0;
+        }
+    }
     if (!s->coerced && JS_VALUE_GET_TAG(arg) == JS_TAG_OBJECT) {
         s->coerced = 1;
         s->cb[0] = (JSValue)arg;   /* borrowed: the header holds the reference */

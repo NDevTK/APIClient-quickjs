@@ -1348,6 +1348,11 @@ JS_EXTERN int JS_MapDeleteRecord(JSContext *ctx, JSValueConst obj, JSValueConst 
             like `cookie.indexOf("role=admin") >= 0` explored NEITHER arm. §solver requires opacity to survive
             coercion precisely so control flow keeps forking, and equality already had a hook while ordering
             did not. `op` is the OP_lt/lte/gt/gte opcode. */
+/* The arithmetic operator a concolic result is derived for — quickjs speaks these to the host so the solver
+   never has to know opcode numbers. */
+enum { JS_CARITH_NEG = 0, JS_CARITH_PLUS, JS_CARITH_NOT, JS_CARITH_INC, JS_CARITH_DEC,
+       JS_CARITH_SUB, JS_CARITH_MUL, JS_CARITH_DIV, JS_CARITH_MOD, JS_CARITH_POW };
+
 typedef struct JSConcolicHooks {
     int (*add)(JSContext *ctx, JSValue *sp);
     int (*cmp)(JSContext *ctx, JSValue *sp, int is_neq);
@@ -1358,6 +1363,16 @@ typedef struct JSConcolicHooks {
        unknown value's type is unknown, and the engine must not answer it from the host object's REPRESENTATION
        (a callable placeholder would say "function" and decide `typeof x === "function"` for the program). */
     JSValue (*type_of)(JSContext *ctx, JSValueConst v);
+    /* 7.1.4 ToNumber OVER UNKNOWN INPUT, answered where the SPEC says the operator computes — never at the
+       conversion boundary, which owes C a real number. `-x`, `~x`, `x*2`, `x**2`, `++x` yield a DERIVED
+       concolic that keeps the source's identity, so a later branch still forks and a later sink still solves
+       for the original source. The EXAMPLE propagates by RUNNING THE REAL OP on the operands' examples, which
+       is what makes this the concolic triple rather than a taint label. Operands are at sp[-nops..sp[-1]] and
+       the result is written to sp[-nops], the shape .add and .cmp already use. Returns 1 when it answered. */
+    int (*arith)(JSContext *ctx, JSValue *sp, int op, int nops);
+    /* 7.1.17 ToString over unknown input, same rule: `String(x)` is unknown, with the source kept. Returns
+       JS_UNINITIALIZED when the operand is not concolic. */
+    JSValue (*to_str)(JSContext *ctx, JSValueConst v);
 } JSConcolicHooks;
 JS_EXTERN void JS_SetConcolicHooks(const JSConcolicHooks *hooks);
 
