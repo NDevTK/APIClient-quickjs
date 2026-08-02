@@ -16630,6 +16630,16 @@ static no_inline int js_relational_slow(JSContext *ctx, JSValue *sp,
     if (g_concolic.rel && g_concolic.rel(ctx, sp, op))
         return 0;
 
+    /* AN OBJECT HERE IS A CONCOLIC — see js_add_slow. The dispatch routes a real object operand onto the
+       ToPrimitive trampoline so its user code runs with a flow base; js_toprim_operand excludes concolics, so
+       those alone arrive, and 7.1.1 over a concolic returns it unchanged. An unrouted real object would run
+       JS from C, which is the thing the routing exists to prevent. */
+    DCHECK(JS_VALUE_GET_TAG(op1) != JS_TAG_OBJECT || (g_concolic.is && g_concolic.is(op1)),
+           "a real object operand reached the slow path — the operator dispatch must route it to the "
+           "ToPrimitive trampoline, never run valueOf from C here");
+    DCHECK(JS_VALUE_GET_TAG(op2) != JS_TAG_OBJECT || (g_concolic.is && g_concolic.is(op2)),
+           "a real object operand reached the slow path — the operator dispatch must route it to the "
+           "ToPrimitive trampoline, never run valueOf from C here");
     op1 = JS_ToPrimitiveFree(ctx, op1, HINT_NUMBER);
     if (JS_IsException(op1)) {
         JS_FreeValue(ctx, op2);
@@ -16852,6 +16862,16 @@ static no_inline __exception int js_eq_slow(JSContext *ctx, JSValue *sp,
                 (tag_is_number(tag2) || tag_is_string(tag2) || tag2 == JS_TAG_SYMBOL)) ||
                (tag2 == JS_TAG_OBJECT &&
                 (tag_is_number(tag1) || tag_is_string(tag1) || tag1 == JS_TAG_SYMBOL))) {
+        /* AN OBJECT HERE IS A CONCOLIC — see js_add_slow. The dispatch routes a real object operand onto the
+           ToPrimitive trampoline so its user code runs with a flow base; js_toprim_operand excludes concolics, so
+           those alone arrive, and 7.1.1 over a concolic returns it unchanged. An unrouted real object would run
+           JS from C, which is the thing the routing exists to prevent. */
+        DCHECK(JS_VALUE_GET_TAG(op1) != JS_TAG_OBJECT || (g_concolic.is && g_concolic.is(op1)),
+               "a real object operand reached the slow path — the operator dispatch must route it to the "
+               "ToPrimitive trampoline, never run valueOf from C here");
+        DCHECK(JS_VALUE_GET_TAG(op2) != JS_TAG_OBJECT || (g_concolic.is && g_concolic.is(op2)),
+               "a real object operand reached the slow path — the operator dispatch must route it to the "
+               "ToPrimitive trampoline, never run valueOf from C here");
         op1 = JS_ToPrimitiveFree(ctx, op1, HINT_NONE);
         if (JS_IsException(op1)) {
             JS_FreeValue(ctx, op2);
