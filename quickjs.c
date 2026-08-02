@@ -44361,6 +44361,7 @@ enum {
     PDS_POSTFIX, PDS_PFX_PAREN, PDS_PFX_NEW, PDS_PFX_IMPORT1, PDS_PFX_IMPORT2,
     PDS_PFX_ARG, PDS_PFX_SPREAD_ELL, PDS_PFX_SPREAD_ITEM, PDS_PFX_INDEX,
     PDS_UNA_POSTFIX,
+    PDS_ARR, PDS_ARR_E1, PDS_ARR_E2, PDS_ARR_SPREAD, PDS_ARR_E3, PDS_PFX_ARRAY,
 };
 static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                                         int parse_flags, int op);
@@ -45751,107 +45752,6 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
     return -1;
 }
 
-static __exception int js_parse_array_literal(JSParseState *s)
-{
-    uint32_t idx;
-    bool need_length;
-
-    if (next_token(s))
-        return -1;
-    /* small regular arrays are created on the stack */
-    idx = 0;
-    while (s->token.val != ']' && idx < 32) {
-        if (s->token.val == ',' || s->token.val == TOK_ELLIPSIS)
-            break;
-        if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
-            return -1;
-        idx++;
-        /* accept trailing comma */
-        if (s->token.val == ',') {
-            if (next_token(s))
-                return -1;
-        } else
-        if (s->token.val != ']')
-            goto done;
-    }
-    emit_op(s, OP_array_from);
-    emit_u16(s, idx);
-
-    /* larger arrays and holes are handled with explicit indices */
-    need_length = false;
-    while (s->token.val != ']' && idx < 0x7fffffff) {
-        if (s->token.val == TOK_ELLIPSIS)
-            break;
-        need_length = true;
-        if (s->token.val != ',') {
-            if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
-                return -1;
-            emit_op(s, OP_define_field);
-            emit_u32(s, __JS_AtomFromUInt32(idx));
-            need_length = false;
-        }
-        idx++;
-        /* accept trailing comma */
-        if (s->token.val == ',') {
-            if (next_token(s))
-                return -1;
-        }
-    }
-    if (s->token.val == ']') {
-        if (need_length) {
-            /* Set the length: Cannot use OP_define_field because
-               length is not configurable */
-            emit_op(s, OP_dup);
-            emit_op(s, OP_push_i32);
-            emit_u32(s, idx);
-            emit_op(s, OP_put_field);
-            emit_atom(s, JS_ATOM_length);
-        }
-        goto done;
-    }
-
-    /* huge arrays and spread elements require a dynamic index on the stack */
-    emit_op(s, OP_push_i32);
-    emit_u32(s, idx);
-
-    /* stack has array, index */
-    while (s->token.val != ']') {
-        if (s->token.val == TOK_ELLIPSIS) {
-            if (next_token(s))
-                return -1;
-            if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
-                return -1;
-            emit_op(s, OP_append);
-        } else {
-            need_length = true;
-            if (s->token.val != ',') {
-                if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
-                    return -1;
-                /* a idx val */
-                emit_op(s, OP_define_array_el);
-                need_length = false;
-            }
-            emit_op(s, OP_inc);
-        }
-        if (s->token.val != ',')
-            break;
-        if (next_token(s))
-            return -1;
-    }
-    if (need_length) {
-        /* Set the length: cannot use OP_define_field because
-           length is not configurable */
-        emit_op(s, OP_dup1);    /* array length - array array length */
-        emit_op(s, OP_put_field);
-        emit_atom(s, JS_ATOM_length);
-    } else {
-        emit_op(s, OP_drop);    /* array length - array */
-    }
-done:
-    return js_parse_expect(s, ']');
-}
-
-/* check if scope chain contains a with statement */
 static bool has_with_scope(JSFunctionDef *s, int scope_level)
 {
     while (s) {
@@ -46853,6 +46753,9 @@ struct JSParseFrame {
     int     prev_op;
     bool    accept_lparen;  /* PF_POSTFIX_CALL: this is a CallExpression, not a bare MemberExpression */
     bool    has_opt_chain;
+    /* ArrayLiteral */
+    uint32_t arr_idx;
+    bool    need_length;
 };
 typedef struct JSParseFrame JSParseFrame;
 
@@ -46926,6 +46829,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         f->call_type = 0; f->call_line_num = 0; f->call_col_num = 0;             \
         f->opt_label = -1; f->arg_count = 0; f->prev_op = 0;                     \
         f->accept_lparen = false; f->has_opt_chain = false;                      \
+        f->arr_idx = 0; f->need_length = false;                                  \
         goto dispatch;                                                          \
     } while (0)
 /* A descent: record where THIS frame continues, then push the callee's. */
@@ -46997,6 +46901,12 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     case PDS_PFX_SPREAD_ITEM: goto pfx_spread_item_done;
     case PDS_PFX_INDEX:       goto pfx_index_done;
     case PDS_UNA_POSTFIX:     goto una_postfix_done;
+    case PDS_ARR:             goto arr_entry;
+    case PDS_ARR_E1:          goto arr_e1_done;
+    case PDS_ARR_E2:          goto arr_e2_done;
+    case PDS_ARR_SPREAD:      goto arr_spread_done;
+    case PDS_ARR_E3:          goto arr_e3_done;
+    case PDS_PFX_ARRAY:       goto pfx_array_done;
     }
     DFAIL("parse descent resumed at a state that does not exist");
     goto unwind;
@@ -47974,11 +47884,16 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         if (s->token.val == '{') {
             if (js_parse_object_literal(s))
                 PD_RET(-1);
-        } else {
-            if (js_parse_array_literal(s))
-                PD_RET(-1);
+            break;
         }
-        break;
+        /* A DESCENT, not a nested activation of this driver. Calling js_parse_descent from inside itself is a C
+           frame per nesting level and leaves `[[[[…]]]]` exactly as deep as the recursion it replaced — the
+           whole point of converting a production is that its call sites INSIDE the driver become PD_CALLs. */
+        PD_CALL(PDS_ARR, 0, 0, 0, PDS_PFX_ARRAY);
+ pfx_array_done:
+        if (pd_ret)
+            PD_RET(-1);
+        goto pfx_after_switch;
     case TOK_NEW:
         if (next_token(s))
             PD_RET(-1);
@@ -48481,6 +48396,111 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         }
     }
     PD_RET(0);
+
+/* ---- ArrayLiteral. Its elements are AssignmentExpressions, which the descent already owns, so converting
+   this production CLOSES the `[[[[…]]]]` cycle rather than merely shortening it. ---- */
+ arr_entry:
+    if (next_token(s))
+        PD_RET(-1);
+    /* small regular arrays are created on the stack */
+    f->arr_idx = 0;
+    while (s->token.val != ']' && f->arr_idx < 32) {
+        if (s->token.val == ',' || s->token.val == TOK_ELLIPSIS)
+            break;
+        PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_ARR_E1);
+ arr_e1_done:
+        if (pd_ret)
+            PD_RET(-1);
+        f->arr_idx++;
+        /* accept trailing comma */
+        if (s->token.val == ',') {
+            if (next_token(s))
+                PD_RET(-1);
+        } else
+        if (s->token.val != ']')
+            goto arr_done;
+    }
+    emit_op(s, OP_array_from);
+    emit_u16(s, f->arr_idx);
+
+    /* larger arrays and holes are handled with explicit indices */
+    f->need_length = false;
+    while (s->token.val != ']' && f->arr_idx < 0x7fffffff) {
+        if (s->token.val == TOK_ELLIPSIS)
+            break;
+        f->need_length = true;
+        if (s->token.val != ',') {
+            PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_ARR_E2);
+ arr_e2_done:
+            if (pd_ret)
+                PD_RET(-1);
+            emit_op(s, OP_define_field);
+            emit_u32(s, __JS_AtomFromUInt32(f->arr_idx));
+            f->need_length = false;
+        }
+        f->arr_idx++;
+        /* accept trailing comma */
+        if (s->token.val == ',') {
+            if (next_token(s))
+                PD_RET(-1);
+        }
+    }
+    if (s->token.val == ']') {
+        if (f->need_length) {
+            /* Set the length: Cannot use OP_define_field because
+               length is not configurable */
+            emit_op(s, OP_dup);
+            emit_op(s, OP_push_i32);
+            emit_u32(s, f->arr_idx);
+            emit_op(s, OP_put_field);
+            emit_atom(s, JS_ATOM_length);
+        }
+        goto arr_done;
+    }
+
+    /* huge arrays and spread elements require a dynamic index on the stack */
+    emit_op(s, OP_push_i32);
+    emit_u32(s, f->arr_idx);
+
+    /* stack has array, index */
+    while (s->token.val != ']') {
+        if (s->token.val == TOK_ELLIPSIS) {
+            if (next_token(s))
+                PD_RET(-1);
+            PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_ARR_SPREAD);
+ arr_spread_done:
+            if (pd_ret)
+                PD_RET(-1);
+            emit_op(s, OP_append);
+        } else {
+            f->need_length = true;
+            if (s->token.val != ',') {
+                PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_ARR_E3);
+ arr_e3_done:
+                if (pd_ret)
+                    PD_RET(-1);
+                /* a idx val */
+                emit_op(s, OP_define_array_el);
+                f->need_length = false;
+            }
+            emit_op(s, OP_inc);
+        }
+        if (s->token.val != ',')
+            break;
+        if (next_token(s))
+            PD_RET(-1);
+    }
+    if (f->need_length) {
+        /* Set the length: cannot use OP_define_field because
+           length is not configurable */
+        emit_op(s, OP_dup1);    /* array length - array array length */
+        emit_op(s, OP_put_field);
+        emit_atom(s, JS_ATOM_length);
+    } else {
+        emit_op(s, OP_drop);    /* array length - array */
+    }
+ arr_done:
+    PD_RET(js_parse_expect(s, ']'));
 
  done:
     goto leave;
