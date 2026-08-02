@@ -44372,6 +44372,7 @@ enum {
     PDS_OBJ, PDS_OBJ_SPREAD, PDS_OBJ_VALUE, PDS_PFX_OBJECT,
     PDS_PROPNAME, PDS_PN_COMPUTED, PDS_OBJ_KEY,
     PDS_TEMPLATE, PDS_TPL_SUB, PDS_PFX_TEMPLATE, PDS_PFX_TAGGED,
+    PDS_VAR, PDS_VAR_LV, PDS_VAR_INIT,
 };
 static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                                         int parse_flags, int op);
@@ -46381,8 +46382,6 @@ static void optional_chain_test(JSParseState *s, int *poptional_chaining_label,
 }
 
 /* allowed parse_flags: PF_POSTFIX_CALL */
-static __exception int js_parse_var(JSParseState *s, int parse_flags, int tok,
-                                    bool export_flag);
 
 /* ============================================================================
  * THE OPERATOR DESCENT — the precedence ladder run on a FLAT C STACK.
@@ -46422,6 +46421,9 @@ struct JSParseFrame {
     int     label2;
     int     opcode;     /* expr_binary: the operator whose operands are being parsed */
     JSAtom  atom;       /* owned, or JS_ATOM_NULL. The unwind path releases it. */
+    JSAtom  atom2;      /* a SECOND owned atom, for a production holding two across one descent —
+                           VariableDeclaration holds the binding's name AND get_lvalue's reference name.
+                           Released by the same unwind: a frame owns everything in its atom slots. */
     bool    comma;      /* Expression: a ',' has been consumed, so the last operand is not an lvalue */
     bool    is_star;    /* AssignmentExpression: `yield *` */
     JSAtom  name0;      /* BORROWED (never dup'd), the identifier before '=' for the OP_set_name pattern */
@@ -46440,6 +46442,17 @@ struct JSParseFrame {
     bool    has_proto;      /* ObjectLiteral: a __proto__ key has already been seen */
     /* PropertyName */
     int     prop_type, is_private;
+    /* Statement productions. The BlockEnv is here and not a C local for a REASON: push_break_entry links its
+       ADDRESS into JSFunctionDef.top_break and leaves it there for as long as the loop/switch BODY is being
+       parsed — which is exactly the span that pushes more descent frames. That is why the frame stack is
+       chunked: a realloc'ing array would move this and dangle the list. */
+    BlockEnv st_be;
+    JSAtom  st_label_name;    /* owned: the statement's label, freed on every exit */
+    int     st_lbl_a, st_lbl_b, st_lbl_c, st_lbl_d;   /* break/cont/body/test, case/break/1, catch/finally/end */
+    int     st_pos_a, st_pos_b;                       /* pos_cont / pos_body, default_label_pos */
+    int     st_scope_a, st_scope_b;                   /* block_scope_level, for_scope_level */
+    int     st_mask, st_tok, st_bits, st_line, st_col, st_idx;
+    bool    st_is_async;
     /* TemplateLiteral: the tagged form's cooked and raw arrays, LIVE ACROSS the substitution descent — a
        nested template is a nested FRAME, and holding these in a driver local let the inner one reset the
        outer's to JS_UNDEFINED. Ownership matches the recursive body: template_object is released after
@@ -46526,6 +46539,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         f = PD_FRAME(s->pd_sp); s->pd_sp++;                                     \
         f->state = e_; f->level = lv_; f->flags = fl_; f->op = o_;               \
         f->label1 = -1; f->label2 = -1; f->opcode = 0; f->atom = JS_ATOM_NULL;   \
+        f->atom2 = JS_ATOM_NULL;                                                 \
         f->comma = false; f->is_star = false; f->name0 = JS_ATOM_NULL;           \
         f->scope = 0; f->label = -1; f->depth_lvalue = 0;                        \
         f->call_type = 0; f->call_line_num = 0; f->call_col_num = 0;             \
@@ -46533,6 +46547,11 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         f->accept_lparen = false; f->has_opt_chain = false;                      \
         f->arr_idx = 0; f->need_length = false; f->has_proto = false;            \
         f->prop_type = 0; f->is_private = 0;                                     \
+        f->st_label_name = JS_ATOM_NULL;                                         \
+        f->st_lbl_a = -1; f->st_lbl_b = -1; f->st_lbl_c = -1; f->st_lbl_d = -1;  \
+        f->st_pos_a = 0; f->st_pos_b = 0; f->st_scope_a = 0; f->st_scope_b = 0;  \
+        f->st_mask = 0; f->st_tok = 0; f->st_bits = 0;                           \
+        f->st_line = 0; f->st_col = 0; f->st_idx = 0; f->st_is_async = false;    \
         f->raw_array = JS_UNDEFINED; f->template_object = JS_UNDEFINED;          \
         f->start_ptr = NULL; f->start_line = 0; f->start_col = 0;                \
         goto dispatch;                                                          \
@@ -46544,7 +46563,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     } while (0)
 /* A production finished: its return code becomes the caller's `pd_ret`. */
 #define PD_RET(v_) do {                                                         \
-        DCHECK(f->atom == JS_ATOM_NULL,                                         \
+        DCHECK(f->atom == JS_ATOM_NULL && f->atom2 == JS_ATOM_NULL,              \
                "a parse frame was popped still owning an atom — it leaks");     \
         pd_ret = (v_); s->pd_sp--; goto dispatch;                                  \
     } while (0)
@@ -46619,6 +46638,9 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     case PDS_PROPNAME:        goto pn_entry;
     case PDS_PN_COMPUTED:     goto pn_computed_done;
     case PDS_OBJ_KEY:         goto obj_key_done;
+    case PDS_VAR:             goto var_entry;
+    case PDS_VAR_LV:          goto var_lv_done;
+    case PDS_VAR_INIT:        goto var_init_done;
     case PDS_TEMPLATE:        goto tpl_entry;
     case PDS_TPL_SUB:         goto tpl_sub_done;
     case PDS_PFX_TEMPLATE:    goto pfx_template_done;
@@ -48583,6 +48605,142 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     /* the tagged form's argument count travels as the STATUS; the untagged form has none */
     PD_RET(f->op ? f->arg_count + 1 : 0);
 
+/* ---- VariableDeclarationList. Its initialisers are AssignmentExpressions, which the descent owns. The frame
+   holds TWO owned atoms across the TOK_VAR path: `atom` is the binding's name and `atom2` is the reference name
+   get_lvalue produced, which must survive the initialiser and reach put_lvalue. `level` carries export_flag,
+   `op` the declaration token. ---- */
+ var_entry:
+    if (s->token.val != TOK_IDENT)
+        goto var_pattern;
+    if (s->token.u.ident.is_reserved)
+        PD_RET(js_parse_error_reserved_identifier(s));
+    f->atom = JS_DupAtom(ctx, s->token.u.ident.atom);
+    if (f->atom == JS_ATOM_let &&
+        (f->op == TOK_LET || f->op == TOK_CONST || f->op == TOK_USING)) {
+        js_parse_error(s, "'let' is not a valid lexical identifier");
+        goto var_error;
+    }
+    f->st_idx = -1;                      /* using_method_idx */
+    if (next_token(s))
+        goto var_error;
+    f->st_is_async = (f->op == TOK_USING) && js_decl_is_program_level(s->cur_func);   /* using_is_global */
+    if (js_define_var(s, f->atom, f->op))
+        goto var_error;
+    if (f->op == TOK_USING) {
+        /* The resource VALUE is whatever js_define_var just created: the module binding it appended to
+           global_vars, or the frame local it appended to vars. The dispose METHOD is always a hidden frame
+           local — it is a compiler temp holding the already-fetched GetDisposeMethod result, never a
+           binding, so it needs no module storage even when the value has some. */
+        int using_value_idx = f->st_is_async ? s->cur_func->global_var_count - 1
+                                             : s->cur_func->var_count - 1;
+        f->st_idx = add_scope_var(ctx, s->cur_func, JS_ATOM__using_dispose_, JS_VAR_USING_METHOD);
+        if (f->st_idx < 0)
+            goto var_error;
+        s->cur_func->vars[f->st_idx].is_lexical = 1;
+        s->cur_func->vars[f->st_idx].is_const = 1;
+        if (add_using_decl(ctx, s->cur_func, using_value_idx, f->st_is_async, f->st_idx,
+                           (f->flags & PF_AWAIT_USING) != 0) < 0)
+            goto var_error;
+    }
+    if (f->level) {   /* export_flag */
+        if (!add_export_entry(s, s->cur_func->module, f->atom, f->atom, JS_EXPORT_TYPE_LOCAL))
+            goto var_error;
+    }
+
+    if (s->token.val == '=') {
+        if (next_token(s))
+            goto var_error;
+        if (f->op == TOK_VAR) {
+            /* Must make a reference for proper `with` semantics */
+            emit_op(s, OP_scope_get_var);
+            emit_atom(s, f->atom);
+            emit_u16(s, s->cur_func->scope_level);
+            if (get_lvalue(s, &f->opcode, &f->scope, &f->atom2, &f->label, NULL, false, '=') < 0)
+                goto var_error;
+            PD_CALL(PDS_ASGN, 0, f->flags, 0, PDS_VAR_LV);
+ var_lv_done:
+            if (pd_ret)
+                goto var_error;            /* the unwind releases atom2 with atom */
+            set_object_name(s, f->atom);
+            put_lvalue(s, f->opcode, f->scope, f->atom2, f->label, PUT_LVALUE_NOKEEP, false);
+            f->atom2 = JS_ATOM_NULL;       /* put_lvalue consumed it */
+        } else {
+            if (f->op == TOK_USING &&
+                !s->cur_func->scopes[s->cur_func->scope_level].has_using) {
+                /* First 'using' in this scope: set up labels for the catch handler and end of disposal */
+                s->cur_func->scopes[s->cur_func->scope_level].has_using = 1;
+                s->cur_func->scopes[s->cur_func->scope_level].using_label_catch = new_label(s);
+                s->cur_func->scopes[s->cur_func->scope_level].using_label_end = new_label(s);
+                /* Emit OP_catch: push catch_offset on the value stack. If an exception occurs, control jumps
+                   to catch_label with the exception value on the stack instead of catch_offset. */
+                emit_goto(s, OP_catch,
+                          s->cur_func->scopes[s->cur_func->scope_level].using_label_catch);
+            }
+            PD_CALL(PDS_ASGN, 0, f->flags, 0, PDS_VAR_INIT);
+ var_init_done:
+            if (pd_ret)
+                goto var_error;
+            set_object_name(s, f->atom);
+            if (f->op == TOK_USING) {
+                emit_op(s, OP_using_check);
+                emit_u8(s, (f->flags & PF_AWAIT_USING) != 0);
+                /* Stack: value, method. Store the method first. Emit OP_put_loc directly (bypasses atom
+                   lookup) so multiple using decls with the shared hidden atom name don't collide. */
+                emit_op(s, OP_put_loc);
+                emit_u16(s, f->st_idx);
+            }
+            emit_op(s, (f->op == TOK_CONST || f->op == TOK_LET || f->op == TOK_USING)
+                       ? OP_scope_put_var_init : OP_scope_put_var);
+            emit_atom(s, f->atom);
+            emit_u16(s, s->cur_func->scope_level);
+        }
+    } else {
+        if (f->op == TOK_CONST || f->op == TOK_USING) {
+            js_parse_error(s, "missing initializer for variable");
+            goto var_error;
+        }
+        if (f->op == TOK_LET) {
+            /* initialize lexical variable upon entering its scope */
+            emit_op(s, OP_undefined);
+            emit_op(s, OP_scope_put_var_init);
+            emit_atom(s, f->atom);
+            emit_u16(s, s->cur_func->scope_level);
+        }
+    }
+    JS_FreeAtom(ctx, f->atom);
+    f->atom = JS_ATOM_NULL;
+    goto var_next;
+
+ var_pattern:
+    {
+        int skip_bits;
+        if ((s->token.val == '[' || s->token.val == '{')
+        &&  js_parse_skip_parens_token(s, &skip_bits, false) == '=') {
+            /* using declarations do not allow binding patterns */
+            if (f->op == TOK_USING)
+                PD_RET_ERR(s, "binding patterns are not allowed in using declarations");
+            emit_op(s, OP_undefined);
+            if (js_parse_destructuring_element(s, f->op, false, true,
+                                               skip_bits & SKIP_HAS_ELLIPSIS, true, f->level) < 0)
+                PD_RET(-1);
+        } else {
+            PD_RET_ERR(s, "variable name expected");
+        }
+    }
+ var_next:
+    if (s->token.val != ',')
+        PD_RET(0);
+    if (next_token(s))
+        PD_RET(-1);
+    goto var_entry;
+
+ var_error:
+    JS_FreeAtom(ctx, f->atom);
+    JS_FreeAtom(ctx, f->atom2);
+    f->atom = JS_ATOM_NULL;
+    f->atom2 = JS_ATOM_NULL;
+    PD_RET(-1);
+
  done:
     goto leave;
 
@@ -48593,6 +48751,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     while (s->pd_sp > base) {
         s->pd_sp--;
         JS_FreeAtom(ctx, PD_FRAME(s->pd_sp)->atom);
+        JS_FreeAtom(ctx, PD_FRAME(s->pd_sp)->atom2);
     }
     pd_ret = -1;
  leave:
@@ -48901,156 +49060,6 @@ static __exception int js_parse_block(JSParseState *s)
 }
 
 /* allowed parse_flags: PF_IN_ACCEPTED */
-static __exception int js_parse_var(JSParseState *s, int parse_flags, int tok,
-                                    bool export_flag)
-{
-    JSContext *ctx = s->ctx;
-    JSFunctionDef *fd = s->cur_func;
-    JSAtom name = JS_ATOM_NULL;
-
-    for (;;) {
-        if (s->token.val == TOK_IDENT) {
-            if (s->token.u.ident.is_reserved) {
-                return js_parse_error_reserved_identifier(s);
-            }
-            name = JS_DupAtom(ctx, s->token.u.ident.atom);
-            if (name == JS_ATOM_let &&
-                (tok == TOK_LET || tok == TOK_CONST || tok == TOK_USING)) {
-                js_parse_error(s, "'let' is not a valid lexical identifier");
-                goto var_error;
-            }
-            int using_method_idx = -1;
-            if (next_token(s))
-                goto var_error;
-            bool using_is_global = (tok == TOK_USING) && js_decl_is_program_level(fd);
-            if (js_define_var(s, name, tok))
-                goto var_error;
-            if (tok == TOK_USING) {
-                /* The resource VALUE is whatever js_define_var just created: the module binding it appended to
-                   global_vars, or the frame local it appended to vars. The dispose METHOD is always a hidden frame
-                   local — it is a compiler temp holding the already-fetched GetDisposeMethod result, never a
-                   binding, so it needs no module storage even when the value has some. */
-                int using_value_idx = using_is_global ? fd->global_var_count - 1 : fd->var_count - 1;
-                using_method_idx = add_scope_var(ctx, fd,
-                                                 JS_ATOM__using_dispose_,
-                                                 JS_VAR_USING_METHOD);
-                if (using_method_idx < 0)
-                    goto var_error;
-                fd->vars[using_method_idx].is_lexical = 1;
-                fd->vars[using_method_idx].is_const = 1;
-                if (add_using_decl(ctx, fd, using_value_idx, using_is_global, using_method_idx,
-                                   (parse_flags & PF_AWAIT_USING) != 0) < 0)
-                    goto var_error;
-            }
-            if (export_flag) {
-                if (!add_export_entry(s, s->cur_func->module, name, name,
-                                      JS_EXPORT_TYPE_LOCAL))
-                    goto var_error;
-            }
-
-            if (s->token.val == '=') {
-                if (next_token(s))
-                    goto var_error;
-                if (tok == TOK_VAR) {
-                    /* Must make a reference for proper `with` semantics */
-                    int opcode, scope, label;
-                    JSAtom name1;
-
-                    emit_op(s, OP_scope_get_var);
-                    emit_atom(s, name);
-                    emit_u16(s, fd->scope_level);
-                    if (get_lvalue(s, &opcode, &scope, &name1, &label, NULL, false, '=') < 0)
-                        goto var_error;
-                    if (js_parse_descent(s, PDS_ASGN, 0, parse_flags, 0)) {
-                        JS_FreeAtom(ctx, name1);
-                        goto var_error;
-                    }
-                    set_object_name(s, name);
-                    put_lvalue(s, opcode, scope, name1, label,
-                               PUT_LVALUE_NOKEEP, false);
-                } else {
-                    bool init;
-
-                    if (tok == TOK_USING) {
-                        if (!fd->scopes[fd->scope_level].has_using) {
-                            /* First 'using' in this scope: set up labels
-                               for the catch handler and end of disposal */
-                            fd->scopes[fd->scope_level].has_using = 1;
-                            fd->scopes[fd->scope_level].using_label_catch =
-                                new_label(s);
-                            fd->scopes[fd->scope_level].using_label_end =
-                                new_label(s);
-
-                            /* Emit OP_catch: push catch_offset on the value
-                               stack. If an exception occurs, control jumps
-                               to catch_label with the exception value on the
-                               stack instead of catch_offset. */
-                            emit_goto(s, OP_catch,
-                                fd->scopes[fd->scope_level].using_label_catch);
-                        }
-                    }
-
-                    if (js_parse_descent(s, PDS_ASGN, 0, parse_flags, 0))
-                        goto var_error;
-                    set_object_name(s, name);
-
-                    if (tok == TOK_USING) {
-                        emit_op(s, OP_using_check);
-                        emit_u8(s, (parse_flags & PF_AWAIT_USING) != 0);
-                        /* Stack: value, method. Store the method first.
-                           Emit OP_put_loc directly (bypasses atom lookup)
-                           so multiple using decls with the shared hidden
-                           atom name don't collide. */
-                        emit_op(s, OP_put_loc);
-                        emit_u16(s, using_method_idx);
-                    }
-
-                    init = (tok == TOK_CONST || tok == TOK_LET || tok == TOK_USING);
-                    emit_op(s, init ? OP_scope_put_var_init : OP_scope_put_var);
-                    emit_atom(s, name);
-                    emit_u16(s, fd->scope_level);
-                }
-            } else {
-                if (tok == TOK_CONST || tok == TOK_USING) {
-                    js_parse_error(s, "missing initializer for variable");
-                    goto var_error;
-                }
-                if (tok == TOK_LET) {
-                    /* initialize lexical variable upon entering its scope */
-                    emit_op(s, OP_undefined);
-                    emit_op(s, OP_scope_put_var_init);
-                    emit_atom(s, name);
-                    emit_u16(s, fd->scope_level);
-                }
-            }
-            JS_FreeAtom(ctx, name);
-        } else {
-            int skip_bits;
-            if ((s->token.val == '[' || s->token.val == '{')
-            &&  js_parse_skip_parens_token(s, &skip_bits, false) == '=') {
-                /* using declarations do not allow binding patterns */
-                if (tok == TOK_USING) {
-                    return js_parse_error(s, "binding patterns are not allowed in using declarations");
-                }
-                emit_op(s, OP_undefined);
-                if (js_parse_destructuring_element(s, tok, false, true, skip_bits & SKIP_HAS_ELLIPSIS, true, export_flag) < 0)
-                    return -1;
-            } else {
-                return js_parse_error(s, "variable name expected");
-            }
-        }
-        if (s->token.val != ',')
-            break;
-        if (next_token(s))
-            return -1;
-    }
-    return 0;
-
- var_error:
-    JS_FreeAtom(ctx, name);
-    return -1;
-}
-
 /* test if the current token is a label. Use simplistic look-ahead scanner */
 static bool is_label(JSParseState *s)
 {
@@ -49634,7 +49643,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
                 s->cur_func->has_await = true;
                 if (next_token(s)) /* skip 'using' */
                     goto fail;
-                if (js_parse_var(s, PF_IN_ACCEPTED | PF_AWAIT_USING, TOK_USING, /*export_flag*/false))
+                if (js_parse_descent(s, PDS_VAR, (false), PF_IN_ACCEPTED | PF_AWAIT_USING, TOK_USING))
                     goto fail;
                 if (js_parse_expect_semi(s))
                     goto fail;
@@ -49656,7 +49665,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
     case TOK_VAR:
         if (next_token(s))
             goto fail;
-        if (js_parse_var(s, PF_IN_ACCEPTED, tok, /*export_flag*/false))
+        if (js_parse_descent(s, PDS_VAR, (false), PF_IN_ACCEPTED, tok))
             goto fail;
         if (js_parse_expect_semi(s))
             goto fail;
@@ -49851,8 +49860,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
                         tok = TOK_USING;
                         if (next_token(s)) /* skip 'using' */
                             goto fail;
-                        if (js_parse_var(s, PF_IN_ACCEPTED | PF_AWAIT_USING,
-                                         TOK_USING, false))
+                        if (js_parse_descent(s, PDS_VAR, (false), PF_IN_ACCEPTED | PF_AWAIT_USING, TOK_USING))
                             goto fail;
                         goto for_init_done;
                     }
@@ -49868,7 +49876,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
                         pf |= PF_AWAIT_USING;
                     if (next_token(s))
                         goto fail;
-                    if (js_parse_var(s, pf, tok, /*export_flag*/false))
+                    if (js_parse_descent(s, PDS_VAR, (false), pf, tok))
                         goto fail;
                 } else {
                     if (js_parse_descent(s, PDS_EXPR2, 0, 0, 0))
@@ -50371,7 +50379,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
                 }
                 if (next_token(s))
                     goto fail;
-                if (js_parse_var(s, PF_IN_ACCEPTED, TOK_USING, /*export_flag*/false))
+                if (js_parse_descent(s, PDS_VAR, (false), PF_IN_ACCEPTED, TOK_USING))
                     goto fail;
                 if (js_parse_expect_semi(s))
                     goto fail;
@@ -53558,7 +53566,7 @@ static __exception int js_parse_export(JSParseState *s)
     case TOK_LET:
     case TOK_CONST:
     case TOK_USING:
-        return js_parse_var(s, PF_IN_ACCEPTED, tok, /*export_flag*/true);
+        return js_parse_descent(s, PDS_VAR, (true), PF_IN_ACCEPTED, tok);
     default:
         return js_parse_error(s, "invalid export syntax");
     }
