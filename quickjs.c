@@ -2285,7 +2285,7 @@ void *js_calloc_rt(JSRuntime *rt, size_t count, size_t size)
     JSMallocState *s;
 
     /* Do not allocate zero bytes: behavior is platform dependent */
-    assert(count != 0 && size != 0);
+    DCHECK(count != 0 && size != 0, "count != 0 && size != 0");
 
     if (size > 0)
         if (unlikely(count != (count * size) / size))
@@ -2826,7 +2826,7 @@ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
     JSJobEntry *e;
     int i;
 
-    assert(!rt->in_free);
+    DCHECK(!rt->in_free, "!rt->in_free");
 
     /* ASYNC-AS-FLOW: if the host routes this job to a scheduler flow (returns 1), it OWNS it now — do not add it
        to the global job list (there is no global drain in forced-execution; each reaction is a first-class flow). */
@@ -3051,7 +3051,7 @@ void JS_FreeRuntime(JSRuntime *rt)
             fprintf(stderr, "[gcleak] gc_obj_type=%d class_id=%d ref_count=%d\n", JS_GC_TYPE(h), cid, JS_REF_COUNT(h));
         }
     }
-    assert(list_empty(&rt->gc_obj_list));
+    DCHECK(list_empty(&rt->gc_obj_list), "list_empty(&rt->gc_obj_list)");
 
     /* free the classes */
     for(i = 0; i < rt->class_count; i++) {
@@ -3299,13 +3299,13 @@ static inline void set_value(JSContext *ctx, JSValue *pval, JSValue new_val)
 
 void JS_SetClassProto(JSContext *ctx, JSClassID class_id, JSValue obj)
 {
-    assert(class_id < ctx->rt->class_count);
+    DCHECK(class_id < ctx->rt->class_count, "class_id < ctx->rt->class_count");
     set_value(ctx, &ctx->class_proto[class_id], obj);
 }
 
 JSValue JS_GetClassProto(JSContext *ctx, JSClassID class_id)
 {
-    assert(class_id < ctx->rt->class_count);
+    DCHECK(class_id < ctx->rt->class_count, "class_id < ctx->rt->class_count");
     return js_dup(ctx->class_proto[class_id]);
 }
 
@@ -3410,7 +3410,7 @@ void JS_FreeContext(JSContext *ctx)
 
     if (--JS_REF_COUNT(ctx) > 0)
         return;
-    assert(JS_REF_COUNT(ctx) == 0);
+    DCHECK(JS_REF_COUNT(ctx) == 0, "JS_REF_COUNT(ctx) == 0");
 
 #ifdef ENABLE_DUMPS // JS_DUMP_ATOMS
     if (check_dump_flag(rt, JS_DUMP_ATOMS))
@@ -3712,7 +3712,7 @@ static int JS_ResizeAtomHash(JSRuntime *rt, int new_hash_size)
     JSAtomStruct *p;
     uint32_t new_hash_mask, h, i, hash_next1, j, *new_hash;
 
-    assert((new_hash_size & (new_hash_size - 1)) == 0); /* power of two */
+    DCHECK((new_hash_size & (new_hash_size - 1)) == 0, "(new_hash_size & (new_hash_size - 1)) == 0"); /* power of two */
     new_hash_mask = new_hash_size - 1;
     new_hash = js_mallocz_rt(rt, sizeof(rt->atom_hash[0]) * new_hash_size);
     if (!new_hash)
@@ -3828,7 +3828,7 @@ static JSAtom js_get_atom_index(JSRuntime *rt, JSAtomStruct *p)
         i = rt->atom_hash[p->hash & (rt->atom_hash_size - 1)];
         p1 = rt->atom_array[i];
         while (p1 != p) {
-            assert(i != 0);
+            DCHECK(i != 0, "i != 0");
             i = p1->hash_next;
             p1 = rt->atom_array[i];
         }
@@ -4048,7 +4048,7 @@ static void JS_FreeAtomStruct(JSRuntime *rt, JSAtomStruct *p)
             rt->atom_hash[h0] = p1->hash_next;
         } else {
             for(;;) {
-                assert(i != 0);
+                DCHECK(i != 0, "i != 0");
                 p0 = p1;
                 i = p1->hash_next;
                 p1 = rt->atom_array[i];
@@ -4071,7 +4071,7 @@ static void JS_FreeAtomStruct(JSRuntime *rt, JSAtomStruct *p)
 #endif
     js_free_rt(rt, p);
     rt->atom_count--;
-    assert(rt->atom_count >= 0);
+    DCHECK(rt->atom_count >= 0, "rt->atom_count >= 0");
 }
 
 static void __JS_FreeAtom(JSRuntime *rt, uint32_t i)
@@ -4171,8 +4171,8 @@ static JSValue JS_NewSymbolFromAtom(JSContext *ctx, JSAtom descr,
     JSRuntime *rt = ctx->rt;
     JSString *p;
 
-    assert(!__JS_AtomIsTaggedInt(descr));
-    assert(descr < rt->atom_size);
+    DCHECK(!__JS_AtomIsTaggedInt(descr), "!__JS_AtomIsTaggedInt(descr)");
+    DCHECK(descr < rt->atom_size, "descr < rt->atom_size");
     p = rt->atom_array[descr];
     js_dup(JS_MKPTR(JS_TAG_STRING, p));
     return JS_NewSymbolInternal(ctx, p, atom_type);
@@ -4210,7 +4210,7 @@ static const char *JS_AtomGetStrRT(JSRuntime *rt, char *buf, int buf_size,
     } else if (atom == JS_ATOM_NULL) {
         snprintf(buf, buf_size, "<null>");
     } else if (atom >= rt->atom_size) {
-        assert(atom < rt->atom_size);
+        DCHECK(atom < rt->atom_size, "atom < rt->atom_size");
         snprintf(buf, buf_size, "<invalid %x>", atom);
     } else {
         JSAtomStruct *p = rt->atom_array[atom];
@@ -4245,7 +4245,7 @@ static JSValue __JS_AtomToValue(JSContext *ctx, JSAtom atom, bool force_string)
     } else {
         JSRuntime *rt = ctx->rt;
         JSAtomStruct *p;
-        assert(atom < rt->atom_size);
+        DCHECK(atom < rt->atom_size, "atom < rt->atom_size");
         p = rt->atom_array[atom];
         if (p->atom_type == JS_ATOM_TYPE_STRING) {
             goto ret_string;
@@ -4284,7 +4284,7 @@ static bool JS_AtomIsArrayIndex(JSContext *ctx, uint32_t *pval, JSAtom atom)
         JSAtomStruct *p;
         uint32_t val;
 
-        assert(atom < rt->atom_size);
+        DCHECK(atom < rt->atom_size, "atom < rt->atom_size");
         p = rt->atom_array[atom];
         if (p->atom_type == JS_ATOM_TYPE_STRING &&
             is_num_string(&val, p) && val != -1) {
@@ -4310,7 +4310,7 @@ static JSValue JS_AtomIsNumericIndex1(JSContext *ctx, JSAtom atom)
 
     if (__JS_AtomIsTaggedInt(atom))
         return js_int32(__JS_AtomToUInt32(atom));
-    assert(atom < rt->atom_size);
+    DCHECK(atom < rt->atom_size, "atom < rt->atom_size");
     p1 = rt->atom_array[atom];
     if (p1->atom_type != JS_ATOM_TYPE_STRING)
         return JS_UNDEFINED;
@@ -5515,7 +5515,7 @@ static JSString *string_rope_iter_next(JSStringRopeIter *s)
         if (JS_VALUE_GET_TAG(val) == JS_TAG_STRING)
             return JS_VALUE_GET_STRING(val);
         r = JS_VALUE_GET_STRING_ROPE(val);
-        assert(s->stack_len < JS_STRING_ROPE_MAX_DEPTH);
+        DCHECK(s->stack_len < JS_STRING_ROPE_MAX_DEPTH, "s->stack_len < JS_STRING_ROPE_MAX_DEPTH");
         s->stack[s->stack_len++] = r->right;
         val = r->left;
     }
@@ -6198,7 +6198,7 @@ static void js_free_shape0(JSRuntime *rt, JSShape *sh)
     uint32_t i;
     JSShapeProperty *pr;
 
-    assert(JS_REF_COUNT(sh) == 0);
+    DCHECK(JS_REF_COUNT(sh) == 0, "JS_REF_COUNT(sh) == 0");
     if (sh->is_hashed)
         js_shape_hash_unlink(rt, sh);
     if (sh->proto != NULL) {
@@ -6311,11 +6311,11 @@ static int compact_properties(JSContext *ctx, JSObject *p)
     JSProperty *prop, *new_prop;
 
     sh = p->shape;
-    assert(!sh->is_hashed);
+    DCHECK(!sh->is_hashed, "!sh->is_hashed");
 
     new_size = max_int(JS_PROP_INITIAL_SIZE,
                        sh->prop_count - sh->deleted_prop_count);
-    assert(new_size <= sh->prop_size);
+    DCHECK(new_size <= sh->prop_size, "new_size <= sh->prop_size");
 
     new_hash_size = sh->prop_hash_mask + 1;
     while ((new_hash_size / 2) >= new_size)
@@ -6360,7 +6360,7 @@ static int compact_properties(JSContext *ctx, JSObject *p)
         }
         old_pr++;
     }
-    assert(j == (sh->prop_count - sh->deleted_prop_count));
+    DCHECK(j == (sh->prop_count - sh->deleted_prop_count), "j == (sh->prop_count - sh->deleted_prop_count)");
     sh->prop_hash_mask = new_hash_mask;
     sh->prop_size = new_size;
     sh->deleted_prop_count = 0;
@@ -6500,7 +6500,7 @@ static __maybe_unused void JS_DumpShapes(JSRuntime *rt)
     for(i = 0; i < rt->shape_hash_size; i++) {
         for(sh = rt->shape_hash[i]; sh != NULL; sh = sh->shape_hash_next) {
             JS_DumpShape(rt, i, sh);
-            assert(sh->is_hashed);
+            DCHECK(sh->is_hashed, "sh->is_hashed");
         }
     }
     /* dump non-hashed shapes */
@@ -6823,8 +6823,8 @@ JSValue JS_NewObjectFrom(JSContext *ctx, int count, const JSAtom *props,
     if (count > 0) {
         p = JS_VALUE_GET_OBJ(obj);
         sh = p->shape;
-        assert(sh->is_hashed);
-        assert(JS_REF_COUNT(sh) == 1);
+        DCHECK(sh->is_hashed, "sh->is_hashed");
+        DCHECK(JS_REF_COUNT(sh) == 1, "JS_REF_COUNT(sh) == 1");
         js_shape_hash_unlink(rt, sh);
         if (resize_properties(ctx, &sh, p, count)) {
             js_shape_hash_link(rt, sh);
@@ -7398,14 +7398,14 @@ static inline JSShapeProperty *find_own_property(JSProperty **ppr,
 static void free_var_ref(JSRuntime *rt, JSVarRef *var_ref)
 {
     if (var_ref) {
-        assert(JS_REF_COUNT(var_ref) > 0);
+        DCHECK(JS_REF_COUNT(var_ref) > 0, "JS_REF_COUNT(var_ref) > 0");
         if (--JS_REF_COUNT(var_ref) == 0) {
             if (var_ref->is_detached) {
                 JS_FreeValueRT(rt, var_ref->value);
                 remove_gc_object(&var_ref->header);
             } else {
                 JSStackFrame *sf = var_ref->stack_frame;
-                assert(sf->var_refs[var_ref->var_ref_idx] == var_ref);
+                DCHECK(sf->var_refs[var_ref->var_ref_idx] == var_ref, "sf->var_refs[var_ref->var_ref_idx] == var_ref");
                 sf->var_refs[var_ref->var_ref_idx] = NULL;
             }
             js_free_rt(rt, var_ref);
@@ -7632,7 +7632,7 @@ static void free_zero_refcount(JSRuntime *rt)
         if (el == &rt->gc_zero_ref_count_list)
             break;
         p = list_entry(el, JSGCObjectHeader, link);
-        assert(JS_REF_COUNT(p) == 0);
+        DCHECK(JS_REF_COUNT(p) == 0, "JS_REF_COUNT(p) == 0");
         free_gc_object(rt, p);
     }
     rt->gc_phase = JS_GC_PHASE_NONE;
@@ -7758,8 +7758,8 @@ static void mark_weak_map_value(JSRuntime *rt, JSWeakRefRecord *first_weak_ref, 
         if (wr->kind == JS_WEAK_REF_KIND_MAP) {
             mr = wr->u.map_record;
             s = mr->map;
-            assert(s->is_weak);
-            assert(!mr->empty); /* no iterator on WeakMap/WeakSet */
+            DCHECK(s->is_weak, "s->is_weak");
+            DCHECK(!mr->empty, "!mr->empty"); /* no iterator on WeakMap/WeakSet */
             JS_MarkValue(rt, mr->value, mark_func);
         }
     }
@@ -7832,7 +7832,7 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
         {
             JSVarRef *var_ref = (JSVarRef *)gp;
             /* only detached variable referenced are taken into account */
-            assert(var_ref->is_detached);
+            DCHECK(var_ref->is_detached, "var_ref->is_detached");
             JS_MarkValue(rt, *var_ref->pvalue, mark_func);
         }
         break;
@@ -7866,7 +7866,7 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
 
 static void gc_decref_child(JSRuntime *rt, JSGCObjectHeader *p)
 {
-    assert(JS_REF_COUNT(p) > 0);
+    DCHECK(JS_REF_COUNT(p) > 0, "JS_REF_COUNT(p) > 0");
     JS_REF_COUNT(p)--;
     if (JS_REF_COUNT(p) == 0 && JS_GC_MARK(p) == 1) {
         list_del(&p->link);
@@ -7886,7 +7886,7 @@ static void gc_decref(JSRuntime *rt)
        tmp_obj_list */
     list_for_each_safe(el, el1, &rt->gc_obj_list) {
         p = list_entry(el, JSGCObjectHeader, link);
-        assert(JS_GC_MARK(p) == 0);
+        DCHECK(JS_GC_MARK(p) == 0, "JS_GC_MARK(p) == 0");
         mark_children(rt, p, gc_decref_child);
         JS_GC_MARK(p) = 1;
         if (JS_REF_COUNT(p) == 0) {
@@ -7921,7 +7921,7 @@ static void gc_scan(JSRuntime *rt)
     /* keep the objects with a refcount > 0 and their children. */
     list_for_each(el, &rt->gc_obj_list) {
         p = list_entry(el, JSGCObjectHeader, link);
-        assert(JS_REF_COUNT(p) > 0);
+        DCHECK(JS_REF_COUNT(p) > 0, "JS_REF_COUNT(p) > 0");
         JS_GC_MARK(p) = 0; /* reset the mark for the next GC call */
         mark_children(rt, p, gc_scan_incref_child);
     }
@@ -7976,8 +7976,7 @@ static void gc_free_cycles(JSRuntime *rt)
 
     list_for_each_safe(el, el1, &rt->gc_zero_ref_count_list) {
         p = list_entry(el, JSGCObjectHeader, link);
-        assert(JS_GC_TYPE(p) == JS_GC_OBJ_TYPE_JS_OBJECT ||
-               JS_GC_TYPE(p) == JS_GC_OBJ_TYPE_FUNCTION_BYTECODE);
+        DCHECK(JS_GC_TYPE(p) == JS_GC_OBJ_TYPE_JS_OBJECT || JS_GC_TYPE(p) == JS_GC_OBJ_TYPE_FUNCTION_BYTECODE, "JS_GC_TYPE(p) == JS_GC_OBJ_TYPE_JS_OBJECT || JS_GC_TYPE(p) == JS_GC_OBJ_TYPE_FUNCTION_BYTECODE");
         js_free_rt(rt, p);
     }
 
@@ -10112,7 +10111,7 @@ static int num_keys_cmp(const void *p1, const void *p2, void *opaque)
 
     atom1_is_integer = JS_AtomIsArrayIndex(ctx, &v1, atom1);
     atom2_is_integer = JS_AtomIsArrayIndex(ctx, &v2, atom2);
-    assert(atom1_is_integer && atom2_is_integer);
+    DCHECK(atom1_is_integer && atom2_is_integer, "atom1_is_integer && atom2_is_integer");
     if (v1 < v2)
         return -1;
     else if (v1 == v2)
@@ -10309,9 +10308,9 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
         }
     }
 
-    assert(num_index == num_keys_count);
-    assert(str_index == num_keys_count + str_keys_count);
-    assert(sym_index == atom_count);
+    DCHECK(num_index == num_keys_count, "num_index == num_keys_count");
+    DCHECK(str_index == num_keys_count + str_keys_count, "str_index == num_keys_count + str_keys_count");
+    DCHECK(sym_index == atom_count, "sym_index == atom_count");
 
     if (num_keys_count != 0 && !num_sorted) {
         rqsort(tab_atom, num_keys_count, sizeof(tab_atom[0]), num_keys_cmp,
@@ -10816,7 +10815,7 @@ static JSProperty *add_property(JSContext *ctx,
             p->shape = new_sh;
         }
     }
-    assert(JS_REF_COUNT(p->shape) == 1);
+    DCHECK(JS_REF_COUNT(p->shape) == 1, "JS_REF_COUNT(p->shape) == 1");
     if (add_shape_property(ctx, &p->shape, p, prop, prop_flags))
         return NULL;
     return &p->prop[p->shape->prop_count - 1];
@@ -11272,8 +11271,8 @@ retry:
             set_value(ctx, &pr->u.value, val);
             return true;
         } else if (prs->flags & JS_PROP_LENGTH) {
-            assert(p->class_id == JS_CLASS_ARRAY);
-            assert(prop == JS_ATOM_length);
+            DCHECK(p->class_id == JS_CLASS_ARRAY, "p->class_id == JS_CLASS_ARRAY");
+            DCHECK(prop == JS_ATOM_length, "prop == JS_ATOM_length");
             return set_array_length(ctx, p, val, flags);
         } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
             return call_setter(ctx, pr->u.getset.setter, this_obj, val, flags);
@@ -11948,7 +11947,7 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
             val = js_uint32(array_length);
             /* prs may have been modified */
             prs = find_own_property(&pr, p, prop);
-            assert(prs != NULL);
+            DCHECK(prs != NULL, "prs != NULL");
         }
         /* property already exists */
         if (!check_define_prop_flags(prs->flags, flags)) {
@@ -12207,8 +12206,8 @@ static int JS_DefineAutoInitProperty(JSContext *ctx, JSValueConst this_obj,
     if (unlikely(!pr))
         return -1;
     pr->u.init.realm_and_id = (uintptr_t)JS_DupContext(ctx);
-    assert((pr->u.init.realm_and_id & 3) == 0);
-    assert(id <= 3);
+    DCHECK((pr->u.init.realm_and_id & 3) == 0, "(pr->u.init.realm_and_id & 3) == 0");
+    DCHECK(id <= 3, "id <= 3");
     pr->u.init.realm_and_id |= id;
     pr->u.init.opaque = opaque;
     return true;
@@ -12678,9 +12677,9 @@ int JS_SetOpaque(JSValueConst obj, void *opaque)
 static void JS_SetOpaqueInternal(JSValueConst obj, void *opaque)
 {
     JSObject *p;
-    assert(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT);
+    DCHECK(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT, "JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT");
     p = JS_VALUE_GET_OBJ(obj);
-    assert(p->class_id < JS_CLASS_INIT_COUNT);
+    DCHECK(p->class_id < JS_CLASS_INIT_COUNT, "p->class_id < JS_CLASS_INIT_COUNT");
     p->u.opaque = opaque;
 }
 
@@ -13355,7 +13354,7 @@ static JSBigInt *js_bigint_normalize1(JSContext *ctx, JSBigInt *a, int l)
 {
     js_limb_t v;
 
-    assert(JS_REF_COUNT(a) == 1);
+    DCHECK(JS_REF_COUNT(a) == 1, "JS_REF_COUNT(a) == 1");
     while (l > 1) {
         v = a->tab[l - 1];
         if ((v != 0 && v != -1) ||
@@ -14117,7 +14116,7 @@ static JSBigInt *js_bigint_from_string(JSContext *ctx,
         memset(r->tab, 0, sizeof(r->tab[0]) * n_limbs);
         for(i = 0; i < n_digits; i++) {
             c = js_to_digit(p[n_digits - 1 - i]);
-            assert(c < radix);
+            DCHECK(c < radix, "c < radix");
             bit_pos = i * log2_radix;
             shift = bit_pos & (JS_LIMB_BITS - 1);
             pos = bit_pos / JS_LIMB_BITS;
@@ -14225,7 +14224,7 @@ static JSValue js_bigint_to_string1(JSContext *ctx, JSValueConst val, int radix)
         bool is_binary_radix;
         JSValue res;
 
-        assert(JS_VALUE_GET_TAG(val) == JS_TAG_BIG_INT);
+        DCHECK(JS_VALUE_GET_TAG(val) == JS_TAG_BIG_INT, "JS_VALUE_GET_TAG(val) == JS_TAG_BIG_INT");
         r = JS_VALUE_GET_PTR(val);
         if (r->len == 1 && r->tab[0] == 0) {
             /* '0' case */
@@ -17964,7 +17963,7 @@ static int js_op_define_class(JSContext *ctx, JSValue *sp,
         goto fail;
 
     b = JS_VALUE_GET_PTR(bfunc);
-    assert(b->func_kind == JS_FUNC_NORMAL);
+    DCHECK(b->func_kind == JS_FUNC_NORMAL, "b->func_kind == JS_FUNC_NORMAL");
     ctor = JS_NewObjectProtoClass(ctx, parent_class,
                                   JS_CLASS_BYTECODE_FUNCTION);
     if (JS_IsException(ctor))
@@ -41329,8 +41328,7 @@ static JSValue js_async_generator_resolve_function(JSContext *ctx,
 
     if (magic >= 2) {
         /* resume next case in AWAITING_RETURN state */
-        assert(s->state == JS_ASYNC_GENERATOR_STATE_AWAITING_RETURN ||
-               s->state == JS_ASYNC_GENERATOR_STATE_COMPLETED);
+        DCHECK(s->state == JS_ASYNC_GENERATOR_STATE_AWAITING_RETURN || s->state == JS_ASYNC_GENERATOR_STATE_COMPLETED, "s->state == JS_ASYNC_GENERATOR_STATE_AWAITING_RETURN || s->state == JS_ASYNC_GENERATOR_STATE_COMPLETED");
         s->state = JS_ASYNC_GENERATOR_STATE_COMPLETED;
         if (is_reject) {
             js_async_generator_reject(ctx, s, arg);
@@ -43637,10 +43635,10 @@ static int update_label(JSFunctionDef *s, int label, int delta)
 {
     LabelSlot *ls;
 
-    assert(label >= 0 && label < s->label_count);
+    DCHECK(label >= 0 && label < s->label_count, "label >= 0 && label < s->label_count");
     ls = &s->label_slots[label];
     ls->ref_count += delta;
-    assert(ls->ref_count >= 0);
+    DCHECK(ls->ref_count >= 0, "ls->ref_count >= 0");
     return ls->ref_count;
 }
 
@@ -44754,7 +44752,7 @@ static void set_object_name(JSParseState *s, JSAtom name)
         JSAtom atom;
         define_class_pos = fd->last_opcode_pos + 1 -
             get_u32(fd->byte_code.buf + fd->last_opcode_pos + 1);
-        assert(fd->byte_code.buf[define_class_pos] == OP_define_class);
+        DCHECK(fd->byte_code.buf[define_class_pos] == OP_define_class, "fd->byte_code.buf[define_class_pos] == OP_define_class");
         /* for consistency we free the previous atom which is
            JS_ATOM_empty_string */
         atom = get_u32(fd->byte_code.buf + define_class_pos + 1);
@@ -44780,7 +44778,7 @@ static void set_object_name_computed(JSParseState *s)
         int define_class_pos;
         define_class_pos = fd->last_opcode_pos + 1 -
             get_u32(fd->byte_code.buf + fd->last_opcode_pos + 1);
-        assert(fd->byte_code.buf[define_class_pos] == OP_define_class);
+        DCHECK(fd->byte_code.buf[define_class_pos] == OP_define_class, "fd->byte_code.buf[define_class_pos] == OP_define_class");
         fd->byte_code.buf[define_class_pos] = OP_define_class_computed;
         fd->last_opcode_pos = -1;
     }
@@ -53251,7 +53249,7 @@ static int js_module_linking_finish(JSContext *ctx, JSModuleDef *m, JSModuleDef 
         JS_FreeValue(ctx, ret_val);
     }
 
-    assert(m->dfs_ancestor_index <= m->dfs_index);
+    DCHECK(m->dfs_ancestor_index <= m->dfs_index, "m->dfs_ancestor_index <= m->dfs_index");
     if (m->dfs_index == m->dfs_ancestor_index) {
         for(;;) {
             /* pop m1 from stack */
@@ -53301,7 +53299,7 @@ static int js_module_linking_enter(JSModuleDef *m, JSModuleDef **pstack_top, int
         m->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
         m->status == JS_MODULE_STATUS_EVALUATED)
         return -1;
-    assert(m->status == JS_MODULE_STATUS_UNLINKED);
+    DCHECK(m->status == JS_MODULE_STATUS_UNLINKED, "m->status == JS_MODULE_STATUS_UNLINKED");
     m->status = JS_MODULE_STATUS_LINKING;
     m->dfs_index = index;
     m->dfs_ancestor_index = index;
@@ -53368,10 +53366,7 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
         {
             JSModuleDef *child = f->m;
             JSModuleLinkFrame *pf = &frames[depth - 1];
-            assert(child->status == JS_MODULE_STATUS_LINKING ||
-                   child->status == JS_MODULE_STATUS_LINKED ||
-                   child->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
-                   child->status == JS_MODULE_STATUS_EVALUATED);
+            DCHECK(child->status == JS_MODULE_STATUS_LINKING || child->status == JS_MODULE_STATUS_LINKED || child->status == JS_MODULE_STATUS_EVALUATING_ASYNC || child->status == JS_MODULE_STATUS_EVALUATED, "child->status == JS_MODULE_STATUS_LINKING || child->status == JS_MODULE_STATUS_LINKED || child->status == JS_MODULE_STATUS_EVALUATING_ASYNC || child->status == JS_MODULE_STATUS_EVALUATED");
             if (child->status == JS_MODULE_STATUS_LINKING)
                 pf->m->dfs_ancestor_index = min_int(pf->m->dfs_ancestor_index, child->dfs_ancestor_index);
         }
@@ -53396,24 +53391,19 @@ static int js_link_module(JSContext *ctx, JSModuleDef *m)
         printf("js_link_module '%s':\n", JS_AtomGetStr(ctx, buf1, sizeof(buf1), m->module_name));
     }
 #endif
-    assert(m->status == JS_MODULE_STATUS_UNLINKED ||
-           m->status == JS_MODULE_STATUS_LINKED ||
-           m->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
-           m->status == JS_MODULE_STATUS_EVALUATED);
+    DCHECK(m->status == JS_MODULE_STATUS_UNLINKED || m->status == JS_MODULE_STATUS_LINKED || m->status == JS_MODULE_STATUS_EVALUATING_ASYNC || m->status == JS_MODULE_STATUS_EVALUATED, "m->status == JS_MODULE_STATUS_UNLINKED || m->status == JS_MODULE_STATUS_LINKED || m->status == JS_MODULE_STATUS_EVALUATING_ASYNC || m->status == JS_MODULE_STATUS_EVALUATED");
     stack_top = NULL;
     if (js_inner_module_linking(ctx, m, &stack_top, 0) < 0) {
         while (stack_top != NULL) {
             m1 = stack_top;
-            assert(m1->status == JS_MODULE_STATUS_LINKING);
+            DCHECK(m1->status == JS_MODULE_STATUS_LINKING, "m1->status == JS_MODULE_STATUS_LINKING");
             m1->status = JS_MODULE_STATUS_UNLINKED;
             stack_top = m1->stack_prev;
         }
         return -1;
     }
-    assert(stack_top == NULL);
-    assert(m->status == JS_MODULE_STATUS_LINKED ||
-           m->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
-           m->status == JS_MODULE_STATUS_EVALUATED);
+    DCHECK(stack_top == NULL, "stack_top == NULL");
+    DCHECK(m->status == JS_MODULE_STATUS_LINKED || m->status == JS_MODULE_STATUS_EVALUATING_ASYNC || m->status == JS_MODULE_STATUS_EVALUATED, "m->status == JS_MODULE_STATUS_LINKED || m->status == JS_MODULE_STATUS_EVALUATING_ASYNC || m->status == JS_MODULE_STATUS_EVALUATED");
     return 0;
 }
 
@@ -53935,7 +53925,7 @@ static void js_set_module_evaluated(JSContext *ctx, JSModuleDef *m)
     m->status = JS_MODULE_STATUS_EVALUATED;
     if (!JS_IsUndefined(m->promise)) {
         JSValue ret_val;
-        assert(m->cycle_root == m);
+        DCHECK(m->cycle_root == m, "m->cycle_root == m");
         JSValueConst value = JS_UNDEFINED;
         ret_val = JS_Call(ctx, m->resolving_funcs[0], JS_UNDEFINED, 1, &value);
         JS_FreeValue(ctx, ret_val);
@@ -53971,6 +53961,23 @@ static bool find_in_exec_module_list(ExecModuleList *exec_list, JSModuleDef *m)
    identical (an edge decrements pending_async_dependencies once either way, and a module is appended only on
    the decrement that reaches zero), and the caller sorts exec_list by async_evaluation_timestamp before using
    it. */
+static void js_module_eval_capture(JSContext *ctx, JSModuleDef *m);
+
+/* WILL THIS MODULE GET ITS OWN FULFILLED REACTION? Exactly one predicate, because two sites must agree about
+   it and they did not. Stock quickjs evaluates a non-TLA module synchronously, so GatherAvailableAncestors has
+   to expand it INLINE — nothing else will ever propagate to its parents. This fork evaluates every BYTECODE
+   body asynchronously whether or not it has top-level await, because a loop or await back-edge can park it,
+   and only a C init_func module stays synchronous. The executor was updated for that; the gather was not, so a
+   non-TLA bytecode module was expanded inline AND later ran its own fulfilled reaction, and each of its
+   parents had pending_async_dependencies decremented twice. The second decrement is the one that goes below
+   zero.
+   That was a plain assert, compiled out of the NDEBUG build the harness uses, so the corpus was green over it
+   for as long as it existed. Migrating the asserts to DCHECK is what made it visible. */
+static inline bool js_module_is_async_evaluated(const JSModuleDef *m)
+{
+    return m->has_tla || !m->init_func;
+}
+
 static int gather_available_ancestors(JSContext *ctx, JSModuleDef *module,
                                       ExecModuleList *exec_list)
 {
@@ -53982,10 +53989,18 @@ static int gather_available_ancestors(JSContext *ctx, JSModuleDef *module,
             JSModuleDef *m = cur->async_parent_modules[i];
             if (!find_in_exec_module_list(exec_list, m) &&
                 !m->cycle_root->eval_has_exception) {
-                assert(m->status == JS_MODULE_STATUS_EVALUATING_ASYNC);
-                assert(!m->eval_has_exception);
-                assert(m->async_evaluation);
-                assert(m->pending_async_dependencies > 0);
+                /* THE DECREMENT BELOW IS A WRITE TO m, not to the module whose promise settled, and it was the
+                   only write to a captured field in the whole module system that never announced itself. The
+                   caller captures the fulfilled module; every ANCESTOR whose pending count this walk lowers is
+                   a different module, so without this the decrement lands outside the flow's COW delta and is
+                   seen by every sibling flow. Two flows then decrement the same counter once each, it reaches
+                   zero twice, and the second walk trips "pending_async_dependencies > 0" — which was a plain
+                   assert compiled out by -DNDEBUG, so it went unseen. */
+                js_module_eval_capture(ctx, m);
+                DCHECK(m->status == JS_MODULE_STATUS_EVALUATING_ASYNC, "m->status == JS_MODULE_STATUS_EVALUATING_ASYNC");
+                DCHECK(!m->eval_has_exception, "!m->eval_has_exception");
+                DCHECK(m->async_evaluation, "m->async_evaluation");
+                DCHECK(m->pending_async_dependencies > 0, "m->pending_async_dependencies > 0");
                 m->pending_async_dependencies--;
                 if (m->pending_async_dependencies == 0) {
                     if (js_resize_array(ctx, (void **)&exec_list->tab, sizeof(exec_list->tab[0]), &exec_list->size, exec_list->count + 1)) {
@@ -53995,8 +54010,11 @@ static int gather_available_ancestors(JSContext *ctx, JSModuleDef *module,
                 }
             }
         }
-        /* the next appended entry that still needs expanding; a TLA module is a leaf here */
-        while (cursor < exec_list->count && exec_list->tab[cursor]->has_tla)
+        /* The next appended entry that still needs expanding. A module that will run its own fulfilled
+           reaction is a LEAF here — that reaction re-enters this walk for it, and expanding it now as well is
+           the double-decrement. */
+        while (cursor < exec_list->count &&
+               js_module_is_async_evaluated(exec_list->tab[cursor]))
             cursor++;
         if (cursor >= exec_list->count)
             return 0;
@@ -54016,51 +54034,70 @@ static int js_execute_async_module(JSContext *ctx, JSModuleDef *m);
 static int js_execute_sync_module(JSContext *ctx, JSModuleDef *m,
                                   JSValue *pvalue);
 static void js_promise_set_handled(JSContext *ctx, JSValueConst promise);
-static void js_module_eval_capture(JSContext *ctx, JSModuleDef *m);
 
+/* AsyncModuleExecutionRejected, as an explicit STACK rather than C recursion, and so with no stack guard: the
+   depth was the async module graph's, which the imported source picks.
+
+   THE ORDER IS THE WHOLE DIFFICULTY, and it is why this is a LIFO stack and not the cursor-over-exec_list that
+   GatherAvailableAncestors uses. Step 9 rejects THIS module's capability and step 10 then walks the async
+   parents in index order, so settlement is pre-order depth-first and OBSERVABLE — a test measures it. A
+   worklist consumed front-to-back would turn that into breadth-first and reorder promise settlement. Popping
+   from a stack and pushing the parents in REVERSE reproduces the recursion's order exactly: parent 0 is on top
+   and is fully expanded before parent 1 is reached. Order preserved by CONSTRUCTION, not by argument.
+
+   The recursion also allocated a JSValue per edge — JS_NewModuleValue purely so the recursive call could
+   re-enter through this function's own callback signature. Walking directly needs no such wrapper, so the
+   edge allocation goes with the recursion. */
 static JSValue js_async_module_execution_rejected(JSContext *ctx, JSValueConst this_val,
                                                   int argc, JSValueConst *argv, int magic,
                                                   JSValueConst *func_data)
 {
     JSModuleDef *module = JS_VALUE_GET_PTR(func_data[0]);
     JSValueConst error = argv[0];
+    JSModuleDef **stack = NULL;
+    int stack_count = 0, stack_size = 0;
     int i;
 
-    if (js_check_stack_overflow(ctx->rt, 0))
-        return JS_ThrowStackOverflow(ctx);
+    if (js_resize_array(ctx, (void **)&stack, sizeof(stack[0]), &stack_size, 1))
+        return JS_EXCEPTION;
+    stack[stack_count++] = module;
 
-    js_module_eval_capture(ctx, module);   /* this reaction is a WRITE to the module's evaluation state */
-    if (module->status == JS_MODULE_STATUS_EVALUATED) {
-        assert(module->eval_has_exception);
-        return JS_UNDEFINED;
+    while (stack_count > 0) {
+        JSModuleDef *m = stack[--stack_count];
+
+        js_module_eval_capture(ctx, m);   /* this reaction is a WRITE to the module's evaluation state */
+        if (m->status == JS_MODULE_STATUS_EVALUATED) {
+            DCHECK(m->eval_has_exception, "m->eval_has_exception");
+            continue;
+        }
+
+        DCHECK(m->status == JS_MODULE_STATUS_EVALUATING_ASYNC, "m->status == JS_MODULE_STATUS_EVALUATING_ASYNC");
+        DCHECK(!m->eval_has_exception, "!m->eval_has_exception");
+        DCHECK(m->async_evaluation, "m->async_evaluation");
+
+        m->eval_has_exception = true;
+        m->eval_exception = js_dup(error);
+        m->status = JS_MODULE_STATUS_EVALUATED;
+
+        /* step 9, before any parent is reached — the leaf-to-root settlement order */
+        if (!JS_IsUndefined(m->promise)) {
+            JSValue ret_val;
+            DCHECK(m->cycle_root == m, "m->cycle_root == m");
+            ret_val = JS_Call(ctx, m->resolving_funcs[1], JS_UNDEFINED,
+                              1, &error);
+            JS_FreeValue(ctx, ret_val);
+        }
+
+        /* step 10, pushed in REVERSE so they pop in index order */
+        if (js_resize_array(ctx, (void **)&stack, sizeof(stack[0]), &stack_size,
+                            stack_count + m->async_parent_modules_count)) {
+            js_free(ctx, stack);
+            return JS_EXCEPTION;
+        }
+        for(i = m->async_parent_modules_count - 1; i >= 0; i--)
+            stack[stack_count++] = m->async_parent_modules[i];
     }
-
-    assert(module->status == JS_MODULE_STATUS_EVALUATING_ASYNC);
-    assert(!module->eval_has_exception);
-    assert(module->async_evaluation);
-
-    module->eval_has_exception = true;
-    module->eval_exception = js_dup(error);
-    module->status = JS_MODULE_STATUS_EVALUATED;
-
-    /* AsyncModuleExecutionRejected step 9 rejects THIS module's top-level capability, and step 10 recurses into
-       the async parents — in that order, so the promises settle LEAF-TO-ROOT. Recursing first settled them
-       root-to-leaf, which rejection-order measures. */
-    if (!JS_IsUndefined(module->promise)) {
-        JSValue ret_val;
-        assert(module->cycle_root == module);
-        ret_val = JS_Call(ctx, module->resolving_funcs[1], JS_UNDEFINED,
-                          1, &error);
-        JS_FreeValue(ctx, ret_val);
-    }
-
-    for(i = 0; i < module->async_parent_modules_count; i++) {
-        JSModuleDef *m = module->async_parent_modules[i];
-        JSValue m_obj = JS_NewModuleValue(ctx, m);
-        js_async_module_execution_rejected(ctx, JS_UNDEFINED, 1, &error, 0,
-                                           vc(&m_obj));
-        JS_FreeValue(ctx, m_obj);
-    }
+    js_free(ctx, stack);
     return JS_UNDEFINED;
 }
 
@@ -54074,12 +54111,12 @@ static JSValue js_async_module_execution_fulfilled(JSContext *ctx, JSValueConst 
 
     js_module_eval_capture(ctx, module);   /* this reaction is a WRITE to the module's evaluation state */
     if (module->status == JS_MODULE_STATUS_EVALUATED) {
-        assert(module->eval_has_exception);
+        DCHECK(module->eval_has_exception, "module->eval_has_exception");
         return JS_UNDEFINED;
     }
-    assert(module->status == JS_MODULE_STATUS_EVALUATING_ASYNC);
-    assert(!module->eval_has_exception);
-    assert(module->async_evaluation);
+    DCHECK(module->status == JS_MODULE_STATUS_EVALUATING_ASYNC, "module->status == JS_MODULE_STATUS_EVALUATING_ASYNC");
+    DCHECK(!module->eval_has_exception, "!module->eval_has_exception");
+    DCHECK(module->async_evaluation, "module->async_evaluation");
     module->async_evaluation = false;
     js_set_module_evaluated(ctx, module);
 
@@ -54099,8 +54136,8 @@ static JSValue js_async_module_execution_fulfilled(JSContext *ctx, JSValueConst 
     for(i = 0; i < exec_list->count; i++) {
         JSModuleDef *m = exec_list->tab[i];
         if (m->status == JS_MODULE_STATUS_EVALUATED) {
-            assert(m->eval_has_exception);
-        } else if (m->has_tla || !m->init_func) {
+            DCHECK(m->eval_has_exception, "m->eval_has_exception");
+        } else if (js_module_is_async_evaluated(m)) {
             /* EVERY bytecode body is async-evaluated, top-level await or not, because a loop/await back-edge can
                PARK it — the same rule js_inner_module_evaluation applies, and the reason only a C init_func
                module is synchronous here. Splitting on has_tla alone drove a parking body through
@@ -54219,7 +54256,7 @@ static int js_module_eval_finish(JSContext *ctx, JSModuleDef *m, JSModuleDef **p
     bool exec_async = false;
 
     if (m->pending_async_dependencies > 0) {
-        assert(!m->async_evaluation);
+        DCHECK(!m->async_evaluation, "!m->async_evaluation");
         m->async_evaluation = true;
         m->async_evaluation_timestamp =
             ctx->rt->module_async_evaluation_next_timestamp++;
@@ -54228,7 +54265,7 @@ static int js_module_eval_finish(JSContext *ctx, JSModuleDef *m, JSModuleDef **p
            back-edge), so it is async-evaluated even without top-level await — the only truly-synchronous modules are
            C init_func modules (no parking). Treating them all as async from the DFS keeps pending_async_dependencies
            correct when a "sync" body parks (a runtime-discovered async-ness would corrupt the parents' counts). */
-        assert(!m->async_evaluation);
+        DCHECK(!m->async_evaluation, "!m->async_evaluation");
         m->async_evaluation = true;
         m->async_evaluation_timestamp =
             ctx->rt->module_async_evaluation_next_timestamp++;
@@ -54239,7 +54276,7 @@ static int js_module_eval_finish(JSContext *ctx, JSModuleDef *m, JSModuleDef **p
             return -1;
     }
 
-    assert(m->dfs_ancestor_index <= m->dfs_index);
+    DCHECK(m->dfs_ancestor_index <= m->dfs_index, "m->dfs_ancestor_index <= m->dfs_index");
     if (m->dfs_index == m->dfs_ancestor_index) {
         for(;;) {
             /* pop m1 from stack */
@@ -54276,16 +54313,13 @@ static int js_module_eval_finish(JSContext *ctx, JSModuleDef *m, JSModuleDef **p
    whose frame has just been popped — which is the one point the recursion reached it from. */
 static int js_module_eval_after_child(JSContext *ctx, JSModuleDef *m, JSModuleDef *m1, JSValue *pvalue)
 {
-    assert(m1->status == JS_MODULE_STATUS_EVALUATING ||
-           m1->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
-           m1->status == JS_MODULE_STATUS_EVALUATED);
+    DCHECK(m1->status == JS_MODULE_STATUS_EVALUATING || m1->status == JS_MODULE_STATUS_EVALUATING_ASYNC || m1->status == JS_MODULE_STATUS_EVALUATED, "m1->status == JS_MODULE_STATUS_EVALUATING || m1->status == JS_MODULE_STATUS_EVALUATING_ASYNC || m1->status == JS_MODULE_STATUS_EVALUATED");
     if (m1->status == JS_MODULE_STATUS_EVALUATING) {
         m->dfs_ancestor_index = min_int(m->dfs_ancestor_index,
                             m1->dfs_ancestor_index);
     } else {
         m1 = m1->cycle_root;
-        assert(m1->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
-           m1->status == JS_MODULE_STATUS_EVALUATED);
+        DCHECK(m1->status == JS_MODULE_STATUS_EVALUATING_ASYNC || m1->status == JS_MODULE_STATUS_EVALUATED, "m1->status == JS_MODULE_STATUS_EVALUATING_ASYNC || m1->status == JS_MODULE_STATUS_EVALUATED");
         if (m1->eval_has_exception) {
         *pvalue = js_dup(m1->eval_exception);
         return -1;
@@ -54326,7 +54360,7 @@ static int js_module_eval_enter(JSContext *ctx, JSModuleDef *m, int index, JSMod
     }
     if (m->status == JS_MODULE_STATUS_EVALUATING)
         return index;
-    assert(m->status == JS_MODULE_STATUS_LINKED);
+    DCHECK(m->status == JS_MODULE_STATUS_LINKED, "m->status == JS_MODULE_STATUS_LINKED");
     m->status = JS_MODULE_STATUS_EVALUATING;
     m->dfs_index = index;
     m->dfs_ancestor_index = index;
@@ -54416,7 +54450,32 @@ typedef struct JSModuleEvalState {
     JSValue promise;
     JSValue resolving_funcs[2];
     JSValue eval_exception;
+    /* THE ASYNC PARENT LIST, and it has to be here because pending_async_dependencies is. The two are one
+       accounting: js_module_eval_after_child increments the counter and appends to this array in the same
+       breath, one pair per graph edge, and GatherAvailableAncestors decrements once per entry it walks.
+       Capturing the counter WITHOUT the array is what broke: a flow saved at count 0, evaluated until the
+       array held two parents and the counter read two, then restored the counter to zero while the array kept
+       both entries — and the next walk decremented a counter that was already zero. That fired as
+       "pending_async_dependencies > 0" and was invisible for as long as it was a plain assert compiled out by
+       -DNDEBUG. The entries are borrowed JSModuleDef pointers owned by the module list, so the ARRAY is owned
+       here and its contents are a shallow copy. */
+    JSModuleDef **async_parent_modules;
+    int async_parent_modules_count;
 } JSModuleEvalState;
+
+/* One copy helper, because the obligation is at four sites — save, restore, clone, free — and a field added to
+   a struct that is copied field-by-field is exactly the shape that gets missed at one of them. */
+static JSModuleDef **js_module_apm_dup(JSContext *ctx, JSModuleDef **src, int count)
+{
+    JSModuleDef **dst;
+    if (count <= 0)
+        return NULL;
+    dst = js_malloc(ctx, sizeof(*dst) * count);
+    if (!dst)
+        return NULL;
+    memcpy(dst, src, sizeof(*dst) * count);
+    return dst;
+}
 
 void *JS_ModuleEvalStateSave(JSContext *ctx, void *mod)
 {
@@ -54424,12 +54483,14 @@ void *JS_ModuleEvalStateSave(JSContext *ctx, void *mod)
     JSModuleEvalState *b = js_malloc(ctx, sizeof(*b));
     if (!b)
         return NULL;
-    /* A module with async PARENTS is mid-flight in a top-level-await graph, and that list is a heap array whose
-       ownership this blob does not take — restoring a stale one would hand two owners the same array. No flow
-       has reached that shape yet; when one does, the array joins the blob. */
-    DCHECK(m->async_parent_modules_count == 0,
-           "a module's evaluation state is being captured while it has async parents — the parent list must "
-           "join the blob before a top-level-await graph can time-travel");
+    /* The array is copied BEFORE any js_dup, so this failure path owns nothing but the blob. */
+    b->async_parent_modules_count = m->async_parent_modules_count;
+    b->async_parent_modules = js_module_apm_dup(ctx, m->async_parent_modules,
+                                                m->async_parent_modules_count);
+    if (m->async_parent_modules_count > 0 && !b->async_parent_modules) {
+        js_free(ctx, b);
+        return NULL;
+    }
     b->status = m->status;
     b->eval_started = m->eval_started;
     b->dfs_index = m->dfs_index;
@@ -54471,6 +54532,14 @@ void JS_ModuleEvalStateRestore(JSContext *ctx, void *mod, void *blob)
     m->resolving_funcs[0] = js_dup(b->resolving_funcs[0]);
     m->resolving_funcs[1] = js_dup(b->resolving_funcs[1]);
     m->eval_exception = js_dup(b->eval_exception);
+    /* The array is restored WITH the counter, never without it — see JSModuleEvalState. */
+    js_free(ctx, m->async_parent_modules);
+    m->async_parent_modules = js_module_apm_dup(ctx, b->async_parent_modules,
+                                                b->async_parent_modules_count);
+    CHECK(b->async_parent_modules_count <= 0 || m->async_parent_modules != NULL,
+          "out of memory restoring a module's async parent list — the flow's accounting cannot be made whole");
+    m->async_parent_modules_count = b->async_parent_modules_count;
+    m->async_parent_modules_size = b->async_parent_modules_count;
 }
 
 void *JS_ModuleEvalStateClone(JSContext *ctx, void *blob)
@@ -54482,6 +54551,12 @@ void *JS_ModuleEvalStateClone(JSContext *ctx, void *blob)
     if (!c)
         return NULL;
     *c = *b;
+    c->async_parent_modules = js_module_apm_dup(ctx, b->async_parent_modules,
+                                                b->async_parent_modules_count);
+    if (b->async_parent_modules_count > 0 && !c->async_parent_modules) {
+        js_free(ctx, c);
+        return NULL;
+    }
     c->promise = js_dup(b->promise);
     c->resolving_funcs[0] = js_dup(b->resolving_funcs[0]);
     c->resolving_funcs[1] = js_dup(b->resolving_funcs[1]);
@@ -54498,6 +54573,7 @@ void JS_ModuleEvalStateFree(JSRuntime *rt, void *blob)
     JS_FreeValueRT(rt, b->resolving_funcs[0]);
     JS_FreeValueRT(rt, b->resolving_funcs[1]);
     JS_FreeValueRT(rt, b->eval_exception);
+    js_free_rt(rt, b->async_parent_modules);
     js_free_rt(rt, b);
 }
 
@@ -54535,9 +54611,7 @@ static JSValue js_evaluate_module(JSContext *ctx, JSModuleDef *m)
     /* BEFORE the status is even READ: whether this flow evaluates at all is decided by state a sibling may have
        written, so the capture has to precede the test, not the write. */
     js_module_eval_capture(ctx, m);
-    assert(m->status == JS_MODULE_STATUS_LINKED ||
-           m->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
-           m->status == JS_MODULE_STATUS_EVALUATED);
+    DCHECK(m->status == JS_MODULE_STATUS_LINKED || m->status == JS_MODULE_STATUS_EVALUATING_ASYNC || m->status == JS_MODULE_STATUS_EVALUATED, "m->status == JS_MODULE_STATUS_LINKED || m->status == JS_MODULE_STATUS_EVALUATING_ASYNC || m->status == JS_MODULE_STATUS_EVALUATED");
     if (m->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
         m->status == JS_MODULE_STATUS_EVALUATED) {
         m = m->cycle_root;
@@ -54563,7 +54637,7 @@ static JSValue js_evaluate_module(JSContext *ctx, JSModuleDef *m)
     if (js_inner_module_evaluation(ctx, m, 0, &stack_top, &result) < 0) {
         while (stack_top != NULL) {
             m1 = stack_top;
-            assert(m1->status == JS_MODULE_STATUS_EVALUATING);
+            DCHECK(m1->status == JS_MODULE_STATUS_EVALUATING, "m1->status == JS_MODULE_STATUS_EVALUATING");
             m1->status = JS_MODULE_STATUS_EVALUATED;
             m1->eval_has_exception = true;
             m1->eval_exception = js_dup(result);
@@ -54571,23 +54645,22 @@ static JSValue js_evaluate_module(JSContext *ctx, JSModuleDef *m)
             stack_top = m1->stack_prev;
         }
         JS_FreeValue(ctx, result);
-        assert(m->status == JS_MODULE_STATUS_EVALUATED);
-        assert(m->eval_has_exception);
+        DCHECK(m->status == JS_MODULE_STATUS_EVALUATED, "m->status == JS_MODULE_STATUS_EVALUATED");
+        DCHECK(m->eval_has_exception, "m->eval_has_exception");
         ret_val = JS_Call(ctx, m->resolving_funcs[1], JS_UNDEFINED,
                           1, vc(&m->eval_exception));
         JS_FreeValue(ctx, ret_val);
     } else {
-        assert(m->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
-               m->status == JS_MODULE_STATUS_EVALUATED);
-        assert(!m->eval_has_exception);
+        DCHECK(m->status == JS_MODULE_STATUS_EVALUATING_ASYNC || m->status == JS_MODULE_STATUS_EVALUATED, "m->status == JS_MODULE_STATUS_EVALUATING_ASYNC || m->status == JS_MODULE_STATUS_EVALUATED");
+        DCHECK(!m->eval_has_exception, "!m->eval_has_exception");
         if (!m->async_evaluation) {
-            assert(m->status == JS_MODULE_STATUS_EVALUATED);
+            DCHECK(m->status == JS_MODULE_STATUS_EVALUATED, "m->status == JS_MODULE_STATUS_EVALUATED");
             JSValueConst value = JS_UNDEFINED;
             ret_val = JS_Call(ctx, m->resolving_funcs[0], JS_UNDEFINED,
                               1, &value);
             JS_FreeValue(ctx, ret_val);
         }
-        assert(stack_top == NULL);
+        DCHECK(stack_top == NULL, "stack_top == NULL");
     }
     return js_dup(m->promise);
 }
@@ -55696,7 +55769,7 @@ static int optimize_scope_make_ref(JSContext *ctx, JSFunctionDef *s,
     /* XXX: should avoid this patch by inserting nops in phase 1 */
     label_pos = ls->pos;
     pos = label_pos - 5;
-    assert(bc_buf[pos] == OP_label);
+    DCHECK(bc_buf[pos] == OP_label, "bc_buf[pos] == OP_label");
     /* label points to an instruction pair:
        - insert3 / put_ref_value
        - perm4 / put_ref_value
@@ -56446,7 +56519,7 @@ static int resolve_scope_private_field(JSContext *ctx, JSFunctionDef *s,
                                        var_name, scope_level);
     if (idx < 0)
         return -1;
-    assert(var_kind != JS_VAR_NORMAL);
+    DCHECK(var_kind != JS_VAR_NORMAL, "var_kind != JS_VAR_NORMAL");
     switch (op) {
     case OP_scope_get_private_field:
     case OP_scope_get_private_field2:
@@ -56507,7 +56580,7 @@ static int resolve_scope_private_field(JSContext *ctx, JSFunctionDef *s,
                 JS_FreeAtom(ctx, setter_name);
                 if (idx < 0)
                     return -1;
-                assert(var_kind == JS_VAR_PRIVATE_SETTER);
+                DCHECK(var_kind == JS_VAR_PRIVATE_SETTER, "var_kind == JS_VAR_PRIVATE_SETTER");
                 get_loc_or_ref(bc, is_ref, idx);
                 dbuf_putc(bc, OP_swap);
                 /* obj func value */
@@ -56605,7 +56678,7 @@ static void add_eval_variables(JSContext *ctx, JSFunctionDef *s)
        they must be all put in the closure. The closure variables are
        ordered by scope. It works only because no closure are created
        before. */
-    assert(s->is_eval || s->closure_var_count == 0);
+    DCHECK(s->is_eval || s->closure_var_count == 0, "s->is_eval || s->closure_var_count == 0");
 
     /* mark all local variables as captured since eval can access any of them */
     if (!s->is_eval) {
@@ -57106,7 +57179,7 @@ static int skip_dead_code(JSFunctionDef *s, const uint8_t *bc_buf, int bc_len,
             label = get_u32(bc_buf + pos + 1);
             if (update_label(s, label, 0) > 0)
                 break;
-            assert(s->label_slots[label].first_reloc == NULL);
+            DCHECK(s->label_slots[label].first_reloc == NULL, "s->label_slots[label].first_reloc == NULL");
         } else {
             /* XXX: output a warning for unreachable code? */
             JSAtom atom;
@@ -57293,7 +57366,7 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
                 LabelSlot *ls;
 
                 label = get_u32(bc_buf + pos + 1);
-                assert(label >= 0 && label < s->label_count);
+                DCHECK(label >= 0 && label < s->label_count, "label >= 0 && label < s->label_count");
                 ls = &s->label_slots[label];
                 if (code_match(&cc, ls->pos, OP_ret, -1)) {
                     ls->ref_count--;
@@ -57358,7 +57431,7 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
                 LabelSlot *ls;
 
                 label = get_u32(bc_buf + pos + 1);
-                assert(label >= 0 && label < s->label_count);
+                DCHECK(label >= 0 && label < s->label_count, "label >= 0 && label < s->label_count");
                 ls = &s->label_slots[label];
                 ls->pos2 = bc_out.size + opcode_info[op].size;
             }
@@ -57517,7 +57590,7 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
             if (code_match(&cc, pos_next, M2(OP_if_false, OP_if_true), OP_drop, -1)) {
                 int lab0, lab1, op1, pos1, line1, col1, pos2;
                 lab0 = lab1 = cc.label;
-                assert(lab1 >= 0 && lab1 < s->label_count);
+                DCHECK(lab1 >= 0 && lab1 < s->label_count, "lab1 >= 0 && lab1 < s->label_count");
                 op1 = cc.op;
                 pos1 = cc.pos;
                 line1 = cc.line_num;
@@ -57710,7 +57783,7 @@ static int find_jump_target(JSFunctionDef *s, int label, int *pop)
 
     update_label(s, label, -1);
     for (i = 0; i < 10; i++) {
-        assert(label >= 0 && label < s->label_count);
+        DCHECK(label >= 0 && label < s->label_count, "label >= 0 && label < s->label_count");
         pos = s->label_slots[label].pos2;
         for (;;) {
             switch(op = s->byte_code.buf[pos]) {
@@ -57939,9 +58012,9 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
         case OP_label:
             {
                 label = get_u32(bc_buf + pos + 1);
-                assert(label >= 0 && label < s->label_count);
+                DCHECK(label >= 0 && label < s->label_count, "label >= 0 && label < s->label_count");
                 ls = &label_slots[label];
-                assert(ls->addr == -1);
+                DCHECK(ls->addr == -1, "ls->addr == -1");
                 ls->addr = bc_out.size;
                 /* resolve the relocation entries */
                 for(re = ls->first_reloc; re != NULL; re = re_next) {
@@ -57952,11 +58025,11 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                         put_u32(bc_out.buf + re->addr, diff);
                         break;
                     case 2:
-                        assert(diff == (int16_t)diff);
+                        DCHECK(diff == (int16_t)diff, "diff == (int16_t)diff");
                         put_u16(bc_out.buf + re->addr, diff);
                         break;
                     case 1:
-                        assert(diff == (int8_t)diff);
+                        DCHECK(diff == (int8_t)diff, "diff == (int8_t)diff");
                         put_u8(bc_out.buf + re->addr, diff);
                         break;
                     }
@@ -58064,7 +58137,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                 pos_next = skip_dead_code(s, bc_buf, bc_len, pos_next,
                                           &line_num, &col_num);
             }
-            assert(label >= 0 && label < s->label_count);
+            DCHECK(label >= 0 && label < s->label_count, "label >= 0 && label < s->label_count");
             ls = &label_slots[label];
             jp = &s->jump_slots[s->jump_count++];
             jp->op = op;
@@ -58131,7 +58204,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                 label = get_u32(bc_buf + pos + 5);
                 is_with = bc_buf[pos + 9];
                 label = find_jump_target(s, label, &op1);
-                assert(label >= 0 && label < s->label_count);
+                DCHECK(label >= 0 && label < s->label_count, "label >= 0 && label < s->label_count");
                 ls = &label_slots[label];
                 add_pc2line_info(s, bc_out.size, line_num, col_num);
                 jp = &s->jump_slots[s->jump_count++];
@@ -58638,7 +58711,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
 
     /* check that there were no missing labels */
     for(i = 0; i < s->label_count; i++) {
-        assert(label_slots[i].first_reloc == NULL);
+        DCHECK(label_slots[i].first_reloc == NULL, "label_slots[i].first_reloc == NULL");
     }
 
     /* more jump optimizations */
@@ -59088,7 +59161,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
         if (JS_IsException(func_obj))
             goto fail;
         /* save it in the constant pool */
-        assert(cpool_idx >= 0);
+        DCHECK(cpool_idx >= 0, "cpool_idx >= 0");
         fd->cpool[cpool_idx] = func_obj;
     }
 
@@ -59638,10 +59711,10 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
     if (eval_type == JS_EVAL_TYPE_DIRECT) {
         JSObject *p;
         sf = ctx->rt->current_stack_frame;
-        assert(sf != NULL);
-        assert(JS_VALUE_GET_TAG(sf->cur_func) == JS_TAG_OBJECT);
+        DCHECK(sf != NULL, "sf != NULL");
+        DCHECK(JS_VALUE_GET_TAG(sf->cur_func) == JS_TAG_OBJECT, "JS_VALUE_GET_TAG(sf->cur_func) == JS_TAG_OBJECT");
         p = JS_VALUE_GET_OBJ(sf->cur_func);
-        assert(js_class_has_bytecode(p->class_id));
+        DCHECK(js_class_has_bytecode(p->class_id), "js_class_has_bytecode(p->class_id)");
         b = p->u.func.function_bytecode;
         var_refs = p->u.func.var_refs;
         is_strict_mode = b->is_strict_mode;
@@ -59820,8 +59893,7 @@ JSValue JS_EvalThis2(JSContext *ctx, JSValueConst this_obj,
     }
     JSValue ret;
 
-    assert((eval_flags & JS_EVAL_TYPE_MASK) == JS_EVAL_TYPE_GLOBAL ||
-           (eval_flags & JS_EVAL_TYPE_MASK) == JS_EVAL_TYPE_MODULE);
+    DCHECK((eval_flags & JS_EVAL_TYPE_MASK) == JS_EVAL_TYPE_GLOBAL || (eval_flags & JS_EVAL_TYPE_MASK) == JS_EVAL_TYPE_MODULE, "(eval_flags & JS_EVAL_TYPE_MASK) == JS_EVAL_TYPE_GLOBAL || (eval_flags & JS_EVAL_TYPE_MASK) == JS_EVAL_TYPE_MODULE");
     ret = JS_EvalInternal(ctx, this_obj, input, input_len, filename, line,
                           eval_flags, -1);
     return ret;
@@ -60306,7 +60378,7 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
     bc_set_flags(&flags, &idx, b->from_eval, 1);
     bc_set_flags(&flags, &idx, b->is_program, 1);
     bc_set_flags(&flags, &idx, s->allow_debug, 1);
-    assert(idx <= 16);
+    DCHECK(idx <= 16, "idx <= 16");
     bc_put_u16(s, flags);
     bc_put_u8(s, b->is_strict_mode);
     bc_put_atom(s, b->func_name);
@@ -60332,7 +60404,7 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
             bc_set_flags(&flags, &idx, vd->is_const, 1);
             bc_set_flags(&flags, &idx, vd->is_lexical, 1);
             bc_set_flags(&flags, &idx, vd->is_captured, 1);
-            assert(idx <= 8);
+            DCHECK(idx <= 8, "idx <= 8");
             bc_put_u8(s, flags);
             if (vd->is_captured)
                 bc_put_leb128(s, vd->var_ref_idx);
@@ -60350,7 +60422,7 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
         bc_set_flags(&flags, &idx, cv->is_const, 1);
         bc_set_flags(&flags, &idx, cv->is_lexical, 1);
         bc_set_flags(&flags, &idx, cv->var_kind, 4);
-        assert(idx <= 16);
+        DCHECK(idx <= 16, "idx <= 16");
         bc_put_leb128(s, flags);
     }
 
@@ -60549,7 +60621,7 @@ static int JS_WriteSharedArrayBuffer(BCWriterState *s, JSValueConst obj)
 {
     JSObject *p = JS_VALUE_GET_OBJ(obj);
     JSArrayBuffer *abuf = p->u.array_buffer;
-    assert(!abuf->detached); /* SharedArrayBuffer are never detached */
+    DCHECK(!abuf->detached, "!abuf->detached"); /* SharedArrayBuffer are never detached */
     bc_put_u8(s, BC_TAG_SHARED_ARRAY_BUFFER);
     bc_put_leb128(s, abuf->byte_length);
     bc_put_leb128(s, abuf->max_byte_length);
@@ -60565,7 +60637,7 @@ static int JS_WriteSharedArrayBuffer(BCWriterState *s, JSValueConst obj)
 static int JS_WriteRegExp(BCWriterState *s, JSRegExp regexp)
 {
     JSString *bc = regexp.bytecode;
-    assert(!bc->is_wide_char);
+    DCHECK(!bc->is_wide_char, "!bc->is_wide_char");
     JS_WriteString(s, regexp.pattern);
     JS_WriteString(s, bc);
     return 0;
@@ -60763,7 +60835,7 @@ static int JS_WriteObjectAtoms(BCWriterState *s)
         } else {
             JSAtomStruct *p = rt->atom_array[atom];
             uint8_t type = p->atom_type;
-            assert(type != JS_ATOM_TYPE_PRIVATE);
+            DCHECK(type != JS_ATOM_TYPE_PRIVATE, "type != JS_ATOM_TYPE_PRIVATE");
             bc_put_u8(s, type);
             JS_WriteString(s, p);
         }
@@ -69677,8 +69749,8 @@ static int js_array_every_step(JSContext *ctx, JSArrayEvery *s, JSValue res, JSV
     int r;
     /* the element cursor never runs past the length; pending_k is either -1 (no callback in flight) or the
        index whose callback result is `res` now — a drift would double-process or skip an element. */
-    assert(s->k >= 0 && s->k <= s->len);
-    assert(s->pending_k == -1 || (s->pending_k >= 0 && s->pending_k < s->len));
+    DCHECK(s->k >= 0 && s->k <= s->len, "s->k >= 0 && s->k <= s->len");
+    DCHECK(s->pending_k == -1 || (s->pending_k >= 0 && s->pending_k < s->len), "s->pending_k == -1 || (s->pending_k >= 0 && s->pending_k < s->len)");
     if (s->def_ph == 2)          /* re-entered mid-coercion of a TypedArray write's value */
         goto do_ta_write;
     if (s->def_ph)               /* re-entered mid-write: the driver has performed it */
@@ -70057,7 +70129,7 @@ static int js_array_reduce_step(JSContext *ctx, JSArrayReduce *s, JSValue acc1, 
 {
     int r;
     /* the scan cursor stays within the array; pending is 0/1 (at most one callback in flight). */
-    assert(s->k >= -1 && s->k <= s->len && (s->pending == 0 || s->pending == 1));
+    DCHECK(s->k >= -1 && s->k <= s->len && (s->pending == 0 || s->pending == 1), "s->k >= -1 && s->k <= s->len && (s->pending == 0 || s->pending == 1)");
     if (s->pending) {
         s->pending = 0;
         JS_FreeValue(ctx, s->acc);
@@ -74841,8 +74913,8 @@ static int js_array_sort_step(JSContext *ctx, JSArraySort *s, JSValue res, JSVal
         /* merge invariants — an active block [lo,hi) with ordered cursors, and the exactly-conserved output
            count (each element placed into tmp is consumed from exactly one run). A violation is a state-machine
            bug; crash at its origin (offensive programming) rather than silently mis-sorting. */
-        assert(s->lo <= s->l && s->l <= s->mid && s->mid <= s->r && s->r <= s->hi && s->hi <= s->n);
-        assert(s->k - s->lo == (s->l - s->lo) + (s->r - s->mid));
+        DCHECK(s->lo <= s->l && s->l <= s->mid && s->mid <= s->r && s->r <= s->hi && s->hi <= s->n, "s->lo <= s->l && s->l <= s->mid && s->mid <= s->r && s->r <= s->hi && s->hi <= s->n");
+        DCHECK(s->k - s->lo == (s->l - s->lo) + (s->r - s->mid), "s->k - s->lo == (s->l - s->lo) + (s->r - s->mid)");
         if (s->l < s->mid && s->r < s->hi) {
             if (JS_IsUndefined(s->method)) {
                 /* DEFAULT ordering: ToString both and compare. It lives HERE so ONE machine covers both
@@ -83210,6 +83282,10 @@ static void js_json_parse_abandon(JSContext *ctx, JSJsonReviver *s)
     s->parsing = 0;
 }
 
+/* The reviver walk's phase ceiling — 0..6, where 5 and 6 are the parked proxy-trap requests. Named so the
+   DFS invariant below cannot fall behind the phases the walk actually uses. */
+#define JR_PHASE_MAX 6
+
 /* stage 0 is the PROLOGUE, JP_TOSTRING the coercion it waits on, JP_PARSE the parse itself (the stage that
    yields), JP_WALK the reviver walk. A resumption must never land on 0, whose first act is to free cb_result —
    see the base64 machine, where it did. */
@@ -83379,9 +83455,14 @@ static int js_json_reviver_step(JSContext *ctx, JSJsonReviver *s, JSValue res, J
     while (s->sp > 0) {
         JRFrame *f = &s->stack[s->sp - 1];
         /* DFS invariants: a live frame stack within its allocation, a valid phase, and (once past init) a child
-           cursor that never runs past the key count. A violation is a walk-state bug; crash at its origin. */
-        assert(s->sp <= s->cap && f->phase <= 4);
-        assert(f->phase == 0 || f->phase == 4 || f->i <= f->len);
+           cursor that never runs past the key count. A violation is a walk-state bug; crash at its origin.
+           THE PHASE BOUND WAS STALE. It read `phase <= 4` while the walk had grown phases 5 and 6 for the
+           parked proxy-trap requests, so a revoked-proxy revive tripped an invariant that was simply out of
+           date — the walk was correct and the assertion about it was not. It was a plain assert, compiled out
+           by the NDEBUG the harness builds with, so it never had a chance to say so. The bound is a named
+           constant now: a seventh phase updates one place, and the DCHECK cannot silently fall behind it. */
+        DCHECK(s->sp <= s->cap && f->phase <= JR_PHASE_MAX, "s->sp <= s->cap && f->phase <= JR_PHASE_MAX");
+        DCHECK(f->phase == 0 || f->phase == 4 || f->i <= f->len, "f->phase == 0 || f->phase == 4 || f->i <= f->len");
         if (f->phase == 0) {
             /* 25.5.1.1 step 1: `Let val be ? Get(holder, P)`. The holder is parser-built at the root, but a
                reviver returns arbitrary values into it, so by the time a deeper frame reads one the holder can be
@@ -85951,7 +86032,7 @@ static void delete_map_weak_ref(JSRuntime *rt, JSMapRecord *mr)
     pwr = get_first_weak_ref(mr->key);
     for(;;) {
         wr = *pwr;
-        assert(wr != NULL);
+        DCHECK(wr != NULL, "wr != NULL");
         if (wr->kind == JS_WEAK_REF_KIND_MAP && wr->u.map_record == mr)
             break;
         pwr = &wr->next_weak_ref;
@@ -85987,7 +86068,7 @@ static void map_decref_record(JSRuntime *rt, JSMapRecord *mr)
 {
     if (--mr->ref_count == 0) {
         /* the record can be safely removed */
-        assert(mr->empty);
+        DCHECK(mr->empty, "mr->empty");
         list_del(&mr->link);
         js_free_rt(rt, mr);
     }
@@ -86346,7 +86427,7 @@ static void js_map_mark(JSRuntime *rt, JSValueConst val,
 
     s = p->u.map_state;
     if (s) {
-        assert(!s->is_weak);
+        DCHECK(!s->is_weak, "!s->is_weak");
         list_for_each(el, &s->records) {
             mr = list_entry(el, JSMapRecord, link);
             JS_MarkValue(rt, mr->key, mark_func);
@@ -86440,7 +86521,7 @@ static JSValue js_map_iterator_next(JSContext *ctx, JSValueConst this_val,
     if (JS_IsUndefined(it->obj))
         goto done;
     s = JS_GetOpaque(it->obj, JS_CLASS_MAP + magic);
-    assert(s != NULL);
+    DCHECK(s != NULL, "s != NULL");
     if (!it->cur_record) {
         el = s->records.next;
     } else {
@@ -88149,7 +88230,7 @@ static JSValue promise_reaction_job(JSContext *ctx, int argc,
     JSValueConst arg;
     bool is_reject;
 
-    assert(argc == 5);
+    DCHECK(argc == 5, "argc == 5");
     handler = argv[2];
     is_reject = JS_ToBool(ctx, argv[3]);
     arg = argv[4];
@@ -88310,7 +88391,7 @@ static JSValue js_promise_resolve_thenable_job(JSContext *ctx,
 
     promise_trace(ctx, "js_promise_resolve_thenable_job\n");
 
-    assert(argc == 3);
+    DCHECK(argc == 3, "argc == 3");
     promise = argv[0];
     thenable = argv[1];
     then = argv[2];
@@ -93047,7 +93128,7 @@ static bool typed_array_is_immutable(JSObject *p)
     JSArrayBuffer *abuf;
     JSTypedArray *ta;
 
-    assert(is_typed_array(p->class_id));
+    DCHECK(is_typed_array(p->class_id), "is_typed_array(p->class_id)");
     ta = p->u.typed_array;
     abuf = ta->buffer->u.array_buffer;
     return abuf->immutable;
@@ -93062,7 +93143,7 @@ static bool typed_array_is_oob(JSObject *p)
     int len, size_elem;
     int64_t end;
 
-    assert(is_typed_array(p->class_id));
+    DCHECK(is_typed_array(p->class_id), "is_typed_array(p->class_id)");
 
     ta = p->u.typed_array;
     abuf = ta->buffer->u.array_buffer;
@@ -95281,7 +95362,7 @@ static bool dataview_is_oob(JSObject *p)
     JSArrayBuffer *abuf;
     JSTypedArray *ta;
 
-    assert(p->class_id == JS_CLASS_DATAVIEW);
+    DCHECK(p->class_id == JS_CLASS_DATAVIEW, "p->class_id == JS_CLASS_DATAVIEW");
     ta = p->u.typed_array;
     abuf = ta->buffer->u.array_buffer;
     if (abuf->detached)
@@ -95625,7 +95706,7 @@ static JSValue js_new_uint8array(JSContext *ctx, JSValue buffer)
         return JS_EXCEPTION;
     }
     JSArrayBuffer *abuf = js_get_array_buffer(ctx, buffer);
-    assert(abuf != NULL);
+    DCHECK(abuf != NULL, "abuf != NULL");
     if (typed_array_init(ctx, obj, buffer, 0, abuf->byte_length, /*track_rab*/false)) {
         // 'buffer' is freed on error above.
         JS_FreeValue(ctx, obj);
@@ -96472,7 +96553,7 @@ static void js_weakref_finalizer(JSRuntime *rt, JSValueConst val)
     pwr = get_first_weak_ref(wrd->target);
     for(;;) {
         wr = *pwr;
-        assert(wr != NULL);
+        DCHECK(wr != NULL, "wr != NULL");
         if (wr->kind == JS_WEAK_REF_KIND_WEAK_REF && wr->u.weak_ref_data == wrd)
             break;
         pwr = &wr->next_weak_ref;
@@ -96566,7 +96647,7 @@ static void delete_finrec_weakref(JSRuntime *rt, JSFinRecEntry *fre)
     pwr = get_first_weak_ref(fre->target);
     for(;;) {
         wr = *pwr;
-        assert(wr != NULL);
+        DCHECK(wr != NULL, "wr != NULL");
         if (wr->kind == JS_WEAK_REF_KIND_FINALIZATION_REGISTRY_ENTRY && wr->u.fin_rec_entry == fre)
             break;
         pwr = &wr->next_weak_ref;
@@ -96787,8 +96868,8 @@ static void reset_weak_ref(JSRuntime *rt, JSWeakRefRecord **first_weak_ref)
         case JS_WEAK_REF_KIND_MAP:
             mr = wr->u.map_record;
             s = mr->map;
-            assert(s->is_weak);
-            assert(!mr->empty); /* no iterator on WeakMap/WeakSet */
+            DCHECK(s->is_weak, "s->is_weak");
+            DCHECK(!mr->empty, "!mr->empty"); /* no iterator on WeakMap/WeakSet */
             list_del(&mr->hash_link);
             list_del(&mr->link);
             s->record_count--;
@@ -97369,7 +97450,7 @@ JSValue JS_PRINTF_FORMAT_ATTR(3, 4) JS_ThrowDOMException(JSContext *ctx, const c
     va_list ap;
     char buf[256];
 
-    assert(JS_IsRegisteredClass(ctx->rt, JS_CLASS_DOM_EXCEPTION));
+    DCHECK(JS_IsRegisteredClass(ctx->rt, JS_CLASS_DOM_EXCEPTION), "JS_IsRegisteredClass(ctx->rt, JS_CLASS_DOM_EXCEPTION)");
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
