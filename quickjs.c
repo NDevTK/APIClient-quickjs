@@ -44375,6 +44375,7 @@ enum {
     PDS_VAR, PDS_VAR_LV, PDS_VAR_INIT,
     PDS_SOD, PDS_BLOCK, PDS_BLK_STMT, PDS_IFC, PDS_IFC_DONE, PDS_SOD_30,
     PDS_FIO, PDS_FIO_01, PDS_FIO_02, PDS_FIO_03, PDS_FIO_04, PDS_FIO_05,
+    PDS_CLASS, PDS_CLS_01, PDS_CLS_02,
     PDS_DESTR, PDS_DE_01, PDS_DE_02, PDS_DE_03, PDS_DE_04, PDS_DE_05,
     PDS_DE_06, PDS_DE_07, PDS_DE_08, PDS_DE_09, PDS_DE_10,
     PDS_SOD_01, PDS_SOD_02, PDS_SOD_03, PDS_SOD_04, PDS_SOD_05, PDS_SOD_06, PDS_SOD_07, PDS_SOD_08, PDS_SOD_09, PDS_SOD_10, PDS_SOD_11, PDS_SOD_12, PDS_SOD_13, PDS_SOD_14, PDS_SOD_15, PDS_SOD_16, PDS_SOD_17, PDS_SOD_18, PDS_SOD_19, PDS_SOD_20, PDS_SOD_21, PDS_SOD_22, PDS_SOD_23, PDS_SOD_24, PDS_SOD_25, PDS_SOD_26, PDS_SOD_27, PDS_SOD_28, PDS_SOD_29,
@@ -44925,547 +44926,6 @@ static __exception int js_parse_class_default_ctor(JSParseState *s,
     return 0;
 }
 
-
-static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
-                                      JSParseExportEnum export_flag)
-{
-    JSContext *ctx = s->ctx;
-    JSFunctionDef *fd = s->cur_func;
-    JSAtom name = JS_ATOM_NULL, class_name = JS_ATOM_NULL, class_name1;
-    JSAtom class_var_name = JS_ATOM_NULL;
-    JSFunctionDef *method_fd, *ctor_fd;
-    int class_name_var_idx, prop_type, ctor_cpool_offset;
-    int class_flags = 0, i, define_class_offset;
-    bool is_static, is_private, is_strict_mode;
-    const uint8_t *class_start_ptr = s->token.ptr;
-    const uint8_t *start_ptr;
-    ClassFieldsDef class_fields[2];
-
-    /* classes are parsed and executed in strict mode */
-    is_strict_mode = fd->is_strict_mode;
-    fd->is_strict_mode = true;
-    if (!is_strict_mode) {
-        /* the heritage and the elements' computed property names run in THIS function's frame, which is sloppy */
-        emit_op(s, OP_set_strict);
-        emit_u8(s, 1);
-    }
-    if (next_token(s))
-        goto fail;
-    if (s->token.val == TOK_IDENT) {
-        if (s->token.u.ident.is_reserved) {
-            js_parse_error_reserved_identifier(s);
-            goto fail;
-        }
-        class_name = JS_DupAtom(ctx, s->token.u.ident.atom);
-        if (next_token(s))
-            goto fail;
-    } else if (!is_class_expr && export_flag != JS_PARSE_EXPORT_DEFAULT) {
-        js_parse_error(s, "class statement requires a name");
-        goto fail;
-    }
-    if (!is_class_expr) {
-        if (class_name == JS_ATOM_NULL)
-            class_var_name = JS_ATOM__default_; /* export default */
-        else
-            class_var_name = class_name;
-        class_var_name = JS_DupAtom(ctx, class_var_name);
-    }
-
-    push_scope(s);
-
-    if (s->token.val == TOK_EXTENDS) {
-        class_flags = JS_DEFINE_CLASS_HAS_HERITAGE;
-        if (next_token(s))
-            goto fail;
-        if (js_parse_descent(s, PDS_POSTFIX, 0, PF_POSTFIX_CALL, 0))
-            goto fail;
-    } else {
-        emit_op(s, OP_undefined);
-    }
-
-    /* add a 'const' definition for the class name */
-    if (class_name != JS_ATOM_NULL) {
-        class_name_var_idx = define_var(s, fd, class_name, JS_VAR_DEF_CONST);
-        if (class_name_var_idx < 0)
-            goto fail;
-    }
-
-    if (js_parse_expect(s, '{'))
-        goto fail;
-
-    /* this scope contains the private fields */
-    push_scope(s);
-
-    emit_op(s, OP_push_const);
-    ctor_cpool_offset = fd->byte_code.size;
-    emit_u32(s, 0); /* will be patched at the end of the class parsing */
-
-    if (class_name == JS_ATOM_NULL) {
-        if (class_var_name != JS_ATOM_NULL)
-            class_name1 = JS_ATOM_default;
-        else
-            class_name1 = JS_ATOM_empty_string;
-    } else {
-        class_name1 = class_name;
-    }
-
-    emit_op(s, OP_define_class);
-    emit_atom(s, class_name1);
-    emit_u8(s, class_flags);
-    define_class_offset = fd->last_opcode_pos;
-
-    for(i = 0; i < 2; i++) {
-        ClassFieldsDef *cf = &class_fields[i];
-        cf->fields_init_fd = NULL;
-        cf->computed_fields_count = 0;
-        cf->need_brand = false;
-        cf->is_static = i;
-    }
-
-    ctor_fd = NULL;
-    while (s->token.val != '}') {
-        if (s->token.val == ';') {
-            if (next_token(s))
-                goto fail;
-            continue;
-        }
-        is_static = false;
-        if (s->token.val == TOK_STATIC) {
-            int next = peek_token(s, true);
-            if (!(next == ';' || next == '}' || next == '(' || next == '='))
-                is_static = true;
-        }
-        prop_type = -1;
-        if (is_static) {
-            if (next_token(s))
-                goto fail;
-            if (s->token.val == '{') {
-                ClassFieldsDef *cf = &class_fields[is_static];
-                if (!cf->fields_init_fd)
-                    if (emit_class_init_start(s, cf))
-                        goto fail;
-                s->cur_func = cf->fields_init_fd;
-                // stack is now: <empty>
-                JSFunctionDef *init;
-                if (js_parse_function_decl2(s, JS_PARSE_FUNC_CLASS_STATIC_INIT,
-                                            JS_FUNC_NORMAL, JS_ATOM_NULL,
-                                            s->token.ptr,
-                                            s->token.line_num,
-                                            s->token.col_num,
-                                            JS_PARSE_EXPORT_NONE, &init, PF_IN_ACCEPTED) < 0) {
-                    goto fail;
-                }
-                // stack is now: fclosure
-                push_scope(s);
-                emit_op(s, OP_scope_get_var);
-                emit_atom(s, JS_ATOM_this);
-                emit_u16(s, 0);
-                // stack is now: fclosure this
-                if (class_name != JS_ATOM_NULL) {
-                    // TODO(bnoordhuis) pass as argument to init method?
-                    emit_op(s, OP_dup);
-                    emit_op(s, OP_scope_put_var_init);
-                    emit_atom(s, class_name);
-                    emit_u16(s, s->cur_func->scope_level);
-                }
-                emit_op(s, OP_swap);
-                // stack is now: this fclosure
-                emit_op(s, OP_call_method);
-                emit_u16(s, 0);
-                // stack is now: returnvalue
-                emit_op(s, OP_drop);
-                // stack is now: <empty>
-                pop_scope(s);
-                s->cur_func = s->cur_func->parent;
-                continue;
-            }
-            /* allow "static" field name */
-            if (s->token.val == ';' || s->token.val == '=') {
-                is_static = false;
-                name = JS_DupAtom(ctx, JS_ATOM_static);
-                prop_type = PROP_TYPE_IDENT;
-            }
-        }
-        if (is_static)
-            emit_op(s, OP_swap);
-        start_ptr = s->token.ptr;
-        if (prop_type < 0) {
-            prop_type = js_parse_property_name(s, &name, true, false, true);
-            if (prop_type < 0)
-                goto fail;
-        }
-        is_private = prop_type & PROP_TYPE_PRIVATE;
-        prop_type &= ~PROP_TYPE_PRIVATE;
-
-        if ((name == JS_ATOM_constructor && !is_static &&
-             prop_type != PROP_TYPE_IDENT) ||
-            (name == JS_ATOM_prototype && is_static) ||
-            name == JS_ATOM_hash_constructor) {
-            js_parse_error(s, "invalid method name");
-            goto fail;
-        }
-        if (prop_type == PROP_TYPE_GET || prop_type == PROP_TYPE_SET) {
-            bool is_set = prop_type - PROP_TYPE_GET;
-            JSFunctionDef *method_fd;
-
-            if (is_private) {
-                int idx, var_kind, is_static1;
-                idx = find_private_class_field(ctx, fd, name, fd->scope_level);
-                if (idx >= 0) {
-                    var_kind = fd->vars[idx].var_kind;
-                    is_static1 = fd->vars[idx].is_static_private;
-                    if (var_kind == JS_VAR_PRIVATE_FIELD ||
-                        var_kind == JS_VAR_PRIVATE_METHOD ||
-                        var_kind == JS_VAR_PRIVATE_GETTER_SETTER ||
-                        var_kind == (JS_VAR_PRIVATE_GETTER + is_set) ||
-                        (var_kind == (JS_VAR_PRIVATE_GETTER + 1 - is_set) &&
-                         is_static != is_static1)) {
-                        goto private_field_already_defined;
-                    }
-                    fd->vars[idx].var_kind = JS_VAR_PRIVATE_GETTER_SETTER;
-                } else {
-                    if (add_private_class_field(s, fd, name,
-                                                JS_VAR_PRIVATE_GETTER + is_set, is_static) < 0)
-                        goto fail;
-                }
-                class_fields[is_static].need_brand = true;
-            }
-
-            if (js_parse_function_decl2(s, JS_PARSE_FUNC_GETTER + is_set,
-                                        JS_FUNC_NORMAL, JS_ATOM_NULL,
-                                        start_ptr,
-                                        s->token.line_num,
-                                        s->token.col_num,
-                                        JS_PARSE_EXPORT_NONE, &method_fd, PF_IN_ACCEPTED))
-                goto fail;
-            if (is_private) {
-                method_fd->need_home_object = true; /* needed for brand check */
-                emit_op(s, OP_set_home_object);
-                /* XXX: missing function name */
-                emit_op(s, OP_scope_put_var_init);
-                if (is_set) {
-                    JSAtom setter_name;
-                    int ret;
-
-                    setter_name = get_private_setter_name(ctx, name);
-                    if (setter_name == JS_ATOM_NULL)
-                        goto fail;
-                    emit_atom(s, setter_name);
-                    ret = add_private_class_field(s, fd, setter_name,
-                                                  JS_VAR_PRIVATE_SETTER, is_static);
-                    JS_FreeAtom(ctx, setter_name);
-                    if (ret < 0)
-                        goto fail;
-                } else {
-                    emit_atom(s, name);
-                }
-                emit_u16(s, s->cur_func->scope_level);
-            } else {
-                if (name == JS_ATOM_NULL) {
-                    emit_op(s, OP_define_method_computed);
-                } else {
-                    emit_op(s, OP_define_method);
-                    emit_atom(s, name);
-                }
-                emit_u8(s, OP_DEFINE_METHOD_GETTER + is_set);
-            }
-        } else if (prop_type == PROP_TYPE_IDENT && s->token.val != '(') {
-            ClassFieldsDef *cf = &class_fields[is_static];
-            JSAtom field_var_name = JS_ATOM_NULL;
-
-            /* class field */
-
-            /* XXX: spec: not consistent with method name checks */
-            if (name == JS_ATOM_constructor || name == JS_ATOM_prototype) {
-                js_parse_error(s, "invalid field name");
-                goto fail;
-            }
-
-            if (is_private) {
-                if (find_private_class_field(ctx, fd, name,
-                                             fd->scope_level) >= 0) {
-                    goto private_field_already_defined;
-                }
-                if (add_private_class_field(s, fd, name,
-                                            JS_VAR_PRIVATE_FIELD, is_static) < 0)
-                    goto fail;
-                emit_op(s, OP_private_symbol);
-                emit_atom(s, name);
-                emit_op(s, OP_scope_put_var_init);
-                emit_atom(s, name);
-                emit_u16(s, s->cur_func->scope_level);
-            }
-
-            if (!cf->fields_init_fd) {
-                if (emit_class_init_start(s, cf))
-                    goto fail;
-            }
-            if (name == JS_ATOM_NULL ) {
-                /* save the computed field name into a variable */
-                field_var_name = js_atom_concat_num(ctx, JS_ATOM_computed_field + is_static, cf->computed_fields_count);
-                if (field_var_name == JS_ATOM_NULL)
-                    goto fail;
-                if (define_var(s, fd, field_var_name, JS_VAR_DEF_CONST) < 0) {
-                    JS_FreeAtom(ctx, field_var_name);
-                    goto fail;
-                }
-                emit_op(s, OP_to_propkey);
-                emit_op(s, OP_scope_put_var_init);
-                emit_atom(s, field_var_name);
-                emit_u16(s, s->cur_func->scope_level);
-            }
-            s->cur_func = cf->fields_init_fd;
-            emit_op(s, OP_scope_get_var);
-            emit_atom(s, JS_ATOM_this);
-            emit_u16(s, 0);
-
-            // expose class name to static initializers
-            if (is_static && class_name != JS_ATOM_NULL) {
-                emit_op(s, OP_dup);
-                emit_op(s, OP_scope_put_var_init);
-                emit_atom(s, class_name);
-                emit_u16(s, s->cur_func->scope_level);
-            }
-
-            if (name == JS_ATOM_NULL) {
-                emit_op(s, OP_scope_get_var);
-                emit_atom(s, field_var_name);
-                emit_u16(s, s->cur_func->scope_level);
-                cf->computed_fields_count++;
-                JS_FreeAtom(ctx, field_var_name);
-            } else if (is_private) {
-                emit_op(s, OP_scope_get_var);
-                emit_atom(s, name);
-                emit_u16(s, s->cur_func->scope_level);
-            }
-
-            if (s->token.val == '=') {
-                if (next_token(s))
-                    goto fail;
-                if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
-                    goto fail;
-            } else {
-                emit_op(s, OP_undefined);
-            }
-            if (is_private) {
-                set_object_name_computed(s);
-                emit_op(s, OP_define_private_field);
-            } else if (name == JS_ATOM_NULL) {
-                set_object_name_computed(s);
-                emit_op(s, OP_define_array_el);
-                emit_op(s, OP_drop);
-            } else {
-                set_object_name(s, name);
-                emit_op(s, OP_define_field);
-                emit_atom(s, name);
-            }
-            s->cur_func = s->cur_func->parent;
-            if (js_parse_expect_semi(s))
-                goto fail;
-        } else {
-            JSParseFunctionEnum func_type;
-            JSFunctionKindEnum func_kind;
-
-            func_type = JS_PARSE_FUNC_METHOD;
-            func_kind = JS_FUNC_NORMAL;
-            if (prop_type == PROP_TYPE_STAR) {
-                func_kind = JS_FUNC_GENERATOR;
-            } else if (prop_type == PROP_TYPE_ASYNC) {
-                func_kind = JS_FUNC_ASYNC;
-            } else if (prop_type == PROP_TYPE_ASYNC_STAR) {
-                func_kind = JS_FUNC_ASYNC_GENERATOR;
-            } else if (name == JS_ATOM_constructor && !is_static) {
-                if (ctor_fd) {
-                    js_parse_error(s, "property constructor appears more than once");
-                    goto fail;
-                }
-                if (class_flags & JS_DEFINE_CLASS_HAS_HERITAGE)
-                    func_type = JS_PARSE_FUNC_DERIVED_CLASS_CONSTRUCTOR;
-                else
-                    func_type = JS_PARSE_FUNC_CLASS_CONSTRUCTOR;
-            }
-            if (is_private) {
-                class_fields[is_static].need_brand = true;
-            }
-            if (js_parse_function_decl2(s, func_type, func_kind, JS_ATOM_NULL,
-                                        start_ptr,
-                                        s->token.line_num,
-                                        s->token.col_num,
-                                        JS_PARSE_EXPORT_NONE, &method_fd, PF_IN_ACCEPTED))
-                goto fail;
-            if (func_type == JS_PARSE_FUNC_DERIVED_CLASS_CONSTRUCTOR ||
-                func_type == JS_PARSE_FUNC_CLASS_CONSTRUCTOR) {
-                ctor_fd = method_fd;
-            } else if (is_private) {
-                method_fd->need_home_object = true; /* needed for brand check */
-                if (find_private_class_field(ctx, fd, name,
-                                             fd->scope_level) >= 0) {
-                private_field_already_defined:
-                    js_parse_error(s, "private class field is already defined");
-                    goto fail;
-                }
-                if (add_private_class_field(s, fd, name,
-                                            JS_VAR_PRIVATE_METHOD, is_static) < 0)
-                    goto fail;
-                emit_op(s, OP_set_home_object);
-                emit_op(s, OP_set_name);
-                emit_atom(s, name);
-                emit_op(s, OP_scope_put_var_init);
-                emit_atom(s, name);
-                emit_u16(s, s->cur_func->scope_level);
-            } else {
-                if (name == JS_ATOM_NULL) {
-                    emit_op(s, OP_define_method_computed);
-                } else {
-                    emit_op(s, OP_define_method);
-                    emit_atom(s, name);
-                }
-                emit_u8(s, OP_DEFINE_METHOD_METHOD);
-            }
-        }
-        if (is_static)
-            emit_op(s, OP_swap);
-        JS_FreeAtom(ctx, name);
-        name = JS_ATOM_NULL;
-    }
-
-    if (s->token.val != '}') {
-        js_parse_error(s, "expecting '%c'", '}');
-        goto fail;
-    }
-
-    if (!ctor_fd) {
-        if (js_parse_class_default_ctor(s, class_flags & JS_DEFINE_CLASS_HAS_HERITAGE, &ctor_fd))
-            goto fail;
-    }
-    /* patch the constant pool index for the constructor */
-    put_u32(fd->byte_code.buf + ctor_cpool_offset, ctor_fd->parent_cpool_idx);
-
-    /* store the class source code in the constructor. */
-    js_free(ctx, ctor_fd->source);
-    ctor_fd->source_len = s->buf_ptr - class_start_ptr;
-    ctor_fd->source = js_strndup(ctx, (const char *)class_start_ptr, ctor_fd->source_len);
-    if (!ctor_fd->source)
-        goto fail;
-
-    /* consume the '}' */
-    if (next_token(s))
-        goto fail;
-
-    {
-        ClassFieldsDef *cf = &class_fields[0];
-        int var_idx;
-
-        if (cf->need_brand) {
-            /* add a private brand to the prototype */
-            emit_op(s, OP_dup);
-            emit_op(s, OP_null);
-            emit_op(s, OP_swap);
-            emit_op(s, OP_add_brand);
-
-            /* define the brand field in 'this' of the initializer */
-            if (!cf->fields_init_fd) {
-                if (emit_class_init_start(s, cf))
-                    goto fail;
-            }
-            /* patch the start of the function to enable the
-               OP_add_brand_instance code */
-            cf->fields_init_fd->byte_code.buf[cf->brand_push_pos] = OP_push_true;
-        }
-
-        /* store the function to initialize the fields to that it can be
-           referenced by the constructor */
-        var_idx = define_var(s, fd, JS_ATOM_class_fields_init,
-                             JS_VAR_DEF_CONST);
-        if (var_idx < 0)
-            goto fail;
-        if (cf->fields_init_fd) {
-            emit_class_init_end(s, cf);
-        } else {
-            emit_op(s, OP_undefined);
-        }
-        emit_op(s, OP_scope_put_var_init);
-        emit_atom(s, JS_ATOM_class_fields_init);
-        emit_u16(s, s->cur_func->scope_level);
-    }
-
-    /* The class's own code ends HERE: everything below is the engine's own shaping, and the field initializers
-       it calls are separate functions with their own strictness. The marker leaves the region at this point
-       rather than at the end of the function so that OP_set_class_name stays the LAST opcode — set_object_name
-       finds an anonymous class expression's inferred name by exactly that pattern. */
-    if (!is_strict_mode) {
-        emit_op(s, OP_set_strict);
-        emit_u8(s, 0);
-    }
-
-    /* drop the prototype */
-    emit_op(s, OP_drop);
-
-    if (class_fields[1].need_brand) {
-        /* add a private brand to the class */
-        emit_op(s, OP_dup);
-        emit_op(s, OP_dup);
-        emit_op(s, OP_add_brand);
-    }
-
-    /* initialize the static fields */
-    if (class_fields[1].fields_init_fd != NULL) {
-        ClassFieldsDef *cf = &class_fields[1];
-        emit_op(s, OP_dup);
-        emit_class_init_end(s, cf);
-        emit_op(s, OP_call_method);
-        emit_u16(s, 0);
-        emit_op(s, OP_drop);
-    }
-
-    if (class_name != JS_ATOM_NULL) {
-        /* store the class name in the scoped class name variable (it
-           is independent from the class statement variable
-           definition) */
-        emit_op(s, OP_dup);
-        emit_op(s, OP_scope_put_var_init);
-        emit_atom(s, class_name);
-        emit_u16(s, fd->scope_level);
-    }
-    pop_scope(s);
-    pop_scope(s);
-
-    /* the class statements have a block level scope */
-    if (class_var_name != JS_ATOM_NULL) {
-        if (define_var(s, fd, class_var_name, JS_VAR_DEF_LET) < 0)
-            goto fail;
-        emit_op(s, OP_scope_put_var_init);
-        emit_atom(s, class_var_name);
-        emit_u16(s, fd->scope_level);
-    } else {
-        if (class_name == JS_ATOM_NULL) {
-            /* cannot use OP_set_name because the name of the class
-               must be defined before the static initializers are
-               executed */
-            emit_op(s, OP_set_class_name);
-            emit_u32(s, fd->last_opcode_pos + 1 - define_class_offset);
-        }
-    }
-
-    if (export_flag != JS_PARSE_EXPORT_NONE) {
-        if (!add_export_entry(s, fd->module,
-                              class_var_name,
-                              export_flag == JS_PARSE_EXPORT_NAMED ? class_var_name : JS_ATOM_default,
-                              JS_EXPORT_TYPE_LOCAL))
-            goto fail;
-    }
-
-    JS_FreeAtom(ctx, class_name);
-    JS_FreeAtom(ctx, class_var_name);
-    fd->is_strict_mode = is_strict_mode;
-    return 0;
- fail:
-    JS_FreeAtom(ctx, name);
-    JS_FreeAtom(ctx, class_name);
-    JS_FreeAtom(ctx, class_var_name);
-    fd->is_strict_mode = is_strict_mode;
-    return -1;
-}
 
 static bool has_with_scope(JSFunctionDef *s, int scope_level)
 {
@@ -46255,6 +45715,9 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     case PDS_FIO_03:          goto fio_03;
     case PDS_FIO_04:          goto fio_04;
     case PDS_FIO_05:          goto fio_05;
+    case PDS_CLASS:           goto cls_entry;
+    case PDS_CLS_01:          goto cls_01;
+    case PDS_CLS_02:          goto cls_02;
     case PDS_DESTR:           goto de_entry;
     case PDS_DE_01:           goto de_01;
     case PDS_DE_02:           goto de_02;
@@ -47193,7 +46656,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             PD_RET(-1);
         break;
     case TOK_CLASS:
-        if (js_parse_class(s, true, JS_PARSE_EXPORT_NONE))
+        if (js_parse_descent(s, PDS_CLASS, true, 0, JS_PARSE_EXPORT_NONE))
             PD_RET(-1);
         break;
     case TOK_NULL:
@@ -49316,7 +48779,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             js_parse_error(s, "class declarations can't appear in single-statement context");
             goto sod_fail;
         }
-        if (js_parse_class(s, false, JS_PARSE_EXPORT_NONE))
+        if (js_parse_descent(s, PDS_CLASS, false, 0, JS_PARSE_EXPORT_NONE))
             goto sod_fail;
         break;
 
@@ -50295,6 +49758,562 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     JS_FreeAtom(ctx, f->atom2);
     f->atom = JS_ATOM_NULL;
     f->atom2 = JS_ATOM_NULL;
+    PD_RET(-1);
+
+/* ---- ClassDeclaration / ClassExpression. `level` carries is_class_expr and `op` the export flag. It holds
+   FOUR owned atoms live across a descent — the member name, the class binding, its var-scope alias and the
+   current field's hidden var — which is why a frame has four atom slots; cls_fail releases all of them. ---- */
+ cls_entry:
+    f->st_mask = 0;   /* class_flags — its declaration carried this initialiser */
+    JSAtom class_name1;
+    JSFunctionDef *method_fd, *ctor_fd;
+    int i;
+    const uint8_t *class_start_ptr = s->token.ptr;
+    const uint8_t *start_ptr;
+    ClassFieldsDef class_fields[2];
+
+    /* classes are parsed and executed in strict mode */
+    f->st_b3 = s->cur_func->is_strict_mode;
+    s->cur_func->is_strict_mode = true;
+    if (!f->st_b3) {
+        /* the heritage and the elements' computed property names run in THIS function's frame, which is sloppy */
+        emit_op(s, OP_set_strict);
+        emit_u8(s, 1);
+    }
+    if (next_token(s))
+        goto cls_fail;
+    if (s->token.val == TOK_IDENT) {
+        if (s->token.u.ident.is_reserved) {
+            js_parse_error_reserved_identifier(s);
+            goto cls_fail;
+        }
+        f->atom2 = JS_DupAtom(ctx, s->token.u.ident.atom);
+        if (next_token(s))
+            goto cls_fail;
+    } else if (!(f->level != 0) && f->op != JS_PARSE_EXPORT_DEFAULT) {
+        js_parse_error(s, "class statement requires a f->atom");
+        goto cls_fail;
+    }
+    if (!(f->level != 0)) {
+        if (f->atom2 == JS_ATOM_NULL)
+            f->atom3 = JS_ATOM__default_; /* export default */
+        else
+            f->atom3 = f->atom2;
+        f->atom3 = JS_DupAtom(ctx, f->atom3);
+    }
+
+    push_scope(s);
+
+    if (s->token.val == TOK_EXTENDS) {
+        f->st_mask = JS_DEFINE_CLASS_HAS_HERITAGE;
+        if (next_token(s))
+            goto cls_fail;
+        PD_CALL(PDS_POSTFIX, 0, PF_POSTFIX_CALL, 0, PDS_CLS_01);
+ cls_01:
+        if (pd_ret)
+            goto cls_fail;
+    } else {
+        emit_op(s, OP_undefined);
+    }
+
+    /* add a 'const' definition for the class f->atom */
+    if (f->atom2 != JS_ATOM_NULL) {
+        f->st_idx = define_var(s, s->cur_func, f->atom2, JS_VAR_DEF_CONST);
+        if (f->st_idx < 0)
+            goto cls_fail;
+    }
+
+    if (js_parse_expect(s, '{'))
+        goto cls_fail;
+
+    /* this scope contains the private fields */
+    push_scope(s);
+
+    emit_op(s, OP_push_const);
+    f->st_pos_a = s->cur_func->byte_code.size;
+    emit_u32(s, 0); /* will be patched at the end of the class parsing */
+
+    if (f->atom2 == JS_ATOM_NULL) {
+        if (f->atom3 != JS_ATOM_NULL)
+            class_name1 = JS_ATOM_default;
+        else
+            class_name1 = JS_ATOM_empty_string;
+    } else {
+        class_name1 = f->atom2;
+    }
+
+    emit_op(s, OP_define_class);
+    emit_atom(s, class_name1);
+    emit_u8(s, f->st_mask);
+    f->st_pos_b = s->cur_func->last_opcode_pos;
+
+    for(i = 0; i < 2; i++) {
+        ClassFieldsDef *cf = &class_fields[i];
+        cf->fields_init_fd = NULL;
+        cf->computed_fields_count = 0;
+        cf->need_brand = false;
+        cf->is_static = i;
+    }
+
+    ctor_fd = NULL;
+    while (s->token.val != '}') {
+        if (s->token.val == ';') {
+            if (next_token(s))
+                goto cls_fail;
+            continue;
+        }
+        f->st_b1 = false;
+        if (s->token.val == TOK_STATIC) {
+            int next = peek_token(s, true);
+            if (!(next == ';' || next == '}' || next == '(' || next == '='))
+                f->st_b1 = true;
+        }
+        f->prop_type = -1;
+        if (f->st_b1) {
+            if (next_token(s))
+                goto cls_fail;
+            if (s->token.val == '{') {
+                ClassFieldsDef *cf = &class_fields[f->st_b1];
+                if (!cf->fields_init_fd)
+                    if (emit_class_init_start(s, cf))
+                        goto cls_fail;
+                s->cur_func = cf->fields_init_fd;
+                // stack is now: <empty>
+                JSFunctionDef *init;
+                if (js_parse_function_decl2(s, JS_PARSE_FUNC_CLASS_STATIC_INIT,
+                                            JS_FUNC_NORMAL, JS_ATOM_NULL,
+                                            s->token.ptr,
+                                            s->token.line_num,
+                                            s->token.col_num,
+                                            JS_PARSE_EXPORT_NONE, &init, PF_IN_ACCEPTED) < 0) {
+                    goto cls_fail;
+                }
+                // stack is now: fclosure
+                push_scope(s);
+                emit_op(s, OP_scope_get_var);
+                emit_atom(s, JS_ATOM_this);
+                emit_u16(s, 0);
+                // stack is now: fclosure this
+                if (f->atom2 != JS_ATOM_NULL) {
+                    // TODO(bnoordhuis) pass as argument to init method?
+                    emit_op(s, OP_dup);
+                    emit_op(s, OP_scope_put_var_init);
+                    emit_atom(s, f->atom2);
+                    emit_u16(s, s->cur_func->scope_level);
+                }
+                emit_op(s, OP_swap);
+                // stack is now: this fclosure
+                emit_op(s, OP_call_method);
+                emit_u16(s, 0);
+                // stack is now: returnvalue
+                emit_op(s, OP_drop);
+                // stack is now: <empty>
+                pop_scope(s);
+                s->cur_func = s->cur_func->parent;
+                continue;
+            }
+            /* allow "static" field f->atom */
+            if (s->token.val == ';' || s->token.val == '=') {
+                f->st_b1 = false;
+                f->atom = JS_DupAtom(ctx, JS_ATOM_static);
+                f->prop_type = PROP_TYPE_IDENT;
+            }
+        }
+        if (f->st_b1)
+            emit_op(s, OP_swap);
+        start_ptr = s->token.ptr;
+        if (f->prop_type < 0) {
+            f->prop_type = js_parse_property_name(s, &f->atom, true, false, true);
+            if (f->prop_type < 0)
+                goto cls_fail;
+        }
+        f->st_b2 = f->prop_type & PROP_TYPE_PRIVATE;
+        f->prop_type &= ~PROP_TYPE_PRIVATE;
+
+        if ((f->atom == JS_ATOM_constructor && !f->st_b1 &&
+             f->prop_type != PROP_TYPE_IDENT) ||
+            (f->atom == JS_ATOM_prototype && f->st_b1) ||
+            f->atom == JS_ATOM_hash_constructor) {
+            js_parse_error(s, "invalid method f->atom");
+            goto cls_fail;
+        }
+        if (f->prop_type == PROP_TYPE_GET || f->prop_type == PROP_TYPE_SET) {
+            bool is_set = f->prop_type - PROP_TYPE_GET;
+            JSFunctionDef *method_fd;
+
+            if (f->st_b2) {
+                int idx, var_kind, is_static1;
+                idx = find_private_class_field(ctx, s->cur_func, f->atom, s->cur_func->scope_level);
+                if (idx >= 0) {
+                    var_kind = s->cur_func->vars[idx].var_kind;
+                    is_static1 = s->cur_func->vars[idx].is_static_private;
+                    if (var_kind == JS_VAR_PRIVATE_FIELD ||
+                        var_kind == JS_VAR_PRIVATE_METHOD ||
+                        var_kind == JS_VAR_PRIVATE_GETTER_SETTER ||
+                        var_kind == (JS_VAR_PRIVATE_GETTER + is_set) ||
+                        (var_kind == (JS_VAR_PRIVATE_GETTER + 1 - is_set) &&
+                         f->st_b1 != is_static1)) {
+                        goto private_field_already_defined;
+                    }
+                    s->cur_func->vars[idx].var_kind = JS_VAR_PRIVATE_GETTER_SETTER;
+                } else {
+                    if (add_private_class_field(s, s->cur_func, f->atom,
+                                                JS_VAR_PRIVATE_GETTER + is_set, f->st_b1) < 0)
+                        goto cls_fail;
+                }
+                class_fields[f->st_b1].need_brand = true;
+            }
+
+            if (js_parse_function_decl2(s, JS_PARSE_FUNC_GETTER + is_set,
+                                        JS_FUNC_NORMAL, JS_ATOM_NULL,
+                                        start_ptr,
+                                        s->token.line_num,
+                                        s->token.col_num,
+                                        JS_PARSE_EXPORT_NONE, &method_fd, PF_IN_ACCEPTED))
+                goto cls_fail;
+            if (f->st_b2) {
+                method_fd->need_home_object = true; /* needed for brand check */
+                emit_op(s, OP_set_home_object);
+                /* XXX: missing function f->atom */
+                emit_op(s, OP_scope_put_var_init);
+                if (is_set) {
+                    JSAtom setter_name;
+                    int ret;
+
+                    setter_name = get_private_setter_name(ctx, f->atom);
+                    if (setter_name == JS_ATOM_NULL)
+                        goto cls_fail;
+                    emit_atom(s, setter_name);
+                    ret = add_private_class_field(s, s->cur_func, setter_name,
+                                                  JS_VAR_PRIVATE_SETTER, f->st_b1);
+                    JS_FreeAtom(ctx, setter_name);
+                    if (ret < 0)
+                        goto cls_fail;
+                } else {
+                    emit_atom(s, f->atom);
+                }
+                emit_u16(s, s->cur_func->scope_level);
+            } else {
+                if (f->atom == JS_ATOM_NULL) {
+                    emit_op(s, OP_define_method_computed);
+                } else {
+                    emit_op(s, OP_define_method);
+                    emit_atom(s, f->atom);
+                }
+                emit_u8(s, OP_DEFINE_METHOD_GETTER + is_set);
+            }
+        } else if (f->prop_type == PROP_TYPE_IDENT && s->token.val != '(') {
+            ClassFieldsDef *cf = &class_fields[f->st_b1];
+            f->atom4 = JS_ATOM_NULL;   /* per ITERATION — its declaration carried this initialiser */
+
+            /* class field */
+
+            /* XXX: spec: not consistent with method f->atom checks */
+            if (f->atom == JS_ATOM_constructor || f->atom == JS_ATOM_prototype) {
+                js_parse_error(s, "invalid field f->atom");
+                goto cls_fail;
+            }
+
+            if (f->st_b2) {
+                if (find_private_class_field(ctx, s->cur_func, f->atom,
+                                             s->cur_func->scope_level) >= 0) {
+                    goto private_field_already_defined;
+                }
+                if (add_private_class_field(s, s->cur_func, f->atom,
+                                            JS_VAR_PRIVATE_FIELD, f->st_b1) < 0)
+                    goto cls_fail;
+                emit_op(s, OP_private_symbol);
+                emit_atom(s, f->atom);
+                emit_op(s, OP_scope_put_var_init);
+                emit_atom(s, f->atom);
+                emit_u16(s, s->cur_func->scope_level);
+            }
+
+            if (!cf->fields_init_fd) {
+                if (emit_class_init_start(s, cf))
+                    goto cls_fail;
+            }
+            if (f->atom == JS_ATOM_NULL ) {
+                /* save the computed field f->atom into a variable */
+                f->atom4 = js_atom_concat_num(ctx, JS_ATOM_computed_field + f->st_b1, cf->computed_fields_count);
+                if (f->atom4 == JS_ATOM_NULL)
+                    goto cls_fail;
+                if (define_var(s, s->cur_func, f->atom4, JS_VAR_DEF_CONST) < 0) {
+                    JS_FreeAtom(ctx, f->atom4);
+                    f->atom4 = JS_ATOM_NULL;
+                    goto cls_fail;
+                }
+                emit_op(s, OP_to_propkey);
+                emit_op(s, OP_scope_put_var_init);
+                emit_atom(s, f->atom4);
+                emit_u16(s, s->cur_func->scope_level);
+            }
+            s->cur_func = cf->fields_init_fd;
+            emit_op(s, OP_scope_get_var);
+            emit_atom(s, JS_ATOM_this);
+            emit_u16(s, 0);
+
+            // expose class f->atom to static initializers
+            if (f->st_b1 && f->atom2 != JS_ATOM_NULL) {
+                emit_op(s, OP_dup);
+                emit_op(s, OP_scope_put_var_init);
+                emit_atom(s, f->atom2);
+                emit_u16(s, s->cur_func->scope_level);
+            }
+
+            if (f->atom == JS_ATOM_NULL) {
+                emit_op(s, OP_scope_get_var);
+                emit_atom(s, f->atom4);
+                emit_u16(s, s->cur_func->scope_level);
+                cf->computed_fields_count++;
+                JS_FreeAtom(ctx, f->atom4);
+                    f->atom4 = JS_ATOM_NULL;
+            } else if (f->st_b2) {
+                emit_op(s, OP_scope_get_var);
+                emit_atom(s, f->atom);
+                emit_u16(s, s->cur_func->scope_level);
+            }
+
+            if (s->token.val == '=') {
+                if (next_token(s))
+                    goto cls_fail;
+                PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_CLS_02);
+ cls_02:
+                if (pd_ret)
+                    goto cls_fail;
+            } else {
+                emit_op(s, OP_undefined);
+            }
+            if (f->st_b2) {
+                set_object_name_computed(s);
+                emit_op(s, OP_define_private_field);
+            } else if (f->atom == JS_ATOM_NULL) {
+                set_object_name_computed(s);
+                emit_op(s, OP_define_array_el);
+                emit_op(s, OP_drop);
+            } else {
+                set_object_name(s, f->atom);
+                emit_op(s, OP_define_field);
+                emit_atom(s, f->atom);
+            }
+            s->cur_func = s->cur_func->parent;
+            if (js_parse_expect_semi(s))
+                goto cls_fail;
+        } else {
+            JSParseFunctionEnum func_type;
+            JSFunctionKindEnum func_kind;
+
+            func_type = JS_PARSE_FUNC_METHOD;
+            func_kind = JS_FUNC_NORMAL;
+            if (f->prop_type == PROP_TYPE_STAR) {
+                func_kind = JS_FUNC_GENERATOR;
+            } else if (f->prop_type == PROP_TYPE_ASYNC) {
+                func_kind = JS_FUNC_ASYNC;
+            } else if (f->prop_type == PROP_TYPE_ASYNC_STAR) {
+                func_kind = JS_FUNC_ASYNC_GENERATOR;
+            } else if (f->atom == JS_ATOM_constructor && !f->st_b1) {
+                if (ctor_fd) {
+                    js_parse_error(s, "property constructor appears more than once");
+                    goto cls_fail;
+                }
+                if (f->st_mask & JS_DEFINE_CLASS_HAS_HERITAGE)
+                    func_type = JS_PARSE_FUNC_DERIVED_CLASS_CONSTRUCTOR;
+                else
+                    func_type = JS_PARSE_FUNC_CLASS_CONSTRUCTOR;
+            }
+            if (f->st_b2) {
+                class_fields[f->st_b1].need_brand = true;
+            }
+            if (js_parse_function_decl2(s, func_type, func_kind, JS_ATOM_NULL,
+                                        start_ptr,
+                                        s->token.line_num,
+                                        s->token.col_num,
+                                        JS_PARSE_EXPORT_NONE, &method_fd, PF_IN_ACCEPTED))
+                goto cls_fail;
+            if (func_type == JS_PARSE_FUNC_DERIVED_CLASS_CONSTRUCTOR ||
+                func_type == JS_PARSE_FUNC_CLASS_CONSTRUCTOR) {
+                ctor_fd = method_fd;
+            } else if (f->st_b2) {
+                method_fd->need_home_object = true; /* needed for brand check */
+                if (find_private_class_field(ctx, s->cur_func, f->atom,
+                                             s->cur_func->scope_level) >= 0) {
+                private_field_already_defined:
+                    js_parse_error(s, "private class field is already defined");
+                    goto cls_fail;
+                }
+                if (add_private_class_field(s, s->cur_func, f->atom,
+                                            JS_VAR_PRIVATE_METHOD, f->st_b1) < 0)
+                    goto cls_fail;
+                emit_op(s, OP_set_home_object);
+                emit_op(s, OP_set_name);
+                emit_atom(s, f->atom);
+                emit_op(s, OP_scope_put_var_init);
+                emit_atom(s, f->atom);
+                emit_u16(s, s->cur_func->scope_level);
+            } else {
+                if (f->atom == JS_ATOM_NULL) {
+                    emit_op(s, OP_define_method_computed);
+                } else {
+                    emit_op(s, OP_define_method);
+                    emit_atom(s, f->atom);
+                }
+                emit_u8(s, OP_DEFINE_METHOD_METHOD);
+            }
+        }
+        if (f->st_b1)
+            emit_op(s, OP_swap);
+        JS_FreeAtom(ctx, f->atom);
+            f->atom = JS_ATOM_NULL;   /* the slot stops owning it, or cls_done frees it twice */
+        f->atom = JS_ATOM_NULL;
+    }
+
+    if (s->token.val != '}') {
+        js_parse_error(s, "expecting '%c'", '}');
+        goto cls_fail;
+    }
+
+    if (!ctor_fd) {
+        if (js_parse_class_default_ctor(s, f->st_mask & JS_DEFINE_CLASS_HAS_HERITAGE, &ctor_fd))
+            goto cls_fail;
+    }
+    /* patch the constant pool index for the constructor */
+    put_u32(s->cur_func->byte_code.buf + f->st_pos_a, ctor_fd->parent_cpool_idx);
+
+    /* store the class source code in the constructor. */
+    js_free(ctx, ctor_fd->source);
+    ctor_fd->source_len = s->buf_ptr - class_start_ptr;
+    ctor_fd->source = js_strndup(ctx, (const char *)class_start_ptr, ctor_fd->source_len);
+    if (!ctor_fd->source)
+        goto cls_fail;
+
+    /* consume the '}' */
+    if (next_token(s))
+        goto cls_fail;
+
+    {
+        ClassFieldsDef *cf = &class_fields[0];
+        int var_idx;
+
+        if (cf->need_brand) {
+            /* add a private brand to the prototype */
+            emit_op(s, OP_dup);
+            emit_op(s, OP_null);
+            emit_op(s, OP_swap);
+            emit_op(s, OP_add_brand);
+
+            /* define the brand field in 'this' of the initializer */
+            if (!cf->fields_init_fd) {
+                if (emit_class_init_start(s, cf))
+                    goto cls_fail;
+            }
+            /* patch the start of the function to enable the
+               OP_add_brand_instance code */
+            cf->fields_init_fd->byte_code.buf[cf->brand_push_pos] = OP_push_true;
+        }
+
+        /* store the function to initialize the fields to that it can be
+           referenced by the constructor */
+        var_idx = define_var(s, s->cur_func, JS_ATOM_class_fields_init,
+                             JS_VAR_DEF_CONST);
+        if (var_idx < 0)
+            goto cls_fail;
+        if (cf->fields_init_fd) {
+            emit_class_init_end(s, cf);
+        } else {
+            emit_op(s, OP_undefined);
+        }
+        emit_op(s, OP_scope_put_var_init);
+        emit_atom(s, JS_ATOM_class_fields_init);
+        emit_u16(s, s->cur_func->scope_level);
+    }
+
+    /* The class's own code ends HERE: everything below is the engine's own shaping, and the field initializers
+       it calls are separate functions with their own strictness. The marker leaves the region at this point
+       rather than at the end of the function so that OP_set_class_name stays the LAST opcode — set_object_name
+       finds an anonymous class expression's inferred f->atom by exactly that pattern. */
+    if (!f->st_b3) {
+        emit_op(s, OP_set_strict);
+        emit_u8(s, 0);
+    }
+
+    /* drop the prototype */
+    emit_op(s, OP_drop);
+
+    if (class_fields[1].need_brand) {
+        /* add a private brand to the class */
+        emit_op(s, OP_dup);
+        emit_op(s, OP_dup);
+        emit_op(s, OP_add_brand);
+    }
+
+    /* initialize the static fields */
+    if (class_fields[1].fields_init_fd != NULL) {
+        ClassFieldsDef *cf = &class_fields[1];
+        emit_op(s, OP_dup);
+        emit_class_init_end(s, cf);
+        emit_op(s, OP_call_method);
+        emit_u16(s, 0);
+        emit_op(s, OP_drop);
+    }
+
+    if (f->atom2 != JS_ATOM_NULL) {
+        /* store the class f->atom in the scoped class f->atom variable (it
+           is independent from the class statement variable
+           definition) */
+        emit_op(s, OP_dup);
+        emit_op(s, OP_scope_put_var_init);
+        emit_atom(s, f->atom2);
+        emit_u16(s, s->cur_func->scope_level);
+    }
+    pop_scope(s);
+    pop_scope(s);
+
+    /* the class statements have a block level scope */
+    if (f->atom3 != JS_ATOM_NULL) {
+        if (define_var(s, s->cur_func, f->atom3, JS_VAR_DEF_LET) < 0)
+            goto cls_fail;
+        emit_op(s, OP_scope_put_var_init);
+        emit_atom(s, f->atom3);
+        emit_u16(s, s->cur_func->scope_level);
+    } else {
+        if (f->atom2 == JS_ATOM_NULL) {
+            /* cannot use OP_set_name because the f->atom of the class
+               must be defined before the static initializers are
+               executed */
+            emit_op(s, OP_set_class_name);
+            emit_u32(s, s->cur_func->last_opcode_pos + 1 - f->st_pos_b);
+        }
+    }
+
+    if (f->op != JS_PARSE_EXPORT_NONE) {
+        if (!add_export_entry(s, s->cur_func->module,
+                              f->atom3,
+                              f->op == JS_PARSE_EXPORT_NAMED ? f->atom3 : JS_ATOM_default,
+                              JS_EXPORT_TYPE_LOCAL))
+            goto cls_fail;
+    }
+
+    /* The recursive body released its atoms at each exit because they were C locals. On a frame that is
+       cls_done/cls_fail's job — doing it here as well freed them twice, which showed up as an over-released
+       atom while the bytecode was being torn down, far from this function. */
+    s->cur_func->is_strict_mode = f->st_b3;
+    goto cls_done;
+ cls_restore_fail:
+    s->cur_func->is_strict_mode = f->st_b3;
+    goto cls_fail;
+ cls_done:
+    JS_FreeAtom(ctx, f->atom);
+    JS_FreeAtom(ctx, f->atom2);
+    JS_FreeAtom(ctx, f->atom3);
+    JS_FreeAtom(ctx, f->atom4);
+    f->atom = f->atom2 = f->atom3 = f->atom4 = JS_ATOM_NULL;
+    PD_RET(0);
+ cls_fail:
+    JS_FreeAtom(ctx, f->atom);
+    JS_FreeAtom(ctx, f->atom2);
+    JS_FreeAtom(ctx, f->atom3);
+    JS_FreeAtom(ctx, f->atom4);
+    f->atom = f->atom2 = f->atom3 = f->atom4 = JS_ATOM_NULL;
     PD_RET(-1);
 
  done:
@@ -53595,7 +53614,7 @@ static __exception int js_parse_export(JSParseState *s)
 
     tok = s->token.val;
     if (tok == TOK_CLASS) {
-        return js_parse_class(s, false, JS_PARSE_EXPORT_NAMED);
+        return js_parse_descent(s, PDS_CLASS, false, 0, JS_PARSE_EXPORT_NAMED);
     } else if (tok == TOK_FUNCTION ||
                (token_is_pseudo_keyword(s, JS_ATOM_async) &&
                 peek_token(s, true) == TOK_FUNCTION)) {
@@ -53721,7 +53740,7 @@ static __exception int js_parse_export(JSParseState *s)
         break;
     case TOK_DEFAULT:
         if (s->token.val == TOK_CLASS) {
-            return js_parse_class(s, false, JS_PARSE_EXPORT_DEFAULT);
+            return js_parse_descent(s, PDS_CLASS, false, 0, JS_PARSE_EXPORT_DEFAULT);
         } else if (s->token.val == TOK_FUNCTION ||
                    (token_is_pseudo_keyword(s, JS_ATOM_async) &&
                     peek_token(s, true) == TOK_FUNCTION)) {
