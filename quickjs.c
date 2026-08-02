@@ -44425,7 +44425,7 @@ static __exception int js_parse_template(JSParseState *s, int call, int *argc)
     JSContext *ctx = s->ctx;
     JSValue raw_array, template_object;
     JSToken cooked;
-    int depth, ret;
+    int depth, pd_ret;
 
     raw_array = JS_UNDEFINED; /* avoid warning */
     template_object = JS_UNDEFINED; /* avoid warning */
@@ -44436,9 +44436,9 @@ static __exception int js_parse_template(JSParseState *s, int call, int *argc)
         if (JS_IsException(template_object))
             return -1;
         //        pool_idx = s->cur_func->cpool_count;
-        ret = emit_push_const(s, template_object, 0);
+        pd_ret = emit_push_const(s, template_object, 0);
         JS_FreeValue(ctx, template_object);
-        if (ret)
+        if (pd_ret)
             return -1;
         raw_array = JS_NewArray(ctx);
         if (JS_IsException(raw_array))
@@ -44481,9 +44481,9 @@ static __exception int js_parse_template(JSParseState *s, int call, int *argc)
                 return -1;
             str = JS_VALUE_GET_STRING(cooked.u.str.str);
             if (str->len != 0 || depth == 0) {
-                ret = emit_push_const(s, cooked.u.str.str, 1);
+                pd_ret = emit_push_const(s, cooked.u.str.str, 1);
                 JS_FreeValue(s->ctx, cooked.u.str.str);
-                if (ret)
+                if (pd_ret)
                     return -1;
                 if (depth == 0) {
                     if (s->token.u.str.sep == '`')
@@ -45429,16 +45429,16 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
                 emit_op(s, OP_scope_put_var_init);
                 if (is_set) {
                     JSAtom setter_name;
-                    int ret;
+                    int pd_ret;
 
                     setter_name = get_private_setter_name(ctx, name);
                     if (setter_name == JS_ATOM_NULL)
                         goto fail;
                     emit_atom(s, setter_name);
-                    ret = add_private_class_field(s, fd, setter_name,
+                    pd_ret = add_private_class_field(s, fd, setter_name,
                                                   JS_VAR_PRIVATE_SETTER, is_static);
                     JS_FreeAtom(ctx, setter_name);
-                    if (ret < 0)
+                    if (pd_ret < 0)
                         goto fail;
                 } else {
                     emit_atom(s, name);
@@ -46827,7 +46827,7 @@ static __exception int js_parse_var(JSParseState *s, int parse_flags, int tok,
  * an explicit frame stack, the shape json_parse_step already uses for JSON in this
  * file: a descent is a PUSH recording where to resume, a finished production POPs
  * and delivers its return code to the frame below, where the resume state inspects
- * `ret` exactly as the recursive call site inspected the callee's return value.
+ * `pd_ret` exactly as the recursive call site inspected the callee's return value.
  *
  * The four recursive bodies this replaces are DELETED, not kept beside it: there
  * is one implementation of each production and nothing to fall back to.
@@ -46909,7 +46909,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
        then released the whole stack on its way out, leaving this one reading freed chunks. That was a segfault
        on the first harness file and a leak on hundreds of tests. `base` is this activation's own floor and is
        genuinely private; the depth never is. */
-    int base = s->pd_sp, ret = 0;
+    int base = s->pd_sp, pd_ret = 0;
     int tok, opcode = 0, drop_count = 0;
 
 /* The arguments are read into temporaries FIRST: they are almost always expressions over the CALLER's frame
@@ -46933,11 +46933,11 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         f->state = (resume_);                                                   \
         PD_PUSH(entry_, level_, flags_, op_);                                   \
     } while (0)
-/* A production finished: its return code becomes the caller's `ret`. */
+/* A production finished: its return code becomes the caller's `pd_ret`. */
 #define PD_RET(v_) do {                                                         \
         DCHECK(f->atom == JS_ATOM_NULL,                                         \
                "a parse frame was popped still owning an atom — it leaks");     \
-        ret = (v_); s->pd_sp--; goto dispatch;                                  \
+        pd_ret = (v_); s->pd_sp--; goto dispatch;                                  \
     } while (0)
 /* js_parse_error returns -1, so an error IS a return value — variadic because the parser's messages are
    formatted. */
@@ -47024,7 +47024,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_CALL(PDS_BIN, f->level - 1, f->flags, 0, PDS_BIN_HEAD);
 
  bin_priv_done:
-    if (ret) {
+    if (pd_ret) {
         JS_FreeAtom(ctx, f->atom);
         f->atom = JS_ATOM_NULL;
         PD_RET(-1);
@@ -47037,7 +47037,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_RET(0);
 
  bin_head_done:
-    if (ret)
+    if (pd_ret)
         PD_RET(-1);
  bin_loop:
     tok = s->token.val;
@@ -47116,7 +47116,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_CALL(PDS_BIN, f->level - 1, f->flags, 0, PDS_BIN_RHS);
 
  bin_rhs_done:
-    if (ret)
+    if (pd_ret)
         PD_RET(-1);
     emit_op(s, f->opcode);
     goto bin_loop;
@@ -47128,7 +47128,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_CALL(PDS_LAO, 0, f->flags, TOK_LAND, PDS_LAO_HEAD);
 
  lao_head_done:
-    if (ret)
+    if (pd_ret)
         PD_RET(-1);
     if (s->token.val != f->op)
         PD_RET(0);
@@ -47144,7 +47144,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_CALL(PDS_LAO, 0, f->flags, TOK_LAND, PDS_LAO_RHS);
 
  lao_rhs_done:
-    if (ret)
+    if (pd_ret)
         PD_RET(-1);
     if (s->token.val != f->op) {
         if (s->token.val == TOK_DOUBLE_QUESTION_MARK)
@@ -47159,7 +47159,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_CALL(PDS_LAO, 0, f->flags, TOK_LOR, PDS_COA_HEAD);
 
  coa_head_done:
-    if (ret)
+    if (pd_ret)
         PD_RET(-1);
     if (s->token.val != TOK_DOUBLE_QUESTION_MARK)
         PD_RET(0);
@@ -47174,7 +47174,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_CALL(PDS_BIN, 8, f->flags, 0, PDS_COA_RHS);
 
  coa_rhs_done:
-    if (ret)
+    if (pd_ret)
         PD_RET(-1);
     if (s->token.val != TOK_DOUBLE_QUESTION_MARK) {
         emit_label(s, f->label1);
@@ -47187,7 +47187,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_CALL(PDS_COA, 0, f->flags, 0, PDS_CND_HEAD);
 
  cnd_head_done:
-    if (ret)
+    if (pd_ret)
         PD_RET(-1);
     if (s->token.val != '?')
         PD_RET(0);
@@ -47197,7 +47197,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_CND_TRUE);
 
  cnd_true_done:
-    if (ret)
+    if (pd_ret)
         PD_RET(-1);
     if (js_parse_expect(s, ':'))
         PD_RET(-1);
@@ -47206,7 +47206,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_CALL(PDS_ASGN, 0, f->flags & PF_IN_ACCEPTED, 0, PDS_CND_FALSE);
 
  cnd_false_done:
-    if (ret)
+    if (pd_ret)
         PD_RET(-1);
     emit_label(s, f->label2);
     PD_RET(0);
@@ -47246,7 +47246,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     }
 
  una_postfix_done:
-    if (ret)
+    if (pd_ret)
         PD_RET(-1);
     {
         if (!s->got_lf &&
@@ -47266,7 +47266,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     goto una_tail;
 
  una_prefix_done:
-    if (ret)
+    if (pd_ret)
         PD_RET(-1);
     switch (f->op) {
     case '-':      emit_op(s, OP_neg); break;
@@ -47283,7 +47283,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     goto una_tail;
 
  una_incdec_done:
-    if (ret)
+    if (pd_ret)
         PD_RET(-1);
     {
         int opcode, scope, label;
@@ -47298,7 +47298,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     goto una_tail;
 
  una_typeof_done:
-    if (ret)
+    if (pd_ret)
         PD_RET(-1);
     {
         /* reference access should not return an exception, so we patch the get_var */
@@ -47311,7 +47311,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     goto una_tail;
 
  una_await_done:
-    if (ret)
+    if (pd_ret)
         PD_RET(-1);
     emit_op(s, OP_await);
     s->cur_func->has_await = true;
@@ -47319,7 +47319,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     goto una_tail;
 
  una_delete_done:
-    if (ret)
+    if (pd_ret)
         PD_RET(-1);
     f->flags = 0;
  una_tail:
@@ -47338,7 +47338,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_RET(0);
 
  una_pow_done:
-    if (ret)
+    if (pd_ret)
         PD_RET(-1);
     emit_op(s, OP_pow);
     PD_RET(0);
@@ -47350,7 +47350,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_CALL(PDS_UNA, 0, PF_POW_FORBIDDEN, 0, PDS_DEL_OPERAND);
 
  del_operand_done:
-    if (ret)
+    if (pd_ret)
         PD_RET(-1);
     {
         JSFunctionDef *fd = s->cur_func;
@@ -47442,7 +47442,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_CALL(PDS_ASGN, 0, f->flags, 0, PDS_EXPR2_ELEM);
 
  expr2_elem_done:
-    if (ret)
+    if (pd_ret)
         PD_RET(-1);
     if (f->comma) {
         /* prevent get_lvalue from using the last expression as an lvalue. This also prevents the conversion
@@ -47464,7 +47464,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_CALL(PDS_EXPR2, 0, PF_IN_ACCEPTED, 0, PDS_PAREN_DONE);
 
  paren_done:
-    if (ret)
+    if (pd_ret)
         PD_RET(-1);
     PD_RET(js_parse_expect(s, ')'));
 
@@ -47561,7 +47561,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_CALL(PDS_CND, 0, f->flags, 0, PDS_ASGN_COND);
 
  assign_yield_done:
-    if (ret)
+    if (pd_ret)
         PD_RET(-1);
  assign_yield_emit:
     {
@@ -47681,7 +47681,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_RET(0);
 
  assign_cond_done:
-    if (ret)
+    if (pd_ret)
         PD_RET(-1);
     f->op = s->token.val;
     if (f->op == '=' || (f->op >= TOK_MUL_ASSIGN && f->op <= TOK_POW_ASSIGN)) {
@@ -47717,7 +47717,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_RET(0);
 
  assign_rhs_done:
-    if (ret) {
+    if (pd_ret) {
         JS_FreeAtom(ctx, f->atom);
         f->atom = JS_ATOM_NULL;
         PD_RET(-1);
@@ -47737,7 +47737,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_RET(0);
 
  assign_logrhs_done:
-    if (ret) {
+    if (pd_ret) {
         JS_FreeAtom(ctx, f->atom);
         f->atom = JS_ATOM_NULL;
         PD_RET(-1);
@@ -47839,13 +47839,13 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     parse_regexp:
         {
             JSValue str;
-            int ret, backtrace_flags;
+            int emit_r, backtrace_flags;
             if (!s->ctx->compile_regexp)
                 PD_RET_ERR(s, "RegExp are not supported");
             /* the previous token is '/' or '/=', so no need to free */
             if (js_parse_regexp(s))
                 PD_RET(-1);
-            ret = emit_push_const(s, s->token.u.regexp.body, 0);
+            emit_r = emit_push_const(s, s->token.u.regexp.body, 0);
             str = s->ctx->compile_regexp(s->ctx, s->token.u.regexp.body,
                                          s->token.u.regexp.flags);
             if (JS_IsException(str)) {
@@ -47860,9 +47860,9 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                                 backtrace_flags);
                 PD_RET(-1);
             }
-            ret = emit_push_const(s, str, 0);
+            emit_r = emit_push_const(s, str, 0);
             JS_FreeValue(s->ctx, str);
-            if (ret)
+            if (emit_r)
                 PD_RET(-1);
             /* we use a specific f->opcode to be sure the correct
                function is called (otherwise the bytecode would have
@@ -47875,7 +47875,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     case '(':
         PD_CALL(PDS_PAREN, 0, 0, 0, PDS_PFX_PAREN);
  pfx_paren_done:
-        if (ret)
+        if (pd_ret)
             PD_RET(-1);
         goto pfx_after_switch;
     case TOK_FUNCTION:
@@ -47998,7 +47998,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             emit_source_loc(s);
             PD_CALL(PDS_POSTFIX, 0, 0, 0, PDS_PFX_NEW);
  pfx_new_done:
-            if (ret)
+            if (pd_ret)
                 PD_RET(-1);
             f->accept_lparen = true;
             if (s->token.val != '(') {
@@ -48053,7 +48053,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                 PD_RET_ERR(s, "invalid use of 'import()'");
             PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_PFX_IMPORT1);
  pfx_import1_done:
-            if (ret)
+            if (pd_ret)
                 PD_RET(-1);
             if (s->token.val == ',') {
                 if (next_token(s))
@@ -48061,7 +48061,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                 if (s->token.val != ')') {
                     PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_PFX_IMPORT2);
  pfx_import2_done:
-                    if (ret)
+                    if (pd_ret)
                         PD_RET(-1);
                     /* accept a trailing comma */
                     if (s->token.val == ',') {
@@ -48255,7 +48255,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                     break;
                 PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_PFX_ARG);
  pfx_arg_done:
-                if (ret)
+                if (pd_ret)
                     PD_RET(-1);
                 f->arg_count++;
                 if (s->token.val == ')')
@@ -48277,14 +48277,14 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                             PD_RET(-1);
                         PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_PFX_SPREAD_ELL);
  pfx_spread_ell_done:
-                        if (ret)
+                        if (pd_ret)
                             PD_RET(-1);
                         /* XXX: could pass is_last indicator? */
                         emit_op(s, OP_append);
                     } else {
                         PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_PFX_SPREAD_ITEM);
  pfx_spread_item_done:
-                        if (ret)
+                        if (pd_ret)
                             PD_RET(-1);
                         /* array idx val */
                         emit_op(s, OP_define_array_el);
@@ -48411,11 +48411,11 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                 }
                 if (get_prev_opcode(s->cur_func) == OP_get_super) {
                     JSValue val;
-                    int ret;
+                    int pd_ret;
                     val = JS_AtomToValue(s->ctx, s->token.u.ident.atom);
-                    ret = emit_push_const(s, val, 1);
+                    pd_ret = emit_push_const(s, val, 1);
                     JS_FreeValue(s->ctx, val);
-                    if (ret)
+                    if (pd_ret)
                         PD_RET(-1);
                     emit_op(s, OP_get_super_value);
                 } else {
@@ -48449,7 +48449,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                 PD_RET(-1);
             PD_CALL(PDS_EXPR2, 0, PF_IN_ACCEPTED, 0, PDS_PFX_INDEX);
  pfx_index_done:
-            if (ret)
+            if (pd_ret)
                 PD_RET(-1);
             if (js_parse_expect(s, ']'))
                 PD_RET(-1);
@@ -48493,12 +48493,12 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         s->pd_sp--;
         JS_FreeAtom(ctx, PD_FRAME(s->pd_sp)->atom);
     }
-    ret = -1;
+    pd_ret = -1;
  leave:
     DCHECK(s->pd_sp == base, "the descent returned at a depth that is not its own base");
     if (s->pd_sp == 0)
         pd_release(ctx, s);   /* the whole descent drained — the parse owns nothing until the next one */
-    return ret;
+    return pd_ret;
 #undef PD_PUSH
 #undef PD_CALL
 #undef PD_RET
