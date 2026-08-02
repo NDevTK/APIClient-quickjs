@@ -41861,6 +41861,20 @@ typedef struct JSParseState {
        the production as it returns and CONSUMED by whoever reads it — a DCHECK asserts it is empty when a
        producer starts, so a dropped read crashes at its origin instead of leaking an atom. */
     JSAtom pd_name;
+    /* THE DRIVER'S CROSS-DISPATCH STATE, and the whole of it. pd_base is where the running activation's frames
+       start, pd_ret is the value a production just returned, pd_name is the out-parameter. These three are
+       exactly what is live AT the dispatch point, which is exactly what a SUSPENDED parse must carry — every
+       other variable in the driver is within-production scratch that no PD_CALL spans. Holding them here
+       rather than in C locals is what lets the dispatch loop RETURN and be re-entered: the frame stack plus
+       these three fully determine where the parse was. */
+    int pd_base, pd_ret;
+    /* SUSPENSION. pd_suspended is the driver's answer "I returned without finishing"; it is a flag and not a
+       sentinel return value because productions legitimately return -1, 0, 1 and a prop_type, and a status
+       smuggled into that range is a bug waiting for the one production whose range grows.
+       The driver suspends at EVERY dispatch — see the suspension point for why there is no mode switch.
+       pd_suspends counts them so the number is reported rather than assumed. */
+    bool pd_suspended;
+    uint64_t pd_suspends;
 } JSParseState;
 
 /* ---- JSON.parse's data types. They sit HERE, below JSParseState, because the step machine at the end of
@@ -45539,6 +45553,16 @@ struct JSParseFrame {
     ClassFieldsDef st_class_fields[2];
     JSFunctionDef *st_ctor_fd;
     const uint8_t *st_class_start;
+    /* FOUND BY SUSPENDING AT EVERY DISPATCH, not by reading the code. Each of these was a C local assigned
+       before a descent and read after it, which worked only because a PD_CALL used to leave the driver's
+       frame standing. Once the driver can RETURN at a dispatch, that local is re-initialised on the way back
+       in and the value is gone: `let {a = expr} = x` emitted a jump to label 0, a labelled statement popped
+       the wrong break entry, and an eval-completion slot restored from a zeroed index. They are the frame's
+       now, which is the only scope that survives a suspension. */
+    int st_label_hasval;      /* destructuring: the has-value jump around a default initialiser */
+    int st_saved_eval_ret;    /* statement: the eval-completion slot parked across a Block */
+    JSFunctionDef *st_label_fd;   /* statement: the def whose break entry a labelled statement pops */
+    JSModuleDef *st_module;       /* export: the module the entries are added to, live across every descent */
 };
 typedef struct JSParseFrame JSParseFrame;
 
@@ -45579,27 +45603,32 @@ static void pd_release(JSContext *ctx, JSParseState *s)
     s->pd_nchunks = 0;
 }
 
-static __exception int js_parse_descent(JSParseState *s, int entry, int level,
-                                        int parse_flags, int op)
+/* THE DISPATCH LOOP, re-enterable. A parse SUSPENDS by returning from here with pd_suspended set and RESUMES
+   by being called again with resuming=true: the frame stack plus pd_base/pd_ret/pd_name fully determine where
+   it was. Every other variable in this function is within-production scratch that no PD_CALL spans — and that
+   claim is not asserted, it is TESTED, because a resume re-enters this function and every one of those locals
+   is therefore FRESH. A production that read one across a suspension sees its initialiser instead of the value
+   it left, so the corpus reports it as a wrong parse instead of it lying in wait for a scheduler. */
+static __exception int js_parse_drive(JSParseState *s, int entry, int level,
+                                      int parse_flags, int op, bool resuming)
 {
     JSContext *ctx = s->ctx;
-    /* LOADED into locals and STORED back at the exits, the way json_parse_step does: the state is the parse's,
-       which is what lets a nested activation share it, but the dispatch loop should not read through a pointer
-       on every state transition. `base` is where THIS activation's frames start — it returns when the stack
-       drains back to it, leaving any outer activation's frames untouched. */
+    /* NOT loaded into locals. An earlier version cached the parse's state here so the dispatch loop would not
+       read through a pointer, and that is precisely what these may not be: pd_base, pd_ret and pd_name are
+       live ACROSS the dispatch point, so a suspend that returned from this function would lose all three.
+       They live in the parse state. `f` is re-derived from the frame stack at every dispatch, so it is
+       genuinely local and a resume rebuilds it for free. */
     JSParseFrame *f = NULL;
     /* THE DEPTH IS NOT CACHED. It is shared state between THIS activation and any nested one, and an
        unconverted C production between two converted ones (js_parse_function_decl, js_parse_class,
        js_parse_template, the literals) re-enters this driver. Holding `sp` in a local and publishing it only on
        the way out told the nested activation the stack was EMPTY: it overwrote this activation's frames and
        then released the whole stack on its way out, leaving this one reading freed chunks. That was a segfault
-       on the first harness file and a leak on hundreds of tests. `base` is this activation's own floor and is
-       genuinely private; the depth never is. */
-    int base = s->pd_sp, pd_ret = 0;
+       on the first harness file and a leak on hundreds of tests. pd_base is this activation's floor.
+       THE NESTING IT DEFENDED AGAINST IS GONE: every production is a state on this stack and the only caller
+       is js_parse_program, so there is exactly one activation, and the DCHECK below is what keeps it that way —
+       a re-entry is reported at its origin instead of silently sharing pd_base. */
     int tok, opcode = 0, drop_count = 0;
-    /* The out-parameter, delivered exactly like pd_ret: a production writes it as it returns and the resume
-       label reads it immediately. Published to s->pd_name on the way out for C callers. */
-    JSAtom out_name = JS_ATOM_NULL;
     bool is_non_reserved_ident = false;
     /* TemplateLiteral scratch — never live across a PD_CALL (the substitution descent is the only one, and
        `cooked` is consumed before it). */
@@ -45632,7 +45661,9 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         f->raw_array = JS_UNDEFINED; f->template_object = JS_UNDEFINED;          \
         f->start_ptr = NULL; f->start_line = 0; f->start_col = 0;                \
         memset(f->st_class_fields, 0, sizeof(f->st_class_fields));               \
-        f->st_ctor_fd = NULL; f->st_class_start = NULL;
+        f->st_ctor_fd = NULL; f->st_class_start = NULL;                          \
+        f->st_label_hasval = -1; f->st_saved_eval_ret = -1;                      \
+        f->st_label_fd = NULL; f->st_module = NULL;
 
 #define PD_PUSH(entry_, level_, flags_, op_) do {                               \
         int e_ = (entry_), lv_ = (level_), fl_ = (flags_), o_ = (op_);          \
@@ -45683,23 +45714,47 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         goto dispatch;                                                          \
     } while (0)
 
-/* A production finished: its return code becomes the caller's `pd_ret`. */
+/* A production finished: its return code becomes the caller's `s->pd_ret`. */
 #define PD_RET(v_) do {                                                         \
         DCHECK(f->atom == JS_ATOM_NULL && f->atom2 == JS_ATOM_NULL &&            \
                f->atom3 == JS_ATOM_NULL && f->atom4 == JS_ATOM_NULL,             \
                "a parse frame was popped still owning an atom — it leaks");     \
-        pd_ret = (v_); s->pd_sp--; goto dispatch;                                  \
+        s->pd_ret = (v_); s->pd_sp--; goto dispatch;                                  \
     } while (0)
 /* js_parse_error returns -1, so an error IS a return value — variadic because the parser's messages are
    formatted. */
 #define PD_RET_ERR(...) PD_RET(js_parse_error(__VA_ARGS__))
 
+    /* The declaration that used to initialise these is gone with them; a parse BEGINS here. The DCHECK is the
+       nesting claim made falsifiable: with every production on the frame stack there is one activation, so a
+       live stack at entry means someone re-entered the driver and would be sharing pd_base with it. */
+    if (resuming)
+        goto dispatch;
+    DCHECK(s->pd_sp == 0, "js_parse_descent re-entered while a parse was live — the driver has one activation");
+    s->pd_base = s->pd_sp;
+    s->pd_ret = 0;
+    s->pd_suspended = false;
+
     PD_PUSH(entry, level, parse_flags, op);
 
  dispatch:
-    if (s->pd_sp == base)
+    if (s->pd_sp == s->pd_base)
         goto done;
-    DCHECK(s->pd_sp > base && s->pd_chunks != NULL,
+    /* THE SUSPENSION POINT, taken UNCONDITIONALLY — there is no non-suspending mode, for the same reason
+       there is no non-feature test262 run. A seam exercised only on request is a seam whose correctness is
+       never tested, and the bug it hides (a driver local read ACROSS a suspension) then surfaces the first
+       time a scheduler parks at the wrong moment instead of in the corpus.
+       A RESUME MUST CONSUME A DISPATCH BEFORE IT MAY SUSPEND AGAIN: the resume re-enters at this label, so an
+       unguarded check would suspend, return, resume, and suspend again having done no work — a livelock, not
+       a slow parse. Clearing `resuming` makes each drive call advance by exactly one production step. */
+    if (resuming) {
+        resuming = false;
+    } else {
+        s->pd_suspends++;
+        s->pd_suspended = true;
+        return 0;
+    }
+    DCHECK(s->pd_sp > s->pd_base && s->pd_chunks != NULL,
            "the descent stack was released while an outer activation still held frames");
     f = PD_FRAME(s->pd_sp - 1);
     switch (f->state) {
@@ -45880,7 +45935,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_CALL(PDS_BIN, f->level - 1, f->flags, 0, PDS_BIN_HEAD);
 
  bin_priv_done:
-    if (pd_ret) {
+    if (s->pd_ret) {
         JS_FreeAtom(ctx, f->atom);
         f->atom = JS_ATOM_NULL;
         PD_RET(-1);
@@ -45893,7 +45948,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_RET(0);
 
  bin_head_done:
-    if (pd_ret)
+    if (s->pd_ret)
         PD_RET(-1);
  bin_loop:
     tok = s->token.val;
@@ -45972,7 +46027,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_CALL(PDS_BIN, f->level - 1, f->flags, 0, PDS_BIN_RHS);
 
  bin_rhs_done:
-    if (pd_ret)
+    if (s->pd_ret)
         PD_RET(-1);
     emit_op(s, f->opcode);
     goto bin_loop;
@@ -45984,7 +46039,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_CALL(PDS_LAO, 0, f->flags, TOK_LAND, PDS_LAO_HEAD);
 
  lao_head_done:
-    if (pd_ret)
+    if (s->pd_ret)
         PD_RET(-1);
     if (s->token.val != f->op)
         PD_RET(0);
@@ -46000,7 +46055,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_CALL(PDS_LAO, 0, f->flags, TOK_LAND, PDS_LAO_RHS);
 
  lao_rhs_done:
-    if (pd_ret)
+    if (s->pd_ret)
         PD_RET(-1);
     if (s->token.val != f->op) {
         if (s->token.val == TOK_DOUBLE_QUESTION_MARK)
@@ -46015,7 +46070,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_CALL(PDS_LAO, 0, f->flags, TOK_LOR, PDS_COA_HEAD);
 
  coa_head_done:
-    if (pd_ret)
+    if (s->pd_ret)
         PD_RET(-1);
     if (s->token.val != TOK_DOUBLE_QUESTION_MARK)
         PD_RET(0);
@@ -46030,7 +46085,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_CALL(PDS_BIN, 8, f->flags, 0, PDS_COA_RHS);
 
  coa_rhs_done:
-    if (pd_ret)
+    if (s->pd_ret)
         PD_RET(-1);
     if (s->token.val != TOK_DOUBLE_QUESTION_MARK) {
         emit_label(s, f->label1);
@@ -46043,7 +46098,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_CALL(PDS_COA, 0, f->flags, 0, PDS_CND_HEAD);
 
  cnd_head_done:
-    if (pd_ret)
+    if (s->pd_ret)
         PD_RET(-1);
     if (s->token.val != '?')
         PD_RET(0);
@@ -46053,7 +46108,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_CND_TRUE);
 
  cnd_true_done:
-    if (pd_ret)
+    if (s->pd_ret)
         PD_RET(-1);
     if (js_parse_expect(s, ':'))
         PD_RET(-1);
@@ -46062,7 +46117,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_CALL(PDS_ASGN, 0, f->flags & PF_IN_ACCEPTED, 0, PDS_CND_FALSE);
 
  cnd_false_done:
-    if (pd_ret)
+    if (s->pd_ret)
         PD_RET(-1);
     emit_label(s, f->label2);
     PD_RET(0);
@@ -46102,7 +46157,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     }
 
  una_postfix_done:
-    if (pd_ret)
+    if (s->pd_ret)
         PD_RET(-1);
     {
         if (!s->got_lf &&
@@ -46122,7 +46177,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     goto una_tail;
 
  una_prefix_done:
-    if (pd_ret)
+    if (s->pd_ret)
         PD_RET(-1);
     switch (f->op) {
     case '-':      emit_op(s, OP_neg); break;
@@ -46139,7 +46194,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     goto una_tail;
 
  una_incdec_done:
-    if (pd_ret)
+    if (s->pd_ret)
         PD_RET(-1);
     {
         int opcode, scope, label;
@@ -46154,7 +46209,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     goto una_tail;
 
  una_typeof_done:
-    if (pd_ret)
+    if (s->pd_ret)
         PD_RET(-1);
     {
         /* reference access should not return an exception, so we patch the get_var */
@@ -46167,7 +46222,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     goto una_tail;
 
  una_await_done:
-    if (pd_ret)
+    if (s->pd_ret)
         PD_RET(-1);
     emit_op(s, OP_await);
     s->cur_func->has_await = true;
@@ -46175,7 +46230,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     goto una_tail;
 
  una_delete_done:
-    if (pd_ret)
+    if (s->pd_ret)
         PD_RET(-1);
     f->flags = 0;
  una_tail:
@@ -46194,7 +46249,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_RET(0);
 
  una_pow_done:
-    if (pd_ret)
+    if (s->pd_ret)
         PD_RET(-1);
     emit_op(s, OP_pow);
     PD_RET(0);
@@ -46206,7 +46261,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_CALL(PDS_UNA, 0, PF_POW_FORBIDDEN, 0, PDS_DEL_OPERAND);
 
  del_operand_done:
-    if (pd_ret)
+    if (s->pd_ret)
         PD_RET(-1);
     {
         JSFunctionDef *fd = s->cur_func;
@@ -46298,7 +46353,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_CALL(PDS_ASGN, 0, f->flags, 0, PDS_EXPR2_ELEM);
 
  expr2_elem_done:
-    if (pd_ret)
+    if (s->pd_ret)
         PD_RET(-1);
     if (f->comma) {
         /* prevent get_lvalue from using the last expression as an lvalue. This also prevents the conversion
@@ -46320,7 +46375,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_CALL(PDS_EXPR2, 0, PF_IN_ACCEPTED, 0, PDS_PAREN_DONE);
 
  paren_done:
-    if (pd_ret)
+    if (s->pd_ret)
         PD_RET(-1);
     PD_RET(js_parse_expect(s, ')'));
 
@@ -46358,7 +46413,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                   s->token.ptr, NULL, s->token.line_num, s->token.col_num,
                   JS_PARSE_EXPORT_NONE, PDS_ASGN_ARROW1);
  asgn_arrow1_done:
-        PD_RET(pd_ret);
+        PD_RET(s->pd_ret);
     }
     if (token_is_pseudo_keyword(s, JS_ATOM_async)) {
         const uint8_t *source_ptr;
@@ -46384,7 +46439,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                       source_ptr, NULL, source_line_num, source_col_num,
                       JS_PARSE_EXPORT_NONE, PDS_ASGN_ARROW2);
  asgn_arrow2_done:
-            PD_RET(pd_ret);
+            PD_RET(s->pd_ret);
         }
         /* undo the token parsing */
         if (js_parse_seek_token(s, &pos))
@@ -46395,7 +46450,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                   s->token.ptr, NULL, s->token.line_num, s->token.col_num,
                   JS_PARSE_EXPORT_NONE, PDS_ASGN_ARROW3);
  asgn_arrow3_done:
-        PD_RET(pd_ret);
+        PD_RET(s->pd_ret);
     }
  assign_next:
     if (s->token.val == '[' || s->token.val == '{') {
@@ -46410,7 +46465,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             PD_CALL(PDS_DESTR, 0,
                     DE_PACK(false, false, true, false, skip_bits & SKIP_HAS_ELLIPSIS), 0, PDS_DE_09);
  de_09:
-            if (pd_ret < 0)
+            if (s->pd_ret < 0)
                 PD_RET(-1);
             PD_RET(0);
         }
@@ -46422,7 +46477,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_CALL(PDS_CND, 0, f->flags, 0, PDS_ASGN_COND);
 
  assign_yield_done:
-    if (pd_ret)
+    if (s->pd_ret)
         PD_RET(-1);
  assign_yield_emit:
     {
@@ -46542,7 +46597,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_RET(0);
 
  assign_cond_done:
-    if (pd_ret)
+    if (s->pd_ret)
         PD_RET(-1);
     f->op = s->token.val;
     if (f->op == '=' || (f->op >= TOK_MUL_ASSIGN && f->op <= TOK_POW_ASSIGN)) {
@@ -46553,9 +46608,9 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             PD_RET(-1);
 
         /* No key coercion is emitted around the RHS: a write-only member reference holds its key raw and
-           OP_put_array_el runs ToObject(base) then ToPropertyKey(key) at PutValue time, which is the whole
-           of the "obtuse" order. The former workaround here re-emitted a nullish-base test so the key could
-           be coerced EARLY on the object-base path — the pre-ES2022 order, before a Reference Record was
+           OP_put_array_el runs ToObject(s->pd_base) then ToPropertyKey(key) at PutValue time, which is the whole
+           of the "obtuse" order. The former workaround here re-emitted a nullish-s->pd_base test so the key could
+           be coerced EARLY on the object-s->pd_base path — the pre-ES2022 order, before a Reference Record was
            allowed to hold an un-coerced [[ReferencedName]]. */
         PD_CALL(PDS_ASGN, 0, f->flags, 0, PDS_ASGN_RHS);
     }
@@ -46578,7 +46633,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_RET(0);
 
  assign_rhs_done:
-    if (pd_ret) {
+    if (s->pd_ret) {
         JS_FreeAtom(ctx, f->atom);
         f->atom = JS_ATOM_NULL;
         PD_RET(-1);
@@ -46598,7 +46653,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_RET(0);
 
  assign_logrhs_done:
-    if (pd_ret) {
+    if (s->pd_ret) {
         JS_FreeAtom(ctx, f->atom);
         f->atom = JS_ATOM_NULL;
         PD_RET(-1);
@@ -46684,7 +46739,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     case TOK_TEMPLATE:
         PD_CALL(PDS_TEMPLATE, 0, 0, 0, PDS_PFX_TEMPLATE);
  pfx_template_done:
-        if (pd_ret)
+        if (s->pd_ret)
             PD_RET(-1);
         goto pfx_after_switch;
     case TOK_STRING:
@@ -46738,7 +46793,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     case '(':
         PD_CALL(PDS_PAREN, 0, 0, 0, PDS_PFX_PAREN);
  pfx_paren_done:
-        if (pd_ret)
+        if (s->pd_ret)
             PD_RET(-1);
         goto pfx_after_switch;
     case TOK_FUNCTION:
@@ -46746,13 +46801,13 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                   s->token.ptr, NULL, s->token.line_num, s->token.col_num,
                   JS_PARSE_EXPORT_NONE, PDS_PFX_FUNC);
  pfx_func_done:
-        if (pd_ret)
+        if (s->pd_ret)
             PD_RET(-1);
         break;
     case TOK_CLASS:
         PD_CALL(PDS_CLASS, true, 0, JS_PARSE_EXPORT_NONE, PDS_PFX_CLASS);
  pfx_class_done:
-        if (pd_ret)
+        if (s->pd_ret)
             PD_RET(-1);
         break;
     case TOK_NULL:
@@ -46808,7 +46863,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                               source_col_num, JS_PARSE_EXPORT_NONE,
                               PDS_PFX_ASYNCFUNC);
  pfx_asyncfunc_done:
-                    if (pd_ret)
+                    if (s->pd_ret)
                         PD_RET(-1);
                 } else {
                     name = JS_DupAtom(s->ctx, JS_ATOM_async);
@@ -46840,7 +46895,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         if (s->token.val == '{') {
             PD_CALL(PDS_OBJ, 0, 0, 0, PDS_PFX_OBJECT);
  pfx_object_done:
-            if (pd_ret)
+            if (s->pd_ret)
                 PD_RET(-1);
             goto pfx_after_switch;
         }
@@ -46849,7 +46904,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
            whole point of converting a production is that its call sites INSIDE the driver become PD_CALLs. */
         PD_CALL(PDS_ARR, 0, 0, 0, PDS_PFX_ARRAY);
  pfx_array_done:
-        if (pd_ret)
+        if (s->pd_ret)
             PD_RET(-1);
         goto pfx_after_switch;
     case TOK_NEW:
@@ -46871,7 +46926,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             emit_source_loc(s);
             PD_CALL(PDS_POSTFIX, 0, 0, 0, PDS_PFX_NEW);
  pfx_new_done:
-            if (pd_ret)
+            if (s->pd_ret)
                 PD_RET(-1);
             f->accept_lparen = true;
             if (s->token.val != '(') {
@@ -46926,7 +46981,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                 PD_RET_ERR(s, "invalid use of 'import()'");
             PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_PFX_IMPORT1);
  pfx_import1_done:
-            if (pd_ret)
+            if (s->pd_ret)
                 PD_RET(-1);
             if (s->token.val == ',') {
                 if (next_token(s))
@@ -46934,7 +46989,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                 if (s->token.val != ')') {
                     PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_PFX_IMPORT2);
  pfx_import2_done:
-                    if (pd_ret)
+                    if (s->pd_ret)
                         PD_RET(-1);
                     /* accept a trailing comma */
                     if (s->token.val == ',') {
@@ -47102,9 +47157,9 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             if (f->call_type == FUNC_CALL_TEMPLATE) {
                 PD_CALL(PDS_TEMPLATE, 0, 0, 1, PDS_PFX_TAGGED);
  pfx_tagged_done:
-                if (pd_ret < 0)
+                if (s->pd_ret < 0)
                     PD_RET(-1);
-                f->arg_count = pd_ret;
+                f->arg_count = s->pd_ret;
                 goto emit_func_call;
             } else if (f->call_type == FUNC_CALL_SUPER_CTOR) {
                 emit_op(s, OP_scope_get_var);
@@ -47131,7 +47186,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                     break;
                 PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_PFX_ARG);
  pfx_arg_done:
-                if (pd_ret)
+                if (s->pd_ret)
                     PD_RET(-1);
                 f->arg_count++;
                 if (s->token.val == ')')
@@ -47153,14 +47208,14 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                             PD_RET(-1);
                         PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_PFX_SPREAD_ELL);
  pfx_spread_ell_done:
-                        if (pd_ret)
+                        if (s->pd_ret)
                             PD_RET(-1);
                         /* XXX: could pass is_last indicator? */
                         emit_op(s, OP_append);
                     } else {
                         PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_PFX_SPREAD_ITEM);
  pfx_spread_item_done:
-                        if (pd_ret)
+                        if (s->pd_ret)
                             PD_RET(-1);
                         /* array idx val */
                         emit_op(s, OP_define_array_el);
@@ -47287,11 +47342,15 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                 }
                 if (get_prev_opcode(s->cur_func) == OP_get_super) {
                     JSValue val;
-                    int pd_ret;
+                    /* Its own name: this was `int pd_ret`, a block-local SHADOWING the driver's return
+                       channel. Nothing broke because it is assigned and tested with no dispatch between, but a
+                       shadow of that channel is the shape that once turned a regexp token into an infinite
+                       loop, so it does not get to keep the name. */
+                    int push_ret;
                     val = JS_AtomToValue(s->ctx, s->token.u.ident.atom);
-                    pd_ret = emit_push_const(s, val, 1);
+                    push_ret = emit_push_const(s, val, 1);
                     JS_FreeValue(s->ctx, val);
-                    if (pd_ret)
+                    if (push_ret)
                         PD_RET(-1);
                     emit_op(s, OP_get_super_value);
                 } else {
@@ -47310,7 +47369,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             if (f->prev_op == OP_get_super) {
                 /* 13.3.4 SuperProperty : super [ Expression ] evaluates the KEY before step 7's
                    MakeSuperPropertyReference, so GetSuperBase has not run yet — `super[ruin()]`, where ruin()
-                   sets the home object's prototype to null, is a TypeError and not a read through a base that
+                   sets the home object's prototype to null, is a TypeError and not a read through a s->pd_base that
                    was captured too early. The primary emitted that read already because every other `super`
                    form wants it there; take it back off and re-emit it after the key. */
                 DCHECK(s->cur_func->byte_code.buf[s->cur_func->last_opcode_pos] == OP_get_super,
@@ -47325,14 +47384,14 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                 PD_RET(-1);
             PD_CALL(PDS_EXPR2, 0, PF_IN_ACCEPTED, 0, PDS_PFX_INDEX);
  pfx_index_done:
-            if (pd_ret)
+            if (s->pd_ret)
                 PD_RET(-1);
             if (js_parse_expect(s, ']'))
                 PD_RET(-1);
             if (f->prev_op == OP_get_super) {
                 emit_op(s, OP_swap);        /* this home key -> this key home */
-                emit_op(s, OP_get_super);   /*              -> this key base  */
-                emit_op(s, OP_swap);        /*              -> this base key  */
+                emit_op(s, OP_get_super);   /*              -> this key s->pd_base  */
+                emit_op(s, OP_swap);        /*              -> this s->pd_base key  */
                 emit_op(s, OP_get_super_value);
             } else {
                 emit_op(s, OP_get_array_el);
@@ -47370,7 +47429,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             break;
         PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_ARR_E1);
  arr_e1_done:
-        if (pd_ret)
+        if (s->pd_ret)
             PD_RET(-1);
         f->arr_idx++;
         /* accept trailing comma */
@@ -47393,7 +47452,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         if (s->token.val != ',') {
             PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_ARR_E2);
  arr_e2_done:
-            if (pd_ret)
+            if (s->pd_ret)
                 PD_RET(-1);
             emit_op(s, OP_define_field);
             emit_u32(s, __JS_AtomFromUInt32(f->arr_idx));
@@ -47430,7 +47489,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                 PD_RET(-1);
             PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_ARR_SPREAD);
  arr_spread_done:
-            if (pd_ret)
+            if (s->pd_ret)
                 PD_RET(-1);
             emit_op(s, OP_append);
         } else {
@@ -47438,7 +47497,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             if (s->token.val != ',') {
                 PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_ARR_E3);
  arr_e3_done:
-                if (pd_ret)
+                if (s->pd_ret)
                     PD_RET(-1);
                 /* a idx val */
                 emit_op(s, OP_define_array_el);
@@ -47485,7 +47544,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                 PD_RET(-1);
             PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_OBJ_SPREAD);
  obj_spread_done:
-            if (pd_ret)
+            if (s->pd_ret)
                 PD_RET(-1);
             emit_op(s, OP_null);  /* dummy excludeList */
             emit_op(s, OP_copy_data_properties);
@@ -47497,9 +47556,9 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
 
         PD_CALL(PDS_PROPNAME, 0, PN_ALLOW_METHOD | PN_ALLOW_VAR, 0, PDS_OBJ_KEY);
  obj_key_done:
-        f->prop_type = pd_ret;
-        f->atom = out_name;
-        out_name = JS_ATOM_NULL;
+        f->prop_type = s->pd_ret;
+        f->atom = s->pd_name;
+        s->pd_name = JS_ATOM_NULL;
         if (f->prop_type < 0)
             goto obj_fail;
 
@@ -47535,7 +47594,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                       f->start_ptr, NULL, f->start_line, f->start_col,
                       JS_PARSE_EXPORT_NONE, PDS_OBJ_METHOD);
  obj_method_done:
-            if (pd_ret)
+            if (s->pd_ret)
                 goto obj_fail;
             if (f->atom == JS_ATOM_NULL) {
                 emit_op(s, OP_define_method_computed);
@@ -47556,7 +47615,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                 goto obj_fail;
             PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_OBJ_VALUE);
  obj_value_done:
-            if (pd_ret)
+            if (s->pd_ret)
                 goto obj_fail;
             if (f->atom == JS_ATOM_NULL) {
                 set_object_name_computed(s);
@@ -47595,7 +47654,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
    closes `{[{[…]}]}`. It returns a PROP-TYPE as its status and the key's ATOM through the out-channel; the atom
    lives in the frame slot until then so the OOM unwind releases it. `parse_flags` here is the PN_* bit set. ---- */
  pn_entry:
-    DCHECK(out_name == JS_ATOM_NULL,
+    DCHECK(s->pd_name == JS_ATOM_NULL,
            "a PropertyName started while the previous key's atom was still unconsumed");
     f->is_private = 0;
     f->prop_type = PROP_TYPE_IDENT;
@@ -47679,7 +47738,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
            access `a[x, y]` is `[ Expression ]` and keeps the comma; the two spellings are different grammars. */
         PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_PN_COMPUTED);
  pn_computed_done:
-        if (pd_ret)
+        if (s->pd_ret)
             goto pn_fail;
         if (js_parse_expect(s, ']'))
             goto pn_fail;
@@ -47706,14 +47765,14 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         goto pn_fail;
     }
     /* the key's atom leaves through the out-channel, so the frame stops owning it here */
-    out_name = f->atom;
+    s->pd_name = f->atom;
     f->atom = JS_ATOM_NULL;
     PD_RET(f->prop_type | f->is_private);
  pn_fail1:
     JS_FreeAtom(ctx, f->atom);
     f->atom = JS_ATOM_NULL;
  pn_fail:
-    out_name = JS_ATOM_NULL;
+    s->pd_name = JS_ATOM_NULL;
     PD_RET(-1);
 
 /* ---- TemplateLiteral. Its substitutions are Expressions, which the descent owns, so `` `${`${…}`}` `` is a
@@ -47795,7 +47854,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             PD_RET(-1);
         PD_CALL(PDS_EXPR2, 0, PF_IN_ACCEPTED, 0, PDS_TPL_SUB);
  tpl_sub_done:
-        if (pd_ret)
+        if (s->pd_ret)
             PD_RET(-1);
         f->arg_count++;
         if (s->token.val != '}')
@@ -47881,7 +47940,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                 goto var_error;
             PD_CALL(PDS_ASGN, 0, f->flags, 0, PDS_VAR_LV);
  var_lv_done:
-            if (pd_ret)
+            if (s->pd_ret)
                 goto var_error;            /* the unwind releases atom2 with atom */
             set_object_name(s, f->atom);
             put_lvalue(s, f->opcode, f->scope, f->atom2, f->label, PUT_LVALUE_NOKEEP, false);
@@ -47900,7 +47959,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             }
             PD_CALL(PDS_ASGN, 0, f->flags, 0, PDS_VAR_INIT);
  var_init_done:
-            if (pd_ret)
+            if (s->pd_ret)
                 goto var_error;
             set_object_name(s, f->atom);
             if (f->op == TOK_USING) {
@@ -47945,7 +48004,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             PD_CALL(PDS_DESTR, 0,
                     DE_PACK(false, true, true, f->level, skip_bits & SKIP_HAS_ELLIPSIS), f->op, PDS_DE_10);
  de_10:
-            if (pd_ret < 0)
+            if (s->pd_ret < 0)
                 PD_RET(-1);
         } else {
             PD_RET_ERR(s, "variable name expected");
@@ -47995,12 +48054,14 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         &&  s->token.val != TOK_DO
         &&  s->token.val != TOK_WHILE) {
             /* labelled regular statement */
-            JSFunctionDef *fd = s->cur_func;
+            /* The def is the FRAME's: it is captured here and pop_break_entry uses it AFTER the statement
+               descent below, which is a suspension point. A local would come back re-initialised. */
+            f->st_label_fd = s->cur_func;
 
             f->st_lbl_a = new_label(s);
-            push_break_entry(fd, &f->st_be, f->atom, f->st_lbl_a, -1, 0);
-            fd->top_break->is_regular_stmt = 1;
-            if (!fd->is_strict_mode &&
+            push_break_entry(f->st_label_fd, &f->st_be, f->atom, f->st_lbl_a, -1, 0);
+            f->st_label_fd->top_break->is_regular_stmt = 1;
+            if (!f->st_label_fd->is_strict_mode &&
                 (f->flags & DECL_MASK_FUNC_WITH_LABEL)) {
                 f->st_mask = DECL_MASK_FUNC | DECL_MASK_FUNC_WITH_LABEL;
             } else {
@@ -48008,10 +48069,10 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             }
             PD_CALL(PDS_SOD, 0, f->st_mask, 0, PDS_SOD_01);
  sod_01:
-            if (pd_ret)
+            if (s->pd_ret)
                 goto sod_fail;
             emit_label(s, f->st_lbl_a);
-            pop_break_entry(fd);
+            pop_break_entry(f->st_label_fd);
             goto sod_done;
         }
     }
@@ -48020,7 +48081,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     case '{':
         PD_CALL(PDS_BLOCK, 0, 0, 0, PDS_SOD_02);
  sod_02:
-        if (pd_ret)
+        if (s->pd_ret)
             goto sod_fail;
         break;
     case TOK_RETURN:
@@ -48037,7 +48098,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         if (s->token.val != ';' && s->token.val != '}' && !s->got_lf) {
             PD_CALL(PDS_EXPR2, 0, PF_IN_ACCEPTED, 0, PDS_SOD_03);
  sod_03:
-            if (pd_ret)
+            if (s->pd_ret)
                 goto sod_fail;
             emit_return(s, true);
         } else {
@@ -48056,7 +48117,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         emit_source_loc(s);
         PD_CALL(PDS_EXPR2, 0, PF_IN_ACCEPTED, 0, PDS_SOD_04);
  sod_04:
-        if (pd_ret)
+        if (s->pd_ret)
             goto sod_fail;
         emit_op(s, OP_throw);
         if (js_parse_expect_semi(s))
@@ -48083,7 +48144,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                     goto sod_fail;
                 PD_CALL(PDS_VAR, (false), PF_IN_ACCEPTED | PF_AWAIT_USING, TOK_USING, PDS_SOD_05);
  sod_05:
-                if (pd_ret)
+                if (s->pd_ret)
                     goto sod_fail;
                 if (js_parse_expect_semi(s))
                     goto sod_fail;
@@ -48107,7 +48168,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             goto sod_fail;
         PD_CALL(PDS_VAR, (false), PF_IN_ACCEPTED, f->op, PDS_SOD_06);
  sod_06:
-        if (pd_ret)
+        if (s->pd_ret)
             goto sod_fail;
         if (js_parse_expect_semi(s))
             goto sod_fail;
@@ -48121,7 +48182,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             set_eval_ret_undefined(s);
             PD_CALL(PDS_PAREN, 0, 0, 0, PDS_SOD_07);
  sod_07:
-            if (pd_ret)
+            if (s->pd_ret)
                 goto sod_fail;
             f->st_lbl_a = emit_goto(s, OP_if_false, -1);
             if (s->cur_func->is_strict_mode)
@@ -48136,7 +48197,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                one won regardless of which branch ran. */
             PD_CALL(PDS_IFC, 0, f->st_mask, 0, PDS_SOD_08);
  sod_08:
-            if (pd_ret)
+            if (s->pd_ret)
                 goto sod_fail;
 
             if (s->token.val == TOK_ELSE) {
@@ -48147,7 +48208,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                 emit_label(s, f->st_lbl_a);
                 PD_CALL(PDS_IFC, 0, f->st_mask, 0, PDS_SOD_09);
  sod_09:
-                if (pd_ret)
+                if (s->pd_ret)
                     goto sod_fail;
 
                 f->st_lbl_a = f->st_lbl_b;
@@ -48173,13 +48234,13 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             emit_label(s, f->st_lbl_a);
             PD_CALL(PDS_PAREN, 0, 0, 0, PDS_SOD_10);
  sod_10:
-            if (pd_ret)
+            if (s->pd_ret)
                 goto sod_fail;
             emit_goto(s, OP_if_false, f->st_lbl_b);
 
             PD_CALL(PDS_SOD, 0, 0, 0, PDS_SOD_11);
  sod_11:
-            if (pd_ret)
+            if (s->pd_ret)
                 goto sod_fail;
             emit_goto(s, OP_goto, f->st_lbl_a);
 
@@ -48207,7 +48268,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
 
             PD_CALL(PDS_SOD, 0, 0, 0, PDS_SOD_12);
  sod_12:
-            if (pd_ret)
+            if (s->pd_ret)
                 goto sod_fail;
 
             emit_label(s, f->st_lbl_a);
@@ -48215,7 +48276,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                 goto sod_fail;
             PD_CALL(PDS_PAREN, 0, 0, 0, PDS_SOD_13);
  sod_13:
-            if (pd_ret)
+            if (s->pd_ret)
                 goto sod_fail;
             /* Insert semicolon if missing */
             if (s->token.val == ';') {
@@ -48260,7 +48321,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                 PD_CALL_AT(PDS_FIO, f->st_is_async, f->atom, 0,
                            f->st_line, f->st_col, PDS_SOD_30);
  sod_30:
-                if (pd_ret)
+                if (s->pd_ret)
                     goto sod_fail;
                 break;
             }
@@ -48308,7 +48369,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                             goto sod_fail;
                         PD_CALL(PDS_VAR, (false), PF_IN_ACCEPTED | PF_AWAIT_USING, TOK_USING, PDS_SOD_14);
  sod_14:
-                        if (pd_ret)
+                        if (s->pd_ret)
                             goto sod_fail;
                         goto for_init_done;
                     }
@@ -48326,12 +48387,12 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                         goto sod_fail;
                     PD_CALL(PDS_VAR, (false), pf, f->st_tok, PDS_SOD_15);
  sod_15:
-                    if (pd_ret)
+                    if (s->pd_ret)
                         goto sod_fail;
                 } else {
                     PD_CALL(PDS_EXPR2, 0, 0, 0, PDS_SOD_16);
  sod_16:
-                    if (pd_ret)
+                    if (s->pd_ret)
                         goto sod_fail;
                     emit_op(s, OP_drop);
                 }
@@ -48364,7 +48425,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                 emit_label(s, f->st_lbl_d);
                 PD_CALL(PDS_EXPR2, 0, PF_IN_ACCEPTED, 0, PDS_SOD_17);
  sod_17:
-                if (pd_ret)
+                if (s->pd_ret)
                     goto sod_fail;
                 emit_goto(s, OP_if_false, f->st_lbl_b);
             }
@@ -48383,7 +48444,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                 emit_label(s, f->st_lbl_a);
                 PD_CALL(PDS_EXPR2, 0, PF_IN_ACCEPTED, 0, PDS_SOD_18);
  sod_18:
-                if (pd_ret)
+                if (s->pd_ret)
                     goto sod_fail;
                 emit_op(s, OP_drop);
                 if (f->st_lbl_d != f->st_lbl_c)
@@ -48396,7 +48457,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             emit_label(s, f->st_lbl_c);
             PD_CALL(PDS_SOD, 0, 0, 0, PDS_SOD_19);
  sod_19:
-            if (pd_ret)
+            if (s->pd_ret)
                 goto sod_fail;
 
             /* close the closures before the next iteration */
@@ -48483,7 +48544,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             set_eval_ret_undefined(s);
             PD_CALL(PDS_PAREN, 0, 0, 0, PDS_SOD_20);
  sod_20:
-            if (pd_ret)
+            if (s->pd_ret)
                 goto sod_fail;
 
             push_scope(s);
@@ -48512,7 +48573,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                         emit_op(s, OP_dup);
                         PD_CALL(PDS_EXPR2, 0, PF_IN_ACCEPTED, 0, PDS_SOD_21);
  sod_21:
-                        if (pd_ret)
+                        if (s->pd_ret)
                             goto sod_fail;
                         if (js_parse_expect(s, ':'))
                             goto sod_fail;
@@ -48583,7 +48644,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                     }
                     PD_CALL(PDS_SOD, 0, DECL_MASK_ALL, 0, PDS_SOD_22);
  sod_22:
-                    if (pd_ret)
+                    if (s->pd_ret)
                         goto sod_fail;
                 }
             }
@@ -48623,7 +48684,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
 
             PD_CALL(PDS_BLOCK, 0, 0, 0, PDS_SOD_23);
  sod_23:
-            if (pd_ret)
+            if (s->pd_ret)
                 goto sod_fail;
 
             pop_break_entry(s->cur_func);
@@ -48661,7 +48722,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                             /* XXX: TOK_LET is not completely correct */
                             PD_CALL(PDS_DESTR, 0, DE_PACK(false, true, true, false, -1), TOK_LET, PDS_SOD_CATCHPAT);
  sod_catchpat_done:
-                            if (pd_ret < 0)
+                            if (s->pd_ret < 0)
                                 goto sod_fail;
                         } else {
                             js_parse_error(s, "identifier expected");
@@ -48696,7 +48757,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
 
                 PD_CALL(PDS_BLOCK, 0, 0, 0, PDS_SOD_24);
  sod_24:
-                if (pd_ret)
+                if (s->pd_ret)
                     goto sod_fail;
 
                 pop_break_entry(s->cur_func);
@@ -48733,7 +48794,6 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             }
             emit_label(s, f->st_lbl_c);
             if (s->token.val == TOK_FINALLY) {
-                int saved_eval_ret_idx = 0; /* avoid warning */
 
                 if (next_token(s))
                     goto sod_fail;
@@ -48744,25 +48804,25 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                 if (s->cur_func->eval_ret_idx >= 0) {
                     /* 'finally' updates eval_ret only if not a normal
                        termination */
-                    saved_eval_ret_idx =
+                    f->st_saved_eval_ret =
                         add_var(s->ctx, s->cur_func, JS_ATOM__ret_);
-                    if (saved_eval_ret_idx < 0)
+                    if (f->st_saved_eval_ret < 0)
                         goto sod_fail;
                     emit_op(s, OP_get_loc);
                     emit_u16(s, s->cur_func->eval_ret_idx);
                     emit_op(s, OP_put_loc);
-                    emit_u16(s, saved_eval_ret_idx);
+                    emit_u16(s, f->st_saved_eval_ret);
                     set_eval_ret_undefined(s);
                 }
 
                 PD_CALL(PDS_BLOCK, 0, 0, 0, PDS_SOD_25);
  sod_25:
-                if (pd_ret)
+                if (s->pd_ret)
                     goto sod_fail;
 
                 if (s->cur_func->eval_ret_idx >= 0) {
                     emit_op(s, OP_get_loc);
-                    emit_u16(s, saved_eval_ret_idx);
+                    emit_u16(s, f->st_saved_eval_ret);
                     emit_op(s, OP_put_loc);
                     emit_u16(s, s->cur_func->eval_ret_idx);
                 }
@@ -48788,7 +48848,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
 
             PD_CALL(PDS_PAREN, 0, 0, 0, PDS_SOD_26);
  sod_26:
-            if (pd_ret)
+            if (s->pd_ret)
                 goto sod_fail;
 
             push_scope(s);
@@ -48803,7 +48863,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             set_eval_ret_undefined(s);
             PD_CALL(PDS_SOD, 0, 0, 0, PDS_SOD_27);
  sod_27:
-            if (pd_ret)
+            if (s->pd_ret)
                 goto sod_fail;
 
             /* Popping scope drops lexical context for the with object variable */
@@ -48854,7 +48914,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                     goto sod_fail;
                 PD_CALL(PDS_VAR, (false), PF_IN_ACCEPTED, TOK_USING, PDS_SOD_28);
  sod_28:
-                if (pd_ret)
+                if (s->pd_ret)
                     goto sod_fail;
                 if (js_parse_expect_semi(s))
                     goto sod_fail;
@@ -48873,7 +48933,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                       JS_FUNC_NORMAL, s->token.ptr, NULL, s->token.line_num,
                       s->token.col_num, JS_PARSE_EXPORT_NONE, PDS_SOD_FUNCVAR);
  sod_funcvar_done:
-            if (pd_ret)
+            if (s->pd_ret)
                 goto sod_fail;
             break;
         }
@@ -48886,7 +48946,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         }
         PD_CALL(PDS_CLASS, false, 0, JS_PARSE_EXPORT_NONE, PDS_SOD_CLASS);
  sod_class_done:
-        if (pd_ret)
+        if (s->pd_ret)
             goto sod_fail;
         break;
 
@@ -48909,7 +48969,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         emit_source_loc(s);
         PD_CALL(PDS_EXPR2, 0, PF_IN_ACCEPTED, 0, PDS_SOD_29);
  sod_29:
-        if (pd_ret)
+        if (s->pd_ret)
             goto sod_fail;
         if (s->cur_func->eval_ret_idx >= 0) {
             /* store the expression value so that it can be returned
@@ -48947,7 +49007,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
  blk_loop:
     PD_CALL(PDS_SOD, 0, DECL_MASK_ALL, 0, PDS_BLK_STMT);
  blk_stmt_done:
-    if (pd_ret)
+    if (s->pd_ret)
         PD_RET(-1);
     if (!f->st_flag && s->cur_func->scopes[f->st_scope_a].has_using) {
         f->st_flag = true;
@@ -48994,7 +49054,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
  ifc_done:
     if (f->st_flag)
         pop_scope(s);
-    PD_RET(pd_ret);
+    PD_RET(s->pd_ret);
 
 /* ---- for-in / for-of. `flags` carries the loop's label atom (BORROWED — the statement frame below owns it),
    `level` the is_async flag, and st_line/st_col the `for` keyword's position, seeded by PD_CALL_AT. It holds
@@ -49064,7 +49124,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             if (s->token.val == '[' || s->token.val == '{') {
                 PD_CALL(PDS_DESTR, 0, DE_PACK(false, true, false, false, -1), f->st_tok, PDS_FIO_PAT1);
  fio_pat1_done:
-                if (pd_ret < 0)
+                if (s->pd_ret < 0)
                     goto fio_fail;
                 f->st_b2 = true;
             } else {
@@ -49135,13 +49195,13 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         &&  ((f->st_bits = js_parse_skip_parens_token(s, &skip_bits, false)) == TOK_IN || f->st_bits == TOK_OF)) {
             PD_CALL(PDS_DESTR, 0, DE_PACK(false, true, true, false, skip_bits & SKIP_HAS_ELLIPSIS), 0, PDS_FIO_PAT2);
  fio_pat2_done:
-            if (pd_ret < 0)
+            if (s->pd_ret < 0)
                 goto fio_fail;
         } else {
             int lvalue_label;
             PD_CALL(PDS_POSTFIX, 0, PF_POSTFIX_CALL, 0, PDS_FIO_01);
  fio_01:
-            if (pd_ret)
+            if (s->pd_ret)
                 goto fio_fail;
             if (get_lvalue(s, &f->opcode, &f->scope, &f->atom, &lvalue_label,
                            NULL, false, TOK_FOR))
@@ -49165,7 +49225,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             goto fio_fail;   /* fio_fail releases f->atom */
         PD_CALL(PDS_ASGN, 0, 0, 0, PDS_FIO_05);
  fio_05:
-        if (pd_ret)
+        if (s->pd_ret)
             goto fio_fail;
         if (f->atom != JS_ATOM_NULL) {
             /* B.3.5's `for ( var BindingIdentifier Initializer in Expression )` names an anonymous initializer
@@ -49207,12 +49267,12 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     if (f->st_b1) {
         PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_FIO_02);
  fio_02:
-        if (pd_ret)
+        if (s->pd_ret)
             goto fio_fail;
     } else {
         PD_CALL(PDS_EXPR2, 0, PF_IN_ACCEPTED, 0, PDS_FIO_03);
  fio_03:
-        if (pd_ret)
+        if (s->pd_ret)
             goto fio_fail;
     }
     /* close the f->scope after having evaluated the expression so that
@@ -49279,7 +49339,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
 
         PD_CALL(PDS_SOD, 0, 0, 0, PDS_FIO_04);
  fio_04:
-        if (pd_ret)
+        if (s->pd_ret)
             goto fio_fail;
 
         if (f->need_length) {
@@ -49451,7 +49511,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                 } else {
                     PD_CALL(PDS_POSTFIX, 0, PF_POSTFIX_CALL, 0, PDS_DE_01);
  de_01:
-                    if (pd_ret)
+                    if (s->pd_ret)
                         goto de_fail;
 
                     if (get_lvalue(s, &f->opcode, &f->scope, &f->atom2,
@@ -49469,9 +49529,9 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             }
             PD_CALL(PDS_PROPNAME, 0, PN_ALLOW_VAR, 0, PDS_DE_KEY);
  de_key_done:
-            f->atom = out_name;
-            out_name = JS_ATOM_NULL;
-            prop_type = pd_ret;
+            f->atom = s->pd_name;
+            s->pd_name = JS_ATOM_NULL;
+            prop_type = s->pd_ret;
             if (prop_type < 0)
                 goto de_fail;
             f->atom2 = JS_ATOM_NULL;
@@ -49521,7 +49581,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                     }
                     PD_CALL(PDS_DESTR, 0, DE_PACK((f->flags & DE_IS_ARG), true, true, (f->flags & DE_EXPORT), -1), f->op, PDS_DE_04);
  de_04:
-                    if (pd_ret < 0)
+                    if (s->pd_ret < 0)
                         goto de_fail;
                     if (s->token.val == '}')
                         break;
@@ -49575,7 +49635,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                 } else {
                     PD_CALL(PDS_POSTFIX, 0, PF_POSTFIX_CALL, 0, PDS_DE_05);
  de_05:
-                    if (pd_ret < 0)
+                    if (s->pd_ret < 0)
                         goto de_prop_error;
                 lvalue:
                     if (get_lvalue(s, &f->opcode, &f->scope, &f->atom2,
@@ -49681,21 +49741,20 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                 f->scope = s->cur_func->scope_level;
             }
             if (s->token.val == '=') {  /* handle optional default value */
-                int label_hasval;
                 emit_op(s, OP_dup);
                 emit_op(s, OP_undefined);
                 emit_op(s, OP_strict_eq);
-                label_hasval = emit_goto(s, OP_if_false, -1);
+                f->st_label_hasval = emit_goto(s, OP_if_false, -1);
                 if (next_token(s))
                     goto de_var_error;
                 emit_op(s, OP_drop);
                 PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_DE_06);
  de_06:
-                if (pd_ret < 0)
+                if (s->pd_ret < 0)
                     goto de_var_error;
                 if (f->opcode == OP_scope_get_var || f->opcode == OP_get_ref_value)
                     set_object_name(s, f->atom2);
-                emit_label(s, label_hasval);
+                emit_label(s, f->st_label_hasval);
             }
             /* store value into lvalue object */
             put_lvalue(s, f->opcode, f->scope, f->atom2, f->st_lbl_d,
@@ -49757,7 +49816,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                 }
                 PD_CALL(PDS_DESTR, 0, DE_PACK((f->flags & DE_IS_ARG), true, true, (f->flags & DE_EXPORT), f->st_bits & SKIP_HAS_ELLIPSIS), f->op, PDS_DE_07);
  de_07:
-                if (pd_ret < 0)
+                if (s->pd_ret < 0)
                     goto de_fail;
             } else {
                 f->atom2 = JS_ATOM_NULL;
@@ -49778,7 +49837,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                 } else {
                     PD_CALL(PDS_POSTFIX, 0, PF_POSTFIX_CALL, 0, PDS_DE_02);
  de_02:
-                    if (pd_ret)
+                    if (s->pd_ret)
                         goto de_fail;
                     if (get_lvalue(s, &f->opcode, &f->scope, &f->atom2,
                                    &f->st_lbl_d, &f->st_mask, false, '[')) {
@@ -49794,21 +49853,20 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                 }
                 if (s->token.val == '=' && !f->st_b1) {
                     /* handle optional default value */
-                    int label_hasval;
                     emit_op(s, OP_dup);
                     emit_op(s, OP_undefined);
                     emit_op(s, OP_strict_eq);
-                    label_hasval = emit_goto(s, OP_if_false, -1);
+                    f->st_label_hasval = emit_goto(s, OP_if_false, -1);
                     if (next_token(s))
                         goto de_var_error;
                     emit_op(s, OP_drop);
                     PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_DE_08);
  de_08:
-                    if (pd_ret < 0)
+                    if (s->pd_ret < 0)
                         goto de_var_error;
                     if (f->opcode == OP_scope_get_var || f->opcode == OP_get_ref_value)
                         set_object_name(s, f->atom2);
-                    emit_label(s, label_hasval);
+                    emit_label(s, f->st_label_hasval);
                 }
                 /* store value into lvalue object */
                 put_lvalue(s, f->opcode, f->scope, f->atom2,
@@ -49843,7 +49901,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             emit_op(s, OP_drop);
         PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_DE_03);
  de_03:
-        if (pd_ret)
+        if (s->pd_ret)
             goto de_fail;
         emit_goto(s, OP_goto, f->st_lbl_b);
         emit_label(s, f->st_lbl_c);
@@ -49927,7 +49985,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             goto cls_fail;
         PD_CALL(PDS_POSTFIX, 0, PF_POSTFIX_CALL, 0, PDS_CLS_01);
  cls_01:
-        if (pd_ret)
+        if (s->pd_ret)
             goto cls_fail;
     } else {
         emit_op(s, OP_undefined);
@@ -50003,7 +50061,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                           s->token.line_num, s->token.col_num,
                           JS_PARSE_EXPORT_NONE, PDS_CLS_SINIT);
  cls_sinit_done:
-                if (pd_ret < 0) {
+                if (s->pd_ret < 0) {
                     goto cls_fail;
                 }
                 // stack is now: fclosure
@@ -50045,9 +50103,9 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         if (f->prop_type < 0) {
             PD_CALL(PDS_PROPNAME, 0, PN_ALLOW_METHOD | PN_ALLOW_PRIVATE, 0, PDS_CLS_KEY);
  cls_key_done:
-            f->atom = out_name;
-            out_name = JS_ATOM_NULL;
-            f->prop_type = pd_ret;
+            f->atom = s->pd_name;
+            s->pd_name = JS_ATOM_NULL;
+            f->prop_type = s->pd_ret;
             if (f->prop_type < 0)
                 goto cls_fail;
         }
@@ -50094,7 +50152,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                       JS_FUNC_NORMAL, f->start_ptr, &f->st_fd, s->token.line_num,
                       s->token.col_num, JS_PARSE_EXPORT_NONE, PDS_CLS_ACCESSOR);
  cls_accessor_done:
-            if (pd_ret)
+            if (s->pd_ret)
                 goto cls_fail;
             if (f->st_b2) {
                 f->st_fd->need_home_object = true; /* needed for brand check */
@@ -50204,7 +50262,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                     goto cls_fail;
                 PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_CLS_02);
  cls_02:
-                if (pd_ret)
+                if (s->pd_ret)
                     goto cls_fail;
             } else {
                 emit_op(s, OP_undefined);
@@ -50255,7 +50313,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                       f->start_ptr, &f->st_fd, s->token.line_num, s->token.col_num,
                       JS_PARSE_EXPORT_NONE, PDS_CLS_METHOD);
  cls_method_done:
-            if (pd_ret)
+            if (s->pd_ret)
                 goto cls_fail;
             if (f->st_tok == JS_PARSE_FUNC_DERIVED_CLASS_CONSTRUCTOR ||
                 f->st_tok == JS_PARSE_FUNC_CLASS_CONSTRUCTOR) {
@@ -50458,12 +50516,12 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                   JS_FUNC_NORMAL, s->token.ptr, NULL, s->token.line_num,
                   s->token.col_num, JS_PARSE_EXPORT_NONE, PDS_SE_FUNC);
  se_func_done:
-        if (pd_ret)
+        if (s->pd_ret)
             PD_RET(-1);
     } else if (s->token.val == TOK_EXPORT && s->cur_func->module) {
         PD_CALL(PDS_EXPORT, 0, 0, 0, PDS_SE_EXPORT);
  se_export_done:
-        if (pd_ret)
+        if (s->pd_ret)
             PD_RET(-1);
     } else if (s->token.val == TOK_IMPORT && s->cur_func->module &&
                ((f->st_tok = peek_token(s, false)) != '(' && f->st_tok != '.'))  {
@@ -50474,7 +50532,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     } else {
         PD_CALL(PDS_SOD, 0, DECL_MASK_ALL, 0, PDS_SE_01);
  se_01:
-        if (pd_ret)
+        if (s->pd_ret)
             PD_RET(-1);
     }
     PD_RET(0);
@@ -50483,7 +50541,10 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
 /* ---- ExportDeclaration. Three of its four descents are TAIL positions — a class or a var declaration IS the
    whole export — so they PD_CALL and hand the callee's status straight back. ---- */
  exp_entry:
-    JSModuleDef *m = s->cur_func->module;
+    /* The module is the FRAME's: every branch of this production descends (a class, a function body, an
+       AssignmentExpression) and then adds export entries with it AFTER the descent returns. As a driver
+       local it came back NULL on a resume and add_export_entry dereferenced it. */
+    f->st_module = s->cur_func->module;
     JSExportEntry *me;
 
     if (next_token(s))
@@ -50493,7 +50554,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     if (f->st_tok == TOK_CLASS) {
         PD_CALL(PDS_CLASS, false, 0, JS_PARSE_EXPORT_NAMED, PDS_EXP_01);
  exp_01:
-        PD_RET(pd_ret);
+        PD_RET(s->pd_ret);
     } else if (f->st_tok == TOK_FUNCTION ||
                (token_is_pseudo_keyword(s, JS_ATOM_async) &&
                 peek_token(s, true) == TOK_FUNCTION)) {
@@ -50501,7 +50562,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                   JS_FUNC_NORMAL, s->token.ptr, NULL, s->token.line_num,
                   s->token.col_num, JS_PARSE_EXPORT_NAMED, PDS_EXP_FUNC);
  exp_func_done:
-        PD_RET(pd_ret);
+        PD_RET(s->pd_ret);
     }
 
     if (next_token(s))
@@ -50509,7 +50570,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
 
     switch(f->st_tok) {
     case '{':
-        f->st_pos_a = m->export_entries_count;
+        f->st_pos_a = f->st_module->export_entries_count;
         while (s->token.val != '}') {
             if (token_is_ident(s->token.val)) {
                 f->atom = JS_DupAtom(ctx, s->token.u.ident.atom);
@@ -50555,7 +50616,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             } else {
                 f->atom2 = JS_DupAtom(ctx, f->atom);
             }
-            me = add_export_entry(s, m, f->atom, f->atom2,
+            me = add_export_entry(s, f->st_module, f->atom, f->atom2,
                                   JS_EXPORT_TYPE_LOCAL);
             JS_FreeAtom(ctx, f->atom);
                     f->atom = JS_ATOM_NULL;
@@ -50571,11 +50632,11 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         if (js_parse_expect(s, '}'))
             goto exp_fail;
         if (token_is_pseudo_keyword(s, JS_ATOM_from)) {
-            f->st_idx = js_parse_from_clause(s, m);
+            f->st_idx = js_parse_from_clause(s, f->st_module);
             if (f->st_idx < 0)
                 goto exp_fail;
-            for(i = f->st_pos_a; i < m->export_entries_count; i++) {
-                me = &m->export_entries[i];
+            for(i = f->st_pos_a; i < f->st_module->export_entries_count; i++) {
+                me = &f->st_module->export_entries[i];
                 me->export_type = JS_EXPORT_TYPE_INDIRECT;
                 me->u.req_module_idx = f->st_idx;
             }
@@ -50601,10 +50662,10 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             }
             if (next_token(s))
                 goto fail1;
-            f->st_idx = js_parse_from_clause(s, m);
+            f->st_idx = js_parse_from_clause(s, f->st_module);
             if (f->st_idx < 0)
                 goto fail1;
-            me = add_export_entry(s, m, JS_ATOM__star_, f->atom2,
+            me = add_export_entry(s, f->st_module, JS_ATOM__star_, f->atom2,
                                   JS_EXPORT_TYPE_INDIRECT);
             JS_FreeAtom(ctx, f->atom2);
                     f->atom2 = JS_ATOM_NULL;
@@ -50613,10 +50674,10 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             me->is_namespace = true;   /* f->atom is the `*` the user wrote, and nothing reads it */
             me->u.req_module_idx = f->st_idx;
         } else {
-            f->st_idx = js_parse_from_clause(s, m);
+            f->st_idx = js_parse_from_clause(s, f->st_module);
             if (f->st_idx < 0)
                 goto exp_fail;
-            if (add_star_export_entry(ctx, m, f->st_idx) < 0)
+            if (add_star_export_entry(ctx, f->st_module, f->st_idx) < 0)
                 goto exp_fail;
         }
         break;
@@ -50624,7 +50685,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         if (s->token.val == TOK_CLASS) {
             PD_CALL(PDS_CLASS, false, 0, JS_PARSE_EXPORT_DEFAULT, PDS_EXP_02);
  exp_02:
-            PD_RET(pd_ret);
+            PD_RET(s->pd_ret);
         } else if (s->token.val == TOK_FUNCTION ||
                    (token_is_pseudo_keyword(s, JS_ATOM_async) &&
                     peek_token(s, true) == TOK_FUNCTION)) {
@@ -50633,11 +50694,11 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                       s->token.col_num, JS_PARSE_EXPORT_DEFAULT,
                       PDS_EXP_DEFFUNC);
  exp_deffunc_done:
-            PD_RET(pd_ret);
+            PD_RET(s->pd_ret);
         } else {
             PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_EXP_04);
  exp_04:
-            if (pd_ret)
+            if (s->pd_ret)
                 goto exp_fail;
         }
         /* set the name of anonymous functions */
@@ -50654,7 +50715,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         emit_atom(s, JS_ATOM__default_);
         emit_u16(s, 0);
 
-        if (!add_export_entry(s, m, JS_ATOM__default_, JS_ATOM_default,
+        if (!add_export_entry(s, f->st_module, JS_ATOM__default_, JS_ATOM_default,
                               JS_EXPORT_TYPE_LOCAL))
             goto exp_fail;
         break;
@@ -50664,7 +50725,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     case TOK_USING:
         PD_CALL(PDS_VAR, (true), PF_IN_ACCEPTED, f->st_tok, PDS_EXP_03);
  exp_03:
-        PD_RET(pd_ret);
+        PD_RET(s->pd_ret);
     default:
         PD_RET_ERR(s, "invalid export syntax");
     }
@@ -50972,7 +51033,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                 }
                 PD_CALL(PDS_DESTR, 0, DE_PACK(true, true, true, false, -1), f->st_fd->has_parameter_expressions ? TOK_LET : TOK_VAR, PDS_FD_04);
  fd2_04:
-                has_initializer = pd_ret;
+                has_initializer = s->pd_ret;
                 if (has_initializer < 0)
                     goto fd2_fail;
                 if (has_initializer)
@@ -51031,7 +51092,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                     emit_op(s, OP_drop);
                     PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_FD_01);
  fd2_01:
-                    if (pd_ret)
+                    if (s->pd_ret)
                         goto fd2_fail;
                     set_object_name(s, f->name0);
                     emit_op(s, OP_dup);
@@ -51139,7 +51200,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
 
             PD_CALL(PDS_ASGN, 0, f->flags & PF_IN_ACCEPTED, 0, PDS_FD_02);
  fd2_02:
-            if (pd_ret)
+            if (s->pd_ret)
                 goto fd2_fail;
 
             if (f->op != JS_FUNC_NORMAL)
@@ -51181,7 +51242,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         while (s->token.val != '}') {
             PD_CALL(PDS_SRCELEM, 0, 0, 0, PDS_FD_03);
  fd2_03:
-            if (pd_ret)
+            if (s->pd_ret)
                 goto fd2_fail;
             /* Check if a 'using' was encountered in the body scope */
             if (!f->st_bits && f->st_fd->scopes[f->st_fd->body_scope].has_using) {
@@ -51366,20 +51427,19 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     /* The frame array could not grow: OOM. This is the ONE exit that does not run a production's own release,
        so it settles the atom of every frame THIS activation pushed. An outer activation's frames are its own
        and are settled when its unwind runs. */
-    while (s->pd_sp > base) {
+    while (s->pd_sp > s->pd_base) {
         s->pd_sp--;
         JS_FreeAtom(ctx, PD_FRAME(s->pd_sp)->atom);
         JS_FreeAtom(ctx, PD_FRAME(s->pd_sp)->atom2);
         JS_FreeAtom(ctx, PD_FRAME(s->pd_sp)->atom3);
         JS_FreeAtom(ctx, PD_FRAME(s->pd_sp)->atom4);
     }
-    pd_ret = -1;
+    s->pd_ret = -1;
  leave:
-    DCHECK(s->pd_sp == base, "the descent returned at a depth that is not its own base");
-    s->pd_name = out_name;
+    DCHECK(s->pd_sp == s->pd_base, "the descent returned at a depth that is not its own pd_base");
     if (s->pd_sp == 0)
         pd_release(ctx, s);   /* the whole descent drained — the parse owns nothing until the next one */
-    return pd_ret;
+    return s->pd_ret;
 #undef PD_PUSH
 #undef PD_CALL
 #undef PD_RET
@@ -51390,6 +51450,21 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
 #undef PD_FRAME
 #undef PD_CHUNK
 #undef PD_CHUNK_BITS
+}
+
+/* THE SEAM. js_parse_drive stops mid-parse and this continues it — the arrangement async_func_resume_run has
+   for a forced back-edge preempt, which self-resumes so a preempt is never mistaken for a yield. Nothing above
+   the parser can carry a suspended parse yet, so this resumes immediately; when the eval path can, the
+   scheduler takes this loop's place and the seam does not change. */
+static __exception int js_parse_descent(JSParseState *s, int entry, int level,
+                                        int parse_flags, int op)
+{
+    int r = js_parse_drive(s, entry, level, parse_flags, op, false);
+    while (s->pd_suspended) {
+        s->pd_suspended = false;
+        r = js_parse_drive(s, 0, 0, 0, 0, true);
+    }
+    return r;
 }
 
 /* allowed parse_flags: PF_IN_ACCEPTED */
