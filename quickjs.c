@@ -12735,16 +12735,22 @@ void *JS_GetAnyOpaque(JSValueConst obj, JSClassID *class_id)
    every PRIMARGS builtin use it.
    WHICH CALLERS STILL REACH IT WAS MEASURED, not read: a DCHECK on the path below, run over the whole corpus,
    names them one at a time. Round one was BigInt.prototype.toString coercing its radix from C — fixed by
-   declaring it PRIMARGS, the mechanism that already existed. Round two is:
+   declaring it PRIMARGS, the mechanism that already existed. Round two is ONE test:
 
-     obj stored into a BigInt typed array element
-     JS_SetPropertyValue -> JS_ToBigInt64Free -> JS_ToBigIntFree -> JS_ToPrimitiveFree
+     built-ins/TypedArrayConstructors/internals/Set/BigInt/key-is-valid-index-reflect-set.js
+     JS_CallInternal -> JS_SetPropertyInternal2 -> JS_DefineProperty -> JS_SetPropertyValue
+       -> JS_ToBigInt64Free -> JS_ToBigIntFree -> JS_ToPrimitiveFree
 
-   That one is not a builtin's argument, so PRIMARGS does not reach it: the coercion happens inside the
-   ELEMENT STORE, so the interpreter has to route the VALUE at OP_put_array_el the way it already routes an
-   operand (TPR_ADD_AFTER_COERCE) and a computed key (TPR_GET_ARRAY_EL) — coerce on the tramp, resume, redo the
-   store. Numeric typed arrays reach the same place through JS_ToNumberFree and are only unobserved because the
-   probe aborts at the first firing, so expect more than one once that store is routed.
+   TWO WRONG DESCRIPTIONS OF THIS PRECEDED THE RIGHT ONE, and both are in the git history, so: it is NOT a
+   missing route at OP_put_array_el, and it is NOT the prototype-chain [[Set]] test. Both of those were read
+   off a -vv listing whose last line is the last SUCCESS, not the failure. Confirm a site with -f on the single
+   file before believing it.
+   The write REACHES the interpreter's own guarded site (the ta_atom_write_needs_toprim arm two thousand lines
+   below, which already routes typed-array element coercion including a write whose site is on the prototype
+   chain). That predicate DECLINES this shape and the write falls through to JS_SetPropertyInternal2, which
+   coerces from C. So the fix is in the predicate's receiver test, not a new coercion path: work out which of
+   Reflect.set's receiver shapes it is rejecting and why, keeping 10.4.5.5 step ii — where the receiver is NOT
+   the typed array the value is genuinely not coerced at all — intact.
    THE DCHECK BELOW STAYS. I removed it once to keep the suite green and called that judgement; it was not.
    A DCHECK is dev-only and ships with no production effect, an unrouted site is a capability that does not
    exist yet, and a directory going red over one is the work queue rather than a reason to soften the check.
