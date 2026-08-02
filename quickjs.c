@@ -40025,7 +40025,22 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
         /* argv is normalised to arg_buf the moment a frame resumes (the rebuild path does exactly this), and the
            padded arg_buf holds the same values for every index < argc, so this IS the caller's argv. */
         ct->caller_argv      = (JSValueConst *)caller_clone->arg_buf;
-        ct->caller_var_refs  = caller_clone->var_refs;
+        /* THE CLOSURE'S CELLS, NOT THE FRAME'S ARRAY. The push assigns `ntf->caller_var_refs = var_refs`, and
+           that `var_refs` is p->u.func.var_refs — the closure's captured cells, which OP_get_var_ref indexes by
+           CLOSURE-VAR index. sf->var_refs is a different array: the frame's own, sized by the bytecode's
+           var_ref_count and used by close_var_refs. Handing the frame's array back on resume made every
+           OP_get_var_ref read the wrong array at an index that array does not have — a 4-byte read past a
+           200-byte frame whenever a closure variable was reached after a deep fork, which is exactly the
+           overflow WPT hit on Node-appendChild and Node-removeChild. The closure object is shared with the
+           original (js_dup'd), so its cells are the right ones by construction. */
+        {
+            JSObject *cfp = JS_VALUE_GET_OBJ(caller_clone->cur_func);
+            int has_bc = JS_VALUE_GET_TAG(caller_clone->cur_func) == JS_TAG_OBJECT
+                         && js_class_has_bytecode(cfp->class_id);
+            DCHECK(has_bc || caller_clone->is_call_root,
+                   "a cloned caller with no bytecode and no call-root marker — nothing names its closure cells");
+            ct->caller_var_refs = has_bc ? cfp->u.func.var_refs : NULL;
+        }
         #undef XL_OK
     }
     #undef XL
