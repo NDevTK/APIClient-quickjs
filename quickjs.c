@@ -44359,7 +44359,6 @@ static __exception int js_parse_function_decl2(JSParseState *s,
                                                int parse_flags);
 static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags);
 static __exception int js_parse_assign_expr(JSParseState *s);
-static __exception int js_parse_unary(JSParseState *s, int parse_flags);
 static void push_break_entry(JSFunctionDef *fd, BlockEnv *be,
                              JSAtom label_name,
                              int label_break, int label_cont,
@@ -47473,488 +47472,591 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
     return 0;
 }
 
-static __exception int js_parse_delete(JSParseState *s)
-{
-    JSFunctionDef *fd = s->cur_func;
-    JSAtom name;
-    int opcode;
+static __exception int js_parse_var(JSParseState *s, int parse_flags, int tok,
+                                    bool export_flag);
 
+/* ============================================================================
+ * THE OPERATOR DESCENT — the precedence ladder run on a FLAT C STACK.
+ *
+ * BE PRECISE ABOUT WHAT THIS COSTS AND WHAT IT DOES NOT. These four productions
+ * are NOT where a source picks the stack depth. `a|b|c|…` is LEFT-nested, and the
+ * recursive version already walked it with a `for(;;)` loop over the operator —
+ * one frame, not one per operand. Measured: 200 000 `|`, `&&`, `??` and `+`
+ * operands parse at an 8 MiB stack both before and after this change. The whole
+ * ladder is nine frames deep (one per precedence level) plus two for `||`/`&&`,
+ * and that is a CONSTANT, not an input.
+ *
+ * What the source DOES choose is the bracket and statement nesting that runs
+ * through js_parse_expr_paren / js_parse_postfix_expr / js_parse_statement_or_decl,
+ * and that recursion is still here: `"(".repeat(50000)` still trips the
+ * js_check_stack_overflow in next_token and reports RangeError, exactly as it did
+ * before. That guard is a BOUND in an error's clothes and it is deleted when the
+ * recursion under it is, not before.
+ *
+ * So this converts the ladder because it is a MEMBER of the 29-function parser
+ * cycle, which is one work queue and does not shrink until every member leaves —
+ * not because these four were the deep ones. Each production is a set of STATES on
+ * an explicit frame stack, the shape json_parse_step already uses for JSON in this
+ * file: a descent is a PUSH recording where to resume, a finished production POPs
+ * and delivers its return code to the frame below, where the resume state inspects
+ * `ret` exactly as the recursive call site inspected the callee's return value.
+ *
+ * The four recursive bodies this replaces are DELETED, not kept beside it: there
+ * is one implementation of each production and nothing to fall back to.
+ * ==========================================================================*/
+typedef struct JSParseFrame {
+    uint8_t state;      /* PDS_*: the production, or the point to resume at */
+    int8_t  level;      /* expr_binary's precedence level */
+    int     flags;      /* the production's parse_flags */
+    int     op;         /* logical_and_or's operator (TOK_LAND / TOK_LOR) */
+    int     label1;     /* labels live ACROSS a descent, so they are frame state */
+    int     label2;
+    int     opcode;     /* expr_binary: the operator whose operands are being parsed */
+    JSAtom  atom;       /* owned, or JS_ATOM_NULL. The unwind path releases it. */
+} JSParseFrame;
+
+enum {
+    PDS_BIN, PDS_BIN_PRIV, PDS_BIN_HEAD, PDS_BIN_LOOP, PDS_BIN_RHS,
+    PDS_LAO, PDS_LAO_HEAD, PDS_LAO_LOOP, PDS_LAO_RHS,
+    PDS_COA, PDS_COA_HEAD, PDS_COA_LOOP, PDS_COA_RHS,
+    PDS_CND, PDS_CND_HEAD,
+    PDS_UNA, PDS_UNA_PREFIX, PDS_UNA_INCDEC, PDS_UNA_TYPEOF, PDS_UNA_AWAIT,
+    PDS_UNA_DELETE, PDS_UNA_POW,
+    PDS_DEL, PDS_DEL_OPERAND,
+};
+
+/* The stack starts INLINE and only reaches the heap when a source nests past it, so the common expression
+   costs no allocation at all. */
+static int pd_grow(JSContext *ctx, JSParseFrame **pfr, int *psize, JSParseFrame *inl)
+{
+    int nsize = *psize * 2;
+    JSParseFrame *nf;
+
+    if (*pfr == inl) {
+        nf = js_malloc(ctx, sizeof(*nf) * nsize);
+        if (!nf)
+            return -1;
+        memcpy(nf, inl, sizeof(*nf) * *psize);
+    } else {
+        nf = js_realloc(ctx, *pfr, sizeof(*nf) * nsize);
+        if (!nf)
+            return -1;
+    }
+    *pfr = nf;
+    *psize = nsize;
+    return 0;
+}
+
+static __exception int js_parse_descent(JSParseState *s, int entry, int level,
+                                        int parse_flags, int op)
+{
+    JSContext *ctx = s->ctx;
+    JSParseFrame inline_fr[16];
+    JSParseFrame *fr = inline_fr, *f = NULL;
+    int size = countof(inline_fr), sp = 0, ret = 0;
+    int tok, opcode = 0;
+
+/* The arguments are read into temporaries FIRST: they are almost always expressions over the CALLER's frame
+   (`f->level - 1`), and the push moves `f` to the callee's. */
+#define PD_PUSH(entry_, level_, flags_, op_) do {                               \
+        int e_ = (entry_), lv_ = (level_), fl_ = (flags_), o_ = (op_);          \
+        if (sp >= size && pd_grow(ctx, &fr, &size, inline_fr))                  \
+            goto unwind;                                                        \
+        f = &fr[sp++];                                                          \
+        f->state = e_; f->level = lv_; f->flags = fl_; f->op = o_;               \
+        f->label1 = -1; f->label2 = -1; f->opcode = 0; f->atom = JS_ATOM_NULL;   \
+        goto dispatch;                                                          \
+    } while (0)
+/* A descent: record where THIS frame continues, then push the callee's. */
+#define PD_CALL(entry_, level_, flags_, op_, resume_) do {                      \
+        f->state = (resume_);                                                   \
+        PD_PUSH(entry_, level_, flags_, op_);                                   \
+    } while (0)
+/* A production finished: its return code becomes the caller's `ret`. */
+#define PD_RET(v_) do {                                                         \
+        DCHECK(f->atom == JS_ATOM_NULL,                                         \
+               "a parse frame was popped still owning an atom — it leaks");     \
+        ret = (v_); sp--; goto dispatch;                                        \
+    } while (0)
+
+    PD_PUSH(entry, level, parse_flags, op);
+
+ dispatch:
+    if (sp == 0)
+        goto done;
+    f = &fr[sp - 1];
+    switch (f->state) {
+    case PDS_BIN:       goto bin_entry;
+    case PDS_BIN_PRIV:  goto bin_priv_done;
+    case PDS_BIN_HEAD:  goto bin_head_done;
+    case PDS_BIN_LOOP:  goto bin_loop;
+    case PDS_BIN_RHS:   goto bin_rhs_done;
+    case PDS_LAO:       goto lao_entry;
+    case PDS_LAO_HEAD:  goto lao_head_done;
+    case PDS_LAO_LOOP:  goto lao_loop;
+    case PDS_LAO_RHS:   goto lao_rhs_done;
+    case PDS_COA:       goto coa_entry;
+    case PDS_COA_HEAD:  goto coa_head_done;
+    case PDS_COA_LOOP:  goto coa_loop;
+    case PDS_COA_RHS:   goto coa_rhs_done;
+    case PDS_CND:       goto cnd_entry;
+    case PDS_CND_HEAD:  goto cnd_head_done;
+    case PDS_UNA:        goto una_entry;
+    case PDS_UNA_PREFIX: goto una_prefix_done;
+    case PDS_UNA_INCDEC: goto una_incdec_done;
+    case PDS_UNA_TYPEOF: goto una_typeof_done;
+    case PDS_UNA_AWAIT:  goto una_await_done;
+    case PDS_UNA_DELETE: goto una_delete_done;
+    case PDS_UNA_POW:    goto una_pow_done;
+    case PDS_DEL:         goto del_entry;
+    case PDS_DEL_OPERAND: goto del_operand_done;
+    }
+    DFAIL("parse descent resumed at a state that does not exist");
+    goto unwind;
+
+/* ---- BinaryExpression, one frame per precedence level. allowed parse_flags: PF_IN_ACCEPTED ---- */
+ bin_entry:
+    DCHECK(f->level >= 0 && f->level <= 8, "expr_binary precedence level out of range");
+    if (f->level == 0) {
+        /* UnaryExpression is the ladder's leaf, and the recursive parser TAIL-called it. On an explicit stack a
+           tail call is a frame REWRITE, not a push — this frame has nothing left to do after it. */
+        f->state = PDS_UNA;
+        f->flags = PF_POW_ALLOWED;
+        goto una_entry;
+    }
+    if (s->token.val == TOK_PRIVATE_NAME && (f->flags & PF_IN_ACCEPTED) &&
+        f->level == 4 && peek_token(s, false) == TOK_IN) {
+        f->atom = JS_DupAtom(ctx, s->token.u.ident.atom);
+        if (next_token(s) || s->token.val != TOK_IN || next_token(s)) {
+            JS_FreeAtom(ctx, f->atom);
+            f->atom = JS_ATOM_NULL;
+            PD_RET(-1);
+        }
+        PD_CALL(PDS_BIN, f->level - 1, f->flags, 0, PDS_BIN_PRIV);
+    }
+    PD_CALL(PDS_BIN, f->level - 1, f->flags, 0, PDS_BIN_HEAD);
+
+ bin_priv_done:
+    if (ret) {
+        JS_FreeAtom(ctx, f->atom);
+        f->atom = JS_ATOM_NULL;
+        PD_RET(-1);
+    }
+    emit_op(s, OP_scope_in_private_field);
+    emit_atom(s, f->atom);
+    emit_u16(s, s->cur_func->scope_level);
+    JS_FreeAtom(ctx, f->atom);
+    f->atom = JS_ATOM_NULL;
+    PD_RET(0);
+
+ bin_head_done:
+    if (ret)
+        PD_RET(-1);
+ bin_loop:
+    tok = s->token.val;
+    switch (f->level) {
+    case 1:
+        switch (tok) {
+        case '*': opcode = OP_mul; break;
+        case '/': opcode = OP_div; break;
+        case '%': opcode = OP_mod; break;
+        default:  PD_RET(0);
+        }
+        break;
+    case 2:
+        switch (tok) {
+        case '+': opcode = OP_add; break;
+        case '-': opcode = OP_sub; break;
+        default:  PD_RET(0);
+        }
+        break;
+    case 3:
+        switch (tok) {
+        case TOK_SHL: opcode = OP_shl; break;
+        case TOK_SAR: opcode = OP_sar; break;
+        case TOK_SHR: opcode = OP_shr; break;
+        default:      PD_RET(0);
+        }
+        break;
+    case 4:
+        switch (tok) {
+        case '<':            opcode = OP_lt; break;
+        case '>':            opcode = OP_gt; break;
+        case TOK_LTE:        opcode = OP_lte; break;
+        case TOK_GTE:        opcode = OP_gte; break;
+        case TOK_INSTANCEOF: opcode = OP_instanceof; break;
+        case TOK_IN:
+            if (!(f->flags & PF_IN_ACCEPTED))
+                PD_RET(0);
+            opcode = OP_in;
+            break;
+        default: PD_RET(0);
+        }
+        break;
+    case 5:
+        switch (tok) {
+        case TOK_EQ:         opcode = OP_eq; break;
+        case TOK_NEQ:        opcode = OP_neq; break;
+        case TOK_STRICT_EQ:  opcode = OP_strict_eq; break;
+        case TOK_STRICT_NEQ: opcode = OP_strict_neq; break;
+        default:             PD_RET(0);
+        }
+        break;
+    case 6:
+        if (tok != '&')
+            PD_RET(0);
+        opcode = OP_and;
+        break;
+    case 7:
+        if (tok != '^')
+            PD_RET(0);
+        opcode = OP_xor;
+        break;
+    case 8:
+        if (tok != '|')
+            PD_RET(0);
+        opcode = OP_or;
+        break;
+    default:
+        /* Unreachable: the entry DCHECK pins the range and every descent decrements by one. */
+        DFAIL("expr_binary reached a precedence level it has no operator table for");
+        PD_RET(-1);
+    }
+    f->opcode = opcode;
     if (next_token(s))
-        return -1;
-    if (js_parse_unary(s, PF_POW_FORBIDDEN))
-        return -1;
-    switch(opcode = get_prev_opcode(fd)) {
-    case OP_get_field:
-    case OP_get_field_opt_chain:
-        {
-            JSValue val;
-            int ret, opt_chain_label, next_label;
-            if (opcode == OP_get_field_opt_chain) {
-                opt_chain_label = get_u32(fd->byte_code.buf +
-                                          fd->last_opcode_pos + 1 + 4 + 1);
-            } else {
-                opt_chain_label = -1;
+        PD_RET(-1);
+    emit_source_loc(s);
+    PD_CALL(PDS_BIN, f->level - 1, f->flags, 0, PDS_BIN_RHS);
+
+ bin_rhs_done:
+    if (ret)
+        PD_RET(-1);
+    emit_op(s, f->opcode);
+    goto bin_loop;
+
+/* ---- LogicalANDExpression / LogicalORExpression. allowed parse_flags: PF_IN_ACCEPTED ---- */
+ lao_entry:
+    if (f->op == TOK_LAND)
+        PD_CALL(PDS_BIN, 8, f->flags, 0, PDS_LAO_HEAD);
+    PD_CALL(PDS_LAO, 0, f->flags, TOK_LAND, PDS_LAO_HEAD);
+
+ lao_head_done:
+    if (ret)
+        PD_RET(-1);
+    if (s->token.val != f->op)
+        PD_RET(0);
+    f->label1 = new_label(s);
+ lao_loop:
+    if (next_token(s))
+        PD_RET(-1);
+    emit_op(s, OP_dup);
+    emit_goto(s, f->op == TOK_LAND ? OP_if_false : OP_if_true, f->label1);
+    emit_op(s, OP_drop);
+    if (f->op == TOK_LAND)
+        PD_CALL(PDS_BIN, 8, f->flags, 0, PDS_LAO_RHS);
+    PD_CALL(PDS_LAO, 0, f->flags, TOK_LAND, PDS_LAO_RHS);
+
+ lao_rhs_done:
+    if (ret)
+        PD_RET(-1);
+    if (s->token.val != f->op) {
+        if (s->token.val == TOK_DOUBLE_QUESTION_MARK)
+            PD_RET(js_parse_error(s, "cannot mix ?? with && or ||"));
+        emit_label(s, f->label1);
+        PD_RET(0);
+    }
+    goto lao_loop;
+
+/* ---- CoalesceExpression ---- */
+ coa_entry:
+    PD_CALL(PDS_LAO, 0, f->flags, TOK_LOR, PDS_COA_HEAD);
+
+ coa_head_done:
+    if (ret)
+        PD_RET(-1);
+    if (s->token.val != TOK_DOUBLE_QUESTION_MARK)
+        PD_RET(0);
+    f->label1 = new_label(s);
+ coa_loop:
+    if (next_token(s))
+        PD_RET(-1);
+    emit_op(s, OP_dup);
+    emit_op(s, OP_is_undefined_or_null);
+    emit_goto(s, OP_if_false, f->label1);
+    emit_op(s, OP_drop);
+    PD_CALL(PDS_BIN, 8, f->flags, 0, PDS_COA_RHS);
+
+ coa_rhs_done:
+    if (ret)
+        PD_RET(-1);
+    if (s->token.val != TOK_DOUBLE_QUESTION_MARK) {
+        emit_label(s, f->label1);
+        PD_RET(0);
+    }
+    goto coa_loop;
+
+/* ---- ConditionalExpression. allowed parse_flags: PF_IN_ACCEPTED ---- */
+ cnd_entry:
+    PD_CALL(PDS_COA, 0, f->flags, 0, PDS_CND_HEAD);
+
+ cnd_head_done:
+    if (ret)
+        PD_RET(-1);
+    if (s->token.val != '?')
+        PD_RET(0);
+    if (next_token(s))
+        PD_RET(-1);
+    f->label1 = emit_goto(s, OP_if_false, -1);
+    if (js_parse_assign_expr(s))
+        PD_RET(-1);
+    if (js_parse_expect(s, ':'))
+        PD_RET(-1);
+    f->label2 = emit_goto(s, OP_goto, -1);
+    emit_label(s, f->label1);
+    if (js_parse_assign_expr2(s, f->flags & PF_IN_ACCEPTED))
+        PD_RET(-1);
+    emit_label(s, f->label2);
+    PD_RET(0);
+
+/* ---- UnaryExpression / UpdateExpression. THIS one the source really does control: `!` and `-` and `typeof`
+   and `await` and `delete` all take a UnaryExpression operand, so `"!".repeat(n)` is n frames deep in the
+   recursive parser, and `a**b**c` recurses once per right-associated `**`. allowed parse_flags:
+   PF_POW_ALLOWED, PF_POW_FORBIDDEN ---- */
+ una_entry:
+    switch (s->token.val) {
+    case '+': case '-': case '!': case '~': case TOK_VOID:
+        f->op = s->token.val;
+        if (next_token(s))
+            PD_RET(-1);
+        PD_CALL(PDS_UNA, 0, PF_POW_FORBIDDEN, 0, PDS_UNA_PREFIX);
+    case TOK_DEC: case TOK_INC:
+        f->op = s->token.val;
+        if (next_token(s))
+            PD_RET(-1);
+        PD_CALL(PDS_UNA, 0, 0, 0, PDS_UNA_INCDEC);
+    case TOK_TYPEOF:
+        if (next_token(s))
+            PD_RET(-1);
+        PD_CALL(PDS_UNA, 0, PF_POW_FORBIDDEN, 0, PDS_UNA_TYPEOF);
+    case TOK_DELETE:
+        PD_CALL(PDS_DEL, 0, 0, 0, PDS_UNA_DELETE);
+    case TOK_AWAIT:
+        if (!(s->cur_func->func_kind & JS_FUNC_ASYNC))
+            PD_RET(js_parse_error(s, "unexpected 'await' keyword"));
+        if (!s->cur_func->in_function_body)
+            PD_RET(js_parse_error(s, "await in default expression"));
+        if (next_token(s))
+            PD_RET(-1);
+        PD_CALL(PDS_UNA, 0, PF_POW_FORBIDDEN, 0, PDS_UNA_AWAIT);
+    default:
+        /* LeftHandSideExpression — still a recursive C call, and it is the bracket/statement cone that owns
+           the remaining depth. */
+        if (js_parse_postfix_expr(s, PF_POSTFIX_CALL))
+            PD_RET(-1);
+        if (!s->got_lf &&
+            (s->token.val == TOK_DEC || s->token.val == TOK_INC)) {
+            int opcode, post_op, scope, label;
+            JSAtom name;
+            post_op = s->token.val;
+            if (get_lvalue(s, &opcode, &scope, &name, &label, NULL, true, post_op))
+                PD_RET(-1);
+            emit_op(s, OP_post_dec + post_op - TOK_DEC);
+            put_lvalue(s, opcode, scope, name, label, PUT_LVALUE_KEEP_SECOND,
+                       false);
+            if (next_token(s))
+                PD_RET(-1);
+        }
+        goto una_tail;
+    }
+
+ una_prefix_done:
+    if (ret)
+        PD_RET(-1);
+    switch (f->op) {
+    case '-':      emit_op(s, OP_neg); break;
+    case '+':      emit_op(s, OP_plus); break;
+    case '!':      emit_op(s, OP_lnot); break;
+    case '~':      emit_op(s, OP_not); break;
+    case TOK_VOID: emit_op(s, OP_drop); emit_op(s, OP_undefined); break;
+    default:
+        /* Unreachable: only the five tokens above reach PDS_UNA_PREFIX. */
+        DFAIL("unary prefix resumed with an operator that has no opcode");
+        PD_RET(-1);
+    }
+    f->flags = 0;
+    goto una_tail;
+
+ una_incdec_done:
+    if (ret)
+        PD_RET(-1);
+    {
+        int opcode, scope, label;
+        JSAtom name;
+        if (get_lvalue(s, &opcode, &scope, &name, &label, NULL, true, f->op))
+            PD_RET(-1);
+        emit_op(s, OP_dec + f->op - TOK_DEC);
+        put_lvalue(s, opcode, scope, name, label, PUT_LVALUE_KEEP_TOP, false);
+    }
+    /* NOT `parse_flags = 0`: the recursive body left the caller's flags alone here, so `++x ** 2` keeps
+       whatever the caller allowed. */
+    goto una_tail;
+
+ una_typeof_done:
+    if (ret)
+        PD_RET(-1);
+    {
+        /* reference access should not return an exception, so we patch the get_var */
+        JSFunctionDef *fd = s->cur_func;
+        if (get_prev_opcode(fd) == OP_scope_get_var)
+            fd->byte_code.buf[fd->last_opcode_pos] = OP_scope_get_var_undef;
+    }
+    emit_op(s, OP_typeof);
+    f->flags = 0;
+    goto una_tail;
+
+ una_await_done:
+    if (ret)
+        PD_RET(-1);
+    emit_op(s, OP_await);
+    s->cur_func->has_await = true;
+    f->flags = 0;
+    goto una_tail;
+
+ una_delete_done:
+    if (ret)
+        PD_RET(-1);
+    f->flags = 0;
+ una_tail:
+    if (f->flags & (PF_POW_ALLOWED | PF_POW_FORBIDDEN)) {
+        if (s->token.val == TOK_POW) {
+            /* Strict ES7 exponentiation syntax rules: to solve conflicting semantics between different
+               implementations regarding the precedence of prefix operators and the postfix exponential, ES7
+               specifies that -2**2 is a syntax error. */
+            if (f->flags & PF_POW_FORBIDDEN)
+                PD_RET(js_parse_error(s, "unparenthesized unary expression can't appear on the left-hand side of '**'"));
+            if (next_token(s))
+                PD_RET(-1);
+            PD_CALL(PDS_UNA, 0, PF_POW_ALLOWED, 0, PDS_UNA_POW);
+        }
+    }
+    PD_RET(0);
+
+ una_pow_done:
+    if (ret)
+        PD_RET(-1);
+    emit_op(s, OP_pow);
+    PD_RET(0);
+
+/* ---- `delete UnaryExpression` ---- */
+ del_entry:
+    if (next_token(s))
+        PD_RET(-1);
+    PD_CALL(PDS_UNA, 0, PF_POW_FORBIDDEN, 0, PDS_DEL_OPERAND);
+
+ del_operand_done:
+    if (ret)
+        PD_RET(-1);
+    {
+        JSFunctionDef *fd = s->cur_func;
+        JSAtom name;
+        int del_opcode;
+
+        switch (del_opcode = get_prev_opcode(fd)) {
+        case OP_get_field:
+        case OP_get_field_opt_chain:
+            {
+                JSValue val;
+                int r, opt_chain_label, next_label;
+                if (del_opcode == OP_get_field_opt_chain) {
+                    opt_chain_label = get_u32(fd->byte_code.buf +
+                                              fd->last_opcode_pos + 1 + 4 + 1);
+                } else {
+                    opt_chain_label = -1;
+                }
+                name = get_u32(fd->byte_code.buf + fd->last_opcode_pos + 1);
+                fd->byte_code.size = fd->last_opcode_pos;
+                val = JS_AtomToValue(ctx, name);
+                r = emit_push_const(s, val, 1);
+                JS_FreeValue(ctx, val);
+                JS_FreeAtom(ctx, name);
+                if (r)
+                    PD_RET(r);
+                emit_op(s, OP_delete);
+                if (opt_chain_label >= 0) {
+                    next_label = emit_goto(s, OP_goto, -1);
+                    emit_label(s, opt_chain_label);
+                    /* if the optional chain is not taken, return 'true' */
+                    emit_op(s, OP_drop);
+                    emit_op(s, OP_push_true);
+                    emit_label(s, next_label);
+                }
+                fd->last_opcode_pos = -1;
             }
-            name = get_u32(fd->byte_code.buf + fd->last_opcode_pos + 1);
+            break;
+        case OP_get_array_el:
             fd->byte_code.size = fd->last_opcode_pos;
-            val = JS_AtomToValue(s->ctx, name);
-            ret = emit_push_const(s, val, 1);
-            JS_FreeValue(s->ctx, val);
-            JS_FreeAtom(s->ctx, name);
-            if (ret)
-                return ret;
+            fd->last_opcode_pos = -1;
             emit_op(s, OP_delete);
-            if (opt_chain_label >= 0) {
+            break;
+        case OP_get_array_el_opt_chain:
+            {
+                int opt_chain_label, next_label;
+                opt_chain_label = get_u32(fd->byte_code.buf +
+                                          fd->last_opcode_pos + 1 + 1);
+                fd->byte_code.size = fd->last_opcode_pos;
+                emit_op(s, OP_delete);
                 next_label = emit_goto(s, OP_goto, -1);
                 emit_label(s, opt_chain_label);
                 /* if the optional chain is not taken, return 'true' */
                 emit_op(s, OP_drop);
                 emit_op(s, OP_push_true);
                 emit_label(s, next_label);
+                fd->last_opcode_pos = -1;
             }
-            fd->last_opcode_pos = -1;
-        }
-        break;
-    case OP_get_array_el:
-        fd->byte_code.size = fd->last_opcode_pos;
-        fd->last_opcode_pos = -1;
-        emit_op(s, OP_delete);
-        break;
-    case OP_get_array_el_opt_chain:
-        {
-            int opt_chain_label, next_label;
-            opt_chain_label = get_u32(fd->byte_code.buf +
-                                      fd->last_opcode_pos + 1 + 1);
+            break;
+        case OP_scope_get_var:
+            /* 'delete this': this is not a reference */
+            name = get_u32(fd->byte_code.buf + fd->last_opcode_pos + 1);
+            if (name == JS_ATOM_this || name == JS_ATOM_new_target)
+                goto del_ret_true;
+            if (fd->is_strict_mode)
+                PD_RET(js_parse_error(s, "cannot delete a direct reference in strict mode"));
+            fd->byte_code.buf[fd->last_opcode_pos] = OP_scope_delete_var;
+            break;
+        case OP_scope_get_private_field:
+            PD_RET(js_parse_error(s, "cannot delete a private class field"));
+        case OP_get_super_value:
             fd->byte_code.size = fd->last_opcode_pos;
-            emit_op(s, OP_delete);
-            next_label = emit_goto(s, OP_goto, -1);
-            emit_label(s, opt_chain_label);
-            /* if the optional chain is not taken, return 'true' */
+            fd->last_opcode_pos = -1;
+            emit_op(s, OP_throw_error);
+            emit_atom(s, JS_ATOM_NULL);
+            emit_u8(s, JS_THROW_ERROR_DELETE_SUPER);
+            break;
+        default:
+        del_ret_true:
             emit_op(s, OP_drop);
             emit_op(s, OP_push_true);
-            emit_label(s, next_label);
-            fd->last_opcode_pos = -1;
-        }
-        break;
-    case OP_scope_get_var:
-        /* 'delete this': this is not a reference */
-        name = get_u32(fd->byte_code.buf + fd->last_opcode_pos + 1);
-        if (name == JS_ATOM_this || name == JS_ATOM_new_target)
-            goto ret_true;
-        if (fd->is_strict_mode) {
-            return js_parse_error(s, "cannot delete a direct reference in strict mode");
-        } else {
-            fd->byte_code.buf[fd->last_opcode_pos] = OP_scope_delete_var;
-        }
-        break;
-    case OP_scope_get_private_field:
-        return js_parse_error(s, "cannot delete a private class field");
-    case OP_get_super_value:
-        fd->byte_code.size = fd->last_opcode_pos;
-        fd->last_opcode_pos = -1;
-        emit_op(s, OP_throw_error);
-        emit_atom(s, JS_ATOM_NULL);
-        emit_u8(s, JS_THROW_ERROR_DELETE_SUPER);
-        break;
-    default:
-    ret_true:
-        emit_op(s, OP_drop);
-        emit_op(s, OP_push_true);
-        break;
-    }
-    return 0;
-}
-
-static __exception int js_parse_var(JSParseState *s, int parse_flags, int tok,
-                                    bool export_flag);
-
-/* allowed parse_flags: PF_POW_ALLOWED, PF_POW_FORBIDDEN */
-static __exception int js_parse_unary(JSParseState *s, int parse_flags)
-{
-    int op;
-
-    switch(s->token.val) {
-    case '+':
-    case '-':
-    case '!':
-    case '~':
-    case TOK_VOID:
-        op = s->token.val;
-        if (next_token(s))
-            return -1;
-        if (js_parse_unary(s, PF_POW_FORBIDDEN))
-            return -1;
-        switch(op) {
-        case '-':
-            emit_op(s, OP_neg);
             break;
-        case '+':
-            emit_op(s, OP_plus);
-            break;
-        case '!':
-            emit_op(s, OP_lnot);
-            break;
-        case '~':
-            emit_op(s, OP_not);
-            break;
-        case TOK_VOID:
-            emit_op(s, OP_drop);
-            emit_op(s, OP_undefined);
-            break;
-        default:
-            abort();
-        }
-        parse_flags = 0;
-        break;
-    case TOK_DEC:
-    case TOK_INC:
-        {
-            int opcode, op, scope, label;
-            JSAtom name;
-            op = s->token.val;
-            if (next_token(s))
-                return -1;
-            if (js_parse_unary(s, 0))
-                return -1;
-            if (get_lvalue(s, &opcode, &scope, &name, &label, NULL, true, op))
-                return -1;
-            emit_op(s, OP_dec + op - TOK_DEC);
-            put_lvalue(s, opcode, scope, name, label, PUT_LVALUE_KEEP_TOP,
-                       false);
-        }
-        break;
-    case TOK_TYPEOF:
-        {
-            JSFunctionDef *fd;
-            if (next_token(s))
-                return -1;
-            if (js_parse_unary(s, PF_POW_FORBIDDEN))
-                return -1;
-            /* reference access should not return an exception, so we
-               patch the get_var */
-            fd = s->cur_func;
-            if (get_prev_opcode(fd) == OP_scope_get_var) {
-                fd->byte_code.buf[fd->last_opcode_pos] = OP_scope_get_var_undef;
-            }
-            emit_op(s, OP_typeof);
-            parse_flags = 0;
-        }
-        break;
-    case TOK_DELETE:
-        if (js_parse_delete(s))
-            return -1;
-        parse_flags = 0;
-        break;
-    case TOK_AWAIT:
-        if (!(s->cur_func->func_kind & JS_FUNC_ASYNC))
-            return js_parse_error(s, "unexpected 'await' keyword");
-        if (!s->cur_func->in_function_body)
-            return js_parse_error(s, "await in default expression");
-        if (next_token(s))
-            return -1;
-        if (js_parse_unary(s, PF_POW_FORBIDDEN))
-            return -1;
-        emit_op(s, OP_await);
-        s->cur_func->has_await = true;
-        parse_flags = 0;
-        break;
-    default:
-        if (js_parse_postfix_expr(s, PF_POSTFIX_CALL))
-            return -1;
-        if (!s->got_lf &&
-            (s->token.val == TOK_DEC || s->token.val == TOK_INC)) {
-            int opcode, op, scope, label;
-            JSAtom name;
-            op = s->token.val;
-            if (get_lvalue(s, &opcode, &scope, &name, &label, NULL, true, op))
-                return -1;
-            emit_op(s, OP_post_dec + op - TOK_DEC);
-            put_lvalue(s, opcode, scope, name, label, PUT_LVALUE_KEEP_SECOND,
-                       false);
-            if (next_token(s))
-                return -1;
-        }
-        break;
-    }
-    if (parse_flags & (PF_POW_ALLOWED | PF_POW_FORBIDDEN)) {
-        if (s->token.val == TOK_POW) {
-            /* Strict ES7 exponentiation syntax rules: To solve
-               conficting semantics between different implementations
-               regarding the precedence of prefix operators and the
-               postifx exponential, ES7 specifies that -2**2 is a
-               syntax error. */
-            if (parse_flags & PF_POW_FORBIDDEN)
-                return js_parse_error(s, "unparenthesized unary expression can't appear on the left-hand side of '**'");
-            if (next_token(s))
-                return -1;
-            if (js_parse_unary(s, PF_POW_ALLOWED))
-                return -1;
-            emit_op(s, OP_pow);
         }
     }
-    return 0;
-}
+    PD_RET(0);
 
-/* allowed parse_flags: PF_IN_ACCEPTED */
-static __exception int js_parse_expr_binary(JSParseState *s, int level,
-                                            int parse_flags)
-{
-    int op, opcode;
+ done:
+    if (fr != inline_fr)
+        js_free(ctx, fr);
+    return ret;
 
-    if (level == 0) {
-        return js_parse_unary(s, PF_POW_ALLOWED);
-    } else if (s->token.val == TOK_PRIVATE_NAME &&
-               (parse_flags & PF_IN_ACCEPTED) && level == 4 &&
-               peek_token(s, false) == TOK_IN) {
-        JSAtom atom;
-        atom = JS_DupAtom(s->ctx, s->token.u.ident.atom);
-        if (next_token(s))
-            goto fail_private_in;
-        if (s->token.val != TOK_IN)
-            goto fail_private_in;
-        if (next_token(s))
-            goto fail_private_in;
-        if (js_parse_expr_binary(s, level - 1, parse_flags)) {
-        fail_private_in:
-            JS_FreeAtom(s->ctx, atom);
-            return -1;
-        }
-        emit_op(s, OP_scope_in_private_field);
-        emit_atom(s, atom);
-        emit_u16(s, s->cur_func->scope_level);
-        JS_FreeAtom(s->ctx, atom);
-        return 0;
-    } else {
-        if (js_parse_expr_binary(s, level - 1, parse_flags))
-            return -1;
-    }
-    for(;;) {
-        op = s->token.val;
-        switch(level) {
-        case 1:
-            switch(op) {
-            case '*':
-                opcode = OP_mul;
-                break;
-            case '/':
-                opcode = OP_div;
-                break;
-            case '%':
-                opcode = OP_mod;
-                break;
-            default:
-                return 0;
-            }
-            break;
-        case 2:
-            switch(op) {
-            case '+':
-                opcode = OP_add;
-                break;
-            case '-':
-                opcode = OP_sub;
-                break;
-            default:
-                return 0;
-            }
-            break;
-        case 3:
-            switch(op) {
-            case TOK_SHL:
-                opcode = OP_shl;
-                break;
-            case TOK_SAR:
-                opcode = OP_sar;
-                break;
-            case TOK_SHR:
-                opcode = OP_shr;
-                break;
-            default:
-                return 0;
-            }
-            break;
-        case 4:
-            switch(op) {
-            case '<':
-                opcode = OP_lt;
-                break;
-            case '>':
-                opcode = OP_gt;
-                break;
-            case TOK_LTE:
-                opcode = OP_lte;
-                break;
-            case TOK_GTE:
-                opcode = OP_gte;
-                break;
-            case TOK_INSTANCEOF:
-                opcode = OP_instanceof;
-                break;
-            case TOK_IN:
-                if (parse_flags & PF_IN_ACCEPTED) {
-                    opcode = OP_in;
-                } else {
-                    return 0;
-                }
-                break;
-            default:
-                return 0;
-            }
-            break;
-        case 5:
-            switch(op) {
-            case TOK_EQ:
-                opcode = OP_eq;
-                break;
-            case TOK_NEQ:
-                opcode = OP_neq;
-                break;
-            case TOK_STRICT_EQ:
-                opcode = OP_strict_eq;
-                break;
-            case TOK_STRICT_NEQ:
-                opcode = OP_strict_neq;
-                break;
-            default:
-                return 0;
-            }
-            break;
-        case 6:
-            switch(op) {
-            case '&':
-                opcode = OP_and;
-                break;
-            default:
-                return 0;
-            }
-            break;
-        case 7:
-            switch(op) {
-            case '^':
-                opcode = OP_xor;
-                break;
-            default:
-                return 0;
-            }
-            break;
-        case 8:
-            switch(op) {
-            case '|':
-                opcode = OP_or;
-                break;
-            default:
-                return 0;
-            }
-            break;
-        default:
-            abort();
-        }
-        if (next_token(s))
-            return -1;
-        emit_source_loc(s);
-        if (js_parse_expr_binary(s, level - 1, parse_flags))
-            return -1;
-        emit_op(s, opcode);
-    }
-    return 0;
-}
-
-/* allowed parse_flags: PF_IN_ACCEPTED */
-static __exception int js_parse_logical_and_or(JSParseState *s, int op,
-                                               int parse_flags)
-{
-    int label1;
-
-    if (op == TOK_LAND) {
-        if (js_parse_expr_binary(s, 8, parse_flags))
-            return -1;
-    } else {
-        if (js_parse_logical_and_or(s, TOK_LAND, parse_flags))
-            return -1;
-    }
-    if (s->token.val == op) {
-        label1 = new_label(s);
-
-        for(;;) {
-            if (next_token(s))
-                return -1;
-            emit_op(s, OP_dup);
-            emit_goto(s, op == TOK_LAND ? OP_if_false : OP_if_true, label1);
-            emit_op(s, OP_drop);
-
-            if (op == TOK_LAND) {
-                if (js_parse_expr_binary(s, 8, parse_flags))
-                    return -1;
-            } else {
-                if (js_parse_logical_and_or(s, TOK_LAND, parse_flags))
-                    return -1;
-            }
-            if (s->token.val != op) {
-                if (s->token.val == TOK_DOUBLE_QUESTION_MARK)
-                    return js_parse_error(s, "cannot mix ?? with && or ||");
-                break;
-            }
-        }
-
-        emit_label(s, label1);
-    }
-    return 0;
-}
-
-static __exception int js_parse_coalesce_expr(JSParseState *s, int parse_flags)
-{
-    int label1;
-
-    if (js_parse_logical_and_or(s, TOK_LOR, parse_flags))
-        return -1;
-    if (s->token.val == TOK_DOUBLE_QUESTION_MARK) {
-        label1 = new_label(s);
-        for(;;) {
-            if (next_token(s))
-                return -1;
-
-            emit_op(s, OP_dup);
-            emit_op(s, OP_is_undefined_or_null);
-            emit_goto(s, OP_if_false, label1);
-            emit_op(s, OP_drop);
-
-            if (js_parse_expr_binary(s, 8, parse_flags))
-                return -1;
-            if (s->token.val != TOK_DOUBLE_QUESTION_MARK)
-                break;
-        }
-        emit_label(s, label1);
-    }
-    return 0;
-}
-
-/* allowed parse_flags: PF_IN_ACCEPTED */
-static __exception int js_parse_cond_expr(JSParseState *s, int parse_flags)
-{
-    int label1, label2;
-
-    if (js_parse_coalesce_expr(s, parse_flags))
-        return -1;
-    if (s->token.val == '?') {
-        if (next_token(s))
-            return -1;
-        label1 = emit_goto(s, OP_if_false, -1);
-
-        if (js_parse_assign_expr(s))
-            return -1;
-        if (js_parse_expect(s, ':'))
-            return -1;
-
-        label2 = emit_goto(s, OP_goto, -1);
-
-        emit_label(s, label1);
-
-        if (js_parse_assign_expr2(s, parse_flags & PF_IN_ACCEPTED))
-            return -1;
-
-        emit_label(s, label2);
-    }
-    return 0;
+ unwind:
+    /* The frame array could not grow. This is the ONE exit that does not run a production's own release, so
+       it settles every frame's atom itself. */
+    while (sp > 0)
+        JS_FreeAtom(ctx, fr[--sp].atom);
+    if (fr != inline_fr)
+        js_free(ctx, fr);
+    return -1;
+#undef PD_PUSH
+#undef PD_CALL
+#undef PD_RET
 }
 
 /* allowed parse_flags: PF_IN_ACCEPTED */
@@ -48163,7 +48265,8 @@ static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags)
         /* name0 is used to check for OP_set_name pattern, not duplicated */
         name0 = s->token.u.ident.atom;
     }
-    if (js_parse_cond_expr(s, parse_flags))
+    /* ConditionalExpression. allowed parse_flags: PF_IN_ACCEPTED */
+    if (js_parse_descent(s, PDS_CND, 0, parse_flags, 0))
         return -1;
 
     op = s->token.val;
