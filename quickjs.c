@@ -15280,6 +15280,18 @@ static JSValue JS_ToLocaleStringFree(JSContext *ctx, JSValue val)
 static JSValue JS_ToPropertyKeyInternal(JSContext *ctx, JSValueConst val,
                                         int flags)
 {
+    /* 7.1.19 ToPropertyKey OVER AN UNKNOWN KEY. A key must become an ATOM, and a concolic cannot be one — but
+       its SHAPE is a real string and it is stable per source, so an unknown key denotes an unknown-but-
+       CONSISTENT slot: `o[x] = 1` then `o[x]` finds it, two different unknown sources are different slots, and
+       `delete o[x]`, `x in o`, `o.hasOwnProperty(x)` and every other key-taking builtin all agree with each
+       other. This is the one place all of them convert, so it is the one place the model is stated.
+       It does NOT decide a READ of a slot that was never written — that is a lookup, not a coercion, and the
+       operator answers it with an unknown value so a gate on it still forks (see .key_read). */
+    if (g_concolic.is && g_concolic.key_name && g_concolic.is(val)) {
+        JSValue name = g_concolic.key_name(ctx, val);
+        if (!JS_IsUninitialized(name))
+            return name;
+    }
     return JS_ToStringInternal(ctx, val, flags | JS_TO_STRING_IS_PROPERTY_KEY);
 }
 
@@ -36144,7 +36156,31 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    key's source, so a gate on it still forks and a sink still solves for the key. Example-free
                    on purpose: which property was meant is exactly what is not known, and @H never invents. */
                 if (g_concolic.is && g_concolic.key_read && g_concolic.is(sp[-1])) {
-                    JSValue kv = g_concolic.key_read(ctx, sp[-2], sp[-1]);
+                    /* A WRITE THROUGH THIS SAME SOURCE WINS. ToPropertyKey maps an unknown key to its shape's
+                       slot, so `o[x] = 1; o[x]` must read back 1 rather than "unknown" — the read is the only
+                       operator that could disagree with the others, and it does not. */
+                    JSValue kv = JS_UNINITIALIZED;
+                    if (g_concolic.key_name) {
+                        JSValue nm = g_concolic.key_name(ctx, sp[-1]);
+                        if (!JS_IsUninitialized(nm)) {
+                            JSAtom na = JS_ValueToAtom(ctx, nm);
+                            JS_FreeValue(ctx, nm);
+                            if (na != JS_ATOM_NULL) {
+                                /* AN OWN SLOT, never an operation. JS_HasProperty/JS_GetProperty from here
+                                   would reach a Proxy's `has`/`get` trap — page code, from C, with no flow
+                                   base — which is the drive-to-completion the build's ratchet counts. The
+                                   question is only "did a write through this same source leave a value in
+                                   this object's own slot", and a stored value answers it. */
+                                JSValue own;
+                                int r = JS_GetOwnSlot(ctx, &own, sp[-2], na);
+                                JS_FreeAtom(ctx, na);
+                                if (r < 0) goto exception;
+                                if (r > 0) kv = own;
+                            }
+                        }
+                    }
+                    if (JS_IsUninitialized(kv))
+                        kv = g_concolic.key_read(ctx, sp[-2], sp[-1]);
                     if (!JS_IsUninitialized(kv)) {
                         JS_FreeValue(ctx, sp[-1]);
                         JS_FreeValue(ctx, sp[-2]);

@@ -1376,6 +1376,13 @@ typedef struct JSConcolicHooks {
     /* `obj[x]` with an UNKNOWN key. Not a coercion of the operand — a lookup that names no particular slot, so
        the read yields a concolic derived from the base and the key's source. JS_UNINITIALIZED = not concolic. */
     JSValue (*key_read)(JSContext *ctx, JSValueConst obj, JSValueConst key);
+    /* THE NAME an unknown key denotes, as a REAL string — the concolic's own shape. A property key must be an
+       atom, which a concolic cannot be, but the shape IS a string and it is stable per source: two writes
+       through the same unknown source land in the SAME slot, two different sources in different ones, and a
+       read through that source finds what was written. That is a sound model of "unknown but consistent", and
+       it is what lets `obj[x] = v`, `delete obj[x]`, `x in obj` and every key-taking builtin work at all.
+       JS_UNINITIALIZED = not concolic. */
+    JSValue (*key_name)(JSContext *ctx, JSValueConst key);
 } JSConcolicHooks;
 JS_EXTERN void JS_SetConcolicHooks(const JSConcolicHooks *hooks);
 
