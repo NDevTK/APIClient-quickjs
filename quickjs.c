@@ -44375,7 +44375,7 @@ enum {
     PDS_VAR, PDS_VAR_LV, PDS_VAR_INIT,
     PDS_SOD, PDS_BLOCK, PDS_BLK_STMT, PDS_IFC, PDS_IFC_DONE, PDS_SOD_30,
     PDS_FIO, PDS_FIO_01, PDS_FIO_02, PDS_FIO_03, PDS_FIO_04, PDS_FIO_05,
-    PDS_CLASS, PDS_CLS_01, PDS_CLS_02,
+    PDS_CLASS, PDS_CLS_01, PDS_CLS_02, PDS_SRCELEM, PDS_SE_01,
     PDS_DESTR, PDS_DE_01, PDS_DE_02, PDS_DE_03, PDS_DE_04, PDS_DE_05,
     PDS_DE_06, PDS_DE_07, PDS_DE_08, PDS_DE_09, PDS_DE_10,
     PDS_SOD_01, PDS_SOD_02, PDS_SOD_03, PDS_SOD_04, PDS_SOD_05, PDS_SOD_06, PDS_SOD_07, PDS_SOD_08, PDS_SOD_09, PDS_SOD_10, PDS_SOD_11, PDS_SOD_12, PDS_SOD_13, PDS_SOD_14, PDS_SOD_15, PDS_SOD_16, PDS_SOD_17, PDS_SOD_18, PDS_SOD_19, PDS_SOD_20, PDS_SOD_21, PDS_SOD_22, PDS_SOD_23, PDS_SOD_24, PDS_SOD_25, PDS_SOD_26, PDS_SOD_27, PDS_SOD_28, PDS_SOD_29,
@@ -44394,6 +44394,8 @@ static int is_let(JSParseState *s, int decl_mask);
 static int is_using(JSParseState *s, bool is_for_of);
 static void set_eval_ret_undefined(JSParseState *s);
 static void emit_async_iterator_close(JSParseState *s);
+static __exception int js_parse_export(JSParseState *s);
+static __exception int js_parse_import(JSParseState *s);
 
 /* allow the 'in' binary operator. It is the [In] parameter of the production being parsed, and it reaches the
    function parsers too: an arrow's ConciseBody is ExpressionBody[?In, ~Await], so `for (x => 0 in 1;;)` must
@@ -45715,6 +45717,8 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     case PDS_FIO_03:          goto fio_03;
     case PDS_FIO_04:          goto fio_04;
     case PDS_FIO_05:          goto fio_05;
+    case PDS_SRCELEM:         goto se_entry;
+    case PDS_SE_01:           goto se_01;
     case PDS_CLASS:           goto cls_entry;
     case PDS_CLS_01:          goto cls_01;
     case PDS_CLS_02:          goto cls_02;
@@ -50316,6 +50320,38 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     f->atom = f->atom2 = f->atom3 = f->atom4 = JS_ATOM_NULL;
     PD_RET(-1);
 
+/* ---- SourceElement: one statement, declaration, import or export at the top level of a script, module or
+   function body. Thin, but it sits between js_parse_program / the function body and the statement cone, so it
+   has to be on the frame stack for those to reach it without a C activation. ---- */
+ se_entry:
+
+    if (s->token.val == TOK_FUNCTION ||
+        (token_is_pseudo_keyword(s, JS_ATOM_async) &&
+         peek_token(s, true) == TOK_FUNCTION)) {
+        if (js_parse_function_decl(s, JS_PARSE_FUNC_STATEMENT,
+                                   JS_FUNC_NORMAL, JS_ATOM_NULL,
+                                   s->token.ptr,
+                                   s->token.line_num,
+                                   s->token.col_num, PF_IN_ACCEPTED))
+            PD_RET(-1);
+    } else if (s->token.val == TOK_EXPORT && s->cur_func->module) {
+        if (js_parse_export(s))
+            PD_RET(-1);
+    } else if (s->token.val == TOK_IMPORT && s->cur_func->module &&
+               ((f->st_tok = peek_token(s, false)) != '(' && f->st_tok != '.'))  {
+        /* the peek_token is needed to avoid confusion with ImportCall
+           (dynamic import) or import.meta */
+        if (js_parse_import(s))
+            PD_RET(-1);
+    } else {
+        PD_CALL(PDS_SOD, 0, DECL_MASK_ALL, 0, PDS_SE_01);
+ se_01:
+        if (pd_ret)
+            PD_RET(-1);
+    }
+    PD_RET(0);
+    PD_RET(0);
+
  done:
     goto leave;
 
@@ -53947,36 +53983,6 @@ static __exception int js_parse_import(JSParseState *s)
         m->import_entries[i].req_module_idx = idx;
 
     return js_parse_expect_semi(s);
-}
-
-static __exception int js_parse_source_element(JSParseState *s)
-{
-    JSFunctionDef *fd = s->cur_func;
-    int tok;
-
-    if (s->token.val == TOK_FUNCTION ||
-        (token_is_pseudo_keyword(s, JS_ATOM_async) &&
-         peek_token(s, true) == TOK_FUNCTION)) {
-        if (js_parse_function_decl(s, JS_PARSE_FUNC_STATEMENT,
-                                   JS_FUNC_NORMAL, JS_ATOM_NULL,
-                                   s->token.ptr,
-                                   s->token.line_num,
-                                   s->token.col_num, PF_IN_ACCEPTED))
-            return -1;
-    } else if (s->token.val == TOK_EXPORT && fd->module) {
-        if (js_parse_export(s))
-            return -1;
-    } else if (s->token.val == TOK_IMPORT && fd->module &&
-               ((tok = peek_token(s, false)) != '(' && tok != '.'))  {
-        /* the peek_token is needed to avoid confusion with ImportCall
-           (dynamic import) or import.meta */
-        if (js_parse_import(s))
-            return -1;
-    } else {
-        if (js_parse_descent(s, PDS_SOD, 0, DECL_MASK_ALL, 0))
-            return -1;
-    }
-    return 0;
 }
 
 /* `filename` may be pure ASCII or UTF-8 encoded */
@@ -59017,7 +59023,7 @@ static __exception int js_parse_function_decl2(JSParseState *s,
         int has_using_be = 0;
 
         while (s->token.val != '}') {
-            if (js_parse_source_element(s))
+            if (js_parse_descent(s, PDS_SRCELEM, 0, 0, 0))
                 goto fail;
             /* Check if a 'using' was encountered in the body scope */
             if (!has_using_be && fd->scopes[fd->body_scope].has_using) {
@@ -59236,7 +59242,7 @@ static __exception int js_parse_program(JSParseState *s)
     }
 
     while (s->token.val != TOK_EOF) {
-        if (js_parse_source_element(s))
+        if (js_parse_descent(s, PDS_SRCELEM, 0, 0, 0))
             return -1;
         /* Check if a 'using' was encountered at the body scope level */
         if (!has_using_be && fd->scopes[fd->body_scope].has_using) {
