@@ -45545,14 +45545,21 @@ struct JSParseFrame {
        object literal with methods of its own. */
     const uint8_t *start_ptr;
     int     start_line, start_col;
-    /* ClassDeclaration: the state that spans the WHOLE member list, so every one of these is live across the
-       descents each member performs (a computed key, a field initialiser, and — once the method body is a
-       PD_CALL rather than a C recursion — the method body itself). A class inside a class method is then a
-       nested FRAME in the same driver activation, so a driver local would be one variable shared by both and
-       the inner class would overwrite the outer's field table, constructor and source start. */
-    ClassFieldsDef st_class_fields[2];
-    JSFunctionDef *st_ctor_fd;
-    const uint8_t *st_class_start;
+    /* PER-PRODUCTION STATE, the first arm. Everything above this point is a shared scratchpad: 17 slots named
+       st_b1 / st_lbl_a / st_pos_a / st_tok, each meaning something different in each of the two to six
+       productions that use it, and every frame paying for all of them whether it is a class body or a `+`.
+       That is not a state machine's state, it is a bag, and the tell is that adding a production required
+       GREPPING to find a slot nobody else had taken — three times in one sitting. A slot picked wrongly is
+       silent, which is the same defect as a driver local read across a suspension, one level up.
+       The fix is a union keyed by production, with names that say what they hold. This arm is the pattern;
+       the shared slots move in one production at a time, and the frame stops being sized by their SUM. */
+    union {
+        struct {
+            ClassFieldsDef fields[2];      /* instance and static field-initialiser defs */
+            JSFunctionDef *ctor_fd;        /* the constructor, once a member turns out to be one */
+            const uint8_t *start;          /* the class's first token, for its source text */
+        } cls;
+    } u;
     /* FOUND BY SUSPENDING AT EVERY DISPATCH, not by reading the code. Each of these was a C local assigned
        before a descent and read after it, which worked only because a PD_CALL used to leave the driver's
        frame standing. Once the driver can RETURN at a dispatch, that local is re-initialised on the way back
@@ -45660,8 +45667,7 @@ static __exception int js_parse_drive(JSParseState *s, int entry, int level,
         f->st_ptr = NULL; f->st_pfd = NULL; f->st_fd = NULL;                     \
         f->raw_array = JS_UNDEFINED; f->template_object = JS_UNDEFINED;          \
         f->start_ptr = NULL; f->start_line = 0; f->start_col = 0;                \
-        memset(f->st_class_fields, 0, sizeof(f->st_class_fields));               \
-        f->st_ctor_fd = NULL; f->st_class_start = NULL;                          \
+        memset(&f->u, 0, sizeof(f->u));                                          \
         f->st_label_hasval = -1; f->st_saved_eval_ret = -1;                      \
         f->st_label_fd = NULL; f->st_module = NULL;
 
@@ -49940,12 +49946,12 @@ static __exception int js_parse_drive(JSParseState *s, int entry, int level,
     f->st_mask = 0;   /* class_flags — its declaration carried this initialiser */
     JSAtom class_name1;
     int i;
-    f->st_class_start = s->token.ptr;
-/* class_fields, ctor_fd and class_start_ptr span the whole member list — see JSParseFrame.st_class_fields.
-   They are spelled through the frame so a class nested in a class METHOD cannot overwrite the outer class's. */
-#define class_fields     (f->st_class_fields)
-#define ctor_fd          (f->st_ctor_fd)
-#define class_start_ptr  (f->st_class_start)
+    f->u.cls.start = s->token.ptr;
+/* class_fields, ctor_fd and class_start_ptr span the whole member list — see JSParseFrame's cls arm. They are
+   spelled through the frame so a class nested in a class METHOD cannot overwrite the outer class's. */
+#define class_fields     (f->u.cls.fields)
+#define ctor_fd          (f->u.cls.ctor_fd)
+#define class_start_ptr  (f->u.cls.start)
 
     /* classes are parsed and executed in strict mode */
     f->st_b3 = s->cur_func->is_strict_mode;
