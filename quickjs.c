@@ -53959,37 +53959,49 @@ static bool find_in_exec_module_list(ExecModuleList *exec_list, JSModuleDef *m)
     return false;
 }
 
+/* AsyncModuleExecutionFulfilled's GatherAvailableAncestors, as an explicit walk rather than C recursion, and
+   therefore with no stack guard: the depth was the async module GRAPH's, which the imported source picks, and
+   the js_check_stack_overflow in front of it turned a graph the algorithm answers into a RangeError.
+   THE WORKLIST IS exec_list ITSELF. Every module this appends is one whose dependencies just reached zero,
+   which is exactly the set the recursion descended into — so a cursor over the entries appended by this call
+   visits each exactly once, and no second array is needed. The one asymmetry the cursor must respect is that a
+   module WITH top-level await is appended but NOT expanded, the same test the recursion made before calling
+   itself.
+   The traversal order changes from depth-first to breadth-first and that is not observable: the SET reached is
+   identical (an edge decrements pending_async_dependencies once either way, and a module is appended only on
+   the decrement that reaches zero), and the caller sorts exec_list by async_evaluation_timestamp before using
+   it. */
 static int gather_available_ancestors(JSContext *ctx, JSModuleDef *module,
                                       ExecModuleList *exec_list)
 {
-    int i;
+    int i, cursor = exec_list->count;
+    JSModuleDef *cur = module;
 
-    if (js_check_stack_overflow(ctx->rt, 0)) {
-        JS_ThrowStackOverflow(ctx);
-        return -1;
-    }
-    for(i = 0; i < module->async_parent_modules_count; i++) {
-        JSModuleDef *m = module->async_parent_modules[i];
-        if (!find_in_exec_module_list(exec_list, m) &&
-            !m->cycle_root->eval_has_exception) {
-            assert(m->status == JS_MODULE_STATUS_EVALUATING_ASYNC);
-            assert(!m->eval_has_exception);
-            assert(m->async_evaluation);
-            assert(m->pending_async_dependencies > 0);
-            m->pending_async_dependencies--;
-            if (m->pending_async_dependencies == 0) {
-                if (js_resize_array(ctx, (void **)&exec_list->tab, sizeof(exec_list->tab[0]), &exec_list->size, exec_list->count + 1)) {
-                    return -1;
-                }
-                exec_list->tab[exec_list->count++] = m;
-                if (!m->has_tla) {
-                    if (gather_available_ancestors(ctx, m, exec_list))
+    for (;;) {
+        for(i = 0; i < cur->async_parent_modules_count; i++) {
+            JSModuleDef *m = cur->async_parent_modules[i];
+            if (!find_in_exec_module_list(exec_list, m) &&
+                !m->cycle_root->eval_has_exception) {
+                assert(m->status == JS_MODULE_STATUS_EVALUATING_ASYNC);
+                assert(!m->eval_has_exception);
+                assert(m->async_evaluation);
+                assert(m->pending_async_dependencies > 0);
+                m->pending_async_dependencies--;
+                if (m->pending_async_dependencies == 0) {
+                    if (js_resize_array(ctx, (void **)&exec_list->tab, sizeof(exec_list->tab[0]), &exec_list->size, exec_list->count + 1)) {
                         return -1;
+                    }
+                    exec_list->tab[exec_list->count++] = m;
                 }
             }
         }
+        /* the next appended entry that still needs expanding; a TLA module is a leaf here */
+        while (cursor < exec_list->count && exec_list->tab[cursor]->has_tla)
+            cursor++;
+        if (cursor >= exec_list->count)
+            return 0;
+        cur = exec_list->tab[cursor++];
     }
-    return 0;
 }
 
 static int exec_module_list_cmp(const void *p1, const void *p2, void *opaque)
