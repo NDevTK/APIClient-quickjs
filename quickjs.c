@@ -61158,6 +61158,16 @@ uint8_t *JS_WriteObject(JSContext *ctx, size_t *psize, JSValueConst obj,
     return JS_WriteObject2(ctx, psize, obj, flags, NULL);
 }
 
+/* One half-built value. `obj` is the container being filled; `i`/`len` is where the fill has got to. */
+typedef struct BCRFrame {
+    uint8_t  kind;
+    uint8_t  phase;
+    JSValue  obj;
+    uint32_t i, len;
+    bool     flag;      /* ARRAY: template, so a trailing `raw` follows the elements */
+} BCRFrame;
+enum { BCR_READ, BCR_ARRAY };
+
 typedef struct BCReaderState {
     JSContext *ctx;
     const uint8_t *buf_start, *ptr, *buf_end;
@@ -61179,6 +61189,16 @@ typedef struct BCReaderState {
     /* used for JS_DUMP_READ_OBJECT */
     const uint8_t *ptr_last;
     int level;
+    /* THE READER'S FRAME STACK. The writer emits as it descends, so a work stack of pending items was enough
+       for it. The reader BUILDS: every child has to be placed into a half-constructed parent, so a frame
+       carries the container AND a cursor, and the finished child arrives in r_result. It lives here rather
+       than in C locals for the same reason the parser's does — everything live at a frame boundary is in the
+       struct, so the driver can return mid-graph and be re-entered.
+       Arms not yet converted still call the old helper, which re-enters the driver as a nested activation;
+       r_base is that activation's floor, exactly as the parser's pd_base was during its own conversion. */
+    struct BCRFrame *r_stack;
+    int r_sp, r_size, r_base;
+    JSValue r_result;
 } BCReaderState;
 
 #ifdef ENABLE_DUMPS // JS_DUMP_READ_OBJECT
@@ -62187,7 +62207,26 @@ static JSValue JS_ReadObjectValue(BCReaderState *s)
 static JSValue JS_ReadMap(BCReaderState *s);
 static JSValue JS_ReadSet(BCReaderState *s);
 
-static JSValue JS_ReadObjectRec(BCReaderState *s)
+static int bcr_push(BCReaderState *s)
+{
+    if (s->r_sp >= s->r_size) {
+        int n = s->r_size ? s->r_size * 2 : 16;
+        BCRFrame *t = js_realloc(s->ctx, s->r_stack, sizeof(*t) * n);
+        if (!t)
+            return -1;
+        s->r_stack = t;
+        s->r_size = n;
+    }
+    memset(&s->r_stack[s->r_sp], 0, sizeof(s->r_stack[0]));
+    s->r_stack[s->r_sp].obj = JS_UNDEFINED;
+    s->r_sp++;
+    return 0;
+}
+
+/* READ ONE VALUE. Returns it, or — for a tag whose arm is on the frame stack — PUSHES a frame and returns
+   JS_UNDEFINED with the stack grown, which the driver detects and drives. The stack guard is still here
+   because the arms below that still call this function re-enter it; it goes when the last one stops. */
+static JSValue bcr_read_one(BCReaderState *s)
 {
     JSContext *ctx = s->ctx;
     uint8_t tag;
@@ -62256,8 +62295,34 @@ static JSValue JS_ReadObjectRec(BCReaderState *s)
         break;
     case BC_TAG_ARRAY:
     case BC_TAG_TEMPLATE_OBJECT:
-        obj = JS_ReadArray(s, tag);
-        break;
+        /* ON THE FRAME STACK. The container and the reference id are established in the same order the
+           recursive arm did — JS_NewArray then BC_add_object_ref then the length — because the reference
+           index a later BC_TAG_OBJECT_REFERENCE resolves against is assigned by that order. */
+        {
+            BCRFrame *f;
+            uint32_t len;
+            obj = JS_NewArray(ctx);
+            if (JS_IsException(obj))
+                return JS_EXCEPTION;
+            if (BC_add_object_ref(s, obj))
+                goto arr_fail;
+            if (bc_get_leb128(s, &len))
+                goto arr_fail;
+            bc_read_trace(s, "%u\n", len);
+            if (bcr_push(s) < 0)
+                goto arr_fail;
+            f = &s->r_stack[s->r_sp - 1];
+            f->kind = BCR_ARRAY;
+            f->phase = 0;
+            f->obj = obj;
+            f->i = 0;
+            f->len = len;
+            f->flag = (tag == BC_TAG_TEMPLATE_OBJECT);
+            return JS_UNDEFINED;   /* the driver sees the pushed frame */
+        arr_fail:
+            JS_FreeValue(ctx, obj);
+            return JS_EXCEPTION;
+        }
     case BC_TAG_TYPED_ARRAY:
         obj = JS_ReadTypedArray(s);
         break;
@@ -62322,6 +62387,90 @@ static JSValue JS_ReadObjectRec(BCReaderState *s)
     }
     bc_read_trace(s, "}\n");
     return obj;
+}
+
+/* THE DRIVER. One value at a time: read, deliver to the frame waiting for it, advance. Everything live at a
+   frame boundary is in BCReaderState, so this loop can be left and re-entered — which is what makes the walk
+   suspendable rather than merely flat. r_base is this activation's floor: an arm that still calls
+   JS_ReadObjectRec re-enters here and gets its own floor, exactly as the parser worked mid-conversion. */
+static JSValue JS_ReadObjectRec(BCReaderState *s)
+{
+    JSContext *ctx = s->ctx;
+    int base = s->r_sp;
+    int saved_base = s->r_base;
+    JSValue result = JS_UNDEFINED;
+    bool need_read = true;
+
+    s->r_base = base;
+    for (;;) {
+        if (need_read) {
+            int before = s->r_sp;
+            result = bcr_read_one(s);
+            if (JS_IsException(result))
+                goto fail;
+            need_read = false;
+            if (s->r_sp > before)
+                result = JS_UNDEFINED;   /* a frame was pushed; it owns what comes next */
+        }
+        if (s->r_sp == base) {
+            s->r_base = saved_base;
+            return result;
+        }
+        {
+            BCRFrame *f = &s->r_stack[s->r_sp - 1];
+            if (f->phase == 1) {
+                /* a child just arrived: install it */
+                if (f->kind == BCR_ARRAY) {
+                    int pf = f->flag ? JS_PROP_ENUMERABLE : JS_PROP_C_W_E;
+                    if (f->i < f->len) {
+                        if (JS_DefinePropertyValueUint32(ctx, f->obj, f->i, result, pf) < 0) {
+                            result = JS_UNDEFINED;
+                            goto fail;
+                        }
+                        f->i++;
+                    } else {
+                        /* the template's `raw` */
+                        if (!JS_IsUndefined(result)) {
+                            if (JS_DefinePropertyValue(ctx, f->obj, JS_ATOM_raw, result, 0) < 0) {
+                                result = JS_UNDEFINED;
+                                goto fail;
+                            }
+                        } else {
+                            JS_FreeValue(ctx, result);
+                        }
+                        JS_PreventExtensions(ctx, f->obj);
+                        f->flag = false;   /* raw consumed */
+                        f->len = f->i;     /* and no elements remain */
+                        result = f->obj;
+                        f->obj = JS_UNDEFINED;
+                        s->r_sp--;
+                        continue;
+                    }
+                }
+                result = JS_UNDEFINED;
+                f->phase = 0;
+                continue;
+            }
+            /* phase 0: does this frame still want a child? */
+            if (f->i < f->len || f->flag) {
+                f->phase = 1;
+                need_read = true;
+                continue;
+            }
+            result = f->obj;
+            f->obj = JS_UNDEFINED;
+            s->r_sp--;
+        }
+    }
+ fail:
+    JS_FreeValue(ctx, result);
+    while (s->r_sp > base) {
+        s->r_sp--;
+        JS_FreeValue(ctx, s->r_stack[s->r_sp].obj);
+        s->r_stack[s->r_sp].obj = JS_UNDEFINED;
+    }
+    s->r_base = saved_base;
+    return JS_EXCEPTION;
 }
 
 static int JS_ReadObjectAtoms(BCReaderState *s)
