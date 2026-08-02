@@ -44373,7 +44373,8 @@ enum {
     PDS_PROPNAME, PDS_PN_COMPUTED, PDS_OBJ_KEY,
     PDS_TEMPLATE, PDS_TPL_SUB, PDS_PFX_TEMPLATE, PDS_PFX_TAGGED,
     PDS_VAR, PDS_VAR_LV, PDS_VAR_INIT,
-    PDS_SOD, PDS_BLOCK, PDS_BLK_STMT, PDS_IFC, PDS_IFC_DONE,
+    PDS_SOD, PDS_BLOCK, PDS_BLK_STMT, PDS_IFC, PDS_IFC_DONE, PDS_SOD_30,
+    PDS_FIO, PDS_FIO_01, PDS_FIO_02, PDS_FIO_03, PDS_FIO_04, PDS_FIO_05,
     PDS_SOD_01, PDS_SOD_02, PDS_SOD_03, PDS_SOD_04, PDS_SOD_05, PDS_SOD_06, PDS_SOD_07, PDS_SOD_08, PDS_SOD_09, PDS_SOD_10, PDS_SOD_11, PDS_SOD_12, PDS_SOD_13, PDS_SOD_14, PDS_SOD_15, PDS_SOD_16, PDS_SOD_17, PDS_SOD_18, PDS_SOD_19, PDS_SOD_20, PDS_SOD_21, PDS_SOD_22, PDS_SOD_23, PDS_SOD_24, PDS_SOD_25, PDS_SOD_26, PDS_SOD_27, PDS_SOD_28, PDS_SOD_29,
 };
 static __exception int js_parse_descent(JSParseState *s, int entry, int level,
@@ -44389,10 +44390,7 @@ static __exception int emit_break(JSParseState *s, JSAtom name, int is_cont);
 static int is_let(JSParseState *s, int decl_mask);
 static int is_using(JSParseState *s, bool is_for_of);
 static void set_eval_ret_undefined(JSParseState *s);
-static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
-                                          bool is_async,
-                                          int source_line_num,
-                                          int source_col_num);
+static void emit_async_iterator_close(JSParseState *s);
 
 /* allow the 'in' binary operator. It is the [In] parameter of the production being parsed, and it reaches the
    function parsers too: an arrow's ConciseBody is ExpressionBody[?In, ~Await], so `for (x => 0 in 1;;)` must
@@ -46471,6 +46469,10 @@ struct JSParseFrame {
     int     st_mask, st_tok, st_bits, st_line, st_col, st_idx;
     bool    st_is_async;
     bool    st_flag;          /* Block: a using-BlockEnv is pushed. IfClause: it opened its own scope. */
+    /* for-in/of holds TWO break entries at once — the loop's own, and the using-scope's around the body —
+       so it needs a second BlockEnv slot; both rely on the frame's address being stable. */
+    BlockEnv st_be2;
+    bool    st_b1, st_b2, st_b3;
     /* TemplateLiteral: the tagged form's cooked and raw arrays, LIVE ACROSS the substitution descent — a
        nested template is a nested FRAME, and holding these in a driver local let the inner one reset the
        outer's to JS_UNDEFINED. Ownership matches the recursive body: template_object is released after
@@ -46550,11 +46552,9 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
 
 /* The arguments are read into temporaries FIRST: they are almost always expressions over the CALLER's frame
    (`f->level - 1`), and the push moves `f` to the callee's. */
-#define PD_PUSH(entry_, level_, flags_, op_) do {                               \
-        int e_ = (entry_), lv_ = (level_), fl_ = (flags_), o_ = (op_);          \
-        if (pd_reserve(ctx, s, s->pd_sp + 1))                                   \
-            goto unwind;                                                        \
-        f = PD_FRAME(s->pd_sp); s->pd_sp++;                                     \
+/* THE FRAME INITIALISER, factored so the two push variants cannot drift apart. Every field a production
+   might read before writing is settled here; a frame is never partially initialised. */
+#define PD_INIT()                                                               \
         f->state = e_; f->level = lv_; f->flags = fl_; f->op = o_;               \
         f->label1 = -1; f->label2 = -1; f->opcode = 0; f->atom = JS_ATOM_NULL;   \
         f->atom2 = JS_ATOM_NULL;                                                 \
@@ -46571,8 +46571,16 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         f->st_mask = 0; f->st_tok = 0; f->st_bits = 0;                           \
         f->st_line = 0; f->st_col = 0; f->st_idx = 0; f->st_is_async = false;    \
         f->st_flag = false;                                                      \
+        f->st_b1 = false; f->st_b2 = false; f->st_b3 = false;                    \
         f->raw_array = JS_UNDEFINED; f->template_object = JS_UNDEFINED;          \
-        f->start_ptr = NULL; f->start_line = 0; f->start_col = 0;                \
+        f->start_ptr = NULL; f->start_line = 0; f->start_col = 0;
+
+#define PD_PUSH(entry_, level_, flags_, op_) do {                               \
+        int e_ = (entry_), lv_ = (level_), fl_ = (flags_), o_ = (op_);          \
+        if (pd_reserve(ctx, s, s->pd_sp + 1))                                   \
+            goto unwind;                                                        \
+        f = PD_FRAME(s->pd_sp); s->pd_sp++;                                     \
+        PD_INIT()                                                               \
         goto dispatch;                                                          \
     } while (0)
 /* A descent: record where THIS frame continues, then push the callee's. */
@@ -46580,6 +46588,22 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         f->state = (resume_);                                                   \
         PD_PUSH(entry_, level_, flags_, op_);                                   \
     } while (0)
+/* A descent that also seeds the callee's SOURCE POSITION. The five-parameter shape covers every production
+   but one: for-in/of needs a label atom, an is_async flag AND the position of the `for` keyword — four values
+   besides the entry. Widening every PD_CALL for one caller would be noise, so this variant seeds st_line and
+   st_col on the callee's frame after PD_INIT has settled it. */
+#define PD_CALL_AT(entry_, level_, flags_, op_, line_, col_, resume_) do {      \
+        int e_ = (entry_), lv_ = (level_), fl_ = (flags_), o_ = (op_);          \
+        int ln_ = (line_), cl_ = (col_);                                        \
+        f->state = (resume_);                                                   \
+        if (pd_reserve(ctx, s, s->pd_sp + 1))                                   \
+            goto unwind;                                                        \
+        f = PD_FRAME(s->pd_sp); s->pd_sp++;                                     \
+        PD_INIT()                                                               \
+        f->st_line = ln_; f->st_col = cl_;                                      \
+        goto dispatch;                                                          \
+    } while (0)
+
 /* A production finished: its return code becomes the caller's `pd_ret`. */
 #define PD_RET(v_) do {                                                         \
         DCHECK(f->atom == JS_ATOM_NULL && f->atom2 == JS_ATOM_NULL,              \
@@ -46665,6 +46689,13 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     case PDS_BLK_STMT:        goto blk_stmt_done;
     case PDS_IFC:             goto ifc_entry;
     case PDS_IFC_DONE:        goto ifc_done;
+    case PDS_SOD_30:          goto sod_30;
+    case PDS_FIO:             goto fio_entry;
+    case PDS_FIO_01:          goto fio_01;
+    case PDS_FIO_02:          goto fio_02;
+    case PDS_FIO_03:          goto fio_03;
+    case PDS_FIO_04:          goto fio_04;
+    case PDS_FIO_05:          goto fio_05;
     case PDS_SOD_01:         goto sod_01;
     case PDS_SOD_02:         goto sod_02;
     case PDS_SOD_03:         goto sod_03;
@@ -49086,8 +49117,10 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
 
             if (!(f->st_bits & SKIP_HAS_SEMI)) {
                 /* parse for/in or for/of */
-                if (js_parse_for_in_of(s, f->atom, f->st_is_async,
-                                       f->st_line, f->st_col))
+                PD_CALL_AT(PDS_FIO, f->st_is_async, f->atom, 0,
+                           f->st_line, f->st_col, PDS_SOD_30);
+ sod_30:
+                if (pd_ret)
                     goto sod_fail;
                 break;
             }
@@ -49819,6 +49852,395 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         pop_scope(s);
     PD_RET(pd_ret);
 
+/* ---- for-in / for-of. `flags` carries the loop's label atom (BORROWED — the statement frame below owns it),
+   `level` the is_async flag, and st_line/st_col the `for` keyword's position, seeded by PD_CALL_AT. It holds
+   TWO break entries at once — the loop's own and the using-scope's around the body — in st_be and st_be2. ---- */
+ fio_entry:
+    f->st_is_async = (f->level != 0);
+
+    f->st_flag = false;
+    f->st_b2 = false;
+    f->st_b1 = false;
+    f->st_scope_a = s->cur_func->scope_level;
+    f->st_lbl_c = new_label(s);
+    f->st_lbl_d = new_label(s);
+    f->label1 = new_label(s);
+    f->st_lbl_a = new_label(s);
+
+    /* create f->scope for the lexical variables declared in the enumeration
+       expressions. XXX: Not completely correct because of weird capturing
+       semantics in `for (i of o) a.push(function(){return i})` */
+    push_scope(s);
+
+    /* local for_in f->scope starts here so individual elements
+       can be closed in statement. */
+    push_break_entry(s->cur_func, &f->st_be,
+                     f->flags, f->label1, f->st_lbl_c, 1);
+    f->st_be.scope_level = f->st_scope_a;
+
+    f->st_lbl_b = emit_goto(s, OP_goto, -1);
+
+    f->st_pos_a = s->cur_func->byte_code.size;
+    emit_label(s, f->st_lbl_a);
+
+    f->st_tok = s->token.val;
+    switch (is_let(s, DECL_MASK_OTHER)) {
+    case true:
+        f->st_tok = TOK_LET;
+        break;
+    case false:
+        break;
+    default:
+        goto fio_fail;
+    }
+    if (f->st_tok == TOK_AWAIT) {
+        int u;
+        if (next_token(s))
+            goto fio_fail;
+        u = is_using(s, false);
+        if (u < 0)
+            goto fio_fail;
+        if (!u)
+            { js_parse_error(s, "'using' expected"); goto fio_fail; }
+        f->st_tok = TOK_USING;
+        f->st_b3 = true;
+        s->cur_func->has_await = true;
+    } else if (token_is_pseudo_keyword(s, JS_ATOM_using)) {
+        int u = is_using(s, true);
+        if (u < 0)
+            goto fio_fail;
+        if (u)
+            f->st_tok = TOK_USING;
+    }
+    if (f->st_tok == TOK_VAR || f->st_tok == TOK_LET || f->st_tok == TOK_CONST || f->st_tok == TOK_USING) {
+        if (next_token(s))
+            goto fio_fail;
+
+        if (!(s->token.val == TOK_IDENT && !s->token.u.ident.is_reserved)) {
+            if (s->token.val == '[' || s->token.val == '{') {
+                if (js_parse_destructuring_element(s, f->st_tok, false, true, -1, false, false) < 0)
+                    goto fio_fail;
+                f->st_b2 = true;
+            } else {
+                { js_parse_error(s, "variable name expected"); goto fio_fail; }
+            }
+            f->atom = JS_ATOM_NULL;
+        } else {
+            bool init;
+            f->atom = JS_DupAtom(ctx, s->token.u.ident.atom);
+            if (f->atom == JS_ATOM_let &&
+                (f->st_tok == TOK_LET || f->st_tok == TOK_CONST || f->st_tok == TOK_USING)) {
+                /* fio_fail owns the release — freeing here as well would leave a dangling slot, which the
+                   PD_RET DCHECK catches, or double-free. */
+                js_parse_error(s, "'let' is not a valid lexical identifier");
+                goto fio_fail;
+            }
+            if (next_token(s)) {
+                JS_FreeAtom(s->ctx, f->atom);
+                f->atom = JS_ATOM_NULL;
+                goto fio_fail;
+            }
+            if (js_define_var(s, f->atom, f->st_tok)) {
+                JS_FreeAtom(s->ctx, f->atom);
+                f->atom = JS_ATOM_NULL;
+                goto fio_fail;
+            }
+            if (f->st_tok == TOK_USING) {
+                /* the for-of head opens its own per-iteration f->scope, so this binding is never program-level */
+                int value_idx = s->cur_func->var_count - 1;
+                DCHECK(!js_decl_is_program_level(s->cur_func),
+                       "a for-of `using` head must be inside its own iteration f->scope, never at the program body f->scope");
+                int mi = add_scope_var(ctx, s->cur_func, JS_ATOM__using_dispose_,
+                                       JS_VAR_USING_METHOD);
+                if (mi < 0) {
+                    JS_FreeAtom(s->ctx, f->atom);
+                f->atom = JS_ATOM_NULL;
+                    goto fio_fail;
+                }
+                s->cur_func->vars[mi].is_lexical = 1;
+                s->cur_func->vars[mi].is_const = 1;
+                if (add_using_decl(ctx, s->cur_func, value_idx, false, mi, f->st_b3) < 0) {
+                    JS_FreeAtom(s->ctx, f->atom);
+                f->atom = JS_ATOM_NULL;
+                    goto fio_fail;
+                }
+                emit_op(s, OP_using_check);
+                emit_u8(s, f->st_b3);
+                emit_op(s, OP_put_loc);
+                emit_u16(s, mi);
+            }
+            init = (f->st_tok == TOK_CONST || f->st_tok == TOK_LET || f->st_tok == TOK_USING);
+            emit_op(s, init ? OP_scope_put_var_init : OP_scope_put_var);
+            emit_atom(s, f->atom);
+            emit_u16(s, s->cur_func->scope_level);
+            if (f->st_tok == TOK_USING) {
+                if (!s->cur_func->scopes[s->cur_func->scope_level].has_using) {
+                    s->cur_func->scopes[s->cur_func->scope_level].has_using = 1;
+                    s->cur_func->scopes[s->cur_func->scope_level].using_label_catch = new_label(s);
+                    s->cur_func->scopes[s->cur_func->scope_level].using_label_end = new_label(s);
+                }
+            }
+        }
+    } else if (!f->st_is_async && token_is_pseudo_keyword(s, JS_ATOM_async) && peek_token(s, false) == TOK_OF) {
+        { js_parse_error(s, "'for of' expression cannot start with 'async'"); goto fio_fail; }
+    } else {
+        int skip_bits;
+        if ((s->token.val == '[' || s->token.val == '{')
+        &&  ((f->st_bits = js_parse_skip_parens_token(s, &skip_bits, false)) == TOK_IN || f->st_bits == TOK_OF)) {
+            if (js_parse_destructuring_element(s, 0, false, true, skip_bits & SKIP_HAS_ELLIPSIS, true, false) < 0)
+                goto fio_fail;
+        } else {
+            int lvalue_label;
+            PD_CALL(PDS_POSTFIX, 0, PF_POSTFIX_CALL, 0, PDS_FIO_01);
+ fio_01:
+            if (pd_ret)
+                goto fio_fail;
+            if (get_lvalue(s, &f->opcode, &f->scope, &f->atom, &lvalue_label,
+                           NULL, false, TOK_FOR))
+                goto fio_fail;
+            put_lvalue(s, f->opcode, f->scope, f->atom, lvalue_label,
+                       PUT_LVALUE_NOKEEP_BOTTOM, false);
+        }
+        f->atom = JS_ATOM_NULL;
+    }
+    emit_goto(s, OP_goto, f->st_lbl_d);
+
+    f->st_pos_b = s->cur_func->byte_code.size;
+    emit_label(s, f->st_lbl_b);
+    if (s->token.val == '=') {
+        /* XXX: potential scoping issue if inside `with` statement */
+        f->st_flag = true;
+        /* parse and evaluate initializer prior to evaluating the
+           object (only used with "for in" with a non lexical variable
+           in non strict mode */
+        if (next_token(s))
+            goto fio_fail;   /* fio_fail releases f->atom */
+        PD_CALL(PDS_ASGN, 0, 0, 0, PDS_FIO_05);
+ fio_05:
+        if (pd_ret)
+            goto fio_fail;
+        if (f->atom != JS_ATOM_NULL) {
+            /* B.3.5's `for ( var BindingIdentifier Initializer in Expression )` names an anonymous initializer
+               after the binding, exactly as an ordinary `var x = function(){}` does — its step 3 is
+               NamedEvaluation with bindingId. This head is parsed by its own function and had no such step, so
+               `for (var forInHead = function(){} in {})` left the function's name "". */
+            set_object_name(s, f->atom);
+            emit_op(s, OP_scope_put_var);
+            emit_atom(s, f->atom);
+            emit_u16(s, s->cur_func->scope_level);
+        }
+    }
+    /* The head's binding name is done here — and the FRAME has to stop owning it, not merely release it.
+       Leaving a dangling atom in the slot pops the frame with it and the PD_RET DCHECK aborts, which is how
+       this was found. */
+    JS_FreeAtom(ctx, f->atom);
+    f->atom = JS_ATOM_NULL;
+
+    if (token_is_pseudo_keyword(s, JS_ATOM_of)) {
+        f->st_b1 = true;
+        if (f->st_flag)
+            goto initializer_error;
+    } else if (s->token.val == TOK_IN) {
+        if (f->st_is_async)
+            { js_parse_error(s, "'for await' loop should be used with 'of'"); goto fio_fail; }
+        if (f->st_tok == TOK_USING)
+            { js_parse_error(s, "using declaration not allowed in for-in"); goto fio_fail; }
+        if (f->st_flag &&
+            (f->st_tok != TOK_VAR || s->cur_func->is_strict_mode || f->st_b2)) {
+        initializer_error:
+            PD_RET_ERR(s, "a declaration in the head of a for-%s loop can't have an initializer",
+                                  f->st_b1 ? "of" : "in");
+        }
+    } else {
+        { js_parse_error(s, "expected 'of' or 'in' in for control expression"); goto fio_fail; }
+    }
+    if (next_token(s))
+        goto fio_fail;
+    if (f->st_b1) {
+        PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_FIO_02);
+ fio_02:
+        if (pd_ret)
+            goto fio_fail;
+    } else {
+        PD_CALL(PDS_EXPR2, 0, PF_IN_ACCEPTED, 0, PDS_FIO_03);
+ fio_03:
+        if (pd_ret)
+            goto fio_fail;
+    }
+    /* close the f->scope after having evaluated the expression so that
+       the TDZ values are in the closures */
+    close_scopes(s, s->cur_func->scope_level, f->st_scope_a);
+    if (f->st_b1) {
+        /* set has_iterator after the iterable expression is parsed so
+           that a yield in the expression does not try to close a
+           not-yet-created iterator */
+        f->st_be.has_iterator = true;
+        f->st_be.is_async_iterator = f->st_is_async;
+        f->st_be.drop_count += 2;
+        if (f->st_is_async)
+            emit_op(s, OP_for_await_of_start);
+        else
+            emit_op(s, OP_for_of_start);
+        /* on stack: enum_rec */
+    } else {
+        emit_op(s, OP_for_in_start);
+        /* on stack: enum_obj */
+    }
+    emit_goto(s, OP_goto, f->st_lbl_c);
+
+    if (js_parse_expect(s, ')'))
+        goto fio_fail;
+
+    {
+        /* move the `next` code here */
+        DynBuf *bc = &s->cur_func->byte_code;
+        int chunk_size = f->st_pos_b - f->st_pos_a;
+        int offset = bc->size - f->st_pos_a;
+        int i;
+        if (dbuf_claim(bc, chunk_size))
+            goto fio_fail;
+        dbuf_put(bc, bc->buf + f->st_pos_a, chunk_size);
+        memset(bc->buf + f->st_pos_a, OP_nop, chunk_size);
+        /* `next` part ends with a goto */
+        s->cur_func->last_opcode_pos = bc->size - 5;
+        /* relocate labels */
+        for (i = f->st_lbl_c; i < s->cur_func->label_count; i++) {
+            LabelSlot *ls = &s->cur_func->label_slots[i];
+            if (ls->pos >= f->st_pos_a && ls->pos < f->st_pos_b)
+                ls->pos += offset;
+        }
+    }
+
+    emit_label(s, f->st_lbl_d);
+    {
+        /* These two were DECLARATIONS WITH INITIALIZERS in the recursive body, and moving a local to the frame
+           deletes the declaration — taking the initializer with it. PD_INIT settles constants, but a value
+           read out of the parse state has to be re-established explicitly. Losing them made a `for await
+           (using …)` skip disposal at the end of each iteration. */
+        f->comma = s->cur_func->scopes[s->cur_func->scope_level].has_using;
+        f->st_scope_b = s->cur_func->scope_level;
+        f->need_length = false;
+
+        if (f->comma) {
+            emit_goto(s, OP_catch, s->cur_func->scopes[f->st_scope_b].using_label_catch);
+            push_break_entry(s->cur_func, &f->st_be2, JS_ATOM_NULL, -1, -1, 1);
+            f->st_be2.has_using = true;
+            f->st_be2.using_scope_level = f->st_scope_b;
+            f->need_length = 1;
+        }
+
+        PD_CALL(PDS_SOD, 0, 0, 0, PDS_FIO_04);
+ fio_04:
+        if (pd_ret)
+            goto fio_fail;
+
+        if (f->need_length) {
+            pop_break_entry(s->cur_func);
+        }
+
+        if (f->comma && js_is_live_code(s)) {
+            emit_op(s, OP_drop);
+            emit_op(s, OP_using_dispose_init);
+            emit_op(s, OP_dispose_scope);
+            emit_u16(s, f->st_scope_b);
+            emit_op(s, OP_using_dispose_end);
+            emit_goto(s, OP_goto,
+                      s->cur_func->scopes[f->st_scope_b].using_label_end);
+        }
+
+        if (f->comma) {
+            emit_label(s, s->cur_func->scopes[f->st_scope_b].using_label_catch);
+            emit_op(s, OP_dispose_scope);
+            emit_u16(s, f->st_scope_b);
+            emit_op(s, OP_throw);
+
+            emit_label(s, s->cur_func->scopes[f->st_scope_b].using_label_end);
+        }
+    }
+
+    close_scopes(s, s->cur_func->scope_level, f->st_scope_a);
+
+    emit_label(s, f->st_lbl_c);
+    if (f->st_b1) {
+        if (f->st_is_async) {
+            /* 14.7.5.7 ForIn/OfBodyEvaluation steps 3.a-3.d are `?`, NOT a try region: an abrupt completion from
+               the HEAD — a rejected next(), a non-object result, a throwing done/value getter — returns without
+               AsyncIteratorClose, because the iterator is already finished. The enum_rec's catch offset 0 on the
+               stack would close it anyway (returnCount 2 where the spec says 1), so the head runs under its own
+               catch offset whose handler DROPS the enum_rec before rethrowing. The sync path reaches the same
+               result in C, by clearing the enum_rec's iterator slot. */
+            int label_head_abrupt = new_label(s);
+            int label_head_ok;
+            /* call the next method */
+            /* stack: iter_obj next catch_offset */
+            emit_op(s, OP_dup3);
+            emit_op(s, OP_drop);
+            emit_op(s, OP_call_method);
+            emit_u16(s, 0);
+            emit_goto(s, OP_catch, label_head_abrupt);
+            emit_op(s, OP_swap);        /* stack: … catch_offset(head) promise */
+            /* get the result of the promise */
+            emit_op(s, OP_await);
+            emit_op(s, OP_swap);
+            emit_op(s, OP_drop);        /* the head settled: its catch offset is done with */
+            /* unwrap the value and done values */
+            emit_op(s, OP_iterator_get_value_done);
+            label_head_ok = emit_goto(s, OP_goto, -1);
+            emit_label(s, label_head_abrupt);
+            /* stack: iter_obj next catch_offset(loop) exception — drop the whole enum_rec so the unwind finds no
+               catch offset 0 for this loop, then rethrow into whatever encloses it. */
+            emit_op(s, OP_nip);
+            emit_op(s, OP_nip);
+            emit_op(s, OP_nip);
+            emit_op(s, OP_throw);
+            emit_label(s, label_head_ok);
+        } else {
+            emit_op(s, OP_for_of_next);
+            emit_u8(s, 0);
+        }
+    } else {
+        emit_op(s, OP_for_in_next);
+    }
+    /* on stack: enum_rec / enum_obj value bool */
+    emit_goto(s, OP_if_false, f->st_lbl_a);
+    /* drop the undefined value from for_xx_next */
+    emit_op(s, OP_drop);
+    if (f->st_b1 && f->st_is_async) {
+        /* EXHAUSTED: 14.7.5.7 step 3.e.i returns without any close — the iterator is already finished. The sync
+           path reaches that by clearing the enum_rec's iterator slot inside OP_for_of_next, which is what makes
+           OP_iterator_close a no-op below; the async head has no such step, so the loop leaves here directly.
+           Falling through to the close instead ran AsyncIteratorClose on an exhausted iterator: one extra
+           PromiseResolve for the wrapper's synthesised result and one more for the Await, which is exactly the
+           tick and constructor-lookup count ticks-with-sync-iter-resolved-promise-and-constructor-lookup pins. */
+        emit_op(s, OP_drop);   /* the catch offset */
+        emit_op(s, OP_drop);   /* the `next` method */
+        emit_op(s, OP_drop);   /* the iterator */
+        f->label2 = emit_goto(s, OP_goto, -1);
+    }
+
+    emit_label(s, f->label1);
+    if (f->st_b1) {
+        /* close and drop enum_rec */
+        emit_source_loc_at(s, f->st_line, f->st_col);
+        if (f->st_is_async)
+            emit_async_iterator_close(s);
+        else
+            emit_op(s, OP_iterator_close);
+    } else {
+        emit_op(s, OP_drop);
+    }
+    if (f->label2 != -1)
+        emit_label(s, f->label2);
+    pop_break_entry(s->cur_func);
+    pop_scope(s);
+    goto fio_done;
+ fio_done:
+    PD_RET(0);
+ fio_fail:
+    JS_FreeAtom(ctx, f->atom);
+    f->atom = JS_ATOM_NULL;
+    PD_RET(-1);
+
  done:
     goto leave;
 
@@ -49842,6 +50264,8 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
 #undef PD_CALL
 #undef PD_RET
 #undef PD_RET_ERR
+#undef PD_CALL_AT
+#undef PD_INIT
 #undef PD_FRAME
 #undef PD_CHUNK
 #undef PD_CHUNK_BITS
@@ -50147,377 +50571,6 @@ static int is_using(JSParseState *s, bool is_for_of)
 
 /* XXX: handle IteratorClose when exiting the loop before the
    enumeration is done */
-static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
-                                          bool is_async,
-                                          int source_line_num,
-                                          int source_col_num)
-{
-    JSContext *ctx = s->ctx;
-    JSFunctionDef *fd = s->cur_func;
-    JSAtom var_name;
-    bool has_initializer, is_for_of, has_destructuring;
-    int tok, tok1, opcode, scope, block_scope_level;
-    int label_next, label_expr, label_cont, label_body, label_break;
-    int label_done_noclose = -1;   /* a `for await` that ends EXHAUSTED performs no close (14.7.5.7 step 3.e.i) */
-    int pos_next, pos_expr;
-    BlockEnv break_entry;
-
-    has_initializer = false;
-    has_destructuring = false;
-    is_for_of = false;
-    block_scope_level = fd->scope_level;
-    label_cont = new_label(s);
-    label_body = new_label(s);
-    label_break = new_label(s);
-    label_next = new_label(s);
-
-    /* create scope for the lexical variables declared in the enumeration
-       expressions. XXX: Not completely correct because of weird capturing
-       semantics in `for (i of o) a.push(function(){return i})` */
-    push_scope(s);
-
-    /* local for_in scope starts here so individual elements
-       can be closed in statement. */
-    push_break_entry(s->cur_func, &break_entry,
-                     label_name, label_break, label_cont, 1);
-    break_entry.scope_level = block_scope_level;
-
-    label_expr = emit_goto(s, OP_goto, -1);
-
-    pos_next = s->cur_func->byte_code.size;
-    emit_label(s, label_next);
-
-    tok = s->token.val;
-    switch (is_let(s, DECL_MASK_OTHER)) {
-    case true:
-        tok = TOK_LET;
-        break;
-    case false:
-        break;
-    default:
-        return -1;
-    }
-    bool is_await_using = false;
-    if (tok == TOK_AWAIT) {
-        int u;
-        if (next_token(s))
-            return -1;
-        u = is_using(s, false);
-        if (u < 0)
-            return -1;
-        if (!u)
-            return js_parse_error(s, "'using' expected");
-        tok = TOK_USING;
-        is_await_using = true;
-        s->cur_func->has_await = true;
-    } else if (token_is_pseudo_keyword(s, JS_ATOM_using)) {
-        int u = is_using(s, true);
-        if (u < 0)
-            return -1;
-        if (u)
-            tok = TOK_USING;
-    }
-    if (tok == TOK_VAR || tok == TOK_LET || tok == TOK_CONST || tok == TOK_USING) {
-        if (next_token(s))
-            return -1;
-
-        if (!(s->token.val == TOK_IDENT && !s->token.u.ident.is_reserved)) {
-            if (s->token.val == '[' || s->token.val == '{') {
-                if (js_parse_destructuring_element(s, tok, false, true, -1, false, false) < 0)
-                    return -1;
-                has_destructuring = true;
-            } else {
-                return js_parse_error(s, "variable name expected");
-            }
-            var_name = JS_ATOM_NULL;
-        } else {
-            bool init;
-            var_name = JS_DupAtom(ctx, s->token.u.ident.atom);
-            if (var_name == JS_ATOM_let &&
-                (tok == TOK_LET || tok == TOK_CONST || tok == TOK_USING)) {
-                JS_FreeAtom(s->ctx, var_name);
-                return js_parse_error(s, "'let' is not a valid lexical identifier");
-            }
-            if (next_token(s)) {
-                JS_FreeAtom(s->ctx, var_name);
-                return -1;
-            }
-            if (js_define_var(s, var_name, tok)) {
-                JS_FreeAtom(s->ctx, var_name);
-                return -1;
-            }
-            if (tok == TOK_USING) {
-                /* the for-of head opens its own per-iteration scope, so this binding is never program-level */
-                int value_idx = fd->var_count - 1;
-                DCHECK(!js_decl_is_program_level(fd),
-                       "a for-of `using` head must be inside its own iteration scope, never at the program body scope");
-                int mi = add_scope_var(ctx, fd, JS_ATOM__using_dispose_,
-                                       JS_VAR_USING_METHOD);
-                if (mi < 0) {
-                    JS_FreeAtom(s->ctx, var_name);
-                    return -1;
-                }
-                fd->vars[mi].is_lexical = 1;
-                fd->vars[mi].is_const = 1;
-                if (add_using_decl(ctx, fd, value_idx, false, mi, is_await_using) < 0) {
-                    JS_FreeAtom(s->ctx, var_name);
-                    return -1;
-                }
-                emit_op(s, OP_using_check);
-                emit_u8(s, is_await_using);
-                emit_op(s, OP_put_loc);
-                emit_u16(s, mi);
-            }
-            init = (tok == TOK_CONST || tok == TOK_LET || tok == TOK_USING);
-            emit_op(s, init ? OP_scope_put_var_init : OP_scope_put_var);
-            emit_atom(s, var_name);
-            emit_u16(s, fd->scope_level);
-            if (tok == TOK_USING) {
-                if (!fd->scopes[fd->scope_level].has_using) {
-                    fd->scopes[fd->scope_level].has_using = 1;
-                    fd->scopes[fd->scope_level].using_label_catch = new_label(s);
-                    fd->scopes[fd->scope_level].using_label_end = new_label(s);
-                }
-            }
-        }
-    } else if (!is_async && token_is_pseudo_keyword(s, JS_ATOM_async) && peek_token(s, false) == TOK_OF) {
-        return js_parse_error(s, "'for of' expression cannot start with 'async'");
-    } else {
-        int skip_bits;
-        if ((s->token.val == '[' || s->token.val == '{')
-        &&  ((tok1 = js_parse_skip_parens_token(s, &skip_bits, false)) == TOK_IN || tok1 == TOK_OF)) {
-            if (js_parse_destructuring_element(s, 0, false, true, skip_bits & SKIP_HAS_ELLIPSIS, true, false) < 0)
-                return -1;
-        } else {
-            int lvalue_label;
-            if (js_parse_descent(s, PDS_POSTFIX, 0, PF_POSTFIX_CALL, 0))
-                return -1;
-            if (get_lvalue(s, &opcode, &scope, &var_name, &lvalue_label,
-                           NULL, false, TOK_FOR))
-                return -1;
-            put_lvalue(s, opcode, scope, var_name, lvalue_label,
-                       PUT_LVALUE_NOKEEP_BOTTOM, false);
-        }
-        var_name = JS_ATOM_NULL;
-    }
-    emit_goto(s, OP_goto, label_body);
-
-    pos_expr = s->cur_func->byte_code.size;
-    emit_label(s, label_expr);
-    if (s->token.val == '=') {
-        /* XXX: potential scoping issue if inside `with` statement */
-        has_initializer = true;
-        /* parse and evaluate initializer prior to evaluating the
-           object (only used with "for in" with a non lexical variable
-           in non strict mode */
-        if (next_token(s) || js_parse_descent(s, PDS_ASGN, 0, 0, 0)) {
-            JS_FreeAtom(ctx, var_name);
-            return -1;
-        }
-        if (var_name != JS_ATOM_NULL) {
-            /* B.3.5's `for ( var BindingIdentifier Initializer in Expression )` names an anonymous initializer
-               after the binding, exactly as an ordinary `var x = function(){}` does — its step 3 is
-               NamedEvaluation with bindingId. This head is parsed by its own function and had no such step, so
-               `for (var forInHead = function(){} in {})` left the function's name "". */
-            set_object_name(s, var_name);
-            emit_op(s, OP_scope_put_var);
-            emit_atom(s, var_name);
-            emit_u16(s, fd->scope_level);
-        }
-    }
-    JS_FreeAtom(ctx, var_name);
-
-    if (token_is_pseudo_keyword(s, JS_ATOM_of)) {
-        is_for_of = true;
-        if (has_initializer)
-            goto initializer_error;
-    } else if (s->token.val == TOK_IN) {
-        if (is_async)
-            return js_parse_error(s, "'for await' loop should be used with 'of'");
-        if (tok == TOK_USING)
-            return js_parse_error(s, "using declaration not allowed in for-in");
-        if (has_initializer &&
-            (tok != TOK_VAR || fd->is_strict_mode || has_destructuring)) {
-        initializer_error:
-            return js_parse_error(s, "a declaration in the head of a for-%s loop can't have an initializer",
-                                  is_for_of ? "of" : "in");
-        }
-    } else {
-        return js_parse_error(s, "expected 'of' or 'in' in for control expression");
-    }
-    if (next_token(s))
-        return -1;
-    if (is_for_of) {
-        if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
-            return -1;
-    } else {
-        if (js_parse_descent(s, PDS_EXPR2, 0, PF_IN_ACCEPTED, 0))
-            return -1;
-    }
-    /* close the scope after having evaluated the expression so that
-       the TDZ values are in the closures */
-    close_scopes(s, s->cur_func->scope_level, block_scope_level);
-    if (is_for_of) {
-        /* set has_iterator after the iterable expression is parsed so
-           that a yield in the expression does not try to close a
-           not-yet-created iterator */
-        break_entry.has_iterator = true;
-        break_entry.is_async_iterator = is_async;
-        break_entry.drop_count += 2;
-        if (is_async)
-            emit_op(s, OP_for_await_of_start);
-        else
-            emit_op(s, OP_for_of_start);
-        /* on stack: enum_rec */
-    } else {
-        emit_op(s, OP_for_in_start);
-        /* on stack: enum_obj */
-    }
-    emit_goto(s, OP_goto, label_cont);
-
-    if (js_parse_expect(s, ')'))
-        return -1;
-
-    {
-        /* move the `next` code here */
-        DynBuf *bc = &s->cur_func->byte_code;
-        int chunk_size = pos_expr - pos_next;
-        int offset = bc->size - pos_next;
-        int i;
-        if (dbuf_claim(bc, chunk_size))
-            return -1;
-        dbuf_put(bc, bc->buf + pos_next, chunk_size);
-        memset(bc->buf + pos_next, OP_nop, chunk_size);
-        /* `next` part ends with a goto */
-        s->cur_func->last_opcode_pos = bc->size - 5;
-        /* relocate labels */
-        for (i = label_cont; i < s->cur_func->label_count; i++) {
-            LabelSlot *ls = &s->cur_func->label_slots[i];
-            if (ls->pos >= pos_next && ls->pos < pos_expr)
-                ls->pos += offset;
-        }
-    }
-
-    emit_label(s, label_body);
-    {
-        bool scope_has_using = fd->scopes[fd->scope_level].has_using;
-        int using_scope_level = fd->scope_level;
-        BlockEnv using_be;
-        int had_using_be = 0;
-
-        if (scope_has_using) {
-            emit_goto(s, OP_catch, fd->scopes[using_scope_level].using_label_catch);
-            push_break_entry(fd, &using_be, JS_ATOM_NULL, -1, -1, 1);
-            using_be.has_using = true;
-            using_be.using_scope_level = using_scope_level;
-            had_using_be = 1;
-        }
-
-        if (js_parse_descent(s, PDS_SOD, 0, 0, 0))
-            return -1;
-
-        if (had_using_be) {
-            pop_break_entry(fd);
-        }
-
-        if (scope_has_using && js_is_live_code(s)) {
-            emit_op(s, OP_drop);
-            emit_op(s, OP_using_dispose_init);
-            emit_op(s, OP_dispose_scope);
-            emit_u16(s, using_scope_level);
-            emit_op(s, OP_using_dispose_end);
-            emit_goto(s, OP_goto,
-                      fd->scopes[using_scope_level].using_label_end);
-        }
-
-        if (scope_has_using) {
-            emit_label(s, fd->scopes[using_scope_level].using_label_catch);
-            emit_op(s, OP_dispose_scope);
-            emit_u16(s, using_scope_level);
-            emit_op(s, OP_throw);
-
-            emit_label(s, fd->scopes[using_scope_level].using_label_end);
-        }
-    }
-
-    close_scopes(s, s->cur_func->scope_level, block_scope_level);
-
-    emit_label(s, label_cont);
-    if (is_for_of) {
-        if (is_async) {
-            /* 14.7.5.7 ForIn/OfBodyEvaluation steps 3.a-3.d are `?`, NOT a try region: an abrupt completion from
-               the HEAD — a rejected next(), a non-object result, a throwing done/value getter — returns without
-               AsyncIteratorClose, because the iterator is already finished. The enum_rec's catch offset 0 on the
-               stack would close it anyway (returnCount 2 where the spec says 1), so the head runs under its own
-               catch offset whose handler DROPS the enum_rec before rethrowing. The sync path reaches the same
-               result in C, by clearing the enum_rec's iterator slot. */
-            int label_head_abrupt = new_label(s);
-            int label_head_ok;
-            /* call the next method */
-            /* stack: iter_obj next catch_offset */
-            emit_op(s, OP_dup3);
-            emit_op(s, OP_drop);
-            emit_op(s, OP_call_method);
-            emit_u16(s, 0);
-            emit_goto(s, OP_catch, label_head_abrupt);
-            emit_op(s, OP_swap);        /* stack: … catch_offset(head) promise */
-            /* get the result of the promise */
-            emit_op(s, OP_await);
-            emit_op(s, OP_swap);
-            emit_op(s, OP_drop);        /* the head settled: its catch offset is done with */
-            /* unwrap the value and done values */
-            emit_op(s, OP_iterator_get_value_done);
-            label_head_ok = emit_goto(s, OP_goto, -1);
-            emit_label(s, label_head_abrupt);
-            /* stack: iter_obj next catch_offset(loop) exception — drop the whole enum_rec so the unwind finds no
-               catch offset 0 for this loop, then rethrow into whatever encloses it. */
-            emit_op(s, OP_nip);
-            emit_op(s, OP_nip);
-            emit_op(s, OP_nip);
-            emit_op(s, OP_throw);
-            emit_label(s, label_head_ok);
-        } else {
-            emit_op(s, OP_for_of_next);
-            emit_u8(s, 0);
-        }
-    } else {
-        emit_op(s, OP_for_in_next);
-    }
-    /* on stack: enum_rec / enum_obj value bool */
-    emit_goto(s, OP_if_false, label_next);
-    /* drop the undefined value from for_xx_next */
-    emit_op(s, OP_drop);
-    if (is_for_of && is_async) {
-        /* EXHAUSTED: 14.7.5.7 step 3.e.i returns without any close — the iterator is already finished. The sync
-           path reaches that by clearing the enum_rec's iterator slot inside OP_for_of_next, which is what makes
-           OP_iterator_close a no-op below; the async head has no such step, so the loop leaves here directly.
-           Falling through to the close instead ran AsyncIteratorClose on an exhausted iterator: one extra
-           PromiseResolve for the wrapper's synthesised result and one more for the Await, which is exactly the
-           tick and constructor-lookup count ticks-with-sync-iter-resolved-promise-and-constructor-lookup pins. */
-        emit_op(s, OP_drop);   /* the catch offset */
-        emit_op(s, OP_drop);   /* the `next` method */
-        emit_op(s, OP_drop);   /* the iterator */
-        label_done_noclose = emit_goto(s, OP_goto, -1);
-    }
-
-    emit_label(s, label_break);
-    if (is_for_of) {
-        /* close and drop enum_rec */
-        emit_source_loc_at(s, source_line_num, source_col_num);
-        if (is_async)
-            emit_async_iterator_close(s);
-        else
-            emit_op(s, OP_iterator_close);
-    } else {
-        emit_op(s, OP_drop);
-    }
-    if (label_done_noclose != -1)
-        emit_label(s, label_done_noclose);
-    pop_break_entry(s->cur_func);
-    pop_scope(s);
-    return 0;
-}
-
 static void set_eval_ret_undefined(JSParseState *s)
 {
     if (s->cur_func->eval_ret_idx >= 0) {
