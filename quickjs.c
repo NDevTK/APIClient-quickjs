@@ -46445,6 +46445,11 @@ struct JSParseFrame {
        outer's to JS_UNDEFINED. Ownership matches the recursive body: template_object is released after
        emit_push_const, raw_array's passes to JS_DefinePropertyValue. */
     JSValue raw_array, template_object;
+    /* ObjectLiteral: where the current property STARTS, for the method's source text. Live across the
+       PropertyName descent, because a computed key `[ { a(){} }.a ]` is an expression that can contain another
+       object literal with methods of its own. */
+    const uint8_t *start_ptr;
+    int     start_line, start_col;
 };
 typedef struct JSParseFrame JSParseFrame;
 
@@ -46503,11 +46508,6 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
        genuinely private; the depth never is. */
     int base = s->pd_sp, pd_ret = 0;
     int tok, opcode = 0, drop_count = 0;
-    /* ObjectLiteral scratch. NOT live across a PD_CALL — start_* are consumed by the method's
-       js_parse_function_decl (a nested ACTIVATION with its own locals) and prop_type by the branch that
-       follows it, both before any descent from this frame. */
-    const uint8_t *start_ptr = NULL;
-    int start_line = 0, start_col = 0;
     /* The out-parameter, delivered exactly like pd_ret: a production writes it as it returns and the resume
        label reads it immediately. Published to s->pd_name on the way out for C callers. */
     JSAtom out_name = JS_ATOM_NULL;
@@ -46534,6 +46534,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         f->arr_idx = 0; f->need_length = false; f->has_proto = false;            \
         f->prop_type = 0; f->is_private = 0;                                     \
         f->raw_array = JS_UNDEFINED; f->template_object = JS_UNDEFINED;          \
+        f->start_ptr = NULL; f->start_line = 0; f->start_col = 0;                \
         goto dispatch;                                                          \
     } while (0)
 /* A descent: record where THIS frame continues, then push the callee's. */
@@ -48237,9 +48238,9 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     f->has_proto = false;
     while (s->token.val != '}') {
         /* specific case for getter/setter */
-        start_ptr = s->token.ptr;
-        start_line = s->token.line_num;
-        start_col = s->token.col_num;
+        f->start_ptr = s->token.ptr;
+        f->start_line = s->token.line_num;
+        f->start_col = s->token.col_num;
 
         if (s->token.val == TOK_ELLIPSIS) {
             if (next_token(s))
@@ -48291,7 +48292,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                     func_kind = JS_FUNC_ASYNC_GENERATOR;
             }
             if (js_parse_function_decl(s, func_type, func_kind, JS_ATOM_NULL,
-                                       start_ptr, start_line, start_col, PF_IN_ACCEPTED))
+                                       f->start_ptr, f->start_line, f->start_col, PF_IN_ACCEPTED))
                 goto obj_fail;
             if (f->atom == JS_ATOM_NULL) {
                 emit_op(s, OP_define_method_computed);
