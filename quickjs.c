@@ -43307,16 +43307,17 @@ static JSAtom json_parse_ident(JSParseState *s, const uint8_t **pp, int c)
     return atom;
 }
 
+/* NO STACK GUARD, for the same reason next_token has none: the recursion it stood in front of is gone.
+   JSON's value grammar is json_parse_step's explicit frame stack, so the C depth here is a constant no input
+   picks — `JSON.parse("[".repeat(1e6) + "1" + "]".repeat(1e6))` parses and round-trips to depth 1000000.
+   A guard over a flattened recursion is not caution, it is a BOUND that survived its cause: it can only ever
+   convert a depth the grammar answers into a RangeError, and deleting it is what makes the flat-stack claim
+   falsifiable — a path that still recursed here would now crash at whatever recursed. */
 static __exception int json_next_token(JSParseState *s)
 {
     const uint8_t *p, *p_next;
     int c;
     JSAtom atom;
-
-    if (js_check_stack_overflow(s->ctx->rt, 1000)) {
-        JS_ThrowStackOverflow(s->ctx);
-        return -1;
-    }
 
     json_free_token(s, &s->token);
 
