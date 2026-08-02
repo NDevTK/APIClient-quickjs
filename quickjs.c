@@ -12726,6 +12726,14 @@ static JSValue JS_ToPrimitiveFree(JSContext *ctx, JSValue val, int hint)
     JSValue method, ret;
     if (JS_VALUE_GET_TAG(val) != JS_TAG_OBJECT)
         return val;
+    /* 7.1.1 OVER A CONCOLIC: it IS what ToPrimitive produces. A concolic stands for unknown EXTERNAL INPUT — a
+       string off location.hash, a field of a reply — which is PRIMITIVE in the page and wears an object only
+       because the solver needs a carrier with an exotic [[Get]]. Reading @@toPrimitive off it instead gets a
+       DERIVED concolic back from that [[Get]] and calls it, which throws "toPrimitive is not a function" inside
+       an expression the page never wrote. Safe to hand back precisely because the conversion boundary above
+       asserts a concolic never reaches it — this cannot become an infinite coercion. */
+    if (g_concolic.is && g_concolic.is(val))
+        return val;
     force_ordinary = hint & HINT_FORCE_ORDINARY;
     hint &= ~HINT_FORCE_ORDINARY;
     if (!force_ordinary) {
@@ -14547,6 +14555,24 @@ static JSValue JS_ToNumberHintFree(JSContext *ctx, JSValue val,
         ret = JS_NAN;
         break;
     case JS_TAG_OBJECT:
+        /* THE CONVERSION CONTRACT (the twin assert is in JS_ToStringInternal). ToNumber and ToString are the C
+           BOUNDARY: every caller — a URL built in C, a property atom, a printf — needs a REAL primitive back,
+           and a concolic cannot be one. So this boundary stays total and honest, and a CONCOLIC MUST NEVER
+           REACH IT: the operator above must have answered with the concolic hooks (.add / .cmp / .rel) before
+           converting, because opacity has to SURVIVE the coercion or the value stops forking control flow.
+           Asserted HERE rather than at the eighteen coercion sites, because this is the one place all of them
+           funnel into — an operator with no concolic semantics yet crashes naming ToNumber instead of looping
+           forever (ToPrimitive hands a concolic straight back, which is an infinite coercion) or silently
+           collapsing to NaN. Where C genuinely wants a concrete projection of a concolic it asks EXPLICITLY —
+           concolic_shape_c for a DOM text node's bytes, concolic_example for a learned value — never implicitly
+           through a coercion. In release the DCHECK is gone and the throw is what keeps it from looping. */
+        if (unlikely(g_concolic.is && g_concolic.is(val))) {
+            DCHECK(0, "ToNumber over a CONCOLIC operand — arithmetic on unknown external input has no concolic "
+                      "semantics yet. Build it in the operator (a derived concolic, the way .add and .rel "
+                      "already answer), never by converting here: this boundary owes C a real number.");
+            JS_FreeValue(ctx, val);
+            return JS_ThrowTypeError(ctx, "arithmetic over unknown external input is not modelled yet");
+        }
         val = JS_ToPrimitiveFree(ctx, val, HINT_NUMBER);
         if (JS_IsException(val))
             return JS_EXCEPTION;
@@ -15193,6 +15219,14 @@ static JSValue JS_ToStringInternal(JSContext *ctx, JSValueConst val,
             return js_new_string8(ctx, "{}");
         } else {
             JSValue val1, ret;
+            /* The ToNumber boundary's twin — see the contract stated there. A concolic must not arrive: the
+               operator owed it a concolic result, and this function owes C a real string. */
+            if (unlikely(g_concolic.is && g_concolic.is(val))) {
+                DCHECK(0, "ToString over a CONCOLIC operand — stringifying unknown external input has no "
+                          "concolic semantics yet. Build it in the operator (a derived concolic), never by "
+                          "converting here: this boundary owes C a real string.");
+                return JS_ThrowTypeError(ctx, "stringifying unknown external input is not modelled yet");
+            }
             val1 = JS_ToPrimitive(ctx, val, HINT_STRING);
             if (JS_IsException(val1))
                 return val1;
@@ -28054,16 +28088,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (unlikely(!tp)) { JS_ThrowOutOfMemory(ctx); goto exception; }
                 tp->outer = tp_outer; tp->outer_kind = tp_outer_kind;
                 tp->obj = js_dup(tp_outer ? tp_value : sp[tp_slot]);
-                /* The other side of js_toprim_operand, asserted where the walk BEGINS rather than at each of the
-                   eighteen sites that can reach it: a concolic here means this site has no concolic semantics
-                   yet (unary arithmetic and ToNumber, a property KEY, `in`, `delete`, an import specifier, a
-                   coercing builtin). Each is a capability to BUILD — what the operator does with unknown
-                   external input — and it crashes naming itself instead of minting a concolic @@toPrimitive and
-                   throwing "not a function" inside the page's own expression. */
-                DCHECK(!(g_concolic.is && g_concolic.is(tp->obj)),
-                       "a CONCOLIC operand reached 7.1.1 ToPrimitive — this coercion site has no concolic "
-                       "semantics yet; give the operator its concolic result (the .add/.cmp hooks' shape) and "
-                       "have the site ask js_toprim_operand instead of the raw object tag");
                 DCHECK(tp_outer != NULL || tp_op_byte != NULL,
                        "an operand-mode ToPrimitive reached the tramp with no opcode byte — the site must set "
                        "tp_op_byte, which is what the delivery restores `opcode` from");
@@ -28095,6 +28119,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSAtom mname;
                 js_toprim_free_cb(ctx, tp);   /* the call that produced ret_val is finished with its operands */
                 DCHECK(!tp->reading, "a ToPrimitive method RESULT was delivered while a method read was in flight");
+                /* The C walk's rule, on the tramp: a CONCOLIC is already what ToPrimitive produces, so the walk
+                   returns it before reading anything off it. This REPLACES the assert that stood at this entry.
+                   That assert was right that the walk must not read @@toPrimitive off a concolic — it was wrong
+                   about the remedy, which is to short-circuit BEFORE the read in ONE place rather than have
+                   eighteen operators each remember to ask js_toprim_operand first. The operators that DO have
+                   concolic semantics (.add, .cmp, .rel) now reach them through a coercion site; the ones that
+                   do not crash at the conversion boundary, which names itself. */
+                if (g_concolic.is && g_concolic.is(tp->obj)) {
+                    JS_FreeValue(ctx, ret_val);
+                    ret_val = js_dup(tp->obj);
+                    goto toprim_deliver;
+                }
                 if (JS_VALUE_GET_TAG(ret_val) != JS_TAG_UNINITIALIZED) {
                     if (tp->stage == 1 && !JS_IsUninitialized(ret_val)) {
                         /* @@toPrimitive's result: 7.1.1 step 2.d — it MUST be primitive, there is no fallback.
@@ -28213,9 +28249,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         DCHECK(touter_kind == CONT_STEP, "ToPrimitive outer continuation: unknown machine kind");
                         goto do_step_step;
                     }
-                    DCHECK(JS_VALUE_GET_TAG(ret_val) != JS_TAG_OBJECT,
+                    DCHECK(JS_VALUE_GET_TAG(ret_val) != JS_TAG_OBJECT || (g_concolic.is && g_concolic.is(ret_val)),
                            "7.1.1 ToPrimitive completed with an OBJECT — the walk returned without converting, so "
-                           "every resume below is about to run the slow path on the operand it was meant to replace");
+                           "every resume below is about to run the slow path on the operand it was meant to "
+                           "replace. A CONCOLIC is the one object that IS the answer: it stands for external "
+                           "input, which is primitive in the page.");
                     JS_FreeValue(ctx, sp[slot]);
                     sp[slot] = ret_val;       /* the operand is now a primitive */
                     ret_val = JS_UNDEFINED;
