@@ -60080,6 +60080,24 @@ typedef enum BCTagEnum {
    a build-time magic number that has to be bumped for a guarantee nothing needs is scaffolding for a deleted
    system, and it made every added atom look like a wire-format change. */
 
+/* One work item. `val` is owned iff own_val — a fetched element is ours to free, a borrowed slot is not. */
+typedef struct BCWItem {
+    uint8_t  kind;
+    bool     own_val;
+    bool     flag;                /* ARR: this array is a template, so a trailing `raw` follows */
+    JSValue  val;                 /* VALUE: what to write.  ARR/OBJ: the container being iterated */
+    JSObject *objp;               /* CLEAR_MARK: whose tmp_mark to drop */
+    JSFunctionBytecode *fb;       /* CPOOL: whose constant pool is being walked */
+    struct JSMapState *map;       /* MAPENT: which map/set */
+    struct JSMapRecord *mr;       /* MAPENT: the cursor into it */
+    JSShape *sh;                  /* OBJ_PROP: the shape captured when iteration began */
+    uint32_t i, len;
+} BCWItem;
+enum {
+    BCW_VALUE, BCW_CLEAR_MARK, BCW_ARR_ELEM, BCW_ARR_RAW,
+    BCW_OBJ_PROP, BCW_CPOOL, BCW_FUNC_TAIL, BCW_MAPENT, BCW_FREE_VAL,
+};
+
 typedef struct BCWriterState {
     JSContext *ctx;
     DynBuf dbuf;
@@ -60099,6 +60117,15 @@ typedef struct BCWriterState {
     int sab_tab_size;
     /* list of referenced objects (used if allow_reference = true) */
     JSObjectList object_list;
+    /* THE SERIALISER'S WORK STACK. The writer was a nine-function recursion whose depth the WRITTEN GRAPH
+       picks — a nested array through JS_WriteObject threw between depth 5000 and 20000, measured — and the
+       js_check_stack_overflow in front of it turned a graph the format can represent into a RangeError.
+       Output is a pre-order byte stream, so a LIFO stack reproduces it exactly: pop an item, emit its header,
+       push its children so the first child pops next. Children are fetched ONE AT A TIME by re-pushing the
+       iterator with an advanced cursor, never all up front — an element getter must not run before the
+       previous element's own nested getters, which eager fetching would reorder. */
+    struct BCWItem *w_stack;
+    int w_sp, w_size;
 } BCWriterState;
 
 #ifdef ENABLE_DUMPS // JS_DUMP_READ_OBJECT
@@ -60355,6 +60382,49 @@ static int JS_WriteBigInt(BCWriterState *s, JSValueConst obj)
     return 0;
 }
 
+/* Push a work item, growing the stack. The item is taken by value; on failure it is freed here so a caller
+   never has to unwind a half-pushed item. */
+static int bcw_push(BCWriterState *s, BCWItem it)
+{
+    if (s->w_sp >= s->w_size) {
+        int n = s->w_size ? s->w_size * 2 : 16;
+        BCWItem *t = js_realloc(s->ctx, s->w_stack, sizeof(*t) * n);
+        if (!t) {
+            if (it.own_val)
+                JS_FreeValue(s->ctx, it.val);
+            return -1;
+        }
+        s->w_stack = t;
+        s->w_size = n;
+    }
+    s->w_stack[s->w_sp++] = it;
+    return 0;
+}
+
+static BCWItem bcw_val(JSValueConst v, bool own)
+{
+    BCWItem it;
+    memset(&it, 0, sizeof(it));
+    it.kind = BCW_VALUE;
+    it.val = unsafe_unconst(v);
+    it.own_val = own;
+    return it;
+}
+
+/* Drop everything still queued — the error path, where the remaining items own fetched values. */
+static void bcw_unwind(BCWriterState *s)
+{
+    while (s->w_sp > 0) {
+        BCWItem *it = &s->w_stack[--s->w_sp];
+        if (it->own_val)
+            JS_FreeValue(s->ctx, it->val);
+        /* a CLEAR_MARK still queued must still run: tmp_mark is the cycle detector and leaving it set would
+           make a LATER write of the same object claim a circular reference that is not there. */
+        if (it->kind == BCW_CLEAR_MARK)
+            it->objp->tmp_mark = 0;
+    }
+}
+
 static int JS_WriteObjectRec(BCWriterState *s, JSValueConst obj);
 
 static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
@@ -60426,13 +60496,30 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
         bc_put_leb128(s, flags);
     }
 
-    // write constant pool before code so code can be disassembled
-    // on the fly at read time
-    for(i = 0; i < b->cpool_count; i++) {
-        if (JS_WriteObjectRec(s, b->cpool[i]))
+    /* Constant pool BEFORE the code, so the code can be disassembled on the fly at read time. Both are
+       queued: the tail is pushed first so it pops after every constant's whole subtree. */
+    {
+        BCWItem tail, pool;
+        memset(&tail, 0, sizeof(tail));
+        tail.kind = BCW_FUNC_TAIL;
+        tail.fb = b;
+        if (bcw_push(s, tail))
+            goto fail;
+        memset(&pool, 0, sizeof(pool));
+        pool.kind = BCW_CPOOL;
+        pool.fb = b;
+        pool.len = b->cpool_count;
+        if (bcw_push(s, pool))
             goto fail;
     }
+    return 0;
+ fail:
+    return -1;
+}
 
+/* The half of a function record that follows its constant pool. */
+static int bcw_func_tail(BCWriterState *s, JSFunctionBytecode *b)
+{
     if (JS_WriteFunctionBytecode(s, b))
         goto fail;
 
@@ -60501,7 +60588,7 @@ static int JS_WriteModule(BCWriterState *s, JSValueConst obj)
 
     bc_put_u8(s, m->has_tla);
 
-    if (JS_WriteObjectRec(s, m->func_obj))
+    if (bcw_push(s, bcw_val(m->func_obj, false)))
         goto fail;
     return 0;
  fail:
@@ -60528,22 +60615,16 @@ static int JS_WriteArray(BCWriterState *s, JSValueConst obj)
     if (js_get_length32(s->ctx, &len, obj))
         goto fail1;
     bc_put_leb128(s, len);
-    for(i = 0; i < len; i++) {
-        val = JS_GetPropertyUint32(s->ctx, obj, i);
-        if (JS_IsException(val))
-            goto fail1;
-        ret = JS_WriteObjectRec(s, val);
-        JS_FreeValue(s->ctx, val);
-        if (ret)
-            goto fail1;
-    }
-    if (is_template) {
-        val = JS_GetProperty(s->ctx, obj, JS_ATOM_raw);
-        if (JS_IsException(val))
-            goto fail1;
-        ret = JS_WriteObjectRec(s, val);
-        JS_FreeValue(s->ctx, val);
-        if (ret)
+    /* The elements are a QUEUED iteration, one fetch per pop: JS_GetPropertyUint32 can run a getter, and
+       fetching them all here would run element i+1's getter before element i's own nested getters. */
+    {
+        BCWItem it;
+        memset(&it, 0, sizeof(it));
+        it.kind = BCW_ARR_ELEM;
+        it.val = unsafe_unconst(obj);
+        it.len = len;
+        it.flag = is_template;
+        if (bcw_push(s, it))
             goto fail1;
     }
     return 0;
@@ -60576,12 +60657,21 @@ static int JS_WriteObjectTag(BCWriterState *s, JSValueConst obj)
                 if (pass == 0) {
                     prop_count++;
                 } else {
-                    bc_put_atom(s, atom);
-                    if (JS_WriteObjectRec(s, p->prop[i].u.value))
-                        goto fail;
+                    /* pass 1 only establishes that the count is right; the writing is queued below */
                 }
             }
         }
+        if (pass == 1)
+            break;   /* the second walk is the queued one */
+    }
+    {
+        BCWItem it;
+        memset(&it, 0, sizeof(it));
+        it.kind = BCW_OBJ_PROP;
+        it.val = unsafe_unconst(obj);
+        it.sh = sh;   /* the shape the count was taken from, held exactly as the recursion held it */
+        if (bcw_push(s, it))
+            goto fail;
     }
     return 0;
  fail:
@@ -60597,7 +60687,7 @@ static int JS_WriteTypedArray(BCWriterState *s, JSValueConst obj)
     bc_put_u8(s, p->class_id - JS_CLASS_UINT8C_ARRAY);
     bc_put_leb128(s, p->u.array.count);
     bc_put_leb128(s, ta->offset);
-    if (JS_WriteObjectRec(s, JS_MKPTR(JS_TAG_OBJECT, ta->buffer)))
+    if (bcw_push(s, bcw_val(JS_MKPTR(JS_TAG_OBJECT, ta->buffer), false)))
         return -1;
     return 0;
 }
@@ -60646,14 +60736,11 @@ static int JS_WriteRegExp(BCWriterState *s, JSRegExp regexp)
 static int JS_WriteMap(BCWriterState *s, struct JSMapState *map_state);
 static int JS_WriteSet(BCWriterState *s, struct JSMapState *map_state);
 
-static int JS_WriteObjectRec(BCWriterState *s, JSValueConst obj)
+/* ONE ITEM. Emits obj's header and PUSHES whatever must follow it; it never writes a child itself, which is
+   what keeps the C stack flat. No stack guard: the depth is the stack's, not the C stack's. */
+static int bcw_step_value(BCWriterState *s, JSValueConst obj)
 {
     uint32_t tag;
-
-    if (js_check_stack_overflow(s->ctx->rt, 0)) {
-        JS_ThrowStackOverflow(s->ctx);
-        return -1;
-    }
 
     tag = JS_VALUE_GET_NORM_TAG(obj);
     switch(tag) {
@@ -60692,9 +60779,7 @@ static int JS_WriteObjectRec(BCWriterState *s, JSValueConst obj)
             str = JS_ToString(s->ctx, obj);
             if (JS_IsException(str))
                 goto fail;
-            ret = JS_WriteObjectRec(s, str);
-            JS_FreeValue(s->ctx, str);
-            if (ret)
+            if (bcw_push(s, bcw_val(str, true)))   /* takes ownership of str */
                 goto fail;
         }
         break;
@@ -60731,6 +60816,18 @@ static int JS_WriteObjectRec(BCWriterState *s, JSValueConst obj)
                     goto fail;
                 }
                 p->tmp_mark = 1;
+                /* Queued BEFORE the children so it pops AFTER all of them — the recursion cleared the mark on
+                   the way out of this object, and the whole subtree must still be inside it. */
+                {
+                    BCWItem cm;
+                    memset(&cm, 0, sizeof(cm));
+                    cm.kind = BCW_CLEAR_MARK;
+                    cm.objp = p;
+                    if (bcw_push(s, cm)) {
+                        p->tmp_mark = 0;
+                        goto fail;
+                    }
+                }
             }
             switch(p->class_id) {
             case JS_CLASS_ARRAY:
@@ -60753,14 +60850,14 @@ static int JS_WriteObjectRec(BCWriterState *s, JSValueConst obj)
                 break;
             case JS_CLASS_DATE:
                 bc_put_u8(s, BC_TAG_DATE);
-                ret = JS_WriteObjectRec(s, p->u.object_data);
+                ret = bcw_push(s, bcw_val(p->u.object_data, false));
                 break;
             case JS_CLASS_NUMBER:
             case JS_CLASS_STRING:
             case JS_CLASS_BOOLEAN:
             case JS_CLASS_BIG_INT:
                 bc_put_u8(s, BC_TAG_OBJECT_VALUE);
-                ret = JS_WriteObjectRec(s, p->u.object_data);
+                ret = bcw_push(s, bcw_val(p->u.object_data, false));
                 break;
             case JS_CLASS_MAP:
                 bc_put_u8(s, BC_TAG_MAP);
@@ -60779,7 +60876,6 @@ static int JS_WriteObjectRec(BCWriterState *s, JSValueConst obj)
                 }
                 break;
             }
-            p->tmp_mark = 0;
             if (ret)
                 goto fail;
         }
@@ -60809,6 +60905,149 @@ static int JS_WriteObjectRec(BCWriterState *s, JSValueConst obj)
     return 0;
 
  fail:
+    return -1;
+}
+
+/* THE DRIVER. One item per turn: emit, queue, pop. The C stack is flat at every depth the written graph can
+   reach, which is why the guard that used to stand here is gone — it reported the C stack's limit as if the
+   format could not represent the value. */
+static int JS_WriteObjectRec(BCWriterState *s, JSValueConst obj)
+{
+    int base = s->w_sp;
+
+    if (bcw_push(s, bcw_val(obj, false)))
+        goto fail;
+
+    while (s->w_sp > base) {
+        BCWItem it = s->w_stack[--s->w_sp];   /* popped BY VALUE: re-pushes below may move the array */
+        switch (it.kind) {
+        case BCW_VALUE:
+            {
+                int r;
+                /* AN OWNED VALUE OUTLIVES ITS STEP. bcw_step_value QUEUES work that still refers to this value
+                   — an array's element cursor, an object's property cursor — so freeing it when the step
+                   returns would hand those items a dead reference. The release is queued FIRST, so it pops
+                   after everything the step pushed. */
+                if (it.own_val) {
+                    BCWItem fr;
+                    memset(&fr, 0, sizeof(fr));
+                    fr.kind = BCW_FREE_VAL;
+                    fr.val = it.val;
+                    fr.own_val = true;
+                    if (bcw_push(s, fr))
+                        goto fail;
+                }
+                r = bcw_step_value(s, it.val);
+                if (r)
+                    goto fail;
+            }
+            break;
+        case BCW_FREE_VAL:
+            JS_FreeValue(s->ctx, it.val);
+            break;
+        case BCW_CLEAR_MARK:
+            it.objp->tmp_mark = 0;
+            break;
+        case BCW_ARR_ELEM:
+            if (it.i < it.len) {
+                JSValue val;
+                uint32_t idx = it.i++;
+                if (bcw_push(s, it))            /* the cursor, advanced */
+                    goto fail;
+                val = JS_GetPropertyUint32(s->ctx, it.val, idx);
+                if (JS_IsException(val))
+                    goto fail;
+                if (bcw_push(s, bcw_val(val, true)))
+                    goto fail;
+            } else if (it.flag) {
+                it.kind = BCW_ARR_RAW;
+                if (bcw_push(s, it))
+                    goto fail;
+            }
+            break;
+        case BCW_ARR_RAW:
+            {
+                JSValue val = JS_GetProperty(s->ctx, it.val, JS_ATOM_raw);
+                if (JS_IsException(val))
+                    goto fail;
+                if (bcw_push(s, bcw_val(val, true)))
+                    goto fail;
+            }
+            break;
+        case BCW_OBJ_PROP:
+            {
+                JSObject *p = JS_VALUE_GET_OBJ(it.val);
+                JSShape *sh = it.sh;
+                JSShapeProperty *pr;
+                uint32_t k = it.i;
+                while (k < sh->prop_count) {
+                    pr = get_shape_prop(sh) + k;
+                    if (pr->atom != JS_ATOM_NULL && (pr->flags & JS_PROP_ENUMERABLE))
+                        break;
+                    k++;
+                }
+                if (k < sh->prop_count) {
+                    pr = get_shape_prop(sh) + k;
+                    bc_put_atom(s, pr->atom);
+                    it.i = k + 1;
+                    if (bcw_push(s, it))
+                        goto fail;
+                    if (bcw_push(s, bcw_val(p->prop[k].u.value, false)))
+                        goto fail;
+                }
+            }
+            break;
+        case BCW_CPOOL:
+            if (it.i < it.len) {
+                uint32_t idx = it.i++;
+                if (bcw_push(s, it))
+                    goto fail;
+                if (bcw_push(s, bcw_val(it.fb->cpool[idx], false)))
+                    goto fail;
+            }
+            break;
+        case BCW_FUNC_TAIL:
+            if (bcw_func_tail(s, it.fb))
+                goto fail;
+            break;
+        case BCW_MAPENT:
+            {
+                JSMapRecord *mr = it.mr;
+                if (&mr->link != &it.map->records) {
+                    JSValue half;
+                    if (it.i == 0) {
+                        half = mr->key;
+                        /* a SET record is key-only; a MAP comes back for the value half */
+                        if (it.flag) {
+                            it.mr = list_entry(mr->link.next, JSMapRecord, link);
+                        } else {
+                            it.i = 1;
+                        }
+                    } else {
+                        half = mr->value;
+                        it.i = 0;
+                        it.mr = list_entry(mr->link.next, JSMapRecord, link);
+                    }
+                    if (bcw_push(s, it))
+                        goto fail;
+                    if (bcw_push(s, bcw_val(half, false)))
+                        goto fail;
+                }
+            }
+            break;
+        default:
+            DFAIL("the bytecode writer's work stack holds an item kind it has no arm for");
+        }
+    }
+    return 0;
+ fail:
+    while (s->w_sp > base) {
+        BCWItem *it = &s->w_stack[--s->w_sp];
+        if (it->own_val)
+            JS_FreeValue(s->ctx, it->val);
+        if (it->kind == BCW_CLEAR_MARK)
+            it->objp->tmp_mark = 0;
+    }
     return -1;
 }
 
@@ -86617,18 +86856,19 @@ static int js_map_write(BCWriterState *s, struct JSMapState *map_state,
     JSMapRecord *mr;
 
     bc_put_leb128(s, map_state ? map_state->record_count : 0);
-    if (map_state) {
-        list_for_each(el, &map_state->records) {
-            mr = list_entry(el, JSMapRecord, link);
-            if (JS_WriteObjectRec(s, mr->key))
-                return -1;
-            // mr->value is always JS_UNDEFINED for sets
-            if (!(magic & MAGIC_SET))
-                if (JS_WriteObjectRec(s, mr->value))
-                    return -1;
-        }
+    /* The records are a QUEUED walk for the same reason the array's elements are: a key or value can be an
+       object whose own write pushes further work, and that subtree must finish before the next record. */
+    if (map_state && !list_empty(&map_state->records)) {
+        BCWItem it;
+        memset(&it, 0, sizeof(it));
+        it.kind = BCW_MAPENT;
+        it.map = map_state;
+        it.mr = list_entry(map_state->records.next, JSMapRecord, link);
+        it.flag = (magic & MAGIC_SET) != 0;   /* a set record is key-only */
+        if (bcw_push(s, it))
+            return -1;
     }
-
+    (void)el; (void)mr;
     return 0;
 }
 
