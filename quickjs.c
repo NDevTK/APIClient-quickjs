@@ -46440,6 +46440,11 @@ struct JSParseFrame {
     bool    has_proto;      /* ObjectLiteral: a __proto__ key has already been seen */
     /* PropertyName */
     int     prop_type, is_private;
+    /* TemplateLiteral: the tagged form's cooked and raw arrays, LIVE ACROSS the substitution descent — a
+       nested template is a nested FRAME, and holding these in a driver local let the inner one reset the
+       outer's to JS_UNDEFINED. Ownership matches the recursive body: template_object is released after
+       emit_push_const, raw_array's passes to JS_DefinePropertyValue. */
+    JSValue raw_array, template_object;
 };
 typedef struct JSParseFrame JSParseFrame;
 
@@ -46509,7 +46514,6 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     bool is_non_reserved_ident = false;
     /* TemplateLiteral scratch — never live across a PD_CALL (the substitution descent is the only one, and
        `cooked` is consumed before it). */
-    JSValue raw_array = JS_UNDEFINED, template_object = JS_UNDEFINED;
     JSToken cooked;
     int emit_ret;
 
@@ -46529,6 +46533,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         f->accept_lparen = false; f->has_opt_chain = false;                      \
         f->arr_idx = 0; f->need_length = false; f->has_proto = false;            \
         f->prop_type = 0; f->is_private = 0;                                     \
+        f->raw_array = JS_UNDEFINED; f->template_object = JS_UNDEFINED;          \
         goto dispatch;                                                          \
     } while (0)
 /* A descent: record where THIS frame continues, then push the callee's. */
@@ -48471,23 +48476,23 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
    argument count — a count is non-negative, so it needs no out-channel; the untagged form returns 0. `depth`
    is the only state live across the substitution descent, so it is the frame's. ---- */
  tpl_entry:
-    raw_array = JS_UNDEFINED;       /* avoid warning */
-    template_object = JS_UNDEFINED; /* avoid warning */
+    f->raw_array = JS_UNDEFINED;       /* avoid warning */
+    f->template_object = JS_UNDEFINED; /* avoid warning */
     if (f->op) {
         /* Create a template object: an array of cooked strings */
         /* Create an array of raw strings and store it to the raw property */
-        template_object = JS_NewArray(ctx);
-        if (JS_IsException(template_object))
+        f->template_object = JS_NewArray(ctx);
+        if (JS_IsException(f->template_object))
             PD_RET(-1);
-        emit_ret = emit_push_const(s, template_object, 0);
-        JS_FreeValue(ctx, template_object);
+        emit_ret = emit_push_const(s, f->template_object, 0);
+        JS_FreeValue(ctx, f->template_object);
         if (emit_ret)
             PD_RET(-1);
-        raw_array = JS_NewArray(ctx);
-        if (JS_IsException(raw_array))
+        f->raw_array = JS_NewArray(ctx);
+        if (JS_IsException(f->raw_array))
             PD_RET(-1);
-        if (JS_DefinePropertyValue(ctx, template_object, JS_ATOM_raw,
-                                   raw_array, JS_PROP_THROW) < 0) {
+        if (JS_DefinePropertyValue(ctx, f->template_object, JS_ATOM_raw,
+                                   f->raw_array, JS_PROP_THROW) < 0) {
             PD_RET(-1);
         }
     }
@@ -48497,7 +48502,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         const uint8_t *p = s->token.ptr + 1;
         cooked = s->token;
         if (f->op) {
-            if (JS_DefinePropertyValueUint32(ctx, raw_array, f->arg_count,
+            if (JS_DefinePropertyValueUint32(ctx, f->raw_array, f->arg_count,
                                              js_dup(s->token.u.str.str),
                                              JS_PROP_ENUMERABLE | JS_PROP_THROW) < 0) {
                 PD_RET(-1);
@@ -48508,7 +48513,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             if (js_parse_string(s, '`', false, p, &cooked, &p)) {
                 cooked.u.str.str = JS_UNDEFINED;
             }
-            if (JS_DefinePropertyValueUint32(ctx, template_object, f->arg_count,
+            if (JS_DefinePropertyValueUint32(ctx, f->template_object, f->arg_count,
                                              cooked.u.str.str,
                                              JS_PROP_ENUMERABLE | JS_PROP_THROW) < 0) {
                 PD_RET(-1);
@@ -48565,8 +48570,8 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
  tpl_done:
     if (f->op) {
         /* Seal the objects */
-        seal_template_obj(ctx, raw_array);
-        seal_template_obj(ctx, template_object);
+        seal_template_obj(ctx, f->raw_array);
+        seal_template_obj(ctx, f->template_object);
     } else {
         emit_op(s, OP_call_method);
         emit_u16(s, f->arg_count - 1);
