@@ -42641,17 +42641,21 @@ static JSAtom parse_ident(JSParseState *s, const uint8_t **pp,
 }
 
 
+/* NO STACK GUARD. There was a js_check_stack_overflow here throwing RangeError, and it was a BOUND in an
+   error's clothes: the grammar has an answer at every nesting depth and the parser refused to give it because
+   the C stack, not the language, ran out. It stood in front of the recursive-descent parser, so it could only
+   be deleted once that recursion was — which it now is: every production is a state on js_parse_descent's
+   explicit frame stack, and the one js_parse_descent(s, ...) call left in the file is js_parse_program's C
+   ENTRY, not a nested activation. The C depth at this function is therefore a CONSTANT that no input picks.
+   Deleting the guard is what makes that claim falsifiable rather than decorative: if some path still reaches
+   here through C recursion, it now overflows the stack and CRASHES LOUD at the point that recursed, instead of
+   being laundered into a RangeError the caller reports as if the source were at fault. */
 static __exception int next_token(JSParseState *s)
 {
     const uint8_t *p, *p_next;
     int c;
     bool ident_has_escape;
     JSAtom atom;
-
-    if (js_check_stack_overflow(s->ctx->rt, 1000)) {
-        JS_ThrowStackOverflow(s->ctx);
-        return -1;
-    }
 
     free_token(s, &s->token);
 
@@ -45437,12 +45441,12 @@ static void optional_chain_test(JSParseState *s, int *poptional_chaining_label,
  * ladder is nine frames deep (one per precedence level) plus two for `||`/`&&`,
  * and that is a CONSTANT, not an input.
  *
- * What the source DOES choose is the bracket and statement nesting that runs
- * through js_parse_expr_paren / js_parse_postfix_expr / js_parse_statement_or_decl,
- * and that recursion is still here: `"(".repeat(50000)` still trips the
- * js_check_stack_overflow in next_token and reports RangeError, exactly as it did
- * before. That guard is a BOUND in an error's clothes and it is deleted when the
- * recursion under it is, not before.
+ * What the source DOES choose is the bracket and statement nesting that ran
+ * through js_parse_expr_paren / js_parse_postfix_expr / js_parse_statement_or_decl.
+ * That recursion is GONE — those productions are states on this frame stack — and
+ * so is the js_check_stack_overflow next_token kept in front of it, which was a
+ * BOUND in an error's clothes and was deleted once, and only once, the recursion
+ * under it had been. `"(".repeat(200000)` parses.
  *
  * So this converts the ladder because it is a MEMBER of the 29-function parser
  * cycle, which is one work queue and does not shrink until every member leaves —
