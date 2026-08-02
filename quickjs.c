@@ -44376,6 +44376,7 @@ enum {
     PDS_SOD, PDS_BLOCK, PDS_BLK_STMT, PDS_IFC, PDS_IFC_DONE, PDS_SOD_30,
     PDS_FIO, PDS_FIO_01, PDS_FIO_02, PDS_FIO_03, PDS_FIO_04, PDS_FIO_05,
     PDS_CLASS, PDS_CLS_01, PDS_CLS_02, PDS_SRCELEM, PDS_SE_01,
+    PDS_EXPORT, PDS_EXP_01, PDS_EXP_02, PDS_EXP_03, PDS_EXP_04,
     PDS_DESTR, PDS_DE_01, PDS_DE_02, PDS_DE_03, PDS_DE_04, PDS_DE_05,
     PDS_DE_06, PDS_DE_07, PDS_DE_08, PDS_DE_09, PDS_DE_10,
     PDS_SOD_01, PDS_SOD_02, PDS_SOD_03, PDS_SOD_04, PDS_SOD_05, PDS_SOD_06, PDS_SOD_07, PDS_SOD_08, PDS_SOD_09, PDS_SOD_10, PDS_SOD_11, PDS_SOD_12, PDS_SOD_13, PDS_SOD_14, PDS_SOD_15, PDS_SOD_16, PDS_SOD_17, PDS_SOD_18, PDS_SOD_19, PDS_SOD_20, PDS_SOD_21, PDS_SOD_22, PDS_SOD_23, PDS_SOD_24, PDS_SOD_25, PDS_SOD_26, PDS_SOD_27, PDS_SOD_28, PDS_SOD_29,
@@ -44394,8 +44395,11 @@ static int is_let(JSParseState *s, int decl_mask);
 static int is_using(JSParseState *s, bool is_for_of);
 static void set_eval_ret_undefined(JSParseState *s);
 static void emit_async_iterator_close(JSParseState *s);
-static __exception int js_parse_export(JSParseState *s);
 static __exception int js_parse_import(JSParseState *s);
+static bool has_unmatched_surrogate(const uint16_t *s, size_t n);
+static __exception int js_parse_from_clause(JSParseState *s, JSModuleDef *m);
+static __exception int js_parse_with_clause(JSParseState *s, JSReqModuleEntry *rme);
+static int add_star_export_entry(JSContext *ctx, JSModuleDef *m, int req_module_idx);
 
 /* allow the 'in' binary operator. It is the [In] parameter of the production being parsed, and it reaches the
    function parsers too: an arrow's ConciseBody is ExpressionBody[?In, ~Await], so `for (x => 0 in 1;;)` must
@@ -45718,6 +45722,11 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     case PDS_FIO_04:          goto fio_04;
     case PDS_FIO_05:          goto fio_05;
     case PDS_SRCELEM:         goto se_entry;
+    case PDS_EXPORT:          goto exp_entry;
+    case PDS_EXP_01:          goto exp_01;
+    case PDS_EXP_02:          goto exp_02;
+    case PDS_EXP_03:          goto exp_03;
+    case PDS_EXP_04:          goto exp_04;
     case PDS_SE_01:           goto se_01;
     case PDS_CLASS:           goto cls_entry;
     case PDS_CLS_01:          goto cls_01;
@@ -50335,7 +50344,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                                    s->token.col_num, PF_IN_ACCEPTED))
             PD_RET(-1);
     } else if (s->token.val == TOK_EXPORT && s->cur_func->module) {
-        if (js_parse_export(s))
+        if (js_parse_descent(s, PDS_EXPORT, 0, 0, 0))
             PD_RET(-1);
     } else if (s->token.val == TOK_IMPORT && s->cur_func->module &&
                ((f->st_tok = peek_token(s, false)) != '(' && f->st_tok != '.'))  {
@@ -50351,6 +50360,204 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     }
     PD_RET(0);
     PD_RET(0);
+
+/* ---- ExportDeclaration. Three of its four descents are TAIL positions — a class or a var declaration IS the
+   whole export — so they PD_CALL and hand the callee's status straight back. ---- */
+ exp_entry:
+    JSModuleDef *m = s->cur_func->module;
+    JSExportEntry *me;
+
+    if (next_token(s))
+        goto exp_fail;
+
+    f->st_tok = s->token.val;
+    if (f->st_tok == TOK_CLASS) {
+        PD_CALL(PDS_CLASS, false, 0, JS_PARSE_EXPORT_NAMED, PDS_EXP_01);
+ exp_01:
+        PD_RET(pd_ret);
+    } else if (f->st_tok == TOK_FUNCTION ||
+               (token_is_pseudo_keyword(s, JS_ATOM_async) &&
+                peek_token(s, true) == TOK_FUNCTION)) {
+        PD_RET(js_parse_function_decl2(s, JS_PARSE_FUNC_STATEMENT,
+                                       JS_FUNC_NORMAL, JS_ATOM_NULL,
+                                       s->token.ptr,
+                                       s->token.line_num,
+                                       s->token.col_num,
+                                       JS_PARSE_EXPORT_NAMED, NULL, PF_IN_ACCEPTED));
+    }
+
+    if (next_token(s))
+        goto exp_fail;
+
+    switch(f->st_tok) {
+    case '{':
+        f->st_pos_a = m->export_entries_count;
+        while (s->token.val != '}') {
+            if (token_is_ident(s->token.val)) {
+                f->atom = JS_DupAtom(ctx, s->token.u.ident.atom);
+            } else if (s->token.val == TOK_STRING) {
+                f->atom = JS_ValueToAtom(ctx, s->token.u.str.str);
+                if (f->atom == JS_ATOM_NULL)
+                    goto exp_fail;
+                f->st_b1 = true;
+            } else {
+                PD_RET_ERR(s, "identifier or string expected");
+            }
+            f->atom2 = JS_ATOM_NULL;
+            if (next_token(s))
+                goto exp_fail;
+            if (token_is_pseudo_keyword(s, JS_ATOM_as)) {
+                if (next_token(s))
+                    goto exp_fail;
+                if (token_is_ident(s->token.val)) {
+                    f->atom2 = JS_DupAtom(ctx, s->token.u.ident.atom);
+                } else if (s->token.val == TOK_STRING) {
+                    JSString *p = JS_VALUE_GET_STRING(s->token.u.str.str);
+                    if (p->is_wide_char && has_unmatched_surrogate(str16(p), p->len)) {
+                        js_parse_error(s, "illegal export name");
+                        goto exp_fail;
+                    }
+                    f->atom2 = JS_ValueToAtom(ctx, s->token.u.str.str);
+                    if (f->atom2 == JS_ATOM_NULL) {
+                        goto exp_fail;
+                    }
+                } else {
+                    js_parse_error(s, "identifier or string expected");
+                    goto exp_fail;
+                }
+                if (next_token(s)) {
+                fail:
+                    JS_FreeAtom(ctx, f->atom);
+                    f->atom = JS_ATOM_NULL;
+                fail1:
+                    JS_FreeAtom(ctx, f->atom2);
+                    f->atom2 = JS_ATOM_NULL;
+                    goto exp_fail;
+                }
+            } else {
+                f->atom2 = JS_DupAtom(ctx, f->atom);
+            }
+            me = add_export_entry(s, m, f->atom, f->atom2,
+                                  JS_EXPORT_TYPE_LOCAL);
+            JS_FreeAtom(ctx, f->atom);
+                    f->atom = JS_ATOM_NULL;
+            JS_FreeAtom(ctx, f->atom2);
+                    f->atom2 = JS_ATOM_NULL;
+            if (!me)
+                goto exp_fail;
+            if (s->token.val != ',')
+                break;
+            if (next_token(s))
+                goto exp_fail;
+        }
+        if (js_parse_expect(s, '}'))
+            goto exp_fail;
+        if (token_is_pseudo_keyword(s, JS_ATOM_from)) {
+            f->st_idx = js_parse_from_clause(s, m);
+            if (f->st_idx < 0)
+                goto exp_fail;
+            for(i = f->st_pos_a; i < m->export_entries_count; i++) {
+                me = &m->export_entries[i];
+                me->export_type = JS_EXPORT_TYPE_INDIRECT;
+                me->u.req_module_idx = f->st_idx;
+            }
+        } else if (f->st_b1) {
+            // Without 'from' clause, string literals cannot be used as local binding names
+            PD_RET_ERR(s, "string export name only allowed with 'from' clause");
+        }
+        break;
+    case '*':
+        if (token_is_pseudo_keyword(s, JS_ATOM_as)) {
+            /* export ns from */
+            if (next_token(s))
+                goto exp_fail;
+            if (token_is_ident(s->token.val)) {
+                f->atom2 = JS_DupAtom(ctx, s->token.u.ident.atom);
+            } else if (s->token.val == TOK_STRING) {
+                f->atom2 = JS_ValueToAtom(ctx, s->token.u.str.str);
+                if (f->atom2 == JS_ATOM_NULL) {
+                    goto exp_fail;
+                }
+            } else {
+                PD_RET_ERR(s, "identifier or string expected");
+            }
+            if (next_token(s))
+                goto fail1;
+            f->st_idx = js_parse_from_clause(s, m);
+            if (f->st_idx < 0)
+                goto fail1;
+            me = add_export_entry(s, m, JS_ATOM__star_, f->atom2,
+                                  JS_EXPORT_TYPE_INDIRECT);
+            JS_FreeAtom(ctx, f->atom2);
+                    f->atom2 = JS_ATOM_NULL;
+            if (!me)
+                goto exp_fail;
+            me->is_namespace = true;   /* f->atom is the `*` the user wrote, and nothing reads it */
+            me->u.req_module_idx = f->st_idx;
+        } else {
+            f->st_idx = js_parse_from_clause(s, m);
+            if (f->st_idx < 0)
+                goto exp_fail;
+            if (add_star_export_entry(ctx, m, f->st_idx) < 0)
+                goto exp_fail;
+        }
+        break;
+    case TOK_DEFAULT:
+        if (s->token.val == TOK_CLASS) {
+            PD_CALL(PDS_CLASS, false, 0, JS_PARSE_EXPORT_DEFAULT, PDS_EXP_02);
+ exp_02:
+            PD_RET(pd_ret);
+        } else if (s->token.val == TOK_FUNCTION ||
+                   (token_is_pseudo_keyword(s, JS_ATOM_async) &&
+                    peek_token(s, true) == TOK_FUNCTION)) {
+            PD_RET(js_parse_function_decl2(s, JS_PARSE_FUNC_STATEMENT,
+                                           JS_FUNC_NORMAL, JS_ATOM_NULL,
+                                           s->token.ptr,
+                                           s->token.line_num,
+                                           s->token.col_num,
+                                           JS_PARSE_EXPORT_DEFAULT, NULL, PF_IN_ACCEPTED));
+        } else {
+            PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_EXP_04);
+ exp_04:
+            if (pd_ret)
+                goto exp_fail;
+        }
+        /* set the name of anonymous functions */
+        set_object_name(s, JS_ATOM_default);
+
+        /* store the value in the _default_ global variable and export
+           it */
+        /* a STATIC atom, not an owned reference — the frame must not hold it in an owned slot or exp_fail
+           over-releases it. */
+        f->atom = JS_ATOM_NULL;
+        if (define_var(s, s->cur_func, JS_ATOM__default_, JS_VAR_DEF_LET) < 0)
+            goto exp_fail;
+        emit_op(s, OP_scope_put_var_init);
+        emit_atom(s, JS_ATOM__default_);
+        emit_u16(s, 0);
+
+        if (!add_export_entry(s, m, JS_ATOM__default_, JS_ATOM_default,
+                              JS_EXPORT_TYPE_LOCAL))
+            goto exp_fail;
+        break;
+    case TOK_VAR:
+    case TOK_LET:
+    case TOK_CONST:
+    case TOK_USING:
+        PD_CALL(PDS_VAR, (true), PF_IN_ACCEPTED, f->st_tok, PDS_EXP_03);
+ exp_03:
+        PD_RET(pd_ret);
+    default:
+        PD_RET_ERR(s, "invalid export syntax");
+    }
+    PD_RET(js_parse_expect_semi(s));
+    PD_RET(0);
+ exp_fail:
+    JS_FreeAtom(ctx, f->atom);
+    JS_FreeAtom(ctx, f->atom2);
+    f->atom = JS_ATOM_NULL;
+    f->atom2 = JS_ATOM_NULL;
+    PD_RET(-1);
 
  done:
     goto leave;
@@ -53635,186 +53842,6 @@ static bool has_unmatched_surrogate(const uint16_t *s, size_t n)
             return true;
     }
     return false;
-}
-
-static __exception int js_parse_export(JSParseState *s)
-{
-    JSContext *ctx = s->ctx;
-    JSModuleDef *m = s->cur_func->module;
-    JSAtom local_name, export_name;
-    int first_export, idx, i, tok;
-    JSExportEntry *me;
-
-    if (next_token(s))
-        return -1;
-
-    tok = s->token.val;
-    if (tok == TOK_CLASS) {
-        return js_parse_descent(s, PDS_CLASS, false, 0, JS_PARSE_EXPORT_NAMED);
-    } else if (tok == TOK_FUNCTION ||
-               (token_is_pseudo_keyword(s, JS_ATOM_async) &&
-                peek_token(s, true) == TOK_FUNCTION)) {
-        return js_parse_function_decl2(s, JS_PARSE_FUNC_STATEMENT,
-                                       JS_FUNC_NORMAL, JS_ATOM_NULL,
-                                       s->token.ptr,
-                                       s->token.line_num,
-                                       s->token.col_num,
-                                       JS_PARSE_EXPORT_NAMED, NULL, PF_IN_ACCEPTED);
-    }
-
-    if (next_token(s))
-        return -1;
-
-    switch(tok) {
-    case '{':
-        first_export = m->export_entries_count;
-        bool has_string_binding = false;
-        while (s->token.val != '}') {
-            if (token_is_ident(s->token.val)) {
-                local_name = JS_DupAtom(ctx, s->token.u.ident.atom);
-            } else if (s->token.val == TOK_STRING) {
-                local_name = JS_ValueToAtom(ctx, s->token.u.str.str);
-                if (local_name == JS_ATOM_NULL)
-                    return -1;
-                has_string_binding = true;
-            } else {
-                return js_parse_error(s, "identifier or string expected");
-            }
-            export_name = JS_ATOM_NULL;
-            if (next_token(s))
-                goto fail;
-            if (token_is_pseudo_keyword(s, JS_ATOM_as)) {
-                if (next_token(s))
-                    goto fail;
-                if (token_is_ident(s->token.val)) {
-                    export_name = JS_DupAtom(ctx, s->token.u.ident.atom);
-                } else if (s->token.val == TOK_STRING) {
-                    JSString *p = JS_VALUE_GET_STRING(s->token.u.str.str);
-                    if (p->is_wide_char && has_unmatched_surrogate(str16(p), p->len)) {
-                        js_parse_error(s, "illegal export name");
-                        return -1;
-                    }
-                    export_name = JS_ValueToAtom(ctx, s->token.u.str.str);
-                    if (export_name == JS_ATOM_NULL) {
-                        return -1;
-                    }
-                } else {
-                    js_parse_error(s, "identifier or string expected");
-                    goto fail;
-                }
-                if (next_token(s)) {
-                fail:
-                    JS_FreeAtom(ctx, local_name);
-                fail1:
-                    JS_FreeAtom(ctx, export_name);
-                    return -1;
-                }
-            } else {
-                export_name = JS_DupAtom(ctx, local_name);
-            }
-            me = add_export_entry(s, m, local_name, export_name,
-                                  JS_EXPORT_TYPE_LOCAL);
-            JS_FreeAtom(ctx, local_name);
-            JS_FreeAtom(ctx, export_name);
-            if (!me)
-                return -1;
-            if (s->token.val != ',')
-                break;
-            if (next_token(s))
-                return -1;
-        }
-        if (js_parse_expect(s, '}'))
-            return -1;
-        if (token_is_pseudo_keyword(s, JS_ATOM_from)) {
-            idx = js_parse_from_clause(s, m);
-            if (idx < 0)
-                return -1;
-            for(i = first_export; i < m->export_entries_count; i++) {
-                me = &m->export_entries[i];
-                me->export_type = JS_EXPORT_TYPE_INDIRECT;
-                me->u.req_module_idx = idx;
-            }
-        } else if (has_string_binding) {
-            // Without 'from' clause, string literals cannot be used as local binding names
-            return js_parse_error(s, "string export name only allowed with 'from' clause");
-        }
-        break;
-    case '*':
-        if (token_is_pseudo_keyword(s, JS_ATOM_as)) {
-            /* export ns from */
-            if (next_token(s))
-                return -1;
-            if (token_is_ident(s->token.val)) {
-                export_name = JS_DupAtom(ctx, s->token.u.ident.atom);
-            } else if (s->token.val == TOK_STRING) {
-                export_name = JS_ValueToAtom(ctx, s->token.u.str.str);
-                if (export_name == JS_ATOM_NULL) {
-                    return -1;
-                }
-            } else {
-                return js_parse_error(s, "identifier or string expected");
-            }
-            if (next_token(s))
-                goto fail1;
-            idx = js_parse_from_clause(s, m);
-            if (idx < 0)
-                goto fail1;
-            me = add_export_entry(s, m, JS_ATOM__star_, export_name,
-                                  JS_EXPORT_TYPE_INDIRECT);
-            JS_FreeAtom(ctx, export_name);
-            if (!me)
-                return -1;
-            me->is_namespace = true;   /* local_name is the `*` the user wrote, and nothing reads it */
-            me->u.req_module_idx = idx;
-        } else {
-            idx = js_parse_from_clause(s, m);
-            if (idx < 0)
-                return -1;
-            if (add_star_export_entry(ctx, m, idx) < 0)
-                return -1;
-        }
-        break;
-    case TOK_DEFAULT:
-        if (s->token.val == TOK_CLASS) {
-            return js_parse_descent(s, PDS_CLASS, false, 0, JS_PARSE_EXPORT_DEFAULT);
-        } else if (s->token.val == TOK_FUNCTION ||
-                   (token_is_pseudo_keyword(s, JS_ATOM_async) &&
-                    peek_token(s, true) == TOK_FUNCTION)) {
-            return js_parse_function_decl2(s, JS_PARSE_FUNC_STATEMENT,
-                                           JS_FUNC_NORMAL, JS_ATOM_NULL,
-                                           s->token.ptr,
-                                           s->token.line_num,
-                                           s->token.col_num,
-                                           JS_PARSE_EXPORT_DEFAULT, NULL, PF_IN_ACCEPTED);
-        } else {
-            if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
-                return -1;
-        }
-        /* set the name of anonymous functions */
-        set_object_name(s, JS_ATOM_default);
-
-        /* store the value in the _default_ global variable and export
-           it */
-        local_name = JS_ATOM__default_;
-        if (define_var(s, s->cur_func, local_name, JS_VAR_DEF_LET) < 0)
-            return -1;
-        emit_op(s, OP_scope_put_var_init);
-        emit_atom(s, local_name);
-        emit_u16(s, 0);
-
-        if (!add_export_entry(s, m, local_name, JS_ATOM_default,
-                              JS_EXPORT_TYPE_LOCAL))
-            return -1;
-        break;
-    case TOK_VAR:
-    case TOK_LET:
-    case TOK_CONST:
-    case TOK_USING:
-        return js_parse_descent(s, PDS_VAR, (true), PF_IN_ACCEPTED, tok);
-    default:
-        return js_parse_error(s, "invalid export syntax");
-    }
-    return js_parse_expect_semi(s);
 }
 
 static int add_closure_var(JSContext *ctx, JSFunctionDef *s,
