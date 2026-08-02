@@ -12745,9 +12745,10 @@ void *JS_GetAnyOpaque(JSValueConst obj, JSClassID *class_id)
    operand (TPR_ADD_AFTER_COERCE) and a computed key (TPR_GET_ARRAY_EL) — coerce on the tramp, resume, redo the
    store. Numeric typed arrays reach the same place through JS_ToNumberFree and are only unobserved because the
    probe aborts at the first firing, so expect more than one once that store is routed.
-   Do NOT leave the DCHECK enabled to force this: it aborts on input the corpus does not happen to cover, which
-   ships a crash for unbuilt work rather than a forcing function. Re-arm it deliberately, fix what it names,
-   remove it again. */
+   THE DCHECK BELOW STAYS. I removed it once to keep the suite green and called that judgement; it was not.
+   A DCHECK is dev-only and ships with no production effect, an unrouted site is a capability that does not
+   exist yet, and a directory going red over one is the work queue rather than a reason to soften the check.
+   Deleting it is how the last unrouted path stays unrouted. */
 static JSValue JS_ToPrimitiveFree(JSContext *ctx, JSValue val, int hint)
 {
     int i;
@@ -12765,6 +12766,8 @@ static JSValue JS_ToPrimitiveFree(JSContext *ctx, JSValue val, int hint)
        asserts a concolic never reaches it — this cannot become an infinite coercion. */
     if (g_concolic.is && g_concolic.is(val))
         return val;
+    DCHECK(false, "JS_ToPrimitiveFree reached with a real object — route this site to the ToPrimitive "
+                  "trampoline instead of running valueOf/toString from C");
     force_ordinary = hint & HINT_FORCE_ORDINARY;
     hint &= ~HINT_FORCE_ORDINARY;
     if (!force_ordinary) {
