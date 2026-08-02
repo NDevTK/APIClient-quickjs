@@ -50133,12 +50133,9 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         if (next_token(s))
             goto de_fail;
     } else if (s->token.val == '[') {
-        bool has_spread;
-        int enum_depth;
-        int source_line_num, source_col_num;
 
-        source_line_num = s->token.line_num;
-        source_col_num = s->token.col_num;
+        f->st_line = s->token.line_num;
+        f->st_col = s->token.col_num;
         if (next_token(s))
             goto de_fail;
         /* the block environment is only needed in generators in case
@@ -50147,7 +50144,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                          JS_ATOM_NULL, -1, -1, 2);
         f->st_be.has_iterator = true;
         emit_op(s, OP_for_of_start);
-        has_spread = false;
+        f->st_b1 = false;
         while (s->token.val != ']') {
             /* get the next value */
             if (s->token.val == TOK_ELLIPSIS) {
@@ -50155,10 +50152,10 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                     goto de_fail;
                 if (s->token.val == ',' || s->token.val == ']')
                     PD_RET_ERR(s, "missing binding pattern...");
-                has_spread = true;
+                f->st_b1 = true;
             }
             if (s->token.val == ',') {
-                /* do nothing, skip the value, has_spread is false */
+                /* do nothing, skip the value, f->st_b1 is false */
                 emit_op(s, OP_for_of_next);
                 emit_u8(s, 0);
                 emit_op(s, OP_drop);
@@ -50166,7 +50163,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             } else if ((s->token.val == '[' || s->token.val == '{')
                    &&  ((f->st_tok = js_parse_skip_parens_token(s, &f->st_bits, false)) == ',' ||
                         f->st_tok == '=' || f->st_tok == ']')) {
-                if (has_spread) {
+                if (f->st_b1) {
                     if (f->st_tok == '=')
                         PD_RET_ERR(s, "rest element cannot have a default value");
                     js_emit_spread_code(s, 0);
@@ -50181,7 +50178,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                     goto de_fail;
             } else {
                 f->atom2 = JS_ATOM_NULL;
-                enum_depth = 0;
+                f->st_mask = 0;
                 if (f->op) {
                     f->atom2 = js_parse_destructuring_var(s, f->op, (f->flags & DE_IS_ARG));
                     if (f->atom2 == JS_ATOM_NULL)
@@ -50201,18 +50198,18 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                     if (pd_ret)
                         goto de_fail;
                     if (get_lvalue(s, &f->opcode, &f->scope, &f->atom2,
-                                   &f->st_lbl_d, &enum_depth, false, '[')) {
+                                   &f->st_lbl_d, &f->st_mask, false, '[')) {
                         goto de_fail;
                     }
                 }
-                if (has_spread) {
-                    js_emit_spread_code(s, enum_depth);
+                if (f->st_b1) {
+                    js_emit_spread_code(s, f->st_mask);
                 } else {
                     emit_op(s, OP_for_of_next);
-                    emit_u8(s, enum_depth);
+                    emit_u8(s, f->st_mask);
                     emit_op(s, OP_drop);
                 }
-                if (s->token.val == '=' && !has_spread) {
+                if (s->token.val == '=' && !f->st_b1) {
                     /* handle optional default value */
                     int label_hasval;
                     emit_op(s, OP_dup);
@@ -50238,7 +50235,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             }
             if (s->token.val == ']')
                 break;
-            if (has_spread)
+            if (f->st_b1)
                 PD_RET_ERR(s, "rest element must be the last one");
             /* accept a trailing comma before the ']' */
             if (js_parse_expect(s, ','))
@@ -50246,7 +50243,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         }
         /* close iterator object:
            if completed, enum_obj has been replaced by undefined */
-        emit_source_loc_at(s, source_line_num, source_col_num);
+        emit_source_loc_at(s, f->st_line, f->st_col);
         emit_op(s, OP_iterator_close);
         pop_break_entry(s->cur_func);
         if (next_token(s))
