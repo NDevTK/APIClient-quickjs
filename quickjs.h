@@ -1373,6 +1373,9 @@ typedef struct JSConcolicHooks {
     /* 7.1.17 ToString over unknown input, same rule: `String(x)` is unknown, with the source kept. Returns
        JS_UNINITIALIZED when the operand is not concolic. */
     JSValue (*to_str)(JSContext *ctx, JSValueConst v);
+    /* `obj[x]` with an UNKNOWN key. Not a coercion of the operand — a lookup that names no particular slot, so
+       the read yields a concolic derived from the base and the key's source. JS_UNINITIALIZED = not concolic. */
+    JSValue (*key_read)(JSContext *ctx, JSValueConst obj, JSValueConst key);
 } JSConcolicHooks;
 JS_EXTERN void JS_SetConcolicHooks(const JSConcolicHooks *hooks);
 

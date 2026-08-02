@@ -36138,6 +36138,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                     goto exception;
                 }
+                /* AN UNKNOWN KEY READS AN UNKNOWN PROPERTY. `obj[x]` where x is unknown external input names no
+                   particular slot: ToPropertyKey would have to stringify it, and that boundary owes C a real
+                   atom. The operator answers instead — the value is a concolic derived from the base and the
+                   key's source, so a gate on it still forks and a sink still solves for the key. Example-free
+                   on purpose: which property was meant is exactly what is not known, and @H never invents. */
+                if (g_concolic.is && g_concolic.key_read && g_concolic.is(sp[-1])) {
+                    JSValue kv = g_concolic.key_read(ctx, sp[-2], sp[-1]);
+                    if (!JS_IsUninitialized(kv)) {
+                        JS_FreeValue(ctx, sp[-1]);
+                        JS_FreeValue(ctx, sp[-2]);
+                        sp[-2] = kv;
+                        sp--;
+                        BREAK;
+                    }
+                }
                 {
                     JSAtom katom = JS_ValueToAtom(ctx, sp[-1]);   /* ToPropertyKey (may throw) */
                     if (unlikely(katom == JS_ATOM_NULL))
@@ -77020,13 +77035,41 @@ static int js_str_concat_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
         if (js_str_concat_prologue(ctx, s)) { JS_FreeValue(ctx, cb_result); return -1; }
     }
     if (JS_VALUE_GET_TAG(cb_result) != JS_TAG_UNINITIALIZED && !JS_IsUndefined(cb_result)) {
+        /* A CONCOLIC PIECE MAKES THE WHOLE CONCATENATION CONCOLIC. An untagged template literal COMPILES to
+           String.prototype.concat, so `v${x}` is this machine — and stringifying unknown external input has no
+           answer at the ToString boundary, which owes C a real string. The answer is the one `+` already gives:
+           concat IS string concatenation, so folding through the .add hook reuses the exact semantics (shape
+           joined, source kept, example produced by actually concatenating the examples) rather than inventing a
+           second rule for the same operation. */
+        if (g_concolic.is && g_concolic.add && g_concolic.is(cb_result)) {
+            if (!s->this_done) { s->this_done = 1; s->acc = cb_result; }
+            else {
+                JSValue pair[2];
+                pair[0] = s->acc; pair[1] = cb_result;
+                if (!g_concolic.add(ctx, pair + 2))
+                    DFAIL("the concolic + hook declined a concolic concat operand");
+                s->acc = pair[0]; s->k++;
+            }
+            goto acc_done;
+        }
         /* a coercion settled: it is a PRIMITIVE, so ToString finishes it without user code. */
+        {
         JSValue str = JS_ToString(ctx, cb_result);
         JS_FreeValue(ctx, cb_result);
         if (JS_IsException(str)) return -1;
         if (!s->this_done) { s->this_done = 1; s->acc = str; }
+        else if (g_concolic.is && g_concolic.add && g_concolic.is(s->acc)) {
+            /* the accumulator went concolic earlier: every later piece joins it the same way. */
+            JSValue pair[2];
+            pair[0] = s->acc; pair[1] = str;
+            if (!g_concolic.add(ctx, pair + 2))
+                DFAIL("the concolic + hook declined a concolic accumulator");
+            s->acc = pair[0]; s->k++;
+        }
         else { s->acc = JS_ConcatString(ctx, s->acc, str); s->k++;
                if (JS_IsException(s->acc)) { s->acc = JS_UNDEFINED; return -1; } }
+        }
+    acc_done: ;
     } else if (JS_VALUE_GET_TAG(cb_result) != JS_TAG_UNINITIALIZED) {
         JS_FreeValue(ctx, cb_result);
     }
@@ -77049,8 +77092,16 @@ static int js_str_concat_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
         }
         { JSValue str = JS_ToString(ctx, v);
           if (JS_IsException(str)) return -1;
-          s->acc = JS_ConcatString(ctx, s->acc, str);
-          if (JS_IsException(s->acc)) { s->acc = JS_UNDEFINED; return -1; }
+          if (g_concolic.is && g_concolic.add && g_concolic.is(s->acc)) {
+              JSValue pair[2];
+              pair[0] = s->acc; pair[1] = str;
+              if (!g_concolic.add(ctx, pair + 2))
+                  DFAIL("the concolic + hook declined a concolic accumulator");
+              s->acc = pair[0];
+          } else {
+              s->acc = JS_ConcatString(ctx, s->acc, str);
+              if (JS_IsException(s->acc)) { s->acc = JS_UNDEFINED; return -1; }
+          }
           s->k++; }
     }
     return 0;
