@@ -39566,6 +39566,9 @@ static int clone_susp_frame(JSContext *ctx, JSStackFrame *cf, const JSStackFrame
     DCHECK((JSValue *)cf->var_refs == cf->arg_buf + lc,
            "clone_susp_frame: the var-ref array is not at the end of the frame slots — the allocation size and "
            "the placement come from the same layout law and must agree");
+    DCHECK(of->is_call_root || of->var_ref_count == b->var_ref_count,
+           "clone_susp_frame: the frame's var-ref count disagrees with its bytecode's — the clone reserves the "
+           "bytecode's count, so a larger frame count writes and reads past the allocation");
     cf->var_ref_count = of->var_ref_count;   /* share the frame's closed cells + take a ref */
     for (int vi = 0; vi < of->var_ref_count; vi++) { cf->var_refs[vi] = of->var_refs[vi]; if (cf->var_refs[vi]) JS_REF_COUNT(cf->var_refs[vi])++; }
     cf->cur_pc = of->cur_pc;
@@ -39921,6 +39924,9 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                    "clone_deep_flow: the relocated var-ref array is not at the end of the frame slots — the "
                    "allocation size and the interpreter's placement come from the same layout law and must agree");
             ct->sf.cur_sp   = (i == 0) ? XL(otf->sf.cur_sp, otf->local_buf, ct->local_buf) : NULL;   /* only deepest runs */
+            DCHECK(otf->sf.var_ref_count == wb->var_ref_count,
+                   "clone_deep_flow: the frame's var-ref count disagrees with its bytecode's — the clone reserves "
+                   "the bytecode's count, so a larger frame count writes and reads past the allocation");
             ct->sf.var_ref_count = otf->sf.var_ref_count;   /* share this frame's closed cells + take a ref */
             for (int vi = 0; vi < otf->sf.var_ref_count; vi++) { ct->sf.var_refs[vi] = otf->sf.var_refs[vi]; if (ct->sf.var_refs[vi]) JS_REF_COUNT(ct->sf.var_refs[vi])++; }
             ct->sf.prev_frame = NULL;
@@ -87237,7 +87243,14 @@ static void flow_reaction_shell_free(JSContext *ctx, JSAsyncFunctionState *c)
 
 static int flow_reaction_complete(JSContext *ctx, JSAsyncFunctionState *s, JSValue res)
 {
-    JSReactionFlow *rf = (JSReactionFlow *)s;
+    /* A JSReactionFlow's fields live AFTER the embedded state, so this cast reads past a state that is not one.
+       The base_kind is what says it is — asserted here, at the cast, rather than discovered as a 4-byte read
+       twelve bytes off the end of a 200-byte allocation. */
+    JSReactionFlow *rf;
+    DCHECK(s->base_kind == FLOW_BASE_STEP_ROOT,
+           "a flow state that is not a STEP_ROOT was cast to JSReactionFlow — its resolve/reject live past the "
+           "end of what was allocated for it");
+    rf = (JSReactionFlow *)s;
 
     /* COMPLETED via `done:` — that path frees the stack/vars inline but not the frame buffer + cur_func/this */
     js_free_rt(ctx->rt, rf->fs.frame.arg_buf);
@@ -87255,7 +87268,14 @@ static int flow_reaction_complete(JSContext *ctx, JSAsyncFunctionState *s, JSVal
 
 static void flow_reaction_free(JSContext *ctx, JSAsyncFunctionState *s)
 {
-    JSReactionFlow *rf = (JSReactionFlow *)s;
+    /* A JSReactionFlow's fields live AFTER the embedded state, so this cast reads past a state that is not one.
+       The base_kind is what says it is — asserted here, at the cast, rather than discovered as a 4-byte read
+       twelve bytes off the end of a 200-byte allocation. */
+    JSReactionFlow *rf;
+    DCHECK(s->base_kind == FLOW_BASE_STEP_ROOT,
+           "a flow state that is not a STEP_ROOT was cast to JSReactionFlow — its resolve/reject live past the "
+           "end of what was allocated for it");
+    rf = (JSReactionFlow *)s;
     if (rf->fs.frame.cur_sp != NULL)
         async_func_free(ctx->rt, &rf->fs);   /* suspended: full frame cleanup */
     else if (rf->fs.tramp_top != NULL)
