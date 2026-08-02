@@ -44362,6 +44362,7 @@ enum {
     PDS_PFX_ARG, PDS_PFX_SPREAD_ELL, PDS_PFX_SPREAD_ITEM, PDS_PFX_INDEX,
     PDS_UNA_POSTFIX,
     PDS_ARR, PDS_ARR_E1, PDS_ARR_E2, PDS_ARR_SPREAD, PDS_ARR_E3, PDS_PFX_ARRAY,
+    PDS_OBJ, PDS_OBJ_SPREAD, PDS_OBJ_VALUE, PDS_PFX_OBJECT,
 };
 static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                                         int parse_flags, int op);
@@ -44919,124 +44920,6 @@ static void set_object_name_computed(JSParseState *s)
     }
 }
 
-static __exception int js_parse_object_literal(JSParseState *s)
-{
-    JSAtom name = JS_ATOM_NULL;
-    const uint8_t *start_ptr;
-    int start_line, start_col, prop_type;
-    bool has_proto;
-
-    if (next_token(s))
-        goto fail;
-    /* XXX: add an initial length that will be patched back */
-    emit_op(s, OP_object);
-    has_proto = false;
-    while (s->token.val != '}') {
-        /* specific case for getter/setter */
-        start_ptr = s->token.ptr;
-        start_line = s->token.line_num;
-        start_col = s->token.col_num;
-
-        if (s->token.val == TOK_ELLIPSIS) {
-            if (next_token(s))
-                return -1;
-            if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
-                return -1;
-            emit_op(s, OP_null);  /* dummy excludeList */
-            emit_op(s, OP_copy_data_properties);
-            emit_u8(s, 2 | (1 << 2) | (0 << 5));
-            emit_op(s, OP_drop); /* pop excludeList */
-            emit_op(s, OP_drop); /* pop src object */
-            goto next;
-        }
-
-        prop_type = js_parse_property_name(s, &name, true, true, false);
-        if (prop_type < 0)
-            goto fail;
-
-        if (prop_type == PROP_TYPE_VAR) {
-            /* shortcut for x: x */
-            emit_op(s, OP_scope_get_var);
-            emit_atom(s, name);
-            emit_u16(s, s->cur_func->scope_level);
-            emit_op(s, OP_define_field);
-            emit_atom(s, name);
-        } else if (s->token.val == '(') {
-            bool is_getset = (prop_type == PROP_TYPE_GET ||
-                              prop_type == PROP_TYPE_SET);
-            JSParseFunctionEnum func_type;
-            JSFunctionKindEnum func_kind;
-            int op_flags;
-
-            func_kind = JS_FUNC_NORMAL;
-            if (is_getset) {
-                func_type = JS_PARSE_FUNC_GETTER + prop_type - PROP_TYPE_GET;
-            } else {
-                func_type = JS_PARSE_FUNC_METHOD;
-                if (prop_type == PROP_TYPE_STAR)
-                    func_kind = JS_FUNC_GENERATOR;
-                else if (prop_type == PROP_TYPE_ASYNC)
-                    func_kind = JS_FUNC_ASYNC;
-                else if (prop_type == PROP_TYPE_ASYNC_STAR)
-                    func_kind = JS_FUNC_ASYNC_GENERATOR;
-            }
-            if (js_parse_function_decl(s, func_type, func_kind, JS_ATOM_NULL,
-                                       start_ptr, start_line, start_col, PF_IN_ACCEPTED))
-                goto fail;
-            if (name == JS_ATOM_NULL) {
-                emit_op(s, OP_define_method_computed);
-            } else {
-                emit_op(s, OP_define_method);
-                emit_atom(s, name);
-            }
-            if (is_getset) {
-                op_flags = OP_DEFINE_METHOD_GETTER +
-                    prop_type - PROP_TYPE_GET;
-            } else {
-                op_flags = OP_DEFINE_METHOD_METHOD;
-            }
-            emit_u8(s, op_flags | OP_DEFINE_METHOD_ENUMERABLE);
-        } else {
-            if (js_parse_expect(s, ':'))
-                goto fail;
-            if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
-                goto fail;
-            if (name == JS_ATOM_NULL) {
-                set_object_name_computed(s);
-                emit_op(s, OP_define_array_el);
-                emit_op(s, OP_drop);
-            } else if (name == JS_ATOM___proto__) {
-                if (has_proto) {
-                    js_parse_error(s, "duplicate __proto__ property name");
-                    goto fail;
-                }
-                emit_op(s, OP_set_proto);
-                has_proto = true;
-            } else {
-                set_object_name(s, name);
-                emit_op(s, OP_define_field);
-                emit_atom(s, name);
-            }
-        }
-        JS_FreeAtom(s->ctx, name);
-    next:
-        name = JS_ATOM_NULL;
-        if (s->token.val != ',')
-            break;
-        if (next_token(s))
-            goto fail;
-    }
-    if (js_parse_expect(s, '}'))
-        goto fail;
-    return 0;
- fail:
-    JS_FreeAtom(s->ctx, name);
-    return -1;
-}
-
-
-
-/* find field in the current scope */
 static int find_private_class_field(JSContext *ctx, JSFunctionDef *fd,
                                     JSAtom name, int scope_level)
 {
@@ -46756,6 +46639,7 @@ struct JSParseFrame {
     /* ArrayLiteral */
     uint32_t arr_idx;
     bool    need_length;
+    bool    has_proto;      /* ObjectLiteral: a __proto__ key has already been seen */
 };
 typedef struct JSParseFrame JSParseFrame;
 
@@ -46814,6 +46698,11 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
        genuinely private; the depth never is. */
     int base = s->pd_sp, pd_ret = 0;
     int tok, opcode = 0, drop_count = 0;
+    /* ObjectLiteral scratch. NOT live across a PD_CALL — start_* are consumed by the method's
+       js_parse_function_decl (a nested ACTIVATION with its own locals) and prop_type by the branch that
+       follows it, both before any descent from this frame. */
+    const uint8_t *start_ptr = NULL;
+    int start_line = 0, start_col = 0, prop_type = 0;
 
 /* The arguments are read into temporaries FIRST: they are almost always expressions over the CALLER's frame
    (`f->level - 1`), and the push moves `f` to the callee's. */
@@ -46829,7 +46718,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         f->call_type = 0; f->call_line_num = 0; f->call_col_num = 0;             \
         f->opt_label = -1; f->arg_count = 0; f->prev_op = 0;                     \
         f->accept_lparen = false; f->has_opt_chain = false;                      \
-        f->arr_idx = 0; f->need_length = false;                                  \
+        f->arr_idx = 0; f->need_length = false; f->has_proto = false;            \
         goto dispatch;                                                          \
     } while (0)
 /* A descent: record where THIS frame continues, then push the callee's. */
@@ -46907,6 +46796,10 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     case PDS_ARR_SPREAD:      goto arr_spread_done;
     case PDS_ARR_E3:          goto arr_e3_done;
     case PDS_PFX_ARRAY:       goto pfx_array_done;
+    case PDS_OBJ:             goto obj_entry;
+    case PDS_OBJ_SPREAD:      goto obj_spread_done;
+    case PDS_OBJ_VALUE:       goto obj_value_done;
+    case PDS_PFX_OBJECT:      goto pfx_object_done;
     }
     DFAIL("parse descent resumed at a state that does not exist");
     goto unwind;
@@ -47882,9 +47775,11 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         /* Always a LITERAL here. The AssignmentPattern reparse belongs to the AssignmentExpression
            production and lives in js_parse_descent's PDS_ASGN. */
         if (s->token.val == '{') {
-            if (js_parse_object_literal(s))
+            PD_CALL(PDS_OBJ, 0, 0, 0, PDS_PFX_OBJECT);
+ pfx_object_done:
+            if (pd_ret)
                 PD_RET(-1);
-            break;
+            goto pfx_after_switch;
         }
         /* A DESCENT, not a nested activation of this driver. Calling js_parse_descent from inside itself is a C
            frame per nesting level and leaves `[[[[…]]]]` exactly as deep as the recursion it replaced — the
@@ -48501,6 +48396,124 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     }
  arr_done:
     PD_RET(js_parse_expect(s, ']'));
+
+/* ---- ObjectLiteral. Its property values are AssignmentExpressions, so like ArrayLiteral this CLOSES
+   `{a:{a:{…}}}` rather than shortening it. `name` is an OWNED atom live across the value descent, so it lives
+   in the frame's atom slot and the OOM unwind releases it — the PD_RET DCHECK is what makes a missed release
+   crash instead of leak. js_parse_property_name stays a C call: it takes a JSAtom out-parameter the descent's
+   signature cannot carry, and for a plain key it descends nowhere. ---- */
+ obj_entry:
+    if (next_token(s))
+        PD_RET(-1);
+    /* XXX: add an initial length that will be patched back */
+    emit_op(s, OP_object);
+    f->has_proto = false;
+    while (s->token.val != '}') {
+        /* specific case for getter/setter */
+        start_ptr = s->token.ptr;
+        start_line = s->token.line_num;
+        start_col = s->token.col_num;
+
+        if (s->token.val == TOK_ELLIPSIS) {
+            if (next_token(s))
+                PD_RET(-1);
+            PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_OBJ_SPREAD);
+ obj_spread_done:
+            if (pd_ret)
+                PD_RET(-1);
+            emit_op(s, OP_null);  /* dummy excludeList */
+            emit_op(s, OP_copy_data_properties);
+            emit_u8(s, 2 | (1 << 2) | (0 << 5));
+            emit_op(s, OP_drop); /* pop excludeList */
+            emit_op(s, OP_drop); /* pop src object */
+            goto obj_next;
+        }
+
+        prop_type = js_parse_property_name(s, &f->atom, true, true, false);
+        if (prop_type < 0)
+            goto obj_fail;
+
+        if (prop_type == PROP_TYPE_VAR) {
+            /* shortcut for x: x */
+            emit_op(s, OP_scope_get_var);
+            emit_atom(s, f->atom);
+            emit_u16(s, s->cur_func->scope_level);
+            emit_op(s, OP_define_field);
+            emit_atom(s, f->atom);
+        } else if (s->token.val == '(') {
+            bool is_getset = (prop_type == PROP_TYPE_GET ||
+                              prop_type == PROP_TYPE_SET);
+            JSParseFunctionEnum func_type;
+            JSFunctionKindEnum func_kind;
+            int op_flags;
+
+            func_kind = JS_FUNC_NORMAL;
+            if (is_getset) {
+                func_type = JS_PARSE_FUNC_GETTER + prop_type - PROP_TYPE_GET;
+            } else {
+                func_type = JS_PARSE_FUNC_METHOD;
+                if (prop_type == PROP_TYPE_STAR)
+                    func_kind = JS_FUNC_GENERATOR;
+                else if (prop_type == PROP_TYPE_ASYNC)
+                    func_kind = JS_FUNC_ASYNC;
+                else if (prop_type == PROP_TYPE_ASYNC_STAR)
+                    func_kind = JS_FUNC_ASYNC_GENERATOR;
+            }
+            if (js_parse_function_decl(s, func_type, func_kind, JS_ATOM_NULL,
+                                       start_ptr, start_line, start_col, PF_IN_ACCEPTED))
+                goto obj_fail;
+            if (f->atom == JS_ATOM_NULL) {
+                emit_op(s, OP_define_method_computed);
+            } else {
+                emit_op(s, OP_define_method);
+                emit_atom(s, f->atom);
+            }
+            if (is_getset) {
+                op_flags = OP_DEFINE_METHOD_GETTER +
+                    prop_type - PROP_TYPE_GET;
+            } else {
+                op_flags = OP_DEFINE_METHOD_METHOD;
+            }
+            emit_u8(s, op_flags | OP_DEFINE_METHOD_ENUMERABLE);
+        } else {
+            if (js_parse_expect(s, ':'))
+                goto obj_fail;
+            PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_OBJ_VALUE);
+ obj_value_done:
+            if (pd_ret)
+                goto obj_fail;
+            if (f->atom == JS_ATOM_NULL) {
+                set_object_name_computed(s);
+                emit_op(s, OP_define_array_el);
+                emit_op(s, OP_drop);
+            } else if (f->atom == JS_ATOM___proto__) {
+                if (f->has_proto) {
+                    js_parse_error(s, "duplicate __proto__ property name");
+                    goto obj_fail;
+                }
+                emit_op(s, OP_set_proto);
+                f->has_proto = true;
+            } else {
+                set_object_name(s, f->atom);
+                emit_op(s, OP_define_field);
+                emit_atom(s, f->atom);
+            }
+        }
+        JS_FreeAtom(ctx, f->atom);
+ obj_next:
+        f->atom = JS_ATOM_NULL;
+        if (s->token.val != ',')
+            break;
+        if (next_token(s))
+            PD_RET(-1);
+    }
+    if (js_parse_expect(s, '}'))
+        goto obj_fail;
+    PD_RET(0);
+ obj_fail:
+    JS_FreeAtom(ctx, f->atom);
+    f->atom = JS_ATOM_NULL;
+    PD_RET(-1);
 
  done:
     goto leave;
