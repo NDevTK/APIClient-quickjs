@@ -46902,16 +46902,23 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
        on every state transition. `base` is where THIS activation's frames start — it returns when the stack
        drains back to it, leaving any outer activation's frames untouched. */
     JSParseFrame *f = NULL;
-    int sp = s->pd_sp, base = s->pd_sp, ret = 0;
+    /* THE DEPTH IS NOT CACHED. It is shared state between THIS activation and any nested one, and an
+       unconverted C production between two converted ones (js_parse_function_decl, js_parse_class,
+       js_parse_template, the literals) re-enters this driver. Holding `sp` in a local and publishing it only on
+       the way out told the nested activation the stack was EMPTY: it overwrote this activation's frames and
+       then released the whole stack on its way out, leaving this one reading freed chunks. That was a segfault
+       on the first harness file and a leak on hundreds of tests. `base` is this activation's own floor and is
+       genuinely private; the depth never is. */
+    int base = s->pd_sp, ret = 0;
     int tok, opcode = 0, drop_count = 0;
 
 /* The arguments are read into temporaries FIRST: they are almost always expressions over the CALLER's frame
    (`f->level - 1`), and the push moves `f` to the callee's. */
 #define PD_PUSH(entry_, level_, flags_, op_) do {                               \
         int e_ = (entry_), lv_ = (level_), fl_ = (flags_), o_ = (op_);          \
-        if (pd_reserve(ctx, s, sp + 1))                                         \
+        if (pd_reserve(ctx, s, s->pd_sp + 1))                                   \
             goto unwind;                                                        \
-        f = PD_FRAME(sp); sp++;                                                 \
+        f = PD_FRAME(s->pd_sp); s->pd_sp++;                                     \
         f->state = e_; f->level = lv_; f->flags = fl_; f->op = o_;               \
         f->label1 = -1; f->label2 = -1; f->opcode = 0; f->atom = JS_ATOM_NULL;   \
         f->comma = false; f->is_star = false; f->name0 = JS_ATOM_NULL;           \
@@ -46930,7 +46937,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
 #define PD_RET(v_) do {                                                         \
         DCHECK(f->atom == JS_ATOM_NULL,                                         \
                "a parse frame was popped still owning an atom — it leaks");     \
-        ret = (v_); sp--; goto dispatch;                                        \
+        ret = (v_); s->pd_sp--; goto dispatch;                                  \
     } while (0)
 /* js_parse_error returns -1, so an error IS a return value — variadic because the parser's messages are
    formatted. */
@@ -46939,9 +46946,11 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_PUSH(entry, level, parse_flags, op);
 
  dispatch:
-    if (sp == base)
+    if (s->pd_sp == base)
         goto done;
-    f = PD_FRAME(sp - 1);
+    DCHECK(s->pd_sp > base && s->pd_chunks != NULL,
+           "the descent stack was released while an outer activation still held frames");
+    f = PD_FRAME(s->pd_sp - 1);
     switch (f->state) {
     case PDS_BIN:       goto bin_entry;
     case PDS_BIN_PRIV:  goto bin_priv_done;
@@ -48474,21 +48483,20 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     PD_RET(0);
 
  done:
-    DCHECK(sp == base, "the parse descent returned with frames of its own still on the stack");
     goto leave;
 
  unwind:
     /* The frame array could not grow: OOM. This is the ONE exit that does not run a production's own release,
        so it settles the atom of every frame THIS activation pushed. An outer activation's frames are its own
        and are settled when its unwind runs. */
-    while (sp > base) {
-        sp--;
-        JS_FreeAtom(ctx, PD_FRAME(sp)->atom);
+    while (s->pd_sp > base) {
+        s->pd_sp--;
+        JS_FreeAtom(ctx, PD_FRAME(s->pd_sp)->atom);
     }
     ret = -1;
  leave:
-    s->pd_sp = sp;
-    if (sp == 0)
+    DCHECK(s->pd_sp == base, "the descent returned at a depth that is not its own base");
+    if (s->pd_sp == 0)
         pd_release(ctx, s);   /* the whole descent drained — the parse owns nothing until the next one */
     return ret;
 #undef PD_PUSH
