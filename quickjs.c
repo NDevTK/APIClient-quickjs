@@ -41854,6 +41854,13 @@ typedef struct JSParseState {
        never moved; only the array OF chunk pointers is ever reallocated. Released when the stack empties. */
     struct JSParseFrame **pd_chunks;
     int pd_sp, pd_nchunks;
+    /* THE DESCENT'S OUT-PARAMETER. Some productions return a value BESIDE their status — PropertyName yields
+       the key's atom as well as its prop-type. The driver's (s, entry, level, flags, op) signature carries no
+       out-pointer, and inventing a per-call side-channel is the shape of every bug this conversion has hit:
+       state two scopes must agree on, forked into one scope's copy. So there is ONE channel, owned, written by
+       the production as it returns and CONSUMED by whoever reads it — a DCHECK asserts it is empty when a
+       producer starts, so a dropped read crashes at its origin instead of leaking an atom. */
+    JSAtom pd_name;
 } JSParseState;
 
 /* ---- JSON.parse's data types. They sit HERE, below JSParseState, because the step machine at the end of
@@ -44363,6 +44370,7 @@ enum {
     PDS_UNA_POSTFIX,
     PDS_ARR, PDS_ARR_E1, PDS_ARR_E2, PDS_ARR_SPREAD, PDS_ARR_E3, PDS_PFX_ARRAY,
     PDS_OBJ, PDS_OBJ_SPREAD, PDS_OBJ_VALUE, PDS_PFX_OBJECT,
+    PDS_PROPNAME, PDS_PN_COMPUTED, PDS_OBJ_KEY,
 };
 static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                                         int parse_flags, int op);
@@ -44378,6 +44386,11 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
 /* forbid the exponentiation operator in js_parse_unary() */
 #define PF_POW_FORBIDDEN (1 << 3)
 #define PF_AWAIT_USING   (1 << 4)
+/* PropertyName reads `parse_flags` as ITS OWN bit set — each production interprets the field, and PropertyName
+   never shares a frame with an expression production. */
+#define PN_ALLOW_METHOD  (1 << 0)
+#define PN_ALLOW_VAR     (1 << 1)
+#define PN_ALLOW_PRIVATE (1 << 2)
 
 static __exception int js_parse_function_decl(JSParseState *s,
                                               JSParseFunctionEnum func_type,
@@ -44564,125 +44577,22 @@ static bool token_starts_property_name(int tok)
 }
 
 /* if the property is an expression, name = JS_ATOM_NULL */
+/* The C-signature adapter for the call sites the descent does not own yet (js_parse_class,
+   js_parse_destructuring_element). There is ONE implementation — PDS_PROPNAME in js_parse_descent — and this
+   only reshapes the out-channel into the JSAtom* those sites pass. It CONSUMES the channel, which is what the
+   producer's DCHECK asserts. */
 static int __exception js_parse_property_name(JSParseState *s,
                                               JSAtom *pname,
                                               bool allow_method, bool allow_var,
                                               bool allow_private)
 {
-    int is_private = 0;
-    bool is_non_reserved_ident;
-    JSAtom name;
-    int prop_type;
-
-    prop_type = PROP_TYPE_IDENT;
-    if (allow_method) {
-        if (token_is_pseudo_keyword(s, JS_ATOM_get)
-        ||  token_is_pseudo_keyword(s, JS_ATOM_set)) {
-            /* get x(), set x() */
-            name = JS_DupAtom(s->ctx, s->token.u.ident.atom);
-            if (next_token(s))
-                goto fail1;
-            if (!token_starts_property_name(s->token.val)) {
-                /* `get`/`set` is the NAME here, not an accessor prefix */
-                is_non_reserved_ident = true;
-                goto ident_found;
-            }
-            prop_type = PROP_TYPE_GET + (name == JS_ATOM_set);
-            JS_FreeAtom(s->ctx, name);
-        } else if (s->token.val == '*') {
-            if (next_token(s))
-                goto fail;
-            prop_type = PROP_TYPE_STAR;
-        } else if (token_is_pseudo_keyword(s, JS_ATOM_async) &&
-                   peek_token(s, true) != '\n') {
-            name = JS_DupAtom(s->ctx, s->token.u.ident.atom);
-            if (next_token(s))
-                goto fail1;
-            if (s->token.val == ':' || s->token.val == ',' ||
-                s->token.val == '}' || s->token.val == '(' ||
-                s->token.val == '=' || s->token.val == ';') {
-                is_non_reserved_ident = true;
-                goto ident_found;
-            }
-            JS_FreeAtom(s->ctx, name);
-            if (s->token.val == '*') {
-                if (next_token(s))
-                    goto fail;
-                prop_type = PROP_TYPE_ASYNC_STAR;
-            } else {
-                prop_type = PROP_TYPE_ASYNC;
-            }
-        }
-    }
-
-    if (token_is_ident(s->token.val)) {
-        /* variable can only be a non-reserved identifier */
-        is_non_reserved_ident =
-            (s->token.val == TOK_IDENT && !s->token.u.ident.is_reserved);
-        /* keywords and reserved words have a valid atom */
-        name = JS_DupAtom(s->ctx, s->token.u.ident.atom);
-        if (next_token(s))
-            goto fail1;
-    ident_found:
-        if (is_non_reserved_ident &&
-            prop_type == PROP_TYPE_IDENT && allow_var) {
-            if (!(s->token.val == ':' ||
-                  (s->token.val == '(' && allow_method))) {
-                prop_type = PROP_TYPE_VAR;
-            }
-        }
-    } else if (s->token.val == TOK_STRING) {
-        name = JS_ValueToAtom(s->ctx, s->token.u.str.str);
-        if (name == JS_ATOM_NULL)
-            goto fail;
-        if (next_token(s))
-            goto fail1;
-    } else if (s->token.val == TOK_NUMBER) {
-        JSValue val;
-        val = s->token.u.num.val;
-        name = JS_ValueToAtom(s->ctx, val);
-        if (name == JS_ATOM_NULL)
-            goto fail;
-        if (next_token(s))
-            goto fail1;
-    } else if (s->token.val == '[') {
-        if (next_token(s))
-            goto fail;
-        /* An ASSIGNMENT expression, not an Expression: the production is `[ AssignmentExpression ]`, so a comma
-           expression is not one of these — `({[1, 2]: 3})` and `({set [1, 2](a) {}})` are Syntax Errors. Member
-           access `a[x, y]` is `[ Expression ]` and keeps the comma; the two spellings are different grammars. */
-        if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
-            goto fail;
-        if (js_parse_expect(s, ']'))
-            goto fail;
-        /* 13.2.5.4 ComputedPropertyName : [ AssignmentExpression ] — step 3 is ToPropertyKey, so the
-           coercion is part of evaluating the NAME, not of the operation that later consumes it. Leaving it
-           to the consumer runs it after the value expression (`{[key]: value}` must coerce key FIRST) and
-           after a class field's whole definition. */
-        emit_op(s, OP_to_propkey);
-        name = JS_ATOM_NULL;
-    } else if (s->token.val == TOK_PRIVATE_NAME && allow_private) {
-        name = JS_DupAtom(s->ctx, s->token.u.ident.atom);
-        if (next_token(s))
-            goto fail1;
-        is_private = PROP_TYPE_PRIVATE;
-    } else {
-        goto invalid_prop;
-    }
-    if (prop_type != PROP_TYPE_IDENT && prop_type != PROP_TYPE_VAR &&
-        s->token.val != '(') {
-        JS_FreeAtom(s->ctx, name);
-    invalid_prop:
-        js_parse_error(s, "invalid property name");
-        goto fail;
-    }
-    *pname = name;
-    return prop_type | is_private;
- fail1:
-    JS_FreeAtom(s->ctx, name);
- fail:
-    *pname = JS_ATOM_NULL;
-    return -1;
+    int r = js_parse_descent(s, PDS_PROPNAME, 0,
+                             (allow_method  ? PN_ALLOW_METHOD  : 0) |
+                             (allow_var     ? PN_ALLOW_VAR     : 0) |
+                             (allow_private ? PN_ALLOW_PRIVATE : 0), 0);
+    *pname = s->pd_name;
+    s->pd_name = JS_ATOM_NULL;
+    return r;
 }
 
 typedef struct JSParsePos {
@@ -46640,6 +46550,8 @@ struct JSParseFrame {
     uint32_t arr_idx;
     bool    need_length;
     bool    has_proto;      /* ObjectLiteral: a __proto__ key has already been seen */
+    /* PropertyName */
+    int     prop_type, is_private;
 };
 typedef struct JSParseFrame JSParseFrame;
 
@@ -46702,7 +46614,11 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
        js_parse_function_decl (a nested ACTIVATION with its own locals) and prop_type by the branch that
        follows it, both before any descent from this frame. */
     const uint8_t *start_ptr = NULL;
-    int start_line = 0, start_col = 0, prop_type = 0;
+    int start_line = 0, start_col = 0;
+    /* The out-parameter, delivered exactly like pd_ret: a production writes it as it returns and the resume
+       label reads it immediately. Published to s->pd_name on the way out for C callers. */
+    JSAtom out_name = JS_ATOM_NULL;
+    bool is_non_reserved_ident = false;
 
 /* The arguments are read into temporaries FIRST: they are almost always expressions over the CALLER's frame
    (`f->level - 1`), and the push moves `f` to the callee's. */
@@ -46719,6 +46635,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         f->opt_label = -1; f->arg_count = 0; f->prev_op = 0;                     \
         f->accept_lparen = false; f->has_opt_chain = false;                      \
         f->arr_idx = 0; f->need_length = false; f->has_proto = false;            \
+        f->prop_type = 0; f->is_private = 0;                                     \
         goto dispatch;                                                          \
     } while (0)
 /* A descent: record where THIS frame continues, then push the callee's. */
@@ -46800,6 +46717,9 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     case PDS_OBJ_SPREAD:      goto obj_spread_done;
     case PDS_OBJ_VALUE:       goto obj_value_done;
     case PDS_PFX_OBJECT:      goto pfx_object_done;
+    case PDS_PROPNAME:        goto pn_entry;
+    case PDS_PN_COMPUTED:     goto pn_computed_done;
+    case PDS_OBJ_KEY:         goto obj_key_done;
     }
     DFAIL("parse descent resumed at a state that does not exist");
     goto unwind;
@@ -48429,11 +48349,15 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             goto obj_next;
         }
 
-        prop_type = js_parse_property_name(s, &f->atom, true, true, false);
-        if (prop_type < 0)
+        PD_CALL(PDS_PROPNAME, 0, PN_ALLOW_METHOD | PN_ALLOW_VAR, 0, PDS_OBJ_KEY);
+ obj_key_done:
+        f->prop_type = pd_ret;
+        f->atom = out_name;
+        out_name = JS_ATOM_NULL;
+        if (f->prop_type < 0)
             goto obj_fail;
 
-        if (prop_type == PROP_TYPE_VAR) {
+        if (f->prop_type == PROP_TYPE_VAR) {
             /* shortcut for x: x */
             emit_op(s, OP_scope_get_var);
             emit_atom(s, f->atom);
@@ -48441,22 +48365,22 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             emit_op(s, OP_define_field);
             emit_atom(s, f->atom);
         } else if (s->token.val == '(') {
-            bool is_getset = (prop_type == PROP_TYPE_GET ||
-                              prop_type == PROP_TYPE_SET);
+            bool is_getset = (f->prop_type == PROP_TYPE_GET ||
+                              f->prop_type == PROP_TYPE_SET);
             JSParseFunctionEnum func_type;
             JSFunctionKindEnum func_kind;
             int op_flags;
 
             func_kind = JS_FUNC_NORMAL;
             if (is_getset) {
-                func_type = JS_PARSE_FUNC_GETTER + prop_type - PROP_TYPE_GET;
+                func_type = JS_PARSE_FUNC_GETTER + f->prop_type - PROP_TYPE_GET;
             } else {
                 func_type = JS_PARSE_FUNC_METHOD;
-                if (prop_type == PROP_TYPE_STAR)
+                if (f->prop_type == PROP_TYPE_STAR)
                     func_kind = JS_FUNC_GENERATOR;
-                else if (prop_type == PROP_TYPE_ASYNC)
+                else if (f->prop_type == PROP_TYPE_ASYNC)
                     func_kind = JS_FUNC_ASYNC;
-                else if (prop_type == PROP_TYPE_ASYNC_STAR)
+                else if (f->prop_type == PROP_TYPE_ASYNC_STAR)
                     func_kind = JS_FUNC_ASYNC_GENERATOR;
             }
             if (js_parse_function_decl(s, func_type, func_kind, JS_ATOM_NULL,
@@ -48470,7 +48394,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             }
             if (is_getset) {
                 op_flags = OP_DEFINE_METHOD_GETTER +
-                    prop_type - PROP_TYPE_GET;
+                    f->prop_type - PROP_TYPE_GET;
             } else {
                 op_flags = OP_DEFINE_METHOD_METHOD;
             }
@@ -48515,6 +48439,131 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     f->atom = JS_ATOM_NULL;
     PD_RET(-1);
 
+/* ---- PropertyName. Its computed form is `[ AssignmentExpression ]`, which the descent owns, so converting it
+   closes `{[{[…]}]}`. It returns a PROP-TYPE as its status and the key's ATOM through the out-channel; the atom
+   lives in the frame slot until then so the OOM unwind releases it. `parse_flags` here is the PN_* bit set. ---- */
+ pn_entry:
+    DCHECK(out_name == JS_ATOM_NULL,
+           "a PropertyName started while the previous key's atom was still unconsumed");
+    f->is_private = 0;
+    f->prop_type = PROP_TYPE_IDENT;
+    if (f->flags & PN_ALLOW_METHOD) {
+        if (token_is_pseudo_keyword(s, JS_ATOM_get)
+        ||  token_is_pseudo_keyword(s, JS_ATOM_set)) {
+            /* get x(), set x() */
+            f->atom = JS_DupAtom(ctx, s->token.u.ident.atom);
+            if (next_token(s))
+                goto pn_fail1;
+            if (!token_starts_property_name(s->token.val)) {
+                /* `get`/`set` is the NAME here, not an accessor prefix */
+                is_non_reserved_ident = true;
+                goto pn_ident_found;
+            }
+            f->prop_type = PROP_TYPE_GET + (f->atom == JS_ATOM_set);
+            JS_FreeAtom(ctx, f->atom);
+            f->atom = JS_ATOM_NULL;
+        } else if (s->token.val == '*') {
+            if (next_token(s))
+                goto pn_fail;
+            f->prop_type = PROP_TYPE_STAR;
+        } else if (token_is_pseudo_keyword(s, JS_ATOM_async) &&
+                   peek_token(s, true) != '\n') {
+            f->atom = JS_DupAtom(ctx, s->token.u.ident.atom);
+            if (next_token(s))
+                goto pn_fail1;
+            if (s->token.val == ':' || s->token.val == ',' ||
+                s->token.val == '}' || s->token.val == '(' ||
+                s->token.val == '=' || s->token.val == ';') {
+                is_non_reserved_ident = true;
+                goto pn_ident_found;
+            }
+            JS_FreeAtom(ctx, f->atom);
+            f->atom = JS_ATOM_NULL;
+            if (s->token.val == '*') {
+                if (next_token(s))
+                    goto pn_fail;
+                f->prop_type = PROP_TYPE_ASYNC_STAR;
+            } else {
+                f->prop_type = PROP_TYPE_ASYNC;
+            }
+        }
+    }
+
+    if (token_is_ident(s->token.val)) {
+        /* variable can only be a non-reserved identifier */
+        is_non_reserved_ident =
+            (s->token.val == TOK_IDENT && !s->token.u.ident.is_reserved);
+        /* keywords and reserved words have a valid atom */
+        f->atom = JS_DupAtom(ctx, s->token.u.ident.atom);
+        if (next_token(s))
+            goto pn_fail1;
+    pn_ident_found:
+        if (is_non_reserved_ident &&
+            f->prop_type == PROP_TYPE_IDENT && (f->flags & PN_ALLOW_VAR)) {
+            if (!(s->token.val == ':' ||
+                  (s->token.val == '(' && (f->flags & PN_ALLOW_METHOD)))) {
+                f->prop_type = PROP_TYPE_VAR;
+            }
+        }
+    } else if (s->token.val == TOK_STRING) {
+        f->atom = JS_ValueToAtom(ctx, s->token.u.str.str);
+        if (f->atom == JS_ATOM_NULL)
+            goto pn_fail;
+        if (next_token(s))
+            goto pn_fail1;
+    } else if (s->token.val == TOK_NUMBER) {
+        JSValue val;
+        val = s->token.u.num.val;
+        f->atom = JS_ValueToAtom(ctx, val);
+        if (f->atom == JS_ATOM_NULL)
+            goto pn_fail;
+        if (next_token(s))
+            goto pn_fail1;
+    } else if (s->token.val == '[') {
+        if (next_token(s))
+            goto pn_fail;
+        /* An ASSIGNMENT expression, not an Expression: the production is `[ AssignmentExpression ]`, so a comma
+           expression is not one of these — `({[1, 2]: 3})` and `({set [1, 2](a) {}})` are Syntax Errors. Member
+           access `a[x, y]` is `[ Expression ]` and keeps the comma; the two spellings are different grammars. */
+        PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_PN_COMPUTED);
+ pn_computed_done:
+        if (pd_ret)
+            goto pn_fail;
+        if (js_parse_expect(s, ']'))
+            goto pn_fail;
+        /* 13.2.5.4 ComputedPropertyName : [ AssignmentExpression ] — step 3 is ToPropertyKey, so the
+           coercion is part of evaluating the NAME, not of the operation that later consumes it. Leaving it
+           to the consumer runs it after the value expression (`{[key]: value}` must coerce key FIRST) and
+           after a class field's whole definition. */
+        emit_op(s, OP_to_propkey);
+        f->atom = JS_ATOM_NULL;
+    } else if (s->token.val == TOK_PRIVATE_NAME && (f->flags & PN_ALLOW_PRIVATE)) {
+        f->atom = JS_DupAtom(ctx, s->token.u.ident.atom);
+        if (next_token(s))
+            goto pn_fail1;
+        f->is_private = PROP_TYPE_PRIVATE;
+    } else {
+        goto pn_invalid;
+    }
+    if (f->prop_type != PROP_TYPE_IDENT && f->prop_type != PROP_TYPE_VAR &&
+        s->token.val != '(') {
+        JS_FreeAtom(ctx, f->atom);
+        f->atom = JS_ATOM_NULL;
+    pn_invalid:
+        js_parse_error(s, "invalid property name");
+        goto pn_fail;
+    }
+    /* the key's atom leaves through the out-channel, so the frame stops owning it here */
+    out_name = f->atom;
+    f->atom = JS_ATOM_NULL;
+    PD_RET(f->prop_type | f->is_private);
+ pn_fail1:
+    JS_FreeAtom(ctx, f->atom);
+    f->atom = JS_ATOM_NULL;
+ pn_fail:
+    out_name = JS_ATOM_NULL;
+    PD_RET(-1);
+
  done:
     goto leave;
 
@@ -48529,6 +48578,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     pd_ret = -1;
  leave:
     DCHECK(s->pd_sp == base, "the descent returned at a depth that is not its own base");
+    s->pd_name = out_name;
     if (s->pd_sp == 0)
         pd_release(ctx, s);   /* the whole descent drained — the parse owns nothing until the next one */
     return pd_ret;
