@@ -1589,7 +1589,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_PARSEINT, STEPDEF_PARSEFLOAT, STEPDEF_STR_SPLIT,
     STEPDEF_ARRAY_JOIN, STEPDEF_ARRAY_TOLOCALESTRING, STEPDEF_ARRAY_TOSTRING,
     STEPDEF_TA_JOIN, STEPDEF_TA_TOLOCALESTRING,
-    STEPDEF_BIGINT_ASUINTN, STEPDEF_BIGINT_ASINTN,
+    STEPDEF_BIGINT_ASUINTN, STEPDEF_BIGINT_ASINTN, STEPDEF_BIGINT_TOSTRING,
     STEPDEF_OBJ_GOPD, STEPDEF_REFLECT_GOPD,
     STEPDEF_OBJ_VALUES, STEPDEF_OBJ_ENTRIES, STEPDEF_OBJ_ASSIGN, STEPDEF_OBJ_SPREAD,
     STEPDEF_ARRAY_FROMASYNC, STEPDEF_ARRAY_FLAT, STEPDEF_ARRAY_FLATMAP, STEPDEF_ARRAY_FROMLIKE, STEPDEF_ARRAY_WITH, STEPDEF_ARRAY_FILL, STEPDEF_ARRAY_COPYWITHIN, STEPDEF_BIGINT_CTOR, STEPDEF_TA_WITH, STEPDEF_TA_FILL, STEPDEF_TA_COPYWITHIN, STEPDEF_TA_INDEXOF, STEPDEF_TA_LASTINDEXOF, STEPDEF_TA_INCLUDES, STEPDEF_TA_SUBARRAY, STEPDEF_AB_SLICE, STEPDEF_AB_SLICE_IMM, STEPDEF_SAB_SLICE, STEPDEF_AB_CTOR, STEPDEF_SAB_CTOR, STEPDEF_AB_RESIZE, STEPDEF_SAB_GROW, STEPDEF_AB_TRANSFER, STEPDEF_AB_TRANSFER_IMM, STEPDEF_AB_TRANSFER_FIX, STEPDEF_DATAVIEW_CTOR, STEPDEF_DATE_TOJSON, STEPDEF_DATE_TOPRIM, STEPDEF_DATE_CTOR,
@@ -71830,6 +71830,14 @@ static JSValue js_global_unescape(JSContext *ctx, JSValueConst this_val, int arg
    models — and each ran that ToString from C, so `decodeURIComponent({toString(){for(;;){}}})` drove to
    completion. Once Object.prototype.toString became a machine the DEFAULT receiver reached its backstop too,
    which is how the corpus named this family. */
+/* 21.2.3.3 BigInt.prototype.toString(radix): the radix is the method's ONLY user code — js_get_radix does
+   ToInt32Sat on it, which is ToPrimitive on an object argument — and everything after runs on a primitive.
+   That is exactly the coerce-then-compute shape, and Number.prototype.toString already had it; this one was
+   still a plain JS_CFUNC_DEF, so `(1n).toString({valueOf(){...}})` ran valueOf from C with no flow base. It is
+   the site the ToPrimitive forcing function named, and the fix is the mechanism that already exists rather
+   than a second one. */
+static JSValue js_bigint_toString(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static const JSTrampStepDef js_bigint_tostring_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), generic, js_bigint_toString, 0);
 static const JSTrampStepDef js_decodeURI_def      = PRIMARGS_DEF(PRIMARGS(0x1, HINT_STRING, 1), generic_magic, js_global_decodeURI, 0);
 static const JSTrampStepDef js_decodeURIComp_def  = PRIMARGS_DEF(PRIMARGS(0x1, HINT_STRING, 1), generic_magic, js_global_decodeURI, 1);
 static const JSTrampStepDef js_encodeURI_def      = PRIMARGS_DEF(PRIMARGS(0x1, HINT_STRING, 1), generic_magic, js_global_encodeURI, 0);
@@ -73622,6 +73630,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_REFLECT_CONSTRUCT] = &js_reflect_construct_def,
     [STEPDEF_NUM_CTOR]        = &js_num_ctor_def,
     [STEPDEF_BIGINT_ASUINTN]  = &js_bigint_asUintN_def,
+    [STEPDEF_BIGINT_TOSTRING] = &js_bigint_tostring_def,
     [STEPDEF_BIGINT_ASINTN]   = &js_bigint_asIntN_def,
     [STEPDEF_OBJ_SETPROTO]    = &js_obj_setproto_def,
     [STEPDEF_REFLECT_SETPROTO] = &js_reflect_setproto_def,
@@ -92447,7 +92456,7 @@ static const JSCFunctionListEntry js_bigint_funcs[] = {
 };
 
 static const JSCFunctionListEntry js_bigint_proto_funcs[] = {
-    JS_CFUNC_DEF("toString", 0, js_bigint_toString ),
+    JS_CFUNC_STEP_DEF("toString", 0, STEPDEF_BIGINT_TOSTRING ),
     JS_CFUNC_DEF("valueOf", 0, js_bigint_valueOf ),
     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "BigInt", JS_PROP_CONFIGURABLE ),
 };
