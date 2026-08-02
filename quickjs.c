@@ -21863,8 +21863,28 @@ static JSObject *ta_atom_write_needs_toprim(JSContext *ctx, JSValueConst target,
        after a chain hop is NOT the typed array — so the comparison is against the SITE, both ways. */
     if (JS_IsUninitialized(recv)) {
         if (JS_VALUE_GET_TAG(target) != JS_TAG_OBJECT || JS_VALUE_GET_OBJ(target) != p) return NULL;
-    } else if (JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT || JS_VALUE_GET_OBJ(recv) != p) {
+    } else if (JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT) {
         return NULL;
+    } else if (JS_VALUE_GET_OBJ(recv) != p) {
+        /* THE SITE IS WHERE THE WRITE LANDS, AND WITH AN ALTERED RECEIVER THAT IS NOT THE TARGET. Step 3 hands
+           the write to OrdinarySet, which performs it on the RECEIVER — so when the receiver is ITSELF a typed
+           array its own element store coerces V by the same 10.4.5.16 step 1, and the site is the receiver.
+           `Reflect.set(ta, 0, Object(2n), otherTa)` is that shape; comparing only against the target's typed
+           array declined it and let the coercion run from C.
+           THE INDEX IS VALIDATED ON THE RECEIVER, because the receiver's write arrives through
+           [[DefineOwnProperty]], and 10.4.5.3 step 1 validates BEFORE coercing — the opposite order from
+           TypedArraySetElement, which coerces first. So an index out of range on the receiver (a SHORTER typed
+           array, or a canonical-but-invalid key) must coerce NOTHING: decline, and the C define path answers
+           false on its own bounds test without running user code. Both of those are pinned by
+           key-is-valid-index-reflect-set.js and key-is-canonical-invalid-index-reflect-set.js. */
+        JSObject *pr = JS_VALUE_GET_OBJ(recv);
+        if (!is_typed_array(pr->class_id)) return NULL;
+        /* STEP 2b GUARDS THE HANDOFF. A canonical numeric index that is invalid on the TARGET returns true
+           right there — the write never reaches OrdinarySet, so it never touches the receiver, however long
+           the receiver is. Checking only the receiver wrote through a key the target had already rejected. */
+        if (!js_ta_index_is_valid(ctx, target, atom)) return NULL;
+        if (!js_ta_index_is_valid(ctx, recv, atom)) return NULL;
+        p = pr;
     }
     return JS_AtomIsNumericIndex(ctx, atom) > 0 ? p : NULL;
 }
