@@ -44377,6 +44377,12 @@ enum {
     PDS_FIO, PDS_FIO_01, PDS_FIO_02, PDS_FIO_03, PDS_FIO_04, PDS_FIO_05,
     PDS_CLASS, PDS_CLS_01, PDS_CLS_02, PDS_SRCELEM, PDS_SE_01,
     PDS_EXPORT, PDS_EXP_01, PDS_EXP_02, PDS_EXP_03, PDS_EXP_04,
+    PDS_FDECL, PDS_FD_01, PDS_FD_02, PDS_FD_03, PDS_FD_04,
+    /* the thirteen places a function body is descended into */
+    PDS_ASGN_ARROW1, PDS_ASGN_ARROW2, PDS_ASGN_ARROW3,
+    PDS_PFX_FUNC, PDS_PFX_ASYNCFUNC, PDS_OBJ_METHOD, PDS_SOD_FUNCVAR,
+    PDS_CLS_SINIT, PDS_CLS_ACCESSOR, PDS_CLS_METHOD,
+    PDS_SE_FUNC, PDS_EXP_FUNC, PDS_EXP_DEFFUNC,
     PDS_DESTR, PDS_DE_01, PDS_DE_02, PDS_DE_03, PDS_DE_04, PDS_DE_05,
     PDS_DE_06, PDS_DE_07, PDS_DE_08, PDS_DE_09, PDS_DE_10,
     PDS_SOD_01, PDS_SOD_02, PDS_SOD_03, PDS_SOD_04, PDS_SOD_05, PDS_SOD_06, PDS_SOD_07, PDS_SOD_08, PDS_SOD_09, PDS_SOD_10, PDS_SOD_11, PDS_SOD_12, PDS_SOD_13, PDS_SOD_14, PDS_SOD_15, PDS_SOD_16, PDS_SOD_17, PDS_SOD_18, PDS_SOD_19, PDS_SOD_20, PDS_SOD_21, PDS_SOD_22, PDS_SOD_23, PDS_SOD_24, PDS_SOD_25, PDS_SOD_26, PDS_SOD_27, PDS_SOD_28, PDS_SOD_29,
@@ -44434,23 +44440,8 @@ static int add_star_export_entry(JSContext *ctx, JSModuleDef *m, int req_module_
    1 — so it is normalised on the way in (negative -> -1, zero -> 0, anything else -> 1) rather than biased
    arithmetically, which packed garbage for every masked caller. */
 
-static __exception int js_parse_function_decl(JSParseState *s,
-                                              JSParseFunctionEnum func_type,
-                                              JSFunctionKindEnum func_kind,
-                                              JSAtom func_name, const uint8_t *ptr,
-                                              int start_line, int start_col,
-                                              int parse_flags);
 static JSFunctionDef *js_parse_function_class_fields_init(JSParseState *s);
-static __exception int js_parse_function_decl2(JSParseState *s,
-                                               JSParseFunctionEnum func_type,
-                                               JSFunctionKindEnum func_kind,
-                                               JSAtom func_name,
-                                               const uint8_t *ptr,
-                                               int function_line_num,
-                                               int function_col_num,
-                                               JSParseExportEnum export_flag,
-                                               JSFunctionDef **pfd,
-                                               int parse_flags);
+/* The descent driver reaches all of these, and every one of them is defined after it. */
 static void push_break_entry(JSFunctionDef *fd, BlockEnv *be,
                              JSAtom label_name,
                              int label_break, int label_cont,
@@ -44459,7 +44450,11 @@ static void pop_break_entry(JSFunctionDef *fd);
 static JSExportEntry *add_export_entry(JSParseState *s, JSModuleDef *m,
                                        JSAtom local_name, JSAtom export_name,
                                        JSExportTypeEnum export_type);
-
+static int seal_template_obj(JSContext *ctx, JSValue obj);
+static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd);
+static __exception int js_parse_directives(JSParseState *s);
+static int js_parse_function_check_names(JSParseState *s, JSFunctionDef *fd,
+                                         JSAtom func_name);
 /* Note: all the fields are already sealed except length */
 static int seal_template_obj(JSContext *ctx, JSValue obj)
 {
@@ -45504,6 +45499,11 @@ struct JSParseFrame {
        arrangement PD_CALL_AT already uses for a source position. */
     const uint8_t *st_ptr;
     JSFunctionDef **st_pfd;
+    /* The ENCLOSING function def. FunctionDeclaration captures s->cur_func on entry and then pushes a NEW one
+       for the function being parsed, so the two diverge and the enclosing def cannot be re-derived from
+       s->cur_func the way every other production re-derives it. It is frame state for the same reason a driver
+       local would be wrong: one variable shared by every frame in an activation, and this production nests. */
+    JSFunctionDef *st_fd;
     /* TemplateLiteral: the tagged form's cooked and raw arrays, LIVE ACROSS the substitution descent — a
        nested template is a nested FRAME, and holding these in a driver local let the inner one reset the
        outer's to JS_UNDEFINED. Ownership matches the recursive body: template_object is released after
@@ -45514,6 +45514,14 @@ struct JSParseFrame {
        object literal with methods of its own. */
     const uint8_t *start_ptr;
     int     start_line, start_col;
+    /* ClassDeclaration: the state that spans the WHOLE member list, so every one of these is live across the
+       descents each member performs (a computed key, a field initialiser, and — once the method body is a
+       PD_CALL rather than a C recursion — the method body itself). A class inside a class method is then a
+       nested FRAME in the same driver activation, so a driver local would be one variable shared by both and
+       the inner class would overwrite the outer's field table, constructor and source start. */
+    ClassFieldsDef st_class_fields[2];
+    JSFunctionDef *st_ctor_fd;
+    const uint8_t *st_class_start;
 };
 typedef struct JSParseFrame JSParseFrame;
 
@@ -45603,9 +45611,11 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         f->st_line = 0; f->st_col = 0; f->st_idx = 0; f->st_is_async = false;    \
         f->st_flag = false;                                                      \
         f->st_b1 = false; f->st_b2 = false; f->st_b3 = false; \
-        f->st_ptr = NULL; f->st_pfd = NULL;                                      \
+        f->st_ptr = NULL; f->st_pfd = NULL; f->st_fd = NULL;                     \
         f->raw_array = JS_UNDEFINED; f->template_object = JS_UNDEFINED;          \
-        f->start_ptr = NULL; f->start_line = 0; f->start_col = 0;
+        f->start_ptr = NULL; f->start_line = 0; f->start_col = 0;                \
+        memset(f->st_class_fields, 0, sizeof(f->st_class_fields));               \
+        f->st_ctor_fd = NULL; f->st_class_start = NULL;
 
 #define PD_PUSH(entry_, level_, flags_, op_) do {                               \
         int e_ = (entry_), lv_ = (level_), fl_ = (flags_), o_ = (op_);          \
@@ -45636,18 +45646,23 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         goto dispatch;                                                          \
     } while (0)
 
-/* A descent that also seeds the callee's POINTER arguments — see JSParseFrame.st_ptr / st_pfd. */
-#define PD_CALL_P(entry_, level_, flags_, op_, ptr_, pfd_, line_, col_, resume_) do { \
+/* A descent carrying the FunctionDeclaration argument set, which the four int slots cannot hold: a source
+   POINTER, a JSFunctionDef** out-parameter, the position of the function's first token, and the export flag.
+   See JSParseFrame.st_ptr / st_pfd / st_line / st_col / st_mask. The remaining parameter of that production,
+   func_name, is JS_ATOM_NULL at every call site, which PD_INIT already settles st_idx to — a caller needing a
+   name seeds st_idx itself, and the DCHECK at fd2_entry is what stops one from forgetting. */
+#define PD_CALL_P(entry_, level_, flags_, op_, ptr_, pfd_, line_, col_, mask_, resume_) do { \
         int e_ = (entry_), lv_ = (level_), fl_ = (flags_), o_ = (op_);          \
         const uint8_t *p_ = (ptr_);                                             \
         JSFunctionDef **pf_ = (pfd_);                                           \
-        int ln_ = (line_), cl_ = (col_);                                        \
+        int ln_ = (line_), cl_ = (col_), mk_ = (mask_);                         \
         f->state = (resume_);                                                   \
         if (pd_reserve(ctx, s, s->pd_sp + 1))                                   \
             goto unwind;                                                        \
         f = PD_FRAME(s->pd_sp); s->pd_sp++;                                     \
         PD_INIT()                                                               \
         f->st_ptr = p_; f->st_pfd = pf_; f->st_line = ln_; f->st_col = cl_;     \
+        f->st_mask = mk_;                                                       \
         goto dispatch;                                                          \
     } while (0)
 
@@ -45746,6 +45761,24 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     case PDS_FIO_05:          goto fio_05;
     case PDS_SRCELEM:         goto se_entry;
     case PDS_EXPORT:          goto exp_entry;
+    case PDS_FDECL:           goto fd2_entry;
+    case PDS_FD_01:           goto fd2_01;
+    case PDS_FD_02:           goto fd2_02;
+    case PDS_FD_03:           goto fd2_03;
+    case PDS_FD_04:           goto fd2_04;
+    case PDS_ASGN_ARROW1:     goto asgn_arrow1_done;
+    case PDS_ASGN_ARROW2:     goto asgn_arrow2_done;
+    case PDS_ASGN_ARROW3:     goto asgn_arrow3_done;
+    case PDS_PFX_FUNC:        goto pfx_func_done;
+    case PDS_PFX_ASYNCFUNC:   goto pfx_asyncfunc_done;
+    case PDS_OBJ_METHOD:      goto obj_method_done;
+    case PDS_SOD_FUNCVAR:     goto sod_funcvar_done;
+    case PDS_CLS_SINIT:       goto cls_sinit_done;
+    case PDS_CLS_ACCESSOR:    goto cls_accessor_done;
+    case PDS_CLS_METHOD:      goto cls_method_done;
+    case PDS_SE_FUNC:         goto se_func_done;
+    case PDS_EXP_FUNC:        goto exp_func_done;
+    case PDS_EXP_DEFFUNC:     goto exp_deffunc_done;
     case PDS_EXP_01:          goto exp_01;
     case PDS_EXP_02:          goto exp_02;
     case PDS_EXP_03:          goto exp_03;
@@ -46299,10 +46332,11 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     }
     if (s->token.val == '(' &&
         js_parse_skip_parens_token(s, NULL, true) == TOK_ARROW) {
-        PD_RET(js_parse_function_decl(s, JS_PARSE_FUNC_ARROW,
-                                      JS_FUNC_NORMAL, JS_ATOM_NULL,
-                                      s->token.ptr, s->token.line_num,
-                                      s->token.col_num, f->flags));
+        PD_CALL_P(PDS_FDECL, JS_PARSE_FUNC_ARROW, f->flags, JS_FUNC_NORMAL,
+                  s->token.ptr, NULL, s->token.line_num, s->token.col_num,
+                  JS_PARSE_EXPORT_NONE, PDS_ASGN_ARROW1);
+ asgn_arrow1_done:
+        PD_RET(pd_ret);
     }
     if (token_is_pseudo_keyword(s, JS_ATOM_async)) {
         const uint8_t *source_ptr;
@@ -46324,20 +46358,22 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
              js_parse_skip_parens_token(s, NULL, true) == TOK_ARROW) ||
             (s->token.val == TOK_IDENT && !s->token.u.ident.is_reserved &&
              peek_token(s, true) == TOK_ARROW)) {
-            PD_RET(js_parse_function_decl(s, JS_PARSE_FUNC_ARROW,
-                                          JS_FUNC_ASYNC, JS_ATOM_NULL,
-                                          source_ptr, source_line_num,
-                                          source_col_num, f->flags));
+            PD_CALL_P(PDS_FDECL, JS_PARSE_FUNC_ARROW, f->flags, JS_FUNC_ASYNC,
+                      source_ptr, NULL, source_line_num, source_col_num,
+                      JS_PARSE_EXPORT_NONE, PDS_ASGN_ARROW2);
+ asgn_arrow2_done:
+            PD_RET(pd_ret);
         }
         /* undo the token parsing */
         if (js_parse_seek_token(s, &pos))
             PD_RET(-1);
     } else if (s->token.val == TOK_IDENT &&
                peek_token(s, true) == TOK_ARROW) {
-        PD_RET(js_parse_function_decl(s, JS_PARSE_FUNC_ARROW,
-                                      JS_FUNC_NORMAL, JS_ATOM_NULL,
-                                      s->token.ptr, s->token.line_num,
-                                      s->token.col_num, f->flags));
+        PD_CALL_P(PDS_FDECL, JS_PARSE_FUNC_ARROW, f->flags, JS_FUNC_NORMAL,
+                  s->token.ptr, NULL, s->token.line_num, s->token.col_num,
+                  JS_PARSE_EXPORT_NONE, PDS_ASGN_ARROW3);
+ asgn_arrow3_done:
+        PD_RET(pd_ret);
     }
  assign_next:
     if (s->token.val == '[' || s->token.val == '{') {
@@ -46684,11 +46720,11 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             PD_RET(-1);
         goto pfx_after_switch;
     case TOK_FUNCTION:
-        if (js_parse_function_decl(s, JS_PARSE_FUNC_EXPR,
-                                   JS_FUNC_NORMAL, JS_ATOM_NULL,
-                                   s->token.ptr,
-                                   s->token.line_num,
-                                   s->token.col_num, PF_IN_ACCEPTED))
+        PD_CALL_P(PDS_FDECL, JS_PARSE_FUNC_EXPR, PF_IN_ACCEPTED, JS_FUNC_NORMAL,
+                  s->token.ptr, NULL, s->token.line_num, s->token.col_num,
+                  JS_PARSE_EXPORT_NONE, PDS_PFX_FUNC);
+ pfx_func_done:
+        if (pd_ret)
             PD_RET(-1);
         break;
     case TOK_CLASS:
@@ -46743,11 +46779,12 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                 if (next_token(s))
                     PD_RET(-1);
                 if (s->token.val == TOK_FUNCTION) {
-                    if (js_parse_function_decl(s, JS_PARSE_FUNC_EXPR,
-                                               JS_FUNC_ASYNC, JS_ATOM_NULL,
-                                               source_ptr,
-                                               source_line_num,
-                                               source_col_num, PF_IN_ACCEPTED))
+                    PD_CALL_P(PDS_FDECL, JS_PARSE_FUNC_EXPR, PF_IN_ACCEPTED,
+                              JS_FUNC_ASYNC, source_ptr, NULL, source_line_num,
+                              source_col_num, JS_PARSE_EXPORT_NONE,
+                              PDS_PFX_ASYNCFUNC);
+ pfx_asyncfunc_done:
+                    if (pd_ret)
                         PD_RET(-1);
                 } else {
                     name = JS_DupAtom(s->ctx, JS_ATOM_async);
@@ -47450,14 +47487,16 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             emit_op(s, OP_define_field);
             emit_atom(s, f->atom);
         } else if (s->token.val == '(') {
-            bool is_getset = (f->prop_type == PROP_TYPE_GET ||
-                              f->prop_type == PROP_TYPE_SET);
+            /* getset is NOT a local: it is read on both sides of the descent below, and a nested activation of
+               this same production would clobber a driver local across it. It is a pure function of prop_type,
+               which the frame carries, so it is recomputed rather than stored. */
+#define OBJ_IS_GETSET() (f->prop_type == PROP_TYPE_GET || f->prop_type == PROP_TYPE_SET)
             JSParseFunctionEnum func_type;
             JSFunctionKindEnum func_kind;
             int op_flags;
 
             func_kind = JS_FUNC_NORMAL;
-            if (is_getset) {
+            if (OBJ_IS_GETSET()) {
                 func_type = JS_PARSE_FUNC_GETTER + f->prop_type - PROP_TYPE_GET;
             } else {
                 func_type = JS_PARSE_FUNC_METHOD;
@@ -47468,8 +47507,11 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                 else if (f->prop_type == PROP_TYPE_ASYNC_STAR)
                     func_kind = JS_FUNC_ASYNC_GENERATOR;
             }
-            if (js_parse_function_decl(s, func_type, func_kind, JS_ATOM_NULL,
-                                       f->start_ptr, f->start_line, f->start_col, PF_IN_ACCEPTED))
+            PD_CALL_P(PDS_FDECL, func_type, PF_IN_ACCEPTED, func_kind,
+                      f->start_ptr, NULL, f->start_line, f->start_col,
+                      JS_PARSE_EXPORT_NONE, PDS_OBJ_METHOD);
+ obj_method_done:
+            if (pd_ret)
                 goto obj_fail;
             if (f->atom == JS_ATOM_NULL) {
                 emit_op(s, OP_define_method_computed);
@@ -47477,13 +47519,14 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                 emit_op(s, OP_define_method);
                 emit_atom(s, f->atom);
             }
-            if (is_getset) {
+            if (OBJ_IS_GETSET()) {
                 op_flags = OP_DEFINE_METHOD_GETTER +
                     f->prop_type - PROP_TYPE_GET;
             } else {
                 op_flags = OP_DEFINE_METHOD_METHOD;
             }
             emit_u8(s, op_flags | OP_DEFINE_METHOD_ENUMERABLE);
+#undef OBJ_IS_GETSET
         } else {
             if (js_parse_expect(s, ':'))
                 goto obj_fail;
@@ -48800,11 +48843,11 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                 goto sod_fail;
             }
         parse_func_var:
-            if (js_parse_function_decl(s, JS_PARSE_FUNC_VAR,
-                                       JS_FUNC_NORMAL, JS_ATOM_NULL,
-                                       s->token.ptr,
-                                       s->token.line_num,
-                                       s->token.col_num, PF_IN_ACCEPTED))
+            PD_CALL_P(PDS_FDECL, JS_PARSE_FUNC_VAR, PF_IN_ACCEPTED,
+                      JS_FUNC_NORMAL, s->token.ptr, NULL, s->token.line_num,
+                      s->token.col_num, JS_PARSE_EXPORT_NONE, PDS_SOD_FUNCVAR);
+ sod_funcvar_done:
+            if (pd_ret)
                 goto sod_fail;
             break;
         }
@@ -49802,11 +49845,14 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
  cls_entry:
     f->st_mask = 0;   /* class_flags — its declaration carried this initialiser */
     JSAtom class_name1;
-    JSFunctionDef *method_fd, *ctor_fd;
     int i;
-    const uint8_t *class_start_ptr = s->token.ptr;
     const uint8_t *start_ptr;
-    ClassFieldsDef class_fields[2];
+    f->st_class_start = s->token.ptr;
+/* class_fields, ctor_fd and class_start_ptr span the whole member list — see JSParseFrame.st_class_fields.
+   They are spelled through the frame so a class nested in a class METHOD cannot overwrite the outer class's. */
+#define class_fields     (f->st_class_fields)
+#define ctor_fd          (f->st_ctor_fd)
+#define class_start_ptr  (f->st_class_start)
 
     /* classes are parsed and executed in strict mode */
     f->st_b3 = s->cur_func->is_strict_mode;
@@ -49915,13 +49961,14 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                         goto cls_fail;
                 s->cur_func = cf->fields_init_fd;
                 // stack is now: <empty>
-                JSFunctionDef *init;
-                if (js_parse_function_decl2(s, JS_PARSE_FUNC_CLASS_STATIC_INIT,
-                                            JS_FUNC_NORMAL, JS_ATOM_NULL,
-                                            s->token.ptr,
-                                            s->token.line_num,
-                                            s->token.col_num,
-                                            JS_PARSE_EXPORT_NONE, &init, PF_IN_ACCEPTED) < 0) {
+                /* the static block's own def is not wanted: it is reached through cf->fields_init_fd, and the
+                   out-parameter was written into a local nothing read. */
+                PD_CALL_P(PDS_FDECL, JS_PARSE_FUNC_CLASS_STATIC_INIT,
+                          PF_IN_ACCEPTED, JS_FUNC_NORMAL, s->token.ptr, NULL,
+                          s->token.line_num, s->token.col_num,
+                          JS_PARSE_EXPORT_NONE, PDS_CLS_SINIT);
+ cls_sinit_done:
+                if (pd_ret < 0) {
                     goto cls_fail;
                 }
                 // stack is now: fclosure
@@ -49974,9 +50021,11 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             goto cls_fail;
         }
         if (f->prop_type == PROP_TYPE_GET || f->prop_type == PROP_TYPE_SET) {
-            bool is_set = f->prop_type - PROP_TYPE_GET;
-            JSFunctionDef *method_fd;
-
+            /* This block held two driver locals that the body descent below now spans: `is_set`, read on both
+               sides of it, and `method_fd`, which the descent WRITES and the code after reads. Neither can be
+               a driver local any more — a class nested inside this very accessor's body is a nested frame in
+               the SAME activation and would overwrite both. is_set was a pure function of prop_type, so it is
+               respelled from the frame at each use; method_fd moves to the frame's spare function-def slot. */
             if (f->st_b2) {
                 int idx, var_kind, is_static1;
                 idx = find_private_class_field(ctx, s->cur_func, f->atom, s->cur_func->scope_level);
@@ -49986,33 +50035,32 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                     if (var_kind == JS_VAR_PRIVATE_FIELD ||
                         var_kind == JS_VAR_PRIVATE_METHOD ||
                         var_kind == JS_VAR_PRIVATE_GETTER_SETTER ||
-                        var_kind == (JS_VAR_PRIVATE_GETTER + is_set) ||
-                        (var_kind == (JS_VAR_PRIVATE_GETTER + 1 - is_set) &&
+                        var_kind == (JS_VAR_PRIVATE_GETTER + (f->prop_type - PROP_TYPE_GET)) ||
+                        (var_kind == (JS_VAR_PRIVATE_GETTER + 1 - (f->prop_type - PROP_TYPE_GET)) &&
                          f->st_b1 != is_static1)) {
                         goto private_field_already_defined;
                     }
                     s->cur_func->vars[idx].var_kind = JS_VAR_PRIVATE_GETTER_SETTER;
                 } else {
                     if (add_private_class_field(s, s->cur_func, f->atom,
-                                                JS_VAR_PRIVATE_GETTER + is_set, f->st_b1) < 0)
+                                                JS_VAR_PRIVATE_GETTER + (f->prop_type - PROP_TYPE_GET), f->st_b1) < 0)
                         goto cls_fail;
                 }
                 class_fields[f->st_b1].need_brand = true;
             }
 
-            if (js_parse_function_decl2(s, JS_PARSE_FUNC_GETTER + is_set,
-                                        JS_FUNC_NORMAL, JS_ATOM_NULL,
-                                        start_ptr,
-                                        s->token.line_num,
-                                        s->token.col_num,
-                                        JS_PARSE_EXPORT_NONE, &method_fd, PF_IN_ACCEPTED))
+            PD_CALL_P(PDS_FDECL, JS_PARSE_FUNC_GETTER + (f->prop_type - PROP_TYPE_GET), PF_IN_ACCEPTED,
+                      JS_FUNC_NORMAL, start_ptr, &f->st_fd, s->token.line_num,
+                      s->token.col_num, JS_PARSE_EXPORT_NONE, PDS_CLS_ACCESSOR);
+ cls_accessor_done:
+            if (pd_ret)
                 goto cls_fail;
             if (f->st_b2) {
-                method_fd->need_home_object = true; /* needed for brand check */
+                f->st_fd->need_home_object = true; /* needed for brand check */
                 emit_op(s, OP_set_home_object);
                 /* XXX: missing function f->atom */
                 emit_op(s, OP_scope_put_var_init);
-                if (is_set) {
+                if ((f->prop_type - PROP_TYPE_GET)) {
                     JSAtom setter_name;
                     int ret;
 
@@ -50036,7 +50084,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                     emit_op(s, OP_define_method);
                     emit_atom(s, f->atom);
                 }
-                emit_u8(s, OP_DEFINE_METHOD_GETTER + is_set);
+                emit_u8(s, OP_DEFINE_METHOD_GETTER + (f->prop_type - PROP_TYPE_GET));
             }
         } else if (f->prop_type == PROP_TYPE_IDENT && s->token.val != '(') {
             ClassFieldsDef *cf = &class_fields[f->st_b1];
@@ -50136,10 +50184,12 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             if (js_parse_expect_semi(s))
                 goto cls_fail;
         } else {
-            JSParseFunctionEnum func_type;
+            /* f->st_tok is read AFTER the body descent below (the constructor test), so it cannot be a driver
+               local once that descent is a PD_CALL: a class declared inside this method's body is a nested
+               frame in the same activation. func_kind is only ever an argument, so it stays a local. */
             JSFunctionKindEnum func_kind;
 
-            func_type = JS_PARSE_FUNC_METHOD;
+            f->st_tok = JS_PARSE_FUNC_METHOD;
             func_kind = JS_FUNC_NORMAL;
             if (f->prop_type == PROP_TYPE_STAR) {
                 func_kind = JS_FUNC_GENERATOR;
@@ -50153,24 +50203,24 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                     goto cls_fail;
                 }
                 if (f->st_mask & JS_DEFINE_CLASS_HAS_HERITAGE)
-                    func_type = JS_PARSE_FUNC_DERIVED_CLASS_CONSTRUCTOR;
+                    f->st_tok = JS_PARSE_FUNC_DERIVED_CLASS_CONSTRUCTOR;
                 else
-                    func_type = JS_PARSE_FUNC_CLASS_CONSTRUCTOR;
+                    f->st_tok = JS_PARSE_FUNC_CLASS_CONSTRUCTOR;
             }
             if (f->st_b2) {
                 class_fields[f->st_b1].need_brand = true;
             }
-            if (js_parse_function_decl2(s, func_type, func_kind, JS_ATOM_NULL,
-                                        start_ptr,
-                                        s->token.line_num,
-                                        s->token.col_num,
-                                        JS_PARSE_EXPORT_NONE, &method_fd, PF_IN_ACCEPTED))
+            PD_CALL_P(PDS_FDECL, f->st_tok, PF_IN_ACCEPTED, func_kind,
+                      start_ptr, &f->st_fd, s->token.line_num, s->token.col_num,
+                      JS_PARSE_EXPORT_NONE, PDS_CLS_METHOD);
+ cls_method_done:
+            if (pd_ret)
                 goto cls_fail;
-            if (func_type == JS_PARSE_FUNC_DERIVED_CLASS_CONSTRUCTOR ||
-                func_type == JS_PARSE_FUNC_CLASS_CONSTRUCTOR) {
-                ctor_fd = method_fd;
+            if (f->st_tok == JS_PARSE_FUNC_DERIVED_CLASS_CONSTRUCTOR ||
+                f->st_tok == JS_PARSE_FUNC_CLASS_CONSTRUCTOR) {
+                ctor_fd = f->st_fd;
             } else if (f->st_b2) {
-                method_fd->need_home_object = true; /* needed for brand check */
+                f->st_fd->need_home_object = true; /* needed for brand check */
                 if (find_private_class_field(ctx, s->cur_func, f->atom,
                                              s->cur_func->scope_level) >= 0) {
                 private_field_already_defined:
@@ -50351,6 +50401,9 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     JS_FreeAtom(ctx, f->atom4);
     f->atom = f->atom2 = f->atom3 = f->atom4 = JS_ATOM_NULL;
     PD_RET(-1);
+#undef class_fields
+#undef ctor_fd
+#undef class_start_ptr
 
 /* ---- SourceElement: one statement, declaration, import or export at the top level of a script, module or
    function body. Thin, but it sits between js_parse_program / the function body and the statement cone, so it
@@ -50360,11 +50413,11 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     if (s->token.val == TOK_FUNCTION ||
         (token_is_pseudo_keyword(s, JS_ATOM_async) &&
          peek_token(s, true) == TOK_FUNCTION)) {
-        if (js_parse_function_decl(s, JS_PARSE_FUNC_STATEMENT,
-                                   JS_FUNC_NORMAL, JS_ATOM_NULL,
-                                   s->token.ptr,
-                                   s->token.line_num,
-                                   s->token.col_num, PF_IN_ACCEPTED))
+        PD_CALL_P(PDS_FDECL, JS_PARSE_FUNC_STATEMENT, PF_IN_ACCEPTED,
+                  JS_FUNC_NORMAL, s->token.ptr, NULL, s->token.line_num,
+                  s->token.col_num, JS_PARSE_EXPORT_NONE, PDS_SE_FUNC);
+ se_func_done:
+        if (pd_ret)
             PD_RET(-1);
     } else if (s->token.val == TOK_EXPORT && s->cur_func->module) {
         if (js_parse_descent(s, PDS_EXPORT, 0, 0, 0))
@@ -50401,12 +50454,11 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     } else if (f->st_tok == TOK_FUNCTION ||
                (token_is_pseudo_keyword(s, JS_ATOM_async) &&
                 peek_token(s, true) == TOK_FUNCTION)) {
-        PD_RET(js_parse_function_decl2(s, JS_PARSE_FUNC_STATEMENT,
-                                       JS_FUNC_NORMAL, JS_ATOM_NULL,
-                                       s->token.ptr,
-                                       s->token.line_num,
-                                       s->token.col_num,
-                                       JS_PARSE_EXPORT_NAMED, NULL, PF_IN_ACCEPTED));
+        PD_CALL_P(PDS_FDECL, JS_PARSE_FUNC_STATEMENT, PF_IN_ACCEPTED,
+                  JS_FUNC_NORMAL, s->token.ptr, NULL, s->token.line_num,
+                  s->token.col_num, JS_PARSE_EXPORT_NAMED, PDS_EXP_FUNC);
+ exp_func_done:
+        PD_RET(pd_ret);
     }
 
     if (next_token(s))
@@ -50533,12 +50585,12 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         } else if (s->token.val == TOK_FUNCTION ||
                    (token_is_pseudo_keyword(s, JS_ATOM_async) &&
                     peek_token(s, true) == TOK_FUNCTION)) {
-            PD_RET(js_parse_function_decl2(s, JS_PARSE_FUNC_STATEMENT,
-                                           JS_FUNC_NORMAL, JS_ATOM_NULL,
-                                           s->token.ptr,
-                                           s->token.line_num,
-                                           s->token.col_num,
-                                           JS_PARSE_EXPORT_DEFAULT, NULL, PF_IN_ACCEPTED));
+            PD_CALL_P(PDS_FDECL, JS_PARSE_FUNC_STATEMENT, PF_IN_ACCEPTED,
+                      JS_FUNC_NORMAL, s->token.ptr, NULL, s->token.line_num,
+                      s->token.col_num, JS_PARSE_EXPORT_DEFAULT,
+                      PDS_EXP_DEFFUNC);
+ exp_deffunc_done:
+            PD_RET(pd_ret);
         } else {
             PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_EXP_04);
  exp_04:
@@ -50580,6 +50632,688 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     JS_FreeAtom(ctx, f->atom2);
     f->atom = JS_ATOM_NULL;
     f->atom2 = JS_ATOM_NULL;
+    PD_RET(-1);
+
+/* ---- FunctionDeclaration / FunctionExpression / method / arrow. The last body in the parser, and the only
+   production needing arguments the four int slots cannot carry: a source POINTER, a JSFunctionDef**
+   out-parameter and the export flag, all seeded by PD_CALL_P.
+
+   st_fd is the function def this production is BUILDING. It starts as the ENCLOSING def, because every name
+   the header resolves (the B.3.2.1 var lookup, the lexical redefinition check) must resolve against the
+   enclosing scope, and js_new_function_def then REPLACES it with the new def. So st_fd cannot be re-derived
+   from s->cur_func at either point, and fd2_fail — reachable only after that replacement — unwinds through
+   st_fd->parent exactly as the recursive body's `fd` local did.
+
+   st_idx is func_name: BORROWED from the caller until the header DUPLICATES it, owned from there until
+   st_fd->func_name adopts it, which is why every PD_RET in that window frees it first. It is deliberately not
+   an atom slot: the slots are settled by PD_RET's DCHECK and by unwind, and an owned st_idx never crosses
+   either (no PD_CALL stands between the duplication and the hand-off). ---- */
+ fd2_entry:
+    /* The two declarations that carried initialisers. st_fd starts as the ENCLOSING def — the recursive body
+       took it from s->cur_func on entry for the same reason — and st_pos_a is lexical_func_idx, whose -1 means
+       "no lexical binding was created"; PD_INIT's 0 is a VALID var index, so leaving it settled to zero made
+       the epilogue write func_pool_idx over variable 0 of the enclosing function. */
+    f->st_fd = s->cur_func;
+    f->st_pos_a = -1;
+    DCHECK(f->st_idx == JS_ATOM_NULL || (f->level != JS_PARSE_FUNC_STATEMENT &&
+           f->level != JS_PARSE_FUNC_EXPR && f->level != JS_PARSE_FUNC_ARROW &&
+           f->level != JS_PARSE_FUNC_VAR),
+           "func_name must be JS_ATOM_NULL for a statement, expression, arrow or var function");
+
+    f->st_b1 = (f->level != JS_PARSE_FUNC_STATEMENT &&
+               f->level != JS_PARSE_FUNC_VAR);
+
+    if (f->level == JS_PARSE_FUNC_STATEMENT ||
+        f->level == JS_PARSE_FUNC_VAR ||
+        f->level == JS_PARSE_FUNC_EXPR) {
+        if (f->op == JS_FUNC_NORMAL &&
+            token_is_pseudo_keyword(s, JS_ATOM_async) &&
+            peek_token(s, true) != '\n') {
+            if (next_token(s))
+                PD_RET(-1);
+            f->op = JS_FUNC_ASYNC;
+        }
+        if (next_token(s))
+            PD_RET(-1);
+        if (s->token.val == '*') {
+            if (next_token(s))
+                PD_RET(-1);
+            f->op |= JS_FUNC_GENERATOR;
+        }
+
+        if (s->token.val == TOK_IDENT) {
+            if (s->token.u.ident.is_reserved ||
+                (s->token.u.ident.atom == JS_ATOM_yield &&
+                 f->level == JS_PARSE_FUNC_EXPR &&
+                 (f->op & JS_FUNC_GENERATOR)) ||
+                (s->token.u.ident.atom == JS_ATOM_await &&
+                 ((f->level == JS_PARSE_FUNC_EXPR &&
+                   (f->op & JS_FUNC_ASYNC)) ||
+                  f->level == JS_PARSE_FUNC_CLASS_STATIC_INIT))) {
+                PD_RET(js_parse_error_reserved_identifier(s));
+            }
+        }
+        /* A GeneratorExpression's BindingIdentifier is [+Yield] and an AsyncFunctionExpression's is [+Await], so
+           the name cannot be `yield`/`await` — and where the ENCLOSING context already spells them as keywords
+           the token is not TOK_IDENT, which is the only reason the check above missed them. That is how
+           `function* g() { (function* yield() {}); }` parsed while the same expression in a non-generator did
+           not: one rule answering differently by where it appeared. */
+        if ((s->token.val == TOK_YIELD && (f->op & JS_FUNC_GENERATOR)) ||
+            (s->token.val == TOK_AWAIT && (f->op & JS_FUNC_ASYNC)))
+            PD_RET(js_parse_error_reserved_identifier(s));
+        if (s->token.val == TOK_IDENT ||
+            (((s->token.val == TOK_YIELD && !f->st_fd->is_strict_mode) ||
+             (s->token.val == TOK_AWAIT && !s->is_module)) &&
+             f->level == JS_PARSE_FUNC_EXPR)) {
+            f->st_idx = JS_DupAtom(ctx, s->token.u.ident.atom);
+            if (next_token(s)) {
+                JS_FreeAtom(ctx, f->st_idx);
+                PD_RET(-1);
+            }
+        } else {
+            if (f->level != JS_PARSE_FUNC_EXPR &&
+                f->st_mask != JS_PARSE_EXPORT_DEFAULT) {
+                PD_RET_ERR(s, "function name expected");
+            }
+        }
+    } else if (f->level != JS_PARSE_FUNC_ARROW) {
+        f->st_idx = JS_DupAtom(ctx, f->st_idx);
+    }
+
+    if (f->st_fd->is_eval && f->st_fd->eval_type == JS_EVAL_TYPE_MODULE &&
+        (f->level == JS_PARSE_FUNC_STATEMENT || f->level == JS_PARSE_FUNC_VAR)) {
+        JSGlobalVar *hf;
+        hf = find_global_var(f->st_fd, f->st_idx);
+        /* XXX: should check scope chain */
+        if (hf && hf->scope_level == f->st_fd->scope_level) {
+            js_parse_error(s, "invalid redefinition of global identifier in module code");
+            JS_FreeAtom(ctx, f->st_idx);
+            PD_RET(-1);
+        }
+    }
+
+    if (f->level == JS_PARSE_FUNC_VAR) {
+        /* B.3.2.1's condition, in the order it states it. A lexical declaration of the same name is what makes
+           "replacing the FunctionDeclaration with a VariableStatement would produce an Early Error" true — with
+           ONE exception: the binding this very declaration is about to create, or the one an EARLIER function
+           declaration in the same block already created, which B.3.3.4 explicitly allows to be redefined.
+           Excluding those too meant only the FIRST of `{ function f(){3}; function f(){4} }` reached the var, so
+           the outer binding kept the function the block's own binding no longer held. */
+        int lex_idx = find_lexical_decl(ctx, f->st_fd, f->st_idx, f->st_fd->scope_first, false);
+        bool lex_is_redefinable_func =
+            (lex_idx >= 0 && lex_idx < GLOBAL_VAR_OFFSET &&
+             f->st_fd->vars[lex_idx].scope_level == f->st_fd->scope_level &&
+             f->st_fd->vars[lex_idx].var_kind == JS_VAR_FUNCTION_DECL);
+        if (!f->st_fd->is_strict_mode
+        && f->op == JS_FUNC_NORMAL
+        &&  (lex_idx < 0 || lex_is_redefinable_func)
+        &&  !((f->st_pos_b = find_var(ctx, f->st_fd, f->st_idx)) >= 0 && (f->st_pos_b & ARGUMENT_VAR_OFFSET))
+        /* "F is not an element of parameterNames", and FunctionDeclarationInstantiation step 22.f APPENDS
+           "arguments" to parameterNames whenever the arguments object is needed — so a block-level
+           `function arguments(){}` never reaches the enclosing binding and `arguments` stays the Arguments
+           object. (sm/lexical-environment/block-scoped-functions-annex-b-arguments asserts the opposite; the
+           spec citation and annexB/.../block-decl-func-skip-arguments are the oracle.) */
+        &&  !(f->st_idx == JS_ATOM_arguments && f->st_fd->has_arguments_binding)) {
+            f->st_b3 = true;
+        }
+        /* Create the lexical name here so that the function closure
+           contains it */
+        if (f->st_fd->is_eval &&
+            (f->st_fd->eval_type == JS_EVAL_TYPE_GLOBAL ||
+             f->st_fd->eval_type == JS_EVAL_TYPE_MODULE) &&
+            f->st_fd->scope_level == f->st_fd->body_scope) {
+            /* avoid creating a lexical variable in the global
+               scope. XXX: check annex B */
+            JSGlobalVar *hf;
+            hf = find_global_var(f->st_fd, f->st_idx);
+            /* XXX: should check scope chain */
+            if (hf && hf->scope_level == f->st_fd->scope_level) {
+                js_parse_error(s, "invalid redefinition of global identifier");
+                JS_FreeAtom(ctx, f->st_idx);
+                PD_RET(-1);
+            }
+        } else {
+            /* Always create a lexical name, fail if at the same scope as
+               existing name */
+            /* Lexical variable will be initialized upon entering scope */
+            f->st_pos_a = define_var(s, f->st_fd, f->st_idx,
+                                          f->op != JS_FUNC_NORMAL ?
+                                          JS_VAR_DEF_NEW_FUNCTION_DECL :
+                                          JS_VAR_DEF_FUNCTION_DECL);
+            if (f->st_pos_a < 0) {
+                JS_FreeAtom(ctx, f->st_idx);
+                PD_RET(-1);
+            }
+        }
+    }
+
+    f->st_fd = js_new_function_def(ctx, f->st_fd, false, f->st_b1, s->filename,
+                             f->st_line, f->st_col);
+    if (!f->st_fd) {
+        JS_FreeAtom(ctx, f->st_idx);
+        PD_RET(-1);
+    }
+    if (s->fn_ctor_toplevel && f->level == JS_PARSE_FUNC_EXPR) {
+        /* the Function constructor's own synthesized wrapper — see js_parse_init's caller. `is_func_expr` is
+           read for exactly one thing, the self-name binding, and this function does not have one. */
+        s->fn_ctor_toplevel = false;
+        f->st_fd->is_func_expr = false;
+    }
+    if (f->st_pfd)
+        *f->st_pfd = f->st_fd;
+    s->cur_func = f->st_fd;
+    f->st_fd->func_name = f->st_idx;
+    /* XXX: test !f->st_fd->is_generator is always false */
+    f->st_fd->has_prototype = (f->level == JS_PARSE_FUNC_STATEMENT ||
+                         f->level == JS_PARSE_FUNC_VAR ||
+                         f->level == JS_PARSE_FUNC_EXPR) &&
+                        f->op == JS_FUNC_NORMAL;
+    f->st_fd->has_home_object = (f->level == JS_PARSE_FUNC_METHOD ||
+                           f->level == JS_PARSE_FUNC_GETTER ||
+                           f->level == JS_PARSE_FUNC_SETTER ||
+                           f->level == JS_PARSE_FUNC_CLASS_CONSTRUCTOR ||
+                           f->level == JS_PARSE_FUNC_DERIVED_CLASS_CONSTRUCTOR);
+    f->st_fd->has_arguments_binding = (f->level != JS_PARSE_FUNC_ARROW &&
+                                 f->level != JS_PARSE_FUNC_CLASS_STATIC_INIT);
+    f->st_fd->has_this_binding = f->st_fd->has_arguments_binding;
+    f->st_fd->is_derived_class_constructor = (f->level == JS_PARSE_FUNC_DERIVED_CLASS_CONSTRUCTOR);
+    if (f->level == JS_PARSE_FUNC_ARROW) {
+        f->st_fd->new_target_allowed = f->st_fd->parent->new_target_allowed;
+        f->st_fd->super_call_allowed = f->st_fd->parent->super_call_allowed;
+        f->st_fd->super_allowed = f->st_fd->parent->super_allowed;
+        f->st_fd->arguments_allowed = f->st_fd->parent->arguments_allowed;
+    } else if (f->level == JS_PARSE_FUNC_CLASS_STATIC_INIT) {
+        f->st_fd->new_target_allowed = true; // although new.target === undefined
+        f->st_fd->super_call_allowed = false;
+        f->st_fd->super_allowed = true;
+        f->st_fd->arguments_allowed = false;
+    } else {
+        f->st_fd->new_target_allowed = true;
+        f->st_fd->super_call_allowed = f->st_fd->is_derived_class_constructor;
+        f->st_fd->super_allowed = f->st_fd->has_home_object;
+        f->st_fd->arguments_allowed = true;
+    }
+
+    /* f->st_fd->in_function_body == false prevents yield/await during the parsing
+       of the arguments in generator/async functions. They are parsed as
+       regular identifiers for other function kinds. */
+    f->st_fd->func_kind = f->op;
+    f->st_fd->func_type = f->level;
+
+    if (f->level == JS_PARSE_FUNC_CLASS_CONSTRUCTOR ||
+        f->level == JS_PARSE_FUNC_DERIVED_CLASS_CONSTRUCTOR) {
+        /* error if not invoked as a constructor */
+        emit_op(s, OP_check_ctor);
+    }
+
+    if (f->level == JS_PARSE_FUNC_CLASS_CONSTRUCTOR) {
+        emit_class_field_init(s);
+    }
+
+    /* parse arguments */
+    f->st_fd->has_simple_parameter_list = true;
+    f->st_fd->has_parameter_expressions = false;
+    f->st_b2 = false;
+    if (f->level == JS_PARSE_FUNC_ARROW && s->token.val == TOK_IDENT) {
+        JSAtom name;
+        /* AsyncArrowBindingIdentifier is BindingIdentifier[+Await] whatever the enclosing context is, so
+           `async await => 1` is an Early Error. The token's own `is_reserved` cannot say so: it was decided when
+           the identifier was scanned, which for this form is BEFORE the arrow -- and therefore before its
+           async-ness -- existed. The parenthesised spelling `async (await) => 1` is parsed inside the arrow and
+           was already rejected; the two differed only in where the question got asked. */
+        if (s->token.u.ident.is_reserved ||
+            ((f->st_fd->func_kind & JS_FUNC_ASYNC) && s->token.u.ident.atom == JS_ATOM_await)) {
+            js_parse_error_reserved_identifier(s);
+            goto fd2_fail;
+        }
+        name = s->token.u.ident.atom;
+        if (add_arg(ctx, f->st_fd, name) < 0)
+            goto fd2_fail;
+        f->st_fd->defined_arg_count = 1;
+    } else if (f->level != JS_PARSE_FUNC_CLASS_STATIC_INIT) {
+        if (s->token.val == '(') {
+            int skip_bits;
+            /* if there is an '=' inside the parameter list, we
+               consider there is a parameter expression inside */
+            js_parse_skip_parens_token(s, &skip_bits, false);
+            if (skip_bits & SKIP_HAS_ASSIGNMENT)
+                f->st_fd->has_parameter_expressions = true;
+            if (next_token(s))
+                goto fd2_fail;
+        } else {
+            if (js_parse_expect(s, '('))
+                goto fd2_fail;
+        }
+
+        if (f->st_fd->has_parameter_expressions) {
+            f->st_fd->scope_level = -1; /* force no parent scope */
+            if (push_scope(s) < 0)
+                PD_RET(-1);
+        }
+
+        while (s->token.val != ')') {
+            /* name, rest, idx and label all span the descents this loop performs (a destructured parameter,
+               a default-value expression), and a default value can itself contain a function — a nested FDECL
+               frame in the SAME driver activation, which would overwrite every one of them. name is BORROWED
+               from the token, so it takes name0 rather than an owned atom slot: unwind frees the atom slots,
+               and freeing a reference this frame never took would be a double free. has_initializer stays a
+               local — it is read at the resume point and never crosses one. */
+            int has_initializer;
+            f->st_flag = false;
+
+            if (s->token.val == TOK_ELLIPSIS) {
+                /* An accessor's parameter list is not a FormalParameters: 15.5.1 gives a getter `( )` and a
+                   setter `( PropertySetParameterList )`, and PropertySetParameterList is a single
+                   FormalParameter — a BindingRestElement is not in either grammar. The arity check below caught
+                   `set x(a, b)` and `set x()` but counted a f->st_flag as the one parameter it demands, so
+                   `({ set x(...a) {} })` parsed. */
+                if (f->level == JS_PARSE_FUNC_GETTER || f->level == JS_PARSE_FUNC_SETTER) {
+                    js_parse_error(s, "f->st_flag parameter is not allowed in a getter or setter");
+                    goto fd2_fail;
+                }
+                f->st_fd->has_simple_parameter_list = false;
+                f->st_flag = true;
+                if (next_token(s))
+                    goto fd2_fail;
+            }
+            if (s->token.val == '[' || s->token.val == '{') {
+                f->st_fd->has_simple_parameter_list = false;
+                if (f->st_flag) {
+                    emit_op(s, OP_rest);
+                    emit_u16(s, f->st_fd->arg_count);
+                } else {
+                    /* unnamed arg for destructuring */
+                    f->st_lbl_a = add_arg(ctx, f->st_fd, JS_ATOM_NULL);
+                    emit_op(s, OP_get_arg);
+                    emit_u16(s, f->st_lbl_a);
+                }
+                PD_CALL(PDS_DESTR, 0, DE_PACK(true, true, true, false, -1), f->st_fd->has_parameter_expressions ? TOK_LET : TOK_VAR, PDS_FD_04);
+ fd2_04:
+                has_initializer = pd_ret;
+                if (has_initializer < 0)
+                    goto fd2_fail;
+                if (has_initializer)
+                    f->st_b2 = true;
+                if (!f->st_b2)
+                    f->st_fd->defined_arg_count++;
+            } else if (s->token.val == TOK_IDENT) {
+                if (s->token.u.ident.is_reserved) {
+                    js_parse_error_reserved_identifier(s);
+                    goto fd2_fail;
+                }
+                f->name0 = s->token.u.ident.atom;
+                if (f->name0 == JS_ATOM_yield && f->st_fd->func_kind == JS_FUNC_GENERATOR) {
+                    js_parse_error_reserved_identifier(s);
+                    goto fd2_fail;
+                }
+                if (f->st_fd->has_parameter_expressions) {
+                    if (js_parse_check_duplicate_parameter(s, f->name0))
+                        goto fd2_fail;
+                    if (define_var(s, f->st_fd, f->name0, JS_VAR_DEF_LET) < 0)
+                        goto fd2_fail;
+                }
+                /* XXX: could avoid allocating an argument if f->st_flag is true */
+                f->st_lbl_a = add_arg(ctx, f->st_fd, f->name0);
+                if (f->st_lbl_a < 0)
+                    goto fd2_fail;
+                if (next_token(s))
+                    goto fd2_fail;
+                if (f->st_flag) {
+                    emit_op(s, OP_rest);
+                    emit_u16(s, f->st_lbl_a);
+                    if (f->st_fd->has_parameter_expressions) {
+                        emit_op(s, OP_dup);
+                        emit_op(s, OP_scope_put_var_init);
+                        emit_atom(s, f->name0);
+                        emit_u16(s, f->st_fd->scope_level);
+                    }
+                    emit_op(s, OP_put_arg);
+                    emit_u16(s, f->st_lbl_a);
+                    f->st_fd->has_simple_parameter_list = false;
+                    f->st_b2 = true;
+                } else if (s->token.val == '=') {
+                    f->st_fd->has_simple_parameter_list = false;
+                    f->st_b2 = true;
+
+                    if (next_token(s))
+                        goto fd2_fail;
+
+                    f->st_lbl_b = new_label(s);
+                    emit_op(s, OP_get_arg);
+                    emit_u16(s, f->st_lbl_a);
+                    emit_op(s, OP_dup);
+                    emit_op(s, OP_undefined);
+                    emit_op(s, OP_strict_eq);
+                    emit_goto(s, OP_if_false, f->st_lbl_b);
+                    emit_op(s, OP_drop);
+                    PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_FD_01);
+ fd2_01:
+                    if (pd_ret)
+                        goto fd2_fail;
+                    set_object_name(s, f->name0);
+                    emit_op(s, OP_dup);
+                    emit_op(s, OP_put_arg);
+                    emit_u16(s, f->st_lbl_a);
+                    emit_label(s, f->st_lbl_b);
+                    emit_op(s, OP_scope_put_var_init);
+                    emit_atom(s, f->name0);
+                    emit_u16(s, f->st_fd->scope_level);
+                } else {
+                    if (!f->st_b2) {
+                        f->st_fd->defined_arg_count++;
+                    }
+                    if (f->st_fd->has_parameter_expressions) {
+                        /* copy the argument to the argument scope */
+                        emit_op(s, OP_get_arg);
+                        emit_u16(s, f->st_lbl_a);
+                        emit_op(s, OP_scope_put_var_init);
+                        emit_atom(s, f->name0);
+                        emit_u16(s, f->st_fd->scope_level);
+                    }
+                }
+            } else {
+                js_parse_error(s, "missing formal parameter");
+                goto fd2_fail;
+            }
+            if (f->st_flag && s->token.val != ')') {
+                js_parse_expect(s, ')');
+                goto fd2_fail;
+            }
+            if (s->token.val == ')')
+                break;
+            if (js_parse_expect(s, ','))
+                goto fd2_fail;
+        }
+        if ((f->level == JS_PARSE_FUNC_GETTER && f->st_fd->arg_count != 0) ||
+            (f->level == JS_PARSE_FUNC_SETTER && f->st_fd->arg_count != 1)) {
+            js_parse_error(s, "invalid number of arguments for getter or setter");
+            goto fd2_fail;
+        }
+    }
+
+    if (f->st_fd->has_parameter_expressions) {
+        int idx;
+
+        /* Copy the variables in the argument scope to the variable
+           scope (see FunctionDeclarationInstantiation() in spec). The
+           normal arguments are already present, so no need to copy
+           them. */
+        idx = f->st_fd->scopes[f->st_fd->scope_level].first;
+        while (idx >= 0) {
+            JSVarDef *vd = &f->st_fd->vars[idx];
+            if (vd->scope_level != f->st_fd->scope_level)
+                break;
+            if (find_var(ctx, f->st_fd, vd->var_name) < 0) {
+                if (add_var(ctx, f->st_fd, vd->var_name) < 0)
+                    goto fd2_fail;
+                vd = &f->st_fd->vars[idx]; /* f->st_fd->vars may have been reallocated */
+                emit_op(s, OP_scope_get_var);
+                emit_atom(s, vd->var_name);
+                emit_u16(s, f->st_fd->scope_level);
+                emit_op(s, OP_scope_put_var);
+                emit_atom(s, vd->var_name);
+                emit_u16(s, 0);
+            }
+            idx = vd->scope_next;
+        }
+
+        /* the argument scope has no parent, hence we don't use pop_scope(s) */
+        emit_op(s, OP_leave_scope);
+        emit_u16(s, f->st_fd->scope_level);
+
+        /* set the variable scope as the current scope */
+        f->st_fd->scope_level = 0;
+        f->st_fd->scope_first = f->st_fd->scopes[f->st_fd->scope_level].first;
+    }
+
+    if (next_token(s))
+        goto fd2_fail;
+
+    /* generator function: yield after the parameters are evaluated */
+    if (f->op == JS_FUNC_GENERATOR ||
+        f->op == JS_FUNC_ASYNC_GENERATOR)
+        emit_op(s, OP_initial_yield);
+
+    /* in generators, yield expression is forbidden during the parsing
+       of the arguments */
+    f->st_fd->in_function_body = true;
+    push_scope(s);  /* enter body scope */
+    f->st_fd->body_scope = f->st_fd->scope_level;
+
+    /* Only an ARROW has a `=>` between its parameters and its body. Asking the TOKEN instead of the FUNCTION
+       KIND let every other kind borrow the arrow body: `({ a() => 0 })`, `({ *a() => 0 })`, `({ get a() => 0 })`
+       and `class C { a() => 0 }` all parsed, where a MethodDefinition's body is `{ FunctionBody }` and nothing
+       else. With the kind asked, the `{` expectation below is what rejects them. */
+    if (f->level == JS_PARSE_FUNC_ARROW) {
+        DCHECK(s->token.val == TOK_ARROW,
+               "an arrow function reached its body with no `=>` — the caller only enters here having seen one");
+        if (next_token(s))
+            goto fd2_fail;
+
+        if (s->token.val != '{') {
+            if (js_parse_function_check_names(s, f->st_fd, f->st_idx))
+                goto fd2_fail;
+
+            PD_CALL(PDS_ASGN, 0, f->flags & PF_IN_ACCEPTED, 0, PDS_FD_02);
+ fd2_02:
+            if (pd_ret)
+                goto fd2_fail;
+
+            if (f->op != JS_FUNC_NORMAL)
+                emit_op(s, OP_return_async);
+            else
+                emit_op(s, OP_return);
+
+            /* save the function source code */
+            /* the end of the function source code is after the last
+                token of the function source stored into s->last_ptr */
+            f->st_fd->source_len = s->last_ptr - f->st_ptr;
+            f->st_fd->source = js_strndup(ctx, (const char *)f->st_ptr, f->st_fd->source_len);
+            if (!f->st_fd->source)
+                goto fd2_fail;
+
+            goto fd2_done;
+        }
+    }
+
+    // js_parse_class() already consumed the '{'
+    if (f->level != JS_PARSE_FUNC_CLASS_STATIC_INIT)
+        if (js_parse_expect(s, '{'))
+            goto fd2_fail;
+
+    if (js_parse_directives(s))
+        goto fd2_fail;
+
+    /* in strict_mode, check function and argument names */
+    if (js_parse_function_check_names(s, f->st_fd, f->st_idx))
+        goto fd2_fail;
+
+    {
+        /* The BlockEnv is FRAME state, not a driver local: push_break_entry links its ADDRESS into
+           fd->top_break and it stays linked across the body descent below. A function declared inside this
+           body is a nested FDECL frame in the same driver activation, so a local here would hand both
+           functions the same BlockEnv and the inner one's pop would unlink the outer's. */
+        f->st_bits = 0;
+
+        while (s->token.val != '}') {
+            PD_CALL(PDS_SRCELEM, 0, 0, 0, PDS_FD_03);
+ fd2_03:
+            if (pd_ret)
+                goto fd2_fail;
+            /* Check if a 'using' was encountered in the body scope */
+            if (!f->st_bits && f->st_fd->scopes[f->st_fd->body_scope].has_using) {
+                f->st_bits = 1;
+                push_break_entry(f->st_fd, &f->st_be, JS_ATOM_NULL, -1, -1, 1);
+                f->st_be.has_using = true;
+                f->st_be.using_scope_level = f->st_fd->body_scope;
+            }
+        }
+
+        /* save the function source code */
+        f->st_fd->source_len = s->buf_ptr - f->st_ptr;
+        f->st_fd->source = js_strndup(ctx, (const char *)f->st_ptr, f->st_fd->source_len);
+        if (!f->st_fd->source)
+            goto fd2_fail;
+
+        if (next_token(s)) {
+            /* consume the '}' */
+            goto fd2_fail;
+        }
+
+        if (f->st_bits) {
+            int label_catch = f->st_fd->scopes[f->st_fd->body_scope].using_label_catch;
+            int label_end = f->st_fd->scopes[f->st_fd->body_scope].using_label_end;
+
+            pop_break_entry(f->st_fd);
+
+            if (js_is_live_code(s)) {
+                emit_op(s, OP_drop);  /* drop catch_offset */
+                emit_op(s, OP_using_dispose_init);  /* initial error_state */
+                emit_op(s, OP_dispose_scope);
+                emit_u16(s, f->st_fd->body_scope);
+                emit_op(s, OP_using_dispose_end);
+                emit_return(s, false);
+            }
+
+            emit_label(s, label_catch);
+            emit_op(s, OP_dispose_scope);
+            emit_u16(s, f->st_fd->body_scope);
+            emit_op(s, OP_throw);
+
+            emit_label(s, label_end);
+        } else {
+            if (js_is_live_code(s)) {
+                emit_return(s, false);
+            }
+        }
+    }
+ fd2_done:
+    s->cur_func = f->st_fd->parent;
+
+    /* Reparse identifiers after the function is terminated so that
+       the token is parsed in the englobing function. It could be done
+       by just using next_token() here for normal functions, but it is
+       necessary for arrow functions with an expression body. */
+    reparse_ident_token(s);
+
+    /* create the function object */
+    {
+        int idx;
+
+        /* the real object will be set at the end of the compilation */
+        idx = cpool_add(s, JS_NULL);
+        f->st_fd->parent_cpool_idx = idx;
+
+        if (f->st_b1) {
+            /* for constructors, no code needs to be generated here */
+            if (f->level != JS_PARSE_FUNC_CLASS_CONSTRUCTOR &&
+                f->level != JS_PARSE_FUNC_DERIVED_CLASS_CONSTRUCTOR) {
+                /* OP_fclosure creates the function object from the bytecode
+                   and adds the scope information */
+                emit_op(s, OP_fclosure);
+                emit_u32(s, idx);
+                if (f->st_idx == JS_ATOM_NULL) {
+                    emit_op(s, OP_set_name);
+                    emit_u32(s, JS_ATOM_NULL);
+                }
+            }
+        } else if (f->level == JS_PARSE_FUNC_VAR) {
+            if (f->st_pos_a >= 0)
+                s->cur_func->vars[f->st_pos_a].func_pool_idx = idx;   /* initialized on entering the scope */
+            /* THE VALUE the Annex B store writes. B.3.2.1 step 3 is
+                   fobj = benv.GetBindingValue(F);  genv.SetMutableBinding(F, fobj)
+               — it reads the BLOCK's binding, it does not build a second function. For a block-scoped
+               declaration this code made a whole new closure here and stored THAT, so
+               `{ function x(){} o = x; }` left the outer `x` and the inner one two different objects, and with
+               two declarations of one name the outer kept the first where the block held the last. The
+               scope-entry hoisting already created the one object; read it. */
+            if (f->st_pos_a >= 0) {
+                if (f->st_b3) {
+                    emit_op(s, OP_scope_get_var);
+                    emit_atom(s, f->st_idx);
+                    emit_u16(s, s->cur_func->scope_level);
+                }
+            } else {
+                emit_op(s, OP_fclosure);
+                emit_u32(s, idx);
+                if (f->st_b3)
+                    emit_op(s, OP_dup);
+            }
+            if (f->st_b3) {
+                if (s->cur_func->is_global_var) {
+                    JSGlobalVar *hf;
+                    /* the global variable must be defined at the start of the
+                       function */
+                    hf = add_global_var(ctx, s->cur_func, f->st_idx);
+                    if (!hf)
+                        goto fd2_fail;
+                    /* it is considered as defined at the top level
+                       (needed for annex B.3.3.4 and B.3.3.5
+                       checks) */
+                    hf->scope_level = 0;
+                    hf->force_init = s->cur_func->is_strict_mode;
+                } else {
+                    /* do not call define_var to bypass lexical scope check */
+                    f->st_pos_b = find_var(ctx, s->cur_func, f->st_idx);
+                    if (f->st_pos_b < 0) {
+                        f->st_pos_b = add_var(ctx, s->cur_func, f->st_idx);
+                        if (f->st_pos_b < 0)
+                            goto fd2_fail;
+                    }
+                }
+                /* store directly into the var, bypassing the lexical scope. The store is PROVISIONAL: an
+                   enclosing block may declare the name lexically LATER, and then the VariableStatement
+                   replacement B.3.2.1 tests would be an Early Error. define_var patches it out if that happens. */
+                annexb_func_var_record(s, s->cur_func, f->st_idx, s->cur_func->byte_code.size);
+                emit_op(s, OP_scope_put_var_env);
+                emit_atom(s, f->st_idx);
+                emit_u16(s, 0);
+            }
+            if (f->st_pos_a < 0) {
+                /* store function object into its lexical name */
+                /* XXX: could use OP_put_loc directly */
+                emit_op(s, OP_scope_put_var_init);
+                emit_atom(s, f->st_idx);
+                emit_u16(s, s->cur_func->scope_level);
+            }
+        } else {
+            if (!s->cur_func->is_global_var) {
+                int var_idx = define_var(s, s->cur_func, f->st_idx, JS_VAR_DEF_VAR);
+
+                if (var_idx < 0)
+                    goto fd2_fail;
+                /* the variable will be assigned at the top of the function */
+                if (var_idx & ARGUMENT_VAR_OFFSET) {
+                    s->cur_func->args[var_idx - ARGUMENT_VAR_OFFSET].func_pool_idx = idx;
+                } else {
+                    s->cur_func->vars[var_idx].func_pool_idx = idx;
+                }
+            } else {
+                JSAtom func_var_name;
+                JSGlobalVar *hf;
+                if (f->st_idx == JS_ATOM_NULL)
+                    func_var_name = JS_ATOM__default_; /* export default */
+                else
+                    func_var_name = f->st_idx;
+                /* the variable will be assigned at the top of the function */
+                hf = add_global_var(ctx, s->cur_func, func_var_name);
+                if (!hf)
+                    goto fd2_fail;
+                hf->cpool_idx = idx;
+                if (f->st_mask != JS_PARSE_EXPORT_NONE) {
+                    if (!add_export_entry(s, s->cur_func->module, func_var_name,
+                                          f->st_mask == JS_PARSE_EXPORT_NAMED ? func_var_name : JS_ATOM_default, JS_EXPORT_TYPE_LOCAL))
+                        goto fd2_fail;
+                }
+            }
+        }
+    }
+    PD_RET(0);
+ fd2_fail:
+    s->cur_func = f->st_fd->parent;
+    js_free_function_def(ctx, f->st_fd);
+    if (f->st_pfd)
+        *f->st_pfd = NULL;
     PD_RET(-1);
 
  done:
@@ -58585,687 +59319,6 @@ static JSFunctionDef *js_parse_function_class_fields_init(JSParseState *s)
     fd->func_kind = JS_FUNC_NORMAL;
     fd->func_type = JS_PARSE_FUNC_METHOD;
     return fd;
-}
-
-/* func_name must be JS_ATOM_NULL for JS_PARSE_FUNC_STATEMENT and
-   JS_PARSE_FUNC_EXPR, JS_PARSE_FUNC_ARROW and JS_PARSE_FUNC_VAR */
-/* `parse_flags` carries the [In] parameter of the production this function came from. It matters for exactly one
-   thing: an arrow's ConciseBody is ExpressionBody[?In, ~Await], so `for (x => 0 in 1;;)` must reject the `in`
-   the same way `for (0 in 1;;)` does. Every other body is a Block, where `in` is always accepted. */
-static __exception int js_parse_function_decl2(JSParseState *s,
-                                               JSParseFunctionEnum func_type,
-                                               JSFunctionKindEnum func_kind,
-                                               JSAtom func_name,
-                                               const uint8_t *ptr,
-                                               int function_line_num,
-                                               int function_col_num,
-                                               JSParseExportEnum export_flag,
-                                               JSFunctionDef **pfd,
-                                               int parse_flags)
-{
-    JSContext *ctx = s->ctx;
-    JSFunctionDef *fd = s->cur_func;
-    bool is_expr;
-    int func_idx, lexical_func_idx = -1;
-    bool has_opt_arg;
-    bool create_func_var = false;
-
-    is_expr = (func_type != JS_PARSE_FUNC_STATEMENT &&
-               func_type != JS_PARSE_FUNC_VAR);
-
-    if (func_type == JS_PARSE_FUNC_STATEMENT ||
-        func_type == JS_PARSE_FUNC_VAR ||
-        func_type == JS_PARSE_FUNC_EXPR) {
-        if (func_kind == JS_FUNC_NORMAL &&
-            token_is_pseudo_keyword(s, JS_ATOM_async) &&
-            peek_token(s, true) != '\n') {
-            if (next_token(s))
-                return -1;
-            func_kind = JS_FUNC_ASYNC;
-        }
-        if (next_token(s))
-            return -1;
-        if (s->token.val == '*') {
-            if (next_token(s))
-                return -1;
-            func_kind |= JS_FUNC_GENERATOR;
-        }
-
-        if (s->token.val == TOK_IDENT) {
-            if (s->token.u.ident.is_reserved ||
-                (s->token.u.ident.atom == JS_ATOM_yield &&
-                 func_type == JS_PARSE_FUNC_EXPR &&
-                 (func_kind & JS_FUNC_GENERATOR)) ||
-                (s->token.u.ident.atom == JS_ATOM_await &&
-                 ((func_type == JS_PARSE_FUNC_EXPR &&
-                   (func_kind & JS_FUNC_ASYNC)) ||
-                  func_type == JS_PARSE_FUNC_CLASS_STATIC_INIT))) {
-                return js_parse_error_reserved_identifier(s);
-            }
-        }
-        /* A GeneratorExpression's BindingIdentifier is [+Yield] and an AsyncFunctionExpression's is [+Await], so
-           the name cannot be `yield`/`await` — and where the ENCLOSING context already spells them as keywords
-           the token is not TOK_IDENT, which is the only reason the check above missed them. That is how
-           `function* g() { (function* yield() {}); }` parsed while the same expression in a non-generator did
-           not: one rule answering differently by where it appeared. */
-        if ((s->token.val == TOK_YIELD && (func_kind & JS_FUNC_GENERATOR)) ||
-            (s->token.val == TOK_AWAIT && (func_kind & JS_FUNC_ASYNC)))
-            return js_parse_error_reserved_identifier(s);
-        if (s->token.val == TOK_IDENT ||
-            (((s->token.val == TOK_YIELD && !fd->is_strict_mode) ||
-             (s->token.val == TOK_AWAIT && !s->is_module)) &&
-             func_type == JS_PARSE_FUNC_EXPR)) {
-            func_name = JS_DupAtom(ctx, s->token.u.ident.atom);
-            if (next_token(s)) {
-                JS_FreeAtom(ctx, func_name);
-                return -1;
-            }
-        } else {
-            if (func_type != JS_PARSE_FUNC_EXPR &&
-                export_flag != JS_PARSE_EXPORT_DEFAULT) {
-                return js_parse_error(s, "function name expected");
-            }
-        }
-    } else if (func_type != JS_PARSE_FUNC_ARROW) {
-        func_name = JS_DupAtom(ctx, func_name);
-    }
-
-    if (fd->is_eval && fd->eval_type == JS_EVAL_TYPE_MODULE &&
-        (func_type == JS_PARSE_FUNC_STATEMENT || func_type == JS_PARSE_FUNC_VAR)) {
-        JSGlobalVar *hf;
-        hf = find_global_var(fd, func_name);
-        /* XXX: should check scope chain */
-        if (hf && hf->scope_level == fd->scope_level) {
-            js_parse_error(s, "invalid redefinition of global identifier in module code");
-            JS_FreeAtom(ctx, func_name);
-            return -1;
-        }
-    }
-
-    if (func_type == JS_PARSE_FUNC_VAR) {
-        /* B.3.2.1's condition, in the order it states it. A lexical declaration of the same name is what makes
-           "replacing the FunctionDeclaration with a VariableStatement would produce an Early Error" true — with
-           ONE exception: the binding this very declaration is about to create, or the one an EARLIER function
-           declaration in the same block already created, which B.3.3.4 explicitly allows to be redefined.
-           Excluding those too meant only the FIRST of `{ function f(){3}; function f(){4} }` reached the var, so
-           the outer binding kept the function the block's own binding no longer held. */
-        int lex_idx = find_lexical_decl(ctx, fd, func_name, fd->scope_first, false);
-        bool lex_is_redefinable_func =
-            (lex_idx >= 0 && lex_idx < GLOBAL_VAR_OFFSET &&
-             fd->vars[lex_idx].scope_level == fd->scope_level &&
-             fd->vars[lex_idx].var_kind == JS_VAR_FUNCTION_DECL);
-        if (!fd->is_strict_mode
-        && func_kind == JS_FUNC_NORMAL
-        &&  (lex_idx < 0 || lex_is_redefinable_func)
-        &&  !((func_idx = find_var(ctx, fd, func_name)) >= 0 && (func_idx & ARGUMENT_VAR_OFFSET))
-        /* "F is not an element of parameterNames", and FunctionDeclarationInstantiation step 22.f APPENDS
-           "arguments" to parameterNames whenever the arguments object is needed — so a block-level
-           `function arguments(){}` never reaches the enclosing binding and `arguments` stays the Arguments
-           object. (sm/lexical-environment/block-scoped-functions-annex-b-arguments asserts the opposite; the
-           spec citation and annexB/.../block-decl-func-skip-arguments are the oracle.) */
-        &&  !(func_name == JS_ATOM_arguments && fd->has_arguments_binding)) {
-            create_func_var = true;
-        }
-        /* Create the lexical name here so that the function closure
-           contains it */
-        if (fd->is_eval &&
-            (fd->eval_type == JS_EVAL_TYPE_GLOBAL ||
-             fd->eval_type == JS_EVAL_TYPE_MODULE) &&
-            fd->scope_level == fd->body_scope) {
-            /* avoid creating a lexical variable in the global
-               scope. XXX: check annex B */
-            JSGlobalVar *hf;
-            hf = find_global_var(fd, func_name);
-            /* XXX: should check scope chain */
-            if (hf && hf->scope_level == fd->scope_level) {
-                js_parse_error(s, "invalid redefinition of global identifier");
-                JS_FreeAtom(ctx, func_name);
-                return -1;
-            }
-        } else {
-            /* Always create a lexical name, fail if at the same scope as
-               existing name */
-            /* Lexical variable will be initialized upon entering scope */
-            lexical_func_idx = define_var(s, fd, func_name,
-                                          func_kind != JS_FUNC_NORMAL ?
-                                          JS_VAR_DEF_NEW_FUNCTION_DECL :
-                                          JS_VAR_DEF_FUNCTION_DECL);
-            if (lexical_func_idx < 0) {
-                JS_FreeAtom(ctx, func_name);
-                return -1;
-            }
-        }
-    }
-
-    fd = js_new_function_def(ctx, fd, false, is_expr, s->filename,
-                             function_line_num, function_col_num);
-    if (!fd) {
-        JS_FreeAtom(ctx, func_name);
-        return -1;
-    }
-    if (s->fn_ctor_toplevel && func_type == JS_PARSE_FUNC_EXPR) {
-        /* the Function constructor's own synthesized wrapper — see js_parse_init's caller. `is_func_expr` is
-           read for exactly one thing, the self-name binding, and this function does not have one. */
-        s->fn_ctor_toplevel = false;
-        fd->is_func_expr = false;
-    }
-    if (pfd)
-        *pfd = fd;
-    s->cur_func = fd;
-    fd->func_name = func_name;
-    /* XXX: test !fd->is_generator is always false */
-    fd->has_prototype = (func_type == JS_PARSE_FUNC_STATEMENT ||
-                         func_type == JS_PARSE_FUNC_VAR ||
-                         func_type == JS_PARSE_FUNC_EXPR) &&
-                        func_kind == JS_FUNC_NORMAL;
-    fd->has_home_object = (func_type == JS_PARSE_FUNC_METHOD ||
-                           func_type == JS_PARSE_FUNC_GETTER ||
-                           func_type == JS_PARSE_FUNC_SETTER ||
-                           func_type == JS_PARSE_FUNC_CLASS_CONSTRUCTOR ||
-                           func_type == JS_PARSE_FUNC_DERIVED_CLASS_CONSTRUCTOR);
-    fd->has_arguments_binding = (func_type != JS_PARSE_FUNC_ARROW &&
-                                 func_type != JS_PARSE_FUNC_CLASS_STATIC_INIT);
-    fd->has_this_binding = fd->has_arguments_binding;
-    fd->is_derived_class_constructor = (func_type == JS_PARSE_FUNC_DERIVED_CLASS_CONSTRUCTOR);
-    if (func_type == JS_PARSE_FUNC_ARROW) {
-        fd->new_target_allowed = fd->parent->new_target_allowed;
-        fd->super_call_allowed = fd->parent->super_call_allowed;
-        fd->super_allowed = fd->parent->super_allowed;
-        fd->arguments_allowed = fd->parent->arguments_allowed;
-    } else if (func_type == JS_PARSE_FUNC_CLASS_STATIC_INIT) {
-        fd->new_target_allowed = true; // although new.target === undefined
-        fd->super_call_allowed = false;
-        fd->super_allowed = true;
-        fd->arguments_allowed = false;
-    } else {
-        fd->new_target_allowed = true;
-        fd->super_call_allowed = fd->is_derived_class_constructor;
-        fd->super_allowed = fd->has_home_object;
-        fd->arguments_allowed = true;
-    }
-
-    /* fd->in_function_body == false prevents yield/await during the parsing
-       of the arguments in generator/async functions. They are parsed as
-       regular identifiers for other function kinds. */
-    fd->func_kind = func_kind;
-    fd->func_type = func_type;
-
-    if (func_type == JS_PARSE_FUNC_CLASS_CONSTRUCTOR ||
-        func_type == JS_PARSE_FUNC_DERIVED_CLASS_CONSTRUCTOR) {
-        /* error if not invoked as a constructor */
-        emit_op(s, OP_check_ctor);
-    }
-
-    if (func_type == JS_PARSE_FUNC_CLASS_CONSTRUCTOR) {
-        emit_class_field_init(s);
-    }
-
-    /* parse arguments */
-    fd->has_simple_parameter_list = true;
-    fd->has_parameter_expressions = false;
-    has_opt_arg = false;
-    if (func_type == JS_PARSE_FUNC_ARROW && s->token.val == TOK_IDENT) {
-        JSAtom name;
-        /* AsyncArrowBindingIdentifier is BindingIdentifier[+Await] whatever the enclosing context is, so
-           `async await => 1` is an Early Error. The token's own `is_reserved` cannot say so: it was decided when
-           the identifier was scanned, which for this form is BEFORE the arrow -- and therefore before its
-           async-ness -- existed. The parenthesised spelling `async (await) => 1` is parsed inside the arrow and
-           was already rejected; the two differed only in where the question got asked. */
-        if (s->token.u.ident.is_reserved ||
-            ((fd->func_kind & JS_FUNC_ASYNC) && s->token.u.ident.atom == JS_ATOM_await)) {
-            js_parse_error_reserved_identifier(s);
-            goto fail;
-        }
-        name = s->token.u.ident.atom;
-        if (add_arg(ctx, fd, name) < 0)
-            goto fail;
-        fd->defined_arg_count = 1;
-    } else if (func_type != JS_PARSE_FUNC_CLASS_STATIC_INIT) {
-        if (s->token.val == '(') {
-            int skip_bits;
-            /* if there is an '=' inside the parameter list, we
-               consider there is a parameter expression inside */
-            js_parse_skip_parens_token(s, &skip_bits, false);
-            if (skip_bits & SKIP_HAS_ASSIGNMENT)
-                fd->has_parameter_expressions = true;
-            if (next_token(s))
-                goto fail;
-        } else {
-            if (js_parse_expect(s, '('))
-                goto fail;
-        }
-
-        if (fd->has_parameter_expressions) {
-            fd->scope_level = -1; /* force no parent scope */
-            if (push_scope(s) < 0)
-                return -1;
-        }
-
-        while (s->token.val != ')') {
-            JSAtom name;
-            bool rest = false;
-            int idx, has_initializer;
-
-            if (s->token.val == TOK_ELLIPSIS) {
-                /* An accessor's parameter list is not a FormalParameters: 15.5.1 gives a getter `( )` and a
-                   setter `( PropertySetParameterList )`, and PropertySetParameterList is a single
-                   FormalParameter — a BindingRestElement is not in either grammar. The arity check below caught
-                   `set x(a, b)` and `set x()` but counted a rest as the one parameter it demands, so
-                   `({ set x(...a) {} })` parsed. */
-                if (func_type == JS_PARSE_FUNC_GETTER || func_type == JS_PARSE_FUNC_SETTER) {
-                    js_parse_error(s, "rest parameter is not allowed in a getter or setter");
-                    goto fail;
-                }
-                fd->has_simple_parameter_list = false;
-                rest = true;
-                if (next_token(s))
-                    goto fail;
-            }
-            if (s->token.val == '[' || s->token.val == '{') {
-                fd->has_simple_parameter_list = false;
-                if (rest) {
-                    emit_op(s, OP_rest);
-                    emit_u16(s, fd->arg_count);
-                } else {
-                    /* unnamed arg for destructuring */
-                    idx = add_arg(ctx, fd, JS_ATOM_NULL);
-                    emit_op(s, OP_get_arg);
-                    emit_u16(s, idx);
-                }
-                has_initializer = js_parse_descent(s, PDS_DESTR, 0, DE_PACK(true, true, true, false, -1), fd->has_parameter_expressions ? TOK_LET : TOK_VAR);
-                if (has_initializer < 0)
-                    goto fail;
-                if (has_initializer)
-                    has_opt_arg = true;
-                if (!has_opt_arg)
-                    fd->defined_arg_count++;
-            } else if (s->token.val == TOK_IDENT) {
-                if (s->token.u.ident.is_reserved) {
-                    js_parse_error_reserved_identifier(s);
-                    goto fail;
-                }
-                name = s->token.u.ident.atom;
-                if (name == JS_ATOM_yield && fd->func_kind == JS_FUNC_GENERATOR) {
-                    js_parse_error_reserved_identifier(s);
-                    goto fail;
-                }
-                if (fd->has_parameter_expressions) {
-                    if (js_parse_check_duplicate_parameter(s, name))
-                        goto fail;
-                    if (define_var(s, fd, name, JS_VAR_DEF_LET) < 0)
-                        goto fail;
-                }
-                /* XXX: could avoid allocating an argument if rest is true */
-                idx = add_arg(ctx, fd, name);
-                if (idx < 0)
-                    goto fail;
-                if (next_token(s))
-                    goto fail;
-                if (rest) {
-                    emit_op(s, OP_rest);
-                    emit_u16(s, idx);
-                    if (fd->has_parameter_expressions) {
-                        emit_op(s, OP_dup);
-                        emit_op(s, OP_scope_put_var_init);
-                        emit_atom(s, name);
-                        emit_u16(s, fd->scope_level);
-                    }
-                    emit_op(s, OP_put_arg);
-                    emit_u16(s, idx);
-                    fd->has_simple_parameter_list = false;
-                    has_opt_arg = true;
-                } else if (s->token.val == '=') {
-                    int label;
-
-                    fd->has_simple_parameter_list = false;
-                    has_opt_arg = true;
-
-                    if (next_token(s))
-                        goto fail;
-
-                    label = new_label(s);
-                    emit_op(s, OP_get_arg);
-                    emit_u16(s, idx);
-                    emit_op(s, OP_dup);
-                    emit_op(s, OP_undefined);
-                    emit_op(s, OP_strict_eq);
-                    emit_goto(s, OP_if_false, label);
-                    emit_op(s, OP_drop);
-                    if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
-                        goto fail;
-                    set_object_name(s, name);
-                    emit_op(s, OP_dup);
-                    emit_op(s, OP_put_arg);
-                    emit_u16(s, idx);
-                    emit_label(s, label);
-                    emit_op(s, OP_scope_put_var_init);
-                    emit_atom(s, name);
-                    emit_u16(s, fd->scope_level);
-                } else {
-                    if (!has_opt_arg) {
-                        fd->defined_arg_count++;
-                    }
-                    if (fd->has_parameter_expressions) {
-                        /* copy the argument to the argument scope */
-                        emit_op(s, OP_get_arg);
-                        emit_u16(s, idx);
-                        emit_op(s, OP_scope_put_var_init);
-                        emit_atom(s, name);
-                        emit_u16(s, fd->scope_level);
-                    }
-                }
-            } else {
-                js_parse_error(s, "missing formal parameter");
-                goto fail;
-            }
-            if (rest && s->token.val != ')') {
-                js_parse_expect(s, ')');
-                goto fail;
-            }
-            if (s->token.val == ')')
-                break;
-            if (js_parse_expect(s, ','))
-                goto fail;
-        }
-        if ((func_type == JS_PARSE_FUNC_GETTER && fd->arg_count != 0) ||
-            (func_type == JS_PARSE_FUNC_SETTER && fd->arg_count != 1)) {
-            js_parse_error(s, "invalid number of arguments for getter or setter");
-            goto fail;
-        }
-    }
-
-    if (fd->has_parameter_expressions) {
-        int idx;
-
-        /* Copy the variables in the argument scope to the variable
-           scope (see FunctionDeclarationInstantiation() in spec). The
-           normal arguments are already present, so no need to copy
-           them. */
-        idx = fd->scopes[fd->scope_level].first;
-        while (idx >= 0) {
-            JSVarDef *vd = &fd->vars[idx];
-            if (vd->scope_level != fd->scope_level)
-                break;
-            if (find_var(ctx, fd, vd->var_name) < 0) {
-                if (add_var(ctx, fd, vd->var_name) < 0)
-                    goto fail;
-                vd = &fd->vars[idx]; /* fd->vars may have been reallocated */
-                emit_op(s, OP_scope_get_var);
-                emit_atom(s, vd->var_name);
-                emit_u16(s, fd->scope_level);
-                emit_op(s, OP_scope_put_var);
-                emit_atom(s, vd->var_name);
-                emit_u16(s, 0);
-            }
-            idx = vd->scope_next;
-        }
-
-        /* the argument scope has no parent, hence we don't use pop_scope(s) */
-        emit_op(s, OP_leave_scope);
-        emit_u16(s, fd->scope_level);
-
-        /* set the variable scope as the current scope */
-        fd->scope_level = 0;
-        fd->scope_first = fd->scopes[fd->scope_level].first;
-    }
-
-    if (next_token(s))
-        goto fail;
-
-    /* generator function: yield after the parameters are evaluated */
-    if (func_kind == JS_FUNC_GENERATOR ||
-        func_kind == JS_FUNC_ASYNC_GENERATOR)
-        emit_op(s, OP_initial_yield);
-
-    /* in generators, yield expression is forbidden during the parsing
-       of the arguments */
-    fd->in_function_body = true;
-    push_scope(s);  /* enter body scope */
-    fd->body_scope = fd->scope_level;
-
-    /* Only an ARROW has a `=>` between its parameters and its body. Asking the TOKEN instead of the FUNCTION
-       KIND let every other kind borrow the arrow body: `({ a() => 0 })`, `({ *a() => 0 })`, `({ get a() => 0 })`
-       and `class C { a() => 0 }` all parsed, where a MethodDefinition's body is `{ FunctionBody }` and nothing
-       else. With the kind asked, the `{` expectation below is what rejects them. */
-    if (func_type == JS_PARSE_FUNC_ARROW) {
-        DCHECK(s->token.val == TOK_ARROW,
-               "an arrow function reached its body with no `=>` — the caller only enters here having seen one");
-        if (next_token(s))
-            goto fail;
-
-        if (s->token.val != '{') {
-            if (js_parse_function_check_names(s, fd, func_name))
-                goto fail;
-
-            if (js_parse_descent(s, PDS_ASGN, 0, parse_flags & PF_IN_ACCEPTED, 0))
-                goto fail;
-
-            if (func_kind != JS_FUNC_NORMAL)
-                emit_op(s, OP_return_async);
-            else
-                emit_op(s, OP_return);
-
-            /* save the function source code */
-            /* the end of the function source code is after the last
-                token of the function source stored into s->last_ptr */
-            fd->source_len = s->last_ptr - ptr;
-            fd->source = js_strndup(ctx, (const char *)ptr, fd->source_len);
-            if (!fd->source)
-                goto fail;
-
-            goto done;
-        }
-    }
-
-    // js_parse_class() already consumed the '{'
-    if (func_type != JS_PARSE_FUNC_CLASS_STATIC_INIT)
-        if (js_parse_expect(s, '{'))
-            goto fail;
-
-    if (js_parse_directives(s))
-        goto fail;
-
-    /* in strict_mode, check function and argument names */
-    if (js_parse_function_check_names(s, fd, func_name))
-        goto fail;
-
-    {
-        BlockEnv using_be;
-        int has_using_be = 0;
-
-        while (s->token.val != '}') {
-            if (js_parse_descent(s, PDS_SRCELEM, 0, 0, 0))
-                goto fail;
-            /* Check if a 'using' was encountered in the body scope */
-            if (!has_using_be && fd->scopes[fd->body_scope].has_using) {
-                has_using_be = 1;
-                push_break_entry(fd, &using_be, JS_ATOM_NULL, -1, -1, 1);
-                using_be.has_using = true;
-                using_be.using_scope_level = fd->body_scope;
-            }
-        }
-
-        /* save the function source code */
-        fd->source_len = s->buf_ptr - ptr;
-        fd->source = js_strndup(ctx, (const char *)ptr, fd->source_len);
-        if (!fd->source)
-            goto fail;
-
-        if (next_token(s)) {
-            /* consume the '}' */
-            goto fail;
-        }
-
-        if (has_using_be) {
-            int label_catch = fd->scopes[fd->body_scope].using_label_catch;
-            int label_end = fd->scopes[fd->body_scope].using_label_end;
-
-            pop_break_entry(fd);
-
-            if (js_is_live_code(s)) {
-                emit_op(s, OP_drop);  /* drop catch_offset */
-                emit_op(s, OP_using_dispose_init);  /* initial error_state */
-                emit_op(s, OP_dispose_scope);
-                emit_u16(s, fd->body_scope);
-                emit_op(s, OP_using_dispose_end);
-                emit_return(s, false);
-            }
-
-            emit_label(s, label_catch);
-            emit_op(s, OP_dispose_scope);
-            emit_u16(s, fd->body_scope);
-            emit_op(s, OP_throw);
-
-            emit_label(s, label_end);
-        } else {
-            if (js_is_live_code(s)) {
-                emit_return(s, false);
-            }
-        }
-    }
-done:
-    s->cur_func = fd->parent;
-
-    /* Reparse identifiers after the function is terminated so that
-       the token is parsed in the englobing function. It could be done
-       by just using next_token() here for normal functions, but it is
-       necessary for arrow functions with an expression body. */
-    reparse_ident_token(s);
-
-    /* create the function object */
-    {
-        int idx;
-        JSAtom func_name = fd->func_name;
-
-        /* the real object will be set at the end of the compilation */
-        idx = cpool_add(s, JS_NULL);
-        fd->parent_cpool_idx = idx;
-
-        if (is_expr) {
-            /* for constructors, no code needs to be generated here */
-            if (func_type != JS_PARSE_FUNC_CLASS_CONSTRUCTOR &&
-                func_type != JS_PARSE_FUNC_DERIVED_CLASS_CONSTRUCTOR) {
-                /* OP_fclosure creates the function object from the bytecode
-                   and adds the scope information */
-                emit_op(s, OP_fclosure);
-                emit_u32(s, idx);
-                if (func_name == JS_ATOM_NULL) {
-                    emit_op(s, OP_set_name);
-                    emit_u32(s, JS_ATOM_NULL);
-                }
-            }
-        } else if (func_type == JS_PARSE_FUNC_VAR) {
-            if (lexical_func_idx >= 0)
-                s->cur_func->vars[lexical_func_idx].func_pool_idx = idx;   /* initialized on entering the scope */
-            /* THE VALUE the Annex B store writes. B.3.2.1 step 3 is
-                   fobj = benv.GetBindingValue(F);  genv.SetMutableBinding(F, fobj)
-               — it reads the BLOCK's binding, it does not build a second function. For a block-scoped
-               declaration this code made a whole new closure here and stored THAT, so
-               `{ function x(){} o = x; }` left the outer `x` and the inner one two different objects, and with
-               two declarations of one name the outer kept the first where the block held the last. The
-               scope-entry hoisting already created the one object; read it. */
-            if (lexical_func_idx >= 0) {
-                if (create_func_var) {
-                    emit_op(s, OP_scope_get_var);
-                    emit_atom(s, func_name);
-                    emit_u16(s, s->cur_func->scope_level);
-                }
-            } else {
-                emit_op(s, OP_fclosure);
-                emit_u32(s, idx);
-                if (create_func_var)
-                    emit_op(s, OP_dup);
-            }
-            if (create_func_var) {
-                if (s->cur_func->is_global_var) {
-                    JSGlobalVar *hf;
-                    /* the global variable must be defined at the start of the
-                       function */
-                    hf = add_global_var(ctx, s->cur_func, func_name);
-                    if (!hf)
-                        goto fail;
-                    /* it is considered as defined at the top level
-                       (needed for annex B.3.3.4 and B.3.3.5
-                       checks) */
-                    hf->scope_level = 0;
-                    hf->force_init = s->cur_func->is_strict_mode;
-                } else {
-                    /* do not call define_var to bypass lexical scope check */
-                    func_idx = find_var(ctx, s->cur_func, func_name);
-                    if (func_idx < 0) {
-                        func_idx = add_var(ctx, s->cur_func, func_name);
-                        if (func_idx < 0)
-                            goto fail;
-                    }
-                }
-                /* store directly into the var, bypassing the lexical scope. The store is PROVISIONAL: an
-                   enclosing block may declare the name lexically LATER, and then the VariableStatement
-                   replacement B.3.2.1 tests would be an Early Error. define_var patches it out if that happens. */
-                annexb_func_var_record(s, s->cur_func, func_name, s->cur_func->byte_code.size);
-                emit_op(s, OP_scope_put_var_env);
-                emit_atom(s, func_name);
-                emit_u16(s, 0);
-            }
-            if (lexical_func_idx < 0) {
-                /* store function object into its lexical name */
-                /* XXX: could use OP_put_loc directly */
-                emit_op(s, OP_scope_put_var_init);
-                emit_atom(s, func_name);
-                emit_u16(s, s->cur_func->scope_level);
-            }
-        } else {
-            if (!s->cur_func->is_global_var) {
-                int var_idx = define_var(s, s->cur_func, func_name, JS_VAR_DEF_VAR);
-
-                if (var_idx < 0)
-                    goto fail;
-                /* the variable will be assigned at the top of the function */
-                if (var_idx & ARGUMENT_VAR_OFFSET) {
-                    s->cur_func->args[var_idx - ARGUMENT_VAR_OFFSET].func_pool_idx = idx;
-                } else {
-                    s->cur_func->vars[var_idx].func_pool_idx = idx;
-                }
-            } else {
-                JSAtom func_var_name;
-                JSGlobalVar *hf;
-                if (func_name == JS_ATOM_NULL)
-                    func_var_name = JS_ATOM__default_; /* export default */
-                else
-                    func_var_name = func_name;
-                /* the variable will be assigned at the top of the function */
-                hf = add_global_var(ctx, s->cur_func, func_var_name);
-                if (!hf)
-                    goto fail;
-                hf->cpool_idx = idx;
-                if (export_flag != JS_PARSE_EXPORT_NONE) {
-                    if (!add_export_entry(s, s->cur_func->module, func_var_name,
-                                          export_flag == JS_PARSE_EXPORT_NAMED ? func_var_name : JS_ATOM_default, JS_EXPORT_TYPE_LOCAL))
-                        goto fail;
-                }
-            }
-        }
-    }
-    return 0;
- fail:
-    s->cur_func = fd->parent;
-    js_free_function_def(ctx, fd);
-    if (pfd)
-        *pfd = NULL;
-    return -1;
-}
-
-static __exception int js_parse_function_decl(JSParseState *s,
-                                              JSParseFunctionEnum func_type,
-                                              JSFunctionKindEnum func_kind,
-                                              JSAtom func_name,
-                                              const uint8_t *ptr,
-                                              int start_line,
-                                              int start_col,
-                                              int parse_flags)
-{
-    return js_parse_function_decl2(s, func_type, func_kind, func_name, ptr,
-                                   start_line, start_col,
-                                   JS_PARSE_EXPORT_NONE, NULL, parse_flags);
 }
 
 static __exception int js_parse_program(JSParseState *s)
