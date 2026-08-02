@@ -41841,12 +41841,19 @@ typedef struct JSParseState {
        which is always the outer wrapper: nothing inside its parameter list is parsed before it exists. */
     bool fn_ctor_toplevel;
     /* THE PARSE DESCENT'S FRAME STACK — see js_parse_descent. It belongs to the PARSE, not to a driver
-       activation: productions the driver does not own yet (js_parse_postfix_expr, js_parse_statement_or_decl)
+       activation: productions the driver does not own yet (js_parse_statement_or_decl and the statement cone)
        sit between converted ones, so the driver is re-entered, and a per-activation array would put the
-       descent's working set back on the C stack. Measured: a 16-frame inline array cost
-       more paren depth than the recursion it replaced. Owned here, released when the stack empties. */
-    struct JSParseFrame *pd_fr;
-    int pd_sp, pd_size;
+       descent's working set back on the C stack. Measured: a 16-frame inline array cost more paren depth than
+       the recursion it replaced.
+       IT IS CHUNKED RATHER THAN A GROWING ARRAY, AND THAT IS A CORRECTNESS REQUIREMENT, NOT A TUNING CHOICE.
+       A frame's ADDRESS has to stay valid while deeper frames are pushed, because the statement productions
+       register the address of a frame-resident BlockEnv into JSFunctionDef.top_break and leave it on that list
+       for exactly as long as the loop BODY is being parsed — which is the span that pushes more frames. A
+       realloc'ing array would move the frame and dangle every entry already linked, surfacing as a
+       use-after-free in break/continue resolution rather than as a parse error. Chunks are allocated once and
+       never moved; only the array OF chunk pointers is ever reallocated. Released when the stack empties. */
+    struct JSParseFrame **pd_chunks;
+    int pd_sp, pd_nchunks;
 } JSParseState;
 
 /* ---- JSON.parse's data types. They sit HERE, below JSParseState, because the step machine at the end of
@@ -46850,6 +46857,42 @@ struct JSParseFrame {
 typedef struct JSParseFrame JSParseFrame;
 
 
+/* Frames live in fixed CHUNKS so their addresses are stable for their whole lifetime — see the pd_chunks
+   comment on JSParseState for why that is a requirement and not an optimisation. A chunk, once allocated,
+   is kept until the stack drains, so a deep parse pays for its depth once. */
+#define PD_CHUNK_BITS 6
+#define PD_CHUNK      (1 << PD_CHUNK_BITS)
+#define PD_FRAME(i_)  (&s->pd_chunks[(i_) >> PD_CHUNK_BITS][(i_) & (PD_CHUNK - 1)])
+
+static int pd_reserve(JSContext *ctx, JSParseState *s, int n)
+{
+    int want = (n + PD_CHUNK - 1) >> PD_CHUNK_BITS;
+
+    while (s->pd_nchunks < want) {
+        JSParseFrame **nc, *chunk;
+        nc = js_realloc(ctx, s->pd_chunks, sizeof(*nc) * (s->pd_nchunks + 1));
+        if (!nc)
+            return -1;
+        s->pd_chunks = nc;
+        chunk = js_malloc(ctx, sizeof(*chunk) * PD_CHUNK);
+        if (!chunk)
+            return -1;
+        nc[s->pd_nchunks++] = chunk;
+    }
+    return 0;
+}
+
+static void pd_release(JSContext *ctx, JSParseState *s)
+{
+    int i;
+    DCHECK(s->pd_sp == 0, "the descent stack was released with frames still live");
+    for (i = 0; i < s->pd_nchunks; i++)
+        js_free(ctx, s->pd_chunks[i]);
+    js_free(ctx, s->pd_chunks);
+    s->pd_chunks = NULL;
+    s->pd_nchunks = 0;
+}
+
 static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                                         int parse_flags, int op)
 {
@@ -46858,17 +46901,17 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
        which is what lets a nested activation share it, but the dispatch loop should not read through a pointer
        on every state transition. `base` is where THIS activation's frames start — it returns when the stack
        drains back to it, leaving any outer activation's frames untouched. */
-    JSParseFrame *fr = s->pd_fr, *f = NULL;
-    int size = s->pd_size, sp = s->pd_sp, base = s->pd_sp, ret = 0;
+    JSParseFrame *f = NULL;
+    int sp = s->pd_sp, base = s->pd_sp, ret = 0;
     int tok, opcode = 0, drop_count = 0;
 
 /* The arguments are read into temporaries FIRST: they are almost always expressions over the CALLER's frame
    (`f->level - 1`), and the push moves `f` to the callee's. */
 #define PD_PUSH(entry_, level_, flags_, op_) do {                               \
         int e_ = (entry_), lv_ = (level_), fl_ = (flags_), o_ = (op_);          \
-        if (js_resize_array(ctx, (void **)&fr, sizeof(fr[0]), &size, sp + 1))    \
+        if (pd_reserve(ctx, s, sp + 1))                                         \
             goto unwind;                                                        \
-        f = &fr[sp++];                                                          \
+        f = PD_FRAME(sp); sp++;                                                 \
         f->state = e_; f->level = lv_; f->flags = fl_; f->op = o_;               \
         f->label1 = -1; f->label2 = -1; f->opcode = 0; f->atom = JS_ATOM_NULL;   \
         f->comma = false; f->is_star = false; f->name0 = JS_ATOM_NULL;           \
@@ -46898,7 +46941,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
  dispatch:
     if (sp == base)
         goto done;
-    f = &fr[sp - 1];
+    f = PD_FRAME(sp - 1);
     switch (f->state) {
     case PDS_BIN:       goto bin_entry;
     case PDS_BIN_PRIV:  goto bin_priv_done;
@@ -48438,24 +48481,23 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     /* The frame array could not grow: OOM. This is the ONE exit that does not run a production's own release,
        so it settles the atom of every frame THIS activation pushed. An outer activation's frames are its own
        and are settled when its unwind runs. */
-    while (sp > base)
-        JS_FreeAtom(ctx, fr[--sp].atom);
+    while (sp > base) {
+        sp--;
+        JS_FreeAtom(ctx, PD_FRAME(sp)->atom);
+    }
     ret = -1;
  leave:
-    s->pd_fr = fr;
-    s->pd_size = size;
     s->pd_sp = sp;
-    if (sp == 0) {
-        /* the whole descent drained — the parse owns nothing until the next one starts */
-        js_free(ctx, fr);
-        s->pd_fr = NULL;
-        s->pd_size = 0;
-    }
+    if (sp == 0)
+        pd_release(ctx, s);   /* the whole descent drained — the parse owns nothing until the next one */
     return ret;
 #undef PD_PUSH
 #undef PD_CALL
 #undef PD_RET
 #undef PD_RET_ERR
+#undef PD_FRAME
+#undef PD_CHUNK
+#undef PD_CHUNK_BITS
 }
 
 /* allowed parse_flags: PF_IN_ACCEPTED */
